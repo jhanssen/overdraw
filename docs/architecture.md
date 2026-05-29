@@ -46,10 +46,16 @@ Two processes in v1: core and GPU. Phase 2 adds a small session supervisor.
 ### Core process
 
 - C++ + Node. The N-API addon loads with the Node main script.
-- C++ owns: `libwayland-server` integration, fd handling (SCM_RIGHTS),
-  DRM master / KMS / libinput / libseat (phase 2), the Dawn wire client
-  for the core's own compositing device, and a generic protocol-trampoline
-  surface that lets JS implement Wayland protocols.
+- C++ owns: `libwayland-server` integration (overdraw's *own* clients), fd
+  handling (SCM_RIGHTS), DRM master / KMS / libinput / libseat (phase 2), the
+  Dawn wire client for the core's own compositing device, and a generic
+  protocol-trampoline surface that lets JS implement Wayland protocols.
+  - **Phase 1 caveat:** the host output window's Wayland *client* connection
+    lives in the GPU process, not the core (a `wl_surface` cannot be shared
+    across processes; the surface and device live GPU-side). The core remains
+    the Wayland *server* for overdraw's own clients and drives the host
+    swapchain over the wire. See "GPU process". This refines the original
+    framing of the core as "the Wayland client of the host."
 - JS owns: protocol semantics, window management, focus policy, plugin
   registry, capability grants. Most protocols are implemented in JS;
   some hot or foundational ones may be in C++ (see "Protocol layers").
@@ -74,6 +80,18 @@ Two processes in v1: core and GPU. Phase 2 adds a small session supervisor.
 - On crash, the core respawns it and replays state (see "GPU process
   crash recovery"). In v1 the core does this directly; in phase 2 the
   session supervisor handles process lifecycle.
+- **Phase 1 only: owns the host Wayland *client* connection used for output
+  presentation.** A `wl_surface` is a client-side proxy bound to one
+  `wl_display` connection and cannot be shared across processes by pointer;
+  the `wgpu::Surface` is created from that `wl_surface` via
+  `SurfaceSourceWaylandSurface`. Since the surface and the compositing device
+  both live in the GPU process, the host output window's Wayland connection
+  must live there too. The core's wire client drives the swapchain
+  (`Configure`/`GetCurrentTexture`/`Present`) over the wire against that
+  server-side surface (validated; see "Validated against Dawn"). Host input
+  events arrive on this connection in the GPU process and are forwarded to the
+  core over the side channel. Phase 2 (KMS) has no host window, so this is
+  phase-1-specific.
 
 ### IPC
 
@@ -732,6 +750,34 @@ Wire-topology facts (cross-process spike, partially validated):
 - **Wire-client callbacks fire only during `wgpuInstanceProcessEvents`** on
   the client's wire instance (with `CallbackMode::AllowProcessEvents`); the
   client event loop must pump it.
+
+Phase-1 presentation facts (cross-process spike, validated end-to-end on
+NVIDIA GTX 1660 SUPER / proprietary driver / Vulkan backend, host Wayland
+session):
+
+- **The Wayland-backed swapchain works over the wire.** A wire *client* can
+  drive a `wgpu::Surface` whose `Surface` and `Device` live in the wire
+  *server*: `Surface::Configure`, `GetCurrentTexture`, render-pass submit, and
+  `Present` all propagate over the wire and produce visible frames in the host
+  window. 240/240 frames presented over the wire.
+- **`ReserveSurface`/`InjectSurface` exist and mirror the texture
+  reserve/inject pattern.** The client calls
+  `WireClient::ReserveSurface(instance, capabilities)` → `ReservedSurface
+  { surface, instanceHandle, handle }`; the server creates the native
+  `wgpu::Surface` and calls `WireServer::InjectSurface(surface, handle,
+  instanceHandle)` at that handle. Generation must match, as with instances.
+- **The host output window's Wayland connection must live in the GPU
+  process.** `SurfaceSourceWaylandSurface` takes raw `wl_display` + `wl_surface`
+  pointers; a `wl_surface` is a client-side proxy bound to one connection and
+  is not shareable across processes. Because the surface/device are GPU-side,
+  the host Wayland *client* connection is GPU-side too (phase 1 only). This
+  refines the original "core is the Wayland client of the host" framing; see
+  "GPU process" and "Core process".
+- **`SurfaceCapabilities` for `ReserveSurface` come from the server.** The
+  native side queries `Surface::GetCapabilities` against the underlying adapter
+  and ships format/present-mode/alpha-mode + size to the client over the side
+  channel; the client uses them to `Configure`. (In the spike the reservation
+  itself accepted an empty caps struct since it only allocates a handle.)
 
 Not yet validated end-to-end: the final reserve-texture / inject-texture
 handshake (server injecting the dmabuf-backed texture at the client's reserved
