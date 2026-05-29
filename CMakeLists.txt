@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.24)
-project(overdraw LANGUAGES CXX)
+project(overdraw LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -13,10 +13,31 @@ endif()
 add_subdirectory(3rdparty/dawn)
 
 find_package(Dawn REQUIRED)
+find_package(PkgConfig REQUIRED)
+pkg_check_modules(WAYLAND_CLIENT REQUIRED wayland-client)
 
-# Minimal target proving the Dawn wire bundle downloads, configures, and links.
-add_executable(overdraw-dawn-probe tools/dawn_probe.cpp)
-target_link_libraries(overdraw-dawn-probe PRIVATE
-    dawn::webgpu_dawn
-    dawn::webgpu_dawn_wire
-)
+# Dawn is built -fno-rtti; match it to avoid typeinfo mismatches.
+add_compile_options($<$<COMPILE_LANGUAGE:CXX>:-fno-rtti>)
+
+# Shared IPC headers (side-channel protocol + transport).
+set(IPC_INCLUDE ${CMAKE_SOURCE_DIR}/native/ipc)
+
+# Checked-in xdg-shell client glue (generated once via wayland-scanner).
+set(XDG_SHELL_DIR ${CMAKE_SOURCE_DIR}/native/wayland/generated)
+
+# ---- GPU process (native, no JS) ----
+add_executable(overdraw-gpu-process
+    gpu-process/src/main.cpp
+    gpu-process/src/host_window.cpp
+    ${XDG_SHELL_DIR}/xdg-shell-protocol.c)
+target_include_directories(overdraw-gpu-process PRIVATE
+    ${IPC_INCLUDE} ${XDG_SHELL_DIR} ${WAYLAND_CLIENT_INCLUDE_DIRS})
+target_link_libraries(overdraw-gpu-process PRIVATE
+    dawn::webgpu_dawn ${WAYLAND_CLIENT_LIBRARIES} pthread dl rt)
+
+# ---- Core (pure C++ stage; Node/N-API wrapping comes later) ----
+add_executable(overdraw-core
+    core/src/main.cpp)
+target_include_directories(overdraw-core PRIVATE ${IPC_INCLUDE})
+target_link_libraries(overdraw-core PRIVATE
+    dawn::webgpu_dawn_wire pthread dl rt)
