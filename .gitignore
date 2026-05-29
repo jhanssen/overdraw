@@ -1,0 +1,14 @@
+# Throwaway de-risking experiments; not tracked.
+/spikes/
+
+# Build output
+/build/
+build/
+
+# Node
+node_modules/
+
+# Editor / OS
+*.swp
+*~
+.DS_Store
