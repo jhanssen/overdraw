@@ -4,6 +4,7 @@
 
 #include <fcntl.h>
 #include <signal.h>
+#include <sys/prctl.h>
 #include <sys/socket.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -24,12 +25,20 @@ GpuProcess spawnGpuProcess(const char* binPath) {
         return out;
     }
 
+    const pid_t parentPid = ::getpid();  // for the child's fork-race death check
     pid_t pid = ::fork();
     if (pid < 0) {
         std::perror("fork");
         return out;
     }
     if (pid == 0) {
+        // Child: die if the core (our parent) dies, even by crash/SIGKILL, so a
+        // GPU process is never orphaned holding the host window + GPU. PDEATHSIG
+        // survives execve. Guard the fork-vs-parent-death race: if the parent
+        // already exited before we set this, getppid() is no longer the core
+        // (reparented to init/pid 1), so exit now.
+        ::prctl(PR_SET_PDEATHSIG, SIGKILL);
+        if (::getppid() != parentPid) _exit(0);
         // Child: keep the GPU-side fds open across exec.
         ::fcntl(wireFds[1], F_SETFD, 0);
         ::fcntl(ctrlFds[1], F_SETFD, 0);
