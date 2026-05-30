@@ -10,7 +10,8 @@ Last updated: 2026-05-29 (rev 3).
 
 All "proven" claims below were exercised on:
 
-- NVIDIA GeForce GTX 1660 SUPER, proprietary driver, Vulkan backend.
+- NVIDIA GeForce RTX 5060 (GB206, Blackwell), proprietary driver
+  595.71.05, Vulkan backend.
 - A live host Wayland session (`wayland-1`), overdraw running nested as a
   client of it.
 - Dawn wire release `jhanssen/dawn` `v20260529-linux-wayland-wire-alpha2`

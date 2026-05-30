@@ -707,8 +707,8 @@ process uses this pattern for swap-chain textures.
 ### Validated against Dawn (spike findings)
 
 The GPU-interop path was exercised against a real Dawn build (the wire-enabled
-fork, Vulkan backend) on NVIDIA proprietary driver 595. Verified facts and the
-constraints they impose:
+fork, Vulkan backend) on NVIDIA RTX 5060 / proprietary driver 595.71.05.
+Verified facts and the constraints they impose:
 
 - **GBM dmabuf → `SharedTextureMemory` import works on NVIDIA proprietary.**
   Single-process round trip (GBM alloc → import → render → read back) produced
@@ -755,7 +755,7 @@ Wire-topology facts (cross-process spike, partially validated):
   client event loop must pump it.
 
 Phase-1 presentation facts (cross-process spike, validated end-to-end on
-NVIDIA GTX 1660 SUPER / proprietary driver / Vulkan backend, host Wayland
+NVIDIA RTX 5060 / proprietary driver 595.71.05 / Vulkan backend, host Wayland
 session):
 
 - **The Wayland-backed swapchain works over the wire.** A wire *client* can
