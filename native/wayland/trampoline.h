@@ -39,6 +39,17 @@ class Trampoline {
     // Returns false if the interface is unknown.
     bool createGlobal(const std::string& interfaceName, napi_value handler);
 
+    // Post an event to a client: encode the JS args per the event's signature
+    // and call wl_resource_post_event_array. `resourceHandle` is a wrapped
+    // resource (from wrapResource); `opcode` is the event index; `argsArray` is
+    // a JS array of the event's typed args. Returns false on error (message set
+    // via napi exception by the caller path).
+    bool postEvent(napi_value resourceHandle, uint32_t opcode, napi_value argsArray);
+
+    // Drop a cached wrapper + mark the JS handle destroyed. Called from the
+    // per-resource destroy listener.
+    void forgetResource(wl_resource* resource);
+
   private:
     struct InterfaceState {
         std::string name;
@@ -51,13 +62,18 @@ class Trampoline {
     static int onDispatch(const void* implData, void* target, uint32_t opcode,
                           const wl_message* msg, wl_argument* args);
 
-    // Build a JS resource handle object wrapping a wl_resource.
+    // Return the JS resource handle for `resource`, creating and caching it on
+    // first use so JS sees a stable object per resource. `ifaceName` is used
+    // only when creating.
     napi_value wrapResource(wl_resource* resource, const std::string& ifaceName);
 
     napi_env env_;
     wl_display* display_;
     InterfaceRegistry* registry_;
     std::unordered_map<std::string, std::unique_ptr<InterfaceState>> interfaces_;
+    // Stable JS wrapper per wl_resource (napi_ref keeps it alive while the
+    // resource lives). Cleared on resource destroy.
+    std::unordered_map<wl_resource*, napi_ref> wrappers_;
 };
 
 }  // namespace overdraw::wayland

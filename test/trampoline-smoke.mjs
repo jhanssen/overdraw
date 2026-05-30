@@ -23,18 +23,27 @@ console.log(`[test] server socket: ${sock}`);
 // wl_surface.attach -> wl_buffer) resolve. The trampoline needs the full
 // transitive closure of referenced interfaces.
 const signatures = [];
+let surfaceMod;
 for (const f of readdirSync(genDir)) {
   if (!f.endsWith('.js')) continue;
   const m = await import(pathToFileURL(join(genDir, f)).href);
   if (m.signature) signatures.push(m.signature);
+  if (f === 'wl_surface.js') surfaceMod = m;
 }
 addon.registerProtocols(signatures);
 
+// Generated event senders for wl_surface, wired to the native post hook.
+const surfaceEvents = surfaceMod.makeEvents(addon.postEvent);
+
 let created = false;
+let stashedSurface = null;
 addon.createGlobal('wl_compositor', {
   create_surface(resource, surface) {
     created = true;
-    console.log(`[test] HANDLER create_surface: resource=${resource.interfaceName} -> new ${surface.interfaceName}`);
+    stashedSurface = surface;  // keep to check destroy invalidation (T5c)
+    console.log(`[test] HANDLER create_surface: resource=${resource.interfaceName} -> new ${surface.interfaceName}, destroyed=${surface.destroyed === true}`);
+    surfaceEvents.send_preferred_buffer_scale(surface, 2);
+    console.log('[test] sent wl_surface.preferred_buffer_scale(2)');
   },
 });
 
@@ -46,8 +55,13 @@ execFile(join(repoRoot, 'build', 'wl-test-client'), [sock], (err, stdout, stderr
   if (stderr) process.stderr.write(stderr);
   if (err) console.error('[test] client error:', err.message);
   setTimeout(() => {
+    // T5c: the client destroyed its surface (wl_surface.destroy, then
+    // disconnect), so the cached wrapper should be marked destroyed.
+    const destroyedOk = stashedSurface && stashedSurface.destroyed === true;
+    console.log(`[test] surface wrapper destroyed after client teardown: ${destroyedOk}`);
     addon.stopServer();
-    console.log(created ? '[test] PASS: handler fired' : '[test] FAIL: handler did not fire');
-    process.exit(created ? 0 : 1);
+    const pass = created && destroyedOk;
+    console.log(pass ? '[test] PASS: handler fired + resource invalidated' : '[test] FAIL');
+    process.exit(pass ? 0 : 1);
   }, 100);
 });

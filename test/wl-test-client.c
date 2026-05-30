@@ -11,6 +11,19 @@
 #include <wayland-client.h>
 
 static struct wl_compositor* compositor = NULL;
+static int got_scale = 0;
+
+static void surfEnter(void* d, struct wl_surface* s, struct wl_output* o) { (void)d;(void)s;(void)o; }
+static void surfLeave(void* d, struct wl_surface* s, struct wl_output* o) { (void)d;(void)s;(void)o; }
+static void surfPreferredScale(void* d, struct wl_surface* s, int32_t factor) {
+    (void)d; (void)s;
+    printf("[client] got preferred_buffer_scale = %d\n", factor);
+    got_scale = factor;
+}
+static void surfPreferredTransform(void* d, struct wl_surface* s, uint32_t t) { (void)d;(void)s;(void)t; }
+static const struct wl_surface_listener surfListener = {
+    surfEnter, surfLeave, surfPreferredScale, surfPreferredTransform
+};
 
 static void regGlobal(void* data, struct wl_registry* reg, uint32_t name,
                       const char* iface, uint32_t version) {
@@ -41,10 +54,10 @@ int main(int argc, char** argv) {
     printf("[client] bound wl_compositor; calling create_surface\n");
 
     struct wl_surface* surface = wl_compositor_create_surface(compositor);
-    wl_display_roundtrip(display);  // flush the request, get any errors
-
     if (!surface) { fprintf(stderr, "[client] create_surface returned null\n"); return 1; }
-    printf("[client] create_surface OK\n");
+    wl_surface_add_listener(surface, &surfListener, NULL);
+    wl_display_roundtrip(display);  // flush request; receive the event back
+    printf("[client] create_surface OK%s\n", got_scale ? " (event received)" : "");
 
     wl_surface_destroy(surface);
     wl_compositor_destroy(compositor);

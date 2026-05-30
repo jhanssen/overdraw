@@ -294,6 +294,20 @@ napi_value CreateGlobal(napi_env env, napi_callback_info info) {
     return undef;
 }
 
+// postEvent(resourceHandle, opcode, argsArray) -> undefined
+// The `post` function the generated makeEvents(post) calls.
+napi_value PostEvent(napi_env env, napi_callback_info info) {
+    size_t argc = 3; napi_value argv[3];
+    napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+    if (argc < 3) return throwError(env, "postEvent(resource, opcode, args) requires three args");
+    if (!g_addon.trampoline) return throwError(env, "no trampoline");
+    uint32_t opcode = 0; napi_get_value_uint32(env, argv[1], &opcode);
+    if (!g_addon.trampoline->postEvent(argv[0], opcode, argv[2]))
+        return throwError(env, "postEvent failed");
+    napi_value undef; napi_get_undefined(env, &undef);
+    return undef;
+}
+
 napi_value Init(napi_env env, napi_value exports) {
     napi_value fnStart, fnStop, fnPresented, fnStartServer, fnStopServer;
     napi_create_function(env, "start", NAPI_AUTO_LENGTH, Start, nullptr, &fnStart);
@@ -301,9 +315,10 @@ napi_value Init(napi_env env, napi_value exports) {
     napi_create_function(env, "presentedCount", NAPI_AUTO_LENGTH, PresentedCount, nullptr, &fnPresented);
     napi_create_function(env, "startServer", NAPI_AUTO_LENGTH, StartServer, nullptr, &fnStartServer);
     napi_create_function(env, "stopServer", NAPI_AUTO_LENGTH, StopServer, nullptr, &fnStopServer);
-    napi_value fnRegister, fnCreateGlobal;
+    napi_value fnRegister, fnCreateGlobal, fnPostEvent;
     napi_create_function(env, "registerProtocols", NAPI_AUTO_LENGTH, RegisterProtocols, nullptr, &fnRegister);
     napi_create_function(env, "createGlobal", NAPI_AUTO_LENGTH, CreateGlobal, nullptr, &fnCreateGlobal);
+    napi_create_function(env, "postEvent", NAPI_AUTO_LENGTH, PostEvent, nullptr, &fnPostEvent);
     napi_set_named_property(env, exports, "start", fnStart);
     napi_set_named_property(env, exports, "stop", fnStop);
     napi_set_named_property(env, exports, "presentedCount", fnPresented);
@@ -311,6 +326,7 @@ napi_value Init(napi_env env, napi_value exports) {
     napi_set_named_property(env, exports, "stopServer", fnStopServer);
     napi_set_named_property(env, exports, "registerProtocols", fnRegister);
     napi_set_named_property(env, exports, "createGlobal", fnCreateGlobal);
+    napi_set_named_property(env, exports, "postEvent", fnPostEvent);
     return exports;
 }
 
