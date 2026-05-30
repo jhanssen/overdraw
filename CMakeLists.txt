@@ -135,15 +135,6 @@ target_include_directories(harness-client PRIVATE
     ${CMAKE_SOURCE_DIR}/native/wayland/generated)
 target_link_libraries(harness-client PRIVATE ${WAYLAND_CLIENT_LIBRARIES})
 
-# ---- color client (long-lived solid-color window for eyeballing compositing) ----
-add_executable(color-client
-    test/color-client.c
-    native/wayland/generated/xdg-shell-protocol.c)
-target_include_directories(color-client PRIVATE
-    ${WAYLAND_CLIENT_INCLUDE_DIRS}
-    ${CMAKE_SOURCE_DIR}/native/wayland/generated)
-target_link_libraries(color-client PRIVATE ${WAYLAND_CLIENT_LIBRARIES})
-
 # ---- SCM_RIGHTS transport unit test (fd passing over the side channel) ----
 add_executable(scm-rights-test test/scm-rights-test.cpp)
 target_include_directories(scm-rights-test PRIVATE ${IPC_INCLUDE})
