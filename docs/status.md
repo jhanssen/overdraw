@@ -4,7 +4,7 @@ Tracks what is built and empirically proven versus what is still design only.
 The design itself lives in `architecture.md`; this file is the ground truth for
 "what exists right now."
 
-Last updated: 2026-05-29.
+Last updated: 2026-05-29 (rev 2).
 
 ## Verification environment
 
@@ -29,22 +29,72 @@ Single machine, single driver. Nothing here is proven portable yet.
   `wayland-scanner`.
 
 ### Two-process presentation spine (phase 1 nested)
-The core (wire client) + GPU process (native Dawn + wire server) topology runs
-as real, non-spike code and presents frames to a host window:
+The core (Node + N-API addon, wire client) + GPU process (native Dawn + wire
+server) topology runs as real, non-spike code and presents to a host window:
 
 - GPU process (`gpu-process/`): owns the host Wayland output window and its
   `wl_display` connection, native Dawn instance + `dawn::wire::WireServer`,
   creates the `wgpu::Surface` from the host `wl_surface`, and `InjectSurface`s
-  it at the client's reserved handle.
-- Core (`core/`, pure C++ for now): `fork`+`exec`s the GPU process with
-  inherited wire + side-channel socket fds, runs `dawn::wire::WireClient`,
-  requests adapter + device over the wire, reserves the surface, configures the
-  swapchain, and presents a cleared **red** frame each tick over the wire.
-- IPC (`native/ipc/`): Dawn wire over one unix socket; a side channel over
-  another carrying plain tagged POD control messages (`side_channel.h`) — not
-  yet flatbuffers (see architecture.md "Side-channel message set").
-- Clean lifecycle: bounded 240-frame run, then ordered shutdown; GPU process
-  exits with code 0. Verified repeatable (5/5 runs).
+  it at the client's reserved handle. Also holds the GBM allocator (see
+  "dmabuf interop").
+- Core: now **Node-hosted C++**. `src/index.js` loads the N-API addon
+  (`overdraw_native.node`); the native side lives in `native/core/`
+  (`gpu_process`, `wire_link`, `compositor`) compiled into a static lib. The
+  addon `fork`+`exec`s the GPU process, runs `dawn::wire::WireClient`, brings
+  up adapter + device + surface over the wire, and composites.
+- IPC (`native/ipc/`): Dawn wire over one `SOCK_STREAM` socket (length-prefixed
+  frames); a side channel over a `SOCK_SEQPACKET` socket carrying fixed-size
+  tagged POD control messages (`side_channel.h`) — not yet flatbuffers. (The
+  side channel was STREAM originally; switched to SEQPACKET once control traffic
+  grew, to preserve message boundaries. SCM_RIGHTS fd passing is not yet used.)
+- Clean lifecycle: runs until `stop()`, then ordered shutdown; GPU process
+  exits cleanly and is reaped (poll then SIGTERM fallback so it cannot orphan).
+
+### JS layer / event loop (core is C++ + Node)
+- The core is C++ + Node as the architecture specifies. Node owns `main()` and
+  the libuv loop; the N-API addon (raw `node_api.h` C API, to avoid
+  node-addon-api's exception/RTTI dependence under `-fno-rtti`) holds the native
+  core. One-shot bring-up runs blocking inside `start()`; the **steady-state
+  present loop is libuv-driven** — a `uv_poll_t` on the wire fd drains inbound
+  wire frames and a `uv_timer_t` (~16ms) paces frame render+present. No
+  hand-rolled C++ spin loop in steady state.
+- A **C++ -> JS event path** works: an optional `onFrame` JS callback is invoked
+  from the frame timer (direct `napi_call_function`, same Node thread). The
+  cross-thread path (Dawn-internal-thread callbacks -> `napi_threadsafe_function`)
+  is **not yet exercised**.
+- Still C++-internal / not in JS: protocol semantics, WM/policy, the plugin
+  model. "JS owns this" per the design has not started beyond the entry script.
+- `wl_event_loop` (server-side Wayland) integration does not exist — there is no
+  Wayland server yet. No host input handling, no resize handling.
+
+### Compositing (single textured quad)
+- A textured-quad pipeline composites one surface: shaders, sampler, bind group,
+  full-surface quad. It samples the dmabuf-backed texture (see below) and
+  presents it; the host window shows the rendered colour (green).
+- Still absent: multiple surfaces, per-surface transforms/opacity, blending,
+  client buffers, multi-output, damage.
+
+### dmabuf interop path (single device, validated end-to-end)
+The plugin/surface buffer path from the design is proven as real, non-spike code
+on the verification hardware (single device — producer and consumer are the same
+core device):
+
+- GBM allocator + DRM modifier probe in the GPU process: `GetFormatCapabilities`
+  chained with `DawnDrmFormatCapabilities` on a native adapter, intersected with
+  `gbm_bo_create_with_modifiers`. On NVIDIA: 7 Dawn-importable BGRA8 modifiers,
+  6 also GBM-allocatable (single-plane only for now). `native/.../allocator`.
+- Import the dmabuf as `SharedTextureMemory` on the wire-resolved device and
+  create a `wgpu::Texture` (usage incl. RenderAttachment + TextureBinding).
+- `ReserveTexture` (client) / `InjectTexture` (server) over the wire: a client
+  texture handle resolves to the server-allocated dmabuf texture.
+- `BeginAccess`/`EndAccess` with mandatory Vulkan image-layout state; EndAccess
+  produces a `SharedFenceSyncFD` (fenceCount=1). The client renders into the
+  dmabuf (write bracket), then samples it for compositing (read bracket).
+- **Not done:** two-device cross-device sharing (plugin device renders, core
+  device samples) and cross-process fence *consumption* — the sync-fd is
+  produced but not waited on across a device boundary. Assumed to work
+  (multi-device STM import is the same primitive), unverified. Multi-plane / YUV
+  import not done. SCM_RIGHTS fence passing not done.
 
 ### Load-bearing facts established (recorded in architecture.md "Validated against Dawn")
 - A Wayland-backed `wgpu::Surface` swapchain works **over the Dawn wire**: a
@@ -70,19 +120,22 @@ as real, non-spike code and presents frames to a host window:
 - **overdraw as a Wayland server.** Accepting real clients; `wl_compositor`,
   `wl_surface`, `xdg_shell`, `linux-dmabuf-v1`; the generic C++ trampoline; the
   XML→JS protocol generator; live reload. None exists. overdraw is currently
-  only a *client* of the host, not a server for its own clients.
-- **Compositing.** Only a solid-color clear is done. No texture sampling, no
-  per-surface quads, no client buffers, no multiple surfaces, no transforms,
-  no multi-output, no damage.
-- **Plugin path.** The dmabuf-backed `ReserveTexture`/`InjectTexture` handshake
-  (plugin renders into a server-injected texture) is still not validated
-  end-to-end. The plugin model, SDK, Worker isolation, watchdog, capability
-  grants, restart policy — none built.
-- **JS layer.** No Node, no N-API addon, no JS core. The core is pure C++.
-- **Real event loop.** Bounded frame count, not run-until-closed. No libuv,
-  no `wl_event_loop` integration, no input handling, no resize handling.
+  only a *client* of the host, not a server for its own clients. (The dmabuf
+  import primitive a `linux-dmabuf-v1` handler would reuse is proven; importing
+  a *client-chosen* modifier we did not allocate is not yet exercised.)
+- **JS-owned core.** The core is C++ + Node, but protocol semantics, WM/policy,
+  and the plugin model are not in JS yet — only the entry script and a frame
+  event callback exist.
+- **Plugin model.** SDK, Worker isolation, watchdog, capability grants, restart
+  policy — none built. (The dmabuf surface buffer path the SDK drives is proven
+  single-device; see "dmabuf interop path".)
+- **Multi-surface / real compositing.** Multiple surfaces, transforms, opacity,
+  blending, client buffers, multi-output, damage — none done.
+- **Cross-thread N-API marshaling.** `napi_threadsafe_function` for Dawn-thread
+  callbacks not exercised.
 - **Crash recovery.** GPU-process respawn + state replay not implemented (the
-  teardown fix above de-risks part of it).
+  teardown fix above de-risks part of it). A crash handler in the GPU process
+  dumps a backtrace to `/tmp` (added while debugging the dmabuf path).
 - **Phase 2 / Phase 3.** KMS/DRM, libinput, libseat, the session supervisor,
   and XWayland are untouched.
 
