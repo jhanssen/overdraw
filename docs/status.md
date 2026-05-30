@@ -4,7 +4,7 @@ Tracks what is built and empirically proven versus what is still design only.
 The design itself lives in `architecture.md`; this file is the ground truth for
 "what exists right now."
 
-Last updated: 2026-05-30 (rev 11).
+Last updated: 2026-05-30 (rev 12).
 
 ## Verification environment
 
@@ -120,9 +120,16 @@ phase-1 interactivity goal (connect → place → receive input) is met for both
   hit-tests the WM window stack (`wm.windowAt`), tracks focus, and emits
   `wl_pointer` enter/leave/motion/button/axis/frame and `wl_keyboard`
   enter/leave/key/modifiers to the resources of the client that owns the focused
-  surface, with **surface-local** pointer coordinates. Keyboard focus follows
-  pointer focus (focus-follows-mouse) for this phase — a deliberate v1
-  simplification, not a real WM focus policy.
+  surface, with **surface-local** pointer coordinates.
+- **Focus policy is configurable** (`FocusOptions` via `installProtocols({ focus })`,
+  interim until a real config system). Pointer events always follow the pointer
+  (correct Wayland). *Keyboard* focus is governed by the policy: `follow-pointer`
+  (default — keyboard focus tracks the surface under the pointer) or
+  `click-to-focus` (focus changes on button press, persists when the pointer
+  moves away). `focusOnMap` (default true) gives a freshly-mapped window keyboard
+  focus so a launched app is typeable immediately — this fixed the "must click
+  first" symptom (a window mapping under a stationary pointer otherwise never got
+  a motion event to focus it under follow-pointer).
 - `Trampoline::clientIdOf` + addon `clientId(resource)`: a stable per-client id
   (the `wl_client*`) associates the focused surface with the right client's
   input resources without exposing `wl_client` to JS.
@@ -142,11 +149,13 @@ phase-1 interactivity goal (connect → place → receive input) is met for both
   local motion + buttons; the client receives a readable keymap (mmap shows
   `xkb_keymap {`); typing routes key press/release to the focused client with
   **correct modifier masks** (Shift → dep bit 0, Alt → dep bit 3, cleared on
-  release); keyboard focus tracks the pointer. **PASS.**
+  release). Verified with real clients: `foot` and `kitty` both focus on map and
+  type without a click (follow-pointer + focus-on-map). **PASS.**
 - Not built: client cursor surfaces (`set_cursor` is a no-op; no software
-  cursor), touch, multi-seat, click-to-focus / keyboard focus independent of the
-  pointer, key-repeat generation (repeat_info sent; client repeats), axis
-  source/discrete refinement.
+  cursor), touch, multi-seat, key-repeat generation (repeat_info sent; client
+  repeats), axis source/discrete refinement. kbFocus is not auto-moved when the
+  focused window is closed (re-resolves on next pointer event; guarded against
+  use of a destroyed surface).
 
 ### Real upstream client: `foot` runs end-to-end (verified)
 An unmodified upstream `foot` terminal (1.25.0) connects, renders, and is

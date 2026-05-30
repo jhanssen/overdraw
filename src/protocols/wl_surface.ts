@@ -64,7 +64,9 @@ export default function makeSurface(ctx: Ctx): WlSurfaceHandler {
         // (the placement stub leaves size to the content size).
         if (uploaded && desc && !s.mapped && s.role === "xdg_toplevel") {
           s.mapped = true;
-          ctx.state.wm?.mapWindow(s.id, s, desc.width, desc.height);
+          const rect = ctx.state.wm?.mapWindow(s.id, s, desc.width, desc.height);
+          // Focus-on-map (per the seat's focus policy).
+          if (rect) ctx.state.seat?.focusWindow(s.id, s, rect);
         }
       }
 

@@ -43,7 +43,7 @@ console.log(`[test] compositor up; output ${dims.width}x${dims.height}`);
 
 const sock = addon.startServer();
 console.log(`[test] server socket: ${sock}`);
-state = await installProtocols(addon, { width: dims.width, height: dims.height });
+state = await installProtocols(addon, { output: { width: dims.width, height: dims.height } });
 
 function spawnClient(argbHex, w, h, title, delayMs) {
   setTimeout(() => {

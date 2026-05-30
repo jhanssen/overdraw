@@ -50,7 +50,7 @@ const dims = addon.start(gpuBin, onFrame, onInput);
 console.log(`[overdraw] compositor up; output ${dims.width}x${dims.height}`);
 
 const sock = addon.startServer();
-state = await installProtocols(addon, { width: dims.width, height: dims.height });
+state = await installProtocols(addon, { output: { width: dims.width, height: dims.height } });
 
 console.log(`[overdraw] Wayland server listening.`);
 console.log(`[overdraw] run a client with:  WAYLAND_DISPLAY=${sock} <your-client>`);

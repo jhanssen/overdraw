@@ -16,7 +16,7 @@ import { dirname, join } from "node:path";
 
 import { createWm } from "../wm/index.js";
 import type { Addon, EventsByInterface, EventSenders } from "../types.js";
-import type { Ctx, CompositorState } from "./ctx.js";
+import type { Ctx, CompositorState, FocusOptions } from "./ctx.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const genDir = join(__dirname, "..", "protocols-gen");
@@ -61,14 +61,23 @@ async function loadSignatures(): Promise<Map<string, SignatureModule>> {
 
 export interface Output { width: number; height: number; }
 
+export interface InstallOptions {
+  output?: Output;
+  // Keyboard focus policy (interim config point until a real config system
+  // exists). Defaults to follow-pointer + focus-on-map.
+  focus?: FocusOptions;
+}
+
 // Wire the protocol layer onto a started server. `addon` is the native module
-// (already had startServer() called). `output` is the compositor output's
+// (already had startServer() called). `opts.output` is the compositor output's
 // logical size (from addon.start()); placement uses it. Returns the shared
 // compositor state for inspection/testing.
 export async function installProtocols(
   addon: Addon,
-  output: Output = { width: 1920, height: 1080 },
+  opts: InstallOptions = {},
 ): Promise<CompositorState> {
+  const output = opts.output ?? { width: 1920, height: 1080 };
+  const focusOpts: FocusOptions = opts.focus ?? { policy: "follow-pointer", focusOnMap: true };
   const mods = await loadSignatures();
 
   // Register every interface's signature so cross-references resolve (the
@@ -140,12 +149,19 @@ export async function installProtocols(
     wl_callback: {}, // event-only (done); no requests to dispatch
   };
 
+  // wl_seat needs the focus options, so instantiate it explicitly (the generic
+  // factory call below would not pass them).
+  const globalHandlers: Record<string, object> = {
+    wl_seat: seatMod.default(ctx, focusOpts),
+  };
+
   for (const name of CHILD_INTERFACES) {
     const handler = childHandlers[name] ?? handlerMods[name].default(ctx);
     addon.registerInterface(name, handler);
   }
   for (const name of GLOBALS) {
-    addon.createGlobal(name, handlerMods[name].default(ctx));
+    const handler = globalHandlers[name] ?? handlerMods[name].default(ctx);
+    addon.createGlobal(name, handler);
   }
 
   return state;

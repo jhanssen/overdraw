@@ -99,11 +99,35 @@ export interface SeatFocus {
   rect: { x: number; y: number; width: number; height: number };
 }
 
+// Keyboard focus policy. Pointer events (wl_pointer enter/leave/motion) always
+// follow the pointer regardless; only *keyboard* focus is governed by this.
+//   "follow-pointer": keyboard focus tracks the surface under the pointer.
+//   "click-to-focus": keyboard focus changes only on pointer button press, and
+//                     persists when the pointer moves away.
+export type FocusPolicy = "follow-pointer" | "click-to-focus";
+
+export interface FocusOptions {
+  policy: FocusPolicy;
+  // Give keyboard focus to a window when it maps. Helps both policies (under
+  // follow-pointer it covers the case where a window maps under a stationary
+  // pointer and would otherwise never get a motion event to focus it).
+  focusOnMap: boolean;
+}
+
 export interface SeatState {
   pointersByClient: Map<number, Set<Resource>>;
   keyboardsByClient: Map<number, Set<Resource>>;
+  // Pointer focus: the surface under the pointer (drives wl_pointer events).
+  // Follows the pointer (correct Wayland semantics for pointer events).
   focus: SeatFocus | null;
+  // Keyboard focus: the active surface for wl_keyboard events. Set by click and
+  // on map (click-to-focus + focus-on-map), independent of pointer position.
+  kbFocus: SeatFocus | null;
   handleInput(ev: import("../types.js").InputEvent): void;
+  // Give keyboard focus to a freshly-mapped window (focus-on-map). Called by the
+  // WM from mapWindow.
+  focusWindow(surfaceId: number, surfaceRec: { resource: Resource },
+              rect: { x: number; y: number; width: number; height: number }): void;
 }
 
 export interface Ctx {
