@@ -4,7 +4,7 @@ Tracks what is built and empirically proven versus what is still design only.
 The design itself lives in `architecture.md`; this file is the ground truth for
 "what exists right now."
 
-Last updated: 2026-05-30 (rev 9).
+Last updated: 2026-05-30 (rev 10).
 
 ## Verification environment
 
@@ -68,9 +68,9 @@ server) topology runs as real, non-spike code and presents to a host window:
   model. "JS owns this" per the design has not started beyond the entry script.
 - `wl_event_loop` (server-side Wayland) integration does not exist — there is no
   Wayland server yet. No resize handling. Host *input* arrives in the core (see
-  "Host input forwarding") and **pointer** input is routed to clients via
-  `wl_seat`/`wl_pointer` (see "Pointer input routing"); keyboard routing is not
-  built.
+  "Host input forwarding") and both **pointer and keyboard** input are routed to
+  clients via `wl_seat`/`wl_pointer`/`wl_keyboard` (see "Input routing to
+  clients").
 
 ### Host input forwarding (host seat -> GPU process -> core -> JS, verified)
 Host pointer/keyboard events reach the core as normalized events. The seam is a
@@ -110,33 +110,43 @@ without touching anything above it.
   mapping waits on resize/scale handling). Touch not forwarded. No keymap
   translation (raw evdev codes only).
 
-### Pointer input routing to clients (wl_seat / wl_pointer, verified)
-A real Wayland client receives mouse events on its surface — the phase-1
-interactivity goal (connect → place → receive input) is met for pointer.
+### Input routing to clients (wl_seat / wl_pointer / wl_keyboard, verified)
+A real Wayland client receives mouse AND keyboard events on its surface — the
+phase-1 interactivity goal (connect → place → receive input) is met for both.
 
-- `src/protocols/wl_seat.js`: the `wl_seat` global advertises **pointer**
-  capability; the seat module tracks `wl_pointer` resources per client and routes
-  the normalized `onInput` stream. `handleInput` hit-tests the WM window stack
-  (`wm.windowAt`), tracks focus, and emits `wl_pointer`
-  enter/leave/motion/button/axis/frame to the `wl_pointer`(s) of the client that
-  owns the focused surface, with **surface-local** coordinates. `wl_pointer`/
-  `wl_keyboard` are registered as child interfaces (release/set_cursor handled;
-  keyboard is NOT routed yet).
+- `src/protocols/wl_seat.ts`: the `wl_seat` global advertises **pointer +
+  keyboard** capability; the seat module tracks `wl_pointer`/`wl_keyboard`
+  resources per client and routes the normalized `onInput` stream. `handleInput`
+  hit-tests the WM window stack (`wm.windowAt`), tracks focus, and emits
+  `wl_pointer` enter/leave/motion/button/axis/frame and `wl_keyboard`
+  enter/leave/key/modifiers to the resources of the client that owns the focused
+  surface, with **surface-local** pointer coordinates. Keyboard focus follows
+  pointer focus (focus-follows-mouse) for this phase — a deliberate v1
+  simplification, not a real WM focus policy.
 - `Trampoline::clientIdOf` + addon `clientId(resource)`: a stable per-client id
-  (the `wl_client*`) lets JS associate the focused surface with the right
-  client's pointer without exposing `wl_client` to JS.
+  (the `wl_client*`) associates the focused surface with the right client's
+  input resources without exposing `wl_client` to JS.
 - WM hit-test: `mapWindow` records the effective window size (committed buffer
   dims when the placement stub leaves size 0) so `windowAt` has real bounds.
-- `onInput` is wired through `installProtocols`' returned
-  `state.seat.handleInput` (start() runs before installProtocols, so the
-  callback delegates to the seat once it exists).
-- Verified interactively (`test/compositing-eyeball.mjs` + `test/color-client.c`
-  which logs pointer events): hovering/clicking two windows produces correct
-  per-window enter/leave, surface-local motion, and button events in the owning
-  client. **PASS.**
-- Not built: keyboard routing (needs the still-stubbed trampoline fd *encode*
-  for `wl_keyboard.keymap` + xkbcommon), client cursor surfaces (`set_cursor` is
-  a no-op; no software cursor), touch, multi-seat, axis source/discrete refinement.
+- `onInput` is wired through `installProtocols`' returned `state.seat.handleInput`.
+- **Keyboard keymap + modifiers** (`native/wayland/keymap.{h,cpp}`, xkbcommon):
+  a default keymap is compiled and serialized to a sealed memfd; `get_keyboard`
+  sends it via `wl_keyboard.keymap` (XKB_V1). Each host key feeds the xkb state
+  (`xkb_state_update_key`, evdev+8) and the serialized modifier masks are emitted
+  via `wl_keyboard.modifiers`. The keymap fd is delivered as a `WaylandFd` and
+  encoded into the event via the now-implemented trampoline fd-**encode** path
+  (`postEvent` 'h' takes the raw fd from the WaylandFd, libwayland dups it into
+  the wire, we close our copy).
+- Verified interactively (`test/compositing-eyeball.mjs` + `test/color-client.c`):
+  hovering/clicking produces correct per-window pointer enter/leave + surface-
+  local motion + buttons; the client receives a readable keymap (mmap shows
+  `xkb_keymap {`); typing routes key press/release to the focused client with
+  **correct modifier masks** (Shift → dep bit 0, Alt → dep bit 3, cleared on
+  release); keyboard focus tracks the pointer. **PASS.**
+- Not built: client cursor surfaces (`set_cursor` is a no-op; no software
+  cursor), touch, multi-seat, click-to-focus / keyboard focus independent of the
+  pointer, key-repeat generation (repeat_info sent; client repeats), axis
+  source/discrete refinement.
 
 ### Compositing (multi-surface: per-surface placement + stacking + blending)
 - A textured-quad pipeline composites client surfaces: shaders, sampler,
@@ -175,9 +185,8 @@ interactivity goal (connect → place → receive input) is met for pointer.
   wire work behind it (including buffer-map). Mailbox avoids that.
 - Still absent: per-surface transforms/opacity/rotation/scale, fractional scale,
   multi-output, damage, real WM/layout policy (placement is a cascade stub),
-  keyboard routing to clients, resize handling. Output logical size == host
-  window size (scale 1). Pointer routing to clients IS done (see "Pointer input
-  routing").
+  resize handling. Output logical size == host window size (scale 1). Pointer +
+  keyboard routing to clients IS done (see "Input routing to clients").
 
 ### Client shm buffers end-to-end (upload → composite → present, pixel-verified)
 A real Wayland client can map a window with content and have its pixels reach
@@ -319,18 +328,21 @@ interfaces built at runtime from the generator metadata (no per-protocol C):
   invalidated. This validates the generator metadata against real wire traffic.
 
 Trampoline gaps (implemented or not):
-- `fd` request-arg **decode** is implemented (native-owned handle path): on
-  decode the fd is `dup`'d into a per-trampoline table and JS receives an opaque
-  integer handle; `addon.fdTake(handle)` transfers the raw fd out (caller
-  closes), `addon.fdClose(handle)` drops it; untaken fds close on trampoline
-  teardown. The `dup`-on-receipt is correct regardless of libwayland's
-  dispatch-time fd ownership (which was not separately resolved). Proven with a
-  real client over `wl_shm.create_pool` (`test/fd-test-client.c` +
-  `test/fd-passing-smoke.mjs`): the server reads back the client's marker bytes
-  from the received fd. This is the buffer-fd handle path
-  (architecture.md "Fds stay in C++"); the read/write `WaylandFd` wrapper for
-  data-transfer fds (pipes, keymaps) is still unbuilt. `fd` **encode** (events
-  carrying fds) is still stubbed (`-1`).
+- `fd` request-arg **decode** is implemented via the `WaylandFd` wrapper
+  (`native/wayland/wayland_fd.{h,cpp}`): on decode the fd is `dup`'d and handed
+  to JS as a `WaylandFd` object that owns it (state OPEN/TAKEN/CLOSED in a napi
+  external; finalizer closes iff still OPEN, with a leak warning). JS calls
+  `fd.takeRawFd()` / `fd.close()`; native consumers call `takeWaylandFd()` to
+  pull the raw fd out by reference. There is no longer a native fd handle table
+  (the old `fdTake`/`fdClose` handle API was removed). Proven over
+  `wl_shm.create_pool` (`test/fd-passing-smoke.mjs`: server reads the client's
+  marker bytes via `takeRawFd`) and the shm/dmabuf e2e (native `takeWaylandFd` →
+  `mmap` / SCM_RIGHTS). The read/write methods on `WaylandFd` for data-transfer
+  fds (pipes) are declared but not implemented (no consumer yet).
+- `fd` **encode** (events carrying fds) is implemented: `postEvent` 'h' takes
+  the raw fd out of a `WaylandFd`, hands it to `wl_resource_post_event_array`
+  (which dups into the wire), then closes the copy. Proven by `wl_keyboard.keymap`
+  delivering a readable keymap memfd to real clients (see "Input routing").
 - `array` encode is proven on the wire (`xdg_toplevel.configure` sends a
   non-empty `states` `wl_array` of one uint32; the client receives 4 bytes
   decoding to `ACTIVATED`, asserting both byte length and value). `array`

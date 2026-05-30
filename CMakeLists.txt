@@ -18,6 +18,7 @@ pkg_check_modules(WAYLAND_CLIENT REQUIRED wayland-client)
 pkg_check_modules(WAYLAND_SERVER REQUIRED wayland-server)
 pkg_check_modules(GBM REQUIRED gbm)
 pkg_check_modules(LIBDRM REQUIRED libdrm)
+pkg_check_modules(XKBCOMMON REQUIRED xkbcommon)
 
 # Dawn is built -fno-rtti; match it to avoid typeinfo mismatches.
 add_compile_options($<$<COMPILE_LANGUAGE:CXX>:-fno-rtti>)
@@ -83,15 +84,16 @@ set_target_properties(overdraw_core PROPERTIES POSITION_INDEPENDENT_CODE ON)
 add_library(overdraw_native MODULE
     native/napi/addon.cpp
     native/wayland/trampoline.cpp
-    native/wayland/wayland_fd.cpp)
+    native/wayland/wayland_fd.cpp
+    native/wayland/keymap.cpp)
 set_target_properties(overdraw_native PROPERTIES
     PREFIX "" SUFFIX ".node")
 target_compile_definitions(overdraw_native PRIVATE
     NODE_GYP_MODULE_NAME=overdraw_native BUILDING_NODE_EXTENSION)
 target_include_directories(overdraw_native PRIVATE
-    ${IPC_INCLUDE} ${NATIVE_INCLUDE} ${NODE_INCLUDE_DIR})
+    ${IPC_INCLUDE} ${NATIVE_INCLUDE} ${NODE_INCLUDE_DIR} ${XKBCOMMON_INCLUDE_DIRS})
 target_link_libraries(overdraw_native PRIVATE
-    overdraw_core dawn::webgpu_dawn_wire pthread dl rt)
+    overdraw_core dawn::webgpu_dawn_wire ${XKBCOMMON_LIBRARIES} pthread dl rt)
 # N-API symbols (napi_*) are resolved from the host node process at load time;
 # a MODULE/shared object leaves them undefined at link by default.
 

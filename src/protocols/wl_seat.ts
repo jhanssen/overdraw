@@ -31,6 +31,28 @@ export default function makeSeat(ctx: Ctx): SeatHandler {
     if (!s) { s = new Set(); pointersByClient.set(clientId, s); }
     return s;
   }
+  function clientKeyboards(clientId: number): Set<Resource> {
+    let s = keyboardsByClient.get(clientId);
+    if (!s) { s = new Set(); keyboardsByClient.set(clientId, s); }
+    return s;
+  }
+  // wl_keyboard.enter carries a wl_array of currently-pressed keys; we send empty.
+  const EMPTY_KEYS = new Uint8Array(0);
+
+  function sendKbEnter(target: SeatFocus): void {
+    const serial = ctx.state.serial();
+    for (const k of clientKeyboards(target.clientId)) {
+      if (k.destroyed) continue;
+      ctx.events.wl_keyboard.send_enter(k, serial, target.surfaceRec.resource, EMPTY_KEYS);
+    }
+  }
+  function sendKbLeave(target: SeatFocus): void {
+    const serial = ctx.state.serial();
+    for (const k of clientKeyboards(target.clientId)) {
+      if (k.destroyed) continue;
+      ctx.events.wl_keyboard.send_leave(k, serial, target.surfaceRec.resource);
+    }
+  }
 
   // Find the topmost window under an output-space point, returning a focus
   // target (surface + client id + rect), or null.
@@ -71,9 +93,11 @@ export default function makeSeat(ctx: Ctx): SeatHandler {
         const x = ev.x ?? 0;
         const y = ev.y ?? 0;
         const hit = pick(x, y);
-        // Focus change: leave the old surface, enter the new one.
+        // Focus change: leave the old surface, enter the new one. Keyboard focus
+        // follows pointer focus (focus-follows-mouse) for this phase.
         if (seat.focus && (!hit || hit.surfaceId !== seat.focus.surfaceId)) {
           sendLeave(seat.focus);
+          sendKbLeave(seat.focus);
           seat.focus = null;
         }
         if (!hit) return;
@@ -82,6 +106,7 @@ export default function makeSeat(ctx: Ctx): SeatHandler {
         if (!seat.focus) {
           seat.focus = hit;
           sendEnter(hit, sx, sy);
+          sendKbEnter(hit);
         } else {
           for (const p of clientPointers(hit.clientId)) {
             if (p.destroyed) continue;
@@ -92,7 +117,7 @@ export default function makeSeat(ctx: Ctx): SeatHandler {
         break;
       }
       case "pointerLeave": {
-        if (seat.focus) { sendLeave(seat.focus); seat.focus = null; }
+        if (seat.focus) { sendLeave(seat.focus); sendKbLeave(seat.focus); seat.focus = null; }
         break;
       }
       case "pointerButton": {
@@ -117,8 +142,26 @@ export default function makeSeat(ctx: Ctx): SeatHandler {
         }
         break;
       }
-      // pointerFrame from the host is coalesced into our per-event frames above;
-      // keyboard* not routed yet (needs keymap fd + xkbcommon).
+      case "keyboardKey": {
+        if (!seat.focus) return;
+        // Feed xkb state (drives modifiers) and send key + updated modifiers to
+        // the focused client's keyboard(s). Raw evdev keycode; client interprets
+        // via the keymap.
+        const pressed = !!ev.pressed;
+        const mods = ctx.addon.keyUpdate(ev.key ?? 0, pressed);
+        const keySerial = ctx.state.serial();
+        const state = pressed ? 1 : 0;
+        for (const k of clientKeyboards(seat.focus.clientId)) {
+          if (k.destroyed) continue;
+          ctx.events.wl_keyboard.send_key(k, keySerial, ev.time, ev.key ?? 0, state);
+          const modSerial = ctx.state.serial();
+          ctx.events.wl_keyboard.send_modifiers(
+            k, modSerial, mods.modsDepressed, mods.modsLatched, mods.modsLocked, mods.group);
+        }
+        break;
+      }
+      // keyboardModifiers from the host is not forwarded separately; we derive
+      // modifiers from key events via xkb. pointerFrame is coalesced above.
       default:
         break;
     }
@@ -127,9 +170,9 @@ export default function makeSeat(ctx: Ctx): SeatHandler {
   ctx.state.seat = { pointersByClient, keyboardsByClient, focus: null, handleInput };
 
   return {
-    // Global bind: advertise capabilities. Pointer only for now.
+    // Global bind: advertise pointer + keyboard capabilities.
     bind(resource) {
-      ctx.events.wl_seat.send_capabilities(resource, CAP.pointer);
+      ctx.events.wl_seat.send_capabilities(resource, CAP.pointer | CAP.keyboard);
       ctx.events.wl_seat.send_name(resource, "seat0");
     },
     get_pointer(resource, pointer) {
@@ -139,10 +182,16 @@ export default function makeSeat(ctx: Ctx): SeatHandler {
     },
     get_keyboard(resource, keyboard) {
       const clientId = ctx.addon.clientId(resource);
-      let s = keyboardsByClient.get(clientId);
-      if (!s) { s = new Set(); keyboardsByClient.set(clientId, s); }
-      s.add(keyboard);
-      // No keymap sent yet; keyboard input is not routed in this phase.
+      clientKeyboards(clientId).add(keyboard);
+      keyboard.__clientId = clientId;
+      // Send the keymap so the client can interpret keycodes. Each client gets
+      // its own dup of the memfd (a WaylandFd; send_keymap takes the raw fd out).
+      const km = ctx.addon.keymapInfo();
+      if (km) {
+        ctx.events.wl_keyboard.send_keymap(keyboard, km.format, km.fd, km.size);
+      }
+      // wl_keyboard v4+ may expect repeat_info; send a sane default.
+      ctx.events.wl_keyboard.send_repeat_info(keyboard, 25, 600);
     },
     get_touch(_resource, _touch) {},
     release(_resource) {},

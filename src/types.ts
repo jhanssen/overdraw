@@ -13,8 +13,9 @@
 import type { Resource, WaylandFd } from "#protocols-gen/wayland-types.js";
 export type { Resource, ResourceOf, WaylandFd } from "#protocols-gen/wayland-types.js";
 
-// Wayland event-sender args: wire scalars, a resource, an array buffer, or null.
-export type EventArg = number | string | Resource | Uint8Array | null;
+// Wayland event-sender args: wire scalars, a resource, a WaylandFd (event fd
+// args like wl_keyboard.keymap), an array buffer, or null.
+export type EventArg = number | string | Resource | WaylandFd | Uint8Array | null;
 // One interface's generated event senders (e.g. { send_capabilities, send_name }).
 export type EventSenders = Record<string, (...args: EventArg[]) => unknown>;
 // The per-interface event-sender set: interfaceName -> its senders.
@@ -35,6 +36,12 @@ export interface Addon {
   createGlobal(name: string, handler: unknown): void;
   postEvent(resource: Resource, opcode: number, args: unknown[]): void;
   clientId(resource: Resource): number;
+
+  // Keyboard: keymap memfd (as a WaylandFd) + xkb modifier state.
+  keymapInfo(): { fd: WaylandFd; format: number; size: number } | null;
+  keyUpdate(evdevKey: number, pressed: boolean): {
+    modsDepressed: number; modsLatched: number; modsLocked: number; group: number;
+  };
 
   // Surface bridge / compositor.
   commitSurfaceBuffer(id: number, poolId: number, offset: number, w: number,

@@ -182,6 +182,9 @@ bool Trampoline::postEvent(napi_value resourceHandle, uint32_t opcode, napi_valu
     // stay stable as we append.
     std::vector<wl_array> arrKeep;
     arrKeep.reserve(n);
+    // Fds extracted for 'h' args: kept valid through the post call, then closed
+    // (wl_resource_post_event_array dups into the wire; we still own ours).
+    std::vector<int> fdKeep;
     int ai = 0;
     for (const char* p = ev->signature; *p && ai < static_cast<int>(n); ++p) {
         if (*p >= '0' && *p <= '9') continue;
@@ -240,13 +243,25 @@ bool Trampoline::postEvent(napi_value resourceHandle, uint32_t opcode, napi_valu
                 wargs[ai].a = &arrKeep.back();
                 break;
             }
-            case 'h': wargs[ai].h = -1; break;       // fd events: later
+            case 'h': {
+                // Outgoing fd arg (e.g. wl_keyboard.keymap). JS passes a
+                // WaylandFd; take the raw fd out and hand it to libwayland, which
+                // dups it into the wire connection on post. We then own (and
+                // close) our copy after the post.
+                int fd = takeWaylandFd(env, v);
+                fdKeep.push_back(fd);
+                wargs[ai].h = fd;
+                break;
+            }
             default: wargs[ai].u = 0; break;
         }
         ++ai;
     }
 
     wl_resource_post_event_array(resource, opcode, wargs.data());
+
+    // libwayland dup'd any fd args into the wire; close our copies.
+    for (int fd : fdKeep) if (fd >= 0) ::close(fd);
     return true;
 }
 

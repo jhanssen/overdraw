@@ -22,6 +22,7 @@ static struct wl_shm* shm = NULL;
 static struct xdg_wm_base* wm_base = NULL;
 static struct wl_seat* seat = NULL;
 static struct wl_pointer* pointer = NULL;
+static struct wl_keyboard* keyboard = NULL;
 static const char* g_title = "color";
 static int configured = 0;
 static volatile sig_atomic_t running = 1;
@@ -85,11 +86,52 @@ static const struct wl_pointer_listener ptListener = {
     ptAxisSrc, ptAxisStop, ptAxisDisc, ptAxisV120, ptAxisDir,
 };
 
+// Keyboard listener: log keymap + key/modifier events.
+static void kbKeymap(void* d, struct wl_keyboard* k, uint32_t format, int32_t fd, uint32_t size) {
+    (void)d;(void)k;
+    printf("[client %s] keyboard KEYMAP format=%u fd=%d size=%u\n", g_title, format, fd, size);
+    if (fd >= 0) {
+        // Map it to prove the fd is real + readable (xkb_v1 text starts with "xkb").
+        void* m = mmap(NULL, size, PROT_READ, MAP_PRIVATE, fd, 0);
+        if (m != MAP_FAILED) {
+            printf("[client %s] keymap first bytes: %.16s\n", g_title, (const char*)m);
+            munmap(m, size);
+        }
+        close(fd);
+    }
+}
+static void kbEnter(void* d, struct wl_keyboard* k, uint32_t serial, struct wl_surface* s, struct wl_array* keys) {
+    (void)d;(void)k;(void)serial;(void)s;(void)keys;
+    printf("[client %s] keyboard ENTER\n", g_title);
+}
+static void kbLeave(void* d, struct wl_keyboard* k, uint32_t serial, struct wl_surface* s) {
+    (void)d;(void)k;(void)serial;(void)s;
+    printf("[client %s] keyboard LEAVE\n", g_title);
+}
+static void kbKey(void* d, struct wl_keyboard* k, uint32_t serial, uint32_t time, uint32_t key, uint32_t state) {
+    (void)d;(void)k;(void)serial;(void)time;
+    printf("[client %s] keyboard KEY %u %s\n", g_title, key, state ? "press" : "release");
+}
+static void kbMods(void* d, struct wl_keyboard* k, uint32_t serial, uint32_t dep, uint32_t lat, uint32_t lock, uint32_t grp) {
+    (void)d;(void)k;(void)serial;
+    printf("[client %s] keyboard MODS dep=%u lat=%u lock=%u grp=%u\n", g_title, dep, lat, lock, grp);
+}
+static void kbRepeat(void* d, struct wl_keyboard* k, int32_t rate, int32_t delay) {
+    (void)d;(void)k;(void)rate;(void)delay;
+}
+static const struct wl_keyboard_listener kbListener = {
+    kbKeymap, kbEnter, kbLeave, kbKey, kbMods, kbRepeat,
+};
+
 static void seatCaps(void* d, struct wl_seat* s, uint32_t caps) {
     (void)d;
     if ((caps & WL_SEAT_CAPABILITY_POINTER) && !pointer) {
         pointer = wl_seat_get_pointer(s);
         wl_pointer_add_listener(pointer, &ptListener, NULL);
+    }
+    if ((caps & WL_SEAT_CAPABILITY_KEYBOARD) && !keyboard) {
+        keyboard = wl_seat_get_keyboard(s);
+        wl_keyboard_add_listener(keyboard, &kbListener, NULL);
     }
 }
 static void seatName(void* d, struct wl_seat* s, const char* n) { (void)d;(void)s;(void)n; }

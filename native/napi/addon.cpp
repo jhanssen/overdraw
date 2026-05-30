@@ -24,6 +24,7 @@
 #include "wayland/interface_registry.h"
 #include "wayland/trampoline.h"
 #include "wayland/wayland_fd.h"
+#include "wayland/keymap.h"
 
 using overdraw::core::Compositor;
 using overdraw::core::InputEvent;
@@ -39,6 +40,7 @@ using overdraw::wayland::InterfaceDesc;
 using overdraw::wayland::MessageDesc;
 using overdraw::wayland::ArgDesc;
 using overdraw::wayland::Trampoline;
+using overdraw::wayland::Keymap;
 
 namespace {
 
@@ -48,6 +50,7 @@ struct Addon {
     std::unique_ptr<InterfaceRegistry> registry;
     std::unique_ptr<Trampoline> trampoline;
     std::unique_ptr<WaylandInputBackend> input;
+    std::unique_ptr<Keymap> keymap;  // xkbcommon keymap + modifier state
     ShmRegistry shm;  // wl_shm pool mappings (CPU-side, independent of the loop)
     uv_poll_t wirePoll{};
     uv_poll_t inputPoll{};
@@ -486,6 +489,54 @@ napi_value ClientId(napi_env env, napi_callback_info info) {
     return out;
 }
 
+// keymapInfo() -> { fd: WaylandFd, format, size } | null
+// The keymap is built lazily on first call. Each call returns a fresh dup of the
+// keymap memfd wrapped as a WaylandFd (each client gets its own to mmap).
+napi_value KeymapInfo(napi_env env, napi_callback_info) {
+    if (!g_addon.keymap) {
+        auto km = std::make_unique<Keymap>();
+        if (!km->init()) {
+            napi_value n; napi_get_null(env, &n); return n;
+        }
+        g_addon.keymap = std::move(km);
+    }
+    int fd = g_addon.keymap->dupFd();
+    if (fd < 0) { napi_value n; napi_get_null(env, &n); return n; }
+    napi_value obj; napi_create_object(env, &obj);
+    napi_set_named_property(env, obj, "fd", overdraw::wayland::makeWaylandFd(env, fd));
+    napi_value fmt; napi_create_uint32(env, g_addon.keymap->format(), &fmt);
+    napi_set_named_property(env, obj, "format", fmt);
+    napi_value sz; napi_create_uint32(env, g_addon.keymap->size(), &sz);
+    napi_set_named_property(env, obj, "size", sz);
+    return obj;
+}
+
+// keyUpdate(evdevKey, pressed) -> { modsDepressed, modsLatched, modsLocked, group }
+// Feeds the key into the xkb state and returns the resulting modifier masks for
+// wl_keyboard.modifiers. Returns zeros if the keymap is not built.
+napi_value KeyUpdate(napi_env env, napi_callback_info info) {
+    size_t argc = 2; napi_value argv[2];
+    napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+    uint32_t key = 0; bool pressed = false;
+    if (argc >= 1) napi_get_value_uint32(env, argv[0], &key);
+    if (argc >= 2) napi_get_value_bool(env, argv[1], &pressed);
+    uint32_t dep = 0, lat = 0, lock = 0, grp = 0;
+    if (g_addon.keymap) {
+        g_addon.keymap->updateKey(key, pressed);
+        g_addon.keymap->modifiers(dep, lat, lock, grp);
+    }
+    napi_value obj; napi_create_object(env, &obj);
+    auto setU = [&](const char* k, uint32_t val) {
+        napi_value n; napi_create_uint32(env, val, &n);
+        napi_set_named_property(env, obj, k, n);
+    };
+    setU("modsDepressed", dep);
+    setU("modsLatched", lat);
+    setU("modsLocked", lock);
+    setU("group", grp);
+    return obj;
+}
+
 // shmCreatePool(fd, size) -> poolId (0 on failure)
 // `fd` is a WaylandFd; we take the raw fd out of it (transferring ownership) and
 // mmap it.
@@ -677,6 +728,8 @@ napi_value Init(napi_env env, napi_value exports) {
     reg("setSurfaceLayout", SetSurfaceLayout);
     reg("setStack", SetStack);
     reg("clientId", ClientId);
+    reg("keymapInfo", KeymapInfo);
+    reg("keyUpdate", KeyUpdate);
     reg("surfaceReadback", SurfaceReadback);
 
     napi_set_named_property(env, exports, "start", fnStart);
