@@ -20,6 +20,13 @@ versus what is still design only, see `status.md`.
 - Wayland is the *external* protocol for normal clients (browsers,
   terminals, toolkit applications). Plugins do *not* use Wayland; they use
   an internal SDK.
+- Goal: run Wayland apps generally, **including** clients that present via a
+  Vulkan/EGL swapchain on their `wl_surface` (Vulkan WSI), not only clients
+  that submit shm/dmabuf buffers. WSI clients do not run yet — this is an
+  unbuilt feature, not a scope exclusion. See `status.md` ("Vulkan-WSI
+  clients do NOT run yet"). The rendering section below describes only the
+  buffer-submission path because that is what is designed/built so far; its
+  silence on WSI is not a decision to exclude it.
 
 ## Process topology
 

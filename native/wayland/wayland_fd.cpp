@@ -2,6 +2,7 @@
 
 #include <cstdio>
 
+#include <fcntl.h>
 #include <unistd.h>
 
 namespace overdraw::wayland {
@@ -123,6 +124,12 @@ int takeWaylandFd(napi_env env, napi_value obj) {
     st->taken = true;
     st->fd = -1;
     return fd;
+}
+
+int peekWaylandFd(napi_env env, napi_value obj) {
+    WaylandFdState* st = stateOf(env, obj);
+    if (!st || st->taken || st->closed || st->fd < 0) return -1;
+    return ::fcntl(st->fd, F_DUPFD_CLOEXEC, 0);  // caller owns the dup; wrapper keeps its fd
 }
 
 }  // namespace overdraw::wayland

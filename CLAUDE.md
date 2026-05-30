@@ -3,6 +3,28 @@
 Project-specific operational notes. Design lives in `docs/architecture.md`;
 ground-truth status in `docs/status.md`.
 
+## Debugging discipline (read first)
+
+- **Surface architectural problems; do not patch over them.** If a bug's real
+  cause is structural (e.g. a missing buffer-release lifecycle, a synchronous
+  call blocking the event loop, no completion signal for GPU work), STOP and
+  tell the user plainly: "this is an architectural problem — here is the
+  fundamental issue." Do not stack symptomatic patches (timer guesses, eager
+  releases, retry bumps) hoping one sticks. A string of small fixes that each
+  "help a bit" but don't resolve it is the signature of papering over a design
+  flaw — name it instead. Burning hundreds of thousands of tokens iterating on
+  patches is the failure mode to avoid.
+- **When you catch yourself theorizing in a loop, get ground truth instead of
+  guessing.** After ~2 hypotheses that don't pan out, proactively ask the user
+  to run under gdb (backtrace the suspect thread), or insert logging / counters /
+  timing and run it — rather than reasoning about what *might* be happening.
+  Measure, don't speculate. The user has the running system and a GPU; use them.
+  Prefer a single decisive experiment (gdb backtrace, a counter, a timing print,
+  a readback) over another round of plausible-sounding theory.
+- Empirical claims about the driver, Dawn, the client, or the kernel are
+  hypotheses until verified by a test in the current session. Verify before
+  building on them.
+
 ## Process management (GPU process)
 
 The compositor fork+execs a separate `overdraw-gpu-process`. When running tests

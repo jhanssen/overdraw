@@ -9,6 +9,8 @@
 #ifndef OVERDRAW_CORE_COMPOSITOR_H_
 #define OVERDRAW_CORE_COMPOSITOR_H_
 
+#include <sys/types.h>  // dev_t, pid_t
+
 #include <cstdint>
 #include <memory>
 #include <string>
@@ -38,10 +40,31 @@ class Compositor {
     uint32_t windowHeight() const { return windowHeight_; }
     uint64_t presented() const { return presented_; }
 
+    // linux-dmabuf-v1 default-feedback data captured from the GPU process during
+    // bring-up. `formatTableFd` is an owned read-only memfd of 16-byte
+    // {format,pad,modifier} records (mmap by the client); -1 if none was sent.
+    // `mainDevice` is the DRM device dev_t; `entryCount`/`formatTableSize`
+    // describe the table. The fd ownership transfers to the caller of
+    // takeDmabufFormatTableFd(); other fields are copyable accessors.
+    struct DmabufFeedback {
+        int formatTableFd = -1;
+        uint64_t mainDevice = 0;
+        uint32_t entryCount = 0;
+        uint32_t formatTableSize = 0;
+    };
+    const DmabufFeedback& dmabufFeedback() const { return dmabufFeedback_; }
+    // A fresh dup of the format_table memfd (caller owns/closes). -1 if none.
+    int dupDmabufFormatTableFd() const;
+
     int wireFd() const { return link_->wireFd(); }
 
     // Steady-state hooks (called from libuv handles in the addon).
     void drainWire() { link_->drainInbound(); }
+    // Drain the outbound wire queue when the wire fd is writable.
+    void wirePumpOut() { link_->pumpOut(); }
+    // True if wire bytes are queued awaiting a writable socket (the addon then
+    // arms UV_WRITABLE on the wire poll).
+    bool wireHasPendingOut() const { return link_->hasPendingOut(); }
     void renderFrame();
 
     // Upload a client surface's CPU pixels (BGRA8Unorm-equivalent, e.g. shm
@@ -61,7 +84,12 @@ class Compositor {
     // round-trip + wire pump).
     bool commitSurfaceDmabuf(uint32_t id, int fd, uint32_t width, uint32_t height,
                              uint32_t drmFourcc, uint64_t modifier,
-                             uint32_t offset, uint32_t stride);
+                             uint32_t offset, uint32_t stride, uint64_t bufferId);
+
+    // Drain the set of dmabuf bufferIds whose last sampling frame has completed
+    // on the GPU (so the client may reuse them). The caller (JS) sends
+    // wl_buffer.release for each. Empties the internal freed list.
+    void takeFreedBuffers(std::vector<uint64_t>& out);
 
     // Set a surface's layout rect in output pixels (top-left origin). w/h of 0
     // means "use the surface's content size". Placement is owned by JS; the
@@ -115,8 +143,21 @@ class Compositor {
         uint32_t layoutW = 0; // layout size in output pixels (0 => use content size)
         uint32_t layoutH = 0;
         bool present = false;
+        uint64_t currentBufferId = 0;  // dmabuf bufferId backing `texture` (0 = none/shm)
     };
     std::unordered_map<uint32_t, ClientSurface> clientSurfaces_;
+
+    // Dmabuf buffer-release lifecycle. A client dmabuf buffer is held (sampled
+    // directly, zero-copy) until the LAST frame that sampled it completes on the
+    // GPU. When a new buffer supersedes the current one, the old buffer "retires"
+    // tagged with the latest submit serial; its OnSubmittedWorkDone frees it.
+    uint64_t submitSerial_ = 0;                  // increments per composited frame
+    uint64_t completedSerial_ = 0;               // highest serial whose work is done
+    struct RetiringBuffer { uint64_t bufferId; uint64_t retireSerial;
+                            wgpu::Texture texture; };  // texture kept alive until freed
+    std::vector<RetiringBuffer> retiring_;       // awaiting GPU completion
+    std::vector<uint64_t> freed_;                // completed; JS drains via takeFreedBuffers
+    void reapRetiredBuffers();                   // move retiring_ -> freed_ by completedSerial_
 
     // Back-to-front draw order (surface ids). Surfaces not in the stack are not
     // drawn. JS owns this via setStack; ids not yet committed are tolerated.
@@ -128,6 +169,7 @@ class Compositor {
     uint32_t windowWidth_ = 0;
     uint32_t windowHeight_ = 0;
     uint64_t presented_ = 0;
+    DmabufFeedback dmabufFeedback_;  // formatTableFd owned; closed in shutdown()
     std::string error_;
 };
 

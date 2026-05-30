@@ -108,11 +108,15 @@ napi_value Trampoline::wrapResource(wl_resource* resource, const std::string& if
 
     napi_value obj;
     napi_create_object(env_, &obj);
-    napi_value ext, name;
+    napi_value ext, name, ver;
     napi_create_external(env_, resource, nullptr, nullptr, &ext);
     napi_create_string_utf8(env_, ifaceName.c_str(), NAPI_AUTO_LENGTH, &name);
+    napi_create_uint32(env_, static_cast<uint32_t>(wl_resource_get_version(resource)), &ver);
     napi_set_named_property(env_, obj, "__resource", ext);
     napi_set_named_property(env_, obj, "interfaceName", name);
+    // The version the client bound this resource at. Handlers must gate
+    // version-since events on this (sending a too-new event aborts the client).
+    napi_set_named_property(env_, obj, "version", ver);
 
     napi_ref ref;
     napi_create_reference(env_, obj, 1, &ref);

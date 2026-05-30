@@ -39,6 +39,11 @@ export interface CompositorState {
   toplevels?: Map<Resource, ToplevelRecord>;
   dmabufParams?: Map<Resource, DmabufParams>;
   subsurfaces?: Map<Resource, SubsurfaceRecord>;
+  // dmabuf release lifecycle: stable bufferId <-> wl_buffer maps. Native reports
+  // freed bufferIds (GPU read complete) and we release the matching wl_buffer.
+  dmabufBufferIds?: Map<Resource, number>;
+  dmabufById?: Map<number, Resource>;
+  nextBufferId?: number;
   [key: string]: unknown;
 }
 

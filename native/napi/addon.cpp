@@ -9,6 +9,7 @@
 #include <node_api.h>
 #include <uv.h>
 
+#include <sys/types.h>  // dev_t
 #include <unistd.h>
 
 #include <cstring>
@@ -239,9 +240,23 @@ void readMessages(napi_env env, napi_value arr, std::vector<MessageDesc>& out) {
     }
 }
 
-void onWireReadable(uv_poll_t*, int status, int) {
+void onWireReadable(uv_poll_t*, int status, int events);
+
+// Arm the wire poll for READABLE always, plus WRITABLE iff outbound wire bytes
+// are queued (so we get told when the socket can take more). Call after anything
+// that may have queued wire output.
+void armWirePoll() {
+    if (!g_addon.loopRunning || !g_addon.compositor) return;
+    int events = UV_READABLE;
+    if (g_addon.compositor->wireHasPendingOut()) events |= UV_WRITABLE;
+    uv_poll_start(&g_addon.wirePoll, events, onWireReadable);
+}
+
+void onWireReadable(uv_poll_t*, int status, int events) {
     if (status < 0 || !g_addon.compositor) return;
-    g_addon.compositor->drainWire();
+    if (events & UV_WRITABLE) g_addon.compositor->wirePumpOut();
+    if (events & UV_READABLE) g_addon.compositor->drainWire();
+    armWirePoll();  // update WRITABLE arming based on remaining queue
 }
 
 void onInputReadable(uv_poll_t*, int status, int) {
@@ -251,15 +266,16 @@ void onInputReadable(uv_poll_t*, int status, int) {
 
 void onFrameTimer(uv_timer_t*) {
     if (!g_addon.compositor) return;
+    // Dispatch client frame callbacks + dmabuf buffer releases FIRST, before
+    // rendering. renderFrame() calls GetCurrentTexture on the HOST swapchain,
+    // which can block/stall on host present pacing; if releases were gated
+    // behind it, a Vulkan-WSI client would starve in vkAcquireNextImageKHR
+    // whenever overdraw's own present stalled. Releasing first decouples the
+    // client's buffer recycling from overdraw's host present cadence.
+    notifyFrame();
+    g_addon.lastNotified = g_addon.compositor->presented();
     g_addon.compositor->renderFrame();
-    // Notify JS every frame: clients drive their render loop off wl_surface.frame
-    // callbacks, which the JS layer fires from this hook. (Was throttled to ~1Hz
-    // when onFrame was only a demo heartbeat; now it carries frame-callback
-    // dispatch, so it must run per frame.)
-    if (g_addon.compositor->presented() != g_addon.lastNotified) {
-        g_addon.lastNotified = g_addon.compositor->presented();
-        notifyFrame();
-    }
+    armWirePoll();  // renderFrame may have queued wire output (Submit/Present)
 }
 
 // start(gpuBinPath, onFrame?, onInput?) -> { width, height }
@@ -621,10 +637,10 @@ napi_value CommitSurfaceBuffer(napi_env env, napi_callback_info info) {
 // Take the client dmabuf fd (a WaylandFd) and import it as a sampled texture for
 // the surface. Returns false if the import is rejected.
 napi_value CommitSurfaceDmabuf(napi_env env, napi_callback_info info) {
-    size_t argc = 9; napi_value argv[9];
+    size_t argc = 10; napi_value argv[10];
     napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
-    if (argc < 9) return throwError(env,
-        "commitSurfaceDmabuf(surfaceId, fd, w, h, fourcc, modHi, modLo, offset, stride)");
+    if (argc < 10) return throwError(env,
+        "commitSurfaceDmabuf(surfaceId, fd, w, h, fourcc, modHi, modLo, offset, stride, bufferId)");
     if (!g_addon.compositor) return throwError(env, "compositor not running");
     uint32_t surfaceId = 0, w = 0, h = 0, fourcc = 0, modHi = 0, modLo = 0, offset = 0, stride = 0;
     napi_get_value_uint32(env, argv[0], &surfaceId);
@@ -635,13 +651,31 @@ napi_value CommitSurfaceDmabuf(napi_env env, napi_callback_info info) {
     napi_get_value_uint32(env, argv[6], &modLo);
     napi_get_value_uint32(env, argv[7], &offset);
     napi_get_value_uint32(env, argv[8], &stride);
-    int fd = overdraw::wayland::takeWaylandFd(env, argv[1]);  // ownership transfers; closed below
+    uint32_t bufferId = 0;
+    napi_get_value_uint32(env, argv[9], &bufferId);
+    // dmabuf wl_buffers are reused (re-attached) across many commits, so the fd
+    // must NOT be consumed -- dup it and keep the WaylandFd valid for next time.
+    int fd = overdraw::wayland::peekWaylandFd(env, argv[1]);
     if (fd < 0) { napi_value out; napi_get_boolean(env, false, &out); return out; }
     uint64_t modifier = (static_cast<uint64_t>(modHi) << 32) | modLo;
-    bool ok = g_addon.compositor->commitSurfaceDmabuf(surfaceId, fd, w, h, fourcc, modifier, offset, stride);
-    ::close(fd);  // GPU process dup'd it over SCM_RIGHTS; close our copy
+    bool ok = g_addon.compositor->commitSurfaceDmabuf(surfaceId, fd, w, h, fourcc, modifier,
+                                                      offset, stride, bufferId);
+    ::close(fd);  // GPU process dup'd it over SCM_RIGHTS; close our dup
     napi_value out; napi_get_boolean(env, ok, &out);
     return out;
+}
+
+// takeFreedBuffers() -> number[]  (dmabuf bufferIds whose GPU read completed)
+napi_value TakeFreedBuffers(napi_env env, napi_callback_info) {
+    napi_value arr; napi_create_array(env, &arr);
+    if (!g_addon.compositor) return arr;
+    std::vector<uint64_t> freed;
+    g_addon.compositor->takeFreedBuffers(freed);
+    for (size_t i = 0; i < freed.size(); ++i) {
+        napi_value v; napi_create_uint32(env, static_cast<uint32_t>(freed[i]), &v);
+        napi_set_element(env, arr, static_cast<uint32_t>(i), v);
+    }
+    return arr;
 }
 
 // removeSurface(surfaceId) -> undefined
@@ -721,6 +755,57 @@ napi_value SurfaceReadback(napi_env env, napi_callback_info info) {
     return out;
 }
 
+// dmabufFeedbackInfo() -> {
+//   formatTableFd: WaylandFd, formatTableSize, entryCount,
+//   mainDevice: Uint8Array(dev_t bytes), trancheFormats: Uint8Array(u16 indices)
+// } | null
+// Returns the GPU-process-supplied linux-dmabuf-v1 default-feedback data. The
+// fd is a fresh dup of the format_table memfd (caller owns; pass to
+// send_format_table). mainDevice/trancheFormats are pre-encoded byte arrays for
+// the 'a' (wl_array) event args. Returns null if the GPU process sent no
+// feedback data (then the caller falls back to the v3 format/modifier events).
+napi_value DmabufFeedbackInfo(napi_env env, napi_callback_info) {
+    if (!g_addon.compositor) { napi_value n; napi_get_null(env, &n); return n; }
+    const auto& fb = g_addon.compositor->dmabufFeedback();
+    if (fb.formatTableFd < 0 || fb.entryCount == 0) {
+        napi_value n; napi_get_null(env, &n); return n;
+    }
+    int fd = g_addon.compositor->dupDmabufFormatTableFd();
+    if (fd < 0) { napi_value n; napi_get_null(env, &n); return n; }
+
+    napi_value obj; napi_create_object(env, &obj);
+    napi_set_named_property(env, obj, "formatTableFd",
+                            overdraw::wayland::makeWaylandFd(env, fd));
+    napi_value sz; napi_create_uint32(env, fb.formatTableSize, &sz);
+    napi_set_named_property(env, obj, "formatTableSize", sz);
+    napi_value ec; napi_create_uint32(env, fb.entryCount, &ec);
+    napi_set_named_property(env, obj, "entryCount", ec);
+
+    // main_device: the dev_t as raw bytes (Wayland carries it as a byte array
+    // whose size the client asserts == sizeof(dev_t)).
+    {
+        dev_t dev = static_cast<dev_t>(fb.mainDevice);
+        napi_value ab; void* data;
+        napi_create_arraybuffer(env, sizeof(dev), &data, &ab);
+        std::memcpy(data, &dev, sizeof(dev));
+        napi_value ta;
+        napi_create_typedarray(env, napi_uint8_array, sizeof(dev), ab, 0, &ta);
+        napi_set_named_property(env, obj, "mainDevice", ta);
+    }
+    // tranche_formats: array of u16 indices [0 .. entryCount) into the table.
+    {
+        const size_t n = fb.entryCount;
+        napi_value ab; void* data;
+        napi_create_arraybuffer(env, n * sizeof(uint16_t), &data, &ab);
+        auto* idx = static_cast<uint16_t*>(data);
+        for (size_t i = 0; i < n; ++i) idx[i] = static_cast<uint16_t>(i);
+        napi_value ta;
+        napi_create_typedarray(env, napi_uint8_array, n * sizeof(uint16_t), ab, 0, &ta);
+        napi_set_named_property(env, obj, "trancheFormats", ta);
+    }
+    return obj;
+}
+
 napi_value Init(napi_env env, napi_value exports) {
     napi_value fnStart, fnStop, fnPresented, fnStartServer, fnStopServer;
     napi_create_function(env, "start", NAPI_AUTO_LENGTH, Start, nullptr, &fnStart);
@@ -746,6 +831,7 @@ napi_value Init(napi_env env, napi_value exports) {
     reg("shmBufferUnref", ShmBufferUnref);
     reg("commitSurfaceBuffer", CommitSurfaceBuffer);
     reg("commitSurfaceDmabuf", CommitSurfaceDmabuf);
+    reg("takeFreedBuffers", TakeFreedBuffers);
     reg("removeSurface", RemoveSurface);
     reg("setSurfaceLayout", SetSurfaceLayout);
     reg("setStack", SetStack);
@@ -753,6 +839,7 @@ napi_value Init(napi_env env, napi_value exports) {
     reg("keymapInfo", KeymapInfo);
     reg("keyUpdate", KeyUpdate);
     reg("surfaceReadback", SurfaceReadback);
+    reg("dmabufFeedbackInfo", DmabufFeedbackInfo);
 
     napi_set_named_property(env, exports, "start", fnStart);
     napi_set_named_property(env, exports, "stop", fnStop);

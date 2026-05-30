@@ -31,6 +31,12 @@ napi_value makeWaylandFd(napi_env env, int fd);
 // consumers (e.g. commitSurfaceDmabuf, shmCreatePool).
 int takeWaylandFd(napi_env env, napi_value obj);
 
+// Return a dup of the WaylandFd's fd WITHOUT consuming the wrapper (it stays
+// valid for reuse). Caller owns/closes the returned fd. -1 if invalid/taken.
+// Used for dmabuf wl_buffers, which a client re-attaches many times: the fd
+// must survive across commits, so the import path dups instead of taking.
+int peekWaylandFd(napi_env env, napi_value obj);
+
 }  // namespace overdraw::wayland
 
 #endif  // OVERDRAW_WAYLAND_WAYLAND_FD_H_

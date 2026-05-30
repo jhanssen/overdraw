@@ -32,6 +32,9 @@ declare const __iface: unique symbol;
 export interface Resource {
   readonly __resource: unknown;
   readonly interfaceName: string;
+  // Version the client bound this resource at. Gate version-'since' events on
+  // this; sending an event newer than the bound version aborts the client.
+  readonly version: number;
   destroyed: boolean;
   [key: string]: unknown;
 }

@@ -25,6 +25,18 @@ GpuProcess spawnGpuProcess(const char* binPath) {
         return out;
     }
 
+    // Enlarge the kernel socket buffers on the high-volume wire socket (both
+    // ends) so the OS keeps draining our queued bytes while we are busy with
+    // other work, rather than filling quickly and forcing an EAGAIN / wait for
+    // writable. We still buffer in userspace (the kernel buffer can always
+    // fill under enough load); this just makes that rarer. Best-effort: the
+    // kernel clamps to net.core.wmem_max/rmem_max, so failures are non-fatal.
+    const int wireBuf = 8 * 1024 * 1024;
+    for (int i = 0; i < 2; ++i) {
+        ::setsockopt(wireFds[i], SOL_SOCKET, SO_SNDBUF, &wireBuf, sizeof(wireBuf));
+        ::setsockopt(wireFds[i], SOL_SOCKET, SO_RCVBUF, &wireBuf, sizeof(wireBuf));
+    }
+
     const pid_t parentPid = ::getpid();  // for the child's fork-race death check
     pid_t pid = ::fork();
     if (pid < 0) {

@@ -51,6 +51,80 @@ server) topology runs as real, non-spike code and presents to a host window:
   `ImportClientTex` message carries a client dmabuf fd this way.)
 - Clean lifecycle: runs until `stop()`, then ordered shutdown; GPU process
   exits cleanly and is reaped (poll then SIGTERM fallback so it cannot orphan).
+- **Fully non-blocking IPC (both sockets, both ends).** No write may ever park:
+  a single-threaded peer blocked in `write()` (waiting for a full socket buffer
+  to drain) while the other waits to be read is a mutual deadlock — observed
+  under sustained WSI client traffic (GPU process parked in `FdSerializer::Flush`
+  → `write` while the core's commit waited for its reply). Now: all fds are
+  `O_NONBLOCK`; writers buffer what the socket can't take and drain on writable.
+  - `native/ipc/transport.h`: `FdSerializer` queues framed wire batches and
+    writes what fits (`Flush` never blocks; `pumpOut` drains on writable);
+    `FrameReader` accumulates partial reads into whole frames; `CtrlSender`
+    buffers SEQPACKET control datagrams (dup'ing fds when queued). Blocking
+    `sendMessage`/`sendMessageFds` shims remain for the one-shot startup/handshake
+    path only.
+  - GPU process: an **`EventLoop` abstraction** (`gpu-process/src/event_loop.h`)
+    with an **epoll** backend (`event_loop_epoll.cpp`) multiplexes wire / ctrl /
+    host-`wl_display` fds; arms `kWrite` only when wire output is queued. The
+    interface is backend-agnostic so a kqueue (BSD/macOS) backend can be added
+    later. Replaced the prior `usleep` spin. Steady-state loop ~190 Hz (not a
+    busy loop).
+  - Core: libuv `uv_poll` arms `UV_WRITABLE` on the wire fd only when output is
+    queued (`armWirePoll`), draining via `wirePumpOut`.
+  - Ordering hazard fixed: a ctrl request (`ImportClientTex`) must not overtake
+    the wire commands it depends on. Mechanism (traced through Dawn wire source,
+    verified): `WireClient::ReserveTexture` emits NO wire command — it just
+    allocates a client-side handle id, recycling freed ids with generation+1
+    (`client/ObjectStore.cpp`). When the core drops the previous reserved/injected
+    `wgpu::Texture`, `Client::Unregister` sends an `UnregisterObjectCmd` over the
+    WIRE and recycles that id at generation+1 (`client/Client.cpp:196`). The GPU's
+    server-side `InjectTexture` → `Allocate` requires the slot's recorded
+    generation to be **strictly less** than the injected handle's generation
+    (`server/ObjectStorage.h:243`), which holds only after the server has
+    processed that `UnregisterObjectCmd`. `ImportClientTex` travels over CTRL; if
+    it overtakes the still-queued wire UnregisterObjectCmd, the server slot still
+    has the old generation → `Allocate` FatalError → `InjectTexture failed`.
+    (NOT "the ReserveTexture command must arrive first" — there is no such
+    command; an earlier note here said that and was wrong.)
+  - Fixed with a **cross-channel wire serial** (no blocking): `FdSerializer`
+    counts cumulative framed wire bytes (`bytesQueued`); the core flushes the
+    reserve and tags `ImportClientTex` with that value (`Message.wireSerial`);
+    the GPU's `FrameReader` counts framed bytes consumed (`bytesConsumed`) and
+    **defers** the import (queued in `pendingImports`) until
+    `bytesConsumed >= wireSerial` — i.e. the prior `UnregisterObjectCmd` has been
+    handed to the wire server. Drained after every wire pump. This is an explicit
+    happens-before across the two sockets with no `write()`/poll blocking.
+    Verified: 0 `InjectTexture failed` across active + idle runs; an active run
+    sustained 146 commits / 142 releases with no starvation.
+  - Wire socket `SO_SNDBUF`/`SO_RCVBUF` enlarged to 8 MiB (`gpu_process.cpp`) so
+    the kernel keeps draining queued bytes while we are busy (userspace buffering
+    still covers the case where even that fills).
+- **Known remaining IPC wart (not a deadlock):** `commitSurfaceDmabuf` is still
+  synchronous — it blocks the Node event loop on the GPU import round-trip per
+  commit. Measured **~1.7 ms/call** on a Release/-O3 build (the 500 ms seen
+  earlier was a stray debug readback in the import path, since removed).
+  Deadlock-safe (writes never block), and fine for one client (~10% of the event
+  loop at 60fps), but it scales linearly: two 60fps clients ≈ 20%, and it will
+  slip frames / add input latency with several animating dmabuf surfaces. This is
+  the next scaling fix.
+  - **Plan (async commit), deferred to its own change:** `commitSurfaceDmabuf`
+    returns immediately after `ReserveTexture` + sending `ImportClientTex`; the
+    `ClientTexImported` reply is handled on the Node thread and finishes the
+    setup (bind group, present-enable, retire) + signals JS for map-on-first-
+    commit. PREREQUISITE: the core has **no steady-state ctrl-fd drain** today —
+    `ctrlFd_` is read only inside the synchronous bring-up/commit spins and is
+    NOT registered with libuv. Async commit needs a libuv `uv_poll` on `ctrlFd_`
+    dispatching `ClientTexImported` (and `EndDone`/`DeviceLost`/`Fault`, which
+    also currently have nowhere to be handled in steady state). Build that
+    ctrl-drain first, then split commit. Verify with 2–3 Release MB instances
+    under load, confirming per-commit event-loop occupancy drops to ~0.
+  - Further option (only if measured necessary): move the wire socket `write()`
+    off the Node thread to a writer worker. Serialization (Dawn `Flush`, not
+    thread-safe) stays on Node and produces framed bytes into the serializer's
+    existing `out_` queue; a worker drains `out_` to the socket (write-only —
+    inbound `HandleCommands` must stay on Node). The buffered transport already
+    makes this a clean producer/consumer seam. NOT done; no measured write-path
+    bottleneck yet (the cost was the round-trip wait, which async commit removes).
 
 ### JS layer / event loop (core is C++ + Node)
 - The core is C++ + Node as the architecture specifies. Node owns `main()` and
@@ -198,16 +272,65 @@ prints `WAYLAND_DISPLAY`, and runs until SIGINT.
   `Allocator::usableModifiers`) is unbuilt — cosmetic for kitty here, but the
   correct implementation of a currently-stubbed protocol.
 
-### Vulkan-WSI clients are NOT supported (architectural boundary)
+### Vulkan-WSI clients run (verified end-to-end on NVIDIA)
 A client that presents via a Vulkan/WebGPU **swapchain on its `wl_surface`**
 (Dawn `SurfaceSourceWaylandSurface` → `vkCreateWaylandSurfaceKHR` +
-`vkCreateSwapchainKHR`) cannot run: overdraw is a **buffer-submission** compositor
-(shm / `linux-dmabuf-v1` `create_immed`), not a Vulkan-WSI-presentable target. It
-does not expose the dmabuf feedback (full format table + main_device) / sync /
-presentation protocols the Vulkan driver's Wayland WSI requires. Such a client
-fails at `vkGetPhysicalDeviceSurfaceFormatsKHR` / `Surface.Configure()`. Making
-overdraw WSI-presentable is a large, separate effort with NVIDIA-driver-specific
-unknowns; clients must instead submit buffers (shm/dmabuf) to run today.
+`vkCreateSwapchainKHR`) now runs interactively under overdraw. Verified
+2026-05-30 with the MasterBandit terminal (Dawn/Vulkan WSI) on RTX 5060 / driver
+595.71.05: it configures its swapchain, renders text, updates live, and sustains
+continuous output without stalling. (An earlier revision of this file framed WSI
+support as an "architectural boundary / out of scope"; that was wrong. WSI
+clients are supported.)
+
+This took four distinct fixes, each verified:
+
+1. **Real dmabuf default-feedback** (`zwp_linux_dmabuf_v1` v4+ feedback). A
+   Vulkan WSI advertising dmabuf v4+ derives swapchain formats ONLY from feedback
+   (`format_table` + `tranche_formats`), ignoring the legacy `format`/`modifier`
+   events. overdraw previously stubbed feedback (`done` only) → empty format list
+   → `Surface.Configure(BGRA8Unorm)` rejected. Now the GPU process probes Dawn
+   (`GetFormatCapabilities` + `DawnDrmFormatCapabilities`) for each format, builds
+   the format_table (a sealed memfd, `{format u32, pad u32, modifier u64}`
+   records), and ships it + `main_device` (DRM render-node dev_t) to the core via
+   a `FeedbackData` side-channel message; the JS `zwp_linux_dmabuf_v1` handler
+   sends `format_table` + `main_device` + one tranche + `done`.
+   (`gpu-process/src/allocator.cpp` `probe`/`formatTable`, `gpu-process/src/main.cpp`
+   FeedbackData, `native/napi/addon.cpp` `dmabufFeedbackInfo`,
+   `src/protocols/zwp_linux_dmabuf_v1.ts` `sendFeedback`.)
+
+2. **Advertise BOTH the alpha and opaque DRM fourcc per format.** A BGRA8 swapchain
+   needs ARGB8888 **and** XRGB8888 advertised (the WSI picks the opaque sibling for
+   an opaque surface). overdraw mapped `BGRA8Unorm → ARGB8888` only; adding the
+   XRGB8888/XBGR8888/XBGR2101010 opaque variants (same modifiers) was the actual
+   fix for the `Configure` rejection (NOT a Vulkan-vs-GBM modifier conflict, which
+   was a mis-diagnosis). (`allocator.cpp` `fourccsFor`.)
+
+3. **wl_seat/wl_pointer/wl_keyboard event version gating.** The NVIDIA WSI binds
+   `wl_seat` at v1; overdraw sent `wl_seat.name` (since v2) / `wl_pointer.frame`
+   (v5) / `wl_keyboard.repeat_info` (v4) unconditionally, aborting the client
+   ("listener for opcode N is NULL"). Events are now gated on the resource's bound
+   version (exposed JS-side as `Resource.version`). (`native/wayland/trampoline.cpp`,
+   `src/protocols/wl_seat.ts`.)
+
+4. **dmabuf buffer-release lifecycle.** A swapchain client blocks in
+   `vkAcquireNextImageKHR` until the compositor releases buffers it has finished
+   reading. overdraw samples client dmabufs zero-copy, so a buffer can only be
+   released once the compositor frame that sampled it COMPLETES on the GPU. The
+   compositor now tags each frame's submit with a serial + `OnSubmittedWorkDone`;
+   a buffer superseded by a newer commit is freed once its retire-serial completes,
+   and the freed bufferIds are reported to JS which sends `wl_buffer.release`.
+   (`native/core/compositor.cpp` retiring_/freed_/`OnSubmittedWorkDone`,
+   `src/protocols/index.ts` release sweep via `takeFreedBuffers`.)
+
+The implicit-sync acquire (export the client dmabuf's read fence via
+`DMA_BUF_IOCTL_EXPORT_SYNC_FILE`, import as a Dawn `SharedFence`, wait on it in
+`BeginAccess`) is also implemented (`gpu-process/src/main.cpp`
+`exportDmabufAcquireFence`), mirroring wlroots' implicit-sync interop.
+
+Reference used: wlroots' Vulkan renderer (`render/vulkan/renderer.c`,
+implicit-sync interop) and Mesa's `src/vulkan/wsi/wsi_common_wayland.c` (the
+compositor-facing WSI contract). Hyprland's `LinuxDMABUF.cpp` was used to compare
+on-wire feedback.
 
 ### Compositing (multi-surface: per-surface placement + stacking + blending)
 - A textured-quad pipeline composites client surfaces: shaders, sampler,

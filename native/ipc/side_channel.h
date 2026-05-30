@@ -22,6 +22,9 @@ enum class Tag : uint8_t {
     InstanceReserved = 'I',  // core -> gpu : reserved instance handle
     DeviceReady  = 'S',  // core -> gpu : device handle + reserved surface handle
     SurfaceReady = 'C',  // gpu  -> core: surface injected + caps + size
+    FeedbackData = 'F',  // gpu  -> core: dmabuf-feedback data (main_device dev_t +
+                         //              format_table entry count); the format_table
+                         //              memfd rides as SCM_RIGHTS on the same msg
     ReserveTex   = 'R',  // core -> gpu : reserved texture+device handle + size/format
     TexInjected  = 't',  // gpu  -> core: dmabuf imported + texture injected (+ modifier)
     ImportClientTex = 'M',  // core -> gpu : import a CLIENT dmabuf fd (SCM_RIGHTS) into
@@ -73,6 +76,21 @@ struct Message {
     uint32_t planeStride = 0;  // plane 0 row stride
     uint32_t planeCount = 0;   // number of planes (1 supported today)
     uint32_t importOk = 0;     // ClientTexImported: 1 = injected, 0 = import failed
+
+    // FeedbackData: dmabuf-feedback default-feedback data. mainDevice is the DRM
+    // device dev_t; entryCount is the number of 16-byte format_table records in
+    // the memfd passed alongside (SCM_RIGHTS). formatTableSize is its byte size.
+    uint64_t mainDevice = 0;
+    uint32_t entryCount = 0;
+    uint32_t formatTableSize = 0;
+
+    // ImportClientTex: cross-channel ordering serial. The GPU process must not
+    // act on this request until its wire reader has consumed at least this many
+    // framed wire bytes (so all wire commands the inject depends on -- the prior
+    // texture's UnregisterObjectCmd that recycled this handle id, object creates,
+    // etc. -- have been handed to the wire server). Sampled by the core from
+    // FdSerializer::bytesQueued() right after flushing the reserve.
+    uint64_t wireSerial = 0;
 };
 
 constexpr uint32_t kProtocolVersion = 1;

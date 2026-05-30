@@ -37,6 +37,9 @@ class HostWindow {
 
     // Pumps queued Wayland events without blocking, then flushes.
     void pump();
+    // The host wl_display fd, for adding to an external event loop (wake on host
+    // events; pump() then does the prepare_read/read_events dance).
+    int displayFd() const;
 
     wl_display* display() const { return display_; }
     wl_surface* surface() const { return surface_; }

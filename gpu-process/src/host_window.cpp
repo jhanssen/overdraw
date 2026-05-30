@@ -175,6 +175,10 @@ void HostWindow::pump() {
     }
 }
 
+int HostWindow::displayFd() const {
+    return display_ ? wl_display_get_fd(display_) : -1;
+}
+
 void HostWindow::bindSeat(wl_seat* s) {
     seat_ = s;
     wl_seat_add_listener(seat_, &kSeatListener, this);

@@ -2,6 +2,7 @@
 
 #include <cstdio>
 #include <fcntl.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 #include <gbm.h>
@@ -10,16 +11,37 @@
 namespace overdraw::gpu {
 namespace {
 
-// Map a Dawn texture format to its DRM fourcc. The byte/channel order
+// Map a Dawn texture format to its DRM fourcc(s). The byte/channel order
 // convention: WGPU BGRA8Unorm stores B,G,R,A in memory -> DRM ARGB8888 (which
 // is little-endian B,G,R,A). RGBA8Unorm -> DRM ABGR8888.
-bool fourccFor(wgpu::TextureFormat fmt, uint32_t& out) {
+//
+// Each format yields BOTH the alpha and the opaque DRM fourcc where one exists
+// (e.g. ARGB8888 + XRGB8888), with identical modifiers. This matters: a Vulkan
+// WSI configuring a BGRA8Unorm swapchain selects the OPAQUE fourcc (XRGB8888)
+// for an opaque surface and the alpha one for alpha, and rejects the surface if
+// its chosen fourcc is absent. Advertising only the alpha variant is why a
+// swapchain Configure() previously failed.
+struct FourccPair { uint32_t alpha; uint32_t opaque; };  // opaque==0 if none
+bool fourccsFor(wgpu::TextureFormat fmt, FourccPair& out) {
     switch (fmt) {
-        case wgpu::TextureFormat::BGRA8Unorm: out = DRM_FORMAT_ARGB8888; return true;
-        case wgpu::TextureFormat::RGBA8Unorm: out = DRM_FORMAT_ABGR8888; return true;
+        case wgpu::TextureFormat::BGRA8Unorm:    out = {DRM_FORMAT_ARGB8888, DRM_FORMAT_XRGB8888}; return true;
+        case wgpu::TextureFormat::RGBA8Unorm:    out = {DRM_FORMAT_ABGR8888, DRM_FORMAT_XBGR8888}; return true;
+        case wgpu::TextureFormat::RGB10A2Unorm:  out = {DRM_FORMAT_ABGR2101010, DRM_FORMAT_XBGR2101010}; return true;
+        case wgpu::TextureFormat::RGBA16Float:   out = {DRM_FORMAT_ABGR16161616F, 0}; return true;
         default: return false;
     }
 }
+
+// The texture formats we probe for dmabuf import. Mirrors a GL compositor
+// enumerating every renderer-importable format; for Dawn this is the set of
+// render/sample formats with a DRM fourcc analog. BGRA8Unorm is primary (the
+// preferred swapchain format on Linux); the rest broaden client choice.
+constexpr wgpu::TextureFormat kProbeFormats[] = {
+    wgpu::TextureFormat::BGRA8Unorm,
+    wgpu::TextureFormat::RGBA8Unorm,
+    wgpu::TextureFormat::RGB10A2Unorm,
+    wgpu::TextureFormat::RGBA16Float,
+};
 
 }  // namespace
 
@@ -39,43 +61,65 @@ bool Allocator::open() {
         std::fprintf(stderr, "[gpu] gbm_create_device failed\n");
         return false;
     }
+    // Capture the device's dev_t for dmabuf-feedback main_device. Non-fatal if
+    // it fails; feedback main_device would then be 0 (clients tolerate it).
+    struct stat st{};
+    if (::fstat(drmFd_, &st) == 0) deviceId_ = st.st_rdev;
+    else std::perror("[gpu] fstat render node");
     return true;
 }
 
-bool Allocator::probe(const wgpu::Adapter& adapter, wgpu::TextureFormat format) {
-    if (!fourccFor(format, fourcc_)) {
-        std::fprintf(stderr, "[gpu] no fourcc for format %u\n",
-                     static_cast<uint32_t>(format));
-        return false;
-    }
-
-    // Dawn-importable modifier list for this format (server-side only).
-    wgpu::DawnDrmFormatCapabilities drmCaps{};
-    wgpu::DawnFormatCapabilities caps{};
-    caps.nextInChain = &drmCaps;
-    if (adapter.GetFormatCapabilities(format, &caps) != wgpu::Status::Success) {
-        std::fprintf(stderr, "[gpu] GetFormatCapabilities failed\n");
-        return false;
-    }
-
-    // Intersect with what GBM will actually allocate for this fourcc: GBM
-    // rejects a create_with_modifiers call constrained to a single modifier it
-    // cannot honor, so probe each candidate by a trial allocation.
+bool Allocator::probe(const wgpu::Adapter& adapter) {
+    table_.clear();
     modifiers_.clear();
-    for (size_t i = 0; i < drmCaps.propertiesCount; ++i) {
-        uint64_t mod = drmCaps.properties[i].modifier;
-        if (drmCaps.properties[i].modifierPlaneCount != 1) continue;  // slice: single-plane
-        gbm_bo* bo = gbm_bo_create_with_modifiers2(
-            gbm_, 64, 64, fourcc_, &mod, 1, GBM_BO_USE_RENDERING);
-        if (bo) {
-            modifiers_.push_back(mod);
-            gbm_bo_destroy(bo);
+    fourcc_ = DRM_FORMAT_ARGB8888;  // BGRA8Unorm; set definitively below
+
+    // Enumerate every probe format, query its Dawn-importable modifiers, and add
+    // each (fourcc, modifier) to the feedback table. Each Dawn format yields both
+    // its alpha and opaque DRM fourcc (e.g. ARGB8888 + XRGB8888) with the same
+    // modifiers -- a WSI configuring a BGRA8 swapchain needs the OPAQUE fourcc
+    // present too. Append DRM_FORMAT_MOD_INVALID per fourcc (implicit-modifier
+    // import; the legacy-compatible entry clients/WSIs expect).
+    for (wgpu::TextureFormat fmt : kProbeFormats) {
+        FourccPair fcc;
+        if (!fourccsFor(fmt, fcc)) continue;
+
+        wgpu::DawnDrmFormatCapabilities drmCaps{};
+        wgpu::DawnFormatCapabilities caps{};
+        caps.nextInChain = &drmCaps;
+        if (adapter.GetFormatCapabilities(fmt, &caps) != wgpu::Status::Success) {
+            std::fprintf(stderr, "[gpu] GetFormatCapabilities failed for fourcc=0x%08x\n", fcc.alpha);
+            continue;
+        }
+
+        // The DRM fourccs this format contributes (alpha + opaque if present).
+        uint32_t fourccs[2] = {fcc.alpha, fcc.opaque};
+        int nfourccs = fcc.opaque ? 2 : 1;
+
+        for (int fi = 0; fi < nfourccs; ++fi) {
+            uint32_t fourcc = fourccs[fi];
+            size_t before = table_.size();
+            for (size_t i = 0; i < drmCaps.propertiesCount; ++i) {
+                if (drmCaps.properties[i].modifierPlaneCount != 1) continue;  // single-plane only
+                uint64_t mod = drmCaps.properties[i].modifier;
+                table_.push_back(FormatTableEntry{fourcc, 0, mod});
+
+                // For the primary fourcc (ARGB8888), record the GBM-allocatable
+                // subset, used when WE allocate server-side buffers.
+                if (fourcc == DRM_FORMAT_ARGB8888) {
+                    gbm_bo* bo = gbm_bo_create_with_modifiers2(
+                        gbm_, 64, 64, fourcc, &mod, 1, GBM_BO_USE_RENDERING);
+                    if (bo) { modifiers_.push_back(mod); gbm_bo_destroy(bo); }
+                }
+            }
+            table_.push_back(FormatTableEntry{fourcc, 0, DRM_FORMAT_MOD_INVALID});
+            std::printf("[gpu] probe fourcc=0x%08x modifiers=%zu (+INVALID)\n",
+                        fourcc, table_.size() - before);
         }
     }
 
-    std::printf("[gpu] probe: format=%u fourcc=0x%08x dawn-modifiers=%zu usable=%zu\n",
-                static_cast<uint32_t>(format), fourcc_,
-                static_cast<size_t>(drmCaps.propertiesCount), modifiers_.size());
+    std::printf("[gpu] probe: %zu total format-table entries; primary gbm-usable=%zu\n",
+                table_.size(), modifiers_.size());
 
     return !modifiers_.empty();
 }

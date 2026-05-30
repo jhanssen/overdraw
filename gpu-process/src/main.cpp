@@ -5,22 +5,30 @@
 // the wire. No JS. Spawned by the core with two inherited socket fds:
 //   argv[1] = wire socket fd, argv[2] = side-channel socket fd.
 
+#include <cerrno>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <chrono>
 #include <unordered_map>
 #include <vector>
 
 #include <execinfo.h>
 #include <fcntl.h>
+#include <poll.h>
 #include <signal.h>
+#include <sys/ioctl.h>
+#include <sys/mman.h>
 #include <unistd.h>
+
+#include <linux/dma-buf.h>
 
 #include "dawn/native/DawnNative.h"
 #include "dawn/wire/WireServer.h"
 #include "dawn/webgpu_cpp.h"
 
 #include "allocator.h"
+#include "event_loop.h"
 #include "host_window.h"
 #include "side_channel.h"
 #include "transport.h"
@@ -57,6 +65,44 @@ void installCrashHandler() {
 
 void usleepShort() { ::usleep(200); }
 
+// Export a dmabuf's implicit READ-acquire fence (the producer's outstanding
+// WRITE work) as a sync_file fd, so the consumer can make its GPU work wait on
+// it. Returns -1 if unavailable (then there is nothing to wait on). This is the
+// implicit-sync acquire a compositor must perform before sampling a client
+// dmabuf that did not use explicit sync (wp_linux_drm_syncobj_v1). The returned
+// fd is owned by the caller. (Mirrors wlroots' vulkan implicit-sync interop:
+// export sync_file, then wait on it on the GPU timeline -- a CPU poll does NOT
+// order the GPU work, so the fence must be imported into the access bracket.)
+int exportDmabufAcquireFence(int dmabufFd) {
+    struct dma_buf_export_sync_file req{};
+    req.flags = DMA_BUF_SYNC_READ;
+    req.fd = -1;
+    if (::ioctl(dmabufFd, DMA_BUF_IOCTL_EXPORT_SYNC_FILE, &req) != 0) {
+        std::fprintf(stderr, "[gpu] EXPORT_SYNC_FILE failed errno=%d\n", errno);
+        return -1;
+    }
+    return req.fd;
+}
+
+// Serialize dmabuf-feedback format_table entries into a sealed read-only memfd
+// (the linux-dmabuf-v1 format_table is mmap'd by the client). Returns the fd
+// (caller owns) or -1 on failure.
+int buildFormatTableMemfd(const std::vector<gpu::FormatTableEntry>& entries) {
+    const size_t bytes = entries.size() * sizeof(gpu::FormatTableEntry);
+    int fd = ::memfd_create("overdraw-dmabuf-format-table",
+                            MFD_CLOEXEC | MFD_ALLOW_SEALING);
+    if (fd < 0) { std::perror("[gpu] memfd_create format_table"); return -1; }
+    if (bytes > 0) {
+        if (::ftruncate(fd, static_cast<off_t>(bytes)) != 0) { ::close(fd); return -1; }
+        void* map = ::mmap(nullptr, bytes, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+        if (map == MAP_FAILED) { ::close(fd); return -1; }
+        std::memcpy(map, entries.data(), bytes);
+        ::munmap(map, bytes);
+    }
+    ::fcntl(fd, F_ADD_SEALS, F_SEAL_SHRINK | F_SEAL_GROW | F_SEAL_WRITE);
+    return fd;
+}
+
 int run(int wireFd, int ctrlFd, int inputFd) {
     // 1) Host output window (this process is the Wayland client of the host).
     //    The host seat (pointer/keyboard) forwards events to the core over
@@ -77,7 +123,8 @@ int run(int wireFd, int ctrlFd, int inputFd) {
     wsd.useSpontaneousCallbacks = true;
     dawn::wire::WireServer server(wsd);
 
-    ::fcntl(ctrlFd, F_SETFL, O_NONBLOCK);
+    ipc::setNonBlocking(ctrlFd);
+    ipc::setNonBlocking(wireFd);  // buffered FdSerializer/FrameReader require NB
 
     // Set once the client's device is resolved (step 5). Device/queue-level
     // async ops (buffer MapAsync, OnSubmittedWorkDone) only resolve when the
@@ -86,26 +133,29 @@ int run(int wireFd, int ctrlFd, int inputFd) {
     // as a raw handle so the pump lambda can tick it before it exists.
     WGPUDevice tickDev = nullptr;
 
-    // Process at most `maxFrames` wire frames per call so the side channel is
-    // not starved while the wire is busy. <=0 means drain fully (startup use).
-    auto pumpWireN = [&](int maxFrames) {
+    ipc::FrameReader wireReader(wireFd);
+
+    // Read + dispatch all currently-buffered wire frames, advance Dawn, and pump
+    // outbound wire bytes. Non-blocking throughout. Returns false if the core
+    // closed the wire. Flush() now queues bytes and writes what fits; the event
+    // loop drains the rest on EPOLLOUT.
+    auto pumpWire = [&]() -> bool {
+        bool alive = wireReader.readAvailable();
         std::vector<uint8_t> frame;
-        int n = 0;
-        while ((maxFrames <= 0 || n < maxFrames) && ipc::readWireFrame(wireFd, frame)) {
+        while (wireReader.nextFrame(frame)) {
             server.HandleCommands(reinterpret_cast<const char*>(frame.data()), frame.size());
             serializer.Flush();
-            ++n;
         }
         dawn::native::InstanceProcessEvents(instance.Get());
         if (tickDev) {
             // Advance the device queue so submitted work + async completions
-            // (e.g. buffer map, OnSubmittedWorkDone) resolve, then flush any
-            // responses the wire-server's spontaneous callbacks wrote back.
+            // (buffer map, OnSubmittedWorkDone) resolve; spontaneous wire-server
+            // callbacks then queue their responses, which Flush pumps.
             dawn::native::DeviceTick(tickDev);
             serializer.Flush();
         }
+        return alive;
     };
-    auto pumpWire = [&] { pumpWireN(0); };
 
     // 3) Handshake: Hello -> HelloReply(size).
     {
@@ -187,11 +237,37 @@ int run(int wireFd, int ctrlFd, int inputFd) {
                 adapter.HasFeature(wgpu::FeatureName::SharedTextureMemoryDmaBuf) ? 1 : 0);
     gpu::Allocator alloc;
     if (!alloc.open()) { std::fprintf(stderr, "[gpu] allocator open failed\n"); return 1; }
-    if (!alloc.probe(adapter, wgpu::TextureFormat::BGRA8Unorm)) {
+    if (!alloc.probe(adapter)) {
         std::fprintf(stderr, "[gpu] modifier probe found nothing importable\n");
         return 1;
     }
     std::printf("[gpu] B1 probe OK (%zu usable modifiers)\n", alloc.usableModifiers().size());
+
+    // Send dmabuf-feedback data to the core: the format_table (one entry per
+    // usable modifier) as a sealed memfd via SCM_RIGHTS, plus main_device dev_t
+    // and the entry count. The core relays this to the JS linux-dmabuf-v1
+    // default-feedback handler. Sent before SurfaceReady so the core can stash
+    // it during bring-up. Non-fatal on failure (clients fall back / warn).
+    {
+        std::vector<gpu::FormatTableEntry> entries = alloc.formatTable();
+        int tableFd = buildFormatTableMemfd(entries);
+        if (tableFd >= 0) {
+            ipc::Message m{};
+            m.tag = ipc::Tag::FeedbackData;
+            m.mainDevice = static_cast<uint64_t>(alloc.deviceId());
+            m.entryCount = static_cast<uint32_t>(entries.size());
+            m.formatTableSize =
+                static_cast<uint32_t>(entries.size() * sizeof(gpu::FormatTableEntry));
+            int fds[1] = {tableFd};
+            ipc::sendMessageFds(ctrlFd, m, fds, 1);
+            ::close(tableFd);  // receiver dup'd it
+            std::printf("[gpu] sent FeedbackData: main_device=0x%llx entries=%u size=%u\n",
+                        static_cast<unsigned long long>(m.mainDevice),
+                        m.entryCount, m.formatTableSize);
+        } else {
+            std::fprintf(stderr, "[gpu] format_table memfd build failed; feedback skipped\n");
+        }
+    }
 
     wgpu::SurfaceCapabilities caps{};
     surface.GetCapabilities(adapter, &caps);
@@ -267,16 +343,101 @@ int run(int wireFd, int ctrlFd, int inputFd) {
     };
     std::unordered_map<uint32_t, ClientTex> clientTextures;
 
+    // ImportClientTex requests whose wireSerial the wire reader has not yet
+    // reached. Held until wireReader.bytesConsumed() >= wireSerial so the prior
+    // UnregisterObjectCmd (recycling this handle id) has been processed. fd owned.
+    struct PendingImport { ipc::Message msg; int fd; };
+    std::vector<PendingImport> pendingImports;
+
     // 9) Service Dawn + the host window until the core requests shutdown or the
     //    host window is closed. The core drives the swapchain over the wire.
     bool shutdown = false;
-    while (!shutdown && !window.shouldClose()) {
-        pumpWireN(8);  // bounded so the side channel below is not starved
-        window.pump();
-        ipc::Message m{};
-        int recvFds[ipc::kMaxMsgFds];
-        int nRecvFds = 0;
-        if (ipc::recvMessageNBFds(ctrlFd, m, recvFds, &nRecvFds)) {
+
+    // Import a client dmabuf (fd owned by us) and inject the texture. Sends the
+    // ClientTexImported reply. Caller must ensure the wire reader has reached
+    // m.wireSerial first (so the prior UnregisterObjectCmd for this recycled
+    // handle id has been applied). Closes fd.
+    auto runImport = [&](const ipc::Message& m, int fd) {
+        ipc::Message reply{};
+        reply.tag = ipc::Tag::ClientTexImported;
+        reply.texture = m.texture;
+        reply.importOk = 0;
+
+        gpu::DmabufBuffer cb{};
+        cb.fd = fd;
+        cb.modifier = m.modifier;
+        cb.stride = m.planeStride;
+        cb.offset = m.planeOffset;
+        cb.width = m.width;
+        cb.height = m.height;
+        cb.bo = nullptr;
+
+        ClientTex ct{};
+        bool ok = gpu::Allocator::importTexture(coreDevice, m.drmFourcc, cb, ct.mem, ct.tex);
+        if (ok) {
+            int syncFd = exportDmabufAcquireFence(cb.fd);
+            wgpu::SharedFence acquireFence;
+            if (syncFd >= 0) {
+                wgpu::SharedFenceSyncFDDescriptor sfd{};
+                sfd.handle = syncFd;
+                wgpu::SharedFenceDescriptor fdd{};
+                fdd.nextInChain = &sfd;
+                acquireFence = coreDevice.ImportSharedFence(&fdd);
+                ::close(syncFd);
+                if (!acquireFence) std::fprintf(stderr, "[gpu] ImportClientTex: ImportSharedFence failed\n");
+            }
+            wgpu::SharedTextureMemoryVkImageLayoutBeginState layout{};
+            layout.oldLayout = 0;  // UNDEFINED
+            layout.newLayout = 1;  // GENERAL
+            wgpu::SharedTextureMemoryBeginAccessDescriptor bad{};
+            bad.nextInChain = &layout;
+            bad.initialized = true;
+            uint64_t signaled = 1;
+            if (acquireFence) {
+                bad.fenceCount = 1;
+                bad.fences = &acquireFence;
+                bad.signaledValueCount = 1;
+                bad.signaledValues = &signaled;
+            } else {
+                bad.fenceCount = 0;
+            }
+            if (ct.mem.BeginAccess(ct.tex, &bad) != wgpu::Status::Success) {
+                std::fprintf(stderr, "[gpu] ImportClientTex: BeginAccess failed\n");
+                ok = false;
+            }
+        }
+        if (ok && !server.InjectTexture(ct.tex.Get(),
+                                        {m.texture.id, m.texture.generation},
+                                        {m.device.id, m.device.generation})) {
+            std::fprintf(stderr, "[gpu] ImportClientTex: InjectTexture failed\n");
+            ok = false;
+        }
+        if (ok) {
+            serializer.Flush();
+            ct.fd = cb.fd;
+            clientTextures[m.texture.id] = std::move(ct);
+            reply.importOk = 1;
+        } else {
+            ::close(cb.fd);
+        }
+        ipc::sendMessage(ctrlFd, reply);
+    };
+
+    // Run any pending imports whose wireSerial the wire reader has now reached.
+    auto drainPendingImports = [&]() {
+        for (size_t i = 0; i < pendingImports.size();) {
+            if (wireReader.bytesConsumed() >= pendingImports[i].msg.wireSerial) {
+                runImport(pendingImports[i].msg, pendingImports[i].fd);
+                pendingImports.erase(pendingImports.begin() + static_cast<long>(i));
+            } else {
+                ++i;
+            }
+        }
+    };
+
+    // Control-message dispatch. Returns false if the core requested shutdown.
+    auto dispatchCtrl = [&](const ipc::Message& m, int* recvFds, int nRecvFds) -> bool {
+        {
             if (m.tag == ipc::Tag::Shutdown) {
                 shutdown = true;
             } else if (m.tag == ipc::Tag::BeginAccess) {
@@ -362,79 +523,78 @@ int run(int wireFd, int ctrlFd, int inputFd) {
                 reply.modifier = dmaBuf.modifier;
                 ipc::sendMessage(ctrlFd, reply);
             } else if (m.tag == ipc::Tag::ImportClientTex) {
-                // Import a CLIENT-provided dmabuf (fd via SCM_RIGHTS) into a
-                // texture on the core device and inject it at the client's
-                // reserved handle. Unlike ReserveTex we do not allocate; the
-                // client chose the modifier/stride/offset, so import may fail if
-                // the driver rejects that layout.
-                ipc::Message reply{};
-                reply.tag = ipc::Tag::ClientTexImported;
-                reply.texture = m.texture;
-                reply.importOk = 0;
-
                 if (nRecvFds < 1) {
-                    std::fprintf(stderr, "[gpu] ImportClientTex: no fd received\n");
+                    std::fprintf(stderr, "[gpu] ImportClientTex: no fd received (nRecvFds=%d)\n", nRecvFds);
+                    ipc::Message reply{};
+                    reply.tag = ipc::Tag::ClientTexImported;
+                    reply.texture = m.texture;
+                    reply.importOk = 0;
                     ipc::sendMessage(ctrlFd, reply);
+                } else if (wireReader.bytesConsumed() >= m.wireSerial) {
+                    runImport(m, recvFds[0]);  // wire caught up: prior Unregister applied
                 } else {
-                    gpu::DmabufBuffer cb{};
-                    cb.fd = recvFds[0];  // we own this dup'd fd now
-                    cb.modifier = m.modifier;
-                    cb.stride = m.planeStride;
-                    cb.offset = m.planeOffset;
-                    cb.width = m.width;
-                    cb.height = m.height;
-                    cb.bo = nullptr;  // not GBM-allocated
-
-                    ClientTex ct{};
-                    bool ok = gpu::Allocator::importTexture(coreDevice, m.drmFourcc,
-                                                            cb, ct.mem, ct.tex);
-                    if (ok) {
-                        // The client already rendered into the dmabuf; begin a
-                        // read access (initialized) so compositing can sample it.
-                        wgpu::SharedTextureMemoryVkImageLayoutBeginState layout{};
-                        layout.oldLayout = 0;  // UNDEFINED -> driver treats as not-yet-known
-                        layout.newLayout = 1;  // GENERAL
-                        wgpu::SharedTextureMemoryBeginAccessDescriptor bad{};
-                        bad.nextInChain = &layout;
-                        bad.initialized = true;
-                        bad.fenceCount = 0;
-                        if (ct.mem.BeginAccess(ct.tex, &bad) != wgpu::Status::Success) {
-                            std::fprintf(stderr, "[gpu] ImportClientTex: BeginAccess failed\n");
-                            ok = false;
-                        }
-                    }
-                    if (ok && !server.InjectTexture(ct.tex.Get(),
-                                                    {m.texture.id, m.texture.generation},
-                                                    {m.device.id, m.device.generation})) {
-                        std::fprintf(stderr, "[gpu] ImportClientTex: InjectTexture failed\n");
-                        ok = false;
-                    }
-                    if (ok) {
-                        serializer.Flush();
-                        ct.fd = cb.fd;
-                        clientTextures[m.texture.id] = std::move(ct);
-                        reply.importOk = 1;
-                        std::printf("[gpu] imported client dmabuf at tex {%u,%u} fourcc=%u mod=%llu\n",
-                                    m.texture.id, m.texture.generation, m.drmFourcc,
-                                    static_cast<unsigned long long>(m.modifier));
-                    } else {
-                        ::close(cb.fd);  // import failed; drop our fd
-                    }
-                    ipc::sendMessage(ctrlFd, reply);
+                    // Wire reader has not reached the serial yet; defer until it has
+                    // (drainPendingImports runs after each wire pump). We own recvFds[0].
+                    pendingImports.push_back({m, recvFds[0]});
                 }
             }
         }
-        // Detect core closing the wire socket.
-        uint32_t probe;
-        if (::recv(wireFd, &probe, 4, MSG_DONTWAIT | MSG_PEEK) == 0) shutdown = true;
-        usleepShort();
+        return !shutdown;
+    };
+
+    // 9) Event-loop driven steady state. epoll over: wire fd (read always; write
+    //    when outbound queued), ctrl fd (read), and the host wl_display fd (read;
+    //    pump() does the prepare_read/read_events dance). A bounded timeout wakes
+    //    us to advance Dawn (DeviceTick) and re-pump even when no fd is ready.
+    //    Nothing here ever blocks in write(): the buffered serializer queues and
+    //    the loop drains on EPOLLOUT -- this is what breaks the prior deadlock
+    //    (single-threaded peer parked in write() while the other waited to read).
+    auto loop = gpu::EventLoop::create();
+    if (!loop) { std::fprintf(stderr, "[gpu] EventLoop create failed\n"); return 1; }
+
+    auto armWire = [&] {
+        uint32_t ev = gpu::EventLoop::kRead;
+        if (serializer.hasPendingOut()) ev |= gpu::EventLoop::kWrite;
+        loop->modify(wireFd, ev);
+    };
+
+    loop->add(wireFd, gpu::EventLoop::kRead, [&](uint32_t ready) {
+        if (ready & gpu::EventLoop::kWrite) serializer.pumpOut();
+        if (ready & gpu::EventLoop::kRead) { if (!pumpWire()) shutdown = true; }
+        drainPendingImports();  // wire advanced -> some deferred imports may be ready
+        armWire();
+    });
+    loop->add(ctrlFd, gpu::EventLoop::kRead, [&](uint32_t) {
+        ipc::Message m{};
+        int recvFds[ipc::kMaxMsgFds];
+        int nRecvFds = 0;
+        while (ipc::recvMessageNBFds(ctrlFd, m, recvFds, &nRecvFds)) {
+            dispatchCtrl(m, recvFds, nRecvFds);
+            if (shutdown) break;
+        }
+        drainPendingImports();
+        armWire();
+    });
+    int hostFd = window.displayFd();
+    if (hostFd >= 0)
+        loop->add(hostFd, gpu::EventLoop::kRead, [&](uint32_t) { window.pump(); });
+
+    while (!shutdown && !window.shouldClose()) {
+        loop->runOnce(8);   // 8ms cap: also advances Dawn + host pump below
+        pumpWire();          // DeviceTick + drain wire, even with no fd ready
+        drainPendingImports();
+        window.pump();       // service host events queued since last read
+        armWire();
     }
+
     for (auto& [id, ct] : clientTextures) {
         ct.tex = nullptr;
         ct.mem = nullptr;
         if (ct.fd >= 0) ::close(ct.fd);
     }
     clientTextures.clear();
+    for (auto& p : pendingImports) if (p.fd >= 0) ::close(p.fd);
+    pendingImports.clear();
     dmaTex = nullptr;
     dmaMem = nullptr;
     alloc.release(dmaBuf);

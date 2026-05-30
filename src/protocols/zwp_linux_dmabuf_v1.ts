@@ -50,28 +50,47 @@ export default function makeLinuxDmabuf(ctx: Ctx): DmabufHandler {
       ctx.state.dmabufParams.set(params, { planes: [], used: false });
     },
     get_default_feedback(_resource, feedback) {
-      sendMinimalFeedback(ctx, feedback);
+      sendFeedback(ctx, feedback);
     },
     get_surface_feedback(_resource, feedback, _surface) {
-      sendMinimalFeedback(ctx, feedback);
+      // Per-surface feedback is the same as default for now (no per-surface
+      // optimization tranche).
+      sendFeedback(ctx, feedback);
     },
     destroy(_resource) {},
   };
 }
 
-// Minimal dmabuf feedback: send `done` with no format table or tranches. This
-// is the "no special per-surface feedback" case -- clients fall back to the v3
-// format/modifier events advertised on bind. Crucially it gives the feedback
-// child resource a real (non-NULL) implementation so libwayland does not abort
-// when the client interacts with it.
+// dmabuf default-feedback. Sends the full spec sequence when the GPU process has
+// supplied feedback data (format_table memfd + main_device dev_t + the usable
+// (format, modifier) set), which a Vulkan-WSI client requires to derive swapchain
+// formats. The event order follows the protocol: format_table, main_device, then
+// one tranche (target_device, formats, tranche_done), then done.
 //
-// NOTE: a fully-spec feedback would send format_table (an fd to a
-// {format,modifier} table) + main_device + tranche_* + done. That needs native
-// support (the DRM device dev_t + the importable format/modifier set as a binary
-// table) and is not built; this minimal form is protocol-legal but may not
-// satisfy a Vulkan-WSI client that requires the format table.
-function sendMinimalFeedback(ctx: Ctx, feedback: Resource): void {
-  ctx.events.zwp_linux_dmabuf_feedback_v1.send_done(feedback);
+// Fallback: if no native feedback data is available (e.g. probe produced nothing,
+// or running without the GPU process), send only `done`. The feedback resource
+// still has a real implementation so libwayland does not abort; clients without
+// feedback fall back to the v3 format/modifier events advertised on bind.
+function sendFeedback(ctx: Ctx, feedback: Resource): void {
+  const ev = ctx.events.zwp_linux_dmabuf_feedback_v1;
+  const fb = ctx.addon.dmabufFeedbackInfo();
+  if (!fb || fb.entryCount === 0) {
+    ev.send_done(feedback);
+    return;
+  }
+  // format_table: fd ('h') + size. The WaylandFd ownership transfers into the
+  // wire on post; each call gets its own dup from dmabufFeedbackInfo().
+  ev.send_format_table(feedback, fb.formatTableFd, fb.formatTableSize);
+  // main_device: dev_t bytes (single tranche targets the same device).
+  ev.send_main_device(feedback, fb.mainDevice);
+  // One tranche targeting the same device. Event order per protocol:
+  // target_device, flags, formats, tranche_done.
+  ev.send_tranche_target_device(feedback, fb.mainDevice);
+  ev.send_tranche_flags(feedback, 0);
+  // tranche_formats: u16 indices into the format_table (all of them).
+  ev.send_tranche_formats(feedback, fb.trancheFormats);
+  ev.send_tranche_done(feedback);
+  ev.send_done(feedback);
 }
 
 // Handler for the zwp_linux_dmabuf_feedback_v1 child resource (only `destroy`).

@@ -102,6 +102,26 @@ export async function installProtocols(
   // frame from the launcher's onFrame hook. wl_callback.done carries a ms
   // timestamp; the callback is single-shot (client re-requests each frame).
   state.dispatchFrameCallbacks = (timeMs: number): void => {
+    // Release dmabuf buffers whose compositor GPU read has completed. Native
+    // tracks this precisely (queue OnSubmittedWorkDone on the frame that last
+    // sampled each buffer) and hands back the freed bufferIds here. This is the
+    // correct completion signal -- not a timer guess: releasing only after the
+    // GPU is done reading avoids both client overwrite-while-reading and the
+    // vkAcquireNextImageKHR starvation seen when buffers are never freed.
+    const freed = addon.takeFreedBuffers();
+    if (freed.length > 0) {
+      const byId = state.dmabufById;
+      const byBuf = state.dmabufBufferIds;
+      for (const id of freed) {
+        const buf = byId?.get(id);
+        if (buf) {
+          if (!buf.destroyed) events.wl_buffer.send_release(buf);
+          byId?.delete(id);
+          byBuf?.delete(buf);
+        }
+      }
+    }
+
     for (const s of state.surfaces.values()) {
       const cbs = s.frameCallbacks;
       if (!cbs || cbs.length === 0) continue;

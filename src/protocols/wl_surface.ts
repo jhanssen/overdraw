@@ -7,6 +7,22 @@ import type { WlSurfaceHandler } from "#protocols-gen/wl_surface.js";
 import type { Ctx } from "./ctx.js";
 import type { Resource } from "../types.js";
 
+// Assign a stable per-wl_buffer id used to track the dmabuf release lifecycle
+// across the JS<->native boundary. Native reports freed bufferIds (once its GPU
+// read completes); index.ts maps them back to the wl_buffer and releases it.
+function bufferIdOf(ctx: Ctx, buffer: Resource): number {
+  const st = ctx.state;
+  st.dmabufBufferIds ??= new Map<Resource, number>();
+  st.dmabufById ??= new Map<number, Resource>();
+  let id = st.dmabufBufferIds.get(buffer);
+  if (id === undefined) {
+    id = (st.nextBufferId = (st.nextBufferId ?? 0) + 1);
+    st.dmabufBufferIds.set(buffer, id);
+    st.dmabufById.set(id, buffer);
+  }
+  return id;
+}
+
 export default function makeSurface(ctx: Ctx): WlSurfaceHandler {
   const rec = (resource: Resource) => ctx.state.surfaces.get(resource);
 
@@ -41,11 +57,17 @@ export default function makeSurface(ctx: Ctx): WlSurfaceHandler {
         let uploaded = false;
         if (desc && desc.dmabuf && desc.fd) {
           // dmabuf: hand the client's fd (WaylandFd) to native for zero-copy
-          // import. The buffer is NOT released immediately -- the compositor
-          // samples it directly, so it stays in use until the surface is replaced.
+          // import. The compositor samples this buffer DIRECTLY (no copy), so it
+          // must stay held until the compositor's GPU read completes. Native
+          // tracks this per bufferId and reports completion via takeFreedBuffers
+          // (driven by queue OnSubmittedWorkDone); we send wl_buffer.release
+          // then. Releasing earlier would let the client overwrite a buffer the
+          // GPU is still reading; never releasing starves a Vulkan-WSI client in
+          // vkAcquireNextImageKHR.
+          const bufferId = bufferIdOf(ctx, buffer);
           const ok = ctx.addon.commitSurfaceDmabuf(
             s.id, desc.fd, desc.width, desc.height, desc.format,
-            desc.modifierHi ?? 0, desc.modifierLo ?? 0, desc.offset, desc.stride);
+            desc.modifierHi ?? 0, desc.modifierLo ?? 0, desc.offset, desc.stride, bufferId);
           if (ok) { ctx.state.lastCommittedSurfaceId = s.id; uploaded = true; }
         } else if (desc && desc.poolId) {
           const ok = ctx.addon.commitSurfaceBuffer(

@@ -39,6 +39,15 @@ export interface Addon {
 
   // Keyboard: keymap memfd (as a WaylandFd) + xkb modifier state.
   keymapInfo(): { fd: WaylandFd; format: number; size: number } | null;
+
+  // linux-dmabuf-v1 default-feedback data sourced from the GPU process.
+  // formatTableFd is a WaylandFd for the {format,pad,modifier} table memfd;
+  // mainDevice/trancheFormats are pre-encoded byte arrays for the 'a' args.
+  // null if the GPU process supplied no feedback (fall back to v3 events).
+  dmabufFeedbackInfo(): {
+    formatTableFd: WaylandFd; formatTableSize: number; entryCount: number;
+    mainDevice: Uint8Array; trancheFormats: Uint8Array;
+  } | null;
   keyUpdate(evdevKey: number, pressed: boolean): {
     modsDepressed: number; modsLatched: number; modsLocked: number; group: number;
   };
@@ -46,10 +55,13 @@ export interface Addon {
   // Surface bridge / compositor.
   commitSurfaceBuffer(id: number, poolId: number, offset: number, w: number,
                       h: number, stride: number): boolean;
-  // The dmabuf fd is a WaylandFd; native takes the raw fd out of it.
+  // The dmabuf fd is a WaylandFd; native dups it (the buffer is reused across
+  // commits). bufferId identifies the buffer for release tracking.
   commitSurfaceDmabuf(id: number, fd: WaylandFd, w: number, h: number,
                       fourcc: number, modHi: number, modLo: number,
-                      offset: number, stride: number): boolean;
+                      offset: number, stride: number, bufferId: number): boolean;
+  // dmabuf bufferIds whose compositor GPU read has completed (safe to release).
+  takeFreedBuffers(): number[];
   removeSurface(id: number): void;
   setSurfaceLayout(id: number, x: number, y: number, w: number, h: number): void;
   setStack(ids: number[]): void;

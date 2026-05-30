@@ -53,7 +53,15 @@ struct Rect { r : vec4f, };
 
 Compositor::Compositor(int wireFd, int ctrlFd, pid_t gpuPid)
     : link_(std::make_unique<WireLink>(wireFd, ctrlFd)),
-      gpuPid_(gpuPid), wireFd_(wireFd), ctrlFd_(ctrlFd) {}
+      gpuPid_(gpuPid), wireFd_(wireFd), ctrlFd_(ctrlFd) {
+    // All inter-process fds are non-blocking: no write may ever park (it would
+    // wedge the single-threaded GPU process and deadlock the pair). Buffered
+    // writers (FdSerializer / CtrlSender) queue what the socket can't take and
+    // drain on writable. ctrlFd is also set non-blocking in handshake() after
+    // the first blocking Hello; set it here too for clarity/idempotence.
+    ipc::setNonBlocking(wireFd_);
+    ipc::setNonBlocking(ctrlFd_);
+}
 
 Compositor::~Compositor() { shutdown(); }
 
@@ -140,12 +148,35 @@ bool Compositor::bringUp() {
         m.surface = {rs.handle.id, rs.handle.generation};
         ipc::sendMessage(ctrlFd_, m);
     }
+    // Wait for SurfaceReady, also capturing FeedbackData (dmabuf feedback) which
+    // the GPU process sends just before it. FeedbackData carries the format_table
+    // memfd as an SCM_RIGHTS fd, so this loop must use the fd-capturing recv.
     ipc::Message surfReady{};
     if (!link_->pumpUntil([&] {
             ipc::Message m{};
-            if (ipc::recvMessageNB(ctrlFd_, m) && m.tag == ipc::Tag::SurfaceReady) {
-                surfReady = m; return true;
+            int fds[ipc::kMaxMsgFds];
+            int nfds = 0;
+            if (!ipc::recvMessageNBFds(ctrlFd_, m, fds, &nfds)) return false;
+            if (m.tag == ipc::Tag::FeedbackData) {
+                if (dmabufFeedback_.formatTableFd >= 0)
+                    ::close(dmabufFeedback_.formatTableFd);
+                dmabufFeedback_.formatTableFd = (nfds > 0) ? fds[0] : -1;
+                dmabufFeedback_.mainDevice = m.mainDevice;
+                dmabufFeedback_.entryCount = m.entryCount;
+                dmabufFeedback_.formatTableSize = m.formatTableSize;
+                // Close any extra unexpected fds to avoid leaks.
+                for (int i = 1; i < nfds; ++i) ::close(fds[i]);
+                std::printf("[core] dmabuf feedback: main_device=0x%llx entries=%u size=%u\n",
+                            static_cast<unsigned long long>(m.mainDevice),
+                            m.entryCount, m.formatTableSize);
+                return false;  // keep waiting for SurfaceReady
             }
+            if (m.tag == ipc::Tag::SurfaceReady) {
+                for (int i = 0; i < nfds; ++i) ::close(fds[i]);  // none expected
+                surfReady = m;
+                return true;
+            }
+            for (int i = 0; i < nfds; ++i) ::close(fds[i]);
             return false;
         })) {
         error_ = "no SurfaceReady";
@@ -286,7 +317,7 @@ void Compositor::commitSurfaceShm(uint32_t id, uint32_t width, uint32_t height,
 
 bool Compositor::commitSurfaceDmabuf(uint32_t id, int fd, uint32_t width, uint32_t height,
                                      uint32_t drmFourcc, uint64_t modifier,
-                                     uint32_t offset, uint32_t stride) {
+                                     uint32_t offset, uint32_t stride, uint64_t bufferId) {
     if (!device_ || width == 0 || height == 0 || fd < 0) return false;
 
     // Reserve a texture handle on the wire; the GPU process imports the client
@@ -298,8 +329,19 @@ bool Compositor::commitSurfaceDmabuf(uint32_t id, int fd, uint32_t width, uint32
     auto rt = link_->client().ReserveTexture(
         device_.Get(), reinterpret_cast<const WGPUTextureDescriptor*>(&td));
 
+    // Cross-channel ordering: InjectTexture (server-side, triggered by the CTRL
+    // ImportClientTex below) reuses a wire handle id that may have just been
+    // recycled when a prior texture was dropped -- that drop sent an
+    // UnregisterObjectCmd over the WIRE. If the ctrl message overtakes that
+    // still-queued wire command, the server slot has a stale generation and the
+    // inject fails. Rather than block, flush the wire and sample the byte serial;
+    // the GPU defers the inject until its wire reader has consumed past it.
+    link_->flush();
+    uint64_t wireSerial = link_->wireBytesQueued();
+
     ipc::Message m{};
     m.tag = ipc::Tag::ImportClientTex;
+    m.wireSerial = wireSerial;
     m.device = {rt.deviceHandle.id, rt.deviceHandle.generation};
     m.texture = {rt.handle.id, rt.handle.generation};
     m.width = width;
@@ -329,11 +371,23 @@ bool Compositor::commitSurfaceDmabuf(uint32_t id, int fd, uint32_t width, uint32
         },
         3000);
     if (!got || !reply.importOk) {
+        std::fprintf(stderr, "[core] dmabuf import FAILED id=%u %ux%u fourcc=0x%08x mod=0x%llx got=%d ok=%u\n",
+                     id, width, height, drmFourcc,
+                     static_cast<unsigned long long>(modifier), got ? 1 : 0, reply.importOk);
         link_->client().ReclaimTextureReservation(rt);
         return false;
     }
-
     ClientSurface& cs = clientSurfaces_[id];
+
+    // Retire the buffer this commit supersedes: it has been sampled by every
+    // frame up to and including the latest submit (submitSerial_). It becomes
+    // free once that submit completes on the GPU. Keep its texture alive until
+    // then (the GPU may still be reading it).
+    if (cs.currentBufferId != 0 && cs.currentBufferId != bufferId && cs.texture) {
+        retiring_.push_back({cs.currentBufferId, submitSerial_, cs.texture});
+    }
+    cs.currentBufferId = bufferId;
+
     cs.texture = wgpu::Texture::Acquire(rt.texture);
     cs.width = width;
     cs.height = height;
@@ -379,8 +433,34 @@ void Compositor::setStack(const std::vector<uint32_t>& ids) {
 }
 
 void Compositor::removeSurface(uint32_t id) {
-    clientSurfaces_.erase(id);
+    auto it = clientSurfaces_.find(id);
+    if (it != clientSurfaces_.end()) {
+        // The surface's current buffer is no longer referenced after this frame;
+        // retire it so the client gets its release (e.g. on unmap/destroy).
+        if (it->second.currentBufferId != 0 && it->second.texture)
+            retiring_.push_back({it->second.currentBufferId, submitSerial_, it->second.texture});
+        clientSurfaces_.erase(it);
+    }
     stack_.erase(std::remove(stack_.begin(), stack_.end(), id), stack_.end());
+}
+
+void Compositor::reapRetiredBuffers() {
+    if (retiring_.empty()) return;
+    std::vector<RetiringBuffer> still;
+    still.reserve(retiring_.size());
+    for (auto& rb : retiring_) {
+        if (rb.retireSerial <= completedSerial_) {
+            freed_.push_back(rb.bufferId);  // texture ref drops here -> GPU memory recyclable
+        } else {
+            still.push_back(std::move(rb));
+        }
+    }
+    retiring_.swap(still);
+}
+
+void Compositor::takeFreedBuffers(std::vector<uint64_t>& out) {
+    out.insert(out.end(), freed_.begin(), freed_.end());
+    freed_.clear();
 }
 
 void Compositor::renderFrame() {
@@ -414,9 +494,23 @@ void Compositor::renderFrame() {
         pass.End();
         wgpu::CommandBuffer cb = enc.Finish();
         device_.GetQueue().Submit(1, &cb);
+
+        // This submit sampled every surface's current buffer. Tag it with a
+        // serial and mark that serial complete on GPU work-done; retiring
+        // buffers whose retireSerial <= completedSerial_ are then safe to free.
+        // The callback fires on this (Node) thread via the wire pump -- no
+        // cross-thread marshaling needed.
+        uint64_t serial = ++submitSerial_;
+        device_.GetQueue().OnSubmittedWorkDone(
+            wgpu::CallbackMode::AllowProcessEvents,
+            [this, serial](wgpu::QueueWorkDoneStatus, wgpu::StringView) {
+                if (serial > completedSerial_) completedSerial_ = serial;
+            });
+
         surface_.Present();
         presented_++;
     }
+    reapRetiredBuffers();
     link_->flush();
 }
 
@@ -489,10 +583,19 @@ void Compositor::shutdown() {
     instance_ = nullptr;
     link_.reset();  // disconnects the wire client
 
+    if (dmabufFeedback_.formatTableFd >= 0) {
+        ::close(dmabufFeedback_.formatTableFd);
+        dmabufFeedback_.formatTableFd = -1;
+    }
     if (wireFd_ >= 0) { ::close(wireFd_); wireFd_ = -1; }
     if (ctrlFd_ >= 0) { ::close(ctrlFd_); ctrlFd_ = -1; }
     reapGpuProcess(gpuPid_);
     gpuPid_ = -1;
+}
+
+int Compositor::dupDmabufFormatTableFd() const {
+    if (dmabufFeedback_.formatTableFd < 0) return -1;
+    return ::fcntl(dmabufFeedback_.formatTableFd, F_DUPFD_CLOEXEC, 0);
 }
 
 }  // namespace overdraw::core

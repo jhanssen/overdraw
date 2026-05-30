@@ -61,6 +61,12 @@ export default function makeSeat(ctx: Ctx, focus: FocusOptions = DEFAULT_FOCUS):
     }
   }
 
+  // wl_pointer.frame is since v5; sending it to an older binding aborts the
+  // client. Gate every frame on the resource's bound version.
+  function pointerFrame(p: Resource): void {
+    if (p.version >= 5) ctx.events.wl_pointer.send_frame(p);
+  }
+
   // Find the topmost window under an output-space point, returning a focus
   // target (surface + client id + rect), or null.
   function pick(x: number, y: number): SeatFocus | null {
@@ -89,7 +95,7 @@ export default function makeSeat(ctx: Ctx, focus: FocusOptions = DEFAULT_FOCUS):
     for (const p of clientPointers(target.clientId)) {
       if (p.destroyed) continue;
       ctx.events.wl_pointer.send_enter(p, serial, target.surfaceRec.resource, sx, sy);
-      ctx.events.wl_pointer.send_frame(p);
+      pointerFrame(p);
     }
   }
 
@@ -98,7 +104,7 @@ export default function makeSeat(ctx: Ctx, focus: FocusOptions = DEFAULT_FOCUS):
     for (const p of clientPointers(target.clientId)) {
       if (p.destroyed) continue;
       ctx.events.wl_pointer.send_leave(p, serial, target.surfaceRec.resource);
-      ctx.events.wl_pointer.send_frame(p);
+      pointerFrame(p);
     }
   }
 
@@ -132,7 +138,7 @@ export default function makeSeat(ctx: Ctx, focus: FocusOptions = DEFAULT_FOCUS):
           for (const p of clientPointers(hit.clientId)) {
             if (p.destroyed) continue;
             ctx.events.wl_pointer.send_motion(p, ev.time, sx, sy);
-            ctx.events.wl_pointer.send_frame(p);
+            pointerFrame(p);
           }
         }
         // KEYBOARD focus: follow-pointer tracks the pointer-focused window.
@@ -152,7 +158,7 @@ export default function makeSeat(ctx: Ctx, focus: FocusOptions = DEFAULT_FOCUS):
         for (const p of clientPointers(seat.focus.clientId)) {
           if (p.destroyed) continue;
           ctx.events.wl_pointer.send_button(p, serial, ev.time, ev.button ?? 0, state);
-          ctx.events.wl_pointer.send_frame(p);
+          pointerFrame(p);
         }
         // click-to-focus: a button press over a window gives it keyboard focus.
         if (focus.policy === "click-to-focus" && ev.pressed) setKbFocus(seat.focus);
@@ -165,7 +171,7 @@ export default function makeSeat(ctx: Ctx, focus: FocusOptions = DEFAULT_FOCUS):
         for (const p of clientPointers(seat.focus.clientId)) {
           if (p.destroyed) continue;
           ctx.events.wl_pointer.send_axis(p, ev.time, axis, ev.value ?? 0);
-          ctx.events.wl_pointer.send_frame(p);
+          pointerFrame(p);
         }
         break;
       }
@@ -217,7 +223,9 @@ export default function makeSeat(ctx: Ctx, focus: FocusOptions = DEFAULT_FOCUS):
     // Global bind: advertise pointer + keyboard capabilities.
     bind(resource) {
       ctx.events.wl_seat.send_capabilities(resource, CAP.pointer | CAP.keyboard);
-      ctx.events.wl_seat.send_name(resource, "seat0");
+      // wl_seat.name is since v2. Sending it to a v1 bind aborts the client
+      // ("listener function for opcode 1 of wl_seat is NULL").
+      if (resource.version >= 2) ctx.events.wl_seat.send_name(resource, "seat0");
     },
     get_pointer(resource, pointer) {
       const clientId = ctx.addon.clientId(resource);
@@ -234,8 +242,8 @@ export default function makeSeat(ctx: Ctx, focus: FocusOptions = DEFAULT_FOCUS):
       if (km) {
         ctx.events.wl_keyboard.send_keymap(keyboard, km.format, km.fd, km.size);
       }
-      // wl_keyboard v4+ may expect repeat_info; send a sane default.
-      ctx.events.wl_keyboard.send_repeat_info(keyboard, 25, 600);
+      // wl_keyboard.repeat_info is since v4.
+      if (keyboard.version >= 4) ctx.events.wl_keyboard.send_repeat_info(keyboard, 25, 600);
     },
     get_touch(_resource, _touch) {},
     release(_resource) {},

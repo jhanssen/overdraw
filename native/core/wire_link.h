@@ -33,11 +33,24 @@ class WireLink {
     // it (wgpuInstanceProcessEvents).
     void setInstance(WGPUInstance inst) { instance_ = inst; }
 
-    void flush() { serializer_->Flush(); }
+    // Queue+try-write any pending wire bytes (non-blocking). Returns false on a
+    // fatal socket error.
+    bool flush() { return serializer_->Flush(); }
+
+    // Drain the outbound wire queue as far as the socket accepts. Call when the
+    // wire fd is writable. Returns false on fatal error.
+    bool pumpOut() { return serializer_->pumpOut(); }
+    bool hasPendingOut() const { return serializer_->hasPendingOut(); }
+
+    // Cumulative framed wire bytes queued so far (the cross-channel ordering
+    // serial). Sample after flush(); send in a ctrl message so the peer defers
+    // acting until its wire reader has consumed at least this many bytes.
+    uint64_t wireBytesQueued() const { return serializer_->bytesQueued(); }
 
     // Read and dispatch all currently-available inbound wire frames, then
     // process wire-client events. Non-blocking. For the libuv steady state.
-    void drainInbound();
+    // Returns false if the peer closed the wire.
+    bool drainInbound();
 
     // Spin (flush + drain one frame + process events) until `done()` or a bound
     // is hit. One-shot bring-up only. Returns done().
@@ -54,6 +67,7 @@ class WireLink {
     int wireFd_;
     int ctrlFd_;
     ipc::FdSerializer* serializer_ = nullptr;
+    ipc::FrameReader* reader_ = nullptr;
     dawn::wire::WireClient* client_ = nullptr;
     WGPUInstance instance_ = nullptr;
 };
