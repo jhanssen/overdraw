@@ -29,13 +29,26 @@ export interface CompositorState {
   wm?: Wm;
   seat?: SeatState;
   lastCommittedSurfaceId?: number;
+  // Fire all surfaces' pending wl_surface.frame callbacks (set by installProtocols;
+  // called once per compositor frame). timeMs is a millisecond timestamp.
+  dispatchFrameCallbacks?: (timeMs: number) => void;
   // Per-protocol bookkeeping maps, created lazily by handlers.
   pools?: Map<Resource, { poolId: number; size: number }>;
   buffers?: Map<Resource, BufferDesc>;
   xdgSurfaces?: Map<Resource, XdgSurfaceRecord>;
   toplevels?: Map<Resource, ToplevelRecord>;
   dmabufParams?: Map<Resource, DmabufParams>;
+  subsurfaces?: Map<Resource, SubsurfaceRecord>;
   [key: string]: unknown;
+}
+
+export interface SubsurfaceRecord {
+  resource: Resource;
+  surface: Resource;
+  parent: Resource;
+  x: number;
+  y: number;
+  sync: boolean;
 }
 
 export interface BufferDesc {

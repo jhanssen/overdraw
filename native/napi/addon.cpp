@@ -252,11 +252,12 @@ void onInputReadable(uv_poll_t*, int status, int) {
 void onFrameTimer(uv_timer_t*) {
     if (!g_addon.compositor) return;
     g_addon.compositor->renderFrame();
-    // Notify JS once per ~60 frames (≈1Hz) to prove the C++->JS event path
-    // without flooding.
-    uint64_t n = g_addon.compositor->presented();
-    if (n - g_addon.lastNotified >= 60) {
-        g_addon.lastNotified = n;
+    // Notify JS every frame: clients drive their render loop off wl_surface.frame
+    // callbacks, which the JS layer fires from this hook. (Was throttled to ~1Hz
+    // when onFrame was only a demo heartbeat; now it carries frame-callback
+    // dispatch, so it must run per frame.)
+    if (g_addon.compositor->presented() != g_addon.lastNotified) {
+        g_addon.lastNotified = g_addon.compositor->presented();
         notifyFrame();
     }
 }

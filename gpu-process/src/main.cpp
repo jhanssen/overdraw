@@ -195,9 +195,23 @@ int run(int wireFd, int ctrlFd, int inputFd) {
 
     wgpu::SurfaceCapabilities caps{};
     surface.GetCapabilities(adapter, &caps);
-    uint32_t format = caps.formatCount
-                          ? static_cast<uint32_t>(caps.formats[0])
-                          : static_cast<uint32_t>(WGPUTextureFormat_BGRA8Unorm);
+    // Choose a NON-sRGB swapchain format. Client buffers carry sRGB-encoded
+    // bytes and the compositing shader passes them through unchanged; an sRGB
+    // swapchain target would sRGB-encode the output a second time (visibly too
+    // bright). Prefer the first advertised non-*Srgb format; fall back to the
+    // first format, then BGRA8Unorm.
+    auto isSrgb = [](uint32_t f) {
+        return f == static_cast<uint32_t>(WGPUTextureFormat_RGBA8UnormSrgb) ||
+               f == static_cast<uint32_t>(WGPUTextureFormat_BGRA8UnormSrgb);
+    };
+    uint32_t format = static_cast<uint32_t>(WGPUTextureFormat_BGRA8Unorm);
+    if (caps.formatCount) {
+        format = static_cast<uint32_t>(caps.formats[0]);
+        for (size_t i = 0; i < caps.formatCount; ++i) {
+            uint32_t f = static_cast<uint32_t>(caps.formats[i]);
+            if (!isSrgb(f)) { format = f; break; }
+        }
+    }
 
     // Prefer Mailbox: GetCurrentTexture is a blocking wire call on the server's
     // single command thread, and FIFO blocks it whenever the host compositor

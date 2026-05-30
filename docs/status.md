@@ -4,7 +4,7 @@ Tracks what is built and empirically proven versus what is still design only.
 The design itself lives in `architecture.md`; this file is the ground truth for
 "what exists right now."
 
-Last updated: 2026-05-30 (rev 10).
+Last updated: 2026-05-30 (rev 11).
 
 ## Verification environment
 
@@ -147,6 +147,47 @@ phase-1 interactivity goal (connect → place → receive input) is met for both
   cursor), touch, multi-seat, click-to-focus / keyboard focus independent of the
   pointer, key-repeat generation (repeat_info sent; client repeats), axis
   source/discrete refinement.
+
+### Real upstream client: `foot` runs end-to-end (verified)
+An unmodified upstream `foot` terminal (1.25.0) connects, renders, and is
+interactive in overdraw. Launch via `npm run compositor` (`src/main.ts`), which
+brings up the compositor, starts the server, installs protocols, wires input,
+prints `WAYLAND_DISPLAY`, and runs until SIGINT.
+
+- Globals added so `foot` (and similar shm/buffer clients) get past startup:
+  `wl_subcompositor`/`wl_subsurface`, `wl_output` (advertises one monitor at the
+  host logical size, scale 1, 60Hz), `wl_data_device_manager`/`wl_data_device`/
+  `wl_data_source`. `wl_callback` (frame callbacks). `zwp_linux_dmabuf_feedback_v1`
+  (minimal `done`, crash-fix from earlier).
+- **Frame callbacks** (`wl_surface.frame` → `wl_callback.done`): the JS layer's
+  `dispatchFrameCallbacks` fires every compositor frame (driven from the now-
+  per-frame `onFrame` hook). Without this a client renders one frame and waits
+  forever — the bug that made `foot` show only its initial background.
+- **Color fix**: the host advertises `RGBA8UnormSrgb` first; using it
+  double-encoded sRGB (client bytes are already sRGB, the shader passes them
+  through, an sRGB swapchain re-encodes → too bright). The GPU process now picks
+  the first **non-sRGB** advertised format. Pass-through is correct for opaque
+  content; NOTE alpha blending now happens in sRGB space (technically wrong for
+  translucency — the proper linear-compositing pipeline is future work).
+- Verified: `foot` renders its prompt, types interactively (keyboard routed,
+  confirmed by running a command), colors match a real compositor. **PASS.**
+- LIMITATIONS hit by `foot`, flagged: **subsurfaces are not composited** (only
+  the primary surface draws), so `foot`'s CSD borders/title and overlays
+  (search box) do not appear; **clipboard is a no-op** (`wl_data_device_manager`
+  exists but does nothing); no server-side decorations, fractional scale, primary
+  selection, xdg-activation, cursor-shape, text-input (all advertised-absent →
+  `foot` warns and falls back).
+
+### Vulkan-WSI clients are NOT supported (architectural boundary)
+A client that presents via a Vulkan/WebGPU **swapchain on its `wl_surface`**
+(Dawn `SurfaceSourceWaylandSurface` → `vkCreateWaylandSurfaceKHR` +
+`vkCreateSwapchainKHR`) cannot run: overdraw is a **buffer-submission** compositor
+(shm / `linux-dmabuf-v1` `create_immed`), not a Vulkan-WSI-presentable target. It
+does not expose the dmabuf feedback (full format table + main_device) / sync /
+presentation protocols the Vulkan driver's Wayland WSI requires. Such a client
+fails at `vkGetPhysicalDeviceSurfaceFormatsKHR` / `Surface.Configure()`. Making
+overdraw WSI-presentable is a large, separate effort with NVIDIA-driver-specific
+unknowns; clients must instead submit buffers (shm/dmabuf) to run today.
 
 ### Compositing (multi-surface: per-surface placement + stacking + blending)
 - A textured-quad pipeline composites client surfaces: shaders, sampler,

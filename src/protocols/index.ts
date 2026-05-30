@@ -34,7 +34,10 @@ type HandlerFactory = (ctx: Ctx) => object;
 interface HandlerModule { default: HandlerFactory; }
 
 // Interfaces advertised as globals (clients bind them from the registry).
-const GLOBALS = ["wl_compositor", "xdg_wm_base", "wl_shm", "zwp_linux_dmabuf_v1", "wl_seat"];
+const GLOBALS = [
+  "wl_compositor", "xdg_wm_base", "wl_shm", "zwp_linux_dmabuf_v1", "wl_seat",
+  "wl_subcompositor", "wl_output", "wl_data_device_manager",
+];
 
 // Interfaces created via requests (new_id), registered without a global so
 // their child resources dispatch to a handler.
@@ -42,6 +45,7 @@ const CHILD_INTERFACES = [
   "wl_surface", "wl_region", "xdg_surface", "xdg_toplevel",
   "wl_shm_pool", "wl_buffer", "zwp_linux_buffer_params_v1",
   "wl_pointer", "wl_keyboard", "zwp_linux_dmabuf_feedback_v1",
+  "wl_subsurface", "wl_data_device", "wl_data_source", "wl_callback",
 ];
 
 // Load all generated signature modules, keyed by interface name.
@@ -83,6 +87,23 @@ export async function installProtocols(
   };
   state.wm = createWm(addon, output);
 
+  // Fire pending wl_surface.frame callbacks. Clients drive their render loop off
+  // these (commit -> request frame -> draw next frame on done), so without this
+  // a client renders one frame and waits forever. Called once per compositor
+  // frame from the launcher's onFrame hook. wl_callback.done carries a ms
+  // timestamp; the callback is single-shot (client re-requests each frame).
+  state.dispatchFrameCallbacks = (timeMs: number): void => {
+    for (const s of state.surfaces.values()) {
+      const cbs = s.frameCallbacks;
+      if (!cbs || cbs.length === 0) continue;
+      s.frameCallbacks = [];
+      for (const cb of cbs) {
+        if (cb.destroyed) continue;
+        events.wl_callback.send_done(cb, timeMs >>> 0);
+      }
+    }
+  };
+
   const ctx: Ctx = { events, state, addon };
 
   // Import handler modules. A handler module default-exports a factory.
@@ -99,15 +120,24 @@ export async function installProtocols(
     zwp_linux_dmabuf_v1: await import("./zwp_linux_dmabuf_v1.js"),
     zwp_linux_buffer_params_v1: await import("./zwp_linux_buffer_params_v1.js"),
     wl_seat: await import("./wl_seat.js"),
+    wl_subcompositor: await import("./wl_subcompositor.js"),
+    wl_output: await import("./wl_output.js"),
+    wl_data_device_manager: await import("./wl_data_device_manager.js"),
   };
 
   // Some child interfaces have handlers from a sibling module's named exports.
   const seatMod = await import("./wl_seat.js");
   const dmabufMod = await import("./zwp_linux_dmabuf_v1.js");
+  const subMod = await import("./wl_subcompositor.js");
+  const ddmMod = await import("./wl_data_device_manager.js");
   const childHandlers: Record<string, object> = {
     wl_pointer: seatMod.makePointer(ctx),
     wl_keyboard: seatMod.makeKeyboard(ctx),
     zwp_linux_dmabuf_feedback_v1: dmabufMod.makeDmabufFeedback(),
+    wl_subsurface: subMod.makeSubsurface(ctx),
+    wl_data_device: ddmMod.makeDataDevice(),
+    wl_data_source: ddmMod.makeDataSource(),
+    wl_callback: {}, // event-only (done); no requests to dispatch
   };
 
   for (const name of CHILD_INTERFACES) {

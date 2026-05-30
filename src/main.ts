@@ -27,6 +27,13 @@ const gpuBin = process.env.OVERDRAW_GPU_PROCESS
 let state: CompositorState | null = null;
 const onInput = (ev: InputEvent): void => { state?.seat?.handleInput(ev); };
 
+// Per-frame: fire client frame callbacks so their render loops advance. The
+// argument is the presented-frame count; clients want a ms timestamp, so use a
+// monotonic clock here.
+const onFrame = (): void => {
+  state?.dispatchFrameCallbacks?.(Math.round(performance.now()));
+};
+
 let stopped = false;
 function shutdown(signal: string): void {
   if (stopped) return;
@@ -39,7 +46,7 @@ function shutdown(signal: string): void {
 process.on("SIGINT", () => shutdown("SIGINT"));
 process.on("SIGTERM", () => shutdown("SIGTERM"));
 
-const dims = addon.start(gpuBin, null, onInput);
+const dims = addon.start(gpuBin, onFrame, onInput);
 console.log(`[overdraw] compositor up; output ${dims.width}x${dims.height}`);
 
 const sock = addon.startServer();
