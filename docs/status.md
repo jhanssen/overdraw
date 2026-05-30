@@ -4,7 +4,7 @@ Tracks what is built and empirically proven versus what is still design only.
 The design itself lives in `architecture.md`; this file is the ground truth for
 "what exists right now."
 
-Last updated: 2026-05-30 (rev 8).
+Last updated: 2026-05-30 (rev 9).
 
 ## Verification environment
 
@@ -67,9 +67,10 @@ server) topology runs as real, non-spike code and presents to a host window:
 - Still C++-internal / not in JS: protocol semantics, WM/policy, the plugin
   model. "JS owns this" per the design has not started beyond the entry script.
 - `wl_event_loop` (server-side Wayland) integration does not exist — there is no
-  Wayland server yet. No resize handling. Host *input* now arrives in the core
-  (see "Host input forwarding"); routing it back out to overdraw's own clients
-  via `wl_seat` is not built.
+  Wayland server yet. No resize handling. Host *input* arrives in the core (see
+  "Host input forwarding") and **pointer** input is routed to clients via
+  `wl_seat`/`wl_pointer` (see "Pointer input routing"); keyboard routing is not
+  built.
 
 ### Host input forwarding (host seat -> GPU process -> core -> JS, verified)
 Host pointer/keyboard events reach the core as normalized events. The seam is a
@@ -107,10 +108,35 @@ without touching anything above it.
 - Limitations: coordinate mapping is currently identity (output logical size ==
   host window size, scale 1; `setOutputSize()` hook exists but is uncalled — real
   mapping waits on resize/scale handling). Touch not forwarded. No keymap
-  translation (raw evdev codes only). Routing these events to overdraw's own
-  Wayland clients via `wl_seat`/`wl_pointer`/`wl_keyboard` is NOT built; keyboard
-  emission there will need the still-stubbed trampoline fd *encode* (for the
-  `wl_keyboard.keymap` fd) plus xkbcommon.
+  translation (raw evdev codes only).
+
+### Pointer input routing to clients (wl_seat / wl_pointer, verified)
+A real Wayland client receives mouse events on its surface — the phase-1
+interactivity goal (connect → place → receive input) is met for pointer.
+
+- `src/protocols/wl_seat.js`: the `wl_seat` global advertises **pointer**
+  capability; the seat module tracks `wl_pointer` resources per client and routes
+  the normalized `onInput` stream. `handleInput` hit-tests the WM window stack
+  (`wm.windowAt`), tracks focus, and emits `wl_pointer`
+  enter/leave/motion/button/axis/frame to the `wl_pointer`(s) of the client that
+  owns the focused surface, with **surface-local** coordinates. `wl_pointer`/
+  `wl_keyboard` are registered as child interfaces (release/set_cursor handled;
+  keyboard is NOT routed yet).
+- `Trampoline::clientIdOf` + addon `clientId(resource)`: a stable per-client id
+  (the `wl_client*`) lets JS associate the focused surface with the right
+  client's pointer without exposing `wl_client` to JS.
+- WM hit-test: `mapWindow` records the effective window size (committed buffer
+  dims when the placement stub leaves size 0) so `windowAt` has real bounds.
+- `onInput` is wired through `installProtocols`' returned
+  `state.seat.handleInput` (start() runs before installProtocols, so the
+  callback delegates to the seat once it exists).
+- Verified interactively (`test/compositing-eyeball.mjs` + `test/color-client.c`
+  which logs pointer events): hovering/clicking two windows produces correct
+  per-window enter/leave, surface-local motion, and button events in the owning
+  client. **PASS.**
+- Not built: keyboard routing (needs the still-stubbed trampoline fd *encode*
+  for `wl_keyboard.keymap` + xkbcommon), client cursor surfaces (`set_cursor` is
+  a no-op; no software cursor), touch, multi-seat, axis source/discrete refinement.
 
 ### Compositing (multi-surface: per-surface placement + stacking + blending)
 - A textured-quad pipeline composites client surfaces: shaders, sampler,
@@ -149,8 +175,9 @@ without touching anything above it.
   wire work behind it (including buffer-map). Mailbox avoids that.
 - Still absent: per-surface transforms/opacity/rotation/scale, fractional scale,
   multi-output, damage, real WM/layout policy (placement is a cascade stub),
-  input routing to clients (no `wl_seat` emission yet), resize handling. Output
-  logical size == host window size (scale 1).
+  keyboard routing to clients, resize handling. Output logical size == host
+  window size (scale 1). Pointer routing to clients IS done (see "Pointer input
+  routing").
 
 ### Client shm buffers end-to-end (upload → composite → present, pixel-verified)
 A real Wayland client can map a window with content and have its pixels reach
