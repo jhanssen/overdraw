@@ -75,6 +75,27 @@ and cleaned up carefully.
   tool is waiting on fd EOF. Redirect child output to files and/or fully detach
   to avoid this.
 
+## Testing policy (new protocols)
+
+- **Every new Wayland protocol gets a test.** When you add or extend a protocol
+  handler, add a unit test that exercises that protocol IN ISOLATION (its
+  requests/events, opcodes, the specific behavior it adds) — not just "it didn't
+  crash." Prefer the cheapest tier that proves the behavior:
+  - pure-unit / structural (`test/**/*.test.js`, GPU-free) when the logic can be
+    tested without the GPU/compositor (e.g. generator metadata, state transitions);
+  - the integration harness (`test/*.gpu.mjs`, `setupCompositor` + a real client +
+    `state.query()` / `frameReadback` / client-reported stdout) when it needs the
+    live server.
+- **If isolating the protocol genuinely doesn't make sense** (the behavior only
+  manifests through interaction with other protocols, compositing, focus, etc.),
+  then write a MORE COMPREHENSIVE test that covers it end-to-end through that
+  interaction — and say so explicitly. Do not skip coverage and call it a "stub":
+  a stub with no test is an untested path, which violates the no-gaps rule above.
+  If you believe a protocol truly cannot/should not be tested yet, flag it to the
+  user with the reason rather than silently leaving it uncovered.
+- Keep `npm test` GPU-free; GPU/host-Wayland tests go in `test/*.gpu.mjs`
+  (`npm run test:gpu`). No interactive (human-in-the-loop) tests.
+
 ## Bisecting wire / device-async issues
 
 - Device/queue-level async ops over the Dawn wire (buffer `MapAsync`,
