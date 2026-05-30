@@ -23,8 +23,30 @@ struct Addon {
     uv_poll_t wirePoll{};
     uv_timer_t frameTimer{};
     bool loopRunning = false;
+
+    // Optional JS callback for frame events. Stored as a ref; called directly
+    // from the frame timer (same thread as Node, so no threadsafe function is
+    // needed). Cross-thread events (e.g. Dawn callbacks on Dawn-internal
+    // threads) will need napi_threadsafe_function -- not exercised yet.
+    napi_env env = nullptr;
+    napi_ref onFrame = nullptr;
+    uint64_t lastNotified = 0;
 };
 Addon g_addon;
+
+// Call the JS onFrame(presentedCount) callback if registered. Same-thread.
+void notifyFrame() {
+    if (!g_addon.onFrame || !g_addon.compositor) return;
+    napi_env env = g_addon.env;
+    napi_handle_scope scope;
+    napi_open_handle_scope(env, &scope);
+    napi_value cb, undefined, arg;
+    napi_get_reference_value(env, g_addon.onFrame, &cb);
+    napi_get_undefined(env, &undefined);
+    napi_create_uint32(env, static_cast<uint32_t>(g_addon.compositor->presented()), &arg);
+    napi_call_function(env, undefined, cb, 1, &arg, nullptr);
+    napi_close_handle_scope(env, scope);
+}
 
 napi_value throwError(napi_env env, const char* msg) {
     napi_throw_error(env, nullptr, msg);
@@ -37,13 +59,21 @@ void onWireReadable(uv_poll_t*, int status, int) {
 }
 
 void onFrameTimer(uv_timer_t*) {
-    if (g_addon.compositor) g_addon.compositor->renderFrame();
+    if (!g_addon.compositor) return;
+    g_addon.compositor->renderFrame();
+    // Notify JS once per ~60 frames (≈1Hz) to prove the C++->JS event path
+    // without flooding.
+    uint64_t n = g_addon.compositor->presented();
+    if (n - g_addon.lastNotified >= 60) {
+        g_addon.lastNotified = n;
+        notifyFrame();
+    }
 }
 
-// start(gpuBinPath) -> { width, height }
+// start(gpuBinPath, onFrame?) -> { width, height }
 napi_value Start(napi_env env, napi_callback_info info) {
-    size_t argc = 1;
-    napi_value argv[1];
+    size_t argc = 2;
+    napi_value argv[2];
     napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
     if (argc < 1) return throwError(env, "start(gpuBinPath) requires a path");
 
@@ -51,6 +81,14 @@ napi_value Start(napi_env env, napi_callback_info info) {
     size_t len = 0;
     if (napi_get_value_string_utf8(env, argv[0], gpuBin, sizeof(gpuBin), &len) != napi_ok)
         return throwError(env, "gpuBinPath must be a string");
+
+    // Optional frame-event callback.
+    g_addon.env = env;
+    if (argc >= 2) {
+        napi_valuetype t;
+        napi_typeof(env, argv[1], &t);
+        if (t == napi_function) napi_create_reference(env, argv[1], 1, &g_addon.onFrame);
+    }
 
     auto gpu = overdraw::core::spawnGpuProcess(gpuBin);
     if (gpu.pid < 0) return throwError(env, "failed to spawn gpu process");
@@ -99,6 +137,11 @@ napi_value Stop(napi_env env, napi_callback_info) {
         g_addon.compositor->shutdown();
         g_addon.compositor.reset();
     }
+    if (g_addon.onFrame) {
+        napi_delete_reference(env, g_addon.onFrame);
+        g_addon.onFrame = nullptr;
+    }
+    g_addon.lastNotified = 0;
     napi_value undef; napi_get_undefined(env, &undef);
     return undef;
 }
