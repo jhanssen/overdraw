@@ -88,19 +88,32 @@ export async function setupCompositor(opts = {}) {
   // Spawn a harness-client. Resolves once the client prints its "mapped" line
   // (so the surface exists on the wire); the caller then waitFor()s the window
   // to appear in query() (map happens on the server's next commit processing).
+  // The returned handle accumulates the client's stdout and offers waitForLine()
+  // so tests can assert what the client RECEIVED (frame.done, kb.key, output.*).
   function spawnClient(args = []) {
     const child = spawn(clientBin, ["--socket", sock, ...args], { stdio: ["ignore", "pipe", "pipe"] });
     clients.push(child);
-    const ready = new Promise((resolve, reject) => {
-      let buf = "";
+    const handle = { child, stdout: "", ready: null };
+    handle.ready = new Promise((resolve, reject) => {
       const to = setTimeout(() => reject(new Error("client did not map in time")), 5000);
       child.stdout.on("data", (d) => {
-        buf += d.toString();
-        if (buf.includes("[harness-client] mapped")) { clearTimeout(to); resolve(child); }
+        handle.stdout += d.toString();
+        if (handle.stdout.includes("[harness-client] mapped")) { clearTimeout(to); resolve(child); }
       });
       child.on("exit", (code) => { clearTimeout(to); if (code) reject(new Error(`client exited ${code}`)); });
     });
-    return { child, ready };
+    // Wait until the client's stdout matches `re` (RegExp) or substring. Yields
+    // to libuv so the server keeps processing while we wait.
+    handle.waitForLine = async (re, { timeoutMs = 4000, what = "client line" } = {}) => {
+      const test = (s) => (re instanceof RegExp ? re.test(s) : s.includes(re));
+      const t0 = Date.now();
+      while (Date.now() - t0 < timeoutMs) {
+        if (test(handle.stdout)) return handle.stdout;
+        await sleep(10);
+      }
+      throw new Error(`waitForLine timed out (${what}); stdout:\n${handle.stdout}`);
+    };
+    return handle;
   }
 
   async function teardown() {

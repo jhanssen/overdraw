@@ -660,9 +660,17 @@ follows the same model.
     at distinct positions both visible; top window wins the overlap (opaque
     stacking). Computed-expectation comparison (each client a known solid color
     at a `query()` rect, ±4/channel tolerance), no golden files.
+  - `test/protocols.gpu.mjs`: 3 protocol-delivery tests — `wl_output` (client
+    receives a mode matching the output size + done), `wl_callback` (compositor
+    fires `wl_surface.frame` → `wl_callback.done` each frame, client re-arms),
+    `wl_keyboard` (key injected via the host path is delivered to the focused
+    client as enter + key press/release). The harness-client reports what it
+    RECEIVES on stdout; `spawnClient(...).waitForLine(re)` asserts it. (Fixed a
+    latent harness-client bug: the hold loop dispatched the queue but never READ
+    the socket, so server-sent events were never delivered — now polls + reads.)
   - `npm run test:gpu` runs `test/*.gpu.mjs` with `--test-concurrency=1` (each
     test owns the GPU + a compositor; serial avoids socket-name and
-    GPU-process-leak-scan races).
+    GPU-process-leak-scan races). 13 GPU tests total.
 
 ### Headless mode (offscreen render, no host window)
 - `addon.start(gpuBin, onFrame?, onInput?, { width, height })` runs HEADLESS: the
@@ -690,11 +698,27 @@ follows the same model.
   colored squares). Superseded by `compositing.gpu.mjs`, which asserts the same
   placement + distinct positioning automatically via pixel readback, and adds
   overlap-stacking coverage the eyeball test lacked. NO interactive tests remain.
+- **Protocol coverage (what IS / is NOT behaviorally tested):**
+  - Tested end-to-end: `wl_compositor`, `wl_surface` (attach/commit/frame),
+    `xdg_wm_base`/`xdg_surface`/`xdg_toplevel` (configure, title/app_id),
+    `wl_shm`/`wl_shm_pool`/`wl_buffer` (pixel-verified), `zwp_linux_dmabuf_v1`/
+    `..._buffer_params_v1` (pixel-verified), `wl_seat`/`wl_pointer`/`wl_keyboard`
+    (focus routing + key delivery), `wl_output` (mode/geometry), `wl_callback`
+    (frame-callback delivery).
+  - Implemented but NOT behaviorally tested: `wl_region` (no-op stub),
+    `wl_subcompositor`/`wl_subsurface` (not composited — known gap),
+    `wl_data_device_manager`/`wl_data_device`/`wl_data_source` (clipboard no-op),
+    `zwp_linux_dmabuf_feedback_v1` (feedback path; exercised by real WSI clients
+    manually, no automated assertion). These are peripheral/stub paths with
+    little behavior to assert until they do something.
+  - Structural (`gen-protocol.test.js`) asserts generator metadata for 8 of 31
+    generated interfaces (wire signature spot-check), not all.
 - **Not yet built (testing):** a stdin command loop on the harness client for
   multi-step sequences (raise/move/resize) within one client lifetime; folding
   the GPU-free `*-smoke.mjs` server-only tests (trampoline/fd/xdg/server) into
   `npm test`; using `frameReadback` to also assert the dmabuf/shm upload smokes'
-  pixels through the headless path (then retiring `surfaceReadback`).
+  pixels through the headless path (then retiring `surfaceReadback`); pixel-test
+  subsurface compositing once that gap is built.
 
 ## Not yet built (design only)
 

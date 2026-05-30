@@ -19,6 +19,7 @@
 #include <stdint.h>
 #include <signal.h>
 #include <time.h>
+#include <poll.h>
 #include <sys/mman.h>
 
 #include <wayland-client.h>
@@ -27,10 +28,95 @@
 static struct wl_compositor* compositor = NULL;
 static struct wl_shm* shm = NULL;
 static struct xdg_wm_base* wm_base = NULL;
+static struct wl_seat* seat = NULL;
+static struct wl_keyboard* keyboard = NULL;
+static struct wl_output* output = NULL;
+static struct wl_surface* g_surface = NULL;
 static int surface_configured = 0;
 static volatile sig_atomic_t running = 1;
 
 static void onTerm(int sig) { (void)sig; running = 0; }
+
+// --- wl_output: report geometry/mode so the harness can assert the advertised
+// monitor matches the (headless) output size. ---
+static void outGeometry(void* d, struct wl_output* o, int32_t x, int32_t y,
+                        int32_t pw, int32_t ph, int32_t subpx, const char* make,
+                        const char* model, int32_t transform) {
+    (void)d;(void)o;(void)pw;(void)ph;(void)subpx;(void)make;(void)model;
+    printf("[harness-client] output.geometry x=%d y=%d transform=%d\n", x, y, transform);
+    fflush(stdout);
+}
+static void outMode(void* d, struct wl_output* o, uint32_t flags, int32_t w, int32_t h, int32_t refresh) {
+    (void)d;(void)o;
+    printf("[harness-client] output.mode flags=%u %dx%d refresh=%d\n", flags, w, h, refresh);
+    fflush(stdout);
+}
+static void outDone(void* d, struct wl_output* o) { (void)d;(void)o;
+    printf("[harness-client] output.done\n"); fflush(stdout); }
+static void outScale(void* d, struct wl_output* o, int32_t s) { (void)d;(void)o;
+    printf("[harness-client] output.scale %d\n", s); fflush(stdout); }
+static void outName(void* d, struct wl_output* o, const char* n) { (void)d;(void)o;(void)n; }
+static void outDescription(void* d, struct wl_output* o, const char* n) { (void)d;(void)o;(void)n; }
+static const struct wl_output_listener outListener = {
+    outGeometry, outMode, outDone, outScale, outName, outDescription };
+
+// --- wl_keyboard: report received keys so the harness can assert key delivery
+// to the focused client. ---
+static void kbKeymap(void* d, struct wl_keyboard* k, uint32_t fmt, int32_t fd, uint32_t size) {
+    (void)d;(void)k;(void)size;
+    printf("[harness-client] kb.keymap format=%u\n", fmt); fflush(stdout);
+    if (fd >= 0) close(fd);
+}
+static void kbEnter(void* d, struct wl_keyboard* k, uint32_t serial, struct wl_surface* s, struct wl_array* keys) {
+    (void)d;(void)k;(void)serial;(void)s;(void)keys;
+    printf("[harness-client] kb.enter\n"); fflush(stdout);
+}
+static void kbLeave(void* d, struct wl_keyboard* k, uint32_t serial, struct wl_surface* s) {
+    (void)d;(void)k;(void)serial;(void)s;
+    printf("[harness-client] kb.leave\n"); fflush(stdout);
+}
+static void kbKey(void* d, struct wl_keyboard* k, uint32_t serial, uint32_t time, uint32_t key, uint32_t state) {
+    (void)d;(void)k;(void)serial;(void)time;
+    printf("[harness-client] kb.key key=%u state=%u\n", key, state); fflush(stdout);
+}
+static void kbMods(void* d, struct wl_keyboard* k, uint32_t serial, uint32_t dep, uint32_t lat, uint32_t lock, uint32_t grp) {
+    (void)d;(void)k;(void)serial;
+    printf("[harness-client] kb.mods dep=%u lat=%u lock=%u grp=%u\n", dep, lat, lock, grp); fflush(stdout);
+}
+static void kbRepeat(void* d, struct wl_keyboard* k, int32_t rate, int32_t delay) {
+    (void)d;(void)k;(void)rate;(void)delay; }
+static const struct wl_keyboard_listener kbListener = {
+    kbKeymap, kbEnter, kbLeave, kbKey, kbMods, kbRepeat };
+
+static void seatCaps(void* d, struct wl_seat* s, uint32_t caps) {
+    (void)d;
+    if ((caps & WL_SEAT_CAPABILITY_KEYBOARD) && !keyboard) {
+        keyboard = wl_seat_get_keyboard(s);
+        wl_keyboard_add_listener(keyboard, &kbListener, NULL);
+    }
+}
+static void seatName(void* d, struct wl_seat* s, const char* n) { (void)d;(void)s;(void)n; }
+static const struct wl_seat_listener seatListener = { seatCaps, seatName };
+
+// --- wl_callback: report frame-callback completion so the harness can assert
+// the compositor fires wl_surface.frame -> wl_callback.done. ---
+static int frame_done_count = 0;
+static const struct wl_callback_listener frameListener;
+static void requestFrame(void);
+static void frameDone(void* d, struct wl_callback* cb, uint32_t t) {
+    (void)d;(void)t;
+    wl_callback_destroy(cb);
+    frame_done_count++;
+    printf("[harness-client] frame.done n=%d\n", frame_done_count); fflush(stdout);
+    requestFrame();  // re-arm, like a real render loop
+}
+static const struct wl_callback_listener frameListener = { frameDone };
+static void requestFrame(void) {
+    if (!g_surface) return;
+    struct wl_callback* cb = wl_surface_frame(g_surface);
+    wl_callback_add_listener(cb, &frameListener, NULL);
+    wl_surface_commit(g_surface);
+}
 
 static void wmPing(void* d, struct xdg_wm_base* b, uint32_t serial) { (void)d; xdg_wm_base_pong(b, serial); }
 static const struct xdg_wm_base_listener wmListener = { wmPing };
@@ -57,6 +143,12 @@ static void regGlobal(void* data, struct wl_registry* reg, uint32_t name, const 
     } else if (strcmp(iface, "xdg_wm_base") == 0) {
         wm_base = wl_registry_bind(reg, name, &xdg_wm_base_interface, version < 5 ? version : 5);
         xdg_wm_base_add_listener(wm_base, &wmListener, NULL);
+    } else if (strcmp(iface, "wl_seat") == 0 && !seat) {
+        seat = wl_registry_bind(reg, name, &wl_seat_interface, version < 5 ? version : 5);
+        wl_seat_add_listener(seat, &seatListener, NULL);
+    } else if (strcmp(iface, "wl_output") == 0 && !output) {
+        output = wl_registry_bind(reg, name, &wl_output_interface, version < 2 ? version : 2);
+        wl_output_add_listener(output, &outListener, NULL);
     }
 }
 static void regRemove(void* data, struct wl_registry* reg, uint32_t name) { (void)data;(void)reg;(void)name; }
@@ -68,6 +160,7 @@ int main(int argc, char** argv) {
     const char* app_id = "harness";
     int W = 200, H = 150;
     uint32_t color = 0xFF0000FFu;  // opaque blue (ARGB)
+    int report_frames = 0;  // --frames: drive a frame-callback loop + print done
 
     for (int i = 1; i < argc; ++i) {
         if (strcmp(argv[i], "--socket") == 0 && i + 1 < argc) socket = argv[++i];
@@ -75,6 +168,7 @@ int main(int argc, char** argv) {
         else if (strcmp(argv[i], "--color") == 0 && i + 1 < argc) { color = (uint32_t)strtoul(argv[++i], NULL, 16); }
         else if (strcmp(argv[i], "--title") == 0 && i + 1 < argc) title = argv[++i];
         else if (strcmp(argv[i], "--app-id") == 0 && i + 1 < argc) app_id = argv[++i];
+        else if (strcmp(argv[i], "--frames") == 0) report_frames = 1;
     }
     if (!socket) { fprintf(stderr, "usage: %s --socket NAME [--size WxH] [--color AARRGGBB] [--title T] [--app-id ID]\n", argv[0]); return 2; }
     if (W <= 0 || H <= 0) { fprintf(stderr, "[harness-client] bad size\n"); return 2; }
@@ -109,6 +203,7 @@ int main(int argc, char** argv) {
     struct wl_buffer* buffer = wl_shm_pool_create_buffer(pool, 0, W, H, stride, WL_SHM_FORMAT_ARGB8888);
 
     struct wl_surface* surface = wl_compositor_create_surface(compositor);
+    g_surface = surface;
     struct xdg_surface* xs = xdg_wm_base_get_xdg_surface(wm_base, surface);
     xdg_surface_add_listener(xs, &xsListener, NULL);
     struct xdg_toplevel* toplevel = xdg_surface_get_toplevel(xs);
@@ -130,12 +225,23 @@ int main(int argc, char** argv) {
            W, H, title, app_id, surface_configured);
     fflush(stdout);
 
+    // Optional: drive a frame-callback loop so the harness can assert the
+    // compositor fires wl_surface.frame -> wl_callback.done each frame.
+    if (report_frames) requestFrame();
+
     // Hold the surface alive, servicing the display, until the harness kills us.
+    // We must READ the socket (not just dispatch the in-memory queue) so events
+    // the server sends -- wl_keyboard.enter/key, wl_callback.done, etc. -- are
+    // actually delivered. poll the wl fd, then dispatch when readable; this stays
+    // responsive to SIGTERM (10ms poll timeout) without blocking.
+    int wlfd = wl_display_get_fd(display);
     while (running) {
-        if (wl_display_dispatch_pending(display) < 0) break;
+        wl_display_dispatch_pending(display);
         wl_display_flush(display);
-        struct timespec ts = { 0, 10 * 1000 * 1000 };  // 10ms
-        nanosleep(&ts, NULL);
+        struct pollfd pfd = { wlfd, POLLIN, 0 };
+        if (poll(&pfd, 1, 10) > 0 && (pfd.revents & POLLIN)) {
+            if (wl_display_dispatch(display) < 0) break;  // reads + dispatches
+        }
     }
 
     close(fd);
