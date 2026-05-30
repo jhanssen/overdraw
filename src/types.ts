@@ -67,6 +67,10 @@ export interface Addon {
   takeImportedSurfaces(): Array<{ id: number; width: number; height: number }>;
   // dmabuf bufferIds whose compositor GPU read has completed (safe to release).
   takeFreedBuffers(): number[];
+  // Synthetic input (test seam): feed a normalized InputEvent through the same
+  // sink the host seat uses, so it routes to onInput / the seat exactly as a real
+  // host event would. Used by integration tests to drive focus/pointer behavior.
+  injectInput(event: InputEvent): void;
   removeSurface(id: number): void;
   setSurfaceLayout(id: number, x: number, y: number, w: number, h: number): void;
   setStack(ids: number[]): void;

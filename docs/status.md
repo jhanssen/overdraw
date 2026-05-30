@@ -624,13 +624,34 @@ follows the same model.
   back-to-front stack order, and pointer/keyboard focus surface ids. Attached to
   the state returned by `installProtocols` as `state.query()`. This is the seam a
   future integration harness asserts against (geometry/focus), without pixels.
-- **Not yet built (testing):** an integration harness that spawns real clients
-  against a running server and asserts via `state.query()`; a synthetic
-  `InputBackend` (the seam exists in `native/core/input.h`) to inject input the
-  way Hyprland's test plugin injects `IKeyboard` events; a frame-readback
-  primitive for the optional GPU-box-only pixel layer (`readbackFrame` +
-  computed-expectation comparison). The existing `*-smoke.mjs` server-only tests
-  (trampoline/fd/xdg/server) are GPU-free but not yet folded into `npm test`.
+- **Integration tests** (`npm run test:gpu` → `node --test 'test/*.gpu.mjs'`;
+  require GPU + host Wayland, auto-skip when `WAYLAND_DISPLAY` unset). Drive REAL
+  libwayland clients against the full stack and assert on `state.query()`
+  (geometry / stacking / focus) — no pixel comparison, mirroring the reference
+  compositors' model.
+  - `test/harness.mjs`: brings up GPU process + present loop + server + protocols
+    with input routed to the seat; `spawnClient(args)` (resolves on the client's
+    "mapped" stdout line), `waitFor(query, pred)` (polls `query()` while yielding
+    to libuv — completion-driven, not a timer guess), and `teardown()` that kills
+    clients, stops the addon, and asserts NO GPU process leaked (scan by exact
+    comm `overdraw-gpu-pr`, per the process-management rules).
+  - `test/harness-client.c`: a controllable shm client — argv config (`--socket`,
+    `--size WxH`, `--color AARRGGBB`, `--title`, `--app-id`), maps one toplevel,
+    holds the surface until SIGTERM (harness controls lifetime; no sleeps).
+  - **Synthetic input backend**: `addon.injectInput(event)` feeds a normalized
+    `InputEvent` through the SAME `InputSink` the host seat uses, so it routes to
+    the seat exactly as a real host event would — the analog of Hyprland's test
+    plugin injecting `IKeyboard` events, but reusing the existing
+    `native/core/input.h` seam (no virtual-input protocol).
+  - `test/integration.gpu.mjs`: 5 tests, all passing — client map→query
+    (title/app_id/size), two-client stacking order, focus-on-map,
+    follow-pointer focus enter/clear, click-to-focus press + persist-on-leave.
+- **Not yet built (testing):** a frame-readback primitive for the optional
+  GPU-box-only PIXEL layer (`readbackFrame` + computed-expectation comparison —
+  the current `surfaceReadback` reads one surface texture, not the composited
+  frame). A stdin command loop on the harness client for multi-step sequences
+  (raise/move) within one client lifetime. Folding the existing GPU-free
+  `*-smoke.mjs` server-only tests (trampoline/fd/xdg/server) into `npm test`.
 
 ## Not yet built (design only)
 

@@ -126,6 +126,15 @@ target_include_directories(shm-test-client PRIVATE
     ${CMAKE_SOURCE_DIR}/native/wayland/generated)
 target_link_libraries(shm-test-client PRIVATE ${WAYLAND_CLIENT_LIBRARIES})
 
+# ---- harness client (controllable shm window for integration tests) ----
+add_executable(harness-client
+    test/harness-client.c
+    native/wayland/generated/xdg-shell-protocol.c)
+target_include_directories(harness-client PRIVATE
+    ${WAYLAND_CLIENT_INCLUDE_DIRS}
+    ${CMAKE_SOURCE_DIR}/native/wayland/generated)
+target_link_libraries(harness-client PRIVATE ${WAYLAND_CLIENT_LIBRARIES})
+
 # ---- color client (long-lived solid-color window for eyeballing compositing) ----
 add_executable(color-client
     test/color-client.c

@@ -718,6 +718,92 @@ napi_value TakeFreedBuffers(napi_env env, napi_callback_info) {
     return arr;
 }
 
+// --- helpers to read fields out of a JS input-event object ---
+uint32_t getU32(napi_env env, napi_value obj, const char* key, uint32_t dflt = 0) {
+    napi_value v;
+    if (napi_get_named_property(env, obj, key, &v) != napi_ok) return dflt;
+    napi_valuetype t; napi_typeof(env, v, &t);
+    if (t != napi_number) return dflt;
+    uint32_t out = dflt; napi_get_value_uint32(env, v, &out); return out;
+}
+double getF64(napi_env env, napi_value obj, const char* key, double dflt = 0.0) {
+    napi_value v;
+    if (napi_get_named_property(env, obj, key, &v) != napi_ok) return dflt;
+    napi_valuetype t; napi_typeof(env, v, &t);
+    if (t != napi_number) return dflt;
+    double out = dflt; napi_get_value_double(env, v, &out); return out;
+}
+bool getBoolProp(napi_env env, napi_value obj, const char* key) {
+    napi_value v;
+    if (napi_get_named_property(env, obj, key, &v) != napi_ok) return false;
+    bool out = false; napi_get_value_bool(env, v, &out); return out;
+}
+
+// injectInput(event) -> undefined
+// Synthetic input backend (test seam): build a normalized InputEvent from a plain
+// JS object and feed it through the SAME InputSink the host seat uses, so it
+// flows to the JS onInput callback and the seat routing exactly as a real host
+// event would. `event.type` is one of the inputTypeName() strings; the remaining
+// fields mirror the onInput payload. Same Node thread; no marshaling.
+napi_value InjectInput(napi_env env, napi_callback_info info) {
+    size_t argc = 1; napi_value argv[1];
+    napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+    if (argc < 1) return throwError(env, "injectInput(event) requires an event object");
+
+    std::string type = getStr(env, argv[0], "type");
+    InputEvent ev{};
+    ev.serial = getU32(env, argv[0], "serial");
+    ev.time = getU32(env, argv[0], "time");
+
+    if (type == "pointerEnter")            ev.type = InputEventType::PointerEnter;
+    else if (type == "pointerLeave")       ev.type = InputEventType::PointerLeave;
+    else if (type == "pointerMotion")      ev.type = InputEventType::PointerMotion;
+    else if (type == "pointerButton")      ev.type = InputEventType::PointerButton;
+    else if (type == "pointerAxis")        ev.type = InputEventType::PointerAxis;
+    else if (type == "pointerFrame")       ev.type = InputEventType::PointerFrame;
+    else if (type == "keyboardEnter")      ev.type = InputEventType::KeyboardEnter;
+    else if (type == "keyboardLeave")      ev.type = InputEventType::KeyboardLeave;
+    else if (type == "keyboardKey")        ev.type = InputEventType::KeyboardKey;
+    else if (type == "keyboardModifiers")  ev.type = InputEventType::KeyboardModifiers;
+    else return throwError(env, "injectInput: unknown event.type");
+
+    switch (ev.type) {
+        case InputEventType::PointerEnter:
+        case InputEventType::PointerMotion:
+            ev.x = getF64(env, argv[0], "x");
+            ev.y = getF64(env, argv[0], "y");
+            break;
+        case InputEventType::PointerButton:
+            ev.button = getU32(env, argv[0], "button");
+            ev.buttonState = getBoolProp(env, argv[0], "pressed")
+                                 ? ButtonState::Pressed : ButtonState::Released;
+            break;
+        case InputEventType::PointerAxis:
+            ev.axis = getBoolProp(env, argv[0], "horizontal")
+                          ? AxisKind::HorizontalScroll : AxisKind::VerticalScroll;
+            ev.axisValue = getF64(env, argv[0], "value");
+            ev.axisDiscrete = static_cast<int32_t>(getU32(env, argv[0], "discrete"));
+            break;
+        case InputEventType::KeyboardKey:
+            ev.key = getU32(env, argv[0], "key");
+            ev.buttonState = getBoolProp(env, argv[0], "pressed")
+                                 ? ButtonState::Pressed : ButtonState::Released;
+            break;
+        case InputEventType::KeyboardModifiers:
+            ev.modsDepressed = getU32(env, argv[0], "modsDepressed");
+            ev.modsLatched = getU32(env, argv[0], "modsLatched");
+            ev.modsLocked = getU32(env, argv[0], "modsLocked");
+            ev.group = getU32(env, argv[0], "group");
+            break;
+        default:
+            break;
+    }
+
+    g_inputSink.onInputEvent(ev);
+    napi_value undef; napi_get_undefined(env, &undef);
+    return undef;
+}
+
 // removeSurface(surfaceId) -> undefined
 napi_value RemoveSurface(napi_env env, napi_callback_info info) {
     size_t argc = 1; napi_value argv[1];
@@ -895,6 +981,7 @@ napi_value Init(napi_env env, napi_value exports) {
     reg("commitSurfaceDmabuf", CommitSurfaceDmabuf);
     reg("takeImportedSurfaces", TakeImportedSurfaces);
     reg("takeFreedBuffers", TakeFreedBuffers);
+    reg("injectInput", InjectInput);
     reg("removeSurface", RemoveSurface);
     reg("setSurfaceLayout", SetSurfaceLayout);
     reg("setStack", SetStack);
