@@ -41,7 +41,7 @@ const GLOBALS = ["wl_compositor", "xdg_wm_base", "wl_shm", "zwp_linux_dmabuf_v1"
 const CHILD_INTERFACES = [
   "wl_surface", "wl_region", "xdg_surface", "xdg_toplevel",
   "wl_shm_pool", "wl_buffer", "zwp_linux_buffer_params_v1",
-  "wl_pointer", "wl_keyboard",
+  "wl_pointer", "wl_keyboard", "zwp_linux_dmabuf_feedback_v1",
 ];
 
 // Load all generated signature modules, keyed by interface name.
@@ -101,11 +101,13 @@ export async function installProtocols(
     wl_seat: await import("./wl_seat.js"),
   };
 
-  // wl_pointer / wl_keyboard handlers come from the seat module's named exports.
+  // Some child interfaces have handlers from a sibling module's named exports.
   const seatMod = await import("./wl_seat.js");
+  const dmabufMod = await import("./zwp_linux_dmabuf_v1.js");
   const childHandlers: Record<string, object> = {
     wl_pointer: seatMod.makePointer(ctx),
     wl_keyboard: seatMod.makeKeyboard(ctx),
+    zwp_linux_dmabuf_feedback_v1: dmabufMod.makeDmabufFeedback(),
   };
 
   for (const name of CHILD_INTERFACES) {

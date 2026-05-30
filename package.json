@@ -10,6 +10,7 @@
   },
   "scripts": {
     "start": "npm run build:js && node dist/index.js",
+    "compositor": "npm run build:js && node dist/main.js",
     "gen-protocols": "node tools/gen-protocol/gen-protocol.js",
     "build:js": "npm run gen-protocols && tsc",
     "test": "npm run build:js && node --test 'test/**/*.test.js'"

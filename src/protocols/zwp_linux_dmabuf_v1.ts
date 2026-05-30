@@ -5,6 +5,7 @@
 // can't handle, surfacing as buffer_params.failed.
 
 import type { ZwpLinuxDmabufV1Handler } from "#protocols-gen/zwp_linux_dmabuf_v1.js";
+import type { ZwpLinuxDmabufFeedbackV1Handler } from "#protocols-gen/zwp_linux_dmabuf_feedback_v1.js";
 import type { Ctx } from "./ctx.js";
 import type { Resource } from "../types.js";
 
@@ -48,10 +49,34 @@ export default function makeLinuxDmabuf(ctx: Ctx): DmabufHandler {
       ctx.state.dmabufParams ??= new Map();
       ctx.state.dmabufParams.set(params, { planes: [], used: false });
     },
-    get_default_feedback(_resource, _feedback) {
-      // Feedback not implemented (v4+); clients fall back to format/modifier.
+    get_default_feedback(_resource, feedback) {
+      sendMinimalFeedback(ctx, feedback);
     },
-    get_surface_feedback(_resource, _feedback, _surface) {},
+    get_surface_feedback(_resource, feedback, _surface) {
+      sendMinimalFeedback(ctx, feedback);
+    },
+    destroy(_resource) {},
+  };
+}
+
+// Minimal dmabuf feedback: send `done` with no format table or tranches. This
+// is the "no special per-surface feedback" case -- clients fall back to the v3
+// format/modifier events advertised on bind. Crucially it gives the feedback
+// child resource a real (non-NULL) implementation so libwayland does not abort
+// when the client interacts with it.
+//
+// NOTE: a fully-spec feedback would send format_table (an fd to a
+// {format,modifier} table) + main_device + tranche_* + done. That needs native
+// support (the DRM device dev_t + the importable format/modifier set as a binary
+// table) and is not built; this minimal form is protocol-legal but may not
+// satisfy a Vulkan-WSI client that requires the format table.
+function sendMinimalFeedback(ctx: Ctx, feedback: Resource): void {
+  ctx.events.zwp_linux_dmabuf_feedback_v1.send_done(feedback);
+}
+
+// Handler for the zwp_linux_dmabuf_feedback_v1 child resource (only `destroy`).
+export function makeDmabufFeedback(): ZwpLinuxDmabufFeedbackV1Handler {
+  return {
     destroy(_resource) {},
   };
 }
