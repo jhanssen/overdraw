@@ -1,7 +1,21 @@
 // xdg_surface: the role-agnostic shell surface. get_toplevel assigns the
 // toplevel role and starts the configure handshake (xdg_toplevel.configure then
-// xdg_surface.configure with a serial the client must ack_configure). For first
-// light we send an empty toplevel state and a 0x0 configure (client picks size).
+// xdg_surface.configure with a serial the client must ack_configure). The
+// configure sends 0x0 (client picks size) and a states wl_array; for a lone
+// window we mark it activated.
+
+import { signature as toplevelSig } from '../protocols-gen/xdg_toplevel.js';
+
+const STATE = toplevelSig.enums.state.entries; // { maximized:1, activated:4, ... }
+
+// Pack a list of xdg_toplevel state values into the wl_array wire form: a
+// contiguous run of host-endian uint32 (libwayland copies the bytes verbatim;
+// the client reads them back as uint32). Returned as a Uint8Array.
+function packStates(states) {
+  const buf = new ArrayBuffer(states.length * 4);
+  new Uint32Array(buf).set(states);
+  return new Uint8Array(buf);
+}
 
 export default function makeXdgSurface(ctx) {
   const rec = (resource) => ctx.state.xdgSurfaces?.get(resource);
@@ -16,10 +30,11 @@ export default function makeXdgSurface(ctx) {
       ctx.state.toplevels.set(toplevel, { resource: toplevel, xdgSurface: xs, title: null, appId: null });
       if (xs.surface) xs.surface.role = 'xdg_toplevel';
 
-      // Initial configure handshake. Send the role configure first (empty
-      // states, 0x0 => client chooses its own size), then xdg_surface.configure
-      // with a serial. The client renders, then ack_configures the serial.
-      const states = new Uint8Array(0); // wl_array of uint32 states; none for now
+      // Initial configure handshake. Send the role configure first (0x0 =>
+      // client chooses its own size; states marks the lone window activated),
+      // then xdg_surface.configure with a serial. The client renders, then
+      // ack_configures the serial.
+      const states = packStates([STATE.activated]);
       ctx.events.xdg_toplevel.send_configure(toplevel, 0, 0, states);
       const serial = ctx.state.serial();
       xs.lastConfigureSerial = serial;

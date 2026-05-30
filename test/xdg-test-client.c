@@ -20,6 +20,8 @@ static struct xdg_wm_base* wm_base = NULL;
 static int toplevel_configured = 0;
 static int surface_configured = 0;
 static int last_toplevel_w = -1, last_toplevel_h = -1;
+static size_t last_states_bytes = 0;
+static int saw_activated = 0;
 
 static void wmPing(void* d, struct xdg_wm_base* b, uint32_t serial) {
     (void)d;
@@ -33,7 +35,14 @@ static void tlConfigure(void* d, struct xdg_toplevel* t, int32_t w, int32_t h,
     last_toplevel_w = w;
     last_toplevel_h = h;
     toplevel_configured = 1;
-    printf("[client] xdg_toplevel.configure %dx%d states=%zu bytes\n", w, h, states->size);
+    last_states_bytes = states->size;
+    // states is a wl_array of uint32 state values; scan for ACTIVATED (4).
+    uint32_t* p;
+    wl_array_for_each(p, states) {
+        if (*p == XDG_TOPLEVEL_STATE_ACTIVATED) saw_activated = 1;
+    }
+    printf("[client] xdg_toplevel.configure %dx%d states=%zu bytes activated=%d\n",
+           w, h, states->size, saw_activated);
 }
 static void tlClose(void* d, struct xdg_toplevel* t) { (void)d; (void)t; }
 static void tlConfigureBounds(void* d, struct xdg_toplevel* t, int32_t w, int32_t h) {
@@ -101,9 +110,11 @@ int main(int argc, char** argv) {
     wl_display_roundtrip(display);  // receive configures, send ack
     wl_display_roundtrip(display);  // flush ack
 
-    int ok = toplevel_configured && surface_configured;
-    printf("[client] handshake: toplevel_configured=%d surface_configured=%d\n",
-           toplevel_configured, surface_configured);
+    int ok = toplevel_configured && surface_configured
+             && last_states_bytes == 4 && saw_activated;
+    printf("[client] handshake: toplevel_configured=%d surface_configured=%d "
+           "states_bytes=%zu activated=%d\n",
+           toplevel_configured, surface_configured, last_states_bytes, saw_activated);
 
     xdg_toplevel_destroy(toplevel);
     xdg_surface_destroy(g_xdg_surface);

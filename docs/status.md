@@ -141,11 +141,10 @@ interfaces built at runtime from the generator metadata (no per-protocol C):
 Trampoline gaps (implemented or not):
 - `fd` args decode/encode to nothing yet (no `WaylandFd`); blocks `wl_shm`,
   data-device, keymap.
-- `array` encode: the **empty-array** path is now proven on the wire
-  (`xdg_toplevel.configure` sends an empty `states` `wl_array`; the client
-  receives `states->size == 0`). **Non-empty** array encode is still unproven —
-  no handler yet sends array content. `array` *decode* has no exerciser (no
-  core protocol has an array request arg).
+- `array` encode is proven on the wire (`xdg_toplevel.configure` sends a
+  non-empty `states` `wl_array` of one uint32; the client receives 4 bytes
+  decoding to `ACTIVATED`, asserting both byte length and value). `array`
+  *decode* still has no exerciser (no core protocol has an array request arg).
 - object arg passed *into* a handler: implemented, not yet end-to-end tested
   (needs a protocol with an existing-object request arg).
 - per-arg since-versioning not handled.
@@ -172,10 +171,12 @@ path).
   surface, `get_xdg_surface` + `get_toplevel`, sets title/app_id, receives both
   configure events and acks; server-side state (toplevel, title, app_id, role,
   configured-after-ack) is asserted. **PASS.**
+- The configure sends `states = [activated]` (a non-empty `wl_array`), which
+  doubles as the on-wire proof of non-empty array encoding.
 - Not done here: no buffer is attached (so nothing composites — `commit` is
   bookkeeping only); configure sends 0×0 (client picks size); no WM/policy
-  (placement, focus, real toplevel states); non-empty `states` array unproven;
-  popups (`get_popup`) and positioners are no-ops.
+  (placement, focus, dynamic toplevel states); popups (`get_popup`) and
+  positioners are no-ops.
 
 ### Load-bearing facts established (recorded in architecture.md "Validated against Dawn")
 - A Wayland-backed `wgpu::Surface` swapchain works **over the Dawn wire**: a
