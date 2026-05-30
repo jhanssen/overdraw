@@ -4,6 +4,9 @@ A Wayland compositor with a thin C++ core, a JS protocol/policy layer, and a
 separate native GPU process running Dawn. Plugins are JS modules loaded as
 worker threads inside the core; they use a granular internal SDK, not Wayland.
 
+This document is the design. For what is actually built and proven so far
+versus what is still design only, see `status.md`.
+
 ## Goals
 
 - Wayland compositor. Phase 1 nested in a host Wayland session (the
