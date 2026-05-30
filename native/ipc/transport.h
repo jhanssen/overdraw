@@ -30,10 +30,15 @@ class FdSerializer : public dawn::wire::CommandSerializer {
 
     size_t GetMaximumAllocationSize() const override { return 1u << 20; }
 
+    // Dawn batches multiple commands between Flush() calls: each GetCmdSpace
+    // hands back a region the wire writes one command into, and they accumulate
+    // until Flush. We must APPEND (not overwrite) so the whole batch is sent as
+    // one length-prefixed frame; HandleCommands on the peer processes the batch.
     void* GetCmdSpace(size_t size) override {
-        if (size > buf_.size()) buf_.resize(size);
-        pending_ = size;
-        return buf_.data();
+        size_t offset = pending_;
+        if (offset + size > buf_.size()) buf_.resize(offset + size);
+        pending_ = offset + size;
+        return buf_.data() + offset;
     }
 
     bool Flush() override {
