@@ -69,7 +69,8 @@ add_library(overdraw_core STATIC
     native/core/gpu_process.cpp
     native/core/wire_link.cpp
     native/core/compositor.cpp
-    native/wayland/server.cpp)
+    native/wayland/server.cpp
+    native/wayland/interface_registry.cpp)
 target_include_directories(overdraw_core PUBLIC
     ${IPC_INCLUDE} ${NATIVE_INCLUDE} ${NODE_INCLUDE_DIR} ${WAYLAND_SERVER_INCLUDE_DIRS})
 target_link_libraries(overdraw_core PUBLIC
@@ -78,7 +79,8 @@ set_target_properties(overdraw_core PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
 # ---- Core N-API addon (Node-hosted core) ----
 add_library(overdraw_native MODULE
-    native/napi/addon.cpp)
+    native/napi/addon.cpp
+    native/wayland/trampoline.cpp)
 set_target_properties(overdraw_native PROPERTIES
     PREFIX "" SUFFIX ".node")
 target_compile_definitions(overdraw_native PRIVATE
@@ -89,3 +91,8 @@ target_link_libraries(overdraw_native PRIVATE
     overdraw_core dawn::webgpu_dawn_wire pthread dl rt)
 # N-API symbols (napi_*) are resolved from the host node process at load time;
 # a MODULE/shared object leaves them undefined at link by default.
+
+# ---- Test client (minimal Wayland client for trampoline testing) ----
+add_executable(wl-test-client test/wl-test-client.c)
+target_include_directories(wl-test-client PRIVATE ${WAYLAND_CLIENT_INCLUDE_DIRS})
+target_link_libraries(wl-test-client PRIVATE ${WAYLAND_CLIENT_LIBRARIES})
