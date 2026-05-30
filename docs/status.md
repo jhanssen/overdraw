@@ -186,6 +186,17 @@ prints `WAYLAND_DISPLAY`, and runs until SIGINT.
   exists but does nothing); no server-side decorations, fractional scale, primary
   selection, xdg-activation, cursor-shape, text-input (all advertised-absent →
   `foot` warns and falls back).
+- `kitty` also runs (hardware EGL — no `LIBGL_ALWAYS_SOFTWARE` needed — renders,
+  focuses on map, types). The pool-refcount fix (see "shm") was required: kitty
+  creates buffers then destroys the pool before rendering.
+- **dmabuf feedback is a stub** (minimal empty `done`, no `main_device`/
+  `format_table`). GPU clients using `zwp_linux_dmabuf_v1` *feedback* to pick a
+  render device get nothing and fall back (kitty logs
+  `libEGL ... failed to get driver name for fd -1` / `MESA-LOADER` warnings, then
+  works via fallback on this single-GPU setup). Real feedback (main_device +
+  format_table + tranche, buildable from the GPU process's DRM device +
+  `Allocator::usableModifiers`) is unbuilt — cosmetic for kitty here, but the
+  correct implementation of a currently-stubbed protocol.
 
 ### Vulkan-WSI clients are NOT supported (architectural boundary)
 A client that presents via a Vulkan/WebGPU **swapchain on its `wl_surface`**
