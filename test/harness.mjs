@@ -70,7 +70,13 @@ export async function setupCompositor(opts = {}) {
   const onInput = (ev) => { state?.seat?.handleInput(ev); };
   const onFrame = () => { state?.dispatchFrameCallbacks?.(Math.round(performance.now())); };
 
-  const dims = addon.start(gpuBin, onFrame, onInput);
+  // Headless by default for tests: no host window/surface; the compositing pass
+  // renders into an offscreen texture read back via frameReadback. Pass
+  // opts.headless = null (or { headless: false }) to use the nested host window.
+  const headless = opts.headless === undefined
+    ? { width: 1280, height: 720 }
+    : opts.headless;
+  const dims = addon.start(gpuBin, onFrame, onInput, headless || null);
   const sock = addon.startServer();
   state = await installProtocols(addon, {
     output: { width: dims.width, height: dims.height },
@@ -109,7 +115,30 @@ export async function setupCompositor(opts = {}) {
     if (leaked > 0) throw new Error(`leaked ${leaked} GPU process(es) after teardown`);
   }
 
-  return { addon, state, sock, dims, query: () => state.query(), spawnClient, waitFor, teardown };
+  // Async composited-frame readback as a Promise<Uint8Array|null> (BGRA, dims).
+  function frameReadback() {
+    return new Promise((resolve) => {
+      const started = addon.frameReadback((px) => resolve(px));
+      if (!started) resolve(null);
+    });
+  }
+
+  return {
+    addon, state, sock, dims, query: () => state.query(),
+    spawnClient, waitFor, frameReadback, teardown,
+  };
+}
+
+// Sample one BGRA pixel from a readback buffer (width W). Returns [b,g,r,a].
+export function pixelAt(px, W, x, y) {
+  const o = (y * W + x) * 4;
+  return [px[o], px[o + 1], px[o + 2], px[o + 3]];
+}
+
+// True if two BGRA pixels match within an absolute per-channel tolerance.
+export function pixelMatches(a, b, tol = 2) {
+  for (let i = 0; i < 4; i++) if (Math.abs(a[i] - b[i]) > tol) return false;
+  return true;
 }
 
 // Convenience input injectors (output-space coords). These use injectInput,

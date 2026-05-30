@@ -14,7 +14,7 @@
     "gen-protocols": "node tools/gen-protocol/gen-protocol.js",
     "build:js": "npm run gen-protocols && tsc",
     "test": "npm run build:js && node --test 'test/**/*.test.js'",
-    "test:gpu": "npm run build:js && node --test 'test/*.gpu.mjs'"
+    "test:gpu": "npm run build:js && node --test --test-concurrency=1 'test/*.gpu.mjs'"
   },
   "devDependencies": {
     "@types/node": "^22.19.19",

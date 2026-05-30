@@ -207,6 +207,27 @@ bool getBool(napi_env env, napi_value obj, const char* key) {
     bool out = false; napi_get_value_bool(env, v, &out); return out;
 }
 
+// Number-getters used by start() headless opts + input-event objects.
+uint32_t getU32(napi_env env, napi_value obj, const char* key, uint32_t dflt = 0) {
+    napi_value v;
+    if (napi_get_named_property(env, obj, key, &v) != napi_ok) return dflt;
+    napi_valuetype t; napi_typeof(env, v, &t);
+    if (t != napi_number) return dflt;
+    uint32_t out = dflt; napi_get_value_uint32(env, v, &out); return out;
+}
+double getF64(napi_env env, napi_value obj, const char* key, double dflt = 0.0) {
+    napi_value v;
+    if (napi_get_named_property(env, obj, key, &v) != napi_ok) return dflt;
+    napi_valuetype t; napi_typeof(env, v, &t);
+    if (t != napi_number) return dflt;
+    double out = dflt; napi_get_value_double(env, v, &out); return out;
+}
+bool getBoolProp(napi_env env, napi_value obj, const char* key) {
+    napi_value v;
+    if (napi_get_named_property(env, obj, key, &v) != napi_ok) return false;
+    bool out = false; napi_get_value_bool(env, v, &out); return out;
+}
+
 // Wayland arg type string -> libwayland signature char.
 char typeChar(const std::string& t) {
     if (t == "int") return 'i';
@@ -293,10 +314,12 @@ void onFrameTimer(uv_timer_t*) {
     armWirePoll();  // renderFrame may have queued wire output (Submit/Present)
 }
 
-// start(gpuBinPath, onFrame?, onInput?) -> { width, height }
+// start(gpuBinPath, onFrame?, onInput?, headless?) -> { width, height }
+// headless (optional): { width, height } -> run with no host window/surface; the
+// compositing pass renders into an offscreen texture (readbackFrame). For tests.
 napi_value Start(napi_env env, napi_callback_info info) {
-    size_t argc = 3;
-    napi_value argv[3];
+    size_t argc = 4;
+    napi_value argv[4];
     napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
     if (argc < 1) return throwError(env, "start(gpuBinPath) requires a path");
 
@@ -318,11 +341,24 @@ napi_value Start(napi_env env, napi_callback_info info) {
         if (t == napi_function) napi_create_reference(env, argv[2], 1, &g_addon.onInput);
     }
 
-    auto gpu = overdraw::core::spawnGpuProcess(gpuBin);
+    // Optional headless { width, height }.
+    uint32_t hw = 0, hh = 0;
+    if (argc >= 4) {
+        napi_valuetype t;
+        napi_typeof(env, argv[3], &t);
+        if (t == napi_object) {
+            hw = getU32(env, argv[3], "width");
+            hh = getU32(env, argv[3], "height");
+        }
+    }
+    const bool headless = hw != 0 && hh != 0;
+
+    auto gpu = overdraw::core::spawnGpuProcess(gpuBin, hw, hh);
     if (gpu.pid < 0) return throwError(env, "failed to spawn gpu process");
     g_addon.inputFd = gpu.inputFd;
 
-    g_addon.compositor = std::make_unique<Compositor>(gpu.wireFd, gpu.ctrlFd, gpu.pid);
+    g_addon.compositor =
+        std::make_unique<Compositor>(gpu.wireFd, gpu.ctrlFd, gpu.pid, headless, hw, hh);
     if (!g_addon.compositor->bringUp()) {
         const char* e = g_addon.compositor->error().c_str();
         // Compositor dtor reaps the GPU process.
@@ -719,27 +755,6 @@ napi_value TakeFreedBuffers(napi_env env, napi_callback_info) {
     return arr;
 }
 
-// --- helpers to read fields out of a JS input-event object ---
-uint32_t getU32(napi_env env, napi_value obj, const char* key, uint32_t dflt = 0) {
-    napi_value v;
-    if (napi_get_named_property(env, obj, key, &v) != napi_ok) return dflt;
-    napi_valuetype t; napi_typeof(env, v, &t);
-    if (t != napi_number) return dflt;
-    uint32_t out = dflt; napi_get_value_uint32(env, v, &out); return out;
-}
-double getF64(napi_env env, napi_value obj, const char* key, double dflt = 0.0) {
-    napi_value v;
-    if (napi_get_named_property(env, obj, key, &v) != napi_ok) return dflt;
-    napi_valuetype t; napi_typeof(env, v, &t);
-    if (t != napi_number) return dflt;
-    double out = dflt; napi_get_value_double(env, v, &out); return out;
-}
-bool getBoolProp(napi_env env, napi_value obj, const char* key) {
-    napi_value v;
-    if (napi_get_named_property(env, obj, key, &v) != napi_ok) return false;
-    bool out = false; napi_get_value_bool(env, v, &out); return out;
-}
-
 // injectInput(event) -> undefined
 // Synthetic input backend (test seam): build a normalized InputEvent from a plain
 // JS object and feed it through the SAME InputSink the host seat uses, so it
@@ -972,6 +987,46 @@ napi_value SurfaceReadback(napi_env env, napi_callback_info info) {
     return out;
 }
 
+// frameReadback(cb) -> boolean
+// Async readback of the COMPOSITED frame (headless: the offscreen capture
+// texture, the full placed+stacked+blended output). cb(px | null) fires on the
+// Node thread when the GPU map completes. Returns false if no capture texture
+// exists (e.g. not headless). Use this (not surfaceReadback) to verify
+// compositing correctness.
+napi_value FrameReadback(napi_env env, napi_callback_info info) {
+    size_t argc = 1; napi_value argv[1];
+    napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+    if (argc < 1) return throwError(env, "frameReadback(cb) requires a callback");
+    if (!g_addon.compositor) return throwError(env, "compositor not running");
+
+    napi_ref cbRef = nullptr;
+    napi_create_reference(env, argv[0], 1, &cbRef);
+
+    bool started = g_addon.compositor->readbackFrame(
+        [env, cbRef](bool ok, std::vector<uint8_t>&& px) {
+            napi_handle_scope scope;
+            napi_open_handle_scope(env, &scope);
+            napi_value arg;
+            if (ok) {
+                napi_value ab; void* data;
+                napi_create_arraybuffer(env, px.size(), &data, &ab);
+                std::memcpy(data, px.data(), px.size());
+                napi_create_typedarray(env, napi_uint8_array, px.size(), ab, 0, &arg);
+            } else {
+                napi_get_null(env, &arg);
+            }
+            napi_value cb, undefined;
+            napi_get_reference_value(env, cbRef, &cb);
+            napi_get_undefined(env, &undefined);
+            napi_call_function(env, undefined, cb, 1, &arg, nullptr);
+            napi_delete_reference(env, cbRef);
+            napi_close_handle_scope(env, scope);
+        });
+    if (!started) napi_delete_reference(env, cbRef);
+    napi_value out; napi_get_boolean(env, started, &out);
+    return out;
+}
+
 // dmabufFeedbackInfo() -> {
 //   formatTableFd: WaylandFd, formatTableSize, entryCount,
 //   mainDevice: Uint8Array(dev_t bytes), trancheFormats: Uint8Array(u16 indices)
@@ -1059,6 +1114,7 @@ napi_value Init(napi_env env, napi_value exports) {
     reg("keymapInfo", KeymapInfo);
     reg("keyUpdate", KeyUpdate);
     reg("surfaceReadback", SurfaceReadback);
+    reg("frameReadback", FrameReadback);
     reg("dmabufFeedbackInfo", DmabufFeedbackInfo);
 
     napi_set_named_property(env, exports, "start", fnStart);

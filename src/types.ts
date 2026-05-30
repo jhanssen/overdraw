@@ -25,7 +25,8 @@ export type EventsByInterface = Record<string, EventSenders>;
 // JS layer calls are declared; add as needed.
 export interface Addon {
   start(gpuBin: string, onFrame?: ((presented: number) => void) | null,
-        onInput?: ((ev: InputEvent) => void) | null): { width: number; height: number };
+        onInput?: ((ev: InputEvent) => void) | null,
+        headless?: { width: number; height: number } | null): { width: number; height: number };
   stop(): void;
   presentedCount(): number;
   startServer(): string;
@@ -83,6 +84,11 @@ export interface Addon {
   // Async test hook: starts a texture readback; cb(px|null) fires later on the
   // Node thread when the GPU map completes. Returns true if started.
   surfaceReadback(id: number, cb: (px: Uint8Array | null) => void): boolean;
+  // Async readback of the COMPOSITED frame (headless offscreen target): the full
+  // placed + stacked + blended output as width*height*4 BGRA bytes. cb(px|null)
+  // fires on the Node thread. Returns false if not headless. Use for compositing
+  // correctness tests.
+  frameReadback(cb: (px: Uint8Array | null) => void): boolean;
 
   // shm pools. The pool fd is a WaylandFd; native takes the raw fd out of it.
   shmCreatePool(fd: WaylandFd, size: number): number;

@@ -651,11 +651,32 @@ follows the same model.
       converted back, exercising the round-trip. This is the analog of Hyprland's
       test plugin injecting at the input layer, reusing the existing
       `native/core/input.h` seam (no virtual-input protocol).
-  - `test/integration.gpu.mjs`: 7 tests, all passing — client map→query
-    (title/app_id/size), two-client stacking order, focus-on-map,
-    follow-pointer focus enter/clear, click-to-focus press + persist-on-leave,
-    plus two HOST-PATH tests via `injectHostInput` (motion drives focus through
-    the real backend normalization; key to focused window).
+  - `test/integration.gpu.mjs`: 7 tests — client map→query (title/app_id/size),
+    two-client stacking order, focus-on-map, follow-pointer focus enter/clear,
+    click-to-focus press + persist-on-leave, plus two HOST-PATH tests via
+    `injectHostInput`. All run HEADLESS now (no host window needed).
+  - `test/compositing.gpu.mjs`: 3 PIXEL tests against the headless offscreen
+    frame — single client composites at its rect + black background; two clients
+    at distinct positions both visible; top window wins the overlap (opaque
+    stacking). Computed-expectation comparison (each client a known solid color
+    at a `query()` rect, ±4/channel tolerance), no golden files.
+  - `npm run test:gpu` runs `test/*.gpu.mjs` with `--test-concurrency=1` (each
+    test owns the GPU + a compositor; serial avoids socket-name and
+    GPU-process-leak-scan races).
+
+### Headless mode (offscreen render, no host window)
+- `addon.start(gpuBin, onFrame?, onInput?, { width, height })` runs HEADLESS: the
+  GPU process is spawned `--headless WxH` (no `HostWindow`, no `wl_surface`, no
+  host seat), brings up the device only, and skips `InjectSurface`/`SurfaceReady`.
+  The core `Compositor` skips `ReserveSurface`/`Configure`/`Present` and renders
+  the compositing pass into an owned offscreen `RenderAttachment|CopySrc` texture
+  (`captureTex_`, BGRA8Unorm). Verified by `EnumerateAdapters` succeeding with no
+  surface (matches a known-good Dawn headless app). Still requires the GPU.
+- `addon.frameReadback(cb)` (core `readbackFrame`) async-reads the COMPOSITED
+  offscreen frame (full placed+stacked+blended output), distinct from
+  `surfaceReadback` (one surface texture). Shared `readbackTexture()` helper.
+- The real launcher (`main.ts`) passes no headless arg → stays NESTED (host
+  window + swapchain).
 - **`input-smoke` removed** (was interactive — required a human to move the mouse
   / type over the nested window). Its durable, product-relevant coverage (the
   `WaylandInputBackend` normalization + seat routing → focus/clients) is now
@@ -665,12 +686,15 @@ follows the same model.
   forwarding over the socket — which is not a durable code path (it is replaced
   by a libinput backend at the same `InputBackend` seam in phase 2), so it is not
   worth an automated test. No interactive tests remain.
-- **Not yet built (testing):** a frame-readback primitive for the optional
-  GPU-box-only PIXEL layer (`readbackFrame` + computed-expectation comparison —
-  the current `surfaceReadback` reads one surface texture, not the composited
-  frame). A stdin command loop on the harness client for multi-step sequences
-  (raise/move) within one client lifetime. Folding the existing GPU-free
-  `*-smoke.mjs` server-only tests (trampoline/fd/xdg/server) into `npm test`.
+- **`compositing-eyeball` removed** (was interactive — a human confirmed two
+  colored squares). Superseded by `compositing.gpu.mjs`, which asserts the same
+  placement + distinct positioning automatically via pixel readback, and adds
+  overlap-stacking coverage the eyeball test lacked. NO interactive tests remain.
+- **Not yet built (testing):** a stdin command loop on the harness client for
+  multi-step sequences (raise/move/resize) within one client lifetime; folding
+  the GPU-free `*-smoke.mjs` server-only tests (trampoline/fd/xdg/server) into
+  `npm test`; using `frameReadback` to also assert the dmabuf/shm upload smokes'
+  pixels through the headless path (then retiring `surfaceReadback`).
 
 ## Not yet built (design only)
 

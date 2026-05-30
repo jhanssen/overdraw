@@ -4,6 +4,7 @@
 #ifndef OVERDRAW_CORE_GPU_PROCESS_H_
 #define OVERDRAW_CORE_GPU_PROCESS_H_
 
+#include <cstdint>
 #include <sys/types.h>
 
 namespace overdraw::core {
@@ -16,8 +17,11 @@ struct GpuProcess {
 };
 
 // Creates the socket pairs, forks/execs `binPath`, and returns the core-side
-// fds. On failure pid < 0 and the message is written to stderr.
-GpuProcess spawnGpuProcess(const char* binPath);
+// fds. On failure pid < 0 and the message is written to stderr. When
+// `headlessW`/`headlessH` are nonzero, the GPU process is launched in headless
+// mode (no host window/surface) at that size via "--headless WxH".
+GpuProcess spawnGpuProcess(const char* binPath,
+                           uint32_t headlessW = 0, uint32_t headlessH = 0);
 
 // Reap the GPU process: poll briefly for a clean exit, then SIGTERM + wait.
 void reapGpuProcess(pid_t pid);

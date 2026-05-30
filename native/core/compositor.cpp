@@ -51,9 +51,12 @@ struct Rect { r : vec4f, };
 
 }  // namespace
 
-Compositor::Compositor(int wireFd, int ctrlFd, pid_t gpuPid)
+Compositor::Compositor(int wireFd, int ctrlFd, pid_t gpuPid,
+                       bool headless, uint32_t headlessW, uint32_t headlessH)
     : link_(std::make_unique<WireLink>(wireFd, ctrlFd)),
       gpuPid_(gpuPid), wireFd_(wireFd), ctrlFd_(ctrlFd) {
+    headless_ = headless;
+    if (headless_) { windowWidth_ = headlessW; windowHeight_ = headlessH; }
     // All inter-process fds are non-blocking: no write may ever park (it would
     // wedge the single-threaded GPU process and deadlock the pair). Buffered
     // writers (FdSerializer / CtrlSender) queue what the socket can't take and
@@ -136,42 +139,51 @@ bool Compositor::bringUp() {
     }
     if (!device_) { error_ = "no device over wire"; return false; }
 
-    // Reserve surface; DeviceReady; wait SurfaceReady.
+    // Helper: capture a FeedbackData ctrl message (dmabuf feedback) into
+    // dmabufFeedback_. The memfd rides as an SCM_RIGHTS fd. Both nested and
+    // headless want this (clients may use dmabuf either way).
+    auto captureFeedback = [&](const ipc::Message& m, int* fds, int nfds) {
+        if (dmabufFeedback_.formatTableFd >= 0) ::close(dmabufFeedback_.formatTableFd);
+        dmabufFeedback_.formatTableFd = (nfds > 0) ? fds[0] : -1;
+        dmabufFeedback_.mainDevice = m.mainDevice;
+        dmabufFeedback_.entryCount = m.entryCount;
+        dmabufFeedback_.formatTableSize = m.formatTableSize;
+        for (int i = 1; i < nfds; ++i) ::close(fds[i]);
+        std::printf("[core] dmabuf feedback: main_device=0x%llx entries=%u size=%u\n",
+                    static_cast<unsigned long long>(m.mainDevice),
+                    m.entryCount, m.formatTableSize);
+    };
+
+    // DeviceReady; then NESTED waits for SurfaceReady (+ FeedbackData), HEADLESS
+    // waits for FeedbackData only (no surface). In headless DeviceReady carries a
+    // zero surface handle (the GPU process does not InjectSurface).
     WGPUSurfaceCapabilities emptyCaps{};
-    auto rs = link_->client().ReserveSurface(instance_.Get(), &emptyCaps);
+    dawn::wire::ReservedSurface rs{};
+    if (!headless_) rs = link_->client().ReserveSurface(instance_.Get(), &emptyCaps);
     {
         ipc::Message m{};
         m.tag = ipc::Tag::DeviceReady;
         m.instance = {ri.handle.id, ri.handle.generation};
         auto dh = link_->client().GetWireHandle(device_.Get());
         m.device = {dh.id, dh.generation};
-        m.surface = {rs.handle.id, rs.handle.generation};
+        m.surface = headless_ ? ipc::WireHandle{0, 0}
+                              : ipc::WireHandle{rs.handle.id, rs.handle.generation};
         ipc::sendMessage(ctrlFd_, m);
     }
-    // Wait for SurfaceReady, also capturing FeedbackData (dmabuf feedback) which
-    // the GPU process sends just before it. FeedbackData carries the format_table
-    // memfd as an SCM_RIGHTS fd, so this loop must use the fd-capturing recv.
+
     ipc::Message surfReady{};
+    bool gotFeedback = false;
     if (!link_->pumpUntil([&] {
             ipc::Message m{};
             int fds[ipc::kMaxMsgFds];
             int nfds = 0;
             if (!ipc::recvMessageNBFds(ctrlFd_, m, fds, &nfds)) return false;
             if (m.tag == ipc::Tag::FeedbackData) {
-                if (dmabufFeedback_.formatTableFd >= 0)
-                    ::close(dmabufFeedback_.formatTableFd);
-                dmabufFeedback_.formatTableFd = (nfds > 0) ? fds[0] : -1;
-                dmabufFeedback_.mainDevice = m.mainDevice;
-                dmabufFeedback_.entryCount = m.entryCount;
-                dmabufFeedback_.formatTableSize = m.formatTableSize;
-                // Close any extra unexpected fds to avoid leaks.
-                for (int i = 1; i < nfds; ++i) ::close(fds[i]);
-                std::printf("[core] dmabuf feedback: main_device=0x%llx entries=%u size=%u\n",
-                            static_cast<unsigned long long>(m.mainDevice),
-                            m.entryCount, m.formatTableSize);
-                return false;  // keep waiting for SurfaceReady
+                captureFeedback(m, fds, nfds);
+                gotFeedback = true;
+                return headless_;  // headless: feedback is the bring-up signal
             }
-            if (m.tag == ipc::Tag::SurfaceReady) {
+            if (!headless_ && m.tag == ipc::Tag::SurfaceReady) {
                 for (int i = 0; i < nfds; ++i) ::close(fds[i]);  // none expected
                 surfReady = m;
                 return true;
@@ -179,22 +191,34 @@ bool Compositor::bringUp() {
             for (int i = 0; i < nfds; ++i) ::close(fds[i]);
             return false;
         })) {
-        error_ = "no SurfaceReady";
+        error_ = headless_ ? "no FeedbackData (headless)" : "no SurfaceReady";
         return false;
     }
+    (void)gotFeedback;
 
-    // Configure swapchain.
-    surface_ = wgpu::Surface::Acquire(rs.surface);
-    {
+    if (!headless_) {
+        // Configure swapchain.
+        surface_ = wgpu::Surface::Acquire(rs.surface);
+        renderFormat_ = static_cast<wgpu::TextureFormat>(surfReady.format);
         wgpu::SurfaceConfiguration cfg{};
         cfg.device = device_;
-        cfg.format = static_cast<wgpu::TextureFormat>(surfReady.format);
+        cfg.format = renderFormat_;
         cfg.usage = wgpu::TextureUsage::RenderAttachment;
         cfg.width = surfReady.width;
         cfg.height = surfReady.height;
         cfg.alphaMode = static_cast<wgpu::CompositeAlphaMode>(surfReady.alphaMode);
         cfg.presentMode = static_cast<wgpu::PresentMode>(surfReady.presentMode);
         surface_.Configure(&cfg);
+        link_->flush();
+    } else {
+        // Headless: an owned offscreen render target (no swapchain). BGRA8Unorm
+        // matches the client-buffer byte order and the readback BGRA convention.
+        renderFormat_ = wgpu::TextureFormat::BGRA8Unorm;
+        wgpu::TextureDescriptor td{};
+        td.size = {windowWidth_, windowHeight_, 1};
+        td.format = renderFormat_;
+        td.usage = wgpu::TextureUsage::RenderAttachment | wgpu::TextureUsage::CopySrc;
+        captureTex_ = device_.CreateTexture(&td);
         link_->flush();
     }
 
@@ -225,7 +249,7 @@ bool Compositor::bringUp() {
         blend.alpha.operation = wgpu::BlendOperation::Add;
 
         wgpu::ColorTargetState target{};
-        target.format = static_cast<wgpu::TextureFormat>(surfReady.format);
+        target.format = renderFormat_;
         target.blend = &blend;
         wgpu::FragmentState fs{};
         fs.module = module;
@@ -499,11 +523,19 @@ void Compositor::takeFreedBuffers(std::vector<uint64_t>& out) {
 }
 
 void Compositor::renderFrame() {
+    // Acquire the render target: the swapchain's current texture (nested) or the
+    // owned offscreen capture texture (headless).
     wgpu::SurfaceTexture st{};
-    surface_.GetCurrentTexture(&st);
-    if (st.texture) {
+    wgpu::TextureView targetView;
+    if (headless_) {
+        if (captureTex_) targetView = captureTex_.CreateView();
+    } else {
+        surface_.GetCurrentTexture(&st);
+        if (st.texture) targetView = st.texture.CreateView();
+    }
+    if (targetView) {
         wgpu::RenderPassColorAttachment ca{};
-        ca.view = st.texture.CreateView();
+        ca.view = targetView;
         ca.loadOp = wgpu::LoadOp::Clear;
         ca.storeOp = wgpu::StoreOp::Store;
         ca.clearValue = {0.0, 0.0, 0.0, 1.0};
@@ -542,23 +574,21 @@ void Compositor::renderFrame() {
                 if (serial > completedSerial_) completedSerial_ = serial;
             });
 
-        surface_.Present();
+        if (!headless_) surface_.Present();
         presented_++;
     }
     reapRetiredBuffers();
     link_->flush();
 }
 
-bool Compositor::readbackSurface(uint32_t id, ReadbackCb cb) {
-    auto it = clientSurfaces_.find(id);
-    if (it == clientSurfaces_.end() || !it->second.texture) return false;
-    ClientSurface& cs = it->second;
+bool Compositor::readbackTexture(const wgpu::Texture& tex, uint32_t width,
+                                 uint32_t height, ReadbackCb cb) {
+    if (!tex || width == 0 || height == 0) return false;
 
     // 256-byte row alignment is required for texture->buffer copies.
-    uint32_t unpadded = cs.width * 4;
+    uint32_t unpadded = width * 4;
     uint32_t padded = (unpadded + 255) & ~255u;
-    uint64_t bufSize = static_cast<uint64_t>(padded) * cs.height;
-    uint32_t height = cs.height;
+    uint64_t bufSize = static_cast<uint64_t>(padded) * height;
 
     wgpu::BufferDescriptor bd{};
     bd.size = bufSize;
@@ -566,13 +596,13 @@ bool Compositor::readbackSurface(uint32_t id, ReadbackCb cb) {
     wgpu::Buffer buf = device_.CreateBuffer(&bd);
 
     wgpu::TexelCopyTextureInfo src{};
-    src.texture = cs.texture;
+    src.texture = tex;
     wgpu::TexelCopyBufferInfo dst{};
     dst.buffer = buf;
     dst.layout.offset = 0;
     dst.layout.bytesPerRow = padded;
-    dst.layout.rowsPerImage = cs.height;
-    wgpu::Extent3D extent{cs.width, cs.height, 1};
+    dst.layout.rowsPerImage = height;
+    wgpu::Extent3D extent{width, height, 1};
     wgpu::CommandEncoder enc = device_.CreateCommandEncoder();
     enc.CopyTextureToBuffer(&src, &dst, &extent);
     wgpu::CommandBuffer cmd = enc.Finish();
@@ -608,6 +638,18 @@ bool Compositor::readbackSurface(uint32_t id, ReadbackCb cb) {
     return true;
 }
 
+bool Compositor::readbackSurface(uint32_t id, ReadbackCb cb) {
+    auto it = clientSurfaces_.find(id);
+    if (it == clientSurfaces_.end() || !it->second.texture) return false;
+    ClientSurface& cs = it->second;
+    return readbackTexture(cs.texture, cs.width, cs.height, std::move(cb));
+}
+
+bool Compositor::readbackFrame(ReadbackCb cb) {
+    if (!captureTex_) return false;  // headless-only (the composited offscreen target)
+    return readbackTexture(captureTex_, windowWidth_, windowHeight_, std::move(cb));
+}
+
 void Compositor::shutdown() {
     if (shutdownDone_) return;
     shutdownDone_ = true;
@@ -624,6 +666,7 @@ void Compositor::shutdown() {
     clientSurfaces_.clear();
     sampler_ = nullptr;
     pipeline_ = nullptr;
+    captureTex_ = nullptr;
     surface_ = nullptr;
     device_ = nullptr;
     instance_ = nullptr;

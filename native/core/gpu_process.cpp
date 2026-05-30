@@ -1,6 +1,8 @@
 #include "gpu_process.h"
 
+#include <cstdint>
 #include <cstdio>
+#include <cstring>
 
 #include <fcntl.h>
 #include <signal.h>
@@ -11,8 +13,9 @@
 
 namespace overdraw::core {
 
-GpuProcess spawnGpuProcess(const char* binPath) {
+GpuProcess spawnGpuProcess(const char* binPath, uint32_t headlessW, uint32_t headlessH) {
     GpuProcess out;
+    const bool headless = headlessW != 0 && headlessH != 0;
     int wireFds[2], ctrlFds[2], inputFds[2];
     // Wire socket: STREAM (length-prefixed framing). Control + input channels:
     // SEQPACKET so fixed-size messages keep their datagram boundaries. Input is
@@ -55,11 +58,17 @@ GpuProcess spawnGpuProcess(const char* binPath) {
         ::fcntl(wireFds[1], F_SETFD, 0);
         ::fcntl(ctrlFds[1], F_SETFD, 0);
         ::fcntl(inputFds[1], F_SETFD, 0);
-        char a1[16], a2[16], a3[16];
+        char a1[16], a2[16], a3[16], asize[32];
         std::snprintf(a1, sizeof(a1), "%d", wireFds[1]);
         std::snprintf(a2, sizeof(a2), "%d", ctrlFds[1]);
         std::snprintf(a3, sizeof(a3), "%d", inputFds[1]);
-        ::execl(binPath, binPath, a1, a2, a3, static_cast<char*>(nullptr));
+        if (headless) {
+            std::snprintf(asize, sizeof(asize), "%ux%u", headlessW, headlessH);
+            ::execl(binPath, binPath, a1, a2, a3, "--headless", asize,
+                    static_cast<char*>(nullptr));
+        } else {
+            ::execl(binPath, binPath, a1, a2, a3, static_cast<char*>(nullptr));
+        }
         ::perror("execl");
         _exit(127);
     }

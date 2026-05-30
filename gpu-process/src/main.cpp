@@ -103,16 +103,25 @@ int buildFormatTableMemfd(const std::vector<gpu::FormatTableEntry>& entries) {
     return fd;
 }
 
-int run(int wireFd, int ctrlFd, int inputFd) {
-    // 1) Host output window (this process is the Wayland client of the host).
-    //    The host seat (pointer/keyboard) forwards events to the core over
-    //    inputFd; if inputFd < 0 input forwarding is disabled.
+int run(int wireFd, int ctrlFd, int inputFd, bool headless,
+        uint32_t headlessW, uint32_t headlessH) {
+    // 1) Output: in nested mode, a host Wayland output window (this process is
+    //    the Wayland client of the host) whose seat forwards input over inputFd.
+    //    In HEADLESS mode there is no host window/surface/seat at all -- the core
+    //    renders the compositing pass into an offscreen texture and reads it back
+    //    (tests). The size is fixed from argv.
     gpu::HostWindow window(inputFd);
-    if (!window.open("overdraw")) {
-        std::fprintf(stderr, "[gpu] failed to open host window (no WAYLAND_DISPLAY?)\n");
-        return 1;
+    if (!headless) {
+        if (!window.open("overdraw")) {
+            std::fprintf(stderr, "[gpu] failed to open host window (no WAYLAND_DISPLAY?)\n");
+            return 1;
+        }
+        std::printf("[gpu] host window %ux%u\n", window.width(), window.height());
+    } else {
+        std::printf("[gpu] HEADLESS %ux%u (no host window/surface)\n", headlessW, headlessH);
     }
-    std::printf("[gpu] host window %ux%u\n", window.width(), window.height());
+    auto outW = [&] { return headless ? headlessW : window.width(); };
+    auto outH = [&] { return headless ? headlessH : window.height(); };
 
     // 2) Native Dawn instance + wire server.
     dawn::native::Instance instance;
@@ -169,8 +178,8 @@ int run(int wireFd, int ctrlFd, int inputFd) {
         ipc::Message reply{};
         reply.tag = ipc::Tag::HelloReply;
         reply.protocolVersion = ipc::kProtocolVersion;
-        reply.width = window.width();
-        reply.height = window.height();
+        reply.width = outW();
+        reply.height = outH();
         ipc::sendMessage(ctrlFd, reply);
     }
 
@@ -212,16 +221,9 @@ int run(int wireFd, int ctrlFd, int inputFd) {
                 ready.device.id, ready.device.generation,
                 ready.surface.id, ready.surface.generation);
 
-    // 6) Create the wgpu::Surface natively from the host wl_surface, query caps.
+    // 6) Native adapter (needed for the dmabuf modifier probe AND, in nested
+    //    mode, for surface caps). In headless mode there is no surface.
     wgpu::Instance inst(instance.Get());
-    wgpu::SurfaceSourceWaylandSurface src{};
-    src.display = window.display();
-    src.surface = window.surface();
-    wgpu::SurfaceDescriptor sd{};
-    sd.nextInChain = &src;
-    wgpu::Surface surface = inst.CreateSurface(&sd);
-    if (!surface) { std::fprintf(stderr, "[gpu] CreateSurface failed\n"); return 1; }
-
     wgpu::RequestAdapterOptions ao{};
     ao.backendType = wgpu::BackendType::Vulkan;
     ao.featureLevel = wgpu::FeatureLevel::Core;
@@ -229,6 +231,18 @@ int run(int wireFd, int ctrlFd, int inputFd) {
         reinterpret_cast<const WGPURequestAdapterOptions*>(&ao));
     if (adapters.empty()) { std::fprintf(stderr, "[gpu] no adapter\n"); return 1; }
     wgpu::Adapter adapter(adapters[0].Get());
+
+    // Nested: create the wgpu::Surface from the host wl_surface. Headless: none.
+    wgpu::Surface surface;
+    if (!headless) {
+        wgpu::SurfaceSourceWaylandSurface src{};
+        src.display = window.display();
+        src.surface = window.surface();
+        wgpu::SurfaceDescriptor sd{};
+        sd.nextInChain = &src;
+        surface = inst.CreateSurface(&sd);
+        if (!surface) { std::fprintf(stderr, "[gpu] CreateSurface failed\n"); return 1; }
+    }
 
     // B1: GBM allocator + Dawn DRM modifier probe (persistent: the allocator
     // owns the gbm device and any allocated bo for the rest of the run).
@@ -269,6 +283,10 @@ int run(int wireFd, int ctrlFd, int inputFd) {
         }
     }
 
+    // 6b/7/8) Surface caps + inject + SurfaceReady -- NESTED only. Headless has
+    // no surface; the core renders into an offscreen texture (no swapchain) and
+    // does not wait for SurfaceReady.
+    if (!headless) {
     wgpu::SurfaceCapabilities caps{};
     surface.GetCapabilities(adapter, &caps);
     // Choose a NON-sRGB swapchain format. Client buffers carry sRGB-encoded
@@ -319,10 +337,11 @@ int run(int wireFd, int ctrlFd, int inputFd) {
         m.format = format;
         m.presentMode = presentMode;
         m.alphaMode = static_cast<uint32_t>(WGPUCompositeAlphaMode_Opaque);
-        m.width = window.width();
-        m.height = window.height();
+        m.width = outW();
+        m.height = outH();
         ipc::sendMessage(ctrlFd, m);
     }
+    }  // if (!headless)
 
     // Wire-resolved core device (non-owning wrapper; addref'd by the ctor).
     wgpu::Device coreDevice(nativeDev);
@@ -579,11 +598,11 @@ int run(int wireFd, int ctrlFd, int inputFd) {
     if (hostFd >= 0)
         loop->add(hostFd, gpu::EventLoop::kRead, [&](uint32_t) { window.pump(); });
 
-    while (!shutdown && !window.shouldClose()) {
+    while (!shutdown && (headless || !window.shouldClose())) {
         loop->runOnce(8);   // 8ms cap: also advances Dawn + host pump below
         pumpWire();          // DeviceTick + drain wire, even with no fd ready
         drainPendingImports();
-        window.pump();       // service host events queued since last read
+        if (!headless) window.pump();  // service host events (no window headless)
         armWire();
     }
 
@@ -617,12 +636,25 @@ int main(int argc, char** argv) {
     setvbuf(stdout, nullptr, _IOLBF, 0);
     installCrashHandler();
     if (argc < 3) {
-        std::fprintf(stderr, "usage: %s <wireFd> <ctrlFd> [inputFd]\n", argv[0]);
+        std::fprintf(stderr, "usage: %s <wireFd> <ctrlFd> [inputFd] [--headless WxH]\n", argv[0]);
         return 1;
     }
     int wireFd = std::atoi(argv[1]);
     int ctrlFd = std::atoi(argv[2]);
     // inputFd is optional: when absent (-1) the GPU process forwards no input.
-    int inputFd = (argc >= 4) ? std::atoi(argv[3]) : -1;
-    return run(wireFd, ctrlFd, inputFd);
+    int inputFd = (argc >= 4 && argv[3][0] != '-') ? std::atoi(argv[3]) : -1;
+
+    // Optional headless mode: "--headless WxH" anywhere after the fds. No host
+    // window/surface; the core renders into an offscreen texture (tests).
+    bool headless = false;
+    uint32_t hw = 0, hh = 0;
+    for (int i = 3; i < argc; ++i) {
+        if (std::strcmp(argv[i], "--headless") == 0 && i + 1 < argc) {
+            headless = true;
+            std::sscanf(argv[i + 1], "%ux%u", &hw, &hh);
+            ++i;
+        }
+    }
+    if (headless && (hw == 0 || hh == 0)) { hw = 1280; hh = 720; }  // default
+    return run(wireFd, ctrlFd, inputFd, headless, hw, hh);
 }

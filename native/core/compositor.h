@@ -26,7 +26,12 @@ namespace overdraw::core {
 
 class Compositor {
   public:
-    Compositor(int wireFd, int ctrlFd, pid_t gpuPid);
+    // `headless` (with a fixed width/height) brings up with NO swapchain: the
+    // compositing pass renders into an owned offscreen texture (read back via
+    // readbackFrame) instead of a surface, and nothing is presented. Used by
+    // tests; the GPU process must also be spawned with matching --headless WxH.
+    Compositor(int wireFd, int ctrlFd, pid_t gpuPid,
+               bool headless = false, uint32_t headlessW = 0, uint32_t headlessH = 0);
     ~Compositor();
 
     Compositor(const Compositor&) = delete;
@@ -121,6 +126,20 @@ class Compositor {
     // Stop compositing a surface and release its texture.
     void removeSurface(uint32_t id);
 
+    // True if running headless (offscreen render target, no swapchain/present).
+    bool headless() const { return headless_; }
+
+    // Callback for async readbacks: ok + width*height*4 BGRA bytes (empty on fail).
+    using ReadbackCb = std::function<void(bool ok, std::vector<uint8_t>&& px)>;
+
+    // Async readback of the COMPOSITED frame (the offscreen capture texture in
+    // headless mode). Renders nothing itself -- reads whatever renderFrame() last
+    // composited. `cb` is invoked on the Node thread when the GPU map completes,
+    // with ok + width*height*4 BGRA bytes. Returns false if no capture texture
+    // exists (e.g. not headless). Non-blocking. The staging buffer is held until
+    // the map resolves.
+    bool readbackFrame(ReadbackCb cb);
+
     // Test hook: read the surface's uploaded texture back to CPU. ASYNCHRONOUS
     // and non-blocking: kicks off a CopyTextureToBuffer + MapAsync and returns
     // immediately. `cb` is invoked later (on the Node thread, from the wire pump
@@ -128,7 +147,6 @@ class Compositor {
     // Returns false synchronously only if the surface is unknown / has no texture
     // (in which case `cb` is not called). The in-flight buffer is held internally
     // until the map resolves.
-    using ReadbackCb = std::function<void(bool ok, std::vector<uint8_t>&& px)>;
     bool readbackSurface(uint32_t id, ReadbackCb cb);
 
     // Stop presenting and release GPU/wire resources; signal + reap the GPU
@@ -137,6 +155,11 @@ class Compositor {
 
   private:
     bool handshake();
+    // Shared async texture->CPU readback (CopyTextureToBuffer + MapAsync). The
+    // staging buffer is held in the map callback until it fires; `cb` gets
+    // width*height*4 BGRA bytes. Used by readbackSurface + readbackFrame.
+    bool readbackTexture(const wgpu::Texture& tex, uint32_t width, uint32_t height,
+                         ReadbackCb cb);
 
     std::unique_ptr<WireLink> link_;
     pid_t gpuPid_ = -1;
@@ -144,9 +167,12 @@ class Compositor {
     int ctrlFd_ = -1;  // owned by Compositor; closed in shutdown()
     bool shutdownDone_ = false;
 
+    bool headless_ = false;
     wgpu::Instance instance_;
     wgpu::Device device_;
-    wgpu::Surface surface_;
+    wgpu::Surface surface_;            // nested only
+    wgpu::Texture captureTex_;         // headless only: offscreen render target
+    wgpu::TextureFormat renderFormat_ = wgpu::TextureFormat::BGRA8Unorm;
     wgpu::RenderPipeline pipeline_;
     wgpu::Sampler sampler_;
 
