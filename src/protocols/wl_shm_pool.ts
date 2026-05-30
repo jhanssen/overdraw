@@ -2,17 +2,15 @@
 // views and supports resize/destroy. Buffer descriptors are recorded against the
 // buffer resource for use at wl_surface.commit.
 
+import type { WlShmPoolHandler } from "#protocols-gen/wl_shm_pool.js";
 import type { Ctx } from "./ctx.js";
 import type { Resource } from "../types.js";
 
-export default function makeShmPool(ctx: Ctx) {
+export default function makeShmPool(ctx: Ctx): WlShmPoolHandler {
   const poolRec = (resource: Resource) => ctx.state.pools?.get(resource);
 
   return {
-    create_buffer(
-      resource: Resource, buffer: Resource, offset: number, width: number,
-      height: number, stride: number, format: number,
-    ) {
+    create_buffer(resource, buffer, offset, width, height, stride, format) {
       const pool = poolRec(resource);
       ctx.state.buffers ??= new Map();
       ctx.state.buffers.set(buffer, {
@@ -22,13 +20,13 @@ export default function makeShmPool(ctx: Ctx) {
         offset, width, height, stride, format,
       });
     },
-    resize(resource: Resource, size: number) {
+    resize(resource, size) {
       const pool = poolRec(resource);
       if (!pool) return;
       ctx.addon.shmResizePool(pool.poolId, size);
       pool.size = size;
     },
-    destroy(resource: Resource) {
+    destroy(resource) {
       const pool = poolRec(resource);
       if (pool) ctx.addon.shmDestroyPool(pool.poolId);
       ctx.state.pools?.delete(resource);

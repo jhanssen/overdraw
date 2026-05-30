@@ -4,8 +4,12 @@
 // modifiers; the actual import (GPU process) will reject anything the driver
 // can't handle, surfacing as buffer_params.failed.
 
+import type { ZwpLinuxDmabufV1Handler } from "#protocols-gen/zwp_linux_dmabuf_v1.js";
 import type { Ctx } from "./ctx.js";
 import type { Resource } from "../types.js";
+
+// `bind` is a synthetic on-bind hook, not a protocol request.
+type DmabufHandler = ZwpLinuxDmabufV1Handler & { bind(resource: Resource): void };
 
 // DRM fourcc codes (little-endian char order). ARGB8888/XRGB8888 are the
 // shm-format names too; the numeric fourcc is what linux-dmabuf carries.
@@ -25,9 +29,9 @@ const DRM_FORMAT_MOD_INVALID = 0xffffffffffffffffn;
 const ADVERTISED = [DRM_FORMAT_ARGB8888, DRM_FORMAT_XRGB8888];
 const MODIFIERS = [DRM_FORMAT_MOD_LINEAR, DRM_FORMAT_MOD_INVALID];
 
-export default function makeLinuxDmabuf(ctx: Ctx) {
+export default function makeLinuxDmabuf(ctx: Ctx): DmabufHandler {
   return {
-    bind(resource: Resource) {
+    bind(resource) {
       // v3+ clients use modifier events; older ones use format events. We send
       // both so either path sees our formats.
       for (const fmt of ADVERTISED) {
@@ -39,14 +43,15 @@ export default function makeLinuxDmabuf(ctx: Ctx) {
         }
       }
     },
-    create_params(_resource: Resource, params: Resource) {
+    create_params(_resource, params) {
       // The params object accumulates planes; track its state.
       ctx.state.dmabufParams ??= new Map();
       ctx.state.dmabufParams.set(params, { planes: [], used: false });
     },
-    get_default_feedback(_resource: Resource, _feedback: Resource) {
+    get_default_feedback(_resource, _feedback) {
       // Feedback not implemented (v4+); clients fall back to format/modifier.
     },
-    get_surface_feedback(_resource: Resource, _feedback: Resource, _surface: Resource) {},
+    get_surface_feedback(_resource, _feedback, _surface) {},
+    destroy(_resource) {},
   };
 }

@@ -3,30 +3,31 @@
 // bridge, then release the buffer (shm bytes are copied at upload time, so the
 // client may reuse the buffer immediately).
 
+import type { WlSurfaceHandler } from "#protocols-gen/wl_surface.js";
 import type { Ctx } from "./ctx.js";
 import type { Resource } from "../types.js";
 
-export default function makeSurface(ctx: Ctx) {
+export default function makeSurface(ctx: Ctx): WlSurfaceHandler {
   const rec = (resource: Resource) => ctx.state.surfaces.get(resource);
 
   return {
-    attach(resource: Resource, buffer: Resource | null, _x: number, _y: number) {
+    attach(resource, buffer, _x, _y) {
       const s = rec(resource);
       if (s) s.pending.buffer = buffer; // wl_buffer wrapper or null
     },
-    damage(_resource: Resource, _x: number, _y: number, _w: number, _h: number) {},
-    damage_buffer(_resource: Resource, _x: number, _y: number, _w: number, _h: number) {},
-    frame(resource: Resource, callback: Resource) {
+    damage(_resource, _x, _y, _w, _h) {},
+    damage_buffer(_resource, _x, _y, _w, _h) {},
+    frame(resource, callback) {
       const s = rec(resource);
       if (!s) return;
       (s.frameCallbacks ??= []).push(callback);
     },
-    set_opaque_region(_resource: Resource, _region: Resource) {},
-    set_input_region(_resource: Resource, _region: Resource) {},
-    set_buffer_transform(_resource: Resource, _transform: number) {},
-    set_buffer_scale(_resource: Resource, _scale: number) {},
-    offset(_resource: Resource, _x: number, _y: number) {},
-    commit(resource: Resource) {
+    set_opaque_region(_resource, _region) {},
+    set_input_region(_resource, _region) {},
+    set_buffer_transform(_resource, _transform) {},
+    set_buffer_scale(_resource, _scale) {},
+    offset(_resource, _x, _y) {},
+    commit(resource) {
       const s = rec(resource);
       if (!s) return;
       if (s.pending.buffer !== undefined) {
@@ -69,7 +70,7 @@ export default function makeSurface(ctx: Ctx) {
 
       if (s.xdgSurface) s.xdgSurface.lastCommitSerial = ctx.state.nextSerial - 1;
     },
-    destroy(resource: Resource) {
+    destroy(resource) {
       const s = rec(resource);
       if (s) {
         ctx.state.wm?.unmapWindow(s.id);

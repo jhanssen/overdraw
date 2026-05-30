@@ -7,14 +7,11 @@
 // protocol modules are typed by their own emitted .d.ts (signature/makeEvents),
 // resolved via the #protocols-gen/* subpath import.
 
-// A trampoline resource wrapper (from wrapResource in native/wayland). Dynamic:
-// extra per-interface fields are attached by handlers, so we allow indexing.
-export interface Resource {
-  __resource: unknown;
-  interfaceName: string;
-  destroyed: boolean;
-  [key: string]: unknown;
-}
+// The trampoline resource wrapper. Single source of truth is the generated
+// wayland-types module (the protocol contracts use the same Resource/ResourceOf),
+// re-exported here so the handwritten layer has one import site.
+import type { Resource } from "#protocols-gen/wayland-types.js";
+export type { Resource, ResourceOf } from "#protocols-gen/wayland-types.js";
 
 // Wayland event-sender args: wire scalars, a resource, an array buffer, or null.
 export type EventArg = number | string | Resource | Uint8Array | null;

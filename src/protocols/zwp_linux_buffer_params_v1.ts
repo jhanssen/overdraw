@@ -6,6 +6,10 @@
 import type { Ctx, DmabufParams, BufferDesc } from "./ctx.js";
 import type { Resource } from "../types.js";
 
+// NOTE: not annotated with the generated ZwpLinuxBufferParamsV1Handler. The
+// contract types `add`'s fd arg as WaylandFd, but the trampoline delivers the
+// dmabuf fd as an opaque integer handle (native-owned). Same fd-typing
+// reconciliation gap as wl_shm.create_pool; hand-typed until then.
 export default function makeBufferParams(ctx: Ctx) {
   const rec = (resource: Resource): DmabufParams | undefined =>
     ctx.state.dmabufParams?.get(resource);

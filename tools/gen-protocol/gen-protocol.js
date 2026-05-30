@@ -21,14 +21,19 @@ const repoRoot = join(__dirname, '..', '..');
 // output dir so the generated protocol modules are self-contained.
 const WAYLAND_TYPES_DTS = `// Generated. Shared types referenced by all generated protocol .d.ts files.
 //
-// A Resource is an opaque, C++-owned wl_resource; JS holds a weak handle. The
-// brand is compile-time only and gives per-interface type safety.
+// A Resource is the trampoline's JS wrapper around a C++-owned wl_resource. The
+// brand on ResourceOf is compile-time only and gives per-interface type safety
+// (a wl_surface resource is not assignable to a wl_buffer parameter). The shape
+// matches native/wayland/trampoline.cpp wrapResource: an opaque __resource
+// external, the interface name, a destroyed flag, plus handler-attached fields.
 
 declare const __iface: unique symbol;
 
 export interface Resource {
+  readonly __resource: unknown;
   readonly interfaceName: string;
-  readonly destroyed: boolean;
+  destroyed: boolean;
+  [key: string]: unknown;
 }
 
 export type ResourceOf<Iface extends string> = Resource & {

@@ -9,12 +9,18 @@
 // the focused surface. Coordinates sent to the client are surface-local.
 
 import { signature as seatSig } from "#protocols-gen/wl_seat.js";
+import type { WlSeatHandler } from "#protocols-gen/wl_seat.js";
+import type { WlPointerHandler } from "#protocols-gen/wl_pointer.js";
+import type { WlKeyboardHandler } from "#protocols-gen/wl_keyboard.js";
 import type { Ctx, SeatFocus } from "./ctx.js";
 import type { Resource, InputEvent } from "../types.js";
 
+// `bind` is a synthetic on-bind hook, not a protocol request.
+type SeatHandler = WlSeatHandler & { bind(resource: Resource): void };
+
 const CAP = seatSig.enums.capability.entries; // { pointer:1, keyboard:2, touch:4 }
 
-export default function makeSeat(ctx: Ctx) {
+export default function makeSeat(ctx: Ctx): SeatHandler {
   // wl_pointer resources grouped by owning client id. A client may have several
   // (one per wl_seat bind); events go to all of that client's pointers.
   const pointersByClient = new Map<number, Set<Resource>>();
@@ -122,40 +128,40 @@ export default function makeSeat(ctx: Ctx) {
 
   return {
     // Global bind: advertise capabilities. Pointer only for now.
-    bind(resource: Resource) {
+    bind(resource) {
       ctx.events.wl_seat.send_capabilities(resource, CAP.pointer);
       ctx.events.wl_seat.send_name(resource, "seat0");
     },
-    get_pointer(resource: Resource, pointer: Resource) {
+    get_pointer(resource, pointer) {
       const clientId = ctx.addon.clientId(resource);
       clientPointers(clientId).add(pointer);
       pointer.__clientId = clientId;
     },
-    get_keyboard(resource: Resource, keyboard: Resource) {
+    get_keyboard(resource, keyboard) {
       const clientId = ctx.addon.clientId(resource);
       let s = keyboardsByClient.get(clientId);
       if (!s) { s = new Set(); keyboardsByClient.set(clientId, s); }
       s.add(keyboard);
       // No keymap sent yet; keyboard input is not routed in this phase.
     },
-    get_touch(_resource: Resource, _touch: Resource) {},
-    release(_resource: Resource) {},
+    get_touch(_resource, _touch) {},
+    release(_resource) {},
   };
 }
 
 // wl_pointer / wl_keyboard child-resource handlers: just handle release/destroy.
-export function makePointer(ctx: Ctx) {
+export function makePointer(ctx: Ctx): WlPointerHandler {
   return {
-    set_cursor(_resource: Resource, _serial: number, _surface: Resource, _hx: number, _hy: number) {
+    set_cursor(_resource, _serial, _surface, _hx, _hy) {
       // Client cursor surface not composited yet (software cursor is future).
     },
-    release(resource: Resource) { cleanup(ctx, resource); },
+    release(resource) { cleanup(ctx, resource); },
   };
 }
 
-export function makeKeyboard(ctx: Ctx) {
+export function makeKeyboard(ctx: Ctx): WlKeyboardHandler {
   return {
-    release(resource: Resource) { cleanupKb(ctx, resource); },
+    release(resource) { cleanupKb(ctx, resource); },
   };
 }
 

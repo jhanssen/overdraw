@@ -1,12 +1,12 @@
 // wl_region: rectangular region accumulation. Not used by compositing yet;
 // requests are accepted and ignored for first light.
 
-import type { Resource } from "../types.js";
+import type { WlRegionHandler } from "#protocols-gen/wl_region.js";
 
-export default function makeRegion() {
+export default function makeRegion(): WlRegionHandler {
   return {
-    add(_resource: Resource, _x: number, _y: number, _w: number, _h: number) {},
-    subtract(_resource: Resource, _x: number, _y: number, _w: number, _h: number) {},
-    destroy(_resource: Resource) {},
+    add(_resource, _x, _y, _w, _h) {},
+    subtract(_resource, _x, _y, _w, _h) {},
+    destroy(_resource) {},
   };
 }

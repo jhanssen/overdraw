@@ -27,8 +27,10 @@ interface SignatureModule {
   makeEvents(post: Addon["postEvent"]): EventSenders;
 }
 
-// A handler module default-exports a factory (ctx) => handler object.
-type HandlerFactory = (ctx: Ctx) => Record<string, unknown>;
+// A handler module default-exports a factory (ctx) => handler object. The
+// concrete return type is the interface's generated WlXHandler; here we only
+// need that it is an object (registerInterface takes it as unknown).
+type HandlerFactory = (ctx: Ctx) => object;
 interface HandlerModule { default: HandlerFactory; }
 
 // Interfaces advertised as globals (clients bind them from the registry).
@@ -101,7 +103,7 @@ export async function installProtocols(
 
   // wl_pointer / wl_keyboard handlers come from the seat module's named exports.
   const seatMod = await import("./wl_seat.js");
-  const childHandlers: Record<string, Record<string, unknown>> = {
+  const childHandlers: Record<string, object> = {
     wl_pointer: seatMod.makePointer(ctx),
     wl_keyboard: seatMod.makeKeyboard(ctx),
   };

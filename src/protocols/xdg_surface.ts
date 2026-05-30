@@ -5,6 +5,7 @@
 // window we mark it activated.
 
 import { signature as toplevelSig } from "#protocols-gen/xdg_toplevel.js";
+import type { XdgSurfaceHandler } from "#protocols-gen/xdg_surface.js";
 import type { Ctx } from "./ctx.js";
 import type { Resource } from "../types.js";
 
@@ -19,11 +20,11 @@ function packStates(states: number[]): Uint8Array {
   return new Uint8Array(buf);
 }
 
-export default function makeXdgSurface(ctx: Ctx) {
+export default function makeXdgSurface(ctx: Ctx): XdgSurfaceHandler {
   const rec = (resource: Resource) => ctx.state.xdgSurfaces?.get(resource);
 
   return {
-    get_toplevel(resource: Resource, toplevel: Resource) {
+    get_toplevel(resource, toplevel) {
       const xs = rec(resource);
       if (!xs) return;
       xs.role = "toplevel";
@@ -42,18 +43,18 @@ export default function makeXdgSurface(ctx: Ctx) {
       xs.lastConfigureSerial = serial;
       ctx.events.xdg_surface.send_configure(resource, serial);
     },
-    get_popup(_resource: Resource, _popup: Resource, _parent: Resource, _positioner: Resource) {
+    get_popup(_resource, _popup, _parent, _positioner) {
       // Popups not implemented for first light.
     },
-    set_window_geometry(resource: Resource, x: number, y: number, w: number, h: number) {
+    set_window_geometry(resource, x, y, w, h) {
       const xs = rec(resource);
       if (xs) xs.geometry = { x, y, width: w, height: h };
     },
-    ack_configure(resource: Resource, serial: number) {
+    ack_configure(resource, serial) {
       const xs = rec(resource);
       if (xs && serial === xs.lastConfigureSerial) xs.configured = true;
     },
-    destroy(resource: Resource) {
+    destroy(resource) {
       const xs = rec(resource);
       if (xs?.surface) xs.surface.xdgSurface = null;
       ctx.state.xdgSurfaces?.delete(resource);

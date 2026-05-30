@@ -2,12 +2,12 @@
 // event the compositor sends once it no longer needs the buffer's contents
 // (after upload, for shm). Descriptor lives in ctx.state.buffers.
 
+import type { WlBufferHandler } from "#protocols-gen/wl_buffer.js";
 import type { Ctx } from "./ctx.js";
-import type { Resource } from "../types.js";
 
-export default function makeBuffer(ctx: Ctx) {
+export default function makeBuffer(ctx: Ctx): WlBufferHandler {
   return {
-    destroy(resource: Resource) {
+    destroy(resource) {
       ctx.state.buffers?.delete(resource);
     },
   };

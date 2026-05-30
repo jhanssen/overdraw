@@ -2,33 +2,34 @@
 // state requests. WM/policy (placement, focus, maximize) is not implemented; for
 // first light we record intent and otherwise no-op.
 
+import type { XdgToplevelHandler } from "#protocols-gen/xdg_toplevel.js";
 import type { Ctx } from "./ctx.js";
 import type { Resource } from "../types.js";
 
-export default function makeToplevel(ctx: Ctx) {
+export default function makeToplevel(ctx: Ctx): XdgToplevelHandler {
   const rec = (resource: Resource) => ctx.state.toplevels?.get(resource);
 
   return {
-    set_parent(_resource: Resource, _parent: Resource) {},
-    set_title(resource: Resource, title: string) {
+    set_parent(_resource, _parent) {},
+    set_title(resource, title) {
       const t = rec(resource);
       if (t) t.title = title;
     },
-    set_app_id(resource: Resource, appId: string) {
+    set_app_id(resource, appId) {
       const t = rec(resource);
       if (t) t.appId = appId;
     },
-    show_window_menu(_resource: Resource, _seat: Resource, _serial: number, _x: number, _y: number) {},
-    move(_resource: Resource, _seat: Resource, _serial: number) {},
-    resize(_resource: Resource, _seat: Resource, _serial: number, _edges: number) {},
-    set_max_size(_resource: Resource, _w: number, _h: number) {},
-    set_min_size(_resource: Resource, _w: number, _h: number) {},
-    set_maximized(_resource: Resource) {},
-    unset_maximized(_resource: Resource) {},
-    set_fullscreen(_resource: Resource, _output: Resource) {},
-    unset_fullscreen(_resource: Resource) {},
-    set_minimized(_resource: Resource) {},
-    destroy(resource: Resource) {
+    show_window_menu(_resource, _seat, _serial, _x, _y) {},
+    move(_resource, _seat, _serial) {},
+    resize(_resource, _seat, _serial, _edges) {},
+    set_max_size(_resource, _w, _h) {},
+    set_min_size(_resource, _w, _h) {},
+    set_maximized(_resource) {},
+    unset_maximized(_resource) {},
+    set_fullscreen(_resource, _output) {},
+    unset_fullscreen(_resource) {},
+    set_minimized(_resource) {},
+    destroy(resource) {
       ctx.state.toplevels?.delete(resource);
     },
   };
