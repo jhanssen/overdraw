@@ -57,6 +57,16 @@ class Trampoline {
     // per-resource destroy listener.
     void forgetResource(wl_resource* resource);
 
+    // Fd handle table. Request fd args are dup'd into the table on decode and
+    // exposed to JS as opaque integer handles; the raw fd stays native-owned.
+    // registerFd stores an (already-owned) fd and returns its handle. takeFd
+    // removes the entry and transfers ownership of the raw fd to the caller
+    // (for handing to a native import API). closeFd closes + drops it. Untaken
+    // fds are closed when the Trampoline is destroyed.
+    uint32_t registerFd(int fd);
+    int takeFd(uint32_t handle);
+    bool closeFd(uint32_t handle);
+
   private:
     struct InterfaceState {
         std::string name;
@@ -86,6 +96,10 @@ class Trampoline {
     // Stable JS wrapper per wl_resource (napi_ref keeps it alive while the
     // resource lives). Cleared on resource destroy.
     std::unordered_map<wl_resource*, napi_ref> wrappers_;
+
+    // Opaque fd handle -> dup'd raw fd. See registerFd/takeFd/closeFd.
+    std::unordered_map<uint32_t, int> fds_;
+    uint32_t nextFd_ = 1;
 };
 
 }  // namespace overdraw::wayland

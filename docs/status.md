@@ -139,8 +139,18 @@ interfaces built at runtime from the generator metadata (no per-protocol C):
   invalidated. This validates the generator metadata against real wire traffic.
 
 Trampoline gaps (implemented or not):
-- `fd` args decode/encode to nothing yet (no `WaylandFd`); blocks `wl_shm`,
-  data-device, keymap.
+- `fd` request-arg **decode** is implemented (native-owned handle path): on
+  decode the fd is `dup`'d into a per-trampoline table and JS receives an opaque
+  integer handle; `addon.fdTake(handle)` transfers the raw fd out (caller
+  closes), `addon.fdClose(handle)` drops it; untaken fds close on trampoline
+  teardown. The `dup`-on-receipt is correct regardless of libwayland's
+  dispatch-time fd ownership (which was not separately resolved). Proven with a
+  real client over `wl_shm.create_pool` (`test/fd-test-client.c` +
+  `test/fd-passing-smoke.mjs`): the server reads back the client's marker bytes
+  from the received fd. This is the buffer-fd handle path
+  (architecture.md "Fds stay in C++"); the read/write `WaylandFd` wrapper for
+  data-transfer fds (pipes, keymaps) is still unbuilt. `fd` **encode** (events
+  carrying fds) is still stubbed (`-1`).
 - `array` encode is proven on the wire (`xdg_toplevel.configure` sends a
   non-empty `states` `wl_array` of one uint32; the client receives 4 bytes
   decoding to `ACTIVATED`, asserting both byte length and value). `array`
@@ -200,13 +210,15 @@ path).
 ## Not yet built (design only)
 
 - **A mappable window (client buffers).** The xdg-shell toplevel-creation chain
-  is implemented and proven (see "JS protocol layer" above), but a real app
-  still cannot *map a window with content*: no buffer is attached or composited.
-  `wl_shm` and `linux-dmabuf-v1` client buffer import are unwritten, and there
-  is no `WaylandFd` to receive client buffer fds (fd args are stubbed in the
-  trampoline). The dmabuf import primitive a `linux-dmabuf-v1` handler would
-  reuse is proven server-side, but importing a *client-chosen* modifier we did
-  not allocate is not yet exercised. No live reload yet. No WM/policy.
+  is implemented and proven (see "JS protocol layer" above), and request fd-arg
+  decode now works (a handler can receive a client buffer fd as a handle — see
+  "Trampoline gaps"), but a real app still cannot *map a window with content*:
+  no buffer is attached, imported, or composited. The `wl_shm` and
+  `linux-dmabuf-v1` handler logic (pool/buffer tracking, import to a texture)
+  is unwritten, and nothing samples a *client* buffer into the compositing pass.
+  The dmabuf import primitive a `linux-dmabuf-v1` handler would reuse is proven
+  server-side, but importing a *client-chosen* modifier we did not allocate is
+  not yet exercised. No live reload yet. No WM/policy.
 - **WM / policy in JS.** Window management, focus, layout — none built.
 - **JS-owned core breadth.** The core is C++ + Node with a working trampoline
   and a frame event callback, but the protocol-handler/WM/plugin layers that

@@ -105,3 +105,8 @@ target_include_directories(xdg-test-client PRIVATE
     ${WAYLAND_CLIENT_INCLUDE_DIRS}
     ${CMAKE_SOURCE_DIR}/native/wayland/generated)
 target_link_libraries(xdg-test-client PRIVATE ${WAYLAND_CLIENT_LIBRARIES})
+
+# ---- fd test client (wl_shm.create_pool fd passing) ----
+add_executable(fd-test-client test/fd-test-client.c)
+target_include_directories(fd-test-client PRIVATE ${WAYLAND_CLIENT_INCLUDE_DIRS})
+target_link_libraries(fd-test-client PRIVATE ${WAYLAND_CLIENT_LIBRARIES})

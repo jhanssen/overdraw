@@ -331,6 +331,32 @@ napi_value PostEvent(napi_env env, napi_callback_info info) {
     return undef;
 }
 
+// fdTake(handle) -> rawFd (number)
+// Remove an fd handle from the trampoline table and return the raw fd, giving
+// ownership to the caller (who must close it). Returns -1 for unknown handles.
+napi_value FdTake(napi_env env, napi_callback_info info) {
+    size_t argc = 1; napi_value argv[1];
+    napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+    if (argc < 1) return throwError(env, "fdTake(handle) requires a handle");
+    if (!g_addon.trampoline) return throwError(env, "no trampoline");
+    uint32_t handle = 0; napi_get_value_uint32(env, argv[0], &handle);
+    int fd = g_addon.trampoline->takeFd(handle);
+    napi_value out; napi_create_int32(env, fd, &out);
+    return out;
+}
+
+// fdClose(handle) -> boolean (true if a handle was closed)
+napi_value FdClose(napi_env env, napi_callback_info info) {
+    size_t argc = 1; napi_value argv[1];
+    napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+    if (argc < 1) return throwError(env, "fdClose(handle) requires a handle");
+    if (!g_addon.trampoline) return throwError(env, "no trampoline");
+    uint32_t handle = 0; napi_get_value_uint32(env, argv[0], &handle);
+    bool ok = g_addon.trampoline->closeFd(handle);
+    napi_value out; napi_get_boolean(env, ok, &out);
+    return out;
+}
+
 napi_value Init(napi_env env, napi_value exports) {
     napi_value fnStart, fnStop, fnPresented, fnStartServer, fnStopServer;
     napi_create_function(env, "start", NAPI_AUTO_LENGTH, Start, nullptr, &fnStart);
@@ -343,6 +369,9 @@ napi_value Init(napi_env env, napi_value exports) {
     napi_create_function(env, "registerInterface", NAPI_AUTO_LENGTH, RegisterInterface, nullptr, &fnRegisterIface);
     napi_create_function(env, "createGlobal", NAPI_AUTO_LENGTH, CreateGlobal, nullptr, &fnCreateGlobal);
     napi_create_function(env, "postEvent", NAPI_AUTO_LENGTH, PostEvent, nullptr, &fnPostEvent);
+    napi_value fnFdTake, fnFdClose;
+    napi_create_function(env, "fdTake", NAPI_AUTO_LENGTH, FdTake, nullptr, &fnFdTake);
+    napi_create_function(env, "fdClose", NAPI_AUTO_LENGTH, FdClose, nullptr, &fnFdClose);
     napi_set_named_property(env, exports, "start", fnStart);
     napi_set_named_property(env, exports, "stop", fnStop);
     napi_set_named_property(env, exports, "presentedCount", fnPresented);
@@ -352,6 +381,8 @@ napi_value Init(napi_env env, napi_value exports) {
     napi_set_named_property(env, exports, "registerInterface", fnRegisterIface);
     napi_set_named_property(env, exports, "createGlobal", fnCreateGlobal);
     napi_set_named_property(env, exports, "postEvent", fnPostEvent);
+    napi_set_named_property(env, exports, "fdTake", fnFdTake);
+    napi_set_named_property(env, exports, "fdClose", fnFdClose);
     return exports;
 }
 
