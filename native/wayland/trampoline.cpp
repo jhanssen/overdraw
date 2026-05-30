@@ -130,6 +130,10 @@ bool Trampoline::postEvent(napi_value resourceHandle, uint32_t opcode, napi_valu
     std::vector<wl_argument> wargs(n);
     std::vector<std::string> strKeep;
     strKeep.reserve(n);
+    // wl_array storage must outlive the post call. Reserve so element addresses
+    // stay stable as we append.
+    std::vector<wl_array> arrKeep;
+    arrKeep.reserve(n);
     int ai = 0;
     for (const char* p = ev->signature; *p && ai < static_cast<int>(n); ++p) {
         if (*p >= '0' && *p <= '9') continue;
@@ -163,7 +167,31 @@ bool Trampoline::postEvent(napi_value resourceHandle, uint32_t opcode, napi_valu
                 break;
             }
             case 'n': { uint32_t x = 0; napi_get_value_uint32(env, v, &x); wargs[ai].n = x; break; }
-            case 'a': wargs[ai].a = nullptr; break;  // array events: later
+            case 'a': {
+                // Uint8Array (or any typed array / arraybuffer) -> wl_array. The
+                // backing bytes belong to the JS value, which is live for this
+                // call; point wl_array at them (post copies into the wire buffer).
+                wl_array a{};
+                bool isTyped = false;
+                napi_is_typedarray(env, v, &isTyped);
+                if (isTyped) {
+                    napi_typedarray_type tt; size_t len; void* data; napi_value ab; size_t off;
+                    napi_get_typedarray_info(env, v, &tt, &len, &data, &ab, &off);
+                    a.data = data;
+                    a.size = len;  // element size 1 for uint8; bytes for others handled by len*?
+                    a.alloc = len;
+                } else {
+                    bool isAb = false; napi_is_arraybuffer(env, v, &isAb);
+                    if (isAb) {
+                        void* data; size_t len;
+                        napi_get_arraybuffer_info(env, v, &data, &len);
+                        a.data = data; a.size = len; a.alloc = len;
+                    }
+                }
+                arrKeep.push_back(a);
+                wargs[ai].a = &arrKeep.back();
+                break;
+            }
             case 'h': wargs[ai].h = -1; break;       // fd events: later
             default: wargs[ai].u = 0; break;
         }
@@ -254,7 +282,17 @@ int Trampoline::onDispatch(const void* implData, void* target, uint32_t opcode,
                 v = self->wrapResource(child, argIface->name);
                 break;
             }
-            case 'a': napi_get_null(env, &v); break;  // array: later
+            case 'a': {
+                // wl_array -> Uint8Array (copy of the bytes).
+                auto* arr = reinterpret_cast<wl_array*>(args[argIndex].a);
+                size_t sz = arr ? arr->size : 0;
+                void* abData = nullptr;
+                napi_value ab;
+                napi_create_arraybuffer(env, sz, &abData, &ab);
+                if (sz) std::memcpy(abData, arr->data, sz);
+                napi_create_typedarray(env, napi_uint8_array, sz, ab, 0, &v);
+                break;
+            }
             case 'h': napi_get_null(env, &v); break;  // fd: later (WaylandFd)
             default: napi_get_undefined(env, &v); break;
         }
