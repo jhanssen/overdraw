@@ -15,6 +15,7 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 import { dirname, join } from "node:path";
 
 import { createWm } from "../wm/index.js";
+import { queryState } from "../query.js";
 import type { Addon, EventsByInterface, EventSenders } from "../types.js";
 import type { Ctx, CompositorState, FocusOptions } from "./ctx.js";
 
@@ -95,6 +96,9 @@ export async function installProtocols(
     serial() { return this.nextSerial++; },
   };
   state.wm = createWm(addon, output);
+  // State-query channel (tests / introspection): a GPU-free snapshot of
+  // geometry / focus / stacking. See src/query.ts.
+  state.query = () => queryState(state);
 
   // Fire pending wl_surface.frame callbacks. Clients drive their render loop off
   // these (commit -> request frame -> draw next frame on done), so without this

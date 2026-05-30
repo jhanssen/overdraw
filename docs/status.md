@@ -602,6 +602,36 @@ path).
   published as the `-alpha2` release overdraw now consumes. overdraw verified
   against the published artifact.
 
+### Testing (pure-unit layer + state-query channel)
+The reference compositors (wlroots, Hyprland) automate correctness via (1) pure
+GPU-free unit tests and (2) a headless run + control-socket state queries +
+synthetic input, asserting on geometry/focus/state strings — NOT pixel/golden
+comparison (Hyprland's own tester flags visual testing as an open TODO). overdraw
+follows the same model.
+
+- **Pure-unit tests** (`npm test` → `node --test 'test/**/*.test.js'`, GPU-free):
+  - `test/gen-protocol.test.js` — protocol-generator structural tests (8).
+  - `test/placement.test.js` — the placement stub's cascade/wrap/clamp.
+  - `test/wm.test.js` — `createWm` map/unmap (rect assignment, content-size
+    fallback, idempotence, stack order pushed to a MOCK addon) + `windowAt`
+    hit-testing (half-open bounds, topmost-on-overlap). The mock addon records
+    `setSurfaceLayout`/`setStack` so the WM is tested without native/GPU.
+  - `test/query.test.js` — the state-query channel snapshot.
+  - 29 tests total, all passing; no native build, no GPU, no Wayland.
+- **State-query channel** (`src/query.ts`, `queryState(state)` → `StateSnapshot`):
+  overdraw's analog of `hyprctl /activewindow` — a serializable, GPU-free snapshot
+  of output size, windows (surfaceId + rect + title + app_id + role + mapped),
+  back-to-front stack order, and pointer/keyboard focus surface ids. Attached to
+  the state returned by `installProtocols` as `state.query()`. This is the seam a
+  future integration harness asserts against (geometry/focus), without pixels.
+- **Not yet built (testing):** an integration harness that spawns real clients
+  against a running server and asserts via `state.query()`; a synthetic
+  `InputBackend` (the seam exists in `native/core/input.h`) to inject input the
+  way Hyprland's test plugin injects `IKeyboard` events; a frame-readback
+  primitive for the optional GPU-box-only pixel layer (`readbackFrame` +
+  computed-expectation comparison). The existing `*-smoke.mjs` server-only tests
+  (trampoline/fd/xdg/server) are GPU-free but not yet folded into `npm test`.
+
 ## Not yet built (design only)
 
 - **Live reload, WM / policy.** A real app can now map a window with both shm

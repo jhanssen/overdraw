@@ -1,0 +1,110 @@
+// Pure-unit tests for the state-query channel (src/query.ts). Builds a minimal
+// CompositorState with the real WM (mock addon) plus hand-built surface/toplevel
+// records, then asserts queryState() snapshots geometry / stack / focus / titles
+// correctly. No GPU, no Wayland.
+
+import { test } from 'node:test';
+import assert from 'node:assert/strict';
+
+import { createWm } from '../dist/wm/index.js';
+import { queryState } from '../dist/query.js';
+
+function mockAddon() {
+  return { setSurfaceLayout() {}, setStack() {} };
+}
+
+// Build a CompositorState scaffold with the real WM and given surfaces.
+function makeState(output = { width: 1920, height: 1080 }) {
+  const surfaces = new Map();   // resource -> SurfaceRecord
+  const toplevels = new Map();  // toplevel resource -> ToplevelRecord
+  const wm = createWm(mockAddon(), output);
+
+  const state = {
+    surfaces, toplevels, nextSerial: 1,
+    serial() { return this.nextSerial++; },
+    wm,
+    seat: { focus: null, kbFocus: null },
+  };
+
+  // Helper: create a mapped toplevel surface with title/app_id and map it.
+  function addToplevel(id, { title = null, appId = null, w = 200, h = 100 } = {}) {
+    const surfaceRes = { __surface: id };
+    const toplevelRes = { __toplevel: id };
+    const xdgSurface = { resource: { __xdg: id }, role: 'toplevel', toplevel: toplevelRes };
+    const surfaceRec = {
+      id, resource: surfaceRes, role: 'xdg_toplevel',
+      pending: {}, committed: { buffer: null }, xdgSurface, mapped: true,
+    };
+    surfaces.set(surfaceRes, surfaceRec);
+    toplevels.set(toplevelRes, { resource: toplevelRes, xdgSurface, title, appId });
+    wm.mapWindow(id, surfaceRec, w, h);
+    return surfaceRec;
+  }
+
+  return { state, addToplevel };
+}
+
+test('queryState: empty compositor', () => {
+  const { state } = makeState();
+  const snap = queryState(state);
+  assert.deepEqual(snap.output, { width: 1920, height: 1080 });
+  assert.deepEqual(snap.windows, []);
+  assert.deepEqual(snap.stack, []);
+  assert.equal(snap.pointerFocus, null);
+  assert.equal(snap.keyboardFocus, null);
+});
+
+test('queryState: windows with geometry, title, app_id, role', () => {
+  const { state, addToplevel } = makeState();
+  addToplevel(1, { title: 'term', appId: 'foot', w: 300, h: 200 });
+
+  const snap = queryState(state);
+  assert.equal(snap.windows.length, 1);
+  const win = snap.windows[0];
+  assert.equal(win.surfaceId, 1);
+  assert.equal(win.title, 'term');
+  assert.equal(win.appId, 'foot');
+  assert.equal(win.role, 'xdg_toplevel');
+  assert.equal(win.mapped, true);
+  assert.equal(win.rect.width, 300);
+  assert.equal(win.rect.height, 200);
+});
+
+test('queryState: stack order is back-to-front', () => {
+  const { state, addToplevel } = makeState();
+  addToplevel(1);
+  addToplevel(2);
+  addToplevel(3);
+  const snap = queryState(state);
+  assert.deepEqual(snap.stack, [1, 2, 3]);
+  assert.deepEqual(snap.windows.map((w) => w.surfaceId), [1, 2, 3]);
+});
+
+test('queryState: reflects pointer + keyboard focus', () => {
+  const { state, addToplevel } = makeState();
+  addToplevel(1);
+  addToplevel(2);
+  state.seat.focus = { surfaceId: 2 };
+  state.seat.kbFocus = { surfaceId: 1 };
+  const snap = queryState(state);
+  assert.equal(snap.pointerFocus, 2);
+  assert.equal(snap.keyboardFocus, 1);
+});
+
+test('queryState: window missing a toplevel record yields null title/appId', () => {
+  const { state, addToplevel } = makeState();
+  const rec = addToplevel(1);
+  // Drop the toplevel record but keep the window mapped.
+  state.toplevels.delete(rec.xdgSurface.toplevel);
+  const snap = queryState(state);
+  assert.equal(snap.windows[0].title, null);
+  assert.equal(snap.windows[0].appId, null);
+});
+
+test('queryState: snapshot is serializable (JSON round-trips)', () => {
+  const { state, addToplevel } = makeState();
+  addToplevel(1, { title: 'a', appId: 'b' });
+  const snap = queryState(state);
+  const round = JSON.parse(JSON.stringify(snap));
+  assert.deepEqual(round, snap);
+});

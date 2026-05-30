@@ -35,6 +35,9 @@ export interface CompositorState {
   // Fire all surfaces' pending wl_surface.frame callbacks (set by installProtocols;
   // called once per compositor frame). timeMs is a millisecond timestamp.
   dispatchFrameCallbacks?: (timeMs: number) => void;
+  // State-query channel: snapshot compositor state (geometry/focus/stack) for
+  // tests + introspection, without reading pixels. Set by installProtocols.
+  query?: () => import("../query.js").StateSnapshot;
   // Per-protocol bookkeeping maps, created lazily by handlers.
   pools?: Map<Resource, { poolId: number; size: number }>;
   buffers?: Map<Resource, BufferDesc>;
