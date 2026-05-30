@@ -7,15 +7,19 @@
 
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <vector>
 
+#include <execinfo.h>
 #include <fcntl.h>
+#include <signal.h>
 #include <unistd.h>
 
 #include "dawn/native/DawnNative.h"
 #include "dawn/wire/WireServer.h"
 #include "dawn/webgpu_cpp.h"
 
+#include "allocator.h"
 #include "host_window.h"
 #include "side_channel.h"
 #include "transport.h"
@@ -23,6 +27,32 @@
 using namespace overdraw;
 
 namespace {
+
+// Crash handler: dump a native backtrace to a file (async-signal-safe-ish:
+// backtrace/backtrace_symbols_fd are commonly used here) then re-raise.
+void crashHandler(int sig) {
+    const char* path = "/tmp/overdraw-gpu-crash.txt";
+    int fd = ::open(path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (fd >= 0) {
+        char hdr[64];
+        int n = std::snprintf(hdr, sizeof(hdr), "GPU process caught signal %d\n", sig);
+        ::write(fd, hdr, static_cast<size_t>(n));
+        void* frames[64];
+        int got = ::backtrace(frames, 64);
+        ::backtrace_symbols_fd(frames, got, fd);
+        ::close(fd);
+    }
+    ::signal(sig, SIG_DFL);
+    ::raise(sig);
+}
+
+void installCrashHandler() {
+    ::signal(SIGSEGV, crashHandler);
+    ::signal(SIGABRT, crashHandler);
+    ::signal(SIGBUS, crashHandler);
+    ::signal(SIGILL, crashHandler);
+    ::signal(SIGFPE, crashHandler);
+}
 
 void usleepShort() { ::usleep(200); }
 
@@ -46,14 +76,19 @@ int run(int wireFd, int ctrlFd) {
 
     ::fcntl(ctrlFd, F_SETFL, O_NONBLOCK);
 
-    auto pumpWire = [&] {
+    // Process at most `maxFrames` wire frames per call so the side channel is
+    // not starved while the wire is busy. <=0 means drain fully (startup use).
+    auto pumpWireN = [&](int maxFrames) {
         std::vector<uint8_t> frame;
-        while (ipc::readWireFrame(wireFd, frame)) {
+        int n = 0;
+        while ((maxFrames <= 0 || n < maxFrames) && ipc::readWireFrame(wireFd, frame)) {
             server.HandleCommands(reinterpret_cast<const char*>(frame.data()), frame.size());
             serializer.Flush();
+            ++n;
         }
         dawn::native::InstanceProcessEvents(instance.Get());
     };
+    auto pumpWire = [&] { pumpWireN(0); };
 
     // 3) Handshake: Hello -> HelloReply(size).
     {
@@ -127,6 +162,19 @@ int run(int wireFd, int ctrlFd) {
     if (adapters.empty()) { std::fprintf(stderr, "[gpu] no adapter\n"); return 1; }
     wgpu::Adapter adapter(adapters[0].Get());
 
+    // B1: GBM allocator + Dawn DRM modifier probe (persistent: the allocator
+    // owns the gbm device and any allocated bo for the rest of the run).
+    std::printf("[gpu] adapter DawnDrmFormatCapabilities feature: %d  SharedTextureMemoryDmaBuf: %d\n",
+                adapter.HasFeature(wgpu::FeatureName::DawnDrmFormatCapabilities) ? 1 : 0,
+                adapter.HasFeature(wgpu::FeatureName::SharedTextureMemoryDmaBuf) ? 1 : 0);
+    gpu::Allocator alloc;
+    if (!alloc.open()) { std::fprintf(stderr, "[gpu] allocator open failed\n"); return 1; }
+    if (!alloc.probe(adapter, wgpu::TextureFormat::BGRA8Unorm)) {
+        std::fprintf(stderr, "[gpu] modifier probe found nothing importable\n");
+        return 1;
+    }
+    std::printf("[gpu] B1 probe OK (%zu usable modifiers)\n", alloc.usableModifiers().size());
+
     wgpu::SurfaceCapabilities caps{};
     surface.GetCapabilities(adapter, &caps);
     uint32_t format = caps.formatCount
@@ -155,19 +203,117 @@ int run(int wireFd, int ctrlFd) {
         ipc::sendMessage(ctrlFd, m);
     }
 
+    // Wire-resolved core device (non-owning wrapper; addref'd by the ctor).
+    wgpu::Device coreDevice(nativeDev);
+
+    // B3: persistent dmabuf-backed texture injected at the client's reserved
+    // handle. Allocated + imported on demand when the core sends ReserveTex.
+    gpu::DmabufBuffer dmaBuf{};
+    wgpu::SharedTextureMemory dmaMem;
+    wgpu::Texture dmaTex;
+
     // 9) Service Dawn + the host window until the core requests shutdown or the
     //    host window is closed. The core drives the swapchain over the wire.
     bool shutdown = false;
     while (!shutdown && !window.shouldClose()) {
-        pumpWire();
+        pumpWireN(8);  // bounded so the side channel below is not starved
         window.pump();
         ipc::Message m{};
-        if (ipc::recvMessageNB(ctrlFd, m) && m.tag == ipc::Tag::Shutdown) shutdown = true;
+        if (ipc::recvMessageNB(ctrlFd, m)) {
+            if (m.tag == ipc::Tag::Shutdown) {
+                shutdown = true;
+            } else if (m.tag == ipc::Tag::BeginAccess) {
+                // Begin access so the core's wire render commands may target the
+                // dmabuf texture. Vulkan layout state is mandatory on this
+                // backend. First access: undefined -> general.
+                wgpu::SharedTextureMemoryVkImageLayoutBeginState layout{};
+                // First (write) access begins from UNDEFINED; subsequent access
+                // begins from the layout the previous EndAccess reported (sent
+                // back by the core in oldLayout). newLayout is GENERAL so the
+                // texture is usable for both render and sample.
+                layout.oldLayout = m.initialized ? m.oldLayout : 0;  // 0=UNDEFINED
+                layout.newLayout = 1;                                // GENERAL
+                wgpu::SharedTextureMemoryBeginAccessDescriptor bad{};
+                bad.nextInChain = &layout;
+                bad.initialized = m.initialized != 0;
+                bad.fenceCount = 0;
+                if (dmaMem.BeginAccess(dmaTex, &bad) != wgpu::Status::Success) {
+                    std::fprintf(stderr, "[gpu] BeginAccess failed\n");
+                    return 1;
+                }
+                serializer.Flush();
+                std::printf("[gpu] BeginAccess OK\n");
+                ipc::Message reply{};
+                reply.tag = ipc::Tag::BeginDone;
+                ipc::sendMessage(ctrlFd, reply);
+            } else if (m.tag == ipc::Tag::EndAccess) {
+                wgpu::SharedTextureMemoryVkImageLayoutEndState endLayout{};
+                wgpu::SharedTextureMemoryEndAccessState endState{};
+                endState.nextInChain = &endLayout;
+                if (dmaMem.EndAccess(dmaTex, &endState) != wgpu::Status::Success) {
+                    std::fprintf(stderr, "[gpu] EndAccess failed\n");
+                    return 1;
+                }
+                // Export the produced sync-fd (proves the fence mechanism). The
+                // single-device path does not consume it cross-process; passing
+                // it over SCM_RIGHTS to the core is the two-device (B6) need.
+                uint32_t fenceCount = static_cast<uint32_t>(endState.fenceCount);
+                int syncFd = -1;
+                if (endState.fenceCount >= 1) {
+                    wgpu::SharedFenceExportInfo exp{};
+                    wgpu::SharedFenceSyncFDExportInfo syncExp{};
+                    exp.nextInChain = &syncExp;
+                    endState.fences[0].ExportInfo(&exp);
+                    syncFd = syncExp.handle;
+                }
+                std::printf("[gpu] EndAccess OK; fenceCount=%u syncFd=%d endLayout(old=%d new=%d)\n",
+                            fenceCount, syncFd, endLayout.oldLayout, endLayout.newLayout);
+                // The fd from ExportInfo is owned by the SharedFence (freed when
+                // endState is destroyed); do NOT close it here. A consumer that
+                // needs to keep it must dup() it (the B6 cross-process path).
+                ipc::Message reply{};
+                reply.tag = ipc::Tag::EndDone;
+                reply.fenceCount = fenceCount;
+                reply.endLayout = endLayout.newLayout;
+                ipc::sendMessage(ctrlFd, reply);
+            } else if (m.tag == ipc::Tag::ReserveTex) {
+                // Allocate a dmabuf, import it on the wire-resolved core device,
+                // create the texture, and inject it at the client's reserved
+                // handle so the client's ReserveTexture proxy now resolves.
+                if (!alloc.allocate(m.width, m.height, dmaBuf)) {
+                    std::fprintf(stderr, "[gpu] ReserveTex: allocate failed\n");
+                    return 1;
+                }
+                if (!gpu::Allocator::importTexture(coreDevice, alloc.fourcc(),
+                                                   dmaBuf, dmaMem, dmaTex)) {
+                    std::fprintf(stderr, "[gpu] ReserveTex: import failed\n");
+                    return 1;
+                }
+                if (!server.InjectTexture(dmaTex.Get(),
+                                          {m.texture.id, m.texture.generation},
+                                          {m.device.id, m.device.generation})) {
+                    std::fprintf(stderr, "[gpu] InjectTexture failed\n");
+                    return 1;
+                }
+                serializer.Flush();
+                std::printf("[gpu] injected dmabuf texture at {%u,%u} on device {%u,%u}\n",
+                            m.texture.id, m.texture.generation,
+                            m.device.id, m.device.generation);
+                ipc::Message reply{};
+                reply.tag = ipc::Tag::TexInjected;
+                reply.texture = m.texture;
+                reply.modifier = dmaBuf.modifier;
+                ipc::sendMessage(ctrlFd, reply);
+            }
+        }
         // Detect core closing the wire socket.
         uint32_t probe;
         if (::recv(wireFd, &probe, 4, MSG_DONTWAIT | MSG_PEEK) == 0) shutdown = true;
         usleepShort();
     }
+    dmaTex = nullptr;
+    dmaMem = nullptr;
+    alloc.release(dmaBuf);
     std::printf("[gpu] shutting down (shutdown=%d windowClosed=%d)\n",
                 static_cast<int>(shutdown), static_cast<int>(window.shouldClose()));
 
@@ -185,6 +331,7 @@ int run(int wireFd, int ctrlFd) {
 
 int main(int argc, char** argv) {
     setvbuf(stdout, nullptr, _IOLBF, 0);
+    installCrashHandler();
     if (argc < 3) {
         std::fprintf(stderr, "usage: %s <wireFd> <ctrlFd>\n", argv[0]);
         return 1;

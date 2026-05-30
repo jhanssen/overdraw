@@ -15,6 +15,8 @@ add_subdirectory(3rdparty/dawn)
 find_package(Dawn REQUIRED)
 find_package(PkgConfig REQUIRED)
 pkg_check_modules(WAYLAND_CLIENT REQUIRED wayland-client)
+pkg_check_modules(GBM REQUIRED gbm)
+pkg_check_modules(LIBDRM REQUIRED libdrm)
 
 # Dawn is built -fno-rtti; match it to avoid typeinfo mismatches.
 add_compile_options($<$<COMPILE_LANGUAGE:CXX>:-fno-rtti>)
@@ -29,11 +31,16 @@ set(XDG_SHELL_DIR ${CMAKE_SOURCE_DIR}/native/wayland/generated)
 add_executable(overdraw-gpu-process
     gpu-process/src/main.cpp
     gpu-process/src/host_window.cpp
+    gpu-process/src/allocator.cpp
     ${XDG_SHELL_DIR}/xdg-shell-protocol.c)
 target_include_directories(overdraw-gpu-process PRIVATE
-    ${IPC_INCLUDE} ${XDG_SHELL_DIR} ${WAYLAND_CLIENT_INCLUDE_DIRS})
+    ${IPC_INCLUDE} ${XDG_SHELL_DIR} ${WAYLAND_CLIENT_INCLUDE_DIRS}
+    ${GBM_INCLUDE_DIRS} ${LIBDRM_INCLUDE_DIRS})
 target_link_libraries(overdraw-gpu-process PRIVATE
-    dawn::webgpu_dawn ${WAYLAND_CLIENT_LIBRARIES} pthread dl rt)
+    dawn::webgpu_dawn ${WAYLAND_CLIENT_LIBRARIES}
+    ${GBM_LIBRARIES} ${LIBDRM_LIBRARIES} pthread dl rt)
+# -rdynamic so backtrace_symbols_fd can resolve function names in the crash handler.
+target_link_options(overdraw-gpu-process PRIVATE -rdynamic)
 
 # ---- Core (pure C++ stage; Node/N-API wrapping comes later) ----
 add_executable(overdraw-core

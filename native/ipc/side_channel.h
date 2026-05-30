@@ -22,7 +22,12 @@ enum class Tag : uint8_t {
     InstanceReserved = 'I',  // core -> gpu : reserved instance handle
     DeviceReady  = 'S',  // core -> gpu : device handle + reserved surface handle
     SurfaceReady = 'C',  // gpu  -> core: surface injected + caps + size
-    FrameMark    = 'F',  // core -> gpu : first frame submitted
+    ReserveTex   = 'R',  // core -> gpu : reserved texture+device handle + size/format
+    TexInjected  = 't',  // gpu  -> core: dmabuf imported + texture injected (+ modifier)
+    BeginAccess  = 'B',  // core -> gpu : begin access on the STM (before wire render)
+    BeginDone    = 'b',  // gpu  -> core: BeginAccess applied + flushed
+    EndAccess    = 'E',  // core -> gpu : end access on the STM (after wire render)
+    EndDone      = 'e',  // gpu  -> core: EndAccess applied; sync-fd exported (fenceCount)
     Shutdown     = 'X',  // core -> gpu : clean termination request
 };
 
@@ -39,14 +44,22 @@ struct Message {
     uint8_t _pad[3] = {0, 0, 0};
 
     WireHandle instance;   // Hello*, InstanceReserved, DeviceReady, SurfaceReady
-    WireHandle device;     // DeviceReady, SurfaceReady
+    WireHandle device;     // DeviceReady, SurfaceReady, ReserveTex
     WireHandle surface;    // DeviceReady, SurfaceReady
+    WireHandle texture;    // ReserveTex, TexInjected
 
-    uint32_t format = 0;       // SurfaceReady: WGPUTextureFormat
+    uint32_t format = 0;       // SurfaceReady, ReserveTex: WGPUTextureFormat
     uint32_t presentMode = 0;  // SurfaceReady: WGPUPresentMode
     uint32_t alphaMode = 0;    // SurfaceReady: WGPUCompositeAlphaMode
-    uint32_t width = 0;        // HelloReply, SurfaceReady
-    uint32_t height = 0;       // HelloReply, SurfaceReady
+    uint32_t width = 0;        // HelloReply, SurfaceReady, ReserveTex
+    uint32_t height = 0;       // HelloReply, SurfaceReady, ReserveTex
+
+    uint64_t modifier = 0;     // TexInjected: DRM modifier the dmabuf was allocated with
+
+    uint32_t fenceCount = 0;   // EndDone: number of SharedFence sync-fds produced
+    uint32_t initialized = 0;  // BeginAccess: 1 if texture contents are already valid
+    int32_t  oldLayout = 0;    // BeginAccess: Vulkan image layout to begin from
+    int32_t  endLayout = 0;    // EndDone: Vulkan image layout the texture ended in
 
     uint32_t protocolVersion = 0;  // Hello/HelloReply
 };

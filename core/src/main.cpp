@@ -2,10 +2,14 @@
 //
 // Spawns the GPU process and drives the compositing swapchain over the Dawn
 // wire: requests adapter+device, reserves a surface (the GPU process injects
-// the real Wayland-backed surface), configures it, and presents a cleared
-// red frame each tick. No Wayland server, protocols, or plugins yet.
+// the real Wayland-backed surface), and validates the dmabuf interop path —
+// reserve a texture, have the GPU process allocate a GBM dmabuf and inject it
+// as SharedTextureMemory, render into it over the wire under a BeginAccess/
+// EndAccess bracket, then sample it onto a full-surface quad each tick.
 //
-// The Node/N-API wrapping comes later; this stage is a plain executable.
+// This is a single-device validation harness, not the final per-surface frame
+// loop. No Wayland server, protocols, plugins, or two-device sharing yet. The
+// Node/N-API wrapping comes later; this stage is a plain executable.
 
 #include <cstdio>
 #include <cstdlib>
@@ -50,8 +54,12 @@ pid_t spawnGpuProcess(const char* binPath, int wireFd, int ctrlFd) {
 
 int run(const char* gpuBin) {
     int wireFds[2], ctrlFds[2];
+    // Wire socket: STREAM (length-prefixed framing handles boundaries).
+    // Side channel: SEQPACKET so fixed-size Message structs keep their datagram
+    // boundaries (STREAM coalesces/splits, desyncing the unframed control
+    // protocol once traffic increases) while still supporting SCM_RIGHTS.
     if (::socketpair(AF_UNIX, SOCK_STREAM, 0, wireFds) ||
-        ::socketpair(AF_UNIX, SOCK_STREAM, 0, ctrlFds)) {
+        ::socketpair(AF_UNIX, SOCK_SEQPACKET, 0, ctrlFds)) {
         perror("socketpair");
         return 1;
     }
@@ -111,6 +119,24 @@ int run(const char* gpuBin) {
         }
     };
 
+    // Send a side-channel request and block (pumping the wire) until the given
+    // reply tag arrives. Returns the reply, or {} on timeout. Used for the
+    // BeginAccess/EndAccess bracket around the dmabuf wire render.
+    auto sendAndWait = [&](const ipc::Message& rq, ipc::Tag replyTag, ipc::Message& reply) -> bool {
+        ipc::sendMessage(ctrlFd, rq);
+        std::vector<uint8_t> f;
+        for (int i = 0; i < 1000000; ++i) {
+            serializer.Flush();
+            if (ipc::readWireFrame(wireFd, f))
+                client.HandleCommands(reinterpret_cast<const char*>(f.data()), f.size());
+            wgpuInstanceProcessEvents(inst.Get());
+            ipc::Message m{};
+            if (ipc::recvMessageNB(ctrlFd, m) && m.tag == replyTag) { reply = m; return true; }
+            ::usleep(200);
+        }
+        return false;
+    };
+
     // Adapter over the wire.
     wgpu::Adapter adapter;
     {
@@ -129,10 +155,17 @@ int run(const char* gpuBin) {
     if (!adapter) { std::fprintf(stderr, "[core] no adapter\n"); return 1; }
     std::printf("[core] got adapter over wire\n");
 
-    // Device over the wire.
+    // Device over the wire. Require SharedTextureMemoryDmaBuf so the server-
+    // resolved device can import dmabuf-backed textures (exposed over the wire).
+    std::printf("[core] adapter SharedTextureMemoryDmaBuf over wire: %d\n",
+                adapter.HasFeature(wgpu::FeatureName::SharedTextureMemoryDmaBuf) ? 1 : 0);
     wgpu::Device device;
     {
+        wgpu::FeatureName feats[] = {wgpu::FeatureName::SharedTextureMemoryDmaBuf,
+                                     wgpu::FeatureName::SharedFenceSyncFD};
         wgpu::DeviceDescriptor dd{};
+        dd.requiredFeatureCount = 2;
+        dd.requiredFeatures = feats;
         dd.SetUncapturedErrorCallback(
             [](const wgpu::Device&, wgpu::ErrorType t, wgpu::StringView m) {
                 std::fprintf(stderr, "[core][dawn err %d] %.*s\n", (int)t, (int)m.length, m.data);
@@ -186,6 +219,49 @@ int run(const char* gpuBin) {
     std::printf("[core] surface ready: format=%u %ux%u\n",
                 surfReady.format, surfReady.width, surfReady.height);
 
+    // B3: reserve a texture handle and have the GPU process allocate a dmabuf,
+    // import it as SharedTextureMemory on this device, and InjectTexture at the
+    // reserved handle. The reserved descriptor must match the injected texture's
+    // actual properties (BGRA8, size, usage). Rendering into it comes in B4/B5.
+    constexpr uint32_t kDmaSize = 256;
+    wgpu::TextureDescriptor dmaTexDesc{};
+    dmaTexDesc.size = {kDmaSize, kDmaSize, 1};
+    dmaTexDesc.format = wgpu::TextureFormat::BGRA8Unorm;
+    dmaTexDesc.usage = wgpu::TextureUsage::RenderAttachment | wgpu::TextureUsage::TextureBinding;
+    auto rt = client.ReserveTexture(
+        device.Get(), reinterpret_cast<const WGPUTextureDescriptor*>(&dmaTexDesc));
+    {
+        ipc::Message m{};
+        m.tag = ipc::Tag::ReserveTex;
+        m.device = {rt.deviceHandle.id, rt.deviceHandle.generation};
+        m.texture = {rt.handle.id, rt.handle.generation};
+        m.format = static_cast<uint32_t>(wgpu::TextureFormat::BGRA8Unorm);
+        m.width = kDmaSize;
+        m.height = kDmaSize;
+        ipc::sendMessage(ctrlFd, m);
+    }
+    std::printf("[core] reserved texture {%u,%u} on device {%u,%u}\n",
+                rt.handle.id, rt.handle.generation,
+                rt.deviceHandle.id, rt.deviceHandle.generation);
+    wgpu::Texture dmaTexture = wgpu::Texture::Acquire(rt.texture);
+
+    // Wait for the GPU process to import + inject (TexInjected).
+    {
+        bool got = false;
+        std::vector<uint8_t> f;
+        for (int i = 0; i < 1000000 && !got; ++i) {
+            serializer.Flush();
+            if (ipc::readWireFrame(wireFd, f))
+                client.HandleCommands(reinterpret_cast<const char*>(f.data()), f.size());
+            wgpuInstanceProcessEvents(inst.Get());
+            ipc::Message m{};
+            if (ipc::recvMessageNB(ctrlFd, m) && m.tag == ipc::Tag::TexInjected) got = true;
+            ::usleep(200);
+        }
+        if (!got) { std::fprintf(stderr, "[core] no TexInjected\n"); return 1; }
+    }
+    std::printf("[core] dmabuf texture injected and resolved\n");
+
     // Configure the swapchain over the wire.
     wgpu::Surface surface = wgpu::Surface::Acquire(rs.surface);
     {
@@ -200,9 +276,134 @@ int run(const char* gpuBin) {
         surface.Configure(&cfg);
         serializer.Flush();
     }
-    std::printf("[core] swapchain configured; presenting red\n");
+    std::printf("[core] swapchain configured\n");
 
-    // Frame loop: clear to red, present, over the wire.
+    // B4/B5: render into the dmabuf-backed texture over the wire, bracketed by
+    // server-side BeginAccess/EndAccess, then sample it onto the swapchain quad.
+    // A SharedTextureMemory texture may only be used (write OR read) while access
+    // is held, so there are two brackets: a write bracket around the green render,
+    // then a read bracket held open across the whole frame loop (closed after it).
+    // If the window shows the colour rendered HERE (green), the dmabuf round-
+    // trip is proven end-to-end.
+    {
+        ipc::Message begin{};
+        begin.tag = ipc::Tag::BeginAccess;
+        begin.initialized = 0;  // first access: contents undefined
+        ipc::Message reply{};
+        if (!sendAndWait(begin, ipc::Tag::BeginDone, reply)) {
+            std::fprintf(stderr, "[core] no BeginDone (write)\n"); return 1;
+        }
+        // Wire render pass: clear the dmabuf texture to green.
+        wgpu::RenderPassColorAttachment ca{};
+        ca.view = dmaTexture.CreateView();
+        ca.loadOp = wgpu::LoadOp::Clear;
+        ca.storeOp = wgpu::StoreOp::Store;
+        ca.clearValue = {0.05, 0.8, 0.1, 1.0};  // green
+        wgpu::RenderPassDescriptor rp{};
+        rp.colorAttachmentCount = 1;
+        rp.colorAttachments = &ca;
+        wgpu::CommandEncoder enc = device.CreateCommandEncoder();
+        enc.BeginRenderPass(&rp).End();
+        wgpu::CommandBuffer cb = enc.Finish();
+        device.GetQueue().Submit(1, &cb);
+        serializer.Flush();
+        // The submit is flushed and ordered ahead of EndAccess on the socket;
+        // sendAndWait pumps the wire so the server drains it before EndAccess.
+        ipc::Message end{};
+        end.tag = ipc::Tag::EndAccess;
+        if (!sendAndWait(end, ipc::Tag::EndDone, reply)) {
+            std::fprintf(stderr, "[core] no EndDone (write)\n"); return 1;
+        }
+        std::printf("[core] dmabuf write bracket done; EndAccess fenceCount=%u endLayout=%d\n",
+                    reply.fenceCount, reply.endLayout);
+
+        // Read bracket: contents now valid; begin from the layout the write
+        // EndAccess reported. Hold access open for the frame loop.
+        begin.initialized = 1;
+        begin.oldLayout = reply.endLayout;
+        if (!sendAndWait(begin, ipc::Tag::BeginDone, reply)) {
+            std::fprintf(stderr, "[core] no BeginDone (read)\n"); return 1;
+        }
+        std::printf("[core] dmabuf read access held for compositing\n");
+    }
+
+    // Compositing pass: sample the dmabuf-backed texture onto a full-surface
+    // quad. Exercises the textured-quad pipeline (shaders, sampler, bind group),
+    // the design's per-surface compositing primitive.
+    wgpu::Sampler sampler;
+    {
+        wgpu::SamplerDescriptor sd{};
+        sd.magFilter = wgpu::FilterMode::Nearest;
+        sd.minFilter = wgpu::FilterMode::Nearest;
+        sampler = device.CreateSampler(&sd);
+    }
+
+    // Full-surface quad emitted from vertex_index (no vertex buffer).
+    static const char* kWgsl = R"(
+struct VsOut {
+  @builtin(position) pos : vec4f,
+  @location(0) uv : vec2f,
+};
+@vertex fn vs(@builtin(vertex_index) i : u32) -> VsOut {
+  var p = array<vec2f, 4>(
+    vec2f(-1.0, -1.0), vec2f(1.0, -1.0),
+    vec2f(-1.0,  1.0), vec2f(1.0,  1.0));
+  var uv = array<vec2f, 4>(
+    vec2f(0.0, 1.0), vec2f(1.0, 1.0),
+    vec2f(0.0, 0.0), vec2f(1.0, 0.0));
+  var o : VsOut;
+  o.pos = vec4f(p[i], 0.0, 1.0);
+  o.uv = uv[i];
+  return o;
+}
+@group(0) @binding(0) var samp : sampler;
+@group(0) @binding(1) var tex : texture_2d<f32>;
+@fragment fn fs(in : VsOut) -> @location(0) vec4f {
+  return textureSample(tex, samp, in.uv);
+}
+)";
+
+    wgpu::RenderPipeline pipeline;
+    wgpu::BindGroup bindGroup;
+    {
+        wgpu::ShaderSourceWGSL wgslDesc{};
+        wgslDesc.code = kWgsl;
+        wgpu::ShaderModuleDescriptor smd{};
+        smd.nextInChain = &wgslDesc;
+        wgpu::ShaderModule module = device.CreateShaderModule(&smd);
+
+        wgpu::ColorTargetState target{};
+        target.format = static_cast<wgpu::TextureFormat>(surfReady.format);
+        wgpu::FragmentState fs{};
+        fs.module = module;
+        fs.entryPoint = "fs";
+        fs.targetCount = 1;
+        fs.targets = &target;
+
+        wgpu::RenderPipelineDescriptor pd{};
+        pd.vertex.module = module;
+        pd.vertex.entryPoint = "vs";
+        pd.primitive.topology = wgpu::PrimitiveTopology::TriangleStrip;
+        pd.fragment = &fs;
+        pipeline = device.CreateRenderPipeline(&pd);
+
+        wgpu::BindGroupEntry entries[2]{};
+        entries[0].binding = 0;
+        entries[0].sampler = sampler;
+        entries[1].binding = 1;
+        // B5: sample the dmabuf-backed texture the client rendered green into,
+        // proving the round-trip is visible.
+        entries[1].textureView = dmaTexture.CreateView();
+        wgpu::BindGroupDescriptor bgd{};
+        bgd.layout = pipeline.GetBindGroupLayout(0);
+        bgd.entryCount = 2;
+        bgd.entries = entries;
+        bindGroup = device.CreateBindGroup(&bgd);
+    }
+    serializer.Flush();
+    std::printf("[core] compositing pipeline ready; presenting textured quad\n");
+
+    // Frame loop: draw the textured quad, present, over the wire.
     int presented = 0;
     for (int frame = 0; frame < kFrames; ++frame) {
         wgpu::SurfaceTexture st{};
@@ -212,12 +413,16 @@ int run(const char* gpuBin) {
             ca.view = st.texture.CreateView();
             ca.loadOp = wgpu::LoadOp::Clear;
             ca.storeOp = wgpu::StoreOp::Store;
-            ca.clearValue = {0.85, 0.05, 0.05, 1.0};  // red
+            ca.clearValue = {0.0, 0.0, 0.0, 1.0};
             wgpu::RenderPassDescriptor rp{};
             rp.colorAttachmentCount = 1;
             rp.colorAttachments = &ca;
             wgpu::CommandEncoder enc = device.CreateCommandEncoder();
-            enc.BeginRenderPass(&rp).End();
+            wgpu::RenderPassEncoder pass = enc.BeginRenderPass(&rp);
+            pass.SetPipeline(pipeline);
+            pass.SetBindGroup(0, bindGroup);
+            pass.Draw(4);
+            pass.End();
             wgpu::CommandBuffer cb = enc.Finish();
             device.GetQueue().Submit(1, &cb);
             surface.Present();
@@ -233,6 +438,14 @@ int run(const char* gpuBin) {
         ::usleep(16000);  // ~60Hz
     }
     std::printf("[core] presented %d/%d frames\n", presented, kFrames);
+
+    // Close the read-access bracket held across the frame loop.
+    {
+        ipc::Message end{}; end.tag = ipc::Tag::EndAccess;
+        ipc::Message reply{};
+        if (!sendAndWait(end, ipc::Tag::EndDone, reply))
+            std::fprintf(stderr, "[core] no EndDone (read close)\n");
+    }
 
     // Clean shutdown. Signal the GPU process, disconnect the wire client, close
     // the sockets, and reap. The GPU process detects the closed wire and exits;
