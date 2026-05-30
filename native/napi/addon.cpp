@@ -13,13 +13,16 @@
 
 #include "core/compositor.h"
 #include "core/gpu_process.h"
+#include "wayland/server.h"
 
 using overdraw::core::Compositor;
+using overdraw::wayland::Server;
 
 namespace {
 
 struct Addon {
     std::unique_ptr<Compositor> compositor;
+    std::unique_ptr<Server> server;
     uv_poll_t wirePoll{};
     uv_timer_t frameTimer{};
     bool loopRunning = false;
@@ -146,14 +149,39 @@ napi_value Stop(napi_env env, napi_callback_info) {
     return undef;
 }
 
+// startServer() -> string (socket name) : stand up the Wayland server on the
+// libuv loop. Independent of the present loop for now.
+napi_value StartServer(napi_env env, napi_callback_info) {
+    if (!g_addon.server) g_addon.server = std::make_unique<Server>();
+    uv_loop_t* loop = nullptr;
+    napi_get_uv_event_loop(env, &loop);
+    if (!g_addon.server->start(loop)) {
+        g_addon.server.reset();
+        return throwError(env, "failed to start wayland server");
+    }
+    napi_value name;
+    napi_create_string_utf8(env, g_addon.server->socketName().c_str(), NAPI_AUTO_LENGTH, &name);
+    return name;
+}
+
+napi_value StopServer(napi_env env, napi_callback_info) {
+    if (g_addon.server) { g_addon.server->stop(); g_addon.server.reset(); }
+    napi_value undef; napi_get_undefined(env, &undef);
+    return undef;
+}
+
 napi_value Init(napi_env env, napi_value exports) {
-    napi_value fnStart, fnStop, fnPresented;
+    napi_value fnStart, fnStop, fnPresented, fnStartServer, fnStopServer;
     napi_create_function(env, "start", NAPI_AUTO_LENGTH, Start, nullptr, &fnStart);
     napi_create_function(env, "stop", NAPI_AUTO_LENGTH, Stop, nullptr, &fnStop);
     napi_create_function(env, "presentedCount", NAPI_AUTO_LENGTH, PresentedCount, nullptr, &fnPresented);
+    napi_create_function(env, "startServer", NAPI_AUTO_LENGTH, StartServer, nullptr, &fnStartServer);
+    napi_create_function(env, "stopServer", NAPI_AUTO_LENGTH, StopServer, nullptr, &fnStopServer);
     napi_set_named_property(env, exports, "start", fnStart);
     napi_set_named_property(env, exports, "stop", fnStop);
     napi_set_named_property(env, exports, "presentedCount", fnPresented);
+    napi_set_named_property(env, exports, "startServer", fnStartServer);
+    napi_set_named_property(env, exports, "stopServer", fnStopServer);
     return exports;
 }
 

@@ -15,6 +15,7 @@ add_subdirectory(3rdparty/dawn)
 find_package(Dawn REQUIRED)
 find_package(PkgConfig REQUIRED)
 pkg_check_modules(WAYLAND_CLIENT REQUIRED wayland-client)
+pkg_check_modules(WAYLAND_SERVER REQUIRED wayland-server)
 pkg_check_modules(GBM REQUIRED gbm)
 pkg_check_modules(LIBDRM REQUIRED libdrm)
 
@@ -43,22 +44,9 @@ target_link_libraries(overdraw-gpu-process PRIVATE
 # -rdynamic so backtrace_symbols_fd can resolve function names in the crash handler.
 target_link_options(overdraw-gpu-process PRIVATE -rdynamic)
 
-# ---- Shared core library (native side of the Node-hosted core) ----
-# Compiled once and linked by the addon (and any future native consumer), so
-# core logic is not duplicated.
-add_library(overdraw_core STATIC
-    native/core/gpu_process.cpp
-    native/core/wire_link.cpp
-    native/core/compositor.cpp)
-target_include_directories(overdraw_core PUBLIC
-    ${IPC_INCLUDE} ${NATIVE_INCLUDE})
-target_link_libraries(overdraw_core PUBLIC
-    dawn::webgpu_dawn_wire pthread dl rt)
-set_target_properties(overdraw_core PROPERTIES POSITION_INDEPENDENT_CODE ON)
-
-# ---- Core N-API addon (Node-hosted core) ----
-# Locate Node addon headers (node_api.h). Prefer the running node's bundled
-# headers; fall back to the node-gyp cache for this version.
+# Locate Node addon headers (node_api.h, and uv.h which the core uses for the
+# libuv-integrated Wayland server). Prefer the running node's bundled headers;
+# fall back to the node-gyp cache for this version.
 execute_process(
     COMMAND node -p "require('path').join(process.execPath,'..','..','include','node')"
     OUTPUT_VARIABLE NODE_INCLUDE_DIR OUTPUT_STRIP_TRAILING_WHITESPACE
@@ -74,6 +62,21 @@ if(NOT EXISTS "${NODE_INCLUDE_DIR}/node_api.h")
 endif()
 message(STATUS "Node addon headers: ${NODE_INCLUDE_DIR}")
 
+# ---- Shared core library (native side of the Node-hosted core) ----
+# Compiled once and linked by the addon (and any future native consumer), so
+# core logic is not duplicated.
+add_library(overdraw_core STATIC
+    native/core/gpu_process.cpp
+    native/core/wire_link.cpp
+    native/core/compositor.cpp
+    native/wayland/server.cpp)
+target_include_directories(overdraw_core PUBLIC
+    ${IPC_INCLUDE} ${NATIVE_INCLUDE} ${NODE_INCLUDE_DIR} ${WAYLAND_SERVER_INCLUDE_DIRS})
+target_link_libraries(overdraw_core PUBLIC
+    dawn::webgpu_dawn_wire ${WAYLAND_SERVER_LIBRARIES} pthread dl rt)
+set_target_properties(overdraw_core PROPERTIES POSITION_INDEPENDENT_CODE ON)
+
+# ---- Core N-API addon (Node-hosted core) ----
 add_library(overdraw_native MODULE
     native/napi/addon.cpp)
 set_target_properties(overdraw_native PROPERTIES
