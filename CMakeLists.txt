@@ -69,6 +69,7 @@ add_library(overdraw_core STATIC
     native/core/gpu_process.cpp
     native/core/wire_link.cpp
     native/core/compositor.cpp
+    native/core/shm.cpp
     native/wayland/server.cpp
     native/wayland/interface_registry.cpp)
 target_include_directories(overdraw_core PUBLIC
@@ -110,3 +111,12 @@ target_link_libraries(xdg-test-client PRIVATE ${WAYLAND_CLIENT_LIBRARIES})
 add_executable(fd-test-client test/fd-test-client.c)
 target_include_directories(fd-test-client PRIVATE ${WAYLAND_CLIENT_INCLUDE_DIRS})
 target_link_libraries(fd-test-client PRIVATE ${WAYLAND_CLIENT_LIBRARIES})
+
+# ---- shm test client (shm buffer upload + composite) ----
+add_executable(shm-test-client
+    test/shm-test-client.c
+    native/wayland/generated/xdg-shell-protocol.c)
+target_include_directories(shm-test-client PRIVATE
+    ${WAYLAND_CLIENT_INCLUDE_DIRS}
+    ${CMAKE_SOURCE_DIR}/native/wayland/generated)
+target_link_libraries(shm-test-client PRIVATE ${WAYLAND_CLIENT_LIBRARIES})

@@ -42,6 +42,20 @@ bool WireLink::pumpUntil(const std::function<bool()>& done) {
     return done();
 }
 
+bool WireLink::pumpUntilTimeout(const std::function<bool()>& done, int maxMs) {
+    std::vector<uint8_t> f;
+    int iters = (maxMs * 1000) / 200;
+    for (int i = 0; i < iters; ++i) {
+        if (done()) return true;
+        serializer_->Flush();
+        if (ipc::readWireFrame(wireFd_, f))
+            client_->HandleCommands(reinterpret_cast<const char*>(f.data()), f.size());
+        if (instance_) wgpuInstanceProcessEvents(instance_);
+        ::usleep(200);
+    }
+    return done();
+}
+
 bool WireLink::sendAndWait(const ipc::Message& req, ipc::Tag replyTag, ipc::Message& reply) {
     ipc::sendMessage(ctrlFd_, req);
     std::vector<uint8_t> f;

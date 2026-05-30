@@ -1,0 +1,65 @@
+# overdraw — agent notes
+
+Project-specific operational notes. Design lives in `docs/architecture.md`;
+ground-truth status in `docs/status.md`.
+
+## Process management (GPU process)
+
+The compositor fork+execs a separate `overdraw-gpu-process`. When running tests
+or harnesses that call `addon.start(...)`, that child process must be tracked
+and cleaned up carefully.
+
+- **Do NOT identify the GPU process with `pgrep`/`pkill` by name.**
+  - `pgrep -x overdraw-gpu-process` finds nothing: the name is >15 chars, so it
+    is truncated to `overdraw-gpu-pr` in `/proc/<pid>/comm` and `pgrep -x` warns
+    and returns zero matches.
+  - `pgrep -f overdraw-gpu-process` is worse: `-f` matches the full command
+    line, so it ALSO matches the shell/monitor script and the `node` process
+    that have that string in their argv. Reading `/proc/<that pid>/wchan` then
+    reports the wrong process (e.g. a shell parked in `sigsuspend`), which has
+    sent debugging down a false path more than once.
+- **Track the PID directly instead.** The addon knows the child pid
+  (`spawnGpuProcess` returns it; `Compositor` holds `gpuPid_`). For ad-hoc
+  inspection, capture the pid when you launch (e.g. write it to a file, or use
+  the node child handle's `.pid`) and use `/proc/<pid>/...` with that exact pid.
+- When you must discover it, filter by the truncated comm and exclude
+  shells/node explicitly, and verify `comm` before trusting any `/proc` read:
+  for `p` in candidates, check `cat /proc/$p/comm` is `overdraw-gpu-pr` (not
+  `zsh`/`node`) before reading `wchan`/`stat`/`stack`.
+- Per-thread state matters: the main thread is `tid == pid`; Vulkan driver
+  threads (`[vkcf]`, `[vkrt]`, `[vkps]`) idle in `futex_do_wait` normally — that
+  is not a hang. The interesting thread is usually the main one.
+- **Always clean up after a test run**, and confirm zero remain (by exact pid,
+  not name). Leaked GPU processes pile up across runs and hold the GPU.
+
+## Crash vs. hang
+
+- The GPU process installs a crash handler that writes a backtrace to
+  `/tmp/overdraw-gpu-crash.txt` on SIGSEGV/SIGABRT/SIGBUS/SIGILL/SIGFPE
+  (`gpu-process/src/main.cpp`). **Before assuming a crash, check that file.**
+  Absent file + live process in a kernel wait (`/proc/<pid>/wchan`) = a hang/
+  deadlock, not a crash.
+- A GPU main thread in `drm_syncobj_array_wait_timeout` is blocked on a
+  DRM/Vulkan fence (e.g. inside `DeviceTick` waiting on submitted work). Often a
+  synchronization/present-pacing entanglement, not a dead process.
+
+## Running tests that need the GPU + host Wayland
+
+- Tests that call `addon.start(gpuBin)` require a live host Wayland session
+  (`WAYLAND_DISPLAY` set) and the GPU. They are NOT pure `node --test`. Pure
+  protocol/trampoline tests (server-only) do not need the GPU process.
+- The bash tool may appear to "time out" on commands that background a child
+  holding the shell's stdout/stderr fds open — the command logic completed; the
+  tool is waiting on fd EOF. Redirect child output to files and/or fully detach
+  to avoid this.
+
+## Bisecting wire / device-async issues
+
+- Device/queue-level async ops over the Dawn wire (buffer `MapAsync`,
+  `OnSubmittedWorkDone`) require the GPU process to advance the device queue via
+  `dawn::native::DeviceTick(device)` — `InstanceProcessEvents` alone only drives
+  instance-level ops (`RequestAdapter`/`RequestDevice`). See
+  `gpu-process/src/main.cpp` pump loop.
+- Buffer mapping over the wire may also need a `MemoryTransferService`
+  (client + server) to shuttle mapped bytes; the wire descriptors set it to
+  `nullptr` today.

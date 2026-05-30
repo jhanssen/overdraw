@@ -76,6 +76,13 @@ int run(int wireFd, int ctrlFd) {
 
     ::fcntl(ctrlFd, F_SETFL, O_NONBLOCK);
 
+    // Set once the client's device is resolved (step 5). Device/queue-level
+    // async ops (buffer MapAsync, OnSubmittedWorkDone) only resolve when the
+    // device's queue is advanced via DeviceTick; InstanceProcessEvents alone
+    // (which drives instance-level ops like RequestDevice) is not enough. Held
+    // as a raw handle so the pump lambda can tick it before it exists.
+    WGPUDevice tickDev = nullptr;
+
     // Process at most `maxFrames` wire frames per call so the side channel is
     // not starved while the wire is busy. <=0 means drain fully (startup use).
     auto pumpWireN = [&](int maxFrames) {
@@ -87,6 +94,13 @@ int run(int wireFd, int ctrlFd) {
             ++n;
         }
         dawn::native::InstanceProcessEvents(instance.Get());
+        if (tickDev) {
+            // Advance the device queue so submitted work + async completions
+            // (e.g. buffer map, OnSubmittedWorkDone) resolve, then flush any
+            // responses the wire-server's spontaneous callbacks wrote back.
+            dawn::native::DeviceTick(tickDev);
+            serializer.Flush();
+        }
     };
     auto pumpWire = [&] { pumpWireN(0); };
 
@@ -140,6 +154,7 @@ int run(int wireFd, int ctrlFd) {
     }
     WGPUDevice nativeDev = server.GetDevice(ready.device.id, ready.device.generation);
     if (!nativeDev) { std::fprintf(stderr, "[gpu] GetDevice null\n"); return 1; }
+    tickDev = nativeDev;  // pump now ticks the device queue (map/work-done)
     std::printf("[gpu] client device {%u,%u} resolved; surface {%u,%u}\n",
                 ready.device.id, ready.device.generation,
                 ready.surface.id, ready.surface.generation);
@@ -181,6 +196,19 @@ int run(int wireFd, int ctrlFd) {
                           ? static_cast<uint32_t>(caps.formats[0])
                           : static_cast<uint32_t>(WGPUTextureFormat_BGRA8Unorm);
 
+    // Prefer Mailbox: GetCurrentTexture is a blocking wire call on the server's
+    // single command thread, and FIFO blocks it whenever the host compositor
+    // isn't consuming frames (e.g. the nested window is unviewed) -- which
+    // stalls all other wire work behind it (buffer map, etc.). Mailbox never
+    // blocks the acquire (it replaces the unpresented frame). Fall back to the
+    // first advertised mode if Mailbox is unsupported.
+    uint32_t presentMode = static_cast<uint32_t>(wgpu::PresentMode::Fifo);
+    bool haveMailbox = false;
+    for (size_t i = 0; i < caps.presentModeCount; ++i)
+        if (caps.presentModes[i] == wgpu::PresentMode::Mailbox) haveMailbox = true;
+    if (haveMailbox) presentMode = static_cast<uint32_t>(wgpu::PresentMode::Mailbox);
+    else if (caps.presentModeCount) presentMode = static_cast<uint32_t>(caps.presentModes[0]);
+
     // 7) Inject the surface at the client's reserved handle.
     if (!server.InjectSurface(surface.Get(),
                               {ready.surface.id, ready.surface.generation},
@@ -196,7 +224,7 @@ int run(int wireFd, int ctrlFd) {
         m.tag = ipc::Tag::SurfaceReady;
         m.surface = ready.surface;
         m.format = format;
-        m.presentMode = static_cast<uint32_t>(WGPUPresentMode_Fifo);
+        m.presentMode = presentMode;
         m.alphaMode = static_cast<uint32_t>(WGPUCompositeAlphaMode_Opaque);
         m.width = window.width();
         m.height = window.height();

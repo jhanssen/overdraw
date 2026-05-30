@@ -1,5 +1,6 @@
 #include "compositor.h"
 
+#include <algorithm>
 #include <cstdio>
 #include <vector>
 
@@ -12,8 +13,6 @@
 
 namespace overdraw::core {
 namespace {
-
-constexpr uint32_t kDmaSize = 256;
 
 const char* kWgsl = R"(
 struct VsOut {
@@ -142,32 +141,6 @@ bool Compositor::bringUp() {
         return false;
     }
 
-    // Reserve a dmabuf-backed texture; GPU process allocates + injects it.
-    wgpu::TextureDescriptor dmaTexDesc{};
-    dmaTexDesc.size = {kDmaSize, kDmaSize, 1};
-    dmaTexDesc.format = wgpu::TextureFormat::BGRA8Unorm;
-    dmaTexDesc.usage = wgpu::TextureUsage::RenderAttachment | wgpu::TextureUsage::TextureBinding;
-    auto rt = link_->client().ReserveTexture(
-        device_.Get(), reinterpret_cast<const WGPUTextureDescriptor*>(&dmaTexDesc));
-    {
-        ipc::Message m{};
-        m.tag = ipc::Tag::ReserveTex;
-        m.device = {rt.deviceHandle.id, rt.deviceHandle.generation};
-        m.texture = {rt.handle.id, rt.handle.generation};
-        m.format = static_cast<uint32_t>(wgpu::TextureFormat::BGRA8Unorm);
-        m.width = kDmaSize;
-        m.height = kDmaSize;
-        ipc::sendMessage(ctrlFd_, m);
-    }
-    dmaTexture_ = wgpu::Texture::Acquire(rt.texture);
-    if (!link_->pumpUntil([&] {
-            ipc::Message m{};
-            return ipc::recvMessageNB(ctrlFd_, m) && m.tag == ipc::Tag::TexInjected;
-        })) {
-        error_ = "no TexInjected";
-        return false;
-    }
-
     // Configure swapchain.
     surface_ = wgpu::Surface::Acquire(rs.surface);
     {
@@ -183,45 +156,13 @@ bool Compositor::bringUp() {
         link_->flush();
     }
 
-    // dmabuf write bracket: render green; then hold a read bracket for the loop.
-    {
-        ipc::Message begin{}; begin.tag = ipc::Tag::BeginAccess; begin.initialized = 0;
-        ipc::Message reply{};
-        if (!link_->sendAndWait(begin, ipc::Tag::BeginDone, reply)) {
-            error_ = "no BeginDone (write)"; return false;
-        }
-        wgpu::RenderPassColorAttachment ca{};
-        ca.view = dmaTexture_.CreateView();
-        ca.loadOp = wgpu::LoadOp::Clear;
-        ca.storeOp = wgpu::StoreOp::Store;
-        ca.clearValue = {0.05, 0.8, 0.1, 1.0};  // green
-        wgpu::RenderPassDescriptor rp{};
-        rp.colorAttachmentCount = 1;
-        rp.colorAttachments = &ca;
-        wgpu::CommandEncoder enc = device_.CreateCommandEncoder();
-        enc.BeginRenderPass(&rp).End();
-        wgpu::CommandBuffer cb = enc.Finish();
-        device_.GetQueue().Submit(1, &cb);
-        link_->flush();
-        ipc::Message end{}; end.tag = ipc::Tag::EndAccess;
-        if (!link_->sendAndWait(end, ipc::Tag::EndDone, reply)) {
-            error_ = "no EndDone (write)"; return false;
-        }
-        begin.initialized = 1;
-        begin.oldLayout = reply.endLayout;
-        if (!link_->sendAndWait(begin, ipc::Tag::BeginDone, reply)) {
-            error_ = "no BeginDone (read)"; return false;
-        }
-        readBracketHeld_ = true;
-    }
-
-    // Compositing pipeline.
-    wgpu::Sampler sampler;
+    // Compositing pipeline + sampler. Client-surface textures bind into this at
+    // commit time; with no client surface present the frame loop just clears.
     {
         wgpu::SamplerDescriptor sd{};
         sd.magFilter = wgpu::FilterMode::Nearest;
         sd.minFilter = wgpu::FilterMode::Nearest;
-        sampler = device_.CreateSampler(&sd);
+        sampler_ = device_.CreateSampler(&sd);
     }
     {
         wgpu::ShaderSourceWGSL wgslDesc{};
@@ -244,20 +185,57 @@ bool Compositor::bringUp() {
         pd.primitive.topology = wgpu::PrimitiveTopology::TriangleStrip;
         pd.fragment = &fs;
         pipeline_ = device_.CreateRenderPipeline(&pd);
+    }
+    link_->flush();
+    return true;
+}
+
+void Compositor::commitSurfaceShm(uint32_t id, uint32_t width, uint32_t height,
+                                  uint32_t stride, const uint8_t* pixels) {
+    if (!device_ || width == 0 || height == 0 || !pixels) return;
+    ClientSurface& cs = clientSurfaces_[id];
+
+    // (Re)create the texture if the size changed (or first commit).
+    if (!cs.texture || cs.width != width || cs.height != height) {
+        wgpu::TextureDescriptor td{};
+        td.size = {width, height, 1};
+        td.format = wgpu::TextureFormat::BGRA8Unorm;
+        td.usage = wgpu::TextureUsage::TextureBinding | wgpu::TextureUsage::CopyDst |
+                   wgpu::TextureUsage::CopySrc;  // CopySrc for readback test hook
+        cs.texture = device_.CreateTexture(&td);
+        cs.width = width;
+        cs.height = height;
 
         wgpu::BindGroupEntry entries[2]{};
         entries[0].binding = 0;
-        entries[0].sampler = sampler;
+        entries[0].sampler = sampler_;
         entries[1].binding = 1;
-        entries[1].textureView = dmaTexture_.CreateView();
+        entries[1].textureView = cs.texture.CreateView();
         wgpu::BindGroupDescriptor bgd{};
         bgd.layout = pipeline_.GetBindGroupLayout(0);
         bgd.entryCount = 2;
         bgd.entries = entries;
-        bindGroup_ = device_.CreateBindGroup(&bgd);
+        cs.bindGroup = device_.CreateBindGroup(&bgd);
     }
+
+    // Upload the pixels. WriteTexture serializes the payload over the wire
+    // (no shared-memory MemoryTransferService configured) -- functional, with a
+    // per-upload copy cost that is not yet measured on this hardware.
+    wgpu::TexelCopyTextureInfo dst{};
+    dst.texture = cs.texture;
+    wgpu::TexelCopyBufferLayout layout{};
+    layout.offset = 0;
+    layout.bytesPerRow = stride;
+    layout.rowsPerImage = height;
+    wgpu::Extent3D extent{width, height, 1};
+    device_.GetQueue().WriteTexture(&dst, pixels, static_cast<size_t>(stride) * height,
+                                    &layout, &extent);
+    cs.present = true;
     link_->flush();
-    return true;
+}
+
+void Compositor::removeSurface(uint32_t id) {
+    clientSurfaces_.erase(id);
 }
 
 void Compositor::renderFrame() {
@@ -275,8 +253,16 @@ void Compositor::renderFrame() {
         wgpu::CommandEncoder enc = device_.CreateCommandEncoder();
         wgpu::RenderPassEncoder pass = enc.BeginRenderPass(&rp);
         pass.SetPipeline(pipeline_);
-        pass.SetBindGroup(0, bindGroup_);
-        pass.Draw(4);
+
+        // First light: draw each present client surface full-screen. No
+        // placement/transform/blending yet -- the last present surface wins the
+        // screen. With no client surface the pass just clears (black).
+        for (auto& [id, cs] : clientSurfaces_) {
+            if (cs.present && cs.bindGroup) {
+                pass.SetBindGroup(0, cs.bindGroup);
+                pass.Draw(4);
+            }
+        }
         pass.End();
         wgpu::CommandBuffer cb = enc.Finish();
         device_.GetQueue().Submit(1, &cb);
@@ -286,25 +272,70 @@ void Compositor::renderFrame() {
     link_->flush();
 }
 
+bool Compositor::readbackSurface(uint32_t id, std::vector<uint8_t>& out) {
+    auto it = clientSurfaces_.find(id);
+    if (it == clientSurfaces_.end() || !it->second.texture) return false;
+    ClientSurface& cs = it->second;
+
+    // 256-byte row alignment is required for texture->buffer copies.
+    uint32_t unpadded = cs.width * 4;
+    uint32_t padded = (unpadded + 255) & ~255u;
+    uint64_t bufSize = static_cast<uint64_t>(padded) * cs.height;
+
+    wgpu::BufferDescriptor bd{};
+    bd.size = bufSize;
+    bd.usage = wgpu::BufferUsage::CopyDst | wgpu::BufferUsage::MapRead;
+    wgpu::Buffer buf = device_.CreateBuffer(&bd);
+
+    wgpu::TexelCopyTextureInfo src{};
+    src.texture = cs.texture;
+    wgpu::TexelCopyBufferInfo dst{};
+    dst.buffer = buf;
+    dst.layout.offset = 0;
+    dst.layout.bytesPerRow = padded;
+    dst.layout.rowsPerImage = cs.height;
+    wgpu::Extent3D extent{cs.width, cs.height, 1};
+    wgpu::CommandEncoder enc = device_.CreateCommandEncoder();
+    enc.CopyTextureToBuffer(&src, &dst, &extent);
+    wgpu::CommandBuffer cb = enc.Finish();
+    device_.GetQueue().Submit(1, &cb);
+    link_->flush();
+
+    bool done = false;
+    bool ok = false;
+    buf.MapAsync(wgpu::MapMode::Read, 0, bufSize, wgpu::CallbackMode::AllowProcessEvents,
+                 [&](wgpu::MapAsyncStatus s, wgpu::StringView) {
+                     ok = (s == wgpu::MapAsyncStatus::Success);
+                     done = true;
+                 });
+    if (!link_->pumpUntilTimeout([&] { return done; }, 3000)) return false;
+    if (!ok) return false;
+
+    const uint8_t* mapped = static_cast<const uint8_t*>(buf.GetConstMappedRange(0, bufSize));
+    if (!mapped) return false;
+    out.resize(static_cast<size_t>(unpadded) * cs.height);
+    for (uint32_t row = 0; row < cs.height; ++row) {
+        std::copy(mapped + static_cast<size_t>(row) * padded,
+                  mapped + static_cast<size_t>(row) * padded + unpadded,
+                  out.data() + static_cast<size_t>(row) * unpadded);
+    }
+    buf.Unmap();
+    return true;
+}
+
 void Compositor::shutdown() {
     if (shutdownDone_) return;
     shutdownDone_ = true;
 
-    if (readBracketHeld_) {
-        ipc::Message end{}; end.tag = ipc::Tag::EndAccess;
-        ipc::Message reply{};
-        link_->sendAndWait(end, ipc::Tag::EndDone, reply);
-        readBracketHeld_ = false;
-    }
     if (ctrlFd_ >= 0) {
         ipc::Message m{}; m.tag = ipc::Tag::Shutdown;
         ipc::sendMessage(ctrlFd_, m);
         link_->flush();
     }
     // Release wgpu objects before tearing down the wire link.
-    bindGroup_ = nullptr;
+    clientSurfaces_.clear();
+    sampler_ = nullptr;
     pipeline_ = nullptr;
-    dmaTexture_ = nullptr;
     surface_ = nullptr;
     device_ = nullptr;
     instance_ = nullptr;

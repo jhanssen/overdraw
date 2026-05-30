@@ -9,15 +9,19 @@
 #include <node_api.h>
 #include <uv.h>
 
+#include <cstring>
 #include <memory>
+#include <vector>
 
 #include "core/compositor.h"
 #include "core/gpu_process.h"
+#include "core/shm.h"
 #include "wayland/server.h"
 #include "wayland/interface_registry.h"
 #include "wayland/trampoline.h"
 
 using overdraw::core::Compositor;
+using overdraw::core::ShmRegistry;
 using overdraw::wayland::Server;
 using overdraw::wayland::InterfaceRegistry;
 using overdraw::wayland::InterfaceDesc;
@@ -32,6 +36,7 @@ struct Addon {
     std::unique_ptr<Server> server;
     std::unique_ptr<InterfaceRegistry> registry;
     std::unique_ptr<Trampoline> trampoline;
+    ShmRegistry shm;  // wl_shm pool mappings (CPU-side, independent of the loop)
     uv_poll_t wirePoll{};
     uv_timer_t frameTimer{};
     bool loopRunning = false;
@@ -357,6 +362,103 @@ napi_value FdClose(napi_env env, napi_callback_info info) {
     return out;
 }
 
+// shmCreatePool(fdHandle, size) -> poolId (0 on failure)
+// Takes the trampoline fd handle (transferring fd ownership) and mmaps it.
+napi_value ShmCreatePool(napi_env env, napi_callback_info info) {
+    size_t argc = 2; napi_value argv[2];
+    napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+    if (argc < 2) return throwError(env, "shmCreatePool(fdHandle, size) requires two args");
+    if (!g_addon.trampoline) return throwError(env, "no trampoline");
+    uint32_t fdHandle = 0; napi_get_value_uint32(env, argv[0], &fdHandle);
+    uint32_t size = 0; napi_get_value_uint32(env, argv[1], &size);
+    int fd = g_addon.trampoline->takeFd(fdHandle);
+    uint32_t poolId = g_addon.shm.createPool(fd, size);  // closes fd on failure
+    napi_value out; napi_create_uint32(env, poolId, &out);
+    return out;
+}
+
+// shmResizePool(poolId, newSize) -> boolean
+napi_value ShmResizePool(napi_env env, napi_callback_info info) {
+    size_t argc = 2; napi_value argv[2];
+    napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+    if (argc < 2) return throwError(env, "shmResizePool(poolId, newSize) requires two args");
+    uint32_t poolId = 0; napi_get_value_uint32(env, argv[0], &poolId);
+    uint32_t newSize = 0; napi_get_value_uint32(env, argv[1], &newSize);
+    napi_value out; napi_get_boolean(env, g_addon.shm.resizePool(poolId, newSize), &out);
+    return out;
+}
+
+// shmDestroyPool(poolId) -> undefined
+napi_value ShmDestroyPool(napi_env env, napi_callback_info info) {
+    size_t argc = 1; napi_value argv[1];
+    napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+    if (argc < 1) return throwError(env, "shmDestroyPool(poolId) requires a poolId");
+    uint32_t poolId = 0; napi_get_value_uint32(env, argv[0], &poolId);
+    g_addon.shm.destroyPool(poolId);
+    napi_value undef; napi_get_undefined(env, &undef);
+    return undef;
+}
+
+// commitSurfaceBuffer(surfaceId, poolId, offset, width, height, stride) -> boolean
+// Resolve the pool region and upload it to the surface's GPU texture. Requires
+// the compositor to be running. Returns false if pool/region invalid.
+napi_value CommitSurfaceBuffer(napi_env env, napi_callback_info info) {
+    size_t argc = 6; napi_value argv[6];
+    napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+    if (argc < 6) return throwError(env, "commitSurfaceBuffer(surfaceId, poolId, offset, w, h, stride)");
+    if (!g_addon.compositor) return throwError(env, "compositor not running");
+    uint32_t surfaceId = 0, poolId = 0, offset = 0, w = 0, h = 0, stride = 0;
+    napi_get_value_uint32(env, argv[0], &surfaceId);
+    napi_get_value_uint32(env, argv[1], &poolId);
+    napi_get_value_uint32(env, argv[2], &offset);
+    napi_get_value_uint32(env, argv[3], &w);
+    napi_get_value_uint32(env, argv[4], &h);
+    napi_get_value_uint32(env, argv[5], &stride);
+    size_t need = static_cast<size_t>(stride) * h;
+    const uint8_t* pixels = g_addon.shm.view(poolId, offset, need);
+    bool ok = pixels != nullptr;
+    if (ok) g_addon.compositor->commitSurfaceShm(surfaceId, w, h, stride, pixels);
+    napi_value out; napi_get_boolean(env, ok, &out);
+    return out;
+}
+
+// removeSurface(surfaceId) -> undefined
+napi_value RemoveSurface(napi_env env, napi_callback_info info) {
+    size_t argc = 1; napi_value argv[1];
+    napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+    if (argc < 1) return throwError(env, "removeSurface(surfaceId) requires a surfaceId");
+    if (g_addon.compositor) {
+        uint32_t surfaceId = 0; napi_get_value_uint32(env, argv[0], &surfaceId);
+        g_addon.compositor->removeSurface(surfaceId);
+    }
+    napi_value undef; napi_get_undefined(env, &undef);
+    return undef;
+}
+
+// surfaceReadback(surfaceId) -> Buffer (width*height*4 BGRA) | null
+// Test hook: read the uploaded surface texture back to CPU. Relies on the
+// swapchain using a non-blocking present mode (Mailbox) so the GPU process's
+// command thread is not parked in a blocking Surface::GetCurrentTexture while
+// the buffer-map command waits behind it.
+napi_value SurfaceReadback(napi_env env, napi_callback_info info) {
+    size_t argc = 1; napi_value argv[1];
+    napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+    if (argc < 1) return throwError(env, "surfaceReadback(surfaceId) requires a surfaceId");
+    if (!g_addon.compositor) return throwError(env, "compositor not running");
+    uint32_t surfaceId = 0; napi_get_value_uint32(env, argv[0], &surfaceId);
+    std::vector<uint8_t> px;
+    if (!g_addon.compositor->readbackSurface(surfaceId, px)) {
+        napi_value n; napi_get_null(env, &n);
+        return n;
+    }
+    napi_value ab; void* data;
+    napi_create_arraybuffer(env, px.size(), &data, &ab);
+    std::memcpy(data, px.data(), px.size());
+    napi_value out;
+    napi_create_typedarray(env, napi_uint8_array, px.size(), ab, 0, &out);
+    return out;
+}
+
 napi_value Init(napi_env env, napi_value exports) {
     napi_value fnStart, fnStop, fnPresented, fnStartServer, fnStopServer;
     napi_create_function(env, "start", NAPI_AUTO_LENGTH, Start, nullptr, &fnStart);
@@ -372,6 +474,19 @@ napi_value Init(napi_env env, napi_value exports) {
     napi_value fnFdTake, fnFdClose;
     napi_create_function(env, "fdTake", NAPI_AUTO_LENGTH, FdTake, nullptr, &fnFdTake);
     napi_create_function(env, "fdClose", NAPI_AUTO_LENGTH, FdClose, nullptr, &fnFdClose);
+
+    // shm / client-surface bridge (the first server <-> compositor connection).
+    auto reg = [&](const char* name, napi_callback fn) {
+        napi_value f; napi_create_function(env, name, NAPI_AUTO_LENGTH, fn, nullptr, &f);
+        napi_set_named_property(env, exports, name, f);
+    };
+    reg("shmCreatePool", ShmCreatePool);
+    reg("shmResizePool", ShmResizePool);
+    reg("shmDestroyPool", ShmDestroyPool);
+    reg("commitSurfaceBuffer", CommitSurfaceBuffer);
+    reg("removeSurface", RemoveSurface);
+    reg("surfaceReadback", SurfaceReadback);
+
     napi_set_named_property(env, exports, "start", fnStart);
     napi_set_named_property(env, exports, "stop", fnStop);
     napi_set_named_property(env, exports, "presentedCount", fnPresented);

@@ -15,3 +15,6 @@ node_modules/
 *.swp
 *~
 .DS_Store
+
+# gdb session history (from ad-hoc debugging)
+.gdb_history

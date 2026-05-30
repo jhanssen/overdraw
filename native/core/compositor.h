@@ -1,6 +1,7 @@
 // The core compositor: owns the wire link, the wgpu objects, and the
-// presentation logic. Brings up the device/surface and the dmabuf interop path
-// over the wire, then renders the textured-quad compositing pass per frame.
+// presentation logic. Brings up the device/surface over the wire, then renders
+// the textured-quad compositing pass per frame, sampling client-surface
+// textures uploaded via commitSurfaceShm.
 //
 // This class holds no libuv/N-API concerns; the addon drives renderFrame() and
 // drainWire() from libuv handles and owns the GPU-process lifecycle handoff.
@@ -11,6 +12,8 @@
 #include <cstdint>
 #include <memory>
 #include <string>
+#include <unordered_map>
+#include <vector>
 
 #include "dawn/webgpu_cpp.h"
 
@@ -26,9 +29,8 @@ class Compositor {
     Compositor(const Compositor&) = delete;
     Compositor& operator=(const Compositor&) = delete;
 
-    // Hello handshake + full bring-up (adapter, device, surface, dmabuf
-    // reserve/inject + access brackets, compositing pipeline). Blocking,
-    // one-shot. Returns false and sets error() on failure.
+    // Hello handshake + bring-up (adapter, device, surface, compositing
+    // pipeline). Blocking, one-shot. Returns false and sets error() on failure.
     bool bringUp();
     const std::string& error() const { return error_; }
 
@@ -41,6 +43,22 @@ class Compositor {
     // Steady-state hooks (called from libuv handles in the addon).
     void drainWire() { link_->drainInbound(); }
     void renderFrame();
+
+    // Upload a client surface's CPU pixels (BGRA8Unorm-equivalent, e.g. shm
+    // ARGB8888/XRGB8888) into a sampled wgpu texture over the wire, creating or
+    // recreating it if size changed, and mark the surface for compositing. The
+    // pixels are tightly read row by row using `stride`. `id` is an opaque
+    // per-surface key chosen by the caller.
+    void commitSurfaceShm(uint32_t id, uint32_t width, uint32_t height,
+                          uint32_t stride, const uint8_t* pixels);
+
+    // Stop compositing a surface and release its texture.
+    void removeSurface(uint32_t id);
+
+    // Test hook: read the surface's uploaded texture back to CPU. Fills `out`
+    // with width*height*4 BGRA bytes. Returns false if the surface is unknown
+    // or readback fails. Blocking (pumps the wire until the map completes).
+    bool readbackSurface(uint32_t id, std::vector<uint8_t>& out);
 
     // Stop presenting and release GPU/wire resources; signal + reap the GPU
     // process. Idempotent.
@@ -58,14 +76,23 @@ class Compositor {
     wgpu::Instance instance_;
     wgpu::Device device_;
     wgpu::Surface surface_;
-    wgpu::Texture dmaTexture_;
     wgpu::RenderPipeline pipeline_;
-    wgpu::BindGroup bindGroup_;
+    wgpu::Sampler sampler_;
+
+    // Client surfaces composited over the wire. One full-screen quad per
+    // present surface (first-light: no placement/transform/blending).
+    struct ClientSurface {
+        wgpu::Texture texture;
+        wgpu::BindGroup bindGroup;
+        uint32_t width = 0;
+        uint32_t height = 0;
+        bool present = false;
+    };
+    std::unordered_map<uint32_t, ClientSurface> clientSurfaces_;
 
     uint32_t windowWidth_ = 0;
     uint32_t windowHeight_ = 0;
     uint64_t presented_ = 0;
-    bool readBracketHeld_ = false;
     std::string error_;
 };
 

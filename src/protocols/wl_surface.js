@@ -1,6 +1,7 @@
-// wl_surface: per-surface double-buffered state. For first light we track the
-// pending/committed buffer and the frame-callback queue; we do not yet sample or
-// composite a client buffer (no buffer import path here).
+// wl_surface: per-surface double-buffered state. On commit, if an shm buffer is
+// attached, upload its pixels to the surface's GPU texture via the compositor
+// bridge, then release the buffer (shm bytes are copied at upload time, so the
+// client may reuse the buffer immediately).
 
 export default function makeSurface(ctx) {
   const rec = (resource) => ctx.state.surfaces.get(resource);
@@ -25,16 +26,30 @@ export default function makeSurface(ctx) {
     commit(resource) {
       const s = rec(resource);
       if (!s) return;
-      // Apply pending -> committed (only buffer tracked so far).
       if (s.pending.buffer !== undefined) {
         s.committed.buffer = s.pending.buffer;
         s.pending.buffer = undefined;
       }
-      // An xdg_surface's first commit (with a role) completes its mapping; the
-      // role object drives the configure handshake, so nothing more here yet.
+
+      const buffer = s.committed.buffer;
+      if (buffer && !buffer.destroyed) {
+        const desc = ctx.state.buffers?.get(buffer);
+        if (desc && desc.poolId) {
+          const ok = ctx.addon.commitSurfaceBuffer(
+            s.id, desc.poolId, desc.offset, desc.width, desc.height, desc.stride);
+          if (ok) {
+            ctx.state.lastCommittedSurfaceId = s.id;
+            // shm: contents are copied at upload, so the buffer is free to reuse.
+            ctx.events.wl_buffer.send_release(buffer);
+          }
+        }
+      }
+
       if (s.xdgSurface) s.xdgSurface.lastCommitSerial = ctx.state.nextSerial - 1;
     },
     destroy(resource) {
+      const s = rec(resource);
+      if (s && ctx.addon.removeSurface) ctx.addon.removeSurface(s.id);
       ctx.state.surfaces.delete(resource);
     },
   };

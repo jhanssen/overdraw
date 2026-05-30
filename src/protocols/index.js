@@ -17,11 +17,14 @@ const __dirname = dirname(fileURLToPath(import.meta.url));
 const genDir = join(__dirname, '..', 'protocols-gen');
 
 // Interfaces advertised as globals (clients bind them from the registry).
-const GLOBALS = ['wl_compositor', 'xdg_wm_base'];
+const GLOBALS = ['wl_compositor', 'xdg_wm_base', 'wl_shm'];
 
 // Interfaces created via requests (new_id), registered without a global so
 // their child resources dispatch to a handler.
-const CHILD_INTERFACES = ['wl_surface', 'wl_region', 'xdg_surface', 'xdg_toplevel'];
+const CHILD_INTERFACES = [
+  'wl_surface', 'wl_region', 'xdg_surface', 'xdg_toplevel',
+  'wl_shm_pool', 'wl_buffer',
+];
 
 // Load all generated signature modules, keyed by interface name.
 async function loadSignatures() {
@@ -66,6 +69,9 @@ export async function installProtocols(addon) {
     xdg_wm_base: await import('./xdg_wm_base.js'),
     xdg_surface: await import('./xdg_surface.js'),
     xdg_toplevel: await import('./xdg_toplevel.js'),
+    wl_shm: await import('./wl_shm.js'),
+    wl_shm_pool: await import('./wl_shm_pool.js'),
+    wl_buffer: await import('./wl_buffer.js'),
   };
 
   for (const name of CHILD_INTERFACES) {

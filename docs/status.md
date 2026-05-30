@@ -4,7 +4,7 @@ Tracks what is built and empirically proven versus what is still design only.
 The design itself lives in `architecture.md`; this file is the ground truth for
 "what exists right now."
 
-Last updated: 2026-05-29 (rev 4).
+Last updated: 2026-05-29 (rev 5).
 
 ## Verification environment
 
@@ -68,12 +68,59 @@ server) topology runs as real, non-spike code and presents to a host window:
 - `wl_event_loop` (server-side Wayland) integration does not exist — there is no
   Wayland server yet. No host input handling, no resize handling.
 
-### Compositing (single textured quad)
-- A textured-quad pipeline composites one surface: shaders, sampler, bind group,
-  full-surface quad. It samples the dmabuf-backed texture (see below) and
-  presents it; the host window shows the rendered colour (green).
-- Still absent: multiple surfaces, per-surface transforms/opacity, blending,
-  client buffers, multi-output, damage.
+### Compositing (single textured quad, real client shm buffers)
+- A textured-quad pipeline composites client surfaces: shaders, sampler,
+  per-surface bind group, full-surface quad. It samples a client-surface texture
+  and presents it; with no client surface present the pass clears to black.
+- The interop dmabuf test quad (a server-allocated dmabuf texture the core used
+  to render green into and hold open) has been **removed** from the compositor;
+  it was spike scaffolding superseded by real client-buffer compositing. The
+  dmabuf import primitive itself stays proven (see "dmabuf interop path") and is
+  still exercised GPU-side, but the core no longer reserves/injects a dmabuf
+  texture or holds a perpetual `SharedTextureMemory` access bracket in steady
+  state.
+- Swapchain present mode is **Mailbox** (non-blocking acquire), chosen from the
+  surface's advertised modes. FIFO blocked `Surface::GetCurrentTexture` on the
+  GPU process's single command thread whenever the host compositor wasn't
+  consuming frames (e.g. an unviewed nested window), which stalled all other
+  wire work behind it (including buffer-map). Mailbox avoids that.
+- Still absent: multiple simultaneous surfaces (the loop draws each present
+  surface full-screen, so the last wins), per-surface placement/transforms/
+  opacity, alpha blending (no blend state), multi-output, damage.
+
+### Client shm buffers end-to-end (upload → composite → present, pixel-verified)
+A real Wayland client can map a window with content and have its pixels reach
+the screen, verified by GPU readback:
+
+- JS handlers `src/protocols/wl_shm.js`, `wl_shm_pool.js`, `wl_buffer.js`:
+  `wl_shm` advertises ARGB8888/XRGB8888 on bind (via a new trampoline on-bind
+  hook) and creates pools; `create_pool` hands the fd (opaque handle) to native,
+  which `mmap`s it (`native/core/shm.cpp` `ShmRegistry`); `create_buffer` records
+  an (offset,w,h,stride,format) view; `wl_surface.commit` resolves the committed
+  buffer and uploads it.
+- Native bridge (`addon.cpp` + `core/compositor.cpp`): `commitSurfaceBuffer`
+  resolves the pool region and calls `Compositor::commitSurfaceShm`, which
+  creates/recreates a `BGRA8Unorm` wgpu texture over the wire
+  (`Device::CreateTexture`) and uploads CPU pixels via `Queue::WriteTexture`,
+  then builds a per-surface bind group. ARGB8888/XRGB8888 shm memory maps to
+  BGRA8Unorm byte-for-byte (no swizzle) on little-endian. After upload the
+  compositor sends `wl_buffer.release` (shm bytes are copied at upload time).
+- Verified end-to-end (`test/shm-test-client.c` + `test/shm-upload-smoke.mjs`,
+  needs GPU + host Wayland): a client binds `wl_shm`+`wl_compositor`+
+  `xdg_wm_base`, fills a 64×64 buffer with solid blue, maps an `xdg_toplevel`,
+  attaches+commits; the server uploads, composites, and presents. A GPU readback
+  (`CopyTextureToBuffer`+`MapAsync`) confirms the uploaded texture is pixel-exact
+  (BGRA `[255,0,0,255]` at sampled points). **PASS.**
+- This also established that device/queue async over the wire (`MapAsync`,
+  `OnSubmittedWorkDone`) needs the GPU process to call
+  `dawn::native::DeviceTick(device)` in its pump loop (instance-level
+  `InstanceProcessEvents` alone is insufficient); added to `gpu-process/main.cpp`.
+- `WriteTexture` over the wire serializes pixels through the socket (no
+  `MemoryTransferService` configured) — functional, per-upload copy cost
+  unmeasured. Throughput is not yet a concern at this stage.
+- Still absent: dmabuf client buffers (`linux-dmabuf-v1`), multi-surface
+  placement, damage-driven partial upload, format conversion beyond
+  ARGB/XRGB8888.
 
 ### dmabuf interop path (single device, validated end-to-end)
 The plugin/surface buffer path from the design is proven as real, non-spike code
@@ -90,7 +137,12 @@ core device):
   texture handle resolves to the server-allocated dmabuf texture.
 - `BeginAccess`/`EndAccess` with mandatory Vulkan image-layout state; EndAccess
   produces a `SharedFenceSyncFD` (fenceCount=1). The client renders into the
-  dmabuf (write bracket), then samples it for compositing (read bracket).
+  dmabuf (write bracket), then samples it for compositing (read bracket). NOTE:
+  the core no longer drives this in steady state — the perpetual read bracket
+  and the dmabuf test quad were removed from the compositor (see "Compositing").
+  The GPU-side allocate/import/inject + access-bracket code remains and is the
+  primitive a future `linux-dmabuf-v1` handler reuses; it is just not exercised
+  by the current present loop.
 - **Not done:** two-device cross-device sharing (plugin device renders, core
   device samples) and cross-process fence *consumption* — the sync-fd is
   produced but not waited on across a device boundary. Assumed to work
@@ -183,10 +235,10 @@ path).
   configured-after-ack) is asserted. **PASS.**
 - The configure sends `states = [activated]` (a non-empty `wl_array`), which
   doubles as the on-wire proof of non-empty array encoding.
-- Not done here: no buffer is attached (so nothing composites — `commit` is
-  bookkeeping only); configure sends 0×0 (client picks size); no WM/policy
-  (placement, focus, dynamic toplevel states); popups (`get_popup`) and
-  positioners are no-ops.
+- Buffer attach/commit now uploads + composites shm buffers (see "Client shm
+  buffers end-to-end"). Still: configure sends 0×0 (client picks size); no
+  WM/policy (placement, focus, dynamic toplevel states); popups (`get_popup`)
+  and positioners are no-ops.
 
 ### Load-bearing facts established (recorded in architecture.md "Validated against Dawn")
 - A Wayland-backed `wgpu::Surface` swapchain works **over the Dawn wire**: a
@@ -209,16 +261,12 @@ path).
 
 ## Not yet built (design only)
 
-- **A mappable window (client buffers).** The xdg-shell toplevel-creation chain
-  is implemented and proven (see "JS protocol layer" above), and request fd-arg
-  decode now works (a handler can receive a client buffer fd as a handle — see
-  "Trampoline gaps"), but a real app still cannot *map a window with content*:
-  no buffer is attached, imported, or composited. The `wl_shm` and
-  `linux-dmabuf-v1` handler logic (pool/buffer tracking, import to a texture)
-  is unwritten, and nothing samples a *client* buffer into the compositing pass.
-  The dmabuf import primitive a `linux-dmabuf-v1` handler would reuse is proven
-  server-side, but importing a *client-chosen* modifier we did not allocate is
-  not yet exercised. No live reload yet. No WM/policy.
+- **dmabuf client buffers (`linux-dmabuf-v1`).** A real app can now map a window
+  with **shm** content end-to-end (see "Client shm buffers end-to-end"), but the
+  `linux-dmabuf-v1` path — a client passing its own dmabuf fd + modifier for
+  zero-copy GPU buffers — is unwritten. The server-side import primitive is
+  proven, but importing a *client-chosen* modifier we did not allocate is not yet
+  exercised, and there is no client-buffer dmabuf handler. No live reload yet.
 - **WM / policy in JS.** Window management, focus, layout — none built.
 - **JS-owned core breadth.** The core is C++ + Node with a working trampoline
   and a frame event callback, but the protocol-handler/WM/plugin layers that

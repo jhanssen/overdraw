@@ -75,6 +75,28 @@ void Trampoline::onBind(wl_client* client, void* data, uint32_t version, uint32_
     // Generic dispatcher; implementation pointer carries the InterfaceState.
     wl_resource_set_dispatcher(res, &Trampoline::onDispatch, st, st, nullptr);
     std::printf("[wl] bind %s v%u id=%u\n", st->name.c_str(), version, id);
+
+    // Optional on-bind hook: if the handler has a `bind` method, call it with
+    // the freshly-bound resource so it can send initial events (e.g.
+    // wl_shm.format advertisements). Runs on the Node thread.
+    Trampoline* self = st->owner;
+    napi_env env = self->env_;
+    napi_handle_scope scope;
+    napi_open_handle_scope(env, &scope);
+    napi_value handler;
+    napi_get_reference_value(env, st->handler, &handler);
+    napi_value bindFn;
+    if (napi_get_named_property(env, handler, "bind", &bindFn) == napi_ok) {
+        napi_valuetype t;
+        napi_typeof(env, bindFn, &t);
+        if (t == napi_function) {
+            napi_value arg = self->wrapResource(res, st->name);
+            napi_value result;
+            if (napi_call_function(env, handler, bindFn, 1, &arg, &result) != napi_ok)
+                napi_get_and_clear_last_exception(env, &result);
+        }
+    }
+    napi_close_handle_scope(env, scope);
 }
 
 napi_value Trampoline::wrapResource(wl_resource* resource, const std::string& ifaceName) {
