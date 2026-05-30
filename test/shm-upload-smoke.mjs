@@ -47,16 +47,14 @@ setTimeout(() => {
 
 // Poll for the committed surface, read it back while the client holds it alive.
 const started = Date.now();
+let pending = false;
 const poll = setInterval(() => {
   const id = state.lastCommittedSurfaceId;
-  if (id != null && readback == null) {
-    const px = addon.surfaceReadback(id);
-    if (px) {
-      readback = px;
-      clearInterval(poll);
-      finish();
-      return;
-    }
+  if (id != null && readback == null && !pending) {
+    pending = addon.surfaceReadback(id, (px) => {
+      pending = false;
+      if (px) { readback = px; clearInterval(poll); finish(); }
+    });
   }
   if (Date.now() - started > 5000) {
     clearInterval(poll);

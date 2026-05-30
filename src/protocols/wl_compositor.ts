@@ -10,14 +10,16 @@ export default function makeCompositor(ctx: Ctx): WlCompositorHandler {
   return {
     create_surface(_resource, surface) {
       const id = ctx.state.serial(); // reuse the monotonic counter for surface ids
-      ctx.state.surfaces.set(surface, {
+      const rec = {
         id,
         resource: surface,
         role: null, // 'xdg_toplevel' once assigned
         pending: { buffer: undefined },
         committed: { buffer: null },
         xdgSurface: null, // associated xdg_surface record
-      });
+      };
+      ctx.state.surfaces.set(surface, rec);
+      (ctx.state.surfacesById ??= new Map()).set(id, rec);
     },
     create_region(_resource, _region) {
       // Regions track damage/opaque/input areas; no state needed for first light.

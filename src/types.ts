@@ -60,12 +60,19 @@ export interface Addon {
   commitSurfaceDmabuf(id: number, fd: WaylandFd, w: number, h: number,
                       fourcc: number, modHi: number, modLo: number,
                       offset: number, stride: number, bufferId: number): boolean;
+  // Surfaces that gained presentable content (commit completed) since the last
+  // call, for both shm and dmabuf. Used as the single map-on-first-content
+  // signal (dmabuf commits complete asynchronously, so map cannot be inferred
+  // from commitSurfaceDmabuf's return).
+  takeImportedSurfaces(): Array<{ id: number; width: number; height: number }>;
   // dmabuf bufferIds whose compositor GPU read has completed (safe to release).
   takeFreedBuffers(): number[];
   removeSurface(id: number): void;
   setSurfaceLayout(id: number, x: number, y: number, w: number, h: number): void;
   setStack(ids: number[]): void;
-  surfaceReadback(id: number): Uint8Array | null;
+  // Async test hook: starts a texture readback; cb(px|null) fires later on the
+  // Node thread when the GPU map completes. Returns true if started.
+  surfaceReadback(id: number, cb: (px: Uint8Array | null) => void): boolean;
 
   // shm pools. The pool fd is a WaylandFd; native takes the raw fd out of it.
   shmCreatePool(fd: WaylandFd, size: number): number;

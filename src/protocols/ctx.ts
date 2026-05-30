@@ -24,6 +24,9 @@ export interface SurfaceRecord {
 
 export interface CompositorState {
   surfaces: Map<Resource, SurfaceRecord>;
+  // surfaceId -> record, for native->JS lookups keyed by the integer id (e.g. the
+  // imported-surface map-on-first-content sweep).
+  surfacesById?: Map<number, SurfaceRecord>;
   nextSerial: number;
   serial(): number;
   wm?: Wm;

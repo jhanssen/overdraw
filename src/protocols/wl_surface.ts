@@ -54,7 +54,6 @@ export default function makeSurface(ctx: Ctx): WlSurfaceHandler {
       const buffer = s.committed.buffer;
       if (buffer && !buffer.destroyed) {
         const desc = ctx.state.buffers?.get(buffer);
-        let uploaded = false;
         if (desc && desc.dmabuf && desc.fd) {
           // dmabuf: hand the client's fd (WaylandFd) to native for zero-copy
           // import. The compositor samples this buffer DIRECTLY (no copy), so it
@@ -64,32 +63,28 @@ export default function makeSurface(ctx: Ctx): WlSurfaceHandler {
           // then. Releasing earlier would let the client overwrite a buffer the
           // GPU is still reading; never releasing starves a Vulkan-WSI client in
           // vkAcquireNextImageKHR.
+          //
+          // The import is ASYNCHRONOUS (commitSurfaceDmabuf returns once the
+          // request is sent, not once the texture is injected). Map-on-first-
+          // content therefore cannot be inferred here; it is driven by the
+          // imported-surface sweep in dispatchFrameCallbacks (see index.ts),
+          // which is shared with shm.
           const bufferId = bufferIdOf(ctx, buffer);
           const ok = ctx.addon.commitSurfaceDmabuf(
             s.id, desc.fd, desc.width, desc.height, desc.format,
             desc.modifierHi ?? 0, desc.modifierLo ?? 0, desc.offset, desc.stride, bufferId);
-          if (ok) { ctx.state.lastCommittedSurfaceId = s.id; uploaded = true; }
+          if (ok) ctx.state.lastCommittedSurfaceId = s.id;
         } else if (desc && desc.poolId) {
           const ok = ctx.addon.commitSurfaceBuffer(
             s.id, desc.poolId, desc.offset, desc.width, desc.height, desc.stride);
           if (ok) {
             ctx.state.lastCommittedSurfaceId = s.id;
-            uploaded = true;
             // shm: contents are copied at upload, so the buffer is free to reuse.
             ctx.events.wl_buffer.send_release(buffer);
           }
         }
-
-        // First buffered commit on a toplevel == map. Hand it to the WM to be
-        // placed + stacked so it actually draws. Guard so it fires once. Pass the
-        // committed buffer size so the WM has real dimensions for hit-testing
-        // (the placement stub leaves size to the content size).
-        if (uploaded && desc && !s.mapped && s.role === "xdg_toplevel") {
-          s.mapped = true;
-          const rect = ctx.state.wm?.mapWindow(s.id, s, desc.width, desc.height);
-          // Focus-on-map (per the seat's focus policy).
-          if (rect) ctx.state.seat?.focusWindow(s.id, s, rect);
-        }
+        // Mapping (first presentable content -> WM place + focus) happens for
+        // both paths in the imported-surface sweep, not here.
       }
 
       if (s.xdgSurface) s.xdgSurface.lastCommitSerial = ctx.state.nextSerial - 1;
@@ -99,6 +94,7 @@ export default function makeSurface(ctx: Ctx): WlSurfaceHandler {
       if (s) {
         ctx.state.wm?.unmapWindow(s.id);
         ctx.addon.removeSurface(s.id);
+        ctx.state.surfacesById?.delete(s.id);
       }
       ctx.state.surfaces.delete(resource);
     },

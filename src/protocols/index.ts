@@ -108,6 +108,20 @@ export async function installProtocols(
     // correct completion signal -- not a timer guess: releasing only after the
     // GPU is done reading avoids both client overwrite-while-reading and the
     // vkAcquireNextImageKHR starvation seen when buffers are never freed.
+    // Map-on-first-content (both shm and dmabuf). Native reports surfaces that
+    // gained presentable content; the first time a toplevel does, hand it to the
+    // WM to place + stack + focus. dmabuf commits complete asynchronously so this
+    // cannot be done inline in wl_surface.commit -- it is the single shared map
+    // signal for both buffer paths. Carries the content size for hit-testing.
+    const imported = addon.takeImportedSurfaces();
+    for (const { id, width, height } of imported) {
+      const s = state.surfacesById?.get(id);
+      if (!s || s.mapped || s.role !== "xdg_toplevel") continue;
+      s.mapped = true;
+      const rect = state.wm?.mapWindow(id, s, width, height);
+      if (rect) state.seat?.focusWindow(id, s, rect);
+    }
+
     const freed = addon.takeFreedBuffers();
     if (freed.length > 0) {
       const byId = state.dmabufById;

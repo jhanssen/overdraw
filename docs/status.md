@@ -4,7 +4,7 @@ Tracks what is built and empirically proven versus what is still design only.
 The design itself lives in `architecture.md`; this file is the ground truth for
 "what exists right now."
 
-Last updated: 2026-05-30 (rev 12).
+Last updated: 2026-05-30 (rev 13).
 
 ## Verification environment
 
@@ -99,32 +99,49 @@ server) topology runs as real, non-spike code and presents to a host window:
   - Wire socket `SO_SNDBUF`/`SO_RCVBUF` enlarged to 8 MiB (`gpu_process.cpp`) so
     the kernel keeps draining queued bytes while we are busy (userspace buffering
     still covers the case where even that fills).
-- **Known remaining IPC wart (not a deadlock):** `commitSurfaceDmabuf` is still
-  synchronous — it blocks the Node event loop on the GPU import round-trip per
-  commit. Measured **~1.7 ms/call** on a Release/-O3 build (the 500 ms seen
-  earlier was a stray debug readback in the import path, since removed).
-  Deadlock-safe (writes never block), and fine for one client (~10% of the event
-  loop at 60fps), but it scales linearly: two 60fps clients ≈ 20%, and it will
-  slip frames / add input latency with several animating dmabuf surfaces. This is
-  the next scaling fix.
-  - **Plan (async commit), deferred to its own change:** `commitSurfaceDmabuf`
-    returns immediately after `ReserveTexture` + sending `ImportClientTex`; the
-    `ClientTexImported` reply is handled on the Node thread and finishes the
-    setup (bind group, present-enable, retire) + signals JS for map-on-first-
-    commit. PREREQUISITE: the core has **no steady-state ctrl-fd drain** today —
-    `ctrlFd_` is read only inside the synchronous bring-up/commit spins and is
-    NOT registered with libuv. Async commit needs a libuv `uv_poll` on `ctrlFd_`
-    dispatching `ClientTexImported` (and `EndDone`/`DeviceLost`/`Fault`, which
-    also currently have nowhere to be handled in steady state). Build that
-    ctrl-drain first, then split commit. Verify with 2–3 Release MB instances
-    under load, confirming per-commit event-loop occupancy drops to ~0.
+- **Async dmabuf commit (the prior synchronous wart is fixed).**
+  `commitSurfaceDmabuf` no longer blocks: it reserves the texture handle, sends
+  `ImportClientTex` (fd via SCM_RIGHTS), records a `PendingImport` keyed by the
+  reserved texture handle id, and returns immediately. The held reservation
+  (neither `Acquire`'d nor `Reclaim`'d until the reply) keeps its handle id from
+  being recycled while in flight. The GPU process imports + injects
+  asynchronously (already non-blocking, deferring on the wire serial) and replies
+  `ClientTexImported`; the reply is dispatched on the Node thread by
+  `Compositor::drainCtrl()` (`finishImport`: retire superseded buffer, adopt the
+  injected texture, build bind group, mark present, report imported).
+  - PREREQUISITE built: a **steady-state ctrl-fd drain**. `ctrlFd_` is now
+    registered with libuv (`uv_poll` in `addon.cpp` → `onCtrlReadable` →
+    `drainCtrl`); `onWireReadable` also calls `drainCtrl` after `drainWire` (the
+    wire advancing may release deferred GPU-side imports). Replies are matched by
+    reserved-texture handle id; per surface they complete in send order.
+  - **Unified map-on-first-content.** Both shm and dmabuf commits now report
+    presentable surfaces via `Compositor::takeImportedSurfaces()` (id + content
+    size). The JS sweep in `dispatchFrameCallbacks` (`src/protocols/index.ts`)
+    maps a toplevel on its first reported content (WM place + focus). The old
+    inline map in `wl_surface.commit` (which relied on the synchronous dmabuf
+    return) is gone; `commit` no longer infers map for either path. A
+    `surfacesById` map gives the sweep id→record lookup.
+  - **Async readback (`surfaceReadback`).** The last steady-state synchronous
+    pump is gone: `Compositor::readbackSurface(id, cb)` kicks off
+    `CopyTextureToBuffer` + `MapAsync` and returns immediately; the staging buffer
+    is captured in the map callback (kept alive until it fires) which delivers the
+    pixels to a JS callback on the Node thread (driven by the wire pump). The
+    addon `surfaceReadback(id, cb)` and both smoke tests use the callback form.
+  - Verified (RTX 5060 / driver 595.71.05): `dmabuf-upload-smoke.mjs` PASS
+    (pixel-exact red, 0 bad components, 3/3 runs); `shm-upload-smoke.mjs` PASS
+    (pixel-exact blue) through the unified path; structural `node --test` suite
+    8/8. No leaked GPU process.
+  - Steady state is now fully libuv-driven with no `write()`/pump blocking on the
+    Node thread. Multi-client per-commit occupancy was not separately re-measured;
+    the per-commit round-trip wait (the ~1.7 ms previously charged to the event
+    loop) is eliminated by construction.
   - Further option (only if measured necessary): move the wire socket `write()`
     off the Node thread to a writer worker. Serialization (Dawn `Flush`, not
     thread-safe) stays on Node and produces framed bytes into the serializer's
     existing `out_` queue; a worker drains `out_` to the socket (write-only —
     inbound `HandleCommands` must stay on Node). The buffered transport already
     makes this a clean producer/consumer seam. NOT done; no measured write-path
-    bottleneck yet (the cost was the round-trip wait, which async commit removes).
+    bottleneck yet.
 
 ### JS layer / event loop (core is C++ + Node)
 - The core is C++ + Node as the architecture specifies. Node owns `main()` and
@@ -427,9 +444,11 @@ proven on the RTX 5060:
   sampleable, and `InjectTexture`s at the core's reserved handle. Per-surface STM
   + texture + fd kept in a keyed map for lifetime.
 - Core `Compositor::commitSurfaceDmabuf`: `ReserveTexture`, send `ImportClientTex`
-  with the fd, await `ClientTexImported`, wrap the injected handle as a
-  `wgpu::Texture`, build the per-surface bind group — plugging into the same
-  `clientSurfaces_` compositing/readback path as shm.
+  with the fd, then return (NON-BLOCKING — see "Async dmabuf commit" above). The
+  `ClientTexImported` reply is later dispatched by `drainCtrl()` on the Node
+  thread, which wraps the injected handle as a `wgpu::Texture` and builds the
+  per-surface bind group — plugging into the same `clientSurfaces_` compositing/
+  readback path as shm.
 - Verified end-to-end (`test/dmabuf-test-client.c` + `test/dmabuf-upload-smoke.mjs`,
   needs GPU + host Wayland): client GBM-allocates a LINEAR ARGB8888 buffer filled
   solid red, sends it via `create_immed`, maps an `xdg_toplevel`, commits; the

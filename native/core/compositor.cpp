@@ -313,6 +313,7 @@ void Compositor::commitSurfaceShm(uint32_t id, uint32_t width, uint32_t height,
                                     &layout, &extent);
     cs.present = true;
     link_->flush();
+    reportImported(id, width, height);  // single map-on-first-content signal
 }
 
 bool Compositor::commitSurfaceDmabuf(uint32_t id, int fd, uint32_t width, uint32_t height,
@@ -357,40 +358,30 @@ bool Compositor::commitSurfaceDmabuf(uint32_t id, int fd, uint32_t width, uint32
         return false;
     }
 
-    // Await the import result, pumping the wire (the inject happens server-side
-    // over the wire and must be processed by the client).
-    ipc::Message reply{};
-    bool got = link_->pumpUntilTimeout(
-        [&] {
-            ipc::Message r{};
-            if (ipc::recvMessageNB(ctrlFd_, r) && r.tag == ipc::Tag::ClientTexImported) {
-                reply = r;
-                return true;
-            }
-            return false;
-        },
-        3000);
-    if (!got || !reply.importOk) {
-        std::fprintf(stderr, "[core] dmabuf import FAILED id=%u %ux%u fourcc=0x%08x mod=0x%llx got=%d ok=%u\n",
-                     id, width, height, drmFourcc,
-                     static_cast<unsigned long long>(modifier), got ? 1 : 0, reply.importOk);
-        link_->client().ReclaimTextureReservation(rt);
-        return false;
-    }
-    ClientSurface& cs = clientSurfaces_[id];
+    // NON-BLOCKING: record the in-flight reservation and return. The GPU process
+    // imports + injects asynchronously (deferring until its wire reader passes
+    // wireSerial) and replies ClientTexImported; drainCtrl() finishes the import
+    // on this (Node) thread. The reservation is held here -- neither Acquired nor
+    // Reclaimed -- so its handle id cannot be recycled while in flight.
+    pendingImports_.push_back({id, bufferId, width, height, rt});
+    return true;
+}
+
+void Compositor::finishImport(const PendingImport& pi) {
+    ClientSurface& cs = clientSurfaces_[pi.surfaceId];
 
     // Retire the buffer this commit supersedes: it has been sampled by every
     // frame up to and including the latest submit (submitSerial_). It becomes
     // free once that submit completes on the GPU. Keep its texture alive until
     // then (the GPU may still be reading it).
-    if (cs.currentBufferId != 0 && cs.currentBufferId != bufferId && cs.texture) {
+    if (cs.currentBufferId != 0 && cs.currentBufferId != pi.bufferId && cs.texture) {
         retiring_.push_back({cs.currentBufferId, submitSerial_, cs.texture});
     }
-    cs.currentBufferId = bufferId;
+    cs.currentBufferId = pi.bufferId;
 
-    cs.texture = wgpu::Texture::Acquire(rt.texture);
-    cs.width = width;
-    cs.height = height;
+    cs.texture = wgpu::Texture::Acquire(pi.reservation.texture);
+    cs.width = pi.width;
+    cs.height = pi.height;
 
     if (!cs.placementBuf) {
         wgpu::BufferDescriptor pbd{};
@@ -415,7 +406,41 @@ bool Compositor::commitSurfaceDmabuf(uint32_t id, int fd, uint32_t width, uint32
     updatePlacement(cs);
     cs.present = true;
     link_->flush();
-    return true;
+    reportImported(pi.surfaceId, pi.width, pi.height);
+}
+
+void Compositor::drainCtrl() {
+    // Dispatch any available side-channel control messages. In steady state the
+    // only message the GPU process sends unsolicited (relative to the present
+    // loop) is ClientTexImported, completing an async dmabuf import.
+    ipc::Message r{};
+    while (ipc::recvMessageNB(ctrlFd_, r)) {
+        if (r.tag != ipc::Tag::ClientTexImported) continue;
+        // Match by reserved texture handle id (the reply echoes it). Imports for
+        // a given surface complete in send order; matching by id is exact.
+        auto it = std::find_if(pendingImports_.begin(), pendingImports_.end(),
+            [&](const PendingImport& pi) {
+                return pi.reservation.handle.id == r.texture.id;
+            });
+        if (it == pendingImports_.end()) continue;  // already handled / unknown
+        if (r.importOk) {
+            finishImport(*it);
+        } else {
+            std::fprintf(stderr, "[core] dmabuf import FAILED id=%u %ux%u\n",
+                         it->surfaceId, it->width, it->height);
+            link_->client().ReclaimTextureReservation(it->reservation);
+        }
+        pendingImports_.erase(it);
+    }
+}
+
+void Compositor::reportImported(uint32_t id, uint32_t width, uint32_t height) {
+    importedSurfaces_.push_back({id, width, height});
+}
+
+void Compositor::takeImportedSurfaces(std::vector<ImportedSurface>& out) {
+    out.insert(out.end(), importedSurfaces_.begin(), importedSurfaces_.end());
+    importedSurfaces_.clear();
 }
 
 void Compositor::setSurfaceLayout(uint32_t id, int32_t x, int32_t y,
@@ -440,6 +465,16 @@ void Compositor::removeSurface(uint32_t id) {
         if (it->second.currentBufferId != 0 && it->second.texture)
             retiring_.push_back({it->second.currentBufferId, submitSerial_, it->second.texture});
         clientSurfaces_.erase(it);
+    }
+    // Drop any in-flight imports for this surface: their completion would
+    // otherwise re-create the surface. Reclaim the held reservations.
+    for (auto pit = pendingImports_.begin(); pit != pendingImports_.end();) {
+        if (pit->surfaceId == id) {
+            link_->client().ReclaimTextureReservation(pit->reservation);
+            pit = pendingImports_.erase(pit);
+        } else {
+            ++pit;
+        }
     }
     stack_.erase(std::remove(stack_.begin(), stack_.end(), id), stack_.end());
 }
@@ -514,7 +549,7 @@ void Compositor::renderFrame() {
     link_->flush();
 }
 
-bool Compositor::readbackSurface(uint32_t id, std::vector<uint8_t>& out) {
+bool Compositor::readbackSurface(uint32_t id, ReadbackCb cb) {
     auto it = clientSurfaces_.find(id);
     if (it == clientSurfaces_.end() || !it->second.texture) return false;
     ClientSurface& cs = it->second;
@@ -523,6 +558,7 @@ bool Compositor::readbackSurface(uint32_t id, std::vector<uint8_t>& out) {
     uint32_t unpadded = cs.width * 4;
     uint32_t padded = (unpadded + 255) & ~255u;
     uint64_t bufSize = static_cast<uint64_t>(padded) * cs.height;
+    uint32_t height = cs.height;
 
     wgpu::BufferDescriptor bd{};
     bd.size = bufSize;
@@ -539,29 +575,36 @@ bool Compositor::readbackSurface(uint32_t id, std::vector<uint8_t>& out) {
     wgpu::Extent3D extent{cs.width, cs.height, 1};
     wgpu::CommandEncoder enc = device_.CreateCommandEncoder();
     enc.CopyTextureToBuffer(&src, &dst, &extent);
-    wgpu::CommandBuffer cb = enc.Finish();
-    device_.GetQueue().Submit(1, &cb);
+    wgpu::CommandBuffer cmd = enc.Finish();
+    device_.GetQueue().Submit(1, &cmd);
     link_->flush();
 
-    bool done = false;
-    bool ok = false;
+    // ASYNCHRONOUS: the map completes later, processed on the Node thread by the
+    // wire pump (drainWire -> wgpuInstanceProcessEvents). The captured `buf` keeps
+    // the staging buffer alive until the callback fires; `cb` is invoked then.
     buf.MapAsync(wgpu::MapMode::Read, 0, bufSize, wgpu::CallbackMode::AllowProcessEvents,
-                 [&](wgpu::MapAsyncStatus s, wgpu::StringView) {
-                     ok = (s == wgpu::MapAsyncStatus::Success);
-                     done = true;
+                 [buf, cb = std::move(cb), bufSize, padded, unpadded, height]
+                 (wgpu::MapAsyncStatus s, wgpu::StringView) {
+                     std::vector<uint8_t> out;
+                     bool ok = (s == wgpu::MapAsyncStatus::Success);
+                     if (ok) {
+                         const uint8_t* mapped =
+                             static_cast<const uint8_t*>(buf.GetConstMappedRange(0, bufSize));
+                         if (mapped) {
+                             out.resize(static_cast<size_t>(unpadded) * height);
+                             for (uint32_t row = 0; row < height; ++row) {
+                                 std::copy(mapped + static_cast<size_t>(row) * padded,
+                                           mapped + static_cast<size_t>(row) * padded + unpadded,
+                                           out.data() + static_cast<size_t>(row) * unpadded);
+                             }
+                             const_cast<wgpu::Buffer&>(buf).Unmap();
+                         } else {
+                             ok = false;
+                         }
+                     }
+                     cb(ok, std::move(out));
                  });
-    if (!link_->pumpUntilTimeout([&] { return done; }, 3000)) return false;
-    if (!ok) return false;
-
-    const uint8_t* mapped = static_cast<const uint8_t*>(buf.GetConstMappedRange(0, bufSize));
-    if (!mapped) return false;
-    out.resize(static_cast<size_t>(unpadded) * cs.height);
-    for (uint32_t row = 0; row < cs.height; ++row) {
-        std::copy(mapped + static_cast<size_t>(row) * padded,
-                  mapped + static_cast<size_t>(row) * padded + unpadded,
-                  out.data() + static_cast<size_t>(row) * unpadded);
-    }
-    buf.Unmap();
+    link_->flush();
     return true;
 }
 
@@ -575,6 +618,9 @@ void Compositor::shutdown() {
         link_->flush();
     }
     // Release wgpu objects before tearing down the wire link.
+    for (auto& pi : pendingImports_)
+        link_->client().ReclaimTextureReservation(pi.reservation);
+    pendingImports_.clear();
     clientSurfaces_.clear();
     sampler_ = nullptr;
     pipeline_ = nullptr;

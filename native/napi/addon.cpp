@@ -54,6 +54,7 @@ struct Addon {
     std::unique_ptr<Keymap> keymap;  // xkbcommon keymap + modifier state
     ShmRegistry shm;  // wl_shm pool mappings (CPU-side, independent of the loop)
     uv_poll_t wirePoll{};
+    uv_poll_t ctrlPoll{};
     uv_poll_t inputPoll{};
     uv_timer_t frameTimer{};
     int inputFd = -1;  // core-side input socket; owned here, closed in Stop()
@@ -255,8 +256,21 @@ void armWirePoll() {
 void onWireReadable(uv_poll_t*, int status, int events) {
     if (status < 0 || !g_addon.compositor) return;
     if (events & UV_WRITABLE) g_addon.compositor->wirePumpOut();
-    if (events & UV_READABLE) g_addon.compositor->drainWire();
+    if (events & UV_READABLE) {
+        g_addon.compositor->drainWire();
+        // The wire advancing may let deferred imports complete on the GPU side,
+        // whose ClientTexImported replies arrive on the ctrl fd; drain it too.
+        g_addon.compositor->drainCtrl();
+    }
     armWirePoll();  // update WRITABLE arming based on remaining queue
+}
+
+// Steady-state ctrl-fd drain: dispatches async control replies (ClientTexImported
+// finishing dmabuf imports). Same Node thread; no threadsafe function needed.
+void onCtrlReadable(uv_poll_t*, int status, int) {
+    if (status < 0 || !g_addon.compositor) return;
+    g_addon.compositor->drainCtrl();
+    armWirePoll();  // finishing an import flushes wire output (bind group etc.)
 }
 
 void onInputReadable(uv_poll_t*, int status, int) {
@@ -321,6 +335,12 @@ napi_value Start(napi_env env, napi_callback_info info) {
     uv_poll_init(loop, &g_addon.wirePoll, g_addon.compositor->wireFd());
     uv_poll_start(&g_addon.wirePoll, UV_READABLE, onWireReadable);
 
+    // Steady-state ctrl-fd drain: async dmabuf import replies (ClientTexImported)
+    // are dispatched here off the Node thread's libuv loop, so commitSurfaceDmabuf
+    // never blocks waiting for the round-trip.
+    uv_poll_init(loop, &g_addon.ctrlPoll, g_addon.compositor->ctrlFd());
+    uv_poll_start(&g_addon.ctrlPoll, UV_READABLE, onCtrlReadable);
+
     // Input backend: maps host-forwarded events to normalized events. Output
     // logical size == host window size in phase 1 (scale 1).
     if (g_addon.inputFd >= 0) {
@@ -356,8 +376,10 @@ napi_value Stop(napi_env env, napi_callback_info) {
     if (g_addon.loopRunning) {
         uv_timer_stop(&g_addon.frameTimer);
         uv_poll_stop(&g_addon.wirePoll);
+        uv_poll_stop(&g_addon.ctrlPoll);
         uv_close(reinterpret_cast<uv_handle_t*>(&g_addon.frameTimer), nullptr);
         uv_close(reinterpret_cast<uv_handle_t*>(&g_addon.wirePoll), nullptr);
+        uv_close(reinterpret_cast<uv_handle_t*>(&g_addon.ctrlPoll), nullptr);
         if (g_addon.input) {
             uv_poll_stop(&g_addon.inputPoll);
             uv_close(reinterpret_cast<uv_handle_t*>(&g_addon.inputPoll), nullptr);
@@ -665,6 +687,24 @@ napi_value CommitSurfaceDmabuf(napi_env env, napi_callback_info info) {
     return out;
 }
 
+// takeImportedSurfaces() -> Array<{ id, width, height }>
+// Surfaces that gained presentable content (first or later commit completed),
+// for both shm and dmabuf. JS uses this as a single map-on-first-content signal.
+napi_value TakeImportedSurfaces(napi_env env, napi_callback_info) {
+    napi_value arr; napi_create_array(env, &arr);
+    if (!g_addon.compositor) return arr;
+    std::vector<Compositor::ImportedSurface> imported;
+    g_addon.compositor->takeImportedSurfaces(imported);
+    for (size_t i = 0; i < imported.size(); ++i) {
+        napi_value obj; napi_create_object(env, &obj);
+        setU32(env, obj, "id", imported[i].id);
+        setU32(env, obj, "width", imported[i].width);
+        setU32(env, obj, "height", imported[i].height);
+        napi_set_element(env, arr, static_cast<uint32_t>(i), obj);
+    }
+    return arr;
+}
+
 // takeFreedBuffers() -> number[]  (dmabuf bufferIds whose GPU read completed)
 napi_value TakeFreedBuffers(napi_env env, napi_callback_info) {
     napi_value arr; napi_create_array(env, &arr);
@@ -731,27 +771,49 @@ napi_value SetStack(napi_env env, napi_callback_info info) {
     return undef;
 }
 
-// surfaceReadback(surfaceId) -> Buffer (width*height*4 BGRA) | null
-// Test hook: read the uploaded surface texture back to CPU. Relies on the
-// swapchain using a non-blocking present mode (Mailbox) so the GPU process's
+// surfaceReadback(surfaceId, cb) -> boolean
+// Test hook: ASYNCHRONOUSLY read the uploaded surface texture back to CPU. Kicks
+// off the copy + map and returns true if started (false if the surface is
+// unknown / has no texture). The callback `cb(px | null)` is invoked later on
+// this same Node thread when the map completes (driven by the wire pump), with a
+// Uint8Array of width*height*4 BGRA bytes on success or null on failure. The
+// swapchain uses a non-blocking present mode (Mailbox) so the GPU process's
 // command thread is not parked in a blocking Surface::GetCurrentTexture while
 // the buffer-map command waits behind it.
 napi_value SurfaceReadback(napi_env env, napi_callback_info info) {
-    size_t argc = 1; napi_value argv[1];
+    size_t argc = 2; napi_value argv[2];
     napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
-    if (argc < 1) return throwError(env, "surfaceReadback(surfaceId) requires a surfaceId");
+    if (argc < 2) return throwError(env, "surfaceReadback(surfaceId, cb) requires a surfaceId and callback");
     if (!g_addon.compositor) return throwError(env, "compositor not running");
     uint32_t surfaceId = 0; napi_get_value_uint32(env, argv[0], &surfaceId);
-    std::vector<uint8_t> px;
-    if (!g_addon.compositor->readbackSurface(surfaceId, px)) {
-        napi_value n; napi_get_null(env, &n);
-        return n;
-    }
-    napi_value ab; void* data;
-    napi_create_arraybuffer(env, px.size(), &data, &ab);
-    std::memcpy(data, px.data(), px.size());
-    napi_value out;
-    napi_create_typedarray(env, napi_uint8_array, px.size(), ab, 0, &out);
+
+    // Hold a ref to the JS callback; release it after it fires once.
+    napi_ref cbRef = nullptr;
+    napi_create_reference(env, argv[1], 1, &cbRef);
+
+    bool started = g_addon.compositor->readbackSurface(
+        surfaceId,
+        [env, cbRef](bool ok, std::vector<uint8_t>&& px) {
+            napi_handle_scope scope;
+            napi_open_handle_scope(env, &scope);
+            napi_value arg;
+            if (ok) {
+                napi_value ab; void* data;
+                napi_create_arraybuffer(env, px.size(), &data, &ab);
+                std::memcpy(data, px.data(), px.size());
+                napi_create_typedarray(env, napi_uint8_array, px.size(), ab, 0, &arg);
+            } else {
+                napi_get_null(env, &arg);
+            }
+            napi_value cb, undefined;
+            napi_get_reference_value(env, cbRef, &cb);
+            napi_get_undefined(env, &undefined);
+            napi_call_function(env, undefined, cb, 1, &arg, nullptr);
+            napi_delete_reference(env, cbRef);
+            napi_close_handle_scope(env, scope);
+        });
+    if (!started) napi_delete_reference(env, cbRef);
+    napi_value out; napi_get_boolean(env, started, &out);
     return out;
 }
 
@@ -831,6 +893,7 @@ napi_value Init(napi_env env, napi_value exports) {
     reg("shmBufferUnref", ShmBufferUnref);
     reg("commitSurfaceBuffer", CommitSurfaceBuffer);
     reg("commitSurfaceDmabuf", CommitSurfaceDmabuf);
+    reg("takeImportedSurfaces", TakeImportedSurfaces);
     reg("takeFreedBuffers", TakeFreedBuffers);
     reg("removeSurface", RemoveSurface);
     reg("setSurfaceLayout", SetSurfaceLayout);
