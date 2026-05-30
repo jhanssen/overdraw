@@ -120,3 +120,19 @@ target_include_directories(shm-test-client PRIVATE
     ${WAYLAND_CLIENT_INCLUDE_DIRS}
     ${CMAKE_SOURCE_DIR}/native/wayland/generated)
 target_link_libraries(shm-test-client PRIVATE ${WAYLAND_CLIENT_LIBRARIES})
+
+# ---- SCM_RIGHTS transport unit test (fd passing over the side channel) ----
+add_executable(scm-rights-test test/scm-rights-test.cpp)
+target_include_directories(scm-rights-test PRIVATE ${IPC_INCLUDE})
+target_link_libraries(scm-rights-test PRIVATE dawn::webgpu_dawn_wire)
+
+# ---- dmabuf test client (linux-dmabuf-v1 import + composite) ----
+add_executable(dmabuf-test-client
+    test/dmabuf-test-client.c
+    native/wayland/generated/xdg-shell-protocol.c
+    native/wayland/generated/linux-dmabuf-v1-protocol.c)
+target_include_directories(dmabuf-test-client PRIVATE
+    ${WAYLAND_CLIENT_INCLUDE_DIRS}
+    ${GBM_INCLUDE_DIRS}
+    ${CMAKE_SOURCE_DIR}/native/wayland/generated)
+target_link_libraries(dmabuf-test-client PRIVATE ${WAYLAND_CLIENT_LIBRARIES} ${GBM_LIBRARIES})

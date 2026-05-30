@@ -9,6 +9,8 @@
 #include <node_api.h>
 #include <uv.h>
 
+#include <unistd.h>
+
 #include <cstring>
 #include <memory>
 #include <vector>
@@ -422,6 +424,36 @@ napi_value CommitSurfaceBuffer(napi_env env, napi_callback_info info) {
     return out;
 }
 
+// commitSurfaceDmabuf(surfaceId, fdHandle, width, height, drmFourcc,
+//                     modifierHi, modifierLo, offset, stride) -> boolean
+// Take the client dmabuf fd (opaque trampoline handle) and import it as a
+// sampled texture for the surface. Returns false if the import is rejected.
+napi_value CommitSurfaceDmabuf(napi_env env, napi_callback_info info) {
+    size_t argc = 9; napi_value argv[9];
+    napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+    if (argc < 9) return throwError(env,
+        "commitSurfaceDmabuf(surfaceId, fdHandle, w, h, fourcc, modHi, modLo, offset, stride)");
+    if (!g_addon.compositor) return throwError(env, "compositor not running");
+    if (!g_addon.trampoline) return throwError(env, "no trampoline");
+    uint32_t surfaceId = 0, fdHandle = 0, w = 0, h = 0, fourcc = 0, modHi = 0, modLo = 0, offset = 0, stride = 0;
+    napi_get_value_uint32(env, argv[0], &surfaceId);
+    napi_get_value_uint32(env, argv[1], &fdHandle);
+    napi_get_value_uint32(env, argv[2], &w);
+    napi_get_value_uint32(env, argv[3], &h);
+    napi_get_value_uint32(env, argv[4], &fourcc);
+    napi_get_value_uint32(env, argv[5], &modHi);
+    napi_get_value_uint32(env, argv[6], &modLo);
+    napi_get_value_uint32(env, argv[7], &offset);
+    napi_get_value_uint32(env, argv[8], &stride);
+    int fd = g_addon.trampoline->takeFd(fdHandle);  // ownership transfers; closed below
+    if (fd < 0) { napi_value out; napi_get_boolean(env, false, &out); return out; }
+    uint64_t modifier = (static_cast<uint64_t>(modHi) << 32) | modLo;
+    bool ok = g_addon.compositor->commitSurfaceDmabuf(surfaceId, fd, w, h, fourcc, modifier, offset, stride);
+    ::close(fd);  // GPU process dup'd it over SCM_RIGHTS; close our copy
+    napi_value out; napi_get_boolean(env, ok, &out);
+    return out;
+}
+
 // removeSurface(surfaceId) -> undefined
 napi_value RemoveSurface(napi_env env, napi_callback_info info) {
     size_t argc = 1; napi_value argv[1];
@@ -484,6 +516,7 @@ napi_value Init(napi_env env, napi_value exports) {
     reg("shmResizePool", ShmResizePool);
     reg("shmDestroyPool", ShmDestroyPool);
     reg("commitSurfaceBuffer", CommitSurfaceBuffer);
+    reg("commitSurfaceDmabuf", CommitSurfaceDmabuf);
     reg("removeSurface", RemoveSurface);
     reg("surfaceReadback", SurfaceReadback);
 

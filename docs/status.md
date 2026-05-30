@@ -4,7 +4,7 @@ Tracks what is built and empirically proven versus what is still design only.
 The design itself lives in `architecture.md`; this file is the ground truth for
 "what exists right now."
 
-Last updated: 2026-05-29 (rev 5).
+Last updated: 2026-05-29 (rev 6).
 
 ## Verification environment
 
@@ -47,7 +47,8 @@ server) topology runs as real, non-spike code and presents to a host window:
   frames); a side channel over a `SOCK_SEQPACKET` socket carrying fixed-size
   tagged POD control messages (`side_channel.h`) — not yet flatbuffers. (The
   side channel was STREAM originally; switched to SEQPACKET once control traffic
-  grew, to preserve message boundaries. SCM_RIGHTS fd passing is not yet used.)
+  grew, to preserve message boundaries. SCM_RIGHTS fd passing IS now used — the
+  `ImportClientTex` message carries a client dmabuf fd this way.)
 - Clean lifecycle: runs until `stop()`, then ordered shutdown; GPU process
   exits cleanly and is reaped (poll then SIGTERM fallback so it cannot orphan).
 
@@ -118,9 +119,46 @@ the screen, verified by GPU readback:
 - `WriteTexture` over the wire serializes pixels through the socket (no
   `MemoryTransferService` configured) — functional, per-upload copy cost
   unmeasured. Throughput is not yet a concern at this stage.
-- Still absent: dmabuf client buffers (`linux-dmabuf-v1`), multi-surface
-  placement, damage-driven partial upload, format conversion beyond
-  ARGB/XRGB8888.
+- Still absent: multi-surface placement, damage-driven partial upload, format
+  conversion beyond ARGB/XRGB8888.
+
+### Client dmabuf buffers end-to-end (`linux-dmabuf-v1`, pixel-verified)
+A real client can now pass its **own** dmabuf (zero-copy GPU buffer) and have it
+imported + composited — the two items previously flagged unverified (SCM_RIGHTS
+fd passing; importing a client-chosen modifier we did not allocate) are now
+proven on the RTX 5060:
+
+- **SCM_RIGHTS fd passing** over the side channel: new `sendMessageFds`/
+  `recvMessageNBFds` in `native/ipc/transport.h` attach/parse fds via `cmsg`/
+  `SCM_RIGHTS`. Unit-verified standalone (`test/scm-rights-test.cpp`: an fd sent
+  over a SEQPACKET pair arrives as a distinct dup'd fd reading the same file).
+- JS handlers `src/protocols/zwp_linux_dmabuf_v1.js` + `zwp_linux_buffer_params_v1.js`:
+  advertise ARGB8888/XRGB8888 with LINEAR+INVALID modifiers on bind; `add`
+  records the plane (fd handle + offset/stride/modifier); `create_immed` builds a
+  dmabuf-tagged buffer descriptor. `wl_surface.commit` branches dmabuf vs shm and
+  does NOT release the dmabuf buffer (zero-copy; sampled directly).
+- New side-channel `ImportClientTex` (core→gpu) carries the client dmabuf params
+  + the fd via SCM_RIGHTS. The GPU process builds a `DmabufBuffer` (no GBM bo),
+  reuses `Allocator::importTexture` (it never assumed GBM origin) to import the
+  client fd as `SharedTextureMemory`, does a `BeginAccess` (initialized) so it is
+  sampleable, and `InjectTexture`s at the core's reserved handle. Per-surface STM
+  + texture + fd kept in a keyed map for lifetime.
+- Core `Compositor::commitSurfaceDmabuf`: `ReserveTexture`, send `ImportClientTex`
+  with the fd, await `ClientTexImported`, wrap the injected handle as a
+  `wgpu::Texture`, build the per-surface bind group — plugging into the same
+  `clientSurfaces_` compositing/readback path as shm.
+- Verified end-to-end (`test/dmabuf-test-client.c` + `test/dmabuf-upload-smoke.mjs`,
+  needs GPU + host Wayland): client GBM-allocates a LINEAR ARGB8888 buffer filled
+  solid red, sends it via `create_immed`, maps an `xdg_toplevel`, commits; the
+  compositor imports the client dmabuf, composites, presents. GPU readback
+  confirms pixel-exact red (BGRA `[0,0,255,255]`). **PASS.**
+- Limitations: single plane only; `create` (async, server-minted wl_buffer) is
+  NOT supported — the trampoline can't mint a server-side new_id for an event, so
+  only `create_immed` (client supplies the buffer id) works; no per-frame
+  re-import optimization / fence-synced release; the held BeginAccess is never
+  ended until teardown (fine single-device, revisit for multi-device); no
+  modifier *negotiation* beyond advertising a static set (import may reject an
+  unadvertised client modifier, surfacing as a failed commit).
 
 ### dmabuf interop path (single device, validated end-to-end)
 The plugin/surface buffer path from the design is proven as real, non-spike code
@@ -261,12 +299,9 @@ path).
 
 ## Not yet built (design only)
 
-- **dmabuf client buffers (`linux-dmabuf-v1`).** A real app can now map a window
-  with **shm** content end-to-end (see "Client shm buffers end-to-end"), but the
-  `linux-dmabuf-v1` path — a client passing its own dmabuf fd + modifier for
-  zero-copy GPU buffers — is unwritten. The server-side import primitive is
-  proven, but importing a *client-chosen* modifier we did not allocate is not yet
-  exercised, and there is no client-buffer dmabuf handler. No live reload yet.
+- **Live reload, WM / policy.** A real app can now map a window with both shm
+  and dmabuf content end-to-end (see the two "end-to-end" sections above). Still
+  missing: live handler reload; window management, focus, layout.
 - **WM / policy in JS.** Window management, focus, layout — none built.
 - **JS-owned core breadth.** The core is C++ + Node with a working trampoline
   and a frame event callback, but the protocol-handler/WM/plugin layers that

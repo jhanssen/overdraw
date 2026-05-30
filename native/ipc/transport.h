@@ -107,6 +107,61 @@ inline bool recvMessageNB(int fd, Message& msg) {
     return ::recvmsg(fd, &mh, MSG_DONTWAIT) == static_cast<ssize_t>(sizeof(Message));
 }
 
+// Max fds attachable to one side-channel message (single-plane dmabuf needs 1;
+// allow a few for multi-plane later).
+constexpr int kMaxMsgFds = 4;
+
+// Send a message with `nfds` file descriptors attached via SCM_RIGHTS (blocking).
+// The receiver gets dup'd copies; the sender keeps ownership of its fds.
+inline bool sendMessageFds(int fd, const Message& msg, const int* fds, int nfds) {
+    if (nfds < 0 || nfds > kMaxMsgFds) return false;
+    iovec iov{const_cast<Message*>(&msg), sizeof(Message)};
+    msghdr mh{};
+    mh.msg_iov = &iov;
+    mh.msg_iovlen = 1;
+
+    char ctrl[CMSG_SPACE(sizeof(int) * kMaxMsgFds)];
+    if (nfds > 0) {
+        std::memset(ctrl, 0, sizeof(ctrl));
+        mh.msg_control = ctrl;
+        mh.msg_controllen = CMSG_SPACE(sizeof(int) * nfds);
+        cmsghdr* cm = CMSG_FIRSTHDR(&mh);
+        cm->cmsg_level = SOL_SOCKET;
+        cm->cmsg_type = SCM_RIGHTS;
+        cm->cmsg_len = CMSG_LEN(sizeof(int) * nfds);
+        std::memcpy(CMSG_DATA(cm), fds, sizeof(int) * nfds);
+        mh.msg_controllen = cm->cmsg_len;
+    }
+    return ::sendmsg(fd, &mh, 0) == static_cast<ssize_t>(sizeof(Message));
+}
+
+// Non-blocking receive of one message plus any attached fds. On success fills
+// `msg`, writes received fds into `fds` (caller owns/closes them) and sets
+// `*nfdsOut`. Returns true if a message was read.
+inline bool recvMessageNBFds(int fd, Message& msg, int* fds, int* nfdsOut) {
+    *nfdsOut = 0;
+    iovec iov{&msg, sizeof(Message)};
+    msghdr mh{};
+    mh.msg_iov = &iov;
+    mh.msg_iovlen = 1;
+    char ctrl[CMSG_SPACE(sizeof(int) * kMaxMsgFds)];
+    mh.msg_control = ctrl;
+    mh.msg_controllen = sizeof(ctrl);
+
+    ssize_t r = ::recvmsg(fd, &mh, MSG_DONTWAIT);
+    if (r != static_cast<ssize_t>(sizeof(Message))) return false;
+
+    for (cmsghdr* cm = CMSG_FIRSTHDR(&mh); cm; cm = CMSG_NXTHDR(&mh, cm)) {
+        if (cm->cmsg_level == SOL_SOCKET && cm->cmsg_type == SCM_RIGHTS) {
+            int n = static_cast<int>((cm->cmsg_len - CMSG_LEN(0)) / sizeof(int));
+            if (n > kMaxMsgFds) n = kMaxMsgFds;
+            std::memcpy(fds, CMSG_DATA(cm), sizeof(int) * n);
+            *nfdsOut = n;
+        }
+    }
+    return true;
+}
+
 }  // namespace overdraw::ipc
 
 #endif  // OVERDRAW_IPC_TRANSPORT_H_

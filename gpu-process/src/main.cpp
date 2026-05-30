@@ -8,6 +8,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <unordered_map>
 #include <vector>
 
 #include <execinfo.h>
@@ -240,6 +241,16 @@ int run(int wireFd, int ctrlFd) {
     wgpu::SharedTextureMemory dmaMem;
     wgpu::Texture dmaTex;
 
+    // Client dmabuf imports (linux-dmabuf-v1). Keyed by the reserved texture
+    // handle id. Each holds the imported STM + texture + the owning dmabuf fd;
+    // a read-access bracket is begun at import so compositing can sample it.
+    struct ClientTex {
+        wgpu::SharedTextureMemory mem;
+        wgpu::Texture tex;
+        int fd = -1;
+    };
+    std::unordered_map<uint32_t, ClientTex> clientTextures;
+
     // 9) Service Dawn + the host window until the core requests shutdown or the
     //    host window is closed. The core drives the swapchain over the wire.
     bool shutdown = false;
@@ -247,7 +258,9 @@ int run(int wireFd, int ctrlFd) {
         pumpWireN(8);  // bounded so the side channel below is not starved
         window.pump();
         ipc::Message m{};
-        if (ipc::recvMessageNB(ctrlFd, m)) {
+        int recvFds[ipc::kMaxMsgFds];
+        int nRecvFds = 0;
+        if (ipc::recvMessageNBFds(ctrlFd, m, recvFds, &nRecvFds)) {
             if (m.tag == ipc::Tag::Shutdown) {
                 shutdown = true;
             } else if (m.tag == ipc::Tag::BeginAccess) {
@@ -332,6 +345,67 @@ int run(int wireFd, int ctrlFd) {
                 reply.texture = m.texture;
                 reply.modifier = dmaBuf.modifier;
                 ipc::sendMessage(ctrlFd, reply);
+            } else if (m.tag == ipc::Tag::ImportClientTex) {
+                // Import a CLIENT-provided dmabuf (fd via SCM_RIGHTS) into a
+                // texture on the core device and inject it at the client's
+                // reserved handle. Unlike ReserveTex we do not allocate; the
+                // client chose the modifier/stride/offset, so import may fail if
+                // the driver rejects that layout.
+                ipc::Message reply{};
+                reply.tag = ipc::Tag::ClientTexImported;
+                reply.texture = m.texture;
+                reply.importOk = 0;
+
+                if (nRecvFds < 1) {
+                    std::fprintf(stderr, "[gpu] ImportClientTex: no fd received\n");
+                    ipc::sendMessage(ctrlFd, reply);
+                } else {
+                    gpu::DmabufBuffer cb{};
+                    cb.fd = recvFds[0];  // we own this dup'd fd now
+                    cb.modifier = m.modifier;
+                    cb.stride = m.planeStride;
+                    cb.offset = m.planeOffset;
+                    cb.width = m.width;
+                    cb.height = m.height;
+                    cb.bo = nullptr;  // not GBM-allocated
+
+                    ClientTex ct{};
+                    bool ok = gpu::Allocator::importTexture(coreDevice, m.drmFourcc,
+                                                            cb, ct.mem, ct.tex);
+                    if (ok) {
+                        // The client already rendered into the dmabuf; begin a
+                        // read access (initialized) so compositing can sample it.
+                        wgpu::SharedTextureMemoryVkImageLayoutBeginState layout{};
+                        layout.oldLayout = 0;  // UNDEFINED -> driver treats as not-yet-known
+                        layout.newLayout = 1;  // GENERAL
+                        wgpu::SharedTextureMemoryBeginAccessDescriptor bad{};
+                        bad.nextInChain = &layout;
+                        bad.initialized = true;
+                        bad.fenceCount = 0;
+                        if (ct.mem.BeginAccess(ct.tex, &bad) != wgpu::Status::Success) {
+                            std::fprintf(stderr, "[gpu] ImportClientTex: BeginAccess failed\n");
+                            ok = false;
+                        }
+                    }
+                    if (ok && !server.InjectTexture(ct.tex.Get(),
+                                                    {m.texture.id, m.texture.generation},
+                                                    {m.device.id, m.device.generation})) {
+                        std::fprintf(stderr, "[gpu] ImportClientTex: InjectTexture failed\n");
+                        ok = false;
+                    }
+                    if (ok) {
+                        serializer.Flush();
+                        ct.fd = cb.fd;
+                        clientTextures[m.texture.id] = std::move(ct);
+                        reply.importOk = 1;
+                        std::printf("[gpu] imported client dmabuf at tex {%u,%u} fourcc=%u mod=%llu\n",
+                                    m.texture.id, m.texture.generation, m.drmFourcc,
+                                    static_cast<unsigned long long>(m.modifier));
+                    } else {
+                        ::close(cb.fd);  // import failed; drop our fd
+                    }
+                    ipc::sendMessage(ctrlFd, reply);
+                }
             }
         }
         // Detect core closing the wire socket.
@@ -339,6 +413,12 @@ int run(int wireFd, int ctrlFd) {
         if (::recv(wireFd, &probe, 4, MSG_DONTWAIT | MSG_PEEK) == 0) shutdown = true;
         usleepShort();
     }
+    for (auto& [id, ct] : clientTextures) {
+        ct.tex = nullptr;
+        ct.mem = nullptr;
+        if (ct.fd >= 0) ::close(ct.fd);
+    }
+    clientTextures.clear();
     dmaTex = nullptr;
     dmaMem = nullptr;
     alloc.release(dmaBuf);

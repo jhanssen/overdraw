@@ -24,6 +24,9 @@ enum class Tag : uint8_t {
     SurfaceReady = 'C',  // gpu  -> core: surface injected + caps + size
     ReserveTex   = 'R',  // core -> gpu : reserved texture+device handle + size/format
     TexInjected  = 't',  // gpu  -> core: dmabuf imported + texture injected (+ modifier)
+    ImportClientTex = 'M',  // core -> gpu : import a CLIENT dmabuf fd (SCM_RIGHTS) into
+                            //              a texture at the reserved handle
+    ClientTexImported = 'm',  // gpu -> core: client dmabuf imported + injected (or failed)
     BeginAccess  = 'B',  // core -> gpu : begin access on the STM (before wire render)
     BeginDone    = 'b',  // gpu  -> core: BeginAccess applied + flushed
     EndAccess    = 'E',  // core -> gpu : end access on the STM (after wire render)
@@ -62,6 +65,14 @@ struct Message {
     int32_t  endLayout = 0;    // EndDone: Vulkan image layout the texture ended in
 
     uint32_t protocolVersion = 0;  // Hello/HelloReply
+
+    // ImportClientTex: client-supplied dmabuf parameters (single plane v1). The
+    // dmabuf fd rides as SCM_RIGHTS ancillary data on the same sendmsg.
+    uint32_t drmFourcc = 0;    // DRM fourcc (e.g. ARGB8888) the client declared
+    uint32_t planeOffset = 0;  // plane 0 byte offset within the dmabuf
+    uint32_t planeStride = 0;  // plane 0 row stride
+    uint32_t planeCount = 0;   // number of planes (1 supported today)
+    uint32_t importOk = 0;     // ClientTexImported: 1 = injected, 0 = import failed
 };
 
 constexpr uint32_t kProtocolVersion = 1;

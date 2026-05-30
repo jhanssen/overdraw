@@ -52,6 +52,17 @@ class Compositor {
     void commitSurfaceShm(uint32_t id, uint32_t width, uint32_t height,
                           uint32_t stride, const uint8_t* pixels);
 
+    // Import a client-provided dmabuf (linux-dmabuf-v1) as a sampled texture and
+    // mark the surface for compositing. The dmabuf `fd` is owned by the caller
+    // and dup'd as needed (passed to the GPU process via SCM_RIGHTS). `drmFourcc`
+    // is the client's declared DRM fourcc; `modifier` the client's modifier.
+    // Returns false if the reserve/import/inject round-trip fails (e.g. the
+    // driver rejects the client's modifier). Blocking (one side-channel
+    // round-trip + wire pump).
+    bool commitSurfaceDmabuf(uint32_t id, int fd, uint32_t width, uint32_t height,
+                             uint32_t drmFourcc, uint64_t modifier,
+                             uint32_t offset, uint32_t stride);
+
     // Stop compositing a surface and release its texture.
     void removeSurface(uint32_t id);
 

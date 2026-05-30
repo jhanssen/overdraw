@@ -34,7 +34,15 @@ export default function makeSurface(ctx) {
       const buffer = s.committed.buffer;
       if (buffer && !buffer.destroyed) {
         const desc = ctx.state.buffers?.get(buffer);
-        if (desc && desc.poolId) {
+        if (desc && desc.dmabuf) {
+          // dmabuf: hand the client's fd to native for zero-copy import. The
+          // buffer is NOT released immediately -- the compositor samples it
+          // directly, so it stays in use until the surface is replaced.
+          const ok = ctx.addon.commitSurfaceDmabuf(
+            s.id, desc.fdHandle, desc.width, desc.height, desc.format,
+            desc.modifierHi, desc.modifierLo, desc.offset, desc.stride);
+          if (ok) ctx.state.lastCommittedSurfaceId = s.id;
+        } else if (desc && desc.poolId) {
           const ok = ctx.addon.commitSurfaceBuffer(
             s.id, desc.poolId, desc.offset, desc.width, desc.height, desc.stride);
           if (ok) {

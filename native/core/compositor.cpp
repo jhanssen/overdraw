@@ -234,6 +234,75 @@ void Compositor::commitSurfaceShm(uint32_t id, uint32_t width, uint32_t height,
     link_->flush();
 }
 
+bool Compositor::commitSurfaceDmabuf(uint32_t id, int fd, uint32_t width, uint32_t height,
+                                     uint32_t drmFourcc, uint64_t modifier,
+                                     uint32_t offset, uint32_t stride) {
+    if (!device_ || width == 0 || height == 0 || fd < 0) return false;
+
+    // Reserve a texture handle on the wire; the GPU process imports the client
+    // dmabuf and injects the native texture at this handle.
+    wgpu::TextureDescriptor td{};
+    td.size = {width, height, 1};
+    td.format = wgpu::TextureFormat::BGRA8Unorm;
+    td.usage = wgpu::TextureUsage::TextureBinding | wgpu::TextureUsage::CopySrc;
+    auto rt = link_->client().ReserveTexture(
+        device_.Get(), reinterpret_cast<const WGPUTextureDescriptor*>(&td));
+
+    ipc::Message m{};
+    m.tag = ipc::Tag::ImportClientTex;
+    m.device = {rt.deviceHandle.id, rt.deviceHandle.generation};
+    m.texture = {rt.handle.id, rt.handle.generation};
+    m.width = width;
+    m.height = height;
+    m.drmFourcc = drmFourcc;
+    m.modifier = modifier;
+    m.planeOffset = offset;
+    m.planeStride = stride;
+    m.planeCount = 1;
+    int fds[1] = {fd};
+    if (!ipc::sendMessageFds(ctrlFd_, m, fds, 1)) {
+        link_->client().ReclaimTextureReservation(rt);
+        return false;
+    }
+
+    // Await the import result, pumping the wire (the inject happens server-side
+    // over the wire and must be processed by the client).
+    ipc::Message reply{};
+    bool got = link_->pumpUntilTimeout(
+        [&] {
+            ipc::Message r{};
+            if (ipc::recvMessageNB(ctrlFd_, r) && r.tag == ipc::Tag::ClientTexImported) {
+                reply = r;
+                return true;
+            }
+            return false;
+        },
+        3000);
+    if (!got || !reply.importOk) {
+        link_->client().ReclaimTextureReservation(rt);
+        return false;
+    }
+
+    ClientSurface& cs = clientSurfaces_[id];
+    cs.texture = wgpu::Texture::Acquire(rt.texture);
+    cs.width = width;
+    cs.height = height;
+
+    wgpu::BindGroupEntry entries[2]{};
+    entries[0].binding = 0;
+    entries[0].sampler = sampler_;
+    entries[1].binding = 1;
+    entries[1].textureView = cs.texture.CreateView();
+    wgpu::BindGroupDescriptor bgd{};
+    bgd.layout = pipeline_.GetBindGroupLayout(0);
+    bgd.entryCount = 2;
+    bgd.entries = entries;
+    cs.bindGroup = device_.CreateBindGroup(&bgd);
+    cs.present = true;
+    link_->flush();
+    return true;
+}
+
 void Compositor::removeSurface(uint32_t id) {
     clientSurfaces_.erase(id);
 }
