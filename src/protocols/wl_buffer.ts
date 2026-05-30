@@ -8,6 +8,10 @@ import type { Ctx } from "./ctx.js";
 export default function makeBuffer(ctx: Ctx): WlBufferHandler {
   return {
     destroy(resource) {
+      const desc = ctx.state.buffers?.get(resource);
+      // Release this buffer's hold on its shm pool mapping (may free a pool that
+      // was already wl_shm_pool.destroy'd).
+      if (desc?.poolId) ctx.addon.shmBufferUnref(desc.poolId);
       ctx.state.buffers?.delete(resource);
     },
   };

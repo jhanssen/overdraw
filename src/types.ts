@@ -59,6 +59,10 @@ export interface Addon {
   shmCreatePool(fd: WaylandFd, size: number): number;
   shmResizePool(poolId: number, size: number): void;
   shmDestroyPool(poolId: number): void;
+  // Buffer lifetime: a wl_buffer keeps its pool's mapping alive past
+  // wl_shm_pool.destroy (Wayland spec).
+  shmBufferRef(poolId: number): void;
+  shmBufferUnref(poolId: number): void;
 
   [key: string]: unknown; // tolerate methods not yet declared here
 }

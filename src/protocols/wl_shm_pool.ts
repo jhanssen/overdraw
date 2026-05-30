@@ -12,13 +12,17 @@ export default function makeShmPool(ctx: Ctx): WlShmPoolHandler {
   return {
     create_buffer(resource, buffer, offset, width, height, stride, format) {
       const pool = poolRec(resource);
+      const poolId = pool ? pool.poolId : 0;
       ctx.state.buffers ??= new Map();
       ctx.state.buffers.set(buffer, {
         resource: buffer,
         poolResource: resource,
-        poolId: pool ? pool.poolId : 0,
+        poolId,
         offset, width, height, stride, format,
       });
+      // Keep the pool mapping alive for this buffer's lifetime (spec: buffers
+      // outlive wl_shm_pool.destroy).
+      if (poolId) ctx.addon.shmBufferRef(poolId);
     },
     resize(resource, size) {
       const pool = poolRec(resource);

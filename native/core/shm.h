@@ -26,21 +26,36 @@ class ShmRegistry {
     // ever grows). Returns false if the pool is unknown or remap fails.
     bool resizePool(uint32_t poolId, size_t newSize);
 
-    // Destroy a pool: unmap and close its fd. No-op for unknown ids.
+    // Mark a pool destroyed (wl_shm_pool.destroy). Per the Wayland spec, buffers
+    // created from the pool remain valid after the pool is destroyed, so the
+    // mapping is freed only once destroyed AND no buffers still reference it.
     void destroyPool(uint32_t poolId);
+
+    // Buffer lifetime refcounting: a wl_buffer carved from a pool keeps the
+    // mapping alive. create_buffer -> addRef; wl_buffer.destroy -> releaseRef.
+    void addBufferRef(uint32_t poolId);
+    void releaseBufferRef(uint32_t poolId);
 
     // Resolve a byte region within a pool. Returns nullptr if the pool is
     // unknown or [offset, offset+len) is out of range.
     const uint8_t* view(uint32_t poolId, size_t offset, size_t len) const;
+
+    // Mapped size of a pool, or 0 if unknown. (Debug/diagnostics.)
+    size_t poolSize(uint32_t poolId) const;
 
   private:
     struct Pool {
         int fd = -1;
         void* base = nullptr;
         size_t size = 0;
+        bool destroyed = false;  // wl_shm_pool.destroy seen
+        uint32_t bufferRefs = 0; // live wl_buffers carved from this pool
     };
     std::unordered_map<uint32_t, Pool> pools_;
     uint32_t nextId_ = 1;
+
+    // Unmap + close + erase a pool. Called when destroyed && bufferRefs == 0.
+    void freePool(uint32_t poolId);
 };
 
 }  // namespace overdraw::core

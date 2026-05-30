@@ -574,6 +574,25 @@ napi_value ShmDestroyPool(napi_env env, napi_callback_info info) {
     return undef;
 }
 
+// shmBufferRef(poolId) / shmBufferUnref(poolId): a wl_buffer carved from a pool
+// keeps its mapping alive past wl_shm_pool.destroy (per the Wayland spec).
+napi_value ShmBufferRef(napi_env env, napi_callback_info info) {
+    size_t argc = 1; napi_value argv[1];
+    napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+    uint32_t poolId = 0; if (argc >= 1) napi_get_value_uint32(env, argv[0], &poolId);
+    g_addon.shm.addBufferRef(poolId);
+    napi_value undef; napi_get_undefined(env, &undef);
+    return undef;
+}
+napi_value ShmBufferUnref(napi_env env, napi_callback_info info) {
+    size_t argc = 1; napi_value argv[1];
+    napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+    uint32_t poolId = 0; if (argc >= 1) napi_get_value_uint32(env, argv[0], &poolId);
+    g_addon.shm.releaseBufferRef(poolId);
+    napi_value undef; napi_get_undefined(env, &undef);
+    return undef;
+}
+
 // commitSurfaceBuffer(surfaceId, poolId, offset, width, height, stride) -> boolean
 // Resolve the pool region and upload it to the surface's GPU texture. Requires
 // the compositor to be running. Returns false if pool/region invalid.
@@ -723,6 +742,8 @@ napi_value Init(napi_env env, napi_value exports) {
     reg("shmCreatePool", ShmCreatePool);
     reg("shmResizePool", ShmResizePool);
     reg("shmDestroyPool", ShmDestroyPool);
+    reg("shmBufferRef", ShmBufferRef);
+    reg("shmBufferUnref", ShmBufferUnref);
     reg("commitSurfaceBuffer", CommitSurfaceBuffer);
     reg("commitSurfaceDmabuf", CommitSurfaceDmabuf);
     reg("removeSurface", RemoveSurface);
