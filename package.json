@@ -6,6 +6,8 @@
   "type": "module",
   "main": "src/index.js",
   "scripts": {
-    "start": "node src/index.js"
+    "start": "node src/index.js",
+    "gen-protocols": "node tools/gen-protocol/gen-protocol.js",
+    "test": "node --test 'test/**/*.test.js'"
   }
 }

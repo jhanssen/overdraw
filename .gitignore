@@ -8,6 +8,9 @@ build/
 # Node
 node_modules/
 
+# Generated protocol modules (reproduced from wayland XML by tools/gen-protocol)
+/src/protocols-gen/
+
 # Editor / OS
 *.swp
 *~
