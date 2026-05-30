@@ -39,12 +39,12 @@ export default function makeSurface(ctx: Ctx): WlSurfaceHandler {
       if (buffer && !buffer.destroyed) {
         const desc = ctx.state.buffers?.get(buffer);
         let uploaded = false;
-        if (desc && desc.dmabuf) {
-          // dmabuf: hand the client's fd to native for zero-copy import. The
-          // buffer is NOT released immediately -- the compositor samples it
-          // directly, so it stays in use until the surface is replaced.
+        if (desc && desc.dmabuf && desc.fd) {
+          // dmabuf: hand the client's fd (WaylandFd) to native for zero-copy
+          // import. The buffer is NOT released immediately -- the compositor
+          // samples it directly, so it stays in use until the surface is replaced.
           const ok = ctx.addon.commitSurfaceDmabuf(
-            s.id, desc.fdHandle ?? -1, desc.width, desc.height, desc.format,
+            s.id, desc.fd, desc.width, desc.height, desc.format,
             desc.modifierHi ?? 0, desc.modifierLo ?? 0, desc.offset, desc.stride);
           if (ok) { ctx.state.lastCommittedSurfaceId = s.id; uploaded = true; }
         } else if (desc && desc.poolId) {

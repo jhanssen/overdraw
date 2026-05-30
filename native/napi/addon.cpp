@@ -23,6 +23,7 @@
 #include "wayland/server.h"
 #include "wayland/interface_registry.h"
 #include "wayland/trampoline.h"
+#include "wayland/wayland_fd.h"
 
 using overdraw::core::Compositor;
 using overdraw::core::InputEvent;
@@ -485,42 +486,15 @@ napi_value ClientId(napi_env env, napi_callback_info info) {
     return out;
 }
 
-// fdTake(handle) -> rawFd (number)
-// Remove an fd handle from the trampoline table and return the raw fd, giving
-// ownership to the caller (who must close it). Returns -1 for unknown handles.
-napi_value FdTake(napi_env env, napi_callback_info info) {
-    size_t argc = 1; napi_value argv[1];
-    napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
-    if (argc < 1) return throwError(env, "fdTake(handle) requires a handle");
-    if (!g_addon.trampoline) return throwError(env, "no trampoline");
-    uint32_t handle = 0; napi_get_value_uint32(env, argv[0], &handle);
-    int fd = g_addon.trampoline->takeFd(handle);
-    napi_value out; napi_create_int32(env, fd, &out);
-    return out;
-}
-
-// fdClose(handle) -> boolean (true if a handle was closed)
-napi_value FdClose(napi_env env, napi_callback_info info) {
-    size_t argc = 1; napi_value argv[1];
-    napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
-    if (argc < 1) return throwError(env, "fdClose(handle) requires a handle");
-    if (!g_addon.trampoline) return throwError(env, "no trampoline");
-    uint32_t handle = 0; napi_get_value_uint32(env, argv[0], &handle);
-    bool ok = g_addon.trampoline->closeFd(handle);
-    napi_value out; napi_get_boolean(env, ok, &out);
-    return out;
-}
-
-// shmCreatePool(fdHandle, size) -> poolId (0 on failure)
-// Takes the trampoline fd handle (transferring fd ownership) and mmaps it.
+// shmCreatePool(fd, size) -> poolId (0 on failure)
+// `fd` is a WaylandFd; we take the raw fd out of it (transferring ownership) and
+// mmap it.
 napi_value ShmCreatePool(napi_env env, napi_callback_info info) {
     size_t argc = 2; napi_value argv[2];
     napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
-    if (argc < 2) return throwError(env, "shmCreatePool(fdHandle, size) requires two args");
-    if (!g_addon.trampoline) return throwError(env, "no trampoline");
-    uint32_t fdHandle = 0; napi_get_value_uint32(env, argv[0], &fdHandle);
+    if (argc < 2) return throwError(env, "shmCreatePool(fd, size) requires two args");
     uint32_t size = 0; napi_get_value_uint32(env, argv[1], &size);
-    int fd = g_addon.trampoline->takeFd(fdHandle);
+    int fd = overdraw::wayland::takeWaylandFd(env, argv[0]);
     uint32_t poolId = g_addon.shm.createPool(fd, size);  // closes fd on failure
     napi_value out; napi_create_uint32(env, poolId, &out);
     return out;
@@ -573,18 +547,16 @@ napi_value CommitSurfaceBuffer(napi_env env, napi_callback_info info) {
 
 // commitSurfaceDmabuf(surfaceId, fdHandle, width, height, drmFourcc,
 //                     modifierHi, modifierLo, offset, stride) -> boolean
-// Take the client dmabuf fd (opaque trampoline handle) and import it as a
-// sampled texture for the surface. Returns false if the import is rejected.
+// Take the client dmabuf fd (a WaylandFd) and import it as a sampled texture for
+// the surface. Returns false if the import is rejected.
 napi_value CommitSurfaceDmabuf(napi_env env, napi_callback_info info) {
     size_t argc = 9; napi_value argv[9];
     napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
     if (argc < 9) return throwError(env,
-        "commitSurfaceDmabuf(surfaceId, fdHandle, w, h, fourcc, modHi, modLo, offset, stride)");
+        "commitSurfaceDmabuf(surfaceId, fd, w, h, fourcc, modHi, modLo, offset, stride)");
     if (!g_addon.compositor) return throwError(env, "compositor not running");
-    if (!g_addon.trampoline) return throwError(env, "no trampoline");
-    uint32_t surfaceId = 0, fdHandle = 0, w = 0, h = 0, fourcc = 0, modHi = 0, modLo = 0, offset = 0, stride = 0;
+    uint32_t surfaceId = 0, w = 0, h = 0, fourcc = 0, modHi = 0, modLo = 0, offset = 0, stride = 0;
     napi_get_value_uint32(env, argv[0], &surfaceId);
-    napi_get_value_uint32(env, argv[1], &fdHandle);
     napi_get_value_uint32(env, argv[2], &w);
     napi_get_value_uint32(env, argv[3], &h);
     napi_get_value_uint32(env, argv[4], &fourcc);
@@ -592,7 +564,7 @@ napi_value CommitSurfaceDmabuf(napi_env env, napi_callback_info info) {
     napi_get_value_uint32(env, argv[6], &modLo);
     napi_get_value_uint32(env, argv[7], &offset);
     napi_get_value_uint32(env, argv[8], &stride);
-    int fd = g_addon.trampoline->takeFd(fdHandle);  // ownership transfers; closed below
+    int fd = overdraw::wayland::takeWaylandFd(env, argv[1]);  // ownership transfers; closed below
     if (fd < 0) { napi_value out; napi_get_boolean(env, false, &out); return out; }
     uint64_t modifier = (static_cast<uint64_t>(modHi) << 32) | modLo;
     bool ok = g_addon.compositor->commitSurfaceDmabuf(surfaceId, fd, w, h, fourcc, modifier, offset, stride);
@@ -690,9 +662,6 @@ napi_value Init(napi_env env, napi_value exports) {
     napi_create_function(env, "registerInterface", NAPI_AUTO_LENGTH, RegisterInterface, nullptr, &fnRegisterIface);
     napi_create_function(env, "createGlobal", NAPI_AUTO_LENGTH, CreateGlobal, nullptr, &fnCreateGlobal);
     napi_create_function(env, "postEvent", NAPI_AUTO_LENGTH, PostEvent, nullptr, &fnPostEvent);
-    napi_value fnFdTake, fnFdClose;
-    napi_create_function(env, "fdTake", NAPI_AUTO_LENGTH, FdTake, nullptr, &fnFdTake);
-    napi_create_function(env, "fdClose", NAPI_AUTO_LENGTH, FdClose, nullptr, &fnFdClose);
 
     // shm / client-surface bridge (the first server <-> compositor connection).
     auto reg = [&](const char* name, napi_callback fn) {
@@ -719,8 +688,6 @@ napi_value Init(napi_env env, napi_value exports) {
     napi_set_named_property(env, exports, "registerInterface", fnRegisterIface);
     napi_set_named_property(env, exports, "createGlobal", fnCreateGlobal);
     napi_set_named_property(env, exports, "postEvent", fnPostEvent);
-    napi_set_named_property(env, exports, "fdTake", fnFdTake);
-    napi_set_named_property(env, exports, "fdClose", fnFdClose);
     return exports;
 }
 

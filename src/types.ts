@@ -10,8 +10,8 @@
 // The trampoline resource wrapper. Single source of truth is the generated
 // wayland-types module (the protocol contracts use the same Resource/ResourceOf),
 // re-exported here so the handwritten layer has one import site.
-import type { Resource } from "#protocols-gen/wayland-types.js";
-export type { Resource, ResourceOf } from "#protocols-gen/wayland-types.js";
+import type { Resource, WaylandFd } from "#protocols-gen/wayland-types.js";
+export type { Resource, ResourceOf, WaylandFd } from "#protocols-gen/wayland-types.js";
 
 // Wayland event-sender args: wire scalars, a resource, an array buffer, or null.
 export type EventArg = number | string | Resource | Uint8Array | null;
@@ -39,7 +39,8 @@ export interface Addon {
   // Surface bridge / compositor.
   commitSurfaceBuffer(id: number, poolId: number, offset: number, w: number,
                       h: number, stride: number): boolean;
-  commitSurfaceDmabuf(id: number, fdHandle: number, w: number, h: number,
+  // The dmabuf fd is a WaylandFd; native takes the raw fd out of it.
+  commitSurfaceDmabuf(id: number, fd: WaylandFd, w: number, h: number,
                       fourcc: number, modHi: number, modLo: number,
                       offset: number, stride: number): boolean;
   removeSurface(id: number): void;
@@ -47,14 +48,10 @@ export interface Addon {
   setStack(ids: number[]): void;
   surfaceReadback(id: number): Uint8Array | null;
 
-  // shm pools.
-  shmCreatePool(fdHandle: number, size: number): number;
+  // shm pools. The pool fd is a WaylandFd; native takes the raw fd out of it.
+  shmCreatePool(fd: WaylandFd, size: number): number;
   shmResizePool(poolId: number, size: number): void;
   shmDestroyPool(poolId: number): void;
-
-  // fd handle table.
-  fdTake(handle: number): number;
-  fdClose(handle: number): void;
 
   [key: string]: unknown; // tolerate methods not yet declared here
 }

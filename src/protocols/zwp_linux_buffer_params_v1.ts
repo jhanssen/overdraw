@@ -3,14 +3,11 @@
 // trampoline handle; we stash it in the buffer descriptor for the commit path
 // to hand to the native import. Single plane supported.
 
+import type { ZwpLinuxBufferParamsV1Handler } from "#protocols-gen/zwp_linux_buffer_params_v1.js";
 import type { Ctx, DmabufParams, BufferDesc } from "./ctx.js";
 import type { Resource } from "../types.js";
 
-// NOTE: not annotated with the generated ZwpLinuxBufferParamsV1Handler. The
-// contract types `add`'s fd arg as WaylandFd, but the trampoline delivers the
-// dmabuf fd as an opaque integer handle (native-owned). Same fd-typing
-// reconciliation gap as wl_shm.create_pool; hand-typed until then.
-export default function makeBufferParams(ctx: Ctx) {
+export default function makeBufferParams(ctx: Ctx): ZwpLinuxBufferParamsV1Handler {
   const rec = (resource: Resource): DmabufParams | undefined =>
     ctx.state.dmabufParams?.get(resource);
 
@@ -22,7 +19,7 @@ export default function makeBufferParams(ctx: Ctx) {
     return {
       resource: buffer,
       dmabuf: true,
-      fdHandle: plane0?.fdHandle,
+      fd: plane0?.fd,
       offset: plane0?.offset ?? 0,
       stride: plane0?.stride ?? 0,
       modifierHi: plane0?.modifierHi ?? 0,
@@ -32,15 +29,12 @@ export default function makeBufferParams(ctx: Ctx) {
   }
 
   return {
-    add(
-      resource: Resource, fdHandle: number, planeIdx: number, offset: number,
-      stride: number, modifierHi: number, modifierLo: number,
-    ) {
+    add(resource, fd, planeIdx, offset, stride, modifierHi, modifierLo) {
       const p = rec(resource);
       if (!p) return;
-      p.planes[planeIdx] = { fdHandle, offset, stride, modifierHi, modifierLo };
+      p.planes[planeIdx] = { fd, offset, stride, modifierHi, modifierLo };
     },
-    create(resource: Resource, _width: number, _height: number, _format: number, _flags: number) {
+    create(resource, _width, _height, _format, _flags) {
       const p = rec(resource);
       if (!p || p.used || !p.planes[0]) {
         // Can't recover a usable buffer; report failure.
@@ -54,17 +48,14 @@ export default function makeBufferParams(ctx: Ctx) {
       // create_immed (client supplies the buffer id). Report failed here.
       ctx.events.zwp_linux_buffer_params_v1.send_failed(resource);
     },
-    create_immed(
-      resource: Resource, buffer: Resource, width: number, height: number,
-      format: number, _flags: number,
-    ) {
+    create_immed(resource, buffer, width, height, format, _flags) {
       const p = rec(resource);
       if (!p || p.used || !p.planes[0]) return;
       p.used = true;
       ctx.state.buffers ??= new Map();
       ctx.state.buffers.set(buffer, makeDescriptor(p, buffer, width, height, format));
     },
-    destroy(resource: Resource) {
+    destroy(resource) {
       ctx.state.dmabufParams?.delete(resource);
     },
   };

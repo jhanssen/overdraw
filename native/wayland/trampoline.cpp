@@ -9,6 +9,8 @@
 #include <wayland-server-core.h>
 #include <wayland-util.h>
 
+#include "wayland_fd.h"
+
 namespace overdraw::wayland {
 namespace {
 
@@ -35,9 +37,6 @@ Trampoline::Trampoline(napi_env env, wl_display* display, InterfaceRegistry* reg
 Trampoline::~Trampoline() {
     for (auto& [name, st] : interfaces_) {
         if (st->handler) napi_delete_reference(env_, st->handler);
-    }
-    for (auto& [handle, fd] : fds_) {
-        if (fd >= 0) ::close(fd);
     }
 }
 
@@ -127,28 +126,6 @@ napi_value Trampoline::wrapResource(wl_resource* resource, const std::string& if
     dl->resource = resource;
     wl_resource_add_destroy_listener(resource, &dl->listener);
     return obj;
-}
-
-uint32_t Trampoline::registerFd(int fd) {
-    uint32_t handle = nextFd_++;
-    fds_[handle] = fd;
-    return handle;
-}
-
-int Trampoline::takeFd(uint32_t handle) {
-    auto it = fds_.find(handle);
-    if (it == fds_.end()) return -1;
-    int fd = it->second;
-    fds_.erase(it);  // ownership transfers to caller; table no longer closes it
-    return fd;
-}
-
-bool Trampoline::closeFd(uint32_t handle) {
-    auto it = fds_.find(handle);
-    if (it == fds_.end()) return false;
-    if (it->second >= 0) ::close(it->second);
-    fds_.erase(it);
-    return true;
 }
 
 void Trampoline::forgetResource(wl_resource* resource) {
@@ -367,14 +344,12 @@ int Trampoline::onDispatch(const void* implData, void* target, uint32_t opcode,
             case 'h': {
                 // libwayland hands us the demarshalled fd for this dispatch.
                 // Its ownership across dispatch is version-dependent, so dup()
-                // immediately into our table -- correct whether libwayland keeps
-                // or closes the original. JS gets an opaque integer handle; the
-                // raw fd stays native-owned (it is handed to native import APIs,
-                // e.g. shm/dmabuf, not operated on in JS).
+                // immediately -- correct whether libwayland keeps or closes the
+                // original. JS gets a WaylandFd wrapper owning the dup; native
+                // consumers take the raw fd out of it (takeWaylandFd).
                 int rawFd = args[argIndex].h;
                 int dupFd = rawFd >= 0 ? ::dup(rawFd) : -1;
-                uint32_t handle = self->registerFd(dupFd);
-                napi_create_uint32(env, handle, &v);
+                v = makeWaylandFd(env, dupFd);
                 break;
             }
             default: napi_get_undefined(env, &v); break;

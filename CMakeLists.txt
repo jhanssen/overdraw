@@ -82,7 +82,8 @@ set_target_properties(overdraw_core PROPERTIES POSITION_INDEPENDENT_CODE ON)
 # ---- Core N-API addon (Node-hosted core) ----
 add_library(overdraw_native MODULE
     native/napi/addon.cpp
-    native/wayland/trampoline.cpp)
+    native/wayland/trampoline.cpp
+    native/wayland/wayland_fd.cpp)
 set_target_properties(overdraw_native PROPERTIES
     PREFIX "" SUFFIX ".node")
 target_compile_definitions(overdraw_native PRIVATE

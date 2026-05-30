@@ -1,7 +1,7 @@
 // End-to-end fd-passing test: register wl_shm with a handler that receives the
-// create_pool fd as an opaque handle, takes the raw fd, and reads it back to
-// confirm the client's marker bytes are present. Proves request fd-arg decode,
-// the dup-into-table, and fdTake ownership transfer.
+// create_pool fd as a WaylandFd, takes the raw fd via takeRawFd(), and reads it
+// back to confirm the client's marker bytes are present. Proves request fd-arg
+// decode + the WaylandFd wrapper's takeRawFd ownership transfer.
 
 import { createRequire } from 'node:module';
 import { fileURLToPath, pathToFileURL } from 'node:url';
@@ -31,12 +31,12 @@ let gotFd = false;
 let markerOk = false;
 
 addon.createGlobal('wl_shm', {
-  create_pool(_resource, _pool, fdHandle, size) {
-    gotFd = typeof fdHandle === 'number' && fdHandle > 0;
-    console.log(`[test] create_pool: fdHandle=${fdHandle} size=${size}`);
+  create_pool(_resource, _pool, fd, size) {
+    gotFd = !!fd && typeof fd.takeRawFd === 'function' && !fd.closed && fd.fd > 0;
+    console.log(`[test] create_pool: fd.fd=${fd && fd.fd} closed=${fd && fd.closed} size=${size}`);
     // Take ownership of the raw fd and read the marker the client wrote.
-    const raw = addon.fdTake(fdHandle);
-    console.log(`[test] fdTake -> raw fd ${raw}`);
+    const raw = fd.takeRawFd();
+    console.log(`[test] takeRawFd -> raw fd ${raw}; closed now=${fd.closed}`);
     if (raw >= 0) {
       try {
         const buf = Buffer.alloc(32);

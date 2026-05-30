@@ -7,7 +7,7 @@
 // fields are typed, with dynamic per-protocol maps allowed via the index
 // signature.
 
-import type { Addon, Resource, EventsByInterface } from "../types.js";
+import type { Addon, Resource, EventsByInterface, WaylandFd } from "../types.js";
 import type { Wm } from "../wm/index.js";
 
 export interface SurfaceRecord {
@@ -43,7 +43,7 @@ export interface BufferDesc {
   dmabuf?: boolean;
   poolId?: number;
   poolResource?: Resource;
-  fdHandle?: number;
+  fd?: WaylandFd; // dmabuf buffers: the client's plane-0 fd
   offset: number;
   stride: number;
   width: number;
@@ -73,7 +73,7 @@ export interface ToplevelRecord {
 
 export interface DmabufParams {
   planes: Array<{
-    fdHandle: number; offset: number; stride: number;
+    fd: WaylandFd; offset: number; stride: number;
     modifierHi: number; modifierLo: number;
   }>;
   used: boolean;
