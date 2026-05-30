@@ -16,6 +16,7 @@ import { dirname, join } from "node:path";
 
 import { createWm } from "../wm/index.js";
 import { queryState } from "../query.js";
+import { applySubsurfaces } from "../subsurfaces.js";
 import type { Addon, EventsByInterface, EventSenders } from "../types.js";
 import type { Ctx, CompositorState, FocusOptions } from "./ctx.js";
 
@@ -118,13 +119,18 @@ export async function installProtocols(
     // cannot be done inline in wl_surface.commit -- it is the single shared map
     // signal for both buffer paths. Carries the content size for hit-testing.
     const imported = addon.takeImportedSurfaces();
+    let mappedAny = false;
     for (const { id, width, height } of imported) {
       const s = state.surfacesById?.get(id);
       if (!s || s.mapped || s.role !== "xdg_toplevel") continue;
       s.mapped = true;
+      mappedAny = true;
       const rect = state.wm?.mapWindow(id, s, width, height);
       if (rect) state.seat?.focusWindow(id, s, rect);
     }
+    // A newly-mapped toplevel changes window rects, so re-lay-out subsurfaces
+    // (a child that committed before its parent mapped gets placed now).
+    if (mappedAny) applySubsurfaces(state, addon);
 
     const freed = addon.takeFreedBuffers();
     if (freed.length > 0) {

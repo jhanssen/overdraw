@@ -6,6 +6,7 @@
 import type { WlSurfaceHandler } from "#protocols-gen/wl_surface.js";
 import type { Ctx } from "./ctx.js";
 import type { Resource } from "../types.js";
+import { applySubsurfaces } from "../subsurfaces.js";
 
 // Assign a stable per-wl_buffer id used to track the dmabuf release lifecycle
 // across the JS<->native boundary. Native reports freed bufferIds (once its GPU
@@ -73,18 +74,21 @@ export default function makeSurface(ctx: Ctx): WlSurfaceHandler {
           const ok = ctx.addon.commitSurfaceDmabuf(
             s.id, desc.fd, desc.width, desc.height, desc.format,
             desc.modifierHi ?? 0, desc.modifierLo ?? 0, desc.offset, desc.stride, bufferId);
-          if (ok) ctx.state.lastCommittedSurfaceId = s.id;
+          if (ok) { ctx.state.lastCommittedSurfaceId = s.id; s.hasContent = true; }
         } else if (desc && desc.poolId) {
           const ok = ctx.addon.commitSurfaceBuffer(
             s.id, desc.poolId, desc.offset, desc.width, desc.height, desc.stride);
           if (ok) {
             ctx.state.lastCommittedSurfaceId = s.id;
+            s.hasContent = true;
             // shm: contents are copied at upload, so the buffer is free to reuse.
             ctx.events.wl_buffer.send_release(buffer);
           }
         }
-        // Mapping (first presentable content -> WM place + focus) happens for
-        // both paths in the imported-surface sweep, not here.
+        // Mapping of TOPLEVELS (first content -> WM place + focus) happens in the
+        // imported-surface sweep. A subsurface gaining content re-lays-out the
+        // subsurface tree now (its parent may already be mapped).
+        if (s.hasContent) applySubsurfaces(ctx.state, ctx.addon);
       }
 
       if (s.xdgSurface) s.xdgSurface.lastCommitSerial = ctx.state.nextSerial - 1;

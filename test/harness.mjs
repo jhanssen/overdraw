@@ -25,6 +25,9 @@ const addonPath = join(repoRoot, "build", "overdraw_native.node");
 const gpuBin = process.env.OVERDRAW_GPU_PROCESS ?? join(repoRoot, "build", "overdraw-gpu-process");
 const clientBin = join(repoRoot, "build", "harness-client");
 
+// Absolute path to a built binary in build/ (for spawnClient({ bin })).
+export const buildBin = (name) => join(repoRoot, "build", name);
+
 // True if the environment can run GPU + host-Wayland integration tests.
 export function canRunGpu() {
   return !!process.env.WAYLAND_DISPLAY;
@@ -85,20 +88,20 @@ export async function setupCompositor(opts = {}) {
 
   const clients = [];
 
-  // Spawn a harness-client. Resolves once the client prints its "mapped" line
-  // (so the surface exists on the wire); the caller then waitFor()s the window
-  // to appear in query() (map happens on the server's next commit processing).
-  // The returned handle accumulates the client's stdout and offers waitForLine()
-  // so tests can assert what the client RECEIVED (frame.done, kb.key, output.*).
-  function spawnClient(args = []) {
-    const child = spawn(clientBin, ["--socket", sock, ...args], { stdio: ["ignore", "pipe", "pipe"] });
+  // Spawn a client binary. Resolves once it prints its "mapped" line (so the
+  // surface exists on the wire); the caller then waitFor()s the window to appear
+  // in query(). The returned handle accumulates stdout + offers waitForLine().
+  // Defaults to the standard harness-client; pass { bin, readyMarker } to run
+  // another client (e.g. subsurface-test-client).
+  function spawnClient(args = [], { bin = clientBin, readyMarker = "] mapped" } = {}) {
+    const child = spawn(bin, ["--socket", sock, ...args], { stdio: ["ignore", "pipe", "pipe"] });
     clients.push(child);
     const handle = { child, stdout: "", ready: null };
     handle.ready = new Promise((resolve, reject) => {
       const to = setTimeout(() => reject(new Error("client did not map in time")), 5000);
       child.stdout.on("data", (d) => {
         handle.stdout += d.toString();
-        if (handle.stdout.includes("[harness-client] mapped")) { clearTimeout(to); resolve(child); }
+        if (handle.stdout.includes(readyMarker)) { clearTimeout(to); resolve(child); }
       });
       child.on("exit", (code) => { clearTimeout(to); if (code) reject(new Error(`client exited ${code}`)); });
     });

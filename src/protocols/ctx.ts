@@ -18,6 +18,7 @@ export interface SurfaceRecord {
   committed: { buffer: Resource | null };
   xdgSurface: XdgSurfaceRecord | null;
   mapped?: boolean;
+  hasContent?: boolean;  // a buffer has been committed + uploaded at least once
   frameCallbacks?: Resource[];
   [key: string]: unknown;
 }

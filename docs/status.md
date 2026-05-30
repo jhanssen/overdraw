@@ -274,9 +274,11 @@ prints `WAYLAND_DISPLAY`, and runs until SIGINT.
   translucency — the proper linear-compositing pipeline is future work).
 - Verified: `foot` renders its prompt, types interactively (keyboard routed,
   confirmed by running a command), colors match a real compositor. **PASS.**
-- LIMITATIONS hit by `foot`, flagged: **subsurfaces are not composited** (only
-  the primary surface draws), so `foot`'s CSD borders/title and overlays
-  (search box) do not appear; **clipboard is a no-op** (`wl_data_device_manager`
+- LIMITATIONS hit by `foot`, flagged: subsurfaces ARE composited now (see
+  "Subsurface compositing" below), but **sync-mode commit batching is not
+  honored** and place_above/below is a no-op — so `foot`'s overlays may still be
+  positioned/ordered wrong even though they now draw; **clipboard is a no-op**
+  (`wl_data_device_manager`
   exists but does nothing); no server-side decorations, fractional scale, primary
   selection, xdg-activation, cursor-shape, text-input (all advertised-absent →
   `foot` warns and falls back).
@@ -706,7 +708,6 @@ follows the same model.
     (focus routing + key delivery), `wl_output` (mode/geometry), `wl_callback`
     (frame-callback delivery).
   - Implemented but NOT behaviorally tested: `wl_region` (no-op stub),
-    `wl_subcompositor`/`wl_subsurface` (not composited — known gap),
     `wl_data_device_manager`/`wl_data_device`/`wl_data_source` (clipboard no-op),
     `zwp_linux_dmabuf_feedback_v1` (feedback path; exercised by real WSI clients
     manually, no automated assertion). These are peripheral/stub paths with
@@ -729,8 +730,30 @@ follows the same model.
 - **Not yet built (testing):** a stdin command loop on the harness client for
   multi-step sequences (raise/move/resize) within one client lifetime; using
   `frameReadback` to also assert the dmabuf/shm upload smokes' pixels through the
-  headless path (then retiring `surfaceReadback`); pixel-test subsurface
-  compositing once that gap is built.
+  headless path (then retiring `surfaceReadback`).
+
+### Subsurface compositing (`wl_subsurface`, pixel-verified)
+A child `wl_surface` made a subsurface of a parent is composited above the parent
+at parent-output-rect + the subsurface offset.
+- A subsurface's `wl_surface` gets a texture on commit like any surface;
+  `src/subsurfaces.ts` `applySubsurfaces()` gives it a layout rect (parent rect +
+  `set_position` x/y) and a draw-stack slot directly above its parent, rebuilding
+  both whenever it could change (child commit, `set_position`, `destroy`, parent
+  map). Nested subsurfaces handled (recursive subtree). The native compositor
+  already drew any placed `ClientSurface` in stack order, so this is JS-layer
+  glue (no native change).
+- Verified: `test/subsurface.gpu.mjs` (headless pixel test) — a green child at
+  offset (40,30) over a blue parent reads back green at the child region and blue
+  in a parent-only region. **PASS.**
+- **NOT yet handled (flagged):** **sync-mode commit batching** — per spec, a
+  `sync` subsurface (the default) caches its commits and applies them atomically
+  on the PARENT's commit; we apply on the child's own commit regardless of
+  sync/desync. The test uses `set_desync`; a default-sync client gets
+  non-spec-atomic updates (visible as a child updating before the parent's
+  matching frame). `place_above`/`place_below` sibling reordering is a no-op
+  (siblings draw in creation order). The WM's own `setStack` on map/unmap pushes
+  toplevels-only; subsurfaces are re-expanded right after in the same sweep, but
+  a future stand-alone WM restack must call `applySubsurfaces` too.
 
 ## Not yet built (design only)
 

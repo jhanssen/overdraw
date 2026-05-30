@@ -135,6 +135,15 @@ target_include_directories(harness-client PRIVATE
     ${CMAKE_SOURCE_DIR}/native/wayland/generated)
 target_link_libraries(harness-client PRIVATE ${WAYLAND_CLIENT_LIBRARIES})
 
+# ---- subsurface test client (wl_subsurface compositing) ----
+add_executable(subsurface-test-client
+    test/subsurface-test-client.c
+    native/wayland/generated/xdg-shell-protocol.c)
+target_include_directories(subsurface-test-client PRIVATE
+    ${WAYLAND_CLIENT_INCLUDE_DIRS}
+    ${CMAKE_SOURCE_DIR}/native/wayland/generated)
+target_link_libraries(subsurface-test-client PRIVATE ${WAYLAND_CLIENT_LIBRARIES})
+
 # ---- SCM_RIGHTS transport unit test (fd passing over the side channel) ----
 add_executable(scm-rights-test test/scm-rights-test.cpp)
 target_include_directories(scm-rights-test PRIVATE ${IPC_INCLUDE})
