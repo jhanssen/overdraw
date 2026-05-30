@@ -5,18 +5,37 @@
 // "JS owns WM"); native only consumes rects + order.
 //
 // This module is the durable seam. The *policy* (where windows go) lives in
-// placement.js and is a stub today; a future dynamic-tiling+floating model
+// placement.ts and is a stub today; a future dynamic-tiling+floating model
 // replaces that policy and may compute the whole arrangement, pushing it through
 // the same setSurfaceLayout/setStack calls used here.
 
-import { placeWindow } from './placement.js';
+import type { Addon, Resource } from "../types.js";
+import { placeWindow } from "./placement.js";
 
-export function createWm(addon, output) {
-  // windows: stack order, back-to-front. Each: { surfaceId, rect, surfaceRec }.
-  const windows = [];
-  const wm = { output, windows };
+export interface Rect { x: number; y: number; width: number; height: number; }
+export interface Output { width: number; height: number; }
 
-  function pushStack() {
+// The WM only needs the surface's resource (for input routing / client id); it
+// does not depend on the protocol layer's SurfaceRecord. Anything carrying a
+// `resource` satisfies this.
+export interface SurfaceHandle { resource: Resource; }
+
+export interface Window { surfaceId: number; rect: Rect; surfaceRec: SurfaceHandle; }
+export interface WmState { output: Output; windows: Window[]; }
+
+export interface Wm {
+  state: WmState;
+  mapWindow(surfaceId: number, surfaceRec: SurfaceHandle, contentW?: number, contentH?: number): Rect | undefined;
+  unmapWindow(surfaceId: number): void;
+  windowAt(x: number, y: number): Window | null;
+}
+
+export function createWm(addon: Addon, output: Output): Wm {
+  // windows: stack order, back-to-front.
+  const windows: Window[] = [];
+  const wm: WmState = { output, windows };
+
+  function pushStack(): void {
     addon.setStack(windows.map((w) => w.surfaceId));
   }
 
@@ -33,14 +52,17 @@ export function createWm(addon, output) {
       // letting native fall back to content size for drawing.
       const effW = rect.width || contentW;
       const effH = rect.height || contentH;
-      const win = { surfaceId, rect: { x: rect.x, y: rect.y, width: effW, height: effH }, surfaceRec };
-      windows.push(win);  // top of stack
+      const win: Window = {
+        surfaceId,
+        rect: { x: rect.x, y: rect.y, width: effW, height: effH },
+        surfaceRec,
+      };
+      windows.push(win); // top of stack
       addon.setSurfaceLayout(surfaceId, rect.x, rect.y, rect.width, rect.height);
       pushStack();
       return win.rect;
     },
 
-    // Called on surface destroy / unmap.
     unmapWindow(surfaceId) {
       const i = windows.findIndex((w) => w.surfaceId === surfaceId);
       if (i < 0) return;
@@ -48,13 +70,12 @@ export function createWm(addon, output) {
       pushStack();
     },
 
-    // The window whose rect contains the output-space point, topmost first, or
-    // null. For pointer hit-testing once the seat layer lands.
+    // Topmost window containing the output-space point, or null.
     windowAt(x, y) {
       for (let i = windows.length - 1; i >= 0; i--) {
-        const r = windows[i].rect;
+        const r = windows[i]!.rect;
         if (x >= r.x && x < r.x + r.width && y >= r.y && y < r.y + r.height)
-          return windows[i];
+          return windows[i]!;
       }
       return null;
     },

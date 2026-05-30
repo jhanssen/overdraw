@@ -10,15 +10,15 @@
 // Current behavior: a trivial cascade. Each new window is offset down-right from
 // the last, at a fixed size, clamped to the output.
 
+import type { Rect, WmState } from "./index.js";
+
 const CASCADE_STEP = 80;
 
-// `wm` is the WM state holder (see wm/index.js): { output: {width,height},
-// windows: [...] in stack order }. Returns { x, y, width, height } in output px.
-// width/height of 0 means "use the surface's content size" (native fallback) --
-// the stub does not impose a size, only a position, so windows show at their
-// natural size cascaded down-right.
-export function placeWindow(wm) {
-  const n = wm.windows.length;  // count BEFORE this window is added
+// Returns { x, y, width, height } in output px. width/height of 0 means "use the
+// surface's content size" (native fallback) -- the stub does not impose a size,
+// only a position, so windows show at their natural size cascaded down-right.
+export function placeWindow(wm: WmState): Rect {
+  const n = wm.windows.length; // count BEFORE this window is added
   const out = wm.output;
 
   let x = (n * CASCADE_STEP) % Math.max(1, out.width - 100);

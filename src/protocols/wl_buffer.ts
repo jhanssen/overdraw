@@ -2,9 +2,12 @@
 // event the compositor sends once it no longer needs the buffer's contents
 // (after upload, for shm). Descriptor lives in ctx.state.buffers.
 
-export default function makeBuffer(ctx) {
+import type { Ctx } from "./ctx.js";
+import type { Resource } from "../types.js";
+
+export default function makeBuffer(ctx: Ctx) {
   return {
-    destroy(resource) {
+    destroy(resource: Resource) {
       ctx.state.buffers?.delete(resource);
     },
   };

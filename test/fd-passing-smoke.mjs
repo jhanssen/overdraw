@@ -12,7 +12,7 @@ import { readdirSync, readSync, closeSync } from 'node:fs';
 const require = createRequire(import.meta.url);
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const repoRoot = join(__dirname, '..');
-const genDir = join(repoRoot, 'src', 'protocols-gen');
+const genDir = join(repoRoot, 'dist', 'protocols-gen');
 const addon = require(join(repoRoot, 'build', 'overdraw_native.node'));
 
 const sock = addon.startServer();

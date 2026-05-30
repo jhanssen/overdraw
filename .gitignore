@@ -8,8 +8,8 @@ build/
 # Node
 node_modules/
 
-# Generated protocol modules (reproduced from wayland XML by tools/gen-protocol)
-/src/protocols-gen/
+# Build output: tsc-compiled JS + generated protocol modules (gen-protocol).
+/dist/
 
 # Editor / OS
 *.swp

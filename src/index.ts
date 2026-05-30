@@ -4,20 +4,24 @@
 // core. start() does one-shot bring-up then registers libuv handles (wire poll
 // + frame timer) that drive presentation. The loop runs until we stop().
 
-import { createRequire } from 'node:module';
-import { fileURLToPath } from 'node:url';
-import { dirname, join } from 'node:path';
+import { createRequire } from "node:module";
+import { fileURLToPath } from "node:url";
+import { dirname, join } from "node:path";
+
+import type { Addon } from "./types.js";
 
 const require = createRequire(import.meta.url);
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
-const addon = require(join(__dirname, '..', 'build', 'overdraw_native.node'));
+// The addon lives in build/ alongside the dist/ output (both one level under the
+// repo root), so ../build resolves from dist/ at runtime just as from src/.
+const addon = require(join(__dirname, "..", "build", "overdraw_native.node")) as Addon;
 const gpuBin = process.env.OVERDRAW_GPU_PROCESS
-  ?? join(__dirname, '..', 'build', 'overdraw-gpu-process');
+  ?? join(__dirname, "..", "build", "overdraw-gpu-process");
 
 // onFrame is invoked by the native frame timer (C++ -> JS event path).
 let frameEvents = 0;
-const onFrame = (presented) => {
+const onFrame = (presented: number): void => {
   frameEvents++;
   console.log(`[core/js] onFrame event #${frameEvents}: ${presented} frames presented`);
 };

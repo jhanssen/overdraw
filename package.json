@@ -4,10 +4,18 @@
   "private": true,
   "description": "Wayland compositor: thin C++ core + Node, separate native GPU process (Dawn).",
   "type": "module",
-  "main": "src/index.js",
+  "main": "dist/index.js",
+  "imports": {
+    "#protocols-gen/*": "./dist/protocols-gen/*"
+  },
   "scripts": {
-    "start": "node src/index.js",
+    "start": "npm run build:js && node dist/index.js",
     "gen-protocols": "node tools/gen-protocol/gen-protocol.js",
-    "test": "node --test 'test/**/*.test.js'"
+    "build:js": "npm run gen-protocols && tsc",
+    "test": "npm run build:js && node --test 'test/**/*.test.js'"
+  },
+  "devDependencies": {
+    "@types/node": "^22.19.19",
+    "typescript": "^6.0.3"
   }
 }

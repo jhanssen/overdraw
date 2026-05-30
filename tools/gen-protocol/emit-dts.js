@@ -16,7 +16,7 @@
 //   enum=...    -> the generated enum type for that arg
 //   allow-null  -> `| null`
 
-const SHARED_IMPORT = `import type { Resource, ResourceOf, WaylandFd } from '../runtime/wayland-types.js';`;
+const SHARED_IMPORT = `import type { Resource, ResourceOf, WaylandFd } from './wayland-types.js';`;
 
 // Reserved words that appear as Wayland arg names; sanitize for TS params.
 const RESERVED = new Set([
@@ -167,6 +167,24 @@ export function emitDts(iface) {
     lines.push(`  send_${m.name}(${params.join(', ')}): void;`);
   }
   lines.push(`}`);
+  lines.push(``);
+
+  // Runtime exports the .js module actually provides (consumed by the
+  // handwritten handler layer today). `signature` is the request/event/enum
+  // table; `makeEvents` builds the event-sender object wired to postEvent. These
+  // declarations keep the .d.ts truthful about the module's real exports until
+  // the handler layer is migrated to consume the typed Handler/Events contracts
+  // above directly.
+  lines.push(`export declare const signature: {`);
+  lines.push(`  name: string;`);
+  lines.push(`  version: number;`);
+  lines.push(`  enums: Record<string, { bitfield?: boolean; entries: Record<string, number> }>;`);
+  lines.push(`  requests: ReadonlyArray<unknown>;`);
+  lines.push(`  events: ReadonlyArray<unknown>;`);
+  lines.push(`};`);
+  lines.push(`export declare function makeEvents(`);
+  lines.push(`  post: (resource: Resource, opcode: number, args: unknown[]) => unknown,`);
+  lines.push(`): ${R}Events;`);
   lines.push(``);
   return lines.join('\n');
 }
