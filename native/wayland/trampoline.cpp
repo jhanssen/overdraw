@@ -169,6 +169,16 @@ void Trampoline::forgetResource(wl_resource* resource) {
     wrappers_.erase(it);
 }
 
+uint64_t Trampoline::clientIdOf(napi_value resourceHandle) {
+    napi_env env = env_;
+    napi_value ext;
+    if (napi_get_named_property(env, resourceHandle, "__resource", &ext) != napi_ok) return 0;
+    void* ptr = nullptr;
+    if (napi_get_value_external(env, ext, &ptr) != napi_ok || !ptr) return 0;
+    auto* resource = static_cast<wl_resource*>(ptr);
+    return reinterpret_cast<uint64_t>(wl_resource_get_client(resource));
+}
+
 bool Trampoline::postEvent(napi_value resourceHandle, uint32_t opcode, napi_value argsArray) {
     napi_env env = env_;
     // Unwrap wl_resource* from the handle's __resource external.

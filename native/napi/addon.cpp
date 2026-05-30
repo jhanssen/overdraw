@@ -474,6 +474,17 @@ napi_value PostEvent(napi_env env, napi_callback_info info) {
     return undef;
 }
 
+// clientId(resource) -> number : a stable per-client id (wl_client pointer) for
+// associating resources created by the same client. 0 on error.
+napi_value ClientId(napi_env env, napi_callback_info info) {
+    size_t argc = 1; napi_value argv[1];
+    napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+    if (argc < 1 || !g_addon.trampoline) { napi_value z; napi_create_double(env, 0, &z); return z; }
+    uint64_t id = g_addon.trampoline->clientIdOf(argv[0]);
+    napi_value out; napi_create_double(env, static_cast<double>(id), &out);
+    return out;
+}
+
 // fdTake(handle) -> rawFd (number)
 // Remove an fd handle from the trampoline table and return the raw fd, giving
 // ownership to the caller (who must close it). Returns -1 for unknown handles.
@@ -696,6 +707,7 @@ napi_value Init(napi_env env, napi_value exports) {
     reg("removeSurface", RemoveSurface);
     reg("setSurfaceLayout", SetSurfaceLayout);
     reg("setStack", SetStack);
+    reg("clientId", ClientId);
     reg("surfaceReadback", SurfaceReadback);
 
     napi_set_named_property(env, exports, "start", fnStart);

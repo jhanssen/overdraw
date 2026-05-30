@@ -20,6 +20,9 @@
 static struct wl_compositor* compositor = NULL;
 static struct wl_shm* shm = NULL;
 static struct xdg_wm_base* wm_base = NULL;
+static struct wl_seat* seat = NULL;
+static struct wl_pointer* pointer = NULL;
+static const char* g_title = "color";
 static int configured = 0;
 static volatile sig_atomic_t running = 1;
 
@@ -46,6 +49,52 @@ static const struct xdg_surface_listener xsListener = { xsConfigure };
 static void shmFormat(void* d, struct wl_shm* s, uint32_t fmt) { (void)d;(void)s;(void)fmt; }
 static const struct wl_shm_listener shmListener = { shmFormat };
 
+// Pointer listener: log events so input routing is verifiable.
+static void ptEnter(void* d, struct wl_pointer* p, uint32_t serial, struct wl_surface* s,
+                    wl_fixed_t x, wl_fixed_t y) {
+    (void)d;(void)p;(void)serial;(void)s;
+    printf("[client %s] pointer ENTER at %.1f,%.1f\n", g_title,
+           wl_fixed_to_double(x), wl_fixed_to_double(y));
+}
+static void ptLeave(void* d, struct wl_pointer* p, uint32_t serial, struct wl_surface* s) {
+    (void)d;(void)p;(void)serial;(void)s;
+    printf("[client %s] pointer LEAVE\n", g_title);
+}
+static void ptMotion(void* d, struct wl_pointer* p, uint32_t t, wl_fixed_t x, wl_fixed_t y) {
+    (void)d;(void)p;(void)t;
+    printf("[client %s] pointer MOTION %.1f,%.1f\n", g_title,
+           wl_fixed_to_double(x), wl_fixed_to_double(y));
+}
+static void ptButton(void* d, struct wl_pointer* p, uint32_t serial, uint32_t t,
+                     uint32_t button, uint32_t state) {
+    (void)d;(void)p;(void)serial;(void)t;
+    printf("[client %s] pointer BUTTON %u %s\n", g_title, button, state ? "press" : "release");
+}
+static void ptAxis(void* d, struct wl_pointer* p, uint32_t t, uint32_t axis, wl_fixed_t v) {
+    (void)d;(void)p;(void)t;
+    printf("[client %s] pointer AXIS %u %.1f\n", g_title, axis, wl_fixed_to_double(v));
+}
+static void ptFrame(void* d, struct wl_pointer* p) { (void)d;(void)p; }
+static void ptAxisSrc(void* d, struct wl_pointer* p, uint32_t s) { (void)d;(void)p;(void)s; }
+static void ptAxisStop(void* d, struct wl_pointer* p, uint32_t t, uint32_t a) { (void)d;(void)p;(void)t;(void)a; }
+static void ptAxisDisc(void* d, struct wl_pointer* p, uint32_t a, int32_t disc) { (void)d;(void)p;(void)a;(void)disc; }
+static void ptAxisV120(void* d, struct wl_pointer* p, uint32_t a, int32_t v) { (void)d;(void)p;(void)a;(void)v; }
+static void ptAxisDir(void* d, struct wl_pointer* p, uint32_t a, uint32_t dir) { (void)d;(void)p;(void)a;(void)dir; }
+static const struct wl_pointer_listener ptListener = {
+    ptEnter, ptLeave, ptMotion, ptButton, ptAxis, ptFrame,
+    ptAxisSrc, ptAxisStop, ptAxisDisc, ptAxisV120, ptAxisDir,
+};
+
+static void seatCaps(void* d, struct wl_seat* s, uint32_t caps) {
+    (void)d;
+    if ((caps & WL_SEAT_CAPABILITY_POINTER) && !pointer) {
+        pointer = wl_seat_get_pointer(s);
+        wl_pointer_add_listener(pointer, &ptListener, NULL);
+    }
+}
+static void seatName(void* d, struct wl_seat* s, const char* n) { (void)d;(void)s;(void)n; }
+static const struct wl_seat_listener seatListener = { seatCaps, seatName };
+
 static void regGlobal(void* data, struct wl_registry* reg, uint32_t name,
                       const char* iface, uint32_t version) {
     (void)data;
@@ -57,6 +106,9 @@ static void regGlobal(void* data, struct wl_registry* reg, uint32_t name,
     } else if (strcmp(iface, "xdg_wm_base") == 0) {
         wm_base = wl_registry_bind(reg, name, &xdg_wm_base_interface, version < 5 ? version : 5);
         xdg_wm_base_add_listener(wm_base, &wmListener, NULL);
+    } else if (strcmp(iface, "wl_seat") == 0) {
+        seat = wl_registry_bind(reg, name, &wl_seat_interface, version < 5 ? version : 5);
+        wl_seat_add_listener(seat, &seatListener, NULL);
     }
 }
 static void regRemove(void* data, struct wl_registry* reg, uint32_t name) { (void)data;(void)reg;(void)name; }
@@ -69,6 +121,7 @@ int main(int argc, char** argv) {
     int W = (argc > 3) ? atoi(argv[3]) : 300;
     int H = (argc > 4) ? atoi(argv[4]) : 300;
     const char* title = (argc > 5) ? argv[5] : "color";
+    g_title = title;
     int stride = W * 4, poolSize = stride * H;
 
     signal(SIGTERM, onSig);

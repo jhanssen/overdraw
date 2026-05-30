@@ -55,10 +55,12 @@ export default function makeSurface(ctx) {
         }
 
         // First buffered commit on a toplevel == map. Hand it to the WM to be
-        // placed + stacked so it actually draws. Guard so it fires once.
+        // placed + stacked so it actually draws. Guard so it fires once. Pass the
+        // committed buffer size so the WM has real dimensions for hit-testing
+        // (the placement stub leaves size to the content size).
         if (uploaded && !s.mapped && s.role === 'xdg_toplevel') {
           s.mapped = true;
-          ctx.state.wm?.mapWindow(s.id, s);
+          ctx.state.wm?.mapWindow(s.id, s, desc.width, desc.height);
         }
       }
 

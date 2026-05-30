@@ -53,6 +53,12 @@ class Trampoline {
     // via napi exception by the caller path).
     bool postEvent(napi_value resourceHandle, uint32_t opcode, napi_value argsArray);
 
+    // Return a stable per-client id (the wl_client pointer as a uint64) for a
+    // wrapped resource, or 0 on error. Lets JS associate resources created by
+    // the same client (e.g. route input to the wl_pointer of the client owning
+    // the focused wl_surface) without exposing wl_client to JS.
+    uint64_t clientIdOf(napi_value resourceHandle);
+
     // Drop a cached wrapper + mark the JS handle destroyed. Called from the
     // per-resource destroy listener.
     void forgetResource(wl_resource* resource);

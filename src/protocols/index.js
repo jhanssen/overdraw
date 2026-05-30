@@ -19,13 +19,14 @@ const __dirname = dirname(fileURLToPath(import.meta.url));
 const genDir = join(__dirname, '..', 'protocols-gen');
 
 // Interfaces advertised as globals (clients bind them from the registry).
-const GLOBALS = ['wl_compositor', 'xdg_wm_base', 'wl_shm', 'zwp_linux_dmabuf_v1'];
+const GLOBALS = ['wl_compositor', 'xdg_wm_base', 'wl_shm', 'zwp_linux_dmabuf_v1', 'wl_seat'];
 
 // Interfaces created via requests (new_id), registered without a global so
 // their child resources dispatch to a handler.
 const CHILD_INTERFACES = [
   'wl_surface', 'wl_region', 'xdg_surface', 'xdg_toplevel',
   'wl_shm_pool', 'wl_buffer', 'zwp_linux_buffer_params_v1',
+  'wl_pointer', 'wl_keyboard',
 ];
 
 // Load all generated signature modules, keyed by interface name.
@@ -78,10 +79,19 @@ export async function installProtocols(addon, output = { width: 1920, height: 10
     wl_buffer: await import('./wl_buffer.js'),
     zwp_linux_dmabuf_v1: await import('./zwp_linux_dmabuf_v1.js'),
     zwp_linux_buffer_params_v1: await import('./zwp_linux_buffer_params_v1.js'),
+    wl_seat: await import('./wl_seat.js'),
+  };
+
+  // wl_pointer / wl_keyboard handlers come from the seat module's named exports.
+  const seatMod = handlerMods.wl_seat;
+  const childHandlers = {
+    wl_pointer: seatMod.makePointer(ctx),
+    wl_keyboard: seatMod.makeKeyboard(ctx),
   };
 
   for (const name of CHILD_INTERFACES) {
-    addon.registerInterface(name, handlerMods[name].default(ctx));
+    const handler = childHandlers[name] ?? handlerMods[name].default(ctx);
+    addon.registerInterface(name, handler);
   }
   for (const name of GLOBALS) {
     addon.createGlobal(name, handlerMods[name].default(ctx));

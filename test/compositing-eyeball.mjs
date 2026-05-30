@@ -29,9 +29,12 @@ function cleanup() {
 process.on('SIGINT', () => { cleanup(); process.exit(0); });
 process.on('SIGTERM', () => { cleanup(); process.exit(0); });
 
+let state = null;
+const onInput = (ev) => state?.seat?.handleInput(ev);
+
 let dims;
 try {
-  dims = addon.start(gpuBin);
+  dims = addon.start(gpuBin, null, onInput);
 } catch (e) {
   console.log(`[test] FAIL bring-up (need GPU + host Wayland): ${e.message}`);
   process.exit(1);
@@ -40,7 +43,7 @@ console.log(`[test] compositor up; output ${dims.width}x${dims.height}`);
 
 const sock = addon.startServer();
 console.log(`[test] server socket: ${sock}`);
-await installProtocols(addon, { width: dims.width, height: dims.height });
+state = await installProtocols(addon, { width: dims.width, height: dims.height });
 
 function spawnClient(argbHex, w, h, title, delayMs) {
   setTimeout(() => {
