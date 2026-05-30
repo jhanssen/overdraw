@@ -36,9 +36,10 @@ Trampoline::~Trampoline() {
     }
 }
 
-bool Trampoline::createGlobal(const std::string& interfaceName, napi_value handler) {
+Trampoline::InterfaceState* Trampoline::ensureInterface(
+    const std::string& interfaceName, napi_value handler) {
     const wl_interface* iface = registry_->get(interfaceName);
-    if (!iface) return false;
+    if (!iface) return nullptr;
 
     auto st = std::make_unique<InterfaceState>();
     st->name = interfaceName;
@@ -46,8 +47,19 @@ bool Trampoline::createGlobal(const std::string& interfaceName, napi_value handl
     st->owner = this;
     napi_create_reference(env_, handler, 1, &st->handler);
 
-    wl_global_create(display_, iface, iface->version, st.get(), &Trampoline::onBind);
+    InterfaceState* raw = st.get();
     interfaces_[interfaceName] = std::move(st);
+    return raw;
+}
+
+bool Trampoline::registerInterface(const std::string& interfaceName, napi_value handler) {
+    return ensureInterface(interfaceName, handler) != nullptr;
+}
+
+bool Trampoline::createGlobal(const std::string& interfaceName, napi_value handler) {
+    InterfaceState* st = ensureInterface(interfaceName, handler);
+    if (!st) return false;
+    wl_global_create(display_, st->iface, st->iface->version, st, &Trampoline::onBind);
     return true;
 }
 

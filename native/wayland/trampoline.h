@@ -34,9 +34,16 @@ class Trampoline {
     Trampoline(napi_env env, wl_display* display, InterfaceRegistry* registry);
     ~Trampoline();
 
-    // Create a global for `interfaceName` (must be built in the registry) and
-    // route its requests to `handler` (a JS object with a method per request).
-    // Returns false if the interface is unknown.
+    // Register a request handler for `interfaceName` (must be built in the
+    // registry) without advertising a global. Used for interfaces that are
+    // created via requests (new_id), e.g. xdg_surface, xdg_toplevel, wl_region:
+    // child resources created over the wire find their handler here. Returns
+    // false if the interface is unknown.
+    bool registerInterface(const std::string& interfaceName, napi_value handler);
+
+    // Register a handler (as registerInterface) and additionally advertise the
+    // interface as a Wayland global so clients can bind it. Returns false if
+    // the interface is unknown.
     bool createGlobal(const std::string& interfaceName, napi_value handler);
 
     // Post an event to a client: encode the JS args per the event's signature
@@ -57,6 +64,11 @@ class Trampoline {
         napi_ref handler = nullptr;
         Trampoline* owner = nullptr;
     };
+
+    // Build + store an InterfaceState for `interfaceName`, taking a strong ref
+    // on `handler`. Returns the stored state (owned by interfaces_) or nullptr
+    // if the interface is unknown. Shared by registerInterface + createGlobal.
+    InterfaceState* ensureInterface(const std::string& interfaceName, napi_value handler);
 
     static void onBind(wl_client* client, void* data, uint32_t version, uint32_t id);
     static int onDispatch(const void* implData, void* target, uint32_t opcode,

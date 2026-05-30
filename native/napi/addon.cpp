@@ -294,6 +294,29 @@ napi_value CreateGlobal(napi_env env, napi_callback_info info) {
     return undef;
 }
 
+// registerInterface(interfaceName: string, handler: object) -> undefined
+// Register a request handler for an interface created via requests (new_id),
+// e.g. xdg_surface / xdg_toplevel, without advertising a global.
+napi_value RegisterInterface(napi_env env, napi_callback_info info) {
+    size_t argc = 2; napi_value argv[2];
+    napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+    if (argc < 2) return throwError(env, "registerInterface(name, handler) requires two args");
+    if (!g_addon.server || !g_addon.registry)
+        return throwError(env, "server + protocols must be registered first");
+
+    if (!g_addon.trampoline)
+        g_addon.trampoline = std::make_unique<Trampoline>(
+            env, g_addon.server->display(), g_addon.registry.get());
+
+    char name[256]; size_t len = 0;
+    napi_get_value_string_utf8(env, argv[0], name, sizeof(name), &len);
+    if (!g_addon.trampoline->registerInterface(name, argv[1]))
+        return throwError(env, "registerInterface: unknown interface");
+
+    napi_value undef; napi_get_undefined(env, &undef);
+    return undef;
+}
+
 // postEvent(resourceHandle, opcode, argsArray) -> undefined
 // The `post` function the generated makeEvents(post) calls.
 napi_value PostEvent(napi_env env, napi_callback_info info) {
@@ -315,8 +338,9 @@ napi_value Init(napi_env env, napi_value exports) {
     napi_create_function(env, "presentedCount", NAPI_AUTO_LENGTH, PresentedCount, nullptr, &fnPresented);
     napi_create_function(env, "startServer", NAPI_AUTO_LENGTH, StartServer, nullptr, &fnStartServer);
     napi_create_function(env, "stopServer", NAPI_AUTO_LENGTH, StopServer, nullptr, &fnStopServer);
-    napi_value fnRegister, fnCreateGlobal, fnPostEvent;
+    napi_value fnRegister, fnCreateGlobal, fnPostEvent, fnRegisterIface;
     napi_create_function(env, "registerProtocols", NAPI_AUTO_LENGTH, RegisterProtocols, nullptr, &fnRegister);
+    napi_create_function(env, "registerInterface", NAPI_AUTO_LENGTH, RegisterInterface, nullptr, &fnRegisterIface);
     napi_create_function(env, "createGlobal", NAPI_AUTO_LENGTH, CreateGlobal, nullptr, &fnCreateGlobal);
     napi_create_function(env, "postEvent", NAPI_AUTO_LENGTH, PostEvent, nullptr, &fnPostEvent);
     napi_set_named_property(env, exports, "start", fnStart);
@@ -325,6 +349,7 @@ napi_value Init(napi_env env, napi_value exports) {
     napi_set_named_property(env, exports, "startServer", fnStartServer);
     napi_set_named_property(env, exports, "stopServer", fnStopServer);
     napi_set_named_property(env, exports, "registerProtocols", fnRegister);
+    napi_set_named_property(env, exports, "registerInterface", fnRegisterIface);
     napi_set_named_property(env, exports, "createGlobal", fnCreateGlobal);
     napi_set_named_property(env, exports, "postEvent", fnPostEvent);
     return exports;

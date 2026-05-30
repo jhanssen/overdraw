@@ -96,3 +96,12 @@ target_link_libraries(overdraw_native PRIVATE
 add_executable(wl-test-client test/wl-test-client.c)
 target_include_directories(wl-test-client PRIVATE ${WAYLAND_CLIENT_INCLUDE_DIRS})
 target_link_libraries(wl-test-client PRIVATE ${WAYLAND_CLIENT_LIBRARIES})
+
+# ---- xdg-shell test client (toplevel-creation / configure handshake) ----
+add_executable(xdg-test-client
+    test/xdg-test-client.c
+    native/wayland/generated/xdg-shell-protocol.c)
+target_include_directories(xdg-test-client PRIVATE
+    ${WAYLAND_CLIENT_INCLUDE_DIRS}
+    ${CMAKE_SOURCE_DIR}/native/wayland/generated)
+target_link_libraries(xdg-test-client PRIVATE ${WAYLAND_CLIENT_LIBRARIES})

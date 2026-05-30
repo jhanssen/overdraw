@@ -4,7 +4,7 @@ Tracks what is built and empirically proven versus what is still design only.
 The design itself lives in `architecture.md`; this file is the ground truth for
 "what exists right now."
 
-Last updated: 2026-05-29 (rev 3).
+Last updated: 2026-05-29 (rev 4).
 
 ## Verification environment
 
@@ -120,13 +120,17 @@ interfaces built at runtime from the generator metadata (no per-protocol C):
 - `native/wayland/interface_registry.cpp`: builds `wl_interface`/`wl_message[]`/
   `types[]` at runtime from the generated signature (libwayland signature
   strings; two-pass cross-reference resolution).
-- `native/wayland/trampoline.cpp`: `createGlobal()` registers a `wl_global`; on
-  bind, creates a `wl_resource` with a generic dispatcher that decodes the
+- `native/wayland/trampoline.cpp`: a generic dispatcher decodes the
   `wl_argument` array into a typed tuple and calls the named JS handler method.
   new_id args create a child resource; object args decode to a cached per-
   resource JS wrapper. Outgoing events: `postEvent` encodes typed args and calls
   `wl_resource_post_event_array` (wired to the generated `makeEvents`). Resource
   destruction invalidates the JS wrapper (`destroyed=true`) and frees the ref.
+  Two registration entry points: `registerInterface(name, handler)` stores a
+  handler without advertising a global (for request-created interfaces like
+  `xdg_surface`/`xdg_toplevel` — child resources from a new_id arg find their
+  handler here); `createGlobal(name, handler)` does the same *and*
+  `wl_global_create`s so clients can bind.
 - Verified end-to-end with a real libwayland client (`test/wl-test-client.c` +
   `test/trampoline-smoke.mjs`): client binds `wl_compositor` (runtime-registered
   global), calls `create_surface`; the JS handler fires, creates the
@@ -137,16 +141,41 @@ interfaces built at runtime from the generator metadata (no per-protocol C):
 Trampoline gaps (implemented or not):
 - `fd` args decode/encode to nothing yet (no `WaylandFd`); blocks `wl_shm`,
   data-device, keymap.
-- `array` encode/decode implemented but unproven on wire (every array-carrying
-  message in our set is an event; encode will be exercised by
-  `xdg_toplevel.configure` in the protocol-handler track; no core protocol has
-  an array *request* arg, so decode has no exerciser).
+- `array` encode: the **empty-array** path is now proven on the wire
+  (`xdg_toplevel.configure` sends an empty `states` `wl_array`; the client
+  receives `states->size == 0`). **Non-empty** array encode is still unproven —
+  no handler yet sends array content. `array` *decode* has no exerciser (no
+  core protocol has an array request arg).
 - object arg passed *into* a handler: implemented, not yet end-to-end tested
   (needs a protocol with an existing-object request arg).
 - per-arg since-versioning not handled.
-- No protocols are actually *implemented* in JS yet (handlers tracking surfaces,
-  xdg-shell roles, etc.); the trampoline is proven but the JS protocol layer on
-  top is unwritten. No live reload yet.
+- No live reload yet.
+
+### JS protocol layer: xdg-shell toplevel creation (first light, no buffer)
+A handwritten JS protocol layer now sits on the trampoline. A real client can
+create and configure an `xdg_toplevel`; it cannot yet show pixels (no buffer
+path).
+
+- `src/protocols/index.js`: minimal loader. Imports every generated signature,
+  calls `registerProtocols`, then wires handlers — globals (`wl_compositor`,
+  `xdg_wm_base`) via `createGlobal`, request-created interfaces (`wl_surface`,
+  `wl_region`, `xdg_surface`, `xdg_toplevel`) via `registerInterface` — and
+  builds the per-interface event senders from `makeEvents(addon.postEvent)`. No
+  C++/core-JS/plugin layering or override semantics yet (deferred until plugins
+  exist).
+- `src/protocols/*.js`: handler modules tracking surfaces (pending/committed
+  buffer, frame-callback queue), xdg roles, and the configure handshake
+  (`xdg_toplevel.configure` empty-states → `xdg_surface.configure` serial →
+  client `ack_configure`), plus `set_title`/`set_app_id`.
+- Verified end-to-end (`test/xdg-test-client.c` + `test/xdg-toplevel-smoke.mjs`):
+  a real libwayland client binds `wl_compositor` + `xdg_wm_base`, creates a
+  surface, `get_xdg_surface` + `get_toplevel`, sets title/app_id, receives both
+  configure events and acks; server-side state (toplevel, title, app_id, role,
+  configured-after-ack) is asserted. **PASS.**
+- Not done here: no buffer is attached (so nothing composites — `commit` is
+  bookkeeping only); configure sends 0×0 (client picks size); no WM/policy
+  (placement, focus, real toplevel states); non-empty `states` array unproven;
+  popups (`get_popup`) and positioners are no-ops.
 
 ### Load-bearing facts established (recorded in architecture.md "Validated against Dawn")
 - A Wayland-backed `wgpu::Surface` swapchain works **over the Dawn wire**: a
@@ -169,14 +198,14 @@ Trampoline gaps (implemented or not):
 
 ## Not yet built (design only)
 
-- **Actual Wayland protocols in JS.** The server + trampoline + generator exist
-  and are proven (see above), but no protocol is *implemented* yet: no handler
-  modules tracking surfaces, no `xdg_shell` roles, no `linux-dmabuf-v1` client
-  buffer import, no live reload. overdraw accepts clients and dispatches their
-  requests to JS, but a real app cannot yet map a window. (The dmabuf import
-  primitive a `linux-dmabuf-v1` handler would reuse is proven server-side;
-  importing a *client-chosen* modifier we did not allocate is not yet exercised,
-  and there is no `WaylandFd` to receive client buffer fds.)
+- **A mappable window (client buffers).** The xdg-shell toplevel-creation chain
+  is implemented and proven (see "JS protocol layer" above), but a real app
+  still cannot *map a window with content*: no buffer is attached or composited.
+  `wl_shm` and `linux-dmabuf-v1` client buffer import are unwritten, and there
+  is no `WaylandFd` to receive client buffer fds (fd args are stubbed in the
+  trampoline). The dmabuf import primitive a `linux-dmabuf-v1` handler would
+  reuse is proven server-side, but importing a *client-chosen* modifier we did
+  not allocate is not yet exercised. No live reload yet. No WM/policy.
 - **WM / policy in JS.** Window management, focus, layout — none built.
 - **JS-owned core breadth.** The core is C++ + Node with a working trampoline
   and a frame event callback, but the protocol-handler/WM/plugin layers that
