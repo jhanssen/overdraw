@@ -711,14 +711,26 @@ follows the same model.
     `zwp_linux_dmabuf_feedback_v1` (feedback path; exercised by real WSI clients
     manually, no automated assertion). These are peripheral/stub paths with
     little behavior to assert until they do something.
-  - Structural (`gen-protocol.test.js`) asserts generator metadata for 8 of 31
-    generated interfaces (wire signature spot-check), not all.
+  - Structural: `gen-protocol.test.js` spot-checks specific interfaces, and
+    `gen-protocol-all.test.js` validates ALL generated signatures (sequential
+    unique opcodes, known arg types, interface references resolve, one makeEvents
+    sender per event at the right opcode).
+  - The server-only smokes are now GPU-free `node --test` files in `npm test`:
+    `server.test.js`, `trampoline.test.js`, `fd-passing.test.js`,
+    `xdg-shell.test.js` (shared `server-helpers.mjs`; each its own file for
+    process isolation — see the start/stop note below). The old `*-smoke.mjs`
+    versions were removed. `npm test` is 37 tests, GPU-free.
+- **Known bug (flagged, not fixed): `startServer`/`stopServer` is NOT safely
+  repeatable in one process** — a second lifecycle aborts with a libuv
+  `uv__finish_close` assertion (`Server::stop()` mishandles uv handle teardown on
+  reuse). Worked around in tests by one server lifecycle per file (node --test
+  isolates files into separate processes). Matters if a long-running compositor
+  ever restarts its server; needs a real fix in `native/wayland/server.cpp`.
 - **Not yet built (testing):** a stdin command loop on the harness client for
-  multi-step sequences (raise/move/resize) within one client lifetime; folding
-  the GPU-free `*-smoke.mjs` server-only tests (trampoline/fd/xdg/server) into
-  `npm test`; using `frameReadback` to also assert the dmabuf/shm upload smokes'
-  pixels through the headless path (then retiring `surfaceReadback`); pixel-test
-  subsurface compositing once that gap is built.
+  multi-step sequences (raise/move/resize) within one client lifetime; using
+  `frameReadback` to also assert the dmabuf/shm upload smokes' pixels through the
+  headless path (then retiring `surfaceReadback`); pixel-test subsurface
+  compositing once that gap is built.
 
 ## Not yet built (design only)
 
