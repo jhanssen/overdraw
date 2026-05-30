@@ -19,15 +19,26 @@ struct VsOut {
   @builtin(position) pos : vec4f,
   @location(0) uv : vec2f,
 };
+// Per-surface placement: rect in NORMALIZED output coords [0,1], origin
+// top-left. xy = top-left position, zw = size. The full-output default is
+// (0,0,1,1). The compositor writes this each frame from the surface's
+// pixel rect and the output size.
+struct Rect { r : vec4f, };
+@group(0) @binding(2) var<uniform> placement : Rect;
 @vertex fn vs(@builtin(vertex_index) i : u32) -> VsOut {
-  var p = array<vec2f, 4>(
-    vec2f(-1.0, -1.0), vec2f(1.0, -1.0),
-    vec2f(-1.0,  1.0), vec2f(1.0,  1.0));
+  // Unit quad in [0,1] (top-left origin) before placement.
+  var q = array<vec2f, 4>(
+    vec2f(0.0, 1.0), vec2f(1.0, 1.0),
+    vec2f(0.0, 0.0), vec2f(1.0, 0.0));
   var uv = array<vec2f, 4>(
     vec2f(0.0, 1.0), vec2f(1.0, 1.0),
     vec2f(0.0, 0.0), vec2f(1.0, 0.0));
+  // Place the unit quad into the surface's normalized rect, then map the
+  // [0,1] top-left-origin space to NDC ([-1,1], y up).
+  let placed = placement.r.xy + q[i] * placement.r.zw;  // normalized output coords
+  let ndc = vec2f(placed.x * 2.0 - 1.0, 1.0 - placed.y * 2.0);
   var o : VsOut;
-  o.pos = vec4f(p[i], 0.0, 1.0);
+  o.pos = vec4f(ndc, 0.0, 1.0);
   o.uv = uv[i];
   return o;
 }
@@ -171,8 +182,20 @@ bool Compositor::bringUp() {
         smd.nextInChain = &wgslDesc;
         wgpu::ShaderModule module = device_.CreateShaderModule(&smd);
 
+        // Premultiplied-alpha blending (architecture: premultiplied throughout):
+        // out = src + dst*(1-srcA). Opaque clients (A=1) fully replace; this is
+        // correct for overlapping surfaces.
+        wgpu::BlendState blend{};
+        blend.color.srcFactor = wgpu::BlendFactor::One;
+        blend.color.dstFactor = wgpu::BlendFactor::OneMinusSrcAlpha;
+        blend.color.operation = wgpu::BlendOperation::Add;
+        blend.alpha.srcFactor = wgpu::BlendFactor::One;
+        blend.alpha.dstFactor = wgpu::BlendFactor::OneMinusSrcAlpha;
+        blend.alpha.operation = wgpu::BlendOperation::Add;
+
         wgpu::ColorTargetState target{};
         target.format = static_cast<wgpu::TextureFormat>(surfReady.format);
+        target.blend = &blend;
         wgpu::FragmentState fs{};
         fs.module = module;
         fs.entryPoint = "fs";
@@ -188,6 +211,22 @@ bool Compositor::bringUp() {
     }
     link_->flush();
     return true;
+}
+
+void Compositor::updatePlacement(ClientSurface& cs) {
+    if (!cs.placementBuf || windowWidth_ == 0 || windowHeight_ == 0) return;
+    // Normalized output rect [0,1], origin top-left. Layout size of 0 falls back
+    // to the surface's content size (so a surface placed before sizing still
+    // shows at its natural size).
+    uint32_t w = cs.layoutW ? cs.layoutW : cs.width;
+    uint32_t h = cs.layoutH ? cs.layoutH : cs.height;
+    float rect[4] = {
+        static_cast<float>(cs.x) / static_cast<float>(windowWidth_),
+        static_cast<float>(cs.y) / static_cast<float>(windowHeight_),
+        static_cast<float>(w) / static_cast<float>(windowWidth_),
+        static_cast<float>(h) / static_cast<float>(windowHeight_),
+    };
+    device_.GetQueue().WriteBuffer(cs.placementBuf, 0, rect, sizeof(rect));
 }
 
 void Compositor::commitSurfaceShm(uint32_t id, uint32_t width, uint32_t height,
@@ -206,17 +245,28 @@ void Compositor::commitSurfaceShm(uint32_t id, uint32_t width, uint32_t height,
         cs.width = width;
         cs.height = height;
 
-        wgpu::BindGroupEntry entries[2]{};
+        if (!cs.placementBuf) {
+            wgpu::BufferDescriptor pbd{};
+            pbd.size = 16;  // vec4f
+            pbd.usage = wgpu::BufferUsage::Uniform | wgpu::BufferUsage::CopyDst;
+            cs.placementBuf = device_.CreateBuffer(&pbd);
+        }
+
+        wgpu::BindGroupEntry entries[3]{};
         entries[0].binding = 0;
         entries[0].sampler = sampler_;
         entries[1].binding = 1;
         entries[1].textureView = cs.texture.CreateView();
+        entries[2].binding = 2;
+        entries[2].buffer = cs.placementBuf;
+        entries[2].size = 16;
         wgpu::BindGroupDescriptor bgd{};
         bgd.layout = pipeline_.GetBindGroupLayout(0);
-        bgd.entryCount = 2;
+        bgd.entryCount = 3;
         bgd.entries = entries;
         cs.bindGroup = device_.CreateBindGroup(&bgd);
     }
+    updatePlacement(cs);  // content size may have changed -> refresh fallback rect
 
     // Upload the pixels. WriteTexture serializes the payload over the wire
     // (no shared-memory MemoryTransferService configured) -- functional, with a
@@ -288,23 +338,49 @@ bool Compositor::commitSurfaceDmabuf(uint32_t id, int fd, uint32_t width, uint32
     cs.width = width;
     cs.height = height;
 
-    wgpu::BindGroupEntry entries[2]{};
+    if (!cs.placementBuf) {
+        wgpu::BufferDescriptor pbd{};
+        pbd.size = 16;  // vec4f
+        pbd.usage = wgpu::BufferUsage::Uniform | wgpu::BufferUsage::CopyDst;
+        cs.placementBuf = device_.CreateBuffer(&pbd);
+    }
+
+    wgpu::BindGroupEntry entries[3]{};
     entries[0].binding = 0;
     entries[0].sampler = sampler_;
     entries[1].binding = 1;
     entries[1].textureView = cs.texture.CreateView();
+    entries[2].binding = 2;
+    entries[2].buffer = cs.placementBuf;
+    entries[2].size = 16;
     wgpu::BindGroupDescriptor bgd{};
     bgd.layout = pipeline_.GetBindGroupLayout(0);
-    bgd.entryCount = 2;
+    bgd.entryCount = 3;
     bgd.entries = entries;
     cs.bindGroup = device_.CreateBindGroup(&bgd);
+    updatePlacement(cs);
     cs.present = true;
     link_->flush();
     return true;
 }
 
+void Compositor::setSurfaceLayout(uint32_t id, int32_t x, int32_t y,
+                                  uint32_t w, uint32_t h) {
+    ClientSurface& cs = clientSurfaces_[id];  // lazily create; rect applies once committed
+    cs.x = x;
+    cs.y = y;
+    cs.layoutW = w;
+    cs.layoutH = h;
+    updatePlacement(cs);  // no-op until placementBuf exists (first commit)
+}
+
+void Compositor::setStack(const std::vector<uint32_t>& ids) {
+    stack_ = ids;
+}
+
 void Compositor::removeSurface(uint32_t id) {
     clientSurfaces_.erase(id);
+    stack_.erase(std::remove(stack_.begin(), stack_.end(), id), stack_.end());
 }
 
 void Compositor::renderFrame() {
@@ -323,10 +399,13 @@ void Compositor::renderFrame() {
         wgpu::RenderPassEncoder pass = enc.BeginRenderPass(&rp);
         pass.SetPipeline(pipeline_);
 
-        // First light: draw each present client surface full-screen. No
-        // placement/transform/blending yet -- the last present surface wins the
-        // screen. With no client surface the pass just clears (black).
-        for (auto& [id, cs] : clientSurfaces_) {
+        // Draw committed surfaces in JS-owned stack order (back-to-front), each
+        // placed into its layout rect with alpha blending. Surfaces not in the
+        // stack are not drawn. With an empty stack the pass just clears (black).
+        for (uint32_t id : stack_) {
+            auto it = clientSurfaces_.find(id);
+            if (it == clientSurfaces_.end()) continue;  // not committed yet
+            ClientSurface& cs = it->second;
             if (cs.present && cs.bindGroup) {
                 pass.SetBindGroup(0, cs.bindGroup);
                 pass.Draw(4);

@@ -4,7 +4,7 @@ Tracks what is built and empirically proven versus what is still design only.
 The design itself lives in `architecture.md`; this file is the ground truth for
 "what exists right now."
 
-Last updated: 2026-05-29 (rev 6).
+Last updated: 2026-05-30 (rev 8).
 
 ## Verification environment
 
@@ -67,12 +67,74 @@ server) topology runs as real, non-spike code and presents to a host window:
 - Still C++-internal / not in JS: protocol semantics, WM/policy, the plugin
   model. "JS owns this" per the design has not started beyond the entry script.
 - `wl_event_loop` (server-side Wayland) integration does not exist — there is no
-  Wayland server yet. No host input handling, no resize handling.
+  Wayland server yet. No resize handling. Host *input* now arrives in the core
+  (see "Host input forwarding"); routing it back out to overdraw's own clients
+  via `wl_seat` is not built.
 
-### Compositing (single textured quad, real client shm buffers)
+### Host input forwarding (host seat -> GPU process -> core -> JS, verified)
+Host pointer/keyboard events reach the core as normalized events. The seam is a
+backend abstraction so a phase-2 libinput source can replace the phase-1 source
+without touching anything above it.
+
+- Phase-1 source: the GPU process binds the host `wl_seat` (`host_window.cpp`,
+  pointer + keyboard, up to wl_seat v5) and forwards each event as a fixed-size
+  `ipc::InputMessage` over a **dedicated SEQPACKET input socket** — separate
+  from the control side channel so unsolicited input never interleaves with
+  control request/reply traffic. Send is non-blocking (`MSG_DONTWAIT`): input is
+  lossy by design and the GPU loop must never block on a full socket buffer
+  (doing so stops it servicing the host connection -> the host marks the window
+  unresponsive). The third socket fd is passed at fork/exec
+  (`gpu_process.cpp`, `argv[3]`, optional).
+- Core abstraction (`native/core/input.h`): `InputEvent` (normalized,
+  OUTPUT-space doubles, raw evdev keycodes, ms timestamps), `InputSink`, and an
+  `InputBackend` interface. `WaylandInputBackend` (`input_wayland.cpp`) reads the
+  input socket, converts `wl_fixed_t` (24.8) to logical pixels, and emits
+  `InputEvent`s. A future `LibinputBackend` implements the same interface.
+- Addon bridge (`addon.cpp`): a `uv_poll_t` on the input fd drains the backend on
+  the Node main thread; events are delivered to an optional `onInput` JS callback
+  (`start(gpuBin, onFrame?, onInput?)`) as plain objects — same-thread
+  `napi_call_function`, no threadsafe function needed.
+- Verified end-to-end **interactively** (`test/input-smoke.mjs`, needs GPU + host
+  Wayland + a human) on the RTX 5060 / Hyprland: pointer enter/motion/frame and
+  keyboard enter/key/modifiers all reach the JS callback; coordinates and evdev
+  keycodes correct. **PASS.** (Not CI-able: input requires real user activity.)
+- Fixed while building this: the GPU process's host-connection `pump()` only
+  called `wl_display_dispatch_pending` (drains the in-memory queue) and never
+  READ the socket, so host events sat unread forever. Now does
+  prepare_read + non-blocking poll on the wl fd + read_events. This was latent
+  before (nothing consumed post-startup host events) and would also have broken
+  future resize/output handling.
+- Limitations: coordinate mapping is currently identity (output logical size ==
+  host window size, scale 1; `setOutputSize()` hook exists but is uncalled — real
+  mapping waits on resize/scale handling). Touch not forwarded. No keymap
+  translation (raw evdev codes only). Routing these events to overdraw's own
+  Wayland clients via `wl_seat`/`wl_pointer`/`wl_keyboard` is NOT built; keyboard
+  emission there will need the still-stubbed trampoline fd *encode* (for the
+  `wl_keyboard.keymap` fd) plus xkbcommon.
+
+### Compositing (multi-surface: per-surface placement + stacking + blending)
 - A textured-quad pipeline composites client surfaces: shaders, sampler,
-  per-surface bind group, full-surface quad. It samples a client-surface texture
-  and presents it; with no client surface present the pass clears to black.
+  per-surface bind group. Each surface is drawn into its layout rect (a per-
+  surface uniform holding a normalized output rect; the vertex shader places the
+  unit quad), in JS-owned back-to-front stack order, with premultiplied-alpha
+  blending. With an empty stack the pass clears to black.
+- **Multi-surface verified** (`test/compositing-eyeball.mjs`, needs GPU + host
+  Wayland + eyeball): two real shm clients (red 300x300, green 350x250) map and
+  appear simultaneously at distinct cascaded positions. **PASS** (visual).
+- Placement seam: native consumes geometry only — `setSurfaceLayout(id,x,y,w,h)`
+  and `setStack(ids[])` (addon -> `Compositor`); JS owns it. `src/wm/index.js`
+  holds the window list/stack and pushes layout+order to native; `src/wm/
+  placement.js` is a STUB (cascade) — the one throwaway policy piece, to be
+  replaced by a real layout model (dynamic tiling + floating) without touching
+  the seam. `mapWindow` fires on a toplevel's first buffered commit
+  (`wl_surface.commit`).
+- **Transport fix found while building this:** the Dawn wire socket is
+  non-blocking; `FdSerializer::writeAll` treated `EAGAIN` as fatal, so any frame
+  larger than the socket send buffer (~200KB, i.e. windows bigger than ~192x192
+  in BGRA) was dropped/truncated. The peer then deserialized garbage (a corrupt
+  `dataLayout.offset` reaching `WriteTexture` validation) -> upload failed ->
+  black. Now `writeAll` polls `POLLOUT` and retries on EAGAIN/EINTR. This was a
+  latent bug independent of multi-surface; large shm uploads now work.
 - The interop dmabuf test quad (a server-allocated dmabuf texture the core used
   to render green into and hold open) has been **removed** from the compositor;
   it was spike scaffolding superseded by real client-buffer compositing. The
@@ -85,9 +147,10 @@ server) topology runs as real, non-spike code and presents to a host window:
   GPU process's single command thread whenever the host compositor wasn't
   consuming frames (e.g. an unviewed nested window), which stalled all other
   wire work behind it (including buffer-map). Mailbox avoids that.
-- Still absent: multiple simultaneous surfaces (the loop draws each present
-  surface full-screen, so the last wins), per-surface placement/transforms/
-  opacity, alpha blending (no blend state), multi-output, damage.
+- Still absent: per-surface transforms/opacity/rotation/scale, fractional scale,
+  multi-output, damage, real WM/layout policy (placement is a cascade stub),
+  input routing to clients (no `wl_seat` emission yet), resize handling. Output
+  logical size == host window size (scale 1).
 
 ### Client shm buffers end-to-end (upload → composite → present, pixel-verified)
 A real Wayland client can map a window with content and have its pixels reach

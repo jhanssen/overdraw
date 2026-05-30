@@ -57,9 +57,11 @@ void installCrashHandler() {
 
 void usleepShort() { ::usleep(200); }
 
-int run(int wireFd, int ctrlFd) {
+int run(int wireFd, int ctrlFd, int inputFd) {
     // 1) Host output window (this process is the Wayland client of the host).
-    gpu::HostWindow window;
+    //    The host seat (pointer/keyboard) forwards events to the core over
+    //    inputFd; if inputFd < 0 input forwarding is disabled.
+    gpu::HostWindow window(inputFd);
     if (!window.open("overdraw")) {
         std::fprintf(stderr, "[gpu] failed to open host window (no WAYLAND_DISPLAY?)\n");
         return 1;
@@ -441,10 +443,12 @@ int main(int argc, char** argv) {
     setvbuf(stdout, nullptr, _IOLBF, 0);
     installCrashHandler();
     if (argc < 3) {
-        std::fprintf(stderr, "usage: %s <wireFd> <ctrlFd>\n", argv[0]);
+        std::fprintf(stderr, "usage: %s <wireFd> <ctrlFd> [inputFd]\n", argv[0]);
         return 1;
     }
     int wireFd = std::atoi(argv[1]);
     int ctrlFd = std::atoi(argv[2]);
-    return run(wireFd, ctrlFd);
+    // inputFd is optional: when absent (-1) the GPU process forwards no input.
+    int inputFd = (argc >= 4) ? std::atoi(argv[3]) : -1;
+    return run(wireFd, ctrlFd, inputFd);
 }

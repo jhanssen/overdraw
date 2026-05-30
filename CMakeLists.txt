@@ -69,6 +69,7 @@ add_library(overdraw_core STATIC
     native/core/gpu_process.cpp
     native/core/wire_link.cpp
     native/core/compositor.cpp
+    native/core/input_wayland.cpp
     native/core/shm.cpp
     native/wayland/server.cpp
     native/wayland/interface_registry.cpp)
@@ -120,6 +121,15 @@ target_include_directories(shm-test-client PRIVATE
     ${WAYLAND_CLIENT_INCLUDE_DIRS}
     ${CMAKE_SOURCE_DIR}/native/wayland/generated)
 target_link_libraries(shm-test-client PRIVATE ${WAYLAND_CLIENT_LIBRARIES})
+
+# ---- color client (long-lived solid-color window for eyeballing compositing) ----
+add_executable(color-client
+    test/color-client.c
+    native/wayland/generated/xdg-shell-protocol.c)
+target_include_directories(color-client PRIVATE
+    ${WAYLAND_CLIENT_INCLUDE_DIRS}
+    ${CMAKE_SOURCE_DIR}/native/wayland/generated)
+target_link_libraries(color-client PRIVATE ${WAYLAND_CLIENT_LIBRARIES})
 
 # ---- SCM_RIGHTS transport unit test (fd passing over the side channel) ----
 add_executable(scm-rights-test test/scm-rights-test.cpp)

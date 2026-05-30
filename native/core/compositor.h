@@ -63,6 +63,16 @@ class Compositor {
                              uint32_t drmFourcc, uint64_t modifier,
                              uint32_t offset, uint32_t stride);
 
+    // Set a surface's layout rect in output pixels (top-left origin). w/h of 0
+    // means "use the surface's content size". Placement is owned by JS; the
+    // compositor only stores + applies it. Unknown ids are created lazily so
+    // layout can be set before the first buffer commit.
+    void setSurfaceLayout(uint32_t id, int32_t x, int32_t y, uint32_t w, uint32_t h);
+
+    // Set the back-to-front draw order. Ids not (yet) committed are tolerated
+    // (skipped at draw time). Surfaces absent from the stack are not drawn.
+    void setStack(const std::vector<uint32_t>& ids);
+
     // Stop compositing a surface and release its texture.
     void removeSurface(uint32_t id);
 
@@ -90,16 +100,30 @@ class Compositor {
     wgpu::RenderPipeline pipeline_;
     wgpu::Sampler sampler_;
 
-    // Client surfaces composited over the wire. One full-screen quad per
-    // present surface (first-light: no placement/transform/blending).
+    // Client surfaces composited over the wire. Each is drawn as a textured
+    // quad placed into its layout rect, in stack order, with alpha blending.
+    // Placement and stack order are owned by JS and pushed via setSurfaceLayout
+    // / setStack; the compositor only consumes them.
     struct ClientSurface {
         wgpu::Texture texture;
+        wgpu::Buffer placementBuf;  // uniform: normalized output rect (vec4)
         wgpu::BindGroup bindGroup;
-        uint32_t width = 0;
+        uint32_t width = 0;   // content (texture) size
         uint32_t height = 0;
+        int32_t x = 0;        // layout position in output pixels (top-left)
+        int32_t y = 0;
+        uint32_t layoutW = 0; // layout size in output pixels (0 => use content size)
+        uint32_t layoutH = 0;
         bool present = false;
     };
     std::unordered_map<uint32_t, ClientSurface> clientSurfaces_;
+
+    // Back-to-front draw order (surface ids). Surfaces not in the stack are not
+    // drawn. JS owns this via setStack; ids not yet committed are tolerated.
+    std::vector<uint32_t> stack_;
+
+    // Write a surface's placement uniform from its layout rect + output size.
+    void updatePlacement(ClientSurface& cs);
 
     uint32_t windowWidth_ = 0;
     uint32_t windowHeight_ = 0;

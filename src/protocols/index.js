@@ -13,6 +13,8 @@ import { readdirSync } from 'node:fs';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { dirname, join } from 'node:path';
 
+import { createWm } from '../wm/index.js';
+
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const genDir = join(__dirname, '..', 'protocols-gen');
 
@@ -38,9 +40,10 @@ async function loadSignatures() {
 }
 
 // Wire the protocol layer onto a started server. `addon` is the native module
-// (already had startServer() called). Returns the shared compositor state for
-// inspection/testing.
-export async function installProtocols(addon) {
+// (already had startServer() called). `output` is the compositor output's
+// logical size { width, height } (from addon.start()); placement uses it.
+// Returns the shared compositor state for inspection/testing.
+export async function installProtocols(addon, output = { width: 1920, height: 1080 }) {
   const mods = await loadSignatures();
 
   // Register every interface's signature so cross-references resolve (the
@@ -57,6 +60,7 @@ export async function installProtocols(addon) {
     nextSerial: 1,
     serial() { return this.nextSerial++; },
   };
+  state.wm = createWm(addon, output);
 
   const ctx = { events, state, addon };
 

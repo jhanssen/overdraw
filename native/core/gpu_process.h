@@ -10,8 +10,9 @@ namespace overdraw::core {
 
 struct GpuProcess {
     pid_t pid = -1;
-    int wireFd = -1;   // core-side end of the Dawn wire socket
-    int ctrlFd = -1;   // core-side end of the side-channel socket
+    int wireFd = -1;    // core-side end of the Dawn wire socket
+    int ctrlFd = -1;    // core-side end of the control side-channel socket
+    int inputFd = -1;   // core-side end of the input socket (GPU process -> core)
 };
 
 // Creates the socket pairs, forks/execs `binPath`, and returns the core-side

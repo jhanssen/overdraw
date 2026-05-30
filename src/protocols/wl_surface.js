@@ -34,6 +34,7 @@ export default function makeSurface(ctx) {
       const buffer = s.committed.buffer;
       if (buffer && !buffer.destroyed) {
         const desc = ctx.state.buffers?.get(buffer);
+        let uploaded = false;
         if (desc && desc.dmabuf) {
           // dmabuf: hand the client's fd to native for zero-copy import. The
           // buffer is NOT released immediately -- the compositor samples it
@@ -41,15 +42,23 @@ export default function makeSurface(ctx) {
           const ok = ctx.addon.commitSurfaceDmabuf(
             s.id, desc.fdHandle, desc.width, desc.height, desc.format,
             desc.modifierHi, desc.modifierLo, desc.offset, desc.stride);
-          if (ok) ctx.state.lastCommittedSurfaceId = s.id;
+          if (ok) { ctx.state.lastCommittedSurfaceId = s.id; uploaded = true; }
         } else if (desc && desc.poolId) {
           const ok = ctx.addon.commitSurfaceBuffer(
             s.id, desc.poolId, desc.offset, desc.width, desc.height, desc.stride);
           if (ok) {
             ctx.state.lastCommittedSurfaceId = s.id;
+            uploaded = true;
             // shm: contents are copied at upload, so the buffer is free to reuse.
             ctx.events.wl_buffer.send_release(buffer);
           }
+        }
+
+        // First buffered commit on a toplevel == map. Hand it to the WM to be
+        // placed + stacked so it actually draws. Guard so it fires once.
+        if (uploaded && !s.mapped && s.role === 'xdg_toplevel') {
+          s.mapped = true;
+          ctx.state.wm?.mapWindow(s.id, s);
         }
       }
 
@@ -57,7 +66,10 @@ export default function makeSurface(ctx) {
     },
     destroy(resource) {
       const s = rec(resource);
-      if (s && ctx.addon.removeSurface) ctx.addon.removeSurface(s.id);
+      if (s) {
+        ctx.state.wm?.unmapWindow(s.id);
+        if (ctx.addon.removeSurface) ctx.addon.removeSurface(s.id);
+      }
       ctx.state.surfaces.delete(resource);
     },
   };

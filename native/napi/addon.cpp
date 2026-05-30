@@ -17,12 +17,20 @@
 
 #include "core/compositor.h"
 #include "core/gpu_process.h"
+#include "core/input.h"
+#include "core/input_wayland.h"
 #include "core/shm.h"
 #include "wayland/server.h"
 #include "wayland/interface_registry.h"
 #include "wayland/trampoline.h"
 
 using overdraw::core::Compositor;
+using overdraw::core::InputEvent;
+using overdraw::core::InputEventType;
+using overdraw::core::InputSink;
+using overdraw::core::ButtonState;
+using overdraw::core::AxisKind;
+using overdraw::core::WaylandInputBackend;
 using overdraw::core::ShmRegistry;
 using overdraw::wayland::Server;
 using overdraw::wayland::InterfaceRegistry;
@@ -38,9 +46,12 @@ struct Addon {
     std::unique_ptr<Server> server;
     std::unique_ptr<InterfaceRegistry> registry;
     std::unique_ptr<Trampoline> trampoline;
+    std::unique_ptr<WaylandInputBackend> input;
     ShmRegistry shm;  // wl_shm pool mappings (CPU-side, independent of the loop)
     uv_poll_t wirePoll{};
+    uv_poll_t inputPoll{};
     uv_timer_t frameTimer{};
+    int inputFd = -1;  // core-side input socket; owned here, closed in Stop()
     bool loopRunning = false;
 
     // Optional JS callback for frame events. Stored as a ref; called directly
@@ -49,9 +60,18 @@ struct Addon {
     // threads) will need napi_threadsafe_function -- not exercised yet.
     napi_env env = nullptr;
     napi_ref onFrame = nullptr;
+    napi_ref onInput = nullptr;  // optional JS callback(event) for input events
     uint64_t lastNotified = 0;
 };
 Addon g_addon;
+
+// Forwards normalized input events to the JS onInput callback. Same Node thread
+// (driven from the inputPoll handle), so a direct napi_call_function is safe.
+class JsInputSink : public InputSink {
+  public:
+    void onInputEvent(const InputEvent& ev) override;
+};
+JsInputSink g_inputSink;
 
 // Call the JS onFrame(presentedCount) callback if registered. Same-thread.
 void notifyFrame() {
@@ -70,6 +90,85 @@ void notifyFrame() {
 napi_value throwError(napi_env env, const char* msg) {
     napi_throw_error(env, nullptr, msg);
     return nullptr;
+}
+
+// Map the event type to a stable string for the JS payload.
+const char* inputTypeName(InputEventType t) {
+    switch (t) {
+        case InputEventType::PointerEnter:      return "pointerEnter";
+        case InputEventType::PointerLeave:      return "pointerLeave";
+        case InputEventType::PointerMotion:     return "pointerMotion";
+        case InputEventType::PointerButton:     return "pointerButton";
+        case InputEventType::PointerAxis:       return "pointerAxis";
+        case InputEventType::PointerFrame:      return "pointerFrame";
+        case InputEventType::KeyboardEnter:     return "keyboardEnter";
+        case InputEventType::KeyboardLeave:     return "keyboardLeave";
+        case InputEventType::KeyboardKey:       return "keyboardKey";
+        case InputEventType::KeyboardModifiers: return "keyboardModifiers";
+    }
+    return "unknown";
+}
+
+void setU32(napi_env env, napi_value obj, const char* key, uint32_t v) {
+    napi_value n; napi_create_uint32(env, v, &n);
+    napi_set_named_property(env, obj, key, n);
+}
+void setF64(napi_env env, napi_value obj, const char* key, double v) {
+    napi_value n; napi_create_double(env, v, &n);
+    napi_set_named_property(env, obj, key, n);
+}
+void setBool(napi_env env, napi_value obj, const char* key, bool v) {
+    napi_value n; napi_get_boolean(env, v, &n);
+    napi_set_named_property(env, obj, key, n);
+}
+
+void JsInputSink::onInputEvent(const InputEvent& ev) {
+    if (!g_addon.onInput) return;
+    napi_env env = g_addon.env;
+    napi_handle_scope scope;
+    napi_open_handle_scope(env, &scope);
+
+    napi_value obj; napi_create_object(env, &obj);
+    napi_value typeStr;
+    napi_create_string_utf8(env, inputTypeName(ev.type), NAPI_AUTO_LENGTH, &typeStr);
+    napi_set_named_property(env, obj, "type", typeStr);
+    setU32(env, obj, "serial", ev.serial);
+    setU32(env, obj, "time", ev.time);
+
+    switch (ev.type) {
+        case InputEventType::PointerEnter:
+        case InputEventType::PointerMotion:
+            setF64(env, obj, "x", ev.x);
+            setF64(env, obj, "y", ev.y);
+            break;
+        case InputEventType::PointerButton:
+            setU32(env, obj, "button", ev.button);
+            setBool(env, obj, "pressed", ev.buttonState == ButtonState::Pressed);
+            break;
+        case InputEventType::PointerAxis:
+            setBool(env, obj, "horizontal", ev.axis == AxisKind::HorizontalScroll);
+            setF64(env, obj, "value", ev.axisValue);
+            setU32(env, obj, "discrete", static_cast<uint32_t>(ev.axisDiscrete));
+            break;
+        case InputEventType::KeyboardKey:
+            setU32(env, obj, "key", ev.key);  // raw evdev keycode
+            setBool(env, obj, "pressed", ev.buttonState == ButtonState::Pressed);
+            break;
+        case InputEventType::KeyboardModifiers:
+            setU32(env, obj, "modsDepressed", ev.modsDepressed);
+            setU32(env, obj, "modsLatched", ev.modsLatched);
+            setU32(env, obj, "modsLocked", ev.modsLocked);
+            setU32(env, obj, "group", ev.group);
+            break;
+        default:
+            break;  // enter/leave/frame: type+serial+time only
+    }
+
+    napi_value cb, undefined;
+    napi_get_reference_value(env, g_addon.onInput, &cb);
+    napi_get_undefined(env, &undefined);
+    napi_call_function(env, undefined, cb, 1, &obj, nullptr);
+    napi_close_handle_scope(env, scope);
 }
 
 // --- helpers to read generated signature objects into InterfaceDesc ---
@@ -141,6 +240,11 @@ void onWireReadable(uv_poll_t*, int status, int) {
     g_addon.compositor->drainWire();
 }
 
+void onInputReadable(uv_poll_t*, int status, int) {
+    if (status < 0 || !g_addon.input) return;
+    g_addon.input->drain();
+}
+
 void onFrameTimer(uv_timer_t*) {
     if (!g_addon.compositor) return;
     g_addon.compositor->renderFrame();
@@ -153,10 +257,10 @@ void onFrameTimer(uv_timer_t*) {
     }
 }
 
-// start(gpuBinPath, onFrame?) -> { width, height }
+// start(gpuBinPath, onFrame?, onInput?) -> { width, height }
 napi_value Start(napi_env env, napi_callback_info info) {
-    size_t argc = 2;
-    napi_value argv[2];
+    size_t argc = 3;
+    napi_value argv[3];
     napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
     if (argc < 1) return throwError(env, "start(gpuBinPath) requires a path");
 
@@ -165,22 +269,29 @@ napi_value Start(napi_env env, napi_callback_info info) {
     if (napi_get_value_string_utf8(env, argv[0], gpuBin, sizeof(gpuBin), &len) != napi_ok)
         return throwError(env, "gpuBinPath must be a string");
 
-    // Optional frame-event callback.
+    // Optional frame-event + input-event callbacks.
     g_addon.env = env;
     if (argc >= 2) {
         napi_valuetype t;
         napi_typeof(env, argv[1], &t);
         if (t == napi_function) napi_create_reference(env, argv[1], 1, &g_addon.onFrame);
     }
+    if (argc >= 3) {
+        napi_valuetype t;
+        napi_typeof(env, argv[2], &t);
+        if (t == napi_function) napi_create_reference(env, argv[2], 1, &g_addon.onInput);
+    }
 
     auto gpu = overdraw::core::spawnGpuProcess(gpuBin);
     if (gpu.pid < 0) return throwError(env, "failed to spawn gpu process");
+    g_addon.inputFd = gpu.inputFd;
 
     g_addon.compositor = std::make_unique<Compositor>(gpu.wireFd, gpu.ctrlFd, gpu.pid);
     if (!g_addon.compositor->bringUp()) {
         const char* e = g_addon.compositor->error().c_str();
         // Compositor dtor reaps the GPU process.
         g_addon.compositor.reset();
+        if (g_addon.inputFd >= 0) { ::close(g_addon.inputFd); g_addon.inputFd = -1; }
         return throwError(env, e);
     }
 
@@ -188,6 +299,18 @@ napi_value Start(napi_env env, napi_callback_info info) {
     napi_get_uv_event_loop(env, &loop);
     uv_poll_init(loop, &g_addon.wirePoll, g_addon.compositor->wireFd());
     uv_poll_start(&g_addon.wirePoll, UV_READABLE, onWireReadable);
+
+    // Input backend: maps host-forwarded events to normalized events. Output
+    // logical size == host window size in phase 1 (scale 1).
+    if (g_addon.inputFd >= 0) {
+        g_addon.input = std::make_unique<WaylandInputBackend>(
+            g_addon.inputFd, g_addon.compositor->windowWidth(),
+            g_addon.compositor->windowHeight());
+        g_addon.input->start(&g_inputSink);
+        uv_poll_init(loop, &g_addon.inputPoll, g_addon.inputFd);
+        uv_poll_start(&g_addon.inputPoll, UV_READABLE, onInputReadable);
+    }
+
     uv_timer_init(loop, &g_addon.frameTimer);
     uv_timer_start(&g_addon.frameTimer, onFrameTimer, 0, 16);  // ~60Hz
     g_addon.loopRunning = true;
@@ -214,8 +337,17 @@ napi_value Stop(napi_env env, napi_callback_info) {
         uv_poll_stop(&g_addon.wirePoll);
         uv_close(reinterpret_cast<uv_handle_t*>(&g_addon.frameTimer), nullptr);
         uv_close(reinterpret_cast<uv_handle_t*>(&g_addon.wirePoll), nullptr);
+        if (g_addon.input) {
+            uv_poll_stop(&g_addon.inputPoll);
+            uv_close(reinterpret_cast<uv_handle_t*>(&g_addon.inputPoll), nullptr);
+        }
         g_addon.loopRunning = false;
     }
+    if (g_addon.input) {
+        g_addon.input->stop();
+        g_addon.input.reset();
+    }
+    if (g_addon.inputFd >= 0) { ::close(g_addon.inputFd); g_addon.inputFd = -1; }
     if (g_addon.compositor) {
         g_addon.compositor->shutdown();
         g_addon.compositor.reset();
@@ -223,6 +355,10 @@ napi_value Stop(napi_env env, napi_callback_info) {
     if (g_addon.onFrame) {
         napi_delete_reference(env, g_addon.onFrame);
         g_addon.onFrame = nullptr;
+    }
+    if (g_addon.onInput) {
+        napi_delete_reference(env, g_addon.onInput);
+        g_addon.onInput = nullptr;
     }
     g_addon.lastNotified = 0;
     napi_value undef; napi_get_undefined(env, &undef);
@@ -467,6 +603,46 @@ napi_value RemoveSurface(napi_env env, napi_callback_info info) {
     return undef;
 }
 
+// setSurfaceLayout(surfaceId, x, y, w, h) -> undefined
+// Placement is owned by JS; this stores the surface's output-pixel rect. w/h of
+// 0 means "use the surface's content size".
+napi_value SetSurfaceLayout(napi_env env, napi_callback_info info) {
+    size_t argc = 5; napi_value argv[5];
+    napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+    if (argc < 5) return throwError(env, "setSurfaceLayout(surfaceId, x, y, w, h)");
+    if (g_addon.compositor) {
+        uint32_t id = 0, w = 0, h = 0; int32_t x = 0, y = 0;
+        napi_get_value_uint32(env, argv[0], &id);
+        napi_get_value_int32(env, argv[1], &x);
+        napi_get_value_int32(env, argv[2], &y);
+        napi_get_value_uint32(env, argv[3], &w);
+        napi_get_value_uint32(env, argv[4], &h);
+        g_addon.compositor->setSurfaceLayout(id, x, y, w, h);
+    }
+    napi_value undef; napi_get_undefined(env, &undef);
+    return undef;
+}
+
+// setStack(idsArray) -> undefined. Back-to-front draw order; JS owns it.
+napi_value SetStack(napi_env env, napi_callback_info info) {
+    size_t argc = 1; napi_value argv[1];
+    napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+    if (argc < 1) return throwError(env, "setStack(ids[]) requires an array");
+    if (g_addon.compositor) {
+        uint32_t n = 0; napi_get_array_length(env, argv[0], &n);
+        std::vector<uint32_t> ids;
+        ids.reserve(n);
+        for (uint32_t i = 0; i < n; ++i) {
+            napi_value v; napi_get_element(env, argv[0], i, &v);
+            uint32_t id = 0; napi_get_value_uint32(env, v, &id);
+            ids.push_back(id);
+        }
+        g_addon.compositor->setStack(ids);
+    }
+    napi_value undef; napi_get_undefined(env, &undef);
+    return undef;
+}
+
 // surfaceReadback(surfaceId) -> Buffer (width*height*4 BGRA) | null
 // Test hook: read the uploaded surface texture back to CPU. Relies on the
 // swapchain using a non-blocking present mode (Mailbox) so the GPU process's
@@ -518,6 +694,8 @@ napi_value Init(napi_env env, napi_value exports) {
     reg("commitSurfaceBuffer", CommitSurfaceBuffer);
     reg("commitSurfaceDmabuf", CommitSurfaceDmabuf);
     reg("removeSurface", RemoveSurface);
+    reg("setSurfaceLayout", SetSurfaceLayout);
+    reg("setStack", SetStack);
     reg("surfaceReadback", SurfaceReadback);
 
     napi_set_named_property(env, exports, "start", fnStart);

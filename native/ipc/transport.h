@@ -11,9 +11,12 @@
 #define OVERDRAW_IPC_TRANSPORT_H_
 
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
+#include <cerrno>
 #include <vector>
 
+#include <poll.h>
 #include <sys/socket.h>
 #include <sys/uio.h>
 #include <unistd.h>
@@ -26,17 +29,30 @@ namespace overdraw::ipc {
 
 class FdSerializer : public dawn::wire::CommandSerializer {
   public:
-    explicit FdSerializer(int fd) : fd_(fd) {}
+    explicit FdSerializer(int fd) : fd_(fd) {
+        // Preallocate so GetCmdSpace never reallocates mid-batch: Dawn requires
+        // pointers from GetCmdSpace to stay valid until Flush(). std::vector data
+        // is at least max_align_t-aligned, satisfying the 8-byte command
+        // alignment Dawn's (de)serializer assumes.
+        buf_.resize(kCapacity);
+    }
 
-    size_t GetMaximumAllocationSize() const override { return 1u << 20; }
+    size_t GetMaximumAllocationSize() const override { return kMaxAllocation; }
 
     // Dawn batches multiple commands between Flush() calls: each GetCmdSpace
     // hands back a region the wire writes one command into, and they accumulate
-    // until Flush. We must APPEND (not overwrite) so the whole batch is sent as
-    // one length-prefixed frame; HandleCommands on the peer processes the batch.
+    // until Flush. We APPEND (not overwrite) so the whole batch is one
+    // length-prefixed frame.
+    //
+    // CRITICAL: each returned region must be 8-byte aligned. Dawn's wire
+    // (de)serializer lays out command structs assuming kWireBufferAlignment (8);
+    // if a command starts at an unaligned offset, the peer mis-reads its u64
+    // fields (observed: a WriteTexture after other commands in the same batch
+    // arrived with a garbage dataLayout.offset, since the prior command's size
+    // left pending_ unaligned). So we round each allocation up to 8 bytes.
     void* GetCmdSpace(size_t size) override {
         size_t offset = pending_;
-        if (offset + size > buf_.size()) buf_.resize(offset + size);
+        if (offset + size > buf_.size()) return nullptr;  // batch overflow
         pending_ = offset + size;
         return buf_.data() + offset;
     }
@@ -50,13 +66,33 @@ class FdSerializer : public dawn::wire::CommandSerializer {
     }
 
   private:
+    // One Dawn command's max payload (matches GetMaximumAllocationSize). A batch
+    // can hold several commands; reserve generously so growth never reallocates.
+    static constexpr size_t kMaxAllocation = 1u << 20;       // 1 MiB
+    static constexpr size_t kCapacity = 16u * (1u << 20);    // 16 MiB headroom
+    // Write all n bytes, handling a non-blocking socket. A large frame (e.g. a
+    // WriteTexture pixel upload) can exceed the socket send buffer; write() then
+    // returns -1/EAGAIN. We must NOT treat that as fatal -- instead poll for the
+    // socket to drain and retry. (Previously EAGAIN was treated as an error, so
+    // frames larger than the send buffer were dropped, and the peer deserialized
+    // whatever partial/garbage bytes did arrive -- seen as a corrupt
+    // dataLayout.offset reaching WriteTexture validation.)
     int writeAll(const void* p, size_t n) {
         const uint8_t* b = static_cast<const uint8_t*>(p);
         while (n) {
             ssize_t w = ::write(fd_, b, n);
-            if (w <= 0) return -1;
-            b += w;
-            n -= static_cast<size_t>(w);
+            if (w > 0) {
+                b += w;
+                n -= static_cast<size_t>(w);
+                continue;
+            }
+            if (w < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+                pollfd pfd{fd_, POLLOUT, 0};
+                ::poll(&pfd, 1, -1);  // wait until the socket can accept more
+                continue;
+            }
+            if (w < 0 && errno == EINTR) continue;
+            return -1;  // real error or peer closed
         }
         return 0;
     }
