@@ -42,9 +42,40 @@ target_link_libraries(overdraw-gpu-process PRIVATE
 # -rdynamic so backtrace_symbols_fd can resolve function names in the crash handler.
 target_link_options(overdraw-gpu-process PRIVATE -rdynamic)
 
-# ---- Core (pure C++ stage; Node/N-API wrapping comes later) ----
+# ---- Core (pure C++ stage; kept as a regression baseline during the Node pivot) ----
 add_executable(overdraw-core
     core/src/main.cpp)
 target_include_directories(overdraw-core PRIVATE ${IPC_INCLUDE})
 target_link_libraries(overdraw-core PRIVATE
     dawn::webgpu_dawn_wire pthread dl rt)
+
+# ---- Core N-API addon (Node-hosted core) ----
+# Locate Node addon headers (node_api.h). Prefer the running node's bundled
+# headers; fall back to the node-gyp cache for this version.
+execute_process(
+    COMMAND node -p "require('path').join(process.execPath,'..','..','include','node')"
+    OUTPUT_VARIABLE NODE_INCLUDE_DIR OUTPUT_STRIP_TRAILING_WHITESPACE
+    RESULT_VARIABLE NODE_INCLUDE_RESULT)
+if(NOT EXISTS "${NODE_INCLUDE_DIR}/node_api.h")
+    execute_process(
+        COMMAND node -p "process.version.slice(1)"
+        OUTPUT_VARIABLE NODE_VERSION OUTPUT_STRIP_TRAILING_WHITESPACE)
+    set(NODE_INCLUDE_DIR "$ENV{HOME}/.cache/node-gyp/${NODE_VERSION}/include/node")
+endif()
+if(NOT EXISTS "${NODE_INCLUDE_DIR}/node_api.h")
+    message(FATAL_ERROR "node_api.h not found (looked in ${NODE_INCLUDE_DIR})")
+endif()
+message(STATUS "Node addon headers: ${NODE_INCLUDE_DIR}")
+
+add_library(overdraw_native MODULE
+    native/napi/addon.cpp)
+set_target_properties(overdraw_native PROPERTIES
+    PREFIX "" SUFFIX ".node")
+target_compile_definitions(overdraw_native PRIVATE
+    NODE_GYP_MODULE_NAME=overdraw_native BUILDING_NODE_EXTENSION)
+target_include_directories(overdraw_native PRIVATE
+    ${IPC_INCLUDE} ${NODE_INCLUDE_DIR})
+target_link_libraries(overdraw_native PRIVATE
+    dawn::webgpu_dawn_wire pthread dl rt)
+# N-API symbols (napi_*) are resolved from the host node process at load time;
+# a MODULE/shared object leaves them undefined at link by default.
