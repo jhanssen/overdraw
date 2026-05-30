@@ -20,6 +20,7 @@
 #include "core/gpu_process.h"
 #include "core/input.h"
 #include "core/input_wayland.h"
+#include "input_channel.h"
 #include "core/shm.h"
 #include "wayland/server.h"
 #include "wayland/interface_registry.h"
@@ -804,6 +805,74 @@ napi_value InjectInput(napi_env env, napi_callback_info info) {
     return undef;
 }
 
+// injectHostInput(event) -> boolean
+// Like injectInput, but feeds a forwarded ipc::InputMessage through the REAL
+// WaylandInputBackend normalization (fixed-point -> output space, evdev codes,
+// state/axis enums) -- the layer injectInput skips. Pointer x/y are LOGICAL
+// output-space doubles here; we encode them to wl_fixed_t (x256) so the test
+// exercises the round-trip. Returns false if no input backend is active.
+napi_value InjectHostInput(napi_env env, napi_callback_info info) {
+    size_t argc = 1; napi_value argv[1];
+    napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+    if (argc < 1) return throwError(env, "injectHostInput(event) requires an event object");
+    if (!g_addon.input) { napi_value f; napi_get_boolean(env, false, &f); return f; }
+
+    std::string type = getStr(env, argv[0], "type");
+    overdraw::ipc::InputMessage m{};
+    m.serial = getU32(env, argv[0], "serial");
+    m.time = getU32(env, argv[0], "time");
+    auto toFixed = [](double v) { return static_cast<int32_t>(v * 256.0); };
+
+    if (type == "pointerEnter") {
+        m.tag = overdraw::ipc::InputTag::PointerEnter;
+        m.surfaceX = toFixed(getF64(env, argv[0], "x"));
+        m.surfaceY = toFixed(getF64(env, argv[0], "y"));
+    } else if (type == "pointerLeave") {
+        m.tag = overdraw::ipc::InputTag::PointerLeave;
+    } else if (type == "pointerMotion") {
+        m.tag = overdraw::ipc::InputTag::PointerMotion;
+        m.surfaceX = toFixed(getF64(env, argv[0], "x"));
+        m.surfaceY = toFixed(getF64(env, argv[0], "y"));
+    } else if (type == "pointerButton") {
+        m.tag = overdraw::ipc::InputTag::PointerButton;
+        m.button = getU32(env, argv[0], "button");
+        m.state = getBoolProp(env, argv[0], "pressed")
+                      ? static_cast<uint32_t>(overdraw::ipc::KeyState::Pressed)
+                      : static_cast<uint32_t>(overdraw::ipc::KeyState::Released);
+    } else if (type == "pointerAxis") {
+        m.tag = overdraw::ipc::InputTag::PointerAxis;
+        m.axis = getBoolProp(env, argv[0], "horizontal")
+                     ? static_cast<uint32_t>(overdraw::ipc::PointerAxisKind::HorizontalScroll)
+                     : static_cast<uint32_t>(overdraw::ipc::PointerAxisKind::VerticalScroll);
+        m.axisValue = toFixed(getF64(env, argv[0], "value"));
+        m.axisDiscrete = static_cast<int32_t>(getU32(env, argv[0], "discrete"));
+    } else if (type == "pointerFrame") {
+        m.tag = overdraw::ipc::InputTag::PointerFrame;
+    } else if (type == "keyboardEnter") {
+        m.tag = overdraw::ipc::InputTag::KeyboardEnter;
+    } else if (type == "keyboardLeave") {
+        m.tag = overdraw::ipc::InputTag::KeyboardLeave;
+    } else if (type == "keyboardKey") {
+        m.tag = overdraw::ipc::InputTag::KeyboardKey;
+        m.key = getU32(env, argv[0], "key");
+        m.state = getBoolProp(env, argv[0], "pressed")
+                      ? static_cast<uint32_t>(overdraw::ipc::KeyState::Pressed)
+                      : static_cast<uint32_t>(overdraw::ipc::KeyState::Released);
+    } else if (type == "keyboardModifiers") {
+        m.tag = overdraw::ipc::InputTag::KeyboardMods;
+        m.modsDepressed = getU32(env, argv[0], "modsDepressed");
+        m.modsLatched = getU32(env, argv[0], "modsLatched");
+        m.modsLocked = getU32(env, argv[0], "modsLocked");
+        m.group = getU32(env, argv[0], "group");
+    } else {
+        return throwError(env, "injectHostInput: unknown event.type");
+    }
+
+    g_addon.input->injectMessage(m);
+    napi_value t; napi_get_boolean(env, true, &t);
+    return t;
+}
+
 // removeSurface(surfaceId) -> undefined
 napi_value RemoveSurface(napi_env env, napi_callback_info info) {
     size_t argc = 1; napi_value argv[1];
@@ -982,6 +1051,7 @@ napi_value Init(napi_env env, napi_value exports) {
     reg("takeImportedSurfaces", TakeImportedSurfaces);
     reg("takeFreedBuffers", TakeFreedBuffers);
     reg("injectInput", InjectInput);
+    reg("injectHostInput", InjectHostInput);
     reg("removeSurface", RemoveSurface);
     reg("setSurfaceLayout", SetSurfaceLayout);
     reg("setStack", SetStack);

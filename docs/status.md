@@ -186,10 +186,13 @@ without touching anything above it.
   the Node main thread; events are delivered to an optional `onInput` JS callback
   (`start(gpuBin, onFrame?, onInput?)`) as plain objects — same-thread
   `napi_call_function`, no threadsafe function needed.
-- Verified end-to-end **interactively** (`test/input-smoke.mjs`, needs GPU + host
-  Wayland + a human) on the RTX 5060 / Hyprland: pointer enter/motion/frame and
-  keyboard enter/key/modifiers all reach the JS callback; coordinates and evdev
-  keycodes correct. **PASS.** (Not CI-able: input requires real user activity.)
+- Verified originally on the RTX 5060 / Hyprland with a real host seat: pointer
+  enter/motion/frame and keyboard enter/key/modifiers all reach the JS callback;
+  coordinates and evdev keycodes correct. The interactive harness that proved
+  this (`test/input-smoke.mjs`) has since been REMOVED (interactive); the durable
+  normalization + routing is now covered automatically by `injectHostInput` (see
+  "Testing"). The host-seat→socket forwarding it also exercised is phase-1
+  nesting scaffolding, not a durable path.
 - Fixed while building this: the GPU process's host-connection `pump()` only
   called `wl_display_dispatch_pending` (drains the in-memory queue) and never
   READ the socket, so host events sat unread forever. Now does
@@ -638,14 +641,30 @@ follows the same model.
   - `test/harness-client.c`: a controllable shm client — argv config (`--socket`,
     `--size WxH`, `--color AARRGGBB`, `--title`, `--app-id`), maps one toplevel,
     holds the surface until SIGTERM (harness controls lifetime; no sleeps).
-  - **Synthetic input backend**: `addon.injectInput(event)` feeds a normalized
-    `InputEvent` through the SAME `InputSink` the host seat uses, so it routes to
-    the seat exactly as a real host event would — the analog of Hyprland's test
-    plugin injecting `IKeyboard` events, but reusing the existing
-    `native/core/input.h` seam (no virtual-input protocol).
-  - `test/integration.gpu.mjs`: 5 tests, all passing — client map→query
+  - **Synthetic input backend, two depths:**
+    - `addon.injectInput(event)` feeds a normalized `InputEvent` directly into the
+      `InputSink` the seat consumes (skips backend normalization).
+    - `addon.injectHostInput(event)` feeds a forwarded `ipc::InputMessage` through
+      the REAL `WaylandInputBackend` normalization (`convert()`, shared with the
+      live `drain()` path: fixed-point↔logical, evdev codes, state/axis enums)
+      then to the sink. Logical pointer coords are encoded to `wl_fixed_t` and
+      converted back, exercising the round-trip. This is the analog of Hyprland's
+      test plugin injecting at the input layer, reusing the existing
+      `native/core/input.h` seam (no virtual-input protocol).
+  - `test/integration.gpu.mjs`: 7 tests, all passing — client map→query
     (title/app_id/size), two-client stacking order, focus-on-map,
-    follow-pointer focus enter/clear, click-to-focus press + persist-on-leave.
+    follow-pointer focus enter/clear, click-to-focus press + persist-on-leave,
+    plus two HOST-PATH tests via `injectHostInput` (motion drives focus through
+    the real backend normalization; key to focused window).
+- **`input-smoke` removed** (was interactive — required a human to move the mouse
+  / type over the nested window). Its durable, product-relevant coverage (the
+  `WaylandInputBackend` normalization + seat routing → focus/clients) is now
+  automated via `injectHostInput`. The only thing it additionally exercised was
+  the phase-1 NESTING scaffolding — the GPU process binding the host
+  `wl_seat`/`wl_pointer`/`wl_keyboard` (`host_window.cpp`) and `ipc::sendInput`
+  forwarding over the socket — which is not a durable code path (it is replaced
+  by a libinput backend at the same `InputBackend` seam in phase 2), so it is not
+  worth an automated test. No interactive tests remain.
 - **Not yet built (testing):** a frame-readback primitive for the optional
   GPU-box-only PIXEL layer (`readbackFrame` + computed-expectation comparison —
   the current `surfaceReadback` reads one surface texture, not the composited

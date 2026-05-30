@@ -71,6 +71,12 @@ export interface Addon {
   // sink the host seat uses, so it routes to onInput / the seat exactly as a real
   // host event would. Used by integration tests to drive focus/pointer behavior.
   injectInput(event: InputEvent): void;
+  // Like injectInput, but routes through the REAL WaylandInputBackend
+  // normalization (fixed-point -> output space, evdev codes) -- the layer
+  // injectInput skips. Pointer x/y are logical output-space coords. Returns false
+  // if no input backend is active. Supersedes the manual input-smoke path (all
+  // but the GPU-process host-seat listener, which needs a real device).
+  injectHostInput(event: InputEvent): boolean;
   removeSurface(id: number): void;
   setSurfaceLayout(id: number, x: number, y: number, w: number, h: number): void;
   setStack(ids: number[]): void;

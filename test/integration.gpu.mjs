@@ -9,7 +9,10 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 
-import { setupCompositor, canRunGpu, pointerMotion, pointerButton } from "./harness.mjs";
+import {
+  setupCompositor, canRunGpu, pointerMotion, pointerButton,
+  pointerMotionHost, keyHost,
+} from "./harness.mjs";
 
 const BTN_LEFT = 0x110;
 const skip = canRunGpu() ? false : "needs GPU + host Wayland (WAYLAND_DISPLAY unset)";
@@ -85,6 +88,57 @@ test("follow-pointer: motion over window sets pointer + keyboard focus; off clea
       { what: "focus cleared" });
     assert.equal(outside.pointerFocus, null);
     assert.equal(outside.keyboardFocus, null);
+  } finally {
+    await c.teardown();
+  }
+});
+
+// Host-path coverage: drive input through the REAL WaylandInputBackend
+// normalization (injectHostInput) rather than the pre-normalized sink. This is
+// the path the manual input-smoke test exercised (minus the GPU-process host
+// wl_seat listener, which needs a real device). Asserting focus via query()
+// proves the fixed-point<->logical conversion + backend + seat chain end to end.
+test("host input path: motion via injectHostInput drives focus (supersedes input-smoke)", { skip }, async () => {
+  const c = await setupCompositor({ focus: { policy: "follow-pointer", focusOnMap: false } });
+  try {
+    const { ready } = c.spawnClient(["--size", "300x200"]); await ready;
+    const snap = await c.waitFor(c.query, (s) => s.windows.length === 1, { what: "window" });
+    const w = snap.windows[0];
+    assert.equal(snap.keyboardFocus, null);
+
+    // Logical coords -> addon encodes to wl_fixed_t -> backend converts back.
+    pointerMotionHost(c.addon, w.rect.x + 7, w.rect.y + 9);
+    const inside = await c.waitFor(
+      c.query, (s) => s.pointerFocus === w.surfaceId && s.keyboardFocus === w.surfaceId,
+      { what: "host-path focus inside" });
+    assert.equal(inside.pointerFocus, w.surfaceId);
+
+    // Move off; focus clears -- proves leave routing through the real backend.
+    pointerMotionHost(c.addon, w.rect.x + w.rect.width + 400, w.rect.y + w.rect.height + 400);
+    const outside = await c.waitFor(
+      c.query, (s) => s.pointerFocus === null && s.keyboardFocus === null,
+      { what: "host-path focus cleared" });
+    assert.equal(outside.keyboardFocus, null);
+  } finally {
+    await c.teardown();
+  }
+});
+
+test("host input path: keyboard key to focused window does not throw (supersedes input-smoke keys)", { skip }, async () => {
+  const c = await setupCompositor({ focus: { policy: "follow-pointer", focusOnMap: true } });
+  try {
+    const { ready } = c.spawnClient([]); await ready;
+    const snap = await c.waitFor(
+      c.query, (s) => s.windows.length === 1 && s.keyboardFocus === s.windows[0].surfaceId,
+      { what: "kb focus on map" });
+    // KEY_A = 30 (evdev). Routed through backend -> seat -> focused client's
+    // wl_keyboard. We can't observe client receipt via query(), but this drives
+    // the xkb keyUpdate + wl_keyboard.send_key path; assert it completes and
+    // focus is unchanged.
+    keyHost(c.addon, 30, true);
+    keyHost(c.addon, 30, false);
+    await new Promise((r) => setTimeout(r, 30));
+    assert.equal(c.query().keyboardFocus, snap.keyboardFocus);
   } finally {
     await c.teardown();
   }

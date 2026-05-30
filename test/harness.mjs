@@ -112,7 +112,8 @@ export async function setupCompositor(opts = {}) {
   return { addon, state, sock, dims, query: () => state.query(), spawnClient, waitFor, teardown };
 }
 
-// Convenience input injectors (output-space coords).
+// Convenience input injectors (output-space coords). These use injectInput,
+// which enters at the normalized InputEvent sink (skips backend normalization).
 export function pointerMotion(addon, x, y, time = 0) {
   addon.injectInput({ type: "pointerMotion", x, y, time });
   addon.injectInput({ type: "pointerFrame", time });
@@ -120,4 +121,19 @@ export function pointerMotion(addon, x, y, time = 0) {
 export function pointerButton(addon, button, pressed, { serial = 1, time = 0 } = {}) {
   addon.injectInput({ type: "pointerButton", button, pressed, serial, time });
   addon.injectInput({ type: "pointerFrame", time });
+}
+
+// Host-path injectors: route through the REAL WaylandInputBackend normalization
+// (fixed-point <-> logical, evdev codes) -- the layer the injectInput variants
+// skip. Used to cover the path the manual input-smoke test exercised.
+export function pointerMotionHost(addon, x, y, time = 0) {
+  addon.injectHostInput({ type: "pointerMotion", x, y, time });
+  addon.injectHostInput({ type: "pointerFrame", time });
+}
+export function pointerButtonHost(addon, button, pressed, { serial = 1, time = 0 } = {}) {
+  addon.injectHostInput({ type: "pointerButton", button, pressed, serial, time });
+  addon.injectHostInput({ type: "pointerFrame", time });
+}
+export function keyHost(addon, key, pressed, { serial = 1, time = 0 } = {}) {
+  addon.injectHostInput({ type: "keyboardKey", key, pressed, serial, time });
 }

@@ -18,6 +18,8 @@
 
 #include "input.h"
 
+namespace overdraw::ipc { struct InputMessage; }
+
 namespace overdraw::core {
 
 class WaylandInputBackend : public InputBackend {
@@ -36,7 +38,17 @@ class WaylandInputBackend : public InputBackend {
     // Update the output logical size used for coordinate mapping (resize).
     void setOutputSize(uint32_t width, uint32_t height) { width_ = width; height_ = height; }
 
+    // Test seam: feed a forwarded InputMessage through the SAME conversion path
+    // drain() uses, emitting the resulting InputEvent to the sink. This exercises
+    // the normalization layer (fixed-point -> output space, evdev codes, state/
+    // axis enums) that injecting a pre-normalized InputEvent would bypass. The
+    // only part of the real host path not covered is the GPU process's host
+    // wl_seat listener + socket send, which need a real host device to drive.
+    void injectMessage(const ipc::InputMessage& m);
+
   private:
+    bool convert(const ipc::InputMessage& m, InputEvent& ev) const;
+
     int inputFd_;
     uint32_t width_;
     uint32_t height_;
