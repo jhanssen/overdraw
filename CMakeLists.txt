@@ -23,6 +23,7 @@ add_compile_options($<$<COMPILE_LANGUAGE:CXX>:-fno-rtti>)
 
 # Shared IPC headers (side-channel protocol + transport).
 set(IPC_INCLUDE ${CMAKE_SOURCE_DIR}/native/ipc)
+set(NATIVE_INCLUDE ${CMAKE_SOURCE_DIR}/native)
 
 # Checked-in xdg-shell client glue (generated once via wayland-scanner).
 set(XDG_SHELL_DIR ${CMAKE_SOURCE_DIR}/native/wayland/generated)
@@ -42,12 +43,18 @@ target_link_libraries(overdraw-gpu-process PRIVATE
 # -rdynamic so backtrace_symbols_fd can resolve function names in the crash handler.
 target_link_options(overdraw-gpu-process PRIVATE -rdynamic)
 
-# ---- Core (pure C++ stage; kept as a regression baseline during the Node pivot) ----
-add_executable(overdraw-core
-    core/src/main.cpp)
-target_include_directories(overdraw-core PRIVATE ${IPC_INCLUDE})
-target_link_libraries(overdraw-core PRIVATE
+# ---- Shared core library (native side of the Node-hosted core) ----
+# Compiled once and linked by the addon (and any future native consumer), so
+# core logic is not duplicated.
+add_library(overdraw_core STATIC
+    native/core/gpu_process.cpp
+    native/core/wire_link.cpp
+    native/core/compositor.cpp)
+target_include_directories(overdraw_core PUBLIC
+    ${IPC_INCLUDE} ${NATIVE_INCLUDE})
+target_link_libraries(overdraw_core PUBLIC
     dawn::webgpu_dawn_wire pthread dl rt)
+set_target_properties(overdraw_core PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
 # ---- Core N-API addon (Node-hosted core) ----
 # Locate Node addon headers (node_api.h). Prefer the running node's bundled
@@ -74,8 +81,8 @@ set_target_properties(overdraw_native PROPERTIES
 target_compile_definitions(overdraw_native PRIVATE
     NODE_GYP_MODULE_NAME=overdraw_native BUILDING_NODE_EXTENSION)
 target_include_directories(overdraw_native PRIVATE
-    ${IPC_INCLUDE} ${NODE_INCLUDE_DIR})
+    ${IPC_INCLUDE} ${NATIVE_INCLUDE} ${NODE_INCLUDE_DIR})
 target_link_libraries(overdraw_native PRIVATE
-    dawn::webgpu_dawn_wire pthread dl rt)
+    overdraw_core dawn::webgpu_dawn_wire pthread dl rt)
 # N-API symbols (napi_*) are resolved from the host node process at load time;
 # a MODULE/shared object leaves them undefined at link by default.
