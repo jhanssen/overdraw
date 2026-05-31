@@ -373,6 +373,42 @@ int run(int wireFd, int ctrlFd, int inputFd, bool headless,
     //    host window is closed. The core drives the swapchain over the wire.
     bool shutdown = false;
 
+    // --- Plugin wire connections (C-M2) ---------------------------------------
+    // Each plugin gets its OWN wire connection (architecture.md "IPC": one
+    // dawn::wire::Server per connected client). The connection's GPU-end fd is
+    // delivered by the core over the side channel (AddWireConn, SCM_RIGHTS); there
+    // is NO listening socket, so only the trusted core can introduce a connection.
+    // Each connection has its own WireServer + serializer + reader + native
+    // instance; the plugin's wire client (in its Worker) drives ReserveInstance/
+    // RequestAdapter/RequestDevice over it, exactly as the core does on its own
+    // connection. The native device is resolved lazily (server.GetDevice) when the
+    // plugin first needs server-side work (STM import, C-M4).
+    struct PluginConn {
+        uint32_t connId = 0;
+        int fd = -1;
+        std::unique_ptr<ipc::FdSerializer> serializer;
+        std::unique_ptr<ipc::FrameReader> reader;
+        std::unique_ptr<dawn::native::Instance> instance;
+        std::unique_ptr<dawn::wire::WireServer> server;
+        WGPUDevice tickDev = nullptr;  // set once the plugin device is resolved
+        bool registered = false;       // added to the event loop yet
+
+        // Read + dispatch buffered wire frames, advance Dawn, pump outbound. NB.
+        bool pump() {
+            bool alive = reader->readAvailable();
+            std::vector<uint8_t> frame;
+            while (reader->nextFrame(frame)) {
+                server->HandleCommands(reinterpret_cast<const char*>(frame.data()),
+                                       frame.size());
+                serializer->Flush();
+            }
+            dawn::native::InstanceProcessEvents(instance->Get());
+            if (tickDev) { dawn::native::DeviceTick(tickDev); serializer->Flush(); }
+            return alive;
+        }
+    };
+    std::vector<std::unique_ptr<PluginConn>> pluginConns;
+
     // Import a client dmabuf (fd owned by us) and inject the texture. Sends the
     // ClientTexImported reply. Caller must ensure the wire reader has reached
     // m.wireSerial first (so the prior UnregisterObjectCmd for this recycled
@@ -461,6 +497,62 @@ int run(int wireFd, int ctrlFd, int inputFd, bool headless,
         {
             if (m.tag == ipc::Tag::Shutdown) {
                 shutdown = true;
+            } else if (m.tag == ipc::Tag::AddWireConn) {
+                // Register a new plugin wire connection from the fd the core sent
+                // (SCM_RIGHTS). No listening socket: only the trusted core, over
+                // this side channel, can introduce a connection.
+                ipc::Message reply{};
+                reply.tag = ipc::Tag::WireConnAdded;
+                reply.connId = m.connId;
+                reply.ok = 0;
+                if (nRecvFds < 1) {
+                    std::fprintf(stderr, "[gpu] AddWireConn: no fd received\n");
+                    ipc::sendMessage(ctrlFd, reply);
+                } else {
+                    int connFd = recvFds[0];
+                    ipc::setNonBlocking(connFd);
+                    const int wb = 8 * 1024 * 1024;
+                    ::setsockopt(connFd, SOL_SOCKET, SO_SNDBUF, &wb, sizeof(wb));
+                    ::setsockopt(connFd, SOL_SOCKET, SO_RCVBUF, &wb, sizeof(wb));
+                    auto pc = std::make_unique<PluginConn>();
+                    pc->connId = m.connId;
+                    pc->fd = connFd;
+                    pc->serializer = std::make_unique<ipc::FdSerializer>(connFd);
+                    pc->reader = std::make_unique<ipc::FrameReader>(connFd);
+                    pc->instance = std::make_unique<dawn::native::Instance>();
+                    dawn::wire::WireServerDescriptor wsd2{};
+                    wsd2.procs = &dawn::native::GetProcs();
+                    wsd2.serializer = pc->serializer.get();
+                    wsd2.useSpontaneousCallbacks = true;  // RequestDevice cb over wire
+                    pc->server = std::make_unique<dawn::wire::WireServer>(wsd2);
+                    std::printf("[gpu] AddWireConn: connId=%u fd=%d registered\n",
+                                m.connId, connFd);
+                    pluginConns.push_back(std::move(pc));
+                    reply.ok = 1;
+                    ipc::sendMessage(ctrlFd, reply);
+                }
+            } else if (m.tag == ipc::Tag::InjectPluginInstance) {
+                // Inject the connection's native instance at the handle the
+                // plugin's wire client reserved (relayed by the core). Mirrors the
+                // core's own ReserveInstance/InjectInstance bring-up.
+                ipc::Message reply{};
+                reply.tag = ipc::Tag::PluginInstanceInjected;
+                reply.connId = m.connId;
+                reply.ok = 0;
+                PluginConn* pc = nullptr;
+                for (auto& c : pluginConns) if (c->connId == m.connId) { pc = c.get(); break; }
+                if (!pc) {
+                    std::fprintf(stderr, "[gpu] InjectPluginInstance: unknown connId=%u\n", m.connId);
+                } else if (!pc->server->InjectInstance(pc->instance->Get(),
+                                                       {m.instance.id, m.instance.generation})) {
+                    std::fprintf(stderr, "[gpu] InjectPluginInstance: InjectInstance failed\n");
+                } else {
+                    pc->serializer->Flush();
+                    std::printf("[gpu] InjectPluginInstance: connId=%u instance {%u,%u}\n",
+                                m.connId, m.instance.id, m.instance.generation);
+                    reply.ok = 1;
+                }
+                ipc::sendMessage(ctrlFd, reply);
             } else if (m.tag == ipc::Tag::BeginAccess) {
                 // Begin access so the core's wire render commands may target the
                 // dmabuf texture. Vulkan layout state is mandatory on this
@@ -609,12 +701,36 @@ int run(int wireFd, int ctrlFd, int inputFd, bool headless,
     if (hostFd >= 0)
         loop->add(hostFd, gpu::EventLoop::kRead, [&](uint32_t) { window.pump(); });
 
+    // Re-arm a plugin connection's epoll interest (write only when output queued).
+    auto armPluginConn = [&](PluginConn* pc) {
+        uint32_t ev = gpu::EventLoop::kRead;
+        if (pc->serializer->hasPendingOut()) ev |= gpu::EventLoop::kWrite;
+        loop->modify(pc->fd, ev);
+    };
+    // Register any plugin connection added at runtime (via AddWireConn) with the
+    // event loop. Its callback pumps that connection's own WireServer + instance.
+    auto registerPluginConns = [&] {
+        for (auto& cptr : pluginConns) {
+            if (cptr->registered) continue;
+            PluginConn* pc = cptr.get();
+            pc->registered = true;
+            loop->add(pc->fd, gpu::EventLoop::kRead, [&, pc](uint32_t ready) {
+                if (ready & gpu::EventLoop::kWrite) pc->serializer->pumpOut();
+                if (ready & gpu::EventLoop::kRead) pc->pump();
+                armPluginConn(pc);
+            });
+        }
+    };
+
     while (!shutdown && (headless || !window.shouldClose())) {
         loop->runOnce(8);   // 8ms cap: also advances Dawn + host pump below
         pumpWire();          // DeviceTick + drain wire, even with no fd ready
         drainPendingImports();
+        registerPluginConns();          // pick up connections added this iteration
+        for (auto& pc : pluginConns) pc->pump();  // advance each plugin connection
         if (!headless) window.pump();  // service host events (no window headless)
         armWire();
+        for (auto& pc : pluginConns) armPluginConn(pc.get());
     }
 
     for (auto& [id, ct] : clientTextures) {
@@ -625,6 +741,13 @@ int run(int wireFd, int ctrlFd, int inputFd, bool headless,
     clientTextures.clear();
     for (auto& p : pendingImports) if (p.fd >= 0) ::close(p.fd);
     pendingImports.clear();
+    for (auto& pc : pluginConns) {
+        if (pc->registered) loop->remove(pc->fd);
+        pc->server.reset();
+        pc->instance.reset();
+        if (pc->fd >= 0) ::close(pc->fd);
+    }
+    pluginConns.clear();
     dmaTex = nullptr;
     dmaMem = nullptr;
     alloc.release(dmaBuf);

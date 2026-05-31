@@ -98,6 +98,22 @@ class Compositor {
     int wireFd() const { return link_->wireFd(); }
     int ctrlFd() const { return ctrlFd_; }
 
+    // --- Plugin wire connections (C-M2) ---------------------------------------
+    // Create a new plugin wire connection: socketpair, send the GPU-end fd to the
+    // GPU process over the side channel (AddWireConn, SCM_RIGHTS), and return the
+    // CLIENT-end fd (owned by the caller -> handed to the plugin's Worker) plus
+    // an opaque connId. The GPU-process registration completes asynchronously;
+    // poll wireConnAdded(connId). Returns clientFd=-1 on failure.
+    struct PluginConnHandle { uint32_t connId; int clientFd; };
+    PluginConnHandle addWireConnection();
+    // Relay the instance handle the plugin's wire client reserved so the GPU
+    // process injects its native instance at that handle. Completion is async;
+    // poll pluginInstanceInjected(connId).
+    void injectPluginInstance(uint32_t connId, uint32_t instanceId, uint32_t instanceGen);
+    // Async-completion polls (driven by drainCtrl): 0=pending, 1=ok, 2=failed.
+    int wireConnAdded(uint32_t connId) const;
+    int pluginInstanceInjected(uint32_t connId) const;
+
     // The JS compositor drives every frame: it acquires the output texture,
     // renders into it over the wire, and presents. The C++ Compositor no longer
     // has a compositing pass -- it provides WSI (surface/acquire/present), dmabuf
@@ -146,6 +162,12 @@ class Compositor {
     int wireFd_ = -1;  // owned by Compositor; closed in shutdown()
     int ctrlFd_ = -1;  // owned by Compositor; closed in shutdown()
     bool shutdownDone_ = false;
+
+    // Plugin wire connections: async-completion status keyed by connId
+    // (0=pending, 1=ok, 2=failed), updated by drainCtrl.
+    uint32_t nextConnId_ = 1;
+    std::unordered_map<uint32_t, int> wireConnAdded_;
+    std::unordered_map<uint32_t, int> pluginInstanceInjected_;
 
     bool headless_ = false;
     wgpu::Texture currentOutputTexture_;  // held between acquire + present

@@ -7,6 +7,7 @@
 
 #include <fcntl.h>
 #include <unistd.h>
+#include <sys/socket.h>
 
 #include "gpu_process.h"
 #include "side_channel.h"
@@ -240,6 +241,14 @@ void Compositor::drainCtrl() {
     // loop) is ClientTexImported, completing an async dmabuf import.
     ipc::Message r{};
     while (ipc::recvMessageNB(ctrlFd_, r)) {
+        if (r.tag == ipc::Tag::WireConnAdded) {
+            wireConnAdded_[r.connId] = r.ok ? 1 : 2;
+            continue;
+        }
+        if (r.tag == ipc::Tag::PluginInstanceInjected) {
+            pluginInstanceInjected_[r.connId] = r.ok ? 1 : 2;
+            continue;
+        }
         if (r.tag != ipc::Tag::ClientTexImported) continue;
         // JS-compositor dmabuf import: report the injected texture handle to JS.
         // Match by reserved texture handle id (the reply echoes it); imports
@@ -263,6 +272,57 @@ void Compositor::drainCtrl() {
         }
         pendingJsImports_.erase(jit);
     }
+}
+
+Compositor::PluginConnHandle Compositor::addWireConnection() {
+    PluginConnHandle h{0, -1};
+    int fds[2];
+    // STREAM, like the core's own wire socket (length-prefixed framing).
+    if (::socketpair(AF_UNIX, SOCK_STREAM, 0, fds) != 0) {
+        std::perror("[core] addWireConnection socketpair");
+        return h;
+    }
+    const int wb = 8 * 1024 * 1024;  // match the core wire socket buffers
+    for (int i = 0; i < 2; ++i) {
+        ::setsockopt(fds[i], SOL_SOCKET, SO_SNDBUF, &wb, sizeof(wb));
+        ::setsockopt(fds[i], SOL_SOCKET, SO_RCVBUF, &wb, sizeof(wb));
+    }
+    // fds[0] = client end (-> the plugin Worker); fds[1] = GPU end (-> GPU proc).
+    const uint32_t connId = nextConnId_++;
+    ipc::Message m{};
+    m.tag = ipc::Tag::AddWireConn;
+    m.connId = connId;
+    int sendFds[1] = {fds[1]};
+    if (!ipc::sendMessageFds(ctrlFd_, m, sendFds, 1)) {
+        std::fprintf(stderr, "[core] addWireConnection: sendMessageFds failed\n");
+        ::close(fds[0]); ::close(fds[1]);
+        return h;
+    }
+    ::close(fds[1]);                 // GPU process dup'd it via SCM_RIGHTS
+    wireConnAdded_[connId] = 0;      // pending
+    h.connId = connId;
+    h.clientFd = fds[0];             // caller owns -> hands to the Worker
+    return h;
+}
+
+void Compositor::injectPluginInstance(uint32_t connId, uint32_t instanceId,
+                                      uint32_t instanceGen) {
+    ipc::Message m{};
+    m.tag = ipc::Tag::InjectPluginInstance;
+    m.connId = connId;
+    m.instance = {instanceId, instanceGen};
+    pluginInstanceInjected_[connId] = 0;  // pending
+    ipc::sendMessage(ctrlFd_, m);
+}
+
+int Compositor::wireConnAdded(uint32_t connId) const {
+    auto it = wireConnAdded_.find(connId);
+    return it == wireConnAdded_.end() ? 0 : it->second;
+}
+
+int Compositor::pluginInstanceInjected(uint32_t connId) const {
+    auto it = pluginInstanceInjected_.find(connId);
+    return it == pluginInstanceInjected_.end() ? 0 : it->second;
 }
 
 WGPUTexture Compositor::acquireOutputTextureHandle() {

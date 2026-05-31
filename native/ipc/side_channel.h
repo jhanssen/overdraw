@@ -37,6 +37,22 @@ enum class Tag : uint8_t {
     BeginDone    = 'b',  // gpu  -> core: BeginAccess applied + flushed
     EndAccess    = 'E',  // core -> gpu : end access on the STM (after wire render)
     EndDone      = 'e',  // gpu  -> core: EndAccess applied; sync-fd exported (fenceCount)
+    AddWireConn  = 'W',  // core -> gpu : register a NEW wire connection for a plugin.
+                         //   The plugin's wire socket (GPU end) rides as SCM_RIGHTS
+                         //   on this message; `connId` names it for later messages.
+                         //   The GPU process creates a per-connection WireServer +
+                         //   native instance and adds the fd to its event loop. The
+                         //   plugin's Worker drives ReserveInstance/RequestDevice
+                         //   over its own wire-client end (no listening socket: only
+                         //   the trusted core, over this side channel, can introduce
+                         //   a connection). See architecture.md "IPC".
+    WireConnAdded = 'w', // gpu -> core: AddWireConn registered (or failed: ok=0)
+    InjectPluginInstance = 'P',  // core -> gpu : inject conn `connId`'s native
+                                 //   instance at the handle the plugin's wire
+                                 //   client reserved (relayed via the Worker).
+                                 //   After this the plugin drives RequestAdapter/
+                                 //   RequestDevice over its own wire.
+    PluginInstanceInjected = 'p', // gpu -> core: InjectInstance done (ok)
     Shutdown     = 'X',  // core -> gpu : clean termination request
 };
 
@@ -86,6 +102,11 @@ struct Message {
     uint64_t mainDevice = 0;
     uint32_t entryCount = 0;
     uint32_t formatTableSize = 0;
+
+    // AddWireConn / WireConnAdded: opaque per-plugin connection id (assigned by
+    // the core; echoed in the reply). `ok` is the reply's success flag.
+    uint32_t connId = 0;
+    uint32_t ok = 0;
 
     // ImportClientTex: cross-channel ordering serial. The GPU process must not
     // act on this request until its wire reader has consumed at least this many
