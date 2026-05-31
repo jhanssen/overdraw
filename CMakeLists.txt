@@ -65,11 +65,20 @@ endif()
 message(STATUS "Node addon headers: ${NODE_INCLUDE_DIR}")
 
 # ---- Shared core library (native side of the Node-hosted core) ----
+# Reusable Dawn wire transport (WireLink + transport/side_channel headers). No
+# Wayland/Node deps, so BOTH the core addon and the plugin Worker addon can link
+# it without pulling in wayland-server etc.
+add_library(overdraw_wire STATIC
+    native/core/wire_link.cpp)
+target_include_directories(overdraw_wire PUBLIC
+    ${IPC_INCLUDE} ${NATIVE_INCLUDE})
+target_link_libraries(overdraw_wire PUBLIC dawn::webgpu_dawn_wire pthread)
+set_target_properties(overdraw_wire PROPERTIES POSITION_INDEPENDENT_CODE ON)
+
 # Compiled once and linked by the addon (and any future native consumer), so
 # core logic is not duplicated.
 add_library(overdraw_core STATIC
     native/core/gpu_process.cpp
-    native/core/wire_link.cpp
     native/core/compositor.cpp
     native/core/plugin_wire.cpp
     native/core/input_wayland.cpp
@@ -79,8 +88,20 @@ add_library(overdraw_core STATIC
 target_include_directories(overdraw_core PUBLIC
     ${IPC_INCLUDE} ${NATIVE_INCLUDE} ${NODE_INCLUDE_DIR} ${WAYLAND_SERVER_INCLUDE_DIRS})
 target_link_libraries(overdraw_core PUBLIC
-    dawn::webgpu_dawn_wire ${WAYLAND_SERVER_LIBRARIES} pthread dl rt)
+    overdraw_wire dawn::webgpu_dawn_wire ${WAYLAND_SERVER_LIBRARIES} pthread dl rt)
 set_target_properties(overdraw_core PROPERTIES POSITION_INDEPENDENT_CODE ON)
+
+# ---- Plugin Worker N-API addon (loaded inside plugin Worker isolates) ----
+add_library(overdraw_plugin_native MODULE
+    native/plugin-napi/addon.cpp
+    native/plugin-napi/worker_wire.cpp)
+set_target_properties(overdraw_plugin_native PROPERTIES PREFIX "" SUFFIX ".node")
+target_compile_definitions(overdraw_plugin_native PRIVATE
+    NODE_GYP_MODULE_NAME=overdraw_plugin_native BUILDING_NODE_EXTENSION)
+target_include_directories(overdraw_plugin_native PRIVATE
+    ${IPC_INCLUDE} ${NATIVE_INCLUDE} ${NODE_INCLUDE_DIR})
+target_link_libraries(overdraw_plugin_native PRIVATE
+    overdraw_wire dawn::webgpu_dawn_wire pthread dl rt)
 
 # ---- Core N-API addon (Node-hosted core) ----
 add_library(overdraw_native MODULE
