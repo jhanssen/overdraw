@@ -4,7 +4,61 @@ Tracks what is built and empirically proven versus what is still design only.
 The design itself lives in `architecture.md`; this file is the ground truth for
 "what exists right now."
 
-Last updated: 2026-05-30 (rev 13).
+Last updated: 2026-05-30 (rev 14).
+
+## Protocol gaps & skeletons (READ FIRST)
+
+What is advertised/wired but incomplete. These are the silent-gap risks — a
+client may use them and get nothing, with no error. Listed worst-first. (Fully
+working protocols are in "Built and proven"; this is the honest incomplete list.)
+
+- **`xdg_popup` / `xdg_positioner` — NOT implemented.** `xdg_surface.get_popup`
+  and `xdg_wm_base.create_positioner` are no-ops. Consequence: ALL popup UI —
+  menus, dropdowns, comboboxes, tooltips, context menus — does not appear. Blocks
+  basically every non-terminal GUI app. A popup is a real surface (wl_surface +
+  xdg_popup role) positioned by the compositor via the positioner (anchor rect +
+  anchor + gravity + constraint-adjustment = flip/slide/resize to fit the output)
+  and input-grabbing (dismiss on click-outside/Escape). Placement reuses the
+  subsurface child-of-parent machinery (`applySubsurfaces`-style); the new work is
+  positioner constraint-solving + grab/dismiss. Constraint-solving needs output
+  bounds — our fabricated `wl_output` size is fine for this (popups stay within
+  the actual drawing area). **This is the recommended next protocol.**
+
+- **`xdg_toplevel` window-management requests — SILENT no-ops.** `move`, `resize`,
+  `set_maximized`/`unset`, `set_fullscreen`/`unset`, `set_minimized`,
+  `set_min_size`/`set_max_size`, `show_window_menu`, `set_parent` are accepted and
+  IGNORED (no effect, no signal). Only `set_title`/`set_app_id` do anything.
+  Gated on a real WM/policy layer (placement is a cascade stub; there is no
+  maximize/fullscreen/interactive-move concept yet). Until that exists, these
+  stay no-ops — but they are advertised, so clients think they work.
+
+- **`wl_output` — FABRICATED.** It advertises one "monitor" whose refresh (60Hz),
+  scale (1), transform, geometry (0,0), physical size, and make/model are all
+  HARDCODED FICTION. The reported size is the nested host *window* size, not a
+  real monitor. There is also NO host-window-resize handling: resizing the
+  overdraw window does not update the output, the swapchain, the WM layout, or
+  input coordinate mapping (all assume the initial size, scale 1, identity
+  mapping). Doing `wl_output` properly = implementing output reconfiguration
+  end-to-end: GPU process reads the host's real `wl_output` + tracks host-window
+  resize → forwards to core → core updates output size → JS resends
+  geometry/mode/scale/done → WM re-lays-out + input mapping + swapchain
+  reconfigure. Build an output-backend SEAM (like the input backend) so phase-1
+  (host output) and phase-2 (DRM connectors/EDID/hotplug) swap underneath without
+  touching the WM/compositing/`wl_output` layers. Cross-cutting; its own subsystem.
+
+- **`wl_region` — no-op stub.** `add`/`subtract` do nothing; opaque/input regions
+  are not tracked (hit-testing uses whole-window rects). Low urgency.
+
+- **Smaller flagged gaps (already noted in their sections):** `wl_subsurface`
+  `place_above`/`place_below` sibling reordering (no-op); DnD drag-icon
+  compositing (implemented, not pixel-tested); dmabuf `create` (async server-minted
+  wl_buffer) not wired (the trampoline primitive now exists); single-plane dmabuf
+  only; `wl_data_device` is complete (clipboard + primary + DnD).
+
+- **Protocols foot probes that are advertised-absent (clean fallback, not gaps):**
+  xdg-decoration (→ CSD), fractional-scale, cursor-shape, text-input, xdg-activation,
+  toplevel-icon, system-bell. Not implemented; clients warn and fall back. See the
+  protocol-coverage matrix lower in this file.
 
 ## Verification environment
 
@@ -390,8 +444,10 @@ on-wire feedback.
   wire work behind it (including buffer-map). Mailbox avoids that.
 - Still absent: per-surface transforms/opacity/rotation/scale, fractional scale,
   multi-output, damage, real WM/layout policy (placement is a cascade stub),
-  resize handling. Output logical size == host window size (scale 1). Pointer +
-  keyboard routing to clients IS done (see "Input routing to clients").
+  resize handling. Output logical size == host window size (scale 1); `wl_output`
+  is otherwise FABRICATED and there is no resize handling — see "Protocol gaps &
+  skeletons (READ FIRST)" at the top. Pointer + keyboard routing to clients IS
+  done (see "Input routing to clients").
 
 ### Client shm buffers end-to-end (upload → composite → present, pixel-verified)
 A real Wayland client can map a window with content and have its pixels reach
@@ -586,8 +642,9 @@ path).
   doubles as the on-wire proof of non-empty array encoding.
 - Buffer attach/commit now uploads + composites shm buffers (see "Client shm
   buffers end-to-end"). Still: configure sends 0×0 (client picks size); no
-  WM/policy (placement, focus, dynamic toplevel states); popups (`get_popup`)
-  and positioners are no-ops.
+  WM/policy (placement, focus, dynamic toplevel states — `xdg_toplevel`
+  move/resize/maximize/fullscreen are silent no-ops); popups (`get_popup`) and
+  positioners are no-ops. See "Protocol gaps & skeletons (READ FIRST)" at the top.
 
 ### Load-bearing facts established (recorded in architecture.md "Validated against Dawn")
 - A Wayland-backed `wgpu::Surface` swapchain works **over the Dawn wire**: a
