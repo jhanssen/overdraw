@@ -28,6 +28,14 @@ try {
 } catch { dawn = null; }
 const gpuBin = join(OD, "build", "overdraw-gpu-process");
 
+// The async addon entry points take a node-style callback; wrap as Promises (the
+// SDK does the same). They resolve when the side-channel replies arrive on the
+// libuv ctrl/wire polls -- no blocking on the Node thread.
+const pluginConnect = () => new Promise((resolve, reject) =>
+  addon.pluginConnect((r) => r ? resolve(r) : reject(new Error("pluginConnect failed"))));
+const pluginAlloc = (connId, w, h) => new Promise((resolve, reject) =>
+  addon.pluginAllocSurfaceBuffer(connId, w, h, (r) => r ? resolve(r) : reject(new Error("alloc failed"))));
+
 test("plugin wire connection brings up its own device", { skip: !dawn ? "dawn.node not built" : false }, async () => {
   addon.start(gpuBin, () => {}, null, { width: 64, height: 64 });
   try {
@@ -35,8 +43,8 @@ test("plugin wire connection brings up its own device", { skip: !dawn ? "dawn.no
     const core = addon.gpuHandles();
     assert.ok(core && core.device, "core gpuHandles");
 
-    // A second, independent plugin connection + device.
-    const p = addon.pluginConnect();
+    // A second, independent plugin connection + device (async; no blocking).
+    const p = await pluginConnect();
     assert.ok(p, "pluginConnect returned handles");
     assert.equal(typeof p.connId, "number");
     assert.ok(p.instance && p.device, "plugin instance+device handles");
@@ -55,7 +63,7 @@ test("plugin wire connection brings up its own device", { skip: !dawn ? "dawn.no
     // imported into BOTH the plugin device and the core device). Both texture
     // handles must wrap (dawn.node wrapTexture) on their respective devices.
     const coreDev = dawn.wrapDevice(core.instance, core.device);
-    const sb = addon.pluginAllocSurfaceBuffer(p.connId, 64, 64);
+    const sb = await pluginAlloc(p.connId, 64, 64);
     assert.ok(sb && sb.surfaceBufId, "pluginAllocSurfaceBuffer");
     assert.notEqual(sb.producerTexture, 0n, "producer texture handle");
     assert.notEqual(sb.consumerTexture, 0n, "consumer texture handle");

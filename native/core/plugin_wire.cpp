@@ -52,65 +52,75 @@ WGPUTexture PluginWireClient::producerTexture(uint32_t surfaceBufId) const {
     return it == producerReservations_.end() ? nullptr : it->second.texture;
 }
 
-bool PluginWireClient::bringUp() {
+void PluginWireClient::startBringUp() {
     // Reserve the plugin instance on this wire client; relay the handle so the
-    // GPU process injects its native instance at it (InjectPluginInstance).
+    // GPU process injects its native instance at it (InjectPluginInstance). The
+    // rest is driven by pump() as the injection reply + wire events arrive.
     auto ri = link_->client().ReserveInstance();
     instance_ = wgpu::Instance::Acquire(ri.instance);
     link_->setInstance(instance_.Get());
     comp_->injectPluginInstance(connId_, ri.handle.id, ri.handle.generation);
+    state_ = State::kInjecting;
+    link_->flush();
+}
 
-    // Pump the wire + the compositor's ctrl drain until the injection completes.
-    // (On the main thread libuv is not turning during this synchronous call, so
-    // we drive both here.) 1=ok, 2=failed.
-    bool injected = link_->pumpUntilTimeout([&] {
-        comp_->drainCtrl();
-        return comp_->pluginInstanceInjected(connId_) != 0;
-    }, 5000);
-    if (!injected || comp_->pluginInstanceInjected(connId_) != 1) {
-        error_ = "plugin instance injection failed/timed out";
-        return false;
-    }
+void PluginWireClient::pump() {
+    // Steady-state + bring-up wire I/O: drain inbound (resolves RequestAdapter/
+    // RequestDevice callbacks via the instance event pump in drainInbound) and
+    // flush outbound. Non-blocking.
+    link_->pumpOut();
+    link_->drainInbound();
 
-    // Adapter.
-    wgpu::Adapter adapter;
-    {
-        wgpu::RequestAdapterOptions ao{};
-        ao.featureLevel = wgpu::FeatureLevel::Core;
-        bool ready = false;
-        instance_.RequestAdapter(&ao, wgpu::CallbackMode::AllowProcessEvents,
-            [&](wgpu::RequestAdapterStatus s, wgpu::Adapter a, wgpu::StringView) {
-                if (s == wgpu::RequestAdapterStatus::Success) adapter = std::move(a);
-                ready = true;
-            });
-        link_->flush();
-        link_->pumpUntil([&] { return ready; });
+    switch (state_) {
+        case State::kInjecting: {
+            int st = comp_->pluginInstanceInjected(connId_);
+            if (st == 2) { error_ = "plugin instance injection failed"; state_ = State::kFailed; return; }
+            if (st != 1) return;  // still pending
+            // Injected -> request the adapter (once).
+            if (!adapterRequested_) {
+                adapterRequested_ = true;
+                wgpu::RequestAdapterOptions ao{};
+                ao.featureLevel = wgpu::FeatureLevel::Core;
+                instance_.RequestAdapter(&ao, wgpu::CallbackMode::AllowProcessEvents,
+                    [this](wgpu::RequestAdapterStatus s, wgpu::Adapter a, wgpu::StringView) {
+                        if (s == wgpu::RequestAdapterStatus::Success) adapter_ = std::move(a);
+                    });
+                link_->flush();
+                state_ = State::kAdapter;
+            }
+            return;
+        }
+        case State::kAdapter: {
+            if (!adapter_) return;  // adapter callback not yet fired
+            if (!deviceRequested_) {
+                deviceRequested_ = true;
+                wgpu::FeatureName feats[] = {wgpu::FeatureName::SharedTextureMemoryDmaBuf,
+                                             wgpu::FeatureName::SharedFenceSyncFD};
+                wgpu::DeviceDescriptor dd{};
+                dd.requiredFeatureCount = 2;
+                dd.requiredFeatures = feats;
+                dd.SetUncapturedErrorCallback(
+                    [](const wgpu::Device&, wgpu::ErrorType t, wgpu::StringView m) {
+                        std::fprintf(stderr, "[plugin-wire][dawn err %d] %.*s\n",
+                                     static_cast<int>(t), static_cast<int>(m.length), m.data);
+                    });
+                adapter_.RequestDevice(&dd, wgpu::CallbackMode::AllowProcessEvents,
+                    [this](wgpu::RequestDeviceStatus s, wgpu::Device d, wgpu::StringView) {
+                        if (s == wgpu::RequestDeviceStatus::Success) device_ = std::move(d);
+                    });
+                link_->flush();
+                state_ = State::kDevice;
+            }
+            return;
+        }
+        case State::kDevice: {
+            if (device_) state_ = State::kDone;
+            return;
+        }
+        case State::kDone:
+        case State::kFailed:
+            return;
     }
-    if (!adapter) { error_ = "plugin: no adapter over wire"; return false; }
-
-    // Device with dmabuf + sync-fd features (the producer/consumer primitive).
-    {
-        wgpu::FeatureName feats[] = {wgpu::FeatureName::SharedTextureMemoryDmaBuf,
-                                     wgpu::FeatureName::SharedFenceSyncFD};
-        wgpu::DeviceDescriptor dd{};
-        dd.requiredFeatureCount = 2;
-        dd.requiredFeatures = feats;
-        dd.SetUncapturedErrorCallback(
-            [](const wgpu::Device&, wgpu::ErrorType t, wgpu::StringView m) {
-                std::fprintf(stderr, "[plugin-wire][dawn err %d] %.*s\n",
-                             static_cast<int>(t), static_cast<int>(m.length), m.data);
-            });
-        bool ready = false;
-        adapter.RequestDevice(&dd, wgpu::CallbackMode::AllowProcessEvents,
-            [&](wgpu::RequestDeviceStatus s, wgpu::Device d, wgpu::StringView) {
-                if (s == wgpu::RequestDeviceStatus::Success) device_ = std::move(d);
-                ready = true;
-            });
-        link_->flush();
-        link_->pumpUntil([&] { return ready; });
-    }
-    if (!device_) { error_ = "plugin: no device over wire"; return false; }
-    return true;
 }
 
 }  // namespace overdraw::core

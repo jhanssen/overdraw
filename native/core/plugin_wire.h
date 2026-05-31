@@ -35,11 +35,18 @@ class PluginWireClient {
     PluginWireClient(const PluginWireClient&) = delete;
     PluginWireClient& operator=(const PluginWireClient&) = delete;
 
-    // Reserve instance -> relay to the GPU process (injectPluginInstance) -> wait
-    // its injection -> RequestAdapter -> RequestDevice (dmabuf + sync-fd
-    // features). Returns false (with error()) on failure. Synchronous; pumps the
-    // wire + the compositor ctrl drain meanwhile. Main-thread bring-up only.
-    bool bringUp();
+    // Bring-up state (advanced by pump(), driven from the libuv plugin-wire poll).
+    enum class State { kInjecting, kAdapter, kDevice, kDone, kFailed };
+
+    // Start async bring-up: reserve instance -> relay to the GPU process
+    // (injectPluginInstance). The rest (RequestAdapter -> RequestDevice) is driven
+    // by pump() as wire events arrive. NON-BLOCKING. Poll state() for kDone/kFailed.
+    void startBringUp();
+    // Advance bring-up + drive steady-state wire I/O. Called from the libuv
+    // plugin-wire poll (and once after startBringUp to kick the first request).
+    // Pumps outbound, drains inbound, advances the bring-up state machine.
+    void pump();
+    State state() const { return state_; }
 
     const std::string& error() const { return error_; }
     uint32_t connId() const { return connId_; }
@@ -79,8 +86,12 @@ class PluginWireClient {
     Compositor* comp_;
     std::unique_ptr<WireLink> link_;
     wgpu::Instance instance_;
+    wgpu::Adapter adapter_;
     wgpu::Device device_;
     std::string error_;
+    State state_ = State::kInjecting;
+    bool adapterRequested_ = false;
+    bool deviceRequested_ = false;
     std::unordered_map<uint32_t, dawn::wire::ReservedTexture> producerReservations_;
 };
 
