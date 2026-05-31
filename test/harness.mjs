@@ -73,6 +73,23 @@ function countGpuProcs() {
   return n;
 }
 
+// PIDs of live GPU processes (exact comm "overdraw-gpu-pr"). Normally one.
+export function gpuPids() {
+  const pids = [];
+  for (const ent of readdirSync("/proc")) {
+    if (!/^\d+$/.test(ent)) continue;
+    try {
+      if (readFileSync(`/proc/${ent}/comm`, "utf8").trim() === "overdraw-gpu-pr") pids.push(Number(ent));
+    } catch { /* pid vanished */ }
+  }
+  return pids;
+}
+
+// Open-fd count of a process (for leak detection).
+export function fdCount(pid) {
+  try { return readdirSync(`/proc/${pid}/fd`).length; } catch { return -1; }
+}
+
 // Bring up the full compositor. Returns a context with a query() bound to the
 // installed protocol state, plus client-spawn + teardown helpers.
 export async function setupCompositor(opts = {}) {

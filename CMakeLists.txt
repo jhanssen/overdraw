@@ -187,3 +187,13 @@ target_include_directories(dmabuf-test-client PRIVATE
     ${GBM_INCLUDE_DIRS}
     ${CMAKE_SOURCE_DIR}/native/wayland/generated)
 target_link_libraries(dmabuf-test-client PRIVATE ${WAYLAND_CLIENT_LIBRARIES} ${GBM_LIBRARIES})
+
+add_executable(dmabuf-cycle-client
+    test/dmabuf-cycle-client.c
+    native/wayland/generated/xdg-shell-protocol.c
+    native/wayland/generated/linux-dmabuf-v1-protocol.c)
+target_include_directories(dmabuf-cycle-client PRIVATE
+    ${WAYLAND_CLIENT_INCLUDE_DIRS}
+    ${GBM_INCLUDE_DIRS}
+    ${CMAKE_SOURCE_DIR}/native/wayland/generated)
+target_link_libraries(dmabuf-cycle-client PRIVATE ${WAYLAND_CLIENT_LIBRARIES} ${GBM_LIBRARIES})

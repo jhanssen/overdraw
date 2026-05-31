@@ -614,6 +614,21 @@ napi_value Stop(napi_env env, napi_callback_info) {
     }
     if (g_addon.inputFd >= 0) { ::close(g_addon.inputFd); g_addon.inputFd = -1; }
     if (g_addon.compositor) {
+        // Drain the wire briefly so any in-flight GPU completion callbacks (e.g.
+        // the last frame's queue.onSubmittedWorkDone, used by the JS compositor's
+        // buffer-release lifecycle) resolve with Success BEFORE we disconnect.
+        // Disconnect cancels pending futures, and a wire WebGPU binding (dawn.node)
+        // throws on a cancelled callback -> teardown crash. The frame timer is
+        // already stopped above, so no new callbacks are issued during this drain.
+        napi_handle_scope drainScope;
+        napi_open_handle_scope(env, &drainScope);
+        for (int i = 0; i < 25; ++i) {  // ~50ms; the last submit completes within a frame
+            g_addon.compositor->drainWire();
+            g_addon.compositor->drainCtrl();
+            fireJsImports(env);
+            ::usleep(2000);
+        }
+        napi_close_handle_scope(env, drainScope);
         g_addon.compositor->shutdown();
         g_addon.compositor.reset();
     }

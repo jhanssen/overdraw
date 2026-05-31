@@ -43,9 +43,9 @@ test("JS compositor: real dmabuf client composites (red)", { skip }, async () =>
   } finally {
     // Fully reap the client before teardown so it never overlaps the
     // GPU-process leak scan.
-    if (client) {
+    if (client && client.exitCode === null && client.signalCode === null) {
       try { client.kill("SIGTERM"); } catch { /* gone */ }
-      await once(client, "exit").catch(() => {});
+      await once(client, "exit").catch(() => {});  // safe: not yet exited
     }
     await c.teardown();
   }
