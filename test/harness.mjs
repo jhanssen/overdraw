@@ -111,8 +111,10 @@ export async function setupCompositor(opts = {}) {
   // Optional: run the compositing pass in JS over the wire (dawn.node) instead
   // of the native C++ Compositor. Creates a JsCompositor wrapping the core's wire
   // device and passes it as the compositor backend.
+  // The JS compositor is the compositor now (the C++ pass is gone). Default to
+  // it; opts.jsCompositor === false is no longer supported.
   let jsCompositor = null;
-  if (opts.jsCompositor) {
+  if (opts.jsCompositor !== false) {
     const dawn = loadDawn();
     if (!dawn) throw new Error("jsCompositor requested but dawn.node not found");
     const h = addon.gpuHandles();
