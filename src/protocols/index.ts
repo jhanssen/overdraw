@@ -39,6 +39,7 @@ interface HandlerModule { default: HandlerFactory; }
 const GLOBALS = [
   "wl_compositor", "xdg_wm_base", "wl_shm", "zwp_linux_dmabuf_v1", "wl_seat",
   "wl_subcompositor", "wl_output", "wl_data_device_manager",
+  "zwp_primary_selection_device_manager_v1",
 ];
 
 // Interfaces created via requests (new_id), registered without a global so
@@ -47,7 +48,9 @@ const CHILD_INTERFACES = [
   "wl_surface", "wl_region", "xdg_surface", "xdg_toplevel",
   "wl_shm_pool", "wl_buffer", "zwp_linux_buffer_params_v1",
   "wl_pointer", "wl_keyboard", "zwp_linux_dmabuf_feedback_v1",
-  "wl_subsurface", "wl_data_device", "wl_data_source", "wl_callback",
+  "wl_subsurface", "wl_data_device", "wl_data_source", "wl_data_offer", "wl_callback",
+  "zwp_primary_selection_device_v1", "zwp_primary_selection_source_v1",
+  "zwp_primary_selection_offer_v1",
 ];
 
 // Load all generated signature modules, keyed by interface name.
@@ -188,8 +191,12 @@ export async function installProtocols(
     wl_keyboard: seatMod.makeKeyboard(ctx),
     zwp_linux_dmabuf_feedback_v1: dmabufMod.makeDmabufFeedback(),
     wl_subsurface: subMod.makeSubsurface(ctx),
-    wl_data_device: ddmMod.makeDataDevice(),
-    wl_data_source: ddmMod.makeDataSource(),
+    wl_data_device: ddmMod.makeDataDevice(ctx),
+    wl_data_source: ddmMod.makeDataSource(ctx),
+    wl_data_offer: ddmMod.makeDataOffer(ctx),
+    zwp_primary_selection_device_v1: ddmMod.makePrimaryDevice(ctx),
+    zwp_primary_selection_source_v1: ddmMod.makePrimarySource(ctx),
+    zwp_primary_selection_offer_v1: ddmMod.makePrimaryOffer(ctx),
     wl_callback: {}, // event-only (done); no requests to dispatch
   };
 
@@ -197,6 +204,7 @@ export async function installProtocols(
   // factory call below would not pass them).
   const globalHandlers: Record<string, object> = {
     wl_seat: seatMod.default(ctx, focusOpts),
+    zwp_primary_selection_device_manager_v1: ddmMod.makePrimaryManager(ctx),
   };
 
   for (const name of CHILD_INTERFACES) {

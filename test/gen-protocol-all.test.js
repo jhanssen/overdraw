@@ -19,6 +19,7 @@ const INPUTS = [
   "/usr/share/wayland/wayland.xml",
   "/usr/share/wayland-protocols/stable/xdg-shell/xdg-shell.xml",
   "/usr/share/wayland-protocols/stable/linux-dmabuf/linux-dmabuf-v1.xml",
+  "/usr/share/wayland-protocols/unstable/primary-selection/primary-selection-unstable-v1.xml",
 ];
 const haveInputs = INPUTS.every((p) => existsSync(p));
 

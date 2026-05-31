@@ -548,8 +548,12 @@ napi_value PostEvent(napi_env env, napi_callback_info info) {
     if (argc < 3) return throwError(env, "postEvent(resource, opcode, args) requires three args");
     if (!g_addon.trampoline) return throwError(env, "no trampoline");
     uint32_t opcode = 0; napi_get_value_uint32(env, argv[1], &opcode);
-    if (!g_addon.trampoline->postEvent(argv[0], opcode, argv[2]))
+    napi_value minted = nullptr;
+    if (!g_addon.trampoline->postEvent(argv[0], opcode, argv[2], &minted))
         return throwError(env, "postEvent failed");
+    // If the event minted a server-side new_id (e.g. wl_data_device.data_offer),
+    // return the wrapped new resource so JS can send events on it; else undefined.
+    if (minted) return minted;
     napi_value undef; napi_get_undefined(env, &undef);
     return undef;
 }

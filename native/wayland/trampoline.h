@@ -50,8 +50,11 @@ class Trampoline {
     // and call wl_resource_post_event_array. `resourceHandle` is a wrapped
     // resource (from wrapResource); `opcode` is the event index; `argsArray` is
     // a JS array of the event's typed args. Returns false on error (message set
-    // via napi exception by the caller path).
-    bool postEvent(napi_value resourceHandle, uint32_t opcode, napi_value argsArray);
+    // via napi exception by the caller path). If the event carries a server-minted
+    // new_id (e.g. wl_data_device.data_offer), `*minted` is set to the wrapped new
+    // resource so JS can send events on it; pass nullptr if not needed.
+    bool postEvent(napi_value resourceHandle, uint32_t opcode, napi_value argsArray,
+                   napi_value* minted = nullptr);
 
     // Return a stable per-client id (the wl_client pointer as a uint64) for a
     // wrapped resource, or 0 on error. Lets JS associate resources created by

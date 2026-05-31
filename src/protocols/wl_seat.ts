@@ -88,6 +88,9 @@ export default function makeSeat(ctx: Ctx, focus: FocusOptions = DEFAULT_FOCUS):
     if (cur && (!target || cur.surfaceId !== target.surfaceId)) sendKbLeave(cur);
     seat.kbFocus = target;
     if (target) sendKbEnter(target);
+    // Notify the clipboard layer so it can (re)send the selection to the newly
+    // focused client (selection follows keyboard focus).
+    seat.onKbFocusChange?.(target ? target.clientId : null);
   }
 
   function sendEnter(target: SeatFocus, sx: number, sy: number): void {

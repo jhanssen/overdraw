@@ -160,7 +160,8 @@ uint64_t Trampoline::clientIdOf(napi_value resourceHandle) {
     return reinterpret_cast<uint64_t>(wl_resource_get_client(resource));
 }
 
-bool Trampoline::postEvent(napi_value resourceHandle, uint32_t opcode, napi_value argsArray) {
+bool Trampoline::postEvent(napi_value resourceHandle, uint32_t opcode, napi_value argsArray,
+                           napi_value* minted) {
     napi_env env = env_;
     // Unwrap wl_resource* from the handle's __resource external.
     napi_value ext;
@@ -189,6 +190,9 @@ bool Trampoline::postEvent(napi_value resourceHandle, uint32_t opcode, napi_valu
     // Fds extracted for 'h' args: kept valid through the post call, then closed
     // (wl_resource_post_event_array dups into the wire; we still own ours).
     std::vector<int> fdKeep;
+    // If the event carries a server-minted new_id, the created resource wrapper is
+    // returned to JS so it can immediately send events on it.
+    napi_value mintedResource = nullptr;
     int ai = 0;
     for (const char* p = ev->signature; *p && ai < static_cast<int>(n); ++p) {
         if (*p >= '0' && *p <= '9') continue;
@@ -221,7 +225,35 @@ bool Trampoline::postEvent(napi_value resourceHandle, uint32_t opcode, napi_valu
                 wargs[ai].o = reinterpret_cast<wl_object*>(p2);
                 break;
             }
-            case 'n': { uint32_t x = 0; napi_get_value_uint32(env, v, &x); wargs[ai].n = x; break; }
+            case 'n': {
+                // Server-minted new_id in an EVENT (e.g. wl_data_device.data_offer).
+                // The server creates the wl_resource; libwayland marshals a sent
+                // new_id from the .o (wl_object*) slot (see wl_argument_from_va_list
+                // 'n' -> .o). JS passes a non-numeric value (e.g. {} or null) to
+                // signal "mint here"; we create the resource on the event target's
+                // client + the arg's interface, route its requests to the registered
+                // handler, and return the wrapped resource to JS (so it can send
+                // events on it, e.g. data_offer.offer). If JS DID pass a number,
+                // honor it as a raw id (legacy/explicit) for completeness.
+                napi_valuetype t; napi_typeof(env, v, &t);
+                if (t == napi_number) {
+                    uint32_t x = 0; napi_get_value_uint32(env, v, &x); wargs[ai].n = x;
+                    break;
+                }
+                const wl_interface* ni = (ev->types && ev->types[ai]) ? ev->types[ai] : nullptr;
+                if (!ni) { wargs[ai].o = nullptr; break; }
+                wl_client* cl = wl_resource_get_client(resource);
+                int version = wl_resource_get_version(resource);
+                wl_resource* child = wl_resource_create(cl, ni, version, 0);  // 0 = server allocates id
+                if (!child) { wl_client_post_no_memory(cl); break; }
+                auto it = interfaces_.find(ni->name);
+                if (it != interfaces_.end())
+                    wl_resource_set_dispatcher(child, &Trampoline::onDispatch,
+                                               it->second.get(), it->second.get(), nullptr);
+                mintedResource = wrapResource(child, ni->name);
+                wargs[ai].o = reinterpret_cast<wl_object*>(child);
+                break;
+            }
             case 'a': {
                 // Uint8Array (or any typed array / arraybuffer) -> wl_array. The
                 // backing bytes belong to the JS value, which is live for this
@@ -266,6 +298,7 @@ bool Trampoline::postEvent(napi_value resourceHandle, uint32_t opcode, napi_valu
 
     // libwayland dup'd any fd args into the wire; close our copies.
     for (int fd : fdKeep) if (fd >= 0) ::close(fd);
+    if (minted) *minted = mintedResource;
     return true;
 }
 

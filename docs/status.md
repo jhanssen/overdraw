@@ -277,9 +277,9 @@ prints `WAYLAND_DISPLAY`, and runs until SIGINT.
 - LIMITATIONS hit by `foot`, flagged: subsurfaces ARE composited with correct
   sync/desync commit semantics (see "Subsurface compositing" below); the only
   remaining subsurface gap is place_above/below sibling reordering (no-op);
-  **clipboard is a no-op** (`wl_data_device_manager`
-  exists but does nothing); no server-side decorations, fractional scale, primary
-  selection, xdg-activation, cursor-shape, text-input (all advertised-absent →
+  clipboard + primary selection ARE implemented now (see "Clipboard" below; DnD on
+  the same interfaces is still a loud-no-op stub); no server-side decorations,
+  fractional scale, xdg-activation, cursor-shape, text-input (advertised-absent →
   `foot` warns and falls back).
 - `kitty` also runs (hardware EGL — no `LIBGL_ALWAYS_SOFTWARE` needed — renders,
   focuses on map, types). The pool-refcount fix (see "shm") was required: kitty
@@ -459,8 +459,10 @@ proven on the RTX 5060:
   compositor imports the client dmabuf, composites, presents. GPU readback
   confirms pixel-exact red (BGRA `[0,0,255,255]`). **PASS.**
 - Limitations: single plane only; `create` (async, server-minted wl_buffer) is
-  NOT supported — the trampoline can't mint a server-side new_id for an event, so
-  only `create_immed` (client supplies the buffer id) works; no per-frame
+  NOT wired up here — though the trampoline CAN now mint a server-side new_id for
+  an event (added for clipboard `data_offer`; see "Clipboard"), so this is now a
+  matter of wiring the dmabuf `create` path, not a missing primitive. Today only
+  `create_immed` (client supplies the buffer id) is used; no per-frame
   re-import optimization / fence-synced release; the held BeginAccess is never
   ended until teardown (fine single-device, revisit for multi-device); no
   modifier *negotiation* beyond advertising a static set (import may reject an
@@ -705,12 +707,16 @@ follows the same model.
     `wl_shm`/`wl_shm_pool`/`wl_buffer` (pixel-verified), `zwp_linux_dmabuf_v1`/
     `..._buffer_params_v1` (pixel-verified), `wl_seat`/`wl_pointer`/`wl_keyboard`
     (focus routing + key delivery), `wl_output` (mode/geometry), `wl_callback`
-    (frame-callback delivery).
-  - Implemented but NOT behaviorally tested: `wl_region` (no-op stub),
-    `wl_data_device_manager`/`wl_data_device`/`wl_data_source` (clipboard no-op),
+    (frame-callback delivery), `wl_data_device*`/`wl_data_offer` +
+    `zwp_primary_selection_*` (CLIPBOARD selection round-trip, pixel-free, see
+    "Clipboard"), `wl_subsurface` (sync/desync commit semantics, pixel-verified).
+  - Implemented but NOT behaviorally tested: `wl_region` (no-op stub);
     `zwp_linux_dmabuf_feedback_v1` (feedback path; exercised by real WSI clients
-    manually, no automated assertion). These are peripheral/stub paths with
-    little behavior to assert until they do something.
+    manually, no automated assertion).
+  - **Tested-as-incomplete (explicit, not silent):** drag-and-drop on the
+    data-device interfaces (`start_drag`/`accept`/`finish`/`set_actions`) — loud
+    warn-once no-ops, pinned by `test/data-device-dnd.test.js`. DnD is the next
+    slice on this protocol; clipboard is done.
   - Structural: `gen-protocol.test.js` spot-checks specific interfaces, and
     `gen-protocol-all.test.js` validates ALL generated signatures (sequential
     unique opcodes, known arg types, interface references resolve, one makeEvents
@@ -764,6 +770,33 @@ at parent-output-rect + the subsurface offset.
   no-op (siblings draw in creation order). The WM's own `setStack` on map/unmap
   pushes toplevels-only; subsurfaces are re-expanded right after in the same
   sweep, but a future stand-alone WM restack must call `applySubsurfaces` too.
+
+### Clipboard + primary selection (`wl_data_device` / `zwp_primary_selection_*`, verified)
+Copy/paste and middle-click paste work end-to-end between two real clients.
+- **Prerequisite built: server-minted new_id in EVENTS.** The trampoline's
+  `postEvent` 'n' case now creates the `wl_resource` server-side (on the event
+  target's client + the arg's interface), routes its requests to the registered
+  handler, and returns the wrapped resource to JS so JS can immediately send
+  events on it. JS passes a non-numeric value (null) for the new_id slot to mean
+  "mint here". libwayland marshals a sent new_id from the `.o` (wl_object*) slot.
+  This was the long-flagged gap; it also unblocks dmabuf `create`.
+- Selection flow: source `create_data_source` → `offer(mime)` → `set_selection`;
+  the compositor stores it and, to the KEYBOARD-FOCUSED client's data_device,
+  mints a `data_offer`, sends `offer(mime)` per type, then `selection(offer)`.
+  The receiver calls `data_offer.receive(mime, pipe-fd)`; the compositor forwards
+  to the source via `data_source.send(mime, fd)` (the same WaylandFd flows request
+  → event); the source writes, the receiver reads. Selection follows keyboard
+  focus (resent on focus change via the seat's `onKbFocusChange` hook).
+- Primary selection (`zwp_primary_selection_*`, middle-click) is the identical
+  flow on its own interfaces + state (no DnD). The generator now also ingests
+  `primary-selection-unstable-v1.xml` (35 generated interfaces; checked-in client
+  glue for the test client).
+- Verified (`test/clipboard.gpu.mjs`, two real clients; GPU-gated ONLY because the
+  receiver maps a window to take keyboard focus): a known payload round-trips for
+  both clipboard and primary selection, byte-exact. **PASS.**
+- **NOT implemented (tested-as-incomplete, not silent):** drag-and-drop on these
+  interfaces — `start_drag`/`accept`/`finish`/`set_actions` are warn-once no-ops
+  pinned by `test/data-device-dnd.test.js`. Next slice on this protocol.
 
 ## Not yet built (design only)
 

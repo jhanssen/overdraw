@@ -55,6 +55,18 @@ export interface CompositorState {
   dmabufBufferIds?: Map<Resource, number>;
   dmabufById?: Map<number, Resource>;
   nextBufferId?: number;
+  // Clipboard (wl_data_device selection). `sources` maps a wl_data_source to its
+  // offered mime types. `dataDevices` maps a clientId to that client's
+  // wl_data_device resources. `selection` is the current clipboard source (or
+  // null). See src/protocols/wl_data_device_manager.ts.
+  dataSources?: Map<Resource, { mimes: string[] }>;
+  dataDevices?: Map<number, Set<Resource>>;
+  selection?: Resource | null;
+  // Primary selection (zwp_primary_selection_*): same shape as clipboard, separate
+  // state. middle-click paste.
+  primarySources?: Map<Resource, { mimes: string[] }>;
+  primaryDevices?: Map<number, Set<Resource>>;
+  primarySelection?: Resource | null;
   [key: string]: unknown;
 }
 
@@ -149,6 +161,10 @@ export interface SeatState {
   // WM from mapWindow.
   focusWindow(surfaceId: number, surfaceRec: { resource: Resource },
               rect: { x: number; y: number; width: number; height: number }): void;
+  // Invoked after keyboard focus changes (new focused clientId, or null). The
+  // clipboard layer uses this to (re)send the current selection to the focused
+  // client. Set by the data-device module.
+  onKbFocusChange?: (clientId: number | null) => void;
 }
 
 export interface Ctx {

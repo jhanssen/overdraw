@@ -144,6 +144,16 @@ target_include_directories(subsurface-test-client PRIVATE
     ${CMAKE_SOURCE_DIR}/native/wayland/generated)
 target_link_libraries(subsurface-test-client PRIVATE ${WAYLAND_CLIENT_LIBRARIES})
 
+# ---- clipboard test client (wl_data_device + primary selection) ----
+add_executable(clipboard-test-client
+    test/clipboard-test-client.c
+    native/wayland/generated/xdg-shell-protocol.c
+    native/wayland/generated/primary-selection-unstable-v1-protocol.c)
+target_include_directories(clipboard-test-client PRIVATE
+    ${WAYLAND_CLIENT_INCLUDE_DIRS}
+    ${CMAKE_SOURCE_DIR}/native/wayland/generated)
+target_link_libraries(clipboard-test-client PRIVATE ${WAYLAND_CLIENT_LIBRARIES})
+
 # ---- SCM_RIGHTS transport unit test (fd passing over the side channel) ----
 add_executable(scm-rights-test test/scm-rights-test.cpp)
 target_include_directories(scm-rights-test PRIVATE ${IPC_INCLUDE})
