@@ -73,10 +73,12 @@ Two processes in v1: core and GPU. Phase 2 adds a small session supervisor.
   `wl_resource`s, libuv, and the core's JS — including the per-output
   frame loop / compositing renderer. Plugin workers are separate V8
   isolates with their own event loops and their own wire clients.
-- The renderer (per-output frame loop, compositing pass) running on
-  the main thread is a v1 choice. It is a candidate for promotion to
-  a dedicated worker thread (sharing the surface graph via
-  `SharedArrayBuffer` + `Atomics`) or to C++ if profiling shows
+- The renderer (per-output frame loop, compositing pass) runs on the
+  main thread in JS, over the Dawn wire (IMPLEMENTED — see status.md
+  "Compositing pass runs in JS over the Dawn wire"; there is no C++
+  compositing pass). Running on the main thread is a v1 choice: it is a
+  candidate for promotion to a dedicated worker thread (sharing the
+  surface graph via `SharedArrayBuffer` + `Atomics`) if profiling shows
   GC pauses or protocol-traffic contention is hurting frame pacing.
   This is internal refactoring; neither the plugin SDK nor the Wayland
   protocol surface is affected. The decision waits until measurements
@@ -859,8 +861,10 @@ the wire libs from one commit (ABI must match the host's wire client). The
 node-binding link must hide static-archive symbols (`-Wl,--exclude-libs,ALL`) so
 the bundled abseil does not interpose with the abseil inside V8/Node.
 
-See `status.md` for what is built/proven (the core compositing pass runs in JS
-over the wire for the headless + shm path).
+See `status.md` for what is built/proven: the core compositing pass runs entirely
+in JS over the wire (shm + dmabuf + nested present); the C++ compositing pass has
+been removed. `wrapTexture` + the dmabuf import/release + fence machinery are the
+same primitives the plugin `Surface` rings will use.
 
 ### Dmabuf-backed surfaces, end to end
 

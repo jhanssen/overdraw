@@ -4,7 +4,7 @@ Tracks what is built and empirically proven versus what is still design only.
 The design itself lives in `architecture.md`; this file is the ground truth for
 "what exists right now."
 
-Last updated: 2026-05-31 (rev 19).
+Last updated: 2026-05-31 (rev 20).
 
 ## Protocol gaps & skeletons (READ FIRST)
 
@@ -249,11 +249,11 @@ rests on facts, not assumptions:
   from the frame timer (direct `napi_call_function`, same Node thread). The
   cross-thread path (Dawn-internal-thread callbacks -> `napi_threadsafe_function`)
   is **not yet exercised**.
-- The **compositing renderer** now has a JS slice (see "WebGPU in JS over the
-  wire + JS compositor (SLICE 1)") — the documented C++/JS divergence is being
-  closed, though the C++ `Compositor` is still the only path real clients use.
-  Protocol handlers are largely in JS (`src/protocols/`). Still C++-internal or
-  absent: WM/policy beyond the placement stub, and the plugin model.
+- The **compositing renderer runs in JS** (see "Compositing pass runs in JS over
+  the Dawn wire") — the documented C++/JS divergence is closed; there is no C++
+  compositing pass. Protocol handlers are in JS (`src/protocols/`). Still
+  C++-internal or absent: WM/policy beyond the placement stub, and the plugin
+  model.
 - Server-side Wayland (`wl_event_loop`) IS integrated into the libuv loop (see
   "Wayland server + generic trampoline"); the core is a real Wayland server. No
   host-window-resize handling. Host *input* arrives in the core (see "Host input
@@ -450,11 +450,12 @@ implicit-sync interop) and Mesa's `src/vulkan/wsi/wsi_common_wayland.c` (the
 compositor-facing WSI contract). Hyprland's `LinuxDMABUF.cpp` was used to compare
 on-wire feedback.
 
-### WebGPU in JS over the wire (dawn.node) + JS compositor (SLICE 1, verified)
-The decision to expose WebGPU to JS via a wire-retargeted `dawn.node` (see
-architecture.md "Exposing WebGPU to JS") is implemented and proven for the first
-slice. This is the foundation for both moving the core renderer to JS (the
-documented C++/JS divergence) and the future plugin `sdk.gpu`.
+### Compositing pass runs in JS over the Dawn wire (dawn.node) — MIGRATION COMPLETE
+The compositing pass lives entirely in core main-thread JS now (the documented
+C++/JS "renderer in JS" divergence is closed). The C++ `Compositor` was reduced
+to a WSI + interop service; there is no C++ compositing pass. WebGPU is exposed
+to JS via a wire-retargeted `dawn.node` (see architecture.md "Exposing WebGPU to
+JS"). This is also the foundation for the future plugin `sdk.gpu`.
 
 - **Wire-retargeted `dawn.node`** (`jhanssen/dawn` @ `f01cb22e5c`, release
   `v20260531-linux-wayland-wire-alpha`, consumed by `3rdparty/dawn`): proc table
@@ -463,30 +464,41 @@ documented C++/JS divergence) and the future plugin `sdk.gpu`.
   GPUDevice/GPUTexture; `AsyncRunner` pumps a `wgpu::Instance`; a wrapped device
   is borrowed (not Destroy()ed). Built with `-Wl,--exclude-libs,ALL` (else the
   bundled abseil interposes with V8's abseil → crash at `requestAdapter`).
-- **`addon.gpuHandles()`** exposes the core compositing instance+device wire
-  handles (BigInt) for `wrapDevice`. **`addon.shmView(poolId,offset,len)`** gives
-  a zero-copy external `ArrayBuffer` over the client shm mapping for
-  `queue.writeTexture`.
-- **`src/gpu/compositor.ts` (`JsCompositor`)**: the compositing pass in core
-  main-thread JS — WGSL pipeline + sampler, per-surface view/uniform/bind group,
-  render pass (placement + premultiplied blend, JS-owned stack), submit, async
-  readback (256-aligned). Same shader/semantics as the C++ path.
-- **Wire lifetime fix (load-bearing)**: JS WebGPU finalizers run at process exit
-  and call into the C++ wire client. `gpuHandles()` marks the client
-  shared-with-JS; teardown `Disconnect()`s but leaks it (else use-after-free /
-  SIGSEGV at exit). The wire pump now runs under an N-API `HandleScope` (it can
-  resolve `dawn.node` promises).
-- **Verified** (`test/js-compositor.gpu.mjs`, headless, GPU): two shm surfaces
-  composite at correct positions, pixel-exact, clean teardown, no GPU leak.
-  Verified end-to-end on a fresh download of the published release.
-- **NOT yet (honest gaps)**: the JS compositor is NOT wired into the real
-  protocol path (the C++ `Compositor` still drives real clients);
-  `test/js-compositor.gpu.mjs` uploads SYNTHETIC pixels via `uploadPixels`, so
-  the `shmView` zero-copy path and `wrapTexture` are SHIPPED BUT UNEXERCISED
-  end-to-end. dmabuf surfaces in the JS path, the dmabuf buffer-release serial
-  lifecycle, and nested-swapchain present remain in C++ (slices 2-4). The C++
-  compositing pass is unchanged and still the default/only path used by real
-  clients.
+- **`src/gpu/compositor.ts` (`JsCompositor`)** is THE compositor: WGSL pipeline +
+  sampler, per-surface view/uniform/bind group, render pass (placement +
+  premultiplied blend, JS-owned stack), submit. It implements the `CompositorSink`
+  interface the protocol/WM layer drives (`commitSurfaceBuffer`/`commitSurfaceDmabuf`/
+  `setSurfaceLayout`/`setStack`/`removeSurface`/`takeImportedSurfaces`/
+  `takeFreedBuffers`/`renderFrame`). Headless renders into an owned offscreen
+  target (read back, 256-aligned); nested presents to the host swapchain.
+- **Native services kept** (the non-wire-propagatable / WSI bits): surface
+  bring-up + `Configure`, `acquireOutputTexture`/`presentOutput`/`outputFormat`
+  (host swapchain), `createTextureFromDmabuf` + `releaseDmabufImport` (dmabuf
+  reserve/inject + STM/fd release, generation-matched), `shmView` (zero-copy
+  external `ArrayBuffer` over the client shm mapping), `gpuHandles`, the wire link.
+- **shm** (slice 1/1b): `commitSurfaceBuffer` → `shmView` + `queue.writeTexture`.
+  **dmabuf** (slice 2): `createTextureFromDmabuf` (async, returns a Promise of the
+  wire handle) → `wrapTexture` → sample; JS owns the buffer-release lifecycle
+  (submit serial + `queue.onSubmittedWorkDone` → `wl_buffer.release` + explicit
+  `ReleaseClientTex` of the server STM/fd). **nested present** (slice 3):
+  `acquireOutputTexture` → wrap as render attachment → present. **slice 4**:
+  deleted the C++ compositing pass; the JS compositor is the only path.
+- **Lifetime/teardown fixes (load-bearing)**: JS WebGPU finalizers run at exit and
+  call into the C++ wire client, so the client is `Disconnect()`'d but leaked at
+  teardown (else UAF/SIGSEGV); the wire pump runs under an N-API `HandleScope`
+  (resolves `dawn.node` promises); `stop()` drains the wire after halting the
+  frame timer so the last `onSubmittedWorkDone` resolves Success before Disconnect
+  (dawn.node throws on a cancelled callback).
+- **Verified**: all GPU tests (`test/*.gpu.mjs`) run on the JS compositor —
+  shm/dmabuf/subsurface/popup pixels, integration, clipboard, DnD, protocols,
+  nested present, and a dmabuf buffer-cycling **leak test** (GPU-process fd count
+  stays bounded over 40 cycled buffers → `ReleaseClientTex` reclaims). `foot`
+  (shm) and a Vulkan-WSI terminal (dmabuf cycling) run on it manually. The
+  launcher (`main.ts`) presents on the JS compositor on-screen.
+- **Remaining gaps (flagged)**: on-screen (nested) PIXEL correctness is not
+  auto-asserted (no post-present readback; it is inherited from the headless
+  pixel tests, same render pass). The host-window frame clock is still a ~16ms
+  timer, not display-driven (pre-existing divergence; see below).
 
 ### Config system (user config: --config / XDG, verified)
 `src/config/` loads user config from `--config <path>` (hard error if missing)
@@ -499,19 +511,18 @@ transpile). Default export may be an object or a (sync/async) function. Validate
   launcher logs "N plugin(s) configured; plugin runtime not implemented yet".
 
 ### Compositing (multi-surface: per-surface placement + stacking + blending)
-- A textured-quad pipeline composites client surfaces: shaders, sampler,
-  per-surface bind group. Each surface is drawn into its layout rect (a per-
-  surface uniform holding a normalized output rect; the vertex shader places the
-  unit quad), in JS-owned back-to-front stack order, with premultiplied-alpha
-  blending. With an empty stack the pass clears to black.
-- **Multi-surface verified** (`test/compositing-eyeball.mjs`, needs GPU + host
-  Wayland + eyeball): two real shm clients (red 300x300, green 350x250) map and
-  appear simultaneously at distinct cascaded positions. **PASS** (visual).
-- Placement seam: native consumes geometry only — `setSurfaceLayout(id,x,y,w,h)`
-  and `setStack(ids[])` (addon -> `Compositor`); JS owns it. `src/wm/index.js`
-  holds the window list/stack and pushes layout+order to native; `src/wm/
-  placement.js` is a STUB (cascade) — the one throwaway policy piece, to be
-  replaced by a real layout model (dynamic tiling + floating) without touching
+- The textured-quad compositing pass runs in JS (`src/gpu/compositor.ts`; see
+  "Compositing pass runs in JS over the Dawn wire"): each surface drawn into its
+  layout rect (per-surface uniform = normalized output rect), JS-owned
+  back-to-front stack order, premultiplied-alpha blend, clear to black when empty.
+- **Multi-surface verified** (`test/compositing.gpu.mjs`, headless pixel readback):
+  two real shm clients composite at distinct cascaded positions; top-of-stack wins
+  the overlap. **PASS**.
+- Placement seam: the compositor consumes geometry only via the `CompositorSink`
+  — `setSurfaceLayout(id,x,y,w,h)` and `setStack(ids[])`; JS owns it. `src/wm/
+  index.ts` holds the window list/stack and pushes layout+order to the sink;
+  `src/wm/placement.ts` is a STUB (cascade) — the one throwaway policy piece, to
+  be replaced by a real layout model (dynamic tiling + floating) without touching
   the seam. `mapWindow` fires on a toplevel's first buffered commit
   (`wl_surface.commit`).
 - **Transport fix found while building this:** the Dawn wire socket is
