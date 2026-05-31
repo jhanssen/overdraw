@@ -110,7 +110,7 @@ function dragMotion(d: DragSession, x: number, y: number,
     const device = [...devices].find((r) => !r.destroyed);
     if (!device) return;
     const mimes = d.source ? (d.ctx.state.dataSources?.get(d.source)?.mimes ?? []) : [];
-    const offer = d.ctx.events.wl_data_device.send_data_offer(device, null) as unknown as Resource;
+    const offer = d.ctx.events.wl_data_device.send_data_offer(device, null) as Resource;
     if (!offer) return;
     dragOfferSession.set(offer, d);
     offerToSource.set(offer, d.source as Resource);
@@ -201,7 +201,7 @@ function sendSelectionTo(ctx: Ctx, clientId: number): void {
     // data_offer is an event carrying a server-minted new_id; postEvent returns
     // the new wl_data_offer resource (see trampoline). Pass null as the new_id
     // slot -- the trampoline treats a non-number new_id arg as "mint server-side".
-    const offer = ctx.events.wl_data_device.send_data_offer(device, null) as unknown as Resource;
+    const offer = ctx.events.wl_data_device.send_data_offer(device, null) as Resource;
     if (!offer) continue;
     offerToSource.set(offer, source);
     for (const mime of mimes) ctx.events.wl_data_offer.send_offer(offer, mime);
@@ -225,7 +225,7 @@ function sendPrimaryTo(ctx: Ctx, clientId: number): void {
       continue;
     }
     const offer = ctx.events.zwp_primary_selection_device_v1
-      .send_data_offer(device, null) as unknown as Resource;
+      .send_data_offer(device, null) as Resource;
     if (!offer) continue;
     primaryOfferToSource.set(offer, source);
     for (const mime of mimes) ctx.events.zwp_primary_selection_offer_v1.send_offer(offer, mime);

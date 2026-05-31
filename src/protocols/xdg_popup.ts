@@ -15,7 +15,8 @@ import { computeBaseStack, emitSubtree } from "../subsurfaces.js";
 // rect; a popup parent uses its own resolved output position (recursively).
 export function parentOutputOrigin(state: CompositorState, parent: XdgSurfaceRecord): { x: number; y: number } | null {
   if (parent.role === "toplevel" && parent.surface) {
-    const win = state.wm?.state.windows.find((w) => w.surfaceId === parent.surface!.id);
+    const surface = parent.surface;
+    const win = state.wm?.state.windows.find((w) => w.surfaceId === surface.id);
     return win ? { x: win.rect.x, y: win.rect.y } : null;
   }
   if (parent.role === "popup" && parent.popup) {
@@ -61,7 +62,8 @@ export default function makeXdgPopup(ctx: Ctx): XdgPopupHandler {
     destroy(resource) {
       const pr = rec(resource);
       if (pr) {
-        if (pr.mapped) ctx.state.compositor.removeSurface(pr.xdgSurface.surface!.id);
+        const surf = pr.xdgSurface.surface;
+        if (pr.mapped && surf) ctx.state.compositor.removeSurface(surf.id);
         if (ctx.state.grabbedPopup === resource) ctx.state.grabbedPopup = undefined;
         ctx.state.popups?.delete(resource);
         rebuildStackWithPopups(ctx.state);

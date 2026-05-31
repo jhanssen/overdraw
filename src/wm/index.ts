@@ -74,9 +74,10 @@ export function createWm(compositor: CompositorSink, output: Output): Wm {
     // Topmost window containing the output-space point, or null.
     windowAt(x, y) {
       for (let i = windows.length - 1; i >= 0; i--) {
-        const r = windows[i]!.rect;
+        const win = windows[i];
+        const r = win.rect;
         if (x >= r.x && x < r.x + r.width && y >= r.y && y < r.y + r.height)
-          return windows[i]!;
+          return win;
       }
       return null;
     },
