@@ -66,6 +66,19 @@ export interface Addon {
                           cb: (handle: bigint | null) => void): number;
   releaseDmabufImport(importId: number): void;
 
+  // Plugin GPU brokering (core side; the Worker owns the wire client). Callbacks
+  // are node-style (result|null or ok); the broker Promise-wraps them.
+  pluginCreateConnection(cb: (r: { connId: number; fd: number } | null) => void): void;
+  pluginInjectInstance(connId: number, id: number, gen: number, cb: (ok: boolean) => void): void;
+  pluginSetTickDevice(connId: number, id: number, gen: number): void;
+  pluginAllocSurfaceBufferW(connId: number, w: number, h: number, ptId: number, ptGen: number,
+                            pdId: number, pdGen: number, cb: (r: { surfaceBufId: number } | null) => void): void;
+  pluginSurfaceProducerBegin(surfaceBufId: number, cb: (ok: boolean) => void): void;
+  pluginSurfaceProducerEndW(surfaceBufId: number, wireSerial: bigint): void;
+  pluginSurfaceConsumerBegin(surfaceBufId: number, cb: (ok: boolean) => void): void;
+  pluginSurfaceConsumerEnd(surfaceBufId: number): void;
+  pluginConsumerTexture(surfaceBufId: number): bigint;
+
   // Synthetic input (test seam): feed a normalized InputEvent through the same
   // sink the host seat uses, so it routes to onInput / the seat exactly as a real
   // host event would. Used by integration tests to drive focus/pointer behavior.

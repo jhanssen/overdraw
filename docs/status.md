@@ -4,7 +4,7 @@ Tracks what is built and empirically proven versus what is still design only.
 The design itself lives in `architecture.md`; this file is the ground truth for
 "what exists right now."
 
-Last updated: 2026-05-31 (rev 25).
+Last updated: 2026-05-31 (rev 26).
 
 ## Protocol gaps & skeletons (READ FIRST)
 
@@ -798,6 +798,44 @@ test, so a standalone C-M2 device-ready test would need throwaway scaffolding).
   connection; cross-process surface allocation (`AllocateSurfaceBuffer` etc.);
   SCM_RIGHTS fence passing cross-process. All C-M4.
 
+### First plugin milestone COMPLETE: an animated-overlay plugin composites on top (C-M4) — VERIFIED
+A real plugin, in its OWN Worker isolate with its OWN GPU device, creates an
+overlay, renders into it, and the core composites it on top of the scene at the
+core-decided rect — pixel-verified end to end (`test/plugin-overlay.gpu.mjs`).
+This closes architecture.md's "First plugin milestone" (one plugin produces one
+surface the core composites on top at a core-decided rect).
+
+- **Worker owns its wire client + device + rendering** (`overdraw_plugin_native.node`,
+  context-aware; `native/plugin-napi/`). The Worker loads it + dawn.node, opens a
+  wire client on a core-brokered fd, brings up its device, and renders. The CORE
+  owns the side channel and brokers everything: connection (`AddWireConn`),
+  instance injection, `SetPluginTickDevice`, surface allocation
+  (`AllocSurfaceBuf`), and the per-frame fence brackets. Reached from the Worker
+  via the runtime's `onRequest` hook (`src/plugins/gpu-broker.ts`).
+- **SDK** (`src/plugins/gpu.ts`, on the scope-B runtime): `sdk.gpu.device` (a
+  dawn.node GPUDevice over the Worker's wire) + `sdk.gpu.createOverlay({layer,
+  anchor,size})` -> a `Surface` with `getCurrentTexture()` + `present()`. The
+  bootstrap brings up the GPU before `init` so `sdk.gpu` is ready. `createOverlay`
+  -> core overlay broker decides rect + layer (C-M3) + allocates the shared buffer;
+  the plugin renders; `present()` drives ProducerEnd -> ConsumerBegin (waits the
+  producer fence) -> the JS compositor samples the consumer texture
+  (`setSurfaceTexture`) at the overlay rect+layer.
+- **Verified**: `test/plugin-overlay.gpu.mjs` — `test/fixtures/plugins/overlay.mjs`
+  creates a top-left 64x64 overlay, clears it green, presents; the composited
+  128x128 frame has green at the overlay rect and black elsewhere. **PASS.**
+- **Bug found (instrumentation): the consumer read bracket must stay OPEN while
+  the compositor samples.** ConsumerEnd releases dmabuf access; ending it before
+  `renderFrame` sampled gave black. The broker keeps the read bracket open (ended
+  at the next present / on destroy) — the single-buffer static-overlay model.
+- **Flagged / not done**: single-buffer (no double-buffering -> not smooth
+  animation across frames; a re-present re-opens the producer bracket but reuses
+  one buffer); `createOverlay` is the only SDK GPU entry (no window/output/capture,
+  no decorations/insets/interactive-regions yet — those are the next milestone
+  steps in architecture.md's build order); no capability gate on `gpu` yet (the
+  runtime hands every plugin the GPU paths); plugin teardown does not yet release
+  the surface buffer / connection (leak on plugin exit — fine for the milestone,
+  must be fixed before multi-plugin churn).
+
 ### Plugin GPU end-to-end: device + shared surface + per-frame fence (C-M4 steps 1-3) — VERIFIED
 The cross-process producer/consumer surface path runs on the verification
 hardware: a plugin's OWN wire-client device renders into a dmabuf the core device
@@ -1232,12 +1270,14 @@ Menus/dropdowns/tooltips: a compositor-positioned, input-grabbing child surface.
 - **JS-owned core breadth.** The core is C++ + Node with a working trampoline
   and a frame event callback, but the protocol-handler/WM/plugin layers that
   "JS owns" per the design are unwritten.
-- **Plugin model.** Worker isolation, lifecycle, watchdog, and restart policy
-  ARE built (scope B — see "Plugin runtime (scope B)"). Still NOT built: the
-  GPU/window/surface/output/capture/input/protocol SDK surface, capability
-  grants/enforcement, and the native-import restriction. (The dmabuf surface
-  buffer path the SDK would drive is proven single-device only; see "dmabuf
-  interop path".) The capture/takeover design — one
+- **Plugin model.** Worker isolation, lifecycle, watchdog, restart policy (scope
+  B), AND the GPU producer/consumer surface path with `sdk.gpu` + `createOverlay`
+  ARE built and pixel-verified end to end (see "First plugin milestone COMPLETE").
+  Still NOT built: window/output/capture/input/protocol SDK surfaces;
+  decorations/insets/interactive-regions; capability grants/enforcement (the gpu
+  paths are handed to every plugin); the native-import restriction; double-
+  buffered surfaces; plugin-teardown resource release. The capture/takeover
+  design — one
   producer/consumer primitive run in both directions (plugin-on-top vs.
   plugin-captures/takes-over), capture uniform over the surface graph, the
   reversed-OffscreenCanvas model, and the overview-animation worked example — is

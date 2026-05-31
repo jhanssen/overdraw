@@ -57,6 +57,9 @@ export interface CompositorSink {
   // overlay). Plugin overlays/decorations use this. Optional so the native sink
   // (if ever used) need not implement it.
   setLayerSurfaces?(layer: Layer, ids: number[]): void;
+  // Install a pre-wrapped wire texture as surface `id`'s sampled texture (plugin
+  // overlay consumer texture). Optional (JS compositor only).
+  setSurfaceTexture?(id: number, tex: GPUTexture, w: number, h: number): void;
   removeSurface(id: number): void;
   takeImportedSurfaces(): Array<{ id: number; width: number; height: number }>;
   takeFreedBuffers(): number[];

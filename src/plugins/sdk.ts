@@ -8,6 +8,8 @@
 
 export type ShutdownCallback = () => void | Promise<void>;
 
+import type { PluginGpu } from "./gpu.js";
+
 export interface PluginSdk {
   // The plugin's stable name (config `name`, defaulting to its module).
   readonly name: string;
@@ -16,6 +18,9 @@ export interface PluginSdk {
   // Register a graceful-shutdown callback. Awaited (with a timeout) by the core
   // before the Worker is terminated. Forced shutdown (crash/watchdog) skips it.
   onShutdown(cb: ShutdownCallback): void;
+  // GPU + overlay surfaces (present iff the plugin has the `gpu` capability and
+  // the runtime brought the device up). Absent otherwise (capability by shape).
+  gpu?: PluginGpu;
 }
 
 // Internal handle the bootstrap uses to drive the SDK (run the shutdown cb, etc.)
@@ -25,7 +30,8 @@ export interface SdkControl {
   runShutdown(): Promise<void>;
 }
 
-export function createSdk(name: string, emitLog: (line: string) => void): SdkControl {
+export function createSdk(name: string, emitLog: (line: string) => void,
+                          gpu?: PluginGpu): SdkControl {
   let shutdownCb: ShutdownCallback | null = null;
 
   const sdk: PluginSdk = {
@@ -38,6 +44,7 @@ export function createSdk(name: string, emitLog: (line: string) => void): SdkCon
       if (typeof cb !== "function") throw new TypeError("onShutdown expects a function");
       shutdownCb = cb;
     },
+    ...(gpu ? { gpu } : {}),
   };
 
   return {

@@ -17,8 +17,10 @@
 // shape worker_threads gives both ends), so it is unit-testable with a plain
 // in-memory channel and reused verbatim by the in-Worker bootstrap.
 
+// Structured-cloneable payload (the transport is postMessage, not JSON, so bigint
+// is allowed -- used for 64-bit wire handles/serials). Named Json for brevity.
 export type Json =
-  | null | boolean | number | string
+  | null | boolean | number | string | bigint
   | Json[] | { [k: string]: Json };
 
 export interface RequestMessage { kind: "request"; id: number; method: string; params: Json; }

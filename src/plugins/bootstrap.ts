@@ -18,8 +18,17 @@ import { parentPort, workerData } from "node:worker_threads";
 import { Endpoint, channelFor } from "./protocol.js";
 import type { Json } from "./protocol.js";
 import { createSdk } from "./sdk.js";
+import { createPluginGpu } from "./gpu.js";
+import type { PluginGpu } from "./gpu.js";
 
-interface BootstrapData { module: string; name: string; }
+interface BootstrapData {
+  module: string;
+  name: string;
+  // Absolute paths to the plugin Worker addon + dawn.node. Present iff the plugin
+  // has the `gpu` capability (the runtime brings up the device before init).
+  pluginAddonPath?: string;
+  dawnPath?: string;
+}
 
 type InitFn = (sdk: unknown) => unknown | Promise<unknown>;
 
@@ -28,10 +37,22 @@ async function main(): Promise<void> {
   const port = parentPort;
   const { module: moduleSpec, name } = workerData as BootstrapData;
 
+  const { pluginAddonPath, dawnPath } = workerData as BootstrapData;
   const endpoint = new Endpoint(channelFor(port));
 
+  // Bring up the plugin's GPU device (over its own wire client) BEFORE init, so
+  // sdk.gpu is ready. Only when the runtime provided the native module paths
+  // (i.e. the plugin has the `gpu` capability). Keeps a steady-state pump going.
+  let gpu: PluginGpu | undefined;
+  if (pluginAddonPath && dawnPath) {
+    const g = await createPluginGpu(endpoint, pluginAddonPath, dawnPath);
+    gpu = g.gpu;
+    const t = setInterval(g.pump, 4);  // keep the plugin wire flowing
+    t.unref?.();
+  }
+
   // SDK logs are forwarded to the core as one-way events (the core prints them).
-  const control = createSdk(name, (line) => { endpoint.emit("log", line); });
+  const control = createSdk(name, (line) => { endpoint.emit("log", line); }, gpu);
 
   // The only request the core sends in scope B is 'shutdown'. Run the registered
   // onShutdown callback; resolving lets the core proceed to terminate.

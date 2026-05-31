@@ -41,11 +41,21 @@ export interface RuntimeOptions {
   shutdownTimeoutMs: number;
   // Override the bootstrap entry (tests point at a fixture-aware bootstrap if needed).
   bootstrapPath?: string;
+  // Absolute paths to the plugin Worker addon + dawn.node. When set (and the
+  // plugin has the gpu capability), the bootstrap brings up the plugin device
+  // before init and sdk.gpu is available. main.ts provides these.
+  pluginAddonPath?: string;
+  dawnPath?: string;
   // Sink for diagnostics (defaults to console). Lets tests capture/quiet logs.
   log?: (msg: string) => void;
   // Observe plugin->core events (name, data, plugin name). In scope B the only
   // plugin-originated event is `log`. Used by main.ts (print) and tests (assert).
   onEvent?: (pluginName: string, name: string, data: unknown) => void;
+  // Handle plugin->core REQUESTS (the SDK's GPU/surface brokering: gpu.connect,
+  // gpu.injectInstance, surface.alloc, surface.present, ...). The resolved value
+  // is the response. main.ts provides this (it has the addon + compositor +
+  // overlay broker); scope-B tests omit it. `pluginName` identifies the caller.
+  onRequest?: (pluginName: string, method: string, params: unknown) => Promise<unknown> | unknown;
 }
 
 export const DEFAULT_OPTIONS: RuntimeOptions = {
@@ -99,7 +109,10 @@ class ManagedPlugin {
     this.missed = 0;
     const bootstrap = this.opts.bootstrapPath ?? BOOTSTRAP;
     const worker = new Worker(bootstrap, {
-      workerData: { module: this.cfg.module, name: this.cfg.name },
+      workerData: {
+        module: this.cfg.module, name: this.cfg.name,
+        pluginAddonPath: this.opts.pluginAddonPath, dawnPath: this.opts.dawnPath,
+      },
       resourceLimits: { maxOldGenerationSizeMb: this.opts.heapMb },
     });
     this.worker = worker;
@@ -109,6 +122,12 @@ class ManagedPlugin {
     this.endpoint = endpoint;
     endpoint.handlePongs(() => { this.missed = 0; });
     endpoint.handleEvents((name, data) => { this.onPluginEvent(name, data); });
+    // Plugin->core requests (SDK GPU/surface brokering) delegate to onRequest.
+    const onReq = this.opts.onRequest;
+    if (onReq) {
+      endpoint.handleRequests(async (method, params) =>
+        (await onReq(this.cfg.name, method, params)) as import("./protocol.js").Json);
+    }
 
     // The bootstrap posts {kind:'event', name:'init'} with {ok:true} or
     // {ok:false, error}. That is the init-resolve/reject signal.

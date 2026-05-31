@@ -17,6 +17,8 @@ import { globSync } from "node:fs";
 import { installProtocols } from "./protocols/index.js";
 import { parseConfigArg, loadConfig } from "./config/load.js";
 import { PluginRuntime } from "./plugins/index.js";
+import { createOverlayBroker } from "./overlay.js";
+import { createGpuBroker } from "./plugins/gpu-broker.js";
 import { JsCompositor } from "./gpu/compositor.js";
 import type { DawnWire, DawnGlobals } from "./gpu/compositor.js";
 import type { Addon, InputEvent } from "./types.js";
@@ -111,10 +113,21 @@ if (config.plugins.length > 0) {
     const isPath = isAbsolute(m) || m.startsWith("./") || m.startsWith("../");
     return isPath ? { ...p, module: pathToFileURL(resolvePath(base, m)).href } : p;
   });
+  // GPU broker: services plugin Worker GPU/surface requests (connection, surface
+  // alloc, fence dance, overlay compositing). Needs the overlay broker + the
+  // core device handle for wrapping consumer textures.
+  const overlays = createOverlayBroker(state, config.output ?? { width: dims.width, height: dims.height });
+  const gpuBroker = createGpuBroker({ addon, compositor, overlays, dawn, coreDeviceHandle: h.device });
+  const [dawnNodePath] = globSync(join(__dirname, "..", "build", "3rdparty", "dawn", "Dawn-*", "dawn.node"));
+  const pluginAddonPath = join(__dirname, "..", "build", "overdraw_plugin_native.node");
+
   runtime = new PluginRuntime({
+    pluginAddonPath,
+    dawnPath: dawnNodePath,
     onEvent: (plugin, name, data) => {
       if (name === "log") console.log(`[plugin ${plugin}] ${String(data)}`);
     },
+    onRequest: (plugin, method, params) => gpuBroker(plugin, method, params),
   });
   await runtime.load(resolved);
   const summary = runtime.states().map((s) => `${s.name}=${s.state}`).join(", ");

@@ -103,6 +103,8 @@ struct PendingAlloc {
     uint32_t surfaceBufId;
     uint32_t connId;
     napi_ref cb;
+    bool worker = false;  // Worker-brokered: producer texture lives in the Worker,
+                          // so resolve with just {surfaceBufId} (no core wire entry).
 };
 std::vector<PendingAlloc> g_pendingAllocs;
 
@@ -495,8 +497,19 @@ void advancePendingAllocs(napi_env env) {
         int st = g_addon.compositor->surfaceBufAllocated(pa.surfaceBufId);
         if (st == 0) { ++i; continue; }  // pending
         bool ok = st == 1;
-        PluginWireEntry* e = ok ? findPluginWire(pa.connId) : nullptr;
         napi_value result = nullptr;
+        if (ok && pa.worker) {
+            // Worker-brokered: the Worker owns the producer texture; just report id.
+            napi_value obj, sv;
+            napi_create_object(env, &obj);
+            napi_create_uint32(env, pa.surfaceBufId, &sv);
+            napi_set_named_property(env, obj, "surfaceBufId", sv);
+            result = obj;
+            invokePluginCb(env, pa.cb, result);
+            g_pendingAllocs.erase(g_pendingAllocs.begin() + static_cast<long>(i));
+            continue;
+        }
+        PluginWireEntry* e = ok ? findPluginWire(pa.connId) : nullptr;
         if (ok && e) {
             auto prod = reinterpret_cast<uint64_t>(e->pw->producerTexture(pa.surfaceBufId));
             auto cons = reinterpret_cast<uint64_t>(g_addon.compositor->coreSurfaceTexture(pa.surfaceBufId));
@@ -773,6 +786,33 @@ napi_value PluginSetTickDevice(napi_env env, napi_callback_info info) {
     return nullptr;
 }
 
+// pluginSurfaceProducerEndW(surfaceBufId, wireSerial:bigint): ProducerEnd with an
+// explicit plugin-wire serial (the Worker owns the wire client, so it samples its
+// own wireBytesQueued and passes it). The GPU process defers the producer
+// EndAccess until its plugin-conn reader has consumed that many bytes.
+napi_value PluginSurfaceProducerEndW(napi_env env, napi_callback_info info) {
+    if (!g_addon.compositor) return nullptr;
+    size_t argc = 2; napi_value argv[2];
+    napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+    uint32_t id = u32(env, argv[0]);
+    uint64_t serial = 0; bool lossless = false;
+    napi_get_value_bigint_uint64(env, argv[1], &serial, &lossless);
+    g_addon.compositor->sendProducerEnd(id, serial);
+    return nullptr;
+}
+
+// pluginConsumerTexture(surfaceBufId) -> bigint: the core's wrapped-able wire
+// texture handle for the consumer side (the JS compositor wraps + samples it).
+napi_value PluginConsumerTexture(napi_env env, napi_callback_info info) {
+    if (!g_addon.compositor) return nullptr;
+    size_t argc = 1; napi_value argv[1];
+    napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+    auto t = reinterpret_cast<uint64_t>(
+        g_addon.compositor->coreSurfaceTexture(u32(env, argv[0])));
+    napi_value out; napi_create_bigint_uint64(env, t, &out);
+    return out;
+}
+
 // pluginAllocSurfaceBufferW(connId, w, h, prodTexId, prodTexGen, prodDevId,
 // prodDevGen, cb): Worker-brokered surface alloc. The WORKER reserved the producer
 // texture on its wire client and passes the handles; the core reserves the
@@ -793,7 +833,7 @@ napi_value PluginAllocSurfaceBufferW(napi_env env, napi_callback_info info) {
         core.surfaceBufId, connId, w, h, {pdId, pdGen}, {ptId, ptGen},
         {core.device.id, core.device.generation}, {core.texture.id, core.texture.generation});
     napi_ref cbRef; napi_create_reference(env, argv[7], 1, &cbRef);
-    g_pendingAllocs.push_back({core.surfaceBufId, connId, cbRef});
+    g_pendingAllocs.push_back({core.surfaceBufId, connId, cbRef, true});
     return nullptr;
 }
 
@@ -1590,6 +1630,8 @@ napi_value Init(napi_env env, napi_value exports) {
     reg("pluginInjectInstance", PluginInjectInstance);
     reg("pluginSetTickDevice", PluginSetTickDevice);
     reg("pluginAllocSurfaceBufferW", PluginAllocSurfaceBufferW);
+    reg("pluginConsumerTexture", PluginConsumerTexture);
+    reg("pluginSurfaceProducerEndW", PluginSurfaceProducerEndW);
     reg("pluginAllocSurfaceBuffer", PluginAllocSurfaceBuffer);
     reg("pluginSurfaceProducerBegin", PluginSurfaceProducerBegin);
     reg("pluginSurfaceProducerEnd", PluginSurfaceProducerEnd);

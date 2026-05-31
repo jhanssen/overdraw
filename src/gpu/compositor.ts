@@ -303,6 +303,35 @@ export class JsCompositor implements CompositorSink {
     this.imported.push({ id, width: w, height: h });
   }
 
+  // Install a pre-wrapped wire texture (e.g. a plugin overlay's consumer texture,
+  // dual-imported dmabuf on the core device) as surface `id`'s sampled texture.
+  // Unlike commitSurfaceDmabuf this does no import (the GPU process already did
+  // it + the core wrapped the injected handle); it just (re)builds the bind group.
+  // The plugin/overlay layer placement is set separately (setSurfaceLayout +
+  // setLayerSurfaces). Idempotent per frame (same texture handle reused).
+  setSurfaceTexture(id: number, tex: GPUTexture, w: number, h: number): void {
+    let s = this.surfaces.get(id);
+    if (!s) { s = blankSurface(0, 0, 0, 0); this.surfaces.set(id, s); }
+    if (s.texture === tex && s.bindGroup) { s.present = true; return; }
+    s.texture = tex;
+    s.width = w; s.height = h;
+    const view = tex.createView();
+    s.view = view;
+    const placementBuf = s.placementBuf ?? this.device.createBuffer({
+      size: 16, usage: this.g.GPUBufferUsage.UNIFORM | this.g.GPUBufferUsage.COPY_DST,
+    });
+    s.placementBuf = placementBuf;
+    s.bindGroup = this.device.createBindGroup({
+      layout: this.layout,
+      entries: [
+        { binding: 0, resource: this.sampler },
+        { binding: 1, resource: view },
+        { binding: 2, resource: { buffer: placementBuf } },
+      ],
+    });
+    s.present = true;
+  }
+
   takeImportedSurfaces(): Array<{ id: number; width: number; height: number }> {
     const out = this.imported;
     this.imported = [];
