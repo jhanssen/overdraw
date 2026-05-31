@@ -14,6 +14,7 @@ import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 
 import { installProtocols } from "./protocols/index.js";
+import { parseConfigArg, loadConfig } from "./config/load.js";
 import type { Addon, InputEvent } from "./types.js";
 import type { CompositorState } from "./protocols/ctx.js";
 
@@ -46,11 +47,22 @@ function shutdown(signal: string): void {
 process.on("SIGINT", () => shutdown("SIGINT"));
 process.on("SIGTERM", () => shutdown("SIGTERM"));
 
+const config = await loadConfig(parseConfigArg(process.argv.slice(2)));
+console.log(`[overdraw] config: ${config.sourcePath ?? "(defaults; no config file)"}`);
+if (config.plugins.length > 0) {
+  // DEFERRED: the plugin runtime is not built yet (docs/status.md). The config
+  // is validated and reported, but nothing loads these — they are inert.
+  console.log(`[overdraw] ${config.plugins.length} plugin(s) configured; plugin runtime not implemented yet (ignored)`);
+}
+
 const dims = addon.start(gpuBin, onFrame, onInput);
 console.log(`[overdraw] compositor up; output ${dims.width}x${dims.height}`);
 
 const sock = addon.startServer();
-state = await installProtocols(addon, { output: { width: dims.width, height: dims.height } });
+state = await installProtocols(addon, {
+  output: config.output ?? { width: dims.width, height: dims.height },
+  focus: config.focus,
+});
 
 console.log(`[overdraw] Wayland server listening.`);
 console.log(`[overdraw] run a client with:  WAYLAND_DISPLAY=${sock} <your-client>`);
