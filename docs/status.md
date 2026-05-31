@@ -4,7 +4,7 @@ Tracks what is built and empirically proven versus what is still design only.
 The design itself lives in `architecture.md`; this file is the ground truth for
 "what exists right now."
 
-Last updated: 2026-05-31 (rev 26).
+Last updated: 2026-05-31 (rev 27).
 
 ## Protocol gaps & skeletons (READ FIRST)
 
@@ -820,21 +820,38 @@ surface the core composites on top at a core-decided rect).
   the plugin renders; `present()` drives ProducerEnd -> ConsumerBegin (waits the
   producer fence) -> the JS compositor samples the consumer texture
   (`setSurfaceTexture`) at the overlay rect+layer.
-- **Verified**: `test/plugin-overlay.gpu.mjs` — `test/fixtures/plugins/overlay.mjs`
-  creates a top-left 64x64 overlay, clears it green, presents; the composited
-  128x128 frame has green at the overlay rect and black elsewhere. **PASS.**
-- **Bug found (instrumentation): the consumer read bracket must stay OPEN while
-  the compositor samples.** ConsumerEnd releases dmabuf access; ending it before
-  `renderFrame` sampled gave black. The broker keeps the read bracket open (ended
-  at the next present / on destroy) — the single-buffer static-overlay model.
-- **Flagged / not done**: single-buffer (no double-buffering -> not smooth
-  animation across frames; a re-present re-opens the producer bracket but reuses
-  one buffer); `createOverlay` is the only SDK GPU entry (no window/output/capture,
-  no decorations/insets/interactive-regions yet — those are the next milestone
-  steps in architecture.md's build order); no capability gate on `gpu` yet (the
-  runtime hands every plugin the GPU paths); plugin teardown does not yet release
-  the surface buffer / connection (leak on plugin exit — fine for the milestone,
-  must be fixed before multi-plugin churn).
+- **Double-buffered ring (animation works)**: a surface is a ring of 2 slots
+  (each a shared dmabuf with its own surfaceBufId, reusing the proven single-buffer
+  primitive). The plugin renders into one slot while the consumer holds a read
+  bracket on the latest-presented slot; on `present` the broker switches the
+  consumer bracket to the just-presented slot and frees the other for the producer
+  (re-opening its producer bracket). The plugin is OBLIVIOUS — it only calls
+  `getCurrentTexture()` + `submit` + `present()` (swapchain-shaped); slots, fences,
+  and brackets live entirely in the SDK + broker + GPU process. The consumer's
+  read of a slot is gated by that slot's producer fence (ConsumerBegin waits it),
+  so the consumer never reads a buffer the producer hasn't finished.
+- **Verified**: `test/plugin-overlay.gpu.mjs` (static: green overlay composites at
+  its rect, black elsewhere — **PASS**) and `test/plugin-overlay-animated.gpu.mjs`
+  (a plugin animates green→red→blue on its own clock; the test observes the
+  composited output and confirms it shows MULTIPLE distinct colors over time, i.e.
+  the buffer genuinely updates frame-to-frame — **PASS**).
+- **Bugs found while building the ring (instrumentation/reasoning, not guessing):**
+  (1) the consumer read bracket must stay OPEN while the compositor samples
+  (ConsumerEnd releases dmabuf access -> black); the broker keeps it open and
+  switches it on present. (2) The SDK keyed both ring slots' producer
+  reservations under the same id (collision) -> fixed with a worker-local unique
+  reservation key per slot, decoupled from the core's surfaceBufId.
+- **HISTORICAL NOTE (accuracy):** rev 26 of this file + commit 676358d called this
+  milestone "animated" / "complete" when only the SINGLE-BUFFER STATIC overlay was
+  built. That was inaccurate — the milestone's criterion (an animated overlay) was
+  not met until the double-buffered ring (this rev). Corrected.
+- **Flagged / not done**: `createOverlay` is the only SDK GPU entry (no window/
+  output/capture, no decorations/insets/interactive-regions — the next steps in
+  architecture.md's build order); no `sdk.onFrame` yet (the animated fixture
+  drives its own loop; the proper core-frame-tick driver is a flagged follow-up);
+  no capability gate on `gpu` (every plugin gets the GPU paths); plugin teardown
+  does not release the surface ring / connection (leak on exit — must fix before
+  multi-plugin churn); only 2 slots (fine; 3 would fully decouple the clocks).
 
 ### Plugin GPU end-to-end: device + shared surface + per-frame fence (C-M4 steps 1-3) — VERIFIED
 The cross-process producer/consumer surface path runs on the verification
@@ -1275,8 +1292,10 @@ Menus/dropdowns/tooltips: a compositor-positioned, input-grabbing child surface.
   ARE built and pixel-verified end to end (see "First plugin milestone COMPLETE").
   Still NOT built: window/output/capture/input/protocol SDK surfaces;
   decorations/insets/interactive-regions; capability grants/enforcement (the gpu
-  paths are handed to every plugin); the native-import restriction; double-
-  buffered surfaces; plugin-teardown resource release. The capture/takeover
+  paths are handed to every plugin); the native-import restriction; sdk.onFrame
+  (animation uses a plugin-driven loop today); plugin-teardown resource release.
+  (Double-buffered animated overlays ARE built — see "First plugin milestone".)
+  The capture/takeover
   design — one
   producer/consumer primitive run in both directions (plugin-on-top vs.
   plugin-captures/takes-over), capture uniform over the surface graph, the

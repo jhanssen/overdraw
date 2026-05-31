@@ -25,12 +25,15 @@ const pProducerBegin = (a: Addon, id: number) => new Promise<void>((res, rej) =>
 const pConsumerBegin = (a: Addon, id: number) => new Promise<void>((res, rej) =>
   a.pluginSurfaceConsumerBegin(id, (ok: boolean) => ok ? res() : rej(new Error("consumerBegin"))));
 
+// A logical overlay surface backed by a ring of slots (each slot is one shared
+// dmabuf with its own surfaceBufId). The producer renders into one slot while the
+// consumer holds a read bracket on the latest-presented slot -> smooth animation.
 interface OverlaySurface {
-  surfaceBufId: number;
   surfaceId: number;      // compositor surface id (== overlay broker id)
   width: number;
   height: number;
-  consumerOpen: boolean;  // a consumer read bracket is currently open
+  slots: number[];        // surfaceBufIds, one per ring slot
+  consumerSlot: number;   // slot currently bracket-open for the consumer (-1 = none)
 }
 
 export interface GpuBrokerDeps {
@@ -44,10 +47,11 @@ export interface GpuBrokerDeps {
 export function createGpuBroker(deps: GpuBrokerDeps) {
   const { addon, compositor, overlays, dawn, coreDeviceHandle } = deps;
   const connByPlugin = new Map<string, number>();
-  // overlay surfaceId -> {pending geometry} between alloc and bindProducer.
-  const pendingAlloc = new Map<number, { width: number; height: number }>();
-  // overlay surfaceId -> surfaceBufId (set at bindProducer).
-  const bufBySurface = new Map<number, number>();
+  // overlay surfaceId -> geometry pending until its slots are bound.
+  const pendingAlloc = new Map<number, { width: number; height: number; overlaySurfaceId: number }>();
+  // surfaceBufId -> its OverlaySurface (so present can find the ring).
+  const surfaceByBuf = new Map<number, OverlaySurface>();
+  // overlay surfaceId -> OverlaySurface.
   const surfaces = new Map<number, OverlaySurface>();
 
   return async function onRequest(pluginName: string, method: string, params: unknown): Promise<unknown> {
@@ -65,50 +69,57 @@ export function createGpuBroker(deps: GpuBrokerDeps) {
         addon.pluginSetTickDevice(p.connId as number, p.id as number, p.generation as number);
         return null;
       case "surface.alloc": {
-        // Core decides the rect + layer (overlay broker) and assigns a surfaceId.
-        // The actual GBM buffer is allocated at bindProducer (it needs the
-        // Worker's producer texture handles). Returns the id + rect.
+        // Core decides the rect + layer (overlay broker) and assigns the overlay
+        // surfaceId. The ring's slots are allocated per-slot at bindProducer (each
+        // needs the Worker's producer texture handles). Returns the slot ids + rect.
         const width = p.width as number, height = p.height as number;
+        const slots = (p.slots as number) ?? 2;
         const handle = overlays.create(pluginName, {
           layer: (p.layer as OverlayLayer) ?? "overlay",
           anchor: (p.anchor as OverlayAnchor) ?? "center", width, height, margin: p.margin as number,
         });
-        pendingAlloc.set(handle.surfaceId, { width, height });
-        return { surfaceBufId: handle.surfaceId, rect: handle.rect };
+        void slots;
+        const surf: OverlaySurface = {
+          surfaceId: handle.surfaceId, width, height, slots: [], consumerSlot: -1,
+        };
+        surfaces.set(handle.surfaceId, surf);
+        pendingAlloc.set(handle.surfaceId, { width, height, overlaySurfaceId: handle.surfaceId });
+        return { overlayId: handle.surfaceId, rect: handle.rect };
       }
       case "surface.bindProducer": {
-        const surfaceId = p.surfaceBufId as number;
-        const pend = pendingAlloc.get(surfaceId);
+        const overlayId = p.overlayId as number;
+        const pend = pendingAlloc.get(overlayId);
         const connId = connByPlugin.get(pluginName);
-        if (!pend || connId === undefined) throw new Error("bindProducer: bad state");
+        const surf = surfaces.get(overlayId);
+        if (!pend || connId === undefined || !surf) throw new Error("bindProducer: bad state");
         const alloc = await pAlloc(addon, connId, pend.width, pend.height,
           p.texId as number, p.texGen as number, p.devId as number, p.devGen as number);
-        surfaces.set(alloc.surfaceBufId,
-          { surfaceBufId: alloc.surfaceBufId, surfaceId, width: pend.width, height: pend.height, consumerOpen: false });
-        bufBySurface.set(surfaceId, alloc.surfaceBufId);
-        pendingAlloc.delete(surfaceId);
-        // Open the producer bracket so the plugin can render into the texture.
+        surf.slots.push(alloc.surfaceBufId);
+        surfaceByBuf.set(alloc.surfaceBufId, surf);
+        // Open the producer bracket on this slot so the plugin can render into it.
         await pProducerBegin(addon, alloc.surfaceBufId);
-        return null;
+        return { surfaceBufId: alloc.surfaceBufId };
       }
       case "surface.present": {
         const connId = connByPlugin.get(pluginName);
-        const surfaceBufId = bufBySurface.get(p.surfaceBufId as number);
-        if (connId === undefined || surfaceBufId === undefined) throw new Error("present: unknown surface");
-        const surf = surfaces.get(surfaceBufId);
-        if (!surf) throw new Error("present: no surface record");
-        // Producer done (deferred on the plugin-wire serial the Worker passed).
-        addon.pluginSurfaceProducerEndW(surfaceBufId, (p.wireSerial as bigint) ?? 0n);
-        // Consumer waits the producer fence; install the consumer texture so the
-        // compositor samples it. The read bracket stays OPEN so the compositor can
-        // sample within it each frame (ConsumerEnd would release dmabuf access
-        // before renderFrame samples). The bracket is ended at the next present
-        // (before re-rendering) or on destroy. This is a single-buffer static
-        // overlay model; double-buffering for smooth animation is future work.
-        if (surf.consumerOpen) { addon.pluginSurfaceConsumerEnd(surfaceBufId); surf.consumerOpen = false; }
-        await pConsumerBegin(addon, surfaceBufId);
-        surf.consumerOpen = true;
-        const tex = dawn.wrapTexture(coreDeviceHandle, addon.pluginConsumerTexture(surfaceBufId));
+        const slotBufId = p.surfaceBufId as number;
+        const surf = surfaceByBuf.get(slotBufId);
+        if (connId === undefined || !surf) throw new Error("present: unknown surface");
+        // Producer done on the presented slot (deferred on the plugin-wire serial).
+        addon.pluginSurfaceProducerEndW(slotBufId, (p.wireSerial as bigint) ?? 0n);
+        // Switch the consumer read bracket to the just-presented slot: end the old
+        // slot's bracket (freeing it for the producer to render into next), then
+        // begin the new slot's (waits its producer fence). The bracket stays OPEN
+        // so the compositor samples within it each frame until the next present.
+        // Double-buffered: the producer renders the OTHER slot while this is held.
+        if (surf.consumerSlot >= 0 && surf.consumerSlot !== slotBufId) {
+          addon.pluginSurfaceConsumerEnd(surf.consumerSlot);
+          // Reopen the producer bracket on the freed slot for the plugin's next frame.
+          await pProducerBegin(addon, surf.consumerSlot);
+        }
+        await pConsumerBegin(addon, slotBufId);
+        surf.consumerSlot = slotBufId;
+        const tex = dawn.wrapTexture(coreDeviceHandle, addon.pluginConsumerTexture(slotBufId));
         compositor.setSurfaceTexture?.(surf.surfaceId, tex, surf.width, surf.height);
         return null;
       }

@@ -34,6 +34,11 @@ interface DawnModule {
   globals: { GPUTextureUsage: typeof GPUTextureUsage; GPUBufferUsage: typeof GPUBufferUsage; GPUMapMode: typeof GPUMapMode };
 }
 
+// Worker-local unique key for each producer-texture reservation (the wire-client
+// reservation map is keyed by it). Decoupled from the core's surfaceBufId so a
+// surface's ring slots never collide.
+let nextResKey = 1;
+
 export type OverlayLayer = "background" | "below" | "above" | "overlay";
 export type OverlayAnchor =
   | "top-left" | "top" | "top-right" | "left" | "center" | "right"
@@ -106,54 +111,54 @@ export async function createPluginGpu(
     device,
     async createOverlay(opts: CreateOverlayOpts): Promise<Surface> {
       const { width, height } = opts;
-      // Ask the core to decide the rect + allocate the shared surface buffer. The
-      // Worker reserves the producer texture first (on its wire client) and passes
-      // the handles; the core reserves the consumer + sends AllocSurfaceBuf.
-      // surfaceBufId is assigned by the core, but reserveProducerTexture needs it
-      // up front -> the core returns it in two phases. To keep one round-trip, the
-      // core assigns the surfaceBufId; we reserve against it after. So: request
-      // alloc with a provisional reserve done AFTER we learn the id is not
-      // possible -> instead the core returns the id, we reserve, then confirm.
-      // Simpler protocol: core allocates id + consumer; replies id; we reserve
-      // producer + send the producer handles in a second 'surface.bindProducer'.
+      const SLOTS = 2;  // double-buffered ring: producer writes one slot while the
+                        // consumer (compositor) holds the other -> smooth animation.
+
+      // The core decides the rect + the logical overlay; it returns SLOTS
+      // surfaceBufIds (one shared dmabuf per slot). The Worker reserves a producer
+      // texture per slot, then binds each (the core finishes AllocSurfaceBuf).
+      // The core creates the logical overlay (geometry/layer) + returns the rect.
       const r = (await endpoint.request("surface.alloc", {
-        connId: conn.connId, width, height,
+        connId: conn.connId, width, height, slots: SLOTS,
         layer: opts.layer ?? "overlay", anchor: opts.anchor ?? "center",
         margin: opts.margin ?? 0,
-      })) as {
-        surfaceBufId: number; rect: { x: number; y: number; width: number; height: number };
-      };
-      const surfaceBufId = r.surfaceBufId;
-      // Reserve the producer texture on our wire client against the core's id, and
-      // give the core the handles so it can finish AllocSurfaceBuf.
-      const pr = plugin.reserveProducerTexture(clientId, surfaceBufId, width, height);
-      plugin.flush(clientId);
-      await endpoint.request("surface.bindProducer", {
-        connId: conn.connId, surfaceBufId,
-        texId: pr.texture.id, texGen: pr.texture.generation,
-        devId: pr.device.id, devGen: pr.device.generation,
-      });
+      })) as { overlayId: number; rect: { x: number; y: number; width: number; height: number } };
 
-      let texture: GPUTexture | null = null;
+      // Per slot: reserve a producer texture under a UNIQUE worker-local key (the
+      // wire-client reservation map is keyed by it), then bindProducer, which
+      // allocates the shared dmabuf server-side and returns the real surfaceBufId.
+      const slotResKey: number[] = [];
+      const slotBufId: number[] = [];
+      const slotTex: (GPUTexture | null)[] = [];
+      for (let i = 0; i < SLOTS; i++) {
+        const resKey = nextResKey++;
+        const pr = plugin.reserveProducerTexture(clientId, resKey, width, height);
+        plugin.flush(clientId);
+        const bound = (await endpoint.request("surface.bindProducer", {
+          connId: conn.connId, overlayId: r.overlayId,
+          texId: pr.texture.id, texGen: pr.texture.generation,
+          devId: pr.device.id, devGen: pr.device.generation,
+        })) as { surfaceBufId: number };
+        slotResKey.push(resKey);
+        slotBufId.push(bound.surfaceBufId);
+        slotTex.push(null);
+      }
+
+      let write = 0;  // slot the plugin currently renders into
       const surface: Surface = {
         width, height, rect: r.rect,
         getCurrentTexture(): GPUTexture {
-          if (!texture) {
-            texture = dawn.wrapTexture(devHandle, plugin.producerTexture(clientId, surfaceBufId));
-          }
-          return texture;
+          let t = slotTex[write];
+          if (!t) { t = dawn.wrapTexture(devHandle, plugin.producerTexture(clientId, slotResKey[write])); slotTex[write] = t; }
+          return t;
         },
         async present(): Promise<void> {
-          // Flush the plugin's render, then ask the core to run the fence dance:
-          // ProducerEnd (waits the render) -> ConsumerBegin (waits the producer
-          // fence) -> core samples into the compositor -> ConsumerEnd.
           plugin.flush(clientId);
-          // The Worker owns the wire client, so it samples its own wire serial
-          // (bytesQueued after flush) and passes it; the core's ProducerEnd defers
-          // on it (render-before-EndAccess across the wire vs side channel).
           const wireSerial = plugin.wireBytesQueued(clientId);
+          const presented = slotBufId[write];
+          write = (write + 1) % SLOTS;  // next frame renders into the other slot
           await endpoint.request("surface.present",
-            { connId: conn.connId, surfaceBufId, wireSerial });
+            { connId: conn.connId, surfaceBufId: presented, wireSerial });
         },
       };
       return surface;
