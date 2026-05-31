@@ -51,9 +51,9 @@ test("JS compositor composites two shm surfaces over the wire", { skip: !dawn ? 
     const green = solid([0, 255, 0, 255], SZ, SZ);   // BGRA green
 
     comp.uploadPixels(1, { width: SZ, height: SZ, stride: red.stride }, red.data);
-    comp.setLayout(1, 0, 0, SZ, SZ);
+    comp.setSurfaceLayout(1, 0, 0, SZ, SZ);
     comp.uploadPixels(2, { width: SZ, height: SZ, stride: green.stride }, green.data);
-    comp.setLayout(2, SZ, 0, SZ, SZ);
+    comp.setSurfaceLayout(2, SZ, 0, SZ, SZ);
     comp.setStack([1, 2]);
 
     comp.renderFrame();

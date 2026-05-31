@@ -39,8 +39,8 @@ export function makeSubsurface(ctx: Ctx): WlSubsurfaceHandler {
       const s = rec(resource);
       ctx.state.subsurfaces?.delete(resource);
       // Drop the child from the draw stack / its layout (no longer a subsurface).
-      if (s) { const c = ctx.state.surfaces.get(s.surface); if (c) ctx.addon.removeSurface(c.id); }
-      applySubsurfaces(ctx.state, ctx.addon);
+      if (s) { const c = ctx.state.surfaces.get(s.surface); if (c) ctx.state.compositor.removeSurface(c.id); }
+      applySubsurfaces(ctx.state);
     },
     set_position(resource, x, y) {
       // Position is double-buffered subsurface state: it takes effect when the

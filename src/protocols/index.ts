@@ -19,7 +19,7 @@ import { queryState } from "../query.js";
 import { applySubsurfaces } from "../subsurfaces.js";
 import { rebuildStackWithPopups, maybeDismissGrabbedPopup } from "./xdg_popup.js";
 import type { Addon, EventsByInterface, EventSenders } from "../types.js";
-import type { Ctx, CompositorState, FocusOptions } from "./ctx.js";
+import type { Ctx, CompositorState, FocusOptions, CompositorSink } from "./ctx.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const genDir = join(__dirname, "..", "protocols-gen");
@@ -72,6 +72,9 @@ export interface InstallOptions {
   // Keyboard focus policy (interim config point until a real config system
   // exists). Defaults to follow-pointer + focus-on-map.
   focus?: FocusOptions;
+  // Compositor backend. Defaults to the native addon (C++ Compositor). Pass a
+  // JsCompositor to run the compositing pass in JS over the wire.
+  compositor?: CompositorSink;
 }
 
 // Wire the protocol layer onto a started server. `addon` is the native module
@@ -97,10 +100,11 @@ export async function installProtocols(
   // Shared compositor state across handlers.
   const state: CompositorState = {
     surfaces: new Map(),
+    compositor: opts.compositor ?? addon,
     nextSerial: 1,
     serial() { return this.nextSerial++; },
   };
-  state.wm = createWm(addon, output);
+  state.wm = createWm(state.compositor, output);
   // State-query channel (tests / introspection): a GPU-free snapshot of
   // geometry / focus / stacking. See src/query.ts.
   state.query = () => queryState(state);
@@ -122,7 +126,7 @@ export async function installProtocols(
     // WM to place + stack + focus. dmabuf commits complete asynchronously so this
     // cannot be done inline in wl_surface.commit -- it is the single shared map
     // signal for both buffer paths. Carries the content size for hit-testing.
-    const imported = addon.takeImportedSurfaces();
+    const imported = state.compositor.takeImportedSurfaces();
     let mappedAny = false;
     let mappedPopup = false;
     for (const { id, width, height } of imported) {
@@ -144,10 +148,10 @@ export async function installProtocols(
     }
     // A newly-mapped toplevel changes window rects, so re-lay-out subsurfaces
     // (a child that committed before its parent mapped gets placed now).
-    if (mappedAny) applySubsurfaces(state, addon);
-    if (mappedAny || mappedPopup) rebuildStackWithPopups({ state, addon });
+    if (mappedAny) applySubsurfaces(state);
+    if (mappedAny || mappedPopup) rebuildStackWithPopups(state);
 
-    const freed = addon.takeFreedBuffers();
+    const freed = state.compositor.takeFreedBuffers();
     if (freed.length > 0) {
       const byId = state.dmabufById;
       const byBuf = state.dmabufBufferIds;
@@ -170,6 +174,11 @@ export async function installProtocols(
         events.wl_callback.send_done(cb, timeMs >>> 0);
       }
     }
+
+    // JS compositor: render the frame now that layout/stack reflect this frame's
+    // commits + any newly-mapped windows. The native path renders on its own
+    // libuv timer, so its renderFrame is undefined (no-op here).
+    state.compositor.renderFrame?.();
   };
 
   const ctx: Ctx = { events, state, addon };

@@ -13,7 +13,7 @@ import { createRequire } from "node:module";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 import { spawn } from "node:child_process";
-import { readdirSync, readFileSync } from "node:fs";
+import { readdirSync, readFileSync, globSync } from "node:fs";
 
 import { installProtocols } from "../dist/protocols/index.js";
 
@@ -34,6 +34,15 @@ export function canRunGpu() {
 }
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+// Load the wire-retargeted dawn.node bundled in the extracted Dawn release.
+// Returns null if not present (so JS-compositor tests can skip).
+export function loadDawn() {
+  try {
+    const [p] = globSync(join(repoRoot, "build", "3rdparty", "dawn", "Dawn-*", "dawn.node"));
+    return p ? require(p) : null;
+  } catch { return null; }
+}
 
 // Poll `query()` until `pred(snapshot)` is truthy, yielding to the libuv loop so
 // the server processes client traffic / frames. Rejects on timeout. Returns the
@@ -81,9 +90,25 @@ export async function setupCompositor(opts = {}) {
     : opts.headless;
   const dims = addon.start(gpuBin, onFrame, onInput, headless || null);
   const sock = addon.startServer();
+
+  // Optional: run the compositing pass in JS over the wire (dawn.node) instead
+  // of the native C++ Compositor. Creates a JsCompositor wrapping the core's wire
+  // device and passes it as the compositor backend.
+  let jsCompositor = null;
+  if (opts.jsCompositor) {
+    const dawn = loadDawn();
+    if (!dawn) throw new Error("jsCompositor requested but dawn.node not found");
+    const h = addon.gpuHandles();
+    const device = dawn.wrapDevice(h.instance, h.device);
+    const { JsCompositor } = await import("../dist/gpu/compositor.js");
+    jsCompositor = new JsCompositor(device, dawn.globals, addon,
+      { width: dims.width, height: dims.height });
+  }
+
   state = await installProtocols(addon, {
     output: { width: dims.width, height: dims.height },
     focus: opts.focus,
+    compositor: jsCompositor ?? undefined,
   });
 
   const clients = [];
@@ -137,7 +162,9 @@ export async function setupCompositor(opts = {}) {
   }
 
   // Async composited-frame readback as a Promise<Uint8Array|null> (BGRA, dims).
+  // With the JS compositor, read its offscreen target; else the native one.
   function frameReadback() {
+    if (jsCompositor) return jsCompositor.readback().then((r) => r.data);
     return new Promise((resolve) => {
       const started = addon.frameReadback((px) => resolve(px));
       if (!started) resolve(null);
@@ -146,7 +173,7 @@ export async function setupCompositor(opts = {}) {
 
   return {
     addon, state, sock, dims, query: () => state.query(),
-    spawnClient, waitFor, frameReadback, teardown,
+    spawnClient, waitFor, frameReadback, teardown, jsCompositor,
   };
 }
 

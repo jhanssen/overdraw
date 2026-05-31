@@ -27,8 +27,29 @@ export interface SurfaceRecord {
   [key: string]: unknown;
 }
 
+// The compositor operations the protocol/WM layer drives, abstracted so either
+// the native C++ Compositor (addon) or the JS compositor (src/gpu/compositor.ts)
+// can back them. Method names mirror the addon's, so the native sink is just the
+// addon itself. `renderFrame` is optional: the native path renders on its own
+// libuv timer, the JS path renders here.
+export interface CompositorSink {
+  commitSurfaceBuffer(id: number, poolId: number, offset: number, w: number,
+                      h: number, stride: number): boolean;
+  commitSurfaceDmabuf(id: number, fd: WaylandFd, w: number, h: number,
+                      fourcc: number, modHi: number, modLo: number,
+                      offset: number, stride: number, bufferId: number): boolean;
+  setSurfaceLayout(id: number, x: number, y: number, w: number, h: number): void;
+  setStack(ids: number[]): void;
+  removeSurface(id: number): void;
+  takeImportedSurfaces(): Array<{ id: number; width: number; height: number }>;
+  takeFreedBuffers(): number[];
+  renderFrame?(): void;
+}
+
 export interface CompositorState {
   surfaces: Map<Resource, SurfaceRecord>;
+  // The compositor backend (native addon or JS compositor). Set by installProtocols.
+  compositor: CompositorSink;
   // surfaceId -> record, for native->JS lookups keyed by the integer id (e.g. the
   // imported-surface map-on-first-content sweep).
   surfacesById?: Map<number, SurfaceRecord>;

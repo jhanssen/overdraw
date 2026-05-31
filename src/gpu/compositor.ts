@@ -44,13 +44,7 @@ struct Rect { r : vec4f, };
 }
 `;
 
-export interface ShmCommit {
-  poolId: number;
-  offset: number;
-  width: number;
-  height: number;
-  stride: number;
-}
+import type { CompositorSink } from "../protocols/ctx.js";
 
 // Minimal slice of the native addon this module needs.
 export interface CompositorAddon {
@@ -73,12 +67,15 @@ interface Surface {
 
 const FORMAT = "bgra8unorm";
 
-export class JsCompositor {
+export class JsCompositor implements CompositorSink {
   private device: any;
   private g: any; // dawn.node globals (GPUTextureUsage, GPUBufferUsage, ...)
   private addon: CompositorAddon;
   private width: number;
   private height: number;
+  // Surfaces that gained presentable content since the last takeImportedSurfaces.
+  private imported: Array<{ id: number; width: number; height: number }> = [];
+  private warnedDmabuf = false;
 
   private sampler: any;
   private pipeline: any;
@@ -125,23 +122,48 @@ export class JsCompositor {
     this.targetView = this.target.createView();
   }
 
+  // --- CompositorSink ---
+
   setStack(ids: number[]): void { this.stack = ids.slice(); }
 
-  setLayout(id: number, x: number, y: number, w: number, h: number): void {
+  setSurfaceLayout(id: number, x: number, y: number, w: number, h: number): void {
     const s = this.surfaces.get(id);
     if (s) { s.x = x; s.y = y; s.layoutW = w; s.layoutH = h; }
     else this.surfaces.set(id, blankSurface(x, y, w, h));
   }
 
-  remove(id: number): void { this.surfaces.delete(id); }
+  removeSurface(id: number): void { this.surfaces.delete(id); }
 
   // Upload a committed shm buffer into the surface's sampled texture (zero-copy
-  // from the client mapping via addon.shmView).
-  uploadShm(id: number, c: ShmCommit): void {
-    const ab = this.addon.shmView(c.poolId, c.offset, c.stride * c.height);
-    if (!ab) return;
-    this.uploadPixels(id, { width: c.width, height: c.height, stride: c.stride }, ab);
+  // from the client mapping via addon.shmView), and report it as presentable.
+  commitSurfaceBuffer(id: number, poolId: number, offset: number,
+                      width: number, height: number, stride: number): boolean {
+    const ab = this.addon.shmView(poolId, offset, stride * height);
+    if (!ab) return false;
+    this.uploadPixels(id, { width, height, stride }, ab);
+    this.imported.push({ id, width, height });
+    return true;
   }
+
+  // dmabuf in the JS compositor is slice 2 (createTextureFromDmabuf + wrapTexture
+  // + the buffer-release lifecycle). Until then, report unhandled.
+  commitSurfaceDmabuf(): boolean {
+    if (!this.warnedDmabuf) {
+      console.warn("[js-compositor] commitSurfaceDmabuf not yet implemented (slice 2)");
+      this.warnedDmabuf = true;
+    }
+    return false;
+  }
+
+  takeImportedSurfaces(): Array<{ id: number; width: number; height: number }> {
+    const out = this.imported;
+    this.imported = [];
+    return out;
+  }
+
+  // shm has no zero-copy buffer-release lifecycle (pixels are copied at upload),
+  // so nothing to release. dmabuf release lands in slice 2.
+  takeFreedBuffers(): number[] { return []; }
 
   // Upload raw BGRA8 pixels (tightly `stride`-rowed) into the surface's sampled
   // texture, creating/recreating it on size change. Used by uploadShm and by

@@ -9,7 +9,8 @@
 // replaces that policy and may compute the whole arrangement, pushing it through
 // the same setSurfaceLayout/setStack calls used here.
 
-import type { Addon, Resource } from "../types.js";
+import type { Resource } from "../types.js";
+import type { CompositorSink } from "../protocols/ctx.js";
 import { placeWindow } from "./placement.js";
 
 export interface Rect { x: number; y: number; width: number; height: number; }
@@ -30,13 +31,13 @@ export interface Wm {
   windowAt(x: number, y: number): Window | null;
 }
 
-export function createWm(addon: Addon, output: Output): Wm {
+export function createWm(compositor: CompositorSink, output: Output): Wm {
   // windows: stack order, back-to-front.
   const windows: Window[] = [];
   const wm: WmState = { output, windows };
 
   function pushStack(): void {
-    addon.setStack(windows.map((w) => w.surfaceId));
+    compositor.setStack(windows.map((w) => w.surfaceId));
   }
 
   return {
@@ -58,7 +59,7 @@ export function createWm(addon: Addon, output: Output): Wm {
         surfaceRec,
       };
       windows.push(win); // top of stack
-      addon.setSurfaceLayout(surfaceId, rect.x, rect.y, rect.width, rect.height);
+      compositor.setSurfaceLayout(surfaceId, rect.x, rect.y, rect.width, rect.height);
       pushStack();
       return win.rect;
     },

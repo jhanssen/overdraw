@@ -164,7 +164,7 @@ function updateDragIcon(d: DragSession, x: number, y: number): void {
   const rec = d.ctx.state.surfaces.get(d.icon);
   if (!rec) return;
   // Position the icon at the pointer; it draws on top via the stack rebuild.
-  d.ctx.addon.setSurfaceLayout(rec.id, Math.round(x), Math.round(y), 0, 0);
+  d.ctx.state.compositor.setSurfaceLayout(rec.id, Math.round(x), Math.round(y), 0, 0);
   pushDragIconStack(d, rec.id);
 }
 function pushDragIconStack(d: DragSession, iconId: number): void {
@@ -175,12 +175,12 @@ function pushDragIconStack(d: DragSession, iconId: number): void {
   const base: number[] = [];
   for (const win of wm.state.windows) base.push(win.surfaceId);
   base.push(iconId);
-  d.ctx.addon.setStack(base);
+  d.ctx.state.compositor.setStack(base);
 }
 function hideDragIcon(d: DragSession): void {
   if (!d.icon) return;
   const rec = d.ctx.state.surfaces.get(d.icon);
-  if (rec) d.ctx.addon.removeSurface(rec.id);
+  if (rec) d.ctx.state.compositor.removeSurface(rec.id);
 }
 
 // Send the current selection to one client's data_device(s). Mints a

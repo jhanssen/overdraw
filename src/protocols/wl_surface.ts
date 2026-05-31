@@ -58,12 +58,12 @@ function uploadBuffer(ctx: Ctx, s: SurfaceRecord, buffer: Resource | null): void
   const desc = ctx.state.buffers?.get(buffer);
   if (desc && desc.dmabuf && desc.fd) {
     const bufferId = bufferIdOf(ctx, buffer);
-    const ok = ctx.addon.commitSurfaceDmabuf(
+    const ok = ctx.state.compositor.commitSurfaceDmabuf(
       s.id, desc.fd, desc.width, desc.height, desc.format,
       desc.modifierHi ?? 0, desc.modifierLo ?? 0, desc.offset, desc.stride, bufferId);
     if (ok) { ctx.state.lastCommittedSurfaceId = s.id; s.hasContent = true; }
   } else if (desc && desc.poolId) {
-    const ok = ctx.addon.commitSurfaceBuffer(
+    const ok = ctx.state.compositor.commitSurfaceBuffer(
       s.id, desc.poolId, desc.offset, desc.width, desc.height, desc.stride);
     if (ok) {
       ctx.state.lastCommittedSurfaceId = s.id;
@@ -108,7 +108,7 @@ function applySurfaceState(ctx: Ctx, s: SurfaceRecord): void {
     }
   }
 
-  if (s.hasContent) applySubsurfaces(ctx.state, ctx.addon);
+  if (s.hasContent) applySubsurfaces(ctx.state);
 }
 
 export default function makeSurface(ctx: Ctx): WlSurfaceHandler {
@@ -170,7 +170,7 @@ export default function makeSurface(ctx: Ctx): WlSurfaceHandler {
       const s = rec(resource);
       if (s) {
         ctx.state.wm?.unmapWindow(s.id);
-        ctx.addon.removeSurface(s.id);
+        ctx.state.compositor.removeSurface(s.id);
         ctx.state.surfacesById?.delete(s.id);
       }
       ctx.state.surfaces.delete(resource);

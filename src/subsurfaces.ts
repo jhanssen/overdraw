@@ -11,7 +11,7 @@
 // native. Called whenever something that affects subsurface layout/stack changes
 // (a subsurface gains content, set_position, parent moves, destroy).
 
-import type { Addon, Resource } from "./types.js";
+import type { Resource } from "./types.js";
 import type { CompositorState, SubsurfaceRecord, SurfaceRecord } from "./protocols/ctx.js";
 import { rebuildStackWithPopups } from "./protocols/xdg_popup.js";
 
@@ -30,21 +30,22 @@ function childrenOf(state: CompositorState, parent: Resource): SubsurfaceRecord[
 // (the child's parent's output-space top-left). Children themselves may have
 // children. Returns nothing; mutates `stack` and pushes layouts to native.
 export function emitSubtree(
-  state: CompositorState, addon: Addon, parentRes: Resource,
+  state: CompositorState, parentRes: Resource,
   parentX: number, parentY: number, stack: number[],
 ): void {
   for (const sub of childrenOf(state, parentRes)) {
     const childRec = state.surfaces.get(sub.surface) as SurfaceRecord | undefined;
     if (!childRec || childRec.resource.destroyed) continue;
-    // Only draw a subsurface once it has committed content (a texture). Native
-    // tolerates an id with no texture (skipped at draw), but keep the stack tight.
+    // Only draw a subsurface once it has committed content (a texture). The
+    // compositor tolerates an id with no texture (skipped at draw), but keep the
+    // stack tight.
     if (!childRec.hasContent) continue;
     const cx = parentX + sub.x;
     const cy = parentY + sub.y;
-    // w/h 0 => native uses the surface's content size.
-    addon.setSurfaceLayout(childRec.id, cx, cy, 0, 0);
+    // w/h 0 => the compositor uses the surface's content size.
+    state.compositor.setSurfaceLayout(childRec.id, cx, cy, 0, 0);
     stack.push(childRec.id);
-    emitSubtree(state, addon, sub.surface, cx, cy, stack);  // nested subsurfaces
+    emitSubtree(state, sub.surface, cx, cy, stack);  // nested subsurfaces
   }
 }
 
@@ -52,13 +53,13 @@ export function emitSubtree(
 // subtrees, back-to-front) and set each subsurface's layout rect. Does NOT call
 // setStack -- the caller appends popups (if any) and sets the final stack, so
 // there is a single owner of the stack order. Returns the base stack ids.
-export function computeBaseStack(state: CompositorState, addon: Addon): number[] {
+export function computeBaseStack(state: CompositorState): number[] {
   const wm = state.wm;
   if (!wm) return [];
   const stack: number[] = [];
   for (const win of wm.state.windows) {
     stack.push(win.surfaceId);
-    emitSubtree(state, addon, win.surfaceRec.resource, win.rect.x, win.rect.y, stack);
+    emitSubtree(state, win.surfaceRec.resource, win.rect.x, win.rect.y, stack);
   }
   return stack;
 }
@@ -66,6 +67,6 @@ export function computeBaseStack(state: CompositorState, addon: Addon): number[]
 // Recompute subsurface layouts + the full draw stack and push to native. Delegates
 // to the popup module's rebuildStackWithPopups, which is the SINGLE owner of
 // setStack (base = windows+subsurfaces via computeBaseStack, then popups on top).
-export function applySubsurfaces(state: CompositorState, addon: Addon): void {
-  rebuildStackWithPopups({ state, addon });
+export function applySubsurfaces(state: CompositorState): void {
+  rebuildStackWithPopups(state);
 }

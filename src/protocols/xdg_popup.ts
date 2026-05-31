@@ -6,22 +6,22 @@
 // subsurfaces). A grab dismisses the popup (popup_done) on click-outside / Escape.
 
 import type { XdgPopupHandler } from "#protocols-gen/xdg_popup.js";
-import type { Ctx, XdgSurfaceRecord, PopupRecord } from "./ctx.js";
+import type { Ctx, XdgSurfaceRecord, PopupRecord, CompositorState } from "./ctx.js";
 import type { Resource } from "../types.js";
 import { solvePopupPosition } from "../popup-position.js";
 import { computeBaseStack, emitSubtree } from "../subsurfaces.js";
 
 // Output-space top-left of a parent xdg_surface: a toplevel uses its WM window
 // rect; a popup parent uses its own resolved output position (recursively).
-export function parentOutputOrigin(ctx: Pick<Ctx, "state">, parent: XdgSurfaceRecord): { x: number; y: number } | null {
+export function parentOutputOrigin(state: CompositorState, parent: XdgSurfaceRecord): { x: number; y: number } | null {
   if (parent.role === "toplevel" && parent.surface) {
-    const win = ctx.state.wm?.state.windows.find((w) => w.surfaceId === parent.surface!.id);
+    const win = state.wm?.state.windows.find((w) => w.surfaceId === parent.surface!.id);
     return win ? { x: win.rect.x, y: win.rect.y } : null;
   }
   if (parent.role === "popup" && parent.popup) {
-    const pr = ctx.state.popups?.get(parent.popup);
+    const pr = state.popups?.get(parent.popup);
     if (!pr) return null;
-    const grand = parentOutputOrigin(ctx, pr.parent);
+    const grand = parentOutputOrigin(state, pr.parent);
     if (!grand) return null;
     return { x: grand.x + pr.rect.x, y: grand.y + pr.rect.y };
   }
@@ -31,7 +31,7 @@ export function parentOutputOrigin(ctx: Pick<Ctx, "state">, parent: XdgSurfaceRe
 // Compute + store the popup rect and send the configure handshake. Shared by
 // get_popup and reposition.
 export function configurePopup(ctx: Ctx, pr: PopupRecord): void {
-  const origin = parentOutputOrigin(ctx, pr.parent) ?? { x: 0, y: 0 };
+  const origin = parentOutputOrigin(ctx.state, pr.parent) ?? { x: 0, y: 0 };
   const out = ctx.state.wm?.state.output ?? { width: 1920, height: 1080 };
   pr.rect = solvePopupPosition(pr.positioner, origin.x, origin.y, out.width, out.height);
   ctx.events.xdg_popup.send_configure(pr.resource, pr.rect.x, pr.rect.y, pr.rect.width, pr.rect.height);
@@ -61,10 +61,10 @@ export default function makeXdgPopup(ctx: Ctx): XdgPopupHandler {
     destroy(resource) {
       const pr = rec(resource);
       if (pr) {
-        if (pr.mapped) ctx.addon.removeSurface(pr.xdgSurface.surface!.id);
+        if (pr.mapped) ctx.state.compositor.removeSurface(pr.xdgSurface.surface!.id);
         if (ctx.state.grabbedPopup === resource) ctx.state.grabbedPopup = undefined;
         ctx.state.popups?.delete(resource);
-        rebuildStackWithPopups(ctx);
+        rebuildStackWithPopups(ctx.state);
       }
     },
   };
@@ -72,7 +72,7 @@ export default function makeXdgPopup(ctx: Ctx): XdgPopupHandler {
 
 // Is the output-space point inside the popup's on-screen rect?
 function pointInPopup(ctx: Pick<Ctx, "state">, pr: PopupRecord, x: number, y: number): boolean {
-  const origin = parentOutputOrigin(ctx, pr.parent);
+  const origin = parentOutputOrigin(ctx.state, pr.parent);
   if (!origin) return false;
   const px = origin.x + pr.rect.x, py = origin.y + pr.rect.y;
   return x >= px && x < px + pr.rect.width && y >= py && y < py + pr.rect.height;
@@ -101,23 +101,23 @@ export function maybeDismissGrabbedPopup(ctx: Ctx, x: number, y: number): boolea
 // subsurfaces, then mapped popups on top (a popup draws above its parent; nested
 // popups above their parent popup). Popups are placed at their parent's output
 // origin + the popup's parent-relative rect.
-export function rebuildStackWithPopups(ctx: Pick<Ctx, "state" | "addon">): void {
-  const wm = ctx.state.wm;
+export function rebuildStackWithPopups(state: CompositorState): void {
+  const wm = state.wm;
   if (!wm) return;
   // Base = WM windows interleaved with their subsurface subtrees (also sets each
   // subsurface's layout). Popups go on top of that.
-  const stack: number[] = computeBaseStack(ctx.state, ctx.addon);
+  const stack: number[] = computeBaseStack(state);
   // Mapped popups, ordered parent-before-child (creation order approximates this).
-  for (const pr of ctx.state.popups?.values() ?? []) {
+  for (const pr of state.popups?.values() ?? []) {
     if (!pr.mapped || !pr.xdgSurface.surface) continue;
-    const origin = parentOutputOrigin(ctx, pr.parent);
+    const origin = parentOutputOrigin(state, pr.parent);
     if (!origin) continue;
     const px = origin.x + pr.rect.x, py = origin.y + pr.rect.y;
-    ctx.addon.setSurfaceLayout(pr.xdgSurface.surface.id, px, py, 0, 0);
+    state.compositor.setSurfaceLayout(pr.xdgSurface.surface.id, px, py, 0, 0);
     stack.push(pr.xdgSurface.surface.id);
     // A popup is a wl_surface and may itself parent subsurfaces; place its
     // subsurface subtree above it (same walk as for window roots).
-    emitSubtree(ctx.state, ctx.addon, pr.xdgSurface.surface.resource, px, py, stack);
+    emitSubtree(state, pr.xdgSurface.surface.resource, px, py, stack);
   }
-  ctx.addon.setStack(stack);
+  state.compositor.setStack(stack);
 }
