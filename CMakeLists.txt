@@ -163,6 +163,15 @@ target_include_directories(dnd-test-client PRIVATE
     ${CMAKE_SOURCE_DIR}/native/wayland/generated)
 target_link_libraries(dnd-test-client PRIVATE ${WAYLAND_CLIENT_LIBRARIES})
 
+# ---- popup test client (xdg_popup / xdg_positioner) ----
+add_executable(popup-test-client
+    test/popup-test-client.c
+    native/wayland/generated/xdg-shell-protocol.c)
+target_include_directories(popup-test-client PRIVATE
+    ${WAYLAND_CLIENT_INCLUDE_DIRS}
+    ${CMAKE_SOURCE_DIR}/native/wayland/generated)
+target_link_libraries(popup-test-client PRIVATE ${WAYLAND_CLIENT_LIBRARIES})
+
 # ---- SCM_RIGHTS transport unit test (fd passing over the side channel) ----
 add_executable(scm-rights-test test/scm-rights-test.cpp)
 target_include_directories(scm-rights-test PRIVATE ${IPC_INCLUDE})

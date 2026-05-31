@@ -13,6 +13,7 @@
 
 import type { Addon, Resource } from "./types.js";
 import type { CompositorState, SubsurfaceRecord, SurfaceRecord } from "./protocols/ctx.js";
+import { rebuildStackWithPopups } from "./protocols/xdg_popup.js";
 
 // Children of a given parent wl_surface, in creation order (interpreted as
 // bottom-to-top among siblings; place_above/below refinement is future work).
@@ -47,15 +48,24 @@ function emitSubtree(
   }
 }
 
-// Recompute subsurface layouts + the full draw stack (toplevels interleaved with
-// their subsurface subtrees) and push to native. Safe to call frequently.
-export function applySubsurfaces(state: CompositorState, addon: Addon): void {
+// Compute the BASE draw stack (toplevels interleaved with their subsurface
+// subtrees, back-to-front) and set each subsurface's layout rect. Does NOT call
+// setStack -- the caller appends popups (if any) and sets the final stack, so
+// there is a single owner of the stack order. Returns the base stack ids.
+export function computeBaseStack(state: CompositorState, addon: Addon): number[] {
   const wm = state.wm;
-  if (!wm) return;
+  if (!wm) return [];
   const stack: number[] = [];
   for (const win of wm.state.windows) {
     stack.push(win.surfaceId);
     emitSubtree(state, addon, win.surfaceRec.resource, win.rect.x, win.rect.y, stack);
   }
-  addon.setStack(stack);
+  return stack;
+}
+
+// Recompute subsurface layouts + the full draw stack and push to native. Delegates
+// to the popup module's rebuildStackWithPopups, which is the SINGLE owner of
+// setStack (base = windows+subsurfaces via computeBaseStack, then popups on top).
+export function applySubsurfaces(state: CompositorState, addon: Addon): void {
+  rebuildStackWithPopups({ state, addon });
 }

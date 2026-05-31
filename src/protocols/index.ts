@@ -17,6 +17,7 @@ import { dirname, join } from "node:path";
 import { createWm } from "../wm/index.js";
 import { queryState } from "../query.js";
 import { applySubsurfaces } from "../subsurfaces.js";
+import { rebuildStackWithPopups, maybeDismissGrabbedPopup } from "./xdg_popup.js";
 import type { Addon, EventsByInterface, EventSenders } from "../types.js";
 import type { Ctx, CompositorState, FocusOptions } from "./ctx.js";
 
@@ -45,7 +46,7 @@ const GLOBALS = [
 // Interfaces created via requests (new_id), registered without a global so
 // their child resources dispatch to a handler.
 const CHILD_INTERFACES = [
-  "wl_surface", "wl_region", "xdg_surface", "xdg_toplevel",
+  "wl_surface", "wl_region", "xdg_surface", "xdg_toplevel", "xdg_positioner", "xdg_popup",
   "wl_shm_pool", "wl_buffer", "zwp_linux_buffer_params_v1",
   "wl_pointer", "wl_keyboard", "zwp_linux_dmabuf_feedback_v1",
   "wl_subsurface", "wl_data_device", "wl_data_source", "wl_data_offer", "wl_callback",
@@ -123,17 +124,28 @@ export async function installProtocols(
     // signal for both buffer paths. Carries the content size for hit-testing.
     const imported = addon.takeImportedSurfaces();
     let mappedAny = false;
+    let mappedPopup = false;
     for (const { id, width, height } of imported) {
       const s = state.surfacesById?.get(id);
-      if (!s || s.mapped || s.role !== "xdg_toplevel") continue;
-      s.mapped = true;
-      mappedAny = true;
-      const rect = state.wm?.mapWindow(id, s, width, height);
-      if (rect) state.seat?.focusWindow(id, s, rect);
+      if (!s || s.mapped) continue;
+      if (s.role === "xdg_toplevel") {
+        s.mapped = true;
+        mappedAny = true;
+        const rect = state.wm?.mapWindow(id, s, width, height);
+        if (rect) state.seat?.focusWindow(id, s, rect);
+      } else if (s.role === "xdg_popup") {
+        // A popup maps on first content; it is compositor-positioned above its
+        // parent (rect already computed at get_popup). Mark its PopupRecord mapped
+        // and rebuild the stack to include it.
+        s.mapped = true;
+        const pr = s.xdgSurface?.popup ? state.popups?.get(s.xdgSurface.popup) : undefined;
+        if (pr) { pr.mapped = true; mappedPopup = true; }
+      }
     }
     // A newly-mapped toplevel changes window rects, so re-lay-out subsurfaces
     // (a child that committed before its parent mapped gets placed now).
     if (mappedAny) applySubsurfaces(state, addon);
+    if (mappedAny || mappedPopup) rebuildStackWithPopups({ state, addon });
 
     const freed = addon.takeFreedBuffers();
     if (freed.length > 0) {
@@ -161,6 +173,8 @@ export async function installProtocols(
   };
 
   const ctx: Ctx = { events, state, addon };
+  // Popup click-away dismissal: the seat calls this on a button press.
+  state.dismissGrabbedPopup = (x, y) => maybeDismissGrabbedPopup(ctx, x, y);
 
   // Import handler modules. A handler module default-exports a factory.
   const handlerMods: Record<string, HandlerModule> = {
@@ -170,6 +184,8 @@ export async function installProtocols(
     xdg_wm_base: await import("./xdg_wm_base.js"),
     xdg_surface: await import("./xdg_surface.js"),
     xdg_toplevel: await import("./xdg_toplevel.js"),
+    xdg_positioner: await import("./xdg_positioner.js"),
+    xdg_popup: await import("./xdg_popup.js"),
     wl_shm: await import("./wl_shm.js"),
     wl_shm_pool: await import("./wl_shm_pool.js"),
     wl_buffer: await import("./wl_buffer.js"),

@@ -6,8 +6,9 @@
 
 import { signature as toplevelSig } from "#protocols-gen/xdg_toplevel.js";
 import type { XdgSurfaceHandler } from "#protocols-gen/xdg_surface.js";
-import type { Ctx } from "./ctx.js";
+import type { Ctx, PopupRecord } from "./ctx.js";
 import type { Resource } from "../types.js";
+import { configurePopup } from "./xdg_popup.js";
 
 const STATE = toplevelSig.enums.state.entries; // { maximized:1, activated:4, ... }
 
@@ -43,8 +44,23 @@ export default function makeXdgSurface(ctx: Ctx): XdgSurfaceHandler {
       xs.lastConfigureSerial = serial;
       ctx.events.xdg_surface.send_configure(resource, serial);
     },
-    get_popup(_resource, _popup, _parent, _positioner) {
-      // Popups not implemented for first light.
+    get_popup(resource, popup, parent, positioner) {
+      const xs = rec(resource);
+      const parentXs = parent ? ctx.state.xdgSurfaces?.get(parent) : undefined;
+      const p = ctx.state.positioners?.get(positioner);
+      if (!xs || !parentXs || !p) return;
+      xs.role = "popup";
+      xs.popup = popup;
+      if (xs.surface) xs.surface.role = "xdg_popup";
+      const pr: PopupRecord = {
+        resource: popup, xdgSurface: xs, parent: parentXs,
+        rect: { x: 0, y: 0, width: p.width, height: p.height },
+        positioner: { ...p }, mapped: false,
+      };
+      ctx.state.popups ??= new Map();
+      ctx.state.popups.set(popup, pr);
+      // Compute position + send the configure handshake (popup then xdg_surface).
+      configurePopup(ctx, pr);
     },
     set_window_geometry(resource, x, y, w, h) {
       const xs = rec(resource);

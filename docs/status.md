@@ -4,25 +4,13 @@ Tracks what is built and empirically proven versus what is still design only.
 The design itself lives in `architecture.md`; this file is the ground truth for
 "what exists right now."
 
-Last updated: 2026-05-30 (rev 14).
+Last updated: 2026-05-30 (rev 15).
 
 ## Protocol gaps & skeletons (READ FIRST)
 
 What is advertised/wired but incomplete. These are the silent-gap risks — a
 client may use them and get nothing, with no error. Listed worst-first. (Fully
 working protocols are in "Built and proven"; this is the honest incomplete list.)
-
-- **`xdg_popup` / `xdg_positioner` — NOT implemented.** `xdg_surface.get_popup`
-  and `xdg_wm_base.create_positioner` are no-ops. Consequence: ALL popup UI —
-  menus, dropdowns, comboboxes, tooltips, context menus — does not appear. Blocks
-  basically every non-terminal GUI app. A popup is a real surface (wl_surface +
-  xdg_popup role) positioned by the compositor via the positioner (anchor rect +
-  anchor + gravity + constraint-adjustment = flip/slide/resize to fit the output)
-  and input-grabbing (dismiss on click-outside/Escape). Placement reuses the
-  subsurface child-of-parent machinery (`applySubsurfaces`-style); the new work is
-  positioner constraint-solving + grab/dismiss. Constraint-solving needs output
-  bounds — our fabricated `wl_output` size is fine for this (popups stay within
-  the actual drawing area). **This is the recommended next protocol.**
 
 - **`xdg_toplevel` window-management requests — SILENT no-ops.** `move`, `resize`,
   `set_maximized`/`unset`, `set_fullscreen`/`unset`, `set_minimized`,
@@ -871,6 +859,32 @@ Full DnD vertical between two real clients.
   (`updateDragIcon`: position the icon at the pointer, draw on top) is implemented
   but the DnD test passes a NULL icon, so it is not yet pixel-verified. Needs an
   icon + `frameReadback` assertion to close.
+
+### Popups (`xdg_popup` / `xdg_positioner`, verified)
+Menus/dropdowns/tooltips: a compositor-positioned, input-grabbing child surface.
+- `xdg_positioner` accumulates size/anchor_rect/anchor/gravity/constraint/offset
+  (`src/protocols/xdg_positioner.ts`). The constraint solver
+  (`src/popup-position.ts`, pure + unit-tested in `test/popup-position.test.js`):
+  anchor point on the anchor rect → gravity placement → offset → constrain to the
+  output via flip (preferred) / slide / resize, per axis.
+- `xdg_surface.get_popup` computes the rect, sends `xdg_popup.configure` +
+  `xdg_surface.configure`; on first content the popup maps as a compositor-placed
+  child drawn ABOVE its parent. The draw stack has a SINGLE owner
+  (`rebuildStackWithPopups` = `computeBaseStack` [windows + subsurface subtrees] +
+  popups on top); `applySubsurfaces` delegates to it (so subsurfaces + popups
+  coexist — a regression where the popup rebuild dropped subsurfaces was caught by
+  the subsurface tests and fixed). Nested popups + reposition supported.
+- Grab + click-away dismiss: `xdg_popup.grab` records the grabbing popup; a pointer
+  button press OUTSIDE the popup tree sends `popup_done` and is swallowed (seat
+  `dismissGrabbedPopup` hook).
+- Verified (`test/popup.gpu.mjs`): a popup with anchor_rect + bottom_left anchor +
+  bottom_right gravity composites at the computed parent-relative position, and the
+  client receives that position in `xdg_popup.configure`. **PASS.**
+- **FLAGGED (untested sub-paths):** the grab/click-away DISMISS path
+  (`maybeDismissGrabbedPopup`) and `reposition` are implemented but not covered by
+  a test (the e2e test covers positioning + map only). Constraint flip/slide/resize
+  is unit-tested in the solver but not exercised end-to-end. `set_reactive`
+  (reposition-on-parent-move) is a no-op.
 
 ## Not yet built (design only)
 

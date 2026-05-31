@@ -3,8 +3,8 @@
 Project-specific operational notes. Design lives in `docs/architecture.md`;
 ground-truth status in `docs/status.md`. Before working on any protocol, read the
 "Protocol gaps & skeletons (READ FIRST)" section at the top of `docs/status.md` —
-it lists what is advertised-but-incomplete (silent-gap risks: `xdg_popup`,
-`xdg_toplevel` WM-state no-ops, fabricated `wl_output`, `wl_region`).
+it lists what is advertised-but-incomplete (silent-gap risks: `xdg_toplevel`
+WM-state no-ops, fabricated `wl_output`, `wl_region`).
 
 ## Debugging discipline (read first)
 

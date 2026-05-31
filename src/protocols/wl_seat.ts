@@ -43,6 +43,10 @@ export default function makeSeat(ctx: Ctx, focus: FocusOptions = DEFAULT_FOCUS):
     if (!s) { s = new Set(); keyboardsByClient.set(clientId, s); }
     return s;
   }
+  // Last pointer position (output space), tracked on motion; used for popup
+  // click-away dismissal at button-press time (button events carry no position).
+  let lastX = 0, lastY = 0;
+
   // wl_keyboard.enter carries a wl_array of currently-pressed keys; we send empty.
   const EMPTY_KEYS = new Uint8Array(0);
 
@@ -137,6 +141,7 @@ export default function makeSeat(ctx: Ctx, focus: FocusOptions = DEFAULT_FOCUS):
       case "pointerEnter": {
         const x = ev.x ?? 0;
         const y = ev.y ?? 0;
+        lastX = x; lastY = y;
         const hit = pick(x, y);
         // POINTER focus follows the pointer (always). Send pointer leave/enter on
         // surface change, motion otherwise.
@@ -172,6 +177,9 @@ export default function makeSeat(ctx: Ctx, focus: FocusOptions = DEFAULT_FOCUS):
         break;
       }
       case "pointerButton": {
+        // A button press outside a grabbing popup dismisses it (and is swallowed,
+        // not delivered to the client under the pointer) -- standard menu behavior.
+        if (ev.pressed && ctx.state.dismissGrabbedPopup?.(lastX, lastY)) return;
         if (!seat.focus) return;
         const serial = ctx.state.serial();
         const state = ev.pressed ? 1 : 0;

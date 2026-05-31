@@ -48,6 +48,17 @@ export interface CompositorState {
   buffers?: Map<Resource, BufferDesc>;
   xdgSurfaces?: Map<Resource, XdgSurfaceRecord>;
   toplevels?: Map<Resource, ToplevelRecord>;
+  // xdg_positioner state (consumed at get_popup). Keyed by the positioner resource.
+  positioners?: Map<Resource, import("../popup-position.js").Positioner>;
+  // xdg_popup records. Keyed by the xdg_popup resource.
+  popups?: Map<Resource, PopupRecord>;
+  // The xdg_popup that currently holds an input grab (dismiss on click-outside).
+  grabbedPopup?: Resource;
+  // On a pointer button press, the seat calls this with the output-space point;
+  // if a grabbing popup exists and the press is outside it, the popup is dismissed
+  // (popup_done) and this returns true so the seat swallows the click. Set by
+  // installProtocols.
+  dismissGrabbedPopup?: (x: number, y: number) => boolean;
   dmabufParams?: Map<Resource, DmabufParams>;
   subsurfaces?: Map<Resource, SubsurfaceRecord>;
   // dmabuf release lifecycle: stable bufferId <-> wl_buffer maps. Native reports
@@ -107,7 +118,19 @@ export interface XdgSurfaceRecord {
   lastConfigureSerial: number;
   lastCommitSerial: number;
   toplevel?: Resource;
+  popup?: Resource;
   geometry?: { x: number; y: number; width: number; height: number };
+}
+
+// An xdg_popup: a compositor-positioned child of a parent xdg_surface. The
+// computed rect is parent-relative (in the parent's window-geometry space).
+export interface PopupRecord {
+  resource: Resource;            // xdg_popup
+  xdgSurface: XdgSurfaceRecord;  // the popup's xdg_surface
+  parent: XdgSurfaceRecord;      // parent xdg_surface (toplevel or another popup)
+  rect: { x: number; y: number; width: number; height: number }; // parent-relative
+  positioner: import("../popup-position.js").Positioner;
+  mapped: boolean;
 }
 
 export interface ToplevelRecord {
