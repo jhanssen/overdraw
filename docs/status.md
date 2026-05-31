@@ -713,10 +713,8 @@ follows the same model.
   - Implemented but NOT behaviorally tested: `wl_region` (no-op stub);
     `zwp_linux_dmabuf_feedback_v1` (feedback path; exercised by real WSI clients
     manually, no automated assertion).
-  - **Tested-as-incomplete (explicit, not silent):** drag-and-drop on the
-    data-device interfaces (`start_drag`/`accept`/`finish`/`set_actions`) — loud
-    warn-once no-ops, pinned by `test/data-device-dnd.test.js`. DnD is the next
-    slice on this protocol; clipboard is done.
+  - `wl_data_device` drag-and-drop (full vertical, `test/dnd.gpu.mjs`); action
+    negotiation unit-tested (`test/data-device-dnd.test.js`).
   - Structural: `gen-protocol.test.js` spot-checks specific interfaces, and
     `gen-protocol-all.test.js` validates ALL generated signatures (sequential
     unique opcodes, known arg types, interface references resolve, one makeEvents
@@ -794,9 +792,28 @@ Copy/paste and middle-click paste work end-to-end between two real clients.
 - Verified (`test/clipboard.gpu.mjs`, two real clients; GPU-gated ONLY because the
   receiver maps a window to take keyboard focus): a known payload round-trips for
   both clipboard and primary selection, byte-exact. **PASS.**
-- **NOT implemented (tested-as-incomplete, not silent):** drag-and-drop on these
-  interfaces — `start_drag`/`accept`/`finish`/`set_actions` are warn-once no-ops
-  pinned by `test/data-device-dnd.test.js`. Next slice on this protocol.
+### Drag-and-drop (`wl_data_device`, verified)
+Full DnD vertical between two real clients.
+- `start_drag` takes a SEAT POINTER GRAB (`seat.beginDrag`): while active,
+  `handleInput` routes pointer motion/button to the DnD machinery instead of
+  `wl_pointer` (matches real compositors; the dragged-over client gets DnD events,
+  not pointer events). Modeled on Hyprland's `initiateDrag`/`updateDrag`/`dropDrag`.
+- On motion, the surface under the pointer gets `data_device.enter` (with a
+  freshly-minted `data_offer` + `offer(mime)` + `source_actions`), then `motion`;
+  crossing surfaces sends `leave` + a new enter. Action negotiation
+  (`negotiateDndAction`: intersect source+receiver masks, honor preferred else
+  copy>move>ask) drives `data_offer.action` + `data_source.action`.
+- Button release over an accepting target → `drop` + `dnd_drop_performed`; the
+  target `receive`s (same fd-pipe transfer as clipboard), reads, `finish`es →
+  `dnd_finished`. Release over nothing/rejected → `cancelled` + abort.
+- Verified (`test/dnd.gpu.mjs`): source presses over its window → start_drag;
+  harness drags the pointer onto the target and releases; the target receives the
+  byte-exact payload via the copy action. **PASS.** Negotiation unit-tested
+  (`test/data-device-dnd.test.js`).
+- **FLAGGED (one untested sub-path):** the drag-ICON surface compositing
+  (`updateDragIcon`: position the icon at the pointer, draw on top) is implemented
+  but the DnD test passes a NULL icon, so it is not yet pixel-verified. Needs an
+  icon + `frameReadback` assertion to close.
 
 ## Not yet built (design only)
 

@@ -115,6 +115,23 @@ export default function makeSeat(ctx: Ctx, focus: FocusOptions = DEFAULT_FOCUS):
   function handleInput(ev: InputEvent): void {
     const seat = ctx.state.seat;
     if (!seat) return;
+
+    // During a drag-and-drop grab, the pointer is owned by the DnD machinery:
+    // motion drives data_device enter/leave/motion to the surface under the
+    // pointer (NOT wl_pointer), and a button release drops. Normal wl_pointer
+    // routing is suppressed for the drag's duration (matches real compositors;
+    // GTK in particular relies on the pointer being unfocused during a drag).
+    if (seat.drag) {
+      if (ev.type === "pointerMotion" || ev.type === "pointerEnter") {
+        const x = ev.x ?? 0, y = ev.y ?? 0;
+        seat.drag.onMotion(x, y, pick(x, y));
+      } else if (ev.type === "pointerButton" && !ev.pressed) {
+        seat.drag.onButton(false);
+      }
+      // Other pointer events are swallowed during the drag.
+      return;
+    }
+
     switch (ev.type) {
       case "pointerMotion":
       case "pointerEnter": {
@@ -220,7 +237,20 @@ export default function makeSeat(ctx: Ctx, focus: FocusOptions = DEFAULT_FOCUS):
   ctx.state.seat = {
     pointersByClient, keyboardsByClient,
     focus: null, kbFocus: null, handleInput, focusWindow,
+    pick,
+    drag: null,
+    // Begin a DnD pointer grab. While set, handleInput routes pointer motion/
+    // button to these callbacks instead of wl_pointer (see handleInput). The
+    // data-device module supplies onMotion/onButton and clears drag on drop/abort.
+    beginDrag(d) {
+      // Releasing the normal pointer focus so the dragged-over client doesn't
+      // also get wl_pointer events (Wayland convention; some toolkits require it).
+      if (seat0?.focus) { sendLeave(seat0.focus); seat0.focus = null; }
+      if (seat0) seat0.drag = d;
+    },
+    endDrag() { if (seat0) seat0.drag = null; },
   };
+  const seat0 = ctx.state.seat;
 
   return {
     // Global bind: advertise pointer + keyboard capabilities.

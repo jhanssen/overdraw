@@ -154,6 +154,15 @@ target_include_directories(clipboard-test-client PRIVATE
     ${CMAKE_SOURCE_DIR}/native/wayland/generated)
 target_link_libraries(clipboard-test-client PRIVATE ${WAYLAND_CLIENT_LIBRARIES})
 
+# ---- DnD test client (drag-and-drop) ----
+add_executable(dnd-test-client
+    test/dnd-test-client.c
+    native/wayland/generated/xdg-shell-protocol.c)
+target_include_directories(dnd-test-client PRIVATE
+    ${WAYLAND_CLIENT_INCLUDE_DIRS}
+    ${CMAKE_SOURCE_DIR}/native/wayland/generated)
+target_link_libraries(dnd-test-client PRIVATE ${WAYLAND_CLIENT_LIBRARIES})
+
 # ---- SCM_RIGHTS transport unit test (fd passing over the side channel) ----
 add_executable(scm-rights-test test/scm-rights-test.cpp)
 target_include_directories(scm-rights-test PRIVATE ${IPC_INCLUDE})

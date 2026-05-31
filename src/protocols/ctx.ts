@@ -59,7 +59,7 @@ export interface CompositorState {
   // offered mime types. `dataDevices` maps a clientId to that client's
   // wl_data_device resources. `selection` is the current clipboard source (or
   // null). See src/protocols/wl_data_device_manager.ts.
-  dataSources?: Map<Resource, { mimes: string[] }>;
+  dataSources?: Map<Resource, { mimes: string[]; dndActions?: number }>;
   dataDevices?: Map<number, Set<Resource>>;
   selection?: Resource | null;
   // Primary selection (zwp_primary_selection_*): same shape as clipboard, separate
@@ -165,6 +165,20 @@ export interface SeatState {
   // clipboard layer uses this to (re)send the current selection to the focused
   // client. Set by the data-device module.
   onKbFocusChange?: (clientId: number | null) => void;
+  // Topmost surface under an output-space point (for DnD hit-testing).
+  pick(x: number, y: number): SeatFocus | null;
+  // DnD pointer grab. While non-null, handleInput routes pointer motion/button to
+  // these callbacks instead of wl_pointer. Set/cleared by the data-device module
+  // via beginDrag/endDrag.
+  drag: DragGrab | null;
+  beginDrag(d: DragGrab): void;
+  endDrag(): void;
+}
+
+// Callbacks the data-device DnD machinery installs on the seat during a drag.
+export interface DragGrab {
+  onMotion(x: number, y: number, hit: SeatFocus | null): void;
+  onButton(pressed: boolean): void;
 }
 
 export interface Ctx {
