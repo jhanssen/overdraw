@@ -279,10 +279,17 @@ void onWireReadable(uv_poll_t*, int status, int events) {
     if (status < 0 || !g_addon.compositor) return;
     if (events & UV_WRITABLE) g_addon.compositor->wirePumpOut();
     if (events & UV_READABLE) {
+        // drainWire() advances the wire client's event manager, which may resolve
+        // JS promises owned by a wire WebGPU binding (dawn.node) sharing this
+        // connection (buffer map, work-done). Those resolutions call into N-API,
+        // so an open HandleScope is required here.
+        napi_handle_scope scope;
+        napi_open_handle_scope(g_addon.env, &scope);
         g_addon.compositor->drainWire();
         // The wire advancing may let deferred imports complete on the GPU side,
         // whose ClientTexImported replies arrive on the ctrl fd; drain it too.
         g_addon.compositor->drainCtrl();
+        napi_close_handle_scope(g_addon.env, scope);
     }
     armWirePoll();  // update WRITABLE arming based on remaining queue
 }
@@ -407,6 +414,48 @@ napi_value PresentedCount(napi_env env, napi_callback_info) {
     napi_value v;
     napi_create_uint32(env, n, &v);
     return v;
+}
+
+// gpuHandles() -> { instance: bigint, device: bigint } | null
+// Raw wire-client handle pointers for the core's compositing instance+device,
+// for a wire-retargeted dawn.node to wrap (dawn.node's wrapDevice). Both addons
+// share the process-global wire proc table, so commands on the wrapped device
+// dispatch over the core's existing wire connection.
+napi_value GpuHandles(napi_env env, napi_callback_info) {
+    if (!g_addon.compositor) return nullptr;
+    g_addon.compositor->markWireSharedWithJs();
+    auto inst = reinterpret_cast<uint64_t>(g_addon.compositor->instanceHandle());
+    auto dev = reinterpret_cast<uint64_t>(g_addon.compositor->deviceHandle());
+    napi_value obj, iv, dv;
+    napi_create_object(env, &obj);
+    napi_create_bigint_uint64(env, inst, &iv);
+    napi_create_bigint_uint64(env, dev, &dv);
+    napi_set_named_property(env, obj, "instance", iv);
+    napi_set_named_property(env, obj, "device", dv);
+    return obj;
+}
+
+// shmView(poolId, offset, length) -> ArrayBuffer | null
+// Zero-copy external ArrayBuffer over the pool's mmap region, so JS can upload
+// shm pixels with device.queue.writeTexture without a copy. The buffer aliases
+// the live mapping; it MUST be consumed synchronously (at commit) and not held
+// past the pool's lifetime (no finalizer -- the mapping is owned by ShmRegistry).
+napi_value ShmView(napi_env env, napi_callback_info info) {
+    size_t argc = 3;
+    napi_value argv[3];
+    napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+    uint32_t poolId = 0, offset = 0, length = 0;
+    napi_get_value_uint32(env, argv[0], &poolId);
+    napi_get_value_uint32(env, argv[1], &offset);
+    napi_get_value_uint32(env, argv[2], &length);
+    const uint8_t* p = g_addon.shm.view(poolId, offset, length);
+    if (!p) return nullptr;
+    napi_value ab;
+    if (napi_create_external_arraybuffer(env, const_cast<uint8_t*>(p), length,
+                                         nullptr, nullptr, &ab) != napi_ok) {
+        return nullptr;
+    }
+    return ab;
 }
 
 napi_value Stop(napi_env env, napi_callback_info) {
@@ -1087,6 +1136,12 @@ napi_value Init(napi_env env, napi_value exports) {
     napi_create_function(env, "start", NAPI_AUTO_LENGTH, Start, nullptr, &fnStart);
     napi_create_function(env, "stop", NAPI_AUTO_LENGTH, Stop, nullptr, &fnStop);
     napi_create_function(env, "presentedCount", NAPI_AUTO_LENGTH, PresentedCount, nullptr, &fnPresented);
+    napi_value fnGpuHandles;
+    napi_create_function(env, "gpuHandles", NAPI_AUTO_LENGTH, GpuHandles, nullptr, &fnGpuHandles);
+    napi_set_named_property(env, exports, "gpuHandles", fnGpuHandles);
+    napi_value fnShmView;
+    napi_create_function(env, "shmView", NAPI_AUTO_LENGTH, ShmView, nullptr, &fnShmView);
+    napi_set_named_property(env, exports, "shmView", fnShmView);
     napi_create_function(env, "startServer", NAPI_AUTO_LENGTH, StartServer, nullptr, &fnStartServer);
     napi_create_function(env, "stopServer", NAPI_AUTO_LENGTH, StopServer, nullptr, &fnStopServer);
     napi_value fnRegister, fnCreateGlobal, fnPostEvent, fnRegisterIface;

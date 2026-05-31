@@ -46,6 +46,16 @@ class Compositor {
     uint32_t windowHeight() const { return windowHeight_; }
     uint64_t presented() const { return presented_; }
 
+    // Raw wire-client handles for the core's compositing instance + device, so a
+    // JS WebGPU binding (wire-retargeted dawn.node) can wrap them and issue
+    // WebGPU commands over the same wire connection. Valid only after bringUp().
+    WGPUInstance instanceHandle() const { return instance_.Get(); }
+    WGPUDevice deviceHandle() const { return device_.Get(); }
+
+    // Declare that the wire client is now shared with a JS WebGPU binding so its
+    // wgpu objects (whose finalizers run at process exit) outlive the client.
+    void markWireSharedWithJs() { link_->markSharedWithExternal(); }
+
     // linux-dmabuf-v1 default-feedback data captured from the GPU process during
     // bring-up. `formatTableFd` is an owned read-only memfd of 16-byte
     // {format,pad,modifier} records (mmap by the client); -1 if none was sent.

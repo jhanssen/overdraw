@@ -29,6 +29,14 @@ class WireLink {
     int wireFd() const { return wireFd_; }
     int ctrlFd() const { return ctrlFd_; }
 
+    // Mark the wire client as shared with an external JS WebGPU binding
+    // (dawn.node) that holds wgpu objects routed through this client. Those
+    // objects' finalizers run at process exit and call into the client; if the
+    // client were freed first that is a use-after-free. When shared, the
+    // destructor disconnects but intentionally leaks the client so late
+    // finalizers are safe (process is ending anyway).
+    void markSharedWithExternal() { sharedWithExternal_ = true; }
+
     // The wire instance must be set once reserved so event processing can pump
     // it (wgpuInstanceProcessEvents).
     void setInstance(WGPUInstance inst) { instance_ = inst; }
@@ -70,6 +78,7 @@ class WireLink {
     ipc::FrameReader* reader_ = nullptr;
     dawn::wire::WireClient* client_ = nullptr;
     WGPUInstance instance_ = nullptr;
+    bool sharedWithExternal_ = false;
 };
 
 }  // namespace overdraw::core
