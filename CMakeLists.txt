@@ -71,6 +71,7 @@ add_library(overdraw_core STATIC
     native/core/gpu_process.cpp
     native/core/wire_link.cpp
     native/core/compositor.cpp
+    native/core/plugin_wire.cpp
     native/core/input_wayland.cpp
     native/core/shm.cpp
     native/wayland/server.cpp

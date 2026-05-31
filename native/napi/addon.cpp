@@ -18,6 +18,7 @@
 
 #include "core/compositor.h"
 #include "core/gpu_process.h"
+#include "core/plugin_wire.h"
 #include "core/input.h"
 #include "core/input_wayland.h"
 #include "input_channel.h"
@@ -48,6 +49,7 @@ namespace {
 
 struct Addon {
     std::unique_ptr<Compositor> compositor;
+    std::vector<std::unique_ptr<overdraw::core::PluginWireClient>> pluginWires;
     std::unique_ptr<Server> server;
     std::unique_ptr<InterfaceRegistry> registry;
     std::unique_ptr<Trampoline> trampoline;
@@ -433,6 +435,51 @@ napi_value GpuHandles(napi_env env, napi_callback_info) {
     napi_create_object(env, &obj);
     napi_create_bigint_uint64(env, inst, &iv);
     napi_create_bigint_uint64(env, dev, &dv);
+    napi_set_named_property(env, obj, "instance", iv);
+    napi_set_named_property(env, obj, "device", dv);
+    return obj;
+}
+
+// pluginConnect(): establish a NEW plugin wire connection to the GPU process and
+// bring up its own device. Runtime-proves the C-M2 plumbing (C-M4 step 1). On the
+// main thread, reusing the core's dawn.node + the global wire proc table. Returns
+// { connId, instance, device } (BigInt handles for dawn.node wrapDevice), or null.
+napi_value PluginConnect(napi_env env, napi_callback_info) {
+    if (!g_addon.compositor) return nullptr;
+    auto handle = g_addon.compositor->addWireConnection();
+    if (handle.clientFd < 0) return throwError(env, "addWireConnection failed");
+
+    // Wait for the GPU process to register the connection (WireConnAdded), pumping
+    // the ctrl drain (no libuv during this synchronous call). 1=ok, 2=failed.
+    for (int i = 0; i < 25000; ++i) {
+        g_addon.compositor->drainCtrl();
+        int st = g_addon.compositor->wireConnAdded(handle.connId);
+        if (st != 0) break;
+        ::usleep(200);
+    }
+    if (g_addon.compositor->wireConnAdded(handle.connId) != 1) {
+        ::close(handle.clientFd);
+        return throwError(env, "GPU process did not register the wire connection");
+    }
+
+    auto pw = std::make_unique<overdraw::core::PluginWireClient>(
+        handle.clientFd, handle.connId, g_addon.compositor.get());
+    if (!pw->bringUp()) {
+        std::string e = pw->error();
+        return throwError(env, e.c_str());
+    }
+    pw->markSharedWithJs();
+    auto inst = reinterpret_cast<uint64_t>(pw->instanceHandle());
+    auto dev = reinterpret_cast<uint64_t>(pw->deviceHandle());
+    uint32_t connId = pw->connId();
+    g_addon.pluginWires.push_back(std::move(pw));
+
+    napi_value obj, cv, iv, dv;
+    napi_create_object(env, &obj);
+    napi_create_uint32(env, connId, &cv);
+    napi_create_bigint_uint64(env, inst, &iv);
+    napi_create_bigint_uint64(env, dev, &dv);
+    napi_set_named_property(env, obj, "connId", cv);
     napi_set_named_property(env, obj, "instance", iv);
     napi_set_named_property(env, obj, "device", dv);
     return obj;
@@ -1129,6 +1176,7 @@ napi_value Init(napi_env env, napi_value exports) {
     reg("keymapInfo", KeymapInfo);
     reg("keyUpdate", KeyUpdate);
     reg("dmabufFeedbackInfo", DmabufFeedbackInfo);
+    reg("pluginConnect", PluginConnect);
 
     napi_set_named_property(env, exports, "start", fnStart);
     napi_set_named_property(env, exports, "stop", fnStop);
