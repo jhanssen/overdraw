@@ -58,6 +58,10 @@ export interface CompositorAddon {
   // Release a dmabuf import (drops the server STM + fd). Called once the buffer
   // is freed (GPU-completion-gated) or the surface is removed.
   releaseDmabufImport(importId: number): void;
+  // Nested present (slice 3): acquire the host swapchain's current texture handle
+  // (null if none this frame) and present it after rendering.
+  acquireOutputTexture(): bigint | null;
+  presentOutput(): void;
 }
 
 // The dawn.node wire binding bits the compositor needs for dmabuf surfaces.
@@ -89,7 +93,15 @@ interface Surface {
 // import may be released (importId).
 interface RetiringBuffer { bufferId: number; importId: number; retireSerial: number; tex: any; }
 
-const FORMAT = "bgra8unorm";
+const DEFAULT_FORMAT = "bgra8unorm";
+
+export interface JsCompositorOpts {
+  // Present to the host swapchain (slice 3) instead of an offscreen target.
+  // Requires dawn + deviceHandle (for wrapTexture) and the addon acquire/present.
+  nested?: boolean;
+  // The render-target color format (must match the swapchain when nested).
+  format?: string;
+}
 
 export class JsCompositor implements CompositorSink {
   private device: any;
@@ -123,9 +135,16 @@ export class JsCompositor implements CompositorSink {
   private dawn: DawnWire | null;
   private deviceHandle: bigint;
 
+  // Nested present (slice 3): render into the host swapchain + present, instead
+  // of an offscreen target.
+  private nested: boolean;
+  private format: string;
+  private outputTex: any = null;  // wrapped swapchain texture held during a frame
+
   constructor(device: any, globals: any, addon: CompositorAddon,
               output: { width: number; height: number },
-              dawn: DawnWire | null = null, deviceHandle: bigint = 0n) {
+              dawn: DawnWire | null = null, deviceHandle: bigint = 0n,
+              opts: JsCompositorOpts = {}) {
     this.device = device;
     this.g = globals;
     this.addon = addon;
@@ -133,6 +152,8 @@ export class JsCompositor implements CompositorSink {
     this.height = output.height;
     this.dawn = dawn;
     this.deviceHandle = deviceHandle;
+    this.nested = opts.nested ?? false;
+    this.format = opts.format ?? DEFAULT_FORMAT;
 
     this.sampler = device.createSampler({ magFilter: "nearest", minFilter: "nearest" });
     const module = device.createShaderModule({ code: WGSL });
@@ -144,7 +165,7 @@ export class JsCompositor implements CompositorSink {
         module,
         entryPoint: "fs",
         targets: [{
-          format: FORMAT,
+          format: this.format,
           blend: {
             color: { srcFactor: "one", dstFactor: "one-minus-src-alpha", operation: "add" },
             alpha: { srcFactor: "one", dstFactor: "one-minus-src-alpha", operation: "add" },
@@ -154,12 +175,16 @@ export class JsCompositor implements CompositorSink {
     });
     this.layout = this.pipeline.getBindGroupLayout(0);
 
-    this.target = device.createTexture({
-      size: { width: this.width, height: this.height },
-      format: FORMAT,
-      usage: this.g.GPUTextureUsage.RENDER_ATTACHMENT | this.g.GPUTextureUsage.COPY_SRC,
-    });
-    this.targetView = this.target.createView();
+    // Headless: an owned offscreen target (read back via readback()). Nested: the
+    // target is the swapchain's current texture, acquired per frame.
+    if (!this.nested) {
+      this.target = device.createTexture({
+        size: { width: this.width, height: this.height },
+        format: this.format,
+        usage: this.g.GPUTextureUsage.RENDER_ATTACHMENT | this.g.GPUTextureUsage.COPY_SRC,
+      });
+      this.targetView = this.target.createView();
+    }
   }
 
   // --- CompositorSink ---
@@ -289,9 +314,11 @@ export class JsCompositor implements CompositorSink {
 
     if (!s.texture || s.width !== c.width || s.height !== c.height) {
       if (s.texture) s.texture.destroy?.();
+      // Sampled client textures are always BGRA8 (shm ARGB8888 byte-for-byte;
+      // dmabuf imported as BGRA8Unorm), independent of the output format.
       s.texture = this.device.createTexture({
         size: { width: c.width, height: c.height },
-        format: FORMAT,
+        format: "bgra8unorm",
         usage: this.g.GPUTextureUsage.TEXTURE_BINDING | this.g.GPUTextureUsage.COPY_DST,
       });
       s.view = s.texture.createView();
@@ -331,14 +358,23 @@ export class JsCompositor implements CompositorSink {
     this.device.queue.writeBuffer(s.placementBuf, 0, rect);
   }
 
-  // Composite one frame into the offscreen target (clear black, draw stack
-  // back-to-front, premultiplied-alpha blend). Returns nothing; read with
-  // readback().
+  // Composite one frame: clear black, draw stack back-to-front, premultiplied
+  // blend. Nested (slice 3) renders into the host swapchain's current texture and
+  // presents; headless renders into the offscreen target (read via readback()).
   renderFrame(): void {
+    let targetView = this.targetView;
+    let presenting = false;
+    if (this.nested) {
+      const handle = this.addon.acquireOutputTexture();
+      if (handle === null) return;  // no swapchain texture this frame
+      this.outputTex = this.dawn!.wrapTexture(this.deviceHandle, handle);
+      targetView = this.outputTex.createView();
+      presenting = true;
+    }
     const enc = this.device.createCommandEncoder();
     const pass = enc.beginRenderPass({
       colorAttachments: [{
-        view: this.targetView,
+        view: targetView,
         loadOp: "clear",
         storeOp: "store",
         clearValue: { r: 0, g: 0, b: 0, a: 1 },
@@ -365,12 +401,18 @@ export class JsCompositor implements CompositorSink {
       if (serial > this.completedSerial) this.completedSerial = serial;
       this.reapRetiring();
     });
+
+    if (presenting) {
+      this.addon.presentOutput();
+      this.outputTex = null;  // drop our borrowed wrap (native held its own ref)
+    }
   }
 
   // Async readback of the composited target. Returns tightly-packed BGRA bytes
   // (width*height*4). copyTextureToBuffer requires 256-aligned bytesPerRow, so
   // we pad on the GPU side and unpad here.
   async readback(): Promise<{ width: number; height: number; data: Uint8Array }> {
+    if (this.nested) throw new Error("readback() is headless-only (nested presents to the swapchain)");
     const unpadded = this.width * 4;
     const padded = Math.ceil(unpadded / 256) * 256;
     const buf = this.device.createBuffer({

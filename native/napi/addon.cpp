@@ -515,6 +515,51 @@ napi_value CreateTextureFromDmabuf(napi_env env, napi_callback_info info) {
     return out;  // JS uses this importId to release later
 }
 
+// setExternalCompositor(bool) -> undefined. When true, the C++ Compositor stops
+// rendering/presenting (the JS compositor drives the frame via acquireOutputTexture
+// + presentOutput).
+napi_value SetExternalCompositor(napi_env env, napi_callback_info info) {
+    size_t argc = 1; napi_value argv[1];
+    napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+    bool on = false; napi_get_value_bool(env, argv[0], &on);
+    if (g_addon.compositor) g_addon.compositor->setExternalRender(on);
+    return nullptr;
+}
+
+// acquireOutputTexture() -> bigint | null. The host swapchain's current texture
+// handle (nested), for the JS compositor to wrap + render into this frame.
+napi_value AcquireOutputTexture(napi_env env, napi_callback_info) {
+    if (!g_addon.compositor) return nullptr;
+    WGPUTexture t = g_addon.compositor->acquireOutputTextureHandle();
+    if (!t) return nullptr;
+    napi_value out;
+    napi_create_bigint_uint64(env, reinterpret_cast<uint64_t>(t), &out);
+    return out;
+}
+
+// presentOutput() -> undefined. Present the acquired output texture.
+napi_value PresentOutput(napi_env env, napi_callback_info) {
+    if (g_addon.compositor) g_addon.compositor->presentOutput();
+    return nullptr;
+}
+
+// outputFormat() -> string. The swapchain's WGPUTextureFormat as a WebGPU format
+// string, so the JS pipeline's color target matches the swapchain.
+napi_value OutputFormat(napi_env env, napi_callback_info) {
+    const char* s = "bgra8unorm";
+    if (g_addon.compositor) {
+        switch (g_addon.compositor->outputFormat()) {
+            case wgpu::TextureFormat::BGRA8Unorm: s = "bgra8unorm"; break;
+            case wgpu::TextureFormat::RGBA8Unorm: s = "rgba8unorm"; break;
+            case wgpu::TextureFormat::BGRA8UnormSrgb: s = "bgra8unorm-srgb"; break;
+            case wgpu::TextureFormat::RGBA8UnormSrgb: s = "rgba8unorm-srgb"; break;
+            default: s = "bgra8unorm"; break;
+        }
+    }
+    napi_value out; napi_create_string_utf8(env, s, NAPI_AUTO_LENGTH, &out);
+    return out;
+}
+
 // releaseDmabufImport(importId) -> undefined
 napi_value ReleaseDmabufImport(napi_env env, napi_callback_info info) {
     size_t argc = 1; napi_value argv[1];
@@ -1241,6 +1286,14 @@ napi_value Init(napi_env env, napi_value exports) {
     napi_create_function(env, "releaseDmabufImport", NAPI_AUTO_LENGTH,
                          ReleaseDmabufImport, nullptr, &fnReleaseDmabuf);
     napi_set_named_property(env, exports, "releaseDmabufImport", fnReleaseDmabuf);
+    for (auto& [name, fn] : std::initializer_list<std::pair<const char*, napi_callback>>{
+             {"setExternalCompositor", SetExternalCompositor},
+             {"acquireOutputTexture", AcquireOutputTexture},
+             {"presentOutput", PresentOutput},
+             {"outputFormat", OutputFormat}}) {
+        napi_value f; napi_create_function(env, name, NAPI_AUTO_LENGTH, fn, nullptr, &f);
+        napi_set_named_property(env, exports, name, f);
+    }
     napi_create_function(env, "startServer", NAPI_AUTO_LENGTH, StartServer, nullptr, &fnStartServer);
     napi_create_function(env, "stopServer", NAPI_AUTO_LENGTH, StopServer, nullptr, &fnStopServer);
     napi_value fnRegister, fnCreateGlobal, fnPostEvent, fnRegisterIface;

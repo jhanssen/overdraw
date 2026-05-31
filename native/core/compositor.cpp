@@ -597,7 +597,26 @@ void Compositor::takeFreedBuffers(std::vector<uint64_t>& out) {
     freed_.clear();
 }
 
+WGPUTexture Compositor::acquireOutputTextureHandle() {
+    if (headless_ || !surface_) return nullptr;
+    wgpu::SurfaceTexture st{};
+    surface_.GetCurrentTexture(&st);
+    if (!st.texture) return nullptr;
+    currentOutputTexture_ = st.texture;  // hold a ref until present
+    return st.texture.Get();
+}
+
+void Compositor::presentOutput() {
+    if (headless_ || !surface_) return;
+    surface_.Present();
+    presented_++;
+    currentOutputTexture_ = nullptr;
+    link_->flush();
+}
+
 void Compositor::renderFrame() {
+    // JS owns the frame (acquire/render/present from JS): only flush wire output.
+    if (externalRender_) { link_->flush(); return; }
     // Acquire the render target: the swapchain's current texture (nested) or the
     // owned offscreen capture texture (headless).
     wgpu::SurfaceTexture st{};

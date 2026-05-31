@@ -53,6 +53,18 @@ export interface Addon {
     modsDepressed: number; modsLatched: number; modsLocked: number; group: number;
   };
 
+  // JS-compositor bridge (wire WebGPU via dawn.node).
+  gpuHandles(): { instance: bigint; device: bigint } | null;
+  outputFormat(): string;
+  setExternalCompositor(on: boolean): void;
+  acquireOutputTexture(): bigint | null;
+  presentOutput(): void;
+  shmView(poolId: number, offset: number, length: number): ArrayBuffer | null;
+  createTextureFromDmabuf(fd: unknown, w: number, h: number, fourcc: number,
+                          modHi: number, modLo: number, offset: number, stride: number,
+                          cb: (handle: bigint | null) => void): number;
+  releaseDmabufImport(importId: number): void;
+
   // Surface bridge / compositor.
   commitSurfaceBuffer(id: number, poolId: number, offset: number, w: number,
                       h: number, stride: number): boolean;

@@ -101,8 +101,12 @@ export async function setupCompositor(opts = {}) {
     const h = addon.gpuHandles();
     const device = dawn.wrapDevice(h.instance, h.device);
     const { JsCompositor } = await import("../dist/gpu/compositor.js");
+    const nested = !headless;  // nested -> present to the host swapchain (slice 3)
     jsCompositor = new JsCompositor(device, dawn.globals, addon,
-      { width: dims.width, height: dims.height }, dawn, h.device);
+      { width: dims.width, height: dims.height }, dawn, h.device,
+      { nested, format: addon.outputFormat() });
+    // The JS compositor now drives the frame; stop the C++ Compositor rendering.
+    addon.setExternalCompositor(true);
   }
 
   state = await installProtocols(addon, {

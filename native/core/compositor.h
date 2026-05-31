@@ -98,6 +98,22 @@ class Compositor {
     int wireFd() const { return link_->wireFd(); }
     int ctrlFd() const { return ctrlFd_; }
 
+    // Slice 3: drive the host swapchain present from JS. The JS compositor
+    // acquires the output texture, renders into it over the wire, then presents.
+    // While "external render" is on, the C++ renderFrame() does NOT acquire/
+    // render/present (JS owns the frame), it only flushes wire output.
+    void setExternalRender(bool e) { externalRender_ = e; }
+    // Acquire the host swapchain's current texture (nested only). Holds a ref
+    // until presentOutput(); returns the wire texture handle (or null headless /
+    // no surface). JS wraps it (dawn.node wrapTexture) as the render target.
+    WGPUTexture acquireOutputTextureHandle();
+    // Present the previously-acquired output texture (Present over the wire) and
+    // drop the held ref. No-op headless.
+    void presentOutput();
+    // The swapchain's texture format (the JS pipeline's color-target format must
+    // match). Valid after bringUp().
+    wgpu::TextureFormat outputFormat() const { return renderFormat_; }
+
     // Steady-state hooks (called from libuv handles in the addon).
     void drainWire() { link_->drainInbound(); }
     // Drain the outbound wire queue when the wire fd is writable.
@@ -201,6 +217,8 @@ class Compositor {
     bool shutdownDone_ = false;
 
     bool headless_ = false;
+    bool externalRender_ = false;      // JS compositor drives the frame (slice 3)
+    wgpu::Texture currentOutputTexture_;  // held between acquire + present
     wgpu::Instance instance_;
     wgpu::Device device_;
     wgpu::Surface surface_;            // nested only
