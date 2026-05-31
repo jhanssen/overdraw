@@ -254,11 +254,11 @@ rests on facts, not assumptions:
   closed, though the C++ `Compositor` is still the only path real clients use.
   Protocol handlers are largely in JS (`src/protocols/`). Still C++-internal or
   absent: WM/policy beyond the placement stub, and the plugin model.
-- `wl_event_loop` (server-side Wayland) integration does not exist — there is no
-  Wayland server yet. No resize handling. Host *input* arrives in the core (see
-  "Host input forwarding") and both **pointer and keyboard** input are routed to
-  clients via `wl_seat`/`wl_pointer`/`wl_keyboard` (see "Input routing to
-  clients").
+- Server-side Wayland (`wl_event_loop`) IS integrated into the libuv loop (see
+  "Wayland server + generic trampoline"); the core is a real Wayland server. No
+  host-window-resize handling. Host *input* arrives in the core (see "Host input
+  forwarding") and both **pointer and keyboard** input are routed to clients via
+  `wl_seat`/`wl_pointer`/`wl_keyboard` (see "Input routing to clients").
 
 ### Host input forwarding (host seat -> GPU process -> core -> JS, verified)
 Host pointer/keyboard events reach the core as normalized events. The seam is a
@@ -764,14 +764,16 @@ comparison (Hyprland's own tester flags visual testing as an open TODO). overdra
 follows the same model.
 
 - **Pure-unit tests** (`npm test` → `node --test 'test/**/*.test.js'`, GPU-free):
-  - `test/gen-protocol.test.js` — protocol-generator structural tests (8).
+  - `test/gen-protocol.test.js` — protocol-generator structural tests.
   - `test/placement.test.js` — the placement stub's cascade/wrap/clamp.
   - `test/wm.test.js` — `createWm` map/unmap (rect assignment, content-size
     fallback, idempotence, stack order pushed to a MOCK addon) + `windowAt`
     hit-testing (half-open bounds, topmost-on-overlap). The mock addon records
     `setSurfaceLayout`/`setStack` so the WM is tested without native/GPU.
   - `test/query.test.js` — the state-query channel snapshot.
-  - 29 tests total, all passing; no native build, no GPU, no Wayland.
+  - `test/config.test.js` — config resolution/loading/validation.
+  - (plus the protocol-coverage + server-only `*.test.js` listed below.)
+  - All passing; no native build, no GPU, no Wayland.
 - **State-query channel** (`src/query.ts`, `queryState(state)` → `StateSnapshot`):
   overdraw's analog of `hyprctl /activewindow` — a serializable, GPU-free snapshot
   of output size, windows (surfaceId + rect + title + app_id + role + mapped),
@@ -802,16 +804,16 @@ follows the same model.
       converted back, exercising the round-trip. This is the analog of Hyprland's
       test plugin injecting at the input layer, reusing the existing
       `native/core/input.h` seam (no virtual-input protocol).
-  - `test/integration.gpu.mjs`: 7 tests — client map→query (title/app_id/size),
+  - `test/integration.gpu.mjs`: client map→query (title/app_id/size),
     two-client stacking order, focus-on-map, follow-pointer focus enter/clear,
     click-to-focus press + persist-on-leave, plus two HOST-PATH tests via
     `injectHostInput`. All run HEADLESS now (no host window needed).
-  - `test/compositing.gpu.mjs`: 3 PIXEL tests against the headless offscreen
+  - `test/compositing.gpu.mjs`: PIXEL tests against the headless offscreen
     frame — single client composites at its rect + black background; two clients
     at distinct positions both visible; top window wins the overlap (opaque
     stacking). Computed-expectation comparison (each client a known solid color
     at a `query()` rect, ±4/channel tolerance), no golden files.
-  - `test/protocols.gpu.mjs`: 3 protocol-delivery tests — `wl_output` (client
+  - `test/protocols.gpu.mjs`: protocol-delivery tests — `wl_output` (client
     receives a mode matching the output size + done), `wl_callback` (compositor
     fires `wl_surface.frame` → `wl_callback.done` each frame, client re-arms),
     `wl_keyboard` (key injected via the host path is delivered to the focused
@@ -821,7 +823,7 @@ follows the same model.
     the socket, so server-sent events were never delivered — now polls + reads.)
   - `npm run test:gpu` runs `test/*.gpu.mjs` with `--test-concurrency=1` (each
     test owns the GPU + a compositor; serial avoids socket-name and
-    GPU-process-leak-scan races). 13 GPU tests total.
+    GPU-process-leak-scan races).
 
 ### Headless mode (offscreen render, no host window)
 - `addon.start(gpuBin, onFrame?, onInput?, { width, height })` runs HEADLESS: the
@@ -871,7 +873,7 @@ follows the same model.
     `server.test.js`, `trampoline.test.js`, `fd-passing.test.js`,
     `xdg-shell.test.js` (shared `server-helpers.mjs`; each its own file for
     process isolation — see the start/stop note below). The old `*-smoke.mjs`
-    versions were removed. `npm test` is 37 tests, GPU-free.
+    versions were removed. `npm test` is GPU-free.
 - **Known bug (flagged, not fixed): `startServer`/`stopServer` is NOT safely
   repeatable in one process** — a second lifecycle aborts with a libuv
   `uv__finish_close` assertion (`Server::stop()` mishandles uv handle teardown on
