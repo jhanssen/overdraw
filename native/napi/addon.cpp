@@ -264,6 +264,7 @@ void readMessages(napi_env env, napi_value arr, std::vector<MessageDesc>& out) {
 }
 
 void onWireReadable(uv_poll_t*, int status, int events);
+void fireJsImports(napi_env env);
 
 // Arm the wire poll for READABLE always, plus WRITABLE iff outbound wire bytes
 // are queued (so we get told when the socket can take more). Call after anything
@@ -289,6 +290,7 @@ void onWireReadable(uv_poll_t*, int status, int events) {
         // The wire advancing may let deferred imports complete on the GPU side,
         // whose ClientTexImported replies arrive on the ctrl fd; drain it too.
         g_addon.compositor->drainCtrl();
+        fireJsImports(g_addon.env);
         napi_close_handle_scope(g_addon.env, scope);
     }
     armWirePoll();  // update WRITABLE arming based on remaining queue
@@ -299,6 +301,7 @@ void onWireReadable(uv_poll_t*, int status, int events) {
 void onCtrlReadable(uv_poll_t*, int status, int) {
     if (status < 0 || !g_addon.compositor) return;
     g_addon.compositor->drainCtrl();
+    fireJsImports(g_addon.env);  // resolve JS dmabuf imports (opens its own scope)
     armWirePoll();  // finishing an import flushes wire output (bind group etc.)
 }
 
@@ -433,6 +436,81 @@ napi_value GpuHandles(napi_env env, napi_callback_info) {
     napi_set_named_property(env, obj, "instance", iv);
     napi_set_named_property(env, obj, "device", dv);
     return obj;
+}
+
+// Pending JS dmabuf-import callbacks, keyed by importId. The callback fires once
+// when the import completes (or fails), then the ref is released.
+std::unordered_map<uint32_t, napi_ref> g_jsImportCbs;
+
+// Drain completed JS dmabuf imports and invoke their JS callbacks with the
+// injected texture handle (BigInt) or null on failure. Runs on the Node thread
+// (from the ctrl/wire poll). Opens its own HandleScope.
+void fireJsImports(napi_env env) {
+    if (!g_addon.compositor) return;
+    std::vector<Compositor::JsImportDone> done;
+    g_addon.compositor->takeCompletedJsImports(done);
+    if (done.empty()) return;
+    napi_handle_scope scope;
+    napi_open_handle_scope(env, &scope);
+    for (auto& d : done) {
+        auto it = g_jsImportCbs.find(d.importId);
+        if (it == g_jsImportCbs.end()) continue;
+        napi_value cb, undefined, arg;
+        napi_get_reference_value(env, it->second, &cb);
+        napi_get_undefined(env, &undefined);
+        if (d.ok) {
+            napi_create_bigint_uint64(env, reinterpret_cast<uint64_t>(d.tex.Get()), &arg);
+        } else {
+            napi_get_null(env, &arg);
+        }
+        napi_call_function(env, undefined, cb, 1, &arg, nullptr);
+        napi_delete_reference(env, it->second);
+        g_jsImportCbs.erase(it);
+    }
+    napi_close_handle_scope(env, scope);
+    // `done` destructs here: each JsImportDone.tex releases the core's ref, having
+    // handed ownership to JS (wrapTexture AddRef'd inside the callback).
+}
+
+// createTextureFromDmabuf(fd, w, h, fourcc, modHi, modLo, offset, stride, cb)
+// Async: imports a client dmabuf as a wire texture (server-side reserve/inject)
+// and invokes cb(handleBigInt | null) when done. JS wraps the handle via
+// dawn.node wrapTexture. The JS API layer presents this as a Promise.
+napi_value CreateTextureFromDmabuf(napi_env env, napi_callback_info info) {
+    size_t argc = 9; napi_value argv[9];
+    napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+    if (argc < 9) return throwError(env, "createTextureFromDmabuf(fd,w,h,fourcc,modHi,modLo,offset,stride,cb)");
+    if (!g_addon.compositor) return throwError(env, "compositor not running");
+    uint32_t w = 0, h = 0, fourcc = 0, modHi = 0, modLo = 0, offset = 0, stride = 0;
+    napi_get_value_uint32(env, argv[1], &w);
+    napi_get_value_uint32(env, argv[2], &h);
+    napi_get_value_uint32(env, argv[3], &fourcc);
+    napi_get_value_uint32(env, argv[4], &modHi);
+    napi_get_value_uint32(env, argv[5], &modLo);
+    napi_get_value_uint32(env, argv[6], &offset);
+    napi_get_value_uint32(env, argv[7], &stride);
+    napi_ref cbRef;
+    napi_create_reference(env, argv[8], 1, &cbRef);
+
+    int fd = overdraw::wayland::peekWaylandFd(env, argv[0]);
+    uint32_t importId = 0;
+    if (fd >= 0) {
+        uint64_t modifier = (static_cast<uint64_t>(modHi) << 32) | modLo;
+        importId = g_addon.compositor->importDmabufForJs(fd, w, h, fourcc, modifier, offset, stride);
+        ::close(fd);  // GPU process dup'd it over SCM_RIGHTS
+    }
+    if (importId == 0) {
+        // Could not start: invoke cb(null) now.
+        napi_value cb, undefined, nul;
+        napi_get_reference_value(env, cbRef, &cb);
+        napi_get_undefined(env, &undefined);
+        napi_get_null(env, &nul);
+        napi_call_function(env, undefined, cb, 1, &nul, nullptr);
+        napi_delete_reference(env, cbRef);
+        return nullptr;
+    }
+    g_jsImportCbs[importId] = cbRef;
+    return nullptr;
 }
 
 // shmView(poolId, offset, length) -> ArrayBuffer | null
@@ -1142,6 +1220,10 @@ napi_value Init(napi_env env, napi_value exports) {
     napi_value fnShmView;
     napi_create_function(env, "shmView", NAPI_AUTO_LENGTH, ShmView, nullptr, &fnShmView);
     napi_set_named_property(env, exports, "shmView", fnShmView);
+    napi_value fnCreateTexDmabuf;
+    napi_create_function(env, "createTextureFromDmabuf", NAPI_AUTO_LENGTH,
+                         CreateTextureFromDmabuf, nullptr, &fnCreateTexDmabuf);
+    napi_set_named_property(env, exports, "createTextureFromDmabuf", fnCreateTexDmabuf);
     napi_create_function(env, "startServer", NAPI_AUTO_LENGTH, StartServer, nullptr, &fnStartServer);
     napi_create_function(env, "stopServer", NAPI_AUTO_LENGTH, StopServer, nullptr, &fnStopServer);
     napi_value fnRegister, fnCreateGlobal, fnPostEvent, fnRegisterIface;

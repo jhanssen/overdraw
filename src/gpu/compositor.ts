@@ -49,6 +49,16 @@ import type { CompositorSink } from "../protocols/ctx.js";
 // Minimal slice of the native addon this module needs.
 export interface CompositorAddon {
   shmView(poolId: number, offset: number, length: number): ArrayBuffer | null;
+  // Async dmabuf import (server-side reserve/inject). cb(handle|null). `fd` is a
+  // WaylandFd (the native side peeks it without consuming).
+  createTextureFromDmabuf(
+    fd: unknown, w: number, h: number, fourcc: number, modHi: number, modLo: number,
+    offset: number, stride: number, cb: (handle: bigint | null) => void): void;
+}
+
+// The dawn.node wire binding bits the compositor needs for dmabuf surfaces.
+export interface DawnWire {
+  wrapTexture(deviceHandle: bigint, textureHandle: bigint): any; // -> GPUTexture
 }
 
 interface Surface {
@@ -63,7 +73,14 @@ interface Surface {
   layoutW: number;
   layoutH: number;
   present: boolean;
+  // dmabuf: the wl_buffer id currently backing this surface (0 = shm/none), for
+  // the zero-copy buffer-release lifecycle.
+  currentBufferId: number;
 }
+
+// A dmabuf buffer awaiting GPU-completion of the last frame that sampled it,
+// after which the client may reuse it (wl_buffer.release).
+interface RetiringBuffer { bufferId: number; retireSerial: number; tex: any; }
 
 const FORMAT = "bgra8unorm";
 
@@ -86,13 +103,29 @@ export class JsCompositor implements CompositorSink {
   private surfaces = new Map<number, Surface>();
   private stack: number[] = [];
 
+  // dmabuf buffer-release lifecycle (mirrors the C++ retiring/freed logic): each
+  // composite submit gets a serial; a superseded buffer retires tagged with the
+  // latest submit serial and is freed once that serial completes on the GPU.
+  private submitSerial = 0;
+  private completedSerial = 0;
+  private retiring: RetiringBuffer[] = [];
+  private freed: number[] = [];
+
+  // dmabuf support (optional; only needed when dmabuf clients run under the JS
+  // compositor). `dawn` provides wrapTexture; `deviceHandle` is the wire device.
+  private dawn: DawnWire | null;
+  private deviceHandle: bigint;
+
   constructor(device: any, globals: any, addon: CompositorAddon,
-              output: { width: number; height: number }) {
+              output: { width: number; height: number },
+              dawn: DawnWire | null = null, deviceHandle: bigint = 0n) {
     this.device = device;
     this.g = globals;
     this.addon = addon;
     this.width = output.width;
     this.height = output.height;
+    this.dawn = dawn;
+    this.deviceHandle = deviceHandle;
 
     this.sampler = device.createSampler({ magFilter: "nearest", minFilter: "nearest" });
     const module = device.createShaderModule({ code: WGSL });
@@ -145,14 +178,59 @@ export class JsCompositor implements CompositorSink {
     return true;
   }
 
-  // dmabuf in the JS compositor is slice 2 (createTextureFromDmabuf + wrapTexture
-  // + the buffer-release lifecycle). Until then, report unhandled.
-  commitSurfaceDmabuf(): boolean {
-    if (!this.warnedDmabuf) {
-      console.warn("[js-compositor] commitSurfaceDmabuf not yet implemented (slice 2)");
-      this.warnedDmabuf = true;
+  // Import a client dmabuf (zero-copy) as a sampled texture and install it on the
+  // surface. The import is async (server-side reserve/inject); on completion we
+  // wrap the wire texture (dawn.node wrapTexture) and build the bind group.
+  commitSurfaceDmabuf(id: number, fd: unknown, w: number, h: number, fourcc: number,
+                      modHi: number, modLo: number, offset: number, stride: number,
+                      bufferId: number): boolean {
+    if (!this.dawn || this.deviceHandle === 0n) {
+      if (!this.warnedDmabuf) {
+        console.warn("[js-compositor] dmabuf needs dawn.wrapTexture + deviceHandle");
+        this.warnedDmabuf = true;
+      }
+      return false;
     }
-    return false;
+    this.addon.createTextureFromDmabuf(fd, w, h, fourcc, modHi, modLo, offset, stride,
+      (handle) => {
+        if (handle === null) return; // import failed
+        const tex = this.dawn!.wrapTexture(this.deviceHandle, handle);
+        this.installDmabuf(id, tex, w, h, bufferId);
+      });
+    return true;
+  }
+
+  // Install a freshly-imported dmabuf texture on the surface, retiring the buffer
+  // it supersedes (freed once the last frame that sampled it completes).
+  private installDmabuf(id: number, tex: any, w: number, h: number, bufferId: number): void {
+    let s = this.surfaces.get(id);
+    if (!s) { s = blankSurface(0, 0, 0, 0); this.surfaces.set(id, s); }
+
+    if (s.currentBufferId !== 0 && s.currentBufferId !== bufferId && s.texture) {
+      // The old buffer was sampled by every frame up to the latest submit; it is
+      // free once that submit completes. Keep its texture alive until then.
+      this.retiring.push({ bufferId: s.currentBufferId, retireSerial: this.submitSerial, tex: s.texture });
+    }
+    s.currentBufferId = bufferId;
+    s.texture = tex;
+    s.view = tex.createView();
+    s.width = w;
+    s.height = h;
+    if (!s.placementBuf) {
+      s.placementBuf = this.device.createBuffer({
+        size: 16, usage: this.g.GPUBufferUsage.UNIFORM | this.g.GPUBufferUsage.COPY_DST,
+      });
+    }
+    s.bindGroup = this.device.createBindGroup({
+      layout: this.layout,
+      entries: [
+        { binding: 0, resource: this.sampler },
+        { binding: 1, resource: s.view },
+        { binding: 2, resource: { buffer: s.placementBuf } },
+      ],
+    });
+    s.present = true;
+    this.imported.push({ id, width: w, height: h });
   }
 
   takeImportedSurfaces(): Array<{ id: number; width: number; height: number }> {
@@ -161,9 +239,23 @@ export class JsCompositor implements CompositorSink {
     return out;
   }
 
-  // shm has no zero-copy buffer-release lifecycle (pixels are copied at upload),
-  // so nothing to release. dmabuf release lands in slice 2.
-  takeFreedBuffers(): number[] { return []; }
+  // dmabuf buffers freed since the last call (their last sampling frame completed
+  // on the GPU). shm buffers are copied at upload, so they never appear here.
+  takeFreedBuffers(): number[] {
+    const out = this.freed;
+    this.freed = [];
+    return out;
+  }
+
+  private reapRetiring(): void {
+    if (this.retiring.length === 0) return;
+    const keep: RetiringBuffer[] = [];
+    for (const r of this.retiring) {
+      if (r.retireSerial <= this.completedSerial) this.freed.push(r.bufferId); // drop r.tex
+      else keep.push(r);
+    }
+    this.retiring = keep;
+  }
 
   // Upload raw BGRA8 pixels (tightly `stride`-rowed) into the surface's sampled
   // texture, creating/recreating it on size change. Used by uploadShm and by
@@ -241,6 +333,16 @@ export class JsCompositor implements CompositorSink {
     }
     pass.end();
     this.device.queue.submit([enc.finish()]);
+
+    // This submit sampled every present surface's current buffer. Tag it; when it
+    // completes on the GPU, advance completedSerial and free retiring dmabuf
+    // buffers whose retireSerial has completed (-> wl_buffer.release). The promise
+    // resolves on the Node thread via the wire pump.
+    const serial = ++this.submitSerial;
+    this.device.queue.onSubmittedWorkDone().then(() => {
+      if (serial > this.completedSerial) this.completedSerial = serial;
+      this.reapRetiring();
+    });
   }
 
   // Async readback of the composited target. Returns tightly-packed BGRA bytes
@@ -276,5 +378,6 @@ function blankSurface(x: number, y: number, w: number, h: number): Surface {
   return {
     texture: null, view: null, placementBuf: null, bindGroup: null,
     width: 0, height: 0, x, y, layoutW: w, layoutH: h, present: false,
+    currentBufferId: 0,
   };
 }

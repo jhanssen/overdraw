@@ -56,6 +56,23 @@ class Compositor {
     // wgpu objects (whose finalizers run at process exit) outlive the client.
     void markWireSharedWithJs() { link_->markSharedWithExternal(); }
 
+    // Import a client dmabuf as a wire texture FOR THE JS COMPOSITOR: reserve a
+    // texture handle, send ImportClientTex (fd via SCM_RIGHTS), and return an
+    // importId. Unlike commitSurfaceDmabuf, this builds NO native compositing
+    // state -- on completion the injected texture's wire HANDLE is reported via
+    // takeCompletedJsImports() for JS to wrap (dawn.node wrapTexture). Returns 0
+    // if the request could not be sent.
+    uint32_t importDmabufForJs(int fd, uint32_t width, uint32_t height,
+                               uint32_t drmFourcc, uint64_t modifier,
+                               uint32_t offset, uint32_t stride);
+
+    // A completed JS dmabuf import. `tex` owns one ref to the injected texture;
+    // the caller hands `tex.Get()` to JS (which AddRefs via wrapTexture) and then
+    // lets `tex` drop, leaving JS as the owner. `ok=false` => import failed.
+    struct JsImportDone { uint32_t importId; uint32_t width; uint32_t height;
+                          wgpu::Texture tex; bool ok; };
+    void takeCompletedJsImports(std::vector<JsImportDone>& out);
+
     // linux-dmabuf-v1 default-feedback data captured from the GPU process during
     // bring-up. `formatTableFd` is an owned read-only memfd of 16-byte
     // {format,pad,modifier} records (mmap by the client); -1 if none was sent.
@@ -232,6 +249,19 @@ class Compositor {
         dawn::wire::ReservedTexture reservation;  // held until reply
     };
     std::vector<PendingImport> pendingImports_;  // keyed by reservation.handle.id
+
+    // JS-compositor dmabuf imports (importDmabufForJs). Like PendingImport but
+    // completion reports the injected texture handle to JS instead of building
+    // native compositing state.
+    struct PendingJsImport {
+        uint32_t importId;
+        uint32_t width;
+        uint32_t height;
+        dawn::wire::ReservedTexture reservation;  // held until reply
+    };
+    std::vector<PendingJsImport> pendingJsImports_;
+    std::vector<JsImportDone> completedJsImports_;
+    uint32_t nextJsImportId_ = 1;
     // Finish a completed import (success path): retire the superseded buffer,
     // adopt the injected texture, (re)build the bind group, mark present, and
     // report the surface as imported.

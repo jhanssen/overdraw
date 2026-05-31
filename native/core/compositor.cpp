@@ -1,6 +1,7 @@
 #include "compositor.h"
 
 #include <algorithm>
+#include <iterator>
 #include <cstdio>
 #include <vector>
 
@@ -391,6 +392,49 @@ bool Compositor::commitSurfaceDmabuf(uint32_t id, int fd, uint32_t width, uint32
     return true;
 }
 
+uint32_t Compositor::importDmabufForJs(int fd, uint32_t width, uint32_t height,
+                                       uint32_t drmFourcc, uint64_t modifier,
+                                       uint32_t offset, uint32_t stride) {
+    if (!device_ || width == 0 || height == 0 || fd < 0) return 0;
+
+    wgpu::TextureDescriptor td{};
+    td.size = {width, height, 1};
+    td.format = wgpu::TextureFormat::BGRA8Unorm;
+    td.usage = wgpu::TextureUsage::TextureBinding | wgpu::TextureUsage::CopySrc;
+    auto rt = link_->client().ReserveTexture(
+        device_.Get(), reinterpret_cast<const WGPUTextureDescriptor*>(&td));
+
+    link_->flush();
+    uint64_t wireSerial = link_->wireBytesQueued();
+
+    ipc::Message m{};
+    m.tag = ipc::Tag::ImportClientTex;
+    m.wireSerial = wireSerial;
+    m.device = {rt.deviceHandle.id, rt.deviceHandle.generation};
+    m.texture = {rt.handle.id, rt.handle.generation};
+    m.width = width;
+    m.height = height;
+    m.drmFourcc = drmFourcc;
+    m.modifier = modifier;
+    m.planeOffset = offset;
+    m.planeStride = stride;
+    m.planeCount = 1;
+    int fds[1] = {fd};
+    if (!ipc::sendMessageFds(ctrlFd_, m, fds, 1)) {
+        link_->client().ReclaimTextureReservation(rt);
+        return 0;
+    }
+    uint32_t importId = nextJsImportId_++;
+    pendingJsImports_.push_back({importId, width, height, rt});
+    return importId;
+}
+
+void Compositor::takeCompletedJsImports(std::vector<JsImportDone>& out) {
+    out.insert(out.end(), std::make_move_iterator(completedJsImports_.begin()),
+               std::make_move_iterator(completedJsImports_.end()));
+    completedJsImports_.clear();
+}
+
 void Compositor::finishImport(const PendingImport& pi) {
     ClientSurface& cs = clientSurfaces_[pi.surfaceId];
 
@@ -446,15 +490,34 @@ void Compositor::drainCtrl() {
             [&](const PendingImport& pi) {
                 return pi.reservation.handle.id == r.texture.id;
             });
-        if (it == pendingImports_.end()) continue;  // already handled / unknown
-        if (r.importOk) {
-            finishImport(*it);
-        } else {
-            std::fprintf(stderr, "[core] dmabuf import FAILED id=%u %ux%u\n",
-                         it->surfaceId, it->width, it->height);
-            link_->client().ReclaimTextureReservation(it->reservation);
+        if (it != pendingImports_.end()) {
+            if (r.importOk) {
+                finishImport(*it);
+            } else {
+                std::fprintf(stderr, "[core] dmabuf import FAILED id=%u %ux%u\n",
+                             it->surfaceId, it->width, it->height);
+                link_->client().ReclaimTextureReservation(it->reservation);
+            }
+            pendingImports_.erase(it);
+            continue;
         }
-        pendingImports_.erase(it);
+        // JS-compositor import: report the injected texture handle to JS.
+        auto jit = std::find_if(pendingJsImports_.begin(), pendingJsImports_.end(),
+            [&](const PendingJsImport& pi) {
+                return pi.reservation.handle.id == r.texture.id;
+            });
+        if (jit == pendingJsImports_.end()) continue;
+        if (r.importOk) {
+            completedJsImports_.push_back(
+                {jit->importId, jit->width, jit->height,
+                 wgpu::Texture::Acquire(jit->reservation.texture), true});
+        } else {
+            std::fprintf(stderr, "[core] dmabuf JS import FAILED id=%u %ux%u\n",
+                         jit->importId, jit->width, jit->height);
+            link_->client().ReclaimTextureReservation(jit->reservation);
+            completedJsImports_.push_back({jit->importId, 0, 0, wgpu::Texture(), false});
+        }
+        pendingJsImports_.erase(jit);
     }
 }
 

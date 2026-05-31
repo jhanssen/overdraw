@@ -102,7 +102,7 @@ export async function setupCompositor(opts = {}) {
     const device = dawn.wrapDevice(h.instance, h.device);
     const { JsCompositor } = await import("../dist/gpu/compositor.js");
     jsCompositor = new JsCompositor(device, dawn.globals, addon,
-      { width: dims.width, height: dims.height });
+      { width: dims.width, height: dims.height }, dawn, h.device);
   }
 
   state = await installProtocols(addon, {
