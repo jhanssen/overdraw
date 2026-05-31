@@ -19,11 +19,15 @@ import { join, isAbsolute, resolve as resolvePath } from "node:path";
 import { pathToFileURL } from "node:url";
 
 import type {
-  ConfigExport, OverdrawConfig, PluginConfig, ResolvedConfig, FocusPolicy,
+  ConfigExport, OverdrawConfig, PluginConfig, ResolvedConfig, ResolvedPlugin,
+  FocusPolicy, RestartPolicy,
 } from "./types.js";
 
 const CONFIG_EXTS = ["ts", "cts", "mts", "js", "cjs", "mjs"] as const;
 const FOCUS_POLICIES: readonly FocusPolicy[] = ["follow-pointer", "click-to-focus"];
+const RESTART_POLICIES: readonly RestartPolicy[] = ["on-failure", "never"];
+
+const PLUGIN_DEFAULTS = { restart: "on-failure" as RestartPolicy, maxRestarts: 3, windowSeconds: 60 };
 
 const DEFAULTS = {
   focus: { policy: "follow-pointer" as FocusPolicy, focusOnMap: true },
@@ -110,16 +114,38 @@ function normalize(raw: unknown, path: string): ResolvedConfig {
     }
   }
 
-  // plugins (DEFERRED: validated/stored, not consumed — see types.ts)
-  const plugins: PluginConfig[] = [];
+  // plugins
+  const plugins: ResolvedPlugin[] = [];
   if (cfg.plugins !== undefined) {
     if (!Array.isArray(cfg.plugins)) fail("`plugins` must be an array", path);
     cfg.plugins.forEach((p, i) => {
       if (p === null || typeof p !== "object") fail(`plugins[${i}] must be an object`, path);
-      if (typeof (p as PluginConfig).module !== "string" || (p as PluginConfig).module.length === 0) {
+      const raw = p as PluginConfig;
+      if (typeof raw.module !== "string" || raw.module.length === 0) {
         fail(`plugins[${i}].module must be a non-empty string`, path);
       }
-      plugins.push(p as PluginConfig);
+      if (raw.name !== undefined && (typeof raw.name !== "string" || raw.name.length === 0)) {
+        fail(`plugins[${i}].name must be a non-empty string`, path);
+      }
+      if (raw.restart !== undefined && !RESTART_POLICIES.includes(raw.restart)) {
+        fail(`plugins[${i}].restart must be one of ${RESTART_POLICIES.map((r) => `"${r}"`).join(", ")}`, path);
+      }
+      if (raw.maxRestarts !== undefined &&
+          (!Number.isInteger(raw.maxRestarts) || raw.maxRestarts < 0)) {
+        fail(`plugins[${i}].maxRestarts must be a non-negative integer`, path);
+      }
+      if (raw.windowSeconds !== undefined &&
+          (!Number.isFinite(raw.windowSeconds) || raw.windowSeconds <= 0)) {
+        fail(`plugins[${i}].windowSeconds must be a positive number`, path);
+      }
+      plugins.push({
+        module: raw.module,
+        name: raw.name ?? raw.module,
+        restart: raw.restart ?? PLUGIN_DEFAULTS.restart,
+        maxRestarts: raw.maxRestarts ?? PLUGIN_DEFAULTS.maxRestarts,
+        windowSeconds: raw.windowSeconds ?? PLUGIN_DEFAULTS.windowSeconds,
+        raw,
+      });
     });
   }
 

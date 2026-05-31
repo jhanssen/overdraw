@@ -1,0 +1,53 @@
+// The plugin SDK object handed to init(sdk) (architecture.md "Plugin SDK
+// surface"). Capabilities are enforced by the SHAPE of this object: a method
+// the plugin's grant doesn't include is simply absent (no in-band check).
+//
+// Scope B is lifecycle-only: there is no GPU, window, surface, output, capture,
+// input, or protocol surface yet. Those land with the GPU-backed plugin work.
+// What exists: identity, logging, and onShutdown registration.
+
+export type ShutdownCallback = () => void | Promise<void>;
+
+export interface PluginSdk {
+  // The plugin's stable name (config `name`, defaulting to its module).
+  readonly name: string;
+  // Structured log from the plugin, tagged + forwarded to the core.
+  log(...args: unknown[]): void;
+  // Register a graceful-shutdown callback. Awaited (with a timeout) by the core
+  // before the Worker is terminated. Forced shutdown (crash/watchdog) skips it.
+  onShutdown(cb: ShutdownCallback): void;
+}
+
+// Internal handle the bootstrap uses to drive the SDK (run the shutdown cb, etc.)
+// without exposing these controls on the plugin-facing object.
+export interface SdkControl {
+  sdk: PluginSdk;
+  runShutdown(): Promise<void>;
+}
+
+export function createSdk(name: string, emitLog: (line: string) => void): SdkControl {
+  let shutdownCb: ShutdownCallback | null = null;
+
+  const sdk: PluginSdk = {
+    name,
+    log(...args: unknown[]): void {
+      const line = args.map((a) => (typeof a === "string" ? a : safeStringify(a))).join(" ");
+      emitLog(line);
+    },
+    onShutdown(cb: ShutdownCallback): void {
+      if (typeof cb !== "function") throw new TypeError("onShutdown expects a function");
+      shutdownCb = cb;
+    },
+  };
+
+  return {
+    sdk,
+    async runShutdown(): Promise<void> {
+      if (shutdownCb) await shutdownCb();
+    },
+  };
+}
+
+function safeStringify(v: unknown): string {
+  try { return JSON.stringify(v); } catch { return String(v); }
+}

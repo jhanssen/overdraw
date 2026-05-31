@@ -4,7 +4,7 @@ Tracks what is built and empirically proven versus what is still design only.
 The design itself lives in `architecture.md`; this file is the ground truth for
 "what exists right now."
 
-Last updated: 2026-05-31 (rev 21).
+Last updated: 2026-05-31 (rev 22).
 
 ## Protocol gaps & skeletons (READ FIRST)
 
@@ -505,10 +505,74 @@ JS"). This is also the foundation for the future plugin `sdk.gpu`.
 else `$XDG_CONFIG_HOME/overdraw/config.*` then `~/.config/overdraw/config.*`,
 probing `.ts/.cts/.mts/.js/.cjs/.mjs` (Node 24 native type-stripping; no
 transpile). Default export may be an object or a (sync/async) function. Validates
-`focus`/`output`; the launcher applies them. 8 unit tests (`test/config.test.js`).
-- **DEFERRED**: a `plugins` array is parsed, validated, and reported but NOT
-  consumed — the plugin runtime does not exist (see "Not yet built"). The
-  launcher logs "N plugin(s) configured; plugin runtime not implemented yet".
+`focus`/`output`; the launcher applies them. Unit tests in `test/config.test.js`.
+- The `plugins` array is parsed, validated (`module` required; `name`/`restart`/
+  `maxRestarts`/`windowSeconds` validated), and resolved (defaults applied), and
+  is now CONSUMED by the plugin runtime (see "Plugin runtime (scope B)"). The
+  capability sub-grant schema is not yet validated (lands with the GPU/window
+  SDK).
+
+### Plugin runtime (scope B: isolation + lifecycle + watchdog + restart; NO GPU/SDK surface yet)
+A plugin module loads in its own worker_threads Worker, runs `init(sdk)`, and is
+contained + supervised per architecture.md ("Plugin model"/"Lifecycle"/
+"Isolation"/"Restart policy"). This is the lifecycle/isolation skeleton ONLY:
+there is intentionally NO GPU, window, surface, output, capture, input, or
+protocol SDK surface yet (those need the cross-device dmabuf producer/consumer
+path, which is unverified — see "dmabuf interop path", "Not done"). A plugin in
+scope B can do exactly: log, and register `onShutdown`.
+
+- `src/plugins/protocol.ts`: the architecture's Worker↔core envelope
+  (`{kind:'request'|'response'|'event'}`) with a pending-promise table, plus
+  `ping`/`pong` control messages (kept OUTSIDE the request table so watchdog
+  liveness never interacts with in-flight requests). Transport-agnostic
+  (`Channel`); `channelFor()` adapts a Worker/MessagePort with no cast.
+- `src/plugins/bootstrap.ts` (runs IN the Worker): builds the SDK, dynamically
+  `import()`s the plugin module, calls its default `init(sdk)`, reports
+  resolve/reject as an `init` event, auto-pongs pings (responsive event loop =
+  liveness), and handles the `shutdown` request by running `onShutdown`.
+- `src/plugins/sdk.ts`: the capability-shaped SDK object. Scope B exposes
+  `name`, `log(...)`, `onShutdown(cb)`. All GPU/window/etc. methods are ABSENT
+  (capabilities enforced by object shape per the design).
+- `src/plugins/runtime.ts`: `PluginRuntime` owns one Worker per plugin with
+  `resourceLimits.maxOldGenerationSizeMb` (heap cap), the lifecycle state
+  machine (`spawning`→`live`→`shutting-down`/`failed`), the **watchdog**
+  (core pings every N ms; >K missed pongs → `worker.terminate()`), and the
+  **restart policy** (`on-failure` up to `maxRestarts` in a rolling
+  `windowSeconds`, then permanently `failed`; `never` disables; init failure
+  counts toward the budget). Graceful `stop()` awaits `onShutdown` up to
+  `shutdownTimeoutMs` then terminates; forced paths (crash/OOM/watchdog) skip
+  the callback. Timing tunables are injectable (fast tests).
+- Wired into `src/main.ts`: configured plugins load after the server is up;
+  plugin `module` paths (absolute / `./` / `../`) resolve relative to the config
+  file's dir, bare specifiers pass through. Plugin `log` events are printed.
+- **Verified** (`test/plugins.test.js`, GPU-free `node --test`, spawning REAL
+  Workers + real fixture plugins in `test/fixtures/plugins/`): well-behaved
+  plugin reaches `live`; init reject / missing-default-export → `failed`;
+  graceful stop runs `onShutdown`; never-resolving `onShutdown` hits the
+  shutdown timeout (no hang); a LIVE plugin that wedges its event loop in a hot
+  loop is terminated by the watchdog and, after exhausting the restart budget,
+  ends `failed`; OOM past the heap cap aborts the Worker and drives restart;
+  multiple plugins are independent (one fails, one stays live). **PASS.**
+- **GAPS / unbuilt (flagged):**
+  - **No GPU/window/surface/output/capture/input/protocol SDK.** A scope-B
+    plugin cannot draw, take input, or implement a protocol. The producer/
+    consumer surface path it would use is unproven cross-device (see "dmabuf
+    interop path"). This is the next plugin milestone, not done.
+  - **No native-import restriction.** architecture.md says a custom Worker
+    module loader rejects non-allowlisted native addons. NOT built — a scope-B
+    plugin's `import()` is unrestricted. Deferred until there is an SDK native
+    addon to allowlist; until then plugins are NOT sandboxed against loading
+    arbitrary native modules. (Acceptable per "malicious plugins out of scope,"
+    but it is a real unbuilt isolation control, flagged here so it is not
+    mistaken for done.)
+  - **Watchdog limit.** A missed pong proves the Worker EVENT LOOP isn't
+    turning (catches hot loops + JS-level blocking). A plugin blocked in a
+    synchronous NATIVE call would also miss pongs, but `terminate()` acts at JS
+    boundaries and may not interrupt arbitrary native blocking. Scope B has no
+    plugin-facing blocking native calls, so this is moot today; relevant once
+    the SDK gains native methods.
+  - **No capability sub-grant enforcement / config schema.** `capabilities` in
+    plugin config is not validated or applied (no capabilities exist to grant).
 
 ### Compositing (multi-surface: per-surface placement + stacking + blending)
 - The textured-quad compositing pass runs in JS (`src/gpu/compositor.ts`; see
@@ -1026,9 +1090,12 @@ Menus/dropdowns/tooltips: a compositor-positioned, input-grabbing child surface.
 - **JS-owned core breadth.** The core is C++ + Node with a working trampoline
   and a frame event callback, but the protocol-handler/WM/plugin layers that
   "JS owns" per the design are unwritten.
-- **Plugin model.** SDK, Worker isolation, watchdog, capability grants, restart
-  policy — none built. (The dmabuf surface buffer path the SDK drives is proven
-  single-device; see "dmabuf interop path".) The capture/takeover design — one
+- **Plugin model.** Worker isolation, lifecycle, watchdog, and restart policy
+  ARE built (scope B — see "Plugin runtime (scope B)"). Still NOT built: the
+  GPU/window/surface/output/capture/input/protocol SDK surface, capability
+  grants/enforcement, and the native-import restriction. (The dmabuf surface
+  buffer path the SDK would drive is proven single-device only; see "dmabuf
+  interop path".) The capture/takeover design — one
   producer/consumer primitive run in both directions (plugin-on-top vs.
   plugin-captures/takes-over), capture uniform over the surface graph, the
   reversed-OffscreenCanvas model, and the overview-animation worked example — is
