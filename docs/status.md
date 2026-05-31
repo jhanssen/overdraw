@@ -4,7 +4,7 @@ Tracks what is built and empirically proven versus what is still design only.
 The design itself lives in `architecture.md`; this file is the ground truth for
 "what exists right now."
 
-Last updated: 2026-05-30 (rev 16).
+Last updated: 2026-05-30 (rev 17).
 
 ## Protocol gaps & skeletons (READ FIRST)
 
@@ -184,6 +184,46 @@ server) topology runs as real, non-spike code and presents to a host window:
     inbound `HandleCommands` must stay on Node). The buffered transport already
     makes this a clean producer/consumer seam. NOT done; no measured write-path
     bottleneck yet.
+
+### GPU process threading (Dawn facts verified; NOT yet implemented)
+The GPU process pump (wire decode + `HandleCommands` + `DeviceTick` + present) is
+**single-threaded today**. There is no measured bottleneck (steady state ~190 Hz),
+but the design admits true parallelism because core and each plugin are independent
+devices. Verified against the vendored Dawn (`~/dev/dawn`) so the threading model
+rests on facts, not assumptions:
+
+- **Each `wgpu::Device` is its own `VkDevice`.** `Device::Initialize` →
+  `CreateDevice` → `vkCreateDevice` per Dawn device, on the shared
+  `VkPhysicalDevice` (`src/dawn/native/vulkan/DeviceVk.cpp:129,758`). So core + each
+  plugin get distinct `VkDevice`/`VkQueue`s and distinct submit timelines — no
+  driver-side serialization point between them. Cross-device sharing is
+  dmabuf-import-per-device + `SharedFence` (`SharedTextureMemoryVk.cpp` imports the
+  dmabuf as a fresh `VkDeviceMemory`/`VkImage` on each `GetVkDevice()`), NOT a shared
+  device handle or any GL-style shared-object namespace.
+- **Dawn is thread-safe only under `Feature::ImplicitDeviceSynchronization`**
+  (stable; `src/dawn/native/Features.cpp:168`), which makes public API methods safe
+  across threads via a **per-device** `DeviceMutex` (`Device.h:694`) — with two
+  caveats: (1) command **encoding is excluded** (encoders are never thread-safe;
+  each must live on one thread), and (2) it is a lock, so calls to the *same* device
+  serialize (correctness, not parallelism).
+- **Implied model: thread-per-connection ownership, NOT the global feature.** Because
+  the mutex is per-device, the clean design is one OS thread per wire connection,
+  each thread *exclusively* owning its device (read socket → `HandleCommands` →
+  encode + submit → `DeviceTick`). No device is touched by two threads, so
+  `ImplicitDeviceSynchronization` is unnecessary (avoids the lock overhead AND the
+  encoding restriction) and core/plugins ingest + submit in genuine parallel.
+  Reserve the feature only for a device that must be touched by >1 thread.
+- **What stays shared and must be guarded (NOT shardable per connection):** the
+  `wgpu::Instance`/adapter, the GBM allocator, and the single DRM-master/KMS state
+  (scanout ring + page-flip loop). Natural shape: N parallel per-connection device
+  threads + one KMS/present thread owning the scanout ring + shared instance/allocator
+  behind their own locks.
+- Structurally simple (the per-connection seam mostly exists), but not literally
+  trivial: the shared instance/allocator/KMS state above needs explicit locking, and
+  Dawn-internal callback threads must be kept on the owning thread (pump
+  `AllowProcessEvents` there) or routed carefully. **Decision: do it; sequence after
+  the phase-2 KMS present loop lands so the KMS/present thread is the obvious home
+  for the shared bits.** No correctness blocker found.
 
 ### JS layer / event loop (core is C++ + Node)
 - The core is C++ + Node as the architecture specifies. Node owns `main()` and
@@ -900,7 +940,17 @@ Menus/dropdowns/tooltips: a compositor-positioned, input-grabbing child surface.
   "JS owns" per the design are unwritten.
 - **Plugin model.** SDK, Worker isolation, watchdog, capability grants, restart
   policy — none built. (The dmabuf surface buffer path the SDK drives is proven
-  single-device; see "dmabuf interop path".)
+  single-device; see "dmabuf interop path".) The capture/takeover design — one
+  producer/consumer primitive run in both directions (plugin-on-top vs.
+  plugin-captures/takes-over), capture uniform over the surface graph, the
+  reversed-OffscreenCanvas model, and the overview-animation worked example — is
+  recorded in architecture.md ("The producer/consumer primitive"). Unbuilt; also
+  presupposes a workspace/WM layer that does not exist yet. A concrete buildable
+  starting point — generic plugin-composited surfaces (overlay/decoration provider:
+  request->core-grants-geometry->plugin-populates, stack-layer model, window-state
+  events, inset + interactive-region declarations, 3-step build order) — is specced
+  in architecture.md ("First plugin milestone: generic plugin-composited surfaces").
+  This is the next thing to pick up.
 - **Multi-surface / real compositing.** Multiple surfaces, transforms, opacity,
   blending, client buffers, multi-output, damage — none done.
 - **Cross-thread N-API marshaling.** `napi_threadsafe_function` for Dawn-thread

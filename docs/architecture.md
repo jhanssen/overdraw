@@ -399,6 +399,162 @@ A plugin cannot inject GPU commands into the core's render pass; it
 contributes buffers and policy. Shared-device drawing would forfeit
 isolation and is out of scope.
 
+### The producer/consumer primitive (one mechanism, two directions)
+
+"Plugin renders on top" (tiers 1/2 contribution) and "plugin captures /
+takes over" (tier 3, and tier-2 takeover) are the **same primitive run in
+opposite directions**, not two subsystems. Building it once is the goal.
+
+The primitive: a producer renders into its own ring of dmabuf-backed
+buffers (2-3, dual-imported as `SharedTextureMemory` into both the
+producer's and the consumer's device, see "Dmabuf-backed surfaces"); the
+consumer samples the **most-recently-presented** buffer (latest-wins, drop
+superseded); a `SharedFence` from the producer's `EndAccess` is waited on in
+the consumer's `BeginAccess` (producer-done-before-consumer-read, on the GPU
+timeline, no CPU handshake); the buffer the consumer is reading returns to
+the producer's free pool once the consumer's sample submit completes. The
+two sides run on their own frame clocks, **one frame pipelined**, concurrent
+on separate `VkDevice`s (verified; see status.md "GPU process threading").
+
+- **Contribution (forward):** plugin is producer, core is consumer. The
+  core samples the plugin's latest presented buffer into its compositing
+  pass and blends it over the scene (premultiplied; see "Compositing").
+- **Capture / takeover (reverse):** core is producer, plugin is consumer.
+  The core keeps *rendering* but redirects output from scanout into a
+  capture ring; the plugin samples the core's latest presented frame as a
+  texture. On full output takeover the plugin also becomes the thing that
+  *presents* to that output (tier 2): core produces source frames, plugin
+  composites + presents. This is the "reversed OffscreenCanvas": the core's
+  composited output is an OffscreenCanvas the plugin samples, exactly as a
+  plugin surface is an OffscreenCanvas the core samples.
+
+Capture is **uniform over the surface graph**, not an API per renderable.
+Everything the core draws is a `Surface` (client, plugin, and internal
+targets are indistinguishable to compositing). Any *node* in that graph — a
+single surface, a per-workspace composited target, a whole output, or
+another plugin's surface — can be designated a capture target, meaning
+"render this node into a `SharedTextureMemory` texture and publish a
+per-frame ready+fence event stream for it." So the SDK is one
+`capture(node, opts)` selector, capability-gated (tier 3 is the
+gate-carefully tier; raw per-surface forwarding ~= a screen recorder), not
+`subscribeWorkspace`/`subscribeOutput`/`subscribeWindow` as separate calls.
+
+Two constraints keep "subscribe to anything" honest:
+
+- **A node is only capturable if the core has a reason to render it into a
+  texture.** Capturing something the core wasn't already rendering (e.g. an
+  off-screen workspace) means adding a render pass + its cost; this is where
+  per-node damage/dirty tracking matters (idle nodes reuse their last
+  texture). Subscription is push-based: the producer renders on its own
+  clock and posts one-way `capture.frame(subscriptionId, slot, fence)`
+  events; the consumer samples the latest at its own tick. NEVER synchronous
+  per-frame RPC (that risks blowing the frame budget on a dependency chain).
+- **Ownership transfer is fence-gated, not message-gated.** A plugin asking
+  the core to "stop rendering so I can take this texture" must receive the
+  GPU-completion fence for the core's final submit (the existing
+  `OnSubmittedWorkDone`/submit-serial), waited in the plugin's first
+  `BeginAccess`. A CPU-side "acked" says nothing about whether the GPU is
+  done — relying on it is the race.
+
+A `getCurrentCoreTexture(node)`-style call returns the core's render target
+for that node dual-imported into the plugin's device, **plus** the
+completion fence — the source, not the scanout destination. (Sampling the
+core's own workspace render target is the zero-copy form of capture: no
+separate "capture texture" copy.) Note the source/destination distinction:
+the output/scanout buffer is where pixels *land*; an overview animation
+needs the workspace *as a source* to shrink, which is a different texture.
+
+**Overview animation (worked example).** A workspace-overview plugin starts
+exactly as the live desktop renders, then shrinks it and reveals other
+workspaces. Snapshot form (cheapest, GNOME-style, recommended v1): capture
+each workspace target ONCE at takeover (fence-gated), animate the frozen
+textures entirely on the plugin's clock — zero per-frame core<->plugin
+messaging, and "start exactly as core rendered" is automatic. Live form
+(workspaces keep updating while shrinking): the core keeps re-rendering each
+subscribed workspace and pushes frame events; the plugin re-samples; needs
+per-workspace dirty tracking to be affordable. The seamless present handoff
+between core-live and plugin-takeover (no dropped/duplicated frame at the
+switch vblank) is a separate hard detail, distinct from the buffer sharing.
+
+### First plugin milestone: generic plugin-composited surfaces
+
+A concrete, buildable target that turns the producer/consumer primitive into a
+real feature and is the foundation for decorations, overlays, panels, and HUDs
+(all of which become thin policy bundles on top of it). NOT yet built; this is
+the spec to implement. The guiding shape: **the plugin requests, the core
+decides authoritative geometry and allocates, the plugin populates.** A plugin
+never invents surface sizes — it declares intent, the core computes the real
+rect (only it knows the window's outer rect, output size, layout) and hands
+back the truth; the plugin renders to what it is given. This mirrors the
+existing surface-resize contract (`window.resize()` returns the actual granted
+size; pool generations retire on resize — see "Surface lifecycle").
+
+The milestone is the smallest end-to-end path: **one plugin produces one
+surface that the core composites on top of the scene at a core-decided rect,
+with input routed per the plugin's declaration.** Decorations follow by adding
+"bound to a window's reserved edge insets" as the placement policy.
+
+Three things the plugin tells the core (declarations / requests):
+
+- **Overlay placement** (free-floating use): `createOverlay({ layer, anchor,
+  size })` -> core returns the actual rect + the allocated surface. `layer` is
+  the stack-layer (below); `anchor`/`size` are a request the core may clamp to
+  the output.
+- **Decoration insets** (window-bound use): `requestInsets(windowId,
+  {top,right,bottom,left})` -> core reserves that edge space, recomputes the
+  window's inner (content) rect, and returns the actual insets + the decoration
+  surface rect granted (it MAY clamp/override — e.g. zero side insets when
+  maximized). Insets flow plugin->core; resulting geometry flows core->plugin.
+- **Interactive regions**: rects in surface-local coords tagged with semantics
+  -- `move` (drag => interactive move), `resize:<edge|corner>` (=> interactive
+  resize), `action:<close|maximize|minimize>` (=> core performs the WM action),
+  `custom:<id>` (=> core forwards a click event to the plugin). The core
+  hit-tests against these; anything interactive MUST be declared here because
+  the core owns hit-testing (the renderer/shader is purely presentational).
+
+What the core tells the plugin (events; all one-way, push, never per-frame RPC):
+
+- **Window-state stream** (decoration use): created/destroyed, focus
+  gained/lost, **resized (new outer + inner + decoration rects)**,
+  maximized/fullscreen toggled, title/app_id changed. The plugin re-renders the
+  affected decoration ONLY on these events (idle windows reuse their last
+  buffer -- decorations are static between state changes).
+- **Authoritative surface size** for each overlay/decoration surface, so the
+  plugin allocates its buffer ring at the right dimensions and reallocates
+  (pool-generation retire) on size change.
+- **Frame ticks** (`surface.onFrame`) for surfaces that animate; static
+  decorations need not subscribe.
+- **Input events** for `custom:` regions and any input the surface accepts.
+
+Surface ownership: core-allocated, plugin-populated. The core brokers the
+dmabuf ring at the size it computed (the producer/consumer primitive, plugin =
+producer); the plugin reserves texture handles and renders into them on its own
+device; the core samples the latest presented buffer (fence-waited,
+premultiplied) into its compositing pass at the rect + stack-layer it decided.
+
+Minimal stack-layer model (new): an ordered set of layers the core composites
+back-to-front -- e.g. `background < below < content < above < overlay`.
+Client/plugin windows live in `content`; decorations bind just behind their
+window's content; overlays pick a layer. This is the smallest generalization of
+the current single flat `stack_` that lets "above/below content" be expressed
+without a full layout engine.
+
+New capability implied: a **decoration/surface provider** tier, distinct from
+surface-provider (tier 1, "my own windows") and output-takeover (tier 2, "the
+whole output"): "render surfaces bound to windows the core lays out (or to a
+chosen layer), declaring insets and interactive regions." It carries a
+capture-like privilege (the provider sees every window's title/state), so it is
+gated deliberately like tier 3.
+
+Build order: (1) the generic plugin-surface producer/consumer primitive +
+`createOverlay` + the stack-layer model (prove one animated overlay composites
+on top, end to end); (2) the window-state event stream + `requestInsets` +
+interactive-region declaration + hit-test routing (this also forces the
+currently-no-op `xdg_toplevel` move/resize/maximize into real behavior -- see
+status.md "Protocol gaps"); (3) decorations as a thin policy bundle on top
+(bind a provider surface to each window's reserved insets). Each later step is
+small once (1) is generic.
+
 ## Wayland protocols: implementation layers
 
 Wayland is the compositor's external API. Real clients (browsers,
