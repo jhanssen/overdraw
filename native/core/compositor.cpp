@@ -429,6 +429,16 @@ uint32_t Compositor::importDmabufForJs(int fd, uint32_t width, uint32_t height,
     return importId;
 }
 
+void Compositor::releaseDmabufImport(uint32_t importId) {
+    auto it = jsImportHandles_.find(importId);
+    if (it == jsImportHandles_.end()) return;
+    ipc::Message m{};
+    m.tag = ipc::Tag::ReleaseClientTex;
+    m.texture = {it->second.id, it->second.generation};
+    ipc::sendMessage(ctrlFd_, m);
+    jsImportHandles_.erase(it);
+}
+
 void Compositor::takeCompletedJsImports(std::vector<JsImportDone>& out) {
     out.insert(out.end(), std::make_move_iterator(completedJsImports_.begin()),
                std::make_move_iterator(completedJsImports_.end()));
@@ -508,6 +518,8 @@ void Compositor::drainCtrl() {
             });
         if (jit == pendingJsImports_.end()) continue;
         if (r.importOk) {
+            jsImportHandles_[jit->importId] =
+                {jit->reservation.handle.id, jit->reservation.handle.generation};
             completedJsImports_.push_back(
                 {jit->importId, jit->width, jit->height,
                  wgpu::Texture::Acquire(jit->reservation.texture), true});

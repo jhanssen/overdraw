@@ -49,11 +49,15 @@ import type { CompositorSink } from "../protocols/ctx.js";
 // Minimal slice of the native addon this module needs.
 export interface CompositorAddon {
   shmView(poolId: number, offset: number, length: number): ArrayBuffer | null;
-  // Async dmabuf import (server-side reserve/inject). cb(handle|null). `fd` is a
-  // WaylandFd (the native side peeks it without consuming).
+  // Async dmabuf import (server-side reserve/inject). Returns a monotonic
+  // importId (0 = could not start); cb(handle|null) fires on completion. `fd` is
+  // a WaylandFd (the native side peeks it without consuming).
   createTextureFromDmabuf(
     fd: unknown, w: number, h: number, fourcc: number, modHi: number, modLo: number,
-    offset: number, stride: number, cb: (handle: bigint | null) => void): void;
+    offset: number, stride: number, cb: (handle: bigint | null) => void): number;
+  // Release a dmabuf import (drops the server STM + fd). Called once the buffer
+  // is freed (GPU-completion-gated) or the surface is removed.
+  releaseDmabufImport(importId: number): void;
 }
 
 // The dawn.node wire binding bits the compositor needs for dmabuf surfaces.
@@ -74,13 +78,16 @@ interface Surface {
   layoutH: number;
   present: boolean;
   // dmabuf: the wl_buffer id currently backing this surface (0 = shm/none), for
-  // the zero-copy buffer-release lifecycle.
+  // the zero-copy buffer-release lifecycle, and the native importId for releasing
+  // the server-side STM/fd (0 = shm/none).
   currentBufferId: number;
+  currentImportId: number;
 }
 
 // A dmabuf buffer awaiting GPU-completion of the last frame that sampled it,
-// after which the client may reuse it (wl_buffer.release).
-interface RetiringBuffer { bufferId: number; retireSerial: number; tex: any; }
+// after which the client may reuse it (wl_buffer.release) and the server-side
+// import may be released (importId).
+interface RetiringBuffer { bufferId: number; importId: number; retireSerial: number; tex: any; }
 
 const FORMAT = "bgra8unorm";
 
@@ -165,7 +172,13 @@ export class JsCompositor implements CompositorSink {
     else this.surfaces.set(id, blankSurface(x, y, w, h));
   }
 
-  removeSurface(id: number): void { this.surfaces.delete(id); }
+  removeSurface(id: number): void {
+    const s = this.surfaces.get(id);
+    // Release the surface's live dmabuf import (its retiring buffers are released
+    // on their own completion in reapRetiring).
+    if (s && s.currentImportId !== 0) this.addon.releaseDmabufImport(s.currentImportId);
+    this.surfaces.delete(id);
+  }
 
   // Upload a committed shm buffer into the surface's sampled texture (zero-copy
   // from the client mapping via addon.shmView), and report it as presentable.
@@ -191,27 +204,31 @@ export class JsCompositor implements CompositorSink {
       }
       return false;
     }
-    this.addon.createTextureFromDmabuf(fd, w, h, fourcc, modHi, modLo, offset, stride,
+    const importId = this.addon.createTextureFromDmabuf(
+      fd, w, h, fourcc, modHi, modLo, offset, stride,
       (handle) => {
-        if (handle === null) return; // import failed
+        if (handle === null) { if (importId) this.addon.releaseDmabufImport(importId); return; }
         const tex = this.dawn!.wrapTexture(this.deviceHandle, handle);
-        this.installDmabuf(id, tex, w, h, bufferId);
+        this.installDmabuf(id, tex, w, h, bufferId, importId);
       });
-    return true;
+    return importId !== 0;
   }
 
   // Install a freshly-imported dmabuf texture on the surface, retiring the buffer
   // it supersedes (freed once the last frame that sampled it completes).
-  private installDmabuf(id: number, tex: any, w: number, h: number, bufferId: number): void {
+  private installDmabuf(id: number, tex: any, w: number, h: number,
+                        bufferId: number, importId: number): void {
     let s = this.surfaces.get(id);
     if (!s) { s = blankSurface(0, 0, 0, 0); this.surfaces.set(id, s); }
 
     if (s.currentBufferId !== 0 && s.currentBufferId !== bufferId && s.texture) {
       // The old buffer was sampled by every frame up to the latest submit; it is
       // free once that submit completes. Keep its texture alive until then.
-      this.retiring.push({ bufferId: s.currentBufferId, retireSerial: this.submitSerial, tex: s.texture });
+      this.retiring.push({ bufferId: s.currentBufferId, importId: s.currentImportId,
+                           retireSerial: this.submitSerial, tex: s.texture });
     }
     s.currentBufferId = bufferId;
+    s.currentImportId = importId;
     s.texture = tex;
     s.view = tex.createView();
     s.width = w;
@@ -251,8 +268,13 @@ export class JsCompositor implements CompositorSink {
     if (this.retiring.length === 0) return;
     const keep: RetiringBuffer[] = [];
     for (const r of this.retiring) {
-      if (r.retireSerial <= this.completedSerial) this.freed.push(r.bufferId); // drop r.tex
-      else keep.push(r);
+      if (r.retireSerial <= this.completedSerial) {
+        this.freed.push(r.bufferId);                       // -> wl_buffer.release
+        if (r.importId !== 0) this.addon.releaseDmabufImport(r.importId); // drop server STM/fd
+        // r.tex reference is dropped here (entry not kept).
+      } else {
+        keep.push(r);
+      }
     }
     this.retiring = keep;
   }
@@ -378,6 +400,6 @@ function blankSurface(x: number, y: number, w: number, h: number): Surface {
   return {
     texture: null, view: null, placementBuf: null, bindGroup: null,
     width: 0, height: 0, x, y, layoutW: w, layoutH: h, present: false,
-    currentBufferId: 0,
+    currentBufferId: 0, currentImportId: 0,
   };
 }

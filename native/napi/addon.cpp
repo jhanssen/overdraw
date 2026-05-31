@@ -507,9 +507,22 @@ napi_value CreateTextureFromDmabuf(napi_env env, napi_callback_info info) {
         napi_get_null(env, &nul);
         napi_call_function(env, undefined, cb, 1, &nul, nullptr);
         napi_delete_reference(env, cbRef);
-        return nullptr;
+        napi_value zero; napi_create_uint32(env, 0, &zero);
+        return zero;
     }
     g_jsImportCbs[importId] = cbRef;
+    napi_value out; napi_create_uint32(env, importId, &out);
+    return out;  // JS uses this importId to release later
+}
+
+// releaseDmabufImport(importId) -> undefined
+napi_value ReleaseDmabufImport(napi_env env, napi_callback_info info) {
+    size_t argc = 1; napi_value argv[1];
+    napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+    if (!g_addon.compositor) return nullptr;
+    uint32_t importId = 0;
+    napi_get_value_uint32(env, argv[0], &importId);
+    if (importId != 0) g_addon.compositor->releaseDmabufImport(importId);
     return nullptr;
 }
 
@@ -1224,6 +1237,10 @@ napi_value Init(napi_env env, napi_value exports) {
     napi_create_function(env, "createTextureFromDmabuf", NAPI_AUTO_LENGTH,
                          CreateTextureFromDmabuf, nullptr, &fnCreateTexDmabuf);
     napi_set_named_property(env, exports, "createTextureFromDmabuf", fnCreateTexDmabuf);
+    napi_value fnReleaseDmabuf;
+    napi_create_function(env, "releaseDmabufImport", NAPI_AUTO_LENGTH,
+                         ReleaseDmabufImport, nullptr, &fnReleaseDmabuf);
+    napi_set_named_property(env, exports, "releaseDmabufImport", fnReleaseDmabuf);
     napi_create_function(env, "startServer", NAPI_AUTO_LENGTH, StartServer, nullptr, &fnStartServer);
     napi_create_function(env, "stopServer", NAPI_AUTO_LENGTH, StopServer, nullptr, &fnStopServer);
     napi_value fnRegister, fnCreateGlobal, fnPostEvent, fnRegisterIface;

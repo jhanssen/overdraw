@@ -73,6 +73,12 @@ class Compositor {
                           wgpu::Texture tex; bool ok; };
     void takeCompletedJsImports(std::vector<JsImportDone>& out);
 
+    // Release a JS dmabuf import: tells the GPU process to drop the imported STM +
+    // dmabuf fd for this importId (generation-matched, so a recycled handle id is
+    // not freed by mistake). Called when the JS compositor frees the buffer (its
+    // last sampling frame completed) or the surface is removed. No-op if unknown.
+    void releaseDmabufImport(uint32_t importId);
+
     // linux-dmabuf-v1 default-feedback data captured from the GPU process during
     // bring-up. `formatTableFd` is an owned read-only memfd of 16-byte
     // {format,pad,modifier} records (mmap by the client); -1 if none was sent.
@@ -262,6 +268,10 @@ class Compositor {
     std::vector<PendingJsImport> pendingJsImports_;
     std::vector<JsImportDone> completedJsImports_;
     uint32_t nextJsImportId_ = 1;
+    // importId -> the injected texture's wire handle {id,generation}, kept so a
+    // later releaseDmabufImport can address the GPU-side entry. Erased on release.
+    struct WireHandleId { uint32_t id; uint32_t generation; };
+    std::unordered_map<uint32_t, WireHandleId> jsImportHandles_;
     // Finish a completed import (success path): retire the superseded buffer,
     // adopt the injected texture, (re)build the bind group, mark present, and
     // report the surface as imported.

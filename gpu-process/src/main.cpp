@@ -359,6 +359,7 @@ int run(int wireFd, int ctrlFd, int inputFd, bool headless,
         wgpu::SharedTextureMemory mem;
         wgpu::Texture tex;
         int fd = -1;
+        uint32_t generation = 0;  // wire handle generation, for release matching
     };
     std::unordered_map<uint32_t, ClientTex> clientTextures;
 
@@ -434,6 +435,7 @@ int run(int wireFd, int ctrlFd, int inputFd, bool headless,
         if (ok) {
             serializer.Flush();
             ct.fd = cb.fd;
+            ct.generation = m.texture.generation;
             clientTextures[m.texture.id] = std::move(ct);
             reply.importOk = 1;
         } else {
@@ -555,6 +557,15 @@ int run(int wireFd, int ctrlFd, int inputFd, bool headless,
                     // Wire reader has not reached the serial yet; defer until it has
                     // (drainPendingImports runs after each wire pump). We own recvFds[0].
                     pendingImports.push_back({m, recvFds[0]});
+                }
+            } else if (m.tag == ipc::Tag::ReleaseClientTex) {
+                // Release a JS-compositor dmabuf import: drop the STM + close the
+                // fd, but only if the entry's generation still matches (the handle
+                // id may have been recycled into a newer import).
+                auto it = clientTextures.find(m.texture.id);
+                if (it != clientTextures.end() && it->second.generation == m.texture.generation) {
+                    if (it->second.fd >= 0) ::close(it->second.fd);
+                    clientTextures.erase(it);
                 }
             }
         }

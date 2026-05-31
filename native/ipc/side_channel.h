@@ -30,6 +30,9 @@ enum class Tag : uint8_t {
     ImportClientTex = 'M',  // core -> gpu : import a CLIENT dmabuf fd (SCM_RIGHTS) into
                             //              a texture at the reserved handle
     ClientTexImported = 'm',  // gpu -> core: client dmabuf imported + injected (or failed)
+    ReleaseClientTex = 'r',   // core -> gpu : release a client-dmabuf import (texture =
+                              //              {id,generation}); GPU drops the STM + fd if
+                              //              the entry's generation still matches.
     BeginAccess  = 'B',  // core -> gpu : begin access on the STM (before wire render)
     BeginDone    = 'b',  // gpu  -> core: BeginAccess applied + flushed
     EndAccess    = 'E',  // core -> gpu : end access on the STM (after wire render)
