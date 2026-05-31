@@ -998,6 +998,40 @@ Wayland surfaces do — the compositing layer sees both as overdraw
 `Surface` objects with a current `wgpu::Texture` handle. The
 origin (plugin vs. Wayland client) is invisible to compositing.
 
+#### Frame clock: the trigger must originate at the display
+
+The loop is **event-driven off a display-side completion signal, NOT a
+timer.** The clock originates where the display lives (the GPU process — the
+host `wl_surface` in phase 1, the KMS connector in phase 2) and is propagated
+to the core; the core does not invent its own cadence. A core-side fixed timer
+(e.g. a 16ms `uv_timer`) is wrong: it has no causal link to the display's
+refresh, so it beats against the real vsync (render frames the display never
+shows = waste/stutter; render late = jank; and under direct KMS it risks
+tearing/stalls). See status.md for the current implementation's divergence from
+this (it uses a timer today — a known shortcut, because Dawn's phase-1 WSI
+swapchain hides the host frame callback).
+
+- **Phase 2 (clean):** the GPU process owns KMS, so it directly receives the
+  DRM page-flip event. On page-flip it emits a side-channel `FrameDone` event
+  (vblank time, freed ring slot) to the core. The core's loop wakes on that
+  event → snapshot → render into the next ring slot over the wire → send
+  `Present { slot }` → GPU process commits. No timer. (`FrameDone`/`Present`
+  are the commit/page-flip side-channel messages noted as "not in v1" above;
+  they are the phase-2 frame clock.)
+- **Phase 1 (entangled):** Dawn's WSI swapchain owns `Present` and hides the
+  host `wl_surface.frame` callback, so the trigger above is not directly
+  available. Options: present FIFO so `GetCurrentTexture` blocks on host vsync
+  (rejected once — a blocking acquire on the GPU process's single command
+  thread stalled all other wire work; would need the acquire off that thread),
+  or present via our own `wl_surface` instead of Dawn's WSI so we can register
+  the frame callback explicitly. Until resolved, phase 1 uses the timer
+  shortcut (status.md).
+- **Plugin pacing:** the core fans the frame trigger out to plugin workers as
+  `surface.onFrame` postMessage ticks (the rAF analog). The core's own
+  compositing loop gets the trigger directly over the side channel (no extra
+  hop); plugins take one postMessage hop and may slip frames (reuse last
+  buffer), which is acceptable per "Frame pacing and threading".
+
 ### Multi-output
 
 - One compositing pass per output. Separate output textures, separate
@@ -1117,6 +1151,58 @@ No discovery, no drop-in directories. Single source of truth.
   export `SharedFence` sync-fd, pass as `IN_FENCE_FD` to atomic commit,
   import `OUT_FENCE` back.
 - Core's main thread `SCHED_RR`.
+
+#### Phase-2 present: a self-managed scanout swapchain (no Dawn surface)
+
+In phase 2 there is **no `wgpu::Surface` / Dawn swapchain** — that is a phase-1
+nested artifact (it exists only because we present into a host `wl_surface`).
+On bare KMS we render into GBM-backed `SharedTextureMemory` textures and KMS
+does the present. It is a hand-rolled swapchain: Dawn is reduced to "render into
+this texture"; acquire/present/sync are ours. Maps to classic Vulkan WSI as:
+the N GBM bos = swapchain images; "acquire" = pick a free ring slot (driven by
+page-flip + OUT_FENCE, not Dawn); "present" = `drmModeAtomicCommit`; the
+acquire/present semaphores = the `SharedFence` sync-fds we manage via
+`BeginAccess`/`EndAccess`.
+
+A ring of **3 scanout buffers** (2 is the minimum that's correct; 3 to never
+stall — one front/scanning-out, one pending-flip, one free to render; only one
+flip may be pending at a time, so 2 buffers idle the GPU between commit and
+page-flip). Each ring slot:
+
+- a `gbm_bo` (`SCANOUT | RENDERING`, modifier from the intersection of the
+  plane's `IN_FORMATS` ∩ Dawn-importable ∩ GBM-allocatable);
+- registered as a KMS framebuffer (`drmModeAddFB2WithModifiers` → `fb_id`);
+- imported as `SharedTextureMemory` → `wgpu::Texture(RenderAttachment)`,
+  `InjectTexture`'d at a core-reserved wire handle (the core composites into it
+  over the wire, exactly as it injects client dmabufs today).
+
+Per-frame fence dance (both are already-proven primitives; see "Validated
+against Dawn" and the implicit-sync acquire in status.md):
+
+- **IN_FENCE (GPU → display):** after the core's composite submit, the GPU
+  process `EndAccess`es the slot → `SharedFenceSyncFD` → exports a sync-fd;
+  the atomic commit passes it as `IN_FENCE_FD`. The display waits on it before
+  scanout, so the commit can be issued before the render completes.
+- **OUT_FENCE (display → GPU):** request `OUT_FENCE_PTR`; it signals when the
+  buffer this commit *replaced* is free to reuse. Import it back as a Dawn
+  `SharedFence` and wait it in the next `BeginAccess` into that freed slot.
+
+Loop (page-flip driven; replaces the core-side timer entirely): DRM page-flip →
+GPU process emits `FrameDone { freedSlot, vblankTime }` → core renders the
+composite into the next free slot over the wire → core sends `Present { slot }`
+→ GPU process `EndAccess` + `drmModeAtomicCommit(fb_id, IN_FENCE_FD,
+PAGE_FLIP_EVENT, OUT_FENCE_PTR)`. Tearing is not a concern: atomic page-flips
+happen at vblank by construction; a missed deadline just repeats the front
+buffer (a dropped frame, not a tear).
+
+Division of labor is unchanged: the **core** still records the compositing pass
+over the wire (it owns layout/stack/policy); the GPU process only adds GBM
+scanout allocation, the KMS commit, the fence plumbing, and the
+`FrameDone`/`Present` messages. `Compositor::renderFrame` barely changes — it
+renders into the current ring slot instead of calling `surface_.Present()`. The
+phase-1 headless path (render into an owned offscreen texture, no swapchain) is
+structurally the same; phase 2 = "headless + the offscreen texture is a scanout
+GBM buffer the GPU process flips."
 
 ### Phase 3 — XWayland
 

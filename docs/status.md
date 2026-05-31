@@ -4,7 +4,7 @@ Tracks what is built and empirically proven versus what is still design only.
 The design itself lives in `architecture.md`; this file is the ground truth for
 "what exists right now."
 
-Last updated: 2026-05-30 (rev 17).
+Last updated: 2026-05-30 (rev 18).
 
 ## Protocol gaps & skeletons (READ FIRST)
 
@@ -233,6 +233,18 @@ rests on facts, not assumptions:
   present loop is libuv-driven** — a `uv_poll_t` on the wire fd drains inbound
   wire frames and a `uv_timer_t` (~16ms) paces frame render+present. No
   hand-rolled C++ spin loop in steady state.
+  - **GAP / divergence: the ~16ms timer is NOT the intended frame clock.** The
+    architecture's frame loop is event-driven off a display-side completion
+    signal (host `wl_surface.frame` callback in phase 1, KMS page-flip in phase
+    2), NOT a free-running timer — a timer has no causal link to refresh and
+    beats against real vsync (waste/stutter, and tearing/stalls under direct
+    KMS). The timer is a phase-1 shortcut because Dawn's WSI swapchain owns
+    `Present` and hides the host frame callback. The documented frame-loop
+    trigger ("phase 1: host `wl_surface.frame` callback") is therefore NOT
+    implemented today. See architecture.md "Frame clock: the trigger must
+    originate at the display" and "Phase-2 present: a self-managed scanout
+    swapchain" for the intended model (GPU-process `FrameDone`/`Present`
+    side-channel events drive the loop; the timer is deleted).
 - A **C++ -> JS event path** works: an optional `onFrame` JS callback is invoked
   from the frame timer (direct `napi_call_function`, same Node thread). The
   cross-thread path (Dawn-internal-thread callbacks -> `napi_threadsafe_function`)
