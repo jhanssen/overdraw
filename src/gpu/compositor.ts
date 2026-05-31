@@ -9,10 +9,8 @@
 // shm mapping (addon.shmView). dmabuf surfaces + nested swapchain present are
 // later slices.
 //
-// The WebGPU objects come from dawn.node; we type them loosely (no @webgpu/types
-// dependency) — this layer is dynamic by nature, like the native-addon surface.
-
-/* eslint-disable @typescript-eslint/no-explicit-any */
+// The WebGPU objects come from dawn.node and conform to the standard WebGPU JS
+// API, so they are typed with @webgpu/types (GPUDevice/GPUTexture/...).
 
 // The same compositing shader the C++ path used: a unit quad placed into a
 // per-surface normalized output rect, sampling the surface texture.
@@ -66,14 +64,22 @@ export interface CompositorAddon {
 
 // The dawn.node wire binding bits the compositor needs for dmabuf surfaces.
 export interface DawnWire {
-  wrapTexture(deviceHandle: bigint, textureHandle: bigint): any; // -> GPUTexture
+  wrapTexture(deviceHandle: bigint, textureHandle: bigint): GPUTexture;
+}
+
+// The bitflag constant objects dawn.node exposes (dawn.globals); shaped like the
+// ambient WebGPU globals.
+export interface DawnGlobals {
+  GPUTextureUsage: typeof GPUTextureUsage;
+  GPUBufferUsage: typeof GPUBufferUsage;
+  GPUMapMode: typeof GPUMapMode;
 }
 
 interface Surface {
-  texture: any;       // GPUTexture (bgra8unorm, sampled)
-  view: any;          // GPUTextureView
-  placementBuf: any;  // uniform buffer (vec4)
-  bindGroup: any;
+  texture: GPUTexture | null;       // bgra8unorm, sampled
+  view: GPUTextureView | null;
+  placementBuf: GPUBuffer | null;   // uniform buffer (vec4)
+  bindGroup: GPUBindGroup | null;
   width: number;
   height: number;
   x: number;
@@ -91,7 +97,7 @@ interface Surface {
 // A dmabuf buffer awaiting GPU-completion of the last frame that sampled it,
 // after which the client may reuse it (wl_buffer.release) and the server-side
 // import may be released (importId).
-interface RetiringBuffer { bufferId: number; importId: number; retireSerial: number; tex: any; }
+interface RetiringBuffer { bufferId: number; importId: number; retireSerial: number; tex: GPUTexture; }
 
 const DEFAULT_FORMAT = "bgra8unorm";
 
@@ -100,12 +106,12 @@ export interface JsCompositorOpts {
   // Requires dawn + deviceHandle (for wrapTexture) and the addon acquire/present.
   nested?: boolean;
   // The render-target color format (must match the swapchain when nested).
-  format?: string;
+  format?: GPUTextureFormat;
 }
 
 export class JsCompositor implements CompositorSink {
-  private device: any;
-  private g: any; // dawn.node globals (GPUTextureUsage, GPUBufferUsage, ...)
+  private device: GPUDevice;
+  private g: DawnGlobals;
   private addon: CompositorAddon;
   private width: number;
   private height: number;
@@ -113,11 +119,11 @@ export class JsCompositor implements CompositorSink {
   private imported: Array<{ id: number; width: number; height: number }> = [];
   private warnedDmabuf = false;
 
-  private sampler: any;
-  private pipeline: any;
-  private layout: any; // bind group layout
-  private target: any; // offscreen render target (headless)
-  private targetView: any;
+  private sampler: GPUSampler;
+  private pipeline: GPURenderPipeline;
+  private layout: GPUBindGroupLayout;
+  private target?: GPUTexture;          // offscreen render target (headless)
+  private targetView?: GPUTextureView;
 
   private surfaces = new Map<number, Surface>();
   private stack: number[] = [];
@@ -138,10 +144,10 @@ export class JsCompositor implements CompositorSink {
   // Nested present (slice 3): render into the host swapchain + present, instead
   // of an offscreen target.
   private nested: boolean;
-  private format: string;
-  private outputTex: any = null;  // wrapped swapchain texture held during a frame
+  private format: GPUTextureFormat;
+  private outputTex: GPUTexture | null = null;  // wrapped swapchain texture, held during a frame
 
-  constructor(device: any, globals: any, addon: CompositorAddon,
+  constructor(device: GPUDevice, globals: DawnGlobals, addon: CompositorAddon,
               output: { width: number; height: number },
               dawn: DawnWire | null = null, deviceHandle: bigint = 0n,
               opts: JsCompositorOpts = {}) {
@@ -222,7 +228,8 @@ export class JsCompositor implements CompositorSink {
   commitSurfaceDmabuf(id: number, fd: unknown, w: number, h: number, fourcc: number,
                       modHi: number, modLo: number, offset: number, stride: number,
                       bufferId: number): boolean {
-    if (!this.dawn || this.deviceHandle === 0n) {
+    const dawn = this.dawn;
+    if (!dawn || this.deviceHandle === 0n) {
       if (!this.warnedDmabuf) {
         console.warn("[js-compositor] dmabuf needs dawn.wrapTexture + deviceHandle");
         this.warnedDmabuf = true;
@@ -233,7 +240,7 @@ export class JsCompositor implements CompositorSink {
       fd, w, h, fourcc, modHi, modLo, offset, stride,
       (handle) => {
         if (handle === null) { if (importId) this.addon.releaseDmabufImport(importId); return; }
-        const tex = this.dawn!.wrapTexture(this.deviceHandle, handle);
+        const tex = dawn.wrapTexture(this.deviceHandle, handle);
         this.installDmabuf(id, tex, w, h, bufferId, importId);
       });
     return importId !== 0;
@@ -241,7 +248,7 @@ export class JsCompositor implements CompositorSink {
 
   // Install a freshly-imported dmabuf texture on the surface, retiring the buffer
   // it supersedes (freed once the last frame that sampled it completes).
-  private installDmabuf(id: number, tex: any, w: number, h: number,
+  private installDmabuf(id: number, tex: GPUTexture, w: number, h: number,
                         bufferId: number, importId: number): void {
     let s = this.surfaces.get(id);
     if (!s) { s = blankSurface(0, 0, 0, 0); this.surfaces.set(id, s); }
@@ -255,20 +262,20 @@ export class JsCompositor implements CompositorSink {
     s.currentBufferId = bufferId;
     s.currentImportId = importId;
     s.texture = tex;
-    s.view = tex.createView();
+    const view = tex.createView();
+    s.view = view;
     s.width = w;
     s.height = h;
-    if (!s.placementBuf) {
-      s.placementBuf = this.device.createBuffer({
-        size: 16, usage: this.g.GPUBufferUsage.UNIFORM | this.g.GPUBufferUsage.COPY_DST,
-      });
-    }
+    const placementBuf = s.placementBuf ?? this.device.createBuffer({
+      size: 16, usage: this.g.GPUBufferUsage.UNIFORM | this.g.GPUBufferUsage.COPY_DST,
+    });
+    s.placementBuf = placementBuf;
     s.bindGroup = this.device.createBindGroup({
       layout: this.layout,
       entries: [
         { binding: 0, resource: this.sampler },
-        { binding: 1, resource: s.view },
-        { binding: 2, resource: { buffer: s.placementBuf } },
+        { binding: 1, resource: view },
+        { binding: 2, resource: { buffer: placementBuf } },
       ],
     });
     s.present = true;
@@ -312,36 +319,38 @@ export class JsCompositor implements CompositorSink {
     let s = this.surfaces.get(id);
     if (!s) { s = blankSurface(0, 0, 0, 0); this.surfaces.set(id, s); }
 
-    if (!s.texture || s.width !== c.width || s.height !== c.height) {
-      if (s.texture) s.texture.destroy?.();
+    let tex = s.texture;
+    if (!tex || s.width !== c.width || s.height !== c.height) {
+      if (tex) tex.destroy();
       // Sampled client textures are always BGRA8 (shm ARGB8888 byte-for-byte;
       // dmabuf imported as BGRA8Unorm), independent of the output format.
-      s.texture = this.device.createTexture({
+      tex = this.device.createTexture({
         size: { width: c.width, height: c.height },
         format: "bgra8unorm",
         usage: this.g.GPUTextureUsage.TEXTURE_BINDING | this.g.GPUTextureUsage.COPY_DST,
       });
-      s.view = s.texture.createView();
+      s.texture = tex;
+      const view = tex.createView();
+      s.view = view;
       s.width = c.width;
       s.height = c.height;
-      if (!s.placementBuf) {
-        s.placementBuf = this.device.createBuffer({
-          size: 16, usage: this.g.GPUBufferUsage.UNIFORM | this.g.GPUBufferUsage.COPY_DST,
-        });
-      }
+      const placementBuf = s.placementBuf ?? this.device.createBuffer({
+        size: 16, usage: this.g.GPUBufferUsage.UNIFORM | this.g.GPUBufferUsage.COPY_DST,
+      });
+      s.placementBuf = placementBuf;
       s.bindGroup = this.device.createBindGroup({
         layout: this.layout,
         entries: [
           { binding: 0, resource: this.sampler },
-          { binding: 1, resource: s.view },
-          { binding: 2, resource: { buffer: s.placementBuf } },
+          { binding: 1, resource: view },
+          { binding: 2, resource: { buffer: placementBuf } },
         ],
       });
     }
 
     // `data` begins at the buffer's first pixel row, so dataLayout offset is 0.
     this.device.queue.writeTexture(
-      { texture: s.texture },
+      { texture: tex },
       data,
       { offset: 0, bytesPerRow: c.stride, rowsPerImage: c.height },
       { width: c.width, height: c.height },
@@ -350,6 +359,7 @@ export class JsCompositor implements CompositorSink {
   }
 
   private updatePlacement(s: Surface): void {
+    if (!s.placementBuf) return;
     const w = s.layoutW || s.width;
     const h = s.layoutH || s.height;
     const rect = new Float32Array([
@@ -367,10 +377,12 @@ export class JsCompositor implements CompositorSink {
     if (this.nested) {
       const handle = this.addon.acquireOutputTexture();
       if (handle === null) return;  // no swapchain texture this frame
-      this.outputTex = this.dawn!.wrapTexture(this.deviceHandle, handle);
+      if (!this.dawn) return;
+      this.outputTex = this.dawn.wrapTexture(this.deviceHandle, handle);
       targetView = this.outputTex.createView();
       presenting = true;
     }
+    if (!targetView) return;  // headless before the target exists (shouldn't happen)
     const enc = this.device.createCommandEncoder();
     const pass = enc.beginRenderPass({
       colorAttachments: [{
@@ -412,7 +424,10 @@ export class JsCompositor implements CompositorSink {
   // (width*height*4). copyTextureToBuffer requires 256-aligned bytesPerRow, so
   // we pad on the GPU side and unpad here.
   async readback(): Promise<{ width: number; height: number; data: Uint8Array }> {
-    if (this.nested) throw new Error("readback() is headless-only (nested presents to the swapchain)");
+    if (this.nested || !this.target) {
+      throw new Error("readback() is headless-only (nested presents to the swapchain)");
+    }
+    const target = this.target;
     const unpadded = this.width * 4;
     const padded = Math.ceil(unpadded / 256) * 256;
     const buf = this.device.createBuffer({
@@ -421,7 +436,7 @@ export class JsCompositor implements CompositorSink {
     });
     const enc = this.device.createCommandEncoder();
     enc.copyTextureToBuffer(
-      { texture: this.target },
+      { texture: target },
       { buffer: buf, bytesPerRow: padded, rowsPerImage: this.height },
       { width: this.width, height: this.height },
     );
@@ -433,7 +448,7 @@ export class JsCompositor implements CompositorSink {
       out.set(mapped.subarray(y * padded, y * padded + unpadded), y * unpadded);
     }
     buf.unmap();
-    buf.destroy?.();
+    buf.destroy();
     return { width: this.width, height: this.height, data: out };
   }
 }

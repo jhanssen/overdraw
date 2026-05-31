@@ -57,7 +57,7 @@ export interface Addon {
   // in JS (src/gpu/compositor.ts); the native side provides WSI (surface acquire/
   // present), dmabuf import, and shm pixel access.
   gpuHandles(): { instance: bigint; device: bigint } | null;
-  outputFormat(): string;
+  outputFormat(): GPUTextureFormat;
   acquireOutputTexture(): bigint | null;
   presentOutput(): void;
   shmView(poolId: number, offset: number, length: number): ArrayBuffer | null;

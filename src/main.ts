@@ -17,7 +17,7 @@ import { globSync } from "node:fs";
 import { installProtocols } from "./protocols/index.js";
 import { parseConfigArg, loadConfig } from "./config/load.js";
 import { JsCompositor } from "./gpu/compositor.js";
-import type { DawnWire } from "./gpu/compositor.js";
+import type { DawnWire, DawnGlobals } from "./gpu/compositor.js";
 import type { Addon, InputEvent } from "./types.js";
 import type { CompositorSink, CompositorState } from "./protocols/ctx.js";
 
@@ -31,8 +31,8 @@ const gpuBin = process.env.OVERDRAW_GPU_PROCESS
 // The compositing pass runs in core JS over the Dawn wire (dawn.node); the C++
 // compositing pass no longer exists.
 interface DawnModule extends DawnWire {
-  wrapDevice(instanceHandle: bigint, deviceHandle: bigint): unknown; // -> GPUDevice
-  globals: unknown;
+  wrapDevice(instanceHandle: bigint, deviceHandle: bigint): GPUDevice;
+  globals: DawnGlobals;
 }
 function loadDawn(): DawnModule | null {
   const [p] = globSync(join(__dirname, "..", "build", "3rdparty", "dawn", "Dawn-*", "dawn.node"));

@@ -13,7 +13,7 @@
     "declaration": false,
     "sourceMap": false,
     "verbatimModuleSyntax": false,
-    "types": ["node"],
+    "types": ["node", "@webgpu/types"],
     "paths": {
       "#protocols-gen/*": ["./dist/protocols-gen/*"]
     }
