@@ -80,7 +80,6 @@ set_target_properties(overdraw_wire PROPERTIES POSITION_INDEPENDENT_CODE ON)
 add_library(overdraw_core STATIC
     native/core/gpu_process.cpp
     native/core/compositor.cpp
-    native/core/plugin_wire.cpp
     native/core/input_wayland.cpp
     native/core/shm.cpp
     native/wayland/server.cpp

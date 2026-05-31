@@ -4,7 +4,7 @@ Tracks what is built and empirically proven versus what is still design only.
 The design itself lives in `architecture.md`; this file is the ground truth for
 "what exists right now."
 
-Last updated: 2026-05-31 (rev 27).
+Last updated: 2026-05-31 (rev 28).
 
 ## Protocol gaps & skeletons (READ FIRST)
 
@@ -853,24 +853,23 @@ surface the core composites on top at a core-decided rect).
   does not release the surface ring / connection (leak on exit — must fix before
   multi-plugin churn); only 2 slots (fine; 3 would fully decouple the clocks).
 
-### Plugin GPU end-to-end: device + shared surface + per-frame fence (C-M4 steps 1-3) — VERIFIED
-The cross-process producer/consumer surface path runs on the verification
-hardware: a plugin's OWN wire-client device renders into a dmabuf the core device
-then samples, fence-ordered. This proves C-M2's plumbing at runtime and applies
-C-M1's primitive cross-process. (Step 1 device bring-up + step 2 surface alloc +
-step 3 per-frame fence; the Worker SDK + animated-overlay compositing are steps
-4-5, not done.) All on the MAIN thread for now (the plugin wire client is core-
-side; moving it into the plugin Worker is gated on the Worker-addon question).
+### Plugin GPU end-to-end: device + shared surface + per-frame fence (C-M4 steps 1-3) — HISTORICAL (superseded by the Worker path)
+NOTE: steps 1-3 were originally built on the MAIN thread (a core-side
+`core::PluginWireClient` + `addon.pluginConnect`/`pluginAllocSurfaceBuffer`) to
+de-risk the GPU primitives incrementally. That main-thread path + its tests
+(`plugin-connect.gpu.mjs`, `plugin-surface-fence.gpu.mjs`) have been REMOVED, now
+that the Worker-owned path (above: "First plugin milestone COMPLETE") supersedes
+them and is verified end to end. The verified FACTS below still hold (they're the
+same primitives the Worker path uses); only the main-thread driver is gone.
 
-- **Step 1 — plugin device** (`native/core/plugin_wire.{h,cpp}`, `addon.pluginConnect`):
-  a second wire connection brings up its own `wgpu::Device` (ReserveInstance ->
-  InjectPluginInstance -> RequestAdapter/RequestDevice). Two `WireClient`s coexist
-  under the one global wire proc table (objects route per-owning-client — proven,
-  not assumed). `test/plugin-connect.gpu.mjs`.
-- **Step 2 — shared surface buffer** (`AllocSurfaceBuf`, `addon.pluginAllocSurfaceBuffer`):
-  one GBM dmabuf imported as `SharedTextureMemory` into BOTH the plugin (producer)
-  and core (consumer) devices, a texture injected at each side's reserved handle.
-  Both wrap (dawn.node) + view on their own device. `test/plugin-connect.gpu.mjs`.
+- **Step 1 — plugin device**: a second wire connection brings up its own
+  `wgpu::Device` (ReserveInstance -> InjectPluginInstance -> RequestAdapter/
+  RequestDevice). Two `WireClient`s coexist under the one global wire proc table
+  (objects route per-owning-client — proven). Now driven by the Worker.
+- **Step 2 — shared surface buffer** (`AllocSurfaceBuf`): one GBM dmabuf imported
+  as `SharedTextureMemory` into BOTH the plugin (producer) and core (consumer)
+  devices, a texture injected at each side's reserved handle. Both wrap
+  (dawn.node) + view on their own device.
 - **Step 3 — per-frame fence** (`ProducerBegin/End`, `ConsumerBegin/End`,
   `test/plugin-surface-fence.gpu.mjs`): producer BeginAccess (UNDEFINED, no fence)
   -> plugin clears the dmabuf -> EndAccess (exports a `SharedFenceSyncFD`, held) ->
