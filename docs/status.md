@@ -274,11 +274,10 @@ prints `WAYLAND_DISPLAY`, and runs until SIGINT.
   translucency — the proper linear-compositing pipeline is future work).
 - Verified: `foot` renders its prompt, types interactively (keyboard routed,
   confirmed by running a command), colors match a real compositor. **PASS.**
-- LIMITATIONS hit by `foot`, flagged: subsurfaces ARE composited now (see
-  "Subsurface compositing" below), but **sync-mode commit batching is not
-  honored** and place_above/below is a no-op — so `foot`'s overlays may still be
-  positioned/ordered wrong even though they now draw; **clipboard is a no-op**
-  (`wl_data_device_manager`
+- LIMITATIONS hit by `foot`, flagged: subsurfaces ARE composited with correct
+  sync/desync commit semantics (see "Subsurface compositing" below); the only
+  remaining subsurface gap is place_above/below sibling reordering (no-op);
+  **clipboard is a no-op** (`wl_data_device_manager`
   exists but does nothing); no server-side decorations, fractional scale, primary
   selection, xdg-activation, cursor-shape, text-input (all advertised-absent →
   `foot` warns and falls back).
@@ -742,18 +741,29 @@ at parent-output-rect + the subsurface offset.
   map). Nested subsurfaces handled (recursive subtree). The native compositor
   already drew any placed `ClientSurface` in stack order, so this is JS-layer
   glue (no native change).
-- Verified: `test/subsurface.gpu.mjs` (headless pixel test) — a green child at
-  offset (40,30) over a blue parent reads back green at the child region and blue
-  in a parent-only region. **PASS.**
-- **NOT yet handled (flagged):** **sync-mode commit batching** — per spec, a
-  `sync` subsurface (the default) caches its commits and applies them atomically
-  on the PARENT's commit; we apply on the child's own commit regardless of
-  sync/desync. The test uses `set_desync`; a default-sync client gets
-  non-spec-atomic updates (visible as a child updating before the parent's
-  matching frame). `place_above`/`place_below` sibling reordering is a no-op
-  (siblings draw in creation order). The WM's own `setStack` on map/unmap pushes
-  toplevels-only; subsurfaces are re-expanded right after in the same sweep, but
-  a future stand-alone WM restack must call `applySubsurfaces` too.
+- **Commit semantics are spec-correct (double-buffered).** `wl_surface` requests
+  accumulate into `pending`; `commit` either APPLIES the state or, for an
+  effective-synchronized subsurface, CACHES it and applies it when the parent
+  commits. Implemented in `wl_surface.commit` + `applySurfaceState`:
+  - **sync** (the default for a subsurface): commit caches; the cache is applied
+    atomically when the parent's state is applied (a parent apply cascades into
+    every effective-sync child's cache, recursively).
+  - **desync**: commit applies directly; a pre-existing cache is flushed as part
+    of the apply.
+  - **inherited sync**: a desync child of a sync-behaving parent is effectively
+    sync (computed up the parent chain; the main surface is always desync).
+  - **subsurface position** (`set_position`) is double-buffered and applied on the
+    PARENT's commit regardless of child mode; `set_sync`/`set_desync` are
+    immediate. Frame callbacks are likewise armed on apply (so a sync child's
+    callbacks fire with the parent's frame).
+- Verified (`test/subsurface.gpu.mjs`, headless pixel tests): green child over a
+  blue parent composites at parent+offset (above parent); a **sync** child does
+  NOT appear until the parent commits, then does; a **desync** child's content
+  appears on its own commit. **PASS.**
+- **Remaining gap (flagged):** `place_above`/`place_below` sibling reordering is a
+  no-op (siblings draw in creation order). The WM's own `setStack` on map/unmap
+  pushes toplevels-only; subsurfaces are re-expanded right after in the same
+  sweep, but a future stand-alone WM restack must call `applySubsurfaces` too.
 
 ## Not yet built (design only)
 

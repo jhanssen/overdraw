@@ -93,10 +93,15 @@ export async function setupCompositor(opts = {}) {
   // in query(). The returned handle accumulates stdout + offers waitForLine().
   // Defaults to the standard harness-client; pass { bin, readyMarker } to run
   // another client (e.g. subsurface-test-client).
-  function spawnClient(args = [], { bin = clientBin, readyMarker = "] mapped" } = {}) {
-    const child = spawn(bin, ["--socket", sock, ...args], { stdio: ["ignore", "pipe", "pipe"] });
+  function spawnClient(args = [], { bin = clientBin, readyMarker = "] mapped", stdin = false } = {}) {
+    const child = spawn(bin, ["--socket", sock, ...args],
+      { stdio: [stdin ? "pipe" : "ignore", "pipe", "pipe"] });
     clients.push(child);
-    const handle = { child, stdout: "", ready: null };
+    const handle = {
+      child, stdout: "", ready: null,
+      // Write a line to the client's stdin (for --step clients).
+      send: (line) => { child.stdin?.write(line.endsWith("\n") ? line : line + "\n"); },
+    };
     handle.ready = new Promise((resolve, reject) => {
       const to = setTimeout(() => reject(new Error("client did not map in time")), 5000);
       child.stdout.on("data", (d) => {

@@ -14,8 +14,12 @@ export interface SurfaceRecord {
   id: number;
   resource: Resource;
   role: string | null;
-  pending: { buffer?: Resource | null };
+  // Double-buffered commit state. Requests accumulate into `pending`; commit
+  // either APPLIES it (effective-desync) or CACHES it (effective-sync subsurface)
+  // until the parent commits. See wl_surface.commit + applySurfaceState.
+  pending: { buffer?: Resource | null; frameCallbacks?: Resource[] };
   committed: { buffer: Resource | null };
+  cached?: { buffer?: Resource | null; frameCallbacks?: Resource[] };  // sync subsurface cache
   xdgSurface: XdgSurfaceRecord | null;
   mapped?: boolean;
   hasContent?: boolean;  // a buffer has been committed + uploaded at least once
@@ -58,9 +62,14 @@ export interface SubsurfaceRecord {
   resource: Resource;
   surface: Resource;
   parent: Resource;
+  // Applied position (output-relative-to-parent). set_position writes pendingX/Y;
+  // per spec the position is applied when the PARENT surface commits, so the
+  // parent's apply copies pending* -> x/y.
   x: number;
   y: number;
-  sync: boolean;
+  pendingX: number;
+  pendingY: number;
+  sync: boolean;        // own mode (set_sync/set_desync); initial = true (sync)
 }
 
 export interface BufferDesc {

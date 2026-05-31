@@ -61,3 +61,75 @@ test("subsurface composites above its parent at parent + offset", { skip }, asyn
     await c.teardown();
   }
 });
+
+// Spec: a SYNCHRONIZED subsurface (the default) caches its commits; the cached
+// state is applied only when the PARENT commits. So after the child commits its
+// buffer but before the parent's next commit, the child must NOT yet appear.
+test("sync subsurface: child does NOT appear until the parent commits", { skip }, async () => {
+  const c = await setupCompositor({ headless: OUT });
+  try {
+    const pColor = 0xff0000ff, cColor = 0xff00ff00;
+    const PW = 300, PH = 200, CW = 80, CH = 60, OX = 40, OY = 30;
+    const cl = c.spawnClient(
+      ["--sync", "--step", "--parent", `${PW}x${PH}`, "--child", `${CW}x${CH}`,
+       "--offset", `${OX}x${OY}`, "--parent-color", pColor.toString(16),
+       "--child-color", cColor.toString(16)],
+      { bin: SUB_BIN, readyMarker: "[subsurface-client] mapped", stdin: true });
+    await cl.ready;
+    const snap = await c.waitFor(c.query, (s) => s.windows.length >= 1, { what: "parent window" });
+    const p = snap.windows[0].rect;
+    const childCx = p.x + OX + (CW >> 1), childCy = p.y + OY + (CH >> 1);
+    const bgraChild = argbToBgra(cColor), bgraParent = argbToBgra(pColor);
+
+    // Child has committed (sync, cached) but the parent has NOT re-committed.
+    await cl.waitForLine(/child-committed/, { what: "child commit" });
+    // Read back: the child region must still show the PARENT color (child cached).
+    // Wait until the parent has composited at all, then assert child is absent.
+    const before = await readWhen(c, { x: p.x + 5, y: p.y + 5, bgra: bgraParent });
+    assert.ok(pixelMatches(pixelAt(before, OUT.width, childCx, childCy), bgraParent, 4),
+      `sync child must NOT show before parent commit; got ${pixelAt(before, OUT.width, childCx, childCy)}`);
+
+    // Tell the client to commit the parent -> the cached child state applies.
+    cl.send("go");
+    await cl.waitForLine(/parent-committed/, { what: "parent commit" });
+    const after = await readWhen(c, { x: childCx, y: childCy, bgra: bgraChild });
+    assert.ok(pixelMatches(pixelAt(after, OUT.width, childCx, childCy), bgraChild, 4),
+      `sync child must appear after parent commit; got ${pixelAt(after, OUT.width, childCx, childCy)}`);
+  } finally {
+    await c.teardown();
+  }
+});
+
+// Spec: a DESYNCHRONIZED subsurface applies its commits directly (no wait for the
+// parent). So the child CONTENT appears as soon as the child commits, before any
+// further parent commit. (Position uses offset 0 here: set_position takes effect
+// on the next PARENT commit per spec, so with no parent re-commit the child sits
+// at the parent origin -- which is exactly what we assert, isolating the content-
+// timing behavior from the position-timing behavior.)
+test("desync subsurface: child content appears on its own commit (no parent commit needed)", { skip }, async () => {
+  const c = await setupCompositor({ headless: OUT });
+  try {
+    const pColor = 0xff0000ff, cColor = 0xff00ff00;
+    const PW = 300, PH = 200, CW = 80, CH = 60;
+    const cl = c.spawnClient(
+      ["--step", "--parent", `${PW}x${PH}`, "--child", `${CW}x${CH}`,
+       "--offset", "0x0", "--parent-color", pColor.toString(16),
+       "--child-color", cColor.toString(16)],  // no --sync => desync
+      { bin: SUB_BIN, readyMarker: "[subsurface-client] mapped", stdin: true });
+    await cl.ready;
+    const snap = await c.waitFor(c.query, (s) => s.windows.length >= 1, { what: "parent window" });
+    const p = snap.windows[0].rect;
+    // Child at parent origin (offset 0). Sample inside the child rect.
+    const cx = p.x + (CW >> 1), cy = p.y + (CH >> 1);
+    const bgraChild = argbToBgra(cColor);
+
+    await cl.waitForLine(/child-committed/, { what: "child commit" });
+    // Desync: child content should appear from its own commit, no parent commit.
+    const frame = await readWhen(c, { x: cx, y: cy, bgra: bgraChild });
+    assert.ok(pixelMatches(pixelAt(frame, OUT.width, cx, cy), bgraChild, 4),
+      `desync child content should appear on its own commit; got ${pixelAt(frame, OUT.width, cx, cy)}`);
+    cl.send("go"); // let it finish cleanly
+  } finally {
+    await c.teardown();
+  }
+});

@@ -83,6 +83,8 @@ int main(int argc, char** argv) {
     int PW = 300, PH = 200, CW = 80, CH = 60, OX = 40, OY = 30;
     uint32_t pColor = 0xFF0000FFu;  // parent: opaque blue
     uint32_t cColor = 0xFF00FF00u;  // child: opaque green
+    int sync = 0;   // --sync: subsurface stays in synchronized mode (default desync here)
+    int step = 0;   // --step: gate the parent commit on a stdin line (timing test)
 
     for (int i = 1; i < argc; ++i) {
         if (strcmp(argv[i], "--socket") == 0 && i + 1 < argc) socket = argv[++i];
@@ -91,8 +93,10 @@ int main(int argc, char** argv) {
         else if (strcmp(argv[i], "--offset") == 0 && i + 1 < argc) sscanf(argv[++i], "%dx%d", &OX, &OY);
         else if (strcmp(argv[i], "--parent-color") == 0 && i + 1 < argc) pColor = (uint32_t)strtoul(argv[++i], NULL, 16);
         else if (strcmp(argv[i], "--child-color") == 0 && i + 1 < argc) cColor = (uint32_t)strtoul(argv[++i], NULL, 16);
+        else if (strcmp(argv[i], "--sync") == 0) sync = 1;
+        else if (strcmp(argv[i], "--step") == 0) step = 1;
     }
-    if (!socket) { fprintf(stderr, "usage: %s --socket NAME [...]\n", argv[0]); return 2; }
+    if (!socket) { fprintf(stderr, "usage: %s --socket NAME [--sync] [--step] [...]\n", argv[0]); return 2; }
 
     signal(SIGTERM, onTerm);
     signal(SIGINT, onTerm);
@@ -121,26 +125,61 @@ int main(int argc, char** argv) {
     wl_surface_commit(parent);          // map: triggers configure
     wl_display_roundtrip(display);
 
-    // Child surface + subsurface at the offset.
-    struct wl_buffer* cbuf = solidBuffer(CW, CH, cColor);
-    struct wl_surface* child = wl_compositor_create_surface(compositor);
-    struct wl_subsurface* sub = wl_subcompositor_get_subsurface(subcompositor, child, parent);
-    wl_subsurface_set_position(sub, OX, OY);
-    wl_subsurface_set_desync(sub);      // child commits apply immediately
-    wl_surface_attach(child, cbuf, 0, 0);
-    wl_surface_damage(child, 0, 0, CW, CH);
-    wl_surface_commit(child);
+    // In --step mode, map the parent FIRST (its own buffer) so the harness sees a
+    // mapped window before the child exists, then drive child/parent commits in
+    // discrete, stdout-announced steps so the harness can read back between them.
+    if (step) {
+        wl_surface_attach(parent, pbuf, 0, 0);
+        wl_surface_damage(parent, 0, 0, PW, PH);
+        wl_surface_commit(parent);
+        wl_display_roundtrip(display);
+        printf("[subsurface-client] mapped parent %dx%d child %dx%d offset %dx%d configured=%d\n",
+               PW, PH, CW, CH, OX, OY, surface_configured);
+        fflush(stdout);
 
-    // Parent content + commit (applies the subsurface association/state).
-    wl_surface_attach(parent, pbuf, 0, 0);
-    wl_surface_damage(parent, 0, 0, PW, PH);
-    wl_surface_commit(parent);
-    wl_display_roundtrip(display);
-    wl_display_roundtrip(display);
+        // Set up the child subsurface and commit ITS buffer. In sync mode this is
+        // cached and must NOT appear until the parent commits next.
+        struct wl_buffer* cbuf = solidBuffer(CW, CH, cColor);
+        struct wl_surface* child = wl_compositor_create_surface(compositor);
+        struct wl_subsurface* sub = wl_subcompositor_get_subsurface(subcompositor, child, parent);
+        wl_subsurface_set_position(sub, OX, OY);
+        if (sync) wl_subsurface_set_sync(sub); else wl_subsurface_set_desync(sub);
+        wl_surface_attach(child, cbuf, 0, 0);
+        wl_surface_damage(child, 0, 0, CW, CH);
+        wl_surface_commit(child);
+        wl_display_roundtrip(display);
+        printf("[subsurface-client] child-committed\n");
+        fflush(stdout);
 
-    printf("[subsurface-client] mapped parent %dx%d child %dx%d offset %dx%d configured=%d\n",
-           PW, PH, CW, CH, OX, OY, surface_configured);
-    fflush(stdout);
+        // Wait for the harness to tell us to commit the parent (it reads back the
+        // frame first to confirm a sync child has NOT yet appeared).
+        char line[64];
+        while (running && !fgets(line, sizeof(line), stdin)) { /* retry on EINTR */ }
+        wl_surface_commit(parent);          // applies cached sync child state
+        wl_display_roundtrip(display);
+        printf("[subsurface-client] parent-committed\n");
+        fflush(stdout);
+    } else {
+        // One-shot path (desync default): child + parent committed together.
+        struct wl_buffer* cbuf = solidBuffer(CW, CH, cColor);
+        struct wl_surface* child = wl_compositor_create_surface(compositor);
+        struct wl_subsurface* sub = wl_subcompositor_get_subsurface(subcompositor, child, parent);
+        wl_subsurface_set_position(sub, OX, OY);
+        if (sync) wl_subsurface_set_sync(sub); else wl_subsurface_set_desync(sub);
+        wl_surface_attach(child, cbuf, 0, 0);
+        wl_surface_damage(child, 0, 0, CW, CH);
+        wl_surface_commit(child);
+
+        wl_surface_attach(parent, pbuf, 0, 0);
+        wl_surface_damage(parent, 0, 0, PW, PH);
+        wl_surface_commit(parent);
+        wl_display_roundtrip(display);
+        wl_display_roundtrip(display);
+
+        printf("[subsurface-client] mapped parent %dx%d child %dx%d offset %dx%d configured=%d\n",
+               PW, PH, CW, CH, OX, OY, surface_configured);
+        fflush(stdout);
+    }
 
     int wlfd = wl_display_get_fd(display);
     while (running) {
@@ -152,9 +191,9 @@ int main(int argc, char** argv) {
         }
     }
 
-    wl_subsurface_destroy(sub);
-    wl_surface_destroy(child);
-    wl_buffer_destroy(cbuf);
+    // Teardown: the surfaces/buffers are owned by the per-branch scopes above and
+    // are reclaimed on exit; just flush + disconnect. (toplevel/xs/parent outlive
+    // both branches but a clean exit lets the server drop the client.)
     xdg_toplevel_destroy(toplevel);
     xdg_surface_destroy(xs);
     wl_surface_destroy(parent);
