@@ -98,11 +98,11 @@ class Compositor {
     int wireFd() const { return link_->wireFd(); }
     int ctrlFd() const { return ctrlFd_; }
 
-    // Slice 3: drive the host swapchain present from JS. The JS compositor
-    // acquires the output texture, renders into it over the wire, then presents.
-    // While "external render" is on, the C++ renderFrame() does NOT acquire/
-    // render/present (JS owns the frame), it only flushes wire output.
-    void setExternalRender(bool e) { externalRender_ = e; }
+    // The JS compositor drives every frame: it acquires the output texture,
+    // renders into it over the wire, and presents. The C++ Compositor no longer
+    // has a compositing pass -- it provides WSI (surface/acquire/present), dmabuf
+    // import, and the wire link.
+    //
     // Acquire the host swapchain's current texture (nested only). Holds a ref
     // until presentOutput(); returns the wire texture handle (or null headless /
     // no surface). JS wraps it (dawn.node wrapTexture) as the render target.
@@ -121,82 +121,18 @@ class Compositor {
     // True if wire bytes are queued awaiting a writable socket (the addon then
     // arms UV_WRITABLE on the wire poll).
     bool wireHasPendingOut() const { return link_->hasPendingOut(); }
+    // Per-frame hook from the addon's frame timer: flush queued wire output. The
+    // JS compositor records + presents the frame; this just drains the wire.
     void renderFrame();
 
-    // Upload a client surface's CPU pixels (BGRA8Unorm-equivalent, e.g. shm
-    // ARGB8888/XRGB8888) into a sampled wgpu texture over the wire, creating or
-    // recreating it if size changed, and mark the surface for compositing. The
-    // pixels are tightly read row by row using `stride`. `id` is an opaque
-    // per-surface key chosen by the caller.
-    void commitSurfaceShm(uint32_t id, uint32_t width, uint32_t height,
-                          uint32_t stride, const uint8_t* pixels);
-
-    // Import a client-provided dmabuf (linux-dmabuf-v1) as a sampled texture and
-    // mark the surface for compositing. The dmabuf `fd` is owned by the caller
-    // and dup'd as needed (passed to the GPU process via SCM_RIGHTS). `drmFourcc`
-    // is the client's declared DRM fourcc; `modifier` the client's modifier.
-    // NON-BLOCKING: reserves a texture handle, sends the import request over the
-    // side channel, records a pending import, and returns immediately. The import
-    // completes asynchronously when the ClientTexImported reply is dispatched by
-    // drainCtrl() (driven from a libuv poll on the ctrl fd). Returns false only if
-    // the request could not be sent. Completed imports surface as "imported"
-    // surfaces via takeImportedSurfaces().
-    bool commitSurfaceDmabuf(uint32_t id, int fd, uint32_t width, uint32_t height,
-                             uint32_t drmFourcc, uint64_t modifier,
-                             uint32_t offset, uint32_t stride, uint64_t bufferId);
-
     // Steady-state hook: drain and dispatch any pending side-channel control
-    // messages (currently ClientTexImported, finishing async dmabuf imports).
+    // messages (ClientTexImported, finishing async JS dmabuf imports).
     // Non-blocking. Driven from a libuv poll on the ctrl fd in the addon.
     void drainCtrl();
 
-    // Drain the set of surface ids that gained presentable content since the last
-    // call (first or subsequent commit completed). Both shm and dmabuf commits
-    // report here, giving JS a single map-on-first-content signal. Each entry
-    // carries the content size for hit-testing. Empties the internal list.
-    struct ImportedSurface { uint32_t id; uint32_t width; uint32_t height; };
-    void takeImportedSurfaces(std::vector<ImportedSurface>& out);
-
-    // Drain the set of dmabuf bufferIds whose last sampling frame has completed
-    // on the GPU (so the client may reuse them). The caller (JS) sends
-    // wl_buffer.release for each. Empties the internal freed list.
-    void takeFreedBuffers(std::vector<uint64_t>& out);
-
-    // Set a surface's layout rect in output pixels (top-left origin). w/h of 0
-    // means "use the surface's content size". Placement is owned by JS; the
-    // compositor only stores + applies it. Unknown ids are created lazily so
-    // layout can be set before the first buffer commit.
-    void setSurfaceLayout(uint32_t id, int32_t x, int32_t y, uint32_t w, uint32_t h);
-
-    // Set the back-to-front draw order. Ids not (yet) committed are tolerated
-    // (skipped at draw time). Surfaces absent from the stack are not drawn.
-    void setStack(const std::vector<uint32_t>& ids);
-
-    // Stop compositing a surface and release its texture.
-    void removeSurface(uint32_t id);
-
-    // True if running headless (offscreen render target, no swapchain/present).
+    // True if running headless (no host window/surface; the JS compositor renders
+    // into its own offscreen target).
     bool headless() const { return headless_; }
-
-    // Callback for async readbacks: ok + width*height*4 BGRA bytes (empty on fail).
-    using ReadbackCb = std::function<void(bool ok, std::vector<uint8_t>&& px)>;
-
-    // Async readback of the COMPOSITED frame (the offscreen capture texture in
-    // headless mode). Renders nothing itself -- reads whatever renderFrame() last
-    // composited. `cb` is invoked on the Node thread when the GPU map completes,
-    // with ok + width*height*4 BGRA bytes. Returns false if no capture texture
-    // exists (e.g. not headless). Non-blocking. The staging buffer is held until
-    // the map resolves.
-    bool readbackFrame(ReadbackCb cb);
-
-    // Test hook: read the surface's uploaded texture back to CPU. ASYNCHRONOUS
-    // and non-blocking: kicks off a CopyTextureToBuffer + MapAsync and returns
-    // immediately. `cb` is invoked later (on the Node thread, from the wire pump
-    // that processes the map completion) with ok + the width*height*4 BGRA bytes.
-    // Returns false synchronously only if the surface is unknown / has no texture
-    // (in which case `cb` is not called). The in-flight buffer is held internally
-    // until the map resolves.
-    bool readbackSurface(uint32_t id, ReadbackCb cb);
 
     // Stop presenting and release GPU/wire resources; signal + reap the GPU
     // process. Idempotent.
@@ -204,11 +140,6 @@ class Compositor {
 
   private:
     bool handshake();
-    // Shared async texture->CPU readback (CopyTextureToBuffer + MapAsync). The
-    // staging buffer is held in the map callback until it fires; `cb` gets
-    // width*height*4 BGRA bytes. Used by readbackSurface + readbackFrame.
-    bool readbackTexture(const wgpu::Texture& tex, uint32_t width, uint32_t height,
-                         ReadbackCb cb);
 
     std::unique_ptr<WireLink> link_;
     pid_t gpuPid_ = -1;
@@ -217,66 +148,16 @@ class Compositor {
     bool shutdownDone_ = false;
 
     bool headless_ = false;
-    bool externalRender_ = false;      // JS compositor drives the frame (slice 3)
     wgpu::Texture currentOutputTexture_;  // held between acquire + present
     wgpu::Instance instance_;
     wgpu::Device device_;
     wgpu::Surface surface_;            // nested only
-    wgpu::Texture captureTex_;         // headless only: offscreen render target
     wgpu::TextureFormat renderFormat_ = wgpu::TextureFormat::BGRA8Unorm;
-    wgpu::RenderPipeline pipeline_;
-    wgpu::Sampler sampler_;
 
-    // Client surfaces composited over the wire. Each is drawn as a textured
-    // quad placed into its layout rect, in stack order, with alpha blending.
-    // Placement and stack order are owned by JS and pushed via setSurfaceLayout
-    // / setStack; the compositor only consumes them.
-    struct ClientSurface {
-        wgpu::Texture texture;
-        wgpu::Buffer placementBuf;  // uniform: normalized output rect (vec4)
-        wgpu::BindGroup bindGroup;
-        uint32_t width = 0;   // content (texture) size
-        uint32_t height = 0;
-        int32_t x = 0;        // layout position in output pixels (top-left)
-        int32_t y = 0;
-        uint32_t layoutW = 0; // layout size in output pixels (0 => use content size)
-        uint32_t layoutH = 0;
-        bool present = false;
-        uint64_t currentBufferId = 0;  // dmabuf bufferId backing `texture` (0 = none/shm)
-    };
-    std::unordered_map<uint32_t, ClientSurface> clientSurfaces_;
-
-    // Dmabuf buffer-release lifecycle. A client dmabuf buffer is held (sampled
-    // directly, zero-copy) until the LAST frame that sampled it completes on the
-    // GPU. When a new buffer supersedes the current one, the old buffer "retires"
-    // tagged with the latest submit serial; its OnSubmittedWorkDone frees it.
-    uint64_t submitSerial_ = 0;                  // increments per composited frame
-    uint64_t completedSerial_ = 0;               // highest serial whose work is done
-    struct RetiringBuffer { uint64_t bufferId; uint64_t retireSerial;
-                            wgpu::Texture texture; };  // texture kept alive until freed
-    std::vector<RetiringBuffer> retiring_;       // awaiting GPU completion
-    std::vector<uint64_t> freed_;                // completed; JS drains via takeFreedBuffers
-    void reapRetiredBuffers();                   // move retiring_ -> freed_ by completedSerial_
-
-    // Async dmabuf import: commitSurfaceDmabuf sends ImportClientTex and records
-    // the in-flight reservation here, keyed by the reserved texture handle id
-    // (which the ClientTexImported reply echoes). The reservation is held -- not
-    // Acquire'd or Reclaim'd -- until the reply, which both keeps the handle id
-    // from being recycled while in flight and lets drainCtrl finish the import.
-    // Per surface these complete in send order (the GPU processes ctrl messages
-    // in order; the wire-serial gate only delays, never reorders).
-    struct PendingImport {
-        uint32_t surfaceId;
-        uint64_t bufferId;
-        uint32_t width;
-        uint32_t height;
-        dawn::wire::ReservedTexture reservation;  // held until reply
-    };
-    std::vector<PendingImport> pendingImports_;  // keyed by reservation.handle.id
-
-    // JS-compositor dmabuf imports (importDmabufForJs). Like PendingImport but
-    // completion reports the injected texture handle to JS instead of building
-    // native compositing state.
+    // JS-compositor dmabuf imports (importDmabufForJs): reserve a texture, send
+    // ImportClientTex, hold the reservation until the GPU replies, then hand the
+    // injected handle to JS. Completion reports the texture handle to JS instead
+    // of building native compositing state.
     struct PendingJsImport {
         uint32_t importId;
         uint32_t width;
@@ -290,21 +171,6 @@ class Compositor {
     // later releaseDmabufImport can address the GPU-side entry. Erased on release.
     struct WireHandleId { uint32_t id; uint32_t generation; };
     std::unordered_map<uint32_t, WireHandleId> jsImportHandles_;
-    // Finish a completed import (success path): retire the superseded buffer,
-    // adopt the injected texture, (re)build the bind group, mark present, and
-    // report the surface as imported.
-    void finishImport(const PendingImport& pi);
-    // Surfaces that gained presentable content since the last drain. Both shm and
-    // dmabuf report here for a single JS map-on-first-content path.
-    std::vector<ImportedSurface> importedSurfaces_;
-    void reportImported(uint32_t id, uint32_t width, uint32_t height);
-
-    // Back-to-front draw order (surface ids). Surfaces not in the stack are not
-    // drawn. JS owns this via setStack; ids not yet committed are tolerated.
-    std::vector<uint32_t> stack_;
-
-    // Write a surface's placement uniform from its layout rect + output size.
-    void updatePlacement(ClientSurface& cs);
 
     uint32_t windowWidth_ = 0;
     uint32_t windowHeight_ = 0;

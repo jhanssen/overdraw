@@ -124,8 +124,6 @@ export async function setupCompositor(opts = {}) {
     jsCompositor = new JsCompositor(device, dawn.globals, addon,
       { width: dims.width, height: dims.height }, dawn, h.device,
       { nested, format: addon.outputFormat() });
-    // The JS compositor now drives the frame; stop the C++ Compositor rendering.
-    addon.setExternalCompositor(true);
   }
 
   state = await installProtocols(addon, {
@@ -185,13 +183,9 @@ export async function setupCompositor(opts = {}) {
   }
 
   // Async composited-frame readback as a Promise<Uint8Array|null> (BGRA, dims).
-  // With the JS compositor, read its offscreen target; else the native one.
+  // Reads the JS compositor's offscreen target (headless only).
   function frameReadback() {
-    if (jsCompositor) return jsCompositor.readback().then((r) => r.data);
-    return new Promise((resolve) => {
-      const started = addon.frameReadback((px) => resolve(px));
-      if (!started) resolve(null);
-    });
+    return jsCompositor.readback().then((r) => r.data);
   }
 
   return {

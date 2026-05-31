@@ -98,9 +98,12 @@ export async function installProtocols(
   for (const [name, m] of mods) events[name] = m.makeEvents(addon.postEvent);
 
   // Shared compositor state across handlers.
+  if (!opts.compositor) {
+    throw new Error("installProtocols requires opts.compositor (the JS compositor)");
+  }
   const state: CompositorState = {
     surfaces: new Map(),
-    compositor: opts.compositor ?? addon,
+    compositor: opts.compositor,
     nextSerial: 1,
     serial() { return this.nextSerial++; },
   };

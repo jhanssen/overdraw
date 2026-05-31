@@ -53,10 +53,11 @@ export interface Addon {
     modsDepressed: number; modsLatched: number; modsLocked: number; group: number;
   };
 
-  // JS-compositor bridge (wire WebGPU via dawn.node).
+  // JS-compositor bridge (wire WebGPU via dawn.node). The compositing pass lives
+  // in JS (src/gpu/compositor.ts); the native side provides WSI (surface acquire/
+  // present), dmabuf import, and shm pixel access.
   gpuHandles(): { instance: bigint; device: bigint } | null;
   outputFormat(): string;
-  setExternalCompositor(on: boolean): void;
   acquireOutputTexture(): bigint | null;
   presentOutput(): void;
   shmView(poolId: number, offset: number, length: number): ArrayBuffer | null;
@@ -65,21 +66,6 @@ export interface Addon {
                           cb: (handle: bigint | null) => void): number;
   releaseDmabufImport(importId: number): void;
 
-  // Surface bridge / compositor.
-  commitSurfaceBuffer(id: number, poolId: number, offset: number, w: number,
-                      h: number, stride: number): boolean;
-  // The dmabuf fd is a WaylandFd; native dups it (the buffer is reused across
-  // commits). bufferId identifies the buffer for release tracking.
-  commitSurfaceDmabuf(id: number, fd: WaylandFd, w: number, h: number,
-                      fourcc: number, modHi: number, modLo: number,
-                      offset: number, stride: number, bufferId: number): boolean;
-  // Surfaces that gained presentable content (commit completed) since the last
-  // call, for both shm and dmabuf. Used as the single map-on-first-content
-  // signal (dmabuf commits complete asynchronously, so map cannot be inferred
-  // from commitSurfaceDmabuf's return).
-  takeImportedSurfaces(): Array<{ id: number; width: number; height: number }>;
-  // dmabuf bufferIds whose compositor GPU read has completed (safe to release).
-  takeFreedBuffers(): number[];
   // Synthetic input (test seam): feed a normalized InputEvent through the same
   // sink the host seat uses, so it routes to onInput / the seat exactly as a real
   // host event would. Used by integration tests to drive focus/pointer behavior.
@@ -90,17 +76,6 @@ export interface Addon {
   // if no input backend is active. Supersedes the manual input-smoke path (all
   // but the GPU-process host-seat listener, which needs a real device).
   injectHostInput(event: InputEvent): boolean;
-  removeSurface(id: number): void;
-  setSurfaceLayout(id: number, x: number, y: number, w: number, h: number): void;
-  setStack(ids: number[]): void;
-  // Async test hook: starts a texture readback; cb(px|null) fires later on the
-  // Node thread when the GPU map completes. Returns true if started.
-  surfaceReadback(id: number, cb: (px: Uint8Array | null) => void): boolean;
-  // Async readback of the COMPOSITED frame (headless offscreen target): the full
-  // placed + stacked + blended output as width*height*4 BGRA bytes. cb(px|null)
-  // fires on the Node thread. Returns false if not headless. Use for compositing
-  // correctness tests.
-  frameReadback(cb: (px: Uint8Array | null) => void): boolean;
 
   // shm pools. The pool fd is a WaylandFd; native takes the raw fd out of it.
   shmCreatePool(fd: WaylandFd, size: number): number;

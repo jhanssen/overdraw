@@ -15,7 +15,14 @@ test("xdg-shell: toplevel create + configure handshake + non-empty states array 
     const { installProtocols } = await import("../dist/protocols/index.js");
     const sock = addon.startServer();
     try {
-      const state = await installProtocols(addon);
+      // No-op compositor sink: this GPU-free test exercises the protocol
+      // handshake only (no rendering), so the compositing ops are stubs.
+      const noopCompositor = {
+        commitSurfaceBuffer: () => true, commitSurfaceDmabuf: () => true,
+        setSurfaceLayout: () => {}, setStack: () => {}, removeSurface: () => {},
+        takeImportedSurfaces: () => [], takeFreedBuffers: () => [],
+      };
+      const state = await installProtocols(addon, { compositor: noopCompositor });
       const { code } = await runClient("xdg-test-client", sock);
       assert.equal(code, 0, "client handshake + states-array intact (exit 0)");
       await sleep(100);

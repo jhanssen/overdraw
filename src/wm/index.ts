@@ -1,8 +1,8 @@
 // Window manager state holder (durable).
 //
-// Owns the window list + stacking order and pushes layout/stack to native via
-// addon.setSurfaceLayout / addon.setStack. JS owns placement (architecture.md:
-// "JS owns WM"); native only consumes rects + order.
+// Owns the window list + stacking order and pushes layout/stack to the
+// compositor sink (CompositorSink.setSurfaceLayout / setStack). JS owns placement
+// (architecture.md: "JS owns WM"); the compositor only consumes rects + order.
 //
 // This module is the durable seam. The *policy* (where windows go) lives in
 // placement.ts and is a stub today; a future dynamic-tiling+floating model

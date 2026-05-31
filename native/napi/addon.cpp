@@ -518,14 +518,6 @@ napi_value CreateTextureFromDmabuf(napi_env env, napi_callback_info info) {
 // setExternalCompositor(bool) -> undefined. When true, the C++ Compositor stops
 // rendering/presenting (the JS compositor drives the frame via acquireOutputTexture
 // + presentOutput).
-napi_value SetExternalCompositor(napi_env env, napi_callback_info info) {
-    size_t argc = 1; napi_value argv[1];
-    napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
-    bool on = false; napi_get_value_bool(env, argv[0], &on);
-    if (g_addon.compositor) g_addon.compositor->setExternalRender(on);
-    return nullptr;
-}
-
 // acquireOutputTexture() -> bigint | null. The host swapchain's current texture
 // handle (nested), for the JS compositor to wrap + render into this frame.
 napi_value AcquireOutputTexture(napi_env env, napi_callback_info) {
@@ -875,90 +867,14 @@ napi_value ShmBufferUnref(napi_env env, napi_callback_info info) {
 // commitSurfaceBuffer(surfaceId, poolId, offset, width, height, stride) -> boolean
 // Resolve the pool region and upload it to the surface's GPU texture. Requires
 // the compositor to be running. Returns false if pool/region invalid.
-napi_value CommitSurfaceBuffer(napi_env env, napi_callback_info info) {
-    size_t argc = 6; napi_value argv[6];
-    napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
-    if (argc < 6) return throwError(env, "commitSurfaceBuffer(surfaceId, poolId, offset, w, h, stride)");
-    if (!g_addon.compositor) return throwError(env, "compositor not running");
-    uint32_t surfaceId = 0, poolId = 0, offset = 0, w = 0, h = 0, stride = 0;
-    napi_get_value_uint32(env, argv[0], &surfaceId);
-    napi_get_value_uint32(env, argv[1], &poolId);
-    napi_get_value_uint32(env, argv[2], &offset);
-    napi_get_value_uint32(env, argv[3], &w);
-    napi_get_value_uint32(env, argv[4], &h);
-    napi_get_value_uint32(env, argv[5], &stride);
-    size_t need = static_cast<size_t>(stride) * h;
-    const uint8_t* pixels = g_addon.shm.view(poolId, offset, need);
-    bool ok = pixels != nullptr;
-    if (ok) g_addon.compositor->commitSurfaceShm(surfaceId, w, h, stride, pixels);
-    napi_value out; napi_get_boolean(env, ok, &out);
-    return out;
-}
-
 // commitSurfaceDmabuf(surfaceId, fdHandle, width, height, drmFourcc,
 //                     modifierHi, modifierLo, offset, stride) -> boolean
 // Take the client dmabuf fd (a WaylandFd) and import it as a sampled texture for
 // the surface. Returns false if the import is rejected.
-napi_value CommitSurfaceDmabuf(napi_env env, napi_callback_info info) {
-    size_t argc = 10; napi_value argv[10];
-    napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
-    if (argc < 10) return throwError(env,
-        "commitSurfaceDmabuf(surfaceId, fd, w, h, fourcc, modHi, modLo, offset, stride, bufferId)");
-    if (!g_addon.compositor) return throwError(env, "compositor not running");
-    uint32_t surfaceId = 0, w = 0, h = 0, fourcc = 0, modHi = 0, modLo = 0, offset = 0, stride = 0;
-    napi_get_value_uint32(env, argv[0], &surfaceId);
-    napi_get_value_uint32(env, argv[2], &w);
-    napi_get_value_uint32(env, argv[3], &h);
-    napi_get_value_uint32(env, argv[4], &fourcc);
-    napi_get_value_uint32(env, argv[5], &modHi);
-    napi_get_value_uint32(env, argv[6], &modLo);
-    napi_get_value_uint32(env, argv[7], &offset);
-    napi_get_value_uint32(env, argv[8], &stride);
-    uint32_t bufferId = 0;
-    napi_get_value_uint32(env, argv[9], &bufferId);
-    // dmabuf wl_buffers are reused (re-attached) across many commits, so the fd
-    // must NOT be consumed -- dup it and keep the WaylandFd valid for next time.
-    int fd = overdraw::wayland::peekWaylandFd(env, argv[1]);
-    if (fd < 0) { napi_value out; napi_get_boolean(env, false, &out); return out; }
-    uint64_t modifier = (static_cast<uint64_t>(modHi) << 32) | modLo;
-    bool ok = g_addon.compositor->commitSurfaceDmabuf(surfaceId, fd, w, h, fourcc, modifier,
-                                                      offset, stride, bufferId);
-    ::close(fd);  // GPU process dup'd it over SCM_RIGHTS; close our dup
-    napi_value out; napi_get_boolean(env, ok, &out);
-    return out;
-}
-
 // takeImportedSurfaces() -> Array<{ id, width, height }>
 // Surfaces that gained presentable content (first or later commit completed),
 // for both shm and dmabuf. JS uses this as a single map-on-first-content signal.
-napi_value TakeImportedSurfaces(napi_env env, napi_callback_info) {
-    napi_value arr; napi_create_array(env, &arr);
-    if (!g_addon.compositor) return arr;
-    std::vector<Compositor::ImportedSurface> imported;
-    g_addon.compositor->takeImportedSurfaces(imported);
-    for (size_t i = 0; i < imported.size(); ++i) {
-        napi_value obj; napi_create_object(env, &obj);
-        setU32(env, obj, "id", imported[i].id);
-        setU32(env, obj, "width", imported[i].width);
-        setU32(env, obj, "height", imported[i].height);
-        napi_set_element(env, arr, static_cast<uint32_t>(i), obj);
-    }
-    return arr;
-}
-
 // takeFreedBuffers() -> number[]  (dmabuf bufferIds whose GPU read completed)
-napi_value TakeFreedBuffers(napi_env env, napi_callback_info) {
-    napi_value arr; napi_create_array(env, &arr);
-    if (!g_addon.compositor) return arr;
-    std::vector<uint64_t> freed;
-    g_addon.compositor->takeFreedBuffers(freed);
-    for (size_t i = 0; i < freed.size(); ++i) {
-        napi_value v; napi_create_uint32(env, static_cast<uint32_t>(freed[i]), &v);
-        napi_set_element(env, arr, static_cast<uint32_t>(i), v);
-    }
-    return arr;
-}
-
 // injectInput(event) -> undefined
 // Synthetic input backend (test seam): build a normalized InputEvent from a plain
 // JS object and feed it through the SAME InputSink the host seat uses, so it
@@ -1093,58 +1009,10 @@ napi_value InjectHostInput(napi_env env, napi_callback_info info) {
 }
 
 // removeSurface(surfaceId) -> undefined
-napi_value RemoveSurface(napi_env env, napi_callback_info info) {
-    size_t argc = 1; napi_value argv[1];
-    napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
-    if (argc < 1) return throwError(env, "removeSurface(surfaceId) requires a surfaceId");
-    if (g_addon.compositor) {
-        uint32_t surfaceId = 0; napi_get_value_uint32(env, argv[0], &surfaceId);
-        g_addon.compositor->removeSurface(surfaceId);
-    }
-    napi_value undef; napi_get_undefined(env, &undef);
-    return undef;
-}
-
 // setSurfaceLayout(surfaceId, x, y, w, h) -> undefined
 // Placement is owned by JS; this stores the surface's output-pixel rect. w/h of
 // 0 means "use the surface's content size".
-napi_value SetSurfaceLayout(napi_env env, napi_callback_info info) {
-    size_t argc = 5; napi_value argv[5];
-    napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
-    if (argc < 5) return throwError(env, "setSurfaceLayout(surfaceId, x, y, w, h)");
-    if (g_addon.compositor) {
-        uint32_t id = 0, w = 0, h = 0; int32_t x = 0, y = 0;
-        napi_get_value_uint32(env, argv[0], &id);
-        napi_get_value_int32(env, argv[1], &x);
-        napi_get_value_int32(env, argv[2], &y);
-        napi_get_value_uint32(env, argv[3], &w);
-        napi_get_value_uint32(env, argv[4], &h);
-        g_addon.compositor->setSurfaceLayout(id, x, y, w, h);
-    }
-    napi_value undef; napi_get_undefined(env, &undef);
-    return undef;
-}
-
 // setStack(idsArray) -> undefined. Back-to-front draw order; JS owns it.
-napi_value SetStack(napi_env env, napi_callback_info info) {
-    size_t argc = 1; napi_value argv[1];
-    napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
-    if (argc < 1) return throwError(env, "setStack(ids[]) requires an array");
-    if (g_addon.compositor) {
-        uint32_t n = 0; napi_get_array_length(env, argv[0], &n);
-        std::vector<uint32_t> ids;
-        ids.reserve(n);
-        for (uint32_t i = 0; i < n; ++i) {
-            napi_value v; napi_get_element(env, argv[0], i, &v);
-            uint32_t id = 0; napi_get_value_uint32(env, v, &id);
-            ids.push_back(id);
-        }
-        g_addon.compositor->setStack(ids);
-    }
-    napi_value undef; napi_get_undefined(env, &undef);
-    return undef;
-}
-
 // surfaceReadback(surfaceId, cb) -> boolean
 // Test hook: ASYNCHRONOUSLY read the uploaded surface texture back to CPU. Kicks
 // off the copy + map and returns true if started (false if the surface is
@@ -1154,83 +1022,12 @@ napi_value SetStack(napi_env env, napi_callback_info info) {
 // swapchain uses a non-blocking present mode (Mailbox) so the GPU process's
 // command thread is not parked in a blocking Surface::GetCurrentTexture while
 // the buffer-map command waits behind it.
-napi_value SurfaceReadback(napi_env env, napi_callback_info info) {
-    size_t argc = 2; napi_value argv[2];
-    napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
-    if (argc < 2) return throwError(env, "surfaceReadback(surfaceId, cb) requires a surfaceId and callback");
-    if (!g_addon.compositor) return throwError(env, "compositor not running");
-    uint32_t surfaceId = 0; napi_get_value_uint32(env, argv[0], &surfaceId);
-
-    // Hold a ref to the JS callback; release it after it fires once.
-    napi_ref cbRef = nullptr;
-    napi_create_reference(env, argv[1], 1, &cbRef);
-
-    bool started = g_addon.compositor->readbackSurface(
-        surfaceId,
-        [env, cbRef](bool ok, std::vector<uint8_t>&& px) {
-            napi_handle_scope scope;
-            napi_open_handle_scope(env, &scope);
-            napi_value arg;
-            if (ok) {
-                napi_value ab; void* data;
-                napi_create_arraybuffer(env, px.size(), &data, &ab);
-                std::memcpy(data, px.data(), px.size());
-                napi_create_typedarray(env, napi_uint8_array, px.size(), ab, 0, &arg);
-            } else {
-                napi_get_null(env, &arg);
-            }
-            napi_value cb, undefined;
-            napi_get_reference_value(env, cbRef, &cb);
-            napi_get_undefined(env, &undefined);
-            napi_call_function(env, undefined, cb, 1, &arg, nullptr);
-            napi_delete_reference(env, cbRef);
-            napi_close_handle_scope(env, scope);
-        });
-    if (!started) napi_delete_reference(env, cbRef);
-    napi_value out; napi_get_boolean(env, started, &out);
-    return out;
-}
-
 // frameReadback(cb) -> boolean
 // Async readback of the COMPOSITED frame (headless: the offscreen capture
 // texture, the full placed+stacked+blended output). cb(px | null) fires on the
 // Node thread when the GPU map completes. Returns false if no capture texture
 // exists (e.g. not headless). Use this (not surfaceReadback) to verify
 // compositing correctness.
-napi_value FrameReadback(napi_env env, napi_callback_info info) {
-    size_t argc = 1; napi_value argv[1];
-    napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
-    if (argc < 1) return throwError(env, "frameReadback(cb) requires a callback");
-    if (!g_addon.compositor) return throwError(env, "compositor not running");
-
-    napi_ref cbRef = nullptr;
-    napi_create_reference(env, argv[0], 1, &cbRef);
-
-    bool started = g_addon.compositor->readbackFrame(
-        [env, cbRef](bool ok, std::vector<uint8_t>&& px) {
-            napi_handle_scope scope;
-            napi_open_handle_scope(env, &scope);
-            napi_value arg;
-            if (ok) {
-                napi_value ab; void* data;
-                napi_create_arraybuffer(env, px.size(), &data, &ab);
-                std::memcpy(data, px.data(), px.size());
-                napi_create_typedarray(env, napi_uint8_array, px.size(), ab, 0, &arg);
-            } else {
-                napi_get_null(env, &arg);
-            }
-            napi_value cb, undefined;
-            napi_get_reference_value(env, cbRef, &cb);
-            napi_get_undefined(env, &undefined);
-            napi_call_function(env, undefined, cb, 1, &arg, nullptr);
-            napi_delete_reference(env, cbRef);
-            napi_close_handle_scope(env, scope);
-        });
-    if (!started) napi_delete_reference(env, cbRef);
-    napi_value out; napi_get_boolean(env, started, &out);
-    return out;
-}
-
 // dmabufFeedbackInfo() -> {
 //   formatTableFd: WaylandFd, formatTableSize, entryCount,
 //   mainDevice: Uint8Array(dev_t bytes), trancheFormats: Uint8Array(u16 indices)
@@ -1302,7 +1099,6 @@ napi_value Init(napi_env env, napi_value exports) {
                          ReleaseDmabufImport, nullptr, &fnReleaseDmabuf);
     napi_set_named_property(env, exports, "releaseDmabufImport", fnReleaseDmabuf);
     for (auto& [name, fn] : std::initializer_list<std::pair<const char*, napi_callback>>{
-             {"setExternalCompositor", SetExternalCompositor},
              {"acquireOutputTexture", AcquireOutputTexture},
              {"presentOutput", PresentOutput},
              {"outputFormat", OutputFormat}}) {
@@ -1327,20 +1123,11 @@ napi_value Init(napi_env env, napi_value exports) {
     reg("shmDestroyPool", ShmDestroyPool);
     reg("shmBufferRef", ShmBufferRef);
     reg("shmBufferUnref", ShmBufferUnref);
-    reg("commitSurfaceBuffer", CommitSurfaceBuffer);
-    reg("commitSurfaceDmabuf", CommitSurfaceDmabuf);
-    reg("takeImportedSurfaces", TakeImportedSurfaces);
-    reg("takeFreedBuffers", TakeFreedBuffers);
     reg("injectInput", InjectInput);
     reg("injectHostInput", InjectHostInput);
-    reg("removeSurface", RemoveSurface);
-    reg("setSurfaceLayout", SetSurfaceLayout);
-    reg("setStack", SetStack);
     reg("clientId", ClientId);
     reg("keymapInfo", KeymapInfo);
     reg("keyUpdate", KeyUpdate);
-    reg("surfaceReadback", SurfaceReadback);
-    reg("frameReadback", FrameReadback);
     reg("dmabufFeedbackInfo", DmabufFeedbackInfo);
 
     napi_set_named_property(env, exports, "start", fnStart);

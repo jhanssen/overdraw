@@ -27,9 +27,8 @@ const addon = require(join(__dirname, "..", "build", "overdraw_native.node")) as
 const gpuBin = process.env.OVERDRAW_GPU_PROCESS
   ?? join(__dirname, "..", "build", "overdraw-gpu-process");
 
-// The JS compositor (compositing pass in core JS over the Dawn wire) is the
-// default; set OVERDRAW_NATIVE_COMPOSITOR=1 to fall back to the C++ pass.
-const useJsCompositor = process.env.OVERDRAW_NATIVE_COMPOSITOR !== "1";
+// The compositing pass runs in core JS over the Dawn wire (dawn.node); the C++
+// compositing pass no longer exists.
 function loadDawn(): { wrapDevice: (i: bigint, d: bigint) => unknown; globals: unknown; wrapTexture: unknown } | null {
   const [p] = globSync(join(__dirname, "..", "build", "3rdparty", "dawn", "Dawn-*", "dawn.node"));
   return p ? (require(p)) : null;
@@ -68,26 +67,16 @@ if (config.plugins.length > 0) {
 const dims = addon.start(gpuBin, onFrame, onInput);
 console.log(`[overdraw] compositor up; output ${dims.width}x${dims.height}`);
 
-// Bring up the JS compositor (nested present to the host swapchain over the
-// wire). Falls back to the native C++ pass if dawn.node is missing or disabled.
-let compositor: CompositorSink | undefined;
-if (useJsCompositor) {
-  const dawn = loadDawn();
-  if (dawn) {
-    const h = addon.gpuHandles();
-    if (h) {
-      const device = dawn.wrapDevice(h.instance, h.device);
-      compositor = new JsCompositor(device, dawn.globals, addon as never,
-        { width: dims.width, height: dims.height }, dawn as never, h.device,
-        { nested: true, format: addon.outputFormat() });
-      addon.setExternalCompositor(true);
-      console.log("[overdraw] compositor: JS (over the Dawn wire)");
-    }
-  }
-  if (!compositor) console.log("[overdraw] compositor: native C++ (dawn.node unavailable)");
-} else {
-  console.log("[overdraw] compositor: native C++ (OVERDRAW_NATIVE_COMPOSITOR=1)");
-}
+// Bring up the JS compositor (nested present to the host swapchain over the wire).
+const dawn = loadDawn();
+if (!dawn) throw new Error("dawn.node not found (build the Dawn release with --node)");
+const h = addon.gpuHandles();
+if (!h) throw new Error("gpuHandles() returned null; compositor not running");
+const device = dawn.wrapDevice(h.instance, h.device);
+const compositor: CompositorSink = new JsCompositor(device, dawn.globals, addon as never,
+  { width: dims.width, height: dims.height }, dawn as never, h.device,
+  { nested: true, format: addon.outputFormat() });
+console.log("[overdraw] compositor: JS (over the Dawn wire)");
 
 const sock = addon.startServer();
 state = await installProtocols(addon, {
