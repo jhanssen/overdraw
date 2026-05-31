@@ -4,7 +4,7 @@ Tracks what is built and empirically proven versus what is still design only.
 The design itself lives in `architecture.md`; this file is the ground truth for
 "what exists right now."
 
-Last updated: 2026-05-30 (rev 15).
+Last updated: 2026-05-30 (rev 16).
 
 ## Protocol gaps & skeletons (READ FIRST)
 
@@ -877,9 +877,12 @@ Menus/dropdowns/tooltips: a compositor-positioned, input-grabbing child surface.
 - Grab + click-away dismiss: `xdg_popup.grab` records the grabbing popup; a pointer
   button press OUTSIDE the popup tree sends `popup_done` and is swallowed (seat
   `dismissGrabbedPopup` hook).
+- A popup is a `wl_surface` and may itself PARENT subsurfaces; the stack rebuild
+  walks each mapped popup's subsurface subtree above it (`emitSubtree`).
 - Verified (`test/popup.gpu.mjs`): a popup with anchor_rect + bottom_left anchor +
   bottom_right gravity composites at the computed parent-relative position, and the
-  client receives that position in `xdg_popup.configure`. **PASS.**
+  client receives that position in `xdg_popup.configure`; a popup-parented
+  subsurface composites above the popup at its offset. **PASS.**
 - **FLAGGED (untested sub-paths):** the grab/click-away DISMISS path
   (`maybeDismissGrabbedPopup`) and `reposition` are implemented but not covered by
   a test (the e2e test covers positioning + map only). Constraint flip/slide/resize
