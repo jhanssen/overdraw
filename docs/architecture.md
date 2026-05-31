@@ -811,6 +811,57 @@ v2 supervisor catches the core's exit and surfaces failure to user.
 
 ## Rendering and buffer interop
 
+### Exposing WebGPU to JS: wire-retargeted `dawn.node` (DECISION)
+
+Both the core compositing renderer (which the design puts in JS — see "Core
+process") and the plugin SDK `gpu` need the same thing: a JS WebGPU
+implementation whose objects are backed by a Dawn **wire client** (the device
+lives in the GPU process). Decision: **use Dawn's own `dawn.node` bindings,
+retargeted onto the wire client**, rather than hand-writing a WebGPU shim.
+
+Rationale (verified, not assumed): `dawn.node`'s ~60 `GPUxxx` object bindings +
+the WebIDL-generated interop layer dispatch entirely through the Dawn proc
+table, so they are backend-agnostic and work unchanged over the wire. The only
+native coupling is the bootstrap (proc-table selection + instance/adapter
+creation), which is small and localized. So the large per-object binding surface
+is free; only the bootstrap is forked.
+
+Mechanism:
+
+- The proc table is process-global and set to `dawn::wire::client::GetProcs()`.
+  There is **no native Dawn in the core process** — it all lives in the GPU
+  process. So the core renderer and every plugin worker share the one wire proc
+  table; this is consistent (all of them target the GPU process over a wire).
+- The host application brings up the wire instance/device (the existing
+  reserve-instance → side-channel inject → `RequestAdapter`/`RequestDevice`
+  handshake) and hands `dawn.node` the resulting handles. The fork adds
+  `wrapDevice(instanceHandle, deviceHandle)` and `wrapTexture(deviceHandle,
+  textureHandle)` entry points (wrapping host-provided wire handles), and an
+  `AsyncRunner` that pumps a `wgpu::Instance`. A wrapped device is *borrowed*
+  (its destructor does not `Destroy()` it).
+- Non-wire-propagatable resources stay native and are exposed to JS as wrappable
+  handles: dmabuf import (`SharedTextureMemory` reserve/inject) becomes a native
+  `createTextureFromDmabuf(...) -> handle` that JS wraps via `wrapTexture`; shm
+  pixels are exposed as a zero-copy external `ArrayBuffer` over the client
+  mapping for `queue.writeTexture`; the swapchain `GetCurrentTexture`/`Present`
+  stay native. The rule: *normal wire WebGPU ops happen in JS; only the
+  non-wire-propagatable bits are native calls returning wrappable handles.*
+
+Lifetime constraint (load-bearing): JS WebGPU object finalizers run at process
+exit and call into the C++ wire client, so **the wire client must outlive the JS
+GPU objects** — the host marks the client shared-with-JS and, on teardown,
+`Disconnect()`s but leaks it rather than freeing it (a use-after-free / crash
+otherwise). The wire pump must also run inside an N-API `HandleScope` once JS
+WebGPU shares the connection (it can resolve `dawn.node` promises).
+
+Packaging: the `jhanssen/dawn` fork's release build ships `dawn.node` alongside
+the wire libs from one commit (ABI must match the host's wire client). The
+node-binding link must hide static-archive symbols (`-Wl,--exclude-libs,ALL`) so
+the bundled abseil does not interpose with the abseil inside V8/Node.
+
+See `status.md` for what is built/proven (the core compositing pass runs in JS
+over the wire for the headless + shm path).
+
 ### Dmabuf-backed surfaces, end to end
 
 Used for both plugin surfaces and real Wayland clients (via
