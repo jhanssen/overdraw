@@ -17,6 +17,7 @@ import { globSync } from "node:fs";
 import { installProtocols } from "./protocols/index.js";
 import { parseConfigArg, loadConfig } from "./config/load.js";
 import { JsCompositor } from "./gpu/compositor.js";
+import type { DawnWire } from "./gpu/compositor.js";
 import type { Addon, InputEvent } from "./types.js";
 import type { CompositorSink, CompositorState } from "./protocols/ctx.js";
 
@@ -29,9 +30,13 @@ const gpuBin = process.env.OVERDRAW_GPU_PROCESS
 
 // The compositing pass runs in core JS over the Dawn wire (dawn.node); the C++
 // compositing pass no longer exists.
-function loadDawn(): { wrapDevice: (i: bigint, d: bigint) => unknown; globals: unknown; wrapTexture: unknown } | null {
+interface DawnModule extends DawnWire {
+  wrapDevice(instanceHandle: bigint, deviceHandle: bigint): unknown; // -> GPUDevice
+  globals: unknown;
+}
+function loadDawn(): DawnModule | null {
   const [p] = globSync(join(__dirname, "..", "build", "3rdparty", "dawn", "Dawn-*", "dawn.node"));
-  return p ? (require(p)) : null;
+  return p ? (require(p) as DawnModule) : null;
 }
 
 let state: CompositorState | null = null;
@@ -73,8 +78,8 @@ if (!dawn) throw new Error("dawn.node not found (build the Dawn release with --n
 const h = addon.gpuHandles();
 if (!h) throw new Error("gpuHandles() returned null; compositor not running");
 const device = dawn.wrapDevice(h.instance, h.device);
-const compositor: CompositorSink = new JsCompositor(device, dawn.globals, addon as never,
-  { width: dims.width, height: dims.height }, dawn as never, h.device,
+const compositor: CompositorSink = new JsCompositor(device, dawn.globals, addon,
+  { width: dims.width, height: dims.height }, dawn, h.device,
   { nested: true, format: addon.outputFormat() });
 console.log("[overdraw] compositor: JS (over the Dawn wire)");
 
