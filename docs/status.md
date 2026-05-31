@@ -4,7 +4,7 @@ Tracks what is built and empirically proven versus what is still design only.
 The design itself lives in `architecture.md`; this file is the ground truth for
 "what exists right now."
 
-Last updated: 2026-05-31 (rev 20).
+Last updated: 2026-05-31 (rev 21).
 
 ## Protocol gaps & skeletons (READ FIRST)
 
@@ -163,13 +163,13 @@ server) topology runs as real, non-spike code and presents to a host window:
     inline map in `wl_surface.commit` (which relied on the synchronous dmabuf
     return) is gone; `commit` no longer infers map for either path. A
     `surfacesById` map gives the sweep id→record lookup.
-  - **Async readback (`surfaceReadback`).** The last steady-state synchronous
-    pump is gone: `Compositor::readbackSurface(id, cb)` kicks off
-    `CopyTextureToBuffer` + `MapAsync` and returns immediately; the staging buffer
-    is captured in the map callback (kept alive until it fires) which delivers the
-    pixels to a JS callback on the Node thread (driven by the wire pump). The
-    addon `surfaceReadback(id, cb)` and both smoke tests use the callback form.
-  - Verified (RTX 5060 / driver 595.71.05): `dmabuf-upload-smoke.mjs` PASS
+  - **(HISTORICAL) Async readback.** This section documents the original
+    native-compositor commit/readback path (`commitSurfaceShm`/`commitSurfaceDmabuf`,
+    `surfaceReadback`, the `*-upload-smoke.mjs` tests). That path was REMOVED with
+    the C++ compositing pass; compositing + readback now live in JS (see
+    "Compositing pass runs in JS over the Dawn wire"). The two-process spine,
+    non-blocking IPC, and async dmabuf import below remain accurate. Original note,
+    for reference (RTX 5060 / driver 595.71.05): `dmabuf-upload-smoke.mjs` PASS
     (pixel-exact red, 0 bad components, 3/3 runs); `shm-upload-smoke.mjs` PASS
     (pixel-exact blue) through the unified path; structural `node --test` suite
     8/8. No leaked GPU process.
@@ -552,6 +552,12 @@ transpile). Default export may be an object or a (sync/async) function. Validate
   done (see "Input routing to clients").
 
 ### Client shm buffers end-to-end (upload → composite → present, pixel-verified)
+NOTE: the IMPLEMENTATION below (`commitSurfaceShm`, native `WriteTexture`) was
+replaced by the JS compositor — shm upload now goes JS-side via `addon.shmView`
+(zero-copy `ArrayBuffer`) + `queue.writeTexture` (see "Compositing pass runs in
+JS over the Dawn wire"). The capability (real shm client composites, pixel-
+verified) still holds; the mechanism described here is historical.
+
 A real Wayland client can map a window with content and have its pixels reach
 the screen, verified by GPU readback:
 
@@ -585,6 +591,14 @@ the screen, verified by GPU readback:
   conversion beyond ARGB/XRGB8888.
 
 ### Client dmabuf buffers end-to-end (`linux-dmabuf-v1`, pixel-verified)
+NOTE: the IMPLEMENTATION below (native `commitSurfaceDmabuf` building the C++
+compositing state) was replaced by the JS compositor — dmabuf import is now
+`addon.createTextureFromDmabuf` (async, returns the wire handle) + dawn.node
+`wrapTexture`, with JS owning the buffer-release lifecycle (see "Compositing pass
+runs in JS over the Dawn wire"). The GPU-process import primitive (reserve →
+`ImportClientTex`/inject → `ReleaseClientTex`) is unchanged. The capability still
+holds; the core-side mechanism described here is historical.
+
 A real client can now pass its **own** dmabuf (zero-copy GPU buffer) and have it
 imported + composited — the two items previously flagged unverified (SCM_RIGHTS
 fd passing; importing a client-chosen modifier we did not allocate) are now
@@ -839,16 +853,16 @@ follows the same model.
 ### Headless mode (offscreen render, no host window)
 - `addon.start(gpuBin, onFrame?, onInput?, { width, height })` runs HEADLESS: the
   GPU process is spawned `--headless WxH` (no `HostWindow`, no `wl_surface`, no
-  host seat), brings up the device only, and skips `InjectSurface`/`SurfaceReady`.
-  The core `Compositor` skips `ReserveSurface`/`Configure`/`Present` and renders
-  the compositing pass into an owned offscreen `RenderAttachment|CopySrc` texture
-  (`captureTex_`, BGRA8Unorm). Verified by `EnumerateAdapters` succeeding with no
-  surface (matches a known-good Dawn headless app). Still requires the GPU.
-- `addon.frameReadback(cb)` (core `readbackFrame`) async-reads the COMPOSITED
-  offscreen frame (full placed+stacked+blended output), distinct from
-  `surfaceReadback` (one surface texture). Shared `readbackTexture()` helper.
+  host seat), brings up the device only, and skips `InjectSurface`/`SurfaceReady`;
+  the core `Compositor` skips `ReserveSurface`/`Configure`/`Present`. Still
+  requires the GPU. The JS compositor (`JsCompositor`, headless mode) creates its
+  own offscreen `RenderAttachment|CopySrc` target (BGRA8Unorm) and renders into it.
+- Frame readback is `JsCompositor.readback()` (the harness exposes it as
+  `frameReadback()`): async `copyTextureToBuffer` + `mapAsync` of the offscreen
+  target → tightly-packed BGRA. (The former native `addon.frameReadback`/
+  `surfaceReadback`/`readbackTexture` were removed with the C++ compositing pass.)
 - The real launcher (`main.ts`) passes no headless arg → stays NESTED (host
-  window + swapchain).
+  window + swapchain), and presents on the JS compositor.
 - **`input-smoke` removed** (was interactive — required a human to move the mouse
   / type over the nested window). Its durable, product-relevant coverage (the
   `WaylandInputBackend` normalization + seat routing → focus/clients) is now
@@ -892,9 +906,7 @@ follows the same model.
   isolates files into separate processes). Matters if a long-running compositor
   ever restarts its server; needs a real fix in `native/wayland/server.cpp`.
 - **Not yet built (testing):** a stdin command loop on the harness client for
-  multi-step sequences (raise/move/resize) within one client lifetime; using
-  `frameReadback` to also assert the dmabuf/shm upload smokes' pixels through the
-  headless path (then retiring `surfaceReadback`).
+  multi-step sequences (raise/move/resize) within one client lifetime.
 
 ### Subsurface compositing (`wl_subsurface`, pixel-verified)
 A child `wl_surface` made a subsurface of a parent is composited above the parent
