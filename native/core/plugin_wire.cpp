@@ -30,6 +30,28 @@ PluginWireClient::~PluginWireClient() {
 
 void PluginWireClient::markSharedWithJs() { link_->markSharedWithExternal(); }
 
+PluginWireClient::SurfaceReservation PluginWireClient::reserveProducerTexture(
+        uint32_t surfaceBufId, uint32_t width, uint32_t height) {
+    SurfaceReservation out{{0, 0}, {0, 0}, false};
+    if (!device_) return out;
+    wgpu::TextureDescriptor td{};
+    td.size = {width, height, 1};
+    td.format = wgpu::TextureFormat::BGRA8Unorm;
+    td.usage = wgpu::TextureUsage::RenderAttachment | wgpu::TextureUsage::TextureBinding;
+    auto rt = link_->client().ReserveTexture(
+        device_.Get(), reinterpret_cast<const WGPUTextureDescriptor*>(&td));
+    producerReservations_[surfaceBufId] = rt;
+    out.texture = {rt.handle.id, rt.handle.generation};
+    out.device = {rt.deviceHandle.id, rt.deviceHandle.generation};
+    out.ok = true;
+    return out;
+}
+
+WGPUTexture PluginWireClient::producerTexture(uint32_t surfaceBufId) const {
+    auto it = producerReservations_.find(surfaceBufId);
+    return it == producerReservations_.end() ? nullptr : it->second.texture;
+}
+
 bool PluginWireClient::bringUp() {
     // Reserve the plugin instance on this wire client; relay the handle so the
     // GPU process injects its native instance at it (InjectPluginInstance).

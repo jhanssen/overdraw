@@ -11,7 +11,9 @@
 #ifndef OVERDRAW_CORE_PLUGIN_WIRE_H_
 #define OVERDRAW_CORE_PLUGIN_WIRE_H_
 
+#include <memory>
 #include <string>
+#include <unordered_map>
 
 #include "dawn/wire/WireClient.h"
 #include "dawn/webgpu_cpp.h"
@@ -50,6 +52,21 @@ class PluginWireClient {
     // Mark the wire client shared with JS (dawn.node) so it outlives JS objects.
     void markSharedWithJs();
 
+    // Reserve a producer texture (RenderAttachment|TextureBinding) on the plugin
+    // device for a surface buffer; returns its wire handle + the device handle,
+    // holding the reservation alive (keyed by surfaceBufId). The GPU process
+    // injects the dmabuf texture at this handle (via AllocSurfaceBuf). The wrapped
+    // texture (dawn.node) is what the plugin renders into.
+    struct Reserved { uint32_t id; uint32_t generation; };
+    struct SurfaceReservation { Reserved texture; Reserved device; bool ok; };
+    SurfaceReservation reserveProducerTexture(uint32_t surfaceBufId,
+                                              uint32_t width, uint32_t height);
+    // The producer texture handle for a surface buffer (the plugin wraps + renders
+    // into it). null if unknown.
+    WGPUTexture producerTexture(uint32_t surfaceBufId) const;
+    // Flush queued wire bytes (call after reserving, before AllocSurfaceBuf).
+    void flush() { link_->flush(); }
+
     // Steady-state pump hooks (driven from the addon's libuv loop, C-M4 later).
     void drainInbound() { link_->drainInbound(); }
     void pumpOut() { link_->pumpOut(); }
@@ -64,6 +81,7 @@ class PluginWireClient {
     wgpu::Instance instance_;
     wgpu::Device device_;
     std::string error_;
+    std::unordered_map<uint32_t, dawn::wire::ReservedTexture> producerReservations_;
 };
 
 }  // namespace overdraw::core

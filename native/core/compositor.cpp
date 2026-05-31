@@ -249,6 +249,17 @@ void Compositor::drainCtrl() {
             pluginInstanceInjected_[r.connId] = r.ok ? 1 : 2;
             continue;
         }
+        if (r.tag == ipc::Tag::SurfaceBufAllocated) {
+            surfaceBufAllocated_[r.surfaceBufId] = r.ok ? 1 : 2;
+            if (!r.ok) {
+                auto it = coreSurfaceReservations_.find(r.surfaceBufId);
+                if (it != coreSurfaceReservations_.end()) {
+                    link_->client().ReclaimTextureReservation(it->second);
+                    coreSurfaceReservations_.erase(it);
+                }
+            }
+            continue;
+        }
         if (r.tag != ipc::Tag::ClientTexImported) continue;
         // JS-compositor dmabuf import: report the injected texture handle to JS.
         // Match by reserved texture handle id (the reply echoes it); imports
@@ -272,6 +283,53 @@ void Compositor::drainCtrl() {
         }
         pendingJsImports_.erase(jit);
     }
+}
+
+Compositor::CoreSurfaceReservation Compositor::reserveCoreSurfaceTexture(
+        uint32_t width, uint32_t height) {
+    CoreSurfaceReservation out{0, {0, 0}, {0, 0}};
+    if (!device_) return out;
+    const uint32_t surfaceBufId = nextSurfaceBufId_++;
+    wgpu::TextureDescriptor td{};
+    td.size = {width, height, 1};
+    td.format = wgpu::TextureFormat::BGRA8Unorm;
+    td.usage = wgpu::TextureUsage::TextureBinding | wgpu::TextureUsage::CopySrc;
+    auto rt = link_->client().ReserveTexture(
+        device_.Get(), reinterpret_cast<const WGPUTextureDescriptor*>(&td));
+    coreSurfaceReservations_[surfaceBufId] = rt;
+    surfaceBufAllocated_[surfaceBufId] = 0;  // pending
+    out.surfaceBufId = surfaceBufId;
+    out.texture = {rt.handle.id, rt.handle.generation};
+    out.device = {rt.deviceHandle.id, rt.deviceHandle.generation};
+    return out;
+}
+
+void Compositor::sendAllocSurfaceBuf(uint32_t surfaceBufId, uint32_t connId,
+                                     uint32_t width, uint32_t height,
+                                     ReservedHandle pluginDevice, ReservedHandle pluginTexture,
+                                     ReservedHandle coreDevice, ReservedHandle coreTexture) {
+    link_->flush();  // ensure any reserve-related wire bytes are queued first
+    ipc::Message m{};
+    m.tag = ipc::Tag::AllocSurfaceBuf;
+    m.surfaceBufId = surfaceBufId;
+    m.connId = connId;
+    m.width = width;
+    m.height = height;
+    m.pluginDevice = {pluginDevice.id, pluginDevice.generation};
+    m.pluginTexture = {pluginTexture.id, pluginTexture.generation};
+    m.device = {coreDevice.id, coreDevice.generation};
+    m.texture = {coreTexture.id, coreTexture.generation};
+    ipc::sendMessage(ctrlFd_, m);
+}
+
+int Compositor::surfaceBufAllocated(uint32_t surfaceBufId) const {
+    auto it = surfaceBufAllocated_.find(surfaceBufId);
+    return it == surfaceBufAllocated_.end() ? 0 : it->second;
+}
+
+WGPUTexture Compositor::coreSurfaceTexture(uint32_t surfaceBufId) const {
+    auto it = coreSurfaceReservations_.find(surfaceBufId);
+    return it == coreSurfaceReservations_.end() ? nullptr : it->second.texture;
 }
 
 Compositor::PluginConnHandle Compositor::addWireConnection() {

@@ -114,6 +114,31 @@ class Compositor {
     int wireConnAdded(uint32_t connId) const;
     int pluginInstanceInjected(uint32_t connId) const;
 
+    // --- Plugin producer/consumer surface buffer (C-M4 step 2) ----------------
+    // Reserve a CORE-device texture (the consumer side: TextureBinding|CopySrc)
+    // for a plugin surface buffer, returning its wire handle + the surfaceBufId
+    // to use. Holds the reservation alive (keyed by surfaceBufId). The plugin
+    // (producer) reserves its own texture on its wire client; the caller then
+    // calls sendAllocSurfaceBuf with both handles.
+    struct ReservedHandle { uint32_t id; uint32_t generation; };
+    struct CoreSurfaceReservation {
+        uint32_t surfaceBufId;
+        ReservedHandle texture;   // core reserved texture handle
+        ReservedHandle device;    // core device wire handle
+    };
+    CoreSurfaceReservation reserveCoreSurfaceTexture(uint32_t width, uint32_t height);
+    // Send AllocSurfaceBuf (one GBM dmabuf imported into plugin+core devices,
+    // injected at both reserved handles). Completion async; poll
+    // surfaceBufAllocated(surfaceBufId).
+    void sendAllocSurfaceBuf(uint32_t surfaceBufId, uint32_t connId,
+                             uint32_t width, uint32_t height,
+                             ReservedHandle pluginDevice, ReservedHandle pluginTexture,
+                             ReservedHandle coreDevice, ReservedHandle coreTexture);
+    int surfaceBufAllocated(uint32_t surfaceBufId) const;
+    // The core's wrapped texture handle for a successfully-allocated surface buf
+    // (the consumer texture the JS compositor wraps + samples). 0 if unknown.
+    WGPUTexture coreSurfaceTexture(uint32_t surfaceBufId) const;
+
     // The JS compositor drives every frame: it acquires the output texture,
     // renders into it over the wire, and presents. The C++ Compositor no longer
     // has a compositing pass -- it provides WSI (surface/acquire/present), dmabuf
@@ -168,6 +193,12 @@ class Compositor {
     uint32_t nextConnId_ = 1;
     std::unordered_map<uint32_t, int> wireConnAdded_;
     std::unordered_map<uint32_t, int> pluginInstanceInjected_;
+
+    // Plugin surface buffers: the core-side reservation (held alive) + alloc
+    // status, keyed by surfaceBufId.
+    uint32_t nextSurfaceBufId_ = 1;
+    std::unordered_map<uint32_t, dawn::wire::ReservedTexture> coreSurfaceReservations_;
+    std::unordered_map<uint32_t, int> surfaceBufAllocated_;
 
     bool headless_ = false;
     wgpu::Texture currentOutputTexture_;  // held between acquire + present

@@ -485,6 +485,62 @@ napi_value PluginConnect(napi_env env, napi_callback_info) {
     return obj;
 }
 
+// pluginAllocSurfaceBuffer(connId, w, h): allocate ONE producer/consumer surface
+// buffer (GBM dmabuf) shared between the plugin device (producer) and core device
+// (consumer). Returns { surfaceBufId, producerTexture, consumerTexture } (BigInt
+// wire handles for dawn.node wrapTexture). C-M4 step 2; main-thread.
+napi_value PluginAllocSurfaceBuffer(napi_env env, napi_callback_info info) {
+    if (!g_addon.compositor) return nullptr;
+    size_t argc = 3; napi_value argv[3];
+    napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+    uint32_t connId = 0, w = 0, h = 0;
+    napi_get_value_uint32(env, argv[0], &connId);
+    napi_get_value_uint32(env, argv[1], &w);
+    napi_get_value_uint32(env, argv[2], &h);
+
+    overdraw::core::PluginWireClient* pw = nullptr;
+    for (auto& p : g_addon.pluginWires) if (p->connId() == connId) { pw = p.get(); break; }
+    if (!pw) return throwError(env, "pluginAllocSurfaceBuffer: unknown connId");
+    if (w == 0 || h == 0) return throwError(env, "pluginAllocSurfaceBuffer: bad size");
+
+    auto core = g_addon.compositor->reserveCoreSurfaceTexture(w, h);
+    if (core.surfaceBufId == 0) return throwError(env, "core texture reserve failed");
+    auto prod = pw->reserveProducerTexture(core.surfaceBufId, w, h);
+    if (!prod.ok) return throwError(env, "producer texture reserve failed");
+    pw->flush();
+    g_addon.compositor->sendAllocSurfaceBuf(
+        core.surfaceBufId, connId, w, h,
+        {prod.device.id, prod.device.generation},
+        {prod.texture.id, prod.texture.generation},
+        {core.device.id, core.device.generation},
+        {core.texture.id, core.texture.generation});
+
+    // Pump both wires + the ctrl drain until the GPU process replies.
+    for (int i = 0; i < 25000; ++i) {
+        g_addon.compositor->wirePumpOut();
+        g_addon.compositor->drainWire();
+        pw->pumpOut();
+        pw->drainInbound();
+        g_addon.compositor->drainCtrl();
+        if (g_addon.compositor->surfaceBufAllocated(core.surfaceBufId) != 0) break;
+        ::usleep(200);
+    }
+    if (g_addon.compositor->surfaceBufAllocated(core.surfaceBufId) != 1)
+        return throwError(env, "GPU process did not allocate the surface buffer");
+
+    auto prodTex = reinterpret_cast<uint64_t>(pw->producerTexture(core.surfaceBufId));
+    auto consTex = reinterpret_cast<uint64_t>(g_addon.compositor->coreSurfaceTexture(core.surfaceBufId));
+    napi_value obj, sv, pv, cv;
+    napi_create_object(env, &obj);
+    napi_create_uint32(env, core.surfaceBufId, &sv);
+    napi_create_bigint_uint64(env, prodTex, &pv);
+    napi_create_bigint_uint64(env, consTex, &cv);
+    napi_set_named_property(env, obj, "surfaceBufId", sv);
+    napi_set_named_property(env, obj, "producerTexture", pv);
+    napi_set_named_property(env, obj, "consumerTexture", cv);
+    return obj;
+}
+
 // Pending JS dmabuf-import callbacks, keyed by importId. The callback fires once
 // when the import completes (or fails), then the ref is released.
 std::unordered_map<uint32_t, napi_ref> g_jsImportCbs;
@@ -1177,6 +1233,7 @@ napi_value Init(napi_env env, napi_value exports) {
     reg("keyUpdate", KeyUpdate);
     reg("dmabufFeedbackInfo", DmabufFeedbackInfo);
     reg("pluginConnect", PluginConnect);
+    reg("pluginAllocSurfaceBuffer", PluginAllocSurfaceBuffer);
 
     napi_set_named_property(env, exports, "start", fnStart);
     napi_set_named_property(env, exports, "stop", fnStop);

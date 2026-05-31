@@ -409,6 +409,21 @@ int run(int wireFd, int ctrlFd, int inputFd, bool headless,
     };
     std::vector<std::unique_ptr<PluginConn>> pluginConns;
 
+    // --- Plugin producer/consumer surface buffers (C-M4 step 2) ---------------
+    // One GBM dmabuf shared between the plugin device (producer) and the core
+    // device (consumer), imported as SharedTextureMemory on EACH and injected at
+    // each side's reserved wire texture handle. The cross-device fence (C-M1) is
+    // applied per frame in step 3 (plugin EndAccess -> sync-fd -> core BeginAccess
+    // waits it). Keyed by surfaceBufId.
+    struct SurfaceBuf {
+        gpu::DmabufBuffer buf;
+        wgpu::SharedTextureMemory producerMem;  // on the plugin device
+        wgpu::Texture producerTex;
+        wgpu::SharedTextureMemory consumerMem;  // on the core device
+        wgpu::Texture consumerTex;
+    };
+    std::unordered_map<uint32_t, SurfaceBuf> surfaceBufs;
+
     // Import a client dmabuf (fd owned by us) and inject the texture. Sends the
     // ClientTexImported reply. Caller must ensure the wire reader has reached
     // m.wireSerial first (so the prior UnregisterObjectCmd for this recycled
@@ -553,6 +568,56 @@ int run(int wireFd, int ctrlFd, int inputFd, bool headless,
                     reply.ok = 1;
                 }
                 ipc::sendMessage(ctrlFd, reply);
+            } else if (m.tag == ipc::Tag::AllocSurfaceBuf) {
+                // Allocate ONE GBM dmabuf; import into the plugin (producer) and
+                // core (consumer) devices; inject a texture at each side's
+                // reserved handle. The producer/consumer surface buffer.
+                ipc::Message reply{};
+                reply.tag = ipc::Tag::SurfaceBufAllocated;
+                reply.surfaceBufId = m.surfaceBufId;
+                reply.connId = m.connId;
+                reply.ok = 0;
+
+                PluginConn* pc = nullptr;
+                for (auto& c : pluginConns) if (c->connId == m.connId) { pc = c.get(); break; }
+                WGPUDevice pluginNative = pc ?
+                    pc->server->GetDevice(m.pluginDevice.id, m.pluginDevice.generation) : nullptr;
+                WGPUDevice coreNative =
+                    server.GetDevice(m.device.id, m.device.generation);
+                if (!pc || !pluginNative || !coreNative) {
+                    std::fprintf(stderr, "[gpu] AllocSurfaceBuf: device resolve failed "
+                                 "(pc=%d plugin=%p core=%p)\n", pc ? 1 : 0,
+                                 static_cast<void*>(pluginNative), static_cast<void*>(coreNative));
+                    ipc::sendMessage(ctrlFd, reply);
+                } else {
+                    SurfaceBuf sb{};
+                    wgpu::Device pluginDev(pluginNative);
+                    wgpu::Device coreDev(coreNative);
+                    bool ok = alloc.allocate(m.width, m.height, sb.buf);
+                    if (ok) ok = gpu::Allocator::importTexture(
+                        pluginDev, alloc.fourcc(), sb.buf, sb.producerMem, sb.producerTex);
+                    if (ok) ok = gpu::Allocator::importTexture(
+                        coreDev, alloc.fourcc(), sb.buf, sb.consumerMem, sb.consumerTex);
+                    if (ok) ok = pc->server->InjectTexture(sb.producerTex.Get(),
+                        {m.pluginTexture.id, m.pluginTexture.generation},
+                        {m.pluginDevice.id, m.pluginDevice.generation});
+                    if (ok) ok = server.InjectTexture(sb.consumerTex.Get(),
+                        {m.texture.id, m.texture.generation},
+                        {m.device.id, m.device.generation});
+                    if (ok) {
+                        pc->serializer->Flush();
+                        serializer.Flush();
+                        std::printf("[gpu] AllocSurfaceBuf id=%u %ux%u: imported on plugin+core, injected\n",
+                                    m.surfaceBufId, m.width, m.height);
+                        surfaceBufs[m.surfaceBufId] = std::move(sb);
+                        reply.ok = 1;
+                    } else {
+                        std::fprintf(stderr, "[gpu] AllocSurfaceBuf id=%u: alloc/import/inject failed\n",
+                                     m.surfaceBufId);
+                        alloc.release(sb.buf);
+                    }
+                    ipc::sendMessage(ctrlFd, reply);
+                }
             } else if (m.tag == ipc::Tag::BeginAccess) {
                 // Begin access so the core's wire render commands may target the
                 // dmabuf texture. Vulkan layout state is mandatory on this
@@ -741,6 +806,12 @@ int run(int wireFd, int ctrlFd, int inputFd, bool headless,
     clientTextures.clear();
     for (auto& p : pendingImports) if (p.fd >= 0) ::close(p.fd);
     pendingImports.clear();
+    for (auto& [id, sb] : surfaceBufs) {
+        sb.producerTex = nullptr; sb.producerMem = nullptr;
+        sb.consumerTex = nullptr; sb.consumerMem = nullptr;
+        alloc.release(sb.buf);
+    }
+    surfaceBufs.clear();
     for (auto& pc : pluginConns) {
         if (pc->registered) loop->remove(pc->fd);
         pc->server.reset();

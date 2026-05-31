@@ -53,6 +53,19 @@ enum class Tag : uint8_t {
                                  //   After this the plugin drives RequestAdapter/
                                  //   RequestDevice over its own wire.
     PluginInstanceInjected = 'p', // gpu -> core: InjectInstance done (ok)
+    AllocSurfaceBuf = 'A',  // core -> gpu : allocate ONE GBM dmabuf and import it
+                            //   into BOTH the plugin device (producer) and the
+                            //   core device (consumer), injecting a texture at
+                            //   each side's reserved handle. This is the
+                            //   producer/consumer surface buffer (architecture.md
+                            //   "Dmabuf-backed surfaces"). connId names the plugin
+                            //   connection; pluginDevice/pluginTexture are on the
+                            //   plugin wire, device/texture (core fields) on the
+                            //   core wire. width/height/format describe the buffer.
+    SurfaceBufAllocated = 'a',  // gpu -> core: allocated + imported + injected on
+                                //   both devices (ok=1), or failed (ok=0). Carries
+                                //   the surfaceBufId the core uses for later
+                                //   Begin/EndAccess on this buffer.
     Shutdown     = 'X',  // core -> gpu : clean termination request
 };
 
@@ -107,6 +120,17 @@ struct Message {
     // the core; echoed in the reply). `ok` is the reply's success flag.
     uint32_t connId = 0;
     uint32_t ok = 0;
+
+    // AllocSurfaceBuf: the plugin (producer) device + reserved texture handle, on
+    // the plugin wire connection (`connId`). The core (consumer) device + reserved
+    // texture handle use the `device`/`texture` fields above. `width`/`height`/
+    // `format` describe the buffer.
+    WireHandle pluginDevice;
+    WireHandle pluginTexture;
+    // SurfaceBufAllocated: an id naming this server-allocated surface buffer, for
+    // the core's later Begin/EndAccess (which side, plugin vs core, is implied by
+    // the access message). Assigned by the core in the request; echoed back.
+    uint32_t surfaceBufId = 0;
 
     // ImportClientTex: cross-channel ordering serial. The GPU process must not
     // act on this request until its wire reader has consumed at least this many

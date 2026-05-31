@@ -50,6 +50,23 @@ test("plugin wire connection brings up its own device", { skip: !dawn ? "dawn.no
     const buf = dev.createBuffer({ size: 256, usage: dawn.globals.GPUBufferUsage.COPY_DST });
     assert.ok(buf, "createBuffer on the plugin device");
     buf.destroy();
+
+    // C-M4 step 2: allocate a producer/consumer surface buffer (one GBM dmabuf
+    // imported into BOTH the plugin device and the core device). Both texture
+    // handles must wrap (dawn.node wrapTexture) on their respective devices.
+    const coreDev = dawn.wrapDevice(core.instance, core.device);
+    const sb = addon.pluginAllocSurfaceBuffer(p.connId, 64, 64);
+    assert.ok(sb && sb.surfaceBufId, "pluginAllocSurfaceBuffer");
+    assert.notEqual(sb.producerTexture, 0n, "producer texture handle");
+    assert.notEqual(sb.consumerTexture, 0n, "consumer texture handle");
+    // Producer texture on the plugin device, consumer on the core device.
+    const prodTex = dawn.wrapTexture(p.device, sb.producerTexture);
+    const consTex = dawn.wrapTexture(core.device, sb.consumerTexture);
+    assert.ok(prodTex, "wrap producer texture (plugin device)");
+    assert.ok(consTex, "wrap consumer texture (core device)");
+    // The producer can make a render-attachment view; the consumer a sampled view.
+    assert.ok(prodTex.createView(), "producer view");
+    assert.ok(consTex.createView(), "consumer view");
   } finally {
     addon.stop();
   }
