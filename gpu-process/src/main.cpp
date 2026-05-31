@@ -393,7 +393,7 @@ int run(int wireFd, int ctrlFd, int inputFd, bool headless,
         WGPUDevice tickDev = nullptr;  // set once the plugin device is resolved
         bool registered = false;       // added to the event loop yet
 
-        // Read + dispatch buffered wire frames, advance Dawn, pump outbound. NB.
+        // Read + dispatch buffered wire frames, advance Dawn, flush outbound. NB.
         bool pump() {
             bool alive = reader->readAvailable();
             std::vector<uint8_t> frame;
@@ -416,13 +416,86 @@ int run(int wireFd, int ctrlFd, int inputFd, bool headless,
     // applied per frame in step 3 (plugin EndAccess -> sync-fd -> core BeginAccess
     // waits it). Keyed by surfaceBufId.
     struct SurfaceBuf {
+        uint32_t connId = 0;  // owning plugin connection (for wire-serial ordering)
         gpu::DmabufBuffer buf;
         wgpu::SharedTextureMemory producerMem;  // on the plugin device
         wgpu::Texture producerTex;
+        wgpu::Device producerDev;               // plugin device (for fence import)
         wgpu::SharedTextureMemory consumerMem;  // on the core device
         wgpu::Texture consumerTex;
+        wgpu::Device consumerDev;               // core device (for fence import)
+        // Per-frame fence dance state. The dmabuf's Vulkan image layout is shared
+        // across both devices; each EndAccess reports the end layout, which the
+        // next BeginAccess (on either side) begins from. The held fences carry
+        // producer-done -> consumer-wait and consumer-done -> producer-wait.
+        int32_t layout = 0;                  // current Vulkan image layout (0=UNDEFINED)
+        bool everProduced = false;           // first ProducerBegin starts UNDEFINED
+        wgpu::SharedFence producerFence;     // last producer EndAccess fence (for consumer)
+        wgpu::SharedFence consumerFence;     // last consumer EndAccess fence (for producer)
     };
     std::unordered_map<uint32_t, SurfaceBuf> surfaceBufs;
+
+    // Close a producer/consumer bracket: EndAccess, export the produced sync-fd as
+    // a SharedFence held for the OTHER side's next Begin wait, record the end
+    // layout. (Defined as a lambda so the deferred-producer-end path can reuse it.)
+    auto runSurfaceEnd = [&](uint32_t surfaceBufId, bool producer) {
+        auto it = surfaceBufs.find(surfaceBufId);
+        if (it == surfaceBufs.end()) return;
+        SurfaceBuf& sb = it->second;
+        wgpu::SharedTextureMemory& mem = producer ? sb.producerMem : sb.consumerMem;
+        wgpu::Texture& tex = producer ? sb.producerTex : sb.consumerTex;
+        wgpu::SharedTextureMemoryVkImageLayoutEndState endLayout{};
+        wgpu::SharedTextureMemoryEndAccessState endState{};
+        endState.nextInChain = &endLayout;
+        if (mem.EndAccess(tex, &endState) != wgpu::Status::Success) {
+            std::fprintf(stderr, "[gpu] %sEnd: EndAccess failed (buf=%u)\n",
+                         producer ? "Producer" : "Consumer", surfaceBufId);
+            return;
+        }
+        sb.layout = endLayout.newLayout;
+        // producerFence (waited by consumer/core) / consumerFence (waited by
+        // producer/plugin); import into the WAITING side's device.
+        wgpu::SharedFence& held = producer ? sb.producerFence : sb.consumerFence;
+        wgpu::Device& waiterDev = producer ? sb.consumerDev : sb.producerDev;
+        held = nullptr;
+        if (endState.fenceCount >= 1) {
+            wgpu::SharedFenceExportInfo exp{};
+            wgpu::SharedFenceSyncFDExportInfo syncExp{};
+            exp.nextInChain = &syncExp;
+            endState.fences[0].ExportInfo(&exp);
+            if (syncExp.handle >= 0) {
+                int dupFd = ::dup(syncExp.handle);
+                if (dupFd >= 0) {
+                    wgpu::SharedFenceSyncFDDescriptor sfd{};
+                    sfd.handle = dupFd;
+                    wgpu::SharedFenceDescriptor fdd{};
+                    fdd.nextInChain = &sfd;
+                    held = waiterDev.ImportSharedFence(&fdd);
+                    ::close(dupFd);
+                }
+            }
+        }
+    };
+
+    // ProducerEnd messages whose plugin-wire serial the plugin conn's reader has
+    // not yet reached. Held until the plugin's render commands (on its own wire)
+    // are consumed, so the producer EndAccess happens AFTER the render. Mirrors
+    // the ImportClientTex cross-channel ordering.
+    struct PendingProducerEnd { uint32_t surfaceBufId; uint32_t connId; uint64_t wireSerial; };
+    std::vector<PendingProducerEnd> pendingProducerEnds;
+    auto drainPendingProducerEnds = [&]() {
+        for (size_t i = 0; i < pendingProducerEnds.size();) {
+            auto& pe = pendingProducerEnds[i];
+            PluginConn* pc = nullptr;
+            for (auto& c : pluginConns) if (c->connId == pe.connId) { pc = c.get(); break; }
+            if (pc && pc->reader->bytesConsumed() >= pe.wireSerial) {
+                runSurfaceEnd(pe.surfaceBufId, true);
+                pendingProducerEnds.erase(pendingProducerEnds.begin() + static_cast<long>(i));
+            } else {
+                ++i;
+            }
+        }
+    };
 
     // Import a client dmabuf (fd owned by us) and inject the texture. Sends the
     // ClientTexImported reply. Caller must ensure the wire reader has reached
@@ -568,6 +641,22 @@ int run(int wireFd, int ctrlFd, int inputFd, bool headless,
                     reply.ok = 1;
                 }
                 ipc::sendMessage(ctrlFd, reply);
+            } else if (m.tag == ipc::Tag::SetPluginTickDevice) {
+                // Resolve the plugin device + tick it each pump so its queue
+                // advances (map/work-done complete). Without this the plugin
+                // device's async ops never resolve.
+                PluginConn* pc = nullptr;
+                for (auto& c : pluginConns) if (c->connId == m.connId) { pc = c.get(); break; }
+                if (pc) {
+                    WGPUDevice dev = pc->server->GetDevice(m.device.id, m.device.generation);
+                    if (dev) {
+                        pc->tickDev = dev;
+                        std::fprintf(stderr, "[gpu] SetPluginTickDevice: connId=%u dev{%u,%u} ok\n",
+                                     m.connId, m.device.id, m.device.generation);
+                    } else {
+                        std::fprintf(stderr, "[gpu] SetPluginTickDevice: GetDevice null connId=%u\n", m.connId);
+                    }
+                }
             } else if (m.tag == ipc::Tag::AllocSurfaceBuf) {
                 // Allocate ONE GBM dmabuf; import into the plugin (producer) and
                 // core (consumer) devices; inject a texture at each side's
@@ -590,6 +679,10 @@ int run(int wireFd, int ctrlFd, int inputFd, bool headless,
                                  static_cast<void*>(pluginNative), static_cast<void*>(coreNative));
                     ipc::sendMessage(ctrlFd, reply);
                 } else {
+                    // tickDev is set via SetPluginTickDevice once the device is
+                    // resolved (right after bring-up); ensure it here too as a
+                    // fallback in case alloc happens first.
+                    if (!pc->tickDev) pc->tickDev = pluginNative;
                     SurfaceBuf sb{};
                     wgpu::Device pluginDev(pluginNative);
                     wgpu::Device coreDev(coreNative);
@@ -607,6 +700,9 @@ int run(int wireFd, int ctrlFd, int inputFd, bool headless,
                     if (ok) {
                         pc->serializer->Flush();
                         serializer.Flush();
+                        sb.producerDev = pluginDev;
+                        sb.consumerDev = coreDev;
+                        sb.connId = m.connId;
                         std::printf("[gpu] AllocSurfaceBuf id=%u %ux%u: imported on plugin+core, injected\n",
                                     m.surfaceBufId, m.width, m.height);
                         surfaceBufs[m.surfaceBufId] = std::move(sb);
@@ -618,6 +714,73 @@ int run(int wireFd, int ctrlFd, int inputFd, bool headless,
                     }
                     ipc::sendMessage(ctrlFd, reply);
                 }
+            } else if (m.tag == ipc::Tag::ProducerBegin ||
+                       m.tag == ipc::Tag::ConsumerBegin) {
+                // Open a producer (write) or consumer (read) access bracket on the
+                // surface buffer, WAITING the other side's last fence (C-M1
+                // cross-device fence, in-process here). The dmabuf's Vulkan layout
+                // continues from the last EndAccess. Reply *Done so the core/plugin
+                // proceeds only once the bracket + fence wait are in.
+                const bool producer = (m.tag == ipc::Tag::ProducerBegin);
+                ipc::Message reply{};
+                reply.tag = producer ? ipc::Tag::ProducerBeginDone : ipc::Tag::ConsumerBeginDone;
+                reply.surfaceBufId = m.surfaceBufId;
+                reply.ok = 0;
+                auto it = surfaceBufs.find(m.surfaceBufId);
+                if (it == surfaceBufs.end()) {
+                    std::fprintf(stderr, "[gpu] %sBegin: unknown surfaceBufId=%u\n",
+                                 producer ? "Producer" : "Consumer", m.surfaceBufId);
+                    ipc::sendMessage(ctrlFd, reply);
+                } else {
+                    SurfaceBuf& sb = it->second;
+                    wgpu::SharedTextureMemory& mem = producer ? sb.producerMem : sb.consumerMem;
+                    wgpu::Texture& tex = producer ? sb.producerTex : sb.consumerTex;
+                    // Producer waits the consumer's last fence; consumer waits the
+                    // producer's last fence.
+                    wgpu::SharedFence& wait = producer ? sb.consumerFence : sb.producerFence;
+                    // First producer access begins UNDEFINED + uninitialized; all
+                    // else continues from the last reported layout, initialized.
+                    bool firstProduce = producer && !sb.everProduced;
+                    wgpu::SharedTextureMemoryVkImageLayoutBeginState layout{};
+                    layout.oldLayout = firstProduce ? 0 : sb.layout;
+                    layout.newLayout = 1;  // GENERAL (render + sample capable)
+                    wgpu::SharedTextureMemoryBeginAccessDescriptor bad{};
+                    bad.nextInChain = &layout;
+                    bad.initialized = !firstProduce;
+                    uint64_t signaled = 1;
+                    if (wait) {
+                        bad.fenceCount = 1;
+                        bad.fences = &wait;
+                        bad.signaledValueCount = 1;
+                        bad.signaledValues = &signaled;
+                    } else {
+                        bad.fenceCount = 0;
+                    }
+                    if (mem.BeginAccess(tex, &bad) != wgpu::Status::Success) {
+                        std::fprintf(stderr, "[gpu] %sBegin: BeginAccess failed (buf=%u)\n",
+                                     producer ? "Producer" : "Consumer", m.surfaceBufId);
+                    } else {
+                        if (producer) sb.everProduced = true;
+                        reply.ok = 1;
+                    }
+                    ipc::sendMessage(ctrlFd, reply);
+                }
+            } else if (m.tag == ipc::Tag::ProducerEnd) {
+                // Defer the producer EndAccess until the plugin conn's wire reader
+                // has consumed the render commands (m.wireSerial) -- those go over
+                // the plugin wire, this message over ctrl, and ctrl can overtake.
+                auto it = surfaceBufs.find(m.surfaceBufId);
+                uint32_t connId = it != surfaceBufs.end() ? it->second.connId : 0;
+                pendingProducerEnds.push_back({m.surfaceBufId, connId, m.wireSerial});
+                drainPendingProducerEnds();
+                // No reply (fire-and-forget; ordering preserved by the consumer's
+                // next Begin waiting the held producer fence).
+            } else if (m.tag == ipc::Tag::ConsumerEnd) {
+                // Consumer's sample commands also go over a wire (the CORE wire),
+                // but the core flushes + drives its own wire before sending this;
+                // the consumer EndAccess fence is only waited by the producer's
+                // NEXT frame, so run immediately.
+                runSurfaceEnd(m.surfaceBufId, false);
             } else if (m.tag == ipc::Tag::BeginAccess) {
                 // Begin access so the core's wire render commands may target the
                 // dmabuf texture. Vulkan layout state is mandatory on this
@@ -782,6 +945,7 @@ int run(int wireFd, int ctrlFd, int inputFd, bool headless,
             loop->add(pc->fd, gpu::EventLoop::kRead, [&, pc](uint32_t ready) {
                 if (ready & gpu::EventLoop::kWrite) pc->serializer->pumpOut();
                 if (ready & gpu::EventLoop::kRead) pc->pump();
+                drainPendingProducerEnds();  // plugin render consumed -> end may fire
                 armPluginConn(pc);
             });
         }
@@ -793,6 +957,7 @@ int run(int wireFd, int ctrlFd, int inputFd, bool headless,
         drainPendingImports();
         registerPluginConns();          // pick up connections added this iteration
         for (auto& pc : pluginConns) pc->pump();  // advance each plugin connection
+        drainPendingProducerEnds();     // fire deferred producer EndAccess when ready
         if (!headless) window.pump();  // service host events (no window headless)
         armWire();
         for (auto& pc : pluginConns) armPluginConn(pc.get());
@@ -1127,6 +1292,12 @@ int selftestXDev() {
 
 int main(int argc, char** argv) {
     setvbuf(stdout, nullptr, _IOLBF, 0);
+    // Optional: redirect this process's stdout+stderr to a file (diagnostics --
+    // the parent's fds may not be capturable by a test harness redirect).
+    if (const char* lp = ::getenv("OVERDRAW_GPU_LOG")) {
+        FILE* f = ::freopen(lp, "w", stderr);
+        if (f) { ::dup2(::fileno(stderr), ::fileno(stdout)); setvbuf(stderr, nullptr, _IOLBF, 0); }
+    }
     installCrashHandler();
     // C-M1 verification mode: two-device cross-device dmabuf STM + fence
     // round-trip. Self-contained (no fds, no core); prints XDEV: PASS/FAIL.

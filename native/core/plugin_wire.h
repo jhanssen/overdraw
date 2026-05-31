@@ -53,8 +53,16 @@ class PluginWireClient {
 
     // Wire handles for the plugin's instance + device, for dawn.node wrapDevice
     // (same shape as Compositor::gpuHandles). Valid after bringUp().
+    // A wire object handle {id, generation}.
+    struct Reserved { uint32_t id; uint32_t generation; };
+
     WGPUInstance instanceHandle() const { return instance_.Get(); }
     WGPUDevice deviceHandle() const { return device_.Get(); }
+    // The plugin device's wire handle {id,generation} (for SetPluginTickDevice).
+    Reserved deviceWireHandle() const {
+        auto h = link_->client().GetWireHandle(device_.Get());
+        return {h.id, h.generation};
+    }
 
     // Mark the wire client shared with JS (dawn.node) so it outlives JS objects.
     void markSharedWithJs();
@@ -64,7 +72,6 @@ class PluginWireClient {
     // holding the reservation alive (keyed by surfaceBufId). The GPU process
     // injects the dmabuf texture at this handle (via AllocSurfaceBuf). The wrapped
     // texture (dawn.node) is what the plugin renders into.
-    struct Reserved { uint32_t id; uint32_t generation; };
     struct SurfaceReservation { Reserved texture; Reserved device; bool ok; };
     SurfaceReservation reserveProducerTexture(uint32_t surfaceBufId,
                                               uint32_t width, uint32_t height);
@@ -73,6 +80,11 @@ class PluginWireClient {
     WGPUTexture producerTexture(uint32_t surfaceBufId) const;
     // Flush queued wire bytes (call after reserving, before AllocSurfaceBuf).
     void flush() { link_->flush(); }
+    // Cumulative framed wire bytes queued (the cross-channel ordering serial).
+    // Sample after flush(); the GPU process defers a ctrl op until its plugin-conn
+    // wire reader has consumed at least this many bytes (so the plugin's render
+    // commands precede a ProducerEnd that depends on them).
+    uint64_t wireBytesQueued() const { return link_->wireBytesQueued(); }
 
     // Steady-state pump hooks (driven from the addon's libuv loop, C-M4 later).
     void drainInbound() { link_->drainInbound(); }

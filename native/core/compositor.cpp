@@ -249,6 +249,14 @@ void Compositor::drainCtrl() {
             pluginInstanceInjected_[r.connId] = r.ok ? 1 : 2;
             continue;
         }
+        if (r.tag == ipc::Tag::ProducerBeginDone) {
+            surfaceBeginDone_[r.surfaceBufId] = r.ok ? 1 : 3;
+            continue;
+        }
+        if (r.tag == ipc::Tag::ConsumerBeginDone) {
+            surfaceBeginDone_[r.surfaceBufId] = r.ok ? 2 : 3;
+            continue;
+        }
         if (r.tag == ipc::Tag::SurfaceBufAllocated) {
             surfaceBufAllocated_[r.surfaceBufId] = r.ok ? 1 : 2;
             if (!r.ok) {
@@ -332,6 +340,30 @@ WGPUTexture Compositor::coreSurfaceTexture(uint32_t surfaceBufId) const {
     return it == coreSurfaceReservations_.end() ? nullptr : it->second.texture;
 }
 
+void Compositor::sendProducerBegin(uint32_t surfaceBufId) {
+    surfaceBeginDone_[surfaceBufId] = 0;
+    ipc::Message m{}; m.tag = ipc::Tag::ProducerBegin; m.surfaceBufId = surfaceBufId;
+    ipc::sendMessage(ctrlFd_, m);
+}
+void Compositor::sendProducerEnd(uint32_t surfaceBufId, uint64_t pluginWireSerial) {
+    ipc::Message m{}; m.tag = ipc::Tag::ProducerEnd; m.surfaceBufId = surfaceBufId;
+    m.wireSerial = pluginWireSerial;
+    ipc::sendMessage(ctrlFd_, m);
+}
+void Compositor::sendConsumerBegin(uint32_t surfaceBufId) {
+    surfaceBeginDone_[surfaceBufId] = 0;
+    ipc::Message m{}; m.tag = ipc::Tag::ConsumerBegin; m.surfaceBufId = surfaceBufId;
+    ipc::sendMessage(ctrlFd_, m);
+}
+void Compositor::sendConsumerEnd(uint32_t surfaceBufId) {
+    ipc::Message m{}; m.tag = ipc::Tag::ConsumerEnd; m.surfaceBufId = surfaceBufId;
+    ipc::sendMessage(ctrlFd_, m);
+}
+int Compositor::surfaceBeginDone(uint32_t surfaceBufId) const {
+    auto it = surfaceBeginDone_.find(surfaceBufId);
+    return it == surfaceBeginDone_.end() ? 0 : it->second;
+}
+
 Compositor::PluginConnHandle Compositor::addWireConnection() {
     PluginConnHandle h{0, -1};
     int fds[2];
@@ -370,6 +402,14 @@ void Compositor::injectPluginInstance(uint32_t connId, uint32_t instanceId,
     m.connId = connId;
     m.instance = {instanceId, instanceGen};
     pluginInstanceInjected_[connId] = 0;  // pending
+    ipc::sendMessage(ctrlFd_, m);
+}
+
+void Compositor::setPluginTickDevice(uint32_t connId, uint32_t deviceId, uint32_t deviceGen) {
+    ipc::Message m{};
+    m.tag = ipc::Tag::SetPluginTickDevice;
+    m.connId = connId;
+    m.device = {deviceId, deviceGen};
     ipc::sendMessage(ctrlFd_, m);
 }
 

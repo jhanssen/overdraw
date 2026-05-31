@@ -4,7 +4,7 @@ Tracks what is built and empirically proven versus what is still design only.
 The design itself lives in `architecture.md`; this file is the ground truth for
 "what exists right now."
 
-Last updated: 2026-05-31 (rev 24).
+Last updated: 2026-05-31 (rev 25).
 
 ## Protocol gaps & skeletons (READ FIRST)
 
@@ -797,6 +797,52 @@ test, so a standalone C-M2 device-ready test would need throwaway scaffolding).
 - **NOT yet:** the Worker-side wire client + dawn.node device bring-up over the
   connection; cross-process surface allocation (`AllocateSurfaceBuffer` etc.);
   SCM_RIGHTS fence passing cross-process. All C-M4.
+
+### Plugin GPU end-to-end: device + shared surface + per-frame fence (C-M4 steps 1-3) — VERIFIED
+The cross-process producer/consumer surface path runs on the verification
+hardware: a plugin's OWN wire-client device renders into a dmabuf the core device
+then samples, fence-ordered. This proves C-M2's plumbing at runtime and applies
+C-M1's primitive cross-process. (Step 1 device bring-up + step 2 surface alloc +
+step 3 per-frame fence; the Worker SDK + animated-overlay compositing are steps
+4-5, not done.) All on the MAIN thread for now (the plugin wire client is core-
+side; moving it into the plugin Worker is gated on the Worker-addon question).
+
+- **Step 1 — plugin device** (`native/core/plugin_wire.{h,cpp}`, `addon.pluginConnect`):
+  a second wire connection brings up its own `wgpu::Device` (ReserveInstance ->
+  InjectPluginInstance -> RequestAdapter/RequestDevice). Two `WireClient`s coexist
+  under the one global wire proc table (objects route per-owning-client — proven,
+  not assumed). `test/plugin-connect.gpu.mjs`.
+- **Step 2 — shared surface buffer** (`AllocSurfaceBuf`, `addon.pluginAllocSurfaceBuffer`):
+  one GBM dmabuf imported as `SharedTextureMemory` into BOTH the plugin (producer)
+  and core (consumer) devices, a texture injected at each side's reserved handle.
+  Both wrap (dawn.node) + view on their own device. `test/plugin-connect.gpu.mjs`.
+- **Step 3 — per-frame fence** (`ProducerBegin/End`, `ConsumerBegin/End`,
+  `test/plugin-surface-fence.gpu.mjs`): producer BeginAccess (UNDEFINED, no fence)
+  -> plugin clears the dmabuf -> EndAccess (exports a `SharedFenceSyncFD`, held) ->
+  consumer BeginAccess WAITS that fence -> core samples -> reads the producer's
+  color back (76,153,229 ≈ 77,153,230). The producer-EndAccess is deferred on a
+  cross-channel wire serial (the render goes over the plugin wire, ProducerEnd
+  over ctrl; same ordering mechanism as `ImportClientTex`). **PASS.**
+- **Bugs found + fixed while building this (all real, all would have blocked it),
+  pinned by instrumentation not guessing:**
+  - The plugin `PluginConn::tickDev` was never set, so the plugin device's queue
+    never advanced and NO async op resolved (map/work-done/popErrorScope all hung).
+    Fixed: `SetPluginTickDevice` relays the plugin device handle so the GPU process
+    `DeviceTick`s it each pump.
+  - `PluginWireClient::pump()` called `pumpOut()` (drain out-queue) instead of
+    `flush()` (frame the WireClient's pending commands into the out-queue). dawn.node
+    only `Flush()`es at its own sync points, so plugin-device commands sat unframed
+    and never reached the GPU process (the decisive symptom: GPU-side frame count
+    stuck at 2). Fixed: `pump()` calls `flush()`.
+  - The per-plugin-wire libuv poll never armed `UV_WRITABLE`, so queued plugin
+    commands never drained. Fixed: `armPluginWire` (mirrors the core `armWirePoll`);
+    plugin wires are also pumped on the frame timer.
+  - **Diagnostic kept:** `OVERDRAW_GPU_LOG=<path>` redirects the GPU process's
+    stdout/stderr to a file (a test harness can't capture the forked child's fds).
+- **Flagged:** the test drives the producer/consumer brackets explicitly from the
+  main thread; the SDK that wraps this for a plugin Worker is step 4 (and forces
+  the Worker-addon decision). ConsumerEnd must follow the sample's completion
+  (EndAccess releases dmabuf access); the SDK must enforce that ordering.
 
 ### Plugin overlay compositing substrate (C-M3) — stack layers + createOverlay broker
 The compositor-side, GPU-free half of the first plugin milestone (architecture.md

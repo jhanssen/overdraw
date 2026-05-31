@@ -65,11 +65,13 @@ void PluginWireClient::startBringUp() {
 }
 
 void PluginWireClient::pump() {
-    // Steady-state + bring-up wire I/O: drain inbound (resolves RequestAdapter/
-    // RequestDevice callbacks via the instance event pump in drainInbound) and
-    // flush outbound. Non-blocking.
-    link_->pumpOut();
-    link_->drainInbound();
+    // Steady-state + bring-up wire I/O. flush() (NOT just pumpOut) is essential:
+    // dawn.node issues commands via the serializer's GetCmdSpace but only commits
+    // them with Flush() at its own sync points, which don't coincide with our
+    // pump. Without flush() here, plugin-device commands sit unframed in the
+    // serializer and never reach the GPU process (its async ops never resolve).
+    link_->flush();          // frame any pending dawn.node-issued commands + send
+    link_->drainInbound();   // read replies; pump the instance -> resolve callbacks
 
     switch (state_) {
         case State::kInjecting: {

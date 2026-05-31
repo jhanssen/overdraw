@@ -106,9 +106,15 @@ struct PendingAlloc {
 };
 std::vector<PendingAlloc> g_pendingAllocs;
 
+// A surface Begin (producer or consumer) in flight; resolved when the matching
+// *BeginDone arrives on the ctrl poll. `expected` is 1 (producer) or 2 (consumer).
+struct PendingSurfaceBegin { uint32_t surfaceBufId; int expected; napi_ref cb; };
+std::vector<PendingSurfaceBegin> g_pendingBegins;
+
 // Defined below; declared here so the ctrl poll (above them) can advance them.
 void advancePendingConnects(napi_env env);
 void advancePendingAllocs(napi_env env);
+void advancePendingBegins(napi_env env);
 
 PluginWireEntry* findPluginWire(uint32_t connId) {
     for (auto& e : g_pluginWires) if (e->pw && e->pw->connId() == connId) return e.get();
@@ -345,11 +351,12 @@ void onCtrlReadable(uv_poll_t*, int status, int) {
     if (status < 0 || !g_addon.compositor) return;
     g_addon.compositor->drainCtrl();
     fireJsImports(g_addon.env);  // resolve JS dmabuf imports (opens its own scope)
-    if (!g_pendingConnects.empty() || !g_pendingAllocs.empty()) {
+    if (!g_pendingConnects.empty() || !g_pendingAllocs.empty() || !g_pendingBegins.empty()) {
         napi_handle_scope scope;
         napi_open_handle_scope(g_addon.env, &scope);
         advancePendingConnects(g_addon.env);  // WireConnAdded / instance-injection
         advancePendingAllocs(g_addon.env);    // SurfaceBufAllocated
+        advancePendingBegins(g_addon.env);    // Producer/ConsumerBeginDone
         napi_close_handle_scope(g_addon.env, scope);
     }
     armWirePoll();  // finishing an import flushes wire output (bind group etc.)
@@ -378,15 +385,29 @@ void invokePluginCb(napi_env env, napi_ref cbRef, napi_value result) {
 // Per-plugin-wire libuv poll: pump the plugin wire (drives bring-up + steady
 // state) then advance any pending connect. HandleScope'd (wire pump may resolve
 // dawn.node JS objects once the SDK shares this connection).
-void onPluginWireReadable(uv_poll_t* h, int status, int) {
+// Arm a plugin wire's poll: READABLE always, WRITABLE iff outbound is queued (so
+// commands the plugin device queued via dawn.node actually drain to the GPU
+// process). Mirrors armWirePoll for the core wire -- without WRITABLE arming the
+// plugin's submitted work never leaves the client and its device never advances.
+void onPluginWireReadable(uv_poll_t* h, int status, int events);
+void armPluginWire(PluginWireEntry* e) {
+    if (!e->pollStarted) return;
+    int events = UV_READABLE;
+    if (e->pw->hasPendingOut()) events |= UV_WRITABLE;
+    uv_poll_start(&e->poll, events, onPluginWireReadable);
+}
+
+void onPluginWireReadable(uv_poll_t* h, int status, int events) {
     if (status < 0) return;
     auto* entry = static_cast<PluginWireEntry*>(h->data);
     if (!entry || !entry->pw) return;
     napi_handle_scope scope;
     napi_open_handle_scope(g_addon.env, &scope);
+    if (events & UV_WRITABLE) entry->pw->pumpOut();
     entry->pw->pump();
     advancePendingConnects(g_addon.env);
     napi_close_handle_scope(g_addon.env, scope);
+    armPluginWire(entry);  // update WRITABLE arming based on remaining queue
 }
 
 void advancePendingConnects(napi_env env) {
@@ -411,8 +432,8 @@ void advancePendingConnects(napi_env env) {
                 napi_get_uv_event_loop(env, &loop);
                 uv_poll_init(loop, &entry->poll, entry->pw->wireFd());
                 entry->poll.data = entry.get();
-                uv_poll_start(&entry->poll, UV_READABLE, onPluginWireReadable);
                 entry->pollStarted = true;
+                uv_poll_start(&entry->poll, UV_READABLE, onPluginWireReadable);
                 pc.entry = entry.get();
                 pc.stage = PendingConnect::kBringingUp;
                 g_pluginWires.push_back(std::move(entry));
@@ -426,6 +447,10 @@ void advancePendingConnects(napi_env env) {
                 invokePluginCb(env, pc.cb, nullptr);
                 done = true;
             } else if (s == overdraw::core::PluginWireClient::State::kDone) {
+                // Tell the GPU process to tick the plugin device (its queue must
+                // advance for map/work-done to resolve).
+                auto dwh = pc.entry->pw->deviceWireHandle();
+                g_addon.compositor->setPluginTickDevice(pc.connId, dwh.id, dwh.generation);
                 auto inst = reinterpret_cast<uint64_t>(pc.entry->pw->instanceHandle());
                 auto dev = reinterpret_cast<uint64_t>(pc.entry->pw->deviceHandle());
                 napi_value obj, cv, iv, dv;
@@ -474,6 +499,18 @@ void advancePendingAllocs(napi_env env) {
     }
 }
 
+// Resolve in-flight surface Begin ops when *BeginDone arrives (ctrl). cb(true|false).
+void advancePendingBegins(napi_env env) {
+    for (size_t i = 0; i < g_pendingBegins.size();) {
+        PendingSurfaceBegin& pb = g_pendingBegins[i];
+        int st = g_addon.compositor->surfaceBeginDone(pb.surfaceBufId);
+        if (st == 0) { ++i; continue; }  // pending
+        napi_value result; napi_get_boolean(env, st == pb.expected, &result);
+        invokePluginCb(env, pb.cb, result);
+        g_pendingBegins.erase(g_pendingBegins.begin() + static_cast<long>(i));
+    }
+}
+
 void onFrameTimer(uv_timer_t*) {
     if (!g_addon.compositor) return;
     // Dispatch client frame callbacks + dmabuf buffer releases FIRST, before
@@ -486,6 +523,16 @@ void onFrameTimer(uv_timer_t*) {
     g_addon.lastNotified = g_addon.compositor->presented();
     g_addon.compositor->renderFrame();
     armWirePoll();  // renderFrame may have queued wire output (Submit/Present)
+    // Pump each plugin wire so plugin-device async ops (map/work-done) advance and
+    // queued plugin commands drain even when no plugin-wire fd event fired.
+    if (!g_pluginWires.empty()) {
+        napi_handle_scope scope;
+        napi_open_handle_scope(g_addon.env, &scope);
+        for (auto& e : g_pluginWires) { if (e->pw) e->pw->pump(); }
+        advancePendingConnects(g_addon.env);
+        napi_close_handle_scope(g_addon.env, scope);
+        for (auto& e : g_pluginWires) armPluginWire(e.get());
+    }
 }
 
 // start(gpuBinPath, onFrame?, onInput?, headless?) -> { width, height }
@@ -667,6 +714,52 @@ napi_value PluginAllocSurfaceBuffer(napi_env env, napi_callback_info info) {
     return nullptr;  // resolved on the ctrl poll
 }
 
+// Per-frame fence-dance helpers (C-M4 step 3). Begin ops are async (cb(bool) on
+// the ctrl poll when the bracket+fence-wait is in); End ops are fire-and-forget.
+static uint32_t arg0u32(napi_env env, napi_callback_info info, napi_value* argv, size_t n) {
+    size_t argc = n; napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+    uint32_t v = 0; napi_get_value_uint32(env, argv[0], &v); return v;
+}
+napi_value PluginSurfaceProducerBegin(napi_env env, napi_callback_info info) {
+    if (!g_addon.compositor) return nullptr;
+    napi_value argv[2]; uint32_t id = arg0u32(env, info, argv, 2);
+    g_addon.compositor->sendProducerBegin(id);
+    napi_ref cbRef; napi_create_reference(env, argv[1], 1, &cbRef);
+    g_pendingBegins.push_back({id, 1, cbRef});
+    return nullptr;
+}
+// pluginSurfaceProducerEnd(surfaceBufId, connId): flush the plugin wire (the
+// render commands) and tag ProducerEnd with the plugin wire serial so the GPU
+// process applies the producer EndAccess only AFTER it has consumed those render
+// commands (cross-channel happens-before; same mechanism as ImportClientTex).
+napi_value PluginSurfaceProducerEnd(napi_env env, napi_callback_info info) {
+    if (!g_addon.compositor) return nullptr;
+    size_t argc = 2; napi_value argv[2];
+    napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+    uint32_t id = 0, connId = 0;
+    napi_get_value_uint32(env, argv[0], &id);
+    napi_get_value_uint32(env, argv[1], &connId);
+    PluginWireEntry* e = findPluginWire(connId);
+    uint64_t serial = 0;
+    if (e) { e->pw->flush(); serial = e->pw->wireBytesQueued(); }
+    g_addon.compositor->sendProducerEnd(id, serial);
+    return nullptr;
+}
+napi_value PluginSurfaceConsumerBegin(napi_env env, napi_callback_info info) {
+    if (!g_addon.compositor) return nullptr;
+    napi_value argv[2]; uint32_t id = arg0u32(env, info, argv, 2);
+    g_addon.compositor->sendConsumerBegin(id);
+    napi_ref cbRef; napi_create_reference(env, argv[1], 1, &cbRef);
+    g_pendingBegins.push_back({id, 2, cbRef});
+    return nullptr;
+}
+napi_value PluginSurfaceConsumerEnd(napi_env env, napi_callback_info info) {
+    if (!g_addon.compositor) return nullptr;
+    napi_value argv[1]; uint32_t id = arg0u32(env, info, argv, 1);
+    g_addon.compositor->sendConsumerEnd(id);
+    return nullptr;
+}
+
 // Pending JS dmabuf-import callbacks, keyed by importId. The callback fires once
 // when the import completes (or fails), then the ref is released.
 std::unordered_map<uint32_t, napi_ref> g_jsImportCbs;
@@ -841,6 +934,8 @@ napi_value Stop(napi_env env, napi_callback_info) {
     g_pendingConnects.clear();
     for (auto& pa : g_pendingAllocs) napi_delete_reference(env, pa.cb);
     g_pendingAllocs.clear();
+    for (auto& pb : g_pendingBegins) napi_delete_reference(env, pb.cb);
+    g_pendingBegins.clear();
     g_pluginWires.clear();  // PluginWireClient dtor disconnects + closes its fd
     if (g_addon.input) {
         g_addon.input->stop();
@@ -1373,6 +1468,10 @@ napi_value Init(napi_env env, napi_value exports) {
     reg("dmabufFeedbackInfo", DmabufFeedbackInfo);
     reg("pluginConnect", PluginConnect);
     reg("pluginAllocSurfaceBuffer", PluginAllocSurfaceBuffer);
+    reg("pluginSurfaceProducerBegin", PluginSurfaceProducerBegin);
+    reg("pluginSurfaceProducerEnd", PluginSurfaceProducerEnd);
+    reg("pluginSurfaceConsumerBegin", PluginSurfaceConsumerBegin);
+    reg("pluginSurfaceConsumerEnd", PluginSurfaceConsumerEnd);
 
     napi_set_named_property(env, exports, "start", fnStart);
     napi_set_named_property(env, exports, "stop", fnStop);

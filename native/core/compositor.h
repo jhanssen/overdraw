@@ -110,6 +110,9 @@ class Compositor {
     // process injects its native instance at that handle. Completion is async;
     // poll pluginInstanceInjected(connId).
     void injectPluginInstance(uint32_t connId, uint32_t instanceId, uint32_t instanceGen);
+    // Tell the GPU process the plugin's device handle so it DeviceTick's it each
+    // pump (the plugin device's queue must advance for map/work-done to resolve).
+    void setPluginTickDevice(uint32_t connId, uint32_t deviceId, uint32_t deviceGen);
     // Async-completion polls (driven by drainCtrl): 0=pending, 1=ok, 2=failed.
     int wireConnAdded(uint32_t connId) const;
     int pluginInstanceInjected(uint32_t connId) const;
@@ -138,6 +141,22 @@ class Compositor {
     // The core's wrapped texture handle for a successfully-allocated surface buf
     // (the consumer texture the JS compositor wraps + samples). 0 if unknown.
     WGPUTexture coreSurfaceTexture(uint32_t surfaceBufId) const;
+
+    // --- Per-frame producer/consumer fence dance (C-M4 step 3) ----------------
+    // Send a surface access bracket message. Begin ops (ProducerBegin/
+    // ConsumerBegin) complete async (poll surfaceBeginDone); End ops are
+    // fire-and-forget (ordering preserved by the next Begin's fence wait).
+    void sendProducerBegin(uint32_t surfaceBufId);
+    // `pluginWireSerial` is the plugin wire's bytesQueued after flushing the
+    // plugin's render: the GPU process defers the producer EndAccess until its
+    // plugin-conn reader has consumed that many bytes (render-before-EndAccess).
+    void sendProducerEnd(uint32_t surfaceBufId, uint64_t pluginWireSerial);
+    void sendConsumerBegin(uint32_t surfaceBufId);
+    void sendConsumerEnd(uint32_t surfaceBufId);
+    // Begin-done poll, keyed by surfaceBufId: 0=pending, 1=producer-begin-done,
+    // 2=consumer-begin-done, 3=failed. Cleared to 0 when the matching Begin is
+    // sent so the next poll waits afresh.
+    int surfaceBeginDone(uint32_t surfaceBufId) const;
 
     // The JS compositor drives every frame: it acquires the output texture,
     // renders into it over the wire, and presents. The C++ Compositor no longer
@@ -199,6 +218,8 @@ class Compositor {
     uint32_t nextSurfaceBufId_ = 1;
     std::unordered_map<uint32_t, dawn::wire::ReservedTexture> coreSurfaceReservations_;
     std::unordered_map<uint32_t, int> surfaceBufAllocated_;
+    // Per-surface Begin-done status (0=pending,1=producer,2=consumer,3=failed).
+    std::unordered_map<uint32_t, int> surfaceBeginDone_;
 
     bool headless_ = false;
     wgpu::Texture currentOutputTexture_;  // held between acquire + present

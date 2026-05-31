@@ -53,6 +53,11 @@ enum class Tag : uint8_t {
                                  //   After this the plugin drives RequestAdapter/
                                  //   RequestDevice over its own wire.
     PluginInstanceInjected = 'p', // gpu -> core: InjectInstance done (ok)
+    SetPluginTickDevice = 'T',  // core -> gpu : the plugin device (resolved over
+                                //   the wire) so the GPU process DeviceTick's it
+                                //   each pump -- without this the plugin device's
+                                //   queue never advances (map/work-done never
+                                //   complete). connId + device handle.
     AllocSurfaceBuf = 'A',  // core -> gpu : allocate ONE GBM dmabuf and import it
                             //   into BOTH the plugin device (producer) and the
                             //   core device (consumer), injecting a texture at
@@ -66,6 +71,23 @@ enum class Tag : uint8_t {
                                 //   both devices (ok=1), or failed (ok=0). Carries
                                 //   the surfaceBufId the core uses for later
                                 //   Begin/EndAccess on this buffer.
+    // Per-frame producer/consumer fence dance on a surface buffer (C-M4 step 3),
+    // reusing the C-M1 cross-device fence. Both STMs live in the GPU process (the
+    // two imports of one dmabuf), so the sync-fds never cross a process boundary;
+    // these messages just drive the access brackets in the right order on the GPU
+    // timeline. `surfaceBufId` names the buffer. Each Begin has a *Done reply so
+    // the core/plugin only proceeds once the bracket (and its fence wait) is in.
+    ProducerBegin = 'G',  // core->gpu: producer BeginAccess (write). Waits the
+                          //   previous consumer fence (don't clobber a buffer the
+                          //   core is still reading).
+    ProducerBeginDone = 'q',  // gpu->core: producer bracket open (plugin may render)
+    ProducerEnd   = 'g',  // core->gpu: producer EndAccess (after plugin render).
+                          //   GPU holds the produced sync-fd for the consumer wait.
+    ConsumerBegin = 'V',  // core->gpu: consumer BeginAccess (read). Waits the
+                          //   producer fence (producer-done-before-read).
+    ConsumerBeginDone = 'k',  // gpu->core: consumer bracket open (core may sample)
+    ConsumerEnd   = 'v',  // core->gpu: consumer EndAccess (after sampling). GPU
+                          //   holds the produced sync-fd for the next ProducerBegin.
     Shutdown     = 'X',  // core -> gpu : clean termination request
 };
 
