@@ -29,7 +29,7 @@ function childrenOf(state: CompositorState, parent: Resource): SubsurfaceRecord[
 // above its parent), setting each child's layout rect relative to `originX/Y`
 // (the child's parent's output-space top-left). Children themselves may have
 // children. Returns nothing; mutates `stack` and pushes layouts to native.
-function emitSubtree(
+export function emitSubtree(
   state: CompositorState, addon: Addon, parentRes: Resource,
   parentX: number, parentY: number, stack: number[],
 ): void {

@@ -26,6 +26,7 @@
 
 static struct wl_compositor* compositor = NULL;
 static struct wl_shm* shm = NULL;
+static struct wl_subcompositor* subcompositor = NULL;
 static struct xdg_wm_base* wm_base = NULL;
 static volatile sig_atomic_t running = 1;
 static int parent_configured = 0, popup_configured = 0;
@@ -60,6 +61,7 @@ static const struct wl_shm_listener shmListener = { shmFormat };
 static void regGlobal(void* data, struct wl_registry* reg, uint32_t name, const char* iface, uint32_t version) {
     (void)data;
     if (strcmp(iface, "wl_compositor") == 0) compositor = wl_registry_bind(reg, name, &wl_compositor_interface, version < 4 ? version : 4);
+    else if (strcmp(iface, "wl_subcompositor") == 0) subcompositor = wl_registry_bind(reg, name, &wl_subcompositor_interface, 1);
     else if (strcmp(iface, "wl_shm") == 0) { shm = wl_registry_bind(reg, name, &wl_shm_interface, 1); wl_shm_add_listener(shm, &shmListener, NULL); }
     else if (strcmp(iface, "xdg_wm_base") == 0) { wm_base = wl_registry_bind(reg, name, &xdg_wm_base_interface, version < 5 ? version : 5); xdg_wm_base_add_listener(wm_base, &wmListener, NULL); }
 }
@@ -84,7 +86,8 @@ int main(int argc, char** argv) {
     const char* socket = NULL;
     int PW = 300, PH = 200, UW = 80, UH = 60;
     int arx = 10, ary = 180, arw = 20, arh = 20;
-    uint32_t pColor = 0xFF0000FFu, uColor = 0xFF00FF00u;
+    uint32_t pColor = 0xFF0000FFu, uColor = 0xFF00FF00u, subColor = 0xFFFF00FFu;
+    int subW = 0, subH = 0, subX = 0, subY = 0;  // popup subsurface (0 = none)
     for (int i = 1; i < argc; ++i) {
         if (strcmp(argv[i], "--socket") == 0 && i + 1 < argc) socket = argv[++i];
         else if (strcmp(argv[i], "--parent") == 0 && i + 1 < argc) sscanf(argv[++i], "%dx%d", &PW, &PH);
@@ -92,6 +95,9 @@ int main(int argc, char** argv) {
         else if (strcmp(argv[i], "--anchor-rect") == 0 && i + 1 < argc) sscanf(argv[++i], "%d,%d,%d,%d", &arx, &ary, &arw, &arh);
         else if (strcmp(argv[i], "--parent-color") == 0 && i + 1 < argc) pColor = (uint32_t)strtoul(argv[++i], NULL, 16);
         else if (strcmp(argv[i], "--popup-color") == 0 && i + 1 < argc) uColor = (uint32_t)strtoul(argv[++i], NULL, 16);
+        else if (strcmp(argv[i], "--popup-sub") == 0 && i + 1 < argc) sscanf(argv[++i], "%dx%d", &subW, &subH);
+        else if (strcmp(argv[i], "--popup-sub-offset") == 0 && i + 1 < argc) sscanf(argv[++i], "%d,%d", &subX, &subY);
+        else if (strcmp(argv[i], "--popup-sub-color") == 0 && i + 1 < argc) subColor = (uint32_t)strtoul(argv[++i], NULL, 16);
     }
     if (!socket) { fprintf(stderr, "usage: %s --socket NAME [...]\n", argv[0]); return 2; }
 
@@ -139,6 +145,20 @@ int main(int argc, char** argv) {
     struct wl_buffer* ubuf = solid(UW, UH, uColor);
     wl_surface_attach(popup, ubuf, 0, 0);
     wl_surface_damage(popup, 0, 0, UW, UH);
+
+    // Optional: a subsurface ON THE POPUP (popups are wl_surfaces and may parent
+    // subsurfaces). Commit it desync so it applies immediately, then the popup.
+    if (subW > 0 && subH > 0 && subcompositor) {
+        struct wl_buffer* sbuf = solid(subW, subH, subColor);
+        struct wl_surface* sub = wl_compositor_create_surface(compositor);
+        struct wl_subsurface* ss = wl_subcompositor_get_subsurface(subcompositor, sub, popup);
+        wl_subsurface_set_position(ss, subX, subY);
+        wl_subsurface_set_desync(ss);
+        wl_surface_attach(sub, sbuf, 0, 0);
+        wl_surface_damage(sub, 0, 0, subW, subH);
+        wl_surface_commit(sub);
+    }
+
     wl_surface_commit(popup);
     wl_display_roundtrip(display); wl_display_roundtrip(display);
 

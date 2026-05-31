@@ -9,7 +9,7 @@ import type { XdgPopupHandler } from "#protocols-gen/xdg_popup.js";
 import type { Ctx, XdgSurfaceRecord, PopupRecord } from "./ctx.js";
 import type { Resource } from "../types.js";
 import { solvePopupPosition } from "../popup-position.js";
-import { computeBaseStack } from "../subsurfaces.js";
+import { computeBaseStack, emitSubtree } from "../subsurfaces.js";
 
 // Output-space top-left of a parent xdg_surface: a toplevel uses its WM window
 // rect; a popup parent uses its own resolved output position (recursively).
@@ -112,9 +112,12 @@ export function rebuildStackWithPopups(ctx: Pick<Ctx, "state" | "addon">): void 
     if (!pr.mapped || !pr.xdgSurface.surface) continue;
     const origin = parentOutputOrigin(ctx, pr.parent);
     if (!origin) continue;
-    ctx.addon.setSurfaceLayout(pr.xdgSurface.surface.id,
-      origin.x + pr.rect.x, origin.y + pr.rect.y, 0, 0);
+    const px = origin.x + pr.rect.x, py = origin.y + pr.rect.y;
+    ctx.addon.setSurfaceLayout(pr.xdgSurface.surface.id, px, py, 0, 0);
     stack.push(pr.xdgSurface.surface.id);
+    // A popup is a wl_surface and may itself parent subsurfaces; place its
+    // subsurface subtree above it (same walk as for window roots).
+    emitSubtree(ctx.state, ctx.addon, pr.xdgSurface.surface.resource, px, py, stack);
   }
   ctx.addon.setStack(stack);
 }

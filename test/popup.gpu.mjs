@@ -59,3 +59,36 @@ test("xdg_popup composites at the positioner-computed location above the parent"
     await c.teardown();
   }
 });
+
+test("a popup can parent a subsurface (composited above the popup at its offset)", { skip }, async () => {
+  const c = await setupCompositor({ headless: OUT });
+  try {
+    const pColor = 0xff0000ff, uColor = 0xff00ff00, sColor = 0xffff00ff; // parent/popup/sub
+    const PW = 300, PH = 200, UW = 100, UH = 80, SUBW = 30, SUBH = 20, SUBX = 50, SUBY = 40;
+    const cl = c.spawnClient(
+      ["--parent", `${PW}x${PH}`, "--popup", `${UW}x${UH}`, "--anchor-rect", "10,180,20,20",
+       "--parent-color", pColor.toString(16), "--popup-color", uColor.toString(16),
+       "--popup-sub", `${SUBW}x${SUBH}`, "--popup-sub-offset", `${SUBX},${SUBY}`,
+       "--popup-sub-color", sColor.toString(16)],
+      { bin: POPUP, readyMarker: "[popup-client] popup configured" });
+    await cl.ready;
+    const snap = await c.waitFor(c.query, (s) => s.windows.length >= 1, { what: "parent window" });
+    const p = snap.windows[0].rect;
+
+    // Popup top-left in output = parent + (10,200). Subsurface = popup + (50,40).
+    const popX = p.x + 10, popY = p.y + 200;
+    const subCx = popX + SUBX + (SUBW >> 1);
+    const subCy = popY + SUBY + (SUBH >> 1);
+    const bgraSub = argbToBgra(sColor);
+    const frame = await readWhen(c, { x: subCx, y: subCy, bgra: bgraSub });
+    assert.ok(pixelMatches(pixelAt(frame, OUT.width, subCx, subCy), bgraSub, 4),
+      `popup's subsurface should composite above the popup; got ${pixelAt(frame, OUT.width, subCx, subCy)}`);
+
+    // And the popup itself still shows where the subsurface doesn't cover it.
+    const popOnlyX = popX + 5, popOnlyY = popY + 5; // top-left of popup, before sub offset
+    assert.ok(pixelMatches(pixelAt(frame, OUT.width, popOnlyX, popOnlyY), argbToBgra(uColor), 4),
+      `popup (uncovered region) should show popup color; got ${pixelAt(frame, OUT.width, popOnlyX, popOnlyY)}`);
+  } finally {
+    await c.teardown();
+  }
+});
