@@ -32,6 +32,17 @@ export interface SurfaceRecord {
 // can back them. Method names mirror the addon's, so the native sink is just the
 // addon itself. `renderFrame` is optional: the native path renders on its own
 // libuv timer, the JS path renders here.
+// Stack layers, composited back-to-front (architecture.md "First plugin
+// milestone": background < below < content < above < overlay). Client/plugin
+// windows live in `content` (set via setStack, which keeps owning the
+// window+subsurface+popup ordering); decorations bind to `below`/`above` of a
+// window; free overlays pick a layer. This is the smallest generalization of the
+// old single flat stack that lets "above/below content" be expressed without a
+// full layout engine.
+export type Layer = "background" | "below" | "content" | "above" | "overlay";
+export const LAYER_ORDER: readonly Layer[] =
+  ["background", "below", "content", "above", "overlay"];
+
 export interface CompositorSink {
   commitSurfaceBuffer(id: number, poolId: number, offset: number, w: number,
                       h: number, stride: number): boolean;
@@ -39,7 +50,13 @@ export interface CompositorSink {
                       fourcc: number, modHi: number, modLo: number,
                       offset: number, stride: number, bufferId: number): boolean;
   setSurfaceLayout(id: number, x: number, y: number, w: number, h: number): void;
+  // The `content` layer's ordered draw list (windows + subsurfaces + popups).
+  // rebuildStackWithPopups remains its single owner.
   setStack(ids: number[]): void;
+  // Set the ordered surface ids for a non-content layer (background/below/above/
+  // overlay). Plugin overlays/decorations use this. Optional so the native sink
+  // (if ever used) need not implement it.
+  setLayerSurfaces?(layer: Layer, ids: number[]): void;
   removeSurface(id: number): void;
   takeImportedSurfaces(): Array<{ id: number; width: number; height: number }>;
   takeFreedBuffers(): number[];

@@ -42,7 +42,8 @@ struct Rect { r : vec4f, };
 }
 `;
 
-import type { CompositorSink } from "../protocols/ctx.js";
+import type { CompositorSink, Layer } from "../protocols/ctx.js";
+import { LAYER_ORDER } from "../protocols/ctx.js";
 
 // Minimal slice of the native addon this module needs.
 export interface CompositorAddon {
@@ -126,7 +127,11 @@ export class JsCompositor implements CompositorSink {
   private targetView?: GPUTextureView;
 
   private surfaces = new Map<number, Surface>();
+  // The content layer's ordered draw list (windows+subsurfaces+popups).
   private stack: number[] = [];
+  // Non-content layers (background/below/above/overlay). Composited around the
+  // content stack per LAYER_ORDER. Plugin overlays/decorations populate these.
+  private layers = new Map<Layer, number[]>();
 
   // dmabuf buffer-release lifecycle (mirrors the C++ retiring/freed logic): each
   // composite submit gets a serial; a superseded buffer retires tagged with the
@@ -196,6 +201,22 @@ export class JsCompositor implements CompositorSink {
   // --- CompositorSink ---
 
   setStack(ids: number[]): void { this.stack = ids.slice(); }
+
+  setLayerSurfaces(layer: Layer, ids: number[]): void {
+    if (layer === "content") { this.stack = ids.slice(); return; }
+    this.layers.set(layer, ids.slice());
+  }
+
+  // The full back-to-front draw order: each layer in LAYER_ORDER, with `content`
+  // taken from the window/subsurface/popup stack.
+  private drawOrder(): number[] {
+    const out: number[] = [];
+    for (const layer of LAYER_ORDER) {
+      if (layer === "content") out.push(...this.stack);
+      else { const ids = this.layers.get(layer); if (ids) out.push(...ids); }
+    }
+    return out;
+  }
 
   setSurfaceLayout(id: number, x: number, y: number, w: number, h: number): void {
     const s = this.surfaces.get(id);
@@ -393,7 +414,7 @@ export class JsCompositor implements CompositorSink {
       }],
     });
     pass.setPipeline(this.pipeline);
-    for (const id of this.stack) {
+    for (const id of this.drawOrder()) {
       const s = this.surfaces.get(id);
       if (s && s.present && s.bindGroup) {
         this.updatePlacement(s);

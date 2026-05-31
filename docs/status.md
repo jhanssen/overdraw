@@ -4,7 +4,7 @@ Tracks what is built and empirically proven versus what is still design only.
 The design itself lives in `architecture.md`; this file is the ground truth for
 "what exists right now."
 
-Last updated: 2026-05-31 (rev 23).
+Last updated: 2026-05-31 (rev 24).
 
 ## Protocol gaps & skeletons (READ FIRST)
 
@@ -764,6 +764,68 @@ handoff gated by a cross-device sync-fd fence.
 - **Scope of the claim:** in-process two-device on this driver. It does NOT yet
   prove the cross-PROCESS plugin path (second wire client + side-channel surface
   allocation + SCM_RIGHTS fence passing) — that is C-M2, built on this result.
+
+### Plugin GPU connection plumbing (C-M2) — BUILT, NOT RUNTIME-TESTED YET
+The cross-process scaffolding for each plugin getting its OWN wire connection +
+device (architecture.md "IPC": one `dawn::wire::Server` per connected client).
+Compiles; its runtime proof is folded into C-M4 (where the plugin's Worker brings
+up a device over the connection and renders — that is the decisive end-to-end
+test, so a standalone C-M2 device-ready test would need throwaway scaffolding).
+
+- **No listening socket (auth by construction).** A new connection can ONLY be
+  introduced by the trusted core over the inherited side channel, so there is
+  nothing for a stranger to `connect()` to. New side-channel messages
+  (`side_channel.h`): `AddWireConn` (core->gpu, plugin wire socket GPU-end rides
+  as SCM_RIGHTS) / `WireConnAdded`; `InjectPluginInstance` (core->gpu, the handle
+  the plugin's wire client reserved) / `PluginInstanceInjected`.
+- **GPU process** (`gpu-process/src/main.cpp`): a `PluginConn` holds a per-
+  connection `FdSerializer`/`FrameReader`/native `Instance`/`WireServer`
+  (`useSpontaneousCallbacks=true`); registered in the epoll loop and pumped each
+  iteration. `AddWireConn` creates it from the received fd; `InjectPluginInstance`
+  injects the native instance at the plugin-reserved handle. Native device
+  resolved lazily (`server.GetDevice`) when the plugin first needs server-side
+  work (C-M4).
+- **Core** (`native/core/compositor.{h,cpp}`): `addWireConnection()` makes a
+  socketpair, sends the GPU-end via the side channel, returns the CLIENT-end fd
+  (-> handed to the plugin Worker; same process, so it's just an integer, no
+  SCM_RIGHTS core<->Worker). `injectPluginInstance()` relays the reserved handle.
+  `drainCtrl()` records async completion; `wireConnAdded()`/
+  `pluginInstanceInjected()` poll (0=pending/1=ok/2=failed).
+- **ABI note (bit me once):** `ipc::Message` grew fields, so the addon AND the
+  GPU process must rebuild together — a stale addon vs. new gpu process disagree
+  on message size and the handshake hangs. `cmake --build build` (all targets).
+- **NOT yet:** the Worker-side wire client + dawn.node device bring-up over the
+  connection; cross-process surface allocation (`AllocateSurfaceBuffer` etc.);
+  SCM_RIGHTS fence passing cross-process. All C-M4.
+
+### Plugin overlay compositing substrate (C-M3) — stack layers + createOverlay broker
+The compositor-side, GPU-free half of the first plugin milestone (architecture.md
+"First plugin milestone"): a plugin overlay can be PLACED on a stack layer at a
+core-decided rect. The producer that fills its pixels is C-M4.
+
+- **Stack-layer model** (`src/protocols/ctx.ts` `Layer`/`LAYER_ORDER`,
+  `src/gpu/compositor.ts`): `background < below < content < above < overlay`,
+  composited back-to-front. `content` is the existing flat stack (windows +
+  subsurfaces + popups) — `setStack` and `rebuildStackWithPopups` are UNCHANGED,
+  so the fragile subsurface/popup ordering does not regress (verified: subsurface
+  3/3, popup 2/2, compositing 3/3 still pass). Other layers via the new optional
+  sink method `setLayerSurfaces(layer, ids)`. `renderFrame` draws all layers in
+  order. Verified: `test/overlay-layers.gpu.mjs` (headless pixel) — an `overlay`
+  surface composites over a `content` surface at the same rect; moved to `below`
+  it composites under. **PASS.**
+- **createOverlay broker** (`src/overlay-position.ts` pure geometry +
+  `src/overlay.ts` broker): the plugin declares `{layer, anchor, size, margin}`;
+  the core computes the authoritative output-clamped rect (`placeOverlay`),
+  assigns a surface id (shared `state.serial()` space), places it in the layer
+  (`setLayerSurfaces`), and returns the granted geometry — the plugin never
+  invents geometry. Plus `destroy`/`destroyForPlugin` (plugin termination) and
+  `reflow` (output resize). Verified: `test/overlay.test.js` (8 GPU-free unit
+  tests: anchors, margin, clamping, layer registration/order, destroy, reflow).
+  **PASS.**
+- **Deferred to C-M4 (flagged):** the broker registers geometry only — the
+  surface has NO pixels until C-M4 allocates its dmabuf producer ring (over the
+  C-M2 connection) and the plugin renders into it. createOverlay is not yet wired
+  to an SDK request or to buffer allocation; that is C-M4.
 
 ### Protocol generator (XML -> JS/TS)
 - `tools/gen-protocol/` parses Wayland protocol XML (per wayland.dtd) and emits,
