@@ -641,11 +641,304 @@ int run(int wireFd, int ctrlFd, int inputFd, bool headless,
     return 0;
 }
 
+// C-M1 verification: the two-device cross-device dmabuf-STM + sync-fd-fence
+// round-trip the plugin producer/consumer primitive depends on. status.md flags
+// this exact composition ("two-device cross-device sharing ... the sync-fd is
+// produced but not waited on across a device boundary ... assumed to work,
+// unverified"). This is the decisive in-process experiment: NO wire, NO core, NO
+// Worker -- just two native wgpu::Devices sharing one GBM dmabuf, fence-gated.
+//
+// Flow: device A (producer) clears the dmabuf texture to a known color, EndAccess
+// -> export sync-fd; device B (consumer) BeginAccess WAITING that fence, samples
+// the dmabuf texture into an offscreen target, reads it back, asserts the color.
+// The fence wait in B's BeginAccess is the ordering under test (producer-done-
+// before-consumer-read on the GPU timeline, no CPU handshake).
+//
+// Reuses the proven primitives: Allocator::importTexture (per-device STM import),
+// the EndAccess sync-fd export (single-device path), and the SharedFence import +
+// wait-in-BeginAccess (the verified WSI implicit-sync acquire).
+int selftestXDev() {
+    std::printf("[gpu] selftest-xdev: two-device dmabuf STM + cross-device fence\n");
+
+    dawn::native::Instance instance;
+    wgpu::Instance inst(instance.Get());
+
+    // A fresh adapter per device: a wgpu::Adapter creates a single device, and
+    // the plugin topology gives each device its own adapter anyway. Enumerate
+    // returns fresh Adapter instances per call.
+    auto makeAdapter = [&]() -> wgpu::Adapter {
+        wgpu::RequestAdapterOptions ao{};
+        ao.backendType = wgpu::BackendType::Vulkan;
+        ao.featureLevel = wgpu::FeatureLevel::Core;
+        auto adapters = instance.EnumerateAdapters(
+            reinterpret_cast<const WGPURequestAdapterOptions*>(&ao));
+        return adapters.empty() ? wgpu::Adapter() : wgpu::Adapter(adapters[0].Get());
+    };
+
+    wgpu::Adapter probeAdapter = makeAdapter();
+    if (!probeAdapter) { std::fprintf(stderr, "XDEV: FAIL (no adapter)\n"); return 1; }
+
+    gpu::Allocator alloc;
+    if (!alloc.open() || !alloc.probe(probeAdapter)) {
+        std::fprintf(stderr, "XDEV: FAIL (allocator open/probe)\n"); return 1;
+    }
+
+    // Two independent native devices, each from its own adapter, each with the
+    // dmabuf + sync-fd features.
+    auto makeDevice = [&](const char* tag) -> wgpu::Device {
+        wgpu::Adapter adapter = makeAdapter();
+        if (!adapter) { std::fprintf(stderr, "[gpu] selftest: no adapter for %s\n", tag);
+                        return wgpu::Device(); }
+        wgpu::FeatureName feats[] = {wgpu::FeatureName::SharedTextureMemoryDmaBuf,
+                                     wgpu::FeatureName::SharedFenceSyncFD};
+        wgpu::DeviceDescriptor dd{};
+        dd.requiredFeatureCount = 2;
+        dd.requiredFeatures = feats;
+        dd.SetUncapturedErrorCallback(
+            [](const wgpu::Device&, wgpu::ErrorType t, wgpu::StringView m) {
+                std::fprintf(stderr, "[gpu][selftest dawn err %d] %.*s\n",
+                             static_cast<int>(t), static_cast<int>(m.length), m.data);
+            });
+        wgpu::Device dev;
+        bool ready = false;
+        adapter.RequestDevice(&dd, wgpu::CallbackMode::AllowProcessEvents,
+            [&](wgpu::RequestDeviceStatus s, wgpu::Device d, wgpu::StringView msg) {
+                if (s == wgpu::RequestDeviceStatus::Success) dev = std::move(d);
+                else std::fprintf(stderr, "[gpu] selftest: RequestDevice(%s) status=%d: %.*s\n",
+                                  tag, static_cast<int>(s),
+                                  static_cast<int>(msg.length), msg.data);
+                ready = true;
+            });
+        for (int i = 0; i < 100000 && !ready; ++i) {
+            dawn::native::InstanceProcessEvents(instance.Get());
+            usleepShort();
+        }
+        if (!dev) std::fprintf(stderr, "[gpu] selftest: RequestDevice(%s) failed (ready=%d)\n",
+                               tag, static_cast<int>(ready));
+        return dev;
+    };
+    wgpu::Device devA = makeDevice("producer");
+    wgpu::Device devB = makeDevice("consumer");
+    if (!devA || !devB) { std::fprintf(stderr, "XDEV: FAIL (device)\n"); return 1; }
+
+    // One GBM dmabuf, imported into BOTH devices as SharedTextureMemory.
+    const uint32_t W = 64, H = 64;
+    gpu::DmabufBuffer buf{};
+    if (!alloc.allocate(W, H, buf)) { std::fprintf(stderr, "XDEV: FAIL (allocate)\n"); return 1; }
+    wgpu::SharedTextureMemory memA, memB;
+    wgpu::Texture texA, texB;
+    if (!gpu::Allocator::importTexture(devA, alloc.fourcc(), buf, memA, texA) ||
+        !gpu::Allocator::importTexture(devB, alloc.fourcc(), buf, memB, texB)) {
+        std::fprintf(stderr, "XDEV: FAIL (cross-device STM import)\n");
+        alloc.release(buf); return 1;
+    }
+
+    // The known color the producer writes (BGRA8Unorm dmabuf; clearValue is RGBA
+    // in linear/unorm terms -> stored bytes B,G,R,A). Use a distinct triple.
+    const double R = 0.20, G = 0.40, B_ = 0.80;
+
+    // --- Producer (device A): BeginAccess (undefined->general), clear, EndAccess.
+    {
+        wgpu::SharedTextureMemoryVkImageLayoutBeginState layout{};
+        layout.oldLayout = 0;  // UNDEFINED
+        layout.newLayout = 1;  // GENERAL
+        wgpu::SharedTextureMemoryBeginAccessDescriptor bad{};
+        bad.nextInChain = &layout;
+        bad.initialized = false;
+        bad.fenceCount = 0;
+        if (memA.BeginAccess(texA, &bad) != wgpu::Status::Success) {
+            std::fprintf(stderr, "XDEV: FAIL (producer BeginAccess)\n");
+            alloc.release(buf); return 1;
+        }
+        wgpu::RenderPassColorAttachment att{};
+        att.view = texA.CreateView();
+        att.loadOp = wgpu::LoadOp::Clear;
+        att.storeOp = wgpu::StoreOp::Store;
+        att.clearValue = {R, G, B_, 1.0};
+        wgpu::RenderPassDescriptor rp{};
+        rp.colorAttachmentCount = 1;
+        rp.colorAttachments = &att;
+        wgpu::CommandEncoder enc = devA.CreateCommandEncoder();
+        enc.BeginRenderPass(&rp).End();
+        wgpu::CommandBuffer cb = enc.Finish();
+        devA.GetQueue().Submit(1, &cb);
+
+        wgpu::SharedTextureMemoryVkImageLayoutEndState endLayout{};
+        wgpu::SharedTextureMemoryEndAccessState endState{};
+        endState.nextInChain = &endLayout;
+        if (memA.EndAccess(texA, &endState) != wgpu::Status::Success || endState.fenceCount < 1) {
+            std::fprintf(stderr, "XDEV: FAIL (producer EndAccess; fenceCount=%zu)\n",
+                         static_cast<size_t>(endState.fenceCount));
+            alloc.release(buf); return 1;
+        }
+        // Export the producer's done-fence and dup it (the export fd is owned by
+        // endState's SharedFence, freed when endState is destroyed at scope exit).
+        wgpu::SharedFenceExportInfo exp{};
+        wgpu::SharedFenceSyncFDExportInfo syncExp{};
+        exp.nextInChain = &syncExp;
+        endState.fences[0].ExportInfo(&exp);
+        int producerSyncFd = (syncExp.handle >= 0) ? ::dup(syncExp.handle) : -1;
+        int producerEndLayout = endLayout.newLayout;
+
+        // --- Consumer (device B): BeginAccess WAITING the producer fence, sample.
+        wgpu::SharedFence waitFence;
+        if (producerSyncFd >= 0) {
+            wgpu::SharedFenceSyncFDDescriptor sfd{};
+            sfd.handle = producerSyncFd;
+            wgpu::SharedFenceDescriptor fdd{};
+            fdd.nextInChain = &sfd;
+            waitFence = devB.ImportSharedFence(&fdd);
+            ::close(producerSyncFd);
+            if (!waitFence) { std::fprintf(stderr, "XDEV: FAIL (consumer ImportSharedFence)\n");
+                              alloc.release(buf); return 1; }
+        } else {
+            std::fprintf(stderr, "XDEV: FAIL (no producer sync-fd to wait)\n");
+            alloc.release(buf); return 1;
+        }
+
+        wgpu::SharedTextureMemoryVkImageLayoutBeginState clayout{};
+        clayout.oldLayout = producerEndLayout;  // continue from producer's end layout
+        clayout.newLayout = 1;                   // GENERAL
+        wgpu::SharedTextureMemoryBeginAccessDescriptor cbad{};
+        cbad.nextInChain = &clayout;
+        cbad.initialized = true;
+        uint64_t signaled = 1;
+        cbad.fenceCount = 1;
+        cbad.fences = &waitFence;
+        cbad.signaledValueCount = 1;
+        cbad.signaledValues = &signaled;
+        if (memB.BeginAccess(texB, &cbad) != wgpu::Status::Success) {
+            std::fprintf(stderr, "XDEV: FAIL (consumer BeginAccess+fence wait)\n");
+            alloc.release(buf); return 1;
+        }
+
+        // Sample texB into an offscreen RGBA8 target (TextureBinding on the dmabuf
+        // is always present; this avoids depending on CopySrc of the dmabuf). The
+        // sampling submit is ordered AFTER the fence by BeginAccess.
+        // textureLoad needs no sampler -> the auto layout has only the texture at
+        // binding 1. Reading via textureLoad (integer coords) also sidesteps
+        // filterable-vs-unfilterable float sampling on the imported format.
+        const char* WGSL =
+            "@vertex fn vs(@builtin(vertex_index) i:u32)->@builtin(position) vec4f{"
+            "var p=array<vec2f,3>(vec2f(-1,-3),vec2f(3,1),vec2f(-1,1));"
+            "return vec4f(p[i],0,1);}"
+            "@group(0) @binding(1) var t:texture_2d<f32>;"
+            "@fragment fn fs(@builtin(position) c:vec4f)->@location(0) vec4f{"
+            "return textureLoad(t, vec2i(i32(c.x),i32(c.y)), 0);}";
+        wgpu::ShaderSourceWGSL wd{};
+        wd.code = WGSL;
+        wgpu::ShaderModuleDescriptor smd{};
+        smd.nextInChain = &wd;
+        wgpu::ShaderModule mod = devB.CreateShaderModule(&smd);
+
+        wgpu::TextureDescriptor od{};
+        od.size = {W, H, 1};
+        od.format = wgpu::TextureFormat::RGBA8Unorm;
+        od.usage = wgpu::TextureUsage::RenderAttachment | wgpu::TextureUsage::CopySrc;
+        wgpu::Texture offscreen = devB.CreateTexture(&od);
+
+        wgpu::ColorTargetState cts{};
+        cts.format = wgpu::TextureFormat::RGBA8Unorm;
+        wgpu::FragmentState fs{};
+        fs.module = mod; fs.entryPoint = "fs"; fs.targetCount = 1; fs.targets = &cts;
+        wgpu::RenderPipelineDescriptor pd{};
+        pd.vertex.module = mod; pd.vertex.entryPoint = "vs";
+        pd.primitive.topology = wgpu::PrimitiveTopology::TriangleList;
+        pd.fragment = &fs;
+        wgpu::RenderPipeline pipe = devB.CreateRenderPipeline(&pd);
+
+        wgpu::BindGroupEntry bge[1]{};
+        bge[0].binding = 1; bge[0].textureView = texB.CreateView();
+        wgpu::BindGroupDescriptor bgd{};
+        bgd.layout = pipe.GetBindGroupLayout(0);
+        bgd.entryCount = 1; bgd.entries = bge;
+        wgpu::BindGroup bg = devB.CreateBindGroup(&bgd);
+
+        wgpu::RenderPassColorAttachment oatt{};
+        oatt.view = offscreen.CreateView();
+        oatt.loadOp = wgpu::LoadOp::Clear;
+        oatt.storeOp = wgpu::StoreOp::Store;
+        oatt.clearValue = {0, 0, 0, 1};
+        wgpu::RenderPassDescriptor orp{};
+        orp.colorAttachmentCount = 1; orp.colorAttachments = &oatt;
+
+        const uint32_t bytesPerRow = 256;  // 64*4 padded to 256 (already 256)
+        wgpu::BufferDescriptor rbd{};
+        rbd.size = static_cast<uint64_t>(bytesPerRow) * H;
+        rbd.usage = wgpu::BufferUsage::CopyDst | wgpu::BufferUsage::MapRead;
+        wgpu::Buffer readback = devB.CreateBuffer(&rbd);
+
+        wgpu::CommandEncoder cenc = devB.CreateCommandEncoder();
+        {
+            wgpu::RenderPassEncoder pe = cenc.BeginRenderPass(&orp);
+            pe.SetPipeline(pipe);
+            pe.SetBindGroup(0, bg);
+            pe.Draw(3);
+            pe.End();
+        }
+        wgpu::TexelCopyTextureInfo src{};
+        src.texture = offscreen;
+        wgpu::TexelCopyBufferInfo dst{};
+        dst.buffer = readback;
+        dst.layout.bytesPerRow = bytesPerRow;
+        dst.layout.rowsPerImage = H;
+        wgpu::Extent3D ext{W, H, 1};
+        cenc.CopyTextureToBuffer(&src, &dst, &ext);
+        wgpu::CommandBuffer ccb = cenc.Finish();
+        devB.GetQueue().Submit(1, &ccb);
+
+        // End the consumer access bracket before reading back (Vulkan layout
+        // end-state is mandatory on this backend, as in the producer EndAccess).
+        wgpu::SharedTextureMemoryVkImageLayoutEndState cEndLayout{};
+        wgpu::SharedTextureMemoryEndAccessState cEnd{};
+        cEnd.nextInChain = &cEndLayout;
+        memB.EndAccess(texB, &cEnd);
+
+        // Map the readback and assert the producer color (with tolerance).
+        bool mapped = false; wgpu::MapAsyncStatus mapStatus{};
+        readback.MapAsync(wgpu::MapMode::Read, 0, rbd.size,
+            wgpu::CallbackMode::AllowProcessEvents,
+            [&](wgpu::MapAsyncStatus s, wgpu::StringView) { mapStatus = s; mapped = true; });
+        for (int i = 0; i < 100000 && !mapped; ++i) {
+            dawn::native::DeviceTick(devB.Get());
+            dawn::native::InstanceProcessEvents(instance.Get());
+            usleepShort();
+        }
+        if (!mapped || mapStatus != wgpu::MapAsyncStatus::Success) {
+            std::fprintf(stderr, "XDEV: FAIL (readback map mapped=%d status=%d)\n",
+                         static_cast<int>(mapped), static_cast<int>(mapStatus));
+            alloc.release(buf); return 1;
+        }
+        const uint8_t* px = static_cast<const uint8_t*>(
+            readback.GetConstMappedRange(0, rbd.size));
+        // Offscreen is RGBA8Unorm; expected bytes R,G,B,A from the producer color.
+        auto u8 = [](double v) { return static_cast<int>(v * 255.0 + 0.5); };
+        int eR = u8(R), eG = u8(G), eB = u8(B_);
+        int gR = px[0], gG = px[1], gB = px[2], gA = px[3];
+        readback.Unmap();
+        alloc.release(buf);
+        const int tol = 3;
+        bool ok = std::abs(gR - eR) <= tol && std::abs(gG - eG) <= tol &&
+                  std::abs(gB - eB) <= tol && std::abs(gA - 255) <= tol;
+        std::printf("[gpu] selftest readback: got RGBA(%d,%d,%d,%d) expected (%d,%d,%d,255)\n",
+                    gR, gG, gB, gA, eR, eG, eB);
+        if (!ok) { std::fprintf(stderr, "XDEV: FAIL (pixel mismatch)\n"); return 1; }
+    }
+
+    std::printf("XDEV: PASS\n");
+    return 0;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
     setvbuf(stdout, nullptr, _IOLBF, 0);
     installCrashHandler();
+    // C-M1 verification mode: two-device cross-device dmabuf STM + fence
+    // round-trip. Self-contained (no fds, no core); prints XDEV: PASS/FAIL.
+    if (argc >= 2 && std::strcmp(argv[1], "--selftest-xdev") == 0) {
+        return selftestXDev();
+    }
     if (argc < 3) {
         std::fprintf(stderr, "usage: %s <wireFd> <ctrlFd> [inputFd] [--headless WxH]\n", argv[0]);
         return 1;

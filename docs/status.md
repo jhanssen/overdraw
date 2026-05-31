@@ -4,7 +4,7 @@ Tracks what is built and empirically proven versus what is still design only.
 The design itself lives in `architecture.md`; this file is the ground truth for
 "what exists right now."
 
-Last updated: 2026-05-31 (rev 22).
+Last updated: 2026-05-31 (rev 23).
 
 ## Protocol gaps & skeletons (READ FIRST)
 
@@ -725,11 +725,45 @@ core device):
   The GPU-side allocate/import/inject + access-bracket code remains and is the
   primitive a future `linux-dmabuf-v1` handler reuses; it is just not exercised
   by the current present loop.
-- **Not done:** two-device cross-device sharing (plugin device renders, core
-  device samples) and cross-process fence *consumption* — the sync-fd is
-  produced but not waited on across a device boundary. Assumed to work
-  (multi-device STM import is the same primitive), unverified. Multi-plane / YUV
-  import not done. SCM_RIGHTS fence passing not done.
+- **Two-device cross-device sharing + cross-device fence wait: NOW VERIFIED**
+  (was "assumed to work, unverified"). See "Cross-device dmabuf+fence verified
+  (C-M1)" below. Still not done: multi-plane / YUV import; SCM_RIGHTS fence
+  passing *cross-process* (the verification is in-process, two devices in the GPU
+  process — the cross-PROCESS plumbing is C-M2).
+
+### Cross-device dmabuf + fence verified (C-M1, the plugin producer/consumer primitive)
+The one composition the plugin-surface design rested on as "assumed, unverified"
+is now proven on the verification hardware (RTX 5060 / driver 595.71.05): two
+independent `wgpu::Device`s sharing ONE GBM dmabuf, with a producer→consumer
+handoff gated by a cross-device sync-fd fence.
+
+- `overdraw-gpu-process --selftest-xdev` (`gpu-process/src/main.cpp`
+  `selftestXDev()`): self-contained — NO wire, NO core, NO Worker. Each device is
+  requested from its OWN adapter (a `wgpu::Adapter` mints one device; the plugin
+  topology gives each device its own adapter anyway). Both devices require
+  `SharedTextureMemoryDmaBuf` + `SharedFenceSyncFD`.
+- Flow: one GBM dmabuf imported as `SharedTextureMemory` into BOTH devices
+  (`Allocator::importTexture` is device-agnostic; STM props print twice,
+  `usage=0x17`). Producer device A: `BeginAccess` (undefined→general) → render-
+  pass CLEAR to a known color → submit → `EndAccess` → export a
+  `SharedFenceSyncFD` (fenceCount=1), dup'd. Consumer device B: `BeginAccess`
+  WAITING that fence (imported via `ImportSharedFence`, general→general,
+  initialized) → `textureLoad`-sample the dmabuf into an offscreen RGBA8 target →
+  `CopyTextureToBuffer` → `EndAccess` → map + readback. Asserts the read-back
+  pixels equal the producer's color (±3/channel).
+- **Verified**: `got RGBA(51,102,204,255) expected (51,102,204,255)` →
+  `XDEV: PASS`. The fence wait in B's `BeginAccess` is the ordering proven
+  (producer-done-before-consumer-read on the GPU timeline, no CPU handshake).
+- Reuses the proven primitives: per-device STM import, the EndAccess sync-fd
+  export (single-device path), and the SharedFence import + wait-in-BeginAccess
+  (the verified WSI implicit-sync acquire). The bind group uses `textureLoad`
+  (no sampler) to sidestep filterable-vs-unfilterable float sampling on the
+  imported format.
+- Test: `test/xdev-fence.gpu.mjs` spawns the selftest and asserts `XDEV: PASS`
+  (GPU-gated; `npm run test:gpu`).
+- **Scope of the claim:** in-process two-device on this driver. It does NOT yet
+  prove the cross-PROCESS plugin path (second wire client + side-channel surface
+  allocation + SCM_RIGHTS fence passing) — that is C-M2, built on this result.
 
 ### Protocol generator (XML -> JS/TS)
 - `tools/gen-protocol/` parses Wayland protocol XML (per wayland.dtd) and emits,
