@@ -1,1613 +1,654 @@
 # overdraw — implementation status
 
-Tracks what is built and empirically proven versus what is still design only.
-The design itself lives in `architecture.md`; this file is the ground truth for
-"what exists right now."
+Ground truth for what exists right now: current capabilities, known gaps, and
+what remains. The design lives in `architecture.md`; this file does not restate
+it. Present-tense only — no change history.
 
-Last updated: 2026-05-31 (rev 35).
+Last updated: 2026-05-31.
 
-## Protocol gaps & skeletons (READ FIRST)
+## Read first: gaps in advertised protocols (silent-gap risks)
 
-What is advertised/wired but incomplete. These are the silent-gap risks — a
-client may use them and get nothing, with no error. Listed worst-first. (Fully
-working protocols are in "Built and proven"; this is the honest incomplete list.)
+These are wired/advertised but incomplete. A client may use them and get nothing,
+with no error. Worst-first.
 
-- **`xdg_toplevel` window-management requests — SILENT no-ops.** `move`, `resize`,
-  `set_maximized`/`unset`, `set_fullscreen`/`unset`, `set_minimized`,
+- **`xdg_toplevel` window-management requests are silent no-ops.** `move`,
+  `resize`, `set_maximized`/`unset`, `set_fullscreen`/`unset`, `set_minimized`,
   `set_min_size`/`set_max_size`, `show_window_menu`, `set_parent` are accepted and
-  IGNORED (no effect, no signal). Only `set_title`/`set_app_id` do anything.
-  Gated on a real WM/policy layer (placement is a cascade stub; there is no
-  maximize/fullscreen/interactive-move concept yet). Until that exists, these
-  stay no-ops — but they are advertised, so clients think they work.
+  ignored (no effect, no signal). Only `set_title`/`set_app_id` do anything. These
+  are gated on a real WM/policy layer that does not exist (placement is a cascade
+  stub; there is no maximize/fullscreen/interactive-move concept). They stay no-ops
+  until that lands, but they are advertised, so clients think they work.
 
-- **`wl_output` — FABRICATED.** It advertises one "monitor" whose refresh (60Hz),
-  scale (1), transform, geometry (0,0), physical size, and make/model are all
-  HARDCODED FICTION. The reported size is the nested host *window* size, not a
-  real monitor. There is also NO host-window-resize handling: resizing the
-  overdraw window does not update the output, the swapchain, the WM layout, or
-  input coordinate mapping (all assume the initial size, scale 1, identity
-  mapping). Doing `wl_output` properly = implementing output reconfiguration
-  end-to-end: GPU process reads the host's real `wl_output` + tracks host-window
-  resize → forwards to core → core updates output size → JS resends
+- **`wl_output` is fabricated.** It advertises one monitor whose refresh (60Hz),
+  scale (1), transform, geometry (0,0), physical size, and make/model are
+  hardcoded. The reported size is the nested host window size, not a real monitor.
+  There is no host-window-resize handling: resizing the overdraw window does not
+  update the output, the swapchain, the WM layout, or input coordinate mapping
+  (all assume the initial size, scale 1, identity mapping). Doing `wl_output`
+  properly means output reconfiguration end-to-end (GPU process reads the host's
+  real output + tracks host-window resize → core updates output size → JS resends
   geometry/mode/scale/done → WM re-lays-out + input mapping + swapchain
-  reconfigure. Build an output-backend SEAM (like the input backend) so phase-1
-  (host output) and phase-2 (DRM connectors/EDID/hotplug) swap underneath without
-  touching the WM/compositing/`wl_output` layers. Cross-cutting; its own subsystem.
+  reconfigure), behind an output-backend seam (like the input backend) so phase-1
+  host-output and phase-2 DRM/EDID/hotplug swap underneath without touching the
+  WM/compositing/`wl_output` layers.
 
-- **`wl_region` — no-op stub.** `add`/`subtract` do nothing; opaque/input regions
-  are not tracked (hit-testing uses whole-window rects). Low urgency.
+- **`wl_region` is a no-op stub.** `add`/`subtract` do nothing; opaque/input
+  regions are not tracked (hit-testing uses whole-window rects). Low urgency.
 
-- **Smaller flagged gaps (already noted in their sections):** `wl_subsurface`
-  `place_above`/`place_below` sibling reordering (no-op); DnD drag-icon
-  compositing (implemented, not pixel-tested); dmabuf `create` (async server-minted
-  wl_buffer) not wired (the trampoline primitive now exists); single-plane dmabuf
-  only; `wl_data_device` is complete (clipboard + primary + DnD).
+- **Frame clock is a ~16ms timer, not display-driven.** The architecture's frame
+  loop is event-driven off a display-side completion signal (host
+  `wl_surface.frame` in phase 1, KMS page-flip in phase 2). Today a `uv_timer`
+  paces render+present, which has no causal link to refresh and beats against real
+  vsync. This is a phase-1 shortcut because Dawn's WSI swapchain owns `Present` and
+  hides the host frame callback. See architecture.md "Frame clock" and "Phase-2
+  present".
 
-- **Protocols foot probes that are advertised-absent (clean fallback, not gaps):**
-  xdg-decoration (→ CSD), fractional-scale, cursor-shape, text-input, xdg-activation,
-  toplevel-icon, system-bell. Not implemented; clients warn and fall back. See the
-  protocol-coverage matrix lower in this file.
+- **Smaller advertised-incomplete items:** `wl_subsurface` `place_above`/
+  `place_below` sibling reordering (no-op); DnD drag-icon compositing (implemented,
+  not pixel-tested); dmabuf `create` (async server-minted `wl_buffer`) not wired
+  (only `create_immed`); single-plane dmabuf only; `zwp_linux_dmabuf_feedback_v1`
+  is functional for WSI clients but not automatically asserted.
+
+- **Advertised-absent (clean fallback, not gaps):** xdg-decoration (→ CSD),
+  fractional-scale, cursor-shape, text-input, xdg-activation, toplevel-icon,
+  system-bell. Clients warn and fall back. See the protocol-coverage matrix.
 
 ## Verification environment
 
-All "proven" claims below were exercised on:
+All "verified" claims were exercised on a single machine, single driver — nothing
+is proven portable:
 
-- NVIDIA GeForce RTX 5060 (GB206, Blackwell), proprietary driver
-  595.71.05, Vulkan backend.
-- A live host Wayland session (`wayland-1`), overdraw running nested as a
-  client of it.
+- NVIDIA GeForce RTX 5060 (GB206, Blackwell), proprietary driver 595.71.05, Vulkan
+  backend.
+- A live host Wayland session, overdraw running nested as a client of it.
 - Dawn wire release `jhanssen/dawn` `v20260531-linux-wayland-wire-alpha2`
-  (commit `6cfd29c89bd608f5fc5192e5ec49d32e939f74c8`). Adds the SharedFence
-  object-tracking fix (see "Decoration surface teardown" below): without it,
-  imported `SharedFence`s were never tracked in the device object list, so their
-  `DestroyImpl` never ran and the imported sync-fd leaked per fence.
+  (`6cfd29c89b`) for the wire libs, and `dawn.node` from `v20260531-linux-wayland-
+  wire-alpha` (`f01cb22e5c`) for the JS WebGPU bindings.
 
-Single machine, single driver. Nothing here is proven portable yet.
+## Architecture as built
 
-## Built and proven
+### Process topology
 
-### Build / dependency integration
-- Top-level CMake downloads the Dawn wire release tarball, runs
-  `find_package(Dawn)`, and links `dawn::webgpu_dawn` (native + wire server)
-  and `dawn::webgpu_dawn_wire` (wire client). See `3rdparty/dawn/CMakeLists.txt`.
-- `wayland-scanner`-generated xdg-shell client glue is checked in
-  (`native/wayland/generated/`); the build has no build-time dependency on
-  `wayland-scanner`.
+Two processes per the design: a core (Node + N-API addon, Dawn wire client) and a
+separate native GPU process (Dawn native + wire server). The core fork+execs the
+GPU process and reaps it on shutdown (poll then SIGTERM, no orphan). The GPU
+process owns the host Wayland output window + its `wl_display` connection, the
+native Dawn instance + `dawn::wire::WireServer`, the `wgpu::Surface` (injected at
+the client's reserved handle), and the GBM allocator. The core runs the
+`dawn::wire::WireClient`, brings up adapter + device + surface over the wire, hosts
+the JS protocol/WM/compositing/plugin layers, and is the Wayland server for
+overdraw's own clients.
 
-### Two-process presentation spine (phase 1 nested)
-The core (Node + N-API addon, wire client) + GPU process (native Dawn + wire
-server) topology runs as real, non-spike code and presents to a host window:
+The core is C++ + Node: `src/index.js`/`src/main.ts` load `overdraw_native.node`;
+native core in `native/core/` (`gpu_process`, `wire_link`, `compositor`). Node owns
+`main()` and the libuv loop. The N-API addon uses the raw `node_api.h` C API (not
+node-addon-api, to avoid exception/RTTI dependence under `-fno-rtti`).
 
-- GPU process (`gpu-process/`): owns the host Wayland output window and its
-  `wl_display` connection, native Dawn instance + `dawn::wire::WireServer`,
-  creates the `wgpu::Surface` from the host `wl_surface`, and `InjectSurface`s
-  it at the client's reserved handle. Also holds the GBM allocator (see
-  "dmabuf interop").
-- Core: now **Node-hosted C++**. `src/index.js` loads the N-API addon
-  (`overdraw_native.node`); the native side lives in `native/core/`
-  (`gpu_process`, `wire_link`, `compositor`) compiled into a static lib. The
-  addon `fork`+`exec`s the GPU process, runs `dawn::wire::WireClient`, brings
-  up adapter + device + surface over the wire, and composites.
-- IPC (`native/ipc/`): Dawn wire over one `SOCK_STREAM` socket (length-prefixed
-  frames); a side channel over a `SOCK_SEQPACKET` socket carrying fixed-size
-  tagged POD control messages (`side_channel.h`) — not yet flatbuffers. (The
-  side channel was STREAM originally; switched to SEQPACKET once control traffic
-  grew, to preserve message boundaries. SCM_RIGHTS fd passing IS now used — the
-  `ImportClientTex` message carries a client dmabuf fd this way.)
-- Clean lifecycle: runs until `stop()`, then ordered shutdown; GPU process
-  exits cleanly and is reaped (poll then SIGTERM fallback so it cannot orphan).
-- **Fully non-blocking IPC (both sockets, both ends).** No write may ever park:
-  a single-threaded peer blocked in `write()` (waiting for a full socket buffer
-  to drain) while the other waits to be read is a mutual deadlock — observed
-  under sustained WSI client traffic (GPU process parked in `FdSerializer::Flush`
-  → `write` while the core's commit waited for its reply). Now: all fds are
-  `O_NONBLOCK`; writers buffer what the socket can't take and drain on writable.
-  - `native/ipc/transport.h`: `FdSerializer` queues framed wire batches and
-    writes what fits (`Flush` never blocks; `pumpOut` drains on writable);
-    `FrameReader` accumulates partial reads into whole frames; `CtrlSender`
-    buffers SEQPACKET control datagrams (dup'ing fds when queued). Blocking
-    `sendMessage`/`sendMessageFds` shims remain for the one-shot startup/handshake
-    path only.
-  - GPU process: an **`EventLoop` abstraction** (`gpu-process/src/event_loop.h`)
-    with an **epoll** backend (`event_loop_epoll.cpp`) multiplexes wire / ctrl /
-    host-`wl_display` fds; arms `kWrite` only when wire output is queued. The
-    interface is backend-agnostic so a kqueue (BSD/macOS) backend can be added
-    later. Replaced the prior `usleep` spin. Steady-state loop ~190 Hz (not a
-    busy loop).
-  - Core: libuv `uv_poll` arms `UV_WRITABLE` on the wire fd only when output is
-    queued (`armWirePoll`), draining via `wirePumpOut`.
-  - Ordering hazard fixed: a ctrl request (`ImportClientTex`) must not overtake
-    the wire commands it depends on. Mechanism (traced through Dawn wire source,
-    verified): `WireClient::ReserveTexture` emits NO wire command — it just
-    allocates a client-side handle id, recycling freed ids with generation+1
-    (`client/ObjectStore.cpp`). When the core drops the previous reserved/injected
-    `wgpu::Texture`, `Client::Unregister` sends an `UnregisterObjectCmd` over the
-    WIRE and recycles that id at generation+1 (`client/Client.cpp:196`). The GPU's
-    server-side `InjectTexture` → `Allocate` requires the slot's recorded
-    generation to be **strictly less** than the injected handle's generation
-    (`server/ObjectStorage.h:243`), which holds only after the server has
-    processed that `UnregisterObjectCmd`. `ImportClientTex` travels over CTRL; if
-    it overtakes the still-queued wire UnregisterObjectCmd, the server slot still
-    has the old generation → `Allocate` FatalError → `InjectTexture failed`.
-    (NOT "the ReserveTexture command must arrive first" — there is no such
-    command; an earlier note here said that and was wrong.)
-  - Fixed with a **cross-channel wire serial** (no blocking): `FdSerializer`
-    counts cumulative framed wire bytes (`bytesQueued`); the core flushes the
-    reserve and tags `ImportClientTex` with that value (`Message.wireSerial`);
-    the GPU's `FrameReader` counts framed bytes consumed (`bytesConsumed`) and
-    **defers** the import (queued in `pendingImports`) until
-    `bytesConsumed >= wireSerial` — i.e. the prior `UnregisterObjectCmd` has been
-    handed to the wire server. Drained after every wire pump. This is an explicit
-    happens-before across the two sockets with no `write()`/poll blocking.
-    Verified: 0 `InjectTexture failed` across active + idle runs; an active run
-    sustained 146 commits / 142 releases with no starvation.
-  - Wire socket `SO_SNDBUF`/`SO_RCVBUF` enlarged to 8 MiB (`gpu_process.cpp`) so
-    the kernel keeps draining queued bytes while we are busy (userspace buffering
-    still covers the case where even that fills).
-- **Async dmabuf commit (the prior synchronous wart is fixed).**
-  `commitSurfaceDmabuf` no longer blocks: it reserves the texture handle, sends
-  `ImportClientTex` (fd via SCM_RIGHTS), records a `PendingImport` keyed by the
-  reserved texture handle id, and returns immediately. The held reservation
-  (neither `Acquire`'d nor `Reclaim`'d until the reply) keeps its handle id from
-  being recycled while in flight. The GPU process imports + injects
-  asynchronously (already non-blocking, deferring on the wire serial) and replies
-  `ClientTexImported`; the reply is dispatched on the Node thread by
-  `Compositor::drainCtrl()` (`finishImport`: retire superseded buffer, adopt the
-  injected texture, build bind group, mark present, report imported).
-  - PREREQUISITE built: a **steady-state ctrl-fd drain**. `ctrlFd_` is now
-    registered with libuv (`uv_poll` in `addon.cpp` → `onCtrlReadable` →
-    `drainCtrl`); `onWireReadable` also calls `drainCtrl` after `drainWire` (the
-    wire advancing may release deferred GPU-side imports). Replies are matched by
-    reserved-texture handle id; per surface they complete in send order.
-  - **Unified map-on-first-content.** Both shm and dmabuf commits now report
-    presentable surfaces via `Compositor::takeImportedSurfaces()` (id + content
-    size). The JS sweep in `dispatchFrameCallbacks` (`src/protocols/index.ts`)
-    maps a toplevel on its first reported content (WM place + focus). The old
-    inline map in `wl_surface.commit` (which relied on the synchronous dmabuf
-    return) is gone; `commit` no longer infers map for either path. A
-    `surfacesById` map gives the sweep id→record lookup.
-  - **(HISTORICAL) Async readback.** This section documents the original
-    native-compositor commit/readback path (`commitSurfaceShm`/`commitSurfaceDmabuf`,
-    `surfaceReadback`, the `*-upload-smoke.mjs` tests). That path was REMOVED with
-    the C++ compositing pass; compositing + readback now live in JS (see
-    "Compositing pass runs in JS over the Dawn wire"). The two-process spine,
-    non-blocking IPC, and async dmabuf import below remain accurate. Original note,
-    for reference (RTX 5060 / driver 595.71.05): `dmabuf-upload-smoke.mjs` PASS
-    (pixel-exact red, 0 bad components, 3/3 runs); `shm-upload-smoke.mjs` PASS
-    (pixel-exact blue) through the unified path; structural `node --test` suite
-    8/8. No leaked GPU process.
-  - Steady state is now fully libuv-driven with no `write()`/pump blocking on the
-    Node thread. Multi-client per-commit occupancy was not separately re-measured;
-    the per-commit round-trip wait (the ~1.7 ms previously charged to the event
-    loop) is eliminated by construction.
-  - Further option (only if measured necessary): move the wire socket `write()`
-    off the Node thread to a writer worker. Serialization (Dawn `Flush`, not
-    thread-safe) stays on Node and produces framed bytes into the serializer's
-    existing `out_` queue; a worker drains `out_` to the socket (write-only —
-    inbound `HandleCommands` must stay on Node). The buffered transport already
-    makes this a clean producer/consumer seam. NOT done; no measured write-path
-    bottleneck yet.
+### IPC (three sockets, fully non-blocking)
 
-### GPU process threading (Dawn facts verified; NOT yet implemented)
+- **Dawn wire** over one `SOCK_STREAM` socket (length-prefixed frames).
+- **Control side channel** over a `SOCK_SEQPACKET` socket carrying fixed-size
+  tagged POD messages (`native/ipc/side_channel.h`) — not flatbuffers. SCM_RIGHTS
+  fd passing is used (e.g. `ImportClientTex` carries a client dmabuf fd).
+- **Input** over a dedicated `SOCK_SEQPACKET` socket (separate from control so
+  unsolicited input never interleaves with request/reply traffic).
+
+No write may ever park: all fds are `O_NONBLOCK`; writers buffer what the socket
+can't take and drain on writable. `native/ipc/transport.h` provides `FdSerializer`
+(queues framed wire batches; `pumpOut` drains on writable), `FrameReader`
+(accumulates whole frames), `CtrlSender` (buffers SEQPACKET datagrams, dup'ing fds
+when queued). Blocking shims remain only for one-shot startup/handshake.
+
+- **GPU process** drives an `EventLoop` abstraction (`gpu-process/src/
+  event_loop.h`) with an epoll backend, multiplexing wire / ctrl / host-
+  `wl_display` fds; arms write-interest only when output is queued. Backend-
+  agnostic so kqueue can be added. Steady-state loop ~190 Hz.
+- **Core** uses libuv `uv_poll`, arming `UV_WRITABLE` on the wire fd only when
+  output is queued (`armWirePoll`/`wirePumpOut`).
+- Wire socket buffers enlarged to 8 MiB; userspace buffering covers overflow.
+
+**Cross-channel ordering.** A control request (`ImportClientTex`) must not overtake
+the wire commands it depends on (the GPU's `InjectTexture` requires the server to
+have processed the prior `UnregisterObjectCmd` that recycles the handle at
+generation+1). Enforced by a wire serial: `FdSerializer` counts cumulative framed
+wire bytes; the core tags `ImportClientTex` with that value; the GPU process defers
+the import until its consumed-byte count reaches the serial. An explicit
+happens-before across the two sockets, no blocking.
+
+### GPU process threading
+
 The GPU process pump (wire decode + `HandleCommands` + `DeviceTick` + present) is
-**single-threaded today**. There is no measured bottleneck (steady state ~190 Hz),
-but the design admits true parallelism because core and each plugin are independent
-devices. Verified against the vendored Dawn (`~/dev/dawn`) so the threading model
-rests on facts, not assumptions:
+single-threaded today. No measured bottleneck. The design admits true parallelism
+(core + each plugin are independent `wgpu::Device`s = independent `VkDevice`/
+`VkQueue`s with distinct submit timelines), via thread-per-connection ownership:
+one OS thread per wire connection, each exclusively owning its device, plus one
+KMS/present thread owning the shared instance/allocator/scanout behind locks.
+Decision: implement after the phase-2 KMS present loop lands. No correctness
+blocker found. Not built.
 
-- **Each `wgpu::Device` is its own `VkDevice`.** `Device::Initialize` →
-  `CreateDevice` → `vkCreateDevice` per Dawn device, on the shared
-  `VkPhysicalDevice` (`src/dawn/native/vulkan/DeviceVk.cpp:129,758`). So core + each
-  plugin get distinct `VkDevice`/`VkQueue`s and distinct submit timelines — no
-  driver-side serialization point between them. Cross-device sharing is
-  dmabuf-import-per-device + `SharedFence` (`SharedTextureMemoryVk.cpp` imports the
-  dmabuf as a fresh `VkDeviceMemory`/`VkImage` on each `GetVkDevice()`), NOT a shared
-  device handle or any GL-style shared-object namespace.
-- **Dawn is thread-safe only under `Feature::ImplicitDeviceSynchronization`**
-  (stable; `src/dawn/native/Features.cpp:168`), which makes public API methods safe
-  across threads via a **per-device** `DeviceMutex` (`Device.h:694`) — with two
-  caveats: (1) command **encoding is excluded** (encoders are never thread-safe;
-  each must live on one thread), and (2) it is a lock, so calls to the *same* device
-  serialize (correctness, not parallelism).
-- **Implied model: thread-per-connection ownership, NOT the global feature.** Because
-  the mutex is per-device, the clean design is one OS thread per wire connection,
-  each thread *exclusively* owning its device (read socket → `HandleCommands` →
-  encode + submit → `DeviceTick`). No device is touched by two threads, so
-  `ImplicitDeviceSynchronization` is unnecessary (avoids the lock overhead AND the
-  encoding restriction) and core/plugins ingest + submit in genuine parallel.
-  Reserve the feature only for a device that must be touched by >1 thread.
-- **What stays shared and must be guarded (NOT shardable per connection):** the
-  `wgpu::Instance`/adapter, the GBM allocator, and the single DRM-master/KMS state
-  (scanout ring + page-flip loop). Natural shape: N parallel per-connection device
-  threads + one KMS/present thread owning the scanout ring + shared instance/allocator
-  behind their own locks.
-- Structurally simple (the per-connection seam mostly exists), but not literally
-  trivial: the shared instance/allocator/KMS state above needs explicit locking, and
-  Dawn-internal callback threads must be kept on the owning thread (pump
-  `AllowProcessEvents` there) or routed carefully. **Decision: do it; sequence after
-  the phase-2 KMS present loop lands so the KMS/present thread is the obvious home
-  for the shared bits.** No correctness blocker found.
+### JS layer / event loop
 
-### JS layer / event loop (core is C++ + Node)
-- The core is C++ + Node as the architecture specifies. Node owns `main()` and
-  the libuv loop; the N-API addon (raw `node_api.h` C API, to avoid
-  node-addon-api's exception/RTTI dependence under `-fno-rtti`) holds the native
-  core. One-shot bring-up runs blocking inside `start()`; the **steady-state
-  present loop is libuv-driven** — a `uv_poll_t` on the wire fd drains inbound
-  wire frames and a `uv_timer_t` (~16ms) paces frame render+present. No
-  hand-rolled C++ spin loop in steady state.
-  - **GAP / divergence: the ~16ms timer is NOT the intended frame clock.** The
-    architecture's frame loop is event-driven off a display-side completion
-    signal (host `wl_surface.frame` callback in phase 1, KMS page-flip in phase
-    2), NOT a free-running timer — a timer has no causal link to refresh and
-    beats against real vsync (waste/stutter, and tearing/stalls under direct
-    KMS). The timer is a phase-1 shortcut because Dawn's WSI swapchain owns
-    `Present` and hides the host frame callback. The documented frame-loop
-    trigger ("phase 1: host `wl_surface.frame` callback") is therefore NOT
-    implemented today. See architecture.md "Frame clock: the trigger must
-    originate at the display" and "Phase-2 present: a self-managed scanout
-    swapchain" for the intended model (GPU-process `FrameDone`/`Present`
-    side-channel events drive the loop; the timer is deleted).
-- A **C++ -> JS event path** works: an optional `onFrame` JS callback is invoked
-  from the frame timer (direct `napi_call_function`, same Node thread). The
-  cross-thread path (Dawn-internal-thread callbacks -> `napi_threadsafe_function`)
-  is **not yet exercised**.
-- The **compositing renderer runs in JS** (see "Compositing pass runs in JS over
-  the Dawn wire") — the documented C++/JS divergence is closed; there is no C++
-  compositing pass. Protocol handlers are in JS (`src/protocols/`). Still
-  C++-internal or absent: WM/policy beyond the placement stub, and the plugin
-  model.
-- Server-side Wayland (`wl_event_loop`) IS integrated into the libuv loop (see
-  "Wayland server + generic trampoline"); the core is a real Wayland server. No
-  host-window-resize handling. Host *input* arrives in the core (see "Host input
-  forwarding") and both **pointer and keyboard** input are routed to clients via
-  `wl_seat`/`wl_pointer`/`wl_keyboard` (see "Input routing to clients").
+One-shot bring-up runs blocking inside `start()`; the steady-state present loop is
+libuv-driven (a `uv_poll_t` on the wire fd drains inbound frames, a `uv_timer_t`
+paces render+present). No hand-rolled C++ spin loop in steady state.
 
-### Host input forwarding (host seat -> GPU process -> core -> JS, verified)
-Host pointer/keyboard events reach the core as normalized events. The seam is a
-backend abstraction so a phase-2 libinput source can replace the phase-1 source
-without touching anything above it.
+A C++→JS path works: an optional `onFrame` callback fires from the frame timer
+(direct `napi_call_function`, same Node thread). The cross-thread path
+(Dawn-internal callbacks → `napi_threadsafe_function`) is not yet exercised.
 
-- Phase-1 source: the GPU process binds the host `wl_seat` (`host_window.cpp`,
-  pointer + keyboard, up to wl_seat v5) and forwards each event as a fixed-size
-  `ipc::InputMessage` over a **dedicated SEQPACKET input socket** — separate
-  from the control side channel so unsolicited input never interleaves with
-  control request/reply traffic. Send is non-blocking (`MSG_DONTWAIT`): input is
-  lossy by design and the GPU loop must never block on a full socket buffer
-  (doing so stops it servicing the host connection -> the host marks the window
-  unresponsive). The third socket fd is passed at fork/exec
-  (`gpu_process.cpp`, `argv[3]`, optional).
-- Core abstraction (`native/core/input.h`): `InputEvent` (normalized,
-  OUTPUT-space doubles, raw evdev keycodes, ms timestamps), `InputSink`, and an
-  `InputBackend` interface. `WaylandInputBackend` (`input_wayland.cpp`) reads the
-  input socket, converts `wl_fixed_t` (24.8) to logical pixels, and emits
-  `InputEvent`s. A future `LibinputBackend` implements the same interface.
-- Addon bridge (`addon.cpp`): a `uv_poll_t` on the input fd drains the backend on
-  the Node main thread; events are delivered to an optional `onInput` JS callback
-  (`start(gpuBin, onFrame?, onInput?)`) as plain objects — same-thread
-  `napi_call_function`, no threadsafe function needed.
-- Verified originally on the RTX 5060 / Hyprland with a real host seat: pointer
-  enter/motion/frame and keyboard enter/key/modifiers all reach the JS callback;
-  coordinates and evdev keycodes correct. The interactive harness that proved
-  this (`test/input-smoke.mjs`) has since been REMOVED (interactive); the durable
-  normalization + routing is now covered automatically by `injectHostInput` (see
-  "Testing"). The host-seat→socket forwarding it also exercised is phase-1
-  nesting scaffolding, not a durable path.
-- Fixed while building this: the GPU process's host-connection `pump()` only
-  called `wl_display_dispatch_pending` (drains the in-memory queue) and never
-  READ the socket, so host events sat unread forever. Now does
-  prepare_read + non-blocking poll on the wl fd + read_events. This was latent
-  before (nothing consumed post-startup host events) and would also have broken
-  future resize/output handling.
-- Limitations: coordinate mapping is currently identity (output logical size ==
-  host window size, scale 1; `setOutputSize()` hook exists but is uncalled — real
-  mapping waits on resize/scale handling). Touch not forwarded. No keymap
-  translation (raw evdev codes only).
+Server-side Wayland (`wl_event_loop`) is integrated into the libuv loop (see
+"Wayland server + trampoline"); the core is a real Wayland server. Protocol
+handlers, WM (beyond the placement stub), compositing, and plugin runtime are in
+JS.
 
-### Input routing to clients (wl_seat / wl_pointer / wl_keyboard, verified)
-A real Wayland client receives mouse AND keyboard events on its surface — the
-phase-1 interactivity goal (connect → place → receive input) is met for both.
+## Compositing (runs in JS over the Dawn wire)
 
-- `src/protocols/wl_seat.ts`: the `wl_seat` global advertises **pointer +
-  keyboard** capability; the seat module tracks `wl_pointer`/`wl_keyboard`
-  resources per client and routes the normalized `onInput` stream. `handleInput`
-  hit-tests the WM window stack (`wm.windowAt`), tracks focus, and emits
-  `wl_pointer` enter/leave/motion/button/axis/frame and `wl_keyboard`
-  enter/leave/key/modifiers to the resources of the client that owns the focused
-  surface, with **surface-local** pointer coordinates.
-- **Focus policy is configurable** (`FocusOptions` via `installProtocols({ focus })`,
-  interim until a real config system). Pointer events always follow the pointer
-  (correct Wayland). *Keyboard* focus is governed by the policy: `follow-pointer`
-  (default — keyboard focus tracks the surface under the pointer) or
-  `click-to-focus` (focus changes on button press, persists when the pointer
-  moves away). `focusOnMap` (default true) gives a freshly-mapped window keyboard
-  focus so a launched app is typeable immediately — this fixed the "must click
-  first" symptom (a window mapping under a stationary pointer otherwise never got
-  a motion event to focus it under follow-pointer).
-- `Trampoline::clientIdOf` + addon `clientId(resource)`: a stable per-client id
-  (the `wl_client*`) associates the focused surface with the right client's
-  input resources without exposing `wl_client` to JS.
-- WM hit-test: `mapWindow` records the effective window size (committed buffer
-  dims when the placement stub leaves size 0) so `windowAt` has real bounds.
-- `onInput` is wired through `installProtocols`' returned `state.seat.handleInput`.
-- **Keyboard keymap + modifiers** (`native/wayland/keymap.{h,cpp}`, xkbcommon):
-  a default keymap is compiled and serialized to a sealed memfd; `get_keyboard`
-  sends it via `wl_keyboard.keymap` (XKB_V1). Each host key feeds the xkb state
-  (`xkb_state_update_key`, evdev+8) and the serialized modifier masks are emitted
-  via `wl_keyboard.modifiers`. The keymap fd is delivered as a `WaylandFd` and
-  encoded into the event via the now-implemented trampoline fd-**encode** path
-  (`postEvent` 'h' takes the raw fd from the WaylandFd, libwayland dups it into
-  the wire, we close our copy).
-- Verified interactively (`test/compositing-eyeball.mjs` + `test/color-client.c`):
-  hovering/clicking produces correct per-window pointer enter/leave + surface-
-  local motion + buttons; the client receives a readable keymap (mmap shows
-  `xkb_keymap {`); typing routes key press/release to the focused client with
-  **correct modifier masks** (Shift → dep bit 0, Alt → dep bit 3, cleared on
-  release). Verified with real clients: `foot` and `kitty` both focus on map and
-  type without a click (follow-pointer + focus-on-map). **PASS.**
-- Not built: client cursor surfaces (`set_cursor` is a no-op; no software
-  cursor), touch, multi-seat, key-repeat generation (repeat_info sent; client
-  repeats), axis source/discrete refinement. kbFocus is not auto-moved when the
-  focused window is closed (re-resolves on next pointer event; guarded against
-  use of a destroyed surface).
+The compositing pass lives entirely in core main-thread JS. There is no C++
+compositing pass; the C++ `Compositor` is a WSI + interop service. WebGPU is
+exposed to JS via a wire-retargeted `dawn.node` (proc table = wire client;
+`wrapDevice`/`wrapTexture` wrap host-provided wire handles; `AsyncRunner` pumps the
+instance; a wrapped device is borrowed, not destroyed). Built with
+`-Wl,--exclude-libs,ALL` so the bundled abseil does not interpose with V8's.
 
-### Real upstream client: `foot` runs end-to-end (verified)
-An unmodified upstream `foot` terminal (1.25.0) connects, renders, and is
-interactive in overdraw. Launch via `npm run compositor` (`src/main.ts`), which
-brings up the compositor, starts the server, installs protocols, wires input,
-prints `WAYLAND_DISPLAY`, and runs until SIGINT.
-
-- Globals added so `foot` (and similar shm/buffer clients) get past startup:
-  `wl_subcompositor`/`wl_subsurface`, `wl_output` (advertises one monitor at the
-  host logical size, scale 1, 60Hz), `wl_data_device_manager`/`wl_data_device`/
-  `wl_data_source`. `wl_callback` (frame callbacks). `zwp_linux_dmabuf_feedback_v1`
-  (minimal `done`, crash-fix from earlier).
-- **Frame callbacks** (`wl_surface.frame` → `wl_callback.done`): the JS layer's
-  `dispatchFrameCallbacks` fires every compositor frame (driven from the now-
-  per-frame `onFrame` hook). Without this a client renders one frame and waits
-  forever — the bug that made `foot` show only its initial background.
-- **Color fix**: the host advertises `RGBA8UnormSrgb` first; using it
-  double-encoded sRGB (client bytes are already sRGB, the shader passes them
-  through, an sRGB swapchain re-encodes → too bright). The GPU process now picks
-  the first **non-sRGB** advertised format. Pass-through is correct for opaque
-  content; NOTE alpha blending now happens in sRGB space (technically wrong for
-  translucency — the proper linear-compositing pipeline is future work).
-- Verified: `foot` renders its prompt, types interactively (keyboard routed,
-  confirmed by running a command), colors match a real compositor. **PASS.**
-- LIMITATIONS hit by `foot`, flagged: subsurfaces ARE composited with correct
-  sync/desync commit semantics (see "Subsurface compositing" below); the only
-  remaining subsurface gap is place_above/below sibling reordering (no-op);
-  clipboard + primary selection ARE implemented now (see "Clipboard" below; DnD on
-  the same interfaces is still a loud-no-op stub); no server-side decorations,
-  fractional scale, xdg-activation, cursor-shape, text-input (advertised-absent →
-  `foot` warns and falls back).
-- `kitty` also runs (hardware EGL — no `LIBGL_ALWAYS_SOFTWARE` needed — renders,
-  focuses on map, types). The pool-refcount fix (see "shm") was required: kitty
-  creates buffers then destroys the pool before rendering.
-- **dmabuf feedback is a stub** (minimal empty `done`, no `main_device`/
-  `format_table`). GPU clients using `zwp_linux_dmabuf_v1` *feedback* to pick a
-  render device get nothing and fall back (kitty logs
-  `libEGL ... failed to get driver name for fd -1` / `MESA-LOADER` warnings, then
-  works via fallback on this single-GPU setup). Real feedback (main_device +
-  format_table + tranche, buildable from the GPU process's DRM device +
-  `Allocator::usableModifiers`) is unbuilt — cosmetic for kitty here, but the
-  correct implementation of a currently-stubbed protocol.
-
-### Vulkan-WSI clients run (verified end-to-end on NVIDIA)
-A client that presents via a Vulkan/WebGPU **swapchain on its `wl_surface`**
-(Dawn `SurfaceSourceWaylandSurface` → `vkCreateWaylandSurfaceKHR` +
-`vkCreateSwapchainKHR`) now runs interactively under overdraw. Verified
-2026-05-30 with the MasterBandit terminal (Dawn/Vulkan WSI) on RTX 5060 / driver
-595.71.05: it configures its swapchain, renders text, updates live, and sustains
-continuous output without stalling. (An earlier revision of this file framed WSI
-support as an "architectural boundary / out of scope"; that was wrong. WSI
-clients are supported.)
-
-This took four distinct fixes, each verified:
-
-1. **Real dmabuf default-feedback** (`zwp_linux_dmabuf_v1` v4+ feedback). A
-   Vulkan WSI advertising dmabuf v4+ derives swapchain formats ONLY from feedback
-   (`format_table` + `tranche_formats`), ignoring the legacy `format`/`modifier`
-   events. overdraw previously stubbed feedback (`done` only) → empty format list
-   → `Surface.Configure(BGRA8Unorm)` rejected. Now the GPU process probes Dawn
-   (`GetFormatCapabilities` + `DawnDrmFormatCapabilities`) for each format, builds
-   the format_table (a sealed memfd, `{format u32, pad u32, modifier u64}`
-   records), and ships it + `main_device` (DRM render-node dev_t) to the core via
-   a `FeedbackData` side-channel message; the JS `zwp_linux_dmabuf_v1` handler
-   sends `format_table` + `main_device` + one tranche + `done`.
-   (`gpu-process/src/allocator.cpp` `probe`/`formatTable`, `gpu-process/src/main.cpp`
-   FeedbackData, `native/napi/addon.cpp` `dmabufFeedbackInfo`,
-   `src/protocols/zwp_linux_dmabuf_v1.ts` `sendFeedback`.)
-
-2. **Advertise BOTH the alpha and opaque DRM fourcc per format.** A BGRA8 swapchain
-   needs ARGB8888 **and** XRGB8888 advertised (the WSI picks the opaque sibling for
-   an opaque surface). overdraw mapped `BGRA8Unorm → ARGB8888` only; adding the
-   XRGB8888/XBGR8888/XBGR2101010 opaque variants (same modifiers) was the actual
-   fix for the `Configure` rejection (NOT a Vulkan-vs-GBM modifier conflict, which
-   was a mis-diagnosis). (`allocator.cpp` `fourccsFor`.)
-
-3. **wl_seat/wl_pointer/wl_keyboard event version gating.** The NVIDIA WSI binds
-   `wl_seat` at v1; overdraw sent `wl_seat.name` (since v2) / `wl_pointer.frame`
-   (v5) / `wl_keyboard.repeat_info` (v4) unconditionally, aborting the client
-   ("listener for opcode N is NULL"). Events are now gated on the resource's bound
-   version (exposed JS-side as `Resource.version`). (`native/wayland/trampoline.cpp`,
-   `src/protocols/wl_seat.ts`.)
-
-4. **dmabuf buffer-release lifecycle.** A swapchain client blocks in
-   `vkAcquireNextImageKHR` until the compositor releases buffers it has finished
-   reading. overdraw samples client dmabufs zero-copy, so a buffer can only be
-   released once the compositor frame that sampled it COMPLETES on the GPU. The
-   compositor now tags each frame's submit with a serial + `OnSubmittedWorkDone`;
-   a buffer superseded by a newer commit is freed once its retire-serial completes,
-   and the freed bufferIds are reported to JS which sends `wl_buffer.release`.
-   (`native/core/compositor.cpp` retiring_/freed_/`OnSubmittedWorkDone`,
-   `src/protocols/index.ts` release sweep via `takeFreedBuffers`.)
-
-The implicit-sync acquire (export the client dmabuf's read fence via
-`DMA_BUF_IOCTL_EXPORT_SYNC_FILE`, import as a Dawn `SharedFence`, wait on it in
-`BeginAccess`) is also implemented (`gpu-process/src/main.cpp`
-`exportDmabufAcquireFence`), mirroring wlroots' implicit-sync interop.
-
-Reference used: wlroots' Vulkan renderer (`render/vulkan/renderer.c`,
-implicit-sync interop) and Mesa's `src/vulkan/wsi/wsi_common_wayland.c` (the
-compositor-facing WSI contract). Hyprland's `LinuxDMABUF.cpp` was used to compare
-on-wire feedback.
-
-### Compositing pass runs in JS over the Dawn wire (dawn.node) — MIGRATION COMPLETE
-The compositing pass lives entirely in core main-thread JS now (the documented
-C++/JS "renderer in JS" divergence is closed). The C++ `Compositor` was reduced
-to a WSI + interop service; there is no C++ compositing pass. WebGPU is exposed
-to JS via a wire-retargeted `dawn.node` (see architecture.md "Exposing WebGPU to
-JS"). This is also the foundation for the future plugin `sdk.gpu`.
-
-- **Wire-retargeted `dawn.node`** (`jhanssen/dawn` @ `f01cb22e5c`, release
-  `v20260531-linux-wayland-wire-alpha`, consumed by `3rdparty/dawn`): proc table
-  = wire client; `wrapDevice(instanceHandle, deviceHandle)` and
-  `wrapTexture(deviceHandle, textureHandle)` wrap host-provided wire handles into
-  GPUDevice/GPUTexture; `AsyncRunner` pumps a `wgpu::Instance`; a wrapped device
-  is borrowed (not Destroy()ed). Built with `-Wl,--exclude-libs,ALL` (else the
-  bundled abseil interposes with V8's abseil → crash at `requestAdapter`).
-- **`src/gpu/compositor.ts` (`JsCompositor`)** is THE compositor: WGSL pipeline +
+- **`src/gpu/compositor.ts` (`JsCompositor`)** is the compositor: WGSL pipeline +
   sampler, per-surface view/uniform/bind group, render pass (placement +
-  premultiplied blend, JS-owned stack), submit. It implements the `CompositorSink`
-  interface the protocol/WM layer drives (`commitSurfaceBuffer`/`commitSurfaceDmabuf`/
-  `setSurfaceLayout`/`setStack`/`removeSurface`/`takeImportedSurfaces`/
-  `takeFreedBuffers`/`renderFrame`). Headless renders into an owned offscreen
-  target (read back, 256-aligned); nested presents to the host swapchain.
-- **Native services kept** (the non-wire-propagatable / WSI bits): surface
-  bring-up + `Configure`, `acquireOutputTexture`/`presentOutput`/`outputFormat`
-  (host swapchain), `createTextureFromDmabuf` + `releaseDmabufImport` (dmabuf
-  reserve/inject + STM/fd release, generation-matched), `shmView` (zero-copy
-  external `ArrayBuffer` over the client shm mapping), `gpuHandles`, the wire link.
-- **shm** (slice 1/1b): `commitSurfaceBuffer` → `shmView` + `queue.writeTexture`.
-  **dmabuf** (slice 2): `createTextureFromDmabuf` (async, returns a Promise of the
-  wire handle) → `wrapTexture` → sample; JS owns the buffer-release lifecycle
-  (submit serial + `queue.onSubmittedWorkDone` → `wl_buffer.release` + explicit
-  `ReleaseClientTex` of the server STM/fd). **nested present** (slice 3):
-  `acquireOutputTexture` → wrap as render attachment → present. **slice 4**:
-  deleted the C++ compositing pass; the JS compositor is the only path.
-- **Lifetime/teardown fixes (load-bearing)**: JS WebGPU finalizers run at exit and
-  call into the C++ wire client, so the client is `Disconnect()`'d but leaked at
-  teardown (else UAF/SIGSEGV); the wire pump runs under an N-API `HandleScope`
-  (resolves `dawn.node` promises); `stop()` drains the wire after halting the
-  frame timer so the last `onSubmittedWorkDone` resolves Success before Disconnect
-  (dawn.node throws on a cancelled callback).
-- **Verified**: all GPU tests (`test/*.gpu.mjs`) run on the JS compositor —
-  shm/dmabuf/subsurface/popup pixels, integration, clipboard, DnD, protocols,
-  nested present, and a dmabuf buffer-cycling **leak test** (GPU-process fd count
-  stays bounded over 40 cycled buffers → `ReleaseClientTex` reclaims). `foot`
-  (shm) and a Vulkan-WSI terminal (dmabuf cycling) run on it manually. The
-  launcher (`main.ts`) presents on the JS compositor on-screen.
-- **Remaining gaps (flagged)**: on-screen (nested) PIXEL correctness is not
-  auto-asserted (no post-present readback; it is inherited from the headless
-  pixel tests, same render pass). The host-window frame clock is still a ~16ms
-  timer, not display-driven (pre-existing divergence; see below).
+  premultiplied blend, JS-owned back-to-front stack), submit. It implements the
+  `CompositorSink` interface the protocol/WM layer drives
+  (`commitSurfaceBuffer`/`commitSurfaceDmabuf`/`setSurfaceLayout`/`setStack`/
+  `setLayerSurfaces`/`setSurfaceTexture`/`removeSurface`/`takeImportedSurfaces`/
+  `takeFreedBuffers`/`afterCurrentFrame`/`renderFrame`). Headless renders into an
+  owned offscreen target (read back, 256-aligned); nested presents to the host
+  swapchain.
+- **Native services kept** (non-wire-propagatable / WSI bits): surface bring-up +
+  `Configure`, `acquireOutputTexture`/`presentOutput`/`outputFormat`,
+  `createTextureFromDmabuf` + `releaseDmabufImport` (generation-matched), `shmView`
+  (zero-copy external `ArrayBuffer` over the client shm mapping), `gpuHandles`, the
+  wire link.
 
-### Config system (user config: --config / XDG, verified)
-`src/config/` loads user config from `--config <path>` (hard error if missing)
-else `$XDG_CONFIG_HOME/overdraw/config.*` then `~/.config/overdraw/config.*`,
-probing `.ts/.cts/.mts/.js/.cjs/.mjs` (Node 24 native type-stripping; no
-transpile). Default export may be an object or a (sync/async) function. Validates
-`focus`/`output`; the launcher applies them. Unit tests in `test/config.test.js`.
-- The `plugins` array is parsed, validated (`module` required; `name`/`restart`/
-  `maxRestarts`/`windowSeconds` validated), and resolved (defaults applied), and
-  is now CONSUMED by the plugin runtime (see "Plugin runtime (scope B)"). The
-  capability sub-grant schema is not yet validated (lands with the GPU/window
-  SDK).
+### Stack layers + placement
 
-### Plugin runtime (scope B: isolation + lifecycle + watchdog + restart; NO GPU/SDK surface yet)
-A plugin module loads in its own worker_threads Worker, runs `init(sdk)`, and is
-contained + supervised per architecture.md ("Plugin model"/"Lifecycle"/
-"Isolation"/"Restart policy"). This is the lifecycle/isolation skeleton ONLY:
-there is intentionally NO GPU, window, surface, output, capture, input, or
-protocol SDK surface yet (those need the cross-device dmabuf producer/consumer
-path, which is unverified — see "dmabuf interop path", "Not done"). A plugin in
-scope B can do exactly: log, and register `onShutdown`.
+- **Layers** (`background < below < content < above < overlay`), composited
+  back-to-front. `content` holds windows + subsurfaces + popups (a single stack
+  owner, `rebuildStackWithPopups`); other layers via `setLayerSurfaces`.
+- **Placement seam:** the compositor consumes geometry only via `CompositorSink`
+  (`setSurfaceLayout`, `setStack`). `src/wm/index.ts` owns the window list/stack
+  and pushes layout+order. `src/wm/placement.ts` is a cascade STUB — the one
+  throwaway policy piece, to be replaced by a real layout model without touching
+  the seam. `mapWindow` records the effective window size for hit-testing.
+- Swapchain present mode is **Mailbox** (non-blocking acquire); FIFO blocks
+  `GetCurrentTexture` on the single command thread and stalls other wire work.
+- **Multi-surface verified** (headless pixel readback): two shm clients composite
+  at distinct cascaded positions; top-of-stack wins the overlap.
 
-- `src/plugins/protocol.ts`: the architecture's Worker↔core envelope
-  (`{kind:'request'|'response'|'event'}`) with a pending-promise table, plus
-  `ping`/`pong` control messages (kept OUTSIDE the request table so watchdog
-  liveness never interacts with in-flight requests). Transport-agnostic
-  (`Channel`); `channelFor()` adapts a Worker/MessagePort with no cast.
-- `src/plugins/bootstrap.ts` (runs IN the Worker): builds the SDK, dynamically
-  `import()`s the plugin module, calls its default `init(sdk)`, reports
-  resolve/reject as an `init` event, auto-pongs pings (responsive event loop =
-  liveness), and handles the `shutdown` request by running `onShutdown`.
-- `src/plugins/sdk.ts`: the capability-shaped SDK object. Scope B exposes
-  `name`, `log(...)`, `onShutdown(cb)`. All GPU/window/etc. methods are ABSENT
-  (capabilities enforced by object shape per the design).
-- `src/plugins/runtime.ts`: `PluginRuntime` owns one Worker per plugin with
-  `resourceLimits.maxOldGenerationSizeMb` (heap cap), the lifecycle state
-  machine (`spawning`→`live`→`shutting-down`/`failed`), the **watchdog**
-  (core pings every N ms; >K missed pongs → `worker.terminate()`), and the
-  **restart policy** (`on-failure` up to `maxRestarts` in a rolling
-  `windowSeconds`, then permanently `failed`; `never` disables; init failure
-  counts toward the budget). Graceful `stop()` awaits `onShutdown` up to
-  `shutdownTimeoutMs` then terminates; forced paths (crash/OOM/watchdog) skip
-  the callback. Timing tunables are injectable (fast tests).
-- Wired into `src/main.ts`: configured plugins load after the server is up;
-  plugin `module` paths (absolute / `./` / `../`) resolve relative to the config
-  file's dir, bare specifiers pass through. Plugin `log` events are printed.
-- **Verified** (`test/plugins.test.js`, GPU-free `node --test`, spawning REAL
-  Workers + real fixture plugins in `test/fixtures/plugins/`): well-behaved
-  plugin reaches `live`; init reject / missing-default-export → `failed`;
-  graceful stop runs `onShutdown`; never-resolving `onShutdown` hits the
-  shutdown timeout (no hang); a LIVE plugin that wedges its event loop in a hot
-  loop is terminated by the watchdog and, after exhausting the restart budget,
-  ends `failed`; OOM past the heap cap aborts the Worker and drives restart;
-  multiple plugins are independent (one fails, one stays live). **PASS.**
-- **GAPS / unbuilt (flagged):**
-  - **No GPU/window/surface/output/capture/input/protocol SDK.** A scope-B
-    plugin cannot draw, take input, or implement a protocol. The producer/
-    consumer surface path it would use is unproven cross-device (see "dmabuf
-    interop path"). This is the next plugin milestone, not done.
-  - **No native-import restriction.** architecture.md says a custom Worker
-    module loader rejects non-allowlisted native addons. NOT built — a scope-B
-    plugin's `import()` is unrestricted. Deferred until there is an SDK native
-    addon to allowlist; until then plugins are NOT sandboxed against loading
-    arbitrary native modules. (Acceptable per "malicious plugins out of scope,"
-    but it is a real unbuilt isolation control, flagged here so it is not
-    mistaken for done.)
-  - **Watchdog limit.** A missed pong proves the Worker EVENT LOOP isn't
-    turning (catches hot loops + JS-level blocking). A plugin blocked in a
-    synchronous NATIVE call would also miss pongs, but `terminate()` acts at JS
-    boundaries and may not interrupt arbitrary native blocking. Scope B has no
-    plugin-facing blocking native calls, so this is moot today; relevant once
-    the SDK gains native methods.
-  - **No capability sub-grant enforcement / config schema.** `capabilities` in
-    plugin config is not validated or applied (no capabilities exist to grant).
+Still absent: per-surface transforms/opacity/rotation/scale, fractional scale,
+multi-output, damage, real WM/layout policy, resize handling.
 
-### Compositing (multi-surface: per-surface placement + stacking + blending)
-- The textured-quad compositing pass runs in JS (`src/gpu/compositor.ts`; see
-  "Compositing pass runs in JS over the Dawn wire"): each surface drawn into its
-  layout rect (per-surface uniform = normalized output rect), JS-owned
-  back-to-front stack order, premultiplied-alpha blend, clear to black when empty.
-- **Multi-surface verified** (`test/compositing.gpu.mjs`, headless pixel readback):
-  two real shm clients composite at distinct cascaded positions; top-of-stack wins
-  the overlap. **PASS**.
-- Placement seam: the compositor consumes geometry only via the `CompositorSink`
-  — `setSurfaceLayout(id,x,y,w,h)` and `setStack(ids[])`; JS owns it. `src/wm/
-  index.ts` holds the window list/stack and pushes layout+order to the sink;
-  `src/wm/placement.ts` is a STUB (cascade) — the one throwaway policy piece, to
-  be replaced by a real layout model (dynamic tiling + floating) without touching
-  the seam. `mapWindow` fires on a toplevel's first buffered commit
-  (`wl_surface.commit`).
-- **Transport fix found while building this:** the Dawn wire socket is
-  non-blocking; `FdSerializer::writeAll` treated `EAGAIN` as fatal, so any frame
-  larger than the socket send buffer (~200KB, i.e. windows bigger than ~192x192
-  in BGRA) was dropped/truncated. The peer then deserialized garbage (a corrupt
-  `dataLayout.offset` reaching `WriteTexture` validation) -> upload failed ->
-  black. Now `writeAll` polls `POLLOUT` and retries on EAGAIN/EINTR. This was a
-  latent bug independent of multi-surface; large shm uploads now work.
-- The interop dmabuf test quad (a server-allocated dmabuf texture the core used
-  to render green into and hold open) has been **removed** from the compositor;
-  it was spike scaffolding superseded by real client-buffer compositing. The
-  dmabuf import primitive itself stays proven (see "dmabuf interop path") and is
-  still exercised GPU-side, but the core no longer reserves/injects a dmabuf
-  texture or holds a perpetual `SharedTextureMemory` access bracket in steady
-  state.
-- Swapchain present mode is **Mailbox** (non-blocking acquire), chosen from the
-  surface's advertised modes. FIFO blocked `Surface::GetCurrentTexture` on the
-  GPU process's single command thread whenever the host compositor wasn't
-  consuming frames (e.g. an unviewed nested window), which stalled all other
-  wire work behind it (including buffer-map). Mailbox avoids that.
-- Still absent: per-surface transforms/opacity/rotation/scale, fractional scale,
-  multi-output, damage, real WM/layout policy (placement is a cascade stub),
-  resize handling. Output logical size == host window size (scale 1); `wl_output`
-  is otherwise FABRICATED and there is no resize handling — see "Protocol gaps &
-  skeletons (READ FIRST)" at the top. Pointer + keyboard routing to clients IS
-  done (see "Input routing to clients").
+## Client buffers
 
-### Client shm buffers end-to-end (upload → composite → present, pixel-verified)
-NOTE: the IMPLEMENTATION below (`commitSurfaceShm`, native `WriteTexture`) was
-replaced by the JS compositor — shm upload now goes JS-side via `addon.shmView`
-(zero-copy `ArrayBuffer`) + `queue.writeTexture` (see "Compositing pass runs in
-JS over the Dawn wire"). The capability (real shm client composites, pixel-
-verified) still holds; the mechanism described here is historical.
+### shm (`wl_shm`/`wl_shm_pool`/`wl_buffer`, pixel-verified)
 
-A real Wayland client can map a window with content and have its pixels reach
-the screen, verified by GPU readback:
+`wl_shm` advertises ARGB8888/XRGB8888 on bind; `create_pool` hands the fd to native
+`ShmRegistry` (`native/core/shm.cpp`) which `mmap`s it; `create_buffer` records an
+(offset,w,h,stride,format) view. On commit the JS compositor takes a zero-copy
+external `ArrayBuffer` (`addon.shmView`) and uploads via `queue.writeTexture`.
+ARGB8888/XRGB8888 maps to BGRA8Unorm byte-for-byte on little-endian. `wl_buffer.
+release` is sent after upload (bytes are copied). A pool-refcount fix supports
+clients (e.g. kitty) that destroy the pool before rendering.
 
-- JS handlers `src/protocols/wl_shm.js`, `wl_shm_pool.js`, `wl_buffer.js`:
-  `wl_shm` advertises ARGB8888/XRGB8888 on bind (via a new trampoline on-bind
-  hook) and creates pools; `create_pool` hands the fd (opaque handle) to native,
-  which `mmap`s it (`native/core/shm.cpp` `ShmRegistry`); `create_buffer` records
-  an (offset,w,h,stride,format) view; `wl_surface.commit` resolves the committed
-  buffer and uploads it.
-- Native bridge (`addon.cpp` + `core/compositor.cpp`): `commitSurfaceBuffer`
-  resolves the pool region and calls `Compositor::commitSurfaceShm`, which
-  creates/recreates a `BGRA8Unorm` wgpu texture over the wire
-  (`Device::CreateTexture`) and uploads CPU pixels via `Queue::WriteTexture`,
-  then builds a per-surface bind group. ARGB8888/XRGB8888 shm memory maps to
-  BGRA8Unorm byte-for-byte (no swizzle) on little-endian. After upload the
-  compositor sends `wl_buffer.release` (shm bytes are copied at upload time).
-- Verified end-to-end (`test/shm-test-client.c` + `test/shm-upload-smoke.mjs`,
-  needs GPU + host Wayland): a client binds `wl_shm`+`wl_compositor`+
-  `xdg_wm_base`, fills a 64×64 buffer with solid blue, maps an `xdg_toplevel`,
-  attaches+commits; the server uploads, composites, and presents. A GPU readback
-  (`CopyTextureToBuffer`+`MapAsync`) confirms the uploaded texture is pixel-exact
-  (BGRA `[255,0,0,255]` at sampled points). **PASS.**
-- This also established that device/queue async over the wire (`MapAsync`,
-  `OnSubmittedWorkDone`) needs the GPU process to call
-  `dawn::native::DeviceTick(device)` in its pump loop (instance-level
-  `InstanceProcessEvents` alone is insufficient); added to `gpu-process/main.cpp`.
-- `WriteTexture` over the wire serializes pixels through the socket (no
-  `MemoryTransferService` configured) — functional, per-upload copy cost
-  unmeasured. Throughput is not yet a concern at this stage.
-- Still absent: multi-surface placement, damage-driven partial upload, format
-  conversion beyond ARGB/XRGB8888.
+### dmabuf (`zwp_linux_dmabuf_v1` / `..._buffer_params_v1`, pixel-verified)
 
-### Client dmabuf buffers end-to-end (`linux-dmabuf-v1`, pixel-verified)
-NOTE: the IMPLEMENTATION below (native `commitSurfaceDmabuf` building the C++
-compositing state) was replaced by the JS compositor — dmabuf import is now
-`addon.createTextureFromDmabuf` (async, returns the wire handle) + dawn.node
-`wrapTexture`, with JS owning the buffer-release lifecycle (see "Compositing pass
-runs in JS over the Dawn wire"). The GPU-process import primitive (reserve →
-`ImportClientTex`/inject → `ReleaseClientTex`) is unchanged. The capability still
-holds; the core-side mechanism described here is historical.
+Advertises ARGB8888/XRGB8888 with LINEAR+INVALID modifiers; `add` records the plane
+(fd + offset/stride/modifier); `create_immed` builds a dmabuf-tagged buffer. On
+commit: `createTextureFromDmabuf` (async, returns a Promise of the wire handle) →
+`wrapTexture` → sample. The fd travels over the side channel via SCM_RIGHTS
+(`ImportClientTex`); the GPU process imports it as `SharedTextureMemory` (reusing
+`Allocator::importTexture`), does an initialized `BeginAccess`, and `InjectTexture`s
+at the core's reserved handle. The commit is non-blocking (reserve → send →
+`PendingImport`, return; the `ClientTexImported` reply is dispatched on the Node
+thread).
 
-A real client can now pass its **own** dmabuf (zero-copy GPU buffer) and have it
-imported + composited — the two items previously flagged unverified (SCM_RIGHTS
-fd passing; importing a client-chosen modifier we did not allocate) are now
-proven on the RTX 5060:
+**Buffer-release lifecycle (zero-copy).** A buffer is released only once the
+compositor frame that sampled it completes on the GPU: the submit is tagged with a
+serial + `onSubmittedWorkDone`; a buffer superseded by a newer commit is freed when
+its retire-serial completes; freed ids drive `wl_buffer.release` + explicit
+`ReleaseClientTex` of the server STM/fd. Verified by a buffer-cycling leak test
+(GPU-process fd count bounded over 40 cycled buffers).
 
-- **SCM_RIGHTS fd passing** over the side channel: new `sendMessageFds`/
-  `recvMessageNBFds` in `native/ipc/transport.h` attach/parse fds via `cmsg`/
-  `SCM_RIGHTS`. Unit-verified standalone (`test/scm-rights-test.cpp`: an fd sent
-  over a SEQPACKET pair arrives as a distinct dup'd fd reading the same file).
-- JS handlers `src/protocols/zwp_linux_dmabuf_v1.js` + `zwp_linux_buffer_params_v1.js`:
-  advertise ARGB8888/XRGB8888 with LINEAR+INVALID modifiers on bind; `add`
-  records the plane (fd handle + offset/stride/modifier); `create_immed` builds a
-  dmabuf-tagged buffer descriptor. `wl_surface.commit` branches dmabuf vs shm and
-  does NOT release the dmabuf buffer (zero-copy; sampled directly).
-- New side-channel `ImportClientTex` (core→gpu) carries the client dmabuf params
-  + the fd via SCM_RIGHTS. The GPU process builds a `DmabufBuffer` (no GBM bo),
-  reuses `Allocator::importTexture` (it never assumed GBM origin) to import the
-  client fd as `SharedTextureMemory`, does a `BeginAccess` (initialized) so it is
-  sampleable, and `InjectTexture`s at the core's reserved handle. Per-surface STM
-  + texture + fd kept in a keyed map for lifetime.
-- Core `Compositor::commitSurfaceDmabuf`: `ReserveTexture`, send `ImportClientTex`
-  with the fd, then return (NON-BLOCKING — see "Async dmabuf commit" above). The
-  `ClientTexImported` reply is later dispatched by `drainCtrl()` on the Node
-  thread, which wraps the injected handle as a `wgpu::Texture` and builds the
-  per-surface bind group — plugging into the same `clientSurfaces_` compositing/
-  readback path as shm.
-- Verified end-to-end (`test/dmabuf-test-client.c` + `test/dmabuf-upload-smoke.mjs`,
-  needs GPU + host Wayland): client GBM-allocates a LINEAR ARGB8888 buffer filled
-  solid red, sends it via `create_immed`, maps an `xdg_toplevel`, commits; the
-  compositor imports the client dmabuf, composites, presents. GPU readback
-  confirms pixel-exact red (BGRA `[0,0,255,255]`). **PASS.**
-- Limitations: single plane only; `create` (async, server-minted wl_buffer) is
-  NOT wired up here — though the trampoline CAN now mint a server-side new_id for
-  an event (added for clipboard `data_offer`; see "Clipboard"), so this is now a
-  matter of wiring the dmabuf `create` path, not a missing primitive. Today only
-  `create_immed` (client supplies the buffer id) is used; no per-frame
-  re-import optimization / fence-synced release; the held BeginAccess is never
-  ended until teardown (fine single-device, revisit for multi-device); no
-  modifier *negotiation* beyond advertising a static set (import may reject an
-  unadvertised client modifier, surfacing as a failed commit).
+Limitations: single plane only; `create` (async server-minted `wl_buffer`) not
+wired (the trampoline can now mint server-side new_ids, so this is wiring, not a
+missing primitive); no per-frame re-import optimization; the import `BeginAccess`
+is never ended until teardown (fine single-device); no modifier negotiation beyond
+a static advertised set (an unadvertised client modifier surfaces as a failed
+commit).
 
-### dmabuf interop path (single device, validated end-to-end)
-The plugin/surface buffer path from the design is proven as real, non-spike code
-on the verification hardware (single device — producer and consumer are the same
-core device):
+## Real clients run end-to-end
 
-- GBM allocator + DRM modifier probe in the GPU process: `GetFormatCapabilities`
-  chained with `DawnDrmFormatCapabilities` on a native adapter, intersected with
-  `gbm_bo_create_with_modifiers`. On NVIDIA: 7 Dawn-importable BGRA8 modifiers,
-  6 also GBM-allocatable (single-plane only for now). `native/.../allocator`.
-- Import the dmabuf as `SharedTextureMemory` on the wire-resolved device and
-  create a `wgpu::Texture` (usage incl. RenderAttachment + TextureBinding).
-- `ReserveTexture` (client) / `InjectTexture` (server) over the wire: a client
-  texture handle resolves to the server-allocated dmabuf texture.
-- `BeginAccess`/`EndAccess` with mandatory Vulkan image-layout state; EndAccess
-  produces a `SharedFenceSyncFD` (fenceCount=1). The client renders into the
-  dmabuf (write bracket), then samples it for compositing (read bracket). NOTE:
-  the core no longer drives this in steady state — the perpetual read bracket
-  and the dmabuf test quad were removed from the compositor (see "Compositing").
-  The GPU-side allocate/import/inject + access-bracket code remains and is the
-  primitive a future `linux-dmabuf-v1` handler reuses; it is just not exercised
-  by the current present loop.
-- **Two-device cross-device sharing + cross-device fence wait: NOW VERIFIED**
-  (was "assumed to work, unverified"). See "Cross-device dmabuf+fence verified
-  (C-M1)" below. Still not done: multi-plane / YUV import; SCM_RIGHTS fence
-  passing *cross-process* (the verification is in-process, two devices in the GPU
-  process — the cross-PROCESS plumbing is C-M2).
+- **`foot`** (1.25.0, shm) connects, renders, and is interactive: prompt renders,
+  keyboard routes, colors match a real compositor.
+- **`kitty`** (hardware EGL) renders, focuses on map, types.
+- **Vulkan-WSI clients** (a client presenting via a Vulkan/WebGPU swapchain on its
+  `wl_surface`) run interactively. Verified with a Dawn/Vulkan WSI terminal: it
+  configures its swapchain, renders, updates live, and sustains continuous output.
+  This required: real dmabuf default-feedback (format_table + main_device +
+  tranche, built from Dawn `GetFormatCapabilities` + `DawnDrmFormatCapabilities`);
+  advertising both the alpha and opaque DRM fourcc per format (e.g. ARGB8888 +
+  XRGB8888); `wl_seat`/`wl_pointer`/`wl_keyboard` event version gating to the
+  resource's bound version; and the dmabuf buffer-release lifecycle above. The
+  implicit-sync acquire (export the client dmabuf's read fence via
+  `DMA_BUF_IOCTL_EXPORT_SYNC_FILE`, import as a Dawn `SharedFence`, wait in
+  `BeginAccess`) is implemented.
 
-### Cross-device dmabuf + fence verified (C-M1, the plugin producer/consumer primitive)
-The one composition the plugin-surface design rested on as "assumed, unverified"
-is now proven on the verification hardware (RTX 5060 / driver 595.71.05): two
-independent `wgpu::Device`s sharing ONE GBM dmabuf, with a producer→consumer
-handoff gated by a cross-device sync-fd fence.
+**Color:** the GPU process picks the first non-sRGB advertised swapchain format and
+the shader passes client bytes (already sRGB) through. Correct for opaque content;
+alpha blending currently happens in sRGB space (wrong for translucency — linear
+compositing is future work).
 
-- `overdraw-gpu-process --selftest-xdev` (`gpu-process/src/main.cpp`
-  `selftestXDev()`): self-contained — NO wire, NO core, NO Worker. Each device is
-  requested from its OWN adapter (a `wgpu::Adapter` mints one device; the plugin
-  topology gives each device its own adapter anyway). Both devices require
-  `SharedTextureMemoryDmaBuf` + `SharedFenceSyncFD`.
-- Flow: one GBM dmabuf imported as `SharedTextureMemory` into BOTH devices
-  (`Allocator::importTexture` is device-agnostic; STM props print twice,
-  `usage=0x17`). Producer device A: `BeginAccess` (undefined→general) → render-
-  pass CLEAR to a known color → submit → `EndAccess` → export a
-  `SharedFenceSyncFD` (fenceCount=1), dup'd. Consumer device B: `BeginAccess`
-  WAITING that fence (imported via `ImportSharedFence`, general→general,
-  initialized) → `textureLoad`-sample the dmabuf into an offscreen RGBA8 target →
-  `CopyTextureToBuffer` → `EndAccess` → map + readback. Asserts the read-back
-  pixels equal the producer's color (±3/channel).
-- **Verified**: `got RGBA(51,102,204,255) expected (51,102,204,255)` →
-  `XDEV: PASS`. The fence wait in B's `BeginAccess` is the ordering proven
-  (producer-done-before-consumer-read on the GPU timeline, no CPU handshake).
-- Reuses the proven primitives: per-device STM import, the EndAccess sync-fd
-  export (single-device path), and the SharedFence import + wait-in-BeginAccess
-  (the verified WSI implicit-sync acquire). The bind group uses `textureLoad`
-  (no sampler) to sidestep filterable-vs-unfilterable float sampling on the
-  imported format.
-- Test: `test/xdev-fence.gpu.mjs` spawns the selftest and asserts `XDEV: PASS`
-  (GPU-gated; `npm run test:gpu`).
-- **Scope of the claim:** in-process two-device on this driver. It does NOT yet
-  prove the cross-PROCESS plugin path (second wire client + side-channel surface
-  allocation + SCM_RIGHTS fence passing) — that is C-M2, built on this result.
+**dmabuf feedback** is real for WSI format selection but the format_table is the
+full probed set, not a curated tranche; cosmetically kitty logs a fallback warning
+on this single-GPU setup before working.
 
-### Plugin GPU connection plumbing (C-M2) — BUILT, NOT RUNTIME-TESTED YET
-The cross-process scaffolding for each plugin getting its OWN wire connection +
-device (architecture.md "IPC": one `dawn::wire::Server` per connected client).
-Compiles; its runtime proof is folded into C-M4 (where the plugin's Worker brings
-up a device over the connection and renders — that is the decisive end-to-end
-test, so a standalone C-M2 device-ready test would need throwaway scaffolding).
+## Input
 
-- **No listening socket (auth by construction).** A new connection can ONLY be
-  introduced by the trusted core over the inherited side channel, so there is
-  nothing for a stranger to `connect()` to. New side-channel messages
-  (`side_channel.h`): `AddWireConn` (core->gpu, plugin wire socket GPU-end rides
-  as SCM_RIGHTS) / `WireConnAdded`; `InjectPluginInstance` (core->gpu, the handle
-  the plugin's wire client reserved) / `PluginInstanceInjected`.
-- **GPU process** (`gpu-process/src/main.cpp`): a `PluginConn` holds a per-
-  connection `FdSerializer`/`FrameReader`/native `Instance`/`WireServer`
-  (`useSpontaneousCallbacks=true`); registered in the epoll loop and pumped each
-  iteration. `AddWireConn` creates it from the received fd; `InjectPluginInstance`
-  injects the native instance at the plugin-reserved handle. Native device
-  resolved lazily (`server.GetDevice`) when the plugin first needs server-side
-  work (C-M4).
-- **Core** (`native/core/compositor.{h,cpp}`): `addWireConnection()` makes a
-  socketpair, sends the GPU-end via the side channel, returns the CLIENT-end fd
-  (-> handed to the plugin Worker; same process, so it's just an integer, no
-  SCM_RIGHTS core<->Worker). `injectPluginInstance()` relays the reserved handle.
-  `drainCtrl()` records async completion; `wireConnAdded()`/
-  `pluginInstanceInjected()` poll (0=pending/1=ok/2=failed).
-- **ABI note (bit me once):** `ipc::Message` grew fields, so the addon AND the
-  GPU process must rebuild together — a stale addon vs. new gpu process disagree
-  on message size and the handshake hangs. `cmake --build build` (all targets).
-- **NOT yet:** the Worker-side wire client + dawn.node device bring-up over the
-  connection; cross-process surface allocation (`AllocateSurfaceBuffer` etc.);
-  SCM_RIGHTS fence passing cross-process. All C-M4.
+### Host input forwarding (host seat → GPU process → core → JS)
 
-### First plugin milestone COMPLETE: an animated-overlay plugin composites on top (C-M4) — VERIFIED
-A real plugin, in its OWN Worker isolate with its OWN GPU device, creates an
-overlay, renders into it, and the core composites it on top of the scene at the
-core-decided rect — pixel-verified end to end (`test/plugin-overlay.gpu.mjs`).
-This closes architecture.md's "First plugin milestone" (one plugin produces one
-surface the core composites on top at a core-decided rect).
+The GPU process binds the host `wl_seat` (`host_window.cpp`, pointer + keyboard, up
+to v5) and forwards each event as a fixed-size `ipc::InputMessage` over the input
+socket (non-blocking `MSG_DONTWAIT`; input is lossy by design). The core abstracts
+this behind a backend seam (`native/core/input.h`: `InputEvent` in OUTPUT-space
+doubles + raw evdev keycodes + ms timestamps, `InputSink`, `InputBackend`).
+`WaylandInputBackend` (`input_wayland.cpp`) reads the socket, converts
+`wl_fixed_t`, and emits `InputEvent`s; a future `LibinputBackend` implements the
+same interface. The addon drains the backend on the Node thread (`uv_poll_t`) and
+delivers to an optional `onInput` JS callback.
 
-- **Worker owns its wire client + device + rendering** (`overdraw_plugin_native.node`,
-  context-aware; `native/plugin-napi/`). The Worker loads it + dawn.node, opens a
-  wire client on a core-brokered fd, brings up its device, and renders. The CORE
-  owns the side channel and brokers everything: connection (`AddWireConn`),
-  instance injection, `SetPluginTickDevice`, surface allocation
-  (`AllocSurfaceBuf`), and the per-frame fence brackets. Reached from the Worker
-  via the runtime's `onRequest` hook (`src/plugins/gpu-broker.ts`).
-- **SDK** (`src/plugins/gpu.ts`, on the scope-B runtime): `sdk.gpu.device` (a
-  dawn.node GPUDevice over the Worker's wire) + `sdk.gpu.createOverlay({layer,
-  anchor,size})` -> a `Surface` with `getCurrentTexture()` + `present()`. The
-  bootstrap brings up the GPU before `init` so `sdk.gpu` is ready. `createOverlay`
-  -> core overlay broker decides rect + layer (C-M3) + allocates the shared buffer;
-  the plugin renders; `present()` drives ProducerEnd -> ConsumerBegin (waits the
-  producer fence) -> the JS compositor samples the consumer texture
-  (`setSurfaceTexture`) at the overlay rect+layer.
-- **Double-buffered ring (animation works)**: a surface is a ring of 2 slots
-  (each a shared dmabuf with its own surfaceBufId, reusing the proven single-buffer
-  primitive). The plugin renders into one slot while the consumer holds a read
-  bracket on the latest-presented slot; on `present` the broker switches the
-  consumer bracket to the just-presented slot and frees the other for the producer
-  (re-opening its producer bracket). The plugin is OBLIVIOUS — it only calls
-  `getCurrentTexture()` + `submit` + `present()` (swapchain-shaped); slots, fences,
-  and brackets live entirely in the SDK + broker + GPU process. The consumer's
-  read of a slot is gated by that slot's producer fence (ConsumerBegin waits it),
-  so the consumer never reads a buffer the producer hasn't finished.
-- **Verified**: `test/plugin-overlay.gpu.mjs` (static: green overlay composites at
-  its rect, black elsewhere — **PASS**) and `test/plugin-overlay-animated.gpu.mjs`
-  (a plugin animates green→red→blue on its own clock; the test observes the
-  composited output and confirms it shows MULTIPLE distinct colors over time, i.e.
-  the buffer genuinely updates frame-to-frame — **PASS**).
-- **Bugs found while building the ring (instrumentation/reasoning, not guessing):**
-  (1) the consumer read bracket must stay OPEN while the compositor samples
-  (ConsumerEnd releases dmabuf access -> black); the broker keeps it open and
-  switches it on present. (2) The SDK keyed both ring slots' producer
-  reservations under the same id (collision) -> fixed with a worker-local unique
-  reservation key per slot, decoupled from the core's surfaceBufId.
-- **HISTORICAL NOTE (accuracy):** rev 26 of this file + commit 676358d called this
-  milestone "animated" / "complete" when only the SINGLE-BUFFER STATIC overlay was
-  built. That was inaccurate — the milestone's criterion (an animated overlay) was
-  not met until the double-buffered ring (this rev). Corrected.
-- **Flagged / not done**: `createOverlay` is the only SDK GPU entry (no window/
-  output/capture, no decorations/insets/interactive-regions — the next steps in
-  architecture.md's build order); no `sdk.onFrame` yet (the animated fixture
-  drives its own loop; the proper core-frame-tick driver is a flagged follow-up);
-  no capability gate on `gpu` (every plugin gets the GPU paths); plugin teardown
-  does not release the surface ring / connection (leak on exit — must fix before
-  multi-plugin churn); only 2 slots (fine; 3 would fully decouple the clocks).
-  Also: `src/plugins/gpu-broker.ts` + `gpu.ts` are LOOSELY TYPED (the Worker↔core
-  request params are an `unknown` bag cast field-by-field with `as`); the
-  strict-typing rule wants a typed request map. Flagged; not yet fixed. (The
-  eslint config bans `as any`/`as unknown` but not `x as ConcreteType` from
-  `unknown`, so this passes lint — a known loophole.)
+Limitations: coordinate mapping is identity (output size == host window size, scale
+1); touch not forwarded; no keymap translation at this layer (raw evdev codes).
 
-### Core event bus + window-state stream (core->plugin events) — BUILT, tested
-The first general core->plugin event push, plus a small typed in-core event bus
-that folds in the pre-existing ad-hoc listener patterns. This is the prerequisite
-for the decoration milestone (architecture.md "First decoration milestone":
-onMap/onUnmap + title/app_id-changed window-state events).
+### Routing to clients (`wl_seat`/`wl_pointer`/`wl_keyboard`)
 
-- **Typed bus** (`src/events/bus.ts`, `TypedBus<M>`): `on(name, cb) -> unsubscribe`,
-  `emit(name, ev)` (synchronous fan-out in registration order), `clear()`.
-  Generic over an event map ({name: payload}) so on/emit are fully type-checked
-  (no `any`, no string-keyed casts). A throwing listener is caught + logged so one
-  bad subscriber cannot break the per-frame sweep or other listeners (node's
-  EventEmitter does neither -- untyped + 'error'-throw is process-fatal -- hence
-  not used). The concrete instance + event map is `src/events/window-bus.ts`
-  (`CompositorEventMap`: window.map/unmap/change + keyboard.focus).
-- **Window-state payloads** (`src/events/types.ts`): `WindowMapEvent`,
-  `WindowUnmapEvent`, `WindowChangeEvent` ({surfaceId, changed: field[], appId,
-  title, activated}). Shared by the in-core bus AND the core->plugin wire; build-
-  time guards keep them structured-clone-safe (forwardable over postMessage).
-- **Producers** (core, `src/protocols/`): the map sweep emits `window.map`;
-  wl_surface.destroy emits `window.unmap`; set_title/set_app_id + keyboard-focus
-  changes call `markWindowChanged` (per-frame dirty set), drained by
-  `flushWindowChanges` in `dispatchFrameCallbacks` into one coalesced
-  `window.change` per surface (consistent snapshot, not intermediate values).
-  This closes the app_id-timing hole: a late `set_app_id` (after map) now produces
-  a window.change carrying the new value.
-- **Folded in:** the old `seat.onKbFocusChange` direct hook is replaced by the bus
-  `keyboard.focus` event (the clipboard layer subscribes); the C-M-era
-  windowObserver map/unmap hook is now a bus producer. No remaining ad-hoc
-  window/focus listener patterns.
-- **Plugin side**: `sdk.window` gains `onMap`/`onUnmap`/`onChange`
-  (`src/plugins/window-observer.ts`); the Worker dispatches inbound window.* events
-  to them, VALIDATING each payload (drops malformed input, filters unknown change
-  fields) rather than casting at the trust boundary. main.ts subscribes to the bus
-  and forwards window.* to the plugin runtime (`PluginRuntime.broadcast`/`emit`).
-- **Verified**: `test/window-events.test.js` (bus unit incl. unsubscribe + throw-
-  isolation; observer dispatch incl. malformed/unknown-field drops; map/change/
-  unmap e2e through a REAL Worker), `test/window-changes.test.js` (core coalescing:
-  dedup, clear-after-flush, activated-from-focus, skip-unmapped, no-bus no-op), and
-  `test/window-change-e2e.gpu.mjs` (a REAL client set_app_id AFTER map -> plugin's
-  sdk.window.onChange receives the new app_id; full wire-through). Clipboard GPU
-  tests still PASS through the new bus keyboard.focus path. **PASS.**
-- **FLAGGED / not done:**
-  - **window.change covers only title/appId/activated.** maximized/fullscreen/
-    minimized/resized/parent are NOT emitted -- those `xdg_toplevel` requests are
-    still silent no-ops with no backing state (see "Protocol gaps"). The bus is
-    ready for them; the producers land with the WM/layout milestone. So this is NOT
-    a complete window-state stream yet.
-  - **No capability gate on `sdk.window`.** Every plugin gets the observer (sees
-    every window's app_id/title/focus). The decoration-provider tier
-    (architecture.md) is meant to gate this like tier 3; unbuilt.
-  - **Pre-map redundancy (minor):** a `set_app_id`/`set_title` before first content
-    is flushed at the map frame, so a window.change (title,appId,activated) fires
-    alongside window.map re-affirming the same state. Harmless; not suppressed.
+A real client receives mouse and keyboard on its surface. `wl_seat` advertises
+pointer + keyboard; `handleInput` hit-tests the WM window stack (`wm.windowAt`),
+tracks focus, and emits enter/leave/motion/button/axis/frame +
+key/modifiers to the focused client's resources with surface-local coordinates.
 
-### Plugin surface ring: SharedArrayBuffer slot-state (fixes animated-surface corruption) — BUILT, tested
-The producer/consumer ring's slot ownership is now a lock-free state machine shared
-between the plugin Worker (producer) and the core (consumer) via a SharedArrayBuffer
-+ Atomics (`src/plugins/surface-slots.ts`). This replaced a blind round-robin `write`
-pointer that handed `getCurrentTexture()` a slot regardless of whether the consumer/
-GPU was still using it -- which corrupted CONTINUOUSLY-ANIMATED surfaces (a plugin
-presenting every frame) with "used in a submit without current access to
-SharedTextureMemory" and black frames. Static / slowly-paced surfaces (present once,
-or with a sleep between presents) masked it; a 60fps animated decoration exposed it.
+- **Focus policy** is configurable (`FocusOptions`): pointer always follows the
+  pointer; keyboard focus is `follow-pointer` (default) or `click-to-focus`.
+  `focusOnMap` (default true) gives a freshly-mapped window keyboard focus so a
+  launched app is typeable immediately.
+- **Keymap + modifiers** (`native/wayland/keymap.{h,cpp}`, xkbcommon): a default
+  keymap is compiled to a sealed memfd, sent via `wl_keyboard.keymap` (XKB_V1, fd
+  delivered through the trampoline fd-encode path); each host key feeds xkb state
+  and serialized modifier masks are emitted via `wl_keyboard.modifiers`.
+- A stable per-client id (`Trampoline::clientIdOf` / addon `clientId`) associates
+  the focused surface with the right client's input resources without exposing
+  `wl_client` to JS.
 
-- **Slot states** (one Int32 per ring slot, atomic CAS transitions): `FREE` ->
-  `ACQUIRED` (producer claims via getCurrentTexture; CAS makes this safe against
-  multiple producer threads sharing a surface) -> `PRESENTED` (handed to the
-  consumer; the latest, re-sampled every frame) -> `DRAINING` (superseded by a newer
-  present) -> `FREE`. Single-writer-per-edge except the FREE->ACQUIRED CAS race.
-- **getCurrentTexture is now async**: it CAS-claims a FREE slot, or `Atomics.waitAsync`
-  (NOT wait -- the Worker event loop must keep turning for watchdog pongs) until one
-  frees, then retries. It NEVER returns a slot in use; present() throws on a non-
-  ACQUIRED slot (invariant guard). The SAB rides the surface.alloc response (shared
-  by reference; validated at the worker boundary, it is not Json).
-- **The DRAINING->FREE flip is gated on the consumer's GPU completion**
-  (`onSubmittedWorkDone` via the compositor's new `afterCurrentFrame(cb)`), NOT done
-  eagerly -- the atomic mirrors the fence; the GPU read-before-write ordering is still
-  the GPU process's SharedFence brackets. The core demotes the prior PRESENTED ->
-  DRAINING on each new present and frees it after the frame that last sampled it
-  completes (then ends its consumer bracket + reopens its producer bracket).
-- **3 slots**: at full pipelining up to one ACQUIRED + one PRESENTED + one DRAINING
-  are busy, so a 3rd keeps a FREE one usually available; getCurrentTexture awaits
-  (correct backpressure) only when the producer outruns the consumer+GPU.
-- **Also fixed (pre-existing, found while debugging)**: a wire-fd-poll vs ctrl-fd-poll
-  reply-dispatch race in `native/napi/addon.cpp` (the wire poll drained ctrl replies
-  but only advanced dmabuf-import callbacks, stranding plugin-broker
-  alloc/begin/conn/inject replies -> post-init surface creation hung intermittently).
-  Fixed by `advanceAllPending()` after drainCtrl in both polls.
-- **Verified**: `test/example-decoration.gpu.mjs` (the shipped example animates a
-  shader gradient titlebar -- continuous presents, pixel changes across frames, no
-  access errors), and all overlay/decoration GPU tests still pass. GPU 35/35,
-  GPU-free 115/115. The corruption that motivated this is gone (10/10 + 6/6 stress).
+Verified with `foot` and `kitty` (focus on map, type without a click). Not built:
+client cursor surfaces (`set_cursor` is a no-op; no software cursor), touch,
+multi-seat, key-repeat generation (repeat_info sent; client repeats), axis
+source/discrete refinement. kbFocus is not auto-moved when the focused window
+closes (re-resolves on next pointer event; guarded against destroyed surfaces).
 
-### Decoration provider: registration + insets + drawing + atomic gating (decoration milestone, pieces 1+2+3) — BUILT, tested
-Server-side decorations, end to end: a plugin registers an app_id pattern, is told
-which mapped windows it owns, and draws a decoration surface the core composites at
-the window's inset rect. The window's CONTENT is held (gated) until the decoration's
-first frame, so content + decoration appear TOGETHER (atomic, like a real WM showing
-a fully-decorated window on first appearance). A provider that never draws is
-deregistered on a timeout and the window is shown undecorated -- a broken provider
-can never make a window permanently invisible. Pixel-verified + safety-path verified.
+## Protocols
 
-- **Registration + assignment (piece 1):** `sdk.decorations.register(pattern,
-  flags?)` (RegExp source; rejects an invalid pattern) + `onAssigned(cb)`. The
-  registry (`src/decorations.ts`, GPU-free) subscribes to the bus `window.map` +
-  `window.change`, assigns the FIRST-registered matching provider (match-once), and
-  (via the broker) emits `decoration.assigned` {surfaceId, appId, title, rect}.
-  Matches at map AND on window.change (late set_app_id reuses the map-time rect).
-- **createDecoration (pieces 2+3):** `sdk.decorations.createDecoration(windowId,
-  {insets, layer?})` -- ONE call: the core reserves ADDITIVE insets (WM `setInsets`:
-  outer rect = content grown by insets; content + client unchanged, never told),
-  returns the outer rect, and the worker allocates a producer/consumer ring there
-  (the same ring `createOverlay` uses, via `overlays.createAt` + a `rect` branch in
-  the gpu-broker's `surface.alloc`), tagging the alloc with `decorates: windowId` so
-  the core links the decoration surface to the window. AUTHORIZED: only the plugin a
-  window is assigned to may decorate it. (Replaced the piece-2 split `requestInsets`
-  + `sdk.gpu.createSurfaceAt`; `createSurfaceAt` is removed -- no public explicit-rect
-  surface API until a concrete use case defines its args.)
-- **Content gating (piece 3):** on assignment the broker GATES the window's content
-  (the WM `setContentGated` holds it out of the draw stack -- `pushStack` +
-  `computeBaseStack` skip gated windows) and arms a first-frame timeout (configurable,
-  default 500ms). When the decoration surface receives its FIRST present (the
-  gpu-broker fires a generic `onSurfacePresented` hook the decoration broker filters
-  via the D<->W link), the gate releases -> content + decoration composite together.
-  The broker stays surface-agnostic; the core decoration layer owns D<->W + release.
-- **Timeout / deregister (piece 3 safety):** if the first decoration frame does not
-  arrive within the deadline, the broker `console.error`s, PERMANENTLY deregisters the
-  provider (no further assignments unless it re-registers), sends it
-  `decoration.deregistered {reason, windowId}`, and releases the gate (window shown
-  UNDECORATED). unmap before the first frame releases the gate without deregistering.
-- **Verified**: `test/decorations.test.js` (registry + broker: match/first-wins/
-  match-once/late-app_id/unregister/invalid-regex/flags; createDecoration auth;
-  GATING: assign-gates, first-present-releases, non-decoration-present-no-op, TIMEOUT
-  deregisters+releases+notifies, unmap-before-draw releases without deregister),
-  `test/wm.test.js` (additive insets + gating filter), `test/decoration-surface.gpu.mjs`
-  (REAL client + provider: assigned -> createDecoration -> draw -> present ->
-  decoration composites blue in the inset band, content red below, gate released;
-  pixel-verified), `test/decoration-timeout.gpu.mjs` (REAL broken provider that never
-  draws -> timeout -> deregistered + content shown undecorated). GPU-free 115/115;
-  GPU 34/34. **PASS.**
-- **FLAGGED / not done:**
-  - **Reconfigure gating is the resize milestone, not built.** The atomic rule for a
-    RECONFIGURED window (don't composite the new configuration until the decoration
-    re-renders to match, within the same deadline; hold the old consistent state
-    meanwhile) is the INTENDED contract but requires window resize/reconfigure, which
-    does not exist yet (the `xdg_toplevel` resize/maximize requests are still no-ops).
-    The gating mechanism is structured to extend to it. Also requires gating the
-    client's already-committed new-size buffer on the decoration clock -- a real
-    client-commit <-> plugin-clock coupling, designed with the resize milestone.
-  - **No capability gate on `sdk.decorations`** (same as `sdk.gpu`/`sdk.window`).
-  - **Match-once only** (no reassign on later app_id change).
-  - **No plugin-teardown wiring of unregisterPlugin** (broker exposes it; main.ts
-    does not call it on plugin exit yet). A crashed provider's gated windows are
-    released by the unmap path or the timeout, but its registration lingers.
-  - **Additive insets only** (shrink-content form needs client configure, deferred
-    with resize). Border region not hit-tested (interactive regions later).
-  - Per-window z-binding, surface teardown, and the teardown crash/leak fixes are
-    in the next section ("Decoration surface teardown + lifecycle fixes").
+### Wayland server + generic trampoline
 
-### Decoration surface teardown + lifecycle fixes — BUILT, tested
-
-This closes the four open items from the (now-removed) decoration-teardown handoff:
-per-window decoration z-binding, ring teardown on unmap, two teardown-race crashes,
-and the GPU-process sync-fd leak. Committed (`7e39fb6`); the Dawn-side dependency is
-published (see "Verification environment").
-
-- **Per-window decoration z-binding (was BUG 3 — occlusion).** Decorations used to
-  sit on the flat global `below` layer, so `drawOrder()` emitted ALL decorations
-  then ALL content (`decoA, decoB, A, B`): with two cascading windows, the upper
-  window's content drew over the lower window's decoration, and a window's own
-  decoration could be hidden by another window's content even where it shouldn't be.
-  Now each decoration is z-bound to its window: `Window.decorationSurfaceId`
-  (`src/wm/index.ts`), spliced directly BELOW its window's content id in
-  `computeBaseStack` (`src/subsurfaces.ts`) so the unified order is `decoA, A, decoB,
-  B`. Window-bound surfaces use a new `overlays.createWindowBound` (assigns id +
-  layout, NOT placed on any flat layer — the WM stack owns z-order); the gpu-broker
-  routes `surface.alloc` with a `decorates` tag through it; the decoration broker
-  sets/clears the WM binding on alloc/unmap. Output-anchored OVERLAYS still use the
-  flat layers. The WM's `pushStack` now delegates to the full `rebuildStackWithPopups`
-  so decorations + subsurfaces + popups have a single stack owner.
-  Verified: `test/decoration-occlusion.gpu.mjs` — two cascading decorated windows,
-  pixel-verifies the top window's titlebar shows over the lower window's content
-  (the decisive point that was RED/occluded with the flat layer, now BLUE). The test
-  was confirmed to FAIL against the old flat-layer behavior before the fix.
-
-- **Surface teardown on unmap.** `Surface.destroy()` (worker) -> gpu-broker
-  `surface.destroy` (stop compositing immediately via `overlays.destroy`; mark the
-  `OverlaySurface.alive=false`; then, gated on `afterCurrentFrame`, end the held
-  consumer bracket + `pluginReleaseSurfaceBuffer` per slot) -> GPU-process
-  `ReleaseSurfaceBuf` (end open brackets, drop STM/textures/fences, `alloc.release`
-  the dmabuf). The decoration plugin destroys its surface on `sdk.window.onUnmap`.
-
-- **`window.unmap` now fires on client DISCONNECT, not just explicit destroy (was
-  part of BUG 1).** `window.unmap` was emitted ONLY from the explicit
-  `wl_surface.destroy` REQUEST handler. A client that disconnects/crashes without
-  first destroying its wl_surface has the resource torn down by libwayland's destroy
-  *listener*, which only marked the JS wrapper `destroyed` — the protocol `destroy`
-  handler never ran, so no `window.unmap`, so a decoration provider's `onUnmap`
-  never fired and its ring (+ imported fences) leaked. Fix: an idempotent
-  `unmapAndTeardownSurface(state, s)` (`src/protocols/wl_surface.ts`, guarded by
-  `SurfaceRecord.unmapped`) used by BOTH the explicit destroy request AND a new
-  per-frame resource-destroyed sweep in `src/protocols/index.ts` (detects surfaces
-  whose `resource.destroyed` is set but not yet `unmapped`). Idempotent, so an
-  explicit unmap-then-disconnect does NOT double-emit. Proven by per-window
-  map/unmap emission logging: leaked windows had mapped with no matching unmap; with
-  the sweep, 10 map/unmap-by-disconnect cycles hold the GPU sync-fd count flat.
-
-- **Producer-bracket recycle race (crash) FIXED.** The ring's slot recycle published
-  a slot FREE (`slotStates.free`) BEFORE its producer `BeginAccess` bracket was
-  reopened — the freed slot woke the worker, which CAS-acquired it and submitted
-  render commands before the GPU process opened the bracket → `dawn err 2: Texture
-  used in a submit without current access` on the producer device → worker wire fault
-  → crash + restart. Fix (`src/plugins/gpu-broker.ts`): gate `free()` on
-  `pProducerBegin().then(...)` so a slot becomes claimable only once its producer
-  bracket is actually open. Diagnosed by gdb/repro (the dawn error is on the WORKER
-  device), not theory; an aggressive multi-window repro went crash→clean.
-
-- **Teardown FATAL under load FIXED (was BUG 2).** `runtime.stop()` sent `shutdown`
-  then immediately `worker.terminate()`; the plugin's async render loop + the GPU
-  pump kept issuing wire/device work, so terminate killed the thread mid-submit →
-  dawn.node `ThrowAsJavaScriptException` (no JS frame) FATAL, ~1-in-20 back-to-back.
-  Fix: `createPluginGpu` returns `stop()`; the bootstrap's `shutdown` handler calls
-  it BEFORE running onShutdown (stops the pump; `getCurrentTexture()` parks,
-  `present()` no-ops) so the Worker is quiesced before termination. Diagnosed from
-  the captured native+JS stack (the throw is in the plugin Worker's `drawFrame` ->
-  `queue.submit`). Verified: 80/80 back-to-back `example-decoration.gpu.mjs` runs, 0
-  FATAL (was ~1-in-20).
-
-- **GPU-process sync-fd leak FIXED (was BUG 1).** Root cause was in DAWN, found with
-  an LD_PRELOAD `dup`/`close` tracer (reuse-proof, syscall-level — the only thing
-  that cut through fd-number + object-pointer reuse): `SharedFenceBase`'s
-  constructor never called `GetObjectTrackingList()->Track(this)`, unlike every other
-  ApiObject. Untracked → `Untrack()` returns false when the last ref drops →
-  `DestroyImpl()` is skipped → the imported sync-fd (`SharedFenceVk::mHandle`) is
-  never closed. This leaked an `anon_inode:sync_file` fd per imported fence — every
-  frame, unbounded. Fixed in the Dawn fork (published commit `6cfd29c89b`,
-  `v20260531-linux-wayland-wire-alpha2`). The per-window decoration ring leak on top
-  of this was the disconnect-unmap gap above (no teardown → ring + held fences never
-  released). With both fixed, sync-fd count is flat across map/unmap cycles.
-  NOTE on the test: `test/decoration-teardown.gpu.mjs`'s fd assertion now samples
-  `fdBefore`/`fdAfter` at QUIESCENT points (brief no-render settle) — the renderer/
-  driver keep a stable in-flight `sync_file` working set (~8-10 during active
-  animation), so a leak check must compare like-for-like, not a pre-animation count
-  vs a mid-animation count (the old assertion did, and falsely flagged the working
-  set as a leak).
-  Verified: `test/decoration-teardown.gpu.mjs` PASS 3/3 (fd back to quiescent
-  baseline after teardown); full decoration + overlay GPU suite + the existing
-  `js-compositor-dmabuf-leak.gpu.mjs` PASS against the published Dawn build;
-  GPU-free 115/115; no leaked GPU processes.
-
-- **REVERTED (kept out — unverified / not the fix):** earlier attempts to force the
-  imported handles closed at teardown — explicit `texture.destroy()` of the wrapped
-  wire textures (caused intermittent fatal dawn.node throws), a `dawn::native::
-  FlushPendingDeletions` API, and releasing (vs reclaiming) the reserved consumer/
-  producer wire textures to drop the wire-server inject-AddRef — were all reverted.
-  The SharedFence-tracking + disconnect-unmap fixes were sufficient; these were not.
-
-### Plugin GPU reply-dispatch race FIXED (post-init surface ops no longer hang)
-A pre-existing race in the core's plugin-GPU reply dispatch (`native/napi/addon.cpp`):
-the wire-fd poll (`onWireReadable`) calls `drainCtrl()` (to pick up dmabuf-import
-replies) but only advanced the IMPORT callbacks afterward -- NOT the plugin-broker
-pending ops (`SurfaceBufAllocated` / `Producer`/`ConsumerBeginDone` / `WireConnAdded`
-/ `PluginInstanceInjected`). `drainCtrl` only RECORDS replies; a separate
-`advancePending*` invokes the JS callback. So when a plugin reply was consumed by the
-wire poll's `drainCtrl` (because wire activity woke that poll), it was recorded but
-never advanced -- and since the ctrl fd was now empty, `onCtrlReadable` never fired to
-advance it -> the awaiting plugin op hung. Surfaced intermittently (~40-80%) by
-creating a plugin surface POST-init (decoration `onAssigned`); the overlay path
-rarely hit it because init-time concurrent wire traffic kept the ctrl poll firing.
-Fixed by `advanceAllPending()` called after `drainCtrl` in BOTH polls. Pinned by
-logging (core `sendProducerBegin` -> GPU recv+reply -> core `drainCtrl recorded` with
-NO subsequent `advanceBegins`), not speculation. Verified: decoration-surface 10/10,
-full GPU suite 33/33.
-
-### Plugin GPU end-to-end: device + shared surface + per-frame fence (C-M4 steps 1-3) — HISTORICAL (superseded by the Worker path)
-NOTE: steps 1-3 were originally built on the MAIN thread (a core-side
-`core::PluginWireClient` + `addon.pluginConnect`/`pluginAllocSurfaceBuffer`) to
-de-risk the GPU primitives incrementally. That main-thread path + its tests
-(`plugin-connect.gpu.mjs`, `plugin-surface-fence.gpu.mjs`) have been REMOVED, now
-that the Worker-owned path (above: "First plugin milestone COMPLETE") supersedes
-them and is verified end to end. The verified FACTS below still hold (they're the
-same primitives the Worker path uses); only the main-thread driver is gone.
-
-- **Step 1 — plugin device**: a second wire connection brings up its own
-  `wgpu::Device` (ReserveInstance -> InjectPluginInstance -> RequestAdapter/
-  RequestDevice). Two `WireClient`s coexist under the one global wire proc table
-  (objects route per-owning-client — proven). Now driven by the Worker.
-- **Step 2 — shared surface buffer** (`AllocSurfaceBuf`): one GBM dmabuf imported
-  as `SharedTextureMemory` into BOTH the plugin (producer) and core (consumer)
-  devices, a texture injected at each side's reserved handle. Both wrap
-  (dawn.node) + view on their own device.
-- **Step 3 — per-frame fence** (`ProducerBegin/End`, `ConsumerBegin/End`,
-  `test/plugin-surface-fence.gpu.mjs`): producer BeginAccess (UNDEFINED, no fence)
-  -> plugin clears the dmabuf -> EndAccess (exports a `SharedFenceSyncFD`, held) ->
-  consumer BeginAccess WAITS that fence -> core samples -> reads the producer's
-  color back (76,153,229 ≈ 77,153,230). The producer-EndAccess is deferred on a
-  cross-channel wire serial (the render goes over the plugin wire, ProducerEnd
-  over ctrl; same ordering mechanism as `ImportClientTex`). **PASS.**
-- **Bugs found + fixed while building this (all real, all would have blocked it),
-  pinned by instrumentation not guessing:**
-  - The plugin `PluginConn::tickDev` was never set, so the plugin device's queue
-    never advanced and NO async op resolved (map/work-done/popErrorScope all hung).
-    Fixed: `SetPluginTickDevice` relays the plugin device handle so the GPU process
-    `DeviceTick`s it each pump.
-  - `PluginWireClient::pump()` called `pumpOut()` (drain out-queue) instead of
-    `flush()` (frame the WireClient's pending commands into the out-queue). dawn.node
-    only `Flush()`es at its own sync points, so plugin-device commands sat unframed
-    and never reached the GPU process (the decisive symptom: GPU-side frame count
-    stuck at 2). Fixed: `pump()` calls `flush()`.
-  - The per-plugin-wire libuv poll never armed `UV_WRITABLE`, so queued plugin
-    commands never drained. Fixed: `armPluginWire` (mirrors the core `armWirePoll`);
-    plugin wires are also pumped on the frame timer.
-  - **Diagnostic kept:** `OVERDRAW_GPU_LOG=<path>` redirects the GPU process's
-    stdout/stderr to a file (a test harness can't capture the forked child's fds).
-- **Flagged:** the test drives the producer/consumer brackets explicitly from the
-  main thread; the SDK that wraps this for a plugin Worker is step 4 (and forces
-  the Worker-addon decision). ConsumerEnd must follow the sample's completion
-  (EndAccess releases dmabuf access); the SDK must enforce that ordering.
-
-### Plugin overlay compositing substrate (C-M3) — stack layers + createOverlay broker
-The compositor-side, GPU-free half of the first plugin milestone (architecture.md
-"First plugin milestone"): a plugin overlay can be PLACED on a stack layer at a
-core-decided rect. The producer that fills its pixels is C-M4.
-
-- **Stack-layer model** (`src/protocols/ctx.ts` `Layer`/`LAYER_ORDER`,
-  `src/gpu/compositor.ts`): `background < below < content < above < overlay`,
-  composited back-to-front. `content` is the existing flat stack (windows +
-  subsurfaces + popups) — `setStack` and `rebuildStackWithPopups` are UNCHANGED,
-  so the fragile subsurface/popup ordering does not regress (verified: subsurface
-  3/3, popup 2/2, compositing 3/3 still pass). Other layers via the new optional
-  sink method `setLayerSurfaces(layer, ids)`. `renderFrame` draws all layers in
-  order. Verified: `test/overlay-layers.gpu.mjs` (headless pixel) — an `overlay`
-  surface composites over a `content` surface at the same rect; moved to `below`
-  it composites under. **PASS.**
-- **createOverlay broker** (`src/overlay-position.ts` pure geometry +
-  `src/overlay.ts` broker): the plugin declares `{layer, anchor, size, margin}`;
-  the core computes the authoritative output-clamped rect (`placeOverlay`),
-  assigns a surface id (shared `state.serial()` space), places it in the layer
-  (`setLayerSurfaces`), and returns the granted geometry — the plugin never
-  invents geometry. Plus `destroy`/`destroyForPlugin` (plugin termination) and
-  `reflow` (output resize). Verified: `test/overlay.test.js` (8 GPU-free unit
-  tests: anchors, margin, clamping, layer registration/order, destroy, reflow).
-  **PASS.**
-- **Deferred to C-M4 (flagged):** the broker registers geometry only — the
-  surface has NO pixels until C-M4 allocates its dmabuf producer ring (over the
-  C-M2 connection) and the plugin renders into it. createOverlay is not yet wired
-  to an SDK request or to buffer allocation; that is C-M4.
-
-### Protocol generator (XML -> JS/TS)
-- `tools/gen-protocol/` parses Wayland protocol XML (per wayland.dtd) and emits,
-  per interface, a `.js` signature module (request/event tables with opcodes,
-  arg metadata, since-versions; enums; a `makeEvents(post)` event-sender
-  factory) and a `.d.ts` typed contract (branded per-interface resource types,
-  handler interface for requests, event-sender interface, enums; `fixed`->
-  number, `fd`->WaylandFd, object/new_id->branded resource, array->Uint8Array).
-- Output goes to `src/protocols-gen/` (gitignored; reproduced from XML). 31
-  interfaces generate from core wayland + xdg-shell + linux-dmabuf-v1; all
-  `.d.ts` type-check under `tsc --strict`; structural tests (`test/`) assert
-  opcodes/types/enums/since.
-- Limitation: per-arg since-versioning not represented (message-level only).
-
-### Wayland server + generic trampoline (the core is now a Wayland *server*)
-overdraw accepts real Wayland clients and dispatches their protocol to JS, with
-interfaces built at runtime from the generator metadata (no per-protocol C):
+The core accepts real Wayland clients and dispatches their protocol to JS, with
+interfaces built at runtime from generator metadata (no per-protocol C):
 
 - `native/wayland/server.cpp`: `wl_display` + listening socket, integrated into
-  Node's libuv loop (uv_poll on the event-loop fd -> dispatch; uv_prepare ->
-  flush_clients).
+  libuv (uv_poll dispatch; uv_prepare flush_clients).
 - `native/wayland/interface_registry.cpp`: builds `wl_interface`/`wl_message[]`/
-  `types[]` at runtime from the generated signature (libwayland signature
-  strings; two-pass cross-reference resolution).
-- `native/wayland/trampoline.cpp`: a generic dispatcher decodes the
-  `wl_argument` array into a typed tuple and calls the named JS handler method.
-  new_id args create a child resource; object args decode to a cached per-
-  resource JS wrapper. Outgoing events: `postEvent` encodes typed args and calls
-  `wl_resource_post_event_array` (wired to the generated `makeEvents`). Resource
-  destruction invalidates the JS wrapper (`destroyed=true`) and frees the ref.
-  Two registration entry points: `registerInterface(name, handler)` stores a
-  handler without advertising a global (for request-created interfaces like
-  `xdg_surface`/`xdg_toplevel` — child resources from a new_id arg find their
-  handler here); `createGlobal(name, handler)` does the same *and*
-  `wl_global_create`s so clients can bind.
-- Verified end-to-end with a real libwayland client (`test/wl-test-client.c` +
-  `test/trampoline-smoke.mjs`): client binds `wl_compositor` (runtime-registered
-  global), calls `create_surface`; the JS handler fires, creates the
-  `wl_surface`, sends `wl_surface.preferred_buffer_scale(2)` back (client
-  receives it); after the client destroys the surface the wrapper is
-  invalidated. This validates the generator metadata against real wire traffic.
+  `types[]` at runtime from the generated signatures (two-pass cross-reference).
+- `native/wayland/trampoline.cpp`: a generic dispatcher decodes the `wl_argument`
+  array into a typed tuple and calls the named JS handler. new_id args create a
+  child resource; object args decode to a cached per-resource JS wrapper.
+  `postEvent` encodes typed args (incl. server-minted new_ids and fds) and calls
+  `wl_resource_post_event_array`. Resource destruction invalidates the JS wrapper.
+  `registerInterface` stores a handler without advertising a global (request-
+  created interfaces); `createGlobal` also `wl_global_create`s.
 
-Trampoline gaps (implemented or not):
-- `fd` request-arg **decode** is implemented via the `WaylandFd` wrapper
-  (`native/wayland/wayland_fd.{h,cpp}`): on decode the fd is `dup`'d and handed
-  to JS as a `WaylandFd` object that owns it (state OPEN/TAKEN/CLOSED in a napi
-  external; finalizer closes iff still OPEN, with a leak warning). JS calls
-  `fd.takeRawFd()` / `fd.close()`; native consumers call `takeWaylandFd()` to
-  pull the raw fd out by reference. There is no longer a native fd handle table
-  (the old `fdTake`/`fdClose` handle API was removed). Proven over
-  `wl_shm.create_pool` (`test/fd-passing-smoke.mjs`: server reads the client's
-  marker bytes via `takeRawFd`) and the shm/dmabuf e2e (native `takeWaylandFd` →
-  `mmap` / SCM_RIGHTS). The read/write methods on `WaylandFd` for data-transfer
-  fds (pipes) are declared but not implemented (no consumer yet).
-- `fd` **encode** (events carrying fds) is implemented: `postEvent` 'h' takes
-  the raw fd out of a `WaylandFd`, hands it to `wl_resource_post_event_array`
-  (which dups into the wire), then closes the copy. Proven by `wl_keyboard.keymap`
-  delivering a readable keymap memfd to real clients (see "Input routing").
-- `array` encode is proven on the wire (`xdg_toplevel.configure` sends a
-  non-empty `states` `wl_array` of one uint32; the client receives 4 bytes
-  decoding to `ACTIVATED`, asserting both byte length and value). `array`
-  *decode* still has no exerciser (no core protocol has an array request arg).
-- object arg passed *into* a handler: implemented, not yet end-to-end tested
-  (needs a protocol with an existing-object request arg).
-- per-arg since-versioning not handled.
-- No live reload yet.
+Trampoline arg support: `fd` decode (via `WaylandFd`, dup-on-decode, owner-tracked
+with finalizer-close) and `fd` encode (events carrying fds) both implemented;
+`array` encode proven on the wire; `array` decode and object-arg-into-handler are
+implemented but not yet exercised end-to-end. Per-arg since-versioning is not
+represented (message-level only). No live reload.
 
-### JS protocol layer: xdg-shell toplevel creation (first light, no buffer)
-A handwritten JS protocol layer now sits on the trampoline. A real client can
-create and configure an `xdg_toplevel`; it cannot yet show pixels (no buffer
-path).
+### Protocol generator (XML → JS/TS)
 
-- `src/protocols/index.js`: minimal loader. Imports every generated signature,
-  calls `registerProtocols`, then wires handlers — globals (`wl_compositor`,
-  `xdg_wm_base`) via `createGlobal`, request-created interfaces (`wl_surface`,
-  `wl_region`, `xdg_surface`, `xdg_toplevel`) via `registerInterface` — and
-  builds the per-interface event senders from `makeEvents(addon.postEvent)`. No
-  C++/core-JS/plugin layering or override semantics yet (deferred until plugins
-  exist).
-- `src/protocols/*.js`: handler modules tracking surfaces (pending/committed
-  buffer, frame-callback queue), xdg roles, and the configure handshake
-  (`xdg_toplevel.configure` empty-states → `xdg_surface.configure` serial →
-  client `ack_configure`), plus `set_title`/`set_app_id`.
-- Verified end-to-end (`test/xdg-test-client.c` + `test/xdg-toplevel-smoke.mjs`):
-  a real libwayland client binds `wl_compositor` + `xdg_wm_base`, creates a
-  surface, `get_xdg_surface` + `get_toplevel`, sets title/app_id, receives both
-  configure events and acks; server-side state (toplevel, title, app_id, role,
-  configured-after-ack) is asserted. **PASS.**
-- The configure sends `states = [activated]` (a non-empty `wl_array`), which
-  doubles as the on-wire proof of non-empty array encoding.
-- Buffer attach/commit now uploads + composites shm buffers (see "Client shm
-  buffers end-to-end"). Still: configure sends 0×0 (client picks size); no
-  WM/policy (placement, focus, dynamic toplevel states — `xdg_toplevel`
-  move/resize/maximize/fullscreen are silent no-ops); popups (`get_popup`) and
-  positioners are no-ops. See "Protocol gaps & skeletons (READ FIRST)" at the top.
+`tools/gen-protocol/` parses Wayland XML and emits, per interface, a `.js`
+signature module (request/event tables with opcodes/arg metadata/since-versions;
+enums; a `makeEvents(post)` factory) and a `.d.ts` typed contract (branded resource
+types, handler interface, event-sender interface, enums). Output to
+`src/protocols-gen/` (gitignored, reproduced from XML). Generates from core wayland
++ xdg-shell + linux-dmabuf-v1 + primary-selection-unstable-v1; all `.d.ts`
+type-check under `tsc --strict`.
 
-### Load-bearing facts established (recorded in architecture.md "Validated against Dawn")
-- A Wayland-backed `wgpu::Surface` swapchain works **over the Dawn wire**: a
-  wire client drives `Configure`/`GetCurrentTexture`/`Present` against a
-  server-side surface + device; frames reach the host window.
-- `ReserveSurface`/`InjectSurface` exist and mirror the texture reserve/inject
-  pattern.
-- The host output window's Wayland client connection must live in the GPU
-  process (a `wl_surface` is not shareable across processes). This corrected
-  the original "core is the Wayland client of the host" framing.
+### xdg-shell
 
-### Upstream Dawn fix (made and published)
-- `dawn::wire::server::Server::~Server()` crashed at process exit when it owned
-  a configured swapchain: devices were destroyed before surfaces, so the
-  swapchain detach in `~Surface` dereferenced freed device state (SIGSEGV in
-  `FencedDeleter`). Fixed by releasing surfaces before devices in `~Server`
-  (`DestroyAllSurfaces()`). Committed to `jhanssen/dawn` (`7af36c5`) and
-  published as the `-alpha2` release overdraw now consumes. overdraw verified
-  against the published artifact.
+A real client can create + configure an `xdg_toplevel`. `wl_compositor`/
+`xdg_wm_base` are globals; `wl_surface`/`wl_region`/`xdg_surface`/`xdg_toplevel`
+are request-created. The configure handshake (`xdg_toplevel.configure`
+empty-states → `xdg_surface.configure` serial → client `ack_configure`) works, plus
+`set_title`/`set_app_id`. configure sends `states = [activated]` (the on-wire proof
+of non-empty array encoding) and 0×0 (client picks size). See the WM-request no-ops
+in "Read first".
 
-### Testing (pure-unit layer + state-query channel)
-The reference compositors (wlroots, Hyprland) automate correctness via (1) pure
-GPU-free unit tests and (2) a headless run + control-socket state queries +
-synthetic input, asserting on geometry/focus/state strings — NOT pixel/golden
-comparison (Hyprland's own tester flags visual testing as an open TODO). overdraw
-follows the same model.
+### Subsurfaces (`wl_subsurface`, pixel-verified)
 
-- **Pure-unit tests** (`npm test` → `node --test 'test/**/*.test.js'`, GPU-free):
-  - `test/gen-protocol.test.js` — protocol-generator structural tests.
-  - `test/placement.test.js` — the placement stub's cascade/wrap/clamp.
-  - `test/wm.test.js` — `createWm` map/unmap (rect assignment, content-size
-    fallback, idempotence, stack order pushed to a MOCK addon) + `windowAt`
-    hit-testing (half-open bounds, topmost-on-overlap). The mock addon records
-    `setSurfaceLayout`/`setStack` so the WM is tested without native/GPU.
-  - `test/query.test.js` — the state-query channel snapshot.
-  - `test/config.test.js` — config resolution/loading/validation.
-  - (plus the protocol-coverage + server-only `*.test.js` listed below.)
-  - All passing; no native build, no GPU, no Wayland.
-- **State-query channel** (`src/query.ts`, `queryState(state)` → `StateSnapshot`):
-  overdraw's analog of `hyprctl /activewindow` — a serializable, GPU-free snapshot
-  of output size, windows (surfaceId + rect + title + app_id + role + mapped),
-  back-to-front stack order, and pointer/keyboard focus surface ids. Attached to
-  the state returned by `installProtocols` as `state.query()`. This is the seam a
-  future integration harness asserts against (geometry/focus), without pixels.
-- **Integration tests** (`npm run test:gpu` → `node --test 'test/*.gpu.mjs'`;
-  require GPU + host Wayland, auto-skip when `WAYLAND_DISPLAY` unset). Drive REAL
-  libwayland clients against the full stack and assert on `state.query()`
-  (geometry / stacking / focus) — no pixel comparison, mirroring the reference
-  compositors' model.
-  - `test/harness.mjs`: brings up GPU process + present loop + server + protocols
-    with input routed to the seat; `spawnClient(args)` (resolves on the client's
-    "mapped" stdout line), `waitFor(query, pred)` (polls `query()` while yielding
-    to libuv — completion-driven, not a timer guess), and `teardown()` that kills
-    clients, stops the addon, and asserts NO GPU process leaked (scan by exact
-    comm `overdraw-gpu-pr`, per the process-management rules).
-  - `test/harness-client.c`: a controllable shm client — argv config (`--socket`,
-    `--size WxH`, `--color AARRGGBB`, `--title`, `--app-id`), maps one toplevel,
-    holds the surface until SIGTERM (harness controls lifetime; no sleeps).
-  - **Synthetic input backend, two depths:**
-    - `addon.injectInput(event)` feeds a normalized `InputEvent` directly into the
-      `InputSink` the seat consumes (skips backend normalization).
-    - `addon.injectHostInput(event)` feeds a forwarded `ipc::InputMessage` through
-      the REAL `WaylandInputBackend` normalization (`convert()`, shared with the
-      live `drain()` path: fixed-point↔logical, evdev codes, state/axis enums)
-      then to the sink. Logical pointer coords are encoded to `wl_fixed_t` and
-      converted back, exercising the round-trip. This is the analog of Hyprland's
-      test plugin injecting at the input layer, reusing the existing
-      `native/core/input.h` seam (no virtual-input protocol).
-  - `test/integration.gpu.mjs`: client map→query (title/app_id/size),
-    two-client stacking order, focus-on-map, follow-pointer focus enter/clear,
-    click-to-focus press + persist-on-leave, plus two HOST-PATH tests via
-    `injectHostInput`. All run HEADLESS now (no host window needed).
-  - `test/compositing.gpu.mjs`: PIXEL tests against the headless offscreen
-    frame — single client composites at its rect + black background; two clients
-    at distinct positions both visible; top window wins the overlap (opaque
-    stacking). Computed-expectation comparison (each client a known solid color
-    at a `query()` rect, ±4/channel tolerance), no golden files.
-  - `test/protocols.gpu.mjs`: protocol-delivery tests — `wl_output` (client
-    receives a mode matching the output size + done), `wl_callback` (compositor
-    fires `wl_surface.frame` → `wl_callback.done` each frame, client re-arms),
-    `wl_keyboard` (key injected via the host path is delivered to the focused
-    client as enter + key press/release). The harness-client reports what it
-    RECEIVES on stdout; `spawnClient(...).waitForLine(re)` asserts it. (Fixed a
-    latent harness-client bug: the hold loop dispatched the queue but never READ
-    the socket, so server-sent events were never delivered — now polls + reads.)
-  - `npm run test:gpu` runs `test/*.gpu.mjs` with `--test-concurrency=1` (each
-    test owns the GPU + a compositor; serial avoids socket-name and
-    GPU-process-leak-scan races).
+A child surface is composited above its parent at parent-rect + offset, with
+spec-correct double-buffered commit semantics: `wl_surface` requests accumulate
+into `pending`; commit applies (desync) or caches and applies on the parent's
+commit (effective-sync). Sync/desync/inherited-sync computed up the parent chain;
+`set_position` is double-buffered and applied on the parent commit; `set_sync`/
+`set_desync` are immediate; frame callbacks arm on apply. Nested subsurfaces
+handled recursively. `src/subsurfaces.ts` gives each a layout rect + a draw-stack
+slot above its parent, rebuilt whenever it could change. Verified: green child over
+blue parent at parent+offset; sync child appears only on parent commit; desync
+child appears on its own commit. **Gap:** `place_above`/`place_below` reordering is
+a no-op (siblings draw in creation order).
 
-### Headless mode (offscreen render, no host window)
-- `addon.start(gpuBin, onFrame?, onInput?, { width, height })` runs HEADLESS: the
-  GPU process is spawned `--headless WxH` (no `HostWindow`, no `wl_surface`, no
-  host seat), brings up the device only, and skips `InjectSurface`/`SurfaceReady`;
-  the core `Compositor` skips `ReserveSurface`/`Configure`/`Present`. Still
-  requires the GPU. The JS compositor (`JsCompositor`, headless mode) creates its
-  own offscreen `RenderAttachment|CopySrc` target (BGRA8Unorm) and renders into it.
-- Frame readback is `JsCompositor.readback()` (the harness exposes it as
-  `frameReadback()`): async `copyTextureToBuffer` + `mapAsync` of the offscreen
-  target → tightly-packed BGRA. (The former native `addon.frameReadback`/
-  `surfaceReadback`/`readbackTexture` were removed with the C++ compositing pass.)
-- The real launcher (`main.ts`) passes no headless arg → stays NESTED (host
-  window + swapchain), and presents on the JS compositor.
-- **`input-smoke` removed** (was interactive — required a human to move the mouse
-  / type over the nested window). Its durable, product-relevant coverage (the
-  `WaylandInputBackend` normalization + seat routing → focus/clients) is now
-  automated via `injectHostInput`. The only thing it additionally exercised was
-  the phase-1 NESTING scaffolding — the GPU process binding the host
-  `wl_seat`/`wl_pointer`/`wl_keyboard` (`host_window.cpp`) and `ipc::sendInput`
-  forwarding over the socket — which is not a durable code path (it is replaced
-  by a libinput backend at the same `InputBackend` seam in phase 2), so it is not
-  worth an automated test. No interactive tests remain.
-- **`compositing-eyeball` removed** (was interactive — a human confirmed two
-  colored squares). Superseded by `compositing.gpu.mjs`, which asserts the same
-  placement + distinct positioning automatically via pixel readback, and adds
-  overlap-stacking coverage the eyeball test lacked. NO interactive tests remain.
-- **Protocol coverage (what IS / is NOT behaviorally tested):**
-  - Tested end-to-end: `wl_compositor`, `wl_surface` (attach/commit/frame),
-    `xdg_wm_base`/`xdg_surface`/`xdg_toplevel` (configure, title/app_id),
-    `wl_shm`/`wl_shm_pool`/`wl_buffer` (pixel-verified), `zwp_linux_dmabuf_v1`/
-    `..._buffer_params_v1` (pixel-verified), `wl_seat`/`wl_pointer`/`wl_keyboard`
-    (focus routing + key delivery), `wl_output` (mode/geometry), `wl_callback`
-    (frame-callback delivery), `wl_data_device*`/`wl_data_offer` +
-    `zwp_primary_selection_*` (CLIPBOARD selection round-trip, pixel-free, see
-    "Clipboard"), `wl_subsurface` (sync/desync commit semantics, pixel-verified).
-  - Implemented but NOT behaviorally tested: `wl_region` (no-op stub);
-    `zwp_linux_dmabuf_feedback_v1` (feedback path; exercised by real WSI clients
-    manually, no automated assertion).
-  - `wl_data_device` drag-and-drop (full vertical, `test/dnd.gpu.mjs`); action
-    negotiation unit-tested (`test/data-device-dnd.test.js`).
-  - Structural: `gen-protocol.test.js` spot-checks specific interfaces, and
-    `gen-protocol-all.test.js` validates ALL generated signatures (sequential
-    unique opcodes, known arg types, interface references resolve, one makeEvents
-    sender per event at the right opcode).
-  - The server-only smokes are now GPU-free `node --test` files in `npm test`:
-    `server.test.js`, `trampoline.test.js`, `fd-passing.test.js`,
-    `xdg-shell.test.js` (shared `server-helpers.mjs`; each its own file for
-    process isolation — see the start/stop note below). The old `*-smoke.mjs`
-    versions were removed. `npm test` is GPU-free.
-- **Known bug (flagged, not fixed): `startServer`/`stopServer` is NOT safely
-  repeatable in one process** — a second lifecycle aborts with a libuv
-  `uv__finish_close` assertion (`Server::stop()` mishandles uv handle teardown on
-  reuse). Worked around in tests by one server lifecycle per file (node --test
-  isolates files into separate processes). Matters if a long-running compositor
-  ever restarts its server; needs a real fix in `native/wayland/server.cpp`.
-- **Not yet built (testing):** a stdin command loop on the harness client for
-  multi-step sequences (raise/move/resize) within one client lifetime.
+### Popups (`xdg_popup` / `xdg_positioner`, pixel-verified)
 
-### Subsurface compositing (`wl_subsurface`, pixel-verified)
-A child `wl_surface` made a subsurface of a parent is composited above the parent
-at parent-output-rect + the subsurface offset.
-- A subsurface's `wl_surface` gets a texture on commit like any surface;
-  `src/subsurfaces.ts` `applySubsurfaces()` gives it a layout rect (parent rect +
-  `set_position` x/y) and a draw-stack slot directly above its parent, rebuilding
-  both whenever it could change (child commit, `set_position`, `destroy`, parent
-  map). Nested subsurfaces handled (recursive subtree). The native compositor
-  already drew any placed `ClientSurface` in stack order, so this is JS-layer
-  glue (no native change).
-- **Commit semantics are spec-correct (double-buffered).** `wl_surface` requests
-  accumulate into `pending`; `commit` either APPLIES the state or, for an
-  effective-synchronized subsurface, CACHES it and applies it when the parent
-  commits. Implemented in `wl_surface.commit` + `applySurfaceState`:
-  - **sync** (the default for a subsurface): commit caches; the cache is applied
-    atomically when the parent's state is applied (a parent apply cascades into
-    every effective-sync child's cache, recursively).
-  - **desync**: commit applies directly; a pre-existing cache is flushed as part
-    of the apply.
-  - **inherited sync**: a desync child of a sync-behaving parent is effectively
-    sync (computed up the parent chain; the main surface is always desync).
-  - **subsurface position** (`set_position`) is double-buffered and applied on the
-    PARENT's commit regardless of child mode; `set_sync`/`set_desync` are
-    immediate. Frame callbacks are likewise armed on apply (so a sync child's
-    callbacks fire with the parent's frame).
-- Verified (`test/subsurface.gpu.mjs`, headless pixel tests): green child over a
-  blue parent composites at parent+offset (above parent); a **sync** child does
-  NOT appear until the parent commits, then does; a **desync** child's content
-  appears on its own commit. **PASS.**
-- **Remaining gap (flagged):** `place_above`/`place_below` sibling reordering is a
-  no-op (siblings draw in creation order). The WM's own `setStack` on map/unmap
-  pushes toplevels-only; subsurfaces are re-expanded right after in the same
-  sweep, but a future stand-alone WM restack must call `applySubsurfaces` too.
+`xdg_positioner` accumulates size/anchor_rect/anchor/gravity/constraint/offset; the
+constraint solver (`src/popup-position.ts`, unit-tested) places the anchor point →
+gravity → offset → constrain to the output via flip/slide/resize per axis.
+`get_popup` computes the rect, sends `xdg_popup.configure` + `xdg_surface.
+configure`; on first content the popup maps above its parent (single stack owner,
+`rebuildStackWithPopups`). Grab + click-away dismiss (`xdg_popup.grab` →
+`popup_done` on outside press). A popup may itself parent subsurfaces (subtree
+walked above it). Nested popups + reposition supported. Verified: a popup composites
+at the computed parent-relative position and the client receives it; a
+popup-parented subsurface composites above the popup. **Untested sub-paths:** the
+grab/click-away dismiss and `reposition` (positioning + map are tested); constraint
+flip/slide/resize is unit-tested in the solver but not end-to-end; `set_reactive`
+is a no-op.
 
 ### Clipboard + primary selection (`wl_data_device` / `zwp_primary_selection_*`, verified)
-Copy/paste and middle-click paste work end-to-end between two real clients.
-- **Prerequisite built: server-minted new_id in EVENTS.** The trampoline's
-  `postEvent` 'n' case now creates the `wl_resource` server-side (on the event
-  target's client + the arg's interface), routes its requests to the registered
-  handler, and returns the wrapped resource to JS so JS can immediately send
-  events on it. JS passes a non-numeric value (null) for the new_id slot to mean
-  "mint here". libwayland marshals a sent new_id from the `.o` (wl_object*) slot.
-  This was the long-flagged gap; it also unblocks dmabuf `create`.
-- Selection flow: source `create_data_source` → `offer(mime)` → `set_selection`;
-  the compositor stores it and, to the KEYBOARD-FOCUSED client's data_device,
-  mints a `data_offer`, sends `offer(mime)` per type, then `selection(offer)`.
-  The receiver calls `data_offer.receive(mime, pipe-fd)`; the compositor forwards
-  to the source via `data_source.send(mime, fd)` (the same WaylandFd flows request
-  → event); the source writes, the receiver reads. Selection follows keyboard
-  focus (resent on focus change via the seat's `onKbFocusChange` hook).
-- Primary selection (`zwp_primary_selection_*`, middle-click) is the identical
-  flow on its own interfaces + state (no DnD). The generator now also ingests
-  `primary-selection-unstable-v1.xml` (35 generated interfaces; checked-in client
-  glue for the test client).
-- Verified (`test/clipboard.gpu.mjs`, two real clients; GPU-gated ONLY because the
-  receiver maps a window to take keyboard focus): a known payload round-trips for
-  both clipboard and primary selection, byte-exact. **PASS.**
-### Drag-and-drop (`wl_data_device`, verified)
-Full DnD vertical between two real clients.
-- `start_drag` takes a SEAT POINTER GRAB (`seat.beginDrag`): while active,
-  `handleInput` routes pointer motion/button to the DnD machinery instead of
-  `wl_pointer` (matches real compositors; the dragged-over client gets DnD events,
-  not pointer events). Modeled on Hyprland's `initiateDrag`/`updateDrag`/`dropDrag`.
-- On motion, the surface under the pointer gets `data_device.enter` (with a
-  freshly-minted `data_offer` + `offer(mime)` + `source_actions`), then `motion`;
-  crossing surfaces sends `leave` + a new enter. Action negotiation
-  (`negotiateDndAction`: intersect source+receiver masks, honor preferred else
-  copy>move>ask) drives `data_offer.action` + `data_source.action`.
-- Button release over an accepting target → `drop` + `dnd_drop_performed`; the
-  target `receive`s (same fd-pipe transfer as clipboard), reads, `finish`es →
-  `dnd_finished`. Release over nothing/rejected → `cancelled` + abort.
-- Verified (`test/dnd.gpu.mjs`): source presses over its window → start_drag;
-  harness drags the pointer onto the target and releases; the target receives the
-  byte-exact payload via the copy action. **PASS.** Negotiation unit-tested
-  (`test/data-device-dnd.test.js`).
-- **FLAGGED (one untested sub-path):** the drag-ICON surface compositing
-  (`updateDragIcon`: position the icon at the pointer, draw on top) is implemented
-  but the DnD test passes a NULL icon, so it is not yet pixel-verified. Needs an
-  icon + `frameReadback` assertion to close.
 
-### Popups (`xdg_popup` / `xdg_positioner`, verified)
-Menus/dropdowns/tooltips: a compositor-positioned, input-grabbing child surface.
-- `xdg_positioner` accumulates size/anchor_rect/anchor/gravity/constraint/offset
-  (`src/protocols/xdg_positioner.ts`). The constraint solver
-  (`src/popup-position.ts`, pure + unit-tested in `test/popup-position.test.js`):
-  anchor point on the anchor rect → gravity placement → offset → constrain to the
-  output via flip (preferred) / slide / resize, per axis.
-- `xdg_surface.get_popup` computes the rect, sends `xdg_popup.configure` +
-  `xdg_surface.configure`; on first content the popup maps as a compositor-placed
-  child drawn ABOVE its parent. The draw stack has a SINGLE owner
-  (`rebuildStackWithPopups` = `computeBaseStack` [windows + subsurface subtrees] +
-  popups on top); `applySubsurfaces` delegates to it (so subsurfaces + popups
-  coexist — a regression where the popup rebuild dropped subsurfaces was caught by
-  the subsurface tests and fixed). Nested popups + reposition supported.
-- Grab + click-away dismiss: `xdg_popup.grab` records the grabbing popup; a pointer
-  button press OUTSIDE the popup tree sends `popup_done` and is swallowed (seat
-  `dismissGrabbedPopup` hook).
-- A popup is a `wl_surface` and may itself PARENT subsurfaces; the stack rebuild
-  walks each mapped popup's subsurface subtree above it (`emitSubtree`).
-- Verified (`test/popup.gpu.mjs`): a popup with anchor_rect + bottom_left anchor +
-  bottom_right gravity composites at the computed parent-relative position, and the
-  client receives that position in `xdg_popup.configure`; a popup-parented
-  subsurface composites above the popup at its offset. **PASS.**
-- **FLAGGED (untested sub-paths):** the grab/click-away DISMISS path
-  (`maybeDismissGrabbedPopup`) and `reposition` are implemented but not covered by
-  a test (the e2e test covers positioning + map only). Constraint flip/slide/resize
-  is unit-tested in the solver but not exercised end-to-end. `set_reactive`
-  (reposition-on-parent-move) is a no-op.
+Copy/paste and middle-click paste work between two real clients. Source
+`create_data_source` → `offer(mime)` → `set_selection`; the compositor stores it
+and, to the keyboard-focused client, mints a `data_offer`, sends `offer(mime)` per
+type, then `selection(offer)`. The receiver `receive(mime, pipe-fd)` →
+`data_source.send(mime, fd)` (the same `WaylandFd` flows request → event); source
+writes, receiver reads. Selection follows keyboard focus (resent on focus change).
+Primary selection is the identical flow on its own interfaces. Verified byte-exact
+for both.
+
+### Drag-and-drop (`wl_data_device`, verified)
+
+`start_drag` takes a seat pointer grab; while active, pointer motion/button route to
+the DnD machinery instead of `wl_pointer`. On motion the surface under the pointer
+gets `data_device.enter` (fresh `data_offer` + `offer(mime)` + `source_actions`)
+then `motion`; crossing surfaces sends `leave` + a new enter. Action negotiation
+(intersect masks, honor preferred else copy>move>ask) drives `data_offer.action` +
+`data_source.action`. Button release over an accepting target → `drop` +
+`dnd_drop_performed` → receiver `receive`s + `finish`es → `dnd_finished`; release
+over nothing/rejected → `cancelled` + abort. Verified byte-exact via the copy
+action; negotiation unit-tested. **Untested sub-path:** drag-icon compositing
+(implemented; the test passes a NULL icon, so not pixel-verified).
+
+## Plugins
+
+### Runtime (isolation + lifecycle + watchdog + restart)
+
+A plugin module loads in its own `worker_threads` Worker, runs `init(sdk)`, and is
+supervised. `src/plugins/protocol.ts` is the Worker↔core envelope
+(`request`/`response`/`event` with a pending-promise table, plus `ping`/`pong`
+control kept outside the request table). `src/plugins/bootstrap.ts` (in the Worker)
+builds the SDK, dynamically imports the module, calls `init`, auto-pongs pings, and
+handles `shutdown`. `src/plugins/runtime.ts` (`PluginRuntime`) owns one Worker per
+plugin with `resourceLimits.maxOldGenerationSizeMb`, the lifecycle state machine
+(`spawning`→`live`→`shutting-down`/`failed`), the watchdog (>K missed pongs →
+`terminate()`), and the restart policy (`on-failure` up to `maxRestarts` in a
+rolling `windowSeconds`, then permanently `failed`; `never` disables). Graceful
+`stop()` awaits `onShutdown` up to `shutdownTimeoutMs` then terminates; forced paths
+skip the callback. Timing tunables are injectable. Configured plugins load after the
+server is up (`src/main.ts`).
+
+### GPU SDK (overlays + decorations)
+
+The cross-process plugin GPU path is built and pixel-verified end to end:
+
+- **Worker owns its wire client + device + rendering** (`overdraw_plugin_native.
+  node`, context-aware; `native/plugin-napi/`). The core owns the side channel and
+  brokers everything: connection (`AddWireConn`, GPU-end fd via SCM_RIGHTS),
+  instance injection, `SetPluginTickDevice`, surface allocation (`AllocSurfaceBuf`),
+  and the per-frame fence brackets — reached from the Worker via the runtime's
+  `onRequest` hook (`src/plugins/gpu-broker.ts`). No listening socket: a new
+  connection can only be introduced by the trusted core over the inherited side
+  channel (auth by construction).
+- **SDK** (`src/plugins/gpu.ts`): `sdk.gpu.device` (a dawn.node GPUDevice over the
+  Worker's wire) + `sdk.gpu.createOverlay({layer, anchor, size})` → a `Surface` with
+  `getCurrentTexture()` + `present()`. `createOverlay` → the core overlay broker
+  decides rect + layer and allocates the shared buffer ring; the plugin renders;
+  `present()` drives ProducerEnd → ConsumerBegin (waits the producer fence) → the
+  JS compositor samples the consumer texture at the overlay rect+layer.
+- **Surface ring with SharedArrayBuffer slot-state** (`src/plugins/surface-
+  slots.ts`): 3 slots, each a shared dmabuf, with one Int32 per slot transitioning
+  via atomic CAS (`FREE → ACQUIRED → PRESENTED → DRAINING → FREE`).
+  `getCurrentTexture` is async: CAS-claims a FREE slot or `Atomics.waitAsync` (not
+  `wait` — the Worker loop must keep turning for watchdog pongs) until one frees.
+  The `DRAINING → FREE` flip is gated on the consumer's GPU completion
+  (`onSubmittedWorkDone` via `afterCurrentFrame`), mirroring the SharedFence
+  brackets. The plugin is oblivious — it calls only `getCurrentTexture` + `submit` +
+  `present`; slots, fences, and brackets live in the SDK + broker + GPU process.
+- **Verified**: a static overlay composites at its rect (black elsewhere); a plugin
+  animates green→red→blue on its own clock and the composited output shows multiple
+  distinct colors over time; a shipped example animates a shader-gradient titlebar
+  with continuous presents and no access errors.
+
+### Core event bus + window-state stream
+
+A typed in-core bus (`src/events/bus.ts`, `TypedBus<M>`: `on`/`emit`/`clear`,
+synchronous fan-out, throwing listeners caught + logged) with a concrete instance +
+event map (`src/events/window-bus.ts`, `CompositorEventMap`:
+window.map/unmap/change + keyboard.focus). Payloads (`src/events/types.ts`) are
+structured-clone-safe (forwardable over postMessage). Producers: the map sweep emits
+`window.map`; surface teardown emits `window.unmap`; set_title/set_app_id +
+keyboard-focus changes mark a per-frame dirty set drained into one coalesced
+`window.change` per surface (consistent snapshot, closes the late-`set_app_id`
+hole). Plugin side: `sdk.window` `onMap`/`onUnmap`/`onChange`
+(`src/plugins/window-observer.ts`), validating each payload at the trust boundary;
+`main.ts` forwards window.* to the runtime (`broadcast`/`emit`). **Gap:**
+`window.change` covers only title/appId/activated — maximized/fullscreen/minimized/
+resized/parent are not emitted (those `xdg_toplevel` requests are no-ops with no
+backing state); the bus is ready for them.
+
+### Decoration provider (registration + insets + drawing + atomic gating)
+
+Server-side decorations end to end: a plugin registers an app_id pattern, is told
+which mapped windows it owns, and draws a decoration surface the core composites at
+the window's inset rect, with the window's content gated until the decoration's
+first frame (content + decoration appear together). A provider that never draws is
+deregistered on a timeout and the window is shown undecorated.
+
+- **Registration** (`src/decorations.ts`, GPU-free): `sdk.decorations.register(
+  pattern, flags?)` (RegExp source) + `onAssigned(cb)`. Subscribes to `window.map`
+  + `window.change`, assigns the first-registered matching provider (match-once),
+  emits `decoration.assigned {surfaceId, appId, title, rect}`.
+- **createDecoration**: `sdk.decorations.createDecoration(windowId, {insets,
+  layer?})` — the core reserves additive insets (WM `setInsets`: outer rect =
+  content grown by insets; content + client unchanged), returns the outer rect, and
+  the Worker allocates a producer/consumer ring there (the same ring `createOverlay`
+  uses, window-bound). Only the plugin a window is assigned to may decorate it.
+- **Content gating**: on assignment the broker gates the window's content (WM
+  `setContentGated` skips it in the stack) and arms a first-frame timeout (default
+  500ms). The decoration surface's first present releases the gate. On timeout the
+  broker logs, permanently deregisters the provider, notifies it
+  (`decoration.deregistered`), and releases the gate (window shown undecorated).
+  Unmap before the first frame releases the gate without deregistering.
+- **Per-window z-binding**: each decoration is z-bound to its window
+  (`Window.decorationSurfaceId`) and spliced directly below its window's content in
+  `computeBaseStack` (unified order `decoA, A, decoB, B`), so a decoration is not
+  occluded by another window's content. Window-bound surfaces use
+  `overlays.createWindowBound` (no flat layer; the WM stack owns z-order);
+  output-anchored overlays still use the flat layers.
+- **Surface teardown on unmap**: `Surface.destroy()` → stop compositing
+  immediately, then (gated on `afterCurrentFrame`) end the consumer bracket +
+  `pluginReleaseSurfaceBuffer` per slot → GPU-process `ReleaseSurfaceBuf` (end
+  brackets, drop STM/textures/fences, release the dmabuf). `window.unmap` fires on
+  client disconnect (not just explicit destroy) via an idempotent
+  `unmapAndTeardownSurface` driven by both the destroy request and a per-frame
+  resource-destroyed sweep, so a crashed client's ring + fences are released.
+- **Verified**: registry/broker unit tests (match/first-wins/match-once/late-app_id/
+  auth/gating/timeout/unmap-before-draw); a real client + provider (decoration
+  composites in the inset band, content below, gate released); a broken provider
+  (timeout → deregistered + content shown); two cascading decorated windows
+  (top window's titlebar shows over the lower window's content); fd count flat
+  across map/unmap cycles.
+
+### Cross-device dmabuf + fence (the producer/consumer primitive)
+
+Two independent `wgpu::Device`s sharing one GBM dmabuf, with a producer→consumer
+handoff gated by a cross-device sync-fd fence, verified in-process via
+`overdraw-gpu-process --selftest-xdev`: one GBM dmabuf imported as
+`SharedTextureMemory` into both devices; producer device A clears it
+(`BeginAccess` → render → `EndAccess` exports a `SharedFenceSyncFD`); consumer
+device B `BeginAccess` waits that fence → samples → reads back; asserts the pixels
+equal the producer's color. This is the GPU-timeline ordering the plugin path rests
+on. **Scope:** in-process two-device on this driver; does not prove the
+cross-process variant beyond what the plugin overlay path exercises. Not done:
+multi-plane/YUV import.
+
+### dmabuf interop primitives (single device)
+
+GBM allocator + DRM modifier probe in the GPU process (`GetFormatCapabilities` +
+`DawnDrmFormatCapabilities` intersected with `gbm_bo_create_with_modifiers`; on
+NVIDIA, 7 Dawn-importable BGRA8 modifiers, 6 GBM-allocatable, single-plane). Import
+as `SharedTextureMemory` on the wire-resolved device, `ReserveTexture`/
+`InjectTexture` over the wire, `BeginAccess`/`EndAccess` with mandatory Vulkan
+image-layout state, `SharedFenceSyncFD` on EndAccess. These are the primitives the
+`linux-dmabuf-v1` handler and plugin rings reuse.
+
+## Testing
+
+The model mirrors the reference compositors (wlroots/Hyprland): pure GPU-free unit
+tests + a headless run with state queries + synthetic input, asserting on
+geometry/focus/state and computed-expectation pixels — no golden files. No
+interactive (human-in-the-loop) tests.
+
+### Pure-unit (`npm test` → `node --test 'test/**/*.test.js'`, GPU-free)
+
+`gen-protocol.test.js` + `gen-protocol-all.test.js` (validates ALL generated
+signatures); `placement.test.js`; `wm.test.js` (map/unmap + `windowAt`, additive
+insets + gating filter, against a mock addon); `query.test.js`; `config.test.js`;
+`overlay.test.js`; `popup-position.test.js`; `data-device-dnd.test.js`;
+`decorations.test.js`; `window-events.test.js` + `window-changes.test.js` (bus +
+observer + coalescing, incl. a real Worker); `plugins.test.js` (real Workers + real
+fixture plugins: live/failed/graceful-stop/watchdog-terminate/OOM/independence);
+`scm-rights.test.js`; the server-only smokes (`server.test.js`,
+`trampoline.test.js`, `fd-passing.test.js`, `xdg-shell.test.js`, shared
+`server-helpers.mjs`, one server lifecycle per file). No native build, no GPU.
+
+### State-query channel (`src/query.ts`)
+
+`queryState(state)` → `StateSnapshot`: output size, windows (surfaceId + rect +
+title + app_id + role + mapped), back-to-front stack order, pointer/keyboard focus
+ids. The analog of `hyprctl /activewindow`; attached as `state.query()`. The seam an
+integration harness asserts against without pixels.
+
+### Integration / GPU (`npm run test:gpu` → `node --test 'test/*.gpu.mjs'`)
+
+Require GPU + host Wayland (auto-skip when `WAYLAND_DISPLAY` unset), run with
+`--test-concurrency=1`. `test/harness.mjs` brings up GPU process + present loop +
+server + protocols with input routed; `spawnClient` (resolves on the client's
+"mapped" stdout line), `waitFor(query, pred)` (polls while yielding to libuv), and
+`teardown()` that asserts no GPU process leaked (scan by exact comm
+`overdraw-gpu-pr`). Synthetic input at two depths: `addon.injectInput` (straight
+into the `InputSink`) and `addon.injectHostInput` (through the real
+`WaylandInputBackend` normalization, round-tripping `wl_fixed_t`).
+
+Coverage: `integration.gpu.mjs` (map→query, stacking, focus-on-map, follow-pointer,
+click-to-focus, plus host-path input); `compositing.gpu.mjs` (pixel: placement,
+two-client positions, overlap stacking); `protocols.gpu.mjs` (`wl_output` mode,
+`wl_callback` per-frame, keyboard delivery via the host path); the JS-compositor
+suite (`js-compositor*.gpu.mjs` incl. a dmabuf buffer-cycling leak test);
+`subsurface.gpu.mjs`; `popup.gpu.mjs`; `clipboard.gpu.mjs`; `dnd.gpu.mjs`;
+`window-change-e2e.gpu.mjs`; `xdev-fence.gpu.mjs`; the plugin suite
+(`plugin-overlay*.gpu.mjs`, `worker-gpu.gpu.mjs`, `decoration-*.gpu.mjs`,
+`example-decoration.gpu.mjs`).
+
+### Protocol coverage matrix
+
+- **Tested end-to-end**: `wl_compositor`, `wl_surface` (attach/commit/frame),
+  `xdg_wm_base`/`xdg_surface`/`xdg_toplevel` (configure, title/app_id),
+  `wl_shm`/`wl_shm_pool`/`wl_buffer` (pixel), `zwp_linux_dmabuf_v1`/
+  `..._buffer_params_v1` (pixel), `wl_seat`/`wl_pointer`/`wl_keyboard` (focus +
+  key delivery), `wl_output` (mode/geometry), `wl_callback`, `wl_data_device*`/
+  `wl_data_offer` + `zwp_primary_selection_*` (clipboard round-trip),
+  `wl_subsurface` (sync/desync, pixel), `xdg_popup`/`xdg_positioner` (pixel),
+  `wl_data_device` DnD (full vertical).
+- **Implemented, not behaviorally tested**: `wl_region` (no-op stub);
+  `zwp_linux_dmabuf_feedback_v1` (exercised by real WSI clients, no automated
+  assertion).
+
+### Headless mode
+
+`addon.start(gpuBin, onFrame?, onInput?, { width, height })` spawns the GPU process
+`--headless WxH` (no host window/`wl_surface`/host seat), brings up the device only,
+skips `InjectSurface`/`Configure`/`Present`. The JS compositor renders into an
+owned offscreen BGRA8Unorm target; `JsCompositor.readback()` (exposed as
+`frameReadback()`) does `copyTextureToBuffer` + `mapAsync` → tightly-packed BGRA.
+The real launcher passes no headless arg → stays nested + presents on screen.
+
+### Known testing bugs / gaps
+
+- **`startServer`/`stopServer` is not safely repeatable in one process** — a second
+  lifecycle aborts with a libuv `uv__finish_close` assertion (uv handle teardown on
+  reuse in `native/wayland/server.cpp`). Worked around with one server lifecycle per
+  test file. Matters if a long-running compositor ever restarts its server; needs a
+  real fix.
+- No stdin command loop on the harness client for multi-step sequences
+  (raise/move/resize) within one client lifetime.
+- On-screen (nested) pixel correctness is not auto-asserted (no post-present
+  readback; inherited from the headless pixel tests, same render pass).
+
+## Config
+
+`src/config/` loads from `--config <path>` (hard error if missing) else
+`$XDG_CONFIG_HOME/overdraw/config.*` then `~/.config/overdraw/config.*`, probing
+`.ts/.cts/.mts/.js/.cjs/.mjs` (Node 24 native type-stripping, no transpile).
+Default export may be an object or a (sync/async) function. Validates
+`focus`/`output`; the launcher applies them. The `plugins` array is parsed,
+validated, resolved, and consumed by the runtime (module paths resolve relative to
+the config file's dir). The capability sub-grant schema is not yet validated (no
+capabilities exist to grant).
 
 ## Not yet built (design only)
 
-- **Live reload, WM / policy.** A real app can now map a window with both shm
-  and dmabuf content end-to-end (see the two "end-to-end" sections above). Still
-  missing: live handler reload; window management, focus, layout.
-- **WM / policy in JS.** Window management, focus, layout — none built.
-- **JS-owned core breadth.** The core is C++ + Node with a working trampoline
-  and a frame event callback, but the protocol-handler/WM/plugin layers that
-  "JS owns" per the design are unwritten.
-- **Plugin model.** Worker isolation, lifecycle, watchdog, restart policy (scope
-  B), AND the GPU producer/consumer surface path with `sdk.gpu` + `createOverlay`
-  ARE built and pixel-verified end to end (see "First plugin milestone COMPLETE").
-  Still NOT built: window/output/capture/input/protocol SDK surfaces;
-  decorations/insets/interactive-regions; capability grants/enforcement (the gpu
-  paths are handed to every plugin); the native-import restriction; sdk.onFrame
-  (animation uses a plugin-driven loop today); plugin-teardown resource release.
-  (Double-buffered animated overlays ARE built — see "First plugin milestone".)
-  The capture/takeover
-  design — one
-  producer/consumer primitive run in both directions (plugin-on-top vs.
-  plugin-captures/takes-over), capture uniform over the surface graph, the
-  reversed-OffscreenCanvas model, and the overview-animation worked example — is
-  recorded in architecture.md ("The producer/consumer primitive"). Unbuilt; also
-  presupposes a workspace/WM layer that does not exist yet. Build-order step (1)
-  of "First plugin milestone" (generic plugin-composited surfaces: overlay +
-  stack layers + producer/consumer ring) IS built. **The scoped first-decoration
-  milestone is now COMPLETE** (app_id-regex match, additive insets, plugin-drawn
-  decoration surface, atomic content gating + timeout/deregister) — see "Decoration
-  provider: registration + insets + drawing + atomic gating". REMAINING decoration
-  work, deferred to later milestones: real `xdg_toplevel` geometry + reconfigure
-  gating (the resize/layout milestone); `xdg-decoration` negotiation (so a CSD client
-  is not double-decorated); a capability gate on the decoration/window-observer tier;
-  reassign-on-app_id-change; interactive-region hit-testing; plugin-teardown wiring of
-  `unregisterPlugin`. Also still flagged: complete strict TypeScript types for the
-  plugin SDK + de-loosen the gpu-broker/protocol (a typed request map replacing the
-  `unknown`->`as` chain) — not yet done.
-- **Multi-surface / real compositing.** Multiple surfaces, transforms, opacity,
-  blending, client buffers, multi-output, damage — none done.
+- **WM / policy / layout.** Window management, focus rules, layout strategy — none
+  built; placement is a cascade stub. This is the gate for the `xdg_toplevel`
+  move/resize/maximize/fullscreen requests (currently no-ops) and for reconfigure
+  gating of decorations.
+- **`wl_output` reconfiguration + host-window resize.** See "Read first".
+- **Display-driven frame clock.** See "Read first" and architecture.md.
+- **Plugin SDK breadth.** Built: scope-B runtime + `sdk.gpu.createOverlay` +
+  `sdk.window` observer + `sdk.decorations`. Not built: window/output/capture/input/
+  protocol SDK surfaces; the capture/takeover direction of the producer/consumer
+  primitive (and the workspace/WM layer it presupposes); interactive-region hit-
+  testing; `sdk.onFrame` (animation uses a plugin-driven loop today).
+- **Capability enforcement.** No capability gate on `sdk.gpu`/`sdk.window`/
+  `sdk.decorations` (every plugin gets them); no native-import restriction (a
+  plugin's `import()` is unrestricted — deferred until there is an SDK native addon
+  to allowlist); no sub-grant schema/enforcement.
+- **Plugin teardown wiring.** `unregisterPlugin` exists in the broker but `main.ts`
+  does not call it on plugin exit; a crashed provider's registration lingers (its
+  gated windows are released by unmap/timeout).
+- **Strict typing of the plugin GPU broker.** `src/plugins/gpu-broker.ts` + `gpu.ts`
+  pass an `unknown` request bag cast field-by-field with `as` (passes lint via a
+  known loophole — eslint bans `as any`/`as unknown` but not `x as ConcreteType`).
+  A typed request map is wanted; not done.
 - **Cross-thread N-API marshaling.** `napi_threadsafe_function` for Dawn-thread
   callbacks not exercised.
-- **Crash recovery.** GPU-process respawn + state replay not implemented (the
-  teardown fix above de-risks part of it). A crash handler in the GPU process
-  dumps a backtrace to `/tmp` (added while debugging the dmabuf path).
-- **Phase 2 / Phase 3.** KMS/DRM, libinput, libseat, the session supervisor,
-  and XWayland are untouched.
+- **Crash recovery.** GPU-process respawn + state replay not implemented. A crash
+  handler in the GPU process dumps a backtrace to `/tmp/overdraw-gpu-crash.txt`.
+- **Linear compositing.** Alpha blending currently happens in sRGB space.
+- **Phase 2 / Phase 3.** KMS/DRM, libinput, libseat, the session supervisor, and
+  XWayland are untouched.
+- **Live reload.** Not built.
 
 ## Spikes
 
-Throwaway de-risking experiments live in `spikes/` (git-ignored). Their
-findings are folded into architecture.md; the code is not part of the build.
-Notable: stage3 (in-process host window + swapchain), stage4 (surface over the
-wire — the cross-process presentation proof).
+Throwaway de-risking experiments live in `spikes/` (git-ignored); findings are
+folded into architecture.md, the code is not part of the build.

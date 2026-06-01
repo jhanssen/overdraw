@@ -20,13 +20,11 @@ versus what is still design only, see `status.md`.
 - Wayland is the *external* protocol for normal clients (browsers,
   terminals, toolkit applications). Plugins do *not* use Wayland; they use
   an internal SDK.
-- Goal: run Wayland apps generally, **including** clients that present via a
+- Run Wayland apps generally, **including** clients that present via a
   Vulkan/EGL swapchain on their `wl_surface` (Vulkan WSI), not only clients
-  that submit shm/dmabuf buffers. WSI clients do not run yet — this is an
-  unbuilt feature, not a scope exclusion. See `status.md` ("Vulkan-WSI
-  clients do NOT run yet"). The rendering section below describes only the
-  buffer-submission path because that is what is designed/built so far; its
-  silence on WSI is not a decision to exclude it.
+  that submit shm/dmabuf buffers. WSI clients run (see `status.md` "Real
+  clients run end-to-end"). The rendering section below describes only the
+  buffer-submission path; its silence on WSI is not a decision to exclude it.
 
 ## Process topology
 
@@ -75,8 +73,7 @@ Two processes in v1: core and GPU. Phase 2 adds a small session supervisor.
   isolates with their own event loops and their own wire clients.
 - The renderer (per-output frame loop, compositing pass) runs on the
   main thread in JS, over the Dawn wire (IMPLEMENTED — see status.md
-  "Compositing pass runs in JS over the Dawn wire"; there is no C++
-  compositing pass). Running on the main thread is a v1 choice: it is a
+  "Compositing"; there is no C++ compositing pass). Running on the main thread is a v1 choice: it is a
   candidate for promotion to a dedicated worker thread (sharing the
   surface graph via `SharedArrayBuffer` + `Atomics`) if profiling shows
   GC pauses or protocol-traffic contention is hurting frame pacing.
@@ -114,13 +111,15 @@ Two processes in v1: core and GPU. Phase 2 adds a small session supervisor.
   - **Flush policy:** flush on `queue.submit` and at wire-internal sync
     points (callback returns, buffer-map completions). Per-call flushes
     are not used.
-  - **Backpressure:** blocking writes. A plugin that produces commands
-    faster than the GPU process drains will block in its `send()` call;
-    its Worker pauses. Other Workers and the core are unaffected.
-- **Side channel** unix socket between the core and the GPU process.
-  Length-prefixed frames; payload is flatbuffers. Fds attached via
-  SCM_RIGHTS in the same `sendmsg`, referenced from the payload by
-  index.
+  - **Backpressure:** fully non-blocking. All fds are `O_NONBLOCK`; a
+    writer buffers what the socket can't take and drains on writable, so a
+    write never parks (a single-threaded peer blocked in `write()` while the
+    other waits to be read is a mutual deadlock). See status.md "IPC".
+- **Side channel** unix socket(s) between the core and the GPU process.
+  Built as two `SOCK_SEQPACKET` sockets — one for control (fixed-size tagged
+  POD messages, `native/ipc/side_channel.h`), one dedicated to input — not
+  the length-prefixed flatbuffers framing originally sketched. Fds attached
+  via SCM_RIGHTS in the same `sendmsg`.
 - The side channel is line-of-sight to the GPU process; plugin workers
   do *not* speak to the GPU process directly except via the wire. All
   control traffic goes through the core.
@@ -415,8 +414,11 @@ superseded); a `SharedFence` from the producer's `EndAccess` is waited on in
 the consumer's `BeginAccess` (producer-done-before-consumer-read, on the GPU
 timeline, no CPU handshake); the buffer the consumer is reading returns to
 the producer's free pool once the consumer's sample submit completes. The
-two sides run on their own frame clocks, **one frame pipelined**, concurrent
-on separate `VkDevice`s (verified; see status.md "GPU process threading").
+two sides run on their own frame clocks, **one frame pipelined**, on separate
+`VkDevice`s. The cross-device dmabuf+fence handoff is verified in-process (see
+status.md "Cross-device dmabuf + fence"); running the per-connection devices
+*concurrently* (thread-per-connection) is designed but the GPU-process pump is
+single-threaded today (see status.md "GPU process threading").
 
 - **Contribution (forward):** plugin is producer, core is consumer. The
   core samples the plugin's latest presented buffer into its compositing
@@ -482,8 +484,8 @@ switch vblank) is a separate hard detail, distinct from the buffer sharing.
 
 A concrete, buildable target that turns the producer/consumer primitive into a
 real feature and is the foundation for decorations, overlays, panels, and HUDs
-(all of which become thin policy bundles on top of it). NOT yet built; this is
-the spec to implement. The guiding shape: **the plugin requests, the core
+(all of which become thin policy bundles on top of it). Largely built (see the
+build order below for what remains). The guiding shape: **the plugin requests, the core
 decides authoritative geometry and allocates, the plugin populates.** A plugin
 never invents surface sizes — it declares intent, the core computes the real
 rect (only it knows the window's outer rect, output size, layout) and hands
@@ -548,21 +550,25 @@ chosen layer), declaring insets and interactive regions." It carries a
 capture-like privilege (the provider sees every window's title/state), so it is
 gated deliberately like tier 3.
 
-Build order: (1) the generic plugin-surface producer/consumer primitive +
-`createOverlay` + the stack-layer model (prove one animated overlay composites
-on top, end to end); (2) the window-state event stream + `requestInsets` +
-interactive-region declaration + hit-test routing (this also forces the
-currently-no-op `xdg_toplevel` move/resize/maximize into real behavior -- see
-status.md "Protocol gaps"); (3) decorations as a thin policy bundle on top
-(bind a provider surface to each window's reserved insets). Each later step is
+Build order (current state annotated): (1) the generic plugin-surface
+producer/consumer primitive + `createOverlay` + the stack-layer model (prove one
+animated overlay composites on top, end to end) — **BUILT** (status.md "GPU SDK",
+"Stack layers + placement", "Cross-device dmabuf + fence"); (2) the window-state
+event stream + `requestInsets` + interactive-region declaration + hit-test routing
+— **PARTIAL**: the window-state stream + additive insets are built (status.md
+"Core event bus + window-state stream", "Decoration provider"), but
+interactive-region declaration + hit-test routing are NOT, and the currently-no-op
+`xdg_toplevel` move/resize/maximize this step is meant to force into real behavior
+remain no-ops (status.md "Read first: gaps in advertised protocols"); (3)
+decorations as a thin policy bundle on top (bind a provider surface to each
+window's reserved insets) — **BUILT** (status.md "Decoration provider"). Each later step is
 small once (1) is generic.
 
-### First decoration milestone (scoped to avoid throwaway work) — NOT BUILT
+### First decoration milestone (scoped to avoid throwaway work) — BUILT
 
-Step (1) above is built (see status.md "First plugin milestone COMPLETE"). The
-NEXT milestone is server-side window decorations drawn by a plugin. To avoid
-building anything the (undesigned) WM/layout model would force a rewrite of, this
-first cut is deliberately narrow:
+Server-side window decorations drawn by a plugin. Built end to end (see status.md
+"Plugins" → "Decoration provider"). Scoped deliberately narrow to avoid building
+anything the (undesigned) WM/layout model would force a rewrite of:
 
 - **Decoration-provider registration by `app_id` regex.** A plugin registers as a
   decoration compositor with a regex matched against a window's `app_id` (the
@@ -572,7 +578,7 @@ first cut is deliberately narrow:
 - **Fixed size — no `xdg_toplevel` geometry.** v1 uses the window's AS-MAPPED
   content size and does NOT send the client any configure/resize. This keeps
   decorations decoupled from the no-op `xdg_toplevel` resize/maximize path
-  (status.md "Protocol gaps"), which must NOT be implemented until the WM/layout
+  (status.md "Read first: gaps in advertised protocols"), which must NOT be implemented until the WM/layout
   policy is designed — otherwise that work is throwaway. Real resize/maximize +
   `xdg_toplevel` geometry is explicitly deferred to the layout-model milestone.
 - **Additive insets (outer grows, content unchanged).** `requestInsets(windowId,
@@ -587,9 +593,10 @@ first cut is deliberately narrow:
   disjoint regions, so the core may composite decoration-then-content or
   content-then-decoration; the decoration binds to a stack layer just behind/
   around its window's content.
-- **Window-state events needed for v1 are minimal:** `onMap(window)` with
-  `{ surfaceId, appId, rect }` and `onUnmap`. Resize/focus/title-change events are
-  deferred (the size is fixed, so a decorated window is static after map).
+- **Window-state events:** `onMap` / `onUnmap` / `onChange` (the last carrying
+  title/app_id/activated; see status.md "Core event bus + window-state stream").
+  Resize-driven re-decoration is deferred with the layout/geometry work (the size
+  is fixed, so a decorated window is otherwise static after map).
 - **`xdg-decoration` negotiation deferred.** v1 does NOT negotiate server- vs
   client-side decorations, so a client that draws its own CSD would get BOTH its
   CSD and the plugin frame. Acceptable for v1 (target `app_id`s known to be
@@ -1045,10 +1052,11 @@ session):
   channel; the client uses them to `Configure`. (In the spike the reservation
   itself accepted an empty caps struct since it only allocates a handle.)
 
-Not yet validated end-to-end: the final reserve-texture / inject-texture
-handshake (server injecting the dmabuf-backed texture at the client's reserved
-handle, client rendering into it). Deferred to the real implementation, which
-has Dawn's own Chrome/`dawn::node` reference for this exact flow.
+The reserve-texture / inject-texture handshake (server injecting the
+dmabuf-backed texture at the client's reserved handle, producer rendering into
+it) — flagged as "not yet validated" in the original spike — is now implemented
+and pixel-verified end to end, both for real client dmabufs and for the plugin
+overlay producer (status.md "Client buffers" → "dmabuf", "GPU SDK").
 
 ### Real Wayland client buffers
 
