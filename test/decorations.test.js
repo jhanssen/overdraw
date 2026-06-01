@@ -9,6 +9,8 @@ import assert from 'node:assert/strict';
 import { TypedBus } from '../dist/events/bus.js';
 import { WINDOW_EVENT, DECORATION_EVENT } from '../dist/events/types.js';
 import { createDecorationRegistry } from '../dist/decorations.js';
+import { createDecorationBroker } from '../dist/plugins/decoration-broker.js';
+import { createWm } from '../dist/wm/index.js';
 
 function setup() {
   const bus = new TypedBus();
@@ -108,4 +110,51 @@ test('regex flags are honored (case-insensitive)', () => {
   reg.register('p', '^term$', 'i');
   bus.emit(WINDOW_EVENT.map, mapEv(1, 'TERM'));
   assert.equal(assigned.length, 1);
+});
+
+// --- broker: requestInsets authorization -----------------------------------
+
+function brokerSetup() {
+  const bus = new TypedBus();
+  const sink = { setSurfaceLayout() {}, setStack() {} };
+  const wm = createWm(sink, { width: 1280, height: 720 });
+  const broker = createDecorationBroker({ bus, state: { wm }, emitToPlugin: () => {} });
+  return { bus, wm, broker };
+}
+
+test('requestInsets: assigned plugin gets the grant', () => {
+  const { bus, wm, broker } = brokerSetup();
+  broker.onRequest('deco', 'decoration.register', { pattern: 'app' });
+  const rect = wm.mapWindow(1, { resource: {} }, 200, 100);
+  bus.emit(WINDOW_EVENT.map, { surfaceId: 1, appId: 'app', title: null, rect });
+  const grant = broker.onRequest('deco', 'decoration.requestInsets',
+    { surfaceId: 1, insets: { top: 24, right: 0, bottom: 0, left: 0 } });
+  assert.deepEqual(grant.insets, { top: 24, right: 0, bottom: 0, left: 0 });
+  assert.deepEqual(grant.outerRect, { x: rect.x, y: rect.y - 24, width: rect.width, height: rect.height + 24 });
+});
+
+test('requestInsets: a plugin NOT assigned the window is rejected', () => {
+  const { bus, wm, broker } = brokerSetup();
+  broker.onRequest('deco', 'decoration.register', { pattern: 'app' });
+  const rect = wm.mapWindow(1, { resource: {} }, 200, 100);
+  bus.emit(WINDOW_EVENT.map, { surfaceId: 1, appId: 'app', title: null, rect });
+  assert.throws(
+    () => broker.onRequest('intruder', 'decoration.requestInsets',
+      { surfaceId: 1, insets: { top: 1, right: 1, bottom: 1, left: 1 } }),
+    /not assigned/);
+});
+
+test('requestInsets: unknown/unmapped surface is rejected', () => {
+  const { broker } = brokerSetup();
+  broker.onRequest('deco', 'decoration.register', { pattern: 'app' });
+  // never assigned -> auth check fails first
+  assert.throws(
+    () => broker.onRequest('deco', 'decoration.requestInsets',
+      { surfaceId: 99, insets: { top: 1, right: 1, bottom: 1, left: 1 } }),
+    /not assigned/);
+});
+
+test('register: invalid params rejected (missing pattern)', () => {
+  const { broker } = brokerSetup();
+  assert.throws(() => broker.onRequest('p', 'decoration.register', {}), /pattern/);
 });

@@ -126,3 +126,53 @@ test('windowAt: topmost window wins on overlap', () => {
   const hit = wm.windowAt(px, py);
   assert.equal(hit.surfaceId, 2, 'topmost (last-mapped) window is hit');
 });
+
+test('setInsets: additive grow -> outer rect grows, content unchanged', () => {
+  const addon = mockAddon();
+  const wm = createWm(addon, { width: 1920, height: 1080 });
+  wm.mapWindow(1, rec(1), 300, 200);   // content rect (0,0,300,200)
+  const grant = wm.setInsets(1, { top: 30, right: 5, bottom: 5, left: 5 });
+  assert.ok(grant);
+  assert.deepEqual(grant.insets, { top: 30, right: 5, bottom: 5, left: 5 });
+  // content unchanged
+  assert.deepEqual(grant.contentRect, { x: 0, y: 0, width: 300, height: 200 });
+  // outer = content grown: origin up-left by (left,top), size +(l+r, t+b)
+  assert.deepEqual(grant.outerRect, { x: -5, y: -30, width: 310, height: 235 });
+  // the window's content rect (wm state) is NOT modified by insets
+  assert.deepEqual(wm.state.windows[0].rect, { x: 0, y: 0, width: 300, height: 200 });
+});
+
+test('setInsets: clamps negative insets to zero', () => {
+  const addon = mockAddon();
+  const wm = createWm(addon, { width: 1920, height: 1080 });
+  wm.mapWindow(1, rec(1), 100, 100);
+  const grant = wm.setInsets(1, { top: -10, right: 0, bottom: 0, left: 0 });
+  assert.equal(grant.insets.top, 0);
+  assert.deepEqual(grant.outerRect, { x: 0, y: 0, width: 100, height: 100 });
+});
+
+test('setInsets: unknown surface -> undefined', () => {
+  const addon = mockAddon();
+  const wm = createWm(addon, { width: 1920, height: 1080 });
+  assert.equal(wm.setInsets(99, { top: 1, right: 1, bottom: 1, left: 1 }), undefined);
+});
+
+test('outerRectOf: returns grown rect with insets, content rect without', () => {
+  const addon = mockAddon();
+  const wm = createWm(addon, { width: 1920, height: 1080 });
+  wm.mapWindow(1, rec(1), 200, 100);
+  assert.deepEqual(wm.outerRectOf(1), { x: 0, y: 0, width: 200, height: 100 }, 'no insets -> content');
+  wm.setInsets(1, { top: 10, right: 0, bottom: 0, left: 0 });
+  assert.deepEqual(wm.outerRectOf(1), { x: 0, y: -10, width: 200, height: 110 });
+  assert.equal(wm.outerRectOf(99), undefined);
+});
+
+test('setInsets: replace -> second call sets new insets (not cumulative)', () => {
+  const addon = mockAddon();
+  const wm = createWm(addon, { width: 1920, height: 1080 });
+  wm.mapWindow(1, rec(1), 100, 100);
+  wm.setInsets(1, { top: 50, right: 0, bottom: 0, left: 0 });
+  const g = wm.setInsets(1, { top: 10, right: 0, bottom: 0, left: 0 });
+  assert.equal(g.insets.top, 10, 'replaced, not added');
+  assert.deepEqual(g.outerRect, { x: 0, y: -10, width: 100, height: 110 });
+});

@@ -16,6 +16,10 @@ import { TypedBus } from '../dist/events/bus.js';
 import { WINDOW_EVENT } from '../dist/events/types.js';
 import { PluginRuntime } from '../dist/plugins/index.js';
 import { createDecorationBroker } from '../dist/plugins/decoration-broker.js';
+import { createWm } from '../dist/wm/index.js';
+
+// Mock compositor sink: the WM pushes layout/stack here; we ignore it.
+const mockSink = () => ({ setSurfaceLayout() {}, setStack() {} });
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const fixture = (f) => pathToFileURL(join(__dirname, 'fixtures', 'plugins', f)).href;
@@ -33,9 +37,14 @@ async function waitForLog(logs, pred, timeoutMs = 3000) {
 
 test('decoration provider registers and is assigned a matching window', async () => {
   const bus = new TypedBus();
+  // Minimal compositor state with a real WM (for requestInsets). The window is
+  // mapped into the WM directly (no real client in this GPU-free e2e).
+  const wm = createWm(mockSink(), { width: 1280, height: 720 });
+  const state = { wm };
   let runtime = null;
   const broker = createDecorationBroker({
     bus,
+    state,
     emitToPlugin: (plugin, name, data) => { runtime?.emit(plugin, name, data); },
   });
 
@@ -54,15 +63,25 @@ test('decoration provider registers and is assigned a matching window', async ()
     }]);
     await waitForLog(logs, (l) => l === 'registered');
 
-    // A matching window maps. The registry assigns it and the runtime forwards
-    // decoration.assigned to the plugin.
-    const rect = { x: 10, y: 20, width: 200, height: 100 };
+    // A matching window maps. Map it into the WM too (so requestInsets can find
+    // it), then emit the bus event with the WM's rect. The registry assigns it and
+    // the runtime forwards decoration.assigned to the plugin.
+    const rect = wm.mapWindow(5, { resource: { __id: 5 } }, 200, 100);
     bus.emit(WINDOW_EVENT.map, { surfaceId: 5, appId: 'org.test.deco', title: 'Hi', rect });
     await waitForLog(logs, (l) => l.startsWith('ASSIGNED '));
 
     const ev = JSON.parse(logs.find((l) => l.startsWith('ASSIGNED ')).slice('ASSIGNED '.length));
     assert.deepEqual(ev, { surfaceId: 5, appId: 'org.test.deco', title: 'Hi', rect });
     assert.equal(broker.registry.assignmentOf(5), 'deco');
+
+    // The plugin requests insets on assignment; assert the granted geometry it
+    // logged (additive: outer = content grown by the titlebar inset).
+    await waitForLog(logs, (l) => l.startsWith('INSETS '));
+    const grant = JSON.parse(logs.find((l) => l.startsWith('INSETS ')).slice('INSETS '.length));
+    assert.deepEqual(grant.insets, { top: 24, right: 0, bottom: 0, left: 0 });
+    assert.deepEqual(grant.contentRect, rect);
+    assert.deepEqual(grant.outerRect,
+      { x: rect.x, y: rect.y - 24, width: rect.width, height: rect.height + 24 });
 
     // A non-matching window is not assigned (no further ASSIGNED log).
     bus.emit(WINDOW_EVENT.map, { surfaceId: 6, appId: 'other', title: null, rect });

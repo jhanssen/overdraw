@@ -145,6 +145,7 @@ if (config.plugins.length > 0) {
   // after a client maps, well after load).
   const decorationBroker = createDecorationBroker({
     bus,
+    state,
     emitToPlugin: (plugin, name, data) => { runtime?.emit(plugin, name, data); },
   });
 
