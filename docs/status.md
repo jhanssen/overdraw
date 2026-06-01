@@ -11,13 +11,14 @@ Last updated: 2026-05-31.
 These are wired/advertised but incomplete. A client may use them and get nothing,
 with no error. Worst-first.
 
-- **`xdg_toplevel` window-management requests are silent no-ops.** `move`,
+- **`xdg_toplevel` window-management *state* requests are silent no-ops.** `move`,
   `resize`, `set_maximized`/`unset`, `set_fullscreen`/`unset`, `set_minimized`,
   `set_min_size`/`set_max_size`, `show_window_menu`, `set_parent` are accepted and
-  ignored (no effect, no signal). Only `set_title`/`set_app_id` do anything. These
-  are gated on a real WM/policy layer that does not exist (placement is a cascade
-  stub; there is no maximize/fullscreen/interactive-move concept). They stay no-ops
-  until that lands, but they are advertised, so clients think they work.
+  ignored (no effect, no signal). Only `set_title`/`set_app_id` do anything. The WM
+  is a fixed master-stack tiler that owns all geometry, so these client-initiated
+  state requests have no meaning yet — there is no maximize/fullscreen/floating/
+  interactive-move concept. They stay no-ops until those land (M2: floating +
+  fullscreen + keybindings), but they are advertised, so clients think they work.
 
 - **`wl_output` is fabricated.** It advertises one monitor whose refresh (60Hz),
   scale (1), transform, geometry (0,0), physical size, and make/model are
@@ -170,18 +171,37 @@ instance; a wrapped device is borrowed, not destroyed). Built with
 - **Layers** (`background < below < content < above < overlay`), composited
   back-to-front. `content` holds windows + subsurfaces + popups (a single stack
   owner, `rebuildStackWithPopups`); other layers via `setLayerSurfaces`.
-- **Placement seam:** the compositor consumes geometry only via `CompositorSink`
-  (`setSurfaceLayout`, `setStack`). `src/wm/index.ts` owns the window list/stack
-  and pushes layout+order. `src/wm/placement.ts` is a cascade STUB — the one
-  throwaway policy piece, to be replaced by a real layout model without touching
-  the seam. `mapWindow` records the effective window size for hit-testing.
+- **Placement seam + tiling WM:** the compositor consumes geometry only via
+  `CompositorSink` (`setSurfaceLayout`, `setStack`). `src/wm/index.ts` owns the
+  window list/stack, computes tiles, and pushes layout+order + a sized configure.
+  `src/wm/placement.ts` is the layout policy — a **master-stack tiler** (dwm-style:
+  first window = master in a left column at `masterFraction`; the rest share the
+  right column as equal-height slices; a single window fills the output). It is the
+  replaceable policy seam (a future plugin-overridable layout or BSP replaces this
+  function without touching the seam). Params (`masterFraction`, `gap`) are passed
+  via `InstallOptions.layout` (interim config point).
+- **Geometry is compositor-owned (proactive configure).** A toplevel is inserted
+  into the layout at `get_toplevel` (becomes master), and the WM sends a sized
+  `xdg_toplevel.configure` immediately (before the client has content); existing
+  windows whose tiles changed are reconfigured too. The client renders at the
+  configured size; first content makes it drawable + focusable. Unmap reflows +
+  reconfigures the survivors. `ack_configure` records the acked size; the WM skips
+  redundant configures.
+- **Decoration insets are subtractive (outer-anchored).** The layout assigns the
+  on-screen OUTER tile; the content rect = outer shrunk by the decoration insets
+  (the client is reconfigured to the shrunk size). The decoration draws in the band
+  inside the outer tile, so it is always on-screen — fixing the prior additive model
+  where a window at (0,0) put its titlebar off-screen at negative y.
 - Swapchain present mode is **Mailbox** (non-blocking acquire); FIFO blocks
   `GetCurrentTexture` on the single command thread and stalls other wire work.
-- **Multi-surface verified** (headless pixel readback): two shm clients composite
-  at distinct cascaded positions; top-of-stack wins the overlap.
+- **Tiling verified** (headless pixel readback + query): 1/2/3 real clients tile to
+  the master-stack rects, fill their tiles via the configure→resize loop, do not
+  overlap, and survivors reflow on unmap.
 
 Still absent: per-surface transforms/opacity/rotation/scale, fractional scale,
-multi-output, damage, real WM/layout policy, resize handling.
+multi-output, damage, host-window/output resize (`wl_output` still fabricated),
+floating windows, fullscreen/maximize, workspaces/tags, compositor keybindings
+(no key interception yet — every key is forwarded to the focused client).
 
 ## Client buffers
 

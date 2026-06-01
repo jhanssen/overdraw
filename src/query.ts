@@ -16,9 +16,10 @@ export interface WindowSnapshot {
 
 export interface StateSnapshot {
   output: { width: number; height: number };
-  // Windows in back-to-front stack order (index 0 = bottom, last = top).
+  // Windows in WM layout order (index 0 = master/front; tiling does not overlap,
+  // so this is the layout order, not a z-stack).
   windows: WindowSnapshot[];
-  // surfaceIds in back-to-front draw order (mirror of the WM stack).
+  // surfaceIds in WM layout order (mirror of wm.state.windows).
   stack: number[];
   // Focused surface ids (or null). Pointer focus follows the pointer; keyboard
   // focus is governed by the seat's focus policy.

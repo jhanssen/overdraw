@@ -127,10 +127,12 @@ function brokerSetup(timeoutMs) {
   return { bus, wm, broker, emits, stacks };
 }
 
-// Map a matching window + assign it to provider `deco`. Returns the window rect.
+// Add + map a matching window and assign it to provider `deco`. Returns the
+// window's outer tile (where the decoration draws).
 function mapAssigned(bus, wm, broker, surfaceId = 1, appId = 'app') {
   broker.onRequest('deco', 'decoration.register', { pattern: appId });
-  const rect = wm.mapWindow(surfaceId, { resource: {} }, 200, 100);
+  wm.addWindow(surfaceId, { resource: {} });
+  const rect = wm.windowHasContent(surfaceId);
   bus.emit(WINDOW_EVENT.map, { surfaceId, appId, title: null, rect });
   return rect;
 }
@@ -141,7 +143,10 @@ test('createDecoration: assigned plugin gets the grant', () => {
   const grant = broker.onRequest('deco', 'decoration.createDecoration',
     { windowId: 1, insets: { top: 24, right: 0, bottom: 0, left: 0 } });
   assert.deepEqual(grant.insets, { top: 24, right: 0, bottom: 0, left: 0 });
-  assert.deepEqual(grant.outerRect, { x: rect.x, y: rect.y - 24, width: rect.width, height: rect.height + 24 });
+  // Subtractive model: the outer tile is unchanged (the on-screen tile the layout
+  // assigned); the decoration draws there and content shrinks inside it.
+  assert.deepEqual(grant.outerRect, { x: rect.x, y: rect.y, width: rect.width, height: rect.height });
+  assert.deepEqual(grant.contentRect, { x: rect.x, y: rect.y + 24, width: rect.width, height: rect.height - 24 });
 });
 
 test('createDecoration: a plugin NOT assigned the window is rejected', () => {
@@ -194,7 +199,8 @@ test('timeout: provider that never draws is deregistered + content released + no
   await new Promise((r) => setTimeout(r, 80));
   assert.equal(wm.isContentGated(1), false, 'content released (shown undecorated) on timeout');
   // provider deregistered: a new matching window is NOT assigned.
-  const rect2 = wm.mapWindow(2, { resource: {} }, 100, 100);
+  wm.addWindow(2, { resource: {} });
+  const rect2 = wm.windowHasContent(2);
   bus.emit(WINDOW_EVENT.map, { surfaceId: 2, appId: 'app', title: null, rect: rect2 });
   assert.equal(broker.registry.assignmentOf(2), undefined, 'provider deregistered after timeout');
   // plugin was told.

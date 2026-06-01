@@ -14,11 +14,12 @@ import { readdirSync } from "node:fs";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { dirname, join } from "node:path";
 
-import { createWm } from "../wm/index.js";
+import { createWm, type LayoutParams } from "../wm/index.js";
 import { queryState } from "../query.js";
 import { applySubsurfaces } from "../subsurfaces.js";
 import { unmapAndTeardownSurface } from "./wl_surface.js";
 import { rebuildStackWithPopups, maybeDismissGrabbedPopup } from "./xdg_popup.js";
+import { configureToplevel } from "./xdg_surface.js";
 import type { Addon, EventsByInterface, EventSenders } from "../types.js";
 import type { Ctx, CompositorState, FocusOptions, CompositorSink } from "./ctx.js";
 import { titleAppId } from "../query.js";
@@ -84,6 +85,9 @@ export interface InstallOptions {
   // to the plugin runtime and the clipboard layer subscribes to keyboard.focus.
   // Optional: GPU-free protocol tests can omit it (emits become no-ops).
   bus?: CompositorBus;
+  // Tiling layout parameters (master fraction, gaps). Interim config point until a
+  // real config system exists. Defaults to DEFAULT_LAYOUT (0.5 master, 0 gap).
+  layout?: LayoutParams;
 }
 
 // Wire the protocol layer onto a started server. `addon` is the native module
@@ -117,10 +121,21 @@ export async function installProtocols(
     serial() { return this.nextSerial++; },
   };
   if (opts.bus) state.bus = opts.bus;
+  // ctx is needed by the WM's ConfigureSink (configureToplevel) below; build it
+  // here. The handler factories receive the same ctx later.
+  const ctx: Ctx = { events, state, addon };
+  // ConfigureSink: the WM calls this to (re)configure a window to a content size.
+  // Resolve surfaceId -> xdg_surface record and send the sized configure.
+  const configureSink = (surfaceId: number, w: number, h: number): void => {
+    const xs = state.surfacesById?.get(surfaceId)?.xdgSurface;
+    if (xs?.toplevel) configureToplevel(ctx, xs, w, h);
+  };
   // The WM delegates its stack push to the full rebuild (windows interleaved with
   // their decorations + subsurfaces + popups via computeBaseStack), keeping
   // rebuildStackWithPopups the single owner of the content stack order.
-  state.wm = createWm(state.compositor, output, () => rebuildStackWithPopups(state));
+  state.wm = createWm(
+    state.compositor, output, () => rebuildStackWithPopups(state), configureSink, opts.layout,
+  );
   // State-query channel (tests / introspection): a GPU-free snapshot of
   // geometry / focus / stacking. See src/query.ts.
   state.query = () => queryState(state);
@@ -151,7 +166,11 @@ export async function installProtocols(
       if (s.role === "xdg_toplevel") {
         s.mapped = true;
         mappedAny = true;
-        const rect = state.wm?.mapWindow(id, s, width, height);
+        // Geometry was assigned proactively at get_toplevel (addWindow); first
+        // content just makes the window drawable + focusable. width/height (the
+        // committed buffer size) are ignored for placement — the tile is owned by
+        // the layout, not the client.
+        const rect = state.wm?.windowHasContent(id);
         if (rect) {
           state.seat?.focusWindow(id, s, rect);
           // Emit window.map. app_id/title may be null if the client set them after
@@ -229,7 +248,6 @@ export async function installProtocols(
     state.compositor.renderFrame?.();
   };
 
-  const ctx: Ctx = { events, state, addon };
   // Popup click-away dismissal: the seat calls this on a button press.
   state.dismissGrabbedPopup = (x, y) => maybeDismissGrabbedPopup(ctx, x, y);
 

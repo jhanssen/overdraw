@@ -1,45 +1,105 @@
-// Pure-unit tests for the window placement stub. No GPU, no Wayland, no addon.
-// placeWindow is a deterministic function of the WM state (window count +
-// output size); these tests pin its current cascade behavior.
+// Pure-unit tests for the master-stack layout engine. No GPU, no Wayland, no
+// addon. masterStackLayout is a deterministic function of (windowCount, output,
+// params); these pin the tiling geometry.
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 
-import { placeWindow } from '../dist/wm/placement.js';
+import { masterStackLayout, DEFAULT_LAYOUT } from '../dist/wm/placement.js';
 
-const CASCADE_STEP = 80;
+const OUT = { width: 1000, height: 600 };
 
-function wm(windowCount, output = { width: 1920, height: 1080 }) {
-  return { output, windows: new Array(windowCount).fill(null) };
-}
-
-test('placeWindow: first window at origin, size 0 (use content size)', () => {
-  const r = placeWindow(wm(0));
-  assert.deepEqual(r, { x: 0, y: 0, width: 0, height: 0 });
+test('empty: no windows -> no rects', () => {
+  assert.deepEqual(masterStackLayout(0, OUT), []);
 });
 
-test('placeWindow: each window cascades down-right by CASCADE_STEP', () => {
-  assert.deepEqual(placeWindow(wm(1)), { x: CASCADE_STEP, y: CASCADE_STEP, width: 0, height: 0 });
-  assert.deepEqual(placeWindow(wm(2)), { x: 2 * CASCADE_STEP, y: 2 * CASCADE_STEP, width: 0, height: 0 });
+test('single window fills the whole output (no gap)', () => {
+  const r = masterStackLayout(1, OUT);
+  assert.equal(r.length, 1);
+  assert.deepEqual(r[0], { x: 0, y: 0, width: 1000, height: 600 });
 });
 
-test('placeWindow: wraps within output bounds (modulo width-100 / height-100)', () => {
-  const out = { width: 500, height: 400 };
-  // n*step % (width-100): with width 500 -> mod 400; height 400 -> mod 300.
-  const n = 6; // 6*80 = 480
-  const r = placeWindow(wm(n, out));
-  assert.equal(r.x, 480 % 400); // 80
-  assert.equal(r.y, 480 % 300); // 180
+test('two windows: master left half, stack right half, full height', () => {
+  const r = masterStackLayout(2, OUT, { masterFraction: 0.5, gap: 0 });
+  assert.equal(r.length, 2);
+  // master: left 50%
+  assert.deepEqual(r[0], { x: 0, y: 0, width: 500, height: 600 });
+  // stack (one window): right 50%, full height
+  assert.deepEqual(r[1], { x: 500, y: 0, width: 500, height: 600 });
 });
 
-test('placeWindow: returns integer coordinates', () => {
-  const r = placeWindow(wm(3));
-  assert.equal(r.x, r.x | 0);
-  assert.equal(r.y, r.y | 0);
+test('three windows: master left, two equal stack slices on the right', () => {
+  const r = masterStackLayout(3, OUT, { masterFraction: 0.5, gap: 0 });
+  assert.equal(r.length, 3);
+  assert.deepEqual(r[0], { x: 0, y: 0, width: 500, height: 600 });
+  // stack column x=500 w=500, two equal-height slices (300 each)
+  assert.deepEqual(r[1], { x: 500, y: 0, width: 500, height: 300 });
+  assert.deepEqual(r[2], { x: 500, y: 300, width: 500, height: 300 });
 });
 
-test('placeWindow: degenerate tiny output does not produce NaN/Infinity', () => {
-  const r = placeWindow(wm(2, { width: 1, height: 1 }));
-  assert.ok(Number.isFinite(r.x));
-  assert.ok(Number.isFinite(r.y));
+test('stack slices tile the full column height with no crack (rounding -> last slice)', () => {
+  // height 601 / 3 stack windows would leave a remainder; last slice absorbs it.
+  const out = { width: 1000, height: 601 };
+  const r = masterStackLayout(4, out, { masterFraction: 0.5, gap: 0 });
+  const stack = r.slice(1);
+  // contiguous, no overlap, exactly fills [0, 601)
+  assert.equal(stack[0].y, 0);
+  for (let i = 1; i < stack.length; i++) {
+    assert.equal(stack[i].y, stack[i - 1].y + stack[i - 1].height);
+  }
+  const last = stack[stack.length - 1];
+  assert.equal(last.y + last.height, 601);
+});
+
+test('masterFraction controls the split', () => {
+  const r = masterStackLayout(2, OUT, { masterFraction: 0.6, gap: 0 });
+  assert.equal(r[0].width, 600);
+  assert.equal(r[1].x, 600);
+  assert.equal(r[1].width, 400);
+});
+
+test('masterFraction is clamped to [0.05, 0.95]', () => {
+  const lo = masterStackLayout(2, OUT, { masterFraction: 0, gap: 0 });
+  assert.ok(lo[0].width >= 1, 'master not collapsed to zero');
+  const hi = masterStackLayout(2, OUT, { masterFraction: 1, gap: 0 });
+  assert.ok(hi[1].width >= 1, 'stack not collapsed to zero');
+});
+
+test('gap insets the outer edge and separates tiles', () => {
+  const g = 10;
+  const r = masterStackLayout(2, OUT, { masterFraction: 0.5, gap: g });
+  // outer gap: usable area starts at (g, g), size (W-2g, H-2g) = (980, 580)
+  assert.equal(r[0].x, g);
+  assert.equal(r[0].y, g);
+  // master width = (usableW - g) * 0.5 = (980 - 10) * 0.5 = 485
+  assert.equal(r[0].width, 485);
+  assert.equal(r[0].height, 580);
+  // stack starts after master + a gap
+  assert.equal(r[1].x, g + 485 + g); // 505
+  assert.equal(r[1].height, 580);
+});
+
+test('all rects are integers', () => {
+  for (const n of [1, 2, 3, 5, 7]) {
+    for (const r of masterStackLayout(n, OUT, { masterFraction: 0.5, gap: 7 })) {
+      assert.equal(r.x, r.x | 0);
+      assert.equal(r.y, r.y | 0);
+      assert.equal(r.width, r.width | 0);
+      assert.equal(r.height, r.height | 0);
+    }
+  }
+});
+
+test('degenerate tiny output: no NaN/Infinity, non-negative sizes', () => {
+  for (const n of [1, 2, 4]) {
+    for (const r of masterStackLayout(n, { width: 1, height: 1 }, { masterFraction: 0.5, gap: 5 })) {
+      assert.ok(Number.isFinite(r.x) && Number.isFinite(r.y));
+      assert.ok(r.width >= 0 && r.height >= 0);
+    }
+  }
+});
+
+test('DEFAULT_LAYOUT is 0.5 fraction, 0 gap', () => {
+  assert.equal(DEFAULT_LAYOUT.masterFraction, 0.5);
+  assert.equal(DEFAULT_LAYOUT.gap, 0);
 });

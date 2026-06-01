@@ -17,9 +17,11 @@ import {
 const BTN_LEFT = 0x110;
 const skip = canRunGpu() ? false : "needs GPU + host Wayland (WAYLAND_DISPLAY unset)";
 
-test("client maps -> appears in query() with title/app_id/size", { skip }, async () => {
+test("client maps -> appears in query() with title/app_id; tiled to full output", { skip }, async () => {
   const c = await setupCompositor();
   try {
+    // Client requests 300x200 but tiling owns geometry: a single window fills the
+    // output regardless of the client's chosen buffer size.
     const { ready } = c.spawnClient(["--size", "300x200", "--title", "term", "--app-id", "foo"]);
     await ready;
     const snap = await c.waitFor(c.query, (s) => s.windows.length === 1, { what: "1 window" });
@@ -27,15 +29,15 @@ test("client maps -> appears in query() with title/app_id/size", { skip }, async
     assert.equal(w.title, "term");
     assert.equal(w.appId, "foo");
     assert.equal(w.role, "xdg_toplevel");
-    assert.equal(w.rect.width, 300);
-    assert.equal(w.rect.height, 200);
+    assert.equal(w.rect.width, c.dims.width, "single window tile width = output width");
+    assert.equal(w.rect.height, c.dims.height, "single window tile height = output height");
     assert.deepEqual(snap.stack, [w.surfaceId]);
   } finally {
     await c.teardown();
   }
 });
 
-test("two clients -> both windows, stack back-to-front in map order", { skip }, async () => {
+test("two clients -> both windows; newest is master (front of layout order)", { skip }, async () => {
   const c = await setupCompositor();
   try {
     const a = c.spawnClient(["--title", "a"]); await a.ready;
@@ -43,9 +45,12 @@ test("two clients -> both windows, stack back-to-front in map order", { skip }, 
     const b = c.spawnClient(["--title", "b"]); await b.ready;
     const snap = await c.waitFor(c.query, (s) => s.windows.length === 2, { what: "second window" });
     assert.equal(snap.stack.length, 2);
-    // Second-mapped is on top (last in back-to-front stack).
-    const top = snap.windows[snap.stack.length - 1];
-    assert.equal(top.title, "b");
+    // Master-stack: the most recently mapped window becomes master = front of the
+    // layout order (windows[0]).
+    assert.equal(snap.windows[0].title, "b", "newest window is master");
+    assert.equal(snap.windows[1].title, "a");
+    // Tiles do not overlap: master (left) + stack (right) partition the width.
+    assert.equal(snap.windows[0].rect.width + snap.windows[1].rect.width, c.dims.width);
   } finally {
     await c.teardown();
   }

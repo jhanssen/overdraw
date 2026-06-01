@@ -11,7 +11,9 @@
 
 import type { Resource } from "../types.js";
 import type { CompositorSink } from "../protocols/ctx.js";
-import { placeWindow } from "./placement.js";
+import { masterStackLayout, DEFAULT_LAYOUT, type LayoutParams } from "./placement.js";
+
+export type { LayoutParams } from "./placement.js";
 
 export interface Rect { x: number; y: number; width: number; height: number; }
 export interface Output { width: number; height: number; }
@@ -26,11 +28,17 @@ export interface SurfaceHandle { resource: Resource; }
 
 export interface Window {
   surfaceId: number;
-  // The CONTENT rect (where the client draws). Unchanged by decoration insets
-  // (additive insets: the client is never told; its content stays put).
+  // The CONTENT rect (where the client draws). In the tiling model this is the
+  // window's OUTER tile shrunk by its decoration insets: the layout owns the
+  // outer tile; decoration eats into it; the client is configured to `rect`.
   rect: Rect;
+  // The OUTER tile assigned by the layout (decoration-inclusive). On-screen by
+  // construction (the layout clamps to the output). Decoration draws here; the
+  // content rect sits inside it offset by the insets.
+  outer: Rect;
   surfaceRec: SurfaceHandle;
-  // Decoration insets reserved around this window (additive). Absent = none.
+  // Decoration insets reserved inside the outer tile. Absent = none (content ==
+  // outer).
   insets?: Insets;
   // The window-bound decoration surface id, if a decoration was created for this
   // window. computeBaseStack splices it directly BELOW this window's content id,
@@ -41,9 +49,19 @@ export interface Window {
   // out of the draw stack waiting for its decoration's first frame, so content +
   // decoration appear together (atomic). computeBaseStack skips gated windows.
   contentGated?: boolean;
+  // True once the client has committed presentable content (the map-on-first-
+  // content signal). A window is in the layout (and configured) from addWindow,
+  // but only drawn once it has content.
+  hasContent?: boolean;
 }
 
-export interface WmState { output: Output; windows: Window[]; }
+export interface WmState { output: Output; windows: Window[]; layout: LayoutParams; }
+
+// Configure sink: ask the protocol layer to send a sized configure to a window's
+// toplevel (xdg_toplevel.configure + xdg_surface.configure with a fresh serial).
+// Wired by installProtocols. The WM calls this whenever a window's content size
+// changes (layout recompute on add/remove, or inset change).
+export type ConfigureSink = (surfaceId: number, contentW: number, contentH: number) => void;
 
 // What setInsets grants back: the (possibly clamped) insets, the outer rect (the
 // decoration's region = content rect grown by the insets), and the content rect
@@ -52,18 +70,27 @@ export interface InsetGrant { insets: Insets; outerRect: Rect; contentRect: Rect
 
 export interface Wm {
   state: WmState;
-  mapWindow(surfaceId: number, surfaceRec: SurfaceHandle, contentW?: number, contentH?: number): Rect | undefined;
+  // Proactive: called at get_toplevel (role assignment), BEFORE the client has
+  // content. Inserts the window into the layout (as the new master), recomputes
+  // tiles for the whole set, and configures every window whose content size
+  // changed (including the new one). The window is not drawn until it commits
+  // content (windowHasContent). Returns the new window's content rect.
+  addWindow(surfaceId: number, surfaceRec: SurfaceHandle): Rect;
+  // The window committed its first presentable content: add it to the draw stack.
+  // Geometry was already assigned by addWindow. Returns the content rect, or
+  // undefined if the window is not tracked.
+  windowHasContent(surfaceId: number): Rect | undefined;
   unmapWindow(surfaceId: number): void;
   windowAt(x: number, y: number): Window | null;
-  // Reserve additive decoration insets around a mapped window. ADDITIVE: the
-  // window's OUTER rect = its as-mapped content rect grown by the insets; the
-  // content rect (and the client) are unchanged. Returns the granted geometry, or
-  // undefined if the surface is not a mapped window. The core may clamp the insets
-  // (v1 does not, but the contract allows it). Idempotent-replace: a second call
-  // sets the new insets.
+  // Reserve decoration insets INSIDE a window's outer tile. SUBTRACTIVE: the
+  // window's content rect = its outer tile shrunk by the insets, so the
+  // decoration is always on-screen (the outer tile is on-screen by construction).
+  // The client is reconfigured to the (shrunk) content size. Returns the granted
+  // geometry, or undefined if the surface is not a tracked window. Idempotent-
+  // replace: a second call sets the new insets.
   setInsets(surfaceId: number, insets: Insets): InsetGrant | undefined;
-  // The outer rect of a window (content grown by its insets), or the content rect
-  // when it has none. Used for decoration placement + (future) outer hit-testing.
+  // The outer tile of a window (the decoration's region), or the content rect when
+  // it has no insets. Used for decoration placement + (future) outer hit-testing.
   outerRectOf(surfaceId: number): Rect | undefined;
   // Content gating (decoration piece 3): hold a window's content out of the draw
   // stack (gated=true) until its decoration's first frame is ready, then release
@@ -78,88 +105,144 @@ export interface Wm {
   setDecorationSurface(windowId: number, decoSurfaceId: number | null): void;
 }
 
-// The outer rect = the content rect grown by the insets (additive): origin moves
-// up-left by (left, top); size grows by (left+right, top+bottom).
-function grow(content: Rect, i: Insets): Rect {
+// The content rect = the outer tile shrunk by the insets (subtractive): origin
+// moves down-right by (left, top); size shrinks by (left+right, top+bottom),
+// clamped non-negative. The decoration occupies the band between outer and content.
+function shrink(outer: Rect, i: Insets): Rect {
   return {
-    x: content.x - i.left,
-    y: content.y - i.top,
-    width: content.width + i.left + i.right,
-    height: content.height + i.top + i.bottom,
+    x: outer.x + i.left,
+    y: outer.y + i.top,
+    width: Math.max(0, outer.width - i.left - i.right),
+    height: Math.max(0, outer.height - i.top - i.bottom),
   };
 }
 
-export function createWm(compositor: CompositorSink, output: Output, rebuild?: () => void): Wm {
-  // windows: stack order, back-to-front.
+// The content rect for a window given its current outer tile + insets.
+function contentOf(win: Window): Rect {
+  return win.insets ? shrink(win.outer, win.insets) : { ...win.outer };
+}
+
+export function createWm(
+  compositor: CompositorSink,
+  output: Output,
+  rebuild?: () => void,
+  configure?: ConfigureSink,
+  layout: LayoutParams = DEFAULT_LAYOUT,
+): Wm {
+  // windows: layout/stack order. Index 0 is the master (front); a newly added
+  // window is inserted at the front (becomes master). Draw order is back-to-front
+  // = reverse of this list (master drawn last/on-top is NOT desired; see pushStack).
   const windows: Window[] = [];
-  const wm: WmState = { output, windows };
+  const wm: WmState = { output, windows, layout };
 
   function pushStack(): void {
     // Prefer the full rebuild (windows interleaved with their decorations +
     // subsurfaces + popups via computeBaseStack/rebuildStackWithPopups), the single
     // owner of the content stack. Without a hook (bare WM in GPU-free unit tests),
     // fall back to a direct setStack that still interleaves each window's decoration
-    // directly below its content, and skips gated windows.
+    // directly below its content, and skips gated/contentless windows.
     if (rebuild) { rebuild(); return; }
     const ids: number[] = [];
     for (const w of windows) {
-      if (w.contentGated) continue;
+      if (w.contentGated || !w.hasContent) continue;
       if (w.decorationSurfaceId !== undefined) ids.push(w.decorationSurfaceId);
       ids.push(w.surfaceId);
     }
     compositor.setStack(ids);
   }
 
+  // Recompute every window's outer tile from the current count + order, update
+  // content rects, push layout for windows that have content, and configure any
+  // window whose content size changed. The single place geometry is assigned.
+  function relayout(): void {
+    const tiles = masterStackLayout(windows.length, output, layout);
+    for (let i = 0; i < windows.length; i++) {
+      const win = windows[i];
+      const prevContent = contentOf(win);
+      win.outer = tiles[i];
+      const content = contentOf(win);
+      win.rect = content;
+      // Drawn position follows the content rect; only meaningful once mapped.
+      if (win.hasContent) {
+        compositor.setSurfaceLayout(win.surfaceId, content.x, content.y, content.width, content.height);
+      }
+      // Configure the client to the new content size if it changed.
+      if (configure && (content.width !== prevContent.width || content.height !== prevContent.height)) {
+        configure(win.surfaceId, content.width, content.height);
+      }
+    }
+  }
+
   return {
     state: wm,
 
-    // Called when a toplevel maps (first buffered commit). Assigns a rect via
-    // the placement policy, pushes it to native, adds to the top of the stack.
-    mapWindow(surfaceId, surfaceRec, contentW = 0, contentH = 0) {
-      if (windows.some((w) => w.surfaceId === surfaceId)) return; // already mapped
-      const rect = placeWindow(wm);
-      // The placement stub may leave size 0 (= use content size). Resolve the
-      // effective size so hit-testing (windowAt) has real bounds, while still
-      // letting native fall back to content size for drawing.
-      const effW = rect.width || contentW;
-      const effH = rect.height || contentH;
+    // Proactive: insert at the front (new window becomes master), recompute the
+    // whole layout, configure all windows whose content size changed. Geometry is
+    // assigned here, before the client has content.
+    addWindow(surfaceId, surfaceRec) {
+      const existing = windows.find((w) => w.surfaceId === surfaceId);
+      if (existing) return contentOf(existing); // idempotent
       const win: Window = {
         surfaceId,
-        rect: { x: rect.x, y: rect.y, width: effW, height: effH },
+        // Provisional sentinel (-1 size) so relayout() always detects a change for
+        // the new window and sends its first configure, even when its computed tile
+        // happens to match the output size (single-window case).
+        outer: { x: 0, y: 0, width: -1, height: -1 },
+        rect: { x: 0, y: 0, width: -1, height: -1 },
         surfaceRec,
       };
-      windows.push(win); // top of stack
-      compositor.setSurfaceLayout(surfaceId, rect.x, rect.y, rect.width, rect.height);
-      pushStack();
+      windows.unshift(win); // front = master
+      relayout();           // assigns outer/rect + configures the new window + reflows others
       return win.rect;
+    },
+
+    // First content commit: mark drawable + add to the stack. Geometry already set.
+    windowHasContent(surfaceId) {
+      const win = windows.find((w) => w.surfaceId === surfaceId);
+      if (!win) return undefined;
+      if (!win.hasContent) {
+        win.hasContent = true;
+        // Push its layout now that it is drawable, then (re)build the stack.
+        compositor.setSurfaceLayout(win.surfaceId, win.rect.x, win.rect.y, win.rect.width, win.rect.height);
+        pushStack();
+      }
+      return { ...win.rect };
     },
 
     unmapWindow(surfaceId) {
       const i = windows.findIndex((w) => w.surfaceId === surfaceId);
       if (i < 0) return;
       windows.splice(i, 1);
+      relayout();   // remaining windows reflow + get reconfigured
       pushStack();
     },
 
     setInsets(surfaceId, insets) {
       const win = windows.find((w) => w.surfaceId === surfaceId);
       if (!win) return undefined;
-      // v1: grant the requested insets verbatim (the contract allows clamping; a
-      // real layout policy may clamp e.g. side insets to zero when maximized).
       const granted: Insets = {
         top: Math.max(0, insets.top), right: Math.max(0, insets.right),
         bottom: Math.max(0, insets.bottom), left: Math.max(0, insets.left),
       };
+      const prevContent = contentOf(win);
       win.insets = granted;
-      const contentRect = { ...win.rect };
-      const outerRect = grow(contentRect, granted);
+      const contentRect = contentOf(win);
+      win.rect = contentRect;
+      const outerRect = { ...win.outer };
+      // Content shrank inside the fixed outer tile: reposition + reconfigure.
+      if (win.hasContent) {
+        compositor.setSurfaceLayout(win.surfaceId, contentRect.x, contentRect.y, contentRect.width, contentRect.height);
+      }
+      if (configure && (contentRect.width !== prevContent.width || contentRect.height !== prevContent.height)) {
+        configure(win.surfaceId, contentRect.width, contentRect.height);
+      }
       return { insets: granted, outerRect, contentRect };
     },
 
     outerRectOf(surfaceId) {
       const win = windows.find((w) => w.surfaceId === surfaceId);
       if (!win) return undefined;
-      return win.insets ? grow(win.rect, win.insets) : { ...win.rect };
+      return { ...win.outer };
     },
 
     setContentGated(surfaceId, gated) {

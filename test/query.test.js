@@ -36,8 +36,10 @@ function makeState(output = { width: 1920, height: 1080 }) {
       pending: {}, committed: { buffer: null }, xdgSurface, mapped: true,
     };
     surfaces.set(surfaceRes, surfaceRec);
+    (state.surfacesById ??= new Map()).set(id, surfaceRec);
     toplevels.set(toplevelRes, { resource: toplevelRes, xdgSurface, title, appId });
-    wm.mapWindow(id, surfaceRec, w, h);
+    wm.addWindow(id, surfaceRec);
+    wm.windowHasContent(id);
     return surfaceRec;
   }
 
@@ -66,18 +68,20 @@ test('queryState: windows with geometry, title, app_id, role', () => {
   assert.equal(win.appId, 'foot');
   assert.equal(win.role, 'xdg_toplevel');
   assert.equal(win.mapped, true);
-  assert.equal(win.rect.width, 300);
-  assert.equal(win.rect.height, 200);
+  // Tiling owns geometry: a single window fills the output (content size ignored).
+  assert.equal(win.rect.width, 1920);
+  assert.equal(win.rect.height, 1080);
 });
 
-test('queryState: stack order is back-to-front', () => {
+test('queryState: window order is layout order (master first)', () => {
   const { state, addToplevel } = makeState();
   addToplevel(1);
   addToplevel(2);
   addToplevel(3);
   const snap = queryState(state);
-  assert.deepEqual(snap.stack, [1, 2, 3]);
-  assert.deepEqual(snap.windows.map((w) => w.surfaceId), [1, 2, 3]);
+  // Each new window becomes master (inserted at the front); order is [3, 2, 1].
+  assert.deepEqual(snap.stack, [3, 2, 1]);
+  assert.deepEqual(snap.windows.map((w) => w.surfaceId), [3, 2, 1]);
 });
 
 test('queryState: reflects pointer + keyboard focus', () => {

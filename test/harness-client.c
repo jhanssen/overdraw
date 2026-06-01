@@ -34,6 +34,10 @@ static struct wl_output* output = NULL;
 static struct wl_surface* g_surface = NULL;
 static int surface_configured = 0;
 static volatile sig_atomic_t running = 1;
+// --fill-configured: track the latest configured content size so the client can
+// resize its buffer to fill the compositor-assigned tile (tiling WM path).
+static int fill_configured = 0;
+static int cfg_w = 0, cfg_h = 0;   // latest xdg_toplevel.configure size (0 = unset)
 
 static void onTerm(int sig) { (void)sig; running = 0; }
 
@@ -121,7 +125,11 @@ static void requestFrame(void) {
 static void wmPing(void* d, struct xdg_wm_base* b, uint32_t serial) { (void)d; xdg_wm_base_pong(b, serial); }
 static const struct xdg_wm_base_listener wmListener = { wmPing };
 
-static void tlConfigure(void* d, struct xdg_toplevel* t, int32_t w, int32_t h, struct wl_array* s) { (void)d;(void)t;(void)w;(void)h;(void)s; }
+static void tlConfigure(void* d, struct xdg_toplevel* t, int32_t w, int32_t h, struct wl_array* s) {
+    (void)d;(void)t;(void)s;
+    // Record the compositor-requested content size (0 means "client chooses").
+    if (w > 0 && h > 0) { cfg_w = w; cfg_h = h; }
+}
 static void tlClose(void* d, struct xdg_toplevel* t) { (void)d;(void)t; running = 0; }
 static void tlConfigureBounds(void* d, struct xdg_toplevel* t, int32_t w, int32_t h) { (void)d;(void)t;(void)w;(void)h; }
 static void tlWmCaps(void* d, struct xdg_toplevel* t, struct wl_array* c) { (void)d;(void)t;(void)c; }
@@ -154,6 +162,26 @@ static void regGlobal(void* data, struct wl_registry* reg, uint32_t name, const 
 static void regRemove(void* data, struct wl_registry* reg, uint32_t name) { (void)data;(void)reg;(void)name; }
 static const struct wl_registry_listener regListener = { regGlobal, regRemove };
 
+// Allocate a solid-color wl_buffer of the given size. Returns the buffer (and
+// leaks the pool/fd intentionally for the test client's lifetime, matching the
+// original single-buffer behavior). On failure returns NULL.
+static struct wl_buffer* make_solid_buffer(int w, int h, uint32_t color) {
+    if (w <= 0 || h <= 0) return NULL;
+    const int stride = w * 4;
+    const size_t poolSize = (size_t)stride * h;
+    int fd = memfd_create("overdraw-harness", 0);
+    if (fd < 0 || ftruncate(fd, poolSize) != 0) { perror("memfd"); return NULL; }
+    uint32_t* px = mmap(NULL, poolSize, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    if (px == MAP_FAILED) { perror("mmap"); close(fd); return NULL; }
+    for (int i = 0; i < w * h; ++i) px[i] = color;
+    munmap(px, poolSize);
+    struct wl_shm_pool* pool = wl_shm_create_pool(shm, fd, poolSize);
+    struct wl_buffer* buf = wl_shm_pool_create_buffer(pool, 0, w, h, stride, WL_SHM_FORMAT_ARGB8888);
+    wl_shm_pool_destroy(pool);  // the buffer holds its own ref to the mapping
+    close(fd);
+    return buf;
+}
+
 int main(int argc, char** argv) {
     const char* socket = NULL;
     const char* title = "harness";
@@ -169,6 +197,7 @@ int main(int argc, char** argv) {
         else if (strcmp(argv[i], "--title") == 0 && i + 1 < argc) title = argv[++i];
         else if (strcmp(argv[i], "--app-id") == 0 && i + 1 < argc) app_id = argv[++i];
         else if (strcmp(argv[i], "--frames") == 0) report_frames = 1;
+        else if (strcmp(argv[i], "--fill-configured") == 0) fill_configured = 1;
     }
     if (!socket) { fprintf(stderr, "usage: %s --socket NAME [--size WxH] [--color AARRGGBB] [--title T] [--app-id ID]\n", argv[0]); return 2; }
     if (W <= 0 || H <= 0) { fprintf(stderr, "[harness-client] bad size\n"); return 2; }
@@ -190,18 +219,6 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    const int stride = W * 4;
-    const size_t poolSize = (size_t)stride * H;
-    int fd = memfd_create("overdraw-harness", 0);
-    if (fd < 0 || ftruncate(fd, poolSize) != 0) { perror("memfd"); return 1; }
-    uint32_t* px = mmap(NULL, poolSize, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
-    if (px == MAP_FAILED) { perror("mmap"); return 1; }
-    for (int i = 0; i < W * H; ++i) px[i] = color;
-    munmap(px, poolSize);
-
-    struct wl_shm_pool* pool = wl_shm_create_pool(shm, fd, poolSize);
-    struct wl_buffer* buffer = wl_shm_pool_create_buffer(pool, 0, W, H, stride, WL_SHM_FORMAT_ARGB8888);
-
     struct wl_surface* surface = wl_compositor_create_surface(compositor);
     g_surface = surface;
     struct xdg_surface* xs = xdg_wm_base_get_xdg_surface(wm_base, surface);
@@ -212,7 +229,15 @@ int main(int argc, char** argv) {
     xdg_toplevel_set_app_id(toplevel, app_id);
 
     wl_surface_commit(surface);        // map: triggers configure
-    wl_display_roundtrip(display);     // receive configure, ack sent
+    wl_display_roundtrip(display);     // receive configure (sets cfg_w/h), ack sent
+
+    // In --fill-configured mode, adopt the compositor-assigned tile size so the
+    // client fills its tile (tiling WM path). Otherwise use the requested --size.
+    if (fill_configured && cfg_w > 0 && cfg_h > 0) { W = cfg_w; H = cfg_h; }
+
+    struct wl_buffer* buffer = make_solid_buffer(W, H, color);
+    if (!buffer) return 1;
+    int cur_w = W, cur_h = H;
 
     wl_surface_attach(surface, buffer, 0, 0);
     wl_surface_damage(surface, 0, 0, W, H);
@@ -242,6 +267,17 @@ int main(int argc, char** argv) {
     char inbuf[256];
     while (running) {
         wl_display_dispatch_pending(display);
+        // --fill-configured: if the compositor reconfigured us to a new tile size,
+        // reallocate a buffer at that size, ack, and recommit so we fill the tile.
+        if (fill_configured && cfg_w > 0 && cfg_h > 0 && (cfg_w != cur_w || cfg_h != cur_h)) {
+            struct wl_buffer* nb = make_solid_buffer(cfg_w, cfg_h, color);
+            if (nb) {
+                cur_w = cfg_w; cur_h = cfg_h;
+                wl_surface_attach(surface, nb, 0, 0);
+                wl_surface_damage(surface, 0, 0, cur_w, cur_h);
+                wl_surface_commit(surface);
+            }
+        }
         wl_display_flush(display);
         struct pollfd pfd[2] = { { wlfd, POLLIN, 0 }, { STDIN_FILENO, POLLIN, 0 } };
         if (poll(pfd, 2, 10) > 0) {
@@ -266,11 +302,9 @@ int main(int argc, char** argv) {
         }
     }
 
-    close(fd);
     xdg_toplevel_destroy(toplevel);
     xdg_surface_destroy(xs);
     wl_buffer_destroy(buffer);
-    wl_shm_pool_destroy(pool);
     wl_surface_destroy(surface);
     wl_display_roundtrip(display);
     xdg_wm_base_destroy(wm_base);

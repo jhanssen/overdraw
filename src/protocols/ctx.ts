@@ -178,6 +178,11 @@ export interface XdgSurfaceRecord {
   toplevel?: Resource;
   popup?: Resource;
   geometry?: { x: number; y: number; width: number; height: number };
+  // Tiling configure cycle: the content size the WM last asked this toplevel to
+  // adopt (sent via xdg_toplevel.configure). Used to avoid re-sending a configure
+  // for an unchanged size. Undefined until the WM has configured a size.
+  configuredWidth?: number;
+  configuredHeight?: number;
 }
 
 // An xdg_popup: a compositor-positioned child of a parent xdg_surface. The

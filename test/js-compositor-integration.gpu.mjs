@@ -18,7 +18,6 @@ function argbToBgra(argb) {
   const r = (argb >>> 16) & 0xff, g = (argb >>> 8) & 0xff, b = argb & 0xff, a = (argb >>> 24) & 0xff;
   return [b, g, r, a];
 }
-const BLACK = [0, 0, 0, 255];
 
 async function readWhenComposited(c, expect, tries = 60) {
   for (let i = 0; i < tries; i++) {
@@ -34,7 +33,9 @@ test("JS compositor (via protocol path): real shm client composites at its rect"
   try {
     const color = 0xff2080c0;
     const bgra = argbToBgra(color);
-    const { ready } = c.spawnClient(["--size", "300x200", "--color", color.toString(16)]);
+    // --fill-configured: the client resizes to its compositor-assigned tile (full
+    // output for a single window), proving the shmView upload path at tile size.
+    const { ready } = c.spawnClient(["--fill-configured", "--color", color.toString(16)]);
     await ready;
     const snap = await c.waitFor(c.query, (s) => s.windows.length === 1, { what: "window" });
     const w = snap.windows[0];
@@ -45,10 +46,9 @@ test("JS compositor (via protocol path): real shm client composites at its rect"
     assert.ok(px, "got a frame");
     assert.ok(pixelMatches(pixelAt(px, OUT.width, cx, cy), bgra, 4),
       `center should be the client color; got ${pixelAt(px, OUT.width, cx, cy)}`);
-    const ox = Math.min(OUT.width - 1, w.rect.x + w.rect.width + 100);
-    const oy = Math.min(OUT.height - 1, w.rect.y + w.rect.height + 100);
-    assert.ok(pixelMatches(pixelAt(px, OUT.width, ox, oy), BLACK, 4),
-      `outside should be black; got ${pixelAt(px, OUT.width, ox, oy)}`);
+    // The tile fills the output: a corner shows the client color too.
+    assert.ok(pixelMatches(pixelAt(px, OUT.width, 5, 5), bgra, 4),
+      `tile corner should be the client color; got ${pixelAt(px, OUT.width, 5, 5)}`);
   } finally {
     await c.teardown();
   }

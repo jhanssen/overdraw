@@ -6,7 +6,7 @@
 
 import { signature as toplevelSig } from "#protocols-gen/xdg_toplevel.js";
 import type { XdgSurfaceHandler } from "#protocols-gen/xdg_surface.js";
-import type { Ctx, PopupRecord } from "./ctx.js";
+import type { Ctx, PopupRecord, XdgSurfaceRecord } from "./ctx.js";
 import type { Resource } from "../types.js";
 import { configurePopup } from "./xdg_popup.js";
 
@@ -19,6 +19,25 @@ function packStates(states: number[]): Uint8Array {
   const buf = new ArrayBuffer(states.length * 4);
   new Uint32Array(buf).set(states);
   return new Uint8Array(buf);
+}
+
+// Send a sized configure to a toplevel: xdg_toplevel.configure(w, h, states) then
+// xdg_surface.configure(serial). The client renders at the given content size and
+// acks the serial. Records the configured size on the xdg_surface record so the
+// WM can skip redundant configures. This is the WM's ConfigureSink primitive.
+//
+// width/height are the CONTENT size (the client's drawable area). states currently
+// always carries `activated` (single-window focus model); maximized/fullscreen
+// states are added when those toplevel requests are implemented.
+export function configureToplevel(ctx: Ctx, xs: XdgSurfaceRecord, width: number, height: number): void {
+  if (!xs.toplevel) return;
+  const states = packStates([STATE.activated]);
+  ctx.events.xdg_toplevel.send_configure(xs.toplevel, Math.max(0, width | 0), Math.max(0, height | 0), states);
+  const serial = ctx.state.serial();
+  xs.lastConfigureSerial = serial;
+  xs.configuredWidth = width;
+  xs.configuredHeight = height;
+  ctx.events.xdg_surface.send_configure(xs.resource, serial);
 }
 
 export default function makeXdgSurface(ctx: Ctx): XdgSurfaceHandler {
@@ -34,15 +53,21 @@ export default function makeXdgSurface(ctx: Ctx): XdgSurfaceHandler {
       ctx.state.toplevels.set(toplevel, { resource: toplevel, xdgSurface: xs, title: null, appId: null });
       if (xs.surface) xs.surface.role = "xdg_toplevel";
 
-      // Initial configure handshake. Send the role configure first (0x0 =>
-      // client chooses its own size; states marks the lone window activated),
-      // then xdg_surface.configure with a serial. The client renders, then
-      // ack_configures the serial.
-      const states = packStates([STATE.activated]);
-      ctx.events.xdg_toplevel.send_configure(toplevel, 0, 0, states);
-      const serial = ctx.state.serial();
-      xs.lastConfigureSerial = serial;
-      ctx.events.xdg_surface.send_configure(resource, serial);
+      // Proactive tiling: insert the window into the layout NOW (before it has
+      // content) so the WM assigns its tile and configures it to the tiled content
+      // size. addWindow drives the ConfigureSink, which calls configureToplevel for
+      // this window (and reconfigures any existing windows whose tiles changed).
+      const surfaceId = xs.surface?.id;
+      if (surfaceId !== undefined && xs.surface && ctx.state.wm) {
+        // The WM's SurfaceHandle must carry the wl_surface record (its .resource is
+        // the wl_surface, used for subsurface child lookup in emitSubtree and for
+        // input/client-id routing), NOT the xdg_toplevel resource.
+        ctx.state.wm.addWindow(surfaceId, xs.surface);
+      } else {
+        // No WM (e.g. bare protocol unit tests): fall back to the 0x0 handshake so
+        // the client still completes its initial configure/ack.
+        configureToplevel(ctx, xs, 0, 0);
+      }
     },
     get_popup(resource, popup, parent, positioner) {
       const xs = rec(resource);
