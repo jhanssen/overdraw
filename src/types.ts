@@ -61,7 +61,7 @@ export interface Addon {
   acquireOutputTexture(): bigint | null;
   presentOutput(): void;
   shmView(poolId: number, offset: number, length: number): ArrayBuffer | null;
-  createTextureFromDmabuf(fd: unknown, w: number, h: number, fourcc: number,
+  createTextureFromDmabuf(fd: WaylandFd, w: number, h: number, fourcc: number,
                           modHi: number, modLo: number, offset: number, stride: number,
                           cb: (handle: bigint | null) => void): number;
   releaseDmabufImport(importId: number): void;
@@ -98,8 +98,6 @@ export interface Addon {
   // wl_shm_pool.destroy (Wayland spec).
   shmBufferRef(poolId: number): void;
   shmBufferUnref(poolId: number): void;
-
-  [key: string]: unknown; // tolerate methods not yet declared here
 }
 
 // Normalized input event delivered to the onInput callback (mirror of

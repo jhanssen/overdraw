@@ -44,6 +44,7 @@ struct Rect { r : vec4f, };
 
 import type { CompositorSink, Layer } from "../protocols/ctx.js";
 import { LAYER_ORDER } from "../protocols/ctx.js";
+import type { WaylandFd } from "../types.js";
 
 // Minimal slice of the native addon this module needs.
 export interface CompositorAddon {
@@ -52,7 +53,7 @@ export interface CompositorAddon {
   // importId (0 = could not start); cb(handle|null) fires on completion. `fd` is
   // a WaylandFd (the native side peeks it without consuming).
   createTextureFromDmabuf(
-    fd: unknown, w: number, h: number, fourcc: number, modHi: number, modLo: number,
+    fd: WaylandFd, w: number, h: number, fourcc: number, modHi: number, modLo: number,
     offset: number, stride: number, cb: (handle: bigint | null) => void): number;
   // Release a dmabuf import (drops the server STM + fd). Called once the buffer
   // is freed (GPU-completion-gated) or the surface is removed.
@@ -246,7 +247,7 @@ export class JsCompositor implements CompositorSink {
   // Import a client dmabuf (zero-copy) as a sampled texture and install it on the
   // surface. The import is async (server-side reserve/inject); on completion we
   // wrap the wire texture (dawn.node wrapTexture) and build the bind group.
-  commitSurfaceDmabuf(id: number, fd: unknown, w: number, h: number, fourcc: number,
+  commitSurfaceDmabuf(id: number, fd: WaylandFd, w: number, h: number, fourcc: number,
                       modHi: number, modLo: number, offset: number, stride: number,
                       bufferId: number): boolean {
     const dawn = this.dawn;

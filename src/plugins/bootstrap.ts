@@ -18,6 +18,7 @@ import { parentPort, workerData } from "node:worker_threads";
 import { Endpoint, channelFor } from "./protocol.js";
 import type { Json } from "./protocol.js";
 import { createSdk } from "./sdk.js";
+import type { PluginSdk } from "./sdk.js";
 import { createPluginGpu } from "./gpu.js";
 import type { PluginGpu } from "./gpu.js";
 
@@ -30,7 +31,7 @@ interface BootstrapData {
   dawnPath?: string;
 }
 
-type InitFn = (sdk: unknown) => unknown | Promise<unknown>;
+type InitFn = (sdk: PluginSdk) => unknown | Promise<unknown>;
 
 async function main(): Promise<void> {
   if (!parentPort) throw new Error("bootstrap must run as a Worker (no parentPort)");

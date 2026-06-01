@@ -24,7 +24,6 @@ export interface SurfaceRecord {
   mapped?: boolean;
   hasContent?: boolean;  // a buffer has been committed + uploaded at least once
   frameCallbacks?: Resource[];
-  [key: string]: unknown;
 }
 
 // The compositor operations the protocol/WM layer drives, abstracted so either
@@ -119,7 +118,6 @@ export interface CompositorState {
   primarySources?: Map<Resource, { mimes: string[] }>;
   primaryDevices?: Map<number, Set<Resource>>;
   primarySelection?: Resource | null;
-  [key: string]: unknown;
 }
 
 export interface SubsurfaceRecord {
