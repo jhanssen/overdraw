@@ -32,6 +32,11 @@ export interface Window {
   surfaceRec: SurfaceHandle;
   // Decoration insets reserved around this window (additive). Absent = none.
   insets?: Insets;
+  // The window-bound decoration surface id, if a decoration was created for this
+  // window. computeBaseStack splices it directly BELOW this window's content id,
+  // so each decoration is z-bound to its own window (a window on top occludes the
+  // decoration below it, just as it occludes the window below it). Absent = none.
+  decorationSurfaceId?: number;
   // Content gating (decoration milestone piece 3): true while the window is held
   // out of the draw stack waiting for its decoration's first frame, so content +
   // decoration appear together (atomic). computeBaseStack skips gated windows.
@@ -66,6 +71,11 @@ export interface Wm {
   // the injected rebuild hook. No-op if the surface is not a mapped window.
   setContentGated(surfaceId: number, gated: boolean): void;
   isContentGated(surfaceId: number): boolean;
+  // Bind a decoration surface to a window (or clear it with null). The decoration
+  // draws directly below its window's content in the unified stack (computeBaseStack),
+  // so it is z-bound to the window. Triggers a stack rebuild. No-op if the surface
+  // is not a mapped window.
+  setDecorationSurface(windowId: number, decoSurfaceId: number | null): void;
 }
 
 // The outer rect = the content rect grown by the insets (additive): origin moves
@@ -79,15 +89,25 @@ function grow(content: Rect, i: Insets): Rect {
   };
 }
 
-export function createWm(compositor: CompositorSink, output: Output): Wm {
+export function createWm(compositor: CompositorSink, output: Output, rebuild?: () => void): Wm {
   // windows: stack order, back-to-front.
   const windows: Window[] = [];
   const wm: WmState = { output, windows };
 
   function pushStack(): void {
-    // Gated windows (waiting for their decoration's first frame) are held out of
-    // the draw stack so content + decoration appear together.
-    compositor.setStack(windows.filter((w) => !w.contentGated).map((w) => w.surfaceId));
+    // Prefer the full rebuild (windows interleaved with their decorations +
+    // subsurfaces + popups via computeBaseStack/rebuildStackWithPopups), the single
+    // owner of the content stack. Without a hook (bare WM in GPU-free unit tests),
+    // fall back to a direct setStack that still interleaves each window's decoration
+    // directly below its content, and skips gated windows.
+    if (rebuild) { rebuild(); return; }
+    const ids: number[] = [];
+    for (const w of windows) {
+      if (w.contentGated) continue;
+      if (w.decorationSurfaceId !== undefined) ids.push(w.decorationSurfaceId);
+      ids.push(w.surfaceId);
+    }
+    compositor.setStack(ids);
   }
 
   return {
@@ -154,6 +174,15 @@ export function createWm(compositor: CompositorSink, output: Output): Wm {
     isContentGated(surfaceId) {
       const win = windows.find((w) => w.surfaceId === surfaceId);
       return win?.contentGated === true;
+    },
+
+    setDecorationSurface(windowId, decoSurfaceId) {
+      const win = windows.find((w) => w.surfaceId === windowId);
+      if (!win) return;
+      const next = decoSurfaceId === null ? undefined : decoSurfaceId;
+      if (win.decorationSurfaceId === next) return;   // no change
+      win.decorationSurfaceId = next;
+      pushStack();   // re-interleave the decoration below its window's content
     },
 
     // Topmost window containing the output-space point, or null.

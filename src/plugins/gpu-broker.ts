@@ -36,6 +36,8 @@ interface OverlaySurface {
   slots: number[];        // surfaceBufIds, indexed by ring-slot index
   consumerSlot: number;   // ring-slot index currently bracket-open for the consumer (-1)
   slotStates: SlotStates; // shared FREE/ACQUIRED/PRESENTED/DRAINING ownership (SAB)
+  alive: boolean;         // false once surface.destroy ran; pending deferred recycles
+                          // must bail (their slots may be freed by the teardown).
 }
 
 export interface GpuBrokerDeps {
@@ -88,26 +90,32 @@ export function createGpuBroker(deps: GpuBrokerDeps) {
         const width = p.width as number, height = p.height as number;
         const slots = (p.slots as number) ?? 2;
         const explicitRect = p.rect as { x: number; y: number; width: number; height: number } | undefined;
-        const handle = explicitRect
-          ? overlays.createAt(pluginName, (p.layer as OverlayLayer) ?? "above", explicitRect)
-          : overlays.create(pluginName, {
-              layer: (p.layer as OverlayLayer) ?? "overlay",
-              anchor: (p.anchor as OverlayAnchor) ?? "center", width, height, margin: p.margin as number,
-            });
+        const decorates = p.decorates as number | undefined;
+        // A decoration is WINDOW-BOUND: it draws directly below its window's content
+        // (z-bound to the window, via the WM stack), not on a flat layer. An overlay
+        // with an explicit rect goes on its requested flat layer; an anchored overlay
+        // is placed + clamped.
+        const handle = typeof decorates === "number" && explicitRect
+          ? overlays.createWindowBound(pluginName, explicitRect)
+          : explicitRect
+            ? overlays.createAt(pluginName, (p.layer as OverlayLayer) ?? "above", explicitRect)
+            : overlays.create(pluginName, {
+                layer: (p.layer as OverlayLayer) ?? "overlay",
+                anchor: (p.anchor as OverlayAnchor) ?? "center", width, height, margin: p.margin as number,
+              });
         // Shared slot-ownership state (SAB) for this surface's ring. Shared to the
         // Worker in the response; both sides agree on FREE/ACQUIRED/PRESENTED/
         // DRAINING via atomics (surface-slots.ts).
         const { sab, states } = createSlotStates(slots);
         const surf: OverlaySurface = {
           surfaceId: handle.surfaceId, width, height, slots: [], consumerSlot: -1,
-          slotStates: new SlotStates(sab),
+          slotStates: new SlotStates(sab), alive: true,
         };
         void states;
         surfaces.set(handle.surfaceId, surf);
         pendingAlloc.set(handle.surfaceId, { width, height, overlaySurfaceId: handle.surfaceId });
         // If this surface decorates a window, tell the decoration layer the link
         // (generic tag; the broker does not interpret it).
-        const decorates = p.decorates as number | undefined;
         if (typeof decorates === "number") onSurfaceAllocated(handle.surfaceId, decorates);
         return { overlayId: handle.surfaceId, rect: handle.rect, slotsSab: sab };
       }
@@ -150,9 +158,25 @@ export function createGpuBroker(deps: GpuBrokerDeps) {
           const prevBufId = surf.slots[prevIdx];
           surf.slotStates.demote(prevIdx);           // PRESENTED -> DRAINING (atomic)
           const recycle = (): void => {
+            // Bail if the surface was destroyed since this was queued: its slots may
+            // already be freed by the teardown, so touching them would fail (and a
+            // rejected producerBegin would otherwise be unhandled).
+            if (!surf.alive) return;
             addon.pluginSurfaceConsumerEnd(prevBufId);
-            void pProducerBegin(addon, prevBufId);
-            surf.slotStates.free(prevIdx);            // DRAINING -> FREE; wakes producer
+            // Reopen the producer bracket, THEN publish the slot as FREE. The FREE
+            // edge wakes the worker, which immediately CAS-acquires the slot and
+            // renders into it -- so the slot must NOT become claimable until its
+            // producer BeginAccess bracket is actually open on the GPU process, or
+            // the worker submits render commands with no open access bracket ("used
+            // in a submit without current access" on the producer device, which
+            // faults the worker wire). Gating free() on producerBegin's completion
+            // keeps the SAB FREE state and the GPU bracket state consistent.
+            pProducerBegin(addon, prevBufId).then(() => {
+              if (!surf.alive) return;                // destroyed while reopening
+              surf.slotStates.free(prevIdx);          // DRAINING -> FREE; wakes producer
+            }).catch((e: unknown) => {
+              console.warn(`[gpu-broker] producerBegin (recycle) failed:`, e);
+            });
           };
           if (compositor.afterCurrentFrame) compositor.afterCurrentFrame(recycle);
           else recycle();
@@ -161,6 +185,34 @@ export function createGpuBroker(deps: GpuBrokerDeps) {
         // (it filters for its own surfaces) so a first decoration frame can release
         // the gated content. Generic; the broker does not interpret it.
         onSurfacePresented(surf.surfaceId);
+        return null;
+      }
+      case "surface.destroy": {
+        const surfaceId = p.overlayId as number;
+        const surf = surfaces.get(surfaceId);
+        if (!surf) return null;   // already destroyed / unknown
+        // Mark dead NOW (synchronously) so any pending deferred recycle bails before
+        // touching slots the teardown is about to free.
+        surf.alive = false;
+        // Stop compositing it immediately (remove from its layer + the compositor's
+        // surface map), so no further frame samples it.
+        overlays.destroy(surfaceId);
+        // Free the ring's GPU resources AFTER the compositor submit that last sampled
+        // it completes (afterCurrentFrame) -- the currently-presented slot's consumer
+        // bracket is open and a GPU read may be in flight. Then, per slot: end any
+        // open consumer bracket and release the surfaceBuf (GPU process drops the
+        // dmabuf/STM/textures; core reclaims its reservation).
+        const slotBufIds = surf.slots.slice();
+        const heldConsumerBuf = surf.consumerSlot >= 0 ? surf.slots[surf.consumerSlot] : -1;
+        const teardown = (): void => {
+          if (heldConsumerBuf >= 0) addon.pluginSurfaceConsumerEnd(heldConsumerBuf);
+          for (const bufId of slotBufIds) addon.pluginReleaseSurfaceBuffer(bufId);
+          for (const bufId of slotBufIds) surfaceByBuf.delete(bufId);
+        };
+        if (compositor.afterCurrentFrame) compositor.afterCurrentFrame(teardown);
+        else teardown();
+        surfaces.delete(surfaceId);
+        pendingAlloc.delete(surfaceId);
         return null;
       }
       default:

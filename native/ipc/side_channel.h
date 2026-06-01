@@ -88,6 +88,10 @@ enum class Tag : uint8_t {
     ConsumerBeginDone = 'k',  // gpu->core: consumer bracket open (core may sample)
     ConsumerEnd   = 'v',  // core->gpu: consumer EndAccess (after sampling). GPU
                           //   holds the produced sync-fd for the next ProducerBegin.
+    ReleaseSurfaceBuf = 'D',  // core->gpu: destroy a ring slot's surfaceBuf -- end any
+                          //   open access bracket, drop the SharedTextureMemory/textures/
+                          //   fences, release the GBM dmabuf. Fire-and-forget (the core
+                          //   has already gated this on its own GPU read completing).
     Shutdown     = 'X',  // core -> gpu : clean termination request
 };
 

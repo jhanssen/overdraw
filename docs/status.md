@@ -4,7 +4,7 @@ Tracks what is built and empirically proven versus what is still design only.
 The design itself lives in `architecture.md`; this file is the ground truth for
 "what exists right now."
 
-Last updated: 2026-05-31 (rev 34).
+Last updated: 2026-05-31 (rev 35).
 
 ## Protocol gaps & skeletons (READ FIRST)
 
@@ -56,8 +56,11 @@ All "proven" claims below were exercised on:
   595.71.05, Vulkan backend.
 - A live host Wayland session (`wayland-1`), overdraw running nested as a
   client of it.
-- Dawn wire release `jhanssen/dawn` `v20260529-linux-wayland-wire-alpha2`
-  (commit `7af36c56902d10775e2229b2f1491f2a38bb476b`).
+- Dawn wire release `jhanssen/dawn` `v20260531-linux-wayland-wire-alpha2`
+  (commit `6cfd29c89bd608f5fc5192e5ec49d32e939f74c8`). Adds the SharedFence
+  object-tracking fix (see "Decoration surface teardown" below): without it,
+  imported `SharedFence`s were never tracked in the device object list, so their
+  `DestroyImpl` never ran and the imported sync-fd leaked per fence.
 
 Single machine, single driver. Nothing here is proven portable yet.
 
@@ -1014,6 +1017,106 @@ can never make a window permanently invisible. Pixel-verified + safety-path veri
     released by the unmap path or the timeout, but its registration lingers.
   - **Additive insets only** (shrink-content form needs client configure, deferred
     with resize). Border region not hit-tested (interactive regions later).
+  - Per-window z-binding, surface teardown, and the teardown crash/leak fixes are
+    in the next section ("Decoration surface teardown + lifecycle fixes").
+
+### Decoration surface teardown + lifecycle fixes — BUILT, tested
+
+This closes the four open items from the (now-removed) decoration-teardown handoff:
+per-window decoration z-binding, ring teardown on unmap, two teardown-race crashes,
+and the GPU-process sync-fd leak. Committed (`7e39fb6`); the Dawn-side dependency is
+published (see "Verification environment").
+
+- **Per-window decoration z-binding (was BUG 3 — occlusion).** Decorations used to
+  sit on the flat global `below` layer, so `drawOrder()` emitted ALL decorations
+  then ALL content (`decoA, decoB, A, B`): with two cascading windows, the upper
+  window's content drew over the lower window's decoration, and a window's own
+  decoration could be hidden by another window's content even where it shouldn't be.
+  Now each decoration is z-bound to its window: `Window.decorationSurfaceId`
+  (`src/wm/index.ts`), spliced directly BELOW its window's content id in
+  `computeBaseStack` (`src/subsurfaces.ts`) so the unified order is `decoA, A, decoB,
+  B`. Window-bound surfaces use a new `overlays.createWindowBound` (assigns id +
+  layout, NOT placed on any flat layer — the WM stack owns z-order); the gpu-broker
+  routes `surface.alloc` with a `decorates` tag through it; the decoration broker
+  sets/clears the WM binding on alloc/unmap. Output-anchored OVERLAYS still use the
+  flat layers. The WM's `pushStack` now delegates to the full `rebuildStackWithPopups`
+  so decorations + subsurfaces + popups have a single stack owner.
+  Verified: `test/decoration-occlusion.gpu.mjs` — two cascading decorated windows,
+  pixel-verifies the top window's titlebar shows over the lower window's content
+  (the decisive point that was RED/occluded with the flat layer, now BLUE). The test
+  was confirmed to FAIL against the old flat-layer behavior before the fix.
+
+- **Surface teardown on unmap.** `Surface.destroy()` (worker) -> gpu-broker
+  `surface.destroy` (stop compositing immediately via `overlays.destroy`; mark the
+  `OverlaySurface.alive=false`; then, gated on `afterCurrentFrame`, end the held
+  consumer bracket + `pluginReleaseSurfaceBuffer` per slot) -> GPU-process
+  `ReleaseSurfaceBuf` (end open brackets, drop STM/textures/fences, `alloc.release`
+  the dmabuf). The decoration plugin destroys its surface on `sdk.window.onUnmap`.
+
+- **`window.unmap` now fires on client DISCONNECT, not just explicit destroy (was
+  part of BUG 1).** `window.unmap` was emitted ONLY from the explicit
+  `wl_surface.destroy` REQUEST handler. A client that disconnects/crashes without
+  first destroying its wl_surface has the resource torn down by libwayland's destroy
+  *listener*, which only marked the JS wrapper `destroyed` — the protocol `destroy`
+  handler never ran, so no `window.unmap`, so a decoration provider's `onUnmap`
+  never fired and its ring (+ imported fences) leaked. Fix: an idempotent
+  `unmapAndTeardownSurface(state, s)` (`src/protocols/wl_surface.ts`, guarded by
+  `SurfaceRecord.unmapped`) used by BOTH the explicit destroy request AND a new
+  per-frame resource-destroyed sweep in `src/protocols/index.ts` (detects surfaces
+  whose `resource.destroyed` is set but not yet `unmapped`). Idempotent, so an
+  explicit unmap-then-disconnect does NOT double-emit. Proven by per-window
+  map/unmap emission logging: leaked windows had mapped with no matching unmap; with
+  the sweep, 10 map/unmap-by-disconnect cycles hold the GPU sync-fd count flat.
+
+- **Producer-bracket recycle race (crash) FIXED.** The ring's slot recycle published
+  a slot FREE (`slotStates.free`) BEFORE its producer `BeginAccess` bracket was
+  reopened — the freed slot woke the worker, which CAS-acquired it and submitted
+  render commands before the GPU process opened the bracket → `dawn err 2: Texture
+  used in a submit without current access` on the producer device → worker wire fault
+  → crash + restart. Fix (`src/plugins/gpu-broker.ts`): gate `free()` on
+  `pProducerBegin().then(...)` so a slot becomes claimable only once its producer
+  bracket is actually open. Diagnosed by gdb/repro (the dawn error is on the WORKER
+  device), not theory; an aggressive multi-window repro went crash→clean.
+
+- **Teardown FATAL under load FIXED (was BUG 2).** `runtime.stop()` sent `shutdown`
+  then immediately `worker.terminate()`; the plugin's async render loop + the GPU
+  pump kept issuing wire/device work, so terminate killed the thread mid-submit →
+  dawn.node `ThrowAsJavaScriptException` (no JS frame) FATAL, ~1-in-20 back-to-back.
+  Fix: `createPluginGpu` returns `stop()`; the bootstrap's `shutdown` handler calls
+  it BEFORE running onShutdown (stops the pump; `getCurrentTexture()` parks,
+  `present()` no-ops) so the Worker is quiesced before termination. Diagnosed from
+  the captured native+JS stack (the throw is in the plugin Worker's `drawFrame` ->
+  `queue.submit`). Verified: 80/80 back-to-back `example-decoration.gpu.mjs` runs, 0
+  FATAL (was ~1-in-20).
+
+- **GPU-process sync-fd leak FIXED (was BUG 1).** Root cause was in DAWN, found with
+  an LD_PRELOAD `dup`/`close` tracer (reuse-proof, syscall-level — the only thing
+  that cut through fd-number + object-pointer reuse): `SharedFenceBase`'s
+  constructor never called `GetObjectTrackingList()->Track(this)`, unlike every other
+  ApiObject. Untracked → `Untrack()` returns false when the last ref drops →
+  `DestroyImpl()` is skipped → the imported sync-fd (`SharedFenceVk::mHandle`) is
+  never closed. This leaked an `anon_inode:sync_file` fd per imported fence — every
+  frame, unbounded. Fixed in the Dawn fork (published commit `6cfd29c89b`,
+  `v20260531-linux-wayland-wire-alpha2`). The per-window decoration ring leak on top
+  of this was the disconnect-unmap gap above (no teardown → ring + held fences never
+  released). With both fixed, sync-fd count is flat across map/unmap cycles.
+  NOTE on the test: `test/decoration-teardown.gpu.mjs`'s fd assertion now samples
+  `fdBefore`/`fdAfter` at QUIESCENT points (brief no-render settle) — the renderer/
+  driver keep a stable in-flight `sync_file` working set (~8-10 during active
+  animation), so a leak check must compare like-for-like, not a pre-animation count
+  vs a mid-animation count (the old assertion did, and falsely flagged the working
+  set as a leak).
+  Verified: `test/decoration-teardown.gpu.mjs` PASS 3/3 (fd back to quiescent
+  baseline after teardown); full decoration + overlay GPU suite + the existing
+  `js-compositor-dmabuf-leak.gpu.mjs` PASS against the published Dawn build;
+  GPU-free 115/115; no leaked GPU processes.
+
+- **REVERTED (kept out — unverified / not the fix):** earlier attempts to force the
+  imported handles closed at teardown — explicit `texture.destroy()` of the wrapped
+  wire textures (caused intermittent fatal dawn.node throws), a `dawn::native::
+  FlushPendingDeletions` API, and releasing (vs reclaiming) the reserved consumer/
+  producer wire textures to drop the wire-server inject-AddRef — were all reverted.
+  The SharedFence-tracking + disconnect-unmap fixes were sufficient; these were not.
 
 ### Plugin GPU reply-dispatch race FIXED (post-init surface ops no longer hang)
 A pre-existing race in the core's plugin-GPU reply dispatch (`native/napi/addon.cpp`):

@@ -78,6 +78,9 @@ class Compositor {
     // not freed by mistake). Called when the JS compositor frees the buffer (its
     // last sampling frame completed) or the surface is removed. No-op if unknown.
     void releaseDmabufImport(uint32_t importId);
+    // Destroy a plugin ring slot's surfaceBuf on the GPU process + reclaim the
+    // core-side reservation/status. Caller gates on the consumer GPU read completing.
+    void releaseSurfaceBuf(uint32_t surfaceBufId);
 
     // linux-dmabuf-v1 default-feedback data captured from the GPU process during
     // bring-up. `formatTableFd` is an owned read-only memfd of 16-byte

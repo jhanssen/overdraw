@@ -140,11 +140,15 @@ export default async function init(sdk) {
     if (w) w.active = ev.activated;
   });
 
-  // Stop animating a window when it unmaps. (No onUnmap on sdk.decorations; use the
-  // window observer.) The core releases the surface on plugin teardown.
+  // When a decorated window unmaps: stop animating AND destroy the decoration
+  // surface, so the core stops compositing it (otherwise its last frame lingers
+  // where the window was) and frees the ring's GPU resources.
   sdk.window.onUnmap((ev) => {
     const w = windows.get(ev.surfaceId);
-    if (w) { w.running = false; windows.delete(ev.surfaceId); }
+    if (!w) return;
+    w.running = false;
+    windows.delete(ev.surfaceId);
+    void w.surface.destroy();
   });
 
   // If the core deregisters us (e.g. we missed a first-frame deadline), stop.

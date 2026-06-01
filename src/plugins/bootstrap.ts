@@ -48,12 +48,19 @@ async function main(): Promise<void> {
   // (i.e. the plugin has the `gpu` capability). Keeps a steady-state pump going.
   let gpu: PluginGpu | undefined;
   let makeRingSurface: RingMaker | undefined;
+  // Quiesce the GPU layer + stop the pump on shutdown, BEFORE the core terminates
+  // the Worker. Without this, a plugin's still-running render loop (and the pump)
+  // keep issuing wire/device work into a wire being torn down, and worker.terminate()
+  // kills the thread mid-submit -> dawn.node throws fatally (ThrowAsJavaScriptException
+  // with no JS frame). No-op when the plugin has no GPU.
+  let stopGpu: () => void = () => {};
   if (pluginAddonPath && dawnPath) {
     const g = await createPluginGpu(endpoint, pluginAddonPath, dawnPath);
     gpu = g.gpu;
     makeRingSurface = g.makeRingSurface;
     const t = setInterval(g.pump, 4);  // keep the plugin wire flowing
     t.unref?.();
+    stopGpu = () => { clearInterval(t); g.stop(); };
   }
 
   // Window-state observation (sdk.window.onMap/onUnmap). The core pushes window.*
@@ -71,7 +78,15 @@ async function main(): Promise<void> {
   // The only request the core sends in scope B is 'shutdown'. Run the registered
   // onShutdown callback; resolving lets the core proceed to terminate.
   endpoint.handleRequests(async (method): Promise<Json> => {
-    if (method === "shutdown") { await control.runShutdown(); return null; }
+    if (method === "shutdown") {
+      // Quiesce GPU FIRST (stop the pump + park surface ops), then run the plugin's
+      // onShutdown, so by the time the core terminates the Worker no GPU/wire work is
+      // in flight. Order matters: stopping GPU before onShutdown means a plugin loop
+      // awaiting getCurrentTexture parks instead of racing teardown.
+      stopGpu();
+      await control.runShutdown();
+      return null;
+    }
     throw new Error(`unknown request method '${method}'`);
   });
 

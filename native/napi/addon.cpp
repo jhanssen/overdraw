@@ -702,6 +702,16 @@ napi_value PluginSurfaceConsumerEnd(napi_env env, napi_callback_info info) {
     return nullptr;
 }
 
+// pluginReleaseSurfaceBuffer(surfaceBufId): destroy a ring slot's surfaceBuf (GPU
+// process frees the dmabuf/STM/textures; core reclaims its reservation). The JS
+// caller has gated this on the consumer's GPU read completing. Fire-and-forget.
+napi_value PluginReleaseSurfaceBuffer(napi_env env, napi_callback_info info) {
+    if (!g_addon.compositor) return nullptr;
+    napi_value argv[1]; uint32_t id = arg0u32(env, info, argv, 1);
+    g_addon.compositor->releaseSurfaceBuf(id);
+    return nullptr;
+}
+
 // Pending JS dmabuf-import callbacks, keyed by importId. The callback fires once
 // when the import completes (or fails), then the ref is released.
 std::unordered_map<uint32_t, napi_ref> g_jsImportCbs;
@@ -1411,6 +1421,7 @@ napi_value Init(napi_env env, napi_value exports) {
     reg("pluginSurfaceProducerBegin", PluginSurfaceProducerBegin);
     reg("pluginSurfaceConsumerBegin", PluginSurfaceConsumerBegin);
     reg("pluginSurfaceConsumerEnd", PluginSurfaceConsumerEnd);
+    reg("pluginReleaseSurfaceBuffer", PluginReleaseSurfaceBuffer);
 
     napi_set_named_property(env, exports, "start", fnStart);
     napi_set_named_property(env, exports, "stop", fnStop);

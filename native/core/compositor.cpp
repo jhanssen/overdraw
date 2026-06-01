@@ -229,6 +229,23 @@ void Compositor::releaseDmabufImport(uint32_t importId) {
     jsImportHandles_.erase(it);
 }
 
+void Compositor::releaseSurfaceBuf(uint32_t surfaceBufId) {
+    // Tell the GPU process to destroy the slot's surfaceBuf (end brackets, drop
+    // STM/textures/fences, release the dmabuf). The caller (JS gpu-broker) has
+    // already gated this on the consumer's GPU read completing.
+    ipc::Message m{};
+    m.tag = ipc::Tag::ReleaseSurfaceBuf;
+    m.surfaceBufId = surfaceBufId;
+    ipc::sendMessage(ctrlFd_, m);
+    auto rit = coreSurfaceReservations_.find(surfaceBufId);
+    if (rit != coreSurfaceReservations_.end()) {
+        link_->client().ReclaimTextureReservation(rit->second);
+        coreSurfaceReservations_.erase(rit);
+    }
+    surfaceBufAllocated_.erase(surfaceBufId);
+    surfaceBeginDone_.erase(surfaceBufId);
+}
+
 void Compositor::takeCompletedJsImports(std::vector<JsImportDone>& out) {
     out.insert(out.end(), std::make_move_iterator(completedJsImports_.begin()),
                std::make_move_iterator(completedJsImports_.end()));

@@ -10,7 +10,7 @@
 // parent commit atomically applies the parent + all its synchronized descendants.
 
 import type { WlSurfaceHandler } from "#protocols-gen/wl_surface.js";
-import type { Ctx, SurfaceRecord, SubsurfaceRecord } from "./ctx.js";
+import type { Ctx, CompositorState, SurfaceRecord, SubsurfaceRecord } from "./ctx.js";
 import type { Resource } from "../types.js";
 import { applySubsurfaces } from "../subsurfaces.js";
 import { WINDOW_EVENT } from "../events/types.js";
@@ -169,19 +169,28 @@ export default function makeSurface(ctx: Ctx): WlSurfaceHandler {
     },
     destroy(resource) {
       const s = rec(resource);
-      if (s) {
-        // Emit window.unmap before tearing down, so a mapped toplevel being
-        // destroyed produces an unmap. Gated on mapped + toplevel role to mirror
-        // window.map. Drop any pending coalesced changes for it (now moot).
-        if (s.mapped && s.role === "xdg_toplevel") {
-          ctx.state.bus?.emit(WINDOW_EVENT.unmap, { surfaceId: s.id });
-        }
-        ctx.state.pendingWindowChanges?.delete(s.id);
-        ctx.state.wm?.unmapWindow(s.id);
-        ctx.state.compositor.removeSurface(s.id);
-        ctx.state.surfacesById?.delete(s.id);
-      }
+      if (s) unmapAndTeardownSurface(ctx.state, s);
       ctx.state.surfaces.delete(resource);
     },
   };
+}
+
+// Run a surface's window-unmap teardown: emit window.unmap (mapped toplevels only,
+// mirroring window.map), drop pending coalesced changes, unmap in the WM, and
+// remove it from the compositor + id map. IDEMPOTENT via the `unmapped` guard, so
+// it is safe to call from BOTH the explicit wl_surface.destroy request AND the
+// resource-destroyed sweep (client disconnect): whichever runs first does the work;
+// the second is a no-op. Without the sweep path, a client that disconnects without
+// explicitly destroying its wl_surface would never emit window.unmap, leaking any
+// decoration ring bound to that window (the provider frees it on sdk.window.onUnmap).
+export function unmapAndTeardownSurface(state: CompositorState, s: SurfaceRecord): void {
+  if (s.unmapped) return;
+  s.unmapped = true;
+  if (s.mapped && s.role === "xdg_toplevel") {
+    state.bus?.emit(WINDOW_EVENT.unmap, { surfaceId: s.id });
+  }
+  state.pendingWindowChanges?.delete(s.id);
+  state.wm?.unmapWindow(s.id);
+  state.compositor.removeSurface(s.id);
+  state.surfacesById?.delete(s.id);
 }

@@ -9,10 +9,12 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <algorithm>
 #include <chrono>
 #include <unordered_map>
 #include <vector>
 
+#include <dirent.h>
 #include <execinfo.h>
 #include <fcntl.h>
 #include <poll.h>
@@ -430,6 +432,8 @@ int run(int wireFd, int ctrlFd, int inputFd, bool headless,
         // producer-done -> consumer-wait and consumer-done -> producer-wait.
         int32_t layout = 0;                  // current Vulkan image layout (0=UNDEFINED)
         bool everProduced = false;           // first ProducerBegin starts UNDEFINED
+        bool producerOpen = false;           // a producer BeginAccess bracket is open
+        bool consumerOpen = false;           // a consumer BeginAccess bracket is open
         wgpu::SharedFence producerFence;     // last producer EndAccess fence (for consumer)
         wgpu::SharedFence consumerFence;     // last consumer EndAccess fence (for producer)
     };
@@ -452,6 +456,7 @@ int run(int wireFd, int ctrlFd, int inputFd, bool headless,
                          producer ? "Producer" : "Consumer", surfaceBufId);
             return;
         }
+        if (producer) sb.producerOpen = false; else sb.consumerOpen = false;
         sb.layout = endLayout.newLayout;
         // producerFence (waited by consumer/core) / consumerFence (waited by
         // producer/plugin); import into the WAITING side's device.
@@ -760,7 +765,8 @@ int run(int wireFd, int ctrlFd, int inputFd, bool headless,
                         std::fprintf(stderr, "[gpu] %sBegin: BeginAccess failed (buf=%u)\n",
                                      producer ? "Producer" : "Consumer", m.surfaceBufId);
                     } else {
-                        if (producer) sb.everProduced = true;
+                        if (producer) { sb.everProduced = true; sb.producerOpen = true; }
+                        else sb.consumerOpen = true;
                         reply.ok = 1;
                     }
                     ipc::sendMessage(ctrlFd, reply);
@@ -781,6 +787,32 @@ int run(int wireFd, int ctrlFd, int inputFd, bool headless,
                 // the consumer EndAccess fence is only waited by the producer's
                 // NEXT frame, so run immediately.
                 runSurfaceEnd(m.surfaceBufId, false);
+             } else if (m.tag == ipc::Tag::ReleaseSurfaceBuf) {
+                 // Destroy a ring slot's surfaceBuf. The core sends this only after it
+                 // has gated on its own GPU read completing (afterCurrentFrame), so no
+                 // consumer read is in flight. End any still-open access bracket before
+                 // dropping the SharedTextureMemory + textures + fences + dmabuf, or
+                 // EndAccess/teardown would race an open bracket.
+                 auto it = surfaceBufs.find(m.surfaceBufId);
+                if (it != surfaceBufs.end()) {
+                    SurfaceBuf& sb = it->second;
+                    // Drop any pending deferred producer-end for this buf (its wire
+                    // serial may never arrive now; the EndAccess below covers it).
+                    pendingProducerEnds.erase(
+                        std::remove_if(pendingProducerEnds.begin(), pendingProducerEnds.end(),
+                            [&](const PendingProducerEnd& pe) { return pe.surfaceBufId == m.surfaceBufId; }),
+                        pendingProducerEnds.end());
+                    if (sb.producerOpen) runSurfaceEnd(m.surfaceBufId, true);
+                    if (sb.consumerOpen) runSurfaceEnd(m.surfaceBufId, false);
+                    sb.producerFence = nullptr;
+                    sb.consumerFence = nullptr;
+                    sb.producerTex = nullptr;
+                    sb.consumerTex = nullptr;
+                    sb.producerMem = nullptr;
+                    sb.consumerMem = nullptr;
+                    alloc.release(sb.buf);     // closes the dmabuf fd + GBM bo
+                    surfaceBufs.erase(it);
+                }
             } else if (m.tag == ipc::Tag::BeginAccess) {
                 // Begin access so the core's wire render commands may target the
                 // dmabuf texture. Vulkan layout state is mandatory on this

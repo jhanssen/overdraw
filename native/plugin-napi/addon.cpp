@@ -159,6 +159,17 @@ napi_value ProducerTexture(napi_env env, napi_callback_info info) {
     return out;
 }
 
+// releaseProducerTexture(clientId, resKey): reclaim a producer reservation on
+// surface teardown so the wire-client handle map does not leak.
+napi_value ReleaseProducerTexture(napi_env env, napi_callback_info info) {
+    size_t argc = 2; napi_value argv[2];
+    napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+    auto* c = self(env)->get(u32(env, argv[0]));
+    if (!c) return throwErr(env, "releaseProducerTexture: bad clientId");
+    c->releaseProducerTexture(u32(env, argv[1]));
+    return nullptr;
+}
+
 // flush(clientId) -> undefined
 napi_value Flush(napi_env env, napi_callback_info info) {
     size_t argc = 1; napi_value argv[1];
@@ -197,6 +208,7 @@ napi_value Init(napi_env env, napi_value exports) {
     reg("deviceHandle", DeviceHandle);
     reg("deviceWireHandle", DeviceWireHandle);
     reg("reserveProducerTexture", ReserveProducerTexture);
+    reg("releaseProducerTexture", ReleaseProducerTexture);
     reg("producerTexture", ProducerTexture);
     reg("flush", Flush);
     reg("wireBytesQueued", WireBytesQueued);

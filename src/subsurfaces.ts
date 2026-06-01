@@ -61,6 +61,12 @@ export function computeBaseStack(state: CompositorState): number[] {
     // Content-gated windows (waiting for their decoration's first frame) are held
     // out of the draw stack so content + decoration appear together (piece 3).
     if (win.contentGated) continue;
+    // The window's decoration (if any) draws directly BELOW its own content, so the
+    // decoration is z-bound to the window: a window stacked above occludes it just
+    // as it occludes the window below. (A flat decoration layer would put ALL
+    // decorations behind ALL content, so an upper window's content would draw over
+    // a lower window's decoration.)
+    if (win.decorationSurfaceId !== undefined) stack.push(win.decorationSurfaceId);
     stack.push(win.surfaceId);
     emitSubtree(state, win.surfaceRec.resource, win.rect.x, win.rect.y, stack);
   }

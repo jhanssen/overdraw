@@ -17,6 +17,7 @@ import { dirname, join } from "node:path";
 import { createWm } from "../wm/index.js";
 import { queryState } from "../query.js";
 import { applySubsurfaces } from "../subsurfaces.js";
+import { unmapAndTeardownSurface } from "./wl_surface.js";
 import { rebuildStackWithPopups, maybeDismissGrabbedPopup } from "./xdg_popup.js";
 import type { Addon, EventsByInterface, EventSenders } from "../types.js";
 import type { Ctx, CompositorState, FocusOptions, CompositorSink } from "./ctx.js";
@@ -116,7 +117,10 @@ export async function installProtocols(
     serial() { return this.nextSerial++; },
   };
   if (opts.bus) state.bus = opts.bus;
-  state.wm = createWm(state.compositor, output);
+  // The WM delegates its stack push to the full rebuild (windows interleaved with
+  // their decorations + subsurfaces + popups via computeBaseStack), keeping
+  // rebuildStackWithPopups the single owner of the content stack order.
+  state.wm = createWm(state.compositor, output, () => rebuildStackWithPopups(state));
   // State-query channel (tests / introspection): a GPU-free snapshot of
   // geometry / focus / stacking. See src/query.ts.
   state.query = () => queryState(state);
@@ -169,10 +173,25 @@ export async function installProtocols(
         if (pr) { pr.mapped = true; mappedPopup = true; }
       }
     }
+    // Resource-destroyed sweep: a client that disconnects (or crashes) without
+    // explicitly sending wl_surface.destroy still has its wl_resource torn down by
+    // libwayland, which only marks our wrapper `destroyed` -- the protocol destroy
+    // handler does NOT run, so no window.unmap would be emitted and anything bound
+    // to that window (e.g. a decoration ring) would leak. Detect such surfaces here
+    // and run the same idempotent unmap teardown. (The explicit-destroy path already
+    // tore down + set `unmapped`, so this only fires for the disconnect case.)
+    let unmappedAny = false;
+    for (const s of [...state.surfaces.values()]) {
+      if (!s.resource.destroyed || s.unmapped) continue;
+      unmapAndTeardownSurface(state, s);
+      state.surfaces.delete(s.resource);
+      unmappedAny = true;
+    }
+
     // A newly-mapped toplevel changes window rects, so re-lay-out subsurfaces
     // (a child that committed before its parent mapped gets placed now).
     if (mappedAny) applySubsurfaces(state);
-    if (mappedAny || mappedPopup) rebuildStackWithPopups(state);
+    if (mappedAny || mappedPopup || unmappedAny) rebuildStackWithPopups(state);
 
     // Drain coalesced window-state changes (title/app_id/activation) accumulated
     // since the last frame into one window.change per affected surface. Coalescing

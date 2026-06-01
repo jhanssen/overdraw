@@ -25,6 +25,10 @@ export interface SurfaceRecord {
   xdgSurface: XdgSurfaceRecord | null;
   mapped?: boolean;
   hasContent?: boolean;  // a buffer has been committed + uploaded at least once
+  // Set once the window's unmap teardown has run (explicit wl_surface.destroy OR
+  // the resource-destroyed sweep on client disconnect). Guards against emitting
+  // window.unmap / tearing down twice.
+  unmapped?: boolean;
   frameCallbacks?: Resource[];
 }
 

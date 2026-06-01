@@ -231,9 +231,18 @@ export class JsCompositor implements CompositorSink {
 
   removeSurface(id: number): void {
     const s = this.surfaces.get(id);
-    // Release the surface's live dmabuf import (its retiring buffers are released
-    // on their own completion in reapRetiring).
-    if (s && s.currentImportId !== 0) this.addon.releaseDmabufImport(s.currentImportId);
+    if (s) {
+      // Release the surface's live dmabuf import (client surfaces; retiring buffers
+      // free on their own completion in reapRetiring).
+      if (s.currentImportId !== 0) this.addon.releaseDmabufImport(s.currentImportId);
+      // Destroy the per-surface placement uniform buffer (a wire GPUBuffer). The
+      // sampled texture is dropped with the map entry; explicitly .destroy()-ing the
+      // wrapped consumer/client texture here caused intermittent fatal dawn.node
+      // throws during teardown (it is owned by the ring/client side), so it is left
+      // to be released via its owner + the GPU-process ReleaseSurfaceBuf path. The
+      // sync_file fence-fd reclaim is tracked separately.
+      s.placementBuf?.destroy();
+    }
     this.surfaces.delete(id);
   }
 

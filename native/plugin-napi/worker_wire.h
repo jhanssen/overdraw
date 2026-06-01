@@ -65,6 +65,9 @@ class WorkerWireClient {
     struct SurfaceReservation { Handle texture; Handle device; bool ok; };
     SurfaceReservation reserveProducerTexture(uint32_t surfaceBufId, uint32_t w, uint32_t h);
     WGPUTexture producerTexture(uint32_t surfaceBufId) const;
+    // Release a producer-texture reservation (surface teardown): reclaim the wire
+    // handle + drop the map entry so it does not leak.
+    void releaseProducerTexture(uint32_t surfaceBufId);
 
     void markSharedWithJs() { link_->markSharedWithExternal(); }
     void flush() { link_->flush(); }

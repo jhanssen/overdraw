@@ -89,8 +89,15 @@ WorkerWireClient::SurfaceReservation WorkerWireClient::reserveProducerTexture(
 }
 
 WGPUTexture WorkerWireClient::producerTexture(uint32_t surfaceBufId) const {
-    auto it = producerReservations_.find(surfaceBufId);
-    return it == producerReservations_.end() ? nullptr : it->second.texture;
+  auto it = producerReservations_.find(surfaceBufId);
+  return it == producerReservations_.end() ? nullptr : it->second.texture;
+}
+
+void WorkerWireClient::releaseProducerTexture(uint32_t surfaceBufId) {
+  auto it = producerReservations_.find(surfaceBufId);
+  if (it == producerReservations_.end()) return;
+  link_->client().ReclaimTextureReservation(it->second);
+  producerReservations_.erase(it);
 }
 
 }  // namespace overdraw::plugin

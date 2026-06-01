@@ -78,6 +78,9 @@ export interface Addon {
   pluginSurfaceConsumerBegin(surfaceBufId: number, cb: (ok: boolean) => void): void;
   pluginSurfaceConsumerEnd(surfaceBufId: number): void;
   pluginConsumerTexture(surfaceBufId: number): bigint;
+  // Destroy a plugin ring slot's surfaceBuf (GPU process frees dmabuf/STM/textures;
+  // core reclaims its reservation). Caller gates on the consumer GPU read completing.
+  pluginReleaseSurfaceBuffer(surfaceBufId: number): void;
 
   // Synthetic input (test seam): feed a normalized InputEvent through the same
   // sink the host seat uses, so it routes to onInput / the seat exactly as a real

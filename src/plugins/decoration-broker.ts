@@ -65,9 +65,13 @@ export function createDecorationBroker(deps: DecorationBrokerDeps): DecorationBr
   const timeoutMs = deps.timeoutMs ?? DEFAULT_DECORATION_TIMEOUT_MS;
 
   // windowId -> Gate (active gates only). decoSurfaceId -> windowId for fast lookup
-  // on first present.
+  // on first present (lives only while a gate is active).
   const gates = new Map<number, Gate>();
   const decoToWindow = new Map<number, number>();
+  // windowId -> its window-bound decoration surface id (persists past gate release;
+  // used to clear the WM binding on unmap). The WM splices this below the window's
+  // content in computeBaseStack so the decoration is z-bound to its window.
+  const windowToDeco = new Map<number, number>();
 
   // Release a window's content gate (idempotent): un-gate in the WM, cancel the
   // timer, drop bookkeeping. Called on first decoration frame, on timeout, and on
@@ -108,9 +112,14 @@ export function createDecorationBroker(deps: DecorationBrokerDeps): DecorationBr
     });
   }
 
-  // Registry callback: a tracked window unmapped. Release any gate.
+  // Registry callback: a tracked window unmapped. Release any gate + clear the WM
+  // decoration binding (no-op if the window is already gone from the WM).
   function onUnmapped(windowId: number): void {
     releaseGate(windowId, "unmap");
+    if (windowToDeco.has(windowId)) {
+      windowToDeco.delete(windowId);
+      state.wm?.setDecorationSurface(windowId, null);
+    }
   }
 
   const registry = createDecorationRegistry(bus, onAssigned, onUnmapped);
@@ -141,6 +150,11 @@ export function createDecorationBroker(deps: DecorationBrokerDeps): DecorationBr
   }
 
   function onSurfaceAllocated(decoSurfaceId: number, windowId: number): void {
+    // Bind the decoration surface to its window in the WM so it draws directly below
+    // the window's content (z-bound). Done regardless of gate state and persists past
+    // gate release (cleared on unmap).
+    windowToDeco.set(windowId, decoSurfaceId);
+    state.wm?.setDecorationSurface(windowId, decoSurfaceId);
     const g = gates.get(windowId);
     if (!g) return;   // not a gated decoration window (or already released)
     g.decoSurfaceId = decoSurfaceId;

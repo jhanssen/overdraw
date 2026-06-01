@@ -32,9 +32,15 @@ export interface OverlayBroker {
   // Plugin requests an overlay; core decides geometry + registers it in the layer.
   create(pluginId: string, params: CreateOverlayParams): OverlayHandle;
   // Register a surface at an EXPLICIT rect on a layer (no placeOverlay/clamp). The
-  // caller already decided the geometry -- decorations pass the inset outerRect.
-  // reflow() leaves these fixed (they are window-relative, not output-anchored).
+  // caller already decided the geometry -- output-anchored overlays pass an explicit
+  // rect. reflow() leaves these fixed (they are window-relative, not output-anchored).
   createAt(pluginId: string, layer: OverlayLayer, rect: Rect): OverlayHandle;
+  // Register a WINDOW-BOUND surface at an explicit rect (decorations). Assigns a
+  // surface id + sets its layout in the compositor map, and tracks it for teardown
+  // (destroy / plugin death), but does NOT place it on any flat layer: its z-order
+  // is owned by the WM stack (computeBaseStack splices it directly below its
+  // window's content). reflow() leaves it fixed (it is window-relative).
+  createWindowBound(pluginId: string, rect: Rect): OverlayHandle;
   // Remove one overlay (plugin destroyed it or the plugin died).
   destroy(surfaceId: number): void;
   // Remove every overlay owned by a plugin (plugin termination).
@@ -50,13 +56,15 @@ export function createOverlayBroker(state: CompositorState, output: Output): Ove
   // Insertion-ordered overlays; per-layer order = insertion order within a layer.
   // `req` is the anchor request (for reflow); absent for explicit-rect surfaces
   // (createAt), which reflow leaves fixed.
-  const overlays = new Map<number, OverlayHandle & { req?: CreateOverlayParams }>();
+  const overlays = new Map<number, OverlayHandle & { req?: CreateOverlayParams; windowBound?: boolean }>();
   let out = { width: output.width, height: output.height };
 
   // Push the ordered surface-id list for one layer to the sink.
   function pushLayer(layer: OverlayLayer): void {
     const ids: number[] = [];
-    for (const o of overlays.values()) if (o.layer === layer) ids.push(o.surfaceId);
+    // Window-bound surfaces (decorations) are not on any flat layer; their z-order
+    // is owned by the WM stack, so they are excluded here.
+    for (const o of overlays.values()) if (!o.windowBound && o.layer === layer) ids.push(o.surfaceId);
     state.compositor.setLayerSurfaces?.(layer, ids);
   }
 
@@ -85,12 +93,27 @@ export function createOverlayBroker(state: CompositorState, output: Output): Ove
       return { surfaceId, layer, rect: { ...rect }, pluginId };
     },
 
+    createWindowBound(pluginId, rect) {
+      const surfaceId = state.serial();
+      const handle: OverlayHandle & { windowBound: true } = {
+        // `layer` is nominal here (window-bound surfaces are never pushed to a flat
+        // layer); the WM stack owns the z-order. No `req` -> reflow skips it.
+        surfaceId, layer: "below", rect: { ...rect }, pluginId, windowBound: true,
+      };
+      overlays.set(surfaceId, handle);
+      // Layout only; no pushLayer (the WM stack places it via computeBaseStack).
+      state.compositor.setSurfaceLayout(surfaceId, rect.x, rect.y, rect.width, rect.height);
+      return { surfaceId, layer: "below", rect: { ...rect }, pluginId };
+    },
+
     destroy(surfaceId) {
       const o = overlays.get(surfaceId);
       if (!o) return;
       overlays.delete(surfaceId);
       state.compositor.removeSurface(surfaceId);
-      pushLayer(o.layer);
+      // Window-bound surfaces aren't on a flat layer; the WM rebuild drops the id
+      // when its window's decorationSurfaceId is cleared. Flat overlays re-push here.
+      if (!o.windowBound) pushLayer(o.layer);
     },
 
     destroyForPlugin(pluginId) {

@@ -26,6 +26,7 @@ interface PluginAddon {
   reserveProducerTexture(clientId: number, surfaceBufId: number, w: number, h: number):
     { texture: { id: number; generation: number }; device: { id: number; generation: number } };
   producerTexture(clientId: number, surfaceBufId: number): bigint;
+  releaseProducerTexture(clientId: number, resKey: number): void;
   flush(clientId: number): void;
   wireBytesQueued(clientId: number): bigint;
 }
@@ -108,6 +109,10 @@ export interface Surface {
   getCurrentTexture(): Promise<GPUTexture>;
   // Hand the acquired texture to the core to composite (drives the fence dance).
   present(): Promise<void>;
+  // Tear down the surface: the core stops compositing it and frees the ring's GPU
+  // resources (dmabuf/STM/textures on both devices); the worker drops its wrapped
+  // textures + producer reservations. After destroy() the surface is unusable.
+  destroy(): Promise<void>;
 }
 
 export interface PluginGpu {
@@ -127,7 +132,7 @@ export type RingMaker = (width: number, height: number, allocExtra: Record<strin
 // /`dawnPath` are absolute paths to the two native modules.
 export async function createPluginGpu(
   endpoint: Endpoint, pluginAddonPath: string, dawnPath: string,
-): Promise<{ gpu: PluginGpu; pump: () => void; makeRingSurface: RingMaker }> {
+): Promise<{ gpu: PluginGpu; pump: () => void; makeRingSurface: RingMaker; stop: () => void }> {
   const require = createRequire(import.meta.url);
   const plugin = require(pluginAddonPath) as PluginAddon;
   const dawn = require(dawnPath) as DawnModule;
@@ -164,7 +169,15 @@ export async function createPluginGpu(
   const devHandle = plugin.deviceHandle(clientId);
 
   // Steady-state pump: keep the wire flowing so device async ops resolve.
-  const pump = (): void => { plugin.pump(clientId); };
+  const pump = (): void => { if (!stopped) plugin.pump(clientId); };
+
+  // Quiesced on shutdown (bootstrap's onShutdown path, BEFORE the Worker is
+  // terminated). Once set, surface ops (getCurrentTexture/present) bail cleanly so a
+  // plugin's still-running render loop unwinds WITHOUT issuing new wire/device work
+  // into a wire that teardown is tearing down -- the race that made dawn.node throw
+  // fatally (ThrowAsJavaScriptException with no JS frame) when worker.terminate()
+  // killed the thread mid-submit/mid-wire-callback.
+  let stopped = false;
 
   // Shared producer/consumer ring setup. `allocExtra` carries the geometry source
   // (anchor params for overlays, an explicit rect for decorations); the core's
@@ -206,9 +219,14 @@ export async function createPluginGpu(
     }
 
     let acquired = -1;   // the slot getCurrentTexture handed out, until present()
+    let destroyed = false;
     return {
       width, height, rect: r.rect,
       async getCurrentTexture(): Promise<GPUTexture> {
+        if (destroyed) throw new Error("surface used after destroy()");
+        // Shutdown quiesce: park the caller (never resolve) so a still-running render
+        // loop stops issuing wire/device work while the Worker is being torn down.
+        if (stopped) return new Promise<GPUTexture>(() => {});
         if (acquired >= 0) {
           // Re-acquire within the same frame returns the same texture (idempotent
           // until present()). A real second producer would CAS its own slot.
@@ -228,6 +246,7 @@ export async function createPluginGpu(
         }
       },
       async present(): Promise<void> {
+        if (stopped) return;   // quiesced: drop the present (Worker is being torn down)
         if (acquired < 0) throw new Error("surface.present() without a prior getCurrentTexture()");
         const slot = acquired;
         acquired = -1;
@@ -238,6 +257,23 @@ export async function createPluginGpu(
         slotStates.present(slot);
         await endpoint.request("surface.present",
           { connId: conn.connId, surfaceBufId: slotBufId[slot], slot, wireSerial });
+      },
+      async destroy(): Promise<void> {
+        if (destroyed) return;
+        destroyed = true;
+        // Ask the core to stop compositing + free the ring's GPU resources (it gates
+        // the GPU-process free on its own read completing).
+        await endpoint.request("surface.destroy", { connId: conn.connId, overlayId: r.overlayId });
+        // Worker-side: drop the wrapped producer textures + reclaim the producer
+        // reservations. (Explicit .destroy() of the wrapped textures here caused
+        // intermittent fatal dawn.node throws during teardown; the GPU process frees
+        // the native textures/STM/dmabuf via ReleaseSurfaceBuf. The deterministic
+        // wire-texture + fence-fd reclaim is tracked separately.)
+        for (let i = 0; i < SLOTS; i++) {
+          slotTex[i] = null;
+          plugin.releaseProducerTexture(clientId, slotResKey[i]);
+        }
+        plugin.flush(clientId);
       },
     };
 
@@ -258,5 +294,9 @@ export async function createPluginGpu(
     },
   };
 
-  return { gpu, pump, makeRingSurface };
+  // Quiesce the GPU layer for shutdown: stop the pump + make surface ops bail, so
+  // no new wire/device work is issued while the Worker is torn down.
+  const stop = (): void => { stopped = true; };
+
+  return { gpu, pump, makeRingSurface, stop };
 }
