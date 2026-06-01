@@ -32,7 +32,25 @@ interface PluginAddon {
 interface DawnModule {
   wrapDevice(instanceHandle: bigint, deviceHandle: bigint): GPUDevice;
   wrapTexture(deviceHandle: bigint, textureHandle: bigint): GPUTexture;
-  globals: { GPUTextureUsage: typeof GPUTextureUsage; GPUBufferUsage: typeof GPUBufferUsage; GPUMapMode: typeof GPUMapMode };
+  // The full set of WebGPU `GPU*` constructors + flag enums (GPUBufferUsage,
+  // GPUShaderStage, GPUTextureUsage, GPUMapMode, GPUColorWrite, GPUDevice, ...).
+  // dawn.node does NOT install these on globalThis itself; the host does (see
+  // installWebGPUGlobals) so plugin code can use them as standard globals.
+  globals: Record<string, unknown>;
+}
+
+// Install dawn.node's WebGPU globals (`GPU*`) onto globalThis so plugin code uses
+// the standard browser-shaped constants -- GPUBufferUsage.UNIFORM,
+// GPUShaderStage.FRAGMENT, GPUTextureUsage.RENDER_ATTACHMENT, etc. -- instead of
+// hardcoding spec bitflag values. dawn.node exposes them on `globals` but does not
+// assign them; we do, once, in the Worker after the module loads. Existing globals
+// (e.g. a future native WebGPU in Node) are NOT overwritten.
+function installWebGPUGlobals(globals: Record<string, unknown>): void {
+  for (const [name, value] of Object.entries(globals)) {
+    // Reflect avoids casting globalThis to an indexable type; skip names already
+    // defined (do not clobber a future native WebGPU in Node).
+    if (!Reflect.has(globalThis, name)) Reflect.set(globalThis, name, value);
+  }
 }
 
 // Worker-local unique key for each producer-texture reservation (the wire-client
@@ -113,6 +131,10 @@ export async function createPluginGpu(
   const require = createRequire(import.meta.url);
   const plugin = require(pluginAddonPath) as PluginAddon;
   const dawn = require(dawnPath) as DawnModule;
+
+  // Expose the WebGPU GPU* globals (enums + types) so plugin code uses the standard
+  // names (GPUBufferUsage.UNIFORM, GPUShaderStage.FRAGMENT, ...) like browser WebGPU.
+  installWebGPUGlobals(dawn.globals);
 
   // 1) Ask the core to create a connection; it returns the client-end fd.
   const conn = (await endpoint.request("gpu.connect")) as { connId: number; fd: number };

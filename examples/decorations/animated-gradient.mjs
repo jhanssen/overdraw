@@ -57,20 +57,16 @@ export default async function init(sdk) {
 
   const dev = sdk.gpu.device;
 
-  // WebGPU bitflag constants (the plugin SDK does not surface the enum objects, so
-  // use the spec values directly). GPUBufferUsage.UNIFORM=0x40, COPY_DST=0x08;
-  // GPUShaderStage.FRAGMENT=0x2.
-  const BUF_UNIFORM_COPYDST = 0x40 | 0x08;
-  const SHADER_FRAGMENT = 0x2;
-
-  // Build the render pipeline once (the surface format is bgra8unorm).
+  // Build the render pipeline once (the surface format is bgra8unorm). The WebGPU
+  // GPU* globals (GPUBufferUsage, GPUShaderStage, ...) are installed by the runtime,
+  // so they're available exactly like browser WebGPU.
   const module = dev.createShaderModule({ code: WGSL });
   const uniformBuf = dev.createBuffer({
     size: 16,                                        // 4 x f32
-    usage: BUF_UNIFORM_COPYDST,
+    usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
   });
   const bindGroupLayout = dev.createBindGroupLayout({
-    entries: [{ binding: 0, visibility: SHADER_FRAGMENT, buffer: { type: "uniform" } }],
+    entries: [{ binding: 0, visibility: GPUShaderStage.FRAGMENT, buffer: { type: "uniform" } }],
   });
   const pipeline = dev.createRenderPipeline({
     layout: dev.createPipelineLayout({ bindGroupLayouts: [bindGroupLayout] }),
