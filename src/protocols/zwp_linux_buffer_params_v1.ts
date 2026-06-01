@@ -34,7 +34,7 @@ export default function makeBufferParams(ctx: Ctx): ZwpLinuxBufferParamsV1Handle
       if (!p) return;
       p.planes[planeIdx] = { fd, offset, stride, modifierHi, modifierLo };
     },
-    create(resource, _width, _height, _format, _flags) {
+    create(resource, width, height, format, _flags) {
       const p = rec(resource);
       if (!p || p.used || !p.planes[0]) {
         // Can't recover a usable buffer; report failure.
@@ -42,11 +42,21 @@ export default function makeBufferParams(ctx: Ctx): ZwpLinuxBufferParamsV1Handle
         return;
       }
       p.used = true;
-      // `create` (async) must hand back a server-created wl_buffer via the
-      // `created` event. The trampoline has no API to mint a new resource
-      // server-side for an event new_id arg, so first light only supports
-      // create_immed (client supplies the buffer id). Report failed here.
-      ctx.events.zwp_linux_buffer_params_v1.send_failed(resource);
+      // `create` (async) hands back a server-minted wl_buffer via the `created`
+      // event. Passing null in the new_id slot tells the trampoline to mint the
+      // resource server-side and return its wrapper (same path as
+      // wl_data_device.data_offer). Record the descriptor against the minted
+      // buffer so the commit path imports it exactly like create_immed.
+      const buffer = ctx.events.zwp_linux_buffer_params_v1.send_created(
+        resource, null,
+      ) as Resource | undefined;
+      if (!buffer) {
+        // Minting failed (no-memory / unregistered interface); report failure.
+        ctx.events.zwp_linux_buffer_params_v1.send_failed(resource);
+        return;
+      }
+      ctx.state.buffers ??= new Map();
+      ctx.state.buffers.set(buffer, makeDescriptor(p, buffer, width, height, format));
     },
     create_immed(resource, buffer, width, height, format, _flags) {
       const p = rec(resource);
