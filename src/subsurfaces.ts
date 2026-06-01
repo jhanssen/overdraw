@@ -58,6 +58,9 @@ export function computeBaseStack(state: CompositorState): number[] {
   if (!wm) return [];
   const stack: number[] = [];
   for (const win of wm.state.windows) {
+    // Content-gated windows (waiting for their decoration's first frame) are held
+    // out of the draw stack so content + decoration appear together (piece 3).
+    if (win.contentGated) continue;
     stack.push(win.surfaceId);
     emitSubtree(state, win.surfaceRec.resource, win.rect.x, win.rect.y, stack);
   }

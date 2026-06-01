@@ -131,22 +131,26 @@ if (config.plugins.length > 0) {
     const isPath = isAbsolute(m) || m.startsWith("./") || m.startsWith("../");
     return isPath ? { ...p, module: pathToFileURL(resolvePath(base, m)).href } : p;
   });
-  // GPU broker: services plugin Worker GPU/surface requests (connection, surface
-  // alloc, fence dance, overlay compositing). Needs the overlay broker + the
-  // core device handle for wrapping consumer textures.
   const overlays = createOverlayBroker(state, config.output ?? { width: dims.width, height: dims.height });
-  const gpuBroker = createGpuBroker({ addon, compositor, overlays, dawn, coreDeviceHandle: h.device });
   const [dawnNodePath] = globSync(join(__dirname, "..", "build", "3rdparty", "dawn", "Dawn-*", "dawn.node"));
   const pluginAddonPath = join(__dirname, "..", "build", "overdraw_plugin_native.node");
 
   // Decoration broker: services decoration.* requests + owns the app_id-regex
-  // provider registry, which subscribes to the bus and notifies matched plugins.
-  // emitToPlugin lazily references `runtime` (assigned below; matches fire only
-  // after a client maps, well after load).
+  // provider registry + the content-gating state machine. emitToPlugin lazily
+  // references `runtime` (assigned below; matches fire only after a client maps).
   const decorationBroker = createDecorationBroker({
     bus,
     state,
     emitToPlugin: (plugin, name, data) => { runtime?.emit(plugin, name, data); },
+  });
+
+  // GPU broker: services plugin Worker GPU/surface requests (connection, surface
+  // alloc, fence dance, overlay/decoration compositing). The generic surface hooks
+  // feed the decoration broker (surface<->window link + first-present release).
+  const gpuBroker = createGpuBroker({
+    addon, compositor, overlays, dawn, coreDeviceHandle: h.device,
+    onSurfaceAllocated: (sid, win) => decorationBroker.onSurfaceAllocated(sid, win),
+    onSurfacePresented: (sid) => decorationBroker.onSurfacePresented(sid),
   });
 
   runtime = new PluginRuntime({

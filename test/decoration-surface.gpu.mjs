@@ -39,9 +39,13 @@ test("decoration surface composites at the inset rect above the window", { skip 
   const dawn = loadDawn();
   const h = c.addon.gpuHandles();
   const overlays = createOverlayBroker(c.state, { width: W, height: H });
-  const gpuBroker = createGpuBroker({ addon: c.addon, compositor: c.jsCompositor, overlays, dawn, coreDeviceHandle: h.device });
   const decoBroker = createDecorationBroker({
     bus, state: c.state, emitToPlugin: (p, n, d) => { runtime?.emit(p, n, d); },
+  });
+  const gpuBroker = createGpuBroker({
+    addon: c.addon, compositor: c.jsCompositor, overlays, dawn, coreDeviceHandle: h.device,
+    onSurfaceAllocated: (sid, win) => decoBroker.onSurfaceAllocated(sid, win),
+    onSurfacePresented: (sid) => decoBroker.onSurfacePresented(sid),
   });
   const [dawnNodePath] = globSync(join(OD, "build", "3rdparty", "dawn", "Dawn-*", "dawn.node"));
 
@@ -99,10 +103,14 @@ test("decoration surface composites at the inset rect above the window", { skip 
     assert.ok(decoPx[0] > 150 && decoPx[2] < 80,
       `decoration pixel not blue at (${dx},${dy}): got ${decoPx}`);
 
-    // A content point (inside the content rect): expect red (R high).
+    // A content point (inside the content rect): expect red (R high). That the
+    // content composites at all confirms the gate RELEASED after the decoration's
+    // first present (piece 3) -- a gated window is held out of the draw stack.
     const contentPx = pixelAt(data, W, cr.x + 5, cr.y + 20);
     assert.ok(contentPx[2] > 150 && contentPx[0] < 80,
       `content pixel not red at (${cr.x + 5},${cr.y + 20}): got ${contentPx}`);
+    assert.equal(c.state.wm.isContentGated(win.surfaceId), false,
+      "content gate released after the decoration's first present");
   } finally {
     if (runtime) await runtime.stop();
     await c.teardown();

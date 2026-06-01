@@ -42,10 +42,20 @@ export interface GpuBrokerDeps {
   overlays: OverlayBroker;
   dawn: DawnWire;
   coreDeviceHandle: bigint;
+  // Generic hooks the broker fires WITHOUT understanding what they mean (it stays
+  // surface-agnostic). The decoration layer uses these to learn its surface ids
+  // and first-present timing; default no-ops.
+  //  - onSurfaceAllocated: a surface.alloc carried a `decorates` tag (the window id
+  //    it decorates); links the new surface id to that window.
+  //  - onSurfacePresented: a surface received a frame (called every present).
+  onSurfaceAllocated?: (surfaceId: number, decoratesWindowId: number) => void;
+  onSurfacePresented?: (surfaceId: number) => void;
 }
 
 export function createGpuBroker(deps: GpuBrokerDeps) {
   const { addon, compositor, overlays, dawn, coreDeviceHandle } = deps;
+  const onSurfaceAllocated = deps.onSurfaceAllocated ?? (() => {});
+  const onSurfacePresented = deps.onSurfacePresented ?? (() => {});
   const connByPlugin = new Map<string, number>();
   // overlay surfaceId -> geometry pending until its slots are bound.
   const pendingAlloc = new Map<number, { width: number; height: number; overlaySurfaceId: number }>();
@@ -88,6 +98,10 @@ export function createGpuBroker(deps: GpuBrokerDeps) {
         };
         surfaces.set(handle.surfaceId, surf);
         pendingAlloc.set(handle.surfaceId, { width, height, overlaySurfaceId: handle.surfaceId });
+        // If this surface decorates a window, tell the decoration layer the link
+        // (generic tag; the broker does not interpret it).
+        const decorates = p.decorates as number | undefined;
+        if (typeof decorates === "number") onSurfaceAllocated(handle.surfaceId, decorates);
         return { overlayId: handle.surfaceId, rect: handle.rect };
       }
       case "surface.bindProducer": {
@@ -125,6 +139,10 @@ export function createGpuBroker(deps: GpuBrokerDeps) {
         surf.consumerSlot = slotBufId;
         const tex = dawn.wrapTexture(coreDeviceHandle, addon.pluginConsumerTexture(slotBufId));
         compositor.setSurfaceTexture?.(surf.surfaceId, tex, surf.width, surf.height);
+        // A frame is now installed for this surface; notify the decoration layer
+        // (it filters for its own surfaces) so a first decoration frame can release
+        // the gated content. Generic; the broker does not interpret it.
+        onSurfacePresented(surf.surfaceId);
         return null;
       }
       default:

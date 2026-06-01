@@ -4,7 +4,7 @@ Tracks what is built and empirically proven versus what is still design only.
 The design itself lives in `architecture.md`; this file is the ground truth for
 "what exists right now."
 
-Last updated: 2026-05-31 (rev 32).
+Last updated: 2026-05-31 (rev 33).
 
 ## Protocol gaps & skeletons (READ FIRST)
 
@@ -912,55 +912,67 @@ onMap/onUnmap + title/app_id-changed window-state events).
     is flushed at the map frame, so a window.change (title,appId,activated) fires
     alongside window.map re-affirming the same state. Harmless; not suppressed.
 
-### Decoration provider: registration + insets + drawing (decoration milestone, pieces 1+2) — BUILT, tested
-Server-side decorations: a plugin registers an app_id pattern, is told which mapped
-windows it owns, reserves additive insets, and DRAWS a decoration surface the core
-composites at the window's inset rect. Pixel-verified end to end. Content-gating +
-the timeout/deregister policy (the atomic first-frame appearance) is piece 3 -- NOT
-built yet; today the decoration appears when the plugin draws it (a brief flash of
-undecorated content is possible).
+### Decoration provider: registration + insets + drawing + atomic gating (decoration milestone, pieces 1+2+3) — BUILT, tested
+Server-side decorations, end to end: a plugin registers an app_id pattern, is told
+which mapped windows it owns, and draws a decoration surface the core composites at
+the window's inset rect. The window's CONTENT is held (gated) until the decoration's
+first frame, so content + decoration appear TOGETHER (atomic, like a real WM showing
+a fully-decorated window on first appearance). A provider that never draws is
+deregistered on a timeout and the window is shown undecorated -- a broken provider
+can never make a window permanently invisible. Pixel-verified + safety-path verified.
 
 - **Registration + assignment (piece 1):** `sdk.decorations.register(pattern,
   flags?)` (RegExp source; rejects an invalid pattern) + `onAssigned(cb)`. The
   registry (`src/decorations.ts`, GPU-free) subscribes to the bus `window.map` +
   `window.change`, assigns the FIRST-registered matching provider (match-once), and
-  emits `decoration.assigned` {surfaceId, appId, title, rect}. Matches at map AND on
-  window.change (late set_app_id reuses the map-time rect); unmap clears.
-- **Inset reservation (piece 2a):** `sdk.decorations.requestInsets(surfaceId,
-  insets)` -> the WM (`src/wm/index.ts` `setInsets`) computes the ADDITIVE outer
-  rect (content grown by insets; content + client unchanged, never told) and returns
-  {insets, outerRect, contentRect}. AUTHORIZED: only the plugin a window is assigned
-  to may reserve its insets.
-- **Decoration surface (piece 2b):** `sdk.gpu.createSurfaceAt(rect, layer)` places a
-  producer/consumer ring surface at an EXPLICIT rect (the inset outerRect) on a layer
-  -- the same ring `createOverlay` uses, via a new `overlays.createAt` (explicit-rect,
-  reflow-fixed) path and a `rect` branch in the gpu-broker's `surface.alloc`. The
-  plugin draws into it and presents; the core composites it (on `below`, the opaque
-  content draws over it so only the inset band shows -- additive-border model).
-- **Broker** (`src/plugins/decoration-broker.ts`): services `decoration.register` +
-  `decoration.requestInsets` (needs `state.wm`); owns the registry. main.ts routes
-  `decoration.*` here, `gpu.*`/`surface.*` to the GPU broker.
-- **Verified**: `test/decorations.test.js` (registry + broker auth: match/first-wins/
-  match-once/late-app_id/unmap-clears/unregister/invalid-regex/flags; requestInsets
-  assigned-ok / intruder + unmapped rejected), `test/wm.test.js` (additive grow,
-  clamp, replace, outerRectOf), `test/decoration-e2e.test.js` (REAL Worker: register
-  -> map -> onAssigned -> requestInsets grant), and `test/decoration-surface.gpu.mjs`
-  (REAL client + provider: assigned -> requestInsets -> createSurfaceAt -> draw ->
-  present -> the decoration composites blue in the inset band, content red below;
-  pixel-verified). GPU-free 112/112; GPU 33/33. **PASS.**
+  (via the broker) emits `decoration.assigned` {surfaceId, appId, title, rect}.
+  Matches at map AND on window.change (late set_app_id reuses the map-time rect).
+- **createDecoration (pieces 2+3):** `sdk.decorations.createDecoration(windowId,
+  {insets, layer?})` -- ONE call: the core reserves ADDITIVE insets (WM `setInsets`:
+  outer rect = content grown by insets; content + client unchanged, never told),
+  returns the outer rect, and the worker allocates a producer/consumer ring there
+  (the same ring `createOverlay` uses, via `overlays.createAt` + a `rect` branch in
+  the gpu-broker's `surface.alloc`), tagging the alloc with `decorates: windowId` so
+  the core links the decoration surface to the window. AUTHORIZED: only the plugin a
+  window is assigned to may decorate it. (Replaced the piece-2 split `requestInsets`
+  + `sdk.gpu.createSurfaceAt`; `createSurfaceAt` is removed -- no public explicit-rect
+  surface API until a concrete use case defines its args.)
+- **Content gating (piece 3):** on assignment the broker GATES the window's content
+  (the WM `setContentGated` holds it out of the draw stack -- `pushStack` +
+  `computeBaseStack` skip gated windows) and arms a first-frame timeout (configurable,
+  default 500ms). When the decoration surface receives its FIRST present (the
+  gpu-broker fires a generic `onSurfacePresented` hook the decoration broker filters
+  via the D<->W link), the gate releases -> content + decoration composite together.
+  The broker stays surface-agnostic; the core decoration layer owns D<->W + release.
+- **Timeout / deregister (piece 3 safety):** if the first decoration frame does not
+  arrive within the deadline, the broker `console.error`s, PERMANENTLY deregisters the
+  provider (no further assignments unless it re-registers), sends it
+  `decoration.deregistered {reason, windowId}`, and releases the gate (window shown
+  UNDECORATED). unmap before the first frame releases the gate without deregistering.
+- **Verified**: `test/decorations.test.js` (registry + broker: match/first-wins/
+  match-once/late-app_id/unregister/invalid-regex/flags; createDecoration auth;
+  GATING: assign-gates, first-present-releases, non-decoration-present-no-op, TIMEOUT
+  deregisters+releases+notifies, unmap-before-draw releases without deregister),
+  `test/wm.test.js` (additive insets + gating filter), `test/decoration-surface.gpu.mjs`
+  (REAL client + provider: assigned -> createDecoration -> draw -> present ->
+  decoration composites blue in the inset band, content red below, gate released;
+  pixel-verified), `test/decoration-timeout.gpu.mjs` (REAL broken provider that never
+  draws -> timeout -> deregistered + content shown undecorated). GPU-free 115/115;
+  GPU 34/34. **PASS.**
 - **FLAGGED / not done:**
-  - **No content gating (piece 3).** The decoration appears when the plugin draws
-    it; content is NOT held until the first decoration frame, so a brief undecorated
-    flash is possible. Piece 3 = atomic first-frame appearance (hold content until
-    the decoration's first present) + the timeout-error-DEREGISTER policy for a
-    provider that never draws (configurable, ~500ms; permanently deregister + send
-    the plugin a `decoration.deregistered` message + console.error). The reconfigure
-    case (don't composite a resized window until the decoration re-renders within the
-    limit) lands with the resize/layout milestone (resize does not exist yet).
+  - **Reconfigure gating is the resize milestone, not built.** The atomic rule for a
+    RECONFIGURED window (don't composite the new configuration until the decoration
+    re-renders to match, within the same deadline; hold the old consistent state
+    meanwhile) is the INTENDED contract but requires window resize/reconfigure, which
+    does not exist yet (the `xdg_toplevel` resize/maximize requests are still no-ops).
+    The gating mechanism is structured to extend to it. Also requires gating the
+    client's already-committed new-size buffer on the decoration clock -- a real
+    client-commit <-> plugin-clock coupling, designed with the resize milestone.
   - **No capability gate on `sdk.decorations`** (same as `sdk.gpu`/`sdk.window`).
   - **Match-once only** (no reassign on later app_id change).
   - **No plugin-teardown wiring of unregisterPlugin** (broker exposes it; main.ts
-    does not call it on plugin exit yet).
+    does not call it on plugin exit yet). A crashed provider's gated windows are
+    released by the unmap path or the timeout, but its registration lingers.
   - **Additive insets only** (shrink-content form needs client configure, deferred
     with resize). Border region not hit-tested (interactive regions later).
 
@@ -1430,20 +1442,17 @@ Menus/dropdowns/tooltips: a compositor-positioned, input-grabbing child surface.
   recorded in architecture.md ("The producer/consumer primitive"). Unbuilt; also
   presupposes a workspace/WM layer that does not exist yet. Build-order step (1)
   of "First plugin milestone" (generic plugin-composited surfaces: overlay +
-  stack layers + producer/consumer ring) IS built. **The next thing to pick up is
-  step (2): server-side window decorations drawn by a plugin** — a scoped first
-  cut is specced in architecture.md ("First decoration milestone (scoped to avoid
-  throwaway work)"): app_id-regex match (first registered match wins), FIXED
-  as-mapped size (no `xdg_toplevel` geometry — deferred to the layout-model
-  milestone to avoid throwaway), additive insets (outer grows, content/client
-  unchanged), minimal onMap/onUnmap window-state events, `xdg-decoration`
-  negotiation deferred. PREREQUISITES now built: the core->plugin event channel +
-  window-state stream (onMap/onUnmap/onChange) — see "Core event bus + window-state
-  stream". STILL needed before/with decorations: the app_id-regex provider registry
-  + `decoration.register` request; additive-inset reservation in the WM; a
-  capability gate on the decoration/window-observer tier. Also still flagged:
-  complete strict TypeScript types for the plugin SDK + de-loosen the gpu-broker/
-  protocol (a typed request map replacing the `unknown`->`as` chain) — not yet done.
+  stack layers + producer/consumer ring) IS built. **The scoped first-decoration
+  milestone is now COMPLETE** (app_id-regex match, additive insets, plugin-drawn
+  decoration surface, atomic content gating + timeout/deregister) — see "Decoration
+  provider: registration + insets + drawing + atomic gating". REMAINING decoration
+  work, deferred to later milestones: real `xdg_toplevel` geometry + reconfigure
+  gating (the resize/layout milestone); `xdg-decoration` negotiation (so a CSD client
+  is not double-decorated); a capability gate on the decoration/window-observer tier;
+  reassign-on-app_id-change; interactive-region hit-testing; plugin-teardown wiring of
+  `unregisterPlugin`. Also still flagged: complete strict TypeScript types for the
+  plugin SDK + de-loosen the gpu-broker/protocol (a typed request map replacing the
+  `unknown`->`as` chain) — not yet done.
 - **Multi-surface / real compositing.** Multiple surfaces, transforms, opacity,
   blending, client buffers, multi-output, damage — none done.
 - **Cross-thread N-API marshaling.** `napi_threadsafe_function` for Dawn-thread

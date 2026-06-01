@@ -32,6 +32,10 @@ export interface Window {
   surfaceRec: SurfaceHandle;
   // Decoration insets reserved around this window (additive). Absent = none.
   insets?: Insets;
+  // Content gating (decoration milestone piece 3): true while the window is held
+  // out of the draw stack waiting for its decoration's first frame, so content +
+  // decoration appear together (atomic). computeBaseStack skips gated windows.
+  contentGated?: boolean;
 }
 
 export interface WmState { output: Output; windows: Window[]; }
@@ -56,6 +60,12 @@ export interface Wm {
   // The outer rect of a window (content grown by its insets), or the content rect
   // when it has none. Used for decoration placement + (future) outer hit-testing.
   outerRectOf(surfaceId: number): Rect | undefined;
+  // Content gating (decoration piece 3): hold a window's content out of the draw
+  // stack (gated=true) until its decoration's first frame is ready, then release
+  // (gated=false) so content + decoration appear together. Rebuilds the stack via
+  // the injected rebuild hook. No-op if the surface is not a mapped window.
+  setContentGated(surfaceId: number, gated: boolean): void;
+  isContentGated(surfaceId: number): boolean;
 }
 
 // The outer rect = the content rect grown by the insets (additive): origin moves
@@ -75,7 +85,9 @@ export function createWm(compositor: CompositorSink, output: Output): Wm {
   const wm: WmState = { output, windows };
 
   function pushStack(): void {
-    compositor.setStack(windows.map((w) => w.surfaceId));
+    // Gated windows (waiting for their decoration's first frame) are held out of
+    // the draw stack so content + decoration appear together.
+    compositor.setStack(windows.filter((w) => !w.contentGated).map((w) => w.surfaceId));
   }
 
   return {
@@ -128,6 +140,20 @@ export function createWm(compositor: CompositorSink, output: Output): Wm {
       const win = windows.find((w) => w.surfaceId === surfaceId);
       if (!win) return undefined;
       return win.insets ? grow(win.rect, win.insets) : { ...win.rect };
+    },
+
+    setContentGated(surfaceId, gated) {
+      const win = windows.find((w) => w.surfaceId === surfaceId);
+      if (!win) return;
+      if (!!win.contentGated === gated) return;   // no change
+      win.contentGated = gated;
+      pushStack();   // re-push without/with this window; a fuller rebuild (popups/
+                     // subsurfaces) follows on the next sweep and also filters gated.
+    },
+
+    isContentGated(surfaceId) {
+      const win = windows.find((w) => w.surfaceId === surfaceId);
+      return win?.contentGated === true;
     },
 
     // Topmost window containing the output-space point, or null.

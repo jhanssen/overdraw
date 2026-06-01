@@ -66,6 +66,7 @@ export type WindowChangeEvent = {
 // Decoration-provider events (core -> the matched provider plugin).
 export const DECORATION_EVENT = {
   assigned: "decoration.assigned",
+  deregistered: "decoration.deregistered",
 } as const;
 
 // Emitted to a decoration-provider plugin when a mapped window matches its
@@ -79,6 +80,15 @@ export type DecorationAssignedEvent = {
   rect: WindowRect;
 };
 
+// Emitted to a provider that was permanently deregistered by the core (currently:
+// it failed to draw an assigned window's decoration within the timeout). The
+// provider receives no further assignments unless it re-registers. `windowId` is
+// the window whose first-frame deadline was missed.
+export type DecorationDeregisteredEvent = {
+  reason: string;
+  windowId: number;
+};
+
 // Compile-time assertion that the plugin-forwarded payloads stay clone-safe. If a
 // field is ever added that is not structured-clone-safe, the build fails rather
 // than silently passing a non-cloneable value over postMessage.
@@ -87,3 +97,4 @@ export type _MapIsCloneable = AssignableToCloneable<WindowMapEvent>;
 export type _UnmapIsCloneable = AssignableToCloneable<WindowUnmapEvent>;
 export type _ChangeIsCloneable = AssignableToCloneable<WindowChangeEvent>;
 export type _AssignedIsCloneable = AssignableToCloneable<DecorationAssignedEvent>;
+export type _DeregisteredIsCloneable = AssignableToCloneable<DecorationDeregisteredEvent>;

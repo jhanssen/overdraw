@@ -6,12 +6,11 @@ export default async function init(sdk) {
   await sdk.decorations.register("^org\\.test\\.deco$");
   sdk.decorations.onAssigned(async (ev) => {
     try {
-      const grant = await sdk.decorations.requestInsets(ev.surfaceId,
-        { top: 24, right: 0, bottom: 0, left: 0 });
-      // Decoration surface at the outer rect (content grown by the top inset), on
-      // the `below` layer so the opaque content draws over it -- only the inset
-      // border band shows the decoration (additive-inset border model).
-      const surf = await sdk.gpu.createSurfaceAt(grant.outerRect, "below");
+      // One call: reserve additive insets + create the decoration surface at the
+      // outer rect, on the `below` layer (opaque content draws over it -- only the
+      // inset border band shows). Its first present releases the gated content.
+      const surf = await sdk.decorations.createDecoration(ev.surfaceId,
+        { insets: { top: 24, right: 0, bottom: 0, left: 0 }, layer: "below" });
       const dev = sdk.gpu.device;
       const tex = surf.getCurrentTexture();
       const enc = dev.createCommandEncoder();
@@ -25,7 +24,7 @@ export default async function init(sdk) {
       pass.end();
       dev.queue.submit([enc.finish()]);
       await surf.present();
-      sdk.log("decorated " + JSON.stringify(grant.outerRect));
+      sdk.log("decorated " + JSON.stringify(surf.rect));
     } catch (e) {
       sdk.log("deco_err " + String(e && e.message ? e.message : e));
     }

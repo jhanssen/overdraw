@@ -62,25 +62,24 @@ export interface Surface {
   present(): Promise<void>;
 }
 
-// An explicit output-space rect (used by decorations, whose geometry the core
-// already decided via the inset reservation -- not anchor-based like overlays).
-export interface SurfaceRect { x: number; y: number; width: number; height: number; }
-
 export interface PluginGpu {
   device: GPUDevice;
   createOverlay(opts: CreateOverlayOpts): Promise<Surface>;
-  // Create a producer/consumer ring surface placed at an EXPLICIT rect on a layer
-  // (the core uses the rect verbatim, no anchor/clamp). For decorations: the rect
-  // is the inset outerRect from sdk.decorations.requestInsets.
-  createSurfaceAt(rect: SurfaceRect, layer: OverlayLayer): Promise<Surface>;
 }
+
+// Internal producer/consumer ring allocator (NOT plugin-facing). `allocExtra`
+// carries the geometry source + any tags (anchor for overlays; an explicit rect +
+// `decorates` window id for decorations). createDecoration (decorations.ts) uses
+// this to place a ring at the inset outer rect; there is no public explicit-rect
+// surface API yet (add one when a concrete use case defines the args).
+export type RingMaker = (width: number, height: number, allocExtra: Record<string, Json>) => Promise<Surface>;
 
 // Bring up the Worker's GPU (device over its own wire) + return the SDK gpu
 // object. `endpoint` brokers side-channel control through the core. `deviceBin`
 // /`dawnPath` are absolute paths to the two native modules.
 export async function createPluginGpu(
   endpoint: Endpoint, pluginAddonPath: string, dawnPath: string,
-): Promise<{ gpu: PluginGpu; pump: () => void }> {
+): Promise<{ gpu: PluginGpu; pump: () => void; makeRingSurface: RingMaker }> {
   const require = createRequire(import.meta.url);
   const plugin = require(pluginAddonPath) as PluginAddon;
   const dawn = require(dawnPath) as DawnModule;
@@ -175,14 +174,7 @@ export async function createPluginGpu(
         margin: opts.margin ?? 0,
       });
     },
-    createSurfaceAt(rect: SurfaceRect, layer: OverlayLayer): Promise<Surface> {
-      // Explicit-rect placement: the core places the surface at `rect` verbatim on
-      // `layer` (no anchor/clamp). width/height come from the rect.
-      return makeRingSurface(rect.width, rect.height, {
-        layer, rect: { x: rect.x, y: rect.y, width: rect.width, height: rect.height },
-      });
-    },
   };
 
-  return { gpu, pump };
+  return { gpu, pump, makeRingSurface };
 }

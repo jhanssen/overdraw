@@ -20,7 +20,7 @@ import type { Json } from "./protocol.js";
 import { createSdk } from "./sdk.js";
 import type { PluginSdk } from "./sdk.js";
 import { createPluginGpu } from "./gpu.js";
-import type { PluginGpu } from "./gpu.js";
+import type { PluginGpu, RingMaker } from "./gpu.js";
 import { createWindowObserver } from "./window-observer.js";
 import { createDecorations } from "./decorations.js";
 
@@ -47,9 +47,11 @@ async function main(): Promise<void> {
   // sdk.gpu is ready. Only when the runtime provided the native module paths
   // (i.e. the plugin has the `gpu` capability). Keeps a steady-state pump going.
   let gpu: PluginGpu | undefined;
+  let makeRingSurface: RingMaker | undefined;
   if (pluginAddonPath && dawnPath) {
     const g = await createPluginGpu(endpoint, pluginAddonPath, dawnPath);
     gpu = g.gpu;
+    makeRingSurface = g.makeRingSurface;
     const t = setInterval(g.pump, 4);  // keep the plugin wire flowing
     t.unref?.();
   }
@@ -58,13 +60,13 @@ async function main(): Promise<void> {
   // events; this observer dispatches them to the plugin's registered handlers.
   const windows = createWindowObserver();
 
-  // Decoration provider (sdk.decorations.register / onAssigned). Registers app_id
-  // patterns and dispatches decoration.assigned events.
-  const decorations = createDecorations(endpoint);
+  // Decoration provider (sdk.decorations). Needs the GPU ring allocator to draw, so
+  // it is only available when the GPU is up (createDecoration draws a surface).
+  const decorations = makeRingSurface ? createDecorations(endpoint, makeRingSurface) : undefined;
 
   // SDK logs are forwarded to the core as one-way events (the core prints them).
   const control = createSdk(name, (line) => { endpoint.emit("log", line); },
-    gpu, windows.observer, decorations.decorations);
+    gpu, windows.observer, decorations?.decorations);
 
   // The only request the core sends in scope B is 'shutdown'. Run the registered
   // onShutdown callback; resolving lets the core proceed to terminate.
@@ -77,7 +79,8 @@ async function main(): Promise<void> {
   // decoration observer; the first that recognizes the name consumes it. Unknown
   // names are ignored (forward-compatible with future core-originated events).
   endpoint.handleEvents((eventName, data) => {
-    windows.dispatch(eventName, data) || decorations.dispatch(eventName, data);
+    if (windows.dispatch(eventName, data)) return;
+    decorations?.dispatch(eventName, data);
   });
 
   // Pings are auto-ponged by the Endpoint default (no explicit ping handler), so

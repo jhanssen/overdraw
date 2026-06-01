@@ -30,18 +30,20 @@ export interface DecorationRegistry {
   // (a RegExp source string + optional flags). Throws on an invalid pattern.
   // Registration order is significant: first match wins.
   register(pluginName: string, pattern: string, flags?: string): void;
-  // Drop all providers for a plugin (plugin teardown).
+  // Drop all providers for a plugin (plugin teardown, or a timed-out provider).
   unregisterPlugin(pluginName: string): void;
   // Introspection (tests).
   assignmentOf(surfaceId: number): string | undefined;
 }
 
-// emitToPlugin pushes a one-way event to one plugin Worker by name (main.ts wires
-// this to PluginRuntime.emit). The registry never talks to Workers directly.
-export type EmitToPlugin = (pluginName: string, name: string, data: DecorationAssignedEvent) => void;
+// Fired when a window is assigned to a provider (match-once). The broker reacts:
+// notify the plugin, gate the window's content, arm the first-frame timeout.
+export type OnAssigned = (ev: DecorationAssignedEvent, pluginName: string) => void;
+// Fired when a tracked window unmaps. The broker releases its gate + state.
+export type OnUnmapped = (surfaceId: number) => void;
 
 export function createDecorationRegistry(
-  bus: CompositorBus, emitToPlugin: EmitToPlugin,
+  bus: CompositorBus, onAssigned: OnAssigned, onUnmapped: OnUnmapped,
 ): DecorationRegistry {
   const providers: Provider[] = [];
   // surfaceId -> pluginName it is assigned to (match-once).
@@ -59,8 +61,7 @@ export function createDecorationRegistry(
     for (const p of providers) {
       if (p.regex.test(appId)) {
         assignments.set(surfaceId, p.pluginName);
-        emitToPlugin(p.pluginName, DECORATION_EVENT.assigned,
-          { surfaceId, appId, title, rect });
+        onAssigned({ surfaceId, appId, title, rect }, p.pluginName);
         return;   // first match wins
       }
     }
@@ -84,6 +85,7 @@ export function createDecorationRegistry(
   bus.on(WINDOW_EVENT.unmap, (ev: WindowUnmapEvent) => {
     lastRect.delete(ev.surfaceId);
     assignments.delete(ev.surfaceId);
+    onUnmapped(ev.surfaceId);
   });
 
   return {
@@ -97,8 +99,8 @@ export function createDecorationRegistry(
       for (let i = providers.length - 1; i >= 0; i--) {
         if (providers[i].pluginName === pluginName) providers.splice(i, 1);
       }
-      // Leave existing assignments; a torn-down plugin's windows simply lose their
-      // (already-delivered) provider. Piece 3 handles surface teardown.
+      // Leave existing assignments; a torn-down/timed-out plugin's windows simply
+      // lose their (already-delivered) provider.
     },
     assignmentOf(surfaceId) { return assignments.get(surfaceId); },
   };
