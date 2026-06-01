@@ -4,7 +4,7 @@ Tracks what is built and empirically proven versus what is still design only.
 The design itself lives in `architecture.md`; this file is the ground truth for
 "what exists right now."
 
-Last updated: 2026-05-31 (rev 33).
+Last updated: 2026-05-31 (rev 34).
 
 ## Protocol gaps & skeletons (READ FIRST)
 
@@ -911,6 +911,45 @@ onMap/onUnmap + title/app_id-changed window-state events).
   - **Pre-map redundancy (minor):** a `set_app_id`/`set_title` before first content
     is flushed at the map frame, so a window.change (title,appId,activated) fires
     alongside window.map re-affirming the same state. Harmless; not suppressed.
+
+### Plugin surface ring: SharedArrayBuffer slot-state (fixes animated-surface corruption) — BUILT, tested
+The producer/consumer ring's slot ownership is now a lock-free state machine shared
+between the plugin Worker (producer) and the core (consumer) via a SharedArrayBuffer
++ Atomics (`src/plugins/surface-slots.ts`). This replaced a blind round-robin `write`
+pointer that handed `getCurrentTexture()` a slot regardless of whether the consumer/
+GPU was still using it -- which corrupted CONTINUOUSLY-ANIMATED surfaces (a plugin
+presenting every frame) with "used in a submit without current access to
+SharedTextureMemory" and black frames. Static / slowly-paced surfaces (present once,
+or with a sleep between presents) masked it; a 60fps animated decoration exposed it.
+
+- **Slot states** (one Int32 per ring slot, atomic CAS transitions): `FREE` ->
+  `ACQUIRED` (producer claims via getCurrentTexture; CAS makes this safe against
+  multiple producer threads sharing a surface) -> `PRESENTED` (handed to the
+  consumer; the latest, re-sampled every frame) -> `DRAINING` (superseded by a newer
+  present) -> `FREE`. Single-writer-per-edge except the FREE->ACQUIRED CAS race.
+- **getCurrentTexture is now async**: it CAS-claims a FREE slot, or `Atomics.waitAsync`
+  (NOT wait -- the Worker event loop must keep turning for watchdog pongs) until one
+  frees, then retries. It NEVER returns a slot in use; present() throws on a non-
+  ACQUIRED slot (invariant guard). The SAB rides the surface.alloc response (shared
+  by reference; validated at the worker boundary, it is not Json).
+- **The DRAINING->FREE flip is gated on the consumer's GPU completion**
+  (`onSubmittedWorkDone` via the compositor's new `afterCurrentFrame(cb)`), NOT done
+  eagerly -- the atomic mirrors the fence; the GPU read-before-write ordering is still
+  the GPU process's SharedFence brackets. The core demotes the prior PRESENTED ->
+  DRAINING on each new present and frees it after the frame that last sampled it
+  completes (then ends its consumer bracket + reopens its producer bracket).
+- **3 slots**: at full pipelining up to one ACQUIRED + one PRESENTED + one DRAINING
+  are busy, so a 3rd keeps a FREE one usually available; getCurrentTexture awaits
+  (correct backpressure) only when the producer outruns the consumer+GPU.
+- **Also fixed (pre-existing, found while debugging)**: a wire-fd-poll vs ctrl-fd-poll
+  reply-dispatch race in `native/napi/addon.cpp` (the wire poll drained ctrl replies
+  but only advanced dmabuf-import callbacks, stranding plugin-broker
+  alloc/begin/conn/inject replies -> post-init surface creation hung intermittently).
+  Fixed by `advanceAllPending()` after drainCtrl in both polls.
+- **Verified**: `test/example-decoration.gpu.mjs` (the shipped example animates a
+  shader gradient titlebar -- continuous presents, pixel changes across frames, no
+  access errors), and all overlay/decoration GPU tests still pass. GPU 35/35,
+  GPU-free 115/115. The corruption that motivated this is gone (10/10 + 6/6 stress).
 
 ### Decoration provider: registration + insets + drawing + atomic gating (decoration milestone, pieces 1+2+3) — BUILT, tested
 Server-side decorations, end to end: a plugin registers an app_id pattern, is told

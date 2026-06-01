@@ -8,7 +8,7 @@ export default async function init(sdk) {
     layer: "overlay", anchor: "top-left", width: 64, height: 64,
   });
   const dev = sdk.gpu.device;
-  const tex = surface.getCurrentTexture();
+  const tex = await surface.getCurrentTexture();
   const enc = dev.createCommandEncoder();
   enc.beginRenderPass({
     colorAttachments: [{

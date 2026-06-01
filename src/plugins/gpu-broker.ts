@@ -11,6 +11,7 @@ import type { CompositorSink } from "../protocols/ctx.js";
 import type { OverlayBroker, OverlayLayer } from "../overlay.js";
 import type { OverlayAnchor } from "../overlay-position.js";
 import type { DawnWire } from "../gpu/compositor.js";
+import { SlotStates, createSlotStates } from "./surface-slots.js";
 
 const pCreateConn = (a: Addon) => new Promise<{ connId: number; fd: number }>((res, rej) =>
   a.pluginCreateConnection((r: { connId: number; fd: number } | null) => r ? res(r) : rej(new Error("createConnection"))));
@@ -32,8 +33,9 @@ interface OverlaySurface {
   surfaceId: number;      // compositor surface id (== overlay broker id)
   width: number;
   height: number;
-  slots: number[];        // surfaceBufIds, one per ring slot
-  consumerSlot: number;   // slot currently bracket-open for the consumer (-1 = none)
+  slots: number[];        // surfaceBufIds, indexed by ring-slot index
+  consumerSlot: number;   // ring-slot index currently bracket-open for the consumer (-1)
+  slotStates: SlotStates; // shared FREE/ACQUIRED/PRESENTED/DRAINING ownership (SAB)
 }
 
 export interface GpuBrokerDeps {
@@ -92,17 +94,22 @@ export function createGpuBroker(deps: GpuBrokerDeps) {
               layer: (p.layer as OverlayLayer) ?? "overlay",
               anchor: (p.anchor as OverlayAnchor) ?? "center", width, height, margin: p.margin as number,
             });
-        void slots;
+        // Shared slot-ownership state (SAB) for this surface's ring. Shared to the
+        // Worker in the response; both sides agree on FREE/ACQUIRED/PRESENTED/
+        // DRAINING via atomics (surface-slots.ts).
+        const { sab, states } = createSlotStates(slots);
         const surf: OverlaySurface = {
           surfaceId: handle.surfaceId, width, height, slots: [], consumerSlot: -1,
+          slotStates: new SlotStates(sab),
         };
+        void states;
         surfaces.set(handle.surfaceId, surf);
         pendingAlloc.set(handle.surfaceId, { width, height, overlaySurfaceId: handle.surfaceId });
         // If this surface decorates a window, tell the decoration layer the link
         // (generic tag; the broker does not interpret it).
         const decorates = p.decorates as number | undefined;
         if (typeof decorates === "number") onSurfaceAllocated(handle.surfaceId, decorates);
-        return { overlayId: handle.surfaceId, rect: handle.rect };
+        return { overlayId: handle.surfaceId, rect: handle.rect, slotsSab: sab };
       }
       case "surface.bindProducer": {
         const overlayId = p.overlayId as number;
@@ -120,25 +127,36 @@ export function createGpuBroker(deps: GpuBrokerDeps) {
       }
       case "surface.present": {
         const connId = connByPlugin.get(pluginName);
-        const slotBufId = p.surfaceBufId as number;
+        const slotIdx = p.slot as number;            // ring-slot index (SAB-tracked)
+        const slotBufId = p.surfaceBufId as number;  // the slot's surfaceBufId
         const surf = surfaceByBuf.get(slotBufId);
         if (connId === undefined || !surf) throw new Error("present: unknown surface");
         // Producer done on the presented slot (deferred on the plugin-wire serial).
         addon.pluginSurfaceProducerEndW(slotBufId, (p.wireSerial as bigint) ?? 0n);
-        // Switch the consumer read bracket to the just-presented slot: end the old
-        // slot's bracket (freeing it for the producer to render into next), then
-        // begin the new slot's (waits its producer fence). The bracket stays OPEN
-        // so the compositor samples within it each frame until the next present.
-        // Double-buffered: the producer renders the OTHER slot while this is held.
-        if (surf.consumerSlot >= 0 && surf.consumerSlot !== slotBufId) {
-          addon.pluginSurfaceConsumerEnd(surf.consumerSlot);
-          // Reopen the producer bracket on the freed slot for the plugin's next frame.
-          await pProducerBegin(addon, surf.consumerSlot);
-        }
-        await pConsumerBegin(addon, slotBufId);
-        surf.consumerSlot = slotBufId;
+        // Switch the consumer read bracket to the just-presented slot. OPEN the new
+        // bracket + install its texture BEFORE freeing the old one, so the surface
+        // always has an open, valid consumer bracket when renderFrame samples it.
+        const prevIdx = surf.consumerSlot;
+        await pConsumerBegin(addon, slotBufId);      // waits this slot's producer fence
         const tex = dawn.wrapTexture(coreDeviceHandle, addon.pluginConsumerTexture(slotBufId));
         compositor.setSurfaceTexture?.(surf.surfaceId, tex, surf.width, surf.height);
+        surf.consumerSlot = slotIdx;
+        // The just-presented slot is the new latest (the worker CAS'd it to
+        // PRESENTED). Demote + recycle the PREVIOUS slot: PRESENTED->DRAINING now,
+        // then free it (DRAINING->FREE) + end its consumer bracket + reopen its
+        // producer bracket ONLY after the compositor submit that last sampled it
+        // completes on the GPU (afterCurrentFrame) -- else EndAccess races the read.
+        if (prevIdx >= 0 && prevIdx !== slotIdx) {
+          const prevBufId = surf.slots[prevIdx];
+          surf.slotStates.demote(prevIdx);           // PRESENTED -> DRAINING (atomic)
+          const recycle = (): void => {
+            addon.pluginSurfaceConsumerEnd(prevBufId);
+            void pProducerBegin(addon, prevBufId);
+            surf.slotStates.free(prevIdx);            // DRAINING -> FREE; wakes producer
+          };
+          if (compositor.afterCurrentFrame) compositor.afterCurrentFrame(recycle);
+          else recycle();
+        }
         // A frame is now installed for this surface; notify the decoration layer
         // (it filters for its own surfaces) so a first decoration frame can release
         // the gated content. Generic; the broker does not interpret it.

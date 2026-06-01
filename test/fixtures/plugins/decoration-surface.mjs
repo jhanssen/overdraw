@@ -12,7 +12,7 @@ export default async function init(sdk) {
       const surf = await sdk.decorations.createDecoration(ev.surfaceId,
         { insets: { top: 24, right: 0, bottom: 0, left: 0 }, layer: "below" });
       const dev = sdk.gpu.device;
-      const tex = surf.getCurrentTexture();
+      const tex = await surf.getCurrentTexture();
       const enc = dev.createCommandEncoder();
       const pass = enc.beginRenderPass({
         colorAttachments: [{

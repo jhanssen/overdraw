@@ -21,7 +21,7 @@ export default async function init(sdk) {
   void (async () => {
     for (let cycle = 0; cycle < 30; cycle++) {
       const f = frames[cycle % frames.length];
-      const tex = surface.getCurrentTexture();
+      const tex = await surface.getCurrentTexture();
       const enc = dev.createCommandEncoder();
       enc.beginRenderPass({
         colorAttachments: [{

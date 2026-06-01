@@ -65,6 +65,10 @@ export interface CompositorSink {
   takeImportedSurfaces(): Array<{ id: number; width: number; height: number }>;
   takeFreedBuffers(): number[];
   renderFrame?(): void;
+  // Run a callback once the compositing submit in flight at call time completes on
+  // the GPU. The plugin/overlay ring uses this to recycle a consumer slot only
+  // after the frame that last sampled it is done (avoids EndAccess racing the read).
+  afterCurrentFrame?(cb: () => void): void;
 }
 
 export interface CompositorState {

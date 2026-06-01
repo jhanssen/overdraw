@@ -141,6 +141,10 @@ export class JsCompositor implements CompositorSink {
   private completedSerial = 0;
   private retiring: RetiringBuffer[] = [];
   private freed: number[] = [];
+  // Callbacks deferred until the compositing submit in flight at registration time
+  // completes on the GPU. Used to recycle a plugin/overlay consumer slot only after
+  // the frame that last sampled it is done (else EndAccess races the GPU read).
+  private afterFrame: Array<{ serial: number; cb: () => void }> = [];
 
   // dmabuf support (optional; only needed when dmabuf clients run under the JS
   // compositor). `dawn` provides wrapTexture; `deviceHandle` is the wire device.
@@ -347,6 +351,28 @@ export class JsCompositor implements CompositorSink {
     return out;
   }
 
+  // Run `cb` once the compositing submit currently in flight (the latest issued)
+  // has completed on the GPU -- i.e. after any frame that may have sampled a
+  // surface's now-superseded consumer slot is done reading it. If no submit is
+  // outstanding, runs on the next completion (a frame is always coming). Used by
+  // the plugin/overlay ring to recycle a consumer slot without racing the GPU read.
+  afterCurrentFrame(cb: () => void): void {
+    this.afterFrame.push({ serial: this.submitSerial, cb });
+  }
+
+  private runAfterFrame(): void {
+    if (this.afterFrame.length === 0) return;
+    const keep: Array<{ serial: number; cb: () => void }> = [];
+    for (const e of this.afterFrame) {
+      if (e.serial <= this.completedSerial) {
+        try { e.cb(); } catch (err) { console.warn("[js-compositor] afterCurrentFrame cb threw", err); }
+      } else {
+        keep.push(e);
+      }
+    }
+    this.afterFrame = keep;
+  }
+
   private reapRetiring(): void {
     if (this.retiring.length === 0) return;
     const keep: RetiringBuffer[] = [];
@@ -463,6 +489,7 @@ export class JsCompositor implements CompositorSink {
     this.device.queue.onSubmittedWorkDone().then(() => {
       if (serial > this.completedSerial) this.completedSerial = serial;
       this.reapRetiring();
+      this.runAfterFrame();
     });
 
     if (presenting) {
