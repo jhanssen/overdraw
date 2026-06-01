@@ -4,7 +4,7 @@ Tracks what is built and empirically proven versus what is still design only.
 The design itself lives in `architecture.md`; this file is the ground truth for
 "what exists right now."
 
-Last updated: 2026-05-31 (rev 28).
+Last updated: 2026-05-31 (rev 29).
 
 ## Protocol gaps & skeletons (READ FIRST)
 
@@ -852,6 +852,11 @@ surface the core composites on top at a core-decided rect).
   no capability gate on `gpu` (every plugin gets the GPU paths); plugin teardown
   does not release the surface ring / connection (leak on exit — must fix before
   multi-plugin churn); only 2 slots (fine; 3 would fully decouple the clocks).
+  Also: `src/plugins/gpu-broker.ts` + `gpu.ts` are LOOSELY TYPED (the Worker↔core
+  request params are an `unknown` bag cast field-by-field with `as`); the
+  strict-typing rule wants a typed request map. Flagged; not yet fixed. (The
+  eslint config bans `as any`/`as unknown` but not `x as ConcreteType` from
+  `unknown`, so this passes lint — a known loophole.)
 
 ### Plugin GPU end-to-end: device + shared surface + per-frame fence (C-M4 steps 1-3) — HISTORICAL (superseded by the Worker path)
 NOTE: steps 1-3 were originally built on the MAIN thread (a core-side
@@ -1300,12 +1305,18 @@ Menus/dropdowns/tooltips: a compositor-positioned, input-grabbing child surface.
   plugin-captures/takes-over), capture uniform over the surface graph, the
   reversed-OffscreenCanvas model, and the overview-animation worked example — is
   recorded in architecture.md ("The producer/consumer primitive"). Unbuilt; also
-  presupposes a workspace/WM layer that does not exist yet. A concrete buildable
-  starting point — generic plugin-composited surfaces (overlay/decoration provider:
-  request->core-grants-geometry->plugin-populates, stack-layer model, window-state
-  events, inset + interactive-region declarations, 3-step build order) — is specced
-  in architecture.md ("First plugin milestone: generic plugin-composited surfaces").
-  This is the next thing to pick up.
+  presupposes a workspace/WM layer that does not exist yet. Build-order step (1)
+  of "First plugin milestone" (generic plugin-composited surfaces: overlay +
+  stack layers + producer/consumer ring) IS built. **The next thing to pick up is
+  step (2): server-side window decorations drawn by a plugin** — a scoped first
+  cut is specced in architecture.md ("First decoration milestone (scoped to avoid
+  throwaway work)"): app_id-regex match (first registered match wins), FIXED
+  as-mapped size (no `xdg_toplevel` geometry — deferred to the layout-model
+  milestone to avoid throwaway), additive insets (outer grows, content/client
+  unchanged), minimal onMap/onUnmap window-state events, `xdg-decoration`
+  negotiation deferred. Plus, before that work: complete strict TypeScript types
+  for the plugin SDK + de-loosen the gpu-broker/protocol (a typed request map
+  replacing the `unknown`->`as` chain) -- flagged but not yet done.
 - **Multi-surface / real compositing.** Multiple surfaces, transforms, opacity,
   blending, client buffers, multi-output, damage — none done.
 - **Cross-thread N-API marshaling.** `napi_threadsafe_function` for Dawn-thread

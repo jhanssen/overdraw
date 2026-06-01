@@ -98,6 +98,18 @@ and cleaned up carefully.
   user with the reason rather than silently leaving it uncovered.
 - Keep `npm test` GPU-free; GPU/host-Wayland tests go in `test/*.gpu.mjs`
   (`npm run test:gpu`). No interactive (human-in-the-loop) tests.
+- **Do not COMMIT artifacts you already know you'll delete.** Verifying
+  throwaway / scaffolding code (incremental milestone steps you'll replace,
+  spikes) is still required — surface problems early. But the act of *committing*
+  a test (or any file) you know is transient creates add-then-remove churn in the
+  history, which is the waste. So: verify in the working tree (a scratch script,
+  a temporary `test/` file you run via `node --test <file>` directly, a temporary
+  assertion) and DELETE it before committing — it never enters git. Only commit
+  tests for code meant to PERSIST. Decide "is this path throwaway?" BEFORE you
+  commit, not after. Anti-pattern from this project: committing
+  `plugin-connect.gpu.mjs` / `plugin-surface-fence.gpu.mjs` for the main-thread
+  plugin path in one commit, then deleting them when the Worker path landed — the
+  verification was right; committing the transient tests was not.
 
 ## Bisecting wire / device-async issues
 

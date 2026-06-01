@@ -557,6 +557,51 @@ status.md "Protocol gaps"); (3) decorations as a thin policy bundle on top
 (bind a provider surface to each window's reserved insets). Each later step is
 small once (1) is generic.
 
+### First decoration milestone (scoped to avoid throwaway work) — NOT BUILT
+
+Step (1) above is built (see status.md "First plugin milestone COMPLETE"). The
+NEXT milestone is server-side window decorations drawn by a plugin. To avoid
+building anything the (undesigned) WM/layout model would force a rewrite of, this
+first cut is deliberately narrow:
+
+- **Decoration-provider registration by `app_id` regex.** A plugin registers as a
+  decoration compositor with a regex matched against a window's `app_id` (the
+  Wayland field set via `xdg_toplevel.set_app_id`). On map, if the regex matches,
+  that plugin gets to decorate the window. If multiple registered plugins match,
+  the FIRST registered to match wins (deterministic, registration order).
+- **Fixed size — no `xdg_toplevel` geometry.** v1 uses the window's AS-MAPPED
+  content size and does NOT send the client any configure/resize. This keeps
+  decorations decoupled from the no-op `xdg_toplevel` resize/maximize path
+  (status.md "Protocol gaps"), which must NOT be implemented until the WM/layout
+  policy is designed — otherwise that work is throwaway. Real resize/maximize +
+  `xdg_toplevel` geometry is explicitly deferred to the layout-model milestone.
+- **Additive insets (outer grows, content unchanged).** `requestInsets(windowId,
+  {top,right,bottom,left})` makes the window's OUTER rect = the as-mapped content
+  rect GROWN by the insets; the content rect stays the as-mapped size and the
+  client is never told anything (it rendered NxM and still does). The decoration
+  surface occupies the inset border region around the content. This is distinct
+  from the eventual "insets shrink content within a fixed outer" form, which needs
+  client configure (the deferred geometry work). The core still decides/clamps the
+  granted insets and returns them.
+- **Compositing order is free.** Decoration surface and content occupy (mostly)
+  disjoint regions, so the core may composite decoration-then-content or
+  content-then-decoration; the decoration binds to a stack layer just behind/
+  around its window's content.
+- **Window-state events needed for v1 are minimal:** `onMap(window)` with
+  `{ surfaceId, appId, rect }` and `onUnmap`. Resize/focus/title-change events are
+  deferred (the size is fixed, so a decorated window is static after map).
+- **`xdg-decoration` negotiation deferred.** v1 does NOT negotiate server- vs
+  client-side decorations, so a client that draws its own CSD would get BOTH its
+  CSD and the plugin frame. Acceptable for v1 (target `app_id`s known to be
+  server-decoration-friendly); proper `xdg-decoration` (tell the client "server
+  decorates, don't self-decorate") lands with the layout/geometry milestone.
+
+The new capability is the **decoration/surface-provider tier** noted above
+(sees every matched window's `app_id`/state, so gated deliberately like tier 3).
+The decoration surface itself is the existing producer/consumer ring (the same
+machinery `createOverlay` uses), just placed at a window-relative inset rect
+instead of a free overlay rect.
+
 ## Wayland protocols: implementation layers
 
 Wayland is the compositor's external API. Real clients (browsers,
