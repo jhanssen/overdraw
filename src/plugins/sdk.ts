@@ -10,6 +10,7 @@ export type ShutdownCallback = () => void | Promise<void>;
 
 import type { PluginGpu } from "./gpu.js";
 import type { PluginWindowObserver } from "./window-observer.js";
+import type { PluginDecorations } from "./decorations.js";
 
 export interface PluginSdk {
   // The plugin's stable name (config `name`, defaulting to its module).
@@ -26,6 +27,11 @@ export interface PluginSdk {
   // the foundation for decorations (architecture.md "First decoration milestone").
   // Always present in the current runtime (no capability gate yet -- flagged).
   window?: PluginWindowObserver;
+  // Decoration provider: register an app_id pattern + observe assigned windows.
+  // No capability gate yet (this tier is meant to be gated like tier 3 -- it sees
+  // every matched window's app_id/state -- but the capability system is unbuilt;
+  // flagged). Always present in the current runtime.
+  decorations?: PluginDecorations;
 }
 
 // Internal handle the bootstrap uses to drive the SDK (run the shutdown cb, etc.)
@@ -36,7 +42,8 @@ export interface SdkControl {
 }
 
 export function createSdk(name: string, emitLog: (line: string) => void,
-                          gpu?: PluginGpu, window?: PluginWindowObserver): SdkControl {
+                          gpu?: PluginGpu, window?: PluginWindowObserver,
+                          decorations?: PluginDecorations): SdkControl {
   let shutdownCb: ShutdownCallback | null = null;
 
   const sdk: PluginSdk = {
@@ -51,6 +58,7 @@ export function createSdk(name: string, emitLog: (line: string) => void,
     },
     ...(gpu ? { gpu } : {}),
     ...(window ? { window } : {}),
+    ...(decorations ? { decorations } : {}),
   };
 
   return {

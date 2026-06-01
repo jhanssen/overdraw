@@ -22,6 +22,7 @@ import type { PluginSdk } from "./sdk.js";
 import { createPluginGpu } from "./gpu.js";
 import type { PluginGpu } from "./gpu.js";
 import { createWindowObserver } from "./window-observer.js";
+import { createDecorations } from "./decorations.js";
 
 interface BootstrapData {
   module: string;
@@ -57,8 +58,13 @@ async function main(): Promise<void> {
   // events; this observer dispatches them to the plugin's registered handlers.
   const windows = createWindowObserver();
 
+  // Decoration provider (sdk.decorations.register / onAssigned). Registers app_id
+  // patterns and dispatches decoration.assigned events.
+  const decorations = createDecorations(endpoint);
+
   // SDK logs are forwarded to the core as one-way events (the core prints them).
-  const control = createSdk(name, (line) => { endpoint.emit("log", line); }, gpu, windows.observer);
+  const control = createSdk(name, (line) => { endpoint.emit("log", line); },
+    gpu, windows.observer, decorations.decorations);
 
   // The only request the core sends in scope B is 'shutdown'. Run the registered
   // onShutdown callback; resolving lets the core proceed to terminate.
@@ -67,9 +73,12 @@ async function main(): Promise<void> {
     throw new Error(`unknown request method '${method}'`);
   });
 
-  // Core -> plugin one-way events: route window.* to the observer. Unknown event
+  // Core -> plugin one-way events: offer each to the window observer, then the
+  // decoration observer; the first that recognizes the name consumes it. Unknown
   // names are ignored (forward-compatible with future core-originated events).
-  endpoint.handleEvents((eventName, data) => { windows.dispatch(eventName, data); });
+  endpoint.handleEvents((eventName, data) => {
+    windows.dispatch(eventName, data) || decorations.dispatch(eventName, data);
+  });
 
   // Pings are auto-ponged by the Endpoint default (no explicit ping handler), so
   // a responsive event loop answers them; nothing more to wire here.

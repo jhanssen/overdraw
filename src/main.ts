@@ -19,6 +19,7 @@ import { parseConfigArg, loadConfig } from "./config/load.js";
 import { PluginRuntime } from "./plugins/index.js";
 import { createOverlayBroker } from "./overlay.js";
 import { createGpuBroker } from "./plugins/gpu-broker.js";
+import { createDecorationBroker } from "./plugins/decoration-broker.js";
 import { JsCompositor } from "./gpu/compositor.js";
 import type { DawnWire, DawnGlobals } from "./gpu/compositor.js";
 import type { Addon, InputEvent } from "./types.js";
@@ -138,13 +139,25 @@ if (config.plugins.length > 0) {
   const [dawnNodePath] = globSync(join(__dirname, "..", "build", "3rdparty", "dawn", "Dawn-*", "dawn.node"));
   const pluginAddonPath = join(__dirname, "..", "build", "overdraw_plugin_native.node");
 
+  // Decoration broker: services decoration.* requests + owns the app_id-regex
+  // provider registry, which subscribes to the bus and notifies matched plugins.
+  // emitToPlugin lazily references `runtime` (assigned below; matches fire only
+  // after a client maps, well after load).
+  const decorationBroker = createDecorationBroker({
+    bus,
+    emitToPlugin: (plugin, name, data) => { runtime?.emit(plugin, name, data); },
+  });
+
   runtime = new PluginRuntime({
     pluginAddonPath,
     dawnPath: dawnNodePath,
     onEvent: (plugin, name, data) => {
       if (name === "log") console.log(`[plugin ${plugin}] ${String(data)}`);
     },
-    onRequest: (plugin, method, params) => gpuBroker(plugin, method, params),
+    onRequest: (plugin, method, params) =>
+      method.startsWith("decoration.")
+        ? decorationBroker.onRequest(plugin, method, params)
+        : gpuBroker(plugin, method, params),
   });
   await runtime.load(resolved);
   const summary = runtime.states().map((s) => `${s.name}=${s.state}`).join(", ");

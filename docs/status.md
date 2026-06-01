@@ -4,7 +4,7 @@ Tracks what is built and empirically proven versus what is still design only.
 The design itself lives in `architecture.md`; this file is the ground truth for
 "what exists right now."
 
-Last updated: 2026-05-31 (rev 30).
+Last updated: 2026-05-31 (rev 31).
 
 ## Protocol gaps & skeletons (READ FIRST)
 
@@ -911,6 +911,46 @@ onMap/onUnmap + title/app_id-changed window-state events).
   - **Pre-map redundancy (minor):** a `set_app_id`/`set_title` before first content
     is flushed at the map frame, so a window.change (title,appId,activated) fires
     alongside window.map re-affirming the same state. Harmless; not suppressed.
+
+### Decoration provider: registration + assignment (decoration milestone, piece 1) — BUILT, tested
+The first slice of server-side decorations (architecture.md "First decoration
+milestone"): a plugin registers an app_id pattern and is told which mapped windows
+it owns the decoration of. NO insets, NO surface, NO drawing yet (pieces 2/3) --
+this is registration + matching + one event.
+
+- **SDK** (`src/plugins/decorations.ts`, on the scope-B runtime): `sdk.decorations
+  .register(pattern, flags?)` (RegExp source string; resolves when the core records
+  it, rejects on an invalid pattern) + `sdk.decorations.onAssigned(cb)`.
+- **Registry** (`src/decorations.ts`, core, GPU-free): subscribes to the bus
+  `window.map` + `window.change`; on a window whose app_id matches a registered
+  pattern, the FIRST-registered matching provider is assigned (match-once) and gets
+  a `decoration.assigned` event ({surfaceId, appId, title, rect}) via the runtime.
+  Matches at map AND on window.change (the late-app_id case -- set_app_id after
+  first content -- reuses the map-time rect). unmap clears the assignment.
+- **Broker** (`src/plugins/decoration-broker.ts`): services `decoration.register`
+  (validates params at the wire boundary) and owns the registry. main.ts routes
+  `decoration.*` requests here, `gpu.*`/`surface.*` to the GPU broker, and wires
+  emitToPlugin -> PluginRuntime.emit.
+- **Verified**: `test/decorations.test.js` (registry unit: match/no-match/first-
+  wins/match-once/late-app_id-via-change/change-without-appId/unmap-clears/
+  unregister/invalid-regex/flags) and `test/decoration-e2e.test.js` (REAL Worker:
+  register -> bus window.map -> plugin sdk.decorations.onAssigned, full wire-through;
+  non-matching window not assigned). GPU-free. **PASS.**
+- **FLAGGED / not done (pieces 2/3 + deferrals):**
+  - **No insets, no surface, no drawing.** The plugin is told which windows it owns
+    but cannot yet reserve inset space (piece 2: `requestInsets`) or draw
+    (piece 3: bind the producer/consumer ring at the inset rect). Assignment is
+    bookkeeping + an event only.
+  - **No capability gate on `sdk.decorations`** (same as `sdk.gpu`/`sdk.window`):
+    every plugin gets it. This tier is meant to be gated like tier 3 (sees every
+    matched window's app_id/state); the capability system is unbuilt.
+  - **Match-once only.** Reassignment when a window's app_id later changes to a
+    different/non-matching provider is NOT handled (no decoration.unassigned /
+    reassign). Deferred.
+  - **No plugin-teardown wiring of unregisterPlugin.** The broker exposes
+    `unregisterPlugin` but main.ts does not yet call it on plugin exit (the runtime
+    has no teardown hook for it). A dead provider's registrations linger. Flagged;
+    fix with the broader plugin-teardown resource release already flagged elsewhere.
 
 ### Plugin GPU end-to-end: device + shared surface + per-frame fence (C-M4 steps 1-3) — HISTORICAL (superseded by the Worker path)
 NOTE: steps 1-3 were originally built on the MAIN thread (a core-side

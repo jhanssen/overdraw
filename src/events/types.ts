@@ -63,6 +63,22 @@ export type WindowChangeEvent = {
   activated: boolean;
 };
 
+// Decoration-provider events (core -> the matched provider plugin).
+export const DECORATION_EVENT = {
+  assigned: "decoration.assigned",
+} as const;
+
+// Emitted to a decoration-provider plugin when a mapped window matches its
+// registered app_id pattern (match-once; first-registered match wins). The
+// plugin now "owns" decorating this window: piece 2/3 will let it requestInsets
+// + draw. rect is the window's current outer rect (output px).
+export type DecorationAssignedEvent = {
+  surfaceId: number;
+  appId: string | null;
+  title: string | null;
+  rect: WindowRect;
+};
+
 // Compile-time assertion that the plugin-forwarded payloads stay clone-safe. If a
 // field is ever added that is not structured-clone-safe, the build fails rather
 // than silently passing a non-cloneable value over postMessage.
@@ -70,3 +86,4 @@ type AssignableToCloneable<T extends Cloneable> = T;
 export type _MapIsCloneable = AssignableToCloneable<WindowMapEvent>;
 export type _UnmapIsCloneable = AssignableToCloneable<WindowUnmapEvent>;
 export type _ChangeIsCloneable = AssignableToCloneable<WindowChangeEvent>;
+export type _AssignedIsCloneable = AssignableToCloneable<DecorationAssignedEvent>;
