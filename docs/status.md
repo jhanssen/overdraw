@@ -4,7 +4,7 @@ Tracks what is built and empirically proven versus what is still design only.
 The design itself lives in `architecture.md`; this file is the ground truth for
 "what exists right now."
 
-Last updated: 2026-05-31 (rev 31).
+Last updated: 2026-05-31 (rev 32).
 
 ## Protocol gaps & skeletons (READ FIRST)
 
@@ -912,45 +912,74 @@ onMap/onUnmap + title/app_id-changed window-state events).
     is flushed at the map frame, so a window.change (title,appId,activated) fires
     alongside window.map re-affirming the same state. Harmless; not suppressed.
 
-### Decoration provider: registration + assignment (decoration milestone, piece 1) — BUILT, tested
-The first slice of server-side decorations (architecture.md "First decoration
-milestone"): a plugin registers an app_id pattern and is told which mapped windows
-it owns the decoration of. NO insets, NO surface, NO drawing yet (pieces 2/3) --
-this is registration + matching + one event.
+### Decoration provider: registration + insets + drawing (decoration milestone, pieces 1+2) — BUILT, tested
+Server-side decorations: a plugin registers an app_id pattern, is told which mapped
+windows it owns, reserves additive insets, and DRAWS a decoration surface the core
+composites at the window's inset rect. Pixel-verified end to end. Content-gating +
+the timeout/deregister policy (the atomic first-frame appearance) is piece 3 -- NOT
+built yet; today the decoration appears when the plugin draws it (a brief flash of
+undecorated content is possible).
 
-- **SDK** (`src/plugins/decorations.ts`, on the scope-B runtime): `sdk.decorations
-  .register(pattern, flags?)` (RegExp source string; resolves when the core records
-  it, rejects on an invalid pattern) + `sdk.decorations.onAssigned(cb)`.
-- **Registry** (`src/decorations.ts`, core, GPU-free): subscribes to the bus
-  `window.map` + `window.change`; on a window whose app_id matches a registered
-  pattern, the FIRST-registered matching provider is assigned (match-once) and gets
-  a `decoration.assigned` event ({surfaceId, appId, title, rect}) via the runtime.
-  Matches at map AND on window.change (the late-app_id case -- set_app_id after
-  first content -- reuses the map-time rect). unmap clears the assignment.
-- **Broker** (`src/plugins/decoration-broker.ts`): services `decoration.register`
-  (validates params at the wire boundary) and owns the registry. main.ts routes
-  `decoration.*` requests here, `gpu.*`/`surface.*` to the GPU broker, and wires
-  emitToPlugin -> PluginRuntime.emit.
-- **Verified**: `test/decorations.test.js` (registry unit: match/no-match/first-
-  wins/match-once/late-app_id-via-change/change-without-appId/unmap-clears/
-  unregister/invalid-regex/flags) and `test/decoration-e2e.test.js` (REAL Worker:
-  register -> bus window.map -> plugin sdk.decorations.onAssigned, full wire-through;
-  non-matching window not assigned). GPU-free. **PASS.**
-- **FLAGGED / not done (pieces 2/3 + deferrals):**
-  - **No insets, no surface, no drawing.** The plugin is told which windows it owns
-    but cannot yet reserve inset space (piece 2: `requestInsets`) or draw
-    (piece 3: bind the producer/consumer ring at the inset rect). Assignment is
-    bookkeeping + an event only.
-  - **No capability gate on `sdk.decorations`** (same as `sdk.gpu`/`sdk.window`):
-    every plugin gets it. This tier is meant to be gated like tier 3 (sees every
-    matched window's app_id/state); the capability system is unbuilt.
-  - **Match-once only.** Reassignment when a window's app_id later changes to a
-    different/non-matching provider is NOT handled (no decoration.unassigned /
-    reassign). Deferred.
-  - **No plugin-teardown wiring of unregisterPlugin.** The broker exposes
-    `unregisterPlugin` but main.ts does not yet call it on plugin exit (the runtime
-    has no teardown hook for it). A dead provider's registrations linger. Flagged;
-    fix with the broader plugin-teardown resource release already flagged elsewhere.
+- **Registration + assignment (piece 1):** `sdk.decorations.register(pattern,
+  flags?)` (RegExp source; rejects an invalid pattern) + `onAssigned(cb)`. The
+  registry (`src/decorations.ts`, GPU-free) subscribes to the bus `window.map` +
+  `window.change`, assigns the FIRST-registered matching provider (match-once), and
+  emits `decoration.assigned` {surfaceId, appId, title, rect}. Matches at map AND on
+  window.change (late set_app_id reuses the map-time rect); unmap clears.
+- **Inset reservation (piece 2a):** `sdk.decorations.requestInsets(surfaceId,
+  insets)` -> the WM (`src/wm/index.ts` `setInsets`) computes the ADDITIVE outer
+  rect (content grown by insets; content + client unchanged, never told) and returns
+  {insets, outerRect, contentRect}. AUTHORIZED: only the plugin a window is assigned
+  to may reserve its insets.
+- **Decoration surface (piece 2b):** `sdk.gpu.createSurfaceAt(rect, layer)` places a
+  producer/consumer ring surface at an EXPLICIT rect (the inset outerRect) on a layer
+  -- the same ring `createOverlay` uses, via a new `overlays.createAt` (explicit-rect,
+  reflow-fixed) path and a `rect` branch in the gpu-broker's `surface.alloc`. The
+  plugin draws into it and presents; the core composites it (on `below`, the opaque
+  content draws over it so only the inset band shows -- additive-border model).
+- **Broker** (`src/plugins/decoration-broker.ts`): services `decoration.register` +
+  `decoration.requestInsets` (needs `state.wm`); owns the registry. main.ts routes
+  `decoration.*` here, `gpu.*`/`surface.*` to the GPU broker.
+- **Verified**: `test/decorations.test.js` (registry + broker auth: match/first-wins/
+  match-once/late-app_id/unmap-clears/unregister/invalid-regex/flags; requestInsets
+  assigned-ok / intruder + unmapped rejected), `test/wm.test.js` (additive grow,
+  clamp, replace, outerRectOf), `test/decoration-e2e.test.js` (REAL Worker: register
+  -> map -> onAssigned -> requestInsets grant), and `test/decoration-surface.gpu.mjs`
+  (REAL client + provider: assigned -> requestInsets -> createSurfaceAt -> draw ->
+  present -> the decoration composites blue in the inset band, content red below;
+  pixel-verified). GPU-free 112/112; GPU 33/33. **PASS.**
+- **FLAGGED / not done:**
+  - **No content gating (piece 3).** The decoration appears when the plugin draws
+    it; content is NOT held until the first decoration frame, so a brief undecorated
+    flash is possible. Piece 3 = atomic first-frame appearance (hold content until
+    the decoration's first present) + the timeout-error-DEREGISTER policy for a
+    provider that never draws (configurable, ~500ms; permanently deregister + send
+    the plugin a `decoration.deregistered` message + console.error). The reconfigure
+    case (don't composite a resized window until the decoration re-renders within the
+    limit) lands with the resize/layout milestone (resize does not exist yet).
+  - **No capability gate on `sdk.decorations`** (same as `sdk.gpu`/`sdk.window`).
+  - **Match-once only** (no reassign on later app_id change).
+  - **No plugin-teardown wiring of unregisterPlugin** (broker exposes it; main.ts
+    does not call it on plugin exit yet).
+  - **Additive insets only** (shrink-content form needs client configure, deferred
+    with resize). Border region not hit-tested (interactive regions later).
+
+### Plugin GPU reply-dispatch race FIXED (post-init surface ops no longer hang)
+A pre-existing race in the core's plugin-GPU reply dispatch (`native/napi/addon.cpp`):
+the wire-fd poll (`onWireReadable`) calls `drainCtrl()` (to pick up dmabuf-import
+replies) but only advanced the IMPORT callbacks afterward -- NOT the plugin-broker
+pending ops (`SurfaceBufAllocated` / `Producer`/`ConsumerBeginDone` / `WireConnAdded`
+/ `PluginInstanceInjected`). `drainCtrl` only RECORDS replies; a separate
+`advancePending*` invokes the JS callback. So when a plugin reply was consumed by the
+wire poll's `drainCtrl` (because wire activity woke that poll), it was recorded but
+never advanced -- and since the ctrl fd was now empty, `onCtrlReadable` never fired to
+advance it -> the awaiting plugin op hung. Surfaced intermittently (~40-80%) by
+creating a plugin surface POST-init (decoration `onAssigned`); the overlay path
+rarely hit it because init-time concurrent wire traffic kept the ctrl poll firing.
+Fixed by `advanceAllPending()` called after `drainCtrl` in BOTH polls. Pinned by
+logging (core `sendProducerBegin` -> GPU recv+reply -> core `drainCtrl recorded` with
+NO subsequent `advanceBegins`), not speculation. Verified: decoration-surface 10/10,
+full GPU suite 33/33.
 
 ### Plugin GPU end-to-end: device + shared surface + per-frame fence (C-M4 steps 1-3) — HISTORICAL (superseded by the Worker path)
 NOTE: steps 1-3 were originally built on the MAIN thread (a core-side

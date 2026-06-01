@@ -62,9 +62,17 @@ export interface Surface {
   present(): Promise<void>;
 }
 
+// An explicit output-space rect (used by decorations, whose geometry the core
+// already decided via the inset reservation -- not anchor-based like overlays).
+export interface SurfaceRect { x: number; y: number; width: number; height: number; }
+
 export interface PluginGpu {
   device: GPUDevice;
   createOverlay(opts: CreateOverlayOpts): Promise<Surface>;
+  // Create a producer/consumer ring surface placed at an EXPLICIT rect on a layer
+  // (the core uses the rect verbatim, no anchor/clamp). For decorations: the rect
+  // is the inset outerRect from sdk.decorations.requestInsets.
+  createSurfaceAt(rect: SurfaceRect, layer: OverlayLayer): Promise<Surface>;
 }
 
 // Bring up the Worker's GPU (device over its own wire) + return the SDK gpu
@@ -107,61 +115,72 @@ export async function createPluginGpu(
   // Steady-state pump: keep the wire flowing so device async ops resolve.
   const pump = (): void => { plugin.pump(clientId); };
 
+  // Shared producer/consumer ring setup. `allocExtra` carries the geometry source
+  // (anchor params for overlays, an explicit rect for decorations); the core's
+  // surface.alloc returns the surfaceId + the decided rect. Both surface kinds use
+  // the identical slot-bind + present machinery.
+  async function makeRingSurface(
+    width: number, height: number,
+    allocExtra: Record<string, Json>,
+  ): Promise<Surface> {
+    const SLOTS = 2;  // double-buffered: producer writes one slot while the
+                      // consumer (compositor) holds the other -> smooth animation.
+    const r = (await endpoint.request("surface.alloc", {
+      connId: conn.connId, width, height, slots: SLOTS, ...allocExtra,
+    })) as { overlayId: number; rect: { x: number; y: number; width: number; height: number } };
+
+    // Per slot: reserve a producer texture under a UNIQUE worker-local key, then
+    // bindProducer (allocates the shared dmabuf server-side, returns surfaceBufId).
+    const slotResKey: number[] = [];
+    const slotBufId: number[] = [];
+    const slotTex: (GPUTexture | null)[] = [];
+    for (let i = 0; i < SLOTS; i++) {
+      const resKey = nextResKey++;
+      const pr = plugin.reserveProducerTexture(clientId, resKey, width, height);
+      plugin.flush(clientId);
+      const bound = (await endpoint.request("surface.bindProducer", {
+        connId: conn.connId, overlayId: r.overlayId,
+        texId: pr.texture.id, texGen: pr.texture.generation,
+        devId: pr.device.id, devGen: pr.device.generation,
+      })) as { surfaceBufId: number };
+      slotResKey.push(resKey);
+      slotBufId.push(bound.surfaceBufId);
+      slotTex.push(null);
+    }
+
+    let write = 0;  // slot the plugin currently renders into
+    return {
+      width, height, rect: r.rect,
+      getCurrentTexture(): GPUTexture {
+        let t = slotTex[write];
+        if (!t) { t = dawn.wrapTexture(devHandle, plugin.producerTexture(clientId, slotResKey[write])); slotTex[write] = t; }
+        return t;
+      },
+      async present(): Promise<void> {
+        plugin.flush(clientId);
+        const wireSerial = plugin.wireBytesQueued(clientId);
+        const presented = slotBufId[write];
+        write = (write + 1) % SLOTS;  // next frame renders into the other slot
+        await endpoint.request("surface.present",
+          { connId: conn.connId, surfaceBufId: presented, wireSerial });
+      },
+    };
+  }
+
   const gpu: PluginGpu = {
     device,
-    async createOverlay(opts: CreateOverlayOpts): Promise<Surface> {
-      const { width, height } = opts;
-      const SLOTS = 2;  // double-buffered ring: producer writes one slot while the
-                        // consumer (compositor) holds the other -> smooth animation.
-
-      // The core decides the rect + the logical overlay; it returns SLOTS
-      // surfaceBufIds (one shared dmabuf per slot). The Worker reserves a producer
-      // texture per slot, then binds each (the core finishes AllocSurfaceBuf).
-      // The core creates the logical overlay (geometry/layer) + returns the rect.
-      const r = (await endpoint.request("surface.alloc", {
-        connId: conn.connId, width, height, slots: SLOTS,
+    createOverlay(opts: CreateOverlayOpts): Promise<Surface> {
+      return makeRingSurface(opts.width, opts.height, {
         layer: opts.layer ?? "overlay", anchor: opts.anchor ?? "center",
         margin: opts.margin ?? 0,
-      })) as { overlayId: number; rect: { x: number; y: number; width: number; height: number } };
-
-      // Per slot: reserve a producer texture under a UNIQUE worker-local key (the
-      // wire-client reservation map is keyed by it), then bindProducer, which
-      // allocates the shared dmabuf server-side and returns the real surfaceBufId.
-      const slotResKey: number[] = [];
-      const slotBufId: number[] = [];
-      const slotTex: (GPUTexture | null)[] = [];
-      for (let i = 0; i < SLOTS; i++) {
-        const resKey = nextResKey++;
-        const pr = plugin.reserveProducerTexture(clientId, resKey, width, height);
-        plugin.flush(clientId);
-        const bound = (await endpoint.request("surface.bindProducer", {
-          connId: conn.connId, overlayId: r.overlayId,
-          texId: pr.texture.id, texGen: pr.texture.generation,
-          devId: pr.device.id, devGen: pr.device.generation,
-        })) as { surfaceBufId: number };
-        slotResKey.push(resKey);
-        slotBufId.push(bound.surfaceBufId);
-        slotTex.push(null);
-      }
-
-      let write = 0;  // slot the plugin currently renders into
-      const surface: Surface = {
-        width, height, rect: r.rect,
-        getCurrentTexture(): GPUTexture {
-          let t = slotTex[write];
-          if (!t) { t = dawn.wrapTexture(devHandle, plugin.producerTexture(clientId, slotResKey[write])); slotTex[write] = t; }
-          return t;
-        },
-        async present(): Promise<void> {
-          plugin.flush(clientId);
-          const wireSerial = plugin.wireBytesQueued(clientId);
-          const presented = slotBufId[write];
-          write = (write + 1) % SLOTS;  // next frame renders into the other slot
-          await endpoint.request("surface.present",
-            { connId: conn.connId, surfaceBufId: presented, wireSerial });
-        },
-      };
-      return surface;
+      });
+    },
+    createSurfaceAt(rect: SurfaceRect, layer: OverlayLayer): Promise<Surface> {
+      // Explicit-rect placement: the core places the surface at `rect` verbatim on
+      // `layer` (no anchor/clamp). width/height come from the rect.
+      return makeRingSurface(rect.width, rect.height, {
+        layer, rect: { x: rect.x, y: rect.y, width: rect.width, height: rect.height },
+      });
     },
   };
 

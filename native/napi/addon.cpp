@@ -310,6 +310,27 @@ void armWirePoll() {
     uv_poll_start(&g_addon.wirePoll, events, onWireReadable);
 }
 
+// Advance every pending plugin-broker op against the latest drained ctrl state.
+// MUST run after ANY drainCtrl() on the Node thread: drainCtrl only RECORDS the
+// replies (SurfaceBufAllocated / *BeginDone / WireConnAdded / PluginInstanceInjected);
+// these advancers invoke the JS callbacks. Both the ctrl-fd poll AND the wire-fd
+// poll drain ctrl (the wire poll drains it for dmabuf-import replies), so if only
+// the ctrl poll advanced, a plugin reply consumed by the wire poll's drainCtrl
+// would be recorded-but-never-advanced -> the awaiting plugin op hangs (the ctrl
+// fd is now empty, so onCtrlReadable never fires to advance it). Calling this from
+// both polls closes that race.
+void advanceAllPending(napi_env env) {
+    if (g_pendingAllocs.empty() && g_pendingBegins.empty() &&
+        g_pendingConnBrokers.empty() && g_pendingInjects.empty()) return;
+    napi_handle_scope scope;
+    napi_open_handle_scope(env, &scope);
+    advancePendingAllocs(env);    // SurfaceBufAllocated
+    advancePendingBegins(env);    // Producer/ConsumerBeginDone
+    advanceConnBrokers(env);      // WireConnAdded
+    advanceInjects(env);          // PluginInstanceInjected
+    napi_close_handle_scope(env, scope);
+}
+
 void onWireReadable(uv_poll_t*, int status, int events) {
     if (status < 0 || !g_addon.compositor) return;
     if (events & UV_WRITABLE) g_addon.compositor->wirePumpOut();
@@ -325,6 +346,9 @@ void onWireReadable(uv_poll_t*, int status, int events) {
         // whose ClientTexImported replies arrive on the ctrl fd; drain it too.
         g_addon.compositor->drainCtrl();
         fireJsImports(g_addon.env);
+        // drainCtrl above may have consumed plugin-broker replies (alloc/begin/...);
+        // advance them here too, else they are stranded (see advanceAllPending).
+        advanceAllPending(g_addon.env);
         napi_close_handle_scope(g_addon.env, scope);
     }
     armWirePoll();  // update WRITABLE arming based on remaining queue
@@ -336,16 +360,7 @@ void onCtrlReadable(uv_poll_t*, int status, int) {
     if (status < 0 || !g_addon.compositor) return;
     g_addon.compositor->drainCtrl();
     fireJsImports(g_addon.env);  // resolve JS dmabuf imports (opens its own scope)
-    if (!g_pendingAllocs.empty() || !g_pendingBegins.empty() ||
-        !g_pendingConnBrokers.empty() || !g_pendingInjects.empty()) {
-        napi_handle_scope scope;
-        napi_open_handle_scope(g_addon.env, &scope);
-        advancePendingAllocs(g_addon.env);    // SurfaceBufAllocated
-        advancePendingBegins(g_addon.env);    // Producer/ConsumerBeginDone
-        advanceConnBrokers(g_addon.env);      // WireConnAdded
-        advanceInjects(g_addon.env);          // PluginInstanceInjected
-        napi_close_handle_scope(g_addon.env, scope);
-    }
+    advanceAllPending(g_addon.env);
     armWirePoll();  // finishing an import flushes wire output (bind group etc.)
 }
 

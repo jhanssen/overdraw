@@ -31,6 +31,10 @@ export interface CreateOverlayParams extends OverlayRequest {
 export interface OverlayBroker {
   // Plugin requests an overlay; core decides geometry + registers it in the layer.
   create(pluginId: string, params: CreateOverlayParams): OverlayHandle;
+  // Register a surface at an EXPLICIT rect on a layer (no placeOverlay/clamp). The
+  // caller already decided the geometry -- decorations pass the inset outerRect.
+  // reflow() leaves these fixed (they are window-relative, not output-anchored).
+  createAt(pluginId: string, layer: OverlayLayer, rect: Rect): OverlayHandle;
   // Remove one overlay (plugin destroyed it or the plugin died).
   destroy(surfaceId: number): void;
   // Remove every overlay owned by a plugin (plugin termination).
@@ -44,7 +48,9 @@ export interface OverlayBroker {
 
 export function createOverlayBroker(state: CompositorState, output: Output): OverlayBroker {
   // Insertion-ordered overlays; per-layer order = insertion order within a layer.
-  const overlays = new Map<number, OverlayHandle & { req: CreateOverlayParams }>();
+  // `req` is the anchor request (for reflow); absent for explicit-rect surfaces
+  // (createAt), which reflow leaves fixed.
+  const overlays = new Map<number, OverlayHandle & { req?: CreateOverlayParams }>();
   let out = { width: output.width, height: output.height };
 
   // Push the ordered surface-id list for one layer to the sink.
@@ -66,6 +72,17 @@ export function createOverlayBroker(state: CompositorState, output: Output): Ove
       state.compositor.setSurfaceLayout(surfaceId, rect.x, rect.y, rect.width, rect.height);
       pushLayer(params.layer);
       return { surfaceId, layer: params.layer, rect, pluginId };
+    },
+
+    createAt(pluginId, layer, rect) {
+      const surfaceId = state.serial();
+      const handle: OverlayHandle & { req?: CreateOverlayParams } = {
+        surfaceId, layer, rect: { ...rect }, pluginId,   // no req -> reflow skips it
+      };
+      overlays.set(surfaceId, handle);
+      state.compositor.setSurfaceLayout(surfaceId, rect.x, rect.y, rect.width, rect.height);
+      pushLayer(layer);
+      return { surfaceId, layer, rect: { ...rect }, pluginId };
     },
 
     destroy(surfaceId) {
@@ -90,6 +107,7 @@ export function createOverlayBroker(state: CompositorState, output: Output): Ove
     reflow(output) {
       out = { width: output.width, height: output.height };
       for (const o of overlays.values()) {
+        if (!o.req) continue;   // explicit-rect surface (createAt): leave fixed
         o.rect = placeOverlay(o.req, out);
         state.compositor.setSurfaceLayout(o.surfaceId, o.rect.x, o.rect.y, o.rect.width, o.rect.height);
       }

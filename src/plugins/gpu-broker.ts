@@ -55,7 +55,7 @@ export function createGpuBroker(deps: GpuBrokerDeps) {
   const surfaces = new Map<number, OverlaySurface>();
 
   return async function onRequest(pluginName: string, method: string, params: unknown): Promise<unknown> {
-    const p = (params ?? {}) as Record<string, number | string | bigint>;
+    const p = (params ?? {}) as Record<string, number | string | bigint | { x: number; y: number; width: number; height: number } | undefined>;
     switch (method) {
       case "gpu.connect": {
         const r = await pCreateConn(addon);
@@ -69,15 +69,19 @@ export function createGpuBroker(deps: GpuBrokerDeps) {
         addon.pluginSetTickDevice(p.connId as number, p.id as number, p.generation as number);
         return null;
       case "surface.alloc": {
-        // Core decides the rect + layer (overlay broker) and assigns the overlay
-        // surfaceId. The ring's slots are allocated per-slot at bindProducer (each
-        // needs the Worker's producer texture handles). Returns the slot ids + rect.
+        // Core decides the rect + layer (overlay broker) and assigns the surface
+        // id. Two geometry sources: an EXPLICIT rect (decorations -- the core
+        // already decided it via the inset reservation) or anchor params
+        // (overlays). The ring's slots are allocated per-slot at bindProducer.
         const width = p.width as number, height = p.height as number;
         const slots = (p.slots as number) ?? 2;
-        const handle = overlays.create(pluginName, {
-          layer: (p.layer as OverlayLayer) ?? "overlay",
-          anchor: (p.anchor as OverlayAnchor) ?? "center", width, height, margin: p.margin as number,
-        });
+        const explicitRect = p.rect as { x: number; y: number; width: number; height: number } | undefined;
+        const handle = explicitRect
+          ? overlays.createAt(pluginName, (p.layer as OverlayLayer) ?? "above", explicitRect)
+          : overlays.create(pluginName, {
+              layer: (p.layer as OverlayLayer) ?? "overlay",
+              anchor: (p.anchor as OverlayAnchor) ?? "center", width, height, margin: p.margin as number,
+            });
         void slots;
         const surf: OverlaySurface = {
           surfaceId: handle.surfaceId, width, height, slots: [], consumerSlot: -1,
