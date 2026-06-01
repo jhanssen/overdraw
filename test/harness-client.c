@@ -234,13 +234,35 @@ int main(int argc, char** argv) {
     // the server sends -- wl_keyboard.enter/key, wl_callback.done, etc. -- are
     // actually delivered. poll the wl fd, then dispatch when readable; this stays
     // responsive to SIGTERM (10ms poll timeout) without blocking.
+    //
+    // Also poll stdin: a `rename <id>` line sets a new app_id + title AFTER map
+    // (the harness sends it only once the window is confirmed mapped via query()),
+    // exercising the post-map window-state change stream deterministically.
     int wlfd = wl_display_get_fd(display);
+    char inbuf[256];
     while (running) {
         wl_display_dispatch_pending(display);
         wl_display_flush(display);
-        struct pollfd pfd = { wlfd, POLLIN, 0 };
-        if (poll(&pfd, 1, 10) > 0 && (pfd.revents & POLLIN)) {
-            if (wl_display_dispatch(display) < 0) break;  // reads + dispatches
+        struct pollfd pfd[2] = { { wlfd, POLLIN, 0 }, { STDIN_FILENO, POLLIN, 0 } };
+        if (poll(pfd, 2, 10) > 0) {
+            if (pfd[1].revents & POLLIN) {
+                ssize_t n = read(STDIN_FILENO, inbuf, sizeof(inbuf) - 1);
+                if (n > 0) {
+                    inbuf[n] = '\0';
+                    char id[128];
+                    if (sscanf(inbuf, "rename %127s", id) == 1) {
+                        xdg_toplevel_set_app_id(toplevel, id);
+                        xdg_toplevel_set_title(toplevel, id);
+                        wl_surface_commit(surface);
+                        wl_display_flush(display);
+                        printf("[harness-client] renamed app_id=%s\n", id);
+                        fflush(stdout);
+                    }
+                }
+            }
+            if (pfd[0].revents & POLLIN) {
+                if (wl_display_dispatch(display) < 0) break;  // reads + dispatches
+            }
         }
     }
 

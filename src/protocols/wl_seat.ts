@@ -19,6 +19,8 @@ import type { WlPointerHandler } from "#protocols-gen/wl_pointer.js";
 import type { WlKeyboardHandler } from "#protocols-gen/wl_keyboard.js";
 import type { Ctx, SeatFocus, FocusOptions } from "./ctx.js";
 import type { Resource, InputEvent } from "../types.js";
+import { KEYBOARD_EVENT } from "../events/window-bus.js";
+import { markWindowChanged } from "./window-changes.js";
 
 // `bind` is a synthetic on-bind hook, not a protocol request.
 type SeatHandler = WlSeatHandler & { bind(resource: Resource): void };
@@ -92,9 +94,16 @@ export default function makeSeat(ctx: Ctx, focus: FocusOptions = DEFAULT_FOCUS):
     if (cur && (!target || cur.surfaceId !== target.surfaceId)) sendKbLeave(cur);
     seat.kbFocus = target;
     if (target) sendKbEnter(target);
-    // Notify the clipboard layer so it can (re)send the selection to the newly
-    // focused client (selection follows keyboard focus).
-    seat.onKbFocusChange?.(target ? target.clientId : null);
+    // keyboard.focus event: the clipboard layer (re)sends the selection to the
+    // newly focused client (selection follows keyboard focus). Replaces the old
+    // seat.onKbFocusChange hook.
+    ctx.state.bus?.emit(KEYBOARD_EVENT.focus, { clientId: target ? target.clientId : null });
+    // Activation changed for the window losing AND the window gaining focus; the
+    // window.change stream reports each (decorations restyle active/inactive).
+    if (cur && (!target || cur.surfaceId !== target.surfaceId)) {
+      markWindowChanged(ctx.state, cur.surfaceId, "activated");
+    }
+    if (target) markWindowChanged(ctx.state, target.surfaceId, "activated");
   }
 
   function sendEnter(target: SeatFocus, sx: number, sy: number): void {

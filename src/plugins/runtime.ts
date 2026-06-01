@@ -17,6 +17,7 @@ import { dirname, join } from "node:path";
 
 import type { ResolvedPlugin } from "../config/types.js";
 import { Endpoint, channelFor } from "./protocol.js";
+import type { Json } from "./protocol.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 // The built bootstrap (this file lives in dist/plugins/ after tsc).
@@ -250,6 +251,14 @@ class ManagedPlugin {
     this.state = "failed";
   }
 
+  // Push a one-way event to this plugin's Worker (core -> plugin). No-op unless
+  // the plugin is `live` (the Worker's event-loop is up and dispatching). Used for
+  // the window-state stream (onMap/onUnmap) and any future core-originated event.
+  emit(name: string, data: Json): void {
+    if (this.state !== "live") return;
+    this.endpoint?.emit(name, data);
+  }
+
   // Test/introspection accessors.
   get currentState(): PluginState { return this.state; }
   get restartCount(): number { return this.restartTimes.length; }
@@ -278,6 +287,20 @@ export class PluginRuntime {
   // Graceful shutdown of all plugins (parallel).
   async stop(): Promise<void> {
     await Promise.all(this.plugins.map((p) => p.stop()));
+  }
+
+  // Push a one-way event to one plugin by name (core -> plugin). No-op if no such
+  // plugin or it is not `live`.
+  emit(pluginName: string, name: string, data: Json): void {
+    for (const p of this.plugins) {
+      if (p.cfg.name === pluginName) { p.emit(name, data); return; }
+    }
+  }
+
+  // Push a one-way event to every live plugin (core -> plugin). The window-state
+  // stream broadcasts here; a plugin that does not observe simply ignores it.
+  broadcast(name: string, data: Json): void {
+    for (const p of this.plugins) p.emit(name, data);
   }
 
   // Introspection.

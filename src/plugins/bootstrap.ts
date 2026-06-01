@@ -21,6 +21,7 @@ import { createSdk } from "./sdk.js";
 import type { PluginSdk } from "./sdk.js";
 import { createPluginGpu } from "./gpu.js";
 import type { PluginGpu } from "./gpu.js";
+import { createWindowObserver } from "./window-observer.js";
 
 interface BootstrapData {
   module: string;
@@ -52,8 +53,12 @@ async function main(): Promise<void> {
     t.unref?.();
   }
 
+  // Window-state observation (sdk.window.onMap/onUnmap). The core pushes window.*
+  // events; this observer dispatches them to the plugin's registered handlers.
+  const windows = createWindowObserver();
+
   // SDK logs are forwarded to the core as one-way events (the core prints them).
-  const control = createSdk(name, (line) => { endpoint.emit("log", line); }, gpu);
+  const control = createSdk(name, (line) => { endpoint.emit("log", line); }, gpu, windows.observer);
 
   // The only request the core sends in scope B is 'shutdown'. Run the registered
   // onShutdown callback; resolving lets the core proceed to terminate.
@@ -61,6 +66,10 @@ async function main(): Promise<void> {
     if (method === "shutdown") { await control.runShutdown(); return null; }
     throw new Error(`unknown request method '${method}'`);
   });
+
+  // Core -> plugin one-way events: route window.* to the observer. Unknown event
+  // names are ignored (forward-compatible with future core-originated events).
+  endpoint.handleEvents((eventName, data) => { windows.dispatch(eventName, data); });
 
   // Pings are auto-ponged by the Endpoint default (no explicit ping handler), so
   // a responsive event loop answers them; nothing more to wire here.

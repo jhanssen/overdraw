@@ -23,6 +23,8 @@ import { JsCompositor } from "./gpu/compositor.js";
 import type { DawnWire, DawnGlobals } from "./gpu/compositor.js";
 import type { Addon, InputEvent } from "./types.js";
 import type { CompositorSink, CompositorState } from "./protocols/ctx.js";
+import { WINDOW_EVENT } from "./events/types.js";
+import { createCompositorBus } from "./events/window-bus.js";
 
 const require = createRequire(import.meta.url);
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -53,6 +55,20 @@ const onFrame = (): void => {
 };
 
 let runtime: PluginRuntime | null = null;
+
+// The core-internal event bus. Producers (protocol layer, seat) emit; the
+// plugin-forwarding subscribers below relay window.* events to plugin Workers.
+// The clipboard layer subscribes to keyboard.focus inside installProtocols.
+const bus = createCompositorBus();
+
+// Forward window.* events to the plugin runtime (structured-clone over postMessage).
+// The runtime may not exist yet (no plugins) or a window may map before it loads;
+// broadcast is a no-op when there are no live plugins. The payloads are already the
+// wire shape (events/types.ts), so they forward verbatim.
+bus.on(WINDOW_EVENT.map, (ev) => { runtime?.broadcast(WINDOW_EVENT.map, ev); });
+bus.on(WINDOW_EVENT.unmap, (ev) => { runtime?.broadcast(WINDOW_EVENT.unmap, ev); });
+bus.on(WINDOW_EVENT.change, (ev) => { runtime?.broadcast(WINDOW_EVENT.change, ev); });
+
 let stopped = false;
 function shutdown(signal: string): void {
   if (stopped) return;
@@ -97,6 +113,7 @@ state = await installProtocols(addon, {
   output: config.output ?? { width: dims.width, height: dims.height },
   focus: config.focus,
   compositor,
+  bus,
 });
 
 console.log(`[overdraw] Wayland server listening.`);

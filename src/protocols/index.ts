@@ -20,6 +20,10 @@ import { applySubsurfaces } from "../subsurfaces.js";
 import { rebuildStackWithPopups, maybeDismissGrabbedPopup } from "./xdg_popup.js";
 import type { Addon, EventsByInterface, EventSenders } from "../types.js";
 import type { Ctx, CompositorState, FocusOptions, CompositorSink } from "./ctx.js";
+import { titleAppId } from "../query.js";
+import { WINDOW_EVENT } from "../events/types.js";
+import type { CompositorBus } from "../events/window-bus.js";
+import { flushWindowChanges } from "./window-changes.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const genDir = join(__dirname, "..", "protocols-gen");
@@ -75,6 +79,10 @@ export interface InstallOptions {
   // Compositor backend. Defaults to the native addon (C++ Compositor). Pass a
   // JsCompositor to run the compositing pass in JS over the wire.
   compositor?: CompositorSink;
+  // Core-internal event bus (window/keyboard events). main.ts forwards window.*
+  // to the plugin runtime and the clipboard layer subscribes to keyboard.focus.
+  // Optional: GPU-free protocol tests can omit it (emits become no-ops).
+  bus?: CompositorBus;
 }
 
 // Wire the protocol layer onto a started server. `addon` is the native module
@@ -107,6 +115,7 @@ export async function installProtocols(
     nextSerial: 1,
     serial() { return this.nextSerial++; },
   };
+  if (opts.bus) state.bus = opts.bus;
   state.wm = createWm(state.compositor, output);
   // State-query channel (tests / introspection): a GPU-free snapshot of
   // geometry / focus / stacking. See src/query.ts.
@@ -139,7 +148,18 @@ export async function installProtocols(
         s.mapped = true;
         mappedAny = true;
         const rect = state.wm?.mapWindow(id, s, width, height);
-        if (rect) state.seat?.focusWindow(id, s, rect);
+        if (rect) {
+          state.seat?.focusWindow(id, s, rect);
+          // Emit window.map. app_id/title may be null if the client set them after
+          // its first commit (a known timing gap); a later window.change carries the
+          // update once set_app_id/set_title fires.
+          const ta = titleAppId(state, id);
+          state.bus?.emit(WINDOW_EVENT.map, {
+            surfaceId: id,
+            rect: { x: rect.x, y: rect.y, width: rect.width, height: rect.height },
+            appId: ta.appId, title: ta.title,
+          });
+        }
       } else if (s.role === "xdg_popup") {
         // A popup maps on first content; it is compositor-positioned above its
         // parent (rect already computed at get_popup). Mark its PopupRecord mapped
@@ -153,6 +173,12 @@ export async function installProtocols(
     // (a child that committed before its parent mapped gets placed now).
     if (mappedAny) applySubsurfaces(state);
     if (mappedAny || mappedPopup) rebuildStackWithPopups(state);
+
+    // Drain coalesced window-state changes (title/app_id/activation) accumulated
+    // since the last frame into one window.change per affected surface. Coalescing
+    // to the frame boundary means a consumer sees consistent state, not the
+    // intermediate values between rapid set_title/set_app_id requests.
+    flushWindowChanges(state);
 
     const freed = state.compositor.takeFreedBuffers();
     if (freed.length > 0) {

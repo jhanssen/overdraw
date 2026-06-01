@@ -5,19 +5,31 @@
 import type { XdgToplevelHandler } from "#protocols-gen/xdg_toplevel.js";
 import type { Ctx } from "./ctx.js";
 import type { Resource } from "../types.js";
+import { markWindowChanged } from "./window-changes.js";
 
 export default function makeToplevel(ctx: Ctx): XdgToplevelHandler {
   const rec = (resource: Resource) => ctx.state.toplevels?.get(resource);
+  // The surfaceId backing a toplevel (via its xdg_surface -> wl_surface), or null.
+  const surfaceIdOf = (resource: Resource): number | null =>
+    rec(resource)?.xdgSurface?.surface?.id ?? null;
 
   return {
     set_parent(_resource, _parent) {},
     set_title(resource, title) {
       const t = rec(resource);
-      if (t) t.title = title;
+      if (!t) return;
+      if (t.title === title) return;   // no-op write: do not emit a spurious change
+      t.title = title;
+      const id = surfaceIdOf(resource);
+      if (id !== null) markWindowChanged(ctx.state, id, "title");
     },
     set_app_id(resource, appId) {
       const t = rec(resource);
-      if (t) t.appId = appId;
+      if (!t) return;
+      if (t.appId === appId) return;
+      t.appId = appId;
+      const id = surfaceIdOf(resource);
+      if (id !== null) markWindowChanged(ctx.state, id, "appId");
     },
     show_window_menu(_resource, _seat, _serial, _x, _y) {},
     move(_resource, _seat, _serial) {},

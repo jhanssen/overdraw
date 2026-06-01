@@ -4,7 +4,7 @@ Tracks what is built and empirically proven versus what is still design only.
 The design itself lives in `architecture.md`; this file is the ground truth for
 "what exists right now."
 
-Last updated: 2026-05-31 (rev 29).
+Last updated: 2026-05-31 (rev 30).
 
 ## Protocol gaps & skeletons (READ FIRST)
 
@@ -858,6 +858,60 @@ surface the core composites on top at a core-decided rect).
   eslint config bans `as any`/`as unknown` but not `x as ConcreteType` from
   `unknown`, so this passes lint — a known loophole.)
 
+### Core event bus + window-state stream (core->plugin events) — BUILT, tested
+The first general core->plugin event push, plus a small typed in-core event bus
+that folds in the pre-existing ad-hoc listener patterns. This is the prerequisite
+for the decoration milestone (architecture.md "First decoration milestone":
+onMap/onUnmap + title/app_id-changed window-state events).
+
+- **Typed bus** (`src/events/bus.ts`, `TypedBus<M>`): `on(name, cb) -> unsubscribe`,
+  `emit(name, ev)` (synchronous fan-out in registration order), `clear()`.
+  Generic over an event map ({name: payload}) so on/emit are fully type-checked
+  (no `any`, no string-keyed casts). A throwing listener is caught + logged so one
+  bad subscriber cannot break the per-frame sweep or other listeners (node's
+  EventEmitter does neither -- untyped + 'error'-throw is process-fatal -- hence
+  not used). The concrete instance + event map is `src/events/window-bus.ts`
+  (`CompositorEventMap`: window.map/unmap/change + keyboard.focus).
+- **Window-state payloads** (`src/events/types.ts`): `WindowMapEvent`,
+  `WindowUnmapEvent`, `WindowChangeEvent` ({surfaceId, changed: field[], appId,
+  title, activated}). Shared by the in-core bus AND the core->plugin wire; build-
+  time guards keep them structured-clone-safe (forwardable over postMessage).
+- **Producers** (core, `src/protocols/`): the map sweep emits `window.map`;
+  wl_surface.destroy emits `window.unmap`; set_title/set_app_id + keyboard-focus
+  changes call `markWindowChanged` (per-frame dirty set), drained by
+  `flushWindowChanges` in `dispatchFrameCallbacks` into one coalesced
+  `window.change` per surface (consistent snapshot, not intermediate values).
+  This closes the app_id-timing hole: a late `set_app_id` (after map) now produces
+  a window.change carrying the new value.
+- **Folded in:** the old `seat.onKbFocusChange` direct hook is replaced by the bus
+  `keyboard.focus` event (the clipboard layer subscribes); the C-M-era
+  windowObserver map/unmap hook is now a bus producer. No remaining ad-hoc
+  window/focus listener patterns.
+- **Plugin side**: `sdk.window` gains `onMap`/`onUnmap`/`onChange`
+  (`src/plugins/window-observer.ts`); the Worker dispatches inbound window.* events
+  to them, VALIDATING each payload (drops malformed input, filters unknown change
+  fields) rather than casting at the trust boundary. main.ts subscribes to the bus
+  and forwards window.* to the plugin runtime (`PluginRuntime.broadcast`/`emit`).
+- **Verified**: `test/window-events.test.js` (bus unit incl. unsubscribe + throw-
+  isolation; observer dispatch incl. malformed/unknown-field drops; map/change/
+  unmap e2e through a REAL Worker), `test/window-changes.test.js` (core coalescing:
+  dedup, clear-after-flush, activated-from-focus, skip-unmapped, no-bus no-op), and
+  `test/window-change-e2e.gpu.mjs` (a REAL client set_app_id AFTER map -> plugin's
+  sdk.window.onChange receives the new app_id; full wire-through). Clipboard GPU
+  tests still PASS through the new bus keyboard.focus path. **PASS.**
+- **FLAGGED / not done:**
+  - **window.change covers only title/appId/activated.** maximized/fullscreen/
+    minimized/resized/parent are NOT emitted -- those `xdg_toplevel` requests are
+    still silent no-ops with no backing state (see "Protocol gaps"). The bus is
+    ready for them; the producers land with the WM/layout milestone. So this is NOT
+    a complete window-state stream yet.
+  - **No capability gate on `sdk.window`.** Every plugin gets the observer (sees
+    every window's app_id/title/focus). The decoration-provider tier
+    (architecture.md) is meant to gate this like tier 3; unbuilt.
+  - **Pre-map redundancy (minor):** a `set_app_id`/`set_title` before first content
+    is flushed at the map frame, so a window.change (title,appId,activated) fires
+    alongside window.map re-affirming the same state. Harmless; not suppressed.
+
 ### Plugin GPU end-to-end: device + shared surface + per-frame fence (C-M4 steps 1-3) — HISTORICAL (superseded by the Worker path)
 NOTE: steps 1-3 were originally built on the MAIN thread (a core-side
 `core::PluginWireClient` + `addon.pluginConnect`/`pluginAllocSurfaceBuffer`) to
@@ -1314,9 +1368,13 @@ Menus/dropdowns/tooltips: a compositor-positioned, input-grabbing child surface.
   as-mapped size (no `xdg_toplevel` geometry — deferred to the layout-model
   milestone to avoid throwaway), additive insets (outer grows, content/client
   unchanged), minimal onMap/onUnmap window-state events, `xdg-decoration`
-  negotiation deferred. Plus, before that work: complete strict TypeScript types
-  for the plugin SDK + de-loosen the gpu-broker/protocol (a typed request map
-  replacing the `unknown`->`as` chain) -- flagged but not yet done.
+  negotiation deferred. PREREQUISITES now built: the core->plugin event channel +
+  window-state stream (onMap/onUnmap/onChange) — see "Core event bus + window-state
+  stream". STILL needed before/with decorations: the app_id-regex provider registry
+  + `decoration.register` request; additive-inset reservation in the WM; a
+  capability gate on the decoration/window-observer tier. Also still flagged:
+  complete strict TypeScript types for the plugin SDK + de-loosen the gpu-broker/
+  protocol (a typed request map replacing the `unknown`->`as` chain) — not yet done.
 - **Multi-surface / real compositing.** Multiple surfaces, transforms, opacity,
   blending, client buffers, multi-output, damage — none done.
 - **Cross-thread N-API marshaling.** `napi_threadsafe_function` for Dawn-thread

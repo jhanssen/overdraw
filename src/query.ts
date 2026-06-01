@@ -27,7 +27,7 @@ export interface StateSnapshot {
 }
 
 // Look up a surface's title/app_id via its xdg_surface -> toplevel record.
-function titleAppId(state: CompositorState, surfaceId: number): { title: string | null; appId: string | null } {
+export function titleAppId(state: CompositorState, surfaceId: number): { title: string | null; appId: string | null } {
   for (const s of state.surfaces.values()) {
     if (s.id !== surfaceId) continue;
     const tl = s.xdgSurface?.toplevel;

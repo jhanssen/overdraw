@@ -13,6 +13,7 @@ import type { WlSurfaceHandler } from "#protocols-gen/wl_surface.js";
 import type { Ctx, SurfaceRecord, SubsurfaceRecord } from "./ctx.js";
 import type { Resource } from "../types.js";
 import { applySubsurfaces } from "../subsurfaces.js";
+import { WINDOW_EVENT } from "../events/types.js";
 
 // Assign a stable per-wl_buffer id used to track the dmabuf release lifecycle
 // across the JS<->native boundary. Native reports freed bufferIds (once its GPU
@@ -169,6 +170,13 @@ export default function makeSurface(ctx: Ctx): WlSurfaceHandler {
     destroy(resource) {
       const s = rec(resource);
       if (s) {
+        // Emit window.unmap before tearing down, so a mapped toplevel being
+        // destroyed produces an unmap. Gated on mapped + toplevel role to mirror
+        // window.map. Drop any pending coalesced changes for it (now moot).
+        if (s.mapped && s.role === "xdg_toplevel") {
+          ctx.state.bus?.emit(WINDOW_EVENT.unmap, { surfaceId: s.id });
+        }
+        ctx.state.pendingWindowChanges?.delete(s.id);
         ctx.state.wm?.unmapWindow(s.id);
         ctx.state.compositor.removeSurface(s.id);
         ctx.state.surfacesById?.delete(s.id);

@@ -130,6 +130,7 @@ export async function setupCompositor(opts = {}) {
     output: { width: dims.width, height: dims.height },
     focus: opts.focus,
     compositor: jsCompositor ?? undefined,
+    bus: opts.bus,
   });
 
   const clients = [];

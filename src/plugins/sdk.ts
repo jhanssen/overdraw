@@ -9,6 +9,7 @@
 export type ShutdownCallback = () => void | Promise<void>;
 
 import type { PluginGpu } from "./gpu.js";
+import type { PluginWindowObserver } from "./window-observer.js";
 
 export interface PluginSdk {
   // The plugin's stable name (config `name`, defaulting to its module).
@@ -21,6 +22,10 @@ export interface PluginSdk {
   // GPU + overlay surfaces (present iff the plugin has the `gpu` capability and
   // the runtime brought the device up). Absent otherwise (capability by shape).
   gpu?: PluginGpu;
+  // Window-state observation (onMap/onUnmap). The first core->plugin event stream;
+  // the foundation for decorations (architecture.md "First decoration milestone").
+  // Always present in the current runtime (no capability gate yet -- flagged).
+  window?: PluginWindowObserver;
 }
 
 // Internal handle the bootstrap uses to drive the SDK (run the shutdown cb, etc.)
@@ -31,7 +36,7 @@ export interface SdkControl {
 }
 
 export function createSdk(name: string, emitLog: (line: string) => void,
-                          gpu?: PluginGpu): SdkControl {
+                          gpu?: PluginGpu, window?: PluginWindowObserver): SdkControl {
   let shutdownCb: ShutdownCallback | null = null;
 
   const sdk: PluginSdk = {
@@ -45,6 +50,7 @@ export function createSdk(name: string, emitLog: (line: string) => void,
       shutdownCb = cb;
     },
     ...(gpu ? { gpu } : {}),
+    ...(window ? { window } : {}),
   };
 
   return {

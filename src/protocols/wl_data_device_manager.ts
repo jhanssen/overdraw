@@ -28,6 +28,7 @@ import type { ZwpPrimarySelectionSourceV1Handler } from "#protocols-gen/zwp_prim
 import type { ZwpPrimarySelectionOfferV1Handler } from "#protocols-gen/zwp_primary_selection_offer_v1.js";
 import type { Ctx } from "./ctx.js";
 import type { Resource, WaylandFd } from "../types.js";
+import { KEYBOARD_EVENT } from "../events/window-bus.js";
 
 // Map a wl_data_offer resource back to the source it represents, so receive() can
 // forward to the right source. Lives module-scope (keyed by offer resource).
@@ -235,14 +236,10 @@ function sendPrimaryTo(ctx: Ctx, clientId: number): void {
 
 export default function makeDataDeviceManager(ctx: Ctx): WlDataDeviceManagerHandler {
   // Resend BOTH selections to a client when it gains keyboard focus (selection
-  // follows keyboard focus). The seat is created during installProtocols before
-  // globals are wired; defer hook registration a tick so it's present.
-  queueMicrotask(() => {
-    if (ctx.state.seat) {
-      ctx.state.seat.onKbFocusChange = (clientId) => {
-        if (clientId != null) { sendSelectionTo(ctx, clientId); sendPrimaryTo(ctx, clientId); }
-      };
-    }
+  // follows keyboard focus). Subscribe to the bus keyboard.focus event. The bus is
+  // optional (GPU-free tests may omit it); subscribe only when present.
+  ctx.state.bus?.on(KEYBOARD_EVENT.focus, ({ clientId }) => {
+    if (clientId != null) { sendSelectionTo(ctx, clientId); sendPrimaryTo(ctx, clientId); }
   });
 
   return {

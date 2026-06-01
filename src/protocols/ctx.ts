@@ -9,6 +9,8 @@
 
 import type { Addon, Resource, EventsByInterface, WaylandFd } from "../types.js";
 import type { Wm } from "../wm/index.js";
+import type { CompositorBus } from "../events/window-bus.js";
+import type { WindowChangeField } from "../events/types.js";
 
 export interface SurfaceRecord {
   id: number;
@@ -118,6 +120,15 @@ export interface CompositorState {
   primarySources?: Map<Resource, { mimes: string[] }>;
   primaryDevices?: Map<number, Set<Resource>>;
   primarySelection?: Resource | null;
+  // Core-internal event bus. Producers (this layer + the seat) emit window/
+  // keyboard events; subscribers (the plugin-forwarding layer in main.ts, the
+  // clipboard layer, the future decoration registry) listen. Set by
+  // installProtocols. Optional so GPU-free protocol tests can omit it.
+  bus?: CompositorBus;
+  // Per-frame change coalescing: surfaceId -> set of fields that changed since the
+  // last flush. The frame sweep drains this into window.change events. Populated
+  // by set_title/set_app_id and keyboard-focus changes. Created lazily.
+  pendingWindowChanges?: Map<number, Set<WindowChangeField>>;
 }
 
 export interface SubsurfaceRecord {
@@ -223,10 +234,6 @@ export interface SeatState {
   // WM from mapWindow.
   focusWindow(surfaceId: number, surfaceRec: { resource: Resource },
               rect: { x: number; y: number; width: number; height: number }): void;
-  // Invoked after keyboard focus changes (new focused clientId, or null). The
-  // clipboard layer uses this to (re)send the current selection to the focused
-  // client. Set by the data-device module.
-  onKbFocusChange?: (clientId: number | null) => void;
   // Topmost surface under an output-space point (for DnD hit-testing).
   pick(x: number, y: number): SeatFocus | null;
   // DnD pointer grab. While non-null, handleInput routes pointer motion/button to
