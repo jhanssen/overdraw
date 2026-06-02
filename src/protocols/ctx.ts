@@ -85,6 +85,15 @@ export interface CompositorState {
   nextSerial: number;
   serial(): number;
   wm?: Wm;
+  // Settable indirection: when the WM detects a decorated window's outer tile
+  // changed (relayout/insets), it calls this hook so the decoration broker can
+  // forward decoration.resized to the owning plugin. The WM itself doesn't know
+  // about the broker; main.ts (and the GPU tests) wires this up after creating
+  // the broker. Absent for GPU-free unit tests / when no broker is present.
+  decorationResize?: (windowId: number,
+                      outerRect: { x: number; y: number; width: number; height: number },
+                      contentRect: { x: number; y: number; width: number; height: number },
+                      insets: { top: number; right: number; bottom: number; left: number }) => void;
   seat?: SeatState;
   lastCommittedSurfaceId?: number;
   // Fire all surfaces' pending wl_surface.frame callbacks (set by installProtocols;

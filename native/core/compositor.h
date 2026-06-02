@@ -52,6 +52,78 @@ class Compositor {
     WGPUInstance instanceHandle() const { return instance_.Get(); }
     WGPUDevice deviceHandle() const { return device_.Get(); }
 
+    // Reserve a wire texture AND capture the cross-channel ordering serial in
+    // one call. The serial is sampled from the wire FdSerializer's bytesQueued()
+    // AFTER the flush that committed the reserve into the wire's out-queue --
+    // doing this in one place makes "captured too early" structurally impossible
+    // at call sites. Callers should use the embedded `wireSerial` to tag any
+    // side-channel message that depends on the reserve being applied by the wire
+    // server (the recycled-handle hazard: see ipc::WireBarrier).
+    //
+    // OWNERSHIP MODEL (TaggedReservation as a policy primitive). The reservation
+    // is held by a move-only RAII-ish holder with TWO explicit terminal actions:
+    //
+    //   - commit(): the reservation has been (or will be) published to a peer
+    //     via a ctrl message that the peer will act on (e.g. ImportClientTex,
+    //     AllocSurfaceBuf). The wire-id is now considered "in use" by the
+    //     server's WireServer object table -- per the deferred-reclaim policy
+    //     for the recycled-handle hazard, it MUST NOT be reclaimed even after
+    //     the resource is later released. commit() relinquishes ownership; the
+    //     destructor will not reclaim.
+    //
+    //   - discard(): the reservation died BEFORE any peer could observe it
+    //     (e.g. ctrl send fatally failed, or this is teardown). The id was never
+    //     published; it is safe to call ReclaimTextureReservation on it.
+    //     discard() returns the id to the wire-client pool.
+    //
+    // Default behavior (destructor without commit/discard) is discard. Callers
+    // MUST call one of the two explicitly at every exit path -- the holder is
+    // designed so the choice is impossible to forget without a leak.
+    //
+    // EMPIRICAL CAVEAT (from test/wire-serial-regression.gpu.mjs): in this Dawn
+    // build, ReserveTexture itself does NOT emit wire bytes, and Reclaim does
+    // NOT emit UnregisterObjectCmd. So Reclaim is a pure client-side id-pool
+    // operation; the wire-server WireServer is never told. That is precisely
+    // why "Reclaim after publish" is unsafe (the server still believes the slot
+    // is in use; a future reserve at id-gen+1 would let an unrelated caller's
+    // Inject collide with it). commit() encodes that policy in the type.
+    class TaggedReservation {
+      public:
+        TaggedReservation() = default;
+        TaggedReservation(dawn::wire::ReservedTexture rt, uint64_t serial,
+                          dawn::wire::WireClient* client);
+        TaggedReservation(TaggedReservation&&) noexcept;
+        TaggedReservation& operator=(TaggedReservation&&) noexcept;
+        TaggedReservation(const TaggedReservation&) = delete;
+        TaggedReservation& operator=(const TaggedReservation&) = delete;
+        ~TaggedReservation();
+
+        // Accessors. Valid until commit() or discard() is called.
+        const dawn::wire::ReservedTexture& reservation() const { return rt_; }
+        uint64_t wireSerial() const { return serial_; }
+        // For C++ callers that need to take ownership of the wgpu::Texture
+        // produced by the reservation (e.g. wrap it for JS handoff). The
+        // texture pointer remains valid; only the right-to-reclaim moves.
+        // The reservation is treated as "committed" (no Reclaim on destruction).
+        dawn::wire::ReservedTexture commitAndTake();
+
+        // The reservation has been published (a ctrl message naming the wire id
+        // was sent and will be acted on by the peer). The destructor will NOT
+        // reclaim.
+        void commit();
+
+        // The reservation never reached a peer (synchronous send failure /
+        // teardown before any publish). Reclaim is safe; do it now.
+        void discard();
+
+      private:
+        dawn::wire::ReservedTexture rt_{};
+        uint64_t serial_ = 0;
+        dawn::wire::WireClient* client_ = nullptr;  // null = empty/committed
+    };
+    TaggedReservation reserveTextureTagged(uint32_t width, uint32_t height,
+                                           wgpu::TextureUsage usage);
+
     // Declare that the wire client is now shared with a JS WebGPU binding so its
     // wgpu objects (whose finalizers run at process exit) outlive the client.
     void markWireSharedWithJs() { link_->markSharedWithExternal(); }
@@ -131,15 +203,28 @@ class Compositor {
         uint32_t surfaceBufId;
         ReservedHandle texture;   // core reserved texture handle
         ReservedHandle device;    // core device wire handle
+        // Core-wire ordering serial sampled by reserveTextureTagged AFTER the
+        // flush that committed the reserve. AllocSurfaceBuf must carry this so
+        // the GPU process can gate the core-side InjectTexture on the core wire
+        // reader catching up past it (recycled-handle hazard).
+        uint64_t coreWireSerial;
     };
     CoreSurfaceReservation reserveCoreSurfaceTexture(uint32_t width, uint32_t height);
     // Send AllocSurfaceBuf (one GBM dmabuf imported into plugin+core devices,
     // injected at both reserved handles). Completion async; poll
     // surfaceBufAllocated(surfaceBufId).
+    //
+    // `pluginReservePointSerial` is the PLUGIN-wire bytesQueued sampled by the
+    // worker AFTER the flush that committed the producer-texture reserve;
+    // `coreReservePointSerial` is the CORE-wire equivalent (from
+    // reserveCoreSurfaceTexture).  Both ride on the message; the GPU process
+    // gates each side's InjectTexture on its respective wire reader catching up.
     void sendAllocSurfaceBuf(uint32_t surfaceBufId, uint32_t connId,
                              uint32_t width, uint32_t height,
                              ReservedHandle pluginDevice, ReservedHandle pluginTexture,
-                             ReservedHandle coreDevice, ReservedHandle coreTexture);
+                             ReservedHandle coreDevice, ReservedHandle coreTexture,
+                             uint64_t pluginReservePointSerial,
+                             uint64_t coreReservePointSerial);
     int surfaceBufAllocated(uint32_t surfaceBufId) const;
     // The core's wrapped texture handle for a successfully-allocated surface buf
     // (the consumer texture the JS compositor wraps + samples). 0 if unknown.
@@ -219,7 +304,13 @@ class Compositor {
     // Plugin surface buffers: the core-side reservation (held alive) + alloc
     // status, keyed by surfaceBufId.
     uint32_t nextSurfaceBufId_ = 1;
-    std::unordered_map<uint32_t, dawn::wire::ReservedTexture> coreSurfaceReservations_;
+    // The held reservation for each in-flight or live surfaceBufId. Owned via
+    // TaggedReservation so the deferred-reclaim policy is enforced by type:
+    // releaseSurfaceBuf commit()s (the GPU process accepted the alloc and may
+    // have published a server-side object at the id -- never recycle); a
+    // SurfaceBufAllocated reply with ok=0 discard()s (the inject failed before
+    // any server-side state was published -- safe to reclaim).
+    std::unordered_map<uint32_t, TaggedReservation> coreSurfaceReservations_;
     std::unordered_map<uint32_t, int> surfaceBufAllocated_;
     // Per-surface Begin-done status (0=pending,1=producer,2=consumer,3=failed).
     std::unordered_map<uint32_t, int> surfaceBeginDone_;
@@ -235,11 +326,17 @@ class Compositor {
     // ImportClientTex, hold the reservation until the GPU replies, then hand the
     // injected handle to JS. Completion reports the texture handle to JS instead
     // of building native compositing state.
+    //
+    // The reservation is owned via TaggedReservation -- callers must terminate
+    // it explicitly with commit() (the GPU process accepted the import; never
+    // recycle the id) or discard() (the import was never observed by a peer;
+    // safe to reclaim). The destructor falls back to discard, so a leaked
+    // entry returns the id to the pool rather than leaking forever.
     struct PendingJsImport {
         uint32_t importId;
         uint32_t width;
         uint32_t height;
-        dawn::wire::ReservedTexture reservation;  // held until reply
+        TaggedReservation reservation;
     };
     std::vector<PendingJsImport> pendingJsImports_;
     std::vector<JsImportDone> completedJsImports_;

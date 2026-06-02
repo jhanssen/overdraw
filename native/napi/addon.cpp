@@ -654,21 +654,29 @@ napi_value PluginConsumerTexture(napi_env env, napi_callback_info info) {
 // texture on its wire client and passes the handles; the core reserves the
 // consumer texture and sends AllocSurfaceBuf. cb({surfaceBufId, consumerTexture} |
 // null) -- the Worker already has its producer handle. Async.
+// 9th arg `pluginReservePointSerial` (BigInt) is the worker's wire-bytesQueued
+// sampled AFTER its flush that committed the producer-texture reserve. The core
+// captures the analogous core-wire serial inside reserveCoreSurfaceTexture and
+// passes both into AllocSurfaceBuf, so the GPU process can gate each side's
+// InjectTexture on its own wire reader catching up (the recycled-handle hazard).
 napi_value PluginAllocSurfaceBufferW(napi_env env, napi_callback_info info) {
     if (!g_addon.compositor) return nullptr;
-    size_t argc = 8; napi_value argv[8];
+    size_t argc = 9; napi_value argv[9];
     napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
-    if (argc < 8) return throwError(env, "pluginAllocSurfaceBufferW(connId,w,h,ptId,ptGen,pdId,pdGen,cb)");
+    if (argc < 9) return throwError(env, "pluginAllocSurfaceBufferW(connId,w,h,ptId,ptGen,pdId,pdGen,pluginSerial,cb)");
     uint32_t connId = u32(env, argv[0]), w = u32(env, argv[1]), h = u32(env, argv[2]);
     uint32_t ptId = u32(env, argv[3]), ptGen = u32(env, argv[4]);
     uint32_t pdId = u32(env, argv[5]), pdGen = u32(env, argv[6]);
     if (w == 0 || h == 0) return throwError(env, "pluginAllocSurfaceBufferW: bad size");
+    uint64_t pluginSerial = 0; bool lossless = false;
+    napi_get_value_bigint_uint64(env, argv[7], &pluginSerial, &lossless);
     auto core = g_addon.compositor->reserveCoreSurfaceTexture(w, h);
     if (core.surfaceBufId == 0) return throwError(env, "core texture reserve failed");
     g_addon.compositor->sendAllocSurfaceBuf(
         core.surfaceBufId, connId, w, h, {pdId, pdGen}, {ptId, ptGen},
-        {core.device.id, core.device.generation}, {core.texture.id, core.texture.generation});
-    napi_ref cbRef; napi_create_reference(env, argv[7], 1, &cbRef);
+        {core.device.id, core.device.generation}, {core.texture.id, core.texture.generation},
+        pluginSerial, core.coreWireSerial);
+    napi_ref cbRef; napi_create_reference(env, argv[8], 1, &cbRef);
     g_pendingAllocs.push_back({core.surfaceBufId, connId, cbRef});
     return nullptr;
 }

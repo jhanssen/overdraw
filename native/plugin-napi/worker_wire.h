@@ -61,13 +61,61 @@ class WorkerWireClient {
 
     // Reserve a producer texture (RenderAttachment|TextureBinding) for a surface
     // buffer; the GPU process injects the dmabuf texture at this handle (the core
-    // sends AllocSurfaceBuf). Returns the texture + device wire handles.
-    struct SurfaceReservation { Handle texture; Handle device; bool ok; };
+    // sends AllocSurfaceBuf). Returns the texture + device wire handles + the
+    // PLUGIN-wire ordering serial sampled AFTER the flush that committed any
+    // pending wire-client traffic into the FdSerializer. Callers MUST pass the
+    // `wireSerial` to AllocSurfaceBuf so the GPU process can gate its plugin-
+    // side InjectTexture on the plugin wire reader catching up past it.
+    //
+    // OWNERSHIP / DEFERRED-RECLAIM POLICY. The reservation is stored internally
+    // keyed by `surfaceBufId`; ownership stays with the WorkerWireClient. The
+    // worker-side API has exactly ONE termination call:
+    //
+    //   forgetProducerReservation(surfaceBufId): drop the bookkeeping for the
+    //   slot, BUT do NOT call ReclaimTextureReservation on the wire client.
+    //   Per the deferred-reclaim policy (see ipc::WireBarrier / Compositor::
+    //   TaggedReservation for the full reasoning): once the wire id has been
+    //   published to the GPU process via AllocSurfaceBuf, the wire-server's
+    //   WireServer object table holds an entry there. Recycling the id would
+    //   let a future reserveProducerTexture pick the same id at gen+1 and the
+    //   subsequent InjectTexture would CONFLICT with the still-registered
+    //   object. So forget without reclaiming; the wire client's id pool will
+    //   allocate fresh ids for the next ring. Cost: a few {id, generation}
+    //   client-side reservation entries leak per resize, bounded by total
+    //   resizes (32-bit ids).
+    //
+    // RECYCLED-HANDLE HAZARD. Wire object handles are {id,generation}; ids
+    // would be recycled by Reclaim. The risk is that the GPU process's
+    // `InjectTexture` at the new (recycled) id runs BEFORE all wire traffic
+    // that references the OLD object at that id has been drained by the wire
+    // server -- so the InjectTexture races a still-pending command, and
+    // either fails or installs over state that is still being read. The
+    // barrier on the receiving side gates InjectTexture on
+    // `bytesConsumed() >= wireSerial`. The serial captured here, AFTER a
+    // flush, encompasses all bytes the FdSerializer has been handed up to
+    // this moment (which includes the OLD-handle-referencing commands).
+    //
+    // EMPIRICAL CAVEAT. In this Dawn build, `ReserveTexture` itself does NOT
+    // emit wire bytes; `ReclaimTextureReservation` does NOT emit
+    // UnregisterObjectCmd. Reclaim is pure client-side id-pool; the wire
+    // server is never told. That is precisely why "Reclaim after publish" is
+    // unsafe: the server still believes the slot is in use. The deferred-
+    // reclaim policy (above) encodes that.
+    //
+    // The flush + bytesQueued sample happens inside this function so the serial
+    // cannot be captured too early; this is the single chokepoint replacing
+    // the previous "reserveProducerTexture() + caller flushes + caller reads
+    // wireBytesQueued()" pattern across separate calls.
+    struct SurfaceReservation { Handle texture; Handle device; uint64_t wireSerial; bool ok; };
     SurfaceReservation reserveProducerTexture(uint32_t surfaceBufId, uint32_t w, uint32_t h);
     WGPUTexture producerTexture(uint32_t surfaceBufId) const;
-    // Release a producer-texture reservation (surface teardown): reclaim the wire
-    // handle + drop the map entry so it does not leak.
-    void releaseProducerTexture(uint32_t surfaceBufId);
+    // Forget a producer-texture reservation slot WITHOUT reclaiming the wire id
+    // (deferred-reclaim policy; see above). The id stays allocated on the wire
+    // client's id pool until process exit; the WireServer's bookkeeping at
+    // that id is preserved (and the GPU process will free its native resources
+    // via ReleaseSurfaceBuf, which acts on STM/textures/dmabuf, not the wire-
+    // handle id). No-op if the id is unknown.
+    void forgetProducerReservation(uint32_t surfaceBufId);
 
     void markSharedWithJs() { link_->markSharedWithExternal(); }
     void flush() { link_->flush(); }

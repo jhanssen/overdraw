@@ -182,24 +182,87 @@ bool Compositor::bringUp() {
     return true;
 }
 
+// --- TaggedReservation ------------------------------------------------------
+
+Compositor::TaggedReservation::TaggedReservation(dawn::wire::ReservedTexture rt,
+                                                 uint64_t serial,
+                                                 dawn::wire::WireClient* client)
+    : rt_(rt), serial_(serial), client_(client) {}
+
+Compositor::TaggedReservation::TaggedReservation(TaggedReservation&& o) noexcept
+    : rt_(o.rt_), serial_(o.serial_), client_(o.client_) {
+    o.client_ = nullptr;
+}
+
+Compositor::TaggedReservation&
+Compositor::TaggedReservation::operator=(TaggedReservation&& o) noexcept {
+    if (this != &o) {
+        // Existing reservation (if any) falls back to discard semantics.
+        if (client_) client_->ReclaimTextureReservation(rt_);
+        rt_ = o.rt_;
+        serial_ = o.serial_;
+        client_ = o.client_;
+        o.client_ = nullptr;
+    }
+    return *this;
+}
+
+Compositor::TaggedReservation::~TaggedReservation() {
+    // Default behavior: discard (reclaim id; safe IF never published). Callers
+    // that DID publish must call commit() explicitly; their wire-id will then
+    // be retained per the deferred-reclaim policy.
+    if (client_) client_->ReclaimTextureReservation(rt_);
+}
+
+void Compositor::TaggedReservation::commit() {
+    client_ = nullptr;  // suppress destructor reclaim
+}
+
+void Compositor::TaggedReservation::discard() {
+    if (client_) {
+        client_->ReclaimTextureReservation(rt_);
+        client_ = nullptr;
+    }
+}
+
+dawn::wire::ReservedTexture Compositor::TaggedReservation::commitAndTake() {
+    auto out = rt_;
+    client_ = nullptr;
+    return out;
+}
+
+Compositor::TaggedReservation Compositor::reserveTextureTagged(
+        uint32_t width, uint32_t height, wgpu::TextureUsage usage) {
+    // The single chokepoint for "reserve a wire texture + capture its ordering
+    // serial". CRITICAL: the bytesQueued() sample MUST happen AFTER the flush
+    // that commits the reserve into the wire FdSerializer (Dawn wire batches
+    // commands between Flush() calls; reading the counter before the flush
+    // yields a serial below the reserve, so the GPU process catches up before
+    // the reserve is actually applied -- the recycled-handle inject then fails
+    // at a stale id). Putting reserve + flush + sample in one helper removes
+    // the chance to get the ordering wrong at a call site.
+    wgpu::TextureDescriptor td{};
+    td.size = {width, height, 1};
+    td.format = wgpu::TextureFormat::BGRA8Unorm;
+    td.usage = usage;
+    auto rt = link_->client().ReserveTexture(
+        device_.Get(), reinterpret_cast<const WGPUTextureDescriptor*>(&td));
+    link_->flush();
+    return TaggedReservation{rt, link_->wireBytesQueued(), &link_->client()};
+}
+
 uint32_t Compositor::importDmabufForJs(int fd, uint32_t width, uint32_t height,
                                        uint32_t drmFourcc, uint64_t modifier,
                                        uint32_t offset, uint32_t stride) {
     if (!device_ || width == 0 || height == 0 || fd < 0) return 0;
 
-    wgpu::TextureDescriptor td{};
-    td.size = {width, height, 1};
-    td.format = wgpu::TextureFormat::BGRA8Unorm;
-    td.usage = wgpu::TextureUsage::TextureBinding | wgpu::TextureUsage::CopySrc;
-    auto rt = link_->client().ReserveTexture(
-        device_.Get(), reinterpret_cast<const WGPUTextureDescriptor*>(&td));
-
-    link_->flush();
-    uint64_t wireSerial = link_->wireBytesQueued();
+    TaggedReservation tr = reserveTextureTagged(width, height,
+        wgpu::TextureUsage::TextureBinding | wgpu::TextureUsage::CopySrc);
+    const auto& rt = tr.reservation();
 
     ipc::Message m{};
     m.tag = ipc::Tag::ImportClientTex;
-    m.wireSerial = wireSerial;
+    m.wireSerial = tr.wireSerial();
     m.device = {rt.deviceHandle.id, rt.deviceHandle.generation};
     m.texture = {rt.handle.id, rt.handle.generation};
     m.width = width;
@@ -211,11 +274,15 @@ uint32_t Compositor::importDmabufForJs(int fd, uint32_t width, uint32_t height,
     m.planeCount = 1;
     int fds[1] = {fd};
     if (!ipc::sendMessageFds(ctrlFd_, m, fds, 1)) {
-        link_->client().ReclaimTextureReservation(rt);
+        // The peer never observed this reservation; safe to recycle the id.
+        tr.discard();
         return 0;
     }
+    // Ctrl message handed to the peer -> the GPU process WILL act on it (will
+    // run InjectTexture, success or failure). Move the holder into the pending
+    // list; final commit()/discard() happens in drainCtrl on the reply.
     uint32_t importId = nextJsImportId_++;
-    pendingJsImports_.push_back({importId, width, height, rt});
+    pendingJsImports_.push_back({importId, width, height, std::move(tr)});
     return importId;
 }
 
@@ -237,10 +304,14 @@ void Compositor::releaseSurfaceBuf(uint32_t surfaceBufId) {
     m.tag = ipc::Tag::ReleaseSurfaceBuf;
     m.surfaceBufId = surfaceBufId;
     ipc::sendMessage(ctrlFd_, m);
-    auto rit = coreSurfaceReservations_.find(surfaceBufId);
-    if (rit != coreSurfaceReservations_.end()) {
-        link_->client().ReclaimTextureReservation(rit->second);
-        coreSurfaceReservations_.erase(rit);
+    // The reservation was PUBLISHED to the GPU process (which InjectTexture'd
+    // it server-side). commit() it -- the deferred-reclaim policy keeps the
+    // wire id from being recycled even after we drop our bookkeeping. See
+    // TaggedReservation in compositor.h for why.
+    auto it = coreSurfaceReservations_.find(surfaceBufId);
+    if (it != coreSurfaceReservations_.end()) {
+        it->second.commit();
+        coreSurfaceReservations_.erase(it);
     }
     surfaceBufAllocated_.erase(surfaceBufId);
     surfaceBeginDone_.erase(surfaceBufId);
@@ -277,9 +348,16 @@ void Compositor::drainCtrl() {
         if (r.tag == ipc::Tag::SurfaceBufAllocated) {
             surfaceBufAllocated_[r.surfaceBufId] = r.ok ? 1 : 2;
             if (!r.ok) {
+                // The GPU process REACHED InjectTexture and it failed. Its
+                // WireServer may already have a partial registration at our
+                // reserved id (Dawn's wire-server state on a failed Inject is
+                // not contractually defined, so we conservatively assume the
+                // slot is occupied). commit() -> the deferred-reclaim policy
+                // keeps the id from being recycled into a future caller's
+                // reserve, which would let an unrelated Inject collide.
                 auto it = coreSurfaceReservations_.find(r.surfaceBufId);
                 if (it != coreSurfaceReservations_.end()) {
-                    link_->client().ReclaimTextureReservation(it->second);
+                    it->second.commit();
                     coreSurfaceReservations_.erase(it);
                 }
             }
@@ -291,19 +369,27 @@ void Compositor::drainCtrl() {
         // complete in send order, so matching by id is exact.
         auto jit = std::find_if(pendingJsImports_.begin(), pendingJsImports_.end(),
             [&](const PendingJsImport& pi) {
-                return pi.reservation.handle.id == r.texture.id;
+                return pi.reservation.reservation().handle.id == r.texture.id;
             });
         if (jit == pendingJsImports_.end()) continue;
+        // commit() on BOTH branches under the deferred-reclaim policy: success
+        // means the GPU server registered the texture; failure means it tried
+        // and the WireServer state at the id may be partial. Either way the id
+        // must not be recycled. (The holder is destroyed when the vector entry
+        // is erased; commit() suppresses the destructor's default reclaim.)
         if (r.importOk) {
-            jsImportHandles_[jit->importId] =
-                {jit->reservation.handle.id, jit->reservation.handle.generation};
+            const auto& rt = jit->reservation.reservation();
+            jsImportHandles_[jit->importId] = {rt.handle.id, rt.handle.generation};
+            // Take ownership of the wgpu::Texture handle for hand-off to JS;
+            // marks the reservation as committed.
+            auto taken = jit->reservation.commitAndTake();
             completedJsImports_.push_back(
                 {jit->importId, jit->width, jit->height,
-                 wgpu::Texture::Acquire(jit->reservation.texture), true});
+                 wgpu::Texture::Acquire(taken.texture), true});
         } else {
             std::fprintf(stderr, "[core] dmabuf JS import FAILED id=%u %ux%u\n",
                          jit->importId, jit->width, jit->height);
-            link_->client().ReclaimTextureReservation(jit->reservation);
+            jit->reservation.commit();
             completedJsImports_.push_back({jit->importId, 0, 0, wgpu::Texture(), false});
         }
         pendingJsImports_.erase(jit);
@@ -312,28 +398,29 @@ void Compositor::drainCtrl() {
 
 Compositor::CoreSurfaceReservation Compositor::reserveCoreSurfaceTexture(
         uint32_t width, uint32_t height) {
-    CoreSurfaceReservation out{0, {0, 0}, {0, 0}};
+    CoreSurfaceReservation out{0, {0, 0}, {0, 0}, 0};
     if (!device_) return out;
     const uint32_t surfaceBufId = nextSurfaceBufId_++;
-    wgpu::TextureDescriptor td{};
-    td.size = {width, height, 1};
-    td.format = wgpu::TextureFormat::BGRA8Unorm;
-    td.usage = wgpu::TextureUsage::TextureBinding | wgpu::TextureUsage::CopySrc;
-    auto rt = link_->client().ReserveTexture(
-        device_.Get(), reinterpret_cast<const WGPUTextureDescriptor*>(&td));
-    coreSurfaceReservations_[surfaceBufId] = rt;
-    surfaceBufAllocated_[surfaceBufId] = 0;  // pending
+    // One-call reserve + flush + serial capture. The captured serial is the
+    // CORE-wire ordering serial: AllocSurfaceBuf's consumer-side InjectTexture
+    // gates on the core wire reader catching up past it.
+    TaggedReservation tr = reserveTextureTagged(width, height,
+        wgpu::TextureUsage::TextureBinding | wgpu::TextureUsage::CopySrc);
     out.surfaceBufId = surfaceBufId;
-    out.texture = {rt.handle.id, rt.handle.generation};
-    out.device = {rt.deviceHandle.id, rt.deviceHandle.generation};
+    out.texture = {tr.reservation().handle.id, tr.reservation().handle.generation};
+    out.device = {tr.reservation().deviceHandle.id, tr.reservation().deviceHandle.generation};
+    out.coreWireSerial = tr.wireSerial();
+    surfaceBufAllocated_[surfaceBufId] = 0;  // pending
+    coreSurfaceReservations_.emplace(surfaceBufId, std::move(tr));
     return out;
 }
 
 void Compositor::sendAllocSurfaceBuf(uint32_t surfaceBufId, uint32_t connId,
                                      uint32_t width, uint32_t height,
                                      ReservedHandle pluginDevice, ReservedHandle pluginTexture,
-                                     ReservedHandle coreDevice, ReservedHandle coreTexture) {
-    link_->flush();  // ensure any reserve-related wire bytes are queued first
+                                     ReservedHandle coreDevice, ReservedHandle coreTexture,
+                                     uint64_t pluginReservePointSerial,
+                                     uint64_t coreReservePointSerial) {
     ipc::Message m{};
     m.tag = ipc::Tag::AllocSurfaceBuf;
     m.surfaceBufId = surfaceBufId;
@@ -344,6 +431,12 @@ void Compositor::sendAllocSurfaceBuf(uint32_t surfaceBufId, uint32_t connId,
     m.pluginTexture = {pluginTexture.id, pluginTexture.generation};
     m.device = {coreDevice.id, coreDevice.generation};
     m.texture = {coreTexture.id, coreTexture.generation};
+    // Cross-channel ordering serials. The GPU process must defer InjectTexture
+    // on both sides until each wire reader has caught up past its serial (the
+    // recycled-handle hazard: see ipc::WireBarrier). Plugin serial gates the
+    // plugin-conn InjectTexture; core serial gates the core-wire InjectTexture.
+    m.reservePointSerial = pluginReservePointSerial;
+    m.wireSerial = coreReservePointSerial;
     ipc::sendMessage(ctrlFd_, m);
 }
 
@@ -354,7 +447,8 @@ int Compositor::surfaceBufAllocated(uint32_t surfaceBufId) const {
 
 WGPUTexture Compositor::coreSurfaceTexture(uint32_t surfaceBufId) const {
     auto it = coreSurfaceReservations_.find(surfaceBufId);
-    return it == coreSurfaceReservations_.end() ? nullptr : it->second.texture;
+    return it == coreSurfaceReservations_.end() ? nullptr
+                                                : it->second.reservation().texture;
 }
 
 void Compositor::sendProducerBegin(uint32_t surfaceBufId) {
@@ -473,10 +567,18 @@ void Compositor::shutdown() {
         ipc::sendMessage(ctrlFd_, m);
         link_->flush();
     }
-    // Release wgpu objects before tearing down the wire link.
-    for (auto& pi : pendingJsImports_)
-        link_->client().ReclaimTextureReservation(pi.reservation);
+    // Release wgpu objects before tearing down the wire link. Each pending
+    // import's reservation was published to the GPU process, which is being
+    // torn down alongside us; commit() (deferred-reclaim policy) is the right
+    // terminal action -- the wire client itself is about to be destroyed two
+    // lines below, so recycling vs not is moot for THIS process, but commit()
+    // keeps the type-level policy consistent.
+    for (auto& pi : pendingJsImports_) pi.reservation.commit();
     pendingJsImports_.clear();
+    // Also commit any live coreSurfaceReservations_ entries (their GPU-process
+    // injects DID happen). They are destroyed when the map clears.
+    for (auto& [bufId, tr] : coreSurfaceReservations_) { (void)bufId; tr.commit(); }
+    coreSurfaceReservations_.clear();
     completedJsImports_.clear();
     currentOutputTexture_ = nullptr;
     surface_ = nullptr;

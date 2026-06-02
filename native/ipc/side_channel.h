@@ -164,7 +164,21 @@ struct Message {
     // texture's UnregisterObjectCmd that recycled this handle id, object creates,
     // etc. -- have been handed to the wire server). Sampled by the core from
     // FdSerializer::bytesQueued() right after flushing the reserve.
+    //
+    // For AllocSurfaceBuf this names the CORE wire reader (the core reserved the
+    // consumer texture); for ProducerEnd, the PLUGIN wire reader (plugin render
+    // commands ride that wire). See `reservePointSerial` for the PLUGIN-wire side
+    // of AllocSurfaceBuf (the producer texture).
     uint64_t wireSerial = 0;
+
+    // AllocSurfaceBuf: cross-channel ordering serial on the PLUGIN wire connection.
+    // The plugin worker sampled its own FdSerializer::bytesQueued() right after
+    // flushing the producer-texture reserve; the GPU process must not InjectTexture
+    // at the producer handle until its plugin-conn wire reader has consumed at
+    // least this many framed bytes (so the prior UnregisterObjectCmd that recycled
+    // this id has been applied and the new ReserveTexture is in). Independent of
+    // `wireSerial` above, which is the CORE-wire serial for the consumer texture.
+    uint64_t reservePointSerial = 0;
 };
 
 constexpr uint32_t kProtocolVersion = 1;

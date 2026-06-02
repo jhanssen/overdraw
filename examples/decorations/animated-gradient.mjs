@@ -103,34 +103,51 @@ export default async function init(sdk) {
     return w.surface.present();
   }
 
-  sdk.decorations.onAssigned(async (ev) => {
-    try {
-      // Reserve a titlebar inset (additive) + create the decoration surface on the
-      // `below` layer (the opaque content draws over it -- only the reserved border
-      // band shows the gradient). One call.
-      const surface = await sdk.decorations.createDecoration(ev.surfaceId, {
-        insets: { top: TITLEBAR_HEIGHT, right: BORDER, bottom: BORDER, left: BORDER },
-        layer: "below",
-      });
-      const w = {
-        surface, w: surface.width, h: surface.height,
-        active: true, t0: performance.now(), running: true,
-      };
-      windows.set(ev.surfaceId, w);
+  async function startDecoration(windowId) {
+    // Reserve a titlebar inset (additive) + create the decoration surface on the
+    // `below` layer (the opaque content draws over it -- only the reserved border
+    // band shows the gradient). One call.
+    const surface = await sdk.decorations.createDecoration(windowId, {
+      insets: { top: TITLEBAR_HEIGHT, right: BORDER, bottom: BORDER, left: BORDER },
+      layer: "below",
+    });
+    const w = {
+      surface, w: surface.width, h: surface.height,
+      active: true, t0: performance.now(), running: true,
+    };
+    windows.set(windowId, w);
+    // Frame loop: animate on our own clock. The first present releases the gated
+    // content (window + titlebar appear together). ~60fps via rAF-ish setTimeout
+    // (a core frame-tick SDK -- sdk.onFrame -- would replace this later).
+    void (async () => {
+      while (w.running) {
+        await drawFrame(w);
+        await new Promise((r) => setTimeout(r, 16));
+      }
+    })();
+    sdk.log(`decorating window ${windowId} (${surface.width}x${surface.height})`);
+  }
 
-      // Frame loop: animate on our own clock. The first present releases the gated
-      // content (window + titlebar appear together). ~60fps via rAF-ish setTimeout
-      // (a core frame-tick SDK -- sdk.onFrame -- would replace this later).
-      void (async () => {
-        while (w.running) {
-          await drawFrame(w);
-          await new Promise((r) => setTimeout(r, 16));
-        }
-      })();
-      sdk.log(`decorating window ${ev.surfaceId} (${surface.width}x${surface.height})`);
-    } catch (e) {
-      sdk.log(`decoration failed for ${ev.surfaceId}: ${e && e.message ? e.message : e}`);
+  sdk.decorations.onAssigned(async (ev) => {
+    try { await startDecoration(ev.surfaceId); }
+    catch (e) { sdk.log(`decoration failed for ${ev.surfaceId}: ${e && e.message ? e.message : e}`); }
+  });
+
+  // When the window's outer tile changes (master-stack retile, inset change),
+  // tear down the old ring (fixed-size at alloc) and create a new one at the
+  // new outer rect. Without this the previous decoration texture composites at
+  // the new -- possibly larger -- rect (scaled up by the compositor), which is
+  // visually wrong AND can cover neighbor windows when the new rect is bigger.
+  sdk.decorations.onResized(async (ev) => {
+    const prev = windows.get(ev.windowId);
+    if (prev) {
+      prev.running = false;
+      windows.delete(ev.windowId);
+      try { await prev.surface.destroy(); }
+      catch (e) { sdk.log(`prev destroy failed for ${ev.windowId}: ${e && e.message ? e.message : e}`); }
     }
+    try { await startDecoration(ev.windowId); }
+    catch (e) { sdk.log(`redecoration failed for ${ev.windowId}: ${e && e.message ? e.message : e}`); }
   });
 
   // Focus styling: window.change carries the `activated` flag. Re-tint the bar

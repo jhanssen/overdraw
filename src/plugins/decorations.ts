@@ -11,13 +11,14 @@
 
 import { DECORATION_EVENT } from "../events/types.js";
 import type {
-  DecorationAssignedEvent, DecorationDeregisteredEvent, WindowRect,
+  DecorationAssignedEvent, DecorationDeregisteredEvent, DecorationResizedEvent, WindowRect,
 } from "../events/types.js";
 import type { Endpoint, Json } from "./protocol.js";
 import type { Surface, RingMaker } from "./gpu.js";
 
 export type DecorationAssignedHandler = (ev: DecorationAssignedEvent) => void;
 export type DecorationDeregisteredHandler = (ev: DecorationDeregisteredEvent) => void;
+export type DecorationResizedHandler = (ev: DecorationResizedEvent) => void;
 
 export type Insets = { top: number; right: number; bottom: number; left: number };
 
@@ -34,6 +35,12 @@ export interface PluginDecorations {
   // Called if the core permanently deregisters this provider (e.g. it missed the
   // first-frame deadline). No further assignments until it re-registers.
   onDeregistered(cb: DecorationDeregisteredHandler): void;
+  // Called when an assigned window's OUTER tile changed (the tiling WM resized
+  // or moved it). The plugin should redraw at the new outer rect -- typically:
+  // `await oldSurface.destroy()` then `await createDecoration(windowId, ...)`
+  // with the new insets (or the same insets if only the outer size changed).
+  // Multiple callbacks may register; all fire in order.
+  onResized(cb: DecorationResizedHandler): void;
   // Reserve additive insets around an assigned window AND create the decoration
   // surface at the resulting outer rect. The core grows the window's OUTER rect by
   // the insets (content unchanged, client never told). Returns a Surface the plugin
@@ -59,6 +66,7 @@ export interface DecorationControl {
 export function createDecorations(endpoint: Endpoint, makeRingSurface: RingMaker): DecorationControl {
   const assignedHandlers: DecorationAssignedHandler[] = [];
   const deregisteredHandlers: DecorationDeregisteredHandler[] = [];
+  const resizedHandlers: DecorationResizedHandler[] = [];
 
   const decorations: PluginDecorations = {
     async register(pattern, flags) {
@@ -67,6 +75,7 @@ export function createDecorations(endpoint: Endpoint, makeRingSurface: RingMaker
     },
     onAssigned(cb) { assignedHandlers.push(cb); },
     onDeregistered(cb) { deregisteredHandlers.push(cb); },
+    onResized(cb) { resizedHandlers.push(cb); },
     async createDecoration(windowId, opts) {
       // Core reserves the additive insets + returns the outer rect.
       const res = await endpoint.request("decoration.createDecoration",
@@ -95,6 +104,11 @@ export function createDecorations(endpoint: Endpoint, makeRingSurface: RingMaker
       case DECORATION_EVENT.deregistered: {
         const ev = asDeregisteredEvent(data);
         if (ev) for (const cb of deregisteredHandlers) cb(ev);
+        return true;
+      }
+      case DECORATION_EVENT.resized: {
+        const ev = asResizedEvent(data);
+        if (ev) for (const cb of resizedHandlers) cb(ev);
         return true;
       }
       default:
@@ -129,6 +143,17 @@ function asDeregisteredEvent(data: Json): DecorationDeregisteredEvent | null {
   if (!isRecord(data)) return null;
   if (typeof data.reason !== "string" || typeof data.windowId !== "number") return null;
   return { reason: data.reason, windowId: data.windowId };
+}
+function asResizedEvent(data: Json): DecorationResizedEvent | null {
+  if (!isRecord(data)) return null;
+  if (typeof data.windowId !== "number") return null;
+  if (!isRect(data.outerRect) || !isRect(data.contentRect) || !isInsets(data.insets)) return null;
+  return {
+    windowId: data.windowId,
+    outerRect: data.outerRect,
+    contentRect: data.contentRect,
+    insets: data.insets,
+  };
 }
 
 interface InsetGrant { insets: Insets; outerRect: WindowRect; contentRect: WindowRect; }

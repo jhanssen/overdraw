@@ -133,9 +133,19 @@ export async function installProtocols(
   // The WM delegates its stack push to the full rebuild (windows interleaved with
   // their decorations + subsurfaces + popups via computeBaseStack), keeping
   // rebuildStackWithPopups the single owner of the content stack order.
-  state.wm = createWm(
-    state.compositor, output, () => rebuildStackWithPopups(state), configureSink, opts.layout,
-  );
+  // DecorationResize sink: indirect to state.decorationResize so the WM stays
+  // unaware of the broker. main.ts sets state.decorationResize after creating
+  // the broker (using broker.onDecorationResized). When unset (GPU-free tests
+  // / pre-broker bring-up), the WM still updates the decoration's compositor
+  // layout directly -- only the plugin-side redraw is skipped.
+  state.wm = createWm(state.compositor, output, {
+    rebuild: () => rebuildStackWithPopups(state),
+    configure: configureSink,
+    decorationResize: (windowId, outerRect, contentRect, insets) => {
+      state.decorationResize?.(windowId, outerRect, contentRect, insets);
+    },
+    layout: opts.layout,
+  });
   // State-query channel (tests / introspection): a GPU-free snapshot of
   // geometry / focus / stacking. See src/query.ts.
   state.query = () => queryState(state);

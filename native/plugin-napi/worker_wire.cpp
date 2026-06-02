@@ -73,7 +73,7 @@ void WorkerWireClient::pump() {
 
 WorkerWireClient::SurfaceReservation WorkerWireClient::reserveProducerTexture(
         uint32_t surfaceBufId, uint32_t w, uint32_t h) {
-    SurfaceReservation out{{0, 0}, {0, 0}, false};
+    SurfaceReservation out{{0, 0}, {0, 0}, 0, false};
     if (!device_) return out;
     wgpu::TextureDescriptor td{};
     td.size = {w, h, 1};
@@ -81,9 +81,14 @@ WorkerWireClient::SurfaceReservation WorkerWireClient::reserveProducerTexture(
     td.usage = wgpu::TextureUsage::RenderAttachment | wgpu::TextureUsage::TextureBinding;
     auto rt = link_->client().ReserveTexture(
         device_.Get(), reinterpret_cast<const WGPUTextureDescriptor*>(&td));
+    // Capture the cross-channel ordering serial AFTER the flush that commits
+    // the reserve into this wire's FdSerializer. Doing it here (not at the
+    // caller) makes "captured too early" impossible.
+    link_->flush();
     producerReservations_[surfaceBufId] = rt;
     out.texture = {rt.handle.id, rt.handle.generation};
     out.device = {rt.deviceHandle.id, rt.deviceHandle.generation};
+    out.wireSerial = link_->wireBytesQueued();
     out.ok = true;
     return out;
 }
@@ -93,11 +98,14 @@ WGPUTexture WorkerWireClient::producerTexture(uint32_t surfaceBufId) const {
   return it == producerReservations_.end() ? nullptr : it->second.texture;
 }
 
-void WorkerWireClient::releaseProducerTexture(uint32_t surfaceBufId) {
-  auto it = producerReservations_.find(surfaceBufId);
-  if (it == producerReservations_.end()) return;
-  link_->client().ReclaimTextureReservation(it->second);
-  producerReservations_.erase(it);
+void WorkerWireClient::forgetProducerReservation(uint32_t surfaceBufId) {
+  // INTENTIONALLY NOT ReclaimTextureReservation, per the deferred-reclaim
+  // policy documented in the header (and Compositor::TaggedReservation on
+  // the core side). The wire id stays in the wire-client's allocated set so
+  // future reserves don't recycle it; the GPU-process WireServer's entry
+  // there is preserved (the native resources are freed separately via
+  // ReleaseSurfaceBuf, which doesn't touch wire-handle bookkeeping).
+  producerReservations_.erase(surfaceBufId);
 }
 
 }  // namespace overdraw::plugin

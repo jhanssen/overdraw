@@ -71,8 +71,15 @@ export interface Addon {
   pluginCreateConnection(cb: (r: { connId: number; fd: number } | null) => void): void;
   pluginInjectInstance(connId: number, id: number, gen: number, cb: (ok: boolean) => void): void;
   pluginSetTickDevice(connId: number, id: number, gen: number): void;
+  // `pluginReservePointSerial` (bigint) is the PLUGIN-wire bytesQueued sampled
+  // AFTER the flush that committed the producer-texture reserve (the WORKER's
+  // reserveProducerTexture returns it directly). Required: the GPU process
+  // defers its plugin-side InjectTexture until its plugin-conn wire reader has
+  // consumed >= this many framed bytes -- the recycled-handle hazard.
   pluginAllocSurfaceBufferW(connId: number, w: number, h: number, ptId: number, ptGen: number,
-                            pdId: number, pdGen: number, cb: (r: { surfaceBufId: number } | null) => void): void;
+                            pdId: number, pdGen: number,
+                            pluginReservePointSerial: bigint,
+                            cb: (r: { surfaceBufId: number } | null) => void): void;
   pluginSurfaceProducerBegin(surfaceBufId: number, cb: (ok: boolean) => void): void;
   pluginSurfaceProducerEndW(surfaceBufId: number, wireSerial: bigint): void;
   pluginSurfaceConsumerBegin(surfaceBufId: number, cb: (ok: boolean) => void): void;

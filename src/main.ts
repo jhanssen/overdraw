@@ -143,6 +143,12 @@ if (config.plugins.length > 0) {
     state,
     emitToPlugin: (plugin, name, data) => { runtime?.emit(plugin, name, data); },
   });
+  // Wire the WM's decoration-resize indirection through the broker, so an outer
+  // tile change (relayout/insets) becomes a decoration.resized event to the
+  // owning plugin. Done after broker creation; state.decorationResize is a
+  // settable hook on CompositorState the WM calls.
+  state.decorationResize = (windowId, outerRect, contentRect, insets) =>
+    decorationBroker.onDecorationResized(windowId, outerRect, contentRect, insets);
 
   // GPU broker: services plugin Worker GPU/surface requests (connection, surface
   // alloc, fence dance, overlay/decoration compositing). The generic surface hooks

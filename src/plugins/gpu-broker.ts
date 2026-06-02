@@ -17,9 +17,14 @@ const pCreateConn = (a: Addon) => new Promise<{ connId: number; fd: number }>((r
   a.pluginCreateConnection((r: { connId: number; fd: number } | null) => r ? res(r) : rej(new Error("createConnection"))));
 const pInject = (a: Addon, connId: number, id: number, gen: number) => new Promise<void>((res, rej) =>
   a.pluginInjectInstance(connId, id, gen, (ok: boolean) => ok ? res() : rej(new Error("injectInstance"))));
-const pAlloc = (a: Addon, connId: number, w: number, h: number, ptId: number, ptGen: number, pdId: number, pdGen: number) =>
+const pAlloc = (
+  a: Addon, connId: number, w: number, h: number,
+  ptId: number, ptGen: number, pdId: number, pdGen: number,
+  pluginReservePointSerial: bigint,
+) =>
   new Promise<{ surfaceBufId: number }>((res, rej) =>
     a.pluginAllocSurfaceBufferW(connId, w, h, ptId, ptGen, pdId, pdGen,
+      pluginReservePointSerial,
       (r: { surfaceBufId: number } | null) => r ? res(r) : rej(new Error("allocSurfaceBuffer"))));
 const pProducerBegin = (a: Addon, id: number) => new Promise<void>((res, rej) =>
   a.pluginSurfaceProducerBegin(id, (ok: boolean) => ok ? res() : rej(new Error("producerBegin"))));
@@ -125,8 +130,15 @@ export function createGpuBroker(deps: GpuBrokerDeps) {
         const connId = connByPlugin.get(pluginName);
         const surf = surfaces.get(overlayId);
         if (!pend || connId === undefined || !surf) throw new Error("bindProducer: bad state");
+        // The worker captured `reservePointSerial` INSIDE reserveProducerTexture
+        // (single chokepoint, see worker_wire.cpp::reserveProducerTexture). The
+        // GPU process uses it to defer the producer-side InjectTexture until the
+        // plugin wire reader has consumed past it -- making the recycled-handle
+        // inject structurally safe whether or not the wire has caught up yet.
+        const reservePointSerial = (p.reservePointSerial as bigint) ?? 0n;
         const alloc = await pAlloc(addon, connId, pend.width, pend.height,
-          p.texId as number, p.texGen as number, p.devId as number, p.devGen as number);
+          p.texId as number, p.texGen as number, p.devId as number, p.devGen as number,
+          reservePointSerial);
         surf.slots.push(alloc.surfaceBufId);
         surfaceByBuf.set(alloc.surfaceBufId, surf);
         // Open the producer bracket on this slot so the plugin can render into it.

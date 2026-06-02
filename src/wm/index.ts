@@ -63,6 +63,19 @@ export interface WmState { output: Output; windows: Window[]; layout: LayoutPara
 // changes (layout recompute on add/remove, or inset change).
 export type ConfigureSink = (surfaceId: number, contentW: number, contentH: number) => void;
 
+// Decoration-resize sink: fired when a decorated window's OUTER tile changes
+// (move and/or size). Two things happen on a sink callback:
+//   1. The compositor's surface layout for the decoration surface is updated by
+//      the WM directly (so the existing decoration texture composites at the
+//      new rect even before the plugin redraws -- prevents pixel corruption).
+//   2. The decoration broker forwards the new geometry to the owning plugin as
+//      a `decoration.resized` event so the plugin can redraw at the new size
+//      (destroy-old-ring + create-new-ring; the ring is fixed-size at alloc).
+// The sink is installed by main.ts (and the decoration GPU tests) via
+// createWm({ decorationResize: ... }); the WM has no direct dependency on the
+// broker.
+export type DecorationResizeSink = (windowId: number, outerRect: Rect, contentRect: Rect, insets: Insets) => void;
+
 // What setInsets grants back: the (possibly clamped) insets, the outer rect (the
 // decoration's region = content rect grown by the insets), and the content rect
 // (unchanged). The decoration surface is placed at outerRect.
@@ -122,13 +135,39 @@ function contentOf(win: Window): Rect {
   return win.insets ? shrink(win.outer, win.insets) : { ...win.outer };
 }
 
+// Options for createWm. `rebuild` and `configure` are present in every prod path
+// (installProtocols installs them); unit tests omit them. `decorationResize`
+// fires when a decorated window's OUTER tile changes (move/resize); the broker
+// uses it to forward a `decoration.resized` event to the owning plugin so it
+// can redraw its ring at the new size.
+export interface WmOptions {
+  rebuild?: () => void;
+  configure?: ConfigureSink;
+  decorationResize?: DecorationResizeSink;
+  layout?: LayoutParams;
+}
+
 export function createWm(
   compositor: CompositorSink,
   output: Output,
-  rebuild?: () => void,
+  optsOrRebuild?: WmOptions | (() => void),
   configure?: ConfigureSink,
   layout: LayoutParams = DEFAULT_LAYOUT,
 ): Wm {
+  // Backwards-compatible parameter shape: callers may pass either the new
+  // WmOptions object as the third arg, or the previous (rebuild, configure,
+  // layout) positional triple. installProtocols + the GPU test harnesses use
+  // the new shape; the pre-existing GPU-free unit tests still use the old one.
+  let rebuild: (() => void) | undefined;
+  let decorationResize: DecorationResizeSink | undefined;
+  if (optsOrRebuild && typeof optsOrRebuild === "object") {
+    rebuild = optsOrRebuild.rebuild;
+    configure = optsOrRebuild.configure ?? configure;
+    decorationResize = optsOrRebuild.decorationResize;
+    layout = optsOrRebuild.layout ?? layout;
+  } else {
+    rebuild = optsOrRebuild as (() => void) | undefined;
+  }
   // windows: layout/stack order. Index 0 is the master (front); a newly added
   // window is inserted at the front (becomes master). Draw order is back-to-front
   // = reverse of this list (master drawn last/on-top is NOT desired; see pushStack).
@@ -159,6 +198,7 @@ export function createWm(
     for (let i = 0; i < windows.length; i++) {
       const win = windows[i];
       const prevContent = contentOf(win);
+      const prevOuter = win.outer;
       win.outer = tiles[i];
       const content = contentOf(win);
       win.rect = content;
@@ -169,6 +209,23 @@ export function createWm(
       // Configure the client to the new content size if it changed.
       if (configure && (content.width !== prevContent.width || content.height !== prevContent.height)) {
         configure(win.surfaceId, content.width, content.height);
+      }
+      // Decoration follow-up: the OUTER tile changed -> reposition the existing
+      // decoration surface NOW (so its already-allocated texture composites at
+      // the new rect; without this the previous outer rect is still painted,
+      // overdrawing the neighbor window after retiling), AND fire the
+      // decoration-resize sink so the owning plugin can redraw at the new size.
+      const outerMoved = prevOuter.x !== win.outer.x || prevOuter.y !== win.outer.y
+                      || prevOuter.width !== win.outer.width || prevOuter.height !== win.outer.height;
+      if (win.decorationSurfaceId !== undefined && outerMoved) {
+        // Immediate visual fix: clamp the decoration to the new outer rect. The
+        // texture itself is still the old size -- the plugin redraw below will
+        // replace it.
+        compositor.setSurfaceLayout(win.decorationSurfaceId,
+          win.outer.x, win.outer.y, win.outer.width, win.outer.height);
+        if (decorationResize && win.insets) {
+          decorationResize(win.surfaceId, { ...win.outer }, { ...content }, { ...win.insets });
+        }
       }
     }
   }

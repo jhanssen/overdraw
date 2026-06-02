@@ -55,11 +55,14 @@ test("decorated window unmap: decoration stops compositing + frees GPU resources
     await waitForLog(logs, (l) => l.includes("registered"));
 
     const pid = gpuPids()[0];
-    const filler = c.spawnClient(["--app-id", "filler", "--size", "50x50"]);
-    await filler.ready; await waitFor(c.query, (s) => s.windows.length === 1);
-
+    // Single decorated client: under master-stack tiling it fills the output
+    // (the previous version used a filler client to push it down, but the
+    // animated-gradient plugin decorates the filler too -- whose decoration
+    // would then move to cover the decorated client's region after unmap,
+    // since the resize plumbing repositions the filler's decoration; using
+    // ONE client makes the "decoration cleared on unmap" assertion clean).
     const client = c.spawnClient(["--app-id", "org.test.app", "--size", "200x100", "--color", "FFFF0000"]);
-    await client.ready; await waitFor(c.query, (s) => s.windows.length === 2);
+    await client.ready; await waitFor(c.query, (s) => s.windows.length === 1);
     const win = c.query().windows.find((w) => w.appId === "org.test.app");
     const cr = win.rect;
     await waitFor(() => ({ g: c.state.wm.isContentGated(win.surfaceId) }), (s) => s.g === false, { what: "gate release" });
@@ -78,9 +81,9 @@ test("decorated window unmap: decoration stops compositing + frees GPU resources
     const fdBefore = fdCount(pid);
 
     // Kill the decorated client -> window unmaps -> the plugin destroys its
-    // decoration surface.
+    // decoration surface. No more windows after this.
     client.child.kill("SIGTERM");
-    await waitFor(c.query, (s) => s.windows.length === 1, { what: "decorated window unmapped" });
+    await waitFor(c.query, (s) => s.windows.length === 0, { what: "decorated window unmapped" });
     // Give the destroy + afterCurrentFrame teardown + GPU release a few frames.
     for (let i = 0; i < 10; i++) { c.jsCompositor.renderFrame(); await sleep(20); }
 

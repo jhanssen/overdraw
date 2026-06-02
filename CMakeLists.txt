@@ -198,6 +198,12 @@ add_executable(scm-rights-test test/scm-rights-test.cpp)
 target_include_directories(scm-rights-test PRIVATE ${IPC_INCLUDE})
 target_link_libraries(scm-rights-test PRIVATE dawn::webgpu_dawn_wire)
 
+# ---- WireBarrier native unit test (cross-channel ordering primitive) ----
+# Header-only class; the test exercises the deferred-action FIFO + cancel +
+# drainAll. No Dawn dep; the include path is just the shared ipc/ dir.
+add_executable(wire-barrier-test test/wire-barrier-test.cpp)
+target_include_directories(wire-barrier-test PRIVATE ${IPC_INCLUDE})
+
 # ---- dmabuf test client (linux-dmabuf-v1 import + composite) ----
 add_executable(dmabuf-test-client
     test/dmabuf-test-client.c

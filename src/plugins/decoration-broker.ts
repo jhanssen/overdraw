@@ -20,7 +20,8 @@ import type { CompositorState } from "../protocols/ctx.js";
 import { createDecorationRegistry } from "../decorations.js";
 import type { DecorationRegistry } from "../decorations.js";
 import { DECORATION_EVENT } from "../events/types.js";
-import type { DecorationAssignedEvent, DecorationDeregisteredEvent } from "../events/types.js";
+import type { DecorationAssignedEvent, DecorationDeregisteredEvent,
+  DecorationResizedEvent } from "../events/types.js";
 
 // Default first-decoration-frame deadline. Generous enough for a provider that
 // compiles shaders / builds pipelines before its first present.
@@ -29,7 +30,8 @@ export const DEFAULT_DECORATION_TIMEOUT_MS = 500;
 // Push a one-way event to one plugin Worker by name (PluginRuntime.emit). The
 // `data` is a structured-clone-safe decoration payload.
 export type EmitToPlugin =
-  (pluginName: string, name: string, data: DecorationAssignedEvent | DecorationDeregisteredEvent) => void;
+  (pluginName: string, name: string,
+   data: DecorationAssignedEvent | DecorationDeregisteredEvent | DecorationResizedEvent) => void;
 
 export interface DecorationBrokerDeps {
   bus: CompositorBus;
@@ -46,6 +48,15 @@ export interface DecorationBroker {
   // for a window; a surface received a frame. The broker filters for its own.
   onSurfaceAllocated(decoSurfaceId: number, windowId: number): void;
   onSurfacePresented(surfaceId: number): void;
+  // Forwarded by the WM (via the DecorationResizeSink it was given) when a
+  // decorated window's outer tile changed: emit decoration.resized to the
+  // owning plugin so it can redraw at the new size (destroy old ring + create
+  // a new one at the new rect). The WM has already updated the decoration
+  // surface's compositor layout, so the existing texture composites at the
+  // new rect in the meantime; the redraw replaces it.
+  onDecorationResized(windowId: number, outerRect: { x: number; y: number; width: number; height: number },
+                      contentRect: { x: number; y: number; width: number; height: number },
+                      insets: { top: number; right: number; bottom: number; left: number }): void;
   unregisterPlugin(pluginName: string): void;
   registry: DecorationRegistry;
 }
@@ -168,8 +179,21 @@ export function createDecorationBroker(deps: DecorationBrokerDeps): DecorationBr
     releaseGate(windowId, "first-frame");
   }
 
+  function onDecorationResized(
+    windowId: number,
+    outerRect: { x: number; y: number; width: number; height: number },
+    contentRect: { x: number; y: number; width: number; height: number },
+    insets: { top: number; right: number; bottom: number; left: number },
+  ): void {
+    // Only relevant if the window is assigned to a provider (else nobody redraws).
+    const pluginName = registry.assignmentOf(windowId);
+    if (pluginName === undefined) return;
+    const ev: DecorationResizedEvent = { windowId, outerRect, contentRect, insets };
+    emitToPlugin(pluginName, DECORATION_EVENT.resized, ev);
+  }
+
   return {
-    onRequest, onSurfaceAllocated, onSurfacePresented,
+    onRequest, onSurfaceAllocated, onSurfacePresented, onDecorationResized,
     unregisterPlugin: (p) => registry.unregisterPlugin(p),
     registry,
   };

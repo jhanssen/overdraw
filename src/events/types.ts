@@ -67,6 +67,7 @@ export type WindowChangeEvent = {
 export const DECORATION_EVENT = {
   assigned: "decoration.assigned",
   deregistered: "decoration.deregistered",
+  resized: "decoration.resized",
 } as const;
 
 // Emitted to a decoration-provider plugin when a mapped window matches its
@@ -89,6 +90,17 @@ export type DecorationDeregisteredEvent = {
   windowId: number;
 };
 
+// Emitted to a decoration-provider plugin when its assigned window's OUTER tile
+// changed (the tiling WM resized/moved the window: a sibling mapped/unmapped,
+// the insets changed, etc.). The plugin should redraw at the new outer rect
+// (destroy + recreate the ring; the ring is fixed-size at alloc).
+export type DecorationResizedEvent = {
+  windowId: number;
+  outerRect: WindowRect;
+  contentRect: WindowRect;
+  insets: { top: number; right: number; bottom: number; left: number };
+};
+
 // Compile-time assertion that the plugin-forwarded payloads stay clone-safe. If a
 // field is ever added that is not structured-clone-safe, the build fails rather
 // than silently passing a non-cloneable value over postMessage.
@@ -98,3 +110,4 @@ export type _UnmapIsCloneable = AssignableToCloneable<WindowUnmapEvent>;
 export type _ChangeIsCloneable = AssignableToCloneable<WindowChangeEvent>;
 export type _AssignedIsCloneable = AssignableToCloneable<DecorationAssignedEvent>;
 export type _DeregisteredIsCloneable = AssignableToCloneable<DecorationDeregisteredEvent>;
+export type _ResizedIsCloneable = AssignableToCloneable<DecorationResizedEvent>;

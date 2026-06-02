@@ -23,10 +23,20 @@ interface PluginAddon {
   instanceHandle(clientId: number): bigint;
   deviceHandle(clientId: number): bigint;
   deviceWireHandle(clientId: number): { id: number; generation: number };
+  // `wireSerial` (bigint) is the PLUGIN-wire ordering serial sampled INSIDE
+  // this call AFTER the flush that committed the reserve. Forwarded to
+  // pluginAllocSurfaceBufferW so the GPU process can gate the producer-side
+  // InjectTexture on the plugin wire reader catching up past it. The single
+  // chokepoint that makes "captured too early" structurally impossible.
   reserveProducerTexture(clientId: number, surfaceBufId: number, w: number, h: number):
-    { texture: { id: number; generation: number }; device: { id: number; generation: number } };
+    { texture: { id: number; generation: number }; device: { id: number; generation: number }; wireSerial: bigint };
   producerTexture(clientId: number, surfaceBufId: number): bigint;
-  releaseProducerTexture(clientId: number, resKey: number): void;
+  // Forget the slot WITHOUT recycling the wire id (deferred-reclaim policy:
+  // see WorkerWireClient::forgetProducerReservation). Today gpu.ts does not
+  // call this -- the ring's slots are simply left in producerReservations_
+  // for the life of the worker; future use cases (e.g. surface migration)
+  // that need to explicitly forget a slot would call this.
+  forgetProducerReservation(clientId: number, resKey: number): void;
   flush(clientId: number): void;
   wireBytesQueued(clientId: number): bigint;
 }
@@ -206,12 +216,17 @@ export async function createPluginGpu(
     const slotTex: (GPUTexture | null)[] = [];
     for (let i = 0; i < SLOTS; i++) {
       const resKey = nextResKey++;
+      // Single-call reserve + flush + serial capture (native chokepoint). The
+      // returned `wireSerial` is the PLUGIN-wire bytesQueued AFTER the flush;
+      // forward it to surface.bindProducer so the broker passes it to
+      // AllocSurfaceBuf -- the GPU process gates the producer-side
+      // InjectTexture on the plugin wire reader catching up past it.
       const pr = plugin.reserveProducerTexture(clientId, resKey, width, height);
-      plugin.flush(clientId);
       const bound = (await endpoint.request("surface.bindProducer", {
         connId: conn.connId, overlayId: r.overlayId,
         texId: pr.texture.id, texGen: pr.texture.generation,
         devId: pr.device.id, devGen: pr.device.generation,
+        reservePointSerial: pr.wireSerial,
       })) as { surfaceBufId: number };
       slotResKey.push(resKey);
       slotBufId.push(bound.surfaceBufId);
@@ -264,15 +279,14 @@ export async function createPluginGpu(
         // Ask the core to stop compositing + free the ring's GPU resources (it gates
         // the GPU-process free on its own read completing).
         await endpoint.request("surface.destroy", { connId: conn.connId, overlayId: r.overlayId });
-        // Worker-side: drop the wrapped producer textures + reclaim the producer
-        // reservations. (Explicit .destroy() of the wrapped textures here caused
-        // intermittent fatal dawn.node throws during teardown; the GPU process frees
-        // the native textures/STM/dmabuf via ReleaseSurfaceBuf. The deterministic
-        // wire-texture + fence-fd reclaim is tracked separately.)
-        for (let i = 0; i < SLOTS; i++) {
-          slotTex[i] = null;
-          plugin.releaseProducerTexture(clientId, slotResKey[i]);
-        }
+        // Worker-side: drop the wrapped producer textures. The deferred-reclaim
+        // policy for the recycled-handle hazard lives in the WorkerWireClient
+        // (see WorkerWireClient::forgetProducerReservation in worker_wire.h):
+        // there is no API on this side that recycles a wire id, by design.
+        // Native textures/STMs/dmabuf are freed by ReleaseSurfaceBuf above; the
+        // ring's producer-texture wire ids stay reserved on the wire client
+        // for the worker's lifetime (small, bounded).
+        for (let i = 0; i < SLOTS; i++) slotTex[i] = null;
         plugin.flush(clientId);
       },
     };

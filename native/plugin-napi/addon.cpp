@@ -132,7 +132,11 @@ napi_value DeviceWireHandle(napi_env env, napi_callback_info info) {
 }
 
 // reserveProducerTexture(clientId, surfaceBufId, w, h)
-//   -> { texture: {id,gen}, device: {id,gen} }
+//   -> { texture: {id,gen}, device: {id,gen}, wireSerial: bigint }
+// `wireSerial` is the cross-channel ordering serial sampled by the native helper
+// AFTER the flush that committed the reserve into the plugin wire's FdSerializer.
+// JS callers MUST forward it to pluginAllocSurfaceBufferW so the GPU process can
+// gate its plugin-side InjectTexture on the plugin wire reader catching up.
 napi_value ReserveProducerTexture(napi_env env, napi_callback_info info) {
     size_t argc = 4; napi_value argv[4];
     napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
@@ -140,10 +144,12 @@ napi_value ReserveProducerTexture(napi_env env, napi_callback_info info) {
     if (!c) return throwErr(env, "reserveProducerTexture: bad clientId");
     auto r = c->reserveProducerTexture(u32(env, argv[1]), u32(env, argv[2]), u32(env, argv[3]));
     if (!r.ok) return throwErr(env, "reserveProducerTexture: failed");
-    napi_value o;
+    napi_value o, ws;
     napi_create_object(env, &o);
     napi_set_named_property(env, o, "texture", handleObj(env, r.texture));
     napi_set_named_property(env, o, "device", handleObj(env, r.device));
+    napi_create_bigint_uint64(env, r.wireSerial, &ws);
+    napi_set_named_property(env, o, "wireSerial", ws);
     return o;
 }
 
@@ -159,14 +165,17 @@ napi_value ProducerTexture(napi_env env, napi_callback_info info) {
     return out;
 }
 
-// releaseProducerTexture(clientId, resKey): reclaim a producer reservation on
-// surface teardown so the wire-client handle map does not leak.
-napi_value ReleaseProducerTexture(napi_env env, napi_callback_info info) {
+// forgetProducerReservation(clientId, resKey): forget the slot on surface
+// teardown (per deferred-reclaim policy: does NOT recycle the wire id; the
+// id remains allocated so future reserves don't collide with the GPU-process
+// WireServer's still-live entry there). See WorkerWireClient::
+// forgetProducerReservation for the full reasoning.
+napi_value ForgetProducerReservation(napi_env env, napi_callback_info info) {
     size_t argc = 2; napi_value argv[2];
     napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
     auto* c = self(env)->get(u32(env, argv[0]));
-    if (!c) return throwErr(env, "releaseProducerTexture: bad clientId");
-    c->releaseProducerTexture(u32(env, argv[1]));
+    if (!c) return throwErr(env, "forgetProducerReservation: bad clientId");
+    c->forgetProducerReservation(u32(env, argv[1]));
     return nullptr;
 }
 
@@ -208,7 +217,7 @@ napi_value Init(napi_env env, napi_value exports) {
     reg("deviceHandle", DeviceHandle);
     reg("deviceWireHandle", DeviceWireHandle);
     reg("reserveProducerTexture", ReserveProducerTexture);
-    reg("releaseProducerTexture", ReleaseProducerTexture);
+    reg("forgetProducerReservation", ForgetProducerReservation);
     reg("producerTexture", ProducerTexture);
     reg("flush", Flush);
     reg("wireBytesQueued", WireBytesQueued);
