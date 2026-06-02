@@ -217,6 +217,22 @@ export async function installProtocols(
       unmappedAny = true;
     }
 
+    // Same disconnect case for wl_buffers: a client that drops without
+    // wl_buffer.destroy leaves its descriptor in state.buffers, and a dmabuf
+    // descriptor holds an open WaylandFd. The destroy handler did not run, so close
+    // the fd + drop the descriptor here (otherwise the wrapper GC-warns + leaks an
+    // fd per buffer the client allocated). shm pools are reclaimed via their own
+    // refcount on pool destroy.
+    if (state.buffers) {
+      for (const [resource, desc] of [...state.buffers.entries()]) {
+        if (!resource.destroyed) continue;
+        if (desc.fd && !desc.fd.closed) {
+          try { desc.fd.close(); } catch { /* already closed/taken */ }
+        }
+        state.buffers.delete(resource);
+      }
+    }
+
     // A newly-mapped toplevel changes window rects, so re-lay-out subsurfaces
     // (a child that committed before its parent mapped gets placed now).
     if (mappedAny) applySubsurfaces(state);
