@@ -73,9 +73,9 @@ void usleepShort() { ::usleep(200); }
 // it. Returns -1 if unavailable (then there is nothing to wait on). This is the
 // implicit-sync acquire a compositor must perform before sampling a client
 // dmabuf that did not use explicit sync (wp_linux_drm_syncobj_v1). The returned
-// fd is owned by the caller. (Mirrors wlroots' vulkan implicit-sync interop:
-// export sync_file, then wait on it on the GPU timeline -- a CPU poll does NOT
-// order the GPU work, so the fence must be imported into the access bracket.)
+// fd is owned by the caller. Export the sync_file, then wait on it on the GPU
+// timeline -- a CPU poll does NOT order the GPU work, so the fence must be
+// imported into the access bracket.
 int exportDmabufAcquireFence(int dmabufFd) {
     struct dma_buf_export_sync_file req{};
     req.flags = DMA_BUF_SYNC_READ;
@@ -357,12 +357,32 @@ int run(int wireFd, int ctrlFd, int inputFd, bool headless,
 
     // Client dmabuf imports (linux-dmabuf-v1). Keyed by the reserved texture
     // handle id. Each holds the imported STM + texture + the owning dmabuf fd;
-    // a read-access bracket is begun at import so compositing can sample it.
+    // Per-frame BeginAccess/EndAccess bracket lives on the core's compositor
+    // submit (see BeginClientAccess/EndClientAccess in side_channel.h). The
+    // import path does NOT call BeginAccess any more -- it just imports the
+    // STM and caches it; the first BeginAccess fires on the first frame that
+    // samples it.
+    //
+    // layout: current Vulkan image layout (carried from the prior EndAccess's
+    //   endState.newLayout into the next BeginAccess's oldLayout). 0=UNDEFINED.
+    // accessOpen: a BeginAccess bracket is currently open on this entry
+    //   (between BeginClientAccess and EndClientAccess). Invariant: never two
+    //   begins without an end (mirrors Dawn's device-error rule; the GPU
+    //   process side enforces it locally with a typed reject before Dawn
+    //   sees it).
+    // lastEndFence: the SharedFence the previous EndAccess exported, imported
+    //   into the same (core) device. Chained into the next BeginAccess's
+    //   fences[] so the per-access fence-chaining model Dawn requires is
+    //   preserved (each Begin waits on the prior End's exported fence).
     struct ClientTex {
         wgpu::SharedTextureMemory mem;
         wgpu::Texture tex;
         int fd = -1;
         uint32_t generation = 0;  // wire handle generation, for release matching
+        int32_t layout = 0;       // 0=UNDEFINED (first BeginAccess starts here)
+        bool accessOpen = false;
+        bool everSampled = false; // initialized=false on first Begin, =true after
+        wgpu::SharedFence lastEndFence;
     };
     std::unordered_map<uint32_t, ClientTex> clientTextures;
 
@@ -526,6 +546,10 @@ int run(int wireFd, int ctrlFd, int inputFd, bool headless,
     // ClientTexImported reply. Caller must ensure the wire reader has reached
     // m.wireSerial first (so the prior UnregisterObjectCmd for this recycled
     // handle id has been applied). Closes fd.
+    //
+    // Does NOT open a BeginAccess bracket -- the per-frame Begin/End model
+    // opens one per compositing submit (BeginClientAccess). The cached entry
+    // starts at layout=0 (UNDEFINED), accessOpen=false, lastEndFence=null.
     auto runImport = [&](const ipc::Message& m, int fd) {
         ipc::Message reply{};
         reply.tag = ipc::Tag::ClientTexImported;
@@ -543,38 +567,6 @@ int run(int wireFd, int ctrlFd, int inputFd, bool headless,
 
         ClientTex ct{};
         bool ok = gpu::Allocator::importTexture(coreDevice, m.drmFourcc, cb, ct.mem, ct.tex);
-        if (ok) {
-            int syncFd = exportDmabufAcquireFence(cb.fd);
-            wgpu::SharedFence acquireFence;
-            if (syncFd >= 0) {
-                wgpu::SharedFenceSyncFDDescriptor sfd{};
-                sfd.handle = syncFd;
-                wgpu::SharedFenceDescriptor fdd{};
-                fdd.nextInChain = &sfd;
-                acquireFence = coreDevice.ImportSharedFence(&fdd);
-                ::close(syncFd);
-                if (!acquireFence) std::fprintf(stderr, "[gpu] ImportClientTex: ImportSharedFence failed\n");
-            }
-            wgpu::SharedTextureMemoryVkImageLayoutBeginState layout{};
-            layout.oldLayout = 0;  // UNDEFINED
-            layout.newLayout = 1;  // GENERAL
-            wgpu::SharedTextureMemoryBeginAccessDescriptor bad{};
-            bad.nextInChain = &layout;
-            bad.initialized = true;
-            uint64_t signaled = 1;
-            if (acquireFence) {
-                bad.fenceCount = 1;
-                bad.fences = &acquireFence;
-                bad.signaledValueCount = 1;
-                bad.signaledValues = &signaled;
-            } else {
-                bad.fenceCount = 0;
-            }
-            if (ct.mem.BeginAccess(ct.tex, &bad) != wgpu::Status::Success) {
-                std::fprintf(stderr, "[gpu] ImportClientTex: BeginAccess failed\n");
-                ok = false;
-            }
-        }
         if (ok && !server.InjectTexture(ct.tex.Get(),
                                         {m.texture.id, m.texture.generation},
                                         {m.device.id, m.device.generation})) {
@@ -591,6 +583,155 @@ int run(int wireFd, int ctrlFd, int inputFd, bool headless,
             ::close(cb.fd);
         }
         ipc::sendMessage(ctrlFd, reply);
+    };
+
+    // Open a per-frame BeginAccess on a cached client texture. Re-exports the
+    // dmabuf's implicit-sync acquire fence at THIS moment (covers all of the
+    // client's writes up to now, including ones from re-commits since the last
+    // sample -- this is the fix for the same-buffer re-commit flicker), and
+    // chains the prior frame's EndAccess fence too. Sends BeginClientAccessDone
+    // back (round-trip; the core only flushes wire sample commands after the
+    // reply lands, because ctrl-after-wire is the only one-way ordering the
+    // existing infrastructure provides).
+    auto runBeginClientAccess = [&](const ipc::Message& m) {
+        ipc::Message reply{};
+        reply.tag = ipc::Tag::BeginClientAccessDone;
+        reply.texture = m.texture;
+        reply.ok = 0;
+        auto it = clientTextures.find(m.texture.id);
+        if (it == clientTextures.end() || it->second.generation != m.texture.generation) {
+            std::fprintf(stderr,
+                "[gpu] BeginClientAccess: unknown texture {%u,%u}\n",
+                m.texture.id, m.texture.generation);
+            ipc::sendMessage(ctrlFd, reply);
+            return;
+        }
+        ClientTex& ct = it->second;
+        if (ct.accessOpen) {
+            // Two begins without an end on the same texture would be a Dawn
+            // device error ("is already used to access"). The state machine
+            // (src/gpu/client-buffer-lifecycle.ts) enforces this too, but
+            // defending here gives a typed error attribution to the bufferId
+            // rather than letting Dawn fault the device.
+            std::fprintf(stderr,
+                "[gpu] BeginClientAccess: bracket already open on {%u,%u}\n",
+                m.texture.id, m.texture.generation);
+            ipc::sendMessage(ctrlFd, reply);
+            return;
+        }
+
+        // Acquire fence: the dmabuf's current implicit-sync read-acquire
+        // sync_file. Covers every write the client has issued on this dmabuf
+        // up to this ioctl. Re-running the ioctl per-frame is the per-commit
+        // re-export the spec calls for (functionally equivalent: the latest
+        // sync_file dominates any earlier one).
+        int syncFd = exportDmabufAcquireFence(ct.fd);
+        wgpu::SharedFence acquireFence;
+        if (syncFd >= 0) {
+            wgpu::SharedFenceSyncFDDescriptor sfd{};
+            sfd.handle = syncFd;
+            wgpu::SharedFenceDescriptor fdd{};
+            fdd.nextInChain = &sfd;
+            acquireFence = coreDevice.ImportSharedFence(&fdd);
+            ::close(syncFd);
+        }
+
+        // Chain the prior frame's EndAccess fence (Dawn's per-access fence
+        // chaining: each Begin waits on the prior End's exported fence).
+        // Both the acquire fence and the chain fence go into bad.fences[].
+        wgpu::SharedFence fences[2];
+        uint64_t signaledValues[2] = {1, 1};
+        size_t fenceCount = 0;
+        if (acquireFence) fences[fenceCount++] = acquireFence;
+        if (ct.lastEndFence) fences[fenceCount++] = ct.lastEndFence;
+
+        wgpu::SharedTextureMemoryVkImageLayoutBeginState layoutBegin{};
+        // First-ever Begin: oldLayout=0 (UNDEFINED) + initialized=false (the
+        // first commit hasn't written via OUR access yet -- but the CLIENT did
+        // write the pixels, so initialized=true is actually correct here too;
+        // mirrors the prior import-time BeginAccess descriptor). Subsequent:
+        // continue from the previous EndAccess's newLayout.
+        layoutBegin.oldLayout = ct.everSampled ? ct.layout : 0;
+        layoutBegin.newLayout = 1;  // GENERAL
+        wgpu::SharedTextureMemoryBeginAccessDescriptor bad{};
+        bad.nextInChain = &layoutBegin;
+        bad.initialized = true;
+        bad.fenceCount = fenceCount;
+        bad.fences = fenceCount ? fences : nullptr;
+        bad.signaledValueCount = fenceCount;
+        bad.signaledValues = fenceCount ? signaledValues : nullptr;
+        if (ct.mem.BeginAccess(ct.tex, &bad) != wgpu::Status::Success) {
+            std::fprintf(stderr,
+                "[gpu] BeginClientAccess: Dawn BeginAccess failed {%u,%u}\n",
+                m.texture.id, m.texture.generation);
+            ipc::sendMessage(ctrlFd, reply);
+            return;
+        }
+        ct.accessOpen = true;
+        ct.everSampled = true;
+        reply.ok = 1;
+        ipc::sendMessage(ctrlFd, reply);
+    };
+
+    // Close the per-frame BeginAccess bracket. Stores the exported fence on
+    // the entry for the next BeginAccess to chain. The fence stays in-process
+    // (both sides of the chain are this same coreDevice), so no SCM_RIGHTS
+    // fd hand-back is needed.
+    auto runEndClientAccess = [&](uint32_t textureId, uint32_t textureGen) {
+        auto it = clientTextures.find(textureId);
+        if (it == clientTextures.end() || it->second.generation != textureGen) {
+            // The cache entry was released (bufferDestroyed) between the
+            // core's send of EndClientAccess and the barrier draining it.
+            // Nothing to do; the entry is gone, the Begin's bracket went away
+            // with the Dawn texture.
+            return;
+        }
+        ClientTex& ct = it->second;
+        if (!ct.accessOpen) {
+            std::fprintf(stderr,
+                "[gpu] EndClientAccess: no open bracket on {%u,%u}\n",
+                textureId, textureGen);
+            return;
+        }
+        wgpu::SharedTextureMemoryVkImageLayoutEndState endLayout{};
+        wgpu::SharedTextureMemoryEndAccessState endState{};
+        endState.nextInChain = &endLayout;
+        if (ct.mem.EndAccess(ct.tex, &endState) != wgpu::Status::Success) {
+            std::fprintf(stderr,
+                "[gpu] EndClientAccess: Dawn EndAccess failed {%u,%u}\n",
+                textureId, textureGen);
+            ct.accessOpen = false;  // cleared even on failure -- Dawn rejects future begins anyway
+            return;
+        }
+        ct.accessOpen = false;
+        ct.layout = endLayout.newLayout;
+        // Re-import the exported fence into the SAME coreDevice for the next
+        // BeginAccess to chain. Mirrors runSurfaceEnd's pattern but consumer-
+        // side and intra-process.
+        ct.lastEndFence = nullptr;
+        if (endState.fenceCount >= 1) {
+            wgpu::SharedFenceExportInfo exp{};
+            wgpu::SharedFenceSyncFDExportInfo syncExp{};
+            exp.nextInChain = &syncExp;
+            endState.fences[0].ExportInfo(&exp);
+            if (syncExp.handle >= 0) {
+                int dupFd = ::dup(syncExp.handle);
+                if (dupFd >= 0) {
+                    wgpu::SharedFenceSyncFDDescriptor sfd{};
+                    sfd.handle = dupFd;
+                    wgpu::SharedFenceDescriptor fdd{};
+                    fdd.nextInChain = &sfd;
+                    ct.lastEndFence = coreDevice.ImportSharedFence(&fdd);
+                    ::close(dupFd);
+                }
+            }
+        }
+    };
+
+    // EndClientAccess tag for the core wire barrier (FIFO + cancellable).
+    auto endClientAccessTag = [](uint32_t textureId) -> ipc::WireBarrier::Tag {
+        return (static_cast<ipc::WireBarrier::Tag>(3) << 32) |
+               static_cast<ipc::WireBarrier::Tag>(textureId);
     };
 
     // Drain the core wire barrier: any deferred ctrl op whose serial the wire
@@ -1022,13 +1163,42 @@ int run(int wireFd, int ctrlFd, int inputFd, bool headless,
                         wireReader.bytesConsumed(),
                         importFdTag(texId));
                 }
+            } else if (m.tag == ipc::Tag::BeginClientAccess) {
+                runBeginClientAccess(m);
+            } else if (m.tag == ipc::Tag::EndClientAccess) {
+                // Defer the EndAccess on the CORE wire barrier: the
+                // compositor's sample commands ride the core wire, this
+                // message rides ctrl, and ctrl can overtake wire. Hold the
+                // EndAccess until the wire reader has consumed at least
+                // `m.wireSerial` framed bytes (the wire commands that
+                // sampled the texture have been HandleCommands'd).
+                const uint32_t texId = m.texture.id;
+                const uint32_t texGen = m.texture.generation;
+                coreWireBarrier.after(
+                    m.wireSerial,
+                    [&runEndClientAccess, texId, texGen] {
+                        runEndClientAccess(texId, texGen);
+                    },
+                    wireReader.bytesConsumed(),
+                    endClientAccessTag(texId));
             } else if (m.tag == ipc::Tag::ReleaseClientTex) {
                 // Release a JS-compositor dmabuf import: drop the STM + close the
                 // fd, but only if the entry's generation still matches (the handle
                 // id may have been recycled into a newer import).
                 auto it = clientTextures.find(m.texture.id);
                 if (it != clientTextures.end() && it->second.generation == m.texture.generation) {
-                    if (it->second.fd >= 0) ::close(it->second.fd);
+                    ClientTex& ct = it->second;
+                    // If a per-frame bracket is still open (the core released
+                    // mid-frame -- typically a bug, but defensive), end it so
+                    // the STM destructor doesn't run with a live access.
+                    if (ct.accessOpen) {
+                        wgpu::SharedTextureMemoryVkImageLayoutEndState endLayout{};
+                        wgpu::SharedTextureMemoryEndAccessState endState{};
+                        endState.nextInChain = &endLayout;
+                        (void)ct.mem.EndAccess(ct.tex, &endState);
+                        ct.accessOpen = false;
+                    }
+                    if (ct.fd >= 0) ::close(ct.fd);
                     clientTextures.erase(it);
                 }
             }
@@ -1110,6 +1280,14 @@ int run(int wireFd, int ctrlFd, int inputFd, bool headless,
     }
 
     for (auto& [id, ct] : clientTextures) {
+        if (ct.accessOpen) {
+            wgpu::SharedTextureMemoryVkImageLayoutEndState endLayout{};
+            wgpu::SharedTextureMemoryEndAccessState endState{};
+            endState.nextInChain = &endLayout;
+            (void)ct.mem.EndAccess(ct.tex, &endState);
+            ct.accessOpen = false;
+        }
+        ct.lastEndFence = nullptr;
         ct.tex = nullptr;
         ct.mem = nullptr;
         if (ct.fd >= 0) ::close(ct.fd);

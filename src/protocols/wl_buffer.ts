@@ -21,6 +21,18 @@ export default function makeBuffer(ctx: Ctx): WlBufferHandler {
       if (desc?.fd && !desc.fd.closed) {
         try { desc.fd.close(); } catch { /* already closed/taken */ }
       }
+      // Drive the client-buffer lifecycle's cache invalidation (rule A: this is
+      // the canonical path that releases a cached GPU import). Looks up the
+      // stable bufferId assigned in wl_surface.ts (bufferIdOf). If the buffer
+      // was never committed -- no bufferId, no import -- nothing to do.
+      if (desc?.dmabuf) {
+        const bufferId = ctx.state.dmabufBufferIds?.get(resource);
+        if (bufferId !== undefined) {
+          ctx.state.compositor.notifyBufferDestroyed?.(bufferId);
+          ctx.state.dmabufBufferIds?.delete(resource);
+          ctx.state.dmabufById?.delete(bufferId);
+        }
+      }
       ctx.state.buffers?.delete(resource);
     },
   };

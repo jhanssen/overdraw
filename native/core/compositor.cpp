@@ -345,6 +345,10 @@ void Compositor::drainCtrl() {
             surfaceBeginDone_[r.surfaceBufId] = r.ok ? 2 : 3;
             continue;
         }
+        if (r.tag == ipc::Tag::BeginClientAccessDone) {
+            clientBeginDone_[r.texture.id] = r.ok ? 1 : 2;
+            continue;
+        }
         if (r.tag == ipc::Tag::SurfaceBufAllocated) {
             surfaceBufAllocated_[r.surfaceBufId] = r.ok ? 1 : 2;
             if (!r.ok) {
@@ -473,6 +477,64 @@ void Compositor::sendConsumerEnd(uint32_t surfaceBufId) {
 int Compositor::surfaceBeginDone(uint32_t surfaceBufId) const {
     auto it = surfaceBeginDone_.find(surfaceBufId);
     return it == surfaceBeginDone_.end() ? 0 : it->second;
+}
+
+bool Compositor::beginClientAccessSync(uint32_t importId) {
+    // Look up the texture handle this importId resolves to (set on
+    // ClientTexImported in drainCtrl, line ~382).
+    auto wh = jsImportHandles_.find(importId);
+    if (wh == jsImportHandles_.end()) {
+        std::fprintf(stderr, "[core] beginClientAccessSync: no handle for importId=%u\n",
+                     importId);
+        return false;
+    }
+    const uint32_t texId = wh->second.id;
+    const uint32_t texGen = wh->second.generation;
+
+    // Send BeginClientAccess.
+    ipc::Message m{};
+    m.tag = ipc::Tag::BeginClientAccess;
+    m.texture = {texId, texGen};
+    clientBeginDone_[texId] = 0;
+    ipc::sendMessage(ctrlFd_, m);
+
+    // Spin-drain ctrl until BeginClientAccessDone for this texId lands. Other
+    // reply types (plugin Begin/End-done, ClientTexImported, etc.) are
+    // dispatched through the same drainCtrl path so nothing is stranded.
+    //
+    // The deadline cap is generous (50ms = 3+ vsync periods) so a transient
+    // GPU-process schedule delay doesn't fail the frame; if it ever fires
+    // there is a real bug (the GPU process is stuck, not slow).
+    constexpr int kDeadlineMs = 50;
+    constexpr int kSleepUs = 50;  // 50us between polls
+    const int kIterations = (kDeadlineMs * 1000) / kSleepUs;
+    for (int i = 0; i < kIterations; ++i) {
+        drainCtrl();
+        auto it = clientBeginDone_.find(texId);
+        if (it != clientBeginDone_.end() && it->second != 0) {
+            const bool ok = it->second == 1;
+            clientBeginDone_.erase(it);
+            return ok;
+        }
+        ::usleep(kSleepUs);
+    }
+    std::fprintf(stderr, "[core] beginClientAccessSync: timed out waiting for BeginClientAccessDone "
+                 "importId=%u tex={%u,%u}\n", importId, texId, texGen);
+    clientBeginDone_.erase(texId);
+    return false;
+}
+
+void Compositor::sendEndClientAccess(uint32_t importId, uint64_t coreWireSerial) {
+    auto wh = jsImportHandles_.find(importId);
+    if (wh == jsImportHandles_.end()) {
+        std::fprintf(stderr, "[core] sendEndClientAccess: no handle for importId=%u\n", importId);
+        return;
+    }
+    ipc::Message m{};
+    m.tag = ipc::Tag::EndClientAccess;
+    m.texture = {wh->second.id, wh->second.generation};
+    m.wireSerial = coreWireSerial;
+    ipc::sendMessage(ctrlFd_, m);
 }
 
 Compositor::PluginConnHandle Compositor::addWireConnection() {

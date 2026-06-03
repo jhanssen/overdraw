@@ -68,6 +68,12 @@ export interface CompositorSink {
   removeSurface(id: number): void;
   takeImportedSurfaces(): Array<{ id: number; width: number; height: number }>;
   takeFreedBuffers(): number[];
+  // Notify the compositor that a client wl_buffer was destroyed (explicit
+  // wl_buffer.destroy or disconnect sweep). Drives cache invalidation in the
+  // client-buffer lifecycle (rule A: this is the only path -- along with
+  // surfaceRemoved -- that releases a cached GPU import). Optional so the
+  // native sink (which is no longer used) need not implement it.
+  notifyBufferDestroyed?(bufferId: number): void;
   renderFrame?(): void;
   // Run a callback once the compositing submit in flight at call time completes on
   // the GPU. The plugin/overlay ring uses this to recycle a consumer slot only

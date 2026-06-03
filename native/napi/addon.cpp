@@ -845,6 +845,65 @@ napi_value ReleaseDmabufImport(napi_env env, napi_callback_info info) {
     return nullptr;
 }
 
+// beginClientAccessSync(importId) -> bool. Per-frame BeginAccess on a cached
+// client dmabuf texture (Layer C). Synchronous round-trip: blocks the calling
+// thread until the GPU process's BeginAccess returns. The block is brief
+// (<1ms typical) and necessary because the wire sample commands MUST not be
+// flushed until the bracket is open -- the existing one-way ctrl-after-wire
+// barrier (ipc::WireBarrier) cannot express the opposite direction.
+napi_value BeginClientAccessSync(napi_env env, napi_callback_info info) {
+    size_t argc = 1; napi_value argv[1];
+    napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+    if (!g_addon.compositor) {
+        napi_value f; napi_get_boolean(env, false, &f); return f;
+    }
+    uint32_t importId = 0;
+    napi_get_value_uint32(env, argv[0], &importId);
+    const bool ok = importId != 0 && g_addon.compositor->beginClientAccessSync(importId);
+    napi_value out; napi_get_boolean(env, ok, &out); return out;
+}
+
+// endClientAccess(importId, wireSerial:bigint) -> undefined. Per-frame
+// EndAccess on a cached client dmabuf texture (Layer C). Fire-and-forget:
+// the GPU process defers the EndAccess on its core wire barrier until its
+// wire reader has consumed `wireSerial` framed bytes (so the compositor
+// submit's sample commands have been HandleCommands'd). Caller samples
+// wireSerial AFTER the wire flush that committed the submit.
+napi_value EndClientAccess(napi_env env, napi_callback_info info) {
+    size_t argc = 2; napi_value argv[2];
+    napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+    if (!g_addon.compositor) return nullptr;
+    uint32_t importId = 0;
+    napi_get_value_uint32(env, argv[0], &importId);
+    uint64_t serial = 0; bool lossless = false;
+    napi_get_value_bigint_uint64(env, argv[1], &serial, &lossless);
+    if (importId != 0) g_addon.compositor->sendEndClientAccess(importId, serial);
+    return nullptr;
+}
+
+// coreWireBytesQueued() -> bigint. Read the core's outbound wire-bytes-queued
+// counter; sampled AFTER flushCoreWire() to tag EndClientAccess so the GPU
+// process defers EndAccess until its wire reader has caught up past that
+// point. dawn.node's queue.submit does NOT itself flush the wire client
+// serializer; callers must flush explicitly.
+napi_value CoreWireBytesQueued(napi_env env, napi_callback_info info) {
+    (void)info;
+    if (!g_addon.compositor) {
+        napi_value z; napi_create_bigint_uint64(env, 0, &z); return z;
+    }
+    napi_value out;
+    napi_create_bigint_uint64(env, g_addon.compositor->coreWireBytesQueued(), &out);
+    return out;
+}
+
+// flushCoreWire() -> undefined. Force-flush the core's outbound wire client.
+// Pairs with coreWireBytesQueued for the EndClientAccess wire-serial tag.
+napi_value FlushCoreWire(napi_env env, napi_callback_info info) {
+    (void)info;
+    if (g_addon.compositor) g_addon.compositor->flushCoreWire();
+    return nullptr;
+}
+
 // shmView(poolId, offset, length) -> ArrayBuffer | null
 // Zero-copy external ArrayBuffer over the pool's mmap region, so JS can upload
 // shm pixels with device.queue.writeTexture without a copy. The buffer aliases
@@ -1389,6 +1448,22 @@ napi_value Init(napi_env env, napi_value exports) {
     napi_create_function(env, "releaseDmabufImport", NAPI_AUTO_LENGTH,
                          ReleaseDmabufImport, nullptr, &fnReleaseDmabuf);
     napi_set_named_property(env, exports, "releaseDmabufImport", fnReleaseDmabuf);
+    napi_value fnBeginClientAccess;
+    napi_create_function(env, "beginClientAccessSync", NAPI_AUTO_LENGTH,
+                         BeginClientAccessSync, nullptr, &fnBeginClientAccess);
+    napi_set_named_property(env, exports, "beginClientAccessSync", fnBeginClientAccess);
+    napi_value fnEndClientAccess;
+    napi_create_function(env, "endClientAccess", NAPI_AUTO_LENGTH,
+                         EndClientAccess, nullptr, &fnEndClientAccess);
+    napi_set_named_property(env, exports, "endClientAccess", fnEndClientAccess);
+    napi_value fnCoreWireBytesQueued;
+    napi_create_function(env, "coreWireBytesQueued", NAPI_AUTO_LENGTH,
+                         CoreWireBytesQueued, nullptr, &fnCoreWireBytesQueued);
+    napi_set_named_property(env, exports, "coreWireBytesQueued", fnCoreWireBytesQueued);
+    napi_value fnFlushCoreWire;
+    napi_create_function(env, "flushCoreWire", NAPI_AUTO_LENGTH,
+                         FlushCoreWire, nullptr, &fnFlushCoreWire);
+    napi_set_named_property(env, exports, "flushCoreWire", fnFlushCoreWire);
     for (auto& [name, fn] : std::initializer_list<std::pair<const char*, napi_callback>>{
              {"acquireOutputTexture", AcquireOutputTexture},
              {"presentOutput", PresentOutput},

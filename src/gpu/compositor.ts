@@ -45,6 +45,10 @@ struct Rect { r : vec4f, };
 import type { CompositorSink, Layer } from "../protocols/ctx.js";
 import { LAYER_ORDER } from "../protocols/ctx.js";
 import type { WaylandFd } from "../types.js";
+import {
+  ClientBufferLifecycle,
+  type LifecycleIntent,
+} from "./client-buffer-lifecycle.js";
 
 // Minimal slice of the native addon this module needs.
 export interface CompositorAddon {
@@ -58,6 +62,28 @@ export interface CompositorAddon {
   // Release a dmabuf import (drops the server STM + fd). Called once the buffer
   // is freed (GPU-completion-gated) or the surface is removed.
   releaseDmabufImport(importId: number): void;
+  // Per-frame BeginAccess/EndAccess on a cached client dmabuf import. Layer C
+  // of docs/client-buffer-lifecycle.md.
+  //   beginClientAccessSync: SYNCHRONOUS round-trip to the GPU process; opens
+  //     the per-frame BeginAccess bracket on the cached client texture (with
+  //     a fresh dmabuf sync_file acquire fence). Returns false on failure /
+  //     timeout. Blocks the calling thread (<1ms typical); needed because
+  //     the wire sample commands MUST not be flushed before the bracket is
+  //     open, and only ctrl-after-wire ordering is available structurally.
+  //   endClientAccess: fire-and-forget; deferred on the core wire barrier in
+  //     the GPU process until its wire reader has consumed `wireSerial` framed
+  //     bytes (so the compositor submit's sample commands have been
+  //     HandleCommands'd). Caller samples wireSerial AFTER queue.submit.
+  beginClientAccessSync(importId: number): boolean;
+  endClientAccess(importId: number, wireSerial: bigint): void;
+  // Core wire bytesQueued counter (cumulative framed-byte tag). Sample AFTER
+  // flushCoreWire(), then pass to endClientAccess so the GPU process can
+  // defer EndAccess until its wire reader is past that point. dawn.node's
+  // queue.submit does NOT itself flush the core wire serializer; an explicit
+  // flushCoreWire() is required for the captured serial to actually cover
+  // the just-submitted commands.
+  coreWireBytesQueued(): bigint;
+  flushCoreWire(): void;
   // Nested present (slice 3): acquire the host swapchain's current texture handle
   // (null if none this frame) and present it after rendering.
   acquireOutputTexture(): bigint | null;
@@ -89,17 +115,42 @@ interface Surface {
   layoutW: number;
   layoutH: number;
   present: boolean;
-  // dmabuf: the wl_buffer id currently backing this surface (0 = shm/none), for
-  // the zero-copy buffer-release lifecycle, and the native importId for releasing
-  // the server-side STM/fd (0 = shm/none).
+  // For dmabuf surfaces, the buffer the lifecycle machine has assigned as
+  // current (0 = shm/none/not-yet-imported). Used to pair frameSampled events
+  // with the right buffer id, and to know what to (re)bind into the bind group
+  // when an import completes.
   currentBufferId: number;
-  currentImportId: number;
 }
 
-// A dmabuf buffer awaiting GPU-completion of the last frame that sampled it,
-// after which the client may reuse it (wl_buffer.release) and the server-side
-// import may be released (importId).
-interface RetiringBuffer { bufferId: number; importId: number; retireSerial: number; tex: GPUTexture; }
+// The executor's per-bufferId record. Holds the GPU side of a cached client
+// dmabuf import (wrapped texture + view + the native importId for release).
+// Created lazily when the lifecycle's importBuffer intent completes (async via
+// the addon callback); torn down by the releaseImport intent.
+interface DmabufImport {
+  tex: GPUTexture;
+  view: GPUTextureView;
+  width: number;
+  height: number;
+  importId: number;
+}
+
+// Pending importBuffer intent: the descriptor we need to call the addon. Kept
+// here (not in the state machine) so the lifecycle stays Dawn-free.
+interface DmabufDescriptor {
+  fd: WaylandFd;
+  width: number;
+  height: number;
+  fourcc: number;
+  modHi: number;
+  modLo: number;
+  offset: number;
+  stride: number;
+  // Surfaces waiting on this import to complete (so we can install the texture
+  // on each once the wrap arrives). One bufferId can be the current of many
+  // surfaces over its lifetime, but per per-surface invariant 4 only one at a
+  // time, so this is normally singleton; defensive list.
+  pendingInstalls: number[];
+}
 
 const DEFAULT_FORMAT = "bgra8unorm";
 
@@ -134,13 +185,26 @@ export class JsCompositor implements CompositorSink {
   // content stack per LAYER_ORDER. Plugin overlays/decorations populate these.
   private layers = new Map<Layer, number[]>();
 
-  // dmabuf buffer-release lifecycle (mirrors the C++ retiring/freed logic): each
-  // composite submit gets a serial; a superseded buffer retires tagged with the
-  // latest submit serial and is freed once that serial completes on the GPU.
+  // dmabuf buffer-release lifecycle. The pure state machine (no GPU, no Dawn)
+  // is the source of truth; the executor here translates events <-> intents.
+  // See src/gpu/client-buffer-lifecycle.ts for the rules; the design is in
+  // docs/client-buffer-lifecycle.md.
+  private lifecycle = new ClientBufferLifecycle();
+  // Per-bufferId cached GPU import. Populated when an importBuffer intent's
+  // async addon callback resolves; cleared by releaseImport. Cache lifetime is
+  // the wl_buffer lifetime (rule A): cycling clients hit cache on re-attach.
+  private dmabufImports = new Map<number, DmabufImport>();
+  // bufferId -> descriptor for importBuffer intents whose async callback has
+  // not yet fired. Also lists surfaces waiting to bind once the wrap arrives.
+  private dmabufPending = new Map<number, DmabufDescriptor>();
+  // Buffers freed by the lifecycle (sendWlRelease intents). Drained per-frame
+  // by src/protocols/index.ts via takeFreedBuffers() (the wire layer).
+  private freed: number[] = [];
+
+  // Submit-serial bookkeeping. completedSerial is what onSubmittedWorkDone
+  // turns into gpuCompleted(serial) events; both also drive afterCurrentFrame.
   private submitSerial = 0;
   private completedSerial = 0;
-  private retiring: RetiringBuffer[] = [];
-  private freed: number[] = [];
   // Callbacks deferred until the compositing submit in flight at registration time
   // completes on the GPU. Used to recycle a plugin/overlay consumer slot only after
   // the frame that last sampled it is done (else EndAccess races the GPU read).
@@ -230,17 +294,23 @@ export class JsCompositor implements CompositorSink {
   }
 
   removeSurface(id: number): void {
+    // Feed surfaceRemoved to the lifecycle BEFORE dropping the Surface record.
+    // The state machine emits the (gated-on-completion) sendWlRelease +
+    // releaseImport for the surface's then-current buffer; the executor
+    // handles them in dispatch(). Other (previously-superseded but still
+    // cached) buffers stay cached until bufferDestroyed fires for them per
+    // rule A; the disconnect sweep in src/protocols/index.ts is what
+    // guarantees no client-disconnect leak.
+    this.dispatch(this.lifecycle.step({ kind: "surfaceRemoved", surfaceId: id }));
+
     const s = this.surfaces.get(id);
     if (s) {
-      // Release the surface's live dmabuf import (client surfaces; retiring buffers
-      // free on their own completion in reapRetiring).
-      if (s.currentImportId !== 0) this.addon.releaseDmabufImport(s.currentImportId);
-      // Destroy the per-surface placement uniform buffer (a wire GPUBuffer). The
-      // sampled texture is dropped with the map entry; explicitly .destroy()-ing the
-      // wrapped consumer/client texture here caused intermittent fatal dawn.node
-      // throws during teardown (it is owned by the ring/client side), so it is left
-      // to be released via its owner + the GPU-process ReleaseSurfaceBuf path. The
-      // sync_file fence-fd reclaim is tracked separately.
+      // The per-surface placement uniform buffer is a wire GPUBuffer the
+      // executor owns; destroy it now. The sampled texture is the dmabuf
+      // import owned by dmabufImports/lifecycle; the lifecycle path released
+      // it via the surfaceRemoved drain (or deferred until inflight frames
+      // complete). Explicitly .destroy()-ing the wrapped client texture here
+      // caused intermittent fatal dawn.node throws during teardown.
       s.placementBuf?.destroy();
     }
     this.surfaces.delete(id);
@@ -257,50 +327,84 @@ export class JsCompositor implements CompositorSink {
     return true;
   }
 
-  // Import a client dmabuf (zero-copy) as a sampled texture and install it on the
-  // surface. The import is async (server-side reserve/inject); on completion we
-  // wrap the wire texture (dawn.node wrapTexture) and build the bind group.
+  // Commit a client dmabuf wl_buffer to a surface. Feeds the lifecycle machine
+  // a `commit` event; the resulting intents drive the import (if first-sight
+  // of this bufferId) or simply re-bind the existing cached import to the
+  // surface.
+  //
+  // Returns false only when this compositor was constructed without a Dawn
+  // wire (the headless protocol-only mode used by some tests); true otherwise.
+  // (It used to return the addon's importId-truthy value, but the
+  // intent-driven path makes the import strictly async, so we return true and
+  // let the lifecycle drive the rest.)
   commitSurfaceDmabuf(id: number, fd: WaylandFd, w: number, h: number, fourcc: number,
                       modHi: number, modLo: number, offset: number, stride: number,
                       bufferId: number): boolean {
-    const dawn = this.dawn;
-    if (!dawn || this.deviceHandle === 0n) {
+    if (!this.dawn || this.deviceHandle === 0n) {
       if (!this.warnedDmabuf) {
         console.warn("[js-compositor] dmabuf needs dawn.wrapTexture + deviceHandle");
         this.warnedDmabuf = true;
       }
       return false;
     }
-    const importId = this.addon.createTextureFromDmabuf(
-      fd, w, h, fourcc, modHi, modLo, offset, stride,
-      (handle) => {
-        if (handle === null) { if (importId) this.addon.releaseDmabufImport(importId); return; }
-        const tex = dawn.wrapTexture(this.deviceHandle, handle);
-        this.installDmabuf(id, tex, w, h, bufferId, importId);
+
+    // Ensure the surface exists (the layout sweep may not have created it).
+    if (!this.surfaces.has(id)) this.surfaces.set(id, blankSurface(0, 0, 0, 0));
+
+    // Stash the descriptor BEFORE the commit event: if the lifecycle emits an
+    // importBuffer intent, the intent handler reads dmabufPending to find the
+    // descriptor. (The lifecycle keeps the rules; the executor keeps the GPU
+    // concerns. Crossing the boundary with raw fds would defeat that.)
+    if (!this.dmabufPending.has(bufferId) && !this.dmabufImports.has(bufferId)) {
+      this.dmabufPending.set(bufferId, {
+        fd, width: w, height: h, fourcc, modHi, modLo, offset, stride,
+        pendingInstalls: [],
       });
-    return importId !== 0;
+    }
+    // Track that this surface wants the texture installed when the import
+    // completes (cache miss path) -- or immediately (cache hit path, handled
+    // below after stepping the lifecycle).
+    const pending = this.dmabufPending.get(bufferId);
+    if (pending && !pending.pendingInstalls.includes(id)) {
+      pending.pendingInstalls.push(id);
+    }
+
+    // Feed the lifecycle. It emits importBuffer (cache miss) or nothing (cache
+    // hit / same-buffer re-commit). The acquireFenceAvailable event is a stub
+    // in Layer B: `kind: "none"` until Layer C re-exports the dmabuf sync_file
+    // per commit. (Today the GPU process exports the sync_file at import time
+    // and feeds it into the single BeginAccess at import, which is the bug
+    // Layer C fixes; Layer B leaves the existing behavior untouched.)
+    this.dispatch(this.lifecycle.step({
+      kind: "commit", surfaceId: id, bufferId, dims: { w, h },
+    }));
+    this.dispatch(this.lifecycle.step({
+      kind: "acquireFenceAvailable", bufferId, fence: { kind: "none" },
+    }));
+
+    // Cache hit: the lifecycle did NOT emit importBuffer, and we already have
+    // a cached GPUTexture for this bufferId. Bind it on the surface now.
+    const cached = this.dmabufImports.get(bufferId);
+    if (cached) {
+      this.bindImportToSurface(id, bufferId, cached);
+      // No longer pending an install.
+      this.dmabufPending.delete(bufferId);
+    }
+
+    return true;
   }
 
-  // Install a freshly-imported dmabuf texture on the surface, retiring the buffer
-  // it supersedes (freed once the last frame that sampled it completes).
-  private installDmabuf(id: number, tex: GPUTexture, w: number, h: number,
-                        bufferId: number, importId: number): void {
+  // Wire a (possibly-just-imported) cached GPU import into the given surface:
+  // (re)build the view + bind group, mark present, and announce the surface as
+  // having new content this frame.
+  private bindImportToSurface(id: number, bufferId: number, imp: DmabufImport): void {
     let s = this.surfaces.get(id);
     if (!s) { s = blankSurface(0, 0, 0, 0); this.surfaces.set(id, s); }
-
-    if (s.currentBufferId !== 0 && s.currentBufferId !== bufferId && s.texture) {
-      // The old buffer was sampled by every frame up to the latest submit; it is
-      // free once that submit completes. Keep its texture alive until then.
-      this.retiring.push({ bufferId: s.currentBufferId, importId: s.currentImportId,
-                           retireSerial: this.submitSerial, tex: s.texture });
-    }
     s.currentBufferId = bufferId;
-    s.currentImportId = importId;
-    s.texture = tex;
-    const view = tex.createView();
-    s.view = view;
-    s.width = w;
-    s.height = h;
+    s.texture = imp.tex;
+    s.view = imp.view;
+    s.width = imp.width;
+    s.height = imp.height;
     const placementBuf = s.placementBuf ?? this.device.createBuffer({
       size: 16, usage: this.g.GPUBufferUsage.UNIFORM | this.g.GPUBufferUsage.COPY_DST,
     });
@@ -309,12 +413,131 @@ export class JsCompositor implements CompositorSink {
       layout: this.layout,
       entries: [
         { binding: 0, resource: this.sampler },
-        { binding: 1, resource: view },
+        { binding: 1, resource: imp.view },
         { binding: 2, resource: { buffer: placementBuf } },
       ],
     });
     s.present = true;
-    this.imported.push({ id, width: w, height: h });
+    this.imported.push({ id, width: imp.width, height: imp.height });
+  }
+
+  // Run the intents the lifecycle just emitted. The executor is intentionally
+  // dumb: it has no policy of its own. Layer B implements importBuffer +
+  // releaseImport + sendWlRelease; beginAccess + endAccess are stubs filled in
+  // by Layer C (the cross-process per-frame Begin/End bracket).
+  private dispatch(intents: LifecycleIntent[]): void {
+    for (const i of intents) this.runIntent(i);
+  }
+
+  private runIntent(intent: LifecycleIntent): void {
+    switch (intent.kind) {
+      case "importBuffer": this.runImportBuffer(intent.bufferId); break;
+      case "releaseImport": this.runReleaseImport(intent.bufferId); break;
+      case "sendWlRelease": this.freed.push(intent.bufferId); break;
+      case "beginAccess":
+      case "endAccess":
+        // The actual GPU-process BeginAccess/EndAccess calls happen in
+        // renderFrame() (Layer C: runFrameBegin / runFrameEnd), BEFORE/AFTER
+        // the wire submit. Why not here? beginClientAccessSync is a sync
+        // round-trip and can fail; if it fails after the state machine has
+        // emitted beginAccess (which sets accessOpen + adds to frame.sampled),
+        // there is no clean rollback. Calling the GPU-process side at the
+        // executor level lets renderFrame decide whether to feed
+        // frameSampled in the first place (and skip the draw if it can't).
+        // The lifecycle intents stay -- they record the LOGICAL contract
+        // the unit tests verify (alternation, chain-fence threading), while
+        // the executor enforces the actual GPU-side bracket.
+        break;
+    }
+  }
+
+  // Async addon call to import the client dmabuf. On completion the wrapped
+  // wire texture is cached and any pending surface installs are bound.
+  private runImportBuffer(bufferId: number): void {
+    if (this.dmabufImports.has(bufferId)) return;  // defensive: never re-import
+    const pending = this.dmabufPending.get(bufferId);
+    if (!pending) {
+      console.warn(`[js-compositor] importBuffer(${bufferId}) without pending descriptor (executor/state-machine drift)`);
+      return;
+    }
+    const dawn = this.dawn;
+    if (!dawn || this.deviceHandle === 0n) {
+      this.dispatch(this.lifecycle.step({
+        kind: "accessFailed", bufferId, reason: "no dawn wire / deviceHandle",
+      }));
+      return;
+    }
+    const importId = this.addon.createTextureFromDmabuf(
+      pending.fd, pending.width, pending.height, pending.fourcc,
+      pending.modHi, pending.modLo, pending.offset, pending.stride,
+      (handle) => {
+        const p = this.dmabufPending.get(bufferId);
+        if (handle === null) {
+          // The native import failed (modifier mismatch, bad dmabuf, etc).
+          // Release the importId reservation; poison the buffer in the
+          // state machine; subsequent samples are skipped (surface stays
+          // last-good).
+          if (importId) this.addon.releaseDmabufImport(importId);
+          if (p) this.dmabufPending.delete(bufferId);
+          this.dispatch(this.lifecycle.step({
+            kind: "accessFailed", bufferId, reason: "createTextureFromDmabuf returned null",
+          }));
+          return;
+        }
+        const tex = dawn.wrapTexture(this.deviceHandle, handle);
+        const view = tex.createView();
+        const imp: DmabufImport = {
+          tex, view, width: pending.width, height: pending.height, importId,
+        };
+        this.dmabufImports.set(bufferId, imp);
+        // Bind to every surface that was waiting for this import.
+        if (p) {
+          for (const sid of p.pendingInstalls) this.bindImportToSurface(sid, bufferId, imp);
+          this.dmabufPending.delete(bufferId);
+        }
+      });
+    if (importId === 0) {
+      // Synchronous failure to start the import (addon refused). Treat the
+      // same as the async-null callback.
+      this.dmabufPending.delete(bufferId);
+      this.dispatch(this.lifecycle.step({
+        kind: "accessFailed", bufferId, reason: "createTextureFromDmabuf returned 0",
+      }));
+    }
+  }
+
+  private runReleaseImport(bufferId: number): void {
+    const imp = this.dmabufImports.get(bufferId);
+    if (!imp) {
+      // releaseImport fired for a buffer whose async import never resolved
+      // (accessFailed path also clears dmabufPending; nothing to do).
+      this.dmabufPending.delete(bufferId);
+      return;
+    }
+    this.dmabufImports.delete(bufferId);
+    // Detach from any surfaces still pointing at this import. Without this, a
+    // surface whose bufferDestroyed fired (or whose buffer was the destroyed
+    // wl_buffer at the moment its own surfaceRemoved drained) keeps a stale
+    // GPUTexture reference; the next frame would try to sample a freed import.
+    for (const s of this.surfaces.values()) {
+      if (s.currentBufferId === bufferId) {
+        s.currentBufferId = 0;
+        s.texture = null;
+        s.view = null;
+        s.bindGroup = null;
+        s.present = false;
+      }
+    }
+    // Native release: drops the server-side STM + texture + dmabuf fd.
+    if (imp.importId !== 0) this.addon.releaseDmabufImport(imp.importId);
+  }
+
+  // The wire layer (src/protocols/wl_buffer.ts) calls this from the wl_buffer
+  // destroy handler and from the disconnect sweep. It's the cache-invalidation
+  // trigger -- the ONLY (along with surfaceRemoved) path that releases a
+  // cached GPU import per rule A.
+  notifyBufferDestroyed(bufferId: number): void {
+    this.dispatch(this.lifecycle.step({ kind: "bufferDestroyed", bufferId }));
   }
 
   // Install a pre-wrapped wire texture (e.g. a plugin overlay's consumer texture,
@@ -382,21 +605,6 @@ export class JsCompositor implements CompositorSink {
     this.afterFrame = keep;
   }
 
-  private reapRetiring(): void {
-    if (this.retiring.length === 0) return;
-    const keep: RetiringBuffer[] = [];
-    for (const r of this.retiring) {
-      if (r.retireSerial <= this.completedSerial) {
-        this.freed.push(r.bufferId);                       // -> wl_buffer.release
-        if (r.importId !== 0) this.addon.releaseDmabufImport(r.importId); // drop server STM/fd
-        // r.tex reference is dropped here (entry not kept).
-      } else {
-        keep.push(r);
-      }
-    }
-    this.retiring = keep;
-  }
-
   // Upload raw BGRA8 pixels (tightly `stride`-rowed) into the surface's sampled
   // texture, creating/recreating it on size change. Used by uploadShm and by
   // tests / future producers that supply pixels directly.
@@ -457,53 +665,145 @@ export class JsCompositor implements CompositorSink {
   // Composite one frame: clear black, draw stack back-to-front, premultiplied
   // blend. Nested (slice 3) renders into the host swapchain's current texture and
   // presents; headless renders into the offscreen target (read via readback()).
+  //
+  // Lifecycle wiring: frameStart at top; frameSampled per drawn dmabuf surface
+  // (drives Layer C's per-frame BeginAccess); submitted after queue.submit (drives
+  // EndAccess); gpuCompleted on onSubmittedWorkDone (drives release intents).
+  // The early-return paths emit frameAborted so the lifecycle's open begin is
+  // rolled back without leaving a dangling access bracket.
   renderFrame(): void {
     let targetView = this.targetView;
     let presenting = false;
+    let frameOpen = false;
     if (this.nested) {
       const handle = this.addon.acquireOutputTexture();
-      if (handle === null) return;  // no swapchain texture this frame
+      if (handle === null) return;  // no swapchain texture this frame; no frame opened
       if (!this.dawn) return;
       this.outputTex = this.dawn.wrapTexture(this.deviceHandle, handle);
       targetView = this.outputTex.createView();
       presenting = true;
     }
     if (!targetView) return;  // headless before the target exists (shouldn't happen)
-    const enc = this.device.createCommandEncoder();
-    const pass = enc.beginRenderPass({
-      colorAttachments: [{
-        view: targetView,
-        loadOp: "clear",
-        storeOp: "store",
-        clearValue: { r: 0, g: 0, b: 0, a: 1 },
-      }],
-    });
-    pass.setPipeline(this.pipeline);
-    for (const id of this.drawOrder()) {
+
+    this.dispatch(this.lifecycle.step({ kind: "frameStart" }));
+    frameOpen = true;
+
+    // Per-frame BeginAccess pass: for each dmabuf surface that will draw, do
+    // the GPU-process round-trip Begin BEFORE encoding the sample command.
+    // If Begin fails, the surface is poisoned and skipped this frame (no
+    // draw, no frameSampled event -- the state machine doesn't see it as
+    // sampled, so no End is owed for it).
+    //
+    // The list `bracketed` holds the (importId, bufferId, surfaceId) of every
+    // dmabuf surface we successfully opened a bracket on, in draw order; the
+    // post-submit End pass walks it to send EndClientAccess. `skip` is the
+    // set of surfaceIds whose Begin failed; the draw loop below skips them
+    // for this frame ONLY (the surface record stays intact; next frame retries
+    // unless the buffer was poisoned by accessFailed gating).
+    const bracketed: Array<{ importId: number; bufferId: number }> = [];
+    const skip = new Set<number>();
+    const draw = this.drawOrder();
+    for (const id of draw) {
       const s = this.surfaces.get(id);
-      if (s && s.present && s.bindGroup) {
-        this.updatePlacement(s);
-        pass.setBindGroup(0, s.bindGroup);
-        pass.draw(4);
+      if (!s || !s.present || !s.bindGroup) continue;
+      if (s.currentBufferId === 0) continue;  // shm or plugin overlay; no lifecycle
+      const imp = this.dmabufImports.get(s.currentBufferId);
+      if (!imp) continue;  // import not yet resolved (async); will draw next frame
+      const ok = this.addon.beginClientAccessSync(imp.importId);
+      if (!ok) {
+        // Poison the buffer in the lifecycle so subsequent frames skip it
+        // (until the client supersedes or destroys it). The state-machine
+        // gate in onFrameSampled also skips poisoned buffers, which is what
+        // suppresses retries -- no re-attempt of beginClientAccessSync until
+        // the buffer is replaced.
+        this.dispatch(this.lifecycle.step({
+          kind: "accessFailed", bufferId: s.currentBufferId,
+          reason: "beginClientAccessSync failed",
+        }));
+        skip.add(id);
+        continue;
       }
+      // Bracket open. Tell the state machine the surface was sampled. The
+      // resulting beginAccess intent is informational (the executor's
+      // runIntent("beginAccess") is a no-op; the real Begin already
+      // happened). The state machine sets accessOpen, adds to frame.sampled.
+      this.dispatch(this.lifecycle.step({ kind: "frameSampled", surfaceId: id }));
+      bracketed.push({ importId: imp.importId, bufferId: s.currentBufferId });
     }
-    pass.end();
-    this.device.queue.submit([enc.finish()]);
 
-    // This submit sampled every present surface's current buffer. Tag it; when it
-    // completes on the GPU, advance completedSerial and free retiring dmabuf
-    // buffers whose retireSerial has completed (-> wl_buffer.release). The promise
-    // resolves on the Node thread via the wire pump.
-    const serial = ++this.submitSerial;
-    this.device.queue.onSubmittedWorkDone().then(() => {
-      if (serial > this.completedSerial) this.completedSerial = serial;
-      this.reapRetiring();
-      this.runAfterFrame();
-    });
+    try {
+      const enc = this.device.createCommandEncoder();
+      const pass = enc.beginRenderPass({
+        colorAttachments: [{
+          view: targetView,
+          loadOp: "clear",
+          storeOp: "store",
+          clearValue: { r: 0, g: 0, b: 0, a: 1 },
+        }],
+      });
+      pass.setPipeline(this.pipeline);
+      for (const id of draw) {
+        if (skip.has(id)) continue;  // Begin failed for this surface this frame
+        const s = this.surfaces.get(id);
+        if (s && s.present && s.bindGroup) {
+          this.updatePlacement(s);
+          pass.setBindGroup(0, s.bindGroup);
+          pass.draw(4);
+        }
+      }
+      pass.end();
+      this.device.queue.submit([enc.finish()]);
+      // dawn.node's queue.submit does NOT flush the wire client serializer
+      // (empirical; the architecture-doc claim is wrong as of writing). We
+      // must force-flush before sampling wireBytesQueued, otherwise the
+      // captured serial doesn't cover the just-submitted commands and the
+      // GPU process's coreWireBarrier passes EndClientAccess BEFORE the
+      // wire reader has actually processed the submit -> Dawn "used in a
+      // submit without current access" error.
+      this.addon.flushCoreWire();
+      const coreWireSerial = this.addon.coreWireBytesQueued();
 
-    if (presenting) {
-      this.addon.presentOutput();
-      this.outputTex = null;  // drop our borrowed wrap (native held its own ref)
+      // Tag the submit; on GPU completion advance completedSerial and emit
+      // gpuCompleted to the lifecycle (which fires deferred release intents).
+      const serial = ++this.submitSerial;
+      this.dispatch(this.lifecycle.step({ kind: "submitted", serial }));
+      frameOpen = false;
+
+      // EndAccess pass: send fire-and-forget EndClientAccess for every
+      // bracket we opened, tagged with the wire serial. Then synthesize
+      // endAccessFenceExported to satisfy the state-machine chain-fence
+      // tracking (the actual fence lives in the GPU process and is chained
+      // intra-process; the state-machine field is informational, used by
+      // the unit-test invariant 7).
+      for (const { importId, bufferId } of bracketed) {
+        this.addon.endClientAccess(importId, coreWireSerial);
+        this.dispatch(this.lifecycle.step({
+          kind: "endAccessFenceExported", bufferId,
+          // Sentinel: the GPU process exports a real fence and chains it
+          // intra-process. The state machine doesn't see the fd; the kind
+          // != "none" is what the chain-fence invariant tests check for.
+          fence: { kind: "syncFile", fd: -1 },
+        }));
+      }
+
+      this.device.queue.onSubmittedWorkDone().then(() => {
+        if (serial > this.completedSerial) this.completedSerial = serial;
+        this.dispatch(this.lifecycle.step({ kind: "gpuCompleted", serial }));
+        this.runAfterFrame();
+      });
+
+      if (presenting) {
+        this.addon.presentOutput();
+        this.outputTex = null;
+      }
+    } catch (e) {
+      // If anything threw between frameStart and submitted, roll back the open
+      // begin so the lifecycle's invariant 2 (alternation) is preserved.
+      if (frameOpen) {
+        try { this.dispatch(this.lifecycle.step({ kind: "frameAborted" })); }
+        catch { /* secondary throw -- intentionally swallowed */ }
+      }
+      throw e;
     }
   }
 
@@ -544,6 +844,6 @@ function blankSurface(x: number, y: number, w: number, h: number): Surface {
   return {
     texture: null, view: null, placementBuf: null, bindGroup: null,
     width: 0, height: 0, x, y, layoutW: w, layoutH: h, present: false,
-    currentBufferId: 0, currentImportId: 0,
+    currentBufferId: 0,
   };
 }

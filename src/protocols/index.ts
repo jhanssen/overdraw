@@ -223,9 +223,23 @@ export async function installProtocols(
     // the fd + drop the descriptor here (otherwise the wrapper GC-warns + leaks an
     // fd per buffer the client allocated). shm pools are reclaimed via their own
     // refcount on pool destroy.
+    //
+    // For dmabuf buffers this is ALSO the cache-invalidation trigger for the
+    // client-buffer lifecycle (rule A): notifyBufferDestroyed releases the
+    // cached GPU import. Without this, a client disconnect would leak imports
+    // for every buffer it ever committed (load-bearing per the spec test:
+    // "leak guard: surfaceRemoved releases ... others need bufferDestroyed").
     if (state.buffers) {
       for (const [resource, desc] of [...state.buffers.entries()]) {
         if (!resource.destroyed) continue;
+        if (desc.dmabuf) {
+          const bufferId = state.dmabufBufferIds?.get(resource);
+          if (bufferId !== undefined) {
+            state.compositor.notifyBufferDestroyed?.(bufferId);
+            state.dmabufBufferIds?.delete(resource);
+            state.dmabufById?.delete(bufferId);
+          }
+        }
         if (desc.fd && !desc.fd.closed) {
           try { desc.fd.close(); } catch { /* already closed/taken */ }
         }
@@ -244,17 +258,19 @@ export async function installProtocols(
     // intermediate values between rapid set_title/set_app_id requests.
     flushWindowChanges(state);
 
+    // Drain sendWlRelease intents from the lifecycle: notify each client that
+    // it may write to the buffer again. Per rule A, the bufferId<->resource
+    // mapping is NOT removed here -- the cached GPU import lives until the
+    // client destroys the wl_buffer (or disconnects), at which point the
+    // mapping is cleaned up in the wl_buffer.destroy handler / disconnect
+    // sweep. Cleaning it here would break the cache-on-re-attach path that
+    // makes a buffer-cycling client efficient.
     const freed = state.compositor.takeFreedBuffers();
     if (freed.length > 0) {
       const byId = state.dmabufById;
-      const byBuf = state.dmabufBufferIds;
       for (const id of freed) {
         const buf = byId?.get(id);
-        if (buf) {
-          if (!buf.destroyed) events.wl_buffer.send_release(buf);
-          byId?.delete(id);
-          byBuf?.delete(buf);
-        }
+        if (buf && !buf.destroyed) events.wl_buffer.send_release(buf);
       }
     }
 

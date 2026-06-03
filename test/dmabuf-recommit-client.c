@@ -1,14 +1,12 @@
-// Buffer-cycling dmabuf client for the JS-compositor release-lifecycle leak test.
-// Allocates N distinct LINEAR ARGB8888 dmabufs via GBM and commits them in
-// sequence on ONE xdg_toplevel (each commit supersedes the prior buffer); the
-// client destroys each PRIOR wl_buffer after attaching the next. Under the
-// rule-A cache model (see docs/client-buffer-lifecycle.md), wl_buffer.destroy
-// is the cache-invalidation trigger that releases the cached GPU import.
-// Without explicit destroys the imports stay cached for the client's lifetime
-// (rule-A behavior: the cache lives for the wl_buffer's lifetime); destroying
-// as we cycle is what real clients do when their pool rolls over.
+// Wayland client for the Layer C per-frame BeginAccess regression test
+// (docs/client-buffer-lifecycle.md). Allocates ONE dmabuf, fills it red, and
+// commits the SAME wl_buffer many times in sequence -- the cursor-blink /
+// focus-change shape. Under the prior (broken) model the compositor sampled
+// the same wl_buffer without re-acquiring per frame, producing intermittent
+// black frames; the fix is the per-frame Begin/End bracket with a fresh
+// dmabuf sync_file acquire fence each Begin. This client drives that path.
 //
-// Usage: dmabuf-cycle-client <socket> [frames]   (default frames=40)
+// Usage: dmabuf-recommit-client <socket> [recommits]   (default recommits=20)
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -32,6 +30,7 @@ static struct wl_compositor* compositor = NULL;
 static struct xdg_wm_base* wm_base = NULL;
 static struct zwp_linux_dmabuf_v1* dmabuf = NULL;
 static int surface_configured = 0;
+static int releases_received = 0;
 
 static void wmPing(void* d, struct xdg_wm_base* b, uint32_t s) { (void)d; xdg_wm_base_pong(b, s); }
 static const struct xdg_wm_base_listener wmListener = { wmPing };
@@ -45,6 +44,8 @@ static const struct xdg_surface_listener xsListener = { xsConfigure };
 static void dmaFormat(void* d, struct zwp_linux_dmabuf_v1* z, uint32_t f) { (void)d;(void)z;(void)f; }
 static void dmaModifier(void* d, struct zwp_linux_dmabuf_v1* z, uint32_t f, uint32_t hi, uint32_t lo) { (void)d;(void)z;(void)f;(void)hi;(void)lo; }
 static const struct zwp_linux_dmabuf_v1_listener dmaListener = { dmaFormat, dmaModifier };
+static void bufRelease(void* d, struct wl_buffer* b) { (void)d;(void)b; releases_received++; }
+static const struct wl_buffer_listener bufListener = { bufRelease };
 
 static void regGlobal(void* data, struct wl_registry* reg, uint32_t name, const char* iface, uint32_t version) {
     (void)data;
@@ -61,21 +62,40 @@ static void regGlobal(void* data, struct wl_registry* reg, uint32_t name, const 
 static void regRemove(void* data, struct wl_registry* reg, uint32_t name) { (void)data;(void)reg;(void)name; }
 static const struct wl_registry_listener regListener = { regGlobal, regRemove };
 
-// Allocate one filled red dmabuf and wrap it as a wl_buffer.
-static struct wl_buffer* makeBuffer(struct gbm_device* gbm) {
+int main(int argc, char** argv) {
+    if (argc < 2) { fprintf(stderr, "usage: %s <socket> [recommits]\n", argv[0]); return 2; }
+    int recommits = argc >= 3 ? atoi(argv[2]) : 20;
+    if (recommits < 1) recommits = 1;
+
+    struct wl_display* display = wl_display_connect(argv[1]);
+    if (!display) { fprintf(stderr, "[recommit] connect failed\n"); return 1; }
+    struct wl_registry* registry = wl_display_get_registry(display);
+    wl_registry_add_listener(registry, &regListener, NULL);
+    wl_display_roundtrip(display);
+    wl_display_roundtrip(display);
+    if (!compositor || !wm_base || !dmabuf) {
+        fprintf(stderr, "[recommit] missing globals\n");
+        return 1;
+    }
+
+    int drm = open("/dev/dri/renderD128", O_RDWR | O_CLOEXEC);
+    if (drm < 0) { perror("open renderD128"); return 1; }
+    struct gbm_device* gbm = gbm_create_device(drm);
+    if (!gbm) { fprintf(stderr, "[recommit] gbm_create_device failed\n"); return 1; }
+
+    // Allocate ONE dmabuf, filled red, and wrap as a wl_buffer.
     uint64_t mod = DRM_FORMAT_MOD_LINEAR;
     struct gbm_bo* bo = gbm_bo_create_with_modifiers(gbm, W, H, DRM_FORMAT_ARGB8888, &mod, 1);
     if (!bo) bo = gbm_bo_create(gbm, W, H, DRM_FORMAT_ARGB8888, GBM_BO_USE_LINEAR | GBM_BO_USE_RENDERING);
-    if (!bo) return NULL;
+    if (!bo) { fprintf(stderr, "[recommit] gbm_bo_create failed\n"); return 1; }
     uint32_t stride = 0; void* md = NULL;
     void* ptr = gbm_bo_map(bo, 0, 0, W, H, GBM_BO_TRANSFER_WRITE, &stride, &md);
-    if (ptr && ptr != MAP_FAILED) {
-        for (uint32_t y = 0; y < H; ++y) {
-            uint32_t* row = (uint32_t*)((uint8_t*)ptr + (size_t)y * stride);
-            for (uint32_t x = 0; x < W; ++x) row[x] = 0xFFFF0000u;
-        }
-        gbm_bo_unmap(bo, md);
+    if (!ptr || ptr == MAP_FAILED) { fprintf(stderr, "[recommit] gbm_bo_map failed\n"); return 1; }
+    for (uint32_t y = 0; y < H; ++y) {
+        uint32_t* row = (uint32_t*)((uint8_t*)ptr + (size_t)y * stride);
+        for (uint32_t x = 0; x < W; ++x) row[x] = 0xFFFF0000u;  // ARGB red
     }
+    gbm_bo_unmap(bo, md);
     int fd = gbm_bo_get_fd(bo);
     uint32_t offset = gbm_bo_get_offset(bo, 0);
     stride = gbm_bo_get_stride(bo);
@@ -86,60 +106,56 @@ static struct wl_buffer* makeBuffer(struct gbm_device* gbm) {
     struct wl_buffer* buf = zwp_linux_buffer_params_v1_create_immed(params, W, H, DRM_FORMAT_ARGB8888, 0);
     zwp_linux_buffer_params_v1_destroy(params);
     close(fd);
-    // bo intentionally leaked for process lifetime (one-shot test client).
-    return buf;
-}
-
-int main(int argc, char** argv) {
-    if (argc < 2) { fprintf(stderr, "usage: %s <socket> [frames]\n", argv[0]); return 2; }
-    int frames = argc >= 3 ? atoi(argv[2]) : 40;
-    if (frames < 1) frames = 1;
-
-    struct wl_display* display = wl_display_connect(argv[1]);
-    if (!display) { fprintf(stderr, "[cycle] connect failed\n"); return 1; }
-    struct wl_registry* registry = wl_display_get_registry(display);
-    wl_registry_add_listener(registry, &regListener, NULL);
-    wl_display_roundtrip(display);
-    wl_display_roundtrip(display);
-    if (!compositor || !wm_base || !dmabuf) { fprintf(stderr, "[cycle] missing globals\n"); return 1; }
-
-    int drm = open("/dev/dri/renderD128", O_RDWR | O_CLOEXEC);
-    if (drm < 0) { perror("open renderD128"); return 1; }
-    struct gbm_device* gbm = gbm_create_device(drm);
-    if (!gbm) { fprintf(stderr, "[cycle] gbm_create_device failed\n"); return 1; }
+    wl_buffer_add_listener(buf, &bufListener, NULL);
 
     struct wl_surface* surface = wl_compositor_create_surface(compositor);
     struct xdg_surface* xs = xdg_wm_base_get_xdg_surface(wm_base, surface);
     xdg_surface_add_listener(xs, &xsListener, NULL);
     struct xdg_toplevel* toplevel = xdg_surface_get_toplevel(xs);
     xdg_toplevel_add_listener(toplevel, &tlListener, NULL);
-    xdg_toplevel_set_title(toplevel, "overdraw-dmabuf-cycle");
+    xdg_toplevel_set_title(toplevel, "overdraw-dmabuf-recommit");
     wl_surface_commit(surface);
     wl_display_roundtrip(display);
 
-    // Commit `frames` DISTINCT dmabufs in sequence; each supersedes the prior
-    // on the surface. After each new commit, destroy the PREVIOUS wl_buffer
-    // (the cache-invalidation trigger that releases the import per rule A).
-    // A real client with a 2-3 buffer pool destroys old buffers when the pool
-    // rolls over; this stresses the same path with N distinct buffers.
-    struct wl_buffer* prev = NULL;
-    for (int i = 0; i < frames; ++i) {
-        struct wl_buffer* buf = makeBuffer(gbm);
-        if (!buf) { fprintf(stderr, "[cycle] makeBuffer failed at %d\n", i); return 1; }
+    // Initial attach+commit: maps the surface.
+    wl_surface_attach(surface, buf, 0, 0);
+    wl_surface_damage(surface, 0, 0, W, H);
+    wl_surface_commit(surface);
+    wl_display_roundtrip(display);
+    wl_display_roundtrip(display);
+
+    // Re-commit the SAME wl_buffer `recommits` times. This is the cursor-blink
+    // / focus-change shape: the surface's content didn't change but the client
+    // is signalling activity. Each commit must trigger a fresh per-frame
+    // BeginAccess in the compositor (with a freshly-exported dmabuf sync_file)
+    // so the compositor reads the current pixels, not a stale snapshot.
+    //
+    // Without re-attaching, just commit() on its own does NOT trigger
+    // wl_surface_apply_state. We need to keep attach+damage+commit (the
+    // protocol does require an attach to count as a new buffer commit).
+    for (int i = 0; i < recommits; ++i) {
         wl_surface_attach(surface, buf, 0, 0);
         wl_surface_damage(surface, 0, 0, W, H);
         wl_surface_commit(surface);
         wl_display_roundtrip(display);
-        usleep(25 * 1000);  // let a compositor frame sample + complete
-        if (prev) wl_buffer_destroy(prev);
-        prev = buf;
+        usleep(25 * 1000);
     }
-    // The very last buffer stays current on the surface; it is released when
-    // the client disconnects (the compositor's disconnect sweep fires
-    // bufferDestroyed for every still-live wl_buffer).
-    printf("[cycle] committed %d buffers\n", frames);
+    printf("[recommit] committed same buffer %d times, releases=%d\n",
+           recommits, releases_received);
     fflush(stdout);
-    usleep(300 * 1000);  // settle: let final releases drain
-    printf("[cycle] done\n");
+    // Give the harness time to capture the final state.
+    usleep(200 * 1000);
+
+    xdg_toplevel_destroy(toplevel);
+    xdg_surface_destroy(xs);
+    wl_buffer_destroy(buf);
+    wl_surface_destroy(surface);
+    gbm_bo_destroy(bo);
+    gbm_device_destroy(gbm);
+    close(drm);
+    zwp_linux_dmabuf_v1_destroy(dmabuf);
+    xdg_wm_base_destroy(wm_base);
+    wl_compositor_destroy(compositor);
+    wl_display_disconnect(display);
     return surface_configured ? 0 : 1;
 }

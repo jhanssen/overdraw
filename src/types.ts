@@ -65,6 +65,19 @@ export interface Addon {
                           modHi: number, modLo: number, offset: number, stride: number,
                           cb: (handle: bigint | null) => void): number;
   releaseDmabufImport(importId: number): void;
+  // Per-frame BeginAccess/EndAccess on a cached client dmabuf import. Layer C
+  // of docs/client-buffer-lifecycle.md. beginClientAccessSync is synchronous
+  // (blocking round-trip); endClientAccess is fire-and-forget, deferred on
+  // the core wire barrier until the wire reader has consumed wireSerial bytes.
+  beginClientAccessSync(importId: number): boolean;
+  endClientAccess(importId: number, wireSerial: bigint): void;
+  // The core's wire bytesQueued counter; sample AFTER flushCoreWire() to tag
+  // endClientAccess so the GPU process defers EndAccess until its wire reader
+  // catches up past that point. dawn.node's queue.submit does NOT itself
+  // flush, so an explicit flushCoreWire() is required first.
+  coreWireBytesQueued(): bigint;
+  // Force-flush the core's outbound wire client; pair with coreWireBytesQueued.
+  flushCoreWire(): void;
 
   // Plugin GPU brokering (core side; the Worker owns the wire client). Callbacks
   // are node-style (result|null or ok); the broker Promise-wraps them.

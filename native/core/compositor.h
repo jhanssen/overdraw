@@ -246,6 +246,42 @@ class Compositor {
     // sent so the next poll waits afresh.
     int surfaceBeginDone(uint32_t surfaceBufId) const;
 
+    // --- Per-frame BeginAccess/EndAccess on cached CLIENT dmabuf textures -----
+    // (Layer C of docs/client-buffer-lifecycle.md.) The compositor opens a
+    // per-frame Begin bracket on each dmabuf surface it samples and closes it
+    // after submit; the GPU process re-exports the dmabuf's implicit-sync
+    // acquire fence per Begin (fixing the same-buffer re-commit flicker).
+    //
+    // `importId` is the JS-compositor import id (from importDmabufForJs).
+    // beginClientAccessSync is a SYNCHRONOUS round-trip: it sends the ctrl
+    // request, spin-drains the ctrl fd (dispatching all reply tags through
+    // drainCtrl-equivalent routing) until BeginClientAccessDone for this
+    // importId lands or the deadline expires, and returns ok/!ok. Blocks the
+    // calling thread; intended for the per-frame compositor path where the
+    // wire sample commands MUST not be flushed before the bracket is open
+    // (the existing one-way ctrl-after-wire barrier cannot enforce the
+    // opposite direction). The block is sub-millisecond in practice.
+    bool beginClientAccessSync(uint32_t importId);
+    // Send the EndAccess request fire-and-forget. The GPU process defers
+    // the EndAccess until its wire reader has consumed `coreWireSerial`
+    // framed bytes (so the compositor submit's sample commands have been
+    // HandleCommands'd). `coreWireSerial` is coreWireBytesQueued() sampled
+    // AFTER the submit's wire flush.
+    void sendEndClientAccess(uint32_t importId, uint64_t coreWireSerial);
+
+    // The core-wire serializer's cumulative bytesQueued counter. JS samples
+    // this AFTER flushCoreWire() to tag EndClientAccess so the GPU process
+    // can defer EndAccess until its wire reader catches up past that point
+    // (ctrl-after-wire ordering via ipc::WireBarrier).
+    uint64_t coreWireBytesQueued() const { return link_->wireBytesQueued(); }
+    // Force-flush the core's outbound wire client (commits any buffered ops
+    // to the wire socket and advances bytesQueued past them). dawn.node's
+    // queue.submit does NOT itself flush the wire client serializer (empirical;
+    // the architecture-doc claim that it does is wrong as of this writing),
+    // so callers that need a wire serial covering recent ops must flush
+    // explicitly before sampling coreWireBytesQueued().
+    void flushCoreWire() { link_->flush(); }
+
     // The JS compositor drives every frame: it acquires the output texture,
     // renders into it over the wire, and presents. The C++ Compositor no longer
     // has a compositing pass -- it provides WSI (surface/acquire/present), dmabuf
@@ -314,6 +350,12 @@ class Compositor {
     std::unordered_map<uint32_t, int> surfaceBufAllocated_;
     // Per-surface Begin-done status (0=pending,1=producer,2=consumer,3=failed).
     std::unordered_map<uint32_t, int> surfaceBeginDone_;
+    // Per-client-texture per-frame BeginAccess status (Layer C). Keyed by the
+    // wire texture handle id (the GPU process side keys clientTextures by it
+    // too, so the reply echoes that id). 0=pending, 1=ok, 2=failed. Cleared
+    // to 0 when beginClientAccessSync sends; updated by drainCtrl on the
+    // BeginClientAccessDone reply.
+    std::unordered_map<uint32_t, int> clientBeginDone_;
 
     bool headless_ = false;
     wgpu::Texture currentOutputTexture_;  // held between acquire + present

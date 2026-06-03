@@ -33,6 +33,37 @@ enum class Tag : uint8_t {
     ReleaseClientTex = 'r',   // core -> gpu : release a client-dmabuf import (texture =
                               //              {id,generation}); GPU drops the STM + fd if
                               //              the entry's generation still matches.
+    // Per-frame BeginAccess/EndAccess bracket on a cached CLIENT dmabuf texture.
+    // The bracket is per-frame to fix the same-buffer re-commit flicker
+    // (docs/client-buffer-lifecycle.md): the prior model BeginAccess'd once at
+    // import and never EndAccess'd, so a re-commit was never re-acquired and
+    // the compositor sampled the texture concurrently with the client's GPU
+    // writes -> black frame. The new model opens a Begin per compositing frame
+    // that samples the texture, waiting on a freshly-exported dmabuf sync_file
+    // acquire fence, and Ends after the compositor's submit.
+    //
+    // BeginClientAccess is a ROUND-TRIP (returns BeginClientAccessDone) so the
+    // core only flushes wire sample commands once the GPU process has applied
+    // the Begin: ordering between ctrl and wire is one-way (ctrl-after-wire,
+    // via WireBarrier), so any ctrl op that must order-precede wire commands
+    // has to wait for an acknowledgement (see runSurfaceEnd / ProducerBegin
+    // for the established pattern).
+    //
+    // EndClientAccess is fire-and-forget, deferred on the core wire barrier
+    // (the End must wait until the GPU process's wire reader has consumed the
+    // compositor submit's bytes, otherwise the End closes the bracket before
+    // the wire commands that actually sample the texture are observed).
+    BeginClientAccess = 'Q',  // core->gpu: open per-frame BeginAccess on the
+                              //   cached client texture (`texture` = {id,gen}).
+                              //   GPU process re-exports the dmabuf sync_file
+                              //   from the held fd and waits it; chains the
+                              //   prior frame's exported EndAccess fence too.
+    BeginClientAccessDone = 'o',  // gpu->core: BeginAccess applied (ok=1) or failed (ok=0).
+                                  //   The core proceeds with wire sample commands.
+    EndClientAccess = 'Y',    // core->gpu: end the per-frame access on the
+                              //   cached client texture. Deferred on the core
+                              //   wire barrier until the wire reader has
+                              //   consumed `wireSerial` framed bytes.
     BeginAccess  = 'B',  // core -> gpu : begin access on the STM (before wire render)
     BeginDone    = 'b',  // gpu  -> core: BeginAccess applied + flushed
     EndAccess    = 'E',  // core -> gpu : end access on the STM (after wire render)

@@ -108,9 +108,15 @@ Two processes in v1: core and GPU. Phase 2 adds a small session supervisor.
   worker). One `dawn::wire::Server` instance in the GPU process per
   connected client; no multiplexing layer. We provide the transport;
   Dawn provides `CommandSerializer`/`CommandHandler`.
-  - **Flush policy:** flush on `queue.submit` and at wire-internal sync
-    points (callback returns, buffer-map completions). Per-call flushes
-    are not used.
+  - **Flush policy:** Dawn batches wire commands in its `CommandSerializer`
+    and flushes them to the socket on its own batch boundaries; an API call
+    such as `queue.submit` does NOT by itself guarantee its commands are
+    flushed to the wire. Code that needs commands committed (e.g. to sample a
+    correct cumulative-bytes ordering serial, or to ensure a peer sees a
+    command before a side-channel message that depends on it) must call an
+    explicit `flush()` and only then read the serial. We also flush at
+    wire-internal sync points (callback returns, buffer-map completions).
+    Per-call flushes are not used.
   - **Backpressure:** fully non-blocking. All fds are `O_NONBLOCK`; a
     writer buffers what the socket can't take and drains on writable, so a
     write never parks (a single-threaded peer blocked in `write()` while the
