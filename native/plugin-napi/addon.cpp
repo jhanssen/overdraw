@@ -188,7 +188,13 @@ napi_value Flush(napi_env env, napi_callback_info info) {
     return nullptr;
 }
 
-// wireBytesQueued(clientId) -> bigint (the cross-channel ordering serial)
+// wireBytesQueued(clientId) -> bigint. The plugin wire's cumulative framed-byte
+// counter. NOT dead after the in-band move: reserveProducerTexture still samples
+// it INTERNALLY (worker_wire.cpp) to capture `reservePointSerial`, which gates
+// the GPU process's producer-side AllocSurfaceBuf InjectTexture (recycled-handle
+// hazard, still a ctrl path -- the inject carries the reserve). This JS export
+// is retained as the observation seam for the wire-serial-regression test, which
+// pins that the internal flush commits prior wire traffic.
 napi_value WireBytesQueued(napi_env env, napi_callback_info info) {
     size_t argc = 1; napi_value argv[1];
     napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
@@ -197,6 +203,28 @@ napi_value WireBytesQueued(napi_env env, napi_callback_info info) {
     napi_value out;
     napi_create_bigint_uint64(env, c->wireBytesQueued(), &out);
     return out;
+}
+
+// writeBeginAccess(clientId, surfaceBufId) / writeEndAccess(clientId, surfaceBufId):
+// in-band producer Begin/End on the plugin wire. Synchronous frame writes (the
+// FIFO wire ordering replaces the prior ctrl ProducerBegin round-trip / the
+// ProducerEnd WireBarrier deferral). The Worker writes Begin as it claims a
+// slot and End after its render submit.
+napi_value WriteBeginAccess(napi_env env, napi_callback_info info) {
+    size_t argc = 2; napi_value argv[2];
+    napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+    auto* c = self(env)->get(u32(env, argv[0]));
+    if (!c) return throwErr(env, "writeBeginAccess: bad clientId");
+    c->writeBeginAccess(u32(env, argv[1]));
+    return nullptr;
+}
+napi_value WriteEndAccess(napi_env env, napi_callback_info info) {
+    size_t argc = 2; napi_value argv[2];
+    napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+    auto* c = self(env)->get(u32(env, argv[0]));
+    if (!c) return throwErr(env, "writeEndAccess: bad clientId");
+    c->writeEndAccess(u32(env, argv[1]));
+    return nullptr;
 }
 
 void cleanup(napi_env, void* data, void*) { delete static_cast<Instance*>(data); }
@@ -221,6 +249,8 @@ napi_value Init(napi_env env, napi_value exports) {
     reg("producerTexture", ProducerTexture);
     reg("flush", Flush);
     reg("wireBytesQueued", WireBytesQueued);
+    reg("writeBeginAccess", WriteBeginAccess);
+    reg("writeEndAccess", WriteEndAccess);
     return exports;
 }
 

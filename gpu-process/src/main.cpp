@@ -11,6 +11,7 @@
 #include <cstring>
 #include <algorithm>
 #include <chrono>
+#include <functional>
 #include <unordered_map>
 #include <vector>
 
@@ -152,12 +153,28 @@ int run(int wireFd, int ctrlFd, int inputFd, bool headless,
     // outbound wire bytes. Non-blocking throughout. Returns false if the core
     // closed the wire. Flush() now queues bytes and writes what fits; the event
     // loop drains the rest on EPOLLOUT.
+    // Dispatch a non-Dawn (kind != 0) core-wire control frame to the matching
+    // access-bracket helper. Assigned after the helpers are defined below; until
+    // then no control frame can legitimately arrive (no textures/surfaces exist
+    // pre-bring-up), so a non-null check guards the bring-up window.
+    std::function<void(ipc::FrameKind, const std::vector<uint8_t>&)> dispatchCoreControlFrame;
+
     auto pumpWire = [&]() -> bool {
         bool alive = wireReader.readAvailable();
+        ipc::FrameKind kind;
         std::vector<uint8_t> frame;
-        while (wireReader.nextFrame(frame)) {
-            server.HandleCommands(reinterpret_cast<const char*>(frame.data()), frame.size());
-            serializer.Flush();
+        while (wireReader.nextFrame(kind, frame)) {
+            if (kind == ipc::FrameKind::WireBytes) {
+                server.HandleCommands(reinterpret_cast<const char*>(frame.data()), frame.size());
+                serializer.Flush();
+            } else if (dispatchCoreControlFrame) {
+                dispatchCoreControlFrame(kind, frame);
+            } else {
+                std::fprintf(stderr,
+                    "[gpu] core wire: control frame kind=%u before dispatch ready\n",
+                    static_cast<unsigned>(kind));
+                std::abort();
+            }
         }
         dawn::native::InstanceProcessEvents(instance.Get());
         if (tickDev) {
@@ -435,15 +452,29 @@ int run(int wireFd, int ctrlFd, int inputFd, bool headless,
         // AllocSurfaceBuf inject) until the plugin wire reader has consumed the
         // commands the ctrl op depends on.
         ipc::WireBarrier barrier;
+        // In-band producer control-frame dispatch (kind=1/kind=2 Surface frames
+        // on THIS plugin wire). Assigned after the runSurface* helpers exist;
+        // until then no producer frame can arrive (no surface bufs yet).
+        std::function<void(ipc::FrameKind, const std::vector<uint8_t>&)> dispatchControl;
 
         // Read + dispatch buffered wire frames, advance Dawn, flush outbound. NB.
         bool pump() {
             bool alive = reader->readAvailable();
+            ipc::FrameKind kind;
             std::vector<uint8_t> frame;
-            while (reader->nextFrame(frame)) {
-                server->HandleCommands(reinterpret_cast<const char*>(frame.data()),
-                                       frame.size());
-                serializer->Flush();
+            while (reader->nextFrame(kind, frame)) {
+                if (kind == ipc::FrameKind::WireBytes) {
+                    server->HandleCommands(reinterpret_cast<const char*>(frame.data()),
+                                           frame.size());
+                    serializer->Flush();
+                } else if (dispatchControl) {
+                    dispatchControl(kind, frame);
+                } else {
+                    std::fprintf(stderr,
+                        "[gpu] plugin conn %u: control frame kind=%u before dispatch ready\n",
+                        connId, static_cast<unsigned>(kind));
+                    std::abort();
+                }
             }
             dawn::native::InstanceProcessEvents(instance->Get());
             if (tickDev) { dawn::native::DeviceTick(tickDev); serializer->Flush(); }
@@ -523,17 +554,62 @@ int run(int wireFd, int ctrlFd, int inputFd, bool headless,
         }
     };
 
-    // ProducerEnd / AllocSurfaceBuf-inject cross-channel ordering now lives on
-    // each PluginConn's `barrier` (ipc::WireBarrier). drainPluginBarriers below
-    // drains them after each plugin-wire pump. Tag scheme:
-    //   - ProducerEnd:      tag = producerEndTag(surfaceBufId)
-    //   - AllocSurfaceBuf:  tag = allocSurfaceBufTag(surfaceBufId)
-    // (Tags are only used by ReleaseSurfaceBuf to cancel a pending op whose
-    // serial may never arrive, mirroring the prior pendingProducerEnds purge.)
-    auto producerEndTag = [](uint32_t bufId) -> ipc::WireBarrier::Tag {
-        return (static_cast<ipc::WireBarrier::Tag>(1) << 32) |
-               static_cast<ipc::WireBarrier::Tag>(bufId);
+    // Open a producer (write) or consumer (read) access bracket on the surface
+    // buffer, WAITING the other side's last fence (C-M1 cross-device fence,
+    // in-process here). The dmabuf's Vulkan layout continues from the last
+    // EndAccess. Returns true iff the bracket opened (the ctrl-dispatch caller
+    // turns this into a *BeginDone reply; in-band dispatch ignores the bool and
+    // hard-fails on false). Mirrors runSurfaceEnd's (surfaceBufId, producer)
+    // shape so both the ctrl branch and the future kind=1 wire dispatch can call
+    // it.
+    auto runSurfaceBegin = [&](uint32_t surfaceBufId, bool producer) -> bool {
+        auto it = surfaceBufs.find(surfaceBufId);
+        if (it == surfaceBufs.end()) {
+            std::fprintf(stderr, "[gpu] %sBegin: unknown surfaceBufId=%u\n",
+                         producer ? "Producer" : "Consumer", surfaceBufId);
+            return false;
+        }
+        SurfaceBuf& sb = it->second;
+        wgpu::SharedTextureMemory& mem = producer ? sb.producerMem : sb.consumerMem;
+        wgpu::Texture& tex = producer ? sb.producerTex : sb.consumerTex;
+        // Producer waits the consumer's last fence; consumer waits the
+        // producer's last fence.
+        wgpu::SharedFence& wait = producer ? sb.consumerFence : sb.producerFence;
+        // First producer access begins UNDEFINED + uninitialized; all
+        // else continues from the last reported layout, initialized.
+        bool firstProduce = producer && !sb.everProduced;
+        wgpu::SharedTextureMemoryVkImageLayoutBeginState layout{};
+        layout.oldLayout = firstProduce ? 0 : sb.layout;
+        layout.newLayout = 1;  // GENERAL (render + sample capable)
+        wgpu::SharedTextureMemoryBeginAccessDescriptor bad{};
+        bad.nextInChain = &layout;
+        bad.initialized = !firstProduce;
+        uint64_t signaled = 1;
+        if (wait) {
+            bad.fenceCount = 1;
+            bad.fences = &wait;
+            bad.signaledValueCount = 1;
+            bad.signaledValues = &signaled;
+        } else {
+            bad.fenceCount = 0;
+        }
+        if (mem.BeginAccess(tex, &bad) != wgpu::Status::Success) {
+            std::fprintf(stderr, "[gpu] %sBegin: BeginAccess failed (buf=%u)\n",
+                         producer ? "Producer" : "Consumer", surfaceBufId);
+            return false;
+        }
+        if (producer) { sb.everProduced = true; sb.producerOpen = true; }
+        else sb.consumerOpen = true;
+        return true;
     };
+
+    // AllocSurfaceBuf-inject cross-channel ordering lives on each PluginConn's
+    // `barrier` (ipc::WireBarrier). drainPluginBarriers below drains them after
+    // each plugin-wire pump. Tag scheme:
+    //   - AllocSurfaceBuf:  tag = allocSurfaceBufTag(surfaceBufId)
+    // (The tag is only used by ReleaseSurfaceBuf to cancel a pending inject whose
+    // serial may never arrive. Producer/consumer Begin/End no longer use the
+    // barrier -- they ride the wire in-band, ordered by FIFO.)
     auto allocSurfaceBufTag = [](uint32_t bufId) -> ipc::WireBarrier::Tag {
         return (static_cast<ipc::WireBarrier::Tag>(2) << 32) |
                static_cast<ipc::WireBarrier::Tag>(bufId);
@@ -594,18 +670,13 @@ int run(int wireFd, int ctrlFd, int inputFd, bool headless,
     // back (round-trip; the core only flushes wire sample commands after the
     // reply lands, because ctrl-after-wire is the only one-way ordering the
     // existing infrastructure provides).
-    auto runBeginClientAccess = [&](const ipc::Message& m) {
-        ipc::Message reply{};
-        reply.tag = ipc::Tag::BeginClientAccessDone;
-        reply.texture = m.texture;
-        reply.ok = 0;
-        auto it = clientTextures.find(m.texture.id);
-        if (it == clientTextures.end() || it->second.generation != m.texture.generation) {
+    auto runBeginClientAccess = [&](uint32_t textureId, uint32_t textureGen) -> bool {
+        auto it = clientTextures.find(textureId);
+        if (it == clientTextures.end() || it->second.generation != textureGen) {
             std::fprintf(stderr,
                 "[gpu] BeginClientAccess: unknown texture {%u,%u}\n",
-                m.texture.id, m.texture.generation);
-            ipc::sendMessage(ctrlFd, reply);
-            return;
+                textureId, textureGen);
+            return false;
         }
         ClientTex& ct = it->second;
         if (ct.accessOpen) {
@@ -616,9 +687,8 @@ int run(int wireFd, int ctrlFd, int inputFd, bool headless,
             // rather than letting Dawn fault the device.
             std::fprintf(stderr,
                 "[gpu] BeginClientAccess: bracket already open on {%u,%u}\n",
-                m.texture.id, m.texture.generation);
-            ipc::sendMessage(ctrlFd, reply);
-            return;
+                textureId, textureGen);
+            return false;
         }
 
         // Acquire fence: the dmabuf's current implicit-sync read-acquire
@@ -664,14 +734,12 @@ int run(int wireFd, int ctrlFd, int inputFd, bool headless,
         if (ct.mem.BeginAccess(ct.tex, &bad) != wgpu::Status::Success) {
             std::fprintf(stderr,
                 "[gpu] BeginClientAccess: Dawn BeginAccess failed {%u,%u}\n",
-                m.texture.id, m.texture.generation);
-            ipc::sendMessage(ctrlFd, reply);
-            return;
+                textureId, textureGen);
+            return false;
         }
         ct.accessOpen = true;
         ct.everSampled = true;
-        reply.ok = 1;
-        ipc::sendMessage(ctrlFd, reply);
+        return true;
     };
 
     // Close the per-frame BeginAccess bracket. Stores the exported fence on
@@ -729,10 +797,71 @@ int run(int wireFd, int ctrlFd, int inputFd, bool headless,
         }
     };
 
-    // EndClientAccess tag for the core wire barrier (FIFO + cancellable).
-    auto endClientAccessTag = [](uint32_t textureId) -> ipc::WireBarrier::Tag {
-        return (static_cast<ipc::WireBarrier::Tag>(3) << 32) |
-               static_cast<ipc::WireBarrier::Tag>(textureId);
+    // In-band core-wire control-frame dispatch (kind=1 BeginAccess / kind=2
+    // EndAccess). The frame is FIFO-ordered against the Dawn (kind=0) commands
+    // around it: a kind=1 written before the sample's kind=0 batch is processed
+    // first (bracket open before HandleCommands reaches the sample); a kind=2
+    // written after the submit's kind=0 batch is processed after it (bracket
+    // closed only once the sample commands are decoded). No ctrl round-trip, no
+    // WireBarrier.
+    //
+    // Failure paths HARD-FAIL (abort): per the in-band design, "unknown texture"
+    // / "bracket already open" / Dawn rejection are state-machine or JS-gate bugs,
+    // not transient races. The old ctrl path soft-failed (reply ok=0, skip the
+    // surface), which masked the bug as a silent glitch. A loud abort surfaces it.
+    dispatchCoreControlFrame = [&](ipc::FrameKind kind, const std::vector<uint8_t>& frame) {
+        if (frame.empty()) {
+            std::fprintf(stderr, "[gpu] core wire: empty control frame\n");
+            std::abort();
+        }
+        auto variant = static_cast<ipc::AccessVariant>(frame[0]);
+        if (variant == ipc::AccessVariant::ClientTex) {
+            if (frame.size() != ipc::ClientTexAccessPayload::kSize) {
+                std::fprintf(stderr, "[gpu] core wire: bad ClientTex payload size %zu\n",
+                             frame.size());
+                std::abort();
+            }
+            uint32_t texId = ipc::getU32LE(frame.data() + 1);
+            uint32_t texGen = ipc::getU32LE(frame.data() + 5);
+            bool ok = (kind == ipc::FrameKind::BeginAccess)
+                          ? runBeginClientAccess(texId, texGen)
+                          : (runEndClientAccess(texId, texGen), true);
+            if (!ok) {
+                std::fprintf(stderr,
+                    "[gpu] in-band client-texture Begin failed {%u,%u} -- "
+                    "JS import gate or state-machine bug\n", texId, texGen);
+                std::abort();
+            }
+        } else if (variant == ipc::AccessVariant::Surface) {
+            if (frame.size() != ipc::SurfaceAccessPayload::kSize) {
+                std::fprintf(stderr, "[gpu] core wire: bad Surface payload size %zu\n",
+                             frame.size());
+                std::abort();
+            }
+            uint32_t surfaceBufId = ipc::getU32LE(frame.data() + 1);
+            bool producer = frame[5] != 0;
+            // The core wire only carries the CONSUMER side (producer=false); the
+            // producer side rides each plugin connection's own wire (step 5).
+            if (producer) {
+                std::fprintf(stderr, "[gpu] core wire: producer Surface frame on "
+                                     "core wire (buf=%u) -- wrong socket\n", surfaceBufId);
+                std::abort();
+            }
+            if (kind == ipc::FrameKind::BeginAccess) {
+                if (!runSurfaceBegin(surfaceBufId, false)) {
+                    std::fprintf(stderr,
+                        "[gpu] in-band consumer Begin failed (buf=%u) -- "
+                        "JS gate or state-machine bug\n", surfaceBufId);
+                    std::abort();
+                }
+            } else {
+                runSurfaceEnd(surfaceBufId, false);
+            }
+        } else {
+            std::fprintf(stderr, "[gpu] core wire: unknown access variant %u\n",
+                         static_cast<unsigned>(frame[0]));
+            std::abort();
+        }
     };
 
     // Drain the core wire barrier: any deferred ctrl op whose serial the wire
@@ -775,6 +904,38 @@ int run(int wireFd, int ctrlFd, int inputFd, bool headless,
                     wsd2.serializer = pc->serializer.get();
                     wsd2.useSpontaneousCallbacks = true;  // RequestDevice cb over wire
                     pc->server = std::make_unique<dawn::wire::WireServer>(wsd2);
+                    // In-band producer Begin/End dispatch on this plugin wire.
+                    // Only producer Surface frames are valid here (the consumer
+                    // rides the core wire). Hard-fail on anything else.
+                    const uint32_t connId = m.connId;
+                    pc->dispatchControl =
+                        [&runSurfaceBegin, &runSurfaceEnd, connId](
+                            ipc::FrameKind kind, const std::vector<uint8_t>& frame) {
+                        if (frame.size() != ipc::SurfaceAccessPayload::kSize ||
+                            static_cast<ipc::AccessVariant>(frame[0]) != ipc::AccessVariant::Surface) {
+                            std::fprintf(stderr,
+                                "[gpu] plugin conn %u: non-Surface control frame\n", connId);
+                            std::abort();
+                        }
+                        uint32_t surfaceBufId = ipc::getU32LE(frame.data() + 1);
+                        bool producer = frame[5] != 0;
+                        if (!producer) {
+                            std::fprintf(stderr,
+                                "[gpu] plugin conn %u: consumer frame on plugin wire "
+                                "(buf=%u) -- wrong socket\n", connId, surfaceBufId);
+                            std::abort();
+                        }
+                        if (kind == ipc::FrameKind::BeginAccess) {
+                            if (!runSurfaceBegin(surfaceBufId, true)) {
+                                std::fprintf(stderr,
+                                    "[gpu] in-band producer Begin failed (buf=%u) -- "
+                                    "JS gate or state-machine bug\n", surfaceBufId);
+                                std::abort();
+                            }
+                        } else {
+                            runSurfaceEnd(surfaceBufId, true);
+                        }
+                    };
                     std::printf("[gpu] AddWireConn: connId=%u fd=%d registered\n",
                                 m.connId, connFd);
                     pluginConns.push_back(std::move(pc));
@@ -939,87 +1100,7 @@ int run(int wireFd, int ctrlFd, int inputFd, bool headless,
                             wireReader.bytesConsumed());
                     }
                 }
-            } else if (m.tag == ipc::Tag::ProducerBegin ||
-                       m.tag == ipc::Tag::ConsumerBegin) {
-                // Open a producer (write) or consumer (read) access bracket on the
-                // surface buffer, WAITING the other side's last fence (C-M1
-                // cross-device fence, in-process here). The dmabuf's Vulkan layout
-                // continues from the last EndAccess. Reply *Done so the core/plugin
-                // proceeds only once the bracket + fence wait are in.
-                const bool producer = (m.tag == ipc::Tag::ProducerBegin);
-                ipc::Message reply{};
-                reply.tag = producer ? ipc::Tag::ProducerBeginDone : ipc::Tag::ConsumerBeginDone;
-                reply.surfaceBufId = m.surfaceBufId;
-                reply.ok = 0;
-                auto it = surfaceBufs.find(m.surfaceBufId);
-                if (it == surfaceBufs.end()) {
-                    std::fprintf(stderr, "[gpu] %sBegin: unknown surfaceBufId=%u\n",
-                                 producer ? "Producer" : "Consumer", m.surfaceBufId);
-                    ipc::sendMessage(ctrlFd, reply);
-                } else {
-                    SurfaceBuf& sb = it->second;
-                    wgpu::SharedTextureMemory& mem = producer ? sb.producerMem : sb.consumerMem;
-                    wgpu::Texture& tex = producer ? sb.producerTex : sb.consumerTex;
-                    // Producer waits the consumer's last fence; consumer waits the
-                    // producer's last fence.
-                    wgpu::SharedFence& wait = producer ? sb.consumerFence : sb.producerFence;
-                    // First producer access begins UNDEFINED + uninitialized; all
-                    // else continues from the last reported layout, initialized.
-                    bool firstProduce = producer && !sb.everProduced;
-                    wgpu::SharedTextureMemoryVkImageLayoutBeginState layout{};
-                    layout.oldLayout = firstProduce ? 0 : sb.layout;
-                    layout.newLayout = 1;  // GENERAL (render + sample capable)
-                    wgpu::SharedTextureMemoryBeginAccessDescriptor bad{};
-                    bad.nextInChain = &layout;
-                    bad.initialized = !firstProduce;
-                    uint64_t signaled = 1;
-                    if (wait) {
-                        bad.fenceCount = 1;
-                        bad.fences = &wait;
-                        bad.signaledValueCount = 1;
-                        bad.signaledValues = &signaled;
-                    } else {
-                        bad.fenceCount = 0;
-                    }
-                    if (mem.BeginAccess(tex, &bad) != wgpu::Status::Success) {
-                        std::fprintf(stderr, "[gpu] %sBegin: BeginAccess failed (buf=%u)\n",
-                                     producer ? "Producer" : "Consumer", m.surfaceBufId);
-                    } else {
-                        if (producer) { sb.everProduced = true; sb.producerOpen = true; }
-                        else sb.consumerOpen = true;
-                        reply.ok = 1;
-                    }
-                    ipc::sendMessage(ctrlFd, reply);
-                }
-            } else if (m.tag == ipc::Tag::ProducerEnd) {
-                // Defer the producer EndAccess on the plugin conn's wire barrier:
-                // the render commands go over the plugin wire, this message over
-                // ctrl, and ctrl can overtake the wire. The barrier holds the
-                // EndAccess until the plugin wire reader has consumed at least
-                // `m.wireSerial` framed bytes (i.e. the render is in).
-                auto it = surfaceBufs.find(m.surfaceBufId);
-                if (it != surfaceBufs.end()) {
-                    PluginConn* pc = nullptr;
-                    for (auto& c : pluginConns)
-                        if (c->connId == it->second.connId) { pc = c.get(); break; }
-                    if (pc) {
-                        const uint32_t bufId = m.surfaceBufId;
-                        pc->barrier.after(
-                            m.wireSerial,
-                            [&runSurfaceEnd, bufId] { runSurfaceEnd(bufId, true); },
-                            pc->reader->bytesConsumed(),
-                            producerEndTag(bufId));
-                    }
-                }
-                // No reply (fire-and-forget; ordering preserved by the consumer's
-                // next Begin waiting the held producer fence).
-            } else if (m.tag == ipc::Tag::ConsumerEnd) {
-                // Consumer's sample commands also go over a wire (the CORE wire),
-                // but the core flushes + drives its own wire before sending this;
-                // the consumer EndAccess fence is only waited by the producer's
-                // NEXT frame, so run immediately.
-                runSurfaceEnd(m.surfaceBufId, false);
-             } else if (m.tag == ipc::Tag::ReleaseSurfaceBuf) {
+            } else if (m.tag == ipc::Tag::ReleaseSurfaceBuf) {
                  // Destroy a ring slot's surfaceBuf. The core sends this only after it
                  // has gated on its own GPU read completing (afterCurrentFrame), so no
                  // consumer read is in flight. End any still-open access bracket before
@@ -1028,19 +1109,18 @@ int run(int wireFd, int ctrlFd, int inputFd, bool headless,
                  auto it = surfaceBufs.find(m.surfaceBufId);
                 if (it != surfaceBufs.end()) {
                     SurfaceBuf& sb = it->second;
-                    // Drop any deferred ProducerEnd / AllocSurfaceBuf inject for
-                    // this buf on the owning plugin conn's barrier (their wire
-                    // serial may never arrive now; the EndAccess below covers
-                    // the producer side, and a yet-to-run alloc inject would
-                    // target a surfaceBuf we're tearing down).
+                    // Drop any deferred AllocSurfaceBuf inject for this buf on the
+                    // owning plugin conn's barrier (its wire serial may never
+                    // arrive now; a yet-to-run alloc inject would target a
+                    // surfaceBuf we're tearing down). Producer/consumer End are
+                    // in-band on the wire now, not deferred ctrl ops.
                     PluginConn* pc = nullptr;
                     for (auto& c : pluginConns)
                         if (c->connId == sb.connId) { pc = c.get(); break; }
                     if (pc) {
-                        const auto pTag = producerEndTag(m.surfaceBufId);
                         const auto aTag = allocSurfaceBufTag(m.surfaceBufId);
-                        pc->barrier.cancel([pTag, aTag](ipc::WireBarrier::Tag t) {
-                            return t == pTag || t == aTag;
+                        pc->barrier.cancel([aTag](ipc::WireBarrier::Tag t) {
+                            return t == aTag;
                         });
                     }
                     if (sb.producerOpen) runSurfaceEnd(m.surfaceBufId, true);
@@ -1164,24 +1244,6 @@ int run(int wireFd, int ctrlFd, int inputFd, bool headless,
                         wireReader.bytesConsumed(),
                         importFdTag(texId));
                 }
-            } else if (m.tag == ipc::Tag::BeginClientAccess) {
-                runBeginClientAccess(m);
-            } else if (m.tag == ipc::Tag::EndClientAccess) {
-                // Defer the EndAccess on the CORE wire barrier: the
-                // compositor's sample commands ride the core wire, this
-                // message rides ctrl, and ctrl can overtake wire. Hold the
-                // EndAccess until the wire reader has consumed at least
-                // `m.wireSerial` framed bytes (the wire commands that
-                // sampled the texture have been HandleCommands'd).
-                const uint32_t texId = m.texture.id;
-                const uint32_t texGen = m.texture.generation;
-                coreWireBarrier.after(
-                    m.wireSerial,
-                    [&runEndClientAccess, texId, texGen] {
-                        runEndClientAccess(texId, texGen);
-                    },
-                    wireReader.bytesConsumed(),
-                    endClientAccessTag(texId));
             } else if (m.tag == ipc::Tag::ReleaseClientTex) {
                 // Release a JS-compositor dmabuf import: drop the STM + close the
                 // fd, but only if the entry's generation still matches (the handle

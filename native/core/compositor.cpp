@@ -314,7 +314,6 @@ void Compositor::releaseSurfaceBuf(uint32_t surfaceBufId) {
         coreSurfaceReservations_.erase(it);
     }
     surfaceBufAllocated_.erase(surfaceBufId);
-    surfaceBeginDone_.erase(surfaceBufId);
 }
 
 void Compositor::takeCompletedJsImports(std::vector<JsImportDone>& out) {
@@ -335,18 +334,6 @@ void Compositor::drainCtrl() {
         }
         if (r.tag == ipc::Tag::PluginInstanceInjected) {
             pluginInstanceInjected_[r.connId] = r.ok ? 1 : 2;
-            continue;
-        }
-        if (r.tag == ipc::Tag::ProducerBeginDone) {
-            surfaceBeginDone_[r.surfaceBufId] = r.ok ? 1 : 3;
-            continue;
-        }
-        if (r.tag == ipc::Tag::ConsumerBeginDone) {
-            surfaceBeginDone_[r.surfaceBufId] = r.ok ? 2 : 3;
-            continue;
-        }
-        if (r.tag == ipc::Tag::BeginClientAccessDone) {
-            clientBeginDone_[r.texture.id] = r.ok ? 1 : 2;
             continue;
         }
         if (r.tag == ipc::Tag::SurfaceBufAllocated) {
@@ -455,86 +442,45 @@ WGPUTexture Compositor::coreSurfaceTexture(uint32_t surfaceBufId) const {
                                                 : it->second.reservation().texture;
 }
 
-void Compositor::sendProducerBegin(uint32_t surfaceBufId) {
-    surfaceBeginDone_[surfaceBufId] = 0;
-    ipc::Message m{}; m.tag = ipc::Tag::ProducerBegin; m.surfaceBufId = surfaceBufId;
-    ipc::sendMessage(ctrlFd_, m);
-}
-void Compositor::sendProducerEnd(uint32_t surfaceBufId, uint64_t pluginWireSerial) {
-    ipc::Message m{}; m.tag = ipc::Tag::ProducerEnd; m.surfaceBufId = surfaceBufId;
-    m.wireSerial = pluginWireSerial;
-    ipc::sendMessage(ctrlFd_, m);
-}
-void Compositor::sendConsumerBegin(uint32_t surfaceBufId) {
-    surfaceBeginDone_[surfaceBufId] = 0;
-    ipc::Message m{}; m.tag = ipc::Tag::ConsumerBegin; m.surfaceBufId = surfaceBufId;
-    ipc::sendMessage(ctrlFd_, m);
-}
-void Compositor::sendConsumerEnd(uint32_t surfaceBufId) {
-    ipc::Message m{}; m.tag = ipc::Tag::ConsumerEnd; m.surfaceBufId = surfaceBufId;
-    ipc::sendMessage(ctrlFd_, m);
-}
-int Compositor::surfaceBeginDone(uint32_t surfaceBufId) const {
-    auto it = surfaceBeginDone_.find(surfaceBufId);
-    return it == surfaceBeginDone_.end() ? 0 : it->second;
-}
-
-bool Compositor::beginClientAccessSync(uint32_t importId) {
-    // Look up the texture handle this importId resolves to (set on
-    // ClientTexImported in drainCtrl, line ~382).
+bool Compositor::writeClientTexBeginAccess(uint32_t importId) {
     auto wh = jsImportHandles_.find(importId);
     if (wh == jsImportHandles_.end()) {
-        std::fprintf(stderr, "[core] beginClientAccessSync: no handle for importId=%u\n",
+        std::fprintf(stderr, "[core] writeClientTexBeginAccess: no handle for importId=%u\n",
                      importId);
         return false;
     }
-    const uint32_t texId = wh->second.id;
-    const uint32_t texGen = wh->second.generation;
-
-    // Send BeginClientAccess.
-    ipc::Message m{};
-    m.tag = ipc::Tag::BeginClientAccess;
-    m.texture = {texId, texGen};
-    clientBeginDone_[texId] = 0;
-    ipc::sendMessage(ctrlFd_, m);
-
-    // Spin-drain ctrl until BeginClientAccessDone for this texId lands. Other
-    // reply types (plugin Begin/End-done, ClientTexImported, etc.) are
-    // dispatched through the same drainCtrl path so nothing is stranded.
-    //
-    // The deadline cap is generous (50ms = 3+ vsync periods) so a transient
-    // GPU-process schedule delay doesn't fail the frame; if it ever fires
-    // there is a real bug (the GPU process is stuck, not slow).
-    constexpr int kDeadlineMs = 50;
-    constexpr int kSleepUs = 50;  // 50us between polls
-    const int kIterations = (kDeadlineMs * 1000) / kSleepUs;
-    for (int i = 0; i < kIterations; ++i) {
-        drainCtrl();
-        auto it = clientBeginDone_.find(texId);
-        if (it != clientBeginDone_.end() && it->second != 0) {
-            const bool ok = it->second == 1;
-            clientBeginDone_.erase(it);
-            return ok;
-        }
-        ::usleep(kSleepUs);
-    }
-    std::fprintf(stderr, "[core] beginClientAccessSync: timed out waiting for BeginClientAccessDone "
-                 "importId=%u tex={%u,%u}\n", importId, texId, texGen);
-    clientBeginDone_.erase(texId);
-    return false;
+    ipc::ClientTexAccessPayload p{wh->second.id, wh->second.generation};
+    uint8_t buf[ipc::ClientTexAccessPayload::kSize];
+    p.encode(buf);
+    link_->appendFrame(ipc::FrameKind::BeginAccess, buf, sizeof(buf));
+    return true;
 }
 
-void Compositor::sendEndClientAccess(uint32_t importId, uint64_t coreWireSerial) {
+void Compositor::writeClientTexEndAccess(uint32_t importId) {
     auto wh = jsImportHandles_.find(importId);
     if (wh == jsImportHandles_.end()) {
-        std::fprintf(stderr, "[core] sendEndClientAccess: no handle for importId=%u\n", importId);
+        std::fprintf(stderr, "[core] writeClientTexEndAccess: no handle for importId=%u\n",
+                     importId);
         return;
     }
-    ipc::Message m{};
-    m.tag = ipc::Tag::EndClientAccess;
-    m.texture = {wh->second.id, wh->second.generation};
-    m.wireSerial = coreWireSerial;
-    ipc::sendMessage(ctrlFd_, m);
+    ipc::ClientTexAccessPayload p{wh->second.id, wh->second.generation};
+    uint8_t buf[ipc::ClientTexAccessPayload::kSize];
+    p.encode(buf);
+    link_->appendFrame(ipc::FrameKind::EndAccess, buf, sizeof(buf));
+}
+
+void Compositor::writeConsumerBeginAccess(uint32_t surfaceBufId) {
+    ipc::SurfaceAccessPayload p{surfaceBufId, /*producer=*/false};
+    uint8_t buf[ipc::SurfaceAccessPayload::kSize];
+    p.encode(buf);
+    link_->appendFrame(ipc::FrameKind::BeginAccess, buf, sizeof(buf));
+}
+
+void Compositor::writeConsumerEndAccess(uint32_t surfaceBufId) {
+    ipc::SurfaceAccessPayload p{surfaceBufId, /*producer=*/false};
+    uint8_t buf[ipc::SurfaceAccessPayload::kSize];
+    p.encode(buf);
+    link_->appendFrame(ipc::FrameKind::EndAccess, buf, sizeof(buf));
 }
 
 Compositor::PluginConnHandle Compositor::addWireConnection() {

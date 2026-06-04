@@ -26,10 +26,6 @@ const pAlloc = (
     a.pluginAllocSurfaceBufferW(connId, w, h, ptId, ptGen, pdId, pdGen,
       pluginReservePointSerial,
       (r: { surfaceBufId: number } | null) => r ? res(r) : rej(new Error("allocSurfaceBuffer"))));
-const pProducerBegin = (a: Addon, id: number) => new Promise<void>((res, rej) =>
-  a.pluginSurfaceProducerBegin(id, (ok: boolean) => ok ? res() : rej(new Error("producerBegin"))));
-const pConsumerBegin = (a: Addon, id: number) => new Promise<void>((res, rej) =>
-  a.pluginSurfaceConsumerBegin(id, (ok: boolean) => ok ? res() : rej(new Error("consumerBegin"))));
 
 // A logical overlay surface backed by a ring of slots (each slot is one shared
 // dmabuf with its own surfaceBufId). The producer renders into one slot while the
@@ -141,8 +137,9 @@ export function createGpuBroker(deps: GpuBrokerDeps) {
           reservePointSerial);
         surf.slots.push(alloc.surfaceBufId);
         surfaceByBuf.set(alloc.surfaceBufId, surf);
-        // Open the producer bracket on this slot so the plugin can render into it.
-        await pProducerBegin(addon, alloc.surfaceBufId);
+        // The producer bracket is opened by the Worker itself, in-band on the
+        // plugin wire, when it first acquires this slot (gpu.ts getCurrentTexture
+        // -> plugin.writeBeginAccess). The broker no longer mediates it.
         return { surfaceBufId: alloc.surfaceBufId };
       }
       case "surface.present": {
@@ -151,44 +148,43 @@ export function createGpuBroker(deps: GpuBrokerDeps) {
         const slotBufId = p.surfaceBufId as number;  // the slot's surfaceBufId
         const surf = surfaceByBuf.get(slotBufId);
         if (connId === undefined || !surf) throw new Error("present: unknown surface");
-        // Producer done on the presented slot (deferred on the plugin-wire serial).
-        addon.pluginSurfaceProducerEndW(slotBufId, (p.wireSerial as bigint) ?? 0n);
+        // Producer End was written by the Worker in-band on the plugin wire
+        // (gpu.ts present -> plugin.writeEndAccess) right after its render submit;
+        // the broker no longer mediates it.
         // Switch the consumer read bracket to the just-presented slot. OPEN the new
         // bracket + install its texture BEFORE freeing the old one, so the surface
         // always has an open, valid consumer bracket when renderFrame samples it.
         const prevIdx = surf.consumerSlot;
-        await pConsumerBegin(addon, slotBufId);      // waits this slot's producer fence
+        // Open the consumer read bracket in-band on the core wire. The kind=1
+        // frame is FIFO-ordered before the next compositor sample batch, so the
+        // bracket (with its wait on this slot's producer fence) is in before
+        // renderFrame's samples are decoded -- no ctrl round-trip to await.
+        addon.writeConsumerBegin(slotBufId);
         const tex = dawn.wrapTexture(coreDeviceHandle, addon.pluginConsumerTexture(slotBufId));
         compositor.setSurfaceTexture?.(surf.surfaceId, tex, surf.width, surf.height);
         surf.consumerSlot = slotIdx;
         // The just-presented slot is the new latest (the worker CAS'd it to
         // PRESENTED). Demote + recycle the PREVIOUS slot: PRESENTED->DRAINING now,
-        // then free it (DRAINING->FREE) + end its consumer bracket + reopen its
-        // producer bracket ONLY after the compositor submit that last sampled it
-        // completes on the GPU (afterCurrentFrame) -- else EndAccess races the read.
+        // then end its consumer bracket + free it (DRAINING->FREE) ONLY after the
+        // compositor submit that last sampled it completes on the GPU
+        // (afterCurrentFrame) -- else the consumer EndAccess races the read.
         if (prevIdx >= 0 && prevIdx !== slotIdx) {
           const prevBufId = surf.slots[prevIdx];
           surf.slotStates.demote(prevIdx);           // PRESENTED -> DRAINING (atomic)
           const recycle = (): void => {
-            // Bail if the surface was destroyed since this was queued: its slots may
-            // already be freed by the teardown, so touching them would fail (and a
-            // rejected producerBegin would otherwise be unhandled).
+            // Bail if the surface was destroyed since this was queued: its slots
+            // may already be freed by the teardown.
             if (!surf.alive) return;
-            addon.pluginSurfaceConsumerEnd(prevBufId);
-            // Reopen the producer bracket, THEN publish the slot as FREE. The FREE
-            // edge wakes the worker, which immediately CAS-acquires the slot and
-            // renders into it -- so the slot must NOT become claimable until its
-            // producer BeginAccess bracket is actually open on the GPU process, or
-            // the worker submits render commands with no open access bracket ("used
-            // in a submit without current access" on the producer device, which
-            // faults the worker wire). Gating free() on producerBegin's completion
-            // keeps the SAB FREE state and the GPU bracket state consistent.
-            pProducerBegin(addon, prevBufId).then(() => {
-              if (!surf.alive) return;                // destroyed while reopening
-              surf.slotStates.free(prevIdx);          // DRAINING -> FREE; wakes producer
-            }).catch((e: unknown) => {
-              console.warn(`[gpu-broker] producerBegin (recycle) failed:`, e);
-            });
+            // End the prior slot's consumer bracket in-band. The afterCurrentFrame
+            // gate (this runs inside `recycle`) already ensured the GPU read of
+            // this slot completed; the kind=2 frame closes the decode-side bracket.
+            addon.writeConsumerEnd(prevBufId);
+            // Publish the slot as FREE. The producer bracket is now opened by the
+            // Worker itself when it re-acquires this slot (gpu.ts getCurrentTexture
+            // -> writeBeginAccess, FIFO-ordered before its render on the plugin
+            // wire), so the broker no longer reopens it or gates free() on it --
+            // the bracket-open/render ordering is intrinsic to the plugin wire.
+            surf.slotStates.free(prevIdx);            // DRAINING -> FREE; wakes producer
           };
           if (compositor.afterCurrentFrame) compositor.afterCurrentFrame(recycle);
           else recycle();
@@ -217,7 +213,7 @@ export function createGpuBroker(deps: GpuBrokerDeps) {
         const slotBufIds = surf.slots.slice();
         const heldConsumerBuf = surf.consumerSlot >= 0 ? surf.slots[surf.consumerSlot] : -1;
         const teardown = (): void => {
-          if (heldConsumerBuf >= 0) addon.pluginSurfaceConsumerEnd(heldConsumerBuf);
+          if (heldConsumerBuf >= 0) addon.writeConsumerEnd(heldConsumerBuf);
           for (const bufId of slotBufIds) addon.pluginReleaseSurfaceBuffer(bufId);
           for (const bufId of slotBufIds) surfaceByBuf.delete(bufId);
         };

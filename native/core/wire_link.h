@@ -45,6 +45,13 @@ class WireLink {
     // fatal socket error.
     bool flush() { return serializer_->Flush(); }
 
+    // Emit an in-band control frame (kind != 0) on the wire socket. Flushes any
+    // staged Dawn (kind=0) bytes first so the kind switch is a clean FIFO
+    // boundary (see FdSerializer::appendFrame). Non-blocking.
+    bool appendFrame(ipc::FrameKind kind, const void* payload, size_t len) {
+        return serializer_->appendFrame(kind, payload, len);
+    }
+
     // Drain the outbound wire queue as far as the socket accepts. Call when the
     // wire fd is writable. Returns false on fatal error.
     bool pumpOut() { return serializer_->pumpOut(); }

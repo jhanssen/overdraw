@@ -117,6 +117,26 @@ class WorkerWireClient {
     // handle id). No-op if the id is unknown.
     void forgetProducerReservation(uint32_t surfaceBufId);
 
+    // In-band producer Begin/End on THIS plugin wire: write a kind=1/kind=2
+    // Surface frame (producer=true) for `surfaceBufId`. Begin's FIFO position
+    // before the Worker's render commands opens the producer bracket in time;
+    // End's position after the render submit closes it after the GPU process
+    // decodes those commands. Replaces the core-mediated ProducerBegin/
+    // ProducerEnd ctrl path and its plugin-wire WireBarrier deferral.
+    // appendFrame flushes staged Dawn bytes first, so the caller does NOT flush.
+    void writeBeginAccess(uint32_t surfaceBufId) {
+        ipc::SurfaceAccessPayload p{surfaceBufId, /*producer=*/true};
+        uint8_t buf[ipc::SurfaceAccessPayload::kSize];
+        p.encode(buf);
+        link_->appendFrame(ipc::FrameKind::BeginAccess, buf, sizeof(buf));
+    }
+    void writeEndAccess(uint32_t surfaceBufId) {
+        ipc::SurfaceAccessPayload p{surfaceBufId, /*producer=*/true};
+        uint8_t buf[ipc::SurfaceAccessPayload::kSize];
+        p.encode(buf);
+        link_->appendFrame(ipc::FrameKind::EndAccess, buf, sizeof(buf));
+    }
+
     void markSharedWithJs() { link_->markSharedWithExternal(); }
     void flush() { link_->flush(); }
     uint64_t wireBytesQueued() const { return link_->wireBytesQueued(); }

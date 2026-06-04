@@ -87,7 +87,9 @@ node-addon-api, to avoid exception/RTTI dependence under `-fno-rtti`).
 
 ### IPC (three sockets, fully non-blocking)
 
-- **Dawn wire** over one `SOCK_STREAM` socket (length-prefixed frames).
+- **Dawn wire** over one `SOCK_STREAM` socket (length-prefixed, kind-tagged
+  frames: `[len][kind][payload]`; kind=0 is Dawn wire bytes, kind=1/kind=2 are
+  in-band access-bracket Begin/End frames — see INBAND-ACCESS.md).
 - **Control side channel** over a `SOCK_SEQPACKET` socket carrying fixed-size
   tagged POD messages (`native/ipc/side_channel.h`) — not flatbuffers. SCM_RIGHTS
   fd passing is used (e.g. `ImportClientTex` carries a client dmabuf fd).
@@ -108,13 +110,19 @@ when queued). Blocking shims remain only for one-shot startup/handshake.
   output is queued (`armWirePoll`/`wirePumpOut`).
 - Wire socket buffers enlarged to 8 MiB; userspace buffering covers overflow.
 
-**Cross-channel ordering.** A control request (`ImportClientTex`) must not overtake
-the wire commands it depends on (the GPU's `InjectTexture` requires the server to
-have processed the prior `UnregisterObjectCmd` that recycles the handle at
-generation+1). Enforced by a wire serial: `FdSerializer` counts cumulative framed
-wire bytes; the core tags `ImportClientTex` with that value; the GPU process defers
-the import until its consumed-byte count reaches the serial. An explicit
-happens-before across the two sockets, no blocking.
+**Cross-channel ordering.** A control request (`ImportClientTex`, and the
+producer/consumer `AllocSurfaceBuf` injects) must not overtake the wire commands it
+depends on (the GPU's `InjectTexture` requires the server to have processed the
+prior `UnregisterObjectCmd` that recycles the handle at generation+1). Enforced by
+a wire serial: `FdSerializer` counts cumulative framed wire bytes; the core tags
+the request with that value; the GPU process defers it (via `ipc::WireBarrier`)
+until its consumed-byte count reaches the serial. An explicit happens-before across
+the two sockets, no blocking. These are the only remaining per-buffer-lifetime
+cross-channel deferrals: the per-FRAME access brackets (client-texture Begin/End,
+producer/consumer Begin/End) no longer ride ctrl at all — they are multiplexed
+in-band on the wire socket as kind=1/kind=2 frames, FIFO-ordered against the Dawn
+commands, removing both the synchronous Begin round-trip and the EndAccess
+WireBarrier deferral (see INBAND-ACCESS.md).
 
 ### GPU process threading
 
@@ -442,8 +450,13 @@ The cross-process plugin GPU path is built and pixel-verified end to end:
   Worker's wire) + `sdk.gpu.createOverlay({layer, anchor, size})` → a `Surface` with
   `getCurrentTexture()` + `present()`. `createOverlay` → the core overlay broker
   decides rect + layer and allocates the shared buffer ring; the plugin renders;
-  `present()` drives ProducerEnd → ConsumerBegin (waits the producer fence) → the
-  JS compositor samples the consumer texture at the overlay rect+layer.
+  `present()` drives producer-End → consumer-Begin (waits the producer fence) → the
+  JS compositor samples the consumer texture at the overlay rect+layer. The
+  access brackets ride the wire sockets IN-BAND (kind=1/kind=2 frames), not the
+  ctrl channel: producer Begin/End on the Worker's plugin wire, consumer Begin/End
+  on the core wire, each FIFO-ordered against the render/sample commands on the
+  same wire — no ctrl round-trip and no WireBarrier deferral in the per-frame path
+  (see INBAND-ACCESS.md). The cross-device fence dance itself is unchanged.
 - **Surface ring with SharedArrayBuffer slot-state** (`src/plugins/surface-
   slots.ts`): 3 slots, each a shared dmabuf, with one Int32 per slot transitioning
   via atomic CAS (`FREE → ACQUIRED → PRESENTED → DRAINING → FREE`).

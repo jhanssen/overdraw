@@ -17,6 +17,7 @@
 
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <cerrno>
 #include <deque>
@@ -42,14 +43,36 @@ inline bool setNonBlocking(int fd) {
 }
 
 // ---------------------------------------------------------------------------
-// Wire (SOCK_STREAM): length-prefixed frames, buffered non-blocking I/O.
+// Wire (SOCK_STREAM): length-prefixed, kind-tagged frames, buffered NB I/O.
 // ---------------------------------------------------------------------------
 
+// Frame kinds multiplexed on the wire socket. kind=0 is Dawn wire bytes (the
+// only payload Dawn ever produces); kind != 0 are overdraw-internal control
+// frames (access brackets) that ride the same FIFO so they are ordered against
+// the Dawn commands around them without a cross-channel barrier.
+enum class FrameKind : uint8_t {
+    WireBytes = 0,    // Dawn wire command batch -> WireServer::HandleCommands
+    BeginAccess = 1,  // overdraw BeginAccess bracket (payload: variant + ids)
+    EndAccess = 2,    // overdraw EndAccess bracket   (payload: variant + ids)
+};
+
+// Per-frame header overhead in the byte-accounting counters. The wire format is
+// [length: u32 LE][kind: u8][payload...], where `length` counts kind + payload.
+// CONTRACT (load-bearing, do not break unilaterally): FdSerializer::bytesQueued
+// (sender) and FrameReader::bytesConsumed (receiver) MUST both add exactly this
+// many bytes per frame on top of the payload, or WireBarrier's serial comparison
+// (used for ImportClientTex's recycled-handle ordering) drifts off-by-N per frame
+// and silently re-admits the race. Both counters use this same constant so the
+// two sides cannot diverge without editing one shared definition.
+inline constexpr uint64_t kFrameHeaderBytes = 4u /*length prefix*/ + 1u /*kind*/;
+
 // dawn::wire::CommandSerializer over a non-blocking stream socket. Dawn batches
-// commands between Flush() calls; on Flush we frame the batch (4-byte LE length
-// + payload) into the outbound queue and write as much as the socket accepts.
-// Flush NEVER blocks. The owner must call pumpOut() when the fd becomes
-// writable (and may call it opportunistically) to drain the rest.
+// commands between Flush() calls; on Flush we frame the batch
+// ([len][kind=0][payload]) into the outbound queue and write what the socket
+// accepts. Flush NEVER blocks. The owner must call pumpOut() when the fd becomes
+// writable (and may call it opportunistically) to drain the rest. appendFrame()
+// emits non-Dawn (kind != 0) control frames on the SAME queue, flushing any
+// staged Dawn bytes first so the kind switch is a clean FIFO boundary.
 class FdSerializer : public dawn::wire::CommandSerializer {
   public:
     explicit FdSerializer(int fd) : fd_(fd) { buf_.resize(kCapacity); }
@@ -67,25 +90,35 @@ class FdSerializer : public dawn::wire::CommandSerializer {
         return buf_.data() + offset;
     }
 
-    // Frame the pending batch into the outbound queue, then try to flush. Never
-    // blocks. Returns false only on a fatal socket error (peer closed).
+    // Frame the pending Dawn batch ([len][kind=0][payload]) into the outbound
+    // queue, then try to flush. Never blocks. Returns false only on a fatal
+    // socket error (peer closed).
     bool Flush() override {
         if (pending_) {
-            uint32_t len = static_cast<uint32_t>(pending_);
-            const uint8_t* lp = reinterpret_cast<const uint8_t*>(&len);
-            out_.insert(out_.end(), lp, lp + 4);
-            out_.insert(out_.end(), buf_.data(), buf_.data() + pending_);
-            bytesQueued_ += 4u + pending_;  // framed bytes (length prefix + payload)
+            frame(FrameKind::WireBytes, buf_.data(), pending_);
             pending_ = 0;
         }
         return pumpOut();
     }
 
-    // Cumulative count of framed bytes ever enqueued (length prefixes + payload).
-    // Used as a cross-channel ordering serial: a side-channel request tagged with
-    // the value sampled after a Flush is only acted on by the peer once its wire
-    // reader has consumed at least that many bytes (i.e. all wire commands queued
-    // up to that point -- object creates, unregisters -- have been processed).
+    // Emit a non-Dawn control frame (kind != 0). UNCONDITIONALLY flushes any
+    // staged Dawn bytes first: the socket FIFO orders FRAMES, not the unflushed
+    // pending_ batch, so a control frame appended without draining pending_ would
+    // land ahead of Dawn commands the caller already issued. Building the flush
+    // in here makes the "kind switch is a flush boundary" invariant non-violable
+    // from callers. Flush() is a cheap no-op when pending_ is empty.
+    bool appendFrame(FrameKind kind, const void* payload, size_t len) {
+        Flush();  // drain staged Dawn bytes as a kind=0 frame (no-op if empty)
+        frame(kind, payload, len);
+        return pumpOut();
+    }
+
+    // Cumulative count of framed bytes ever enqueued (header + payload, see
+    // kFrameHeaderBytes). Used as a cross-channel ordering serial: a side-channel
+    // request tagged with the value sampled after a Flush is only acted on by the
+    // peer once its wire reader has consumed at least that many bytes (i.e. all
+    // wire commands queued up to that point -- object creates, unregisters --
+    // have been processed).
     uint64_t bytesQueued() const { return bytesQueued_; }
 
     // Write as much of the outbound queue as the socket accepts right now.
@@ -115,6 +148,19 @@ class FdSerializer : public dawn::wire::CommandSerializer {
     static constexpr size_t kMaxAllocation = 1u << 20;     // 1 MiB (one command)
     static constexpr size_t kCapacity = 16u * (1u << 20);  // 16 MiB batch headroom
     static constexpr size_t kChunk = 256u * 1024u;         // write granularity
+
+    // Append one [length: u32 LE][kind: u8][payload] frame to the outbound queue
+    // and advance the byte-accounting counter. `length` = 1 (kind) + payload len.
+    // Does not write to the socket; callers follow with pumpOut().
+    void frame(FrameKind kind, const void* payload, size_t payloadLen) {
+        uint32_t len = static_cast<uint32_t>(1u + payloadLen);  // kind + payload
+        const uint8_t* lp = reinterpret_cast<const uint8_t*>(&len);
+        out_.insert(out_.end(), lp, lp + 4);
+        out_.push_back(static_cast<uint8_t>(kind));
+        const uint8_t* p = static_cast<const uint8_t*>(payload);
+        out_.insert(out_.end(), p, p + payloadLen);
+        bytesQueued_ += kFrameHeaderBytes + payloadLen;
+    }
 
     int fd_;
     std::vector<uint8_t> buf_;       // current Dawn batch (pre-frame)
@@ -147,23 +193,46 @@ class FrameReader {
         return true;
     }
 
-    // Pop one complete frame into `out`. Returns true if a frame was available.
-    bool nextFrame(std::vector<uint8_t>& out) {
+    // Pop one complete frame: its kind byte into `kind`, payload into `out`.
+    // Returns true if a whole frame was buffered. Wire format is
+    // [length: u32 LE][kind: u8][payload], length counting kind + payload.
+    bool nextFrame(FrameKind& kind, std::vector<uint8_t>& out) {
         size_t avail = in_.size() - rd_;
         if (avail < 4) return false;
         uint32_t len;
         std::memcpy(&len, in_.data() + rd_, 4);
-        if (avail < 4u + len) return false;
-        out.assign(in_.begin() + rd_ + 4, in_.begin() + rd_ + 4 + len);
+        if (len < 1) return false;             // malformed: must hold a kind byte
+        if (avail < 4u + len) return false;    // frame not fully buffered yet
+        kind = static_cast<FrameKind>(in_[rd_ + 4]);
+        size_t payloadLen = len - 1u;
+        out.assign(in_.begin() + rd_ + 5, in_.begin() + rd_ + 5 + payloadLen);
         rd_ += 4u + len;
-        bytesConsumed_ += 4u + len;  // framed bytes handed out (matches FdSerializer::bytesQueued)
+        // Header (kFrameHeaderBytes) + payload; mirrors FdSerializer exactly.
+        bytesConsumed_ += kFrameHeaderBytes + payloadLen;
         return true;
     }
 
-    // Cumulative framed bytes yielded via nextFrame. The peer's FdSerializer
-    // counts the same framed units, so comparing this against a wireSerial sent
-    // over the side channel tells us whether all wire commands up to that serial
-    // have been handed to the wire server (HandleCommands) yet.
+    // Compat overload for readers that only ever receive Dawn (kind=0) frames
+    // (e.g. the core's inbound GPU->core wire). A non-zero kind here is a
+    // protocol bug -- the peer wrote a control frame on a direction that has no
+    // dispatcher for it -- so surface it loudly rather than mis-handing the
+    // payload to the wire decoder, which would manifest as Dawn parsing garbage.
+    bool nextFrame(std::vector<uint8_t>& out) {
+        FrameKind kind;
+        if (!nextFrame(kind, out)) return false;
+        if (kind != FrameKind::WireBytes) {
+            std::fprintf(stderr,
+                "[ipc] FrameReader: unexpected non-Dawn frame kind=%u on a "
+                "wire-bytes-only direction\n", static_cast<unsigned>(kind));
+            std::abort();
+        }
+        return true;
+    }
+
+    // Cumulative framed bytes yielded via nextFrame (header + payload). The
+    // peer's FdSerializer counts the same units (kFrameHeaderBytes), so comparing
+    // this against a wireSerial sent over the side channel tells us whether all
+    // wire commands up to that serial have been handed to the wire server yet.
     uint64_t bytesConsumed() const { return bytesConsumed_; }
 
   private:

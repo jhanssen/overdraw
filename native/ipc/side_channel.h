@@ -33,37 +33,13 @@ enum class Tag : uint8_t {
     ReleaseClientTex = 'r',   // core -> gpu : release a client-dmabuf import (texture =
                               //              {id,generation}); GPU drops the STM + fd if
                               //              the entry's generation still matches.
-    // Per-frame BeginAccess/EndAccess bracket on a cached CLIENT dmabuf texture.
-    // The bracket is per-frame to fix the same-buffer re-commit flicker
-    // (docs/client-buffer-lifecycle.md): the prior model BeginAccess'd once at
-    // import and never EndAccess'd, so a re-commit was never re-acquired and
-    // the compositor sampled the texture concurrently with the client's GPU
-    // writes -> black frame. The new model opens a Begin per compositing frame
-    // that samples the texture, waiting on a freshly-exported dmabuf sync_file
-    // acquire fence, and Ends after the compositor's submit.
-    //
-    // BeginClientAccess is a ROUND-TRIP (returns BeginClientAccessDone) so the
-    // core only flushes wire sample commands once the GPU process has applied
-    // the Begin: ordering between ctrl and wire is one-way (ctrl-after-wire,
-    // via WireBarrier), so any ctrl op that must order-precede wire commands
-    // has to wait for an acknowledgement (see runSurfaceEnd / ProducerBegin
-    // for the established pattern).
-    //
-    // EndClientAccess is fire-and-forget, deferred on the core wire barrier
-    // (the End must wait until the GPU process's wire reader has consumed the
-    // compositor submit's bytes, otherwise the End closes the bracket before
-    // the wire commands that actually sample the texture are observed).
-    BeginClientAccess = 'Q',  // core->gpu: open per-frame BeginAccess on the
-                              //   cached client texture (`texture` = {id,gen}).
-                              //   GPU process re-exports the dmabuf sync_file
-                              //   from the held fd and waits it; chains the
-                              //   prior frame's exported EndAccess fence too.
-    BeginClientAccessDone = 'o',  // gpu->core: BeginAccess applied (ok=1) or failed (ok=0).
-                                  //   The core proceeds with wire sample commands.
-    EndClientAccess = 'Y',    // core->gpu: end the per-frame access on the
-                              //   cached client texture. Deferred on the core
-                              //   wire barrier until the wire reader has
-                              //   consumed `wireSerial` framed bytes.
+    // NOTE: the per-frame CLIENT-dmabuf BeginAccess/EndAccess bracket no longer
+    // rides ctrl. It is multiplexed in-band on the WIRE socket as a kind=1/kind=2
+    // frame (see transport.h FrameKind + side_channel.h ClientTexAccessPayload),
+    // FIFO-ordered against the Dawn sample commands -- no ctrl round-trip, no
+    // WireBarrier. The former tags ('Q' BeginClientAccess / 'o'
+    // BeginClientAccessDone / 'Y' EndClientAccess) are retired; do not reuse those
+    // letters without checking no in-flight build still emits them.
     BeginAccess  = 'B',  // core -> gpu : begin access on the STM (before wire render)
     BeginDone    = 'b',  // gpu  -> core: BeginAccess applied + flushed
     EndAccess    = 'E',  // core -> gpu : end access on the STM (after wire render)
@@ -102,23 +78,15 @@ enum class Tag : uint8_t {
                                 //   both devices (ok=1), or failed (ok=0). Carries
                                 //   the surfaceBufId the core uses for later
                                 //   Begin/EndAccess on this buffer.
-    // Per-frame producer/consumer fence dance on a surface buffer (C-M4 step 3),
-    // reusing the C-M1 cross-device fence. Both STMs live in the GPU process (the
-    // two imports of one dmabuf), so the sync-fds never cross a process boundary;
-    // these messages just drive the access brackets in the right order on the GPU
-    // timeline. `surfaceBufId` names the buffer. Each Begin has a *Done reply so
-    // the core/plugin only proceeds once the bracket (and its fence wait) is in.
-    ProducerBegin = 'G',  // core->gpu: producer BeginAccess (write). Waits the
-                          //   previous consumer fence (don't clobber a buffer the
-                          //   core is still reading).
-    ProducerBeginDone = 'q',  // gpu->core: producer bracket open (plugin may render)
-    ProducerEnd   = 'g',  // core->gpu: producer EndAccess (after plugin render).
-                          //   GPU holds the produced sync-fd for the consumer wait.
-    ConsumerBegin = 'V',  // core->gpu: consumer BeginAccess (read). Waits the
-                          //   producer fence (producer-done-before-read).
-    ConsumerBeginDone = 'k',  // gpu->core: consumer bracket open (core may sample)
-    ConsumerEnd   = 'v',  // core->gpu: consumer EndAccess (after sampling). GPU
-                          //   holds the produced sync-fd for the next ProducerBegin.
+    // NOTE: the per-frame producer/consumer fence-dance brackets on a surface
+    // buffer also no longer ride ctrl. Consumer Begin/End ride the CORE wire and
+    // producer Begin/End ride the owning PLUGIN wire, both as in-band kind=1/
+    // kind=2 Surface frames (SurfaceAccessPayload), FIFO-ordered against the
+    // render/sample commands on the same wire. The former tags ('G'/'q'/'g'
+    // Producer*, 'V'/'k'/'v' Consumer*) are retired; do not reuse those letters
+    // without checking no in-flight build still emits them. The cross-device
+    // fence dance itself is unchanged (runSurfaceBegin/runSurfaceEnd in the GPU
+    // process); only the trigger moved from ctrl to the wire.
     ReleaseSurfaceBuf = 'D',  // core->gpu: destroy a ring slot's surfaceBuf -- end any
                           //   open access bracket, drop the SharedTextureMemory/textures/
                           //   fences, release the GBM dmabuf. Fire-and-forget (the core
@@ -213,6 +181,65 @@ struct Message {
 };
 
 constexpr uint32_t kProtocolVersion = 1;
+
+// ---------------------------------------------------------------------------
+// In-band access-bracket frame payloads (FrameKind::BeginAccess / EndAccess).
+//
+// These ride the WIRE socket as kind != 0 frames (see transport.h FrameKind),
+// not the ctrl socket. The frame payload begins with a 1-byte variant
+// discriminating which Begin/End pair it is, since the three pairs key on
+// different server-side identifiers. Layouts (little-endian, packed by the
+// helpers below; no struct padding assumptions cross the socket):
+//
+//   variant=ClientTex : [variant:u8][textureId:u32][textureGeneration:u32]
+//   variant=Surface   : [variant:u8][surfaceBufId:u32][producer:u8]
+//
+// Begin and End use the SAME payload shape per variant (client-texture keys on
+// the (id,generation) wire handle for both; surface keys on surfaceBufId +
+// producer bit for both). Encoded/decoded only through these helpers so the
+// two processes cannot disagree on the byte layout.
+enum class AccessVariant : uint8_t {
+    ClientTex = 0,  // per-frame client dmabuf texture bracket (core wire)
+    Surface = 1,    // producer/consumer surface-buffer bracket (core/plugin wire)
+};
+
+// Append a u32 little-endian to a byte buffer.
+inline void putU32LE(uint8_t* p, uint32_t v) {
+    p[0] = static_cast<uint8_t>(v);
+    p[1] = static_cast<uint8_t>(v >> 8);
+    p[2] = static_cast<uint8_t>(v >> 16);
+    p[3] = static_cast<uint8_t>(v >> 24);
+}
+inline uint32_t getU32LE(const uint8_t* p) {
+    return static_cast<uint32_t>(p[0]) | (static_cast<uint32_t>(p[1]) << 8) |
+           (static_cast<uint32_t>(p[2]) << 16) | (static_cast<uint32_t>(p[3]) << 24);
+}
+
+// Client-texture Begin/End payload: variant + (id, generation). 9 bytes.
+struct ClientTexAccessPayload {
+    uint32_t textureId;
+    uint32_t textureGeneration;
+    static constexpr size_t kSize = 1 + 4 + 4;
+    void encode(uint8_t* out) const {
+        out[0] = static_cast<uint8_t>(AccessVariant::ClientTex);
+        putU32LE(out + 1, textureId);
+        putU32LE(out + 5, textureGeneration);
+    }
+};
+
+// Surface (producer/consumer) Begin/End payload: variant + surfaceBufId +
+// producer bit. 6 bytes. Used by the consumer (core wire) and producer (plugin
+// wire) paths.
+struct SurfaceAccessPayload {
+    uint32_t surfaceBufId;
+    bool producer;
+    static constexpr size_t kSize = 1 + 4 + 1;
+    void encode(uint8_t* out) const {
+        out[0] = static_cast<uint8_t>(AccessVariant::Surface);
+        putU32LE(out + 1, surfaceBufId);
+        out[5] = producer ? 1 : 0;
+    }
+};
 
 }  // namespace overdraw::ipc
 

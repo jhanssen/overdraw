@@ -38,7 +38,13 @@ interface PluginAddon {
   // that need to explicitly forget a slot would call this.
   forgetProducerReservation(clientId: number, resKey: number): void;
   flush(clientId: number): void;
-  wireBytesQueued(clientId: number): bigint;
+  // In-band producer Begin/End on the plugin wire (replaces the core-mediated
+  // ProducerBegin ctrl round-trip / ProducerEnd WireBarrier deferral). The
+  // Worker writes Begin as it claims a slot (kind=1, FIFO-ordered before its
+  // render commands) and End after its render submit (kind=2, after them).
+  // Synchronous; appendFrame flushes staged wire bytes first.
+  writeBeginAccess(clientId: number, surfaceBufId: number): void;
+  writeEndAccess(clientId: number, surfaceBufId: number): void;
 }
 interface DawnModule {
   wrapDevice(instanceHandle: bigint, deviceHandle: bigint): GPUDevice;
@@ -252,7 +258,17 @@ export async function createPluginGpu(
         // (watchdog pongs) while backpressured.
         for (;;) {
           const slot = slotStates.tryAcquire();
-          if (slot >= 0) { acquired = slot; return wrapSlot(slot); }
+          if (slot >= 0) {
+            acquired = slot;
+            // Open the producer write bracket in-band on the plugin wire BEFORE
+            // the plugin encodes render commands against this slot's texture.
+            // The kind=1 frame is FIFO-ordered before those commands, so the
+            // GPU process opens the bracket before HandleCommands decodes the
+            // render -- no "used in a submit without current access" fault, no
+            // ctrl round-trip, no broker-mediated reopen.
+            plugin.writeBeginAccess(clientId, slotBufId[slot]);
+            return wrapSlot(slot);
+          }
           // No free slot: wait until ANY slot's state changes, then retry. Wait on
           // slot 0; the core notifies the freed slot's index, but state changes are
           // infrequent enough that polling all on wake is fine -- re-loop tryAcquire.
@@ -265,13 +281,18 @@ export async function createPluginGpu(
         if (acquired < 0) throw new Error("surface.present() without a prior getCurrentTexture()");
         const slot = acquired;
         acquired = -1;
-        plugin.flush(clientId);
-        const wireSerial = plugin.wireBytesQueued(clientId);
+        // Close the producer write bracket in-band on the plugin wire AFTER the
+        // plugin's render submit. The kind=2 frame's FIFO position after the
+        // render's wire batch (appendFrame flushes it first) guarantees the GPU
+        // process closes the bracket only after decoding those commands, and
+        // exports the producer fence the consumer's next Begin waits on. No
+        // wireSerial tag, no ProducerEnd WireBarrier deferral.
+        plugin.writeEndAccess(clientId, slotBufId[slot]);
         // Ownership: ACQUIRED -> PRESENTED (atomic; the core demotes the prior
         // PRESENTED to DRAINING and frees it once its read completes).
         slotStates.present(slot);
         await endpoint.request("surface.present",
-          { connId: conn.connId, surfaceBufId: slotBufId[slot], slot, wireSerial });
+          { connId: conn.connId, surfaceBufId: slotBufId[slot], slot });
       },
       async destroy(): Promise<void> {
         if (destroyed) return;

@@ -65,19 +65,15 @@ export interface Addon {
                           modHi: number, modLo: number, offset: number, stride: number,
                           cb: (handle: bigint | null) => void): number;
   releaseDmabufImport(importId: number): void;
-  // Per-frame BeginAccess/EndAccess on a cached client dmabuf import. Layer C
-  // of docs/client-buffer-lifecycle.md. beginClientAccessSync is synchronous
-  // (blocking round-trip); endClientAccess is fire-and-forget, deferred on
-  // the core wire barrier until the wire reader has consumed wireSerial bytes.
-  beginClientAccessSync(importId: number): boolean;
-  endClientAccess(importId: number, wireSerial: bigint): void;
-  // The core's wire bytesQueued counter; sample AFTER flushCoreWire() to tag
-  // endClientAccess so the GPU process defers EndAccess until its wire reader
-  // catches up past that point. dawn.node's queue.submit does NOT itself
-  // flush, so an explicit flushCoreWire() is required first.
-  coreWireBytesQueued(): bigint;
-  // Force-flush the core's outbound wire client; pair with coreWireBytesQueued.
-  flushCoreWire(): void;
+  // In-band per-frame BeginAccess/EndAccess on a cached client dmabuf import
+  // (Layer C of docs/client-buffer-lifecycle.md): write a kind=1/kind=2 control
+  // frame on the core WIRE socket (not ctrl). FIFO-ordered against the Dawn
+  // sample commands, so no ctrl round-trip (the Node thread never blocks), no
+  // wireSerial, no WireBarrier. The addon flushes staged Dawn bytes before each
+  // frame. writeBeginAccess returns false iff the import is unknown (a JS-gate
+  // desync the caller surfaces).
+  writeBeginAccess(importId: number): boolean;
+  writeEndAccess(importId: number): void;
 
   // Plugin GPU brokering (core side; the Worker owns the wire client). Callbacks
   // are node-style (result|null or ok); the broker Promise-wraps them.
@@ -93,10 +89,13 @@ export interface Addon {
                             pdId: number, pdGen: number,
                             pluginReservePointSerial: bigint,
                             cb: (r: { surfaceBufId: number } | null) => void): void;
-  pluginSurfaceProducerBegin(surfaceBufId: number, cb: (ok: boolean) => void): void;
-  pluginSurfaceProducerEndW(surfaceBufId: number, wireSerial: bigint): void;
-  pluginSurfaceConsumerBegin(surfaceBufId: number, cb: (ok: boolean) => void): void;
-  pluginSurfaceConsumerEnd(surfaceBufId: number): void;
+  // In-band consumer Begin/End on the core wire. Synchronous frame writes:
+  // Begin's FIFO position before the next compositor sample opens the bracket
+  // in time; End is gated by the caller on afterCurrentFrame. No begin-done cb.
+  // (Producer Begin/End live on the plugin wire, written by the Worker; the
+  // core does not mediate them -- see src/plugins/gpu.ts.)
+  writeConsumerBegin(surfaceBufId: number): void;
+  writeConsumerEnd(surfaceBufId: number): void;
   pluginConsumerTexture(surfaceBufId: number): bigint;
   // Destroy a plugin ring slot's surfaceBuf (GPU process frees dmabuf/STM/textures;
   // core reclaims its reservation). Caller gates on the consumer GPU read completing.

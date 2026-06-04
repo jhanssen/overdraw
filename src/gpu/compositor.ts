@@ -62,28 +62,18 @@ export interface CompositorAddon {
   // Release a dmabuf import (drops the server STM + fd). Called once the buffer
   // is freed (GPU-completion-gated) or the surface is removed.
   releaseDmabufImport(importId: number): void;
-  // Per-frame BeginAccess/EndAccess on a cached client dmabuf import. Layer C
-  // of docs/client-buffer-lifecycle.md.
-  //   beginClientAccessSync: SYNCHRONOUS round-trip to the GPU process; opens
-  //     the per-frame BeginAccess bracket on the cached client texture (with
-  //     a fresh dmabuf sync_file acquire fence). Returns false on failure /
-  //     timeout. Blocks the calling thread (<1ms typical); needed because
-  //     the wire sample commands MUST not be flushed before the bracket is
-  //     open, and only ctrl-after-wire ordering is available structurally.
-  //   endClientAccess: fire-and-forget; deferred on the core wire barrier in
-  //     the GPU process until its wire reader has consumed `wireSerial` framed
-  //     bytes (so the compositor submit's sample commands have been
-  //     HandleCommands'd). Caller samples wireSerial AFTER queue.submit.
-  beginClientAccessSync(importId: number): boolean;
-  endClientAccess(importId: number, wireSerial: bigint): void;
-  // Core wire bytesQueued counter (cumulative framed-byte tag). Sample AFTER
-  // flushCoreWire(), then pass to endClientAccess so the GPU process can
-  // defer EndAccess until its wire reader is past that point. dawn.node's
-  // queue.submit does NOT itself flush the core wire serializer; an explicit
-  // flushCoreWire() is required for the captured serial to actually cover
-  // the just-submitted commands.
-  coreWireBytesQueued(): bigint;
-  flushCoreWire(): void;
+  // In-band per-frame BeginAccess/EndAccess on a cached client dmabuf import
+  // (Layer C of docs/client-buffer-lifecycle.md): write a kind=1/kind=2 control
+  // frame on the core WIRE socket (not ctrl). The frame is FIFO-ordered against
+  // the Dawn sample commands around it -- a Begin written before the sample's
+  // wire batch is processed first (bracket open before HandleCommands reaches
+  // the sample); an End written after the submit's wire batch is processed
+  // after it. No ctrl round-trip (Node thread does not block), no wireSerial,
+  // no WireBarrier. The addon flushes staged Dawn bytes before each frame, so
+  // JS does NOT flush explicitly. writeBeginAccess returns false iff the import
+  // is unknown (JS-gate bug; the GPU process hard-fails on its side too).
+  writeBeginAccess(importId: number): boolean;
+  writeEndAccess(importId: number): void;
   // Nested present (slice 3): acquire the host swapchain's current texture handle
   // (null if none this frame) and present it after rendering.
   acquireOutputTexture(): bigint | null;
@@ -436,17 +426,13 @@ export class JsCompositor implements CompositorSink {
       case "sendWlRelease": this.freed.push(intent.bufferId); break;
       case "beginAccess":
       case "endAccess":
-        // The actual GPU-process BeginAccess/EndAccess calls happen in
-        // renderFrame() (Layer C: runFrameBegin / runFrameEnd), BEFORE/AFTER
-        // the wire submit. Why not here? beginClientAccessSync is a sync
-        // round-trip and can fail; if it fails after the state machine has
-        // emitted beginAccess (which sets accessOpen + adds to frame.sampled),
-        // there is no clean rollback. Calling the GPU-process side at the
-        // executor level lets renderFrame decide whether to feed
-        // frameSampled in the first place (and skip the draw if it can't).
-        // The lifecycle intents stay -- they record the LOGICAL contract
-        // the unit tests verify (alternation, chain-fence threading), while
-        // the executor enforces the actual GPU-side bracket.
+        // The actual GPU-process BeginAccess/EndAccess are written in-band in
+        // renderFrame() (writeBeginAccess before the sample, writeEndAccess
+        // after the submit). They are not driven from here: renderFrame writes
+        // the Begin frame and only THEN feeds frameSampled, so the lifecycle
+        // intents are informational. They record the LOGICAL contract the unit
+        // tests verify (alternation, chain-fence threading), while the wire
+        // frames enforce the actual GPU-side bracket ordering.
         break;
     }
   }
@@ -688,20 +674,19 @@ export class JsCompositor implements CompositorSink {
     this.dispatch(this.lifecycle.step({ kind: "frameStart" }));
     frameOpen = true;
 
-    // Per-frame BeginAccess pass: for each dmabuf surface that will draw, do
-    // the GPU-process round-trip Begin BEFORE encoding the sample command.
-    // If Begin fails, the surface is poisoned and skipped this frame (no
-    // draw, no frameSampled event -- the state machine doesn't see it as
-    // sampled, so no End is owed for it).
+    // Per-frame BeginAccess pass: for each dmabuf surface that will draw, write
+    // an in-band kind=1 frame on the core wire BEFORE encoding the sample
+    // command. All begins are written up-front (each appendFrame flushes any
+    // staged Dawn bytes first); the encode+submit below then produces the
+    // sample wire commands as a later kind=0 batch, so on the wire the order is
+    // [begin...][sample submit batch][end...] -- every bracket is open by the
+    // time the GPU process's HandleCommands decodes the samples. No round-trip;
+    // the Node thread does not block.
     //
-    // The list `bracketed` holds the (importId, bufferId, surfaceId) of every
-    // dmabuf surface we successfully opened a bracket on, in draw order; the
-    // post-submit End pass walks it to send EndClientAccess. `skip` is the
-    // set of surfaceIds whose Begin failed; the draw loop below skips them
-    // for this frame ONLY (the surface record stays intact; next frame retries
-    // unless the buffer was poisoned by accessFailed gating).
+    // `bracketed` holds the (importId, bufferId) of every dmabuf surface we
+    // opened a bracket on, in draw order; the post-submit End pass walks it to
+    // write kind=2 frames.
     const bracketed: Array<{ importId: number; bufferId: number }> = [];
-    const skip = new Set<number>();
     const draw = this.drawOrder();
     for (const id of draw) {
       const s = this.surfaces.get(id);
@@ -709,19 +694,18 @@ export class JsCompositor implements CompositorSink {
       if (s.currentBufferId === 0) continue;  // shm or plugin overlay; no lifecycle
       const imp = this.dmabufImports.get(s.currentBufferId);
       if (!imp) continue;  // import not yet resolved (async); will draw next frame
-      const ok = this.addon.beginClientAccessSync(imp.importId);
-      if (!ok) {
-        // Poison the buffer in the lifecycle so subsequent frames skip it
-        // (until the client supersedes or destroys it). The state-machine
-        // gate in onFrameSampled also skips poisoned buffers, which is what
-        // suppresses retries -- no re-attempt of beginClientAccessSync until
-        // the buffer is replaced.
-        this.dispatch(this.lifecycle.step({
-          kind: "accessFailed", bufferId: s.currentBufferId,
-          reason: "beginClientAccessSync failed",
-        }));
-        skip.add(id);
-        continue;
+      // The dmabufImports gate above already proved the import is live (its
+      // handle was installed only after the GPU process applied the inject).
+      // writeBeginAccess therefore must succeed; a false return means the
+      // JS-side import gate and the core's jsImportHandles_ map have desynced
+      // -- a contract violation, not a recoverable per-frame condition. Surface
+      // it loudly (the GPU process hard-fails on its side for analogous bugs).
+      if (!this.addon.writeBeginAccess(imp.importId)) {
+        throw new Error(
+          `writeBeginAccess returned false for live import ` +
+          `(bufferId=${s.currentBufferId}, importId=${imp.importId}): ` +
+          `dmabufImports gate / core handle map desync`,
+        );
       }
       // Bracket open. Tell the state machine the surface was sampled. The
       // resulting beginAccess intent is informational (the executor's
@@ -743,7 +727,6 @@ export class JsCompositor implements CompositorSink {
       });
       pass.setPipeline(this.pipeline);
       for (const id of draw) {
-        if (skip.has(id)) continue;  // Begin failed for this surface this frame
         const s = this.surfaces.get(id);
         if (s && s.present && s.bindGroup) {
           this.updatePlacement(s);
@@ -753,15 +736,6 @@ export class JsCompositor implements CompositorSink {
       }
       pass.end();
       this.device.queue.submit([enc.finish()]);
-      // dawn.node's queue.submit does NOT flush the wire client serializer
-      // (empirical; the architecture-doc claim is wrong as of writing). We
-      // must force-flush before sampling wireBytesQueued, otherwise the
-      // captured serial doesn't cover the just-submitted commands and the
-      // GPU process's coreWireBarrier passes EndClientAccess BEFORE the
-      // wire reader has actually processed the submit -> Dawn "used in a
-      // submit without current access" error.
-      this.addon.flushCoreWire();
-      const coreWireSerial = this.addon.coreWireBytesQueued();
 
       // Tag the submit; on GPU completion advance completedSerial and emit
       // gpuCompleted to the lifecycle (which fires deferred release intents).
@@ -769,14 +743,19 @@ export class JsCompositor implements CompositorSink {
       this.dispatch(this.lifecycle.step({ kind: "submitted", serial }));
       frameOpen = false;
 
-      // EndAccess pass: send fire-and-forget EndClientAccess for every
-      // bracket we opened, tagged with the wire serial. Then synthesize
-      // endAccessFenceExported to satisfy the state-machine chain-fence
-      // tracking (the actual fence lives in the GPU process and is chained
-      // intra-process; the state-machine field is informational, used by
-      // the unit-test invariant 7).
+      // EndAccess pass: write an in-band kind=2 frame for every bracket we
+      // opened. Its FIFO position after the submit's kind=0 batch guarantees
+      // the GPU process closes the bracket only after decoding the sample
+      // commands -- the role the wireSerial-tagged WireBarrier deferral played
+      // before, now intrinsic to the wire ordering (no flush+sample, no tag).
+      // appendFrame flushes the submit's staged wire bytes as that kind=0 batch
+      // before writing the first kind=2, so the ordering holds without an
+      // explicit flushCoreWire. Then synthesize endAccessFenceExported to
+      // satisfy the state-machine chain-fence tracking (the actual fence lives
+      // in the GPU process and is chained intra-process; the state-machine
+      // field is informational, used by the unit-test invariant 7).
       for (const { importId, bufferId } of bracketed) {
-        this.addon.endClientAccess(importId, coreWireSerial);
+        this.addon.writeEndAccess(importId);
         this.dispatch(this.lifecycle.step({
           kind: "endAccessFenceExported", bufferId,
           // Sentinel: the GPU process exports a real fence and chains it

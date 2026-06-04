@@ -86,11 +86,6 @@ uint32_t u32(napi_env env, napi_value v) { uint32_t o = 0; napi_get_value_uint32
 struct PendingAlloc { uint32_t surfaceBufId; uint32_t connId; napi_ref cb; };
 std::vector<PendingAlloc> g_pendingAllocs;
 
-// A surface Begin (producer or consumer) in flight; resolved when the matching
-// *BeginDone arrives on the ctrl poll. `expected` is 1 (producer) or 2 (consumer).
-struct PendingSurfaceBegin { uint32_t surfaceBufId; int expected; napi_ref cb; };
-std::vector<PendingSurfaceBegin> g_pendingBegins;
-
 // Connection brokering (the Worker owns the wire client; the core brokers the
 // side channel). Resolve from the ctrl poll.
 //   PendingConnBroker: addWireConnection -> WireConnAdded -> cb({connId, fd}).
@@ -102,7 +97,6 @@ std::vector<PendingInject> g_pendingInjects;
 
 // Defined below; declared here so the ctrl poll (above them) can advance them.
 void advancePendingAllocs(napi_env env);
-void advancePendingBegins(napi_env env);
 void advanceConnBrokers(napi_env env);
 void advanceInjects(napi_env env);
 
@@ -320,12 +314,11 @@ void armWirePoll() {
 // fd is now empty, so onCtrlReadable never fires to advance it). Calling this from
 // both polls closes that race.
 void advanceAllPending(napi_env env) {
-    if (g_pendingAllocs.empty() && g_pendingBegins.empty() &&
+    if (g_pendingAllocs.empty() &&
         g_pendingConnBrokers.empty() && g_pendingInjects.empty()) return;
     napi_handle_scope scope;
     napi_open_handle_scope(env, &scope);
     advancePendingAllocs(env);    // SurfaceBufAllocated
-    advancePendingBegins(env);    // Producer/ConsumerBeginDone
     advanceConnBrokers(env);      // WireConnAdded
     advanceInjects(env);          // PluginInstanceInjected
     napi_close_handle_scope(env, scope);
@@ -432,18 +425,6 @@ void advanceInjects(napi_env env) {
         napi_value result; napi_get_boolean(env, st == 1, &result);
         invokePluginCb(env, pi.cb, result);
         g_pendingInjects.erase(g_pendingInjects.begin() + static_cast<long>(i));
-    }
-}
-
-// Resolve in-flight surface Begin ops when *BeginDone arrives (ctrl). cb(true|false).
-void advancePendingBegins(napi_env env) {
-    for (size_t i = 0; i < g_pendingBegins.size();) {
-        PendingSurfaceBegin& pb = g_pendingBegins[i];
-        int st = g_addon.compositor->surfaceBeginDone(pb.surfaceBufId);
-        if (st == 0) { ++i; continue; }  // pending
-        napi_value result; napi_get_boolean(env, st == pb.expected, &result);
-        invokePluginCb(env, pb.cb, result);
-        g_pendingBegins.erase(g_pendingBegins.begin() + static_cast<long>(i));
     }
 }
 
@@ -622,21 +603,6 @@ napi_value PluginSetTickDevice(napi_env env, napi_callback_info info) {
     return nullptr;
 }
 
-// pluginSurfaceProducerEndW(surfaceBufId, wireSerial:bigint): ProducerEnd with an
-// explicit plugin-wire serial (the Worker owns the wire client, so it samples its
-// own wireBytesQueued and passes it). The GPU process defers the producer
-// EndAccess until its plugin-conn reader has consumed that many bytes.
-napi_value PluginSurfaceProducerEndW(napi_env env, napi_callback_info info) {
-    if (!g_addon.compositor) return nullptr;
-    size_t argc = 2; napi_value argv[2];
-    napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
-    uint32_t id = u32(env, argv[0]);
-    uint64_t serial = 0; bool lossless = false;
-    napi_get_value_bigint_uint64(env, argv[1], &serial, &lossless);
-    g_addon.compositor->sendProducerEnd(id, serial);
-    return nullptr;
-}
-
 // pluginConsumerTexture(surfaceBufId) -> bigint: the core's wrapped-able wire
 // texture handle for the consumer side (the JS compositor wraps + samples it).
 napi_value PluginConsumerTexture(napi_env env, napi_callback_info info) {
@@ -681,32 +647,27 @@ napi_value PluginAllocSurfaceBufferW(napi_env env, napi_callback_info info) {
     return nullptr;
 }
 
-// Per-frame fence-dance helpers. Begin ops are async (cb(bool) on
-// the ctrl poll when the bracket+fence-wait is in); End ops are fire-and-forget.
+// Extract argv[0] as a uint32 (used by the surface-buffer entry points below).
 static uint32_t arg0u32(napi_env env, napi_callback_info info, napi_value* argv, size_t n) {
     size_t argc = n; napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
     uint32_t v = 0; napi_get_value_uint32(env, argv[0], &v); return v;
 }
-napi_value PluginSurfaceProducerBegin(napi_env env, napi_callback_info info) {
-    if (!g_addon.compositor) return nullptr;
-    napi_value argv[2]; uint32_t id = arg0u32(env, info, argv, 2);
-    g_addon.compositor->sendProducerBegin(id);
-    napi_ref cbRef; napi_create_reference(env, argv[1], 1, &cbRef);
-    g_pendingBegins.push_back({id, 1, cbRef});
-    return nullptr;
-}
-napi_value PluginSurfaceConsumerBegin(napi_env env, napi_callback_info info) {
-    if (!g_addon.compositor) return nullptr;
-    napi_value argv[2]; uint32_t id = arg0u32(env, info, argv, 2);
-    g_addon.compositor->sendConsumerBegin(id);
-    napi_ref cbRef; napi_create_reference(env, argv[1], 1, &cbRef);
-    g_pendingBegins.push_back({id, 2, cbRef});
-    return nullptr;
-}
-napi_value PluginSurfaceConsumerEnd(napi_env env, napi_callback_info info) {
+
+// writeConsumerBegin(surfaceBufId) / writeConsumerEnd(surfaceBufId): in-band
+// consumer Begin/End on the core wire (replaces the pluginSurfaceConsumerBegin/
+// End ctrl round-trips). Synchronous frame writes -- no pendingBegins callback;
+// the FIFO wire ordering replaces the begin-done acknowledgement. The caller
+// still gates End on afterCurrentFrame (GPU-read completion).
+napi_value WriteConsumerBegin(napi_env env, napi_callback_info info) {
     if (!g_addon.compositor) return nullptr;
     napi_value argv[1]; uint32_t id = arg0u32(env, info, argv, 1);
-    g_addon.compositor->sendConsumerEnd(id);
+    g_addon.compositor->writeConsumerBeginAccess(id);
+    return nullptr;
+}
+napi_value WriteConsumerEnd(napi_env env, napi_callback_info info) {
+    if (!g_addon.compositor) return nullptr;
+    napi_value argv[1]; uint32_t id = arg0u32(env, info, argv, 1);
+    g_addon.compositor->writeConsumerEndAccess(id);
     return nullptr;
 }
 
@@ -845,62 +806,36 @@ napi_value ReleaseDmabufImport(napi_env env, napi_callback_info info) {
     return nullptr;
 }
 
-// beginClientAccessSync(importId) -> bool. Per-frame BeginAccess on a cached
-// client dmabuf texture (Layer C). Synchronous round-trip: blocks the calling
-// thread until the GPU process's BeginAccess returns. The block is brief
-// (<1ms typical) and necessary because the wire sample commands MUST not be
-// flushed until the bracket is open -- the existing one-way ctrl-after-wire
-// barrier (ipc::WireBarrier) cannot express the opposite direction.
-napi_value BeginClientAccessSync(napi_env env, napi_callback_info info) {
+// writeBeginAccess(importId) -> bool. In-band per-frame BeginAccess: write a
+// kind=1 frame on the core WIRE socket for the client texture importId resolves
+// to. Replaces beginClientAccessSync's ctrl round-trip; does NOT block the Node
+// thread. The frame's FIFO position before the sample's wire batch guarantees
+// the GPU process opens the bracket before HandleCommands decodes the sample
+// (appendFrame flushes staged Dawn bytes first). Returns false iff the import
+// is unknown (a JS-gate bug -- the caller gates Begin on the import being live).
+napi_value WriteBeginAccess(napi_env env, napi_callback_info info) {
     size_t argc = 1; napi_value argv[1];
     napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
-    if (!g_addon.compositor) {
-        napi_value f; napi_get_boolean(env, false, &f); return f;
-    }
+    if (!g_addon.compositor) { napi_value f; napi_get_boolean(env, false, &f); return f; }
     uint32_t importId = 0;
     napi_get_value_uint32(env, argv[0], &importId);
-    const bool ok = importId != 0 && g_addon.compositor->beginClientAccessSync(importId);
+    const bool ok = importId != 0 && g_addon.compositor->writeClientTexBeginAccess(importId);
     napi_value out; napi_get_boolean(env, ok, &out); return out;
 }
 
-// endClientAccess(importId, wireSerial:bigint) -> undefined. Per-frame
-// EndAccess on a cached client dmabuf texture (Layer C). Fire-and-forget:
-// the GPU process defers the EndAccess on its core wire barrier until its
-// wire reader has consumed `wireSerial` framed bytes (so the compositor
-// submit's sample commands have been HandleCommands'd). Caller samples
-// wireSerial AFTER the wire flush that committed the submit.
-napi_value EndClientAccess(napi_env env, napi_callback_info info) {
-    size_t argc = 2; napi_value argv[2];
+// writeEndAccess(importId) -> undefined. In-band per-frame EndAccess: write a
+// kind=2 frame on the core WIRE socket. Its FIFO position after the submit's
+// wire batch guarantees the GPU process closes the bracket only after decoding
+// the sample commands -- no wireSerial tag, no WireBarrier deferral. (The GPU
+// completion-ordering for buffer recycling stays the caller's concern, as it
+// was: this only orders decode, not GPU execution.)
+napi_value WriteEndAccess(napi_env env, napi_callback_info info) {
+    size_t argc = 1; napi_value argv[1];
     napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
     if (!g_addon.compositor) return nullptr;
     uint32_t importId = 0;
     napi_get_value_uint32(env, argv[0], &importId);
-    uint64_t serial = 0; bool lossless = false;
-    napi_get_value_bigint_uint64(env, argv[1], &serial, &lossless);
-    if (importId != 0) g_addon.compositor->sendEndClientAccess(importId, serial);
-    return nullptr;
-}
-
-// coreWireBytesQueued() -> bigint. Read the core's outbound wire-bytes-queued
-// counter; sampled AFTER flushCoreWire() to tag EndClientAccess so the GPU
-// process defers EndAccess until its wire reader has caught up past that
-// point. dawn.node's queue.submit does NOT itself flush the wire client
-// serializer; callers must flush explicitly.
-napi_value CoreWireBytesQueued(napi_env env, napi_callback_info info) {
-    (void)info;
-    if (!g_addon.compositor) {
-        napi_value z; napi_create_bigint_uint64(env, 0, &z); return z;
-    }
-    napi_value out;
-    napi_create_bigint_uint64(env, g_addon.compositor->coreWireBytesQueued(), &out);
-    return out;
-}
-
-// flushCoreWire() -> undefined. Force-flush the core's outbound wire client.
-// Pairs with coreWireBytesQueued for the EndClientAccess wire-serial tag.
-napi_value FlushCoreWire(napi_env env, napi_callback_info info) {
-    (void)info;
-    if (g_addon.compositor) g_addon.compositor->flushCoreWire();
+    if (importId != 0) g_addon.compositor->writeClientTexEndAccess(importId);
     return nullptr;
 }
 
@@ -948,8 +883,6 @@ napi_value Stop(napi_env env, napi_callback_info) {
     g_pendingInjects.clear();
     for (auto& pa : g_pendingAllocs) napi_delete_reference(env, pa.cb);
     g_pendingAllocs.clear();
-    for (auto& pb : g_pendingBegins) napi_delete_reference(env, pb.cb);
-    g_pendingBegins.clear();
     if (g_addon.input) {
         g_addon.input->stop();
         g_addon.input.reset();
@@ -1448,22 +1381,14 @@ napi_value Init(napi_env env, napi_value exports) {
     napi_create_function(env, "releaseDmabufImport", NAPI_AUTO_LENGTH,
                          ReleaseDmabufImport, nullptr, &fnReleaseDmabuf);
     napi_set_named_property(env, exports, "releaseDmabufImport", fnReleaseDmabuf);
-    napi_value fnBeginClientAccess;
-    napi_create_function(env, "beginClientAccessSync", NAPI_AUTO_LENGTH,
-                         BeginClientAccessSync, nullptr, &fnBeginClientAccess);
-    napi_set_named_property(env, exports, "beginClientAccessSync", fnBeginClientAccess);
-    napi_value fnEndClientAccess;
-    napi_create_function(env, "endClientAccess", NAPI_AUTO_LENGTH,
-                         EndClientAccess, nullptr, &fnEndClientAccess);
-    napi_set_named_property(env, exports, "endClientAccess", fnEndClientAccess);
-    napi_value fnCoreWireBytesQueued;
-    napi_create_function(env, "coreWireBytesQueued", NAPI_AUTO_LENGTH,
-                         CoreWireBytesQueued, nullptr, &fnCoreWireBytesQueued);
-    napi_set_named_property(env, exports, "coreWireBytesQueued", fnCoreWireBytesQueued);
-    napi_value fnFlushCoreWire;
-    napi_create_function(env, "flushCoreWire", NAPI_AUTO_LENGTH,
-                         FlushCoreWire, nullptr, &fnFlushCoreWire);
-    napi_set_named_property(env, exports, "flushCoreWire", fnFlushCoreWire);
+    napi_value fnWriteBeginAccess;
+    napi_create_function(env, "writeBeginAccess", NAPI_AUTO_LENGTH,
+                         WriteBeginAccess, nullptr, &fnWriteBeginAccess);
+    napi_set_named_property(env, exports, "writeBeginAccess", fnWriteBeginAccess);
+    napi_value fnWriteEndAccess;
+    napi_create_function(env, "writeEndAccess", NAPI_AUTO_LENGTH,
+                         WriteEndAccess, nullptr, &fnWriteEndAccess);
+    napi_set_named_property(env, exports, "writeEndAccess", fnWriteEndAccess);
     for (auto& [name, fn] : std::initializer_list<std::pair<const char*, napi_callback>>{
              {"acquireOutputTexture", AcquireOutputTexture},
              {"presentOutput", PresentOutput},
@@ -1500,10 +1425,8 @@ napi_value Init(napi_env env, napi_value exports) {
     reg("pluginSetTickDevice", PluginSetTickDevice);
     reg("pluginAllocSurfaceBufferW", PluginAllocSurfaceBufferW);
     reg("pluginConsumerTexture", PluginConsumerTexture);
-    reg("pluginSurfaceProducerEndW", PluginSurfaceProducerEndW);
-    reg("pluginSurfaceProducerBegin", PluginSurfaceProducerBegin);
-    reg("pluginSurfaceConsumerBegin", PluginSurfaceConsumerBegin);
-    reg("pluginSurfaceConsumerEnd", PluginSurfaceConsumerEnd);
+    reg("writeConsumerBegin", WriteConsumerBegin);
+    reg("writeConsumerEnd", WriteConsumerEnd);
     reg("pluginReleaseSurfaceBuffer", PluginReleaseSurfaceBuffer);
 
     napi_set_named_property(env, exports, "start", fnStart);
