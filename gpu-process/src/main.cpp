@@ -48,7 +48,8 @@ void crashHandler(int sig) {
     if (fd >= 0) {
         char hdr[64];
         int n = std::snprintf(hdr, sizeof(hdr), "GPU process caught signal %d\n", sig);
-        ::write(fd, hdr, static_cast<size_t>(n));
+        ssize_t w = ::write(fd, hdr, static_cast<size_t>(n));
+        (void)w;
         void* frames[64];
         int got = ::backtrace(frames, 64);
         ::backtrace_symbols_fd(frames, got, fd);
