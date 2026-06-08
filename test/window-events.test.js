@@ -12,37 +12,12 @@
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { fileURLToPath, pathToFileURL } from 'node:url';
-import { dirname, join } from 'node:path';
 
 import { createWindowObserver } from '../packages/core/dist/plugins/window-observer.js';
 import { WINDOW_EVENT } from '../packages/core/dist/events/types.js';
 import { TypedBus } from '../packages/core/dist/events/bus.js';
 import { DynamicBus } from '../packages/core/dist/events/dynamic-bus.js';
-import { PluginRuntime } from '../packages/core/dist/plugins/index.js';
-
-const __dirname = dirname(fileURLToPath(import.meta.url));
-const FIX = join(__dirname, 'fixtures', 'plugins');
-const fixture = (f) => pathToFileURL(join(FIX, f)).href;
-
-const FAST = { pingIntervalMs: 50, maxMissedPongs: 2, shutdownTimeoutMs: 300, heapMb: 32 };
-
-function entry(file, over = {}) {
-  return {
-    module: fixture(file), name: over.name ?? file.replace(/\.mjs$/, ''),
-    restart: over.restart ?? 'never', maxRestarts: over.maxRestarts ?? 3,
-    windowSeconds: over.windowSeconds ?? 60, raw: {},
-  };
-}
-
-async function waitFor(pred, timeoutMs = 4000) {
-  const start = Date.now();
-  for (;;) {
-    if (pred()) return;
-    if (Date.now() - start > timeoutMs) throw new Error('waitFor timed out');
-    await new Promise((r) => setTimeout(r, 25));
-  }
-}
+import { entry, waitFor, withRuntime } from './plugin-helpers.mjs';
 
 // --- tier 0: the typed bus in isolation ------------------------------------
 
@@ -222,43 +197,35 @@ test('observer release() detaches the bus subscription', () => {
 test('dynamic bus delivers window.map/change/unmap to a live plugin', async () => {
   const events = [];
   const pluginBus = new DynamicBus();
-  const rt = new PluginRuntime({
-    ...FAST, log: () => {},
-    bus: pluginBus,
-    onEvent: (p, n, d) => events.push({ p, n, d }),
+  await withRuntime({ bus: pluginBus, onEvent: (p, n, d) => events.push({ p, n, d }) }, async (rt) => {
+    await rt.load([entry('window-observer.mjs')]);
+    assert.equal(rt.states()[0].state, 'live');
+
+    // The plugin logs "ready" once init runs; wait for it so its handlers + bus
+    // subscription are established before we start emitting.
+    await waitFor(() => events.some((e) => e.n === 'log' && String(e.d) === 'ready'));
+    // Allow the bootstrap's events.subscribe message to traverse the wire.
+    await new Promise((r) => setTimeout(r, 50));
+
+    const mapEv = { surfaceId: 42, rect: { x: 5, y: 6, width: 100, height: 60 }, appId: 'foo', title: 'Foo' };
+    const changeEv = {
+      surfaceId: 42, changed: ['title'],
+      appId: 'foo', title: 'Renamed', activated: true,
+      floating: false, fullscreen: false, maximized: false, minimized: false,
+    };
+    pluginBus.emit(WINDOW_EVENT.map, mapEv);
+    pluginBus.emit(WINDOW_EVENT.change, changeEv);
+    pluginBus.emit(WINDOW_EVENT.unmap, { surfaceId: 42 });
+
+    await waitFor(() => events.some((e) => e.n === 'log' && String(e.d).startsWith('MAP ')));
+    await waitFor(() => events.some((e) => e.n === 'log' && String(e.d).startsWith('CHANGE ')));
+    await waitFor(() => events.some((e) => e.n === 'log' && String(e.d).startsWith('UNMAP ')));
+
+    const mapLog = events.find((e) => e.n === 'log' && String(e.d).startsWith('MAP '));
+    const changeLog = events.find((e) => e.n === 'log' && String(e.d).startsWith('CHANGE '));
+    const unmapLog = events.find((e) => e.n === 'log' && String(e.d).startsWith('UNMAP '));
+    assert.deepEqual(JSON.parse(String(mapLog.d).slice(4)), mapEv);
+    assert.deepEqual(JSON.parse(String(changeLog.d).slice(7)), changeEv);
+    assert.deepEqual(JSON.parse(String(unmapLog.d).slice(6)), { surfaceId: 42 });
   });
-  await rt.load([entry('window-observer.mjs')]);
-  assert.equal(rt.states()[0].state, 'live');
-
-  // The plugin logs "ready" once init runs; wait for it so its handlers + bus
-  // subscription are established before we start emitting.
-  await waitFor(() => events.some((e) => e.n === 'log' && String(e.d) === 'ready'));
-
-  // Allow the bootstrap's events.subscribe message to traverse the wire (the
-  // plugin's bus subscription is set on init, but the events.subscribe envelope
-  // to core is async). Wait one microtask round-trip's worth.
-  await new Promise((r) => setTimeout(r, 50));
-
-  const mapEv = { surfaceId: 42, rect: { x: 5, y: 6, width: 100, height: 60 }, appId: 'foo', title: 'Foo' };
-  const changeEv = {
-    surfaceId: 42, changed: ['title'],
-    appId: 'foo', title: 'Renamed', activated: true,
-    floating: false, fullscreen: false, maximized: false, minimized: false,
-  };
-  pluginBus.emit(WINDOW_EVENT.map, mapEv);
-  pluginBus.emit(WINDOW_EVENT.change, changeEv);
-  pluginBus.emit(WINDOW_EVENT.unmap, { surfaceId: 42 });
-
-  await waitFor(() => events.some((e) => e.n === 'log' && String(e.d).startsWith('MAP ')));
-  await waitFor(() => events.some((e) => e.n === 'log' && String(e.d).startsWith('CHANGE ')));
-  await waitFor(() => events.some((e) => e.n === 'log' && String(e.d).startsWith('UNMAP ')));
-
-  const mapLog = events.find((e) => e.n === 'log' && String(e.d).startsWith('MAP '));
-  const changeLog = events.find((e) => e.n === 'log' && String(e.d).startsWith('CHANGE '));
-  const unmapLog = events.find((e) => e.n === 'log' && String(e.d).startsWith('UNMAP '));
-  assert.deepEqual(JSON.parse(String(mapLog.d).slice(4)), mapEv);
-  assert.deepEqual(JSON.parse(String(changeLog.d).slice(7)), changeEv);
-  assert.deepEqual(JSON.parse(String(unmapLog.d).slice(6)), { surfaceId: 42 });
-
-  await rt.stop();
 });
