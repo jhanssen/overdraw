@@ -21,6 +21,7 @@ import type { Json } from "./protocol.js";
 import type { DynamicBus, Subscription } from "../events/dynamic-bus.js";
 import { NamespaceRegistry } from "./namespace-registry.js";
 import type { Registration } from "./namespace-registry.js";
+import { ActionRegistry } from "./action-registry.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 // The built bootstrap (this file lives in dist/plugins/ after tsc).
@@ -67,26 +68,23 @@ export interface RuntimeOptions {
   bus?: DynamicBus;
 }
 
-// Per-plugin namespace-routing controller passed by the runtime to each
-// ManagedPlugin. The plugin's request handler calls these for the four
-// plugin.* messages (register/unregister are events on the plugin->core
-// direction; invoke/wait-for-active are requests). The runtime owns the
-// registry and knows about every plugin, so it can route invocations across
-// plugins.
-interface NamespaceController {
-  // Returns the registry (used for plugin death cleanup; tests).
+// Per-plugin controller passed by the runtime to each ManagedPlugin. The
+// plugin's request handler calls these for the cross-plugin messages
+// (namespace.* and actions.*). The runtime owns the registries and knows
+// about every plugin, so it can route invocations across plugins.
+interface PluginController {
+  // -- namespace registry (core-plugin-api.md §11) --
   registry(): NamespaceRegistry;
-  // Process a plugin.register one-way event from a worker.
   onRegister(pluginName: string, payload: unknown): void;
-  // Process a plugin.unregister one-way event from a worker.
   onUnregister(pluginName: string, payload: unknown): void;
-  // Handle a plugin.invoke request: look up the active winner for the
-  // namespace, forward as plugin.handle to that plugin's endpoint, relay
-  // the response (or reject if no active winner / method unknown).
   onInvoke(callerName: string, payload: unknown): Promise<Json>;
-  // Handle a plugin.wait-for-active request: resolve when the namespace has
-  // an active winner, or reject on timeout.
   onWaitForActive(callerName: string, payload: unknown): Promise<Json>;
+  // -- action registry (core-plugin-api.md §10) --
+  actions(): ActionRegistry;
+  onActionRegister(pluginName: string, payload: unknown): void;
+  onActionUnregister(pluginName: string, payload: unknown): void;
+  onActionInvoke(callerName: string, payload: unknown): Promise<Json>;
+  onActionList(callerName: string, payload: unknown): Promise<Json>;
 }
 
 export const DEFAULT_OPTIONS: RuntimeOptions = {
@@ -101,7 +99,7 @@ class ManagedPlugin {
   readonly cfg: ResolvedPlugin;
   private opts: RuntimeOptions;
   private log: (msg: string) => void;
-  private ns: NamespaceController;
+  private ns: PluginController;
 
   state: PluginState = "spawning";
   private worker: Worker | null = null;
@@ -131,7 +129,7 @@ class ManagedPlugin {
   private firstSettle: { resolve: () => void } | null = null;
   readonly ready: Promise<void>;
 
-  constructor(cfg: ResolvedPlugin, opts: RuntimeOptions, ns: NamespaceController) {
+  constructor(cfg: ResolvedPlugin, opts: RuntimeOptions, ns: PluginController) {
     this.cfg = cfg;
     this.opts = opts;
     this.ns = ns;
@@ -170,9 +168,8 @@ class ManagedPlugin {
     this.endpoint = endpoint;
     endpoint.handlePongs(() => { this.missed = 0; });
     endpoint.handleEvents((name, data) => { this.onPluginEvent(name, data); });
-    // Plugin->core requests: try namespace plumbing first (plugin.invoke,
-    // plugin.wait-for-active), then fall back to onRequest (gpu/decoration
-    // brokers).
+    // Plugin->core requests: try namespace + action plumbing first, then
+    // fall back to onRequest (gpu/decoration brokers).
     const onReq = this.opts.onRequest;
     endpoint.handleRequests(async (method, params): Promise<Json> => {
       if (method === "plugin.invoke") {
@@ -180,6 +177,12 @@ class ManagedPlugin {
       }
       if (method === "plugin.wait-for-active") {
         return await this.ns.onWaitForActive(this.cfg.name, params);
+      }
+      if (method === "actions.invoke") {
+        return await this.ns.onActionInvoke(this.cfg.name, params);
+      }
+      if (method === "actions.list") {
+        return await this.ns.onActionList(this.cfg.name, params);
       }
       if (onReq) {
         return (await onReq(this.cfg.name, method, params)) as Json;
@@ -223,6 +226,11 @@ class ManagedPlugin {
     // core-plugin-api.md §11.
     if (name === "plugin.register") { this.ns.onRegister(this.cfg.name, data); return; }
     if (name === "plugin.unregister") { this.ns.onUnregister(this.cfg.name, data); return; }
+
+    // Action registry interactions (sdk.actions.register / unregister).
+    // core-plugin-api.md §10.
+    if (name === "actions.register") { this.ns.onActionRegister(this.cfg.name, data); return; }
+    if (name === "actions.unregister") { this.ns.onActionUnregister(this.cfg.name, data); return; }
 
     // Surface other plugin->core events (scope B: `log`) to the observer.
     this.opts.onEvent?.(this.cfg.name, name, data);
@@ -316,6 +324,7 @@ class ManagedPlugin {
     this.terminating = true;
     this.releaseBusSubs();
     this.ns.registry().unregisterAllFor(this.cfg.name);
+    this.ns.actions().unregisterAllFor(this.cfg.name);
     this.endpoint?.close(`plugin ${this.cfg.name} terminated`);
     void this.worker?.terminate();
   }
@@ -330,6 +339,7 @@ class ManagedPlugin {
     this.stopWatchdog();
     this.releaseBusSubs();
     this.ns.registry().unregisterAllFor(this.cfg.name);
+    this.ns.actions().unregisterAllFor(this.cfg.name);
     this.endpoint?.close(`plugin ${this.cfg.name} exited (code ${code})`);
     this.endpoint = null;
     this.worker = null;
@@ -374,6 +384,7 @@ class ManagedPlugin {
     if (!this.worker || !this.endpoint) {
       this.releaseBusSubs();
       this.ns.registry().unregisterAllFor(this.cfg.name);
+      this.ns.actions().unregisterAllFor(this.cfg.name);
       this.state = "failed"; return;
     }
     this.state = "shutting-down";
@@ -404,12 +415,14 @@ class ManagedPlugin {
 }
 
 // The registry: owns all managed plugins.
-export class PluginRuntime implements NamespaceController {
+export class PluginRuntime implements PluginController {
   private plugins: ManagedPlugin[] = [];
   private opts: RuntimeOptions;
   // Plugin namespace registry (sdk.registerPlugin / sdk.plugin). Shared
-  // across all managed plugins; the runtime is the namespace controller.
+  // across all managed plugins; the runtime is the controller.
   private nsRegistry = new NamespaceRegistry();
+  // Action registry (sdk.actions.register / invoke / list). Also shared.
+  private actionRegistry = new ActionRegistry();
   // Pending `plugin.wait-for-active` waiters, keyed by namespace. Each
   // waiter's promise resolves when the registry's active winner appears (or
   // rejects on timeout / when the waiting plugin dies).
@@ -563,9 +576,89 @@ export class PluginRuntime implements NamespaceController {
     });
   }
 
+  // -- Action controller (core-plugin-api.md §10) --
+
+  actions(): ActionRegistry { return this.actionRegistry; }
+
+  onActionRegister(pluginName: string, payload: unknown): void {
+    if (!isActionRegisterPayload(payload)) {
+      this.opts.log?.(`[plugin ${pluginName}] actions.register: malformed payload; ignored`);
+      return;
+    }
+    try {
+      this.actionRegistry.register({
+        pluginName, name: payload.name,
+        description: payload.description,
+        schema: payload.schema,
+      });
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : String(err);
+      this.opts.log?.(`[plugin ${pluginName}] actions.register('${payload.name}') rejected: ${msg}`);
+    }
+  }
+
+  onActionUnregister(pluginName: string, payload: unknown): void {
+    if (!isActionUnregisterPayload(payload)) {
+      this.opts.log?.(`[plugin ${pluginName}] actions.unregister: malformed payload; ignored`);
+      return;
+    }
+    this.actionRegistry.unregister(pluginName, payload.name);
+  }
+
+  async onActionInvoke(callerName: string, payload: unknown): Promise<Json> {
+    if (!isActionInvokePayload(payload)) {
+      throw new Error("actions.invoke: malformed payload");
+    }
+    const owner = this.actionRegistry.lookup(payload.name);
+    if (!owner) {
+      throw new Error(`actions.invoke: no such action '${payload.name}'`);
+    }
+    const target = this.plugins.find((p) => p.cfg.name === owner.pluginName);
+    const ep = target?.endpointHandle();
+    if (!ep) {
+      throw new Error(
+        `actions.invoke: owner '${owner.pluginName}' of '${payload.name}' is not live`);
+    }
+    void callerName;
+    return await ep.request("actions.handle",
+      { name: payload.name, params: payload.params });
+  }
+
+  onActionList(callerName: string, _payload: unknown): Promise<Json> {
+    void callerName;
+    // ActionInfo[] is structured-clone-safe by construction: name and
+    // description are strings; schema arrived via postMessage from a worker
+    // (which already enforces clone-safety), so it survives a round trip
+    // back. Json's type machinery doesn't model the optional fields cleanly,
+    // hence the assertion.
+    // eslint-disable-next-line no-restricted-syntax
+    return Promise.resolve(this.actionRegistry.list() as unknown as Json);
+  }
+
   private cfgOf(pluginName: string): ResolvedPlugin | undefined {
     return this.plugins.find((p) => p.cfg.name === pluginName)?.cfg;
   }
+}
+
+// Type guards for the action-event payloads.
+
+function isActionRegisterPayload(d: unknown): d is { name: string; description?: string; schema?: unknown } {
+  if (typeof d !== "object" || d === null) return false;
+  const o = d as { [k: string]: unknown };
+  if (typeof o.name !== "string" || o.name.length === 0) return false;
+  if (o.description !== undefined && typeof o.description !== "string") return false;
+  return true;
+}
+
+function isActionUnregisterPayload(d: unknown): d is { name: string } {
+  return typeof d === "object" && d !== null
+    && typeof (d as { name?: unknown }).name === "string";
+}
+
+function isActionInvokePayload(d: unknown): d is { name: string; params: Json } {
+  return typeof d === "object" && d !== null
+    && typeof (d as { name?: unknown }).name === "string"
+    && "params" in (d as object);
 }
 
 // Payload guards for the events.* reserved one-way events. The worker is

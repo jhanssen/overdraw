@@ -25,6 +25,7 @@ import { createWindowObserver } from "./window-observer.js";
 import { createDecorations } from "./decorations.js";
 import { createPluginEvents } from "./events.js";
 import { createNamespaceHandle } from "./namespace.js";
+import { createPluginActions } from "./actions.js";
 
 interface BootstrapData {
   module: string;
@@ -74,6 +75,10 @@ async function main(): Promise<void> {
   // requests from core (other plugins calling this plugin's methods).
   const nsHandle = createNamespaceHandle(endpoint);
 
+  // Action registry surface (sdk.actions). core-plugin-api.md §10. The
+  // dispatcher handles inbound `actions.handle` requests from core.
+  const actionsHandle = createPluginActions(endpoint);
+
   // Window-state observation (sdk.window.onMap/onUnmap). Typed convenience
   // wrapper over sdk.events.subscribe('window.*', ...) -- the bus is the
   // primary delivery path; this observer dispatches validated payloads to the
@@ -86,15 +91,19 @@ async function main(): Promise<void> {
 
   // SDK logs are forwarded to the core as one-way events (the core prints them).
   const control = createSdk(name, (line) => { endpoint.emit("log", line); },
-    eventsHandle.events, nsHandle.ns,
+    eventsHandle.events, nsHandle.ns, actionsHandle.actions,
     gpu, windows.observer, decorations?.decorations);
 
-  // Inbound request chain: try the namespace dispatcher first (plugin.handle),
-  // then fall through to the lifecycle methods (shutdown). Unknown methods
-  // throw, which becomes a JSON-RPC-like error response on the core side.
+  // Inbound request chain: try the namespace and actions dispatchers first
+  // (plugin.handle, actions.handle), then fall through to the lifecycle
+  // methods (shutdown). Unknown methods throw, which becomes a JSON-RPC-like
+  // error response on the core side.
   endpoint.handleRequests(async (method, params): Promise<Json> => {
     const ns = nsHandle.dispatcher.tryHandle(method, params);
     if (ns.handled) return await ns.result;
+
+    const ac = actionsHandle.dispatcher.tryHandle(method, params);
+    if (ac.handled) return await ac.result;
 
     if (method === "shutdown") {
       // Quiesce GPU FIRST (stop the pump + park surface ops), then run the plugin's

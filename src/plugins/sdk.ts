@@ -15,6 +15,7 @@ import type { PluginEvents } from "./events.js";
 import type {
   PluginNamespace, InitFn, RegisterOptions, RegistrationHandle, RegisteredApi,
 } from "./namespace.js";
+import type { PluginActions } from "./actions.js";
 
 export interface PluginSdk {
   // The plugin's stable name (config `name`, defaulting to its module).
@@ -36,6 +37,9 @@ export interface PluginSdk {
     name: string, init: InitFn<API>, opts?: RegisterOptions
   ) => Promise<RegistrationHandle>;
   plugin: <API extends RegisteredApi>(name: string) => Promise<API>;
+  // Action registry: named operations (core-plugin-api.md §10). Other
+  // plugins, hotkeys, IPC clients all invoke through this single surface.
+  actions: PluginActions;
   // GPU + overlay surfaces (present iff the plugin has the `gpu` capability and
   // the runtime brought the device up). Absent otherwise (capability by shape).
   gpu?: PluginGpu;
@@ -59,6 +63,7 @@ export interface SdkControl {
 
 export function createSdk(name: string, emitLog: (line: string) => void,
                           events: PluginEvents, ns: PluginNamespace,
+                          actions: PluginActions,
                           gpu?: PluginGpu, window?: PluginWindowObserver,
                           decorations?: PluginDecorations): SdkControl {
   let shutdownCb: ShutdownCallback | null = null;
@@ -76,6 +81,7 @@ export function createSdk(name: string, emitLog: (line: string) => void,
     events,
     registerPlugin: ns.registerPlugin,
     plugin: ns.plugin,
+    actions,
     ...(gpu ? { gpu } : {}),
     ...(window ? { window } : {}),
     ...(decorations ? { decorations } : {}),
