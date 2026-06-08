@@ -24,6 +24,7 @@ import type { PluginGpu, RingMaker } from "./gpu.js";
 import { createWindowObserver } from "./window-observer.js";
 import { createDecorations } from "./decorations.js";
 import { createPluginEvents } from "./events.js";
+import { createNamespaceHandle } from "./namespace.js";
 
 interface BootstrapData {
   module: string;
@@ -68,6 +69,11 @@ async function main(): Promise<void> {
   // available; the dispatcher consumes core-pushed `events.dispatch` events.
   const eventsHandle = createPluginEvents(endpoint);
 
+  // Plugin namespace registry surface (sdk.registerPlugin / sdk.plugin).
+  // core-plugin-api.md §11. The dispatcher handles inbound `plugin.handle`
+  // requests from core (other plugins calling this plugin's methods).
+  const nsHandle = createNamespaceHandle(endpoint);
+
   // Window-state observation (sdk.window.onMap/onUnmap). Typed convenience
   // wrapper over sdk.events.subscribe('window.*', ...) -- the bus is the
   // primary delivery path; this observer dispatches validated payloads to the
@@ -80,11 +86,16 @@ async function main(): Promise<void> {
 
   // SDK logs are forwarded to the core as one-way events (the core prints them).
   const control = createSdk(name, (line) => { endpoint.emit("log", line); },
-    eventsHandle.events, gpu, windows.observer, decorations?.decorations);
+    eventsHandle.events, nsHandle.ns,
+    gpu, windows.observer, decorations?.decorations);
 
-  // The only request the core sends in scope B is 'shutdown'. Run the registered
-  // onShutdown callback; resolving lets the core proceed to terminate.
-  endpoint.handleRequests(async (method): Promise<Json> => {
+  // Inbound request chain: try the namespace dispatcher first (plugin.handle),
+  // then fall through to the lifecycle methods (shutdown). Unknown methods
+  // throw, which becomes a JSON-RPC-like error response on the core side.
+  endpoint.handleRequests(async (method, params): Promise<Json> => {
+    const ns = nsHandle.dispatcher.tryHandle(method, params);
+    if (ns.handled) return await ns.result;
+
     if (method === "shutdown") {
       // Quiesce GPU FIRST (stop the pump + park surface ops), then run the plugin's
       // onShutdown, so by the time the core terminates the Worker no GPU/wire work is

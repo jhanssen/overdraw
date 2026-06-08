@@ -83,6 +83,11 @@ export interface ResolvedPlugin {
   restart: RestartPolicy;
   maxRestarts: number;
   windowSeconds: number;
+  // True for bundled plugins (loaded by core, ships with overdraw). When the
+  // plugin calls sdk.registerPlugin without an explicit priority, bundled
+  // defaults to 0 (the floor); user plugins default to 100. Bundled is also
+  // a hook for the in-thread (vs Worker) transport later; not used yet.
+  bundled: boolean;
   raw: PluginConfig;
 }
 

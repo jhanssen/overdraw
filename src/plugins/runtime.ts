@@ -19,6 +19,8 @@ import type { ResolvedPlugin } from "../config/types.js";
 import { Endpoint, channelFor } from "./protocol.js";
 import type { Json } from "./protocol.js";
 import type { DynamicBus, Subscription } from "../events/dynamic-bus.js";
+import { NamespaceRegistry } from "./namespace-registry.js";
+import type { Registration } from "./namespace-registry.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 // The built bootstrap (this file lives in dist/plugins/ after tsc).
@@ -65,6 +67,28 @@ export interface RuntimeOptions {
   bus?: DynamicBus;
 }
 
+// Per-plugin namespace-routing controller passed by the runtime to each
+// ManagedPlugin. The plugin's request handler calls these for the four
+// plugin.* messages (register/unregister are events on the plugin->core
+// direction; invoke/wait-for-active are requests). The runtime owns the
+// registry and knows about every plugin, so it can route invocations across
+// plugins.
+interface NamespaceController {
+  // Returns the registry (used for plugin death cleanup; tests).
+  registry(): NamespaceRegistry;
+  // Process a plugin.register one-way event from a worker.
+  onRegister(pluginName: string, payload: unknown): void;
+  // Process a plugin.unregister one-way event from a worker.
+  onUnregister(pluginName: string, payload: unknown): void;
+  // Handle a plugin.invoke request: look up the active winner for the
+  // namespace, forward as plugin.handle to that plugin's endpoint, relay
+  // the response (or reject if no active winner / method unknown).
+  onInvoke(callerName: string, payload: unknown): Promise<Json>;
+  // Handle a plugin.wait-for-active request: resolve when the namespace has
+  // an active winner, or reject on timeout.
+  onWaitForActive(callerName: string, payload: unknown): Promise<Json>;
+}
+
 export const DEFAULT_OPTIONS: RuntimeOptions = {
   heapMb: 128,
   pingIntervalMs: 1000,
@@ -77,6 +101,7 @@ class ManagedPlugin {
   readonly cfg: ResolvedPlugin;
   private opts: RuntimeOptions;
   private log: (msg: string) => void;
+  private ns: NamespaceController;
 
   state: PluginState = "spawning";
   private worker: Worker | null = null;
@@ -106,11 +131,19 @@ class ManagedPlugin {
   private firstSettle: { resolve: () => void } | null = null;
   readonly ready: Promise<void>;
 
-  constructor(cfg: ResolvedPlugin, opts: RuntimeOptions) {
+  constructor(cfg: ResolvedPlugin, opts: RuntimeOptions, ns: NamespaceController) {
     this.cfg = cfg;
     this.opts = opts;
+    this.ns = ns;
     this.log = opts.log ?? ((m) => console.log(m));
     this.ready = new Promise<void>((resolve) => { this.firstSettle = { resolve }; });
+  }
+
+  // Expose the endpoint so the runtime can send plugin.handle requests
+  // (cross-plugin invocations) to this plugin's worker. Returns null when the
+  // plugin is not live.
+  endpointHandle(): Endpoint | null {
+    return this.state === "live" ? this.endpoint : null;
   }
 
   private settleFirst(): void {
@@ -137,12 +170,22 @@ class ManagedPlugin {
     this.endpoint = endpoint;
     endpoint.handlePongs(() => { this.missed = 0; });
     endpoint.handleEvents((name, data) => { this.onPluginEvent(name, data); });
-    // Plugin->core requests (SDK GPU/surface brokering) delegate to onRequest.
+    // Plugin->core requests: try namespace plumbing first (plugin.invoke,
+    // plugin.wait-for-active), then fall back to onRequest (gpu/decoration
+    // brokers).
     const onReq = this.opts.onRequest;
-    if (onReq) {
-      endpoint.handleRequests(async (method, params) =>
-        (await onReq(this.cfg.name, method, params)) as import("./protocol.js").Json);
-    }
+    endpoint.handleRequests(async (method, params): Promise<Json> => {
+      if (method === "plugin.invoke") {
+        return await this.ns.onInvoke(this.cfg.name, params);
+      }
+      if (method === "plugin.wait-for-active") {
+        return await this.ns.onWaitForActive(this.cfg.name, params);
+      }
+      if (onReq) {
+        return (await onReq(this.cfg.name, method, params)) as Json;
+      }
+      throw new Error(`no handler for request '${method}'`);
+    });
 
     // The bootstrap posts {kind:'event', name:'init'} with {ok:true} or
     // {ok:false, error}. That is the init-resolve/reject signal.
@@ -175,6 +218,11 @@ class ManagedPlugin {
     if (name === "events.subscribe") { this.onEventsSubscribe(data); return; }
     if (name === "events.unsubscribe") { this.onEventsUnsubscribe(data); return; }
     if (name === "events.emit") { this.onEventsEmit(data); return; }
+
+    // Namespace registry interactions (sdk.registerPlugin / unregister).
+    // core-plugin-api.md §11.
+    if (name === "plugin.register") { this.ns.onRegister(this.cfg.name, data); return; }
+    if (name === "plugin.unregister") { this.ns.onUnregister(this.cfg.name, data); return; }
 
     // Surface other plugin->core events (scope B: `log`) to the observer.
     this.opts.onEvent?.(this.cfg.name, name, data);
@@ -267,6 +315,7 @@ class ManagedPlugin {
     this.stopWatchdog();
     this.terminating = true;
     this.releaseBusSubs();
+    this.ns.registry().unregisterAllFor(this.cfg.name);
     this.endpoint?.close(`plugin ${this.cfg.name} terminated`);
     void this.worker?.terminate();
   }
@@ -280,6 +329,7 @@ class ManagedPlugin {
   private onExit(code: number): void {
     this.stopWatchdog();
     this.releaseBusSubs();
+    this.ns.registry().unregisterAllFor(this.cfg.name);
     this.endpoint?.close(`plugin ${this.cfg.name} exited (code ${code})`);
     this.endpoint = null;
     this.worker = null;
@@ -323,6 +373,7 @@ class ManagedPlugin {
     this.stopWatchdog();
     if (!this.worker || !this.endpoint) {
       this.releaseBusSubs();
+      this.ns.registry().unregisterAllFor(this.cfg.name);
       this.state = "failed"; return;
     }
     this.state = "shutting-down";
@@ -353,19 +404,37 @@ class ManagedPlugin {
 }
 
 // The registry: owns all managed plugins.
-export class PluginRuntime {
+export class PluginRuntime implements NamespaceController {
   private plugins: ManagedPlugin[] = [];
   private opts: RuntimeOptions;
+  // Plugin namespace registry (sdk.registerPlugin / sdk.plugin). Shared
+  // across all managed plugins; the runtime is the namespace controller.
+  private nsRegistry = new NamespaceRegistry();
+  // Pending `plugin.wait-for-active` waiters, keyed by namespace. Each
+  // waiter's promise resolves when the registry's active winner appears (or
+  // rejects on timeout / when the waiting plugin dies).
+  private waiters = new Map<string, Set<{ resolve: () => void; reject: (e: Error) => void; timer: NodeJS.Timeout | null }>>();
 
   constructor(opts: Partial<RuntimeOptions> = {}) {
     this.opts = { ...DEFAULT_OPTIONS, ...opts };
+    // Resolve namespace waiters whenever the active winner appears.
+    this.nsRegistry.onActiveChange((ns, _prev, next) => {
+      if (!next) return;   // active became null; don't resolve waiters
+      const set = this.waiters.get(ns);
+      if (!set) return;
+      for (const w of set) {
+        if (w.timer) clearTimeout(w.timer);
+        w.resolve();
+      }
+      set.clear();
+    });
   }
 
   // Spawn every configured plugin and await each one's first settle (live or
   // failed). Returns the managed handles (for introspection / tests).
   async load(configs: readonly ResolvedPlugin[]): Promise<void> {
     for (const cfg of configs) {
-      const p = new ManagedPlugin(cfg, this.opts);
+      const p = new ManagedPlugin(cfg, this.opts, this);
       this.plugins.push(p);
       p.spawn();
     }
@@ -375,6 +444,14 @@ export class PluginRuntime {
   // Graceful shutdown of all plugins (parallel).
   async stop(): Promise<void> {
     await Promise.all(this.plugins.map((p) => p.stop()));
+  }
+
+  // Graceful shutdown of one plugin by name. Used by tests for failover
+  // scenarios; the main launcher uses rt.stop() (whole-runtime teardown).
+  // No-op if no such plugin or it isn't running.
+  async stopByName(pluginName: string): Promise<void> {
+    const p = this.plugins.find((x) => x.cfg.name === pluginName);
+    if (p) await p.stop();
   }
 
   // Push a one-way event to one plugin by name (core -> plugin). No-op if no such
@@ -391,6 +468,103 @@ export class PluginRuntime {
     return this.plugins.map((p) => ({
       name: p.cfg.name, state: p.currentState, restarts: p.restartCount,
     }));
+  }
+
+  // -- NamespaceController implementation --------------------------------
+  // Implements core-plugin-api.md §11 routing. The registry stores who claims
+  // what; this controller routes invocations across plugins and gates
+  // wait-for-active on registrations.
+
+  registry(): NamespaceRegistry { return this.nsRegistry; }
+
+  onRegister(pluginName: string, payload: unknown): void {
+    if (!isRegisterPayload(payload)) {
+      this.opts.log?.(`[plugin ${pluginName}] plugin.register: malformed payload; ignored`);
+      return;
+    }
+    const isBundled = !!this.cfgOf(pluginName)?.bundled;
+    const priority = typeof payload.priority === "number"
+      ? payload.priority
+      : (isBundled ? 0 : 100);
+    try {
+      this.nsRegistry.register({
+        pluginName, namespace: payload.namespace,
+        priority, methods: new Set(payload.methods),
+      });
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : String(err);
+      this.opts.log?.(`[plugin ${pluginName}] plugin.register('${payload.namespace}') rejected: ${msg}`);
+    }
+  }
+
+  onUnregister(pluginName: string, payload: unknown): void {
+    if (!isUnregisterPayload(payload)) {
+      this.opts.log?.(`[plugin ${pluginName}] plugin.unregister: malformed payload; ignored`);
+      return;
+    }
+    this.nsRegistry.unregister(pluginName, payload.namespace);
+  }
+
+  async onInvoke(callerName: string, payload: unknown): Promise<Json> {
+    if (!isInvokePayload(payload)) {
+      throw new Error("plugin.invoke: malformed payload");
+    }
+    const active = this.nsRegistry.active(payload.namespace);
+    if (!active) {
+      throw new Error(`plugin.invoke: no active plugin for namespace '${payload.namespace}'`);
+    }
+    if (!active.methods.has(payload.method)) {
+      throw new Error(
+        `plugin.invoke: '${payload.namespace}.${payload.method}' not registered ` +
+        `by '${active.pluginName}'`);
+    }
+    // The active plugin may be the caller itself. That's legal (a plugin can
+    // call its own API), but it means we route back into the same worker via
+    // the existing endpoint -- no special case needed.
+    const target = this.plugins.find((p) => p.cfg.name === active.pluginName);
+    const ep = target?.endpointHandle();
+    if (!ep) {
+      throw new Error(
+        `plugin.invoke: active plugin '${active.pluginName}' for ` +
+        `'${payload.namespace}' is not live`);
+    }
+    void callerName;   // recorded for future audit/policy; unused today
+    return await ep.request("plugin.handle", {
+      namespace: payload.namespace, method: payload.method, args: payload.args,
+    });
+  }
+
+  onWaitForActive(callerName: string, payload: unknown): Promise<Json> {
+    if (!isWaitForActivePayload(payload)) {
+      return Promise.reject(new Error("plugin.wait-for-active: malformed payload"));
+    }
+    void callerName;
+    if (this.nsRegistry.active(payload.namespace)) {
+      return Promise.resolve(null);
+    }
+    return new Promise<Json>((resolve, reject) => {
+      const set = this.waiters.get(payload.namespace) ?? new Set();
+      const entry = {
+        resolve: () => resolve(null),
+        reject,
+        timer: null as NodeJS.Timeout | null,
+      };
+      if (payload.timeoutMs > 0) {
+        entry.timer = setTimeout(() => {
+          set.delete(entry);
+          reject(new Error(
+            `plugin.wait-for-active('${payload.namespace}'): ` +
+            `timed out after ${payload.timeoutMs}ms`));
+        }, payload.timeoutMs);
+        entry.timer.unref?.();
+      }
+      set.add(entry);
+      this.waiters.set(payload.namespace, set);
+    });
+  }
+
+  private cfgOf(pluginName: string): ResolvedPlugin | undefined {
+    return this.plugins.find((p) => p.cfg.name === pluginName)?.cfg;
   }
 }
 
@@ -413,4 +587,34 @@ function isEmitPayload(d: unknown): d is { name: string; payload: Json } {
   return typeof d === "object" && d !== null
     && typeof (d as { name?: unknown }).name === "string"
     && "payload" in (d as object);
+}
+
+function isRegisterPayload(d: unknown): d is { namespace: string; methods: string[]; priority?: number } {
+  if (typeof d !== "object" || d === null) return false;
+  const o = d as { [k: string]: unknown };
+  if (typeof o.namespace !== "string" || o.namespace.length === 0) return false;
+  if (!Array.isArray(o.methods)) return false;
+  if (!o.methods.every((m) => typeof m === "string")) return false;
+  if (o.priority !== undefined && typeof o.priority !== "number") return false;
+  return true;
+}
+
+function isUnregisterPayload(d: unknown): d is { namespace: string } {
+  return typeof d === "object" && d !== null
+    && typeof (d as { namespace?: unknown }).namespace === "string";
+}
+
+function isInvokePayload(d: unknown): d is { namespace: string; method: string; args: Json[] } {
+  if (typeof d !== "object" || d === null) return false;
+  const o = d as { [k: string]: unknown };
+  return typeof o.namespace === "string"
+    && typeof o.method === "string"
+    && Array.isArray(o.args);
+}
+
+function isWaitForActivePayload(d: unknown): d is { namespace: string; timeoutMs: number } {
+  if (typeof d !== "object" || d === null) return false;
+  const o = d as { [k: string]: unknown };
+  return typeof o.namespace === "string"
+    && typeof o.timeoutMs === "number";
 }

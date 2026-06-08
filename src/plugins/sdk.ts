@@ -12,6 +12,9 @@ import type { PluginGpu } from "./gpu.js";
 import type { PluginWindowObserver } from "./window-observer.js";
 import type { PluginDecorations } from "./decorations.js";
 import type { PluginEvents } from "./events.js";
+import type {
+  PluginNamespace, InitFn, RegisterOptions, RegistrationHandle, RegisteredApi,
+} from "./namespace.js";
 
 export interface PluginSdk {
   // The plugin's stable name (config `name`, defaulting to its module).
@@ -25,6 +28,14 @@ export interface PluginSdk {
   // Always present; no capability gate (the bus is the primary observation
   // mechanism for everything plugin-facing).
   events: PluginEvents;
+  // Plugin namespace registry: claim a namespace ('workspace', 'layout', ...)
+  // by exposing an API; or consume another plugin's namespace. Both shapes are
+  // promoted to top-level for ergonomics so plugin authors don't write
+  // `sdk.namespace.registerPlugin`. core-plugin-api.md §11.
+  registerPlugin: <API extends RegisteredApi>(
+    name: string, init: InitFn<API>, opts?: RegisterOptions
+  ) => Promise<RegistrationHandle>;
+  plugin: <API extends RegisteredApi>(name: string) => Promise<API>;
   // GPU + overlay surfaces (present iff the plugin has the `gpu` capability and
   // the runtime brought the device up). Absent otherwise (capability by shape).
   gpu?: PluginGpu;
@@ -47,7 +58,7 @@ export interface SdkControl {
 }
 
 export function createSdk(name: string, emitLog: (line: string) => void,
-                          events: PluginEvents,
+                          events: PluginEvents, ns: PluginNamespace,
                           gpu?: PluginGpu, window?: PluginWindowObserver,
                           decorations?: PluginDecorations): SdkControl {
   let shutdownCb: ShutdownCallback | null = null;
@@ -63,6 +74,8 @@ export function createSdk(name: string, emitLog: (line: string) => void,
       shutdownCb = cb;
     },
     events,
+    registerPlugin: ns.registerPlugin,
+    plugin: ns.plugin,
     ...(gpu ? { gpu } : {}),
     ...(window ? { window } : {}),
     ...(decorations ? { decorations } : {}),

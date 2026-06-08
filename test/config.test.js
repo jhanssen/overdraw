@@ -43,7 +43,7 @@ test('object default export: validate + normalize + defaults applied', async () 
   // plugins resolve to full entries with defaults + the original raw object.
   assert.deepEqual(c.plugins, [{
     module: '/x.js', name: '/x.js', restart: 'on-failure',
-    maxRestarts: 3, windowSeconds: 60, raw: { module: '/x.js' },
+    maxRestarts: 3, windowSeconds: 60, bundled: false, raw: { module: '/x.js' },
   }]);
   assert.equal(c.sourcePath, p);
   rmSync(dir, { recursive: true, force: true });
@@ -89,6 +89,7 @@ test('plugin restart-policy fields: defaults, overrides, and validation', async 
     'export default { plugins: [{ module: "/a.js", name: "a", restart: "never", maxRestarts: 5, windowSeconds: 30 }] }'));
   assert.deepEqual(c.plugins[0], {
     module: '/a.js', name: 'a', restart: 'never', maxRestarts: 5, windowSeconds: 30,
+    bundled: false,
     raw: { module: '/a.js', name: 'a', restart: 'never', maxRestarts: 5, windowSeconds: 30 },
   });
   // invalid restart policy

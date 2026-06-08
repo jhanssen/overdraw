@@ -20,6 +20,7 @@ import { PluginRuntime } from "./plugins/index.js";
 import { createOverlayBroker } from "./overlay.js";
 import { createGpuBroker } from "./plugins/gpu-broker.js";
 import { createDecorationBroker } from "./plugins/decoration-broker.js";
+import { BUNDLED_PLUGINS, bundledToResolved } from "./plugins/bundled.js";
 import { JsCompositor } from "./gpu/compositor.js";
 import type { DawnWire, DawnGlobals } from "./gpu/compositor.js";
 import type { Addon, InputEvent } from "./types.js";
@@ -125,17 +126,35 @@ state = await installProtocols(addon, {
 console.log(`[overdraw] Wayland server listening.`);
 console.log(`[overdraw] run a client with:  WAYLAND_DISPLAY=${sock} <your-client>`);
 
-// Plugins (scope B: isolation + lifecycle + watchdog + restart; no GPU/window
-// SDK yet). A plugin `module` that looks like a filesystem path (absolute, or
-// starting with ./ or ../) is resolved relative to the config file's directory
-// (or cwd when no config file); bare specifiers pass through to the resolver.
-if (config.plugins.length > 0) {
+// Plugins. Bundled plugins ship with overdraw and load at priority 0 (the
+// floor of the namespace priority chain); user-config plugins load second at
+// the default priority of 100 (override-able). core-plugin-api.md §"No-plugin-
+// loaded fallback".
+//
+// A plugin `module` that looks like a filesystem path (absolute, or starting
+// with ./ or ../) is resolved relative to the config file's directory (or cwd
+// when no config file); bare specifiers pass through to the resolver.
+const bundledResolved = BUNDLED_PLUGINS.map((spec) => {
+  // Bundled modules are bare specifiers ('@overdraw/plugin-*'); the runtime
+  // resolves them via Node's normal module resolution. In dev, a path could
+  // also be used; treat the same as user-config path handling below for
+  // consistency.
+  const isPath = isAbsolute(spec.module)
+    || spec.module.startsWith("./") || spec.module.startsWith("../");
+  const module = isPath
+    ? pathToFileURL(resolvePath(process.cwd(), spec.module)).href
+    : spec.module;
+  return bundledToResolved(spec, module);
+});
+
+if (bundledResolved.length + config.plugins.length > 0) {
   const base = config.sourcePath ? dirname(config.sourcePath) : process.cwd();
-  const resolved = config.plugins.map((p) => {
+  const userResolved = config.plugins.map((p) => {
     const m = p.module;
     const isPath = isAbsolute(m) || m.startsWith("./") || m.startsWith("../");
     return isPath ? { ...p, module: pathToFileURL(resolvePath(base, m)).href } : p;
   });
+  const resolved = [...bundledResolved, ...userResolved];
   const overlays = createOverlayBroker(state, config.output ?? { width: dims.width, height: dims.height });
   const [dawnNodePath] = globSync(join(__dirname, "..", "build", "3rdparty", "dawn", "Dawn-*", "dawn.node"));
   const pluginAddonPath = join(__dirname, "..", "build", "overdraw_plugin_native.node");

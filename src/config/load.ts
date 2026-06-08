@@ -144,6 +144,7 @@ function normalize(raw: unknown, path: string): ResolvedConfig {
         restart: raw.restart ?? PLUGIN_DEFAULTS.restart,
         maxRestarts: raw.maxRestarts ?? PLUGIN_DEFAULTS.maxRestarts,
         windowSeconds: raw.windowSeconds ?? PLUGIN_DEFAULTS.windowSeconds,
+        bundled: false,   // user-config plugins are never bundled
         raw,
       });
     });
