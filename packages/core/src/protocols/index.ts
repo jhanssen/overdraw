@@ -14,7 +14,8 @@ import { readdirSync } from "node:fs";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { dirname, join } from "node:path";
 
-import { createWm, type LayoutParams } from "../wm/index.js";
+import { createWm } from "../wm/index.js";
+import type { LayoutDriver, LayoutSnapshot, LayoutApplyTarget } from "../wm/layout-driver.js";
 import { queryState } from "../query.js";
 import { applySubsurfaces } from "../subsurfaces.js";
 import { unmapAndTeardownSurface } from "./wl_surface.js";
@@ -85,9 +86,13 @@ export interface InstallOptions {
   // to the plugin runtime and the clipboard layer subscribes to keyboard.focus.
   // Optional: GPU-free protocol tests can omit it (emits become no-ops).
   bus?: CompositorBus;
-  // Tiling layout parameters (master fraction, gaps). Interim config point until a
-  // real config system exists. Defaults to DEFAULT_LAYOUT (0.5 master, 0 gap).
-  layout?: LayoutParams;
+  // Layout driver factory. main.ts passes a runtime-backed driver; GPU-free
+  // tests can pass an inline driver (or omit, in which case the WM uses a
+  // no-op driver that never moves windows). core-plugin-api.md §13.
+  layoutDriverFactory?: (
+    target: LayoutApplyTarget,
+    snapshot: () => LayoutSnapshot,
+  ) => LayoutDriver;
 }
 
 // Wire the protocol layer onto a started server. `addon` is the native module
@@ -144,7 +149,7 @@ export async function installProtocols(
     decorationResize: (windowId, outerRect, contentRect, insets) => {
       state.decorationResize?.(windowId, outerRect, contentRect, insets);
     },
-    layout: opts.layout,
+    layoutDriverFactory: opts.layoutDriverFactory,
   });
   // State-query channel (tests / introspection): a GPU-free snapshot of
   // geometry / focus / stacking. See src/query.ts.

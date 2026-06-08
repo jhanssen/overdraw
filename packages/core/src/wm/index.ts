@@ -11,9 +11,8 @@
 
 import type { Resource } from "../types.js";
 import type { CompositorSink } from "../protocols/ctx.js";
-import { masterStackLayout, DEFAULT_LAYOUT, type LayoutParams } from "./placement.js";
-
-export type { LayoutParams } from "./placement.js";
+import type { LayoutWindow, LayoutResult, LayoutReason } from "@overdraw/layout-types";
+import type { LayoutDriver, LayoutSnapshot, LayoutApplyTarget } from "./layout-driver.js";
 
 export interface Rect { x: number; y: number; width: number; height: number; }
 export interface Output { width: number; height: number; }
@@ -82,7 +81,7 @@ export interface Window {
   state: Map<string, unknown>;
 }
 
-export interface WmState { output: Output; windows: Window[]; layout: LayoutParams; }
+export interface WmState { output: Output; windows: Window[]; }
 
 // Configure sink: ask the protocol layer to send a sized configure to a window's
 // toplevel (xdg_toplevel.configure + xdg_surface.configure with a fresh serial).
@@ -111,16 +110,26 @@ export interface InsetGrant { insets: Insets; outerRect: Rect; contentRect: Rect
 export interface Wm {
   state: WmState;
   // Proactive: called at get_toplevel (role assignment), BEFORE the client has
-  // content. Inserts the window into the layout (as the new master), recomputes
-  // tiles for the whole set, and configures every window whose content size
-  // changed (including the new one). The window is not drawn until it commits
-  // content (windowHasContent). Returns the new window's content rect.
+  // content. Inserts the window into the layout (as the new master) and
+  // SCHEDULES a layout pass. The pass runs asynchronously through the layout
+  // driver; results are applied (push setSurfaceLayout to the compositor +
+  // fire configure) when compute() resolves. Idempotent for an already-added
+  // surface.
+  //
+  // The returned rect is the window's CURRENT content rect (the placeholder
+  // sentinel until the first layout settles, then the assigned content rect).
+  // Callers needing the settled rect should `await wm.settled()` first.
   addWindow(surfaceId: number, surfaceRec: SurfaceHandle): Rect;
   // The window committed its first presentable content: add it to the draw stack.
-  // Geometry was already assigned by addWindow. Returns the content rect, or
-  // undefined if the window is not tracked.
+  // Returns the current content rect (the placeholder until layout has
+  // settled, then the assigned rect). Returns undefined when the window
+  // isn't tracked.
   windowHasContent(surfaceId: number): Rect | undefined;
   unmapWindow(surfaceId: number): void;
+  // Resolves when the layout has fully settled (no compute pending or in
+  // flight). After addWindow / unmapWindow / setInsets, callers waiting on
+  // post-layout geometry should await this.
+  settled(): Promise<void>;
   windowAt(x: number, y: number): Window | null;
   // Reserve decoration insets INSIDE a window's outer tile. SUBTRACTIVE: the
   // window's content rect = its outer tile shrunk by the insets, so the
@@ -210,11 +219,18 @@ function contentOf(win: Window): Rect {
 // fires when a decorated window's OUTER tile changes (move/resize); the broker
 // uses it to forward a `decoration.resized` event to the owning plugin so it
 // can redraw its ring at the new size.
+//
+// `layoutDriverFactory` builds the driver once the WM has an apply-target
+// (the WM passes itself in). Tests pass an inline driver (synchronous fake
+// layout); main.ts passes a runtime-backed driver. When omitted, the WM
+// constructs a no-op driver: schedule() does nothing, settled() resolves
+// immediately. That mode is used by the existing GPU-free tests that don't
+// care about layout output and don't want a runtime spinning up.
 export interface WmOptions {
   rebuild?: () => void;
   configure?: ConfigureSink;
   decorationResize?: DecorationResizeSink;
-  layout?: LayoutParams;
+  layoutDriverFactory?: (target: LayoutApplyTarget, snapshot: () => LayoutSnapshot) => LayoutDriver;
 }
 
 export function createWm(
@@ -222,19 +238,19 @@ export function createWm(
   output: Output,
   optsOrRebuild?: WmOptions | (() => void),
   configure?: ConfigureSink,
-  layout: LayoutParams = DEFAULT_LAYOUT,
 ): Wm {
   // Backwards-compatible parameter shape: callers may pass either the new
-  // WmOptions object as the third arg, or the previous (rebuild, configure,
-  // layout) positional triple. installProtocols + the GPU test harnesses use
-  // the new shape; the pre-existing GPU-free unit tests still use the old one.
+  // WmOptions object as the third arg, or the previous (rebuild, configure)
+  // positional pair. installProtocols + the GPU test harnesses use the new
+  // shape; the pre-existing GPU-free unit tests still use the old one.
   let rebuild: (() => void) | undefined;
   let decorationResize: DecorationResizeSink | undefined;
+  let layoutDriverFactory: WmOptions["layoutDriverFactory"];
   if (optsOrRebuild && typeof optsOrRebuild === "object") {
     rebuild = optsOrRebuild.rebuild;
     configure = optsOrRebuild.configure ?? configure;
     decorationResize = optsOrRebuild.decorationResize;
-    layout = optsOrRebuild.layout ?? layout;
+    layoutDriverFactory = optsOrRebuild.layoutDriverFactory;
   } else {
     rebuild = optsOrRebuild as (() => void) | undefined;
   }
@@ -242,7 +258,7 @@ export function createWm(
   // window is inserted at the front (becomes master). Draw order is back-to-front
   // = reverse of this list (master drawn last/on-top is NOT desired; see pushStack).
   const windows: Window[] = [];
-  const wm: WmState = { output, windows, layout };
+  const wm: WmState = { output, windows };
 
   function pushStack(): void {
     // Prefer the full rebuild (windows interleaved with their decorations +
@@ -260,16 +276,22 @@ export function createWm(
     compositor.setStack(ids);
   }
 
-  // Recompute every window's outer tile from the current count + order, update
-  // content rects, push layout for windows that have content, and configure any
-  // window whose content size changed. The single place geometry is assigned.
-  function relayout(): void {
-    const tiles = masterStackLayout(windows.length, output, layout);
-    for (let i = 0; i < windows.length; i++) {
-      const win = windows[i];
+  // Apply a LayoutResult: update each window's outer rect to match, push the
+  // compositor's setSurfaceLayout for mapped windows, fire configure where
+  // size changed, and update bound decorations. Windows omitted from the
+  // result keep their previous geometry (a layout that wants to hide a
+  // window should leave it out; the driver doesn't auto-hide).
+  function applyLayout(result: LayoutResult, _reason: LayoutReason): void {
+    void _reason;
+    // Index by id for O(1) lookup; layouts may return rects in arbitrary order.
+    const byId = new Map<number, { id: number; outer: Rect }>();
+    for (const r of result.rects) byId.set(r.id, r);
+    for (const win of windows) {
+      const r = byId.get(win.surfaceId);
+      if (!r) continue;   // layout omitted this window: leave its geometry
       const prevContent = contentOf(win);
       const prevOuter = win.outer;
-      win.outer = tiles[i];
+      win.outer = { ...r.outer };
       const content = contentOf(win);
       win.rect = content;
       // Drawn position follows the content rect; only meaningful once mapped.
@@ -281,16 +303,11 @@ export function createWm(
         configure(win.surfaceId, content.width, content.height);
       }
       // Decoration follow-up: the OUTER tile changed -> reposition the existing
-      // decoration surface NOW (so its already-allocated texture composites at
-      // the new rect; without this the previous outer rect is still painted,
-      // overdrawing the neighbor window after retiling), AND fire the
-      // decoration-resize sink so the owning plugin can redraw at the new size.
+      // decoration surface NOW + fire the decoration-resize sink so the owning
+      // plugin can redraw at the new size.
       const outerMoved = prevOuter.x !== win.outer.x || prevOuter.y !== win.outer.y
                       || prevOuter.width !== win.outer.width || prevOuter.height !== win.outer.height;
       if (win.decorationSurfaceId !== undefined && outerMoved) {
-        // Immediate visual fix: clamp the decoration to the new outer rect. The
-        // texture itself is still the old size -- the plugin redraw below will
-        // replace it.
         compositor.setSurfaceLayout(win.decorationSurfaceId,
           win.outer.x, win.outer.y, win.outer.width, win.outer.height);
         if (decorationResize && win.insets) {
@@ -300,20 +317,52 @@ export function createWm(
     }
   }
 
+  // Build a LayoutSnapshot from the current WM state. Called by the driver
+  // each compute(). Caller never holds the references; immutable for the
+  // duration of one compute.
+  function snapshot(): LayoutSnapshot {
+    const layoutWindows: LayoutWindow[] = windows.map((w) => ({
+      id: w.surfaceId,
+      role: "toplevel" as const,
+      hints: {
+        floating: w.hints.floating,
+        wantsFullscreen: w.hints.fullscreen,
+        wantsMaximized: w.hints.maximized,
+        wantsMinimized: w.hints.minimized,
+      },
+      currentRect: { ...w.outer },
+    }));
+    return { output: { width: output.width, height: output.height }, windows: layoutWindows };
+  }
+
+  // Build the driver. When no factory is provided, use a stub that does
+  // nothing (schedule is a no-op, settled() resolves immediately). This is
+  // the mode for GPU-free unit tests that don't exercise layout output but
+  // need a working WM for stack / focus / insets bookkeeping.
+  const target: LayoutApplyTarget = { apply: applyLayout };
+  const driver: LayoutDriver = layoutDriverFactory
+    ? layoutDriverFactory(target, snapshot)
+    : { schedule: () => { /* no-op */ }, settled: () => Promise.resolve() };
+
   return {
     state: wm,
 
-    // Proactive: insert at the front (new window becomes master), recompute the
-    // whole layout, configure all windows whose content size changed. Geometry is
-    // assigned here, before the client has content.
+    // Proactive: insert at the front (new window becomes master) and SCHEDULE
+    // a layout pass. The pass runs through the layout driver asynchronously;
+    // when its compute() resolves, the driver calls applyLayout(), which
+    // assigns outer/rect and fires configure for any window whose content size
+    // changed (including the new one).
+    //
+    // The returned rect is the placeholder sentinel until layout settles;
+    // callers needing the assigned rect should `await wm.settled()`.
     addWindow(surfaceId, surfaceRec) {
       const existing = windows.find((w) => w.surfaceId === surfaceId);
       if (existing) return contentOf(existing); // idempotent
       const win: Window = {
         surfaceId,
-        // Provisional sentinel (-1 size) so relayout() always detects a change for
-        // the new window and sends its first configure, even when its computed tile
-        // happens to match the output size (single-window case).
+        // Provisional sentinel (-1 size) so the first layout pass always
+        // detects a change for the new window and sends its first configure,
+        // even when its computed tile happens to match the output size.
         outer: { x: 0, y: 0, width: -1, height: -1 },
         rect: { x: 0, y: 0, width: -1, height: -1 },
         surfaceRec,
@@ -321,7 +370,7 @@ export function createWm(
         state: new Map<string, unknown>(),
       };
       windows.unshift(win); // front = master
-      relayout();           // assigns outer/rect + configures the new window + reflows others
+      driver.schedule("mapped");
       return win.rect;
     },
 
@@ -342,9 +391,11 @@ export function createWm(
       const i = windows.findIndex((w) => w.surfaceId === surfaceId);
       if (i < 0) return;
       windows.splice(i, 1);
-      relayout();   // remaining windows reflow + get reconfigured
+      driver.schedule("unmapped");   // remaining windows reflow when compute resolves
       pushStack();
     },
+
+    settled() { return driver.settled(); },
 
     setInsets(surfaceId, insets) {
       const win = windows.find((w) => w.surfaceId === surfaceId);

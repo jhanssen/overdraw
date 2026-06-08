@@ -5,7 +5,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 
-import { masterStackLayout, DEFAULT_LAYOUT } from '../packages/core/dist/wm/placement.js';
+import { masterStackLayout, DEFAULT_LAYOUT } from '../../packages/plugin-layout-master-stack/dist/master-stack.js';
 
 const OUT = { width: 1000, height: 600 };
 

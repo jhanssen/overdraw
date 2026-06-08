@@ -28,10 +28,20 @@ export interface BundledPluginSpec {
   module: string;
 }
 
-// The canonical list of bundled plugins. Empty in Phase 0b. Phase 2 adds the
-// layout plugin here.
+// The canonical list of bundled plugins. Each ships with overdraw and is
+// resolved as a bare npm package specifier via Node's module resolution
+// (workspace symlinks point at packages/plugin-<name>/dist/index.js).
+//
+// Adding a new bundled plugin: add a workspace package under
+// packages/, declare its `name` here, and `npm install` to refresh the
+// symlinks. The runtime will load it on boot at priority 0.
 export const BUNDLED_PLUGINS: ReadonlyArray<BundledPluginSpec> = [
-  // Phase 2: { name: "layout-master-stack", module: "@overdraw/plugin-layout-master-stack" },
+  {
+    // Master-stack tiling layout (dwm-style). The floor of the 'layout'
+    // namespace; replaceable by a higher-priority user plugin.
+    name: "layout-master-stack",
+    module: "@overdraw/plugin-layout-master-stack",
+  },
 ];
 
 // Convert a bundled plugin spec to a ResolvedPlugin (the runtime's loading

@@ -496,6 +496,29 @@ export class PluginRuntime implements PluginController {
     return this.onActionList("<external>", null);
   }
 
+  // External-caller API for invoking a method on the active plugin in a
+  // namespace (core-plugin-api.md §11 + §13). Used by core-side drivers
+  // (the layout driver, focus driver) that need to call into a plugin
+  // without going through the worker SDK. Args are passed positionally;
+  // returns the plugin's result.
+  //
+  // Rejects if no plugin claims the namespace OR the method is unregistered.
+  // Caller may catch + handle (e.g. the layout driver leaves windows alone
+  // when compute rejects).
+  invokeNamespace(namespace: string, method: string, args: Json[]): Promise<Json> {
+    return this.onInvoke("<external>", { namespace, method, args });
+  }
+
+  // External-caller API for awaiting a namespace registration. Resolves when
+  // some plugin claims `namespace`; rejects on timeout. Used by core-side
+  // drivers that need to wait for their plugin before the system can serve
+  // requests (e.g. the layout driver waits for the 'layout' namespace
+  // before the WM applies its first layout).
+  waitForNamespace(namespace: string, timeoutMs: number = 5_000): Promise<void> {
+    return this.onWaitForActive("<external>", { namespace, timeoutMs })
+      .then(() => undefined);
+  }
+
   // -- NamespaceController implementation --------------------------------
   // Implements core-plugin-api.md §11 routing. The registry stores who claims
   // what; this controller routes invocations across plugins and gates

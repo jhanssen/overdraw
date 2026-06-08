@@ -7,6 +7,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 
 import { createWm } from '../packages/core/dist/wm/index.js';
+import { inlineMasterStackDriverFactory } from './wm-helpers.mjs';
 import { queryState } from '../packages/core/dist/query.js';
 
 function mockAddon() {
@@ -17,7 +18,11 @@ function mockAddon() {
 function makeState(output = { width: 1920, height: 1080 }) {
   const surfaces = new Map();   // resource -> SurfaceRecord
   const toplevels = new Map();  // toplevel resource -> ToplevelRecord
-  const wm = createWm(mockAddon(), output);
+  // Inline master-stack driver so addToplevel windows pick up real rects on
+  // settle (otherwise the WM's no-op driver leaves them as placeholders).
+  const wm = createWm(mockAddon(), output, {
+    layoutDriverFactory: inlineMasterStackDriverFactory,
+  });
 
   const state = {
     surfaces, toplevels, nextSerial: 1,
@@ -27,7 +32,9 @@ function makeState(output = { width: 1920, height: 1080 }) {
   };
 
   // Helper: create a mapped toplevel surface with title/app_id and map it.
-  function addToplevel(id, { title = null, appId = null, w = 200, h = 100 } = {}) {
+  // Async because the inline layout driver compute() resolves on the next
+  // microtask; callers `await addToplevel(...)`.
+  async function addToplevel(id, { title = null, appId = null, w = 200, h = 100 } = {}) {
     const surfaceRes = { __surface: id };
     const toplevelRes = { __toplevel: id };
     const xdgSurface = { resource: { __xdg: id }, role: 'toplevel', toplevel: toplevelRes };
@@ -39,6 +46,7 @@ function makeState(output = { width: 1920, height: 1080 }) {
     (state.surfacesById ??= new Map()).set(id, surfaceRec);
     toplevels.set(toplevelRes, { resource: toplevelRes, xdgSurface, title, appId });
     wm.addWindow(id, surfaceRec);
+    await wm.settled();
     wm.windowHasContent(id);
     return surfaceRec;
   }
@@ -56,9 +64,9 @@ test('queryState: empty compositor', () => {
   assert.equal(snap.keyboardFocus, null);
 });
 
-test('queryState: windows with geometry, title, app_id, role', () => {
+test('queryState: windows with geometry, title, app_id, role', async () => {
   const { state, addToplevel } = makeState();
-  addToplevel(1, { title: 'term', appId: 'foot', w: 300, h: 200 });
+  await addToplevel(1, { title: 'term', appId: 'foot', w: 300, h: 200 });
 
   const snap = queryState(state);
   assert.equal(snap.windows.length, 1);
@@ -73,21 +81,21 @@ test('queryState: windows with geometry, title, app_id, role', () => {
   assert.equal(win.rect.height, 1080);
 });
 
-test('queryState: window order is layout order (master first)', () => {
+test('queryState: window order is layout order (master first)', async () => {
   const { state, addToplevel } = makeState();
-  addToplevel(1);
-  addToplevel(2);
-  addToplevel(3);
+  await addToplevel(1);
+  await addToplevel(2);
+  await addToplevel(3);
   const snap = queryState(state);
   // Each new window becomes master (inserted at the front); order is [3, 2, 1].
   assert.deepEqual(snap.stack, [3, 2, 1]);
   assert.deepEqual(snap.windows.map((w) => w.surfaceId), [3, 2, 1]);
 });
 
-test('queryState: reflects pointer + keyboard focus', () => {
+test('queryState: reflects pointer + keyboard focus', async () => {
   const { state, addToplevel } = makeState();
-  addToplevel(1);
-  addToplevel(2);
+  await addToplevel(1);
+  await addToplevel(2);
   state.seat.focus = { surfaceId: 2 };
   state.seat.kbFocus = { surfaceId: 1 };
   const snap = queryState(state);
@@ -95,9 +103,9 @@ test('queryState: reflects pointer + keyboard focus', () => {
   assert.equal(snap.keyboardFocus, 1);
 });
 
-test('queryState: window missing a toplevel record yields null title/appId', () => {
+test('queryState: window missing a toplevel record yields null title/appId', async () => {
   const { state, addToplevel } = makeState();
-  const rec = addToplevel(1);
+  const rec = await addToplevel(1);
   // Drop the toplevel record but keep the window mapped.
   state.toplevels.delete(rec.xdgSurface.toplevel);
   const snap = queryState(state);
@@ -105,9 +113,9 @@ test('queryState: window missing a toplevel record yields null title/appId', () 
   assert.equal(snap.windows[0].appId, null);
 });
 
-test('queryState: snapshot is serializable (JSON round-trips)', () => {
+test('queryState: snapshot is serializable (JSON round-trips)', async () => {
   const { state, addToplevel } = makeState();
-  addToplevel(1, { title: 'a', appId: 'b' });
+  await addToplevel(1, { title: 'a', appId: 'b' });
   const snap = queryState(state);
   const round = JSON.parse(JSON.stringify(snap));
   assert.deepEqual(round, snap);

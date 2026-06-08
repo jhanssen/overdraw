@@ -15,6 +15,7 @@ import { dirname, join, isAbsolute, resolve as resolvePath } from "node:path";
 import { globSync } from "node:fs";
 
 import { installProtocols } from "./protocols/index.js";
+import { createLayoutDriver } from "./wm/layout-driver.js";
 import { parseConfigArg, loadConfig } from "./config/load.js";
 import { PluginRuntime } from "./plugins/index.js";
 import { createOverlayBroker } from "./overlay.js";
@@ -125,11 +126,35 @@ const compositor: CompositorSink = new JsCompositor(device, dawn.globals, addon,
 console.log("[overdraw] compositor: JS (over the Dawn wire)");
 
 const sock = addon.startServer();
+
+// The WM needs a layout driver before installProtocols creates it; the driver
+// invokes the layout plugin via the runtime; the runtime is created later.
+// Use a forward-reference closure: by the time the first compute() fires
+// (on a Wayland commit), runtime.load(resolved) has run and the bundled
+// 'layout' plugin has registered. waitForNamespace handles the boot race
+// where addWindow could fire before plugins finish init.
 state = await installProtocols(addon, {
   output: config.output ?? { width: dims.width, height: dims.height },
   focus: config.focus,
   compositor,
   bus,
+  layoutDriverFactory: (target, snapshot) => createLayoutDriver({
+    target, snapshot,
+    compute: async (inputs) => {
+      if (!runtime) throw new Error("layout: runtime not initialized");
+      await runtime.waitForNamespace("layout");
+      // LayoutInputs is structurally a Json (numbers/strings/objects/arrays);
+      // the wire Json type machinery doesn't model the optional fields, hence
+      // the cast.
+      // eslint-disable-next-line no-restricted-syntax
+      const args = [inputs as unknown as import("./plugins/protocol.js").Json];
+      const result = await runtime.invokeNamespace("layout", "compute", args);
+      // LayoutResult is by-contract returned by the plugin (LayoutAPI); cast
+      // it back at the boundary. The plugin author is responsible for shape.
+      // eslint-disable-next-line no-restricted-syntax
+      return result as unknown as import("@overdraw/layout-types").LayoutResult;
+    },
+  }),
 });
 
 console.log(`[overdraw] Wayland server listening.`);

@@ -1,0 +1,16 @@
+{
+  "name": "@overdraw/plugin-layout-master-stack",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Bundled layout plugin: dwm-style master-stack tiling. Ships with overdraw and registers in the 'layout' namespace at priority 0 (the floor of the priority chain). User configs may override by registering a higher-priority layout plugin in the same namespace.",
+  "type": "module",
+  "main": "./dist/index.js",
+  "exports": {
+    ".": {
+      "default": "./dist/index.js"
+    }
+  },
+  "dependencies": {
+    "@overdraw/layout-types": "*"
+  }
+}

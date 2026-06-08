@@ -9,7 +9,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 
 import { setupCompositor, canRunGpu, loadDawn } from "./harness.mjs";
-import { masterStackLayout } from "../packages/core/dist/wm/placement.js";
+import { masterStackLayout } from "../packages/plugin-layout-master-stack/dist/master-stack.js";
 
 const skip = !canRunGpu() ? "needs GPU (WAYLAND_DISPLAY unset)"
   : (!loadDawn() ? "dawn.node not built" : false);

@@ -11,6 +11,7 @@ import { WINDOW_EVENT } from '../packages/core/dist/events/types.js';
 import { createDecorationRegistry } from '../packages/core/dist/decorations.js';
 import { createDecorationBroker } from '../packages/core/dist/plugins/decoration-broker.js';
 import { createWm } from '../packages/core/dist/wm/index.js';
+import { inlineMasterStackDriverFactory } from './wm-helpers.mjs';
 
 function setup() {
   const bus = new TypedBus();
@@ -118,7 +119,9 @@ function brokerSetup(timeoutMs) {
   const bus = new TypedBus();
   const stacks = [];
   const sink = { setSurfaceLayout() {}, setStack(ids) { stacks.push([...ids]); } };
-  const wm = createWm(sink, { width: 1280, height: 720 });
+  const wm = createWm(sink, { width: 1280, height: 720 }, {
+    layoutDriverFactory: inlineMasterStackDriverFactory,
+  });
   const emits = [];
   const broker = createDecorationBroker({
     bus, state: { wm }, timeoutMs,
@@ -128,18 +131,20 @@ function brokerSetup(timeoutMs) {
 }
 
 // Add + map a matching window and assign it to provider `deco`. Returns the
-// window's outer tile (where the decoration draws).
-function mapAssigned(bus, wm, broker, surfaceId = 1, appId = 'app') {
+// window's outer tile (where the decoration draws). Awaits the WM's layout
+// to settle so the assigned rect matches the master-stack output.
+async function mapAssigned(bus, wm, broker, surfaceId = 1, appId = 'app') {
   broker.onRequest('deco', 'decoration.register', { pattern: appId });
   wm.addWindow(surfaceId, { resource: {} });
+  await wm.settled();
   const rect = wm.windowHasContent(surfaceId);
   bus.emit(WINDOW_EVENT.map, { surfaceId, appId, title: null, rect });
   return rect;
 }
 
-test('createDecoration: assigned plugin gets the grant', () => {
+test('createDecoration: assigned plugin gets the grant', async () => {
   const { bus, wm, broker } = brokerSetup();
-  const rect = mapAssigned(bus, wm, broker, 1);
+  const rect = await mapAssigned(bus, wm, broker, 1);
   const grant = broker.onRequest('deco', 'decoration.createDecoration',
     { windowId: 1, insets: { top: 24, right: 0, bottom: 0, left: 0 } });
   assert.deepEqual(grant.insets, { top: 24, right: 0, bottom: 0, left: 0 });
@@ -149,9 +154,9 @@ test('createDecoration: assigned plugin gets the grant', () => {
   assert.deepEqual(grant.contentRect, { x: rect.x, y: rect.y + 24, width: rect.width, height: rect.height - 24 });
 });
 
-test('createDecoration: a plugin NOT assigned the window is rejected', () => {
+test('createDecoration: a plugin NOT assigned the window is rejected', async () => {
   const { bus, wm, broker } = brokerSetup();
-  mapAssigned(bus, wm, broker, 1);
+  await mapAssigned(bus, wm, broker, 1);
   assert.throws(
     () => broker.onRequest('intruder', 'decoration.createDecoration',
       { windowId: 1, insets: { top: 1, right: 1, bottom: 1, left: 1 } }),
@@ -163,18 +168,18 @@ test('register: invalid params rejected (missing pattern)', () => {
   assert.throws(() => broker.onRequest('p', 'decoration.register', {}), /pattern/);
 });
 
-test('gating: assignment gates the window out of the stack', () => {
+test('gating: assignment gates the window out of the stack', async () => {
   const { bus, wm, broker } = brokerSetup();
-  mapAssigned(bus, wm, broker, 1);
+  await mapAssigned(bus, wm, broker, 1);
   assert.equal(wm.isContentGated(1), true, 'gated on assignment');
   // The content stack (last setStack) excludes the gated window.
   // mapWindow pushed [1]; the gate re-pushed [].
   assert.deepEqual(wm.state.windows.map((w) => w.surfaceId), [1], 'still a known window');
 });
 
-test('gating: first decoration present releases the gate (atomic appearance)', () => {
+test('gating: first decoration present releases the gate (atomic appearance)', async () => {
   const { bus, wm, broker } = brokerSetup();
-  mapAssigned(bus, wm, broker, 1);
+  await mapAssigned(bus, wm, broker, 1);
   // Plugin creates the decoration surface (tagged decorates=1) -> the gpu broker
   // would call onSurfaceAllocated; simulate the surface id the alloc returned.
   broker.onRequest('deco', 'decoration.createDecoration',
@@ -185,16 +190,16 @@ test('gating: first decoration present releases the gate (atomic appearance)', (
   assert.equal(wm.isContentGated(1), false, 'released on first present');
 });
 
-test('gating: a non-decoration surface present does not release anything', () => {
+test('gating: a non-decoration surface present does not release anything', async () => {
   const { bus, wm, broker } = brokerSetup();
-  mapAssigned(bus, wm, broker, 1);
+  await mapAssigned(bus, wm, broker, 1);
   broker.onSurfacePresented(999);   // unrelated surface
   assert.equal(wm.isContentGated(1), true, 'still gated');
 });
 
 test('timeout: provider that never draws is deregistered + content released + notified', async () => {
   const { bus, wm, broker, emits } = brokerSetup(30);   // 30ms deadline
-  mapAssigned(bus, wm, broker, 1);
+  await mapAssigned(bus, wm, broker, 1);
   assert.equal(wm.isContentGated(1), true);
   await new Promise((r) => setTimeout(r, 80));
   assert.equal(wm.isContentGated(1), false, 'content released (shown undecorated) on timeout');
@@ -211,7 +216,7 @@ test('timeout: provider that never draws is deregistered + content released + no
 
 test('unmap before draw releases the gate (no leak, no timeout fire)', async () => {
   const { bus, wm, broker, emits } = brokerSetup(30);
-  mapAssigned(bus, wm, broker, 1);
+  await mapAssigned(bus, wm, broker, 1);
   bus.emit(WINDOW_EVENT.unmap, { surfaceId: 1 });
   await new Promise((r) => setTimeout(r, 80));
   // No deregister (the window just went away; provider stays registered).
