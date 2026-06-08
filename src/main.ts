@@ -29,6 +29,7 @@ import type { CompositorSink, CompositorState } from "./protocols/ctx.js";
 import { WINDOW_EVENT } from "./events/types.js";
 import { createCompositorBus } from "./events/window-bus.js";
 import { DynamicBus } from "./events/dynamic-bus.js";
+import { IpcServer } from "./ipc/server.js";
 
 const require = createRequire(import.meta.url);
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -77,6 +78,8 @@ bus.on(WINDOW_EVENT.map, (ev) => { pluginBus.emit(WINDOW_EVENT.map, ev); });
 bus.on(WINDOW_EVENT.unmap, (ev) => { pluginBus.emit(WINDOW_EVENT.unmap, ev); });
 bus.on(WINDOW_EVENT.change, (ev) => { pluginBus.emit(WINDOW_EVENT.change, ev); });
 
+let ipcServer: IpcServer | null = null;
+
 let stopped = false;
 function shutdown(signal: string): void {
   if (stopped) return;
@@ -89,11 +92,16 @@ function shutdown(signal: string): void {
     try { addon.stop(); } catch { /* ignore */ }
     process.exit(0);
   };
+  // Stop IPC first (synchronous-ish; awaits socket close + unlink). The IPC
+  // server runs alongside the runtime, so order doesn't matter for safety;
+  // doing IPC first ensures no in-flight requests during the runtime teardown.
+  const stopIpc = ipcServer ? ipcServer.stop().catch(() => {}) : Promise.resolve();
   if (runtime) {
-    void runtime.stop().then(finish, finish);
+    const r = runtime;
+    void stopIpc.then(() => r.stop()).then(finish, finish);
     setTimeout(finish, 3000).unref();
   } else {
-    finish();
+    void stopIpc.then(finish, finish);
   }
 }
 process.on("SIGINT", () => shutdown("SIGINT"));
@@ -148,74 +156,84 @@ const bundledResolved = BUNDLED_PLUGINS.map((spec) => {
   return bundledToResolved(spec, module);
 });
 
-if (bundledResolved.length + config.plugins.length > 0) {
-  const base = config.sourcePath ? dirname(config.sourcePath) : process.cwd();
-  const userResolved = config.plugins.map((p) => {
-    const m = p.module;
-    const isPath = isAbsolute(m) || m.startsWith("./") || m.startsWith("../");
-    return isPath ? { ...p, module: pathToFileURL(resolvePath(base, m)).href } : p;
-  });
-  const resolved = [...bundledResolved, ...userResolved];
-  const overlays = createOverlayBroker(state, config.output ?? { width: dims.width, height: dims.height });
-  const [dawnNodePath] = globSync(join(__dirname, "..", "build", "3rdparty", "dawn", "Dawn-*", "dawn.node"));
-  const pluginAddonPath = join(__dirname, "..", "build", "overdraw_plugin_native.node");
+const base = config.sourcePath ? dirname(config.sourcePath) : process.cwd();
+const userResolved = config.plugins.map((p) => {
+  const m = p.module;
+  const isPath = isAbsolute(m) || m.startsWith("./") || m.startsWith("../");
+  return isPath ? { ...p, module: pathToFileURL(resolvePath(base, m)).href } : p;
+});
+const resolved = [...bundledResolved, ...userResolved];
 
-  // Decoration broker: services decoration.* requests + owns the app_id-regex
-  // provider registry + the content-gating state machine. emitToPlugin lazily
-  // references `runtime` (assigned below; matches fire only after a client maps).
-  const decorationBroker = createDecorationBroker({
-    bus,
-    state,
-    emitToPlugin: (plugin, name, data) => { runtime?.emit(plugin, name, data); },
-  });
-  // Wire the WM's decoration-resize indirection through the broker, so an outer
-  // tile change (relayout/insets) becomes a decoration.resized event to the
-  // owning plugin. Done after broker creation; state.decorationResize is a
-  // settable hook on CompositorState the WM calls.
-  state.decorationResize = (windowId, outerRect, contentRect, insets) =>
-    decorationBroker.onDecorationResized(windowId, outerRect, contentRect, insets);
+const overlays = createOverlayBroker(state, config.output ?? { width: dims.width, height: dims.height });
+const [dawnNodePath] = globSync(join(__dirname, "..", "build", "3rdparty", "dawn", "Dawn-*", "dawn.node"));
+const pluginAddonPath = join(__dirname, "..", "build", "overdraw_plugin_native.node");
 
-  // GPU broker: services plugin Worker GPU/surface requests (connection, surface
-  // alloc, fence dance, overlay/decoration compositing). The generic surface hooks
-  // feed the decoration broker (surface<->window link + first-present release).
-  const gpuBroker = createGpuBroker({
-    addon, compositor, overlays, dawn, coreDeviceHandle: h.device,
-    onSurfaceAllocated: (sid, win) => decorationBroker.onSurfaceAllocated(sid, win),
-    onSurfacePresented: (sid) => decorationBroker.onSurfacePresented(sid),
-  });
+// Decoration broker: services decoration.* requests + owns the app_id-regex
+// provider registry + the content-gating state machine. emitToPlugin lazily
+// references `runtime` (assigned below; matches fire only after a client maps).
+const decorationBroker = createDecorationBroker({
+  bus,
+  state,
+  emitToPlugin: (plugin, name, data) => { runtime?.emit(plugin, name, data); },
+});
+// Wire the WM's decoration-resize indirection through the broker.
+state.decorationResize = (windowId, outerRect, contentRect, insets) =>
+  decorationBroker.onDecorationResized(windowId, outerRect, contentRect, insets);
 
-  // Windows broker: services sdk.windows.set / set-state / get-state / get /
-  // list / delete-state. state.wm exists from installProtocols above.
-  // core-plugin-api.md §1.
-  if (!state.wm) throw new Error("internal: state.wm not set by installProtocols");
-  const windowsBroker = createWindowsBroker({
-    wm: state.wm, compositor, state, pluginBus, bus,
-  });
+// GPU broker: services plugin Worker GPU/surface requests.
+const gpuBroker = createGpuBroker({
+  addon, compositor, overlays, dawn, coreDeviceHandle: h.device,
+  onSurfaceAllocated: (sid, win) => decorationBroker.onSurfaceAllocated(sid, win),
+  onSurfacePresented: (sid) => decorationBroker.onSurfacePresented(sid),
+});
 
-  runtime = new PluginRuntime({
-    pluginAddonPath,
-    dawnPath: dawnNodePath,
-    bus: pluginBus,
-    onEvent: (plugin, name, data) => {
-      if (name === "log") console.log(`[plugin ${plugin}] ${String(data)}`);
-    },
-    onRequest: (plugin, method, params) => {
-      if (method.startsWith("decoration.")) {
-        return decorationBroker.onRequest(plugin, method, params);
+// Windows broker: services sdk.windows.set / set-state / get-state / get /
+// list / delete-state / set-output-stack. core-plugin-api.md §1.
+if (!state.wm) throw new Error("internal: state.wm not set by installProtocols");
+const windowsBroker = createWindowsBroker({
+  wm: state.wm, compositor, state, pluginBus, bus,
+});
+
+// The runtime is created unconditionally so the IPC server has an action
+// registry to dispatch against even before any plugin is loaded. load() is
+// called with the combined bundled + user-config plugin set (possibly
+// empty).
+runtime = new PluginRuntime({
+  pluginAddonPath,
+  dawnPath: dawnNodePath,
+  bus: pluginBus,
+  onEvent: (plugin, name, data) => {
+    if (name === "log") console.log(`[plugin ${plugin}] ${String(data)}`);
+  },
+  onRequest: (plugin, method, params) => {
+    if (method.startsWith("decoration.")) {
+      return decorationBroker.onRequest(plugin, method, params);
+    }
+    if (method.startsWith("windows.")) {
+      const r = windowsBroker(plugin, method, params);
+      if (r === WINDOWS_NOT_HANDLED) {
+        throw new Error(`no handler for windows method '${method}'`);
       }
-      if (method.startsWith("windows.")) {
-        const r = windowsBroker(plugin, method, params);
-        if (r === WINDOWS_NOT_HANDLED) {
-          throw new Error(`no handler for windows method '${method}'`);
-        }
-        return r;
-      }
-      return gpuBroker(plugin, method, params);
-    },
-  });
-  await runtime.load(resolved);
-  const summary = runtime.states().map((s) => `${s.name}=${s.state}`).join(", ");
-  console.log(`[overdraw] plugins: ${summary}`);
+      return r;
+    }
+    return gpuBroker(plugin, method, params);
+  },
+});
+await runtime.load(resolved);
+const summary = runtime.states().map((s) => `${s.name}=${s.state}`).join(", ");
+console.log(`[overdraw] plugins: ${summary.length > 0 ? summary : "(none)"}`);
+
+// IPC server: JSON-RPC 2.0 over a Unix socket. Plugins register actions and
+// emit events; overdrawctl / status bars / scripts connect here.
+// core-plugin-api.md §12.
+const runtimeDir = process.env.XDG_RUNTIME_DIR;
+if (!runtimeDir) {
+  console.warn("[overdraw] XDG_RUNTIME_DIR not set; IPC server disabled");
+} else {
+  const socketPath = join(runtimeDir, `overdraw-${sock}.sock`);
+  ipcServer = new IpcServer({ socketPath, runtime, bus: pluginBus });
+  await ipcServer.start();
+  console.log(`[overdraw] IPC: ${socketPath}`);
 }
 
 console.log(`[overdraw] ctrl-c to quit.`);

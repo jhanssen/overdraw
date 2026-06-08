@@ -1,0 +1,8 @@
+#!/usr/bin/env bash
+# Wrapper for the compiled overdrawctl CLI. Resolves the dist path relative
+# to this script so it works both in-repo (./bin/overdrawctl) and from any
+# installation layout that preserves the bin/ -> ../dist/ relationship.
+
+set -e
+here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+exec node "$here/../dist/cli/overdrawctl.js" "$@"

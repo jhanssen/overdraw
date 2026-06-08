@@ -95,10 +95,8 @@ export function createPluginWindows(
       if (typeof key !== "string" || key.length === 0) {
         throw new TypeError("setState key must be a non-empty string");
       }
-      // Cast through Json: the plugin author is responsible for clone-safety;
-      // postMessage enforces it at runtime. eslint-disable-next-line justified
-      // because the state-bag is intentionally `unknown` at the SDK boundary.
-      // eslint-disable-next-line no-restricted-syntax
+      // Cast value to Json at the boundary: the plugin author is responsible
+      // for clone-safety; postMessage enforces it at runtime.
       await endpoint.request("windows.set-state", { id, key, value: value as Json });
     },
     async getState(id, key): Promise<unknown> {

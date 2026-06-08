@@ -483,6 +483,19 @@ export class PluginRuntime implements PluginController {
     }));
   }
 
+  // External-caller API for invoking actions (IPC, in-process scripts). Same
+  // routing as plugin-to-plugin invocation, but with a clean
+  // (name, params) -> Promise<result> contract. Caller identity is "<external>"
+  // for audit logs.
+  invokeAction(name: string, params: Json): Promise<Json> {
+    return this.onActionInvoke("<external>", { name, params });
+  }
+
+  // External-caller API for listing actions (IPC list-actions / overdrawctl).
+  listActions(): Promise<Json> {
+    return this.onActionList("<external>", null);
+  }
+
   // -- NamespaceController implementation --------------------------------
   // Implements core-plugin-api.md §11 routing. The registry stores who claims
   // what; this controller routes invocations across plugins and gates
