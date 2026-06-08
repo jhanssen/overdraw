@@ -33,12 +33,22 @@ export function flushWindowChanges(state: CompositorState): void {
     if (fields.size === 0) continue;
     if (!isMappedToplevel(state, surfaceId)) continue;   // unmapped/destroyed since recorded
     const ta = titleAppId(state, surfaceId);
+    // Snapshot the window's hints so the event payload carries the full
+    // observable state. The hints stay false in the current tiling-only WM
+    // until xdg_toplevel.set_* requests start populating them (and plugins
+    // can override via sdk.windows.setFloating/etc.).
+    const hints = state.wm?.getHints(surfaceId) ??
+      { floating: false, fullscreen: false, maximized: false, minimized: false };
     bus?.emit(WINDOW_EVENT.change, {
       surfaceId,
       changed: [...fields],
       appId: ta.appId,
       title: ta.title,
       activated: surfaceId === activeId,
+      floating: hints.floating,
+      fullscreen: hints.fullscreen,
+      maximized: hints.maximized,
+      minimized: hints.minimized,
     });
   }
   pending.clear();

@@ -182,7 +182,7 @@ export default function makeSurface(ctx: Ctx): WlSurfaceHandler {
 // resource-destroyed sweep (client disconnect): whichever runs first does the work;
 // the second is a no-op. Without the sweep path, a client that disconnects without
 // explicitly destroying its wl_surface would never emit window.unmap, leaking any
-// decoration ring bound to that window (the provider frees it on sdk.window.onUnmap).
+// decoration ring bound to that window (the provider frees it on sdk.windows.onUnmap).
 export function unmapAndTeardownSurface(state: CompositorState, s: SurfaceRecord): void {
   if (s.unmapped) return;
   s.unmapped = true;

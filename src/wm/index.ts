@@ -26,6 +26,25 @@ export interface Insets { top: number; right: number; bottom: number; left: numb
 // `resource` satisfies this.
 export interface SurfaceHandle { resource: Resource; }
 
+// Per-window hint state (core-plugin-api.md §1). Booleans representing
+// client-driven state requests (set_floating/set_fullscreen/etc.) AND
+// plugin-driven state (a hotkey plugin toggling floating). Today's WM is
+// a tiling-only master-stack policy that does not yet act on these hints;
+// they are stored verbatim so layout plugins (Phase 2) can read them as
+// inputs without core having to grow special-case behavior. The
+// xdg_toplevel.set_* requests will populate these once those handlers
+// stop being no-ops (status.md "Read first").
+export interface WindowHints {
+  floating: boolean;
+  fullscreen: boolean;
+  maximized: boolean;
+  minimized: boolean;
+}
+
+export type HintField = keyof WindowHints;
+export const HINT_FIELDS: ReadonlyArray<HintField> =
+  ["floating", "fullscreen", "maximized", "minimized"];
+
 export interface Window {
   surfaceId: number;
   // The CONTENT rect (where the client draws). In the tiling model this is the
@@ -53,6 +72,14 @@ export interface Window {
   // content signal). A window is in the layout (and configured) from addWindow,
   // but only drawn once it has content.
   hasContent?: boolean;
+  // Hint state (see WindowHints). All four default to false on map.
+  hints: WindowHints;
+  // Freeform per-window state bag (core-plugin-api.md §1 "Per-window state
+  // bag"). Plugins store concept-specific data here under namespaced keys
+  // ('workspace.id', 'rules.tags', ...). Core does not interpret the values;
+  // any structured-clone-safe value is accepted at the SDK boundary. Mutations
+  // are observable via the 'window.state-changed' event.
+  state: Map<string, unknown>;
 }
 
 export interface WmState { output: Output; windows: Window[]; layout: LayoutParams; }
@@ -116,6 +143,49 @@ export interface Wm {
   // so it is z-bound to the window. Triggers a stack rebuild. No-op if the surface
   // is not a mapped window.
   setDecorationSurface(windowId: number, decoSurfaceId: number | null): void;
+
+  // Hint state setters (core-plugin-api.md §1). Return true if the field
+  // actually changed (so the caller can decide whether to emit a change
+  // event), false if the value matched the current one or the window doesn't
+  // exist.
+  setHint(surfaceId: number, field: HintField, value: boolean): boolean;
+  // Snapshot of a window's hints; returns null if unknown.
+  getHints(surfaceId: number): WindowHints | null;
+
+  // Freeform per-window state bag (core-plugin-api.md §1). Returns true if
+  // the stored value changed (so an event should fire); false if unchanged
+  // or the window doesn't exist. Pass `undefined` (via deleteState) to
+  // remove a key; setting null is allowed and distinct from delete.
+  setState(surfaceId: number, key: string, value: unknown): boolean;
+  // Read a single state-bag value; undefined when unset or window unknown.
+  getState(surfaceId: number, key: string): unknown;
+  // Remove a state-bag key. Returns true if a value was removed.
+  deleteState(surfaceId: number, key: string): boolean;
+  // Snapshot of all state-bag entries for a window. Empty object when none /
+  // when unknown.
+  getStateAll(surfaceId: number): { [key: string]: unknown };
+
+  // Snapshot of a window, suitable for sdk.windows.get / serialization over
+  // the postMessage wire. Returns null when unknown. Excludes implementation
+  // bookkeeping (surfaceRec).
+  getSnapshot(surfaceId: number): WindowSnapshot | null;
+  // Snapshot of every tracked window (sdk.windows.list).
+  listSnapshots(): WindowSnapshot[];
+}
+
+// Structured-clone-safe snapshot of a window's observable state. The shape
+// that flows over the worker wire (sdk.windows.get / list) and the typed
+// event payloads. surfaceRec / Resource are NOT included (not cloneable).
+export interface WindowSnapshot {
+  surfaceId: number;
+  rect: Rect;
+  outer: Rect;
+  insets?: Insets;
+  decorationSurfaceId?: number;
+  hasContent: boolean;
+  contentGated: boolean;
+  hints: WindowHints;
+  state: { [key: string]: unknown };
 }
 
 // The content rect = the outer tile shrunk by the insets (subtractive): origin
@@ -247,6 +317,8 @@ export function createWm(
         outer: { x: 0, y: 0, width: -1, height: -1 },
         rect: { x: 0, y: 0, width: -1, height: -1 },
         surfaceRec,
+        hints: { floating: false, fullscreen: false, maximized: false, minimized: false },
+        state: new Map<string, unknown>(),
       };
       windows.unshift(win); // front = master
       relayout();           // assigns outer/rect + configures the new window + reflows others
@@ -335,5 +407,78 @@ export function createWm(
       }
       return null;
     },
+
+    setHint(surfaceId, field, value) {
+      const win = windows.find((w) => w.surfaceId === surfaceId);
+      if (!win) return false;
+      if (win.hints[field] === value) return false;
+      win.hints[field] = value;
+      return true;
+    },
+
+    getHints(surfaceId) {
+      const win = windows.find((w) => w.surfaceId === surfaceId);
+      return win ? { ...win.hints } : null;
+    },
+
+    setState(surfaceId, key, value) {
+      const win = windows.find((w) => w.surfaceId === surfaceId);
+      if (!win) return false;
+      const existed = win.state.has(key);
+      const prev = win.state.get(key);
+      // Equality semantics: identity check is enough for primitives; for
+      // objects, plugins are expected to replace (not mutate in place). A
+      // false-positive "changed" event when the same object is re-set is
+      // acceptable.
+      if (existed && prev === value) return false;
+      win.state.set(key, value);
+      return true;
+    },
+
+    getState(surfaceId, key) {
+      const win = windows.find((w) => w.surfaceId === surfaceId);
+      return win ? win.state.get(key) : undefined;
+    },
+
+    deleteState(surfaceId, key) {
+      const win = windows.find((w) => w.surfaceId === surfaceId);
+      if (!win) return false;
+      return win.state.delete(key);
+    },
+
+    getStateAll(surfaceId) {
+      const win = windows.find((w) => w.surfaceId === surfaceId);
+      if (!win) return {};
+      const out: { [key: string]: unknown } = {};
+      for (const [k, v] of win.state.entries()) out[k] = v;
+      return out;
+    },
+
+    getSnapshot(surfaceId) {
+      const win = windows.find((w) => w.surfaceId === surfaceId);
+      if (!win) return null;
+      return snapshotOf(win);
+    },
+
+    listSnapshots() {
+      return windows.map(snapshotOf);
+    },
   };
+}
+
+function snapshotOf(win: Window): WindowSnapshot {
+  const state: { [key: string]: unknown } = {};
+  for (const [k, v] of win.state.entries()) state[k] = v;
+  const snap: WindowSnapshot = {
+    surfaceId: win.surfaceId,
+    rect: { ...win.rect },
+    outer: { ...win.outer },
+    hasContent: !!win.hasContent,
+    contentGated: !!win.contentGated,
+    hints: { ...win.hints },
+    state,
+  };
+  if (win.insets) snap.insets = { ...win.insets };
+  if (win.decorationSurfaceId !== undefined) snap.decorationSurfaceId = win.decorationSurfaceId;
+  return snap;
 }

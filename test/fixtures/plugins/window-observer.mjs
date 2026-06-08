@@ -3,7 +3,7 @@
 // the core -> plugin window event channel delivered the right data.
 export default async function init(sdk) {
   sdk.log("ready");
-  sdk.window.onMap((ev) => { sdk.log("MAP " + JSON.stringify(ev)); });
-  sdk.window.onUnmap((ev) => { sdk.log("UNMAP " + JSON.stringify(ev)); });
-  sdk.window.onChange((ev) => { sdk.log("CHANGE " + JSON.stringify(ev)); });
+  sdk.windows.onMap((ev) => { sdk.log("MAP " + JSON.stringify(ev)); });
+  sdk.windows.onUnmap((ev) => { sdk.log("UNMAP " + JSON.stringify(ev)); });
+  sdk.windows.onChange((ev) => { sdk.log("CHANGE " + JSON.stringify(ev)); });
 }

@@ -24,7 +24,7 @@ export default async function init(sdk) {
     return calc;
   }
 
-  sdk.window.onMap(async (ev) => {
+  sdk.windows.onMap(async (ev) => {
     const op = ev.surfaceId;
     if (op === 0) { await ensureCalc(); return; }
     if (op === 1) {

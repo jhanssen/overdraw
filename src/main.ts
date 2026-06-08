@@ -20,6 +20,7 @@ import { PluginRuntime } from "./plugins/index.js";
 import { createOverlayBroker } from "./overlay.js";
 import { createGpuBroker } from "./plugins/gpu-broker.js";
 import { createDecorationBroker } from "./plugins/decoration-broker.js";
+import { createWindowsBroker, NOT_HANDLED as WINDOWS_NOT_HANDLED } from "./plugins/windows-broker.js";
 import { BUNDLED_PLUGINS, bundledToResolved } from "./plugins/bundled.js";
 import { JsCompositor } from "./gpu/compositor.js";
 import type { DawnWire, DawnGlobals } from "./gpu/compositor.js";
@@ -183,6 +184,14 @@ if (bundledResolved.length + config.plugins.length > 0) {
     onSurfacePresented: (sid) => decorationBroker.onSurfacePresented(sid),
   });
 
+  // Windows broker: services sdk.windows.set / set-state / get-state / get /
+  // list / delete-state. state.wm exists from installProtocols above.
+  // core-plugin-api.md §1.
+  if (!state.wm) throw new Error("internal: state.wm not set by installProtocols");
+  const windowsBroker = createWindowsBroker({
+    wm: state.wm, state, pluginBus, bus,
+  });
+
   runtime = new PluginRuntime({
     pluginAddonPath,
     dawnPath: dawnNodePath,
@@ -190,10 +199,19 @@ if (bundledResolved.length + config.plugins.length > 0) {
     onEvent: (plugin, name, data) => {
       if (name === "log") console.log(`[plugin ${plugin}] ${String(data)}`);
     },
-    onRequest: (plugin, method, params) =>
-      method.startsWith("decoration.")
-        ? decorationBroker.onRequest(plugin, method, params)
-        : gpuBroker(plugin, method, params),
+    onRequest: (plugin, method, params) => {
+      if (method.startsWith("decoration.")) {
+        return decorationBroker.onRequest(plugin, method, params);
+      }
+      if (method.startsWith("windows.")) {
+        const r = windowsBroker(plugin, method, params);
+        if (r === WINDOWS_NOT_HANDLED) {
+          throw new Error(`no handler for windows method '${method}'`);
+        }
+        return r;
+      }
+      return gpuBroker(plugin, method, params);
+    },
   });
   await runtime.load(resolved);
   const summary = runtime.states().map((s) => `${s.name}=${s.state}`).join(", ");

@@ -8,7 +8,7 @@
 //   5 = list and log all actions
 //   6 = invoke async.action({ delay: 30 })
 export default async function init(sdk) {
-  sdk.window.onMap(async (ev) => {
+  sdk.windows.onMap(async (ev) => {
     const op = ev.surfaceId;
     try {
       if (op === 1) {

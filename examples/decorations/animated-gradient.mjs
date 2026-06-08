@@ -2,7 +2,7 @@
 // shader. Registers as a decoration provider for ALL windows (app_id /.*/), and on
 // each assigned window draws a top titlebar whose gradient shifts over time, with a
 // moving highlight sweep. The bar tints brighter when the window is focused and
-// dims when it loses focus (driven by sdk.window.onChange's `activated` flag).
+// dims when it loses focus (driven by sdk.windows.onChange's `activated` flag).
 //
 // This is a real, animatable, server-side decoration: the plugin runs its own
 // frame loop and presents continuously. Decorations are NOT interactive yet (clicks
@@ -152,7 +152,7 @@ export default async function init(sdk) {
 
   // Focus styling: window.change carries the `activated` flag. Re-tint the bar
   // (the frame loop reads w.active each frame, so just flip it).
-  sdk.window.onChange((ev) => {
+  sdk.windows.onChange((ev) => {
     const w = windows.get(ev.surfaceId);
     if (w) w.active = ev.activated;
   });
@@ -160,7 +160,7 @@ export default async function init(sdk) {
   // When a decorated window unmaps: stop animating AND destroy the decoration
   // surface, so the core stops compositing it (otherwise its last frame lingers
   // where the window was) and frees the ring's GPU resources.
-  sdk.window.onUnmap((ev) => {
+  sdk.windows.onUnmap((ev) => {
     const w = windows.get(ev.surfaceId);
     if (!w) return;
     w.running = false;

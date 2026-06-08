@@ -9,7 +9,7 @@
 export type ShutdownCallback = () => void | Promise<void>;
 
 import type { PluginGpu } from "./gpu.js";
-import type { PluginWindowObserver } from "./window-observer.js";
+import type { PluginWindows } from "./windows-sdk.js";
 import type { PluginDecorations } from "./decorations.js";
 import type { PluginEvents } from "./events.js";
 import type {
@@ -43,10 +43,10 @@ export interface PluginSdk {
   // GPU + overlay surfaces (present iff the plugin has the `gpu` capability and
   // the runtime brought the device up). Absent otherwise (capability by shape).
   gpu?: PluginGpu;
-  // Window-state observation (onMap/onUnmap). The first core->plugin event stream;
-  // the foundation for decorations (architecture.md "First decoration milestone").
-  // Always present in the current runtime (no capability gate yet -- flagged).
-  window?: PluginWindowObserver;
+  // Window observation + mutation (core-plugin-api.md §1). Always present;
+  // no capability gate yet (the observer half is privacy-sensitive but
+  // capability gating is unbuilt).
+  windows: PluginWindows;
   // Decoration provider: register an app_id pattern + observe assigned windows.
   // No capability gate yet (this tier is meant to be gated like tier 3 -- it sees
   // every matched window's app_id/state -- but the capability system is unbuilt;
@@ -63,8 +63,8 @@ export interface SdkControl {
 
 export function createSdk(name: string, emitLog: (line: string) => void,
                           events: PluginEvents, ns: PluginNamespace,
-                          actions: PluginActions,
-                          gpu?: PluginGpu, window?: PluginWindowObserver,
+                          actions: PluginActions, windows: PluginWindows,
+                          gpu?: PluginGpu,
                           decorations?: PluginDecorations): SdkControl {
   let shutdownCb: ShutdownCallback | null = null;
 
@@ -82,8 +82,8 @@ export function createSdk(name: string, emitLog: (line: string) => void,
     registerPlugin: ns.registerPlugin,
     plugin: ns.plugin,
     actions,
+    windows,
     ...(gpu ? { gpu } : {}),
-    ...(window ? { window } : {}),
     ...(decorations ? { decorations } : {}),
   };
 

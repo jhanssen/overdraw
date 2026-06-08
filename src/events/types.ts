@@ -21,6 +21,12 @@ export const WINDOW_EVENT = {
   map: "window.map",
   unmap: "window.unmap",
   change: "window.change",
+  // Per-window state-bag mutation (core-plugin-api.md §3). Separate from
+  // window.change because the state bag is high-cardinality (any plugin-
+  // defined key) and would otherwise drown the lower-frequency typed
+  // change stream. Plugins observing state mutations subscribe directly to
+  // 'window.state-changed'.
+  stateChanged: "window.state-changed",
 } as const;
 
 // `type` (not `interface`) so the payloads carry an implicit index signature and
@@ -48,19 +54,41 @@ export type WindowUnmapEvent = {
   surfaceId: number;
 };
 
-// Which fields of a mapped window changed since the last emit. Extend as the WM
-// gains real maximized/fullscreen/geometry state (those are no-ops today).
-export type WindowChangeField = "title" | "appId" | "activated";
+// Which fields of a mapped window changed since the last emit. Extend as the
+// WM gains additional observable state. The four hint fields
+// (floating/fullscreen/maximized/minimized) are populated by plugin setters
+// today; client-side xdg_toplevel.set_* requests are still no-ops (status.md
+// "Read first") so they remain false until those handlers land.
+export type WindowChangeField =
+  | "title" | "appId" | "activated"
+  | "floating" | "fullscreen" | "maximized" | "minimized";
 
 // Emitted (coalesced per frame) when a mapped toplevel's observable state
 // changes. `changed` lists the fields; the current values are included so a
 // consumer never has to re-query. `activated` is keyboard-focus (active window).
+// Hint fields (floating/fullscreen/maximized/minimized) accompany the snapshot
+// so subscribers see the full state without a separate fetch.
 export type WindowChangeEvent = {
   surfaceId: number;
   changed: WindowChangeField[];
   appId: string | null;
   title: string | null;
   activated: boolean;
+  floating: boolean;
+  fullscreen: boolean;
+  maximized: boolean;
+  minimized: boolean;
+};
+
+// Emitted when a per-window state-bag entry changes (sdk.windows.setState or
+// deleteState). `value` is the new value, or null when the key was deleted
+// (null/undefined collapse on the wire; explicit `deleted: true` differentiates
+// a delete from setting null).
+export type WindowStateChangedEvent = {
+  surfaceId: number;
+  key: string;
+  value: unknown;
+  deleted: boolean;
 };
 
 // Decoration-provider events (core -> the matched provider plugin).

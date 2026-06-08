@@ -161,7 +161,11 @@ test('observer routes window.change to onChange handlers', () => {
   const { observer } = createWindowObserver(fe.handle);
   const got = [];
   observer.onChange((ev) => got.push(ev));
-  const ev = { surfaceId: 3, changed: ['title', 'activated'], appId: 'a', title: 'New', activated: true };
+  const ev = {
+    surfaceId: 3, changed: ['title', 'activated'],
+    appId: 'a', title: 'New', activated: true,
+    floating: false, fullscreen: false, maximized: false, minimized: false,
+  };
   fe.deliver(WINDOW_EVENT.change, ev);
   assert.deepEqual(got, [ev]);
 });
@@ -171,7 +175,11 @@ test('observer drops unknown change fields but keeps valid ones', () => {
   const { observer } = createWindowObserver(fe.handle);
   const got = [];
   observer.onChange((ev) => got.push(ev));
-  fe.deliver(WINDOW_EVENT.change, { surfaceId: 1, changed: ['title', 'bogus'], appId: null, title: 't', activated: false });
+  fe.deliver(WINDOW_EVENT.change, {
+    surfaceId: 1, changed: ['title', 'bogus'],
+    appId: null, title: 't', activated: false,
+    floating: false, fullscreen: false, maximized: false, minimized: false,
+  });
   assert.deepEqual(got[0].changed, ['title']);   // 'bogus' filtered out
 });
 
@@ -232,7 +240,11 @@ test('dynamic bus delivers window.map/change/unmap to a live plugin', async () =
   await new Promise((r) => setTimeout(r, 50));
 
   const mapEv = { surfaceId: 42, rect: { x: 5, y: 6, width: 100, height: 60 }, appId: 'foo', title: 'Foo' };
-  const changeEv = { surfaceId: 42, changed: ['title'], appId: 'foo', title: 'Renamed', activated: true };
+  const changeEv = {
+    surfaceId: 42, changed: ['title'],
+    appId: 'foo', title: 'Renamed', activated: true,
+    floating: false, fullscreen: false, maximized: false, minimized: false,
+  };
   pluginBus.emit(WINDOW_EVENT.map, mapEv);
   pluginBus.emit(WINDOW_EVENT.change, changeEv);
   pluginBus.emit(WINDOW_EVENT.unmap, { surfaceId: 42 });

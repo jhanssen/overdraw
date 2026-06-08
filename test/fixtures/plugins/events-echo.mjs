@@ -18,7 +18,7 @@ export default async function init(sdk) {
   // window.map signal (re-using an existing core->plugin event without needing
   // any new wiring). The test can verify the unsubscribed pattern no longer
   // fires.
-  sdk.window.onMap((ev) => {
+  sdk.windows.onMap((ev) => {
     if (ev.surfaceId === 99) { sub1.off(); sdk.log("UNSUB1"); }
     if (ev.surfaceId === 98) { sub2.off(); sdk.log("UNSUB2"); }
   });

@@ -9,7 +9,9 @@
 
 import { TypedBus } from "./bus.js";
 import { WINDOW_EVENT } from "./types.js";
-import type { WindowMapEvent, WindowUnmapEvent, WindowChangeEvent } from "./types.js";
+import type {
+  WindowMapEvent, WindowUnmapEvent, WindowChangeEvent, WindowStateChangedEvent,
+} from "./types.js";
 
 // Keyboard-focus change (active window). clientId is the newly focused client, or
 // null when focus cleared. In-core consumer: the clipboard layer (selection
@@ -25,6 +27,7 @@ export interface CompositorEventMap {
   [WINDOW_EVENT.map]: WindowMapEvent;
   [WINDOW_EVENT.unmap]: WindowUnmapEvent;
   [WINDOW_EVENT.change]: WindowChangeEvent;
+  [WINDOW_EVENT.stateChanged]: WindowStateChangedEvent;
   [KEYBOARD_EVENT.focus]: KeyboardFocusEvent;
 }
 

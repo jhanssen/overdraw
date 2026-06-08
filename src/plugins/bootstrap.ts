@@ -21,7 +21,7 @@ import { createSdk } from "./sdk.js";
 import type { PluginSdk } from "./sdk.js";
 import { createPluginGpu } from "./gpu.js";
 import type { PluginGpu, RingMaker } from "./gpu.js";
-import { createWindowObserver } from "./window-observer.js";
+import { createPluginWindows } from "./windows-sdk.js";
 import { createDecorations } from "./decorations.js";
 import { createPluginEvents } from "./events.js";
 import { createNamespaceHandle } from "./namespace.js";
@@ -79,11 +79,10 @@ async function main(): Promise<void> {
   // dispatcher handles inbound `actions.handle` requests from core.
   const actionsHandle = createPluginActions(endpoint);
 
-  // Window-state observation (sdk.window.onMap/onUnmap). Typed convenience
-  // wrapper over sdk.events.subscribe('window.*', ...) -- the bus is the
-  // primary delivery path; this observer dispatches validated payloads to the
-  // plugin's onMap/onUnmap/onChange handlers.
-  const windows = createWindowObserver(eventsHandle.events);
+  // Window observation + mutation (sdk.windows). core-plugin-api.md §1.
+  // Observation uses sdk.events.subscribe('window.*') under the hood;
+  // mutations (setFloating/setState/etc.) become windows.* requests to core.
+  const windowsCtl = createPluginWindows(endpoint, eventsHandle.events);
 
   // Decoration provider (sdk.decorations). Needs the GPU ring allocator to draw, so
   // it is only available when the GPU is up (createDecoration draws a surface).
@@ -91,8 +90,8 @@ async function main(): Promise<void> {
 
   // SDK logs are forwarded to the core as one-way events (the core prints them).
   const control = createSdk(name, (line) => { endpoint.emit("log", line); },
-    eventsHandle.events, nsHandle.ns, actionsHandle.actions,
-    gpu, windows.observer, decorations?.decorations);
+    eventsHandle.events, nsHandle.ns, actionsHandle.actions, windowsCtl.windows,
+    gpu, decorations?.decorations);
 
   // Inbound request chain: try the namespace and actions dispatchers first
   // (plugin.handle, actions.handle), then fall through to the lifecycle
