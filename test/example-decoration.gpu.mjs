@@ -13,6 +13,7 @@ import { globSync } from "node:fs";
 
 import { setupCompositor, canRunGpu, loadDawn, waitFor, pixelAt } from "./harness.mjs";
 import { createCompositorBus } from "../dist/events/window-bus.js";
+import { DynamicBus } from "../dist/events/dynamic-bus.js";
 import { PluginRuntime } from "../dist/plugins/index.js";
 import { createGpuBroker } from "../dist/plugins/gpu-broker.js";
 import { createDecorationBroker } from "../dist/plugins/decoration-broker.js";
@@ -27,11 +28,14 @@ const W = 256, H = 256;
 
 test("example animated-gradient decoration composites + animates", { skip }, async () => {
   const bus = createCompositorBus();
+  const pluginBus = new DynamicBus();
   const c = await setupCompositor({ bus, headless: { width: W, height: H } });
   let runtime = null;
-  bus.on(WINDOW_EVENT.map, (ev) => runtime?.broadcast(WINDOW_EVENT.map, ev));
-  bus.on(WINDOW_EVENT.change, (ev) => runtime?.broadcast(WINDOW_EVENT.change, ev));
-  bus.on(WINDOW_EVENT.unmap, (ev) => runtime?.broadcast(WINDOW_EVENT.unmap, ev));
+  // Republish core window.* events onto the plugin bus, where the runtime
+  // delivers them to subscribed plugins.
+  bus.on(WINDOW_EVENT.map, (ev) => pluginBus.emit(WINDOW_EVENT.map, ev));
+  bus.on(WINDOW_EVENT.change, (ev) => pluginBus.emit(WINDOW_EVENT.change, ev));
+  bus.on(WINDOW_EVENT.unmap, (ev) => pluginBus.emit(WINDOW_EVENT.unmap, ev));
 
   const dawn = loadDawn();
   const h = c.addon.gpuHandles();
@@ -47,6 +51,7 @@ test("example animated-gradient decoration composites + animates", { skip }, asy
   runtime = new PluginRuntime({
     pluginAddonPath: join(OD, "build", "overdraw_plugin_native.node"), dawnPath: dawnNodePath,
     pingIntervalMs: 500, maxMissedPongs: 10, shutdownTimeoutMs: 800, heapMb: 128, log: () => {},
+    bus: pluginBus,
     onEvent: (_p, name, data) => { if (name === "log") logs.push(String(data)); },
     onRequest: (p, m, params) => m.startsWith("decoration.") ? decoBroker.onRequest(p, m, params) : gpuBroker(p, m, params),
   });

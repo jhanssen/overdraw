@@ -1,15 +1,18 @@
-// Worker-side window-state observer (runs INSIDE the plugin Worker). Receives the
-// core's one-way window.* events off the Endpoint and dispatches them to the
-// callbacks a plugin registered via sdk.window.onMap / onUnmap / onChange.
+// Worker-side window-state observer (sdk.window). A typed convenience wrapper
+// over sdk.events.subscribe('window.*', ...): plugin registers
+// onMap/onUnmap/onChange, this observer subscribes once to 'window.*' and
+// dispatches the validated payloads to handlers.
 //
-// Pull-free: the core pushes events; the plugin only registers handlers. A plugin
-// that never registers a handler simply has no listeners and the events are dropped.
+// Pull-free: the core emits onto the bus; this observer (via its bus
+// subscription) routes to plugin callbacks. A plugin that never registers a
+// handler still has the bus subscription, but with no handlers attached the
+// dispatch is a no-op.
 
 import { WINDOW_EVENT } from "../events/types.js";
 import type {
   WindowMapEvent, WindowUnmapEvent, WindowChangeEvent, WindowChangeField,
 } from "../events/types.js";
-import type { Json } from "./protocol.js";
+import type { PluginEvents } from "./events.js";
 
 export type WindowMapHandler = (ev: WindowMapEvent) => void;
 export type WindowUnmapHandler = (ev: WindowUnmapEvent) => void;
@@ -26,15 +29,15 @@ export interface PluginWindowObserver {
   onChange(cb: WindowChangeHandler): void;
 }
 
-// The observer plus the internal dispatch entry the bootstrap wires into the
-// Endpoint's event handler. `dispatch` is NOT on the plugin-facing object.
+// The observer + a release handle for the underlying bus subscription. The
+// bootstrap calls release() on plugin shutdown (the bus subscription would
+// otherwise leak per worker generation).
 export interface WindowObserverControl {
   observer: PluginWindowObserver;
-  // Returns true if `name` was a window.* event it consumed.
-  dispatch(name: string, data: Json): boolean;
+  release(): void;
 }
 
-export function createWindowObserver(): WindowObserverControl {
+export function createWindowObserver(events: PluginEvents): WindowObserverControl {
   const mapHandlers: WindowMapHandler[] = [];
   const unmapHandlers: WindowUnmapHandler[] = [];
   const changeHandlers: WindowChangeHandler[] = [];
@@ -45,53 +48,54 @@ export function createWindowObserver(): WindowObserverControl {
     onChange(cb) { changeHandlers.push(cb); },
   };
 
-  // The core constructs these payloads from typed sources (events/types.ts) and
-  // sends them over a structured-clone transport. This is a trust boundary, so the
-  // inbound Json is validated (not blindly cast) before invoking handlers; a
-  // malformed payload is dropped rather than handed to plugin code.
-  const dispatch = (name: string, data: Json): boolean => {
+  // The core constructs these payloads from typed sources (events/types.ts)
+  // and sends them over a structured-clone transport. This is a trust
+  // boundary, so the inbound payload is validated (not blindly cast) before
+  // invoking handlers; a malformed payload is dropped rather than handed to
+  // plugin code.
+  const sub = events.subscribe("window.*", (name, payload) => {
     switch (name) {
       case WINDOW_EVENT.map: {
-        const ev = asMapEvent(data);
+        const ev = asMapEvent(payload);
         if (ev) for (const cb of mapHandlers) cb(ev);
-        return true;
+        return;
       }
       case WINDOW_EVENT.unmap: {
-        const ev = asUnmapEvent(data);
+        const ev = asUnmapEvent(payload);
         if (ev) for (const cb of unmapHandlers) cb(ev);
-        return true;
+        return;
       }
       case WINDOW_EVENT.change: {
-        const ev = asChangeEvent(data);
+        const ev = asChangeEvent(payload);
         if (ev) for (const cb of changeHandlers) cb(ev);
-        return true;
+        return;
       }
-      default:
-        return false;
     }
-  };
+    // Other window.* events (closing, etc.) — not yet exposed via this
+    // observer. Subscribers wanting them use sdk.events.subscribe directly.
+  });
 
-  return { observer, dispatch };
+  return { observer, release: () => sub.off() };
 }
 
-// Runtime validators for the inbound Json payloads (trust boundary; see dispatch).
+// Runtime validators for the inbound payloads (trust boundary; see subscribe).
 // Each returns the narrowed type or null when the shape does not match.
 
-function isRecord(v: Json): v is { [k: string]: Json } {
+function isRecord(v: unknown): v is { [k: string]: unknown } {
   return typeof v === "object" && v !== null && !Array.isArray(v);
 }
 
-function isRect(v: Json): v is WindowMapEvent["rect"] {
+function isRect(v: unknown): v is WindowMapEvent["rect"] {
   return isRecord(v)
     && typeof v.x === "number" && typeof v.y === "number"
     && typeof v.width === "number" && typeof v.height === "number";
 }
 
-function isNullableString(v: Json): v is string | null {
+function isNullableString(v: unknown): v is string | null {
   return v === null || typeof v === "string";
 }
 
-function asMapEvent(data: Json): WindowMapEvent | null {
+function asMapEvent(data: unknown): WindowMapEvent | null {
   if (!isRecord(data)) return null;
   if (typeof data.surfaceId !== "number") return null;
   if (!isRect(data.rect)) return null;
@@ -99,7 +103,7 @@ function asMapEvent(data: Json): WindowMapEvent | null {
   return { surfaceId: data.surfaceId, rect: data.rect, appId: data.appId, title: data.title };
 }
 
-function asUnmapEvent(data: Json): WindowUnmapEvent | null {
+function asUnmapEvent(data: unknown): WindowUnmapEvent | null {
   if (!isRecord(data)) return null;
   if (typeof data.surfaceId !== "number") return null;
   return { surfaceId: data.surfaceId };
@@ -107,7 +111,7 @@ function asUnmapEvent(data: Json): WindowUnmapEvent | null {
 
 const CHANGE_FIELDS: readonly WindowChangeField[] = ["title", "appId", "activated"];
 
-function asChangeEvent(data: Json): WindowChangeEvent | null {
+function asChangeEvent(data: unknown): WindowChangeEvent | null {
   if (!isRecord(data)) return null;
   if (typeof data.surfaceId !== "number") return null;
   if (!isNullableString(data.appId) || !isNullableString(data.title)) return null;

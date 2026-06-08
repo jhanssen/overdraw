@@ -26,6 +26,7 @@ import type { Addon, InputEvent } from "./types.js";
 import type { CompositorSink, CompositorState } from "./protocols/ctx.js";
 import { WINDOW_EVENT } from "./events/types.js";
 import { createCompositorBus } from "./events/window-bus.js";
+import { DynamicBus } from "./events/dynamic-bus.js";
 
 const require = createRequire(import.meta.url);
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -57,18 +58,22 @@ const onFrame = (): void => {
 
 let runtime: PluginRuntime | null = null;
 
-// The core-internal event bus. Producers (protocol layer, seat) emit; the
-// plugin-forwarding subscribers below relay window.* events to plugin Workers.
-// The clipboard layer subscribes to keyboard.focus inside installProtocols.
+// The core-internal typed bus. Producers (protocol layer, seat) emit; in-core
+// subscribers (e.g. clipboard for keyboard.focus) call bus.on(...). The typed
+// bus stays for static, core-internal event delivery.
 const bus = createCompositorBus();
 
-// Forward window.* events to the plugin runtime (structured-clone over postMessage).
-// The runtime may not exist yet (no plugins) or a window may map before it loads;
-// broadcast is a no-op when there are no live plugins. The payloads are already the
-// wire shape (events/types.ts), so they forward verbatim.
-bus.on(WINDOW_EVENT.map, (ev) => { runtime?.broadcast(WINDOW_EVENT.map, ev); });
-bus.on(WINDOW_EVENT.unmap, (ev) => { runtime?.broadcast(WINDOW_EVENT.unmap, ev); });
-bus.on(WINDOW_EVENT.change, (ev) => { runtime?.broadcast(WINDOW_EVENT.change, ev); });
+// The plugin-visible dynamic bus. Window.* events from the typed bus are
+// republished here for plugin subscription; plugins also emit their own events
+// to it. This is the substrate for sdk.events (core-plugin-api.md §3) and the
+// later IPC subscription pipe.
+const pluginBus = new DynamicBus();
+
+// Republish core-emitted window.* events onto the plugin bus. The payloads are
+// already the wire shape (events/types.ts) and forward verbatim.
+bus.on(WINDOW_EVENT.map, (ev) => { pluginBus.emit(WINDOW_EVENT.map, ev); });
+bus.on(WINDOW_EVENT.unmap, (ev) => { pluginBus.emit(WINDOW_EVENT.unmap, ev); });
+bus.on(WINDOW_EVENT.change, (ev) => { pluginBus.emit(WINDOW_EVENT.change, ev); });
 
 let stopped = false;
 function shutdown(signal: string): void {
@@ -162,6 +167,7 @@ if (config.plugins.length > 0) {
   runtime = new PluginRuntime({
     pluginAddonPath,
     dawnPath: dawnNodePath,
+    bus: pluginBus,
     onEvent: (plugin, name, data) => {
       if (name === "log") console.log(`[plugin ${plugin}] ${String(data)}`);
     },

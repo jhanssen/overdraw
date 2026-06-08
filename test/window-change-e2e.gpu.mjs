@@ -12,6 +12,7 @@ import { globSync } from "node:fs";
 
 import { setupCompositor, canRunGpu, loadDawn, waitFor } from "./harness.mjs";
 import { createCompositorBus } from "../dist/events/window-bus.js";
+import { DynamicBus } from "../dist/events/dynamic-bus.js";
 import { WINDOW_EVENT } from "../dist/events/types.js";
 import { PluginRuntime } from "../dist/plugins/index.js";
 
@@ -24,13 +25,14 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 test("client set_app_id after map -> plugin sees window.change with new app_id", { skip }, async () => {
   const bus = createCompositorBus();
+  const pluginBus = new DynamicBus();
   const c = await setupCompositor({ bus });
 
   // Forward window.* over the bus to the plugin runtime (mirrors main.ts).
   let runtime = null;
-  bus.on(WINDOW_EVENT.map, (ev) => runtime?.broadcast(WINDOW_EVENT.map, ev));
-  bus.on(WINDOW_EVENT.change, (ev) => runtime?.broadcast(WINDOW_EVENT.change, ev));
-  bus.on(WINDOW_EVENT.unmap, (ev) => runtime?.broadcast(WINDOW_EVENT.unmap, ev));
+  bus.on(WINDOW_EVENT.map, (ev) => pluginBus.emit(WINDOW_EVENT.map, ev));
+  bus.on(WINDOW_EVENT.change, (ev) => pluginBus.emit(WINDOW_EVENT.change, ev));
+  bus.on(WINDOW_EVENT.unmap, (ev) => pluginBus.emit(WINDOW_EVENT.unmap, ev));
 
   const logs = [];
   // No GPU/window SDK paths needed: the window-observer plugin only logs. Omit
@@ -39,6 +41,7 @@ test("client set_app_id after map -> plugin sees window.change with new app_id",
   runtime = new PluginRuntime({
     pingIntervalMs: 200, maxMissedPongs: 5, shutdownTimeoutMs: 500, heapMb: 64,
     log: () => {},
+    bus: pluginBus,
     onEvent: (_p, name, data) => { if (name === "log") logs.push(String(data)); },
   });
 

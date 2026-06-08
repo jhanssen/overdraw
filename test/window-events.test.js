@@ -1,11 +1,14 @@
-// Core -> plugin window-state event channel (the first core->plugin event push).
-// GPU-free. Two tiers:
-//   1. window-observer.ts in isolation: dispatch routes/validates window.* payloads
-//      to onMap/onUnmap handlers and drops malformed ones.
+// Core -> plugin window-state event channel. GPU-free. Three tiers:
+//   0. the typed bus (TypedBus) in isolation: registration-order fan-out,
+//      throwing-listener isolation, clear().
+//   1. window-observer.ts in isolation: wired against a fake PluginEvents,
+//      routes validated window.* payloads to onMap/onUnmap/onChange handlers
+//      and drops malformed ones.
 //   2. end-to-end through a REAL Worker: a fixture plugin registers
-//      sdk.window.onMap/onUnmap; the runtime broadcasts events; the plugin logs the
-//      payload it received (observed via onEvent). Proves the full
-//      core -> Endpoint.emit -> Worker handleEvents -> observer -> sdk callback path.
+//      sdk.window.onMap/onUnmap; the dynamic bus emits events; the plugin logs
+//      the payload it received (observed via onEvent). Proves the full
+//      core bus -> runtime delivery -> Endpoint.emit -> Worker dispatcher ->
+//      observer -> sdk callback path.
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
@@ -15,6 +18,7 @@ import { dirname, join } from 'node:path';
 import { createWindowObserver } from '../dist/plugins/window-observer.js';
 import { WINDOW_EVENT } from '../dist/events/types.js';
 import { TypedBus } from '../dist/events/bus.js';
+import { DynamicBus } from '../dist/events/dynamic-bus.js';
 import { PluginRuntime } from '../dist/plugins/index.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -86,93 +90,152 @@ test('bus: clear() removes listeners', () => {
   assert.equal(n, 0);
 });
 
-// --- tier 1: window-observer dispatch in isolation -------------------------
+// --- tier 1: window-observer in isolation (against a fake PluginEvents) ----
+//
+// The observer subscribes to 'window.*' on the PluginEvents handle the
+// bootstrap normally provides. Here we provide a tiny in-process equivalent
+// so the observer can be exercised without a Worker.
 
-test('observer dispatch routes window.map to onMap handlers', () => {
-  const { observer, dispatch } = createWindowObserver();
+function fakeEvents() {
+  // pattern -> Set<cb>. Only the patterns the observer actually subscribes to
+  // are supported (currently 'window.*'); other patterns would also work via
+  // the same mechanism.
+  const patternSubs = new Map();
+  return {
+    handle: {
+      subscribe(pattern, cb) {
+        const set = patternSubs.get(pattern) ?? new Set();
+        set.add(cb);
+        patternSubs.set(pattern, set);
+        return { off: () => { set.delete(cb); } };
+      },
+      emit() { /* not used in these tests */ },
+    },
+    // Deliver an event to subscribers whose pattern matches `name`. Supports
+    // prefix-glob 'X.*' and exact match — enough for the observer's needs.
+    deliver(name, payload) {
+      for (const [pattern, subs] of patternSubs.entries()) {
+        const match = pattern.endsWith('.*')
+          ? name.startsWith(pattern.slice(0, -1))
+          : pattern === name;
+        if (!match) continue;
+        for (const cb of subs) cb(name, payload);
+      }
+    },
+  };
+}
+
+test('observer routes window.map to onMap handlers', () => {
+  const fe = fakeEvents();
+  const { observer } = createWindowObserver(fe.handle);
   const got = [];
   observer.onMap((ev) => got.push(ev));
   const ev = { surfaceId: 7, rect: { x: 1, y: 2, width: 3, height: 4 }, appId: 'a', title: 't' };
-  const consumed = dispatch(WINDOW_EVENT.map, ev);
-  assert.equal(consumed, true);
+  fe.deliver(WINDOW_EVENT.map, ev);
   assert.deepEqual(got, [ev]);
 });
 
-test('observer dispatch routes window.unmap to onUnmap handlers', () => {
-  const { observer, dispatch } = createWindowObserver();
+test('observer routes window.unmap to onUnmap handlers', () => {
+  const fe = fakeEvents();
+  const { observer } = createWindowObserver(fe.handle);
   const got = [];
   observer.onUnmap((ev) => got.push(ev));
-  assert.equal(dispatch(WINDOW_EVENT.unmap, { surfaceId: 9 }), true);
+  fe.deliver(WINDOW_EVENT.unmap, { surfaceId: 9 });
   assert.deepEqual(got, [{ surfaceId: 9 }]);
 });
 
-test('observer dispatch supports multiple handlers and null app_id/title', () => {
-  const { observer, dispatch } = createWindowObserver();
+test('observer supports multiple handlers and null app_id/title', () => {
+  const fe = fakeEvents();
+  const { observer } = createWindowObserver(fe.handle);
   const a = [], b = [];
   observer.onMap((ev) => a.push(ev));
   observer.onMap((ev) => b.push(ev));
   const ev = { surfaceId: 1, rect: { x: 0, y: 0, width: 10, height: 10 }, appId: null, title: null };
-  dispatch(WINDOW_EVENT.map, ev);
+  fe.deliver(WINDOW_EVENT.map, ev);
   assert.deepEqual(a, [ev]);
   assert.deepEqual(b, [ev]);
 });
 
-test('observer dispatch routes window.change to onChange handlers', () => {
-  const { observer, dispatch } = createWindowObserver();
+test('observer routes window.change to onChange handlers', () => {
+  const fe = fakeEvents();
+  const { observer } = createWindowObserver(fe.handle);
   const got = [];
   observer.onChange((ev) => got.push(ev));
   const ev = { surfaceId: 3, changed: ['title', 'activated'], appId: 'a', title: 'New', activated: true };
-  assert.equal(dispatch(WINDOW_EVENT.change, ev), true);
+  fe.deliver(WINDOW_EVENT.change, ev);
   assert.deepEqual(got, [ev]);
 });
 
-test('observer dispatch drops unknown change fields but keeps valid ones', () => {
-  const { observer, dispatch } = createWindowObserver();
+test('observer drops unknown change fields but keeps valid ones', () => {
+  const fe = fakeEvents();
+  const { observer } = createWindowObserver(fe.handle);
   const got = [];
   observer.onChange((ev) => got.push(ev));
-  dispatch(WINDOW_EVENT.change, { surfaceId: 1, changed: ['title', 'bogus'], appId: null, title: 't', activated: false });
+  fe.deliver(WINDOW_EVENT.change, { surfaceId: 1, changed: ['title', 'bogus'], appId: null, title: 't', activated: false });
   assert.deepEqual(got[0].changed, ['title']);   // 'bogus' filtered out
 });
 
-test('observer dispatch ignores unknown event names', () => {
-  const { observer, dispatch } = createWindowObserver();
+test('observer ignores events that are not window.map/unmap/change', () => {
+  const fe = fakeEvents();
+  const { observer } = createWindowObserver(fe.handle);
   let fired = false;
   observer.onMap(() => { fired = true; });
-  assert.equal(dispatch('something.else', { surfaceId: 1 }), false);
+  // Subscription is on 'window.*' so window.closing matches the pattern but is
+  // not one of the three the observer handles; it must be a no-op.
+  fe.deliver('window.closing', { surfaceId: 1 });
   assert.equal(fired, false);
 });
 
-test('observer dispatch drops malformed payloads (validated, not blindly cast)', () => {
-  const { observer, dispatch } = createWindowObserver();
+test('observer drops malformed payloads (validated, not blindly cast)', () => {
+  const fe = fakeEvents();
+  const { observer } = createWindowObserver(fe.handle);
   const got = [];
   observer.onMap((ev) => got.push(ev));
-  // returns true (it IS a window.map event name) but the payload is invalid, so
-  // no handler is invoked.
-  assert.equal(dispatch(WINDOW_EVENT.map, { surfaceId: 'nope' }), true);
-  assert.equal(dispatch(WINDOW_EVENT.map, { surfaceId: 1 }), true); // missing rect
-  assert.equal(dispatch(WINDOW_EVENT.map, null), true);
+  fe.deliver(WINDOW_EVENT.map, { surfaceId: 'nope' });
+  fe.deliver(WINDOW_EVENT.map, { surfaceId: 1 }); // missing rect
+  fe.deliver(WINDOW_EVENT.map, null);
   assert.equal(got.length, 0);
+});
+
+test('observer release() detaches the bus subscription', () => {
+  const fe = fakeEvents();
+  const { observer, release } = createWindowObserver(fe.handle);
+  const got = [];
+  observer.onMap((ev) => got.push(ev));
+  const ev = { surfaceId: 7, rect: { x: 1, y: 2, width: 3, height: 4 }, appId: 'a', title: 't' };
+  fe.deliver(WINDOW_EVENT.map, ev);
+  release();
+  fe.deliver(WINDOW_EVENT.map, ev);
+  assert.equal(got.length, 1);   // only the pre-release delivery
 });
 
 // --- tier 2: end-to-end through a real Worker ------------------------------
 
-test('core broadcast delivers window.map/unmap to a live plugin', async () => {
+test('dynamic bus delivers window.map/change/unmap to a live plugin', async () => {
   const events = [];
+  const pluginBus = new DynamicBus();
   const rt = new PluginRuntime({
     ...FAST, log: () => {},
+    bus: pluginBus,
     onEvent: (p, n, d) => events.push({ p, n, d }),
   });
   await rt.load([entry('window-observer.mjs')]);
   assert.equal(rt.states()[0].state, 'live');
 
-  // The plugin logs "ready" once init runs; wait for it so its handlers are set.
+  // The plugin logs "ready" once init runs; wait for it so its handlers + bus
+  // subscription are established before we start emitting.
   await waitFor(() => events.some((e) => e.n === 'log' && String(e.d) === 'ready'));
+
+  // Allow the bootstrap's events.subscribe message to traverse the wire (the
+  // plugin's bus subscription is set on init, but the events.subscribe envelope
+  // to core is async). Wait one microtask round-trip's worth.
+  await new Promise((r) => setTimeout(r, 50));
 
   const mapEv = { surfaceId: 42, rect: { x: 5, y: 6, width: 100, height: 60 }, appId: 'foo', title: 'Foo' };
   const changeEv = { surfaceId: 42, changed: ['title'], appId: 'foo', title: 'Renamed', activated: true };
-  rt.broadcast(WINDOW_EVENT.map, mapEv);
-  rt.broadcast(WINDOW_EVENT.change, changeEv);
-  rt.emit('window-observer', WINDOW_EVENT.unmap, { surfaceId: 42 });
+  pluginBus.emit(WINDOW_EVENT.map, mapEv);
+  pluginBus.emit(WINDOW_EVENT.change, changeEv);
+  pluginBus.emit(WINDOW_EVENT.unmap, { surfaceId: 42 });
 
   await waitFor(() => events.some((e) => e.n === 'log' && String(e.d).startsWith('MAP ')));
   await waitFor(() => events.some((e) => e.n === 'log' && String(e.d).startsWith('CHANGE ')));

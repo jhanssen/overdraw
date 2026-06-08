@@ -23,6 +23,7 @@ import { createPluginGpu } from "./gpu.js";
 import type { PluginGpu, RingMaker } from "./gpu.js";
 import { createWindowObserver } from "./window-observer.js";
 import { createDecorations } from "./decorations.js";
+import { createPluginEvents } from "./events.js";
 
 interface BootstrapData {
   module: string;
@@ -63,9 +64,15 @@ async function main(): Promise<void> {
     stopGpu = () => { clearInterval(t); g.stop(); };
   }
 
-  // Window-state observation (sdk.window.onMap/onUnmap). The core pushes window.*
-  // events; this observer dispatches them to the plugin's registered handlers.
-  const windows = createWindowObserver();
+  // Event bus (sdk.events.subscribe / emit). core-plugin-api.md §3. Always
+  // available; the dispatcher consumes core-pushed `events.dispatch` events.
+  const eventsHandle = createPluginEvents(endpoint);
+
+  // Window-state observation (sdk.window.onMap/onUnmap). Typed convenience
+  // wrapper over sdk.events.subscribe('window.*', ...) -- the bus is the
+  // primary delivery path; this observer dispatches validated payloads to the
+  // plugin's onMap/onUnmap/onChange handlers.
+  const windows = createWindowObserver(eventsHandle.events);
 
   // Decoration provider (sdk.decorations). Needs the GPU ring allocator to draw, so
   // it is only available when the GPU is up (createDecoration draws a surface).
@@ -73,7 +80,7 @@ async function main(): Promise<void> {
 
   // SDK logs are forwarded to the core as one-way events (the core prints them).
   const control = createSdk(name, (line) => { endpoint.emit("log", line); },
-    gpu, windows.observer, decorations?.decorations);
+    eventsHandle.events, gpu, windows.observer, decorations?.decorations);
 
   // The only request the core sends in scope B is 'shutdown'. Run the registered
   // onShutdown callback; resolving lets the core proceed to terminate.
@@ -90,11 +97,13 @@ async function main(): Promise<void> {
     throw new Error(`unknown request method '${method}'`);
   });
 
-  // Core -> plugin one-way events: offer each to the window observer, then the
-  // decoration observer; the first that recognizes the name consumes it. Unknown
-  // names are ignored (forward-compatible with future core-originated events).
+  // Core -> plugin one-way events: offer each to the events bus dispatcher
+  // first (so plugin subscriptions catch everything they asked for), then to
+  // the decoration observer (which still uses direct event dispatch; it will
+  // migrate to the bus in a later phase). Unknown names are ignored
+  // (forward-compatible with future core-originated events).
   endpoint.handleEvents((eventName, data) => {
-    if (windows.dispatch(eventName, data)) return;
+    if (eventsHandle.dispatcher.dispatch(eventName, data)) return;
     decorations?.dispatch(eventName, data);
   });
 

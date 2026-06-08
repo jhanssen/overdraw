@@ -19,6 +19,7 @@ import { globSync } from "node:fs";
 
 import { setupCompositor, canRunGpu, loadDawn, waitFor, pixelAt } from "./harness.mjs";
 import { createCompositorBus } from "../dist/events/window-bus.js";
+import { DynamicBus } from "../dist/events/dynamic-bus.js";
 import { PluginRuntime } from "../dist/plugins/index.js";
 import { createGpuBroker } from "../dist/plugins/gpu-broker.js";
 import { createDecorationBroker } from "../dist/plugins/decoration-broker.js";
@@ -36,13 +37,14 @@ const LAYOUT = { masterFraction: 0.5, gap: 0 };
 test("two tiled decorated windows both show their own content after retile",
      { skip }, async () => {
   const bus = createCompositorBus();
+  const pluginBus = new DynamicBus();
   const c = await setupCompositor({ bus, headless: { width: W, height: H }, layout: LAYOUT });
 
   // Forward window.* to the runtime so the decoration broker sees them.
   let runtime = null;
-  bus.on(WINDOW_EVENT.map, (ev) => runtime?.broadcast(WINDOW_EVENT.map, ev));
-  bus.on(WINDOW_EVENT.change, (ev) => runtime?.broadcast(WINDOW_EVENT.change, ev));
-  bus.on(WINDOW_EVENT.unmap, (ev) => runtime?.broadcast(WINDOW_EVENT.unmap, ev));
+  bus.on(WINDOW_EVENT.map, (ev) => pluginBus.emit(WINDOW_EVENT.map, ev));
+  bus.on(WINDOW_EVENT.change, (ev) => pluginBus.emit(WINDOW_EVENT.change, ev));
+  bus.on(WINDOW_EVENT.unmap, (ev) => pluginBus.emit(WINDOW_EVENT.unmap, ev));
 
   const dawn = loadDawn();
   const h = c.addon.gpuHandles();
@@ -67,6 +69,7 @@ test("two tiled decorated windows both show their own content after retile",
     dawnPath: dawnNodePath,
     pingIntervalMs: 500, maxMissedPongs: 10, shutdownTimeoutMs: 800, heapMb: 128,
     log: () => {},
+    bus: pluginBus,
     onEvent: (_p, name, data) => { if (name === "log") logs.push(String(data)); },
     onRequest: (p, method, params) =>
       method.startsWith("decoration.") ? decoBroker.onRequest(p, method, params) : gpuBroker(p, method, params),

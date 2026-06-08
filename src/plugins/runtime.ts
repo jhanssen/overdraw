@@ -18,6 +18,7 @@ import { dirname, join } from "node:path";
 import type { ResolvedPlugin } from "../config/types.js";
 import { Endpoint, channelFor } from "./protocol.js";
 import type { Json } from "./protocol.js";
+import type { DynamicBus, Subscription } from "../events/dynamic-bus.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 // The built bootstrap (this file lives in dist/plugins/ after tsc).
@@ -57,6 +58,11 @@ export interface RuntimeOptions {
   // is the response. main.ts provides this (it has the addon + compositor +
   // overlay broker); scope-B tests omit it. `pluginName` identifies the caller.
   onRequest?: (pluginName: string, method: string, params: unknown) => Promise<unknown> | unknown;
+  // The dynamic event bus (core-plugin-api.md §3). When set, plugins can
+  // subscribe to events via sdk.events.subscribe (routed to bus.subscribe) and
+  // emit events via sdk.events.emit (routed to bus.emit). When unset (scope-B
+  // tests with no bus), the SDK still exists but subscribe/emit are no-ops.
+  bus?: DynamicBus;
 }
 
 export const DEFAULT_OPTIONS: RuntimeOptions = {
@@ -87,6 +93,14 @@ class ManagedPlugin {
   private stopping = false;
   // Set while a forced terminate() is in flight so onExit knows it was a kill.
   private terminating = false;
+
+  // Plugin-owned bus subscriptions: the plugin's own subId -> the bus
+  // Subscription handle. Released on Worker exit/terminate so a crashed plugin
+  // leaves no lingering subscribers in the bus. The plugin mints the subIds
+  // (its sdk.events.subscribe call uses a local counter); core stores them
+  // verbatim and uses them as the discriminator on `events.dispatch` back to
+  // the worker.
+  private busSubs = new Map<number, Subscription>();
 
   // Resolves when the plugin first reaches `live` or `failed` (initial spawn).
   private firstSettle: { resolve: () => void } | null = null;
@@ -155,8 +169,77 @@ class ManagedPlugin {
       }
       return;
     }
+
+    // SDK event-bus interactions are reserved one-way events; intercept before
+    // surfacing to onEvent. core-plugin-api.md §3.
+    if (name === "events.subscribe") { this.onEventsSubscribe(data); return; }
+    if (name === "events.unsubscribe") { this.onEventsUnsubscribe(data); return; }
+    if (name === "events.emit") { this.onEventsEmit(data); return; }
+
     // Surface other plugin->core events (scope B: `log`) to the observer.
     this.opts.onEvent?.(this.cfg.name, name, data);
+  }
+
+  private onEventsSubscribe(data: unknown): void {
+    const bus = this.opts.bus;
+    if (!bus) return;  // no bus configured (scope-B tests): silently ignore
+    if (!isSubscribePayload(data)) {
+      this.log(`[plugin ${this.cfg.name}] events.subscribe: malformed payload; ignored`);
+      return;
+    }
+    const { subId, pattern } = data;
+    if (this.busSubs.has(subId)) {
+      this.log(`[plugin ${this.cfg.name}] events.subscribe: duplicate subId ${subId}; ignored`);
+      return;
+    }
+    let sub: Subscription;
+    try {
+      sub = bus.subscribe(pattern, (evName, payload) => {
+        // Deliver to the worker as a one-way event. The endpoint may be null
+        // mid-teardown; the emit() guard there is a no-op.
+        this.endpoint?.emit("events.dispatch",
+          { subId, name: evName, payload: payload as Json });
+      });
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : String(err);
+      this.log(`[plugin ${this.cfg.name}] events.subscribe('${pattern}') rejected: ${msg}`);
+      return;
+    }
+    this.busSubs.set(subId, sub);
+  }
+
+  private onEventsUnsubscribe(data: unknown): void {
+    if (!isUnsubscribePayload(data)) {
+      this.log(`[plugin ${this.cfg.name}] events.unsubscribe: malformed payload; ignored`);
+      return;
+    }
+    const sub = this.busSubs.get(data.subId);
+    if (!sub) return;       // unknown subId (late unsubscribe after teardown): ignore
+    sub.off();
+    this.busSubs.delete(data.subId);
+  }
+
+  private onEventsEmit(data: unknown): void {
+    const bus = this.opts.bus;
+    if (!bus) return;
+    if (!isEmitPayload(data)) {
+      this.log(`[plugin ${this.cfg.name}] events.emit: malformed payload; ignored`);
+      return;
+    }
+    try {
+      bus.emit(data.name, data.payload);
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : String(err);
+      this.log(`[plugin ${this.cfg.name}] events.emit('${data.name}') rejected: ${msg}`);
+    }
+  }
+
+  // Release all bus subscriptions this plugin holds. Called on Worker exit
+  // (crash, terminate, graceful) so a dead plugin leaves no lingering
+  // bus subscribers (which would otherwise try to emit to a closed endpoint).
+  private releaseBusSubs(): void {
+    for (const sub of this.busSubs.values()) sub.off();
+    this.busSubs.clear();
   }
 
   private startWatchdog(): void {
@@ -183,6 +266,7 @@ class ManagedPlugin {
   private forceTerminate(): void {
     this.stopWatchdog();
     this.terminating = true;
+    this.releaseBusSubs();
     this.endpoint?.close(`plugin ${this.cfg.name} terminated`);
     void this.worker?.terminate();
   }
@@ -195,6 +279,7 @@ class ManagedPlugin {
 
   private onExit(code: number): void {
     this.stopWatchdog();
+    this.releaseBusSubs();
     this.endpoint?.close(`plugin ${this.cfg.name} exited (code ${code})`);
     this.endpoint = null;
     this.worker = null;
@@ -236,7 +321,10 @@ class ManagedPlugin {
   async stop(): Promise<void> {
     this.stopping = true;
     this.stopWatchdog();
-    if (!this.worker || !this.endpoint) { this.state = "failed"; return; }
+    if (!this.worker || !this.endpoint) {
+      this.releaseBusSubs();
+      this.state = "failed"; return;
+    }
     this.state = "shutting-down";
     const ep = this.endpoint;
     const worker = this.worker;
@@ -290,17 +378,12 @@ export class PluginRuntime {
   }
 
   // Push a one-way event to one plugin by name (core -> plugin). No-op if no such
-  // plugin or it is not `live`.
+  // plugin or it is not `live`. Used by point-to-point flows like decoration
+  // assignment; broad event delivery goes through the dynamic bus instead.
   emit(pluginName: string, name: string, data: Json): void {
     for (const p of this.plugins) {
       if (p.cfg.name === pluginName) { p.emit(name, data); return; }
     }
-  }
-
-  // Push a one-way event to every live plugin (core -> plugin). The window-state
-  // stream broadcasts here; a plugin that does not observe simply ignores it.
-  broadcast(name: string, data: Json): void {
-    for (const p of this.plugins) p.emit(name, data);
   }
 
   // Introspection.
@@ -309,4 +392,25 @@ export class PluginRuntime {
       name: p.cfg.name, state: p.currentState, restarts: p.restartCount,
     }));
   }
+}
+
+// Payload guards for the events.* reserved one-way events. The worker is
+// trusted (it's our bootstrap.ts) but malformed messages should be logged and
+// dropped rather than corrupt the bus.
+
+function isSubscribePayload(d: unknown): d is { subId: number; pattern: string } {
+  return typeof d === "object" && d !== null
+    && typeof (d as { subId?: unknown }).subId === "number"
+    && typeof (d as { pattern?: unknown }).pattern === "string";
+}
+
+function isUnsubscribePayload(d: unknown): d is { subId: number } {
+  return typeof d === "object" && d !== null
+    && typeof (d as { subId?: unknown }).subId === "number";
+}
+
+function isEmitPayload(d: unknown): d is { name: string; payload: Json } {
+  return typeof d === "object" && d !== null
+    && typeof (d as { name?: unknown }).name === "string"
+    && "payload" in (d as object);
 }

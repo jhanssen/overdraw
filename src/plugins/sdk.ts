@@ -11,6 +11,7 @@ export type ShutdownCallback = () => void | Promise<void>;
 import type { PluginGpu } from "./gpu.js";
 import type { PluginWindowObserver } from "./window-observer.js";
 import type { PluginDecorations } from "./decorations.js";
+import type { PluginEvents } from "./events.js";
 
 export interface PluginSdk {
   // The plugin's stable name (config `name`, defaulting to its module).
@@ -20,6 +21,10 @@ export interface PluginSdk {
   // Register a graceful-shutdown callback. Awaited (with a timeout) by the core
   // before the Worker is terminated. Forced shutdown (crash/watchdog) skips it.
   onShutdown(cb: ShutdownCallback): void;
+  // Event bus (subscribe by pattern, emit by name). core-plugin-api.md §3.
+  // Always present; no capability gate (the bus is the primary observation
+  // mechanism for everything plugin-facing).
+  events: PluginEvents;
   // GPU + overlay surfaces (present iff the plugin has the `gpu` capability and
   // the runtime brought the device up). Absent otherwise (capability by shape).
   gpu?: PluginGpu;
@@ -42,6 +47,7 @@ export interface SdkControl {
 }
 
 export function createSdk(name: string, emitLog: (line: string) => void,
+                          events: PluginEvents,
                           gpu?: PluginGpu, window?: PluginWindowObserver,
                           decorations?: PluginDecorations): SdkControl {
   let shutdownCb: ShutdownCallback | null = null;
@@ -56,6 +62,7 @@ export function createSdk(name: string, emitLog: (line: string) => void,
       if (typeof cb !== "function") throw new TypeError("onShutdown expects a function");
       shutdownCb = cb;
     },
+    events,
     ...(gpu ? { gpu } : {}),
     ...(window ? { window } : {}),
     ...(decorations ? { decorations } : {}),
