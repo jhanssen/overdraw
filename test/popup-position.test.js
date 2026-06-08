@@ -4,7 +4,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 
-import { solvePopupPosition } from "../dist/popup-position.js";
+import { solvePopupPosition } from "../packages/core/dist/popup-position.js";
 
 // enum values
 const ANCHOR = { none: 0, top: 1, bottom: 2, left: 3, right: 4, top_left: 5, bottom_left: 6, top_right: 7, bottom_right: 8 };

@@ -1,15 +1,18 @@
 # Throwaway de-risking experiments; not tracked.
 /spikes/
 
-# Build output
+# Build outputs: tsc dist/ and CMake build/ per package.
+packages/*/dist/
+packages/*/build/
+# Also catch any stale root-level dirs from before the monorepo restructure.
+/dist/
 /build/
-build/
+
+# Generated protocol modules (gen-protocol).
+packages/*/src/protocols-gen/
 
 # Node
 node_modules/
-
-# Build output: tsc-compiled JS + generated protocol modules (gen-protocol).
-/dist/
 
 # Editor / OS
 *.swp
@@ -18,3 +21,6 @@ node_modules/
 
 # gdb session history (from ad-hoc debugging)
 .gdb_history
+
+# TypeScript project-references incremental build info.
+*.tsbuildinfo

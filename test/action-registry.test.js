@@ -4,7 +4,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 
-import { ActionRegistry } from '../dist/plugins/action-registry.js';
+import { ActionRegistry } from '../packages/core/dist/plugins/action-registry.js';
 
 function reg(plugin, name, desc, schema) {
   const r = { pluginName: plugin, name };

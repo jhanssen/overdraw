@@ -12,8 +12,8 @@ import tseslint from "typescript-eslint";
 
 export default [
   {
-    files: ["src/**/*.ts"],
-    ignores: ["src/protocols-gen/**"], // generated
+    files: ["packages/*/src/**/*.ts"],
+    ignores: ["packages/*/src/protocols-gen/**"], // generated
     languageOptions: { parser: tseslint.parser },
     plugins: { "@typescript-eslint": tseslint.plugin },
     rules: {

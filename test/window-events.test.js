@@ -15,11 +15,11 @@ import assert from 'node:assert/strict';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { dirname, join } from 'node:path';
 
-import { createWindowObserver } from '../dist/plugins/window-observer.js';
-import { WINDOW_EVENT } from '../dist/events/types.js';
-import { TypedBus } from '../dist/events/bus.js';
-import { DynamicBus } from '../dist/events/dynamic-bus.js';
-import { PluginRuntime } from '../dist/plugins/index.js';
+import { createWindowObserver } from '../packages/core/dist/plugins/window-observer.js';
+import { WINDOW_EVENT } from '../packages/core/dist/events/types.js';
+import { TypedBus } from '../packages/core/dist/events/bus.js';
+import { DynamicBus } from '../packages/core/dist/events/dynamic-bus.js';
+import { PluginRuntime } from '../packages/core/dist/plugins/index.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const FIX = join(__dirname, 'fixtures', 'plugins');

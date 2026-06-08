@@ -6,11 +6,11 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 
-import { TypedBus } from '../dist/events/bus.js';
-import { WINDOW_EVENT } from '../dist/events/types.js';
-import { createDecorationRegistry } from '../dist/decorations.js';
-import { createDecorationBroker } from '../dist/plugins/decoration-broker.js';
-import { createWm } from '../dist/wm/index.js';
+import { TypedBus } from '../packages/core/dist/events/bus.js';
+import { WINDOW_EVENT } from '../packages/core/dist/events/types.js';
+import { createDecorationRegistry } from '../packages/core/dist/decorations.js';
+import { createDecorationBroker } from '../packages/core/dist/plugins/decoration-broker.js';
+import { createWm } from '../packages/core/dist/wm/index.js';
 
 function setup() {
   const bus = new TypedBus();

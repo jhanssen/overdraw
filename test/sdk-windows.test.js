@@ -11,13 +11,13 @@ import assert from 'node:assert/strict';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { dirname, join } from 'node:path';
 
-import { DynamicBus } from '../dist/events/dynamic-bus.js';
-import { createCompositorBus } from '../dist/events/window-bus.js';
-import { WINDOW_EVENT } from '../dist/events/types.js';
-import { PluginRuntime } from '../dist/plugins/index.js';
-import { createWm } from '../dist/wm/index.js';
+import { DynamicBus } from '../packages/core/dist/events/dynamic-bus.js';
+import { createCompositorBus } from '../packages/core/dist/events/window-bus.js';
+import { WINDOW_EVENT } from '../packages/core/dist/events/types.js';
+import { PluginRuntime } from '../packages/core/dist/plugins/index.js';
+import { createWm } from '../packages/core/dist/wm/index.js';
 import { createWindowsBroker, NOT_HANDLED as WINDOWS_NOT_HANDLED }
-  from '../dist/plugins/windows-broker.js';
+  from '../packages/core/dist/plugins/windows-broker.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const FIX = join(__dirname, 'fixtures', 'plugins');

@@ -8,7 +8,7 @@ import { mkdtempSync, writeFileSync, mkdirSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
-import { parseConfigArg, resolveConfigPath, loadConfig } from '../dist/config/load.js';
+import { parseConfigArg, resolveConfigPath, loadConfig } from '../packages/core/dist/config/load.js';
 
 function tmp() { return mkdtempSync(join(tmpdir(), 'odcfg-')); }
 

@@ -11,12 +11,14 @@ import { dirname, join } from "node:path";
 
 const require = createRequire(import.meta.url);
 const __dirname = dirname(fileURLToPath(import.meta.url));
-const repoRoot = join(__dirname, "..");
-export const addonPath = join(repoRoot, "build", "overdraw_native.node");
-export const genDir = join(repoRoot, "dist", "protocols-gen");
+// Native build outputs + generated protocol modules live under packages/core/
+// post-monorepo restructure.
+const coreRoot = join(__dirname, "..", "packages", "core");
+export const addonPath = join(coreRoot, "build", "overdraw_native.node");
+export const genDir = join(coreRoot, "dist", "protocols-gen");
 
 export const haveAddon = existsSync(addonPath);
-export const bin = (name) => join(repoRoot, "build", name);
+export const bin = (name) => join(coreRoot, "build", name);
 export const loadAddon = () => require(addonPath);
 
 // Skip reason if the addon and the named client binary aren't both built.

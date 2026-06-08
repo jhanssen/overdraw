@@ -11,10 +11,10 @@ import { dirname, join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { mkdtempSync } from 'node:fs';
 
-import { DynamicBus } from '../dist/events/dynamic-bus.js';
-import { PluginRuntime } from '../dist/plugins/index.js';
-import { IpcServer } from '../dist/ipc/server.js';
-import { encode, parseMessage } from '../dist/ipc/protocol.js';
+import { DynamicBus } from '../packages/core/dist/events/dynamic-bus.js';
+import { PluginRuntime } from '../packages/core/dist/plugins/index.js';
+import { IpcServer } from '../packages/core/dist/ipc/server.js';
+import { encode, parseMessage } from '../packages/core/dist/ipc/protocol.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const FIX = join(__dirname, 'fixtures', 'plugins');

@@ -11,16 +11,16 @@ import { dirname, join } from "node:path";
 import { globSync } from "node:fs";
 
 import { setupCompositor, canRunGpu, loadDawn, waitFor, pixelAt, pixelMatches } from "./harness.mjs";
-import { createCompositorBus } from "../dist/events/window-bus.js";
-import { DynamicBus } from "../dist/events/dynamic-bus.js";
-import { PluginRuntime } from "../dist/plugins/index.js";
-import { createGpuBroker } from "../dist/plugins/gpu-broker.js";
-import { createDecorationBroker } from "../dist/plugins/decoration-broker.js";
-import { createOverlayBroker } from "../dist/overlay.js";
-import { WINDOW_EVENT } from "../dist/events/types.js";
+import { createCompositorBus } from "../packages/core/dist/events/window-bus.js";
+import { DynamicBus } from "../packages/core/dist/events/dynamic-bus.js";
+import { PluginRuntime } from "../packages/core/dist/plugins/index.js";
+import { createGpuBroker } from "../packages/core/dist/plugins/gpu-broker.js";
+import { createDecorationBroker } from "../packages/core/dist/plugins/decoration-broker.js";
+import { createOverlayBroker } from "../packages/core/dist/overlay.js";
+import { WINDOW_EVENT } from "../packages/core/dist/events/types.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
-const OD = join(__dirname, "..");
+const OD = join(__dirname, "..", "packages", "core");
 const skip = !canRunGpu() ? "no host Wayland" : !loadDawn() ? "dawn.node not built" : false;
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 

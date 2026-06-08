@@ -8,7 +8,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 
-import { createWm } from '../dist/wm/index.js';
+import { createWm } from '../packages/core/dist/wm/index.js';
 
 function mockCompositor() {
   const layouts = [];

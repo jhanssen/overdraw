@@ -4,7 +4,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 
-import { DynamicBus } from '../dist/events/dynamic-bus.js';
+import { DynamicBus } from '../packages/core/dist/events/dynamic-bus.js';
 
 // --- exact-name subscription -----------------------------------------------
 

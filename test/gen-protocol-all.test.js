@@ -15,6 +15,7 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const repoRoot = join(__dirname, "..");
+const coreRoot = join(repoRoot, "packages", "core");
 const INPUTS = [
   "/usr/share/wayland/wayland.xml",
   "/usr/share/wayland-protocols/stable/xdg-shell/xdg-shell.xml",
@@ -30,7 +31,7 @@ function ensureGenerated() {
   if (outDir) return outDir;
   outDir = mkdtempSync(join(tmpdir(), "overdraw-genall-"));
   execFileSync("node", [
-    join(repoRoot, "tools", "gen-protocol", "gen-protocol.js"),
+    join(coreRoot, "tools", "gen-protocol", "gen-protocol.js"),
     "--out", outDir, ...INPUTS,
   ]);
   return outDir;

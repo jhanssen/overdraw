@@ -11,8 +11,8 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 
-import { createWm } from "../dist/wm/index.js";
-import { computeBaseStack } from "../dist/subsurfaces.js";
+import { createWm } from "../packages/core/dist/wm/index.js";
+import { computeBaseStack } from "../packages/core/dist/subsurfaces.js";
 
 // Minimal CompositorState for computeBaseStack: it needs `wm` and reads
 // `surfaces` (for subsurface subtrees) -- empty here (no subsurfaces). The WM is

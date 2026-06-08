@@ -6,8 +6,8 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 
-import { createWm } from '../dist/wm/index.js';
-import { queryState } from '../dist/query.js';
+import { createWm } from '../packages/core/dist/wm/index.js';
+import { queryState } from '../packages/core/dist/query.js';
 
 function mockAddon() {
   return { setSurfaceLayout() {}, setStack() {} };

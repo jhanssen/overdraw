@@ -5,10 +5,10 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 
-import { createWindowsBroker } from '../dist/plugins/windows-broker.js';
-import { createWm } from '../dist/wm/index.js';
-import { DynamicBus } from '../dist/events/dynamic-bus.js';
-import { createCompositorBus } from '../dist/events/window-bus.js';
+import { createWindowsBroker } from '../packages/core/dist/plugins/windows-broker.js';
+import { createWm } from '../packages/core/dist/wm/index.js';
+import { DynamicBus } from '../packages/core/dist/events/dynamic-bus.js';
+import { createCompositorBus } from '../packages/core/dist/events/window-bus.js';
 
 function mockSink() {
   const calls = [];

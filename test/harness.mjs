@@ -15,18 +15,19 @@ import { dirname, join } from "node:path";
 import { spawn } from "node:child_process";
 import { readdirSync, readFileSync, globSync } from "node:fs";
 
-import { installProtocols } from "../dist/protocols/index.js";
+import { installProtocols } from "../packages/core/dist/protocols/index.js";
 
 const require = createRequire(import.meta.url);
 const __dirname = dirname(fileURLToPath(import.meta.url));
-const repoRoot = join(__dirname, "..");
+// Native build outputs live under packages/core/build/ post-monorepo restructure.
+const coreRoot = join(__dirname, "..", "packages", "core");
 
-const addonPath = join(repoRoot, "build", "overdraw_native.node");
-const gpuBin = process.env.OVERDRAW_GPU_PROCESS ?? join(repoRoot, "build", "overdraw-gpu-process");
-const clientBin = join(repoRoot, "build", "harness-client");
+const addonPath = join(coreRoot, "build", "overdraw_native.node");
+const gpuBin = process.env.OVERDRAW_GPU_PROCESS ?? join(coreRoot, "build", "overdraw-gpu-process");
+const clientBin = join(coreRoot, "build", "harness-client");
 
 // Absolute path to a built binary in build/ (for spawnClient({ bin })).
-export const buildBin = (name) => join(repoRoot, "build", name);
+export const buildBin = (name) => join(coreRoot, "build", name);
 
 // True if the environment can run GPU + host-Wayland integration tests.
 export function canRunGpu() {
@@ -39,7 +40,7 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 // Returns null if not present (so JS-compositor tests can skip).
 export function loadDawn() {
   try {
-    const [p] = globSync(join(repoRoot, "build", "3rdparty", "dawn", "Dawn-*", "dawn.node"));
+    const [p] = globSync(join(coreRoot, "build", "3rdparty", "dawn", "Dawn-*", "dawn.node"));
     return p ? require(p) : null;
   } catch { return null; }
 }

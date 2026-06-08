@@ -6,8 +6,8 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 
-import { placeOverlay } from '../dist/overlay-position.js';
-import { createOverlayBroker } from '../dist/overlay.js';
+import { placeOverlay } from '../packages/core/dist/overlay-position.js';
+import { createOverlayBroker } from '../packages/core/dist/overlay.js';
 
 const OUT = { width: 1000, height: 800 };
 

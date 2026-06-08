@@ -6,7 +6,7 @@ import assert from 'node:assert/strict';
 
 import {
   parseMessage, isRequest, isNotification, ok, err, notify, encode, JSONRPC_ERRORS,
-} from '../dist/ipc/protocol.js';
+} from '../packages/core/dist/ipc/protocol.js';
 
 // --- parseMessage ---------------------------------------------------------
 

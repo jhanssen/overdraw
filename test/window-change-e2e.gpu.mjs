@@ -11,13 +11,13 @@ import { dirname, join } from "node:path";
 import { globSync } from "node:fs";
 
 import { setupCompositor, canRunGpu, loadDawn, waitFor } from "./harness.mjs";
-import { createCompositorBus } from "../dist/events/window-bus.js";
-import { DynamicBus } from "../dist/events/dynamic-bus.js";
-import { WINDOW_EVENT } from "../dist/events/types.js";
-import { PluginRuntime } from "../dist/plugins/index.js";
+import { createCompositorBus } from "../packages/core/dist/events/window-bus.js";
+import { DynamicBus } from "../packages/core/dist/events/dynamic-bus.js";
+import { WINDOW_EVENT } from "../packages/core/dist/events/types.js";
+import { PluginRuntime } from "../packages/core/dist/plugins/index.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
-const OD = join(__dirname, "..");
+const OD = join(__dirname, "..", "packages", "core");
 const skip = !canRunGpu() ? "no host Wayland (WAYLAND_DISPLAY unset)"
   : !loadDawn() ? "dawn.node not built" : false;
 

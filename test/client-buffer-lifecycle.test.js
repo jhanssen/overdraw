@@ -16,7 +16,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 
-import { ClientBufferLifecycle } from "../dist/gpu/client-buffer-lifecycle.js";
+import { ClientBufferLifecycle } from "../packages/core/dist/gpu/client-buffer-lifecycle.js";
 
 // Helpers --------------------------------------------------------------------
 

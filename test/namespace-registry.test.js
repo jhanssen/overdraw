@@ -4,7 +4,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 
-import { NamespaceRegistry } from '../dist/plugins/namespace-registry.js';
+import { NamespaceRegistry } from '../packages/core/dist/plugins/namespace-registry.js';
 
 function reg(plugin, ns, prio, methods = ['m']) {
   return { pluginName: plugin, namespace: ns, priority: prio, methods: new Set(methods) };

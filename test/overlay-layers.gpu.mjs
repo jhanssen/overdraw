@@ -15,7 +15,7 @@ import { globSync } from "node:fs";
 
 const require = createRequire(import.meta.url);
 const __dirname = dirname(fileURLToPath(import.meta.url));
-const OD = join(__dirname, "..");
+const OD = join(__dirname, "..", "packages", "core");
 
 const addon = require(join(OD, "build", "overdraw_native.node"));
 let dawn = null;

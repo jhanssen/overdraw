@@ -6,9 +6,9 @@ import assert from 'node:assert/strict';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { dirname, join } from 'node:path';
 
-import { DynamicBus } from '../dist/events/dynamic-bus.js';
-import { WINDOW_EVENT } from '../dist/events/types.js';
-import { PluginRuntime } from '../dist/plugins/index.js';
+import { DynamicBus } from '../packages/core/dist/events/dynamic-bus.js';
+import { WINDOW_EVENT } from '../packages/core/dist/events/types.js';
+import { PluginRuntime } from '../packages/core/dist/plugins/index.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const FIX = join(__dirname, 'fixtures', 'plugins');

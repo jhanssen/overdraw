@@ -13,7 +13,7 @@ import { tmpdir } from "node:os";
 
 const require = createRequire(import.meta.url);
 const __dirname = dirname(fileURLToPath(import.meta.url));
-const OD = join(__dirname, "..");
+const OD = join(__dirname, "..", "packages", "core");
 
 const addon = require(join(OD, "build", "overdraw_native.node"));
 // dawn.node ships inside the extracted Dawn release bundle.

@@ -7,7 +7,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 
-import { negotiateDndAction } from "../dist/protocols/wl_data_device_manager.js";
+import { negotiateDndAction } from "../packages/core/dist/protocols/wl_data_device_manager.js";
 
 const NONE = 0, COPY = 1, MOVE = 2, ASK = 4;
 

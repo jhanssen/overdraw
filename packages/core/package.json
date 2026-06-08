@@ -1,0 +1,18 @@
+{
+  "name": "overdraw",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Wayland compositor: thin C++ core + Node, separate native GPU process (Dawn).",
+  "type": "module",
+  "main": "dist/index.js",
+  "imports": {
+    "#protocols-gen/*": "./dist/protocols-gen/*"
+  },
+  "bin": {
+    "overdrawctl": "./bin/overdrawctl"
+  },
+  "scripts": {
+    "gen-protocols": "node tools/gen-protocol/gen-protocol.js",
+    "build:js": "npm run gen-protocols && tsc -b"
+  }
+}

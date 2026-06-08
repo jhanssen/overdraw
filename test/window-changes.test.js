@@ -6,9 +6,9 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 
-import { TypedBus } from '../dist/events/bus.js';
-import { WINDOW_EVENT } from '../dist/events/types.js';
-import { markWindowChanged, flushWindowChanges } from '../dist/protocols/window-changes.js';
+import { TypedBus } from '../packages/core/dist/events/bus.js';
+import { WINDOW_EVENT } from '../packages/core/dist/events/types.js';
+import { markWindowChanged, flushWindowChanges } from '../packages/core/dist/protocols/window-changes.js';
 
 // Build a minimal CompositorState with one mapped toplevel (surfaceId) whose
 // toplevel record carries title/appId. titleAppId() resolves via
