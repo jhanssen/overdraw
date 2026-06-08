@@ -4,7 +4,7 @@ Ground truth for what exists right now: current capabilities, known gaps, and
 what remains. The design lives in `architecture.md`; this file does not restate
 it. Present-tense only — no change history.
 
-Last updated: 2026-05-31.
+Last updated: 2026-06-08.
 
 ## Read first: gaps in advertised protocols (silent-gap risks)
 
@@ -80,7 +80,7 @@ the client's reserved handle), and the GBM allocator. The core runs the
 the JS protocol/WM/compositing/plugin layers, and is the Wayland server for
 overdraw's own clients.
 
-The core is C++ + Node: `src/index.js`/`src/main.ts` load `overdraw_native.node`;
+The core is C++ + Node: `packages/core/src/index.js`/`packages/core/src/main.ts` load `overdraw_native.node`;
 native core in `native/core/` (`gpu_process`, `wire_link`, `compositor`). Node owns
 `main()` and the libuv loop. The N-API addon uses the raw `node_api.h` C API (not
 node-addon-api, to avoid exception/RTTI dependence under `-fno-rtti`).
@@ -147,8 +147,7 @@ A C++→JS path works: an optional `onFrame` callback fires from the frame timer
 
 Server-side Wayland (`wl_event_loop`) is integrated into the libuv loop (see
 "Wayland server + trampoline"); the core is a real Wayland server. Protocol
-handlers, WM (beyond the placement stub), compositing, and plugin runtime are in
-JS.
+handlers, WM, compositing, and plugin runtime are in JS.
 
 ## Compositing (runs in JS over the Dawn wire)
 
@@ -159,7 +158,7 @@ exposed to JS via a wire-retargeted `dawn.node` (proc table = wire client;
 instance; a wrapped device is borrowed, not destroyed). Built with
 `-Wl,--exclude-libs,ALL` so the bundled abseil does not interpose with V8's.
 
-- **`src/gpu/compositor.ts` (`JsCompositor`)** is the compositor: WGSL pipeline +
+- **`packages/core/src/gpu/compositor.ts` (`JsCompositor`)** is the compositor: WGSL pipeline +
   sampler, per-surface view/uniform/bind group, render pass (placement +
   premultiplied blend, JS-owned back-to-front stack), submit. It implements the
   `CompositorSink` interface the protocol/WM layer drives
@@ -180,14 +179,18 @@ instance; a wrapped device is borrowed, not destroyed). Built with
   back-to-front. `content` holds windows + subsurfaces + popups (a single stack
   owner, `rebuildStackWithPopups`); other layers via `setLayerSurfaces`.
 - **Placement seam + tiling WM:** the compositor consumes geometry only via
-  `CompositorSink` (`setSurfaceLayout`, `setStack`). `src/wm/index.ts` owns the
-  window list/stack, computes tiles, and pushes layout+order + a sized configure.
-  `src/wm/placement.ts` is the layout policy — a **master-stack tiler** (dwm-style:
-  first window = master in a left column at `masterFraction`; the rest share the
-  right column as equal-height slices; a single window fills the output). It is the
-  replaceable policy seam (a future plugin-overridable layout or BSP replaces this
-  function without touching the seam). Params (`masterFraction`, `gap`) are passed
-  via `InstallOptions.layout` (interim config point).
+  `CompositorSink` (`setSurfaceLayout`, `setStack`/`setOutputStack`).
+  `packages/core/src/wm/index.ts` owns the window list/stack, schedules
+  relayouts through `packages/core/src/wm/layout-driver.ts`, and pushes
+  layout+order + a sized configure. The layout *policy* lives in a bundled
+  plugin: `packages/plugin-layout-master-stack/`, registered in the `'layout'`
+  namespace at priority 0 (the bundled-plugin floor). It is a **master-stack
+  tiler** (dwm-style: first window = master in a left column at
+  `masterFraction`; the rest share the right column as equal-height slices;
+  a single window fills the output). A third-party layout plugin claiming the
+  same namespace at higher priority displaces the bundled one; the
+  priority-chain demotes back on failure. Params (`masterFraction`, `gap`) are
+  plugin-internal defaults today (no config wiring yet).
 - **Geometry is compositor-owned (proactive configure).** A toplevel is inserted
   into the layout at `get_toplevel` (becomes master), and the WM sends a sized
   `xdg_toplevel.configure` immediately (before the client has content); existing
@@ -348,7 +351,7 @@ represented (message-level only). No live reload.
 signature module (request/event tables with opcodes/arg metadata/since-versions;
 enums; a `makeEvents(post)` factory) and a `.d.ts` typed contract (branded resource
 types, handler interface, event-sender interface, enums). Output to
-`src/protocols-gen/` (gitignored, reproduced from XML). Generates from core wayland
+`packages/core/src/protocols-gen/` (gitignored, reproduced from XML). Generates from core wayland
 + xdg-shell + linux-dmabuf-v1 + primary-selection-unstable-v1; all `.d.ts`
 type-check under `tsc --strict`.
 
@@ -370,7 +373,7 @@ into `pending`; commit applies (desync) or caches and applies on the parent's
 commit (effective-sync). Sync/desync/inherited-sync computed up the parent chain;
 `set_position` is double-buffered and applied on the parent commit; `set_sync`/
 `set_desync` are immediate; frame callbacks arm on apply. Nested subsurfaces
-handled recursively. `src/subsurfaces.ts` gives each a layout rect + a draw-stack
+handled recursively. `packages/core/src/subsurfaces.ts` gives each a layout rect + a draw-stack
 slot above its parent, rebuilt whenever it could change. Verified: green child over
 blue parent at parent+offset; sync child appears only on parent commit; desync
 child appears on its own commit. **Gap:** `place_above`/`place_below` reordering is
@@ -379,7 +382,7 @@ a no-op (siblings draw in creation order).
 ### Popups (`xdg_popup` / `xdg_positioner`, pixel-verified)
 
 `xdg_positioner` accumulates size/anchor_rect/anchor/gravity/constraint/offset; the
-constraint solver (`src/popup-position.ts`, unit-tested) places the anchor point →
+constraint solver (`packages/core/src/popup-position.ts`, unit-tested) places the anchor point →
 gravity → offset → constrain to the output via flip/slide/resize per axis.
 `get_popup` computes the rect, sends `xdg_popup.configure` + `xdg_surface.
 configure`; on first content the popup maps above its parent (single stack owner,
@@ -421,18 +424,25 @@ action; negotiation unit-tested. **Untested sub-path:** drag-icon compositing
 ### Runtime (isolation + lifecycle + watchdog + restart)
 
 A plugin module loads in its own `worker_threads` Worker, runs `init(sdk)`, and is
-supervised. `src/plugins/protocol.ts` is the Worker↔core envelope
+supervised. `packages/core/src/plugins/protocol.ts` is the Worker↔core envelope
 (`request`/`response`/`event` with a pending-promise table, plus `ping`/`pong`
-control kept outside the request table). `src/plugins/bootstrap.ts` (in the Worker)
-builds the SDK, dynamically imports the module, calls `init`, auto-pongs pings, and
-handles `shutdown`. `src/plugins/runtime.ts` (`PluginRuntime`) owns one Worker per
-plugin with `resourceLimits.maxOldGenerationSizeMb`, the lifecycle state machine
+control kept outside the request table). `packages/core/src/plugins/bootstrap.ts`
+(in the Worker) builds the SDK, dynamically imports the module, calls `init`,
+auto-pongs pings, and handles `shutdown`. `packages/core/src/plugins/runtime.ts`
+(`PluginRuntime`) owns one Worker per plugin with
+`resourceLimits.maxOldGenerationSizeMb`, the lifecycle state machine
 (`spawning`→`live`→`shutting-down`/`failed`), the watchdog (>K missed pongs →
 `terminate()`), and the restart policy (`on-failure` up to `maxRestarts` in a
 rolling `windowSeconds`, then permanently `failed`; `never` disables). Graceful
-`stop()` awaits `onShutdown` up to `shutdownTimeoutMs` then terminates; forced paths
-skip the callback. Timing tunables are injectable. Configured plugins load after the
-server is up (`src/main.ts`).
+`stop()` awaits `onShutdown` up to `shutdownTimeoutMs` then terminates; forced
+paths skip the callback. Timing tunables are injectable.
+
+**Bundled plugins** (Phase 2, `packages/core/src/plugins/bundled.ts`) load
+first on boot, before user-config plugins; user-config plugins load after the
+server is up (`packages/core/src/main.ts`). Bundled plugins register at
+priority 0 in the namespace registry; user plugins claiming the same
+namespace at a higher priority displace them, demoting on failure (priority
+chain). Currently bundled: `@overdraw/plugin-layout-master-stack`.
 
 ### GPU SDK (overlays + decorations)
 
@@ -443,10 +453,10 @@ The cross-process plugin GPU path is built and pixel-verified end to end:
   brokers everything: connection (`AddWireConn`, GPU-end fd via SCM_RIGHTS),
   instance injection, `SetPluginTickDevice`, surface allocation (`AllocSurfaceBuf`),
   and the per-frame fence brackets — reached from the Worker via the runtime's
-  `onRequest` hook (`src/plugins/gpu-broker.ts`). No listening socket: a new
-  connection can only be introduced by the trusted core over the inherited side
-  channel (auth by construction).
-- **SDK** (`src/plugins/gpu.ts`): `sdk.gpu.device` (a dawn.node GPUDevice over the
+  `onRequest` hook (`packages/core/src/plugins/gpu-broker.ts`). No listening
+  socket: a new connection can only be introduced by the trusted core over the
+  inherited side channel (auth by construction).
+- **SDK** (`packages/core/src/plugins/gpu.ts`): `sdk.gpu.device` (a dawn.node GPUDevice over the
   Worker's wire) + `sdk.gpu.createOverlay({layer, anchor, size})` → a `Surface` with
   `getCurrentTexture()` + `present()`. `createOverlay` → the core overlay broker
   decides rect + layer and allocates the shared buffer ring; the plugin renders;
@@ -457,8 +467,8 @@ The cross-process plugin GPU path is built and pixel-verified end to end:
   on the core wire, each FIFO-ordered against the render/sample commands on the
   same wire — no ctrl round-trip and no WireBarrier deferral in the per-frame path
   (see INBAND-ACCESS.md). The cross-device fence dance itself is unchanged.
-- **Surface ring with SharedArrayBuffer slot-state** (`src/plugins/surface-
-  slots.ts`): 3 slots, each a shared dmabuf, with one Int32 per slot transitioning
+- **Surface ring with SharedArrayBuffer slot-state**
+  (`packages/core/src/plugins/surface-slots.ts`): 3 slots, each a shared dmabuf, with one Int32 per slot transitioning
   via atomic CAS (`FREE → ACQUIRED → PRESENTED → DRAINING → FREE`).
   `getCurrentTexture` is async: CAS-claims a FREE slot or `Atomics.waitAsync` (not
   `wait` — the Worker loop must keep turning for watchdog pongs) until one frees.
@@ -473,20 +483,97 @@ The cross-process plugin GPU path is built and pixel-verified end to end:
 
 ### Core event bus + window-state stream
 
-A typed in-core bus (`src/events/bus.ts`, `TypedBus<M>`: `on`/`emit`/`clear`,
-synchronous fan-out, throwing listeners caught + logged) with a concrete instance +
-event map (`src/events/window-bus.ts`, `CompositorEventMap`:
-window.map/unmap/change + keyboard.focus). Payloads (`src/events/types.ts`) are
-structured-clone-safe (forwardable over postMessage). Producers: the map sweep emits
-`window.map`; surface teardown emits `window.unmap`; set_title/set_app_id +
-keyboard-focus changes mark a per-frame dirty set drained into one coalesced
-`window.change` per surface (consistent snapshot, closes the late-`set_app_id`
-hole). Plugin side: `sdk.window` `onMap`/`onUnmap`/`onChange`
-(`src/plugins/window-observer.ts`), validating each payload at the trust boundary;
-`main.ts` forwards window.* to the runtime (`broadcast`/`emit`). **Gap:**
-`window.change` covers only title/appId/activated — maximized/fullscreen/minimized/
-resized/parent are not emitted (those `xdg_toplevel` requests are no-ops with no
-backing state); the bus is ready for them.
+A typed in-core bus (`packages/core/src/events/bus.ts`, `TypedBus<M>`:
+`on`/`emit`/`clear`, synchronous fan-out, throwing listeners caught + logged)
+with a concrete instance + event map
+(`packages/core/src/events/window-bus.ts`, `CompositorEventMap`:
+window.map/unmap/change + keyboard.focus). Payloads
+(`packages/core/src/events/types.ts`) are structured-clone-safe (forwardable
+over postMessage). Producers: the map sweep emits `window.map`; surface
+teardown emits `window.unmap`; set_title/set_app_id + keyboard-focus changes
+mark a per-frame dirty set drained into one coalesced `window.change` per
+surface (consistent snapshot, closes the late-`set_app_id` hole). Plugin
+side: `sdk.window` `onMap`/`onUnmap`/`onChange`
+(`packages/core/src/plugins/window-observer.ts`), validating each payload at
+the trust boundary; `main.ts` forwards window.* to the runtime
+(`broadcast`/`emit`). **Gap:** `window.change` covers only
+title/appId/activated — maximized/fullscreen/minimized/resized/parent are not
+emitted (those `xdg_toplevel` requests are no-ops with no backing state); the
+bus is ready for them.
+
+**Pattern subscribe + plugin emit** (Phase 0a, `dynamic-bus.ts`): on top of
+the typed bus, a dynamic, string-keyed event bus supports
+`sdk.events.subscribe(pattern, cb)` (exact name or glob — `'workspace.*'`,
+`'*'`) and `sdk.events.emit(name, payload)`. Core re-publishes the typed
+bus's `CompositorEventMap` events into the dynamic bus so plugin
+subscribers see them under the same names; plugins emit into their own
+namespaces. This is the substrate the IPC server's `subscribe` /
+`unsubscribe` methods route through.
+
+### Plugin SDK substrate (Phase 0)
+
+Foundation primitives on which everything else layers; see
+`core-plugin-api.md` for the API surface and `build-order.md` for the
+sequencing.
+
+- **Namespace registry** (Phase 0b,
+  `packages/core/src/plugins/namespace-registry.ts` +
+  `namespace.ts`/`runtime.ts`): a plugin claims a string namespace at a
+  priority and exposes typed methods; the registry records all
+  registrations sorted priority-descending. The head is the active winner;
+  failure (Worker terminate, restart-budget exhaustion) demotes to the
+  next-highest registration (priority chain). `sdk.registerPlugin(name,
+  init, {priority?})` + `sdk.plugin(name)`; cross-Worker invocation routes
+  through `runtime.invokeNamespace(namespace, method, args)`. Bundled
+  plugins register at priority 0 (the floor) unless they explicitly
+  override. The layout driver (Phase 2) is the first real consumer.
+
+- **Action registry** (Phase 0c,
+  `packages/core/src/plugins/action-registry.ts` + `actions.ts`):
+  `sdk.actions.register({name, description?, schema?, handler})` /
+  `sdk.actions.invoke(name, params?)` / `sdk.actions.list()`. Name
+  collisions throw on registration. Actions are the IPC's primary entry
+  point; the bundled actions surface today is empty (Phase 6+ greenfield
+  plugins add their own actions).
+
+- **Per-window state bag + hint setters** (Phase 0d,
+  `packages/core/src/plugins/windows-sdk.ts` + `windows-broker.ts`):
+  `sdk.windows.setFloating` / `setFullscreen` / `setMaximized` /
+  `setMinimized` store opaque hint state (no behavioral change in core
+  today; the WM is still a fixed tiler — see "Read first" silent-gap
+  list). `setState(id, key, value)` / `getState` / `deleteState` is the
+  untyped per-window state bag; structured-clone-validated at the
+  bundled/external boundary. `get(id)` / `list()` snapshot windows for
+  the plugin (used by the layout driver and any plugin needing inputs
+  without subscribing). Convention: namespace your keys
+  (`'workspace.id'`, `'rules.tags'`) — ownership is conventional.
+
+- **`setOutputStack`** (Phase 0e): `sdk.windows.setOutputStack(outputId,
+  ids[]|null)` per-output stack ordering, primitive replacing the prior
+  global `setStack`. The compositor filters its stack per output; passing
+  `null` clears the per-output override and falls back to the global
+  stack. Substrate for workspaces (Phase 6).
+
+### IPC: JSON-RPC 2.0 server + `overdrawctl` (Phase 1)
+
+- **Server** (`packages/core/src/ipc/server.ts`, ~330 lines): listens on
+  `$XDG_RUNTIME_DIR/overdraw-<display>.sock` (mode 0700), strict JSON-RPC
+  2.0 framing (LF-delimited JSON, one request per line). Methods:
+  - `invoke {action, args?}` — dispatch into the action registry; result
+    or JSON-RPC error.
+  - `list-actions` — enumerate registered actions (`ActionInfo[]`).
+  - `subscribe {pattern}` — register a dynamic-bus pattern; returns
+    `{subscription}`. Matching events arrive as id-less notifications:
+    `method: "event"`, `params: {subscription, name, payload}`.
+  - `unsubscribe {subscription}`.
+
+- **`overdrawctl`** (`packages/core/src/cli/overdrawctl.ts`, ~260 lines;
+  shipped as `bin/overdrawctl` in the `overdraw` npm package): thin CLI
+  wrapper mapping `overdrawctl <action> [args...]`, `overdrawctl list`,
+  `overdrawctl subscribe <pattern>` to JSON-RPC over the socket.
+
+Authentication is filesystem permissions on the socket; no token / per-
+caller auth.
 
 ### Decoration provider (registration + insets + drawing + atomic gating)
 
@@ -496,7 +583,7 @@ the window's inset rect, with the window's content gated until the decoration's
 first frame (content + decoration appear together). A provider that never draws is
 deregistered on a timeout and the window is shown undecorated.
 
-- **Registration** (`src/decorations.ts`, GPU-free): `sdk.decorations.register(
+- **Registration** (`packages/core/src/decorations.ts`, GPU-free): `sdk.decorations.register(
   pattern, flags?)` (RegExp source) + `onAssigned(cb)`. Subscribes to `window.map`
   + `window.change`, assigns the first-registered matching provider (match-once),
   emits `decoration.assigned {surfaceId, appId, title, rect}`.
@@ -563,18 +650,32 @@ interactive (human-in-the-loop) tests.
 
 ### Pure-unit (`npm test` → `node --test 'test/**/*.test.js'`, GPU-free)
 
-`gen-protocol.test.js` + `gen-protocol-all.test.js` (validates ALL generated
-signatures); `placement.test.js`; `wm.test.js` (map/unmap + `windowAt`, additive
-insets + gating filter, against a mock addon); `query.test.js`; `config.test.js`;
-`overlay.test.js`; `popup-position.test.js`; `data-device-dnd.test.js`;
-`decorations.test.js`; `window-events.test.js` + `window-changes.test.js` (bus +
-observer + coalescing, incl. a real Worker); `plugins.test.js` (real Workers + real
-fixture plugins: live/failed/graceful-stop/watchdog-terminate/OOM/independence);
-`scm-rights.test.js`; the server-only smokes (`server.test.js`,
+Generator + protocols: `gen-protocol.test.js`, `gen-protocol-all.test.js`
+(validates ALL generated signatures), `popup-position.test.js`,
+`data-device-dnd.test.js`. WM: `wm.test.js` (map/unmap + `windowAt`,
+additive insets + gating filter, against a mock addon),
+`wm-hints-state.test.js`. Layout (Phase 2,
+`test/layout-master-stack/`): `master-stack.test.js` (algorithm),
+`integration.test.js` (driver + bundled plugin invocation end to end).
+Snapshot / query: `query.test.js`. Config: `config.test.js`. Overlays /
+decorations: `overlay.test.js`, `decorations.test.js`,
+`decoration-zbind.test.js`. Events / windows brokers (Phase 0a/0d/0e):
+`window-events.test.js` + `window-changes.test.js` (bus + observer +
+coalescing, incl. a real Worker), `dynamic-bus.test.js` (pattern subscribe
++ plugin emit), `sdk-events.test.js`, `sdk-windows.test.js`,
+`windows-broker-output-stack.test.js`. Namespace / actions registries
+(Phase 0b/0c): `namespace-registry.test.js`, `sdk-namespace.test.js`,
+`action-registry.test.js`, `sdk-actions.test.js`. IPC (Phase 1):
+`ipc-protocol.test.js`, `ipc-server.test.js`. Plugin runtime:
+`plugins.test.js` (real Workers + real fixture plugins:
+live/failed/graceful-stop/watchdog-terminate/OOM/independence). Buffers /
+wire / fds: `client-buffer-lifecycle.test.js`, `wire-barrier.test.js`,
+`scm-rights.test.js`. Server-only smokes: `server.test.js`,
 `trampoline.test.js`, `fd-passing.test.js`, `xdg-shell.test.js`, shared
-`server-helpers.mjs`, one server lifecycle per file). No native build, no GPU.
+`server-helpers.mjs`, one server lifecycle per file. No native build,
+no GPU.
 
-### State-query channel (`src/query.ts`)
+### State-query channel (`packages/core/src/query.ts`)
 
 `queryState(state)` → `StateSnapshot`: output size, windows (surfaceId + rect +
 title + app_id + role + mapped), back-to-front stack order, pointer/keyboard focus
@@ -592,15 +693,18 @@ server + protocols with input routed; `spawnClient` (resolves on the client's
 into the `InputSink`) and `addon.injectHostInput` (through the real
 `WaylandInputBackend` normalization, round-tripping `wl_fixed_t`).
 
-Coverage: `integration.gpu.mjs` (map→query, stacking, focus-on-map, follow-pointer,
-click-to-focus, plus host-path input); `compositing.gpu.mjs` (pixel: placement,
-two-client positions, overlap stacking); `protocols.gpu.mjs` (`wl_output` mode,
-`wl_callback` per-frame, keyboard delivery via the host path); the JS-compositor
-suite (`js-compositor*.gpu.mjs` incl. a dmabuf buffer-cycling leak test);
-`subsurface.gpu.mjs`; `popup.gpu.mjs`; `clipboard.gpu.mjs`; `dnd.gpu.mjs`;
-`window-change-e2e.gpu.mjs`; `xdev-fence.gpu.mjs`; the plugin suite
-(`plugin-overlay*.gpu.mjs`, `worker-gpu.gpu.mjs`, `decoration-*.gpu.mjs`,
-`example-decoration.gpu.mjs`).
+Coverage: `integration.gpu.mjs` (map→query, stacking, focus-on-map,
+follow-pointer, click-to-focus, plus host-path input);
+`compositing.gpu.mjs` (pixel: placement, two-client positions, overlap
+stacking); `tiling.gpu.mjs` (master-stack tiling under real clients, post-
+extraction); `protocols.gpu.mjs` (`wl_output` mode, `wl_callback` per-frame,
+keyboard delivery via the host path); the JS-compositor suite
+(`js-compositor*.gpu.mjs` incl. a dmabuf buffer-cycling leak test);
+`overlay-layers.gpu.mjs`; `subsurface.gpu.mjs`; `popup.gpu.mjs`;
+`clipboard.gpu.mjs`; `dnd.gpu.mjs`; `window-change-e2e.gpu.mjs`;
+`xdev-fence.gpu.mjs`; `wire-serial-regression.gpu.mjs`; the plugin suite
+(`plugin-overlay*.gpu.mjs`, `worker-gpu.gpu.mjs`, `decoration-*.gpu.mjs`
+incl. `decoration-two-windows.gpu.mjs`, `example-decoration.gpu.mjs`).
 
 ### Protocol coverage matrix
 
@@ -639,28 +743,45 @@ The real launcher passes no headless arg → stays nested + presents on screen.
 
 ## Config
 
-`src/config/` loads from `--config <path>` (hard error if missing) else
+`packages/core/src/config/` loads from `--config <path>` (hard error if missing) else
 `$XDG_CONFIG_HOME/overdraw/config.*` then `~/.config/overdraw/config.*`, probing
 `.ts/.cts/.mts/.js/.cjs/.mjs` (Node 24 native type-stripping, no transpile).
 Default export may be an object or a (sync/async) function. Validates
 `focus`/`output`; the launcher applies them. The `plugins` array is parsed,
 validated, resolved, and consumed by the runtime (module paths resolve relative to
-the config file's dir). The capability sub-grant schema is not yet validated (no
+the config file's dir); bundled plugins (from
+`packages/core/src/plugins/bundled.ts`) are resolved separately and load
+first. The capability sub-grant schema is not yet validated (no
 capabilities exist to grant).
 
 ## Not yet built (design only)
 
-- **WM / policy / layout.** Window management, focus rules, layout strategy — none
-  built; placement is a cascade stub. This is the gate for the `xdg_toplevel`
-  move/resize/maximize/fullscreen requests (currently no-ops) and for reconfigure
-  gating of decorations.
+- **WM behavioral state.** Layout policy is a bundled plugin (master-stack
+  tiler, Phase 2) — that piece is built. What is not: behavioral handling of
+  the `xdg_toplevel` state requests (move/resize/maximize/fullscreen/
+  minimize). The hint setters (`sdk.windows.setFloating` etc., Phase 0d)
+  store opaque state and emit on the bus, but the WM and the bundled
+  layout do not react to those hints. This is the gate for the `xdg_toplevel`
+  WM-state silent-gap items in "Read first", and for any user-driven
+  interactive move/resize/keybinding feature.
+- **Focus policy still in core.** `follow-pointer`/`click-to-focus`/
+  `focusOnMap` live in `packages/core/src/protocols/wl_seat.ts`, not in
+  a plugin. Phase 3 extracts this into a bundled `'focus'`-namespace
+  plugin per `build-order.md`.
 - **`wl_output` reconfiguration + host-window resize.** See "Read first".
 - **Display-driven frame clock.** See "Read first" and architecture.md.
-- **Plugin SDK breadth.** Built: scope-B runtime + `sdk.gpu.createOverlay` +
-  `sdk.window` observer + `sdk.decorations`. Not built: window/output/capture/input/
-  protocol SDK surfaces; the capture/takeover direction of the producer/consumer
-  primitive (and the workspace/WM layer it presupposes); interactive-region hit-
-  testing; `sdk.onFrame` (animation uses a plugin-driven loop today).
+- **Plugin SDK breadth.** Built: scope-B runtime + `sdk.gpu.createOverlay`
+  + `sdk.window` observer + `sdk.decorations`; namespace registry + action
+  registry + dynamic event bus (Phase 0); `sdk.windows` hint setters +
+  state bag + snapshots + `setOutputStack` (Phase 0d/0e); IPC JSON-RPC
+  server + `overdrawctl` (Phase 1). Not built: per-surface state
+  primitives (opacity/mask/transform/output-margin per
+  `core-plugin-api.md` §1, scheduled Phase 4a); `sdk.compose` /
+  `sdk.transitions` (Phases 5, 8); animation evaluator (Phase 4); cursor
+  / closing / velocity (Phase 9); input chain (`sdk.input.bind`, Phase
+  7); output observation beyond a fabricated `wl_output`; protocol SDK
+  surface; interactive-region hit-testing; `sdk.onFrame` (animation uses
+  a plugin-driven loop today).
 - **Capability enforcement.** No capability gate on `sdk.gpu`/`sdk.window`/
   `sdk.decorations` (every plugin gets them); no native-import restriction (a
   plugin's `import()` is unrestricted — deferred until there is an SDK native addon
@@ -668,7 +789,7 @@ capabilities exist to grant).
 - **Plugin teardown wiring.** `unregisterPlugin` exists in the broker but `main.ts`
   does not call it on plugin exit; a crashed provider's registration lingers (its
   gated windows are released by unmap/timeout).
-- **Strict typing of the plugin GPU broker.** `src/plugins/gpu-broker.ts` + `gpu.ts`
+- **Strict typing of the plugin GPU broker.** `packages/core/src/plugins/gpu-broker.ts` + `gpu.ts`
   pass an `unknown` request bag cast field-by-field with `as` (passes lint via a
   known loophole — eslint bans `as any`/`as unknown` but not `x as ConcreteType`).
   A typed request map is wanted; not done.

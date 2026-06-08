@@ -9,6 +9,12 @@ Read order: `customization.md` (the model) → `core-plugin-api.md` (the API
 surface + decisions) → this file (the build sequence). Ground truth for
 what is actually built today is in `status.md`.
 
+## Status
+
+Phases 0a, 0b, 0c, 0d, 0e, 1, 2 are landed (see `git log` and `status.md`).
+Phase 3 is next. The text below describes each phase in its original
+forward-looking shape; ✅ marks the completed ones inline.
+
 ## Principle
 
 Build the load-bearing primitives early so everything else can layer on
@@ -40,20 +46,20 @@ this plan:
 These don't have to come first, but they limit the user-visible payoff of
 later phases until resolved.
 
-## Phase 0 — Foundation primitives
+## Phase 0 — Foundation primitives ✅
 
 Pre-requisite to everything else. No user-visible behavior change.
 
-### 0a. Event bus generalization
+### 0a. Event bus generalization ✅
 
-- Extend `src/events/bus.ts` to support plugin-side `emit` and pattern
-  subscription (`'workspace.*'`, `'*'`).
+- Extend `packages/core/src/events/bus.ts` to support plugin-side `emit`
+  and pattern subscription (`'workspace.*'`, `'*'`).
 - Extend `CompositorEventMap` to cover the full set named in
   `core-plugin-api.md` §3 (window.closing, output.*, frame.tick,
   hint-state events).
 - ~200 lines.
 
-### 0b. Plugin namespace registry
+### 0b. Plugin namespace registry ✅
 
 - New: `sdk.registerPlugin(name, init)` / `sdk.plugin(name)` with priority-
   chain arbitration per `core-plugin-api.md` §10.
@@ -64,14 +70,14 @@ Pre-requisite to everything else. No user-visible behavior change.
   augmentable interfaces).
 - ~150 lines.
 
-### 0c. Action registry
+### 0c. Action registry ✅
 
 - New: `sdk.actions.register` / `invoke` / `list` per `core-plugin-api.md`
   §9.
 - Name collisions error.
 - ~100 lines.
 
-### 0d. Per-window state bag + hint-state setters
+### 0d. Per-window state bag + hint-state setters ✅
 
 - New: `sdk.windows.setState` / `getState` (untyped runtime; structured-
   clone validated at the bundled/external boundary).
@@ -80,10 +86,11 @@ Pre-requisite to everything else. No user-visible behavior change.
   field.
 - ~150 lines.
 
-### 0e. `setOutputStack`
+### 0e. `setOutputStack` ✅
 
 - New: per-output stack ordering primitive replacing the current global
-  `setStack` in `src/wm/index.ts` / `src/gpu/compositor.ts`.
+  `setStack` in `packages/core/src/wm/index.ts` /
+  `packages/core/src/gpu/compositor.ts`.
 - The compositor filters its stack per output based on this.
 - ~100 lines of new code + compositor changes.
 
@@ -93,11 +100,11 @@ Pre-requisite to everything else. No user-visible behavior change.
 registry are the substrate for everything else. Getting them right at
 this stage is cheap; retrofitting later would touch every plugin.
 
-## Phase 1 — IPC and `overdrawctl`
+## Phase 1 — IPC and `overdrawctl` ✅
 
 Layers cleanly on the Phase 0 action registry + event bus.
 
-### 1a. JSON-RPC 2.0 server
+### 1a. JSON-RPC 2.0 server ✅
 
 - Listen on `$XDG_RUNTIME_DIR/overdraw-<display>.sock` (700).
 - JSON-RPC 2.0 framing.
@@ -106,7 +113,7 @@ Layers cleanly on the Phase 0 action registry + event bus.
   per the convention in `core-plugin-api.md` §11.
 - ~300 lines.
 
-### 1b. `overdrawctl` binary
+### 1b. `overdrawctl` binary ✅
 
 - Thin CLI wrapper mapping CLI invocations to JSON-RPC.
 - ~200 lines.
@@ -117,33 +124,37 @@ Layers cleanly on the Phase 0 action registry + event bus.
 (the CLI), and the IPC interop story is testable end-to-end early. Every
 subsequent feature gets a CLI surface for free.
 
-## Phase 2 — Layout extraction
+## Phase 2 — Layout extraction ✅
 
 The first exercise of the plugin namespace registry, on an extraction
-seam that already exists in code (`src/wm/placement.ts`).
+seam that already existed in code (previously `src/wm/placement.ts`).
 
-### 2a. Layout driver in core
+### 2a. Layout driver in core ✅
 
-- In `src/wm/index.ts`, replace the direct call to `computeMasterStack`
-  with a call to `sdk.plugin('layout').compute(inputs)`.
-- Coalesce in-flight `compute` per output (one at a time).
-- Apply result via `setGeometry` + configure dispatch.
-- ~100 lines of change in core.
+- `packages/core/src/wm/layout-driver.ts` invokes the active 'layout'
+  plugin via the runtime's namespace dispatch; `packages/core/src/wm/
+  index.ts` schedules through the driver.
+- Coalesces in-flight `compute` per output (one at a time;
+  most-recent reason wins on coalesce).
+- Apply path: result rects flow back to the WM, which updates records,
+  pushes `setSurfaceLayout` to the compositor, and fires configure on
+  size change.
 
-### 2b. Bundled layout plugin
+### 2b. Bundled layout plugin ✅
 
-- New: `@overdraw/plugin-layout-master-stack` (or similar).
-- Contains the existing `computeMasterStack` logic verbatim.
-- Registers via `sdk.registerPlugin('layout', ...)` at priority 0.
-- Ships with overdraw; loaded on boot.
-- ~100 lines (mostly relocation).
+- `packages/plugin-layout-master-stack/` (npm name
+  `@overdraw/plugin-layout-master-stack`).
+- Contains the existing master-stack algorithm.
+- Registers via `sdk.registerPlugin('layout', ...)` at priority 0 (the
+  bundled-plugin floor).
+- Listed in `packages/core/src/plugins/bundled.ts`, loaded on boot.
 
-### 2c. Shared interface package
+### 2c. Shared interface package ✅
 
-- New: `@overdraw/layout-types` defining `LayoutAPI`, `LayoutInputs`,
-  `LayoutResult`, `LayoutWindow`.
+- `packages/layout-types/` (npm name `@overdraw/layout-types`) defining
+  `LayoutAPI`, `LayoutInputs`, `LayoutResult`, `LayoutWindow`,
+  `LayoutReason`.
 - Type-only.
-- ~80 lines.
 
 **Total estimate**: ~280 lines, mostly relocation.
 
@@ -188,7 +199,7 @@ primitives + the declarative animation engine online.
 ### 4a. Per-surface state primitives
 
 - Add `setOpacity` / `setMask` / `setTransform` / `setOutputMargin` to the
-  compositor's shader uniforms in `src/gpu/compositor.ts`.
+  compositor's shader uniforms in `packages/core/src/gpu/compositor.ts`.
 - Independent of animation — these are useful for any plugin styling.
 - ~200 lines of compositor change + WGSL.
 

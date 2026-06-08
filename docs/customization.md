@@ -2,9 +2,13 @@
 
 Design exploration for the visual customization and plugin extension model.
 Building on `architecture.md` but supersedes it where they differ; the
-canonical decisions will land when this gets built. Nothing here is
-implemented yet unless explicitly noted; for what is actually built, see
-`status.md`.
+canonical decisions will land when this gets built. For what is actually
+built, see `status.md`; `core-plugin-api.md` is the concrete API manifest
+derived from this exploration and is newer where they differ in detail.
+Several substrate items here (per-window state bag, hint setters, event
+bus, action registry, plugin namespace registry, IPC + `overdrawctl`) are
+implemented as of Phase 0–2 of `build-order.md`; this document is not
+re-edited to reflect that.
 
 ## Premise
 

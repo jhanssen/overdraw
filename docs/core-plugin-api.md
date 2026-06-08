@@ -505,9 +505,11 @@ Core's responsibilities:
 - Apply the result: `setGeometry` per window, `xdg_toplevel.configure` per
   affected window, configure→ack→commit settle.
 
-The bundled master-stack layout (currently `src/wm/placement.ts`) becomes
-a `sdk.registerPlugin('layout', ...)` registration at priority 0. The seam
-already exists in code; this exposes it via the plugin registry.
+The bundled master-stack layout is a `sdk.registerPlugin('layout', ...)`
+registration at priority 0 — extracted from core to
+`packages/plugin-layout-master-stack/` as of Phase 2. The seam in core is
+`packages/core/src/wm/layout-driver.ts`, which invokes the active
+'layout' plugin via the namespace registry.
 
 ### 14. Focus driver
 
@@ -722,8 +724,8 @@ specific plugin they're targeting and use its types directly.
 Beyond the SDK surface above, core gains these internal mechanisms:
 
 - **Action registry**: name → handler + schema + owning plugin.
-- **Event bus** (extending `src/events/bus.ts`): pattern subscription,
-  plugin emission, IPC routing.
+- **Event bus** (extending `packages/core/src/events/bus.ts`): pattern
+  subscription, plugin emission, IPC routing.
 - **Plugin namespace registry**: name → list of registrations with priorities;
   exclusive-role arbitration; failure-promotion.
 - **Animation evaluator**: in-flight animation list, per-frame evaluation,
@@ -743,30 +745,40 @@ target.
 
 ### Stays in core (already correct)
 - Wayland protocol handling, trampoline, generator (`native/wayland/`,
-  `src/protocols-gen/`).
+  `packages/core/src/protocols-gen/`).
 - Frame loop, present, fence machinery (`native/core/`, `gpu-process/`).
 - Buffer/dmabuf import + fence (`native/core/shm.cpp`, dmabuf path).
 - Input event source (`native/core/input.h`, `input_wayland.cpp`).
 - `wl_output` (such as it is).
 - Window state, lifecycle, surface tree (the `Window`/`Surface` records
-  in `src/wm/index.ts`).
-- Compositing pass (`src/gpu/compositor.ts`).
-- Plugin runtime + watchdog + restart (`src/plugins/runtime.ts`,
+  in `packages/core/src/wm/index.ts`).
+- Compositing pass (`packages/core/src/gpu/compositor.ts`).
+- Plugin runtime + watchdog + restart (`packages/core/src/plugins/runtime.ts`,
   `protocol.ts`, `bootstrap.ts`).
 
+### Already extracted to bundled plugins
+- **Master-stack layout policy** → `packages/plugin-layout-master-stack/`,
+  registered at priority 0 in namespace `'layout'`. Core seam:
+  `packages/core/src/wm/layout-driver.ts`. Type contract:
+  `packages/layout-types/`. Phase 2 of `build-order.md`.
+
 ### Currently in core, must move to plugin
-- **Master-stack layout policy** (`src/wm/placement.ts`, 96 lines) →
-  bundled layout plugin registered at priority 0 in namespace `'layout'`.
 - **Focus policy** (the `follow-pointer`/`click-to-focus` logic in
-  `src/wm/index.ts`) → bundled focus plugin in namespace `'focus'`, with
-  the modes implemented inline in core per the parameterized-mode pattern.
+  `packages/core/src/protocols/wl_seat.ts`) → bundled focus plugin in
+  namespace `'focus'`, with the modes implemented inline in core per the
+  parameterized-mode pattern. Phase 3 of `build-order.md`.
 
 ### Decoration broker (in core, stays)
-- `src/plugins/decoration-broker.ts` is broker machinery for an
-  exclusive-multiplex pattern. With the namespace-registry generalization,
-  the broker pattern moves into the namespace-registry implementation itself.
-  The specific decoration logic stays in `src/plugins/decorations.ts` on the
-  plugin side.
+- `packages/core/src/plugins/decoration-broker.ts` is broker machinery
+  for an exclusive-multiplex pattern. The namespace registry
+  (`packages/core/src/plugins/namespace-registry.ts`) now exists (Phase
+  0b), but the decoration broker has not been refactored on top of it —
+  it still runs its own arbitration. Open: whether to fold decoration
+  arbitration into the namespace registry, or leave the broker as the
+  multiplex-with-match pattern (the namespace registry today serves
+  exclusive-role plugins; multiplex semantics are not the same shape).
+  The specific decoration logic stays in
+  `packages/core/src/decorations.ts` on the plugin side.
 
 ### Greenfield (build as plugin from day one)
 The following are not built; per the model they should be plugins, not core:
