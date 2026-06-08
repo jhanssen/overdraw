@@ -48,6 +48,13 @@ export type Layer = "background" | "below" | "content" | "above" | "overlay";
 export const LAYER_ORDER: readonly Layer[] =
   ["background", "below", "content", "above", "overlay"];
 
+// The placeholder id of the single output today. wl_output is fabricated
+// (status.md "Read first") and core renders one output; OUTPUT_DEFAULT is the
+// id every output-keyed API uses until real multi-output reconfiguration
+// lands. New output handlers MUST assign real ids; this constant is the
+// transitional value, not a magic default to keep.
+export const OUTPUT_DEFAULT = 0;
+
 export interface CompositorSink {
   commitSurfaceBuffer(id: number, poolId: number, offset: number, w: number,
                       h: number, stride: number): boolean;
@@ -56,8 +63,18 @@ export interface CompositorSink {
                       offset: number, stride: number, bufferId: number): boolean;
   setSurfaceLayout(id: number, x: number, y: number, w: number, h: number): void;
   // The `content` layer's ordered draw list (windows + subsurfaces + popups).
-  // rebuildStackWithPopups remains its single owner.
+  // rebuildStackWithPopups remains its single owner. Acts as the DEFAULT
+  // content stack; an output may override it via setOutputStack.
   setStack(ids: number[]): void;
+  // Per-output content-stack override (core-plugin-api.md §1 setOutputStack).
+  // When set, the named output renders this ordered id list for its content
+  // layer instead of the global setStack output. Pass `null` to clear the
+  // override (output falls back to the global stack). Optional so the native
+  // sink (if ever used) need not implement it.
+  //
+  // Single-output today: outputId 0 (OUTPUT_DEFAULT) is the only valid id;
+  // future multi-output reconfiguration assigns real ids.
+  setOutputStack?(outputId: number, ids: number[] | null): void;
   // Set the ordered surface ids for a non-content layer (background/below/above/
   // overlay). Plugin overlays/decorations use this. Optional so the native sink
   // (if ever used) need not implement it.

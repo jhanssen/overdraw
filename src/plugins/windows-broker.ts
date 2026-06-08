@@ -12,10 +12,14 @@ import type { DynamicBus } from "../events/dynamic-bus.js";
 import { WINDOW_EVENT } from "../events/types.js";
 import type { WindowStateChangedEvent } from "../events/types.js";
 import { markWindowChanged } from "../protocols/window-changes.js";
-import type { CompositorState } from "../protocols/ctx.js";
+import type { CompositorState, CompositorSink } from "../protocols/ctx.js";
 
 export interface WindowsBrokerDeps {
   wm: Wm;
+  // The compositor sink, for windows.set-output-stack (overrides the
+  // default stack on a specific output). Optional: when absent, the broker
+  // rejects set-output-stack requests cleanly.
+  compositor: CompositorSink;
   // Compositor state, for markWindowChanged (which coalesces window.change
   // emissions onto the frame boundary -- consistent with title/appId/activated
   // changes from the protocol layer).
@@ -41,7 +45,7 @@ export type WindowsBroker = (
 export const NOT_HANDLED = Symbol("windows-broker:not-handled");
 
 export function createWindowsBroker(deps: WindowsBrokerDeps): WindowsBroker {
-  const { wm, state, pluginBus } = deps;
+  const { wm, compositor, state, pluginBus } = deps;
 
   return (pluginName: string, method: string, params: unknown): unknown | typeof NOT_HANDLED => {
     void pluginName;   // available for future audit / capability gating
@@ -52,8 +56,20 @@ export function createWindowsBroker(deps: WindowsBrokerDeps): WindowsBroker {
     if (method === "windows.get-state") return handleGetState(params);
     if (method === "windows.get") return handleGet(params);
     if (method === "windows.list") return wm.listSnapshots();
+    if (method === "windows.set-output-stack") return handleSetOutputStack(params);
     return NOT_HANDLED;
   };
+
+  function handleSetOutputStack(p: unknown): null {
+    if (!isSetOutputStackPayload(p)) {
+      throw new Error("windows.set-output-stack: malformed payload");
+    }
+    if (!compositor.setOutputStack) {
+      throw new Error("windows.set-output-stack: not supported by this compositor");
+    }
+    compositor.setOutputStack(p.outputId, p.ids);
+    return null;
+  }
 
   function handleSet(p: unknown): null {
     if (!isSetPayload(p)) throw new Error("windows.set: malformed payload");
@@ -137,4 +153,13 @@ function isGetStatePayload(d: unknown): d is { id: number; key: string } {
 function isGetPayload(d: unknown): d is { id: number } {
   return typeof d === "object" && d !== null
     && typeof (d as { id?: unknown }).id === "number";
+}
+
+function isSetOutputStackPayload(d: unknown): d is { outputId: number; ids: number[] | null } {
+  if (typeof d !== "object" || d === null) return false;
+  const o = d as { [k: string]: unknown };
+  if (typeof o.outputId !== "number") return false;
+  if (o.ids === null) return true;
+  if (!Array.isArray(o.ids)) return false;
+  return o.ids.every((x) => typeof x === "number");
 }

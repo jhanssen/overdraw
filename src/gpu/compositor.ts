@@ -43,7 +43,7 @@ struct Rect { r : vec4f, };
 `;
 
 import type { CompositorSink, Layer } from "../protocols/ctx.js";
-import { LAYER_ORDER } from "../protocols/ctx.js";
+import { LAYER_ORDER, OUTPUT_DEFAULT } from "../protocols/ctx.js";
 import type { WaylandFd } from "../types.js";
 import {
   ClientBufferLifecycle,
@@ -169,8 +169,14 @@ export class JsCompositor implements CompositorSink {
   private targetView?: GPUTextureView;
 
   private surfaces = new Map<number, Surface>();
-  // The content layer's ordered draw list (windows+subsurfaces+popups).
+  // The DEFAULT content-layer draw list (windows+subsurfaces+popups). The WM
+  // owns this via setStack. An output may override it via setOutputStack.
   private stack: number[] = [];
+  // Per-output content-stack overrides (core-plugin-api.md §1). When an entry
+  // exists for an outputId, that output's content layer renders the override
+  // list instead of `this.stack`. Single-output today: only OUTPUT_DEFAULT is
+  // ever keyed. Cleared by setOutputStack(outputId, null).
+  private outputStacks = new Map<number, number[]>();
   // Non-content layers (background/below/above/overlay). Composited around the
   // content stack per LAYER_ORDER. Plugin overlays/decorations populate these.
   private layers = new Map<Layer, number[]>();
@@ -261,17 +267,25 @@ export class JsCompositor implements CompositorSink {
 
   setStack(ids: number[]): void { this.stack = ids.slice(); }
 
+  setOutputStack(outputId: number, ids: number[] | null): void {
+    if (ids === null) this.outputStacks.delete(outputId);
+    else this.outputStacks.set(outputId, ids.slice());
+  }
+
   setLayerSurfaces(layer: Layer, ids: number[]): void {
     if (layer === "content") { this.stack = ids.slice(); return; }
     this.layers.set(layer, ids.slice());
   }
 
-  // The full back-to-front draw order: each layer in LAYER_ORDER, with `content`
-  // taken from the window/subsurface/popup stack.
+  // The full back-to-front draw order: each layer in LAYER_ORDER, with the
+  // content layer taken from either the per-output override (when set) or the
+  // global `this.stack`. Single-output today: the per-output query is keyed
+  // on OUTPUT_DEFAULT. Future multi-output: drawOrder takes outputId arg.
   private drawOrder(): number[] {
     const out: number[] = [];
+    const content = this.outputStacks.get(OUTPUT_DEFAULT) ?? this.stack;
     for (const layer of LAYER_ORDER) {
-      if (layer === "content") out.push(...this.stack);
+      if (layer === "content") out.push(...content);
       else { const ids = this.layers.get(layer); if (ids) out.push(...ids); }
     }
     return out;

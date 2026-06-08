@@ -189,7 +189,7 @@ if (bundledResolved.length + config.plugins.length > 0) {
   // core-plugin-api.md §1.
   if (!state.wm) throw new Error("internal: state.wm not set by installProtocols");
   const windowsBroker = createWindowsBroker({
-    wm: state.wm, state, pluginBus, bus,
+    wm: state.wm, compositor, state, pluginBus, bus,
   });
 
   runtime = new PluginRuntime({

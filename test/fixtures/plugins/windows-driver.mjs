@@ -8,6 +8,8 @@
 //   6 = deleteState(targetId, 'workspace.id')
 //   7 = get(targetId) and log the snapshot
 //   8 = list() and log the count + first surfaceId
+//   9 = setOutputStack(0, [100, targetId])
+//  10 = setOutputStack(0, null) -- clear override
 //
 // targetId is provided via window.change events' surfaceId field (only the
 // LAST change event's surfaceId is used).
@@ -44,6 +46,16 @@ export default async function init(sdk) {
     if (op === 8) {
       const l = await sdk.windows.list();
       sdk.log(`list-count=${l.length}` + (l.length ? ` first=${l[0].surfaceId}` : ''));
+      return;
+    }
+    if (op === 9) {
+      await sdk.windows.setOutputStack(0, [100, targetId]);
+      sdk.log('set-output-stack');
+      return;
+    }
+    if (op === 10) {
+      await sdk.windows.setOutputStack(0, null);
+      sdk.log('clear-output-stack');
       return;
     }
   });

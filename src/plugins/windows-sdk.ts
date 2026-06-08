@@ -52,7 +52,22 @@ export interface PluginWindows extends PluginWindowObserver {
   // Snapshot accessors.
   get(surfaceId: number): Promise<WindowSnapshot | null>;
   list(): Promise<WindowSnapshot[]>;
+
+  // Override the content-layer draw order for a specific output
+  // (core-plugin-api.md §1). Pass `null` to clear the override and fall
+  // back to the global stack. The workspace plugin (Phase 6) drives this
+  // to push the currently-visible workspace's windows per output.
+  //
+  // Today's single-output system: use OUTPUT_DEFAULT (= 0) as outputId.
+  // Multi-output reconfiguration (deferred per status.md) will assign
+  // real ids.
+  setOutputStack(outputId: number, ids: number[] | null): Promise<void>;
 }
+
+// The single-output placeholder id (kept in sync with OUTPUT_DEFAULT in
+// protocols/ctx.ts). Re-exported for plugin authors so they don't import
+// from internal core paths.
+export const OUTPUT_DEFAULT = 0;
 
 export interface WindowsControl {
   windows: PluginWindows;
@@ -115,6 +130,23 @@ export function createPluginWindows(
       const r = await endpoint.request("windows.list", null);
       // eslint-disable-next-line no-restricted-syntax
       return r as unknown as WindowSnapshot[];
+    },
+
+    async setOutputStack(outputId, ids): Promise<void> {
+      if (typeof outputId !== "number") {
+        throw new TypeError("setOutputStack outputId must be a number");
+      }
+      if (ids !== null) {
+        if (!Array.isArray(ids)) {
+          throw new TypeError("setOutputStack ids must be an array or null");
+        }
+        for (const x of ids) {
+          if (typeof x !== "number") {
+            throw new TypeError("setOutputStack ids must contain numbers");
+          }
+        }
+      }
+      await endpoint.request("windows.set-output-stack", { outputId, ids });
     },
   };
 

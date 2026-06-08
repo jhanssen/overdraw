@@ -45,12 +45,17 @@ async function waitFor(pred, timeoutMs = 4000) {
 }
 
 function mockSink() {
-  return {
+  const sink = {
+    outputStackCalls: [],
     setSurfaceLayout() {}, setStack() {}, setLayerSurfaces() {},
     setSurfaceTexture() {}, commitSurfaceBuffer() {}, commitSurfaceDmabuf() {},
     removeSurface() {}, takeImportedSurfaces() { return []; },
     takeFreedBuffers() { return []; }, afterCurrentFrame() {}, renderFrame() {},
+    setOutputStack(outputId, ids) {
+      sink.outputStackCalls.push({ outputId, ids: ids === null ? null : [...ids] });
+    },
   };
+  return sink;
 }
 
 function res(id) { return { resource: { id, version: 1, destroyed: false } }; }
@@ -85,14 +90,15 @@ async function setupRuntime(targetId) {
   const events = [];
   const pluginBus = new DynamicBus();
   const bus = createCompositorBus();
-  const wm = createWm(mockSink(), { width: 800, height: 600 });
+  const sink = mockSink();
+  const wm = createWm(sink, { width: 800, height: 600 });
   wm.addWindow(100, res(100));
   wm.windowHasContent(100);
   wm.addWindow(targetId, res(targetId));
   wm.windowHasContent(targetId);
 
   const state = makeCoreState(wm, bus);
-  const broker = createWindowsBroker({ wm, state, pluginBus, bus });
+  const broker = createWindowsBroker({ wm, compositor: sink, state, pluginBus, bus });
 
   const rt = new PluginRuntime({
     ...FAST, log: () => {},
@@ -118,7 +124,7 @@ async function setupRuntime(targetId) {
     floating: false, fullscreen: false, maximized: false, minimized: false,
   });
   await waitFor(() => events.some((e) => e.n === 'log' && String(e.d) === `target=${targetId}`));
-  return { rt, events, pluginBus, wm };
+  return { rt, events, pluginBus, wm, sink };
 }
 
 test('setFloating: toggles WM hint state and the snapshot reflects it', async () => {
@@ -231,6 +237,31 @@ test('state-changed event: setState emits, deleteState emits with deleted=true',
   await waitFor(() => stateEvents.length >= 2);
   assert.equal(stateEvents[1].payload.key, 'workspace.id');
   assert.equal(stateEvents[1].payload.deleted, true);
+
+  await rt.stop();
+});
+
+test('setOutputStack: forwards ids to the compositor sink', async () => {
+  const { rt, events, pluginBus, sink } = await setupRuntime(7);
+
+  trigger(pluginBus, 9);   // setOutputStack(0, [100, 7])
+  await waitFor(() => findLog(events, 'set-output-stack'));
+  assert.equal(sink.outputStackCalls.length, 1);
+  assert.deepEqual(sink.outputStackCalls[0], { outputId: 0, ids: [100, 7] });
+
+  await rt.stop();
+});
+
+test('setOutputStack: null clears the override', async () => {
+  const { rt, events, pluginBus, sink } = await setupRuntime(7);
+
+  trigger(pluginBus, 9);    // set the override
+  await waitFor(() => findLog(events, 'set-output-stack'));
+
+  trigger(pluginBus, 10);   // clear it
+  await waitFor(() => findLog(events, 'clear-output-stack'));
+  assert.equal(sink.outputStackCalls.length, 2);
+  assert.deepEqual(sink.outputStackCalls[1], { outputId: 0, ids: null });
 
   await rt.stop();
 });
