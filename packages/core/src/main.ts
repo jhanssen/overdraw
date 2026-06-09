@@ -271,13 +271,14 @@ runtime = new PluginRuntime({
       }
       return r;
     }
-    // gpu.* / surface.* are the Worker-transport GPU SDK protocol
-    // (createPluginGpu in plugins/gpu.ts). In-thread plugins skip this
-    // entirely -- their sdk.gpu is constructed in-process and talks to
-    // the overlay broker directly; they never originate these requests.
-    // Route by prefix rather than as a catch-all so an unknown method
-    // surfaces a clear error instead of being mis-dispatched.
-    if (method.startsWith("gpu.") || method.startsWith("surface.")) {
+    // gpu.* / surface.* / compose.* are the Worker-transport GPU SDK
+    // protocol (createPluginGpu in plugins/gpu.ts and createWorkerCompose
+    // in plugins/compose-sdk.ts). In-thread plugins skip this entirely --
+    // their sdk.gpu / sdk.compose are constructed in-process. Route by
+    // prefix rather than as a catch-all so an unknown method surfaces a
+    // clear error instead of being mis-dispatched.
+    if (method.startsWith("gpu.") || method.startsWith("surface.")
+        || method.startsWith("compose.")) {
       return gpuBroker(plugin, method, params);
     }
     throw new Error(`no handler for plugin request '${method}'`);

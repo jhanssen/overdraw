@@ -157,9 +157,21 @@ export type RingMaker = (width: number, height: number, allocExtra: Record<strin
 // Bring up the Worker's GPU (device over its own wire) + return the SDK gpu
 // object. `endpoint` brokers side-channel control through the core. `deviceBin`
 // /`dawnPath` are absolute paths to the two native modules.
+//
+// The returned `composeDeps` is the internal handle createWorkerCompose
+// (compose-sdk.ts) needs to participate in cross-device dmabuf compose
+// (phase 5b). Not plugin-facing; consumed by the loader.
+export interface WorkerGpuInternals {
+  clientId: number;
+  plugin: PluginAddon;
+  dawn: DawnModule;
+  devHandle: bigint;
+  allocSurfaceBufId: () => number;
+}
 export async function createPluginGpu(
   endpoint: Endpoint, pluginAddonPath: string, dawnPath: string,
-): Promise<{ gpu: PluginGpu; pump: () => void; makeRingSurface: RingMaker; stop: () => void }> {
+): Promise<{ gpu: PluginGpu; pump: () => void; makeRingSurface: RingMaker;
+            stop: () => void; internals: WorkerGpuInternals }> {
   const require = createRequire(import.meta.url);
   const plugin = require(pluginAddonPath) as PluginAddon;
   const dawn = require(dawnPath) as DawnModule;
@@ -344,5 +356,12 @@ export async function createPluginGpu(
   // no new wire/device work is issued while the Worker is torn down.
   const stop = (): void => { stopped = true; };
 
-  return { gpu, pump, makeRingSurface, stop };
+  // Internals exposed to the loader so it can build sdk.compose (phase 5b)
+  // without re-doing the device bring-up. Not plugin-facing.
+  const internals: WorkerGpuInternals = {
+    clientId, plugin, dawn, devHandle,
+    allocSurfaceBufId: () => nextResKey++,
+  };
+
+  return { gpu, pump, makeRingSurface, stop, internals };
 }

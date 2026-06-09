@@ -29,7 +29,7 @@ import { createPluginEvents } from "./events.js";
 import { createNamespaceHandle } from "./namespace.js";
 import { createPluginActions } from "./actions.js";
 import { createPluginAnimations } from "./animations-sdk.js";
-import { createInThreadCompose } from "./compose-sdk.js";
+import { createInThreadCompose, createWorkerCompose } from "./compose-sdk.js";
 import type { PluginCompose } from "./compose-sdk.js";
 
 export interface LoaderInput {
@@ -54,10 +54,10 @@ export async function runLoader(channel: Channel, input: LoaderInput): Promise<v
   let gpu: PluginGpu | undefined;
   let makeRingSurface: RingMaker | undefined;
   let stopGpu: () => void = () => {};
-  // sdk.compose is in-thread-only in Phase 5a: it returns GPUTexture handles
-  // which only cross the boundary by reference when the plugin shares
-  // core's device. Worker plugins receive sdk.compose === undefined
-  // (capability-by-shape); Phase 5b adds their transport.
+  // sdk.compose: in-thread bundled plugins share core's device, so they get
+  // GPUTexture handles by reference (createInThreadCompose). Worker plugins
+  // get cross-device dmabuf compose via createWorkerCompose (phase 5b
+  // snapshot today; live mode lands in phase 5b-live).
   let compose: PluginCompose | undefined;
   if (input.inThreadGpu) {
     const g = createInThreadGpu(input.name, input.inThreadGpu);
@@ -72,6 +72,15 @@ export async function runLoader(channel: Channel, input: LoaderInput): Promise<v
     const t = setInterval(g.pump, 4);
     t.unref?.();
     stopGpu = () => { clearInterval(t); g.stop(); };
+    // Phase 5b: Worker plugins get sdk.compose backed by AllocComposeBuf.
+    compose = createWorkerCompose({
+      clientId: g.internals.clientId,
+      plugin: g.internals.plugin,
+      dawn: g.internals.dawn,
+      pluginDeviceHandle: g.internals.devHandle,
+      endpoint,
+      allocSurfaceBufId: g.internals.allocSurfaceBufId,
+    });
   }
 
   const eventsHandle = createPluginEvents(endpoint);

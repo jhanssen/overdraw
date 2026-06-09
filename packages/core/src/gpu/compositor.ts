@@ -154,6 +154,13 @@ export interface CompositorAddon {
   // is unknown (JS-gate bug; the GPU process hard-fails on its side too).
   writeBeginAccess(importId: number): boolean;
   writeEndAccess(importId: number): void;
+  // Phase 5b: in-band producer Begin/End on the core wire for compose buffers
+  // (AllocComposeBuf). The core IS the producer for compose buffers, so
+  // producer Begin/End ride the core wire (inverted from sdk.gpu overlays
+  // where they ride the plugin wire). Used by composeIntoView when its
+  // target is a wire-wrapped dmabuf with a producerSurfaceBufId.
+  writeProducerBegin(surfaceBufId: number): void;
+  writeProducerEnd(surfaceBufId: number): void;
   // Nested present (slice 3): acquire the host swapchain's current texture handle
   // (null if none this frame) and present it after rendering.
   acquireOutputTexture(): bigint | null;
@@ -1247,6 +1254,38 @@ export class JsCompositor implements CompositorSink {
       outW, outH,
     });
     return { texture, outW, outH };
+  }
+
+  // Render the listed windows into a PRE-ALLOCATED target view, with optional
+  // producer Begin/End wrapping for cross-device dmabuf targets (phase 5b
+  // Worker compose). Used when the target texture is a wire-wrapped dmabuf
+  // that the core produces and a Worker plugin consumes; the producer bracket
+  // is required for the GPU process to chain the cross-device fence to the
+  // plugin's subsequent consumer Begin.
+  composeIntoView(args: {
+    outputId: number;
+    targetView: GPUTextureView;
+    windows: ReadonlyArray<number>;
+    outW: number;
+    outH: number;
+    // When set, the compose pass is wrapped in producer Begin/End frames on
+    // the core wire keyed on this surfaceBufId. Required for dmabuf compose
+    // targets allocated via AllocComposeBuf (the plugin's consumer Begin
+    // chains on the fence the producer End exports). Omit for in-thread
+    // targets (no cross-device handoff).
+    producerSurfaceBufId?: number;
+  }): void {
+    if (args.producerSurfaceBufId !== undefined) {
+      this.addon.writeProducerBegin(args.producerSurfaceBufId);
+    }
+    this.composeSnapshot({
+      targetView: args.targetView,
+      drawList: [...args.windows],
+      outW: args.outW, outH: args.outH,
+    });
+    if (args.producerSurfaceBufId !== undefined) {
+      this.addon.writeProducerEnd(args.producerSurfaceBufId);
+    }
   }
 
   // Render each listed window into its own texture sized to that window's

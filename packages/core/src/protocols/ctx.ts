@@ -131,6 +131,18 @@ export interface CompositorSink {
     outputId: number;
     windows: ReadonlyArray<{ id: number; rect?: { x: number; y: number; w: number; h: number } }>;
   }): import("../gpu/compositor.js").LiveWindowCompHandle;
+  // Phase 5b: render the listed windows into a pre-allocated target view.
+  // When producerSurfaceBufId is set, the compose pass is wrapped in
+  // producer Begin/End frames on the core wire keyed on that surfaceBufId
+  // (cross-device dmabuf compose target).
+  composeIntoView?(args: {
+    outputId: number;
+    targetView: GPUTextureView;
+    windows: ReadonlyArray<number>;
+    outW: number;
+    outH: number;
+    producerSurfaceBufId?: number;
+  }): void;
 }
 
 export interface CompositorState {

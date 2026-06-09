@@ -27,6 +27,19 @@ const pAlloc = (
       pluginReservePointSerial,
       (r: { surfaceBufId: number } | null) => r ? res(r) : rej(new Error("allocSurfaceBuffer"))));
 
+// Phase 5b: AllocComposeBuf. Reverse direction (core produces, plugin consumes).
+// The plugin reserved its consumer texture; the core reserves its producer
+// texture and ships AllocComposeBuf with all handles + the plugin's wireSerial.
+const pAllocCompose = (
+  a: Addon, connId: number, w: number, h: number,
+  ctId: number, ctGen: number, cdId: number, cdGen: number,
+  pluginReservePointSerial: bigint,
+) =>
+  new Promise<{ surfaceBufId: number }>((res, rej) =>
+    a.coreAllocComposeBufferW(connId, w, h, ctId, ctGen, cdId, cdGen,
+      pluginReservePointSerial,
+      (r: { surfaceBufId: number } | null) => r ? res(r) : rej(new Error("allocComposeBuffer"))));
+
 // A logical overlay surface backed by a ring of slots (each slot is one shared
 // dmabuf with its own surfaceBufId). The producer renders into one slot while the
 // consumer holds a read bracket on the latest-presented slot -> smooth animation.
@@ -68,6 +81,11 @@ export function createGpuBroker(deps: GpuBrokerDeps) {
   const surfaceByBuf = new Map<number, OverlaySurface>();
   // overlay surfaceId -> OverlaySurface.
   const surfaces = new Map<number, OverlaySurface>();
+  // Phase 5b compose buffers (snapshot, one-shot): surfaceBufId -> the
+  // wrapped core-device producer texture. Held alive until release.
+  // (Could later track per-plugin so destroy-on-plugin-stop teardowns
+  // these along with overlays.)
+  const composeBufs = new Map<number, { texture: GPUTexture; width: number; height: number }>();
 
   return async function onRequest(pluginName: string, method: string, params: unknown): Promise<unknown> {
     const p = (params ?? {}) as Record<string, number | string | bigint | { x: number; y: number; width: number; height: number } | undefined>;
@@ -193,6 +211,73 @@ export function createGpuBroker(deps: GpuBrokerDeps) {
         // (it filters for its own surfaces) so a first decoration frame can release
         // the gated content. Generic; the broker does not interpret it.
         onSurfacePresented(surf.surfaceId);
+        return null;
+      }
+      case "compose.snapshot": {
+        // Phase 5b: Worker plugin asked for a snapshot compose. The plugin
+        // has already reserved its consumer-side texture on its own wire
+        // and is sending us the reserved handle. We:
+        //   1. Allocate a compose dmabuf (core = producer, plugin = consumer)
+        //      via coreAllocComposeBufferW -- core reserves its producer
+        //      texture, sends AllocComposeBuf, awaits inject on both wires.
+        //   2. Wrap the core's producer wgpu::Texture handle as a GPUTexture.
+        //   3. Render the requested windows into it (composeIntoView with
+        //      producerSurfaceBufId set -> producer Begin/End on the core
+        //      wire chain a fence the plugin's consumer Begin will wait on).
+        //   4. Reply {surfaceBufId, width, height}; the plugin wraps its
+        //      consumer texture handle separately on its own device.
+        const connId = connByPlugin.get(pluginName);
+        if (connId === undefined) throw new Error("compose.snapshot: no plugin conn");
+        const w = p.width as number, h = p.height as number;
+        if (!w || !h) throw new Error("compose.snapshot: bad dims");
+        const ctId = p.consumerTexId as number;
+        const ctGen = p.consumerTexGen as number;
+        const cdId = p.consumerDevId as number;
+        const cdGen = p.consumerDevGen as number;
+        const pluginSerial = (p.pluginReservePointSerial as bigint) ?? 0n;
+        const windows = (p.windows as unknown as number[]) ?? [];
+
+        const alloc = await pAllocCompose(addon, connId, w, h,
+          ctId, ctGen, cdId, cdGen, pluginSerial);
+
+        // The core's wrapped wgpu::Texture for this surface (the producer
+        // side: TextureBinding|CopySrc|RenderAttachment -- compositor.h
+        // reserveCoreComposeTexture). pluginConsumerTexture returns
+        // whichever side is on the core's device, regardless of role.
+        const tex = dawn.wrapTexture(coreDeviceHandle,
+          addon.pluginConsumerTexture(alloc.surfaceBufId));
+        composeBufs.set(alloc.surfaceBufId, { texture: tex, width: w, height: h });
+
+        if (compositor.composeIntoView) {
+          compositor.composeIntoView({
+            outputId: 0,
+            targetView: tex.createView(),
+            windows,
+            outW: w, outH: h,
+            producerSurfaceBufId: alloc.surfaceBufId,
+          });
+        } else {
+          throw new Error("compose.snapshot: compositor lacks composeIntoView");
+        }
+        return { surfaceBufId: alloc.surfaceBufId, width: w, height: h };
+      }
+      case "compose.release": {
+        // Plugin is done with a compose snapshot. Drop our reference to the
+        // wrapped core-device texture and ask the GPU process to free the
+        // dmabuf + STMs + textures via ReleaseSurfaceBuf.
+        const bufId = p.surfaceBufId as number;
+        if (bufId === undefined) throw new Error("compose.release: bad surfaceBufId");
+        composeBufs.delete(bufId);
+        // Gate release on afterCurrentFrame: a previous compose pass's GPU
+        // work may still be in flight on the core's queue (the producer
+        // submit). Releasing the surfaceBuf before that completes drops
+        // the STM/texture while Dawn still has a queue submission pointing
+        // at it. The plugin has already issued its consumer End on its own
+        // wire; afterCurrentFrame on the core ensures our producer submit
+        // completed.
+        const reap = () => addon.pluginReleaseSurfaceBuffer(bufId);
+        if (compositor.afterCurrentFrame) compositor.afterCurrentFrame(reap);
+        else reap();
         return null;
       }
       case "surface.destroy": {
