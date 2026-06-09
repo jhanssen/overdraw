@@ -13,6 +13,7 @@ import { createRequire } from "node:module";
 
 import type { Endpoint, Json } from "./protocol.js";
 import { SlotStates } from "./surface-slots.js";
+import { SurfaceProducer } from "./surface-ring.js";
 
 // Minimal shapes for the two native modules the Worker loads.
 interface PluginAddon {
@@ -262,61 +263,33 @@ export async function createPluginGpu(
       slotTex.push(null);
     }
 
-    let acquired = -1;   // the slot getCurrentTexture handed out, until present()
     let destroyed = false;
+    // Build the SurfaceProducer abstraction. It owns the slot-state CAS,
+    // the producer-wire Begin/End writes, and the texture-handing. The
+    // Surface interface plugins use (getCurrentTexture/present/destroy)
+    // is a thin facade -- the meat lives in surface-ring.ts.
+    const producer = new SurfaceProducer({
+      slots: {
+        surfaceBufIds: slotBufId,
+        textureFor: wrapSlot,
+      },
+      slotStates,
+      writeBegin: (id) => plugin.writeBeginAccess(clientId, id),
+      writeEnd: (id) => plugin.writeEndAccess(clientId, id),
+      onPresented: async (slot, surfaceBufId) => {
+        await endpoint.request("surface.present",
+          { connId: conn.connId, surfaceBufId, slot });
+      },
+      isStopped: () => stopped,
+    });
     return {
       width, height, rect: r.rect,
       async getCurrentTexture(): Promise<GPUTexture> {
         if (destroyed) throw new Error("surface used after destroy()");
-        // Shutdown quiesce: park the caller (never resolve) so a still-running render
-        // loop stops issuing wire/device work while the Worker is being torn down.
-        if (stopped) return new Promise<GPUTexture>(() => {});
-        if (acquired >= 0) {
-          // Re-acquire within the same frame returns the same texture (idempotent
-          // until present()). A real second producer would CAS its own slot.
-          return wrapSlot(acquired);
-        }
-        // Claim a FREE slot; if none, await a state change (a DRAINING slot freeing)
-        // and retry. waitAsync (not wait) so the Worker event loop keeps turning
-        // (watchdog pongs) while backpressured.
-        for (;;) {
-          const slot = slotStates.tryAcquire();
-          if (slot >= 0) {
-            acquired = slot;
-            // Open the producer write bracket in-band on the plugin wire BEFORE
-            // the plugin encodes render commands against this slot's texture.
-            // The kind=1 frame is FIFO-ordered before those commands, so the
-            // GPU process opens the bracket before HandleCommands decodes the
-            // render -- no "used in a submit without current access" fault, no
-            // ctrl round-trip, no broker-mediated reopen.
-            plugin.writeBeginAccess(clientId, slotBufId[slot]);
-            return wrapSlot(slot);
-          }
-          // No free slot: wait until ANY slot's state changes, then retry. Wait on
-          // slot 0; the core notifies the freed slot's index, but state changes are
-          // infrequent enough that polling all on wake is fine -- re-loop tryAcquire.
-          const w = Atomics.waitAsync(slotStates.states, 0, slotStates.state(0));
-          if (w.async) await w.value; else await Promise.resolve();
-        }
+        const r = await producer.acquire();
+        return r.texture;
       },
-      async present(): Promise<void> {
-        if (stopped) return;   // quiesced: drop the present (Worker is being torn down)
-        if (acquired < 0) throw new Error("surface.present() without a prior getCurrentTexture()");
-        const slot = acquired;
-        acquired = -1;
-        // Close the producer write bracket in-band on the plugin wire AFTER the
-        // plugin's render submit. The kind=2 frame's FIFO position after the
-        // render's wire batch (appendFrame flushes it first) guarantees the GPU
-        // process closes the bracket only after decoding those commands, and
-        // exports the producer fence the consumer's next Begin waits on. No
-        // wireSerial tag, no ProducerEnd WireBarrier deferral.
-        plugin.writeEndAccess(clientId, slotBufId[slot]);
-        // Ownership: ACQUIRED -> PRESENTED (atomic; the core demotes the prior
-        // PRESENTED to DRAINING and frees it once its read completes).
-        slotStates.present(slot);
-        await endpoint.request("surface.present",
-          { connId: conn.connId, surfaceBufId: slotBufId[slot], slot });
-      },
+      async present(): Promise<void> { await producer.present(); },
       async destroy(): Promise<void> {
         if (destroyed) return;
         destroyed = true;
