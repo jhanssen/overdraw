@@ -483,21 +483,40 @@ int run(int wireFd, int ctrlFd, int inputFd, bool headless,
     };
     std::vector<std::unique_ptr<PluginConn>> pluginConns;
 
-    // --- Plugin producer/consumer surface buffers (C-M4 step 2) ---------------
-    // One GBM dmabuf shared between the plugin device (producer) and the core
-    // device (consumer), imported as SharedTextureMemory on EACH and injected at
-    // each side's reserved wire texture handle. The cross-device fence (C-M1) is
-    // applied per frame in step 3 (plugin EndAccess -> sync-fd -> core BeginAccess
-    // waits it). Keyed by surfaceBufId.
+    // --- Producer/consumer surface buffers ------------------------------------
+    // One GBM dmabuf shared between two devices: one writes (the "producer"),
+    // one reads (the "consumer"). The cross-device fence (C-M1) is applied per
+    // frame: producer EndAccess exports a sync-fd, which the consumer BeginAccess
+    // waits on (and vice versa, for the next producer cycle).
+    //
+    // Two directions exist:
+    //
+    //   AllocSurfaceBuf: producerOnCore=false. PRODUCER is the plugin device
+    //     (plugin renders an overlay), CONSUMER is the core device (the JS
+    //     compositor samples it). Producer Begin/End ride the plugin wire;
+    //     consumer Begin/End ride the core wire. Used by sdk.gpu overlays
+    //     and decorations.
+    //
+    //   AllocComposeBuf: producerOnCore=true. PRODUCER is the core device
+    //     (core's JS compositor writes a compose result), CONSUMER is the
+    //     plugin device (the plugin samples the compose output). Producer
+    //     Begin/End ride the core wire; consumer Begin/End ride the plugin
+    //     wire. Used by sdk.compose for Worker plugins.
+    //
+    // producerMem/Tex/Dev always points at the producing-device side, regardless
+    // of whether that's plugin or core. consumerMem/Tex/Dev points at the
+    // consuming-device side. The producerOnCore flag tells the wire dispatchers
+    // which socket carries which role for each surface.
     struct SurfaceBuf {
         uint32_t connId = 0;  // owning plugin connection (for wire-serial ordering)
         gpu::DmabufBuffer buf;
-        wgpu::SharedTextureMemory producerMem;  // on the plugin device
+        bool producerOnCore = false;             // false: plugin produces; true: core produces
+        wgpu::SharedTextureMemory producerMem;   // on the producing device
         wgpu::Texture producerTex;
-        wgpu::Device producerDev;               // plugin device (for fence import)
-        wgpu::SharedTextureMemory consumerMem;  // on the core device
+        wgpu::Device producerDev;                // for fence import
+        wgpu::SharedTextureMemory consumerMem;   // on the consuming device
         wgpu::Texture consumerTex;
-        wgpu::Device consumerDev;               // core device (for fence import)
+        wgpu::Device consumerDev;                // for fence import
         // Per-frame fence dance state. The dmabuf's Vulkan image layout is shared
         // across both devices; each EndAccess reports the end layout, which the
         // next BeginAccess (on either side) begins from. The held fences carry
@@ -840,22 +859,38 @@ int run(int wireFd, int ctrlFd, int inputFd, bool headless,
             }
             uint32_t surfaceBufId = ipc::getU32LE(frame.data() + 1);
             bool producer = frame[5] != 0;
-            // The core wire only carries the CONSUMER side (producer=false); the
-            // producer side rides each plugin connection's own wire (step 5).
-            if (producer) {
-                std::fprintf(stderr, "[gpu] core wire: producer Surface frame on "
-                                     "core wire (buf=%u) -- wrong socket\n", surfaceBufId);
-                std::abort();
+            // A Surface frame's role (producer vs consumer) must match the wire
+            // it rode in on, per the SurfaceBuf's direction:
+            //   producerOnCore=false: core wire carries CONSUMER frames only.
+            //   producerOnCore=true:  core wire carries PRODUCER frames only.
+            // The payload's `producer` bit is a self-consistency check.
+            // Direction validation: if the surface still exists, the role
+            // bit MUST match its direction. Missing surface = release race
+            // (in-band End frames written before destroy can land after the
+            // surface is gone); handle the same way runSurface{Begin,End}
+            // did before this refactor -- log + skip for End, abort for
+            // Begin (a Begin against a freed surface is a real bug).
+            auto it = surfaceBufs.find(surfaceBufId);
+            if (it != surfaceBufs.end()) {
+                const bool expectProducer = it->second.producerOnCore;
+                if (producer != expectProducer) {
+                    std::fprintf(stderr, "[gpu] core wire: %s frame on core wire "
+                                 "(buf=%u producerOnCore=%d) -- wrong socket\n",
+                                 producer ? "producer" : "consumer",
+                                 surfaceBufId, static_cast<int>(expectProducer));
+                    std::abort();
+                }
             }
             if (kind == ipc::FrameKind::BeginAccess) {
-                if (!runSurfaceBegin(surfaceBufId, false)) {
+                if (!runSurfaceBegin(surfaceBufId, producer)) {
                     std::fprintf(stderr,
-                        "[gpu] in-band consumer Begin failed (buf=%u) -- "
-                        "JS gate or state-machine bug\n", surfaceBufId);
+                        "[gpu] in-band %s Begin failed (buf=%u) -- "
+                        "JS gate or state-machine bug\n",
+                        producer ? "producer" : "consumer", surfaceBufId);
                     std::abort();
                 }
             } else {
-                runSurfaceEnd(surfaceBufId, false);
+                runSurfaceEnd(surfaceBufId, producer);
             }
         } else {
             std::fprintf(stderr, "[gpu] core wire: unknown access variant %u\n",
@@ -909,7 +944,7 @@ int run(int wireFd, int ctrlFd, int inputFd, bool headless,
                     // rides the core wire). Hard-fail on anything else.
                     const uint32_t connId = m.connId;
                     pc->dispatchControl =
-                        [&runSurfaceBegin, &runSurfaceEnd, connId](
+                        [&runSurfaceBegin, &runSurfaceEnd, &surfaceBufs, connId](
                             ipc::FrameKind kind, const std::vector<uint8_t>& frame) {
                         if (frame.size() != ipc::SurfaceAccessPayload::kSize ||
                             static_cast<ipc::AccessVariant>(frame[0]) != ipc::AccessVariant::Surface) {
@@ -919,21 +954,35 @@ int run(int wireFd, int ctrlFd, int inputFd, bool headless,
                         }
                         uint32_t surfaceBufId = ipc::getU32LE(frame.data() + 1);
                         bool producer = frame[5] != 0;
-                        if (!producer) {
-                            std::fprintf(stderr,
-                                "[gpu] plugin conn %u: consumer frame on plugin wire "
-                                "(buf=%u) -- wrong socket\n", connId, surfaceBufId);
-                            std::abort();
+                        // Plugin wire's role expectation is inverted from the
+                        // core wire: producerOnCore=false -> plugin produces ->
+                        // plugin wire carries PRODUCER frames; producerOnCore=
+                        // true (compose buf) -> plugin consumes -> plugin wire
+                        // carries CONSUMER frames. Missing surface = release
+                        // race -- silently skip on End, abort on Begin
+                        // (matches pre-refactor behavior).
+                        auto it = surfaceBufs.find(surfaceBufId);
+                        if (it != surfaceBufs.end()) {
+                            const bool expectProducer = !it->second.producerOnCore;
+                            if (producer != expectProducer) {
+                                std::fprintf(stderr,
+                                    "[gpu] plugin conn %u: %s frame on plugin wire "
+                                    "(buf=%u producerOnCore=%d) -- wrong socket\n",
+                                    connId, producer ? "producer" : "consumer",
+                                    surfaceBufId, static_cast<int>(it->second.producerOnCore));
+                                std::abort();
+                            }
                         }
                         if (kind == ipc::FrameKind::BeginAccess) {
-                            if (!runSurfaceBegin(surfaceBufId, true)) {
+                            if (!runSurfaceBegin(surfaceBufId, producer)) {
                                 std::fprintf(stderr,
-                                    "[gpu] in-band producer Begin failed (buf=%u) -- "
-                                    "JS gate or state-machine bug\n", surfaceBufId);
+                                    "[gpu] in-band %s Begin failed (buf=%u) -- "
+                                    "JS gate or state-machine bug\n",
+                                    producer ? "producer" : "consumer", surfaceBufId);
                                 std::abort();
                             }
                         } else {
-                            runSurfaceEnd(surfaceBufId, true);
+                            runSurfaceEnd(surfaceBufId, producer);
                         }
                     };
                     std::printf("[gpu] AddWireConn: connId=%u fd=%d registered\n",
