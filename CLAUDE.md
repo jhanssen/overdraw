@@ -6,6 +6,79 @@ ground-truth status in `docs/status.md`. Before working on any protocol, read th
 it lists what is advertised-but-incomplete (silent-gap risks: `xdg_toplevel`
 WM-state no-ops, fabricated `wl_output`, `wl_region`).
 
+## Comments describe the code, not its history
+
+Code comments describe what the code does right now. Never reference past
+decisions, prior states, build phases, refactors, deleted code, or "what
+this used to do." A reader a month from now has no context for any of that.
+Forbidden in comments:
+
+- Phase / milestone references ("Phase 2", "phase 0b", "post-Phase 3",
+  "build-order.md phase 1"). The reader has never heard of phases.
+- "Previously", "formerly", "no longer exists", "used to be", "rewritten",
+  "moved from", "extracted from", "migrated to", "now lives in", "replaces
+  the X path". Just describe what IS, not what WAS.
+- Forward-looking ("Phase 6 will...", "future X"). Describe today's
+  behavior; if a future change is genuinely relevant, frame it as a current
+  limitation in `docs/status.md`, not a comment.
+- Diff narration ("this fixes...", "this was changed to..."). Belongs in
+  the commit message, not the source.
+
+Allowed:
+
+- Describing current behavior using verbs that incidentally look historical
+  ("the surface no longer exists" = describes runtime state; "the previous
+  buffer is superseded" = describes algorithm state). Test: would a reader
+  who never saw the prior version of the code understand the comment? If
+  yes, fine.
+- Cross-references to design docs (`core-plugin-api.md §14`, `architecture.md
+  "Frame clock"`) for rationale that lives elsewhere.
+
+**When you change behavior, rewrite the comment.** Not "amend" — rewrite,
+so the comment describes the new behavior with no trace of the old. A
+comment that says "X now does Y (used to do Z)" is wrong; just say "X
+does Y." If you edit a function, re-read every comment in/above it and
+ask: would this comment still make sense to a reader who never saw the
+previous version? If no, replace it.
+
+When refactoring or extracting code, scrub the comments at the same time.
+A comment that survives a refactor unchanged is usually stale.
+
+## Comments must earn their place
+
+Sparse comments, not paragraphs. The bar is high: the comment must tell
+the reader something the code itself doesn't already say. Files where the
+comments outweigh the code are a smell — they usually mean the same
+information is being said three times (the code, the doc-comment, the
+explanatory prose).
+
+Worth keeping:
+
+- A short module-level orientation (one paragraph, max) for what the file
+  is and how it fits.
+- Why something is non-obvious: a subtle invariant, an unusual ordering
+  constraint, a contract with a peer module that isn't visible from this
+  file, or a reason the obvious-looking alternative is wrong.
+- Cross-references to design docs where rationale legitimately lives
+  elsewhere.
+
+Cut:
+
+- Restating what the code does in prose ("Validate the config; throw on
+  bad input" above `validateConfig`).
+- Explaining well-known language features (closures, await, generics).
+- Documentation-style header comments on internal helpers (`// Returns
+  the foo.` above `function getFoo(): Foo`).
+- Listing decided-not-to-do options inside a function body. If the
+  rejection rationale matters, it goes in the design doc.
+- "Why X and not Y" mini-essays when the choice is in a doc — link the
+  doc instead.
+- Boilerplate noise around obvious code ("Build the list", "Return the
+  result").
+
+Test for any given comment: does removing it make the code harder to read
+or to maintain correctly? If no, delete it.
+
 ## Debugging discipline (read first)
 
 - **Surface architectural problems; do not patch over them.** If a bug's real

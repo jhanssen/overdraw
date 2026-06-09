@@ -61,14 +61,9 @@ export function createWindowsBroker(deps: WindowsBrokerDeps): WindowsBroker {
     return NOT_HANDLED;
   };
 
-  // Explicit-override focus (core-plugin-api.md §1: "sdk.windows.focus(id):
-  // // explicit override"). Bypasses the focus plugin's decide() and applies
-  // directly via the seat. id of null clears focus. The 'explicit' decide()
-  // reason is reserved for callers that want the plugin's policy to apply --
-  // sdk.windows.focus is the unconditional path.
-  //
-  // Returns null when the seat isn't bound yet (the request is silently
-  // dropped) or the surface no longer exists.
+  // Explicit focus override. Bypasses the focus plugin's decide() and
+  // applies via the seat directly (core-plugin-api.md §1). null clears.
+  // Silent no-op when the seat is not bound yet or the surface is gone.
   function handleFocus(p: unknown): null {
     if (!isFocusPayload(p)) throw new Error("windows.focus: malformed payload");
     state.seat?.applyKeyboardFocus(p.id);

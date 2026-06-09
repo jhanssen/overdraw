@@ -92,11 +92,7 @@ function normalize(raw: unknown, path: string): ResolvedConfig {
     }
   }
 
-  // focus: verbatim pass-through to the focus plugin's config. Core does
-  // not validate -- the active focus plugin owns its schema (and surfaces
-  // schema violations as a fatal init throw per the in-thread bundled-
-  // plugin contract; for the bundled focus plugin that is
-  // `@overdraw/plugin-focus-default`'s validateConfig()).
+  // Verbatim pass-through; the active focus plugin owns the schema.
   const focus: unknown = cfg.focus;
 
   // plugins

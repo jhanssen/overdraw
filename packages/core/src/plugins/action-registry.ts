@@ -9,8 +9,8 @@
 // actions.register, unregister on plugin death, query for invocation
 // routing).
 
-// JSON-Schema-ish opaque blob. Core never inspects it; the IPC layer (phase 1)
-// uses it for validation. Plugins may pass undefined.
+// JSON-Schema-ish opaque blob. Core never inspects it; the IPC layer uses
+// it for validation. Plugins may pass undefined.
 export type ActionSchema = unknown;
 
 export interface Registration {

@@ -1,17 +1,15 @@
-// Focus driver. Translates focus-relevant coarse events into decide() calls
-// on the active 'focus' namespace plugin, and applies the result via the
-// seat's setKeyboardFocus. core-plugin-api.md §14.
+// Focus driver. Dispatches focus-relevant coarse events to the active
+// 'focus' plugin's decide() and applies the result via the seat. See
+// core-plugin-api.md §14 for the design.
 //
-// Fire-and-forget: dispatch() returns synchronously after kicking off
-// decide(). The hot path (wl_seat.ts handleInput) does NOT await -- the
-// returned promise applies the focus change on the next tick. Sequencing
-// by a monotonic counter discards stale results (a result from request N
-// is dropped if request N+1 has been issued before N resolved).
+// Fire-and-forget: dispatch() is synchronous. The wl_seat hot path does
+// not await; the result applies on the next tick once decide() resolves.
+// A monotonic sequence number discards stale results -- a result for
+// request N is dropped if N+1 was dispatched before N resolved (a slow
+// decide() must not overwrite a newer one's decision).
 //
-// Failure handling: if no 'focus' plugin is registered, or compute() throws
-// / rejects, the dispatch is logged and the seat's keyboard focus stays
-// untouched. The compositor remains usable (input still routes; keys go
-// to whatever surface currently has kb focus).
+// On decide() failure (no plugin, plugin throws) the dispatch is logged
+// and focus stays where it was.
 
 import type {
   FocusReason, FocusInputs, FocusResult,
@@ -19,7 +17,6 @@ import type {
 
 export type { FocusReason, FocusInputs, FocusResult } from "@overdraw/focus-types";
 
-// What the seat hands the driver to dispatch one coarse event.
 export interface DispatchArgs {
   reason: FocusReason;
   pointer: FocusInputs["pointer"];
@@ -27,25 +24,19 @@ export interface DispatchArgs {
   trigger?: number;
 }
 
-// What the seat exposes for the driver to apply a focus result.
 export interface FocusApplyTarget {
-  // Apply a keyboard-focus change. The id refers to a wl_surface (the same
-  // SurfaceId the seat already tracks). null clears focus. The seat is
-  // responsible for resolving the id to its current SeatFocus structure
-  // and sending the appropriate wl_keyboard leave/enter events.
+  // null clears focus. The seat resolves the surface id to its current
+  // SeatFocus and sends the wl_keyboard leave/enter pair.
   applyKeyboardFocus(surfaceId: number | null): void;
 }
 
-// The compute function the driver uses. Production: wraps
-// runtime.invokeNamespace('focus', 'decide', [inputs]). Tests can inject a
-// synchronous fake.
+// Production wraps runtime.invokeNamespace('focus', 'decide', [inputs]);
+// tests pass a synchronous fake.
 export type DecideFn = (inputs: FocusInputs) => Promise<FocusResult>;
 
 export interface FocusDriver {
-  // Dispatch a coarse event. Synchronous: kicks off decide() and returns;
-  // the result applies on the next tick (or is dropped if stale).
   dispatch(args: DispatchArgs): void;
-  // Used by tests to wait for outstanding dispatches to settle.
+  // For tests: resolves when no dispatches are in flight.
   settled(): Promise<void>;
 }
 
@@ -58,14 +49,8 @@ export interface FocusDriverDeps {
 export function createFocusDriver(deps: FocusDriverDeps): FocusDriver {
   const log = deps.log ?? ((m) => console.warn(`[focus] ${m}`));
 
-  // Monotonic sequence. Each dispatch() bumps this and tags its in-flight
-  // request; on resolve we apply only if our seq is still the latest. This
-  // is the "discard stale results" pattern from core-plugin-api.md §14.
   let seq = 0;
-  // The most-recently-issued seq across all dispatches. A resolving request
-  // checks: am I still the latest? If not, drop my result.
   let latestSeq = 0;
-  // Outstanding (not yet resolved) request promises. settled() awaits these.
   const inflight = new Set<Promise<void>>();
 
   function dispatch(args: DispatchArgs): void {
@@ -79,16 +64,11 @@ export function createFocusDriver(deps: FocusDriverDeps): FocusDriver {
     };
     const p = deps.decide(inputs).then(
       (result) => {
-        // Stale: a newer dispatch has been issued. Drop the result so we
-        // don't apply outdated focus decisions (e.g. an old hover that
-        // resolved after the pointer moved past).
-        if (mySeq !== latestSeq) return;
+        if (mySeq !== latestSeq) return;                  // superseded; drop
         if (result.keyboardFocus === undefined) return;   // leave unchanged
         deps.target.applyKeyboardFocus(result.keyboardFocus);
       },
       (err: unknown) => {
-        // decide() failed -- typically "no active plugin for namespace
-        // 'focus'" or the plugin's decide threw. Log + leave focus alone.
         const msg = err instanceof Error ? err.message : String(err);
         log(`decide(${args.reason}) failed: ${msg}`);
       },

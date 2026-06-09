@@ -29,7 +29,7 @@ export interface ActionRegisterSpec {
   // Optional human-readable description (shown in CLI introspection / help).
   description?: string;
   // Optional schema (JSON-Schema-ish) for IPC parameter validation. Core
-  // does not validate against it; the IPC layer (phase 1) does.
+  // does not validate against it; the IPC layer does.
   schema?: ActionSchema;
   // The handler invoked when this action is called. Sync or async; result is
   // returned to the caller (must be structured-clone-safe).

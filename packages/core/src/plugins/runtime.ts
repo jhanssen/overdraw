@@ -67,8 +67,6 @@ export interface RuntimeOptions {
   bus?: DynamicBus;
 }
 
-// PluginController is now in plugin-host.ts (shared with InThreadPlugin).
-
 export const DEFAULT_OPTIONS: RuntimeOptions = {
   heapMb: 128,
   pingIntervalMs: 1000,
@@ -139,11 +137,8 @@ class ManagedPlugin implements PluginHandle {
     const worker = new Worker(bootstrap, {
       workerData: {
         module: this.cfg.module, name: this.cfg.name,
-        // Per-plugin config: BundledPluginSpec.config (bundled) or the
-        // user-config plugin entry's raw config (user plugins). Verbatim
-        // pass-through per core-plugin-api.md "Per-bundled-plugin config"
-        // decision. The plugin's init(sdk, config?) receives it; init that
-        // doesn't take config simply ignores the second arg.
+        // Verbatim per-plugin config; plugin's init(sdk, config?) consumes
+        // it. Plugins that take no config ignore the second arg.
         config: this.cfg.raw,
         pluginAddonPath: this.opts.pluginAddonPath, dawnPath: this.opts.dawnPath,
       },
@@ -431,11 +426,9 @@ export class PluginRuntime implements PluginController {
     });
   }
 
-  // Spawn every configured plugin and await each one's first settle (live or
-  // failed). Bundled plugins (cfg.bundled === true) use the in-thread
-  // transport (InThreadPlugin); user plugins use the Worker transport
-  // (ManagedPlugin) -- per the "Bundled plugins run in-thread" decision in
-  // core-plugin-api.md.
+  // Spawn every configured plugin and await each one's first settle (live
+  // or failed). cfg.bundled selects the transport: in-thread for bundled,
+  // Worker for user plugins.
   async load(configs: readonly ResolvedPlugin[]): Promise<void> {
     for (const cfg of configs) {
       let p: PluginHandle;
@@ -582,7 +575,7 @@ export class PluginRuntime implements PluginController {
         `plugin.invoke: active plugin '${active.pluginName}' for ` +
         `'${payload.namespace}' is not live`);
     }
-    void callerName;   // recorded for future audit/policy; unused today
+    void callerName;
     return await ep.request("plugin.handle", {
       namespace: payload.namespace, method: payload.method, args: payload.args,
     });

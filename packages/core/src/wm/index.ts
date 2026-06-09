@@ -26,13 +26,11 @@ export interface Insets { top: number; right: number; bottom: number; left: numb
 export interface SurfaceHandle { resource: Resource; }
 
 // Per-window hint state (core-plugin-api.md §1). Booleans representing
-// client-driven state requests (set_floating/set_fullscreen/etc.) AND
-// plugin-driven state (a hotkey plugin toggling floating). Today's WM is
-// a tiling-only master-stack policy that does not yet act on these hints;
-// they are stored verbatim so layout plugins (Phase 2) can read them as
-// inputs without core having to grow special-case behavior. The
-// xdg_toplevel.set_* requests will populate these once those handlers
-// stop being no-ops (status.md "Read first").
+// client-driven (set_floating/set_fullscreen/...) and plugin-driven state
+// (a hotkey plugin toggling floating). Stored verbatim so layout plugins
+// can read them as inputs; the WM itself does not act on them.
+// xdg_toplevel.set_* requests do not populate these yet -- those handlers
+// are still no-ops (status.md "Read first").
 export interface WindowHints {
   floating: boolean;
   fullscreen: boolean;

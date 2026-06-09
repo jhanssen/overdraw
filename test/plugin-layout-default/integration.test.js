@@ -1,10 +1,8 @@
-// Integration test: WM + layout driver + real runtime + bundled master-stack
-// plugin, exercising the end-to-end Phase 2 pipeline.
-//
-// What this test proves over the unit tests:
+// End-to-end: WM + layout driver + real runtime + bundled master-stack
+// plugin. Proves:
 //   - The bundled plugin loads and registers in the 'layout' namespace.
 //   - The layout driver calls runtime.invokeNamespace -> plugin.handle ->
-//     worker -> plugin's compute() -> result back to core.
+//     plugin's compute() -> result back to core.
 //   - The WM applies the result and the configure sink fires.
 
 import { test } from 'node:test';

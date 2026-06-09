@@ -1,10 +1,6 @@
-// Plugin Worker entry. Runs INSIDE a worker_threads Worker.
-//
-// All loader logic is in loader.ts (shared with the in-thread path used by
-// bundled plugins). This file's job is:
-//   1. Grab parentPort + workerData (the Worker-specific bits).
-//   2. Adapt parentPort to a Channel via channelFor.
-//   3. Delegate to runLoader.
+// Plugin Worker entry. Runs INSIDE a worker_threads Worker. Adapts
+// parentPort to a Channel and delegates to runLoader (the loader is
+// shared with the main-thread path in inthread-plugin.ts).
 
 import { parentPort, workerData } from "node:worker_threads";
 
@@ -14,10 +10,7 @@ import { runLoader } from "./loader.js";
 interface BootstrapData {
   module: string;
   name: string;
-  // Per-plugin config (verbatim from ResolvedPlugin.raw for user plugins or
-  // BundledPluginSpec.config for bundled plugins). May be undefined.
   config?: unknown;
-  // Native paths for plugins with the gpu capability.
   pluginAddonPath?: string;
   dawnPath?: string;
 }

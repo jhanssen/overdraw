@@ -23,8 +23,8 @@ test("xdg-shell: toplevel create + configure handshake + non-empty states array 
         setSurfaceLayout: () => {}, setStack: () => {}, removeSurface: () => {},
         takeImportedSurfaces: () => [], takeFreedBuffers: () => [],
       };
-      // Inline layout driver so addWindow assigns a tile and the WM fires the
-      // sized configure (xdg_toplevel.configure). Post-Phase-2 the WM is
+      // Inline layout driver so addWindow assigns a tile and the WM fires
+      // the sized configure (xdg_toplevel.configure). The WM is
       // layout-policy-agnostic; without a driver it would never configure.
       const state = await installProtocols(addon, {
         compositor: noopCompositor,

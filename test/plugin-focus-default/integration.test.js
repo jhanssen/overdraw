@@ -1,7 +1,7 @@
-// Integration test: focus driver + real runtime + bundled focus plugin,
-// exercising the end-to-end Phase 3 pipeline. The driver fires decide()
-// via runtime.invokeNamespace, the bundled in-thread plugin computes the
-// result, and the driver applies it via the test's FocusApplyTarget.
+// End-to-end: focus driver + real runtime + bundled focus plugin. The
+// driver fires decide() via runtime.invokeNamespace, the in-thread plugin
+// computes the result, and the driver applies it via the test's
+// FocusApplyTarget.
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';

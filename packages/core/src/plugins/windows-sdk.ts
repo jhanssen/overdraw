@@ -53,21 +53,14 @@ export interface PluginWindows extends PluginWindowObserver {
   get(surfaceId: number): Promise<WindowSnapshot | null>;
   list(): Promise<WindowSnapshot[]>;
 
-  // Override the content-layer draw order for a specific output
-  // (core-plugin-api.md §1). Pass `null` to clear the override and fall
-  // back to the global stack. The workspace plugin (Phase 6) drives this
-  // to push the currently-visible workspace's windows per output.
-  //
-  // Today's single-output system: use OUTPUT_DEFAULT (= 0) as outputId.
-  // Multi-output reconfiguration (deferred per status.md) will assign
-  // real ids.
+  // Override the content-layer draw order for an output. null clears the
+  // override and falls back to the global stack. Use OUTPUT_DEFAULT (=0)
+  // until multi-output reconfiguration is built (see status.md).
   setOutputStack(outputId: number, ids: number[] | null): Promise<void>;
 
-  // Explicit focus override (core-plugin-api.md §1). Bypasses the focus
-  // plugin's decide() and immediately moves keyboard focus to `id`
-  // (null clears focus). Use for unconditional focus moves (e.g. an IPC
-  // action that selects a specific window); for policy-mediated focus
-  // changes, emit an event the focus plugin observes.
+  // Explicit focus override; bypasses the focus plugin's decide()
+  // (core-plugin-api.md §1). null clears. For policy-mediated focus
+  // changes, emit an event the focus plugin observes instead.
   focus(id: number | null): Promise<void>;
 }
 

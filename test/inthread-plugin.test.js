@@ -1,4 +1,4 @@
-// In-thread bundled plugin transport (Phase 3a). Verifies:
+// In-thread bundled plugin transport. Verifies:
 //   - A bundled plugin (cfg.bundled === true) loads in-thread (no Worker).
 //   - The plugin's init receives the config (cfg.raw) as its second arg.
 //   - Namespace registration works; the runtime can invokeNamespace it.

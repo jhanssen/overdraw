@@ -40,8 +40,7 @@ const addon = require(join(__dirname, "..", "build", "overdraw_native.node")) as
 const gpuBin = process.env.OVERDRAW_GPU_PROCESS
   ?? join(__dirname, "..", "build", "overdraw-gpu-process");
 
-// The compositing pass runs in core JS over the Dawn wire (dawn.node); the C++
-// compositing pass no longer exists.
+// The compositing pass runs in core JS over the Dawn wire (dawn.node).
 interface DawnModule extends DawnWire {
   wrapDevice(instanceHandle: bigint, deviceHandle: bigint): GPUDevice;
   globals: DawnGlobals;
@@ -63,19 +62,12 @@ const onFrame = (): void => {
 
 let runtime: PluginRuntime | null = null;
 
-// The core-internal typed bus. Producers (protocol layer, seat) emit; in-core
-// subscribers (e.g. clipboard for keyboard.focus) call bus.on(...). The typed
-// bus stays for static, core-internal event delivery.
+// Two buses: the core-internal typed bus (in-core subscribers like the
+// clipboard layer) and the plugin-visible dynamic bus (sdk.events +
+// IPC). Window.* events are republished from the typed bus onto the
+// plugin bus verbatim.
 const bus = createCompositorBus();
-
-// The plugin-visible dynamic bus. Window.* events from the typed bus are
-// republished here for plugin subscription; plugins also emit their own events
-// to it. This is the substrate for sdk.events (core-plugin-api.md §3) and the
-// later IPC subscription pipe.
 const pluginBus = new DynamicBus();
-
-// Republish core-emitted window.* events onto the plugin bus. The payloads are
-// already the wire shape (events/types.ts) and forward verbatim.
 bus.on(WINDOW_EVENT.map, (ev) => { pluginBus.emit(WINDOW_EVENT.map, ev); });
 bus.on(WINDOW_EVENT.unmap, (ev) => { pluginBus.emit(WINDOW_EVENT.unmap, ev); });
 bus.on(WINDOW_EVENT.change, (ev) => { pluginBus.emit(WINDOW_EVENT.change, ev); });
@@ -176,26 +168,16 @@ state = await installProtocols(addon, {
 console.log(`[overdraw] Wayland server listening.`);
 console.log(`[overdraw] run a client with:  WAYLAND_DISPLAY=${sock} <your-client>`);
 
-// Plugins. Bundled plugins ship with overdraw and load at priority 0 (the
-// floor of the namespace priority chain); user-config plugins load second at
-// the default priority of 100 (override-able). core-plugin-api.md §"No-plugin-
-// loaded fallback".
-//
-// A plugin `module` that looks like a filesystem path (absolute, or starting
-// with ./ or ../) is resolved relative to the config file's directory (or cwd
-// when no config file); bare specifiers pass through to the resolver.
+// Bundled plugins first (priority 0 floor), then user-config plugins
+// (default priority 100). A `module` that looks like a path (absolute or
+// ./ ../) resolves to a file:// URL; bare specifiers pass through to
+// Node's resolver.
 const bundledResolved = BUNDLED_PLUGINS.map((spec) => {
-  // Bundled modules are bare specifiers ('@overdraw/plugin-*'); the runtime
-  // resolves them via Node's normal module resolution. In dev, a path could
-  // also be used; treat the same as user-config path handling below for
-  // consistency.
   const isPath = isAbsolute(spec.module)
     || spec.module.startsWith("./") || spec.module.startsWith("../");
   const module = isPath
     ? pathToFileURL(resolvePath(process.cwd(), spec.module)).href
     : spec.module;
-  // Pass the loaded user config so the spec's configFrom can extract its
-  // slice (e.g. config.focus for plugin-focus-default).
   return bundledToResolved(spec, module, config);
 });
 

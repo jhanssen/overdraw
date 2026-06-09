@@ -86,10 +86,9 @@ export interface CompositorSink {
   takeImportedSurfaces(): Array<{ id: number; width: number; height: number }>;
   takeFreedBuffers(): number[];
   // Notify the compositor that a client wl_buffer was destroyed (explicit
-  // wl_buffer.destroy or disconnect sweep). Drives cache invalidation in the
-  // client-buffer lifecycle (rule A: this is the only path -- along with
-  // surfaceRemoved -- that releases a cached GPU import). Optional so the
-  // native sink (which is no longer used) need not implement it.
+  // wl_buffer.destroy or disconnect sweep). Drives cache invalidation in
+  // the client-buffer lifecycle (rule A: along with surfaceRemoved, the
+  // only path that releases a cached GPU import).
   notifyBufferDestroyed?(bufferId: number): void;
   renderFrame?(): void;
   // Run a callback once the compositing submit in flight at call time completes on
@@ -250,36 +249,26 @@ export interface SeatFocus {
   rect: { x: number; y: number; width: number; height: number };
 }
 
-// (FocusPolicy / FocusOptions previously lived here; the focus policy now
-// lives in the bundled `@overdraw/plugin-focus-default` plugin. The seat is
-// policy-free and dispatches decide() through the focus driver. See
-// core-plugin-api.md §14 and protocols/focus-driver.ts.)
-
 export interface SeatState {
   pointersByClient: Map<number, Set<Resource>>;
   keyboardsByClient: Map<number, Set<Resource>>;
-  // Pointer focus: the surface under the pointer (drives wl_pointer events).
-  // Follows the pointer (correct Wayland semantics for pointer events).
+  // The surface under the pointer (drives wl_pointer events).
   focus: SeatFocus | null;
-  // Keyboard focus: the active surface for wl_keyboard events. Resolved by
-  // the focus plugin's decide() and applied via applyKeyboardFocus.
+  // The keyboard-focused surface (drives wl_keyboard events). Set by the
+  // focus plugin's decide() via applyKeyboardFocus.
   kbFocus: SeatFocus | null;
   handleInput(ev: import("../types.js").InputEvent): void;
-  // Called by the WM map sweep when a freshly-mapped toplevel gains
-  // presentable content. The seat dispatches a 'window-mapped' decide() to
-  // the focus plugin; the plugin's focusOnMap config decides whether to
-  // actually focus.
+  // Called by the WM map sweep when a toplevel gains presentable content;
+  // dispatches a 'window-mapped' decide() to the focus plugin.
   focusWindow(surfaceId: number, surfaceRec: { resource: Resource },
               rect: { x: number; y: number; width: number; height: number }): void;
-  // Apply a focus result from the focus plugin (or an external explicit
-  // request via sdk.windows.focus). The seat resolves the surface id to a
-  // SeatFocus and sends the appropriate wl_keyboard leave/enter.
+  // Apply a focus result by surface id (null clears). Used by the focus
+  // driver and by the explicit-override path sdk.windows.focus.
   applyKeyboardFocus(surfaceId: number | null): void;
   // Topmost surface under an output-space point (for DnD hit-testing).
   pick(x: number, y: number): SeatFocus | null;
-  // DnD pointer grab. While non-null, handleInput routes pointer motion/button to
-  // these callbacks instead of wl_pointer. Set/cleared by the data-device module
-  // via beginDrag/endDrag.
+  // DnD pointer grab. While non-null, handleInput routes pointer motion/
+  // button to these callbacks instead of wl_pointer.
   drag: DragGrab | null;
   beginDrag(d: DragGrab): void;
   endDrag(): void;

@@ -19,9 +19,9 @@
 // Every field is optional; an absent config (or absent field) uses defaults.
 
 export interface OutputConfig {
-  // Logical output size. Phase 1 nested: today this is driven by the host window
-  // size from addon.start(); a value here is an override hint only (real
-  // wl_output / resize handling is not built yet — see docs/status.md).
+  // Logical output size. The host window size drives this in nested mode;
+  // a value here is only an override hint. Real wl_output / resize
+  // handling is not built (see docs/status.md).
   width?: number;
   height?: number;
 }
@@ -81,26 +81,23 @@ export interface ResolvedPlugin {
   restart: RestartPolicy;
   maxRestarts: number;
   windowSeconds: number;
-  // True for bundled plugins (loaded by core, ships with overdraw). When the
-  // plugin calls sdk.registerPlugin without an explicit priority, bundled
-  // defaults to 0 (the floor); user plugins default to 100. Bundled is also
-  // a hook for the in-thread (vs Worker) transport later; not used yet.
+  // True for plugins that ship with overdraw. The runtime selects the
+  // in-thread transport for bundled plugins; user plugins always run in a
+  // Worker. Also drives the default priority on sdk.registerPlugin
+  // (bundled -> 0, user -> 100).
   bundled: boolean;
-  // Per-plugin config blob. For user plugins this is the raw PluginConfig
-  // (preserves capability grants etc. that core doesn't know about yet).
-  // For bundled plugins this is the value extracted from the user config
-  // by the spec's configFrom (e.g. config.focus for plugin-focus-default).
-  // Verbatim pass-through to the plugin's init(sdk, config) -- core does
-  // NOT validate; the plugin owns its schema.
+  // Per-plugin config blob. For user plugins: the raw PluginConfig
+  // (preserves capability grants etc.). For bundled plugins: the slice
+  // extracted by the spec's configFrom. Passed verbatim to the plugin's
+  // init(sdk, config); core does not validate.
   raw: unknown;
 }
 
-// Fully-resolved config: every field present, defaults applied. This is what the
-// loader returns and the launcher consumes.
+// Fully-resolved config: every field present, defaults applied.
 export interface ResolvedConfig {
   output: { width: number; height: number } | null; // null = follow host window
-  // Verbatim user value (or undefined if absent). Threaded into the bundled
-  // focus plugin's config via bundled.ts's configFrom; the plugin validates.
+  // Verbatim user value (or undefined). Threaded to the bundled focus
+  // plugin via bundled.ts's configFrom; the plugin validates.
   focus: unknown;
   plugins: ResolvedPlugin[];
   // Absolute path of the config file that was loaded, or null if none was found

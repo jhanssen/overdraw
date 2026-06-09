@@ -1,20 +1,13 @@
 // wl_seat / wl_pointer / wl_keyboard: route host input to overdraw's own
-// clients.
+// clients. handleInput() hit-tests the WM stack on each event.
 //
-// Host input arrives normalized via the addon onInput callback (output-space
-// coords, evdev keycodes). handleInput() hit-tests the WM's window stack.
-//
-// POINTER events (enter/leave/motion/button/axis) always go to the surface under
-// the pointer — that is correct Wayland and not a policy choice.
-//
-// KEYBOARD focus is decided by the active plugin in the 'focus' namespace
-// (core-plugin-api.md §14). The seat is policy-free: at each focus-relevant
-// coarse event (pointer-enter / pointer-leave / pointer-button /
-// window-mapped / window-unmapped / explicit) it fire-and-forgets a
-// decide() call via the FocusDriver and applies the returned focus on the
-// next tick. handleInput stays synchronous; per-pointer-motion does NOT
-// invoke decide (it only fires when the pointer crosses surface boundaries
-// or leaves the output -- those are coarse, human-rate events).
+// Pointer events always follow the pointer (Wayland semantics, not a
+// policy choice). Keyboard focus is the 'focus' plugin's call: at each
+// coarse focus-relevant event the seat fire-and-forgets a decide() via
+// the FocusDriver and applies the result on the next tick. handleInput
+// stays synchronous -- per-pointer-motion does NOT invoke decide, only
+// surface-boundary crossings and the other coarse events do (see
+// FocusReason in @overdraw/focus-types).
 
 import { signature as seatSig } from "#protocols-gen/wl_seat.js";
 import type { WlSeatHandler } from "#protocols-gen/wl_seat.js";
@@ -107,21 +100,13 @@ export default function makeSeat(ctx: Ctx, driver: FocusDriver): SeatHandler {
     if (target) markWindowChanged(ctx.state, target.surfaceId, "activated");
   }
 
-  // Resolve a SurfaceId (or null) to a SeatFocus and apply via setKbFocus.
-  // This is the FocusApplyTarget the driver uses: when decide() resolves
-  // with { keyboardFocus: id }, we look up the current window+client for id
-  // and route through the standard keyboard leave/enter machinery.
-  //
-  // If the surface no longer exists (it unmapped between dispatch and
-  // resolve), the apply is a silent no-op -- the seat's kb focus stays
-  // wherever it currently is.
+  // Apply a focus result by surface id. null clears. Silent no-op if the
+  // surface unmapped between dispatch and apply (the focus driver does not
+  // care about apply failures; the kb focus simply stays where it was).
   function applyKeyboardFocus(surfaceId: number | null): void {
     if (surfaceId === null) { setKbFocus(null); return; }
     const s = ctx.state.surfacesById?.get(surfaceId);
     if (!s || s.resource.destroyed) return;
-    // Get the window's content rect from the WM. If the window has unmapped
-    // (or was never mapped) between dispatch and apply, this is undefined --
-    // drop the apply silently.
     const snap = ctx.state.wm?.getSnapshot(surfaceId);
     if (!snap) return;
     const clientId = ctx.addon.clientId(s.resource);
@@ -190,18 +175,12 @@ export default function makeSeat(ctx: Ctx, driver: FocusDriver): SeatHandler {
         const y = ev.y ?? 0;
         lastX = x; lastY = y;
         const hit = pick(x, y);
-        // POINTER focus follows the pointer (always). Send pointer leave/enter on
-        // surface change, motion otherwise. Surface-boundary transitions also
-        // fire focus decide() calls (pointer-leave for the old, pointer-enter
-        // for the new) so the focus plugin can react to surface crossings.
         const prevPointerSurface = seat.focus?.surfaceId ?? null;
         if (seat.focus && (!hit || hit.surfaceId !== seat.focus.surfaceId)) {
           sendLeave(seat.focus);
           seat.focus = null;
         }
         if (!hit) {
-          // Pointer left all surfaces. If we were over one before, that's a
-          // pointer-leave for focus purposes.
           if (prevPointerSurface !== null) {
             dispatchFocus("pointer-leave", undefined, null);
           }
@@ -219,8 +198,8 @@ export default function makeSeat(ctx: Ctx, driver: FocusDriver): SeatHandler {
             pointerFrame(p);
           }
         }
-        // KEYBOARD focus: dispatch only on surface change (the coarse event).
-        // Per-pointer-motion within the same surface does NOT fire decide().
+        // Focus dispatch only on surface change (coarse event), not per
+        // motion within the same surface.
         if (prevPointerSurface !== hit.surfaceId) {
           dispatchFocus("pointer-enter", hit.surfaceId, hit.surfaceId);
         }
@@ -229,16 +208,14 @@ export default function makeSeat(ctx: Ctx, driver: FocusDriver): SeatHandler {
       case "pointerLeave": {
         const prev = seat.focus?.surfaceId ?? null;
         if (seat.focus) { sendLeave(seat.focus); seat.focus = null; }
-        // Pointer left the output entirely. If we had a surface, that's a
-        // pointer-leave for focus purposes; if we didn't, there's no change.
         if (prev !== null) {
           dispatchFocus("pointer-leave", undefined, null);
         }
         break;
       }
       case "pointerButton": {
-        // A button press outside a grabbing popup dismisses it (and is swallowed,
-        // not delivered to the client under the pointer) -- standard menu behavior.
+        // A press outside a grabbing popup dismisses it (and is swallowed,
+        // not delivered to the client) -- standard menu behavior.
         if (ev.pressed && ctx.state.dismissGrabbedPopup?.(lastX, lastY)) return;
         if (!seat.focus) return;
         const serial = ctx.state.serial();
@@ -248,8 +225,6 @@ export default function makeSeat(ctx: Ctx, driver: FocusDriver): SeatHandler {
           ctx.events.wl_pointer.send_button(p, serial, ev.time, ev.button ?? 0, state);
           pointerFrame(p);
         }
-        // Fire decide() on press. The focus plugin decides whether to focus
-        // (click-to-focus does; follow-pointer ignores).
         if (ev.pressed) {
           dispatchFocus("pointer-button", seat.focus.surfaceId, seat.focus.surfaceId);
         }
@@ -293,8 +268,7 @@ export default function makeSeat(ctx: Ctx, driver: FocusDriver): SeatHandler {
   }
 
   // Called by the WM map sweep when a freshly-mapped toplevel gains
-  // presentable content. Fires a 'window-mapped' decide(); the bundled
-  // focus plugin's focusOnMap config decides whether to actually focus it.
+  // presentable content. The focus plugin decides whether to focus it.
   function focusWindow(
     surfaceId: number, _surfaceRec: { resource: Resource },
     _rect: { x: number; y: number; width: number; height: number },

@@ -60,10 +60,8 @@ test('function default export is invoked (async)', async () => {
 });
 
 test('focus is verbatim pass-through (core does NOT validate)', async () => {
-  // After Phase 3, focus config is owned by the active focus plugin.
-  // Core accepts any value (including nonsense); the focus plugin
-  // throws from init on bad config, which surfaces as a fatal startup
-  // error per the in-thread bundled-plugin contract.
+  // Core accepts any value; the focus plugin owns the schema and throws
+  // from init on bad config (surfacing as a fatal startup error).
   const dir = tmp();
   const p = join(dir, 'config.mjs');
   writeFileSync(p, 'export default { focus: { policy: "nope" } }');

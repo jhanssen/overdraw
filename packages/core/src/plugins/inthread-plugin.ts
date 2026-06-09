@@ -1,25 +1,12 @@
-// In-thread bundled plugin host. Mirrors ManagedPlugin's external shape but
-// runs the plugin on the main thread instead of a worker_threads Worker.
+// In-thread plugin host for bundled plugins. Runs init on the main thread
+// over a paired in-memory Channel; the loader is shared with the Worker
+// path. Implements PluginHandle so the runtime can hold both transports in
+// one list.
 //
-// Used for bundled plugins (ResolvedPlugin.bundled === true) per the
-// "Bundled plugins run in-thread" decision in core-plugin-api.md. The
-// plugin's init runs on the main event loop; the SDK construction code in
-// loader.ts is reused unchanged. The transport is a paired in-memory
-// Channel: the loader's Endpoint talks on side B; the runtime's Endpoint
-// talks on side A.
-//
-// Differences from ManagedPlugin (Worker-mode):
-//   - No Worker is spawned. No watchdog ping/pong (liveness is co-extensive
-//     with the core's event loop).
-//   - No restart on failure: init throws are fatal startup errors (release-
-//     blocking bug per core-plugin-api.md decided list); per-call exceptions
-//     from registered namespace/action methods are caught at the Endpoint
-//     boundary as today.
-//   - stop() awaits the shutdown request, then drops the endpoints. No
-//     terminate() is needed (no thread to kill).
-//
-// External contract: the same `PluginHandle` interface that ManagedPlugin
-// implements, so PluginRuntime can hold both kinds in one list.
+// No watchdog: liveness is co-extensive with the core's event loop. No
+// restart: init throws are fatal startup errors; per-call exceptions catch
+// at the Endpoint boundary and the plugin stays registered. stop() awaits
+// the plugin's onShutdown then drops the endpoint.
 
 import { Endpoint } from "./protocol.js";
 import { createChannelPair } from "./pair-channel.js";
@@ -34,8 +21,6 @@ export interface InThreadOptions {
   onEvent?: (pluginName: string, name: string, data: unknown) => void;
   onRequest?: (pluginName: string, method: string, params: unknown) => Promise<unknown> | unknown;
   bus?: DynamicBus;
-  // shutdownTimeoutMs only governs the await on the plugin's onShutdown
-  // callback; no terminate() follows on the in-thread path.
   shutdownTimeoutMs: number;
 }
 
@@ -47,13 +32,9 @@ export class InThreadPlugin implements PluginHandle {
 
   state: PluginState = "spawning";
   private endpoint: Endpoint | null = null;
-  // The loader-side endpoint stays alive for the plugin's lifetime; we don't
-  // hold a direct reference, but the paired channel keeps both endpoints
-  // referenced so neither is GC'd.
   private busSubs = new Map<number, Subscription>();
   private firstSettle: { resolve: () => void } | null = null;
   readonly ready: Promise<void>;
-  private stopping = false;
 
   constructor(cfg: ResolvedPlugin, opts: InThreadOptions, ns: PluginController) {
     this.cfg = cfg;
@@ -71,29 +52,20 @@ export class InThreadPlugin implements PluginHandle {
     if (this.firstSettle) { this.firstSettle.resolve(); this.firstSettle = null; }
   }
 
-  // Start the plugin. Sets up the paired channel + endpoints, wires the
-  // request/event chain that ManagedPlugin wires, then kicks off runLoader on
-  // the loader side. Returns synchronously; init completion arrives via the
-  // 'init' event the loader emits (caught in onPluginEvent below).
+  // Kicks off the loader; returns synchronously. Init completion arrives
+  // via the loader's 'init' event (onPluginEvent below).
   spawn(): void {
     this.state = "spawning";
     const pair = createChannelPair();
     this.wireCoreEndpoint(pair.a);
-    // Fire the loader. The promise it returns resolves after init either
-    // succeeds or fails (and the loader emits the corresponding 'init'
-    // event), so we don't need to await it here.
     void runLoader(pair.b, {
       module: this.cfg.module,
       name: this.cfg.name,
-      // ResolvedPlugin.raw is the user-config blob for user plugins, or the
-      // BundledPluginSpec.config value for bundled plugins; pass through
-      // verbatim. Plugins that don't expect a config simply ignore the arg.
       config: this.cfg.raw,
     }).catch((err: unknown) => {
-      // runLoader itself shouldn't reject (it converts init errors into the
-      // 'init' event); a reject here means something more fundamental went
-      // wrong (e.g. createChannelPair / SDK construction). Treat as a fatal
-      // startup error -- log and mark failed; no respawn.
+      // runLoader converts init errors into the 'init' event; a reject
+      // here means something more fundamental failed (channel setup, SDK
+      // construction). Treat as a fatal startup error.
       const msg = err instanceof Error ? err.message : String(err);
       this.log(`[plugin ${this.cfg.name}] loader fatal: ${msg}`);
       this.state = "failed";
@@ -104,9 +76,6 @@ export class InThreadPlugin implements PluginHandle {
   private wireCoreEndpoint(channel: Channel): void {
     const endpoint = new Endpoint(channel);
     this.endpoint = endpoint;
-    // No watchdog; in-thread plugins don't need pongs. The Endpoint's
-    // default ping handler would auto-pong, which is fine but we don't send
-    // pings either way.
     endpoint.handleEvents((name, data) => { this.onPluginEvent(name, data); });
 
     const onReq = this.opts.onRequest;
@@ -138,9 +107,6 @@ export class InThreadPlugin implements PluginHandle {
         this.log(`[plugin ${this.cfg.name}] live (in-thread)`);
         this.settleFirst();
       } else {
-        // Init failure for an in-thread bundled plugin is a fatal startup
-        // error per core-plugin-api.md. No restart, no respawn. Surface
-        // through the log; user-facing diagnostic stream is TBD.
         this.log(`[plugin ${this.cfg.name}] init failed: ${d.error ?? "unknown"}`);
         this.state = "failed";
         this.ns.registry().unregisterAllFor(this.cfg.name);
@@ -221,10 +187,7 @@ export class InThreadPlugin implements PluginHandle {
     this.busSubs.clear();
   }
 
-  // Graceful shutdown: ask the plugin to run onShutdown, await up to the
-  // timeout, then release. No terminate() (no thread to kill).
   async stop(): Promise<void> {
-    this.stopping = true;
     if (!this.endpoint || this.state === "failed") {
       this.releaseBusSubs();
       this.ns.registry().unregisterAllFor(this.cfg.name);
@@ -257,7 +220,6 @@ export class InThreadPlugin implements PluginHandle {
   }
 
   get currentState(): PluginState { return this.state; }
-  // No restart bookkeeping for in-thread; always 0 (failures are fatal).
   get restartCount(): number { return 0; }
 }
 

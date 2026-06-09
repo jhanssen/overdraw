@@ -77,25 +77,20 @@ export interface Output { width: number; height: number; }
 
 export interface InstallOptions {
   output?: Output;
-  // Compositor backend. Defaults to the native addon (C++ Compositor). Pass a
-  // JsCompositor to run the compositing pass in JS over the wire.
+  // The compositing sink (the JsCompositor in production).
   compositor?: CompositorSink;
-  // Core-internal event bus (window/keyboard events). main.ts forwards window.*
-  // to the plugin runtime and the clipboard layer subscribes to keyboard.focus.
-  // Optional: GPU-free protocol tests can omit it (emits become no-ops).
+  // Core-internal event bus. GPU-free tests may omit it; emits become
+  // no-ops.
   bus?: CompositorBus;
-  // Layout driver factory. main.ts passes a runtime-backed driver; GPU-free
-  // tests can pass an inline driver (or omit, in which case the WM uses a
-  // no-op driver that never moves windows). core-plugin-api.md §13.
+  // Layout driver factory (core-plugin-api.md §13). Omit -> the WM uses a
+  // no-op driver that never moves windows; useful for tests that don't
+  // exercise layout.
   layoutDriverFactory?: (
     target: LayoutApplyTarget,
     snapshot: () => LayoutSnapshot,
   ) => LayoutDriver;
-  // Focus driver factory. main.ts passes a runtime-backed driver that
-  // invokes the 'focus' namespace plugin's decide(); GPU-free tests can
-  // pass an inline driver (synchronous fake) or omit (in which case the
-  // seat is constructed with a no-op driver that never changes focus).
-  // core-plugin-api.md §14.
+  // Focus driver factory (core-plugin-api.md §14). Omit -> the seat uses
+  // a no-op driver that never changes focus.
   focusDriverFactory?: (target: FocusApplyTarget) => FocusDriver;
 }
 
@@ -342,23 +337,20 @@ export async function installProtocols(
     wl_callback: {}, // event-only (done); no requests to dispatch
   };
 
-  // Build the focus driver. It needs an apply target that routes back into
-  // the seat, but the seat isn't constructed yet -- use a lazy forwarder
-  // closure that resolves state.seat.applyKeyboardFocus after construction.
+  // The apply target forwards lazily: the seat is constructed below and
+  // populates state.seat; the driver may dispatch before that happens
+  // (unlikely in practice but cheap to guard).
   const applyTarget: FocusApplyTarget = {
     applyKeyboardFocus(surfaceId) {
       state.seat?.applyKeyboardFocus(surfaceId);
     },
   };
-  // If no factory was provided (GPU-free tests), use a no-op driver so the
-  // seat code's dispatchFocus calls become silent. Production main.ts
-  // passes a runtime-backed driver.
   const focusDriver: FocusDriver = opts.focusDriverFactory
     ? opts.focusDriverFactory(applyTarget)
     : { dispatch: () => {}, settled: () => Promise.resolve() };
 
-  // wl_seat needs the focus driver; instantiate it explicitly (the generic
-  // factory call below would not pass it).
+  // wl_seat takes the focus driver explicitly (the generic factory call
+  // below has no way to pass it).
   const globalHandlers: Record<string, object> = {
     wl_seat: seatMod.default(ctx, focusDriver),
     zwp_primary_selection_device_manager_v1: ddmMod.makePrimaryManager(ctx),

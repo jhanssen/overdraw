@@ -97,21 +97,18 @@ export function fdCount(pid) {
   try { return readdirSync(`/proc/${pid}/fd`).length; } catch { return -1; }
 }
 
-// Bring up the full compositor. Returns a context with a query() bound to the
-// installed protocol state, plus client-spawn + teardown helpers. Spins up the
-// PluginRuntime with the bundled plugins (layout + focus); opts.focus and
-// opts.layoutParams flow through the bundled-plugin config channel.
+// Bring up the full compositor: GPU process, JS compositor, Wayland
+// server, protocol layer, plugin runtime with the bundled plugins
+// loaded. Returns a context with query(), spawnClient(), teardown(), and
+// the runtime + pluginBus handles for tests that want to observe.
 //
 // opts:
-//   focus:         user-config-style { policy, focusOnMap }; flows to the
-//                  bundled focus plugin. Defaults to follow-pointer + on-map.
-//   layoutParams:  master-stack params (currently the bundled layout plugin
-//                  ignores config). Passed through symmetrically for future use.
-//   bus:           pre-built DynamicBus (events tests use this to subscribe
-//                  before any plugin loads). Defaults to a fresh one.
-//   headless:      { width, height } | null. Default { 1280, 720 }; pass null
-//                  for nested-host-window mode.
-//   jsCompositor:  default true (the JS compositor is the only path now).
+//   focus     user-config-style { policy, focusOnMap }; flows verbatim
+//             to the bundled focus plugin's config.
+//   bus       pre-built DynamicBus (for tests that subscribe before plugins
+//             load). Defaults to a fresh one.
+//   headless  { width, height } | null. Default { 1280, 720 }; pass null
+//             for nested-host-window mode.
 export async function setupCompositor(opts = {}) {
   const addon = require(addonPath);
 
@@ -119,17 +116,14 @@ export async function setupCompositor(opts = {}) {
   const onInput = (ev) => { state?.seat?.handleInput(ev); };
   const onFrame = () => { state?.dispatchFrameCallbacks?.(Math.round(performance.now())); };
 
-  // Headless by default for tests: no host window/surface; the compositing pass
-  // renders into an offscreen texture read back via frameReadback. Pass
-  // opts.headless = null (or { headless: false }) to use the nested host window.
+  // Headless by default: the JS compositor renders into an offscreen target
+  // read back via frameReadback(). Pass headless: null to nest to the host.
   const headless = opts.headless === undefined
     ? { width: 1280, height: 720 }
     : opts.headless;
   const dims = addon.start(gpuBin, onFrame, onInput, headless || null);
   const sock = addon.startServer();
 
-  // The JS compositor is the compositor now (the C++ pass is gone). Default to
-  // it; opts.jsCompositor === false is no longer supported.
   let jsCompositor = null;
   if (opts.jsCompositor !== false) {
     const dawn = loadDawn();
@@ -143,12 +137,11 @@ export async function setupCompositor(opts = {}) {
       { nested, format: addon.outputFormat() });
   }
 
-  // The plugin bus (shared between runtime + tests that want to observe).
   const pluginBus = opts.bus ?? new DynamicBus();
 
-  // Build the runtime BEFORE installProtocols so the layout/focus driver
-  // factories can close over it. The runtime's load() will be called after
-  // the protocol layer is up.
+  // The driver factories close over `runtime`, which is built after
+  // installProtocols below. waitForNamespace inside compute()/decide()
+  // absorbs the boot race.
   let runtime = null;
 
   state = await installProtocols(addon, {
