@@ -57,8 +57,23 @@ export function createWindowsBroker(deps: WindowsBrokerDeps): WindowsBroker {
     if (method === "windows.get") return handleGet(params);
     if (method === "windows.list") return wm.listSnapshots();
     if (method === "windows.set-output-stack") return handleSetOutputStack(params);
+    if (method === "windows.focus") return handleFocus(params);
     return NOT_HANDLED;
   };
+
+  // Explicit-override focus (core-plugin-api.md §1: "sdk.windows.focus(id):
+  // // explicit override"). Bypasses the focus plugin's decide() and applies
+  // directly via the seat. id of null clears focus. The 'explicit' decide()
+  // reason is reserved for callers that want the plugin's policy to apply --
+  // sdk.windows.focus is the unconditional path.
+  //
+  // Returns null when the seat isn't bound yet (the request is silently
+  // dropped) or the surface no longer exists.
+  function handleFocus(p: unknown): null {
+    if (!isFocusPayload(p)) throw new Error("windows.focus: malformed payload");
+    state.seat?.applyKeyboardFocus(p.id);
+    return null;
+  }
 
   function handleSetOutputStack(p: unknown): null {
     if (!isSetOutputStackPayload(p)) {
@@ -153,6 +168,12 @@ function isGetStatePayload(d: unknown): d is { id: number; key: string } {
 function isGetPayload(d: unknown): d is { id: number } {
   return typeof d === "object" && d !== null
     && typeof (d as { id?: unknown }).id === "number";
+}
+
+function isFocusPayload(d: unknown): d is { id: number | null } {
+  if (typeof d !== "object" || d === null) return false;
+  const id = (d as { id?: unknown }).id;
+  return id === null || typeof id === "number";
 }
 
 function isSetOutputStackPayload(d: unknown): d is { outputId: number; ids: number[] | null } {

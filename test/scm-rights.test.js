@@ -11,8 +11,8 @@ import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
-const bin = join(__dirname, "..", "build", "scm-rights-test");
-const skip = existsSync(bin) ? false : "build/scm-rights-test not built (run cmake --build build)";
+const bin = join(__dirname, "..", "packages", "core", "build", "scm-rights-test");
+const skip = existsSync(bin) ? false : "packages/core/build/scm-rights-test not built";
 
 test("SCM_RIGHTS fd passing over the side-channel transport", { skip }, async () => {
   const { code, stdout } = await new Promise((resolve) => {

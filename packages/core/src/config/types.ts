@@ -18,16 +18,6 @@
 //
 // Every field is optional; an absent config (or absent field) uses defaults.
 
-export type FocusPolicy = "follow-pointer" | "click-to-focus";
-
-export interface FocusConfig {
-  // Keyboard-focus policy. Pointer events always follow the pointer regardless.
-  // Default: "follow-pointer".
-  policy?: FocusPolicy;
-  // Give keyboard focus to a window when it maps. Default: true.
-  focusOnMap?: boolean;
-}
-
 export interface OutputConfig {
   // Logical output size. Phase 1 nested: today this is driven by the host window
   // size from addon.start(); a value here is an override hint only (real
@@ -64,7 +54,15 @@ export interface PluginConfig {
 
 export interface OverdrawConfig {
   output?: OutputConfig;
-  focus?: FocusConfig;
+  // Bundled-plugin config slice for the 'focus' namespace. Verbatim
+  // pass-through to the active focus plugin's init(sdk, config). Core does
+  // NOT validate; the focus plugin owns its schema (defaults to the bundled
+  // `@overdraw/plugin-focus-default`, which accepts
+  // `{ policy: 'follow-pointer' | 'click-to-focus', focusOnMap: boolean }`).
+  // For IDE-friendly typing, users may
+  // `import type { FocusPluginConfig } from '@overdraw/plugin-focus-default'`
+  // and write `focus: cfg satisfies FocusPluginConfig`.
+  focus?: unknown;
   // DEFERRED — see PluginConfig. Declared/validated but not yet consumed.
   plugins?: PluginConfig[];
 }
@@ -88,14 +86,22 @@ export interface ResolvedPlugin {
   // defaults to 0 (the floor); user plugins default to 100. Bundled is also
   // a hook for the in-thread (vs Worker) transport later; not used yet.
   bundled: boolean;
-  raw: PluginConfig;
+  // Per-plugin config blob. For user plugins this is the raw PluginConfig
+  // (preserves capability grants etc. that core doesn't know about yet).
+  // For bundled plugins this is the value extracted from the user config
+  // by the spec's configFrom (e.g. config.focus for plugin-focus-default).
+  // Verbatim pass-through to the plugin's init(sdk, config) -- core does
+  // NOT validate; the plugin owns its schema.
+  raw: unknown;
 }
 
 // Fully-resolved config: every field present, defaults applied. This is what the
 // loader returns and the launcher consumes.
 export interface ResolvedConfig {
   output: { width: number; height: number } | null; // null = follow host window
-  focus: { policy: FocusPolicy; focusOnMap: boolean };
+  // Verbatim user value (or undefined if absent). Threaded into the bundled
+  // focus plugin's config via bundled.ts's configFrom; the plugin validates.
+  focus: unknown;
   plugins: ResolvedPlugin[];
   // Absolute path of the config file that was loaded, or null if none was found
   // (built-in defaults in effect).

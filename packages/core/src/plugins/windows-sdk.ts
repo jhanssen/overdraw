@@ -62,6 +62,13 @@ export interface PluginWindows extends PluginWindowObserver {
   // Multi-output reconfiguration (deferred per status.md) will assign
   // real ids.
   setOutputStack(outputId: number, ids: number[] | null): Promise<void>;
+
+  // Explicit focus override (core-plugin-api.md §1). Bypasses the focus
+  // plugin's decide() and immediately moves keyboard focus to `id`
+  // (null clears focus). Use for unconditional focus moves (e.g. an IPC
+  // action that selects a specific window); for policy-mediated focus
+  // changes, emit an event the focus plugin observes.
+  focus(id: number | null): Promise<void>;
 }
 
 // The single-output placeholder id (kept in sync with OUTPUT_DEFAULT in
@@ -145,6 +152,13 @@ export function createPluginWindows(
         }
       }
       await endpoint.request("windows.set-output-stack", { outputId, ids });
+    },
+
+    async focus(id): Promise<void> {
+      if (id !== null && typeof id !== "number") {
+        throw new TypeError("focus id must be a number or null");
+      }
+      await endpoint.request("windows.focus", { id });
     },
   };
 

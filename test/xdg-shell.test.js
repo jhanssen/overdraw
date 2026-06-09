@@ -7,12 +7,13 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { skipUnless, loadAddon, runClient, sleep } from "./server-helpers.mjs";
+import { inlineMasterStackDriverFactory } from "./wm-helpers.mjs";
 
 test("xdg-shell: toplevel create + configure handshake + non-empty states array encode",
   { skip: skipUnless("xdg-test-client") },
   async () => {
     const addon = loadAddon();
-    const { installProtocols } = await import("../dist/protocols/index.js");
+    const { installProtocols } = await import("../packages/core/dist/protocols/index.js");
     const sock = addon.startServer();
     try {
       // No-op compositor sink: this GPU-free test exercises the protocol
@@ -22,7 +23,13 @@ test("xdg-shell: toplevel create + configure handshake + non-empty states array 
         setSurfaceLayout: () => {}, setStack: () => {}, removeSurface: () => {},
         takeImportedSurfaces: () => [], takeFreedBuffers: () => [],
       };
-      const state = await installProtocols(addon, { compositor: noopCompositor });
+      // Inline layout driver so addWindow assigns a tile and the WM fires the
+      // sized configure (xdg_toplevel.configure). Post-Phase-2 the WM is
+      // layout-policy-agnostic; without a driver it would never configure.
+      const state = await installProtocols(addon, {
+        compositor: noopCompositor,
+        layoutDriverFactory: inlineMasterStackDriverFactory,
+      });
       const { code } = await runClient("xdg-test-client", sock);
       assert.equal(code, 0, "client handshake + states-array intact (exit 0)");
       await sleep(100);

@@ -1,10 +1,11 @@
 // Integration-test harness for overdraw.
 //
 // Brings up the full stack (GPU process + present loop, Wayland server, protocol
-// layer, input routing), spawns real libwayland clients against it, and asserts
-// on compositor STATE via the in-process state-query channel (state.query()) --
-// geometry / stacking / focus -- not pixels. This mirrors how the reference
-// compositors structure integration tests (drive + query state).
+// layer, plugin runtime with bundled plugins, input routing), spawns real
+// libwayland clients against it, and asserts on compositor STATE via the
+// in-process state-query channel (state.query()) -- geometry / stacking /
+// focus -- not pixels. This mirrors how the reference compositors structure
+// integration tests (drive + query state).
 //
 // Requires a live host Wayland session (WAYLAND_DISPLAY) and the GPU, same as the
 // *-upload-smoke tests. Use canRunGpu() to skip gracefully when absent.
@@ -16,6 +17,11 @@ import { spawn } from "node:child_process";
 import { readdirSync, readFileSync, globSync } from "node:fs";
 
 import { installProtocols } from "../packages/core/dist/protocols/index.js";
+import { createLayoutDriver } from "../packages/core/dist/wm/layout-driver.js";
+import { createFocusDriver } from "../packages/core/dist/protocols/focus-driver.js";
+import { PluginRuntime } from "../packages/core/dist/plugins/index.js";
+import { BUNDLED_PLUGINS, bundledToResolved } from "../packages/core/dist/plugins/bundled.js";
+import { DynamicBus } from "../packages/core/dist/events/dynamic-bus.js";
 
 const require = createRequire(import.meta.url);
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -92,7 +98,20 @@ export function fdCount(pid) {
 }
 
 // Bring up the full compositor. Returns a context with a query() bound to the
-// installed protocol state, plus client-spawn + teardown helpers.
+// installed protocol state, plus client-spawn + teardown helpers. Spins up the
+// PluginRuntime with the bundled plugins (layout + focus); opts.focus and
+// opts.layoutParams flow through the bundled-plugin config channel.
+//
+// opts:
+//   focus:         user-config-style { policy, focusOnMap }; flows to the
+//                  bundled focus plugin. Defaults to follow-pointer + on-map.
+//   layoutParams:  master-stack params (currently the bundled layout plugin
+//                  ignores config). Passed through symmetrically for future use.
+//   bus:           pre-built DynamicBus (events tests use this to subscribe
+//                  before any plugin loads). Defaults to a fresh one.
+//   headless:      { width, height } | null. Default { 1280, 720 }; pass null
+//                  for nested-host-window mode.
+//   jsCompositor:  default true (the JS compositor is the only path now).
 export async function setupCompositor(opts = {}) {
   const addon = require(addonPath);
 
@@ -109,9 +128,6 @@ export async function setupCompositor(opts = {}) {
   const dims = addon.start(gpuBin, onFrame, onInput, headless || null);
   const sock = addon.startServer();
 
-  // Optional: run the compositing pass in JS over the wire (dawn.node) instead
-  // of the native C++ Compositor. Creates a JsCompositor wrapping the core's wire
-  // device and passes it as the compositor backend.
   // The JS compositor is the compositor now (the C++ pass is gone). Default to
   // it; opts.jsCompositor === false is no longer supported.
   let jsCompositor = null;
@@ -120,20 +136,58 @@ export async function setupCompositor(opts = {}) {
     if (!dawn) throw new Error("jsCompositor requested but dawn.node not found");
     const h = addon.gpuHandles();
     const device = dawn.wrapDevice(h.instance, h.device);
-    const { JsCompositor } = await import("../dist/gpu/compositor.js");
-    const nested = !headless;  // nested -> present to the host swapchain (slice 3)
+    const { JsCompositor } = await import("../packages/core/dist/gpu/compositor.js");
+    const nested = !headless;
     jsCompositor = new JsCompositor(device, dawn.globals, addon,
       { width: dims.width, height: dims.height }, dawn, h.device,
       { nested, format: addon.outputFormat() });
   }
 
+  // The plugin bus (shared between runtime + tests that want to observe).
+  const pluginBus = opts.bus ?? new DynamicBus();
+
+  // Build the runtime BEFORE installProtocols so the layout/focus driver
+  // factories can close over it. The runtime's load() will be called after
+  // the protocol layer is up.
+  let runtime = null;
+
   state = await installProtocols(addon, {
     output: { width: dims.width, height: dims.height },
-    focus: opts.focus,
     compositor: jsCompositor ?? undefined,
     bus: opts.bus,
-    layout: opts.layout,
+    layoutDriverFactory: (target, snapshot) => createLayoutDriver({
+      target, snapshot,
+      compute: async (inputs) => {
+        if (!runtime) throw new Error("layout: runtime not initialized");
+        await runtime.waitForNamespace("layout");
+        return await runtime.invokeNamespace("layout", "compute", [inputs]);
+      },
+    }),
+    focusDriverFactory: (target) => createFocusDriver({
+      target,
+      decide: async (inputs) => {
+        if (!runtime) throw new Error("focus: runtime not initialized");
+        await runtime.waitForNamespace("focus");
+        return await runtime.invokeNamespace("focus", "decide", [inputs]);
+      },
+    }),
   });
+
+  // Spin up the runtime + load the bundled plugins. The user-config-style
+  // focus and layoutParams flow through bundledToResolved's third arg, which
+  // each plugin spec extracts via its configFrom.
+  const resolvedConfig = {
+    output: null,
+    focus: opts.focus,
+    plugins: [],
+    sourcePath: null,
+  };
+  runtime = new PluginRuntime({
+    bus: pluginBus,
+    log: opts.log ?? (() => {}),
+  });
+  const resolved = BUNDLED_PLUGINS.map((spec) => bundledToResolved(spec, spec.module, resolvedConfig));
+  await runtime.load(resolved);
 
   const clients = [];
 
@@ -177,6 +231,8 @@ export async function setupCompositor(opts = {}) {
     for (const c of clients) { try { c.kill("SIGTERM"); } catch { /* already gone */ } }
     // Give clients a beat to disconnect cleanly, servicing the loop.
     await sleep(50);
+    // Stop the runtime before the addon so plugins quiesce before the server.
+    try { await runtime.stop(); } catch { /* ignore */ }
     try { addon.stopServer(); } catch { /* ignore */ }
     try { addon.stop(); } catch { /* ignore */ }
     // addon.stop() reaps the GPU process; confirm none leaked (by exact comm).
@@ -194,6 +250,7 @@ export async function setupCompositor(opts = {}) {
   return {
     addon, state, sock, dims, query: () => state.query(),
     spawnClient, waitFor, frameReadback, teardown, jsCompositor,
+    runtime, pluginBus,
   };
 }
 

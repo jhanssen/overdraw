@@ -250,20 +250,10 @@ export interface SeatFocus {
   rect: { x: number; y: number; width: number; height: number };
 }
 
-// Keyboard focus policy. Pointer events (wl_pointer enter/leave/motion) always
-// follow the pointer regardless; only *keyboard* focus is governed by this.
-//   "follow-pointer": keyboard focus tracks the surface under the pointer.
-//   "click-to-focus": keyboard focus changes only on pointer button press, and
-//                     persists when the pointer moves away.
-export type FocusPolicy = "follow-pointer" | "click-to-focus";
-
-export interface FocusOptions {
-  policy: FocusPolicy;
-  // Give keyboard focus to a window when it maps. Helps both policies (under
-  // follow-pointer it covers the case where a window maps under a stationary
-  // pointer and would otherwise never get a motion event to focus it).
-  focusOnMap: boolean;
-}
+// (FocusPolicy / FocusOptions previously lived here; the focus policy now
+// lives in the bundled `@overdraw/plugin-focus-default` plugin. The seat is
+// policy-free and dispatches decide() through the focus driver. See
+// core-plugin-api.md §14 and protocols/focus-driver.ts.)
 
 export interface SeatState {
   pointersByClient: Map<number, Set<Resource>>;
@@ -271,14 +261,20 @@ export interface SeatState {
   // Pointer focus: the surface under the pointer (drives wl_pointer events).
   // Follows the pointer (correct Wayland semantics for pointer events).
   focus: SeatFocus | null;
-  // Keyboard focus: the active surface for wl_keyboard events. Set by click and
-  // on map (click-to-focus + focus-on-map), independent of pointer position.
+  // Keyboard focus: the active surface for wl_keyboard events. Resolved by
+  // the focus plugin's decide() and applied via applyKeyboardFocus.
   kbFocus: SeatFocus | null;
   handleInput(ev: import("../types.js").InputEvent): void;
-  // Give keyboard focus to a freshly-mapped window (focus-on-map). Called by the
-  // WM from mapWindow.
+  // Called by the WM map sweep when a freshly-mapped toplevel gains
+  // presentable content. The seat dispatches a 'window-mapped' decide() to
+  // the focus plugin; the plugin's focusOnMap config decides whether to
+  // actually focus.
   focusWindow(surfaceId: number, surfaceRec: { resource: Resource },
               rect: { x: number; y: number; width: number; height: number }): void;
+  // Apply a focus result from the focus plugin (or an external explicit
+  // request via sdk.windows.focus). The seat resolves the surface id to a
+  // SeatFocus and sends the appropriate wl_keyboard leave/enter.
+  applyKeyboardFocus(surfaceId: number | null): void;
   // Topmost surface under an output-space point (for DnD hit-testing).
   pick(x: number, y: number): SeatFocus | null;
   // DnD pointer grab. While non-null, handleInput routes pointer motion/button to

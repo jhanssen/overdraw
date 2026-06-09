@@ -16,6 +16,7 @@ import { globSync } from "node:fs";
 
 import { installProtocols } from "./protocols/index.js";
 import { createLayoutDriver } from "./wm/layout-driver.js";
+import { createFocusDriver } from "./protocols/focus-driver.js";
 import { parseConfigArg, loadConfig } from "./config/load.js";
 import { PluginRuntime } from "./plugins/index.js";
 import { createOverlayBroker } from "./overlay.js";
@@ -135,7 +136,6 @@ const sock = addon.startServer();
 // where addWindow could fire before plugins finish init.
 state = await installProtocols(addon, {
   output: config.output ?? { width: dims.width, height: dims.height },
-  focus: config.focus,
   compositor,
   bus,
   layoutDriverFactory: (target, snapshot) => createLayoutDriver({
@@ -153,6 +153,22 @@ state = await installProtocols(addon, {
       // it back at the boundary. The plugin author is responsible for shape.
       // eslint-disable-next-line no-restricted-syntax
       return result as unknown as import("@overdraw/layout-types").LayoutResult;
+    },
+  }),
+  focusDriverFactory: (target) => createFocusDriver({
+    target,
+    decide: async (inputs) => {
+      if (!runtime) throw new Error("focus: runtime not initialized");
+      // The first focus dispatch (e.g. window-mapped on the very first
+      // client) can race plugin load; wait for the 'focus' namespace
+      // before invoking. After the first wait, subsequent calls go
+      // straight through.
+      await runtime.waitForNamespace("focus");
+      // eslint-disable-next-line no-restricted-syntax
+      const args = [inputs as unknown as import("./plugins/protocol.js").Json];
+      const result = await runtime.invokeNamespace("focus", "decide", args);
+      // eslint-disable-next-line no-restricted-syntax
+      return result as unknown as import("@overdraw/focus-types").FocusResult;
     },
   }),
 });
@@ -178,7 +194,9 @@ const bundledResolved = BUNDLED_PLUGINS.map((spec) => {
   const module = isPath
     ? pathToFileURL(resolvePath(process.cwd(), spec.module)).href
     : spec.module;
-  return bundledToResolved(spec, module);
+  // Pass the loaded user config so the spec's configFrom can extract its
+  // slice (e.g. config.focus for plugin-focus-default).
+  return bundledToResolved(spec, module, config);
 });
 
 const base = config.sourcePath ? dirname(config.sourcePath) : process.cwd();

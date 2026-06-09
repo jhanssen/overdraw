@@ -22,7 +22,8 @@ import { unmapAndTeardownSurface } from "./wl_surface.js";
 import { rebuildStackWithPopups, maybeDismissGrabbedPopup } from "./xdg_popup.js";
 import { configureToplevel } from "./xdg_surface.js";
 import type { Addon, EventsByInterface, EventSenders } from "../types.js";
-import type { Ctx, CompositorState, FocusOptions, CompositorSink } from "./ctx.js";
+import type { Ctx, CompositorState, CompositorSink } from "./ctx.js";
+import type { FocusDriver, FocusApplyTarget } from "./focus-driver.js";
 import { titleAppId } from "../query.js";
 import { WINDOW_EVENT } from "../events/types.js";
 import type { CompositorBus } from "../events/window-bus.js";
@@ -76,9 +77,6 @@ export interface Output { width: number; height: number; }
 
 export interface InstallOptions {
   output?: Output;
-  // Keyboard focus policy (interim config point until a real config system
-  // exists). Defaults to follow-pointer + focus-on-map.
-  focus?: FocusOptions;
   // Compositor backend. Defaults to the native addon (C++ Compositor). Pass a
   // JsCompositor to run the compositing pass in JS over the wire.
   compositor?: CompositorSink;
@@ -93,6 +91,12 @@ export interface InstallOptions {
     target: LayoutApplyTarget,
     snapshot: () => LayoutSnapshot,
   ) => LayoutDriver;
+  // Focus driver factory. main.ts passes a runtime-backed driver that
+  // invokes the 'focus' namespace plugin's decide(); GPU-free tests can
+  // pass an inline driver (synchronous fake) or omit (in which case the
+  // seat is constructed with a no-op driver that never changes focus).
+  // core-plugin-api.md §14.
+  focusDriverFactory?: (target: FocusApplyTarget) => FocusDriver;
 }
 
 // Wire the protocol layer onto a started server. `addon` is the native module
@@ -104,7 +108,6 @@ export async function installProtocols(
   opts: InstallOptions = {},
 ): Promise<CompositorState> {
   const output = opts.output ?? { width: 1920, height: 1080 };
-  const focusOpts: FocusOptions = opts.focus ?? { policy: "follow-pointer", focusOnMap: true };
   const mods = await loadSignatures();
 
   // Register every interface's signature so cross-references resolve (the
@@ -313,7 +316,8 @@ export async function installProtocols(
     wl_buffer: await import("./wl_buffer.js"),
     zwp_linux_dmabuf_v1: await import("./zwp_linux_dmabuf_v1.js"),
     zwp_linux_buffer_params_v1: await import("./zwp_linux_buffer_params_v1.js"),
-    wl_seat: await import("./wl_seat.js"),
+    // wl_seat is constructed via globalHandlers (it takes the focus driver
+    // as a second arg, which the generic HandlerFactory shape doesn't allow).
     wl_subcompositor: await import("./wl_subcompositor.js"),
     wl_output: await import("./wl_output.js"),
     wl_data_device_manager: await import("./wl_data_device_manager.js"),
@@ -338,10 +342,25 @@ export async function installProtocols(
     wl_callback: {}, // event-only (done); no requests to dispatch
   };
 
-  // wl_seat needs the focus options, so instantiate it explicitly (the generic
-  // factory call below would not pass them).
+  // Build the focus driver. It needs an apply target that routes back into
+  // the seat, but the seat isn't constructed yet -- use a lazy forwarder
+  // closure that resolves state.seat.applyKeyboardFocus after construction.
+  const applyTarget: FocusApplyTarget = {
+    applyKeyboardFocus(surfaceId) {
+      state.seat?.applyKeyboardFocus(surfaceId);
+    },
+  };
+  // If no factory was provided (GPU-free tests), use a no-op driver so the
+  // seat code's dispatchFocus calls become silent. Production main.ts
+  // passes a runtime-backed driver.
+  const focusDriver: FocusDriver = opts.focusDriverFactory
+    ? opts.focusDriverFactory(applyTarget)
+    : { dispatch: () => {}, settled: () => Promise.resolve() };
+
+  // wl_seat needs the focus driver; instantiate it explicitly (the generic
+  // factory call below would not pass it).
   const globalHandlers: Record<string, object> = {
-    wl_seat: seatMod.default(ctx, focusOpts),
+    wl_seat: seatMod.default(ctx, focusDriver),
     zwp_primary_selection_device_manager_v1: ddmMod.makePrimaryManager(ctx),
   };
 

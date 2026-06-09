@@ -1,0 +1,15 @@
+{
+  "name": "@overdraw/focus-types",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Shared canonical type definitions for the focus plugin namespace. Imported by both core (the focus driver) and any plugin claiming the 'focus' namespace. Type-only: no runtime code.",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
+  }
+}

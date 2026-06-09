@@ -23,8 +23,9 @@ test('parseConfigArg: space form, = form, absent', () => {
 test('loadConfig(null) returns a well-shaped resolved config', async () => {
   // XDG may or may not have a real file on the test host; assert only the shape.
   const c = await loadConfig(null);
-  assert.equal(typeof c.focus.policy, 'string');
-  assert.equal(typeof c.focus.focusOnMap, 'boolean');
+  // focus is now unknown (verbatim pass-through to the focus plugin); the
+  // bundled @overdraw/plugin-focus-default applies its own defaults when
+  // this is undefined.
   assert.ok(Array.isArray(c.plugins));
 });
 
@@ -37,8 +38,8 @@ test('object default export: validate + normalize + defaults applied', async () 
   const p = join(dir, 'config.mjs');
   writeFileSync(p, 'export default { focus: { policy: "click-to-focus" }, plugins: [{ module: "/x.js" }] }');
   const c = await loadConfig(p);
-  assert.equal(c.focus.policy, 'click-to-focus');
-  assert.equal(c.focus.focusOnMap, true); // default filled
+  // focus is passed through verbatim; core does not validate or apply defaults.
+  assert.deepEqual(c.focus, { policy: 'click-to-focus' });
   assert.equal(c.output, null);
   // plugins resolve to full entries with defaults + the original raw object.
   assert.deepEqual(c.plugins, [{
@@ -58,11 +59,16 @@ test('function default export is invoked (async)', async () => {
   rmSync(dir, { recursive: true, force: true });
 });
 
-test('invalid focus.policy rejected with clear message', async () => {
+test('focus is verbatim pass-through (core does NOT validate)', async () => {
+  // After Phase 3, focus config is owned by the active focus plugin.
+  // Core accepts any value (including nonsense); the focus plugin
+  // throws from init on bad config, which surfaces as a fatal startup
+  // error per the in-thread bundled-plugin contract.
   const dir = tmp();
   const p = join(dir, 'config.mjs');
   writeFileSync(p, 'export default { focus: { policy: "nope" } }');
-  await assert.rejects(() => loadConfig(p), /focus\.policy/);
+  const c = await loadConfig(p);
+  assert.deepEqual(c.focus, { policy: 'nope' });
   rmSync(dir, { recursive: true, force: true });
 });
 
@@ -114,7 +120,7 @@ test('XDG resolution probes config.* and loads it', async () => {
   try {
     assert.equal(resolveConfigPath(null), p);
     const c = await loadConfig(null);
-    assert.equal(c.focus.focusOnMap, false);
+    assert.deepEqual(c.focus, { focusOnMap: false });
   } finally {
     if (prev === undefined) delete process.env.XDG_CONFIG_HOME;
     else process.env.XDG_CONFIG_HOME = prev;

@@ -13,8 +13,8 @@ import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
-const bin = join(__dirname, "..", "build", "wire-barrier-test");
-const skip = existsSync(bin) ? false : "build/wire-barrier-test not built (run cmake --build build)";
+const bin = join(__dirname, "..", "packages", "core", "build", "wire-barrier-test");
+const skip = existsSync(bin) ? false : "packages/core/build/wire-barrier-test not built";
 
 test("ipc::WireBarrier deferred-action FIFO + cancel + drainAll", { skip }, async () => {
   const { code, stdout, stderr } = await new Promise((resolve) => {

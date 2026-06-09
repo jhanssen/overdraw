@@ -22,17 +22,16 @@ import type { DynamicBus, Subscription } from "../events/dynamic-bus.js";
 import { NamespaceRegistry } from "./namespace-registry.js";
 import type { Registration } from "./namespace-registry.js";
 import { ActionRegistry } from "./action-registry.js";
+import { InThreadPlugin } from "./inthread-plugin.js";
+import type { PluginController, PluginHandle, PluginState } from "./plugin-host.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 // The built bootstrap (this file lives in dist/plugins/ after tsc).
 const BOOTSTRAP = join(__dirname, "bootstrap.js");
 
-// Lifecycle states (architecture.md "Lifecycle").
-export type PluginState =
-  | "spawning"     // Worker created, awaiting init(sdk) to resolve
-  | "live"         // init resolved; watchdog running; events flow
-  | "shutting-down" // graceful onShutdown in progress
-  | "failed";      // permanently failed (restart budget exhausted, or restart="never")
+// Lifecycle states are shared with the in-thread bundled-plugin transport.
+// See plugin-host.ts.
+export type { PluginState } from "./plugin-host.js";
 
 // Tunables (injectable for fast tests). Defaults match architecture.md intent.
 export interface RuntimeOptions {
@@ -68,24 +67,7 @@ export interface RuntimeOptions {
   bus?: DynamicBus;
 }
 
-// Per-plugin controller passed by the runtime to each ManagedPlugin. The
-// plugin's request handler calls these for the cross-plugin messages
-// (namespace.* and actions.*). The runtime owns the registries and knows
-// about every plugin, so it can route invocations across plugins.
-interface PluginController {
-  // -- namespace registry (core-plugin-api.md §11) --
-  registry(): NamespaceRegistry;
-  onRegister(pluginName: string, payload: unknown): void;
-  onUnregister(pluginName: string, payload: unknown): void;
-  onInvoke(callerName: string, payload: unknown): Promise<Json>;
-  onWaitForActive(callerName: string, payload: unknown): Promise<Json>;
-  // -- action registry (core-plugin-api.md §10) --
-  actions(): ActionRegistry;
-  onActionRegister(pluginName: string, payload: unknown): void;
-  onActionUnregister(pluginName: string, payload: unknown): void;
-  onActionInvoke(callerName: string, payload: unknown): Promise<Json>;
-  onActionList(callerName: string, payload: unknown): Promise<Json>;
-}
+// PluginController is now in plugin-host.ts (shared with InThreadPlugin).
 
 export const DEFAULT_OPTIONS: RuntimeOptions = {
   heapMb: 128,
@@ -95,7 +77,7 @@ export const DEFAULT_OPTIONS: RuntimeOptions = {
 };
 
 // A managed plugin: its config, current Worker generation, and lifecycle state.
-class ManagedPlugin {
+class ManagedPlugin implements PluginHandle {
   readonly cfg: ResolvedPlugin;
   private opts: RuntimeOptions;
   private log: (msg: string) => void;
@@ -157,6 +139,12 @@ class ManagedPlugin {
     const worker = new Worker(bootstrap, {
       workerData: {
         module: this.cfg.module, name: this.cfg.name,
+        // Per-plugin config: BundledPluginSpec.config (bundled) or the
+        // user-config plugin entry's raw config (user plugins). Verbatim
+        // pass-through per core-plugin-api.md "Per-bundled-plugin config"
+        // decision. The plugin's init(sdk, config?) receives it; init that
+        // doesn't take config simply ignores the second arg.
+        config: this.cfg.raw,
         pluginAddonPath: this.opts.pluginAddonPath, dawnPath: this.opts.dawnPath,
       },
       resourceLimits: { maxOldGenerationSizeMb: this.opts.heapMb },
@@ -414,9 +402,9 @@ class ManagedPlugin {
   get restartCount(): number { return this.restartTimes.length; }
 }
 
-// The registry: owns all managed plugins.
+// The registry: owns all managed plugins (Worker-mode + in-thread bundled).
 export class PluginRuntime implements PluginController {
-  private plugins: ManagedPlugin[] = [];
+  private plugins: PluginHandle[] = [];
   private opts: RuntimeOptions;
   // Plugin namespace registry (sdk.registerPlugin / sdk.plugin). Shared
   // across all managed plugins; the runtime is the controller.
@@ -444,12 +432,29 @@ export class PluginRuntime implements PluginController {
   }
 
   // Spawn every configured plugin and await each one's first settle (live or
-  // failed). Returns the managed handles (for introspection / tests).
+  // failed). Bundled plugins (cfg.bundled === true) use the in-thread
+  // transport (InThreadPlugin); user plugins use the Worker transport
+  // (ManagedPlugin) -- per the "Bundled plugins run in-thread" decision in
+  // core-plugin-api.md.
   async load(configs: readonly ResolvedPlugin[]): Promise<void> {
     for (const cfg of configs) {
-      const p = new ManagedPlugin(cfg, this.opts, this);
+      let p: PluginHandle;
+      if (cfg.bundled) {
+        const itp = new InThreadPlugin(cfg, {
+          log: this.opts.log,
+          onEvent: this.opts.onEvent,
+          onRequest: this.opts.onRequest,
+          bus: this.opts.bus,
+          shutdownTimeoutMs: this.opts.shutdownTimeoutMs,
+        }, this);
+        itp.spawn();
+        p = itp;
+      } else {
+        const mp = new ManagedPlugin(cfg, this.opts, this);
+        mp.spawn();
+        p = mp;
+      }
       this.plugins.push(p);
-      p.spawn();
     }
     await Promise.all(this.plugins.map((p) => p.ready));
   }

@@ -4,7 +4,7 @@ Ground truth for what exists right now: current capabilities, known gaps, and
 what remains. The design lives in `architecture.md`; this file does not restate
 it. Present-tense only — no change history.
 
-Last updated: 2026-06-08.
+Last updated: 2026-06-08 (post-Phase 3).
 
 ## Read first: gaps in advertised protocols (silent-gap risks)
 
@@ -302,10 +302,19 @@ pointer + keyboard; `handleInput` hit-tests the WM window stack (`wm.windowAt`),
 tracks focus, and emits enter/leave/motion/button/axis/frame +
 key/modifiers to the focused client's resources with surface-local coordinates.
 
-- **Focus policy** is configurable (`FocusOptions`): pointer always follows the
-  pointer; keyboard focus is `follow-pointer` (default) or `click-to-focus`.
-  `focusOnMap` (default true) gives a freshly-mapped window keyboard focus so a
-  launched app is typeable immediately.
+- **Focus policy is a bundled plugin** (`@overdraw/plugin-focus-default`,
+  Phase 3 of `build-order.md`). Pointer always follows the pointer; the
+  seat is policy-free for keyboard focus and dispatches `decide()` on
+  coarse events (pointer-enter / pointer-leave / pointer-button /
+  window-mapped / window-unmapped / explicit) to the active plugin in the
+  `'focus'` namespace via the focus driver
+  (`packages/core/src/protocols/focus-driver.ts`). Fire-and-forget:
+  `handleInput` does not await the result; sequence-tagged dispatches
+  discard stale results so the pointer path stays synchronous. The
+  bundled plugin implements `follow-pointer` (default) and
+  `click-to-focus`, plus `focusOnMap` (default true). Config flows in
+  through the bundled-plugin config channel (the user's `config.focus`
+  is passed verbatim to the plugin's init; core does not validate).
 - **Keymap + modifiers** (`native/wayland/keymap.{h,cpp}`, xkbcommon): a default
   keymap is compiled to a sealed memfd, sent via `wl_keyboard.keymap` (XKB_V1, fd
   delivered through the trampoline fd-encode path); each host key feeds xkb state
@@ -575,6 +584,74 @@ sequencing.
 Authentication is filesystem permissions on the socket; no token / per-
 caller auth.
 
+### In-thread bundled plugin transport + config channel (Phase 3)
+
+Bundled plugins (those listed in `BUNDLED_PLUGINS`) load in-thread on
+the main event loop, not in a worker_threads Worker. User-installed
+plugins continue through the Worker path unchanged. Selection is by
+`ResolvedPlugin.bundled`; the runtime branches on it in `load()`. The
+SDK contract is uniform across both transports (every call returns a
+Promise), but the in-thread path resolves on the next microtask via
+direct call -- no postMessage, no structured clone, no watchdog
+ping/pong, no `resourceLimits`. Bundled plugins are core's own code
+and are trusted at the same level.
+
+- **Pair channel** (`packages/core/src/plugins/pair-channel.ts`): two
+  in-memory `Channel`s connected back-to-back. Either end's
+  `postMessage` delivers to the other end's listener on the next
+  microtask. The Endpoint (Worker path's transport adapter) talks to
+  this channel unchanged -- the transport-agnostic shape is what makes
+  the same SDK construction code run on both paths.
+- **Loader extraction** (`packages/core/src/plugins/loader.ts`): the
+  generic body of the former `bootstrap.ts` (build SDK; dynamic-import
+  the plugin module; call `init(sdk, config?)`; report init result).
+  `bootstrap.ts` is now a thin Worker entry that grabs `parentPort` and
+  delegates; `inthread-plugin.ts` calls it on the main thread with the
+  paired channel's other end.
+- **InThreadPlugin** (`packages/core/src/plugins/inthread-plugin.ts`):
+  implements the same `PluginHandle` interface as `ManagedPlugin`
+  (`packages/core/src/plugins/plugin-host.ts`), so the runtime holds a
+  mixed list. Failure handling differs: init throws are fatal startup
+  errors (no respawn); per-call exceptions from registered methods are
+  caught at the Endpoint boundary, logged, treated as null/empty result;
+  the plugin stays registered. User-facing diagnostic surfacing is TBD.
+
+**Per-bundled-plugin config channel.** Plugin `init` now takes a second
+arg: `init(sdk, config?: unknown)`. Core passes the value verbatim --
+no validation; the plugin owns its schema. For bundled plugins, the
+config slice comes from the user config via `BundledPluginSpec.configFrom`
+(e.g. `(config) => config.focus` for `plugin-focus-default`). For user
+plugins, the slice is `ResolvedPlugin.raw` (the user's full plugin entry).
+Plugins that don't take config simply ignore the second arg.
+
+### Bundled plugins extracted from core (Phase 2 + 3)
+
+- **`@overdraw/plugin-layout-master-stack`** (Phase 2): master-stack
+  tiling. Namespace `'layout'`, priority 0. Core seam:
+  `packages/core/src/wm/layout-driver.ts`. Type contract:
+  `@overdraw/layout-types`. Migrated to the in-thread transport in
+  Phase 3 (no plugin code change; the runtime picks transport based on
+  `bundled: true`).
+- **`@overdraw/plugin-focus-default`** (Phase 3): follow-pointer +
+  click-to-focus, plus focusOnMap. Namespace `'focus'`, priority 0.
+  Internal state machine in `policy.ts`; pure (no async, no SDK
+  references) and tested in isolation. Core seam:
+  `packages/core/src/protocols/focus-driver.ts` (dispatches `decide()`
+  fire-and-forget; applies result via the seat's `applyKeyboardFocus`).
+  Type contract: `@overdraw/focus-types` (FocusAPI is `decide()`-only;
+  no `getMode` / named modes / `'custom'` -- the bundled plugin is the
+  named-mode floor, and any alternative focus plugin replaces it
+  end-to-end). Config flows in from the user's `config.focus`
+  verbatim; the plugin validates and throws on bad schema (manifests
+  as a fatal startup error).
+
+**`sdk.windows.focus(id)`** (Phase 3): explicit focus override. Bypasses
+the focus plugin's `decide()` and applies via the seat directly. For
+policy-mediated focus, plugins emit an event the focus plugin observes
+(or wait for one of the standard coarse events). The `'explicit'`
+`decide()` reason is reserved for future paths where a caller wants the
+plugin's policy to apply (e.g. an IPC action that delegates).
+
 ### Decoration provider (registration + insets + drawing + atomic gating)
 
 Server-side decorations end to end: a plugin registers an app_id pattern, is told
@@ -663,17 +740,25 @@ decorations: `overlay.test.js`, `decorations.test.js`,
 `window-events.test.js` + `window-changes.test.js` (bus + observer +
 coalescing, incl. a real Worker), `dynamic-bus.test.js` (pattern subscribe
 + plugin emit), `sdk-events.test.js`, `sdk-windows.test.js`,
-`windows-broker-output-stack.test.js`. Namespace / actions registries
+`windows-broker-output-stack.test.js` (includes the `windows.focus`
+explicit-override path added in Phase 3). Namespace / actions registries
 (Phase 0b/0c): `namespace-registry.test.js`, `sdk-namespace.test.js`,
 `action-registry.test.js`, `sdk-actions.test.js`. IPC (Phase 1):
 `ipc-protocol.test.js`, `ipc-server.test.js`. Plugin runtime:
 `plugins.test.js` (real Workers + real fixture plugins:
-live/failed/graceful-stop/watchdog-terminate/OOM/independence). Buffers /
-wire / fds: `client-buffer-lifecycle.test.js`, `wire-barrier.test.js`,
+live/failed/graceful-stop/watchdog-terminate/OOM/independence). Phase 3:
+`inthread-plugin.test.js` (in-thread bundled transport: register +
+invoke; init throw -> failed state with no respawn; per-bundled-plugin
+config channel verbatim pass-through);
+`test/plugin-focus-default/policy.test.js` (the follow-pointer /
+click-to-focus state machine in isolation + validateConfig);
+`test/plugin-focus-default/integration.test.js` (focus driver + real
+runtime + bundled plugin end to end; stale-result discard; bad-config
+init throw). Buffers / wire / fds:
+`client-buffer-lifecycle.test.js`, `wire-barrier.test.js`,
 `scm-rights.test.js`. Server-only smokes: `server.test.js`,
 `trampoline.test.js`, `fd-passing.test.js`, `xdg-shell.test.js`, shared
-`server-helpers.mjs`, one server lifecycle per file. No native build,
-no GPU.
+`server-helpers.mjs`, one server lifecycle per file.
 
 ### State-query channel (`packages/core/src/query.ts`)
 
@@ -685,13 +770,16 @@ integration harness asserts against without pixels.
 ### Integration / GPU (`npm run test:gpu` → `node --test 'test/*.gpu.mjs'`)
 
 Require GPU + host Wayland (auto-skip when `WAYLAND_DISPLAY` unset), run with
-`--test-concurrency=1`. `test/harness.mjs` brings up GPU process + present loop +
-server + protocols with input routed; `spawnClient` (resolves on the client's
-"mapped" stdout line), `waitFor(query, pred)` (polls while yielding to libuv), and
-`teardown()` that asserts no GPU process leaked (scan by exact comm
-`overdraw-gpu-pr`). Synthetic input at two depths: `addon.injectInput` (straight
-into the `InputSink`) and `addon.injectHostInput` (through the real
-`WaylandInputBackend` normalization, round-tripping `wl_fixed_t`).
+`--test-concurrency=1`. `test/harness.mjs` brings up GPU process + present
+loop + server + protocols + plugin runtime with the bundled plugins
+(layout + focus) loaded in-thread, with layout + focus driver factories
+wired against the runtime; `spawnClient` (resolves on the client's
+"mapped" stdout line), `waitFor(query, pred)` (polls while yielding to
+libuv), and `teardown()` (stops the runtime, then the addon; asserts no
+GPU process leaked, scanning by exact comm `overdraw-gpu-pr`). Synthetic
+input at two depths: `addon.injectInput` (straight into the `InputSink`)
+and `addon.injectHostInput` (through the real `WaylandInputBackend`
+normalization, round-tripping `wl_fixed_t`).
 
 Coverage: `integration.gpu.mjs` (map→query, stacking, focus-on-map,
 follow-pointer, click-to-focus, plus host-path input);
@@ -764,24 +852,26 @@ capabilities exist to grant).
   layout do not react to those hints. This is the gate for the `xdg_toplevel`
   WM-state silent-gap items in "Read first", and for any user-driven
   interactive move/resize/keybinding feature.
-- **Focus policy still in core.** `follow-pointer`/`click-to-focus`/
-  `focusOnMap` live in `packages/core/src/protocols/wl_seat.ts`, not in
-  a plugin. Phase 3 extracts this into a bundled `'focus'`-namespace
-  plugin per `build-order.md`.
 - **`wl_output` reconfiguration + host-window resize.** See "Read first".
 - **Display-driven frame clock.** See "Read first" and architecture.md.
+- **User-facing diagnostic surfacing.** Plugin errors (in-thread init
+  throws, per-call method exceptions, bad config from the focus plugin's
+  validateConfig) currently only log. A real channel for surfacing them
+  to the user (status-bar notification, IPC event, CLI command) is open
+  per the corresponding open item in `core-plugin-api.md`.
 - **Plugin SDK breadth.** Built: scope-B runtime + `sdk.gpu.createOverlay`
   + `sdk.window` observer + `sdk.decorations`; namespace registry + action
   registry + dynamic event bus (Phase 0); `sdk.windows` hint setters +
   state bag + snapshots + `setOutputStack` (Phase 0d/0e); IPC JSON-RPC
-  server + `overdrawctl` (Phase 1). Not built: per-surface state
-  primitives (opacity/mask/transform/output-margin per
-  `core-plugin-api.md` §1, scheduled Phase 4a); `sdk.compose` /
-  `sdk.transitions` (Phases 5, 8); animation evaluator (Phase 4); cursor
-  / closing / velocity (Phase 9); input chain (`sdk.input.bind`, Phase
-  7); output observation beyond a fabricated `wl_output`; protocol SDK
-  surface; interactive-region hit-testing; `sdk.onFrame` (animation uses
-  a plugin-driven loop today).
+  server + `overdrawctl` (Phase 1); in-thread bundled-plugin transport +
+  per-bundled-plugin config channel + `sdk.windows.focus(id)` (Phase 3).
+  Not built: per-surface state primitives
+  (opacity/mask/transform/output-margin per `core-plugin-api.md` §1,
+  scheduled Phase 4a); `sdk.compose` / `sdk.transitions` (Phases 5, 8);
+  animation evaluator (Phase 4); cursor / closing / velocity (Phase 9);
+  input chain (`sdk.input.bind`, Phase 7); output observation beyond a
+  fabricated `wl_output`; protocol SDK surface; interactive-region
+  hit-testing; `sdk.onFrame` (animation uses a plugin-driven loop today).
 - **Capability enforcement.** No capability gate on `sdk.gpu`/`sdk.window`/
   `sdk.decorations` (every plugin gets them); no native-import restriction (a
   plugin's `import()` is unrestricted — deferred until there is an SDK native addon

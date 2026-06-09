@@ -3,6 +3,8 @@
   "references": [
     { "path": "./packages/layout-types" },
     { "path": "./packages/plugin-layout-master-stack" },
+    { "path": "./packages/focus-types" },
+    { "path": "./packages/plugin-focus-default" },
     { "path": "./packages/core" }
   ]
 }

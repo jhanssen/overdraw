@@ -20,18 +20,13 @@ import { pathToFileURL } from "node:url";
 
 import type {
   ConfigExport, OverdrawConfig, PluginConfig, ResolvedConfig, ResolvedPlugin,
-  FocusPolicy, RestartPolicy,
+  RestartPolicy,
 } from "./types.js";
 
 const CONFIG_EXTS = ["ts", "cts", "mts", "js", "cjs", "mjs"] as const;
-const FOCUS_POLICIES: readonly FocusPolicy[] = ["follow-pointer", "click-to-focus"];
 const RESTART_POLICIES: readonly RestartPolicy[] = ["on-failure", "never"];
 
 const PLUGIN_DEFAULTS = { restart: "on-failure" as RestartPolicy, maxRestarts: 3, windowSeconds: 60 };
-
-const DEFAULTS = {
-  focus: { policy: "follow-pointer" as FocusPolicy, focusOnMap: true },
-};
 
 // Pull `--config <path>` / `--config=<path>` out of an argv-style array.
 // Returns the path, or null if absent.
@@ -97,22 +92,12 @@ function normalize(raw: unknown, path: string): ResolvedConfig {
     }
   }
 
-  // focus
-  const focus = { ...DEFAULTS.focus };
-  if (cfg.focus !== undefined) {
-    const f = cfg.focus;
-    if (f === null || typeof f !== "object") fail("`focus` must be an object", path);
-    if (f.policy !== undefined) {
-      if (!FOCUS_POLICIES.includes(f.policy)) {
-        fail(`\`focus.policy\` must be one of ${FOCUS_POLICIES.map((p) => `"${p}"`).join(", ")}`, path);
-      }
-      focus.policy = f.policy;
-    }
-    if (f.focusOnMap !== undefined) {
-      if (typeof f.focusOnMap !== "boolean") fail("`focus.focusOnMap` must be a boolean", path);
-      focus.focusOnMap = f.focusOnMap;
-    }
-  }
+  // focus: verbatim pass-through to the focus plugin's config. Core does
+  // not validate -- the active focus plugin owns its schema (and surfaces
+  // schema violations as a fatal init throw per the in-thread bundled-
+  // plugin contract; for the bundled focus plugin that is
+  // `@overdraw/plugin-focus-default`'s validateConfig()).
+  const focus: unknown = cfg.focus;
 
   // plugins
   const plugins: ResolvedPlugin[] = [];
@@ -158,7 +143,7 @@ function normalize(raw: unknown, path: string): ResolvedConfig {
 export async function loadConfig(explicit: string | null): Promise<ResolvedConfig> {
   const path = resolveConfigPath(explicit);
   if (path === null) {
-    return { output: null, focus: { ...DEFAULTS.focus }, plugins: [], sourcePath: null };
+    return { output: null, focus: undefined, plugins: [], sourcePath: null };
   }
   const mod = (await import(pathToFileURL(path).href)) as { default?: ConfigExport };
   if (mod.default === undefined) fail("file has no default export", path);

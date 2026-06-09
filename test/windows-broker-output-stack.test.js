@@ -83,6 +83,62 @@ test('set-output-stack: array with non-numbers throws', () => {
     /malformed payload/);
 });
 
+// ---- windows.focus (explicit-override path; core-plugin-api.md §1) ---------
+
+// A minimal seat stub: records applyKeyboardFocus calls.
+function brokerWithSeat() {
+  const seatCalls = [];
+  const sink = mockSink();
+  const wm = createWm(sink, { width: 800, height: 600 });
+  const bus = createCompositorBus();
+  const pluginBus = new DynamicBus();
+  const state = makeState(wm, bus);
+  state.seat = { applyKeyboardFocus: (id) => seatCalls.push(id) };
+  const broker = createWindowsBroker({
+    wm, compositor: sink, state, pluginBus, bus,
+  });
+  return { broker, seatCalls };
+}
+
+test('windows.focus: forwards id to seat.applyKeyboardFocus', () => {
+  const { broker, seatCalls } = brokerWithSeat();
+  broker('p', 'windows.focus', { id: 42 });
+  assert.deepEqual(seatCalls, [42]);
+});
+
+test('windows.focus: null clears focus via the seat', () => {
+  const { broker, seatCalls } = brokerWithSeat();
+  broker('p', 'windows.focus', { id: null });
+  assert.deepEqual(seatCalls, [null]);
+});
+
+test('windows.focus: missing id throws malformed payload', () => {
+  const { broker } = brokerWithSeat();
+  assert.throws(() => broker('p', 'windows.focus', {}), /malformed payload/);
+});
+
+test('windows.focus: non-number, non-null id throws', () => {
+  const { broker } = brokerWithSeat();
+  assert.throws(() => broker('p', 'windows.focus', { id: 'oops' }),
+    /malformed payload/);
+});
+
+test('windows.focus: no seat bound -> silent no-op', () => {
+  // state.seat is null until installProtocols runs; the broker should
+  // tolerate this (some lifecycle stage where the seat doesn't exist).
+  const sink = mockSink();
+  const wm = createWm(sink, { width: 800, height: 600 });
+  const bus = createCompositorBus();
+  const pluginBus = new DynamicBus();
+  const broker = createWindowsBroker({
+    wm, compositor: sink, state: makeState(wm, bus), pluginBus, bus,
+  });
+  // No throw; returns null.
+  assert.equal(broker('p', 'windows.focus', { id: 42 }), null);
+});
+
+// ---- set-output-stack (cont.) ----------------------------------------------
+
 test('set-output-stack: missing compositor.setOutputStack rejects', () => {
   // Use a sink without setOutputStack (the protocol marks it optional).
   const sinkNoOut = {

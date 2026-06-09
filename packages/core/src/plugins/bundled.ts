@@ -7,15 +7,19 @@
 // Dynamic discovery (looking for node_modules/@overdraw/plugin-*) is rejected
 // as fragile (security concern: any matching package would auto-load).
 //
-// Currently empty: Phase 2 (layout extraction) introduces the first bundled
-// plugin. The shape is here so that lands as a one-line addition to the
-// BUNDLED_PLUGINS list.
+// Per Phase 3 of build-order.md, bundled plugins run in-thread (cf.
+// inthread-plugin.ts) rather than in a worker_threads Worker. The transport
+// is invisible to the plugin author; the runtime selects it via the
+// ResolvedPlugin.bundled flag.
 //
 // Bundled plugin entries are resolved at runtime: the module path is computed
 // either as a bare specifier (resolved relative to the overdraw root via
 // require.resolve) or as a filesystem path (for tests / dev installations).
+// Per-plugin config is computed from the user's loaded config (e.g.
+// config.focus -> focus-default's config) and threaded through the
+// in-thread loader.
 
-import type { ResolvedPlugin } from "../config/types.js";
+import type { ResolvedPlugin, ResolvedConfig } from "../config/types.js";
 
 // One bundled plugin descriptor. Keep this small; bundled plugins are core's
 // own code, so most settings (restart policy etc.) get defaults that match
@@ -26,6 +30,11 @@ export interface BundledPluginSpec {
   // Either a bare module specifier (e.g. "@overdraw/plugin-layout-master-stack")
   // or an absolute path. main.ts resolves and converts to a file:// URL.
   module: string;
+  // Pull the per-plugin config value out of the loaded user config.
+  // Returns undefined when the user did not specify anything relevant; the
+  // plugin's init receives undefined and applies its defaults. The default
+  // for plugins that take no config is to omit this function.
+  configFrom?: (config: ResolvedConfig) => unknown;
 }
 
 // The canonical list of bundled plugins. Each ships with overdraw and is
@@ -41,16 +50,36 @@ export const BUNDLED_PLUGINS: ReadonlyArray<BundledPluginSpec> = [
     // namespace; replaceable by a higher-priority user plugin.
     name: "layout-master-stack",
     module: "@overdraw/plugin-layout-master-stack",
+    // No user-config knob today (params are plugin-internal defaults).
+  },
+  {
+    // Default focus policy plugin (follow-pointer / click-to-focus +
+    // focusOnMap). The floor of the 'focus' namespace.
+    name: "focus-default",
+    module: "@overdraw/plugin-focus-default",
+    configFrom: (config) => config.focus,
   },
 ];
 
 // Convert a bundled plugin spec to a ResolvedPlugin (the runtime's loading
 // shape). The module string is whatever the caller resolved it to (file:// URL
-// or bare specifier). Restart policy is "on-failure" with the normal budget;
-// bundled plugins are core's own code so they shouldn't fail, but if they do
-// the priority-chain fallback handles it (next-lower in the namespace, often
-// nothing -- so a bundled-plugin failure manifests as a degraded system).
-export function bundledToResolved(spec: BundledPluginSpec, module: string): ResolvedPlugin {
+// or bare specifier). The resolvedConfig is the loaded user config (so the
+// spec's configFrom can pull out the relevant subset).
+//
+// Restart policy is "on-failure" / 3 / 60s by tradition; in-thread bundled
+// plugins ignore these fields (in-thread failures are fatal, no respawn) but
+// they're set for symmetry with the Worker path's ResolvedPlugin shape.
+export function bundledToResolved(
+  spec: BundledPluginSpec,
+  module: string,
+  resolvedConfig?: ResolvedConfig,
+): ResolvedPlugin {
+  // Compute the per-plugin config slice from the user config (if any). The
+  // plugin's init(sdk, config) receives this. Passing through verbatim --
+  // core does NOT validate; the plugin owns its config schema.
+  const raw = resolvedConfig && spec.configFrom
+    ? spec.configFrom(resolvedConfig)
+    : { module: spec.module, name: spec.name };
   return {
     module,
     name: spec.name,
@@ -58,6 +87,6 @@ export function bundledToResolved(spec: BundledPluginSpec, module: string): Reso
     maxRestarts: 3,
     windowSeconds: 60,
     bundled: true,
-    raw: { module: spec.module, name: spec.name },
+    raw,
   };
 }
