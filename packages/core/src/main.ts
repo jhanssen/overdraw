@@ -23,6 +23,8 @@ import { createOverlayBroker } from "./overlay.js";
 import { createGpuBroker } from "./plugins/gpu-broker.js";
 import { createDecorationBroker } from "./plugins/decoration-broker.js";
 import { createWindowsBroker, NOT_HANDLED as WINDOWS_NOT_HANDLED } from "./plugins/windows-broker.js";
+import { createAnimationsBroker, NOT_HANDLED as ANIM_NOT_HANDLED } from "./plugins/animations-broker.js";
+import { createEvaluator } from "./animations/evaluator.js";
 import { BUNDLED_PLUGINS, bundledToResolved } from "./plugins/bundled.js";
 import { JsCompositor } from "./gpu/compositor.js";
 import type { DawnWire, DawnGlobals } from "./gpu/compositor.js";
@@ -219,6 +221,13 @@ const windowsBroker = createWindowsBroker({
   wm: state.wm, compositor, state, pluginBus, bus,
 });
 
+// Animation evaluator + broker (core-plugin-api.md §9). The evaluator
+// ticks once per compositor frame from state.beforeRender (wired below);
+// the broker routes plugin animations.run / cancel requests to it.
+const evaluator = createEvaluator(compositor);
+const animationsBroker = createAnimationsBroker(evaluator);
+state.beforeRender = (timeMs: number): void => { evaluator.tick(timeMs); };
+
 // The runtime is created unconditionally so the IPC server has an action
 // registry to dispatch against even before any plugin is loaded. load() is
 // called with the combined bundled + user-config plugin set (possibly
@@ -251,6 +260,13 @@ runtime = new PluginRuntime({
       const r = windowsBroker(plugin, method, params);
       if (r === WINDOWS_NOT_HANDLED) {
         throw new Error(`no handler for windows method '${method}'`);
+      }
+      return r;
+    }
+    if (method.startsWith("animations.")) {
+      const r = animationsBroker(plugin, method, params);
+      if (r === ANIM_NOT_HANDLED) {
+        throw new Error(`no handler for animations method '${method}'`);
       }
       return r;
     }

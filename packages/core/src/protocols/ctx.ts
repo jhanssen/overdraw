@@ -135,6 +135,13 @@ export interface CompositorState {
   // Fire all surfaces' pending wl_surface.frame callbacks (set by installProtocols;
   // called once per compositor frame). timeMs is a millisecond timestamp.
   dispatchFrameCallbacks?: (timeMs: number) => void;
+  // Run just before the per-frame renderFrame. Used by the animation
+  // evaluator (core-plugin-api.md §9) to advance active animations and
+  // write the new per-surface state values for this frame. Set by
+  // main.ts after creating the evaluator; tests omitting an evaluator
+  // leave this unset (the protocols frame sweep then just runs the
+  // wl_surface.frame callbacks + renderFrame, as before).
+  beforeRender?: (timeMs: number) => void;
   // State-query channel: snapshot compositor state (geometry/focus/stack) for
   // tests + introspection, without reading pixels. Set by installProtocols.
   query?: () => import("../query.js").StateSnapshot;

@@ -287,6 +287,12 @@ export async function installProtocols(
       }
     }
 
+    // Animation evaluator: advance active animations and write the new
+    // per-surface state values for this frame. Runs BEFORE renderFrame so
+    // the compositor's submit reads the updated uniforms. main.ts sets
+    // beforeRender; tests / harnesses without an evaluator leave it unset.
+    state.beforeRender?.(timeMs);
+
     // JS compositor: render the frame now that layout/stack reflect this frame's
     // commits + any newly-mapped windows. The native path renders on its own
     // libuv timer, so its renderFrame is undefined (no-op here).

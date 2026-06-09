@@ -678,6 +678,58 @@ policy-mediated focus, plugins emit an event the focus plugin observes
 `decide()` reason is reserved for future paths where a caller wants the
 plugin's policy to apply (e.g. an IPC action that delegates).
 
+### Animation evaluator (Phase 4b)
+
+`sdk.animations.run(spec)` / `sdk.animations.cancel(target)`
+(core-plugin-api.md §9). Plugins submit a declarative `AnimationSpec`;
+core evaluates per compositor frame and writes the result through the
+per-surface render state primitives (Phase 4a:
+`setSurfaceOpacity` / `setSurfaceTransform` / `setSurfaceOutputMargin`).
+One IPC call per animation regardless of duration -- the evaluator
+ticks in-core.
+
+- **Spec format**
+  (`packages/core/src/animations/spec.ts`): `tween` (cubic-bezier
+  easing + the four CSS presets), `spring` (semi-implicit Euler with
+  rest-velocity threshold; default stiffness 200, damping 20, mass 1),
+  `sequence` (await items in order), `parallel` (await all items
+  concurrently). `decay` / `keyframes` / `stagger` are deferred until
+  concrete use cases demand them (per `core-plugin-api.md` "v1
+  minimal"). User-function easings are not supported (not
+  serializable); cubic-bezier covers the same envelope.
+- **Targets**: `window-opacity`, `window-transform` (full
+  translate+scale object), `window-output-margin` (full margin
+  object). One active leaf per (kind, windowId) at a time --
+  cancel-on-replacement: a new leaf on the same target preempts the
+  prior one (its `run()` Promise resolves cleanly, then the new leaf
+  starts on the next tick). `cancel(target)` resolves the same way.
+- **Evaluator** (`packages/core/src/animations/evaluator.ts`): holds
+  the active leaf list keyed by `targetKey`; `tick(timeMs)` computes
+  dt against the last tick, clamps to 100ms (covers first-tick / long-
+  pause gaps without spawning huge accelerations), and steps each leaf
+  once. Writes results via `CompositorSink` setters. Composite specs
+  (sequence / parallel) unfold into leaves whose Promises the
+  composite awaits.
+- **Frame integration**: the evaluator's `tick(timeMs)` runs from
+  `protocols/index.ts`'s `dispatchFrameCallbacks` via the new
+  `state.beforeRender(timeMs)` hook, BEFORE the compositor's
+  `renderFrame()`. Same `timeMs` the wl_surface.frame callbacks see;
+  no separate clock. The hook is optional (GPU-free tests omitting
+  the evaluator leave it unset).
+- **From-required-in-v1**: `from` is required on tween / spring specs.
+  When the evaluator gets a value-cache reading the surface's current
+  state (to default `from` from there), this becomes optional --
+  open per `core-plugin-api.md` §9.
+- **Tests**: `test/animations-evaluator.test.js` (pure-unit, 15 tests:
+  tween linear / preset easings / clamping / zero-duration / transform
+  multi-field; spring overshoot + settle + critically-damped
+  no-overshoot; cancel-on-replacement; sequence / parallel
+  completion; payload validation), `test/animations-broker.test.js`
+  (pure-unit, 7 tests: routing + malformed-payload rejection),
+  `test/inthread-animation.gpu.mjs` (GPU integration via a bundled
+  in-thread plugin running `sdk.animations.run` on opacity; readback
+  at midpoint + completion).
+
 ### Decoration provider (registration + insets + drawing + atomic gating)
 
 Server-side decorations end to end: a plugin registers an app_id pattern, is told
@@ -820,7 +872,8 @@ keyboard delivery via the host path); the JS-compositor suite
 (`plugin-overlay*.gpu.mjs`, `worker-gpu.gpu.mjs`, `decoration-*.gpu.mjs`
 incl. `decoration-two-windows.gpu.mjs`, `example-decoration.gpu.mjs`,
 `inthread-gpu.gpu.mjs` for the in-thread bundled-plugin core-device path,
-`inthread-mask.gpu.mjs` for sdk.windows.setMask via a real bundled plugin);
+`inthread-mask.gpu.mjs` for sdk.windows.setMask via a real bundled plugin,
+`inthread-animation.gpu.mjs` for sdk.animations.run end-to-end);
 per-surface render state primitives (`compositor-fx.gpu.mjs`).
 
 ### Protocol coverage matrix
@@ -893,14 +946,15 @@ capabilities exist to grant).
   registry + dynamic event bus (Phase 0); `sdk.windows` hint setters +
   state bag + snapshots + `setOutputStack` (Phase 0d/0e); IPC JSON-RPC
   server + `overdrawctl` (Phase 1); in-thread bundled-plugin transport +
-  per-bundled-plugin config channel + `sdk.windows.focus(id)` (Phase 3).
-  Not built: per-surface state primitives
-  (opacity/mask/transform/output-margin per `core-plugin-api.md` §1,
-  scheduled Phase 4a); `sdk.compose` / `sdk.transitions` (Phases 5, 8);
-  animation evaluator (Phase 4); cursor / closing / velocity (Phase 9);
-  input chain (`sdk.input.bind`, Phase 7); output observation beyond a
-  fabricated `wl_output`; protocol SDK surface; interactive-region
-  hit-testing; `sdk.onFrame` (animation uses a plugin-driven loop today).
+  per-bundled-plugin config channel + `sdk.windows.focus(id)` (Phase 3);
+  per-surface render state primitives `setOpacity` / `setTransform` /
+  `setOutputMargin` / `setMask` (Phase 4a); declarative animation
+  evaluator `sdk.animations.run` / `cancel` with tween + spring +
+  sequence + parallel (Phase 4b). Not built:
+  `sdk.compose` / `sdk.transitions` (Phases 5, 8); cursor / closing /
+  velocity (Phase 9); input chain (`sdk.input.bind`, Phase 7); output
+  observation beyond a fabricated `wl_output`; protocol SDK surface;
+  interactive-region hit-testing; `sdk.onFrame` (Phase 5+).
 - **Capability enforcement.** No capability gate on `sdk.gpu`/`sdk.window`/
   `sdk.decorations` (every plugin gets them); no native-import restriction (a
   plugin's `import()` is unrestricted — deferred until there is an SDK native addon

@@ -28,6 +28,7 @@ import { createDecorations } from "./decorations.js";
 import { createPluginEvents } from "./events.js";
 import { createNamespaceHandle } from "./namespace.js";
 import { createPluginActions } from "./actions.js";
+import { createPluginAnimations } from "./animations-sdk.js";
 
 export interface LoaderInput {
   module: string;
@@ -69,11 +70,12 @@ export async function runLoader(channel: Channel, input: LoaderInput): Promise<v
   const nsHandle = createNamespaceHandle(endpoint);
   const actionsHandle = createPluginActions(endpoint);
   const windowsCtl = createPluginWindows(endpoint, eventsHandle.events);
+  const animations = createPluginAnimations(endpoint);
   const decorations = makeRingSurface ? createDecorations(endpoint, makeRingSurface) : undefined;
 
   const control = createSdk(input.name, (line) => { endpoint.emit("log", line); },
     eventsHandle.events, nsHandle.ns, actionsHandle.actions, windowsCtl.windows,
-    gpu, decorations?.decorations);
+    animations, gpu, decorations?.decorations);
 
   endpoint.handleRequests(async (method, params): Promise<Json> => {
     const ns = nsHandle.dispatcher.tryHandle(method, params);

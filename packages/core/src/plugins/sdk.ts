@@ -16,6 +16,7 @@ import type {
   PluginNamespace, InitFn, RegisterOptions, RegistrationHandle, RegisteredApi,
 } from "./namespace.js";
 import type { PluginActions } from "./actions.js";
+import type { PluginAnimations } from "./animations-sdk.js";
 
 export interface PluginSdk {
   // The plugin's stable name (config `name`, defaulting to its module).
@@ -47,6 +48,11 @@ export interface PluginSdk {
   // no capability gate yet (the observer half is privacy-sensitive but
   // capability gating is unbuilt).
   windows: PluginWindows;
+  // Declarative animation runner (core-plugin-api.md §9). Submits an
+  // AnimationSpec; core evaluates per frame. Targets are core-owned
+  // per-surface state (window-opacity / window-transform /
+  // window-output-margin). Always present.
+  animations: PluginAnimations;
   // Decoration provider: register an app_id pattern + observe assigned windows.
   // No capability gate yet (this tier is meant to be gated like tier 3 -- it sees
   // every matched window's app_id/state -- but the capability system is unbuilt;
@@ -64,6 +70,7 @@ export interface SdkControl {
 export function createSdk(name: string, emitLog: (line: string) => void,
                           events: PluginEvents, ns: PluginNamespace,
                           actions: PluginActions, windows: PluginWindows,
+                          animations: PluginAnimations,
                           gpu?: PluginGpu,
                           decorations?: PluginDecorations): SdkControl {
   let shutdownCb: ShutdownCallback | null = null;
@@ -83,6 +90,7 @@ export function createSdk(name: string, emitLog: (line: string) => void,
     plugin: ns.plugin,
     actions,
     windows,
+    animations,
     ...(gpu ? { gpu } : {}),
     ...(decorations ? { decorations } : {}),
   };
