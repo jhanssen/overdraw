@@ -11,11 +11,12 @@ what is actually built today is in `status.md`.
 
 ## Status
 
-Phases 0a, 0b, 0c, 0d, 0e, 1, 2, 3, 4, 4.5, and 5a are landed (see
-`git log` and `status.md`). Phase 5b (Worker transport for `sdk.compose`
-via cross-device dmabuf) is next. The text below describes each phase
-in its original forward-looking shape; ✅ marks the completed ones
-inline.
+Phases 0a, 0b, 0c, 0d, 0e, 1, 2, 3, 4, 4.5, 5a, and 5b-snapshot
+(the one-shot half of cross-device dmabuf compose for Worker
+plugins) are landed (see `git log` and `status.md`). Phase
+5b-live (the per-frame variant) is next. The text below describes
+each phase in its original forward-looking shape; ✅ marks the
+completed ones inline.
 
 ## Principle
 
@@ -436,19 +437,46 @@ screen recording, thumbnails.
 - Texture lifecycle: refcounted handles; `release()` semantics.
 - ~400 lines.
 
-### 5b. Cross-device for external plugins
+### 5b. Cross-device for external plugins (snapshot ✅, live in progress)
 
 - Compose textures imported as dmabuf on the plugin's device.
-- Reuses existing intercept/overlay machinery
-  (`status.md` §"Cross-device dmabuf + fence").
-- ~150 lines, mostly wiring.
+- Reuses the cross-device dmabuf + fence primitives that back the
+  plugin-overlay path (`status.md` §"Cross-device dmabuf + fence"),
+  with the producer/consumer roles swapped (core = producer,
+  plugin = consumer for compose buffers; the inverse of overlays).
+- Splits into two sub-phases:
+  - **5b-snapshot** ✅: one-shot compose into a dmabuf. ~1100
+    lines across native + JS + tests. Refactored the GPU-process
+    surface-buf dispatcher to be direction-parameterized so both
+    AllocSurfaceBuf and the new AllocComposeBuf share one
+    allocate-and-import code path.
+  - **5b-live**: per-frame compose into the same dmabuf (the
+    fence-bracket dance across `renderFrame`). The cross-device
+    fence chain alternates: producer (core) End -> import as
+    fence on plugin device -> consumer (plugin) Begin waits;
+    consumer End -> import as fence on core device -> next
+    producer Begin waits. Per-frame, not per-snapshot. Estimate
+    ~300-500 lines.
 
-**Total estimate**: ~550 lines, GPU-heavy.
+**Original total estimate was ~550 lines, "mostly wiring." Actual
+5b-snapshot alone was ~1100 lines** -- the refactor to make the
+existing surface-buf machinery role-agnostic was larger than
+anticipated. Estimate for 5b-live is unknown; will be tracked in
+status.md when it lands.
 
-**What this validates**: the most novel core mechanism. New GPU tests in
-`test/compose.gpu.mjs`: snapshot returns expected pixels frozen at call
-time (subsequent client commits don't change it); live mode reflects
-subsequent client commits and per-surface state changes.
+**What this validates**: cross-device dmabuf in the reverse
+direction (the existing path was plugin -> core; this adds core ->
+plugin). The producer Begin/End on the core wire + consumer
+Begin/End on the plugin wire (each inverted from the overlay
+path's wire assignment). The role-parameterized GPU-process
+dispatcher (a SurfaceBuf carries `producerOnCore`; the dispatchers
+validate the role bit on each in-band frame against the surface's
+recorded direction).
+
+5b-snapshot test: `test/compose-worker.gpu.mjs` -- a real Wayland
+client maps a known-color window, a Worker plugin calls
+`sdk.compose.scene({mode:'snapshot'})`, reads back the texture on
+ITS OWN DEVICE (not core's), and asserts the pixel matches.
 
 ## Phase 5.5 — Core effect primitives
 

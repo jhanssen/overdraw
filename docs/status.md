@@ -4,7 +4,7 @@ Ground truth for what exists right now: current capabilities, known gaps, and
 what remains. The design lives in `architecture.md`; this file does not restate
 it. Present-tense only — no change history.
 
-Last updated: 2026-06-09 (post-Phase 5a).
+Last updated: 2026-06-09 (post-Phase 5b-snapshot).
 
 ## Read first: gaps in advertised protocols (silent-gap risks)
 
@@ -915,15 +915,79 @@ chain is not yet applied to compose textures.
   wrapper (`createInThreadCompose`) handles snapshot + live + the
   outputId validation. 66/66 GPU tests pass (was 59; +7 compose).
 
-**Not yet built (Phase 5b and beyond)**: Worker transport for
-`sdk.compose` (cross-device dmabuf import + fence onto the plugin's
-device). The intercept chain (Phase 10) that `core-plugin-api.md`
-§6 references as "applied" to compose textures -- the per-surface
-state currently baked in is opacity / transform / mask / outputMargin
-plus decoration surface splicing, but no per-pixel plugin transform.
-Multi-output: `outputId` is plumbed honestly but only
-`OUTPUT_DEFAULT` is meaningful until the `wl_output` reconfiguration
-pre-condition lands.
+**Not yet built (Phase 5b live mode and beyond)**: live mode for
+Worker plugins (snapshot is in; live is the per-frame variant where
+the same dmabuf is re-rendered each `renderFrame` and the plugin
+samples it between frames -- the fence-bracket dance is per-frame,
+not per-snapshot). The intercept chain (Phase 10) that
+`core-plugin-api.md` §6 references as "applied" to compose textures
+-- the per-surface state currently baked in is opacity / transform /
+mask / outputMargin plus decoration surface splicing, but no
+per-pixel plugin transform. Multi-output: `outputId` is plumbed
+honestly but only `OUTPUT_DEFAULT` is meaningful until the
+`wl_output` reconfiguration pre-condition lands.
+
+### Cross-device compose for Worker plugins (Phase 5b-snapshot)
+
+`sdk.compose.scene({mode:'snapshot'})` for Worker plugins -- the
+plugin gets a `GPUTexture` on ITS OWN device backed by a dmabuf
+the core produced into. Uses the same cross-device dmabuf
+machinery as the plugin-overlay path with the producer/consumer
+roles SWAPPED: core = producer (writes), plugin = consumer
+(samples). Producer Begin/End ride the core wire; consumer
+Begin/End ride the plugin wire.
+
+- **New wire op**: `AllocComposeBuf` (`'c'`). Same payload shape
+  as `AllocSurfaceBuf` -- the GPU process reads the direction
+  flag (a new `SurfaceBuf.producerOnCore`) to know which side
+  of each wire field is the producer vs consumer.
+- **GPU-process dispatchers** (`packages/core/gpu-process/src/main.cpp`):
+  the in-band Surface frame dispatchers on the core wire + each
+  plugin wire are role-parameterized. Each surface declares its
+  direction at allocation; the dispatchers validate each in-band
+  frame's `producer` bit against the surface's recorded
+  direction. Missing surface = release race; silently skipped
+  on End (matches pre-refactor behavior for the overlay path).
+- **Refactor**: the `AllocSurfaceBuf` + `AllocComposeBuf` handlers
+  share one `allocSurfaceBufImpl(m, producerOnCore)` lambda. The
+  Allocator + GBM + dual-import code is unchanged; only the
+  device-resolution and inject-routing flips.
+- **Core C++**: `Compositor::reserveCoreComposeTexture` (reserves
+  with `RENDER_ATTACHMENT|TEXTURE_BINDING|COPY_SRC` on the core
+  device), `sendAllocComposeBuf` (mirror of `sendAllocSurfaceBuf`
+  for the new tag), `writeProducerBegin/EndAccess` (in-band on
+  the core wire). napi `coreAllocComposeBufferW`,
+  `writeProducerBegin/End`.
+- **Plugin C++**: `WorkerWireClient::reserveConsumerTexture` (the
+  inverse of `reserveProducerTexture`; reserves with
+  `TextureBinding|CopySrc` on the plugin device),
+  `consumerTexture` / `forgetConsumerReservation`. In-band
+  `writeConsumerBegin/EndAccess` on the plugin wire. napi
+  `reserveConsumerTexture` / `consumerTexture` /
+  `forgetConsumerReservation` / `writeConsumerBegin/End`.
+- **JS broker** (`gpu-broker.ts`): new `compose.snapshot` request.
+  The plugin reserves its consumer texture and sends the handles;
+  the core reserves its producer texture, calls
+  `coreAllocComposeBufferW`, awaits inject, wraps the producer
+  texture as a `GPUTexture`, runs `compositor.composeIntoView`
+  (a new public method on `JsCompositor`) under producer
+  Begin/End, returns `{surfaceBufId}` to the plugin.
+- **JS plugin SDK** (`compose-sdk.ts`): `createWorkerCompose`
+  builds a `PluginCompose` backed by the broker round-trip.
+  Wired into `loader.ts` so Worker plugins receive
+  `sdk.compose` (in-thread plugins keep `createInThreadCompose`,
+  unchanged).
+
+**Verified**: `test/compose-worker.gpu.mjs` -- a Worker plugin
+calls `sdk.compose.scene({mode:'snapshot'})` against a real
+Wayland client's window, reads back the texture on its own
+device via `copyTextureToBuffer`+`mapAsync`, and asserts the
+center pixel matches the client's color. 67/67 GPU tests pass
+(was 66 after Phase 5a). 5/5 consecutive isolated runs of the
+new test pass.
+
+**Not yet built**: live mode for Worker plugins. `compose.windows`
+for Worker plugins (deferred until a real use case forces it).
 
 ### Decoration provider (registration + insets + drawing + atomic gating)
 
