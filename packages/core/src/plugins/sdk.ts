@@ -17,6 +17,7 @@ import type {
 } from "./namespace.js";
 import type { PluginActions } from "./actions.js";
 import type { PluginAnimations } from "./animations-sdk.js";
+import type { PluginCompose } from "./compose-sdk.js";
 
 export interface PluginSdk {
   // The plugin's stable name (config `name`, defaulting to its module).
@@ -58,6 +59,11 @@ export interface PluginSdk {
   // every matched window's app_id/state -- but the capability system is unbuilt;
   // flagged). Always present in the current runtime.
   decorations?: PluginDecorations;
+  // Scene compose primitive (core-plugin-api.md §6): render a window subset
+  // into a fresh texture. Present iff the plugin runs in-thread (it returns
+  // GPUTexture handles that only cross the boundary for in-thread plugins
+  // sharing core's device). Phase 5b adds the Worker variant.
+  compose?: PluginCompose;
 }
 
 // Internal handle the bootstrap uses to drive the SDK (run the shutdown cb, etc.)
@@ -72,7 +78,8 @@ export function createSdk(name: string, emitLog: (line: string) => void,
                           actions: PluginActions, windows: PluginWindows,
                           animations: PluginAnimations,
                           gpu?: PluginGpu,
-                          decorations?: PluginDecorations): SdkControl {
+                          decorations?: PluginDecorations,
+                          compose?: PluginCompose): SdkControl {
   let shutdownCb: ShutdownCallback | null = null;
 
   const sdk: PluginSdk = {
@@ -93,6 +100,7 @@ export function createSdk(name: string, emitLog: (line: string) => void,
     animations,
     ...(gpu ? { gpu } : {}),
     ...(decorations ? { decorations } : {}),
+    ...(compose ? { compose } : {}),
   };
 
   return {

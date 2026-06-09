@@ -109,6 +109,28 @@ export interface CompositorSink {
   // the GPU. The plugin/overlay ring uses this to recycle a consumer slot only
   // after the frame that last sampled it is done (avoids EndAccess racing the read).
   afterCurrentFrame?(cb: () => void): void;
+  // Scene-compose primitives (core-plugin-api.md §6). Snapshot variants return
+  // one-shot textures the caller owns; the live variants register a target
+  // refreshed every renderFrame() until released. Optional so non-JsCompositor
+  // sinks (none today) need not implement them; the SDK only constructs
+  // sdk.compose when they're present.
+  composeScene?(args: {
+    outputId: number; windows: ReadonlyArray<number>;
+    outW?: number; outH?: number;
+  }): { texture: GPUTexture; outW: number; outH: number };
+  composeWindows?(args: {
+    outputId: number;
+    windows: ReadonlyArray<{ id: number; rect?: { x: number; y: number; w: number; h: number } }>;
+  }): Array<{ id: number; texture: GPUTexture;
+              rect: { x: number; y: number; w: number; h: number } }>;
+  registerLiveScene?(args: {
+    outputId: number; windows: ReadonlyArray<number>;
+    outW?: number; outH?: number;
+  }): import("../gpu/compositor.js").LiveSceneHandle;
+  registerLiveWindows?(args: {
+    outputId: number;
+    windows: ReadonlyArray<{ id: number; rect?: { x: number; y: number; w: number; h: number } }>;
+  }): import("../gpu/compositor.js").LiveWindowCompHandle;
 }
 
 export interface CompositorState {

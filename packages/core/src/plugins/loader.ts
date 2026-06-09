@@ -29,6 +29,8 @@ import { createPluginEvents } from "./events.js";
 import { createNamespaceHandle } from "./namespace.js";
 import { createPluginActions } from "./actions.js";
 import { createPluginAnimations } from "./animations-sdk.js";
+import { createInThreadCompose } from "./compose-sdk.js";
+import type { PluginCompose } from "./compose-sdk.js";
 
 export interface LoaderInput {
   module: string;
@@ -52,11 +54,17 @@ export async function runLoader(channel: Channel, input: LoaderInput): Promise<v
   let gpu: PluginGpu | undefined;
   let makeRingSurface: RingMaker | undefined;
   let stopGpu: () => void = () => {};
+  // sdk.compose is in-thread-only in Phase 5a: it returns GPUTexture handles
+  // which only cross the boundary by reference when the plugin shares
+  // core's device. Worker plugins receive sdk.compose === undefined
+  // (capability-by-shape); Phase 5b adds their transport.
+  let compose: PluginCompose | undefined;
   if (input.inThreadGpu) {
     const g = createInThreadGpu(input.name, input.inThreadGpu);
     gpu = g.gpu;
     makeRingSurface = g.makeRingSurface;
     stopGpu = g.stop;
+    compose = createInThreadCompose(input.inThreadGpu.compositor) ?? undefined;
   } else if (input.pluginAddonPath && input.dawnPath) {
     const g = await createPluginGpu(endpoint, input.pluginAddonPath, input.dawnPath);
     gpu = g.gpu;
@@ -75,7 +83,7 @@ export async function runLoader(channel: Channel, input: LoaderInput): Promise<v
 
   const control = createSdk(input.name, (line) => { endpoint.emit("log", line); },
     eventsHandle.events, nsHandle.ns, actionsHandle.actions, windowsCtl.windows,
-    animations, gpu, decorations?.decorations);
+    animations, gpu, decorations?.decorations, compose);
 
   endpoint.handleRequests(async (method, params): Promise<Json> => {
     const ns = nsHandle.dispatcher.tryHandle(method, params);
