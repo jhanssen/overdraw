@@ -14,6 +14,7 @@ import type { Channel, Json } from "./protocol.js";
 import type { DynamicBus, Subscription } from "../events/dynamic-bus.js";
 import type { ResolvedPlugin } from "../config/types.js";
 import { runLoader } from "./loader.js";
+import type { InThreadGpuDeps } from "./inthread-gpu.js";
 import type { PluginController, PluginHandle, PluginState } from "./plugin-host.js";
 
 export interface InThreadOptions {
@@ -22,6 +23,13 @@ export interface InThreadOptions {
   onRequest?: (pluginName: string, method: string, params: unknown) => Promise<unknown> | unknown;
   bus?: DynamicBus;
   shutdownTimeoutMs: number;
+  // Core-device GPU bundle. When set, the in-thread plugin gets a working
+  // sdk.gpu whose .device IS core's GPUDevice and whose .createOverlay
+  // allocates same-device GPUTextures. Omitting it (GPU-free unit tests,
+  // headless harnesses with no compositor) leaves sdk.gpu absent -- the
+  // SDK construction in loader.ts skips both GPU and decorations when the
+  // bundle is missing.
+  inThreadGpu?: InThreadGpuDeps;
 }
 
 export class InThreadPlugin implements PluginHandle {
@@ -62,6 +70,7 @@ export class InThreadPlugin implements PluginHandle {
       module: this.cfg.module,
       name: this.cfg.name,
       config: this.cfg.raw,
+      inThreadGpu: this.opts.inThreadGpu,
     }).catch((err: unknown) => {
       // runLoader converts init errors into the 'init' event; a reject
       // here means something more fundamental failed (channel setup, SDK

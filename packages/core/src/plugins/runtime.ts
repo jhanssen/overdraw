@@ -23,6 +23,7 @@ import { NamespaceRegistry } from "./namespace-registry.js";
 import type { Registration } from "./namespace-registry.js";
 import { ActionRegistry } from "./action-registry.js";
 import { InThreadPlugin } from "./inthread-plugin.js";
+import type { InThreadGpuDeps } from "./inthread-gpu.js";
 import type { PluginController, PluginHandle, PluginState } from "./plugin-host.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -50,6 +51,12 @@ export interface RuntimeOptions {
   // before init and sdk.gpu is available. main.ts provides these.
   pluginAddonPath?: string;
   dawnPath?: string;
+  // Core-device GPU bundle for in-thread bundled plugins. When set, sdk.gpu
+  // for bundled plugins shares core's GPUDevice; createOverlay allocates same-
+  // device textures (no wire client, no cross-device fences). main.ts builds
+  // it from the core compositor / overlay broker / dawn.node device. Tests
+  // that don't need bundled-plugin GPU access omit it.
+  inThreadGpu?: InThreadGpuDeps;
   // Sink for diagnostics (defaults to console). Lets tests capture/quiet logs.
   log?: (msg: string) => void;
   // Observe plugin->core events (name, data, plugin name). In scope B the only
@@ -439,6 +446,7 @@ export class PluginRuntime implements PluginController {
           onRequest: this.opts.onRequest,
           bus: this.opts.bus,
           shutdownTimeoutMs: this.opts.shutdownTimeoutMs,
+          inThreadGpu: this.opts.inThreadGpu,
         }, this);
         itp.spawn();
         p = itp;
@@ -474,10 +482,14 @@ export class PluginRuntime implements PluginController {
     }
   }
 
-  // Introspection.
-  states(): Array<{ name: string; state: PluginState; restarts: number }> {
+  // Introspection. `bundled` distinguishes in-thread (true) from Worker
+  // (false); in-thread plugins always report restarts=0 because the
+  // transport has no restart machinery (a consumer that sees restarts=0
+  // can't otherwise tell "never had to" from "can't").
+  states(): Array<{ name: string; state: PluginState; restarts: number; bundled: boolean }> {
     return this.plugins.map((p) => ({
       name: p.cfg.name, state: p.currentState, restarts: p.restartCount,
+      bundled: p.cfg.bundled,
     }));
   }
 

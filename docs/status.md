@@ -625,6 +625,31 @@ config slice comes from the user config via `BundledPluginSpec.configFrom`
 plugins, the slice is `ResolvedPlugin.raw` (the user's full plugin entry).
 Plugins that don't take config simply ignore the second arg.
 
+**In-thread `sdk.gpu` (core-device shared).** Bundled plugins get
+`sdk.gpu.device === core's GPUDevice` -- the SAME JS object the JS
+compositor uses; no separate device, no plugin-side wire client, no
+`overdraw_plugin_native.node` load. `sdk.gpu.createOverlay({layer,
+anchor, width, height})` returns a `Surface` whose slots are core-device
+`GPUTexture`s allocated with `RENDER_ATTACHMENT | TEXTURE_BINDING`;
+`present()` installs the just-rendered slot via
+`compositor.setSurfaceTexture` and recycles the prior slot once the
+compositor's GPU read of it completes (`afterCurrentFrame`). Triple-
+buffered like the Worker path, but no SAB, no atomics, no fences --
+same-device queue ordering guarantees the compositor's sample sees
+the plugin's render writes (`packages/core/src/plugins/inthread-gpu.ts`).
+The contract is the same `PluginGpu` interface (`packages/core/src/
+plugins/gpu.ts`) the Worker path exposes; the plugin source is
+identical across transports per `customization.md` "Two execution
+paths, one SDK". Wired through `RuntimeOptions.inThreadGpu` ->
+`InThreadPlugin` -> `loader.ts`; `main.ts` populates the bundle from
+its already-built core device + overlay broker + compositor + dawn
+globals.
+
+A bundled plugin without `inThreadGpu` plumbed in (GPU-free unit
+tests, headless harnesses with no compositor) gets `sdk.gpu`
+absent -- same fallback as user plugins lacking `pluginAddonPath` /
+`dawnPath`.
+
 ### Bundled plugins extracted from core (Phase 2 + 3)
 
 - **`@overdraw/plugin-layout-default`** (Phase 2): master-stack
@@ -793,7 +818,8 @@ keyboard delivery via the host path); the JS-compositor suite
 `clipboard.gpu.mjs`; `dnd.gpu.mjs`; `window-change-e2e.gpu.mjs`;
 `xdev-fence.gpu.mjs`; `wire-serial-regression.gpu.mjs`; the plugin suite
 (`plugin-overlay*.gpu.mjs`, `worker-gpu.gpu.mjs`, `decoration-*.gpu.mjs`
-incl. `decoration-two-windows.gpu.mjs`, `example-decoration.gpu.mjs`).
+incl. `decoration-two-windows.gpu.mjs`, `example-decoration.gpu.mjs`,
+`inthread-gpu.gpu.mjs` for the in-thread bundled-plugin core-device path).
 
 ### Protocol coverage matrix
 

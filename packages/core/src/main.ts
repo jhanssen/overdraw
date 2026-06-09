@@ -226,6 +226,19 @@ const windowsBroker = createWindowsBroker({
 runtime = new PluginRuntime({
   pluginAddonPath,
   dawnPath: dawnNodePath,
+  // In-thread bundled plugins share core's GPUDevice. main.ts already
+  // brought up the device + the overlay broker + the compositor; package
+  // them into the bundle the in-thread loader uses to construct sdk.gpu.
+  inThreadGpu: {
+    coreDevice: device,
+    // DawnGlobals is the narrow shape compositor.ts cares about (3 enums);
+    // the in-thread loader installs the FULL dawn.globals bag on globalThis,
+    // matching what the Worker path does. Widen at the call site.
+    // eslint-disable-next-line no-restricted-syntax
+    globals: dawn.globals as unknown as Record<string, unknown>,
+    overlays,
+    compositor,
+  },
   bus: pluginBus,
   onEvent: (plugin, name, data) => {
     if (name === "log") console.log(`[plugin ${plugin}] ${String(data)}`);
@@ -241,7 +254,16 @@ runtime = new PluginRuntime({
       }
       return r;
     }
-    return gpuBroker(plugin, method, params);
+    // gpu.* / surface.* are the Worker-transport GPU SDK protocol
+    // (createPluginGpu in plugins/gpu.ts). In-thread plugins skip this
+    // entirely -- their sdk.gpu is constructed in-process and talks to
+    // the overlay broker directly; they never originate these requests.
+    // Route by prefix rather than as a catch-all so an unknown method
+    // surfaces a clear error instead of being mis-dispatched.
+    if (method.startsWith("gpu.") || method.startsWith("surface.")) {
+      return gpuBroker(plugin, method, params);
+    }
+    throw new Error(`no handler for plugin request '${method}'`);
   },
 });
 await runtime.load(resolved);

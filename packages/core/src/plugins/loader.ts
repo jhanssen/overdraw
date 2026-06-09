@@ -6,6 +6,14 @@
 //
 // Pings auto-pong via the Endpoint default. The Worker watchdog kills on
 // missed pongs; in-thread has no watchdog (liveness == core's event loop).
+//
+// Two sdk.gpu construction paths (selected by which input fields are set):
+//   - Worker:    pluginAddonPath + dawnPath  -> createPluginGpu (separate
+//                device on a separate wire client; cross-device fences via
+//                surface-slots).
+//   - In-thread: inThreadGpu                 -> createInThreadGpu (shares
+//                core's GPUDevice; same-device texture rotation).
+// Both produce the same PluginGpu shape, so the plugin source is identical.
 
 import { Endpoint } from "./protocol.js";
 import type { Channel, Json } from "./protocol.js";
@@ -13,6 +21,8 @@ import { createSdk } from "./sdk.js";
 import type { PluginSdk } from "./sdk.js";
 import { createPluginGpu } from "./gpu.js";
 import type { PluginGpu, RingMaker } from "./gpu.js";
+import { createInThreadGpu } from "./inthread-gpu.js";
+import type { InThreadGpuDeps } from "./inthread-gpu.js";
 import { createPluginWindows } from "./windows-sdk.js";
 import { createDecorations } from "./decorations.js";
 import { createPluginEvents } from "./events.js";
@@ -24,10 +34,13 @@ export interface LoaderInput {
   name: string;
   // Per-plugin config slice; passed verbatim as init's second arg.
   config?: unknown;
-  // Set these to enable sdk.gpu + sdk.decorations. Bundled in-thread
-  // plugins omit them (no GPU need).
+  // Worker path: paths to the plugin Worker addon + dawn.node. Set together;
+  // ignored if inThreadGpu is also set.
   pluginAddonPath?: string;
   dawnPath?: string;
+  // In-thread path: the core-device dependency bundle. When set, sdk.gpu
+  // shares core's device and the Worker path is not used.
+  inThreadGpu?: InThreadGpuDeps;
 }
 
 type InitFn = (sdk: PluginSdk, config?: unknown) => unknown | Promise<unknown>;
@@ -38,7 +51,12 @@ export async function runLoader(channel: Channel, input: LoaderInput): Promise<v
   let gpu: PluginGpu | undefined;
   let makeRingSurface: RingMaker | undefined;
   let stopGpu: () => void = () => {};
-  if (input.pluginAddonPath && input.dawnPath) {
+  if (input.inThreadGpu) {
+    const g = createInThreadGpu(input.name, input.inThreadGpu);
+    gpu = g.gpu;
+    makeRingSurface = g.makeRingSurface;
+    stopGpu = g.stop;
+  } else if (input.pluginAddonPath && input.dawnPath) {
     const g = await createPluginGpu(endpoint, input.pluginAddonPath, input.dawnPath);
     gpu = g.gpu;
     makeRingSurface = g.makeRingSurface;
