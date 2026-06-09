@@ -78,6 +78,18 @@ enum class Tag : uint8_t {
                                 //   both devices (ok=1), or failed (ok=0). Carries
                                 //   the surfaceBufId the core uses for later
                                 //   Begin/EndAccess on this buffer.
+    AllocComposeBuf = 'c',  // core -> gpu : SAME as AllocSurfaceBuf, but the
+                            //   producer is the CORE device and the consumer
+                            //   is the plugin device (sdk.compose Worker
+                            //   transport, phase 5b). Wire fields are the
+                            //   same shape -- device/texture name the CORE
+                            //   (producer) side; pluginDevice/pluginTexture
+                            //   name the PLUGIN (consumer) side. Reply is
+                            //   SurfaceBufAllocated like AllocSurfaceBuf.
+                            //   The resulting SurfaceBuf has producerOnCore=
+                            //   true; producer Begin/End ride the CORE wire
+                            //   and consumer Begin/End ride the OWNING plugin
+                            //   wire (inverted from AllocSurfaceBuf).
     // NOTE: the per-frame producer/consumer fence-dance brackets on a surface
     // buffer also no longer ride ctrl. Consumer Begin/End ride the CORE wire and
     // producer Begin/End ride the owning PLUGIN wire, both as in-band kind=1/
