@@ -20,8 +20,8 @@ import { withRuntime } from '../plugin-helpers.mjs';
 const __dirname = dirname(fileURLToPath(import.meta.url));
 // The bundled plugin's module specifier is a bare npm package name; resolve
 // it via the workspace symlink in this repo's node_modules.
-const layoutPluginSpec = BUNDLED_PLUGINS.find((p) => p.name === 'layout-master-stack');
-if (!layoutPluginSpec) throw new Error('test setup: layout-master-stack not in BUNDLED_PLUGINS');
+const layoutPluginSpec = BUNDLED_PLUGINS.find((p) => p.name === 'layout-default');
+if (!layoutPluginSpec) throw new Error('test setup: layout-default not in BUNDLED_PLUGINS');
 void __dirname;
 
 function mockCompositor() {

@@ -183,7 +183,7 @@ instance; a wrapped device is borrowed, not destroyed). Built with
   `packages/core/src/wm/index.ts` owns the window list/stack, schedules
   relayouts through `packages/core/src/wm/layout-driver.ts`, and pushes
   layout+order + a sized configure. The layout *policy* lives in a bundled
-  plugin: `packages/plugin-layout-master-stack/`, registered in the `'layout'`
+  plugin: `packages/plugin-layout-default/`, registered in the `'layout'`
   namespace at priority 0 (the bundled-plugin floor). It is a **master-stack
   tiler** (dwm-style: first window = master in a left column at
   `masterFraction`; the rest share the right column as equal-height slices;
@@ -451,7 +451,8 @@ first on boot, before user-config plugins; user-config plugins load after the
 server is up (`packages/core/src/main.ts`). Bundled plugins register at
 priority 0 in the namespace registry; user plugins claiming the same
 namespace at a higher priority displace them, demoting on failure (priority
-chain). Currently bundled: `@overdraw/plugin-layout-master-stack`.
+chain). Currently bundled: `@overdraw/plugin-layout-default`,
+`@overdraw/plugin-focus-default`.
 
 ### GPU SDK (overlays + decorations)
 
@@ -626,7 +627,7 @@ Plugins that don't take config simply ignore the second arg.
 
 ### Bundled plugins extracted from core (Phase 2 + 3)
 
-- **`@overdraw/plugin-layout-master-stack`** (Phase 2): master-stack
+- **`@overdraw/plugin-layout-default`** (Phase 2): master-stack
   tiling. Namespace `'layout'`, priority 0. Core seam:
   `packages/core/src/wm/layout-driver.ts`. Type contract:
   `@overdraw/layout-types`. Migrated to the in-thread transport in
@@ -732,7 +733,7 @@ Generator + protocols: `gen-protocol.test.js`, `gen-protocol-all.test.js`
 `data-device-dnd.test.js`. WM: `wm.test.js` (map/unmap + `windowAt`,
 additive insets + gating filter, against a mock addon),
 `wm-hints-state.test.js`. Layout (Phase 2,
-`test/layout-master-stack/`): `master-stack.test.js` (algorithm),
+`test/plugin-layout-default/`): `master-stack.test.js` (algorithm),
 `integration.test.js` (driver + bundled plugin invocation end to end).
 Snapshot / query: `query.test.js`. Config: `config.test.js`. Overlays /
 decorations: `overlay.test.js`, `decorations.test.js`,

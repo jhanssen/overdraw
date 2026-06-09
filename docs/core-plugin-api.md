@@ -541,7 +541,7 @@ Core's responsibilities:
 
 The bundled master-stack layout is a `sdk.registerPlugin('layout', ...)`
 registration at priority 0 — extracted from core to
-`packages/plugin-layout-master-stack/` as of Phase 2. The seam in core is
+`packages/plugin-layout-default/` as of Phase 2. The seam in core is
 `packages/core/src/wm/layout-driver.ts`, which invokes the active
 'layout' plugin via the namespace registry.
 
@@ -824,7 +824,7 @@ target.
   `protocol.ts`, `bootstrap.ts`).
 
 ### Already extracted to bundled plugins
-- **Master-stack layout policy** → `packages/plugin-layout-master-stack/`,
+- **Master-stack layout policy** → `packages/plugin-layout-default/`,
   registered at priority 0 in namespace `'layout'`. Core seam:
   `packages/core/src/wm/layout-driver.ts`. Type contract:
   `packages/layout-types/`. Phase 2 of `build-order.md`.

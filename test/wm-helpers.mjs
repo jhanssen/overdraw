@@ -6,10 +6,14 @@
 //
 // The inline driver runs the master-stack algorithm directly. It exists
 // only to give WM tests a deterministic layout to assert against; the
-// algorithm itself is tested in test/layout-master-stack/.
+// algorithm itself is tested in test/plugin-layout-default/.
+//
+// The inline driver runs the master-stack algorithm directly. It exists
+// only to give WM tests a deterministic layout to assert against; the
+// algorithm itself is tested in test/plugin-layout-default/.
 
 import { createLayoutDriver } from '../packages/core/dist/wm/layout-driver.js';
-import { masterStackLayout } from '../packages/plugin-layout-master-stack/dist/master-stack.js';
+import { masterStackLayout } from '../packages/plugin-layout-default/dist/master-stack.js';
 
 // Build an inline layout driver factory that the WM tests can pass via
 // WmOptions.layoutDriverFactory. The driver runs master-stack synchronously

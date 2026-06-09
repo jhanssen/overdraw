@@ -27,7 +27,7 @@ import type { ResolvedPlugin, ResolvedConfig } from "../config/types.js";
 export interface BundledPluginSpec {
   // The plugin's stable name (used in logs + namespace registry attribution).
   name: string;
-  // Either a bare module specifier (e.g. "@overdraw/plugin-layout-master-stack")
+  // Either a bare module specifier (e.g. "@overdraw/plugin-layout-default")
   // or an absolute path. main.ts resolves and converts to a file:// URL.
   module: string;
   // Pull the per-plugin config value out of the loaded user config.
@@ -46,10 +46,14 @@ export interface BundledPluginSpec {
 // symlinks. The runtime will load it on boot at priority 0.
 export const BUNDLED_PLUGINS: ReadonlyArray<BundledPluginSpec> = [
   {
-    // Master-stack tiling layout (dwm-style). The floor of the 'layout'
-    // namespace; replaceable by a higher-priority user plugin.
-    name: "layout-master-stack",
-    module: "@overdraw/plugin-layout-master-stack",
+    // Default layout: master-stack tiling (dwm-style). The floor of the
+    // 'layout' namespace; replaceable by a higher-priority user plugin.
+    // The algorithm is master-stack today; if a future bundled default
+    // changes (e.g. to BSP), the package keeps the 'plugin-layout-default'
+    // name -- the algorithm is an implementation detail of the bundled
+    // floor, not a name commitment.
+    name: "layout-default",
+    module: "@overdraw/plugin-layout-default",
     // No user-config knob today (params are plugin-internal defaults).
   },
   {

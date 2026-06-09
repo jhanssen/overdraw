@@ -142,8 +142,12 @@ seam that already existed in code (previously `src/wm/placement.ts`).
 
 ### 2b. Bundled layout plugin ✅
 
-- `packages/plugin-layout-master-stack/` (npm name
-  `@overdraw/plugin-layout-master-stack`).
+- `packages/plugin-layout-default/` (npm name
+  `@overdraw/plugin-layout-default`). The bundled default for the
+  'layout' namespace; implements master-stack tiling. Package name
+  follows the "by role" convention -- the name says it's the bundled
+  default; the algorithm (master-stack) is an internal implementation
+  detail.
 - Contains the existing master-stack algorithm.
 - Registers via `sdk.registerPlugin('layout', ...)` at priority 0 (the
   bundled-plugin floor).
@@ -216,11 +220,11 @@ machinery) costs more than it buys for them.
 - ~30–50 lines: config plumbing from `loadConfig` → `bundledToResolved`
   → bootstrap.
 
-### 3c. Migrate `@overdraw/plugin-layout-master-stack` to in-thread
+### 3c. Migrate `@overdraw/plugin-layout-default` to in-thread
 
 - Same registration, same algorithm. Only the runtime transport
   changes. The Worker-mode tests for layout are deleted (their behavior
-  is exercised end-to-end by `test/layout-master-stack/integration.
+  is exercised end-to-end by `test/plugin-layout-default/integration.
   test.js`); the in-thread tests assert direct-call semantics.
 - ~20 lines of change in the plugin (mostly tsconfig / dependency
   cleanup).

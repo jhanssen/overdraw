@@ -1,7 +1,7 @@
 // Pure-unit tests for the window manager (src/wm). The WM is layout-policy-
 // agnostic post-Phase 2; these tests inject an inline master-stack driver to
 // keep asserting on tile rects (the master-stack algorithm itself is tested
-// in test/layout-master-stack/).
+// in test/plugin-layout-default/).
 //
 // No GPU/Wayland: a mock compositor records setSurfaceLayout/setStack and a
 // mock configure sink records configure(surfaceId, w, h) calls. Covers the
