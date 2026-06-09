@@ -848,12 +848,14 @@ export class JsCompositor implements CompositorSink {
 
   // Pack the per-surface render state (placement + transform + margin + fx)
   // into the WGSL Uniforms struct and upload. Normalizes all output-pixel
-  // quantities to [0,1] output space; the shader needs no output dims.
-  private updateUniforms(s: Surface): void {
+  // quantities to [0,1] target space; the shader needs no target dims.
+  // ow/oh are the dimensions of the render target this surface will be drawn
+  // into -- the on-screen output for renderFrame, an arbitrary compose
+  // texture for compose calls.
+  private updateUniforms(s: Surface, ow: number, oh: number): void {
     if (!s.uniformBuf) return;
     const w = s.layoutW || s.width;
     const h = s.layoutH || s.height;
-    const ow = this.width, oh = this.height;
     const fx = s.fx;
     const data = new Float32Array(UNIFORM_BYTES / 4);
     // placement
@@ -872,15 +874,108 @@ export class JsCompositor implements CompositorSink {
     this.device.queue.writeBuffer(s.uniformBuf, 0, data);
   }
 
-  // Composite one frame: clear black, draw stack back-to-front, premultiplied
-  // blend. Nested (slice 3) renders into the host swapchain's current texture and
-  // presents; headless renders into the offscreen target (read via readback()).
+  // Open per-frame dmabuf import brackets for every surface in `drawList`
+  // that has a live dmabuf import. Appends to `bracketed`; de-dupes on
+  // importId so an import shared across multiple draw lists (on-screen +
+  // live composers) opens exactly one Begin. Dispatches frameSampled to
+  // the lifecycle exactly once per import for the same reason.
   //
-  // Lifecycle wiring: frameStart at top; frameSampled per drawn dmabuf surface
-  // (drives Layer C's per-frame BeginAccess); submitted after queue.submit (drives
-  // EndAccess); gpuCompleted on onSubmittedWorkDone (drives release intents).
-  // The early-return paths emit frameAborted so the lifecycle's open begin is
-  // rolled back without leaving a dangling access bracket.
+  // Wire ordering: each writeBeginAccess flushes staged Dawn bytes first,
+  // so the on-wire layout is [begin...][sample submit batch][end...] --
+  // every bracket is open by the time the GPU process's HandleCommands
+  // decodes the samples.
+  private openImportBrackets(
+    drawList: number[],
+    bracketed: Array<{ importId: number; bufferId: number }>,
+  ): void {
+    for (const id of drawList) {
+      const s = this.surfaces.get(id);
+      if (!s || !s.present || !s.bindGroup) continue;
+      if (s.currentBufferId === 0) continue;  // shm or plugin overlay; no lifecycle
+      const imp = this.dmabufImports.get(s.currentBufferId);
+      if (!imp) continue;  // import not yet resolved (async); will draw next frame
+      // De-dupe: an import already opened for an earlier draw list (or earlier
+      // surface in this list) gets one Begin per frame. The GPU process's
+      // ClientTex.accessOpen invariant forbids two Begins without an End.
+      if (bracketed.some((b) => b.importId === imp.importId)) continue;
+      // The dmabufImports gate above already proved the import is live (its
+      // handle was installed only after the GPU process applied the inject).
+      // writeBeginAccess therefore must succeed; a false return means the
+      // JS-side import gate and the core's jsImportHandles_ map have desynced
+      // -- a contract violation, not a recoverable per-frame condition.
+      if (!this.addon.writeBeginAccess(imp.importId)) {
+        throw new Error(
+          `writeBeginAccess returned false for live import ` +
+          `(bufferId=${s.currentBufferId}, importId=${imp.importId}): ` +
+          `dmabufImports gate / core handle map desync`,
+        );
+      }
+      this.dispatch(this.lifecycle.step({ kind: "frameSampled", surfaceId: id }));
+      bracketed.push({ importId: imp.importId, bufferId: s.currentBufferId });
+    }
+  }
+
+  // Close every bracket opened by openImportBrackets for this frame. Writes
+  // EndAccess in the same order Begins were written; the wire FIFO closes
+  // each bracket only after the GPU process has decoded the intervening
+  // sample commands. The endAccessFenceExported sentinel satisfies the
+  // state machine's chain-fence invariant (real fence lives in the GPU
+  // process and is chained intra-process).
+  private closeImportBrackets(
+    bracketed: ReadonlyArray<{ importId: number; bufferId: number }>,
+  ): void {
+    for (const { importId, bufferId } of bracketed) {
+      this.addon.writeEndAccess(importId);
+      this.dispatch(this.lifecycle.step({
+        kind: "endAccessFenceExported", bufferId,
+        fence: { kind: "syncFile", fd: -1 },
+      }));
+    }
+  }
+
+  // Encode one render pass: clear black, draw each surface in `drawList`
+  // back-to-front into `targetView` with placement normalized to (outW,outH).
+  // Pure pass-encoder -- no submit, no lifecycle calls, no bracket management.
+  // Multiple calls within one frame share a single command encoder + submit
+  // and share one set of import brackets opened around them.
+  private composite(args: {
+    encoder: GPUCommandEncoder;
+    targetView: GPUTextureView;
+    drawList: number[];
+    outW: number;
+    outH: number;
+  }): void {
+    const pass = args.encoder.beginRenderPass({
+      colorAttachments: [{
+        view: args.targetView,
+        loadOp: "clear",
+        storeOp: "store",
+        clearValue: { r: 0, g: 0, b: 0, a: 1 },
+      }],
+    });
+    pass.setPipeline(this.pipeline);
+    for (const id of args.drawList) {
+      const s = this.surfaces.get(id);
+      if (s && s.present && s.bindGroup) {
+        this.updateUniforms(s, args.outW, args.outH);
+        pass.setBindGroup(0, s.bindGroup);
+        pass.draw(4);
+      }
+    }
+    pass.end();
+  }
+
+  // Composite one on-screen frame: open import brackets, encode the pass,
+  // submit, close brackets. Nested (slice 3) renders into the host
+  // swapchain's current texture and presents; headless renders into the
+  // offscreen target (read via readback()).
+  //
+  // Lifecycle wiring: frameStart at top; frameSampled per drawn dmabuf
+  // surface (drives Layer C's per-frame BeginAccess); submitted after
+  // queue.submit (drives EndAccess); gpuCompleted on onSubmittedWorkDone
+  // (drives release intents). The early-return paths emit frameAborted so
+  // the lifecycle's open begin is rolled back without leaving a dangling
+  // access bracket.
   renderFrame(): void {
     let targetView = this.targetView;
     let presenting = false;
@@ -898,67 +993,16 @@ export class JsCompositor implements CompositorSink {
     this.dispatch(this.lifecycle.step({ kind: "frameStart" }));
     frameOpen = true;
 
-    // Per-frame BeginAccess pass: for each dmabuf surface that will draw, write
-    // an in-band kind=1 frame on the core wire BEFORE encoding the sample
-    // command. All begins are written up-front (each appendFrame flushes any
-    // staged Dawn bytes first); the encode+submit below then produces the
-    // sample wire commands as a later kind=0 batch, so on the wire the order is
-    // [begin...][sample submit batch][end...] -- every bracket is open by the
-    // time the GPU process's HandleCommands decodes the samples. No round-trip;
-    // the Node thread does not block.
-    //
-    // `bracketed` holds the (importId, bufferId) of every dmabuf surface we
-    // opened a bracket on, in draw order; the post-submit End pass walks it to
-    // write kind=2 frames.
-    const bracketed: Array<{ importId: number; bufferId: number }> = [];
     const draw = this.drawOrder();
-    for (const id of draw) {
-      const s = this.surfaces.get(id);
-      if (!s || !s.present || !s.bindGroup) continue;
-      if (s.currentBufferId === 0) continue;  // shm or plugin overlay; no lifecycle
-      const imp = this.dmabufImports.get(s.currentBufferId);
-      if (!imp) continue;  // import not yet resolved (async); will draw next frame
-      // The dmabufImports gate above already proved the import is live (its
-      // handle was installed only after the GPU process applied the inject).
-      // writeBeginAccess therefore must succeed; a false return means the
-      // JS-side import gate and the core's jsImportHandles_ map have desynced
-      // -- a contract violation, not a recoverable per-frame condition. Surface
-      // it loudly (the GPU process hard-fails on its side for analogous bugs).
-      if (!this.addon.writeBeginAccess(imp.importId)) {
-        throw new Error(
-          `writeBeginAccess returned false for live import ` +
-          `(bufferId=${s.currentBufferId}, importId=${imp.importId}): ` +
-          `dmabufImports gate / core handle map desync`,
-        );
-      }
-      // Bracket open. Tell the state machine the surface was sampled. The
-      // resulting beginAccess intent is informational (the executor's
-      // runIntent("beginAccess") is a no-op; the real Begin already
-      // happened). The state machine sets accessOpen, adds to frame.sampled.
-      this.dispatch(this.lifecycle.step({ kind: "frameSampled", surfaceId: id }));
-      bracketed.push({ importId: imp.importId, bufferId: s.currentBufferId });
-    }
+    const bracketed: Array<{ importId: number; bufferId: number }> = [];
+    this.openImportBrackets(draw, bracketed);
 
     try {
       const enc = this.device.createCommandEncoder();
-      const pass = enc.beginRenderPass({
-        colorAttachments: [{
-          view: targetView,
-          loadOp: "clear",
-          storeOp: "store",
-          clearValue: { r: 0, g: 0, b: 0, a: 1 },
-        }],
+      this.composite({
+        encoder: enc, targetView, drawList: draw,
+        outW: this.width, outH: this.height,
       });
-      pass.setPipeline(this.pipeline);
-      for (const id of draw) {
-        const s = this.surfaces.get(id);
-        if (s && s.present && s.bindGroup) {
-          this.updateUniforms(s);
-          pass.setBindGroup(0, s.bindGroup);
-          pass.draw(4);
-        }
-      }
-      pass.end();
       this.device.queue.submit([enc.finish()]);
 
       // Tag the submit; on GPU completion advance completedSerial and emit
@@ -967,27 +1011,7 @@ export class JsCompositor implements CompositorSink {
       this.dispatch(this.lifecycle.step({ kind: "submitted", serial }));
       frameOpen = false;
 
-      // EndAccess pass: write an in-band kind=2 frame for every bracket we
-      // opened. Its FIFO position after the submit's kind=0 batch guarantees
-      // the GPU process closes the bracket only after decoding the sample
-      // commands -- the role the wireSerial-tagged WireBarrier deferral played
-      // before, now intrinsic to the wire ordering (no flush+sample, no tag).
-      // appendFrame flushes the submit's staged wire bytes as that kind=0 batch
-      // before writing the first kind=2, so the ordering holds without an
-      // explicit flushCoreWire. Then synthesize endAccessFenceExported to
-      // satisfy the state-machine chain-fence tracking (the actual fence lives
-      // in the GPU process and is chained intra-process; the state-machine
-      // field is informational, used by the unit-test invariant 7).
-      for (const { importId, bufferId } of bracketed) {
-        this.addon.writeEndAccess(importId);
-        this.dispatch(this.lifecycle.step({
-          kind: "endAccessFenceExported", bufferId,
-          // Sentinel: the GPU process exports a real fence and chains it
-          // intra-process. The state machine doesn't see the fd; the kind
-          // != "none" is what the chain-fence invariant tests check for.
-          fence: { kind: "syncFile", fd: -1 },
-        }));
-      }
+      this.closeImportBrackets(bracketed);
 
       this.device.queue.onSubmittedWorkDone().then(() => {
         if (serial > this.completedSerial) this.completedSerial = serial;
