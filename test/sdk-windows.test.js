@@ -20,12 +20,22 @@ import { entry, waitFor, withRuntime } from './plugin-helpers.mjs';
 function mockSink() {
   const sink = {
     outputStackCalls: [],
+    fxCalls: [],
     setSurfaceLayout() {}, setStack() {}, setLayerSurfaces() {},
     setSurfaceTexture() {}, commitSurfaceBuffer() {}, commitSurfaceDmabuf() {},
     removeSurface() {}, takeImportedSurfaces() { return []; },
     takeFreedBuffers() { return []; }, afterCurrentFrame() {}, renderFrame() {},
     setOutputStack(outputId, ids) {
       sink.outputStackCalls.push({ outputId, ids: ids === null ? null : [...ids] });
+    },
+    setSurfaceOpacity(id, opacity) {
+      sink.fxCalls.push({ method: 'opacity', id, opacity });
+    },
+    setSurfaceTransform(id, t) {
+      sink.fxCalls.push({ method: 'transform', id, t: { ...t } });
+    },
+    setSurfaceOutputMargin(id, m) {
+      sink.fxCalls.push({ method: 'margin', id, m: { ...m } });
     },
   };
   return sink;
@@ -214,5 +224,36 @@ test('setOutputStack: null clears the override', async () => {
     await waitFor(() => findLog(events, 'clear-output-stack'));
     assert.equal(sink.outputStackCalls.length, 2);
     assert.deepEqual(sink.outputStackCalls[1], { outputId: 0, ids: null });
+  });
+});
+
+// Per-surface render-state setters land through the same broker, exercised
+// end-to-end through a Worker plugin (sdk.windows.set{Opacity,Transform,
+// OutputMargin}) -> windows-broker -> compositor sink.
+
+test('setOpacity: forwards opacity to the compositor sink', async () => {
+  await withWindowsSetup(7, async ({ events, pluginBus, sink }) => {
+    trigger(pluginBus, 11);
+    await waitFor(() => findLog(events, 'set-opacity'));
+    assert.deepEqual(sink.fxCalls[0], { method: 'opacity', id: 7, opacity: 0.5 });
+  });
+});
+
+test('setTransform: forwards full transform to the compositor sink', async () => {
+  await withWindowsSetup(7, async ({ events, pluginBus, sink }) => {
+    trigger(pluginBus, 12);
+    await waitFor(() => findLog(events, 'set-transform'));
+    assert.deepEqual(sink.fxCalls[0],
+      { method: 'transform', id: 7,
+        t: { translateX: 10, translateY: 20, scaleX: 2, scaleY: 2 } });
+  });
+});
+
+test('setOutputMargin: forwards margin to the compositor sink', async () => {
+  await withWindowsSetup(7, async ({ events, pluginBus, sink }) => {
+    trigger(pluginBus, 13);
+    await waitFor(() => findLog(events, 'set-output-margin'));
+    assert.deepEqual(sink.fxCalls[0],
+      { method: 'margin', id: 7, m: { top: 4, right: 8, bottom: 12, left: 16 } });
   });
 });

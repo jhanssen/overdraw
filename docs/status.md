@@ -819,7 +819,9 @@ keyboard delivery via the host path); the JS-compositor suite
 `xdev-fence.gpu.mjs`; `wire-serial-regression.gpu.mjs`; the plugin suite
 (`plugin-overlay*.gpu.mjs`, `worker-gpu.gpu.mjs`, `decoration-*.gpu.mjs`
 incl. `decoration-two-windows.gpu.mjs`, `example-decoration.gpu.mjs`,
-`inthread-gpu.gpu.mjs` for the in-thread bundled-plugin core-device path).
+`inthread-gpu.gpu.mjs` for the in-thread bundled-plugin core-device path,
+`inthread-mask.gpu.mjs` for sdk.windows.setMask via a real bundled plugin);
+per-surface render state primitives (`compositor-fx.gpu.mjs`).
 
 ### Protocol coverage matrix
 

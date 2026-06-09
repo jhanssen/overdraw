@@ -17,6 +17,27 @@ import { createWindowObserver } from "./window-observer.js";
 // Hint field names; must match WindowHints keys on the core side.
 export type HintField = "floating" | "fullscreen" | "maximized" | "minimized";
 
+// Per-surface transform; all fields optional, missing fields reset to identity.
+// translate is in output pixels, scale is unitless. Rotation is not supported in
+// v1 (spec builders compose center-anchored scale via translate + scale + counter-
+// translate; rotation needs a shader path that doesn't exist yet).
+export interface SurfaceTransform {
+  translateX?: number;
+  translateY?: number;
+  scaleX?: number;
+  scaleY?: number;
+}
+
+// Per-edge margin in output pixels reserved AROUND the surface's nominal rect.
+// Used by downstream consumers (masks, decoration shadows, intercept stages) to
+// paint outside the surface itself. Missing fields default to 0.
+export interface SurfaceMargin {
+  top?: number;
+  right?: number;
+  bottom?: number;
+  left?: number;
+}
+
 // Snapshot of a window. Matches WindowSnapshot in wm/index.ts (kept in sync
 // by hand because wm/ is core-side; this is what arrives over the wire).
 export interface WindowSnapshot {
@@ -62,6 +83,26 @@ export interface PluginWindows extends PluginWindowObserver {
   // (core-plugin-api.md §1). null clears. For policy-mediated focus
   // changes, emit an event the focus plugin observes instead.
   focus(id: number | null): Promise<void>;
+
+  // Per-surface render-state setters (core-plugin-api.md §1). Each is global
+  // per surface (not per output) and consumed by the compositor's shader
+  // every frame; calls are cheap (uniform-buffer writes on the next frame).
+  // opacity is clamped to [0,1]. Animations targeting these flow through
+  // sdk.animations.run with the matching target ref.
+  setOpacity(id: number, opacity: number): Promise<void>;
+  setTransform(id: number, t: SurfaceTransform): Promise<void>;
+  setOutputMargin(id: number, m: SurfaceMargin): Promise<void>;
+  // Alpha mask sampled across the (surface + outputMargin) region; the .a
+  // channel modulates the surface's premultiplied rgb and alpha. null clears
+  // (default-white, no visible effect). The caller OWNS the GPUTexture's
+  // lifetime: keep it alive while installed; replace or clear before destroy.
+  //
+  // The texture must live on the same GPUDevice the compositor uses to sample
+  // it. For in-thread bundled plugins this is automatic (sdk.gpu.device IS
+  // core's device). Worker plugins cannot pass a GPUTexture across the thread
+  // boundary -- their textures live on a separate device, so the cross-device
+  // mask path is unimplemented; calling this from a Worker plugin rejects.
+  setMask(id: number, mask: GPUTexture | null): Promise<void>;
 }
 
 // The single-output placeholder id (kept in sync with OUTPUT_DEFAULT in
@@ -153,6 +194,52 @@ export function createPluginWindows(
       }
       await endpoint.request("windows.focus", { id });
     },
+
+    async setOpacity(id, opacity): Promise<void> {
+      if (typeof id !== "number") {
+        throw new TypeError("setOpacity id must be a number");
+      }
+      if (typeof opacity !== "number" || !Number.isFinite(opacity)) {
+        throw new TypeError("setOpacity opacity must be a finite number");
+      }
+      await endpoint.request("windows.set-opacity", { id, opacity });
+    },
+
+    async setTransform(id, t): Promise<void> {
+      if (typeof id !== "number") {
+        throw new TypeError("setTransform id must be a number");
+      }
+      validateTransform(t);
+      // SurfaceTransform fields are all `number | undefined` -- structurally
+      // a Json object once undefined-stripped at the postMessage boundary.
+      // eslint-disable-next-line no-restricted-syntax
+      await endpoint.request("windows.set-transform", { id, t: t as unknown as Json });
+    },
+
+    async setOutputMargin(id, m): Promise<void> {
+      if (typeof id !== "number") {
+        throw new TypeError("setOutputMargin id must be a number");
+      }
+      validateMargin(m);
+      // Same Json-compatibility justification as setTransform above.
+      // eslint-disable-next-line no-restricted-syntax
+      await endpoint.request("windows.set-output-margin", { id, m: m as unknown as Json });
+    },
+
+    async setMask(id, mask): Promise<void> {
+      if (typeof id !== "number") {
+        throw new TypeError("setMask id must be a number");
+      }
+      if (mask !== null && (typeof mask !== "object" || mask === undefined)) {
+        throw new TypeError("setMask mask must be a GPUTexture or null");
+      }
+      // The payload carries a GPUTexture reference; not Json-cloneable. For
+      // in-thread the pair-channel delivers by reference. For Worker the
+      // postMessage attempt rejects at the transport boundary -- the right
+      // failure for a plugin whose textures live on a different device.
+      // eslint-disable-next-line no-restricted-syntax
+      await endpoint.request("windows.set-mask", { id, mask: mask as unknown as Json });
+    },
   };
 
   return {
@@ -167,4 +254,28 @@ async function setHint(
   if (typeof id !== "number") throw new TypeError("setHint id must be a number");
   if (typeof value !== "boolean") throw new TypeError("setHint value must be boolean");
   await endpoint.request("windows.set", { id, field, value });
+}
+
+function validateTransform(t: SurfaceTransform): void {
+  if (typeof t !== "object" || t === null) {
+    throw new TypeError("setTransform t must be an object");
+  }
+  for (const k of ["translateX", "translateY", "scaleX", "scaleY"] as const) {
+    const v = t[k];
+    if (v !== undefined && (typeof v !== "number" || !Number.isFinite(v))) {
+      throw new TypeError(`setTransform ${k} must be a finite number`);
+    }
+  }
+}
+
+function validateMargin(m: SurfaceMargin): void {
+  if (typeof m !== "object" || m === null) {
+    throw new TypeError("setOutputMargin m must be an object");
+  }
+  for (const k of ["top", "right", "bottom", "left"] as const) {
+    const v = m[k];
+    if (v !== undefined && (typeof v !== "number" || !Number.isFinite(v) || v < 0)) {
+      throw new TypeError(`setOutputMargin ${k} must be a non-negative finite number`);
+    }
+  }
 }

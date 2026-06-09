@@ -82,6 +82,20 @@ export interface CompositorSink {
   // Install a pre-wrapped wire texture as surface `id`'s sampled texture (plugin
   // overlay consumer texture). Optional (JS compositor only).
   setSurfaceTexture?(id: number, tex: GPUTexture, w: number, h: number): void;
+  // Per-surface render-state setters (core-plugin-api.md §1). Each is global
+  // per surface (not per-output) and consumed by the compositor's shader every
+  // frame. Optional so the native sink (if ever used) need not implement them.
+  setSurfaceOpacity?(id: number, opacity: number): void;
+  setSurfaceTransform?(id: number, t: import("../gpu/compositor.js").SurfaceTransform): void;
+  setSurfaceOutputMargin?(id: number, m: import("../gpu/compositor.js").SurfaceMargin): void;
+  // Alpha mask sampled across the surface + outputMargin region; .a modulates
+  // the surface's alpha (and premultiplied rgb). null clears (default-white,
+  // no visible effect). Caller owns the GPUTexture's lifetime. Reached from
+  // plugins via sdk.windows.setMask -- the texture must live on the same
+  // GPUDevice the compositor uses (in-thread bundled plugins share that
+  // device; Worker plugins do not, so the cross-device handle path is
+  // currently unimplemented for them).
+  setSurfaceMask?(id: number, mask: GPUTexture | null): void;
   removeSurface(id: number): void;
   takeImportedSurfaces(): Array<{ id: number; width: number; height: number }>;
   takeFreedBuffers(): number[];

@@ -10,6 +10,9 @@
 //   8 = list() and log the count + first surfaceId
 //   9 = setOutputStack(0, [100, targetId])
 //  10 = setOutputStack(0, null) -- clear override
+//  11 = setOpacity(targetId, 0.5)
+//  12 = setTransform(targetId, {translateX:10, translateY:20, scaleX:2, scaleY:2})
+//  13 = setOutputMargin(targetId, {top:4, right:8, bottom:12, left:16})
 //
 // targetId is provided via window.change events' surfaceId field (only the
 // LAST change event's surfaceId is used).
@@ -56,6 +59,23 @@ export default async function init(sdk) {
     if (op === 10) {
       await sdk.windows.setOutputStack(0, null);
       sdk.log('clear-output-stack');
+      return;
+    }
+    if (op === 11) {
+      await sdk.windows.setOpacity(targetId, 0.5);
+      sdk.log('set-opacity');
+      return;
+    }
+    if (op === 12) {
+      await sdk.windows.setTransform(targetId,
+        { translateX: 10, translateY: 20, scaleX: 2, scaleY: 2 });
+      sdk.log('set-transform');
+      return;
+    }
+    if (op === 13) {
+      await sdk.windows.setOutputMargin(targetId,
+        { top: 4, right: 8, bottom: 12, left: 16 });
+      sdk.log('set-output-margin');
       return;
     }
   });

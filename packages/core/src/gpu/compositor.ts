@@ -1,44 +1,110 @@
 // JS compositor: the per-output compositing pass, in core main-thread JS, over
-// the Dawn wire (via a wire-retargeted dawn.node GPUDevice). This is the
-// architecture's intended home for the renderer (architecture.md: "the core's
-// per-output frame loop / compositing renderer" runs on the Node main thread);
-// it replaces the equivalent C++ Compositor render path.
+// the Dawn wire (via a wire-retargeted dawn.node GPUDevice). architecture.md
+// calls this "the core's per-output frame loop / compositing renderer."
 //
-// Slice 1: headless (offscreen target) + shm surfaces. Each surface's pixels are
-// uploaded with queue.writeTexture from a zero-copy ArrayBuffer over the client
-// shm mapping (addon.shmView). dmabuf surfaces + nested swapchain present are
-// later slices.
+// shm surfaces upload via queue.writeTexture from a zero-copy ArrayBuffer over
+// the client shm mapping (addon.shmView); dmabuf surfaces import via the GPU
+// process and arrive as wire texture handles wrapped on this device.
 //
-// The WebGPU objects come from dawn.node and conform to the standard WebGPU JS
-// API, so they are typed with @webgpu/types (GPUDevice/GPUTexture/...).
+// Two render targets: an owned offscreen target (read back via readback())
+// and the host swapchain's current texture (acquired + presented per frame).
+// Constructor picks via JsCompositorOpts.nested.
+//
+// WebGPU objects come from dawn.node and conform to the standard JS API; the
+// types are @webgpu/types (GPUDevice/GPUTexture/...).
 
-// The same compositing shader the C++ path used: a unit quad placed into a
-// per-surface normalized output rect, sampling the surface texture.
+// The per-surface compositing shader. A unit quad is placed into the surface's
+// normalized output rect, optionally translated/scaled, optionally extended
+// outward by outputMargin, then textured and modulated by an alpha mask.
+//
+// Uniform layout (one vec4 per slot, std140-aligned):
+//   placement (vec4): x, y, w, h          -- normalized [0,1] output space
+//   transform (vec4): tx, ty, sx, sy      -- translate (normalized), scale (unitless)
+//   margin    (vec4): top, right, bottom, left  -- normalized output px
+//   fx        (vec4): opacity, _, _, _
+//
+// transform.scale anchors at the placement's top-left; an animation wanting
+// center-anchored scale composes that as translate + scale + counter-translate
+// in the plugin-side spec builder.
+//
+// outputMargin reserves canvas around the surface's nominal rect. The mask
+// is sampled across the FULL expanded region (margin included) and its alpha
+// modulates the surface's alpha (and premultiplied rgb). The surface texture
+// itself is only sampled inside [0,1] surface-UV; outside it contributes
+// transparent black. Common cases:
+//   - No mask, no margin: surface renders unchanged (default mask is 1x1 white).
+//   - Rounded corners: mask = corner-alpha texture in [0,1] UV; margin = 0.
+//   - Soft-edged rounded corners: same, but with a small margin so the soft
+//     edge fades into the reserved region.
+//   - Colored shadows / glows: NOT served by mask alone (mask is alpha-only);
+//     use a decoration surface for the color and mask it on its own.
 const WGSL = `
 struct VsOut {
   @builtin(position) pos : vec4f,
-  @location(0) uv : vec2f,
+  @location(0) surfUV : vec2f,
+  @location(1) maskUV : vec2f,
 };
-struct Rect { r : vec4f, };
-@group(0) @binding(2) var<uniform> placement : Rect;
+struct Uniforms {
+  placement : vec4f,
+  transform : vec4f,
+  margin    : vec4f,
+  fx        : vec4f,
+};
+@group(0) @binding(2) var<uniform> u : Uniforms;
 @vertex fn vs(@builtin(vertex_index) i : u32) -> VsOut {
-  var q = array<vec2f, 4>(
-    vec2f(0.0, 1.0), vec2f(1.0, 1.0),
-    vec2f(0.0, 0.0), vec2f(1.0, 0.0));
-  var uv = array<vec2f, 4>(
-    vec2f(0.0, 1.0), vec2f(1.0, 1.0),
-    vec2f(0.0, 0.0), vec2f(1.0, 0.0));
-  let placed = placement.r.xy + q[i] * placement.r.zw;
+  // qExt corners in surface-local UV space, EXPANDED by per-edge margins.
+  // With zero margins this is exactly [0,1]x[0,1]. Triangle-strip order:
+  // (0,1) (1,1) (0,0) (1,0).
+  let mL = u.margin.w; let mR = u.margin.y;
+  let mT = u.margin.x; let mB = u.margin.z;
+  var qExt = array<vec2f, 4>(
+    vec2f(-mL, 1.0 + mB),
+    vec2f(1.0 + mR, 1.0 + mB),
+    vec2f(-mL, -mT),
+    vec2f(1.0 + mR, -mT));
+
+  let surfUV = qExt[i];
+  // Mask UV: remap qExt [-mL, 1+mR] x [-mT, 1+mB] to [0,1] x [0,1].
+  let wTotal = 1.0 + mL + mR;
+  let hTotal = 1.0 + mT + mB;
+  let maskUV = vec2f((surfUV.x + mL) / wTotal, (surfUV.y + mT) / hTotal);
+
+  // Place the (possibly margin-expanded) UV into the surface's output rect,
+  // then apply transform: scale around the placement origin, then translate.
+  let scaled = qExt[i] * vec2f(u.transform.z, u.transform.w);
+  let placed = u.placement.xy + u.transform.xy + scaled * u.placement.zw;
   let ndc = vec2f(placed.x * 2.0 - 1.0, 1.0 - placed.y * 2.0);
+
   var o : VsOut;
   o.pos = vec4f(ndc, 0.0, 1.0);
-  o.uv = uv[i];
+  o.surfUV = surfUV;
+  o.maskUV = maskUV;
   return o;
 }
 @group(0) @binding(0) var samp : sampler;
 @group(0) @binding(1) var tex : texture_2d<f32>;
+@group(0) @binding(3) var maskSamp : sampler;
+@group(0) @binding(4) var maskTex : texture_2d<f32>;
 @fragment fn fs(in : VsOut) -> @location(0) vec4f {
-  return textureSample(tex, samp, in.uv);
+  // Mask is always sampled (the default mask is 1x1 white, so this is a no-op
+  // when the plugin hasn't installed one). The alpha channel is the mask
+  // value; opaque-white = 1.0, transparent = 0.0.
+  let mAlpha = textureSample(maskTex, maskSamp, in.maskUV).a;
+
+  // The surface texture is only meaningful in [0,1] UV; outside (the margin
+  // region) it must contribute nothing. WGSL requires uniform control flow
+  // around textureSample, so we sample unconditionally with explicit LOD
+  // (textureSampleLevel) and multiply by an inside-rect mask computed from
+  // the interpolated UV. The sampled value at clamp-edges is harmless
+  // because we zero it via the inside multiplier below.
+  let surf = textureSampleLevel(tex, samp, in.surfUV, 0.0);
+  let inside = step(0.0, in.surfUV.x) * step(in.surfUV.x, 1.0)
+             * step(0.0, in.surfUV.y) * step(in.surfUV.y, 1.0);
+
+  // Premultiplied: rgb and alpha both multiplied by inside * mAlpha * opacity.
+  // Matches the pipeline's premultiplied blend.
+  let k = inside * mAlpha * u.fx.x;
+  return vec4f(surf.rgb * k, surf.a * k);
 }
 `;
 
@@ -93,10 +159,32 @@ export interface DawnGlobals {
   GPUMapMode: typeof GPUMapMode;
 }
 
+// Per-surface render state mutated by setSurfaceOpacity/Transform/OutputMargin
+// (core-plugin-api.md §1) and consumed by the WGSL Uniforms struct each frame.
+// Defaults: opacity=1, identity transform, zero margin -- equivalent to the
+// pre-primitive shader behavior.
+interface SurfaceFx {
+  opacity: number;
+  // Translate in output pixels; scale unitless. Rotation is deferred (v1 has
+  // no shader path for it; spec builders compose center-anchor scale via
+  // translate before/after).
+  translateX: number; translateY: number;
+  scaleX: number; scaleY: number;
+  // Output-pixel margin reserved around the surface's nominal rect. The
+  // surface texture is only sampled inside [0,1] surface-UV; the mask is
+  // sampled across the FULL expanded region (surface + margin) so it can
+  // shape pixels in the reserved area (soft rounded-corner falloff,
+  // decoration-bound shadow alpha, etc.).
+  marginTop: number; marginRight: number; marginBottom: number; marginLeft: number;
+}
+
 interface Surface {
   texture: GPUTexture | null;       // bgra8unorm, sampled
   view: GPUTextureView | null;
-  placementBuf: GPUBuffer | null;   // uniform buffer (vec4)
+  // 64-byte uniform buffer holding the WGSL Uniforms struct (4 vec4s:
+  // placement, transform, margin, fx). Rebuilt on size change like the
+  // bind group; updated each frame via writeBuffer.
+  uniformBuf: GPUBuffer | null;
   bindGroup: GPUBindGroup | null;
   width: number;
   height: number;
@@ -110,6 +198,23 @@ interface Surface {
   // with the right buffer id, and to know what to (re)bind into the bind group
   // when an import completes.
   currentBufferId: number;
+  fx: SurfaceFx;
+  // Alpha mask sampled across the full expanded (surface + outputMargin)
+  // region. null = use the compositor's shared 1x1-white default (no
+  // visible effect). The bind group references the chosen mask's view;
+  // setSurfaceMask rebuilds the bind group.
+  maskView: GPUTextureView | null;
+}
+
+const UNIFORM_BYTES = 64;
+
+function defaultFx(): SurfaceFx {
+  return {
+    opacity: 1,
+    translateX: 0, translateY: 0,
+    scaleX: 1, scaleY: 1,
+    marginTop: 0, marginRight: 0, marginBottom: 0, marginLeft: 0,
+  };
 }
 
 // The executor's per-bufferId record. Holds the GPU side of a cached client
@@ -144,6 +249,26 @@ interface DmabufDescriptor {
 
 const DEFAULT_FORMAT = "bgra8unorm";
 
+// Public payloads for the per-surface render-state setters
+// (setSurfaceTransform, setSurfaceOutputMargin). Each field is optional so
+// callers may partially update; missing fields reset to the identity / zero.
+export interface SurfaceTransform {
+  translateX?: number;
+  translateY?: number;
+  scaleX?: number;
+  scaleY?: number;
+}
+export interface SurfaceMargin {
+  top?: number;
+  right?: number;
+  bottom?: number;
+  left?: number;
+}
+
+function clamp(v: number, lo: number, hi: number): number {
+  return v < lo ? lo : v > hi ? hi : v;
+}
+
 export interface JsCompositorOpts {
   // Present to the host swapchain (slice 3) instead of an offscreen target.
   // Requires dawn + deviceHandle (for wrapTexture) and the addon acquire/present.
@@ -163,6 +288,15 @@ export class JsCompositor implements CompositorSink {
   private warnedDmabuf = false;
 
   private sampler: GPUSampler;
+  // Mask sampler: linear filtering so soft mask edges (rounded corners with
+  // anti-aliasing) interpolate nicely. The surface sampler stays nearest
+  // (clients render their own crisp pixels and we don't want bilinear blur).
+  private maskSampler: GPUSampler;
+  // Shared 1x1 BGRA8 opaque-white texture; the default mask for every surface.
+  // Sampling it returns alpha=1 unconditionally, so a surface with no mask
+  // renders identically to a surface whose mask is solid white. One texture
+  // serves every surface (texture views are cheap to create per bind group).
+  private defaultMaskView: GPUTextureView;
   private pipeline: GPURenderPipeline;
   private layout: GPUBindGroupLayout;
   private target?: GPUTexture;          // offscreen render target (headless)
@@ -232,6 +366,25 @@ export class JsCompositor implements CompositorSink {
     this.format = opts.format ?? DEFAULT_FORMAT;
 
     this.sampler = device.createSampler({ magFilter: "nearest", minFilter: "nearest" });
+    this.maskSampler = device.createSampler({ magFilter: "linear", minFilter: "linear" });
+
+    // Allocate the shared default mask. 1x1 opaque white; uploaded once at
+    // construction. Every surface defaults to a view of this texture, so the
+    // shader path is always "sample mask" regardless of whether the plugin
+    // installed one.
+    const defaultMask = device.createTexture({
+      size: { width: 1, height: 1 },
+      format: "bgra8unorm",
+      usage: this.g.GPUTextureUsage.TEXTURE_BINDING | this.g.GPUTextureUsage.COPY_DST,
+    });
+    device.queue.writeTexture(
+      { texture: defaultMask },
+      new Uint8Array([0xff, 0xff, 0xff, 0xff]),
+      { bytesPerRow: 4, rowsPerImage: 1 },
+      { width: 1, height: 1 },
+    );
+    this.defaultMaskView = defaultMask.createView();
+
     const module = device.createShaderModule({ code: WGSL });
     this.pipeline = device.createRenderPipeline({
       layout: "auto",
@@ -297,6 +450,57 @@ export class JsCompositor implements CompositorSink {
     else this.surfaces.set(id, blankSurface(x, y, w, h));
   }
 
+  // Per-surface render-state setters (core-plugin-api.md §1). Cheap: they
+  // mutate the per-surface SurfaceFx; the values flow into the WGSL Uniforms
+  // each frame via updateUniforms. Auto-create the Surface so callers don't
+  // race the protocol layer's setSurfaceLayout.
+  setSurfaceOpacity(id: number, opacity: number): void {
+    this.ensureSurface(id).fx.opacity = clamp(opacity, 0, 1);
+  }
+
+  setSurfaceTransform(id: number, t: SurfaceTransform): void {
+    const fx = this.ensureSurface(id).fx;
+    fx.translateX = t.translateX ?? 0;
+    fx.translateY = t.translateY ?? 0;
+    fx.scaleX = t.scaleX ?? 1;
+    fx.scaleY = t.scaleY ?? 1;
+  }
+
+  setSurfaceOutputMargin(id: number, m: SurfaceMargin): void {
+    const fx = this.ensureSurface(id).fx;
+    fx.marginTop = m.top ?? 0;
+    fx.marginRight = m.right ?? 0;
+    fx.marginBottom = m.bottom ?? 0;
+    fx.marginLeft = m.left ?? 0;
+  }
+
+  // Install (or clear) an alpha mask on a surface. The mask is sampled across
+  // the full expanded (surface + outputMargin) region; its .a channel modulates
+  // the surface's alpha (and premultiplied rgb). null restores the default
+  // white mask (no visible effect).
+  //
+  // Bind groups embed view references, so we must rebuild the surface's bind
+  // group on every mask change. Cheap (per-frame state changes are not
+  // expected; mask installation is a state event, not a hot path).
+  //
+  // Caller owns the GPUTexture's lifetime: the compositor doesn't take
+  // ownership, never .destroy()s it. The caller MUST keep the texture alive
+  // for as long as it is installed, and replace or clear it before destroy.
+  setSurfaceMask(id: number, mask: GPUTexture | null): void {
+    const s = this.ensureSurface(id);
+    s.maskView = mask ? mask.createView() : null;
+    // Rebuild the bind group if a surface view already exists. If no surface
+    // texture is committed yet, the mask installs into the Surface struct;
+    // the next rebuildBindGroup (on first content) will pick it up.
+    if (s.view) this.rebuildBindGroup(s, s.view);
+  }
+
+  private ensureSurface(id: number): Surface {
+    let s = this.surfaces.get(id);
+    if (!s) { s = blankSurface(0, 0, 0, 0); this.surfaces.set(id, s); }
+    return s;
+  }
+
   removeSurface(id: number): void {
     // Feed surfaceRemoved to the lifecycle BEFORE dropping the Surface record.
     // The state machine emits the (gated-on-completion) sendWlRelease +
@@ -309,13 +513,13 @@ export class JsCompositor implements CompositorSink {
 
     const s = this.surfaces.get(id);
     if (s) {
-      // The per-surface placement uniform buffer is a wire GPUBuffer the
-      // executor owns; destroy it now. The sampled texture is the dmabuf
-      // import owned by dmabufImports/lifecycle; the lifecycle path released
-      // it via the surfaceRemoved drain (or deferred until inflight frames
-      // complete). Explicitly .destroy()-ing the wrapped client texture here
-      // caused intermittent fatal dawn.node throws during teardown.
-      s.placementBuf?.destroy();
+      // The per-surface uniform buffer is a wire GPUBuffer the executor
+      // owns; destroy it now. The sampled texture is the dmabuf import
+      // owned by dmabufImports/lifecycle; the lifecycle path released it
+      // via the surfaceRemoved drain (or deferred until inflight frames
+      // complete). Explicitly .destroy()-ing the wrapped client texture
+      // here caused intermittent fatal dawn.node throws during teardown.
+      s.uniformBuf?.destroy();
     }
     this.surfaces.delete(id);
   }
@@ -409,20 +613,32 @@ export class JsCompositor implements CompositorSink {
     s.view = imp.view;
     s.width = imp.width;
     s.height = imp.height;
-    const placementBuf = s.placementBuf ?? this.device.createBuffer({
-      size: 16, usage: this.g.GPUBufferUsage.UNIFORM | this.g.GPUBufferUsage.COPY_DST,
-    });
-    s.placementBuf = placementBuf;
+    this.rebuildBindGroup(s, imp.view);
+    s.present = true;
+    this.imported.push({ id, width: imp.width, height: imp.height });
+  }
+
+  // Allocate (lazily) the per-surface uniform buffer + rebuild the bind group
+  // bound to `view` plus the surface's current mask (or the default-white
+  // mask). Called whenever the sampled view or the mask view changes.
+  private rebuildBindGroup(s: Surface, view: GPUTextureView): void {
+    if (!s.uniformBuf) {
+      s.uniformBuf = this.device.createBuffer({
+        size: UNIFORM_BYTES,
+        usage: this.g.GPUBufferUsage.UNIFORM | this.g.GPUBufferUsage.COPY_DST,
+      });
+    }
+    const mask = s.maskView ?? this.defaultMaskView;
     s.bindGroup = this.device.createBindGroup({
       layout: this.layout,
       entries: [
         { binding: 0, resource: this.sampler },
-        { binding: 1, resource: imp.view },
-        { binding: 2, resource: { buffer: placementBuf } },
+        { binding: 1, resource: view },
+        { binding: 2, resource: { buffer: s.uniformBuf } },
+        { binding: 3, resource: this.maskSampler },
+        { binding: 4, resource: mask },
       ],
     });
-    s.present = true;
-    this.imported.push({ id, width: imp.width, height: imp.height });
   }
 
   // Run the intents the lifecycle just emitted. The executor is intentionally
@@ -554,18 +770,7 @@ export class JsCompositor implements CompositorSink {
     s.width = w; s.height = h;
     const view = tex.createView();
     s.view = view;
-    const placementBuf = s.placementBuf ?? this.device.createBuffer({
-      size: 16, usage: this.g.GPUBufferUsage.UNIFORM | this.g.GPUBufferUsage.COPY_DST,
-    });
-    s.placementBuf = placementBuf;
-    s.bindGroup = this.device.createBindGroup({
-      layout: this.layout,
-      entries: [
-        { binding: 0, resource: this.sampler },
-        { binding: 1, resource: view },
-        { binding: 2, resource: { buffer: placementBuf } },
-      ],
-    });
+    this.rebuildBindGroup(s, view);
     s.present = true;
   }
 
@@ -628,18 +833,7 @@ export class JsCompositor implements CompositorSink {
       s.view = view;
       s.width = c.width;
       s.height = c.height;
-      const placementBuf = s.placementBuf ?? this.device.createBuffer({
-        size: 16, usage: this.g.GPUBufferUsage.UNIFORM | this.g.GPUBufferUsage.COPY_DST,
-      });
-      s.placementBuf = placementBuf;
-      s.bindGroup = this.device.createBindGroup({
-        layout: this.layout,
-        entries: [
-          { binding: 0, resource: this.sampler },
-          { binding: 1, resource: view },
-          { binding: 2, resource: { buffer: placementBuf } },
-        ],
-      });
+      this.rebuildBindGroup(s, view);
     }
 
     // `data` begins at the buffer's first pixel row, so dataLayout offset is 0.
@@ -652,14 +846,30 @@ export class JsCompositor implements CompositorSink {
     s.present = true;
   }
 
-  private updatePlacement(s: Surface): void {
-    if (!s.placementBuf) return;
+  // Pack the per-surface render state (placement + transform + margin + fx)
+  // into the WGSL Uniforms struct and upload. Normalizes all output-pixel
+  // quantities to [0,1] output space; the shader needs no output dims.
+  private updateUniforms(s: Surface): void {
+    if (!s.uniformBuf) return;
     const w = s.layoutW || s.width;
     const h = s.layoutH || s.height;
-    const rect = new Float32Array([
-      s.x / this.width, s.y / this.height, w / this.width, h / this.height,
-    ]);
-    this.device.queue.writeBuffer(s.placementBuf, 0, rect);
+    const ow = this.width, oh = this.height;
+    const fx = s.fx;
+    const data = new Float32Array(UNIFORM_BYTES / 4);
+    // placement
+    data[0] = s.x / ow; data[1] = s.y / oh;
+    data[2] = w / ow;   data[3] = h / oh;
+    // transform: translate (normalized output coords); scale (unitless)
+    data[4] = fx.translateX / ow; data[5] = fx.translateY / oh;
+    data[6] = fx.scaleX;          data[7] = fx.scaleY;
+    // margin: top/right/bottom/left (normalized output coords)
+    data[8]  = fx.marginTop    / oh;
+    data[9]  = fx.marginRight  / ow;
+    data[10] = fx.marginBottom / oh;
+    data[11] = fx.marginLeft   / ow;
+    // fx: opacity in x; rest reserved
+    data[12] = fx.opacity;
+    this.device.queue.writeBuffer(s.uniformBuf, 0, data);
   }
 
   // Composite one frame: clear black, draw stack back-to-front, premultiplied
@@ -743,7 +953,7 @@ export class JsCompositor implements CompositorSink {
       for (const id of draw) {
         const s = this.surfaces.get(id);
         if (s && s.present && s.bindGroup) {
-          this.updatePlacement(s);
+          this.updateUniforms(s);
           pass.setBindGroup(0, s.bindGroup);
           pass.draw(4);
         }
@@ -835,8 +1045,10 @@ export class JsCompositor implements CompositorSink {
 
 function blankSurface(x: number, y: number, w: number, h: number): Surface {
   return {
-    texture: null, view: null, placementBuf: null, bindGroup: null,
+    texture: null, view: null, uniformBuf: null, bindGroup: null,
     width: 0, height: 0, x, y, layoutW: w, layoutH: h, present: false,
     currentBufferId: 0,
+    fx: defaultFx(),
+    maskView: null,
   };
 }
