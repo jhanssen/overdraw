@@ -429,7 +429,9 @@ screen recording, thumbnails.
 
 - Render-to-texture path in the compositor accepting explicit window list
   + output context.
-- Three modes: `'snapshot'`, `'live'`, `'live-on-damage'`.
+- Two modes: `'snapshot'` (one-shot capture at call time) and `'live'`
+  (texture kept in sync with compositor state; re-render scheduling is
+  the compositor's business, not part of the contract).
 - Texture lifecycle: refcounted handles; `release()` semantics.
 - ~400 lines.
 
@@ -443,9 +445,55 @@ screen recording, thumbnails.
 **Total estimate**: ~550 lines, GPU-heavy.
 
 **What this validates**: the most novel core mechanism. New GPU tests in
-`test/compose.gpu.mjs`: snapshot returns expected pixels; live mode
-updates on client commit; live-on-damage doesn't re-render static content
-(count render passes).
+`test/compose.gpu.mjs`: snapshot returns expected pixels frozen at call
+time (subsequent client commits don't change it); live mode reflects
+subsequent client commits and per-surface state changes.
+
+## Phase 5.5 — Core effect primitives
+
+Small expansion of the per-surface state primitives Phase 4 added. These
+are effects expressible as values fed into the existing WGSL pipeline —
+one sample of the surface texture, modulated by uniform values — so they
+ride the existing compositor pass without needing the intercept-chain
+machinery of Phase 10. The criterion: if an effect can be expressed as
+"here's a value for each window" with one sample per pixel, it belongs in
+core; if it needs a separate shader pass that reads the window's pixels
+(blur, distortion, convolution, arbitrary user WGSL), it's an intercept
+(Phase 10).
+
+The mask + outputMargin primitives Phase 4 added already cover rounded
+corners (mask = corner-alpha texture) and soft-shadow alpha falloff;
+`customization.md:171-175` is explicit about this. So those are not
+listed below — they already work.
+
+### 5.5a. Tint + color matrix
+
+- `sdk.windows.setSurfaceTint(id, rgba)` — one extra uniform, multiplied
+  into the sampled surface pixel before the existing alpha/mask/opacity
+  modulation. Default `{1,1,1,1}` = identity.
+- `sdk.windows.setSurfaceColorMatrix(id, mat4)` — single 4×4 multiplication
+  on the sampled RGBA. Covers saturation, hue rotation, contrast,
+  brightness, and arbitrary linear color transforms in one primitive.
+  Default = identity matrix.
+- Compositor side: extend the WGSL `Uniforms` struct, update
+  `updateUniforms`, add two setters paralleling `setSurfaceOpacity` etc.
+- Windows-broker plumbing matching the existing setters.
+- ~80 lines of compositor + WGSL + broker.
+
+### 5.5b. (Optional) 3D LUT
+
+- `sdk.windows.setSurfaceLut3D(id, tex)` — extra texture sample for
+  arbitrary color grading. On the boundary between "value" and "shader
+  pass" (it is one extra sample, no neighbor sampling, so it fits the
+  core criterion); ship if a real consumer wants it. Skip until then.
+
+**Total estimate**: ~80 lines (5.5a only); add ~80 more if 5.5b lands.
+
+**What this validates**: the criterion line between "core primitive" and
+"intercept." `setSurfaceTint` and `setSurfaceColorMatrix` are the first
+test cases that the per-surface uniform path can grow without spilling
+into intercept territory. New pure-unit tests for the uniform packing;
+GPU test: tint a window red, readback shows red-modulated pixels.
 
 ## Phase 6 — Workspaces (first greenfield plugin, instant transitions)
 
@@ -551,7 +599,110 @@ The API surface for `sdk.transitions.run` is `core-plugin-api.md` §8.
 **What this validates**: phantom-window lifetime via the
 await-on-decision pattern; cursor customization end-to-end.
 
-## Phase 10 — Remaining greenfield (per demand)
+## Phase 10 — Buffer intercept
+
+The per-pixel intercept feature designed in `customization.md` §"Buffer
+interception" / §"Chains" (lines 177-310, 455-490). A plugin registers
+against a client-window match; for each matched surface, the plugin's
+`render` callback runs once per frame the surface updates and writes a
+new texture which core composites instead of the client buffer. Use
+cases: blur, color grading via custom shaders, distortion, CRT-style
+effects, any user-written WGSL window effect. Effects that fit core's
+"one sample per pixel modulated by uniforms" criterion go through Phase
+5.5 instead; intercept is for genuine shader passes that need the
+client texture as input.
+
+Builds on Phase 5 (scene compose) and Phase 9 (the await-on-decision
+pattern from `window.closing` generalizes to per-surface phantom
+lifetime for animations driven by intercept output). Resolves the
+buffer-import open point flagged in `customization.md:215` (whether
+core dual-imports or the plugin is the sole importer) as part of
+phase planning, not as a code afterthought.
+
+### 10a. Match registry + per-client activation
+
+- `sdk.intercept.register({name, match, contributes, inputs,
+  inputMargin, outputMargin, priority, setup})` — registration API per
+  `customization.md:460-482`.
+- Per-client match (not per-surface): when a client matches, the
+  intercept applies to all that client's content surfaces (toplevel,
+  subsurfaces, popups, layer-shell). Cursor excluded.
+- `onSurfaceMatched` / `onSurfaceUnmatched` lifecycle callbacks; `setup`
+  runs once.
+- ~250 lines (broker + match engine + lifecycle wiring).
+
+### 10b. Chain orchestration + categorized ordering
+
+- Categories: `pixels` → `geometry` → `composition`. Registration
+  order within a category, explicit `priority` overrides.
+- Chain runs through core, not direct plugin-to-plugin. Each stage's
+  output handle + fence is posted to core; core dispatches the next
+  stage with prior output + fence as input. Failure of a stage skips
+  it cleanly with fallback to upstream cached output.
+- Padding propagation: each stage's textures sized to the conservative
+  max of `inputMargin`/`outputMargin` across the chain.
+- ~300 lines.
+
+### 10c. Per-stage texture lifecycle + caching
+
+- Textures allocated per intercepted client surface, lifetime tied to
+  the match.
+- Per-stage cache: a stage whose inputs (surface buffer, window state,
+  effect state) haven't changed since last frame returns its previous
+  output unchanged. The "what changed" signals are the same chokepoint
+  Phase 5 needs for live-mode invalidation — share the mechanism.
+- ~200 lines.
+
+### 10d. Cross-device dmabuf for external plugins
+
+- External plugins render on their own device against a `GPUTexture`.
+  SDK imports the client's dmabuf onto the plugin's device.
+- Reuses the cross-device dmabuf + fence primitives already in place
+  for the plugin overlay path (`status.md` §"Cross-device dmabuf +
+  fence"); shares wiring with Phase 5b.
+- Resolve the open import-policy point: core does NOT import client
+  buffers for intercepted surfaces in the steady state; the plugin is
+  the sole importer; core caches the plugin's last output and falls
+  back on transient miss. Re-import on transition (plugin failed,
+  match removed, plugin uninstalled). Per `customization.md:215-225`.
+- ~250 lines.
+
+### 10e. `outputRect` return + geometry-category integration
+
+- A `render` callback may return `{outputRect}`; core composites the
+  plugin's output at that rect rather than the surface's natural
+  geometry. Subsumes per-frame transform animations driven by a
+  plugin (CRT-off shrink-to-point, slide, scale).
+- Wires into the compositor's per-surface placement path.
+- ~100 lines.
+
+### 10f. Interaction with takeover + compose
+
+- During output takeover, intercepts continue to run; their outputs
+  feed core's normal compositing; the takeover plugin's `input.texture`
+  is the composited scene with intercepts applied
+  (`customization.md:350-353`).
+- `compose.windows` / `compose.scene` apply the intercept chain to
+  each listed window's output. This is the missing piece §6 of
+  `core-plugin-api.md` already references with "intercept chain
+  applied"; Phase 10 is when that promise becomes true. Update §6 to
+  remove the not-yet-applied caveat.
+- ~50 lines of integration + the §6 doc edit.
+
+**Total estimate**: ~1150 lines. Substantial; the largest phase in the
+plan.
+
+**What this validates**: per-pixel plugin participation in compositing.
+The chain orchestration model. The cross-device dmabuf primitive in
+the reverse direction (core → plugin) at scale. The buffer-import
+policy in practice. GPU integration tests: rounded-corners intercept
+(plugin renders a corner-masked output, pixel readback confirms the
+shape); chain of two intercepts (one tint, one blur) produces the
+expected composed effect; a failing intercept stage falls back to
+upstream cached output without flicker; geometry-category intercept
+returns a per-frame `outputRect` and the window animates accordingly.
+
+## Phase 11 — Remaining greenfield (per demand)
 
 Demand-driven; ordering doesn't matter much:
 
@@ -576,11 +727,13 @@ Demand-driven; ordering doesn't matter much:
 | 4. Animation evaluator | 800 | yes | per-frame eval, spec serialization, springs |
 | 4.5. Event interception | 270 | minimal | bus modify/defer; `window.relayout`; await-on-decision generalized |
 | 5. Scene compose | 550 | yes | the load-bearing pixel primitive |
+| 5.5. Core effect primitives | 80 | minimal | tint + colorMatrix; the core-vs-intercept criterion |
 | 6. Workspaces (instant) | 500 | no | first real greenfield plugin |
 | 7. Hotkeys | 300 | no | input.bind + actions composition |
 | 8. Transitions | 350 | yes | compose + animations interplay |
 | 9. Cursor + closing | 400 | yes | velocity, snapshot lifecycle |
-| 10. Remaining greenfield | per demand | varies | — |
+| 10. Buffer intercept | 1150 | yes | per-pixel plugin participation; chain orchestration; cross-device dmabuf at scale |
+| 11. Remaining greenfield | per demand | varies | — |
 
 **Phases 0–3** (foundation + extractions): no user-visible change, but
 the plugin model is exercised end-to-end on existing functionality. ~1650
@@ -589,27 +742,44 @@ lines.
 **Phases 4–4.5** (animation + interception): GPU primitives + bus
 generalization. ~1070 lines.
 
-**Phase 5** (scene compose): the load-bearing pixel primitive. ~550 lines.
+**Phase 5 + 5.5** (scene compose + core effect primitives): the load-
+bearing pixel primitive plus the small effect-uniform expansion. ~630
+lines.
 
 **Phases 6–8** (workspaces + hotkeys + transitions): first new user-
 visible feature set. ~1150 lines.
 
-**Phases 9–10**: polish + remaining greenfield.
+**Phase 9** (cursor + closing): polish + the await-on-decision
+generalization used by Phase 10.
+
+**Phase 10** (buffer intercept): per-pixel plugin compositing; the
+largest single phase. ~1150 lines.
+
+**Phase 11**: demand-driven greenfield.
 
 Total to "a real compositor with workspaces and animated transitions"
-(Phases 0–8): **~4420 lines** of core + plugin code. Comparable to the
-existing `src/` size (~6000 lines incl. tests).
+(Phases 0–8): **~4500 lines** of core + plugin code. Comparable to the
+existing `src/` size (~6000 lines incl. tests). Adding intercept
+(Phase 10) brings the total to ~5650 lines.
 
 ## What this plan does not promise
 
-- These estimates are rough. Spring physics, the JSON-RPC framing, and
-  the compose dmabuf wiring each have unknowns that could change the
-  shape of the work.
+- These estimates are rough. Spring physics, the JSON-RPC framing, the
+  compose dmabuf wiring, and the intercept chain orchestration each have
+  unknowns that could change the shape of the work.
 - The plan assumes the seven decisions in `core-plugin-api.md` hold. If
   any are revisited (especially "scene compose" or "animation library
   in-house"), the affected phases reshape.
+- Phase 10 (buffer intercept) has an open design point inherited from
+  `customization.md:215` — whether core also imports client buffers for
+  intercepted surfaces (dual-import) or the plugin is sole importer with
+  core caching the last successful output. Phase planning must resolve
+  this before code; the chosen direction (per Phase 10d) is "plugin is
+  sole importer, core caches" but it's worth confirming under
+  implementation pressure.
 - Pre-conditions (`wl_output` reconfiguration, frame clock, xdg_toplevel
   state) are real and may need to be interleaved. The plan doesn't
   schedule them; it assumes they land alongside the work as needed.
-- "Lines of code" is a poor proxy for time. GPU work (Phases 4, 5, 8, 9)
-  is typically more time per line than pure-CPU code (0, 1, 2, 3, 6, 7).
+- "Lines of code" is a poor proxy for time. GPU work (Phases 4, 5, 5.5,
+  8, 9, 10) is typically more time per line than pure-CPU code (0, 1,
+  2, 3, 6, 7).

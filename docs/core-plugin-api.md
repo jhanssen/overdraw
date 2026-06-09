@@ -73,8 +73,9 @@ the *behavior* is core's job and the plugin is choosing *which* of
 several core-provided implementations to use, the API exposes a closed
 string set:
 
-- `sdk.compose.scene({mode: 'snapshot' | 'live' | 'live-on-damage'})` —
-  freshness contract for core's render-cache scheduling.
+- `sdk.compose.scene({mode: 'snapshot' | 'live'})` — freshness contract
+  for the returned texture (one-shot capture vs. kept-in-sync with
+  compositor state).
 - `sdk.transitions.run({kind: 'crossfade' | 'slide-N' | 'scale'})` —
   core's built-in shaders.
 - `AnimationSpec` types (`'tween' | 'spring' | ...`) — core's
@@ -362,13 +363,13 @@ The load-bearing primitive for "do something pixel-level with windows."
 sdk.compose.windows({
   outputId,
   windows: ReadonlyArray<{ id: SurfaceId, rect?: { x, y, w, h } }>,
-  mode: 'snapshot' | 'live' | 'live-on-damage',
+  mode: 'snapshot' | 'live',
 }): Promise<WindowComposition>
 
 sdk.compose.scene({
   outputId,
   windows: ReadonlyArray<SurfaceId>,
-  mode: 'snapshot' | 'live' | 'live-on-damage',
+  mode: 'snapshot' | 'live',
 }): Promise<SceneHandle>
 
 type WindowComposition = {
@@ -382,17 +383,26 @@ type SceneHandle = { texture: GPUTexture; release(): Promise<void>; };
 chain applied and per-surface state baked in). `compose.scene` returns the
 composed result as a single texture (built on the same primitive).
 
+The intercept chain is the `sdk.intercept` mechanism designed in
+`customization.md` §"Buffer interception" / §"Chains" (per-client match,
+ordered chain by category `pixels`→`geometry`→`composition`, padding
+propagation). It is **not yet implemented**; until then, compose
+textures carry per-surface state (opacity / transform / mask /
+outputMargin / tint / colorMatrix) and any spliced decoration surfaces,
+but no per-pixel plugin transform. `build-order.md` Phase 10 is when
+the chain becomes real and `compose.*` start applying it.
+
 Modes:
 
-- `'snapshot'`: one-shot render, texture never updates. Cheap; for short
-  transitions where one frame's snapshot is enough.
-- `'live'`: core re-renders every frame regardless of source state.
-  Texture content updates on every frame. For ongoing thumbnails / overview
-  mode where the content is part of an animation.
-- `'live-on-damage'`: core re-renders only when source windows commit
-  damage. Texture content updates on real changes. For screen recording /
-  long-lived thumbnails / anywhere you want freshness without paying for
-  re-rendering static content.
+- `'snapshot'`: one-shot render at call time; texture never updates. For
+  short transitions where one frame's snapshot is enough, and for capture
+  use cases that want exactly the state at a moment in time (screenshots).
+- `'live'`: texture is kept in sync with what the compositor would draw
+  for that window list on that output. Caller doesn't specify "when" --
+  re-rendering is the compositor's business. Use for thumbnails, overview
+  modes, screen recording, accessibility magnifier, any case where the
+  texture should track ongoing changes (client buffer commits, per-surface
+  state changes, animation evaluator output).
 
 Capture use cases (screenshots, recording, thumbnails) are served by this
 primitive. No separate `sdk.capture` namespace. Per-frame delivery, if a
@@ -980,7 +990,10 @@ themselves are not core's code.
 
 - **Scene compose mode**: no default; `mode` is required on every `compose`
   call. Snapshot and live have different correctness properties (a snapshot
-  goes stale on client updates; live keeps re-rendering). Caller picks.
+  is frozen at call time; live tracks ongoing compositor state). Caller
+  picks. Two modes only -- no separate `'live-on-damage'`: how aggressively
+  core re-renders a live texture (every tick vs. dirty-tracked) is an
+  internal compositor optimization, not part of the contract.
 
 - **Action namespace collisions**: error on duplicate `register`. Collisions
   are bugs, not policies. The priority-chain is for handlers of *events*,
@@ -1047,10 +1060,9 @@ themselves are not core's code.
 - **`sdk.capture` dropped**: no `sdk.capture` namespace. The capture use
   cases (screenshots, recording, thumbnails, accessibility magnifier) are
   served by `sdk.compose.windows` / `sdk.compose.scene`. `mode` is
-  `'snapshot' | 'live' | 'live-on-damage'`; `'live-on-damage'` re-renders
-  only when source windows commit, which covers the common "I want to
-  observe every change" case efficiently. Per-frame delivery (if a plugin
-  wants a callback per frame) is built on top via `sdk.frame.onTick`
+  `'snapshot' | 'live'`: snapshot captures one frame, live tracks
+  compositor state for ongoing observation. Per-frame delivery (if a
+  plugin wants a callback per frame) is built on top via `sdk.frame.onTick`
   reading the compose texture.
 
 - **Animation library**: in-house, with the API surface modeled on Motion
@@ -1160,8 +1172,8 @@ Specific corrections to fold into `customization.md` when this gets built:
   core-owned per-surface state; no user-function easings.
 - **§"Capture" (lines 309–337)**: dropped. No `sdk.capture` namespace.
   Capture use cases use `sdk.compose.windows` / `sdk.compose.scene` with
-  `mode: 'live'` or `'live-on-damage'`. Per-frame delivery via
-  `sdk.frame.onTick` reading the live texture.
+  `mode: 'snapshot'` (one-shot) or `'live'` (ongoing). Per-frame delivery
+  via `sdk.frame.onTick` reading the live texture.
 
 ## Relationship to other docs
 
