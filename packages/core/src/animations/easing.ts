@@ -14,7 +14,7 @@
 // curve passes through (0,0); at t=1 through (1,1). Out-of-range t is
 // clamped at the call site.
 
-import type { CubicBezier, EasingSpec } from "./spec.js";
+import type { CubicBezier, EasingSpec } from "@overdraw/animation-types";
 
 // CSS preset curves (https://drafts.csswg.org/css-easing-1/#valdef-easing-function-ease).
 const PRESETS: Record<string, CubicBezier> = {

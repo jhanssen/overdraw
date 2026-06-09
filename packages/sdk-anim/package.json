@@ -1,0 +1,18 @@
+{
+  "name": "@overdraw/sdk-anim",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Plugin-side spec builders for the animations namespace (core-plugin-api.md §9). Constructs AnimationSpec values that plugins submit via sdk.animations.run; no runtime sdk dependency.",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
+  },
+  "dependencies": {
+    "@overdraw/animation-types": "*"
+  }
+}

@@ -5,6 +5,8 @@
     { "path": "./packages/plugin-layout-default" },
     { "path": "./packages/focus-types" },
     { "path": "./packages/plugin-focus-default" },
+    { "path": "./packages/animation-types" },
+    { "path": "./packages/sdk-anim" },
     { "path": "./packages/core" }
   ]
 }

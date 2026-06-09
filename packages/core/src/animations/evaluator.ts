@@ -15,7 +15,7 @@ import type { CompositorSink } from "../protocols/ctx.js";
 import type {
   AnimationHandle, AnimationSpec, ParallelSpec, SequenceSpec,
   SpringSpec, TargetRef, TweenSpec,
-} from "./spec.js";
+} from "@overdraw/animation-types";
 import { resolveEasing, type EasingFn } from "./easing.js";
 import { DEFAULT_SPRING, SpringState, type SpringParams } from "./spring.js";
 import { applyValue, coerceValue } from "./value.js";

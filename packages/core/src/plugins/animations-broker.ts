@@ -4,7 +4,7 @@
 // the windows broker.
 
 import type { AnimationEvaluator } from "../animations/evaluator.js";
-import type { AnimationSpec, TargetRef } from "../animations/spec.js";
+import type { AnimationSpec, TargetRef } from "@overdraw/animation-types";
 
 export const NOT_HANDLED = Symbol("animations-broker:not-handled");
 

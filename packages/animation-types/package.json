@@ -1,0 +1,15 @@
+{
+  "name": "@overdraw/animation-types",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Canonical AnimationSpec / TargetRef / EasingSpec types for the animations namespace (core-plugin-api.md §9). Imported by core's evaluator + broker, by @overdraw/sdk-anim's builders, and by any plugin that wants to type-check specs directly. Type-only: no runtime code.",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
+  }
+}

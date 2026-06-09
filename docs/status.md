@@ -688,15 +688,18 @@ per-surface render state primitives (Phase 4a:
 One IPC call per animation regardless of duration -- the evaluator
 ticks in-core.
 
-- **Spec format**
-  (`packages/core/src/animations/spec.ts`): `tween` (cubic-bezier
+- **Spec format** (`@overdraw/animation-types`): `tween` (cubic-bezier
   easing + the four CSS presets), `spring` (semi-implicit Euler with
   rest-velocity threshold; default stiffness 200, damping 20, mass 1),
   `sequence` (await items in order), `parallel` (await all items
   concurrently). `decay` / `keyframes` / `stagger` are deferred until
   concrete use cases demand them (per `core-plugin-api.md` "v1
   minimal"). User-function easings are not supported (not
-  serializable); cubic-bezier covers the same envelope.
+  serializable); cubic-bezier covers the same envelope. The shared
+  type package follows the same pattern as `@overdraw/layout-types`
+  and `@overdraw/focus-types`: core's evaluator + broker, the
+  `@overdraw/sdk-anim` builders, and any plugin that wants to
+  type-check specs directly all import from one source.
 - **Targets**: `window-opacity`, `window-transform` (full
   translate+scale object), `window-output-margin` (full margin
   object). One active leaf per (kind, windowId) at a time --
@@ -729,6 +732,37 @@ ticks in-core.
   `test/inthread-animation.gpu.mjs` (GPU integration via a bundled
   in-thread plugin running `sdk.animations.run` on opacity; readback
   at midpoint + completion).
+
+### `@overdraw/sdk-anim` (Phase 4c)
+
+The plugin-side spec builder library. Type-safe functions that
+produce `AnimationSpec` values plugins submit via `sdk.animations.run`:
+
+- `tween(target, { from, to, duration, easing? })` -> `TweenSpec`
+- `spring(target, { from, to, stiffness?, damping?, mass?,
+  initialVelocity? })` -> `SpringSpec`
+- `sequence(...items)` / `parallel(...items)` -> composite specs
+- `target.windowOpacity(id)` / `windowTransform(id)` /
+  `windowOutputMargin(id)` -> `TargetRef` values
+- `cubicBezier(x1, y1, x2, y2)` + `easings.*` (linear / ease / easeIn /
+  easeOut / easeInOut) -> easing values
+
+The builders are stateless functions over `AnimationSpec` shapes from
+`@overdraw/animation-types`; no SDK runtime dependency. Tests:
+`test/sdk-anim-builders.test.js` (pure-unit, 14 tests: shape checks
+for each builder + composites + easings + statelessness),
+`test/sdk-anim.gpu.mjs` (GPU integration via a bundled in-thread
+plugin that uses `import { tween, target } from "@overdraw/sdk-anim"`
+to construct a spec and submits it; midpoint + completion pixel
+readback matches the hand-built-spec test).
+
+The builder API diverges from the doc example in
+`core-plugin-api.md:407-413` in one small way: the doc shows
+`animate(...)` calling `sdk.animations.run`, but the builder pattern
+chosen returns the spec value (the plugin author passes it to
+`sdk.animations.run` themselves). Returning specs avoids requiring
+the package to capture a Worker-bound SDK reference; the boilerplate
+delta is one wrapping call per animation site.
 
 ### Decoration provider (registration + insets + drawing + atomic gating)
 
@@ -873,7 +907,8 @@ keyboard delivery via the host path); the JS-compositor suite
 incl. `decoration-two-windows.gpu.mjs`, `example-decoration.gpu.mjs`,
 `inthread-gpu.gpu.mjs` for the in-thread bundled-plugin core-device path,
 `inthread-mask.gpu.mjs` for sdk.windows.setMask via a real bundled plugin,
-`inthread-animation.gpu.mjs` for sdk.animations.run end-to-end);
+`inthread-animation.gpu.mjs` for sdk.animations.run end-to-end,
+`sdk-anim.gpu.mjs` for @overdraw/sdk-anim builders end-to-end);
 per-surface render state primitives (`compositor-fx.gpu.mjs`).
 
 ### Protocol coverage matrix
@@ -950,7 +985,8 @@ capabilities exist to grant).
   per-surface render state primitives `setOpacity` / `setTransform` /
   `setOutputMargin` / `setMask` (Phase 4a); declarative animation
   evaluator `sdk.animations.run` / `cancel` with tween + spring +
-  sequence + parallel (Phase 4b). Not built:
+  sequence + parallel (Phase 4b); `@overdraw/sdk-anim` plugin-side
+  spec builders (Phase 4c). Not built:
   `sdk.compose` / `sdk.transitions` (Phases 5, 8); cursor / closing /
   velocity (Phase 9); input chain (`sdk.input.bind`, Phase 7); output
   observation beyond a fabricated `wl_output`; protocol SDK surface;

@@ -7,7 +7,7 @@
 import type { CompositorSink } from "../protocols/ctx.js";
 import type {
   TargetRef, TransformValue, MarginValue,
-} from "./spec.js";
+} from "@overdraw/animation-types";
 
 // Field names per target kind (in canonical order). The evaluator
 // stores per-animation arrays of field values aligned with this order.

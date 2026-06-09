@@ -1,8 +1,18 @@
-// Animation spec types (core-plugin-api.md §9). Plugins construct
-// AnimationSpec values (via @overdraw/sdk-anim or directly) and submit
-// them to core's evaluator via sdk.animations.run. Every shape is
-// structured-clone-safe so the spec survives the SDK boundary unchanged
-// regardless of transport.
+// Canonical types for the animations namespace (core-plugin-api.md §9).
+//
+// Plugins build AnimationSpec values (via @overdraw/sdk-anim or directly)
+// and submit them to core via sdk.animations.run; core's evaluator
+// reads them every frame and writes the result through the per-surface
+// render-state setters. Every shape is structured-clone-safe so the
+// spec survives the SDK boundary unchanged regardless of transport.
+//
+// Why a separate package: the spec types cross multiple boundaries
+// (core's evaluator + broker; the @overdraw/sdk-anim builders; any
+// plugin author who wants to type-check a spec directly). Pinning them
+// in their own package avoids three copies that could drift.
+//
+// Type-only: no runtime code. dist/index.js is an empty module; the
+// .d.ts carries the types.
 //
 // v1 ships tween + spring + sequence + parallel (per core-plugin-api.md
 // "Decided"). decay / keyframes / stagger are deferred until concrete

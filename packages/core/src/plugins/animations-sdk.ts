@@ -9,7 +9,7 @@
 // plugin's only IPC is the one run() call and any explicit cancel().
 
 import type { Endpoint, Json } from "./protocol.js";
-import type { AnimationSpec, TargetRef } from "../animations/spec.js";
+import type { AnimationSpec, TargetRef } from "@overdraw/animation-types";
 
 export interface PluginAnimations {
   // Run an animation. Resolves on natural completion OR when the
