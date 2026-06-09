@@ -81,11 +81,17 @@ export function createGpuBroker(deps: GpuBrokerDeps) {
   const surfaceByBuf = new Map<number, OverlaySurface>();
   // overlay surfaceId -> OverlaySurface.
   const surfaces = new Map<number, OverlaySurface>();
-  // Phase 5b compose buffers (snapshot, one-shot): surfaceBufId -> the
-  // wrapped core-device producer texture. Held alive until release.
+  // Phase 5b compose buffers: surfaceBufId -> the wrapped core-device
+  // producer texture + bookkeeping. For snapshot (live=false) the broker
+  // does ONE compose pass at allocation. For live (live=true) the broker
+  // registers the buffer with the compositor and the per-frame produce
+  // loop renders into it; the broker releases the registration on
+  // compose.release.
   // (Could later track per-plugin so destroy-on-plugin-stop teardowns
   // these along with overlays.)
-  const composeBufs = new Map<number, { texture: GPUTexture; width: number; height: number }>();
+  const composeBufs = new Map<number, {
+    texture: GPUTexture; width: number; height: number; live: boolean;
+  }>();
 
   return async function onRequest(pluginName: string, method: string, params: unknown): Promise<unknown> {
     const p = (params ?? {}) as Record<string, number | string | bigint | { x: number; y: number; width: number; height: number } | undefined>;
@@ -246,7 +252,8 @@ export function createGpuBroker(deps: GpuBrokerDeps) {
         // whichever side is on the core's device, regardless of role.
         const tex = dawn.wrapTexture(coreDeviceHandle,
           addon.pluginConsumerTexture(alloc.surfaceBufId));
-        composeBufs.set(alloc.surfaceBufId, { texture: tex, width: w, height: h });
+        composeBufs.set(alloc.surfaceBufId,
+          { texture: tex, width: w, height: h, live: false });
 
         if (compositor.composeIntoView) {
           compositor.composeIntoView({
@@ -261,12 +268,64 @@ export function createGpuBroker(deps: GpuBrokerDeps) {
         }
         return { surfaceBufId: alloc.surfaceBufId, width: w, height: h };
       }
+      case "compose.live": {
+        // Phase 5b-live: Worker plugin asks for a live compose. Same
+        // allocation as snapshot, then registers the buffer with the
+        // compositor's per-frame produce loop. The buffer's contents
+        // track on-screen compositor state (subject to the per-frame
+        // serialization with the plugin's consumer Begin/End brackets).
+        //
+        // We do an EAGER initial compose pass so the texture has frame-0
+        // contents available the first time the plugin samples (matches
+        // snapshot's 'texture valid immediately' contract; without this
+        // the plugin's first sample would see an uninitialized dmabuf
+        // until the next on-screen renderFrame).
+        const connId = connByPlugin.get(pluginName);
+        if (connId === undefined) throw new Error("compose.live: no plugin conn");
+        const w = p.width as number, h = p.height as number;
+        if (!w || !h) throw new Error("compose.live: bad dims");
+        const ctId = p.consumerTexId as number;
+        const ctGen = p.consumerTexGen as number;
+        const cdId = p.consumerDevId as number;
+        const cdGen = p.consumerDevGen as number;
+        const pluginSerial = (p.pluginReservePointSerial as bigint) ?? 0n;
+        const windows = (p.windows as unknown as number[]) ?? [];
+
+        const alloc = await pAllocCompose(addon, connId, w, h,
+          ctId, ctGen, cdId, cdGen, pluginSerial);
+
+        const tex = dawn.wrapTexture(coreDeviceHandle,
+          addon.pluginConsumerTexture(alloc.surfaceBufId));
+        composeBufs.set(alloc.surfaceBufId,
+          { texture: tex, width: w, height: h, live: true });
+
+        if (!compositor.composeIntoView || !compositor.registerLiveCompose) {
+          throw new Error("compose.live: compositor lacks live-compose machinery");
+        }
+        const targetView = tex.createView();
+        // Initial frame-0 produce. After this the per-frame produce loop
+        // takes over and re-renders on every renderFrame.
+        compositor.composeIntoView({
+          outputId: 0, targetView, windows,
+          outW: w, outH: h, producerSurfaceBufId: alloc.surfaceBufId,
+        });
+        compositor.registerLiveCompose({
+          surfaceBufId: alloc.surfaceBufId, targetView, windows,
+          outW: w, outH: h,
+        });
+        return { surfaceBufId: alloc.surfaceBufId, width: w, height: h };
+      }
       case "compose.release": {
-        // Plugin is done with a compose snapshot. Drop our reference to the
-        // wrapped core-device texture and ask the GPU process to free the
-        // dmabuf + STMs + textures via ReleaseSurfaceBuf.
+        // Plugin is done with a compose snapshot or live target. Drop our
+        // reference to the wrapped core-device texture, unregister from the
+        // live-compose loop (no-op for snapshots), and ask the GPU process
+        // to free the dmabuf + STMs + textures via ReleaseSurfaceBuf.
         const bufId = p.surfaceBufId as number;
         if (bufId === undefined) throw new Error("compose.release: bad surfaceBufId");
+        const entry = composeBufs.get(bufId);
+        if (entry?.live && compositor.unregisterLiveCompose) {
+          compositor.unregisterLiveCompose(bufId);
+        }
         composeBufs.delete(bufId);
         // Gate release on afterCurrentFrame: a previous compose pass's GPU
         // work may still be in flight on the core's queue (the producer
