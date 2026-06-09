@@ -11,10 +11,11 @@ what is actually built today is in `status.md`.
 
 ## Status
 
-Phases 0a, 0b, 0c, 0d, 0e, 1, 2, 3, 4, 4.5 are landed (see `git log` and
-`status.md`). Phase 5 (scene compose) is next. The text below describes
-each phase in its original forward-looking shape; ✅ marks the completed
-ones inline.
+Phases 0a, 0b, 0c, 0d, 0e, 1, 2, 3, 4, 4.5, and 5a are landed (see
+`git log` and `status.md`). Phase 5b (Worker transport for `sdk.compose`
+via cross-device dmabuf) is next. The text below describes each phase
+in its original forward-looking shape; ✅ marks the completed ones
+inline.
 
 ## Principle
 
@@ -425,7 +426,7 @@ all reuse the same mechanism.
 The other GPU primitive. Enables workspace transitions, overview modes,
 screen recording, thumbnails.
 
-### 5a. `compose.windows` / `compose.scene`
+### 5a. `compose.windows` / `compose.scene` ✅
 
 - Render-to-texture path in the compositor accepting explicit window list
   + output context.

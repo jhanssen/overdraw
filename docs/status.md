@@ -4,7 +4,7 @@ Ground truth for what exists right now: current capabilities, known gaps, and
 what remains. The design lives in `architecture.md`; this file does not restate
 it. Present-tense only — no change history.
 
-Last updated: 2026-06-08 (post-Phase 4.5).
+Last updated: 2026-06-09 (post-Phase 5a).
 
 ## Read first: gaps in advertised protocols (silent-gap risks)
 
@@ -822,6 +822,108 @@ mechanism gates.
   client maps, bundled plugin's intercept modifies newOuter, WM
   applies the intercepted rect; second test verifies the plugin sees
   both oldOuter and newOuter in the payload).
+
+### Scene compose (Phase 5a)
+
+`sdk.compose.scene` / `sdk.compose.windows` for in-thread bundled plugins.
+Render a window subset into a fresh `GPUTexture`; two modes:
+`'snapshot'` (one-shot at call time, frozen thereafter) and `'live'`
+(re-rendered every on-screen `renderFrame()`, kept in sync with
+compositor state). The texture is on core's GPU device; the plugin
+shares that device in-thread and can sample/copy/blit it as if it
+were any other resource. core-plugin-api.md §6 is the spec; the
+intercept-chain language there is forward-looking (Phase 10) -- the
+chain is not yet applied to compose textures.
+
+- **Refactor** (`packages/core/src/gpu/compositor.ts`):
+  - `composite({encoder, targetView, drawList, outW, outH, placements?, cropUV?})`
+    is a pure pass-encoder. Both `renderFrame` (on-screen) and the
+    compose path encode their passes through it; the on-screen frame
+    skipping work when nothing changed will live in this single
+    chokepoint when dirty-tracking lands.
+  - `openImportBrackets(drawList, bracketed)` / `closeImportBrackets(bracketed)`
+    factor the dmabuf BeginAccess / EndAccess pair, de-duping on
+    `importId` (the GPU process forbids two Begins without an End on
+    one import). The frame's brackets cover the UNION of imports
+    across on-screen + every live composer's window list; one Begin
+    per import per frame regardless of how many passes sample it.
+  - `updateUniforms(s, ow, oh, overrides?)` takes target dims as
+    parameters; compose passes targeting non-output-sized textures
+    normalize their per-surface placement to the actual target. The
+    `cropUV` override (Map<surfaceId, {u0,v0,u1,v1}>) is the
+    sub-region of the surface texture to sample; `placements`
+    overrides the per-surface output rect for the duration of a
+    compose pass.
+
+- **WGSL** (`compositor.ts:41-117`): `Uniforms` gains a `cropUV vec4f`
+  slot (UNIFORM_BYTES 64 -> 80). The fragment shader maps
+  `surfUV` through `mix(cropUV.xy, cropUV.zw, surfUV)` before
+  sampling the surface texture; identity (0,0,1,1) is the default
+  for every surface, so on-screen pixels are unchanged from before
+  the refactor.
+
+- **Snapshot** (`composeScene` / `composeWindows`): allocate a
+  `RENDER_ATTACHMENT | TEXTURE_BINDING | COPY_SRC` texture in
+  `this.format`, open its own short-lived dmabuf brackets, encode
+  one composite pass, submit, close brackets. Synchronous wrt the
+  on-screen frame loop (JS is single-threaded; the snapshot returns
+  before the next tick). Does NOT drive the lifecycle state machine
+  (frameStart / frameSampled / submitted / gpuCompleted) -- that
+  cycle exists to track client `wl_buffer` release and snapshot
+  sampling of cached imports has no bearing on it. Wire-level
+  brackets are still required so the GPU process can keep the
+  access window open around its sample commands; `openImportBrackets`
+  handles them.
+
+- **Live** (`registerLiveScene` / `registerLiveWindows`): the
+  compositor holds a list of live targets; every `renderFrame()`
+  iterates them after the on-screen pass, encoding one composite
+  per live target into the same command encoder. One `submit`
+  closes everything together; one set of brackets covers the union.
+  `release()` removes the registration and destroys the underlying
+  texture (the holder polls texture contents between frames; the
+  texture handle is stable across frames, only its contents update).
+
+- **Per-window crop** (`composeWindows`): the `rect` parameter is a
+  source-crop rect in surface-local pixels. Each per-window target
+  is sized to the crop's dims; the crop region fills the entire
+  output via the placement-override + cropUV-override mechanism.
+  Per-surface render state (opacity / transform / mask /
+  outputMargin) is NOT applied to per-window compose textures
+  today -- those are on-screen placement state, and a per-window
+  crop is content extraction.
+
+- **SDK** (`packages/core/src/plugins/compose-sdk.ts`):
+  `PluginCompose.scene(args)` / `PluginCompose.windows(args)`
+  return `Promise<SceneHandle>` / `Promise<WindowComposition>`
+  with `texture` (or per-window `windows[i].texture`), `outW`/`outH`
+  (or per-window `rect`), and `release(): Promise<void>`. Wired in
+  `sdk.ts` / `loader.ts` only when the loader is the in-thread
+  path; Worker plugins receive `sdk.compose === undefined`
+  (capability-by-shape; Phase 5b adds the dmabuf-import transport
+  for them). `outputId` validation rejects anything other than
+  `OUTPUT_DEFAULT` -- the `wl_output` substrate is single-output
+  today (fabricated; status.md §"Read first").
+
+- **Tests** (`test/compose.gpu.mjs`, 7 tests, all real Wayland clients
+  through `setupCompositor`): snapshot byte-identical to on-screen
+  composite; snapshot frozen across subsequent state changes;
+  live reflects per-surface state and matches on-screen the same
+  frame; per-window crop extracts a sub-region; two-window
+  compose.windows produces two textures; release destroys the
+  texture and removes the live registration (idempotent); SDK
+  wrapper (`createInThreadCompose`) handles snapshot + live + the
+  outputId validation. 66/66 GPU tests pass (was 59; +7 compose).
+
+**Not yet built (Phase 5b and beyond)**: Worker transport for
+`sdk.compose` (cross-device dmabuf import + fence onto the plugin's
+device). The intercept chain (Phase 10) that `core-plugin-api.md`
+§6 references as "applied" to compose textures -- the per-surface
+state currently baked in is opacity / transform / mask / outputMargin
+plus decoration surface splicing, but no per-pixel plugin transform.
+Multi-output: `outputId` is plumbed honestly but only
+`OUTPUT_DEFAULT` is meaningful until the `wl_output` reconfiguration
+pre-condition lands.
 
 ### Decoration provider (registration + insets + drawing + atomic gating)
 
