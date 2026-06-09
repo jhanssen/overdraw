@@ -283,6 +283,52 @@ function clamp(v: number, lo: number, hi: number): number {
   return v < lo ? lo : v > hi ? hi : v;
 }
 
+// A live compose target re-rendered every on-screen renderFrame(). The
+// texture handle is stable across frames; only its contents update.
+interface LiveScene {
+  texture: GPUTexture;
+  view: GPUTextureView;
+  outputId: number;
+  windows: number[];
+  outW: number;
+  outH: number;
+}
+
+// A live per-window compose target. Each window in the list has its own
+// texture sized to its crop rect; the compositor re-renders all of them
+// per frame from the same draw-state.
+interface LiveWindowComp {
+  outputId: number;
+  windows: Array<{
+    id: number;
+    rect: { x: number; y: number; w: number; h: number };
+    texture: GPUTexture;
+    view: GPUTextureView;
+    // surface dims at registration time (used to compute cropUV); on
+    // resize, the registration is invalidated. Phase 5a does not handle
+    // mid-life surface resize for live window-comps; the holder releases
+    // and re-registers if it needs to track resizes.
+    surfW: number;
+    surfH: number;
+  }>;
+}
+
+export interface LiveSceneHandle {
+  texture: GPUTexture;
+  outW: number;
+  outH: number;
+  release(): void;
+}
+
+export interface LiveWindowCompHandle {
+  windows: ReadonlyArray<{
+    id: number;
+    texture: GPUTexture;
+    rect: { x: number; y: number; w: number; h: number };
+  }>;
+  release(): void;
+}
+
 export interface JsCompositorOpts {
   // Present to the host swapchain (slice 3) instead of an offscreen target.
   // Requires dawn + deviceHandle (for wrapTexture) and the addon acquire/present.
@@ -328,6 +374,22 @@ export class JsCompositor implements CompositorSink {
   // Non-content layers (background/below/above/overlay). Composited around the
   // content stack per LAYER_ORDER. Plugin overlays/decorations populate these.
   private layers = new Map<Layer, number[]>();
+
+  // Live compose targets. Each entry is re-rendered inside every renderFrame()
+  // alongside the on-screen composite, sharing the frame's open import
+  // brackets and command encoder. A live composer's texture is owned by the
+  // compositor between register/release; the holder polls it whenever they
+  // need current pixels.
+  //
+  // LiveScene is the unified "composed result" variant (compose.scene); the
+  // listed windows are drawn back-to-front into a single target texture at
+  // their natural layout rects, normalized to (outW,outH).
+  //
+  // LiveWindowComp is the per-window-textures variant (compose.windows);
+  // each listed window gets its own target texture sized to its crop rect,
+  // with the cropped region filling the target.
+  private liveScenes: LiveScene[] = [];
+  private liveWindowComps: LiveWindowComp[] = [];
 
   // dmabuf buffer-release lifecycle. The pure state machine (no GPU, no Dawn)
   // is the source of truth; the executor here translates events <-> intents.
@@ -1039,14 +1101,52 @@ export class JsCompositor implements CompositorSink {
 
     const draw = this.drawOrder();
     const bracketed: Array<{ importId: number; bufferId: number }> = [];
+    // Brackets must cover the UNION of imports sampled this frame --
+    // on-screen draw order plus every live composer's window list.
+    // openImportBrackets de-dupes on importId so any import shared
+    // across these lists opens exactly one Begin (the GPU process
+    // forbids two Begins without an End).
     this.openImportBrackets(draw, bracketed);
+    for (const ls of this.liveScenes) this.openImportBrackets(ls.windows, bracketed);
+    for (const lw of this.liveWindowComps) {
+      this.openImportBrackets(lw.windows.map((w) => w.id), bracketed);
+    }
 
     try {
       const enc = this.device.createCommandEncoder();
+      // On-screen composite.
       this.composite({
         encoder: enc, targetView, drawList: draw,
         outW: this.width, outH: this.height,
       });
+      // Live composers, in registration order. Each pass writes to its
+      // own target texture; they don't blend against each other.
+      for (const ls of this.liveScenes) {
+        this.composite({
+          encoder: enc, targetView: ls.view, drawList: ls.windows,
+          outW: ls.outW, outH: ls.outH,
+        });
+      }
+      for (const lw of this.liveWindowComps) {
+        for (const w of lw.windows) {
+          // Same per-window crop / placement-override pattern as
+          // composeWindows: render the surface filling the target,
+          // sampling only the crop region.
+          const placements = new Map([[w.id, { x: 0, y: 0, w: w.rect.w, h: w.rect.h }]]);
+          const cropUV = w.surfW > 0 && w.surfH > 0
+            ? new Map([[w.id, {
+                u0: w.rect.x / w.surfW, v0: w.rect.y / w.surfH,
+                u1: (w.rect.x + w.rect.w) / w.surfW,
+                v1: (w.rect.y + w.rect.h) / w.surfH,
+              }]])
+            : undefined;
+          this.composite({
+            encoder: enc, targetView: w.view, drawList: [w.id],
+            outW: w.rect.w, outH: w.rect.h,
+            placements, cropUV,
+          });
+        }
+      }
       this.device.queue.submit([enc.finish()]);
 
       // Tag the submit; on GPU completion advance completedSerial and emit
@@ -1203,6 +1303,81 @@ export class JsCompositor implements CompositorSink {
       out.push({ id: w.id, texture, rect });
     }
     return out;
+  }
+
+  // Register a live compose-scene target. The texture is re-rendered on
+  // every on-screen renderFrame() under the same import brackets and
+  // command encoder, so its contents always reflect what the listed
+  // windows would currently look like on-screen. Holder polls the
+  // returned texture between frames. release() removes the registration
+  // and destroys the texture.
+  registerLiveScene(args: {
+    outputId: number;
+    windows: ReadonlyArray<number>;
+    outW?: number;
+    outH?: number;
+  }): LiveSceneHandle {
+    const outW = args.outW ?? this.width;
+    const outH = args.outH ?? this.height;
+    const texture = this.allocComposeTexture(outW, outH);
+    const entry: LiveScene = {
+      texture, view: texture.createView(),
+      outputId: args.outputId, windows: [...args.windows],
+      outW, outH,
+    };
+    this.liveScenes.push(entry);
+    let released = false;
+    return {
+      texture, outW, outH,
+      release: () => {
+        if (released) return;
+        released = true;
+        const i = this.liveScenes.indexOf(entry);
+        if (i >= 0) this.liveScenes.splice(i, 1);
+        texture.destroy();
+      },
+    };
+  }
+
+  // Register a live compose-windows target. Each listed window gets its
+  // own texture sized to its crop rect (or the full surface if no rect),
+  // re-rendered on every on-screen renderFrame(). The set of windows
+  // and their crop rects is fixed at registration; releasing and
+  // re-registering is how the holder changes the list.
+  registerLiveWindows(args: {
+    outputId: number;
+    windows: ReadonlyArray<{
+      id: number;
+      rect?: { x: number; y: number; w: number; h: number };
+    }>;
+  }): LiveWindowCompHandle {
+    const windows: LiveWindowComp["windows"] = [];
+    for (const w of args.windows) {
+      const s = this.surfaces.get(w.id);
+      if (!s) continue;  // unknown window: skip
+      const surfW = s.width || s.layoutW || 0;
+      const surfH = s.height || s.layoutH || 0;
+      const rect = w.rect ?? { x: 0, y: 0, w: surfW, h: surfH };
+      if (rect.w <= 0 || rect.h <= 0) continue;
+      const texture = this.allocComposeTexture(rect.w, rect.h);
+      windows.push({
+        id: w.id, rect, texture, view: texture.createView(),
+        surfW, surfH,
+      });
+    }
+    const entry: LiveWindowComp = { outputId: args.outputId, windows };
+    this.liveWindowComps.push(entry);
+    let released = false;
+    return {
+      windows: windows.map((w) => ({ id: w.id, texture: w.texture, rect: w.rect })),
+      release: () => {
+        if (released) return;
+        released = true;
+        const i = this.liveWindowComps.indexOf(entry);
+        if (i >= 0) this.liveWindowComps.splice(i, 1);
+        for (const w of windows) w.texture.destroy();
+      },
+    };
   }
 
   // Async readback of an arbitrary GPUTexture. Returns tightly-packed BGRA
