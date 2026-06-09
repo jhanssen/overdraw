@@ -109,6 +109,14 @@ class WorkerWireClient {
     struct SurfaceReservation { Handle texture; Handle device; uint64_t wireSerial; bool ok; };
     SurfaceReservation reserveProducerTexture(uint32_t surfaceBufId, uint32_t w, uint32_t h);
     WGPUTexture producerTexture(uint32_t surfaceBufId) const;
+    // Phase 5b: reserve a consumer-side texture on this plugin wire. The
+    // plugin is the CONSUMER for a compose buffer (the core produces, the
+    // plugin samples). Same reserve-and-flush-and-sample-serial pattern as
+    // reserveProducerTexture; usage is TextureBinding|CopySrc (sample +
+    // optional readback). Stored separately from producerReservations_ so
+    // the same surfaceBufId space can be used for both directions.
+    SurfaceReservation reserveConsumerTexture(uint32_t surfaceBufId, uint32_t w, uint32_t h);
+    WGPUTexture consumerTexture(uint32_t surfaceBufId) const;
     // Forget a producer-texture reservation slot WITHOUT reclaiming the wire id
     // (deferred-reclaim policy; see above). The id stays allocated on the wire
     // client's id pool until process exit; the WireServer's bookkeeping at
@@ -116,6 +124,7 @@ class WorkerWireClient {
     // via ReleaseSurfaceBuf, which acts on STM/textures/dmabuf, not the wire-
     // handle id). No-op if the id is unknown.
     void forgetProducerReservation(uint32_t surfaceBufId);
+    void forgetConsumerReservation(uint32_t surfaceBufId);
 
     // In-band producer Begin/End on THIS plugin wire: write a kind=1/kind=2
     // Surface frame (producer=true) for `surfaceBufId`. Begin's FIFO position
@@ -132,6 +141,21 @@ class WorkerWireClient {
     }
     void writeEndAccess(uint32_t surfaceBufId) {
         ipc::SurfaceAccessPayload p{surfaceBufId, /*producer=*/true};
+        uint8_t buf[ipc::SurfaceAccessPayload::kSize];
+        p.encode(buf);
+        link_->appendFrame(ipc::FrameKind::EndAccess, buf, sizeof(buf));
+    }
+    // Phase 5b: in-band consumer Begin/End on THIS plugin wire. The plugin
+    // is the consumer for compose buffers, so consumer Begin/End ride the
+    // plugin wire (inverted from sdk.gpu where consumer = core).
+    void writeConsumerBeginAccess(uint32_t surfaceBufId) {
+        ipc::SurfaceAccessPayload p{surfaceBufId, /*producer=*/false};
+        uint8_t buf[ipc::SurfaceAccessPayload::kSize];
+        p.encode(buf);
+        link_->appendFrame(ipc::FrameKind::BeginAccess, buf, sizeof(buf));
+    }
+    void writeConsumerEndAccess(uint32_t surfaceBufId) {
+        ipc::SurfaceAccessPayload p{surfaceBufId, /*producer=*/false};
         uint8_t buf[ipc::SurfaceAccessPayload::kSize];
         p.encode(buf);
         link_->appendFrame(ipc::FrameKind::EndAccess, buf, sizeof(buf));
@@ -155,6 +179,7 @@ class WorkerWireClient {
     bool failed_ = false;
     std::string error_;
     std::unordered_map<uint32_t, dawn::wire::ReservedTexture> producerReservations_;
+    std::unordered_map<uint32_t, dawn::wire::ReservedTexture> consumerReservations_;
 };
 
 }  // namespace overdraw::plugin

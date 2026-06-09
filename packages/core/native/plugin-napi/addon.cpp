@@ -227,6 +227,64 @@ napi_value WriteEndAccess(napi_env env, napi_callback_info info) {
     return nullptr;
 }
 
+// Phase 5b: reserveConsumerTexture(clientId, surfaceBufId, w, h) -> same shape
+// as ReserveProducerTexture. The plugin is the CONSUMER for a compose buffer.
+napi_value ReserveConsumerTexture(napi_env env, napi_callback_info info) {
+    size_t argc = 4; napi_value argv[4];
+    napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+    auto* c = self(env)->get(u32(env, argv[0]));
+    if (!c) return throwErr(env, "reserveConsumerTexture: bad clientId");
+    auto r = c->reserveConsumerTexture(u32(env, argv[1]), u32(env, argv[2]), u32(env, argv[3]));
+    if (!r.ok) return throwErr(env, "reserveConsumerTexture: failed");
+    napi_value o, ws;
+    napi_create_object(env, &o);
+    napi_set_named_property(env, o, "texture", handleObj(env, r.texture));
+    napi_set_named_property(env, o, "device", handleObj(env, r.device));
+    napi_create_bigint_uint64(env, r.wireSerial, &ws);
+    napi_set_named_property(env, o, "wireSerial", ws);
+    return o;
+}
+
+napi_value ConsumerTexture(napi_env env, napi_callback_info info) {
+    size_t argc = 2; napi_value argv[2];
+    napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+    auto* c = self(env)->get(u32(env, argv[0]));
+    if (!c) return throwErr(env, "consumerTexture: bad clientId");
+    napi_value out;
+    napi_create_bigint_uint64(env,
+        reinterpret_cast<uint64_t>(c->consumerTexture(u32(env, argv[1]))), &out);
+    return out;
+}
+
+napi_value ForgetConsumerReservation(napi_env env, napi_callback_info info) {
+    size_t argc = 2; napi_value argv[2];
+    napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+    auto* c = self(env)->get(u32(env, argv[0]));
+    if (!c) return throwErr(env, "forgetConsumerReservation: bad clientId");
+    c->forgetConsumerReservation(u32(env, argv[1]));
+    return nullptr;
+}
+
+// Phase 5b: in-band consumer Begin/End on the plugin wire (compose buffers
+// where the plugin is the consumer). Inverted from sdk.gpu overlay surfaces
+// where the plugin is the producer.
+napi_value WriteConsumerBegin(napi_env env, napi_callback_info info) {
+    size_t argc = 2; napi_value argv[2];
+    napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+    auto* c = self(env)->get(u32(env, argv[0]));
+    if (!c) return throwErr(env, "writeConsumerBegin: bad clientId");
+    c->writeConsumerBeginAccess(u32(env, argv[1]));
+    return nullptr;
+}
+napi_value WriteConsumerEnd(napi_env env, napi_callback_info info) {
+    size_t argc = 2; napi_value argv[2];
+    napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+    auto* c = self(env)->get(u32(env, argv[0]));
+    if (!c) return throwErr(env, "writeConsumerEnd: bad clientId");
+    c->writeConsumerEndAccess(u32(env, argv[1]));
+    return nullptr;
+}
+
 void cleanup(napi_env, void* data, void*) { delete static_cast<Instance*>(data); }
 
 napi_value Init(napi_env env, napi_value exports) {
@@ -247,10 +305,15 @@ napi_value Init(napi_env env, napi_value exports) {
     reg("reserveProducerTexture", ReserveProducerTexture);
     reg("forgetProducerReservation", ForgetProducerReservation);
     reg("producerTexture", ProducerTexture);
+    reg("reserveConsumerTexture", ReserveConsumerTexture);
+    reg("forgetConsumerReservation", ForgetConsumerReservation);
+    reg("consumerTexture", ConsumerTexture);
     reg("flush", Flush);
     reg("wireBytesQueued", WireBytesQueued);
     reg("writeBeginAccess", WriteBeginAccess);
     reg("writeEndAccess", WriteEndAccess);
+    reg("writeConsumerBegin", WriteConsumerBegin);
+    reg("writeConsumerEnd", WriteConsumerEnd);
     return exports;
 }
 

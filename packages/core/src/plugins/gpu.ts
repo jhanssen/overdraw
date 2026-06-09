@@ -37,6 +37,13 @@ interface PluginAddon {
   // for the life of the worker; future use cases (e.g. surface migration)
   // that need to explicitly forget a slot would call this.
   forgetProducerReservation(clientId: number, resKey: number): void;
+  // Phase 5b: consumer-side reserve for compose buffers (the plugin is the
+  // consumer; the core produces). Same shape as reserveProducerTexture;
+  // wireSerial is forwarded to coreAllocComposeBufferW.
+  reserveConsumerTexture(clientId: number, surfaceBufId: number, w: number, h: number):
+    { texture: { id: number; generation: number }; device: { id: number; generation: number }; wireSerial: bigint };
+  consumerTexture(clientId: number, surfaceBufId: number): bigint;
+  forgetConsumerReservation(clientId: number, resKey: number): void;
   flush(clientId: number): void;
   // In-band producer Begin/End on the plugin wire (replaces the core-mediated
   // ProducerBegin ctrl round-trip / ProducerEnd WireBarrier deferral). The
@@ -45,6 +52,10 @@ interface PluginAddon {
   // Synchronous; appendFrame flushes staged wire bytes first.
   writeBeginAccess(clientId: number, surfaceBufId: number): void;
   writeEndAccess(clientId: number, surfaceBufId: number): void;
+  // Phase 5b: in-band consumer Begin/End on the plugin wire (compose buffers
+  // where the plugin is the consumer).
+  writeConsumerBegin(clientId: number, surfaceBufId: number): void;
+  writeConsumerEnd(clientId: number, surfaceBufId: number): void;
 }
 interface DawnModule {
   wrapDevice(instanceHandle: bigint, deviceHandle: bigint): GPUDevice;

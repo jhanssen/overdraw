@@ -108,4 +108,33 @@ void WorkerWireClient::forgetProducerReservation(uint32_t surfaceBufId) {
   producerReservations_.erase(surfaceBufId);
 }
 
+WorkerWireClient::SurfaceReservation WorkerWireClient::reserveConsumerTexture(
+        uint32_t surfaceBufId, uint32_t w, uint32_t h) {
+    SurfaceReservation out{{0, 0}, {0, 0}, 0, false};
+    if (!device_) return out;
+    wgpu::TextureDescriptor td{};
+    td.size = {w, h, 1};
+    td.format = wgpu::TextureFormat::BGRA8Unorm;
+    td.usage = wgpu::TextureUsage::TextureBinding | wgpu::TextureUsage::CopySrc;
+    auto rt = link_->client().ReserveTexture(
+        device_.Get(), reinterpret_cast<const WGPUTextureDescriptor*>(&td));
+    link_->flush();
+    consumerReservations_[surfaceBufId] = rt;
+    out.texture = {rt.handle.id, rt.handle.generation};
+    out.device = {rt.deviceHandle.id, rt.deviceHandle.generation};
+    out.wireSerial = link_->wireBytesQueued();
+    out.ok = true;
+    return out;
+}
+
+WGPUTexture WorkerWireClient::consumerTexture(uint32_t surfaceBufId) const {
+    auto it = consumerReservations_.find(surfaceBufId);
+    return it == consumerReservations_.end() ? nullptr : it->second.texture;
+}
+
+void WorkerWireClient::forgetConsumerReservation(uint32_t surfaceBufId) {
+    // Deferred-reclaim, same as forgetProducerReservation.
+    consumerReservations_.erase(surfaceBufId);
+}
+
 }  // namespace overdraw::plugin
