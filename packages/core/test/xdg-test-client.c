@@ -116,12 +116,25 @@ int main(int argc, char** argv) {
            "states_bytes=%zu activated=%d\n",
            toplevel_configured, surface_configured, last_states_bytes, saw_activated);
 
-    xdg_toplevel_destroy(toplevel);
-    xdg_surface_destroy(g_xdg_surface);
-    wl_surface_destroy(surface);
-    xdg_wm_base_destroy(wm_base);
-    wl_compositor_destroy(compositor);
+    // Idiomatic disconnect: a final wl_display_roundtrip forces the
+    // server to acknowledge every queued client request (in particular
+    // the ack_configure flushed by the previous roundtrip) before we
+    // close the socket. Without it, the server's epoll can see
+    // EPOLLIN | EPOLLHUP together after the client exits; libwayland's
+    // wl_client_connection_data (wayland-server.c) checks HANGUP first
+    // and destroys the client without reading the pending bytes -- the
+    // last ack_configure gets dropped ~30-40% of the time on this
+    // hardware. (See weston tests/harness/weston-test-client-helper.c
+    // line ~1335 for the same pattern in weston's test harness.)
+    //
+    // We DO NOT call xdg_toplevel_destroy / wl_surface_destroy / ...
+    // before disconnect: those destroy requests would delete the
+    // server-side state the test asserts on. Real clients usually don't
+    // destroy these proactively either; libwayland tears them down on
+    // socket close.
+    wl_display_roundtrip(display);
     wl_display_disconnect(display);
+    (void)toplevel; (void)surface;  // resources are reaped by libwayland on disconnect
     printf("[client] done\n");
     return ok ? 0 : 1;
 }
