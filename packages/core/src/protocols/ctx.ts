@@ -143,17 +143,6 @@ export interface CompositorSink {
     outH: number;
     producerSurfaceBufId?: number;
   }): void;
-  // Phase 5b-live: register a dmabuf compose target for per-frame produce.
-  // Each renderFrame() emits one producer Begin + compose pass + producer
-  // End for the entry on the core wire.
-  registerLiveCompose?(args: {
-    surfaceBufId: number;
-    targetView: GPUTextureView;
-    windows: ReadonlyArray<number>;
-    outW: number;
-    outH: number;
-  }): void;
-  unregisterLiveCompose?(surfaceBufId: number): void;
 }
 
 export interface CompositorState {
