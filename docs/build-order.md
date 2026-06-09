@@ -163,33 +163,133 @@ package convention, and the "extraction without behavior change" path.
 Existing `compositing.gpu.mjs` and tile-verification tests must still
 pass — the master-stack behavior is unchanged.
 
-## Phase 3 — Focus extraction
+## Phase 3 — Focus extraction + bundled-plugin substrate
 
-Same pattern as layout, smaller. Focus modes (`follow-pointer` /
-`click-to-focus`) stay inline in core per the parameterized-mode pattern
-(see `core-plugin-api.md` §"Cross-cutting patterns").
+Bigger than the original plan: in addition to extracting focus, Phase 3
+adds two pieces of runtime substrate that bundled plugins (Phase 2's
+layout and this phase's focus) both need going forward — the in-thread
+bundled-plugin transport and the per-bundled-plugin config channel. The
+layout plugin from Phase 2 is migrated onto the new transport as part
+of this phase.
 
-### 3a. Focus driver
+The design changed during planning: the original "parameterized mode"
+pattern for focus (`getMode()` returning a closed string set) is
+rejected in favor of pure fire-and-forget `decide()`. See
+`core-plugin-api.md` §14 and §"Cross-cutting patterns" / Pattern A vs.
+Pattern B. Reason: focus is policy and core should not know the named
+modes; the optimization Pattern A bought (zero IPC for the common case)
+doesn't justify special-casing policy when fire-and-forget keeps the
+hot path bounded anyway.
 
-- Consult `sdk.plugin('focus').getMode()` and dispatch:
-  - `'follow-pointer'` / `'click-to-focus'`: evaluated in core.
-  - `'custom'`: `decide` callback at coarse events.
-- ~80 lines of change in core.
+### 3a. In-thread bundled plugin transport
 
-### 3b. Bundled focus plugin
+Bundled plugins are core's own code, trusted at the same level. The
+Worker isolation (postMessage, structured clone, watchdog, restart
+machinery) costs more than it buys for them.
 
-- Implements `FocusAPI`. Returns the user's configured mode.
-- ~50 lines.
+- New: in-thread bootstrap path in the runtime. Selected by
+  `ResolvedPlugin.bundled === true`; user plugins continue through the
+  Worker path unchanged.
+- The in-thread plugin's `init` runs on the main event loop; the SDK is
+  the same shape (every call returns a Promise) but the transport is
+  direct call + microtask hop. `invokeNamespace` for an in-thread
+  target calls the registered method directly.
+- Failure handling per `core-plugin-api.md` "Decided" list: init-time
+  exceptions are fatal startup errors; per-call exceptions are caught,
+  logged, treated as null/empty result; the plugin stays registered.
+- No watchdog ping/pong, no `resourceLimits`, no terminate-on-fault for
+  in-thread plugins. Sharing the main loop means liveness is co-extensive
+  with core.
+- ~100–150 lines in the runtime (parallel to `bootstrap.ts` /
+  `runtime.ts`'s Worker path).
 
-### 3c. Shared interface package
+### 3b. Per-bundled-plugin config channel
 
-- `@overdraw/focus-types`.
-- ~40 lines.
+- Plugin `init` signature becomes `init(sdk, config?: unknown)`. Core
+  passes the user-config value for the plugin's namespace verbatim;
+  the plugin owns validation.
+- Same shape applies to user-installed plugins (config from
+  `ResolvedPlugin.raw`); the plugin author writes one init signature.
+- Invalid config throws from init; in-thread bundled plugins treat
+  that as a fatal startup error per (3a) (user-facing diagnostic
+  surfacing is TBD per the open item in `core-plugin-api.md`).
+- ~30–50 lines: config plumbing from `loadConfig` → `bundledToResolved`
+  → bootstrap.
 
-**Total estimate**: ~170 lines.
+### 3c. Migrate `@overdraw/plugin-layout-master-stack` to in-thread
 
-**What this validates**: the parameterized-mode pattern for hot-path
-policy. Existing `integration.gpu.mjs` focus tests must still pass.
+- Same registration, same algorithm. Only the runtime transport
+  changes. The Worker-mode tests for layout are deleted (their behavior
+  is exercised end-to-end by `test/layout-master-stack/integration.
+  test.js`); the in-thread tests assert direct-call semantics.
+- ~20 lines of change in the plugin (mostly tsconfig / dependency
+  cleanup).
+
+### 3d. Shared interface package: `@overdraw/focus-types`
+
+- `FocusAPI = { decide(inputs): Promise<FocusResult> }`. No `getMode`,
+  no `'custom'`.
+- `FocusInputs.reason` enumerates coarse events:
+  `'pointer-button' | 'pointer-enter' | 'pointer-leave' |
+  'window-mapped' | 'window-unmapped' | 'window-raised' |
+  'workspace-changed' | 'explicit'`.
+- `FocusResult.keyboardFocus?: SurfaceId | null | undefined`
+  (`undefined` = leave focus alone, the common case).
+- ~50 lines type-only.
+
+### 3e. Bundled focus plugin: `@overdraw/plugin-focus-default`
+
+- In-thread bundled plugin, priority 0, namespace `'focus'`.
+- Implements `decide()` with the follow-pointer and click-to-focus
+  state machines internally. The `focusOnMap` behavior (today a core
+  config field that auto-focuses freshly mapped windows) becomes a
+  plugin behavior: the plugin observes `pointer-enter` / `pointer-leave`
+  / `pointer-button` / `window-mapped` and returns the appropriate
+  `keyboardFocus`.
+- Config (verbatim from user's `config.focus`):
+  `{ policy: 'follow-pointer' | 'click-to-focus', focusOnMap: boolean }`.
+  Defaults: `policy: 'follow-pointer'`, `focusOnMap: true`. Validates
+  at init.
+- ~150 lines (includes the two state machines that used to live in
+  `wl_seat.ts`).
+
+### 3f. Core focus driver rewrite
+
+- In `packages/core/src/protocols/wl_seat.ts`: remove all `focus.policy
+  === ...` branches. At each focus-relevant coarse event,
+  fire-and-forget `runtime.invokeNamespace('focus', 'decide', [inputs])`
+  with a per-request sequence number; apply the result via the existing
+  `setKbFocus()` path. Discard stale results.
+- `sdk.windows.focus(id)` (§1 of `core-plugin-api.md`) — add this so
+  the bundled focus plugin can apply its decisions back into core
+  (without it the plugin can't actually change focus). ~30 lines in
+  the windows broker.
+- Remove `FocusOptions.policy` and `focusOnMap` from core config; the
+  user's `focus` config field is now consumed by the bundled focus
+  plugin's config (no backward compatibility — no existing users).
+- ~120 lines of change in core (mostly subtractive in `wl_seat.ts`;
+  the new dispatch + sequencing logic is ~40 lines).
+
+### 3g. Tests
+
+- Pure-unit (the two state machines tested in isolation against
+  synthetic event sequences).
+- Pure-unit for the in-thread bootstrap (a fake bundled plugin
+  registers a namespace; an external caller invokes it; assert
+  direct-call semantics + no Worker spawned).
+- The existing `integration.gpu.mjs` focus tests (follow-pointer,
+  click-to-focus, focus-on-map) must still pass against the extracted
+  plugin — these are the regression contract.
+
+**Total estimate**: ~500 lines (vs. ~170 in the original plan).
+Roughly: 130 substrate (3a + 3b), 20 layout migration (3c), 50 types
+(3d), 150 focus plugin (3e), 120 core changes (3f), tests on top.
+
+**What this validates**: the fire-and-forget hot-path pattern (Pattern
+B in `core-plugin-api.md`); the in-thread bundled-plugin transport
+that the priority-chain floor is supposed to provide near-free; the
+config channel that future bundled plugins (and any user plugin
+needing config) will use.
 
 ## Phase 4 — Animation evaluator
 
@@ -377,7 +477,7 @@ Demand-driven; ordering doesn't matter much:
 | 0. Foundation | 700 | no | bus, registry, actions, state, setOutputStack |
 | 1. IPC + overdrawctl | 500 | no | action registry under a real consumer |
 | 2. Layout extraction | 280 | minimal | namespace registry; shared types convention |
-| 3. Focus extraction | 170 | no | parameterized-mode pattern |
+| 3. Focus extraction + bundled-plugin substrate | 500 | no | in-thread bundled transport, config channel, fire-and-forget hot path |
 | 4. Animation evaluator | 800 | yes | per-frame eval, spec serialization, springs |
 | 5. Scene compose | 550 | yes | the load-bearing pixel primitive |
 | 6. Workspaces (instant) | 500 | no | first real greenfield plugin |

@@ -60,20 +60,54 @@ The exclusive-role arbitration logic is the same regardless of which role.
 Core provides one mechanism (the plugin-namespace registry) that all exclusive
 roles use; categories don't reimplement it.
 
-### Hot-path policy must be parameterizable
+### Hot path: fire-and-forget, not parameterize-and-bypass
 
 The async-everywhere model breaks down on per-frame or per-pointer-event
-decisions: round-tripping an external plugin per pointer-move is not viable.
-Where a policy decision lives on the hot path, the API splits in two:
+decisions: a chain of plugins each round-tripping per pointer-move
+saturates the IPC channel and ties tail latency to plugin Worker
+liveness. Two patterns address this; they look similar but address
+different problems.
 
-- A **parameterized mode** (cheap, named, evaluated in core) — e.g. focus mode
-  `follow-pointer` | `click-to-focus`, easing name.
-- An optional **callback** for the exceptional path, invoked at coarse events
-  (mapping, focus change, etc.).
+**Pattern A — Closed vocabulary for core machinery (§6, §8, §9).** Where
+the *behavior* is core's job and the plugin is choosing *which* of
+several core-provided implementations to use, the API exposes a closed
+string set:
 
-When a category has a hot-path component, the design names the parameterized
-mode explicitly. Callbacks are reserved for events at human-input rate or
-slower.
+- `sdk.compose.scene({mode: 'snapshot' | 'live' | 'live-on-damage'})` —
+  freshness contract for core's render-cache scheduling.
+- `sdk.transitions.run({kind: 'crossfade' | 'slide-N' | 'scale'})` —
+  core's built-in shaders.
+- `AnimationSpec` types (`'tween' | 'spring' | ...`) — core's
+  animation evaluator's instruction set.
+
+Plugins extend beyond these via the documented escape hatch: `sdk.output.
+takeover` for compose/transitions; `sdk.frame.onTick` + manual state
+writes for animations. There is no `'custom'` mode inside the closed
+set; the escape hatch is the explicitly-different shape.
+
+**Pattern B — Fire-and-forget for policy (§14).** Where the *decision*
+is policy and doesn't belong in core, core calls into the plugin
+asynchronously and does NOT await before returning from the hot-path
+handler. The plugin's result applies on the next tick via core SDK
+calls (`sdk.windows.focus`, `sdk.windows.setOutputStack`, etc.).
+Sequencing by request id discards stale results. The hot path stays
+synchronous and bounded.
+
+This pattern requires:
+- The decision being decoupled from the event whose handler triggers it
+  (e.g. pointer-motion can drop a stale focus-change without breaking
+  Wayland pointer routing — pointer events always follow the pointer
+  regardless of keyboard focus).
+- Coarse-event granularity (not literally per pointer-move; per
+  pointer-cross-surface, per button-press, per map/unmap). Plugins
+  observe the coarse event, not the underlying high-rate stream.
+
+**Avoid Pattern A for policy.** An earlier design used Pattern A for
+focus, with `getMode()` returning `'follow-pointer' | 'click-to-focus' |
+'custom'`. This conflated the two patterns: the named modes were
+implementations of policy that the plugin merely selected, requiring
+core to know the modes. The fire-and-forget approach (Pattern B) keeps
+focus policy out of core entirely.
 
 ### Policy plugin pushes state into core
 
@@ -514,28 +548,61 @@ registration at priority 0 — extracted from core to
 ### 14. Focus driver
 
 Same shape as layout: an exclusive-role plugin in the `'focus'` namespace
-decides keyboard focus on coarse events.
+decides keyboard focus on coarse events. Unlike layout, no named modes
+are baked into core — the plugin owns the policy end-to-end. Core fires
+a `decide()` call per focus-relevant coarse event and applies the
+returned focus target.
 
 ```ts
 type FocusAPI = {
-  // Mode is read by core at registration and after `getMode` notifications.
-  // The hot-path follow-pointer / click-to-focus modes are evaluated in
-  // core; only `custom` invokes `decide` per coarse event.
-  getMode(): Promise<'follow-pointer' | 'click-to-focus' | 'custom'>;
-  decide?(inputs: FocusInputs): Promise<FocusResult>;     // for mode='custom'
+  decide(inputs: FocusInputs): Promise<FocusResult>;
 };
 
 type FocusInputs = {
-  reason: 'pointer-button' | 'window-mapped' | 'window-unmapped'
+  // What triggered this decision. Coarse events only (human-input rate or
+  // slower); pointer-motion does NOT trigger decide (pointer events always
+  // follow the pointer per Wayland semantics; only KEYBOARD focus is the
+  // plugin's call, and a follow-pointer plugin reacts to pointer-enter /
+  // pointer-leave, not per-motion).
+  reason: 'pointer-button' | 'pointer-enter' | 'pointer-leave'
+        | 'window-mapped' | 'window-unmapped'
         | 'window-raised' | 'workspace-changed' | 'explicit';
-  pointer, currentKeyboardFocus, currentPointerFocus, trigger?, windows,
+  pointer: { x: number; y: number; surfaceUnderPointer: SurfaceId | null };
+  currentKeyboardFocus: SurfaceId | null;
+  trigger?: SurfaceId;        // e.g. the mapped/raised/clicked window
+  // The plugin may consult sdk.windows.list() for full window state; the
+  // small payload here is what changed since the last decide.
 };
 
-type FocusResult = { keyboardFocus: SurfaceId | null };
+type FocusResult = {
+  // The new keyboard focus target, or null to clear focus, or undefined
+  // to leave focus unchanged. (undefined is the common case: most events
+  // do not trigger a focus change under a click-to-focus policy.)
+  keyboardFocus?: SurfaceId | null;
+};
 ```
 
-The hot-path follow-pointer mode is implemented inline in core; `decide` is
-only called for `mode: 'custom'`. Per the parameterized-mode pattern.
+**Hot-path note.** The core call-site is fire-and-forget: `handleInput`
+dispatches `decide()` and continues; it does NOT await the result. The
+Promise's resolution applies the focus change on the next tick via
+`sdk.windows.focus(id)` (§1). Sequencing is by request id — a decision
+arriving after a newer request was already dispatched is discarded
+(stale results don't apply). This keeps the input path synchronous and
+bounded regardless of plugin latency.
+
+**Why no `'mode'` parameter.** An earlier design surfaced
+`getMode()` returning a closed string set (`'follow-pointer' |
+'click-to-focus' | 'custom'`) so core could implement the two named
+modes inline. That conflated two different things — core machinery
+(compose modes, transition kinds, animation specs — see §6, §8, §9) where
+the closed vocabulary IS the API, and policy (focus) where the closed
+vocabulary was an optimization for the common case. The optimization
+introduced a special case in core for behavior that genuinely doesn't
+belong to core. The fire-and-forget `decide()` pattern keeps the runtime
+contract uniform and removes core's knowledge of focus modes entirely.
+The bundled focus plugin implements follow-pointer / click-to-focus
+internally; a `'custom'` mode is no longer a distinct concept because
+every focus plugin is by definition custom.
 
 ## Typing model
 
@@ -765,8 +832,12 @@ target.
 ### Currently in core, must move to plugin
 - **Focus policy** (the `follow-pointer`/`click-to-focus` logic in
   `packages/core/src/protocols/wl_seat.ts`) → bundled focus plugin in
-  namespace `'focus'`, with the modes implemented inline in core per the
-  parameterized-mode pattern. Phase 3 of `build-order.md`.
+  namespace `'focus'`. The plugin owns the policy end-to-end via
+  `decide()` (fire-and-forget per the hot-path pattern in §"Cross-
+  cutting patterns"); no named modes in core. Phase 3 of
+  `build-order.md`. Note: Phase 3 also introduces the in-thread bundled
+  plugin transport (used by both this and the migrated layout plugin)
+  and the per-bundled-plugin config channel.
 
 ### Decoration broker (in core, stays)
 - `packages/core/src/plugins/decoration-broker.ts` is broker machinery
@@ -804,6 +875,10 @@ themselves are not core's code.
 - Event bus generalization (emit + pattern subscribe + IPC routing).
 - Action registry.
 - Plugin namespace registry.
+- In-thread bundled plugin transport + per-bundled-plugin config channel
+  (Phase 3 of `build-order.md`).
+- `sdk.windows.focus(id)` (§1; the focus plugin uses this to apply its
+  `decide()` result back into core).
 - Animation evaluator + spec format.
 - `compose.windows` / `compose.scene`.
 - `transitions.run` with built-in shaders (crossfade, slide-N, scale).
@@ -911,9 +986,50 @@ themselves are not core's code.
   Consistent with `customization.md` lines 701–711 ("built-in is the
   floor") and 742–753 ("no safe mode").
 
+- **Bundled plugins run in-thread.** Bundled plugins (those in
+  `BUNDLED_PLUGINS`) load on the main thread, not in a `worker_threads`
+  Worker. Same SDK contract as Worker plugins (every call returns a
+  Promise) but the transport is direct call + microtask hop, so calls
+  resolve near-free with no `postMessage` / structured-clone cost. User-
+  installed (third-party) plugins always run in a Worker, isolated and
+  watchdogged.
+
+  Rationale: bundled plugins are core's own code, trusted at the same
+  level as core, so the Worker isolation costs (per-call IPC, separate
+  GPU device handoff for `sdk.gpu`, restart machinery) buy nothing.
+  Putting them in-thread makes "bundled = near-free per call" honest
+  and matches the design intent that the priority-chain floor is a
+  zero-tax default. Failure handling for in-thread plugins differs:
+  init-time exceptions are fatal startup errors (release-blocking bug
+  per above); per-call exceptions from registered methods are caught at
+  the runtime boundary, logged (and surfaced to the user via a TBD
+  user-facing diagnostic stream), and treated as a null/empty result —
+  the plugin stays registered.
+
+- **Per-bundled-plugin config**: bundled-plugin `init` takes a second
+  argument. The plugin module exports
+  `default async function init(sdk, config?: unknown): Promise<void>`;
+  the config value is whatever the user's config file sets under the
+  plugin's name (e.g. `config.focus` flows into the bundled focus
+  plugin; `config.layout` into the bundled layout plugin). Core does
+  NOT validate plugin-specific config — it passes the value through
+  verbatim. The plugin owns its config schema and validates at init;
+  invalid config throws from init and surfaces the error to the user
+  (mechanism TBD; for now this manifests as the plugin failing to
+  register). The same second-arg shape applies to user-installed
+  plugins, populated from their `ResolvedPlugin.raw` entry — so a
+  plugin's `init` signature is the same regardless of how it's
+  installed.
+
 ### Open
 
-(All seven decisions resolved.)
+- **User-facing exception surfacing.** When an in-thread bundled
+  plugin's per-call method throws, or when init throws on a
+  config-validation failure, the error today goes to the log. A real
+  user-facing diagnostic stream (status-bar notification, IPC event,
+  CLI command) is TBD.
+
+(Seven decisions originally resolved; two more above.)
 
 ## Doc corrections to `customization.md`
 
