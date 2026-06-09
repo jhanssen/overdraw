@@ -11,10 +11,10 @@ what is actually built today is in `status.md`.
 
 ## Status
 
-Phases 0a, 0b, 0c, 0d, 0e, 1, 2, 3, 4 are landed (see `git log` and
-`status.md`). Phase 4.5 (event interception) is next. The text below
-describes each phase in its original forward-looking shape; ✅ marks
-the completed ones inline.
+Phases 0a, 0b, 0c, 0d, 0e, 1, 2, 3, 4, 4.5 are landed (see `git log` and
+`status.md`). Phase 5 (scene compose) is next. The text below describes
+each phase in its original forward-looking shape; ✅ marks the completed
+ones inline.
 
 ## Principle
 
@@ -330,7 +330,7 @@ GPU tests in `test/animations.gpu.mjs`: animate opacity with pixel readback
 at midpoint; spring overshoot + settle; cancel-on-new-animation
 replacement semantics.
 
-## Phase 4.5 — Event interception
+## Phase 4.5 — Event interception ✅
 
 Generalize the bus from observe-only into observe-or-modify. Lifecycle
 events become interceptable: a plugin can modify the payload core uses,

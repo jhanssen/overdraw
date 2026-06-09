@@ -111,6 +111,10 @@ class ManagedPlugin implements PluginHandle {
   // verbatim and uses them as the discriminator on `events.dispatch` back to
   // the worker.
   private busSubs = new Map<number, Subscription>();
+  // Plugin-owned interceptor registrations: interceptId -> bus Subscription.
+  // The plugin mints the ids locally; core stores them verbatim and routes
+  // intercept-handle requests back to the worker by that id.
+  private busIntercepts = new Map<number, Subscription>();
 
   // Resolves when the plugin first reaches `live` or `failed` (initial spawn).
   private firstSettle: { resolve: () => void } | null = null;
@@ -211,6 +215,8 @@ class ManagedPlugin implements PluginHandle {
     if (name === "events.subscribe") { this.onEventsSubscribe(data); return; }
     if (name === "events.unsubscribe") { this.onEventsUnsubscribe(data); return; }
     if (name === "events.emit") { this.onEventsEmit(data); return; }
+    if (name === "events.intercept-register") { this.onEventsInterceptRegister(data); return; }
+    if (name === "events.intercept-unregister") { this.onEventsInterceptUnregister(data); return; }
 
     // Namespace registry interactions (sdk.registerPlugin / unregister).
     // core-plugin-api.md §11.
@@ -280,12 +286,63 @@ class ManagedPlugin implements PluginHandle {
     }
   }
 
-  // Release all bus subscriptions this plugin holds. Called on Worker exit
-  // (crash, terminate, graceful) so a dead plugin leaves no lingering
-  // bus subscribers (which would otherwise try to emit to a closed endpoint).
+  private onEventsInterceptRegister(data: unknown): void {
+    const bus = this.opts.bus;
+    if (!bus) return;
+    if (!isInterceptRegisterPayload(data)) {
+      this.log(`[plugin ${this.cfg.name}] events.intercept-register: malformed payload; ignored`);
+      return;
+    }
+    const { interceptId, pattern, priority } = data;
+    if (this.busIntercepts.has(interceptId)) {
+      this.log(`[plugin ${this.cfg.name}] events.intercept-register: duplicate interceptId ${interceptId}; ignored`);
+      return;
+    }
+    let sub: Subscription;
+    try {
+      sub = bus.intercept(pattern, (evName, payload) => {
+        // Forward to the worker as a request; the worker's reply is the
+        // (possibly modified) payload. The bus enforces its per-handler
+        // timeout on the returned Promise, so a stuck worker can't stall
+        // the chain.
+        const ep = this.endpoint;
+        if (!ep) return undefined;
+        return ep.request("events.intercept-handle",
+          { interceptId, name: evName, payload: payload as Json })
+          .then((reply) => {
+            if (!isInterceptReply(reply)) return undefined;
+            if (!reply.modified) return undefined;
+            return reply.payload;
+          });
+      }, priority !== undefined ? { priority } : undefined);
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : String(err);
+      this.log(`[plugin ${this.cfg.name}] events.intercept-register('${pattern}') rejected: ${msg}`);
+      return;
+    }
+    this.busIntercepts.set(interceptId, sub);
+  }
+
+  private onEventsInterceptUnregister(data: unknown): void {
+    if (!isInterceptUnregisterPayload(data)) {
+      this.log(`[plugin ${this.cfg.name}] events.intercept-unregister: malformed payload; ignored`);
+      return;
+    }
+    const sub = this.busIntercepts.get(data.interceptId);
+    if (!sub) return;
+    sub.off();
+    this.busIntercepts.delete(data.interceptId);
+  }
+
+  // Release all bus subscriptions and interceptors this plugin holds. Called
+  // on Worker exit (crash, terminate, graceful) so a dead plugin leaves no
+  // lingering registrations (which would otherwise try to emit/request
+  // against a closed endpoint).
   private releaseBusSubs(): void {
     for (const sub of this.busSubs.values()) sub.off();
     this.busSubs.clear();
+    for (const sub of this.busIntercepts.values()) sub.off();
+    this.busIntercepts.clear();
   }
 
   private startWatchdog(): void {
@@ -726,6 +783,28 @@ function isEmitPayload(d: unknown): d is { name: string; payload: Json } {
   return typeof d === "object" && d !== null
     && typeof (d as { name?: unknown }).name === "string"
     && "payload" in (d as object);
+}
+
+function isInterceptRegisterPayload(d: unknown): d is { interceptId: number; pattern: string; priority?: number } {
+  if (typeof d !== "object" || d === null) return false;
+  const o = d as { [k: string]: unknown };
+  if (typeof o.interceptId !== "number") return false;
+  if (typeof o.pattern !== "string") return false;
+  if (o.priority !== undefined && typeof o.priority !== "number") return false;
+  return true;
+}
+
+function isInterceptUnregisterPayload(d: unknown): d is { interceptId: number } {
+  return typeof d === "object" && d !== null
+    && typeof (d as { interceptId?: unknown }).interceptId === "number";
+}
+
+function isInterceptReply(d: unknown): d is { modified: false } | { modified: true; payload: Json } {
+  if (typeof d !== "object" || d === null) return false;
+  const o = d as { [k: string]: unknown };
+  if (o.modified === false) return true;
+  if (o.modified === true) return "payload" in o;
+  return false;
 }
 
 function isRegisterPayload(d: unknown): d is { namespace: string; methods: string[]; priority?: number } {

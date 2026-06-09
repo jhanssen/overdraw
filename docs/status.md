@@ -4,7 +4,7 @@ Ground truth for what exists right now: current capabilities, known gaps, and
 what remains. The design lives in `architecture.md`; this file does not restate
 it. Present-tense only — no change history.
 
-Last updated: 2026-06-08 (post-Phase 3).
+Last updated: 2026-06-08 (post-Phase 4.5).
 
 ## Read first: gaps in advertised protocols (silent-gap risks)
 
@@ -511,14 +511,34 @@ title/appId/activated — maximized/fullscreen/minimized/resized/parent are not
 emitted (those `xdg_toplevel` requests are no-ops with no backing state); the
 bus is ready for them.
 
-**Pattern subscribe + plugin emit** (Phase 0a, `dynamic-bus.ts`): on top of
-the typed bus, a dynamic, string-keyed event bus supports
+**Pattern subscribe + plugin emit** (`dynamic-bus.ts`): on top of the
+typed bus, a dynamic, string-keyed event bus supports
 `sdk.events.subscribe(pattern, cb)` (exact name or glob — `'workspace.*'`,
-`'*'`) and `sdk.events.emit(name, payload)`. Core re-publishes the typed
-bus's `CompositorEventMap` events into the dynamic bus so plugin
+`'*'`) and `sdk.events.emit(name, payload, opts?)`. Core re-publishes the
+typed bus's `CompositorEventMap` events into the dynamic bus so plugin
 subscribers see them under the same names; plugins emit into their own
 namespaces. This is the substrate the IPC server's `subscribe` /
 `unsubscribe` methods route through.
+
+**Interception** (`dynamic-bus.ts intercept` + `events.ts`,
+core-plugin-api.md §3.1): on top of passive subscription, the bus supports
+`sdk.events.intercept(pattern, handler, {priority?})`. A handler may return
+a new payload (modify), a `Promise` resolving to one (defer + modify), or
+`undefined` (observe-only). `bus.emit(name, payload, {timeoutMs?})` runs
+matching interceptors in priority order (lower first; registration order
+breaks ties), then fans out observers with the FINAL payload. Hot path is
+unchanged when no interceptors match: observers fan out synchronously and
+the returned Promise is already-resolved. `emitSync` is the variant for
+sync-only sites (frame timer, synchronous input handlers): observers run
+synchronously; matching interceptors run for side effects but their
+return values are discarded. `markSyncOnly(name)` declares a name as
+sync-only so `intercept()` warns at registration. The plugin-side
+interceptor handler runs over the same Endpoint as
+subscribe/emit: `events.intercept-register` / `events.intercept-unregister`
+(one-way), `events.intercept-handle` (core->plugin REQUEST whose reply
+is the modified payload or an observe-only marker). Worker postMessage
+round-trip is bounded by the per-handler `timeoutMs`. Same wiring in
+both `runtime.ts` (Worker) and `inthread-plugin.ts` (bundled).
 
 ### Plugin SDK substrate (Phase 0)
 
@@ -763,6 +783,45 @@ chosen returns the spec value (the plugin author passes it to
 `sdk.animations.run` themselves). Returning specs avoids requiring
 the package to capture a Worker-bound SDK reference; the boilerplate
 delta is one wrapping call per animation site.
+
+### Event interception + window.relayout (Phase 4.5)
+
+Generalizes the bus from observe-only into observe-or-modify. The bus
+mechanism (intercept registration, async emit with chain, sync-only
+variant) is described above under "Pattern subscribe + plugin emit".
+This subsection describes what core EMITS on the bus that the new
+mechanism gates.
+
+- **`window.relayout`** (`packages/core/src/events/types.ts` +
+  `wm/index.ts applyLayout`): emitted per affected window inside
+  `applyLayout` BEFORE the WM mutates its outer rect, calls
+  `compositor.setSurfaceLayout`, or fires `xdg_toplevel.configure`.
+  Payload `{ surfaceId, oldOuter, newOuter }`. The WM awaits the emit
+  with a 100ms per-handler timeout. An interceptor that returns a
+  modified payload with a different `newOuter` redirects the WM's
+  installed rect (validated as a finite-numbered Rect; garbage falls
+  back to the layout's intended `newOuter`). An interceptor that
+  returns `undefined` may still have done side-effects (e.g. submitted
+  a `sdk.windows.setTransform` animation) before the WM proceeds. The
+  `LayoutApplyTarget.apply` contract returns `void | Promise<void>`;
+  the layout driver awaits it so coalesced relayouts serialize behind
+  the interceptor chain.
+- **Wiring**: `installProtocols({pluginBus})` threads the dynamic bus
+  into the WM via `createWm({pluginBus})`. GPU-free tests that don't
+  pass a bus get the no-emit path.
+- **Tests**: `test/dynamic-bus-intercept.test.js` (pure-unit, 39 tests
+  covering modify/defer/priority/timeout/sync-only/markSyncOnly/error
+  handling), `test/wm-relayout-event.test.js` (pure-unit, 8 tests:
+  emit payload shape, observer sees post-modification, interceptor
+  modifies the installed rect, async interceptor defers WM mutation,
+  garbage fallback, no-bus path, stuck-handler 100ms timeout),
+  `test/sdk-events-intercept.test.js` (e2e through Worker + in-thread,
+  9 tests: modify/observe/defer/priority/observer-payload/off()/teardown-
+  release/in-thread-transport/per-handler-timeout),
+  `test/relayout-intercept.gpu.mjs` (GPU integration: real wayland
+  client maps, bundled plugin's intercept modifies newOuter, WM
+  applies the intercepted rect; second test verifies the plugin sees
+  both oldOuter and newOuter in the payload).
 
 ### Decoration provider (registration + insets + drawing + atomic gating)
 

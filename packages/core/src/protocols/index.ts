@@ -82,6 +82,9 @@ export interface InstallOptions {
   // Core-internal event bus. GPU-free tests may omit it; emits become
   // no-ops.
   bus?: CompositorBus;
+  // Plugin-visible (dynamic) event bus. When set, the WM emits
+  // 'window.relayout' on it during applyLayout. Tests may omit it.
+  pluginBus?: import("../events/dynamic-bus.js").DynamicBus;
   // Layout driver factory (core-plugin-api.md §13). Omit -> the WM uses a
   // no-op driver that never moves windows; useful for tests that don't
   // exercise layout.
@@ -148,6 +151,7 @@ export async function installProtocols(
       state.decorationResize?.(windowId, outerRect, contentRect, insets);
     },
     layoutDriverFactory: opts.layoutDriverFactory,
+    pluginBus: opts.pluginBus,
   });
   // State-query channel (tests / introspection): a GPU-free snapshot of
   // geometry / focus / stacking. See src/query.ts.

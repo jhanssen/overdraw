@@ -148,6 +148,7 @@ export async function setupCompositor(opts = {}) {
     output: { width: dims.width, height: dims.height },
     compositor: jsCompositor ?? undefined,
     bus: opts.bus,
+    pluginBus,
     layoutDriverFactory: (target, snapshot) => createLayoutDriver({
       target, snapshot,
       compute: async (inputs) => {
@@ -178,9 +179,13 @@ export async function setupCompositor(opts = {}) {
   runtime = new PluginRuntime({
     bus: pluginBus,
     log: opts.log ?? (() => {}),
+    onEvent: opts.onEvent,
   });
   const resolved = BUNDLED_PLUGINS.map((spec) => bundledToResolved(spec, spec.module, resolvedConfig));
-  await runtime.load(resolved);
+  // Optional extra plugins (ResolvedPlugin shape) from the test. Loaded
+  // alongside the bundled set so interception tests can drop in a fixture.
+  const extra = opts.plugins ?? [];
+  await runtime.load([...resolved, ...extra]);
 
   const clients = [];
 

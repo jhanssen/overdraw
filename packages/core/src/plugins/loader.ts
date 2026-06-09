@@ -84,6 +84,9 @@ export async function runLoader(channel: Channel, input: LoaderInput): Promise<v
     const ac = actionsHandle.dispatcher.tryHandle(method, params);
     if (ac.handled) return await ac.result;
 
+    const ev = eventsHandle.requests.tryHandle(method, params);
+    if (ev.handled) return await ev.result;
+
     if (method === "shutdown") {
       stopGpu();
       await control.runShutdown();

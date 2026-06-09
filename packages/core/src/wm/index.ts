@@ -13,6 +13,9 @@ import type { Resource } from "../types.js";
 import type { CompositorSink } from "../protocols/ctx.js";
 import type { LayoutWindow, LayoutResult, LayoutReason } from "@overdraw/layout-types";
 import type { LayoutDriver, LayoutSnapshot, LayoutApplyTarget } from "./layout-driver.js";
+import type { DynamicBus } from "../events/dynamic-bus.js";
+import { WINDOW_EVENT } from "../events/types.js";
+import type { WindowRelayoutEvent } from "../events/types.js";
 
 export interface Rect { x: number; y: number; width: number; height: number; }
 export interface Output { width: number; height: number; }
@@ -212,6 +215,16 @@ function contentOf(win: Window): Rect {
   return win.insets ? shrink(win.outer, win.insets) : { ...win.outer };
 }
 
+// Validate that an arbitrary value matches the Rect shape with finite numbers.
+// An interceptor may return anything; if it returns garbage, fall back to the
+// WM's intended newOuter rather than corrupt geometry.
+function isRect(v: unknown): v is Rect {
+  if (typeof v !== "object" || v === null) return false;
+  const r = v as { [k: string]: unknown };
+  return Number.isFinite(r.x) && Number.isFinite(r.y)
+      && Number.isFinite(r.width) && Number.isFinite(r.height);
+}
+
 // Options for createWm. `rebuild` and `configure` are present in every prod path
 // (installProtocols installs them); unit tests omit them. `decorationResize`
 // fires when a decorated window's OUTER tile changes (move/resize); the broker
@@ -229,7 +242,15 @@ export interface WmOptions {
   configure?: ConfigureSink;
   decorationResize?: DecorationResizeSink;
   layoutDriverFactory?: (target: LayoutApplyTarget, snapshot: () => LayoutSnapshot) => LayoutDriver;
+  // Plugin-visible event bus. When set, applyLayout emits 'window.relayout'
+  // per affected window before mutating its outer tile, awaiting any
+  // interceptors. Omitting it skips the emit (GPU-free tests with no bus).
+  pluginBus?: DynamicBus;
 }
+
+// Per-handler ceiling for window.relayout interceptors (core-plugin-api.md §3.1).
+// Bounded so a hung/expensive plugin handler can't stall the WM indefinitely.
+const RELAYOUT_TIMEOUT_MS = 100;
 
 export function createWm(
   compositor: CompositorSink,
@@ -244,11 +265,13 @@ export function createWm(
   let rebuild: (() => void) | undefined;
   let decorationResize: DecorationResizeSink | undefined;
   let layoutDriverFactory: WmOptions["layoutDriverFactory"];
+  let pluginBus: DynamicBus | undefined;
   if (optsOrRebuild && typeof optsOrRebuild === "object") {
     rebuild = optsOrRebuild.rebuild;
     configure = optsOrRebuild.configure ?? configure;
     decorationResize = optsOrRebuild.decorationResize;
     layoutDriverFactory = optsOrRebuild.layoutDriverFactory;
+    pluginBus = optsOrRebuild.pluginBus;
   } else {
     rebuild = optsOrRebuild as (() => void) | undefined;
   }
@@ -274,12 +297,13 @@ export function createWm(
     compositor.setStack(ids);
   }
 
-  // Apply a LayoutResult: update each window's outer rect to match, push the
-  // compositor's setSurfaceLayout for mapped windows, fire configure where
-  // size changed, and update bound decorations. Windows omitted from the
-  // result keep their previous geometry (a layout that wants to hide a
+  // Apply a LayoutResult: emit window.relayout (interceptors may pre-snap a
+  // transform or redirect the new rect), then update each window's outer rect,
+  // push the compositor's setSurfaceLayout for mapped windows, fire configure
+  // where size changed, and update bound decorations. Windows omitted from
+  // the result keep their previous geometry (a layout that wants to hide a
   // window should leave it out; the driver doesn't auto-hide).
-  function applyLayout(result: LayoutResult, _reason: LayoutReason): void {
+  async function applyLayout(result: LayoutResult, _reason: LayoutReason): Promise<void> {
     void _reason;
     // Index by id for O(1) lookup; layouts may return rects in arbitrary order.
     const byId = new Map<number, { id: number; outer: Rect }>();
@@ -289,7 +313,24 @@ export function createWm(
       if (!r) continue;   // layout omitted this window: leave its geometry
       const prevContent = contentOf(win);
       const prevOuter = win.outer;
-      win.outer = { ...r.outer };
+      let newOuter: Rect = { ...r.outer };
+
+      // Pre-action emit: interceptors run BEFORE any compositor or
+      // xdg_toplevel side effect. A modifying interceptor returning a new
+      // payload with a different newOuter redirects this window's relayout.
+      if (pluginBus) {
+        const initial: WindowRelayoutEvent = {
+          surfaceId: win.surfaceId,
+          oldOuter: { ...prevOuter },
+          newOuter: { ...newOuter },
+        };
+        const finalPayload = await pluginBus.emit(WINDOW_EVENT.relayout, initial,
+          { timeoutMs: RELAYOUT_TIMEOUT_MS });
+        const ev = finalPayload as WindowRelayoutEvent | undefined;
+        if (ev && isRect(ev.newOuter)) newOuter = { ...ev.newOuter };
+      }
+
+      win.outer = newOuter;
       const content = contentOf(win);
       win.rect = content;
       // Drawn position follows the content rect; only meaningful once mapped.

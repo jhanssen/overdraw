@@ -27,6 +27,13 @@ export const WINDOW_EVENT = {
   // change stream. Plugins observing state mutations subscribe directly to
   // 'window.state-changed'.
   stateChanged: "window.state-changed",
+  // Pre-action lifecycle event: the WM is about to change a window's outer
+  // tile. Fired BEFORE the compositor receives the new rect or xdg_toplevel
+  // sees the configure. Await-capable: an interceptor may modify the new
+  // rect, or run async work (e.g. set a transform that pre-snaps the surface
+  // for an entry animation) and the WM awaits before pushing. Bounded by a
+  // 100ms per-handler timeout. core-plugin-api.md §3.1.
+  relayout: "window.relayout",
 } as const;
 
 // `type` (not `interface`) so the payloads carry an implicit index signature and
@@ -91,6 +98,17 @@ export type WindowStateChangedEvent = {
   deleted: boolean;
 };
 
+// Emitted before the WM mutates a mapped toplevel's outer tile. `oldOuter` is
+// the rect the window has right now; `newOuter` is what the WM is about to
+// install. An interceptor may return the same shape with a different
+// `newOuter` to redirect the relayout, or return undefined (observe-only) and
+// optionally perform side effects (e.g. setTransform) before the WM proceeds.
+export type WindowRelayoutEvent = {
+  surfaceId: number;
+  oldOuter: WindowRect;
+  newOuter: WindowRect;
+};
+
 // Decoration-provider events (core -> the matched provider plugin).
 export const DECORATION_EVENT = {
   assigned: "decoration.assigned",
@@ -136,6 +154,7 @@ type AssignableToCloneable<T extends Cloneable> = T;
 export type _MapIsCloneable = AssignableToCloneable<WindowMapEvent>;
 export type _UnmapIsCloneable = AssignableToCloneable<WindowUnmapEvent>;
 export type _ChangeIsCloneable = AssignableToCloneable<WindowChangeEvent>;
+export type _RelayoutIsCloneable = AssignableToCloneable<WindowRelayoutEvent>;
 export type _AssignedIsCloneable = AssignableToCloneable<DecorationAssignedEvent>;
 export type _DeregisteredIsCloneable = AssignableToCloneable<DecorationDeregisteredEvent>;
 export type _ResizedIsCloneable = AssignableToCloneable<DecorationResizedEvent>;

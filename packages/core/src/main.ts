@@ -132,6 +132,7 @@ state = await installProtocols(addon, {
   output: config.output ?? { width: dims.width, height: dims.height },
   compositor,
   bus,
+  pluginBus,
   layoutDriverFactory: (target, snapshot) => createLayoutDriver({
     target, snapshot,
     compute: async (inputs) => {

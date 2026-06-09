@@ -38,8 +38,10 @@ export interface LayoutSnapshot {
 export interface LayoutApplyTarget {
   // Apply this set of (id, outer) rects. The WM updates its records, pushes
   // setSurfaceLayout to the compositor for windows with content, and fires
-  // configure for windows whose content size changed.
-  apply(result: LayoutResult, reason: LayoutReason): void;
+  // configure for windows whose content size changed. Returns a Promise so
+  // the WM can await interceptors (window.relayout) before mutating
+  // geometry; tests with no bus may still return synchronously.
+  apply(result: LayoutResult, reason: LayoutReason): void | Promise<void>;
 }
 
 // The function the driver uses to invoke the layout plugin. In production
@@ -112,7 +114,7 @@ export function createLayoutDriver(deps: LayoutDriverDeps): LayoutDriver {
         reason,
       };
       const result = await deps.compute(inputs);
-      deps.target.apply(result, reason);
+      await deps.target.apply(result, reason);
     } catch (e: unknown) {
       const msg = e instanceof Error ? e.message : String(e);
       log(`compute(${reason}) failed: ${msg}`);
