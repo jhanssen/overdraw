@@ -180,6 +180,9 @@ export async function setupCompositor(opts = {}) {
     bus: pluginBus,
     log: opts.log ?? (() => {}),
     onEvent: opts.onEvent,
+    onRequest: opts.onRequest,
+    pluginAddonPath: opts.pluginAddonPath,
+    dawnPath: opts.dawnPath,
   });
   const resolved = BUNDLED_PLUGINS.map((spec) => bundledToResolved(spec, spec.module, resolvedConfig));
   // Optional extra plugins (ResolvedPlugin shape) from the test. Loaded
