@@ -1034,36 +1034,42 @@ export class JsCompositor implements CompositorSink {
     }
   }
 
-  // Async readback of the composited target. Returns tightly-packed BGRA bytes
-  // (width*height*4). copyTextureToBuffer requires 256-aligned bytesPerRow, so
-  // we pad on the GPU side and unpad here.
-  async readback(): Promise<{ width: number; height: number; data: Uint8Array }> {
-    if (this.nested || !this.target) {
-      throw new Error("readback() is headless-only (nested presents to the swapchain)");
-    }
-    const target = this.target;
-    const unpadded = this.width * 4;
+  // Async readback of an arbitrary GPUTexture. Returns tightly-packed BGRA
+  // bytes (w*h*4). copyTextureToBuffer requires 256-aligned bytesPerRow, so
+  // pad on the GPU side and unpad here. The texture must have COPY_SRC usage.
+  async readbackTexture(tex: GPUTexture, w: number, h: number):
+      Promise<{ width: number; height: number; data: Uint8Array }> {
+    const unpadded = w * 4;
     const padded = Math.ceil(unpadded / 256) * 256;
     const buf = this.device.createBuffer({
-      size: padded * this.height,
+      size: padded * h,
       usage: this.g.GPUBufferUsage.COPY_DST | this.g.GPUBufferUsage.MAP_READ,
     });
     const enc = this.device.createCommandEncoder();
     enc.copyTextureToBuffer(
-      { texture: target },
-      { buffer: buf, bytesPerRow: padded, rowsPerImage: this.height },
-      { width: this.width, height: this.height },
+      { texture: tex },
+      { buffer: buf, bytesPerRow: padded, rowsPerImage: h },
+      { width: w, height: h },
     );
     this.device.queue.submit([enc.finish()]);
     await buf.mapAsync(this.g.GPUMapMode.READ);
     const mapped = new Uint8Array(buf.getMappedRange());
-    const out = new Uint8Array(unpadded * this.height);
-    for (let y = 0; y < this.height; y++) {
+    const out = new Uint8Array(unpadded * h);
+    for (let y = 0; y < h; y++) {
       out.set(mapped.subarray(y * padded, y * padded + unpadded), y * unpadded);
     }
     buf.unmap();
     buf.destroy();
-    return { width: this.width, height: this.height, data: out };
+    return { width: w, height: h, data: out };
+  }
+
+  // Async readback of the headless offscreen target. Convenience wrapper
+  // around readbackTexture for the on-screen composite (used by tests).
+  async readback(): Promise<{ width: number; height: number; data: Uint8Array }> {
+    if (this.nested || !this.target) {
+      throw new Error("readback() is headless-only (nested presents to the swapchain)");
+    }
+    return this.readbackTexture(this.target, this.width, this.height);
   }
 }
 
