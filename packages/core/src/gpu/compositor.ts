@@ -22,10 +22,17 @@
 //   transform (vec4): tx, ty, sx, sy      -- translate (normalized), scale (unitless)
 //   margin    (vec4): top, right, bottom, left  -- normalized output px
 //   fx        (vec4): opacity, _, _, _
+//   cropUV    (vec4): u0, v0, u1, v1      -- surface-texture UV range to sample
 //
 // transform.scale anchors at the placement's top-left; an animation wanting
 // center-anchored scale composes that as translate + scale + counter-translate
 // in the plugin-side spec builder.
+//
+// cropUV selects a sub-rect of the surface texture to sample as the surface's
+// pixels. Identity is (0,0,1,1) -- sample the full texture (the on-screen
+// default). compose.windows uses non-identity cropUV when its caller passes
+// a source-crop rect: the crop's surface-local pixel coords are normalized
+// into UV and packed here, so the (cropped) region fills the rendered surface.
 //
 // outputMargin reserves canvas around the surface's nominal rect. The mask
 // is sampled across the FULL expanded region (margin included) and its alpha
@@ -49,6 +56,7 @@ struct Uniforms {
   transform : vec4f,
   margin    : vec4f,
   fx        : vec4f,
+  cropUV    : vec4f,
 };
 @group(0) @binding(2) var<uniform> u : Uniforms;
 @vertex fn vs(@builtin(vertex_index) i : u32) -> VsOut {
@@ -97,7 +105,13 @@ struct Uniforms {
   // (textureSampleLevel) and multiply by an inside-rect mask computed from
   // the interpolated UV. The sampled value at clamp-edges is harmless
   // because we zero it via the inside multiplier below.
-  let surf = textureSampleLevel(tex, samp, in.surfUV, 0.0);
+  //
+  // surfUV addresses the surface's nominal [0,1] region; cropUV remaps that
+  // into the actual texture coords to sample (compose.windows uses this to
+  // render a sub-region of a surface). Default cropUV = (0,0,1,1) =
+  // identity (sample the full texture).
+  let sampleUV = mix(u.cropUV.xy, u.cropUV.zw, in.surfUV);
+  let surf = textureSampleLevel(tex, samp, sampleUV, 0.0);
   let inside = step(0.0, in.surfUV.x) * step(in.surfUV.x, 1.0)
              * step(0.0, in.surfUV.y) * step(in.surfUV.y, 1.0);
 
@@ -181,9 +195,9 @@ interface SurfaceFx {
 interface Surface {
   texture: GPUTexture | null;       // bgra8unorm, sampled
   view: GPUTextureView | null;
-  // 64-byte uniform buffer holding the WGSL Uniforms struct (4 vec4s:
-  // placement, transform, margin, fx). Rebuilt on size change like the
-  // bind group; updated each frame via writeBuffer.
+  // 80-byte uniform buffer holding the WGSL Uniforms struct (5 vec4s:
+  // placement, transform, margin, fx, cropUV). Rebuilt on size change
+  // like the bind group; updated each frame via writeBuffer.
   uniformBuf: GPUBuffer | null;
   bindGroup: GPUBindGroup | null;
   width: number;
@@ -206,7 +220,7 @@ interface Surface {
   maskView: GPUTextureView | null;
 }
 
-const UNIFORM_BYTES = 64;
+const UNIFORM_BYTES = 80;
 
 function defaultFx(): SurfaceFx {
   return {
@@ -846,21 +860,37 @@ export class JsCompositor implements CompositorSink {
     s.present = true;
   }
 
-  // Pack the per-surface render state (placement + transform + margin + fx)
-  // into the WGSL Uniforms struct and upload. Normalizes all output-pixel
-  // quantities to [0,1] target space; the shader needs no target dims.
+  // Pack the per-surface render state (placement + transform + margin + fx +
+  // cropUV) into the WGSL Uniforms struct and upload. Normalizes all output-
+  // pixel quantities to [0,1] target space; the shader needs no target dims.
+  //
   // ow/oh are the dimensions of the render target this surface will be drawn
   // into -- the on-screen output for renderFrame, an arbitrary compose
   // texture for compose calls.
-  private updateUniforms(s: Surface, ow: number, oh: number): void {
+  //
+  // overrides (optional, compose-only): when present, the surface's nominal
+  // placement (xywh) and/or sampled crop region (UV) are replaced by the
+  // caller-supplied values for this draw only. compose.windows uses both:
+  // placement = {0,0,outW,outH} so the cropped region fills the per-window
+  // texture; cropUV = normalized source-crop pixel coords. compose.scene
+  // passes neither, falling through to the on-screen behavior.
+  private updateUniforms(
+    s: Surface, ow: number, oh: number,
+    overrides?: {
+      placement?: { x: number; y: number; w: number; h: number };
+      cropUV?: { u0: number; v0: number; u1: number; v1: number };
+    },
+  ): void {
     if (!s.uniformBuf) return;
-    const w = s.layoutW || s.width;
-    const h = s.layoutH || s.height;
+    const px = overrides?.placement?.x ?? s.x;
+    const py = overrides?.placement?.y ?? s.y;
+    const pw = overrides?.placement?.w ?? (s.layoutW || s.width);
+    const ph = overrides?.placement?.h ?? (s.layoutH || s.height);
     const fx = s.fx;
     const data = new Float32Array(UNIFORM_BYTES / 4);
     // placement
-    data[0] = s.x / ow; data[1] = s.y / oh;
-    data[2] = w / ow;   data[3] = h / oh;
+    data[0] = px / ow; data[1] = py / oh;
+    data[2] = pw / ow; data[3] = ph / oh;
     // transform: translate (normalized output coords); scale (unitless)
     data[4] = fx.translateX / ow; data[5] = fx.translateY / oh;
     data[6] = fx.scaleX;          data[7] = fx.scaleY;
@@ -871,6 +901,10 @@ export class JsCompositor implements CompositorSink {
     data[11] = fx.marginLeft   / ow;
     // fx: opacity in x; rest reserved
     data[12] = fx.opacity;
+    // cropUV: u0, v0, u1, v1 (defaults identity = full surface texture)
+    const cu = overrides?.cropUV;
+    data[16] = cu?.u0 ?? 0; data[17] = cu?.v0 ?? 0;
+    data[18] = cu?.u1 ?? 1; data[19] = cu?.v1 ?? 1;
     this.device.queue.writeBuffer(s.uniformBuf, 0, data);
   }
 
@@ -938,12 +972,19 @@ export class JsCompositor implements CompositorSink {
   // Pure pass-encoder -- no submit, no lifecycle calls, no bracket management.
   // Multiple calls within one frame share a single command encoder + submit
   // and share one set of import brackets opened around them.
+  //
+  // placements / cropUV are per-call overrides (compose-only); when absent
+  // the surface's stored placement and identity cropUV are used. compose.
+  // windows passes both to render a sub-region of a surface into a
+  // crop-sized texture; compose.scene passes neither.
   private composite(args: {
     encoder: GPUCommandEncoder;
     targetView: GPUTextureView;
     drawList: number[];
     outW: number;
     outH: number;
+    placements?: Map<number, { x: number; y: number; w: number; h: number }>;
+    cropUV?: Map<number, { u0: number; v0: number; u1: number; v1: number }>;
   }): void {
     const pass = args.encoder.beginRenderPass({
       colorAttachments: [{
@@ -957,7 +998,10 @@ export class JsCompositor implements CompositorSink {
     for (const id of args.drawList) {
       const s = this.surfaces.get(id);
       if (s && s.present && s.bindGroup) {
-        this.updateUniforms(s, args.outW, args.outH);
+        const placement = args.placements?.get(id);
+        const cropUV = args.cropUV?.get(id);
+        this.updateUniforms(s, args.outW, args.outH,
+          placement || cropUV ? { placement, cropUV } : undefined);
         pass.setBindGroup(0, s.bindGroup);
         pass.draw(4);
       }
@@ -1032,6 +1076,133 @@ export class JsCompositor implements CompositorSink {
       }
       throw e;
     }
+  }
+
+  // Allocate a texture suitable as a compose target: same format as the
+  // output, sampleable downstream by the plugin / for readback, plus
+  // COPY_SRC so readbackTexture can read it.
+  private allocComposeTexture(w: number, h: number): GPUTexture {
+    return this.device.createTexture({
+      size: { width: w, height: h },
+      format: this.format,
+      usage: this.g.GPUTextureUsage.RENDER_ATTACHMENT
+           | this.g.GPUTextureUsage.TEXTURE_BINDING
+           | this.g.GPUTextureUsage.COPY_SRC,
+    });
+  }
+
+  // Snapshot compose primitive shared by composeScene and composeWindows.
+  // Runs one composite pass into `targetView` with its own dmabuf bracket
+  // open/close pair. Synchronous wrt the on-screen frame loop: the JS
+  // event loop is single-threaded, so a snapshot returns before the next
+  // tick. The lifecycle state machine is NOT driven by snapshots -- the
+  // wire-level brackets are independent of the per-frame frameStart /
+  // frameSampled / submitted / gpuCompleted cycle, which exists to track
+  // client buffer release (an on-screen-only concern; what compose samples
+  // doesn't affect what gets shown to the client).
+  private composeSnapshot(args: {
+    targetView: GPUTextureView;
+    drawList: number[];
+    outW: number;
+    outH: number;
+    placements?: Map<number, { x: number; y: number; w: number; h: number }>;
+    cropUV?: Map<number, { u0: number; v0: number; u1: number; v1: number }>;
+  }): void {
+    const bracketed: Array<{ importId: number; bufferId: number }> = [];
+    this.openImportBrackets(args.drawList, bracketed);
+    try {
+      const enc = this.device.createCommandEncoder();
+      this.composite({
+        encoder: enc,
+        targetView: args.targetView,
+        drawList: args.drawList,
+        outW: args.outW, outH: args.outH,
+        placements: args.placements,
+        cropUV: args.cropUV,
+      });
+      this.device.queue.submit([enc.finish()]);
+    } finally {
+      this.closeImportBrackets(bracketed);
+    }
+  }
+
+  // Render the listed windows into a fresh texture sized to (outW, outH).
+  // Snapshot mode: one-shot, the texture is not refreshed after this call.
+  // Windows are drawn in list order (back to front) using their current
+  // per-surface state (placement, transform, mask, opacity); no crop.
+  //
+  // Caller owns the returned texture and must .destroy() it when done.
+  composeScene(args: {
+    outputId: number;
+    windows: ReadonlyArray<number>;
+    outW?: number;
+    outH?: number;
+  }): { texture: GPUTexture; outW: number; outH: number } {
+    const outW = args.outW ?? this.width;
+    const outH = args.outH ?? this.height;
+    const texture = this.allocComposeTexture(outW, outH);
+    this.composeSnapshot({
+      targetView: texture.createView(),
+      drawList: [...args.windows],
+      outW, outH,
+    });
+    return { texture, outW, outH };
+  }
+
+  // Render each listed window into its own texture sized to that window's
+  // crop rect (or the window's full size if no crop). The cropped region of
+  // the surface texture fills the target texture; per-surface state
+  // (transform, mask, opacity, outputMargin) is currently NOT applied to
+  // per-window compose textures -- those are render-state for on-screen
+  // placement, and a per-window crop is a content extraction.
+  // (The placement override sets the surface's draw rect to fill the target.)
+  //
+  // rect (if given) is source crop in surface-local pixels; the target
+  // texture is sized to (rect.w, rect.h). Without rect, target sized to
+  // the window's full layout/buffer dims.
+  //
+  // Caller owns each returned texture and must .destroy() them when done.
+  composeWindows(args: {
+    outputId: number;
+    windows: ReadonlyArray<{ id: number;
+                            rect?: { x: number; y: number; w: number; h: number } }>;
+  }): Array<{ id: number; texture: GPUTexture;
+              rect: { x: number; y: number; w: number; h: number } }> {
+    // Compute per-window output rects and cropUV. The crop's UV range is
+    // the crop pixel coords / surface dims (the surface texture is sampled
+    // in [0,1] UV regardless of its actual pixel size; cropUV picks a
+    // sub-rect of that).
+    const out: Array<{ id: number; texture: GPUTexture;
+                       rect: { x: number; y: number; w: number; h: number } }> = [];
+    for (const w of args.windows) {
+      const s = this.surfaces.get(w.id);
+      if (!s) continue;  // unknown window: skip (caller bug; report empty)
+      const surfW = s.width || s.layoutW || 0;
+      const surfH = s.height || s.layoutH || 0;
+      const rect = w.rect ?? { x: 0, y: 0, w: surfW, h: surfH };
+      // Degenerate (zero-dim) windows produce no texture (would error on
+      // createTexture). Skip and let the caller see a shorter result.
+      if (rect.w <= 0 || rect.h <= 0) continue;
+
+      const texture = this.allocComposeTexture(rect.w, rect.h);
+      // Render this surface filling the target (placement = full target).
+      // Sample only the crop region (cropUV in [0,1] UV).
+      const placements = new Map([[w.id, { x: 0, y: 0, w: rect.w, h: rect.h }]]);
+      const cropUV = surfW > 0 && surfH > 0
+        ? new Map([[w.id, {
+            u0: rect.x / surfW, v0: rect.y / surfH,
+            u1: (rect.x + rect.w) / surfW, v1: (rect.y + rect.h) / surfH,
+          }]])
+        : undefined;
+      this.composeSnapshot({
+        targetView: texture.createView(),
+        drawList: [w.id],
+        outW: rect.w, outH: rect.h,
+        placements, cropUV,
+      });
+      out.push({ id: w.id, texture, rect });
+    }
+    return out;
   }
 
   // Async readback of an arbitrary GPUTexture. Returns tightly-packed BGRA
