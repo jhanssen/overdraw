@@ -397,6 +397,22 @@ export class JsCompositor implements CompositorSink {
   // with the cropped region filling the target.
   private liveScenes: LiveScene[] = [];
   private liveWindowComps: LiveWindowComp[] = [];
+  // Phase 5b-live: per-frame compose targets for Worker plugins. Each entry
+  // is a dmabuf compose buffer (allocated via AllocComposeBuf) being kept in
+  // sync with compositor state. On every renderFrame(), after the on-screen
+  // composite, each entry's render pass writes the current windows into its
+  // target, wrapped in producer Begin/End on the core wire (the GPU process
+  // chains the resulting fence into the plugin's next consumer Begin). The
+  // target view + producerSurfaceBufId are stored at registration time; the
+  // texture handle itself is owned by the broker (it wraps the wire texture
+  // for its own use too).
+  private liveComposeBufs: Array<{
+    surfaceBufId: number;
+    targetView: GPUTextureView;
+    windows: number[];
+    outW: number;
+    outH: number;
+  }> = [];
 
   // dmabuf buffer-release lifecycle. The pure state machine (no GPU, no Dawn)
   // is the source of truth; the executor here translates events <-> intents.
@@ -1118,6 +1134,16 @@ export class JsCompositor implements CompositorSink {
     for (const lw of this.liveWindowComps) {
       this.openImportBrackets(lw.windows.map((w) => w.id), bracketed);
     }
+    for (const lc of this.liveComposeBufs) this.openImportBrackets(lc.windows, bracketed);
+    // Producer Begin for every dmabuf compose buf. FIFO-ordered before the
+    // submit batch (writeProducerBegin flushes staged Dawn bytes first), so
+    // the GPU process opens the producer bracket before HandleCommands
+    // decodes the compose pass for this surface. Per-frame producer
+    // Begin/End pairs; the GPU process chains the End fence into the
+    // plugin's next consumer Begin.
+    for (const lc of this.liveComposeBufs) {
+      this.addon.writeProducerBegin(lc.surfaceBufId);
+    }
 
     try {
       const enc = this.device.createCommandEncoder();
@@ -1154,6 +1180,14 @@ export class JsCompositor implements CompositorSink {
           });
         }
       }
+      // Live compose buffers (phase 5b-live). Same shape as liveScenes but
+      // targeted at a wire-wrapped dmabuf with producer Begin/End brackets.
+      for (const lc of this.liveComposeBufs) {
+        this.composite({
+          encoder: enc, targetView: lc.targetView, drawList: lc.windows,
+          outW: lc.outW, outH: lc.outH,
+        });
+      }
       this.device.queue.submit([enc.finish()]);
 
       // Tag the submit; on GPU completion advance completedSerial and emit
@@ -1163,6 +1197,12 @@ export class JsCompositor implements CompositorSink {
       frameOpen = false;
 
       this.closeImportBrackets(bracketed);
+      // Producer End for every live compose buf, FIFO-ordered after the
+      // submit so the GPU process closes the producer bracket only after
+      // decoding the compose-pass commands.
+      for (const lc of this.liveComposeBufs) {
+        this.addon.writeProducerEnd(lc.surfaceBufId);
+      }
 
       this.device.queue.onSubmittedWorkDone().then(() => {
         if (serial > this.completedSerial) this.completedSerial = serial;
@@ -1417,6 +1457,35 @@ export class JsCompositor implements CompositorSink {
         for (const w of windows) w.texture.destroy();
       },
     };
+  }
+
+  // Phase 5b-live: register a dmabuf compose buffer for per-frame produce.
+  // The broker (gpu-broker.ts compose.live) allocates the AllocComposeBuf,
+  // wraps the producer-side texture on the core device, and calls this to
+  // get the core's per-frame produce loop to render into it. Each renderFrame
+  // emits one producer Begin + compose pass + producer End for this entry.
+  //
+  // The caller (broker) owns the GPUTexture's lifetime. unregisterLiveCompose
+  // removes the entry; the broker then releases the wire texture / dmabuf.
+  registerLiveCompose(args: {
+    surfaceBufId: number;
+    targetView: GPUTextureView;
+    windows: ReadonlyArray<number>;
+    outW: number;
+    outH: number;
+  }): void {
+    this.liveComposeBufs.push({
+      surfaceBufId: args.surfaceBufId,
+      targetView: args.targetView,
+      windows: [...args.windows],
+      outW: args.outW,
+      outH: args.outH,
+    });
+  }
+
+  unregisterLiveCompose(surfaceBufId: number): void {
+    const i = this.liveComposeBufs.findIndex((lc) => lc.surfaceBufId === surfaceBufId);
+    if (i >= 0) this.liveComposeBufs.splice(i, 1);
   }
 
   // Async readback of an arbitrary GPUTexture. Returns tightly-packed BGRA
