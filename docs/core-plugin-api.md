@@ -109,6 +109,17 @@ implementations of policy that the plugin merely selected, requiring
 core to know the modes. The fire-and-forget approach (Pattern B) keeps
 focus policy out of core entirely.
 
+**Patterns A and B are about the hot path** (per-frame / per-pointer-
+event). The lower-frequency lifecycle events (`window.relayout`,
+`window.map`, `window.closing`) use a third pattern: bus-level
+**interception** (§3.1). Plugins register an interceptor on an event,
+modify its payload before core acts on it, or defer the action while
+they prepare state. Per-event timeouts bound the wait. This pattern
+is the one used for things that AREN'T per-frame -- a relayout fires
+at most a few times a second under interactive use; a map fires
+once per window birth. Interception adds round-trip cost per
+intercepted emit, but at lifecycle-event rates the cost is invisible.
+
 ### Policy plugin pushes state into core
 
 Where a plugin owns a concept (workspaces, window-rules, etc.), it pushes the
@@ -198,35 +209,113 @@ core; plugins observe, don't set, in v1. Future: plugin-driven policy
 ### 3. Event bus
 
 A pattern-subscribable, plugin-emittable event bus. The primary observation
-mechanism; replaces ad-hoc per-category observe APIs.
+mechanism; replaces ad-hoc per-category observe APIs. Two subscription
+shapes: passive observation (`subscribe`) and active modification
+(`intercept`); see "Interception" below.
 
 ```ts
-sdk.events.emit(name: string, payload: unknown): void
+sdk.events.emit<T>(name: string, payload: T, opts?: { timeoutMs?: number }): Promise<T>
 sdk.events.subscribe(pattern: string, cb: (name, payload) => void): { unsubscribe }
+sdk.events.intercept<T>(pattern: string,
+                        cb: (payload: T) => T | Promise<T> | void,
+                        opts?: { priority?: number }): { unsubscribe }
 ```
 
 Pattern is exact (`window.map`) or glob (`workspace.*`, `*`).
 
 Core emits a stable set of events:
 
-- `window.map`, `window.unmap`, `window.change`, `window.closing`. The
-  `window.change` payload covers core-tracked state only (title, app_id,
-  focused, floating/fullscreen/maximized/minimized, geometry). Plugin
-  concepts like workspace membership are not in this payload — plugins
-  observe their own state-bag changes via separate events they emit.
+- `window.map`, `window.unmap`, `window.relayout`, `window.change`,
+  `window.closing`. The `window.change` payload covers core-tracked
+  state only (title, app_id, focused, floating/fullscreen/maximized/
+  minimized). Plugin concepts like workspace membership are not in
+  this payload — plugins observe their own state-bag changes via
+  separate events they emit.
 - `output.added`, `output.removed`, `output.changed`
 - `pointer.focus`, `keyboard.focus`
 - `frame.tick` (per output)
 
-`window.closing` is *await-on-decision*: subscribers may async-await; core
-awaits all with a 500ms bounded timeout before processing the unmap. See
-the "Phantom-window lifetime" decision.
+`window.closing` is *await-on-decision* (see Interception): subscribers
+may async-await; core awaits all with a 500ms bounded timeout before
+processing the unmap. See the "Phantom-window lifetime" decision.
 
 Plugins emit whatever they want under their own namespace. The event bus is
 also the substrate for IPC subscriptions (below).
 
 Typed wrappers (e.g. `sdk.windows.onChange(cb)`) can layer on top for
 ergonomics, but the bus is the primitive.
+
+#### 3.1 Interception
+
+Beyond passive observation, plugins may intercept events to MODIFY the
+payload core uses, or to DEFER a downstream action while they prepare
+state. Same mechanism for both, distinguished by what the handler
+returns:
+
+- **Modify**: handler returns the (possibly modified) payload, or a
+  Promise of it. Multiple interceptors run in priority order; each sees
+  the prior interceptor's output as input. Last-write-wins per field.
+- **Defer (veto / gate)**: handler does work (start an animation, set
+  state, etc.) and returns nothing. The emitter (core or another
+  plugin) awaits the handler's Promise before proceeding with whatever
+  action follows the emit. Bounded by a per-emit timeout.
+
+```ts
+// Modify example: an intercept-relayout plugin pre-snaps each
+// window's transform before core pushes the new rect.
+sdk.events.intercept<RelayoutEvent>("window.relayout", async (ev) => {
+  await sdk.windows.setTransform(ev.surfaceId, computeFromOldToNew(ev));
+  // returns void -> defer: core awaits, then proceeds to push new rect.
+});
+
+// Modify example: a focus-policy plugin redirects focus before
+// it lands.
+sdk.events.intercept<KeyboardFocusEvent>("keyboard.focus", (ev) => {
+  if (shouldRedirect(ev)) return { ...ev, surfaceId: pinnedSurfaceId };
+  // returns nothing -> observe-only for this emit; core uses original.
+});
+```
+
+The single `emit` shape always returns a Promise that resolves to the
+FINAL payload (the original if no interceptors registered, or the
+chain output otherwise). Authors who don't await get fire-and-forget
+semantics; the bus's hot path is synchronous when no interceptors
+exist, so an `emit` followed by sync next-line code retains today's
+ordering against observers. With interceptors present, observers see
+the post-modification payload and run after the interceptor chain
+settles.
+
+Per-event policy is implicit in where core emits:
+
+- *Pre-action emit sites* (e.g. `window.relayout`, `window.map`'s
+  draw-stack push, `window.closing` before unmap): await-capable; the
+  caller `await emit(...)` before performing the action.
+- *Post-action emit sites* (e.g. `window.change`, `keyboard.focus`'s
+  notification): nothing to modify or defer; interceptors are run for
+  their side effects but their return values are not honored by the
+  emit caller.
+- *Synchronous emit sites* (driven from C++ frame timer / synchronous
+  input handlers): cannot await. Core uses a synchronous `emitSync`
+  variant; interceptors register but core does not honor their
+  modifications. The bus warns at registration if a plugin tries to
+  intercept a name whose emit site is sync-only.
+
+Per-emit timeout defaults are documented on each event in the section
+that introduces it. Interceptors that exceed their event's timeout
+are abandoned (the chain proceeds with the prior payload); the
+plugin is logged but stays registered.
+
+Plugin-emitted events follow the same mechanism: a plugin's
+`sdk.events.emit(name, payload)` may be intercepted by any other
+plugin (or by core code if it ever subscribes). The emitting plugin
+opts into honoring modifications by awaiting; not awaiting is
+fire-and-forget regardless of who registered interceptors.
+
+Worker plugins intercept the same way as in-thread; the cost is one
+postMessage round-trip per Worker plugin in the chain. Per-event
+timeouts are set such that Worker round-trip is feasible (e.g.
+100ms for `window.relayout` is comfortable; a hypothetical
+0ms event would effectively bar Worker interceptors).
 
 ### 4. Input primitives
 
@@ -920,6 +1009,24 @@ themselves are not core's code.
   wants tags, a separate plugin can claim the `'workspace'` namespace with
   that semantics. Core API (`setOutputStack`) is agnostic either way.
 
+- **Generic event interception**: every event the bus carries is
+  potentially interceptable -- by plugins, on each other's events as
+  well as on core's. The mechanism is one `intercept(pattern, handler)`
+  registration alongside the existing `subscribe`; `emit` becomes
+  Promise-returning so the emitter (or anyone awaiting it) sees the
+  final post-modification payload. Hot path is unchanged when no
+  interceptors are registered: observers fan out synchronously,
+  Promise resolves with the original payload. With interceptors
+  registered, the bus runs them in priority order before observers,
+  chaining modifications. Per-event timeouts bound interceptor
+  latency; throwing/timing-out interceptors are skipped, chain
+  continues with the prior payload. See §3.1 for the full mechanism;
+  per-event policy (await-capable vs sync-only emit sites) is
+  documented at each event's introduction in this doc. The "modify"
+  shape (return a value to change the payload) and the "defer" shape
+  (return void after doing work to gate the next action) share one
+  registration -- they differ only by handler return value.
+
 - **Phantom-window-lifetime API**: no explicit
   `requestExtendedLifetime` call. Lifetime extension is implicit in the
   `window.closing` event being an *await-on-decision* event. When a client
@@ -933,7 +1040,9 @@ themselves are not core's code.
   timeout elapses; that's the actual moment of surface destruction.
   Multiple subscribers awaiting compose naturally — core waits for the
   longest. No explicit refcount, no per-call `maxDuration` (one system-wide
-  timeout).
+  timeout). Implemented via the generic interception mechanism
+  above (the "defer" shape: subscribers return after their async work
+  completes; core awaits).
 
 - **`sdk.capture` dropped**: no `sdk.capture` namespace. The capture use
   cases (screenshots, recording, thumbnails, accessibility magnifier) are

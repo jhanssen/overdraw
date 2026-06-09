@@ -11,9 +11,10 @@ what is actually built today is in `status.md`.
 
 ## Status
 
-Phases 0a, 0b, 0c, 0d, 0e, 1, 2 are landed (see `git log` and `status.md`).
-Phase 3 is next. The text below describes each phase in its original
-forward-looking shape; ✅ marks the completed ones inline.
+Phases 0a, 0b, 0c, 0d, 0e, 1, 2, 3, 4 are landed (see `git log` and
+`status.md`). Phase 4.5 (event interception) is next. The text below
+describes each phase in its original forward-looking shape; ✅ marks
+the completed ones inline.
 
 ## Principle
 
@@ -167,7 +168,7 @@ package convention, and the "extraction without behavior change" path.
 Existing `compositing.gpu.mjs` and tile-verification tests must still
 pass — the master-stack behavior is unchanged.
 
-## Phase 3 — Focus extraction + bundled-plugin substrate
+## Phase 3 — Focus extraction + bundled-plugin substrate ✅
 
 Bigger than the original plan: in addition to extracting focus, Phase 3
 adds two pieces of runtime substrate that bundled plugins (Phase 2's
@@ -295,7 +296,7 @@ that the priority-chain floor is supposed to provide near-free; the
 config channel that future bundled plugins (and any user plugin
 needing config) will use.
 
-## Phase 4 — Animation evaluator
+## Phase 4 — Animation evaluator ✅
 
 First phase that touches GPU/compositor. Brings per-surface state
 primitives + the declarative animation engine online.
@@ -328,6 +329,96 @@ across the bundled/external boundary, spring physics correctness. New
 GPU tests in `test/animations.gpu.mjs`: animate opacity with pixel readback
 at midpoint; spring overshoot + settle; cancel-on-new-animation
 replacement semantics.
+
+## Phase 4.5 — Event interception
+
+Generalize the bus from observe-only into observe-or-modify. Lifecycle
+events become interceptable: a plugin can modify the payload core uses,
+or defer core's downstream action while it prepares state. The first
+real consumer is animated relayout (a plugin pre-snaps each window's
+transform on `window.relayout` so the entry/move animation has no
+visible jump), but the mechanism is general -- any event is
+interceptable, including plugin-emitted events.
+
+See `core-plugin-api.md` §3.1 for the full design. Summary:
+
+- `sdk.events.emit<T>(name, payload, opts?)` returns
+  `Promise<T>`; resolves to the final post-modification payload.
+- `sdk.events.intercept<T>(pattern, handler, opts?)` registers an
+  interceptor that returns `T | Promise<T> | void`. Returning a value
+  modifies the payload; returning nothing observes; returning a Promise
+  defers core's downstream action until it settles.
+- Hot path is unchanged when no interceptors are registered: observers
+  fan out synchronously, Promise resolves with the original payload.
+- Per-event timeout policy: a slow / hung interceptor is skipped after
+  the timeout; chain continues with the prior payload.
+
+### 4.5a. Bus mechanism
+
+- Extend `packages/core/src/events/dynamic-bus.ts` with `intercept`
+  registration + an `emit` variant that runs the interceptor chain in
+  priority order, awaiting each handler's result, then fans out to
+  observers with the final payload. Hot path (no interceptors) stays
+  synchronous.
+- Backward-compatible: today's `emit(name, payload): void` becomes
+  `emit(name, payload): Promise<T>` whose Promise is already-resolved
+  when no interceptors exist (an `emit` not followed by `await` is
+  fire-and-forget at the same cost as today).
+- Sync-only emit sites (frame timer, synchronous input handlers) use
+  a new `emitSync` variant that runs observers only -- interceptors
+  on those events still register but their return values are not
+  honored. The bus logs a warning at first intercept of a sync-only
+  name.
+- ~150 lines.
+
+### 4.5b. First interceptable event: `window.relayout`
+
+- Emit `window.relayout` from `applyLayout` in the WM
+  (`packages/core/src/wm/index.ts`), BEFORE pushing the new outer
+  rect to the compositor + before firing `xdg_toplevel.configure`.
+  Payload: `{ surfaceId, oldOuter, newOuter }`.
+- Use the new `emit` (awaitable). Per-event default timeout 100ms.
+- The plugin's interceptor runs while `applyLayout` is paused; the
+  interceptor can call `sdk.windows.setTransform(surfaceId,
+  oldToNewTransform)` to pre-snap the surface. After interceptors
+  resolve, `applyLayout` pushes the new rect; the next compositor
+  frame draws the surface with the pre-snap transform in effect.
+- ~40 lines for the emit-site wiring + the new event type.
+
+### 4.5c. Worker-plugin interception path
+
+- Worker plugins register interceptors the same way as in-thread
+  bundled plugins. The transport already supports request-response
+  semantics via `endpoint.handleRequests`; intercept handlers ride
+  the same machinery, just with a different request method
+  (`events.intercept-handle`).
+- Per-Worker postMessage round-trip per intercepted emit. Bounded by
+  the per-event timeout (a Worker that exceeds it is skipped).
+- ~80 lines of wiring.
+
+### 4.5d. Tests
+
+- Pure-unit: bus mechanism (intercept registration; chain runs in
+  priority order; modification chaining; observer sees post-mod
+  payload; timeout; throwing interceptor skipped; sync-only emit
+  rejects intercept).
+- Pure-unit: `window.relayout` emitted with correct payload from
+  `applyLayout`; interceptor can modify; without interceptor the
+  emit is fire-and-forget cost.
+- GPU integration: a bundled plugin intercepts `window.relayout`,
+  pre-snaps a window's transform from old rect to new rect on map;
+  pixel readback during the animation midpoint shows the window at
+  an intermediate position (not the final layout rect).
+
+**Total estimate**: ~270 lines + the animated-relayout demo plugin
+(~120 lines, lands as a bundled plugin or separate example).
+
+**What this validates**: the bus's intercept primitive end-to-end,
+the await-on-decision model for lifecycle events generalized beyond
+`window.closing` (which Phase 9 reuses), and the relayout animation
+case that's been the design driver. Subsequent phases (workspace
+transitions, hotkey-driven layout switches, window-closing animations)
+all reuse the same mechanism.
 
 ## Phase 5 — Scene compose
 
@@ -483,6 +574,7 @@ Demand-driven; ordering doesn't matter much:
 | 2. Layout extraction | 280 | minimal | namespace registry; shared types convention |
 | 3. Focus extraction + bundled-plugin substrate | 500 | no | in-thread bundled transport, config channel, fire-and-forget hot path |
 | 4. Animation evaluator | 800 | yes | per-frame eval, spec serialization, springs |
+| 4.5. Event interception | 270 | minimal | bus modify/defer; `window.relayout`; await-on-decision generalized |
 | 5. Scene compose | 550 | yes | the load-bearing pixel primitive |
 | 6. Workspaces (instant) | 500 | no | first real greenfield plugin |
 | 7. Hotkeys | 300 | no | input.bind + actions composition |
@@ -494,7 +586,10 @@ Demand-driven; ordering doesn't matter much:
 the plugin model is exercised end-to-end on existing functionality. ~1650
 lines.
 
-**Phases 4–5** (animation + compose): the GPU primitives. ~1350 lines.
+**Phases 4–4.5** (animation + interception): GPU primitives + bus
+generalization. ~1070 lines.
+
+**Phase 5** (scene compose): the load-bearing pixel primitive. ~550 lines.
 
 **Phases 6–8** (workspaces + hotkeys + transitions): first new user-
 visible feature set. ~1150 lines.
@@ -502,7 +597,7 @@ visible feature set. ~1150 lines.
 **Phases 9–10**: polish + remaining greenfield.
 
 Total to "a real compositor with workspaces and animated transitions"
-(Phases 0–8): **~4150 lines** of core + plugin code. Comparable to the
+(Phases 0–8): **~4420 lines** of core + plugin code. Comparable to the
 existing `src/` size (~6000 lines incl. tests).
 
 ## What this plan does not promise
