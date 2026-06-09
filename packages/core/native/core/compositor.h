@@ -210,6 +210,13 @@ class Compositor {
         uint64_t coreWireSerial;
     };
     CoreSurfaceReservation reserveCoreSurfaceTexture(uint32_t width, uint32_t height);
+    // Reserve a CORE-device texture for a COMPOSE buffer (phase 5b). Same as
+    // reserveCoreSurfaceTexture but with RENDER_ATTACHMENT | TEXTURE_BINDING |
+    // COPY_SRC usage -- the core is the producer (it renders into the dmabuf)
+    // and may also re-sample / read back. The plugin (consumer) reserves a
+    // TextureBinding|CopySrc texture on its own wire.
+    CoreSurfaceReservation reserveCoreComposeTexture(uint32_t width, uint32_t height);
+
     // Send AllocSurfaceBuf (one GBM dmabuf imported into plugin+core devices,
     // injected at both reserved handles). Completion async; poll
     // surfaceBufAllocated(surfaceBufId).
@@ -225,9 +232,22 @@ class Compositor {
                              ReservedHandle coreDevice, ReservedHandle coreTexture,
                              uint64_t pluginReservePointSerial,
                              uint64_t coreReservePointSerial);
+    // Send AllocComposeBuf (phase 5b): SAME machinery as AllocSurfaceBuf but
+    // the GPU process imports the dmabuf with the core device as PRODUCER and
+    // the plugin device as CONSUMER. Wire field shape is identical -- the
+    // pluginDevice/pluginTexture name the plugin-side handle (consumer) and
+    // coreDevice/coreTexture name the core-side handle (producer).
+    void sendAllocComposeBuf(uint32_t surfaceBufId, uint32_t connId,
+                             uint32_t width, uint32_t height,
+                             ReservedHandle pluginDevice, ReservedHandle pluginTexture,
+                             ReservedHandle coreDevice, ReservedHandle coreTexture,
+                             uint64_t pluginReservePointSerial,
+                             uint64_t coreReservePointSerial);
     int surfaceBufAllocated(uint32_t surfaceBufId) const;
     // The core's wrapped texture handle for a successfully-allocated surface buf
-    // (the consumer texture the JS compositor wraps + samples). 0 if unknown.
+    // (the consumer texture the JS compositor wraps + samples for the plugin-
+    // produces direction; the producer texture for compose buffers). 0 if
+    // unknown.
     WGPUTexture coreSurfaceTexture(uint32_t surfaceBufId) const;
 
     // --- In-band per-frame BeginAccess/EndAccess on cached CLIENT dmabuf textures
@@ -260,6 +280,15 @@ class Compositor {
     // write on GPU-read completion (afterCurrentFrame) for execution ordering.
     void writeConsumerBeginAccess(uint32_t surfaceBufId);
     void writeConsumerEndAccess(uint32_t surfaceBufId);
+    // In-band producer Begin/End on a compose buffer (phase 5b): write a
+    // kind=1/kind=2 Surface frame (producer=true) on the CORE wire socket.
+    // For compose buffers the core IS the producer, so producer Begin/End
+    // ride the core wire (inverted from sdk.gpu overlay buffers where the
+    // producer is the plugin and producer Begin/End ride the plugin wire).
+    // FIFO-ordered with the core's render commands the same way consumer
+    // Begin/End are with its sample commands.
+    void writeProducerBeginAccess(uint32_t surfaceBufId);
+    void writeProducerEndAccess(uint32_t surfaceBufId);
 
     // The JS compositor drives every frame: it acquires the output texture,
     // renders into it over the wire, and presents. The C++ Compositor no longer

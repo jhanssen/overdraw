@@ -647,6 +647,41 @@ napi_value PluginAllocSurfaceBufferW(napi_env env, napi_callback_info info) {
     return nullptr;
 }
 
+// coreAllocComposeBufferW(connId, w, h, conTexId, conTexGen, conDevId, conDevGen,
+// pluginSerial, cb): the reverse-direction alloc (phase 5b). The core is the
+// PRODUCER (renders into the dmabuf), the plugin is the CONSUMER (samples it).
+// The WORKER reserved its consumer-side texture on its wire client and passes
+// those handles; the core reserves its producer-side texture and sends
+// AllocComposeBuf. cb({surfaceBufId, producerTexture} | null) -- the Worker
+// already has its consumer handle. Async.
+// pluginSerial is the worker's PLUGIN-wire bytesQueued AFTER the flush that
+// committed the consumer-texture reserve (it gates the consumer-side
+// InjectTexture on the plugin wire's barrier).
+napi_value CoreAllocComposeBufferW(napi_env env, napi_callback_info info) {
+    if (!g_addon.compositor) return nullptr;
+    size_t argc = 9; napi_value argv[9];
+    napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+    if (argc < 9) return throwError(env, "coreAllocComposeBufferW(connId,w,h,ctId,ctGen,cdId,cdGen,pluginSerial,cb)");
+    uint32_t connId = u32(env, argv[0]), w = u32(env, argv[1]), h = u32(env, argv[2]);
+    uint32_t ctId = u32(env, argv[3]), ctGen = u32(env, argv[4]);
+    uint32_t cdId = u32(env, argv[5]), cdGen = u32(env, argv[6]);
+    if (w == 0 || h == 0) return throwError(env, "coreAllocComposeBufferW: bad size");
+    uint64_t pluginSerial = 0; bool lossless = false;
+    napi_get_value_bigint_uint64(env, argv[7], &pluginSerial, &lossless);
+    auto core = g_addon.compositor->reserveCoreComposeTexture(w, h);
+    if (core.surfaceBufId == 0) return throwError(env, "core compose texture reserve failed");
+    // Wire shape is identical to AllocSurfaceBuf: pluginDevice/pluginTexture
+    // name the plugin-side handles (here the CONSUMER), device/texture name
+    // the core-side handles (here the PRODUCER).
+    g_addon.compositor->sendAllocComposeBuf(
+        core.surfaceBufId, connId, w, h, {cdId, cdGen}, {ctId, ctGen},
+        {core.device.id, core.device.generation}, {core.texture.id, core.texture.generation},
+        pluginSerial, core.coreWireSerial);
+    napi_ref cbRef; napi_create_reference(env, argv[8], 1, &cbRef);
+    g_pendingAllocs.push_back({core.surfaceBufId, connId, cbRef});
+    return nullptr;
+}
+
 // Extract argv[0] as a uint32 (used by the surface-buffer entry points below).
 static uint32_t arg0u32(napi_env env, napi_callback_info info, napi_value* argv, size_t n) {
     size_t argc = n; napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
@@ -668,6 +703,23 @@ napi_value WriteConsumerEnd(napi_env env, napi_callback_info info) {
     if (!g_addon.compositor) return nullptr;
     napi_value argv[1]; uint32_t id = arg0u32(env, info, argv, 1);
     g_addon.compositor->writeConsumerEndAccess(id);
+    return nullptr;
+}
+
+// writeProducerBegin / writeProducerEnd: in-band producer Begin/End on the
+// core wire (phase 5b). The core IS the producer for compose buffers, so
+// producer Begin/End ride the core wire (inverted from plugin-overlay
+// surfaces where producer Begin/End ride the plugin wire).
+napi_value WriteProducerBegin(napi_env env, napi_callback_info info) {
+    if (!g_addon.compositor) return nullptr;
+    napi_value argv[1]; uint32_t id = arg0u32(env, info, argv, 1);
+    g_addon.compositor->writeProducerBeginAccess(id);
+    return nullptr;
+}
+napi_value WriteProducerEnd(napi_env env, napi_callback_info info) {
+    if (!g_addon.compositor) return nullptr;
+    napi_value argv[1]; uint32_t id = arg0u32(env, info, argv, 1);
+    g_addon.compositor->writeProducerEndAccess(id);
     return nullptr;
 }
 
@@ -1424,9 +1476,12 @@ napi_value Init(napi_env env, napi_value exports) {
     reg("pluginInjectInstance", PluginInjectInstance);
     reg("pluginSetTickDevice", PluginSetTickDevice);
     reg("pluginAllocSurfaceBufferW", PluginAllocSurfaceBufferW);
+    reg("coreAllocComposeBufferW", CoreAllocComposeBufferW);
     reg("pluginConsumerTexture", PluginConsumerTexture);
     reg("writeConsumerBegin", WriteConsumerBegin);
     reg("writeConsumerEnd", WriteConsumerEnd);
+    reg("writeProducerBegin", WriteProducerBegin);
+    reg("writeProducerEnd", WriteProducerEnd);
     reg("pluginReleaseSurfaceBuffer", PluginReleaseSurfaceBuffer);
 
     napi_set_named_property(env, exports, "start", fnStart);

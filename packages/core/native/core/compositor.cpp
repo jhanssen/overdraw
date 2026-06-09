@@ -406,14 +406,36 @@ Compositor::CoreSurfaceReservation Compositor::reserveCoreSurfaceTexture(
     return out;
 }
 
-void Compositor::sendAllocSurfaceBuf(uint32_t surfaceBufId, uint32_t connId,
-                                     uint32_t width, uint32_t height,
-                                     ReservedHandle pluginDevice, ReservedHandle pluginTexture,
-                                     ReservedHandle coreDevice, ReservedHandle coreTexture,
-                                     uint64_t pluginReservePointSerial,
-                                     uint64_t coreReservePointSerial) {
-    ipc::Message m{};
-    m.tag = ipc::Tag::AllocSurfaceBuf;
+Compositor::CoreSurfaceReservation Compositor::reserveCoreComposeTexture(
+        uint32_t width, uint32_t height) {
+    CoreSurfaceReservation out{0, {0, 0}, {0, 0}, 0};
+    if (!device_) return out;
+    const uint32_t surfaceBufId = nextSurfaceBufId_++;
+    // Producer texture for a compose buffer: RENDER_ATTACHMENT (core writes
+    // into it), TEXTURE_BINDING (re-sampleable), COPY_SRC (readback for tests).
+    TaggedReservation tr = reserveTextureTagged(width, height,
+        wgpu::TextureUsage::RenderAttachment | wgpu::TextureUsage::TextureBinding
+        | wgpu::TextureUsage::CopySrc);
+    out.surfaceBufId = surfaceBufId;
+    out.texture = {tr.reservation().handle.id, tr.reservation().handle.generation};
+    out.device = {tr.reservation().deviceHandle.id, tr.reservation().deviceHandle.generation};
+    out.coreWireSerial = tr.wireSerial();
+    surfaceBufAllocated_[surfaceBufId] = 0;
+    coreSurfaceReservations_.emplace(surfaceBufId, std::move(tr));
+    return out;
+}
+
+// Shared message builder for AllocSurfaceBuf / AllocComposeBuf.
+static void buildAllocMessage(ipc::Message& m, ipc::Tag tag,
+                              uint32_t surfaceBufId, uint32_t connId,
+                              uint32_t width, uint32_t height,
+                              Compositor::ReservedHandle pluginDevice,
+                              Compositor::ReservedHandle pluginTexture,
+                              Compositor::ReservedHandle coreDevice,
+                              Compositor::ReservedHandle coreTexture,
+                              uint64_t pluginReservePointSerial,
+                              uint64_t coreReservePointSerial) {
+    m.tag = tag;
     m.surfaceBufId = surfaceBufId;
     m.connId = connId;
     m.width = width;
@@ -422,12 +444,33 @@ void Compositor::sendAllocSurfaceBuf(uint32_t surfaceBufId, uint32_t connId,
     m.pluginTexture = {pluginTexture.id, pluginTexture.generation};
     m.device = {coreDevice.id, coreDevice.generation};
     m.texture = {coreTexture.id, coreTexture.generation};
-    // Cross-channel ordering serials. The GPU process must defer InjectTexture
-    // on both sides until each wire reader has caught up past its serial (the
-    // recycled-handle hazard: see ipc::WireBarrier). Plugin serial gates the
-    // plugin-conn InjectTexture; core serial gates the core-wire InjectTexture.
     m.reservePointSerial = pluginReservePointSerial;
     m.wireSerial = coreReservePointSerial;
+}
+
+void Compositor::sendAllocSurfaceBuf(uint32_t surfaceBufId, uint32_t connId,
+                                     uint32_t width, uint32_t height,
+                                     ReservedHandle pluginDevice, ReservedHandle pluginTexture,
+                                     ReservedHandle coreDevice, ReservedHandle coreTexture,
+                                     uint64_t pluginReservePointSerial,
+                                     uint64_t coreReservePointSerial) {
+    ipc::Message m{};
+    buildAllocMessage(m, ipc::Tag::AllocSurfaceBuf, surfaceBufId, connId,
+        width, height, pluginDevice, pluginTexture, coreDevice, coreTexture,
+        pluginReservePointSerial, coreReservePointSerial);
+    ipc::sendMessage(ctrlFd_, m);
+}
+
+void Compositor::sendAllocComposeBuf(uint32_t surfaceBufId, uint32_t connId,
+                                     uint32_t width, uint32_t height,
+                                     ReservedHandle pluginDevice, ReservedHandle pluginTexture,
+                                     ReservedHandle coreDevice, ReservedHandle coreTexture,
+                                     uint64_t pluginReservePointSerial,
+                                     uint64_t coreReservePointSerial) {
+    ipc::Message m{};
+    buildAllocMessage(m, ipc::Tag::AllocComposeBuf, surfaceBufId, connId,
+        width, height, pluginDevice, pluginTexture, coreDevice, coreTexture,
+        pluginReservePointSerial, coreReservePointSerial);
     ipc::sendMessage(ctrlFd_, m);
 }
 
@@ -478,6 +521,20 @@ void Compositor::writeConsumerBeginAccess(uint32_t surfaceBufId) {
 
 void Compositor::writeConsumerEndAccess(uint32_t surfaceBufId) {
     ipc::SurfaceAccessPayload p{surfaceBufId, /*producer=*/false};
+    uint8_t buf[ipc::SurfaceAccessPayload::kSize];
+    p.encode(buf);
+    link_->appendFrame(ipc::FrameKind::EndAccess, buf, sizeof(buf));
+}
+
+void Compositor::writeProducerBeginAccess(uint32_t surfaceBufId) {
+    ipc::SurfaceAccessPayload p{surfaceBufId, /*producer=*/true};
+    uint8_t buf[ipc::SurfaceAccessPayload::kSize];
+    p.encode(buf);
+    link_->appendFrame(ipc::FrameKind::BeginAccess, buf, sizeof(buf));
+}
+
+void Compositor::writeProducerEndAccess(uint32_t surfaceBufId) {
+    ipc::SurfaceAccessPayload p{surfaceBufId, /*producer=*/true};
     uint8_t buf[ipc::SurfaceAccessPayload::kSize];
     p.encode(buf);
     link_->appendFrame(ipc::FrameKind::EndAccess, buf, sizeof(buf));

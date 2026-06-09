@@ -89,6 +89,17 @@ export interface Addon {
                             pdId: number, pdGen: number,
                             pluginReservePointSerial: bigint,
                             cb: (r: { surfaceBufId: number } | null) => void): void;
+  // Reverse-direction alloc (phase 5b): the core is the PRODUCER for a compose
+  // buffer, the plugin is the CONSUMER. The worker reserves its consumer-side
+  // texture on the plugin wire and passes the handles; the core reserves its
+  // producer-side texture (RENDER_ATTACHMENT|TEXTURE_BINDING|COPY_SRC) and
+  // sends AllocComposeBuf. cb({surfaceBufId} | null) -- the worker already has
+  // its consumer handle. The pluginReservePointSerial gates the consumer-side
+  // InjectTexture on the PLUGIN wire's barrier.
+  coreAllocComposeBufferW(connId: number, w: number, h: number, ctId: number, ctGen: number,
+                          cdId: number, cdGen: number,
+                          pluginReservePointSerial: bigint,
+                          cb: (r: { surfaceBufId: number } | null) => void): void;
   // In-band consumer Begin/End on the core wire. Synchronous frame writes:
   // Begin's FIFO position before the next compositor sample opens the bracket
   // in time; End is gated by the caller on afterCurrentFrame. No begin-done cb.
@@ -96,6 +107,11 @@ export interface Addon {
   // core does not mediate them -- see src/plugins/gpu.ts.)
   writeConsumerBegin(surfaceBufId: number): void;
   writeConsumerEnd(surfaceBufId: number): void;
+  // In-band producer Begin/End on the core wire (phase 5b, for compose
+  // buffers where the core is the producer). Inverted from plugin-overlay
+  // surfaces where producer Begin/End ride the plugin wire.
+  writeProducerBegin(surfaceBufId: number): void;
+  writeProducerEnd(surfaceBufId: number): void;
   pluginConsumerTexture(surfaceBufId: number): bigint;
   // Destroy a plugin ring slot's surfaceBuf (GPU process frees dmabuf/STM/textures;
   // core reclaims its reservation). Caller gates on the consumer GPU read completing.
