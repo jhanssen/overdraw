@@ -5,9 +5,7 @@
 // setters' shapes.
 
 import type { CompositorSink } from "../protocols/ctx.js";
-import type {
-  TargetRef, TransformValue, MarginValue,
-} from "@overdraw/animation-types";
+import type { TargetRef } from "@overdraw/animation-types";
 
 // Field names per target kind (in canonical order). The evaluator
 // stores per-animation arrays of field values aligned with this order.
@@ -89,27 +87,4 @@ export function applyValue(
   }
 }
 
-// Map an arbitrary user-supplied object onto canonical components for
-// the target kind. Re-exported for tests; for runtime use, coerceValue
-// is the entry point (it also validates).
-export { TRANSFORM_FIELDS, MARGIN_FIELDS };
 
-// Build the SurfaceTransform / SurfaceMargin shape the SDK expects from
-// canonical component arrays. Used by the cancel-on-replacement path to
-// emit a final-snapshot apply.
-export function packTransform(components: readonly number[]): TransformValue {
-  return {
-    translateX: components[0],
-    translateY: components[1],
-    scaleX: components[2],
-    scaleY: components[3],
-  };
-}
-export function packMargin(components: readonly number[]): MarginValue {
-  return {
-    top: components[0],
-    right: components[1],
-    bottom: components[2],
-    left: components[3],
-  };
-}

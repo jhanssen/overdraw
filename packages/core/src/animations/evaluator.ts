@@ -13,7 +13,7 @@
 
 import type { CompositorSink } from "../protocols/ctx.js";
 import type {
-  AnimationHandle, AnimationSpec, ParallelSpec, SequenceSpec,
+  AnimationSpec, ParallelSpec, SequenceSpec,
   SpringSpec, TargetRef, TweenSpec,
 } from "@overdraw/animation-types";
 import { resolveEasing, type EasingFn } from "./easing.js";
@@ -24,7 +24,6 @@ import { applyValue, coerceValue } from "./value.js";
 // Promise; composite specs (sequence / parallel) await leaf Promises
 // directly. Only leaves drive the per-frame tick.
 interface ActiveLeaf {
-  handle: AnimationHandle;
   target: TargetRef;
   // Resolves cleanly on natural completion OR cancellation.
   settle: () => void;
@@ -76,7 +75,6 @@ export function createEvaluator(
 ): AnimationEvaluator {
   const leaves = new Map<string, Leaf>();
   let lastTickMs: number | null = null;
-  let nextHandle: AnimationHandle = 1;
   const maxDtSec = opts.maxDtSec ?? 0.1;
 
   function targetKey(t: TargetRef): string {
@@ -109,7 +107,6 @@ export function createEvaluator(
     return new Promise<void>((resolve) => {
       const leaf: TweenLeaf = {
         kind: "tween",
-        handle: nextHandle++,
         target: spec.target,
         from, to,
         durationSec: spec.duration / 1000,
@@ -149,7 +146,6 @@ export function createEvaluator(
       const springs = from.map((f, i) => new SpringState(f, to[i], params));
       const leaf: SpringLeaf = {
         kind: "spring",
-        handle: nextHandle++,
         target: spec.target,
         springs,
         settle: resolve,
