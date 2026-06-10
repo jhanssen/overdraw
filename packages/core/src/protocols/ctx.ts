@@ -143,6 +143,12 @@ export interface CompositorSink {
     outH: number;
     producerSurfaceBufId?: number;
   }): void;
+  // Phase 5b-live: register a per-frame produce callback. Each renderFrame
+  // invokes onFrame after the on-screen composite; the callback owns its
+  // own SurfaceProducer + composes a fresh frame into the next FREE ring
+  // slot (skipping if all slots are busy). Returns a token used to
+  // unregister.
+  registerLiveProducer?(onFrame: () => void): { unregister: () => void };
 }
 
 export interface CompositorState {

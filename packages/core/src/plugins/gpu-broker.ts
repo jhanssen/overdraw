@@ -12,7 +12,7 @@ import type { OverlayBroker, OverlayLayer } from "../overlay.js";
 import type { OverlayAnchor } from "../overlay-position.js";
 import type { DawnWire } from "../gpu/compositor.js";
 import { SlotStates, createSlotStates } from "./surface-slots.js";
-import { SurfaceConsumer } from "./surface-ring.js";
+import { SurfaceConsumer, SurfaceProducer } from "./surface-ring.js";
 
 const pCreateConn = (a: Addon) => new Promise<{ connId: number; fd: number }>((res, rej) =>
   a.pluginCreateConnection((r: { connId: number; fd: number } | null) => r ? res(r) : rej(new Error("createConnection"))));
@@ -91,6 +91,13 @@ export function createGpuBroker(deps: GpuBrokerDeps) {
   // (Could later track per-plugin so destroy-on-plugin-stop teardowns
   // these along with overlays.)
   const composeBufs = new Map<number, { texture: GPUTexture; width: number; height: number }>();
+  // Phase 5b-live compose rings: any slot's surfaceBufId -> the live ring it
+  // belongs to. compose.release deregisters the whole ring on any slot id.
+  interface LiveComposeRing {
+    surfaceBufIds: number[];
+    teardown: () => void;
+  }
+  const liveComposeRings = new Map<number, LiveComposeRing>();
 
   return async function onRequest(pluginName: string, method: string, params: unknown): Promise<unknown> {
     const p = (params ?? {}) as Record<string, number | string | bigint | { x: number; y: number; width: number; height: number } | undefined>;
@@ -265,12 +272,147 @@ export function createGpuBroker(deps: GpuBrokerDeps) {
         }
         return { surfaceBufId: alloc.surfaceBufId, width: w, height: h };
       }
+      case "compose.live": {
+        // Phase 5b-live: Worker plugin asked for a live compose. The plugin
+        // has reserved SLOTS consumer textures on its own wire (one per ring
+        // slot) and sent their handles. We:
+        //   1. Allocate SLOTS dmabufs (one per slot via coreAllocComposeBufferW).
+        //   2. Build a core-side SurfaceProducer over the ring; the per-slot
+        //      wgpu::Texture comes from addon.pluginConsumerTexture (which
+        //      for AllocComposeBuf returns the core-side / producer-side
+        //      texture).
+        //   3. Build a SAB-backed SlotStates and return it in the reply.
+        //   4. Register a per-frame callback: tryAcquire a FREE slot,
+        //      composeIntoView, presentSync. If no FREE slot is available
+        //      (consumer hogging all of them), skip the frame -- the next
+        //      consumer release will wake the next produce attempt.
+        const connId = connByPlugin.get(pluginName);
+        if (connId === undefined) throw new Error("compose.live: no plugin conn");
+        const w = p.width as number, h = p.height as number;
+        if (!w || !h) throw new Error("compose.live: bad dims");
+        const slotsN = (p.slots as number) ?? 3;
+        const consumers = p.consumers as unknown as Array<{
+          texId: number; texGen: number; devId: number; devGen: number;
+          wireSerial: bigint;
+        }>;
+        if (!consumers || consumers.length !== slotsN) {
+          throw new Error(`compose.live: expected ${slotsN} consumer handles, got ${consumers?.length}`);
+        }
+        const windows = (p.windows as unknown as number[]) ?? [];
+
+        if (!compositor.composeIntoView || !compositor.registerLiveProducer) {
+          throw new Error("compose.live: compositor lacks live-producer machinery");
+        }
+
+        // Allocate one dmabuf per slot. Each AllocComposeBuf call reserves
+        // a core producer texture, sends the wire op, awaits inject.
+        const slotBufIds: number[] = [];
+        for (let i = 0; i < slotsN; i++) {
+          const con = consumers[i];
+          const a = await pAllocCompose(addon, connId, w, h,
+            con.texId, con.texGen, con.devId, con.devGen, con.wireSerial);
+          slotBufIds.push(a.surfaceBufId);
+        }
+
+        // Wrap each slot's CORE-side texture lazily as a GPUTexture on the
+        // core device. The core's wgpu::Texture for AllocComposeBuf is
+        // returned by addon.pluginConsumerTexture(surfaceBufId).
+        const slotTextures: (GPUTexture | null)[] = new Array(slotsN).fill(null);
+        const slotViews: (GPUTextureView | null)[] = new Array(slotsN).fill(null);
+        const textureFor = (slot: number): GPUTexture | null => {
+          if (slotTextures[slot]) return slotTextures[slot];
+          const t = dawn.wrapTexture(coreDeviceHandle,
+            addon.pluginConsumerTexture(slotBufIds[slot]));
+          slotTextures[slot] = t;
+          return t;
+        };
+        const viewFor = (slot: number): GPUTextureView => {
+          if (slotViews[slot]) return slotViews[slot] as GPUTextureView;
+          const t = textureFor(slot);
+          if (!t) throw new Error(`compose.live: no texture for slot ${slot}`);
+          const v = t.createView();
+          slotViews[slot] = v;
+          return v;
+        };
+
+        // Build the SAB + slot states. The SAB is sent to the plugin in
+        // the reply so both sides share the same atomic slot states.
+        const { sab } = createSlotStates(slotsN);
+        const slotStates = new SlotStates(sab);
+
+        // Build the core-side producer. writeBegin/writeEnd ride the core
+        // wire (the core IS the producer for compose-live). onPresented
+        // is a no-op -- the SAB notify in slotStates.present() is what
+        // signals the consumer; no round-trip needed.
+        const producer = new SurfaceProducer({
+          slots: {
+            surfaceBufId: (slot) => slotBufIds[slot],
+            textureFor,
+          },
+          slotStates,
+          writeBegin: (id) => addon.writeProducerBegin(id),
+          writeEnd: (id) => addon.writeProducerEnd(id),
+          onPresented: () => {},
+          // Compose-live: pull-based consumer (plugin samples on its own
+          // clock). Enforce single-PRESENTED invariant so the plugin's
+          // awaitPresentedSlot returns the LATEST, not whichever slot got
+          // PRESENTED first in a backlog of producer cycles.
+          demoteStaleOnPresent: true,
+        });
+
+        // Per-frame callback: tryAcquire FREE slot, composeIntoView (without
+        // producerSurfaceBufId; the SurfaceProducer's tryAcquire / presentSync
+        // already write the producer Begin/End brackets on the core wire),
+        // presentSync.
+        const onFrame = (): void => {
+          const got = producer.tryAcquire();
+          if (!got) return;  // no FREE slot; skip this frame
+          compositor.composeIntoView?.({
+            outputId: 0,
+            targetView: viewFor(got.slot),
+            windows,
+            outW: w, outH: h,
+            // Intentionally no producerSurfaceBufId -- the SurfaceProducer
+            // already wraps the pass in writeProducerBegin/End.
+          });
+          producer.presentSync();
+        };
+        const live = compositor.registerLiveProducer(onFrame);
+
+        // Bookkeeping for compose.release: any slot id maps to this ring.
+        const ring: LiveComposeRing = {
+          surfaceBufIds: slotBufIds.slice(),
+          teardown: () => {
+            live.unregister();
+            for (const id of slotBufIds) {
+              const reap = () => addon.pluginReleaseSurfaceBuffer(id);
+              if (compositor.afterCurrentFrame) compositor.afterCurrentFrame(reap);
+              else reap();
+            }
+          },
+        };
+        for (const id of slotBufIds) liveComposeRings.set(id, ring);
+
+        return {
+          slotsSab: sab,
+          slots: slotBufIds.map((id) => ({ surfaceBufId: id })),
+        };
+      }
       case "compose.release": {
-        // Plugin is done with a compose snapshot. Drop our reference to the
-        // wrapped core-device texture and ask the GPU process to free the
-        // dmabuf + STMs + textures via ReleaseSurfaceBuf.
+        // Plugin is done with a compose snapshot or live ring. Snapshot:
+        // single surfaceBufId; live: array of slot surfaceBufIds.
+        const arr = p.surfaceBufIds as unknown as number[] | undefined;
+        if (arr && Array.isArray(arr)) {
+          // Live ring release.
+          const ring = liveComposeRings.get(arr[0]);
+          if (ring) {
+            for (const id of ring.surfaceBufIds) liveComposeRings.delete(id);
+            ring.teardown();
+          }
+          return null;
+        }
         const bufId = p.surfaceBufId as number;
-        if (bufId === undefined) throw new Error("compose.release: bad surfaceBufId");
+        if (bufId === undefined) throw new Error("compose.release: bad surfaceBufId(s)");
         composeBufs.delete(bufId);
         // Gate release on afterCurrentFrame: a previous compose pass's GPU
         // work may still be in flight on the core's queue (the producer

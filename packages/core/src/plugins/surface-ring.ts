@@ -67,6 +67,15 @@ export interface SurfaceProducerDeps {
   // Quiesce: if set, acquire() returns a never-resolving Promise (parks the
   // caller's render loop while the host is tearing down).
   isStopped?: () => boolean;
+  // When true, present()/presentSync() demotes any OTHER currently-PRESENTED
+  // slot (immediately freeing it) before publishing the new one. Enforces a
+  // single-PRESENTED invariant for consumers that pull on their own clock
+  // (compose-live: the plugin's sample() calls presentedSlot() to find the
+  // LATEST; stale-PRESENTED slots would be returned instead). Leave false
+  // for push-based flows (overlay: the broker's surface.present roundtrip
+  // demotes the prior on the consumer side as it swaps; producer-side
+  // demote would race the broker's still-open consumer bracket).
+  demoteStaleOnPresent?: boolean;
 }
 
 // Producer-half of the ring. The owner calls acquire() -> renders into the
@@ -78,6 +87,36 @@ export class SurfaceProducer {
   private acquired = -1;  // the slot tryAcquire most recently handed out
 
   constructor(deps: SurfaceProducerDeps) { this.deps = deps; }
+
+  // Try to claim a FREE slot without awaiting. Returns null if no FREE slot
+  // is currently available (the producer can skip this cycle: the consumer
+  // is using everything). Used by sync produce paths (e.g. renderFrame).
+  // Idempotent within an open acquire (re-call returns the same slot).
+  tryAcquire(): { slot: number; texture: GPUTexture } | null {
+    if (this.deps.isStopped?.()) return null;
+    if (this.acquired >= 0) {
+      const tex = this.deps.slots.textureFor(this.acquired);
+      if (!tex) return null;
+      return { slot: this.acquired, texture: tex };
+    }
+    const slot = this.deps.slotStates.tryAcquire();
+    if (slot < 0) return null;
+    const tex = this.deps.slots.textureFor(slot);
+    if (!tex) {
+      // No texture wrapped yet; release the slot back to FREE so the next
+      // try can re-attempt once the caller has populated textureFor.
+      // (Don't transition through ACQUIRED's normal flow because there's
+      // no producer Begin to roll back; just CAS back.)
+      // SlotStates doesn't have a "give back FREE" -- the slot is now
+      // ACQUIRED. Best we can do: write a no-op Begin/End pair? Cleaner:
+      // textureFor must always return a texture by the time tryAcquire is
+      // called. Throw to surface the misuse.
+      throw new Error(`SurfaceProducer.tryAcquire: slot ${slot} acquired but no texture`);
+    }
+    this.acquired = slot;
+    this.deps.writeBegin(this.deps.slots.surfaceBufId(slot));
+    return { slot, texture: tex };
+  }
 
   // Claim the next FREE slot. Awaits if all slots are non-FREE (a healthy
   // backpressure -- the producer is faster than the consumer's drain).
@@ -113,6 +152,24 @@ export class SurfaceProducer {
     }
   }
 
+  // Demote any OTHER currently-PRESENTED slot (PRESENTED -> DRAINING -> FREE)
+  // when demoteStaleOnPresent is enabled. Used for pull-based consumers
+  // where presentedSlot() must return the LATEST. The free here is NOT
+  // afterReadDone-gated because the consumer never opened a bracket on
+  // the slot we're demoting (we superseded it before the consumer could
+  // find it); the cross-device fence's "producer's next Begin waits on
+  // consumer's last End" semantics still serialize correctly.
+  private demoteStalePresented(except: number): void {
+    if (!this.deps.demoteStaleOnPresent) return;
+    const states = this.deps.slotStates;
+    for (let i = 0; i < states.slots; i++) {
+      if (i === except) continue;
+      if (states.demote(i)) {
+        try { states.free(i); } catch { /* race; already moved */ }
+      }
+    }
+  }
+
   // Close the producer bracket, CAS ACQUIRED -> PRESENTED, invoke the
   // onPresented hook (overlay path: sends surface.present to the broker;
   // compose-live: updates "latest presented" for sample()). Throws if no
@@ -129,7 +186,36 @@ export class SurfaceProducer {
     // wire frame, FIFO after the submit's wire batch).
     this.deps.writeEnd(surfaceBufId);
     this.deps.slotStates.present(slot);
+    this.demoteStalePresented(slot);
     await this.deps.onPresented(slot, surfaceBufId);
+  }
+
+  // Sync variant of present(): close bracket + CAS without awaiting the
+  // onPresented hook. The hook still fires; if it returns a Promise,
+  // it's fire-and-forgotten (any reject is unhandled -- onPresented impls
+  // that need to fail explicitly should use the async present() variant
+  // instead). Used in sync contexts like renderFrame's compose-live
+  // produce loop where there's no place to await.
+  presentSync(): void {
+    if (this.deps.isStopped?.()) return;
+    if (this.acquired < 0) {
+      throw new Error("SurfaceProducer.presentSync(): no acquired slot");
+    }
+    const slot = this.acquired;
+    this.acquired = -1;
+    const surfaceBufId = this.deps.slots.surfaceBufId(slot);
+    this.deps.writeEnd(surfaceBufId);
+    this.deps.slotStates.present(slot);
+    this.demoteStalePresented(slot);
+    const r = this.deps.onPresented(slot, surfaceBufId);
+    // Swallow any returned promise to keep presentSync non-async. Callers
+    // that need to observe failures should use present().
+    if (r && typeof (r as Promise<void>).then === "function") {
+      (r as Promise<void>).catch((e) => {
+        // eslint-disable-next-line no-console
+        console.error("[SurfaceProducer.presentSync] onPresented rejected:", e);
+      });
+    }
   }
 }
 

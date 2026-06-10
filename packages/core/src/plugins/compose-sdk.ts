@@ -18,6 +18,8 @@ import type {
 import type { CompositorSink } from "../protocols/ctx.js";
 import { OUTPUT_DEFAULT } from "../protocols/ctx.js";
 import type { Endpoint } from "./protocol.js";
+import { SlotStates } from "./surface-slots.js";
+import { SurfaceConsumer, awaitPresentedSlot } from "./surface-ring.js";
 
 export type ComposeMode = "snapshot" | "live";
 
@@ -31,9 +33,19 @@ export interface Rect {
 export interface SceneHandle {
   // The composed texture. Owned by core; the caller must NOT .destroy() it.
   // Validity ends at release().
+  //
+  // For snapshot (in-thread or Worker) and live-in-thread, `texture` can
+  // be sampled at any time between scene() and release(). For live-Worker,
+  // each frame lives in a different ring slot's dmabuf; sample(cb) is the
+  // ONLY valid way to read it (the cb runs with whichever slot the latest
+  // present landed in, under an open consumer Begin/End bracket on the
+  // plugin wire). For all other variants, sample(cb) just runs cb with
+  // `texture` immediately -- plugins use sample() unconditionally so the
+  // same code works in either mode.
   texture: GPUTexture;
   outW: number;
   outH: number;
+  sample<T>(cb: (texture: GPUTexture) => T | Promise<T>): Promise<T>;
   release(): Promise<void>;
 }
 
@@ -100,12 +112,16 @@ export function createInThreadCompose(compositor: CompositorSink): PluginCompose
           outW: args.outW, outH: args.outH,
         });
         let released = false;
+        const tex = r.texture;
         return {
-          texture: r.texture, outW: r.outW, outH: r.outH,
+          texture: tex, outW: r.outW, outH: r.outH,
+          async sample<T>(cb: (t: GPUTexture) => T | Promise<T>): Promise<T> {
+            return await cb(tex);
+          },
           async release(): Promise<void> {
             if (released) return;
             released = true;
-            r.texture.destroy();
+            tex.destroy();
           },
         };
       }
@@ -115,11 +131,13 @@ export function createInThreadCompose(compositor: CompositorSink): PluginCompose
         windows: args.windows,
         outW: args.outW, outH: args.outH,
       });
+      const tex = h.texture;
       return {
-        texture: h.texture, outW: h.outW, outH: h.outH,
-        async release(): Promise<void> {
-          h.release();
+        texture: tex, outW: h.outW, outH: h.outH,
+        async sample<T>(cb: (t: GPUTexture) => T | Promise<T>): Promise<T> {
+          return await cb(tex);
         },
+        async release(): Promise<void> { h.release(); },
       };
     },
 
@@ -208,70 +226,202 @@ export function createWorkerCompose(deps: WorkerComposeDeps): PluginCompose {
   return {
     async scene(args): Promise<SceneHandle> {
       checkOutput(args.outputId);
-      if (args.mode !== "snapshot") {
-        throw new Error(
-          "sdk.compose: live mode is not yet supported for Worker plugins (phase 5b-live)",
-        );
-      }
-      // For Worker plugins, the host output dims aren't directly accessible
-      // here; default to whatever the caller provides (no implicit
-      // this.width/this.height). The compose-sdk in-thread variant defaults
-      // to the compositor's dims; for Worker we require explicit dims.
       const outW = args.outW;
       const outH = args.outH;
       if (!outW || !outH) {
         throw new Error("sdk.compose.scene: outW/outH required for Worker plugins");
       }
-      // 1. Reserve consumer texture on our plugin wire. flush is internal;
-      //    wireSerial is captured AFTER the flush.
-      const surfaceBufId = allocSurfaceBufId();
-      const con = plugin.reserveConsumerTexture(clientId, surfaceBufId, outW, outH);
-      // 2. Round-trip to the core broker. It allocates the producer side,
-      //    sends AllocComposeBuf, awaits both injects, then renders the
-      //    requested windows into the producer texture (writeProducerBegin/
-      //    composeIntoView/writeProducerEnd on the core wire). The reply
-      //    confirms the surfaceBufId is in surfaceBufs[].
-      const r = (await endpoint.request("compose.snapshot", {
-        width: outW, height: outH,
-        consumerTexId: con.texture.id, consumerTexGen: con.texture.generation,
-        consumerDevId: con.device.id, consumerDevGen: con.device.generation,
-        pluginReservePointSerial: con.wireSerial,
-        windows: [...args.windows],
-      })) as { surfaceBufId: number; width: number; height: number };
-      // The core's reply uses ITS own surfaceBufId allocator, not ours, so
-      // overwrite. (This is a minor wart -- the allocations are parallel and
-      // both maps key off this id. Could be unified, but they're per-side
-      // pools today.)
-      const actualBufId = r.surfaceBufId;
-      // 3. Wrap the consumer texture handle on our device.
-      const texHandle = plugin.consumerTexture(clientId, surfaceBufId);
-      if (texHandle === 0n) {
-        throw new Error("compose.snapshot: consumer texture not yet injected on plugin wire");
+      if (args.mode === "snapshot") {
+        return makeWorkerSnapshot(deps, [...args.windows], outW, outH);
       }
-      const texture = dawn.wrapTexture(pluginDeviceHandle, texHandle);
-      // 4. Open the consumer read bracket on the plugin wire. The kind=1
-      //    frame is FIFO-ordered before any subsequent sample commands we
-      //    encode on this wire, so the GPU process opens the bracket (which
-      //    waits on the producer's EndAccess fence) before our reads decode.
-      plugin.writeConsumerBegin(clientId, surfaceBufId);
-      let released = false;
-      return {
-        texture, outW, outH,
-        async release(): Promise<void> {
-          if (released) return;
-          released = true;
-          // Close the consumer bracket on our wire.
-          plugin.writeConsumerEnd(clientId, surfaceBufId);
-          // Ask the core to release the surfaceBuf (GPU process frees the
-          // dmabuf + STMs + textures; core's afterCurrentFrame gates this
-          // on the producer submit completing).
-          await endpoint.request("compose.release", { surfaceBufId: actualBufId });
-        },
-      };
+      return makeWorkerLive(deps, [...args.windows], outW, outH);
     },
 
     async windows(_args): Promise<WindowComposition> {
       throw new Error("sdk.compose.windows: not yet implemented for Worker plugins (phase 5b)");
+    },
+  };
+}
+
+// Snapshot: one-shot compose. Plugin reserves ONE consumer texture, broker
+// runs ONE produce pass into it, plugin opens a single consumer Begin that
+// covers reads until release(). No ring needed (the texture's contents are
+// frozen after the one produce).
+async function makeWorkerSnapshot(
+  deps: WorkerComposeDeps,
+  windows: ReadonlyArray<number>, outW: number, outH: number,
+): Promise<SceneHandle> {
+  const { clientId, plugin, dawn, pluginDeviceHandle, endpoint, allocSurfaceBufId } = deps;
+  // Reserve one consumer texture on our plugin wire under a WORKER-local key
+  // (resKey). The reservation's wireSerial is captured AFTER the flush; the
+  // GPU process defers its plugin-side InjectTexture on that.
+  const resKey = allocSurfaceBufId();
+  const con = plugin.reserveConsumerTexture(clientId, resKey, outW, outH);
+  // Round-trip to the broker -> AllocComposeBuf -> one composeIntoView pass.
+  // The broker's reply gives the GPU-process surfaceBufId (a different
+  // namespace from the worker's resKey).
+  const r = (await endpoint.request("compose.snapshot", {
+    width: outW, height: outH,
+    consumerTexId: con.texture.id, consumerTexGen: con.texture.generation,
+    consumerDevId: con.device.id, consumerDevGen: con.device.generation,
+    pluginReservePointSerial: con.wireSerial,
+    windows: [...windows],
+  })) as { surfaceBufId: number; width: number; height: number };
+  const surfaceBufId = r.surfaceBufId;
+  const texHandle = plugin.consumerTexture(clientId, resKey);
+  if (texHandle === 0n) {
+    throw new Error("compose.snapshot: consumer texture not yet injected on plugin wire");
+  }
+  const texture = dawn.wrapTexture(pluginDeviceHandle, texHandle);
+  // Open the consumer bracket once; close it at release(). Snapshot's
+  // contents don't change after the broker's one produce, so a single
+  // Begin/End pair covers all reads.
+  plugin.writeConsumerBegin(clientId, surfaceBufId);
+  let released = false;
+  return {
+    texture, outW, outH,
+    async sample<T>(cb: (t: GPUTexture) => T | Promise<T>): Promise<T> {
+      return await cb(texture);
+    },
+    async release(): Promise<void> {
+      if (released) return;
+      released = true;
+      plugin.writeConsumerEnd(clientId, surfaceBufId);
+      await endpoint.request("compose.release", { surfaceBufId });
+    },
+  };
+}
+
+// Live: per-frame compose into a 3-slot ring. The core (producer) writes to
+// FREE slots; the plugin (consumer) reads PRESENTED slots via sample(cb).
+// The SAB-CAS slot-state machine + per-slot SharedFence brackets keep them
+// non-racing. The plugin sees ONE GPUTexture handle from sample(cb) that
+// happens to be whichever ring slot was most recently presented.
+async function makeWorkerLive(
+  deps: WorkerComposeDeps,
+  windows: ReadonlyArray<number>, outW: number, outH: number,
+): Promise<SceneHandle> {
+  const { clientId, plugin, dawn, pluginDeviceHandle, endpoint, allocSurfaceBufId } = deps;
+  const SLOTS = 3;  // ring depth, same as the overlay path
+
+  // Reserve SLOTS consumer textures (one per ring slot) on our plugin wire.
+  // Each gets its own worker-local resKey; we keep both keys per slot.
+  const slotResKeys: number[] = [];
+  type ConRes = ReturnType<typeof plugin.reserveConsumerTexture>;
+  const cons: ConRes[] = [];
+  for (let i = 0; i < SLOTS; i++) {
+    const resKey = allocSurfaceBufId();
+    slotResKeys.push(resKey);
+    cons.push(plugin.reserveConsumerTexture(clientId, resKey, outW, outH));
+  }
+
+  // Round-trip to the broker: it allocates SLOTS dmabufs (one per slot via
+  // AllocComposeBuf), registers them for per-frame produce, builds the
+  // shared SlotStates SAB, and replies with {slotsSab, slots:[{surfaceBufId}]}.
+  // Each per-slot consumer handle is on the worker; the broker sees the
+  // wire reserved {texId, texGen, devId, devGen, wireSerial} per slot.
+  const r = (await endpoint.request("compose.live", {
+    width: outW, height: outH, slots: SLOTS,
+    consumers: cons.map((c) => ({
+      texId: c.texture.id, texGen: c.texture.generation,
+      devId: c.device.id, devGen: c.device.generation,
+      wireSerial: c.wireSerial,
+    })),
+    windows: [...windows],
+  })) as unknown as { slotsSab: SharedArrayBuffer; slots: Array<{ surfaceBufId: number }> };
+
+  const slotBufIds: number[] = r.slots.map((s) => s.surfaceBufId);
+  const slotTextures: (GPUTexture | null)[] = new Array(SLOTS).fill(null);
+  const slotStates = new SlotStates(r.slotsSab);
+
+  // Build the consumer half of the ring. The plugin's GPU device tracks
+  // afterReadDone via onSubmittedWorkDone -- consumer End must wait until
+  // the plugin's most recent sample submit completed.
+  const dev = deps.plugin === undefined ? null : null; void dev;
+  // (sdk.gpu.device is on the worker side -- consumers run cb() that
+  // encodes + submits. The DRAINING -> FREE / writeEnd must come AFTER
+  // that submit's GPU work completes. We rely on the cb itself awaiting
+  // its mapAsync/work-completion before returning; the writeEnd fires
+  // synchronously in endConsume so it's after the cb resolves, which the
+  // FIFO wire ordering then sequences correctly.)
+  let openSlot = -1;
+  const consumer = new SurfaceConsumer({
+    slots: {
+      surfaceBufId: (slot) => slotBufIds[slot],
+      textureFor: (slot) => {
+        if (slotTextures[slot]) return slotTextures[slot];
+        const handle = plugin.consumerTexture(clientId, slotResKeys[slot]);
+        if (handle === 0n) return null;
+        const t = dawn.wrapTexture(pluginDeviceHandle, handle);
+        slotTextures[slot] = t;
+        return t;
+      },
+    },
+    slotStates,
+    writeBegin: (id) => plugin.writeConsumerBegin(clientId, id),
+    writeEnd: (id) => plugin.writeConsumerEnd(clientId, id),
+    // For the plugin-side consumer, afterReadDone fires synchronously --
+    // the sample()'s cb is expected to await its own mapAsync /
+    // onSubmittedWorkDone before returning, so when endConsume is called
+    // the plugin's GPU work for THIS sample is already done. writeEnd
+    // immediately is correct.
+    afterReadDone: (cb) => cb(),
+  });
+
+  // Pull-based sample(): await a PRESENTED slot, open consumer Begin on
+  // it, run cb, close End. ONE sample at a time (single-buffer-like guard
+  // against the caller invoking sample() before a prior one settles).
+  let sampling = false;
+  let released = false;
+  // Texture-of-record for SceneHandle.texture: this is a representative
+  // texture; the plugin should sample inside sample(cb) which gives the
+  // ACTUAL slot's texture for that sample. We expose slot-0's texture as
+  // a placeholder so .texture isn't null; documenting the contract.
+  // Pre-wrap so the SceneHandle has a non-null texture.
+  await new Promise<void>((res) => setTimeout(res, 0));  // yield once
+  const slot0Tex = (() => {
+    const h = plugin.consumerTexture(clientId, slotResKeys[0]);
+    if (h === 0n) return null;
+    const t = dawn.wrapTexture(pluginDeviceHandle, h);
+    slotTextures[0] = t;
+    return t;
+  })();
+
+  return {
+    texture: slot0Tex as GPUTexture,  // representative; sample(cb) hands the real one
+    outW, outH,
+    async sample<T>(cb: (t: GPUTexture) => T | Promise<T>): Promise<T> {
+      if (released) throw new Error("compose.live: sample after release");
+      if (sampling) throw new Error("compose.live: sample called while another sample is in flight");
+      sampling = true;
+      try {
+        const slot = await awaitPresentedSlot(slotStates);
+        openSlot = slot;
+        const tex = consumer.beginConsume(slot);
+        // The cb encodes + submits its reads against `tex`. The cb is
+        // expected to await any mapAsync / onSubmittedWorkDone BEFORE
+        // returning, so by the time await cb() resolves the plugin's
+        // GPU work against this slot is complete.
+        const result = await cb(tex);
+        // End the bracket + demote PRESENTED -> DRAINING -> FREE so the
+        // producer can re-claim this slot.
+        consumer.endConsume();
+        openSlot = -1;
+        return result;
+      } finally {
+        sampling = false;
+      }
+    },
+    async release(): Promise<void> {
+      if (released) return;
+      released = true;
+      while (sampling) await new Promise((r) => setTimeout(r, 1));
+      if (openSlot >= 0) {
+        consumer.endConsume();
+        openSlot = -1;
+      }
+      // Tell the broker to unregister + release every slot's surfaceBuf.
+      await endpoint.request("compose.release", { surfaceBufIds: slotBufIds });
     },
   };
 }

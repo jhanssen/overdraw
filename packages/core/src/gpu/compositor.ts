@@ -397,6 +397,12 @@ export class JsCompositor implements CompositorSink {
   // with the cropped region filling the target.
   private liveScenes: LiveScene[] = [];
   private liveWindowComps: LiveWindowComp[] = [];
+  // Phase 5b-live: per-frame callbacks the broker registers for cross-device
+  // dmabuf compose-live. Each callback owns its own ring + producer; the
+  // compositor doesn't know the target. Invoked after the on-screen frame
+  // composite (and the existing liveScenes/liveWindowComps passes), so the
+  // producer's compose pass shares the frame's encoder + submit.
+  private liveProducers: Array<() => void> = [];
 
   // dmabuf buffer-release lifecycle. The pure state machine (no GPU, no Dawn)
   // is the source of truth; the executor here translates events <-> intents.
@@ -1170,6 +1176,19 @@ export class JsCompositor implements CompositorSink {
         this.runAfterFrame();
       });
 
+      // Phase 5b-live: invoke each registered live-producer callback. They
+      // own their own SurfaceProducer + ring slot; each runs its own
+      // writeProducerBegin / composeIntoView / writeProducerEnd as a
+      // separate submit (since the per-buf brackets are FIFO-ordered with
+      // their compose pass on the core wire; they can't share the
+      // on-screen submit's encoder because their producer Begin would
+      // sit before the on-screen samples and that's wrong ordering for
+      // the GPU process's bracket-decode invariants).
+      for (const cb of this.liveProducers) {
+        try { cb(); }
+        catch (e) { console.warn("[js-compositor] liveProducer threw:", e); }
+      }
+
       if (presenting) {
         this.addon.presentOutput();
         this.outputTex = null;
@@ -1286,6 +1305,24 @@ export class JsCompositor implements CompositorSink {
     if (args.producerSurfaceBufId !== undefined) {
       this.addon.writeProducerEnd(args.producerSurfaceBufId);
     }
+  }
+
+  // Phase 5b-live: register a per-frame produce callback. The compositor
+  // invokes it after the on-screen frame submits. The caller owns its
+  // SurfaceProducer + ring; each callback typically calls producer.
+  // tryAcquire() -> composeIntoView -> producer.presentSync(). Returns an
+  // unregister handle.
+  registerLiveProducer(onFrame: () => void): { unregister: () => void } {
+    this.liveProducers.push(onFrame);
+    let off = false;
+    return {
+      unregister: () => {
+        if (off) return;
+        off = true;
+        const i = this.liveProducers.indexOf(onFrame);
+        if (i >= 0) this.liveProducers.splice(i, 1);
+      },
+    };
   }
 
   // Render each listed window into its own texture sized to that window's
