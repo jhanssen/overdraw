@@ -14,6 +14,7 @@ import type { WindowStateChangedEvent } from "../events/types.js";
 import { markWindowChanged } from "../protocols/window-changes.js";
 import type { CompositorState, CompositorSink } from "../protocols/ctx.js";
 import { rebuildStackWithPopups } from "../protocols/xdg_popup.js";
+import { FOCUS_REASONS } from "@overdraw/focus-types";
 
 export interface WindowsBrokerDeps {
   wm: Wm;
@@ -263,20 +264,12 @@ function isFocusPayload(d: unknown): d is { id: number | null } {
   return id === null || typeof id === "number";
 }
 
-// Mirrors VALID_FOCUS_REASONS in windows-sdk.ts; the SDK validates at the
-// plugin boundary, the broker re-validates here as the trust boundary.
-const VALID_FOCUS_REASONS: readonly string[] = [
-  "pointer-enter", "pointer-leave", "pointer-button",
-  "window-mapped", "window-unmapped", "window-raised",
-  "workspace-changed", "explicit",
-];
-
 function isRequestFocusDecisionPayload(d: unknown): d is {
   reason: import("@overdraw/focus-types").FocusReason; trigger?: number;
 } {
   if (typeof d !== "object" || d === null) return false;
   const o = d as { [k: string]: unknown };
-  if (typeof o.reason !== "string" || !VALID_FOCUS_REASONS.includes(o.reason)) {
+  if (typeof o.reason !== "string" || !(FOCUS_REASONS as readonly string[]).includes(o.reason)) {
     return false;
   }
   if (o.trigger !== undefined && typeof o.trigger !== "number") return false;

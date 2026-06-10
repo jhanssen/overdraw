@@ -13,7 +13,7 @@ import type { Endpoint, Json } from "./protocol.js";
 import type { PluginWindowObserver, WindowObserverControl } from "./window-observer.js";
 import type { PluginEvents } from "./events.js";
 import { createWindowObserver } from "./window-observer.js";
-import type { FocusReason } from "@overdraw/focus-types";
+import { FOCUS_REASONS, type FocusReason } from "@overdraw/focus-types";
 
 // Hint field names; must match WindowHints keys on the core side.
 export type HintField = "floating" | "fullscreen" | "maximized" | "minimized";
@@ -148,14 +148,7 @@ export interface PluginWindows extends PluginWindowObserver {
 // from internal core paths.
 export const OUTPUT_DEFAULT = 0;
 
-// Valid FocusReason strings, mirrored from @overdraw/focus-types. Kept here
-// as a runtime list because the SDK validates the boundary; the focus-types
-// package is type-only.
-const VALID_FOCUS_REASONS: readonly string[] = [
-  "pointer-enter", "pointer-leave", "pointer-button",
-  "window-mapped", "window-unmapped", "window-raised",
-  "workspace-changed", "explicit",
-];
+
 
 export interface WindowsControl {
   windows: PluginWindows;
@@ -243,9 +236,9 @@ export function createPluginWindows(
     },
 
     async requestFocusDecision(reason, trigger): Promise<void> {
-      if (typeof reason !== "string" || !VALID_FOCUS_REASONS.includes(reason)) {
+      if (typeof reason !== "string" || !(FOCUS_REASONS as readonly string[]).includes(reason)) {
         throw new TypeError(
-          `requestFocusDecision reason must be one of ${VALID_FOCUS_REASONS.join("|")}`);
+          `requestFocusDecision reason must be one of ${FOCUS_REASONS.join("|")}`);
       }
       if (trigger !== undefined && typeof trigger !== "number") {
         throw new TypeError("requestFocusDecision trigger must be a number or omitted");
