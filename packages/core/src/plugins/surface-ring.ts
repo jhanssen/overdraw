@@ -33,16 +33,19 @@ import { SlotStates, SLOT_FREE, SLOT_PRESENTED } from "./surface-slots.js";
 // Per-slot identifiers + handles the producer/consumer need. The two halves
 // fill this in differently (e.g. the producer-side textures come from the
 // PRODUCER's device; the consumer-side textures from the CONSUMER's device),
-// but the shape is the same.
+// but the shape is the same. Both fields are getter functions because slot
+// bindings are populated incrementally in some flows (e.g. the overlay
+// broker fills slot bufIds one at a time via surface.bindProducer).
 export interface SlotMap {
-  // surfaceBufId per slot (the wire-level id the GPU process uses to find the
-  // SurfaceBuf). Both sides share these ids -- they identify the dmabuf, not
-  // the side.
-  surfaceBufIds: ReadonlyArray<number>;
-  // Pre-wrapped GPUTexture per slot, on the LOCAL device (producer-side ring's
-  // textures are on the producer device; consumer-side on the consumer device).
-  // Lazily filled by the caller before the slot is first used; the ring just
-  // hands them out by index.
+  // surfaceBufId for a slot (the wire-level id the GPU process uses to find
+  // the SurfaceBuf). Both sides share these ids -- they identify the dmabuf,
+  // not the side. Throw if the slot's id isn't yet known.
+  surfaceBufId: (slot: number) => number;
+  // Wrapped GPUTexture per slot, on the LOCAL device (producer-side ring's
+  // textures are on the producer device; consumer-side on the consumer
+  // device). Lazily filled by the caller before the slot is first used; the
+  // ring just hands them out by index. Return null if not yet wrapped (the
+  // ring will throw a clear error).
   textureFor: (slot: number) => GPUTexture | null;
 }
 
@@ -97,7 +100,7 @@ export class SurfaceProducer {
         // are submitted. writeBegin's wire frame is FIFO-ordered before those
         // commands, so the GPU process opens the bracket before HandleCommands
         // decodes them.
-        this.deps.writeBegin(this.deps.slots.surfaceBufIds[slot]);
+        this.deps.writeBegin(this.deps.slots.surfaceBufId(slot));
         const tex = this.deps.slots.textureFor(slot);
         if (!tex) throw new Error(`SurfaceProducer.acquire: no texture for slot ${slot}`);
         return { slot, texture: tex };
@@ -121,7 +124,7 @@ export class SurfaceProducer {
     }
     const slot = this.acquired;
     this.acquired = -1;
-    const surfaceBufId = this.deps.slots.surfaceBufIds[slot];
+    const surfaceBufId = this.deps.slots.surfaceBufId(slot);
     // Close the producer bracket AFTER the caller's render submit (kind=2
     // wire frame, FIFO after the submit's wire batch).
     this.deps.writeEnd(surfaceBufId);
@@ -180,7 +183,7 @@ export class SurfaceConsumer {
       if (!t) throw new Error(`SurfaceConsumer: no texture for slot ${slot}`);
       return t;
     }
-    this.deps.writeBegin(this.deps.slots.surfaceBufIds[slot]);
+    this.deps.writeBegin(this.deps.slots.surfaceBufId(slot));
     this.openSlot = slot;
     const t = this.deps.slots.textureFor(slot);
     if (!t) throw new Error(`SurfaceConsumer: no texture for slot ${slot}`);
@@ -193,7 +196,7 @@ export class SurfaceConsumer {
     if (this.openSlot < 0) return;
     const slot = this.openSlot;
     this.openSlot = -1;
-    const surfaceBufId = this.deps.slots.surfaceBufIds[slot];
+    const surfaceBufId = this.deps.slots.surfaceBufId(slot);
     // Demote PRESENTED -> DRAINING synchronously. (If it was already DRAINING
     // -- e.g. another swap happened first -- demote returns false; the slot's
     // already in flight to be freed and our End/free below still finish it.)
@@ -230,10 +233,10 @@ export class SurfaceConsumer {
     // temporarily allow two open slots, but the prior is immediately
     // released to afterReadDone, so by the next sample only one is truly
     // open from the GPU process's perspective.
-    this.deps.writeBegin(this.deps.slots.surfaceBufIds[newSlot]);
+    this.deps.writeBegin(this.deps.slots.surfaceBufId(newSlot));
     this.openSlot = newSlot;
     if (prev >= 0) {
-      const prevBufId = this.deps.slots.surfaceBufIds[prev];
+      const prevBufId = this.deps.slots.surfaceBufId(prev);
       this.deps.slotStates.demote(prev);
       const deps = this.deps;
       deps.afterReadDone(() => {

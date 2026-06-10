@@ -270,7 +270,7 @@ export async function createPluginGpu(
     // is a thin facade -- the meat lives in surface-ring.ts.
     const producer = new SurfaceProducer({
       slots: {
-        surfaceBufIds: slotBufId,
+        surfaceBufId: (slot) => slotBufId[slot],
         textureFor: wrapSlot,
       },
       slotStates,
