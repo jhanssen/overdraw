@@ -24,6 +24,7 @@ import type { Registration } from "./namespace-registry.js";
 import { ActionRegistry } from "./action-registry.js";
 import { InThreadPlugin } from "./inthread-plugin.js";
 import type { InThreadGpuDeps } from "./inthread-gpu.js";
+import { warnRuntimeMisconfig } from "./runtime-warnings.js";
 import type { PluginController, PluginHandle, PluginState } from "./plugin-host.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -234,7 +235,13 @@ class ManagedPlugin implements PluginHandle {
 
   private onEventsSubscribe(data: unknown): void {
     const bus = this.opts.bus;
-    if (!bus) return;  // no bus configured (scope-B tests): silently ignore
+    if (!bus) {
+      // Runtime constructed without a bus: the subscription has nowhere to
+      // wire to. Warn loudly through console.error -- bypassing this.log
+      // so a test that silences logs still sees the misconfiguration.
+      warnRuntimeMisconfig(this.cfg.name, "events.subscribe", "subscription will never fire");
+      return;
+    }
     if (!isSubscribePayload(data)) {
       this.log(`[plugin ${this.cfg.name}] events.subscribe: malformed payload; ignored`);
       return;
@@ -273,7 +280,10 @@ class ManagedPlugin implements PluginHandle {
 
   private onEventsEmit(data: unknown): void {
     const bus = this.opts.bus;
-    if (!bus) return;
+    if (!bus) {
+      warnRuntimeMisconfig(this.cfg.name, "events.emit", "emit dropped");
+      return;
+    }
     if (!isEmitPayload(data)) {
       this.log(`[plugin ${this.cfg.name}] events.emit: malformed payload; ignored`);
       return;
@@ -288,7 +298,11 @@ class ManagedPlugin implements PluginHandle {
 
   private onEventsInterceptRegister(data: unknown): void {
     const bus = this.opts.bus;
-    if (!bus) return;
+    if (!bus) {
+      warnRuntimeMisconfig(this.cfg.name, "events.intercept-register",
+        "interceptor will never fire");
+      return;
+    }
     if (!isInterceptRegisterPayload(data)) {
       this.log(`[plugin ${this.cfg.name}] events.intercept-register: malformed payload; ignored`);
       return;
@@ -536,6 +550,41 @@ export class PluginRuntime implements PluginController {
   emit(pluginName: string, name: string, data: Json): void {
     for (const p of this.plugins) {
       if (p.cfg.name === pluginName) { p.emit(name, data); return; }
+    }
+  }
+
+  // Drain in-flight plugin work to a quiescent point. Tests call this after
+  // triggering a state change (an emit on the bus, a synthetic input event)
+  // and before asserting on plugin-observed state, so the assertion is not
+  // racing the dispatch -> plugin -> broker -> reply chain.
+  //
+  // Quiescent = no plugin endpoint has any pending outbound request, across
+  // a small number of microtask + macrotask hops. The implementation polls
+  // pendingCount() across all plugins; once it's zero for two consecutive
+  // rounds, the chain has fully settled (one round of zero is not enough --
+  // a plugin can fire a follow-up request inside its reply handler).
+  //
+  // Bounded: gives up after `maxRounds` and returns; tests that rely on
+  // flush() should still assert with a timeout so a stuck plugin produces a
+  // diagnostic rather than a silent pass.
+  async flush(maxRounds: number = 50): Promise<void> {
+    let consecutiveQuiet = 0;
+    for (let i = 0; i < maxRounds; i++) {
+      // Macrotask hop: lets timers (setTimeout 0), I/O, and microtasks run.
+      await new Promise<void>((r) => setImmediate(r));
+      // Microtask hop: drains promise reactions enqueued by the macrotask.
+      await Promise.resolve();
+      let pending = 0;
+      for (const p of this.plugins) {
+        const ep = p.endpointHandle();
+        if (ep) pending += ep.pendingCount();
+      }
+      if (pending === 0) {
+        consecutiveQuiet++;
+        if (consecutiveQuiet >= 2) return;
+      } else {
+        consecutiveQuiet = 0;
+      }
     }
   }
 

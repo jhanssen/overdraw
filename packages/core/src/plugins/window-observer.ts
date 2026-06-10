@@ -42,40 +42,46 @@ export function createWindowObserver(events: PluginEvents): WindowObserverContro
   const unmapHandlers: WindowUnmapHandler[] = [];
   const changeHandlers: WindowChangeHandler[] = [];
 
+  // The underlying 'window.*' bus subscription is lazy: it's installed on
+  // the first onMap/onUnmap/onChange handler registration, so a plugin that
+  // never observes window state does not pay for an unused subscription
+  // (and does not trigger the runtime's no-bus warning).
+  let sub: ReturnType<PluginEvents["subscribe"]> | null = null;
+  function ensureSubscribed(): void {
+    if (sub) return;
+    sub = events.subscribe("window.*", (name, payload) => {
+      switch (name) {
+        case WINDOW_EVENT.map: {
+          const ev = asMapEvent(payload);
+          if (ev) for (const cb of mapHandlers) cb(ev);
+          return;
+        }
+        case WINDOW_EVENT.unmap: {
+          const ev = asUnmapEvent(payload);
+          if (ev) for (const cb of unmapHandlers) cb(ev);
+          return;
+        }
+        case WINDOW_EVENT.change: {
+          const ev = asChangeEvent(payload);
+          if (ev) for (const cb of changeHandlers) cb(ev);
+          return;
+        }
+      }
+      // Other window.* events (closing, etc.) -- not yet exposed via this
+      // observer. Subscribers wanting them use sdk.events.subscribe directly.
+    });
+  }
+
   const observer: PluginWindowObserver = {
-    onMap(cb) { mapHandlers.push(cb); },
-    onUnmap(cb) { unmapHandlers.push(cb); },
-    onChange(cb) { changeHandlers.push(cb); },
+    onMap(cb) { mapHandlers.push(cb); ensureSubscribed(); },
+    onUnmap(cb) { unmapHandlers.push(cb); ensureSubscribed(); },
+    onChange(cb) { changeHandlers.push(cb); ensureSubscribed(); },
   };
 
-  // The core constructs these payloads from typed sources (events/types.ts)
-  // and sends them over a structured-clone transport. This is a trust
-  // boundary, so the inbound payload is validated (not blindly cast) before
-  // invoking handlers; a malformed payload is dropped rather than handed to
-  // plugin code.
-  const sub = events.subscribe("window.*", (name, payload) => {
-    switch (name) {
-      case WINDOW_EVENT.map: {
-        const ev = asMapEvent(payload);
-        if (ev) for (const cb of mapHandlers) cb(ev);
-        return;
-      }
-      case WINDOW_EVENT.unmap: {
-        const ev = asUnmapEvent(payload);
-        if (ev) for (const cb of unmapHandlers) cb(ev);
-        return;
-      }
-      case WINDOW_EVENT.change: {
-        const ev = asChangeEvent(payload);
-        if (ev) for (const cb of changeHandlers) cb(ev);
-        return;
-      }
-    }
-    // Other window.* events (closing, etc.) — not yet exposed via this
-    // observer. Subscribers wanting them use sdk.events.subscribe directly.
-  });
-
-  return { observer, release: () => sub.off() };
+  return {
+    observer,
+    release(): void { sub?.off(); sub = null; },
+  };
 }
 
 // Runtime validators for the inbound payloads (trust boundary; see subscribe).

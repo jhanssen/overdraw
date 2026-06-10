@@ -94,6 +94,9 @@ export class Endpoint {
   handleRequests(h: RequestHandler): void { this.onRequest = h; }
   // Register the handler for inbound one-way events.
   handleEvents(h: EventHandler): void { this.onEvent = h; }
+  // How many outbound requests are still awaiting a reply. Used by
+  // PluginRuntime.flush() to detect a quiescent state.
+  pendingCount(): number { return this.pending.size; }
   // Core side: observe pongs (watchdog). Worker side: auto-replies to pings
   // unless an explicit ping handler is set.
   handlePongs(h: PongHandler): void { this.onPong = h; }

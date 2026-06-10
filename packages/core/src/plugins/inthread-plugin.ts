@@ -16,6 +16,7 @@ import type { ResolvedPlugin } from "../config/types.js";
 import { runLoader } from "./loader.js";
 import type { InThreadGpuDeps } from "./inthread-gpu.js";
 import type { PluginController, PluginHandle, PluginState } from "./plugin-host.js";
+import { warnRuntimeMisconfig } from "./runtime-warnings.js";
 
 export interface InThreadOptions {
   log?: (msg: string) => void;
@@ -144,7 +145,10 @@ export class InThreadPlugin implements PluginHandle {
 
   private onEventsSubscribe(data: unknown): void {
     const bus = this.opts.bus;
-    if (!bus) return;
+    if (!bus) {
+      warnRuntimeMisconfig(this.cfg.name, "events.subscribe", "subscription will never fire");
+      return;
+    }
     if (!isSubscribePayload(data)) {
       this.log(`[plugin ${this.cfg.name}] events.subscribe: malformed payload; ignored`);
       return;
@@ -181,7 +185,10 @@ export class InThreadPlugin implements PluginHandle {
 
   private onEventsEmit(data: unknown): void {
     const bus = this.opts.bus;
-    if (!bus) return;
+    if (!bus) {
+      warnRuntimeMisconfig(this.cfg.name, "events.emit", "emit dropped");
+      return;
+    }
     if (!isEmitPayload(data)) {
       this.log(`[plugin ${this.cfg.name}] events.emit: malformed payload; ignored`);
       return;
@@ -196,7 +203,11 @@ export class InThreadPlugin implements PluginHandle {
 
   private onEventsInterceptRegister(data: unknown): void {
     const bus = this.opts.bus;
-    if (!bus) return;
+    if (!bus) {
+      warnRuntimeMisconfig(this.cfg.name, "events.intercept-register",
+        "interceptor will never fire");
+      return;
+    }
     if (!isInterceptRegisterPayload(data)) {
       this.log(`[plugin ${this.cfg.name}] events.intercept-register: malformed payload; ignored`);
       return;
