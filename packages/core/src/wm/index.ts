@@ -309,12 +309,24 @@ export function createWm(
   // where size changed, and update bound decorations. Windows omitted from
   // the result keep their previous geometry (a layout that wants to hide a
   // window should leave it out; the driver doesn't auto-hide).
+  //
+  // The relayout emit awaits a (possibly slow) interceptor chain. Other code
+  // paths (unmapWindow, addWindow) mutate `windows` synchronously while this
+  // is awaiting. Two precautions:
+  //   1. Iterate a SNAPSHOT of `windows` so the for-of iterator can't be
+  //      corrupted mid-traversal (splice while iterating skips or repeats).
+  //   2. After each await, re-check the window is still in `windows`. A
+  //      window unmapped during the await is gone from the WM's view --
+  //      applying its layout would push to the compositor (potentially
+  //      resurrecting a deleted Surface via setSurfaceLayout's auto-create)
+  //      and would fire configure() on a destroyed xdg_toplevel.
   async function applyLayout(result: LayoutResult, _reason: LayoutReason): Promise<void> {
     void _reason;
     // Index by id for O(1) lookup; layouts may return rects in arbitrary order.
     const byId = new Map<number, { id: number; outer: Rect }>();
     for (const r of result.rects) byId.set(r.id, r);
-    for (const win of windows) {
+    const snapshotWindows = [...windows];
+    for (const win of snapshotWindows) {
       const r = byId.get(win.surfaceId);
       if (!r) continue;   // layout omitted this window: leave its geometry
       const prevContent = contentOf(win);
@@ -332,6 +344,10 @@ export function createWm(
         };
         const finalPayload = await pluginBus.emit(WINDOW_EVENT.relayout, initial,
           { timeoutMs: RELAYOUT_TIMEOUT_MS });
+        // Membership re-check: a synchronous unmap during the await above
+        // splices `windows`. Continuing would push stale layout for a
+        // destroyed window.
+        if (!windows.includes(win)) continue;
         const ev = finalPayload as WindowRelayoutEvent | undefined;
         if (ev && isRect(ev.newOuter)) newOuter = { ...ev.newOuter };
       }
