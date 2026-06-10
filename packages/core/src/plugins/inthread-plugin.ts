@@ -11,12 +11,12 @@
 import { Endpoint } from "./protocol.js";
 import { createChannelPair } from "./pair-channel.js";
 import type { Channel, Json } from "./protocol.js";
-import type { DynamicBus, Subscription } from "../events/dynamic-bus.js";
+import type { DynamicBus } from "../events/dynamic-bus.js";
 import type { ResolvedPlugin } from "../config/types.js";
 import { runLoader } from "./loader.js";
 import type { InThreadGpuDeps } from "./inthread-gpu.js";
 import type { PluginController, PluginHandle, PluginState } from "./plugin-host.js";
-import { warnRuntimeMisconfig } from "./runtime-warnings.js";
+import { BusBridge } from "./bus-bridge.js";
 
 export interface InThreadOptions {
   log?: (msg: string) => void;
@@ -41,10 +41,15 @@ export class InThreadPlugin implements PluginHandle {
 
   state: PluginState = "spawning";
   private endpoint: Endpoint | null = null;
-  private busSubs = new Map<number, Subscription>();
-  private busIntercepts = new Map<number, Subscription>();
   private firstSettle: { resolve: () => void } | null = null;
   readonly ready: Promise<void>;
+
+  // events.* surface is delegated to a BusBridge so the Worker-backed host
+  // (runtime.ts) and the in-thread host stay in lockstep. The bridge reads
+  // pluginName/bus/endpoint/log freshly each dispatch via the host adapter
+  // below (getter shape so endpoint reflects the current value, not the
+  // value at construction time).
+  private bridge: BusBridge;
 
   constructor(cfg: ResolvedPlugin, opts: InThreadOptions, ns: PluginController) {
     this.cfg = cfg;
@@ -52,6 +57,13 @@ export class InThreadPlugin implements PluginHandle {
     this.ns = ns;
     this.log = opts.log ?? ((m) => console.log(m));
     this.ready = new Promise<void>((resolve) => { this.firstSettle = { resolve }; });
+    const self = this;
+    this.bridge = new BusBridge({
+      get pluginName() { return self.cfg.name; },
+      get bus() { return self.opts.bus; },
+      get endpoint() { return self.endpoint; },
+      log: (m) => self.log(m),
+    });
   }
 
   endpointHandle(): Endpoint | null {
@@ -130,11 +142,7 @@ export class InThreadPlugin implements PluginHandle {
       return;
     }
 
-    if (name === "events.subscribe") { this.onEventsSubscribe(data); return; }
-    if (name === "events.unsubscribe") { this.onEventsUnsubscribe(data); return; }
-    if (name === "events.emit") { this.onEventsEmit(data); return; }
-    if (name === "events.intercept-register") { this.onEventsInterceptRegister(data); return; }
-    if (name === "events.intercept-unregister") { this.onEventsInterceptUnregister(data); return; }
+    if (this.bridge.handle(name, data)) return;
     if (name === "plugin.register") { this.ns.onRegister(this.cfg.name, data); return; }
     if (name === "plugin.unregister") { this.ns.onUnregister(this.cfg.name, data); return; }
     if (name === "actions.register") { this.ns.onActionRegister(this.cfg.name, data); return; }
@@ -143,118 +151,7 @@ export class InThreadPlugin implements PluginHandle {
     this.opts.onEvent?.(this.cfg.name, name, data);
   }
 
-  private onEventsSubscribe(data: unknown): void {
-    const bus = this.opts.bus;
-    if (!bus) {
-      warnRuntimeMisconfig(this.cfg.name, "events.subscribe", "subscription will never fire");
-      return;
-    }
-    if (!isSubscribePayload(data)) {
-      this.log(`[plugin ${this.cfg.name}] events.subscribe: malformed payload; ignored`);
-      return;
-    }
-    const { subId, pattern } = data;
-    if (this.busSubs.has(subId)) {
-      this.log(`[plugin ${this.cfg.name}] events.subscribe: duplicate subId ${subId}; ignored`);
-      return;
-    }
-    let sub: Subscription;
-    try {
-      sub = bus.subscribe(pattern, (evName, payload) => {
-        this.endpoint?.emit("events.dispatch",
-          { subId, name: evName, payload: payload as Json });
-      });
-    } catch (err: unknown) {
-      const msg = err instanceof Error ? err.message : String(err);
-      this.log(`[plugin ${this.cfg.name}] events.subscribe('${pattern}') rejected: ${msg}`);
-      return;
-    }
-    this.busSubs.set(subId, sub);
-  }
-
-  private onEventsUnsubscribe(data: unknown): void {
-    if (!isUnsubscribePayload(data)) {
-      this.log(`[plugin ${this.cfg.name}] events.unsubscribe: malformed payload; ignored`);
-      return;
-    }
-    const sub = this.busSubs.get(data.subId);
-    if (!sub) return;
-    sub.off();
-    this.busSubs.delete(data.subId);
-  }
-
-  private onEventsEmit(data: unknown): void {
-    const bus = this.opts.bus;
-    if (!bus) {
-      warnRuntimeMisconfig(this.cfg.name, "events.emit", "emit dropped");
-      return;
-    }
-    if (!isEmitPayload(data)) {
-      this.log(`[plugin ${this.cfg.name}] events.emit: malformed payload; ignored`);
-      return;
-    }
-    try {
-      bus.emit(data.name, data.payload);
-    } catch (err: unknown) {
-      const msg = err instanceof Error ? err.message : String(err);
-      this.log(`[plugin ${this.cfg.name}] events.emit('${data.name}') rejected: ${msg}`);
-    }
-  }
-
-  private onEventsInterceptRegister(data: unknown): void {
-    const bus = this.opts.bus;
-    if (!bus) {
-      warnRuntimeMisconfig(this.cfg.name, "events.intercept-register",
-        "interceptor will never fire");
-      return;
-    }
-    if (!isInterceptRegisterPayload(data)) {
-      this.log(`[plugin ${this.cfg.name}] events.intercept-register: malformed payload; ignored`);
-      return;
-    }
-    const { interceptId, pattern, priority } = data;
-    if (this.busIntercepts.has(interceptId)) {
-      this.log(`[plugin ${this.cfg.name}] events.intercept-register: duplicate interceptId ${interceptId}; ignored`);
-      return;
-    }
-    let sub: Subscription;
-    try {
-      sub = bus.intercept(pattern, (evName, payload) => {
-        const ep = this.endpoint;
-        if (!ep) return undefined;
-        return ep.request("events.intercept-handle",
-          { interceptId, name: evName, payload: payload as Json })
-          .then((reply) => {
-            if (!isInterceptReply(reply)) return undefined;
-            if (!reply.modified) return undefined;
-            return reply.payload;
-          });
-      }, priority !== undefined ? { priority } : undefined);
-    } catch (err: unknown) {
-      const msg = err instanceof Error ? err.message : String(err);
-      this.log(`[plugin ${this.cfg.name}] events.intercept-register('${pattern}') rejected: ${msg}`);
-      return;
-    }
-    this.busIntercepts.set(interceptId, sub);
-  }
-
-  private onEventsInterceptUnregister(data: unknown): void {
-    if (!isInterceptUnregisterPayload(data)) {
-      this.log(`[plugin ${this.cfg.name}] events.intercept-unregister: malformed payload; ignored`);
-      return;
-    }
-    const sub = this.busIntercepts.get(data.interceptId);
-    if (!sub) return;
-    sub.off();
-    this.busIntercepts.delete(data.interceptId);
-  }
-
-  private releaseBusSubs(): void {
-    for (const sub of this.busSubs.values()) sub.off();
-    this.busSubs.clear();
-    for (const sub of this.busIntercepts.values()) sub.off();
-    this.busIntercepts.clear();
-  }
+  private releaseBusSubs(): void { this.bridge.release(); }
 
   async stop(): Promise<void> {
     if (!this.endpoint || this.state === "failed") {
@@ -290,43 +187,4 @@ export class InThreadPlugin implements PluginHandle {
 
   get currentState(): PluginState { return this.state; }
   get restartCount(): number { return 0; }
-}
-
-function isSubscribePayload(d: unknown): d is { subId: number; pattern: string } {
-  return typeof d === "object" && d !== null
-    && typeof (d as { subId?: unknown }).subId === "number"
-    && typeof (d as { pattern?: unknown }).pattern === "string";
-}
-
-function isUnsubscribePayload(d: unknown): d is { subId: number } {
-  return typeof d === "object" && d !== null
-    && typeof (d as { subId?: unknown }).subId === "number";
-}
-
-function isEmitPayload(d: unknown): d is { name: string; payload: Json } {
-  return typeof d === "object" && d !== null
-    && typeof (d as { name?: unknown }).name === "string"
-    && "payload" in (d as object);
-}
-
-function isInterceptRegisterPayload(d: unknown): d is { interceptId: number; pattern: string; priority?: number } {
-  if (typeof d !== "object" || d === null) return false;
-  const o = d as { [k: string]: unknown };
-  if (typeof o.interceptId !== "number") return false;
-  if (typeof o.pattern !== "string") return false;
-  if (o.priority !== undefined && typeof o.priority !== "number") return false;
-  return true;
-}
-
-function isInterceptUnregisterPayload(d: unknown): d is { interceptId: number } {
-  return typeof d === "object" && d !== null
-    && typeof (d as { interceptId?: unknown }).interceptId === "number";
-}
-
-function isInterceptReply(d: unknown): d is { modified: false } | { modified: true; payload: Json } {
-  if (typeof d !== "object" || d === null) return false;
-  const o = d as { [k: string]: unknown };
-  if (o.modified === false) return true;
-  if (o.modified === true) return "payload" in o;
-  return false;
 }

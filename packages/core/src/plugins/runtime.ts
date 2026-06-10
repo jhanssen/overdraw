@@ -18,14 +18,14 @@ import { dirname, join } from "node:path";
 import type { ResolvedPlugin } from "../config/types.js";
 import { Endpoint, channelFor } from "./protocol.js";
 import type { Json } from "./protocol.js";
-import type { DynamicBus, Subscription } from "../events/dynamic-bus.js";
+import type { DynamicBus } from "../events/dynamic-bus.js";
 import { NamespaceRegistry } from "./namespace-registry.js";
 import type { Registration } from "./namespace-registry.js";
 import { ActionRegistry } from "./action-registry.js";
 import { InThreadPlugin } from "./inthread-plugin.js";
 import type { InThreadGpuDeps } from "./inthread-gpu.js";
-import { warnRuntimeMisconfig } from "./runtime-warnings.js";
 import type { PluginController, PluginHandle, PluginState } from "./plugin-host.js";
+import { BusBridge } from "./bus-bridge.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 // The built bootstrap (this file lives in dist/plugins/ after tsc).
@@ -112,17 +112,14 @@ class ManagedPlugin implements PluginHandle {
   // Set while a forced terminate() is in flight so onExit knows it was a kill.
   private terminating = false;
 
-  // Plugin-owned bus subscriptions: the plugin's own subId -> the bus
-  // Subscription handle. Released on Worker exit/terminate so a crashed plugin
-  // leaves no lingering subscribers in the bus. The plugin mints the subIds
-  // (its sdk.events.subscribe call uses a local counter); core stores them
-  // verbatim and uses them as the discriminator on `events.dispatch` back to
-  // the worker.
-  private busSubs = new Map<number, Subscription>();
-  // Plugin-owned interceptor registrations: interceptId -> bus Subscription.
-  // The plugin mints the ids locally; core stores them verbatim and routes
-  // intercept-handle requests back to the worker by that id.
-  private busIntercepts = new Map<number, Subscription>();
+  // The events.* SDK surface is delegated to a BusBridge so the in-thread
+  // host (inthread-plugin.ts) and this Worker-backed host stay in lockstep.
+  // The bridge owns the per-plugin Subscription maps and releases them on
+  // Worker exit/terminate so a crashed plugin leaves no lingering
+  // subscribers in the bus. It reads pluginName/bus/endpoint/log freshly
+  // each dispatch via the host adapter (getter shape) below, so endpoint
+  // reflects the current value rather than the value at construction time.
+  private bridge: BusBridge;
 
   // Resolves when the plugin first reaches `live` or `failed` (initial spawn).
   private firstSettle: { resolve: () => void } | null = null;
@@ -134,6 +131,13 @@ class ManagedPlugin implements PluginHandle {
     this.ns = ns;
     this.log = opts.log ?? ((m) => console.log(m));
     this.ready = new Promise<void>((resolve) => { this.firstSettle = { resolve }; });
+    const self = this;
+    this.bridge = new BusBridge({
+      get pluginName() { return self.cfg.name; },
+      get bus() { return self.opts.bus; },
+      get endpoint() { return self.endpoint; },
+      log: (m) => self.log(m),
+    });
   }
 
   // Expose the endpoint so the runtime can send plugin.handle requests
@@ -220,11 +224,7 @@ class ManagedPlugin implements PluginHandle {
 
     // SDK event-bus interactions are reserved one-way events; intercept before
     // surfacing to onEvent. core-plugin-api.md §3.
-    if (name === "events.subscribe") { this.onEventsSubscribe(data); return; }
-    if (name === "events.unsubscribe") { this.onEventsUnsubscribe(data); return; }
-    if (name === "events.emit") { this.onEventsEmit(data); return; }
-    if (name === "events.intercept-register") { this.onEventsInterceptRegister(data); return; }
-    if (name === "events.intercept-unregister") { this.onEventsInterceptUnregister(data); return; }
+    if (this.bridge.handle(name, data)) return;
 
     // Namespace registry interactions (sdk.registerPlugin / unregister).
     // core-plugin-api.md §11.
@@ -240,131 +240,7 @@ class ManagedPlugin implements PluginHandle {
     this.opts.onEvent?.(this.cfg.name, name, data);
   }
 
-  private onEventsSubscribe(data: unknown): void {
-    const bus = this.opts.bus;
-    if (!bus) {
-      // Runtime constructed without a bus: the subscription has nowhere to
-      // wire to. Warn loudly through console.error -- bypassing this.log
-      // so a test that silences logs still sees the misconfiguration.
-      warnRuntimeMisconfig(this.cfg.name, "events.subscribe", "subscription will never fire");
-      return;
-    }
-    if (!isSubscribePayload(data)) {
-      this.log(`[plugin ${this.cfg.name}] events.subscribe: malformed payload; ignored`);
-      return;
-    }
-    const { subId, pattern } = data;
-    if (this.busSubs.has(subId)) {
-      this.log(`[plugin ${this.cfg.name}] events.subscribe: duplicate subId ${subId}; ignored`);
-      return;
-    }
-    let sub: Subscription;
-    try {
-      sub = bus.subscribe(pattern, (evName, payload) => {
-        // Deliver to the worker as a one-way event. The endpoint may be null
-        // mid-teardown; the emit() guard there is a no-op.
-        this.endpoint?.emit("events.dispatch",
-          { subId, name: evName, payload: payload as Json });
-      });
-    } catch (err: unknown) {
-      const msg = err instanceof Error ? err.message : String(err);
-      this.log(`[plugin ${this.cfg.name}] events.subscribe('${pattern}') rejected: ${msg}`);
-      return;
-    }
-    this.busSubs.set(subId, sub);
-  }
-
-  private onEventsUnsubscribe(data: unknown): void {
-    if (!isUnsubscribePayload(data)) {
-      this.log(`[plugin ${this.cfg.name}] events.unsubscribe: malformed payload; ignored`);
-      return;
-    }
-    const sub = this.busSubs.get(data.subId);
-    if (!sub) return;       // unknown subId (late unsubscribe after teardown): ignore
-    sub.off();
-    this.busSubs.delete(data.subId);
-  }
-
-  private onEventsEmit(data: unknown): void {
-    const bus = this.opts.bus;
-    if (!bus) {
-      warnRuntimeMisconfig(this.cfg.name, "events.emit", "emit dropped");
-      return;
-    }
-    if (!isEmitPayload(data)) {
-      this.log(`[plugin ${this.cfg.name}] events.emit: malformed payload; ignored`);
-      return;
-    }
-    try {
-      bus.emit(data.name, data.payload);
-    } catch (err: unknown) {
-      const msg = err instanceof Error ? err.message : String(err);
-      this.log(`[plugin ${this.cfg.name}] events.emit('${data.name}') rejected: ${msg}`);
-    }
-  }
-
-  private onEventsInterceptRegister(data: unknown): void {
-    const bus = this.opts.bus;
-    if (!bus) {
-      warnRuntimeMisconfig(this.cfg.name, "events.intercept-register",
-        "interceptor will never fire");
-      return;
-    }
-    if (!isInterceptRegisterPayload(data)) {
-      this.log(`[plugin ${this.cfg.name}] events.intercept-register: malformed payload; ignored`);
-      return;
-    }
-    const { interceptId, pattern, priority } = data;
-    if (this.busIntercepts.has(interceptId)) {
-      this.log(`[plugin ${this.cfg.name}] events.intercept-register: duplicate interceptId ${interceptId}; ignored`);
-      return;
-    }
-    let sub: Subscription;
-    try {
-      sub = bus.intercept(pattern, (evName, payload) => {
-        // Forward to the worker as a request; the worker's reply is the
-        // (possibly modified) payload. The bus enforces its per-handler
-        // timeout on the returned Promise, so a stuck worker can't stall
-        // the chain.
-        const ep = this.endpoint;
-        if (!ep) return undefined;
-        return ep.request("events.intercept-handle",
-          { interceptId, name: evName, payload: payload as Json })
-          .then((reply) => {
-            if (!isInterceptReply(reply)) return undefined;
-            if (!reply.modified) return undefined;
-            return reply.payload;
-          });
-      }, priority !== undefined ? { priority } : undefined);
-    } catch (err: unknown) {
-      const msg = err instanceof Error ? err.message : String(err);
-      this.log(`[plugin ${this.cfg.name}] events.intercept-register('${pattern}') rejected: ${msg}`);
-      return;
-    }
-    this.busIntercepts.set(interceptId, sub);
-  }
-
-  private onEventsInterceptUnregister(data: unknown): void {
-    if (!isInterceptUnregisterPayload(data)) {
-      this.log(`[plugin ${this.cfg.name}] events.intercept-unregister: malformed payload; ignored`);
-      return;
-    }
-    const sub = this.busIntercepts.get(data.interceptId);
-    if (!sub) return;
-    sub.off();
-    this.busIntercepts.delete(data.interceptId);
-  }
-
-  // Release all bus subscriptions and interceptors this plugin holds. Called
-  // on Worker exit (crash, terminate, graceful) so a dead plugin leaves no
-  // lingering registrations (which would otherwise try to emit/request
-  // against a closed endpoint).
-  private releaseBusSubs(): void {
-    for (const sub of this.busSubs.values()) sub.off();
-    this.busSubs.clear();
-    for (const sub of this.busIntercepts.values()) sub.off();
-    this.busIntercepts.clear();
-  }
+  private releaseBusSubs(): void { this.bridge.release(); }
 
   private startWatchdog(): void {
     this.stopWatchdog();
@@ -830,48 +706,10 @@ function isActionInvokePayload(d: unknown): d is { name: string; params: Json } 
     && "params" in (d as object);
 }
 
-// Payload guards for the events.* reserved one-way events. The worker is
-// trusted (it's our bootstrap.ts) but malformed messages should be logged and
-// dropped rather than corrupt the bus.
-
-function isSubscribePayload(d: unknown): d is { subId: number; pattern: string } {
-  return typeof d === "object" && d !== null
-    && typeof (d as { subId?: unknown }).subId === "number"
-    && typeof (d as { pattern?: unknown }).pattern === "string";
-}
-
-function isUnsubscribePayload(d: unknown): d is { subId: number } {
-  return typeof d === "object" && d !== null
-    && typeof (d as { subId?: unknown }).subId === "number";
-}
-
-function isEmitPayload(d: unknown): d is { name: string; payload: Json } {
-  return typeof d === "object" && d !== null
-    && typeof (d as { name?: unknown }).name === "string"
-    && "payload" in (d as object);
-}
-
-function isInterceptRegisterPayload(d: unknown): d is { interceptId: number; pattern: string; priority?: number } {
-  if (typeof d !== "object" || d === null) return false;
-  const o = d as { [k: string]: unknown };
-  if (typeof o.interceptId !== "number") return false;
-  if (typeof o.pattern !== "string") return false;
-  if (o.priority !== undefined && typeof o.priority !== "number") return false;
-  return true;
-}
-
-function isInterceptUnregisterPayload(d: unknown): d is { interceptId: number } {
-  return typeof d === "object" && d !== null
-    && typeof (d as { interceptId?: unknown }).interceptId === "number";
-}
-
-function isInterceptReply(d: unknown): d is { modified: false } | { modified: true; payload: Json } {
-  if (typeof d !== "object" || d === null) return false;
-  const o = d as { [k: string]: unknown };
-  if (o.modified === false) return true;
-  if (o.modified === true) return "payload" in o;
-  return false;
-}
+// Payload guards for namespace and action registrations (the events.*
+// guards live with the BusBridge in bus-bridge.ts). The worker is trusted
+// (it's our bootstrap.ts) but malformed messages should be logged and
+// dropped rather than corrupt a registry.
 
 function isRegisterPayload(d: unknown): d is { namespace: string; methods: string[]; priority?: number } {
   if (typeof d !== "object" || d === null) return false;
