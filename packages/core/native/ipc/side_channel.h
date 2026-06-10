@@ -25,25 +25,16 @@ enum class Tag : uint8_t {
     FeedbackData = 'F',  // gpu  -> core: dmabuf-feedback data (main_device dev_t +
                          //              format_table entry count); the format_table
                          //              memfd rides as SCM_RIGHTS on the same msg
-    ReserveTex   = 'R',  // core -> gpu : reserved texture+device handle + size/format
-    TexInjected  = 't',  // gpu  -> core: dmabuf imported + texture injected (+ modifier)
     ImportClientTex = 'M',  // core -> gpu : import a CLIENT dmabuf fd (SCM_RIGHTS) into
                             //              a texture at the reserved handle
     ClientTexImported = 'm',  // gpu -> core: client dmabuf imported + injected (or failed)
     ReleaseClientTex = 'r',   // core -> gpu : release a client-dmabuf import (texture =
                               //              {id,generation}); GPU drops the STM + fd if
                               //              the entry's generation still matches.
-    // NOTE: the per-frame CLIENT-dmabuf BeginAccess/EndAccess bracket no longer
-    // rides ctrl. It is multiplexed in-band on the WIRE socket as a kind=1/kind=2
-    // frame (see transport.h FrameKind + side_channel.h ClientTexAccessPayload),
-    // FIFO-ordered against the Dawn sample commands -- no ctrl round-trip, no
-    // WireBarrier. The former tags ('Q' BeginClientAccess / 'o'
-    // BeginClientAccessDone / 'Y' EndClientAccess) are retired; do not reuse those
-    // letters without checking no in-flight build still emits them.
-    BeginAccess  = 'B',  // core -> gpu : begin access on the STM (before wire render)
-    BeginDone    = 'b',  // gpu  -> core: BeginAccess applied + flushed
-    EndAccess    = 'E',  // core -> gpu : end access on the STM (after wire render)
-    EndDone      = 'e',  // gpu  -> core: EndAccess applied; sync-fd exported (fenceCount)
+    // The per-frame CLIENT-dmabuf BeginAccess/EndAccess bracket is multiplexed
+    // in-band on the WIRE socket as a kind=1/kind=2 frame (see transport.h
+    // FrameKind + ClientTexAccessPayload below), FIFO-ordered against the Dawn
+    // sample commands -- no ctrl round-trip, no WireBarrier.
     AddWireConn  = 'W',  // core -> gpu : register a NEW wire connection for a plugin.
                          //   The plugin's wire socket (GPU end) rides as SCM_RIGHTS
                          //   on this message; `connId` names it for later messages.
@@ -119,22 +110,17 @@ struct Message {
     uint8_t _pad[3] = {0, 0, 0};
 
     WireHandle instance;   // Hello*, InstanceReserved, DeviceReady, SurfaceReady
-    WireHandle device;     // DeviceReady, SurfaceReady, ReserveTex
+    WireHandle device;     // DeviceReady, SurfaceReady
     WireHandle surface;    // DeviceReady, SurfaceReady
-    WireHandle texture;    // ReserveTex, TexInjected
+    WireHandle texture;    // ImportClientTex, ClientTexImported, ReleaseClientTex
 
-    uint32_t format = 0;       // SurfaceReady, ReserveTex: WGPUTextureFormat
+    uint32_t format = 0;       // SurfaceReady: WGPUTextureFormat
     uint32_t presentMode = 0;  // SurfaceReady: WGPUPresentMode
     uint32_t alphaMode = 0;    // SurfaceReady: WGPUCompositeAlphaMode
-    uint32_t width = 0;        // HelloReply, SurfaceReady, ReserveTex
-    uint32_t height = 0;       // HelloReply, SurfaceReady, ReserveTex
+    uint32_t width = 0;        // HelloReply, SurfaceReady
+    uint32_t height = 0;       // HelloReply, SurfaceReady
 
-    uint64_t modifier = 0;     // TexInjected: DRM modifier the dmabuf was allocated with
-
-    uint32_t fenceCount = 0;   // EndDone: number of SharedFence sync-fds produced
-    uint32_t initialized = 0;  // BeginAccess: 1 if texture contents are already valid
-    int32_t  oldLayout = 0;    // BeginAccess: Vulkan image layout to begin from
-    int32_t  endLayout = 0;    // EndDone: Vulkan image layout the texture ended in
+    uint64_t modifier = 0;     // ImportClientTex: DRM modifier of the client dmabuf
 
     uint32_t protocolVersion = 0;  // Hello/HelloReply
 

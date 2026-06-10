@@ -1142,7 +1142,7 @@ int run(int wireFd, int ctrlFd, int inputFd, bool headless,
     };
 
     // Control-message dispatch. Returns false if the core requested shutdown.
-    auto dispatchCtrl = [&](const ipc::Message& m, int* recvFds, int nRecvFds) -> bool {
+    auto dispatchCtrl = [&](const ipc::Message& m, int* recvFds, int nRecvFds) -> void {
         {
             if (m.tag == ipc::Tag::Shutdown) {
                 shutdown = true;
@@ -1307,88 +1307,6 @@ int run(int wireFd, int ctrlFd, int inputFd, bool headless,
                     alloc.release(sb.buf);     // closes the dmabuf fd + GBM bo
                     surfaceBufs.erase(it);
                 }
-            } else if (m.tag == ipc::Tag::BeginAccess) {
-                // Begin access so the core's wire render commands may target the
-                // dmabuf texture. Vulkan layout state is mandatory on this
-                // backend. First access: undefined -> general.
-                wgpu::SharedTextureMemoryVkImageLayoutBeginState layout{};
-                // First (write) access begins from UNDEFINED; subsequent access
-                // begins from the layout the previous EndAccess reported (sent
-                // back by the core in oldLayout). newLayout is GENERAL so the
-                // texture is usable for both render and sample.
-                layout.oldLayout = m.initialized ? m.oldLayout : 0;  // 0=UNDEFINED
-                layout.newLayout = 1;                                // GENERAL
-                wgpu::SharedTextureMemoryBeginAccessDescriptor bad{};
-                bad.nextInChain = &layout;
-                bad.initialized = m.initialized != 0;
-                bad.fenceCount = 0;
-                if (dmaMem.BeginAccess(dmaTex, &bad) != wgpu::Status::Success) {
-                    std::fprintf(stderr, "[gpu] BeginAccess failed\n");
-                    return 1;
-                }
-                serializer.Flush();
-                std::printf("[gpu] BeginAccess OK\n");
-                ipc::Message reply{};
-                reply.tag = ipc::Tag::BeginDone;
-                ipc::sendMessage(ctrlFd, reply);
-            } else if (m.tag == ipc::Tag::EndAccess) {
-                wgpu::SharedTextureMemoryVkImageLayoutEndState endLayout{};
-                wgpu::SharedTextureMemoryEndAccessState endState{};
-                endState.nextInChain = &endLayout;
-                if (dmaMem.EndAccess(dmaTex, &endState) != wgpu::Status::Success) {
-                    std::fprintf(stderr, "[gpu] EndAccess failed\n");
-                    return 1;
-                }
-                // Export the produced sync-fd (proves the fence mechanism). The
-                // single-device path does not consume it cross-process; passing
-                // it over SCM_RIGHTS to the core is the two-device (B6) need.
-                uint32_t fenceCount = static_cast<uint32_t>(endState.fenceCount);
-                int syncFd = -1;
-                if (endState.fenceCount >= 1) {
-                    wgpu::SharedFenceExportInfo exp{};
-                    wgpu::SharedFenceSyncFDExportInfo syncExp{};
-                    exp.nextInChain = &syncExp;
-                    endState.fences[0].ExportInfo(&exp);
-                    syncFd = syncExp.handle;
-                }
-                std::printf("[gpu] EndAccess OK; fenceCount=%u syncFd=%d endLayout(old=%d new=%d)\n",
-                            fenceCount, syncFd, endLayout.oldLayout, endLayout.newLayout);
-                // The fd from ExportInfo is owned by the SharedFence (freed when
-                // endState is destroyed); do NOT close it here. A consumer that
-                // needs to keep it must dup() it (the B6 cross-process path).
-                ipc::Message reply{};
-                reply.tag = ipc::Tag::EndDone;
-                reply.fenceCount = fenceCount;
-                reply.endLayout = endLayout.newLayout;
-                ipc::sendMessage(ctrlFd, reply);
-            } else if (m.tag == ipc::Tag::ReserveTex) {
-                // Allocate a dmabuf, import it on the wire-resolved core device,
-                // create the texture, and inject it at the client's reserved
-                // handle so the client's ReserveTexture proxy now resolves.
-                if (!alloc.allocate(m.width, m.height, dmaBuf)) {
-                    std::fprintf(stderr, "[gpu] ReserveTex: allocate failed\n");
-                    return 1;
-                }
-                if (!gpu::Allocator::importTexture(coreDevice, alloc.fourcc(),
-                                                   dmaBuf, dmaMem, dmaTex)) {
-                    std::fprintf(stderr, "[gpu] ReserveTex: import failed\n");
-                    return 1;
-                }
-                if (!server.InjectTexture(dmaTex.Get(),
-                                          {m.texture.id, m.texture.generation},
-                                          {m.device.id, m.device.generation})) {
-                    std::fprintf(stderr, "[gpu] InjectTexture failed\n");
-                    return 1;
-                }
-                serializer.Flush();
-                std::printf("[gpu] injected dmabuf texture at {%u,%u} on device {%u,%u}\n",
-                            m.texture.id, m.texture.generation,
-                            m.device.id, m.device.generation);
-                ipc::Message reply{};
-                reply.tag = ipc::Tag::TexInjected;
-                reply.texture = m.texture;
-                reply.modifier = dmaBuf.modifier;
-                ipc::sendMessage(ctrlFd, reply);
             } else if (m.tag == ipc::Tag::ImportClientTex) {
                 if (nRecvFds < 1) {
                     std::fprintf(stderr, "[gpu] ImportClientTex: no fd received (nRecvFds=%d)\n", nRecvFds);
@@ -1439,7 +1357,6 @@ int run(int wireFd, int ctrlFd, int inputFd, bool headless,
                 }
             }
         }
-        return !shutdown;
     };
 
     // 9) Event-loop driven steady state. epoll over: wire fd (read always; write
