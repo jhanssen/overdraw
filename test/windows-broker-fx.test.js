@@ -32,6 +32,12 @@ function mockSink() {
     setSurfaceMask(id, mask) {
       calls.push({ method: 'setSurfaceMask', id, mask });
     },
+    setSurfaceTint(id, t) {
+      calls.push({ method: 'setSurfaceTint', id, t });
+    },
+    setSurfaceColorMatrix(id, m) {
+      calls.push({ method: 'setSurfaceColorMatrix', id, m });
+    },
   };
 }
 
@@ -202,5 +208,124 @@ test('set-mask: sink without setSurfaceMask -> not supported', () => {
   };
   const { broker } = makeBroker(bare);
   assert.throws(() => broker('p', 'windows.set-mask', { id: 1, mask: null }),
+    /not supported/);
+});
+
+// ---- set-tint ---------------------------------------------------------------
+
+test('set-tint: forwards the full tint object', () => {
+  const { broker, sink } = makeBroker();
+  broker('p', 'windows.set-tint', { id: 7, t: { r: 0.5, g: 0.6, b: 0.7, a: 0.8 } });
+  assert.deepEqual(sink.calls[0],
+    { method: 'setSurfaceTint', id: 7, t: { r: 0.5, g: 0.6, b: 0.7, a: 0.8 } });
+});
+
+test('set-tint: partial tint (only r) is accepted', () => {
+  const { broker, sink } = makeBroker();
+  broker('p', 'windows.set-tint', { id: 7, t: { r: 0 } });
+  assert.deepEqual(sink.calls[0].t, { r: 0 });
+});
+
+test('set-tint: empty object (identity) is accepted', () => {
+  const { broker, sink } = makeBroker();
+  broker('p', 'windows.set-tint', { id: 7, t: {} });
+  assert.deepEqual(sink.calls[0].t, {});
+});
+
+test('set-tint: non-finite channel throws', () => {
+  const { broker } = makeBroker();
+  assert.throws(() => broker('p', 'windows.set-tint', { id: 1, t: { r: NaN } }),
+    /malformed payload/);
+  assert.throws(() => broker('p', 'windows.set-tint', { id: 1, t: { g: Infinity } }),
+    /malformed payload/);
+});
+
+test('set-tint: non-number channel throws', () => {
+  const { broker } = makeBroker();
+  assert.throws(() => broker('p', 'windows.set-tint', { id: 1, t: { b: 'dark' } }),
+    /malformed payload/);
+});
+
+test('set-tint: missing id throws', () => {
+  const { broker } = makeBroker();
+  assert.throws(() => broker('p', 'windows.set-tint', { t: {} }), /malformed payload/);
+});
+
+test('set-tint: sink without setSurfaceTint -> not supported', () => {
+  const bare = {
+    setSurfaceLayout() {}, setStack() {}, setLayerSurfaces() {},
+    setSurfaceTexture() {}, commitSurfaceBuffer() {}, commitSurfaceDmabuf() {},
+    removeSurface() {}, takeImportedSurfaces() { return []; },
+    takeFreedBuffers() { return []; }, afterCurrentFrame() {}, renderFrame() {},
+    // no setSurfaceTint
+  };
+  const { broker } = makeBroker(bare);
+  assert.throws(() => broker('p', 'windows.set-tint', { id: 1, t: {} }),
+    /not supported/);
+});
+
+// ---- set-color-matrix -------------------------------------------------------
+
+const IDENTITY_MAT = [
+  1, 0, 0, 0,
+  0, 1, 0, 0,
+  0, 0, 1, 0,
+  0, 0, 0, 1,
+];
+
+test('set-color-matrix: forwards a 16-number array', () => {
+  const { broker, sink } = makeBroker();
+  broker('p', 'windows.set-color-matrix', { id: 7, m: IDENTITY_MAT });
+  assert.deepEqual(sink.calls[0],
+    { method: 'setSurfaceColorMatrix', id: 7, m: IDENTITY_MAT });
+});
+
+test('set-color-matrix: null clears (identity)', () => {
+  const { broker, sink } = makeBroker();
+  broker('p', 'windows.set-color-matrix', { id: 7, m: null });
+  assert.deepEqual(sink.calls[0],
+    { method: 'setSurfaceColorMatrix', id: 7, m: null });
+});
+
+test('set-color-matrix: wrong length throws', () => {
+  const { broker } = makeBroker();
+  assert.throws(() => broker('p', 'windows.set-color-matrix',
+    { id: 1, m: [1, 2, 3] }), /malformed payload/);
+  assert.throws(() => broker('p', 'windows.set-color-matrix',
+    { id: 1, m: new Array(17).fill(0) }), /malformed payload/);
+});
+
+test('set-color-matrix: non-array throws', () => {
+  const { broker } = makeBroker();
+  assert.throws(() => broker('p', 'windows.set-color-matrix',
+    { id: 1, m: { 0: 1 } }), /malformed payload/);
+  assert.throws(() => broker('p', 'windows.set-color-matrix',
+    { id: 1, m: 'identity' }), /malformed payload/);
+});
+
+test('set-color-matrix: non-finite entry throws', () => {
+  const { broker } = makeBroker();
+  const bad = [...IDENTITY_MAT];
+  bad[5] = NaN;
+  assert.throws(() => broker('p', 'windows.set-color-matrix', { id: 1, m: bad }),
+    /malformed payload/);
+});
+
+test('set-color-matrix: missing id throws', () => {
+  const { broker } = makeBroker();
+  assert.throws(() => broker('p', 'windows.set-color-matrix', { m: IDENTITY_MAT }),
+    /malformed payload/);
+});
+
+test('set-color-matrix: sink without setSurfaceColorMatrix -> not supported', () => {
+  const bare = {
+    setSurfaceLayout() {}, setStack() {}, setLayerSurfaces() {},
+    setSurfaceTexture() {}, commitSurfaceBuffer() {}, commitSurfaceDmabuf() {},
+    removeSurface() {}, takeImportedSurfaces() { return []; },
+    takeFreedBuffers() { return []; }, afterCurrentFrame() {}, renderFrame() {},
+    // no setSurfaceColorMatrix
+  };
+  const { broker } = makeBroker(bare);
+  assert.throws(() => broker('p', 'windows.set-color-matrix', { id: 1, m: null }),
     /not supported/);
 });

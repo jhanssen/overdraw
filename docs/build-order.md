@@ -11,12 +11,20 @@ what is actually built today is in `status.md`.
 
 ## Status
 
-Phases 0a, 0b, 0c, 0d, 0e, 1, 2, 3, 4, 4.5, 5, and 5b (both
+Phases 0a, 0b, 0c, 0d, 0e, 1, 2, 3, 4, 4.5, 5, 5b (both
 snapshot + live halves of cross-device dmabuf compose for Worker
-plugins) are landed (see `git log` and `status.md`). Phase 5.5
-(core effect primitives) is next. The text below describes each
-phase in its original forward-looking shape; ✅ marks the completed
-ones inline.
+plugins), and 5.5a (tint + color matrix per-surface primitives)
+are landed (see `git log` and `status.md`). Phase 6 (workspaces
+plugin) is next. The text below describes each phase in its
+original forward-looking shape; ✅ marks the completed ones inline.
+
+Deferred: 5.5b (3D LUT) -- skip until a real consumer wants it.
+Phase 5b's `sdk.compose.windows` for Worker plugins (the per-
+window-crop variant; `sdk.compose.scene` is built for both
+transports). Loud-not-silent: Worker callers get an explicit
+"not yet implemented" throw. Deferred until a real use case
+forces it; an overview/thumbnail plugin in Phase 6 or later
+is likely to drive its design.
 
 ## Principle
 
@@ -497,7 +505,7 @@ Tests:
   proves the cross-device fence chain correctly delivers
   producer writes to consumer reads.)
 
-## Phase 5.5 — Core effect primitives
+## Phase 5.5 — Core effect primitives ✅ (5.5a)
 
 Small expansion of the per-surface state primitives Phase 4 added. These
 are effects expressible as values fed into the existing WGSL pipeline —
@@ -514,19 +522,26 @@ corners (mask = corner-alpha texture) and soft-shadow alpha falloff;
 `customization.md:171-175` is explicit about this. So those are not
 listed below — they already work.
 
-### 5.5a. Tint + color matrix
+### 5.5a. Tint + color matrix ✅
 
-- `sdk.windows.setSurfaceTint(id, rgba)` — one extra uniform, multiplied
+- `sdk.windows.setTint(id, rgba)` — one extra uniform, multiplied
   into the sampled surface pixel before the existing alpha/mask/opacity
   modulation. Default `{1,1,1,1}` = identity.
-- `sdk.windows.setSurfaceColorMatrix(id, mat4)` — single 4×4 multiplication
-  on the sampled RGBA. Covers saturation, hue rotation, contrast,
-  brightness, and arbitrary linear color transforms in one primitive.
-  Default = identity matrix.
-- Compositor side: extend the WGSL `Uniforms` struct, update
-  `updateUniforms`, add two setters paralleling `setSurfaceOpacity` etc.
-- Windows-broker plumbing matching the existing setters.
-- ~80 lines of compositor + WGSL + broker.
+- `sdk.windows.setColorMatrix(id, mat4 | null)` — single 4×4 multiplication
+  on the sampled RGBA (column-major, matching WGSL `mat4x4f`). Covers
+  saturation, hue rotation, contrast, brightness, and arbitrary linear
+  color transforms in one primitive. Default = identity matrix; `null`
+  restores identity.
+- Compositor side: WGSL `Uniforms` extended (160 bytes total), fragment
+  shader applies `colorMatrix * surf` then `surf * tint` before the
+  existing coverage/alpha modulation. Two new setters
+  (`setSurfaceTint` / `setSurfaceColorMatrix`) parallel `setSurfaceOpacity`
+  etc.
+- Windows-broker: `windows.set-tint` / `windows.set-color-matrix` routes.
+- Tests: pure-unit broker (rejects malformed payloads, "not supported"
+  surface), SDK end-to-end via the windows-driver fixture plugin, GPU
+  pixel (swap-rg matrix turns red to green; tint halves a channel;
+  identity defaults; matrix-before-tint ordering; `null` clears).
 
 ### 5.5b. (Optional) 3D LUT
 

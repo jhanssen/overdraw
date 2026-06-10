@@ -18,11 +18,13 @@
 // outward by outputMargin, then textured and modulated by an alpha mask.
 //
 // Uniform layout (one vec4 per slot, std140-aligned):
-//   placement (vec4): x, y, w, h          -- normalized [0,1] output space
-//   transform (vec4): tx, ty, sx, sy      -- translate (normalized), scale (unitless)
-//   margin    (vec4): top, right, bottom, left  -- normalized output px
-//   fx        (vec4): opacity, _, _, _
-//   cropUV    (vec4): u0, v0, u1, v1      -- surface-texture UV range to sample
+//   placement   (vec4):     x, y, w, h          -- normalized [0,1] output space
+//   transform   (vec4):     tx, ty, sx, sy      -- translate (normalized), scale (unitless)
+//   margin      (vec4):     top, right, bottom, left  -- normalized output px
+//   fx          (vec4):     opacity, _, _, _
+//   cropUV      (vec4):     u0, v0, u1, v1      -- surface-texture UV range to sample
+//   tint        (vec4):     r, g, b, a          -- per-channel multiplier; identity = (1,1,1,1)
+//   colorMatrix (mat4x4f):  4 column vectors    -- applied to sampled rgba; identity by default
 //
 // transform.scale anchors at the placement's top-left; an animation wanting
 // center-anchored scale composes that as translate + scale + counter-translate
@@ -33,6 +35,18 @@
 // default). compose.windows uses non-identity cropUV when its caller passes
 // a source-crop rect: the crop's surface-local pixel coords are normalized
 // into UV and packed here, so the (cropped) region fills the rendered surface.
+//
+// tint + colorMatrix operate on the SAMPLED premultiplied RGBA -- the bytes
+// the client commits are already premultiplied, and the existing
+// coverage/alpha modulation (inside * mAlpha * opacity) is a scalar applied
+// after. Identity is tint = (1,1,1,1) and colorMatrix = identity (no change).
+// Order: surf = textureSample(...); surf = colorMatrix * surf; surf = surf * tint;
+// then multiply by inside * mAlpha * opacity. Common cases:
+//   - Saturation / brightness / contrast / hue rotation -> colorMatrix.
+//   - Per-channel scale (dim red channel, etc.) -> tint.
+//   - Workspace inactive dim: tint = (0.5, 0.5, 0.5, 1).
+// Effects that need to read neighbor pixels (blur, distortion) are not
+// expressible here -- they're for the buffer-intercept path (Phase 10).
 //
 // outputMargin reserves canvas around the surface's nominal rect. The mask
 // is sampled across the FULL expanded region (margin included) and its alpha
@@ -52,11 +66,13 @@ struct VsOut {
   @location(1) maskUV : vec2f,
 };
 struct Uniforms {
-  placement : vec4f,
-  transform : vec4f,
-  margin    : vec4f,
-  fx        : vec4f,
-  cropUV    : vec4f,
+  placement   : vec4f,
+  transform   : vec4f,
+  margin      : vec4f,
+  fx          : vec4f,
+  cropUV      : vec4f,
+  tint        : vec4f,
+  colorMatrix : mat4x4f,
 };
 @group(0) @binding(2) var<uniform> u : Uniforms;
 @vertex fn vs(@builtin(vertex_index) i : u32) -> VsOut {
@@ -111,9 +127,15 @@ struct Uniforms {
   // render a sub-region of a surface). Default cropUV = (0,0,1,1) =
   // identity (sample the full texture).
   let sampleUV = mix(u.cropUV.xy, u.cropUV.zw, in.surfUV);
-  let surf = textureSampleLevel(tex, samp, sampleUV, 0.0);
+  var surf = textureSampleLevel(tex, samp, sampleUV, 0.0);
   let inside = step(0.0, in.surfUV.x) * step(in.surfUV.x, 1.0)
              * step(0.0, in.surfUV.y) * step(in.surfUV.y, 1.0);
+
+  // Color transform on the sampled premultiplied rgba: matrix first, then
+  // per-channel tint. Identity matrix + tint = (1,1,1,1) leaves surf
+  // unchanged (the default).
+  surf = u.colorMatrix * surf;
+  surf = surf * u.tint;
 
   // Premultiplied: rgb and alpha both multiplied by inside * mAlpha * opacity.
   // Matches the pipeline's premultiplied blend.
@@ -197,14 +219,22 @@ interface SurfaceFx {
   // shape pixels in the reserved area (soft rounded-corner falloff,
   // decoration-bound shadow alpha, etc.).
   marginTop: number; marginRight: number; marginBottom: number; marginLeft: number;
+  // Per-channel tint multiplier on the sampled rgba (after colorMatrix).
+  // Identity = (1,1,1,1).
+  tintR: number; tintG: number; tintB: number; tintA: number;
+  // 4x4 color matrix applied to the sampled rgba (column-major: 16 floats
+  // = 4 columns of 4 components). Identity by default. WGSL mat4x4f is
+  // column-major; we pack the same way.
+  colorMatrix: Float32Array;
 }
 
 interface Surface {
   texture: GPUTexture | null;       // bgra8unorm, sampled
   view: GPUTextureView | null;
-  // 80-byte uniform buffer holding the WGSL Uniforms struct (5 vec4s:
-  // placement, transform, margin, fx, cropUV). Rebuilt on size change
-  // like the bind group; updated each frame via writeBuffer.
+  // 160-byte uniform buffer holding the WGSL Uniforms struct (6 vec4s:
+  // placement, transform, margin, fx, cropUV, tint; plus a mat4x4f
+  // colorMatrix = 4 more vec4s). Rebuilt on size change like the bind
+  // group; updated each frame via writeBuffer.
   uniformBuf: GPUBuffer | null;
   bindGroup: GPUBindGroup | null;
   width: number;
@@ -227,7 +257,16 @@ interface Surface {
   maskView: GPUTextureView | null;
 }
 
-const UNIFORM_BYTES = 80;
+// 6 vec4s (placement, transform, margin, fx, cropUV, tint) + 1 mat4x4f
+// (colorMatrix, packed as 4 vec4 columns) = 10 vec4s = 40 floats = 160 bytes.
+const UNIFORM_BYTES = 160;
+const UNIFORM_FLOATS = UNIFORM_BYTES / 4;
+
+function identityColorMatrix(): Float32Array {
+  const m = new Float32Array(16);
+  m[0] = 1; m[5] = 1; m[10] = 1; m[15] = 1;
+  return m;
+}
 
 function defaultFx(): SurfaceFx {
   return {
@@ -235,6 +274,8 @@ function defaultFx(): SurfaceFx {
     translateX: 0, translateY: 0,
     scaleX: 1, scaleY: 1,
     marginTop: 0, marginRight: 0, marginBottom: 0, marginLeft: 0,
+    tintR: 1, tintG: 1, tintB: 1, tintA: 1,
+    colorMatrix: identityColorMatrix(),
   };
 }
 
@@ -271,8 +312,9 @@ interface DmabufDescriptor {
 const DEFAULT_FORMAT = "bgra8unorm";
 
 // Public payloads for the per-surface render-state setters
-// (setSurfaceTransform, setSurfaceOutputMargin). Each field is optional so
-// callers may partially update; missing fields reset to the identity / zero.
+// (setSurfaceTransform, setSurfaceOutputMargin, setSurfaceTint). Each field
+// is optional so callers may partially update; missing fields reset to the
+// identity / zero.
 export interface SurfaceTransform {
   translateX?: number;
   translateY?: number;
@@ -285,6 +327,19 @@ export interface SurfaceMargin {
   bottom?: number;
   left?: number;
 }
+// Per-channel tint multiplier on the sampled rgba (after colorMatrix).
+// Missing fields default to 1 (identity, no change to that channel).
+export interface SurfaceTint {
+  r?: number;
+  g?: number;
+  b?: number;
+  a?: number;
+}
+// 4x4 color matrix applied to the sampled rgba. Caller passes 16 numbers in
+// column-major order (matching WGSL mat4x4f layout). Identity has 1s on the
+// diagonal and 0s elsewhere; that is the default if a surface has never had
+// setSurfaceColorMatrix called.
+export type ColorMatrix = readonly number[] | Float32Array;
 
 function clamp(v: number, lo: number, hi: number): number {
   return v < lo ? lo : v > hi ? hi : v;
@@ -561,6 +616,33 @@ export class JsCompositor implements CompositorSink {
     fx.marginRight = m.right ?? 0;
     fx.marginBottom = m.bottom ?? 0;
     fx.marginLeft = m.left ?? 0;
+  }
+
+  setSurfaceTint(id: number, t: SurfaceTint): void {
+    const fx = this.ensureSurface(id).fx;
+    fx.tintR = t.r ?? 1;
+    fx.tintG = t.g ?? 1;
+    fx.tintB = t.b ?? 1;
+    fx.tintA = t.a ?? 1;
+  }
+
+  // Install a 4x4 color matrix applied to the sampled rgba each frame. The
+  // caller passes 16 numbers in column-major order (WGSL mat4x4f layout).
+  // null restores the identity matrix.
+  setSurfaceColorMatrix(id: number, m: ColorMatrix | null): void {
+    const fx = this.ensureSurface(id).fx;
+    if (m === null) {
+      fx.colorMatrix = identityColorMatrix();
+      return;
+    }
+    if (m.length !== 16) {
+      throw new Error(`setSurfaceColorMatrix: expected 16 numbers, got ${m.length}`);
+    }
+    // Defensive copy: the caller's array is theirs to mutate without
+    // affecting subsequent frames.
+    const dst = new Float32Array(16);
+    for (let i = 0; i < 16; i++) dst[i] = m[i] ?? 0;
+    fx.colorMatrix = dst;
   }
 
   // Install (or clear) an alpha mask on a surface. The mask is sampled across
@@ -962,7 +1044,7 @@ export class JsCompositor implements CompositorSink {
     const pw = overrides?.placement?.w ?? (s.layoutW || s.width);
     const ph = overrides?.placement?.h ?? (s.layoutH || s.height);
     const fx = s.fx;
-    const data = new Float32Array(UNIFORM_BYTES / 4);
+    const data = new Float32Array(UNIFORM_FLOATS);
     // placement
     data[0] = px / ow; data[1] = py / oh;
     data[2] = pw / ow; data[3] = ph / oh;
@@ -980,6 +1062,11 @@ export class JsCompositor implements CompositorSink {
     const cu = overrides?.cropUV;
     data[16] = cu?.u0 ?? 0; data[17] = cu?.v0 ?? 0;
     data[18] = cu?.u1 ?? 1; data[19] = cu?.v1 ?? 1;
+    // tint: r, g, b, a (defaults identity = (1,1,1,1))
+    data[20] = fx.tintR; data[21] = fx.tintG;
+    data[22] = fx.tintB; data[23] = fx.tintA;
+    // colorMatrix: 4 column vectors of 4 components each (mat4x4f, column-major)
+    data.set(fx.colorMatrix, 24);
     this.device.queue.writeBuffer(s.uniformBuf, 0, data);
   }
 

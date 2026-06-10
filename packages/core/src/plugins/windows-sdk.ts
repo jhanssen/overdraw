@@ -38,6 +38,25 @@ export interface SurfaceMargin {
   left?: number;
 }
 
+// Per-channel tint multiplier on the sampled rgba (Phase 5.5a). Identity is
+// (1,1,1,1); missing fields default to 1 (no change to that channel).
+// Examples: dim to half = { r: 0.5, g: 0.5, b: 0.5 }; suppress red =
+// { r: 0 }; fade alpha = { a: 0.5 }.
+export interface SurfaceTint {
+  r?: number;
+  g?: number;
+  b?: number;
+  a?: number;
+}
+
+// 4x4 color matrix applied to the sampled rgba before the per-channel tint
+// (Phase 5.5a). Caller passes 16 numbers in COLUMN-MAJOR order, matching
+// WGSL mat4x4f. Identity = [1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1]. Covers
+// saturation, hue rotation, contrast, brightness, channel swap. Anything
+// needing neighbor pixels (blur, distortion) is for the buffer-intercept
+// path (Phase 10), not core primitives.
+export type ColorMatrix = readonly number[] | Float32Array;
+
 // Snapshot of a window. Matches WindowSnapshot in wm/index.ts (kept in sync
 // by hand because wm/ is core-side; this is what arrives over the wire).
 export interface WindowSnapshot {
@@ -103,6 +122,16 @@ export interface PluginWindows extends PluginWindowObserver {
   // boundary -- their textures live on a separate device, so the cross-device
   // mask path is unimplemented; calling this from a Worker plugin rejects.
   setMask(id: number, mask: GPUTexture | null): Promise<void>;
+
+  // Per-channel tint multiplier on the sampled rgba (Phase 5.5a). Identity
+  // = (1,1,1,1); missing fields default to 1. Cheap (uniform write next
+  // frame).
+  setTint(id: number, t: SurfaceTint): Promise<void>;
+
+  // 4x4 color matrix applied to the sampled rgba BEFORE the tint (Phase
+  // 5.5a). Pass 16 numbers in column-major order (WGSL mat4x4f). null
+  // restores identity.
+  setColorMatrix(id: number, m: ColorMatrix | null): Promise<void>;
 }
 
 // The single-output placeholder id (kept in sync with OUTPUT_DEFAULT in
@@ -240,6 +269,29 @@ export function createPluginWindows(
       // eslint-disable-next-line no-restricted-syntax
       await endpoint.request("windows.set-mask", { id, mask: mask as unknown as Json });
     },
+
+    async setTint(id, t): Promise<void> {
+      if (typeof id !== "number") {
+        throw new TypeError("setTint id must be a number");
+      }
+      validateTint(t);
+      // eslint-disable-next-line no-restricted-syntax
+      await endpoint.request("windows.set-tint", { id, t: t as unknown as Json });
+    },
+
+    async setColorMatrix(id, m): Promise<void> {
+      if (typeof id !== "number") {
+        throw new TypeError("setColorMatrix id must be a number");
+      }
+      if (m !== null) validateColorMatrix(m);
+      // Float32Array is structured-clone-safe; plain number[] is Json.
+      // Cast through Json at the boundary so the type matches endpoint.request.
+      const payload = m === null
+        ? null
+        : (m instanceof Float32Array ? Array.from(m) : m);
+      // eslint-disable-next-line no-restricted-syntax
+      await endpoint.request("windows.set-color-matrix", { id, m: payload as unknown as Json });
+    },
   };
 
   return {
@@ -276,6 +328,34 @@ function validateMargin(m: SurfaceMargin): void {
     const v = m[k];
     if (v !== undefined && (typeof v !== "number" || !Number.isFinite(v) || v < 0)) {
       throw new TypeError(`setOutputMargin ${k} must be a non-negative finite number`);
+    }
+  }
+}
+
+function validateTint(t: SurfaceTint): void {
+  if (typeof t !== "object" || t === null) {
+    throw new TypeError("setTint t must be an object");
+  }
+  for (const k of ["r", "g", "b", "a"] as const) {
+    const v = t[k];
+    if (v !== undefined && (typeof v !== "number" || !Number.isFinite(v))) {
+      throw new TypeError(`setTint ${k} must be a finite number`);
+    }
+  }
+}
+
+function validateColorMatrix(m: ColorMatrix): void {
+  // Accept readonly number[] or Float32Array; both are ArrayLike<number>.
+  if (!Array.isArray(m) && !(m instanceof Float32Array)) {
+    throw new TypeError("setColorMatrix m must be an array of 16 numbers or null");
+  }
+  if (m.length !== 16) {
+    throw new TypeError(`setColorMatrix m must have 16 entries, got ${m.length}`);
+  }
+  for (let i = 0; i < 16; i++) {
+    const v = m[i];
+    if (typeof v !== "number" || !Number.isFinite(v)) {
+      throw new TypeError(`setColorMatrix m[${i}] must be a finite number`);
     }
   }
 }

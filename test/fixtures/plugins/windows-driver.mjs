@@ -13,6 +13,8 @@
 //  11 = setOpacity(targetId, 0.5)
 //  12 = setTransform(targetId, {translateX:10, translateY:20, scaleX:2, scaleY:2})
 //  13 = setOutputMargin(targetId, {top:4, right:8, bottom:12, left:16})
+//  14 = setTint(targetId, {r:0.5, g:0.6, b:0.7, a:1})
+//  15 = setColorMatrix(targetId, identity-16-array)
 //
 // targetId is provided via window.change events' surfaceId field (only the
 // LAST change event's surfaceId is used).
@@ -76,6 +78,21 @@ export default async function init(sdk) {
       await sdk.windows.setOutputMargin(targetId,
         { top: 4, right: 8, bottom: 12, left: 16 });
       sdk.log('set-output-margin');
+      return;
+    }
+    if (op === 14) {
+      await sdk.windows.setTint(targetId, { r: 0.5, g: 0.6, b: 0.7, a: 1 });
+      sdk.log('set-tint');
+      return;
+    }
+    if (op === 15) {
+      await sdk.windows.setColorMatrix(targetId, [
+        1, 0, 0, 0,
+        0, 1, 0, 0,
+        0, 0, 1, 0,
+        0, 0, 0, 1,
+      ]);
+      sdk.log('set-color-matrix');
       return;
     }
   });

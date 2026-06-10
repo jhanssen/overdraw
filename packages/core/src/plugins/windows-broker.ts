@@ -62,8 +62,30 @@ export function createWindowsBroker(deps: WindowsBrokerDeps): WindowsBroker {
     if (method === "windows.set-transform") return handleSetTransform(params);
     if (method === "windows.set-output-margin") return handleSetOutputMargin(params);
     if (method === "windows.set-mask") return handleSetMask(params);
+    if (method === "windows.set-tint") return handleSetTint(params);
+    if (method === "windows.set-color-matrix") return handleSetColorMatrix(params);
     return NOT_HANDLED;
   };
+
+  function handleSetTint(p: unknown): null {
+    if (!isSetTintPayload(p)) throw new Error("windows.set-tint: malformed payload");
+    if (!compositor.setSurfaceTint) {
+      throw new Error("windows.set-tint: not supported by this compositor");
+    }
+    compositor.setSurfaceTint(p.id, p.t);
+    return null;
+  }
+
+  function handleSetColorMatrix(p: unknown): null {
+    if (!isSetColorMatrixPayload(p)) {
+      throw new Error("windows.set-color-matrix: malformed payload");
+    }
+    if (!compositor.setSurfaceColorMatrix) {
+      throw new Error("windows.set-color-matrix: not supported by this compositor");
+    }
+    compositor.setSurfaceColorMatrix(p.id, p.m);
+    return null;
+  }
 
   function handleSetMask(p: unknown): null {
     if (!isSetMaskPayload(p)) throw new Error("windows.set-mask: malformed payload");
@@ -266,4 +288,36 @@ function isSetMaskPayload(d: unknown): d is { id: number; mask: GPUTexture | nul
   // without false positives. Accept null or "looks like an object" and
   // let the compositor surface a clear error if the wrong thing was passed.
   return o.mask === null || typeof o.mask === "object";
+}
+
+function isSetTintPayload(d: unknown): d is {
+  id: number; t: import("../gpu/compositor.js").SurfaceTint;
+} {
+  if (typeof d !== "object" || d === null) return false;
+  const o = d as { [k: string]: unknown };
+  if (typeof o.id !== "number") return false;
+  if (typeof o.t !== "object" || o.t === null) return false;
+  const t = o.t as { [k: string]: unknown };
+  for (const k of ["r", "g", "b", "a"]) {
+    const v = t[k];
+    if (v !== undefined && (typeof v !== "number" || !Number.isFinite(v))) return false;
+  }
+  return true;
+}
+
+function isSetColorMatrixPayload(d: unknown): d is {
+  id: number; m: import("../gpu/compositor.js").ColorMatrix | null;
+} {
+  if (typeof d !== "object" || d === null) return false;
+  const o = d as { [k: string]: unknown };
+  if (typeof o.id !== "number") return false;
+  if (o.m === null) return true;
+  if (!Array.isArray(o.m) && !(o.m instanceof Float32Array)) return false;
+  const m = o.m as ArrayLike<unknown>;
+  if (m.length !== 16) return false;
+  for (let i = 0; i < 16; i++) {
+    const v = m[i];
+    if (typeof v !== "number" || !Number.isFinite(v)) return false;
+  }
+  return true;
 }

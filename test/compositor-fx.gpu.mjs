@@ -302,6 +302,165 @@ test("per-surface render state primitives (opacity/transform/outputMargin)",
       assert.deepEqual(px(data, 32, 32), [0, 0, 0, 255], "surface 1 masked out");
       assert.deepEqual(px(data, 96, 32), [0, 255, 0, 255], "surface 2 unmasked = green");
     });
+
+    // ---- Phase 5.5a: tint + color matrix ------------------------------------
+
+    await t.test("setSurfaceTint: per-channel scale on the sampled rgba", async () => {
+      const comp = new JsCompositor(device, dawn.globals, addon, { width: W, height: H });
+      comp.uploadPixels(1, { width: SZ, height: SZ, stride: red.stride }, red.data);
+      comp.setSurfaceLayout(1, 0, 0, SZ, SZ);
+      comp.setStack([1]);
+
+      // Halve the R channel; leave the others identity.
+      comp.setSurfaceTint(1, { r: 0.5 });
+      comp.renderFrame();
+      const { data } = await comp.readback();
+      const [b, g, r, a] = px(data, 32, 32);
+      assert.equal(b, 0);
+      assert.equal(g, 0);
+      assert.ok(Math.abs(r - 128) <= 1, `red ~= 128 got ${r}`);
+      assert.equal(a, 255);
+    });
+
+    await t.test("setSurfaceTint: identity (default) leaves the surface unchanged",
+      async () => {
+      const comp = new JsCompositor(device, dawn.globals, addon, { width: W, height: H });
+      comp.uploadPixels(1, { width: SZ, height: SZ, stride: red.stride }, red.data);
+      comp.setSurfaceLayout(1, 0, 0, SZ, SZ);
+      comp.setStack([1]);
+
+      // No setSurfaceTint call -- default tint is (1,1,1,1).
+      comp.renderFrame();
+      let { data } = await comp.readback();
+      assert.deepEqual(px(data, 32, 32), [0, 0, 255, 255], "default tint = identity");
+
+      // Explicit identity (empty object -> all fields default to 1).
+      comp.setSurfaceTint(1, {});
+      comp.renderFrame();
+      ({ data } = await comp.readback());
+      assert.deepEqual(px(data, 32, 32), [0, 0, 255, 255], "explicit identity tint");
+    });
+
+    await t.test("setSurfaceTint: zero on all rgb channels blacks the surface",
+      async () => {
+      const comp = new JsCompositor(device, dawn.globals, addon, { width: W, height: H });
+      comp.uploadPixels(1, { width: SZ, height: SZ, stride: red.stride }, red.data);
+      comp.setSurfaceLayout(1, 0, 0, SZ, SZ);
+      comp.setStack([1]);
+
+      comp.setSurfaceTint(1, { r: 0, g: 0, b: 0 });
+      comp.renderFrame();
+      const { data } = await comp.readback();
+      // rgb gone; surf.a stays 1, so alpha modulation outputs (0,0,0,1).
+      assert.deepEqual(px(data, 32, 32), [0, 0, 0, 255], "rgb tinted to zero");
+    });
+
+    await t.test("setSurfaceColorMatrix: swap-rg matrix turns red into green",
+      async () => {
+      const comp = new JsCompositor(device, dawn.globals, addon, { width: W, height: H });
+      comp.uploadPixels(1, { width: SZ, height: SZ, stride: red.stride }, red.data);
+      comp.setSurfaceLayout(1, 0, 0, SZ, SZ);
+      comp.setStack([1]);
+
+      // Column-major 4x4 matrix that maps (r,g,b,a) -> (g,r,b,a). Each
+      // 4-tuple below is one COLUMN (not one row).
+      const swapRG = [
+        0, 1, 0, 0,  // column 0: contributes (g=col0[0]=0, r=col0[1]=1, b=col0[2]=0, a=col0[3]=0) for input r
+        1, 0, 0, 0,  // column 1: r=1 from input g, etc.
+        0, 0, 1, 0,
+        0, 0, 0, 1,
+      ];
+      comp.setSurfaceColorMatrix(1, swapRG);
+      comp.renderFrame();
+      const { data } = await comp.readback();
+      // Sampled red (r=1,g=0,b=0,a=1) -> matrix -> (r=0,g=1,b=0,a=1) = green.
+      // Framebuffer BGRA bytes: B=0,G=255,R=0,A=255.
+      assert.deepEqual(px(data, 32, 32), [0, 255, 0, 255], "swap-rg matrix turns red to green");
+    });
+
+    await t.test("setSurfaceColorMatrix: identity is the default (no change)",
+      async () => {
+      const comp = new JsCompositor(device, dawn.globals, addon, { width: W, height: H });
+      comp.uploadPixels(1, { width: SZ, height: SZ, stride: red.stride }, red.data);
+      comp.setSurfaceLayout(1, 0, 0, SZ, SZ);
+      comp.setStack([1]);
+
+      // No setSurfaceColorMatrix call -- default is identity.
+      comp.renderFrame();
+      let { data } = await comp.readback();
+      assert.deepEqual(px(data, 32, 32), [0, 0, 255, 255], "default = identity");
+
+      // Explicit identity.
+      comp.setSurfaceColorMatrix(1, [
+        1, 0, 0, 0,
+        0, 1, 0, 0,
+        0, 0, 1, 0,
+        0, 0, 0, 1,
+      ]);
+      comp.renderFrame();
+      ({ data } = await comp.readback());
+      assert.deepEqual(px(data, 32, 32), [0, 0, 255, 255], "explicit identity");
+
+      // null also restores identity (test the clear path after a non-identity).
+      comp.setSurfaceColorMatrix(1, [
+        0, 1, 0, 0,
+        1, 0, 0, 0,
+        0, 0, 1, 0,
+        0, 0, 0, 1,
+      ]);  // swap-rg
+      comp.renderFrame();
+      ({ data } = await comp.readback());
+      assert.deepEqual(px(data, 32, 32), [0, 255, 0, 255], "swap-rg in effect");
+      comp.setSurfaceColorMatrix(1, null);
+      comp.renderFrame();
+      ({ data } = await comp.readback());
+      assert.deepEqual(px(data, 32, 32), [0, 0, 255, 255], "null cleared swap-rg");
+    });
+
+    await t.test("setSurfaceColorMatrix + tint: matrix applied before tint",
+      async () => {
+      const comp = new JsCompositor(device, dawn.globals, addon, { width: W, height: H });
+      comp.uploadPixels(1, { width: SZ, height: SZ, stride: red.stride }, red.data);
+      comp.setSurfaceLayout(1, 0, 0, SZ, SZ);
+      comp.setStack([1]);
+
+      // Swap r and g, then halve the resulting g channel via tint. Input red
+      // (r=1,g=0,b=0) -> matrix -> (r=0,g=1,b=0) -> tint*(g=0.5) -> (r=0,g=0.5,b=0).
+      const swapRG = [
+        0, 1, 0, 0,
+        1, 0, 0, 0,
+        0, 0, 1, 0,
+        0, 0, 0, 1,
+      ];
+      comp.setSurfaceColorMatrix(1, swapRG);
+      comp.setSurfaceTint(1, { g: 0.5 });
+      comp.renderFrame();
+      const { data } = await comp.readback();
+      const [b, g, r, a] = px(data, 32, 32);
+      assert.equal(b, 0);
+      assert.equal(r, 0);
+      assert.ok(Math.abs(g - 128) <= 1, `green ~= 128 got ${g}`);
+      assert.equal(a, 255);
+    });
+
+    await t.test("setSurfaceColorMatrix accepts a Float32Array", async () => {
+      const comp = new JsCompositor(device, dawn.globals, addon, { width: W, height: H });
+      comp.uploadPixels(1, { width: SZ, height: SZ, stride: red.stride }, red.data);
+      comp.setSurfaceLayout(1, 0, 0, SZ, SZ);
+      comp.setStack([1]);
+
+      // Same swap-rg matrix as before but as a typed array.
+      const swap = new Float32Array([
+        0, 1, 0, 0,
+        1, 0, 0, 0,
+        0, 0, 1, 0,
+        0, 0, 0, 1,
+      ]);
+      comp.setSurfaceColorMatrix(1, swap);
+      comp.renderFrame();
+      const { data } = await comp.readback();
+      assert.deepEqual(px(data, 32, 32), [0, 255, 0, 255], "Float32Array works");
+    });
   } finally {
     addon.stop();
   }

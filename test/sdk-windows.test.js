@@ -37,6 +37,15 @@ function mockSink() {
     setSurfaceOutputMargin(id, m) {
       sink.fxCalls.push({ method: 'margin', id, m: { ...m } });
     },
+    setSurfaceTint(id, t) {
+      sink.fxCalls.push({ method: 'tint', id, t: { ...t } });
+    },
+    setSurfaceColorMatrix(id, m) {
+      sink.fxCalls.push({
+        method: 'color-matrix', id,
+        m: m === null ? null : [...m],
+      });
+    },
   };
   return sink;
 }
@@ -255,5 +264,25 @@ test('setOutputMargin: forwards margin to the compositor sink', async () => {
     await waitFor(() => findLog(events, 'set-output-margin'));
     assert.deepEqual(sink.fxCalls[0],
       { method: 'margin', id: 7, m: { top: 4, right: 8, bottom: 12, left: 16 } });
+  });
+});
+
+test('setTint: forwards tint to the compositor sink', async () => {
+  await withWindowsSetup(7, async ({ events, pluginBus, sink }) => {
+    trigger(pluginBus, 14);
+    await waitFor(() => findLog(events, 'set-tint'));
+    assert.deepEqual(sink.fxCalls[0],
+      { method: 'tint', id: 7, t: { r: 0.5, g: 0.6, b: 0.7, a: 1 } });
+  });
+});
+
+test('setColorMatrix: forwards 16-number array to the compositor sink', async () => {
+  await withWindowsSetup(7, async ({ events, pluginBus, sink }) => {
+    trigger(pluginBus, 15);
+    await waitFor(() => findLog(events, 'set-color-matrix'));
+    assert.deepEqual(sink.fxCalls[0], {
+      method: 'color-matrix', id: 7,
+      m: [1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1],
+    });
   });
 });

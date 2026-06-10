@@ -88,6 +88,12 @@ export interface CompositorSink {
   setSurfaceOpacity?(id: number, opacity: number): void;
   setSurfaceTransform?(id: number, t: import("../gpu/compositor.js").SurfaceTransform): void;
   setSurfaceOutputMargin?(id: number, m: import("../gpu/compositor.js").SurfaceMargin): void;
+  // Per-channel multiplier + 4x4 matrix on the sampled rgba (Phase 5.5a).
+  // The matrix is column-major (matching WGSL mat4x4f); null restores identity.
+  setSurfaceTint?(id: number, t: import("../gpu/compositor.js").SurfaceTint): void;
+  setSurfaceColorMatrix?(
+    id: number, m: import("../gpu/compositor.js").ColorMatrix | null,
+  ): void;
   // Alpha mask sampled across the surface + outputMargin region; .a modulates
   // the surface's alpha (and premultiplied rgb). null clears (default-white,
   // no visible effect). Caller owns the GPUTexture's lifetime. Reached from

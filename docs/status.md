@@ -4,7 +4,7 @@ Ground truth for what exists right now: current capabilities, known gaps, and
 what remains. The design lives in `architecture.md`; this file does not restate
 it. Present-tense only — no change history.
 
-Last updated: 2026-06-09 (post-Phase 5b — snapshot + live).
+Last updated: 2026-06-09 (post-Phase 5.5a — tint + color matrix).
 
 ## Read first: gaps in advertised protocols (silent-gap risks)
 
@@ -1045,6 +1045,51 @@ window crop variant). Deferred until a real use case forces it
 (the in-thread `compose.windows` works; Worker version throws a
 clear error).
 
+### Per-surface color primitives (Phase 5.5a)
+
+Tint + color matrix extend the existing per-surface uniform path
+(`setOpacity`/`setTransform`/`setMask`/`setOutputMargin`). One sample
+per pixel modulated by uniforms; no neighbor sampling. Effects that
+need to read neighbor pixels (blur, distortion) are for the buffer-
+intercept path (Phase 10), not core primitives.
+
+- **`sdk.windows.setTint(id, {r?, g?, b?, a?})`**
+  (`packages/core/src/plugins/windows-sdk.ts`,
+  `gpu/compositor.ts setSurfaceTint`): per-channel multiplier on the
+  sampled rgba. Missing fields default to 1 (identity). Common cases:
+  workspace inactive dim `{r:0.5, g:0.5, b:0.5}`; alpha fade `{a:0.5}`.
+- **`sdk.windows.setColorMatrix(id, mat4 | null)`**
+  (`gpu/compositor.ts setSurfaceColorMatrix`): 4x4 column-major matrix
+  applied to the sampled rgba BEFORE the tint. Caller passes 16
+  numbers (or a `Float32Array`); `null` restores identity. Covers
+  saturation, hue rotation, contrast, brightness, channel swap,
+  arbitrary linear color transforms.
+- **WGSL**: `Uniforms` extended with `tint vec4f` (slot 5) and
+  `colorMatrix mat4x4f` (slots 6-9 as 4 column vectors). Total
+  uniform size 160 bytes (was 80). Fragment shader applies
+  `surf = colorMatrix * surf; surf = surf * tint;` before the
+  existing `inside * mAlpha * opacity` modulation. Identity
+  defaults make the rendering byte-identical to pre-5.5a when no
+  plugin has touched these values.
+- **Broker** (`packages/core/src/plugins/windows-broker.ts`):
+  `windows.set-tint` / `windows.set-color-matrix` routes; SDK-side
+  validation in `windows-sdk.ts` (finite numbers; matrix length =
+  16); broker re-validates at the boundary.
+- **Tests**: pure-unit
+  (`test/windows-broker-fx.test.js`: 13 new tests on payload
+  validation + sink-missing-method rejection;
+  `test/sdk-windows.test.js`: 2 end-to-end Worker round-trips
+  through the driver fixture). GPU
+  (`test/compositor-fx.gpu.mjs`: 7 new tests on identity defaults,
+  per-channel tint scaling, swap-rg matrix, matrix-before-tint
+  order, `Float32Array` accepted, `null` clears).
+
+75/75 GPU tests pass (was 68 pre-5.5a; +7 from compositor-fx).
+479/479 unit tests pass.
+
+**Skipped**: 5.5b (3D LUT) -- per build-order.md, skip until a real
+consumer wants it.
+
 ### Decoration provider (registration + insets + drawing + atomic gating)
 
 Server-side decorations end to end: a plugin registers an app_id pattern, is told
@@ -1267,8 +1312,9 @@ capabilities exist to grant).
   `setOutputMargin` / `setMask` (Phase 4a); declarative animation
   evaluator `sdk.animations.run` / `cancel` with tween + spring +
   sequence + parallel (Phase 4b); `@overdraw/sdk-anim` plugin-side
-  spec builders (Phase 4c). Not built:
-  `sdk.compose` / `sdk.transitions` (Phases 5, 8); cursor / closing /
+  spec builders (Phase 4c); per-surface tint + 4x4 color matrix
+  primitives `setTint` / `setColorMatrix` (Phase 5.5a). Not built:
+  `sdk.transitions` (Phase 8); cursor / closing /
   velocity (Phase 9); input chain (`sdk.input.bind`, Phase 7); output
   observation beyond a fabricated `wl_output`; protocol SDK surface;
   interactive-region hit-testing; `sdk.onFrame` (Phase 5+).
