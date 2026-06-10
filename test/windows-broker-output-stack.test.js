@@ -14,19 +14,20 @@ function mockSink() {
   const calls = [];
   return {
     calls,
-    setSurfaceLayout() {}, setStack() {}, setLayerSurfaces() {},
+    setSurfaceLayout() {}, setLayerSurfaces() {},
     setSurfaceTexture() {}, commitSurfaceBuffer() {}, commitSurfaceDmabuf() {},
     removeSurface() {}, takeImportedSurfaces() { return []; },
     takeFreedBuffers() { return []; }, afterCurrentFrame() {}, renderFrame() {},
+    setStack(ids) { this.calls.push({ method: 'setStack', ids }); },
     setOutputStack(outputId, ids) {
       this.calls.push({ method: 'setOutputStack', outputId, ids });
     },
   };
 }
 
-function makeState(wm, bus) {
+function makeState(wm, bus, sink) {
   return { bus, wm, pendingWindowChanges: undefined, surfaces: new Map(), seat: null,
-    compositor: null, decorationResize: null };
+    compositor: sink, decorationResize: null };
 }
 
 function makeBroker() {
@@ -35,28 +36,51 @@ function makeBroker() {
   const bus = createCompositorBus();
   const pluginBus = new DynamicBus();
   const broker = createWindowsBroker({
-    wm, compositor: sink, state: makeState(wm, bus), pluginBus, bus,
+    wm, compositor: sink, state: makeState(wm, bus, sink), pluginBus, bus,
   });
   return { broker, sink, wm };
 }
 
-test('set-output-stack: passes outputId + ids to the compositor sink', () => {
-  const { broker, sink } = makeBroker();
-  broker('test-plugin', 'windows.set-output-stack', { outputId: 0, ids: [1, 2, 3] });
-  assert.equal(sink.calls.length, 1);
-  assert.deepEqual(sink.calls[0], { method: 'setOutputStack', outputId: 0, ids: [1, 2, 3] });
+// The broker's set-output-stack stores the toplevel-order filter and triggers
+// rebuildStackWithPopups, which expands each filter into the full draw list
+// ([toplevel, ...subsurface subtree, ...popups]) and pushes via
+// setOutputStack. With no WM windows the expansion is empty.
+test('set-output-stack: pushes expanded toplevel order to the sink', () => {
+  const { broker, sink, wm } = makeBroker();
+  // Stub the WM with three toplevels so the expansion contains them.
+  const fakeSurfaceRec = (id) => ({ resource: { id } });
+  wm.addWindow(1, fakeSurfaceRec(1));
+  wm.addWindow(2, fakeSurfaceRec(2));
+  wm.addWindow(3, fakeSurfaceRec(3));
+  for (const id of [1, 2, 3]) wm.windowHasContent(id);
+  sink.calls.length = 0;  // ignore stack pushes from addWindow/windowHasContent
+  broker('test-plugin', 'windows.set-output-stack', { outputId: 0, ids: [3, 1, 2] });
+  // rebuildStackWithPopups pushes the GLOBAL stack via setStack, then the
+  // per-output expansion via setOutputStack. We assert the per-output call
+  // reflects the requested toplevel order (no subsurfaces in this fixture).
+  const out = sink.calls.find((c) => c.method === 'setOutputStack');
+  assert.ok(out, 'setOutputStack was called');
+  assert.equal(out.outputId, 0);
+  assert.deepEqual(out.ids, [3, 1, 2]);
 });
 
 test('set-output-stack: null ids clears the override', () => {
   const { broker, sink } = makeBroker();
   broker('test-plugin', 'windows.set-output-stack', { outputId: 0, ids: null });
-  assert.deepEqual(sink.calls[0], { method: 'setOutputStack', outputId: 0, ids: null });
+  // The broker clears directly via setOutputStack(outputId, null) and then
+  // calls rebuildStackWithPopups; the clear call must have happened.
+  const cleared = sink.calls.find((c) =>
+    c.method === 'setOutputStack' && c.outputId === 0 && c.ids === null);
+  assert.ok(cleared, `expected a setOutputStack(0, null) call; got ${JSON.stringify(sink.calls)}`);
 });
 
-test('set-output-stack: empty ids array is valid (composes nothing)', () => {
+test('set-output-stack: empty ids array is a valid filter (composes nothing)', () => {
   const { broker, sink } = makeBroker();
   broker('test-plugin', 'windows.set-output-stack', { outputId: 0, ids: [] });
-  assert.deepEqual(sink.calls[0], { method: 'setOutputStack', outputId: 0, ids: [] });
+  const out = sink.calls.find((c) =>
+    c.method === 'setOutputStack' && c.outputId === 0);
+  assert.ok(out, 'setOutputStack was called');
+  assert.deepEqual(out.ids, []);
 });
 
 test('set-output-stack: missing outputId throws', () => {
@@ -92,7 +116,7 @@ function brokerWithSeat() {
   const wm = createWm(sink, { width: 800, height: 600 });
   const bus = createCompositorBus();
   const pluginBus = new DynamicBus();
-  const state = makeState(wm, bus);
+  const state = makeState(wm, bus, sink);
   state.seat = { applyKeyboardFocus: (id) => seatCalls.push(id) };
   const broker = createWindowsBroker({
     wm, compositor: sink, state, pluginBus, bus,
@@ -131,7 +155,7 @@ test('windows.focus: no seat bound -> silent no-op', () => {
   const bus = createCompositorBus();
   const pluginBus = new DynamicBus();
   const broker = createWindowsBroker({
-    wm, compositor: sink, state: makeState(wm, bus), pluginBus, bus,
+    wm, compositor: sink, state: makeState(wm, bus, sink), pluginBus, bus,
   });
   // No throw; returns null.
   assert.equal(broker('p', 'windows.focus', { id: 42 }), null);
@@ -152,7 +176,7 @@ test('set-output-stack: missing compositor.setOutputStack rejects', () => {
   const bus = createCompositorBus();
   const pluginBus = new DynamicBus();
   const broker = createWindowsBroker({
-    wm, compositor: sinkNoOut, state: makeState(wm, bus), pluginBus, bus,
+    wm, compositor: sinkNoOut, state: makeState(wm, bus, sinkNoOut), pluginBus, bus,
   });
   assert.throws(() => broker('p', 'windows.set-output-stack', { outputId: 0, ids: [1] }),
     /not supported/);

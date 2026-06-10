@@ -96,4 +96,13 @@ const wl_interface* InterfaceRegistry::get(const std::string& name) const {
     return it == built_.end() ? nullptr : it->second->iface.get();
 }
 
+bool InterfaceRegistry::isRequestDestructor(const std::string& interfaceName,
+                                            uint32_t opcode) const {
+    auto it = built_.find(interfaceName);
+    if (it == built_.end()) return false;
+    const auto& reqs = it->second->desc.requests;
+    if (opcode >= reqs.size()) return false;
+    return reqs[opcode].isDestructor;
+}
+
 }  // namespace overdraw::wayland

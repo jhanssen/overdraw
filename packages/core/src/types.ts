@@ -36,6 +36,11 @@ export interface Addon {
   registerInterface(name: string, handler: unknown): void;
   createGlobal(name: string, handler: unknown): void;
   postEvent(resource: Resource, opcode: number, args: unknown[]): void;
+  // Server-initiated destruction: drop the libwayland resource + wrapper.
+  // For client-issued destructor requests (wl_buffer.destroy etc.) the
+  // trampoline handles destruction automatically; JS only needs this for
+  // events that destroy their target (wl_callback.done).
+  destroyResource(resource: Resource): void;
   clientId(resource: Resource): number;
 
   // Keyboard: keymap memfd (as a WaylandFd) + xkb modifier state.

@@ -13,6 +13,7 @@ import { WINDOW_EVENT } from "../events/types.js";
 import type { WindowStateChangedEvent } from "../events/types.js";
 import { markWindowChanged } from "../protocols/window-changes.js";
 import type { CompositorState, CompositorSink } from "../protocols/ctx.js";
+import { rebuildStackWithPopups } from "../protocols/xdg_popup.js";
 
 export interface WindowsBrokerDeps {
   wm: Wm;
@@ -153,7 +154,22 @@ export function createWindowsBroker(deps: WindowsBrokerDeps): WindowsBroker {
     if (!compositor.setOutputStack) {
       throw new Error("windows.set-output-stack: not supported by this compositor");
     }
-    compositor.setOutputStack(p.outputId, p.ids);
+    // Store the toplevel-order filter; let the protocol layer expand it into
+    // [toplevel, ...subsurface subtree, ...popups parented under it] in the
+    // filter's order. Calling compositor.setOutputStack with the raw
+    // toplevel list would skip subsurfaces + popups, which the workspace
+    // plugin doesn't model. rebuildStackWithPopups is the single owner of
+    // setStack / setOutputStack pushes.
+    state.outputToplevelStacks ??= new Map();
+    if (p.ids === null) {
+      state.outputToplevelStacks.delete(p.outputId);
+      // Clear the compositor's override now; rebuildStackWithPopups iterates
+      // remaining filters only and would otherwise leave a stale stack.
+      compositor.setOutputStack(p.outputId, null);
+    } else {
+      state.outputToplevelStacks.set(p.outputId, p.ids.slice());
+    }
+    rebuildStackWithPopups(state);
     return null;
   }
 

@@ -877,6 +877,15 @@ export class JsCompositor implements CompositorSink {
           tex, view, width: pending.width, height: pending.height, importId,
         };
         this.dmabufImports.set(bufferId, imp);
+        // Tell the lifecycle the buffer transitioned Importing -> Imported.
+        // A bufferDestroyed (or surfaceRemoved-drain) that arrived while
+        // Importing left importOwed=true; the lifecycle's maybeFlush fires
+        // the deferred releaseImport now via this dispatch, and the
+        // executor's releaseImport (below) releases the just-cached import.
+        // Without this event the late callback would silently stash an
+        // unreachable import (leaking its native importId for the lifetime
+        // of the run).
+        this.dispatch(this.lifecycle.step({ kind: "importCompleted", bufferId }));
         // Bind to every surface that was waiting for this import.
         if (p) {
           for (const sid of p.pendingInstalls) this.bindImportToSurface(sid, bufferId, imp);
@@ -1157,6 +1166,14 @@ export class JsCompositor implements CompositorSink {
       }],
     });
     pass.setPipeline(this.pipeline);
+    if (process.env.OVERDRAW_DEBUG_DECO) {
+      // eslint-disable-next-line no-console
+      console.error(`[diag-frame] drawList=`, JSON.stringify(args.drawList),
+        "surfaces=", JSON.stringify(args.drawList.map(id => {
+          const s = this.surfaces.get(id);
+          return s ? { id, x: s.x, y: s.y, lw: s.layoutW, lh: s.layoutH, w: s.width, h: s.height, p: !!s.present, bg: !!s.bindGroup } : { id, miss: true };
+        })));
+    }
     for (const id of args.drawList) {
       const s = this.surfaces.get(id);
       if (s && s.present && s.bindGroup) {
@@ -1201,18 +1218,26 @@ export class JsCompositor implements CompositorSink {
 
     const draw = this.drawOrder();
     const bracketed: Array<{ importId: number; bufferId: number }> = [];
-    // Brackets must cover the UNION of imports sampled this frame --
-    // on-screen draw order plus every live composer's window list.
-    // openImportBrackets de-dupes on importId so any import shared
-    // across these lists opens exactly one Begin (the GPU process
-    // forbids two Begins without an End).
-    this.openImportBrackets(draw, bracketed);
-    for (const ls of this.liveScenes) this.openImportBrackets(ls.windows, bracketed);
-    for (const lw of this.liveWindowComps) {
-      this.openImportBrackets(lw.windows.map((w) => w.id), bracketed);
-    }
 
     try {
+      // Brackets must cover the UNION of imports sampled this frame --
+      // on-screen draw order plus every live composer's window list.
+      // openImportBrackets de-dupes on importId so any import shared
+      // across these lists opens exactly one Begin (the GPU process
+      // forbids two Begins without an End).
+      //
+      // Bracket opening lives INSIDE the try so a throw from writeBeginAccess
+      // (the JS-gate vs core-handle desync at openImportBrackets) or from the
+      // lifecycle's frameSampled dispatch (alternation violation) drops into
+      // the catch below. Without that, the lifecycle's frameStart was
+      // dispatched but never paired with frameAborted, and every subsequent
+      // renderFrame throws "frame already in flight" forever.
+      this.openImportBrackets(draw, bracketed);
+      for (const ls of this.liveScenes) this.openImportBrackets(ls.windows, bracketed);
+      for (const lw of this.liveWindowComps) {
+        this.openImportBrackets(lw.windows.map((w) => w.id), bracketed);
+      }
+
       const enc = this.device.createCommandEncoder();
       // On-screen composite.
       this.composite({
@@ -1281,8 +1306,16 @@ export class JsCompositor implements CompositorSink {
         this.outputTex = null;
       }
     } catch (e) {
-      // If anything threw between frameStart and submitted, roll back the open
-      // begin so the lifecycle's invariant 2 (alternation) is preserved.
+      // If anything threw between frameStart and submitted, close any begin
+      // brackets that DID open (the GPU process's wire-side Begin/End
+      // alternation must stay paired even when JS bails mid-frame; partial
+      // brackets leak the per-import accessOpen flag on the GPU side, which
+      // refuses the next Begin) and roll back the lifecycle's open begin so
+      // its invariant 2 (alternation) is preserved here too. closeImportBrackets
+      // is a no-op on an empty list; the secondary try/catch swallows a
+      // secondary throw so the original `e` propagates.
+      try { this.closeImportBrackets(bracketed); }
+      catch { /* secondary throw -- intentionally swallowed */ }
       if (frameOpen) {
         try { this.dispatch(this.lifecycle.step({ kind: "frameAborted" })); }
         catch { /* secondary throw -- intentionally swallowed */ }

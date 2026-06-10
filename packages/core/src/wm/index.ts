@@ -142,6 +142,12 @@ export interface Wm {
   // The outer tile of a window (the decoration's region), or the content rect when
   // it has no insets. Used for decoration placement + (future) outer hit-testing.
   outerRectOf(surfaceId: number): Rect | undefined;
+  // The content rect of a window (the assigned tile inside any insets). The map
+  // sweep needs this to build the window.map payload BEFORE calling
+  // windowHasContent: emitting window.map first lets a decoration registry
+  // subscriber set contentGated synchronously so the window is excluded from the
+  // stack push at windowHasContent time. Returns undefined when not tracked.
+  rectOf(surfaceId: number): Rect | undefined;
   // Content gating (decoration piece 3): hold a window's content out of the draw
   // stack (gated=true) until its decoration's first frame is ready, then release
   // (gated=false) so content + decoration appear together. Rebuilds the stack via
@@ -464,6 +470,12 @@ export function createWm(
       return { ...win.outer };
     },
 
+    rectOf(surfaceId) {
+      const win = windows.find((w) => w.surfaceId === surfaceId);
+      if (!win) return undefined;
+      return { ...win.rect };
+    },
+
     setContentGated(surfaceId, gated) {
       const win = windows.find((w) => w.surfaceId === surfaceId);
       if (!win) return;
@@ -484,6 +496,17 @@ export function createWm(
       const next = decoSurfaceId === null ? undefined : decoSurfaceId;
       if (win.decorationSurfaceId === next) return;   // no change
       win.decorationSurfaceId = next;
+      // Push the decoration's current outer-rect layout. The alloc captured
+      // the outer at the moment decoration.createDecoration ran; layout
+      // passes that ran between the grant and surface.alloc completion would
+      // have skipped the decoration (decorationSurfaceId was still
+      // undefined). Without pushing now, the decoration stays at the stale
+      // rect from alloc until the NEXT relayout -- and a stale full-output
+      // decoration covers other windows.
+      if (next !== undefined && win.outer.width > 0 && win.outer.height > 0) {
+        compositor.setSurfaceLayout(next, win.outer.x, win.outer.y,
+                                    win.outer.width, win.outer.height);
+      }
       pushStack();   // re-interleave the decoration below its window's content
     },
 

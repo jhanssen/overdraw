@@ -217,9 +217,15 @@ export async function installProtocols(
         // content just makes the window drawable + focusable. width/height (the
         // committed buffer size) are ignored for placement — the tile is owned by
         // the layout, not the client.
-        const rect = state.wm?.windowHasContent(id);
+        //
+        // EMIT ORDER: window.map fires BEFORE windowHasContent's pushStack so the
+        // decoration registry (a synchronous bus subscriber) gets to call
+        // setContentGated(true) BEFORE the window is interleaved into the stack
+        // by computeBaseStack. Otherwise the window draws undecorated in the
+        // race window between pushStack and onAssigned -- breaking the "content
+        // held until decoration's first frame" contract.
+        const rect = state.wm?.rectOf(id);
         if (rect) {
-          state.seat?.focusWindow(id, s, rect);
           // Emit window.map. app_id/title may be null if the client set them after
           // its first commit (a known timing gap); a later window.change carries the
           // update once set_app_id/set_title fires.
@@ -229,6 +235,12 @@ export async function installProtocols(
             rect: { x: rect.x, y: rect.y, width: rect.width, height: rect.height },
             appId: ta.appId, title: ta.title,
           });
+          // Now mark the window drawable + push the stack. If a decoration
+          // provider matched in the map emission above, the window is already
+          // contentGated and will be skipped by computeBaseStack until the
+          // decoration's first present releases the gate.
+          state.wm?.windowHasContent(id);
+          state.seat?.focusWindow(id, s, rect);
         }
       } else if (s.role === "xdg_popup") {
         // A popup maps on first content; it is compositor-positioned above its
@@ -318,6 +330,10 @@ export async function installProtocols(
       for (const cb of cbs) {
         if (cb.destroyed) continue;
         events.wl_callback.send_done(cb, timeMs >>> 0);
+        // wl_callback.done is type="destructor": the protocol says the
+        // resource is gone after this event. Without this call the
+        // libwayland resource + napi_ref leaks per frame per surface.
+        addon.destroyResource(cb);
       }
     }
 

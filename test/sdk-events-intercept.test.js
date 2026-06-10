@@ -45,11 +45,14 @@ test('intercept: defer path: emit awaits async handler', async () => {
     await waitFor(() => events.some((e) => e.n === 'log' && String(e.d) === 'ready'));
     await new Promise((r) => setTimeout(r, 50));
 
-    const t0 = Date.now();
+    // hrtime.bigint() is monotonic + ns-resolution; Date.now() rounds to ms and
+    // can show 9 for an actual ~10.0001ms wait when t0 lands mid-millisecond.
+    const t0 = process.hrtime.bigint();
     const out = await pluginBus.emit('defer', { v: 1 }, { timeoutMs: 1000 });
-    const elapsed = Date.now() - t0;
+    const elapsedNs = process.hrtime.bigint() - t0;
     assert.deepEqual(out, { v: 1, deferred: true });
-    assert.ok(elapsed >= 10, `expected at least 10ms wait, got ${elapsed}ms`);
+    assert.ok(elapsedNs >= 10_000_000n,
+      `expected at least 10ms wait, got ${Number(elapsedNs) / 1e6}ms`);
   });
 });
 

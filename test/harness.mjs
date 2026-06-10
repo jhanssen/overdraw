@@ -136,8 +136,14 @@ export function fdCount(pid) {
 // opts:
 //   focus     user-config-style { policy, focusOnMap }; flows verbatim
 //             to the bundled focus plugin's config.
-//   bus       pre-built DynamicBus (for tests that subscribe before plugins
-//             load). Defaults to a fresh one.
+//   bus       The TYPED CORE bus (createCompositorBus); window.* event
+//             source the protocol layer + seat emit on. Default: fresh one.
+//             The harness republishes window.* from this onto the plugin
+//             bus (mirroring main.ts).
+//   pluginBus Pre-built DynamicBus the plugin runtime subscribes through.
+//             Default: fresh one. Tests that need to observe subscribe to
+//             this. (Backwards compat: tests sometimes constructed one
+//             locally and passed it in.)
 //   headless  { width, height } | null. Default { 1280, 720 }; pass null
 //             for nested-host-window mode.
 export async function setupCompositor(opts = {}) {
@@ -168,13 +174,14 @@ export async function setupCompositor(opts = {}) {
       { nested, format: addon.outputFormat() });
   }
 
-  const pluginBus = opts.bus ?? new DynamicBus();
+  const pluginBus = opts.pluginBus ?? new DynamicBus();
   // Typed core bus -- producers (the protocol layer + the seat) emit
   // window.* / keyboard.* events. main.ts republishes them onto the plugin
   // (dynamic) bus so sdk.windows.onMap / onUnmap subscriptions see them. The
   // harness mirrors that so plugins running under setupCompositor observe
   // the same lifecycle as in production.
-  const coreBus = opts.coreBus ?? createCompositorBus();
+  // (opts.coreBus is an older alias for the same purpose; both accepted.)
+  const coreBus = opts.bus ?? opts.coreBus ?? createCompositorBus();
   coreBus.on(WINDOW_EVENT.map, (ev) => { pluginBus.emit(WINDOW_EVENT.map, ev); });
   coreBus.on(WINDOW_EVENT.unmap, (ev) => { pluginBus.emit(WINDOW_EVENT.unmap, ev); });
   coreBus.on(WINDOW_EVENT.change, (ev) => { pluginBus.emit(WINDOW_EVENT.change, ev); });

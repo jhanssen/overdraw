@@ -66,6 +66,16 @@ class Trampoline {
     // per-resource destroy listener.
     void forgetResource(wl_resource* resource);
 
+    // Destroy a server-initiated resource (e.g. wl_callback after its done
+    // event was sent: the protocol says the callback IS the event and the
+    // resource has no more uses afterward). Unwraps the JS Resource handle
+    // and calls wl_resource_destroy; the existing destroy listener then
+    // forgets the wrapper. Idempotent over a JS handle whose `destroyed`
+    // flag is already true (the underlying wl_resource is gone -- our
+    // wrapper map no longer has it -- the call is silently a no-op).
+    // Returns false if the handle is not a wrapped Resource.
+    bool destroyResource(napi_value resourceHandle);
+
   private:
     struct InterfaceState {
         std::string name;

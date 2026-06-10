@@ -124,6 +124,12 @@ add_executable(wl-test-client test/wl-test-client.c)
 target_include_directories(wl-test-client PRIVATE ${WAYLAND_CLIENT_INCLUDE_DIRS})
 target_link_libraries(wl-test-client PRIVATE ${WAYLAND_CLIENT_LIBRARIES})
 
+# Destructor-request test client: validates the trampoline destroys the
+# libwayland resource on a destructor request BEFORE the client disconnects.
+add_executable(wl-destructor-client test/wl-destructor-client.c)
+target_include_directories(wl-destructor-client PRIVATE ${WAYLAND_CLIENT_INCLUDE_DIRS})
+target_link_libraries(wl-destructor-client PRIVATE ${WAYLAND_CLIENT_LIBRARIES})
+
 # ---- xdg-shell test client (toplevel-creation / configure handshake) ----
 add_executable(xdg-test-client
     test/xdg-test-client.c
@@ -197,6 +203,11 @@ target_link_libraries(popup-test-client PRIVATE ${WAYLAND_CLIENT_LIBRARIES})
 add_executable(scm-rights-test test/scm-rights-test.cpp)
 target_include_directories(scm-rights-test PRIVATE ${IPC_INCLUDE})
 target_link_libraries(scm-rights-test PRIVATE dawn::webgpu_dawn_wire)
+
+# ---- CtrlSender wedge-resistance test (steady-state ctrl is non-blocking) ----
+add_executable(ctrl-sender-test test/ctrl-sender-test.cpp)
+target_include_directories(ctrl-sender-test PRIVATE ${IPC_INCLUDE})
+target_link_libraries(ctrl-sender-test PRIVATE dawn::webgpu_dawn_wire)
 
 # ---- WireBarrier native unit test (cross-channel ordering primitive) ----
 # Header-only class; the test exercises the deferred-action FIFO + cancel +

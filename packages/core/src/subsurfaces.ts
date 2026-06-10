@@ -50,14 +50,22 @@ export function emitSubtree(
 }
 
 // Compute the BASE draw stack (toplevels interleaved with their subsurface
-// subtrees, back-to-front) and set each subsurface's layout rect. Does NOT call
-// setStack -- the caller appends popups (if any) and sets the final stack, so
-// there is a single owner of the stack order. Returns the base stack ids.
-export function computeBaseStack(state: CompositorState): number[] {
-  const wm = state.wm;
-  if (!wm) return [];
+// subtrees, back-to-front) and set each subsurface's layout rect. Does NOT
+// call setStack -- the caller appends popups (if any) and sets the final
+// stack, so there is a single owner of the stack order. Returns the base
+// stack ids.
+//
+// `windows` is the toplevel order to emit. Default = wm.state.windows (the
+// global stack). Pass a filtered/reordered list for per-output expansion.
+// Without a WM AND no explicit list, returns [].
+export function computeBaseStack(
+  state: CompositorState,
+  windows?: ReadonlyArray<WmWindowLike>,
+): number[] {
+  const list = windows ?? state.wm?.state.windows;
+  if (!list) return [];
   const stack: number[] = [];
-  for (const win of wm.state.windows) {
+  for (const win of list) {
     // Content-gated windows (waiting for their decoration's first frame) are held
     // out of the draw stack so content + decoration appear together (piece 3).
     if (win.contentGated) continue;
@@ -71,6 +79,17 @@ export function computeBaseStack(state: CompositorState): number[] {
     emitSubtree(state, win.surfaceRec.resource, win.rect.x, win.rect.y, stack);
   }
   return stack;
+}
+
+// Minimal WM window shape consumed by computeBaseStack. Avoids importing the
+// WM's full WmWindow type into the protocols layer (it lives outside this
+// module's package), and keeps the contract narrow.
+export interface WmWindowLike {
+  surfaceId: number;
+  surfaceRec: { resource: Resource };
+  rect: { x: number; y: number };
+  contentGated?: boolean;
+  decorationSurfaceId?: number;
 }
 
 // Recompute subsurface layouts + the full draw stack and push to native. Delegates

@@ -22,6 +22,8 @@
 
 #include "wire_link.h"
 
+namespace overdraw::ipc { class CtrlSender; }
+
 namespace overdraw::core {
 
 class Compositor {
@@ -322,6 +324,16 @@ class Compositor {
     // Non-blocking. Driven from a libuv poll on the ctrl fd in the addon.
     void drainCtrl();
 
+    // Drain the outbound ctrl queue when the ctrl fd is writable. Mirrors
+    // wirePumpOut: every steady-state ctrl send is buffered through CtrlSender
+    // so a peer that briefly stops draining never wedges this side; the addon's
+    // libuv poll calls this on UV_WRITABLE to flush what the socket can now
+    // accept.
+    void ctrlPumpOut();
+    // True if ctrl bytes are queued awaiting a writable socket (the addon then
+    // arms UV_WRITABLE on the ctrl poll).
+    bool ctrlHasPendingOut() const;
+
     // True if running headless (no host window/surface; the JS compositor renders
     // into its own offscreen target).
     bool headless() const { return headless_; }
@@ -338,6 +350,14 @@ class Compositor {
     int wireFd_ = -1;  // owned by Compositor; closed in shutdown()
     int ctrlFd_ = -1;  // owned by Compositor; closed in shutdown()
     bool shutdownDone_ = false;
+
+    // Buffered non-blocking sender for steady-state ctrl messages. A peer that
+    // briefly stops draining (e.g. GPU process inside a DRM fence wait) cannot
+    // wedge this side: send() queues on EAGAIN, the addon's UV_WRITABLE arm
+    // drains it via ctrlPumpOut(). Constructed only after handshake() (which
+    // does the one-shot blocking Hello). Shutdown still uses blocking
+    // sendMessage -- both sides are tearing down, brief blocking is acceptable.
+    std::unique_ptr<ipc::CtrlSender> ctrlSender_;
 
     // Plugin wire connections: async-completion status keyed by connId
     // (0=pending, 1=ok, 2=failed), updated by drainCtrl.

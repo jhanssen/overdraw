@@ -38,6 +38,17 @@ function pick(intents, kind, pred = () => true) {
   return intents.filter((i) => i.kind === kind && pred(i));
 }
 
+// Commit + immediate importCompleted: the happy path where the executor's
+// async import resolves "instantly". Most tests want this; they pre-date the
+// Importing state but assert on the post-Imported behaviour. Tests that
+// EXERCISE the Importing window dispatch the events separately.
+function commitImported(m, surfaceId, bufferId, d) {
+  const out = [];
+  out.push(...m.step({ kind: "commit", surfaceId, bufferId, dims: d }));
+  out.push(...m.step({ kind: "importCompleted", bufferId }));
+  return out;
+}
+
 // Run a one-frame compositing pass: frameStart, sample each of `surfaces`, then
 // submitted(serial). Returns the intents that fired during this frame.
 function runFrame(m, surfaces, serial) {
@@ -54,6 +65,7 @@ test("invariant 1: importBuffer fires once per buffer; re-commit of same buffer 
   const m = new ClientBufferLifecycle();
   const i1 = m.step({ kind: "commit", surfaceId: 1, bufferId: 100, dims: dims(8, 8) });
   assert.equal(pick(i1, "importBuffer").length, 1, "first commit imports");
+  m.step({ kind: "importCompleted", bufferId: 100 });
   const i2 = m.step({ kind: "commit", surfaceId: 1, bufferId: 100, dims: dims(8, 8) });
   assert.equal(pick(i2, "importBuffer").length, 0, "re-commit does NOT import");
 });
@@ -62,7 +74,7 @@ test("invariant 1: importBuffer fires once per buffer; re-commit of same buffer 
 
 test("invariant 2: two frameSampled for the same buffer in one frame throws (begin/end alternation)", () => {
   const m = new ClientBufferLifecycle();
-  m.step({ kind: "commit", surfaceId: 1, bufferId: 100, dims: dims(8, 8) });
+  commitImported(m, 1, 100, dims(8, 8));
   m.step({ kind: "frameStart" });
   m.step({ kind: "frameSampled", surfaceId: 1 });
   // The state-machine layer enforces this even though the spec discussion is
@@ -76,7 +88,7 @@ test("invariant 2: two frameSampled for the same buffer in one frame throws (beg
 test("invariant 2: begin/end alternate across many frames on the same buffer", () => {
   const m = new ClientBufferLifecycle();
   const allIntents = [];
-  allIntents.push(...m.step({ kind: "commit", surfaceId: 1, bufferId: 100, dims: dims(8, 8) }));
+  allIntents.push(...commitImported(m, 1, 100, dims(8, 8)));
   // 50 frames, all re-committing the SAME buffer (cursor-blink / focus-change
   // shape -- the regression we are guarding against).
   for (let f = 1; f <= 50; f++) {
@@ -99,8 +111,8 @@ test("invariant 2: begin/end alternate across many frames on the same buffer", (
 
 test("invariant 3: one begin/end pair per sampled frame per buffer", () => {
   const m = new ClientBufferLifecycle();
-  m.step({ kind: "commit", surfaceId: 1, bufferId: 100, dims: dims(8, 8) });
-  m.step({ kind: "commit", surfaceId: 2, bufferId: 200, dims: dims(8, 8) });
+  commitImported(m, 1, 100, dims(8, 8));
+  commitImported(m, 2, 200, dims(8, 8));
   const frame = runFrame(m, [1, 2], 1);
   const begins = pick(frame, "beginAccess");
   const ends = pick(frame, "endAccess");
@@ -116,13 +128,15 @@ test("invariant 3: one begin/end pair per sampled frame per buffer", () => {
 test("invariant 4 (rule A): supersede A by B -> sendWlRelease(A) after frame completes; releaseImport(A) does NOT fire (cache stays live)", () => {
   const m = new ClientBufferLifecycle();
   // commit A, sample, submit
-  m.step({ kind: "commit", surfaceId: 1, bufferId: 100, dims: dims(8, 8) });
+  commitImported(m, 1, 100, dims(8, 8));
   runFrame(m, [1], 1);
   m.step({ kind: "endAccessFenceExported", bufferId: 100, fence: sfFence(1001) });
 
   // commit B (supersedes A on surface 1). A's wl_buffer.release is owed but
-  // inflight serial 1 has not yet completed, so nothing fires yet.
+  // inflight serial 1 has not yet completed, so nothing fires yet. B is in
+  // Importing -- its importCompleted doesn't affect A's release path.
   const i = m.step({ kind: "commit", surfaceId: 1, bufferId: 200, dims: dims(8, 8) });
+  m.step({ kind: "importCompleted", bufferId: 200 });
   assert.equal(pick(i, "sendWlRelease").length, 0, "no release before GPU completion");
   assert.equal(pick(i, "releaseImport").length, 0);
 
@@ -143,10 +157,10 @@ test("invariant 4 + rule A: re-commit of a superseded-then-released buffer hits 
   const m = new ClientBufferLifecycle();
   const all = [];
   // commit A, sample, complete, supersede with B, drain.
-  all.push(...m.step({ kind: "commit", surfaceId: 1, bufferId: 100, dims: dims(8, 8) }));
+  all.push(...commitImported(m, 1, 100, dims(8, 8)));
   all.push(...runFrame(m, [1], 1));
   all.push(...m.step({ kind: "endAccessFenceExported", bufferId: 100, fence: sfFence(1001) }));
-  all.push(...m.step({ kind: "commit", surfaceId: 1, bufferId: 200, dims: dims(8, 8) }));
+  all.push(...commitImported(m, 1, 200, dims(8, 8)));
   all.push(...m.step({ kind: "gpuCompleted", serial: 1 }));
   // Two imports so far (one per buffer).
   assert.equal(pick(all, "importBuffer").length, 2);
@@ -161,7 +175,7 @@ test("invariant 4 + rule A: re-commit of a superseded-then-released buffer hits 
 test("invariant 4: same-buffer re-commit NEVER fires sendWlRelease (regression for the black-frame bug)", () => {
   const m = new ClientBufferLifecycle();
   const all = [];
-  all.push(...m.step({ kind: "commit", surfaceId: 1, bufferId: 100, dims: dims(8, 8) }));
+  all.push(...commitImported(m, 1, 100, dims(8, 8)));
   for (let f = 1; f <= 20; f++) {
     all.push(...runFrame(m, [1], f));
     all.push(...m.step({ kind: "endAccessFenceExported", bufferId: 100, fence: sfFence(1000 + f) }));
@@ -178,7 +192,7 @@ test("invariant 4: same-buffer re-commit NEVER fires sendWlRelease (regression f
 
 test("invariant 5 (rule A): supersede with pipelined inflight -> sendWlRelease(A) once last inflight drains; releaseImport(A) NEVER fires until destroy", () => {
   const m = new ClientBufferLifecycle();
-  m.step({ kind: "commit", surfaceId: 1, bufferId: 100, dims: dims(8, 8) });
+  commitImported(m, 1, 100, dims(8, 8));
   // 3 frames in flight on A before supersede (pipeline depth).
   runFrame(m, [1], 1);
   m.step({ kind: "endAccessFenceExported", bufferId: 100, fence: sfFence(1001) });
@@ -189,7 +203,7 @@ test("invariant 5 (rule A): supersede with pipelined inflight -> sendWlRelease(A
   runFrame(m, [1], 3);
   m.step({ kind: "endAccessFenceExported", bufferId: 100, fence: sfFence(1003) });
   // Supersede A with B.
-  m.step({ kind: "commit", surfaceId: 1, bufferId: 200, dims: dims(8, 8) });
+  commitImported(m, 1, 200, dims(8, 8));
 
   // Drain frames 1 and 2; sendWlRelease(A) still gated on frame 3.
   const i1 = m.step({ kind: "gpuCompleted", serial: 1 });
@@ -211,7 +225,7 @@ test("invariant 5 (rule A): supersede with pipelined inflight -> sendWlRelease(A
 
 test("invariant 6: surfaceRemoved with a frame inflight defers BOTH intents until completion", () => {
   const m = new ClientBufferLifecycle();
-  m.step({ kind: "commit", surfaceId: 1, bufferId: 100, dims: dims(8, 8) });
+  commitImported(m, 1, 100, dims(8, 8));
   runFrame(m, [1], 1);
   m.step({ kind: "endAccessFenceExported", bufferId: 100, fence: sfFence(1001) });
   const i = m.step({ kind: "surfaceRemoved", surfaceId: 1 });
@@ -226,7 +240,7 @@ test("invariant 6: surfaceRemoved with a frame inflight defers BOTH intents unti
 
 test("invariant 6: surfaceRemoved with no inflight fires both intents immediately and drains", () => {
   const m = new ClientBufferLifecycle();
-  m.step({ kind: "commit", surfaceId: 1, bufferId: 100, dims: dims(8, 8) });
+  commitImported(m, 1, 100, dims(8, 8));
   // surfaceRemoved before any frame samples it.
   const i = m.step({ kind: "surfaceRemoved", surfaceId: 1 });
   assert.equal(pick(i, "sendWlRelease", (x) => x.bufferId === 100).length, 1);
@@ -240,11 +254,11 @@ test("invariant 6: surfaceRemoved with no inflight fires both intents immediatel
 
 test("leak guard: destroy a cached-but-not-current buffer -> releaseImport fires immediately", () => {
   const m = new ClientBufferLifecycle();
-  m.step({ kind: "commit", surfaceId: 1, bufferId: 100, dims: dims(8, 8) });
+  commitImported(m, 1, 100, dims(8, 8));
   // Supersede with B; drain so A is fully released-to-client but cached.
   runFrame(m, [1], 1);
   m.step({ kind: "endAccessFenceExported", bufferId: 100, fence: sfFence(1) });
-  m.step({ kind: "commit", surfaceId: 1, bufferId: 200, dims: dims(8, 8) });
+  commitImported(m, 1, 200, dims(8, 8));
   m.step({ kind: "gpuCompleted", serial: 1 });
   // Now destroy A. Expected: releaseImport(A) fires immediately (no inflight).
   const i = m.step({ kind: "bufferDestroyed", bufferId: 100 });
@@ -254,7 +268,7 @@ test("leak guard: destroy a cached-but-not-current buffer -> releaseImport fires
 
 test("leak guard: destroy a buffer that is currently being sampled -> releaseImport deferred until drain", () => {
   const m = new ClientBufferLifecycle();
-  m.step({ kind: "commit", surfaceId: 1, bufferId: 100, dims: dims(8, 8) });
+  commitImported(m, 1, 100, dims(8, 8));
   runFrame(m, [1], 1);
   m.step({ kind: "endAccessFenceExported", bufferId: 100, fence: sfFence(1) });
   // Client destroys A while frame 1 is still on the GPU.
@@ -269,7 +283,7 @@ test("leak guard: destroy a buffer that is currently being sampled -> releaseImp
 
 test("rescue: surfaceRemoved with inflight then re-attach to a different surface before drain -> NO releaseImport", () => {
   const m = new ClientBufferLifecycle();
-  m.step({ kind: "commit", surfaceId: 1, bufferId: 100, dims: dims(8, 8) });
+  commitImported(m, 1, 100, dims(8, 8));
   runFrame(m, [1], 1);
   m.step({ kind: "endAccessFenceExported", bufferId: 100, fence: sfFence(1) });
   // surfaceRemoved with frame 1 still on the GPU -- importOwed is set, deferred.
@@ -294,7 +308,7 @@ test("leak guard: surfaceRemoved releases ALL the surface's currently-cached imp
   // Cycle 3 buffers on surface 1; all three end up cached under rule A.
   const ids = [101, 102, 103];
   for (let i = 0; i < 3; i++) {
-    m.step({ kind: "commit", surfaceId: 1, bufferId: ids[i], dims: dims(8, 8) });
+    commitImported(m, 1, ids[i], dims(8, 8));
     runFrame(m, [1], i + 1);
     m.step({ kind: "endAccessFenceExported", bufferId: ids[i], fence: sfFence(i + 1) });
     m.step({ kind: "gpuCompleted", serial: i + 1 });
@@ -321,7 +335,7 @@ test("leak guard: surfaceRemoved releases ALL the surface's currently-cached imp
 
 test("#7: beginAccess after the first carries chainFence == last endAccessFenceExported for same buffer", () => {
   const m = new ClientBufferLifecycle();
-  m.step({ kind: "commit", surfaceId: 1, bufferId: 100, dims: dims(8, 8) });
+  commitImported(m, 1, 100, dims(8, 8));
 
   // Frame 1: first begin has chainFence=none. No previous end fence yet.
   const f1 = runFrame(m, [1], 1);
@@ -350,7 +364,7 @@ test("#7: beginAccess after the first carries chainFence == last endAccessFenceE
 
 test("#7 + acquire fence: beginAccess carries BOTH the client's acquireFence and the chainFence", () => {
   const m = new ClientBufferLifecycle();
-  m.step({ kind: "commit", surfaceId: 1, bufferId: 100, dims: dims(8, 8) });
+  commitImported(m, 1, 100, dims(8, 8));
   m.step({ kind: "acquireFenceAvailable", bufferId: 100, fence: sfFence(9001) });
   const f1 = runFrame(m, [1], 1);
   const b1 = pick(f1, "beginAccess")[0];
@@ -372,7 +386,7 @@ test("#7 + acquire fence: beginAccess carries BOTH the client's acquireFence and
 
 test("#8: bufferDestroyed mid-flight defers releaseImport until inflight completes, NEVER sendWlRelease", () => {
   const m = new ClientBufferLifecycle();
-  m.step({ kind: "commit", surfaceId: 1, bufferId: 100, dims: dims(8, 8) });
+  commitImported(m, 1, 100, dims(8, 8));
   runFrame(m, [1], 1);
   m.step({ kind: "endAccessFenceExported", bufferId: 100, fence: sfFence(1001) });
 
@@ -391,18 +405,109 @@ test("#8: bufferDestroyed mid-flight defers releaseImport until inflight complet
 
 test("#8: bufferDestroyed with no inflight fires releaseImport immediately and no sendWlRelease", () => {
   const m = new ClientBufferLifecycle();
-  m.step({ kind: "commit", surfaceId: 1, bufferId: 100, dims: dims(8, 8) });
+  commitImported(m, 1, 100, dims(8, 8));
   // No frame ever sampled it.
   const i = m.step({ kind: "bufferDestroyed", bufferId: 100 });
   assert.equal(pick(i, "sendWlRelease").length, 0);
   assert.equal(pick(i, "releaseImport", (x) => x.bufferId === 100).length, 1);
 });
 
+// Importing window (the race the third state closes) ----------------------
+// Before this state existed, the lifecycle treated a buffer as Imported the
+// moment its commit landed -- but the executor's async addon callback hadn't
+// resolved yet, so dmabufImports had no entry. bufferDestroyed arriving in
+// that window emitted releaseImport with no cache to release; the late
+// callback then stashed an unreachable import (a permanent native importId
+// leak). The Importing state defers releaseImport until importCompleted,
+// where it can actually release something.
+
+test("Importing: bufferDestroyed before importCompleted defers releaseImport; fires after import completes", () => {
+  const m = new ClientBufferLifecycle();
+  // First-sight commit: buffer is in Importing.
+  const i1 = m.step({ kind: "commit", surfaceId: 1, bufferId: 100, dims: dims(8, 8) });
+  assert.equal(pick(i1, "importBuffer").length, 1);
+  // Client destroys the buffer while it is still importing. The lifecycle
+  // must NOT emit releaseImport now -- the executor has nothing to release.
+  const i2 = m.step({ kind: "bufferDestroyed", bufferId: 100 });
+  assert.equal(pick(i2, "releaseImport").length, 0,
+    "no releaseImport while Importing: executor has no live import yet");
+  assert.equal(pick(i2, "sendWlRelease").length, 0, "destroyed: no wl release ever");
+  // Now the executor reports the import completed. The deferred releaseImport
+  // must fire NOW so the GPU-side reservation does not leak.
+  const i3 = m.step({ kind: "importCompleted", bufferId: 100 });
+  assert.equal(pick(i3, "releaseImport", (x) => x.bufferId === 100).length, 1,
+    "releaseImport fires once the cache exists, closing the leak");
+  assert.equal(m.snapshot().buffers.length, 0, "buffer entry drained");
+});
+
+test("Importing: surfaceRemoved before importCompleted defers releaseImport too", () => {
+  const m = new ClientBufferLifecycle();
+  m.step({ kind: "commit", surfaceId: 1, bufferId: 100, dims: dims(8, 8) });
+  // Surface goes away before the import resolves.
+  const i = m.step({ kind: "surfaceRemoved", surfaceId: 1 });
+  assert.equal(pick(i, "releaseImport").length, 0);
+  // The completion ships the deferred release.
+  const i2 = m.step({ kind: "importCompleted", bufferId: 100 });
+  assert.equal(pick(i2, "releaseImport", (x) => x.bufferId === 100).length, 1);
+  assert.equal(m.snapshot().buffers.length, 0);
+});
+
+test("Importing: frameSampled skips a surface whose current buffer is still importing", () => {
+  const m = new ClientBufferLifecycle();
+  m.step({ kind: "commit", surfaceId: 1, bufferId: 100, dims: dims(8, 8) });
+  // No importCompleted yet: buffer is Importing. Sampling this surface must
+  // be a no-op (no beginAccess), mirroring the executor's openImportBrackets
+  // gate that skips surfaces whose import hasn't resolved.
+  const f = runFrame(m, [1], 1);
+  assert.equal(pick(f, "beginAccess").length, 0, "Importing: no begin");
+  assert.equal(pick(f, "endAccess").length, 0);
+  // After completion the surface samples normally.
+  m.step({ kind: "importCompleted", bufferId: 100 });
+  const f2 = runFrame(m, [1], 2);
+  assert.equal(pick(f2, "beginAccess", (x) => x.bufferId === 100).length, 1);
+});
+
+test("Importing: a second commit before importCompleted does NOT emit a second importBuffer", () => {
+  const m = new ClientBufferLifecycle();
+  const i1 = m.step({ kind: "commit", surfaceId: 1, bufferId: 100, dims: dims(8, 8) });
+  assert.equal(pick(i1, "importBuffer").length, 1);
+  // Re-commit the same bufferId while the import is in flight (the executor
+  // hasn't fired importCompleted yet). Rule A: this is a re-attach, NOT a
+  // re-import -- the lifecycle is already tracking the buffer (in Importing).
+  const i2 = m.step({ kind: "commit", surfaceId: 1, bufferId: 100, dims: dims(8, 8) });
+  assert.equal(pick(i2, "importBuffer").length, 0, "re-commit while Importing: no import twice");
+  // importCompleted lands; the surface now samples normally.
+  m.step({ kind: "importCompleted", bufferId: 100 });
+  const f = runFrame(m, [1], 1);
+  assert.equal(pick(f, "beginAccess", (x) => x.bufferId === 100).length, 1);
+});
+
+test("Importing: accessFailed (import failure) closes the Importing window without leaking", () => {
+  const m = new ClientBufferLifecycle();
+  m.step({ kind: "commit", surfaceId: 1, bufferId: 100, dims: dims(8, 8) });
+  // bufferDestroyed during Importing sets importOwed; the executor reports
+  // the import FAILED rather than completed. The lifecycle transitions to
+  // Poisoned and the deferred releaseImport-or-equivalent must reconcile so
+  // we don't leak the executor's reservation. (The executor releases its
+  // reservation on its own failure path; the lifecycle just shouldn't keep
+  // any owed flags hanging.)
+  m.step({ kind: "bufferDestroyed", bufferId: 100 });
+  const i = m.step({ kind: "accessFailed", bufferId: 100, reason: "import returned null" });
+  // releaseImport fires only if a cache exists; on a failed import there is
+  // nothing to release. importOwed clears, buffer entry drains via maybeFlush.
+  // The contract: the entry is gone afterwards (no stuck state).
+  assert.equal(pick(i, "sendWlRelease").length, 0);
+  // Implementation defines whether releaseImport fires on the failure path;
+  // both behaviours are acceptable so long as the buffer entry drains. The
+  // executor's release of its native reservation is on its own failure path.
+  assert.equal(m.snapshot().buffers.length, 0, "no stuck state after failure");
+});
+
 // 9. syncobj acquire fence is asserted-not-implemented ---------------------
 
 test("#9: syncobj acquire fence throws on beginAccess emission, NOT silently degrades", () => {
   const m = new ClientBufferLifecycle();
-  m.step({ kind: "commit", surfaceId: 1, bufferId: 100, dims: dims(8, 8) });
+  commitImported(m, 1, 100, dims(8, 8));
   // Set the syncobj fence -- routing through acquireFenceAvailable is fine.
   m.step({
     kind: "acquireFenceAvailable", bufferId: 100,
@@ -418,7 +523,7 @@ test("#9: syncobj acquire fence throws on beginAccess emission, NOT silently deg
 
 test("#9: syncobj rejection is at intent-emission, not at acquireFenceAvailable (event routing is fine)", () => {
   const m = new ClientBufferLifecycle();
-  m.step({ kind: "commit", surfaceId: 1, bufferId: 100, dims: dims(8, 8) });
+  commitImported(m, 1, 100, dims(8, 8));
   // Routing the syncobj into the machine is NOT what throws. Only when a
   // sampled frame would carry it to the executor does it throw. This keeps the
   // event-vocabulary shape future-proof.
@@ -452,7 +557,7 @@ test("submitted without frameStart throws", () => {
 
 test("frameAborted: the open begin is rolled back; no stale endAccess follows", () => {
   const m = new ClientBufferLifecycle();
-  m.step({ kind: "commit", surfaceId: 1, bufferId: 100, dims: dims(8, 8) });
+  commitImported(m, 1, 100, dims(8, 8));
   m.step({ kind: "frameStart" });
   const i1 = m.step({ kind: "frameSampled", surfaceId: 1 });
   assert.equal(pick(i1, "beginAccess").length, 1);
@@ -470,8 +575,10 @@ test("frameAborted: the open begin is rolled back; no stale endAccess follows", 
 
 test("accessFailed poisons the buffer; no further beginAccess on it; supersede still sends wl_buffer.release", () => {
   const m = new ClientBufferLifecycle();
+  // The commit puts A in Importing. accessFailed (executor reports import
+  // failure) transitions Importing -> Poisoned. The buffer entry stays alive
+  // so supersede + destroy can still drive it through release.
   m.step({ kind: "commit", surfaceId: 1, bufferId: 100, dims: dims(8, 8) });
-  // accessFailed before any frame samples it.
   m.step({ kind: "accessFailed", bufferId: 100, reason: "import returned null" });
   // Frame samples surface 1 -- no beginAccess emitted for the poisoned buffer.
   const f = runFrame(m, [1], 1);
@@ -481,6 +588,7 @@ test("accessFailed poisons the buffer; no further beginAccess on it; supersede s
   // sendWlRelease(A) fires (one per cycle, gated only on no-inflight here);
   // releaseImport(A) does NOT fire on supersede -- cache survives.
   const sup = m.step({ kind: "commit", surfaceId: 1, bufferId: 200, dims: dims(8, 8) });
+  m.step({ kind: "importCompleted", bufferId: 200 });
   assert.equal(pick(sup, "sendWlRelease", (x) => x.bufferId === 100).length, 1);
   assert.equal(pick(sup, "releaseImport").length, 0,
     "rule A: cache survives supersede, even of a poisoned buffer");
@@ -493,7 +601,7 @@ test("accessFailed poisons the buffer; no further beginAccess on it; supersede s
 
 test("buffer moved from surface A to surface B retires from A and adopts on B (no import twice)", () => {
   const m = new ClientBufferLifecycle();
-  m.step({ kind: "commit", surfaceId: 1, bufferId: 100, dims: dims(8, 8) });
+  commitImported(m, 1, 100, dims(8, 8));
   // Surface 1 currently has 100.
   const i = m.step({ kind: "commit", surfaceId: 2, bufferId: 100, dims: dims(8, 8) });
   assert.equal(pick(i, "importBuffer").length, 0, "no re-import on adopt-move");
@@ -522,9 +630,17 @@ test("3-buffer cycling: exactly 3 imports across many cycles (rule A cache survi
   // imported ONCE on first sight and the cache survives every supersede; the
   // re-attaches at i=3,4,5,... hit cache. This is the realistic dmabuf client
   // pattern (a 2-3 buffer pool rotated round-robin).
+  const seen = new Set();
   for (let i = 0; i < 9; i++) {
     const bufferId = ids[i % 3];
     allIntents.push(...m.step({ kind: "commit", surfaceId: 1, bufferId, dims: dims(8, 8) }));
+    // First sight of this bufferId: dispatch importCompleted to move it from
+    // Importing -> Imported. Subsequent commits of the same bufferId are
+    // no-ops in the state machine (cache hit, no import intent).
+    if (!seen.has(bufferId)) {
+      allIntents.push(...m.step({ kind: "importCompleted", bufferId }));
+      seen.add(bufferId);
+    }
     frame += 1;
     allIntents.push(...runFrame(m, [1], frame));
     allIntents.push(...m.step({ kind: "endAccessFenceExported", bufferId, fence: sfFence(2000 + frame) }));
@@ -548,8 +664,8 @@ test("3-buffer cycling: exactly 3 imports across many cycles (rule A cache survi
 
 test("teardown drains: surfaceRemoved + gpuCompleted all -> machine empty", () => {
   const m = new ClientBufferLifecycle();
-  m.step({ kind: "commit", surfaceId: 1, bufferId: 100, dims: dims(8, 8) });
-  m.step({ kind: "commit", surfaceId: 2, bufferId: 200, dims: dims(8, 8) });
+  commitImported(m, 1, 100, dims(8, 8));
+  commitImported(m, 2, 200, dims(8, 8));
   runFrame(m, [1, 2], 1);
   m.step({ kind: "endAccessFenceExported", bufferId: 100, fence: sfFence(1) });
   m.step({ kind: "endAccessFenceExported", bufferId: 200, fence: sfFence(2) });
@@ -645,9 +761,15 @@ function fuzzRun(seed) {
         allEverBuffers.set(bufferId, d);
         event = { kind: "commit", surfaceId, bufferId, dims: d };
         surfaces.add(surfaceId);
+        const isFirstSight = !liveBuffers.has(bufferId);
         liveBuffers.add(bufferId);
         destroyedBuffers.delete(bufferId);  // re-import after destroy is a new lifetime
         surfaceCurrent.set(surfaceId, bufferId);
+        // Stash for after the m.step() below: first-sight commits put the
+        // buffer in Importing and the fuzz's invariants assume Imported (a
+        // sampled buffer must produce a beginAccess intent). Drive
+        // importCompleted to transition.
+        event._firstSight = isFirstSight ? bufferId : null;
         break;
       }
       case "acquireFence": {
@@ -723,6 +845,18 @@ function fuzzRun(seed) {
     try { intents = m.step(event); }
     catch (e) {
       throw new Error(`fuzz step ${step} (seed=${seed}) threw: ${e.message}\nevent=${JSON.stringify(event)}\nlog:\n${log.slice(-10).map(JSON.stringify).join("\n")}`);
+    }
+    // Resolve first-sight commits immediately so frame samples find an
+    // Imported buffer. The dedicated "Importing window" tests below exercise
+    // the bufferDestroyed-during-import path explicitly.
+    if (event.kind === "commit" && event._firstSight !== null) {
+      const completionEvent = { kind: "importCompleted", bufferId: event._firstSight };
+      log.push(completionEvent);
+      try {
+        intents.push(...m.step(completionEvent));
+      } catch (e) {
+        throw new Error(`fuzz step ${step} (seed=${seed}) importCompleted threw: ${e.message}`);
+      }
     }
 
     // Track per-frame begins to attribute them when the frame ends.

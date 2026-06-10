@@ -276,6 +276,10 @@ void readMessages(napi_env env, napi_value arr, std::vector<MessageDesc>& out) {
         MessageDesc md;
         md.name = getStr(env, m, "name");
         md.since = getInt(env, m, "since", 1);
+        // The generator emits `type` as the XML <request>/<event> type
+        // attribute ("destructor" for destructor requests, otherwise null/
+        // missing). Only "destructor" is acted on; other values are ignored.
+        md.isDestructor = getStr(env, m, "type") == "destructor";
         napi_value argsArr; napi_get_named_property(env, m, "args", &argsArr);
         uint32_t an = 0; napi_get_array_length(env, argsArr, &an);
         for (uint32_t j = 0; j < an; ++j) {
@@ -303,6 +307,12 @@ void armWirePoll() {
     if (g_addon.compositor->wireHasPendingOut()) events |= UV_WRITABLE;
     uv_poll_start(&g_addon.wirePoll, events, onWireReadable);
 }
+
+// Mirror of armWirePoll for the ctrl fd: steady-state ctrl sends are buffered
+// through Compositor::ctrlSender_, and a backed-up queue must be drained on
+// fd-writable. Call after anything that may have queued ctrl output (every
+// site that hands a Message to the compositor's broker methods).
+void armCtrlPoll();
 
 // Advance every pending plugin-broker op against the latest drained ctrl state.
 // MUST run after ANY drainCtrl() on the Node thread: drainCtrl only RECORDS the
@@ -349,12 +359,26 @@ void onWireReadable(uv_poll_t*, int status, int events) {
 
 // Steady-state ctrl-fd drain: dispatches async control replies (ClientTexImported
 // finishing dmabuf imports). Same Node thread; no threadsafe function needed.
-void onCtrlReadable(uv_poll_t*, int status, int) {
+// Also handles UV_WRITABLE: every steady-state ctrl send is buffered through
+// CtrlSender, and a peer that briefly stops draining queues bytes here; this
+// pumps what the socket can now accept so the queue eventually empties.
+void onCtrlReadable(uv_poll_t*, int status, int events) {
     if (status < 0 || !g_addon.compositor) return;
-    g_addon.compositor->drainCtrl();
-    fireJsImports(g_addon.env);  // resolve JS dmabuf imports (opens its own scope)
-    advanceAllPending(g_addon.env);
-    armWirePoll();  // finishing an import flushes wire output (bind group etc.)
+    if (events & UV_WRITABLE) g_addon.compositor->ctrlPumpOut();
+    if (events & UV_READABLE) {
+        g_addon.compositor->drainCtrl();
+        fireJsImports(g_addon.env);  // resolve JS dmabuf imports (opens its own scope)
+        advanceAllPending(g_addon.env);
+        armWirePoll();  // finishing an import flushes wire output (bind group etc.)
+    }
+    armCtrlPoll();  // re-arm UV_WRITABLE based on remaining queue
+}
+
+void armCtrlPoll() {
+    if (!g_addon.loopRunning || !g_addon.compositor) return;
+    int events = UV_READABLE;
+    if (g_addon.compositor->ctrlHasPendingOut()) events |= UV_WRITABLE;
+    uv_poll_start(&g_addon.ctrlPoll, events, onCtrlReadable);
 }
 
 void onInputReadable(uv_poll_t*, int status, int) {
@@ -570,6 +594,7 @@ napi_value PluginCreateConnection(napi_env env, napi_callback_info info) {
     if (h.clientFd < 0) return throwError(env, "addWireConnection failed");
     napi_ref cbRef; napi_create_reference(env, argv[0], 1, &cbRef);
     g_pendingConnBrokers.push_back({h.connId, h.clientFd, cbRef});
+    armCtrlPoll();
     return nullptr;
 }
 
@@ -586,6 +611,7 @@ napi_value PluginInjectInstance(napi_env env, napi_callback_info info) {
     g_addon.compositor->injectPluginInstance(connId, id, gen);
     napi_ref cbRef; napi_create_reference(env, argv[3], 1, &cbRef);
     g_pendingInjects.push_back({connId, cbRef});
+    armCtrlPoll();
     return nullptr;
 }
 
@@ -600,6 +626,7 @@ napi_value PluginSetTickDevice(napi_env env, napi_callback_info info) {
     napi_get_value_uint32(env, argv[1], &id);
     napi_get_value_uint32(env, argv[2], &gen);
     g_addon.compositor->setPluginTickDevice(connId, id, gen);
+    armCtrlPoll();
     return nullptr;
 }
 
@@ -644,6 +671,7 @@ napi_value PluginAllocSurfaceBufferW(napi_env env, napi_callback_info info) {
         pluginSerial, core.coreWireSerial);
     napi_ref cbRef; napi_create_reference(env, argv[8], 1, &cbRef);
     g_pendingAllocs.push_back({core.surfaceBufId, connId, cbRef});
+    armCtrlPoll();
     return nullptr;
 }
 
@@ -679,6 +707,7 @@ napi_value CoreAllocComposeBufferW(napi_env env, napi_callback_info info) {
         pluginSerial, core.coreWireSerial);
     napi_ref cbRef; napi_create_reference(env, argv[8], 1, &cbRef);
     g_pendingAllocs.push_back({core.surfaceBufId, connId, cbRef});
+    armCtrlPoll();
     return nullptr;
 }
 
@@ -730,6 +759,7 @@ napi_value PluginReleaseSurfaceBuffer(napi_env env, napi_callback_info info) {
     if (!g_addon.compositor) return nullptr;
     napi_value argv[1]; uint32_t id = arg0u32(env, info, argv, 1);
     g_addon.compositor->releaseSurfaceBuf(id);
+    armCtrlPoll();
     return nullptr;
 }
 
@@ -794,6 +824,7 @@ napi_value CreateTextureFromDmabuf(napi_env env, napi_callback_info info) {
         importId = g_addon.compositor->importDmabufForJs(fd, w, h, fourcc, modifier, offset, stride);
         ::close(fd);  // GPU process dup'd it over SCM_RIGHTS
     }
+    armCtrlPoll();
     if (importId == 0) {
         // Could not start: invoke cb(null) now.
         napi_value cb, undefined, nul;
@@ -855,6 +886,7 @@ napi_value ReleaseDmabufImport(napi_env env, napi_callback_info info) {
     uint32_t importId = 0;
     napi_get_value_uint32(env, argv[0], &importId);
     if (importId != 0) g_addon.compositor->releaseDmabufImport(importId);
+    armCtrlPoll();
     return nullptr;
 }
 
@@ -1081,6 +1113,22 @@ napi_value PostEvent(napi_env env, napi_callback_info info) {
     // If the event minted a server-side new_id (e.g. wl_data_device.data_offer),
     // return the wrapped new resource so JS can send events on it; else undefined.
     if (minted) return minted;
+    napi_value undef; napi_get_undefined(env, &undef);
+    return undef;
+}
+
+// destroyResource(resource) -> undefined
+// Server-initiated destruction (e.g. wl_callback after its `done` event was
+// sent: the protocol says the callback IS the event and the resource has no
+// more uses). Trampoline drops the libwayland resource + its napi wrapper;
+// no-op if already destroyed.
+napi_value DestroyResource(napi_env env, napi_callback_info info) {
+    size_t argc = 1; napi_value argv[1];
+    napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+    if (argc < 1 || !g_addon.trampoline) {
+        napi_value undef; napi_get_undefined(env, &undef); return undef;
+    }
+    g_addon.trampoline->destroyResource(argv[0]);
     napi_value undef; napi_get_undefined(env, &undef);
     return undef;
 }
@@ -1472,6 +1520,7 @@ napi_value Init(napi_env env, napi_value exports) {
     reg("injectInput", InjectInput);
     reg("injectHostInput", InjectHostInput);
     reg("clientId", ClientId);
+    reg("destroyResource", DestroyResource);
     reg("keymapInfo", KeymapInfo);
     reg("keyUpdate", KeyUpdate);
     reg("dmabufFeedbackInfo", DmabufFeedbackInfo);

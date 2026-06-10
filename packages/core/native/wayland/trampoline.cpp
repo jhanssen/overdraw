@@ -132,6 +132,21 @@ napi_value Trampoline::wrapResource(wl_resource* resource, const std::string& if
     return obj;
 }
 
+bool Trampoline::destroyResource(napi_value resourceHandle) {
+    napi_value ext;
+    if (napi_get_named_property(env_, resourceHandle, "__resource", &ext) != napi_ok)
+        return false;
+    void* ptr = nullptr;
+    if (napi_get_value_external(env_, ext, &ptr) != napi_ok || !ptr) return false;
+    auto* resource = static_cast<wl_resource*>(ptr);
+    // Skip if our wrapper map no longer has it (a destroy listener already
+    // ran -- the libwayland resource is gone). Avoids calling
+    // wl_resource_destroy on a dangling pointer.
+    if (wrappers_.find(resource) == wrappers_.end()) return true;
+    wl_resource_destroy(resource);
+    return true;
+}
+
 void Trampoline::forgetResource(wl_resource* resource) {
     auto it = wrappers_.find(resource);
     if (it == wrappers_.end()) return;
@@ -420,6 +435,18 @@ int Trampoline::onDispatch(const void* implData, void* target, uint32_t opcode,
         }
     }
     napi_close_handle_scope(env, scope);
+
+    // For destructor requests (XML type="destructor": wl_buffer.destroy,
+    // wl_surface.destroy, wl_pointer.release, etc.) the protocol contract is
+    // that this resource is gone. The per-protocol JS handler did its
+    // bookkeeping (TS map deletes, lifecycle dispatches); now release the
+    // libwayland-side resource so the wl_resource and its napi_ref aren't
+    // leaked for the client's lifetime. forgetResource (via the destroy
+    // listener) drops the cached wrapper and flips destroyed=true on the JS
+    // handle, so any stale JS reference is harmless.
+    if (self->registry_->isRequestDestructor(st->name, opcode)) {
+        wl_resource_destroy(resource);
+    }
     return 0;
 }
 

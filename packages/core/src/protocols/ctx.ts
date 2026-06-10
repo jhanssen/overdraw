@@ -241,6 +241,15 @@ export interface CompositorState {
   // last flush. The frame sweep drains this into window.change events. Populated
   // by set_title/set_app_id and keyboard-focus changes. Created lazily.
   pendingWindowChanges?: Map<number, Set<WindowChangeField>>;
+  // Per-output toplevel-order filter set by sdk.windows.setOutputStack
+  // (workspace plugin, etc). The protocol layer is the single owner of the
+  // compositor's per-output draw stack: rebuildStackWithPopups expands each
+  // filter into [toplevel, ...subsurface subtree, ...popups parented under
+  // it] in the filter's toplevel order and pushes via setOutputStack. The
+  // broker writes this map and triggers a rebuild; it does NOT call
+  // compositor.setOutputStack directly (that would clobber subsurfaces +
+  // popups, which the workspace plugin doesn't model).
+  outputToplevelStacks?: Map<number, number[]>;
 }
 
 export interface SubsurfaceRecord {

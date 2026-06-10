@@ -24,20 +24,34 @@ Compositor::Compositor(int wireFd, int ctrlFd, pid_t gpuPid,
     // All inter-process fds are non-blocking: no write may ever park (it would
     // wedge the single-threaded GPU process and deadlock the pair). Buffered
     // writers (FdSerializer / CtrlSender) queue what the socket can't take and
-    // drain on writable. ctrlFd is also set non-blocking in handshake() after
-    // the first blocking Hello; set it here too for clarity/idempotence.
+    // drain on writable. The wire fd is non-blocking immediately; the ctrl fd
+    // is flipped to non-blocking in handshake() after the one-shot blocking
+    // Hello completes. The CtrlSender is constructed at that same point.
     ipc::setNonBlocking(wireFd_);
-    ipc::setNonBlocking(ctrlFd_);
 }
 
 Compositor::~Compositor() { shutdown(); }
 
+void Compositor::ctrlPumpOut() {
+    if (ctrlSender_) ctrlSender_->pumpOut();
+}
+
+bool Compositor::ctrlHasPendingOut() const {
+    return ctrlSender_ && ctrlSender_->hasPendingOut();
+}
+
 bool Compositor::handshake() {
+    // Hello is the one-shot blocking send. The peer is actively draining its
+    // startup spin and the socket buffer is empty, so the brief block is safe
+    // (the contract from transport.h: blocking sendMessage is for handshake
+    // only). After Hello we flip the fd non-blocking and construct CtrlSender
+    // for every subsequent send.
     ipc::Message hello{};
     hello.tag = ipc::Tag::Hello;
     hello.protocolVersion = ipc::kProtocolVersion;
     ipc::sendMessage(ctrlFd_, hello);
-    ::fcntl(ctrlFd_, F_SETFL, O_NONBLOCK);
+    ipc::setNonBlocking(ctrlFd_);
+    ctrlSender_ = std::make_unique<ipc::CtrlSender>(ctrlFd_);
 
     bool got = false;
     ipc::Message m{};
@@ -273,7 +287,7 @@ uint32_t Compositor::importDmabufForJs(int fd, uint32_t width, uint32_t height,
     m.planeStride = stride;
     m.planeCount = 1;
     int fds[1] = {fd};
-    if (!ipc::sendMessageFds(ctrlFd_, m, fds, 1)) {
+    if (!ctrlSender_->send(m, fds, 1)) {
         // The peer never observed this reservation; safe to recycle the id.
         tr.discard();
         return 0;
@@ -292,7 +306,7 @@ void Compositor::releaseDmabufImport(uint32_t importId) {
     ipc::Message m{};
     m.tag = ipc::Tag::ReleaseClientTex;
     m.texture = {it->second.id, it->second.generation};
-    ipc::sendMessage(ctrlFd_, m);
+    ctrlSender_->send(m);
     jsImportHandles_.erase(it);
 }
 
@@ -303,7 +317,7 @@ void Compositor::releaseSurfaceBuf(uint32_t surfaceBufId) {
     ipc::Message m{};
     m.tag = ipc::Tag::ReleaseSurfaceBuf;
     m.surfaceBufId = surfaceBufId;
-    ipc::sendMessage(ctrlFd_, m);
+    ctrlSender_->send(m);
     // The reservation was PUBLISHED to the GPU process (which InjectTexture'd
     // it server-side). commit() it -- the deferred-reclaim policy keeps the
     // wire id from being recycled even after we drop our bookkeeping. See
@@ -458,7 +472,7 @@ void Compositor::sendAllocSurfaceBuf(uint32_t surfaceBufId, uint32_t connId,
     buildAllocMessage(m, ipc::Tag::AllocSurfaceBuf, surfaceBufId, connId,
         width, height, pluginDevice, pluginTexture, coreDevice, coreTexture,
         pluginReservePointSerial, coreReservePointSerial);
-    ipc::sendMessage(ctrlFd_, m);
+    ctrlSender_->send(m);
 }
 
 void Compositor::sendAllocComposeBuf(uint32_t surfaceBufId, uint32_t connId,
@@ -471,7 +485,7 @@ void Compositor::sendAllocComposeBuf(uint32_t surfaceBufId, uint32_t connId,
     buildAllocMessage(m, ipc::Tag::AllocComposeBuf, surfaceBufId, connId,
         width, height, pluginDevice, pluginTexture, coreDevice, coreTexture,
         pluginReservePointSerial, coreReservePointSerial);
-    ipc::sendMessage(ctrlFd_, m);
+    ctrlSender_->send(m);
 }
 
 int Compositor::surfaceBufAllocated(uint32_t surfaceBufId) const {
@@ -559,8 +573,8 @@ Compositor::PluginConnHandle Compositor::addWireConnection() {
     m.tag = ipc::Tag::AddWireConn;
     m.connId = connId;
     int sendFds[1] = {fds[1]};
-    if (!ipc::sendMessageFds(ctrlFd_, m, sendFds, 1)) {
-        std::fprintf(stderr, "[core] addWireConnection: sendMessageFds failed\n");
+    if (!ctrlSender_->send(m, sendFds, 1)) {
+        std::fprintf(stderr, "[core] addWireConnection: ctrlSender send failed\n");
         ::close(fds[0]); ::close(fds[1]);
         return h;
     }
@@ -578,7 +592,7 @@ void Compositor::injectPluginInstance(uint32_t connId, uint32_t instanceId,
     m.connId = connId;
     m.instance = {instanceId, instanceGen};
     pluginInstanceInjected_[connId] = 0;  // pending
-    ipc::sendMessage(ctrlFd_, m);
+    ctrlSender_->send(m);
 }
 
 void Compositor::setPluginTickDevice(uint32_t connId, uint32_t deviceId, uint32_t deviceGen) {
@@ -586,7 +600,7 @@ void Compositor::setPluginTickDevice(uint32_t connId, uint32_t deviceId, uint32_
     m.tag = ipc::Tag::SetPluginTickDevice;
     m.connId = connId;
     m.device = {deviceId, deviceGen};
-    ipc::sendMessage(ctrlFd_, m);
+    ctrlSender_->send(m);
 }
 
 int Compositor::wireConnAdded(uint32_t connId) const {
@@ -628,8 +642,23 @@ void Compositor::shutdown() {
     shutdownDone_ = true;
 
     if (ctrlFd_ >= 0) {
+        // Drain anything still queued on the CtrlSender (releaseSurfaceBuf etc.
+        // emitted late in teardown) BEFORE the Shutdown message so the peer
+        // sees them in order. ctrlSender_ may be null if handshake failed; the
+        // Shutdown send below is then the only ctrl write needed.
         ipc::Message m{}; m.tag = ipc::Tag::Shutdown;
-        ipc::sendMessage(ctrlFd_, m);
+        if (ctrlSender_) {
+            ctrlSender_->send(m);
+            // Best-effort drain. If the peer is genuinely wedged the queue
+            // will persist past this; we're tearing the process down either
+            // way, so blocking longer would just delay the user.
+            for (int i = 0; i < 50 && ctrlSender_->hasPendingOut(); ++i) {
+                ctrlSender_->pumpOut();
+                ::usleep(2000);
+            }
+        } else {
+            ipc::sendMessage(ctrlFd_, m);
+        }
         link_->flush();
     }
     // Release wgpu objects before tearing down the wire link. Each pending
@@ -655,6 +684,10 @@ void Compositor::shutdown() {
         ::close(dmabufFeedback_.formatTableFd);
         dmabufFeedback_.formatTableFd = -1;
     }
+    // Drop the CtrlSender before closing ctrlFd_: its destructor close()s any
+    // fds dup'd into the unsent queue (they're our copies the peer never got),
+    // and the underlying ctrlFd_ slot is about to be invalidated.
+    ctrlSender_.reset();
     if (wireFd_ >= 0) { ::close(wireFd_); wireFd_ = -1; }
     if (ctrlFd_ >= 0) { ::close(ctrlFd_); ctrlFd_ = -1; }
     reapGpuProcess(gpuPid_);

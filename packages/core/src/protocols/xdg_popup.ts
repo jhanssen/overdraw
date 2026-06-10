@@ -99,19 +99,38 @@ export function maybeDismissGrabbedPopup(ctx: Ctx, x: number, y: number): boolea
   return true;
 }
 
-// Rebuild the draw stack: WM windows (back-to-front) each followed by their
-// subsurfaces, then mapped popups on top (a popup draws above its parent; nested
-// popups above their parent popup). Popups are placed at their parent's output
-// origin + the popup's parent-relative rect.
-export function rebuildStackWithPopups(state: CompositorState): void {
-  const wm = state.wm;
-  if (!wm) return;
-  // Base = WM windows interleaved with their subsurface subtrees (also sets each
-  // subsurface's layout). Popups go on top of that.
-  const stack: number[] = computeBaseStack(state);
+// Walk a popup's parent chain back to the root toplevel xdg_surface. Returns
+// the root toplevel's surfaceId, or null if the chain is malformed (orphan
+// popup, parent without a wl_surface). Used to attribute a popup to a single
+// toplevel for per-output stack filtering.
+function popupRootToplevelId(state: CompositorState, pr: PopupRecord): number | null {
+  let parent: XdgSurfaceRecord = pr.parent;
+  // Bounded walk to avoid pathological cycles (popups shouldn't cycle, but a
+  // misbehaving client / mis-set state shouldn't lock us up).
+  for (let i = 0; i < 64; i++) {
+    if (parent.role === "toplevel") return parent.surface?.id ?? null;
+    if (parent.role !== "popup" || !parent.popup) return null;
+    const grand = state.popups?.get(parent.popup);
+    if (!grand) return null;
+    parent = grand.parent;
+  }
+  return null;
+}
+
+// Append the popup chain to `stack`, in parent-before-child order, setting each
+// popup's output-space layout rect. `includePopup` filters which popups draw
+// (per-output expansion uses the filter; global pass returns true for all).
+// Subsurfaces parented under an included popup are walked the same way as for
+// window roots.
+function appendPopups(
+  state: CompositorState,
+  stack: number[],
+  includePopup: (pr: PopupRecord) => boolean,
+): void {
   // Mapped popups, ordered parent-before-child (creation order approximates this).
   for (const pr of state.popups?.values() ?? []) {
     if (!pr.mapped || !pr.xdgSurface.surface) continue;
+    if (!includePopup(pr)) continue;
     const origin = parentOutputOrigin(state, pr.parent);
     if (!origin) continue;
     const px = origin.x + pr.rect.x, py = origin.y + pr.rect.y;
@@ -121,5 +140,55 @@ export function rebuildStackWithPopups(state: CompositorState): void {
     // subsurface subtree above it (same walk as for window roots).
     emitSubtree(state, pr.xdgSurface.surface.resource, px, py, stack);
   }
-  state.compositor.setStack(stack);
+}
+
+// Rebuild the draw stack: WM windows (back-to-front) each followed by their
+// subsurfaces, then mapped popups on top (a popup draws above its parent; nested
+// popups above their parent popup). Popups are placed at their parent's output
+// origin + the popup's parent-relative rect.
+//
+// Also republishes every per-output toplevel filter
+// (state.outputToplevelStacks) as a fully-expanded list (toplevels + their
+// subsurface subtrees + popups whose root toplevel is in the filter), in the
+// filter's order. The compositor's per-output stack is a strict override of
+// the global stack, so the filter must contain the full draw list -- a
+// toplevels-only list would clobber subsurfaces and popups (workspace plugin
+// only knows toplevels). Single owner of all setStack / setOutputStack pushes.
+export function rebuildStackWithPopups(state: CompositorState): void {
+  const wm = state.wm;
+  if (!wm) return;
+
+  // --- Global stack: all toplevels in WM order + their subsurfaces + all popups.
+  const globalStack: number[] = computeBaseStack(state, wm.state.windows);
+  appendPopups(state, globalStack, () => true);
+  state.compositor.setStack(globalStack);
+
+  // --- Per-output filtered stacks. Each filter is a toplevel-id order; expand
+  // it analogously to the global pass.
+  const filters = state.outputToplevelStacks;
+  if (!filters || filters.size === 0) return;
+  if (!state.compositor.setOutputStack) return;
+
+  for (const [outputId, toplevelIds] of filters) {
+    // Build the WM-window list in the filter's order. Surfaces in the filter
+    // that aren't (yet) WM windows are dropped silently -- matches the
+    // global pass, which only iterates WM windows.
+    const byId = new Map<number, typeof wm.state.windows[number]>();
+    for (const w of wm.state.windows) byId.set(w.surfaceId, w);
+    const ordered: typeof wm.state.windows = [];
+    for (const id of toplevelIds) {
+      const w = byId.get(id);
+      if (w) ordered.push(w);
+    }
+    const stack: number[] = computeBaseStack(state, ordered);
+
+    // Popups whose root toplevel is in the filter.
+    const inFilter = new Set(toplevelIds);
+    appendPopups(state, stack, (pr) => {
+      const root = popupRootToplevelId(state, pr);
+      return root !== null && inFilter.has(root);
+    });
+
+    state.compositor.setOutputStack(outputId, stack);
+  }
 }

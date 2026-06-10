@@ -58,6 +58,11 @@ export type LifecycleEvent =
   | { kind: "gpuCompleted"; serial: number }
   | { kind: "bufferDestroyed"; bufferId: number }
   | { kind: "surfaceRemoved"; surfaceId: number }
+  // Executor reports the async importBuffer intent completed: the GPU
+  // import is now live, the buffer transitions Importing -> Imported, and
+  // any owed releaseImport (a bufferDestroyed or surfaceRemoved-drain that
+  // arrived while Importing) fires now via maybeFlush.
+  | { kind: "importCompleted"; bufferId: number }
   | { kind: "accessFailed"; bufferId: number; reason: string };
 
 export type LifecycleIntent =
@@ -72,11 +77,20 @@ export type LifecycleIntent =
 // or the only surface referencing it is torn down. Supersede does NOT drop
 // the cache -- that's what makes a buffer-cycling client efficient and what
 // fixes the import-twice bug for real.)
-type BufferState = "Imported" | "Poisoned";
-//   Imported: cached server-side, may or may not currently be a surface's
-//             current. Stays in this state across supersedes; only
-//             bufferDestroyed/surfaceRemoved-drain takes it out.
-//   Poisoned: accessFailed; no further begins; release path still runs.
+type BufferState = "Importing" | "Imported" | "Poisoned";
+//   Importing: first sight; importBuffer intent fired, but the executor has
+//              not yet reported its GPU import is live (the async addon
+//              callback is in flight). frameSampled skips a surface whose
+//              current buffer is Importing; releaseImport is held until
+//              importCompleted lands. Without this state, bufferDestroyed
+//              arriving during the import window emits releaseImport with
+//              no cache yet -- the late callback then stashes an unreachable
+//              import, leaking its native importId.
+//   Imported:  cached server-side, may or may not currently be a surface's
+//              current. Stays in this state across supersedes; only
+//              bufferDestroyed/surfaceRemoved-drain takes it out.
+//   Poisoned:  accessFailed (or import failure); no further begins; release
+//              path still runs.
 // (No explicit Released/Retiring: the entry is deleted once released.)
 
 interface BufferRec {
@@ -156,6 +170,7 @@ export class ClientBufferLifecycle {
       case "gpuCompleted": this.onGpuCompleted(event.serial); break;
       case "bufferDestroyed": this.onBufferDestroyed(event.bufferId); break;
       case "surfaceRemoved": this.onSurfaceRemoved(event.surfaceId); break;
+      case "importCompleted": this.onImportCompleted(event.bufferId); break;
       case "accessFailed": this.onAccessFailed(event.bufferId, event.reason); break;
     }
     return this.out;
@@ -169,10 +184,12 @@ export class ClientBufferLifecycle {
 
     // First sight of this buffer (or first re-sight after the cache was torn
     // down by bufferDestroyed): import and cache it. Cache hit = no import.
+    // New entries start in Importing; the executor drives importCompleted
+    // (success) or accessFailed (failure) to transition.
     let b = this.buffers.get(bufferId);
     if (!b) {
       b = {
-        state: "Imported", currentSurfaceId: surfaceId, destroyed: false,
+        state: "Importing", currentSurfaceId: surfaceId, destroyed: false,
         releaseOwed: false, importOwed: false,
         chainFence: { kind: "none" }, pendingAcquireFence: { kind: "none" },
         inflightSerials: new Set(), accessOpen: false, dims,
@@ -234,6 +251,13 @@ export class ClientBufferLifecycle {
     const b = this.buffers.get(bufferId);
     if (!b) return;
     if (b.state === "Poisoned") return;  // accessFailed: skip this surface's draw
+    if (b.state === "Importing") return; // import in flight: executor has no
+                                         // GPU handle yet to BeginAccess
+                                         // against. Mirrors the executor's own
+                                         // gate in openImportBrackets (skip
+                                         // surfaces whose import hasn't
+                                         // resolved). Surface stays last-good
+                                         // until importCompleted.
 
     if (b.accessOpen) {
       // Invariant 2: a second beginAccess without an endAccess on the same B
@@ -367,6 +391,23 @@ export class ClientBufferLifecycle {
     b.state = "Poisoned";
     // The buffer keeps its surface/inflight state -- it can still be released
     // normally. We just won't emit any more beginAccess for it.
+    // If the buffer was Importing when the failure landed, maybeFlush may now
+    // emit a deferred releaseImport (e.g. bufferDestroyed arrived during
+    // import). Without this, the executor's reservation leaks.
+    this.maybeFlush(bufferId);
+  }
+
+  private onImportCompleted(bufferId: number): void {
+    const b = this.buffers.get(bufferId);
+    if (!b) return;
+    if (b.state !== "Importing") return;  // late: failure / supersede races
+    b.state = "Imported";
+    // If a bufferDestroyed (or surfaceRemoved drain) arrived while Importing,
+    // the importOwed flag is set; emit the deferred releaseImport now that
+    // the executor's import is live and can actually be released. maybeFlush
+    // gates on inflightSerials/accessOpen, both empty in the Importing window
+    // (frameSampled skipped this buffer), so it fires immediately.
+    this.maybeFlush(bufferId);
   }
 
   // --- helpers ---
@@ -402,6 +443,11 @@ export class ClientBufferLifecycle {
     if (!b) return;
     if (b.inflightSerials.size > 0) return;
     if (b.accessOpen) return;
+    if (b.state === "Importing") return;  // wait for importCompleted: the
+                                          // executor has no live import to
+                                          // releaseImport against, and
+                                          // sendWlRelease would race the
+                                          // not-yet-completed import path
 
     if (b.releaseOwed) {
       // Invariant 8: never sendWlRelease for a destroyed buffer.

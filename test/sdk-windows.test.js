@@ -53,10 +53,15 @@ function mockSink() {
 function res(id) { return { resource: { id, version: 1, destroyed: false } }; }
 
 // Build a minimal CompositorState shape that the windows broker uses.
-function makeCoreState(wm, bus, seat = null) {
+// `sink` is the same compositor passed to createWindowsBroker so the
+// protocol-layer rebuild (rebuildStackWithPopups) and the broker's direct
+// sink call agree on a single backend; the legacy `compositor: null` works
+// only as long as the broker never reaches into state.compositor, which it
+// now does (set-output-stack triggers a stack rebuild).
+function makeCoreState(wm, bus, sink, seat = null) {
   return {
     bus, wm, pendingWindowChanges: undefined, surfaces: new Map(),
-    seat, compositor: null, decorationResize: null,
+    seat, compositor: sink, decorationResize: null,
   };
 }
 
@@ -85,7 +90,7 @@ async function withWindowsSetup(targetId, fn, opts = {}) {
   wm.addWindow(targetId, res(targetId));
   wm.windowHasContent(targetId);
 
-  const state = makeCoreState(wm, bus, opts.seat ?? null);
+  const state = makeCoreState(wm, bus, sink, opts.seat ?? null);
   const broker = createWindowsBroker({ wm, compositor: sink, state, pluginBus, bus });
 
   await withRuntime({

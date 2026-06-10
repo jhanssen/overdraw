@@ -30,6 +30,13 @@ struct ArgDesc {
 struct MessageDesc {
     std::string name;
     int since = 1;
+    // True for requests marked type="destructor" in the protocol XML. The
+    // trampoline calls wl_resource_destroy on the resource after dispatching
+    // such a request, so the libwayland-side resource and its napi wrapper
+    // are released without the per-protocol JS handler having to (it can't:
+    // wl_resource_destroy is not exposed to JS, and forgetting to call it
+    // would leak the resource + napi_ref for the client's lifetime).
+    bool isDestructor = false;
     std::vector<ArgDesc> args;
 };
 struct InterfaceDesc {
@@ -51,6 +58,12 @@ class InterfaceRegistry {
 
     // The built wl_interface for `name`, or nullptr.
     const wl_interface* get(const std::string& name) const;
+
+    // True iff `interfaceName` is registered, `opcode` is a valid request
+    // opcode for it, and the corresponding XML <request> is type="destructor".
+    // The trampoline consults this after dispatching to decide whether to
+    // wl_resource_destroy the target.
+    bool isRequestDestructor(const std::string& interfaceName, uint32_t opcode) const;
 
   private:
     struct Built {

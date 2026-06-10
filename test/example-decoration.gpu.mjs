@@ -69,10 +69,23 @@ test("example animated-gradient decoration composites + animates", { skip }, asy
     await client.ready; await waitFor(c.query, (s) => s.windows.length === 2);
 
     const win = c.query().windows.find((w) => w.appId === "org.test.app");
-    const cr = win.rect;
-    // Atomic appearance: content held until the decoration's first frame.
-    await waitFor(() => ({ g: c.state.wm.isContentGated(win.surfaceId) }),
-      (s) => s.g === false, { what: "gate release" });
+    // Atomic appearance: wait for the decoration to be bound AND the gate to
+    // have been released (i.e. the decoration's first frame has presented).
+    // Checking `isContentGated === false` ALONE is not enough: the gate's
+    // never-armed initial state is also false, so the wait would sail through
+    // the window between `windows.length === 2` (addWindow at get_toplevel)
+    // and `window.map` (first content) firing onAssigned -> setContentGated.
+    // Requiring decorationSurfaceId !== undefined first sequences this: the
+    // surface id is set by setDecorationSurface AFTER the broker's
+    // surface.alloc completes for this window's decoration, which only
+    // happens after onAssigned (= gate was armed). So once both conditions
+    // are met, the gate has been armed and then released by first-present.
+    await waitFor(() => {
+      const w = c.state.wm.state.windows.find((x) => x.surfaceId === win.surfaceId);
+      return { d: w?.decorationSurfaceId, g: w?.contentGated };
+    }, (s) => s.d !== undefined && s.g === false,
+       { what: "decoration bound + gate released" });
+    const cr = c.state.wm.state.windows.find((w) => w.surfaceId === win.surfaceId).rect;
 
     const sx = cr.x + 5, sy = Math.max(0, cr.y - 12);   // in the titlebar band
     c.jsCompositor.renderFrame();

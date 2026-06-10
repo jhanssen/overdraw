@@ -140,6 +140,16 @@ int run(int wireFd, int ctrlFd, int inputFd, bool headless,
     ipc::setNonBlocking(ctrlFd);
     ipc::setNonBlocking(wireFd);  // buffered FdSerializer/FrameReader require NB
 
+    // Buffered non-blocking sender for steady-state ctrl replies. The core side
+    // briefly stops draining whenever its Node thread is busy (frame render, JS
+    // GC, etc.); a peer that backs up cannot wedge us as long as we never park
+    // in a write. Bringup-phase sends (HelloReply, SurfaceReady, FeedbackData)
+    // stay on blocking sendMessage by the contract in transport.h: the core is
+    // actively recv-spinning for them so the buffer cannot fill, and the
+    // recv-spin loop in this function does not pump CtrlSender, so queueing
+    // wouldn't help anyway.
+    ipc::CtrlSender ctrlSender(ctrlFd);
+
     // Set once the client's device is resolved (step 5). Device/queue-level
     // async ops (buffer MapAsync, OnSubmittedWorkDone) only resolve when the
     // device's queue is advanced via DeviceTick; InstanceProcessEvents alone
@@ -545,6 +555,10 @@ int run(int wireFd, int ctrlFd, int inputFd, bool headless,
         if (mem.EndAccess(tex, &endState) != wgpu::Status::Success) {
             std::fprintf(stderr, "[gpu] %sEnd: EndAccess failed (buf=%u)\n",
                          producer ? "Producer" : "Consumer", surfaceBufId);
+            // A failed End leaves nothing for the peer to wait on. Clear any
+            // stale fence from the previous successful End so the peer's next
+            // Begin doesn't wait on an obsolete fence.
+            (producer ? sb.producerFence : sb.consumerFence) = nullptr;
             return;
         }
         if (producer) sb.producerOpen = false; else sb.consumerOpen = false;
@@ -589,6 +603,40 @@ int run(int wireFd, int ctrlFd, int inputFd, bool headless,
             return false;
         }
         SurfaceBuf& sb = it->second;
+        // CROSS-WIRE FENCE ORDERING (consumer Begin only).
+        //
+        // The consumer Begin rides the CORE wire while the matching producer
+        // End rides the PLUGIN wire -- two independent FIFOs. The event loop
+        // pumps the core wire before each plugin connection, so when both
+        // frames are buffered at the start of one iteration, the consumer
+        // Begin is decoded first. That opens the bracket with no fence wait
+        // AND a UNDEFINED -> GENERAL image-layout transition, which Vulkan is
+        // allowed to discard the image contents on. Result: a corrupt or
+        // empty consumer sample on that slot until the next cycle heals it.
+        //
+        // SAFE BY CONSTRUCTION: the worker writes producer End to its socket
+        // BEFORE sending the surface.present IPC that triggers the consumer
+        // Begin. So whenever we see a consumer Begin with the producer's
+        // bracket still open on this buf, the producer End is already in the
+        // kernel recv buffer for the owning plugin connection. A single
+        // non-blocking drain of that connection picks it up before we open
+        // the consumer bracket. No poll, no event-loop stall.
+        if (!producer && (sb.producerOpen || !sb.everProduced)) {
+            PluginConn* owner = nullptr;
+            for (auto& c : pluginConns) if (c->connId == sb.connId) { owner = c.get(); break; }
+            if (owner) {
+                owner->pump();
+                owner->barrier.drain(owner->reader->bytesConsumed());
+                if (sb.producerOpen || !sb.everProduced) {
+                    std::fprintf(stderr,
+                        "[gpu] ConsumerBegin buf=%u: producer End not yet decoded after pump "
+                        "(producerOpen=%d everProduced=%d). Proceeding with no fence wait; "
+                        "this slot may sample stale/zeroed contents.\n",
+                        surfaceBufId,
+                        sb.producerOpen ? 1 : 0, sb.everProduced ? 1 : 0);
+                }
+            }
+        }
         wgpu::SharedTextureMemory& mem = producer ? sb.producerMem : sb.consumerMem;
         wgpu::Texture& tex = producer ? sb.producerTex : sb.consumerTex;
         // Producer waits the consumer's last fence; consumer waits the
@@ -612,7 +660,8 @@ int run(int wireFd, int ctrlFd, int inputFd, bool headless,
         } else {
             bad.fenceCount = 0;
         }
-        if (mem.BeginAccess(tex, &bad) != wgpu::Status::Success) {
+        wgpu::Status ba = mem.BeginAccess(tex, &bad);
+        if (ba != wgpu::Status::Success) {
             std::fprintf(stderr, "[gpu] %sBegin: BeginAccess failed (buf=%u)\n",
                          producer ? "Producer" : "Consumer", surfaceBufId);
             return false;
@@ -678,7 +727,7 @@ int run(int wireFd, int ctrlFd, int inputFd, bool headless,
         } else {
             ::close(cb.fd);
         }
-        ipc::sendMessage(ctrlFd, reply);
+        ctrlSender.send(reply);
     };
 
     // Open a per-frame BeginAccess on a cached client texture. Re-exports the
@@ -957,7 +1006,7 @@ int run(int wireFd, int ctrlFd, int inputFd, bool headless,
             reply.surfaceBufId = m.surfaceBufId;
             reply.connId = m.connId;
             reply.ok = 0;
-            ipc::sendMessage(ctrlFd, reply);
+            ctrlSender.send(reply);
             return;
         }
         // The plugin connection always needs a ticked device (its own queue
@@ -985,7 +1034,7 @@ int run(int wireFd, int ctrlFd, int inputFd, bool headless,
             reply.surfaceBufId = m.surfaceBufId;
             reply.connId = m.connId;
             reply.ok = 0;
-            ipc::sendMessage(ctrlFd, reply);
+            ctrlSender.send(reply);
             return;
         }
         // Stage the SurfaceBuf NOW (its textures/STMs are imported on both
@@ -1008,7 +1057,7 @@ int run(int wireFd, int ctrlFd, int inputFd, bool headless,
         state->msg = m;
         state->producerOnCore = producerOnCore;
         state->sb = std::move(sb);
-        auto finalize = [&surfaceBufs, &alloc, &serializer, ctrlFd, state, tagName]() {
+        auto finalize = [&surfaceBufs, &alloc, &serializer, &ctrlSender, state, tagName]() {
             ipc::Message reply{};
             reply.tag = ipc::Tag::SurfaceBufAllocated;
             reply.surfaceBufId = state->msg.surfaceBufId;
@@ -1032,7 +1081,7 @@ int run(int wireFd, int ctrlFd, int inputFd, bool headless,
                 state->sb.consumerMem = nullptr;
                 alloc.release(state->sb.buf);
             }
-            ipc::sendMessage(ctrlFd, reply);
+            ctrlSender.send(reply);
         };
         // The two injects go on the wires their target device lives on. The
         // serial each waits for is the reserve-point on that wire.
@@ -1107,7 +1156,7 @@ int run(int wireFd, int ctrlFd, int inputFd, bool headless,
                 reply.ok = 0;
                 if (nRecvFds < 1) {
                     std::fprintf(stderr, "[gpu] AddWireConn: no fd received\n");
-                    ipc::sendMessage(ctrlFd, reply);
+                    ctrlSender.send(reply);
                 } else {
                     int connFd = recvFds[0];
                     ipc::setNonBlocking(connFd);
@@ -1175,7 +1224,7 @@ int run(int wireFd, int ctrlFd, int inputFd, bool headless,
                                 m.connId, connFd);
                     pluginConns.push_back(std::move(pc));
                     reply.ok = 1;
-                    ipc::sendMessage(ctrlFd, reply);
+                    ctrlSender.send(reply);
                 }
             } else if (m.tag == ipc::Tag::InjectPluginInstance) {
                 // Inject the connection's native instance at the handle the
@@ -1198,7 +1247,7 @@ int run(int wireFd, int ctrlFd, int inputFd, bool headless,
                                 m.connId, m.instance.id, m.instance.generation);
                     reply.ok = 1;
                 }
-                ipc::sendMessage(ctrlFd, reply);
+                ctrlSender.send(reply);
             } else if (m.tag == ipc::Tag::SetPluginTickDevice) {
                 // Resolve the plugin device + tick it each pump so its queue
                 // advances (map/work-done complete). Without this the plugin
@@ -1347,7 +1396,7 @@ int run(int wireFd, int ctrlFd, int inputFd, bool headless,
                     reply.tag = ipc::Tag::ClientTexImported;
                     reply.texture = m.texture;
                     reply.importOk = 0;
-                    ipc::sendMessage(ctrlFd, reply);
+                    ctrlSender.send(reply);
                 } else {
                     // Defer (or run immediately) via the core wire barrier: the
                     // inject must wait for the wire reader to have applied the
@@ -1409,22 +1458,33 @@ int run(int wireFd, int ctrlFd, int inputFd, bool headless,
         loop->modify(wireFd, ev);
     };
 
+    auto armCtrl = [&] {
+        uint32_t ev = gpu::EventLoop::kRead;
+        if (ctrlSender.hasPendingOut()) ev |= gpu::EventLoop::kWrite;
+        loop->modify(ctrlFd, ev);
+    };
+
     loop->add(wireFd, gpu::EventLoop::kRead, [&](uint32_t ready) {
         if (ready & gpu::EventLoop::kWrite) serializer.pumpOut();
         if (ready & gpu::EventLoop::kRead) { if (!pumpWire()) shutdown = true; }
         drainCoreBarrier();  // core wire advanced -> some deferred ctrl ops may be ready
         armWire();
+        armCtrl();          // drainCoreBarrier ran deferred ops that may have queued ctrl replies
     });
-    loop->add(ctrlFd, gpu::EventLoop::kRead, [&](uint32_t) {
-        ipc::Message m{};
-        int recvFds[ipc::kMaxMsgFds];
-        int nRecvFds = 0;
-        while (ipc::recvMessageNBFds(ctrlFd, m, recvFds, &nRecvFds)) {
-            dispatchCtrl(m, recvFds, nRecvFds);
-            if (shutdown) break;
+    loop->add(ctrlFd, gpu::EventLoop::kRead, [&](uint32_t ready) {
+        if (ready & gpu::EventLoop::kWrite) ctrlSender.pumpOut();
+        if (ready & gpu::EventLoop::kRead) {
+            ipc::Message m{};
+            int recvFds[ipc::kMaxMsgFds];
+            int nRecvFds = 0;
+            while (ipc::recvMessageNBFds(ctrlFd, m, recvFds, &nRecvFds)) {
+                dispatchCtrl(m, recvFds, nRecvFds);
+                if (shutdown) break;
+            }
+            drainCoreBarrier();
+            armWire();      // dispatchCtrl may have flushed wire output
         }
-        drainCoreBarrier();
-        armWire();
+        armCtrl();
     });
     int hostFd = window.displayFd();
     if (hostFd >= 0)
