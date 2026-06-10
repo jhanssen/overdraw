@@ -4,7 +4,7 @@ Ground truth for what exists right now: current capabilities, known gaps, and
 what remains. The design lives in `architecture.md`; this file does not restate
 it. Present-tense only — no change history.
 
-Last updated: 2026-06-09 (post-Phase 5b-snapshot).
+Last updated: 2026-06-09 (post-Phase 5b — snapshot + live).
 
 ## Read first: gaps in advertised protocols (silent-gap risks)
 
@@ -49,6 +49,15 @@ with no error. Worst-first.
   not pixel-tested); dmabuf `create` (async server-minted `wl_buffer`) not wired
   (only `create_immed`); single-plane dmabuf only; `zwp_linux_dmabuf_feedback_v1`
   is functional for WSI clients but not automatically asserted.
+
+- **`sdk.compose.windows` is in-thread-only.** The per-window-textures
+  variant of compose works for in-thread bundled plugins (Phase 5a) but
+  the Worker variant throws "not yet implemented for Worker plugins
+  (phase 5b)". Loud failure, not silent -- a Worker plugin that calls
+  it gets a clear error rather than missing pixels. Deferred until a
+  real use case forces it; `core-plugin-api.md` §6 promises both
+  variants. `sdk.compose.scene` (the single-composed-result variant)
+  works for both in-thread and Worker plugins.
 
 - **Advertised-absent (clean fallback, not gaps):** xdg-decoration (→ CSD),
   fractional-scale, cursor-shape, text-input, xdg-activation, toplevel-icon,
@@ -927,15 +936,21 @@ per-pixel plugin transform. Multi-output: `outputId` is plumbed
 honestly but only `OUTPUT_DEFAULT` is meaningful until the
 `wl_output` reconfiguration pre-condition lands.
 
-### Cross-device compose for Worker plugins (Phase 5b-snapshot)
+### Cross-device compose for Worker plugins (Phase 5b — snapshot + live)
 
-`sdk.compose.scene({mode:'snapshot'})` for Worker plugins -- the
-plugin gets a `GPUTexture` on ITS OWN device backed by a dmabuf
-the core produced into. Uses the same cross-device dmabuf
-machinery as the plugin-overlay path with the producer/consumer
-roles SWAPPED: core = producer (writes), plugin = consumer
-(samples). Producer Begin/End ride the core wire; consumer
-Begin/End ride the plugin wire.
+`sdk.compose.scene({mode:'snapshot'|'live'})` for Worker plugins --
+the plugin gets a `GPUTexture` on ITS OWN device backed by a dmabuf
+the core produced into. Uses the same cross-device dmabuf machinery
+as the plugin-overlay path with the producer/consumer roles SWAPPED:
+core = producer (writes), plugin = consumer (samples). Producer
+Begin/End ride the core wire; consumer Begin/End ride the plugin wire.
+
+Snapshot is one-shot: core renders ONCE into a dmabuf, plugin samples
+once, both release. Live is per-frame: core renders into a 3-slot
+ring every `renderFrame`, plugin samples the LATEST presented slot
+via `sample(cb)`. The ring's atomic SAB-CAS slot state machine + per-
+slot SharedFence brackets keep producer and consumer non-racing
+(they work on different physical memory at any moment).
 
 - **New wire op**: `AllocComposeBuf` (`'c'`). Same payload shape
   as `AllocSurfaceBuf` -- the GPU process reads the direction
@@ -965,29 +980,70 @@ Begin/End ride the plugin wire.
   `writeConsumerBegin/EndAccess` on the plugin wire. napi
   `reserveConsumerTexture` / `consumerTexture` /
   `forgetConsumerReservation` / `writeConsumerBegin/End`.
-- **JS broker** (`gpu-broker.ts`): new `compose.snapshot` request.
-  The plugin reserves its consumer texture and sends the handles;
-  the core reserves its producer texture, calls
-  `coreAllocComposeBufferW`, awaits inject, wraps the producer
-  texture as a `GPUTexture`, runs `compositor.composeIntoView`
-  (a new public method on `JsCompositor`) under producer
-  Begin/End, returns `{surfaceBufId}` to the plugin.
+- **Producer/Consumer abstractions** (`packages/core/src/plugins/
+  surface-ring.ts`): `SurfaceProducer` and `SurfaceConsumer` over a
+  `SlotStates` ring. Direction-agnostic: parameterized by which
+  wire writes the brackets (writeBegin/End) and a `textureFor` per-
+  slot wrapper. The overlay path (plugin = producer / core =
+  consumer) and the compose path (core = producer / plugin =
+  consumer) both build on these abstractions; the SAB-CAS slot
+  state machine in `surface-slots.ts` is shared unchanged.
+  - `SurfaceProducer.tryAcquire/present` (sync) used by
+    renderFrame's per-frame produce; `acquire/present` (async)
+    used by the worker's overlay path.
+  - `SurfaceConsumer.swapToLatest` for push notifications (overlay
+    surface.present); `beginConsume + endConsume` for pull
+    sampling (compose.live).
+  - `demoteStaleOnPresent` flag (set for compose-live): the
+    producer demotes other PRESENTED slots on each new present so
+    the pull consumer's `presentedSlot()` always returns the
+    LATEST.
+- **JS broker** (`gpu-broker.ts`): new `compose.snapshot` (one-
+  shot AllocComposeBuf + composeIntoView) and `compose.live`
+  (per-slot AllocComposeBuf + registerLiveProducer + per-frame
+  tryAcquire/composeIntoView/presentSync). `compose.release`
+  handles both shapes (single surfaceBufId for snapshot, array
+  for live).
+- **JS compositor** (`compositor.ts`): `composeIntoView(args)`
+  for the snapshot path (one render pass into a pre-allocated
+  target view, optionally wrapped in producer Begin/End on the
+  core wire). `registerLiveProducer(cb)` for per-frame produce:
+  the compositor invokes `cb` after the on-screen frame submits;
+  each callback owns its own ring + SurfaceProducer.
 - **JS plugin SDK** (`compose-sdk.ts`): `createWorkerCompose`
-  builds a `PluginCompose` backed by the broker round-trip.
-  Wired into `loader.ts` so Worker plugins receive
+  builds a `PluginCompose` backed by the broker round-trips. The
+  `SceneHandle` exposes `sample(cb)`: in snapshot mode and the
+  in-thread variants it's a no-op wrapper (runs cb with the
+  texture immediately); in Worker live mode it wraps cb in
+  consumer Begin/End brackets so the cross-device fence chain
+  serializes the plugin's reads against the core's per-frame
+  writes. Wired into `loader.ts` so Worker plugins receive
   `sdk.compose` (in-thread plugins keep `createInThreadCompose`,
   unchanged).
 
-**Verified**: `test/compose-worker.gpu.mjs` -- a Worker plugin
-calls `sdk.compose.scene({mode:'snapshot'})` against a real
-Wayland client's window, reads back the texture on its own
-device via `copyTextureToBuffer`+`mapAsync`, and asserts the
-center pixel matches the client's color. 67/67 GPU tests pass
-(was 66 after Phase 5a). 5/5 consecutive isolated runs of the
-new test pass.
+**Verified**:
+- `test/compose-worker.gpu.mjs` (snapshot): a Worker plugin
+  calls `sdk.compose.scene({mode:'snapshot'})` against a real
+  Wayland client's window, reads back the texture on its own
+  device via `copyTextureToBuffer`+`mapAsync`, and asserts the
+  center pixel matches the client's color.
+- `test/compose-worker-live.gpu.mjs` (live): same setup with
+  `mode:'live'`. The test mutates `setSurfaceOpacity` on the
+  source surface and verifies both samples reflect the new
+  state. (The mutation is applied BEFORE the plugin loads
+  because the worker-to-main-thread `sdk.log` events have
+  multi-second propagation latency through the plugin runtime's
+  Endpoint, so mutating between two log-driven sample events is
+  unreliable. Mutate-before-load proves the cross-device fence
+  chain correctly delivers the producer's writes to the
+  consumer's GPU on every sampled frame.)
 
-**Not yet built**: live mode for Worker plugins. `compose.windows`
-for Worker plugins (deferred until a real use case forces it).
+68/68 GPU tests pass (was 66 pre-5b; +1 snapshot, +1 live).
+
+**Not yet built**: `compose.windows` for Worker plugins (the per-
+window crop variant). Deferred until a real use case forces it
+(the in-thread `compose.windows` works; Worker version throws a
+clear error).
 
 ### Decoration provider (registration + insets + drawing + atomic gating)
 
