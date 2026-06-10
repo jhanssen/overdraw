@@ -96,6 +96,10 @@ function normalize(raw: unknown, path: string): ResolvedConfig {
   const focus: unknown = cfg.focus;
   // Verbatim pass-through; the active hotkey plugin owns the schema.
   const hotkeys: unknown = cfg.hotkeys;
+  // Verbatim pass-through to the bundled config-actions plugin. The
+  // plugin validates the shape ({ [name: string]: function }) and
+  // registers each entry into the action registry.
+  const actions: unknown = cfg.actions;
 
   // plugins
   const plugins: ResolvedPlugin[] = [];
@@ -133,7 +137,7 @@ function normalize(raw: unknown, path: string): ResolvedConfig {
     });
   }
 
-  return { output, focus, hotkeys, plugins, sourcePath: path };
+  return { output, focus, hotkeys, actions, plugins, sourcePath: path };
 }
 
 // Resolve, import, and normalize the config. `explicit` is the --config path (or
@@ -141,7 +145,10 @@ function normalize(raw: unknown, path: string): ResolvedConfig {
 export async function loadConfig(explicit: string | null): Promise<ResolvedConfig> {
   const path = resolveConfigPath(explicit);
   if (path === null) {
-    return { output: null, focus: undefined, hotkeys: undefined, plugins: [], sourcePath: null };
+    return {
+      output: null, focus: undefined, hotkeys: undefined, actions: undefined,
+      plugins: [], sourcePath: null,
+    };
   }
   const mod = (await import(pathToFileURL(path).href)) as { default?: ConfigExport };
   if (mod.default === undefined) fail("file has no default export", path);

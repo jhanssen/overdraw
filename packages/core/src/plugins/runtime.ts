@@ -73,6 +73,13 @@ export interface RuntimeOptions {
   // emit events via sdk.events.emit (routed to bus.emit). When unset (scope-B
   // tests with no bus), the SDK still exists but subscribe/emit are no-ops.
   bus?: DynamicBus;
+  // Deferred-reference resolver for action params (Phase 7b). When set,
+  // sdk.actions.invoke walks the params payload at invoke time and
+  // substitutes every { $ref: name } sentinel with the resolver's
+  // current value for `name`. main.ts populates the resolver map from
+  // core state (seat, wm, workspace plugin). Tests stub it. When unset,
+  // params pass through unchanged.
+  resolveDeferredRefs?: (params: unknown) => unknown;
 }
 
 export const DEFAULT_OPTIONS: RuntimeOptions = {
@@ -772,8 +779,18 @@ export class PluginRuntime implements PluginController {
         `actions.invoke: owner '${owner.pluginName}' of '${payload.name}' is not live`);
     }
     void callerName;
+    // Deferred-reference resolution (Phase 7b): if the launcher
+    // provided a resolver, walk params and substitute every
+    // { $ref: name } sentinel with its current value. When unset,
+    // params pass through unchanged. The resolved value is cast back
+    // to Json -- the resolver's outputs (numbers, strings, ids) are
+    // structured-clone-safe.
+    let params: Json = payload.params;
+    if (this.opts.resolveDeferredRefs) {
+      params = this.opts.resolveDeferredRefs(payload.params) as Json;
+    }
     return await ep.request("actions.handle",
-      { name: payload.name, params: payload.params });
+      { name: payload.name, params });
   }
 
   onActionList(callerName: string, _payload: unknown): Promise<Json> {

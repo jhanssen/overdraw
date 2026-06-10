@@ -82,7 +82,10 @@ async function withWorkspacePlugin(fn) {
     },
   }, async (rt) => {
     await rt.load([bundledToResolved(wsSpec, wsSpec.module,
-      { output: null, focus: null, hotkeys: undefined, plugins: [], sourcePath: null })]);
+      {
+        output: null, focus: null, hotkeys: undefined, actions: undefined,
+        plugins: [], sourcePath: null,
+      })]);
     await rt.waitForNamespace('workspace');
     await fn({
       rt, events, sink, wm, pluginBus, bus, wsEvents, seatCalls,
@@ -318,5 +321,57 @@ test('actions: malformed params throw', async () => {
       /index must be a positive integer/);
     await assert.rejects(() => rt.invokeAction('workspace.move-window', { index: 1 }),
       /surfaceId must be a number/);
+  });
+});
+
+// ---- name lookup (Phase 7b) ----------------------------------------------
+
+test('workspace.show by name: resolves a named workspace', async () => {
+  await withWorkspacePlugin(async ({ rt, sink }) => {
+    await rt.invokeAction('workspace.create', { name: 'mail' });
+    sink.outputStackCalls.length = 0;
+    await rt.invokeAction('workspace.show', { name: 'mail' });
+    assert.equal(sink.outputStackCalls.length, 1);
+    assert.equal(sink.outputStackCalls[0].outputId, 0);
+  });
+});
+
+test('workspace.show by name: unknown name rejects', async () => {
+  await withWorkspacePlugin(async ({ rt }) => {
+    await assert.rejects(
+      () => rt.invokeAction('workspace.show', { name: 'nope' }),
+      /no workspace named 'nope'/);
+  });
+});
+
+test('workspace.show: both index and name rejects', async () => {
+  await withWorkspacePlugin(async ({ rt }) => {
+    await assert.rejects(
+      () => rt.invokeAction('workspace.show', { index: 1, name: 'foo' }),
+      /pass either index or name, not both/);
+  });
+});
+
+test('workspace.show: neither index nor name rejects', async () => {
+  await withWorkspacePlugin(async ({ rt }) => {
+    await assert.rejects(
+      () => rt.invokeAction('workspace.show', {}),
+      /missing required field/);
+  });
+});
+
+test('workspace.move-window by name: moves to the named workspace', async () => {
+  await withWorkspacePlugin(async ({ rt, sink, addWindow }) => {
+    addWindow(101);
+    await new Promise((r) => setTimeout(r, 50));
+    await rt.invokeAction('workspace.create', { name: 'mail' });
+    sink.outputStackCalls.length = 0;
+    await rt.invokeAction('workspace.move-window', { surfaceId: 101, name: 'mail' });
+    // Source (default) lost 101 -> emit setOutputStack([]).
+    assert.ok(sink.outputStackCalls.some((c) =>
+      c.outputId === 0 && Array.isArray(c.ids) && c.ids.length === 0));
+    // Workspace 2 ("mail") now has 101.
+    const list = await rt.invokeAction('workspace.list', { outputId: 0 });
+    assert.deepEqual(list[1].members, [101]);
   });
 });

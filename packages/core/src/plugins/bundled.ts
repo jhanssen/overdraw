@@ -40,10 +40,19 @@ export const BUNDLED_PLUGINS: ReadonlyArray<BundledPluginSpec> = [
     module: "@overdraw/plugin-workspace-default",
   },
   {
+    // Loads after all action-registering plugins so the user's actions
+    // can call into theirs by name. Loads BEFORE hotkey-default so a
+    // hotkey can bind to a user.* action.
+    name: "config-actions",
+    module: "@overdraw/plugin-config-actions",
+    configFrom: (config) => config.actions,
+  },
+  {
     // Loads LAST so any action it might bind (compositor.quit,
-    // workspace.show, etc.) is already registered. The hotkey plugin
-    // never needs other plugins' namespaces at init time, but its
-    // BINDINGS are unmeaningful until the corresponding action exists.
+    // workspace.show, user.*, etc.) is already registered. The hotkey
+    // plugin never needs other plugins' namespaces at init time, but
+    // its BINDINGS are unmeaningful until the corresponding action
+    // exists.
     name: "hotkey-default",
     module: "@overdraw/plugin-hotkey-default",
     configFrom: (config) => config.hotkeys,

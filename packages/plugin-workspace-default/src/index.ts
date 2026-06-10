@@ -145,9 +145,9 @@ export default async function init(sdk: SdkLike, _config?: unknown): Promise<voi
 
   sdk.actions.register({
     name: "workspace.show",
-    description: "Make the workspace at the given index the visible one.",
+    description: "Make the workspace at the given index (or matching name) the visible one.",
     handler: async (params: unknown): Promise<null> => {
-      const p = parseIndexParams(params, "workspace.show");
+      const p = parseIndexOrNameParams(state, params, "workspace.show");
       const r = reg.show(state, p.index, p.outputId);
       state = r.state;
       await applyEffects(r.sideEffects);
@@ -157,9 +157,9 @@ export default async function init(sdk: SdkLike, _config?: unknown): Promise<voi
 
   sdk.actions.register({
     name: "workspace.move-window",
-    description: "Move a window to the workspace at the given index.",
+    description: "Move a window to the workspace at the given index (or matching name).",
     handler: async (params: unknown): Promise<null> => {
-      const p = parseMoveParams(params);
+      const p = parseMoveParams(state, params);
       const r = reg.moveWindow(state, p.surfaceId, p.index, p.outputId);
       state = r.state;
       await applyEffects(r.sideEffects);
@@ -278,20 +278,62 @@ function parseCreateParams(params: unknown): { name?: string; outputId?: number 
   return out;
 }
 
+// Parse params that strictly identify a workspace by its 1-based
+// index. Used by destroy + set-name (where adding name lookup would
+// be ambiguous with the value being set).
 function parseIndexParams(params: unknown, label: string,
                           ): { index: WorkspaceIndex; outputId: number } {
   if (!isObj(params)) {
     throw new TypeError(`${label}: expected an object with { index, outputId? }`);
   }
-  if (typeof params.index !== "number" || !Number.isInteger(params.index) || params.index < 1) {
+  if (typeof params.index !== "number" || !Number.isInteger(params.index)
+      || params.index < 1) {
     throw new TypeError(`${label}: index must be a positive integer`);
   }
   return { index: asIndex(params.index), outputId: parseOptionalOutputId(params) };
 }
 
-function parseMoveParams(params: unknown,
+// Parse params that identify a workspace EITHER by 1-based index OR by
+// display name. Exactly one must be set (both is ambiguous; neither is
+// missing). When `name` is set, the registry's findIndexByName resolves
+// it to an index at parse time (so the rest of the handler treats it
+// uniformly). A name that doesn't match any workspace throws.
+function parseIndexOrNameParams(
+  state: WorkspaceState, params: unknown, label: string,
+): { index: WorkspaceIndex; outputId: number } {
+  if (!isObj(params)) {
+    throw new TypeError(`${label}: expected an object with { index | name, outputId? }`);
+  }
+  const outputId = parseOptionalOutputId(params);
+  const hasIndex = params.index !== undefined;
+  const hasName = params.name !== undefined;
+  if (hasIndex && hasName) {
+    throw new TypeError(`${label}: pass either index or name, not both`);
+  }
+  if (!hasIndex && !hasName) {
+    throw new TypeError(`${label}: missing required field 'index' or 'name'`);
+  }
+  if (hasIndex) {
+    if (typeof params.index !== "number" || !Number.isInteger(params.index)
+        || params.index < 1) {
+      throw new TypeError(`${label}: index must be a positive integer`);
+    }
+    return { index: asIndex(params.index), outputId };
+  }
+  if (typeof params.name !== "string" || params.name.length === 0) {
+    throw new TypeError(`${label}: name must be a non-empty string`);
+  }
+  const resolved = reg.findIndexByName(state, params.name, outputId);
+  if (resolved === null) {
+    throw new Error(
+      `${label}: no workspace named '${params.name}' on output ${outputId}`);
+  }
+  return { index: resolved, outputId };
+}
+
+function parseMoveParams(state: WorkspaceState, params: unknown,
                          ): { surfaceId: number; index: WorkspaceIndex; outputId: number } {
-  const base = parseIndexParams(params, "workspace.move-window");
+  const base = parseIndexOrNameParams(state, params, "workspace.move-window");
   if (!isObj(params)) throw new TypeError("unreachable");
   if (typeof params.surfaceId !== "number") {
     throw new TypeError("workspace.move-window: surfaceId must be a number");

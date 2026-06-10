@@ -8,7 +8,7 @@ import assert from 'node:assert/strict';
 import {
   init, create, destroy, show, moveWindow, setName,
   applyMap, applyUnmap, current, snapshotsForOutput,
-  findHandle, findIndex, snapshotOf, OUTPUT_DEFAULT,
+  findHandle, findIndex, findIndexByName, snapshotOf, OUTPUT_DEFAULT,
 } from '../../packages/plugin-workspace-default/dist/registry.js';
 
 // Helpers: pick effects by kind for assertions.
@@ -409,6 +409,32 @@ test('findHandle: out-of-range index returns null', () => {
   const state = init().state;
   assert.equal(findHandle(state, 5, OUTPUT_DEFAULT), null);
   assert.equal(findHandle(state, 0, OUTPUT_DEFAULT), null);
+});
+
+// ---- findIndexByName -------------------------------------------------------
+
+test('findIndexByName: resolves a named workspace to its index', () => {
+  let state = init().state;
+  // Set name on workspace 1.
+  let r = setName(state, 1, 'web', OUTPUT_DEFAULT); state = r.state;
+  // Create workspace 2 with a name at creation time.
+  let cr = create(state, { name: 'mail' }); state = cr.state;
+  assert.equal(findIndexByName(state, 'web', OUTPUT_DEFAULT), 1);
+  assert.equal(findIndexByName(state, 'mail', OUTPUT_DEFAULT), 2);
+});
+
+test('findIndexByName: unknown name returns null', () => {
+  const state = init().state;
+  assert.equal(findIndexByName(state, 'nope', OUTPUT_DEFAULT), null);
+});
+
+test('findIndexByName: duplicate names -> first match wins (position order)', () => {
+  let state = init().state;
+  let cr = create(state, { name: 'web' }); state = cr.state;
+  cr = create(state, { name: 'web' }); state = cr.state;
+  // Default mode has no name; ws2 and ws3 both named "web". First-match
+  // by index -> 2.
+  assert.equal(findIndexByName(state, 'web', OUTPUT_DEFAULT), 2);
 });
 
 // ---- snapshot --------------------------------------------------------------

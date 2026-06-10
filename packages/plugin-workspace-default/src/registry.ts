@@ -115,6 +115,21 @@ export function findIndex(state: WorkspaceState,
   return asIndex(i + 1);
 }
 
+// Find a workspace by its display name on outputId. Names are not
+// required to be unique (the API doesn't enforce uniqueness; two
+// workspaces may share a name); the first match in position order
+// wins. Returns null if no workspace on outputId carries `name`.
+export function findIndexByName(state: WorkspaceState,
+                                name: string,
+                                outputId: number): WorkspaceIndex | null {
+  const positions = state.positionsByOutput.get(outputId) ?? [];
+  for (let i = 0; i < positions.length; i++) {
+    const rec = state.byHandle.get(positions[i]);
+    if (rec?.name === name) return asIndex(i + 1);
+  }
+  return null;
+}
+
 // Build the back-to-front surfaceId list for the currently-shown workspace
 // on outputId. Empty if the output has no workspaces (transient).
 function stackFor(state: WorkspaceState, outputId: number): number[] {

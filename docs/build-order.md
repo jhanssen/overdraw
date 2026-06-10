@@ -15,11 +15,12 @@ Phases 0a, 0b, 0c, 0d, 0e, 1, 2, 3, 4, 4.5, 5, 5b (both
 snapshot + live halves of cross-device dmabuf compose for Worker
 plugins), 5.5a (tint + color matrix per-surface primitives),
 6 (bundled workspaces plugin + `sdk.windows.requestFocusDecision`),
-and 7a (input binding chain + chord + mode-stack + bundled hotkey
-plugin) are landed (see `git log` and `status.md`). Phase 7b
-(deferred-ref params + user-config actions + workspace-action
-revisions) is next. The text below describes each phase in its
-original forward-looking shape; ✅ marks the completed ones inline.
+7a (input binding chain + chord + mode-stack + bundled hotkey
+plugin), and 7b (deferred-ref params + user-config actions +
+workspace by-name lookup) are landed (see `git log` and
+`status.md`). Phase 8 (transitions) is next. The text below
+describes each phase in its original forward-looking shape; ✅
+marks the completed ones inline.
 
 Deferred: 5.5b (3D LUT) -- skip until a real consumer wants it.
 Phase 5b's `sdk.compose.windows` for Worker plugins (the per-
@@ -641,21 +642,27 @@ real use guide the deferred-ref + user-action design:
   `compositor.quit`) and `@overdraw/plugin-hotkey-default` (parses
   the user's `OverdrawConfig.hotkeys`).
 
-### 7b. Deferred refs + user-config actions (next)
+### 7b. Deferred refs + user-config actions ✅
 
 - Typed `ref` exports from `overdraw/config`:
   `ref.surfaceUnderPointer`, `ref.focusedWindow`, `ref.pointerX/Y`,
   `ref.activeOutput`, `ref.currentWorkspace`. Resolved recursively
-  in `sdk.actions.invoke()`'s params at invoke time.
-- `OverdrawConfig.actions: { [name]: (sdk, params) => ... }` so a
-  user can declare actions inline; registered into the action
-  registry by a tiny bundled `@overdraw/plugin-config-actions`.
-- Workspace action revisions: `workspace.move-window`
-  `surfaceId?` defaults to focused window; `workspace.show` and
+  in `sdk.actions.invoke()`'s params at invoke time. Recognized by
+  the `{ $ref: name }` shape, so refs survive structured-clone.
+- `OverdrawConfig.actions: { [name]: (sdk, params) => ... }`;
+  registered by the bundled `@overdraw/plugin-config-actions`.
+  Handlers run in the main thread (in-thread plugin); the handler
+  receives `sdk` for chaining into other actions.
+- Workspace action revisions: `workspace.show` and
   `workspace.move-window` accept `{ name }` as an alternative to
-  `{ index }`.
+  `{ index }`. The `surfaceId` default for `move-window` was
+  initially planned to default to the focused window, but is now
+  driven by deferred refs instead -- the user writes
+  `params: { surfaceId: ref.focusedWindow, index: 1 }`. Explicit
+  in config, no magic in the action handler.
 
-**Total estimate**: ~1500 lines for 7a (landed); ~500 lines for 7b.
+**Total**: ~1100 lines for 7b (vs. ~500 estimate; doc + test
+expansion drove the overshoot).
 
 ## Phase 8 — Transitions primitive
 

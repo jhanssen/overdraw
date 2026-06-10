@@ -4,7 +4,7 @@ Ground truth for what exists right now: current capabilities, known gaps, and
 what remains. The design lives in `architecture.md`; this file does not restate
 it. Present-tense only — no change history.
 
-Last updated: 2026-06-09 (post-Phase 7a — input chain + bundled hotkey plugin).
+Last updated: 2026-06-09 (post-Phase 7b — deferred refs + user-config actions + workspace by-name lookup).
 
 ## Read first: gaps in advertised protocols (silent-gap risks)
 
@@ -1445,6 +1445,146 @@ hotkey.gpu.mjs).
   doesn't exist at bind time is allowed (bind succeeds; the
   invoke at match time surfaces "no such action" via `sdk.log`).
 
+### Deferred refs + user-config actions + workspace by-name lookup (Phase 7b)
+
+Closes the "hotkey config can't carry runtime state or inline JS" gaps
+left by 7a. Three pieces:
+
+**1. Deferred-reference resolution in the action registry.** When the
+config writes `{ $ref: "focusedWindow" }` (or the typed sugar
+`ref.focusedWindow`) inside an action's params, the action registry
+walks the params at invoke time and substitutes each `{$ref}` sentinel
+with the current value from a resolver map. Resolvers are populated by
+the launcher from core state (the seat, the WM, the workspace plugin's
+cached current workspace) and read on each invoke; no caching, no
+async. Recognized refs:
+- `ref.surfaceUnderPointer` -> number | null (state.seat.focus.surfaceId).
+- `ref.focusedWindow` -> number | null (state.seat.kbFocus.surfaceId).
+- `ref.pointerX` / `ref.pointerY` -> number (state.seat.pointerPosition).
+- `ref.activeOutput` -> number (OUTPUT_DEFAULT=0 today; multi-output
+  is a wl_output reconfiguration pre-condition).
+- `ref.currentWorkspace` -> number | null (cached from workspace.shown
+  events; the workspace plugin's namespace methods are async, so a
+  bus subscription keeps the value live without blocking the resolver).
+
+Refs are recognized by the `{ $ref: string }` shape, NOT by reference
+equality with the `ref.X` exports. This is deliberate: refs survive
+structured-clone (IPC, postMessage); user configs may write
+`{ $ref: "name" }` literals; the resolver works the same in every
+transport. Unknown ref names resolve to undefined (action sees the
+slot as missing).
+
+**2. User-config actions.** `OverdrawConfig.actions: { [name]:
+(sdk, params?) => unknown }` lets the user declare action handlers
+inline in their config. Registered by a new bundled
+`@overdraw/plugin-config-actions` (in-thread; loads after every other
+action-registering plugin so user handlers can call into them).
+Handlers receive `sdk` (the bundled plugin's SDK reference, so the
+handler can `sdk.actions.invoke`, push modes, log) and `params`
+(already with deferred refs resolved). Convention: prefix user action
+names with `user.`.
+
+Combined with 7a's hotkey + 7b's deferred refs, this means a user can
+bind a chord to arbitrary JS that reads current core state, without
+writing a full plugin:
+
+```ts
+import type { OverdrawConfig } from "overdraw/config";
+import { ref } from "overdraw/config";
+
+export default {
+  actions: {
+    "user.print-focus": async (sdk, params) => {
+      console.log("focused surface:", params.surface);
+    },
+  },
+  hotkeys: {
+    modes: {
+      default: [
+        { keys: "Mod+u", action: "user.print-focus",
+          params: { surface: ref.focusedWindow } },
+      ],
+    },
+  },
+} satisfies OverdrawConfig;
+```
+
+**3. Workspace by-name lookup.** `workspace.show` and
+`workspace.move-window` accept `{ name }` as an alternative to
+`{ index }`. The registry's `findIndexByName` resolves at action
+parse time; an unknown name throws ("no workspace named '...' on
+output ..."). Combined with deferred refs, the user can write
+`{ surfaceId: ref.focusedWindow, name: "mail" }` for a "move the
+focused window to the mail workspace" binding. (Note: this assumes
+a workspace with a stable name exists; sway-style workspace IDs
+that may renumber after destroy are still the user's concern.)
+
+**Files:**
+- `packages/core/src/config/refs.ts` (new): `ref` namespace,
+  `DeferredRef<T>` type, `isDeferredRef` predicate.
+- `packages/core/src/config/index.ts`: re-export `ref` + types.
+- `packages/core/src/plugins/deferred-refs.ts` (new): `resolveRefs`
+  walker, `buildResolver` factory.
+- `packages/core/src/plugins/runtime.ts`: `RuntimeOptions.resolveDeferredRefs`
+  hook; `onActionInvoke` calls it before forwarding.
+- `packages/core/src/config/{load.ts,types.ts}`: `actions` field +
+  `ActionHandler` type.
+- `packages/core/src/main.ts`: resolver map populated from core state;
+  workspace.shown subscription caches `currentWorkspaceIndex`.
+- `packages/core/src/plugins/bundled.ts`: new `config-actions` entry.
+- `packages/core/src/protocols/wl_seat.ts`,
+  `packages/core/src/protocols/ctx.ts`:
+  `SeatState.pointerPosition()` exposes (lastX, lastY).
+- `packages/plugin-config-actions/` (new): bundled plugin.
+- `packages/plugin-workspace-default/src/index.ts`: action handlers
+  for show + move-window accept `{name}` as alternative to `{index}`.
+- `packages/plugin-workspace-default/src/registry.ts`:
+  `findIndexByName(state, name, outputId)`.
+- `test/harness.mjs`: matching resolver wiring so tests under
+  setupCompositor get the same behavior as main.ts.
+
+**Tests:**
+- Pure-unit: `test/deferred-refs.test.js` (15 tests: ref exports,
+  isDeferredRef predicate, recursive substitution, unknown ref ->
+  undefined, null pass-through, immutability, error propagation,
+  buildResolver live-read semantics).
+- Pure-unit: `test/plugin-workspace-default/registry.test.js` (+3
+  tests on findIndexByName).
+- Pure-unit: `test/plugin-workspace-default/integration.test.js`
+  (+5 tests: workspace.show / move-window by name; unknown name
+  rejects; both index+name rejects; neither rejects).
+- Pure-unit: `test/plugin-hotkey-default/integration.test.js` (+4
+  tests: user-defined action fires; deferred refs resolved in
+  params; resolver returning null passes through; user handler
+  invokes other actions via sdk).
+- GPU: `test/plugin-hotkey-default/hotkey-7b.gpu.mjs` (1 test: real
+  client + Mod+u with ref.focusedWindow in params + user.observe-focus
+  handler; verifies the ref resolved to the actual focused
+  surfaceId).
+
+637/637 unit tests pass (was 610 pre-7b; +27). All workspace + hotkey
+GPU tests on the target set still pass.
+
+**Caveats:**
+- `ref.currentWorkspace` is cached from `workspace.shown` events. If
+  the workspace plugin is not loaded (a different hotkey plugin
+  replaces it), the cache stays null. Resolving the ref gives null
+  in that case; action handlers should treat it as "no current
+  workspace info available."
+- `ref.activeOutput` is constant 0 today (single-output). When
+  multi-output lands (depends on `wl_output` reconfiguration), the
+  resolver will read from the seat's notion of the active output.
+- The user-config `actions` map is a verbatim pass-through to the
+  in-thread `plugin-config-actions`. A Worker plugin can't be the
+  receiver of `config.actions` because function references can't
+  cross postMessage; this is documented and intentional. Worker
+  plugins consume user actions via `sdk.actions.invoke(name)`,
+  same as any other action.
+- `findIndexByName`'s first-match-wins behavior on duplicate names
+  is deterministic but not enforced: the workspace API doesn't
+  prevent two workspaces from sharing a name. Documented in the
+  registry.
+
 ### Decoration provider (registration + insets + drawing + atomic gating)
 
 Server-side decorations end to end: a plugin registers an app_id pattern, is told
@@ -1673,12 +1813,13 @@ capabilities exist to grant).
   focus dispatch + the bundled workspace plugin's `'workspace'`
   namespace API (Phase 6); `sdk.input.bind` / `defineMode` /
   `pushMode` / `popMode` keyboard binding chain + the bundled hotkey
-  + core-actions plugins (Phase 7a). Not built: `sdk.transitions`
-  (Phase 8); cursor / closing / velocity (Phase 9); deferred-ref
-  resolution in action params + `config.actions` for user-defined JS
-  handlers (Phase 7b); output observation beyond a fabricated
-  `wl_output`; protocol SDK surface; interactive-region hit-testing;
-  `sdk.onFrame` (Phase 5+).
+  + core-actions plugins (Phase 7a); deferred-ref resolution
+  (`ref.surfaceUnderPointer` etc.) in action params + `config.actions`
+  + bundled `plugin-config-actions` + workspace by-name lookup
+  (Phase 7b). Not built: `sdk.transitions` (Phase 8); cursor /
+  closing / velocity (Phase 9); output observation beyond a
+  fabricated `wl_output`; protocol SDK surface; interactive-region
+  hit-testing; `sdk.onFrame` (Phase 5+).
 - **Capability enforcement.** No capability gate on `sdk.gpu`/`sdk.window`/
   `sdk.decorations` (every plugin gets them); no native-import restriction (a
   plugin's `import()` is unrestricted — deferred until there is an SDK native addon

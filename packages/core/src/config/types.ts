@@ -71,9 +71,34 @@ export interface OverdrawConfig {
   // `import type { KeyboardConfig } from "@overdraw/hotkey-types"` and
   // write `hotkeys: cfg satisfies KeyboardConfig`.
   hotkeys?: unknown;
+  // User-defined actions. Each entry is a name -> handler function
+  // registered into the core action registry by the bundled
+  // @overdraw/plugin-config-actions. Handlers run in the main thread
+  // (the bundled plugin is in-thread); the handler receives `sdk` (the
+  // plugin's SDK reference) and the action params. Use this to bind a
+  // hotkey to inline JS without writing a full plugin:
+  //
+  //   actions: {
+  //     "user.toggle-mute": async (sdk) => { ... },
+  //   },
+  //   hotkeys: { modes: { default: [
+  //     { keys: "Mod+m", action: "user.toggle-mute" },
+  //   ]}}
+  //
+  // Convention: prefix names with "user." to avoid colliding with
+  // plugin-registered actions. Not enforced; collisions surface as
+  // duplicate-registration errors at boot.
+  actions?: { [name: string]: ActionHandler };
   // DEFERRED — see PluginConfig. Declared/validated but not yet consumed.
   plugins?: PluginConfig[];
 }
+
+// Handler signature for OverdrawConfig.actions entries.
+// `sdk` is the bundled plugin's SDK reference; `params` is the value
+// the caller passed to sdk.actions.invoke (already with deferred refs
+// resolved by the action registry).
+export type ActionHandler =
+  (sdk: unknown, params?: unknown) => unknown | Promise<unknown>;
 
 // The config default export: an object, or a (sync/async) function returning one.
 export type ConfigExport =
@@ -109,6 +134,11 @@ export interface ResolvedConfig {
   focus: unknown;
   // Same verbatim pass-through to the bundled hotkey plugin.
   hotkeys: unknown;
+  // User-defined action handlers. The bundled @overdraw/plugin-config-
+  // actions registers each entry into the action registry. Function
+  // references survive only because the plugin is in-thread (bundled);
+  // verbatim pass-through.
+  actions: unknown;
   plugins: ResolvedPlugin[];
   // Absolute path of the config file that was loaded, or null if none was found
   // (built-in defaults in effect).

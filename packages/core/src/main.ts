@@ -249,6 +249,37 @@ const inputBroker = createInputBroker({
   },
 });
 
+// Deferred-reference resolver map (phase 7b). Used by the action
+// registry to substitute `ref.X` sentinels in invoke params at
+// dispatch time. The map is LIVE -- each function reads core state on
+// every action invocation, so resolvers see the current pointer / focus
+// / workspace.
+//
+// currentWorkspace is cached via a bus subscription rather than read
+// synchronously from the workspace plugin (whose namespace methods are
+// async); workspace.shown updates the cache.
+let currentWorkspaceIndex: number | null = null;
+pluginBus.subscribe("workspace.shown", (_n, payload) => {
+  if (payload && typeof payload === "object") {
+    const p = payload as { index?: unknown; outputId?: unknown };
+    if (typeof p.index === "number"
+        // Cache only the default-output workspace (single-output today).
+        && (p.outputId === undefined || p.outputId === 0)) {
+      currentWorkspaceIndex = p.index;
+    }
+  }
+});
+const { buildResolver } = await import("./plugins/deferred-refs.js");
+const deferredRefResolver = buildResolver({
+  surfaceUnderPointer: () => state?.seat?.focus?.surfaceId ?? null,
+  focusedWindow: () => state?.seat?.kbFocus?.surfaceId ?? null,
+  pointerX: () => state?.seat?.pointerPosition().x ?? 0,
+  pointerY: () => state?.seat?.pointerPosition().y ?? 0,
+  // Single-output today (wl_output is fabricated); always 0.
+  activeOutput: () => 0,
+  currentWorkspace: () => currentWorkspaceIndex,
+});
+
 // The runtime is created unconditionally so the IPC server has an action
 // registry to dispatch against even before any plugin is loaded. load() is
 // called with the combined bundled + user-config plugin set (possibly
@@ -270,6 +301,7 @@ runtime = new PluginRuntime({
     compositor,
   },
   bus: pluginBus,
+  resolveDeferredRefs: deferredRefResolver,
   onEvent: (plugin, name, data) => {
     if (name === "log") console.log(`[plugin ${plugin}] ${String(data)}`);
   },

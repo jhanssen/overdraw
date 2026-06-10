@@ -348,6 +348,11 @@ export interface SeatState {
                      trigger?: number): void;
   // Topmost surface under an output-space point (for DnD hit-testing).
   pick(x: number, y: number): SeatFocus | null;
+  // The last observed pointer position (output-space). Used by the
+  // action-registry's deferred-ref resolver (ref.pointerX/Y). When no
+  // pointer event has ever been seen, returns {x: 0, y: 0} -- matches
+  // the seat's internal default.
+  pointerPosition(): { x: number; y: number };
   // DnD pointer grab. While non-null, handleInput routes pointer motion/
   // button to these callbacks instead of wl_pointer.
   drag: DragGrab | null;

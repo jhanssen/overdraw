@@ -17,12 +17,15 @@ import {
   bundledToResolved, BUNDLED_PLUGINS,
 } from '../../packages/core/dist/plugins/bundled.js';
 import { parseSpec } from '../../packages/core/dist/input/keyspec.js';
+import { buildResolver } from '../../packages/core/dist/plugins/deferred-refs.js';
 import { withRuntime } from '../plugin-helpers.mjs';
 
 const hotkeySpec = BUNDLED_PLUGINS.find((p) => p.name === 'hotkey-default');
 if (!hotkeySpec) throw new Error('test setup: hotkey-default not in BUNDLED_PLUGINS');
 const coreActionsSpec = BUNDLED_PLUGINS.find((p) => p.name === 'core-actions');
 if (!coreActionsSpec) throw new Error('test setup: core-actions not in BUNDLED_PLUGINS');
+const configActionsSpec = BUNDLED_PLUGINS.find((p) => p.name === 'config-actions');
+if (!configActionsSpec) throw new Error('test setup: config-actions not in BUNDLED_PLUGINS');
 
 function mockSink() {
   return {
@@ -40,6 +43,10 @@ function mockSink() {
 //   log: capture runtime log lines (default: into the events array).
 //   expectFailure: skip the waitForNamespace step (the plugin is expected
 //     to enter the failed state from a malformed config).
+//   actions: OverdrawConfig.actions map (user-defined action handlers).
+//     Loaded via @overdraw/plugin-config-actions.
+//   resolvers: deferred-ref resolver map (e.g. focusedWindow: () => 7).
+//     Wired into PluginRuntime.resolveDeferredRefs via buildResolver.
 async function withHotkeyPlugin(hotkeysConfig, fn, opts = {}) {
   const events = [];
   const pluginBus = new DynamicBus();
@@ -86,10 +93,15 @@ async function withHotkeyPlugin(hotkeysConfig, fn, opts = {}) {
     }
   });
 
+  const resolveDeferredRefs = opts.resolvers
+    ? buildResolver(opts.resolvers)
+    : undefined;
+
   await withRuntime({
     bus: pluginBus,
     log: opts.log ?? ((m) => events.push({ p: '<runtime>', n: 'log', d: m })),
     onEvent: (p, n, d) => events.push({ p, n, d }),
+    resolveDeferredRefs,
     onRequest: (plugin, method, params) => {
       if (method.startsWith('windows.')) {
         const r = windowsBroker(plugin, method, params);
@@ -105,13 +117,19 @@ async function withHotkeyPlugin(hotkeysConfig, fn, opts = {}) {
     },
   }, async (runtime) => {
     rt = runtime;
-    // Load core-actions first so compositor.quit is available, then
-    // hotkey-default with the test's config.
+    // Load core-actions first (registers compositor.quit), then
+    // config-actions (registers user-defined actions from opts.actions),
+    // then hotkey-default (binds keys to actions).
+    const baseConfig = {
+      output: null, focus: null, hotkeys: undefined, actions: undefined,
+      plugins: [], sourcePath: null,
+    };
     const resolved = [
-      bundledToResolved(coreActionsSpec, coreActionsSpec.module,
-        { output: null, focus: null, hotkeys: undefined, plugins: [], sourcePath: null }),
+      bundledToResolved(coreActionsSpec, coreActionsSpec.module, baseConfig),
+      bundledToResolved(configActionsSpec, configActionsSpec.module,
+        { ...baseConfig, actions: opts.actions }),
       bundledToResolved(hotkeySpec, hotkeySpec.module,
-        { output: null, focus: null, hotkeys: hotkeysConfig, plugins: [], sourcePath: null }),
+        { ...baseConfig, hotkeys: hotkeysConfig }),
     ];
     await runtime.load(resolved);
     // Tests expecting init failure skip waitForNamespace via expectFailure.
@@ -365,6 +383,115 @@ test('NumLock-with-binding still matches', async () => {
       assert.equal(r.consume, true);
       await runtime.flush();
       assert.equal(events.length, 1);
+    },
+  );
+});
+
+// ---- config.actions + deferred refs (Phase 7b) ----------------------------
+
+test('config.actions: user-defined handler fires on hotkey match', async () => {
+  const userInvocations = [];
+  await withHotkeyPlugin(
+    {
+      modes: {
+        default: [
+          { keys: 'Mod+u', action: 'user.note', params: { msg: 'hello' } },
+        ],
+      },
+    },
+    async ({ chain, runtime }) => {
+      // Run the binding.
+      const r = chain.dispatch(parseSpec('Mod+u'));
+      assert.equal(r.consume, true);
+      await runtime.flush();
+      assert.equal(userInvocations.length, 1);
+      assert.deepEqual(userInvocations[0].params, { msg: 'hello' });
+    },
+    {
+      actions: {
+        'user.note': async (_sdk, params) => {
+          userInvocations.push({ params });
+        },
+      },
+    },
+  );
+});
+
+test('deferred refs: ref.focusedWindow resolved at invoke time', async () => {
+  const invocations = [];
+  await withHotkeyPlugin(
+    {
+      modes: {
+        default: [
+          { keys: 'Mod+w', action: 'user.observe',
+            params: { surface: { $ref: 'focusedWindow' }, count: 1 } },
+        ],
+      },
+    },
+    async ({ chain, runtime }) => {
+      chain.dispatch(parseSpec('Mod+w'));
+      await runtime.flush();
+      assert.equal(invocations.length, 1);
+      // The resolver returned 42 -> the handler sees { surface: 42, count: 1 }.
+      assert.deepEqual(invocations[0].params, { surface: 42, count: 1 });
+    },
+    {
+      actions: {
+        'user.observe': async (_sdk, params) => { invocations.push({ params }); },
+      },
+      resolvers: { focusedWindow: () => 42 },
+    },
+  );
+});
+
+test('deferred refs: resolver returning null passes through', async () => {
+  const invocations = [];
+  await withHotkeyPlugin(
+    {
+      modes: {
+        default: [
+          { keys: 'Mod+n', action: 'user.observe',
+            params: { surface: { $ref: 'focusedWindow' } } },
+        ],
+      },
+    },
+    async ({ chain, runtime }) => {
+      chain.dispatch(parseSpec('Mod+n'));
+      await runtime.flush();
+      assert.equal(invocations.length, 1);
+      assert.equal(invocations[0].params.surface, null);
+    },
+    {
+      actions: {
+        'user.observe': async (_sdk, params) => { invocations.push({ params }); },
+      },
+      resolvers: { focusedWindow: () => null },
+    },
+  );
+});
+
+test('config.actions: handler can invoke other actions via sdk', async () => {
+  const shutdowns = [];
+  await withHotkeyPlugin(
+    {
+      modes: {
+        default: [
+          { keys: 'Mod+q', action: 'user.confirm-quit' },
+        ],
+      },
+    },
+    async ({ chain, runtime, pluginBus }) => {
+      pluginBus.subscribe('compositor.shutdown', () => shutdowns.push('fired'));
+      chain.dispatch(parseSpec('Mod+q'));
+      await runtime.flush();
+      assert.equal(shutdowns.length, 1);
+    },
+    {
+      actions: {
+        'user.confirm-quit': async (sdk) => {
+          await sdk.actions.invoke('compositor.quit');
+        },
+      },
     },
   );
 });

@@ -28,6 +28,7 @@ import { createWindowsBroker, NOT_HANDLED as WINDOWS_NOT_HANDLED }
   from "../packages/core/dist/plugins/windows-broker.js";
 import { createInputBroker, NOT_HANDLED as INPUT_NOT_HANDLED }
   from "../packages/core/dist/plugins/input-broker.js";
+import { buildResolver } from "../packages/core/dist/plugins/deferred-refs.js";
 
 const require = createRequire(import.meta.url);
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -213,6 +214,7 @@ export async function setupCompositor(opts = {}) {
     output: null,
     focus: opts.focus,
     hotkeys: opts.hotkeys,
+    actions: opts.actions,
     plugins: [],
     sourcePath: null,
   };
@@ -247,11 +249,31 @@ export async function setupCompositor(opts = {}) {
     throw new Error(`harness: no handler for plugin request '${method}'`);
   };
 
+  // Deferred-reference resolver: same wiring main.ts does, populated from
+  // the test's state.seat (pointer + focus). currentWorkspace is cached via
+  // workspace.shown emits (workspace plugin loads as part of bundled set).
+  let currentWorkspaceIndex = null;
+  pluginBus.subscribe("workspace.shown", (_n, payload) => {
+    if (payload && typeof payload === "object" && typeof payload.index === "number"
+        && (payload.outputId === undefined || payload.outputId === 0)) {
+      currentWorkspaceIndex = payload.index;
+    }
+  });
+  const deferredRefResolver = buildResolver({
+    surfaceUnderPointer: () => state?.seat?.focus?.surfaceId ?? null,
+    focusedWindow: () => state?.seat?.kbFocus?.surfaceId ?? null,
+    pointerX: () => state?.seat?.pointerPosition?.().x ?? 0,
+    pointerY: () => state?.seat?.pointerPosition?.().y ?? 0,
+    activeOutput: () => 0,
+    currentWorkspace: () => currentWorkspaceIndex,
+  });
+
   runtime = new PluginRuntime({
     bus: pluginBus,
     log: opts.log ?? (() => {}),
     onEvent: opts.onEvent,
     onRequest,
+    resolveDeferredRefs: deferredRefResolver,
     pluginAddonPath: opts.pluginAddonPath,
     dawnPath: opts.dawnPath,
   });

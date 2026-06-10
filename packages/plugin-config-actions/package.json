@@ -1,0 +1,13 @@
+{
+  "name": "@overdraw/plugin-config-actions",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Bundled plugin: registers the user's OverdrawConfig.actions map into the core action registry. Each entry is a name -> handler function the user wrote in their config; the bundled plugin (in-thread) holds the function reference and forwards invokes. This is how a hotkey can bind to inline JS without writing a full plugin.",
+  "type": "module",
+  "main": "./dist/index.js",
+  "exports": {
+    ".": {
+      "default": "./dist/index.js"
+    }
+  }
+}
