@@ -13,10 +13,11 @@ what is actually built today is in `status.md`.
 
 Phases 0a, 0b, 0c, 0d, 0e, 1, 2, 3, 4, 4.5, 5, 5b (both
 snapshot + live halves of cross-device dmabuf compose for Worker
-plugins), and 5.5a (tint + color matrix per-surface primitives)
-are landed (see `git log` and `status.md`). Phase 6 (workspaces
-plugin) is next. The text below describes each phase in its
-original forward-looking shape; ✅ marks the completed ones inline.
+plugins), 5.5a (tint + color matrix per-surface primitives), and
+6 (bundled workspaces plugin + `sdk.windows.requestFocusDecision`)
+are landed (see `git log` and `status.md`). Phase 7 (hotkeys) is
+next. The text below describes each phase in its original
+forward-looking shape; ✅ marks the completed ones inline.
 
 Deferred: 5.5b (3D LUT) -- skip until a real consumer wants it.
 Phase 5b's `sdk.compose.windows` for Worker plugins (the per-
@@ -558,27 +559,47 @@ test cases that the per-surface uniform path can grow without spilling
 into intercept territory. New pure-unit tests for the uniform packing;
 GPU test: tint a window red, readback shows red-modulated pixels.
 
-## Phase 6 — Workspaces (first greenfield plugin, instant transitions)
+## Phase 6 — Workspaces (first greenfield plugin, instant transitions) ✅
 
-The first big user-visible plugin built on the foundation.
+The first big user-visible plugin built on the foundation. Final
+shape diverged from the plan in two ways:
 
-### 6a. Shared interface package
+- **Two-id model.** Workspaces have a stable `WorkspaceHandle`
+  (monotonic, never reused; stored in the state bag) AND a dense
+  1-based `WorkspaceIndex` (positional; hotkey / CLI-facing;
+  renumbers on destroy). The original `WorkspaceId` in `core-plugin-
+  api.md` conflated these. The state bag carries handles so
+  subscribers caching them don't break when other workspaces
+  destroy; user-facing inputs accept indices.
+- **Some new core work, not "none".** The plan said "No new core
+  work." In practice Phase 6 also added `sdk.windows.requestFocusDecision`
+  (so `workspace.show` can re-decide focus under the new stack via the
+  active focus plugin's policy) and updated the bundled focus plugin's
+  `workspace-changed` branch (which was a no-op until Phase 6
+  motivated it). Both are documented in `status.md`.
 
-- `@overdraw/workspace-types` with `WorkspaceAPI`, `WorkspaceId`, etc.
+### 6a. Shared interface package ✅
 
-### 6b. Bundled workspace plugin
+- `@overdraw/workspace-types` with `WorkspaceHandle`, `WorkspaceIndex`,
+  `WorkspaceSnapshot`, `WorkspaceAPI`.
+
+### 6b. Bundled workspace plugin ✅
 
 - Dynamic workspaces (per the Decided model).
 - Per-output assignment.
-- `show(ws, output)`: atomically updates `setOutputStack`. **No
-  transition** in v1 — animated transitions land in Phase 8.
-- Actions: `workspace.create`, `workspace.show`, `workspace.move-window`,
-  `workspace.destroy`, etc. (registered via `sdk.actions.register`).
-- Events: `workspace.shown`, `workspace.created`, etc. (emitted via
-  `sdk.events.emit`).
-- ~400 lines + types.
+- `show(index, output)`: atomically updates `setOutputStack` +
+  triggers a focus re-decide via `requestFocusDecision`. **No
+  transition** in v1 -- animated transitions land in Phase 8.
+- Actions: `workspace.create`, `workspace.destroy`, `workspace.show`,
+  `workspace.move-window`, `workspace.set-name`, `workspace.list`,
+  `workspace.current`.
+- Events: `workspace.created`, `workspace.destroyed`,
+  `workspace.shown`, `workspace.hidden`, `workspace.renumbered`,
+  `workspace.renamed`, `workspace.window-moved`.
 
-**Total estimate**: ~500 lines plugin + types. No new core work.
+**Total**: ~830 lines plugin + types + tests (vs. ~500 estimate).
+Driven up by the registry's destroy-with-relocation policy + the
+pure-unit + integration test sets and the new core wiring.
 
 **What this validates**: first real greenfield plugin; `setOutputStack`
 as the workspace projection onto core; the full action + event + state-bag

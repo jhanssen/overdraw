@@ -15,6 +15,7 @@
 //  13 = setOutputMargin(targetId, {top:4, right:8, bottom:12, left:16})
 //  14 = setTint(targetId, {r:0.5, g:0.6, b:0.7, a:1})
 //  15 = setColorMatrix(targetId, identity-16-array)
+//  16 = requestFocusDecision('workspace-changed')
 //
 // targetId is provided via window.change events' surfaceId field (only the
 // LAST change event's surfaceId is used).
@@ -93,6 +94,11 @@ export default async function init(sdk) {
         0, 0, 0, 1,
       ]);
       sdk.log('set-color-matrix');
+      return;
+    }
+    if (op === 16) {
+      await sdk.windows.requestFocusDecision('workspace-changed');
+      sdk.log('request-focus-decision');
       return;
     }
   });

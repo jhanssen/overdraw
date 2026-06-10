@@ -13,6 +13,7 @@ import type { Endpoint, Json } from "./protocol.js";
 import type { PluginWindowObserver, WindowObserverControl } from "./window-observer.js";
 import type { PluginEvents } from "./events.js";
 import { createWindowObserver } from "./window-observer.js";
+import type { FocusReason } from "@overdraw/focus-types";
 
 // Hint field names; must match WindowHints keys on the core side.
 export type HintField = "floating" | "fullscreen" | "maximized" | "minimized";
@@ -103,6 +104,14 @@ export interface PluginWindows extends PluginWindowObserver {
   // changes, emit an event the focus plugin observes instead.
   focus(id: number | null): Promise<void>;
 
+  // Trigger a policy-mediated focus decision. Core builds a FocusInputs
+  // from the current pointer + keyboard-focus state and dispatches it to
+  // the active 'focus' plugin's decide(). Fire-and-forget; the result
+  // applies asynchronously. Use this (not focus()) when the caller wants
+  // the focus plugin's policy to decide -- e.g. a workspace plugin after
+  // show() wants to re-resolve focus under the new stack.
+  requestFocusDecision(reason: FocusReason, trigger?: number): Promise<void>;
+
   // Per-surface render-state setters (core-plugin-api.md §1). Each is global
   // per surface (not per output) and consumed by the compositor's shader
   // every frame; calls are cheap (uniform-buffer writes on the next frame).
@@ -138,6 +147,15 @@ export interface PluginWindows extends PluginWindowObserver {
 // protocols/ctx.ts). Re-exported for plugin authors so they don't import
 // from internal core paths.
 export const OUTPUT_DEFAULT = 0;
+
+// Valid FocusReason strings, mirrored from @overdraw/focus-types. Kept here
+// as a runtime list because the SDK validates the boundary; the focus-types
+// package is type-only.
+const VALID_FOCUS_REASONS: readonly string[] = [
+  "pointer-enter", "pointer-leave", "pointer-button",
+  "window-mapped", "window-unmapped", "window-raised",
+  "workspace-changed", "explicit",
+];
 
 export interface WindowsControl {
   windows: PluginWindows;
@@ -222,6 +240,20 @@ export function createPluginWindows(
         throw new TypeError("focus id must be a number or null");
       }
       await endpoint.request("windows.focus", { id });
+    },
+
+    async requestFocusDecision(reason, trigger): Promise<void> {
+      if (typeof reason !== "string" || !VALID_FOCUS_REASONS.includes(reason)) {
+        throw new TypeError(
+          `requestFocusDecision reason must be one of ${VALID_FOCUS_REASONS.join("|")}`);
+      }
+      if (trigger !== undefined && typeof trigger !== "number") {
+        throw new TypeError("requestFocusDecision trigger must be a number or omitted");
+      }
+      const payload: { reason: string; trigger?: number } = { reason };
+      if (trigger !== undefined) payload.trigger = trigger;
+      // eslint-disable-next-line no-restricted-syntax
+      await endpoint.request("windows.request-focus-decision", payload as unknown as Json);
     },
 
     async setOpacity(id, opacity): Promise<void> {

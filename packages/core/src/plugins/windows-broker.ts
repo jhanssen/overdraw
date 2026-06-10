@@ -58,6 +58,7 @@ export function createWindowsBroker(deps: WindowsBrokerDeps): WindowsBroker {
     if (method === "windows.list") return wm.listSnapshots();
     if (method === "windows.set-output-stack") return handleSetOutputStack(params);
     if (method === "windows.focus") return handleFocus(params);
+    if (method === "windows.request-focus-decision") return handleRequestFocusDecision(params);
     if (method === "windows.set-opacity") return handleSetOpacity(params);
     if (method === "windows.set-transform") return handleSetTransform(params);
     if (method === "windows.set-output-margin") return handleSetOutputMargin(params);
@@ -129,6 +130,19 @@ export function createWindowsBroker(deps: WindowsBrokerDeps): WindowsBroker {
   function handleFocus(p: unknown): null {
     if (!isFocusPayload(p)) throw new Error("windows.focus: malformed payload");
     state.seat?.applyKeyboardFocus(p.id);
+    return null;
+  }
+
+  // Policy-mediated focus dispatch. The caller supplies a FocusReason (and
+  // optional trigger surfaceId); the seat builds a FocusInputs from current
+  // pointer + keyboard state and fires the focus driver. Silent no-op when
+  // the seat isn't bound (matches windows.focus's tolerance for partial
+  // lifecycle).
+  function handleRequestFocusDecision(p: unknown): null {
+    if (!isRequestFocusDecisionPayload(p)) {
+      throw new Error("windows.request-focus-decision: malformed payload");
+    }
+    state.seat?.dispatchFocusEvent(p.reason, p.trigger);
     return null;
   }
 
@@ -231,6 +245,26 @@ function isFocusPayload(d: unknown): d is { id: number | null } {
   if (typeof d !== "object" || d === null) return false;
   const id = (d as { id?: unknown }).id;
   return id === null || typeof id === "number";
+}
+
+// Mirrors VALID_FOCUS_REASONS in windows-sdk.ts; the SDK validates at the
+// plugin boundary, the broker re-validates here as the trust boundary.
+const VALID_FOCUS_REASONS: readonly string[] = [
+  "pointer-enter", "pointer-leave", "pointer-button",
+  "window-mapped", "window-unmapped", "window-raised",
+  "workspace-changed", "explicit",
+];
+
+function isRequestFocusDecisionPayload(d: unknown): d is {
+  reason: import("@overdraw/focus-types").FocusReason; trigger?: number;
+} {
+  if (typeof d !== "object" || d === null) return false;
+  const o = d as { [k: string]: unknown };
+  if (typeof o.reason !== "string" || !VALID_FOCUS_REASONS.includes(o.reason)) {
+    return false;
+  }
+  if (o.trigger !== undefined && typeof o.trigger !== "number") return false;
+  return true;
 }
 
 function isSetOutputStackPayload(d: unknown): d is { outputId: number; ids: number[] | null } {

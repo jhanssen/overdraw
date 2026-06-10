@@ -53,10 +53,10 @@ function mockSink() {
 function res(id) { return { resource: { id, version: 1, destroyed: false } }; }
 
 // Build a minimal CompositorState shape that the windows broker uses.
-function makeCoreState(wm, bus) {
+function makeCoreState(wm, bus, seat = null) {
   return {
     bus, wm, pendingWindowChanges: undefined, surfaces: new Map(),
-    seat: null, compositor: null, decorationResize: null,
+    seat, compositor: null, decorationResize: null,
   };
 }
 
@@ -71,8 +71,10 @@ function findLog(events, prefix) {
 
 // Build the test scaffold (Wm with two mapped windows, runtime with broker
 // hooked in, driver plugin loaded + retargeted) and run `fn` with it. Always
-// cleans up the runtime via withRuntime's finally guarantee.
-async function withWindowsSetup(targetId, fn) {
+// cleans up the runtime via withRuntime's finally guarantee. `opts.seat`
+// optionally attaches a seat stub for routes that need state.seat (e.g.
+// windows.request-focus-decision).
+async function withWindowsSetup(targetId, fn, opts = {}) {
   const events = [];
   const pluginBus = new DynamicBus();
   const bus = createCompositorBus();
@@ -83,7 +85,7 @@ async function withWindowsSetup(targetId, fn) {
   wm.addWindow(targetId, res(targetId));
   wm.windowHasContent(targetId);
 
-  const state = makeCoreState(wm, bus);
+  const state = makeCoreState(wm, bus, opts.seat ?? null);
   const broker = createWindowsBroker({ wm, compositor: sink, state, pluginBus, bus });
 
   await withRuntime({
@@ -110,7 +112,7 @@ async function withWindowsSetup(targetId, fn) {
     });
     await waitFor(() => events.some((e) => e.n === 'log' && String(e.d) === `target=${targetId}`));
 
-    await fn({ rt, events, pluginBus, wm, sink });
+    await fn({ rt, events, pluginBus, wm, sink, seat: opts.seat });
   });
 }
 
@@ -285,4 +287,19 @@ test('setColorMatrix: forwards 16-number array to the compositor sink', async ()
       m: [1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1],
     });
   });
+});
+
+test('requestFocusDecision: forwards reason to seat.dispatchFocusEvent', async () => {
+  const dispatchCalls = [];
+  const seat = {
+    applyKeyboardFocus() {},
+    dispatchFocusEvent(reason, trigger) { dispatchCalls.push({ reason, trigger }); },
+  };
+  await withWindowsSetup(7, async ({ events, pluginBus }) => {
+    trigger(pluginBus, 16);
+    await waitFor(() => findLog(events, 'request-focus-decision'));
+    assert.equal(dispatchCalls.length, 1);
+    assert.equal(dispatchCalls[0].reason, 'workspace-changed');
+    assert.equal(dispatchCalls[0].trigger, undefined);
+  }, { seat });
 });

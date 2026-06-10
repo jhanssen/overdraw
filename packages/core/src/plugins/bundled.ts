@@ -24,6 +24,15 @@ export const BUNDLED_PLUGINS: ReadonlyArray<BundledPluginSpec> = [
     module: "@overdraw/plugin-focus-default",
     configFrom: (config) => config.focus,
   },
+  {
+    // Loads AFTER focus-default so the workspace plugin's show() can call
+    // sdk.windows.requestFocusDecision; the broker forwards through the
+    // seat which dispatches through the focus driver -- the focus plugin
+    // must be registered by then. Bundled plugins load sequentially in
+    // this array's order.
+    name: "workspace-default",
+    module: "@overdraw/plugin-workspace-default",
+  },
 ];
 
 // Convert a spec to the runtime's ResolvedPlugin shape. The restart fields

@@ -22,6 +22,10 @@ import { createFocusDriver } from "../packages/core/dist/protocols/focus-driver.
 import { PluginRuntime } from "../packages/core/dist/plugins/index.js";
 import { BUNDLED_PLUGINS, bundledToResolved } from "../packages/core/dist/plugins/bundled.js";
 import { DynamicBus } from "../packages/core/dist/events/dynamic-bus.js";
+import { createCompositorBus } from "../packages/core/dist/events/window-bus.js";
+import { WINDOW_EVENT } from "../packages/core/dist/events/types.js";
+import { createWindowsBroker, NOT_HANDLED as WINDOWS_NOT_HANDLED }
+  from "../packages/core/dist/plugins/windows-broker.js";
 
 const require = createRequire(import.meta.url);
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -64,6 +68,30 @@ export async function waitFor(query, pred, { timeoutMs = 5000, intervalMs = 10, 
     }
     await sleep(intervalMs);
   }
+}
+
+// Poll an arbitrary (possibly async) `producer()` -> value until `pred(value)`
+// is truthy. Same shape as waitFor but doesn't assume the value comes from
+// state.query(); use this for plugin-side state (action invocations, etc.)
+// that race the bus dispatch -> plugin handler -> broker reply chain.
+//
+// Returns the value that satisfied the predicate. Times out with a
+// diagnostic message that includes the last observed value.
+export async function settled(producer, pred, { timeoutMs = 5000, intervalMs = 25, what = "condition" } = {}) {
+  const t0 = Date.now();
+  let last;
+  for (;;) {
+    last = await producer();
+    if (pred(last)) return last;
+    if (Date.now() - t0 > timeoutMs) {
+      throw new Error(`settled timed out (${what}); last value: ${safeStringify(last)}`);
+    }
+    await sleep(intervalMs);
+  }
+}
+
+function safeStringify(v) {
+  try { return JSON.stringify(v); } catch { return String(v); }
 }
 
 // Count live GPU processes by EXACT comm (truncated to "overdraw-gpu-pr"), per
@@ -138,6 +166,15 @@ export async function setupCompositor(opts = {}) {
   }
 
   const pluginBus = opts.bus ?? new DynamicBus();
+  // Typed core bus -- producers (the protocol layer + the seat) emit
+  // window.* / keyboard.* events. main.ts republishes them onto the plugin
+  // (dynamic) bus so sdk.windows.onMap / onUnmap subscriptions see them. The
+  // harness mirrors that so plugins running under setupCompositor observe
+  // the same lifecycle as in production.
+  const coreBus = opts.coreBus ?? createCompositorBus();
+  coreBus.on(WINDOW_EVENT.map, (ev) => { pluginBus.emit(WINDOW_EVENT.map, ev); });
+  coreBus.on(WINDOW_EVENT.unmap, (ev) => { pluginBus.emit(WINDOW_EVENT.unmap, ev); });
+  coreBus.on(WINDOW_EVENT.change, (ev) => { pluginBus.emit(WINDOW_EVENT.change, ev); });
 
   // The driver factories close over `runtime`, which is built after
   // installProtocols below. waitForNamespace inside compute()/decide()
@@ -147,7 +184,7 @@ export async function setupCompositor(opts = {}) {
   state = await installProtocols(addon, {
     output: { width: dims.width, height: dims.height },
     compositor: jsCompositor ?? undefined,
-    bus: opts.bus,
+    bus: coreBus,
     pluginBus,
     layoutDriverFactory: (target, snapshot) => createLayoutDriver({
       target, snapshot,
@@ -176,11 +213,31 @@ export async function setupCompositor(opts = {}) {
     plugins: [],
     sourcePath: null,
   };
+  // Wire a windows broker so bundled / fixture plugins can call
+  // sdk.windows.*. The test's onRequest is consulted for any method the
+  // broker doesn't handle.
+  let windowsBroker = null;
+  if (state.wm) {
+    windowsBroker = createWindowsBroker({
+      wm: state.wm,
+      compositor: jsCompositor ?? noopSinkForBroker(),
+      state, pluginBus, bus: coreBus,
+    });
+  }
+  const onRequest = (plugin, method, params) => {
+    if (windowsBroker && method.startsWith("windows.")) {
+      const r = windowsBroker(plugin, method, params);
+      if (r !== WINDOWS_NOT_HANDLED) return r;
+    }
+    if (opts.onRequest) return opts.onRequest(plugin, method, params);
+    throw new Error(`harness: no handler for plugin request '${method}'`);
+  };
+
   runtime = new PluginRuntime({
     bus: pluginBus,
     log: opts.log ?? (() => {}),
     onEvent: opts.onEvent,
-    onRequest: opts.onRequest,
+    onRequest,
     pluginAddonPath: opts.pluginAddonPath,
     dawnPath: opts.dawnPath,
   });
@@ -252,6 +309,22 @@ export async function setupCompositor(opts = {}) {
     addon, state, sock, dims, query: () => state.query(),
     spawnClient, waitFor, frameReadback, teardown, jsCompositor,
     runtime, pluginBus,
+  };
+}
+
+// Fallback compositor sink the windows broker uses when jsCompositor wasn't
+// brought up (e.g. tests passing jsCompositor: false). The broker's compositor
+// arg is only invoked for setOutputStack / setSurface* etc. -- methods this
+// stub provides as no-ops so the broker can route without crashing.
+function noopSinkForBroker() {
+  return {
+    setSurfaceLayout() {}, setStack() {}, setLayerSurfaces() {},
+    setSurfaceTexture() {}, commitSurfaceBuffer() {}, commitSurfaceDmabuf() {},
+    removeSurface() {}, takeImportedSurfaces() { return []; },
+    takeFreedBuffers() { return []; }, afterCurrentFrame() {}, renderFrame() {},
+    setOutputStack() {},
+    setSurfaceOpacity() {}, setSurfaceTransform() {}, setSurfaceOutputMargin() {},
+    setSurfaceMask() {}, setSurfaceTint() {}, setSurfaceColorMatrix() {},
   };
 }
 

@@ -1,0 +1,16 @@
+{
+  "name": "@overdraw/plugin-workspace-default",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Bundled workspace plugin: dynamic workspaces with stable internal handles + dense user-facing indices. Per-output assignment. Ships with overdraw and registers in the 'workspace' namespace at priority 0 (the floor of the priority chain). User configs may override by registering a higher-priority workspace plugin in the same namespace.",
+  "type": "module",
+  "main": "./dist/index.js",
+  "exports": {
+    ".": {
+      "default": "./dist/index.js"
+    }
+  },
+  "dependencies": {
+    "@overdraw/workspace-types": "*"
+  }
+}

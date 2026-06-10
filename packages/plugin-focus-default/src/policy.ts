@@ -82,8 +82,18 @@ export function decideFocus(config: FocusPluginConfig, inputs: FocusInputs): Foc
       return {};
     }
 
+    case "workspace-changed": {
+      // The pointer is stationary across a workspace switch but the stack
+      // under it changed. Under follow-pointer the keyboard target should
+      // track the new surface (null if nothing is there now). Click-to-
+      // focus leaves focus where it is until a click.
+      if (policy === "follow-pointer") {
+        return { keyboardFocus: inputs.pointer.surfaceUnderPointer };
+      }
+      return {};
+    }
+
     case "window-raised":
-    case "workspace-changed":
       return {};
 
     case "explicit": {

@@ -332,6 +332,14 @@ export interface SeatState {
   // Apply a focus result by surface id (null clears). Used by the focus
   // driver and by the explicit-override path sdk.windows.focus.
   applyKeyboardFocus(surfaceId: number | null): void;
+  // Trigger a focus-driver decide() with the given coarse reason. The seat
+  // supplies the current pointer position + surfaceUnderPointer + current
+  // keyboard focus to FocusInputs. Used by policy-mediated focus callers
+  // (e.g. a workspace plugin after show()) so they don't bypass the focus
+  // plugin via applyKeyboardFocus. Fire-and-forget like the seat's own
+  // dispatches.
+  dispatchFocusEvent(reason: import("./focus-driver.js").FocusReason,
+                     trigger?: number): void;
   // Topmost surface under an output-space point (for DnD hit-testing).
   pick(x: number, y: number): SeatFocus | null;
   // DnD pointer grab. While non-null, handleInput routes pointer motion/

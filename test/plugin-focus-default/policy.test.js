@@ -151,11 +151,30 @@ test('explicit without trigger clears focus', () => {
   assert.deepEqual(r, { keyboardFocus: null });
 });
 
-// ---- reserved events --------------------------------------------------------
+// ---- workspace-changed ------------------------------------------------------
 
-test('window-raised and workspace-changed are no-ops in the bundled plugin', () => {
-  for (const reason of ['window-raised', 'workspace-changed']) {
-    const r = decideFocus(FOLLOW, inputs(reason));
-    assert.deepEqual(r, {}, `reason=${reason}`);
+test('follow-pointer: workspace-changed focuses surface now under the pointer', () => {
+  const r = decideFocus(FOLLOW, inputs('workspace-changed', { under: 7 }));
+  assert.deepEqual(r, { keyboardFocus: 7 });
+});
+
+test('follow-pointer: workspace-changed with no surface clears focus', () => {
+  const r = decideFocus(FOLLOW, inputs('workspace-changed',
+    { under: null, currentKb: 42 }));
+  assert.deepEqual(r, { keyboardFocus: null });
+});
+
+test('click-to-focus: workspace-changed does NOT change focus', () => {
+  const r = decideFocus(CLICK, inputs('workspace-changed',
+    { under: 7, currentKb: 42 }));
+  assert.deepEqual(r, {});
+});
+
+// ---- window-raised ----------------------------------------------------------
+
+test('window-raised is a no-op in the bundled plugin', () => {
+  for (const cfg of [FOLLOW, CLICK]) {
+    const r = decideFocus(cfg, inputs('window-raised', { under: 7, currentKb: 42 }));
+    assert.deepEqual(r, {}, `policy=${cfg.policy}`);
   }
 });

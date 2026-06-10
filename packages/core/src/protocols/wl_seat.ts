@@ -280,6 +280,7 @@ export default function makeSeat(ctx: Ctx, driver: FocusDriver): SeatHandler {
     pointersByClient, keyboardsByClient,
     focus: null, kbFocus: null, handleInput, focusWindow,
     applyKeyboardFocus,
+    dispatchFocusEvent(reason, trigger) { dispatchFocus(reason, trigger); },
     pick,
     drag: null,
     // Begin a DnD pointer grab. While set, handleInput routes pointer motion/

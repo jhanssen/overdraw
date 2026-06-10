@@ -4,7 +4,7 @@ Ground truth for what exists right now: current capabilities, known gaps, and
 what remains. The design lives in `architecture.md`; this file does not restate
 it. Present-tense only — no change history.
 
-Last updated: 2026-06-09 (post-Phase 5.5a — tint + color matrix).
+Last updated: 2026-06-09 (post-Phase 6 — workspaces).
 
 ## Read first: gaps in advertised protocols (silent-gap risks)
 
@@ -1090,6 +1090,157 @@ intercept path (Phase 10), not core primitives.
 **Skipped**: 5.5b (3D LUT) -- per build-order.md, skip until a real
 consumer wants it.
 
+### Workspaces (Phase 6)
+
+Dynamic workspaces driven by the first greenfield bundled plugin.
+The plugin owns the registry; core sees only per-output stack
+overrides via `sdk.windows.setOutputStack(outputId, ids[])`. Switching
+workspaces changes WHAT THE COMPOSITOR DRAWS on that output -- the
+WM's layout is unchanged (it has no concept of workspaces). A window
+on a hidden workspace keeps its tile geometry; the compositor renders
+that tile's region as the clear color (opaque black) because the
+hidden surface isn't in the per-output draw list.
+
+**Two-id model.** Each workspace has two identifiers:
+- `WorkspaceHandle` (branded number, stable, monotonic, never reused):
+  stored in the per-window state bag under `'workspace.id'` and carried
+  in event payloads. Subscribers caching this id don't break when other
+  workspaces are destroyed.
+- `WorkspaceIndex` (branded number, 1-based position): what hotkeys,
+  CLI (`overdrawctl workspace.show 2`), and status bars use. Dense;
+  shifts down on destroy.
+
+Methods that take user input (the action surface) accept an Index and
+resolve it to a handle at the boundary.
+
+**Bundled plugin** (`@overdraw/plugin-workspace-default`): in-thread,
+namespace `'workspace'`, priority 0. Loads after `focus-default` (so
+`requestFocusDecision` reaches a live focus plugin). Maintains:
+- Workspace registry: `byHandle` (records), `positionsByOutput`
+  (ordering), `shownByOutput`, `surfaceToHandle` (reverse index),
+  `nextHandle` (monotonic counter).
+- An invariant: at least one workspace exists per output that has
+  been touched. Workspace 1 is created on init.
+- Destroy policy: removes the workspace at the requested index;
+  shifts subsequent indices down; relocates members to the workspace
+  that took the destroyed position (or the new last one when
+  destroying the tail); if positions become empty, allocates a fresh
+  handle for the new index 1.
+
+**Action surface** (registered via `sdk.actions.register`, dispatched
+by `overdrawctl` and any future hotkey plugin):
+- `workspace.create({name?, outputId?}) -> WorkspaceSnapshot`
+- `workspace.destroy({index, outputId?}) -> null`
+- `workspace.show({index, outputId?}) -> null`
+- `workspace.move-window({surfaceId, index, outputId?}) -> null`
+- `workspace.set-name({index, name | null | undefined, outputId?}) -> null`
+- `workspace.list({outputId?}) -> WorkspaceSnapshot[]`
+- `workspace.current({outputId?}) -> WorkspaceSnapshot | null`
+
+**Event family** (emitted via `sdk.events.emit`):
+- `workspace.created` `{handle, index, outputId, name?}`
+- `workspace.destroyed` `{handle, formerIndex, outputId}`
+- `workspace.shown` `{handle, index, outputId}`
+- `workspace.hidden` `{handle, index, outputId}`
+- `workspace.renumbered` `{outputId, changes: [{handle, oldIndex, newIndex}]}`
+- `workspace.renamed` `{handle, index, outputId, name?}`
+- `workspace.window-moved` `{surfaceId, fromHandle, toHandle, fromIndex, toIndex, fromOutputId, toOutputId}`
+
+**Substrate added for Phase 6:**
+- `sdk.windows.requestFocusDecision(reason, trigger?)`: lets a plugin
+  trigger the focus driver to re-decide via the active focus plugin's
+  policy. Used by `workspace.show` to re-resolve focus under the new
+  stack. Goes through `windows.request-focus-decision` (broker route)
+  -> `state.seat.dispatchFocusEvent(reason, trigger)` (new SeatState
+  method) -> `focusDriver.dispatch(...)` (existing). Fire-and-forget;
+  result applies asynchronously per the focus driver's normal
+  sequence-tagged path.
+- Focus plugin policy fix: `workspace-changed` under `follow-pointer`
+  now returns `{keyboardFocus: pointer.surfaceUnderPointer}` (was
+  `{}`). Switching workspaces re-resolves focus to whatever's now
+  under the pointer; under `click-to-focus` it remains a no-op.
+
+**Per-window state bag.** When a window joins a workspace, the plugin
+writes `state['workspace.id'] = WorkspaceHandle` via
+`sdk.windows.setState`. Move clears the source and writes to the
+target; unmap deletes the entry. Other plugins (status bar,
+overdraw-ctl, window rules) read this key to know which workspace a
+window is on.
+
+**Caveats:**
+- Single-output today. `outputId` defaults to `OUTPUT_DEFAULT=0`;
+  passing anything else routes through the registry but only output 0
+  is meaningful until `wl_output` reconfiguration lands ("Read first"
+  silent-gap list).
+- No animated transitions (Phase 6 spec: instant only; transitions
+  are Phase 8).
+- One-frame flash on map into a hidden workspace: a window enters the
+  WM's layout at `xdg_surface.get_toplevel` (before the plugin sees
+  `window.map`), so its tile can be configured + render in the brief
+  interval before the workspace plugin observes the map and pushes a
+  filtered `setOutputStack`. Accepted limitation in v1.
+- No workspace persistence across compositor restarts.
+
+**Files:**
+- `packages/workspace-types/src/index.ts` (canonical type contract).
+- `packages/plugin-workspace-default/src/registry.ts` (pure state
+  machine with side-effect-tuple return for SDK translation).
+- `packages/plugin-workspace-default/src/index.ts` (plugin wrapper:
+  subscribes to onMap/onUnmap; registers actions + namespace + emits).
+- `packages/core/src/plugins/bundled.ts` (`workspace-default` entry).
+- `packages/core/src/plugins/windows-sdk.ts`,
+  `packages/core/src/plugins/windows-broker.ts`,
+  `packages/core/src/protocols/ctx.ts`,
+  `packages/core/src/protocols/wl_seat.ts`
+  (`requestFocusDecision` substrate).
+- `packages/plugin-focus-default/src/policy.ts`
+  (`workspace-changed` policy update).
+
+**Tests:**
+- Pure-unit: `test/plugin-workspace-default/registry.test.js` (34
+  tests on the state machine in isolation -- destroy renumber +
+  relocation, always-at-least-one invariant, map/unmap idempotence,
+  show no-op same-workspace, etc.).
+- Pure-unit: `test/plugin-workspace-default/integration.test.js` (15
+  tests through a real `PluginRuntime` against a mock CompositorSink
+  + seat stub; verifies setOutputStack effects, event payloads,
+  focus-driver dispatch, malformed-params rejection).
+- Pure-unit: `test/windows-broker-request-focus-decision.test.js` (8
+  tests on the new broker route + payload validation).
+- Pure-unit: focus policy tests
+  (`test/plugin-focus-default/policy.test.js`) updated; +3 new tests
+  for the `workspace-changed` branches.
+- GPU integration: `test/plugin-workspace-default/workspaces.gpu.mjs`
+  (2 tests: one-client membership wiring; two-client pixel readback
+  proving `move-window` + `show` flip what composites where).
+
+**Test framework gaps closed alongside Phase 6:**
+- `harness.mjs` defaults: brings up the typed core bus +
+  `coreBus -> pluginBus` republish + windows broker by default, so
+  plugins under `setupCompositor` see the same SDK wiring `main.ts`
+  provides. Previously a bundled plugin using `sdk.windows.*` would
+  silently fail in tests.
+- `PluginRuntime.flush()`: drains in-flight plugin endpoint requests
+  across microtask + macrotask hops until quiescent; tests call it
+  after triggering a state change before asserting. Exposed via
+  `c.runtime.flush()`.
+- `harness.mjs settled(producer, pred, opts)`: polls an arbitrary
+  async producer until pred(value) is truthy; replaces ad-hoc polling
+  loops in tests.
+- Loud-not-silent runtime warnings: `if (!bus) return;` in
+  `inthread-plugin.ts` and `runtime.ts` (events.subscribe/emit/
+  intercept-register) now route through `warnRuntimeMisconfig(...)`
+  -> `console.error`, bypassing test-silenced log hooks. Combined
+  with making the `window.*` observer subscription lazy (only on
+  first onMap/onUnmap/onChange handler), tests that don't observe
+  windows no longer trigger spurious warnings -- but a plugin that
+  does observe a no-bus runtime gets a clear stderr message.
+- `Endpoint.pendingCount()`: introspection hook flush() uses.
+
+540/540 unit tests pass (was 479 pre-6; +61 from the additions
+above). 77/77 GPU tests pass (was 75 pre-6; +2 from
+workspaces.gpu.mjs).
+
 ### Decoration provider (registration + insets + drawing + atomic gating)
 
 Server-side decorations end to end: a plugin registers an app_id pattern, is told
@@ -1313,11 +1464,14 @@ capabilities exist to grant).
   evaluator `sdk.animations.run` / `cancel` with tween + spring +
   sequence + parallel (Phase 4b); `@overdraw/sdk-anim` plugin-side
   spec builders (Phase 4c); per-surface tint + 4x4 color matrix
-  primitives `setTint` / `setColorMatrix` (Phase 5.5a). Not built:
-  `sdk.transitions` (Phase 8); cursor / closing /
-  velocity (Phase 9); input chain (`sdk.input.bind`, Phase 7); output
-  observation beyond a fabricated `wl_output`; protocol SDK surface;
-  interactive-region hit-testing; `sdk.onFrame` (Phase 5+).
+  primitives `setTint` / `setColorMatrix` (Phase 5.5a);
+  `sdk.windows.requestFocusDecision(reason, trigger?)` policy-mediated
+  focus dispatch + the bundled workspace plugin's `'workspace'`
+  namespace API (Phase 6). Not built: `sdk.transitions` (Phase 8);
+  cursor / closing / velocity (Phase 9); input chain
+  (`sdk.input.bind`, Phase 7); output observation beyond a fabricated
+  `wl_output`; protocol SDK surface; interactive-region hit-testing;
+  `sdk.onFrame` (Phase 5+).
 - **Capability enforcement.** No capability gate on `sdk.gpu`/`sdk.window`/
   `sdk.decorations` (every plugin gets them); no native-import restriction (a
   plugin's `import()` is unrestricted — deferred until there is an SDK native addon
