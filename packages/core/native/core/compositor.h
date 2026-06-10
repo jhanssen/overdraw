@@ -22,7 +22,10 @@
 
 #include "wire_link.h"
 
-namespace overdraw::ipc { class CtrlSender; }
+namespace overdraw::ipc {
+class CtrlSender;
+enum class FrameKind : uint8_t;
+}
 
 namespace overdraw::core {
 
@@ -344,6 +347,12 @@ class Compositor {
 
   private:
     bool handshake();
+
+    // Encode a wire-frame payload into a stack buffer sized by Payload::kSize
+    // and append it as `kind`. The six write*Access helpers above differ only
+    // in payload type + frame kind; this collapses the boilerplate.
+    template <typename Payload>
+    void writeAccessFrame(ipc::FrameKind kind, const Payload& payload);
 
     std::unique_ptr<WireLink> link_;
     pid_t gpuPid_ = -1;

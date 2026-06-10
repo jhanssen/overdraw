@@ -499,6 +499,17 @@ WGPUTexture Compositor::coreSurfaceTexture(uint32_t surfaceBufId) const {
                                                 : it->second.reservation().texture;
 }
 
+// Encode `payload` into a stack-allocated buffer sized by Payload::kSize and
+// append it as a wire frame of `kind`. The six write* helpers below differ
+// only in payload type (ClientTexAccessPayload vs SurfaceAccessPayload) and
+// the kind constant; everything else is mechanical encode + appendFrame.
+template <typename Payload>
+void Compositor::writeAccessFrame(ipc::FrameKind kind, const Payload& payload) {
+    uint8_t buf[Payload::kSize];
+    payload.encode(buf);
+    link_->appendFrame(kind, buf, sizeof(buf));
+}
+
 bool Compositor::writeClientTexBeginAccess(uint32_t importId) {
     auto wh = jsImportHandles_.find(importId);
     if (wh == jsImportHandles_.end()) {
@@ -506,10 +517,8 @@ bool Compositor::writeClientTexBeginAccess(uint32_t importId) {
                      importId);
         return false;
     }
-    ipc::ClientTexAccessPayload p{wh->second.id, wh->second.generation};
-    uint8_t buf[ipc::ClientTexAccessPayload::kSize];
-    p.encode(buf);
-    link_->appendFrame(ipc::FrameKind::BeginAccess, buf, sizeof(buf));
+    writeAccessFrame(ipc::FrameKind::BeginAccess,
+                     ipc::ClientTexAccessPayload{wh->second.id, wh->second.generation});
     return true;
 }
 
@@ -520,38 +529,28 @@ void Compositor::writeClientTexEndAccess(uint32_t importId) {
                      importId);
         return;
     }
-    ipc::ClientTexAccessPayload p{wh->second.id, wh->second.generation};
-    uint8_t buf[ipc::ClientTexAccessPayload::kSize];
-    p.encode(buf);
-    link_->appendFrame(ipc::FrameKind::EndAccess, buf, sizeof(buf));
+    writeAccessFrame(ipc::FrameKind::EndAccess,
+                     ipc::ClientTexAccessPayload{wh->second.id, wh->second.generation});
 }
 
 void Compositor::writeConsumerBeginAccess(uint32_t surfaceBufId) {
-    ipc::SurfaceAccessPayload p{surfaceBufId, /*producer=*/false};
-    uint8_t buf[ipc::SurfaceAccessPayload::kSize];
-    p.encode(buf);
-    link_->appendFrame(ipc::FrameKind::BeginAccess, buf, sizeof(buf));
+    writeAccessFrame(ipc::FrameKind::BeginAccess,
+                     ipc::SurfaceAccessPayload{surfaceBufId, /*producer=*/false});
 }
 
 void Compositor::writeConsumerEndAccess(uint32_t surfaceBufId) {
-    ipc::SurfaceAccessPayload p{surfaceBufId, /*producer=*/false};
-    uint8_t buf[ipc::SurfaceAccessPayload::kSize];
-    p.encode(buf);
-    link_->appendFrame(ipc::FrameKind::EndAccess, buf, sizeof(buf));
+    writeAccessFrame(ipc::FrameKind::EndAccess,
+                     ipc::SurfaceAccessPayload{surfaceBufId, /*producer=*/false});
 }
 
 void Compositor::writeProducerBeginAccess(uint32_t surfaceBufId) {
-    ipc::SurfaceAccessPayload p{surfaceBufId, /*producer=*/true};
-    uint8_t buf[ipc::SurfaceAccessPayload::kSize];
-    p.encode(buf);
-    link_->appendFrame(ipc::FrameKind::BeginAccess, buf, sizeof(buf));
+    writeAccessFrame(ipc::FrameKind::BeginAccess,
+                     ipc::SurfaceAccessPayload{surfaceBufId, /*producer=*/true});
 }
 
 void Compositor::writeProducerEndAccess(uint32_t surfaceBufId) {
-    ipc::SurfaceAccessPayload p{surfaceBufId, /*producer=*/true};
-    uint8_t buf[ipc::SurfaceAccessPayload::kSize];
-    p.encode(buf);
-    link_->appendFrame(ipc::FrameKind::EndAccess, buf, sizeof(buf));
+    writeAccessFrame(ipc::FrameKind::EndAccess,
+                     ipc::SurfaceAccessPayload{surfaceBufId, /*producer=*/true});
 }
 
 Compositor::PluginConnHandle Compositor::addWireConnection() {
