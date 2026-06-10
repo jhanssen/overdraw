@@ -127,6 +127,36 @@ export async function installProtocols(
     serial() { return this.nextSerial++; },
   };
   if (opts.bus) state.bus = opts.bus;
+  // The binding chain owns the input modes + chord trie. Plugins
+  // register bindings via the windows broker; the seat dispatches each
+  // key-down here. Chain events (mode-pushed/popped, chord-*) re-emit on
+  // the plugin bus (when present) so subscribers like a status bar
+  // observe mode + chord state.
+  const { BindingChain } = await import("../input/binding-chain.js");
+  const chain = new BindingChain();
+  state.bindingChain = chain;
+  if (opts.pluginBus) {
+    const pb = opts.pluginBus;
+    chain.setListener((ev) => {
+      switch (ev.kind) {
+        case "mode-pushed":
+          pb.emit("input.mode-pushed", { name: ev.name, stack: ev.stack });
+          break;
+        case "mode-popped":
+          pb.emit("input.mode-popped", { name: ev.name, stack: ev.stack });
+          break;
+        case "chord-entered":
+          pb.emit("input.chord-entered", { mode: ev.mode, path: ev.path });
+          break;
+        case "chord-cancelled":
+          pb.emit("input.chord-cancelled", { mode: ev.mode, path: ev.path });
+          break;
+        case "chord-matched":
+          pb.emit("input.chord-matched", { mode: ev.mode, path: ev.path });
+          break;
+      }
+    });
+  }
   // ctx is needed by the WM's ConfigureSink (configureToplevel) below; build it
   // here. The handler factories receive the same ctx later.
   const ctx: Ctx = { events, state, addon };

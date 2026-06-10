@@ -26,6 +26,8 @@ import { createCompositorBus } from "../packages/core/dist/events/window-bus.js"
 import { WINDOW_EVENT } from "../packages/core/dist/events/types.js";
 import { createWindowsBroker, NOT_HANDLED as WINDOWS_NOT_HANDLED }
   from "../packages/core/dist/plugins/windows-broker.js";
+import { createInputBroker, NOT_HANDLED as INPUT_NOT_HANDLED }
+  from "../packages/core/dist/plugins/input-broker.js";
 
 const require = createRequire(import.meta.url);
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -210,6 +212,7 @@ export async function setupCompositor(opts = {}) {
   const resolvedConfig = {
     output: null,
     focus: opts.focus,
+    hotkeys: opts.hotkeys,
     plugins: [],
     sourcePath: null,
   };
@@ -224,10 +227,21 @@ export async function setupCompositor(opts = {}) {
       state, pluginBus, bus: coreBus,
     });
   }
+  // The input broker emits 'input.binding-fired' to the originating plugin
+  // when a binding matches; runtime.emit is the indirection. `runtime` is
+  // assigned below (let-bound in scope at the top of this function).
+  const inputBroker = createInputBroker({
+    state,
+    emitToPlugin: (plugin, name, data) => { runtime?.emit(plugin, name, data); },
+  });
   const onRequest = (plugin, method, params) => {
     if (windowsBroker && method.startsWith("windows.")) {
       const r = windowsBroker(plugin, method, params);
       if (r !== WINDOWS_NOT_HANDLED) return r;
+    }
+    if (method.startsWith("input.")) {
+      const r = inputBroker(plugin, method, params);
+      if (r !== INPUT_NOT_HANDLED) return r;
     }
     if (opts.onRequest) return opts.onRequest(plugin, method, params);
     throw new Error(`harness: no handler for plugin request '${method}'`);

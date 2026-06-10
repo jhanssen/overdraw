@@ -1,22 +1,23 @@
 // overdraw user-configuration API.
 //
-// This is the public, stable shape a user's config file declares. It lives in
-// the core as a .ts so a standalone .d.ts can be generated later (for users who
-// `import type { OverdrawConfig } from "overdraw"` in their config.ts — that
-// type-only import is erased at runtime by Node's type stripping, so it works
-// even before such a package export exists).
+// This is the public, stable shape a user's config file declares. The
+// canonical import path is "overdraw/config":
 //
-// A config file (config.{ts,cts,mts,js,cjs,mjs} under ~/.config/overdraw/, or a
-// path given with --config) default-exports either an OverdrawConfig object or a
-// function returning one (sync or async):
-//
-//   import type { OverdrawConfig } from "overdraw";
+//   import type { OverdrawConfig } from "overdraw/config";
 //   export default {
 //     focus: { policy: "click-to-focus" },
 //     plugins: [{ module: "/path/to/plugin.js" }],
 //   } satisfies OverdrawConfig;
 //
-// Every field is optional; an absent config (or absent field) uses defaults.
+// The type-only import is erased at runtime by Node's native .ts stripping;
+// a .js config can omit the import entirely (the shape is structural).
+//
+// A config file (config.{ts,cts,mts,js,cjs,mjs} under ~/.config/overdraw/,
+// or a path given with --config) default-exports either an OverdrawConfig
+// object or a function returning one (sync or async).
+//
+// Every field is optional; an absent config (or absent field) uses
+// defaults.
 
 export interface OutputConfig {
   // Logical output size. The host window size drives this in nested mode;
@@ -63,6 +64,13 @@ export interface OverdrawConfig {
   // `import type { FocusPluginConfig } from '@overdraw/plugin-focus-default'`
   // and write `focus: cfg satisfies FocusPluginConfig`.
   focus?: unknown;
+  // Bundled-plugin config slice for the 'hotkey' namespace. Same verbatim
+  // pass-through pattern as `focus`: the bundled hotkey plugin owns the
+  // schema (`KeyboardConfig` from `@overdraw/hotkey-types`). For typed
+  // editing, users may
+  // `import type { KeyboardConfig } from "@overdraw/hotkey-types"` and
+  // write `hotkeys: cfg satisfies KeyboardConfig`.
+  hotkeys?: unknown;
   // DEFERRED — see PluginConfig. Declared/validated but not yet consumed.
   plugins?: PluginConfig[];
 }
@@ -99,6 +107,8 @@ export interface ResolvedConfig {
   // Verbatim user value (or undefined). Threaded to the bundled focus
   // plugin via bundled.ts's configFrom; the plugin validates.
   focus: unknown;
+  // Same verbatim pass-through to the bundled hotkey plugin.
+  hotkeys: unknown;
   plugins: ResolvedPlugin[];
   // Absolute path of the config file that was loaded, or null if none was found
   // (built-in defaults in effect).

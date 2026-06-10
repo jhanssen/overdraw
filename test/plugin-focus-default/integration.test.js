@@ -16,7 +16,7 @@ if (!focusSpec) throw new Error('test setup: focus-default not in BUNDLED_PLUGIN
 // Build a tiny ResolvedConfig harness so bundledToResolved picks up our
 // focus config via spec.configFrom.
 function loadedConfig(focus) {
-  return { output: null, focus, plugins: [], sourcePath: null };
+  return { output: null, focus, hotkeys: undefined, plugins: [], sourcePath: null };
 }
 
 // Drive the focus driver through one dispatch and await both the driver's

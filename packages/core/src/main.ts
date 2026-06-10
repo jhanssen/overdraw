@@ -24,6 +24,7 @@ import { createGpuBroker } from "./plugins/gpu-broker.js";
 import { createDecorationBroker } from "./plugins/decoration-broker.js";
 import { createWindowsBroker, NOT_HANDLED as WINDOWS_NOT_HANDLED } from "./plugins/windows-broker.js";
 import { createAnimationsBroker, NOT_HANDLED as ANIM_NOT_HANDLED } from "./plugins/animations-broker.js";
+import { createInputBroker, NOT_HANDLED as INPUT_NOT_HANDLED } from "./plugins/input-broker.js";
 import { createEvaluator } from "./animations/evaluator.js";
 import { BUNDLED_PLUGINS, bundledToResolved } from "./plugins/bundled.js";
 import { JsCompositor } from "./gpu/compositor.js";
@@ -102,6 +103,12 @@ function shutdown(signal: string): void {
 }
 process.on("SIGINT", () => shutdown("SIGINT"));
 process.on("SIGTERM", () => shutdown("SIGTERM"));
+
+// The core-actions plugin's compositor.quit action emits this event; any
+// other plugin or IPC caller can fire the same shutdown by emitting it
+// directly. shutdown() is idempotent, so a SIGTERM during compositor.quit
+// processing is safe.
+pluginBus.subscribe("compositor.shutdown", () => shutdown("compositor.shutdown"));
 
 const config = await loadConfig(parseConfigArg(process.argv.slice(2)));
 console.log(`[overdraw] config: ${config.sourcePath ?? "(defaults; no config file)"}`);
@@ -229,6 +236,19 @@ const evaluator = createEvaluator(compositor);
 const animationsBroker = createAnimationsBroker(evaluator);
 state.beforeRender = (timeMs: number): void => { evaluator.tick(timeMs); };
 
+// Input broker: services plugin sdk.input.* calls by routing into the
+// seat's binding chain. emitToPlugin uses the runtime's per-plugin event
+// emit; the runtime is assigned below before any plugin loads.
+const inputBroker = createInputBroker({
+  state,
+  // input-broker passes structured-clone-safe payloads (numeric ids +
+  // KeyStep records) but its EmitToPlugin signature is unknown for
+  // generality. The runtime's emit asserts Json at its boundary.
+  emitToPlugin: (plugin, name, data) => {
+    runtime?.emit(plugin, name, data as import("./plugins/protocol.js").Json);
+  },
+});
+
 // The runtime is created unconditionally so the IPC server has an action
 // registry to dispatch against even before any plugin is loaded. load() is
 // called with the combined bundled + user-config plugin set (possibly
@@ -268,6 +288,13 @@ runtime = new PluginRuntime({
       const r = animationsBroker(plugin, method, params);
       if (r === ANIM_NOT_HANDLED) {
         throw new Error(`no handler for animations method '${method}'`);
+      }
+      return r;
+    }
+    if (method.startsWith("input.")) {
+      const r = inputBroker(plugin, method, params);
+      if (r === INPUT_NOT_HANDLED) {
+        throw new Error(`no handler for input method '${method}'`);
       }
       return r;
     }

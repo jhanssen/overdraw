@@ -18,6 +18,7 @@ import type {
 import type { PluginActions } from "./actions.js";
 import type { PluginAnimations } from "./animations-sdk.js";
 import type { PluginCompose } from "./compose-sdk.js";
+import type { PluginInput } from "./input-sdk.js";
 
 export interface PluginSdk {
   // The plugin's stable name (config `name`, defaulting to its module).
@@ -54,6 +55,11 @@ export interface PluginSdk {
   // per-surface state (window-opacity / window-transform /
   // window-output-margin). Always present.
   animations: PluginAnimations;
+  // Keyboard binding chain (core-plugin-api.md §4). Plugins register
+  // chord bindings and named modes; the seat dispatches each key-down
+  // through the chain before forwarding to the focused client. Always
+  // present.
+  input: PluginInput;
   // Decoration provider: register an app_id pattern + observe assigned windows.
   // No capability gate yet (this tier is meant to be gated like tier 3 -- it sees
   // every matched window's app_id/state -- but the capability system is unbuilt;
@@ -77,6 +83,7 @@ export function createSdk(name: string, emitLog: (line: string) => void,
                           events: PluginEvents, ns: PluginNamespace,
                           actions: PluginActions, windows: PluginWindows,
                           animations: PluginAnimations,
+                          input: PluginInput,
                           gpu?: PluginGpu,
                           decorations?: PluginDecorations,
                           compose?: PluginCompose): SdkControl {
@@ -98,6 +105,7 @@ export function createSdk(name: string, emitLog: (line: string) => void,
     actions,
     windows,
     animations,
+    input,
     ...(gpu ? { gpu } : {}),
     ...(decorations ? { decorations } : {}),
     ...(compose ? { compose } : {}),

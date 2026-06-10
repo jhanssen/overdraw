@@ -45,6 +45,11 @@ class Keymap {
     void updateKey(uint32_t evdevKeycode, bool pressed);
     void modifiers(uint32_t& depressed, uint32_t& latched,
                    uint32_t& locked, uint32_t& group) const;
+    // Resolve a raw evdev keycode to its keysym under the CURRENT xkb state
+    // (modifier + layout). Returns 0 (XKB_KEY_NoSymbol) if the keymap isn't
+    // built or the key has no symbol bound. The seat uses this to look up
+    // the keysym for binding-chain match decisions.
+    uint32_t keysym(uint32_t evdevKeycode) const;
 
   private:
     ::xkb_context* ctx_ = nullptr;

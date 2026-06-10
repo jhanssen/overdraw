@@ -75,4 +75,10 @@ void Keymap::modifiers(uint32_t& depressed, uint32_t& latched,
     group = xkb_state_serialize_layout(state_, XKB_STATE_LAYOUT_EFFECTIVE);
 }
 
+uint32_t Keymap::keysym(uint32_t evdevKeycode) const {
+    if (!state_) return 0;
+    // xkb keycodes are evdev + 8 (the X11/XKB offset).
+    return xkb_state_key_get_one_sym(state_, evdevKeycode + 8);
+}
+
 }  // namespace overdraw::wayland

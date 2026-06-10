@@ -242,13 +242,29 @@ export default function makeSeat(ctx: Ctx, driver: FocusDriver): SeatHandler {
         break;
       }
       case "keyboardKey": {
-        const kb = seat.kbFocus;
-        if (!kb) return;
-        // Feed xkb state (drives modifiers) and send key + updated modifiers to
-        // the keyboard-focused client's keyboard(s). Raw evdev keycode; client
-        // interprets via the keymap.
+        // Always feed xkb state, even when no client is focused: the chain
+        // consults modifier state to match bindings, and xkb's mod state
+        // must track every keystroke regardless of where it goes.
         const pressed = !!ev.pressed;
         const mods = ctx.addon.keyUpdate(ev.key ?? 0, pressed);
+
+        // Consult the binding chain on key-DOWN before forwarding to the
+        // client. A matched binding consumes the key (skips wl_keyboard
+        // delivery). Key-up events bypass the chain (bindings fire on
+        // press only); xkb still sees them so subsequent presses have the
+        // right modifier state.
+        let consumed = false;
+        if (pressed && ctx.state.bindingChain && mods.keysym !== 0) {
+          const r = ctx.state.bindingChain.dispatch({
+            mods: mods.modsDepressed, keysym: mods.keysym,
+          });
+          consumed = r.consume;
+        }
+
+        const kb = seat.kbFocus;
+        if (!kb || consumed) return;
+        // Forward to the focused client's keyboards. Raw evdev keycode;
+        // client interprets via the keymap.
         const keySerial = ctx.state.serial();
         const state = pressed ? 1 : 0;
         for (const k of clientKeyboards(kb.clientId)) {

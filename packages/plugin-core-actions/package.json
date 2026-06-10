@@ -1,0 +1,13 @@
+{
+  "name": "@overdraw/plugin-core-actions",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Bundled plugin that registers core-owned actions: compositor.quit (graceful shutdown) and any future compositor-scoped utility actions. Loads first among the bundled plugins so the actions are available to any subsequent plugin (e.g. the hotkey plugin binding a quit shortcut).",
+  "type": "module",
+  "main": "./dist/index.js",
+  "exports": {
+    ".": {
+      "default": "./dist/index.js"
+    }
+  }
+}

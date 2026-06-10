@@ -16,6 +16,13 @@ export interface BundledPluginSpec {
 
 export const BUNDLED_PLUGINS: ReadonlyArray<BundledPluginSpec> = [
   {
+    // Loads first so its actions (compositor.quit, ...) are available for
+    // any subsequent plugin that wants to bind them. Bundled plugins load
+    // sequentially in this array's order.
+    name: "core-actions",
+    module: "@overdraw/plugin-core-actions",
+  },
+  {
     name: "layout-default",
     module: "@overdraw/plugin-layout-default",
   },
@@ -28,10 +35,18 @@ export const BUNDLED_PLUGINS: ReadonlyArray<BundledPluginSpec> = [
     // Loads AFTER focus-default so the workspace plugin's show() can call
     // sdk.windows.requestFocusDecision; the broker forwards through the
     // seat which dispatches through the focus driver -- the focus plugin
-    // must be registered by then. Bundled plugins load sequentially in
-    // this array's order.
+    // must be registered by then.
     name: "workspace-default",
     module: "@overdraw/plugin-workspace-default",
+  },
+  {
+    // Loads LAST so any action it might bind (compositor.quit,
+    // workspace.show, etc.) is already registered. The hotkey plugin
+    // never needs other plugins' namespaces at init time, but its
+    // BINDINGS are unmeaningful until the corresponding action exists.
+    name: "hotkey-default",
+    module: "@overdraw/plugin-hotkey-default",
+    configFrom: (config) => config.hotkeys,
   },
 ];
 

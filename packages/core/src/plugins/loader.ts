@@ -31,6 +31,7 @@ import { createPluginActions } from "./actions.js";
 import { createPluginAnimations } from "./animations-sdk.js";
 import { createInThreadCompose, createWorkerCompose } from "./compose-sdk.js";
 import type { PluginCompose } from "./compose-sdk.js";
+import { createPluginInput } from "./input-sdk.js";
 
 export interface LoaderInput {
   module: string;
@@ -89,10 +90,11 @@ export async function runLoader(channel: Channel, input: LoaderInput): Promise<v
   const windowsCtl = createPluginWindows(endpoint, eventsHandle.events);
   const animations = createPluginAnimations(endpoint);
   const decorations = makeRingSurface ? createDecorations(endpoint, makeRingSurface) : undefined;
+  const inputHandle = createPluginInput(endpoint);
 
   const control = createSdk(input.name, (line) => { endpoint.emit("log", line); },
     eventsHandle.events, nsHandle.ns, actionsHandle.actions, windowsCtl.windows,
-    animations, gpu, decorations?.decorations, compose);
+    animations, inputHandle.input, gpu, decorations?.decorations, compose);
 
   endpoint.handleRequests(async (method, params): Promise<Json> => {
     const ns = nsHandle.dispatcher.tryHandle(method, params);
@@ -114,6 +116,7 @@ export async function runLoader(channel: Channel, input: LoaderInput): Promise<v
 
   endpoint.handleEvents((eventName, data) => {
     if (eventsHandle.dispatcher.dispatch(eventName, data)) return;
+    if (inputHandle.dispatcher.dispatch(eventName, data)) return;
     decorations?.dispatch(eventName, data);
   });
 

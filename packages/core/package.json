@@ -5,6 +5,15 @@
   "description": "Wayland compositor: thin C++ core + Node, separate native GPU process (Dawn).",
   "type": "module",
   "main": "dist/index.js",
+  "exports": {
+    ".": {
+      "default": "./dist/index.js"
+    },
+    "./config": {
+      "types": "./dist/config/index.d.ts",
+      "default": "./dist/config/index.js"
+    }
+  },
   "imports": {
     "#protocols-gen/*": "./dist/protocols-gen/*"
   },

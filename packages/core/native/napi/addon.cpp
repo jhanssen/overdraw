@@ -1118,19 +1118,21 @@ napi_value KeymapInfo(napi_env env, napi_callback_info) {
     return obj;
 }
 
-// keyUpdate(evdevKey, pressed) -> { modsDepressed, modsLatched, modsLocked, group }
+// keyUpdate(evdevKey, pressed) -> { modsDepressed, modsLatched, modsLocked, group, keysym }
 // Feeds the key into the xkb state and returns the resulting modifier masks for
-// wl_keyboard.modifiers. Returns zeros if the keymap is not built.
+// wl_keyboard.modifiers, plus the resolved keysym (post-update) for binding-chain
+// matching. Returns zeros if the keymap is not built.
 napi_value KeyUpdate(napi_env env, napi_callback_info info) {
     size_t argc = 2; napi_value argv[2];
     napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
     uint32_t key = 0; bool pressed = false;
     if (argc >= 1) napi_get_value_uint32(env, argv[0], &key);
     if (argc >= 2) napi_get_value_bool(env, argv[1], &pressed);
-    uint32_t dep = 0, lat = 0, lock = 0, grp = 0;
+    uint32_t dep = 0, lat = 0, lock = 0, grp = 0, sym = 0;
     if (g_addon.keymap) {
         g_addon.keymap->updateKey(key, pressed);
         g_addon.keymap->modifiers(dep, lat, lock, grp);
+        sym = g_addon.keymap->keysym(key);
     }
     napi_value obj; napi_create_object(env, &obj);
     auto setU = [&](const char* k, uint32_t val) {
@@ -1141,6 +1143,7 @@ napi_value KeyUpdate(napi_env env, napi_callback_info info) {
     setU("modsLatched", lat);
     setU("modsLocked", lock);
     setU("group", grp);
+    setU("keysym", sym);
     return obj;
 }
 

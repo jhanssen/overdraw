@@ -13,11 +13,13 @@ what is actually built today is in `status.md`.
 
 Phases 0a, 0b, 0c, 0d, 0e, 1, 2, 3, 4, 4.5, 5, 5b (both
 snapshot + live halves of cross-device dmabuf compose for Worker
-plugins), 5.5a (tint + color matrix per-surface primitives), and
-6 (bundled workspaces plugin + `sdk.windows.requestFocusDecision`)
-are landed (see `git log` and `status.md`). Phase 7 (hotkeys) is
-next. The text below describes each phase in its original
-forward-looking shape; ✅ marks the completed ones inline.
+plugins), 5.5a (tint + color matrix per-surface primitives),
+6 (bundled workspaces plugin + `sdk.windows.requestFocusDecision`),
+and 7a (input binding chain + chord + mode-stack + bundled hotkey
+plugin) are landed (see `git log` and `status.md`). Phase 7b
+(deferred-ref params + user-config actions + workspace-action
+revisions) is next. The text below describes each phase in its
+original forward-looking shape; ✅ marks the completed ones inline.
 
 Deferred: 5.5b (3D LUT) -- skip until a real consumer wants it.
 Phase 5b's `sdk.compose.windows` for Worker plugins (the per-
@@ -606,30 +608,54 @@ as the workspace projection onto core; the full action + event + state-bag
 loop. GPU integration test: switch workspaces; verify only the new
 workspace's windows composite.
 
-## Phase 7 — Hotkeys
+## Phase 7 — Hotkeys (split 7a / 7b)
 
 Brings keyboard control online. First validation that actions +
 `sdk.input.bind` compose into a real user feature.
 
-### 7a. `sdk.input.bind` in core
+Split into two sub-phases to ship the working core early and let
+real use guide the deferred-ref + user-action design:
+- **7a (landed):** input chain + modes + chord trie + bundled
+  hotkey plugin reading a pure-data config; action-name dispatch
+  only. ~1500 lines (substantially over the original ~300 estimate
+  because chords + modes + the chain trie + the xkbcommon keysym
+  plumbing all live here).
+- **7b (next):** deferred refs (`ref.surfaceUnderPointer` etc.) so
+  action params resolve at chord-match time; user-config actions
+  (`config.actions: { [name]: (sdk, params) => ... }`) so a user can
+  bind a chord to inline JS without writing a full plugin;
+  workspace action revisions (focused-window default; name lookup).
 
-- Add key-binding chain: priority-ordered plugin handlers before client
-  delivery.
-- Consume vs. forward semantics per `core-plugin-api.md` §4.
-- ~150 lines.
+### 7a. `sdk.input.bind` in core + bundled hotkey plugin ✅
 
-### 7b. Bundled hotkey plugin
+- Key-binding chain in `wl_seat.handleInput`, consulted on key-down
+  before per-client forward. Consume vs. forward semantics per
+  `core-plugin-api.md` §4.
+- Chord (multi-step binding) support; bindings live in a trie per
+  mode. Conflict (duplicate / prefix-mask) rejected at bind time.
+- Mode stack: named binding sets pushed/popped on the seat;
+  isolated (no fall-through); default Escape pops sub-modes.
+- Native: `xkbcommon` keysym lookup wired through
+  `addon.keyUpdate`.
+- Bundled plugins: `@overdraw/plugin-core-actions` (registers
+  `compositor.quit`) and `@overdraw/plugin-hotkey-default` (parses
+  the user's `OverdrawConfig.hotkeys`).
 
-- Parses user config's hotkey table.
-- Registers `sdk.input.bind` per binding.
-- Handler invokes `sdk.actions.invoke(actionName, params)`.
-- ~150 lines.
+### 7b. Deferred refs + user-config actions (next)
 
-**Total estimate**: ~300 lines.
+- Typed `ref` exports from `overdraw/config`:
+  `ref.surfaceUnderPointer`, `ref.focusedWindow`, `ref.pointerX/Y`,
+  `ref.activeOutput`, `ref.currentWorkspace`. Resolved recursively
+  in `sdk.actions.invoke()`'s params at invoke time.
+- `OverdrawConfig.actions: { [name]: (sdk, params) => ... }` so a
+  user can declare actions inline; registered into the action
+  registry by a tiny bundled `@overdraw/plugin-config-actions`.
+- Workspace action revisions: `workspace.move-window`
+  `surfaceId?` defaults to focused window; `workspace.show` and
+  `workspace.move-window` accept `{ name }` as an alternative to
+  `{ index }`.
 
-**What this validates**: input chain + action invocation. GPU integration
-test: launch with config hotkey for `workspace.show`, send key, verify
-workspace switch occurs via state query.
+**Total estimate**: ~1500 lines for 7a (landed); ~500 lines for 7b.
 
 ## Phase 8 — Transitions primitive
 

@@ -4,7 +4,7 @@ Ground truth for what exists right now: current capabilities, known gaps, and
 what remains. The design lives in `architecture.md`; this file does not restate
 it. Present-tense only — no change history.
 
-Last updated: 2026-06-09 (post-Phase 6 — workspaces).
+Last updated: 2026-06-09 (post-Phase 7a — input chain + bundled hotkey plugin).
 
 ## Read first: gaps in advertised protocols (silent-gap risks)
 
@@ -1241,6 +1241,210 @@ window is on.
 above). 77/77 GPU tests pass (was 75 pre-6; +2 from
 workspaces.gpu.mjs).
 
+### Keyboard binding chain + bundled hotkey plugin (Phase 7a)
+
+Keyboard hotkeys driven by user config, with chord (multi-step
+binding) and mode (named binding set) support. Modes form a stack;
+the top mode's binding trie is consulted on each key-down, before the
+seat forwards to the focused client. Modes are isolated: a key not
+bound in the top mode does NOT fall through to a lower mode -- it
+forwards to the client (the user's typing reaches their app).
+
+**Binding chain** (`packages/core/src/input/binding-chain.ts`): a per-
+mode trie of registered chord bindings + a stack of active modes.
+Owned by the seat (constructed in `installProtocols`). Each key-down,
+the seat builds a `KeyStep = {mods, keysym}` from the xkb-resolved
+state, then dispatches against the top mode's trie:
+- **Match** (leaf): fire handler async, reset path, consume.
+- **Prefix** (intermediate node): advance path, consume.
+- **Miss**: if the chord pointer is at root AND `exitOnEscape` is true
+  AND the key is plain Escape on a non-default mode, pop the mode;
+  otherwise reset path and forward to the client.
+
+Mods are compared after stripping `Lock` (CapsLock) and `Mod2`
+(NumLock) -- otherwise a NumLock-on user would see no bindings ever
+match.
+
+**Key-spec parser** (`packages/core/src/input/keyspec.ts`): turns
+human strings into KeySteps. Supports `Mod`/`Super`/`Logo` (all
+Mod4), `Alt` (Mod1), `Ctrl`, `Shift`, plus the explicit `Mod2..Mod5`
+aliases. Chord syntax accepts a single string (`"Mod+a, Mod+b"` or
+`"Mod+a Mod+b"`), a string array (`["Mod+a", "Mod+b"]`), or pre-
+parsed `KeyStep[]`. Keysym lookup goes through a curated table of
+~100 common keys (letters, digits, Function keys, navigation,
+common punctuation) at `keysyms.ts`; the table values mirror
+`<xkbcommon/xkbcommon-keysyms.h>`.
+
+**Native plumbing**: `xkbcommon` resolves keycode -> keysym in the
+seat's `Keymap::keysym()` method (new in Phase 7a). The native
+`keyUpdate(evdevKey, pressed)` returns the post-update modifier
+masks AND the resolved keysym in one round-trip. The seat passes
+that pair into the chain.
+
+**SDK** (`packages/core/src/plugins/input-sdk.ts`):
+- `sdk.input.bind({ keys, mode?, handler, priority? })`: returns a
+  Promise of an unregister handle. Resolves after the chain has the
+  binding (request/reply round-trip, not fire-and-forget, so the
+  plugin's init awaits before subsequent key events can race).
+  Rejects on conflict (duplicate, prefix-mask) or unknown mode.
+- `sdk.input.defineMode(name, { exitOnEscape? })`: Promise of an
+  undefine handle. Default `exitOnEscape: true` for sub-modes; the
+  `'default'` mode is built-in (cannot be defined or undefined) and
+  has `exitOnEscape: false`.
+- `sdk.input.pushMode(name)`: idempotent if name is already on top.
+- `sdk.input.popMode()`: no-op at root.
+
+**Bus events** (`input.*`, emitted to the plugin bus when
+installProtocols is given one): `input.mode-pushed`, `input.mode-
+popped`, `input.chord-entered`, `input.chord-cancelled`, `input.
+chord-matched`. Future status bars (Phase 11) consume these to show
+"Mode: resize" or "Prefix: Mod+a, waiting…" UI.
+
+**Bundled core-actions plugin** (`@overdraw/plugin-core-actions`):
+loads first (before any plugin that might bind one of its actions).
+Today registers a single action:
+- `compositor.quit`: emits `compositor.shutdown` on the plugin bus.
+  `main.ts` subscribes and runs its existing `shutdown(signal)`
+  path (graceful: IPC server stop, plugin runtime stop, Wayland
+  server stop, GPU process stop, then `process.exit(0)`).
+
+**Bundled hotkey plugin** (`@overdraw/plugin-hotkey-default`): in-
+thread, namespace `'hotkey'`, priority 0. Loads last (after every
+plugin that might register actions it binds). Reads `config.hotkeys`
+(verbatim from the user's `OverdrawConfig.hotkeys`); validates the
+schema; defines each non-default mode; binds each entry via
+`sdk.input.bind`. Each binding's handler dispatches per the spec:
+- `{ action: "name", params?: <unknown> }` -> `sdk.actions.invoke`.
+- `{ pushMode: "name" }` -> `sdk.input.pushMode`.
+- `{ popMode: true }` -> `sdk.input.popMode`.
+
+Validation: exactly one outcome per binding; `keys` is a string or
+array; `modes.default` is required; unknown key spec rejects at
+init (fatal startup error per the in-thread bundled-plugin
+transport).
+
+**Config schema** (`@overdraw/hotkey-types`):
+```ts
+interface KeyboardConfig {
+  modes: {
+    default: BindingSpec[] | ModeSpec;
+    [name: string]: BindingSpec[] | ModeSpec;
+  };
+}
+interface BindingSpec {
+  keys: string | string[];           // single step or chord
+  action?: string;
+  params?: unknown;
+  pushMode?: string;
+  popMode?: true;                    // literal true
+}
+interface ModeSpec {
+  bindings: BindingSpec[];
+  exitOnEscape?: boolean;            // default: true (false for "default")
+}
+```
+
+User config example (`@overdraw/hotkey-types` is a type-only
+package; the data structure flows verbatim to the plugin's init):
+```ts
+import type { OverdrawConfig } from "overdraw/config";
+import type { KeyboardConfig } from "@overdraw/hotkey-types";
+
+export default {
+  hotkeys: {
+    modes: {
+      default: [
+        { keys: "Mod+q", action: "compositor.quit" },
+        { keys: "Mod+1", action: "workspace.show", params: { index: 1 } },
+        { keys: "Mod+r", pushMode: "resize" },
+        { keys: ["Mod+a", "Mod+b"], action: "user.demo" },
+      ],
+      resize: [
+        { keys: "Return", popMode: true },
+      ],
+    } satisfies KeyboardConfig["modes"],
+  },
+} satisfies OverdrawConfig;
+```
+
+**Package surface**: the `overdraw` package now publishes an
+`exports` map with a `./config` subpath (`overdraw/config`). The
+subpath re-exports the config types (`OverdrawConfig`,
+`OutputConfig`, `PluginConfig`, `RestartPolicy`, `ConfigExport`).
+Type-only today; Phase 7b adds runtime exports (deferred-ref
+helpers).
+
+**Files:**
+- `packages/core/src/input/{keysyms.ts, keyspec.ts, binding-chain.ts}`.
+- `packages/core/src/plugins/{input-sdk.ts, input-broker.ts}`.
+- `packages/core/src/protocols/wl_seat.ts` (key-down consults the
+  chain before forwarding).
+- `packages/core/src/protocols/ctx.ts` (CompositorState.bindingChain).
+- `packages/core/src/protocols/index.ts` (constructs chain +
+  subscribes its events to the plugin bus).
+- `packages/core/native/wayland/keymap.{h,cpp}` (keysym lookup).
+- `packages/core/native/napi/addon.cpp` (keyUpdate returns keysym).
+- `packages/core/src/types.ts` (keyUpdate type signature).
+- `packages/core/src/main.ts` (compositor.shutdown subscriber +
+  input broker wiring).
+- `packages/hotkey-types/` (new).
+- `packages/plugin-core-actions/` (new).
+- `packages/plugin-hotkey-default/` (new).
+- `packages/core/package.json` (exports map: `.` + `./config`).
+- `packages/core/src/config/{types.ts, index.ts, load.ts}`
+  (`hotkeys` field; `overdraw/config` subpath).
+
+**Tests:**
+- Pure-unit: `test/input-keyspec.test.js` (30 tests: mod aliases,
+  case-insensitivity, chord parsing, malformed spec rejection,
+  keysym table coverage).
+- Pure-unit: `test/binding-chain.test.js` (27 tests: single-step +
+  chord match, NumLock-mod-stripping, conflict rejection (duplicate
+  / prefix-mask), unbind + trie pruning, mode push/pop + isolation,
+  Escape exit, listener invocation, handler error containment).
+- Pure-unit: `test/plugin-hotkey-default/integration.test.js` (12
+  tests through a real PluginRuntime + BindingChain + brokers:
+  empty config, single-step fires, chord enter+match, mode push/
+  pop, Escape default behavior, exitOnEscape: false, schema
+  validation (missing default / multiple outcomes / no outcome /
+  unknown key spec), NumLock tolerance).
+- Pure-unit: `test/input-worker.test.js` (1 test: a Worker plugin
+  uses `sdk.input.bind` + `defineMode` + `pushMode/popMode` end-
+  to-end. The input SDK is transport-agnostic -- both in-thread
+  bundled plugins and Worker plugins drive the same chain through
+  the same broker route).
+- GPU: `test/plugin-hotkey-default/hotkey.gpu.mjs` (1 test: real
+  wayland client + injected Mod+q -> compositor.shutdown observed
+  on the bus).
+
+610/610 unit tests pass (was 540 pre-7a; +70 from the additions
+above: +30 keyspec, +27 binding-chain, +12 hotkey integration, +1
+Worker-input). 78/78 GPU tests pass (was 77 pre-7a; +1
+hotkey.gpu.mjs).
+
+**Deferred to Phase 7b:**
+- Deferred-ref helpers (`ref.surfaceUnderPointer`, etc.) so action
+  params can resolve runtime state at chord-match time.
+- `OverdrawConfig.actions` (user-defined JS handlers registered as
+  actions, so a hotkey can bind to arbitrary user code without
+  writing a full plugin).
+- Workspace action revisions: `workspace.move-window` defaulting
+  `surfaceId` to focused window; `workspace.show` + `move-window`
+  accepting `{ name }` as an alternative to `{ index }`.
+
+**Caveats:**
+- Bindings fire on key-DOWN only. No release-event bindings, no
+  mouse-button bindings (keyboard-only in 7a).
+- Modifier-only chord steps (e.g. "tap Super" as a binding) are
+  not supported; the parser requires a non-modifier keysym.
+- Chord cancellation forwards the non-matching key to the client
+  but does NOT replay the consumed prefix (a prefix-then-cancel is
+  user error and the prefix keys are gone).
+- The hotkey plugin loads LAST among bundled plugins, so any
+  action it might bind is already registered. An action that
+  doesn't exist at bind time is allowed (bind succeeds; the
+  invoke at match time surfaces "no such action" via `sdk.log`).
+
 ### Decoration provider (registration + insets + drawing + atomic gating)
 
 Server-side decorations end to end: a plugin registers an app_id pattern, is told
@@ -1467,9 +1671,12 @@ capabilities exist to grant).
   primitives `setTint` / `setColorMatrix` (Phase 5.5a);
   `sdk.windows.requestFocusDecision(reason, trigger?)` policy-mediated
   focus dispatch + the bundled workspace plugin's `'workspace'`
-  namespace API (Phase 6). Not built: `sdk.transitions` (Phase 8);
-  cursor / closing / velocity (Phase 9); input chain
-  (`sdk.input.bind`, Phase 7); output observation beyond a fabricated
+  namespace API (Phase 6); `sdk.input.bind` / `defineMode` /
+  `pushMode` / `popMode` keyboard binding chain + the bundled hotkey
+  + core-actions plugins (Phase 7a). Not built: `sdk.transitions`
+  (Phase 8); cursor / closing / velocity (Phase 9); deferred-ref
+  resolution in action params + `config.actions` for user-defined JS
+  handlers (Phase 7b); output observation beyond a fabricated
   `wl_output`; protocol SDK surface; interactive-region hit-testing;
   `sdk.onFrame` (Phase 5+).
 - **Capability enforcement.** No capability gate on `sdk.gpu`/`sdk.window`/

@@ -177,6 +177,12 @@ export interface CompositorState {
                       contentRect: { x: number; y: number; width: number; height: number },
                       insets: { top: number; right: number; bottom: number; left: number }) => void;
   seat?: SeatState;
+  // The keyboard binding chain (input modes + chord trie). Constructed by
+  // installProtocols when keyboard input is wired; the seat consults it on
+  // each key-down to decide whether the event is consumed (no forward to
+  // the focused client) or forwarded as usual. Plugins register bindings
+  // via the windows broker (windows.input.* methods).
+  bindingChain?: import("../input/binding-chain.js").BindingChain;
   lastCommittedSurfaceId?: number;
   // Fire all surfaces' pending wl_surface.frame callbacks (set by installProtocols;
   // called once per compositor frame). timeMs is a millisecond timestamp.

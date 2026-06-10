@@ -82,7 +82,7 @@ async function withWorkspacePlugin(fn) {
     },
   }, async (rt) => {
     await rt.load([bundledToResolved(wsSpec, wsSpec.module,
-      { output: null, focus: null, plugins: [], sourcePath: null })]);
+      { output: null, focus: null, hotkeys: undefined, plugins: [], sourcePath: null })]);
     await rt.waitForNamespace('workspace');
     await fn({
       rt, events, sink, wm, pluginBus, bus, wsEvents, seatCalls,

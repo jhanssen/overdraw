@@ -1,0 +1,16 @@
+{
+  "name": "@overdraw/plugin-hotkey-default",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Bundled hotkey plugin: parses the user's hotkey config (KeyboardConfig), defines sub-modes on the seat's binding chain, and registers each binding via sdk.input.bind. Handlers dispatch to actions, push/pop modes, or no-op per the binding spec. Ships with overdraw and registers in the 'hotkey' namespace at priority 0 (the floor of the priority chain).",
+  "type": "module",
+  "main": "./dist/index.js",
+  "exports": {
+    ".": {
+      "default": "./dist/index.js"
+    }
+  },
+  "dependencies": {
+    "@overdraw/hotkey-types": "*"
+  }
+}

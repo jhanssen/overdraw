@@ -51,6 +51,10 @@ export interface Addon {
   } | null;
   keyUpdate(evdevKey: number, pressed: boolean): {
     modsDepressed: number; modsLatched: number; modsLocked: number; group: number;
+    // The keysym resolved against the post-update xkb state. 0 = no symbol
+    // (XKB_KEY_NoSymbol). Used by the binding-chain match path; not sent on
+    // the wire (wl_keyboard.key carries the raw evdev keycode).
+    keysym: number;
   };
 
   // JS-compositor bridge (wire WebGPU via dawn.node). The compositing pass lives
