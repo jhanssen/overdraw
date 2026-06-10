@@ -212,7 +212,6 @@ export class SurfaceProducer {
     // that need to observe failures should use present().
     if (r && typeof (r as Promise<void>).then === "function") {
       (r as Promise<void>).catch((e) => {
-        // eslint-disable-next-line no-console
         console.error("[SurfaceProducer.presentSync] onPresented rejected:", e);
       });
     }

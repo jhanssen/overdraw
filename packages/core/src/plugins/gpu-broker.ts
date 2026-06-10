@@ -246,6 +246,8 @@ export function createGpuBroker(deps: GpuBrokerDeps) {
         const cdId = p.consumerDevId as number;
         const cdGen = p.consumerDevGen as number;
         const pluginSerial = (p.pluginReservePointSerial as bigint) ?? 0n;
+        // p is the worker-side request bag; SDK has already validated shape.
+        // eslint-disable-next-line no-restricted-syntax
         const windows = (p.windows as unknown as number[]) ?? [];
 
         const alloc = await pAllocCompose(addon, connId, w, h,
@@ -291,6 +293,8 @@ export function createGpuBroker(deps: GpuBrokerDeps) {
         const w = p.width as number, h = p.height as number;
         if (!w || !h) throw new Error("compose.live: bad dims");
         const slotsN = (p.slots as number) ?? 3;
+        // SDK pre-validates the consumers / windows shape; cast at the boundary.
+        // eslint-disable-next-line no-restricted-syntax
         const consumers = p.consumers as unknown as Array<{
           texId: number; texGen: number; devId: number; devGen: number;
           wireSerial: bigint;
@@ -298,6 +302,7 @@ export function createGpuBroker(deps: GpuBrokerDeps) {
         if (!consumers || consumers.length !== slotsN) {
           throw new Error(`compose.live: expected ${slotsN} consumer handles, got ${consumers?.length}`);
         }
+        // eslint-disable-next-line no-restricted-syntax
         const windows = (p.windows as unknown as number[]) ?? [];
 
         if (!compositor.composeIntoView || !compositor.registerLiveProducer) {
@@ -401,6 +406,7 @@ export function createGpuBroker(deps: GpuBrokerDeps) {
       case "compose.release": {
         // Plugin is done with a compose snapshot or live ring. Snapshot:
         // single surfaceBufId; live: array of slot surfaceBufIds.
+        // eslint-disable-next-line no-restricted-syntax
         const arr = p.surfaceBufIds as unknown as number[] | undefined;
         if (arr && Array.isArray(arr)) {
           // Live ring release.

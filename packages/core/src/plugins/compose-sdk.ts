@@ -320,7 +320,8 @@ async function makeWorkerLive(
   // shared SlotStates SAB, and replies with {slotsSab, slots:[{surfaceBufId}]}.
   // Each per-slot consumer handle is on the worker; the broker sees the
   // wire reserved {texId, texGen, devId, devGen, wireSerial} per slot.
-  const r = (await endpoint.request("compose.live", {
+  // The broker's reply shape is known by contract (gpu-broker.ts compose.live).
+  const reply = await endpoint.request("compose.live", {
     width: outW, height: outH, slots: SLOTS,
     consumers: cons.map((c) => ({
       texId: c.texture.id, texGen: c.texture.generation,
@@ -328,7 +329,9 @@ async function makeWorkerLive(
       wireSerial: c.wireSerial,
     })),
     windows: [...windows],
-  })) as unknown as { slotsSab: SharedArrayBuffer; slots: Array<{ surfaceBufId: number }> };
+  });
+  // eslint-disable-next-line no-restricted-syntax
+  const r = reply as unknown as { slotsSab: SharedArrayBuffer; slots: Array<{ surfaceBufId: number }> };
 
   const slotBufIds: number[] = r.slots.map((s) => s.surfaceBufId);
   const slotTextures: (GPUTexture | null)[] = new Array(SLOTS).fill(null);

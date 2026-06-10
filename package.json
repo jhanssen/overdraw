@@ -11,9 +11,9 @@
     "start": "npm run build:js && node packages/core/dist/index.js",
     "compositor": "npm run build:js && node packages/core/dist/main.js",
     "gen-protocols": "npm run gen-protocols -w overdraw",
-    "build:js": "npm run gen-protocols && tsc -b",
     "lint": "eslint 'packages/*/src/**/*.ts'",
-    "test": "npm run lint && npm run build:js && node --test 'test/**/*.test.js'",
+    "build:js": "npm run gen-protocols && tsc -b && npm run lint",
+    "test": "npm run build:js && node --test 'test/**/*.test.js'",
     "test:gpu": "npm run build:js && node --test --test-concurrency=1 'test/*.gpu.mjs'"
   },
   "devDependencies": {
