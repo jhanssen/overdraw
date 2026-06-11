@@ -23,6 +23,13 @@ export const BUNDLED_PLUGINS: ReadonlyArray<BundledPluginSpec> = [
     module: "@overdraw/plugin-core-actions",
   },
   {
+    // Loads alongside core-actions for the same reason: cursor.* actions
+    // should be available to hotkey bindings (registered later). Has no
+    // namespace registration, just action registrations.
+    name: "cursor-actions",
+    module: "@overdraw/plugin-cursor-actions",
+  },
+  {
     name: "layout-default",
     module: "@overdraw/plugin-layout-default",
   },

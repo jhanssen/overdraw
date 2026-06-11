@@ -20,6 +20,7 @@ import type { PluginAnimations } from "./animations-sdk.js";
 import type { PluginCompose } from "./compose-sdk.js";
 import type { PluginInput } from "./input-sdk.js";
 import type { PluginTransitions } from "./transitions-sdk.js";
+import type { CursorAPI } from "@overdraw/cursor-types";
 
 export interface PluginSdk {
   // The plugin's stable name (config `name`, defaulting to its module).
@@ -77,6 +78,12 @@ export interface PluginSdk {
   // not Worker, so the SDK shape is the same for both transports; the
   // implementation differs in how the commit callback is delivered).
   transitions?: PluginTransitions;
+  // Cursor control (cursor-design.md): named shape installs, custom
+  // textures (in-thread only), declarative shape-by-kinematic-state
+  // rules, compositor default. Present iff the runtime brought up the
+  // cursor broker + rule engine (always, when the JS compositor's
+  // cursor slot is wired).
+  cursor?: CursorAPI;
 }
 
 // Internal handle the bootstrap uses to drive the SDK (run the shutdown cb, etc.)
@@ -94,7 +101,8 @@ export function createSdk(name: string, emitLog: (line: string) => void,
                           gpu?: PluginGpu,
                           decorations?: PluginDecorations,
                           compose?: PluginCompose,
-                          transitions?: PluginTransitions): SdkControl {
+                          transitions?: PluginTransitions,
+                          cursor?: CursorAPI): SdkControl {
   let shutdownCb: ShutdownCallback | null = null;
 
   const sdk: PluginSdk = {
@@ -118,6 +126,7 @@ export function createSdk(name: string, emitLog: (line: string) => void,
     ...(decorations ? { decorations } : {}),
     ...(compose ? { compose } : {}),
     ...(transitions ? { transitions } : {}),
+    ...(cursor ? { cursor } : {}),
   };
 
   return {

@@ -28,6 +28,12 @@ import { createInputBroker, NOT_HANDLED as INPUT_NOT_HANDLED } from "./plugins/i
 import { createEvaluator } from "./animations/evaluator.js";
 import { createTransitionEvaluator } from "./transitions/evaluator.js";
 import {
+  createCursorBroker, CURSOR_NOT_HANDLED,
+} from "./plugins/cursor-broker.js";
+import { createCursorThemeResolver } from "./cursor/theme-resolver.js";
+import { Kinematics } from "./cursor/kinematics.js";
+import { CursorRuleEngine } from "./cursor/rule-engine.js";
+import {
   createTransitionsBroker, NOT_HANDLED as TRANSITIONS_NOT_HANDLED,
 } from "./plugins/transitions-broker.js";
 import { createSceneRegistry } from "./plugins/scene-registry.js";
@@ -288,9 +294,29 @@ const transitionsBroker = createTransitionsBroker({
   compositor, evaluator: transitionEvaluator, sceneRegistry,
 });
 
+// Cursor (Phase 9c). Theme resolver + kinematic state + rule engine
+// + broker. The resolver caches XCursor file parses; the kinematic
+// state machine is lazily enabled by rule registration; the broker
+// is the plugin-facing route for cursor.* requests.
+const cursorResolver = createCursorThemeResolver(addon);
+const cursorKinematics = new Kinematics();
+const cursorRuleEngine = new CursorRuleEngine();
+const cursorBroker = createCursorBroker({
+  addon, compositor, resolver: cursorResolver,
+  kinematics: cursorKinematics, ruleEngine: cursorRuleEngine,
+  cursorSizePx: Number(process.env.XCURSOR_SIZE) || 24,
+});
+// Publish the kinematic state so wl_seat can feed it on pointer motion.
+state.cursorKinematics = cursorKinematics;
+
 state.beforeRender = (timeMs: number): void => {
   evaluator.tick(timeMs);
   transitionEvaluator.tick(timeMs);
+  // Cursor: tick the kinematic state (idle accumulator) and re-evaluate
+  // rules. Lazy: kinematics.tick is a no-op while no rule is registered;
+  // rule engine evaluate is cheap when no rule is active.
+  cursorKinematics.tick(timeMs);
+  cursorRuleEngine.evaluate();
 };
 
 // Input broker: services plugin sdk.input.* calls by routing into the
@@ -392,6 +418,13 @@ runtime = new PluginRuntime({
       const r = transitionsBroker(plugin, method, params);
       if (r === TRANSITIONS_NOT_HANDLED) {
         throw new Error(`no handler for transitions method '${method}'`);
+      }
+      return r;
+    }
+    if (method.startsWith("cursor.")) {
+      const r = cursorBroker(plugin, method, params);
+      if (r === CURSOR_NOT_HANDLED) {
+        throw new Error(`no handler for cursor method '${method}'`);
       }
       return r;
     }

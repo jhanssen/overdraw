@@ -317,6 +317,46 @@ export async function setupCompositor(opts = {}) {
     };
   }
 
+  // Optional cursor broker (sdk.cursor + the rule engine). opts.cursor =
+  // true brings it up. Mirrors main.ts: kinematic state machine + rule
+  // engine + broker; the kinematic state is published on state so the
+  // seat feeds it on pointer motion.
+  let cursorBroker = null;
+  let CURSOR_NOT_HANDLED = null;
+  if (opts.cursor && jsCompositor) {
+    const { createCursorThemeResolver } = await import(
+      "../packages/core/dist/cursor/theme-resolver.js");
+    const { Kinematics } = await import(
+      "../packages/core/dist/cursor/kinematics.js");
+    const { CursorRuleEngine } = await import(
+      "../packages/core/dist/cursor/rule-engine.js");
+    const cb = await import("../packages/core/dist/plugins/cursor-broker.js");
+    const resolver = createCursorThemeResolver(addon);
+    const kine = new Kinematics();
+    const eng = new CursorRuleEngine();
+    cursorBroker = cb.createCursorBroker({
+      addon, compositor: jsCompositor, resolver,
+      kinematics: kine, ruleEngine: eng,
+      cursorSizePx: Number(process.env.XCURSOR_SIZE) || 24,
+    });
+    CURSOR_NOT_HANDLED = cb.CURSOR_NOT_HANDLED;
+    state.cursorKinematics = kine;
+    const priorBefore = state.beforeRender;
+    state.beforeRender = (timeMs) => {
+      priorBefore?.(timeMs);
+      kine.tick(timeMs);
+      eng.evaluate();
+    };
+    // Install the boot default so the cursor slot is non-empty when
+    // tests don't explicitly setShape. Tests that want NO default cursor
+    // should opt out before any motion is injected.
+    const r = resolver.resolveShape("default", Number(process.env.XCURSOR_SIZE) || 24, 1);
+    if (r) {
+      jsCompositor.setCursorPixels(r.rgba, r.width, r.height, r.hotspotX, r.hotspotY);
+      jsCompositor.setCursorVisible(true);
+    }
+  }
+
   const onRequest = (plugin, method, params) => {
     if (windowsBroker && method.startsWith("windows.")) {
       const r = windowsBroker(plugin, method, params);
@@ -333,6 +373,10 @@ export async function setupCompositor(opts = {}) {
     if (animationsBroker && method.startsWith("animations.")) {
       const r = animationsBroker(plugin, method, params);
       if (r !== ANIM_NOT_HANDLED) return r;
+    }
+    if (cursorBroker && method.startsWith("cursor.")) {
+      const r = cursorBroker(plugin, method, params);
+      if (r !== CURSOR_NOT_HANDLED) return r;
     }
     if (opts.onRequest) return opts.onRequest(plugin, method, params);
     throw new Error(`harness: no handler for plugin request '${method}'`);

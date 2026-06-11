@@ -1,0 +1,13 @@
+{
+  "name": "@overdraw/plugin-cursor-actions",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Bundled plugin that registers cursor-related actions: cursor.set-shape, cursor.hide, cursor.show, cursor.clear-override. Used by hotkey configs and overdrawctl to drive the cursor without a full plugin. The actions wrap sdk.cursor.* (cursor-design.md).",
+  "type": "module",
+  "main": "./dist/index.js",
+  "exports": {
+    ".": {
+      "default": "./dist/index.js"
+    }
+  }
+}

@@ -8,11 +8,13 @@
     { "path": "./packages/animation-types" },
     { "path": "./packages/sdk-anim" },
     { "path": "./packages/transition-types" },
+    { "path": "./packages/cursor-types" },
     { "path": "./packages/workspace-types" },
     { "path": "./packages/plugin-workspace-default" },
     { "path": "./packages/hotkey-types" },
     { "path": "./packages/plugin-hotkey-default" },
     { "path": "./packages/plugin-core-actions" },
+    { "path": "./packages/plugin-cursor-actions" },
     { "path": "./packages/plugin-config-actions" },
     { "path": "./packages/core" }
   ]

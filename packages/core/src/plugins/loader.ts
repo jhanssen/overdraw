@@ -34,6 +34,7 @@ import type { PluginCompose } from "./compose-sdk.js";
 import { createPluginInput } from "./input-sdk.js";
 import { createTransitions } from "./transitions-sdk.js";
 import type { PluginTransitions } from "./transitions-sdk.js";
+import { createPluginCursor } from "./cursor-sdk.js";
 
 export interface LoaderInput {
   module: string;
@@ -99,11 +100,12 @@ export async function runLoader(channel: Channel, input: LoaderInput): Promise<v
   const animations = createPluginAnimations(endpoint);
   const decorations = makeRingSurface ? createDecorations(endpoint, makeRingSurface) : undefined;
   const inputHandle = createPluginInput(endpoint);
+  const cursorCtl = createPluginCursor(endpoint);
 
   const control = createSdk(input.name, (line) => { endpoint.emit("log", line); },
     eventsHandle.events, nsHandle.ns, actionsHandle.actions, windowsCtl.windows,
     animations, inputHandle.input, gpu, decorations?.decorations, compose,
-    transitions);
+    transitions, cursorCtl.cursor);
 
   endpoint.handleRequests(async (method, params): Promise<Json> => {
     const ns = nsHandle.dispatcher.tryHandle(method, params);
@@ -117,6 +119,7 @@ export async function runLoader(channel: Channel, input: LoaderInput): Promise<v
 
     if (method === "shutdown") {
       stopGpu();
+      cursorCtl.release();
       await control.runShutdown();
       return null;
     }
