@@ -155,6 +155,19 @@ export interface CompositorSink {
   // slot (skipping if all slots are busy). Returns a token used to
   // unregister.
   registerLiveProducer?(onFrame: () => void): { unregister: () => void };
+  // Phase 8: install a transition that replaces the on-screen pass for
+  // the duration of the transition. Pulled here so the transitions
+  // broker can drive the compositor through the sink interface (rather
+  // than coupling to the JsCompositor class). Optional because the
+  // native compositor path doesn't implement transitions today.
+  setActiveTransition?(opts: {
+    fromTex: GPUTexture;
+    toTex: GPUTexture;
+    kind: import("@overdraw/transition-types").TransitionKind;
+    getProgress: () => number;
+    resolveTextures?: () => { fromTex: GPUTexture; toTex: GPUTexture } | null;
+  }): void;
+  clearActiveTransition?(): void;
 }
 
 export interface CompositorState {

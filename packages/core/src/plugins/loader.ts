@@ -32,6 +32,10 @@ import { createPluginAnimations } from "./animations-sdk.js";
 import { createInThreadCompose, createWorkerCompose } from "./compose-sdk.js";
 import type { PluginCompose } from "./compose-sdk.js";
 import { createPluginInput } from "./input-sdk.js";
+import {
+  createInThreadTransitions, createWorkerTransitions,
+} from "./transitions-sdk.js";
+import type { PluginTransitions } from "./transitions-sdk.js";
 
 export interface LoaderInput {
   module: string;
@@ -60,12 +64,20 @@ export async function runLoader(channel: Channel, input: LoaderInput): Promise<v
   // get cross-device dmabuf compose via createWorkerCompose (phase 5b
   // snapshot today; live mode lands in phase 5b-live).
   let compose: PluginCompose | undefined;
+  let transitions: PluginTransitions | undefined;
   if (input.inThreadGpu) {
     const g = createInThreadGpu(input.name, input.inThreadGpu);
     gpu = g.gpu;
     makeRingSurface = g.makeRingSurface;
     stopGpu = g.stop;
-    compose = createInThreadCompose(input.inThreadGpu.compositor) ?? undefined;
+    compose = createInThreadCompose(
+      input.inThreadGpu.compositor,
+      input.inThreadGpu.sceneRegistry,
+    ) ?? undefined;
+    // Transitions SDK is the in-thread variant: commit functions live
+    // in this same JS process, so the SDK stashes them on a side-table
+    // and sends only a token to the broker.
+    transitions = createInThreadTransitions(endpoint);
   } else if (input.pluginAddonPath && input.dawnPath) {
     const g = await createPluginGpu(endpoint, input.pluginAddonPath, input.dawnPath);
     gpu = g.gpu;
@@ -82,6 +94,11 @@ export async function runLoader(channel: Channel, input: LoaderInput): Promise<v
       endpoint,
       allocSurfaceBufId: g.internals.allocSurfaceBufId,
     });
+    // Transitions SDK is the Worker variant: a commit() function can't
+    // cross postMessage, so the Worker variant rejects that field at
+    // call time. Otherwise the request shape is identical (sceneIds
+    // resolve via the broker's shared registry).
+    transitions = createWorkerTransitions(endpoint);
   }
 
   const eventsHandle = createPluginEvents(endpoint);
@@ -94,7 +111,8 @@ export async function runLoader(channel: Channel, input: LoaderInput): Promise<v
 
   const control = createSdk(input.name, (line) => { endpoint.emit("log", line); },
     eventsHandle.events, nsHandle.ns, actionsHandle.actions, windowsCtl.windows,
-    animations, inputHandle.input, gpu, decorations?.decorations, compose);
+    animations, inputHandle.input, gpu, decorations?.decorations, compose,
+    transitions);
 
   endpoint.handleRequests(async (method, params): Promise<Json> => {
     const ns = nsHandle.dispatcher.tryHandle(method, params);

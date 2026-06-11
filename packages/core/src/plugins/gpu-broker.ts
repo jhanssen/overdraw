@@ -11,6 +11,8 @@ import type { CompositorSink } from "../protocols/ctx.js";
 import type { OverlayBroker, OverlayLayer } from "../overlay.js";
 import type { OverlayAnchor } from "../overlay-position.js";
 import type { DawnWire } from "../gpu/compositor.js";
+import type { SceneRegistry } from "./scene-registry.js";
+import { createSceneRegistry } from "./scene-registry.js";
 import { SlotStates, createSlotStates } from "./surface-slots.js";
 import { SurfaceConsumer, SurfaceProducer } from "./surface-ring.js";
 
@@ -65,6 +67,13 @@ export interface GpuBrokerDeps {
   overlays: OverlayBroker;
   dawn: DawnWire;
   coreDeviceHandle: bigint;
+  // Scene registry: Worker compose handles register their core-side
+  // textures here so other SDK consumers (transitions, future intercept)
+  // can resolve a SceneHandle.id back to a sampleable GPUTexture on
+  // core's device. Optional today; when absent, compose.snapshot /
+  // compose.live still work but the SceneHandles they hand back lack a
+  // valid .id (transitions.run will reject them with a clear error).
+  sceneRegistry?: SceneRegistry;
   // Generic hooks the broker fires WITHOUT understanding what they mean (it stays
   // surface-agnostic). The decoration layer uses these to learn its surface ids
   // and first-present timing; default no-ops.
@@ -77,6 +86,12 @@ export interface GpuBrokerDeps {
 
 export function createGpuBroker(deps: GpuBrokerDeps) {
   const { addon, compositor, overlays, dawn, coreDeviceHandle } = deps;
+  // Fall back to a broker-private registry when none is supplied.
+  // Callers that want to expose Worker SceneHandles to transitions (or
+  // any other cross-SDK consumer) pass the shared registry main.ts /
+  // the harness construct; tests that only exercise overlays leave it
+  // unset and never look at the returned sceneIds.
+  const sceneRegistry = deps.sceneRegistry ?? createSceneRegistry();
   const onSurfaceAllocated = deps.onSurfaceAllocated ?? (() => {});
   const onSurfacePresented = deps.onSurfacePresented ?? (() => {});
   const connByPlugin = new Map<string, number>();
@@ -98,6 +113,12 @@ export function createGpuBroker(deps: GpuBrokerDeps) {
     teardown: () => void;
   }
   const liveComposeRings = new Map<number, LiveComposeRing>();
+  // Phase 8: surfaceBufId -> sceneId minted by the scene registry on
+  // compose.snapshot / compose.live. Lets compose.release route through
+  // the registry (so a transition pinning the scene defers teardown).
+  // For live, only the FIRST slot's surfaceBufId maps to the sceneId
+  // (the ring shares one logical scene).
+  const sceneIdByBuf = new Map<number, number>();
 
   return async function onRequest(pluginName: string, method: string, params: unknown): Promise<unknown> {
     const p = (params ?? {}) as Record<string, number | string | bigint | { x: number; y: number; width: number; height: number } | undefined>;
@@ -272,7 +293,22 @@ export function createGpuBroker(deps: GpuBrokerDeps) {
         } else {
           throw new Error("compose.snapshot: compositor lacks composeIntoView");
         }
-        return { surfaceBufId: alloc.surfaceBufId, width: w, height: h };
+        // Register with the scene registry so transitions (or any
+        // future consumer) can resolve sceneId -> core-side texture.
+        // The teardown closure runs only after BOTH the Worker's
+        // compose.release and any holding pins have settled.
+        const bufId = alloc.surfaceBufId;
+        const sceneId = sceneRegistry.register(
+          { texture: tex, outW: w, outH: h },
+          () => {
+            composeBufs.delete(bufId);
+            const reap = () => addon.pluginReleaseSurfaceBuffer(bufId);
+            if (compositor.afterCurrentFrame) compositor.afterCurrentFrame(reap);
+            else reap();
+          },
+        );
+        sceneIdByBuf.set(bufId, sceneId);
+        return { surfaceBufId: bufId, width: w, height: h, sceneId };
       }
       case "compose.live": {
         // Phase 5b-live: Worker plugin asked for a live compose. The plugin
@@ -398,38 +434,64 @@ export function createGpuBroker(deps: GpuBrokerDeps) {
         };
         for (const id of slotBufIds) liveComposeRings.set(id, ring);
 
+        // Register the live scene. resolveTexture returns whichever
+        // slot is currently PRESENTED (the producer's
+        // demoteStaleOnPresent guarantees at most one). The
+        // representative .texture is slot 0's wrap; per-frame
+        // consumers (transitions) use resolveTexture instead.
+        const repTex = textureFor(0);
+        if (!repTex) throw new Error("compose.live: slot 0 texture not wrappable");
+        const sceneId = sceneRegistry.register(
+          {
+            texture: repTex, outW: w, outH: h,
+            resolveTexture: (): GPUTexture | null => {
+              const slot = slotStates.presentedSlot();
+              if (slot < 0) return null;
+              return textureFor(slot);
+            },
+          },
+          () => { ring.teardown(); },
+        );
+        // Map the first slot's surfaceBufId to the sceneId so
+        // compose.release can find it (Worker SDK sends the slot list;
+        // we look up by slot 0 like the legacy LiveComposeRing map).
+        sceneIdByBuf.set(slotBufIds[0], sceneId);
+
         return {
           slotsSab: sab,
           slots: slotBufIds.map((id) => ({ surfaceBufId: id })),
+          sceneId,
         };
       }
       case "compose.release": {
-        // Plugin is done with a compose snapshot or live ring. Snapshot:
-        // single surfaceBufId; live: array of slot surfaceBufIds.
+        // Plugin is done with a compose snapshot or live ring. Both
+        // route through the scene registry: a transition currently
+        // pinning the scene defers the underlying surfaceBuf release
+        // until the transition completes (unpin).
         // eslint-disable-next-line no-restricted-syntax
         const arr = p.surfaceBufIds as unknown as number[] | undefined;
         if (arr && Array.isArray(arr)) {
-          // Live ring release.
-          const ring = liveComposeRings.get(arr[0]);
-          if (ring) {
-            for (const id of ring.surfaceBufIds) liveComposeRings.delete(id);
-            ring.teardown();
+          // Live ring release. Look up the sceneId via slot 0.
+          const sceneId = sceneIdByBuf.get(arr[0]);
+          if (sceneId !== undefined) {
+            sceneIdByBuf.delete(arr[0]);
+            // Drop the ring map for every slot id so a (defensive)
+            // future lookup doesn't see a stale entry. The actual
+            // teardown still fires once the registry's pin count
+            // reaches 0.
+            const ring = liveComposeRings.get(arr[0]);
+            if (ring) for (const id of ring.surfaceBufIds) liveComposeRings.delete(id);
+            sceneRegistry.unregister(sceneId);
           }
           return null;
         }
         const bufId = p.surfaceBufId as number;
         if (bufId === undefined) throw new Error("compose.release: bad surfaceBufId(s)");
-        composeBufs.delete(bufId);
-        // Gate release on afterCurrentFrame: a previous compose pass's GPU
-        // work may still be in flight on the core's queue (the producer
-        // submit). Releasing the surfaceBuf before that completes drops
-        // the STM/texture while Dawn still has a queue submission pointing
-        // at it. The plugin has already issued its consumer End on its own
-        // wire; afterCurrentFrame on the core ensures our producer submit
-        // completed.
-        const reap = () => addon.pluginReleaseSurfaceBuffer(bufId);
-        if (compositor.afterCurrentFrame) compositor.afterCurrentFrame(reap);
-        else reap();
+        const sceneId = sceneIdByBuf.get(bufId);
+        if (sceneId !== undefined) {
+          sceneIdByBuf.delete(bufId);
+          sceneRegistry.unregister(sceneId);
+        }
         return null;
       }
       case "surface.destroy": {

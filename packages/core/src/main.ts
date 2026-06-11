@@ -26,6 +26,11 @@ import { createWindowsBroker, NOT_HANDLED as WINDOWS_NOT_HANDLED } from "./plugi
 import { createAnimationsBroker, NOT_HANDLED as ANIM_NOT_HANDLED } from "./plugins/animations-broker.js";
 import { createInputBroker, NOT_HANDLED as INPUT_NOT_HANDLED } from "./plugins/input-broker.js";
 import { createEvaluator } from "./animations/evaluator.js";
+import { createTransitionEvaluator } from "./transitions/evaluator.js";
+import {
+  createTransitionsBroker, NOT_HANDLED as TRANSITIONS_NOT_HANDLED,
+} from "./plugins/transitions-broker.js";
+import { createSceneRegistry } from "./plugins/scene-registry.js";
 import { BUNDLED_PLUGINS, bundledToResolved } from "./plugins/bundled.js";
 import { JsCompositor } from "./gpu/compositor.js";
 import type { DawnWire, DawnGlobals } from "./gpu/compositor.js";
@@ -215,9 +220,17 @@ const decorationBroker = createDecorationBroker({
 state.decorationResize = (windowId, outerRect, contentRect, insets) =>
   decorationBroker.onDecorationResized(windowId, outerRect, contentRect, insets);
 
+// Scene registry (phase 8): every SceneHandle minted by in-thread or
+// Worker compose registers here so transitions (and any future
+// cross-SDK consumer) can resolve a sceneId back to a core-side
+// GPUTexture. Shared by the gpu-broker (Worker compose paths) and
+// the in-thread compose-sdk (via inThreadGpu.sceneRegistry below).
+const sceneRegistry = createSceneRegistry();
+
 // GPU broker: services plugin Worker GPU/surface requests.
 const gpuBroker = createGpuBroker({
   addon, compositor, overlays, dawn, coreDeviceHandle: h.device,
+  sceneRegistry,
   onSurfaceAllocated: (sid, win) => decorationBroker.onSurfaceAllocated(sid, win),
   onSurfacePresented: (sid) => decorationBroker.onSurfacePresented(sid),
 });
@@ -234,7 +247,21 @@ const windowsBroker = createWindowsBroker({
 // the broker routes plugin animations.run / cancel requests to it.
 const evaluator = createEvaluator(compositor);
 const animationsBroker = createAnimationsBroker(evaluator);
-state.beforeRender = (timeMs: number): void => { evaluator.tick(timeMs); };
+
+// Transition evaluator + broker (core-plugin-api.md §8). Shares the
+// same frame clock as animations; ticks BEFORE the compositor's
+// renderFrame so the compositor's per-frame getProgress callback reads
+// a fresh value. The broker holds the registry + the compositor +
+// the evaluator together; plugin transitions.run requests route to it.
+const transitionEvaluator = createTransitionEvaluator();
+const transitionsBroker = createTransitionsBroker({
+  compositor, evaluator: transitionEvaluator, sceneRegistry,
+});
+
+state.beforeRender = (timeMs: number): void => {
+  evaluator.tick(timeMs);
+  transitionEvaluator.tick(timeMs);
+};
 
 // Input broker: services plugin sdk.input.* calls by routing into the
 // seat's binding chain. emitToPlugin uses the runtime's per-plugin event
@@ -299,6 +326,7 @@ runtime = new PluginRuntime({
     globals: dawn.globals as unknown as Record<string, unknown>,
     overlays,
     compositor,
+    sceneRegistry,
   },
   bus: pluginBus,
   resolveDeferredRefs: deferredRefResolver,
@@ -327,6 +355,13 @@ runtime = new PluginRuntime({
       const r = inputBroker(plugin, method, params);
       if (r === INPUT_NOT_HANDLED) {
         throw new Error(`no handler for input method '${method}'`);
+      }
+      return r;
+    }
+    if (method.startsWith("transitions.")) {
+      const r = transitionsBroker(plugin, method, params);
+      if (r === TRANSITIONS_NOT_HANDLED) {
+        throw new Error(`no handler for transitions method '${method}'`);
       }
       return r;
     }

@@ -32,6 +32,7 @@ import type {
 import type { OverlayBroker, OverlayLayer } from "../overlay.js";
 import type { OverlayAnchor } from "../overlay-position.js";
 import type { Json } from "./protocol.js";
+import type { SceneRegistry } from "./scene-registry.js";
 
 const SLOTS = 3;  // triple-buffered: producer, presented (consumer sampling), spare.
 
@@ -73,6 +74,12 @@ export interface InThreadGpuDeps {
   // makes this strictly safer than the cross-device path needed, but the
   // deferral keeps the SAME texture from being reused while still being read).
   compositor: CompositorSink;
+  // Scene registry: in-thread SceneHandles minted by createInThreadCompose
+  // register their textures here so transitions (and any future cross-SDK
+  // consumer) can resolve a sceneId back to a sampleable GPUTexture.
+  // Optional: when absent, in-thread SceneHandles still work for direct
+  // sampling but lack a .id, so transitions.run will reject them.
+  sceneRegistry?: SceneRegistry;
 }
 
 // Per-plugin GPU SDK construction. The plugin's name flows in so the overlay

@@ -19,6 +19,7 @@ import type { PluginActions } from "./actions.js";
 import type { PluginAnimations } from "./animations-sdk.js";
 import type { PluginCompose } from "./compose-sdk.js";
 import type { PluginInput } from "./input-sdk.js";
+import type { PluginTransitions } from "./transitions-sdk.js";
 
 export interface PluginSdk {
   // The plugin's stable name (config `name`, defaulting to its module).
@@ -70,6 +71,12 @@ export interface PluginSdk {
   // GPUTexture handles that only cross the boundary for in-thread plugins
   // sharing core's device). Phase 5b adds the Worker variant.
   compose?: PluginCompose;
+  // Built-in transitions (core-plugin-api.md §8): blend two SceneHandles
+  // on screen via a kind-specific shader. Present iff the runtime brought
+  // up the transitions broker + evaluator (transition machinery is core,
+  // not Worker, so the SDK shape is the same for both transports; the
+  // implementation differs in how the commit callback is delivered).
+  transitions?: PluginTransitions;
 }
 
 // Internal handle the bootstrap uses to drive the SDK (run the shutdown cb, etc.)
@@ -86,7 +93,8 @@ export function createSdk(name: string, emitLog: (line: string) => void,
                           input: PluginInput,
                           gpu?: PluginGpu,
                           decorations?: PluginDecorations,
-                          compose?: PluginCompose): SdkControl {
+                          compose?: PluginCompose,
+                          transitions?: PluginTransitions): SdkControl {
   let shutdownCb: ShutdownCallback | null = null;
 
   const sdk: PluginSdk = {
@@ -109,6 +117,7 @@ export function createSdk(name: string, emitLog: (line: string) => void,
     ...(gpu ? { gpu } : {}),
     ...(decorations ? { decorations } : {}),
     ...(compose ? { compose } : {}),
+    ...(transitions ? { transitions } : {}),
   };
 
   return {

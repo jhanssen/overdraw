@@ -18,6 +18,8 @@ import type {
 import type { CompositorSink } from "../protocols/ctx.js";
 import { OUTPUT_DEFAULT } from "../protocols/ctx.js";
 import type { Endpoint } from "./protocol.js";
+import type { SceneRegistry } from "./scene-registry.js";
+import { createSceneRegistry } from "./scene-registry.js";
 import { SlotStates } from "./surface-slots.js";
 import { SurfaceConsumer, awaitPresentedSlot } from "./surface-ring.js";
 
@@ -45,6 +47,12 @@ export interface SceneHandle {
   texture: GPUTexture;
   outW: number;
   outH: number;
+  // Opaque scene id, valid across the SDK boundary (Worker postMessage
+  // safe; in-thread by reference). Plugins pass this to other SDK
+  // surfaces that consume scenes -- e.g. sdk.transitions.run(outputId,
+  // {fromSceneId: from.id, toSceneId: to.id, ...}). Plugins do NOT
+  // construct ids themselves.
+  readonly id: number;
   sample<T>(cb: (texture: GPUTexture) => T | Promise<T>): Promise<T>;
   release(): Promise<void>;
 }
@@ -80,7 +88,16 @@ export interface PluginCompose {
 // cross-device import, no fence. Returns null if the sink does not
 // implement the compose methods (in which case sdk.compose is absent
 // from the SDK -- capability-by-shape).
-export function createInThreadCompose(compositor: CompositorSink): PluginCompose | null {
+//
+// sceneRegistry: every SceneHandle this builds is registered so the
+// scene's core-side texture is reachable by id from other SDK consumers
+// (transitions, future intercept). Optional today; when absent, the
+// SceneHandles still expose .texture / .sample / .release but their .id
+// is 0 and transitions.run will reject them with a clear error.
+export function createInThreadCompose(
+  compositor: CompositorSink,
+  sceneRegistry?: SceneRegistry,
+): PluginCompose | null {
   if (!compositor.composeScene || !compositor.composeWindows
       || !compositor.registerLiveScene || !compositor.registerLiveWindows) {
     return null;
@@ -91,6 +108,12 @@ export function createInThreadCompose(compositor: CompositorSink): PluginCompose
   const composeWindows = compositor.composeWindows.bind(compositor);
   const registerLiveScene = compositor.registerLiveScene.bind(compositor);
   const registerLiveWindows = compositor.registerLiveWindows.bind(compositor);
+  // When the caller hasn't passed a shared registry, fall back to a
+  // local one. SceneHandles still get a unique .id within this SDK
+  // instance, but transitions.run on the same plugin won't find them
+  // (the broker's registry is separate). For tests that don't exercise
+  // transitions this is invisible.
+  const registry = sceneRegistry ?? createSceneRegistry();
   // outputId validation: today only OUTPUT_DEFAULT exists. Reject anything
   // else explicitly rather than silently treat it as 0.
   function checkOutput(outputId: number): void {
@@ -113,15 +136,22 @@ export function createInThreadCompose(compositor: CompositorSink): PluginCompose
         });
         let released = false;
         const tex = r.texture;
+        // Register in the scene registry. onTeardown destroys the
+        // texture only after the last pin drops (a transition holding
+        // the scene defers the destroy).
+        const sceneId = registry.register(
+          { texture: tex, outW: r.outW, outH: r.outH },
+          () => { tex.destroy(); },
+        );
         return {
-          texture: tex, outW: r.outW, outH: r.outH,
+          texture: tex, outW: r.outW, outH: r.outH, id: sceneId,
           async sample<T>(cb: (t: GPUTexture) => T | Promise<T>): Promise<T> {
             return await cb(tex);
           },
           async release(): Promise<void> {
             if (released) return;
             released = true;
-            tex.destroy();
+            registry.unregister(sceneId);
           },
         };
       }
@@ -132,12 +162,16 @@ export function createInThreadCompose(compositor: CompositorSink): PluginCompose
         outW: args.outW, outH: args.outH,
       });
       const tex = h.texture;
+      const sceneId = registry.register(
+        { texture: tex, outW: h.outW, outH: h.outH },
+        () => { h.release(); },
+      );
       return {
-        texture: tex, outW: h.outW, outH: h.outH,
+        texture: tex, outW: h.outW, outH: h.outH, id: sceneId,
         async sample<T>(cb: (t: GPUTexture) => T | Promise<T>): Promise<T> {
           return await cb(tex);
         },
-        async release(): Promise<void> { h.release(); },
+        async release(): Promise<void> { registry.unregister(sceneId); },
       };
     },
 
@@ -266,8 +300,12 @@ async function makeWorkerSnapshot(
     consumerDevId: con.device.id, consumerDevGen: con.device.generation,
     pluginReservePointSerial: con.wireSerial,
     windows: [...windows],
-  })) as { surfaceBufId: number; width: number; height: number };
+  })) as { surfaceBufId: number; width: number; height: number; sceneId?: number };
   const surfaceBufId = r.surfaceBufId;
+  // sceneId is undefined when the broker was constructed without a
+  // shared sceneRegistry (e.g. an older test); the handle still works
+  // for direct sample(cb), but transitions.run on it would fail.
+  const sceneId = r.sceneId ?? 0;
   const texHandle = plugin.consumerTexture(clientId, resKey);
   if (texHandle === 0n) {
     throw new Error("compose.snapshot: consumer texture not yet injected on plugin wire");
@@ -279,7 +317,7 @@ async function makeWorkerSnapshot(
   plugin.writeConsumerBegin(clientId, surfaceBufId);
   let released = false;
   return {
-    texture, outW, outH,
+    texture, outW, outH, id: sceneId,
     async sample<T>(cb: (t: GPUTexture) => T | Promise<T>): Promise<T> {
       return await cb(texture);
     },
@@ -331,7 +369,12 @@ async function makeWorkerLive(
     windows: [...windows],
   });
   // eslint-disable-next-line no-restricted-syntax
-  const r = reply as unknown as { slotsSab: SharedArrayBuffer; slots: Array<{ surfaceBufId: number }> };
+  const r = reply as unknown as {
+    slotsSab: SharedArrayBuffer;
+    slots: Array<{ surfaceBufId: number }>;
+    sceneId?: number;
+  };
+  const sceneId = r.sceneId ?? 0;
 
   const slotBufIds: number[] = r.slots.map((s) => s.surfaceBufId);
   const slotTextures: (GPUTexture | null)[] = new Array(SLOTS).fill(null);
@@ -392,7 +435,7 @@ async function makeWorkerLive(
 
   return {
     texture: slot0Tex as GPUTexture,  // representative; sample(cb) hands the real one
-    outW, outH,
+    outW, outH, id: sceneId,
     async sample<T>(cb: (t: GPUTexture) => T | Promise<T>): Promise<T> {
       if (released) throw new Error("compose.live: sample after release");
       if (sampling) throw new Error("compose.live: sample called while another sample is in flight");
