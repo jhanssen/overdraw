@@ -27,6 +27,26 @@ export type SceneId = number;
 // per-frame callback lets the compositor re-pick which slot to sample.
 // Stable cases (in-thread snapshot/live, Worker snapshot) set it to
 // undefined; the texture field is used directly.
+// Per-frame resolver result for ring-backed scenes (Worker-live):
+// the texture chosen this frame plus optional bracket hooks the
+// consumer must call around its sample.
+//
+// For Worker-live the broker's resolveTexture picks the latest
+// PRESENTED slot and pairs it with writeProducerBegin/End for THAT
+// slot's surfaceBufId. The transitions broker calls beginRead before
+// encoding the transition pass and endRead after the submit, so the
+// GPU process holds the core-side STM access open across the sample
+// commands. Without these the sample reads STM-backed memory with no
+// active access -- Dawn validation fails.
+//
+// For non-STM live scenes (in-thread live) the texture is core-owned
+// and always sampleable; brackets are omitted.
+export interface ResolvedSceneTexture {
+  readonly texture: GPUTexture;
+  readonly beginRead?: () => void;
+  readonly endRead?: () => void;
+}
+
 export interface SceneEntry {
   // outW/outH are the scene's output dims. The transition pipeline
   // assumes input dims match the on-screen output; the broker
@@ -35,18 +55,21 @@ export interface SceneEntry {
   readonly outH: number;
   // Stable handle for the simple cases. For Worker-live, this is the
   // representative slot-0 texture (so a one-shot read returns something
-  // valid); per-frame consumers should prefer resolveTextures().
+  // valid); per-frame consumers should prefer resolveTexture().
   readonly texture: GPUTexture;
-  // Per-frame texture pick. Null means "no texture available this
-  // frame" (e.g. the ring has nothing PRESENTED yet); the compositor's
-  // transition pass falls back to opaque-black for that frame.
-  readonly resolveTexture?: () => GPUTexture | null;
+  // Per-frame texture pick + optional bracket hooks. Returning null
+  // means "no texture available this frame" (e.g. the ring has nothing
+  // PRESENTED yet); the compositor's transition pass falls back to
+  // opaque-black for that frame.
+  readonly resolveTexture?: () => ResolvedSceneTexture | null;
   // Called when the FIRST pin attaches; returns a release closure
   // called when the LAST pin drops. Used to open/close access brackets
-  // on shared-texture-memory-backed scenes (Worker compose snapshot
-  // and live) so consumers like the transitions broker can sample
-  // safely. For non-STM scenes (in-thread compose) this is undefined
-  // -- the texture is core-owned and always sampleable.
+  // on shared-texture-memory-backed scenes whose texture identity is
+  // STABLE (Worker compose snapshot) so consumers like the transitions
+  // broker can sample safely across the transition's lifetime. For
+  // live scenes the per-frame brackets ride on resolveTexture's
+  // ResolvedSceneTexture instead -- a once-per-pin Begin/End wouldn't
+  // cover the slot rotation.
   //
   // The registry guarantees acquireForSampling fires exactly once on
   // the 0 -> 1 pin edge and the returned release fires exactly once

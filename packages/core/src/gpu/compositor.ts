@@ -545,13 +545,23 @@ interface ActiveTransition {
   toTex: GPUTexture;
   kind: TransitionKind;
   getProgress: () => number;
-  resolveTextures?: () => { fromTex: GPUTexture; toTex: GPUTexture } | null;
+  resolveTextures?: () => {
+    fromTex: GPUTexture;
+    toTex: GPUTexture;
+    beginRead?: () => void;
+    endRead?: () => void;
+  } | null;
   // Per-frame bind group cache. Invalidated when textures change
   // (resolveTextures returns different handles). Keyed on (fromTex,
   // toTex) identity.
   cachedFromTex: GPUTexture | null;
   cachedToTex: GPUTexture | null;
   cachedBindGroup: GPUBindGroup | null;
+  // Per-frame endRead closure captured by encodeTransitionPass; the
+  // renderFrame caller runs it after submit so the wire End fires
+  // FIFO-after the sample commands. null when the resolver this frame
+  // didn't request brackets.
+  pendingEndRead: (() => void) | null;
 }
 
 export interface LiveWindowCompHandle {
@@ -1499,6 +1509,17 @@ export class JsCompositor implements CompositorSink {
       this.dispatch(this.lifecycle.step({ kind: "submitted", serial }));
       frameOpen = false;
 
+      // Phase 8: close the per-frame transition read bracket on the
+      // wire AFTER the submit. encodeTransitionPass stashed endRead in
+      // pendingEndRead (only when this frame's transition resolver
+      // returned bracket hooks -- Worker-live). One-shot per frame.
+      if (this.activeTransition?.pendingEndRead) {
+        const endRead = this.activeTransition.pendingEndRead;
+        this.activeTransition.pendingEndRead = null;
+        try { endRead(); }
+        catch (e) { console.error("[js-compositor] transition endRead threw:", e); }
+      }
+
       this.closeImportBrackets(bracketed);
 
       this.device.queue.onSubmittedWorkDone().then(() => {
@@ -1535,6 +1556,16 @@ export class JsCompositor implements CompositorSink {
       // secondary throw so the original `e` propagates.
       try { this.closeImportBrackets(bracketed); }
       catch { /* secondary throw -- intentionally swallowed */ }
+      // Phase 8: same alternation invariant for the transition's
+      // per-frame Begin/End. encodeTransitionPass sets pendingEndRead
+      // before calling beginRead, so if either threw the End needs to
+      // run here to close the bracket the Begin opened.
+      if (this.activeTransition?.pendingEndRead) {
+        const endRead = this.activeTransition.pendingEndRead;
+        this.activeTransition.pendingEndRead = null;
+        try { endRead(); }
+        catch { /* secondary throw -- intentionally swallowed */ }
+      }
       if (frameOpen) {
         try { this.dispatch(this.lifecycle.step({ kind: "frameAborted" })); }
         catch { /* secondary throw -- intentionally swallowed */ }
@@ -1684,7 +1715,22 @@ export class JsCompositor implements CompositorSink {
     toTex: GPUTexture;
     kind: TransitionKind;
     getProgress: () => number;
-    resolveTextures?: () => { fromTex: GPUTexture; toTex: GPUTexture } | null;
+    // Optional per-frame resolver. When set, called inside each
+    // renderFrame to re-pick this frame's textures + optional bracket
+    // hooks. The hooks (beginRead/endRead) ride the core wire FIFO-
+    // ordered against the transition pass: beginRead writes a
+    // producer Begin BEFORE the encode (so the GPU process opens the
+    // STM access before HandleCommands reaches the sample); endRead
+    // writes End AFTER the submit (so the access stays open through
+    // the sample's wire commands). Used by Worker-live scenes whose
+    // ring slot's STM-backed wgpu::Texture needs an active access on
+    // the core side.
+    resolveTextures?: () => {
+      fromTex: GPUTexture;
+      toTex: GPUTexture;
+      beginRead?: () => void;
+      endRead?: () => void;
+    } | null;
   }): void {
     if (this.activeTransition !== null) {
       throw new Error("setActiveTransition: a transition is already active");
@@ -1701,6 +1747,7 @@ export class JsCompositor implements CompositorSink {
       cachedFromTex: null,
       cachedToTex: null,
       cachedBindGroup: null,
+      pendingEndRead: null,
     };
   }
 
@@ -1729,7 +1776,16 @@ export class JsCompositor implements CompositorSink {
 
     // Re-pick textures if a resolver is installed; rebuild the bind
     // group on identity change. For the stable case the cached bind
-    // group is reused every frame.
+    // group is reused every frame. For ring-backed scenes the
+    // resolver also returns optional per-frame beginRead/endRead
+    // wire-bracket closures: beginRead fires here (BEFORE the pass
+    // is encoded, so the wire Begin is FIFO-ordered before the
+    // sample's Dawn commands); endRead is stashed in pendingEndRead
+    // and run by renderFrame after the submit (FIFO-after the sample).
+    // Defensive: clear any stale endRead from a prior frame -- the
+    // resolver may transition from bracketed (Worker-live) to stable
+    // (the producer ring tore down mid-transition) or vice versa.
+    t.pendingEndRead = null;
     let fromTex = t.fromTex;
     let toTex = t.toTex;
     if (t.resolveTextures) {
@@ -1751,6 +1807,13 @@ export class JsCompositor implements CompositorSink {
       }
       fromTex = r.fromTex;
       toTex = r.toTex;
+      // Open the wire bracket on the core side BEFORE encoding the
+      // sample. Stash endRead FIRST so a throw between Begin and the
+      // pass encode still leaves the cleanup reachable to the catch
+      // path in renderFrame (which fires pendingEndRead before
+      // rethrowing).
+      t.pendingEndRead = r.endRead ?? null;
+      if (r.beginRead) r.beginRead();
     }
     if (t.cachedBindGroup === null
         || t.cachedFromTex !== fromTex

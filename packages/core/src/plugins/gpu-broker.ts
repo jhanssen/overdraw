@@ -451,16 +451,27 @@ export function createGpuBroker(deps: GpuBrokerDeps) {
         // slot is currently PRESENTED (the producer's
         // demoteStaleOnPresent guarantees at most one). The
         // representative .texture is slot 0's wrap; per-frame
-        // consumers (transitions) use resolveTexture instead.
+        // consumers (transitions) use resolveTexture instead. The
+        // returned ResolvedSceneTexture carries beginRead/endRead
+        // closures that write producer Begin/End on the core wire
+        // for THIS frame's slot, so the GPU process holds the
+        // core-side STM access open across the consumer's sample.
         const repTex = textureFor(0);
         if (!repTex) throw new Error("compose.live: slot 0 texture not wrappable");
         const sceneId = sceneRegistry.register(
           {
             texture: repTex, outW: w, outH: h,
-            resolveTexture: (): GPUTexture | null => {
+            resolveTexture: () => {
               const slot = slotStates.presentedSlot();
               if (slot < 0) return null;
-              return textureFor(slot);
+              const tex = textureFor(slot);
+              if (!tex) return null;
+              const bufId = slotBufIds[slot];
+              return {
+                texture: tex,
+                beginRead: () => { addon.writeProducerBegin(bufId); },
+                endRead:   () => { addon.writeProducerEnd(bufId); },
+              };
             },
           },
           () => { ring.teardown(); },

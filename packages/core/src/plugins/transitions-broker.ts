@@ -31,13 +31,25 @@ export const NOT_HANDLED = Symbol("transitions-broker:not-handled");
 // JsCompositor in production; tests pass a mock. The two methods are
 // optional on CompositorSink (the native compositor doesn't have
 // them) -- the broker validates at construction.
+//
+// resolveTextures' return shape carries optional per-frame bracket
+// hooks (beginRead/endRead). For ring-backed inputs (Worker-live)
+// the compositor must call beginRead BEFORE encoding the transition
+// pass and endRead AFTER the submit so the GPU process holds the
+// STM-backed texture's access open across the sample. Stable inputs
+// (in-thread, Worker snapshot) leave the hooks undefined.
 export interface TransitionCompositorSink {
   setActiveTransition?: (opts: {
     fromTex: GPUTexture;
     toTex: GPUTexture;
     kind: TransitionKind;
     getProgress: () => number;
-    resolveTextures?: () => { fromTex: GPUTexture; toTex: GPUTexture } | null;
+    resolveTextures?: () => {
+      fromTex: GPUTexture;
+      toTex: GPUTexture;
+      beginRead?: () => void;
+      endRead?: () => void;
+    } | null;
   }) => void;
   clearActiveTransition?: () => void;
 }
@@ -158,17 +170,48 @@ export function createTransitionsBroker(
     // Build the per-frame resolver. For stable scenes (no resolveTexture
     // on either entry) skip the callback entirely; the compositor uses
     // the install-time fromTex/toTex every frame. For ring-backed
-    // scenes (Worker-live), resolveTexture returns the latest
-    // PRESENTED slot's core-side texture; if either side has nothing
-    // PRESENTED yet, the callback returns null and the compositor
-    // clears to opaque-black for that frame.
+    // scenes (Worker-live), each scene's resolveTexture returns the
+    // latest PRESENTED slot's texture plus per-frame Begin/End wire
+    // brackets; the broker composes the two sides' brackets so the
+    // compositor sees a single beginRead/endRead pair that wraps
+    // both sample sources.
     const usesResolver = from.resolveTexture || to.resolveTexture;
     const resolveTextures = usesResolver
-      ? (): { fromTex: GPUTexture; toTex: GPUTexture } | null => {
-          const f = from.resolveTexture ? from.resolveTexture() : from.texture;
-          const t = to.resolveTexture ? to.resolveTexture() : to.texture;
-          if (!f || !t) return null;
-          return { fromTex: f, toTex: t };
+      ? (): {
+          fromTex: GPUTexture; toTex: GPUTexture;
+          beginRead?: () => void; endRead?: () => void;
+        } | null => {
+          const fRes = from.resolveTexture
+            ? from.resolveTexture()
+            : { texture: from.texture };
+          const tRes = to.resolveTexture
+            ? to.resolveTexture()
+            : { texture: to.texture };
+          if (!fRes || !tRes) return null;
+          // Compose brackets across the two sides. Both sides being
+          // bracketed (Worker-live <-> Worker-live) is the most common
+          // ring case; the snapshot+live or live+snapshot mixes also
+          // work because the snapshot side's resolveTexture is
+          // undefined and we fall through to the stable texture.
+          const beginAll = (fRes.beginRead || tRes.beginRead)
+            ? (): void => {
+                fRes.beginRead?.();
+                tRes.beginRead?.();
+              }
+            : undefined;
+          const endAll = (fRes.endRead || tRes.endRead)
+            ? (): void => {
+                // End in reverse order: last opened, first closed.
+                // GPU process FIFO-orders per-surfaceBufId so this is
+                // mainly hygiene, but matches Begin/End pairing rules.
+                tRes.endRead?.();
+                fRes.endRead?.();
+              }
+            : undefined;
+          return {
+            fromTex: fRes.texture, toTex: tRes.texture,
+            beginRead: beginAll, endRead: endAll,
+          };
         }
       : undefined;
 
