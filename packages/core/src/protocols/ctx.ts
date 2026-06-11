@@ -168,6 +168,20 @@ export interface CompositorSink {
     resolveTextures?: () => { fromTex: GPUTexture; toTex: GPUTexture } | null;
   }): void;
   clearActiveTransition?(): void;
+  // Phase 9a: snapshot the surfaces of a closing window into a fresh
+  // phantom surface entry. The phantom is a regular surface (the
+  // standard per-surface setters work on it) but its texture is
+  // core-owned; the lifecycle is plugin-driven (or compositor's
+  // backstop). Optional because the native compositor path doesn't
+  // implement phantoms today.
+  createClosingPhantom?(args: {
+    phantomSurfaceId: number;
+    surfaceIds: ReadonlyArray<number>;
+    outerRect: { x: number; y: number; w: number; h: number };
+  }): number;
+  // Tear down a phantom created via createClosingPhantom. Removes
+  // from the draw order; destroys the snapshot texture. Idempotent.
+  destroyClosingPhantom?(phantomSurfaceId: number): void;
 }
 
 export interface CompositorState {
@@ -196,6 +210,14 @@ export interface CompositorState {
   // the focused client) or forwarded as usual. Plugins register bindings
   // via the windows broker (windows.input.* methods).
   bindingChain?: import("../input/binding-chain.js").BindingChain;
+  // Phase 9a closing driver. When wired (a 'window-closing' plugin
+  // is registered), the wl_surface unmap path consults this before
+  // tearing down a mapped toplevel: if a plugin handler is present,
+  // the driver snapshots the window into a phantom + emits
+  // window.closing + arms a backstop timer. Absent or no-op when
+  // no closing plugin is registered -- the unmap then proceeds
+  // instantly (pre-phase-9a behavior).
+  closingDriver?: import("./closing-driver.js").ClosingDriver;
   lastCommittedSurfaceId?: number;
   // Fire all surfaces' pending wl_surface.frame callbacks (set by installProtocols;
   // called once per compositor frame). timeMs is a millisecond timestamp.

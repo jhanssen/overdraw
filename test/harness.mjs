@@ -187,6 +187,7 @@ export async function setupCompositor(opts = {}) {
   coreBus.on(WINDOW_EVENT.map, (ev) => { pluginBus.emit(WINDOW_EVENT.map, ev); });
   coreBus.on(WINDOW_EVENT.unmap, (ev) => { pluginBus.emit(WINDOW_EVENT.unmap, ev); });
   coreBus.on(WINDOW_EVENT.change, (ev) => { pluginBus.emit(WINDOW_EVENT.change, ev); });
+  coreBus.on(WINDOW_EVENT.closing, (ev) => { pluginBus.emit(WINDOW_EVENT.closing, ev); });
 
   // The driver factories close over `runtime`, which is built after
   // installProtocols below. waitForNamespace inside compute()/decide()
@@ -227,6 +228,21 @@ export async function setupCompositor(opts = {}) {
     plugins: [],
     sourcePath: null,
   };
+  // Phase 9a closing driver: snapshots a phantom of a closing toplevel
+  // when a 'window-closing' plugin is registered. hasPluginHandler reads
+  // the runtime's namespace registry (assigned below). state.closingDriver
+  // is the hook unmapAndTeardownSurface calls.
+  let closingDriver = null;
+  if (opts.closingAnimations) {
+    const { createClosingDriver } = await import(
+      "../packages/core/dist/protocols/closing-driver.js");
+    closingDriver = createClosingDriver({
+      hasPluginHandler: () => runtime?.registry?.()?.active("window-closing") != null,
+      backstopMs: opts.closingBackstopMs,  // tests can override default 10s
+    });
+    state.closingDriver = closingDriver;
+  }
+
   // Wire a windows broker so bundled / fixture plugins can call
   // sdk.windows.*. The test's onRequest is consulted for any method the
   // broker doesn't handle.
@@ -236,6 +252,7 @@ export async function setupCompositor(opts = {}) {
       wm: state.wm,
       compositor: jsCompositor ?? noopSinkForBroker(),
       state, pluginBus, bus: coreBus,
+      closingDriver: closingDriver ?? undefined,
     });
   }
   // The input broker emits 'input.binding-fired' to the originating plugin
@@ -279,6 +296,27 @@ export async function setupCompositor(opts = {}) {
     };
   }
 
+  // Optional animations broker (sdk.animations.run / cancel). Same shape
+  // as the transitions wiring: opts.animations = true brings it up.
+  // Closing-animation tests need this because the bundled closing plugin
+  // animates the phantom's opacity via sdk.animations.run.
+  let animationsBroker = null;
+  let ANIM_NOT_HANDLED = null;
+  if (opts.animations && jsCompositor) {
+    const { createEvaluator } = await import(
+      "../packages/core/dist/animations/evaluator.js");
+    const ab = await import(
+      "../packages/core/dist/plugins/animations-broker.js");
+    const animEvaluator = createEvaluator(jsCompositor);
+    animationsBroker = ab.createAnimationsBroker(animEvaluator);
+    ANIM_NOT_HANDLED = ab.NOT_HANDLED;
+    const priorBefore = state.beforeRender;
+    state.beforeRender = (timeMs) => {
+      priorBefore?.(timeMs);
+      animEvaluator.tick(timeMs);
+    };
+  }
+
   const onRequest = (plugin, method, params) => {
     if (windowsBroker && method.startsWith("windows.")) {
       const r = windowsBroker(plugin, method, params);
@@ -291,6 +329,10 @@ export async function setupCompositor(opts = {}) {
     if (transitionsBroker && method.startsWith("transitions.")) {
       const r = transitionsBroker(plugin, method, params);
       if (r !== TRANSITIONS_NOT_HANDLED) return r;
+    }
+    if (animationsBroker && method.startsWith("animations.")) {
+      const r = animationsBroker(plugin, method, params);
+      if (r !== ANIM_NOT_HANDLED) return r;
     }
     if (opts.onRequest) return opts.onRequest(plugin, method, params);
     throw new Error(`harness: no handler for plugin request '${method}'`);

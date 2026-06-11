@@ -11,6 +11,7 @@ import { TypedBus } from "./bus.js";
 import { WINDOW_EVENT } from "./types.js";
 import type {
   WindowMapEvent, WindowUnmapEvent, WindowChangeEvent, WindowStateChangedEvent,
+  WindowClosingEvent,
 } from "./types.js";
 
 // Keyboard-focus change (active window). clientId is the newly focused client, or
@@ -28,6 +29,7 @@ export interface CompositorEventMap {
   [WINDOW_EVENT.unmap]: WindowUnmapEvent;
   [WINDOW_EVENT.change]: WindowChangeEvent;
   [WINDOW_EVENT.stateChanged]: WindowStateChangedEvent;
+  [WINDOW_EVENT.closing]: WindowClosingEvent;
   [KEYBOARD_EVENT.focus]: KeyboardFocusEvent;
 }
 

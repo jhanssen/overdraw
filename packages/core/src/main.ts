@@ -79,6 +79,7 @@ const pluginBus = new DynamicBus();
 bus.on(WINDOW_EVENT.map, (ev) => { pluginBus.emit(WINDOW_EVENT.map, ev); });
 bus.on(WINDOW_EVENT.unmap, (ev) => { pluginBus.emit(WINDOW_EVENT.unmap, ev); });
 bus.on(WINDOW_EVENT.change, (ev) => { pluginBus.emit(WINDOW_EVENT.change, ev); });
+bus.on(WINDOW_EVENT.closing, (ev) => { pluginBus.emit(WINDOW_EVENT.closing, ev); });
 
 let ipcServer: IpcServer | null = null;
 
@@ -235,11 +236,23 @@ const gpuBroker = createGpuBroker({
   onSurfacePresented: (sid) => decorationBroker.onSurfacePresented(sid),
 });
 
+// Phase 9a closing driver: snapshots a phantom of a closing toplevel
+// for the registered 'window-closing' plugin (if any). hasPluginHandler
+// reads the runtime's namespace registry; runtime is created below.
+// state.closingDriver is the hook unmapAndTeardownSurface calls.
+const { createClosingDriver } = await import("./protocols/closing-driver.js");
+const closingDriver = createClosingDriver({
+  hasPluginHandler: () => runtime?.registry().active("window-closing") !== null
+    && runtime?.registry().active("window-closing") !== undefined,
+});
+state.closingDriver = closingDriver;
+
 // Windows broker: services sdk.windows.set / set-state / get-state / get /
 // list / delete-state / set-output-stack. core-plugin-api.md §1.
 if (!state.wm) throw new Error("internal: state.wm not set by installProtocols");
 const windowsBroker = createWindowsBroker({
   wm: state.wm, compositor, state, pluginBus, bus,
+  closingDriver,
 });
 
 // Animation evaluator + broker (core-plugin-api.md §9). The evaluator

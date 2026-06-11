@@ -141,6 +141,18 @@ export interface PluginWindows extends PluginWindowObserver {
   // 5.5a). Pass 16 numbers in column-major order (WGSL mat4x4f). null
   // restores identity.
   setColorMatrix(id: number, m: ColorMatrix | null): Promise<void>;
+
+  // Phase 9a: destroy a phantom surface (created by core in response to
+  // a closing window and passed to the plugin via the window.closing
+  // event). The plugin calls this when its closing animation completes;
+  // the compositor removes the phantom from the draw order, destroys
+  // the snapshot texture, and cancels the backstop timer.
+  //
+  // Idempotent: calling on an already-destroyed phantom id is a no-op.
+  // Calling on a non-phantom id (a regular client surface) is also
+  // (effectively) a no-op -- the compositor's destroyClosingPhantom
+  // refuses non-phantom ids.
+  destroyPhantom(id: number): Promise<void>;
 }
 
 // The single-output placeholder id (kept in sync with OUTPUT_DEFAULT in
@@ -316,6 +328,13 @@ export function createPluginWindows(
         : (m instanceof Float32Array ? Array.from(m) : m);
       // eslint-disable-next-line no-restricted-syntax
       await endpoint.request("windows.set-color-matrix", { id, m: payload as unknown as Json });
+    },
+
+    async destroyPhantom(id): Promise<void> {
+      if (typeof id !== "number" || !Number.isInteger(id) || id <= 0) {
+        throw new TypeError("destroyPhantom id must be a positive integer");
+      }
+      await endpoint.request("windows.destroy-phantom", { id });
     },
   };
 

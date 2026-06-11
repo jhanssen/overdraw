@@ -34,6 +34,13 @@ export const WINDOW_EVENT = {
   // for an entry animation) and the WM awaits before pushing. Bounded by a
   // 100ms per-handler timeout. core-plugin-api.md §3.1.
   relayout: "window.relayout",
+  // Phase 9a: a mapped toplevel has unmapped (client destroyed it or
+  // disconnected) and the compositor has minted a phantom surface
+  // holding a snapshot of its last visible state. The phantom sits
+  // at the closing window's prior screen rect, above the content
+  // layer; its lifetime is plugin-driven (via sdk.windows.destroyPhantom)
+  // or the compositor's 10s backstop. core-plugin-api.md §9.
+  closing: "window.closing",
 } as const;
 
 // `type` (not `interface`) so the payloads carry an implicit index signature and
@@ -109,6 +116,36 @@ export type WindowRelayoutEvent = {
   newOuter: WindowRect;
 };
 
+// Phase 9a: emitted after a mapped toplevel has unmapped (client
+// destroyed it or disconnected). `phantomSurfaceId` is a fresh
+// compositor surface entry the core minted to display a snapshot
+// of the closing window's last visible state at its prior screen
+// rect, on top of the content layer. The plugin (typically the head
+// of the 'closing-animation' namespace priority chain) manipulates
+// this surface via the regular per-surface SDK (setOpacity,
+// setTransform, animations.run, transitions.run with it as a scene
+// input). Lifetime: plugin calls sdk.windows.destroyPhantom when
+// done, OR the compositor's 10s backstop fires.
+//
+// `originalSurfaceId` is the now-gone toplevel's id (for plugins
+// that want to correlate with a prior window.map event's data,
+// e.g. a status bar that tracked the window).
+//
+// `rect` is the closing window's outer rect at unmap time. Same
+// as `phantomSurfaceId`'s initial layout; included so plugins
+// have it without an extra fetch.
+//
+// appId/title are the closing toplevel's, snapshotted at unmap
+// time. Either may be null (a client may set_app_id after first
+// commit; if it never did, both are null).
+export type WindowClosingEvent = {
+  phantomSurfaceId: number;
+  originalSurfaceId: number;
+  rect: WindowRect;
+  appId: string | null;
+  title: string | null;
+};
+
 // Decoration-provider events (core -> the matched provider plugin).
 export const DECORATION_EVENT = {
   assigned: "decoration.assigned",
@@ -155,6 +192,7 @@ export type _MapIsCloneable = AssignableToCloneable<WindowMapEvent>;
 export type _UnmapIsCloneable = AssignableToCloneable<WindowUnmapEvent>;
 export type _ChangeIsCloneable = AssignableToCloneable<WindowChangeEvent>;
 export type _RelayoutIsCloneable = AssignableToCloneable<WindowRelayoutEvent>;
+export type _ClosingIsCloneable = AssignableToCloneable<WindowClosingEvent>;
 export type _AssignedIsCloneable = AssignableToCloneable<DecorationAssignedEvent>;
 export type _DeregisteredIsCloneable = AssignableToCloneable<DecorationDeregisteredEvent>;
 export type _ResizedIsCloneable = AssignableToCloneable<DecorationResizedEvent>;

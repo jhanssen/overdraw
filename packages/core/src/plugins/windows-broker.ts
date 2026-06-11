@@ -33,6 +33,12 @@ export interface WindowsBrokerDeps {
   // The core typed bus -- markWindowChanged consults state.bus, but the broker
   // does not emit directly through it. Kept here for symmetry/extension.
   bus: CompositorBus;
+  // Phase 9a closing driver. The destroy-phantom path needs to cancel
+  // the driver's backstop timer in addition to calling
+  // compositor.destroyClosingPhantom. Optional: when absent (a
+  // configuration without closing-animation support), destroy-phantom
+  // still works -- it just skips the backstop-cancel step.
+  closingDriver?: import("../protocols/closing-driver.js").ClosingDriver;
 }
 
 // The shape main.ts plugs into its onRequest chain. Returns the result for
@@ -47,7 +53,7 @@ export type WindowsBroker = (
 export const NOT_HANDLED = Symbol("windows-broker:not-handled");
 
 export function createWindowsBroker(deps: WindowsBrokerDeps): WindowsBroker {
-  const { wm, compositor, state, pluginBus } = deps;
+  const { wm, compositor, state, pluginBus, closingDriver } = deps;
 
   return (pluginName: string, method: string, params: unknown): unknown | typeof NOT_HANDLED => {
     void pluginName;   // available for future audit / capability gating
@@ -67,8 +73,26 @@ export function createWindowsBroker(deps: WindowsBrokerDeps): WindowsBroker {
     if (method === "windows.set-mask") return handleSetMask(params);
     if (method === "windows.set-tint") return handleSetTint(params);
     if (method === "windows.set-color-matrix") return handleSetColorMatrix(params);
+    if (method === "windows.destroy-phantom") return handleDestroyPhantom(params);
     return NOT_HANDLED;
   };
+
+  function handleDestroyPhantom(p: unknown): null {
+    if (!isDestroyPhantomPayload(p)) {
+      throw new Error("windows.destroy-phantom: malformed payload");
+    }
+    if (!compositor.destroyClosingPhantom) {
+      throw new Error(
+        "windows.destroy-phantom: not supported by this compositor");
+    }
+    // Cancel the backstop FIRST so an unlucky race where the timer
+    // fires between this destroy and a fresh phantom getting the
+    // same id can't mis-destroy. The timer's destroy callback is
+    // a no-op when the timer was already cancelled.
+    closingDriver?.cancelBackstop(p.id);
+    compositor.destroyClosingPhantom(p.id);
+    return null;
+  }
 
   function handleSetTint(p: unknown): null {
     if (!isSetTintPayload(p)) throw new Error("windows.set-tint: malformed payload");
@@ -363,4 +387,10 @@ function isSetColorMatrixPayload(d: unknown): d is {
     if (typeof v !== "number" || !Number.isFinite(v)) return false;
   }
   return true;
+}
+
+function isDestroyPhantomPayload(d: unknown): d is { id: number } {
+  if (typeof d !== "object" || d === null) return false;
+  const o = d as { [k: string]: unknown };
+  return typeof o.id === "number" && Number.isInteger(o.id) && o.id > 0;
 }

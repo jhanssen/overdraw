@@ -641,6 +641,22 @@ export class JsCompositor implements CompositorSink {
   // producer's compose pass shares the frame's encoder + submit.
   private liveProducers: Array<() => void> = [];
 
+  // Phase 9a: closing-animation phantoms. When a mapped toplevel
+  // unmaps, the compositor composites its surface set (toplevel +
+  // decoration + subsurfaces) into a fresh core-owned texture, mints
+  // a new surfaceId for the phantom, and tracks it here. Phantoms
+  // are drawn above the content stack (between content and the
+  // 'above' layer) so they sit on top of the survivors reflowing
+  // into the closing window's vacated tile. The plugin owns lifetime
+  // via destroyPhantom; the broker also enforces a backstop timeout.
+  // Insertion order = z order within the phantom group.
+  private phantoms: number[] = [];
+  // Texture handles for each phantom, keyed by phantom surfaceId.
+  // Destroyed when destroyPhantom runs. The phantom's compositor
+  // surface entry in this.surfaces sees the texture via the regular
+  // bindGroup wiring (setSurfaceTexture installs it).
+  private phantomTextures = new Map<number, GPUTexture>();
+
   // Phase 8: active transition (core-plugin-api.md §8). When non-null,
   // renderFrame replaces the on-screen surface-list composite with a
   // single transition pass blending two textures via a kind-specific
@@ -804,7 +820,17 @@ export class JsCompositor implements CompositorSink {
     const out: number[] = [];
     const content = this.outputStacks.get(OUTPUT_DEFAULT) ?? this.stack;
     for (const layer of LAYER_ORDER) {
-      if (layer === "content") out.push(...content);
+      if (layer === "content") {
+        out.push(...content);
+        // Phase 9a: phantoms (closing-animation snapshots) draw on top
+        // of the content layer but below the 'above' layer. Insertion
+        // order = z order; the most recently closed window's phantom
+        // is on top of older phantoms. This is the v1 z model;
+        // future phases may splice phantoms into the exact z position
+        // their original surface had if the simple "on top of content"
+        // placement turns out wrong for some real use case.
+        if (this.phantoms.length > 0) out.push(...this.phantoms);
+      }
       else { const ids = this.layers.get(layer); if (ids) out.push(...ids); }
     }
     return out;
@@ -1644,6 +1670,102 @@ export class JsCompositor implements CompositorSink {
     });
     return { texture, outW, outH };
   }
+
+  // Phase 9a: snapshot the closing window's surfaces into a fresh
+  // texture and mint a phantom surface entry to display it. The
+  // phantom is a regular compositor surface (the plugin can
+  // manipulate it via the standard windows broker -- setOpacity,
+  // setTransform, etc.); it's added to the phantoms array so
+  // drawOrder includes it above the content stack.
+  //
+  // `surfaceIds` is the surfaces to composite (typically: toplevel,
+  // decoration, subsurfaces). They must still be sampleable -- callers
+  // run this BEFORE compositor.removeSurface on any of them.
+  //
+  // `outerRect` is the closing window's outer screen rect; each
+  // surface's screen position is translated into the phantom's local
+  // coordinate space relative to that origin. The phantom is then
+  // placed at the same screen rect so it appears exactly where the
+  // closing window was.
+  //
+  // `phantomSurfaceId` is provided by the caller (typically a fresh
+  // id from state.serial()). Returns the same id for convenience.
+  createClosingPhantom(args: {
+    phantomSurfaceId: number;
+    surfaceIds: ReadonlyArray<number>;
+    outerRect: { x: number; y: number; w: number; h: number };
+  }): number {
+    const { phantomSurfaceId, surfaceIds, outerRect } = args;
+    const outW = Math.max(1, outerRect.w);
+    const outH = Math.max(1, outerRect.h);
+
+    // Build a placement override: each surface goes at (s.x - outerRect.x,
+    // s.y - outerRect.y) with its current layoutW/layoutH. This maps
+    // every member's absolute screen position to the phantom-local
+    // coordinate space.
+    const placements = new Map<number, { x: number; y: number; w: number; h: number }>();
+    for (const id of surfaceIds) {
+      const s = this.surfaces.get(id);
+      if (!s) continue;
+      placements.set(id, {
+        x: s.x - outerRect.x,
+        y: s.y - outerRect.y,
+        w: s.layoutW,
+        h: s.layoutH,
+      });
+    }
+
+    // Allocate a fresh phantom texture sized to the outer rect.
+    const phantomTex = this.allocComposeTexture(outW, outH);
+    const view = phantomTex.createView();
+
+    // Compose the surface set into the phantom texture using the
+    // placement override. The phantom-local coordinates above mean
+    // the result matches what the on-screen composite would have
+    // drawn for those surfaces (up to clipping at the outer rect).
+    this.composeSnapshot({
+      targetView: view,
+      drawList: [...surfaceIds],
+      outW, outH,
+      placements,
+    });
+
+    // Mint the phantom surface entry. setSurfaceLayout creates the
+    // Surface record if absent; setSurfaceTexture installs the
+    // sampled texture + bind group. Layout = outer rect (so the
+    // phantom draws at the same position as the closing window).
+    this.setSurfaceLayout(phantomSurfaceId,
+      outerRect.x, outerRect.y, outW, outH);
+    this.setSurfaceTexture(phantomSurfaceId, phantomTex, outW, outH);
+
+    // Track for lifetime + draw-order inclusion.
+    this.phantomTextures.set(phantomSurfaceId, phantomTex);
+    this.phantoms.push(phantomSurfaceId);
+    return phantomSurfaceId;
+  }
+
+  // Phase 9a: tear down a phantom. Removes it from the draw order,
+  // drops the surface entry, destroys the snapshot texture. Idempotent
+  // (no-op if the id isn't a known phantom).
+  destroyClosingPhantom(phantomSurfaceId: number): void {
+    const tex = this.phantomTextures.get(phantomSurfaceId);
+    if (!tex) return;
+    this.phantomTextures.delete(phantomSurfaceId);
+    const i = this.phantoms.indexOf(phantomSurfaceId);
+    if (i >= 0) this.phantoms.splice(i, 1);
+    // Drop the surface entry. removeSurface dispatches the
+    // lifecycle's surfaceRemoved step; safe for a phantom since
+    // its currentBufferId is 0 (no client buffer) so the lifecycle
+    // emits nothing.
+    this.removeSurface(phantomSurfaceId);
+    // Destroy the texture last -- removeSurface may have its own
+    // teardown that references it (e.g. the bind group) but those
+    // are released before the texture itself goes.
+    tex.destroy();
+  }
+
+  // For tests: enumerate active phantom surfaceIds in draw order.
+  activePhantomIds(): number[] { return this.phantoms.slice(); }
 
   // Render the listed windows into a PRE-ALLOCATED target view, with optional
   // producer Begin/End wrapping for cross-device dmabuf targets (phase 5b

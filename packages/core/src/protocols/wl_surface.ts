@@ -186,6 +186,15 @@ export default function makeSurface(ctx: Ctx): WlSurfaceHandler {
 export function unmapAndTeardownSurface(state: CompositorState, s: SurfaceRecord): void {
   if (s.unmapped) return;
   s.unmapped = true;
+  // Phase 9a: BEFORE the WM/compositor teardown, give the closing
+  // driver a chance to capture a phantom. The driver is a no-op when
+  // no plugin claims the 'window-closing' namespace, so when nothing
+  // is registered we proceed straight to instant unmap (the original
+  // pre-9a behavior). When the driver DOES capture, it emits
+  // window.closing on the bus + arms a backstop; the phantom lives
+  // in the compositor independently until the plugin (or the
+  // backstop) destroys it.
+  state.closingDriver?.beforeUnmap(state, s);
   if (s.mapped && s.role === "xdg_toplevel") {
     state.bus?.emit(WINDOW_EVENT.unmap, { surfaceId: s.id });
   }
