@@ -4,7 +4,7 @@ Ground truth for what exists right now: current capabilities, known gaps, and
 what remains. The design lives in `architecture.md`; this file does not restate
 it. Present-tense only — no change history.
 
-Last updated: 2026-06-10 (post-Phase 8 — `sdk.transitions` + animated workspace.show).
+Last updated: 2026-06-11 (post-Phase 9a — `window.closing` + phantom + plugin closing animations; 9b/9c deferred).
 
 ## Read first: gaps in advertised protocols (silent-gap risks)
 
@@ -1764,6 +1764,151 @@ fixed in this phase from `test/*.gpu.mjs` to `test/**/*.gpu.mjs`
 so prior `test/plugin-*/*.gpu.mjs` files now also run). 674/674
 unit tests pass.
 
+### Phantom-based closing animations (Phase 9a)
+
+A mapped toplevel that unmaps (client destroyed it or disconnected)
+can be replaced briefly by a phantom: a core-owned snapshot of its
+last visible state, displayed at the closing window's prior screen
+rect. A plugin registered in the `'window-closing'` namespace
+animates the phantom (fade / shrink / slide / transition-to-empty)
+and then destroys it. The client gets cleaned up immediately the
+moment it unmaps -- the snapshot decouples the visual from the
+client lifetime entirely, so a buggy or slow plugin animation
+can never delay the client teardown.
+
+**Architecture.** Three pieces:
+
+- **JsCompositor.createClosingPhantom / destroyClosingPhantom**:
+  the compositor-side primitive. `createClosingPhantom` collects
+  the closing window's surface set (toplevel + decoration +
+  subsurfaces), composites them into a fresh core-owned texture
+  sized to the outer rect (one-shot `composeSnapshot` with a
+  per-surface placement override translating absolute screen
+  coords into phantom-local coords), then mints a phantom surface
+  entry via the standard `setSurfaceLayout` / `setSurfaceTexture`
+  setters. The compositor tracks active phantoms in a private
+  `phantoms[]` list; `drawOrder` injects them ABOVE the content
+  layer (so they sit on top of the survivors reflowing into the
+  closing window's vacated tile). `destroyClosingPhantom` is
+  symmetric: removes from `phantoms`, removes the surface entry,
+  destroys the snapshot texture.
+
+- **packages/core/src/protocols/closing-driver.ts**: the
+  integration point. Reads `hasPluginHandler` (a callback the
+  launcher wires to `runtime.registry().active('window-closing')`).
+  When no plugin claims the namespace, the driver is a no-op and
+  unmap is instant -- the pre-9a behavior is preserved bit-for-bit.
+  When a plugin IS registered, the driver:
+    1. Mints a fresh `phantomSurfaceId` via `state.serial()`.
+    2. Walks the surface set (decoration / toplevel /
+       subsurface subtree).
+    3. Calls `compositor.createClosingPhantom(...)`.
+    4. Emits `WINDOW_EVENT.closing` on the typed bus with the
+       phantom's id + the closing window's outerRect + the
+       toplevel's appId / title.
+    5. Arms a 10s backstop timer (configurable for tests).
+
+- **unmapAndTeardownSurface** (in `wl_surface.ts`) calls
+  `state.closingDriver?.beforeUnmap` BEFORE the WM/compositor
+  teardown so the source surfaces are still sampleable. The
+  emit order is `window.closing` → `window.unmap` → WM unmap
+  → compositor removeSurface; subscribers see the closing event
+  first, then the unmap (which the rest of the system already
+  reacts to).
+
+**Plugin API.** Plugin claims the `'window-closing'` namespace
+(`sdk.registerPlugin('window-closing', () => ({}))`), subscribes
+to `window.closing` on the bus, and on each event runs its
+animation against the phantom's surfaceId via the existing per-
+surface SDK -- `sdk.windows.setOpacity` / `setTransform` /
+`sdk.animations.run({target: {kind: 'window-opacity', windowId:
+phantomSurfaceId}, ...})` / `sdk.transitions.run({from: ...,
+to: ..., ...})`. When the animation completes the plugin calls
+`sdk.windows.destroyPhantom(phantomSurfaceId)`, which cancels
+the backstop + tears down the phantom.
+
+If the plugin fails to call destroyPhantom (forgot, threw, etc.),
+the 10s backstop fires and the compositor destroys the phantom
+on its own. Tests can override the timeout via
+`opts.closingBackstopMs`.
+
+**Caveats / known limitations.**
+- One composited phantom per window (subsurfaces baked in). Per-
+  element animation (titlebar peels off independently while content
+  shrinks) is deferred; the snapshot + SceneRegistry plumbing from
+  Phase 8 could be extended for that if a real consumer needs it.
+- The closing driver returns no-op when the closing surface isn't
+  fully mapped yet (no first content commit). A client that
+  disconnects between `get_toplevel` and first content gets the
+  pre-9a instant-unmap behavior. Tests must wait for first-content
+  before killing the client to exercise the closing path.
+- Phantoms are placed above the content layer regardless of their
+  original z. For the master-stack tiler this matches the expected
+  visual (closing window is "leaving"); future designs may want
+  z-aware splicing if a closing window had others above it (popups
+  currently close with their toplevel, so this isn't a real case
+  today).
+- One plugin wins via the namespace priority chain. Other plugins
+  observing `window.closing` are watch-only -- they see the event
+  but the phantom is the registered plugin's to animate. No
+  per-plugin phantom (each closing produces ONE phantom that the
+  registered plugin owns).
+- Phase 9b (smoothed pointer velocity in `wl_pointer` events) and
+  Phase 9c (`sdk.cursor` + custom cursor compositing) are deferred.
+
+**Files (new):**
+- `packages/core/src/protocols/closing-driver.ts`.
+- `test/fixtures/plugins/closing-animation.mjs` (fixture plugin
+  for the GPU tests; not a bundled plugin).
+
+**Files (modified):**
+- `packages/core/src/gpu/compositor.ts`: `createClosingPhantom` /
+  `destroyClosingPhantom` / `activePhantomIds`, `phantoms[]` +
+  `phantomTextures` state, drawOrder branch.
+- `packages/core/src/protocols/wl_surface.ts`: hook
+  `state.closingDriver?.beforeUnmap` into
+  `unmapAndTeardownSurface`.
+- `packages/core/src/protocols/ctx.ts`: optional
+  `CompositorSink.createClosingPhantom` /
+  `destroyClosingPhantom`; optional
+  `CompositorState.closingDriver`.
+- `packages/core/src/events/types.ts`: `WINDOW_EVENT.closing` +
+  `WindowClosingEvent` + cloneability assertion.
+- `packages/core/src/events/window-bus.ts`: map entry for
+  `window.closing`.
+- `packages/core/src/plugins/windows-broker.ts`:
+  `windows.destroy-phantom` route + payload validator + closing-
+  driver dependency for backstop cancel.
+- `packages/core/src/plugins/windows-sdk.ts`:
+  `PluginWindows.destroyPhantom(id)`.
+- `packages/core/src/main.ts`: closing driver construction +
+  hasPluginHandler wired to the runtime's namespace registry,
+  republish of `window.closing` from typed bus to plugin bus.
+- `test/harness.mjs`: `opts.closingAnimations` /
+  `opts.closingBackstopMs` / `opts.animations` flags +
+  bringup of the closing driver + animations broker.
+
+**Tests:**
+- GPU (`test/phantoms.gpu.mjs`, 2 tests): compositor-direct test
+  of `createClosingPhantom` / `destroyClosingPhantom` + draw
+  order (phantom appears at original rect with the captured
+  pixels; phantom draws above the content layer).
+- GPU (`test/closing-animation.gpu.mjs`, 3 tests):
+    * baseline -- no plugin, instant unmap, no phantom, no event.
+    * with-plugin -- fixture plugin runs a 400ms opacity fade on
+      the phantom; pixel readback observes intermediate alpha
+      values mid-animation; plugin calls destroyPhantom on
+      completion.
+    * backstop -- plugin runs the fade but never calls
+      destroyPhantom; the configurable backstop (500ms in the
+      test) fires and the compositor force-destroys the phantom.
+
+102/102 GPU tests pass (was 97 pre-Phase-9a; +2 phantoms.gpu.mjs +
+3 closing-animation.gpu.mjs). 674/674 unit tests pass (unchanged
+-- Phase 9a's logic is exercised end-to-end through GPU tests
+because the snapshot path requires the compositor; the closing
+driver itself is small enough that the GPU coverage is sufficient).
+
 ### Decoration provider (registration + insets + drawing + atomic gating)
 
 Server-side decorations end to end: a plugin registers an app_id pattern, is told
@@ -1999,9 +2144,12 @@ capabilities exist to grant).
   crossfade, slide-left/right/up/down, scale) with declarative
   atomic commit, snapshot + live scene inputs, in-thread + Worker
   transports (Phase 8a); animated `workspace.show` opt-in via the
-  `transition` arg (Phase 8b). Not built: cursor / closing /
-  velocity (Phase 9); output observation beyond a fabricated
-  `wl_output`; protocol SDK surface; interactive-region hit-testing;
+  `transition` arg (Phase 8b); `window.closing` event + phantom
+  snapshot + `sdk.windows.destroyPhantom` + 10s backstop, gated on
+  a registered `'window-closing'` namespace plugin (Phase 9a). Not
+  built: smoothed pointer velocity (Phase 9b); `sdk.cursor`
+  (Phase 9c); output observation beyond a fabricated `wl_output`;
+  protocol SDK surface; interactive-region hit-testing;
   `sdk.onFrame` (Phase 5+).
 - **Capability enforcement.** No capability gate on `sdk.gpu`/`sdk.window`/
   `sdk.decorations` (every plugin gets them); no native-import restriction (a
