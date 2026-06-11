@@ -26,10 +26,13 @@ a registered `'window-closing'` namespace plugin), and 9b+9c
 `wl_pointer.set_cursor` + `wp_cursor_shape_v1` end-to-end,
 `sdk.cursor` with declarative rule engine + kinematic state
 machine -- 9b's pointer-velocity payload was folded into rules)
-are landed (see `git log` and `status.md`). Phase 10 (buffer
-intercept) is the largest remaining phase. The text below
-describes each phase in its original forward-looking shape; ✅
-marks the completed ones inline.
+are landed (see `git log` and `status.md`). Phase 10 is split:
+10a (single intercept per matched toplevel, in-thread + Worker,
+outputRect, render-throw fallback) is landed; 10b (chains,
+per-stage caching, hold-last-output, A1 input optimization,
+popups + subsurfaces, capture/takeover integration) is deferred.
+The text below describes each phase in its original forward-
+looking shape; ✅ marks the completed ones inline.
 
 Deferred: 5.5b (3D LUT) -- skip until a real consumer wants it.
 Phase 5b's `sdk.compose.windows` for Worker plugins (the per-
@@ -748,7 +751,7 @@ frame 0), Worker `setImage` (in-thread only), HiDPI cursor scaling
 **What this validates**: phantom-window lifetime via the
 await-on-decision pattern; cursor customization end-to-end.
 
-## Phase 10 — Buffer intercept
+## Phase 10 — Buffer intercept (split into 10a ✅ + 10b deferred)
 
 The per-pixel intercept feature designed in `customization.md` §"Buffer
 interception" / §"Chains" (lines 177-310, 455-490). A plugin registers
@@ -768,7 +771,24 @@ buffer-import open point flagged in `customization.md:215` (whether
 core dual-imports or the plugin is the sole importer) as part of
 phase planning, not as a code afterthought.
 
-### 10a. Match registry + per-client activation
+Phase 10 is split into two phases:
+
+- **10a (landed)** — minimum viable intercept: per-client matching
+  (toplevels only), single intercept per surface, in-thread + Worker
+  transports, render every visible frame, output texture displaces
+  client buffer, optional outputRect for geometry control. Design
+  doc: `intercept-design.md`. ~1500 lines (vs. ~1150 estimated for
+  the full phase 10) -- the Worker cross-device transport landed in
+  10a per the request to ship Worker support from day one.
+
+- **10b (deferred)** — multi-stage chains, categorized ordering
+  (pixels -> geometry -> composition), per-stage caching, hold-
+  last-output fallback, A1 (re-export client dmabuf vs. A2 copy
+  ring), failed-stage skip-with-fallback, popups + subsurfaces of
+  matched clients, capture/takeover integration of the chain.
+  Design sketch at the end of `intercept-design.md`.
+
+### 10a. Match registry + per-client activation ✅ (toplevels only in 10a; popups + subsurfaces deferred to 10b)
 
 - `sdk.intercept.register({name, match, contributes, inputs,
   inputMargin, outputMargin, priority, setup})` — registration API per
@@ -780,7 +800,7 @@ phase planning, not as a code afterthought.
   runs once.
 - ~250 lines (broker + match engine + lifecycle wiring).
 
-### 10b. Chain orchestration + categorized ordering
+### 10b. Chain orchestration + categorized ordering (deferred)
 
 - Categories: `pixels` → `geometry` → `composition`. Registration
   order within a category, explicit `priority` overrides.
@@ -792,7 +812,7 @@ phase planning, not as a code afterthought.
   max of `inputMargin`/`outputMargin` across the chain.
 - ~300 lines.
 
-### 10c. Per-stage texture lifecycle + caching
+### 10c. Per-stage texture lifecycle + caching (deferred to 10b)
 
 - Textures allocated per intercepted client surface, lifetime tied to
   the match.
@@ -802,7 +822,7 @@ phase planning, not as a code afterthought.
   Phase 5 needs for live-mode invalidation — share the mechanism.
 - ~200 lines.
 
-### 10d. Cross-device dmabuf for external plugins
+### 10d. Cross-device dmabuf for external plugins ✅ (landed in 10a with A2 copy on input; A1 re-export deferred to 10b)
 
 - External plugins render on their own device against a `GPUTexture`.
   SDK imports the client's dmabuf onto the plugin's device.
@@ -816,7 +836,7 @@ phase planning, not as a code afterthought.
   match removed, plugin uninstalled). Per `customization.md:215-225`.
 - ~250 lines.
 
-### 10e. `outputRect` return + geometry-category integration
+### 10e. `outputRect` return + geometry-category integration ✅ (geometry-category and chain-membership semantics deferred to 10b; the per-frame outputRect itself works)
 
 - A `render` callback may return `{outputRect}`; core composites the
   plugin's output at that rect rather than the surface's natural
@@ -825,7 +845,7 @@ phase planning, not as a code afterthought.
 - Wires into the compositor's per-surface placement path.
 - ~100 lines.
 
-### 10f. Interaction with takeover + compose
+### 10f. Interaction with takeover + compose (deferred to 10b)
 
 - During output takeover, intercepts continue to run; their outputs
   feed core's normal compositing; the takeover plugin's `input.texture`

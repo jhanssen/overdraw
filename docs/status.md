@@ -4,7 +4,7 @@ Ground truth for what exists right now: current capabilities, known gaps, and
 what remains. The design lives in `architecture.md`; this file does not restate
 it. Present-tense only — no change history.
 
-Last updated: 2026-06-11 (post-Phase 9c — software cursor compositing slot, XCursor theme resolver, `wl_pointer.set_cursor`, `wp_cursor_shape_v1`, `sdk.cursor` with declarative rule engine + kinematic state machine; 9b folded into rules).
+Last updated: 2026-06-11 (post-Phase 10a — buffer intercept v1: match engine, in-thread + Worker transports via cross-device dmabuf rings, outputRect, render-throw fallback. 10b deferred: chains, per-stage caching, hold-last-output, A1 input optimization, popups + subsurfaces).
 
 ## Read first: gaps in advertised protocols (silent-gap risks)
 
@@ -2158,6 +2158,224 @@ pre-Phase-9c; +9 cursor compositing + 1 set_cursor + 1 cursor-shape
   either a cursor-specific render pass or extending the per-surface
   transform path to apply to the cursor slot.
 
+### Buffer intercept (Phase 10a)
+
+Per-pixel intercept v1. A plugin registers against a client (by
+`app_id` regex); for each matched toplevel, the plugin's `render`
+callback runs every visible frame and writes a new texture core
+composites instead of the client buffer. Use cases: blur, color
+grading via custom shaders, distortion, CRT effects -- anything that
+needs the client texture as input. Effects that fit core's "one
+sample per pixel modulated by uniforms" criterion (opacity, mask,
+tint, color matrix, transform, margin) belong in Phase 5.5's per-
+surface state path; intercept is for genuine shader passes.
+
+**10a scope (landed):** in-thread + Worker transports, single
+intercept per surface, render every visible frame, output texture
+replaces client buffer in the compositor's per-surface render pass,
+optional `outputRect` return for per-frame placement override,
+render-throw fallback to raw, consecutive-failure auto-unregister
+(in-thread only).
+
+**Deferred to 10b:** multi-stage chains with categorized ordering
+(`pixels` -> `geometry` -> `composition`), per-stage caching keyed
+on commit-since-last-render, hold-last-output on render failure
+(v1 falls back to raw), A1 input optimization (re-export client
+dmabuf vs. the A2 copy ring 10a uses), popups + subsurfaces of
+matched clients (10a covers toplevels only), capture/takeover
+integration of the chain. Design: `intercept-design.md`.
+
+**Architecture.** Four pieces in core:
+
+- **Match engine** (`packages/core/src/intercept/match-engine.ts`):
+  pure JS, tracks each mapped toplevel's `(surfaceId, appId, title)`;
+  on register / unregister / window.map / window.change(appId) /
+  window.unmap, computes first-match-wins assignments and emits
+  abstract matched/unmatched events the broker translates to plugin
+  callbacks. First-registered match wins for clients matching
+  multiple registrations.
+
+- **InThreadInterceptState**
+  (`packages/core/src/intercept/inthread-state.ts`): per-surface
+  state for bundled plugins sharing core's `GPUDevice`. Owns a 3-
+  slot output ring of core-device textures (`RENDER_ATTACHMENT |
+  TEXTURE_BINDING | COPY_SRC | COPY_DST`, reallocated on dimension
+  change). Each per-frame `tick(timeMs)` reads the surface's current
+  client texture, rotates the ring, calls the plugin's `render`,
+  installs the just-rendered slot as the surface's intercept output
+  view + optional outputRect. K consecutive render throws (default
+  30) trigger auto-unregister.
+
+- **WorkerInterceptState**
+  (`packages/core/src/intercept/worker-state.ts`): per-surface state
+  for Worker plugins on their own `GPUDevice`. Two cross-device
+  dmabuf rings:
+  - **Input ring** (core produces, plugin consumes): core encodes
+    `copyTextureToTexture(clientTex, ringSlot)` each tick (A2
+    "copy ring"; A1 "re-export the client's dmabuf" is the 10b
+    optimization). Producer Begin/End ride the core wire; consumer
+    Begin/End ride the plugin wire.
+  - **Output ring** (plugin produces, core consumes): plugin's
+    `render` writes to the output slot; producer Begin/End ride the
+    plugin wire; consumer Begin/End ride the core wire (FIFO behind
+    the compositor's sample). Same `SurfaceProducer` / `SurfaceConsumer`
+    abstractions the overlay + compose-live paths use.
+  - The worker's per-surface tick loop pulls on the input SAB
+    (`Atomics.waitAsync` on slot state), invokes `render`, presents
+    the output. Core polls the latest PRESENTED output slot each
+    frame and binds it as the surface's intercept output view via
+    `JsCompositor.installInterceptOutput`.
+
+- **Broker** (`packages/core/src/intercept/broker.ts`): listens on
+  the typed window-event bus, routes matched/unmatched events to
+  the right transport, runs setup + per-frame `tick`. The plugin-
+  facing route for Worker requests lives in
+  `packages/core/src/plugins/intercept-plugin-broker.ts`
+  (`intercept.register`, `intercept.unregister`,
+  `intercept.alloc-rings`).
+
+**Compositor integration**
+(`packages/core/src/gpu/compositor.ts`):
+
+- `Surface.interceptOutputView` field added. When set,
+  `rebuildBindGroup` substitutes this view for the surface's
+  sampled texture in the per-surface render pass.
+- `Surface.interceptPlacement` field added. When set, the per-
+  surface composite uses this rect instead of the surface's
+  `(x, y, layoutW, layoutH)` -- the `outputRect` return from
+  the plugin's render callback.
+- `installInterceptOutput(surfaceId, view, placement)` /
+  `clearInterceptOutput(surfaceId)` on the sink interface.
+- `copyClientToInterceptInputSlot(surfaceId, dstTex)`: encode +
+  submit a single `copyTextureToTexture` from the surface's
+  current client texture into a dmabuf the Worker plugin will
+  sample. Wraps in producer Begin/End on the core wire.
+- The shm client-texture path now creates surface textures with
+  `COPY_SRC` in addition to `TEXTURE_BINDING | COPY_DST` so the
+  Worker input-leg copy can use them as source.
+
+**`sdk.intercept`**
+(`packages/core/src/plugins/intercept-sdk.ts`,
+`@overdraw/intercept-types`):
+
+```ts
+interface InterceptAPI {
+  register(spec: InterceptSpec): Promise<{ unregister(): Promise<void> }>;
+}
+
+interface InterceptSpec {
+  name: string;
+  match: {
+    appId?: { source: string; flags: string };   // serialized RegExp
+    roles?: ReadonlyArray<"toplevel" | "popup" | "subsurface">;
+  };
+  contributes?: ReadonlyArray<"pixels" | "geometry" | "composition">;
+  setup(ctx: { device: GPUDevice }): Promise<InterceptHandlers> | InterceptHandlers;
+}
+
+interface InterceptHandlers {
+  onSurfaceMatched?(surface: InterceptSurfaceInfo): void;
+  onSurfaceUnmatched?(surface: InterceptSurfaceInfo): void;
+  render(args: {
+    input: { texture: GPUTexture; rect: Rect };
+    output: { texture: GPUTexture; rect: Rect };
+    ctx: { surfaceId: number; frameNumber: number; time: number };
+  }): { outputRect?: Rect } | void;
+  destroy?(): void;
+}
+```
+
+The plugin source is **identical** for in-thread and Worker. The
+SDK transparently routes to the right transport. `setup()` runs
+LOCALLY in both cases -- in-thread with core's `GPUDevice`, in a
+Worker with the worker's own device. The cross-device dmabuf ring
+plumbing is invisible to the plugin.
+
+**Worker-side runLoop**
+(`packages/core/src/plugins/intercept-sdk.ts` `WorkerPerSurfaceState`):
+synchronous per-surface event loop driven by `Atomics.waitAsync` on
+the input SAB. On each iteration: wait for a PRESENTED input slot
+-> consumer Begin on it -> acquire next FREE output slot (producer
+Begin) -> call `render` (plugin encodes + submits) -> producer End
+-> consumer End. Exits when the SDK's per-state `stop()` flips the
+`stopped` flag (driven by `onSurfaceUnmatched` notifications from
+core and by the plugin's `unregister` call).
+
+**Compositor displacement priority.** Within the on-screen
+composite pass, a surface's sampled texture is its
+`interceptOutputView` if non-null, else its client texture
+(`view`). The placement is `interceptPlacement` if non-null,
+else the surface's WM-assigned rect. The intercept broker
+sets/clears these per frame via the sink.
+
+**Verified**:
+- `test/intercept-match.test.js` (23 pure-unit): first-match-wins
+  registration order, app_id regex compile + match, predicate
+  AND-combination is N/A for intercept (no chained conditions),
+  re-evaluation on app_id change, unmap clears assignments,
+  remove-registration re-assigns freed surfaces.
+- `test/intercept-broker.test.js` (11 pure-unit): setup runs once,
+  bus-driven lifecycle, render-throw -> log + skip, K-failures ->
+  auto-unregister (in-thread), unregister fires onSurfaceUnmatched
+  + destroy, in-thread transport required for registerInThread,
+  invalid app_id regex rejects.
+- `test/intercept-inthread.gpu.mjs` (4): invert demo (real Wayland
+  client showing red, fixture plugin renders cyan via WGSL invert,
+  pixel readback confirms displacement); outputRect override (the
+  same plugin returns `{outputRect: {x:64,y:64,w:64,h:64}}` -->
+  cyan inside that rect, black outside, NO client buffer at the
+  WM rect); match scope (two clients, only matched is inverted);
+  unmatched fires when the client unmaps.
+- `test/intercept-worker.gpu.mjs` (1): same invert demo through
+  the Worker SDK + cross-device dmabuf chain. Core copies the
+  client texture into the input ring; the worker plugin samples
+  it + writes inverted cyan into the output ring; core composites
+  the output ring's latest slot. Pixel readback matches in-thread.
+
+746/746 unit tests pass (was 712 pre-10a; +23 match + 11 broker).
+123/123 GPU tests pass (was 117 pre-10a; +4 inthread + 1 worker +
+1 wrapping suite).
+
+**Caveats / known limitations (10a):**
+- **No chain**: only ONE intercept can apply per surface. First-
+  registered wins for clients matching multiple registrations.
+  Chains land in 10b.
+- **No per-stage cache**: render is called every visible frame even
+  if neither inputs nor effect state changed. Plugin caches its own
+  work if needed.
+- **No hold-last-output on failure**: render throw -> draw raw for
+  that frame (visible flicker). Hold-last-output is 10b.
+- **Worker input is A2 (copy)**: per-frame `copyTextureToTexture`
+  cost per intercepted surface on core device. A1 (direct dmabuf
+  re-export) is the 10b optimization. For typical 1080p surfaces
+  the copy is ~8MB/frame which is bounded but noticeable.
+- **`contributes` field recorded but unused**: 10b's chain dispatch
+  consumes it.
+- **HiDPI**: ring textures sized to the client buffer's pixel
+  dimensions. Scale factor is 1 today; awaits `wl_output`
+  reconfiguration.
+- **Decoration + cursor surfaces always excluded**: not user-
+  selectable in 10a or 10b.
+- **Popups + subsurfaces of matched clients draw raw**: 10a matches
+  toplevels only. 10b extends to all content surfaces via parent-
+  walking + a surfaceCreated/Destroyed event.
+- **`outputRect` interacts oddly with the WM**: the WM still owns
+  the surface's "logical" rect (for hit-testing + layout). The
+  compositor uses `outputRect` for placement, but input events
+  hit-test against the WM's rect. Plugins that animate `outputRect`
+  far from the WM rect will get hit-tests that don't match the
+  visual position.
+- **Worker test teardown flake**: `test/intercept-worker.gpu.mjs`
+  intermittently crashes in `addon.stop()`'s Dawn-wire-link
+  teardown (`Napi::CallbackScope` destructor throws when the wire
+  fires pending tracked events with "Instance no longer exists"
+  errors). The SUB-TEST passes deterministically; the crash is in
+  teardown, after assertions complete. The full `npm run test:gpu`
+  run passes 123/123 reliably; running this single file in isolation
+  flakes ~half the time. Pre-existing Dawn wire teardown limitation
+  exposed by the worker's tight per-frame loop; not specific to
+  intercept's logic.
+
 ### Decoration provider (registration + insets + drawing + atomic gating)
 
 Server-side decorations end to end: a plugin registers an app_id pattern, is told
@@ -2402,13 +2620,21 @@ capabilities exist to grant).
   idle), and a declarative rule engine -- plus the `wl_pointer.
   set_cursor` and `wp_cursor_shape_v1` client-cursor protocols
   routed into the same compositor slot (Phase 9c, with Phase 9b
-  folded in). Not built: animated cursor frames (static frame 0);
-  HiDPI cursor scaling (resolver takes scale arg but core only ever
-  passes 1); cross-device cursor textures from Worker plugins;
-  continuous cursor transforms (tilt/rotate/stretch); output
-  observation beyond a fabricated `wl_output`; protocol SDK
-  surface; interactive-region hit-testing; `sdk.onFrame` (Phase
-  5+).
+  folded in); `sdk.intercept` (per-client app_id match, in-thread
+  + Worker, per-surface render callback every visible frame,
+  output texture replaces client buffer in the compositor's
+  sampled-texture slot, optional `outputRect` for geometry
+  control) backed by a match engine + per-surface output ring
+  (in-thread = core-device textures; Worker = cross-device dmabuf
+  rings via A2 copy on the input leg + overlay-style brackets on
+  the output leg) (Phase 10a). Not built: animated cursor frames
+  (static frame 0); HiDPI cursor scaling (resolver takes scale
+  arg but core only ever passes 1); continuous cursor transforms
+  (tilt/rotate/stretch); intercept chains + per-stage caching +
+  hold-last-output + A1 input optimization + popups/subsurfaces
+  (10b); output observation beyond a fabricated `wl_output`;
+  protocol SDK surface; interactive-region hit-testing;
+  `sdk.onFrame` (Phase 5+).
 - **Capability enforcement.** No capability gate on `sdk.gpu`/`sdk.window`/
   `sdk.decorations` (every plugin gets them); no native-import restriction (a
   plugin's `import()` is unrestricted — deferred until there is an SDK native addon
