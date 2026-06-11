@@ -4,7 +4,7 @@ Ground truth for what exists right now: current capabilities, known gaps, and
 what remains. The design lives in `architecture.md`; this file does not restate
 it. Present-tense only — no change history.
 
-Last updated: 2026-06-11 (post-Phase 9a — `window.closing` + phantom + plugin closing animations; 9b/9c deferred).
+Last updated: 2026-06-11 (post-Phase 9c — software cursor compositing slot, XCursor theme resolver, `wl_pointer.set_cursor`, `wp_cursor_shape_v1`, `sdk.cursor` with declarative rule engine + kinematic state machine; 9b folded into rules).
 
 ## Read first: gaps in advertised protocols (silent-gap risks)
 
@@ -60,8 +60,9 @@ with no error. Worst-first.
   works for both in-thread and Worker plugins.
 
 - **Advertised-absent (clean fallback, not gaps):** xdg-decoration (→ CSD),
-  fractional-scale, cursor-shape, text-input, xdg-activation, toplevel-icon,
+  fractional-scale, text-input, xdg-activation, toplevel-icon,
   system-bell. Clients warn and fall back. See the protocol-coverage matrix.
+  (`wp_cursor_shape_v1` is now advertised; see the Cursor section.)
 
 ## Verification environment
 
@@ -333,10 +334,14 @@ key/modifiers to the focused client's resources with surface-local coordinates.
   `wl_client` to JS.
 
 Verified with `foot` and `kitty` (focus on map, type without a click). Not built:
-client cursor surfaces (`set_cursor` is a no-op; no software cursor), touch,
-multi-seat, key-repeat generation (repeat_info sent; client repeats), axis
+touch, multi-seat, key-repeat generation (repeat_info sent; client repeats), axis
 source/discrete refinement. kbFocus is not auto-moved when the focused window
 closes (re-resolves on next pointer event; guarded against destroyed surfaces).
+
+Client cursor surfaces are end-to-end wired in Phase 9c (see the "Cursor
+system" section below): `wl_pointer.set_cursor` + `wp_cursor_shape_v1` route
+the client's cursor selection through the compositor's software cursor slot,
+which draws above every layer at the pointer position.
 
 ## Protocols
 
@@ -1853,8 +1858,12 @@ on its own. Tests can override the timeout via
   but the phantom is the registered plugin's to animate. No
   per-plugin phantom (each closing produces ONE phantom that the
   registered plugin owns).
-- Phase 9b (smoothed pointer velocity in `wl_pointer` events) and
-  Phase 9c (`sdk.cursor` + custom cursor compositing) are deferred.
+- Phase 9b (originally: smoothed pointer velocity in a
+  `PointerEvent` payload pushed to plugins) was folded into Phase
+  9c's declarative rule engine. Plugins consume velocity / shake /
+  idle state via `sdk.cursor.defineRule({when: {speedRange / shake /
+  idle}})` rather than subscribing to per-event motion. Phase 9c is
+  landed -- see the "Cursor system" section below.
 
 **Files (new):**
 - `packages/core/src/protocols/closing-driver.ts`.
@@ -1908,6 +1917,246 @@ on its own. Tests can override the timeout via
 -- Phase 9a's logic is exercised end-to-end through GPU tests
 because the snapshot path requires the compositor; the closing
 driver itself is small enough that the GPU coverage is sufficient).
+
+### Cursor system (Phase 9c)
+
+Software cursor compositing end-to-end: XCursor theme resolver,
+`wl_pointer.set_cursor`, `wp_cursor_shape_v1`, `sdk.cursor` (set
+shape / set image / hide / show / set default / clear override /
+define rule), kinematic state machine (windowed velocity + KWin-
+style shake detector + idle timer), declarative rule engine. Phase
+9b (smoothed pointer velocity in a `PointerEvent` payload) is folded
+into the rule engine -- rules with `when: { speedRange / idle /
+shake }` consume the kinematic snapshot directly; no per-event
+push to plugins.
+
+Priority resolution (cursor-design.md):
+1. Plugin explicit override (`sdk.cursor.setShape/setImage/hide`)
+   or a matched plugin rule.
+2. Client cursor (`wl_pointer.set_cursor` or
+   `wp_cursor_shape_v1.set_shape`).
+3. `sdk.cursor.setDefault` shape (when present).
+4. Built-in default ('default' from the XCursor theme, with the
+   built-in 16x16 arrow fallback for environments missing a theme).
+
+- **Theme resolver**
+  (`packages/core/native/cursor/xcursor.{h,cpp}` +
+   `packages/core/src/cursor/theme-resolver.ts`): XDG-conventional
+  theme discovery (`XCURSOR_THEME` / `XCURSOR_SIZE` / `XCURSOR_PATH`
+  +
+  `$XDG_DATA_HOME/icons:$XDG_DATA_DIRS/icons:~/.icons:/usr/share/icons:/usr/share/pixmaps`).
+  Walks `[Icon Theme] Inherits=` chains with cycle guard + depth cap
+  16. Parses Xcursor binary files (`Xcur` magic + TOC of image
+  chunks). Picks the smallest nominal size ≥ requested, else the
+  largest available. v1 limitation: always picks subimage 0 (no
+  animation -- the `wait` spinner displays as frame 0 forever).
+  Pixels are returned as BGRA8 (matches the compositor's format
+  byte-for-byte on LE; XCursor's "ARGB pixels" are uint32-packed
+  ARGB, identical to BGRA8 in memory). Premultiplied alpha
+  (consistent with wlroots; matches the compositor's blend mode).
+  Built-in fallback arrow (16x16 BGRA, white body + black border)
+  for `'default'` only -- so tests don't depend on host themes.
+  Native binding `addon.resolveCursorShape(name, sizePx, scale)`;
+  JS `CursorThemeResolver` wraps it with an LRU cache (default
+  64 entries).
+
+- **Cursor compositing slot**
+  (`packages/core/src/gpu/compositor.ts`): a singleton surface drawn
+  above every other layer. `drawOrder()` appends the cursor target
+  surfaceId last whenever visible + textured.
+  - `setCursorPixels(bytes, w, h, hotX, hotY)`: uploads BGRA8 bytes
+    to a core-device texture via `queue.writeTexture` and installs
+    into the slot. Used by the theme resolver path + the bundled
+    boot default + plugin shape rules.
+  - `setCursorFromSurface(surfaceId, hotX, hotY)`: points the slot at
+    an existing surface whose own buffer pipeline drives its texture.
+    Used by `wl_pointer.set_cursor`: the client's cursor surface
+    commits its buffer through the standard shm/dmabuf path; the
+    slot just observes.
+  - `setCursorTexture(tex, w, h, hotX, hotY)`: install an already-on-
+    device GPUTexture directly (test fixtures + future plugin
+    setImage paths).
+  - `setCursorPosition(x, y)`: per pointer motion; the cursor draws
+    at `(pointerX - hotspotX, pointerY - hotspotY)`.
+  - `setCursorVisible(bool)` / `clearCursor()`.
+  - Internal cursor surface id `0x7FFFFFF0` (reserved, outside any
+    WM range; never in client-buffer lifecycle, never in any layer
+    or stack list).
+
+- **`wl_pointer.set_cursor`**
+  (`packages/core/src/protocols/wl_seat.ts`): the previously-silent
+  no-op now routes end-to-end. The seat tracks the most-recent
+  `pointer.enter` serial per pointer resource (recorded in
+  `sendEnter`; cleared in `sendLeave` + on resource release). On
+  `set_cursor(serial, surface, hx, hy)`: serial < latest-enter is
+  silently dropped (protocol convention). NULL `surface` records
+  "hidden" for the client (pointer over this client's surfaces
+  hides the cursor). Otherwise the surface is locked to role
+  `"cursor"` (other role-attach paths checking `s.role` must reject
+  it; the cross-role error post is TBD). Per-client cursor state
+  (`SeatCursorOps.setClientCursor`) is stored and applied when the
+  client gains pointer focus (`sendEnter` -> `applyClientCursor`).
+  Cursor surface commits trigger the seat's `onCursorSurfaceCommit`
+  hook from `wl_surface.commit`, which re-applies the slot so the
+  new texture is observed without waiting for a focus change.
+
+- **`wp_cursor_shape_v1`**
+  (`packages/core/src/protocols/cursor_shape.ts`): two-interface
+  protocol, manager + per-pointer device. `get_pointer(pointer)`
+  returns a device bound to that pointer; `set_shape(serial,
+  shape)` validates the serial against the bound pointer's
+  enter-serial and looks up the shape name via the theme resolver.
+  Shape enum maps to standard XCursor names (`pointer`, `text`,
+  `wait`, `*-resize`, ...). Out-of-range shape values are silently
+  dropped (the `invalid_shape` protocol error isn't wired). Unknown
+  shapes that the active theme doesn't ship (and aren't `default`)
+  resolve to null and leave the previous cursor in place. The
+  protocol's `get_tablet_tool_v2` is accepted but the resulting
+  device is inert (no tablet protocol advertised). One v1
+  limitation: shapes installed via set_shape are NOT cached against
+  the focus's client (the seat's `applyClientCursor` only handles
+  surface-or-hidden); clients must re-call `set_shape` on every
+  `pointer.enter`, which is what they already do for the
+  `wl_pointer.set_cursor` mechanism.
+
+  Generator + native wiring: the cursor-shape XML is in
+  `tools/gen-protocol`'s default inputs; the interface registry
+  tolerates unresolved cross-protocol object types (e.g. the
+  manager's `zwp_tablet_tool_v2` reference -- which we don't
+  implement -- now resolves to a null `types[]` slot rather than
+  refusing to build the registry). The C client test glue
+  references `zwp_tablet_tool_v2_interface`; we ship a tiny
+  link-time stub (`test/tablet-stub.c`) so test clients link
+  without pulling in the tablet protocol.
+
+- **Kinematic state machine**
+  (`packages/core/src/cursor/kinematics.ts`): windowed finite-
+  difference velocity (port of hypr-dynamic-cursors' ModeTilt /
+  ModeStretch math), KWin-style shake detector (trail / diagonal-of-
+  bounding-box ratio, with the 100-px diagonal jitter suppression),
+  idle timer driven by `beforeRender(timeMs)`. Refcounted lazy
+  enablement: the rule engine bumps a refcount per rule that uses
+  each capability; pointer-motion updates are no-ops while the
+  refcount is zero. Hardcoded 60Hz for the sample-count math (the
+  frame clock is fabricated; status.md "Read first"). When the
+  display-driven clock lands, the count math becomes correct
+  without code change.
+
+- **Rule engine**
+  (`packages/core/src/cursor/rule-engine.ts`): stores `CursorRuleSpec`
+  registrations in order. Per frame (driven by `state.beforeRender`
+  in main.ts): evaluates predicates against the kinematic snapshot;
+  first-match-wins; installs the matched rule's outcome (shape via
+  resolver + setCursorPixels, or texture via setCursorTexture)
+  through a `RuleInstaller` adapter. Explicit overrides
+  (`sdk.cursor.setShape/setImage/hide`) preempt rule installs --
+  the rule engine has a `setExplicitOverride(bool)` flag the broker
+  flips. `unregister` drops kinematic refcounts and re-evaluates.
+
+- **`sdk.cursor`** (`packages/core/src/plugins/cursor-sdk.ts`):
+  ```ts
+  interface CursorAPI {
+    setShape(name): Promise<void>;
+    setImage(texture): Promise<void>;
+    hide(): Promise<void>;
+    show(): Promise<void>;
+    clearOverride(): Promise<void>;
+    setDefault(shape | null): Promise<void>;
+    defineRule(spec): Promise<{ unregister(): Promise<void> }>;
+  }
+  ```
+  `setImage` and texture-outcome rules require in-thread bundled
+  plugin (cross-device cursor textures from Worker plugins throw
+  "not supported; in-thread only in v1"). All other methods work
+  for both transports. Plugin release auto-unregisters outstanding
+  rules. The shared type contract lives in `@overdraw/cursor-types`.
+
+- **Cursor broker** (`packages/core/src/plugins/cursor-broker.ts`):
+  routes `cursor.*` plugin-to-core requests. Owns the resolver,
+  rule engine, kinematic state, and the `RuleInstaller`. Per-plugin
+  rule tracking so a crashed plugin's rules get dropped (the broker
+  exposes `releasePluginRules(pluginName)` for the runtime to call
+  on plugin exit; the wiring is in cursor-broker.ts but the runtime
+  hook isn't yet called -- low-impact since the SDK's `release()`
+  unregisters them voluntarily on graceful shutdown).
+
+- **Boot default**: `main.ts` resolves `'default'` at boot and
+  installs it on the cursor slot, so something is visible even
+  before any client connects or any plugin loads.
+
+- **Bundled `@overdraw/plugin-cursor-actions`**: registers
+  `cursor.set-shape`, `cursor.hide`, `cursor.show`,
+  `cursor.clear-override`, `cursor.set-default`. Wraps the SDK.
+  Loads alongside `plugin-core-actions` so the actions are
+  available for hotkey bindings before the hotkey plugin loads.
+
+**Verified**:
+- `test/cursor-theme.test.js` (8): LRU semantics + native built-in
+  fallback (always succeeds for `default`) + miss returns null.
+- `test/cursor-kinematics.test.js` (13): enable/disable refcount;
+  windowed velocity in both axes; shake detector fires/doesn't fire
+  in expected scenarios; idle counter; reset.
+- `test/cursor-rule-engine.test.js` (17): spec validation; first-
+  match-wins; speedRange/idle/shake predicates; predicate AND;
+  explicit override preempts; unregister + re-evaluate;
+  refcount-per-capability; clear(); maxVelocityWindowMs.
+- `test/cursor.gpu.mjs` (9 sub-tests): cursor invisible by default;
+  setCursorVisible + position; hotspot offsets; draws above content
+  layer; clearCursor; resize reallocation; native default fallback
+  renders; cursorState introspection; setCursorFromSurface.
+- `test/cursor-set-cursor.gpu.mjs` (1): real Wayland client maps a
+  red toplevel + a green cursor surface, calls `set_cursor`; the
+  compositor shows green at the pointer position over the red
+  window.
+- `test/cursor-shape.gpu.mjs` (1): real Wayland client uses
+  `wp_cursor_shape_v1.set_shape(default)`; the resolver's fallback
+  arrow renders at the pointer position.
+- `test/cursor-sdk.gpu.mjs` (3): bundled fixture plugin uses
+  `sdk.cursor.setShape` + `sdk.cursor.hide` + `sdk.cursor.defineRule`
+  with `speedRange` predicate; readback verifies the cursor pixel
+  is visible/hidden as expected.
+
+712/712 unit tests pass (was 674 pre-Phase-9c; +13 kinematics + 17
+rule engine + 8 theme = +38). 117/117 GPU tests pass (was 102
+pre-Phase-9c; +9 cursor compositing + 1 set_cursor + 1 cursor-shape
++ 3 cursor SDK + 1 outer wrapper = +15).
+
+**Caveats / known limitations**:
+- **`wait` cursor is static**: animated XCursor frames not supported
+  (v1 picks subimage 0). Real themes' `wait` / `progress` /
+  `left_ptr_watch` display as a single frame.
+- **HiDPI cursor not scaled**: resolver takes a `scale` arg from
+  day one (so no retrofit), but only scale 1 is ever passed.
+  Awaits the `wl_output` reconfiguration pre-condition.
+- **`enlarge` rule outcome is no-op in v1**: the rule engine accepts
+  the field but doesn't apply a scale to the cursor texture. Would
+  need either pre-scaled uploads or a compositor scale uniform on
+  the cursor surface specifically. Punted until a real consumer
+  needs shake-to-find magnification.
+- **Subsurfaces on cursor surfaces ignored**: the protocol permits
+  them; we don't composite them. Warning is NOT logged (silent gap).
+- **Cross-device cursor textures from Worker plugins unsupported**:
+  `sdk.cursor.setImage` + texture-outcome rules throw with a clear
+  message from in-thread harness; Worker plugins can call
+  `setShape` + shape-outcome rules just fine (the resolver runs in
+  core).
+- **Cursor surface protocol-error post unwired**: a surface already
+  bound to a different role being passed to `set_cursor` should
+  raise a protocol error per spec; we drop silently
+  (`post_error`-wired errors don't exist in this compositor yet).
+- **`wp_cursor_shape_v1` shapes don't persist across pointer enter/
+  leave for the client**: clients re-issue `set_shape` on each
+  `pointer.enter`, the same convention they follow for
+  `wl_pointer.set_cursor`. The seat could cache shape selections
+  the same way it caches `set_cursor` surfaces, but the current
+  `applyClientCursor` path only handles surface-or-hidden.
+- **`enlarge` from continuous transforms** (tilt / rotate / stretch
+  from hypr-dynamic-cursors): not in v1. The kinematic primitives
+  expose enough state for a future plugin to port them, but the
+  rule engine's outcome vocabulary is shape-or-texture only; per-
+  frame rotation / tilt of the cursor texture itself would need
+  either a cursor-specific render pass or extending the per-surface
+  transform path to apply to the cursor slot.
 
 ### Decoration provider (registration + insets + drawing + atomic gating)
 
@@ -2146,11 +2395,20 @@ capabilities exist to grant).
   transports (Phase 8a); animated `workspace.show` opt-in via the
   `transition` arg (Phase 8b); `window.closing` event + phantom
   snapshot + `sdk.windows.destroyPhantom` + 10s backstop, gated on
-  a registered `'window-closing'` namespace plugin (Phase 9a). Not
-  built: smoothed pointer velocity (Phase 9b); `sdk.cursor`
-  (Phase 9c); output observation beyond a fabricated `wl_output`;
-  protocol SDK surface; interactive-region hit-testing;
-  `sdk.onFrame` (Phase 5+).
+  a registered `'window-closing'` namespace plugin (Phase 9a);
+  `sdk.cursor` (set shape / image / hide / show / set default /
+  clear override / define rule) backed by an XCursor theme
+  resolver, a kinematic state machine (windowed velocity + shake +
+  idle), and a declarative rule engine -- plus the `wl_pointer.
+  set_cursor` and `wp_cursor_shape_v1` client-cursor protocols
+  routed into the same compositor slot (Phase 9c, with Phase 9b
+  folded in). Not built: animated cursor frames (static frame 0);
+  HiDPI cursor scaling (resolver takes scale arg but core only ever
+  passes 1); cross-device cursor textures from Worker plugins;
+  continuous cursor transforms (tilt/rotate/stretch); output
+  observation beyond a fabricated `wl_output`; protocol SDK
+  surface; interactive-region hit-testing; `sdk.onFrame` (Phase
+  5+).
 - **Capability enforcement.** No capability gate on `sdk.gpu`/`sdk.window`/
   `sdk.decorations` (every plugin gets them); no native-import restriction (a
   plugin's `import()` is unrestricted — deferred until there is an SDK native addon

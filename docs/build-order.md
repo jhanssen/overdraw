@@ -16,9 +16,18 @@ snapshot + live halves of cross-device dmabuf compose for Worker
 plugins), 5.5a (tint + color matrix per-surface primitives),
 6 (bundled workspaces plugin + `sdk.windows.requestFocusDecision`),
 7a (input binding chain + chord + mode-stack + bundled hotkey
-plugin), and 7b (deferred-ref params + user-config actions +
-workspace by-name lookup) are landed (see `git log` and
-`status.md`). Phase 8 (transitions) is next. The text below
+plugin), 7b (deferred-ref params + user-config actions + workspace
+by-name lookup), 8 (built-in transitions: six kinds, declarative
+atomic commit, snapshot + live scenes, in-thread + Worker;
+animated `workspace.show`), 9a (window.closing event + phantom
+snapshot + `sdk.windows.destroyPhantom` + 10s backstop, gated on
+a registered `'window-closing'` namespace plugin), and 9b+9c
+(software cursor compositing slot, XCursor theme resolver,
+`wl_pointer.set_cursor` + `wp_cursor_shape_v1` end-to-end,
+`sdk.cursor` with declarative rule engine + kinematic state
+machine -- 9b's pointer-velocity payload was folded into rules)
+are landed (see `git log` and `status.md`). Phase 10 (buffer
+intercept) is the largest remaining phase. The text below
 describes each phase in its original forward-looking shape; ✅
 marks the completed ones inline.
 
@@ -664,12 +673,12 @@ real use guide the deferred-ref + user-action design:
 **Total**: ~1100 lines for 7b (vs. ~500 estimate; doc + test
 expansion drove the overshoot).
 
-## Phase 8 — Transitions primitive
+## Phase 8 — Transitions primitive ✅
 
 Built-in named transitions consuming scene snapshots. Closes the gap
 between scene compose and workspace-animation-without-takeover.
 
-### 8a. `sdk.transitions.run`
+### 8a. `sdk.transitions.run` ✅
 
 - Takes `from: SceneHandle`, `to: SceneHandle`, `kind` (crossfade /
   slide-N / scale), `duration`, `easing`.
@@ -677,9 +686,10 @@ between scene compose and workspace-animation-without-takeover.
 - Resolves the promise when the transition completes; releases the scenes.
 - ~300 lines + shader code.
 
-### 8b. Workspace plugin updated
+### 8b. Workspace plugin updated ✅
 
-- `show()` uses `transitions.run` instead of instant swap.
+- `show()` accepts an optional `transition: {kind, duration, easing?}`
+  arg; omitted = instant swap (Phase 6 behavior preserved).
 - ~50 lines change.
 
 **Total estimate**: ~350 lines.
@@ -688,9 +698,20 @@ between scene compose and workspace-animation-without-takeover.
 two scenes with distinct colors; crossfade midpoint has blended pixels.
 The API surface for `sdk.transitions.run` is `core-plugin-api.md` §8.
 
-## Phase 9 — Cursor + window-closing
+## Phase 9 — Cursor + window-closing ✅
 
-### 9a. `window.closing` event + last-buffer snapshot
+### 9a. `window.closing` event + last-buffer snapshot ✅
+
+Shipped form differs from the original sketch (kept here for reference):
+core composites a fresh phantom texture at unmap, fires `window.closing`
+on the bus, and lets a registered `'window-closing'` plugin animate the
+phantom and call `sdk.windows.destroyPhantom`. The bus emit is NOT
+awaited (the original "await subscribers with 500ms timeout" model);
+instead the phantom survives as a core-owned surface decoupled from the
+client lifetime, with a 10s backstop that force-destroys it if the
+plugin never does. `window.unmap` fires immediately after
+`window.closing`, in the same call site, so the client teardown is not
+delayed by the animation.
 
 - Snapshot the last buffer at unmap.
 - Await closing subscribers with 500ms timeout.
@@ -698,18 +719,29 @@ The API surface for `sdk.transitions.run` is `core-plugin-api.md` §8.
   timed out.
 - ~200 lines.
 
-### 9b. Velocity in pointer events
+### 9b + 9c. Cursor system ✅
 
-- Smoothed velocity computation in core (EMA over last ~50ms).
-- Include in `PointerEvent` payload.
-- ~50 lines.
+Original sketch was ~200 lines total (smoothed velocity in `PointerEvent`
+payload + `sdk.cursor.setShape/setImage/hide/show`). Replaced by the
+fuller design in `cursor-design.md`, which landed. Highlights:
 
-### 9c. `sdk.cursor` primitive
+- **Software cursor compositing primitive** (no cursor of any kind
+  exists today; `wl_pointer.set_cursor` is a silent no-op).
+- **XCursor theme resolver** — discovery + file parsing + LRU cache.
+- **`wl_pointer.set_cursor`** + **`wp_cursor_shape_v1`** (advertised),
+  both backed by the resolver.
+- **Kinematic state machine** (windowed velocity ring buffer + shake
+  detector + idle timer), lazily enabled by consumer presence.
+- **Declarative rule system**: `sdk.cursor.defineRule({when:
+  {speedRange|idle|shake}, shape|texture, enlarge?})`. Per-frame
+  evaluation; plugin doesn't subscribe to pointer events.
+- Priority resolution: plugin override > client cursor > setDefault >
+  built-in default.
 
-- `setShape` (XCursor theme), `setImage(texture, hotspot)`, `hide`,
-  `show`.
-- Compositing of the cursor as a special overlay.
-- ~150 lines.
+Estimated ~800 lines. Deferred from v1: animated XCursor frames (static
+frame 0), Worker `setImage` (in-thread only), HiDPI cursor scaling
+(awaits `wl_output` reconfig), continuous transforms
+(tilt/rotate/stretch as in hypr-dynamic-cursors — future phase).
 
 **Total estimate**: ~400 lines.
 
