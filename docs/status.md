@@ -4,7 +4,7 @@ Ground truth for what exists right now: current capabilities, known gaps, and
 what remains. The design lives in `architecture.md`; this file does not restate
 it. Present-tense only — no change history.
 
-Last updated: 2026-06-09 (post-Phase 7b — deferred refs + user-config actions + workspace by-name lookup).
+Last updated: 2026-06-10 (post-Phase 8 — `sdk.transitions` + animated workspace.show).
 
 ## Read first: gaps in advertised protocols (silent-gap risks)
 
@@ -1172,8 +1172,11 @@ window is on.
   passing anything else routes through the registry but only output 0
   is meaningful until `wl_output` reconfiguration lands ("Read first"
   silent-gap list).
-- No animated transitions (Phase 6 spec: instant only; transitions
-  are Phase 8).
+- Animated transitions (Phase 8) land via the optional
+  `transition: {kind, duration, easing?}` arg on `workspace.show`
+  (action + namespace API). When omitted, the swap is instant
+  (the original Phase 6 behavior). See "Built-in transitions
+  (Phase 8)" below.
 - One-frame flash on map into a hidden workspace: a window enters the
   WM's layout at `xdg_surface.get_toplevel` (before the plugin sees
   `window.map`), so its tile can be configured + render in the brief
@@ -1585,6 +1588,182 @@ GPU tests on the target set still pass.
   prevent two workspaces from sharing a name. Documented in the
   registry.
 
+### Built-in transitions (Phase 8)
+
+`sdk.transitions.run(opts)` blends two `SceneHandle`s on screen via
+a kind-specific shader (core-plugin-api.md §8). Closed set of six
+built-in kinds: `crossfade`, `slide-left` / `slide-right` /
+`slide-up` / `slide-down`, `scale`. Each kind is one branch of a
+single WGSL fragment shader that samples both inputs and writes the
+final premultiplied pixel directly to the on-screen target
+(replacing the normal per-surface composite while a transition is
+active). All four scene-input combinations are supported:
+
+| Scene mode  | In-thread plugin              | Worker plugin                                     |
+|-------------|-------------------------------|---------------------------------------------------|
+| `snapshot`  | core-owned texture, direct    | STM-backed dmabuf; once-per-pin producer Begin/End on the core wire (`acquireForSampling`) covers the consumer's reads |
+| `live`      | stable core-device texture    | ring-backed; per-frame producer Begin/End on the latest PRESENTED slot's `surfaceBufId`, written by the compositor wrapping the transition pass encode |
+
+**Architecture.** Three pieces:
+
+- **Transition evaluator** (`packages/core/src/transitions/evaluator.ts`):
+  pure time-machine. One active transition at a time; `install({
+  durationMs, easing?, commit? })` returns a `Promise<void>`;
+  `tick(timeMs)` advances; at `t >= 1` the commit callback fires
+  synchronously THEN the Promise resolves. Decoupled from the
+  compositor (no GPU state) and from the broker (no SDK plumbing) --
+  just the lifecycle.
+
+- **Transitions broker** (`packages/core/src/plugins/transitions-broker.ts`):
+  routes `transitions.run` requests from the runtime. Resolves
+  `fromSceneId` / `toSceneId` via the `SceneRegistry` to core-side
+  GPUTextures + (for ring-backed scenes) per-frame bracket
+  callbacks. Pins both scenes for the transition's lifetime so a
+  buggy plugin's `SceneHandle.release()` during the transition
+  defers the underlying resource teardown instead of yanking. On
+  completion, applies the declarative commit (today: a list of
+  `setOutputStack` ops) synchronously against the compositor BEFORE
+  the next renderFrame -- so the post-transition state is visible
+  on the very next frame with no glitch.
+
+- **Compositor pipeline** (`packages/core/src/gpu/compositor.ts`):
+  a separate `transitionPipeline` (no blend; the shader writes the
+  final premultiplied pixel). `setActiveTransition({fromTex, toTex,
+  kind, getProgress, resolveTextures?})` installs;
+  `clearActiveTransition()` tears down; renderFrame branches on
+  `activeTransition` and routes to `encodeTransitionPass` instead of
+  the normal per-surface composite. Live composers + live producers
+  continue to run while a transition is active so live-scene inputs
+  keep tracking; the transition pass samples whatever the ring
+  currently has presented.
+
+**SceneRegistry** (`packages/core/src/plugins/scene-registry.ts`):
+the new substrate that lets any SceneHandle (in-thread or Worker)
+be referenced by integer id across the SDK boundary. Mints
+monotonic, never-reused ids; producer registers with a teardown
+closure + optional `acquireForSampling` (per-pin bracket
+management); consumer pins/unpins. Pins defer the teardown until
+the last release; an entry in the teardown-pending state refuses
+new pins. Designed for reuse -- the future intercept / overview /
+recording paths will plug into the same shape.
+
+**Declarative commit.** `TransitionRunOpts.commit` is data, not a
+function -- structured-clone-safe so the same shape works
+unchanged for in-thread and Worker plugins (an earlier landing
+shipped a function-commit + side-table token for in-thread + loud
+rejection for Worker; collapsed to one shape in a refactor).
+Today's vocabulary is one field: `setOutputStack`. New atomic-
+commit operations are added by extending `TransitionCommit` +
+broker's `applyCommit` interpreter; the SDK boundary doesn't
+change.
+
+**Conflict policy.** Reject overlapping transitions on the same
+output. The evaluator's `install` throws synchronously; the broker
+rolls back the compositor's `setActiveTransition` + scene pins
+before propagating to the caller.
+
+**Pre-conditions / limitations.**
+- Single-output (`outputId === 0` only) -- the broker validates
+  loudly. Multi-output transitions wait for `wl_output`
+  reconfiguration ("Read first" silent-gap list).
+- No `AbortSignal` / cancellation in v1. A plugin can choose
+  not to await `run()` -- but the transition still runs to
+  completion on the compositor's clock.
+- Closed set of kinds. Anything beyond crossfade / 4 slides / scale
+  uses `sdk.output.takeover` (per-plugin per-frame render) when
+  that primitive lands.
+- Easing: same `EasingSpec` types as the animation evaluator
+  (linear / preset / cubic-bezier); `resolveEasing` is shared.
+  Default linear.
+
+**Workspace integration (Phase 8b).** `workspace.show` (action +
+namespace API) accepts an optional `transition: {kind, duration,
+easing?}` arg. The plugin: captures FROM scene snapshot of the
+currently-shown stack; mutates registry to produce sideEffects +
+the TO stack; applies non-stack-non-focus sideEffects normally;
+captures TO scene snapshot; runs the transition with `commit: {
+setOutputStack: [{outputId, ids: TO}] }`; releases both scenes;
+fires the deferred `requestFocusDecision` so focus re-decides
+under the post-transition stack. When omitted, the swap is
+instant (Phase 6 behavior preserved). The transition path
+throws loudly if `sdk.compose` or `sdk.transitions` is absent
+(older harnesses, builds without GPU).
+
+**Files (new):**
+- `packages/transition-types/` (npm name `@overdraw/transition-types`):
+  TransitionKind (the 6-kind union), TransitionSpec, plus the
+  `TRANSITION_KINDS` runtime-checkable array. Type-only.
+- `packages/core/src/transitions/evaluator.ts`.
+- `packages/core/src/plugins/scene-registry.ts`.
+- `packages/core/src/plugins/transitions-broker.ts`.
+- `packages/core/src/plugins/transitions-sdk.ts`.
+- `packages/plugin-workspace-default/src/index.ts`
+  (`showWithTransition`).
+- `packages/workspace-types/src/index.ts`
+  (`WorkspaceTransitionSpec`, optional 3rd arg to `WorkspaceAPI.show`).
+
+**Files (modified):**
+- `packages/core/src/gpu/compositor.ts`: WGSL `TRANSITION_WGSL`,
+  `transitionPipeline`, `setActiveTransition` /
+  `clearActiveTransition`, `encodeTransitionPass`, renderFrame
+  routing + per-frame `pendingEndRead` for live brackets.
+- `packages/core/src/plugins/gpu-broker.ts`: every Worker compose
+  (snapshot + live) registers in the SceneRegistry. Snapshot's
+  `acquireForSampling` re-opens producer Begin/End on the 0->1 pin
+  edge. Live's `resolveTexture` returns
+  `{texture, beginRead, endRead}` per-slot.
+- `packages/core/src/plugins/compose-sdk.ts`: SceneHandle gains
+  `id`; both in-thread variants and Worker variants register on
+  construction; `release()` calls `sceneRegistry.unregister(id)`.
+- `packages/core/src/plugins/loader.ts`: single `createTransitions`
+  for both transports; `inThreadGpu.sceneRegistry` plumbed through.
+- `packages/core/src/plugins/sdk.ts`: `sdk.transitions?: PluginTransitions`.
+- `packages/core/src/protocols/ctx.ts`: `CompositorSink` gains
+  optional `setActiveTransition` / `clearActiveTransition`.
+- `packages/core/src/main.ts`: scene registry, transition evaluator,
+  transitions broker; evaluator ticks via `state.beforeRender`
+  alongside the animation evaluator; runtime onRequest routes
+  `transitions.*`.
+- `test/harness.mjs`: `opts.transitions = true` brings up the
+  registry + evaluator + broker + the `inThreadGpu` bundle so
+  bundled plugins get `sdk.compose` + `sdk.transitions`.
+
+**Tests:**
+- Pure-unit (`test/transitions-evaluator.test.js`, 18 tests):
+  install / tick / completion / commit-before-resolve / commit
+  sees idle / commit-installing-follow-up / commit throw recovery
+  / easing / clock-backwards clamp / re-install after completion.
+- GPU (`test/transitions-compositor.gpu.mjs`, 11 tests): each of
+  the six kinds verified at midpoint with the expected pixel
+  layout; `resolveTextures` identity-change path; null-resolver
+  opaque-black fallback; double-install rejection;
+  `hasActiveTransition` lifecycle; on-screen pass replacement
+  invariant.
+- GPU (`test/inthread-transitions.gpu.mjs`, 1 test): bundled
+  in-thread plugin runs sdk.transitions.run end-to-end; pixel
+  readback at p=0 / 0.5 / past-end through the SDK + broker
+  chain.
+- GPU (`test/worker-transitions.gpu.mjs`, 1 test): Worker plugin
+  with snapshot scenes; verifies install state, completion,
+  scene release, NO Dawn `SharedTextureMemory` validation errors
+  (per-pin producer Begin/End is correct).
+- GPU (`test/worker-transitions-live.gpu.mjs`, 1 test): Worker
+  plugin with LIVE scenes; same Dawn-clean-stderr check across
+  the per-frame slot rotation.
+- GPU (`test/plugin-workspace-default/workspace-transition.gpu.mjs`,
+  2 tests): full workspace.show + transition path with two real
+  Wayland clients; verifies in-flight transition pixels are
+  neither FROM nor TO pure state (the master-tile center passes
+  through intermediate blue values as crossfade progresses) AND
+  the post-transition state is visible on the very next frame
+  (master=blue, stack=black, workspace.current=2). Plus a
+  regression test that the no-transition path still works.
+
+97/97 GPU tests pass (the standard `npm run test:gpu` glob was
+fixed in this phase from `test/*.gpu.mjs` to `test/**/*.gpu.mjs`
+so prior `test/plugin-*/*.gpu.mjs` files now also run). 674/674
+unit tests pass.
+
 ### Decoration provider (registration + insets + drawing + atomic gating)
 
 Server-side decorations end to end: a plugin registers an app_id pattern, is told
@@ -1700,7 +1879,7 @@ title + app_id + role + mapped), back-to-front stack order, pointer/keyboard foc
 ids. The analog of `hyprctl /activewindow`; attached as `state.query()`. The seam an
 integration harness asserts against without pixels.
 
-### Integration / GPU (`npm run test:gpu` → `node --test 'test/*.gpu.mjs'`)
+### Integration / GPU (`npm run test:gpu` → `node --test 'test/**/*.gpu.mjs'`)
 
 Require GPU + host Wayland (auto-skip when `WAYLAND_DISPLAY` unset), run with
 `--test-concurrency=1`. `test/harness.mjs` brings up GPU process + present
@@ -1816,10 +1995,14 @@ capabilities exist to grant).
   + core-actions plugins (Phase 7a); deferred-ref resolution
   (`ref.surfaceUnderPointer` etc.) in action params + `config.actions`
   + bundled `plugin-config-actions` + workspace by-name lookup
-  (Phase 7b). Not built: `sdk.transitions` (Phase 8); cursor /
-  closing / velocity (Phase 9); output observation beyond a
-  fabricated `wl_output`; protocol SDK surface; interactive-region
-  hit-testing; `sdk.onFrame` (Phase 5+).
+  (Phase 7b); built-in transitions `sdk.transitions.run` (six kinds:
+  crossfade, slide-left/right/up/down, scale) with declarative
+  atomic commit, snapshot + live scene inputs, in-thread + Worker
+  transports (Phase 8a); animated `workspace.show` opt-in via the
+  `transition` arg (Phase 8b). Not built: cursor / closing /
+  velocity (Phase 9); output observation beyond a fabricated
+  `wl_output`; protocol SDK surface; interactive-region hit-testing;
+  `sdk.onFrame` (Phase 5+).
 - **Capability enforcement.** No capability gate on `sdk.gpu`/`sdk.window`/
   `sdk.decorations` (every plugin gets them); no native-import restriction (a
   plugin's `import()` is unrestricted — deferred until there is an SDK native addon
