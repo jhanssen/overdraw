@@ -162,14 +162,16 @@ export async function setupCompositor(opts = {}) {
   const sock = addon.startServer();
 
   let jsCompositor = null;
+  let coreDevice = null;
+  let dawn = null;
   if (opts.jsCompositor !== false) {
-    const dawn = loadDawn();
+    dawn = loadDawn();
     if (!dawn) throw new Error("jsCompositor requested but dawn.node not found");
     const h = addon.gpuHandles();
-    const device = dawn.wrapDevice(h.instance, h.device);
+    coreDevice = dawn.wrapDevice(h.instance, h.device);
     const { JsCompositor } = await import("../packages/core/dist/gpu/compositor.js");
     const nested = !headless;
-    jsCompositor = new JsCompositor(device, dawn.globals, addon,
+    jsCompositor = new JsCompositor(coreDevice, dawn.globals, addon,
       { width: dims.width, height: dims.height }, dawn, h.device,
       { nested, format: addon.outputFormat() });
   }
@@ -351,6 +353,7 @@ export async function setupCompositor(opts = {}) {
   return {
     addon, state, sock, dims, query: () => state.query(),
     spawnClient, waitFor, frameReadback, teardown, jsCompositor,
+    coreDevice, dawn,
     runtime, pluginBus,
   };
 }

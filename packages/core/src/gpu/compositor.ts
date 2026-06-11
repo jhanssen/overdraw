@@ -144,9 +144,155 @@ struct Uniforms {
 }
 `;
 
+// Transition pipeline shader (core-plugin-api.md §8). Renders a single
+// full-screen quad blending two input textures (`from` / `to`) via a
+// kind-uniform branch. Output replaces the on-screen target (no blend);
+// the input textures carry premultiplied alpha, and each kind's logic
+// preserves premultiplication so the direct write is correct.
+//
+// kind encoding (in TUniforms.kind):
+//   0 = crossfade
+//   1 = slide-left  (FROM slides off left;  TO enters from right)
+//   2 = slide-right (FROM slides off right; TO enters from left)
+//   3 = slide-up    (FROM slides off top;   TO enters from bottom)
+//   4 = slide-down  (FROM slides off bottom; TO enters from top)
+//   5 = scale       (FROM scales down + fades; TO scales up from center)
+//
+// progress is the eased value in [0, 1] the transition evaluator
+// computes once per frame. The fragment shader treats progress as
+// authoritative -- no per-pixel time math.
+const TRANSITION_WGSL = `
+struct VsOut {
+  @builtin(position) pos : vec4f,
+  @location(0) uv : vec2f,
+};
+struct TUniforms {
+  kind     : u32,
+  progress : f32,
+  _pad0    : f32,
+  _pad1    : f32,
+};
+@group(0) @binding(0) var samp : sampler;
+@group(0) @binding(1) var texFrom : texture_2d<f32>;
+@group(0) @binding(2) var texTo : texture_2d<f32>;
+@group(0) @binding(3) var<uniform> u : TUniforms;
+
+@vertex fn vs(@builtin(vertex_index) i : u32) -> VsOut {
+  // Full-screen quad in NDC; triangle-strip order matches the surface
+  // pipeline. uv runs (0,0) top-left to (1,1) bottom-right.
+  var pos = array<vec2f, 4>(
+    vec2f(-1.0,  1.0),
+    vec2f( 1.0,  1.0),
+    vec2f(-1.0, -1.0),
+    vec2f( 1.0, -1.0),
+  );
+  var uv = array<vec2f, 4>(
+    vec2f(0.0, 0.0),
+    vec2f(1.0, 0.0),
+    vec2f(0.0, 1.0),
+    vec2f(1.0, 1.0),
+  );
+  var o : VsOut;
+  o.pos = vec4f(pos[i], 0.0, 1.0);
+  o.uv = uv[i];
+  return o;
+}
+
+// Sample a 2D texture at uv; if uv is outside [0,1] in either axis,
+// return (0,0,0,0) so out-of-range samples (e.g. the slide's offscreen
+// half, or scale's outside-the-shrinking-rect) contribute nothing.
+fn sampleClamped(t : texture_2d<f32>, uv : vec2f) -> vec4f {
+  let inside = step(0.0, uv.x) * step(uv.x, 1.0)
+             * step(0.0, uv.y) * step(uv.y, 1.0);
+  let s = textureSampleLevel(t, samp, clamp(uv, vec2f(0.0), vec2f(1.0)), 0.0);
+  return s * inside;
+}
+
+@fragment fn fs(in : VsOut) -> @location(0) vec4f {
+  let p = u.progress;
+  let uv = in.uv;
+
+  // Crossfade: linear blend of the two premultiplied samples.
+  // Result remains premultiplied: (1-p)*A + p*B, where A and B are
+  // both already premultiplied.
+  if (u.kind == 0u) {
+    let a = textureSampleLevel(texFrom, samp, uv, 0.0);
+    let b = textureSampleLevel(texTo,   samp, uv, 0.0);
+    return mix(a, b, p);
+  }
+
+  // Slide variants: FROM and TO are shifted by p (or -p) along one
+  // axis. Each pixel reads exactly one of the two scenes via the
+  // sampleClamped helper (the other returns 0 due to out-of-range uv).
+  if (u.kind == 1u) {
+    // slide-left: FROM shifts left by p; TO comes in from the right.
+    let fromUV = vec2f(uv.x + p,         uv.y);
+    let toUV   = vec2f(uv.x - (1.0 - p), uv.y);
+    return sampleClamped(texFrom, fromUV) + sampleClamped(texTo, toUV);
+  }
+  if (u.kind == 2u) {
+    // slide-right: FROM shifts right by p; TO comes in from the left.
+    let fromUV = vec2f(uv.x - p,         uv.y);
+    let toUV   = vec2f(uv.x + (1.0 - p), uv.y);
+    return sampleClamped(texFrom, fromUV) + sampleClamped(texTo, toUV);
+  }
+  if (u.kind == 3u) {
+    // slide-up: FROM shifts up by p; TO comes in from the bottom.
+    let fromUV = vec2f(uv.x, uv.y + p);
+    let toUV   = vec2f(uv.x, uv.y - (1.0 - p));
+    return sampleClamped(texFrom, fromUV) + sampleClamped(texTo, toUV);
+  }
+  if (u.kind == 4u) {
+    // slide-down: FROM shifts down by p; TO comes in from the top.
+    let fromUV = vec2f(uv.x, uv.y - p);
+    let toUV   = vec2f(uv.x, uv.y + (1.0 - p));
+    return sampleClamped(texFrom, fromUV) + sampleClamped(texTo, toUV);
+  }
+  if (u.kind == 5u) {
+    // scale: FROM shrinks to center while fading (factor 1-p);
+    // TO grows from center while fading in (factor p). Each is
+    // sampled in its own center-anchored coordinate frame; the
+    // alpha-fade multiplier preserves premultiplication.
+    //
+    // Guard against division by 0 at the endpoints by skipping the
+    // sample when the scale factor is below a small epsilon -- the
+    // corresponding alpha multiplier is 0 there anyway.
+    let eps = 1.0 / 1024.0;
+    let sFrom = 1.0 - p;
+    let sTo   = p;
+    var a = vec4f(0.0);
+    var b = vec4f(0.0);
+    if (sFrom > eps) {
+      let fromUV = (uv - vec2f(0.5)) / sFrom + vec2f(0.5);
+      a = sampleClamped(texFrom, fromUV) * sFrom;
+    }
+    if (sTo > eps) {
+      let toUV = (uv - vec2f(0.5)) / sTo + vec2f(0.5);
+      b = sampleClamped(texTo, toUV) * sTo;
+    }
+    return a + b;
+  }
+  // Unknown kind (broker is supposed to reject these before install).
+  // Fail visibly: bright magenta so a test catches it.
+  return vec4f(1.0, 0.0, 1.0, 1.0);
+}
+`;
+
 import type { CompositorSink, Layer } from "../protocols/ctx.js";
 import { LAYER_ORDER, OUTPUT_DEFAULT } from "../protocols/ctx.js";
+import type { TransitionKind } from "@overdraw/transition-types";
 import type { WaylandFd } from "../types.js";
+
+// Map a TransitionKind name to its WGSL u32 encoding (must match the
+// kind switch in TRANSITION_WGSL.fs above).
+const TRANSITION_KIND_CODE: Record<TransitionKind, number> = {
+  "crossfade":   0,
+  "slide-left":  1,
+  "slide-right": 2,
+  "slide-up":    3,
+  "slide-down":  4,
+  "scale":       5,
+};
 import {
   ClientBufferLifecycle,
   type LifecycleIntent,
@@ -382,6 +528,32 @@ export interface LiveSceneHandle {
   release(): void;
 }
 
+// Active-transition state held by the compositor while a transition is
+// running. setActiveTransition installs; clearActiveTransition (or the
+// install-er calling clear themselves on completion) tears down. The
+// compositor itself does not manage transition timing -- it reads
+// progress from getProgress each frame and the broker / evaluator
+// decide when to clear.
+//
+// resolveTextures is optional: when set, it's called each frame to
+// re-pick which textures to sample (the Worker-live case, where the
+// presented slot rotates). When unset, the install-time fromTex/toTex
+// are used every frame (the stable case: in-thread snapshot/live,
+// Worker snapshot).
+interface ActiveTransition {
+  fromTex: GPUTexture;
+  toTex: GPUTexture;
+  kind: TransitionKind;
+  getProgress: () => number;
+  resolveTextures?: () => { fromTex: GPUTexture; toTex: GPUTexture } | null;
+  // Per-frame bind group cache. Invalidated when textures change
+  // (resolveTextures returns different handles). Keyed on (fromTex,
+  // toTex) identity.
+  cachedFromTex: GPUTexture | null;
+  cachedToTex: GPUTexture | null;
+  cachedBindGroup: GPUBindGroup | null;
+}
+
 export interface LiveWindowCompHandle {
   windows: ReadonlyArray<{
     id: number;
@@ -458,6 +630,19 @@ export class JsCompositor implements CompositorSink {
   // composite (and the existing liveScenes/liveWindowComps passes), so the
   // producer's compose pass shares the frame's encoder + submit.
   private liveProducers: Array<() => void> = [];
+
+  // Phase 8: active transition (core-plugin-api.md §8). When non-null,
+  // renderFrame replaces the on-screen surface-list composite with a
+  // single transition pass blending two textures via a kind-specific
+  // shader. Live composers (above) + live producers continue to run --
+  // their content keeps tracking, so a transition over live scenes
+  // sees in-flight client buffer commits. Only one transition per
+  // compositor at a time (single output today; multi-output is a
+  // future per-output map).
+  private transitionPipeline: GPURenderPipeline | null = null;
+  private transitionLayout: GPUBindGroupLayout | null = null;
+  private transitionUniformBuf: GPUBuffer | null = null;
+  private activeTransition: ActiveTransition | null = null;
 
   // dmabuf buffer-release lifecycle. The pure state machine (no GPU, no Dawn)
   // is the source of truth; the executor here translates events <-> intents.
@@ -547,6 +732,33 @@ export class JsCompositor implements CompositorSink {
       },
     });
     this.layout = this.pipeline.getBindGroupLayout(0);
+
+    // Phase 8: transition pipeline. A separate pipeline because the
+    // bind-group shape and the shader (full-screen quad, two input
+    // textures) differ from the per-surface composite pass. Built
+    // eagerly so the per-frame fast path in renderFrame can encode
+    // without any allocation when a transition is active.
+    const transitionModule = device.createShaderModule({ code: TRANSITION_WGSL });
+    this.transitionPipeline = device.createRenderPipeline({
+      layout: "auto",
+      vertex: { module: transitionModule, entryPoint: "vs" },
+      primitive: { topology: "triangle-strip" },
+      fragment: {
+        module: transitionModule,
+        entryPoint: "fs",
+        // No blend: the transition pass overwrites the on-screen
+        // target. The shader outputs the final premultiplied pixel
+        // (kind-specific blend is done in WGSL, not by fixed-function).
+        targets: [{ format: this.format }],
+      },
+    });
+    this.transitionLayout = this.transitionPipeline.getBindGroupLayout(0);
+    // Uniform buffer: kind (u32) + progress (f32) + 8 bytes of padding
+    // to 16-byte alignment. Reused every frame.
+    this.transitionUniformBuf = device.createBuffer({
+      size: 16,
+      usage: this.g.GPUBufferUsage.UNIFORM | this.g.GPUBufferUsage.COPY_DST,
+    });
 
     // Headless: an owned offscreen target (read back via readback()). Nested: the
     // target is the swapchain's current texture, acquired per frame.
@@ -1224,18 +1436,33 @@ export class JsCompositor implements CompositorSink {
       // the catch below. Without that, the lifecycle's frameStart was
       // dispatched but never paired with frameAborted, and every subsequent
       // renderFrame throws "frame already in flight" forever.
-      this.openImportBrackets(draw, bracketed);
+      // When a transition is active the on-screen pass does NOT sample
+      // any client surfaces (it samples the two compose-output textures
+      // the transition was installed with). Skip the on-screen draw's
+      // bracket open + frameSampled dispatch. The live composers still
+      // sample real surfaces, so their bracket opens stay.
+      if (!this.activeTransition) {
+        this.openImportBrackets(draw, bracketed);
+      }
       for (const ls of this.liveScenes) this.openImportBrackets(ls.windows, bracketed);
       for (const lw of this.liveWindowComps) {
         this.openImportBrackets(lw.windows.map((w) => w.id), bracketed);
       }
 
       const enc = this.device.createCommandEncoder();
-      // On-screen composite.
-      this.composite({
-        encoder: enc, targetView, drawList: draw,
-        outW: this.width, outH: this.height,
-      });
+      // On-screen pass: either a transition pass (Phase 8) or the
+      // normal per-surface composite. The two are mutually exclusive
+      // -- a transition replaces the on-screen output entirely while
+      // active; the input textures it samples are not part of any
+      // surface in the WM's draw list.
+      if (this.activeTransition) {
+        this.encodeTransitionPass(enc, targetView);
+      } else {
+        this.composite({
+          encoder: enc, targetView, drawList: draw,
+          outW: this.width, outH: this.height,
+        });
+      }
       // Live composers, in registration order. Each pass writes to its
       // own target texture; they don't blend against each other.
       for (const ls of this.liveScenes) {
@@ -1435,6 +1662,131 @@ export class JsCompositor implements CompositorSink {
         if (i >= 0) this.liveProducers.splice(i, 1);
       },
     };
+  }
+
+  // Phase 8: install a transition (core-plugin-api.md §8). While set,
+  // renderFrame replaces the on-screen surface-list composite with a
+  // transition pass blending fromTex/toTex via the kind-specific
+  // shader. getProgress is called once per frame to read the eased
+  // progress in [0, 1]; the broker / evaluator owns that state.
+  //
+  // resolveTextures is for the Worker-live case: when the producer's
+  // ring rotates between frames the textures change identity; passing
+  // a resolver lets the compositor re-pick per frame and rebuild the
+  // bind group only when identity changes. Omit for stable cases
+  // (snapshot scenes, in-thread live scenes, where the texture handle
+  // is stable across frames).
+  //
+  // Throws if a transition is already active -- the broker pre-rejects
+  // concurrent installs, this is defense in depth.
+  setActiveTransition(opts: {
+    fromTex: GPUTexture;
+    toTex: GPUTexture;
+    kind: TransitionKind;
+    getProgress: () => number;
+    resolveTextures?: () => { fromTex: GPUTexture; toTex: GPUTexture } | null;
+  }): void {
+    if (this.activeTransition !== null) {
+      throw new Error("setActiveTransition: a transition is already active");
+    }
+    if (this.transitionPipeline === null || this.transitionLayout === null) {
+      throw new Error("setActiveTransition: pipeline not initialized");
+    }
+    this.activeTransition = {
+      fromTex: opts.fromTex,
+      toTex: opts.toTex,
+      kind: opts.kind,
+      getProgress: opts.getProgress,
+      resolveTextures: opts.resolveTextures,
+      cachedFromTex: null,
+      cachedToTex: null,
+      cachedBindGroup: null,
+    };
+  }
+
+  // Tear down the active transition. The broker calls this from inside
+  // the evaluator's commit callback so the very next frame draws the
+  // post-transition state through the normal composite path. Idempotent.
+  clearActiveTransition(): void {
+    this.activeTransition = null;
+  }
+
+  // For tests: true while a transition is installed.
+  hasActiveTransition(): boolean { return this.activeTransition !== null; }
+
+  // Encode the transition pass into targetView. Called from renderFrame
+  // when activeTransition is non-null. The caller has already opened
+  // any import brackets it needs (none for transitions today -- the
+  // input textures are not client dmabufs, they're compose-output
+  // textures or live-scene targets whose lifetimes the broker pins
+  // for the transition's duration).
+  private encodeTransitionPass(
+    encoder: GPUCommandEncoder, targetView: GPUTextureView,
+  ): void {
+    const t = this.activeTransition;
+    if (!t || !this.transitionPipeline || !this.transitionLayout
+        || !this.transitionUniformBuf) return;
+
+    // Re-pick textures if a resolver is installed; rebuild the bind
+    // group on identity change. For the stable case the cached bind
+    // group is reused every frame.
+    let fromTex = t.fromTex;
+    let toTex = t.toTex;
+    if (t.resolveTextures) {
+      const r = t.resolveTextures();
+      if (r === null) {
+        // No texture available this frame (e.g. ring has nothing
+        // PRESENTED yet). Skip the transition pass; clear the target
+        // to opaque black so the on-screen output isn't undefined.
+        const pass = encoder.beginRenderPass({
+          colorAttachments: [{
+            view: targetView,
+            loadOp: "clear",
+            storeOp: "store",
+            clearValue: { r: 0, g: 0, b: 0, a: 1 },
+          }],
+        });
+        pass.end();
+        return;
+      }
+      fromTex = r.fromTex;
+      toTex = r.toTex;
+    }
+    if (t.cachedBindGroup === null
+        || t.cachedFromTex !== fromTex
+        || t.cachedToTex !== toTex) {
+      t.cachedBindGroup = this.device.createBindGroup({
+        layout: this.transitionLayout,
+        entries: [
+          { binding: 0, resource: this.sampler },
+          { binding: 1, resource: fromTex.createView() },
+          { binding: 2, resource: toTex.createView() },
+          { binding: 3, resource: { buffer: this.transitionUniformBuf } },
+        ],
+      });
+      t.cachedFromTex = fromTex;
+      t.cachedToTex = toTex;
+    }
+
+    // Update the kind + progress uniform. 16 bytes (matches WGSL
+    // TUniforms padding).
+    const u = new ArrayBuffer(16);
+    new Uint32Array(u, 0, 1)[0] = TRANSITION_KIND_CODE[t.kind];
+    new Float32Array(u, 4, 1)[0] = t.getProgress();
+    this.device.queue.writeBuffer(this.transitionUniformBuf, 0, u);
+
+    const pass = encoder.beginRenderPass({
+      colorAttachments: [{
+        view: targetView,
+        loadOp: "clear",
+        storeOp: "store",
+        clearValue: { r: 0, g: 0, b: 0, a: 1 },
+      }],
+    });
+    pass.setPipeline(this.transitionPipeline);
+    pass.setBindGroup(0, t.cachedBindGroup);
+    pass.draw(4);
+    pass.end();
   }
 
   // Render each listed window into its own texture sized to that window's
