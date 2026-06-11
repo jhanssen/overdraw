@@ -13,6 +13,9 @@
     "gen-protocols": "npm run gen-protocols -w overdraw",
     "lint": "eslint 'packages/*/src/**/*.ts'",
     "build:js": "npm run gen-protocols && tsc -b && npm run lint",
+    "build:native:configure": "test -f packages/core/build/CMakeCache.txt || cmake -S packages/core -B packages/core/build -G Ninja",
+    "build:native": "npm run build:native:configure && cmake --build packages/core/build --parallel",
+    "build": "npm run build:js && npm run build:native",
     "test": "npm run build:js && node --test 'test/**/*.test.js'",
     "test:gpu": "npm run build:js && node --test --test-concurrency=1 'test/*.gpu.mjs'"
   },
