@@ -245,6 +245,40 @@ export async function setupCompositor(opts = {}) {
     state,
     emitToPlugin: (plugin, name, data) => { runtime?.emit(plugin, name, data); },
   });
+  // Phase 8: optional transitions broker. Tests that exercise
+  // sdk.transitions (workspace animations etc.) set opts.transitions
+  // = true and the harness brings up the scene registry + transition
+  // evaluator + broker + wires evaluator.tick into beforeRender so
+  // the renderFrame loop drives the transition.
+  let sceneRegistry = null;
+  let transitionEvaluator = null;
+  let transitionsBroker = null;
+  let TRANSITIONS_NOT_HANDLED = null;
+  if (opts.transitions && jsCompositor) {
+    const { createSceneRegistry } = await import(
+      "../packages/core/dist/plugins/scene-registry.js");
+    const { createTransitionEvaluator } = await import(
+      "../packages/core/dist/transitions/evaluator.js");
+    const tx = await import(
+      "../packages/core/dist/plugins/transitions-broker.js");
+    sceneRegistry = createSceneRegistry();
+    transitionEvaluator = createTransitionEvaluator();
+    transitionsBroker = tx.createTransitionsBroker({
+      compositor: jsCompositor,
+      evaluator: transitionEvaluator,
+      sceneRegistry,
+    });
+    TRANSITIONS_NOT_HANDLED = tx.NOT_HANDLED;
+    // Hook the evaluator into the frame clock. dispatchFrameCallbacks
+    // calls state.beforeRender(timeMs) before renderFrame, so the
+    // compositor's getProgress callback reads a fresh value each frame.
+    const priorBefore = state.beforeRender;
+    state.beforeRender = (timeMs) => {
+      priorBefore?.(timeMs);
+      transitionEvaluator.tick(timeMs);
+    };
+  }
+
   const onRequest = (plugin, method, params) => {
     if (windowsBroker && method.startsWith("windows.")) {
       const r = windowsBroker(plugin, method, params);
@@ -253,6 +287,10 @@ export async function setupCompositor(opts = {}) {
     if (method.startsWith("input.")) {
       const r = inputBroker(plugin, method, params);
       if (r !== INPUT_NOT_HANDLED) return r;
+    }
+    if (transitionsBroker && method.startsWith("transitions.")) {
+      const r = transitionsBroker(plugin, method, params);
+      if (r !== TRANSITIONS_NOT_HANDLED) return r;
     }
     if (opts.onRequest) return opts.onRequest(plugin, method, params);
     throw new Error(`harness: no handler for plugin request '${method}'`);
@@ -277,6 +315,27 @@ export async function setupCompositor(opts = {}) {
     currentWorkspace: () => currentWorkspaceIndex,
   });
 
+  // When transitions (or any future sdk.compose-needing test) asks for
+  // it, bring up the InThreadGpuDeps bundle: bundled plugins get
+  // sdk.compose + sdk.gpu wired in-thread, sharing the harness's
+  // core device. Otherwise the runtime falls back to Worker GPU iff
+  // opts.pluginAddonPath / opts.dawnPath were provided.
+  let inThreadGpuDeps;
+  if (opts.transitions && jsCompositor && coreDevice && dawn) {
+    const { createOverlayBroker } = await import(
+      "../packages/core/dist/overlay.js");
+    let _serial = 5000;
+    const overlayState = { serial: () => ++_serial, compositor: jsCompositor };
+    const overlays = createOverlayBroker(overlayState, dims);
+    inThreadGpuDeps = {
+      coreDevice,
+      globals: dawn.globals,
+      overlays,
+      compositor: jsCompositor,
+      sceneRegistry,
+    };
+  }
+
   runtime = new PluginRuntime({
     bus: pluginBus,
     log: opts.log ?? (() => {}),
@@ -285,6 +344,7 @@ export async function setupCompositor(opts = {}) {
     resolveDeferredRefs: deferredRefResolver,
     pluginAddonPath: opts.pluginAddonPath,
     dawnPath: opts.dawnPath,
+    inThreadGpu: inThreadGpuDeps,
   });
   const resolved = BUNDLED_PLUGINS.map((spec) => bundledToResolved(spec, spec.module, resolvedConfig));
   // Optional extra plugins (ResolvedPlugin shape) from the test. Loaded

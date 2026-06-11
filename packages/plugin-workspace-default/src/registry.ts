@@ -132,7 +132,9 @@ export function findIndexByName(state: WorkspaceState,
 
 // Build the back-to-front surfaceId list for the currently-shown workspace
 // on outputId. Empty if the output has no workspaces (transient).
-function stackFor(state: WorkspaceState, outputId: number): number[] {
+// Exported so the plugin's transition path can capture the FROM stack
+// before mutating state to compute the TO stack.
+export function stackFor(state: WorkspaceState, outputId: number): number[] {
   const shown = state.shownByOutput.get(outputId);
   if (shown === undefined) return [];
   const rec = state.byHandle.get(shown);

@@ -41,6 +41,38 @@ interface PluginWindowsLike {
   onMap(cb: (ev: { surfaceId: number }) => void): void;
   onUnmap(cb: (ev: { surfaceId: number }) => void): void;
 }
+// Compose + transitions surfaces the plugin uses for animated
+// workspace.show. Optional: when the runtime didn't bring them up
+// (older harnesses, builds without GPU), the plugin falls back to
+// the instant-swap path -- transitions are opt-in by the caller
+// AND require runtime support.
+interface SceneHandleLike {
+  texture: unknown;
+  outW: number;
+  outH: number;
+  id: number;
+  release(): Promise<void>;
+}
+interface PluginComposeLike {
+  scene(args: {
+    outputId: number;
+    windows: readonly number[];
+    mode: "snapshot" | "live";
+    outW?: number;
+    outH?: number;
+  }): Promise<SceneHandleLike>;
+}
+interface PluginTransitionsLike {
+  run(opts: {
+    outputId: number;
+    kind: string;
+    duration: number;
+    easing?: unknown;
+    from: SceneHandleLike;
+    to: SceneHandleLike;
+    commit?: { setOutputStack?: ReadonlyArray<{ outputId: number; ids: readonly number[] | null }> };
+  }): Promise<void>;
+}
 interface SdkLike {
   readonly name: string;
   log(...args: unknown[]): void;
@@ -49,6 +81,8 @@ interface SdkLike {
   actions: PluginActionsLike;
   events: PluginEventsLike;
   windows: PluginWindowsLike;
+  compose?: PluginComposeLike;
+  transitions?: PluginTransitionsLike;
 }
 
 // The state-bag key under which each window's owning WorkspaceHandle is
@@ -66,8 +100,16 @@ export default async function init(sdk: SdkLike, _config?: unknown): Promise<voi
   // Apply each side effect against the SDK. Errors from SDK calls bubble up;
   // the registry's invariants are preserved either way (state is updated
   // synchronously before effects fire).
-  async function applyEffects(effects: SideEffect[]): Promise<void> {
+  //
+  // skipKinds: side-effect kinds to omit (used by the transition path,
+  // which applies setOutputStack atomically via the transition's commit
+  // payload + defers requestFocusDecision until after the run resolves).
+  async function applyEffects(
+    effects: SideEffect[],
+    skipKinds: ReadonlySet<SideEffect["kind"]> = new Set(),
+  ): Promise<void> {
     for (const e of effects) {
+      if (skipKinds.has(e.kind)) continue;
       switch (e.kind) {
         case "setOutputStack":
           await sdk.windows.setOutputStack(e.outputId, e.ids);
@@ -85,6 +127,83 @@ export default async function init(sdk: SdkLike, _config?: unknown): Promise<voi
           sdk.events.emit(e.name, e.payload);
           break;
       }
+    }
+  }
+
+  // Animated workspace.show: capture FROM + TO scene snapshots, run
+  // the transition with a setOutputStack commit that fires atomically
+  // with completion, then defer focus-decide until after.
+  //
+  // Falls back to caller's responsibility: if sdk.compose or
+  // sdk.transitions is absent (runtime didn't bring them up), the
+  // caller's transition param was honored but we have nothing to
+  // run -- throw a clear error so the caller knows the runtime
+  // doesn't support it. (Plain instant show is reached via NOT
+  // passing a transition.)
+  async function showWithTransition(
+    index: WorkspaceIndex, outputId: number, t: ShowTransitionSpec,
+  ): Promise<void> {
+    if (!sdk.compose || !sdk.transitions) {
+      throw new Error(
+        "workspace.show: transition requested but the runtime didn't " +
+        "wire sdk.compose + sdk.transitions (need an in-thread bundled " +
+        "plugin path with the transitions broker + scene registry).");
+    }
+    // Capture the FROM stack (what's on screen now).
+    const fromIds = reg.stackFor(state, outputId);
+    // Mutate state to produce the TO stack + the rest of the show's
+    // side effects. The setOutputStack effect carries the TO ids; we
+    // extract it and skip the normal apply because the transition's
+    // commit will apply it atomically with completion.
+    const r = reg.show(state, index, outputId);
+    state = r.state;
+    const setStackEffect = r.sideEffects.find(
+      (e): e is Extract<SideEffect, { kind: "setOutputStack" }> =>
+        e.kind === "setOutputStack" && e.outputId === outputId);
+    const toIds = setStackEffect ? setStackEffect.ids : [];
+    // Apply all OTHER side effects normally (emit hidden/shown,
+    // setStateBag, etc.). Skip setOutputStack (commit owns it) and
+    // requestFocusDecision (deferred to after-run).
+    await applyEffects(r.sideEffects, new Set(["setOutputStack", "requestFocusDecision"]));
+
+    // Capture snapshots. compose.scene without outW/outH defaults to
+    // the compositor's output dims, which is what the transition
+    // shader expects.
+    const fromScene = await sdk.compose.scene({
+      outputId, mode: "snapshot", windows: fromIds,
+    });
+    let toScene: SceneHandleLike | null = null;
+    try {
+      toScene = await sdk.compose.scene({
+        outputId, mode: "snapshot", windows: toIds ?? [],
+      });
+      // Run the transition. The broker applies the commit's
+      // setOutputStack synchronously inside the completion tick, so
+      // the very next renderFrame draws the TO stack via the normal
+      // composite path. easing is optional and passed through.
+      const runOpts: Parameters<PluginTransitionsLike["run"]>[0] = {
+        outputId, kind: t.kind, duration: t.duration,
+        from: fromScene, to: toScene,
+        commit: { setOutputStack: [{ outputId, ids: toIds ?? [] }] },
+      };
+      if (t.easing !== undefined) runOpts.easing = t.easing;
+      await sdk.transitions.run(runOpts);
+    } finally {
+      // Release scenes regardless of throw / success. The transitions
+      // broker unpins on completion (or on its install-time throw);
+      // the registry's deferred teardown only frees the underlying
+      // surfaceBuf after the last pin drops, so release() now is safe.
+      await fromScene.release();
+      if (toScene) await toScene.release();
+    }
+    // Now fire the deferred focus-decide. requestFocusDecision is
+    // fire-and-forget on the focus driver's per-event sequence
+    // machinery.
+    const focusEffect = r.sideEffects.find(
+      (e): e is Extract<SideEffect, { kind: "requestFocusDecision" }> =>
+        e.kind === "requestFocusDecision");
+    if (focusEffect) {
+      await sdk.windows.requestFocusDecision(focusEffect.reason);
     }
   }
 
@@ -148,6 +267,11 @@ export default async function init(sdk: SdkLike, _config?: unknown): Promise<voi
     description: "Make the workspace at the given index (or matching name) the visible one.",
     handler: async (params: unknown): Promise<null> => {
       const p = parseIndexOrNameParams(state, params, "workspace.show");
+      const t = parseShowTransition(params, "workspace.show");
+      if (t) {
+        await showWithTransition(p.index, p.outputId, t);
+        return null;
+      }
       const r = reg.show(state, p.index, p.outputId);
       state = r.state;
       await applyEffects(r.sideEffects);
@@ -213,7 +337,14 @@ export default async function init(sdk: SdkLike, _config?: unknown): Promise<voi
       state = r.state;
       await applyEffects(r.sideEffects);
     },
-    async show(index, outputId): Promise<void> {
+    async show(index, outputId, transition): Promise<void> {
+      if (transition) {
+        await showWithTransition(
+          index, outputId ?? 0,
+          { kind: transition.kind, duration: transition.duration, easing: transition.easing },
+        );
+        return;
+      }
       const r = reg.show(state, index, outputId);
       state = r.state;
       await applyEffects(r.sideEffects);
@@ -329,6 +460,37 @@ function parseIndexOrNameParams(
       `${label}: no workspace named '${params.name}' on output ${outputId}`);
   }
   return { index: resolved, outputId };
+}
+
+// Optional transition spec for workspace.show (and friends). When the
+// caller passes this, the plugin captures FROM and TO scene snapshots
+// + invokes sdk.transitions.run with a setOutputStack commit. When
+// absent (or when the runtime didn't bring up sdk.transitions),
+// workspace.show is an instant swap.
+interface ShowTransitionSpec {
+  kind: string;
+  duration: number;
+  easing?: unknown;
+}
+function parseShowTransition(params: unknown, label: string): ShowTransitionSpec | null {
+  if (!isObj(params)) return null;
+  const t = (params as { transition?: unknown }).transition;
+  if (t === undefined || t === null) return null;
+  if (!isObj(t)) {
+    throw new TypeError(`${label}: transition must be an object`);
+  }
+  if (typeof t.kind !== "string") {
+    throw new TypeError(`${label}: transition.kind must be a string`);
+  }
+  if (typeof t.duration !== "number" || !(t.duration > 0)) {
+    throw new TypeError(
+      `${label}: transition.duration must be > 0 (got ${String(t.duration)})`);
+  }
+  return {
+    kind: t.kind,
+    duration: t.duration,
+    easing: (t as { easing?: unknown }).easing,
+  };
 }
 
 function parseMoveParams(state: WorkspaceState, params: unknown,

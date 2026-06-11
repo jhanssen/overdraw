@@ -38,6 +38,16 @@ export interface WorkspaceCreateSpec {
   outputId?: number;
 }
 
+// Transition spec accepted by show() / moveWindow() to animate the swap.
+// kind + duration are the same shape sdk.transitions.run takes (core-
+// plugin-api.md §8); the easing field is passed through verbatim.
+export interface WorkspaceTransitionSpec {
+  kind: "crossfade" | "slide-left" | "slide-right"
+      | "slide-up" | "slide-down" | "scale";
+  duration: number;            // ms; must be > 0
+  easing?: unknown;            // EasingSpec from @overdraw/animation-types
+}
+
 export interface WorkspaceAPI {
   /**
    * Append a new workspace at the end of the position list for outputId
@@ -71,8 +81,16 @@ export interface WorkspaceAPI {
    * OUTPUT_DEFAULT). Pushes the workspace's members to that output's
    * stack; the previously-shown workspace's windows are no longer
    * composited there.
+   *
+   * When `transition` is set, the swap is animated: the plugin captures
+   * scene snapshots of the FROM and TO stacks via sdk.compose.scene
+   * and runs sdk.transitions.run between them, applying the new
+   * stack atomically with completion (no glitch frame). Requires the
+   * runtime to have wired sdk.compose + sdk.transitions; throws
+   * otherwise. Omit `transition` for an instant swap.
    */
-  show(index: WorkspaceIndex, outputId?: number): Promise<void>;
+  show(index: WorkspaceIndex, outputId?: number,
+       transition?: WorkspaceTransitionSpec): Promise<void>;
 
   /**
    * Move a window into the workspace at `index` on outputId (default
