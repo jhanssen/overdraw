@@ -21,8 +21,8 @@ export type EventSenders = Record<string, (...args: EventArg[]) => unknown>;
 // The per-interface event-sender set: interfaceName -> its senders.
 export type EventsByInterface = Record<string, EventSenders>;
 
-// The native N-API addon (build/overdraw_native.node). Only the methods the
-// JS layer calls are declared; add as needed.
+// The native N-API addon. Only the methods the JS layer calls are declared;
+// add as needed.
 export interface Addon {
   start(gpuBin: string, onFrame?: ((presented: number) => void) | null,
         onInput?: ((ev: InputEvent) => void) | null,
