@@ -7,6 +7,7 @@
     { "path": "./packages/plugin-focus-default" },
     { "path": "./packages/animation-types" },
     { "path": "./packages/sdk-anim" },
+    { "path": "./packages/transition-types" },
     { "path": "./packages/workspace-types" },
     { "path": "./packages/plugin-workspace-default" },
     { "path": "./packages/hotkey-types" },
