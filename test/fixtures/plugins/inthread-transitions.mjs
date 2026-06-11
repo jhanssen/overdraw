@@ -30,16 +30,18 @@ export default async function init(sdk, config) {
   });
   sdk.log(`to-scene built id=${toScene.id}`);
 
-  // Run the transition. commit callback fires synchronously inside the
-  // completion tick (before the run() Promise resolves) so the test can
-  // observe ordering via the logs.
+  // Run the transition. commit is declarative: the broker interprets
+  // it synchronously inside the completion tick (before the run()
+  // Promise resolves) so the very next renderFrame sees the post-
+  // transition state. The test uses setOutputStack with [] to verify
+  // the data flows through; pixel checks confirm the final state.
   void sdk.transitions.run({
     outputId: 0,
     kind: config.kind,
     duration: config.durationMs,
     from: fromScene,
     to: toScene,
-    commit: () => { sdk.log("commit fired"); },
+    commit: { setOutputStack: [{ outputId: 0, ids: [] }] },
   }).then(async () => {
     sdk.log("transition done");
     await fromScene.release();

@@ -183,13 +183,6 @@ test("bundled in-thread plugin runs sdk.transitions.run (crossfade)",
     assert.ok(logs.includes("transition done"),
       `plugin did not see transition done; logs=${JSON.stringify(logs)}`);
 
-    // Commit fired BEFORE done (the evaluator's contract). Check the
-    // ordering in the log.
-    const commitIdx = logs.indexOf("commit fired");
-    const doneIdx = logs.indexOf("transition done");
-    assert.ok(commitIdx >= 0 && doneIdx > commitIdx,
-      `commit should fire before done; logs=${JSON.stringify(logs)}`);
-
     // Wait for scene release log (the plugin awaits both releases).
     const t2 = Date.now();
     while (!logs.includes("scenes released") && Date.now() - t2 < 2000) {

@@ -52,6 +52,11 @@ export interface TransitionCompositorSink {
     } | null;
   }) => void;
   clearActiveTransition?: () => void;
+  // Phase 8 commit interpreter dependency: the broker applies
+  // setOutputStack instructions on the completion tick directly
+  // against the compositor, bypassing the SDK's postMessage hop
+  // (which would resolve too late to be visible on the next frame).
+  setOutputStack?: (outputId: number, ids: number[] | null) => void;
 }
 
 export interface TransitionsBrokerDeps {
@@ -64,29 +69,17 @@ export type TransitionsBroker = (
   pluginName: string, method: string, params: unknown,
 ) => Promise<unknown> | unknown | typeof NOT_HANDLED;
 
-// In-thread plugins can pass a function to be called synchronously
-// inside the completion tick (so the next renderFrame draws the
-// post-transition state with no glitch). Worker plugins can't pass
-// functions over postMessage; their commit is undefined. A Worker
-// plugin that needs atomic post-transition state can express it as
-// a follow-up action invocation by chaining .then() on the run
-// Promise -- one frame later, but still correct for most use cases.
-export type InThreadCommit = () => void;
-
-// Broker-internal: in-thread plugins can stash a pre-resolved commit
-// function on a side-table keyed by a token. The transitions-sdk
-// (in-thread variant) puts the function here and sends only the
-// token over the wire. (Worker plugins lack this side-table entirely;
-// they always omit commit.)
-const inThreadCommits = new Map<number, InThreadCommit>();
-let nextCommitToken = 1;
-
-// Public helper for the in-thread SDK: stash a commit callback,
-// returning the token to send to the broker.
-export function stashInThreadCommit(cb: InThreadCommit): number {
-  const tok = nextCommitToken++;
-  inThreadCommits.set(tok, cb);
-  return tok;
+// Atomic-commit instructions the broker applies synchronously inside
+// the evaluator's completion tick. Mirror of TransitionCommit in
+// transitions-sdk; defined here too because the broker is the
+// consumer + we don't want a cross-import. Plugin sends this as
+// part of transitions.run; broker interprets each field in order
+// before resolve() fires.
+interface BrokerCommit {
+  readonly setOutputStack?: ReadonlyArray<{
+    outputId: number;
+    ids: readonly number[] | null;
+  }>;
 }
 
 export function createTransitionsBroker(
@@ -100,6 +93,25 @@ export function createTransitionsBroker(
   }
   const setActiveTransition = compositor.setActiveTransition.bind(compositor);
   const clearActiveTransition = compositor.clearActiveTransition.bind(compositor);
+  const setOutputStack = compositor.setOutputStack?.bind(compositor);
+
+  // Apply declarative commit instructions. Each kind is independent;
+  // the broker runs them in array order. Errors are caught + logged
+  // (the run() Promise still resolves; a partial commit is bad but
+  // throwing would leave the compositor in an inconsistent state too).
+  function applyCommit(c: BrokerCommit): void {
+    if (c.setOutputStack && setOutputStack) {
+      for (const item of c.setOutputStack) {
+        try {
+          setOutputStack(item.outputId,
+            item.ids === null ? null : item.ids.slice());
+        } catch (e) {
+          console.error(
+            `[transitions] commit setOutputStack(${item.outputId}) threw:`, e);
+        }
+      }
+    }
+  }
 
   return (pluginName: string, method: string, params: unknown) => {
     void pluginName;
@@ -140,21 +152,11 @@ export function createTransitionsBroker(
       );
     }
 
-    // Resolve the commit callback. In-thread plugins send a token
-    // they stashed in the side-table; Worker plugins always omit.
-    let commit: InThreadCommit | undefined;
-    if (typeof p.commitToken === "number") {
-      commit = inThreadCommits.get(p.commitToken);
-      // The token is single-use; clear it now whether or not we found
-      // a callback (a missing entry was probably already consumed).
-      inThreadCommits.delete(p.commitToken);
-      if (!commit) {
-        throw new Error(
-          `transitions.run: commitToken=${p.commitToken} not found ` +
-          `(double-run or token lifetime bug)`,
-        );
-      }
-    }
+    // Resolve the commit instructions. Declarative shape; the broker
+    // applies each instruction synchronously inside the completion
+    // tick. p.commit was validated by the SDK on the plugin side;
+    // re-check structurally here at the trust boundary.
+    const commit = parseCommit(p.commit);
 
     // Pin the scenes BEFORE installing on the compositor. Failure to
     // pin (entry being torn down) throws here and the install never
@@ -245,19 +247,15 @@ export function createTransitionsBroker(
         durationMs: p.duration,
         easing: p.easing,
         commit: () => {
-          // Order: run the plugin's commit (atomic with transition
-          // end), THEN clear the compositor's transition slot so the
-          // next frame draws normally, THEN release the scene pins
-          // (which may fire the underlying surfaceBuf release on a
-          // deferred-teardown path). All synchronous; the evaluator's
-          // resolve fires after this returns.
-          if (commit) {
-            try { commit(); }
-            catch (err) {
-              console.error(
-                `[transitions] plugin commit threw:`, err);
-            }
-          }
+          // Order: apply the declarative commit (atomic with
+          // transition end, BEFORE the next renderFrame, so the post-
+          // transition state is visible on the very next frame), THEN
+          // clear the compositor's transition slot so the next frame
+          // draws via the normal composite path, THEN release the
+          // scene pins (deferred-teardown gates the underlying
+          // surfaceBuf release). All synchronous; evaluator's resolve
+          // fires after this returns.
+          if (commit) applyCommit(commit);
           clearActiveTransition();
           unpinScenes();
         },
@@ -281,7 +279,7 @@ interface RunPayload {
   easing?: EasingSpec;
   fromSceneId: number;
   toSceneId: number;
-  commitToken?: number;
+  commit?: unknown;
 }
 
 function isRunPayload(d: unknown): d is RunPayload {
@@ -292,8 +290,51 @@ function isRunPayload(d: unknown): d is RunPayload {
   if (typeof o.duration !== "number") return false;
   if (typeof o.fromSceneId !== "number" || o.fromSceneId <= 0) return false;
   if (typeof o.toSceneId !== "number" || o.toSceneId <= 0) return false;
-  if (o.commitToken !== undefined && typeof o.commitToken !== "number") return false;
+  // commit is validated structurally by parseCommit; the type guard
+  // here just accepts any value (including undefined).
   // easing is validated by resolveEasing at install time; we don't
   // duplicate the closed-set check here.
   return true;
+}
+
+// Structurally validate the declarative commit payload at the trust
+// boundary. Returns null if the field was omitted; throws on bad
+// shape (the run() Promise rejects, the install never happens).
+function parseCommit(raw: unknown): BrokerCommit | undefined {
+  if (raw === undefined || raw === null) return undefined;
+  if (typeof raw !== "object" || Array.isArray(raw)) {
+    throw new TypeError(`transitions.run: commit must be an object`);
+  }
+  const o = raw as { [k: string]: unknown };
+  const out: { setOutputStack?: BrokerCommit["setOutputStack"] } = {};
+  if (o.setOutputStack !== undefined) {
+    if (!Array.isArray(o.setOutputStack)) {
+      throw new TypeError(
+        `transitions.run: commit.setOutputStack must be an array`);
+    }
+    const items: Array<{ outputId: number; ids: number[] | null }> = [];
+    for (const item of o.setOutputStack) {
+      if (typeof item !== "object" || item === null) {
+        throw new TypeError(
+          `transitions.run: commit.setOutputStack[*] must be objects`);
+      }
+      const i = item as { [k: string]: unknown };
+      if (typeof i.outputId !== "number") {
+        throw new TypeError(
+          `transitions.run: commit.setOutputStack[*].outputId must be a number`);
+      }
+      let ids: number[] | null;
+      if (i.ids === null) {
+        ids = null;
+      } else if (Array.isArray(i.ids) && i.ids.every((v) => typeof v === "number")) {
+        ids = (i.ids as number[]).slice();
+      } else {
+        throw new TypeError(
+          `transitions.run: commit.setOutputStack[*].ids must be number[] or null`);
+      }
+      items.push({ outputId: i.outputId, ids });
+    }
+    out.setOutputStack = items;
+  }
+  return out;
 }

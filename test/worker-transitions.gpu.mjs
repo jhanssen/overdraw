@@ -131,10 +131,6 @@ test("Worker plugin: sdk.transitions.run drives a transition end to end (snapsho
     assert.ok(logs.includes("worker-transitions submitted"),
       `plugin did not submit transition; logs=${JSON.stringify(logs)}`);
 
-    // Commit-rejection happened first (in the plugin's fixture).
-    assert.ok(logs.includes("worker-transitions commit-rejection ok"),
-      `commit rejection log missing; logs=${JSON.stringify(logs)}`);
-
     // The plugin's scenes are now registered + the transition is
     // installed. Confirm compositor sees it as active.
     assert.equal(c.jsCompositor.hasActiveTransition(), true,

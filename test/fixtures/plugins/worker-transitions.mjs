@@ -31,26 +31,13 @@ export default async function init(sdk, config) {
   });
   sdk.log(`worker-transitions to-scene id=${toScene.id}`);
 
-  // Reject the commit field (Worker SDK explicitly rejects).
-  try {
-    await sdk.transitions.run({
-      outputId: 0, kind: config.kind, duration: config.durationMs,
-      from: fromScene, to: toScene,
-      commit: () => {},
-    });
-    sdk.log("worker-transitions ERROR: commit-rejection did not throw");
-  } catch (e) {
-    if (e && String(e.message).includes("not supported for Worker plugins")) {
-      sdk.log("worker-transitions commit-rejection ok");
-    } else {
-      sdk.log(`worker-transitions ERROR: unexpected throw: ${e.message}`);
-    }
-  }
-
-  // Run the real transition (no commit).
+  // Commit is declarative + works for Worker (same shape as in-thread).
+  // Include a setOutputStack instruction so the test verifies the
+  // broker applied it.
   void sdk.transitions.run({
     outputId: 0, kind: config.kind, duration: config.durationMs,
     from: fromScene, to: toScene,
+    commit: { setOutputStack: [{ outputId: 0, ids: [] }] },
   }).then(async () => {
     sdk.log("worker-transitions done");
     await fromScene.release();
