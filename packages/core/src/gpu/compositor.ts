@@ -1166,14 +1166,6 @@ export class JsCompositor implements CompositorSink {
       }],
     });
     pass.setPipeline(this.pipeline);
-    if (process.env.OVERDRAW_DEBUG_DECO) {
-      // eslint-disable-next-line no-console
-      console.error(`[diag-frame] drawList=`, JSON.stringify(args.drawList),
-        "surfaces=", JSON.stringify(args.drawList.map(id => {
-          const s = this.surfaces.get(id);
-          return s ? { id, x: s.x, y: s.y, lw: s.layoutW, lh: s.layoutH, w: s.width, h: s.height, p: !!s.present, bg: !!s.bindGroup } : { id, miss: true };
-        })));
-    }
     for (const id of args.drawList) {
       const s = this.surfaces.get(id);
       if (s && s.present && s.bindGroup) {
