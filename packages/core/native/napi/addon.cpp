@@ -1144,17 +1144,24 @@ napi_value ClientId(napi_env env, napi_callback_info info) {
     return out;
 }
 
+// Build the singleton keymap if it doesn't exist yet. Both keymapInfo()
+// (a client binds wl_keyboard) and keyUpdate() (every host key-down) can
+// be the first caller -- the binding chain consults keysyms whether or
+// not any overdraw client has bound a keyboard. Returns false only if
+// xkbcommon failed to compile the default keymap.
+bool ensureKeymap() {
+    if (g_addon.keymap) return true;
+    auto km = std::make_unique<Keymap>();
+    if (!km->init()) return false;
+    g_addon.keymap = std::move(km);
+    return true;
+}
+
 // keymapInfo() -> { fd: WaylandFd, format, size } | null
-// The keymap is built lazily on first call. Each call returns a fresh dup of the
-// keymap memfd wrapped as a WaylandFd (each client gets its own to mmap).
+// Each call returns a fresh dup of the keymap memfd wrapped as a WaylandFd
+// (each client gets its own to mmap).
 napi_value KeymapInfo(napi_env env, napi_callback_info) {
-    if (!g_addon.keymap) {
-        auto km = std::make_unique<Keymap>();
-        if (!km->init()) {
-            napi_value n; napi_get_null(env, &n); return n;
-        }
-        g_addon.keymap = std::move(km);
-    }
+    if (!ensureKeymap()) { napi_value n; napi_get_null(env, &n); return n; }
     int fd = g_addon.keymap->dupFd();
     if (fd < 0) { napi_value n; napi_get_null(env, &n); return n; }
     napi_value obj; napi_create_object(env, &obj);
@@ -1169,7 +1176,7 @@ napi_value KeymapInfo(napi_env env, napi_callback_info) {
 // keyUpdate(evdevKey, pressed) -> { modsDepressed, modsLatched, modsLocked, group, keysym }
 // Feeds the key into the xkb state and returns the resulting modifier masks for
 // wl_keyboard.modifiers, plus the resolved keysym (post-update) for binding-chain
-// matching. Returns zeros if the keymap is not built.
+// matching. Returns zeros if the keymap cannot be built.
 napi_value KeyUpdate(napi_env env, napi_callback_info info) {
     size_t argc = 2; napi_value argv[2];
     napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
@@ -1177,7 +1184,7 @@ napi_value KeyUpdate(napi_env env, napi_callback_info info) {
     if (argc >= 1) napi_get_value_uint32(env, argv[0], &key);
     if (argc >= 2) napi_get_value_bool(env, argv[1], &pressed);
     uint32_t dep = 0, lat = 0, lock = 0, grp = 0, sym = 0;
-    if (g_addon.keymap) {
+    if (ensureKeymap()) {
         g_addon.keymap->updateKey(key, pressed);
         g_addon.keymap->modifiers(dep, lat, lock, grp);
         sym = g_addon.keymap->keysym(key);
