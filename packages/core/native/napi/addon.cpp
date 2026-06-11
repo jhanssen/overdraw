@@ -27,6 +27,7 @@
 #include "wayland/trampoline.h"
 #include "wayland/wayland_fd.h"
 #include "wayland/keymap.h"
+#include "cursor/xcursor.h"
 
 using overdraw::core::Compositor;
 using overdraw::core::InputEvent;
@@ -1206,6 +1207,57 @@ napi_value KeyUpdate(napi_env env, napi_callback_info info) {
     return obj;
 }
 
+// resolveCursorShape(name, sizePx, scale)
+//   -> { width, height, hotspotX, hotspotY, rgba: Uint8Array } | null
+// Looks up the XCursor shape in the current theme (XCURSOR_THEME env, with
+// inheritance walk). Returns BGRA8 pixel bytes tightly packed at width*height*4.
+// For 'default', a built-in 16x16 fallback ensures the call never fails.
+napi_value ResolveCursorShape(napi_env env, napi_callback_info info) {
+    size_t argc = 3; napi_value argv[3];
+    napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+    if (argc < 1) { napi_value n; napi_get_null(env, &n); return n; }
+
+    char nameBuf[256];
+    size_t nameLen = 0;
+    if (napi_get_value_string_utf8(env, argv[0], nameBuf, sizeof(nameBuf), &nameLen)
+        != napi_ok) {
+        napi_value n; napi_get_null(env, &n); return n;
+    }
+    std::string name(nameBuf, nameLen);
+
+    uint32_t sizePx = 24;
+    if (argc >= 2) napi_get_value_uint32(env, argv[1], &sizePx);
+    if (sizePx == 0) sizePx = 24;
+    uint32_t scale = 1;
+    if (argc >= 3) napi_get_value_uint32(env, argv[2], &scale);
+    if (scale == 0) scale = 1;
+
+    overdraw::cursor::ResolvedShape r;
+    if (!overdraw::cursor::resolveShape(name, sizePx, scale, r)) {
+        napi_value n; napi_get_null(env, &n); return n;
+    }
+
+    napi_value obj; napi_create_object(env, &obj);
+    auto setU = [&](const char* k, uint32_t val) {
+        napi_value n; napi_create_uint32(env, val, &n);
+        napi_set_named_property(env, obj, k, n);
+    };
+    setU("width", r.width);
+    setU("height", r.height);
+    setU("hotspotX", r.hotspotX);
+    setU("hotspotY", r.hotspotY);
+
+    // Copy the pixel bytes into a JS-owned ArrayBuffer (not external; the
+    // ResolvedShape's vector is freed when this function returns).
+    napi_value ab; void* data;
+    napi_create_arraybuffer(env, r.rgba.size(), &data, &ab);
+    if (!r.rgba.empty()) std::memcpy(data, r.rgba.data(), r.rgba.size());
+    napi_value ta;
+    napi_create_typedarray(env, napi_uint8_array, r.rgba.size(), ab, 0, &ta);
+    napi_set_named_property(env, obj, "rgba", ta);
+    return obj;
+}
+
 // shmCreatePool(fd, size) -> poolId (0 on failure)
 // `fd` is a WaylandFd; we take the raw fd out of it (transferring ownership) and
 // mmap it.
@@ -1534,6 +1586,7 @@ napi_value Init(napi_env env, napi_value exports) {
     reg("destroyResource", DestroyResource);
     reg("keymapInfo", KeymapInfo);
     reg("keyUpdate", KeyUpdate);
+    reg("resolveCursorShape", ResolveCursorShape);
     reg("dmabufFeedbackInfo", DmabufFeedbackInfo);
     reg("pluginCreateConnection", PluginCreateConnection);
     reg("pluginInjectInstance", PluginInjectInstance);

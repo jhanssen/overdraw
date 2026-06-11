@@ -62,6 +62,19 @@ export interface Addon {
     keysym: number;
   };
 
+  // XCursor theme resolver. Looks up a named shape in the current theme
+  // (XCURSOR_THEME env, with [Icon Theme] Inherits= walk). Returns BGRA8
+  // pixels tightly packed at width*height*4. For 'default', a built-in
+  // 16x16 fallback ensures success even when no theme is installed; for
+  // other shapes a true theme miss returns null.
+  resolveCursorShape(name: string, sizePx: number, scale: number): {
+    width: number;
+    height: number;
+    hotspotX: number;
+    hotspotY: number;
+    rgba: Uint8Array;
+  } | null;
+
   // JS-compositor bridge (wire WebGPU via dawn.node). The compositing pass lives
   // in JS (src/gpu/compositor.ts); the native side provides WSI (surface acquire/
   // present), dmabuf import, and shm pixel access.

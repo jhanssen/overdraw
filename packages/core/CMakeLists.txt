@@ -107,7 +107,8 @@ add_library(overdraw_native MODULE
     native/napi/addon.cpp
     native/wayland/trampoline.cpp
     native/wayland/wayland_fd.cpp
-    native/wayland/keymap.cpp)
+    native/wayland/keymap.cpp
+    native/cursor/xcursor.cpp)
 set_target_properties(overdraw_native PROPERTIES
     PREFIX "" SUFFIX ".node")
 target_compile_definitions(overdraw_native PRIVATE
@@ -198,6 +199,26 @@ target_include_directories(popup-test-client PRIVATE
     ${WAYLAND_CLIENT_INCLUDE_DIRS}
     ${CMAKE_SOURCE_DIR}/native/wayland/generated)
 target_link_libraries(popup-test-client PRIVATE ${WAYLAND_CLIENT_LIBRARIES})
+
+# ---- cursor test client (wl_pointer.set_cursor) ----
+add_executable(cursor-test-client
+    test/cursor-test-client.c
+    native/wayland/generated/xdg-shell-protocol.c)
+target_include_directories(cursor-test-client PRIVATE
+    ${WAYLAND_CLIENT_INCLUDE_DIRS}
+    ${CMAKE_SOURCE_DIR}/native/wayland/generated)
+target_link_libraries(cursor-test-client PRIVATE ${WAYLAND_CLIENT_LIBRARIES})
+
+# ---- cursor-shape test client (wp_cursor_shape_v1.set_shape) ----
+add_executable(cursor-shape-test-client
+    test/cursor-shape-test-client.c
+    test/tablet-stub.c
+    native/wayland/generated/xdg-shell-protocol.c
+    native/wayland/generated/cursor-shape-v1-protocol.c)
+target_include_directories(cursor-shape-test-client PRIVATE
+    ${WAYLAND_CLIENT_INCLUDE_DIRS}
+    ${CMAKE_SOURCE_DIR}/native/wayland/generated)
+target_link_libraries(cursor-shape-test-client PRIVATE ${WAYLAND_CLIENT_LIBRARIES})
 
 # ---- SCM_RIGHTS transport unit test (fd passing over the side channel) ----
 add_executable(scm-rights-test test/scm-rights-test.cpp)

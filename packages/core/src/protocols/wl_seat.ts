@@ -44,6 +44,94 @@ export default function makeSeat(ctx: Ctx, driver: FocusDriver): SeatHandler {
   // click-away dismissal at button-press time (button events carry no position).
   let lastX = 0, lastY = 0;
 
+  // Phase 9c cursor state. Shared with makePointer via ctx.state.seat
+  // (which we publish below). Per-pointer-resource latest enter serial
+  // for set_cursor serial validation; per-client cursor preference
+  // (the surface + hotspot, or "hidden"). Encapsulated as helpers so
+  // makePointer doesn't reach into our maps directly.
+  const lastEnterSerial = new Map<Resource, number>();
+  interface ClientCursor {
+    surfaceResource: Resource | null;
+    hotspotX: number;
+    hotspotY: number;
+    hidden: boolean;
+  }
+  const clientCursors = new Map<number, ClientCursor>();
+  // The reserved compositor-internal cursor surface id (matches the
+  // constant in JsCompositor). Used to re-point the slot at the bundled
+  // default cursor when no client owns it.
+  const INTERNAL_CURSOR_ID = 0x7FFF_FFF0;
+
+  function installCompositorDefaultCursor(): void {
+    // Today: revert to whatever was installed at boot (the resolver's
+    // 'default' shape stored on the internal cursor surface). When
+    // sdk.cursor.setDefault lands, this is where the priority resolver
+    // arbitrates between plugin default and built-in default.
+    ctx.state.compositor.setCursorFromSurface?.(INTERNAL_CURSOR_ID, 0, 0);
+  }
+
+  function applyClientCursor(clientId: number): void {
+    const c = clientCursors.get(clientId);
+    if (!c) {
+      installCompositorDefaultCursor();
+      ctx.state.compositor.setCursorVisible?.(true);
+      return;
+    }
+    if (c.hidden) {
+      ctx.state.compositor.setCursorVisible?.(false);
+      return;
+    }
+    if (!c.surfaceResource || c.surfaceResource.destroyed) {
+      installCompositorDefaultCursor();
+      ctx.state.compositor.setCursorVisible?.(true);
+      return;
+    }
+    const sRec = ctx.state.surfaces.get(c.surfaceResource);
+    if (!sRec) {
+      installCompositorDefaultCursor();
+      ctx.state.compositor.setCursorVisible?.(true);
+      return;
+    }
+    ctx.state.compositor.setCursorVisible?.(true);
+    ctx.state.compositor.setCursorFromSurface?.(sRec.id, c.hotspotX, c.hotspotY);
+  }
+
+  // Accessor object: exposes the cursor state to makePointer (and to
+  // wl_surface.commit, so committing a client cursor surface re-applies
+  // the client's preference if it's the active focus's). Published on
+  // ctx.state.seat as `cursor` below.
+  const cursorOps = {
+    recordEnterSerial(p: Resource, serial: number): void {
+      lastEnterSerial.set(p, serial);
+    },
+    clearEnterSerial(p: Resource): void {
+      lastEnterSerial.delete(p);
+    },
+    lastEnterSerialFor(p: Resource): number | undefined {
+      return lastEnterSerial.get(p);
+    },
+    setClientCursor(clientId: number, c: ClientCursor): void {
+      clientCursors.set(clientId, c);
+      // If this client's surface is the current pointer focus, apply
+      // the new cursor immediately.
+      const seat = ctx.state.seat;
+      if (seat?.focus?.clientId === clientId) applyClientCursor(clientId);
+    },
+    // Called by wl_surface.commit when the surface has the "cursor"
+    // role and might be a client's active cursor surface. Re-applies
+    // the slot so the new texture is observed.
+    onCursorSurfaceCommit(surfaceResource: Resource): void {
+      const seat = ctx.state.seat;
+      const focusClient = seat?.focus?.clientId;
+      if (focusClient === undefined) return;
+      const c = clientCursors.get(focusClient);
+      if (!c || c.surfaceResource !== surfaceResource) return;
+      applyClientCursor(focusClient);
+    },
+  };
+  // Publish to ctx.state for cross-handler access (wl_pointer, wl_surface).
+  // The 'cursor' field is added to SeatState below.
+
   // wl_keyboard.enter carries a wl_array of currently-pressed keys; we send empty.
   const EMPTY_KEYS = new Uint8Array(0);
 
@@ -118,8 +206,16 @@ export default function makeSeat(ctx: Ctx, driver: FocusDriver): SeatHandler {
     for (const p of clientPointers(target.clientId)) {
       if (p.destroyed) continue;
       ctx.events.wl_pointer.send_enter(p, serial, target.surfaceRec.resource, sx, sy);
+      // Phase 9c: stash the enter serial per pointer resource so a
+      // subsequent set_cursor request from the client can be validated
+      // against it.
+      lastEnterSerial.set(p, serial);
       pointerFrame(p);
     }
+    // Switch the cursor slot to this client's preference. set_cursor
+    // may have arrived BEFORE enter (the client races); apply whatever
+    // we have, or fall back to the compositor default if nothing.
+    applyClientCursor(target.clientId);
   }
 
   function sendLeave(target: SeatFocus): void {
@@ -127,8 +223,14 @@ export default function makeSeat(ctx: Ctx, driver: FocusDriver): SeatHandler {
     for (const p of clientPointers(target.clientId)) {
       if (p.destroyed) continue;
       ctx.events.wl_pointer.send_leave(p, serial, target.surfaceRec.resource);
+      // Clear the recorded enter serial so a late set_cursor for the
+      // prior focus is rejected.
+      lastEnterSerial.delete(p);
       pointerFrame(p);
     }
+    // Pointer left the client's surface: revert to compositor default.
+    installCompositorDefaultCursor();
+    ctx.state.compositor.setCursorVisible?.(true);
   }
 
   // Dispatch a focus decide() with the current snapshot.
@@ -174,6 +276,17 @@ export default function makeSeat(ctx: Ctx, driver: FocusDriver): SeatHandler {
         const x = ev.x ?? 0;
         const y = ev.y ?? 0;
         lastX = x; lastY = y;
+        // Move the software cursor with the pointer (Phase 9c). The
+        // compositor's cursor slot draws above every layer; visibility
+        // and texture-installed gate inclusion -- so this is cheap when
+        // no cursor is set up yet. pointerEnter restores visibility
+        // after a prior pointerLeave hide.
+        if (ev.type === "pointerEnter") ctx.state.compositor.setCursorVisible?.(true);
+        ctx.state.compositor.setCursorPosition?.(x, y);
+        // Feed kinematic state machine. State.cursorKinematics is wired
+        // in main.ts; harnesses that don't bring up cursor leave it
+        // absent (the call is optional-chained).
+        ctx.state.cursorKinematics?.update(x, y, ev.time ?? performance.now());
         const hit = pick(x, y);
         const prevPointerSurface = seat.focus?.surfaceId ?? null;
         if (seat.focus && (!hit || hit.surfaceId !== seat.focus.surfaceId)) {
@@ -211,6 +324,12 @@ export default function makeSeat(ctx: Ctx, driver: FocusDriver): SeatHandler {
         if (prev !== null) {
           dispatchFocus("pointer-leave", undefined, null);
         }
+        // Host pointer left the overdraw window: hide the software
+        // cursor. setCursorVisible(true) is restored either on
+        // pointerEnter below or on the next external cursor install
+        // (depending on policy; today we restore on next motion via
+        // the install-time visibility default).
+        ctx.state.compositor.setCursorVisible?.(false);
         break;
       }
       case "pointerButton": {
@@ -300,6 +419,9 @@ export default function makeSeat(ctx: Ctx, driver: FocusDriver): SeatHandler {
     pick,
     pointerPosition() { return { x: lastX, y: lastY }; },
     drag: null,
+    // Phase 9c: cursor handling shared with makePointer (set_cursor) and
+    // wl_surface.commit (cursor-role surface texture refresh).
+    cursor: cursorOps,
     // Begin a DnD pointer grab. While set, handleInput routes pointer motion/
     // button to these callbacks instead of wl_pointer (see handleInput). The
     // data-device module supplies onMotion/onButton and clears drag on drop/abort.
@@ -347,10 +469,58 @@ export default function makeSeat(ctx: Ctx, driver: FocusDriver): SeatHandler {
 // wl_pointer / wl_keyboard child-resource handlers: just handle release/destroy.
 export function makePointer(ctx: Ctx): WlPointerHandler {
   return {
-    set_cursor(_resource, _serial, _surface, _hx, _hy) {
-      // Client cursor surface not composited yet (software cursor is future).
+    set_cursor(resource, serial, surface, hx, hy) {
+      const seat = ctx.state.seat;
+      if (!seat) return;
+      // Phase 9c: validate against the most-recent enter serial for this
+      // pointer resource. Stale requests (serial < latest enter) are
+      // silently dropped per protocol convention. A missing entry means
+      // no current enter for this resource (client never had focus, or
+      // already left); also drop.
+      const exp = seat.cursor.lastEnterSerialFor(resource);
+      if (exp === undefined || serial < exp) return;
+
+      const clientId = ctx.addon.clientId(resource);
+
+      if (!surface) {
+        // NULL surface => client wants no cursor over its surface.
+        seat.cursor.setClientCursor(clientId, {
+          surfaceResource: null,
+          hotspotX: 0,
+          hotspotY: 0,
+          hidden: true,
+        });
+        return;
+      }
+
+      // Role lock: the surface is permanently bound to role "cursor".
+      // The spec requires a surface have only one role for its lifetime.
+      // Other role-attach paths (xdg_toplevel get_toplevel, subsurface,
+      // popup) check sRec.role; reaching here from any of those with a
+      // cursor-roled surface posts a protocol error THERE.
+      const sRec = ctx.state.surfaces.get(surface);
+      if (sRec) {
+        if (sRec.role && sRec.role !== "cursor") {
+          // Surface already has a different role. Per spec this is a
+          // protocol error; for now drop silently (no post_error path).
+          // TODO(role-errors): wire post_error wlr-style.
+          return;
+        }
+        sRec.role = "cursor";
+      }
+
+      seat.cursor.setClientCursor(clientId, {
+        surfaceResource: surface,
+        hotspotX: hx,
+        hotspotY: hy,
+        hidden: false,
+      });
     },
-    release(resource) { cleanup(ctx, resource); },
+    release(resource) {
+      const seat = ctx.state.seat;
+      seat?.cursor.clearEnterSerial(resource);
+      cleanup(ctx, resource);
+    },
   };
 }
 

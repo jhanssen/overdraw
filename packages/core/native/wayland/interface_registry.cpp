@@ -63,8 +63,16 @@ bool InterfaceRegistry::build(std::string& err) {
                     if ((arg.type == 'o' || arg.type == 'n') && !arg.interface.empty()) {
                         auto it = built_.find(arg.interface);
                         if (it == built_.end()) {
-                            err = "unregistered interface referenced: " + arg.interface;
-                            return false;
+                            // Cross-protocol references to interfaces this
+                            // compositor does not support land here (e.g.
+                            // wp_cursor_shape_v1's get_tablet_tool_v2 refers
+                            // to zwp_tablet_tool_v2). libwayland accepts a
+                            // null types[] slot for an object/new_id arg
+                            // (treated as generic / loosely-typed). Leave
+                            // it null and continue rather than refusing to
+                            // build the registry.
+                            typeVec[a] = nullptr;
+                            continue;
                         }
                         typeVec[a] = it->second->iface.get();
                     }

@@ -49,6 +49,7 @@ const GLOBALS = [
   "wl_compositor", "xdg_wm_base", "wl_shm", "zwp_linux_dmabuf_v1", "wl_seat",
   "wl_subcompositor", "wl_output", "wl_data_device_manager",
   "zwp_primary_selection_device_manager_v1",
+  "wp_cursor_shape_manager_v1",
 ];
 
 // Interfaces created via requests (new_id), registered without a global so
@@ -60,6 +61,7 @@ const CHILD_INTERFACES = [
   "wl_subsurface", "wl_data_device", "wl_data_source", "wl_data_offer", "wl_callback",
   "zwp_primary_selection_device_v1", "zwp_primary_selection_source_v1",
   "zwp_primary_selection_offer_v1",
+  "wp_cursor_shape_device_v1",
 ];
 
 // Load all generated signature modules, keyed by interface name.
@@ -372,6 +374,8 @@ export async function installProtocols(
     wl_subcompositor: await import("./wl_subcompositor.js"),
     wl_output: await import("./wl_output.js"),
     wl_data_device_manager: await import("./wl_data_device_manager.js"),
+    // wp_cursor_shape_manager_v1 is exposed via globalHandlers; the
+    // module's helper factories aren't a default export.
   };
 
   // Some child interfaces have handlers from a sibling module's named exports.
@@ -379,6 +383,7 @@ export async function installProtocols(
   const dmabufMod = await import("./zwp_linux_dmabuf_v1.js");
   const subMod = await import("./wl_subcompositor.js");
   const ddmMod = await import("./wl_data_device_manager.js");
+  const cursorShapeMod = await import("./cursor_shape.js");
   const childHandlers: Record<string, object> = {
     wl_pointer: seatMod.makePointer(ctx),
     wl_keyboard: seatMod.makeKeyboard(ctx),
@@ -391,6 +396,7 @@ export async function installProtocols(
     zwp_primary_selection_source_v1: ddmMod.makePrimarySource(ctx),
     zwp_primary_selection_offer_v1: ddmMod.makePrimaryOffer(ctx),
     wl_callback: {}, // event-only (done); no requests to dispatch
+    wp_cursor_shape_device_v1: cursorShapeMod.makeCursorShapeDevice(ctx),
   };
 
   // The apply target forwards lazily: the seat is constructed below and
@@ -410,6 +416,7 @@ export async function installProtocols(
   const globalHandlers: Record<string, object> = {
     wl_seat: seatMod.default(ctx, focusDriver),
     zwp_primary_selection_device_manager_v1: ddmMod.makePrimaryManager(ctx),
+    wp_cursor_shape_manager_v1: cursorShapeMod.makeCursorShapeManager(ctx),
   };
 
   for (const name of CHILD_INTERFACES) {

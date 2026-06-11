@@ -133,6 +133,23 @@ const compositor: CompositorSink = new JsCompositor(device, dawn.globals, addon,
   { nested: true, format: addon.outputFormat() });
 console.log("[overdraw] compositor: JS (over the Dawn wire)");
 
+// Phase 9c: install the built-in default cursor. The XCursor theme
+// resolver picks up XCURSOR_THEME / XCURSOR_SIZE from env; for
+// 'default' the resolver always succeeds (built-in 16x16 fallback
+// if no theme on disk). The cursor draws above every other layer
+// (drawOrder appends it last when visible + textured).
+{
+  const cursorSize = Number(process.env.XCURSOR_SIZE) || 24;
+  const r = addon.resolveCursorShape("default", cursorSize, 1);
+  if (r) {
+    compositor.setCursorPixels?.(r.rgba, r.width, r.height, r.hotspotX, r.hotspotY);
+    compositor.setCursorVisible?.(true);
+    console.log(`[overdraw] cursor: default ${r.width}x${r.height} hotspot=(${r.hotspotX},${r.hotspotY})`);
+  } else {
+    console.warn("[overdraw] cursor: default shape not resolved; no cursor shown");
+  }
+}
+
 const sock = addon.startServer();
 
 // The WM needs a layout driver before installProtocols creates it; the driver

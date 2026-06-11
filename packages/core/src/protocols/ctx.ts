@@ -182,6 +182,28 @@ export interface CompositorSink {
   // Tear down a phantom created via createClosingPhantom. Removes
   // from the draw order; destroys the snapshot texture. Idempotent.
   destroyClosingPhantom?(phantomSurfaceId: number): void;
+
+  // Phase 9c: software cursor slot. The cursor draws above every other
+  // layer; visibility + texture-installed gate inclusion. Install paths:
+  //   setCursorPixels  -- CPU BGRA8 bytes (theme resolver output,
+  //                       plugin setImage in-thread).
+  //   setCursorFromSurface -- point the slot at an existing surface
+  //                       whose buffer pipeline drives its texture
+  //                       (wl_pointer.set_cursor client surface).
+  //   setCursorTexture -- already-on-device GPUTexture (test fixtures).
+  // setCursorPosition takes pointer coordinates; the cursor draws at
+  // (pointer - hotspot). All optional: GPU-free harnesses skip cursor
+  // compositing.
+  setCursorPixels?(bytes: Uint8Array,
+                   width: number, height: number,
+                   hotspotX: number, hotspotY: number): void;
+  setCursorFromSurface?(surfaceId: number | null,
+                        hotspotX: number, hotspotY: number): void;
+  setCursorTexture?(tex: GPUTexture, width: number, height: number,
+                    hotspotX: number, hotspotY: number): void;
+  setCursorPosition?(x: number, y: number): void;
+  setCursorVisible?(visible: boolean): void;
+  clearCursor?(): void;
 }
 
 export interface CompositorState {
@@ -218,6 +240,10 @@ export interface CompositorState {
   // no closing plugin is registered -- the unmap then proceeds
   // instantly (pre-phase-9a behavior).
   closingDriver?: import("./closing-driver.js").ClosingDriver;
+  // Phase 9c: cursor kinematic state machine. Pointer motion events in
+  // wl_seat feed it; the cursor rule engine reads its snapshot per frame.
+  // Absent in GPU-free harnesses that don't bring up cursor support.
+  cursorKinematics?: import("../cursor/kinematics.js").Kinematics;
   lastCommittedSurfaceId?: number;
   // Fire all surfaces' pending wl_surface.frame callbacks (set by installProtocols;
   // called once per compositor frame). timeMs is a millisecond timestamp.
@@ -402,6 +428,29 @@ export interface SeatState {
   drag: DragGrab | null;
   beginDrag(d: DragGrab): void;
   endDrag(): void;
+  // Phase 9c: cursor state (per-pointer-resource enter serials, per-client
+  // cursor preference). Owned by wl_seat, accessed by wl_pointer (set_cursor
+  // serial validation + client preference recording) and by wl_surface
+  // (cursor-role surface commit triggers a slot re-apply).
+  cursor: SeatCursorOps;
+}
+
+export interface ClientCursor {
+  surfaceResource: import("../types.js").Resource | null;
+  hotspotX: number;
+  hotspotY: number;
+  hidden: boolean;
+}
+
+export interface SeatCursorOps {
+  recordEnterSerial(p: import("../types.js").Resource, serial: number): void;
+  clearEnterSerial(p: import("../types.js").Resource): void;
+  lastEnterSerialFor(p: import("../types.js").Resource): number | undefined;
+  setClientCursor(clientId: number, c: ClientCursor): void;
+  // Called by wl_surface.commit when the surface has role "cursor": if
+  // it is the current pointer focus's active cursor surface, re-apply
+  // it so the new texture is picked up.
+  onCursorSurfaceCommit(surfaceResource: import("../types.js").Resource): void;
 }
 
 // Callbacks the data-device DnD machinery installs on the seat during a drag.

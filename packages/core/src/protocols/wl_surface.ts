@@ -166,6 +166,14 @@ export default function makeSurface(ctx: Ctx): WlSurfaceHandler {
       }
 
       if (s.xdgSurface) s.xdgSurface.lastCommitSerial = ctx.state.nextSerial - 1;
+
+      // Phase 9c: if this surface has the "cursor" role and is the
+      // current pointer focus's active cursor surface, re-apply the
+      // cursor slot so the just-uploaded texture is picked up by the
+      // compositor. The seat re-checks ownership before mutating.
+      if (s.role === "cursor") {
+        ctx.state.seat?.cursor.onCursorSurfaceCommit(resource);
+      }
     },
     destroy(resource) {
       const s = rec(resource);

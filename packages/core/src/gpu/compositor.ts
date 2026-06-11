@@ -833,6 +833,22 @@ export class JsCompositor implements CompositorSink {
       }
       else { const ids = this.layers.get(layer); if (ids) out.push(...ids); }
     }
+    // Phase 9c: the cursor is always on top -- above every layer,
+    // above phantoms, above any plugin overlay. The target surfaceId
+    // can be the internal cursor surface (CPU-uploaded image) or any
+    // existing surface (e.g. a wl_pointer.set_cursor client surface).
+    // Visibility flag + target-set + target-has-texture gate inclusion.
+    if (this.cursorVisible && this.cursorTargetSurfaceId !== null) {
+      const s = this.surfaces.get(this.cursorTargetSurfaceId);
+      if (s && s.texture) {
+        // When the target is a regular WM surface that's ALSO in the
+        // content stack (a client cursor surface should not be — those
+        // are never in the WM stack — but defensively), avoid pushing
+        // it twice. drawOrder dedup is the caller's responsibility for
+        // ordinary stacks, but we own this insertion.
+        out.push(this.cursorTargetSurfaceId);
+      }
+    }
     return out;
   }
 
@@ -1766,6 +1782,196 @@ export class JsCompositor implements CompositorSink {
 
   // For tests: enumerate active phantom surfaceIds in draw order.
   activePhantomIds(): number[] { return this.phantoms.slice(); }
+
+  // ----- Cursor slot (Phase 9c) ---------------------------------------------
+  //
+  // A singleton overlay drawn ABOVE every other layer. The cursor "slot"
+  // is a reference to a surfaceId + hotspot + visibility; drawOrder()
+  // appends it last whenever (visible && a target surfaceId is set &&
+  // that surface has a texture).
+  //
+  // Two ways to install a cursor:
+  //   setCursorPixels(bytes, w, h, hotX, hotY): CPU-side BGRA8 bytes are
+  //     uploaded into a compositor-owned internal surface; that surface's
+  //     surfaceId becomes the slot's target. Used by the theme resolver
+  //     output and (later) by plugin setImage in-thread.
+  //   setCursorFromSurface(surfaceId, hotX, hotY): point the slot at an
+  //     EXISTING surface (one with its own buffer pipeline running, e.g.
+  //     a wl_pointer.set_cursor surface). The slot picks up texture
+  //     changes automatically as that surface commits new buffers.
+  //
+  // The hotspot is the offset within the cursor image that aligns with the
+  // pointer's hot point. setCursorPosition() takes the pointer position;
+  // the cursor draws at (pointerX - hotX, pointerY - hotY).
+  //
+  // The compositor's internal cursor surface lives at a reserved high
+  // surfaceId outside any WM range; it is never fed through the client-
+  // buffer lifecycle and never appears in any layer or stack list.
+
+  private readonly internalCursorSurfaceId = 0x7FFF_FFF0;   // reserved
+  private cursorTargetSurfaceId: number | null = null;
+  private cursorVisible = false;
+  private cursorOwnedTexture: GPUTexture | null = null;     // for internal surface
+  private cursorHotspotX = 0;
+  private cursorHotspotY = 0;
+  private cursorPointerX = 0;
+  private cursorPointerY = 0;
+
+  // Place the cursor target surface at (pointer - hotspot). Called on
+  // every position update, and after install.
+  private updateCursorLayout(): void {
+    if (this.cursorTargetSurfaceId === null) return;
+    const s = this.surfaces.get(this.cursorTargetSurfaceId);
+    if (!s) return;
+    const x = this.cursorPointerX - this.cursorHotspotX;
+    const y = this.cursorPointerY - this.cursorHotspotY;
+    s.x = x; s.y = y;
+    // For the internal surface, layoutW/H match the sampled texture
+    // dims; for a client surface, the client owns layoutW/H via the
+    // normal protocol path and we don't override it.
+    if (this.cursorTargetSurfaceId === this.internalCursorSurfaceId) {
+      s.layoutW = s.width;
+      s.layoutH = s.height;
+    }
+  }
+
+  // Install a CPU-side BGRA8 cursor image into the internal cursor surface
+  // and point the cursor slot at it. Allocates / reuses a core-device
+  // texture; uploads via queue.writeTexture.
+  setCursorPixels(bytes: Uint8Array,
+                  width: number, height: number,
+                  hotspotX: number, hotspotY: number): void {
+    if (width <= 0 || height <= 0 || bytes.length !== width * height * 4) {
+      throw new Error(`setCursorPixels: invalid dims/bytes (${width}x${height}, ${bytes.length} bytes)`);
+    }
+    const owned = this.cursorOwnedTexture;
+    let tex = owned;
+    if (!tex || tex.width !== width || tex.height !== height) {
+      if (owned) owned.destroy();
+      tex = this.device.createTexture({
+        size: { width, height, depthOrArrayLayers: 1 },
+        format: "bgra8unorm",
+        // TEXTURE_BINDING for sampling, COPY_DST for queue.writeTexture.
+        // RENDER_ATTACHMENT isn't strictly required for sampling but
+        // keeps the texture compatible with any render-into-cursor
+        // future path (e.g. a scale/transform pass).
+        usage: this.g.GPUTextureUsage.TEXTURE_BINDING
+             | this.g.GPUTextureUsage.COPY_DST
+             | this.g.GPUTextureUsage.RENDER_ATTACHMENT,
+      });
+      this.cursorOwnedTexture = tex;
+    }
+    this.device.queue.writeTexture(
+      { texture: tex, mipLevel: 0, origin: { x: 0, y: 0, z: 0 } },
+      bytes,
+      { offset: 0, bytesPerRow: width * 4, rowsPerImage: height },
+      { width, height, depthOrArrayLayers: 1 },
+    );
+    // Install into the internal cursor surface (mint on first use).
+    if (!this.surfaces.has(this.internalCursorSurfaceId)) {
+      this.surfaces.set(this.internalCursorSurfaceId, blankSurface(0, 0, width, height));
+    }
+    this.setSurfaceTexture(this.internalCursorSurfaceId, tex, width, height);
+    this.cursorTargetSurfaceId = this.internalCursorSurfaceId;
+    this.cursorHotspotX = hotspotX;
+    this.cursorHotspotY = hotspotY;
+    this.updateCursorLayout();
+  }
+
+  // Point the cursor slot at an existing surface (e.g. a client cursor
+  // surface for wl_pointer.set_cursor). The surface's normal buffer
+  // pipeline drives its texture; the slot just observes. The slot reads
+  // the surface's width/height per frame to compute the layout rect.
+  // If `surfaceId === null`, clears the target (cursor hidden).
+  // If the surface doesn't exist yet (set_cursor with NULL), the slot
+  // is cleared.
+  setCursorFromSurface(surfaceId: number | null,
+                       hotspotX: number, hotspotY: number): void {
+    // If switching away from the internal surface, free the owned
+    // texture -- the slot won't be using it anymore.
+    if (surfaceId !== this.internalCursorSurfaceId && this.cursorOwnedTexture) {
+      this.cursorOwnedTexture.destroy();
+      this.cursorOwnedTexture = null;
+      // Drop the internal surface entry too (it's no longer needed).
+      const intern = this.surfaces.get(this.internalCursorSurfaceId);
+      if (intern && surfaceId !== this.internalCursorSurfaceId) {
+        if (intern.uniformBuf) intern.uniformBuf.destroy();
+        this.surfaces.delete(this.internalCursorSurfaceId);
+      }
+    }
+    this.cursorTargetSurfaceId = surfaceId;
+    this.cursorHotspotX = hotspotX;
+    this.cursorHotspotY = hotspotY;
+    this.updateCursorLayout();
+  }
+
+  // Deprecated direct-texture install (kept for tests that hand-craft a
+  // GPUTexture). New callers should use setCursorPixels (CPU bytes) or
+  // setCursorFromSurface (existing surface).
+  setCursorTexture(tex: GPUTexture, width: number, height: number,
+                   hotspotX: number, hotspotY: number): void {
+    if (this.cursorOwnedTexture) {
+      this.cursorOwnedTexture.destroy();
+      this.cursorOwnedTexture = null;
+    }
+    if (!this.surfaces.has(this.internalCursorSurfaceId)) {
+      this.surfaces.set(this.internalCursorSurfaceId, blankSurface(0, 0, width, height));
+    }
+    this.setSurfaceTexture(this.internalCursorSurfaceId, tex, width, height);
+    this.cursorTargetSurfaceId = this.internalCursorSurfaceId;
+    this.cursorHotspotX = hotspotX;
+    this.cursorHotspotY = hotspotY;
+    this.updateCursorLayout();
+  }
+
+  // Update pointer position. Called on every host pointer motion event.
+  // No-op when no cursor texture is installed yet.
+  setCursorPosition(x: number, y: number): void {
+    this.cursorPointerX = x;
+    this.cursorPointerY = y;
+    this.updateCursorLayout();
+  }
+
+  setCursorVisible(visible: boolean): void {
+    this.cursorVisible = visible;
+  }
+
+  // Tear down the cursor entirely. Called on compositor shutdown; tests use
+  // this between cases.
+  clearCursor(): void {
+    this.cursorVisible = false;
+    this.cursorTargetSurfaceId = null;
+    const intern = this.surfaces.get(this.internalCursorSurfaceId);
+    if (intern) {
+      if (intern.uniformBuf) intern.uniformBuf.destroy();
+      this.surfaces.delete(this.internalCursorSurfaceId);
+    }
+    if (this.cursorOwnedTexture) {
+      this.cursorOwnedTexture.destroy();
+      this.cursorOwnedTexture = null;
+    }
+  }
+
+  // Test/introspection accessors.
+  cursorState(): {
+    visible: boolean; targetSurfaceId: number | null;
+    x: number; y: number;
+    width: number; height: number;
+    hotspotX: number; hotspotY: number;
+  } {
+    const sid = this.cursorTargetSurfaceId;
+    const s = sid !== null ? this.surfaces.get(sid) : undefined;
+    return {
+      visible: this.cursorVisible && sid !== null && !!s && !!s.texture,
+      targetSurfaceId: sid,
+      x: s?.x ?? 0,
+      y: s?.y ?? 0,
+      width: s?.width ?? 0,
+      height: s?.height ?? 0,
+      hotspotX: this.cursorHotspotX,
+      hotspotY: this.cursorHotspotY,
+    };
+  }
 
   // Render the listed windows into a PRE-ALLOCATED target view, with optional
   // producer Begin/End wrapping for cross-device dmabuf targets (phase 5b
