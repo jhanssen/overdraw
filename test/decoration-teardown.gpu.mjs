@@ -50,7 +50,7 @@ test("decorated window unmap: decoration stops compositing + frees GPU resources
     pingIntervalMs: 500, maxMissedPongs: 10, shutdownTimeoutMs: 800, heapMb: 128, log: () => {},
     bus: pluginBus,
     onEvent: (_p, name, data) => { if (name === "log") logs.push(String(data)); },
-    onRequest: (p, m, params) => m.startsWith("decoration.") ? decoBroker.onRequest(p, m, params) : gpuBroker(p, m, params),
+    onRequest: (p, m, params) => m.startsWith("decoration.") ? decoBroker.onRequest(p, m, params) : gpuBroker.onRequest(p, m, params),
   });
 
   try {

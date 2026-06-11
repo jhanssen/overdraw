@@ -183,6 +183,36 @@ export interface CompositorSink {
   // from the draw order; destroys the snapshot texture. Idempotent.
   destroyClosingPhantom?(phantomSurfaceId: number): void;
 
+  // Phase 10a buffer intercept: route a surface's sampled texture
+  // through a plugin-supplied view. The intercept broker drives this
+  // each frame after invoking the plugin's render callback. Optional
+  // `placement` overrides the surface's WM-assigned rect for the
+  // compose pass only (the outputRect return). Clearing reverts the
+  // surface to its client texture for compositing.
+  installInterceptOutput?(surfaceId: number, view: GPUTextureView,
+                          placement: { x: number; y: number; w: number; h: number } | null): void;
+  clearInterceptOutput?(surfaceId: number): void;
+  // Phase 10a: the broker queries these per frame to drive the
+  // intercept's render callback. surfaceClientTexture returns the
+  // current sampled client texture for the surface (the input the
+  // plugin will read from). surfaceIsPresentable gates the per-frame
+  // render dispatch to surfaces actually being composited.
+  surfaceClientTexture?(surfaceId: number): { texture: GPUTexture; w: number; h: number } | null;
+  surfaceIsPresentable?(surfaceId: number): boolean;
+  // Phase 10a Worker intercept: copy the surface's currently-
+  // committed client texture into a dmabuf the Worker plugin
+  // samples. Both textures are on the core device; the dmabuf was
+  // allocated via AllocComposeBuf. The copy is wrapped in producer
+  // Begin/End on the core wire so the plugin's consumer Begin
+  // chains on the produced fence. The caller (SurfaceProducer)
+  // wrote the producer Begin before this; the matching End is
+  // written by presentSync() after. Returns true on success; false
+  // if the surface has no committed texture.
+  copyClientToInterceptInputSlot?(args: {
+    surfaceId: number;
+    dstTex: GPUTexture;
+  }): boolean;
+
   // Phase 9c: software cursor slot. The cursor draws above every other
   // layer; visibility + texture-installed gate inclusion. Install paths:
   //   setCursorPixels  -- CPU BGRA8 bytes (theme resolver output,

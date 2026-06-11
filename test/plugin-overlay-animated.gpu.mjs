@@ -55,7 +55,7 @@ test("animated plugin overlay: composited output changes across frames", { skip:
       pluginAddonPath: join(OD, "build", "overdraw_plugin_native.node"),
       dawnPath: globSync(join(OD, "build", "3rdparty", "dawn", "Dawn-*", "dawn.node"))[0],
       onEvent: () => {},
-      onRequest: (p, m, params) => gpuBroker(p, m, params),
+      onRequest: (p, m, params) => gpuBroker.onRequest(p, m, params),
     });
     await runtime.load([{
       module: pathToFileURL(join(__dirname, "fixtures", "plugins", "overlay-animated.mjs")).href,

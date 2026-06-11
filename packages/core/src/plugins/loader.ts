@@ -35,6 +35,11 @@ import { createPluginInput } from "./input-sdk.js";
 import { createTransitions } from "./transitions-sdk.js";
 import type { PluginTransitions } from "./transitions-sdk.js";
 import { createPluginCursor } from "./cursor-sdk.js";
+import {
+  createInThreadInterceptSdk, createWorkerInterceptSdk,
+  dispatchInterceptEvent, releaseAllInterceptStates,
+} from "./intercept-sdk.js";
+import type { InterceptAPI } from "@overdraw/intercept-types";
 
 export interface LoaderInput {
   module: string;
@@ -64,6 +69,7 @@ export async function runLoader(channel: Channel, input: LoaderInput): Promise<v
   // snapshot today; live mode lands in phase 5b-live).
   let compose: PluginCompose | undefined;
   let transitions: PluginTransitions | undefined;
+  let intercept: InterceptAPI | undefined;
   if (input.inThreadGpu) {
     const g = createInThreadGpu(input.name, input.inThreadGpu);
     gpu = g.gpu;
@@ -74,6 +80,17 @@ export async function runLoader(channel: Channel, input: LoaderInput): Promise<v
       input.inThreadGpu.sceneRegistry,
     ) ?? undefined;
     transitions = createTransitions(endpoint);
+    // Phase 10a: in-thread intercept SDK. The broker is reached
+    // directly (no IPC) when wired; absent when the harness/launcher
+    // didn't construct it.
+    if (input.inThreadGpu.interceptBroker) {
+      const broker = input.inThreadGpu.interceptBroker;
+      intercept = createInThreadInterceptSdk({
+        pluginName: input.name,
+        registerInThread: (spec, name) => broker.registerInThread(spec, name),
+        unregister: (id) => broker.unregister(id),
+      });
+    }
   } else if (input.pluginAddonPath && input.dawnPath) {
     const g = await createPluginGpu(endpoint, input.pluginAddonPath, input.dawnPath);
     gpu = g.gpu;
@@ -91,6 +108,19 @@ export async function runLoader(channel: Channel, input: LoaderInput): Promise<v
       allocSurfaceBufId: g.internals.allocSurfaceBufId,
     });
     transitions = createTransitions(endpoint);
+    // Phase 10a Worker intercept: full cross-device dmabuf wiring.
+    // The SDK reuses the existing plugin GPU machinery (the plugin's
+    // wire client, device, addon) which createPluginGpu just brought up.
+    intercept = createWorkerInterceptSdk({
+      pluginName: input.name,
+      endpoint,
+      clientId: g.internals.clientId,
+      pluginDeviceHandle: g.internals.devHandle,
+      dawn: g.internals.dawn,
+      plugin: g.internals.plugin,
+      allocSurfaceBufId: g.internals.allocSurfaceBufId,
+      device: gpu.device,
+    });
   }
 
   const eventsHandle = createPluginEvents(endpoint);
@@ -105,7 +135,7 @@ export async function runLoader(channel: Channel, input: LoaderInput): Promise<v
   const control = createSdk(input.name, (line) => { endpoint.emit("log", line); },
     eventsHandle.events, nsHandle.ns, actionsHandle.actions, windowsCtl.windows,
     animations, inputHandle.input, gpu, decorations?.decorations, compose,
-    transitions, cursorCtl.cursor);
+    transitions, cursorCtl.cursor, intercept);
 
   endpoint.handleRequests(async (method, params): Promise<Json> => {
     const ns = nsHandle.dispatcher.tryHandle(method, params);
@@ -118,6 +148,11 @@ export async function runLoader(channel: Channel, input: LoaderInput): Promise<v
     if (ev.handled) return await ev.result;
 
     if (method === "shutdown") {
+      // Drain any worker intercept loops BEFORE the GPU stops; they
+      // hold Atomics.waitAsync promises against SABs and pending
+      // Dawn submits. releaseAllInterceptStates() flips their
+      // stopped flag and clears the active set.
+      releaseAllInterceptStates();
       stopGpu();
       cursorCtl.release();
       await control.runShutdown();
@@ -129,6 +164,7 @@ export async function runLoader(channel: Channel, input: LoaderInput): Promise<v
   endpoint.handleEvents((eventName, data) => {
     if (eventsHandle.dispatcher.dispatch(eventName, data)) return;
     if (inputHandle.dispatcher.dispatch(eventName, data)) return;
+    if (dispatchInterceptEvent(eventName, data)) return;
     decorations?.dispatch(eventName, data);
   });
 

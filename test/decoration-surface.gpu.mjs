@@ -60,7 +60,7 @@ test("decoration surface composites at the inset rect above the window", { skip 
     bus: pluginBus,
     onEvent: (_p, name, data) => { if (name === "log") logs.push(String(data)); },
     onRequest: (p, method, params) =>
-      method.startsWith("decoration.") ? decoBroker.onRequest(p, method, params) : gpuBroker(p, method, params),
+      method.startsWith("decoration.") ? decoBroker.onRequest(p, method, params) : gpuBroker.onRequest(p, method, params),
   });
 
   try {

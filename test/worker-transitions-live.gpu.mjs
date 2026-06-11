@@ -70,7 +70,7 @@ test("Worker plugin: sdk.transitions.run on LIVE scenes (per-frame brackets)",
     onRequest: (plugin, method, params) => {
       if (method.startsWith("gpu.") || method.startsWith("surface.")
           || method.startsWith("compose.")) {
-        return gpuBroker(plugin, method, params);
+        return gpuBroker.onRequest(plugin, method, params);
       }
       if (method.startsWith("transitions.")) {
         const r = transitionsBroker(plugin, method, params);

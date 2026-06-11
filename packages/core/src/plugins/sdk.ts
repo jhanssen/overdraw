@@ -21,6 +21,7 @@ import type { PluginCompose } from "./compose-sdk.js";
 import type { PluginInput } from "./input-sdk.js";
 import type { PluginTransitions } from "./transitions-sdk.js";
 import type { CursorAPI } from "@overdraw/cursor-types";
+import type { InterceptAPI } from "@overdraw/intercept-types";
 
 export interface PluginSdk {
   // The plugin's stable name (config `name`, defaulting to its module).
@@ -84,6 +85,15 @@ export interface PluginSdk {
   // cursor broker + rule engine (always, when the JS compositor's
   // cursor slot is wired).
   cursor?: CursorAPI;
+  // Buffer intercept (intercept-design.md, Phase 10a): per-pixel
+  // intercept of matched client surfaces. Plugin registers with a
+  // match predicate + setup callback; the SDK runs setup once,
+  // dispatches render every visible frame on matched surfaces, and
+  // composites the plugin's output in place of the client buffer.
+  // 10a: in-thread bundled plugins work end-to-end; Worker plugins
+  // get the same SDK shape but `register` throws "not yet supported"
+  // until the cross-device transport lands.
+  intercept?: InterceptAPI;
 }
 
 // Internal handle the bootstrap uses to drive the SDK (run the shutdown cb, etc.)
@@ -102,7 +112,8 @@ export function createSdk(name: string, emitLog: (line: string) => void,
                           decorations?: PluginDecorations,
                           compose?: PluginCompose,
                           transitions?: PluginTransitions,
-                          cursor?: CursorAPI): SdkControl {
+                          cursor?: CursorAPI,
+                          intercept?: InterceptAPI): SdkControl {
   let shutdownCb: ShutdownCallback | null = null;
 
   const sdk: PluginSdk = {
@@ -127,6 +138,7 @@ export function createSdk(name: string, emitLog: (line: string) => void,
     ...(compose ? { compose } : {}),
     ...(transitions ? { transitions } : {}),
     ...(cursor ? { cursor } : {}),
+    ...(intercept ? { intercept } : {}),
   };
 
   return {

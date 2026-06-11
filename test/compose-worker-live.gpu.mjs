@@ -60,7 +60,7 @@ test("sdk.compose.scene LIVE for Worker plugins reflects per-frame state changes
       }
       if (method.startsWith("gpu.") || method.startsWith("surface.")
           || method.startsWith("compose.")) {
-        return gpuBroker(plugin, method, params);
+        return gpuBroker.onRequest(plugin, method, params);
       }
       throw new Error(`unexpected request: ${method}`);
     },

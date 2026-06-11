@@ -9,6 +9,7 @@
     { "path": "./packages/sdk-anim" },
     { "path": "./packages/transition-types" },
     { "path": "./packages/cursor-types" },
+    { "path": "./packages/intercept-types" },
     { "path": "./packages/workspace-types" },
     { "path": "./packages/plugin-workspace-default" },
     { "path": "./packages/hotkey-types" },

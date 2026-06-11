@@ -84,7 +84,25 @@ export interface GpuBrokerDeps {
   onSurfacePresented?: (surfaceId: number) => void;
 }
 
-export function createGpuBroker(deps: GpuBrokerDeps) {
+export interface GpuBroker {
+  // The plugin request route (intercept by main.ts's onRequest).
+  onRequest(pluginName: string, method: string, params: unknown): Promise<unknown>;
+  // Resolve a plugin name to its wire connection id, or undefined if
+  // the plugin hasn't called gpu.connect yet. Used by the intercept
+  // Worker broker which needs the connId to alloc dmabufs.
+  connIdForPlugin(pluginName: string): number | undefined;
+  // Async wrappers around AllocComposeBuf / AllocSurfaceBuf for cross-
+  // device dmabuf allocations. Exposed for the intercept Worker
+  // transport.
+  allocCompose(connId: number, w: number, h: number,
+               ctId: number, ctGen: number, cdId: number, cdGen: number,
+               wireSerial: bigint): Promise<{ surfaceBufId: number }>;
+  allocSurface(connId: number, w: number, h: number,
+               ptId: number, ptGen: number, pdId: number, pdGen: number,
+               wireSerial: bigint): Promise<{ surfaceBufId: number }>;
+}
+
+export function createGpuBroker(deps: GpuBrokerDeps): GpuBroker {
   const { addon, compositor, overlays, dawn, coreDeviceHandle } = deps;
   // Fall back to a broker-private registry when none is supplied.
   // Callers that want to expose Worker SceneHandles to transitions (or
@@ -120,7 +138,7 @@ export function createGpuBroker(deps: GpuBrokerDeps) {
   // (the ring shares one logical scene).
   const sceneIdByBuf = new Map<number, number>();
 
-  return async function onRequest(pluginName: string, method: string, params: unknown): Promise<unknown> {
+  const onRequest = async function (pluginName: string, method: string, params: unknown): Promise<unknown> {
     const p = (params ?? {}) as Record<string, number | string | bigint | { x: number; y: number; width: number; height: number } | undefined>;
     switch (method) {
       case "gpu.connect": {
@@ -549,5 +567,14 @@ export function createGpuBroker(deps: GpuBrokerDeps) {
       default:
         throw new Error(`gpu-broker: unknown method '${method}'`);
     }
+  };
+
+  return {
+    onRequest,
+    connIdForPlugin: (pluginName) => connByPlugin.get(pluginName),
+    allocCompose: (connId, w, h, ctId, ctGen, cdId, cdGen, wireSerial) =>
+      pAllocCompose(addon, connId, w, h, ctId, ctGen, cdId, cdGen, wireSerial),
+    allocSurface: (connId, w, h, ptId, ptGen, pdId, pdGen, wireSerial) =>
+      pAlloc(addon, connId, w, h, ptId, ptGen, pdId, pdGen, wireSerial),
   };
 }

@@ -61,7 +61,7 @@ test("Worker plugin: sdk.transitions.run drives a transition end to end (snapsho
     onRequest: (plugin, method, params) => {
       if (method.startsWith("gpu.") || method.startsWith("surface.")
           || method.startsWith("compose.")) {
-        return gpuBroker(plugin, method, params);
+        return gpuBroker.onRequest(plugin, method, params);
       }
       if (method.startsWith("transitions.")) {
         const r = transitionsBroker(plugin, method, params);

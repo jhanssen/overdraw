@@ -378,6 +378,14 @@ export async function setupCompositor(opts = {}) {
       const r = cursorBroker(plugin, method, params);
       if (r !== CURSOR_NOT_HANDLED) return r;
     }
+    if (state.__interceptPluginBroker && method.startsWith("intercept.")) {
+      const r = state.__interceptPluginBroker(plugin, method, params);
+      if (r !== state.__interceptNotHandled) return r;
+    }
+    if (state.__workerGpuBroker && (method.startsWith("gpu.")
+        || method.startsWith("surface.") || method.startsWith("compose."))) {
+      return state.__workerGpuBroker.onRequest(plugin, method, params);
+    }
     if (opts.onRequest) return opts.onRequest(plugin, method, params);
     throw new Error(`harness: no handler for plugin request '${method}'`);
   };
@@ -401,13 +409,15 @@ export async function setupCompositor(opts = {}) {
     currentWorkspace: () => currentWorkspaceIndex,
   });
 
-  // When transitions (or any future sdk.compose-needing test) asks for
-  // it, bring up the InThreadGpuDeps bundle: bundled plugins get
-  // sdk.compose + sdk.gpu wired in-thread, sharing the harness's
-  // core device. Otherwise the runtime falls back to Worker GPU iff
-  // opts.pluginAddonPath / opts.dawnPath were provided.
+  // When transitions / intercept / etc. ask for it, bring up the
+  // InThreadGpuDeps bundle: bundled plugins get sdk.compose + sdk.gpu
+  // wired in-thread, sharing the harness's core device. Otherwise the
+  // runtime falls back to Worker GPU iff opts.pluginAddonPath /
+  // opts.dawnPath were provided.
   let inThreadGpuDeps;
-  if (opts.transitions && jsCompositor && coreDevice && dawn) {
+  let interceptBroker = null;
+  const needInThreadGpu = (opts.transitions || opts.intercept) && jsCompositor && coreDevice && dawn;
+  if (needInThreadGpu) {
     const { createOverlayBroker } = await import(
       "../packages/core/dist/overlay.js");
     let _serial = 5000;
@@ -420,6 +430,74 @@ export async function setupCompositor(opts = {}) {
       compositor: jsCompositor,
       sceneRegistry,
     };
+    if (opts.intercept) {
+      const { InterceptBroker } = await import(
+        "../packages/core/dist/intercept/broker.js");
+      // Worker-transport wiring requires a gpu-broker (for connId
+      // lookup + alloc helpers). Build one lazily if the test passes
+      // pluginAddonPath / dawnPath; otherwise leave the worker leg
+      // unwired (in-thread tests only).
+      const interceptBrokerOpts = {
+        bus: coreBus,
+        compositor: jsCompositor,
+        inThread: {
+          device: coreDevice,
+          textureUsage: dawn.globals.GPUTextureUsage,
+        },
+        log: opts.log ?? (() => {}),
+      };
+      let workerGpuBroker = null;
+      if (opts.pluginAddonPath && opts.dawnPath) {
+        const { createGpuBroker } = await import(
+          "../packages/core/dist/plugins/gpu-broker.js");
+        const { createOverlayBroker } = await import(
+          "../packages/core/dist/overlay.js");
+        let _s = 6000;
+        const overlayState = { serial: () => ++_s, compositor: jsCompositor };
+        const overlays2 = createOverlayBroker(overlayState, dims);
+        const h2 = addon.gpuHandles();
+        workerGpuBroker = createGpuBroker({
+          addon, compositor: jsCompositor, overlays: overlays2, dawn,
+          coreDeviceHandle: h2.device,
+          sceneRegistry,
+        });
+        interceptBrokerOpts.worker = {
+          addon, dawn,
+          coreDeviceHandle: h2.device,
+          textureUsage: dawn.globals.GPUTextureUsage,
+          connIdByPlugin: (pluginName) => workerGpuBroker.connIdForPlugin(pluginName),
+          allocCompose: (...args) => workerGpuBroker.allocCompose(...args),
+          allocSurface: (...args) => workerGpuBroker.allocSurface(...args),
+        };
+      }
+      interceptBroker = new InterceptBroker(interceptBrokerOpts);
+      inThreadGpuDeps.interceptBroker = interceptBroker;
+      // Tick the broker from beforeRender so the per-frame render
+      // dispatch happens BEFORE renderFrame samples.
+      const prior = state.beforeRender;
+      state.beforeRender = (timeMs) => {
+        prior?.(timeMs);
+        interceptBroker.tick(timeMs);
+      };
+      // Expose the worker gpu-broker + plugin-broker for the test's
+      // onRequest chain.
+      if (workerGpuBroker) {
+        const { createInterceptPluginBroker, INTERCEPT_NOT_HANDLED }
+          = await import(
+            "../packages/core/dist/plugins/intercept-plugin-broker.js");
+        const interceptPluginBroker = createInterceptPluginBroker({
+          interceptBroker,
+          emitToPlugin: (pluginName, name, data) => {
+            runtime?.emit(pluginName, name, data);
+          },
+        });
+        // Stash on the returned context so the test's onRequest
+        // routing layer can reach them.
+        state.__interceptPluginBroker = interceptPluginBroker;
+        state.__interceptNotHandled = INTERCEPT_NOT_HANDLED;
+        state.__workerGpuBroker = workerGpuBroker;
+      }
+    }
   }
 
   runtime = new PluginRuntime({
@@ -480,8 +558,45 @@ export async function setupCompositor(opts = {}) {
     for (const c of clients) { try { c.kill("SIGTERM"); } catch { /* already gone */ } }
     // Give clients a beat to disconnect cleanly, servicing the loop.
     await sleep(50);
+    // Shutdown intercept broker BEFORE runtime.stop: destroys per-
+    // surface state synchronously (releases dmabuf rings + clears
+    // compositor bindings) so no Worker wire ops are pending when
+    // addon.stop tears down the Dawn wire link. After shutdown
+    // there will be afterCurrentFrame callbacks queued (the
+    // SurfaceConsumer's End-then-free path schedules them); drive
+    // one more renderFrame + await its GPU completion so they fire
+    // and clear the wire's pending tracked-event queue before the
+    // wire link teardown happens.
+    try { interceptBroker?.shutdown(); } catch { /* ignore */ }
+    if (jsCompositor && coreDevice) {
+      try {
+        jsCompositor.renderFrame();
+        // Race onSubmittedWorkDone against a 200ms timeout: the
+        // worker's wire is still alive at this point but is being
+        // torn down imminently; if onSubmittedWorkDone hangs (no
+        // submit was pending), the timeout lets us continue.
+        await Promise.race([
+          coreDevice.queue.onSubmittedWorkDone(),
+          sleep(200),
+        ]);
+      } catch { /* ignore */ }
+    }
     // Stop the runtime before the addon so plugins quiesce before the server.
     try { await runtime.stop(); } catch { /* ignore */ }
+    // After runtime.stop the Worker is terminated; pending Worker-
+    // side callbacks against the core's wire may still be in flight.
+    // Give the libuv loop a few cycles to dispatch them before the
+    // wire teardown.
+    try {
+      await sleep(20);
+      if (jsCompositor && coreDevice) {
+        jsCompositor.renderFrame();
+        await Promise.race([
+          coreDevice.queue.onSubmittedWorkDone(),
+          sleep(100),
+        ]);
+      }
+    } catch { /* ignore */ }
     try { addon.stopServer(); } catch { /* ignore */ }
     try { addon.stop(); } catch { /* ignore */ }
     // addon.stop() reaps the GPU process; confirm none leaked (by exact comm).

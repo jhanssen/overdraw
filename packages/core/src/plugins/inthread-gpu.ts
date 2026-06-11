@@ -80,6 +80,12 @@ export interface InThreadGpuDeps {
   // Optional: when absent, in-thread SceneHandles still work for direct
   // sampling but lack a .id, so transitions.run will reject them.
   sceneRegistry?: SceneRegistry;
+  // Phase 10a intercept: the broker the in-thread sdk.intercept SDK
+  // talks to directly. Optional: when absent, sdk.intercept.register
+  // will reject (the bundled-plugin path either has it or doesn't,
+  // mirroring how sdk.transitions only works when sceneRegistry is
+  // wired).
+  interceptBroker?: import("../intercept/broker.js").InterceptBroker;
 }
 
 // Per-plugin GPU SDK construction. The plugin's name flows in so the overlay

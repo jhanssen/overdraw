@@ -1,0 +1,15 @@
+{
+  "name": "@overdraw/intercept-types",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Canonical InterceptSpec / InterceptHandlers / InterceptAPI types for the intercept namespace (intercept-design.md). Imported by core's intercept broker + match engine, and by any plugin that wants to type-check intercept registrations directly. Type-only: no runtime code.",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
+  }
+}

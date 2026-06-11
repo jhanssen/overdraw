@@ -33,6 +33,10 @@ import {
 import { createCursorThemeResolver } from "./cursor/theme-resolver.js";
 import { Kinematics } from "./cursor/kinematics.js";
 import { CursorRuleEngine } from "./cursor/rule-engine.js";
+import { InterceptBroker } from "./intercept/broker.js";
+import {
+  createInterceptPluginBroker, INTERCEPT_NOT_HANDLED,
+} from "./plugins/intercept-plugin-broker.js";
 import {
   createTransitionsBroker, NOT_HANDLED as TRANSITIONS_NOT_HANDLED,
 } from "./plugins/transitions-broker.js";
@@ -309,6 +313,43 @@ const cursorBroker = createCursorBroker({
 // Publish the kinematic state so wl_seat can feed it on pointer motion.
 state.cursorKinematics = cursorKinematics;
 
+// Intercept (Phase 10a). Match engine + per-surface state + broker.
+// In-thread bundled plugins register through the broker directly;
+// Worker plugins register via the intercept-plugin-broker route which
+// drives the cross-device dmabuf machinery shared with the gpu-broker.
+// eslint-disable-next-line no-restricted-syntax -- dawn.globals carries arbitrary GPU* entries
+const textureUsageBag = (dawn.globals as unknown as { GPUTextureUsage: typeof GPUTextureUsage }).GPUTextureUsage;
+const interceptBroker = new InterceptBroker({
+  bus,
+  compositor,
+  inThread: {
+    device,
+    textureUsage: textureUsageBag,
+  },
+  worker: {
+    addon,
+    dawn,
+    coreDeviceHandle: h.device,
+    textureUsage: textureUsageBag,
+    connIdByPlugin: (pluginName) => gpuBroker.connIdForPlugin(pluginName),
+    allocCompose: (connId, w, hh, ctId, ctGen, cdId, cdGen, wireSerial) =>
+      gpuBroker.allocCompose(connId, w, hh, ctId, ctGen, cdId, cdGen, wireSerial),
+    allocSurface: (connId, w, hh, ptId, ptGen, pdId, pdGen, wireSerial) =>
+      gpuBroker.allocSurface(connId, w, hh, ptId, ptGen, pdId, pdGen, wireSerial),
+  },
+  log: (line) => console.log(line),
+});
+const interceptPluginBroker = createInterceptPluginBroker({
+  interceptBroker,
+  // emitToPlugin forwards events to a specific plugin by name. Used
+  // for intercept.matched / unmatched notifications.
+  emitToPlugin: (pluginName, name, data) => {
+    // The broker's notify event data is shape-validated upstream;
+    // runtime.emit accepts Json. Forward.
+    runtime?.emit(pluginName, name, data as import("./plugins/protocol.js").Json);
+  },
+});
+
 state.beforeRender = (timeMs: number): void => {
   evaluator.tick(timeMs);
   transitionEvaluator.tick(timeMs);
@@ -317,6 +358,10 @@ state.beforeRender = (timeMs: number): void => {
   // rule engine evaluate is cheap when no rule is active.
   cursorKinematics.tick(timeMs);
   cursorRuleEngine.evaluate();
+  // Intercept: drive plugin render callbacks for every matched
+  // surface BEFORE the compositor's renderFrame samples. Lazy: tick
+  // is a no-op while no registration is active.
+  interceptBroker.tick(timeMs);
 };
 
 // Input broker: services plugin sdk.input.* calls by routing into the
@@ -383,6 +428,7 @@ runtime = new PluginRuntime({
     overlays,
     compositor,
     sceneRegistry,
+    interceptBroker,
   },
   bus: pluginBus,
   resolveDeferredRefs: deferredRefResolver,
@@ -436,7 +482,14 @@ runtime = new PluginRuntime({
     // clear error instead of being mis-dispatched.
     if (method.startsWith("gpu.") || method.startsWith("surface.")
         || method.startsWith("compose.")) {
-      return gpuBroker(plugin, method, params);
+      return gpuBroker.onRequest(plugin, method, params);
+    }
+    if (method.startsWith("intercept.")) {
+      const r = interceptPluginBroker(plugin, method, params);
+      if (r === INTERCEPT_NOT_HANDLED) {
+        throw new Error(`no handler for intercept method '${method}'`);
+      }
+      return r;
     }
     throw new Error(`no handler for plugin request '${method}'`);
   },

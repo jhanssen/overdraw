@@ -401,6 +401,19 @@ interface Surface {
   // visible effect). The bind group references the chosen mask's view;
   // setSurfaceMask rebuilds the bind group.
   maskView: GPUTextureView | null;
+  // Phase 10a buffer intercept: when set, the compositor's per-surface
+  // render pass samples from this view instead of `view`. The intercept
+  // broker drives this via installInterceptOutput / clearInterceptOutput:
+  // each frame the broker invokes the plugin's render callback, then
+  // points the surface's bind group at the plugin's just-rendered
+  // output slot. Cleared when no intercept is active for this surface.
+  interceptOutputView: GPUTextureView | null;
+  // Optional per-frame placement override for the intercept's
+  // outputRect return. When set, the surface composites at this rect
+  // instead of its WM-assigned (x, y, layoutW, layoutH). Updated by the
+  // broker each frame; reset when the intercept clears or the plugin
+  // returns no outputRect.
+  interceptPlacement: { x: number; y: number; w: number; h: number } | null;
 }
 
 // 6 vec4s (placement, transform, margin, fx, cropUV, tint) + 1 mat4x4f
@@ -1063,12 +1076,19 @@ export class JsCompositor implements CompositorSink {
         usage: this.g.GPUBufferUsage.UNIFORM | this.g.GPUBufferUsage.COPY_DST,
       });
     }
+    // Phase 10a: when an intercept is active for this surface, sample
+    // the plugin's output instead of the client texture. Callers that
+    // update the client view still call rebuildBindGroup with that
+    // view; this chokepoint substitutes the intercept view when
+    // present. installInterceptOutput passes the intercept view
+    // directly (the substitution here is a no-op for that path).
+    const sampledView = s.interceptOutputView ?? view;
     const mask = s.maskView ?? this.defaultMaskView;
     s.bindGroup = this.device.createBindGroup({
       layout: this.layout,
       entries: [
         { binding: 0, resource: this.sampler },
-        { binding: 1, resource: view },
+        { binding: 1, resource: sampledView },
         { binding: 2, resource: { buffer: s.uniformBuf } },
         { binding: 3, resource: this.maskSampler },
         { binding: 4, resource: mask },
@@ -1270,7 +1290,15 @@ export class JsCompositor implements CompositorSink {
       tex = this.device.createTexture({
         size: { width: c.width, height: c.height },
         format: "bgra8unorm",
-        usage: this.g.GPUTextureUsage.TEXTURE_BINDING | this.g.GPUTextureUsage.COPY_DST,
+        // COPY_SRC is required by the Phase 10a Worker intercept's
+        // input-leg copy (core copies the client texture into a dmabuf
+        // the plugin samples). Keeping it always-on is cheap; the
+        // alternative (re-create texture with COPY_SRC when an
+        // intercept matches) means a one-frame flash + texture
+        // churn.
+        usage: this.g.GPUTextureUsage.TEXTURE_BINDING
+             | this.g.GPUTextureUsage.COPY_DST
+             | this.g.GPUTextureUsage.COPY_SRC,
       });
       s.texture = tex;
       const view = tex.createView();
@@ -1433,7 +1461,11 @@ export class JsCompositor implements CompositorSink {
     for (const id of args.drawList) {
       const s = this.surfaces.get(id);
       if (s && s.present && s.bindGroup) {
-        const placement = args.placements?.get(id);
+        // Placement override priority: caller-supplied `placements` map
+        // (compose paths use this for crop) > per-surface intercept
+        // placement (Phase 10a outputRect) > surface's natural rect.
+        const placement = args.placements?.get(id)
+          ?? s.interceptPlacement ?? undefined;
         const cropUV = args.cropUV?.get(id);
         this.updateUniforms(s, args.outW, args.outH,
           placement || cropUV ? { placement, cropUV } : undefined);
@@ -1783,6 +1815,86 @@ export class JsCompositor implements CompositorSink {
   // For tests: enumerate active phantom surfaceIds in draw order.
   activePhantomIds(): number[] { return this.phantoms.slice(); }
 
+  // ----- Buffer intercept (Phase 10a) ---------------------------------------
+  //
+  // Displaces a surface's sampled texture with a plugin-supplied one.
+  // The intercept broker runs in the beforeRender hook: for each
+  // intercepted surface it (a) calls the plugin's render callback into
+  // an output ring slot, then (b) calls installInterceptOutput to
+  // point the surface's bind group at that slot. The next on-screen
+  // composite pass samples the plugin's pixels in place of the client
+  // buffer for that surface.
+  //
+  // The plugin output texture is provided by the broker as a
+  // GPUTextureView; the compositor doesn't manage its lifetime.
+  // In-thread plugins share core's device so the view is direct;
+  // Worker plugins go through the cross-device dmabuf machinery (10b).
+  //
+  // outputRect (optional): a per-frame placement override that
+  // replaces the WM-assigned (x, y, layoutW, layoutH) for compose
+  // purposes only. Hit-testing still uses the WM rect (10a
+  // limitation documented in intercept-design.md).
+
+  installInterceptOutput(surfaceId: number,
+                         view: GPUTextureView,
+                         placement: { x: number; y: number; w: number; h: number } | null): void {
+    const s = this.surfaces.get(surfaceId);
+    if (!s) return;     // surface unknown (race with unmap); silent no-op
+    s.interceptOutputView = view;
+    s.interceptPlacement = placement;
+    // Rebuild the bind group around the intercept view. If the surface
+    // had no underlying client texture yet (a brand-new toplevel that
+    // mapped but committed no buffer), this is the first time
+    // rebuildBindGroup is called on it.
+    this.rebuildBindGroup(s, view);
+    s.present = true;   // matched + textured -> drawable
+  }
+
+  clearInterceptOutput(surfaceId: number): void {
+    const s = this.surfaces.get(surfaceId);
+    if (!s) return;
+    s.interceptOutputView = null;
+    s.interceptPlacement = null;
+    // Restore the client texture's view (if any) into the bind group.
+    if (s.view) this.rebuildBindGroup(s, s.view);
+    // If there's no client view (the surface never had a buffer), the
+    // bind group can't be rebuilt without a view; mark as not present
+    // so the compose pass skips it.
+    else { s.bindGroup = null; s.present = false; }
+  }
+
+  // For tests: enumerate the surfaceIds currently routed through an
+  // intercept (the broker installed an output view for them).
+  activeInterceptIds(): number[] {
+    const out: number[] = [];
+    for (const [id, s] of this.surfaces.entries()) {
+      if (s.interceptOutputView !== null) out.push(id);
+    }
+    return out;
+  }
+
+  // Phase 10a: hand the intercept broker the current client texture
+  // for a surface. The broker passes this as `input.texture` to the
+  // plugin's render callback in the in-thread path. Returns null when
+  // the surface is unknown or has no committed buffer yet (the broker
+  // skips render for that frame and falls back to raw, which for a
+  // surface with no buffer is just "not drawn").
+  surfaceClientTexture(surfaceId: number): { texture: GPUTexture; w: number; h: number } | null {
+    const s = this.surfaces.get(surfaceId);
+    if (!s || !s.texture) return null;
+    return { texture: s.texture, w: s.width, h: s.height };
+  }
+
+  // Phase 10a: whether the surface is in the on-screen draw list this
+  // frame. The broker uses this to skip render dispatch for surfaces
+  // that aren't being composited (off-screen / hidden by a workspace).
+  // Returns the surface's presentable flag; the broker treats "not
+  // present" as "no render needed."
+  surfaceIsPresentable(surfaceId: number): boolean {
+    const s = this.surfaces.get(surfaceId);
+    return !!s && s.present;
+  }
+
   // ----- Cursor slot (Phase 9c) ---------------------------------------------
   //
   // A singleton overlay drawn ABOVE every other layer. The cursor "slot"
@@ -2003,6 +2115,44 @@ export class JsCompositor implements CompositorSink {
     if (args.producerSurfaceBufId !== undefined) {
       this.addon.writeProducerEnd(args.producerSurfaceBufId);
     }
+  }
+
+  // Phase 10a Worker intercept: copy a client surface's currently-
+  // committed texture into a dmabuf the Worker plugin samples. Both
+  // textures live on the core device (the dmabuf was allocated via
+  // AllocComposeBuf; the core has the producer-side wgpu::Texture).
+  // The copy is wrapped in producer Begin/End on the core wire so
+  // the plugin's consumer Begin can chain on the produced fence.
+  //
+  // The SurfaceProducer's tryAcquire already wrote the producer Begin
+  // before this call; we just need to encode the copy + submit. The
+  // matching producer End is written by SurfaceProducer.presentSync()
+  // after this returns.
+  copyClientToInterceptInputSlot(args: {
+    surfaceId: number;
+    dstTex: GPUTexture;
+  }): boolean {
+    const s = this.surfaces.get(args.surfaceId);
+    if (!s || !s.texture) return false;
+    // The client texture's import bracket must be open during the
+    // copy (its dmabuf has a SharedTextureMemory access bracket the
+    // GPU process needs to know about). Use the same import-bracket
+    // mechanism the on-screen frame uses: openImportBrackets ->
+    // copy -> closeImportBrackets.
+    const bracketed: Array<{ importId: number; bufferId: number }> = [];
+    this.openImportBrackets([args.surfaceId], bracketed);
+    try {
+      const enc = this.device.createCommandEncoder();
+      enc.copyTextureToTexture(
+        { texture: s.texture, mipLevel: 0, origin: { x: 0, y: 0, z: 0 } },
+        { texture: args.dstTex, mipLevel: 0, origin: { x: 0, y: 0, z: 0 } },
+        { width: s.width, height: s.height, depthOrArrayLayers: 1 },
+      );
+      this.device.queue.submit([enc.finish()]);
+    } finally {
+      this.closeImportBrackets(bracketed);
+    }
+    return true;
   }
 
   // Phase 5b-live: register a per-frame produce callback. The compositor
@@ -2357,5 +2507,7 @@ function blankSurface(x: number, y: number, w: number, h: number): Surface {
     currentBufferId: 0,
     fx: defaultFx(),
     maskView: null,
+    interceptOutputView: null,
+    interceptPlacement: null,
   };
 }

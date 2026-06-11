@@ -60,7 +60,7 @@ test("sdk.compose.scene snapshot for Worker plugins (cross-device dmabuf)",
       }
       if (method.startsWith("gpu.") || method.startsWith("surface.")
           || method.startsWith("compose.")) {
-        return gpuBroker(plugin, method, params);
+        return gpuBroker.onRequest(plugin, method, params);
       }
       throw new Error(`unexpected request: ${method}`);
     },

@@ -72,7 +72,7 @@ test("two tiled decorated windows both show their own content after retile",
     bus: pluginBus,
     onEvent: (_p, name, data) => { if (name === "log") logs.push(String(data)); },
     onRequest: (p, method, params) =>
-      method.startsWith("decoration.") ? decoBroker.onRequest(p, method, params) : gpuBroker(p, method, params),
+      method.startsWith("decoration.") ? decoBroker.onRequest(p, method, params) : gpuBroker.onRequest(p, method, params),
   });
 
   try {
