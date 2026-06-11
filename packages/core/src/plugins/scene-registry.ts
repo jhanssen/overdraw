@@ -41,6 +41,18 @@ export interface SceneEntry {
   // frame" (e.g. the ring has nothing PRESENTED yet); the compositor's
   // transition pass falls back to opaque-black for that frame.
   readonly resolveTexture?: () => GPUTexture | null;
+  // Called when the FIRST pin attaches; returns a release closure
+  // called when the LAST pin drops. Used to open/close access brackets
+  // on shared-texture-memory-backed scenes (Worker compose snapshot
+  // and live) so consumers like the transitions broker can sample
+  // safely. For non-STM scenes (in-thread compose) this is undefined
+  // -- the texture is core-owned and always sampleable.
+  //
+  // The registry guarantees acquireForSampling fires exactly once on
+  // the 0 -> 1 pin edge and the returned release fires exactly once
+  // on the 1 -> 0 pin edge (or on unregister if the producer side
+  // tears down first).
+  readonly acquireForSampling?: () => () => void;
 }
 
 // Internal storage: a slot in the registry. pinned is a refcount the
@@ -58,6 +70,12 @@ interface Slot {
   // True once unregister() has been called; final teardown is gated
   // on unpinned.
   removing: boolean;
+  // Release closure produced by acquireForSampling on the 0 -> 1
+  // pin edge. Called on the 1 -> 0 pin edge (or on final teardown
+  // if pins are still held when removal happens, which is a
+  // producer bug we surface but don't crash on). null when no
+  // acquireForSampling was set.
+  release: (() => void) | null;
 }
 
 export interface SceneRegistry {
@@ -96,6 +114,14 @@ export function createSceneRegistry(): SceneRegistry {
   function maybeFinalize(id: SceneId, slot: Slot): void {
     if (!slot.removing) return;
     if (slot.pinned > 0) return;
+    // Defensive: if a release closure is still set, the unpin path
+    // somehow didn't fire it. Fire it now before onTeardown so the
+    // bracket close orders before the resource free.
+    if (slot.release) {
+      try { slot.release(); }
+      catch (e) { console.error(`[scene-registry] release(${id}) threw:`, e); }
+      slot.release = null;
+    }
     slots.delete(id);
     try { slot.onTeardown(); }
     catch (e) { console.error(`[scene-registry] onTeardown(${id}) threw:`, e); }
@@ -104,7 +130,7 @@ export function createSceneRegistry(): SceneRegistry {
   return {
     register(entry, onTeardown) {
       const id = next++;
-      slots.set(id, { entry, pinned: 0, onTeardown, removing: false });
+      slots.set(id, { entry, pinned: 0, onTeardown, removing: false, release: null });
       return id;
     },
     unregister(id) {
@@ -126,11 +152,30 @@ export function createSceneRegistry(): SceneRegistry {
         throw new Error(`scene ${id}: cannot pin -- entry is being torn down`);
       }
       slot.pinned++;
+      // First pin: open the producer's sampling bracket if it has one.
+      // The release closure is stashed on the slot for the eventual
+      // 1 -> 0 transition.
+      if (slot.pinned === 1 && slot.entry.acquireForSampling) {
+        slot.release = slot.entry.acquireForSampling();
+      }
     },
     unpin(id) {
       const slot = slots.get(id);
       if (!slot) return;  // best-effort; pinned-after-teardown is a producer bug
-      if (slot.pinned > 0) slot.pinned--;
+      if (slot.pinned > 0) {
+        slot.pinned--;
+        // Last pin: close the bracket BEFORE running finalize (which
+        // may free the underlying resources). Order matters -- the
+        // bracket close fires producer End on the wire, which must
+        // come before pluginReleaseSurfaceBuffer destroys the STM.
+        if (slot.pinned === 0 && slot.release) {
+          try { slot.release(); }
+          catch (e) {
+            console.error(`[scene-registry] release(${id}) threw:`, e);
+          }
+          slot.release = null;
+        }
+      }
       maybeFinalize(id, slot);
     },
     pinnedCount(id) {

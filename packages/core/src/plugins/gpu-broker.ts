@@ -295,11 +295,24 @@ export function createGpuBroker(deps: GpuBrokerDeps) {
         }
         // Register with the scene registry so transitions (or any
         // future consumer) can resolve sceneId -> core-side texture.
+        // acquireForSampling re-opens the producer access bracket
+        // around the consumer's reads: the broker's one-shot
+        // composeIntoView wrote a producer End above (closing the
+        // STM access on the core side), so for the transition pass
+        // to sample the core-side texture we must re-Begin. The
+        // release closure writes End on the 1 -> 0 pin edge.
+        //
         // The teardown closure runs only after BOTH the Worker's
         // compose.release and any holding pins have settled.
         const bufId = alloc.surfaceBufId;
         const sceneId = sceneRegistry.register(
-          { texture: tex, outW: w, outH: h },
+          {
+            texture: tex, outW: w, outH: h,
+            acquireForSampling: () => {
+              addon.writeProducerBegin(bufId);
+              return () => { addon.writeProducerEnd(bufId); };
+            },
+          },
           () => {
             composeBufs.delete(bufId);
             const reap = () => addon.pluginReleaseSurfaceBuffer(bufId);
