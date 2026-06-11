@@ -999,6 +999,10 @@ napi_value Stop(napi_env env, napi_callback_info) {
         napi_delete_reference(env, g_addon.onInput);
         g_addon.onInput = nullptr;
     }
+    // Release the xkb keymap singleton. Built on demand by ensureKeymap()
+    // from either keymapInfo (client wl_keyboard bind) or keyUpdate (host
+    // key-down); a subsequent start()/stop() cycle must see fresh state.
+    g_addon.keymap.reset();
     g_addon.lastNotified = 0;
     napi_value undef; napi_get_undefined(env, &undef);
     return undef;
