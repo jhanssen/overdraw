@@ -12,6 +12,14 @@ import type { Wm } from "../wm/index.js";
 import type { CompositorBus } from "../events/window-bus.js";
 import type { WindowChangeField } from "../events/types.js";
 
+// Pending region-set state: undefined = no set_*_region call this commit
+// cycle (region stays whatever was applied previously); null = the client
+// explicitly passed NULL (an infinite-extent region); a Region = the
+// snapshot taken at commit time from the wl_region resource the client
+// passed. wl_surface.set_input_region / set_opaque_region store the
+// CURRENT region resource here; commit() snapshots it via Region.clone().
+type RegionSlot = import("./region.js").Region | null | undefined;
+
 export interface SurfaceRecord {
   id: number;
   resource: Resource;
@@ -19,9 +27,34 @@ export interface SurfaceRecord {
   // Double-buffered commit state. Requests accumulate into `pending`; commit
   // either APPLIES it (effective-desync) or CACHES it (effective-sync subsurface)
   // until the parent commits. See wl_surface.commit + applySurfaceState.
-  pending: { buffer?: Resource | null; frameCallbacks?: Resource[] };
+  //
+  // `pendingInputRegion` / `pendingOpaqueRegion` hold the wl_region resource
+  // (or null = infinite) the client passed via set_*_region since the last
+  // commit. On commit, the region's CURRENT rect list is snapshotted to
+  // `inputRegion` / `opaqueRegion` (copy semantics; the client can destroy
+  // the region resource immediately).
+  pending: {
+    buffer?: Resource | null;
+    frameCallbacks?: Resource[];
+    inputRegion?: Resource | null;
+    opaqueRegion?: Resource | null;
+  };
   committed: { buffer: Resource | null };
-  cached?: { buffer?: Resource | null; frameCallbacks?: Resource[] };  // sync subsurface cache
+  cached?: {
+    buffer?: Resource | null;
+    frameCallbacks?: Resource[];
+    inputRegion?: Resource | null;
+    opaqueRegion?: Resource | null;
+  };
+  // Applied input region. Used for hit-testing in surface-local coords.
+  // null = "infinite" (whole surface accepts input -- the spec's initial
+  // state). A non-null empty Region (no rects) = "no input anywhere" --
+  // the surface is click-through.
+  inputRegion?: RegionSlot;
+  // Applied opaque region. A rendering hint to the compositor about which
+  // sub-rect of the surface is fully opaque (no alpha). Not currently
+  // consumed; stored for future use (alpha-aware overdraw skipping).
+  opaqueRegion?: RegionSlot;
   xdgSurface: XdgSurfaceRecord | null;
   mapped?: boolean;
   hasContent?: boolean;  // a buffer has been committed + uploaded at least once
@@ -274,6 +307,11 @@ export interface CompositorState {
   // wl_seat feed it; the cursor rule engine reads its snapshot per frame.
   // Absent in GPU-free harnesses that don't bring up cursor support.
   cursorKinematics?: import("../cursor/kinematics.js").Kinematics;
+  // wl_region resources keyed by their wl_resource. The wl_region handler
+  // accumulates add/subtract into the corresponding Region object.
+  // wl_surface.set_input_region / set_opaque_region snapshot the region's
+  // rect list at commit time (copy semantics per spec).
+  regions?: Map<import("../types.js").Resource, import("./region.js").Region>;
   // Hook the seat invokes on interactive-grab start/end to install the
   // appropriate XCursor theme shape ('move' for moves; 'top_left_corner'
   // etc. for resizes). null means "restore the default cursor." Wired

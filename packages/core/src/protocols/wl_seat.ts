@@ -161,9 +161,27 @@ export default function makeSeat(ctx: Ctx, driver: FocusDriver): SeatHandler {
   }
 
   // Find the topmost window under an output-space point, returning a focus
-  // target (surface + client id + rect), or null.
+  // target (surface + client id + rect), or null. Respects wl_surface
+  // input regions: when a window's input region rejects the surface-
+  // local point, the search falls through to the window below.
+  //
+  // The default (no applied input region, or null applied = "infinite")
+  // matches the whole content rect, so most surfaces hit-test exactly
+  // like before. An empty input region (Region with no rects) makes the
+  // window entirely click-through.
   function pick(x: number, y: number): SeatFocus | null {
-    const win = ctx.state.wm?.windowAt(x, y);
+    const win = ctx.state.wm?.windowAt(x, y, (w, lx, ly) => {
+      // Look up the SurfaceRecord backing this window. The WM's
+      // surfaceRec is a SurfaceHandle; the protocol layer's surface
+      // record lives in ctx.state.surfaces keyed by the wl_surface
+      // resource.
+      const sRec = ctx.state.surfaces.get(w.surfaceRec.resource);
+      const region = sRec?.inputRegion;
+      // undefined = no set_input_region call has been committed (initial
+      // state = infinite = accept). null = explicit infinite = accept.
+      if (region === undefined || region === null) return true;
+      return region.contains(lx, ly);
+    });
     if (!win) return null;
     const rec = win.surfaceRec;
     if (!rec || rec.resource.destroyed) return null;

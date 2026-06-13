@@ -176,7 +176,16 @@ export interface Wm {
   windowHasContent(surfaceId: number): Rect | undefined;
   unmapWindow(surfaceId: number): void;
   settled(): Promise<void>;
-  windowAt(x: number, y: number): Window | null;
+  // Topmost window containing the point. Walks the stack front-to-back.
+  // The optional `accept` predicate is consulted on each candidate; when
+  // it returns false, the search continues to the next window underneath.
+  // Used by hit-testing to respect wl_surface input regions: when the
+  // point is inside a window's rect but outside its input region, the
+  // search falls through to the window below.
+  windowAt(
+    x: number, y: number,
+    accept?: (win: Window, localX: number, localY: number) => boolean,
+  ): Window | null;
   setInsets(surfaceId: number, insets: Insets): InsetGrant | undefined;
   outerRectOf(surfaceId: number): Rect | undefined;
   rectOf(surfaceId: number): Rect | undefined;
@@ -607,12 +616,30 @@ export function createWm(
       pushStack();
     },
 
-    windowAt(x, y) {
-      for (let i = windows.length - 1; i >= 0; i--) {
+    windowAt(x, y, accept) {
+      // master-front order: index 0 is the master. The drawn stack draws
+      // back-to-front from the END of `windows` (older windows are below
+      // newer ones). Hit-testing wants front-to-back: start at index 0
+      // (the master is typically the on-top focused window in dwm-style
+      // tilers), but actually with the master-stack the layout puts the
+      // master in a fixed left column -- visual order matters for
+      // overlap (popups, subsurfaces) which aren't in this list. For
+      // toplevel-only hit-testing, master-front == hit-test order works
+      // for non-overlapping tiled layouts. With floating windows in the
+      // mix, the front-most is index 0 -- the layout plugin's job to
+      // keep z-order consistent with intended layering.
+      //
+      // We use the windows array in declared order: front first.
+      for (let i = 0; i < windows.length; i++) {
         const win = windows[i];
         const r = win.rect;
-        if (x >= r.x && x < r.x + r.width && y >= r.y && y < r.y + r.height)
-          return win;
+        if (x < r.x || x >= r.x + r.width || y < r.y || y >= r.y + r.height) continue;
+        if (accept) {
+          const localX = x - r.x;
+          const localY = y - r.y;
+          if (!accept(win, localX, localY)) continue;
+        }
+        return win;
       }
       return null;
     },

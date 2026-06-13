@@ -74,6 +74,21 @@ function uploadBuffer(ctx: Ctx, s: SurfaceRecord, buffer: Resource | null): void
   }
 }
 
+// Snapshot a pending region resource into an applied Region (or null for
+// "infinite"). Called on commit for input/opaque region application.
+// Per spec: copy semantics -- the client may destroy the wl_region
+// resource immediately after the commit; the applied region keeps the
+// rect list it had at commit time.
+function snapshotRegion(
+  ctx: Ctx,
+  pending: Resource | null | undefined,
+): import("./region.js").Region | null | undefined {
+  if (pending === undefined) return undefined;   // no set_*_region this cycle
+  if (pending === null) return null;             // explicit null = infinite
+  const r = ctx.state.regions?.get(pending);
+  return r ? r.clone() : null;                   // missing/destroyed -> infinite
+}
+
 // Apply a surface's committed state (buffer + frame callbacks + subsurface-
 // managed state of its children), then CASCADE into every effective-sync child:
 // the child's cached state is applied atomically with this (parent) apply. This
@@ -86,6 +101,17 @@ function applySurfaceState(ctx: Ctx, s: SurfaceRecord): void {
   if (s.pending.frameCallbacks?.length) {
     (s.frameCallbacks ??= []).push(...s.pending.frameCallbacks);
     s.pending.frameCallbacks = undefined;
+  }
+
+  // Apply input/opaque regions. undefined = no set_*_region call this
+  // cycle, leave applied region alone.
+  if (s.pending.inputRegion !== undefined) {
+    s.inputRegion = snapshotRegion(ctx, s.pending.inputRegion);
+    s.pending.inputRegion = undefined;
+  }
+  if (s.pending.opaqueRegion !== undefined) {
+    s.opaqueRegion = snapshotRegion(ctx, s.pending.opaqueRegion);
+    s.pending.opaqueRegion = undefined;
   }
 
   // Subsurface-managed state (position) of THIS surface's children is applied on
@@ -102,6 +128,12 @@ function applySurfaceState(ctx: Ctx, s: SurfaceRecord): void {
         childRec.committed.buffer = childRec.cached.buffer ?? childRec.committed.buffer;
         if (childRec.cached.frameCallbacks?.length) {
           (childRec.pending.frameCallbacks ??= []).push(...childRec.cached.frameCallbacks);
+        }
+        if (childRec.cached.inputRegion !== undefined) {
+          childRec.pending.inputRegion = childRec.cached.inputRegion;
+        }
+        if (childRec.cached.opaqueRegion !== undefined) {
+          childRec.pending.opaqueRegion = childRec.cached.opaqueRegion;
         }
         childRec.cached = undefined;
         applySurfaceState(ctx, childRec);
@@ -128,8 +160,18 @@ export default function makeSurface(ctx: Ctx): WlSurfaceHandler {
       // Double-buffered: the callback arms when this surface's state is applied.
       (s.pending.frameCallbacks ??= []).push(callback);
     },
-    set_opaque_region(_resource, _region) {},
-    set_input_region(_resource, _region) {},
+    set_opaque_region(resource, region) {
+      const s = rec(resource);
+      if (!s) return;
+      // Double-buffered: store the region resource (or null = infinite);
+      // commit() snapshots its rect list.
+      s.pending.opaqueRegion = region;
+    },
+    set_input_region(resource, region) {
+      const s = rec(resource);
+      if (!s) return;
+      s.pending.inputRegion = region;
+    },
     set_buffer_transform(_resource, _transform) {},
     set_buffer_scale(_resource, _scale) {},
     offset(_resource, _x, _y) {},
@@ -152,6 +194,14 @@ export default function makeSurface(ctx: Ctx): WlSurfaceHandler {
           (s.cached.frameCallbacks ??= []).push(...s.pending.frameCallbacks);
           s.pending.frameCallbacks = undefined;
         }
+        if (s.pending.inputRegion !== undefined) {
+          s.cached.inputRegion = s.pending.inputRegion;
+          s.pending.inputRegion = undefined;
+        }
+        if (s.pending.opaqueRegion !== undefined) {
+          s.cached.opaqueRegion = s.pending.opaqueRegion;
+          s.pending.opaqueRegion = undefined;
+        }
       } else {
         // Desynchronized (incl. main surface): apply now. If a cache exists (e.g.
         // it was sync then switched to desync), it is flushed as part of apply.
@@ -159,6 +209,12 @@ export default function makeSurface(ctx: Ctx): WlSurfaceHandler {
           s.committed.buffer = s.cached.buffer ?? s.committed.buffer;
           if (s.cached.frameCallbacks?.length) {
             (s.pending.frameCallbacks ??= []).push(...s.cached.frameCallbacks);
+          }
+          if (s.cached.inputRegion !== undefined) {
+            s.pending.inputRegion = s.cached.inputRegion;
+          }
+          if (s.cached.opaqueRegion !== undefined) {
+            s.pending.opaqueRegion = s.cached.opaqueRegion;
           }
           s.cached = undefined;
         }
