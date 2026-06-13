@@ -418,6 +418,12 @@ export interface CompositorState {
   // via effectiveRect() to compute the tile region. Single shared instance
   // for the lifetime of the compositor; installProtocols creates it.
   reservedZones?: import("../wm/reserved-zones.js").ReservedZoneRegistry;
+  // Output registry: per-output identity + geometry consumed by wire layers
+  // that need to describe outputs (xdg-output today; future wl_output-on-
+  // change emissions). One entry today (OUTPUT_DEFAULT) reflecting the
+  // fabricated single output. The map is the integration seam DRM/KMS
+  // plugs into later.
+  outputs?: Map<number, OutputRecord>;
   // Per-layer ordered surface ids contributed by the overlay broker. Set
   // by the broker when it's constructed (main.ts wires this); read by
   // layer-stack.ts's rebuild to merge with layer-shell surfaces before
@@ -518,6 +524,21 @@ export interface ToplevelRecord {
   xdgSurface: XdgSurfaceRecord;
   title: string | null;
   appId: string | null;
+}
+
+// One output's identity + logical geometry in the global compositor space.
+// `id` is the stable per-output id (OUTPUT_DEFAULT today). `logicalPosition`
+// + `logicalSize` are the values xdg-output reports verbatim; they are the
+// rect the WM places windows into. `name` is a short stable identifier
+// (e.g. "DP-1") used by clients (waybar) to key per-output configuration;
+// `description` is a longer human-readable label.
+export interface OutputRecord {
+  id: number;
+  logicalPosition: { x: number; y: number };
+  logicalSize: { width: number; height: number };
+  scale: number;
+  name: string;
+  description: string;
 }
 
 // Protocol-level layer enum from zwlr_layer_shell_v1.layer. Uses the

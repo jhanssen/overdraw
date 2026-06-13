@@ -4,7 +4,7 @@ Ground truth for what exists right now: current capabilities, known gaps, and
 what remains. The design lives in `architecture.md`; this file does not restate
 it. Present-tense only — no change history.
 
-Last updated: 2026-06-12 (post-xdg-decoration — wire-level SSD negotiation; the compositor unconditionally replies server_side. Actual decoration drawing remains per-app_id via the existing decoration broker; toplevels with no matching plugin remain borderless under SSD).
+Last updated: 2026-06-12 (post-xdg-output — state.outputs registry + zxdg_output_manager_v1 side-channel on wl_output reporting logical_position / logical_size / name / description. Single OUTPUT_DEFAULT entry; the map is the seam multi-output reconfiguration plugs into later).
 
 ## Read first: gaps in advertised protocols (silent-gap risks)
 
@@ -31,7 +31,10 @@ with no error. Worst-first.
   geometry/mode/scale/done → WM re-lays-out + input mapping + swapchain
   reconfigure), behind an output-backend seam (like the input backend) so phase-1
   host-output and phase-2 DRM/EDID/hotplug swap underneath without touching the
-  WM/compositing/`wl_output` layers.
+  WM/compositing/`wl_output` layers. The `state.outputs` registry (added
+  for xdg-output, see below) is the integration seam: a future
+  reconfiguration path updates entries in that map; bound xdg_output_v1
+  resources re-emit on change.
 
 - **`wl_region` is a no-op stub.** `add`/`subtract` do nothing; opaque/input
   regions are not tracked (hit-testing uses whole-window rects). Low urgency.
@@ -2577,6 +2580,43 @@ value -- a configure with `server_side` is still sent in reply).
 Files: `packages/core/src/protocols/zxdg_decoration_manager_v1.ts`
 (both interfaces), `test/xdg-decoration.test.js` (7 unit tests).
 
+### xdg-output (`zxdg_output_manager_v1` / `zxdg_output_v1`)
+
+A side-channel on `wl_output` that reports the output's logical position
+(in the global compositor coordinate space), logical size (post-scale),
+name, and description. Carries the same identity `wl_output` v4 advertises
+(name + description); xdg-output is the path clients that want this data
+without requiring v4 use. waybar specifically binds it at startup and
+refuses to run when the global is absent -- adding xdg-output is the
+single change that takes waybar from "exits with 'Failed to acquire
+required resources'" to "runs". Advertised at protocol version 3.
+
+`state.outputs: Map<number, OutputRecord>` is the underlying registry the
+handler reads from. One entry today (`OUTPUT_DEFAULT = 0`) populated in
+`installProtocols` from the fabricated output dims. The fields are:
+`logicalPosition` (`{0, 0}` today; multi-output puts each connector at a
+real position), `logicalSize` (the output dims at scale 1), `scale`
+(`1`), `name` (`"overdraw-0"`), `description` (`"overdraw nested
+output"`). When real KMS lands, the GPU process publishes connector data
+into this map; the xdg-output handler is unchanged.
+
+`get_xdg_output(wl_output)` emits the full burst on creation:
+`logical_position` -> `logical_size` -> `name` -> `description` -> `done`.
+The `done` event is marked deprecated since v3 in favor of `wl_output.done`
+but compositors must still support it; we emit it for v1/v2 clients.
+
+**Not wired**: re-emission on output change. The single output is constant
+today; when multi-output reconfiguration lands, the handler will need to
+walk bound `zxdg_output_v1` resources on each output and re-emit the
+changed properties + `done`. The data path (state.outputs) is ready for
+this; the only piece missing is a per-resource bookkeeping map and the
+hook on registry mutation.
+
+Files: `packages/core/src/protocols/zxdg_output_manager_v1.ts` (both
+interfaces), `test/xdg-output.test.js` (4 unit tests). Type:
+`OutputRecord` in `packages/core/src/protocols/ctx.ts`; state field
+`CompositorState.outputs`.
+
 ### Decoration provider (registration + insets + drawing + atomic gating)
 
 Server-side decorations end to end: a plugin registers an app_id pattern, is told
@@ -2740,7 +2780,10 @@ per-surface render state primitives (`compositor-fx.gpu.mjs`).
   `zxdg_decoration_manager_v1`/`zxdg_toplevel_decoration_v1` (unconditional
   server-side reply; the configure handshake is unit-tested, no GPU
   coverage since the protocol carries no visible state of its own --
-  decorations come from the per-app_id broker).
+  decorations come from the per-app_id broker),
+  `zxdg_output_manager_v1`/`zxdg_output_v1` (logical_position +
+  logical_size + name + description + done burst on bind; sourced from
+  state.outputs which has one OUTPUT_DEFAULT entry today).
 - **Implemented, not behaviorally tested**: `wl_region` (no-op stub);
   `zwp_linux_dmabuf_feedback_v1` (exercised by real WSI clients, no automated
   assertion).

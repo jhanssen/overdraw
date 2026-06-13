@@ -23,6 +23,7 @@ import { rebuildStackWithPopups, maybeDismissGrabbedPopup } from "./xdg_popup.js
 import { configureToplevel } from "./xdg_surface.js";
 import type { Addon, EventsByInterface, EventSenders } from "../types.js";
 import type { Ctx, CompositorState, CompositorSink } from "./ctx.js";
+import { OUTPUT_DEFAULT } from "./ctx.js";
 import type { FocusDriver, FocusApplyTarget } from "./focus-driver.js";
 import { titleAppId } from "../query.js";
 import { WINDOW_EVENT } from "../events/types.js";
@@ -53,6 +54,7 @@ const GLOBALS = [
   "wp_cursor_shape_manager_v1",
   "zwlr_layer_shell_v1",
   "zxdg_decoration_manager_v1",
+  "zxdg_output_manager_v1",
 ];
 
 // Interfaces created via requests (new_id), registered without a global so
@@ -67,6 +69,7 @@ const CHILD_INTERFACES = [
   "wp_cursor_shape_device_v1",
   "zwlr_layer_surface_v1",
   "zxdg_toplevel_decoration_v1",
+  "zxdg_output_v1",
 ];
 
 // Load all generated signature modules, keyed by interface name.
@@ -142,6 +145,18 @@ export async function installProtocols(
   };
   if (opts.bus) state.bus = opts.bus;
   if (opts.reservedZones) state.reservedZones = opts.reservedZones;
+  // Single fabricated output. Multi-output reconfiguration replaces this
+  // map's contents (see status.md "Read first"); xdg-output + wl_output
+  // re-read on emission so changes propagate without a per-handler hook.
+  state.outputs = new Map();
+  state.outputs.set(OUTPUT_DEFAULT, {
+    id: OUTPUT_DEFAULT,
+    logicalPosition: { x: 0, y: 0 },
+    logicalSize: { width: output.width, height: output.height },
+    scale: 1,
+    name: "overdraw-0",
+    description: "overdraw nested output",
+  });
   // The binding chain owns the input modes + chord trie. Plugins
   // register bindings via the windows broker; the seat dispatches each
   // key-down here. Chain events (mode-pushed/popped, chord-*) re-emit on
@@ -416,6 +431,7 @@ export async function installProtocols(
     // module's helper factories aren't a default export.
     zwlr_layer_shell_v1: await import("./zwlr_layer_shell_v1.js"),
     zxdg_decoration_manager_v1: await import("./zxdg_decoration_manager_v1.js"),
+    zxdg_output_manager_v1: await import("./zxdg_output_manager_v1.js"),
   };
 
   // Some child interfaces have handlers from a sibling module's named exports.
@@ -426,6 +442,7 @@ export async function installProtocols(
   const cursorShapeMod = await import("./cursor_shape.js");
   const layerShellMod = await import("./zwlr_layer_shell_v1.js");
   const decorationMod = await import("./zxdg_decoration_manager_v1.js");
+  const xdgOutputMod = await import("./zxdg_output_manager_v1.js");
   const childHandlers: Record<string, object> = {
     wl_pointer: seatMod.makePointer(ctx),
     wl_keyboard: seatMod.makeKeyboard(ctx),
@@ -441,6 +458,7 @@ export async function installProtocols(
     wp_cursor_shape_device_v1: cursorShapeMod.makeCursorShapeDevice(ctx),
     zwlr_layer_surface_v1: layerShellMod.makeLayerSurface(ctx),
     zxdg_toplevel_decoration_v1: decorationMod.makeToplevelDecoration(ctx),
+    zxdg_output_v1: xdgOutputMod.makeXdgOutput(ctx),
   };
 
   // The apply target forwards lazily: the seat is constructed below and
