@@ -1,12 +1,13 @@
-// Worker-side sdk.windows surface (core-plugin-api.md §1). Combines:
-//   - The window-observer (onMap/onUnmap/onChange) for state-change events.
-//   - Hint-state setters (setFloating/setFullscreen/setMaximized/setMinimized).
+// Worker-side sdk.windows surface. Combines:
+//   - The window-observer (onMap/onUnmap/onChange) for metadata changes.
+//   - propose() for behavioral-state changes (presentation, layoutMode,
+//     layoutData, constraints, parent).
 //   - Freeform state-bag setters (setState/getState/deleteState).
 //   - Snapshot accessors (get/list).
+//   - Per-surface render-state setters (opacity/transform/mask/etc.).
 //
-// Routes all the new methods through the Endpoint as request/reply messages
-// (windows.set, windows.set-state, windows.get-state, windows.delete-state,
-// windows.get, windows.list). The observation half is unchanged; it uses
+// Routes through the Endpoint as request/reply messages
+// (windows.propose, windows.set-state, ...). The observation half uses
 // sdk.events.subscribe('window.*', ...) under the hood.
 
 import type { Endpoint, Json } from "./protocol.js";
@@ -14,9 +15,26 @@ import type { PluginWindowObserver, WindowObserverControl } from "./window-obser
 import type { PluginEvents } from "./events.js";
 import { createWindowObserver } from "./window-observer.js";
 import { FOCUS_REASONS, type FocusReason } from "@overdraw/focus-types";
+import type {
+  Presentation, ProposalReason, WindowState,
+} from "../events/types.js";
 
-// Hint field names; must match WindowHints keys on the core side.
-export type HintField = "floating" | "fullscreen" | "maximized" | "minimized";
+// Re-exported so plugins building proposals don't need a parallel import.
+export type { Presentation, ProposalReason, WindowState } from "../events/types.js";
+
+// A partial WindowState. Fields omitted from the proposal stay at their
+// current value. constraints is a partial of its sub-object too: missing
+// min/max stays put.
+export interface WindowStateProposal {
+  presentation?: Presentation;
+  layoutMode?: string | null;
+  layoutData?: unknown;
+  constraints?: {
+    minSize?: { width: number; height: number } | null;
+    maxSize?: { width: number; height: number } | null;
+  };
+  parent?: number | null;
+}
 
 // Per-surface transform; all fields optional, missing fields reset to identity.
 // translate is in output pixels, scale is unitless. Rotation is not supported in
@@ -68,7 +86,7 @@ export interface WindowSnapshot {
   decorationSurfaceId?: number;
   hasContent: boolean;
   contentGated: boolean;
-  hints: { floating: boolean; fullscreen: boolean; maximized: boolean; minimized: boolean };
+  windowState: WindowState;
   state: { [key: string]: unknown };
 }
 
@@ -76,12 +94,22 @@ export interface WindowSnapshot {
 // directly so plugins write `sdk.windows.onMap(...)` not
 // `sdk.windows.observer.onMap(...)`.
 export interface PluginWindows extends PluginWindowObserver {
-  // Hint-state setters. Toggles per-window hints; emits 'window.change' with
-  // the field listed.
-  setFloating(surfaceId: number, value: boolean): Promise<void>;
-  setFullscreen(surfaceId: number, value: boolean): Promise<void>;
-  setMaximized(surfaceId: number, value: boolean): Promise<void>;
-  setMinimized(surfaceId: number, value: boolean): Promise<void>;
+  // Propose a behavioral-state change. The proposal is merged with the
+  // window's current state; the resulting candidate goes through the
+  // 'window.proposed' interceptor chain (other plugins may modify it);
+  // the final candidate is committed and 'window.committed' fires. A
+  // geometry-affecting change schedules a layout pass.
+  //
+  // Resolves to the committed state (which may differ from the proposal
+  // after arbitration) or null if the window doesn't exist. `reason`
+  // defaults to 'plugin' when omitted -- a plugin acting on user input
+  // (a hotkey grab) should pass 'user-input' so policy plugins can
+  // distinguish.
+  propose(
+    surfaceId: number,
+    proposal: WindowStateProposal,
+    reason?: ProposalReason,
+  ): Promise<WindowState | null>;
 
   // Freeform state-bag access. setState emits 'window.state-changed';
   // deleteState emits 'window.state-changed' with deleted=true. getState
@@ -178,10 +206,22 @@ export function createPluginWindows(
     onUnmap(cb) { observer.observer.onUnmap(cb); },
     onChange(cb) { observer.observer.onChange(cb); },
 
-    setFloating(id, value) { return setHint(endpoint, id, "floating", value); },
-    setFullscreen(id, value) { return setHint(endpoint, id, "fullscreen", value); },
-    setMaximized(id, value) { return setHint(endpoint, id, "maximized", value); },
-    setMinimized(id, value) { return setHint(endpoint, id, "minimized", value); },
+    async propose(id, proposal, reason): Promise<WindowState | null> {
+      if (typeof id !== "number") throw new TypeError("propose id must be a number");
+      validateProposal(proposal);
+      const finalReason: ProposalReason = reason ?? "plugin";
+      // WindowStateProposal contains `layoutData: unknown` (opaque to core,
+      // the plugin author owns clone-safety). Cast through Json at the
+      // boundary so the Endpoint.request signature matches.
+      // eslint-disable-next-line no-restricted-syntax
+      const payload = proposal as unknown as Json;
+      const r = await endpoint.request("windows.propose", {
+        id, proposal: payload, reason: finalReason,
+      });
+      if (r === null) return null;
+      // eslint-disable-next-line no-restricted-syntax
+      return r as unknown as WindowState;
+    },
 
     async setState(id, key, value): Promise<void> {
       if (typeof id !== "number") throw new TypeError("setState id must be a number");
@@ -344,12 +384,45 @@ export function createPluginWindows(
   };
 }
 
-async function setHint(
-  endpoint: Endpoint, id: number, field: HintField, value: boolean,
-): Promise<void> {
-  if (typeof id !== "number") throw new TypeError("setHint id must be a number");
-  if (typeof value !== "boolean") throw new TypeError("setHint value must be boolean");
-  await endpoint.request("windows.set", { id, field, value });
+const PRESENTATIONS: ReadonlyArray<Presentation> = [
+  "managed", "maximized", "fullscreen", "minimized",
+];
+
+function validateProposal(p: WindowStateProposal): void {
+  if (typeof p !== "object" || p === null) {
+    throw new TypeError("propose proposal must be an object");
+  }
+  if (p.presentation !== undefined
+      && !(PRESENTATIONS as readonly string[]).includes(p.presentation)) {
+    throw new TypeError(
+      `propose presentation must be one of ${PRESENTATIONS.join("|")}`);
+  }
+  if (p.layoutMode !== undefined
+      && p.layoutMode !== null
+      && typeof p.layoutMode !== "string") {
+    throw new TypeError("propose layoutMode must be a string or null");
+  }
+  if (p.parent !== undefined
+      && p.parent !== null
+      && typeof p.parent !== "number") {
+    throw new TypeError("propose parent must be a number or null");
+  }
+  if (p.constraints !== undefined) {
+    if (typeof p.constraints !== "object" || p.constraints === null) {
+      throw new TypeError("propose constraints must be an object");
+    }
+    for (const k of ["minSize", "maxSize"] as const) {
+      const v = p.constraints[k];
+      if (v !== undefined && v !== null) {
+        if (typeof v !== "object" || typeof v.width !== "number"
+            || typeof v.height !== "number"
+            || !Number.isFinite(v.width) || !Number.isFinite(v.height)) {
+          throw new TypeError(
+            `propose constraints.${k} must be { width, height } or null`);
+        }
+      }
+    }
+  }
 }
 
 function validateTransform(t: SurfaceTransform): void {

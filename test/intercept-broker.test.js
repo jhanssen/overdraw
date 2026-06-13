@@ -103,7 +103,7 @@ function mapEvent(surfaceId, appId = null, title = null) {
 function changeEvent(surfaceId, fields, appId = null, title = null) {
   return {
     surfaceId, changed: fields, appId, title,
-    activated: false, floating: false, fullscreen: false, maximized: false, minimized: false,
+    activated: false,
   };
 }
 

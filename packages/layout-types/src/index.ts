@@ -5,13 +5,6 @@
 // single source of truth for the wire shape (Worker-postMessage serializes
 // these values).
 //
-// Why a separate package: per core-plugin-api.md "Namespace = API contract",
-// two plugins claiming 'layout' must implement the same canonical interface.
-// Pinning that interface in its own package means an implementing plugin
-// 'declare module 'overdraw'' augmentation references the same exact type
-// (not a copy that could drift); npm dedup makes the workspace see one
-// definition.
-//
 // Type-only: there is no runtime code here. The compiled output is an empty
 // index.js + the .d.ts. The plugin and core both `import type { ... } from
 // "@overdraw/layout-types"`.
@@ -33,36 +26,34 @@ export interface Output {
   scale: number;
 }
 
-// Why the layout driver is re-invoking compute(). The plugin may use this to
-// skip work in some cases (e.g. ignore 'focus-changed' if focus does not
-// affect layout in this plugin's policy).
+// Why the layout driver is re-invoking compute(). Plugins may skip work for
+// reasons that do not affect their policy.
 export type LayoutReason =
   | "mapped"          // a window mapped (was added to the layout)
   | "unmapped"        // a window unmapped (was removed from the layout)
   | "output-resized"  // the output dimensions changed
-  | "focus-changed"   // keyboard / pointer focus changed (relevant to follow-focus layouts)
+  | "focus-changed"   // keyboard / pointer focus changed
   | "reorder"         // explicit stack-order change (e.g. raise)
-  | "param-changed";  // layout-specific config (master fraction, gap) changed
+  | "param-changed"   // layout-specific config (master fraction, gap) changed
+  | "state-changed";  // a window's behavioral state changed (presentation,
+                      // layoutMode, layoutData, or constraints)
 
-export interface WindowHints {
-  // Client-requested geometry constraints. The xdg_toplevel set_min_size /
-  // set_max_size requests populate these; until those handlers land
-  // (status.md "Read first") they are undefined.
+// Protocol-defined size constraints from xdg_toplevel.set_min_size /
+// set_max_size. Layouts should clamp the rects they assign within these
+// bounds where possible; the WM does not auto-clamp.
+export interface SizeConstraints {
   minSize?: { width: number; height: number };
   maxSize?: { width: number; height: number };
-  // Client-requested or plugin-imposed state. The layout plugin treats these
-  // as inputs: e.g. a fullscreen window fills the output regardless of the
-  // tiling algorithm; a floating window is omitted from the tile.
-  wantsFullscreen?: boolean;
-  wantsMaximized?: boolean;
-  wantsMinimized?: boolean;
-  floating?: boolean;
 }
 
 // What the layout sees about each window. The layout's compute() iterates
 // these in order; index 0 is conventionally the 'master' in tiling layouts.
+//
+// `presentation` is NOT on this type because the WM's resolver dispatches
+// non-managed modes (maximized / fullscreen / minimized) itself, before
+// calling the plugin. The plugin only sees `managed` windows.
 export interface LayoutWindow {
-  id: number;             // Surface id (matches core's window record).
+  id: number;             // surface id (matches core's window record)
   appId?: string | null;
   title?: string | null;
   // Role in the compositor's surface tree. 'toplevel' is the normal case;
@@ -70,15 +61,31 @@ export interface LayoutWindow {
   // list -- they are positioned by the layer-shell protocol. Listed here for
   // type completeness; today only toplevel is passed.
   role: "toplevel" | "layer-shell";
-  hints: WindowHints;
+  // Layout-plugin-defined arrangement vocabulary. Opaque to core. The
+  // bundled master-stack plugin ignores it; a more complex plugin (tabbed,
+  // scrollable, scratchpad) consumes it to decide placement.
+  layoutMode?: string;
+  // Plugin-private per-window blob. Carried across compute() calls via the
+  // WM's window state. Opaque to core; the plugin reads/writes it through
+  // sdk.windows.propose. The plugin is responsible for keeping it
+  // structured-clone-safe.
+  layoutData?: unknown;
+  // Protocol-defined size constraints. Layouts should respect them.
+  constraints?: SizeConstraints;
   // The window's current outer rect, if any. Lets a layout animate from the
-  // current position (a future plugin might transition rects smoothly). The
-  // master-stack plugin ignores this.
+  // current position. The master-stack plugin ignores this.
   currentRect?: Rect;
 }
 
 export interface LayoutInputs {
   output: Output;
+  // The region the plugin may place windows in. This is the output rect
+  // minus reserved zones (layer-shell anchored surfaces, etc.) minus any
+  // exclusion zones from non-managed windows on the same output. The
+  // plugin treats this as its working area; it should not place windows
+  // outside it (decoration layers handle anything that needs to draw
+  // beyond).
+  tileRegion: Rect;
   windows: ReadonlyArray<LayoutWindow>;
   reason: LayoutReason;
 }
@@ -86,15 +93,17 @@ export interface LayoutInputs {
 // One outer rect per window. The driver applies these to the compositor +
 // fires xdg_toplevel.configure for windows whose size changed.
 //
-// Layouts that want to omit a window from the layout (e.g. a minimized
-// window) may simply not include it in rects[]. The driver treats omitted
-// windows as hidden (their last rect is removed from the compositor).
+// `rects` is for windows the layout chose to place. Omitting a window
+// from rects[] means "no opinion, leave its geometry alone." Use
+// `hidden[]` to explicitly hide a window this frame (tabbed inactive
+// tab, scratchpad-hidden, etc.) -- the WM will not draw it until the
+// next layout pass restores it.
 //
-// rects[] order does NOT need to match windows[] order; the driver matches
-// by id. (Master-stack returns them in the order it consumed; another
-// layout might reorder.)
+// rects[] order does NOT need to match windows[] order; the driver
+// matches by id.
 export interface LayoutResult {
   rects: ReadonlyArray<{ id: number; outer: Rect }>;
+  hidden?: ReadonlyArray<number>;
 }
 
 // The contract a plugin claiming 'layout' implements. compute() is the only

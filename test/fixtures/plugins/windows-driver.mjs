@@ -1,8 +1,8 @@
 // Fixture: a plugin that drives sdk.windows.* operations on demand. The test
 // emits window.map events with operation codes (surfaceId) to trigger:
-//   1 = setFloating(targetId, true)
-//   2 = setFloating(targetId, false)
-//   3 = setFullscreen(targetId, true)
+//   1 = propose(targetId, { presentation: 'maximized' })
+//   2 = propose(targetId, { presentation: 'managed' })
+//   3 = propose(targetId, { presentation: 'fullscreen' })
 //   4 = setState(targetId, 'workspace.id', 7)
 //   5 = getState(targetId, 'workspace.id') and log it
 //   6 = deleteState(targetId, 'workspace.id')
@@ -34,9 +34,9 @@ export default async function init(sdk) {
 
   sdk.windows.onMap(async (ev) => {
     const op = ev.surfaceId;
-    if (op === 1) { await sdk.windows.setFloating(targetId, true); sdk.log('set-floating-true'); return; }
-    if (op === 2) { await sdk.windows.setFloating(targetId, false); sdk.log('set-floating-false'); return; }
-    if (op === 3) { await sdk.windows.setFullscreen(targetId, true); sdk.log('set-fullscreen-true'); return; }
+    if (op === 1) { await sdk.windows.propose(targetId, { presentation: 'maximized' }); sdk.log('propose-maximized'); return; }
+    if (op === 2) { await sdk.windows.propose(targetId, { presentation: 'managed' }); sdk.log('propose-managed'); return; }
+    if (op === 3) { await sdk.windows.propose(targetId, { presentation: 'fullscreen' }); sdk.log('propose-fullscreen'); return; }
     if (op === 4) { await sdk.windows.setState(targetId, 'workspace.id', 7); sdk.log('set-state'); return; }
     if (op === 5) {
       const v = await sdk.windows.getState(targetId, 'workspace.id');

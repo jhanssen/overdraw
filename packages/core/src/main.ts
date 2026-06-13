@@ -16,6 +16,7 @@ import { globSync } from "node:fs";
 
 import { installProtocols } from "./protocols/index.js";
 import { createLayoutDriver } from "./wm/layout-driver.js";
+import { createReservedZoneRegistry } from "./wm/reserved-zones.js";
 import { createFocusDriver } from "./protocols/focus-driver.js";
 import { parseConfigArg, loadConfig } from "./config/load.js";
 import { PluginRuntime } from "./plugins/index.js";
@@ -162,6 +163,11 @@ console.log("[overdraw] compositor: JS (over the Dawn wire)");
 
 const sock = addon.startServer();
 
+// Reserved-zone registry. No producer today (layer-shell isn't built);
+// the registry is in place so `maximized` windows + the layout plugin's
+// tile region honor reservations from day one.
+const reservedZones = createReservedZoneRegistry();
+
 // The WM needs a layout driver before installProtocols creates it; the driver
 // invokes the layout plugin via the runtime; the runtime is created later.
 // Use a forward-reference closure: by the time the first compute() fires
@@ -175,6 +181,7 @@ state = await installProtocols(addon, {
   pluginBus,
   layoutDriverFactory: (target, snapshot) => createLayoutDriver({
     target, snapshot,
+    reservedZones,
     compute: async (inputs) => {
       if (!runtime) throw new Error("layout: runtime not initialized");
       await runtime.waitForNamespace("layout");

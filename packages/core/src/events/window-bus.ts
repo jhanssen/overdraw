@@ -10,7 +10,7 @@
 import { TypedBus } from "./bus.js";
 import { WINDOW_EVENT } from "./types.js";
 import type {
-  WindowMapEvent, WindowUnmapEvent, WindowChangeEvent, WindowStateChangedEvent,
+  WindowMapEvent, WindowUnmapEvent, WindowChangeEvent, WindowStateBagChangedEvent,
   WindowClosingEvent,
 } from "./types.js";
 
@@ -28,7 +28,7 @@ export interface CompositorEventMap {
   [WINDOW_EVENT.map]: WindowMapEvent;
   [WINDOW_EVENT.unmap]: WindowUnmapEvent;
   [WINDOW_EVENT.change]: WindowChangeEvent;
-  [WINDOW_EVENT.stateChanged]: WindowStateChangedEvent;
+  [WINDOW_EVENT.stateBagChanged]: WindowStateBagChangedEvent;
   [WINDOW_EVENT.closing]: WindowClosingEvent;
   [KEYBOARD_EVENT.focus]: KeyboardFocusEvent;
 }

@@ -5,16 +5,23 @@
 //
 // Routed from main.ts's onRequest chain. Pure JS broker; no GPU.
 
-import type { Wm, HintField } from "../wm/index.js";
-import { HINT_FIELDS } from "../wm/index.js";
+import type { Wm, WindowStateProposal } from "../wm/index.js";
 import type { CompositorBus } from "../events/window-bus.js";
 import type { DynamicBus } from "../events/dynamic-bus.js";
 import { WINDOW_EVENT } from "../events/types.js";
-import type { WindowStateChangedEvent } from "../events/types.js";
-import { markWindowChanged } from "../protocols/window-changes.js";
+import type {
+  WindowStateBagChangedEvent, ProposalReason, Presentation,
+} from "../events/types.js";
 import type { CompositorState, CompositorSink } from "../protocols/ctx.js";
 import { rebuildStackWithPopups } from "../protocols/xdg_popup.js";
 import { FOCUS_REASONS } from "@overdraw/focus-types";
+
+const PRESENTATIONS: ReadonlyArray<Presentation> = [
+  "managed", "maximized", "fullscreen", "minimized",
+];
+const PROPOSAL_REASONS: ReadonlyArray<ProposalReason> = [
+  "client-request", "plugin", "user-input", "window-rule", "core",
+];
 
 export interface WindowsBrokerDeps {
   wm: Wm;
@@ -58,7 +65,7 @@ export function createWindowsBroker(deps: WindowsBrokerDeps): WindowsBroker {
   return (pluginName: string, method: string, params: unknown): unknown | typeof NOT_HANDLED => {
     void pluginName;   // available for future audit / capability gating
 
-    if (method === "windows.set") return handleSet(params);
+    if (method === "windows.propose") return handlePropose(params);
     if (method === "windows.set-state") return handleSetState(params);
     if (method === "windows.delete-state") return handleDeleteState(params);
     if (method === "windows.get-state") return handleGetState(params);
@@ -198,31 +205,22 @@ export function createWindowsBroker(deps: WindowsBrokerDeps): WindowsBroker {
     return null;
   }
 
-  function handleSet(p: unknown): null {
-    if (!isSetPayload(p)) throw new Error("windows.set: malformed payload");
-    if (!(HINT_FIELDS as readonly string[]).includes(p.field)) {
-      throw new Error(`windows.set: unknown field '${p.field}'`);
-    }
-    if (typeof p.value !== "boolean") {
-      throw new Error(`windows.set: '${p.field}' value must be a boolean`);
-    }
-    const changed = wm.setHint(p.id, p.field as HintField, p.value);
-    if (changed) {
-      // Use the same coalescing path as title/appId/activated -- one change
-      // event per surface per frame regardless of how many fields toggled.
-      markWindowChanged(state, p.id, p.field as HintField);
-    }
-    return null;
+  async function handlePropose(p: unknown): Promise<unknown> {
+    if (!isProposePayload(p)) throw new Error("windows.propose: malformed payload");
+    const committed = await wm.propose(p.id, p.proposal, p.reason);
+    // Returning the committed WindowState (or null) so plugins can confirm
+    // what was actually applied after interceptors ran.
+    return committed;
   }
 
   function handleSetState(p: unknown): null {
     if (!isSetStatePayload(p)) throw new Error("windows.set-state: malformed payload");
     const changed = wm.setState(p.id, p.key, p.value);
     if (changed) {
-      const ev: WindowStateChangedEvent = {
+      const ev: WindowStateBagChangedEvent = {
         surfaceId: p.id, key: p.key, value: p.value, deleted: false,
       };
-      pluginBus.emit(WINDOW_EVENT.stateChanged, ev);
+      pluginBus.emit(WINDOW_EVENT.stateBagChanged, ev);
     }
     return null;
   }
@@ -231,10 +229,10 @@ export function createWindowsBroker(deps: WindowsBrokerDeps): WindowsBroker {
     if (!isDeleteStatePayload(p)) throw new Error("windows.delete-state: malformed payload");
     const removed = wm.deleteState(p.id, p.key);
     if (removed) {
-      const ev: WindowStateChangedEvent = {
+      const ev: WindowStateBagChangedEvent = {
         surfaceId: p.id, key: p.key, value: null, deleted: true,
       };
-      pluginBus.emit(WINDOW_EVENT.stateChanged, ev);
+      pluginBus.emit(WINDOW_EVENT.stateBagChanged, ev);
     }
     return null;
   }
@@ -250,12 +248,42 @@ export function createWindowsBroker(deps: WindowsBrokerDeps): WindowsBroker {
   }
 }
 
-function isSetPayload(d: unknown): d is { id: number; field: string; value: unknown } {
+function isProposePayload(d: unknown): d is {
+  id: number; proposal: WindowStateProposal; reason: ProposalReason;
+} {
   if (typeof d !== "object" || d === null) return false;
   const o = d as { [k: string]: unknown };
-  return typeof o.id === "number"
-    && typeof o.field === "string"
-    && "value" in o;
+  if (typeof o.id !== "number") return false;
+  if (typeof o.reason !== "string"
+      || !(PROPOSAL_REASONS as readonly string[]).includes(o.reason)) {
+    return false;
+  }
+  if (typeof o.proposal !== "object" || o.proposal === null) return false;
+  const p = o.proposal as { [k: string]: unknown };
+  // Validate each known field shape. Missing fields are allowed.
+  if (p.presentation !== undefined) {
+    if (typeof p.presentation !== "string"
+        || !(PRESENTATIONS as readonly string[]).includes(p.presentation)) return false;
+  }
+  if (p.layoutMode !== undefined) {
+    if (p.layoutMode !== null && typeof p.layoutMode !== "string") return false;
+  }
+  // layoutData is opaque; any clone-safe value is acceptable.
+  if (p.parent !== undefined) {
+    if (p.parent !== null && typeof p.parent !== "number") return false;
+  }
+  if (p.constraints !== undefined) {
+    if (typeof p.constraints !== "object" || p.constraints === null) return false;
+    const c = p.constraints as { [k: string]: unknown };
+    for (const k of ["minSize", "maxSize"]) {
+      if (c[k] !== undefined && c[k] !== null) {
+        if (typeof c[k] !== "object" || c[k] === null) return false;
+        const sz = c[k] as { [k: string]: unknown };
+        if (!Number.isFinite(sz.width) || !Number.isFinite(sz.height)) return false;
+      }
+    }
+  }
+  return true;
 }
 
 function isSetStatePayload(d: unknown): d is { id: number; key: string; value: unknown } {

@@ -1,5 +1,5 @@
 // End-to-end test for sdk.windows.* across the Worker boundary. Exercises
-// setFloating/setFullscreen/setState/getState/deleteState/get/list and the
+// propose / setState / getState / deleteState / get / list and the
 // resulting bus events. GPU-free.
 //
 // We construct a real core-side Wm (with a mock compositor sink) and a real
@@ -113,7 +113,6 @@ async function withWindowsSetup(targetId, fn, opts = {}) {
     pluginBus.emit(WINDOW_EVENT.change, {
       surfaceId: targetId, changed: ['title'],
       appId: null, title: `TARGET:${targetId}`, activated: false,
-      floating: false, fullscreen: false, maximized: false, minimized: false,
     });
     await waitFor(() => events.some((e) => e.n === 'log' && String(e.d) === `target=${targetId}`));
 
@@ -121,24 +120,24 @@ async function withWindowsSetup(targetId, fn, opts = {}) {
   });
 }
 
-test('setFloating: toggles WM hint state and the snapshot reflects it', async () => {
+test('propose: maximized commits to WM state and is reflected in the snapshot', async () => {
   await withWindowsSetup(7, async ({ events, pluginBus, wm }) => {
-    assert.equal(wm.getHints(7).floating, false);
+    assert.equal(wm.getWindowState(7).presentation, 'managed');
     trigger(pluginBus, 1);
-    await waitFor(() => findLog(events, 'set-floating-true'));
-    assert.equal(wm.getHints(7).floating, true);
+    await waitFor(() => findLog(events, 'propose-maximized'));
+    assert.equal(wm.getWindowState(7).presentation, 'maximized');
 
     trigger(pluginBus, 2);
-    await waitFor(() => findLog(events, 'set-floating-false'));
-    assert.equal(wm.getHints(7).floating, false);
+    await waitFor(() => findLog(events, 'propose-managed'));
+    assert.equal(wm.getWindowState(7).presentation, 'managed');
   });
 });
 
-test('setFullscreen: toggles WM hint state', async () => {
+test('propose: fullscreen commits to WM state', async () => {
   await withWindowsSetup(7, async ({ events, pluginBus, wm }) => {
     trigger(pluginBus, 3);
-    await waitFor(() => findLog(events, 'set-fullscreen-true'));
-    assert.equal(wm.getHints(7).fullscreen, true);
+    await waitFor(() => findLog(events, 'propose-fullscreen'));
+    assert.equal(wm.getWindowState(7).presentation, 'fullscreen');
   });
 });
 
@@ -172,9 +171,9 @@ test('deleteState: removes the value; subsequent getState returns undefined', as
   });
 });
 
-test('get: returns the window snapshot with hints + state inlined', async () => {
+test('get: returns the window snapshot with windowState + state inlined', async () => {
   await withWindowsSetup(7, async ({ events, pluginBus, wm }) => {
-    wm.setHint(7, 'floating', true);
+    await wm.propose(7, { layoutMode: 'floating' }, 'plugin');
     wm.setState(7, 'k', 'v');
 
     trigger(pluginBus, 7);
@@ -182,7 +181,8 @@ test('get: returns the window snapshot with hints + state inlined', async () => 
     const log = findLog(events, 'get=');
     const snap = JSON.parse(String(log.d).slice(4));
     assert.equal(snap.surfaceId, 7);
-    assert.equal(snap.hints.floating, true);
+    assert.equal(snap.windowState.layoutMode, 'floating');
+    assert.equal(snap.windowState.presentation, 'managed');
     assert.equal(snap.state.k, 'v');
   });
 });
@@ -197,12 +197,12 @@ test('list: returns all tracked windows', async () => {
   });
 });
 
-test('state-changed event: setState emits, deleteState emits with deleted=true', async () => {
+test('state-bag-changed event: setState emits, deleteState emits with deleted=true', async () => {
   await withWindowsSetup(7, async ({ events, pluginBus }) => {
-    // Subscribe to window.state-changed on the plugin bus directly so the test
-    // observes the emitted event without needing another fixture.
+    // Subscribe to window.state-bag-changed on the plugin bus directly so the
+    // test observes the emitted event without needing another fixture.
     const stateEvents = [];
-    pluginBus.subscribe('window.state-changed', (name, payload) => {
+    pluginBus.subscribe('window.state-bag-changed', (name, payload) => {
       stateEvents.push({ name, payload });
     });
 

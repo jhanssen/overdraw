@@ -1,21 +1,33 @@
 // Window manager state holder (durable).
 //
 // Owns the window list + stacking order and pushes layout/stack to the
-// compositor sink (CompositorSink.setSurfaceLayout / setStack). JS owns placement
-// (architecture.md: "JS owns WM"); the compositor only consumes rects + order.
+// compositor sink. The geometry policy (where windows go) lives in
+// layout-driver.ts (the resolver) + the bundled layout plugin. The
+// behavioral state of each window (presentation, layoutMode, constraints,
+// parent) lives here, mutated through propose().
 //
-// This module is the durable seam. The *policy* (where windows go) lives in
-// placement.ts and is a stub today; a future dynamic-tiling+floating model
-// replaces that policy and may compute the whole arrangement, pushing it through
-// the same setSurfaceLayout/setStack calls used here.
+// propose() is the single entry point for behavioral-state changes. It
+// emits 'window.proposed' (interceptable), commits the final candidate,
+// emits 'window.committed' (observe-only), and schedules a relayout when
+// geometry-affecting fields changed.
+//
+// Structural operations (addWindow, unmapWindow, setInsets, etc.) stay
+// direct calls because they manage membership and decoration, not state.
 
 import type { Resource } from "../types.js";
 import type { CompositorSink } from "../protocols/ctx.js";
-import type { LayoutWindow, LayoutResult, LayoutReason } from "@overdraw/layout-types";
+import type { LayoutResult, LayoutReason } from "@overdraw/layout-types";
 import type { LayoutDriver, LayoutSnapshot, LayoutApplyTarget } from "./layout-driver.js";
 import type { DynamicBus } from "../events/dynamic-bus.js";
 import { WINDOW_EVENT } from "../events/types.js";
-import type { WindowRelayoutEvent } from "../events/types.js";
+import type {
+  WindowRelayoutEvent,
+  WindowState,
+  Presentation,
+  ProposalReason,
+  WindowProposedEvent,
+  WindowCommittedEvent,
+} from "../events/types.js";
 
 export interface Rect { x: number; y: number; width: number; height: number; }
 export interface Output { width: number; height: number; }
@@ -27,23 +39,6 @@ export interface Insets { top: number; right: number; bottom: number; left: numb
 // does not depend on the protocol layer's SurfaceRecord. Anything carrying a
 // `resource` satisfies this.
 export interface SurfaceHandle { resource: Resource; }
-
-// Per-window hint state (core-plugin-api.md §1). Booleans representing
-// client-driven (set_floating/set_fullscreen/...) and plugin-driven state
-// (a hotkey plugin toggling floating). Stored verbatim so layout plugins
-// can read them as inputs; the WM itself does not act on them.
-// xdg_toplevel.set_* requests do not populate these yet -- those handlers
-// are still no-ops (status.md "Read first").
-export interface WindowHints {
-  floating: boolean;
-  fullscreen: boolean;
-  maximized: boolean;
-  minimized: boolean;
-}
-
-export type HintField = keyof WindowHints;
-export const HINT_FIELDS: ReadonlyArray<HintField> =
-  ["floating", "fullscreen", "maximized", "minimized"];
 
 export interface Window {
   surfaceId: number;
@@ -61,131 +56,113 @@ export interface Window {
   insets?: Insets;
   // The window-bound decoration surface id, if a decoration was created for this
   // window. computeBaseStack splices it directly BELOW this window's content id,
-  // so each decoration is z-bound to its own window (a window on top occludes the
-  // decoration below it, just as it occludes the window below it). Absent = none.
+  // so each decoration is z-bound to its own window. Absent = none.
   decorationSurfaceId?: number;
-  // Content gating (decoration milestone piece 3): true while the window is held
-  // out of the draw stack waiting for its decoration's first frame, so content +
-  // decoration appear together (atomic). computeBaseStack skips gated windows.
+  // Content gating: true while the window is held out of the draw stack
+  // waiting for its decoration's first frame, so content + decoration appear
+  // together (atomic).
   contentGated?: boolean;
   // True once the client has committed presentable content (the map-on-first-
   // content signal). A window is in the layout (and configured) from addWindow,
   // but only drawn once it has content.
   hasContent?: boolean;
-  // Hint state (see WindowHints). All four default to false on map.
-  hints: WindowHints;
-  // Freeform per-window state bag (core-plugin-api.md §1 "Per-window state
-  // bag"). Plugins store concept-specific data here under namespaced keys
-  // ('workspace.id', 'rules.tags', ...). Core does not interpret the values;
-  // any structured-clone-safe value is accepted at the SDK boundary. Mutations
-  // are observable via the 'window.state-changed' event.
+  // Behavioral state (presentation, layoutMode, layoutData, constraints,
+  // parent, restoreRect). Mutated only through propose().
+  windowState: WindowState;
+  // Freeform per-window state bag. Plugins store concept-specific data here
+  // under namespaced keys ('workspace.id', 'rules.tags', ...). Core does not
+  // interpret the values; any structured-clone-safe value is accepted at
+  // the SDK boundary. Mutations emit 'window.state-bag-changed'.
   state: Map<string, unknown>;
+}
+
+// Default behavioral state for a freshly added window. Mutating the
+// returned object is safe (it's a fresh literal per call).
+export function defaultWindowState(): WindowState {
+  return {
+    presentation: "managed",
+    layoutMode: null,
+    layoutData: undefined,
+    constraints: { minSize: null, maxSize: null },
+    parent: null,
+    restoreRect: null,
+  };
 }
 
 export interface WmState { output: Output; windows: Window[]; }
 
 // Configure sink: ask the protocol layer to send a sized configure to a window's
-// toplevel (xdg_toplevel.configure + xdg_surface.configure with a fresh serial).
-// Wired by installProtocols. The WM calls this whenever a window's content size
-// changes (layout recompute on add/remove, or inset change).
+// toplevel. Wired by installProtocols.
 export type ConfigureSink = (surfaceId: number, contentW: number, contentH: number) => void;
 
 // Decoration-resize sink: fired when a decorated window's OUTER tile changes
-// (move and/or size). Two things happen on a sink callback:
-//   1. The compositor's surface layout for the decoration surface is updated by
-//      the WM directly (so the existing decoration texture composites at the
-//      new rect even before the plugin redraws -- prevents pixel corruption).
-//   2. The decoration broker forwards the new geometry to the owning plugin as
-//      a `decoration.resized` event so the plugin can redraw at the new size
-//      (destroy-old-ring + create-new-ring; the ring is fixed-size at alloc).
-// The sink is installed by main.ts (and the decoration GPU tests) via
-// createWm({ decorationResize: ... }); the WM has no direct dependency on the
-// broker.
+// (move and/or size).
 export type DecorationResizeSink = (windowId: number, outerRect: Rect, contentRect: Rect, insets: Insets) => void;
 
 // What setInsets grants back: the (possibly clamped) insets, the outer rect (the
 // decoration's region = content rect grown by the insets), and the content rect
-// (unchanged). The decoration surface is placed at outerRect.
+// (unchanged).
 export interface InsetGrant { insets: Insets; outerRect: Rect; contentRect: Rect; }
+
+// A field-subset of WindowState. propose() merges this into the current
+// state, runs the candidate through the proposed-event chain, then commits.
+// Fields omitted from the proposal stay at their current value.
+export interface WindowStateProposal {
+  presentation?: Presentation;
+  layoutMode?: string | null;
+  layoutData?: unknown;
+  constraints?: {
+    minSize?: { width: number; height: number } | null;
+    maxSize?: { width: number; height: number } | null;
+  };
+  parent?: number | null;
+}
 
 export interface Wm {
   state: WmState;
   // Proactive: called at get_toplevel (role assignment), BEFORE the client has
   // content. Inserts the window into the layout (as the new master) and
-  // SCHEDULES a layout pass. The pass runs asynchronously through the layout
-  // driver; results are applied (push setSurfaceLayout to the compositor +
-  // fire configure) when compute() resolves. Idempotent for an already-added
-  // surface.
-  //
-  // The returned rect is the window's CURRENT content rect (the placeholder
-  // sentinel until the first layout settles, then the assigned content rect).
-  // Callers needing the settled rect should `await wm.settled()` first.
+  // SCHEDULES a layout pass. Idempotent for an already-added surface. The
+  // returned rect is the placeholder sentinel until layout has settled.
   addWindow(surfaceId: number, surfaceRec: SurfaceHandle): Rect;
-  // The window committed its first presentable content: add it to the draw stack.
-  // Returns the current content rect (the placeholder until layout has
-  // settled, then the assigned rect). Returns undefined when the window
-  // isn't tracked.
   windowHasContent(surfaceId: number): Rect | undefined;
   unmapWindow(surfaceId: number): void;
-  // Resolves when the layout has fully settled (no compute pending or in
-  // flight). After addWindow / unmapWindow / setInsets, callers waiting on
-  // post-layout geometry should await this.
   settled(): Promise<void>;
   windowAt(x: number, y: number): Window | null;
-  // Reserve decoration insets INSIDE a window's outer tile. SUBTRACTIVE: the
-  // window's content rect = its outer tile shrunk by the insets, so the
-  // decoration is always on-screen (the outer tile is on-screen by construction).
-  // The client is reconfigured to the (shrunk) content size. Returns the granted
-  // geometry, or undefined if the surface is not a tracked window. Idempotent-
-  // replace: a second call sets the new insets.
   setInsets(surfaceId: number, insets: Insets): InsetGrant | undefined;
-  // The outer tile of a window (the decoration's region), or the content rect when
-  // it has no insets. Used for decoration placement + (future) outer hit-testing.
   outerRectOf(surfaceId: number): Rect | undefined;
-  // The content rect of a window (the assigned tile inside any insets). The map
-  // sweep needs this to build the window.map payload BEFORE calling
-  // windowHasContent: emitting window.map first lets a decoration registry
-  // subscriber set contentGated synchronously so the window is excluded from the
-  // stack push at windowHasContent time. Returns undefined when not tracked.
   rectOf(surfaceId: number): Rect | undefined;
-  // Content gating (decoration piece 3): hold a window's content out of the draw
-  // stack (gated=true) until its decoration's first frame is ready, then release
-  // (gated=false) so content + decoration appear together. Rebuilds the stack via
-  // the injected rebuild hook. No-op if the surface is not a mapped window.
   setContentGated(surfaceId: number, gated: boolean): void;
   isContentGated(surfaceId: number): boolean;
-  // Bind a decoration surface to a window (or clear it with null). The decoration
-  // draws directly below its window's content in the unified stack (computeBaseStack),
-  // so it is z-bound to the window. Triggers a stack rebuild. No-op if the surface
-  // is not a mapped window.
   setDecorationSurface(windowId: number, decoSurfaceId: number | null): void;
 
-  // Hint state setters (core-plugin-api.md §1). Return true if the field
-  // actually changed (so the caller can decide whether to emit a change
-  // event), false if the value matched the current one or the window doesn't
-  // exist.
-  setHint(surfaceId: number, field: HintField, value: boolean): boolean;
-  // Snapshot of a window's hints; returns null if unknown.
-  getHints(surfaceId: number): WindowHints | null;
+  // Propose a behavioral-state change. Builds a candidate by merging the
+  // proposal onto the current state, runs the candidate through the
+  // 'window.proposed' interceptor chain, commits the final candidate to
+  // win.windowState, emits 'window.committed', and schedules a relayout
+  // when geometry-affecting fields changed.
+  //
+  // Resolves AFTER the state is committed and any needed relayout has
+  // been scheduled (NOT after the relayout settles). Returns the
+  // committed state, or null if the window doesn't exist.
+  propose(
+    surfaceId: number,
+    proposal: WindowStateProposal,
+    reason: ProposalReason,
+  ): Promise<WindowState | null>;
 
-  // Freeform per-window state bag (core-plugin-api.md §1). Returns true if
-  // the stored value changed (so an event should fire); false if unchanged
-  // or the window doesn't exist. Pass `undefined` (via deleteState) to
-  // remove a key; setting null is allowed and distinct from delete.
+  // Snapshot of a window's behavioral state; null if unknown.
+  getWindowState(surfaceId: number): WindowState | null;
+
+  // Freeform per-window state bag. setState returns true if the value
+  // actually changed (so the caller can decide whether to emit a change
+  // event), false otherwise.
   setState(surfaceId: number, key: string, value: unknown): boolean;
-  // Read a single state-bag value; undefined when unset or window unknown.
   getState(surfaceId: number, key: string): unknown;
-  // Remove a state-bag key. Returns true if a value was removed.
   deleteState(surfaceId: number, key: string): boolean;
-  // Snapshot of all state-bag entries for a window. Empty object when none /
-  // when unknown.
   getStateAll(surfaceId: number): { [key: string]: unknown };
 
-  // Snapshot of a window, suitable for sdk.windows.get / serialization over
-  // the postMessage wire. Returns null when unknown. Excludes implementation
-  // bookkeeping (surfaceRec).
   getSnapshot(surfaceId: number): WindowSnapshot | null;
-  // Snapshot of every tracked window (sdk.windows.list).
   listSnapshots(): WindowSnapshot[];
 }
 
@@ -200,7 +177,7 @@ export interface WindowSnapshot {
   decorationSurfaceId?: number;
   hasContent: boolean;
   contentGated: boolean;
-  hints: WindowHints;
+  windowState: WindowState;
   state: { [key: string]: unknown };
 }
 
@@ -216,14 +193,11 @@ function shrink(outer: Rect, i: Insets): Rect {
   };
 }
 
-// The content rect for a window given its current outer tile + insets.
 function contentOf(win: Window): Rect {
   return win.insets ? shrink(win.outer, win.insets) : { ...win.outer };
 }
 
 // Validate that an arbitrary value matches the Rect shape with finite numbers.
-// An interceptor may return anything; if it returns garbage, fall back to the
-// WM's intended newOuter rather than corrupt geometry.
 function isRect(v: unknown): v is Rect {
   if (typeof v !== "object" || v === null) return false;
   const r = v as { [k: string]: unknown };
@@ -231,32 +205,136 @@ function isRect(v: unknown): v is Rect {
       && Number.isFinite(r.width) && Number.isFinite(r.height);
 }
 
-// Options for createWm. `rebuild` and `configure` are present in every prod path
-// (installProtocols installs them); unit tests omit them. `decorationResize`
-// fires when a decorated window's OUTER tile changes (move/resize); the broker
-// uses it to forward a `decoration.resized` event to the owning plugin so it
-// can redraw its ring at the new size.
-//
-// `layoutDriverFactory` builds the driver once the WM has an apply-target
-// (the WM passes itself in). Tests pass an inline driver (synchronous fake
-// layout); main.ts passes a runtime-backed driver. When omitted, the WM
-// constructs a no-op driver: schedule() does nothing, settled() resolves
-// immediately. That mode is used by the existing GPU-free tests that don't
-// care about layout output and don't want a runtime spinning up.
+// Deep-ish clone of WindowState for the proposed/committed payloads.
+// Sufficient because we never include `layoutData` in deep-clone (it's
+// opaque; pass-through); other fields are primitives or fixed-shape
+// objects we copy explicitly.
+function cloneState(s: WindowState): WindowState {
+  return {
+    presentation: s.presentation,
+    layoutMode: s.layoutMode,
+    layoutData: s.layoutData,
+    constraints: {
+      minSize: s.constraints.minSize ? { ...s.constraints.minSize } : null,
+      maxSize: s.constraints.maxSize ? { ...s.constraints.maxSize } : null,
+    },
+    parent: s.parent,
+    restoreRect: s.restoreRect ? { ...s.restoreRect } : null,
+  };
+}
+
+// Validate an arbitrary payload's `candidate` field after the interceptor
+// chain. An interceptor may return garbage; if shape is wrong we fall back
+// to the original candidate. Returns the validated state or null.
+function validateState(v: unknown): WindowState | null {
+  if (typeof v !== "object" || v === null) return null;
+  const o = v as { [k: string]: unknown };
+  const p = o.presentation;
+  if (p !== "managed" && p !== "maximized" && p !== "fullscreen" && p !== "minimized") {
+    return null;
+  }
+  if (o.layoutMode !== null && typeof o.layoutMode !== "string") return null;
+  const c = o.constraints;
+  if (typeof c !== "object" || c === null) return null;
+  const cc = c as { [k: string]: unknown };
+  // minSize / maxSize: null or {width, height}.
+  for (const k of ["minSize", "maxSize"] as const) {
+    const val = cc[k];
+    if (val !== null) {
+      if (typeof val !== "object" || val === null) return null;
+      const sz = val as { [k: string]: unknown };
+      if (!Number.isFinite(sz.width) || !Number.isFinite(sz.height)) return null;
+    }
+  }
+  if (o.parent !== null && typeof o.parent !== "number") return null;
+  if (o.restoreRect !== null && !isRect(o.restoreRect)) return null;
+  // layoutData is opaque -- accept anything.
+  // We've validated each known field above; the cast here marks the value
+  // as a well-formed WindowState for downstream code.
+  // eslint-disable-next-line no-restricted-syntax
+  return o as unknown as WindowState;
+}
+
+// Fields whose change requires a layout pass.
+const GEOMETRY_FIELDS: ReadonlyArray<keyof WindowState> = [
+  "presentation", "layoutMode", "layoutData", "constraints",
+];
+
+// Diff two WindowState values; returns the list of differing field names.
+function diffState(prev: WindowState, next: WindowState): Array<keyof WindowState> {
+  const out: Array<keyof WindowState> = [];
+  if (prev.presentation !== next.presentation) out.push("presentation");
+  if (prev.layoutMode !== next.layoutMode) out.push("layoutMode");
+  // layoutData identity-compare; plugins are expected to replace, not mutate.
+  if (prev.layoutData !== next.layoutData) out.push("layoutData");
+  if (!constraintsEqual(prev.constraints, next.constraints)) out.push("constraints");
+  if (prev.parent !== next.parent) out.push("parent");
+  if (!restoreRectEqual(prev.restoreRect, next.restoreRect)) out.push("restoreRect");
+  return out;
+}
+
+function constraintsEqual(a: WindowState["constraints"], b: WindowState["constraints"]): boolean {
+  return sizeEqual(a.minSize, b.minSize) && sizeEqual(a.maxSize, b.maxSize);
+}
+
+function sizeEqual(
+  a: { width: number; height: number } | null,
+  b: { width: number; height: number } | null,
+): boolean {
+  if (a === null && b === null) return true;
+  if (a === null || b === null) return false;
+  return a.width === b.width && a.height === b.height;
+}
+
+function restoreRectEqual(a: Rect | null, b: Rect | null): boolean {
+  if (a === null && b === null) return true;
+  if (a === null || b === null) return false;
+  return a.x === b.x && a.y === b.y && a.width === b.width && a.height === b.height;
+}
+
+// Merge a proposal onto the current state. Returns a new WindowState; does
+// not mutate `current`.
+function mergeProposal(current: WindowState, p: WindowStateProposal): WindowState {
+  const next = cloneState(current);
+  if (p.presentation !== undefined) next.presentation = p.presentation;
+  if (p.layoutMode !== undefined) next.layoutMode = p.layoutMode;
+  if ("layoutData" in p) next.layoutData = p.layoutData;
+  if (p.constraints !== undefined) {
+    if (p.constraints.minSize !== undefined) {
+      next.constraints.minSize = p.constraints.minSize === null
+        ? null
+        : { ...p.constraints.minSize };
+    }
+    if (p.constraints.maxSize !== undefined) {
+      next.constraints.maxSize = p.constraints.maxSize === null
+        ? null
+        : { ...p.constraints.maxSize };
+    }
+  }
+  if (p.parent !== undefined) next.parent = p.parent;
+  return next;
+}
+
 export interface WmOptions {
   rebuild?: () => void;
   configure?: ConfigureSink;
   decorationResize?: DecorationResizeSink;
   layoutDriverFactory?: (target: LayoutApplyTarget, snapshot: () => LayoutSnapshot) => LayoutDriver;
-  // Plugin-visible event bus. When set, applyLayout emits 'window.relayout'
-  // per affected window before mutating its outer tile, awaiting any
-  // interceptors. Omitting it skips the emit (GPU-free tests with no bus).
+  // Plugin-visible event bus. When set:
+  //   - applyLayout emits 'window.relayout' per affected window before
+  //     mutating its outer tile, awaiting interceptors.
+  //   - propose() emits 'window.proposed' (interceptable) and
+  //     'window.committed' (observe-only).
+  // Omitting it skips both emit paths (GPU-free tests with no bus).
   pluginBus?: DynamicBus;
 }
 
-// Per-handler ceiling for window.relayout interceptors (core-plugin-api.md §3.1).
-// Bounded so a hung/expensive plugin handler can't stall the WM indefinitely.
-const RELAYOUT_TIMEOUT_MS = 100;
+// Window state convenience helpers re-exported here so callers reading the
+// WM module don't need a parallel events/types.js import.
+export type { Presentation, WindowState, ProposalReason } from "../events/types.js";
+
+// Per-handler ceiling for window.relayout + window.proposed interceptors.
+const INTERCEPTOR_TIMEOUT_MS = 100;
 
 export function createWm(
   compositor: CompositorSink,
@@ -264,10 +342,6 @@ export function createWm(
   optsOrRebuild?: WmOptions | (() => void),
   configure?: ConfigureSink,
 ): Wm {
-  // Backwards-compatible parameter shape: callers may pass either the new
-  // WmOptions object as the third arg, or the previous (rebuild, configure)
-  // positional pair. installProtocols + the GPU test harnesses use the new
-  // shape; the pre-existing GPU-free unit tests still use the old one.
   let rebuild: (() => void) | undefined;
   let decorationResize: DecorationResizeSink | undefined;
   let layoutDriverFactory: WmOptions["layoutDriverFactory"];
@@ -281,18 +355,10 @@ export function createWm(
   } else {
     rebuild = optsOrRebuild as (() => void) | undefined;
   }
-  // windows: layout/stack order. Index 0 is the master (front); a newly added
-  // window is inserted at the front (becomes master). Draw order is back-to-front
-  // = reverse of this list (master drawn last/on-top is NOT desired; see pushStack).
   const windows: Window[] = [];
   const wm: WmState = { output, windows };
 
   function pushStack(): void {
-    // Prefer the full rebuild (windows interleaved with their decorations +
-    // subsurfaces + popups via computeBaseStack/rebuildStackWithPopups), the single
-    // owner of the content stack. Without a hook (bare WM in GPU-free unit tests),
-    // fall back to a direct setStack that still interleaves each window's decoration
-    // directly below its content, and skips gated/contentless windows.
     if (rebuild) { rebuild(); return; }
     const ids: number[] = [];
     for (const w of windows) {
@@ -303,39 +369,21 @@ export function createWm(
     compositor.setStack(ids);
   }
 
-  // Apply a LayoutResult: emit window.relayout (interceptors may pre-snap a
-  // transform or redirect the new rect), then update each window's outer rect,
-  // push the compositor's setSurfaceLayout for mapped windows, fire configure
-  // where size changed, and update bound decorations. Windows omitted from
-  // the result keep their previous geometry (a layout that wants to hide a
-  // window should leave it out; the driver doesn't auto-hide).
-  //
-  // The relayout emit awaits a (possibly slow) interceptor chain. Other code
-  // paths (unmapWindow, addWindow) mutate `windows` synchronously while this
-  // is awaiting. Two precautions:
-  //   1. Iterate a SNAPSHOT of `windows` so the for-of iterator can't be
-  //      corrupted mid-traversal (splice while iterating skips or repeats).
-  //   2. After each await, re-check the window is still in `windows`. A
-  //      window unmapped during the await is gone from the WM's view --
-  //      applying its layout would push to the compositor (potentially
-  //      resurrecting a deleted Surface via setSurfaceLayout's auto-create)
-  //      and would fire configure() on a destroyed xdg_toplevel.
+  // Apply a LayoutResult: emit window.relayout, then update each window's
+  // outer rect, push the compositor's setSurfaceLayout, fire configure
+  // where size changed, and update bound decorations.
   async function applyLayout(result: LayoutResult, _reason: LayoutReason): Promise<void> {
     void _reason;
-    // Index by id for O(1) lookup; layouts may return rects in arbitrary order.
     const byId = new Map<number, { id: number; outer: Rect }>();
     for (const r of result.rects) byId.set(r.id, r);
     const snapshotWindows = [...windows];
     for (const win of snapshotWindows) {
       const r = byId.get(win.surfaceId);
-      if (!r) continue;   // layout omitted this window: leave its geometry
+      if (!r) continue;
       const prevContent = contentOf(win);
       const prevOuter = win.outer;
       let newOuter: Rect = { ...r.outer };
 
-      // Pre-action emit: interceptors run BEFORE any compositor or
-      // xdg_toplevel side effect. A modifying interceptor returning a new
-      // payload with a different newOuter redirects this window's relayout.
       if (pluginBus) {
         const initial: WindowRelayoutEvent = {
           surfaceId: win.surfaceId,
@@ -343,10 +391,7 @@ export function createWm(
           newOuter: { ...newOuter },
         };
         const finalPayload = await pluginBus.emit(WINDOW_EVENT.relayout, initial,
-          { timeoutMs: RELAYOUT_TIMEOUT_MS });
-        // Membership re-check: a synchronous unmap during the await above
-        // splices `windows`. Continuing would push stale layout for a
-        // destroyed window.
+          { timeoutMs: INTERCEPTOR_TIMEOUT_MS });
         if (!windows.includes(win)) continue;
         const ev = finalPayload as WindowRelayoutEvent | undefined;
         if (ev && isRect(ev.newOuter)) newOuter = { ...ev.newOuter };
@@ -355,17 +400,12 @@ export function createWm(
       win.outer = newOuter;
       const content = contentOf(win);
       win.rect = content;
-      // Drawn position follows the content rect; only meaningful once mapped.
       if (win.hasContent) {
         compositor.setSurfaceLayout(win.surfaceId, content.x, content.y, content.width, content.height);
       }
-      // Configure the client to the new content size if it changed.
       if (configure && (content.width !== prevContent.width || content.height !== prevContent.height)) {
         configure(win.surfaceId, content.width, content.height);
       }
-      // Decoration follow-up: the OUTER tile changed -> reposition the existing
-      // decoration surface NOW + fire the decoration-resize sink so the owning
-      // plugin can redraw at the new size.
       const outerMoved = prevOuter.x !== win.outer.x || prevOuter.y !== win.outer.y
                       || prevOuter.width !== win.outer.width || prevOuter.height !== win.outer.height;
       if (win.decorationSurfaceId !== undefined && outerMoved) {
@@ -378,28 +418,27 @@ export function createWm(
     }
   }
 
-  // Build a LayoutSnapshot from the current WM state. Called by the driver
-  // each compute(). Caller never holds the references; immutable for the
-  // duration of one compute.
+  // Build a LayoutSnapshot from the current WM state. Carries presentation
+  // so the driver's resolver can dispatch mode-specific rects without
+  // calling the plugin.
   function snapshot(): LayoutSnapshot {
-    const layoutWindows: LayoutWindow[] = windows.map((w) => ({
-      id: w.surfaceId,
-      role: "toplevel" as const,
-      hints: {
-        floating: w.hints.floating,
-        wantsFullscreen: w.hints.fullscreen,
-        wantsMaximized: w.hints.maximized,
-        wantsMinimized: w.hints.minimized,
-      },
-      currentRect: { ...w.outer },
-    }));
-    return { output: { width: output.width, height: output.height }, windows: layoutWindows };
+    const snapshotWindows: import("./layout-driver.js").LayoutSnapshotWindow[] =
+      windows.map((w) => ({
+        id: w.surfaceId,
+        role: "toplevel" as const,
+        presentation: w.windowState.presentation,
+        layoutMode: w.windowState.layoutMode ?? undefined,
+        layoutData: w.windowState.layoutData,
+        constraints: {
+          minSize: w.windowState.constraints.minSize ?? undefined,
+          maxSize: w.windowState.constraints.maxSize ?? undefined,
+        },
+        currentRect: { ...w.outer },
+        ...(w.windowState.restoreRect ? { restoreRect: { ...w.windowState.restoreRect } } : {}),
+      }));
+    return { output: { width: output.width, height: output.height }, windows: snapshotWindows };
   }
 
-  // Build the driver. When no factory is provided, use a stub that does
-  // nothing (schedule is a no-op, settled() resolves immediately). This is
-  // the mode for GPU-free unit tests that don't exercise layout output but
-  // need a working WM for stack / focus / insets bookkeeping.
   const target: LayoutApplyTarget = { apply: applyLayout };
   const driver: LayoutDriver = layoutDriverFactory
     ? layoutDriverFactory(target, snapshot)
@@ -408,40 +447,27 @@ export function createWm(
   return {
     state: wm,
 
-    // Proactive: insert at the front (new window becomes master) and SCHEDULE
-    // a layout pass. The pass runs through the layout driver asynchronously;
-    // when its compute() resolves, the driver calls applyLayout(), which
-    // assigns outer/rect and fires configure for any window whose content size
-    // changed (including the new one).
-    //
-    // The returned rect is the placeholder sentinel until layout settles;
-    // callers needing the assigned rect should `await wm.settled()`.
     addWindow(surfaceId, surfaceRec) {
       const existing = windows.find((w) => w.surfaceId === surfaceId);
-      if (existing) return contentOf(existing); // idempotent
+      if (existing) return contentOf(existing);
       const win: Window = {
         surfaceId,
-        // Provisional sentinel (-1 size) so the first layout pass always
-        // detects a change for the new window and sends its first configure,
-        // even when its computed tile happens to match the output size.
         outer: { x: 0, y: 0, width: -1, height: -1 },
         rect: { x: 0, y: 0, width: -1, height: -1 },
         surfaceRec,
-        hints: { floating: false, fullscreen: false, maximized: false, minimized: false },
+        windowState: defaultWindowState(),
         state: new Map<string, unknown>(),
       };
-      windows.unshift(win); // front = master
+      windows.unshift(win);
       driver.schedule("mapped");
       return win.rect;
     },
 
-    // First content commit: mark drawable + add to the stack. Geometry already set.
     windowHasContent(surfaceId) {
       const win = windows.find((w) => w.surfaceId === surfaceId);
       if (!win) return undefined;
       if (!win.hasContent) {
         win.hasContent = true;
-        // Push its layout now that it is drawable, then (re)build the stack.
         compositor.setSurfaceLayout(win.surfaceId, win.rect.x, win.rect.y, win.rect.width, win.rect.height);
         pushStack();
       }
@@ -452,7 +478,7 @@ export function createWm(
       const i = windows.findIndex((w) => w.surfaceId === surfaceId);
       if (i < 0) return;
       windows.splice(i, 1);
-      driver.schedule("unmapped");   // remaining windows reflow when compute resolves
+      driver.schedule("unmapped");
       pushStack();
     },
 
@@ -470,7 +496,6 @@ export function createWm(
       const contentRect = contentOf(win);
       win.rect = contentRect;
       const outerRect = { ...win.outer };
-      // Content shrank inside the fixed outer tile: reposition + reconfigure.
       if (win.hasContent) {
         compositor.setSurfaceLayout(win.surfaceId, contentRect.x, contentRect.y, contentRect.width, contentRect.height);
       }
@@ -482,23 +507,20 @@ export function createWm(
 
     outerRectOf(surfaceId) {
       const win = windows.find((w) => w.surfaceId === surfaceId);
-      if (!win) return undefined;
-      return { ...win.outer };
+      return win ? { ...win.outer } : undefined;
     },
 
     rectOf(surfaceId) {
       const win = windows.find((w) => w.surfaceId === surfaceId);
-      if (!win) return undefined;
-      return { ...win.rect };
+      return win ? { ...win.rect } : undefined;
     },
 
     setContentGated(surfaceId, gated) {
       const win = windows.find((w) => w.surfaceId === surfaceId);
       if (!win) return;
-      if (!!win.contentGated === gated) return;   // no change
+      if (!!win.contentGated === gated) return;
       win.contentGated = gated;
-      pushStack();   // re-push without/with this window; a fuller rebuild (popups/
-                     // subsurfaces) follows on the next sweep and also filters gated.
+      pushStack();
     },
 
     isContentGated(surfaceId) {
@@ -510,23 +532,15 @@ export function createWm(
       const win = windows.find((w) => w.surfaceId === windowId);
       if (!win) return;
       const next = decoSurfaceId === null ? undefined : decoSurfaceId;
-      if (win.decorationSurfaceId === next) return;   // no change
+      if (win.decorationSurfaceId === next) return;
       win.decorationSurfaceId = next;
-      // Push the decoration's current outer-rect layout. The alloc captured
-      // the outer at the moment decoration.createDecoration ran; layout
-      // passes that ran between the grant and surface.alloc completion would
-      // have skipped the decoration (decorationSurfaceId was still
-      // undefined). Without pushing now, the decoration stays at the stale
-      // rect from alloc until the NEXT relayout -- and a stale full-output
-      // decoration covers other windows.
       if (next !== undefined && win.outer.width > 0 && win.outer.height > 0) {
         compositor.setSurfaceLayout(next, win.outer.x, win.outer.y,
                                     win.outer.width, win.outer.height);
       }
-      pushStack();   // re-interleave the decoration below its window's content
+      pushStack();
     },
 
-    // Topmost window containing the output-space point, or null.
     windowAt(x, y) {
       for (let i = windows.length - 1; i >= 0; i--) {
         const win = windows[i];
@@ -537,17 +551,51 @@ export function createWm(
       return null;
     },
 
-    setHint(surfaceId, field, value) {
+    async propose(surfaceId, proposal, reason) {
       const win = windows.find((w) => w.surfaceId === surfaceId);
-      if (!win) return false;
-      if (win.hints[field] === value) return false;
-      win.hints[field] = value;
-      return true;
+      if (!win) return null;
+      const current = cloneState(win.windowState);
+      let candidate = mergeProposal(current, proposal);
+
+      if (pluginBus) {
+        const initial: WindowProposedEvent = {
+          surfaceId, reason, current,
+          candidate: cloneState(candidate),
+        };
+        const finalPayload = await pluginBus.emit(WINDOW_EVENT.proposed, initial,
+          { timeoutMs: INTERCEPTOR_TIMEOUT_MS });
+        if (!windows.includes(win)) return null; // unmapped during await
+        const ev = finalPayload as WindowProposedEvent | undefined;
+        const modified = ev ? validateState(ev.candidate) : null;
+        if (modified) candidate = cloneState(modified);
+      }
+
+      const changed = diffState(current, candidate);
+      if (changed.length === 0) return cloneState(current);
+
+      win.windowState = candidate;
+
+      if (pluginBus) {
+        const ev: WindowCommittedEvent = {
+          surfaceId, reason,
+          previous: current,
+          current: cloneState(candidate),
+          changed: [...changed],
+        };
+        pluginBus.emit(WINDOW_EVENT.committed, ev);
+      }
+
+      // Schedule a relayout when geometry-relevant fields changed.
+      if (changed.some((f) => GEOMETRY_FIELDS.includes(f))) {
+        driver.schedule("state-changed");
+      }
+
+      return cloneState(candidate);
     },
 
-    getHints(surfaceId) {
+    getWindowState(surfaceId) {
       const win = windows.find((w) => w.surfaceId === surfaceId);
-      return win ? { ...win.hints } : null;
+      return win ? cloneState(win.windowState) : null;
     },
 
     setState(surfaceId, key, value) {
@@ -555,10 +603,6 @@ export function createWm(
       if (!win) return false;
       const existed = win.state.has(key);
       const prev = win.state.get(key);
-      // Equality semantics: identity check is enough for primitives; for
-      // objects, plugins are expected to replace (not mutate in place). A
-      // false-positive "changed" event when the same object is re-set is
-      // acceptable.
       if (existed && prev === value) return false;
       win.state.set(key, value);
       return true;
@@ -585,8 +629,7 @@ export function createWm(
 
     getSnapshot(surfaceId) {
       const win = windows.find((w) => w.surfaceId === surfaceId);
-      if (!win) return null;
-      return snapshotOf(win);
+      return win ? snapshotOf(win) : null;
     },
 
     listSnapshots() {
@@ -604,7 +647,20 @@ function snapshotOf(win: Window): WindowSnapshot {
     outer: { ...win.outer },
     hasContent: !!win.hasContent,
     contentGated: !!win.contentGated,
-    hints: { ...win.hints },
+    windowState: {
+      presentation: win.windowState.presentation,
+      layoutMode: win.windowState.layoutMode,
+      layoutData: win.windowState.layoutData,
+      constraints: {
+        minSize: win.windowState.constraints.minSize
+          ? { ...win.windowState.constraints.minSize } : null,
+        maxSize: win.windowState.constraints.maxSize
+          ? { ...win.windowState.constraints.maxSize } : null,
+      },
+      parent: win.windowState.parent,
+      restoreRect: win.windowState.restoreRect
+        ? { ...win.windowState.restoreRect } : null,
+    },
     state,
   };
   if (win.insets) snap.insets = { ...win.insets };

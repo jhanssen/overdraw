@@ -21,12 +21,20 @@ export const WINDOW_EVENT = {
   map: "window.map",
   unmap: "window.unmap",
   change: "window.change",
-  // Per-window state-bag mutation (core-plugin-api.md §3). Separate from
-  // window.change because the state bag is high-cardinality (any plugin-
-  // defined key) and would otherwise drown the lower-frequency typed
-  // change stream. Plugins observing state mutations subscribe directly to
-  // 'window.state-changed'.
-  stateChanged: "window.state-changed",
+  // Per-window state-bag mutation. The freeform plugin-namespaced key/value
+  // store on each window (sdk.windows.setState). Separate from window.change
+  // (lower-frequency, typed) and from window.committed (behavioral state).
+  stateBagChanged: "window.state-bag-changed",
+  // Pre-action interceptable event: someone wants to change a window's
+  // behavioral state (presentation, layoutMode, layoutData, constraints,
+  // parent). Interceptors receive the current state and a candidate; they
+  // may modify the candidate (return a new payload) or revert it (return
+  // the candidate with the disputed field set back to current = veto).
+  // After interceptors resolve, the final candidate is committed.
+  proposed: "window.proposed",
+  // Post-commit observe-only event: a window's behavioral state was just
+  // committed. Carries previous + current + which fields changed.
+  committed: "window.committed",
   // Pre-action lifecycle event: the WM is about to change a window's outer
   // tile. Fired BEFORE the compositor receives the new rect or xdg_toplevel
   // sees the configure. Await-capable: an interceptor may modify the new
@@ -68,41 +76,96 @@ export type WindowUnmapEvent = {
   surfaceId: number;
 };
 
-// Which fields of a mapped window changed since the last emit. Extend as the
-// WM gains additional observable state. The four hint fields
-// (floating/fullscreen/maximized/minimized) are populated by plugin setters
-// today; client-side xdg_toplevel.set_* requests are still no-ops (status.md
-// "Read first") so they remain false until those handlers land.
-export type WindowChangeField =
-  | "title" | "appId" | "activated"
-  | "floating" | "fullscreen" | "maximized" | "minimized";
+// Which fields of a mapped window changed since the last emit. Window
+// behavioral state (presentation, layoutMode, etc.) is NOT a change field --
+// those go through 'window.committed'. This event is for the metadata
+// stream: title, appId, focus activation.
+export type WindowChangeField = "title" | "appId" | "activated";
 
-// Emitted (coalesced per frame) when a mapped toplevel's observable state
-// changes. `changed` lists the fields; the current values are included so a
-// consumer never has to re-query. `activated` is keyboard-focus (active window).
-// Hint fields (floating/fullscreen/maximized/minimized) accompany the snapshot
-// so subscribers see the full state without a separate fetch.
+// Emitted (coalesced per frame) when a mapped toplevel's metadata changes.
+// `changed` lists the fields; the current values are included so a consumer
+// never has to re-query. `activated` is keyboard-focus (active window).
 export type WindowChangeEvent = {
   surfaceId: number;
   changed: WindowChangeField[];
   appId: string | null;
   title: string | null;
   activated: boolean;
-  floating: boolean;
-  fullscreen: boolean;
-  maximized: boolean;
-  minimized: boolean;
 };
 
 // Emitted when a per-window state-bag entry changes (sdk.windows.setState or
 // deleteState). `value` is the new value, or null when the key was deleted
 // (null/undefined collapse on the wire; explicit `deleted: true` differentiates
 // a delete from setting null).
-export type WindowStateChangedEvent = {
+export type WindowStateBagChangedEvent = {
   surfaceId: number;
   key: string;
   value: unknown;
   deleted: boolean;
+};
+
+// Per-window behavioral state. Carried in the proposed/committed event
+// payloads + the window snapshot. Three layers:
+//   - `presentation`: closed enum, drives xdg_toplevel.configure states +
+//     core's mode dispatch in the geometry resolver.
+//   - `layoutMode` / `layoutData`: open vocabulary owned by the active
+//     layout plugin; opaque to core. Carried so other plugins can intercept
+//     transitions ("don't let Firefox go floating") without coupling to a
+//     specific layout plugin.
+//   - `constraints` + `parent`: protocol-defined fields from xdg_toplevel.
+//     set_min_size / set_max_size / set_parent.
+export type Presentation = "managed" | "maximized" | "fullscreen" | "minimized";
+
+export type WindowState = {
+  presentation: Presentation;
+  layoutMode: string | null;
+  layoutData: unknown;
+  constraints: {
+    minSize: { width: number; height: number } | null;
+    maxSize: { width: number; height: number } | null;
+  };
+  parent: number | null;
+  // The rect to restore to when leaving maximized/fullscreen back to
+  // 'managed'. Captured at the propose() that transitions OUT of 'managed'
+  // and consumed at the propose() that transitions back in. null until
+  // the first such transition.
+  restoreRect: { x: number; y: number; width: number; height: number } | null;
+};
+
+// Why a proposal was made. Helps interceptors distinguish client intent
+// from automated rules from user input. Status bars / audit logs may also
+// branch on this.
+export type ProposalReason =
+  | "client-request"    // xdg_toplevel.set_* from a wayland client
+  | "plugin"            // sdk.windows.propose from a plugin
+  | "user-input"        // hotkey / pointer grab (plugin-driven, flagged
+                        //   so policy plugins can prefer it over rules)
+  | "window-rule"       // a window-rules plugin applying its policy
+  | "core";             // core's own self-propose
+
+// Pre-commit interceptable event. `current` is the window's state right
+// now; `candidate` is what the WM would commit. An interceptor returning a
+// modified payload with a different `candidate` redirects the commit; an
+// interceptor returning the candidate unchanged is observe-only. Reverting
+// a disputed field in `candidate` back to its value in `current` is the
+// veto pattern.
+export type WindowProposedEvent = {
+  surfaceId: number;
+  reason: ProposalReason;
+  current: WindowState;
+  candidate: WindowState;
+};
+
+// Post-commit observe-only event. `previous` is what the window had before;
+// `current` is what it has now; `changed` lists the fields that actually
+// differ (post-arbitration -- if an interceptor reverted a field, it won't
+// appear here even though it was in the original proposal).
+export type WindowCommittedEvent = {
+  surfaceId: number;
+  reason: ProposalReason;
+  previous: WindowState;
+  current: WindowState;
+  changed: ReadonlyArray<keyof WindowState>;
 };
 
 // Emitted before the WM mutates a mapped toplevel's outer tile. `oldOuter` is
@@ -187,6 +250,12 @@ export type DecorationResizedEvent = {
 // Compile-time assertion that the plugin-forwarded payloads stay clone-safe. If a
 // field is ever added that is not structured-clone-safe, the build fails rather
 // than silently passing a non-cloneable value over postMessage.
+//
+// WindowState contains `layoutData: unknown` which is not statically
+// Cloneable; the plugin author is responsible for keeping it clone-safe.
+// The proposed/committed events therefore carry an unknown field and we
+// can't assert them here. The bus enforces clone-safety at emit time
+// (structured-clone throws on non-cloneable values).
 type AssignableToCloneable<T extends Cloneable> = T;
 export type _MapIsCloneable = AssignableToCloneable<WindowMapEvent>;
 export type _UnmapIsCloneable = AssignableToCloneable<WindowUnmapEvent>;

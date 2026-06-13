@@ -117,7 +117,6 @@ function asUnmapEvent(data: unknown): WindowUnmapEvent | null {
 
 const CHANGE_FIELDS: readonly WindowChangeField[] = [
   "title", "appId", "activated",
-  "floating", "fullscreen", "maximized", "minimized",
 ];
 
 function asChangeEvent(data: unknown): WindowChangeEvent | null {
@@ -125,10 +124,6 @@ function asChangeEvent(data: unknown): WindowChangeEvent | null {
   if (typeof data.surfaceId !== "number") return null;
   if (!isNullableString(data.appId) || !isNullableString(data.title)) return null;
   if (typeof data.activated !== "boolean") return null;
-  if (typeof data.floating !== "boolean") return null;
-  if (typeof data.fullscreen !== "boolean") return null;
-  if (typeof data.maximized !== "boolean") return null;
-  if (typeof data.minimized !== "boolean") return null;
   const raw = data.changed;
   if (!Array.isArray(raw)) return null;
   const changed: WindowChangeField[] = [];
@@ -141,7 +136,5 @@ function asChangeEvent(data: unknown): WindowChangeEvent | null {
     surfaceId: data.surfaceId, changed,
     appId: data.appId, title: data.title,
     activated: data.activated,
-    floating: data.floating, fullscreen: data.fullscreen,
-    maximized: data.maximized, minimized: data.minimized,
   };
 }

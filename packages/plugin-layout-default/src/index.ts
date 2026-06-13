@@ -32,22 +32,25 @@ export default async function init(sdk: SdkLike): Promise<void> {
 
   const api: LayoutAPI = {
     async compute(inputs: LayoutInputs): Promise<LayoutResult> {
-      // The master-stack algorithm only consumes the window count + output
-      // dimensions. Hints, focus, currentRect are ignored. A future
-      // alternative layout plugin (e.g. BSP) would consume more of LayoutInputs.
+      // Master-stack only consumes window count + the working rect.
+      // layoutMode, layoutData, currentRect are ignored. Tiles are
+      // placed within `tileRegion` (output minus reserved zones); the
+      // core resolver dispatched non-managed presentations before we
+      // were called.
+      const region = inputs.tileRegion;
       const rects = masterStackLayout(
         inputs.windows.length,
-        { width: inputs.output.rect.width, height: inputs.output.rect.height },
+        { width: region.width, height: region.height },
         params,
       );
       return {
         rects: inputs.windows.map((w, i) => ({
           id: w.id,
           outer: {
-            // Translate the algorithm's output-local rect into compositor
-            // coordinates by adding the output's origin.
-            x: rects[i].x + inputs.output.rect.x,
-            y: rects[i].y + inputs.output.rect.y,
+            // Translate the algorithm's region-local rect into compositor
+            // coordinates by adding the tile region's origin.
+            x: rects[i].x + region.x,
+            y: rects[i].y + region.y,
             width: rects[i].width,
             height: rects[i].height,
           },
