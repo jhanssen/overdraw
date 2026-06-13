@@ -52,6 +52,7 @@ const GLOBALS = [
   "zwp_primary_selection_device_manager_v1",
   "wp_cursor_shape_manager_v1",
   "zwlr_layer_shell_v1",
+  "zxdg_decoration_manager_v1",
 ];
 
 // Interfaces created via requests (new_id), registered without a global so
@@ -65,6 +66,7 @@ const CHILD_INTERFACES = [
   "zwp_primary_selection_offer_v1",
   "wp_cursor_shape_device_v1",
   "zwlr_layer_surface_v1",
+  "zxdg_toplevel_decoration_v1",
 ];
 
 // Load all generated signature modules, keyed by interface name.
@@ -413,6 +415,7 @@ export async function installProtocols(
     // wp_cursor_shape_manager_v1 is exposed via globalHandlers; the
     // module's helper factories aren't a default export.
     zwlr_layer_shell_v1: await import("./zwlr_layer_shell_v1.js"),
+    zxdg_decoration_manager_v1: await import("./zxdg_decoration_manager_v1.js"),
   };
 
   // Some child interfaces have handlers from a sibling module's named exports.
@@ -422,6 +425,7 @@ export async function installProtocols(
   const ddmMod = await import("./wl_data_device_manager.js");
   const cursorShapeMod = await import("./cursor_shape.js");
   const layerShellMod = await import("./zwlr_layer_shell_v1.js");
+  const decorationMod = await import("./zxdg_decoration_manager_v1.js");
   const childHandlers: Record<string, object> = {
     wl_pointer: seatMod.makePointer(ctx),
     wl_keyboard: seatMod.makeKeyboard(ctx),
@@ -436,6 +440,7 @@ export async function installProtocols(
     wl_callback: {}, // event-only (done); no requests to dispatch
     wp_cursor_shape_device_v1: cursorShapeMod.makeCursorShapeDevice(ctx),
     zwlr_layer_surface_v1: layerShellMod.makeLayerSurface(ctx),
+    zxdg_toplevel_decoration_v1: decorationMod.makeToplevelDecoration(ctx),
   };
 
   // The apply target forwards lazily: the seat is constructed below and

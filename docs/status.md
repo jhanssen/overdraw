@@ -4,7 +4,7 @@ Ground truth for what exists right now: current capabilities, known gaps, and
 what remains. The design lives in `architecture.md`; this file does not restate
 it. Present-tense only — no change history.
 
-Last updated: 2026-06-12 (post-wlr-layer-shell-unstable-v1 — desktop-shell components: anchored layer surfaces with configure/ack handshake, exclusive-zone reflow of the WM tile region, popups parented to layer surfaces, keyboard-interactivity routing including the exclusive override above the focus driver, OUTPUT_DEFAULT-only).
+Last updated: 2026-06-12 (post-xdg-decoration — wire-level SSD negotiation; the compositor unconditionally replies server_side. Actual decoration drawing remains per-app_id via the existing decoration broker; toplevels with no matching plugin remain borderless under SSD).
 
 ## Read first: gaps in advertised protocols (silent-gap risks)
 
@@ -69,10 +69,11 @@ with no error. Worst-first.
   variants. `sdk.compose.scene` (the single-composed-result variant)
   works for both in-thread and Worker plugins.
 
-- **Advertised-absent (clean fallback, not gaps):** xdg-decoration (→ CSD),
+- **Advertised-absent (clean fallback, not gaps):**
   fractional-scale, text-input, xdg-activation, toplevel-icon,
   system-bell. Clients warn and fall back. See the protocol-coverage matrix.
-  (`wp_cursor_shape_v1` is now advertised; see the Cursor section.)
+  (`wp_cursor_shape_v1` and `zxdg_decoration_manager_v1` are now advertised;
+  see their sections.)
 
 ## Verification environment
 
@@ -2546,6 +2547,36 @@ toplevels.
 
 966/966 unit tests pass; 129/129 GPU tests pass.
 
+### xdg-decoration (`zxdg_decoration_manager_v1` / `zxdg_toplevel_decoration_v1`)
+
+The wire-level negotiation a client uses to ask "do you want me to draw my
+own decorations?" The compositor's answer is unconditional: `server_side`,
+on initial `get_toplevel_decoration` and on every `set_mode`/`unset_mode`.
+The client's preference is ignored -- the compositor's policy is "draw
+decorations server-side"; a well-behaved client suppresses its CSD on
+receiving the SSD configure.
+
+The protocol is decoupled from the actual decoration drawing, which lives
+in the per-app_id decoration broker (`packages/core/src/decorations.ts`).
+Binding `zxdg_decoration_manager_v1` does NOT cause decorations to appear
+around a toplevel -- a decoration plugin still has to match the client's
+`app_id` and draw. The protocol's contribution is the SSD signal that
+tells well-behaved GTK/Qt clients to suppress their own titlebar. A
+toplevel whose `app_id` has no matching decoration plugin: under the
+protocol it gets the "SSD will be drawn" signal but no decoration plugin
+actually draws one -- the client may have already suppressed its CSD,
+leaving a borderless window. An end-user-visible papercut for clients
+with no matching style rule; a universal fallback decorator plugin (a
+catch-all regex at priority 0) closes it.
+
+Silent-drops (no `post_error`; see "Read first"): `already_constructed`
+(second `get_toplevel_decoration` on the same xdg_toplevel),
+`unconfigured_buffer`, `orphaned`, `invalid_mode` (out-of-range enum
+value -- a configure with `server_side` is still sent in reply).
+
+Files: `packages/core/src/protocols/zxdg_decoration_manager_v1.ts`
+(both interfaces), `test/xdg-decoration.test.js` (7 unit tests).
+
 ### Decoration provider (registration + insets + drawing + atomic gating)
 
 Server-side decorations end to end: a plugin registers an app_id pattern, is told
@@ -2705,7 +2736,11 @@ per-surface render state primitives (`compositor-fx.gpu.mjs`).
   `wl_data_device` DnD (full vertical),
   `zwlr_layer_shell_v1`/`zwlr_layer_surface_v1` (anchor + exclusive zone
   reflow, window.map role, exclusive keyboard interactivity override,
-  popup re-parenting).
+  popup re-parenting),
+  `zxdg_decoration_manager_v1`/`zxdg_toplevel_decoration_v1` (unconditional
+  server-side reply; the configure handshake is unit-tested, no GPU
+  coverage since the protocol carries no visible state of its own --
+  decorations come from the per-app_id broker).
 - **Implemented, not behaviorally tested**: `wl_region` (no-op stub);
   `zwp_linux_dmabuf_feedback_v1` (exercised by real WSI clients, no automated
   assertion).
