@@ -45,6 +45,7 @@ set(XDG_SHELL_DIR ${CMAKE_SOURCE_DIR}/native/wayland/generated)
 add_executable(overdraw-gpu-process
     gpu-process/src/main.cpp
     gpu-process/src/host_window.cpp
+    gpu-process/src/output_host_window.cpp
     gpu-process/src/allocator.cpp
     gpu-process/src/event_loop_epoll.cpp
     ${XDG_SHELL_DIR}/xdg-shell-protocol.c)

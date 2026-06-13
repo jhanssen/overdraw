@@ -4,7 +4,7 @@ Ground truth for what exists right now: current capabilities, known gaps, and
 what remains. The design lives in `architecture.md`; this file does not restate
 it. Present-tense only — no change history.
 
-Last updated: 2026-06-13 (post-slice-1 of phase-2 DRM/KMS work — libseat (`native/core/seat.{h,cpp}`) and `LibinputBackend` (`native/core/input_libinput.{h,cpp}`) land alongside the existing `WaylandInputBackend` as sibling input backends, selectable at runtime via `OVERDRAW_INPUT_BACKEND=libinput|wayland`. Verified on the test box: headless start with `LIBSEAT_BACKEND=seatd` produces correct `InputEvent`s from physical keyboard and trackpad. No display backend change; nested-mode (`WaylandInputBackend`) remains the default and is unchanged. Design: `docs/drm-design.md`.
+Last updated: 2026-06-13 (post-slice-2 of phase-2 DRM/KMS work — output-backend seam in the GPU process. `HostWindow` lifted behind `HostWindowOutputBackend` (`gpu-process/src/output_host_window.{h,cpp}`) implementing the new abstract `OutputBackend` (`gpu-process/src/output_backend.h`). Pure refactor; nested-mode behavior is unchanged. All 994 pure-unit tests and the integration GPU tests (nested host-Wayland path) still pass. Slice 1 (libseat + `LibinputBackend` siblings to `WaylandInputBackend`, selected via `OVERDRAW_INPUT_BACKEND=libinput`) remains in place. Design: `docs/drm-design.md`.
 
 ## Read first: gaps in advertised protocols (silent-gap risks)
 
@@ -97,12 +97,22 @@ is proven portable:
 Two processes per the design: a core (Node + N-API addon, Dawn wire client) and a
 separate native GPU process (Dawn native + wire server). The core fork+execs the
 GPU process and reaps it on shutdown (poll then SIGTERM, no orphan). The GPU
-process owns the host Wayland output window + its `wl_display` connection, the
-native Dawn instance + `dawn::wire::WireServer`, the `wgpu::Surface` (injected at
-the client's reserved handle), and the GBM allocator. The core runs the
-`dawn::wire::WireClient`, brings up adapter + device + surface over the wire, hosts
-the JS protocol/WM/compositing/plugin layers, and is the Wayland server for
-overdraw's own clients.
+process owns the output target via an output-backend seam
+(`gpu-process/src/output_backend.h`): `HostWindowOutputBackend`
+(`output_host_window.{h,cpp}`) is the phase-1 implementation, owning the host
+Wayland output window + its `wl_display` connection; the phase-2
+`KmsOutputBackend` (DRM/KMS + GBM scanout) lands in slice 4 of
+`docs/drm-design.md` against the same interface. The seam exposes
+open/close/size/createWgpuSurface/eventFd/pump/shouldClose; acquire/present
+primitives are not on the interface yet (slice 4 introduces them with a real
+implementation). Headless mode has no `OutputBackend` -- the GPU process
+branches on `headless` and never constructs one in that case. The GPU process
+also owns the native Dawn instance + `dawn::wire::WireServer`, the `wgpu::
+Surface` (injected at the client's reserved handle, built via
+`OutputBackend::createWgpuSurface` in nested mode), and the GBM allocator. The
+core runs the `dawn::wire::WireClient`, brings up adapter + device + surface
+over the wire, hosts the JS protocol/WM/compositing/plugin layers, and is the
+Wayland server for overdraw's own clients.
 
 The core is C++ + Node: `packages/core/src/index.js`/`packages/core/src/main.ts` load `overdraw_native.node`;
 native core in `native/core/` (`gpu_process`, `wire_link`, `compositor`). Node owns

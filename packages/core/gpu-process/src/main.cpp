@@ -32,7 +32,8 @@
 
 #include "allocator.h"
 #include "event_loop.h"
-#include "host_window.h"
+#include "output_backend.h"
+#include "output_host_window.h"
 #include "side_channel.h"
 #include "transport.h"
 #include "wire_barrier.h"
@@ -110,23 +111,27 @@ int buildFormatTableMemfd(const std::vector<gpu::FormatTableEntry>& entries) {
 
 int run(int wireFd, int ctrlFd, int inputFd, bool headless,
         uint32_t headlessW, uint32_t headlessH) {
-    // 1) Output: in nested mode, a host Wayland output window (this process is
-    //    the Wayland client of the host) whose seat forwards input over inputFd.
-    //    In HEADLESS mode there is no host window/surface/seat at all -- the core
-    //    renders the compositing pass into an offscreen texture and reads it back
-    //    (tests). The size is fixed from argv.
-    gpu::HostWindow window(inputFd);
+    // 1) Output: in nested mode, an OutputBackend brings up the display target
+    //    (HostWindowOutputBackend in phase 1 = a host Wayland output window the
+    //    GPU process is a client of, forwarding host pointer/keyboard over
+    //    inputFd; KmsOutputBackend in phase 2 = DRM/KMS scanout, no host).
+    //    HEADLESS mode has no output target at all -- the core renders into an
+    //    offscreen texture and reads it back (tests). The size is fixed from
+    //    argv. `output` is null in headless mode.
+    std::unique_ptr<gpu::OutputBackend> output;
     if (!headless) {
-        if (!window.open("overdraw")) {
+        output = std::make_unique<gpu::HostWindowOutputBackend>(inputFd);
+        if (!output->open("overdraw")) {
             std::fprintf(stderr, "[gpu] failed to open host window (no WAYLAND_DISPLAY?)\n");
             return 1;
         }
-        std::printf("[gpu] host window %ux%u\n", window.width(), window.height());
+        const gpu::OutputSize sz = output->size();
+        std::printf("[gpu] host window %ux%u\n", sz.width, sz.height);
     } else {
         std::printf("[gpu] HEADLESS %ux%u (no host window/surface)\n", headlessW, headlessH);
     }
-    auto outW = [&] { return headless ? headlessW : window.width(); };
-    auto outH = [&] { return headless ? headlessH : window.height(); };
+    auto outW = [&] { return headless ? headlessW : output->size().width; };
+    auto outH = [&] { return headless ? headlessH : output->size().height; };
 
     // 2) Native Dawn instance + wire server.
     dawn::native::Instance instance;
@@ -263,15 +268,15 @@ int run(int wireFd, int ctrlFd, int inputFd, bool headless,
     if (adapters.empty()) { std::fprintf(stderr, "[gpu] no adapter\n"); return 1; }
     wgpu::Adapter adapter(adapters[0].Get());
 
-    // Nested: create the wgpu::Surface from the host wl_surface. Headless: none.
+    // Nested: create the wgpu::Surface for this output from the backend.
+    // Headless: no surface (offscreen path). The KMS backend will return a
+    // null surface from createWgpuSurface (scanout via SharedTextureMemory,
+    // not Dawn WSI); slice 4 adds the branch that skips WSI bring-up in that
+    // case. For slice 2, only HostWindowOutputBackend exists so a non-null
+    // surface is required.
     wgpu::Surface surface;
     if (!headless) {
-        wgpu::SurfaceSourceWaylandSurface src{};
-        src.display = window.display();
-        src.surface = window.surface();
-        wgpu::SurfaceDescriptor sd{};
-        sd.nextInChain = &src;
-        surface = inst.CreateSurface(&sd);
+        surface = output->createWgpuSurface(inst);
         if (!surface) { std::fprintf(stderr, "[gpu] CreateSurface failed\n"); return 1; }
     }
 
@@ -1403,9 +1408,9 @@ int run(int wireFd, int ctrlFd, int inputFd, bool headless,
         }
         armCtrl();
     });
-    int hostFd = window.displayFd();
-    if (hostFd >= 0)
-        loop->add(hostFd, gpu::EventLoop::kRead, [&](uint32_t) { window.pump(); });
+    const int outputFd = output ? output->eventFd() : -1;
+    if (outputFd >= 0)
+        loop->add(outputFd, gpu::EventLoop::kRead, [&](uint32_t) { output->pump(); });
 
     // Re-arm a plugin connection's epoll interest (write only when output queued).
     auto armPluginConn = [&](PluginConn* pc) {
@@ -1431,14 +1436,14 @@ int run(int wireFd, int ctrlFd, int inputFd, bool headless,
         }
     };
 
-    while (!shutdown && (headless || !window.shouldClose())) {
-        loop->runOnce(8);   // 8ms cap: also advances Dawn + host pump below
+    while (!shutdown && (headless || !output->shouldClose())) {
+        loop->runOnce(8);   // 8ms cap: also advances Dawn + output pump below
         pumpWire();          // DeviceTick + drain wire, even with no fd ready
         drainCoreBarrier();
         registerPluginConns();          // pick up connections added this iteration
         for (auto& pc : pluginConns) pc->pump();  // advance each plugin connection
         drainPluginBarriers();          // fire deferred producer-end / alloc-inject when ready
-        if (!headless) window.pump();  // service host events (no window headless)
+        if (output) output->pump();    // service output backend events
         armWire();
         for (auto& pc : pluginConns) armPluginConn(pc.get());
     }
@@ -1481,8 +1486,9 @@ int run(int wireFd, int ctrlFd, int inputFd, bool headless,
     dmaTex = nullptr;
     dmaMem = nullptr;
     alloc.release(dmaBuf);
-    std::printf("[gpu] shutting down (shutdown=%d windowClosed=%d)\n",
-                static_cast<int>(shutdown), static_cast<int>(window.shouldClose()));
+    std::printf("[gpu] shutting down (shutdown=%d outputClosed=%d)\n",
+                static_cast<int>(shutdown),
+                static_cast<int>(output ? output->shouldClose() : 0));
 
     // Drain the wire until the core closes it, then exit.
     for (int i = 0; i < 4000; ++i) {
