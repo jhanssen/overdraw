@@ -194,13 +194,22 @@ export async function setupCompositor(opts = {}) {
   // absorbs the boot race.
   let runtime = null;
 
+  // Reserved-zone registry shared with the layout driver. Always
+  // constructed in the harness; layer-shell tests rely on it to register
+  // exclusive zones and on the WM to honor them via tileRegion.
+  const { createReservedZoneRegistry } = await import(
+    "../packages/core/dist/wm/reserved-zones.js");
+  const reservedZones = createReservedZoneRegistry();
+
   state = await installProtocols(addon, {
     output: { width: dims.width, height: dims.height },
     compositor: jsCompositor ?? undefined,
     bus: coreBus,
     pluginBus,
+    reservedZones,
     layoutDriverFactory: (target, snapshot) => createLayoutDriver({
       target, snapshot,
+      reservedZones,
       compute: async (inputs) => {
         if (!runtime) throw new Error("layout: runtime not initialized");
         await runtime.waitForNamespace("layout");

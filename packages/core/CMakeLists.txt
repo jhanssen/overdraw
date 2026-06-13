@@ -220,6 +220,16 @@ target_include_directories(cursor-shape-test-client PRIVATE
     ${CMAKE_SOURCE_DIR}/native/wayland/generated)
 target_link_libraries(cursor-shape-test-client PRIVATE ${WAYLAND_CLIENT_LIBRARIES})
 
+# ---- layer-shell test client (zwlr_layer_surface_v1 panel + keyboard) ----
+add_executable(layer-shell-test-client
+    test/layer-shell-test-client.c
+    native/wayland/generated/xdg-shell-protocol.c
+    native/wayland/generated/wlr-layer-shell-unstable-v1-protocol.c)
+target_include_directories(layer-shell-test-client PRIVATE
+    ${WAYLAND_CLIENT_INCLUDE_DIRS}
+    ${CMAKE_SOURCE_DIR}/native/wayland/generated)
+target_link_libraries(layer-shell-test-client PRIVATE ${WAYLAND_CLIENT_LIBRARIES})
+
 # ---- SCM_RIGHTS transport unit test (fd passing over the side channel) ----
 add_executable(scm-rights-test test/scm-rights-test.cpp)
 target_include_directories(scm-rights-test PRIVATE ${IPC_INCLUDE})
