@@ -2380,32 +2380,54 @@ sets/clears these per frame via the sink.
   far from the WM rect will get hit-tests that don't match the
   visual position.
 - **Worker test teardown flake**: `test/intercept-worker.gpu.mjs`
-  intermittently crashes in `addon.stop()`'s Dawn-wire-link teardown
-  (`Napi::CallbackScope::~CallbackScope` aborts when a tracked event
-  fires its JS callback with the "instance no longer exists" status
-  during `WireClient::Disconnect()`). Reproduces ~15-20% of runs in
-  isolation; the SUB-TEST always passes (assertions land before
-  teardown). Equivalent in-thread test (`intercept-inthread.gpu.mjs`)
-  doesn't flake -- the issue is specific to cross-device Worker submits.
-  Root cause is architectural: the cross-device fence chain has
-  core-side submits whose completion depends on the worker's submits
-  finishing. When the worker is terminated mid-frame (graceful shutdown
-  via `runtime.stop()`, then `worker.terminate()` after a 2s window),
-  the GPU process has core-side submits whose fence dependencies will
-  never resolve. The matching `onSubmittedWorkDone` tracked events on
-  the core wire remain pending. The 50ms drain in `addon.cpp` Stop()
-  can't help -- no completion will ever arrive. When `WireClient::Disconnect()`
-  runs, it fires every pending tracked event with an error status; the
-  JS callbacks throw (they expected GPU success); the throw escapes
-  through `Napi::CallbackScope`'s destructor with no JS frame above to
-  catch it, and Node aborts. The proper fix is GPU-process side: when
-  a worker disconnects, find any submits on other devices whose fence
-  dependencies are now unresolvable and complete them with failure
-  (or drop their tracked events) so the core wire drains cleanly before
-  Disconnect. Verified ~15-20% repro rate, identical stack trace
-  across crashes. Increasing the drain budget (tested at 500ms) only
-  marginally improves the rate (the completions truly never arrive,
-  not just slowly).
+  intermittently fails in `addon.stop()` teardown. Two failure modes,
+  both about ~15-20% per run in isolation (the full `npm run test:gpu`
+  passes 129/129 reliably since the flake is per-process and the suite
+  serializes tests):
+
+  Mode A: `Napi::CallbackScope::~CallbackScope` aborts when a Dawn-wire
+  tracked event fires its JS callback with the "instance no longer
+  exists" status during `WireClient::Disconnect()`. The callback (e.g.
+  the `onSubmittedWorkDone` registered for a per-frame submit) throws
+  because it expected GPU success; the throw escapes through Napi's
+  destructor with no JS frame above to catch it.
+
+  Mode B: the GPU process itself aborts (signal 6) somewhere in its
+  control-frame dispatch -- a Begin/End access frame arriving after the
+  matching surfaceBuf state was torn down hits one of several
+  hard-aborts on the path. Verified by `/tmp/overdraw-gpu-crash.txt`:
+  the backtrace lands in `dispatchControl` (plugin wire) or
+  `allocSurfaceBufImpl`'s `finalize` (core wire), both reached via stale
+  deferred work after the worker died.
+
+  Equivalent in-thread test (`intercept-inthread.gpu.mjs`) doesn't
+  flake -- both modes are specific to cross-device Worker submits.
+
+  Root cause is architectural and two-layered: (1) the cross-device
+  fence chain has core-side submits whose completion depends on the
+  worker's submits; when the worker is terminated mid-frame, the GPU
+  process holds work whose fence dependencies will never resolve, and
+  the matching `onSubmittedWorkDone` tracked events on the core wire
+  remain pending until `Disconnect()` cancels them with errors. (2) the
+  GPU process is built around "hard-abort on unexpected state" (a
+  steady-state correctness invariant; the comments call out the design
+  choice explicitly) which conflicts with the partial-state realities
+  of shutdown -- in-flight wire frames against torn-down state, barrier
+  deferred actions whose preconditions vanished, etc.
+
+  Attempted fix in this session: a shutdown handshake protocol
+  (`Tag::ShutdownAck`) where the GPU process force-ends open
+  surface-buf access brackets + ticks each device + flushes completion
+  responses + acks before the core proceeds to `Disconnect()`. The
+  handshake mechanism worked (verified with logging: ack arrives in
+  ~0ms when nothing else races), but didn't move the flake rate
+  measurably (baseline 17/100, with-fix 22/100 -- within noise).
+  Reverted. The issue isn't a single missing pump or drain step;
+  several abort sites in the GPU process need shutdown-aware paths,
+  and properly fixing it is a multi-day refactor with risk of
+  breaking the steady-state correctness invariants the aborts
+  protect. Recorded here as architectural debt to address before the
+  intercept-Worker code path takes production traffic.
 
 ### wlr-layer-shell (`zwlr_layer_shell_v1` / `zwlr_layer_surface_v1`)
 
