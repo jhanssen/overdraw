@@ -94,6 +94,13 @@ enum class Tag : uint8_t {
                           //   open access bracket, drop the SharedTextureMemory/textures/
                           //   fences, release the GBM dmabuf. Fire-and-forget (the core
                           //   has already gated this on its own GPU read completing).
+    OutputDescriptor = 'O',  // gpu -> core: the output's identity + geometry. Sent
+                             //   once after surface bring-up and again whenever the
+                             //   GPU process detects a change (host-window resize in
+                             //   nested mode; a future KMS mode change). The core's
+                             //   state.outputs is updated from this and re-emits to
+                             //   bound wl_output / xdg_output resources. See
+                             //   docs/drm-design.md "Output configuration".
     Shutdown     = 'X',  // core -> gpu : clean termination request
 };
 
@@ -176,6 +183,25 @@ struct Message {
     // this id has been applied and the new ReserveTexture is in). Independent of
     // `wireSerial` above, which is the CORE-wire serial for the consumer texture.
     uint64_t reservePointSerial = 0;
+
+    // OutputDescriptor: the output's identity + geometry. Width/height (above,
+    // shared with HelloReply/SurfaceReady) carry the logical pixel size of the
+    // output. Refresh is in mHz (wl_output.mode units: Hz * 1000). Scale is the
+    // integer wl_output v1-style scale (HiDPI multiplier; future fractional
+    // scale carries the same integer ceiling here and a separate fractional
+    // hint protocol surface). Transform is the wl_output.transform enum value
+    // (normal=0, 90=1, 180=2, 270=3, flipped=4..). Physical dims in millimeters
+    // (0 = unknown). Make/model/name are fixed-size NUL-terminated buffers; the
+    // protocol-level strings are derived from these on the core side (e.g.
+    // wl_output.geometry's make/model; xdg_output's description).
+    uint32_t refreshMhz       = 0;
+    uint32_t outScale         = 1;
+    uint32_t outTransform     = 0;
+    uint32_t physicalWidthMm  = 0;
+    uint32_t physicalHeightMm = 0;
+    char outputName [64] = {};
+    char outputMake [64] = {};
+    char outputModel[64] = {};
 };
 
 constexpr uint32_t kProtocolVersion = 1;

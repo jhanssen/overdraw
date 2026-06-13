@@ -150,6 +150,25 @@ class Compositor {
                           wgpu::Texture tex; bool ok; };
     void takeCompletedJsImports(std::vector<JsImportDone>& out);
 
+    // OutputDescriptor delivery: the GPU process sends one of these after
+    // surface bring-up and again on any change worth re-emitting (host-window
+    // resize in slice 3b; KMS mode change later). Each received descriptor is
+    // queued here and drained by the addon, which fires the JS onOutput
+    // callback per entry. Fields mirror ipc::Tag::OutputDescriptor.
+    struct OutputDescriptorMsg {
+        uint32_t width            = 0;
+        uint32_t height           = 0;
+        uint32_t refreshMhz       = 0;
+        uint32_t scale            = 1;
+        uint32_t transform        = 0;
+        uint32_t physicalWidthMm  = 0;
+        uint32_t physicalHeightMm = 0;
+        std::string name;
+        std::string make;
+        std::string model;
+    };
+    void takePendingOutputDescriptors(std::vector<OutputDescriptorMsg>& out);
+
     // Release a JS dmabuf import: tells the GPU process to drop the imported STM +
     // dmabuf fd for this importId (generation-matched, so a recycled handle id is
     // not freed by mistake). Called when the JS compositor frees the buffer (its
@@ -411,6 +430,7 @@ class Compositor {
     };
     std::vector<PendingJsImport> pendingJsImports_;
     std::vector<JsImportDone> completedJsImports_;
+    std::vector<OutputDescriptorMsg> pendingOutputDescriptors_;
     uint32_t nextJsImportId_ = 1;
     // importId -> the injected texture's wire handle {id,generation}, kept so a
     // later releaseDmabufImport can address the GPU-side entry. Erased on release.

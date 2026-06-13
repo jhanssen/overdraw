@@ -1,34 +1,109 @@
 // wl_output: advertises the (single, phase-1) output. Clients like foot abort if
-// no monitor is present, and use geometry/mode/scale to size themselves. We send
-// one output matching the compositor's logical size at scale 1 on bind.
+// no monitor is present, and use geometry/mode/scale to size themselves. The
+// values come from state.outputs (OUTPUT_DEFAULT entry), populated from the
+// GPU process's OutputDescriptor ctrl message; until that arrives, the seed
+// values in installProtocols are used.
+//
+// Re-emission: when the output reconfigures (host-window resize today; KMS
+// mode change later), state.outputs is updated and reemitWlOutput() walks
+// the bound-resource set, resending the same geometry/mode/scale/name/
+// description/done burst with the new values. Per spec the events are not
+// delta -- the full set is resent and `done` is the atomic-commit signal.
+// main.ts hooks this to bus.emit('output.changed').
 
 import { signature as outSig } from "#protocols-gen/wl_output.js";
 import type { WlOutputHandler } from "#protocols-gen/wl_output.js";
-import type { Ctx } from "./ctx.js";
+import type { Ctx, CompositorState, OutputRecord } from "./ctx.js";
+import { OUTPUT_DEFAULT } from "./ctx.js";
 import type { Resource } from "../types.js";
 
 const SUBPIXEL_UNKNOWN = outSig.enums.subpixel.entries.unknown;
-const TRANSFORM_NORMAL = outSig.enums.transform.entries.normal;
 const MODE_CURRENT = outSig.enums.mode.entries.current;
 const MODE_PREFERRED = outSig.enums.mode.entries.preferred;
 
 // `bind` is a synthetic on-bind hook, not a protocol request.
 type OutputHandler = WlOutputHandler & { bind(resource: Resource): void };
 
+// Bound wl_output resources live on state.wlOutputResources (state-scoped,
+// not module-level) so tests + multiple compositor instances stay
+// independent. Populated on bind, scrubbed lazily during re-emit
+// (resource.destroyed check) and on release.
+function trackedSet(state: CompositorState, outputId: number): Set<Resource> {
+  if (!state.wlOutputResources) state.wlOutputResources = new Map();
+  let set = state.wlOutputResources.get(outputId);
+  if (!set) { set = new Set<Resource>(); state.wlOutputResources.set(outputId, set); }
+  return set;
+}
+
+function emitTo(
+  events: import("../types.js").EventsByInterface,
+  resource: Resource,
+  out: OutputRecord,
+): void {
+  events.wl_output.send_geometry(
+    resource,
+    out.logicalPosition.x, out.logicalPosition.y,
+    out.physicalWidthMm, out.physicalHeightMm,
+    SUBPIXEL_UNKNOWN,
+    out.make, out.model,
+    out.transform);
+  events.wl_output.send_mode(
+    resource, MODE_CURRENT | MODE_PREFERRED,
+    out.logicalSize.width, out.logicalSize.height,
+    out.refreshMhz);
+  events.wl_output.send_scale(resource, out.scale);
+  events.wl_output.send_name(resource, out.name);
+  events.wl_output.send_description(resource, out.description);
+  events.wl_output.send_done(resource);
+}
+
+function fallback(state: CompositorState): OutputRecord {
+  // Defensive fallback: if state.outputs is somehow empty (GPU-free harness
+  // that skipped the registry seed), advertise something matching the WM's
+  // known output size so clients don't abort.
+  return {
+    id: OUTPUT_DEFAULT,
+    logicalPosition: { x: 0, y: 0 },
+    logicalSize: state.wm?.state.output ?? { width: 1920, height: 1080 },
+    scale: 1,
+    name: "overdraw-0",
+    description: "overdraw nested output",
+    refreshMhz: 60000,
+    transform: 0,
+    physicalWidthMm: 0,
+    physicalHeightMm: 0,
+    make: "overdraw",
+    model: "overdraw nested output",
+  };
+}
+
+// Re-emit the full event burst to every bound wl_output resource for the
+// given output id. Destroyed resources are removed from the tracking set
+// in-line. Single-output today: outputId is always OUTPUT_DEFAULT.
+// Silent no-op if state.events isn't populated yet (e.g. mid-bring-up
+// before installProtocols finishes) or if no resources are bound.
+export function reemitWlOutput(state: CompositorState, outputId: number): void {
+  const set = state.wlOutputResources?.get(outputId);
+  if (!set || set.size === 0) return;
+  if (!state.events) return;
+  const rec = state.outputs?.get(outputId) ?? fallback(state);
+  for (const resource of [...set]) {
+    if (resource.destroyed) { set.delete(resource); continue; }
+    emitTo(state.events, resource, rec);
+  }
+}
+
 export default function makeOutput(ctx: Ctx): OutputHandler {
-  const out = ctx.state.wm?.state.output ?? { width: 1920, height: 1080 };
   return {
     bind(resource) {
-      // Physical size in mm is unknown nested; report 0 (compositors do this).
-      ctx.events.wl_output.send_geometry(
-        resource, 0, 0, 0, 0, SUBPIXEL_UNKNOWN, "overdraw", "overdraw-0", TRANSFORM_NORMAL);
-      ctx.events.wl_output.send_mode(
-        resource, MODE_CURRENT | MODE_PREFERRED, out.width, out.height, 60000);
-      ctx.events.wl_output.send_scale(resource, 1);
-      ctx.events.wl_output.send_name(resource, "overdraw-0");
-      ctx.events.wl_output.send_description(resource, "overdraw nested output");
-      ctx.events.wl_output.send_done(resource);
+      trackedSet(ctx.state, OUTPUT_DEFAULT).add(resource);
+      const rec = ctx.state.outputs?.get(OUTPUT_DEFAULT) ?? fallback(ctx.state);
+      emitTo(ctx.events, resource, rec);
     },
-    release(_resource) {},
+    release(resource) {
+      // wl_output.release is the v3+ destructor request. Drop tracking; the
+      // trampoline handles libwayland teardown.
+      ctx.state.wlOutputResources?.get(OUTPUT_DEFAULT)?.delete(resource);
+    },
   };
 }

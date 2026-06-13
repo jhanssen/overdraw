@@ -6,25 +6,29 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 
-import makeXdgOutputManager from
+import makeXdgOutputManager, { reemitXdgOutput } from
   "../packages/core/dist/protocols/zxdg_output_manager_v1.js";
 
 function mockCtx(outputRecord) {
   const calls = [];
+  const events = {
+    zxdg_output_v1: {
+      send_logical_position(resource, x, y) { calls.push(["logical_position", { resource, x, y }]); },
+      send_logical_size(resource, w, h) { calls.push(["logical_size", { resource, w, h }]); },
+      send_name(resource, name) { calls.push(["name", { resource, name }]); },
+      send_description(resource, description) { calls.push(["description", { resource, description }]); },
+      send_done(resource) { calls.push(["done", { resource }]); },
+    },
+  };
   return {
     addon: { clientId: () => 1 },
     state: {
       outputs: outputRecord ? new Map([[outputRecord.id, outputRecord]]) : new Map(),
+      // reemitXdgOutput reads from state.events; the ctx already has events,
+      // but reemit takes state directly so we stash a reference there too.
+      events,
     },
-    events: {
-      zxdg_output_v1: {
-        send_logical_position(resource, x, y) { calls.push(["logical_position", { resource, x, y }]); },
-        send_logical_size(resource, w, h) { calls.push(["logical_size", { resource, w, h }]); },
-        send_name(resource, name) { calls.push(["name", { resource, name }]); },
-        send_description(resource, description) { calls.push(["description", { resource, description }]); },
-        send_done(resource) { calls.push(["done", { resource }]); },
-      },
-    },
+    events,
     _calls: calls,
   };
 }
@@ -41,6 +45,12 @@ function defaultRecord() {
     scale: 1,
     name: "overdraw-0",
     description: "overdraw nested output",
+    refreshMhz: 60000,
+    transform: 0,
+    physicalWidthMm: 0,
+    physicalHeightMm: 0,
+    make: "overdraw",
+    model: "overdraw nested output",
   };
 }
 
@@ -70,6 +80,12 @@ test("get_xdg_output reads the current OutputRecord values", () => {
     scale: 1,
     name: "DP-1",
     description: "Dell U2718Q",
+    refreshMhz: 144000,
+    transform: 0,
+    physicalWidthMm: 600,
+    physicalHeightMm: 340,
+    make: "Dell",
+    model: "U2718Q",
   });
   const mgr = makeXdgOutputManager(ctx);
   mgr.get_xdg_output(mockResource("mgr"), mockResource("xdg"), mockResource("wl_output"));
@@ -96,4 +112,75 @@ test("manager destroy is accepted", () => {
   // destructor: trampoline normally tears down the resource. We just
   // check the handler shape accepts the call without throwing.
   mgr.destroy(mockResource("mgr"));
+});
+
+test("reemitXdgOutput re-sends the full burst to every bound resource", () => {
+  const ctx = mockCtx(defaultRecord());
+  const mgr = makeXdgOutputManager(ctx);
+  const a = mockResource("xdg-a");
+  const b = mockResource("xdg-b");
+  mgr.get_xdg_output(mockResource("mgr"), a, mockResource("wl_output-a"));
+  mgr.get_xdg_output(mockResource("mgr"), b, mockResource("wl_output-b"));
+  // Bind sent 5 events per resource = 10 events. Clear and re-emit.
+  ctx._calls.length = 0;
+  // Simulate a reconfiguration: mutate the OutputRecord in place (this is
+  // what main.ts's onOutputDescriptor handler does).
+  const rec = ctx.state.outputs.get(0);
+  rec.logicalSize = { width: 2400, height: 1300 };
+  rec.scale = 2;
+  reemitXdgOutput(ctx.state, 0);
+  // Both resources should receive the burst again (5 events each).
+  const kinds = ctx._calls.map(([k]) => k);
+  assert.deepEqual(kinds,
+    ["logical_position", "logical_size", "name", "description", "done",
+     "logical_position", "logical_size", "name", "description", "done"]);
+  // Both saw the NEW logical_size.
+  const sizes = ctx._calls.filter(([k]) => k === "logical_size").map(([, v]) => v);
+  assert.deepEqual(sizes, [
+    { resource: a, w: 2400, h: 1300 },
+    { resource: b, w: 2400, h: 1300 },
+  ]);
+});
+
+test("reemitXdgOutput skips destroyed resources and removes them from tracking", () => {
+  const ctx = mockCtx(defaultRecord());
+  const mgr = makeXdgOutputManager(ctx);
+  const a = mockResource("xdg-a");
+  const b = mockResource("xdg-b");
+  mgr.get_xdg_output(mockResource("mgr"), a, mockResource("wl_output-a"));
+  mgr.get_xdg_output(mockResource("mgr"), b, mockResource("wl_output-b"));
+  ctx._calls.length = 0;
+  // Mark `a` destroyed (client disconnect / explicit destroy).
+  a.destroyed = true;
+  reemitXdgOutput(ctx.state, 0);
+  // Only b should receive the burst (5 events).
+  const kinds = ctx._calls.map(([k]) => k);
+  assert.deepEqual(kinds,
+    ["logical_position", "logical_size", "name", "description", "done"]);
+  assert.equal(ctx._calls[0][1].resource, b);
+  // A second re-emit (with no further changes) should still only target b;
+  // the prior re-emit's lazy scrub cleared a from the tracking set.
+  ctx._calls.length = 0;
+  reemitXdgOutput(ctx.state, 0);
+  const kinds2 = ctx._calls.map(([k]) => k);
+  assert.equal(kinds2.length, 5);
+  assert.equal(ctx._calls[0][1].resource, b);
+});
+
+test("reemitXdgOutput is a no-op when no resources are bound", () => {
+  const ctx = mockCtx(defaultRecord());
+  // No get_xdg_output calls => empty tracking set.
+  reemitXdgOutput(ctx.state, 0);
+  assert.deepEqual(ctx._calls, []);
+});
+
+test("reemitXdgOutput is a no-op when state.events is missing", () => {
+  const ctx = mockCtx(defaultRecord());
+  const mgr = makeXdgOutputManager(ctx);
+  mgr.get_xdg_output(mockResource("mgr"), mockResource("xdg"), mockResource("wl_output"));
+  ctx._calls.length = 0;
+  // Simulate mid-bring-up: events not yet attached.
+  ctx.state.events = undefined;
+  reemitXdgOutput(ctx.state, 0);
+  assert.deepEqual(ctx._calls, []);
 });

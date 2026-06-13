@@ -282,6 +282,19 @@ export interface CompositorState {
   surfaces: Map<Resource, SurfaceRecord>;
   // The compositor backend (native addon or JS compositor). Set by installProtocols.
   compositor: CompositorSink;
+  // Per-interface event senders, built once by installProtocols. Exposed on
+  // state so re-emit functions outside the handler-factory closure (e.g.
+  // reemitWlOutput called from main.ts's output-changed bus subscriber)
+  // can dispatch the same events handlers would.
+  events?: import("../types.js").EventsByInterface;
+  // Bound wl_output resources keyed by outputId. wl_output.bind populates
+  // this; reemitWlOutput walks it on output reconfigure. Single-output
+  // today: only OUTPUT_DEFAULT (=0) has an entry. State-scoped (not module-
+  // level) so test fixtures get a fresh map per ctx.
+  wlOutputResources?: Map<number, Set<Resource>>;
+  // Bound zxdg_output_v1 resources keyed by their underlying outputId. Same
+  // shape and lifetime as wlOutputResources.
+  xdgOutputResources?: Map<number, Set<Resource>>;
   // surfaceId -> record, for native->JS lookups keyed by the integer id (e.g. the
   // imported-surface map-on-first-content sweep).
   surfacesById?: Map<number, SurfaceRecord>;
@@ -537,6 +550,12 @@ export interface ToplevelRecord {
 // rect the WM places windows into. `name` is a short stable identifier
 // (e.g. "DP-1") used by clients (waybar) to key per-output configuration;
 // `description` is a longer human-readable label.
+//
+// Mode/transform/physical fields source wl_output's geometry and mode events
+// (drm-design.md "Output configuration"). `refreshMhz` is Hz * 1000;
+// `transform` is the wl_output.transform enum value (0=normal, 1=90, 2=180,
+// 3=270, 4..=flipped); physical dims are millimeters (0 = unknown). `make`
+// and `model` are the wl_output.geometry strings.
 export interface OutputRecord {
   id: number;
   logicalPosition: { x: number; y: number };
@@ -544,6 +563,12 @@ export interface OutputRecord {
   scale: number;
   name: string;
   description: string;
+  refreshMhz: number;
+  transform: number;
+  physicalWidthMm: number;
+  physicalHeightMm: number;
+  make: string;
+  model: string;
 }
 
 // Protocol-level layer enum from zwlr_layer_shell_v1.layer. Uses the

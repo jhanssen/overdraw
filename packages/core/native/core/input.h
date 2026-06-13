@@ -119,6 +119,13 @@ class InputBackend {
     // the sink. Non-blocking. Called from the addon's poll handle on the Node
     // main thread (no cross-thread marshaling needed at this layer).
     virtual void drain() = 0;
+
+    // Update the output's logical size used by the backend for coordinate
+    // mapping or clamping. Both backends apply it to the pointer-space rect
+    // (wayland: host-surface-local -> output mapping; libinput: cursor
+    // accumulator clamp). Called when the output is reconfigured (host
+    // window resize in nested mode; KMS mode change later).
+    virtual void setOutputSize(uint32_t width, uint32_t height) = 0;
 };
 
 }  // namespace overdraw::core

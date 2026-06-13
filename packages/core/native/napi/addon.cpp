@@ -84,6 +84,7 @@ struct Addon {
     napi_env env = nullptr;
     napi_ref onFrame = nullptr;
     napi_ref onInput = nullptr;  // optional JS callback(event) for input events
+    napi_ref onOutput = nullptr; // optional JS callback(descriptor) for OutputDescriptor msgs
     uint64_t lastNotified = 0;
 };
 Addon g_addon;
@@ -313,6 +314,7 @@ void readMessages(napi_env env, napi_value arr, std::vector<MessageDesc>& out) {
 
 void onWireReadable(uv_poll_t*, int status, int events);
 void fireJsImports(napi_env env);
+void fireOutputDescriptors(napi_env env);
 
 // Arm the wire poll for READABLE always, plus WRITABLE iff outbound wire bytes
 // are queued (so we get told when the socket can take more). Call after anything
@@ -365,6 +367,7 @@ void onWireReadable(uv_poll_t*, int status, int events) {
         // whose ClientTexImported replies arrive on the ctrl fd; drain it too.
         g_addon.compositor->drainCtrl();
         fireJsImports(g_addon.env);
+        fireOutputDescriptors(g_addon.env);
         // drainCtrl above may have consumed plugin-broker replies (alloc/begin/...);
         // advance them here too, else they are stranded (see advanceAllPending).
         advanceAllPending(g_addon.env);
@@ -384,6 +387,7 @@ void onCtrlReadable(uv_poll_t*, int status, int events) {
     if (events & UV_READABLE) {
         g_addon.compositor->drainCtrl();
         fireJsImports(g_addon.env);  // resolve JS dmabuf imports (opens its own scope)
+        fireOutputDescriptors(g_addon.env);
         advanceAllPending(g_addon.env);
         armWirePoll();  // finishing an import flushes wire output (bind group etc.)
     }
@@ -886,6 +890,40 @@ void fireJsImports(napi_env env) {
     // handed ownership to JS (wrapTexture AddRef'd inside the callback).
 }
 
+// Drain queued OutputDescriptor messages and invoke the JS onOutput callback
+// for each (one call per descriptor; the JS layer applies the per-descriptor
+// update to state.outputs). Same Node thread as ctrl/wire poll.
+void fireOutputDescriptors(napi_env env) {
+    if (!g_addon.compositor || !g_addon.onOutput) return;
+    std::vector<Compositor::OutputDescriptorMsg> descs;
+    g_addon.compositor->takePendingOutputDescriptors(descs);
+    if (descs.empty()) return;
+    napi_handle_scope scope;
+    napi_open_handle_scope(env, &scope);
+    napi_value cb, undefined;
+    napi_get_reference_value(env, g_addon.onOutput, &cb);
+    napi_get_undefined(env, &undefined);
+    for (const auto& d : descs) {
+        napi_value obj, v, sname, smake, smodel;
+        napi_create_object(env, &obj);
+        napi_create_uint32(env, d.width,            &v); napi_set_named_property(env, obj, "width", v);
+        napi_create_uint32(env, d.height,           &v); napi_set_named_property(env, obj, "height", v);
+        napi_create_uint32(env, d.refreshMhz,       &v); napi_set_named_property(env, obj, "refreshMhz", v);
+        napi_create_uint32(env, d.scale,            &v); napi_set_named_property(env, obj, "scale", v);
+        napi_create_uint32(env, d.transform,        &v); napi_set_named_property(env, obj, "transform", v);
+        napi_create_uint32(env, d.physicalWidthMm,  &v); napi_set_named_property(env, obj, "physicalWidthMm", v);
+        napi_create_uint32(env, d.physicalHeightMm, &v); napi_set_named_property(env, obj, "physicalHeightMm", v);
+        napi_create_string_utf8(env, d.name.c_str(),  d.name.size(),  &sname);
+        napi_create_string_utf8(env, d.make.c_str(),  d.make.size(),  &smake);
+        napi_create_string_utf8(env, d.model.c_str(), d.model.size(), &smodel);
+        napi_set_named_property(env, obj, "name",  sname);
+        napi_set_named_property(env, obj, "make",  smake);
+        napi_set_named_property(env, obj, "model", smodel);
+        napi_call_function(env, undefined, cb, 1, &obj, nullptr);
+    }
+    napi_close_handle_scope(env, scope);
+}
+
 // createTextureFromDmabuf(fd, w, h, fourcc, modHi, modLo, offset, stride, cb)
 // Async: imports a client dmabuf as a wire texture (server-side reserve/inject)
 // and invokes cb(handleBigInt | null) when done. JS wraps the handle via
@@ -1104,6 +1142,10 @@ napi_value Stop(napi_env env, napi_callback_info) {
         napi_delete_reference(env, g_addon.onInput);
         g_addon.onInput = nullptr;
     }
+    if (g_addon.onOutput) {
+        napi_delete_reference(env, g_addon.onOutput);
+        g_addon.onOutput = nullptr;
+    }
     // Release the xkb keymap singleton. Built on demand by ensureKeymap()
     // from either keymapInfo (client wl_keyboard bind) or keyUpdate (host
     // key-down); a subsequent start()/stop() cycle must see fresh state.
@@ -1264,6 +1306,50 @@ bool ensureKeymap() {
     if (!km->init()) return false;
     g_addon.keymap = std::move(km);
     return true;
+}
+
+// updateOutputSize(width, height) -> undefined
+// Update the input backend's notion of output size (used for pointer coordinate
+// mapping / cursor clamping). Called when state.outputs's logicalSize changes
+// (host-window resize in nested mode; KMS mode change later). Silent no-op if
+// no input backend is active.
+napi_value UpdateOutputSize(napi_env env, napi_callback_info info) {
+    size_t argc = 2; napi_value argv[2];
+    napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+    if (argc < 2) return throwError(env, "updateOutputSize(width, height) requires 2 args");
+    uint32_t w = 0, h = 0;
+    napi_get_value_uint32(env, argv[0], &w);
+    napi_get_value_uint32(env, argv[1], &h);
+    if (g_addon.input) g_addon.input->setOutputSize(w, h);
+    napi_value u; napi_get_undefined(env, &u); return u;
+}
+
+// setOnOutputDescriptor(cb) -> undefined
+// Register a JS callback fired for each OutputDescriptor message arriving from
+// the GPU process. The callback receives one object per descriptor with
+// {width, height, refreshMhz, scale, transform, physicalWidthMm,
+//  physicalHeightMm, name, make, model}. Called on the Node thread from the
+// ctrl/wire poll. Passing null (or omitting the arg) clears the callback.
+napi_value SetOnOutputDescriptor(napi_env env, napi_callback_info info) {
+    size_t argc = 1; napi_value argv[1];
+    napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+    if (g_addon.onOutput) {
+        napi_delete_reference(env, g_addon.onOutput);
+        g_addon.onOutput = nullptr;
+    }
+    if (argc >= 1) {
+        napi_valuetype t; napi_typeof(env, argv[0], &t);
+        if (t == napi_function) napi_create_reference(env, argv[0], 1, &g_addon.onOutput);
+    }
+    // The GPU process sends the first OutputDescriptor right after SurfaceReady
+    // (during bringUp). bringUp doesn't drain past SurfaceReady, so the
+    // descriptor may still be in the ctrl-fd kernel buffer when JS registers
+    // its callback. Drain ctrl now and fire so the freshly-registered callback
+    // sees the bring-up descriptor synchronously; without this, state.outputs
+    // can be the seed values when the first client binds wl_output.
+    if (g_addon.compositor) g_addon.compositor->drainCtrl();
+    fireOutputDescriptors(env);
+    napi_value u; napi_get_undefined(env, &u); return u;
 }
 
 // keymapInfo() -> { fd: WaylandFd, format, size } | null
@@ -1703,6 +1789,8 @@ napi_value Init(napi_env env, napi_value exports) {
     reg("writeProducerBegin", WriteProducerBegin);
     reg("writeProducerEnd", WriteProducerEnd);
     reg("pluginReleaseSurfaceBuffer", PluginReleaseSurfaceBuffer);
+    reg("setOnOutputDescriptor", SetOnOutputDescriptor);
+    reg("updateOutputSize", UpdateOutputSize);
 
     napi_set_named_property(env, exports, "start", fnStart);
     napi_set_named_property(env, exports, "stop", fnStop);

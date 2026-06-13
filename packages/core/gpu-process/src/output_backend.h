@@ -38,12 +38,30 @@
 #define OVERDRAW_GPU_OUTPUT_BACKEND_H_
 
 #include <cstdint>
+#include <functional>
 
 namespace wgpu { class Instance; class Surface; }
 
 namespace overdraw::gpu {
 
 struct OutputSize { uint32_t width; uint32_t height; };
+
+// What the GPU process sends to the core over the side channel to describe
+// the output. The host-window backend synthesizes this from host wl_output
+// state + the nested window size; the KMS backend will fill it from the DRM
+// connector. See docs/drm-design.md "Output configuration".
+struct OutputDescriptorInfo {
+    uint32_t width            = 0;     // logical pixel width  of the scanout target
+    uint32_t height           = 0;     // logical pixel height of the scanout target
+    uint32_t refreshMhz       = 0;     // Hz * 1000; 0 = unknown
+    uint32_t scale            = 1;     // integer wl_output scale (HiDPI multiplier)
+    uint32_t transform        = 0;     // wl_output.transform enum value
+    uint32_t physicalWidthMm  = 0;     // 0 = unknown
+    uint32_t physicalHeightMm = 0;     // 0 = unknown
+    char name [64]  = {};               // short identifier (e.g. "DP-1" / "overdraw-0")
+    char make [64]  = {};               // monitor make (or "overdraw" in nested mode)
+    char model[64]  = {};               // monitor model (or a nested description)
+};
 
 class OutputBackend {
   public:
@@ -60,6 +78,13 @@ class OutputBackend {
     // Current output dimensions. Stable until a future reconfiguration
     // (slice 3+). Valid only after open().
     virtual OutputSize size() const = 0;
+
+    // Build a fresh OutputDescriptorInfo from the backend's current state.
+    // Called once after surface bring-up to seed the core's state.outputs,
+    // and again whenever the backend detects a change worth re-emitting.
+    // Valid only after open(). The core re-emits wl_output / xdg_output on
+    // any change.
+    virtual void describeOutput(OutputDescriptorInfo& out) const = 0;
 
     // Build a wgpu::Surface for this output, used by Dawn's WSI swapchain.
     // The phase-1 host-window backend returns a real surface created from
@@ -82,6 +107,16 @@ class OutputBackend {
     // The user has signaled exit through the backend (e.g. closed the host
     // window). The pump loop checks this each iteration.
     virtual bool shouldClose() const = 0;
+
+    // Register a callback fired when the backend's output dimensions change
+    // (host-window resize in nested mode; future KMS mode change). The
+    // callback receives the NEW width/height. Set once during bring-up;
+    // calling again replaces the prior listener. The backend invokes the
+    // callback from its pump() (i.e. on the GPU process's event-loop
+    // thread), so the listener can synchronously perform GPU work like
+    // wgpu::Surface::Configure.
+    using ResizeListener = std::function<void(uint32_t, uint32_t)>;
+    virtual void setResizeListener(ResizeListener cb) = 0;
 };
 
 }  // namespace overdraw::gpu

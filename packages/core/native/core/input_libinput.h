@@ -57,7 +57,9 @@ class LibinputBackend : public InputBackend {
     void drain() override;
 
     // Update the output logical size used for cursor clamping (resize).
-    void setOutputSize(uint32_t width, uint32_t height) { width_ = width; height_ = height; }
+    void setOutputSize(uint32_t width, uint32_t height) override {
+        width_ = width; height_ = height;
+    }
 
     const std::string& error() const { return error_; }
 

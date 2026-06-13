@@ -4,7 +4,7 @@ Ground truth for what exists right now: current capabilities, known gaps, and
 what remains. The design lives in `architecture.md`; this file does not restate
 it. Present-tense only — no change history.
 
-Last updated: 2026-06-13 (post-slice-2 of phase-2 DRM/KMS work — output-backend seam in the GPU process. `HostWindow` lifted behind `HostWindowOutputBackend` (`gpu-process/src/output_host_window.{h,cpp}`) implementing the new abstract `OutputBackend` (`gpu-process/src/output_backend.h`). Pure refactor; nested-mode behavior is unchanged. All 994 pure-unit tests and the integration GPU tests (nested host-Wayland path) still pass. Slice 1 (libseat + `LibinputBackend` siblings to `WaylandInputBackend`, selected via `OVERDRAW_INPUT_BACKEND=libinput`) remains in place. Design: `docs/drm-design.md`.
+Last updated: 2026-06-13 (post-slice-3 of phase-2 DRM/KMS work — real `wl_output` end-to-end. GPU process binds host `wl_output` and ships an `OutputDescriptor` ctrl message with the nested-window size + host-derived refresh/scale/transform/physical/make/model overrides; core's `state.outputs` is updated from it, `wl_output.ts` and `zxdg_output_v1.ts` advertise the real values. Host-window resize triggers `wgpu::Surface::Configure` natively in the GPU process + a fresh `OutputDescriptor`; the core propagates to `JsCompositor.setOutputSize`, `addon.updateOutputSize` (input backend clamp), `state.wm.state.output`, `state.relayout`, and `pluginBus.emit("output.changed")` which the two protocol modules subscribe to for bound-resource re-emit. Verified end-to-end on the dev box (240Hz host produces `@240083mHz` real values). Pure-unit coverage: `test/wl-output.test.js` (new, 8 tests) + `test/xdg-output.test.js` (8 tests, 4 added for re-emit + destroyed-resource scrub). Closes the two long-standing "Read first" gaps (fabricated `wl_output`; missing host-window-resize handling). Slices 1+2 (libseat + libinput; output-backend seam) remain in place. Design: `docs/drm-design.md`.
 
 ## Read first: gaps in advertised protocols (silent-gap risks)
 
@@ -19,22 +19,6 @@ with no error. Worst-first.
   state requests have no meaning yet — there is no maximize/fullscreen/floating/
   interactive-move concept. They stay no-ops until those land (M2: floating +
   fullscreen + keybindings), but they are advertised, so clients think they work.
-
-- **`wl_output` is fabricated.** It advertises one monitor whose refresh (60Hz),
-  scale (1), transform, geometry (0,0), physical size, and make/model are
-  hardcoded. The reported size is the nested host window size, not a real monitor.
-  There is no host-window-resize handling: resizing the overdraw window does not
-  update the output, the swapchain, the WM layout, or input coordinate mapping
-  (all assume the initial size, scale 1, identity mapping). Doing `wl_output`
-  properly means output reconfiguration end-to-end (GPU process reads the host's
-  real output + tracks host-window resize → core updates output size → JS resends
-  geometry/mode/scale/done → WM re-lays-out + input mapping + swapchain
-  reconfigure), behind an output-backend seam (like the input backend) so phase-1
-  host-output and phase-2 DRM/EDID/hotplug swap underneath without touching the
-  WM/compositing/`wl_output` layers. The `state.outputs` registry (added
-  for xdg-output, see below) is the integration seam: a future
-  reconfiguration path updates entries in that map; bound xdg_output_v1
-  resources re-emit on change.
 
 - **`wl_region` is a no-op stub.** `add`/`subtract` do nothing; opaque/input
   regions are not tracked (hit-testing uses whole-window rects). Low urgency.
@@ -312,6 +296,72 @@ compositing is future work).
 full probed set, not a curated tranche; cosmetically kitty logs a fallback warning
 on this single-GPU setup before working.
 
+## Output reconfiguration
+
+The GPU process owns the display target (`OutputBackend`); the core owns
+client-facing protocol state. They coordinate via a single side-channel
+message, `ipc::Tag::OutputDescriptor` (see `native/ipc/side_channel.h`),
+sent gpu → core at bring-up and again on any change.
+
+**Initial descriptor** (`gpu-process/src/main.cpp`, post-`SurfaceReady`):
+`HostWindowOutputBackend::describeOutput` synthesizes the descriptor from
+the nested window size (width/height) plus host-derived refresh / scale /
+transform / physical dims (HostWindow binds the host's `wl_output` and
+records mode/scale/geometry events), plus overdraw-synthesized
+make/model/name (we deliberately do not forward host monitor identity to
+overdraw's clients).
+
+**Resize path.** When the host fires `xdg_toplevel.configure(w,h)` and
+`HostWindow::onSize` observes a real change, an `OutputBackend`
+ResizeListener fires (installed in main.cpp). The listener does TWO things
+synchronously in the GPU process: (1) `wgpu::Surface::Configure` natively
+on the existing surface with the new w/h plus the cached
+format/presentMode/alphaMode triple — done locally in the GPU process so
+there's no "frame at the wrong size" between the host's configure-ack and
+the swapchain Configure; (2) re-emit `OutputDescriptor` over the ctrl
+socket.
+
+**Core dispatch.** `Compositor::drainCtrl` parses `OutputDescriptor` into a
+queue; the addon's `fireOutputDescriptors` invokes the JS callback
+registered via `addon.setOnOutputDescriptor`. The callback in `main.ts`
+runs the propagation in known order:
+
+- Mutate `state.outputs.get(OUTPUT_DEFAULT)` in place with the new fields.
+- `JsCompositor.setOutputSize(w, h)` — render passes pick up new dims.
+- `addon.updateOutputSize(w, h)` — input backend's pointer mapping /
+  cursor clamp gets the new rect.
+- `state.wm.state.output.{width,height}` mutated — subsequent layout
+  snapshots see the new dims.
+- `state.relayout("output-resized")` — tiled clients reflow.
+- `pluginBus.emit("output.changed", ...)` — external subscribers fire.
+
+**External re-emit** (the bus-driven half). `wl_output.ts` and
+`zxdg_output_manager_v1.ts` track bound resources on `state.wlOutputResources`
+/ `state.xdgOutputResources` (state-scoped, populated on bind /
+get_xdg_output, lazily scrubbed when destroyed). They each export a
+`reemitWlOutput(state, outputId)` / `reemitXdgOutput(state, outputId)`
+function. `main.ts` subscribes to `output.changed` and calls both. Each
+re-emit walks its tracking set and resends the FULL event burst
+(geometry / mode / scale / name / description / done for wl_output;
+logical_position / logical_size / name / description / done for xdg_output)
+with the updated values. Per spec the events are not delta — the full set
+is resent and `done` is the atomic-commit signal.
+
+**Verified.** Nested-mode bring-up on a 240Hz host advertises real values
+(`mode 1900x1045 @240083mHz scale=1`, real physical dims, transform). On
+host-triggered resize the descriptor re-fires and the swapchain is
+reconfigured before the next acquire; the second `output:` log line appears
+with the new dims and the chain runs end-to-end. Pure-unit coverage for
+bind + re-emit + destroyed-resource scrub: `test/wl-output.test.js` (8
+tests), `test/xdg-output.test.js` (8 tests including the 4 added for
+re-emit).
+
+Out of scope today: HiDPI fractional scale (`wp_fractional_scale_v1` not
+advertised); multi-output (single OUTPUT_DEFAULT entry; the registry is
+sized for many, no second binding yet); KMS-side mode changes
+(`SetOutputMode` core→gpu request from drm-design.md is not wired — only
+the gpu→core direction is). Subpixel hint is hardcoded UNKNOWN.
+
 ## Input
 
 ### Host input forwarding (host seat → GPU process → core → JS)
@@ -342,15 +392,21 @@ the KMS slice). Devices opened through the seat are released via
 `closeDevice(deviceId)` + a separate `close(fd)`; `LibinputBackend` does this
 in its libinput `close_restricted` trampoline.
 
-Limitations: coordinate mapping is identity (output size == host window size,
-scale 1); touch not forwarded; no keymap translation at this layer (raw evdev
-codes). The libinput backend has no per-backend unit test in this slice — the
-conversion layer (libinput event → `InputEvent`) is verified end-to-end on the
-test box (real device → libinput → `LibinputBackend` → JS `onInput`), not in
-isolation. Full coverage arrives with the KMS slice (slice 6 of
-`drm-design.md`) when libinput drives a real client end-to-end. The libinput
-backend also ignores hotplug device add/remove (the events arrive but are not
-surfaced upward); v1 is laptop-internal devices only.
+Output size on resize is propagated to the input backend via
+`addon.updateOutputSize`, called from main.ts's onOutputDescriptor callback
+(see "Output reconfiguration" below); both `WaylandInputBackend` and
+`LibinputBackend` update their pointer-mapping / cursor-clamp rect from it.
+Scale is still 1 (HiDPI fractional / integer scale is not applied to pointer
+coordinates yet).
+
+Limitations: touch not forwarded; no keymap translation at this layer (raw
+evdev codes). The libinput backend has no per-backend unit test in this
+slice — the conversion layer (libinput event → `InputEvent`) is verified
+end-to-end on the test box (real device → libinput → `LibinputBackend` → JS
+`onInput`), not in isolation. Full coverage arrives with the KMS slice
+(slice 6 of `drm-design.md`) when libinput drives a real client end-to-end.
+The libinput backend also ignores hotplug device add/remove (the events
+arrive but are not surfaced upward); v1 is laptop-internal devices only.
 
 ### Routing to clients (`wl_seat`/`wl_pointer`/`wl_keyboard`)
 

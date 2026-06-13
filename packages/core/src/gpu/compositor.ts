@@ -813,6 +813,29 @@ export class JsCompositor implements CompositorSink {
 
   // --- CompositorSink ---
 
+  // Called when the output reconfigures. Updates the size used for render
+  // passes (output-space rects, cursor placement, layout sentinels).
+  //
+  // For nested mode this is just bookkeeping -- the swapchain is
+  // reconfigured by the GPU process synchronously when the host fires its
+  // xdg_toplevel.configure, so the next acquireOutputTexture already
+  // returns a correctly-sized texture and no GPU resources need re-creating
+  // here.
+  //
+  // For headless mode the offscreen target is sized at construction. If
+  // setOutputSize is ever called with a different size in headless mode,
+  // subsequent renders would write to the wrong-sized target -- so this
+  // method REQUIRES that headless callers either avoid calling it or
+  // recreate the target alongside. Today no path triggers it in headless
+  // (the GPU process only emits OutputDescriptor in nested mode), so this
+  // is a precondition, not a missed reconfiguration; if a future path
+  // wants headless resize, this method has to grow the target-recreate
+  // logic at that point.
+  setOutputSize(width: number, height: number): void {
+    this.width = width;
+    this.height = height;
+  }
+
   setStack(ids: number[]): void { this.stack = ids.slice(); }
 
   setOutputStack(outputId: number, ids: number[] | null): void {

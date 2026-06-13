@@ -158,6 +158,33 @@ export interface Addon {
   // wl_shm_pool.destroy (Wayland spec).
   shmBufferRef(poolId: number): void;
   shmBufferUnref(poolId: number): void;
+
+  // Register a callback fired once per OutputDescriptor message from the GPU
+  // process. The descriptor carries the output's identity + geometry (see
+  // drm-design.md "Output configuration"). Called on the Node thread from the
+  // ctrl/wire poll; may be called multiple times if the output reconfigures.
+  // Passing null clears the callback. Descriptors that arrived before the
+  // callback was registered (during bring-up) are drained synchronously.
+  setOnOutputDescriptor(cb: ((d: OutputDescriptor) => void) | null): void;
+  // Update the input backend's notion of output size (used by both the
+  // wayland and libinput backends to map / clamp pointer coordinates). Called
+  // when the output reconfigures. Silent no-op if no input backend is active.
+  updateOutputSize(width: number, height: number): void;
+}
+
+// One OutputDescriptor message delivered from the GPU process. Mirrors the
+// fields in ipc::Tag::OutputDescriptor; updates state.outputs.
+export interface OutputDescriptor {
+  width: number;
+  height: number;
+  refreshMhz: number;
+  scale: number;
+  transform: number;
+  physicalWidthMm: number;
+  physicalHeightMm: number;
+  name: string;
+  make: string;
+  model: string;
 }
 
 // Normalized input event delivered to the onInput callback (mirror of

@@ -36,7 +36,9 @@ class WaylandInputBackend : public InputBackend {
     void drain() override;
 
     // Update the output logical size used for coordinate mapping (resize).
-    void setOutputSize(uint32_t width, uint32_t height) { width_ = width; height_ = height; }
+    void setOutputSize(uint32_t width, uint32_t height) override {
+        width_ = width; height_ = height;
+    }
 
     // Test seam: feed a forwarded InputMessage through the SAME conversion path
     // drain() uses, emitting the resulting InputEvent to the sink. This exercises

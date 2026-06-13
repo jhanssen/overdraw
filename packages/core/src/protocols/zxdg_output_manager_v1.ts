@@ -11,18 +11,17 @@
 // support" emitting it -- and we do here so v1/v2 clients see the
 // atomicity signal they expect.
 //
-// Re-emission on output change: not wired today (the single output is
-// constant). state.outputs is the integration seam: when a future
-// reconfiguration path updates an OutputRecord, this module would walk
-// bound xdg_output_v1 resources for that wl_output and re-emit the
-// changed properties + done. Not built; the data is constant.
+// Re-emission: when state.outputs is updated, reemitXdgOutput() walks the
+// bound xdg_output_v1 resources for that output and re-emits the full set
+// + done. main.ts hooks this to bus.emit('output.changed').
 
 import { signature as outputSig } from "#protocols-gen/zxdg_output_v1.js";
 import type { ZxdgOutputManagerV1Handler } from "#protocols-gen/zxdg_output_manager_v1.js";
 import type { ZxdgOutputV1Handler } from "#protocols-gen/zxdg_output_v1.js";
 
-import type { Ctx, OutputRecord } from "./ctx.js";
+import type { Ctx, CompositorState, OutputRecord } from "./ctx.js";
 import { OUTPUT_DEFAULT } from "./ctx.js";
+import type { Resource } from "../types.js";
 
 void outputSig;
 
@@ -34,6 +33,46 @@ function outputFor(ctx: Ctx, _wlOutput: unknown): OutputRecord | null {
   return ctx.state.outputs?.get(OUTPUT_DEFAULT) ?? null;
 }
 
+// Bound xdg_output_v1 resources live on state.xdgOutputResources (state-
+// scoped, not module-level) so tests + multiple compositor instances stay
+// independent. Populated by get_xdg_output, scrubbed lazily during re-emit
+// (resource.destroyed check) and by destroy.
+function trackedSet(state: CompositorState, outputId: number): Set<Resource> {
+  if (!state.xdgOutputResources) state.xdgOutputResources = new Map();
+  let set = state.xdgOutputResources.get(outputId);
+  if (!set) { set = new Set<Resource>(); state.xdgOutputResources.set(outputId, set); }
+  return set;
+}
+
+function emitTo(
+  events: import("../types.js").EventsByInterface,
+  resource: Resource,
+  rec: OutputRecord,
+): void {
+  events.zxdg_output_v1.send_logical_position(
+    resource, rec.logicalPosition.x, rec.logicalPosition.y);
+  events.zxdg_output_v1.send_logical_size(
+    resource, rec.logicalSize.width, rec.logicalSize.height);
+  events.zxdg_output_v1.send_name(resource, rec.name);
+  events.zxdg_output_v1.send_description(resource, rec.description);
+  events.zxdg_output_v1.send_done(resource);
+}
+
+// Re-emit the full event burst to every bound xdg_output_v1 resource for
+// the given output id. Destroyed resources are removed from the tracking
+// set in-line. Silent no-op if state.events isn't populated yet (mid-bringup).
+export function reemitXdgOutput(state: CompositorState, outputId: number): void {
+  const set = state.xdgOutputResources?.get(outputId);
+  if (!set || set.size === 0) return;
+  if (!state.events) return;
+  const rec = state.outputs?.get(outputId);
+  if (!rec) return;
+  for (const resource of [...set]) {
+    if (resource.destroyed) { set.delete(resource); continue; }
+    emitTo(state.events, resource, rec);
+  }
+}
+
 export default function makeXdgOutputManager(ctx: Ctx): ZxdgOutputManagerV1Handler {
   return {
     destroy(_resource) {
@@ -42,26 +81,19 @@ export default function makeXdgOutputManager(ctx: Ctx): ZxdgOutputManagerV1Handl
     get_xdg_output(_manager, id, output) {
       const rec = outputFor(ctx, output);
       if (!rec) return;
-      // Send the identity + geometry. v3 sends them at creation; the same
-      // set is re-sent whenever the output changes (not wired today).
-      ctx.events.zxdg_output_v1.send_logical_position(
-        id, rec.logicalPosition.x, rec.logicalPosition.y);
-      ctx.events.zxdg_output_v1.send_logical_size(
-        id, rec.logicalSize.width, rec.logicalSize.height);
-      ctx.events.zxdg_output_v1.send_name(id, rec.name);
-      ctx.events.zxdg_output_v1.send_description(id, rec.description);
-      // The xdg_output_v1.done event is deprecated since v3 but compositors
-      // must still emit it for v1/v2 clients.
-      ctx.events.zxdg_output_v1.send_done(id);
+      trackedSet(ctx.state, rec.id).add(id);
+      emitTo(ctx.events, id, rec);
     },
   };
 }
 
-export function makeXdgOutput(_ctx: Ctx): ZxdgOutputV1Handler {
+export function makeXdgOutput(ctx: Ctx): ZxdgOutputV1Handler {
   return {
-    destroy(_resource) {
-      // Destructor: trampoline handles teardown. No per-resource state
-      // tracked today.
+    destroy(resource) {
+      // Drop from every tracking set we own. Cheap: at most a few entries.
+      const all = ctx.state.xdgOutputResources;
+      if (!all) return;
+      for (const set of all.values()) set.delete(resource);
     },
   };
 }

@@ -148,9 +148,13 @@ export async function installProtocols(
   if (opts.bus) state.bus = opts.bus;
   if (opts.pluginBus) state.pluginBus = opts.pluginBus;
   if (opts.reservedZones) state.reservedZones = opts.reservedZones;
-  // Single fabricated output. Multi-output reconfiguration replaces this
-  // map's contents (see status.md "Read first"); xdg-output + wl_output
-  // re-read on emission so changes propagate without a per-handler hook.
+  // Single output. The GPU process sends an OutputDescriptor over the ctrl
+  // channel after surface bring-up that updates this record with real
+  // host-derived values (refresh, scale, transform, physical dims) and the
+  // nested-window size; main.ts registers a callback (addon.onOutputDescriptor)
+  // that applies the descriptor. Until that arrives (or in GPU-free
+  // harnesses that never wire the callback), this seed record keeps
+  // wl_output/xdg-output emitting something sensible.
   state.outputs = new Map();
   state.outputs.set(OUTPUT_DEFAULT, {
     id: OUTPUT_DEFAULT,
@@ -159,6 +163,12 @@ export async function installProtocols(
     scale: 1,
     name: "overdraw-0",
     description: "overdraw nested output",
+    refreshMhz: 60000,
+    transform: 0,
+    physicalWidthMm: 0,
+    physicalHeightMm: 0,
+    make: "overdraw",
+    model: "overdraw nested output",
   });
   // The binding chain owns the input modes + chord trie. Plugins
   // register bindings via the windows broker; the seat dispatches each
@@ -193,6 +203,10 @@ export async function installProtocols(
   // ctx is needed by the WM's ConfigureSink (configureToplevel) below; build it
   // here. The handler factories receive the same ctx later.
   const ctx: Ctx = { events, state, addon };
+  // Stash the event-sender map on state so re-emit paths outside the handler
+  // factories (e.g. wl_output / xdg_output re-emit on output.changed) can
+  // dispatch through it.
+  state.events = events;
   // ConfigureSink: the WM calls this to (re)configure a window to a content size.
   // Resolve surfaceId -> xdg_surface record and send the sized configure.
   const configureSink = (surfaceId: number, w: number, h: number): void => {

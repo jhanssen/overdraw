@@ -47,6 +47,9 @@ import { JsCompositor } from "./gpu/compositor.js";
 import type { DawnWire, DawnGlobals } from "./gpu/compositor.js";
 import type { Addon, InputEvent } from "./types.js";
 import type { CompositorSink, CompositorState } from "./protocols/ctx.js";
+import { OUTPUT_DEFAULT } from "./protocols/ctx.js";
+import { reemitWlOutput } from "./protocols/wl_output.js";
+import { reemitXdgOutput } from "./protocols/zxdg_output_manager_v1.js";
 import { WINDOW_EVENT } from "./events/types.js";
 import { createCompositorBus } from "./events/window-bus.js";
 import { DynamicBus } from "./events/dynamic-bus.js";
@@ -214,6 +217,75 @@ state = await installProtocols(addon, {
       return result as unknown as import("@overdraw/focus-types").FocusResult;
     },
   }),
+});
+
+// OutputDescriptor from the GPU process: update state.outputs's seed record
+// with real host-derived values, then propagate to every layer that needs to
+// know about the output's size or geometry.
+//
+// Two propagation styles per the design:
+//   - INTERNAL system layers are called directly here in known order:
+//       compositor.setOutputSize  -> render passes know the new dims
+//       addon.updateOutputSize    -> input backend's pointer mapping clamp
+//       wm.state.output           -> mutated so subsequent layout snapshots
+//                                    pick up the new dims; relayout scheduled
+//   - EXTERNAL protocol layers (wl_output + zxdg_output_v1 re-emit to bound
+//     client resources) ride bus.emit("output.changed"). Subscribers live in
+//     protocols/wl_output.ts and protocols/zxdg_output_manager_v1.ts.
+//
+// The first descriptor arrives during addon.start() (drained synchronously by
+// setOnOutputDescriptor) and sets up state.outputs before any clients have
+// bound wl_output, so the re-emit on that first call is a no-op.
+addon.setOnOutputDescriptor((d) => {
+  const rec = state.outputs?.get(OUTPUT_DEFAULT);
+  if (!rec) return;
+  const sizeChanged = rec.logicalSize.width !== d.width || rec.logicalSize.height !== d.height;
+  rec.logicalSize = { width: d.width, height: d.height };
+  rec.scale = d.scale;
+  rec.refreshMhz = d.refreshMhz;
+  rec.transform = d.transform;
+  rec.physicalWidthMm = d.physicalWidthMm;
+  rec.physicalHeightMm = d.physicalHeightMm;
+  rec.name = d.name;
+  rec.make = d.make;
+  rec.model = d.model;
+  // description stays as set by installProtocols's seed; the descriptor
+  // doesn't carry one (xdg-output's description is overdraw-owned policy).
+
+  console.log(
+    `[overdraw] output: ${d.width}x${d.height} @${d.refreshMhz}mHz scale=${d.scale} `
+    + `xform=${d.transform} phys=${d.physicalWidthMm}x${d.physicalHeightMm}mm `
+    + `name=${d.name} make=${d.make} model=${d.model}`,
+  );
+
+  // Internal reconfigurations, in dependency order.
+  if (compositor instanceof JsCompositor) compositor.setOutputSize(d.width, d.height);
+  addon.updateOutputSize(d.width, d.height);
+  if (state.wm) {
+    state.wm.state.output.width = d.width;
+    state.wm.state.output.height = d.height;
+  }
+  if (sizeChanged) state.relayout?.("output-resized");
+
+  // External: tell clients (via the re-emit subscribers wired below).
+  pluginBus.emit("output.changed", {
+    outputId: OUTPUT_DEFAULT,
+    width: d.width,
+    height: d.height,
+    scale: d.scale,
+    refreshMhz: d.refreshMhz,
+  });
+});
+
+// External re-emit subscribers: protocol layers that need to resend their
+// burst to bound client resources whenever the output changes. Each is a
+// self-contained re-emit walking its tracked-resources set. Subscribers run
+// in registration order; ordering between wl_output and xdg_output doesn't
+// matter (different resources, no cross-dependency).
+pluginBus.subscribe("output.changed", (_name, payload) => {
+  const outputId = (payload as { outputId: number }).outputId;
+  reemitWlOutput(state, outputId);
+  reemitXdgOutput(state, outputId);
 });
 
 console.log(`[overdraw] Wayland server listening.`);

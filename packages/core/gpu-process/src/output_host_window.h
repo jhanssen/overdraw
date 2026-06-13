@@ -29,11 +29,17 @@ class HostWindowOutputBackend : public OutputBackend {
         return {window_.width(), window_.height()};
     }
 
+    void describeOutput(OutputDescriptorInfo& out) const override;
+
     wgpu::Surface createWgpuSurface(wgpu::Instance& instance) override;
 
     int eventFd() const override { return window_.displayFd(); }
     void pump() override { window_.pump(); }
     bool shouldClose() const override { return window_.shouldClose(); }
+
+    void setResizeListener(ResizeListener cb) override {
+        window_.setResizeListener(std::move(cb));
+    }
 
   private:
     HostWindow window_;

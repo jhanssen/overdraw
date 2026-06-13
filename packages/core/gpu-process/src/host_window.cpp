@@ -87,6 +87,32 @@ void seatCaps(void* data, wl_seat*, uint32_t caps) {
 void seatName(void*, wl_seat*, const char*) {}
 const wl_seat_listener kSeatListener = {seatCaps, seatName};
 
+// ---- Output listener -----------------------------------------------------
+
+void outGeometry(void* data, wl_output*, int32_t /*x*/, int32_t /*y*/,
+                 int32_t pw, int32_t ph, int32_t /*subpx*/,
+                 const char* make, const char* model, int32_t transform) {
+    static_cast<HostWindow*>(data)->onOutputGeometry(pw, ph, transform, make, model);
+}
+void outMode(void* data, wl_output*, uint32_t flags, int32_t w, int32_t h, int32_t refresh) {
+    static_cast<HostWindow*>(data)->onOutputMode(flags, w, h, refresh);
+}
+void outDone(void* data, wl_output*) {
+    static_cast<HostWindow*>(data)->onOutputDone();
+}
+void outScale(void* data, wl_output*, int32_t factor) {
+    static_cast<HostWindow*>(data)->onOutputScale(factor);
+}
+void outName(void* data, wl_output*, const char* name) {
+    static_cast<HostWindow*>(data)->onOutputName(name);
+}
+void outDescription(void* data, wl_output*, const char* desc) {
+    static_cast<HostWindow*>(data)->onOutputDescription(desc);
+}
+const wl_output_listener kOutputListener = {
+    outGeometry, outMode, outDone, outScale, outName, outDescription,
+};
+
 void regGlobal(void* data, wl_registry* reg, uint32_t name,
                const char* iface, uint32_t version) {
     auto* w = static_cast<HostWindow*>(data);
@@ -102,6 +128,14 @@ void regGlobal(void* data, wl_registry* reg, uint32_t name,
         // Bind up to v5 (frame/axis-discrete events). Capabilities arrive async.
         w->bindSeat(static_cast<wl_seat*>(
             wl_registry_bind(reg, name, &wl_seat_interface, version < 5 ? version : 5)));
+    } else if (!std::strcmp(iface, wl_output_interface.name)) {
+        // Bind the FIRST host wl_output for refresh/scale/transform/physical/
+        // make/model. Subsequent host outputs are ignored (nested mode reports
+        // one output to overdraw's clients). Bind up to v4 (name + description).
+        if (!w->hasHostOutput()) {
+            w->bindOutput(static_cast<wl_output*>(
+                wl_registry_bind(reg, name, &wl_output_interface, version < 4 ? version : 4)));
+        }
     }
 }
 void regRemove(void*, wl_registry*, uint32_t) {}
@@ -179,9 +213,56 @@ int HostWindow::displayFd() const {
     return display_ ? wl_display_get_fd(display_) : -1;
 }
 
+void HostWindow::onSize(uint32_t w, uint32_t h) {
+    if (!w || !h) return;
+    if (w == width_ && h == height_) return;
+    width_  = w;
+    height_ = h;
+    if (onResize_) onResize_(w, h);
+}
+
 void HostWindow::bindSeat(wl_seat* s) {
     seat_ = s;
     wl_seat_add_listener(seat_, &kSeatListener, this);
+}
+
+void HostWindow::bindOutput(wl_output* o) {
+    output_ = o;
+    wl_output_add_listener(output_, &kOutputListener, this);
+}
+
+void HostWindow::onOutputGeometry(int32_t physWMm, int32_t physHMm, int32_t transform,
+                                  const char* make, const char* model) {
+    hostPhysWMm_ = static_cast<uint32_t>(physWMm < 0 ? 0 : physWMm);
+    hostPhysHMm_ = static_cast<uint32_t>(physHMm < 0 ? 0 : physHMm);
+    hostTransform_ = static_cast<uint32_t>(transform);
+    if (make)  hostMake_  = make;
+    if (model) hostModel_ = model;
+}
+
+void HostWindow::onOutputMode(uint32_t flags, int32_t /*w*/, int32_t /*h*/, int32_t refresh) {
+    // Only record the CURRENT mode's refresh; modes flagged otherwise are
+    // alternatives we don't expose. wl_output.mode flags: 0x1 = current.
+    if (flags & 0x1) {
+        hostRefreshMhz_ = static_cast<uint32_t>(refresh < 0 ? 0 : refresh);
+    }
+}
+
+void HostWindow::onOutputScale(int32_t factor) {
+    hostScale_ = static_cast<uint32_t>(factor < 1 ? 1 : factor);
+}
+
+void HostWindow::onOutputName(const char* name) {
+    if (name) hostName_ = name;
+}
+
+void HostWindow::onOutputDescription(const char* /*desc*/) {
+    // Description is host-only metadata; we don't propagate it. Our wl_output
+    // describes the nested window, not the host's monitor.
+}
+
+void HostWindow::onOutputDone() {
+    // No-op for now. A future re-emit path uses this as the trigger.
 }
 
 void HostWindow::onSeatCapabilities(uint32_t caps) {

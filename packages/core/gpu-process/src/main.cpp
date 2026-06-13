@@ -322,6 +322,13 @@ int run(int wireFd, int ctrlFd, int inputFd, bool headless,
     // 6b/7/8) Surface caps + inject + SurfaceReady -- NESTED only. Headless has
     // no surface; the core renders into an offscreen texture (no swapchain) and
     // does not wait for SurfaceReady.
+    //
+    // The swapchain config triple (format/presentMode/alphaMode) is cached in
+    // outer scope so the resize handler can re-apply Configure with the same
+    // values when the host window changes size.
+    uint32_t surfaceFormat = static_cast<uint32_t>(WGPUTextureFormat_BGRA8Unorm);
+    uint32_t surfacePresentMode = static_cast<uint32_t>(wgpu::PresentMode::Fifo);
+    constexpr uint32_t kSurfaceAlphaMode = static_cast<uint32_t>(WGPUCompositeAlphaMode_Opaque);
     if (!headless) {
     wgpu::SurfaceCapabilities caps{};
     surface.GetCapabilities(adapter, &caps);
@@ -334,12 +341,11 @@ int run(int wireFd, int ctrlFd, int inputFd, bool headless,
         return f == static_cast<uint32_t>(WGPUTextureFormat_RGBA8UnormSrgb) ||
                f == static_cast<uint32_t>(WGPUTextureFormat_BGRA8UnormSrgb);
     };
-    uint32_t format = static_cast<uint32_t>(WGPUTextureFormat_BGRA8Unorm);
     if (caps.formatCount) {
-        format = static_cast<uint32_t>(caps.formats[0]);
+        surfaceFormat = static_cast<uint32_t>(caps.formats[0]);
         for (size_t i = 0; i < caps.formatCount; ++i) {
             uint32_t f = static_cast<uint32_t>(caps.formats[i]);
-            if (!isSrgb(f)) { format = f; break; }
+            if (!isSrgb(f)) { surfaceFormat = f; break; }
         }
     }
 
@@ -349,12 +355,11 @@ int run(int wireFd, int ctrlFd, int inputFd, bool headless,
     // stalls all other wire work behind it (buffer map, etc.). Mailbox never
     // blocks the acquire (it replaces the unpresented frame). Fall back to the
     // first advertised mode if Mailbox is unsupported.
-    uint32_t presentMode = static_cast<uint32_t>(wgpu::PresentMode::Fifo);
     bool haveMailbox = false;
     for (size_t i = 0; i < caps.presentModeCount; ++i)
         if (caps.presentModes[i] == wgpu::PresentMode::Mailbox) haveMailbox = true;
-    if (haveMailbox) presentMode = static_cast<uint32_t>(wgpu::PresentMode::Mailbox);
-    else if (caps.presentModeCount) presentMode = static_cast<uint32_t>(caps.presentModes[0]);
+    if (haveMailbox) surfacePresentMode = static_cast<uint32_t>(wgpu::PresentMode::Mailbox);
+    else if (caps.presentModeCount) surfacePresentMode = static_cast<uint32_t>(caps.presentModes[0]);
 
     // 7) Inject the surface at the client's reserved handle.
     if (!server.InjectSurface(surface.Get(),
@@ -363,24 +368,110 @@ int run(int wireFd, int ctrlFd, int inputFd, bool headless,
         std::fprintf(stderr, "[gpu] InjectSurface failed\n");
         return 1;
     }
-    std::printf("[gpu] injected surface; format=%u\n", format);
+    std::printf("[gpu] injected surface; format=%u\n", surfaceFormat);
 
     // 8) Tell the core the surface is ready (caps + size).
     {
         ipc::Message m{};
         m.tag = ipc::Tag::SurfaceReady;
         m.surface = ready.surface;
-        m.format = format;
-        m.presentMode = presentMode;
-        m.alphaMode = static_cast<uint32_t>(WGPUCompositeAlphaMode_Opaque);
+        m.format = surfaceFormat;
+        m.presentMode = surfacePresentMode;
+        m.alphaMode = kSurfaceAlphaMode;
         m.width = outW();
         m.height = outH();
         ipc::sendMessage(ctrlFd, m);
+    }
+
+    // 8b) Output descriptor: nested-window size + host-derived
+    // refresh/scale/transform/physical, and overdraw-synthesized make/model/
+    // name. Sent ONCE here so the core's state.outputs starts with real
+    // values; the host wl_output bound during HostWindow::open() has its
+    // first done burst by now (open() does the second roundtrip). A future
+    // re-emit path (slice 3b) sends this again on host-window resize.
+    {
+        gpu::OutputDescriptorInfo info{};
+        output->describeOutput(info);
+        ipc::Message m{};
+        m.tag = ipc::Tag::OutputDescriptor;
+        m.width            = info.width;
+        m.height           = info.height;
+        m.refreshMhz       = info.refreshMhz;
+        m.outScale         = info.scale;
+        m.outTransform     = info.transform;
+        m.physicalWidthMm  = info.physicalWidthMm;
+        m.physicalHeightMm = info.physicalHeightMm;
+        std::memcpy(m.outputName,  info.name,  sizeof(m.outputName));
+        std::memcpy(m.outputMake,  info.make,  sizeof(m.outputMake));
+        std::memcpy(m.outputModel, info.model, sizeof(m.outputModel));
+        ipc::sendMessage(ctrlFd, m);
+        std::printf(
+            "[gpu] sent OutputDescriptor: %ux%u @%umHz scale=%u xform=%u "
+            "phys=%ux%umm name=%s make=%s model=%s\n",
+            info.width, info.height, info.refreshMhz, info.scale, info.transform,
+            info.physicalWidthMm, info.physicalHeightMm, info.name, info.make, info.model);
     }
     }  // if (!headless)
 
     // Wire-resolved core device (non-owning wrapper; addref'd by the ctor).
     wgpu::Device coreDevice(nativeDev);
+
+    // Host-window resize handler (NESTED only). The host fires
+    // xdg_toplevel.configure(w,h) when the user resizes the overdraw window;
+    // HostWindow acks it and calls onSize, which invokes this listener with
+    // the new dimensions. We do TWO things synchronously here, in order:
+    //
+    //   1) Re-Configure the wgpu::Surface at the new size. This is a native
+    //      Dawn call -- no wire round-trip, no core involvement. By the
+    //      time the next wire GetCurrentTexture request from the core
+    //      arrives at the wire server, the surface is already at the new
+    //      size. The host's "next attached frame must be at the acked size"
+    //      contract is met without a frame at the wrong size.
+    //
+    //   2) Send a fresh OutputDescriptor over ctrl with the new dimensions.
+    //      The core's drainCtrl picks it up; main.ts's onOutputDescriptor
+    //      callback updates state.outputs, reflows the WM, and re-emits
+    //      wl_output / xdg_output to bound clients (slice 3b).
+    //
+    // The two steps are independent: (1) is purely GPU-process-local and
+    // (2) is a one-way ctrl message. There's no acknowledgement back from
+    // the core; the next time the JS compositor queries the output, it has
+    // the updated state.outputs and the swapchain delivers correctly sized
+    // textures.
+    if (!headless) {
+        output->setResizeListener(
+            [&surface, &coreDevice, &surfaceFormat, &surfacePresentMode, &output, ctrlFd]
+            (uint32_t newW, uint32_t newH) {
+                if (!surface) return;
+                wgpu::SurfaceConfiguration cfg{};
+                cfg.device      = coreDevice;
+                cfg.format      = static_cast<wgpu::TextureFormat>(surfaceFormat);
+                cfg.usage       = wgpu::TextureUsage::RenderAttachment;
+                cfg.width       = newW;
+                cfg.height      = newH;
+                cfg.alphaMode   = static_cast<wgpu::CompositeAlphaMode>(kSurfaceAlphaMode);
+                cfg.presentMode = static_cast<wgpu::PresentMode>(surfacePresentMode);
+                surface.Configure(&cfg);
+
+                gpu::OutputDescriptorInfo info{};
+                output->describeOutput(info);
+                ipc::Message m{};
+                m.tag              = ipc::Tag::OutputDescriptor;
+                m.width            = info.width;
+                m.height           = info.height;
+                m.refreshMhz       = info.refreshMhz;
+                m.outScale         = info.scale;
+                m.outTransform     = info.transform;
+                m.physicalWidthMm  = info.physicalWidthMm;
+                m.physicalHeightMm = info.physicalHeightMm;
+                std::memcpy(m.outputName,  info.name,  sizeof(m.outputName));
+                std::memcpy(m.outputMake,  info.make,  sizeof(m.outputMake));
+                std::memcpy(m.outputModel, info.model, sizeof(m.outputModel));
+                ipc::sendMessage(ctrlFd, m);
+                std::printf("[gpu] resize -> %ux%u; reconfigured surface; sent OutputDescriptor\n",
+                            newW, newH);
+            });
+    }
 
     // B3: persistent dmabuf-backed texture injected at the client's reserved
     // handle. Allocated + imported on demand when the core sends ReserveTex.

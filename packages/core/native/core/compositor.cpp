@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <iterator>
 #include <cstdio>
+#include <cstring>
 #include <vector>
 
 #include <fcntl.h>
@@ -336,12 +337,41 @@ void Compositor::takeCompletedJsImports(std::vector<JsImportDone>& out) {
     completedJsImports_.clear();
 }
 
+void Compositor::takePendingOutputDescriptors(std::vector<OutputDescriptorMsg>& out) {
+    out.insert(out.end(),
+               std::make_move_iterator(pendingOutputDescriptors_.begin()),
+               std::make_move_iterator(pendingOutputDescriptors_.end()));
+    pendingOutputDescriptors_.clear();
+}
+
 void Compositor::drainCtrl() {
     // Dispatch any available side-channel control messages. In steady state the
     // only message the GPU process sends unsolicited (relative to the present
     // loop) is ClientTexImported, completing an async dmabuf import.
     ipc::Message r{};
     while (ipc::recvMessageNB(ctrlFd_, r)) {
+        if (r.tag == ipc::Tag::OutputDescriptor) {
+            OutputDescriptorMsg msg{};
+            msg.width            = r.width;
+            msg.height           = r.height;
+            msg.refreshMhz       = r.refreshMhz;
+            msg.scale            = r.outScale;
+            msg.transform        = r.outTransform;
+            msg.physicalWidthMm  = r.physicalWidthMm;
+            msg.physicalHeightMm = r.physicalHeightMm;
+            // Bounded NUL-terminated strings on the wire; trust the source's
+            // bound (the GPU process wrote with copyBounded which guarantees
+            // NUL-termination within the buffer), but cap defensively.
+            auto bounded = [](const char* s, size_t cap) {
+                size_t n = ::strnlen(s, cap);
+                return std::string(s, n);
+            };
+            msg.name  = bounded(r.outputName,  sizeof(r.outputName));
+            msg.make  = bounded(r.outputMake,  sizeof(r.outputMake));
+            msg.model = bounded(r.outputModel, sizeof(r.outputModel));
+            pendingOutputDescriptors_.push_back(std::move(msg));
+            continue;
+        }
         if (r.tag == ipc::Tag::WireConnAdded) {
             wireConnAdded_[r.connId] = r.ok ? 1 : 2;
             continue;
