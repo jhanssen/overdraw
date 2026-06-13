@@ -43,6 +43,9 @@ export default function makeSeat(ctx: Ctx, driver: FocusDriver): SeatHandler {
   // Last pointer position (output space), tracked on motion; used for popup
   // click-away dismissal at button-press time (button events carry no position).
   let lastX = 0, lastY = 0;
+  // Last-known modsDepressed mask, used to diff modifier-release events
+  // for the binding chain's release callback path.
+  let lastModsDepressed = 0;
 
   // Phase 9c cursor state. Shared with makePointer via ctx.state.seat
   // (which we publish below). Per-pointer-resource latest enter serial
@@ -336,12 +339,33 @@ export default function makeSeat(ctx: Ctx, driver: FocusDriver): SeatHandler {
         // A press outside a grabbing popup dismisses it (and is swallowed,
         // not delivered to the client) -- standard menu behavior.
         if (ev.pressed && ctx.state.dismissGrabbedPopup?.(lastX, lastY)) return;
+        const button = ev.button ?? 0;
+
+        // Consult the binding chain. Press: dispatchPress (with the
+        // current mod mask). Release: dispatchRelease. The chain consumes
+        // (suppresses client forwarding) when a binding matches its press
+        // OR when a release participates in a held instance.
+        let consumed = false;
+        const chain = ctx.state.bindingChain;
+        if (chain && button !== 0) {
+          if (ev.pressed) {
+            const r = chain.dispatchPress({
+              kind: "button", mods: lastModsDepressed, button,
+            });
+            consumed = r.consume;
+          } else {
+            const r = chain.dispatchRelease({ kind: "button", button });
+            consumed = r.consume;
+          }
+        }
+        if (consumed) return;
+
         if (!seat.focus) return;
         const serial = ctx.state.serial();
         const state = ev.pressed ? 1 : 0;
         for (const p of clientPointers(seat.focus.clientId)) {
           if (p.destroyed) continue;
-          ctx.events.wl_pointer.send_button(p, serial, ev.time, ev.button ?? 0, state);
+          ctx.events.wl_pointer.send_button(p, serial, ev.time, button, state);
           pointerFrame(p);
         }
         if (ev.pressed) {
@@ -365,19 +389,46 @@ export default function makeSeat(ctx: Ctx, driver: FocusDriver): SeatHandler {
         // consults modifier state to match bindings, and xkb's mod state
         // must track every keystroke regardless of where it goes.
         const pressed = !!ev.pressed;
+        const prevMods = lastModsDepressed;
         const mods = ctx.addon.keyUpdate(ev.key ?? 0, pressed);
+        lastModsDepressed = mods.modsDepressed;
 
-        // Consult the binding chain on key-DOWN before forwarding to the
-        // client. A matched binding consumes the key (skips wl_keyboard
-        // delivery). Key-up events bypass the chain (bindings fire on
-        // press only); xkb still sees them so subsequent presses have the
+        // Consult the binding chain.
+        //   - press: dispatchPress; consume on match.
+        //   - release: dispatchRelease for (a) the released keysym AND
+        //     (b) every modifier bit that just became unset. Consume if
+        //     any held instance participated.
+        // Key-up events bypass the press path (bindings fire on press
+        // only); xkb still sees them so subsequent presses have the
         // right modifier state.
         let consumed = false;
-        if (pressed && ctx.state.bindingChain && mods.keysym !== 0) {
-          const r = ctx.state.bindingChain.dispatch({
-            mods: mods.modsDepressed, keysym: mods.keysym,
-          });
-          consumed = r.consume;
+        const chain = ctx.state.bindingChain;
+        if (chain) {
+          if (pressed && mods.keysym !== 0) {
+            const r = chain.dispatchPress({
+              kind: "key",
+              mods: mods.modsDepressed, keysym: mods.keysym,
+            });
+            consumed = r.consume;
+          } else if (!pressed) {
+            // Released a modifier? Diff the mask and dispatch each
+            // newly-unset bit.
+            const droppedBits = prevMods & ~mods.modsDepressed;
+            for (let bit = 1; bit !== 0 && bit <= droppedBits; bit <<= 1) {
+              if ((droppedBits & bit) !== 0) {
+                const r = chain.dispatchRelease({ kind: "mod", bit });
+                if (r.consume) consumed = true;
+              }
+            }
+            // Released a non-mod key? Look up its keysym from xkb. The
+            // current modsDepressed already reflects the release; the
+            // keysym field on the return is the symbol for the released
+            // keycode.
+            if (mods.keysym !== 0) {
+              const r = chain.dispatchRelease({ kind: "key", keysym: mods.keysym });
+              if (r.consume) consumed = true;
+            }
+          }
         }
 
         const kb = seat.kbFocus;

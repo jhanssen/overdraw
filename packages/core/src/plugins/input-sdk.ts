@@ -23,25 +23,29 @@
 // 'input.mode-pushed' / '-popped' via sdk.events.subscribe instead).
 
 import type { Endpoint, Json } from "./protocol.js";
-import type { KeyStep } from "../input/keyspec.js";
+import type { InputStep } from "../input/keyspec.js";
 import { parseChord } from "../input/keyspec.js";
 
 export type InputBindingHandler =
-  (event: { chord: KeyStep[] }) => void | Promise<void>;
+  (event: { chord: InputStep[] }) => void | Promise<void>;
+
+export type InputBindingReleaseHandler =
+  (event: { chord: InputStep[] }) => void | Promise<void>;
 
 export interface BindOptions {
-  // Either a single step ("Mod+a"), a chord ("Mod+a, Mod+b" or
-  // ["Mod+a", "Mod+b"]), or pre-parsed KeyStep[].
-  keys: string | readonly string[] | readonly KeyStep[];
+  // Either a single step ("Mod+a", "Super+button1"), a chord
+  // ("Mod+a, Mod+b" or ["Mod+a", "Mod+b"]), or pre-parsed InputStep[].
+  keys: string | readonly string[] | readonly InputStep[];
   // The mode this binding belongs to. Defaults to "default".
   mode?: string;
   // Conflict-tiebreak priority when two plugins bind the same step
-  // sequence in the same mode. Higher wins. Not yet meaningful (the
-  // chain rejects exact-duplicate bindings outright); reserved.
+  // sequence in the same mode. Higher wins. Reserved.
   priority?: number;
-  // Called when the chord matches. Sync or async; the consume decision
-  // is made synchronously when the binding matches.
+  // Called when the chord matches.
   handler: InputBindingHandler;
+  // Optional. When set, fires when every key/button/mod held at the
+  // press has been released. Only valid for single-step bindings.
+  release?: InputBindingReleaseHandler;
 }
 
 export interface DefineModeOptions {
@@ -84,6 +88,7 @@ export interface InputHandle {
 export function createPluginInput(endpoint: Endpoint): InputHandle {
   let nextId = 1;
   const handlers = new Map<number, InputBindingHandler>();
+  const releaseHandlers = new Map<number, InputBindingReleaseHandler>();
 
   // bind / defineMode return Promises so the plugin awaits the chain
   // registration before proceeding. The broker validates + registers
@@ -97,11 +102,23 @@ export function createPluginInput(endpoint: Endpoint): InputHandle {
     if (typeof opts.handler !== "function") {
       throw new TypeError("input.bind handler must be a function");
     }
+    if (opts.release !== undefined && typeof opts.release !== "function") {
+      throw new TypeError("input.bind release must be a function or omitted");
+    }
     const steps = parseChord(opts.keys);
     const id = nextId++;
     handlers.set(id, opts.handler);
-    // KeyStep is { mods: number; keysym: number } -- structurally Json.
-    const stepsJson: Json[] = steps.map((s) => ({ mods: s.mods, keysym: s.keysym }));
+    if (opts.release) releaseHandlers.set(id, opts.release);
+    // InputStep is a tagged-union of {mods, kind: 'key', keysym} or
+    // {mods, kind: 'button', button}; serialize each shape explicitly so
+    // the Json type's object indexer doesn't see undefined fields from
+    // the union member that isn't selected.
+    const stepsJson: Json[] = steps.map((s): Json => {
+      if (s.kind === "button") {
+        return { mods: s.mods, kind: "button", button: s.button };
+      }
+      return { mods: s.mods, kind: "key", keysym: s.keysym };
+    });
     const payload: Json = {
       id, steps: stepsJson,
       mode: opts.mode ?? "default",
@@ -109,16 +126,21 @@ export function createPluginInput(endpoint: Endpoint): InputHandle {
     if (opts.priority !== undefined) {
       (payload as { [k: string]: Json }).priority = opts.priority;
     }
+    if (opts.release !== undefined) {
+      (payload as { [k: string]: Json }).release = true;
+    }
     try {
       await endpoint.request("input.bind", payload);
     } catch (e) {
       handlers.delete(id);
+      releaseHandlers.delete(id);
       throw e;
     }
     return {
       unregister(): void {
         if (!handlers.has(id)) return;
         handlers.delete(id);
+        releaseHandlers.delete(id);
         // Unregister fire-and-forget: the plugin doesn't typically await
         // teardown, and a late delivery race is harmless (a binding
         // unregister-after-fire is idempotent).
@@ -156,32 +178,49 @@ export function createPluginInput(endpoint: Endpoint): InputHandle {
 
   const dispatcher: InputDispatcher = {
     dispatch(eventName, data): boolean {
-      if (eventName !== "input.binding-fired") return false;
-      if (!isBindingFiredPayload(data)) return true;   // bad payload; drop
-      const handler = handlers.get(data.id);
-      if (!handler) return true;                       // late delivery; drop
-      try {
-        const r = handler({ chord: data.chord });
-        if (r && typeof (r as Promise<unknown>).then === "function") {
-          (r as Promise<unknown>).catch((err: unknown) => {
-            const msg = err instanceof Error ? err.message : String(err);
-            endpoint.emit("log",
-              `[sdk.input] handler for binding ${data.id} failed: ${msg}`);
-          });
-        }
-      } catch (err) {
-        const msg = err instanceof Error ? err.message : String(err);
-        endpoint.emit("log",
-          `[sdk.input] handler for binding ${data.id} threw: ${msg}`);
+      if (eventName === "input.binding-fired") {
+        if (!isBindingFiredPayload(data)) return true;
+        const handler = handlers.get(data.id);
+        if (!handler) return true;
+        invokeHandler(handler, data, "handler");
+        return true;
       }
-      return true;
+      if (eventName === "input.binding-released") {
+        if (!isBindingFiredPayload(data)) return true;
+        const handler = releaseHandlers.get(data.id);
+        if (!handler) return true;
+        invokeHandler(handler, data, "release");
+        return true;
+      }
+      return false;
     },
   };
+
+  function invokeHandler(
+    handler: InputBindingHandler | InputBindingReleaseHandler,
+    data: { id: number; chord: InputStep[] },
+    label: string,
+  ): void {
+    try {
+      const r = handler({ chord: data.chord });
+      if (r && typeof (r as Promise<unknown>).then === "function") {
+        (r as Promise<unknown>).catch((err: unknown) => {
+          const msg = err instanceof Error ? err.message : String(err);
+          endpoint.emit("log",
+            `[sdk.input] ${label} for binding ${data.id} failed: ${msg}`);
+        });
+      }
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      endpoint.emit("log",
+        `[sdk.input] ${label} for binding ${data.id} threw: ${msg}`);
+    }
+  }
 
   return { input, dispatcher };
 }
 
-function isBindingFiredPayload(d: unknown): d is { id: number; chord: KeyStep[] } {
+function isBindingFiredPayload(d: unknown): d is { id: number; chord: InputStep[] } {
   if (typeof d !== "object" || d === null) return false;
   const o = d as { [k: string]: unknown };
   if (typeof o.id !== "number") return false;

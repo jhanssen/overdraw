@@ -1,29 +1,30 @@
-// Parse a human-written key specification ("Mod+Shift+Return") into a
-// KeyStep. Single-step and chord (KeyStep[]) shapes are both supported via
-// parseSpec (single) and parseChord (array or "step1, step2").
+// Parse a human-written key/button specification ("Mod+Shift+Return",
+// "Super+button1") into an InputStep (KeyStep or ButtonStep). Single-step
+// and chord (InputStep[]) shapes are both supported via parseSpec (single)
+// and parseChord (array or "step1, step2").
 //
 // Modifier name -> X11 modifier bit mask:
 //   Shift  0x01
 //   Lock   0x02   (Caps_Lock; usually NOT used in bindings)
 //   Ctrl   0x04
-//   Alt    0x08   (Mod1; the typical Alt/Meta assignment in stock keymaps)
-//   Mod2   0x10   (typically NumLock; included for completeness; not aliased)
+//   Alt    0x08   (Mod1)
+//   Mod2   0x10   (typically NumLock)
 //   Mod3   0x20
-//   Mod    0x40   (Mod4; the Super/Logo/Windows key in stock keymaps)
+//   Mod    0x40   (Mod4 / Super / Logo)
 //   Mod5   0x80   (typically AltGr / ISO_Level3_Shift)
 //
-// Aliases:  Mod = Super = Logo = Mod4 = 0x40
-//           Ctrl = Control
-//           Alt = Mod1
+// Aliases:  Mod = Super = Logo = Mod4 = 0x40;  Ctrl = Control;  Alt = Mod1.
+//
+// Buttons (X11 numbering for the common cases):
+//   button1 = left   (BTN_LEFT   = 0x110)
+//   button2 = middle (BTN_MIDDLE = 0x112)
+//   button3 = right  (BTN_RIGHT  = 0x111)
+//   button4..8       = BTN_SIDE/EXTRA/FORWARD/BACK/TASK (0x113..0x117)
 //
 // Limitations of v1:
-// - No layout-specific keysym aliases (we don't map "1" to the digit "1"
-//   under a Dvorak layout; the user's keymap is what xkb resolves at match
-//   time). The parser produces what the user TYPED; the seat compares
-//   against the xkb-resolved keysym from the current state.
-// - No release-event bindings ("up" half of a key). Bindings fire on
-//   key-down only.
-// - No mouse buttons. Keyboard only.
+// - No layout-specific keysym aliases under non-US layouts.
+// - Bindings fire on press only by default. The hotkey plugin's
+//   `releaseAction` lets a binding fire a second action on release.
 
 import { keysymOf, keysymName } from "./keysyms.js";
 
@@ -37,16 +38,49 @@ export const MOD_MOD3 = 0x20;
 export const MOD_MOD4 = 0x40;        // typically Super/Logo
 export const MOD_MOD5 = 0x80;        // typically AltGr
 
-// One step of a binding: a set of modifier bits + a keysym. Equality is
-// (modsMask === modsMask) && (keysym === keysym); see stepsEqual below.
+// One step of a binding: a set of modifier bits + either a keysym (key
+// step) or a pointer button code (button step). Equality is the union of
+// the same fields (see stepsEqual below).
 export interface KeyStep {
-  // Bit mask of modifiers that must be held when the key is pressed for the
-  // step to match. Unstated modifiers (e.g. NumLock) are IGNORED at match
-  // time -- only the bits set here are compared.
+  kind?: "key";
+  // Bit mask of modifiers that must be held for the step to match.
+  // Unstated bits (e.g. NumLock) are IGNORED at match time.
   mods: number;
   // The keysym (post-xkb-resolution) the key resolves to.
   keysym: number;
 }
+
+export interface ButtonStep {
+  kind: "button";
+  mods: number;
+  // Evdev button code (BTN_LEFT=0x110, etc.). Matches the value carried
+  // in wl_pointer.button events.
+  button: number;
+}
+
+export type InputStep = KeyStep | ButtonStep;
+
+// Evdev button codes (from <linux/input-event-codes.h>) for the named
+// "button<N>" tokens in key specs.
+export const BTN_LEFT = 0x110;
+export const BTN_RIGHT = 0x111;
+export const BTN_MIDDLE = 0x112;
+export const BTN_SIDE = 0x113;
+export const BTN_EXTRA = 0x114;
+export const BTN_FORWARD = 0x115;
+export const BTN_BACK = 0x116;
+export const BTN_TASK = 0x117;
+
+const BUTTON_ALIASES: { [name: string]: number } = {
+  button1: BTN_LEFT,
+  button2: BTN_MIDDLE,
+  button3: BTN_RIGHT,
+  button4: BTN_SIDE,
+  button5: BTN_EXTRA,
+  button6: BTN_FORWARD,
+  button7: BTN_BACK,
+  button8: BTN_TASK,
+};
 
 const MOD_ALIASES: { [name: string]: number } = {
   shift: MOD_SHIFT,
@@ -64,22 +98,21 @@ const MOD_ALIASES: { [name: string]: number } = {
   altgr: MOD_MOD5,
 };
 
-// Parse one step ("Mod+Shift+Return"). Tokens are split on '+'. The last
-// token is the keysym; everything before is a modifier name. Whitespace is
-// trimmed between tokens. Throws TypeError on shape errors (empty input,
-// unknown modifier, unknown keysym).
-export function parseSpec(spec: string): KeyStep {
+// Parse one step ("Mod+Shift+Return", "Super+button1"). Tokens are split
+// on '+'. The last token is the keysym OR button alias; everything before
+// is a modifier name. Throws TypeError on shape errors.
+export function parseSpec(spec: string): InputStep {
   if (typeof spec !== "string") {
-    throw new TypeError("key spec must be a string");
+    throw new TypeError("input spec must be a string");
   }
   const trimmed = spec.trim();
-  if (trimmed.length === 0) throw new TypeError("key spec is empty");
+  if (trimmed.length === 0) throw new TypeError("input spec is empty");
 
   const tokens = trimmed.split("+").map((t) => t.trim());
   if (tokens.some((t) => t.length === 0)) {
-    throw new TypeError(`key spec has empty token: '${spec}'`);
+    throw new TypeError(`input spec has empty token: '${spec}'`);
   }
-  const keyToken = tokens[tokens.length - 1];
+  const lastToken = tokens[tokens.length - 1];
   const modTokens = tokens.slice(0, -1);
 
   let mods = 0;
@@ -87,40 +120,46 @@ export function parseSpec(spec: string): KeyStep {
     const bit = MOD_ALIASES[m.toLowerCase()];
     if (bit === undefined) {
       throw new TypeError(
-        `unknown modifier '${m}' in key spec '${spec}'; ` +
+        `unknown modifier '${m}' in input spec '${spec}'; ` +
         `known: Shift, Ctrl, Alt, Mod (=Super/Logo), Mod2..Mod5`);
     }
     if ((mods & bit) !== 0) {
-      throw new TypeError(`duplicate modifier '${m}' in key spec '${spec}'`);
+      throw new TypeError(`duplicate modifier '${m}' in input spec '${spec}'`);
     }
     mods |= bit;
   }
-  const keysym = keysymOf(keyToken);
+
+  // Try button alias first ("button1" .. "button8"); fall back to keysym.
+  const button = BUTTON_ALIASES[lastToken.toLowerCase()];
+  if (button !== undefined) {
+    return { kind: "button", mods, button };
+  }
+  const keysym = keysymOf(lastToken);
   if (keysym === null) {
     throw new TypeError(
-      `unknown keysym '${keyToken}' in key spec '${spec}'; ` +
-      `see packages/core/src/input/keysyms.ts for the supported set`);
+      `unknown keysym/button '${lastToken}' in input spec '${spec}'; ` +
+      `keys: see packages/core/src/input/keysyms.ts; ` +
+      `buttons: button1..button8`);
   }
-  return { mods, keysym };
+  return { kind: "key", mods, keysym };
 }
 
 // Parse a chord. Accepts:
-//   - a single string "Mod+a, Mod+b" or "Mod+a Mod+b" (commas or spaces
-//     between steps; whichever the user prefers),
-//   - an array of step strings ["Mod+a", "Mod+b"],
-//   - a pre-parsed array of KeyStep.
-// Always returns KeyStep[] with at least one step.
-export function parseChord(input: string | readonly string[] | readonly KeyStep[]): KeyStep[] {
+//   - a single string "Mod+a, Mod+b" or "Mod+a Mod+b",
+//   - an array of step strings,
+//   - a pre-parsed array of InputStep.
+// Always returns InputStep[] with at least one step.
+export function parseChord(input: string | readonly string[] | readonly InputStep[]): InputStep[] {
   if (Array.isArray(input)) {
     if (input.length === 0) throw new TypeError("chord is empty");
-    const out: KeyStep[] = [];
+    const out: InputStep[] = [];
     for (const step of input) {
       if (typeof step === "string") {
         out.push(parseSpec(step));
-      } else if (isKeyStep(step)) {
-        out.push({ mods: step.mods, keysym: step.keysym });
+      } else if (isInputStep(step)) {
+        out.push(cloneStep(step));
       } else {
-        throw new TypeError(`chord entry must be a string or KeyStep, got ${typeof step}`);
+        throw new TypeError(`chord entry must be a string or InputStep, got ${typeof step}`);
       }
     }
     return out;
@@ -128,22 +167,37 @@ export function parseChord(input: string | readonly string[] | readonly KeyStep[
   if (typeof input !== "string") {
     throw new TypeError("chord must be a string or array");
   }
-  // Split on commas OR runs of whitespace; both are accepted.
   const parts = input.split(/[,\s]+/).filter((s) => s.length > 0);
   if (parts.length === 0) throw new TypeError(`chord is empty: '${input}'`);
   return parts.map(parseSpec);
 }
 
-function isKeyStep(v: unknown): v is KeyStep {
+function isInputStep(v: unknown): v is InputStep {
   if (typeof v !== "object" || v === null) return false;
   const o = v as { [k: string]: unknown };
-  return typeof o.mods === "number" && typeof o.keysym === "number";
+  if (typeof o.mods !== "number") return false;
+  // KeyStep: kind absent or 'key' + keysym number.
+  if ((o.kind === undefined || o.kind === "key") && typeof o.keysym === "number") return true;
+  // ButtonStep: kind 'button' + button number.
+  if (o.kind === "button" && typeof o.button === "number") return true;
+  return false;
 }
 
-// Render a KeyStep back to its canonical "Mod+Shift+Key" string. Used in
-// diagnostic messages + the bus event payloads (so subscribers see a stable,
-// human-readable identifier rather than two raw integers).
-export function formatStep(step: KeyStep): string {
+function cloneStep(s: InputStep): InputStep {
+  return s.kind === "button"
+    ? { kind: "button", mods: s.mods, button: s.button }
+    : { kind: "key", mods: s.mods, keysym: s.keysym };
+}
+
+// Return true if `step` is a button (vs. a key) step. A KeyStep without
+// an explicit `kind` field defaults to a key step.
+export function isButtonStep(step: InputStep): step is ButtonStep {
+  return step.kind === "button";
+}
+
+// Render an InputStep back to its canonical "Mod+Shift+Key" or
+// "Mod+button1" string. Used in diagnostics + bus event payloads.
+export function formatStep(step: InputStep): string {
   const parts: string[] = [];
   if (step.mods & MOD_CTRL) parts.push("Ctrl");
   if (step.mods & MOD_MOD1) parts.push("Alt");
@@ -153,15 +207,25 @@ export function formatStep(step: KeyStep): string {
   if (step.mods & MOD_MOD3) parts.push("Mod3");
   if (step.mods & MOD_MOD5) parts.push("Mod5");
   if (step.mods & MOD_LOCK) parts.push("Lock");
-  parts.push(keysymName(step.keysym));
+  parts.push(isButtonStep(step) ? buttonName(step.button) : keysymName(step.keysym));
   return parts.join("+");
 }
 
-export function formatChord(steps: readonly KeyStep[]): string {
+function buttonName(button: number): string {
+  for (const [name, code] of Object.entries(BUTTON_ALIASES)) {
+    if (code === button) return name;
+  }
+  return `button(0x${button.toString(16)})`;
+}
+
+export function formatChord(steps: readonly InputStep[]): string {
   return steps.map(formatStep).join(", ");
 }
 
-// Compare two KeySteps for equality (same mods AND same keysym).
-export function stepsEqual(a: KeyStep, b: KeyStep): boolean {
-  return a.mods === b.mods && a.keysym === b.keysym;
+// Compare two InputSteps for equality.
+export function stepsEqual(a: InputStep, b: InputStep): boolean {
+  if (a.mods !== b.mods) return false;
+  if (isButtonStep(a) !== isButtonStep(b)) return false;
+  if (isButtonStep(a)) return a.button === (b as ButtonStep).button;
+  return a.keysym === (b as KeyStep).keysym;
 }

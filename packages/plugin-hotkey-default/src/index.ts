@@ -23,6 +23,7 @@ interface SdkLike {
   input: {
     bind(opts: { keys: string | readonly string[]; mode?: string;
                  handler: (event: unknown) => void | Promise<void>;
+                 release?: (event: unknown) => void | Promise<void>;
                  priority?: number; }): Promise<{ unregister(): void }>;
     defineMode(name: string, opts?: { exitOnEscape?: boolean }):
       Promise<{ undefine(): void }>;
@@ -55,16 +56,23 @@ export default async function init(sdk: SdkLike, rawConfig?: unknown): Promise<v
   const bindings: { unregister(): void }[] = [];
   for (const [modeName, modeSpec] of Object.entries(config.modes)) {
     for (const binding of modeSpec.bindings) {
-      const handle = await sdk.input.bind({
+      const hasRelease = binding.releaseAction !== undefined
+        || binding.releasePushMode !== undefined
+        || binding.releasePopMode !== undefined;
+      const bindOpts: Parameters<typeof sdk.input.bind>[0] = {
         keys: binding.keys as string | readonly string[],
         mode: modeName,
-        handler: () => dispatch(binding),
-      });
+        handler: () => dispatchPress(binding),
+      };
+      if (hasRelease) {
+        bindOpts.release = () => dispatchRelease(binding);
+      }
+      const handle = await sdk.input.bind(bindOpts);
       bindings.push(handle);
     }
   }
 
-  async function dispatch(binding: BindingSpec): Promise<void> {
+  async function dispatchPress(binding: BindingSpec): Promise<void> {
     if (binding.action) {
       try {
         await sdk.actions.invoke(binding.action, binding.params);
@@ -92,8 +100,38 @@ export default async function init(sdk: SdkLike, rawConfig?: unknown): Promise<v
       }
       return;
     }
-    // validateConfig rejects bindings with no outcome; this is defensive.
     sdk.log(`binding has no outcome: ${JSON.stringify(binding)}`);
+  }
+
+  async function dispatchRelease(binding: BindingSpec): Promise<void> {
+    if (binding.releaseAction) {
+      try {
+        await sdk.actions.invoke(binding.releaseAction, binding.releaseParams);
+      } catch (err: unknown) {
+        const msg = err instanceof Error ? err.message : String(err);
+        sdk.log(`releaseAction '${binding.releaseAction}' failed: ${msg}`);
+      }
+      return;
+    }
+    if (binding.releasePushMode) {
+      try {
+        await sdk.input.pushMode(binding.releasePushMode);
+      } catch (err: unknown) {
+        const msg = err instanceof Error ? err.message : String(err);
+        sdk.log(`releasePushMode '${binding.releasePushMode}' failed: ${msg}`);
+      }
+      return;
+    }
+    if (binding.releasePopMode) {
+      try {
+        await sdk.input.popMode();
+      } catch (err: unknown) {
+        const msg = err instanceof Error ? err.message : String(err);
+        sdk.log(`releasePopMode failed: ${msg}`);
+      }
+      return;
+    }
+    sdk.log(`binding has releaseAction but no outcome: ${JSON.stringify(binding)}`);
   }
 
   await sdk.registerPlugin("hotkey", () => api);
@@ -192,5 +230,26 @@ function validateBindingSpec(modeName: string, b: BindingSpec): void {
   }
   if (b.popMode !== undefined && b.popMode !== true) {
     throw new TypeError(`hotkey '${modeName}' binding 'popMode' must be the literal true`);
+  }
+
+  // Release-half validation: at most one of releaseAction / releasePushMode /
+  // releasePopMode. Empty (none) is fine; it just means the binding has no
+  // release behavior.
+  const releaseOutcomes = [b.releaseAction, b.releasePushMode, b.releasePopMode]
+    .filter((v) => v !== undefined);
+  if (releaseOutcomes.length > 1) {
+    throw new TypeError(
+      `hotkey '${modeName}' binding has multiple release outcomes (set at most one of releaseAction / releasePushMode / releasePopMode): ${JSON.stringify(b)}`);
+  }
+  if (b.releaseAction !== undefined
+      && (typeof b.releaseAction !== "string" || b.releaseAction.length === 0)) {
+    throw new TypeError(`hotkey '${modeName}' binding 'releaseAction' must be a non-empty string`);
+  }
+  if (b.releasePushMode !== undefined
+      && (typeof b.releasePushMode !== "string" || b.releasePushMode.length === 0)) {
+    throw new TypeError(`hotkey '${modeName}' binding 'releasePushMode' must be a non-empty string`);
+  }
+  if (b.releasePopMode !== undefined && b.releasePopMode !== true) {
+    throw new TypeError(`hotkey '${modeName}' binding 'releasePopMode' must be the literal true`);
   }
 }

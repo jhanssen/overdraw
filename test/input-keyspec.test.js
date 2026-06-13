@@ -13,14 +13,14 @@ import { keysymOf } from "../packages/core/dist/input/keysyms.js";
 // ---- parseSpec --------------------------------------------------------------
 
 test("parseSpec: plain key", () => {
-  assert.deepEqual(parseSpec("a"), { mods: 0, keysym: 0x61 });
-  assert.deepEqual(parseSpec("Return"), { mods: 0, keysym: 0xff0d });
+  assert.deepEqual(parseSpec("a"), { kind: "key", mods: 0, keysym: 0x61 });
+  assert.deepEqual(parseSpec("Return"), { kind: "key", mods: 0, keysym: 0xff0d });
 });
 
 test("parseSpec: single modifier", () => {
-  assert.deepEqual(parseSpec("Mod+1"), { mods: MOD_MOD4, keysym: 0x31 });
-  assert.deepEqual(parseSpec("Ctrl+c"), { mods: MOD_CTRL, keysym: 0x63 });
-  assert.deepEqual(parseSpec("Alt+F4"), { mods: MOD_MOD1, keysym: 0xffc1 });
+  assert.deepEqual(parseSpec("Mod+1"), { kind: "key", mods: MOD_MOD4, keysym: 0x31 });
+  assert.deepEqual(parseSpec("Ctrl+c"), { kind: "key", mods: MOD_CTRL, keysym: 0x63 });
+  assert.deepEqual(parseSpec("Alt+F4"), { kind: "key", mods: MOD_MOD1, keysym: 0xffc1 });
 });
 
 test("parseSpec: multiple modifiers (any order)", () => {
@@ -32,9 +32,9 @@ test("parseSpec: multiple modifiers (any order)", () => {
 });
 
 test("parseSpec: case-insensitive on modifiers", () => {
-  assert.deepEqual(parseSpec("MOD+a"), { mods: MOD_MOD4, keysym: 0x61 });
+  assert.deepEqual(parseSpec("MOD+a"), { kind: "key", mods: MOD_MOD4, keysym: 0x61 });
   assert.deepEqual(parseSpec("ctrl+SHIFT+a"),
-    { mods: MOD_CTRL | MOD_SHIFT, keysym: 0x61 });
+    { kind: "key", mods: MOD_CTRL | MOD_SHIFT, keysym: 0x61 });
 });
 
 test("parseSpec: case-insensitive on keysym name", () => {
@@ -43,12 +43,12 @@ test("parseSpec: case-insensitive on keysym name", () => {
 });
 
 test("parseSpec: Super and Logo are aliases for Mod", () => {
-  assert.deepEqual(parseSpec("Super+a"), { mods: MOD_MOD4, keysym: 0x61 });
-  assert.deepEqual(parseSpec("Logo+a"), { mods: MOD_MOD4, keysym: 0x61 });
+  assert.deepEqual(parseSpec("Super+a"), { kind: "key", mods: MOD_MOD4, keysym: 0x61 });
+  assert.deepEqual(parseSpec("Logo+a"), { kind: "key", mods: MOD_MOD4, keysym: 0x61 });
 });
 
 test("parseSpec: trims whitespace around tokens", () => {
-  assert.deepEqual(parseSpec("  Mod  +  a  "), { mods: MOD_MOD4, keysym: 0x61 });
+  assert.deepEqual(parseSpec("  Mod  +  a  "), { kind: "key", mods: MOD_MOD4, keysym: 0x61 });
 });
 
 test("parseSpec: rejects empty input", () => {
@@ -85,14 +85,14 @@ test("parseSpec: rejects non-string", () => {
 test("parseChord: single-step string is a 1-element array", () => {
   const r = parseChord("Mod+a");
   assert.equal(r.length, 1);
-  assert.deepEqual(r[0], { mods: MOD_MOD4, keysym: 0x61 });
+  assert.deepEqual(r[0], { kind: "key", mods: MOD_MOD4, keysym: 0x61 });
 });
 
 test("parseChord: comma-separated chord", () => {
   const r = parseChord("Mod+a, Mod+b");
   assert.equal(r.length, 2);
-  assert.deepEqual(r[0], { mods: MOD_MOD4, keysym: 0x61 });
-  assert.deepEqual(r[1], { mods: MOD_MOD4, keysym: 0x62 });
+  assert.deepEqual(r[0], { kind: "key", mods: MOD_MOD4, keysym: 0x61 });
+  assert.deepEqual(r[1], { kind: "key", mods: MOD_MOD4, keysym: 0x62 });
 });
 
 test("parseChord: space-separated chord", () => {
@@ -103,13 +103,13 @@ test("parseChord: space-separated chord", () => {
 test("parseChord: array of strings", () => {
   const r = parseChord(["Mod+a", "Mod+b"]);
   assert.equal(r.length, 2);
-  assert.deepEqual(r[1], { mods: MOD_MOD4, keysym: 0x62 });
+  assert.deepEqual(r[1], { kind: "key", mods: MOD_MOD4, keysym: 0x62 });
 });
 
 test("parseChord: array of pre-parsed steps passes through", () => {
-  const r = parseChord([{ mods: MOD_CTRL, keysym: 0x61 }, { mods: 0, keysym: 0x62 }]);
+  const r = parseChord([{ kind: "key", mods: MOD_CTRL, keysym: 0x61 }, { kind: "key", mods: 0, keysym: 0x62 }]);
   assert.equal(r.length, 2);
-  assert.deepEqual(r[0], { mods: MOD_CTRL, keysym: 0x61 });
+  assert.deepEqual(r[0], { kind: "key", mods: MOD_CTRL, keysym: 0x61 });
 });
 
 test("parseChord: rejects empty array", () => {
@@ -179,13 +179,13 @@ test("keysymOf: returns null for unknown", () => {
 // ---- stepsEqual -------------------------------------------------------------
 
 test("stepsEqual: identical steps", () => {
-  assert.ok(stepsEqual({ mods: 0x40, keysym: 0x61 }, { mods: 0x40, keysym: 0x61 }));
+  assert.ok(stepsEqual({ kind: "key", mods: 0x40, keysym: 0x61 }, { kind: "key", mods: 0x40, keysym: 0x61 }));
 });
 
 test("stepsEqual: different mods", () => {
-  assert.ok(!stepsEqual({ mods: 0x40, keysym: 0x61 }, { mods: 0x44, keysym: 0x61 }));
+  assert.ok(!stepsEqual({ kind: "key", mods: 0x40, keysym: 0x61 }, { kind: "key", mods: 0x44, keysym: 0x61 }));
 });
 
 test("stepsEqual: different keysym", () => {
-  assert.ok(!stepsEqual({ mods: 0x40, keysym: 0x61 }, { mods: 0x40, keysym: 0x62 }));
+  assert.ok(!stepsEqual({ kind: "key", mods: 0x40, keysym: 0x61 }, { kind: "key", mods: 0x40, keysym: 0x62 }));
 });

@@ -30,7 +30,7 @@ test("single-step binding fires and consumes on exact match", () => {
   const { chain } = newChain();
   let fired = 0;
   chain.bind({ steps: [step("Mod+a")], handler: () => { fired++; } });
-  const r = chain.dispatch(step("Mod+a"));
+  const r = chain.dispatchPress(step("Mod+a"));
   assert.equal(r.consume, true);
   assert.equal(r.matched, true);
   assert.equal(fired, 1);
@@ -39,7 +39,7 @@ test("single-step binding fires and consumes on exact match", () => {
 test("unbound key is not consumed", () => {
   const { chain } = newChain();
   chain.bind({ steps: [step("Mod+a")], handler: () => {} });
-  const r = chain.dispatch(step("Mod+b"));
+  const r = chain.dispatchPress(step("Mod+b"));
   assert.equal(r.consume, false);
   assert.equal(r.matched, false);
 });
@@ -48,7 +48,7 @@ test("modifier mismatch is not consumed", () => {
   const { chain } = newChain();
   chain.bind({ steps: [step("Mod+a")], handler: () => {} });
   // Same keysym, different (no) modifier.
-  const r = chain.dispatch({ mods: 0, keysym: parseSpec("a").keysym });
+  const r = chain.dispatchPress({ mods: 0, keysym: parseSpec("a").keysym });
   assert.equal(r.consume, false);
 });
 
@@ -57,7 +57,7 @@ test("ignores Lock + Mod2 bits when comparing modifiers", () => {
   let fired = 0;
   chain.bind({ steps: [step("Mod+a")], handler: () => { fired++; } });
   // Press Mod+a with NumLock (Mod2 = 0x10) also active.
-  const r = chain.dispatch({ mods: MOD_MOD4 | 0x10 | 0x02, keysym: parseSpec("a").keysym });
+  const r = chain.dispatchPress({ mods: MOD_MOD4 | 0x10 | 0x02, keysym: parseSpec("a").keysym });
   assert.equal(r.consume, true);
   assert.equal(fired, 1);
 });
@@ -70,14 +70,14 @@ test("two-step chord enters prefix state, then matches", () => {
   chain.bind({ steps: parseChord(["Mod+a", "Mod+b"]), handler: () => { fired++; } });
 
   // First step: consume + enter chord state, no fire yet.
-  const r1 = chain.dispatch(step("Mod+a"));
+  const r1 = chain.dispatchPress(step("Mod+a"));
   assert.equal(r1.consume, true);
   assert.equal(r1.matched, false);
   assert.equal(fired, 0);
   assert.ok(events.some((e) => e.kind === "chord-entered" && e.mode === "default"));
 
   // Second step: match + fire.
-  const r2 = chain.dispatch(step("Mod+b"));
+  const r2 = chain.dispatchPress(step("Mod+b"));
   assert.equal(r2.consume, true);
   assert.equal(r2.matched, true);
   assert.equal(fired, 1);
@@ -89,14 +89,14 @@ test("chord prefix followed by non-matching key cancels + forwards the non-match
   let fired = 0;
   chain.bind({ steps: parseChord(["Mod+a", "Mod+b"]), handler: () => { fired++; } });
 
-  chain.dispatch(step("Mod+a"));            // enter prefix
-  const r = chain.dispatch(step("Mod+x"));  // cancel
+  chain.dispatchPress(step("Mod+a"));            // enter prefix
+  const r = chain.dispatchPress(step("Mod+x"));  // cancel
   assert.equal(r.consume, false);           // the non-matching key is NOT consumed
   assert.equal(fired, 0);
   assert.ok(events.some((e) => e.kind === "chord-cancelled"));
 
   // After cancellation we're back at root: pressing Mod+a should re-enter the chord.
-  const r2 = chain.dispatch(step("Mod+a"));
+  const r2 = chain.dispatchPress(step("Mod+a"));
   assert.equal(r2.consume, true);
 });
 
@@ -104,9 +104,9 @@ test("currentPath reflects in-progress chord", () => {
   const { chain } = newChain();
   chain.bind({ steps: parseChord(["Mod+a", "Mod+b"]), handler: () => {} });
   assert.equal(chain.currentPath().length, 0);
-  chain.dispatch(step("Mod+a"));
+  chain.dispatchPress(step("Mod+a"));
   assert.equal(chain.currentPath().length, 1);
-  chain.dispatch(step("Mod+b"));            // match resets
+  chain.dispatchPress(step("Mod+b"));            // match resets
   assert.equal(chain.currentPath().length, 0);
 });
 
@@ -143,7 +143,7 @@ test("unbind removes the binding; the key is no longer consumed", () => {
   let fired = 0;
   const h = chain.bind({ steps: [step("Mod+a")], handler: () => { fired++; } });
   h.unbind();
-  const r = chain.dispatch(step("Mod+a"));
+  const r = chain.dispatchPress(step("Mod+a"));
   assert.equal(r.consume, false);
   assert.equal(fired, 0);
 });
@@ -175,14 +175,14 @@ test("defineMode + pushMode shifts the active trie", () => {
   chain.bind({ steps: [step("h")], mode: "resize", handler: () => { resizeFired++; } });
 
   // Before push: default mode is active.
-  chain.dispatch(step("h"));
+  chain.dispatchPress(step("h"));
   assert.equal(defaultFired, 1);
   assert.equal(resizeFired, 0);
 
   chain.pushMode("resize");
   assert.ok(events.some((e) => e.kind === "mode-pushed" && e.name === "resize"));
 
-  chain.dispatch(step("h"));
+  chain.dispatchPress(step("h"));
   assert.equal(defaultFired, 1);
   assert.equal(resizeFired, 1);
 });
@@ -194,7 +194,7 @@ test("modes are isolated: unbound key in top mode is NOT consumed (no fall-throu
   chain.bind({ steps: [step("Mod+1")], handler: () => { defaultFired++; } });
   // No binding for Mod+1 in resize.
   chain.pushMode("resize");
-  const r = chain.dispatch(step("Mod+1"));
+  const r = chain.dispatchPress(step("Mod+1"));
   assert.equal(r.consume, false);
   assert.equal(defaultFired, 0);  // default's Mod+1 is NOT consulted
 });
@@ -204,7 +204,7 @@ test("Escape pops a mode by default", () => {
   chain.defineMode("resize");
   chain.pushMode("resize");
   assert.deepEqual(chain.stackNames(), ["default", "resize"]);
-  const r = chain.dispatch(step("Escape"));
+  const r = chain.dispatchPress(step("Escape"));
   assert.equal(r.consume, true);
   assert.deepEqual(chain.stackNames(), ["default"]);
   assert.ok(events.some((e) => e.kind === "mode-popped" && e.name === "resize"));
@@ -214,14 +214,14 @@ test("Escape does NOT pop when exitOnEscape: false", () => {
   const { chain } = newChain();
   chain.defineMode("modal", { exitOnEscape: false });
   chain.pushMode("modal");
-  const r = chain.dispatch(step("Escape"));
+  const r = chain.dispatchPress(step("Escape"));
   assert.equal(r.consume, false);  // unbound key, forward
   assert.deepEqual(chain.stackNames(), ["default", "modal"]);
 });
 
 test("Escape on the default mode does NOT pop (root frame is never popped)", () => {
   const { chain } = newChain();
-  const r = chain.dispatch(step("Escape"));
+  const r = chain.dispatchPress(step("Escape"));
   assert.equal(r.consume, false);   // unbound; default has exitOnEscape=false
   assert.deepEqual(chain.stackNames(), ["default"]);
 });
@@ -281,8 +281,8 @@ test("listener is invoked for mode pushes / pops / chord events", () => {
 
   chain.bind({ steps: parseChord(["Mod+a", "Mod+b"]), handler: () => {} });
   events.length = 0;
-  chain.dispatch(step("Mod+a"));
-  chain.dispatch(step("Mod+b"));
+  chain.dispatchPress(step("Mod+a"));
+  chain.dispatchPress(step("Mod+b"));
   assert.deepEqual(events, ["chord-entered", "chord-matched"]);
 });
 
@@ -302,7 +302,7 @@ test("handler throwing still consumes the key and resets the path", () => {
   const { chain } = newChain();
   chain.bind({ steps: [step("Mod+a")], handler: () => { throw new Error("boom"); } });
   // Should NOT throw out of dispatch.
-  const r = chain.dispatch(step("Mod+a"));
+  const r = chain.dispatchPress(step("Mod+a"));
   assert.equal(r.consume, true);
   // Path reset: next press is a fresh start.
   assert.equal(chain.currentPath().length, 0);

@@ -25,7 +25,9 @@ export type Chord = KeySpec | KeySpec[];
 // One binding entry. Exactly one of `action`, `pushMode`, `popMode`
 // must be set; the plugin throws if more or fewer outcomes are present.
 export interface BindingSpec {
-  // The chord that triggers this binding.
+  // The chord that triggers this binding. Supports key steps
+  // ("Mod+a") and pointer-button steps ("Super+button1"); buttons are
+  // only valid as the SINGLE leaf step (no mid-chord buttons).
   keys: Chord;
 
   // Outcome 1: invoke an action. `params` is passed verbatim as the
@@ -42,6 +44,16 @@ export interface BindingSpec {
   // Outcome 3: pop the current mode. The literal `true` is required;
   // any other value is a config error.
   popMode?: true;
+
+  // Optional release outcome. Fires when every key/button/mod held at
+  // the press has been released (e.g. user lets go of Super after
+  // dragging with Super+button1). Same vocabulary as the press
+  // outcomes (action OR pushMode OR popMode). Only valid on
+  // single-step bindings.
+  releaseAction?: string;
+  releaseParams?: unknown;
+  releasePushMode?: string;
+  releasePopMode?: true;
 }
 
 // A mode is a named binding set. The "default" mode is always present.

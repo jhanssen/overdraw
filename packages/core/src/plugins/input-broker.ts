@@ -7,7 +7,7 @@
 // GPU.
 
 import type { CompositorState } from "../protocols/ctx.js";
-import type { KeyStep } from "../input/keyspec.js";
+import type { InputStep } from "../input/keyspec.js";
 
 // One-way emit-to-plugin shape the runtime exposes. Used to deliver
 // 'input.binding-fired' to the plugin that registered the binding.
@@ -54,15 +54,26 @@ export function createInputBroker(deps: InputBrokerDeps): InputBroker {
         if (!isBindPayload(params)) {
           throw new Error("input.bind: malformed payload");
         }
-        const handle = chain.bind({
+        const bindSpec: Parameters<typeof chain.bind>[0] = {
           steps: params.steps,
           mode: params.mode ?? "default",
-          priority: params.priority,
           handler: ({ chord }) => {
             emitToPlugin(pluginName, "input.binding-fired",
               { id: params.id, chord });
           },
-        });
+        };
+        if (params.priority !== undefined) bindSpec.priority = params.priority;
+        // Release-capable bindings: the chain fires `release()` when every
+        // input held at press time is released. We forward as a separate
+        // event ('input.binding-released') so the plugin SDK can dispatch
+        // it to a user-supplied release handler.
+        if (params.release === true) {
+          bindSpec.release = ({ chord }) => {
+            emitToPlugin(pluginName, "input.binding-released",
+              { id: params.id, chord });
+          };
+        }
+        const handle = chain.bind(bindSpec);
         pluginBindings(pluginName).set(params.id, handle);
         return null;
       }
@@ -112,14 +123,18 @@ export function createInputBroker(deps: InputBrokerDeps): InputBroker {
 
 // ---- Payload guards -------------------------------------------------------
 
-function isStep(v: unknown): v is KeyStep {
+function isStep(v: unknown): v is InputStep {
   if (typeof v !== "object" || v === null) return false;
   const o = v as { [k: string]: unknown };
-  return typeof o.mods === "number" && typeof o.keysym === "number";
+  if (typeof o.mods !== "number") return false;
+  if (o.kind === "button") return typeof o.button === "number";
+  // Default ('key' or absent kind): needs a keysym.
+  if (o.kind === undefined || o.kind === "key") return typeof o.keysym === "number";
+  return false;
 }
 
 function isBindPayload(d: unknown): d is {
-  id: number; steps: KeyStep[]; mode?: string; priority?: number;
+  id: number; steps: InputStep[]; mode?: string; priority?: number; release?: boolean;
 } {
   if (typeof d !== "object" || d === null) return false;
   const o = d as { [k: string]: unknown };
@@ -128,6 +143,7 @@ function isBindPayload(d: unknown): d is {
   for (const s of o.steps) if (!isStep(s)) return false;
   if (o.mode !== undefined && typeof o.mode !== "string") return false;
   if (o.priority !== undefined && typeof o.priority !== "number") return false;
+  if (o.release !== undefined && typeof o.release !== "boolean") return false;
   return true;
 }
 

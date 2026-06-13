@@ -52,28 +52,28 @@ test("Worker plugin: sdk.input.bind + defineMode + pushMode/popMode end-to-end",
       (e) => e.p === "input-binder" && e.n === "log" && String(e.d) === "ready"));
 
     // Single-step binding fires.
-    const r1 = chain.dispatch(step("Mod+w"));
+    const r1 = chain.dispatchPress(step("Mod+w"));
     assert.equal(r1.consume, true);
     assert.equal(r1.matched, true);
     await waitFor(() => events.some(
       (e) => e.n === "log" && String(e.d) === "fired: Mod+w"));
 
     // Chord fires.
-    chain.dispatch(step("Mod+a"));
-    const r2 = chain.dispatch(step("Mod+b"));
+    chain.dispatchPress(step("Mod+a"));
+    const r2 = chain.dispatchPress(step("Mod+b"));
     assert.equal(r2.consume, true);
     assert.equal(r2.matched, true);
     await waitFor(() => events.some(
       (e) => e.n === "log" && String(e.d) === "fired: Mod+a, Mod+b"));
 
     // pushMode: handler enters worker-mode.
-    chain.dispatch(step("Mod+r"));
+    chain.dispatchPress(step("Mod+r"));
     await waitFor(() => events.some(
       (e) => e.n === "log" && String(e.d).includes("pushMode(worker-mode)")));
     assert.deepEqual(chain.stackNames(), ["default", "worker-mode"]);
 
     // In the new mode, Return is bound -> popMode.
-    chain.dispatch(step("Return"));
+    chain.dispatchPress(step("Return"));
     await waitFor(() => events.some(
       (e) => e.n === "log" && String(e.d).includes("popMode")));
     // pushMode / popMode are async (Promise<void> via endpoint.request);

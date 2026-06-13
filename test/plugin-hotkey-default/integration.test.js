@@ -144,7 +144,7 @@ async function withHotkeyPlugin(hotkeysConfig, fn, opts = {}) {
 // Dispatch a key through the chain (post-xkb-resolved -- the test
 // synthesizes the KeyStep directly).
 function dispatch(chain, spec) {
-  return chain.dispatch(parseSpec(spec));
+  return chain.dispatchPress(parseSpec(spec));
 }
 
 // ---- Empty / minimal config ----------------------------------------------
@@ -379,7 +379,7 @@ test('NumLock-with-binding still matches', async () => {
       pluginBus.subscribe('compositor.shutdown', () => events.push('fired'));
       // Mod+1 with NumLock (Mod2 = 0x10) on top.
       const step = parseSpec('Mod+1');
-      const r = chain.dispatch({ mods: step.mods | 0x10, keysym: step.keysym });
+      const r = chain.dispatchPress({ mods: step.mods | 0x10, keysym: step.keysym });
       assert.equal(r.consume, true);
       await runtime.flush();
       assert.equal(events.length, 1);
@@ -401,7 +401,7 @@ test('config.actions: user-defined handler fires on hotkey match', async () => {
     },
     async ({ chain, runtime }) => {
       // Run the binding.
-      const r = chain.dispatch(parseSpec('Mod+u'));
+      const r = chain.dispatchPress(parseSpec('Mod+u'));
       assert.equal(r.consume, true);
       await runtime.flush();
       assert.equal(userInvocations.length, 1);
@@ -429,7 +429,7 @@ test('deferred refs: ref.focusedWindow resolved at invoke time', async () => {
       },
     },
     async ({ chain, runtime }) => {
-      chain.dispatch(parseSpec('Mod+w'));
+      chain.dispatchPress(parseSpec('Mod+w'));
       await runtime.flush();
       assert.equal(invocations.length, 1);
       // The resolver returned 42 -> the handler sees { surface: 42, count: 1 }.
@@ -456,7 +456,7 @@ test('deferred refs: resolver returning null passes through', async () => {
       },
     },
     async ({ chain, runtime }) => {
-      chain.dispatch(parseSpec('Mod+n'));
+      chain.dispatchPress(parseSpec('Mod+n'));
       await runtime.flush();
       assert.equal(invocations.length, 1);
       assert.equal(invocations[0].params.surface, null);
@@ -482,7 +482,7 @@ test('config.actions: handler can invoke other actions via sdk', async () => {
     },
     async ({ chain, runtime, pluginBus }) => {
       pluginBus.subscribe('compositor.shutdown', () => shutdowns.push('fired'));
-      chain.dispatch(parseSpec('Mod+q'));
+      chain.dispatchPress(parseSpec('Mod+q'));
       await runtime.flush();
       assert.equal(shutdowns.length, 1);
     },
@@ -492,6 +492,93 @@ test('config.actions: handler can invoke other actions via sdk', async () => {
           await sdk.actions.invoke('compositor.quit');
         },
       },
+    },
+  );
+});
+
+// ---- Release callbacks ----------------------------------------------------
+
+test('releaseAction fires when the held key is released', async () => {
+  const seen = [];
+  await withHotkeyPlugin(
+    {
+      modes: {
+        default: [
+          { keys: 'Mod+m',
+            action: 'user.press',
+            releaseAction: 'user.release' },
+        ],
+      },
+    },
+    async ({ chain, runtime }) => {
+      chain.dispatchPress(parseSpec('Mod+m'));
+      await runtime.flush();
+      assert.deepEqual(seen, ['press']);
+      // Release the trigger first, then the modifier.
+      chain.dispatchRelease({ kind: 'key', keysym: parseSpec('m').keysym });
+      chain.dispatchRelease({ kind: 'mod', bit: 0x40 /* MOD_MOD4 */ });
+      await runtime.flush();
+      assert.deepEqual(seen, ['press', 'release']);
+    },
+    {
+      actions: {
+        'user.press': () => { seen.push('press'); },
+        'user.release': () => { seen.push('release'); },
+      },
+    },
+  );
+});
+
+test('releaseAction validation: chord + releaseAction is rejected by the chain', async () => {
+  let failed = false;
+  await withHotkeyPlugin(
+    {
+      modes: {
+        default: [
+          { keys: ['Mod+a', 'Mod+b'],
+            action: 'noop',
+            releaseAction: 'noop' },
+        ],
+      },
+    },
+    async ({ runtime }) => {
+      const states = runtime.states();
+      const hk = states.find((s) => s.name === 'hotkey-default');
+      if (hk?.state === 'failed') failed = true;
+    },
+    { expectFailure: true },
+  );
+  assert.equal(failed, true);
+});
+
+test('releaseAction without action is allowed (release-only binding via action)', async () => {
+  // Press an action AND register a release. Order in the spec is action +
+  // releaseAction; this exercises the per-half independence.
+  const seen = [];
+  await withHotkeyPlugin(
+    {
+      modes: {
+        default: [
+          { keys: 'Mod+n',
+            pushMode: 'submode',
+            releasePopMode: true },
+        ],
+        submode: [
+          { keys: 'Escape', popMode: true },
+        ],
+      },
+    },
+    async ({ chain, runtime }) => {
+      // pushMode on press.
+      chain.dispatchPress(parseSpec('Mod+n'));
+      await runtime.flush();
+      assert.deepEqual(chain.stackNames(), ['default', 'submode']);
+      // popMode on release.
+      chain.dispatchRelease({ kind: 'key', keysym: parseSpec('n').keysym });
+      chain.dispatchRelease({ kind: 'mod', bit: 0x40 });
+      await runtime.flush();
+      assert.deepEqual(chain.stackNames(), ['default']);
+      assert.equal(seen.length, 0); // no actions fired in this test
     },
   );
 });

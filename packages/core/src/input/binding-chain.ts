@@ -27,28 +27,56 @@
 // NOT fall through to a lower mode in the stack. The user pressed a key
 // the active mode doesn't claim; the client gets it.
 
-import type { KeyStep } from "./keyspec.js";
-import { MOD_LOCK, MOD_MOD2, stepsEqual, formatStep, formatChord } from "./keyspec.js";
+import type { InputStep, KeyStep, ButtonStep } from "./keyspec.js";
+import { MOD_LOCK, MOD_MOD2, formatStep, formatChord, isButtonStep } from "./keyspec.js";
 
-// A handler called when a binding matches. Returns a boolean to indicate
-// whether the key event should be consumed (true) or forwarded to the
-// client (false). Returning void / undefined means consume (the common
-// case -- bound keys usually shouldn't reach the client).
-//
-// May be async; the consume decision must be made synchronously, so the
-// chain ALWAYS consumes a matched binding regardless of what the handler
-// eventually returns. The boolean is reserved for future async-vetoing
-// designs; today the seat treats matched = consumed unconditionally.
+// A press handler. Returns a boolean to indicate consume (true) or forward
+// (false). Returning void/undefined means consume. May be async; the
+// consume decision must be made synchronously, so the chain ALWAYS
+// consumes a matched binding.
 export type BindingHandler =
-  (event: { step: KeyStep; chord: KeyStep[] }) => void | boolean | Promise<void | boolean>;
+  (event: { step: InputStep; chord: InputStep[] }) => void | boolean | Promise<void | boolean>;
+
+// A release handler. Fires when every key/button/mod that was held at
+// press time has been released. No return semantics; release events are
+// always consumed if they participate in a held instance.
+export type BindingReleaseHandler =
+  (event: { chord: InputStep[] }) => void | Promise<void>;
 
 // One registered binding. The chain owns these inside its tries; callers
 // receive an opaque {unbind} handle.
 interface RegisteredBinding {
-  steps: KeyStep[];
+  steps: InputStep[];
   handler: BindingHandler;
+  release?: BindingReleaseHandler;
   priority: number;
   mode: string;
+}
+
+// A live "held" instance: created on a successful press of a binding that
+// has a release callback. The instance tracks WHICH inputs are still down;
+// when the set drains to empty, the release callback fires and the
+// instance is destroyed.
+//
+// Two kinds of tracked inputs:
+//   - mod bits: the modifier bitmask that was set at press time. Each mod
+//     bit becomes a tracked entry, released individually as the user lifts
+//     each modifier key.
+//   - trigger: the matched step's keysym (for KeyStep) or button code
+//     (for ButtonStep). Released by the corresponding key-up/button-up.
+//
+// A release event for an input not in the set is ignored (does NOT
+// participate, does NOT consume).
+interface HeldInstance {
+  binding: RegisteredBinding;
+  // The matched step (the leaf step the press matched). The chord may
+  // have more steps but release tracking only applies to the leaf.
+  triggerStep: InputStep;
+  // Mod bits still held. Each mod bit is decremented as the user lifts
+  // that modifier key.
+  heldMods: number;
+  // True until the trigger key/button has been released.
+  triggerHeld: boolean;
 }
 
 // Trie node. `children` keyed by a step's serialized "mods:keysym" form. A
@@ -63,7 +91,27 @@ interface TrieNode {
 
 function newNode(): TrieNode { return { children: new Map() }; }
 
-function stepKey(step: KeyStep): string { return `${step.mods}:${step.keysym}`; }
+function stepKey(step: InputStep): string {
+  return isButtonStep(step)
+    ? `${step.mods}:b:${step.button}`
+    : `${step.mods}:k:${step.keysym}`;
+}
+
+function cloneInputStep(s: InputStep): InputStep {
+  return isButtonStep(s)
+    ? { kind: "button", mods: s.mods, button: s.button }
+    : { kind: "key", mods: s.mods, keysym: s.keysym };
+}
+
+// Parse a stepKey back into an InputStep. Inverse of stepKey() above.
+function parseStepKey(key: string): InputStep {
+  const [modsStr, kindChar, codeStr] = key.split(":");
+  const mods = Number(modsStr);
+  const code = Number(codeStr);
+  return kindChar === "b"
+    ? { kind: "button", mods, button: code }
+    : { kind: "key", mods, keysym: code };
+}
 
 // Modes the user has access to. The default mode is always present; other
 // modes are added via defineMode(). Each mode has its own trie + flags.
@@ -111,6 +159,10 @@ export class BindingChain {
   // Active stack; top is modes[stack.length - 1].
   private stack: ModeFrame[] = [];
   private listener: ChainEventListener | null = null;
+  // Held instances created by presses of bindings with release callbacks.
+  // Each release event (key-up / button-up / mod release) decrements one
+  // or more instances; when an instance's set is empty its release fires.
+  private held: HeldInstance[] = [];
 
   constructor() {
     const def: ModeDef = { name: "default", root: newNode(), exitOnEscape: false };
@@ -162,12 +214,19 @@ export class BindingChain {
   // Register a binding. Returns {unbind} to remove it. Throws on conflict:
   // either a binding with the same step sequence already exists, OR the
   // step sequence is a strict prefix of an existing binding, OR an existing
-  // binding is a strict prefix of this one. Same-prefix conflicts are
-  // ambiguous because the shorter binding would always match first.
+  // binding is a strict prefix of this one.
+  //
+  // `release` is an optional callback that fires when every key/button/mod
+  // held at press time has been released. Only valid on single-step
+  // bindings (length === 1): a multi-step chord cancels its prefix on
+  // dispatch, so there's nothing to "release" after a chord matches.
+  // Button-step chords (mid-chord button presses) are not supported; a
+  // button may only appear as the SINGLE leaf step.
   bind(spec: {
-    steps: KeyStep[];
+    steps: InputStep[];
     mode?: string;
     handler: BindingHandler;
+    release?: BindingReleaseHandler;
     priority?: number;
   }): { unbind(): void } {
     if (!Array.isArray(spec.steps) || spec.steps.length === 0) {
@@ -176,14 +235,32 @@ export class BindingChain {
     if (typeof spec.handler !== "function") {
       throw new TypeError("bind: handler must be a function");
     }
+    if (spec.release !== undefined) {
+      if (typeof spec.release !== "function") {
+        throw new TypeError("bind: release must be a function or omitted");
+      }
+      if (spec.steps.length > 1) {
+        throw new TypeError(
+          "bind: release callback is only valid on single-step bindings (chords cannot be released)");
+      }
+    }
+    // Button steps may only appear as the SINGLE leaf step. Mid-chord
+    // button presses ("Mod+a then button1") aren't supported in v1.
+    for (let i = 0; i < spec.steps.length - 1; i++) {
+      if (isButtonStep(spec.steps[i])) {
+        throw new TypeError(
+          "bind: button steps may only appear as the leaf (last) step of a binding");
+      }
+    }
     const modeName = spec.mode ?? "default";
     const def = this.modes.get(modeName);
     if (!def) {
       throw new Error(`bind: mode '${modeName}' is not defined`);
     }
     const binding: RegisteredBinding = {
-      steps: spec.steps.map((s) => ({ mods: s.mods, keysym: s.keysym })),
+      steps: spec.steps.map((s) => cloneInputStep(s)),
       handler: spec.handler,
+      ...(spec.release ? { release: spec.release } : {}),
       priority: spec.priority ?? 0,
       mode: modeName,
     };
@@ -227,7 +304,7 @@ export class BindingChain {
     return { unbind: () => this.unbindLeaf(modeName, binding.steps) };
   }
 
-  private unbindLeaf(modeName: string, steps: KeyStep[]): void {
+  private unbindLeaf(modeName: string, steps: InputStep[]): void {
     const def = this.modes.get(modeName);
     if (!def) return;
     // Walk + record the chain so we can prune empty branches on the way back.
@@ -241,6 +318,10 @@ export class BindingChain {
       node = next;
     }
     if (!node.binding) return;
+    // Drop any held instances tied to this binding (the user can no
+    // longer trigger its release; without this, a held instance would
+    // leak forever).
+    this.held = this.held.filter((h) => h.binding !== node.binding);
     delete node.binding;
     // Prune empty nodes from the bottom up.
     for (let i = path.length - 1; i >= 0; i--) {
@@ -290,7 +371,7 @@ export class BindingChain {
 
   // Snapshot of the current chord progress (the steps consumed so far in
   // the top frame). Empty if the top frame is at root.
-  currentPath(): KeyStep[] {
+  currentPath(): InputStep[] {
     const top = this.stack[this.stack.length - 1];
     if (top.path === top.def.root) return [];
     return this.pathToSteps(top.def, top.path);
@@ -298,14 +379,13 @@ export class BindingChain {
 
   // Reconstruct the steps from a path node by re-walking the trie. Slow
   // (O(depth * branching)) but only called for diagnostics.
-  private pathToSteps(def: ModeDef, target: TrieNode): KeyStep[] {
+  private pathToSteps(def: ModeDef, target: TrieNode): InputStep[] {
     if (target === def.root) return [];
-    const result: KeyStep[] = [];
-    const walk = (node: TrieNode, acc: KeyStep[]): boolean => {
+    const result: InputStep[] = [];
+    const walk = (node: TrieNode, acc: InputStep[]): boolean => {
       if (node === target) { result.push(...acc); return true; }
       for (const [key, child] of node.children) {
-        const [modsStr, symStr] = key.split(":");
-        acc.push({ mods: Number(modsStr), keysym: Number(symStr) });
+        acc.push(parseStepKey(key));
         if (walk(child, acc)) return true;
         acc.pop();
       }
@@ -315,30 +395,42 @@ export class BindingChain {
     return result;
   }
 
-  // Outcome of dispatching one key-down. The seat consumes when consume is
-  // true (skip wl_keyboard.key) and forwards when false. matched=true means
-  // a binding fired; the handler has been called (synchronously, but any
+  // Dispatch a press event (key-down or button-down). The seat consumes
+  // when consume is true and forwards when false. matched=true means a
+  // binding fired (the press handler has been called synchronously; a
   // Promise it returns is dropped -- consume decisions can't await).
-  dispatch(step: KeyStep): { consume: boolean; matched: boolean } {
+  dispatchPress(step: InputStep): { consume: boolean; matched: boolean } {
     const top = this.stack[this.stack.length - 1];
     // Match-time mods: strip the bits we don't care about.
-    const compareStep: KeyStep = { mods: step.mods & ~IGNORED_MODS, keysym: step.keysym };
+    const compareStep: InputStep = isButtonStep(step)
+      ? { kind: "button", mods: step.mods & ~IGNORED_MODS, button: step.button }
+      : { kind: "key", mods: step.mods & ~IGNORED_MODS, keysym: step.keysym };
     const key = stepKey(compareStep);
     const next = top.path.children.get(key);
     if (next) {
       if (next.binding) {
         // Leaf: fire + reset + consume.
-        const chord = next.binding.steps;
+        const binding = next.binding;
+        const chord = binding.steps;
         this.emit({
           kind: "chord-matched", mode: top.def.name, path: formatChord(chord),
         });
-        const handler = next.binding.handler;
         top.path = top.def.root;
-        // Run the handler; errors are logged but don't block the consume
-        // decision. The handler may push/pop modes; that's OK -- those
-        // affect subsequent key events, not this one.
+        // If this binding has a release callback, register a held
+        // instance. The trigger step is `compareStep` (the actually-
+        // matched leaf, in case future code needs it).
+        if (binding.release) {
+          this.held.push({
+            binding,
+            triggerStep: cloneInputStep(compareStep),
+            heldMods: compareStep.mods,
+            triggerHeld: true,
+          });
+        }
+        // Run the press handler. Errors are logged but don't block the
+        // consume decision.
         try {
-          const r = handler({ step, chord });
+          const r = binding.handler({ step, chord });
           if (r && typeof (r as Promise<unknown>).then === "function") {
             (r as Promise<unknown>).catch((err: unknown) => {
               const msg = err instanceof Error ? err.message : String(err);
@@ -359,23 +451,21 @@ export class BindingChain {
       });
       return { consume: true, matched: false };
     }
-    // No match in the trie. Check exit-on-Escape (only meaningful when the
-    // top frame is not the default mode AND its exitOnEscape is true AND
-    // the chord pointer is at root -- otherwise an in-progress chord
-    // would just cancel, see below).
+    // No match in the trie. Check exit-on-Escape (only meaningful for
+    // a non-default top frame with exitOnEscape, when the chord pointer
+    // is at root and the step is the bare Escape keysym).
     if (
       this.stack.length > 1
       && top.def.exitOnEscape
       && top.path === top.def.root
+      && !isButtonStep(compareStep)
       && compareStep.keysym === ESCAPE_KEYSYM
       && compareStep.mods === 0
     ) {
       this.popMode();
       return { consume: true, matched: false };
     }
-    // In-progress chord that didn't match: cancel and forward THIS key to
-    // the client. (Cancel does NOT forward the prior consumed prefix; we
-    // can't un-consume those.)
+    // In-progress chord that didn't match: cancel and forward THIS event.
     if (top.path !== top.def.root) {
       this.emit({
         kind: "chord-cancelled", mode: top.def.name,
@@ -385,6 +475,79 @@ export class BindingChain {
     }
     return { consume: false, matched: false };
   }
+
+  // Dispatch a release event (key-up or button-up). Decrements held
+  // instances; fires release callbacks when an instance's set drains.
+  // Returns consume=true if the released input participated in at least
+  // one held instance (so the seat can suppress forwarding).
+  //
+  // `event` is the raw input event:
+  //   - keyboard release: kind='key' + keysym.
+  //   - button release: kind='button' + button.
+  //   - mod release: kind='mod' + the modifier bit that became unset
+  //     (computed by the seat by diff against the prior mod mask).
+  dispatchRelease(event:
+      | { kind: "key"; keysym: number }
+      | { kind: "button"; button: number }
+      | { kind: "mod"; bit: number },
+  ): { consume: boolean } {
+    if (this.held.length === 0) return { consume: false };
+    let anyParticipated = false;
+    const drained: HeldInstance[] = [];
+    for (let i = this.held.length - 1; i >= 0; i--) {
+      const inst = this.held[i];
+      let participated = false;
+      if (event.kind === "mod") {
+        if ((inst.heldMods & event.bit) !== 0) {
+          inst.heldMods &= ~event.bit;
+          participated = true;
+        }
+      } else if (event.kind === "key"
+                 && inst.triggerHeld
+                 && !isButtonStep(inst.triggerStep)
+                 && (inst.triggerStep as KeyStep).keysym === event.keysym) {
+        inst.triggerHeld = false;
+        participated = true;
+      } else if (event.kind === "button"
+                 && inst.triggerHeld
+                 && isButtonStep(inst.triggerStep)
+                 && (inst.triggerStep as ButtonStep).button === event.button) {
+        inst.triggerHeld = false;
+        participated = true;
+      }
+      if (participated) {
+        anyParticipated = true;
+        // Drain check: no mods left AND trigger released -> instance done.
+        if (inst.heldMods === 0 && !inst.triggerHeld) {
+          drained.push(inst);
+          this.held.splice(i, 1);
+        }
+      }
+    }
+    // Fire release callbacks AFTER mutating held[], so a release handler
+    // that synchronously presses keys / re-enters dispatch sees a clean
+    // held list.
+    for (const inst of drained) {
+      try {
+        const r = inst.binding.release?.({ chord: inst.binding.steps });
+        if (r && typeof (r as Promise<unknown>).then === "function") {
+          (r as Promise<unknown>).catch((err: unknown) => {
+            const msg = err instanceof Error ? err.message : String(err);
+            console.error(`[binding-chain] release for '${formatChord(inst.binding.steps)}' failed: ${msg}`);
+          });
+        }
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        console.error(`[binding-chain] release for '${formatChord(inst.binding.steps)}' threw: ${msg}`);
+      }
+    }
+    return { consume: anyParticipated };
+  }
+
+  // Diagnostic: number of currently-held release-capable instances. Used
+  // by tests and the seat (to know whether to bother calling
+  // dispatchRelease on every key-up).
+  heldCount(): number { return this.held.length; }
 
   private emit(ev: ChainEvent): void {
     if (!this.listener) return;
