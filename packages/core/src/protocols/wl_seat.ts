@@ -314,10 +314,10 @@ export default function makeSeat(ctx: Ctx, driver: FocusDriver): SeatHandler {
 
   // Recompute the exclusive-layer-focus state. Called from the layer-shell
   // handler whenever a layer surface is mapped, unmapped, or has its
-  // keyboard_interactivity / layer changed. When an exclusive layer exists
-  // and kbFocus isn't already there, install it. When the previously-active
-  // exclusive layer unmapped, re-run the focus driver under the new
-  // (non-exclusive) state.
+  // keyboard_interactivity / layer changed. When an exclusive layer is
+  // mapped and kbFocus isn't already on it, install it. When no exclusive
+  // layer is mapped but kbFocus is still on one (it just unmapped), re-run
+  // the focus driver under normal semantics.
   function reevaluateExclusiveLayerFocus(): void {
     const seat = ctx.state.seat;
     if (!seat) return;

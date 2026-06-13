@@ -4,7 +4,7 @@ Ground truth for what exists right now: current capabilities, known gaps, and
 what remains. The design lives in `architecture.md`; this file does not restate
 it. Present-tense only — no change history.
 
-Last updated: 2026-06-11 (post-Phase 10a — buffer intercept v1: match engine, in-thread + Worker transports via cross-device dmabuf rings, outputRect, render-throw fallback. 10b deferred: chains, per-stage caching, hold-last-output, A1 input optimization, popups + subsurfaces).
+Last updated: 2026-06-12 (post-wlr-layer-shell-unstable-v1 — desktop-shell components: anchored layer surfaces with configure/ack handshake, exclusive-zone reflow of the WM tile region, popups parented to layer surfaces, keyboard-interactivity routing including the exclusive override above the focus driver, OUTPUT_DEFAULT-only).
 
 ## Read first: gaps in advertised protocols (silent-gap risks)
 
@@ -43,6 +43,16 @@ with no error. Worst-first.
   vsync. This is a phase-1 shortcut because Dawn's WSI swapchain owns `Present` and
   hides the host frame callback. See architecture.md "Frame clock" and "Phase-2
   present".
+
+- **No `wl_resource_post_error` mechanism.** Requests that the spec defines
+  as protocol errors (e.g. `zwlr_layer_surface_v1.invalid_size` when set_size
+  has a 0 axis with no opposite-edge anchors, `wp_cursor_shape_v1.invalid_shape`
+  for out-of-range shape enums, `wl_subsurface` place_above/place_below on
+  a non-sibling, cross-role surface assignment) are silently dropped rather
+  than disconnected. Compliant clients see no behavior change in the
+  successful path; non-compliant clients don't get the spec'd disconnect.
+  Each silent-drop site is commented with the error it would otherwise
+  post. Adding a generic `post_error` path is its own piece of work.
 
 - **Smaller advertised-incomplete items:** `wl_subsurface` `place_above`/
   `place_below` sibling reordering (no-op); DnD drag-icon compositing (implemented,
@@ -2376,6 +2386,166 @@ sets/clears these per frame via the sink.
   exposed by the worker's tight per-frame loop; not specific to
   intercept's logic.
 
+### wlr-layer-shell (`zwlr_layer_shell_v1` / `zwlr_layer_surface_v1`)
+
+Desktop-shell-component surfaces (status bars, wallpapers, app launchers,
+notifications): a client roles a `wl_surface` as a layer surface in one of
+four named layers (background / bottom / top / overlay), with anchor,
+size, margin, exclusive zone, and keyboard-interactivity state. The
+compositor computes the output-space rect from anchor + size + margin
+against the appropriate output rect (raw output for `zone != 0`, output
+minus other surfaces' reservations for `zone == 0`), registers the
+surface's own exclusive zone (when valid) with the reserved-zone
+registry, and composites it in the requested layer above or below
+toplevels.
+
+- **Globals + child interfaces** advertised at the standard versions
+  (v4 for both, the latest the wlr protocol publishes).
+- **Configure / ack handshake** mirrors xdg-shell: get_layer_surface
+  defers the first configure; the client commits with no buffer; the
+  compositor sends `configure(serial, w, h)`; the client acks; the next
+  commit attaches a buffer and maps. A buffer attached before the first
+  ack is dropped (would post `invalid_surface_state`; see "Read first"
+  for the no-`post_error` gap).
+- **Anchor + size + margin + zone math** lives in
+  `packages/core/src/protocols/layer-shell-position.ts`, pure +
+  unit-tested (`placeLayerSurface`, `resolveExclusiveEdge`,
+  `computeReservedThickness`; 27 tests). Size 0 on an axis means "span
+  the anchored opposite edges"; v5 `set_exclusive_edge` resolves the
+  corner-anchor ambiguity for the reservation.
+- **Reserved-zone registry**
+  (`packages/core/src/wm/reserved-zones.ts`): a layer surface with
+  `zone > 0` and a resolvable edge installs a per-edge band. The WM's
+  layout driver reads `effectiveRect()` to compute the tile region;
+  tiled windows reflow inside it and `maximized` resolves to it.
+  `Wm.schedule('reserved-zones-changed')` triggers the relayout when a
+  zone changes. Sibling zone==0 layer surfaces re-place against the new
+  effective rect on every apply (and on the panel's destroy).
+- **Layer-stack merge** (`packages/core/src/layer-stack.ts`): the
+  overlay broker (plugin overlays + decorations on flat layers) and the
+  zwlr_layer_surface_v1 registry both write into the same compositor
+  non-content layers; `rebuildLayerStack(state, layer?)` merges them
+  before pushing `setLayerSurfaces`. Order per layer: overlay-broker
+  ids first (compositor chrome), then layer-shell ids (user content
+  for the layer). Protocol "bottom" maps to compositor "below";
+  "top" -> "above".
+- **`window.map` discriminator**: layer surfaces fire
+  `window.map { role: 'layer-shell', appId: null, title: null }` on
+  the typed core bus (the protocol carries a `namespace` string instead
+  of app_id/title; not surfaced on this event today). `LayoutWindow.role`
+  already had the value reserved.
+- **Pointer hit-testing**: the seat's `pick()` now searches layer
+  surfaces above toplevels (overlay > top) before toplevels, and below
+  (bottom > background) after. Input regions are honored on layer
+  surfaces too.
+- **Keyboard interactivity** (`none` / `on_demand` / `exclusive`):
+  - `none` (default): not eligible for keyboard focus. Pointer/touch
+    routes normally.
+  - `on_demand` (v4+): participates in the normal focus path. The
+    bundled focus plugin's `decide()` sees the surface id under the
+    pointer and resolves focus through its existing policy (no plugin
+    change needed; the focus seam is surface-id-shaped).
+  - `exclusive` on the `top` or `overlay` layer: a core-level override
+    above the focus driver. While at least one such surface is mapped,
+    the seat's `applyKeyboardFocus` and `dispatchFocus` short-circuit
+    and force kbFocus to the topmost-overlay-then-topmost-top exclusive
+    surface; tie-break is creation order. The bundled focus plugin is
+    not consulted. `bottom` and `background` exclusive requests are
+    silently treated as `on_demand` (spec: "the compositor is allowed
+    to use normal focus semantics" there).
+- **Popups parented to layer surfaces**:
+  `zwlr_layer_surface_v1.get_popup` accepts an `xdg_popup` created with
+  NULL parent (the spec's escape hatch). `xdg_surface.get_popup` now
+  accepts NULL; its configure is deferred until the layer-shell
+  get_popup supplies the layer parent. `popupOutputOrigin` resolves
+  both xdg-shell and layer-shell parents; per-output filtered stacks
+  always include layer-parented popups (workspaces don't model layer
+  surfaces). Destroying a layer surface drops its popups.
+
+**Limitations / known gaps:**
+
+- **Single output** (`OUTPUT_DEFAULT = 0` only). The `output` arg to
+  `get_layer_surface` is accepted but ignored; every layer surface
+  targets the single fabricated output. Multi-output is a `wl_output`
+  reconfiguration pre-condition (see "Read first").
+- **Protocol-error posts are silent-drops.** This compositor has no
+  `wl_resource_post_error` mechanism (cursor-shape, seat, subsurfaces
+  follow the same convention). Each silent-drop site in the layer-shell
+  handler is commented with the spec error it would otherwise raise:
+  `role` (existing role on the wl_surface), `already_constructed`
+  (buffer attached before role), `invalid_layer`, `invalid_anchor`,
+  `invalid_keyboard_interactivity`, `invalid_size` (size==0 axis
+  without opposite-edge anchors), `invalid_exclusive_edge`,
+  `invalid_surface_state` (buffer attached before first ack). Clients
+  that violate these see no visible behavior change vs. a compliant
+  compositor in most cases (the request is dropped + the surface
+  proceeds with default state).
+- **`closed` event not emitted.** The spec lets the compositor send
+  `closed` (e.g. on output destruction); there is no output destruction
+  yet, so this event isn't used. Client-initiated destroy proceeds
+  through the normal destructor path.
+- **Animated cursors and HiDPI** are inherited limitations from the
+  cursor / output substrates, not layer-shell-specific.
+
+**Files** (new):
+- `packages/core/protocols/wlr-layer-shell-unstable-v1.xml` (vendored).
+- `packages/core/src/protocols/layer-shell-position.ts` (pure math).
+- `packages/core/src/protocols/zwlr_layer_shell_v1.ts` (both
+  interfaces' handler factories + the apply pipeline +
+  applyLayerSurfaceInitial / applyLayerSurfacePending /
+  markLayerSurfaceMapped / teardownLayerSurface).
+- `packages/core/src/layer-stack.ts` (merged push).
+- `packages/core/native/wayland/generated/wlr-layer-shell-unstable-v1-*`
+  (wayland-scanner output for the C test client).
+- `packages/core/test/layer-shell-test-client.c` (GPU test client).
+- `test/layer-shell-position.test.js` (27 unit tests),
+  `test/layer-stack.test.js` (8), `test/layer-shell-registry.test.js`
+  (22), `test/wm-reserved-zones.test.js` (5),
+  `test/layer-shell.gpu.mjs` (4 GPU).
+
+**Files** (modified):
+- `packages/core/src/protocols/ctx.ts`: LayerSurfaceRecord +
+  state.layerSurfaces / layerSurfacesBySurface / reservedZones /
+  relayout / overlayLayerIds; PopupRecord.parent widened to
+  XdgSurfaceRecord | null + PopupRecord.layerParent;
+  SeatState.reevaluateExclusiveLayerFocus.
+- `packages/core/src/events/types.ts`: WindowMapEvent gains
+  optional `role: 'toplevel' | 'layer-shell'`.
+- `packages/core/src/protocols/index.ts`: GLOBALS + CHILD_INTERFACES
+  add the two interfaces; InstallOptions.reservedZones threaded
+  through; state.relayout = wm.schedule; the imported-surfaces sweep
+  fires window.map for layer surfaces.
+- `packages/core/src/protocols/wl_surface.ts`: initial-commit
+  detection branches on s.layerSurface; pre-ack buffer is dropped;
+  apply path calls applyLayerSurfacePending. unmapAndTeardownSurface
+  emits window.unmap for layer_surface role and calls
+  teardownLayerSurface.
+- `packages/core/src/protocols/xdg_surface.ts`: get_popup accepts
+  NULL parent.
+- `packages/core/src/protocols/xdg_popup.ts`: parentOutputOrigin
+  handles XdgSurfaceRecord | null; popupOutputOrigin resolves
+  layer-parented popups via PopupRecord.layerParent;
+  rebuildStackWithPopups always includes layer-parented popups in
+  per-output filtered stacks.
+- `packages/core/src/protocols/wl_seat.ts`: pickLayer; exclusive-
+  layer focus override (focusTargetFor, pickExclusiveLayerSurface,
+  reevaluateExclusiveLayerFocus). applyKeyboardFocus + dispatchFocus
+  consult the override.
+- `packages/core/src/wm/index.ts`: Wm.schedule(reason).
+- `packages/core/src/overlay.ts`: pushLayer routes through
+  rebuildLayerStack; state.overlayLayerIds published.
+- `packages/core/src/main.ts`: reservedZones passed into
+  installProtocols (was layout-driver only).
+- `packages/layout-types/src/index.ts`: LayoutReason gains
+  'reserved-zones-changed'.
+- `packages/core/CMakeLists.txt`: layer-shell-test-client target.
+- `packages/core/tools/gen-protocol/gen-protocol.js`: XML added to
+  DEFAULT_INPUTS.
+- `test/harness.mjs`: constructs and threads reservedZones into
+  installProtocols + the layout driver factory.
+
+966/966 unit tests pass; 129/129 GPU tests pass.
+
 ### Decoration provider (registration + insets + drawing + atomic gating)
 
 Server-side decorations end to end: a plugin registers an app_id pattern, is told
@@ -2532,7 +2702,10 @@ per-surface render state primitives (`compositor-fx.gpu.mjs`).
   key delivery), `wl_output` (mode/geometry), `wl_callback`, `wl_data_device*`/
   `wl_data_offer` + `zwp_primary_selection_*` (clipboard round-trip),
   `wl_subsurface` (sync/desync, pixel), `xdg_popup`/`xdg_positioner` (pixel),
-  `wl_data_device` DnD (full vertical).
+  `wl_data_device` DnD (full vertical),
+  `zwlr_layer_shell_v1`/`zwlr_layer_surface_v1` (anchor + exclusive zone
+  reflow, window.map role, exclusive keyboard interactivity override,
+  popup re-parenting).
 - **Implemented, not behaviorally tested**: `wl_region` (no-op stub);
   `zwp_linux_dmabuf_feedback_v1` (exercised by real WSI clients, no automated
   assertion).
