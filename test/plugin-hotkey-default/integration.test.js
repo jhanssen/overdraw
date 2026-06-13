@@ -582,3 +582,98 @@ test('releaseAction without action is allowed (release-only binding via action)'
     },
   );
 });
+
+// ---- Grab actions (registered by plugin-core-actions) --------------------
+
+test('window.begin-move action emits window.grab-requested with kind=move', async () => {
+  const requests = [];
+  await withHotkeyPlugin(
+    {
+      modes: {
+        default: [
+          { keys: 'Mod+button1',
+            action: 'window.begin-move',
+            params: { surfaceId: 42 } },
+        ],
+      },
+    },
+    async ({ chain, pluginBus, runtime }) => {
+      pluginBus.subscribe('window.grab-requested', (_n, p) => requests.push(p));
+      chain.dispatchPress({ kind: 'button', mods: 0x40, button: 0x110 });
+      await runtime.flush();
+      assert.equal(requests.length, 1);
+      assert.equal(requests[0].kind, 'move');
+      assert.equal(requests[0].surfaceId, 42);
+    },
+  );
+});
+
+test('window.begin-resize action emits window.grab-requested with edges', async () => {
+  const requests = [];
+  await withHotkeyPlugin(
+    {
+      modes: {
+        default: [
+          { keys: 'Mod+button3',
+            action: 'window.begin-resize',
+            params: { surfaceId: 7, edges: 'top-left' } },
+        ],
+      },
+    },
+    async ({ chain, pluginBus, runtime }) => {
+      pluginBus.subscribe('window.grab-requested', (_n, p) => requests.push(p));
+      chain.dispatchPress({ kind: 'button', mods: 0x40, button: 0x111 });
+      await runtime.flush();
+      assert.equal(requests.length, 1);
+      assert.equal(requests[0].kind, 'resize');
+      assert.equal(requests[0].edges, 'top-left');
+    },
+  );
+});
+
+test('window.begin-resize: edges defaults to bottom-right when omitted', async () => {
+  const requests = [];
+  await withHotkeyPlugin(
+    {
+      modes: {
+        default: [
+          { keys: 'Mod+button3',
+            action: 'window.begin-resize',
+            params: { surfaceId: 7 } },
+        ],
+      },
+    },
+    async ({ chain, pluginBus, runtime }) => {
+      pluginBus.subscribe('window.grab-requested', (_n, p) => requests.push(p));
+      chain.dispatchPress({ kind: 'button', mods: 0x40, button: 0x111 });
+      await runtime.flush();
+      assert.equal(requests[0].edges, 'bottom-right');
+    },
+  );
+});
+
+test('window.end-grab action emits window.grab-end-requested', async () => {
+  const requests = [];
+  await withHotkeyPlugin(
+    {
+      modes: {
+        default: [
+          { keys: 'Mod+button1',
+            action: 'window.begin-move',
+            params: { surfaceId: 1 },
+            releaseAction: 'window.end-grab' },
+        ],
+      },
+    },
+    async ({ chain, pluginBus, runtime }) => {
+      pluginBus.subscribe('window.grab-end-requested', () => requests.push({}));
+      chain.dispatchPress({ kind: 'button', mods: 0x40, button: 0x110 });
+      await runtime.flush();
+      // Release the button and the Mod.
+      chain.dispatchRelease({ kind: 'button', button: 0x110 });
+      chain.dispatchRelease({ kind: 'mod', bit: 0x40 });
+      await runtime.flush();
+      assert.equal(requests.length, 1);
+    },
+  );
+});

@@ -51,9 +51,10 @@ export interface LayoutSnapshot {
 // presentations).
 export interface LayoutSnapshotWindow extends LayoutWindow {
   presentation: Presentation;
-  // For windows transitioning out of maximize/fullscreen back to managed;
-  // the driver does not consume this directly but the plugin may use it
-  // (currentRect already covers the common case).
+  // The rect to place a floating window at. Used only when
+  // presentation === 'floating'. Absent for other modes.
+  floatingRect?: Rect;
+  // For windows transitioning out of maximize/fullscreen back to managed.
   restoreRect?: Rect;
 }
 
@@ -131,10 +132,22 @@ export function createLayoutDriver(deps: LayoutDriverDeps): LayoutDriver {
           case "minimized":
             hidden.push(w.id);
             break;
+          case "floating":
+            // Floating: the WM's stored floatingRect is the assigned
+            // outer rect. The layout plugin doesn't see floating windows.
+            // If no floatingRect is stored (shouldn't happen -- the WM
+            // captures one on the transition into 'floating'), fall
+            // back to the window's currentRect so it doesn't vanish.
+            resolvedRects.push({
+              id: w.id,
+              outer: w.floatingRect ?? w.currentRect ?? outputRect,
+            });
+            break;
           case "managed":
           default:
-            // Strip the presentation field before handing to the plugin;
-            // plugin's LayoutWindow type doesn't include it.
+            // Strip the presentation + WM-internal fields before handing
+            // to the plugin; the plugin's LayoutWindow type doesn't
+            // include them.
             managed.push({
               id: w.id,
               appId: w.appId,

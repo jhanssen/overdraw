@@ -17,7 +17,7 @@ import { rebuildStackWithPopups } from "../protocols/xdg_popup.js";
 import { FOCUS_REASONS } from "@overdraw/focus-types";
 
 const PRESENTATIONS: ReadonlyArray<Presentation> = [
-  "managed", "maximized", "fullscreen", "minimized",
+  "managed", "floating", "maximized", "fullscreen", "minimized",
 ];
 const PROPOSAL_REASONS: ReadonlyArray<ProposalReason> = [
   "client-request", "plugin", "user-input", "window-rule", "core",

@@ -404,6 +404,64 @@ pluginBus.subscribe("workspace.shown", (_n, payload) => {
     }
   }
 });
+
+// Interactive grab plumbing: the bundled core-actions plugin's
+// window.begin-move / .begin-resize / .end-grab actions emit on the bus;
+// here we apply the grab to the seat. The action handlers run in plugin
+// context which doesn't have direct seat access, so the bus is the seam.
+// Each request transitions the window to 'floating' presentation if
+// needed (the grab can only manipulate floating geometry) and then
+// installs the grab on the seat.
+pluginBus.subscribe("window.grab-requested", async (_n, payload) => {
+  if (!state || !state.seat || !state.wm) return;
+  if (!payload || typeof payload !== "object") return;
+  const p = payload as {
+    kind?: unknown; surfaceId?: unknown; edges?: unknown;
+  };
+  if (p.kind !== "move" && p.kind !== "resize") return;
+  if (typeof p.surfaceId !== "number") return;
+  const surfaceId = p.surfaceId;
+
+  // Capture the window's current outer (the start rect) BEFORE
+  // proposing the floating transition; the propose may schedule a
+  // relayout that's a no-op for floating (the rect carries over),
+  // but we want a deterministic snapshot.
+  const startOuter = state.wm.outerRectOf(surfaceId);
+  if (!startOuter) return;
+
+  const ws = state.wm.getWindowState(surfaceId);
+  if (ws && ws.presentation !== "floating") {
+    await state.wm.propose(surfaceId, { presentation: "floating" }, "user-input");
+  }
+
+  const pos = state.seat.pointerPosition();
+  if (p.kind === "move") {
+    state.seat.beginGrab({
+      kind: "move", surfaceId,
+      anchorX: pos.x, anchorY: pos.y,
+      startRect: startOuter,
+    });
+  } else {
+    const valid: ReadonlyArray<import("./protocols/ctx.js").ResizeEdges> = [
+      "top", "bottom", "left", "right",
+      "top-left", "top-right", "bottom-left", "bottom-right",
+    ];
+    const edges = (typeof p.edges === "string"
+      && (valid as readonly string[]).includes(p.edges))
+      ? (p.edges as import("./protocols/ctx.js").ResizeEdges)
+      : "bottom-right";
+    state.seat.beginGrab({
+      kind: "resize", surfaceId,
+      anchorX: pos.x, anchorY: pos.y,
+      startRect: startOuter,
+      edges,
+    });
+  }
+});
+
+pluginBus.subscribe("window.grab-end-requested", () => {
+  state?.seat?.endGrab();
+});
 const { buildResolver } = await import("./plugins/deferred-refs.js");
 const deferredRefResolver = buildResolver({
   surfaceUnderPointer: () => state?.seat?.focus?.surfaceId ?? null,

@@ -385,7 +385,7 @@ export function createPluginWindows(
 }
 
 const PRESENTATIONS: ReadonlyArray<Presentation> = [
-  "managed", "maximized", "fullscreen", "minimized",
+  "managed", "floating", "maximized", "fullscreen", "minimized",
 ];
 
 function validateProposal(p: WindowStateProposal): void {

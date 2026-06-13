@@ -38,5 +38,74 @@ export default async function init(sdk: SdkLike): Promise<void> {
       return null;
     },
   });
+
+  // Interactive move/resize/end-grab. These emit bus events; the launcher
+  // subscribes and calls into state.seat.beginGrab / endGrab. (The action
+  // handler runs in plugin context which doesn't have direct access to the
+  // seat; the bus is the integration seam.)
+  sdk.actions.register({
+    name: "window.begin-move",
+    description: "Start an interactive move grab for the given surface. " +
+      "Params: { surfaceId: number }. Typically bound on the press half " +
+      "of a hotkey with releaseAction: 'window.end-grab'.",
+    handler: async (params: unknown): Promise<null> => {
+      const surfaceId = readSurfaceId(params, "window.begin-move");
+      sdk.events.emit("window.grab-requested",
+        { kind: "move", surfaceId });
+      return null;
+    },
+  });
+
+  sdk.actions.register({
+    name: "window.begin-resize",
+    description: "Start an interactive resize grab for the given surface. " +
+      "Params: { surfaceId: number, edges?: ResizeEdges }. `edges` " +
+      "defaults to 'bottom-right'.",
+    handler: async (params: unknown): Promise<null> => {
+      const surfaceId = readSurfaceId(params, "window.begin-resize");
+      const edges = readEdges(params);
+      sdk.events.emit("window.grab-requested",
+        { kind: "resize", surfaceId, edges });
+      return null;
+    },
+  });
+
+  sdk.actions.register({
+    name: "window.end-grab",
+    description: "End any active interactive move/resize grab. Idempotent.",
+    handler: async (): Promise<null> => {
+      sdk.events.emit("window.grab-end-requested", {});
+      return null;
+    },
+  });
+
   sdk.log("core-actions registered");
+}
+
+const EDGES = [
+  "top", "bottom", "left", "right",
+  "top-left", "top-right", "bottom-left", "bottom-right",
+] as const;
+type Edges = (typeof EDGES)[number];
+
+function readSurfaceId(params: unknown, ctx: string): number {
+  if (typeof params !== "object" || params === null) {
+    throw new TypeError(`${ctx}: params must be an object`);
+  }
+  const id = (params as { surfaceId?: unknown }).surfaceId;
+  if (typeof id !== "number" || !Number.isInteger(id) || id <= 0) {
+    throw new TypeError(`${ctx}: params.surfaceId must be a positive integer`);
+  }
+  return id;
+}
+
+function readEdges(params: unknown): Edges {
+  if (typeof params !== "object" || params === null) return "bottom-right";
+  const e = (params as { edges?: unknown }).edges;
+  if (e === undefined) return "bottom-right";
+  if (typeof e !== "string" || !(EDGES as readonly string[]).includes(e)) {
+    throw new TypeError(
+      `window.begin-resize: edges must be one of ${EDGES.join("|")}`);
+  }
+  return e as Edges;
 }

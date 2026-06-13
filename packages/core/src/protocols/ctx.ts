@@ -461,6 +461,19 @@ export interface SeatState {
   drag: DragGrab | null;
   beginDrag(d: DragGrab): void;
   endDrag(): void;
+  // Interactive pointer grab (move / resize). While non-null, motion
+  // drives the grabbed window's floating rect via wm.setFloatingRect;
+  // pointer events are not forwarded to clients. Started by
+  // window.begin-move / window.begin-resize actions; ended by
+  // window.end-grab (typically from a hotkey binding's release callback).
+  grab: PointerGrab | null;
+  // Start a grab on the given window. Transitions the window to
+  // 'floating' presentation if it isn't already (captures the initial
+  // floating rect from its current outer). No-op if a grab is already
+  // active (only one grab at a time).
+  beginGrab(grab: PointerGrab): void;
+  // End any active grab. Idempotent.
+  endGrab(): void;
   // Phase 9c: cursor state (per-pointer-resource enter serials, per-client
   // cursor preference). Owned by wl_seat, accessed by wl_pointer (set_cursor
   // serial validation + client preference recording) and by wl_surface
@@ -491,6 +504,40 @@ export interface DragGrab {
   onMotion(x: number, y: number, hit: SeatFocus | null): void;
   onButton(pressed: boolean): void;
 }
+
+// Pointer-grab state: a single in-progress interactive move or resize.
+// While a grab is active, pointer motion drives the grabbed window's
+// floating rect via wm.setFloatingRect; pointer events are not forwarded
+// to clients (the user is manipulating compositor geometry, not the
+// client). Modifier / keyboard events still flow normally.
+//
+// Started via SeatState.beginGrab (typically from a window.begin-move /
+// window.begin-resize action). Ended via SeatState.endGrab (typically
+// from a hotkey binding's release callback).
+export type ResizeEdges =
+  | "top" | "bottom" | "left" | "right"
+  | "top-left" | "top-right" | "bottom-left" | "bottom-right";
+
+export interface PointerGrabMove {
+  kind: "move";
+  surfaceId: number;
+  // Pointer position at grab start.
+  anchorX: number;
+  anchorY: number;
+  // Window outer rect at grab start.
+  startRect: { x: number; y: number; width: number; height: number };
+}
+
+export interface PointerGrabResize {
+  kind: "resize";
+  surfaceId: number;
+  anchorX: number;
+  anchorY: number;
+  startRect: { x: number; y: number; width: number; height: number };
+  edges: ResizeEdges;
+}
+
+export type PointerGrab = PointerGrabMove | PointerGrabResize;
 
 export interface Ctx {
   events: EventsByInterface; // per-interface event senders (built from makeEvents)

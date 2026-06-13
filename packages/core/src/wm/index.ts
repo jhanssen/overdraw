@@ -67,6 +67,13 @@ export interface Window {
   // content signal). A window is in the layout (and configured) from addWindow,
   // but only drawn once it has content.
   hasContent?: boolean;
+  // The outer rect to use when presentation === 'floating'. Captured
+  // when the window first transitions into 'floating' (defaulting to
+  // the current outer so it stays visually in place); updated per-frame
+  // during an interactive move/resize grab; preserved across
+  // floating <-> managed transitions so a window restoring to floating
+  // appears where the user last put it.
+  floatingRect?: Rect;
   // True while the window is between get_toplevel and the initial commit.
   // While set, applyLayout assigns the rect but skips firing configure -- so
   // a client that calls set_maximized between get_toplevel and the initial
@@ -187,6 +194,17 @@ export interface Wm {
 
   // Snapshot of a window's behavioral state; null if unknown.
   getWindowState(surfaceId: number): WindowState | null;
+
+  // Set the floating rect for a window. Used by the pointer-grab path
+  // to update geometry per motion event; bypasses the proposal pipeline
+  // because per-frame interactive drags are continuous geometric
+  // updates, not policy decisions. The window must be in 'floating'
+  // presentation for the rect to take effect (otherwise the resolver
+  // ignores it -- the rect is still stored for later transitions).
+  // Triggers a relayout pass.
+  setFloatingRect(surfaceId: number, rect: Rect): void;
+  // Read a window's stored floating rect, or null if none.
+  getFloatingRect(surfaceId: number): Rect | null;
 
   // Freeform per-window state bag. setState returns true if the value
   // actually changed (so the caller can decide whether to emit a change
@@ -473,6 +491,7 @@ export function createWm(
           maxSize: w.windowState.constraints.maxSize ?? undefined,
         },
         currentRect: { ...w.outer },
+        ...(w.floatingRect ? { floatingRect: { ...w.floatingRect } } : {}),
         ...(w.windowState.restoreRect ? { restoreRect: { ...w.windowState.restoreRect } } : {}),
       }));
     return { output: { width: output.width, height: output.height }, windows: snapshotWindows };
@@ -659,6 +678,8 @@ export function createWm(
       if (!win) return null;
       const current = cloneState(win.windowState);
       let candidate = mergeProposal(current, proposal);
+      const wasFloating = current.presentation === "floating";
+      const becomingFloating = candidate.presentation === "floating";
 
       if (pluginBus) {
         const initial: WindowProposedEvent = {
@@ -675,6 +696,14 @@ export function createWm(
 
       const changed = diffState(current, candidate);
       if (changed.length === 0) return cloneState(current);
+
+      // Capture the initial floating rect when a window enters 'floating'
+      // for the first time (no prior floatingRect stored). The window
+      // stays visually in place across the transition: its current outer
+      // becomes the floating rect.
+      if (!wasFloating && becomingFloating && win.floatingRect === undefined) {
+        win.floatingRect = { ...win.outer };
+      }
 
       win.windowState = candidate;
 
@@ -699,6 +728,21 @@ export function createWm(
     getWindowState(surfaceId) {
       const win = windows.find((w) => w.surfaceId === surfaceId);
       return win ? cloneState(win.windowState) : null;
+    },
+
+    setFloatingRect(surfaceId, rect) {
+      const win = windows.find((w) => w.surfaceId === surfaceId);
+      if (!win) return;
+      win.floatingRect = { ...rect };
+      // Trigger a layout pass so the resolver picks up the new rect.
+      // Cheap: floating windows bypass the layout plugin (the resolver
+      // dispatches them in-core).
+      driver.schedule("state-changed");
+    },
+
+    getFloatingRect(surfaceId) {
+      const win = windows.find((w) => w.surfaceId === surfaceId);
+      return win?.floatingRect ? { ...win.floatingRect } : null;
     },
 
     setState(surfaceId, key, value) {

@@ -14,6 +14,7 @@ import type { WlSeatHandler } from "#protocols-gen/wl_seat.js";
 import type { WlPointerHandler } from "#protocols-gen/wl_pointer.js";
 import type { WlKeyboardHandler } from "#protocols-gen/wl_keyboard.js";
 import type { Ctx, SeatFocus } from "./ctx.js";
+import { computeGrabRect } from "../input/grab-math.js";
 import type { Resource, InputEvent } from "../types.js";
 import { KEYBOARD_EVENT } from "../events/window-bus.js";
 import { markWindowChanged } from "./window-changes.js";
@@ -252,6 +253,15 @@ export default function makeSeat(ctx: Ctx, driver: FocusDriver): SeatHandler {
     });
   }
 
+  // Apply a pointer-motion event to an active grab: compute the new
+  // floating rect from the grab's anchor + startRect + current pointer
+  // position, then push it to the WM.
+  function applyGrabMotion(g: import("./ctx.js").PointerGrab, x: number, y: number): void {
+    const ws = ctx.state.wm?.getWindowState(g.surfaceId) ?? null;
+    const rect = computeGrabRect(g, x, y, ws?.constraints ?? null);
+    ctx.state.wm?.setFloatingRect(g.surfaceId, rect);
+  }
+
   // Route one normalized input event.
   function handleInput(ev: InputEvent): void {
     const seat = ctx.state.seat;
@@ -270,6 +280,20 @@ export default function makeSeat(ctx: Ctx, driver: FocusDriver): SeatHandler {
         seat.drag.onButton(false);
       }
       // Other pointer events are swallowed during the drag.
+      return;
+    }
+
+    // Interactive pointer grab (move / resize). While active, motion
+    // drives the grabbed window's floating rect; pointer events are not
+    // forwarded to clients. Keyboard / button events still go through
+    // the normal flow below (the binding chain's release path consumes
+    // the binding's button-up + modifier-up, ending the grab via the
+    // release callback's action).
+    if (seat.grab && (ev.type === "pointerMotion" || ev.type === "pointerEnter")) {
+      lastX = ev.x ?? 0;
+      lastY = ev.y ?? 0;
+      ctx.state.compositor.setCursorPosition?.(lastX, lastY);
+      applyGrabMotion(seat.grab, lastX, lastY);
       return;
     }
 
@@ -359,6 +383,12 @@ export default function makeSeat(ctx: Ctx, driver: FocusDriver): SeatHandler {
           }
         }
         if (consumed) return;
+
+        // While a grab is active, button events are not forwarded to the
+        // client (the user is manipulating compositor geometry, not the
+        // client). The binding chain still saw the event above, so the
+        // grab's release callback gets to fire normally.
+        if (seat.grab) return;
 
         if (!seat.focus) return;
         const serial = ctx.state.serial();
@@ -483,6 +513,21 @@ export default function makeSeat(ctx: Ctx, driver: FocusDriver): SeatHandler {
       if (seat0) seat0.drag = d;
     },
     endDrag() { if (seat0) seat0.drag = null; },
+    grab: null,
+    beginGrab(g) {
+      if (!seat0 || seat0.grab) return;
+      seat0.grab = g;
+      // Release the pointer focus during the grab: motion events drive
+      // geometry, not client wl_pointer; the focused client shouldn't
+      // see a stale enter+motion sequence.
+      if (seat0.focus) { sendLeave(seat0.focus); seat0.focus = null; }
+    },
+    endGrab() {
+      if (!seat0) return;
+      seat0.grab = null;
+      // After ending the grab, the next pointer motion will land an
+      // enter on whichever surface is now under the pointer.
+    },
   };
   const seat0 = ctx.state.seat;
 

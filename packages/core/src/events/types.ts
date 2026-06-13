@@ -123,7 +123,16 @@ export type WindowStateBagChangedEvent = {
 //     specific layout plugin.
 //   - `constraints` + `parent`: protocol-defined fields from xdg_toplevel.
 //     set_min_size / set_max_size / set_parent.
-export type Presentation = "managed" | "maximized" | "fullscreen" | "minimized";
+// Per-window presentation mode. Closed set; drives core's geometry
+// resolver dispatch + the xdg_toplevel.configure states array.
+//   managed     -- layout plugin assigns the rect (tiled).
+//   floating    -- user-positioned, not in the tile flow. Rect is the
+//                  WM's per-window floatingRect store; the layout plugin
+//                  is not asked about this window.
+//   maximized   -- full tileRegion (output minus reserved zones).
+//   fullscreen  -- full output (ignores reserved zones).
+//   minimized   -- not drawn this frame.
+export type Presentation = "managed" | "floating" | "maximized" | "fullscreen" | "minimized";
 
 export type WindowState = {
   presentation: Presentation;
