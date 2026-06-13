@@ -2380,15 +2380,32 @@ sets/clears these per frame via the sink.
   far from the WM rect will get hit-tests that don't match the
   visual position.
 - **Worker test teardown flake**: `test/intercept-worker.gpu.mjs`
-  intermittently crashes in `addon.stop()`'s Dawn-wire-link
-  teardown (`Napi::CallbackScope` destructor throws when the wire
-  fires pending tracked events with "Instance no longer exists"
-  errors). The SUB-TEST passes deterministically; the crash is in
-  teardown, after assertions complete. The full `npm run test:gpu`
-  run passes 123/123 reliably; running this single file in isolation
-  flakes ~half the time. Pre-existing Dawn wire teardown limitation
-  exposed by the worker's tight per-frame loop; not specific to
-  intercept's logic.
+  intermittently crashes in `addon.stop()`'s Dawn-wire-link teardown
+  (`Napi::CallbackScope::~CallbackScope` aborts when a tracked event
+  fires its JS callback with the "instance no longer exists" status
+  during `WireClient::Disconnect()`). Reproduces ~15-20% of runs in
+  isolation; the SUB-TEST always passes (assertions land before
+  teardown). Equivalent in-thread test (`intercept-inthread.gpu.mjs`)
+  doesn't flake -- the issue is specific to cross-device Worker submits.
+  Root cause is architectural: the cross-device fence chain has
+  core-side submits whose completion depends on the worker's submits
+  finishing. When the worker is terminated mid-frame (graceful shutdown
+  via `runtime.stop()`, then `worker.terminate()` after a 2s window),
+  the GPU process has core-side submits whose fence dependencies will
+  never resolve. The matching `onSubmittedWorkDone` tracked events on
+  the core wire remain pending. The 50ms drain in `addon.cpp` Stop()
+  can't help -- no completion will ever arrive. When `WireClient::Disconnect()`
+  runs, it fires every pending tracked event with an error status; the
+  JS callbacks throw (they expected GPU success); the throw escapes
+  through `Napi::CallbackScope`'s destructor with no JS frame above to
+  catch it, and Node aborts. The proper fix is GPU-process side: when
+  a worker disconnects, find any submits on other devices whose fence
+  dependencies are now unresolvable and complete them with failure
+  (or drop their tracked events) so the core wire drains cleanly before
+  Disconnect. Verified ~15-20% repro rate, identical stack trace
+  across crashes. Increasing the drain budget (tested at 500ms) only
+  marginally improves the rate (the completions truly never arrive,
+  not just slowly).
 
 ### wlr-layer-shell (`zwlr_layer_shell_v1` / `zwlr_layer_surface_v1`)
 
