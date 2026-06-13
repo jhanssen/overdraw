@@ -274,6 +274,12 @@ export interface CompositorState {
   // wl_seat feed it; the cursor rule engine reads its snapshot per frame.
   // Absent in GPU-free harnesses that don't bring up cursor support.
   cursorKinematics?: import("../cursor/kinematics.js").Kinematics;
+  // Hook the seat invokes on interactive-grab start/end to install the
+  // appropriate XCursor theme shape ('move' for moves; 'top_left_corner'
+  // etc. for resizes). null means "restore the default cursor." Wired
+  // by main.ts; unset in GPU-free tests, where the grab runs without a
+  // shape change.
+  installGrabCursor?(shape: string | null): void;
   lastCommittedSurfaceId?: number;
   // Fire all surfaces' pending wl_surface.frame callbacks (set by installProtocols;
   // called once per compositor frame). timeMs is a millisecond timestamp.
@@ -526,6 +532,11 @@ export interface PointerGrabMove {
   anchorY: number;
   // Window outer rect at grab start.
   startRect: { x: number; y: number; width: number; height: number };
+  // When true, the seat auto-ends the grab on the next pointer-button
+  // release. Used by xdg_toplevel.move/.resize (button-driven grabs);
+  // hotkey-initiated grabs leave this false because their release is
+  // already handled by the binding chain's release callback.
+  endOnButtonUp?: boolean;
 }
 
 export interface PointerGrabResize {
@@ -535,6 +546,7 @@ export interface PointerGrabResize {
   anchorY: number;
   startRect: { x: number; y: number; width: number; height: number };
   edges: ResizeEdges;
+  endOnButtonUp?: boolean;
 }
 
 export type PointerGrab = PointerGrabMove | PointerGrabResize;

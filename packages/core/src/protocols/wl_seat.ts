@@ -253,6 +253,23 @@ export default function makeSeat(ctx: Ctx, driver: FocusDriver): SeatHandler {
     });
   }
 
+  // Map a grab to an XCursor theme shape name. Resize cursors use the
+  // X11-style corner/edge names ('top_left_corner', 'left_side', etc.)
+  // that ship in every XCursor theme.
+  function grabCursorShape(g: import("./ctx.js").PointerGrab): string {
+    if (g.kind === "move") return "move";
+    switch (g.edges) {
+      case "top": return "top_side";
+      case "bottom": return "bottom_side";
+      case "left": return "left_side";
+      case "right": return "right_side";
+      case "top-left": return "top_left_corner";
+      case "top-right": return "top_right_corner";
+      case "bottom-left": return "bottom_left_corner";
+      case "bottom-right": return "bottom_right_corner";
+    }
+  }
+
   // Apply a pointer-motion event to an active grab: compute the new
   // floating rect from the grab's anchor + startRect + current pointer
   // position, then push it to the WM.
@@ -388,7 +405,18 @@ export default function makeSeat(ctx: Ctx, driver: FocusDriver): SeatHandler {
         // client (the user is manipulating compositor geometry, not the
         // client). The binding chain still saw the event above, so the
         // grab's release callback gets to fire normally.
-        if (seat.grab) return;
+        //
+        // Protocol-initiated grabs (xdg_toplevel.move/.resize) set
+        // endOnButtonUp: the seat auto-ends the grab on the next
+        // button release. Hotkey-initiated grabs leave it false (the
+        // binding chain's release callback ends them via the
+        // window.end-grab action).
+        if (seat.grab) {
+          if (!ev.pressed && seat.grab.endOnButtonUp) {
+            seat.endGrab();
+          }
+          return;
+        }
 
         if (!seat.focus) return;
         const serial = ctx.state.serial();
@@ -521,10 +549,19 @@ export default function makeSeat(ctx: Ctx, driver: FocusDriver): SeatHandler {
       // geometry, not client wl_pointer; the focused client shouldn't
       // see a stale enter+motion sequence.
       if (seat0.focus) { sendLeave(seat0.focus); seat0.focus = null; }
+      // Install the grab cursor shape (move / resize-corner). The
+      // installGrabCursor hook is wired by main.ts to the cursor
+      // broker's resolver; absent it (GPU-free tests), this is a
+      // no-op.
+      ctx.state.installGrabCursor?.(grabCursorShape(g));
     },
     endGrab() {
       if (!seat0) return;
       seat0.grab = null;
+      // Restore the default cursor. The hook is responsible for
+      // routing this through the cursor broker's priority chain
+      // (plugin override > client cursor > setDefault > theme default).
+      ctx.state.installGrabCursor?.(null);
       // After ending the grab, the next pointer motion will land an
       // enter on whichever surface is now under the pointer.
     },

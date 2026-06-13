@@ -320,6 +320,29 @@ const cursorBroker = createCursorBroker({
 // Publish the kinematic state so wl_seat can feed it on pointer motion.
 state.cursorKinematics = cursorKinematics;
 
+// Grab-cursor hook: the seat calls this on beginGrab/endGrab to install
+// the right XCursor theme shape ('move', 'top_left_corner', etc.). On
+// grab end (shape=null), we re-apply whichever default the cursor broker
+// has set up (typically the boot 'default'). The resolver gracefully
+// returns null for unknown shapes so a missing theme entry doesn't
+// throw -- the previous cursor stays in place.
+state.installGrabCursor = (shape) => {
+  const sizePx = Number(process.env.XCURSOR_SIZE) || 24;
+  if (shape === null) {
+    // Restore the default: re-resolve the boot default. (A future
+    // refinement could replay the priority chain to honor a
+    // setDefault override; v1 just goes back to 'default'.)
+    const r = cursorResolver.resolveShape("default", sizePx, 1);
+    if (r) compositor.setCursorPixels?.(r.rgba, r.width, r.height, r.hotspotX, r.hotspotY);
+    return;
+  }
+  const r = cursorResolver.resolveShape(shape, sizePx, 1);
+  if (r) {
+    compositor.setCursorPixels?.(r.rgba, r.width, r.height, r.hotspotX, r.hotspotY);
+    compositor.setCursorVisible?.(true);
+  }
+};
+
 // Intercept (Phase 10a). Match engine + per-surface state + broker.
 // In-thread bundled plugins register through the broker directly;
 // Worker plugins register via the intercept-plugin-broker route which
