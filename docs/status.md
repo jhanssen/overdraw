@@ -4,7 +4,7 @@ Ground truth for what exists right now: current capabilities, known gaps, and
 what remains. The design lives in `architecture.md`; this file does not restate
 it. Present-tense only — no change history.
 
-Last updated: 2026-06-12 (post-wlr-foreign-toplevel-management — taskbar / dock / window-switcher protocol. Bound clients receive a handle per mapped toplevel, observe title / app_id / activation / presentation / parent changes, and route inbound state requests through wm.propose. Advertised to all clients without auth, matching the reference compositor model).
+Last updated: 2026-06-13 (post-slice-1 of phase-2 DRM/KMS work — libseat (`native/core/seat.{h,cpp}`) and `LibinputBackend` (`native/core/input_libinput.{h,cpp}`) land alongside the existing `WaylandInputBackend` as sibling input backends, selectable at runtime via `OVERDRAW_INPUT_BACKEND=libinput|wayland`. Verified on the test box: headless start with `LIBSEAT_BACKEND=seatd` produces correct `InputEvent`s from physical keyboard and trackpad. No display backend change; nested-mode (`WaylandInputBackend`) remains the default and is unchanged. Design: `docs/drm-design.md`.
 
 ## Read first: gaps in advertised protocols (silent-gap risks)
 
@@ -312,12 +312,35 @@ socket (non-blocking `MSG_DONTWAIT`; input is lossy by design). The core abstrac
 this behind a backend seam (`native/core/input.h`: `InputEvent` in OUTPUT-space
 doubles + raw evdev keycodes + ms timestamps, `InputSink`, `InputBackend`).
 `WaylandInputBackend` (`input_wayland.cpp`) reads the socket, converts
-`wl_fixed_t`, and emits `InputEvent`s; a future `LibinputBackend` implements the
-same interface. The addon drains the backend on the Node thread (`uv_poll_t`) and
-delivers to an optional `onInput` JS callback.
+`wl_fixed_t`, and emits `InputEvent`s. `LibinputBackend` (`input_libinput.cpp`)
+is the bare-metal sibling: opens `/dev/input/event*` via libseat, reads from
+libinput's pollable fd on the same libuv loop, accumulates relative pointer
+motion into output-space coordinates with bounds clamping, and emits the same
+`InputEvent`s (raw evdev keycodes, no XKB +8 offset). Selectable at startup via
+`OVERDRAW_INPUT_BACKEND=libinput|wayland` (default `wayland`); libinput requires
+the build option `OVERDRAW_KMS=ON` (default ON on Linux). The addon drains the
+backend on the Node thread (`uv_poll_t`) and delivers to an optional `onInput`
+JS callback.
 
-Limitations: coordinate mapping is identity (output size == host window size, scale
-1); touch not forwarded; no keymap translation at this layer (raw evdev codes).
+Seat acquisition (`native/core/seat.{h,cpp}`) wraps libseat. libseat picks its
+backend (logind or seatd) per `LIBSEAT_BACKEND`. For headless / SSH dev where
+the SSH session is not attached to a seat, seatd (`apt install seatd`, user in
+`video`) is the working path; logind requires an active console session on
+`seat0`. The seat's poll fd is on libuv; libseat dispatches enable/disable
+events through it (slice-1 callbacks are no-ops — VT-switch handling lands in
+the KMS slice). Devices opened through the seat are released via
+`closeDevice(deviceId)` + a separate `close(fd)`; `LibinputBackend` does this
+in its libinput `close_restricted` trampoline.
+
+Limitations: coordinate mapping is identity (output size == host window size,
+scale 1); touch not forwarded; no keymap translation at this layer (raw evdev
+codes). The libinput backend has no per-backend unit test in this slice — the
+conversion layer (libinput event → `InputEvent`) is verified end-to-end on the
+test box (real device → libinput → `LibinputBackend` → JS `onInput`), not in
+isolation. Full coverage arrives with the KMS slice (slice 6 of
+`drm-design.md`) when libinput drives a real client end-to-end. The libinput
+backend also ignores hotplug device add/remove (the events arrive but are not
+surfaced upward); v1 is laptop-internal devices only.
 
 ### Routing to clients (`wl_seat`/`wl_pointer`/`wl_keyboard`)
 

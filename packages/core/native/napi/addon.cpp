@@ -20,6 +20,10 @@
 #include "core/gpu_process.h"
 #include "core/input.h"
 #include "core/input_wayland.h"
+#if OVERDRAW_KMS
+#include "core/seat.h"
+#include "core/input_libinput.h"
+#endif
 #include "input_channel.h"
 #include "core/shm.h"
 #include "wayland/server.h"
@@ -52,7 +56,18 @@ struct Addon {
     std::unique_ptr<Server> server;
     std::unique_ptr<InterfaceRegistry> registry;
     std::unique_ptr<Trampoline> trampoline;
-    std::unique_ptr<WaylandInputBackend> input;
+    // The active input backend. Today either a WaylandInputBackend (nested,
+    // input forwarded from the GPU process) or a LibinputBackend (bare metal,
+    // reads /dev/input/* via libseat). Exactly one is active per Start(). The
+    // wayland pointer is kept separately for the injectHostInput test seam,
+    // which only applies to the nested path.
+    std::unique_ptr<overdraw::core::InputBackend> input;
+    WaylandInputBackend* waylandInput = nullptr;  // non-owning; points into `input` when active
+#if OVERDRAW_KMS
+    std::unique_ptr<overdraw::core::Seat> seat;
+    uv_poll_t seatPoll{};
+    bool seatPollActive = false;
+#endif
     std::unique_ptr<Keymap> keymap;  // xkbcommon keymap + modifier state
     ShmRegistry shm;  // wl_shm pool mappings (CPU-side, independent of the loop)
     uv_poll_t wirePoll{};
@@ -387,6 +402,13 @@ void onInputReadable(uv_poll_t*, int status, int) {
     g_addon.input->drain();
 }
 
+#if OVERDRAW_KMS
+void onSeatReadable(uv_poll_t*, int status, int) {
+    if (status < 0 || !g_addon.seat) return;
+    g_addon.seat->dispatch();
+}
+#endif
+
 // Resolve `cb` with `result` (or null) and release the ref. Same Node thread.
 void invokePluginCb(napi_env env, napi_ref cbRef, napi_value result) {
     napi_value cb, undefined;
@@ -513,11 +535,11 @@ napi_value Start(napi_env env, napi_callback_info info) {
     g_addon.compositor =
         std::make_unique<Compositor>(gpu.wireFd, gpu.ctrlFd, gpu.pid, headless, hw, hh);
     if (!g_addon.compositor->bringUp()) {
-        const char* e = g_addon.compositor->error().c_str();
-        // Compositor dtor reaps the GPU process.
+        // Copy the error string out of the compositor BEFORE the dtor frees it.
+        const std::string err = g_addon.compositor->error();
         g_addon.compositor.reset();
         if (g_addon.inputFd >= 0) { ::close(g_addon.inputFd); g_addon.inputFd = -1; }
-        return throwError(env, e);
+        return throwError(env, err.c_str());
     }
 
     uv_loop_t* loop = nullptr;
@@ -531,13 +553,79 @@ napi_value Start(napi_env env, napi_callback_info info) {
     uv_poll_init(loop, &g_addon.ctrlPoll, g_addon.compositor->ctrlFd());
     uv_poll_start(&g_addon.ctrlPoll, UV_READABLE, onCtrlReadable);
 
-    // Input backend: maps host-forwarded events to normalized events. Output
-    // logical size == host window size in phase 1 (scale 1).
-    if (g_addon.inputFd >= 0) {
-        g_addon.input = std::make_unique<WaylandInputBackend>(
+    // Input backend selection. Default: WaylandInputBackend (events forwarded
+    // from the GPU process's host wl_seat). OVERDRAW_INPUT_BACKEND=libinput
+    // selects the bare-metal path (libseat + libinput on /dev/input/*); this
+    // requires OVERDRAW_KMS=ON at build and a working logind session at run.
+    // The seat itself is unused for display in slice 1 -- the existing nested
+    // output path stays in place. Slices 4-7 will reuse this seat for DRM.
+    const char* inputBackendEnv = ::getenv("OVERDRAW_INPUT_BACKEND");
+    const bool wantLibinput = inputBackendEnv && std::strcmp(inputBackendEnv, "libinput") == 0;
+
+    if (wantLibinput) {
+#if OVERDRAW_KMS
+        g_addon.seat = std::make_unique<overdraw::core::Seat>();
+        // Slice 1: no VT-switch handling yet. The callbacks just track state;
+        // slice 7 wires the GPU-process pause/resume side-channel messages.
+        if (!g_addon.seat->open(/*onEnable*/ nullptr, /*onDisable*/ nullptr)) {
+            const std::string err = "libseat open failed: " + g_addon.seat->error();
+            g_addon.seat.reset();
+            g_addon.compositor.reset();
+            if (g_addon.inputFd >= 0) { ::close(g_addon.inputFd); g_addon.inputFd = -1; }
+            return throwError(env, err.c_str());
+        }
+        // libseat needs its event fd dispatched on libuv. Synchronously poll
+        // once so the initial enable_seat fires before we open devices.
+        g_addon.seat->dispatch();
+        if (!g_addon.seat->isActive()) {
+            const std::string err = "libseat opened but seat not active (logind session?)";
+            g_addon.seat.reset();
+            g_addon.compositor.reset();
+            if (g_addon.inputFd >= 0) { ::close(g_addon.inputFd); g_addon.inputFd = -1; }
+            return throwError(env, err.c_str());
+        }
+        const std::string seatName = g_addon.seat->name();
+        auto libiBackend = std::make_unique<overdraw::core::LibinputBackend>(
+            *g_addon.seat, seatName,
+            g_addon.compositor->windowWidth(),
+            g_addon.compositor->windowHeight());
+        if (!libiBackend->init()) {
+            const std::string err = "libinput init failed: " + libiBackend->error();
+            g_addon.seat.reset();
+            g_addon.compositor.reset();
+            if (g_addon.inputFd >= 0) { ::close(g_addon.inputFd); g_addon.inputFd = -1; }
+            return throwError(env, err.c_str());
+        }
+        const int liFd = libiBackend->pollFd();
+        libiBackend->start(&g_inputSink);
+        g_addon.input = std::move(libiBackend);
+        uv_poll_init(loop, &g_addon.inputPoll, liFd);
+        uv_poll_start(&g_addon.inputPoll, UV_READABLE, onInputReadable);
+
+        const int seatFd = g_addon.seat->pollFd();
+        if (seatFd >= 0) {
+            uv_poll_init(loop, &g_addon.seatPoll, seatFd);
+            uv_poll_start(&g_addon.seatPoll, UV_READABLE, onSeatReadable);
+            g_addon.seatPollActive = true;
+        }
+
+        // The input socket forwarded from the GPU process is unused on the
+        // libinput path; close it so it doesn't accumulate.
+        if (g_addon.inputFd >= 0) { ::close(g_addon.inputFd); g_addon.inputFd = -1; }
+#else
+        g_addon.compositor.reset();
+        if (g_addon.inputFd >= 0) { ::close(g_addon.inputFd); g_addon.inputFd = -1; }
+        return throwError(env, "OVERDRAW_INPUT_BACKEND=libinput but build has OVERDRAW_KMS=OFF");
+#endif
+    } else if (g_addon.inputFd >= 0) {
+        // Nested input backend: maps host-forwarded events to normalized
+        // events. Output logical size == host window size in phase 1 (scale 1).
+        auto wlBackend = std::make_unique<WaylandInputBackend>(
             g_addon.inputFd, g_addon.compositor->windowWidth(),
             g_addon.compositor->windowHeight());
-        g_addon.input->start(&g_inputSink);
+        g_addon.waylandInput = wlBackend.get();
+        wlBackend->start(&g_inputSink);
+        g_addon.input = std::move(wlBackend);
         uv_poll_init(loop, &g_addon.inputPoll, g_addon.inputFd);
         uv_poll_start(&g_addon.inputPoll, UV_READABLE, onInputReadable);
     }
@@ -959,6 +1047,13 @@ napi_value Stop(napi_env env, napi_callback_info) {
             uv_poll_stop(&g_addon.inputPoll);
             uv_close(reinterpret_cast<uv_handle_t*>(&g_addon.inputPoll), nullptr);
         }
+#if OVERDRAW_KMS
+        if (g_addon.seatPollActive) {
+            uv_poll_stop(&g_addon.seatPoll);
+            uv_close(reinterpret_cast<uv_handle_t*>(&g_addon.seatPoll), nullptr);
+            g_addon.seatPollActive = false;
+        }
+#endif
         g_addon.loopRunning = false;
     }
     // Reject any still-pending plugin broker requests.
@@ -971,7 +1066,16 @@ napi_value Stop(napi_env env, napi_callback_info) {
     if (g_addon.input) {
         g_addon.input->stop();
         g_addon.input.reset();
+        g_addon.waylandInput = nullptr;
     }
+#if OVERDRAW_KMS
+    // Seat closes after libinput so libinput's close_restricted can release
+    // device ids through it.
+    if (g_addon.seat) {
+        g_addon.seat->close();
+        g_addon.seat.reset();
+    }
+#endif
     if (g_addon.inputFd >= 0) { ::close(g_addon.inputFd); g_addon.inputFd = -1; }
     if (g_addon.compositor) {
         // Drain the wire briefly so any in-flight GPU completion callbacks (e.g.
@@ -1399,7 +1503,7 @@ napi_value InjectHostInput(napi_env env, napi_callback_info info) {
     size_t argc = 1; napi_value argv[1];
     napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
     if (argc < 1) return throwError(env, "injectHostInput(event) requires an event object");
-    if (!g_addon.input) { napi_value f; napi_get_boolean(env, false, &f); return f; }
+    if (!g_addon.waylandInput) { napi_value f; napi_get_boolean(env, false, &f); return f; }
 
     std::string type = getStr(env, argv[0], "type");
     overdraw::ipc::InputMessage m{};
@@ -1452,7 +1556,7 @@ napi_value InjectHostInput(napi_env env, napi_callback_info info) {
         return throwError(env, "injectHostInput: unknown event.type");
     }
 
-    g_addon.input->injectMessage(m);
+    g_addon.waylandInput->injectMessage(m);
     napi_value t; napi_get_boolean(env, true, &t);
     return t;
 }

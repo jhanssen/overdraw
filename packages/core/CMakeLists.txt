@@ -20,6 +20,17 @@ pkg_check_modules(GBM REQUIRED gbm)
 pkg_check_modules(LIBDRM REQUIRED libdrm)
 pkg_check_modules(XKBCOMMON REQUIRED xkbcommon)
 
+# Phase-2 (DRM/KMS/libinput) deps. ON by default on Linux; the build still
+# produces a working phase-1 nested compositor when OFF (no behavior change).
+# When ON, the core's LibinputBackend + Seat are compiled in; the KMS output
+# backend will land in a later slice.
+option(OVERDRAW_KMS "Build phase-2 DRM/KMS/libinput/libseat support" ON)
+if(OVERDRAW_KMS)
+    pkg_check_modules(LIBINPUT REQUIRED libinput)
+    pkg_check_modules(LIBSEAT  REQUIRED libseat)
+    pkg_check_modules(LIBUDEV  REQUIRED libudev)
+endif()
+
 # Dawn is built -fno-rtti; match it to avoid typeinfo mismatches.
 add_compile_options($<$<COMPILE_LANGUAGE:CXX>:-fno-rtti>)
 
@@ -77,17 +88,30 @@ set_target_properties(overdraw_wire PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
 # Compiled once and linked by the addon (and any future native consumer), so
 # core logic is not duplicated.
-add_library(overdraw_core STATIC
+set(OVERDRAW_CORE_SOURCES
     native/core/gpu_process.cpp
     native/core/compositor.cpp
     native/core/input_wayland.cpp
     native/core/shm.cpp
     native/wayland/server.cpp
     native/wayland/interface_registry.cpp)
+if(OVERDRAW_KMS)
+    list(APPEND OVERDRAW_CORE_SOURCES
+        native/core/seat.cpp
+        native/core/input_libinput.cpp)
+endif()
+add_library(overdraw_core STATIC ${OVERDRAW_CORE_SOURCES})
 target_include_directories(overdraw_core PUBLIC
     ${IPC_INCLUDE} ${NATIVE_INCLUDE} ${NODE_INCLUDE_DIR} ${WAYLAND_SERVER_INCLUDE_DIRS})
 target_link_libraries(overdraw_core PUBLIC
     overdraw_wire dawn::webgpu_dawn_wire ${WAYLAND_SERVER_LIBRARIES} pthread dl rt)
+if(OVERDRAW_KMS)
+    target_include_directories(overdraw_core PUBLIC
+        ${LIBINPUT_INCLUDE_DIRS} ${LIBSEAT_INCLUDE_DIRS} ${LIBUDEV_INCLUDE_DIRS})
+    target_link_libraries(overdraw_core PUBLIC
+        ${LIBINPUT_LIBRARIES} ${LIBSEAT_LIBRARIES} ${LIBUDEV_LIBRARIES})
+    target_compile_definitions(overdraw_core PUBLIC OVERDRAW_KMS=1)
+endif()
 set_target_properties(overdraw_core PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
 # ---- Plugin Worker N-API addon (loaded inside plugin Worker isolates) ----
