@@ -54,15 +54,17 @@ export default function makeXdgSurface(ctx: Ctx): XdgSurfaceHandler {
       if (xs.surface) xs.surface.role = "xdg_toplevel";
 
       // Proactive tiling: insert the window into the layout NOW (before it has
-      // content) so the WM assigns its tile and configures it to the tiled content
-      // size. addWindow drives the ConfigureSink, which calls configureToplevel for
-      // this window (and reconfigures any existing windows whose tiles changed).
+      // content) so the WM assigns its tile. The FIRST configure is held
+      // until the client's initial commit (wl_surface.commit with no buffer),
+      // detected in wl_surface.ts -- this lets a client send set_maximized /
+      // set_min_size between get_toplevel and the initial commit, and the
+      // single first configure carries the resolved size + states array.
       const surfaceId = xs.surface?.id;
       if (surfaceId !== undefined && xs.surface && ctx.state.wm) {
         // The WM's SurfaceHandle must carry the wl_surface record (its .resource is
         // the wl_surface, used for subsurface child lookup in emitSubtree and for
         // input/client-id routing), NOT the xdg_toplevel resource.
-        ctx.state.wm.addWindow(surfaceId, xs.surface);
+        ctx.state.wm.addWindow(surfaceId, xs.surface, { deferInitialCommit: true });
       } else {
         // No WM (e.g. bare protocol unit tests): fall back to the 0x0 handshake so
         // the client still completes its initial configure/ack.

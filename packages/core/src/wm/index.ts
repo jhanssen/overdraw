@@ -27,6 +27,7 @@ import type {
   ProposalReason,
   WindowProposedEvent,
   WindowCommittedEvent,
+  WindowPreconfigureEvent,
 } from "../events/types.js";
 
 export interface Rect { x: number; y: number; width: number; height: number; }
@@ -66,6 +67,15 @@ export interface Window {
   // content signal). A window is in the layout (and configured) from addWindow,
   // but only drawn once it has content.
   hasContent?: boolean;
+  // True while the window is between get_toplevel and the initial commit.
+  // While set, applyLayout assigns the rect but skips firing configure -- so
+  // a client that calls set_maximized between get_toplevel and the initial
+  // commit gets a SINGLE first configure carrying the final state + dims.
+  // markInitialCommitComplete() clears the flag, emits window.proposed (with
+  // initialState reflecting the accumulated client-declared state), commits
+  // any modifications, and forces a configure with the resolved size.
+  // Default false; production opts in via addWindow(..., {deferInitialCommit:true}).
+  pendingInitialCommit?: boolean;
   // Behavioral state (presentation, layoutMode, layoutData, constraints,
   // parent, restoreRect). Mutated only through propose().
   windowState: WindowState;
@@ -122,9 +132,33 @@ export interface Wm {
   state: WmState;
   // Proactive: called at get_toplevel (role assignment), BEFORE the client has
   // content. Inserts the window into the layout (as the new master) and
-  // SCHEDULES a layout pass. Idempotent for an already-added surface. The
+  // schedules a layout pass. Idempotent for an already-added surface. The
   // returned rect is the placeholder sentinel until layout has settled.
-  addWindow(surfaceId: number, surfaceRec: SurfaceHandle): Rect;
+  //
+  // opts.deferInitialCommit (default false): hold the first configure until
+  // markInitialCommitComplete() is called. The layout pass still runs and
+  // the rect is assigned, but configure() is suppressed so client-declared
+  // state arriving between get_toplevel and the initial commit can fold
+  // into a single first configure. Tests calling addWindow directly omit
+  // this; the production xdg_surface.get_toplevel handler opts in.
+  addWindow(
+    surfaceId: number,
+    surfaceRec: SurfaceHandle,
+    opts?: { deferInitialCommit?: boolean },
+  ): Rect;
+  // Mark the initial-commit phase complete for a deferred window: emit
+  // window.proposed with the accumulated state as the candidate so a
+  // window-rules plugin can intercept, commit any modifications, and force
+  // a configure with the resolved content size. No-op when the window
+  // doesn't exist or wasn't in the deferred-commit phase.
+  //
+  // Carries appId + title in the emitted event so window-rules plugins can
+  // dispatch off them. The caller (wl_surface.commit when it detects an
+  // initial commit) supplies them.
+  markInitialCommitComplete(
+    surfaceId: number,
+    info: { appId: string | null; title: string | null },
+  ): Promise<void>;
   windowHasContent(surfaceId: number): Rect | undefined;
   unmapWindow(surfaceId: number): void;
   settled(): Promise<void>;
@@ -403,7 +437,12 @@ export function createWm(
       if (win.hasContent) {
         compositor.setSurfaceLayout(win.surfaceId, content.x, content.y, content.width, content.height);
       }
-      if (configure && (content.width !== prevContent.width || content.height !== prevContent.height)) {
+      // Suppress configure while in the deferred-initial-commit phase: the
+      // client hasn't yet sent its initial commit, so any configure we
+      // emit now would be redundant (the markInitialCommitComplete path
+      // sends the first configure with the final accumulated state).
+      if (configure && !win.pendingInitialCommit
+          && (content.width !== prevContent.width || content.height !== prevContent.height)) {
         configure(win.surfaceId, content.width, content.height);
       }
       const outerMoved = prevOuter.x !== win.outer.x || prevOuter.y !== win.outer.y
@@ -447,7 +486,7 @@ export function createWm(
   return {
     state: wm,
 
-    addWindow(surfaceId, surfaceRec) {
+    addWindow(surfaceId, surfaceRec, opts) {
       const existing = windows.find((w) => w.surfaceId === surfaceId);
       if (existing) return contentOf(existing);
       const win: Window = {
@@ -458,9 +497,73 @@ export function createWm(
         windowState: defaultWindowState(),
         state: new Map<string, unknown>(),
       };
+      if (opts?.deferInitialCommit) win.pendingInitialCommit = true;
       windows.unshift(win);
       driver.schedule("mapped");
       return win.rect;
+    },
+
+    async markInitialCommitComplete(surfaceId, info) {
+      const win = windows.find((w) => w.surfaceId === surfaceId);
+      if (!win || !win.pendingInitialCommit) return;
+
+      // Emit window.preconfigure with the accumulated state as initialState.
+      // A window-rules plugin's interceptor may return a modified payload;
+      // we use the returned initialState as the candidate. Reverting fields
+      // back to current = no change (same as propose's veto pattern).
+      let finalState: WindowState = cloneState(win.windowState);
+      if (pluginBus) {
+        const initial: WindowPreconfigureEvent = {
+          surfaceId,
+          appId: info.appId, title: info.title,
+          initialState: cloneState(win.windowState),
+        };
+        const finalPayload = await pluginBus.emit(WINDOW_EVENT.preconfigure, initial,
+          { timeoutMs: INTERCEPTOR_TIMEOUT_MS });
+        if (!windows.includes(win)) return; // unmapped during await
+        const ev = finalPayload as WindowPreconfigureEvent | undefined;
+        const modified = ev ? validateState(ev.initialState) : null;
+        if (modified) finalState = cloneState(modified);
+      }
+
+      // Diff vs. current; commit changes through the standard path so
+      // window.committed fires for any field that was modified by an
+      // interceptor.
+      const previous = cloneState(win.windowState);
+      const changed = diffState(previous, finalState);
+      if (changed.length > 0) {
+        win.windowState = finalState;
+        if (pluginBus) {
+          const ev: WindowCommittedEvent = {
+            surfaceId, reason: "window-rule",
+            previous,
+            current: cloneState(finalState),
+            changed: [...changed],
+          };
+          pluginBus.emit(WINDOW_EVENT.committed, ev);
+        }
+      }
+
+      // Clear the flag BEFORE scheduling so the configure suppression
+      // in applyLayout doesn't fire for the post-rule pass.
+      win.pendingInitialCommit = false;
+
+      // If state changed geometry-relevant fields, schedule a fresh layout
+      // pass and wait for it; otherwise the existing rect from addWindow's
+      // initial pass already reflects the right geometry.
+      if (changed.some((f) => GEOMETRY_FIELDS.includes(f))) {
+        driver.schedule("state-changed");
+        await driver.settled();
+      }
+
+      // Force the initial configure. applyLayout normally only fires
+      // configure when content size changed, but the first configure must
+      // ALWAYS go out so the client has a serial to ack -- otherwise the
+      // first wl_buffer.attach never lands.
+      if (configure) {
+        const content = contentOf(win);
+        configure(win.surfaceId, content.width, content.height);
+      }
     },
 
     windowHasContent(surfaceId) {

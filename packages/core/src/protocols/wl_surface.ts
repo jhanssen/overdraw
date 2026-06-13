@@ -167,6 +167,27 @@ export default function makeSurface(ctx: Ctx): WlSurfaceHandler {
 
       if (s.xdgSurface) s.xdgSurface.lastCommitSerial = ctx.state.nextSerial - 1;
 
+      // Initial-commit detection (xdg-shell): the first commit on a
+      // toplevel-roled surface whose xdg_surface has not yet sent any
+      // configure. Per spec the client commits the xdg_surface with no
+      // buffer to signal "ready for configure"; the server then sends the
+      // first configure carrying the accumulated client-declared state
+      // (set_maximized / set_min_size / etc. that may have arrived after
+      // get_toplevel). We trigger markInitialCommitComplete which emits
+      // window.preconfigure (interceptable by window-rules plugins) and
+      // forces the first configure with the resolved size.
+      //
+      // Fire-and-forget: the configure sink may take a microtask hop.
+      // The client is expected to wait for the configure before attaching
+      // a buffer (the ack_configure handshake).
+      const xs = s.xdgSurface;
+      if (xs?.toplevel && xs.lastConfigureSerial === undefined) {
+        const t = ctx.state.toplevels?.get(xs.toplevel);
+        const appId = t?.appId ?? null;
+        const title = t?.title ?? null;
+        void ctx.state.wm?.markInitialCommitComplete(s.id, { appId, title });
+      }
+
       // Phase 9c: if this surface has the "cursor" role and is the
       // current pointer focus's active cursor surface, re-apply the
       // cursor slot so the just-uploaded texture is picked up by the

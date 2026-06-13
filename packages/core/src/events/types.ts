@@ -35,6 +35,15 @@ export const WINDOW_EVENT = {
   // Post-commit observe-only event: a window's behavioral state was just
   // committed. Carries previous + current + which fields changed.
   committed: "window.committed",
+  // Pre-action interceptable event fired at the initial commit (after
+  // get_toplevel + any client-declared set_maximized/set_min_size/etc.
+  // requests, before the first xdg_toplevel.configure goes out). Carries
+  // the accumulated client-declared `initialState` so a window-rules
+  // plugin can override it. After interceptors resolve, the final state
+  // is committed and the configure goes out. Subscribers that want to
+  // observe "the window now exists" without intercepting should use
+  // window.map (fires at first content).
+  preconfigure: "window.preconfigure",
   // Pre-action lifecycle event: the WM is about to change a window's outer
   // tile. Fired BEFORE the compositor receives the new rect or xdg_toplevel
   // sees the configure. Await-capable: an interceptor may modify the new
@@ -166,6 +175,21 @@ export type WindowCommittedEvent = {
   previous: WindowState;
   current: WindowState;
   changed: ReadonlyArray<keyof WindowState>;
+};
+
+// Pre-action interceptable event fired at the initial commit. `initialState`
+// is the accumulated client-declared state at the moment the client commits
+// its xdg_surface for the first time. Interceptors may modify it (return
+// the payload with a different `initialState`); the final value is what the
+// WM commits and what the first xdg_toplevel.configure reflects.
+//
+// `appId` and `title` may be null (the client may not have set them yet);
+// later changes arrive via window.change.
+export type WindowPreconfigureEvent = {
+  surfaceId: number;
+  appId: string | null;
+  title: string | null;
+  initialState: WindowState;
 };
 
 // Emitted before the WM mutates a mapped toplevel's outer tile. `oldOuter` is
