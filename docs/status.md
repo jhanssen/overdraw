@@ -4,7 +4,7 @@ Ground truth for what exists right now: current capabilities, known gaps, and
 what remains. The design lives in `architecture.md`; this file does not restate
 it. Present-tense only — no change history.
 
-Last updated: 2026-06-12 (post-xdg-output — state.outputs registry + zxdg_output_manager_v1 side-channel on wl_output reporting logical_position / logical_size / name / description. Single OUTPUT_DEFAULT entry; the map is the seam multi-output reconfiguration plugs into later).
+Last updated: 2026-06-12 (post-wlr-foreign-toplevel-management — taskbar / dock / window-switcher protocol. Bound clients receive a handle per mapped toplevel, observe title / app_id / activation / presentation / parent changes, and route inbound state requests through wm.propose. Advertised to all clients without auth, matching the reference compositor model).
 
 ## Read first: gaps in advertised protocols (silent-gap risks)
 
@@ -2617,6 +2617,87 @@ interfaces), `test/xdg-output.test.js` (4 unit tests). Type:
 `OutputRecord` in `packages/core/src/protocols/ctx.ts`; state field
 `CompositorState.outputs`.
 
+### wlr-foreign-toplevel-management (`zwlr_foreign_toplevel_manager_v1` / `zwlr_foreign_toplevel_handle_v1`)
+
+Lets a client observe every mapped toplevel and request state changes on
+them. The data backbone for taskbars (waybar's `wlr/taskbar` module),
+docks, and window switchers. Advertised at protocol version 3.
+
+**Security model**: every client that binds the global gets the full
+toplevel list. No per-client auth check; same model as the reference
+compositors -- sandbox / portal layers handle isolation, not the
+compositor. A toggle to disable advertising the manager is not built;
+the implicit assumption is the user trusts everything in their session.
+
+**Per-manager bookkeeping**: each bound manager resource holds its own
+per-toplevel handle resource. Map size = (#managers) × (#mapped
+toplevels). On bind, the handler emits `toplevel` + the initial property
+burst (app_id, title, state array, done) for every currently-mapped
+toplevel (the catch-up). New mappings emit on every bound manager via
+the typed bus.
+
+**Emission sources**:
+
+- `window.map` (typed bus) -> emit `toplevel` + initial burst on every
+  bound manager. layer-shell window.map's (role: 'layer-shell') are
+  filtered out -- only toplevels go through this protocol.
+- `window.unmap` (typed bus) -> emit `closed` on every manager's
+  matching handle; drop the per-manager mapping. The handle resource
+  stays alive (spec: "becomes inert") until the client destroys it.
+- `window.change` (typed bus, coalesced per frame) -> re-emit
+  `title` / `app_id` / `state` (when `activated` flipped) followed by
+  `done`.
+- `window.committed` (plugin bus) -> re-emit `state` (when
+  `presentation` changed) and/or `parent` (when the parent slot
+  changed) followed by `done`. The parent event's argument resolves to
+  the new parent's handle on the SAME manager; on a different manager
+  the same surfaceId resolves to that manager's own handle.
+
+**Inbound requests**:
+
+- `set_maximized` / `unset_maximized` / `set_minimized` /
+  `unset_minimized` / `set_fullscreen(wl_output | null)` /
+  `unset_fullscreen`: route through `wm.propose(surfaceId, {
+  presentation: ... }, "plugin")`. The proposal goes through the
+  intercept chain (so a focus plugin / window-rules plugin can veto)
+  and committed; the resulting `window.committed` emit re-flows back
+  into the handle as a state array. `set_fullscreen`'s `output` arg
+  is currently ignored (single-output; see "Read first").
+- `activate(wl_seat)`: bypasses the focus driver and calls
+  `seat.applyKeyboardFocus(surfaceId)` directly. The reasoning: a
+  foreign-toplevel client is a window switcher / taskbar / dock; its
+  selection is explicit user intent. Policy plugins shouldn't
+  second-guess.
+- `close`: emits `xdg_toplevel.close` on the target's xdg_toplevel
+  resource. The client decides whether to honor (typically yes;
+  sometimes with a "save your work" prompt). No force-kill.
+- `set_rectangle(wl_surface, x, y, w, h)`: minimize-to-icon animation
+  hint. Accepted; no minimize animation is wired today so the
+  rectangle is recorded only at the wire layer.
+- `destroy`: drops the per-manager bookkeeping. The window may still
+  be mapped; this just means this client is done with the handle.
+
+**Stop request**: `manager.stop` emits `finished` and marks the manager
+inactive. Subsequent events suppress; the client is expected to destroy
+the resource.
+
+**Limitations / known gaps**:
+
+- **`output_enter` / `output_leave` not emitted.** Single-output today
+  (`OUTPUT_DEFAULT` only). When multi-output reconfiguration lands, a
+  per-client wl_output resource accessor is needed to find the bound
+  resources for a given client + output before this can fire. Most
+  consumers (waybar's taskbar in single-output configurations) don't
+  depend on it.
+- **No GPU end-to-end test.** The harness has no foreign-toplevel C
+  client. Unit coverage on the wire shape is comprehensive (17 tests);
+  a real waybar against overdraw is the integration check. Worth
+  adding a dedicated C client when a behavioral regression surfaces.
+
+**Files**: `packages/core/src/protocols/zwlr_foreign_toplevel_manager_v1.ts`
+(both interfaces, ~310 lines), `test/foreign-toplevel.test.js`
+(17 unit tests). XML vendored at `packages/core/protocols/wlr-foreign-toplevel-management-unstable-v1.xml`.
+
 ### Decoration provider (registration + insets + drawing + atomic gating)
 
 Server-side decorations end to end: a plugin registers an app_id pattern, is told
@@ -2783,7 +2864,11 @@ per-surface render state primitives (`compositor-fx.gpu.mjs`).
   decorations come from the per-app_id broker),
   `zxdg_output_manager_v1`/`zxdg_output_v1` (logical_position +
   logical_size + name + description + done burst on bind; sourced from
-  state.outputs which has one OUTPUT_DEFAULT entry today).
+  state.outputs which has one OUTPUT_DEFAULT entry today),
+  `zwlr_foreign_toplevel_manager_v1`/`zwlr_foreign_toplevel_handle_v1`
+  (taskbar protocol; window list + state observation + inbound state
+  requests routed through wm.propose; unit-tested wire shape, no GPU
+  test client today).
 - **Implemented, not behaviorally tested**: `wl_region` (no-op stub);
   `zwp_linux_dmabuf_feedback_v1` (exercised by real WSI clients, no automated
   assertion).

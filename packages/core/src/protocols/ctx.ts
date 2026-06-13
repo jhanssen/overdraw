@@ -424,6 +424,11 @@ export interface CompositorState {
   // fabricated single output. The map is the integration seam DRM/KMS
   // plugs into later.
   outputs?: Map<number, OutputRecord>;
+  // The plugin-visible dynamic bus (carries window.committed / window.proposed
+  // / window.relayout / arbitrary plugin events). Stored on state so handlers
+  // outside installProtocols (e.g. foreign-toplevel-manager) can subscribe.
+  // Absent in GPU-free harnesses that don't pass a pluginBus.
+  pluginBus?: import("../events/dynamic-bus.js").DynamicBus;
   // Per-layer ordered surface ids contributed by the overlay broker. Set
   // by the broker when it's constructed (main.ts wires this); read by
   // layer-stack.ts's rebuild to merge with layer-shell surfaces before

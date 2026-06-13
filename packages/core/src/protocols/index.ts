@@ -55,6 +55,7 @@ const GLOBALS = [
   "zwlr_layer_shell_v1",
   "zxdg_decoration_manager_v1",
   "zxdg_output_manager_v1",
+  "zwlr_foreign_toplevel_manager_v1",
 ];
 
 // Interfaces created via requests (new_id), registered without a global so
@@ -70,6 +71,7 @@ const CHILD_INTERFACES = [
   "zwlr_layer_surface_v1",
   "zxdg_toplevel_decoration_v1",
   "zxdg_output_v1",
+  "zwlr_foreign_toplevel_handle_v1",
 ];
 
 // Load all generated signature modules, keyed by interface name.
@@ -144,6 +146,7 @@ export async function installProtocols(
     serial() { return this.nextSerial++; },
   };
   if (opts.bus) state.bus = opts.bus;
+  if (opts.pluginBus) state.pluginBus = opts.pluginBus;
   if (opts.reservedZones) state.reservedZones = opts.reservedZones;
   // Single fabricated output. Multi-output reconfiguration replaces this
   // map's contents (see status.md "Read first"); xdg-output + wl_output
@@ -432,6 +435,7 @@ export async function installProtocols(
     zwlr_layer_shell_v1: await import("./zwlr_layer_shell_v1.js"),
     zxdg_decoration_manager_v1: await import("./zxdg_decoration_manager_v1.js"),
     zxdg_output_manager_v1: await import("./zxdg_output_manager_v1.js"),
+    zwlr_foreign_toplevel_manager_v1: await import("./zwlr_foreign_toplevel_manager_v1.js"),
   };
 
   // Some child interfaces have handlers from a sibling module's named exports.
@@ -443,6 +447,7 @@ export async function installProtocols(
   const layerShellMod = await import("./zwlr_layer_shell_v1.js");
   const decorationMod = await import("./zxdg_decoration_manager_v1.js");
   const xdgOutputMod = await import("./zxdg_output_manager_v1.js");
+  const foreignTopMod = await import("./zwlr_foreign_toplevel_manager_v1.js");
   const childHandlers: Record<string, object> = {
     wl_pointer: seatMod.makePointer(ctx),
     wl_keyboard: seatMod.makeKeyboard(ctx),
@@ -459,6 +464,7 @@ export async function installProtocols(
     zwlr_layer_surface_v1: layerShellMod.makeLayerSurface(ctx),
     zxdg_toplevel_decoration_v1: decorationMod.makeToplevelDecoration(ctx),
     zxdg_output_v1: xdgOutputMod.makeXdgOutput(ctx),
+    zwlr_foreign_toplevel_handle_v1: foreignTopMod.makeForeignToplevelHandle(ctx),
   };
 
   // The apply target forwards lazily: the seat is constructed below and
@@ -489,6 +495,12 @@ export async function installProtocols(
     const handler = globalHandlers[name] ?? handlerMods[name].default(ctx);
     addon.createGlobal(name, handler);
   }
+
+  // Foreign-toplevel manager: subscribe to the typed bus + plugin bus for
+  // window lifecycle / state change emission. Wired after globals so the
+  // handler factory has already been constructed by the GLOBALS loop above
+  // and registered its module-local manager set.
+  foreignTopMod.installForeignToplevelBusHooks(ctx);
 
   return state;
 }
