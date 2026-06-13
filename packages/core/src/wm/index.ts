@@ -144,6 +144,11 @@ export interface WindowStateProposal {
 
 export interface Wm {
   state: WmState;
+  // Trigger a layout pass with the given reason. Used by callers outside the
+  // WM that affect the tile region (notably layer-shell reserved-zone changes:
+  // a new exclusive zone shrinks the tile region for every managed window).
+  // Coalesces with in-flight passes via the driver's existing scheduling.
+  schedule(reason: import("@overdraw/layout-types").LayoutReason): void;
   // Proactive: called at get_toplevel (role assignment), BEFORE the client has
   // content. Inserts the window into the layout (as the new master) and
   // schedules a layout pass. Idempotent for an already-added surface. The
@@ -520,6 +525,10 @@ export function createWm(
 
   return {
     state: wm,
+
+    schedule(reason) {
+      driver.schedule(reason);
+    },
 
     addWindow(surfaceId, surfaceRec, opts) {
       const existing = windows.find((w) => w.surfaceId === surfaceId);

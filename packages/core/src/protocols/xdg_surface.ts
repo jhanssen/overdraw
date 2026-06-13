@@ -98,9 +98,14 @@ export default function makeXdgSurface(ctx: Ctx): XdgSurfaceHandler {
     },
     get_popup(resource, popup, parent, positioner) {
       const xs = rec(resource);
-      const parentXs = parent ? ctx.state.xdgSurfaces?.get(parent) : undefined;
       const p = ctx.state.positioners?.get(positioner);
-      if (!xs || !parentXs || !p) return;
+      if (!xs || !p) return;
+      // `parent` may be null when the popup is destined to be re-parented to
+      // a zwlr_layer_surface_v1 via its get_popup request. In that case the
+      // PopupRecord carries parent=null + a layer-parent filled in later;
+      // configurePopup defers the configure until that happens.
+      const parentXs = parent ? ctx.state.xdgSurfaces?.get(parent) ?? null : null;
+      if (parent && !parentXs) return; // parent supplied but lookup failed
       xs.role = "popup";
       xs.popup = popup;
       if (xs.surface) xs.surface.role = "xdg_popup";
@@ -112,6 +117,8 @@ export default function makeXdgSurface(ctx: Ctx): XdgSurfaceHandler {
       ctx.state.popups ??= new Map();
       ctx.state.popups.set(popup, pr);
       // Compute position + send the configure handshake (popup then xdg_surface).
+      // For a NULL-parent popup, configurePopup is a no-op until the
+      // zwlr_layer_surface_v1.get_popup request supplies the layer parent.
       configurePopup(ctx, pr);
     },
     set_window_geometry(resource, x, y, w, h) {

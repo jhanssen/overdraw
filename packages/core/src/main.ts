@@ -163,9 +163,9 @@ console.log("[overdraw] compositor: JS (over the Dawn wire)");
 
 const sock = addon.startServer();
 
-// Reserved-zone registry. No producer today (layer-shell isn't built);
-// the registry is in place so `maximized` windows + the layout plugin's
-// tile region honor reservations from day one.
+// Reserved-zone registry. Layer-shell exclusive zones write into it; the
+// layout driver and the protocol layer share this instance via
+// installProtocols(opts.reservedZones).
 const reservedZones = createReservedZoneRegistry();
 
 // The WM needs a layout driver before installProtocols creates it; the driver
@@ -179,6 +179,7 @@ state = await installProtocols(addon, {
   compositor,
   bus,
   pluginBus,
+  reservedZones,
   layoutDriverFactory: (target, snapshot) => createLayoutDriver({
     target, snapshot,
     reservedZones,

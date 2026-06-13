@@ -12,11 +12,14 @@ import { solvePopupPosition } from "../popup-position.js";
 import { computeBaseStack, emitSubtree } from "../subsurfaces.js";
 
 // Output-space top-left of a parent xdg_surface: a toplevel uses its WM window
-// rect; a popup parent uses its own resolved output position (recursively).
-// `parent` may be null when the popup was created with a NULL parent and not
-// yet re-parented via zwlr_layer_surface_v1.get_popup; in that case there is
-// no resolvable origin and we return null. T7 (popup layer-parenting) extends
-// this to also resolve a layer-shell parent origin via PopupRecord.layerParent.
+// rect; a popup parent uses its own resolved output position (recursively);
+// a layer-surface parent (popup re-parented via zwlr_layer_surface_v1.
+// get_popup) uses the layer-surface's applied rect. `parent` may be null when
+// the popup was created with NULL parent and has not yet been layer-parented;
+// in that case there is no resolvable origin and we return null. The
+// PopupRecord-aware variant `popupOutputOrigin` is preferred for callers that
+// have the popup record; this raw-XdgSurfaceRecord variant exists for the
+// xdg-popup recursion and stays narrow to that case.
 export function parentOutputOrigin(state: CompositorState, parent: XdgSurfaceRecord | null): { x: number; y: number } | null {
   if (!parent) return null;
   if (parent.role === "toplevel" && parent.surface) {
@@ -27,17 +30,34 @@ export function parentOutputOrigin(state: CompositorState, parent: XdgSurfaceRec
   if (parent.role === "popup" && parent.popup) {
     const pr = state.popups?.get(parent.popup);
     if (!pr) return null;
-    const grand = parentOutputOrigin(state, pr.parent);
+    const grand = popupOutputOrigin(state, pr);
     if (!grand) return null;
     return { x: grand.x + pr.rect.x, y: grand.y + pr.rect.y };
   }
   return null;
 }
 
+// Output-space top-left of the surface a popup is parented to. Resolves the
+// xdg-shell parent chain OR the layer-shell parent's applied rect. Returns
+// null when no origin can be computed (layer-parent has not applied its
+// first configure yet, transient NULL-parent state, etc).
+export function popupOutputOrigin(state: CompositorState, pr: PopupRecord): { x: number; y: number } | null {
+  if (pr.layerParent) {
+    const r = pr.layerParent.rect;
+    return r ? { x: r.x, y: r.y } : null;
+  }
+  return parentOutputOrigin(state, pr.parent);
+}
+
 // Compute + store the popup rect and send the configure handshake. Shared by
-// get_popup and reposition.
+// get_popup, reposition, and the zwlr_layer_surface_v1.get_popup path. When
+// the popup has neither an xdg parent nor a layer parent yet (the transient
+// state between xdg_surface.get_popup(NULL) and the layer-shell get_popup),
+// the configure is suppressed -- the layer-shell handler calls back into
+// configurePopup once the layer parent is assigned.
 export function configurePopup(ctx: Ctx, pr: PopupRecord): void {
-  const origin = parentOutputOrigin(ctx.state, pr.parent) ?? { x: 0, y: 0 };
+  const origin = popupOutputOrigin(ctx.state, pr);
+  if (!origin) return; // unparented; defer the configure
   const out = ctx.state.wm?.state.output ?? { width: 1920, height: 1080 };
   pr.rect = solvePopupPosition(pr.positioner, origin.x, origin.y, out.width, out.height);
   ctx.events.xdg_popup.send_configure(pr.resource, pr.rect.x, pr.rect.y, pr.rect.width, pr.rect.height);
@@ -79,7 +99,7 @@ export default function makeXdgPopup(ctx: Ctx): XdgPopupHandler {
 
 // Is the output-space point inside the popup's on-screen rect?
 function pointInPopup(ctx: Pick<Ctx, "state">, pr: PopupRecord, x: number, y: number): boolean {
-  const origin = parentOutputOrigin(ctx.state, pr.parent);
+  const origin = popupOutputOrigin(ctx.state, pr);
   if (!origin) return false;
   const px = origin.x + pr.rect.x, py = origin.y + pr.rect.y;
   return x >= px && x < px + pr.rect.width && y >= py && y < py + pr.rect.height;
@@ -139,7 +159,7 @@ function appendPopups(
   for (const pr of state.popups?.values() ?? []) {
     if (!pr.mapped || !pr.xdgSurface.surface) continue;
     if (!includePopup(pr)) continue;
-    const origin = parentOutputOrigin(state, pr.parent);
+    const origin = popupOutputOrigin(state, pr);
     if (!origin) continue;
     const px = origin.x + pr.rect.x, py = origin.y + pr.rect.y;
     state.compositor.setSurfaceLayout(pr.xdgSurface.surface.id, px, py, 0, 0);
@@ -190,9 +210,13 @@ export function rebuildStackWithPopups(state: CompositorState): void {
     }
     const stack: number[] = computeBaseStack(state, ordered);
 
-    // Popups whose root toplevel is in the filter.
+    // Popups whose root toplevel is in the filter, plus layer-shell-parented
+    // popups (no root toplevel; always include them per output since the
+    // layer surface itself is per-output-by-construction and workspaces
+    // don't model layer surfaces).
     const inFilter = new Set(toplevelIds);
     appendPopups(state, stack, (pr) => {
+      if (pr.layerParent) return true;
       const root = popupRootToplevelId(state, pr);
       return root !== null && inFilter.has(root);
     });

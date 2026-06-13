@@ -26,6 +26,7 @@ import type { Ctx, CompositorState, CompositorSink } from "./ctx.js";
 import type { FocusDriver, FocusApplyTarget } from "./focus-driver.js";
 import { titleAppId } from "../query.js";
 import { WINDOW_EVENT } from "../events/types.js";
+import { markLayerSurfaceMapped } from "./zwlr_layer_shell_v1.js";
 import type { CompositorBus } from "../events/window-bus.js";
 import { flushWindowChanges } from "./window-changes.js";
 
@@ -50,6 +51,7 @@ const GLOBALS = [
   "wl_subcompositor", "wl_output", "wl_data_device_manager",
   "zwp_primary_selection_device_manager_v1",
   "wp_cursor_shape_manager_v1",
+  "zwlr_layer_shell_v1",
 ];
 
 // Interfaces created via requests (new_id), registered without a global so
@@ -62,6 +64,7 @@ const CHILD_INTERFACES = [
   "zwp_primary_selection_device_v1", "zwp_primary_selection_source_v1",
   "zwp_primary_selection_offer_v1",
   "wp_cursor_shape_device_v1",
+  "zwlr_layer_surface_v1",
 ];
 
 // Load all generated signature modules, keyed by interface name.
@@ -97,6 +100,13 @@ export interface InstallOptions {
   // Focus driver factory (core-plugin-api.md §14). Omit -> the seat uses
   // a no-op driver that never changes focus.
   focusDriverFactory?: (target: FocusApplyTarget) => FocusDriver;
+  // Reserved-zone registry. Layer-shell exclusive zones add reservations
+  // here; the layout driver consults it via effectiveRect() to compute the
+  // tile region. The CALLER (main.ts in production; test harnesses
+  // optionally) creates the registry and is responsible for also passing
+  // it into the layoutDriverFactory's deps so both sides see the same
+  // instance. Omit in GPU-free tests that don't exercise layer-shell.
+  reservedZones?: import("../wm/reserved-zones.js").ReservedZoneRegistry;
 }
 
 // Wire the protocol layer onto a started server. `addon` is the native module
@@ -129,6 +139,7 @@ export async function installProtocols(
     serial() { return this.nextSerial++; },
   };
   if (opts.bus) state.bus = opts.bus;
+  if (opts.reservedZones) state.reservedZones = opts.reservedZones;
   // The binding chain owns the input modes + chord trie. Plugins
   // register bindings via the windows broker; the seat dispatches each
   // key-down here. Chain events (mode-pushed/popped, chord-*) re-emit on
@@ -185,6 +196,9 @@ export async function installProtocols(
     layoutDriverFactory: opts.layoutDriverFactory,
     pluginBus: opts.pluginBus,
   });
+  // Expose wm.schedule via state.relayout for callers outside the WM that
+  // affect the tile region (layer-shell reserved-zone changes).
+  state.relayout = (reason) => state.wm?.schedule(reason);
   // State-query channel (tests / introspection): a GPU-free snapshot of
   // geometry / focus / stacking. See src/query.ts.
   state.query = () => queryState(state);
@@ -251,6 +265,28 @@ export async function installProtocols(
         s.mapped = true;
         const pr = s.xdgSurface?.popup ? state.popups?.get(s.xdgSurface.popup) : undefined;
         if (pr) { pr.mapped = true; mappedPopup = true; }
+      } else if (s.role === "layer_surface" && s.layerSurface) {
+        // Layer-shell first content: mark mapped, push to the layer stack,
+        // emit window.map with role: 'layer-shell'. width/height from the
+        // imported buffer are ignored for placement -- the rect was decided
+        // by placeLayerSurface against anchor / size / margin. appId/title
+        // are null for layer surfaces (the protocol carries a `namespace`
+        // identifier instead, not surfaced on this event today).
+        s.mapped = true;
+        const ls = s.layerSurface;
+        ls.mapped = true;
+        const rect = ls.rect;
+        if (rect) {
+          state.bus?.emit(WINDOW_EVENT.map, {
+            surfaceId: id,
+            rect: { x: rect.x, y: rect.y, width: rect.width, height: rect.height },
+            appId: null, title: null,
+            role: "layer-shell",
+          });
+        }
+        // Push the layer stack so the compositor includes this surface.
+        markLayerSurfaceMapped(state, ls);
+        mappedAny = true;
       }
     }
     // Resource-destroyed sweep: a client that disconnects (or crashes) without
@@ -376,6 +412,7 @@ export async function installProtocols(
     wl_data_device_manager: await import("./wl_data_device_manager.js"),
     // wp_cursor_shape_manager_v1 is exposed via globalHandlers; the
     // module's helper factories aren't a default export.
+    zwlr_layer_shell_v1: await import("./zwlr_layer_shell_v1.js"),
   };
 
   // Some child interfaces have handlers from a sibling module's named exports.
@@ -384,6 +421,7 @@ export async function installProtocols(
   const subMod = await import("./wl_subcompositor.js");
   const ddmMod = await import("./wl_data_device_manager.js");
   const cursorShapeMod = await import("./cursor_shape.js");
+  const layerShellMod = await import("./zwlr_layer_shell_v1.js");
   const childHandlers: Record<string, object> = {
     wl_pointer: seatMod.makePointer(ctx),
     wl_keyboard: seatMod.makeKeyboard(ctx),
@@ -397,6 +435,7 @@ export async function installProtocols(
     zwp_primary_selection_offer_v1: ddmMod.makePrimaryOffer(ctx),
     wl_callback: {}, // event-only (done); no requests to dispatch
     wp_cursor_shape_device_v1: cursorShapeMod.makeCursorShapeDevice(ctx),
+    zwlr_layer_surface_v1: layerShellMod.makeLayerSurface(ctx),
   };
 
   // The apply target forwards lazily: the seat is constructed below and

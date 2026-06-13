@@ -35,8 +35,11 @@ export type LayoutReason =
   | "focus-changed"   // keyboard / pointer focus changed
   | "reorder"         // explicit stack-order change (e.g. raise)
   | "param-changed"   // layout-specific config (master fraction, gap) changed
-  | "state-changed";  // a window's behavioral state changed (presentation,
+  | "state-changed"   // a window's behavioral state changed (presentation,
                       // layoutMode, layoutData, or constraints)
+  | "reserved-zones-changed";  // a layer-shell exclusive zone was added,
+                               // removed, or resized; the tile region
+                               // (output minus reserved zones) shifted
 
 // Protocol-defined size constraints from xdg_toplevel.set_min_size /
 // set_max_size. Layouts should clamp the rects they assign within these

@@ -424,6 +424,11 @@ export interface CompositorState {
   // pushing to setLayerSurfaces. Excludes the "content" layer (which the
   // WM stack owns).
   overlayLayerIds?: (layer: Exclude<Layer, "content">) => number[];
+  // Schedule a WM layout pass with the given reason. Set by installProtocols
+  // after the WM is constructed; reachable from layer-shell apply paths so a
+  // reserved-zone change reflows tiled / maximized windows. Absent in
+  // GPU-free harnesses that bring up the protocol layer without a real WM.
+  relayout?: (reason: import("@overdraw/layout-types").LayoutReason) => void;
 }
 
 export interface SubsurfaceRecord {
@@ -664,6 +669,13 @@ export interface SeatState {
   // serial validation + client preference recording) and by wl_surface
   // (cursor-role surface commit triggers a slot re-apply).
   cursor: SeatCursorOps;
+  // Layer-shell exclusive keyboard interactivity: while at least one
+  // mapped layer surface in the `top` or `overlay` protocol layer has
+  // keyboard_interactivity === "exclusive", the seat forces kbFocus to
+  // that surface (topmost wins) and bypasses the focus driver entirely.
+  // Called from the layer-shell apply / teardown paths whenever the set
+  // of qualifying surfaces might have changed.
+  reevaluateExclusiveLayerFocus(): void;
 }
 
 export interface ClientCursor {

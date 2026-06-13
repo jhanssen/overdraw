@@ -160,33 +160,76 @@ export default function makeSeat(ctx: Ctx, driver: FocusDriver): SeatHandler {
     if (p.version >= 5) ctx.events.wl_pointer.send_frame(p);
   }
 
-  // Find the topmost window under an output-space point, returning a focus
-  // target (surface + client id + rect), or null. Respects wl_surface
-  // input regions: when a window's input region rejects the surface-
-  // local point, the search falls through to the window below.
+  // Find the topmost surface under an output-space point. Searches layer-
+  // shell surfaces above toplevels first (overlay then top layers), then
+  // WM toplevels via the WM, then layer-shell surfaces below toplevels
+  // (bottom then background). Respects wl_surface input regions on all
+  // candidates: when a region rejects the surface-local point, the search
+  // falls through.
   //
   // The default (no applied input region, or null applied = "infinite")
-  // matches the whole content rect, so most surfaces hit-test exactly
-  // like before. An empty input region (Region with no rects) makes the
-  // window entirely click-through.
+  // matches the whole rect, so most surfaces hit-test exactly like before.
+  // An empty input region (Region with no rects) makes the surface entirely
+  // click-through.
   function pick(x: number, y: number): SeatFocus | null {
+    // Compositor z-order for hit-testing: overlay > top > toplevels >
+    // bottom > background.
+    const above = pickLayer(x, y, ["overlay", "top"]);
+    if (above) return above;
     const win = ctx.state.wm?.windowAt(x, y, (w, lx, ly) => {
-      // Look up the SurfaceRecord backing this window. The WM's
-      // surfaceRec is a SurfaceHandle; the protocol layer's surface
-      // record lives in ctx.state.surfaces keyed by the wl_surface
-      // resource.
       const sRec = ctx.state.surfaces.get(w.surfaceRec.resource);
       const region = sRec?.inputRegion;
-      // undefined = no set_input_region call has been committed (initial
-      // state = infinite = accept). null = explicit infinite = accept.
       if (region === undefined || region === null) return true;
       return region.contains(lx, ly);
     });
-    if (!win) return null;
-    const rec = win.surfaceRec;
-    if (!rec || rec.resource.destroyed) return null;
-    const clientId = ctx.addon.clientId(rec.resource);
-    return { surfaceId: win.surfaceId, surfaceRec: rec, clientId, rect: win.rect };
+    if (win) {
+      const rec = win.surfaceRec;
+      if (rec && !rec.resource.destroyed) {
+        const clientId = ctx.addon.clientId(rec.resource);
+        return { surfaceId: win.surfaceId, surfaceRec: rec, clientId, rect: win.rect };
+      }
+    }
+    return pickLayer(x, y, ["bottom", "background"]);
+  }
+
+  // Topmost layer-shell surface in the given protocol-layer set under the
+  // point, with input-region filtering. Iterates state.layerSurfaces in
+  // insertion order; within the same layer the most-recently-mapped surface
+  // ought to win, but layer-shell's spec says ordering within a layer is
+  // undefined so insertion-order is acceptable. Caller passes layers in the
+  // desired check order (overlay before top, etc.).
+  function pickLayer(
+    x: number, y: number,
+    layers: ReadonlyArray<"background" | "bottom" | "top" | "overlay">,
+  ): SeatFocus | null {
+    const ls = ctx.state.layerSurfaces;
+    if (!ls) return null;
+    for (const layer of layers) {
+      // Iterate in reverse so a later-mapped surface in the same layer wins.
+      const candidates = [...ls.values()].reverse();
+      for (const rec of candidates) {
+        if (!rec.mapped || rec.destroyed) continue;
+        if (rec.applied.layer !== layer) continue;
+        const r = rec.rect;
+        if (!r) continue;
+        if (x < r.x || x >= r.x + r.width || y < r.y || y >= r.y + r.height) continue;
+        const sRec = rec.surface;
+        // Input region (surface-local): respect set_input_region as the WM
+        // path does.
+        const region = sRec.inputRegion;
+        const lx = x - r.x, ly = y - r.y;
+        if (region !== undefined && region !== null && !region.contains(lx, ly)) continue;
+        if (sRec.resource.destroyed) continue;
+        const clientId = ctx.addon.clientId(sRec.resource);
+        return {
+          surfaceId: sRec.id,
+          surfaceRec: sRec,
+          clientId,
+          rect: { x: r.x, y: r.y, width: r.width, height: r.height },
+        };
+      }
+    }
+    return null;
   }
 
   // Move keyboard focus to `target` (or clear with null). Sends wl_keyboard
@@ -210,17 +253,93 @@ export default function makeSeat(ctx: Ctx, driver: FocusDriver): SeatHandler {
     if (target) markWindowChanged(ctx.state, target.surfaceId, "activated");
   }
 
+  // Build a SeatFocus for a surface id, handling both WM toplevels (rect via
+  // wm.getSnapshot) and layer-shell surfaces (rect via state.layerSurfaces).
+  // Returns null when the surface is unknown or unmapped.
+  function focusTargetFor(surfaceId: number): SeatFocus | null {
+    const s = ctx.state.surfacesById?.get(surfaceId);
+    if (!s || s.resource.destroyed) return null;
+    const clientId = ctx.addon.clientId(s.resource);
+    // Layer-shell first: the WM doesn't know about these.
+    if (s.layerSurface?.rect) {
+      const r = s.layerSurface.rect;
+      return { surfaceId, surfaceRec: s, clientId, rect: { x: r.x, y: r.y, width: r.width, height: r.height } };
+    }
+    const snap = ctx.state.wm?.getSnapshot(surfaceId);
+    if (!snap) return null;
+    return { surfaceId, surfaceRec: s, clientId, rect: snap.rect };
+  }
+
+  // Topmost mapped layer surface in protocol layers top|overlay with
+  // keyboard_interactivity === "exclusive". Returns null when none.
+  // Tie-break: insertion order (later wins), then overlay before top.
+  // Bottom and background layers are not eligible (spec: "the compositor
+  // is allowed to use normal focus semantics").
+  function pickExclusiveLayerSurface(): import("./ctx.js").LayerSurfaceRecord | null {
+    const ls = ctx.state.layerSurfaces;
+    if (!ls) return null;
+    let pick: import("./ctx.js").LayerSurfaceRecord | null = null;
+    for (const rec of ls.values()) {
+      if (!rec.mapped || rec.destroyed) continue;
+      if (rec.applied.keyboardInteractivity !== "exclusive") continue;
+      const l = rec.applied.layer;
+      if (l !== "top" && l !== "overlay") continue;
+      // Overlay layer always beats top.
+      if (!pick) { pick = rec; continue; }
+      if (pick.applied.layer === "overlay" && l !== "overlay") continue;
+      if (pick.applied.layer !== "overlay" && l === "overlay") { pick = rec; continue; }
+      // Same layer: later insertion wins (Map preserves insertion order;
+      // a later iteration step replaces the earlier pick).
+      pick = rec;
+    }
+    return pick;
+  }
+
   // Apply a focus result by surface id. null clears. Silent no-op if the
   // surface unmapped between dispatch and apply (the focus driver does not
   // care about apply failures; the kb focus simply stays where it was).
+  // Layer-shell exclusive override: when a qualifying exclusive surface
+  // exists, any focus target is replaced with that surface.
   function applyKeyboardFocus(surfaceId: number | null): void {
+    const exclusive = pickExclusiveLayerSurface();
+    if (exclusive) {
+      const t = focusTargetFor(exclusive.surface.id);
+      setKbFocus(t);
+      return;
+    }
     if (surfaceId === null) { setKbFocus(null); return; }
-    const s = ctx.state.surfacesById?.get(surfaceId);
-    if (!s || s.resource.destroyed) return;
-    const snap = ctx.state.wm?.getSnapshot(surfaceId);
-    if (!snap) return;
-    const clientId = ctx.addon.clientId(s.resource);
-    setKbFocus({ surfaceId, surfaceRec: s, clientId, rect: snap.rect });
+    const t = focusTargetFor(surfaceId);
+    if (t) setKbFocus(t);
+  }
+
+  // Recompute the exclusive-layer-focus state. Called from the layer-shell
+  // handler whenever a layer surface is mapped, unmapped, or has its
+  // keyboard_interactivity / layer changed. When an exclusive layer exists
+  // and kbFocus isn't already there, install it. When the previously-active
+  // exclusive layer unmapped, re-run the focus driver under the new
+  // (non-exclusive) state.
+  function reevaluateExclusiveLayerFocus(): void {
+    const seat = ctx.state.seat;
+    if (!seat) return;
+    const exclusive = pickExclusiveLayerSurface();
+    if (exclusive) {
+      const t = focusTargetFor(exclusive.surface.id);
+      if (t && (!seat.kbFocus || seat.kbFocus.surfaceId !== t.surfaceId)) {
+        setKbFocus(t);
+      }
+      return;
+    }
+    // No exclusive anymore. If kbFocus was on a layer surface that's no
+    // longer qualified (e.g. it just unmapped), re-run the driver.
+    const cur = seat.kbFocus;
+    if (cur) {
+      const s = ctx.state.surfacesById?.get(cur.surfaceId);
+      if (!s || s.unmapped || s.resource.destroyed
+          || (s.layerSurface && (s.layerSurface.destroyed || !s.layerSurface.mapped))) {
+        // Re-resolve via the focus driver under normal semantics.
+        dispatchFocus("explicit");
+      }
+    }
   }
 
   function sendEnter(target: SeatFocus, sx: number, sy: number): void {
@@ -255,10 +374,19 @@ export default function makeSeat(ctx: Ctx, driver: FocusDriver): SeatHandler {
     ctx.state.compositor.setCursorVisible?.(true);
   }
 
-  // Dispatch a focus decide() with the current snapshot.
+  // Dispatch a focus decide() with the current snapshot. When a layer-shell
+  // exclusive-keyboard surface is mapped on top/overlay, skip the driver
+  // entirely and force focus to that surface -- the focus plugin does not
+  // see layer-shell exclusivity (a core-level invariant above policy).
   function dispatchFocus(reason: import("./focus-driver.js").FocusReason,
                         trigger?: number, surfaceUnderPointer?: number | null): void {
     const seat = ctx.state.seat;
+    const exclusive = pickExclusiveLayerSurface();
+    if (exclusive) {
+      const t = focusTargetFor(exclusive.surface.id);
+      if (t) setKbFocus(t);
+      return;
+    }
     const cur = seat?.kbFocus?.surfaceId ?? null;
     const sup = surfaceUnderPointer !== undefined
       ? surfaceUnderPointer
@@ -545,6 +673,7 @@ export default function makeSeat(ctx: Ctx, driver: FocusDriver): SeatHandler {
     dispatchFocusEvent(reason, trigger) { dispatchFocus(reason, trigger); },
     pick,
     pointerPosition() { return { x: lastX, y: lastY }; },
+    reevaluateExclusiveLayerFocus,
     drag: null,
     // Phase 9c: cursor handling shared with makePointer (set_cursor) and
     // wl_surface.commit (cursor-role surface texture refresh).

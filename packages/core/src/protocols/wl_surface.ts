@@ -14,6 +14,12 @@ import type { Ctx, CompositorState, SurfaceRecord, SubsurfaceRecord } from "./ct
 import type { Resource } from "../types.js";
 import { applySubsurfaces, applySubsurfaceReorder } from "../subsurfaces.js";
 import { WINDOW_EVENT } from "../events/types.js";
+import {
+  isLayerSurfaceInitialCommit,
+  applyLayerSurfaceInitial,
+  applyLayerSurfacePending,
+  teardownLayerSurface,
+} from "./zwlr_layer_shell_v1.js";
 
 // Assign a stable per-wl_buffer id used to track the dmabuf release lifecycle
 // across the JS<->native boundary. Native reports freed bufferIds (once its GPU
@@ -187,6 +193,15 @@ export default function makeSurface(ctx: Ctx): WlSurfaceHandler {
         s.pending.buffer = undefined;
       }
 
+      // Layer-shell: a buffer attached before the first configure-ack is
+      // invalid_surface_state per spec. Silent-drop convention (no
+      // post_error path in this compositor today; see top of
+      // zwlr_layer_shell_v1.ts); discard the buffer so it never reaches
+      // the GPU.
+      if (s.layerSurface && isLayerSurfaceInitialCommit(s.layerSurface) && s.committed.buffer) {
+        s.committed.buffer = null;
+      }
+
       if (effectiveSync(ctx, s)) {
         // Synchronized subsurface: CACHE this commit; do not apply. The cache is
         // applied when the parent commits (via applySurfaceState's cascade).
@@ -253,6 +268,20 @@ export default function makeSurface(ctx: Ctx): WlSurfaceHandler {
       if (s.role === "cursor") {
         ctx.state.seat?.cursor.onCursorSurfaceCommit(resource);
       }
+
+      // Layer-shell: drive the configure handshake + apply pipeline. The
+      // initial commit (no configure sent yet) sends the first configure
+      // with the resolved size; subsequent commits apply any pending
+      // double-buffered state (set_size / set_anchor / ...) and may send
+      // a new configure when the rect changed.
+      const ls = s.layerSurface;
+      if (ls && !ls.destroyed) {
+        if (isLayerSurfaceInitialCommit(ls)) {
+          applyLayerSurfaceInitial(ctx, ls);
+        } else {
+          applyLayerSurfacePending(ctx, ls);
+        }
+      }
     },
     destroy(resource) {
       const s = rec(resource);
@@ -282,10 +311,17 @@ export function unmapAndTeardownSurface(state: CompositorState, s: SurfaceRecord
   // in the compositor independently until the plugin (or the
   // backstop) destroys it.
   state.closingDriver?.beforeUnmap(state, s);
-  if (s.mapped && s.role === "xdg_toplevel") {
+  if (s.mapped && (s.role === "xdg_toplevel" || s.role === "layer_surface")) {
     state.bus?.emit(WINDOW_EVENT.unmap, { surfaceId: s.id });
   }
   state.pendingWindowChanges?.delete(s.id);
+  // Layer-shell teardown: clear reservations + drop from the layer stack.
+  // Idempotent so the explicit zwlr_layer_surface_v1.destroy AND this
+  // wl_surface sweep can each run safely.
+  if (s.layerSurface) {
+    teardownLayerSurface(state, s.layerSurface);
+    s.layerSurface = null;
+  }
   state.wm?.unmapWindow(s.id);
   state.compositor.removeSurface(s.id);
   state.surfacesById?.delete(s.id);
