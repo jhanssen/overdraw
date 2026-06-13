@@ -15,14 +15,98 @@ import type { Resource } from "./types.js";
 import type { CompositorState, SubsurfaceRecord, SurfaceRecord } from "./protocols/ctx.js";
 import { rebuildStackWithPopups } from "./protocols/xdg_popup.js";
 
-// Children of a given parent wl_surface, in creation order (interpreted as
-// bottom-to-top among siblings; place_above/below refinement is future work).
+// Children of a given parent wl_surface, in bottom-to-top draw order.
+// The order is maintained by wl_subcompositor.get_subsurface (appends each
+// new child to the top) + applySubsurfaceReorder (drained on parent
+// commit, applying queued place_above / place_below operations).
 function childrenOf(state: CompositorState, parent: Resource): SubsurfaceRecord[] {
+  const order = state.subsurfaceOrder?.get(parent);
+  if (!order) return [];
   const out: SubsurfaceRecord[] = [];
-  const subs = state.subsurfaces;
-  if (!subs) return out;
-  for (const sub of subs.values()) if (sub.parent === parent) out.push(sub);
+  for (const subResource of order) {
+    const sub = state.subsurfaces?.get(subResource);
+    if (sub) out.push(sub);
+  }
   return out;
+}
+
+// Drain any queued place_above / place_below operations for the given
+// parent. Called from wl_surface.commit's apply path (applySurfaceState)
+// so reorder ops are double-buffered like position changes.
+//
+// An invalid sibling -- one that is neither the parent's wl_surface nor
+// the wl_surface of one of the parent's other subsurfaces -- silently
+// drops the op (matches the "no post_error" convention).
+//
+// Multiple ops in arrival order: each runs against the result of the
+// previous. The wl_subsurface spec says successive operations stack
+// without explicit ordering rules; arrival order is the natural choice.
+export function applySubsurfaceReorder(state: CompositorState, parent: Resource): void {
+  const queue = state.subsurfacePendingOrder?.get(parent);
+  if (!queue || queue.length === 0) return;
+  const order = state.subsurfaceOrder?.get(parent);
+  if (!order) {
+    // Defensive: queue refers to a parent with no child list (shouldn't
+    // happen -- get_subsurface populates the list). Drop the queue.
+    state.subsurfacePendingOrder?.delete(parent);
+    return;
+  }
+  for (const op of queue) {
+    applyOneReorder(state, parent, order, op);
+  }
+  state.subsurfacePendingOrder?.delete(parent);
+}
+
+function applyOneReorder(
+  state: CompositorState,
+  parent: Resource,
+  order: Resource[],
+  op: import("./protocols/ctx.js").SubsurfaceOrderOp,
+): void {
+  const subIdx = order.indexOf(op.subsurface);
+  if (subIdx < 0) return;   // subsurface destroyed since queueing; drop.
+
+  // The reference sibling is named by its wl_surface. Resolve to a
+  // position in the parent's order:
+  //   - If the sibling wl_surface is the parent's own surface, the
+  //     reference is BELOW all subsurfaces (index -1 conceptually).
+  //   - Otherwise the sibling must be the surface of one of this
+  //     parent's subsurfaces; find its index in `order`.
+  let refIdx: number;
+  if (op.sibling === parent) {
+    refIdx = -1;
+  } else {
+    refIdx = -2;   // sentinel: not found
+    for (let i = 0; i < order.length; i++) {
+      const sub = state.subsurfaces?.get(order[i]);
+      if (sub && sub.surface === op.sibling) { refIdx = i; break; }
+    }
+    if (refIdx === -2) return;   // sibling not a child of this parent; drop.
+  }
+
+  // Remove the subsurface from its current position.
+  order.splice(subIdx, 1);
+  // Recompute the reference index post-removal: if it was after the
+  // subsurface, it shifts down by one.
+  if (refIdx > subIdx) refIdx -= 1;
+
+  // Insertion index for above/below relative to the reference position.
+  //   place_above(ref): goes at refIdx + 1 (above ref).
+  //   place_below(ref): goes at refIdx (taking ref's slot, pushing ref
+  //                     and anything above up).
+  // refIdx = -1 (parent) with place_above => index 0 (bottom of siblings,
+  // just above parent). place_below(parent) => behind the parent, which
+  // we treat as the bottom too (index 0) -- the parent's own surface
+  // isn't part of the child list, so there's nothing "below" it among
+  // subsurfaces. (A more strict implementation might post a protocol
+  // error; we don't.)
+  let insertAt: number;
+  if (op.op === "above") {
+    insertAt = refIdx + 1;
+  } else {
+    insertAt = refIdx < 0 ? 0 : refIdx;
+  }
+  order.splice(insertAt, 0, op.subsurface);
 }
 
 // Recursively append `surfaceRes`'s subsurface subtree to `stack` (each child

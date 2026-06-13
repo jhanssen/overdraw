@@ -350,6 +350,17 @@ export interface CompositorState {
   dismissGrabbedPopup?: (x: number, y: number) => boolean;
   dmabufParams?: Map<Resource, DmabufParams>;
   subsurfaces?: Map<Resource, SubsurfaceRecord>;
+  // Per-parent child order: wl_surface (parent) -> ordered list of
+  // wl_subsurface resources, bottom-to-top among siblings. Created on
+  // wl_subcompositor.get_subsurface (new child appended at the top).
+  // Mutated by place_above / place_below applied at parent commit.
+  // childrenOf() reads this list instead of iterating the subsurfaces
+  // map so sibling reorder takes effect.
+  subsurfaceOrder?: Map<Resource, Resource[]>;
+  // Per-parent pending sibling-reorder operations, drained on parent
+  // commit. Double-buffered per spec; multiple ops between commits
+  // apply in arrival order against the child list.
+  subsurfacePendingOrder?: Map<Resource, SubsurfaceOrderOp[]>;
   // dmabuf release lifecycle: stable bufferId <-> wl_buffer maps. Native reports
   // freed bufferIds (GPU read complete) and we release the matching wl_buffer.
   dmabufBufferIds?: Map<Resource, number>;
@@ -399,6 +410,19 @@ export interface SubsurfaceRecord {
   pendingX: number;
   pendingY: number;
   sync: boolean;        // own mode (set_sync/set_desync); initial = true (sync)
+}
+
+// One pending sibling-reorder operation accumulated between parent commits.
+// place_above / place_below requests are double-buffered per spec: they go
+// into the parent's pending queue; on parent commit, the queue is drained
+// in order against the parent's child list. `subsurface` is the
+// wl_subsurface resource whose order is changing; `sibling` is the
+// wl_surface of another subsurface (or the parent's wl_surface) it
+// should be placed relative to.
+export interface SubsurfaceOrderOp {
+  op: "above" | "below";
+  subsurface: Resource;   // wl_subsurface resource
+  sibling: Resource;      // wl_surface resource of the reference
 }
 
 export interface BufferDesc {

@@ -12,7 +12,7 @@
 import type { WlSurfaceHandler } from "#protocols-gen/wl_surface.js";
 import type { Ctx, CompositorState, SurfaceRecord, SubsurfaceRecord } from "./ctx.js";
 import type { Resource } from "../types.js";
-import { applySubsurfaces } from "../subsurfaces.js";
+import { applySubsurfaces, applySubsurfaceReorder } from "../subsurfaces.js";
 import { WINDOW_EVENT } from "../events/types.js";
 
 // Assign a stable per-wl_buffer id used to track the dmabuf release lifecycle
@@ -114,8 +114,10 @@ function applySurfaceState(ctx: Ctx, s: SurfaceRecord): void {
     s.pending.opaqueRegion = undefined;
   }
 
-  // Subsurface-managed state (position) of THIS surface's children is applied on
-  // THIS surface's commit, regardless of child mode (spec). Copy pending->applied.
+  // Subsurface-managed state (position + sibling reorder) of THIS
+  // surface's children is applied on THIS surface's commit, regardless
+  // of child mode (spec).
+  applySubsurfaceReorder(ctx.state, s.resource);
   const subs = ctx.state.subsurfaces;
   if (subs) {
     for (const sub of subs.values()) {
