@@ -38,6 +38,10 @@ static volatile sig_atomic_t running = 1;
 // resize its buffer to fill the compositor-assigned tile (tiling WM path).
 static int fill_configured = 0;
 static int cfg_w = 0, cfg_h = 0;   // latest xdg_toplevel.configure size (0 = unset)
+// Initial state requests (sent BEFORE the initial commit so the server's first
+// configure carries the resolved size + states): 0=none, 1=maximized,
+// 2=fullscreen, 3=minimized. Set via --initial-state.
+static int initial_state = 0;
 
 static void onTerm(int sig) { (void)sig; running = 0; }
 
@@ -126,9 +130,17 @@ static void wmPing(void* d, struct xdg_wm_base* b, uint32_t serial) { (void)d; x
 static const struct xdg_wm_base_listener wmListener = { wmPing };
 
 static void tlConfigure(void* d, struct xdg_toplevel* t, int32_t w, int32_t h, struct wl_array* s) {
-    (void)d;(void)t;(void)s;
+    (void)d;(void)t;
     // Record the compositor-requested content size (0 means "client chooses").
     if (w > 0 && h > 0) { cfg_w = w; cfg_h = h; }
+    // Report the states array so the harness can assert on maximized/fullscreen/
+    // activated bits. The wl_array carries uint32 entries.
+    printf("[harness-client] configure %dx%d states=[", w, h);
+    const uint32_t* st = (const uint32_t*) s->data;
+    const size_t n = s->size / sizeof(uint32_t);
+    for (size_t i = 0; i < n; ++i) printf("%s%u", i ? "," : "", st[i]);
+    printf("]\n");
+    fflush(stdout);
 }
 static void tlClose(void* d, struct xdg_toplevel* t) { (void)d;(void)t; running = 0; }
 static void tlConfigureBounds(void* d, struct xdg_toplevel* t, int32_t w, int32_t h) { (void)d;(void)t;(void)w;(void)h; }
@@ -198,6 +210,12 @@ int main(int argc, char** argv) {
         else if (strcmp(argv[i], "--app-id") == 0 && i + 1 < argc) app_id = argv[++i];
         else if (strcmp(argv[i], "--frames") == 0) report_frames = 1;
         else if (strcmp(argv[i], "--fill-configured") == 0) fill_configured = 1;
+        else if (strcmp(argv[i], "--initial-state") == 0 && i + 1 < argc) {
+            const char* v = argv[++i];
+            if (strcmp(v, "maximized") == 0) initial_state = 1;
+            else if (strcmp(v, "fullscreen") == 0) initial_state = 2;
+            else if (strcmp(v, "minimized") == 0) initial_state = 3;
+        }
     }
     if (!socket) { fprintf(stderr, "usage: %s --socket NAME [--size WxH] [--color AARRGGBB] [--title T] [--app-id ID]\n", argv[0]); return 2; }
     if (W <= 0 || H <= 0) { fprintf(stderr, "[harness-client] bad size\n"); return 2; }
@@ -228,7 +246,17 @@ int main(int argc, char** argv) {
     xdg_toplevel_set_title(toplevel, title);
     xdg_toplevel_set_app_id(toplevel, app_id);
 
-    wl_surface_commit(surface);        // map: triggers configure
+    // --initial-state: send the state-affecting request BEFORE the initial
+    // commit so the server's first configure carries the resolved size +
+    // states. Exercises the deferred-configure path (set_maximized between
+    // get_toplevel and wl_surface.commit -> single first configure).
+    switch (initial_state) {
+        case 1: xdg_toplevel_set_maximized(toplevel); break;
+        case 2: xdg_toplevel_set_fullscreen(toplevel, NULL); break;
+        case 3: xdg_toplevel_set_minimized(toplevel); break;
+    }
+
+    wl_surface_commit(surface);        // initial commit: triggers configure
     wl_display_roundtrip(display);     // receive configure (sets cfg_w/h), ack sent
 
     // In --fill-configured mode, adopt the compositor-assigned tile size so the

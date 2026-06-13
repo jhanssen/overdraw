@@ -26,18 +26,43 @@ function packStates(states: number[]): Uint8Array {
 // acks the serial. Records the configured size on the xdg_surface record so the
 // WM can skip redundant configures. This is the WM's ConfigureSink primitive.
 //
-// width/height are the CONTENT size (the client's drawable area). states currently
-// always carries `activated` (single-window focus model); maximized/fullscreen
-// states are added when those toplevel requests are implemented.
+// width/height are the CONTENT size (the client's drawable area). states
+// reflects the window's current presentation: 'maximized' / 'fullscreen' /
+// 'activated' (latter when this window has keyboard focus). The wire shape is
+// a wl_array of uint32 state values.
 export function configureToplevel(ctx: Ctx, xs: XdgSurfaceRecord, width: number, height: number): void {
   if (!xs.toplevel) return;
-  const states = packStates([STATE.activated]);
+  const states = buildStatesArray(ctx, xs);
   ctx.events.xdg_toplevel.send_configure(xs.toplevel, Math.max(0, width | 0), Math.max(0, height | 0), states);
   const serial = ctx.state.serial();
   xs.lastConfigureSerial = serial;
   xs.configuredWidth = width;
   xs.configuredHeight = height;
   ctx.events.xdg_surface.send_configure(xs.resource, serial);
+}
+
+// Build the xdg_toplevel.configure states[] array from current WM + focus
+// state. Order doesn't matter on the wire; clients iterate the array.
+function buildStatesArray(ctx: Ctx, xs: XdgSurfaceRecord): Uint8Array {
+  const states: number[] = [];
+  const id = xs.surface?.id;
+  if (id !== undefined && ctx.state.wm) {
+    const ws = ctx.state.wm.getWindowState(id);
+    if (ws) {
+      switch (ws.presentation) {
+        case "maximized": states.push(STATE.maximized); break;
+        case "fullscreen": states.push(STATE.fullscreen); break;
+        // 'managed' and 'minimized' have no corresponding xdg_toplevel
+        // state. (Minimized clients aren't expected to render; we just
+        // exclude them from the layout.)
+      }
+    }
+  }
+  // 'activated' tracks keyboard focus.
+  if (id !== undefined && ctx.state.seat?.kbFocus?.surfaceId === id) {
+    states.push(STATE.activated);
+  }
+  return packStates(states);
 }
 
 export default function makeXdgSurface(ctx: Ctx): XdgSurfaceHandler {
