@@ -377,7 +377,10 @@ export interface XdgSurfaceRecord {
   surface?: SurfaceRecord;
   role: string | null;
   configured: boolean;
-  lastConfigureSerial: number;
+  // The serial of the last xdg_toplevel.configure sent, or null if no
+  // configure has been sent yet. The initial-commit detection in
+  // wl_surface.commit uses this to identify the first commit.
+  lastConfigureSerial: number | null;
   lastCommitSerial: number;
   toplevel?: Resource;
   popup?: Resource;

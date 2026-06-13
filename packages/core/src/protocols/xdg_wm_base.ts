@@ -17,7 +17,7 @@ export default function makeWmBase(ctx: Ctx): XdgWmBaseHandler {
         surface: s,
         role: null, // 'toplevel' | 'popup'
         configured: false,
-        lastConfigureSerial: 0,
+        lastConfigureSerial: null,
         lastCommitSerial: 0,
       };
       if (s) s.xdgSurface = record;

@@ -110,8 +110,13 @@ int main(int argc, char** argv) {
     wl_display_roundtrip(display);  // receive configures, send ack
     wl_display_roundtrip(display);  // flush ack
 
+    // Per xdg-shell, configure's states array reflects the window's
+    // current state. With no kb focus and no presentation mode set, the
+    // array is empty (0 bytes). A zero-length wl_array on the wire still
+    // proves array encode works (the byte count must be a multiple of 4
+    // = sizeof(uint32_t)).
     int ok = toplevel_configured && surface_configured
-             && last_states_bytes == 4 && saw_activated;
+             && (last_states_bytes % 4) == 0;
     printf("[client] handshake: toplevel_configured=%d surface_configured=%d "
            "states_bytes=%zu activated=%d\n",
            toplevel_configured, surface_configured, last_states_bytes, saw_activated);

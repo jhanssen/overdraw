@@ -181,7 +181,7 @@ export default function makeSurface(ctx: Ctx): WlSurfaceHandler {
       // The client is expected to wait for the configure before attaching
       // a buffer (the ack_configure handshake).
       const xs = s.xdgSurface;
-      if (xs?.toplevel && xs.lastConfigureSerial === undefined) {
+      if (xs?.toplevel && xs.lastConfigureSerial === null) {
         const t = ctx.state.toplevels?.get(xs.toplevel);
         const appId = t?.appId ?? null;
         const title = t?.title ?? null;
