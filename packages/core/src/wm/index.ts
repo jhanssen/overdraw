@@ -67,6 +67,13 @@ export interface Window {
   // content signal). A window is in the layout (and configured) from addWindow,
   // but only drawn once it has content.
   hasContent?: boolean;
+  // Per-window mutation queue. Async operations on win.windowState
+  // (propose, markInitialCommitComplete) chain on this so a second call
+  // doesn't read stale state mid-microtask from an in-flight first call.
+  // Each operation: await pendingMutation; do work; set pendingMutation
+  // to its own completion. Resolves once the operation has committed
+  // (state mutated; events emitted).
+  pendingMutation?: Promise<void>;
   // The outer rect to use when presentation === 'floating'. Captured
   // when the window first transitions into 'floating' (defaulting to
   // the current outer so it stays visually in place); updated per-frame
@@ -522,69 +529,6 @@ export function createWm(
       return win.rect;
     },
 
-    async markInitialCommitComplete(surfaceId, info) {
-      const win = windows.find((w) => w.surfaceId === surfaceId);
-      if (!win || !win.pendingInitialCommit) return;
-
-      // Emit window.preconfigure with the accumulated state as initialState.
-      // A window-rules plugin's interceptor may return a modified payload;
-      // we use the returned initialState as the candidate. Reverting fields
-      // back to current = no change (same as propose's veto pattern).
-      let finalState: WindowState = cloneState(win.windowState);
-      if (pluginBus) {
-        const initial: WindowPreconfigureEvent = {
-          surfaceId,
-          appId: info.appId, title: info.title,
-          initialState: cloneState(win.windowState),
-        };
-        const finalPayload = await pluginBus.emit(WINDOW_EVENT.preconfigure, initial,
-          { timeoutMs: INTERCEPTOR_TIMEOUT_MS });
-        if (!windows.includes(win)) return; // unmapped during await
-        const ev = finalPayload as WindowPreconfigureEvent | undefined;
-        const modified = ev ? validateState(ev.initialState) : null;
-        if (modified) finalState = cloneState(modified);
-      }
-
-      // Diff vs. current; commit changes through the standard path so
-      // window.committed fires for any field that was modified by an
-      // interceptor.
-      const previous = cloneState(win.windowState);
-      const changed = diffState(previous, finalState);
-      if (changed.length > 0) {
-        win.windowState = finalState;
-        if (pluginBus) {
-          const ev: WindowCommittedEvent = {
-            surfaceId, reason: "window-rule",
-            previous,
-            current: cloneState(finalState),
-            changed: [...changed],
-          };
-          pluginBus.emit(WINDOW_EVENT.committed, ev);
-        }
-      }
-
-      // Clear the flag BEFORE scheduling so the configure suppression
-      // in applyLayout doesn't fire for the post-rule pass.
-      win.pendingInitialCommit = false;
-
-      // If state changed geometry-relevant fields, schedule a fresh layout
-      // pass and wait for it; otherwise the existing rect from addWindow's
-      // initial pass already reflects the right geometry.
-      if (changed.some((f) => GEOMETRY_FIELDS.includes(f))) {
-        driver.schedule("state-changed");
-        await driver.settled();
-      }
-
-      // Force the initial configure. applyLayout normally only fires
-      // configure when content size changed, but the first configure must
-      // ALWAYS go out so the client has a serial to ack -- otherwise the
-      // first wl_buffer.attach never lands.
-      if (configure) {
-        const content = contentOf(win);
-        configure(win.surfaceId, content.width, content.height);
-      }
-    },
-
     windowHasContent(surfaceId) {
       const win = windows.find((w) => w.surfaceId === surfaceId);
       if (!win) return undefined;
@@ -676,53 +620,135 @@ export function createWm(
     async propose(surfaceId, proposal, reason) {
       const win = windows.find((w) => w.surfaceId === surfaceId);
       if (!win) return null;
-      const current = cloneState(win.windowState);
-      let candidate = mergeProposal(current, proposal);
-      const wasFloating = current.presentation === "floating";
-      const becomingFloating = candidate.presentation === "floating";
+      // Serialize against any in-flight mutation on this window so a
+      // second caller doesn't read stale state mid-microtask. Two
+      // requests in the same wayland-batch (e.g. set_maximized then
+      // initial commit) would otherwise race on win.windowState.
+      const prior = win.pendingMutation;
+      let resolveSelf!: () => void;
+      win.pendingMutation = new Promise<void>((res) => { resolveSelf = res; });
+      try {
+        if (prior) await prior;
+        if (!windows.includes(win)) return null;
 
-      if (pluginBus) {
-        const initial: WindowProposedEvent = {
-          surfaceId, reason, current,
-          candidate: cloneState(candidate),
-        };
-        const finalPayload = await pluginBus.emit(WINDOW_EVENT.proposed, initial,
-          { timeoutMs: INTERCEPTOR_TIMEOUT_MS });
-        if (!windows.includes(win)) return null; // unmapped during await
-        const ev = finalPayload as WindowProposedEvent | undefined;
-        const modified = ev ? validateState(ev.candidate) : null;
-        if (modified) candidate = cloneState(modified);
+        const current = cloneState(win.windowState);
+        let candidate = mergeProposal(current, proposal);
+        const wasFloating = current.presentation === "floating";
+        const becomingFloating = candidate.presentation === "floating";
+
+        if (pluginBus) {
+          const initial: WindowProposedEvent = {
+            surfaceId, reason, current,
+            candidate: cloneState(candidate),
+          };
+          const finalPayload = await pluginBus.emit(WINDOW_EVENT.proposed, initial,
+            { timeoutMs: INTERCEPTOR_TIMEOUT_MS });
+          if (!windows.includes(win)) return null;
+          const ev = finalPayload as WindowProposedEvent | undefined;
+          const modified = ev ? validateState(ev.candidate) : null;
+          if (modified) candidate = cloneState(modified);
+        }
+
+        const changed = diffState(current, candidate);
+        if (changed.length === 0) return cloneState(current);
+
+        // Capture the initial floating rect when a window enters
+        // 'floating' for the first time. The window stays visually in
+        // place across the transition: its current outer becomes the
+        // floating rect.
+        if (!wasFloating && becomingFloating && win.floatingRect === undefined) {
+          win.floatingRect = { ...win.outer };
+        }
+
+        win.windowState = candidate;
+
+        if (pluginBus) {
+          const ev: WindowCommittedEvent = {
+            surfaceId, reason,
+            previous: current,
+            current: cloneState(candidate),
+            changed: [...changed],
+          };
+          pluginBus.emit(WINDOW_EVENT.committed, ev);
+        }
+
+        if (changed.some((f) => GEOMETRY_FIELDS.includes(f))) {
+          driver.schedule("state-changed");
+        }
+        return cloneState(candidate);
+      } finally {
+        resolveSelf();
       }
+    },
 
-      const changed = diffState(current, candidate);
-      if (changed.length === 0) return cloneState(current);
+    async markInitialCommitComplete(surfaceId, info) {
+      const win = windows.find((w) => w.surfaceId === surfaceId);
+      if (!win || !win.pendingInitialCommit) return;
+      // Serialize like propose -- any in-flight proposes (e.g.
+      // set_maximized called between get_toplevel and the initial
+      // commit) must commit before we read state.
+      const prior = win.pendingMutation;
+      let resolveSelf!: () => void;
+      win.pendingMutation = new Promise<void>((res) => { resolveSelf = res; });
+      try {
+        if (prior) await prior;
+        if (!windows.includes(win) || !win.pendingInitialCommit) return;
 
-      // Capture the initial floating rect when a window enters 'floating'
-      // for the first time (no prior floatingRect stored). The window
-      // stays visually in place across the transition: its current outer
-      // becomes the floating rect.
-      if (!wasFloating && becomingFloating && win.floatingRect === undefined) {
-        win.floatingRect = { ...win.outer };
+        let finalState: WindowState = cloneState(win.windowState);
+        if (pluginBus) {
+          const initial: WindowPreconfigureEvent = {
+            surfaceId,
+            appId: info.appId, title: info.title,
+            initialState: cloneState(win.windowState),
+          };
+          const finalPayload = await pluginBus.emit(WINDOW_EVENT.preconfigure, initial,
+            { timeoutMs: INTERCEPTOR_TIMEOUT_MS });
+          if (!windows.includes(win)) return;
+          const ev = finalPayload as WindowPreconfigureEvent | undefined;
+          const modified = ev ? validateState(ev.initialState) : null;
+          if (modified) finalState = cloneState(modified);
+        }
+
+        const previous = cloneState(win.windowState);
+        const changed = diffState(previous, finalState);
+        if (changed.length > 0) {
+          win.windowState = finalState;
+          if (pluginBus) {
+            const ev: WindowCommittedEvent = {
+              surfaceId, reason: "window-rule",
+              previous,
+              current: cloneState(finalState),
+              changed: [...changed],
+            };
+            pluginBus.emit(WINDOW_EVENT.committed, ev);
+          }
+        }
+
+        // Clear the flag BEFORE scheduling so the configure suppression
+        // in applyLayout doesn't fire for the post-rule pass.
+        win.pendingInitialCommit = false;
+
+        if (changed.some((f) => GEOMETRY_FIELDS.includes(f))) {
+          driver.schedule("state-changed");
+        }
+        // Always await settled before the forced configure: a prior
+        // propose may have scheduled a layout pass we haven't picked up
+        // yet; without this, the configure fires with a stale rect (the
+        // placeholder -1,-1 from addWindow if the pass hasn't run, or
+        // the pre-state-change rect if it has).
+        await driver.settled();
+        if (!windows.includes(win)) return;
+
+        // Force the initial configure. applyLayout normally only fires
+        // configure when content size changed, but the first configure
+        // must ALWAYS go out so the client has a serial to ack.
+        if (configure) {
+          const content = contentOf(win);
+          configure(win.surfaceId, content.width, content.height);
+        }
+      } finally {
+        resolveSelf();
       }
-
-      win.windowState = candidate;
-
-      if (pluginBus) {
-        const ev: WindowCommittedEvent = {
-          surfaceId, reason,
-          previous: current,
-          current: cloneState(candidate),
-          changed: [...changed],
-        };
-        pluginBus.emit(WINDOW_EVENT.committed, ev);
-      }
-
-      // Schedule a relayout when geometry-relevant fields changed.
-      if (changed.some((f) => GEOMETRY_FIELDS.includes(f))) {
-        driver.schedule("state-changed");
-      }
-
-      return cloneState(candidate);
     },
 
     getWindowState(surfaceId) {
@@ -734,9 +760,6 @@ export function createWm(
       const win = windows.find((w) => w.surfaceId === surfaceId);
       if (!win) return;
       win.floatingRect = { ...rect };
-      // Trigger a layout pass so the resolver picks up the new rect.
-      // Cheap: floating windows bypass the layout plugin (the resolver
-      // dispatches them in-core).
       driver.schedule("state-changed");
     },
 
