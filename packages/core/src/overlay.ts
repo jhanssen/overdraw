@@ -12,6 +12,7 @@
 import type { CompositorState, Layer } from "./protocols/ctx.js";
 import { placeOverlay } from "./overlay-position.js";
 import type { OverlayRequest, Rect, Output } from "./overlay-position.js";
+import { rebuildLayerStack } from "./layer-stack.js";
 
 // A layer an overlay may target. `content` is reserved for client/plugin windows
 // (owned by the WM stack), so overlays choose a non-content layer.
@@ -59,13 +60,19 @@ export function createOverlayBroker(state: CompositorState, output: Output): Ove
   const overlays = new Map<number, OverlayHandle & { req?: CreateOverlayParams; windowBound?: boolean }>();
   let out = { width: output.width, height: output.height };
 
-  // Push the ordered surface-id list for one layer to the sink.
-  function pushLayer(layer: OverlayLayer): void {
+  // Per-layer ordered ids contributed by this broker. Published on the state
+  // so the unified layer-stack rebuild can merge it with layer-shell surfaces.
+  // Window-bound surfaces (decorations) sit in the WM stack instead, so they
+  // are excluded here.
+  function layerIds(layer: OverlayLayer): number[] {
     const ids: number[] = [];
-    // Window-bound surfaces (decorations) are not on any flat layer; their z-order
-    // is owned by the WM stack, so they are excluded here.
     for (const o of overlays.values()) if (!o.windowBound && o.layer === layer) ids.push(o.surfaceId);
-    state.compositor.setLayerSurfaces?.(layer, ids);
+    return ids;
+  }
+  state.overlayLayerIds = layerIds;
+
+  function pushLayer(layer: OverlayLayer): void {
+    rebuildLayerStack(state, layer);
   }
 
   return {

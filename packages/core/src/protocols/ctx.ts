@@ -23,6 +23,11 @@ type RegionSlot = import("./region.js").Region | null | undefined;
 export interface SurfaceRecord {
   id: number;
   resource: Resource;
+  // The role assigned to this wl_surface. Values used today:
+  //   "xdg_toplevel" | "xdg_popup" | "cursor" | "layer_surface"
+  // null until a role is assigned. Once non-null, the wl_surface cannot
+  // be re-roled (the role protocols enforce this; cross-role assignment
+  // posts the appropriate protocol error).
   role: string | null;
   // Double-buffered commit state. Requests accumulate into `pending`; commit
   // either APPLIES it (effective-desync) or CACHES it (effective-sync subsurface)
@@ -56,6 +61,10 @@ export interface SurfaceRecord {
   // consumed; stored for future use (alpha-aware overdraw skipping).
   opaqueRegion?: RegionSlot;
   xdgSurface: XdgSurfaceRecord | null;
+  // Non-null when this wl_surface has the zwlr_layer_surface_v1 role
+  // (role === "layer_surface"). Exclusive with xdgSurface (a wl_surface
+  // has at most one role).
+  layerSurface?: LayerSurfaceRecord | null;
   mapped?: boolean;
   hasContent?: boolean;  // a buffer has been committed + uploaded at least once
   // Set once the window's unmap teardown has run (explicit wl_surface.destroy OR
@@ -396,6 +405,25 @@ export interface CompositorState {
   // compositor.setOutputStack directly (that would clobber subsurfaces +
   // popups, which the workspace plugin doesn't model).
   outputToplevelStacks?: Map<number, number[]>;
+  // zwlr_layer_surface_v1 records, keyed by the layer-surface resource.
+  // The role state for every layer-shell surface lives here; the WM is NOT
+  // aware of these (they go through setLayerSurfaces, not addWindow).
+  layerSurfaces?: Map<Resource, LayerSurfaceRecord>;
+  // Reverse index: wl_surface -> layer-surface record. Lets wl_surface.commit
+  // / unmapAndTeardownSurface find the layer-surface role record by the
+  // wl_surface alone.
+  layerSurfacesBySurface?: Map<Resource, LayerSurfaceRecord>;
+  // Reserved-zone registry: tracks which output edges have reserved bands
+  // (layer-shell exclusive zones today). The WM's layout driver consults it
+  // via effectiveRect() to compute the tile region. Single shared instance
+  // for the lifetime of the compositor; installProtocols creates it.
+  reservedZones?: import("../wm/reserved-zones.js").ReservedZoneRegistry;
+  // Per-layer ordered surface ids contributed by the overlay broker. Set
+  // by the broker when it's constructed (main.ts wires this); read by
+  // layer-stack.ts's rebuild to merge with layer-shell surfaces before
+  // pushing to setLayerSurfaces. Excludes the "content" layer (which the
+  // WM stack owns).
+  overlayLayerIds?: (layer: Exclude<Layer, "content">) => number[];
 }
 
 export interface SubsurfaceRecord {
@@ -460,13 +488,22 @@ export interface XdgSurfaceRecord {
   configuredHeight?: number;
 }
 
-// An xdg_popup: a compositor-positioned child of a parent xdg_surface. The
-// computed rect is parent-relative (in the parent's window-geometry space).
+// An xdg_popup: a compositor-positioned child surface. `parent` is the
+// xdg_surface parent when present (the normal xdg-shell case: toplevel or
+// nested popup). When the popup was created with a NULL parent via
+// xdg_surface.get_popup AND subsequently re-parented via
+// zwlr_layer_surface_v1.get_popup, `parent` is null and `layerParent`
+// carries the owning layer surface. Exactly one of `parent` / `layerParent`
+// is non-null on a fully-parented popup; both null is the transient state
+// between xdg_surface.get_popup(NULL) and the layer-shell get_popup call.
+// `rect` is parent-relative (in the parent's surface-local space; for a
+// layer-shell parent that's the layer-surface's output-space rect origin).
 export interface PopupRecord {
-  resource: Resource;            // xdg_popup
-  xdgSurface: XdgSurfaceRecord;  // the popup's xdg_surface
-  parent: XdgSurfaceRecord;      // parent xdg_surface (toplevel or another popup)
-  rect: { x: number; y: number; width: number; height: number }; // parent-relative
+  resource: Resource;                       // xdg_popup
+  xdgSurface: XdgSurfaceRecord;             // the popup's xdg_surface
+  parent: XdgSurfaceRecord | null;          // parent xdg_surface; null when layer-parented
+  layerParent?: LayerSurfaceRecord | null;  // set by zwlr_layer_surface_v1.get_popup
+  rect: { x: number; y: number; width: number; height: number };
   positioner: import("../popup-position.js").Positioner;
   mapped: boolean;
 }
@@ -476,6 +513,86 @@ export interface ToplevelRecord {
   xdgSurface: XdgSurfaceRecord;
   title: string | null;
   appId: string | null;
+}
+
+// Protocol-level layer enum from zwlr_layer_shell_v1.layer. Uses the
+// protocol's spelling ("bottom"); converted to the compositor's Layer type
+// ("below") at the rendering boundary.
+export type LayerShellLayer = "background" | "bottom" | "top" | "overlay";
+
+// Protocol-level anchor bitfield encoding from zwlr_layer_surface_v1.anchor:
+// top=1 | bottom=2 | left=4 | right=8. Stored as a number; helpers in
+// layer-shell-position.ts decode it.
+export type LayerShellAnchor = number;
+
+// Protocol-level keyboard-interactivity enum.
+export type LayerShellKeyboardInteractivity = "none" | "exclusive" | "on_demand";
+
+// One snapshot of the double-buffered zwlr_layer_surface_v1 state. Stored
+// in pending until wl_surface.commit applies it. Each field is optional:
+// undefined = "not changed since last commit".
+export interface LayerSurfacePending {
+  width?: number;
+  height?: number;
+  anchor?: LayerShellAnchor;
+  exclusiveZone?: number;
+  margin?: { top: number; right: number; bottom: number; left: number };
+  keyboardInteractivity?: LayerShellKeyboardInteractivity;
+  layer?: LayerShellLayer;
+  // v5 set_exclusive_edge: an anchor bit (1/2/4/8) selecting which edge
+  // the exclusive zone applies to when the anchor combination is ambiguous
+  // (corner anchors). 0 = "auto-deduce from anchor."
+  exclusiveEdge?: number;
+}
+
+// The applied state of a zwlr_layer_surface_v1. Mirrors LayerSurfacePending
+// but every field has a concrete value (the protocol's default-state spec).
+export interface LayerSurfaceApplied {
+  width: number;
+  height: number;
+  anchor: LayerShellAnchor;
+  exclusiveZone: number;                // 0 default; -1 = ignore reserved; >0 = reserve
+  margin: { top: number; right: number; bottom: number; left: number };
+  keyboardInteractivity: LayerShellKeyboardInteractivity;
+  layer: LayerShellLayer;
+  exclusiveEdge: number;
+}
+
+// A zwlr_layer_surface_v1 instance. Tracks the role state of a wl_surface
+// that has been assigned the layer-shell role. Lifetime: created in
+// zwlr_layer_shell_v1.get_layer_surface; destroyed by the matching
+// .destroy request OR by the wl_surface's destruction.
+export interface LayerSurfaceRecord {
+  resource: Resource;            // the zwlr_layer_surface_v1
+  surface: SurfaceRecord;        // the wl_surface this is roled onto
+  output: number;                // OUTPUT_DEFAULT today
+  namespace: string;             // client-supplied identifier (e.g. "panel")
+  pending: LayerSurfacePending;
+  applied: LayerSurfaceApplied;
+  // Configure handshake bookkeeping (mirrors XdgSurfaceRecord). null until
+  // the first configure goes out; updated each time a new configure is sent.
+  lastConfigureSerial: number | null;
+  // The last configured size we sent; used to skip redundant reconfigures.
+  configuredWidth: number;
+  configuredHeight: number;
+  // True after the client acked the most recent configure. The next
+  // wl_surface.commit may legally carry a buffer.
+  acked: boolean;
+  // True once the surface has presentable content (first buffer-bearing
+  // commit was processed). The window.map / setLayerSurfaces push happens
+  // on the transition from false to true.
+  mapped: boolean;
+  // Output-space rect, computed at apply time from anchor/size/margin
+  // against the (effective)Rect appropriate to the exclusive-zone mode.
+  // Undefined until applyLayerSurfaceInitial runs.
+  rect?: { x: number; y: number; width: number; height: number };
+  // The reserved-zone-registry id under which this surface's exclusive
+  // zone (if any) is registered. Set when zone > 0 produces a valid edge;
+  // cleared otherwise. Used to clear/update without scanning.
+  reservedZoneId?: string;
+  // Cleared on destroy / wl_surface teardown to short-circuit any in-flight
+  // sweep that still holds a reference (the sweep pattern used elsewhere).
+  destroyed: boolean;
 }
 
 export interface DmabufParams {

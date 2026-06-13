@@ -13,7 +13,12 @@ import { computeBaseStack, emitSubtree } from "../subsurfaces.js";
 
 // Output-space top-left of a parent xdg_surface: a toplevel uses its WM window
 // rect; a popup parent uses its own resolved output position (recursively).
-export function parentOutputOrigin(state: CompositorState, parent: XdgSurfaceRecord): { x: number; y: number } | null {
+// `parent` may be null when the popup was created with a NULL parent and not
+// yet re-parented via zwlr_layer_surface_v1.get_popup; in that case there is
+// no resolvable origin and we return null. T7 (popup layer-parenting) extends
+// this to also resolve a layer-shell parent origin via PopupRecord.layerParent.
+export function parentOutputOrigin(state: CompositorState, parent: XdgSurfaceRecord | null): { x: number; y: number } | null {
+  if (!parent) return null;
   if (parent.role === "toplevel" && parent.surface) {
     const surface = parent.surface;
     const win = state.wm?.state.windows.find((w) => w.surfaceId === surface.id);
@@ -104,10 +109,13 @@ export function maybeDismissGrabbedPopup(ctx: Ctx, x: number, y: number): boolea
 // popup, parent without a wl_surface). Used to attribute a popup to a single
 // toplevel for per-output stack filtering.
 function popupRootToplevelId(state: CompositorState, pr: PopupRecord): number | null {
-  let parent: XdgSurfaceRecord = pr.parent;
+  let parent: XdgSurfaceRecord | null = pr.parent;
   // Bounded walk to avoid pathological cycles (popups shouldn't cycle, but a
-  // misbehaving client / mis-set state shouldn't lock us up).
+  // misbehaving client / mis-set state shouldn't lock us up). A layer-shell-
+  // parented popup has parent === null; it has no root toplevel, so per-output
+  // toplevel-filter expansion drops it (handled at the caller).
   for (let i = 0; i < 64; i++) {
+    if (!parent) return null;
     if (parent.role === "toplevel") return parent.surface?.id ?? null;
     if (parent.role !== "popup" || !parent.popup) return null;
     const grand = state.popups?.get(parent.popup);

@@ -69,15 +69,27 @@ export type WindowRect = {
   height: number;
 };
 
-// Emitted when a toplevel maps (first content). `rect` is the core-decided
+// The kind of mapped surface. `toplevel` is the normal xdg_toplevel case;
+// `layer-shell` is a zwlr_layer_surface_v1 surface (status bars, wallpapers,
+// notifications). Matches the value set on LayoutWindow.role.
+export type WindowMapRole = "toplevel" | "layer-shell";
+
+// Emitted when a window maps (first content). `rect` is the core-decided
 // placement (output px). `appId`/`title` are the toplevel's, resolved at emit
 // time; either may be null (a client may set_app_id after its first commit --
-// the window.change event then carries the update).
+// the window.change event then carries the update). For layer-shell surfaces,
+// both are null (layer-shell carries a `namespace` instead of app_id/title;
+// not surfaced on this event).
+//
+// `role` discriminates toplevel vs layer-shell so subscribers (status bars,
+// workspace plugins, etc.) can branch without looking up the surface
+// elsewhere. Omitted on emit defaults to "toplevel" at the consumer.
 export type WindowMapEvent = {
   surfaceId: number;
   rect: WindowRect;
   appId: string | null;
   title: string | null;
+  role?: WindowMapRole;
 };
 
 // Emitted when a mapped toplevel is destroyed/unmapped.
