@@ -133,7 +133,28 @@ pluginBus.subscribe("compositor.shutdown", () => shutdown("compositor.shutdown")
 const config = await loadConfig(parseConfigArg(process.argv.slice(2)));
 console.log(`[overdraw] config: ${config.sourcePath ?? "(defaults; no config file)"}`);
 
-const dims = addon.start(gpuBin, onFrame, onInput);
+// Backend selection. Production default: KMS (bare-metal). Override:
+//   --backend=nested (e.g. running under Hyprland during dev)
+//   OVERDRAW_BACKEND=nested
+// `--card=/dev/dri/cardN` selects which DRM device libseat opens for KMS;
+// default /dev/dri/card0.
+function parseBackendOpts(argv: string[]): { backend: "kms" | "nested"; card?: string } {
+  let backend: "kms" | "nested" = "kms";
+  let card: string | undefined;
+  const envBackend = process.env.OVERDRAW_BACKEND;
+  if (envBackend === "nested" || envBackend === "kms") backend = envBackend;
+  for (const a of argv) {
+    if (a === "--backend=nested") backend = "nested";
+    else if (a === "--backend=kms") backend = "kms";
+    else if (a.startsWith("--card=")) card = a.slice("--card=".length);
+  }
+  return card ? { backend, card } : { backend };
+}
+const backendOpts = parseBackendOpts(process.argv.slice(2));
+console.log(`[overdraw] backend: ${backendOpts.backend}`
+  + (backendOpts.card ? ` card=${backendOpts.card}` : ""));
+
+const dims = addon.start(gpuBin, onFrame, onInput, backendOpts);
 console.log(`[overdraw] compositor up; output ${dims.width}x${dims.height}`);
 
 // Bring up the JS compositor (nested present to the host swapchain over the wire).

@@ -42,19 +42,29 @@ set(NATIVE_INCLUDE ${CMAKE_SOURCE_DIR}/native)
 set(XDG_SHELL_DIR ${CMAKE_SOURCE_DIR}/native/wayland/generated)
 
 # ---- GPU process (native, no JS) ----
-add_executable(overdraw-gpu-process
+set(OVERDRAW_GPU_PROCESS_SOURCES
     gpu-process/src/main.cpp
     gpu-process/src/host_window.cpp
     gpu-process/src/output_host_window.cpp
     gpu-process/src/allocator.cpp
     gpu-process/src/event_loop_epoll.cpp
     ${XDG_SHELL_DIR}/xdg-shell-protocol.c)
+if(OVERDRAW_KMS)
+    list(APPEND OVERDRAW_GPU_PROCESS_SOURCES
+        gpu-process/src/drm_utils.cpp
+        gpu-process/src/kms_scanout_ring.cpp
+        gpu-process/src/kms_output.cpp)
+endif()
+add_executable(overdraw-gpu-process ${OVERDRAW_GPU_PROCESS_SOURCES})
 target_include_directories(overdraw-gpu-process PRIVATE
     ${IPC_INCLUDE} ${XDG_SHELL_DIR} ${WAYLAND_CLIENT_INCLUDE_DIRS}
     ${GBM_INCLUDE_DIRS} ${LIBDRM_INCLUDE_DIRS})
 target_link_libraries(overdraw-gpu-process PRIVATE
     dawn::webgpu_dawn ${WAYLAND_CLIENT_LIBRARIES}
     ${GBM_LIBRARIES} ${LIBDRM_LIBRARIES} pthread dl rt)
+if(OVERDRAW_KMS)
+    target_compile_definitions(overdraw-gpu-process PRIVATE OVERDRAW_KMS=1)
+endif()
 # -rdynamic so backtrace_symbols_fd can resolve function names in the crash handler.
 target_link_options(overdraw-gpu-process PRIVATE -rdynamic)
 

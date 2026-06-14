@@ -56,9 +56,18 @@ Out (deferred):
   existing client-buffer policy.
 - **Tearing / immediate flips, adaptive sync (VRR), explicit-sync
   KMS API.** v1 uses standard atomic + page-flip events.
-- **NVIDIA proprietary as KMS target.** The architecture admits it, but
-  the v1 development target is Intel i915 on the test box. NVIDIA is
-  out of scope for v1 (kept as a known limitation, not a stub).
+- **Driving the panel from a GPU other than the laptop's iGPU.** On the
+  test laptop (and most hybrid laptops), the built-in display is wired by
+  hardware to the Intel iGPU; the NVIDIA dGPU has no display path to it.
+  Slice 4 targets the iGPU's display engine because that is the only path
+  to the panel on this machine — not a deliberate "no NVIDIA" choice but
+  the topology. NVIDIA participates here only via PRIME render offload
+  (a per-client opt-in render resource whose output is dmabuf-shared back
+  to Intel for scanout), which is orthogonal to KMS slice 4 and works the
+  same way it does today for nested-mode clients. Configurations where
+  the scanout GPU IS NVIDIA (some desktops, some external-GPU rigs) are
+  not part of v1's test matrix; the KMS code is written driver-agnostic
+  (libdrm atomic, libgbm) so they aren't precluded, just unverified.
 - **TTY ownership without logind** (direct VT_SETMODE, seatd-launch).
   v1 requires logind. If we ever ship without systemd, libseat can
   switch to a seatd backend with no code change — but seatd isn't being
@@ -534,7 +543,7 @@ dependency order. Each slice is committable, leaves the existing
 nested path working, and produces something demonstrable before the
 next slice starts.
 
-### Slice 1 — libseat + libinput (no display changes)
+### Slice 1 — libseat + libinput (no display changes) ✅ landed
 
 The smallest end-to-end. The existing nested compositor keeps working
 on the host Wayland session for display; input is the only thing
@@ -555,7 +564,7 @@ This slice is mostly additive — it doesn't replace the existing
 `WaylandInputBackend`; it adds a sibling. Easy to back out if libseat
 or libinput integration hits an unknown.
 
-### Slice 2 — output-backend seam (refactor only, no new backend)
+### Slice 2 — output-backend seam (refactor only, no new backend) ✅ landed
 
 Lift `HostWindow` behind an `OutputBackend` interface. The GPU
 process's `main.cpp` builds a `HostWindowOutputBackend` and drives it
@@ -564,7 +573,7 @@ through the new abstract interface. No behavior change.
 Validation: every existing test continues to pass (nested mode is
 unchanged). Refactor commit.
 
-### Slice 3 — `wl_output` real (for the nested backend)
+### Slice 3 — `wl_output` real (for the nested backend) ✅ landed
 
 The host backend reports its real output descriptor (host
 `wl_output`'s actual mode, scale, geometry) via the new
@@ -578,40 +587,75 @@ make / model instead of fabricated values. `wl_output_get_make` /
 This is the long-standing `wl_output` gap (`status.md` "Read first")
 landed without depending on KMS.
 
-### Slice 4 — KMS minimal: scan out a solid color
+### Slice 4 — KMS minimal: scan out a solid color, page-flip-paced ✅ landed
+
+**Slices 4 and 5 in the original plan are merged.** The original split (slice
+4 = "scan out a solid color, timer-driven"; slice 5 = "real frame clock +
+page-flip pacing") would have meant slice 4 ships a `uv_timer`-driven KMS
+render loop that slice 5 then immediately rips out and replaces with
+page-flip-driven scheduling. The slice-4 timer code would be throwaway.
+Avoiding throwaway code is project policy, so the two are landed together.
+`IN_FENCE_FD` (originally a slice-5 follow-on) is also included from day
+one: at vsync rate there IS in-flight GPU work at commit time and the
+fence matters; the original "defer to slice 5" was tied to "defer because
+timer-paced slice 4 has no in-flight work," which goes away with the
+merge.
 
 The `KmsOutputBackend` brings up DRM/atomic on `eDP-1`, allocates the
-GBM scanout ring, dual-imports as `wgpu::Texture`, and the JS
-compositor renders the (currently empty) compositor scene into it.
-No clients, no input routing — just "the laptop panel displays the
-compositor's clear color, driven by page-flips."
+GBM scanout ring (3 slots, LINEAR modifier), dual-imports as
+`wgpu::Texture`, drives an initial atomic modeset, and from then on
+runs the compositor's render loop on page-flip events: on
+`DRM_EVENT_FLIP_COMPLETE`, the prior scanout slot moves to FREE and
+the next render fires. The `uv_timer` is bypassed for KMS from day one.
+`IN_FENCE_FD` rides each atomic commit so the kernel doesn't latch a
+scanout buffer before the GPU finishes rendering into it.
+
+No clients, no input routing yet — just "the laptop panel displays the
+compositor's clear color, vsync-locked." The compositor's clear color
+will be set to hot pink for slice-4 verification (revert to black
+when slice 4 lands).
 
 Validation: SSH to the remote box, `sudo systemctl stop gdm`, run
-`overdraw --backend=kms`, the panel shows the clear color. `dmesg` /
-DRM debugfs confirms our process is master on card1. Kill the
-process; the panel goes black (gdm not restarted yet). Restart gdm,
-desktop returns.
+`overdraw --backend=kms`, the panel shows hot pink. `dmesg` / DRM
+debugfs confirms our process is master on card1. Frame times
+measured against the panel's vblank cadence. Kill the process; the
+panel goes black (gdm not restarted yet). Restart gdm, desktop
+returns.
 
 This is the first time the project drives hardware. Everything from
 here on is layering existing functionality on top.
 
-### Slice 5 — Real frame clock + page-flip pacing
+Acknowledged deferral (NOT silent): `wl_buffer.release` is still gated
+by `onSubmittedWorkDone` (the JS compositor's submit-complete signal),
+not by the scanout-slot's flip-complete. That's the right gate for
+nested mode but wrong for KMS — a client buffer could be released
+back to its client while still being scanned out. The bug is latent
+in slice 4+5 because there ARE NO CLIENTS in the merged slice.
+Slice 6 (libinput → real clients on KMS) is where the gate change
+has to land, by design, because that's when client buffers start
+flowing through KMS. This is an explicit, user-approved deferral —
+not a silent gap.
 
-Wire the KMS page-flip event into the compositor's render loop.
-Render is gated on flip-complete; the `uv_timer` is bypassed for KMS.
+### Slice 5 — (merged into slice 4) ✅ landed
 
-Validation: a moving rectangle (or `foot` with a cursor blinking)
-runs at the panel's native refresh, with no tearing. Frame times
-measured at the panel's vblank cadence.
+See slice 4.
 
 ### Slice 6 — libinput routed into real clients
 
 Connect Slice 1's libinput input to the running KMS compositor. Real
 clients (`foot`, `kitty`) become interactive on the bare-metal panel.
 
+Includes the buffer-release-via-flip-complete change deferred from
+slice 4+5: client `wl_buffer.release` is gated on the scanout slot's
+flip-complete instead of `onSubmittedWorkDone`. This is the slice
+where it has to land because it's the first slice where client
+buffers actually flow through KMS scanout.
+
 Validation: launch `foot` over SSH against the running KMS overdraw,
 type into it, click on it. Everything that worked nested now works
-on KMS.
+on KMS. Buffer release timing is correct: a client that
+double-buffers does not see its just-released buffer torn between
+old and new content.
 
 ### Slice 7 — VT switch
 
@@ -630,19 +674,21 @@ preserved across the pause).
 fabricated; frame clock is a timer for the KMS path) are removed or
 moved. `architecture.md` "Phase 2" references are updated to reflect
 what shipped vs what's still deferred (multi-output, hardware
-cursor, NVIDIA).
+cursor, scanout from non-Intel GPUs, hotplug).
 
 ## Open points (resolve before slice 4)
 
-1. **Buffer release ordering with KMS.** Today the JS compositor's
-   `buffer-release lifecycle` uses `onSubmittedWorkDone` to release a
-   client buffer once the compositor's submit completes. With KMS, a
-   client buffer is still being sampled until the scanout slot that
-   sampled it FLIPS — and we need the flip event, not just submit
-   completion, to release. This means an extra serial chain
-   (compositor submit → flip-complete → buffer release). Where does
-   the flip-complete fan-in live (GPU process side-channel message →
-   core's `client-buffer-lifecycle.ts`)?
+1. **Buffer release ordering with KMS** — RESOLVED: deferred to slice 6
+   with explicit acknowledgment in slice 4+5's notes. Today's
+   `onSubmittedWorkDone` gating is wrong for KMS in the presence of
+   clients (a client buffer can be released while still being scanned
+   out), but slice 4+5 has no clients so the bug is latent. Slice 6 is
+   where clients arrive on KMS and is the natural home for the gate
+   change. The chain: compositor submit → flip-complete (carried by
+   `drmHandleEvent`) → GPU process sends a new
+   `ScanoutSlotReleased{slotIdx, retireSerial}` side-channel msg → core
+   advances the per-serial release list that `client-buffer-lifecycle.ts`
+   already maintains. Code design lives in slice 6.
 2. **GPU-process pump fairness.** The GPU process's epoll loop today
    multiplexes wire/ctrl/host-display fds. KMS adds the DRM fd. The
    fd-arming policy (arm-on-need) extends naturally, but worth
@@ -658,23 +704,33 @@ cursor, NVIDIA).
    instead of WSI. The wire-side handle is just a wire-wrapped
    `wgpu::Texture` either way. Should be a transparent backend swap;
    confirm during slice 4.
-4. **Dawn explicit-sync over KMS.** Today, client-buffer dmabufs
-   carry implicit-sync read fences exported via
-   `DMA_BUF_IOCTL_EXPORT_SYNC_FILE`. For KMS scanout we should pass
-   the compositor's submit-completion fence via the atomic commit's
-   `IN_FENCE_FD` property so the kernel doesn't latch the buffer
-   before our render is done. This is straightforward but easy to
-   miss — flagging it now.
-5. **NVIDIA scoping.** The test box has an NVIDIA GPU as a render-
-   capable but display-disconnected card; v1 ignores it. If we ever
-   target Optimus laptops with the dGPU as the active display, that's
-   its own work. Worth saying loudly that v1 = i915-only as a known
-   limitation.
+4. **Dawn explicit-sync over KMS** — RESOLVED: included in slice 4+5
+   from day one. Today's `onSubmittedWorkDone` plus implicit-sync on
+   client-buffer dmabufs is not enough on the scanout side: the kernel
+   could latch a scanout buffer before the compositor's render into it
+   completes. Mitigation: export Dawn's submit-completion fence (the
+   same primitive `OnSubmittedWorkDone` builds on) as a sync_file fd
+   and attach it to each atomic commit via the plane's `IN_FENCE_FD`
+   property. The kernel waits on the fence before scanning out.
+   Originally proposed as a slice-5 follow-on; merged forward to
+   slice 4+5 because slice 4+5 now runs at vsync rate where in-flight
+   GPU work is the steady state.
+5. **Verify Dawn picks the iGPU adapter.** Hybrid laptops have multiple
+   Vulkan-capable adapters; the GPU process today calls
+   `EnumerateAdapters` and uses the first one. On the test box that
+   happens to resolve to Intel (verified by inspecting `main_device` in
+   the dmabuf feedback message — `0xe280` = major 226 minor 128 =
+   `/dev/dri/renderD128` = Intel). We need this to remain true after KMS
+   slice 4: the compositor's GBM device is opened on `/dev/dri/card1`
+   (Intel, the scanout target), and the Dawn adapter must allocate
+   textures on the same physical GPU or the dual-import will fail. A
+   sanity check (assert `gbm_device_get_fd`'s major/minor matches the
+   adapter's device id) catches drift.
 
 ## Verification target
 
 Slice 6 done = the project meets the architecture-doc claim "phase 2
-bare metal (DRM/KMS)" for a single-output, i915-only, software-cursor
+bare metal (DRM/KMS)" for a single-output, single-GPU, software-cursor
 configuration. From a user's perspective:
 
 - SSH to a Linux box with no graphical session running.

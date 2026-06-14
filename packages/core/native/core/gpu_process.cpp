@@ -13,7 +13,8 @@
 
 namespace overdraw::core {
 
-GpuProcess spawnGpuProcess(const char* binPath, uint32_t headlessW, uint32_t headlessH) {
+GpuProcess spawnGpuProcess(const char* binPath, uint32_t headlessW, uint32_t headlessH,
+                           OutputBackendKind output) {
     GpuProcess out;
     const bool headless = headlessW != 0 && headlessH != 0;
     int wireFds[2], ctrlFds[2], inputFds[2];
@@ -62,12 +63,18 @@ GpuProcess spawnGpuProcess(const char* binPath, uint32_t headlessW, uint32_t hea
         std::snprintf(a1, sizeof(a1), "%d", wireFds[1]);
         std::snprintf(a2, sizeof(a2), "%d", ctrlFds[1]);
         std::snprintf(a3, sizeof(a3), "%d", inputFds[1]);
+        // Output-backend argv flag: only meaningful in non-headless mode (headless
+        // has no output backend at all). Pass it explicitly so the child does not
+        // have to infer from environment.
+        const char* outputArg = output == OutputBackendKind::Kms
+            ? "--output=kms" : "--output=nested";
         if (headless) {
             std::snprintf(asize, sizeof(asize), "%ux%u", headlessW, headlessH);
             ::execl(binPath, binPath, a1, a2, a3, "--headless", asize,
                     static_cast<char*>(nullptr));
         } else {
-            ::execl(binPath, binPath, a1, a2, a3, static_cast<char*>(nullptr));
+            ::execl(binPath, binPath, a1, a2, a3, outputArg,
+                    static_cast<char*>(nullptr));
         }
         ::perror("execl");
         _exit(127);

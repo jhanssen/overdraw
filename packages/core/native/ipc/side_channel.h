@@ -101,6 +101,32 @@ enum class Tag : uint8_t {
                              //   state.outputs is updated from this and re-emits to
                              //   bound wl_output / xdg_output resources. See
                              //   docs/drm-design.md "Output configuration".
+    SetDrmFd     = 'R',  // core -> gpu: hand off the DRM card fd (opened by the core
+                         //   via libseat) for the KMS output backend. The fd rides as
+                         //   SCM_RIGHTS on the same sendmsg. Sent during bring-up
+                         //   BEFORE Hello when --output=kms; the GPU process refuses
+                         //   to start the output backend until it arrives.
+                         //   See drm-design.md "Seat / VT lifecycle".
+    ScanoutReserve  = 'Z',  // core -> gpu: the core has ReserveTexture'd three wire
+                            //   handles (sent as `scanoutHandles[3]` on this msg).
+                            //   The GPU process completes its DRM/GBM/STM bring-up
+                            //   and InjectTexture's the three scanout-ring textures
+                            //   at the matching handles. width/height carry the
+                            //   scanout dims (chosen by the connector's mode).
+    ScanoutReady    = 'y',  // gpu -> core: the scanout ring is built and injected
+                            //   at the three reserved handles. ok=1 success, 0 failure.
+                            //   Sent once during bring-up.
+    ScanoutPresent  = 'z',  // core -> gpu: the JS compositor finished rendering
+                            //   into slot `surfaceBufId` (the slot index, 0..2).
+                            //   The GPU process runs drmModeAtomicCommit with
+                            //   IN_FENCE_FD set to the attached sync_file fd (via
+                            //   SCM_RIGHTS) so the kernel waits for GPU work to
+                            //   complete. fence fd may be absent (no SCM_RIGHTS
+                            //   payload) -- then no IN_FENCE_FD is added.
+    ScanoutFlipComplete = 'Y',  // gpu -> core: a page-flip retired a slot. The
+                                //   `surfaceBufId` field carries the slot index
+                                //   that just exited SCANOUT (now FREE). The core
+                                //   advances its slot state machine off this.
     Shutdown     = 'X',  // core -> gpu : clean termination request
 };
 
@@ -202,6 +228,17 @@ struct Message {
     char outputName [64] = {};
     char outputMake [64] = {};
     char outputModel[64] = {};
+
+    // ScanoutReserve: the three texture wire handles (id+generation) the core
+    // ReserveTexture'd for the KMS scanout ring slots, plus the three
+    // surfaceBufId values the core assigned for in-band access brackets on
+    // them. The GPU process InjectTexture's each ring slot's wgpu::Texture
+    // at the matching handle AND registers each surfaceBufId as a SurfaceBuf
+    // (producerOnCore=true, consumer side null) so the existing in-band
+    // BeginAccess/EndAccess machinery covers scanout brackets too. Width/
+    // height (above) carry the scanout dims.
+    WireHandle scanoutHandles[3] = {};
+    uint32_t   scanoutBufIds[3]  = {};
 };
 
 constexpr uint32_t kProtocolVersion = 1;

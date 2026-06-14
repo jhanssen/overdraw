@@ -4,7 +4,7 @@ Ground truth for what exists right now: current capabilities, known gaps, and
 what remains. The design lives in `architecture.md`; this file does not restate
 it. Present-tense only — no change history.
 
-Last updated: 2026-06-13 (post-slice-3 of phase-2 DRM/KMS work — real `wl_output` end-to-end. GPU process binds host `wl_output` and ships an `OutputDescriptor` ctrl message with the nested-window size + host-derived refresh/scale/transform/physical/make/model overrides; core's `state.outputs` is updated from it, `wl_output.ts` and `zxdg_output_v1.ts` advertise the real values. Host-window resize triggers `wgpu::Surface::Configure` natively in the GPU process + a fresh `OutputDescriptor`; the core propagates to `JsCompositor.setOutputSize`, `addon.updateOutputSize` (input backend clamp), `state.wm.state.output`, `state.relayout`, and `pluginBus.emit("output.changed")` which the two protocol modules subscribe to for bound-resource re-emit. Verified end-to-end on the dev box (240Hz host produces `@240083mHz` real values). Pure-unit coverage: `test/wl-output.test.js` (new, 8 tests) + `test/xdg-output.test.js` (8 tests, 4 added for re-emit + destroyed-resource scrub). Closes the two long-standing "Read first" gaps (fabricated `wl_output`; missing host-window-resize handling). Slices 1+2 (libseat + libinput; output-backend seam) remain in place. Design: `docs/drm-design.md`.
+Last updated: 2026-06-13 (post-slice-4+5 of phase-2 DRM/KMS work — bare-metal scanout. `--backend=kms` end-to-end: libseat opens `/dev/dri/cardN`, the GPU process runs DRM/atomic bring-up (connector + CRTC + primary plane + modeset), allocates a 3-slot GBM scanout ring at LINEAR modifier, dual-imports each slot as `wgpu::Texture` via `SharedTextureMemory`, and runs the JS compositor's render loop at vsync via page-flip-driven atomic commits with `IN_FENCE_FD` for explicit-sync. Verified on a 2560×1600 @165Hz Intel iGPU laptop: panel lights up at the compositor's clear color, clean shutdown. Reuses the existing producer/consumer SurfaceBuf machinery (with the consumer side empty -- kernel is the consumer, not a wgpu device) so in-band BeginAccess/EndAccess wire frames cover scanout brackets too. Production default is now KMS; tests default to nested when an output backend is needed. All 1006 unit + 129 GPU tests still pass. KMS path itself has no automated test coverage (manual verification only, with explicit user signoff). Slices 1-3 (libseat + libinput; output-backend seam; real wl_output + resize) remain in place. Design: `docs/drm-design.md`.
 
 ## Read first: gaps in advertised protocols (silent-gap risks)
 
@@ -361,6 +361,157 @@ advertised); multi-output (single OUTPUT_DEFAULT entry; the registry is
 sized for many, no second binding yet); KMS-side mode changes
 (`SetOutputMode` core→gpu request from drm-design.md is not wired — only
 the gpu→core direction is). Subpixel hint is hardcoded UNKNOWN.
+
+## KMS scanout backend (`--backend=kms`)
+
+Bare-metal output via DRM/KMS. The GPU process opens a card (passed by
+the core via libseat + SCM_RIGHTS), enumerates connector / CRTC /
+primary plane, allocates a 3-slot scanout ring via GBM, imports each
+buffer into the Dawn device as `SharedTextureMemory`, atomic-commits
+the initial modeset, and drives subsequent frames as page-flip-paced
+atomic commits with `IN_FENCE_FD` so the kernel waits for the
+compositor's submit before latching.
+
+### Backend selection
+
+The Node core's `addon.start(...)` takes an `opts` object selecting the
+output backend:
+
+```
+opts = { width, height }                        // headless (legacy + tests)
+opts = { backend: "kms" | "nested", card? }    // production / dev
+```
+
+Production defaults to `kms` (`packages/core/src/main.ts`). Override with
+`--backend=nested` or `OVERDRAW_BACKEND=nested` for dev under a host
+Wayland session. Tests default to nested when an output backend is
+requested (`headless: false` / `headless: null`); KMS tests must opt in
+explicitly via `setupCompositor({ headless: false, backend: "kms" })`.
+
+### Bring-up flow
+
+1. Core opens `/dev/dri/card0` (or `--card=<path>`) via libseat
+   (`Seat::openDevice`), holds the fd as long as the compositor runs.
+2. Core sends `ipc::Tag::SetDrmFd` to the GPU process via SCM_RIGHTS
+   BEFORE the regular Hello handshake.
+3. GPU process constructs `KmsOutputBackend(drmFd)`, calls `open()`:
+   enables atomic + universal-planes caps, picks the first connected
+   connector (env var `OVERDRAW_CONNECTOR` may pin a name), picks the
+   preferred mode (or mode 0), finds a compatible CRTC, finds a primary
+   plane, resolves all the atomic-commit property ids, creates a GBM
+   device on the DRM fd.
+4. GPU process sends `OutputDescriptor` to the core with the connector's
+   mode dimensions + EDID-derived physical mm + product name.
+5. Core (now knowing the dims) ReserveTexture's 3 wire handles for the
+   scanout ring slots, assigns a `surfaceBufId` per slot (re-using the
+   existing producer/consumer SurfaceBuf machinery for access brackets),
+   sends `ScanoutReserve { handles[3], bufIds[3], width, height }`.
+6. GPU process calls `KmsOutputBackend::initScanout(coreDevice)`:
+   allocates 3 GBM bo's (LINEAR modifier only in v1; see below),
+   dual-imports each as `SharedTextureMemory` + `wgpu::Texture` via
+   the existing `Allocator::importTexture` helper, `AddFB2WithModifiers`
+   per slot. For each slot it also registers a `SurfaceBuf` in the
+   surface-buf machinery (`producerOnCore=true`, consumer side empty
+   because the consumer is the kernel display engine, not another wgpu
+   device).
+7. GPU process `InjectTexture`s each slot's `wgpu::Texture` at the
+   matching reserved wire handle, then sends `ScanoutReady { ok=1 }`.
+8. Core proceeds with steady-state.
+
+### Steady-state frame
+
+1. JS compositor's `renderFrame()` calls `addon.acquireOutputTexture()`.
+2. Core's `Compositor::acquireOutputTextureHandle()` picks the next
+   FREE slot, writes an in-band BeginAccess frame (`kind=1`,
+   `SurfaceAccessPayload{surfaceBufId, producer=true}`) on the wire,
+   returns the slot's wire texture handle.
+3. JS records render commands + calls `queue.submit`. The in-band Begin
+   already opened the STM bracket so the submit is validated.
+4. JS calls `addon.presentOutput()`. Core writes an in-band EndAccess
+   frame on the wire, then sends `ipc::Tag::ScanoutPresent { surfaceBufId }`
+   on ctrl, then flushes the wire.
+5. GPU process's wire reader hits the EndAccess frame, calls
+   `runSurfaceEnd(surfaceBufId, producer=true)` which calls `mem.EndAccess`.
+   The exported sync_file fd is captured into
+   `scanoutSlotFenceFd[slot]` (instead of the usual cross-device fence
+   import path — there's no wgpu consumer device for scanout).
+6. GPU process's ctrl handler dispatches `ScanoutPresent`: looks up
+   `scanoutBufIdToSlot[surfaceBufId]` → slot index, picks up the
+   captured fence fd, builds an atomic commit with the slot's `fb_id`
+   on the primary plane + the fence fd on the plane's `IN_FENCE_FD`
+   property. The kernel waits for the fence before latching.
+7. Page-flip event arrives on the DRM fd. `KmsOutputBackend::pump()`
+   (called from the GPU process's epoll loop) runs `drmHandleEvent`
+   which calls the page-flip trampoline, which advances the ring's
+   state machine (`PENDING_FLIP` → `SCANOUT`, prior `SCANOUT` → `FREE`)
+   and sends `ipc::Tag::ScanoutFlipComplete { surfaceBufId }` on ctrl.
+8. Core's `drainCtrl` consumes `ScanoutFlipComplete`, advances the
+   local slot state machine. The retired slot is now FREE for the next
+   acquire.
+
+### Initial vs. steady-state atomic commit
+
+The initial commit is `ALLOW_MODESET` only (no `PAGE_FLIP_EVENT`,
+because the modeset is synchronous on return). Subsequent commits are
+`PAGE_FLIP_EVENT | ATOMIC_NONBLOCK`. The atomic TEST_ONLY flag strips
+both `PAGE_FLIP_EVENT` and `NONBLOCK` (the kernel rejects them on
+TEST_ONLY); TEST_ONLY always precedes the real commit so a rejection
+doesn't leave half-state. The initial commit additionally sets the
+connector→CRTC link, CRTC mode blob, and CRTC active.
+
+### Limitations of v1
+
+- **LINEAR modifier only** for scanout buffers. `IN_FORMATS` on the
+  plane advertises tiled modifiers (e.g. `I915_FORMAT_MOD_4_TILED`)
+  but those require auxiliary CCS planes for Dawn's
+  `ImportSharedTextureMemory`. Our import path is single-plane, so we
+  skip tiled modifiers and use LINEAR (universally supported, single-
+  plane). Tiled support is a perf follow-on requiring a multi-plane
+  import path; until then scanout is slightly slower than it could be.
+- **No buffer-release-via-flip yet** (deferred to slice 6 per
+  `drm-design.md`). Today's `wl_buffer.release` is gated by
+  `onSubmittedWorkDone`, which is wrong for KMS in the presence of
+  clients — a client buffer can be released while still being scanned
+  out. **Latent in slice 4** because slice 4 has no clients. Slice 6
+  is where the gate change has to land, by design.
+- **No KMS coverage in the test suite** (per user direction, option A
+  in the slice planning). KMS path verified only by manual run; tests
+  use nested or headless. A future virtual-DRM (vkms) test harness
+  would close this.
+- **NVIDIA / non-Intel scanout** unverified. Code is driver-agnostic
+  (libdrm atomic + libgbm) but only tested on Intel i915.
+- **No mode changes** (the `SetOutputMode` core→gpu message family is
+  not wired). The connector's preferred mode is used at bring-up and
+  not changed thereafter.
+- **No VT switch handling** (slice 7). Switching VTs while overdraw
+  has DRM master is undefined behavior today.
+
+### Files
+
+- `packages/core/native/core/seat.{h,cpp}` — libseat wrapper (slice 1).
+- `packages/core/native/ipc/side_channel.h` — `SetDrmFd`,
+  `ScanoutReserve`, `ScanoutReady`, `ScanoutPresent`,
+  `ScanoutFlipComplete` messages.
+- `packages/core/native/core/compositor.{h,cpp}` — KMS-aware
+  `acquireOutputTextureHandle` / `presentOutput`, scanout slot state
+  machine, in-band Begin/End writes.
+- `packages/core/gpu-process/src/drm_utils.{h,cpp}` — libdrm helpers
+  (connector / CRTC / plane enumeration, atomic-commit helpers, EDID
+  parsing, IN_FORMATS reader).
+- `packages/core/gpu-process/src/kms_scanout_ring.{h,cpp}` — 3-slot
+  ring (GBM bo + STM + wgpu::Texture + fb_id + state machine).
+- `packages/core/gpu-process/src/kms_output.{h,cpp}` —
+  `KmsOutputBackend` implementing `OutputBackend`. Two-phase init
+  (`open()` for DRM topology; `initScanout(device)` for ring + import +
+  initial modeset).
+
+### Verified
+
+Bare-metal run on a 16" 2560×1600 @165Hz Intel iGPU laptop with gdm
+stopped and seatd active: the panel lights up at the compositor's
+clear color, atomic commits succeed, page-flip events fire at the
+panel's native refresh, no Dawn validation errors, clean shutdown
+releases DRM master and closes all fds.
 
 ## Input
 

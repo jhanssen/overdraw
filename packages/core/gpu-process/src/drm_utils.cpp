@@ -1,0 +1,398 @@
+#include "drm_utils.h"
+
+#include <cerrno>
+#include <cstdio>
+#include <cstring>
+#include <functional>
+#include <memory>
+
+extern "C" {
+#include <xf86drm.h>
+#include <xf86drmMode.h>
+#include <drm_fourcc.h>
+}
+
+namespace overdraw::gpu {
+namespace {
+
+const char* connectorTypeName(uint32_t type) {
+    switch (type) {
+        case DRM_MODE_CONNECTOR_HDMIA:     return "HDMI-A";
+        case DRM_MODE_CONNECTOR_HDMIB:     return "HDMI-B";
+        case DRM_MODE_CONNECTOR_DisplayPort: return "DP";
+        case DRM_MODE_CONNECTOR_eDP:       return "eDP";
+        case DRM_MODE_CONNECTOR_LVDS:      return "LVDS";
+        case DRM_MODE_CONNECTOR_VGA:       return "VGA";
+        case DRM_MODE_CONNECTOR_DVII:      return "DVI-I";
+        case DRM_MODE_CONNECTOR_DVID:      return "DVI-D";
+        case DRM_MODE_CONNECTOR_DVIA:      return "DVI-A";
+        case DRM_MODE_CONNECTOR_VIRTUAL:   return "Virtual";
+        case DRM_MODE_CONNECTOR_DSI:       return "DSI";
+        case DRM_MODE_CONNECTOR_USB:       return "USB";
+        default:                           return "Unknown";
+    }
+}
+
+uint32_t modeRefreshMhz(const drmModeModeInfo& m) {
+    // refresh_hz = clock * 1000 / (htotal * vtotal). The mode's clock is in kHz.
+    // Express as mHz (Hz * 1000) for the wl_output protocol.
+    if (m.htotal == 0 || m.vtotal == 0) return 0;
+    uint64_t num = static_cast<uint64_t>(m.clock) * 1'000'000ULL;  // clock kHz -> mHz
+    uint64_t den = static_cast<uint64_t>(m.htotal) * static_cast<uint64_t>(m.vtotal);
+    return static_cast<uint32_t>(num / den);
+}
+
+// Walk every property of `objectId` (of type `objectType`) calling `cb(name,
+// value, prop)`. Returns the number of properties visited.
+int walkProperties(int drmFd, uint32_t objectId, uint32_t objectType,
+                   const std::function<void(const char*, uint64_t, const drmModePropertyRes*)>& cb) {
+    drmModeObjectProperties* props = drmModeObjectGetProperties(drmFd, objectId, objectType);
+    if (!props) return 0;
+    int count = 0;
+    for (uint32_t i = 0; i < props->count_props; ++i) {
+        drmModePropertyRes* p = drmModeGetProperty(drmFd, props->props[i]);
+        if (!p) continue;
+        cb(p->name, props->prop_values[i], p);
+        drmModeFreeProperty(p);
+        ++count;
+    }
+    drmModeFreeObjectProperties(props);
+    return count;
+}
+
+}  // namespace
+
+bool enableDrmAtomicCaps(int drmFd) {
+    if (drmSetClientCap(drmFd, DRM_CLIENT_CAP_ATOMIC, 1) != 0) {
+        std::fprintf(stderr, "[drm] DRM_CLIENT_CAP_ATOMIC rejected: %s\n", std::strerror(errno));
+        return false;
+    }
+    if (drmSetClientCap(drmFd, DRM_CLIENT_CAP_UNIVERSAL_PLANES, 1) != 0) {
+        std::fprintf(stderr, "[drm] DRM_CLIENT_CAP_UNIVERSAL_PLANES rejected: %s\n",
+                     std::strerror(errno));
+        return false;
+    }
+    return true;
+}
+
+bool pickConnector(int drmFd, const std::string& preferConnectorName,
+                   uint32_t& outConnectorId, std::string& outConnectorName,
+                   DrmMode& outMode) {
+    drmModeRes* res = drmModeGetResources(drmFd);
+    if (!res) {
+        std::fprintf(stderr, "[drm] drmModeGetResources failed: %s\n", std::strerror(errno));
+        return false;
+    }
+
+    auto consider = [&](uint32_t connectorId) -> bool {
+        drmModeConnector* c = drmModeGetConnector(drmFd, connectorId);
+        if (!c) return false;
+        bool ok = false;
+        if (c->connection == DRM_MODE_CONNECTED && c->count_modes > 0) {
+            // Name = "<type>-<typeIndex>", e.g. "eDP-1".
+            char name[64];
+            std::snprintf(name, sizeof(name), "%s-%u",
+                          connectorTypeName(c->connector_type),
+                          c->connector_type_id);
+
+            // Pick a mode: preferred if marked, else mode 0.
+            int chosen = 0;
+            for (int i = 0; i < c->count_modes; ++i) {
+                if (c->modes[i].type & DRM_MODE_TYPE_PREFERRED) { chosen = i; break; }
+            }
+            const drmModeModeInfo& m = c->modes[chosen];
+            outConnectorId = connectorId;
+            outConnectorName = name;
+            outMode.hdisplay    = m.hdisplay;
+            outMode.vdisplay    = m.vdisplay;
+            outMode.vrefreshMhz = modeRefreshMhz(m);
+            outMode.preferred   = (m.type & DRM_MODE_TYPE_PREFERRED) != 0;
+            outMode.raw         = m;
+            ok = true;
+        }
+        drmModeFreeConnector(c);
+        return ok;
+    };
+
+    // Pass 1: if a preferred name was requested, try to satisfy it first.
+    if (!preferConnectorName.empty()) {
+        for (int i = 0; i < res->count_connectors; ++i) {
+            drmModeConnector* c = drmModeGetConnector(drmFd, res->connectors[i]);
+            if (!c) continue;
+            char name[64];
+            std::snprintf(name, sizeof(name), "%s-%u",
+                          connectorTypeName(c->connector_type),
+                          c->connector_type_id);
+            const bool matches = preferConnectorName == name;
+            drmModeFreeConnector(c);
+            if (matches && consider(res->connectors[i])) {
+                drmModeFreeResources(res);
+                return true;
+            }
+        }
+    }
+
+    // Pass 2: first connected.
+    for (int i = 0; i < res->count_connectors; ++i) {
+        if (consider(res->connectors[i])) {
+            drmModeFreeResources(res);
+            return true;
+        }
+    }
+
+    drmModeFreeResources(res);
+    std::fprintf(stderr, "[drm] no connected connector with modes\n");
+    return false;
+}
+
+bool pickCrtc(int drmFd, uint32_t connectorId, uint32_t& outCrtcId) {
+    drmModeRes* res = drmModeGetResources(drmFd);
+    if (!res) return false;
+    drmModeConnector* conn = drmModeGetConnector(drmFd, connectorId);
+    if (!conn) { drmModeFreeResources(res); return false; }
+
+    // Already-bound CRTCs we should avoid (don't trample another connector).
+    // Built by querying each connector's current encoder->crtc.
+    auto crtcInUse = [&](uint32_t crtcId) -> bool {
+        for (int i = 0; i < res->count_connectors; ++i) {
+            if (res->connectors[i] == connectorId) continue;
+            drmModeConnector* other = drmModeGetConnector(drmFd, res->connectors[i]);
+            if (!other) continue;
+            if (other->encoder_id != 0) {
+                drmModeEncoder* enc = drmModeGetEncoder(drmFd, other->encoder_id);
+                if (enc) {
+                    if (enc->crtc_id == crtcId) {
+                        drmModeFreeEncoder(enc);
+                        drmModeFreeConnector(other);
+                        return true;
+                    }
+                    drmModeFreeEncoder(enc);
+                }
+            }
+            drmModeFreeConnector(other);
+        }
+        return false;
+    };
+
+    // Walk every encoder the connector lists and intersect its possible_crtcs
+    // with res->crtcs. Pick the first free one.
+    bool ok = false;
+    for (int e = 0; e < conn->count_encoders && !ok; ++e) {
+        drmModeEncoder* enc = drmModeGetEncoder(drmFd, conn->encoders[e]);
+        if (!enc) continue;
+        for (int c = 0; c < res->count_crtcs && !ok; ++c) {
+            const uint32_t mask = 1u << c;
+            if ((enc->possible_crtcs & mask) == 0) continue;
+            const uint32_t crtcId = res->crtcs[c];
+            if (crtcInUse(crtcId)) continue;
+            outCrtcId = crtcId;
+            ok = true;
+        }
+        drmModeFreeEncoder(enc);
+    }
+
+    drmModeFreeConnector(conn);
+    drmModeFreeResources(res);
+    if (!ok) std::fprintf(stderr, "[drm] no free CRTC for connector %u\n", connectorId);
+    return ok;
+}
+
+bool pickPrimaryPlane(int drmFd, uint32_t crtcId, uint32_t& outPlaneId) {
+    drmModeRes* res = drmModeGetResources(drmFd);
+    if (!res) return false;
+
+    // Map crtcId -> its index in res->crtcs, to evaluate plane->possible_crtcs.
+    int crtcIdx = -1;
+    for (int i = 0; i < res->count_crtcs; ++i) {
+        if (res->crtcs[i] == crtcId) { crtcIdx = i; break; }
+    }
+    drmModeFreeResources(res);
+    if (crtcIdx < 0) return false;
+
+    drmModePlaneRes* planes = drmModeGetPlaneResources(drmFd);
+    if (!planes) return false;
+    bool ok = false;
+    for (uint32_t i = 0; i < planes->count_planes && !ok; ++i) {
+        drmModePlane* p = drmModeGetPlane(drmFd, planes->planes[i]);
+        if (!p) continue;
+        const bool reachable = (p->possible_crtcs & (1u << crtcIdx)) != 0;
+        drmModeFreePlane(p);
+        if (!reachable) continue;
+        // The plane is reachable from the CRTC; check its type via the type
+        // property (universal-planes makes this required reading).
+        bool isPrimary = false;
+        walkProperties(drmFd, planes->planes[i], DRM_MODE_OBJECT_PLANE,
+            [&](const char* name, uint64_t value, const drmModePropertyRes*) {
+                if (std::strcmp(name, "type") == 0 && value == DRM_PLANE_TYPE_PRIMARY) {
+                    isPrimary = true;
+                }
+            });
+        if (isPrimary) {
+            outPlaneId = planes->planes[i];
+            ok = true;
+        }
+    }
+    drmModeFreePlaneResources(planes);
+    if (!ok) std::fprintf(stderr, "[drm] no primary plane for CRTC %u\n", crtcId);
+    return ok;
+}
+
+bool resolveProperties(int drmFd, DrmTopology& topo) {
+    bool okConn = false, okCrtc = false, okPlane = false;
+
+    walkProperties(drmFd, topo.connectorId, DRM_MODE_OBJECT_CONNECTOR,
+        [&](const char* name, uint64_t, const drmModePropertyRes* p) {
+            if (std::strcmp(name, "CRTC_ID") == 0) { topo.connectorProps.crtc_id = p->prop_id; okConn = true; }
+        });
+    walkProperties(drmFd, topo.crtcId, DRM_MODE_OBJECT_CRTC,
+        [&](const char* name, uint64_t, const drmModePropertyRes* p) {
+            if (std::strcmp(name, "MODE_ID") == 0) topo.crtcProps.mode_id = p->prop_id;
+            if (std::strcmp(name, "ACTIVE")  == 0) topo.crtcProps.active  = p->prop_id;
+        });
+    okCrtc = topo.crtcProps.mode_id && topo.crtcProps.active;
+    walkProperties(drmFd, topo.planeId, DRM_MODE_OBJECT_PLANE,
+        [&](const char* name, uint64_t, const drmModePropertyRes* p) {
+            auto& pp = topo.planeProps;
+            if (std::strcmp(name, "FB_ID")        == 0) pp.fb_id        = p->prop_id;
+            else if (std::strcmp(name, "CRTC_ID") == 0) pp.crtc_id      = p->prop_id;
+            else if (std::strcmp(name, "SRC_X")   == 0) pp.src_x        = p->prop_id;
+            else if (std::strcmp(name, "SRC_Y")   == 0) pp.src_y        = p->prop_id;
+            else if (std::strcmp(name, "SRC_W")   == 0) pp.src_w        = p->prop_id;
+            else if (std::strcmp(name, "SRC_H")   == 0) pp.src_h        = p->prop_id;
+            else if (std::strcmp(name, "CRTC_X")  == 0) pp.crtc_x       = p->prop_id;
+            else if (std::strcmp(name, "CRTC_Y")  == 0) pp.crtc_y       = p->prop_id;
+            else if (std::strcmp(name, "CRTC_W")  == 0) pp.crtc_w       = p->prop_id;
+            else if (std::strcmp(name, "CRTC_H")  == 0) pp.crtc_h       = p->prop_id;
+            else if (std::strcmp(name, "IN_FENCE_FD") == 0) pp.in_fence_fd = p->prop_id;
+            else if (std::strcmp(name, "IN_FORMATS")  == 0) pp.in_formats  = p->prop_id;
+        });
+    auto& pp = topo.planeProps;
+    okPlane = pp.fb_id && pp.crtc_id && pp.src_x && pp.src_y && pp.src_w && pp.src_h
+              && pp.crtc_x && pp.crtc_y && pp.crtc_w && pp.crtc_h;
+
+    if (!(okConn && okCrtc && okPlane)) {
+        std::fprintf(stderr,
+            "[drm] missing required properties: connector=%d crtc=%d plane=%d\n",
+            okConn, okCrtc, okPlane);
+        return false;
+    }
+    return true;
+}
+
+bool readEdid(int drmFd, uint32_t connectorId, EdidInfo& out) {
+    // Find the EDID property and its blob id.
+    uint32_t edidPropId = 0;
+    uint64_t edidBlobId = 0;
+    walkProperties(drmFd, connectorId, DRM_MODE_OBJECT_CONNECTOR,
+        [&](const char* name, uint64_t value, const drmModePropertyRes* p) {
+            if (std::strcmp(name, "EDID") == 0) { edidPropId = p->prop_id; edidBlobId = value; }
+        });
+    if (!edidPropId || !edidBlobId) return false;
+
+    drmModePropertyBlobRes* blob = drmModeGetPropertyBlob(drmFd, edidBlobId);
+    if (!blob || !blob->data || blob->length < 128) {
+        if (blob) drmModeFreePropertyBlob(blob);
+        return false;
+    }
+    const uint8_t* edid = static_cast<const uint8_t*>(blob->data);
+
+    // Validate EDID magic ("\x00\xff\xff\xff\xff\xff\xff\x00").
+    static const uint8_t kMagic[8] = {0x00, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x00};
+    if (std::memcmp(edid, kMagic, 8) != 0) {
+        drmModeFreePropertyBlob(blob);
+        return false;
+    }
+
+    // Detailed Timing Descriptor 1 starts at offset 54 (18 bytes). Physical
+    // size in mm is bytes 12 (horiz low), 13 (vert low), 14 (4-bit upper
+    // nibbles: hi nibble = horiz upper 4, lo nibble = vert upper 4).
+    const uint8_t* dtd = edid + 54;
+    if (dtd[2] || dtd[3] || dtd[4] || dtd[5] || dtd[6] || dtd[7]) {
+        // It looks like a real DTD (not all-zero placeholder). Extract phys mm.
+        out.physicalWidthMm  = static_cast<uint32_t>(dtd[12])
+                             | (static_cast<uint32_t>(dtd[14] & 0xf0) << 4);
+        out.physicalHeightMm = static_cast<uint32_t>(dtd[13])
+                             | (static_cast<uint32_t>(dtd[14] & 0x0f) << 8);
+    }
+
+    // Display descriptors start at offset 54 too, but DTDs 1..4 occupy bytes
+    // 54..125 in 18-byte blocks. A descriptor block is a "display descriptor"
+    // (not a DTD) when bytes 0..1 are 0; in that case byte 3 is the tag:
+    //   0xFC = Display Product Name (ASCII, up to 13 bytes, LF-terminated)
+    for (int i = 0; i < 4; ++i) {
+        const uint8_t* d = edid + 54 + 18 * i;
+        if (d[0] == 0 && d[1] == 0 && d[2] == 0 && d[3] == 0xFC) {
+            char name[14] = {0};
+            std::memcpy(name, d + 5, 13);
+            // EDID descriptors are LF-terminated or space-padded; trim.
+            for (int j = 0; j < 13; ++j) {
+                if (name[j] == '\n' || name[j] == '\r') { name[j] = '\0'; break; }
+            }
+            for (int j = 12; j >= 0; --j) {
+                if (name[j] == ' ' || name[j] == '\0') name[j] = '\0';
+                else break;
+            }
+            out.productName = name;
+        }
+    }
+
+    drmModeFreePropertyBlob(blob);
+    return true;
+}
+
+std::vector<PlaneFormatModifier>
+readPlaneFormats(int drmFd, uint32_t planeId, uint32_t inFormatsPropId) {
+    std::vector<PlaneFormatModifier> result;
+    if (inFormatsPropId == 0) return result;
+
+    // Find the IN_FORMATS blob value on the plane.
+    uint64_t blobId = 0;
+    walkProperties(drmFd, planeId, DRM_MODE_OBJECT_PLANE,
+        [&](const char* name, uint64_t value, const drmModePropertyRes* p) {
+            if (p->prop_id == inFormatsPropId || std::strcmp(name, "IN_FORMATS") == 0) {
+                blobId = value;
+            }
+        });
+    if (!blobId) return result;
+
+    drmModePropertyBlobRes* blob = drmModeGetPropertyBlob(drmFd, blobId);
+    if (!blob || !blob->data) {
+        if (blob) drmModeFreePropertyBlob(blob);
+        return result;
+    }
+    // The IN_FORMATS blob is a drm_format_modifier_blob struct (see drm_mode.h):
+    //   { u32 version; u32 flags; u32 count_formats; u32 count_modifiers;
+    //     u32 formats_offset; u32 modifiers_offset; ... }
+    // followed by formats[count_formats] (u32 each) and
+    // modifiers[count_modifiers] (drm_format_modifier each: { formats_mask u64;
+    // offset u16; pad u16; modifier u64 }). Each modifier entry's formats_mask
+    // bit i means "applies to formats[offset + i]".
+    const auto* hdr = static_cast<const drm_format_modifier_blob*>(blob->data);
+    const uint8_t* base = static_cast<const uint8_t*>(blob->data);
+    const uint32_t* formats = reinterpret_cast<const uint32_t*>(base + hdr->formats_offset);
+    const auto* mods = reinterpret_cast<const drm_format_modifier*>(
+        base + hdr->modifiers_offset);
+
+    for (uint32_t i = 0; i < hdr->count_modifiers; ++i) {
+        const auto& m = mods[i];
+        for (uint32_t b = 0; b < 64; ++b) {
+            if ((m.formats & (1ULL << b)) == 0) continue;
+            const uint32_t idx = m.offset + b;
+            if (idx >= hdr->count_formats) continue;
+            result.push_back({formats[idx], m.modifier});
+        }
+    }
+    drmModeFreePropertyBlob(blob);
+    return result;
+}
+
+uint32_t createModeBlob(int drmFd, const drmModeModeInfo& mode) {
+    uint32_t id = 0;
+    if (drmModeCreatePropertyBlob(drmFd, &mode, sizeof(mode), &id) != 0) {
+        std::fprintf(stderr, "[drm] createModeBlob failed: %s\n", std::strerror(errno));
+        return 0;
+    }
+    return id;
+}
+
+}  // namespace overdraw::gpu

@@ -24,9 +24,18 @@ export type EventsByInterface = Record<string, EventSenders>;
 // The native N-API addon. Only the methods the JS layer calls are declared;
 // add as needed.
 export interface Addon {
+  // start(gpuBin, onFrame?, onInput?, opts?)
+  // opts is either:
+  //   - { width, height }  -> headless (no output backend; offscreen render).
+  //   - { backend: "kms" | "nested", card?: string }  -> bare-metal or nested.
+  //   - omitted/null       -> KMS with default card.
+  // Tests typically pass { width, height } (headless) or { backend: "nested" }.
   start(gpuBin: string, onFrame?: ((presented: number) => void) | null,
         onInput?: ((ev: InputEvent) => void) | null,
-        headless?: { width: number; height: number } | null): { width: number; height: number };
+        opts?:
+          | { width: number; height: number }
+          | { backend: "kms" | "nested"; card?: string }
+          | null): { width: number; height: number };
   stop(): void;
   presentedCount(): number;
   startServer(): string;

@@ -154,11 +154,20 @@ export async function setupCompositor(opts = {}) {
   const onFrame = () => { state?.dispatchFrameCallbacks?.(Math.round(performance.now())); };
 
   // Headless by default: the JS compositor renders into an offscreen target
-  // read back via frameReadback(). Pass headless: null to nest to the host.
-  const headless = opts.headless === undefined
-    ? { width: 1280, height: 720 }
-    : opts.headless;
-  const dims = addon.start(gpuBin, onFrame, onInput, headless || null);
+  // read back via frameReadback(). Pass `headless: null` or `headless: false`
+  // to use an output backend (nested by default in tests; `backend: "kms"`
+  // opt-in for KMS tests that need to drive real hardware).
+  //
+  // PRODUCTION defaults to KMS (see packages/core/src/main.ts). TESTS
+  // default to nested when an output backend is needed -- KMS tests must
+  // opt in explicitly so they don't try to grab the dev/CI machine's
+  // display.
+  let headless;
+  if (opts.headless === undefined) headless = { width: 1280, height: 720 };
+  else if (opts.headless && typeof opts.headless === "object") headless = opts.headless;
+  else headless = null;  // null or false -> use an output backend
+  const startOpts = headless ?? { backend: opts.backend ?? "nested" };
+  const dims = addon.start(gpuBin, onFrame, onInput, startOpts);
   const sock = addon.startServer();
 
   let jsCompositor = null;

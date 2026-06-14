@@ -67,6 +67,8 @@ struct Addon {
     std::unique_ptr<overdraw::core::Seat> seat;
     uv_poll_t seatPoll{};
     bool seatPollActive = false;
+    int drmCardFd = -1;        // KMS: our copy of the DRM fd (libseat-owned tracking)
+    int drmCardDeviceId = -1;  // KMS: libseat device id for closeDevice on shutdown
 #endif
     std::unique_ptr<Keymap> keymap;  // xkbcommon keymap + modifier state
     ShmRegistry shm;  // wl_shm pool mappings (CPU-side, independent of the loop)
@@ -493,9 +495,15 @@ void onFrameTimer(uv_timer_t*) {
     armWirePoll();  // renderFrame may have queued wire output (Submit/Present)
 }
 
-// start(gpuBinPath, onFrame?, onInput?, headless?) -> { width, height }
-// headless (optional): { width, height } -> run with no host window/surface; the
-// compositing pass renders into an offscreen texture (readbackFrame). For tests.
+// start(gpuBinPath, onFrame?, onInput?, opts?) -> { width, height }
+// opts (object, optional): one of
+//   { width, height }                    -> headless mode (legacy shape)
+//   { backend: "kms" | "nested", card?: "/dev/dri/cardN" }
+//                                         -> select output backend.
+//                                         -> default if absent: KMS.
+//                                         -> headless takes precedence if width+height set.
+// `card` defaults to "/dev/dri/card0" for KMS (libseat picks the first
+// connected if absent). Used only when backend == "kms".
 napi_value Start(napi_env env, napi_callback_info info) {
     size_t argc = 4;
     napi_value argv[4];
@@ -520,29 +528,123 @@ napi_value Start(napi_env env, napi_callback_info info) {
         if (t == napi_function) napi_create_reference(env, argv[2], 1, &g_addon.onInput);
     }
 
-    // Optional headless { width, height }.
+    // Optional opts object. Headless takes precedence (legacy + test path);
+    // otherwise the backend choice picks KMS or nested.
     uint32_t hw = 0, hh = 0;
+    std::string backend = "kms";  // production default
+    std::string drmCardPath = "/dev/dri/card0";
     if (argc >= 4) {
         napi_valuetype t;
         napi_typeof(env, argv[3], &t);
         if (t == napi_object) {
             hw = getU32(env, argv[3], "width");
             hh = getU32(env, argv[3], "height");
+            // backend string (optional). Headless ignores it.
+            char buf[16] = {};
+            size_t n = 0;
+            napi_value v;
+            if (napi_get_named_property(env, argv[3], "backend", &v) == napi_ok) {
+                napi_valuetype bt;
+                napi_typeof(env, v, &bt);
+                if (bt == napi_string) {
+                    napi_get_value_string_utf8(env, v, buf, sizeof(buf), &n);
+                    backend = buf;
+                }
+            }
+            char cbuf[256] = {};
+            if (napi_get_named_property(env, argv[3], "card", &v) == napi_ok) {
+                napi_valuetype bt;
+                napi_typeof(env, v, &bt);
+                if (bt == napi_string) {
+                    napi_get_value_string_utf8(env, v, cbuf, sizeof(cbuf), &n);
+                    drmCardPath = cbuf;
+                }
+            }
         }
     }
     const bool headless = hw != 0 && hh != 0;
+    const bool wantKms = !headless && backend == "kms";
 
-    auto gpu = overdraw::core::spawnGpuProcess(gpuBin, hw, hh);
+    auto gpu = overdraw::core::spawnGpuProcess(
+        gpuBin, hw, hh,
+        wantKms ? overdraw::core::OutputBackendKind::Kms
+                : overdraw::core::OutputBackendKind::Nested);
     if (gpu.pid < 0) return throwError(env, "failed to spawn gpu process");
     g_addon.inputFd = gpu.inputFd;
 
+#if OVERDRAW_KMS
+    // In KMS mode, open the DRM card via libseat and SCM_RIGHTS-pass the fd
+    // to the GPU process BEFORE bringUp's Hello dance. The GPU process is
+    // blocked waiting for SetDrmFd before it constructs the KmsOutputBackend.
+    if (wantKms) {
+        if (!g_addon.seat) {
+            g_addon.seat = std::make_unique<overdraw::core::Seat>();
+            if (!g_addon.seat->open(nullptr, nullptr)) {
+                const std::string err = "libseat open failed: " + g_addon.seat->error();
+                g_addon.seat.reset();
+                if (g_addon.inputFd >= 0) { ::close(g_addon.inputFd); g_addon.inputFd = -1; }
+                return throwError(env, err.c_str());
+            }
+            g_addon.seat->dispatch();
+            if (!g_addon.seat->isActive()) {
+                g_addon.seat.reset();
+                if (g_addon.inputFd >= 0) { ::close(g_addon.inputFd); g_addon.inputFd = -1; }
+                return throwError(env, "libseat opened but seat not active (logind session?)");
+            }
+        }
+        int drmFd = -1;
+        int drmDeviceId = -1;
+        if (!g_addon.seat->openDevice(drmCardPath.c_str(), drmFd, drmDeviceId)) {
+            const std::string err = "libseat openDevice(" + drmCardPath + ") failed: "
+                                  + g_addon.seat->error();
+            g_addon.seat.reset();
+            if (g_addon.inputFd >= 0) { ::close(g_addon.inputFd); g_addon.inputFd = -1; }
+            return throwError(env, err.c_str());
+        }
+        // Track for later closeDevice on Stop().
+        g_addon.drmCardFd = drmFd;
+        g_addon.drmCardDeviceId = drmDeviceId;
+        // SCM_RIGHTS the fd to the GPU process via the ctrl socket.
+        overdraw::ipc::Message msg{};
+        msg.tag = overdraw::ipc::Tag::SetDrmFd;
+        int fds[1] = { drmFd };
+        if (!overdraw::ipc::sendMessageFds(gpu.ctrlFd, msg, fds, 1)) {
+            g_addon.seat->closeDevice(drmDeviceId);
+            ::close(drmFd);
+            g_addon.drmCardFd = -1;
+            g_addon.drmCardDeviceId = -1;
+            g_addon.seat.reset();
+            if (g_addon.inputFd >= 0) { ::close(g_addon.inputFd); g_addon.inputFd = -1; }
+            return throwError(env, "SetDrmFd sendmsg failed");
+        }
+        // The GPU process receives a dup'd fd; we keep ours open so libseat
+        // can revoke / track it. Closed in Stop().
+    }
+#endif
+
     g_addon.compositor =
-        std::make_unique<Compositor>(gpu.wireFd, gpu.ctrlFd, gpu.pid, headless, hw, hh);
+        std::make_unique<Compositor>(gpu.wireFd, gpu.ctrlFd, gpu.pid, headless, hw, hh, wantKms);
     if (!g_addon.compositor->bringUp()) {
         // Copy the error string out of the compositor BEFORE the dtor frees it.
         const std::string err = g_addon.compositor->error();
         g_addon.compositor.reset();
         if (g_addon.inputFd >= 0) { ::close(g_addon.inputFd); g_addon.inputFd = -1; }
+#if OVERDRAW_KMS
+        // KMS bring-up may have opened a DRM card via libseat and a seat
+        // handle; release both so a retry sees a clean slot.
+        if (g_addon.drmCardFd >= 0) {
+            if (g_addon.seat && g_addon.drmCardDeviceId >= 0) {
+                g_addon.seat->closeDevice(g_addon.drmCardDeviceId);
+            }
+            ::close(g_addon.drmCardFd);
+            g_addon.drmCardFd = -1;
+            g_addon.drmCardDeviceId = -1;
+        }
+        if (g_addon.seat) {
+            g_addon.seat->close();
+            g_addon.seat.reset();
+        }
+#endif
         return throwError(env, err.c_str());
     }
 
@@ -1107,6 +1209,16 @@ napi_value Stop(napi_env env, napi_callback_info) {
         g_addon.waylandInput = nullptr;
     }
 #if OVERDRAW_KMS
+    // Release the DRM card (if we opened one for KMS) BEFORE closing the seat,
+    // so libseat's accounting stays consistent.
+    if (g_addon.drmCardFd >= 0) {
+        if (g_addon.seat && g_addon.drmCardDeviceId >= 0) {
+            g_addon.seat->closeDevice(g_addon.drmCardDeviceId);
+        }
+        ::close(g_addon.drmCardFd);
+        g_addon.drmCardFd = -1;
+        g_addon.drmCardDeviceId = -1;
+    }
     // Seat closes after libinput so libinput's close_restricted can release
     // device ids through it.
     if (g_addon.seat) {

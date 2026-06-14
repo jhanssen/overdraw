@@ -35,8 +35,15 @@ class Compositor {
     // compositing pass renders into an owned offscreen texture (read back via
     // readbackFrame) instead of a surface, and nothing is presented. Used by
     // tests; the GPU process must also be spawned with matching --headless WxH.
+    //
+    // `kms` selects the bare-metal output path: no wgpu::Surface, three
+    // scanout textures injected by the GPU process at GPU-chosen wire handles
+    // (received via ipc::Tag::ScanoutInjected during bring-up), atomic-commit
+    // driven by side-channel ScanoutPresent / ScanoutFlipComplete messages.
+    // Mutually exclusive with `headless`. Default false (nested mode).
     Compositor(int wireFd, int ctrlFd, pid_t gpuPid,
-               bool headless = false, uint32_t headlessW = 0, uint32_t headlessH = 0);
+               bool headless = false, uint32_t headlessW = 0, uint32_t headlessH = 0,
+               bool kms = false);
     ~Compositor();
 
     Compositor(const Compositor&) = delete;
@@ -168,6 +175,36 @@ class Compositor {
         std::string model;
     };
     void takePendingOutputDescriptors(std::vector<OutputDescriptorMsg>& out);
+
+    // --- KMS scanout path (slice 4) -------------------------------------------
+    //
+    // In KMS mode the wire `wgpu::Surface` is absent. Instead the GPU process
+    // owns three scanout textures (one per ring slot) injected at GPU-chosen
+    // wire handles and reported via ipc::Tag::ScanoutInjected during bring-up.
+    // The core tracks per-slot state locally and dispatches:
+    //   acquireOutputTextureHandle() -> returns the next FREE slot's texture
+    //     handle, or nullptr if no slot is currently free.
+    //   presentOutput() -> sends ScanoutPresent { slotIdx, fenceFd } and marks
+    //     the slot PENDING_FLIP.
+    // The GPU process's flip-complete handler sends ScanoutFlipComplete back;
+    // drainCtrl advances the local state machine on receipt.
+
+    // True if this compositor is in KMS mode (bring-up received ScanoutInjected
+    // instead of SurfaceReady). When false: WSI / headless paths.
+    bool kmsMode() const { return kmsMode_; }
+
+    // Set the fence fd to attach to the next ScanoutPresent. Caller transfers
+    // ownership; the compositor will close it after sending. Pass -1 to send
+    // a present with no fence (test paths). Called by the JS render path
+    // right before presentOutput().
+    void setPendingScanoutFenceFd(int fd) { pendingScanoutFenceFd_ = fd; }
+
+    // KMS state machine -- exposed for testing / introspection only. Production
+    // paths use acquireOutputTextureHandle / presentOutput.
+    enum class ScanoutSlotState : uint8_t { FREE, PENDING_FLIP, SCANOUT };
+    ScanoutSlotState scanoutSlotState(int idx) const {
+        return idx >= 0 && idx < 3 ? scanoutSlots_[idx].state : ScanoutSlotState::SCANOUT;
+    }
 
     // Release a JS dmabuf import: tells the GPU process to drop the imported STM +
     // dmabuf fd for this importId (generation-matched, so a recycled handle id is
@@ -431,6 +468,23 @@ class Compositor {
     std::vector<PendingJsImport> pendingJsImports_;
     std::vector<JsImportDone> completedJsImports_;
     std::vector<OutputDescriptorMsg> pendingOutputDescriptors_;
+
+    // KMS scanout state. Populated on receipt of ipc::Tag::ScanoutInjected
+    // during bring-up. Each slot holds the wire handle id+generation (resolved
+    // to a WGPUTexture via WireClient::GetTextureHandle later) and the local
+    // state machine bit. `currentSlot_` is the slot acquired in this frame's
+    // acquireOutputTextureHandle, used by presentOutput to know which to flip.
+    struct ScanoutSlot {
+        uint32_t handleId   = 0;
+        uint32_t handleGen  = 0;
+        uint32_t surfaceBufId = 0;  // for in-band BeginAccess/EndAccess brackets
+        ScanoutSlotState state = ScanoutSlotState::FREE;
+        WGPUTexture tex     = nullptr;  // resolved from (handleId, handleGen) at first use
+    };
+    bool kmsMode_ = false;
+    ScanoutSlot scanoutSlots_[3] = {};
+    int currentSlot_ = -1;            // slot acquired by the current frame; -1 if none
+    int pendingScanoutFenceFd_ = -1;  // attached to next presentOutput, then closed
     uint32_t nextJsImportId_ = 1;
     // importId -> the injected texture's wire handle {id,generation}, kept so a
     // later releaseDmabufImport can address the GPU-side entry. Erased on release.

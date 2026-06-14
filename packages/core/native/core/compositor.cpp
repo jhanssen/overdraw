@@ -17,10 +17,12 @@
 namespace overdraw::core {
 
 Compositor::Compositor(int wireFd, int ctrlFd, pid_t gpuPid,
-                       bool headless, uint32_t headlessW, uint32_t headlessH)
+                       bool headless, uint32_t headlessW, uint32_t headlessH,
+                       bool kms)
     : link_(std::make_unique<WireLink>(wireFd, ctrlFd)),
       gpuPid_(gpuPid), wireFd_(wireFd), ctrlFd_(ctrlFd) {
     headless_ = headless;
+    kmsMode_ = kms && !headless;  // headless wins; kms ignored in headless tests
     if (headless_) { windowWidth_ = headlessW; windowHeight_ = headlessH; }
     // All inter-process fds are non-blocking: no write may ever park (it would
     // wedge the single-threaded GPU process and deadlock the pair). Buffered
@@ -133,25 +135,44 @@ bool Compositor::bringUp() {
                     m.entryCount, m.formatTableSize);
     };
 
-    // DeviceReady; then NESTED waits for SurfaceReady (+ FeedbackData), HEADLESS
-    // waits for FeedbackData only (no surface). In headless DeviceReady carries a
-    // zero surface handle (the GPU process does not InjectSurface).
+    // DeviceReady; then dispatch on output mode:
+    //   nested  -> wait for SurfaceReady (+ FeedbackData)
+    //   kms     -> wait for ScanoutInjected (+ FeedbackData)
+    //   headless-> wait for FeedbackData only (no surface).
+    // KMS and headless DeviceReady carry a zero surface handle (the GPU
+    // process does not InjectSurface in either case).
     WGPUSurfaceCapabilities emptyCaps{};
     dawn::wire::ReservedSurface rs{};
-    if (!headless_) rs = link_->client().ReserveSurface(instance_.Get(), &emptyCaps);
+    const bool wantSurface = !headless_ && !kmsMode_;
+    if (wantSurface) rs = link_->client().ReserveSurface(instance_.Get(), &emptyCaps);
     {
         ipc::Message m{};
         m.tag = ipc::Tag::DeviceReady;
         m.instance = {ri.handle.id, ri.handle.generation};
         auto dh = link_->client().GetWireHandle(device_.Get());
         m.device = {dh.id, dh.generation};
-        m.surface = headless_ ? ipc::WireHandle{0, 0}
-                              : ipc::WireHandle{rs.handle.id, rs.handle.generation};
+        m.surface = wantSurface ? ipc::WireHandle{rs.handle.id, rs.handle.generation}
+                                : ipc::WireHandle{0, 0};
         ipc::sendMessage(ctrlFd_, m);
     }
 
+    // First-phase wait: any bring-up modes wait for at least FeedbackData.
+    //   nested -> additionally waits for SurfaceReady.
+    //   kms    -> additionally waits for OutputDescriptor (the GPU process
+    //             sends one once it has the DRM topology), then we reserve
+    //             scanout texture handles and send ScanoutReserve, then we
+    //             wait for ScanoutReady.
+    //   headless-> FeedbackData alone is enough.
     ipc::Message surfReady{};
+    ipc::Message kmsDescriptor{};
     bool gotFeedback = false;
+    bool gotKmsDescriptor = false;
+    auto firstPhaseDone = [&] {
+        if (headless_) return gotFeedback;
+        if (wantSurface) return surfReady.tag == ipc::Tag::SurfaceReady;
+        // kms
+        return gotKmsDescriptor;
+    };
     if (!link_->pumpUntil([&] {
             ipc::Message m{};
             int fds[ipc::kMaxMsgFds];
@@ -160,22 +181,48 @@ bool Compositor::bringUp() {
             if (m.tag == ipc::Tag::FeedbackData) {
                 captureFeedback(m, fds, nfds);
                 gotFeedback = true;
-                return headless_;  // headless: feedback is the bring-up signal
+                return firstPhaseDone();
             }
-            if (!headless_ && m.tag == ipc::Tag::SurfaceReady) {
-                for (int i = 0; i < nfds; ++i) ::close(fds[i]);  // none expected
+            if (wantSurface && m.tag == ipc::Tag::SurfaceReady) {
+                for (int i = 0; i < nfds; ++i) ::close(fds[i]);
                 surfReady = m;
-                return true;
+                return firstPhaseDone();
+            }
+            if (kmsMode_ && m.tag == ipc::Tag::OutputDescriptor) {
+                for (int i = 0; i < nfds; ++i) ::close(fds[i]);
+                kmsDescriptor = m;
+                gotKmsDescriptor = true;
+                // OutputDescriptor will be drained again in steady state too,
+                // but during bring-up we capture it once for our own use AND
+                // also push it to the steady-state queue so main.ts's
+                // onOutputDescriptor callback fires normally.
+                OutputDescriptorMsg msg{};
+                msg.width = m.width; msg.height = m.height;
+                msg.refreshMhz = m.refreshMhz; msg.scale = m.outScale;
+                msg.transform = m.outTransform;
+                msg.physicalWidthMm = m.physicalWidthMm;
+                msg.physicalHeightMm = m.physicalHeightMm;
+                auto bounded = [](const char* s, size_t cap) {
+                    size_t n = ::strnlen(s, cap);
+                    return std::string(s, n);
+                };
+                msg.name  = bounded(m.outputName,  sizeof(m.outputName));
+                msg.make  = bounded(m.outputMake,  sizeof(m.outputMake));
+                msg.model = bounded(m.outputModel, sizeof(m.outputModel));
+                pendingOutputDescriptors_.push_back(std::move(msg));
+                return firstPhaseDone();
             }
             for (int i = 0; i < nfds; ++i) ::close(fds[i]);
             return false;
         })) {
-        error_ = headless_ ? "no FeedbackData (headless)" : "no SurfaceReady";
+        error_ = headless_ ? "no FeedbackData (headless)"
+              : kmsMode_   ? "no OutputDescriptor (kms)"
+                           : "no SurfaceReady";
         return false;
     }
     (void)gotFeedback;
 
-    if (!headless_) {
+    if (wantSurface) {
         // Configure swapchain.
         surface_ = wgpu::Surface::Acquire(rs.surface);
         renderFormat_ = static_cast<wgpu::TextureFormat>(surfReady.format);
@@ -189,6 +236,65 @@ bool Compositor::bringUp() {
         cfg.presentMode = static_cast<wgpu::PresentMode>(surfReady.presentMode);
         surface_.Configure(&cfg);
         link_->flush();
+    } else if (kmsMode_) {
+        // Scanout texture format matches the compositor's render path.
+        renderFormat_ = wgpu::TextureFormat::BGRA8Unorm;
+        windowWidth_  = kmsDescriptor.width;
+        windowHeight_ = kmsDescriptor.height;
+
+        // Reserve three texture handles for the scanout ring slots, send them
+        // to the GPU process, and wait for ScanoutReady.
+        WGPUTextureDescriptor td{};
+        td.size = { windowWidth_, windowHeight_, 1 };
+        td.mipLevelCount = 1;
+        td.sampleCount = 1;
+        td.dimension = WGPUTextureDimension_2D;
+        td.format = static_cast<WGPUTextureFormat>(renderFormat_);
+        td.usage = WGPUTextureUsage_RenderAttachment | WGPUTextureUsage_TextureBinding;
+        ipc::Message rsMsg{};
+        rsMsg.tag = ipc::Tag::ScanoutReserve;
+        rsMsg.width = windowWidth_;
+        rsMsg.height = windowHeight_;
+        for (int i = 0; i < 3; ++i) {
+            auto r = link_->client().ReserveTexture(device_.Get(), &td);
+            scanoutSlots_[i].handleId  = r.handle.id;
+            scanoutSlots_[i].handleGen = r.handle.generation;
+            scanoutSlots_[i].state     = ScanoutSlotState::FREE;
+            scanoutSlots_[i].tex       = r.texture;  // wire-side handle, valid pre-inject
+            scanoutSlots_[i].surfaceBufId = nextSurfaceBufId_++;
+            rsMsg.scanoutHandles[i]    = { r.handle.id, r.handle.generation };
+            rsMsg.scanoutBufIds[i]     = scanoutSlots_[i].surfaceBufId;
+        }
+        // Flush the reserves into the wire before sending ScanoutReserve so the
+        // GPU process's wire reader has consumed any reservation-related bytes
+        // by the time it tries to InjectTexture at our handles.
+        link_->flush();
+        ipc::sendMessage(ctrlFd_, rsMsg);
+
+        // Wait for ScanoutReady.
+        bool ready = false;
+        bool ok = false;
+        if (!link_->pumpUntil([&] {
+                ipc::Message m{};
+                int fds[ipc::kMaxMsgFds];
+                int nfds = 0;
+                if (!ipc::recvMessageNBFds(ctrlFd_, m, fds, &nfds)) return false;
+                for (int i = 0; i < nfds; ++i) ::close(fds[i]);
+                if (m.tag == ipc::Tag::ScanoutReady) {
+                    ready = true;
+                    ok = m.ok != 0;
+                    return true;
+                }
+                return false;
+            })) {
+            error_ = "no ScanoutReady";
+            return false;
+        }
+        (void)ready;
+        if (!ok) {
+            error_ = "ScanoutReady reported failure";
+            return false;
+        }
     } else {
         // Headless: no swapchain. The JS compositor renders into its own
         // offscreen target; the format it samples client buffers as is BGRA8Unorm.
@@ -350,6 +456,22 @@ void Compositor::drainCtrl() {
     // loop) is ClientTexImported, completing an async dmabuf import.
     ipc::Message r{};
     while (ipc::recvMessageNB(ctrlFd_, r)) {
+        if (r.tag == ipc::Tag::ScanoutFlipComplete) {
+            // The GPU process flipped to slot `surfaceBufId`. Advance the
+            // local state machine: that slot is now SCANOUT, the prior
+            // SCANOUT slot becomes FREE.
+            const int flipped = static_cast<int>(r.surfaceBufId);
+            if (flipped >= 0 && flipped < 3) {
+                for (int i = 0; i < 3; ++i) {
+                    if (i == flipped) continue;
+                    if (scanoutSlots_[i].state == ScanoutSlotState::SCANOUT) {
+                        scanoutSlots_[i].state = ScanoutSlotState::FREE;
+                    }
+                }
+                scanoutSlots_[flipped].state = ScanoutSlotState::SCANOUT;
+            }
+            continue;
+        }
         if (r.tag == ipc::Tag::OutputDescriptor) {
             OutputDescriptorMsg msg{};
             msg.width            = r.width;
@@ -643,7 +765,30 @@ int Compositor::pluginInstanceInjected(uint32_t connId) const {
 }
 
 WGPUTexture Compositor::acquireOutputTextureHandle() {
-    if (headless_ || !surface_) return nullptr;
+    if (headless_) return nullptr;
+    if (kmsMode_) {
+        // Pick the next FREE slot. Returns nullptr (frame skipped) if all
+        // three are PENDING_FLIP/SCANOUT -- the JS compositor's render path
+        // already handles a null acquire. The texture handle was returned
+        // by the wire-client ReserveTexture during bring-up; the GPU process
+        // has InjectTexture'd at it (ScanoutReady ok=1 attests).
+        //
+        // Open a producer BeginAccess bracket on the slot's SharedTextureMemory.
+        // Reuses the same in-band kind=1 wire frame the plugin overlay path
+        // uses (SurfaceAccessPayload{surfaceBufId, producer=true}); the GPU
+        // process has registered this surfaceBufId as a SurfaceBuf during
+        // ScanoutReady. Without this bracket, Dawn validation rejects every
+        // queue submit that uses the scanout texture with "used in a submit
+        // without current access to SharedTextureMemory".
+        for (int i = 0; i < 3; ++i) {
+            if (scanoutSlots_[i].state != ScanoutSlotState::FREE) continue;
+            currentSlot_ = i;
+            writeProducerBeginAccess(scanoutSlots_[i].surfaceBufId);
+            return scanoutSlots_[i].tex;
+        }
+        return nullptr;  // all slots busy
+    }
+    if (!surface_) return nullptr;
     wgpu::SurfaceTexture st{};
     surface_.GetCurrentTexture(&st);
     if (!st.texture) return nullptr;
@@ -652,7 +797,35 @@ WGPUTexture Compositor::acquireOutputTextureHandle() {
 }
 
 void Compositor::presentOutput() {
-    if (headless_ || !surface_) return;
+    if (headless_) return;
+    if (kmsMode_) {
+        if (currentSlot_ < 0) return;  // no slot was acquired this frame
+        const int slot = currentSlot_;
+        currentSlot_ = -1;
+        scanoutSlots_[slot].state = ScanoutSlotState::PENDING_FLIP;
+
+        // Close the producer access bracket on this slot's STM. The
+        // EndAccess writes are in-band on the wire (kind=2), FIFO-ordered
+        // after the render submit, so the GPU process EndAccess's the STM
+        // AFTER the queue submit has been processed -- producing a sync_file
+        // fd that we then attach to the atomic commit's IN_FENCE_FD prop.
+        // The fence-fd attachment happens GPU-side: the GPU process pairs
+        // each EndAccess on a scanout surfaceBufId with the next
+        // ScanoutPresent on the same slot and stuffs the captured fd into
+        // the atomic commit. So the core does NOT need to ship a fence fd
+        // through the ScanoutPresent SCM_RIGHTS path -- it's already in the
+        // GPU process's hands by then.
+        writeProducerEndAccess(scanoutSlots_[slot].surfaceBufId);
+
+        ipc::Message m{};
+        m.tag = ipc::Tag::ScanoutPresent;
+        m.surfaceBufId = scanoutSlots_[slot].surfaceBufId;
+        ipc::sendMessage(ctrlFd_, m);
+        presented_++;
+        link_->flush();
+        return;
+    }
+    if (!surface_) return;
     surface_.Present();
     presented_++;
     currentOutputTexture_ = nullptr;

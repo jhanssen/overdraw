@@ -34,6 +34,9 @@
 #include "event_loop.h"
 #include "output_backend.h"
 #include "output_host_window.h"
+#if OVERDRAW_KMS
+#include "kms_output.h"
+#endif
 #include "side_channel.h"
 #include "transport.h"
 #include "wire_barrier.h"
@@ -110,7 +113,7 @@ int buildFormatTableMemfd(const std::vector<gpu::FormatTableEntry>& entries) {
 }
 
 int run(int wireFd, int ctrlFd, int inputFd, bool headless,
-        uint32_t headlessW, uint32_t headlessH) {
+        uint32_t headlessW, uint32_t headlessH, bool outputKms) {
     // 1) Output: in nested mode, an OutputBackend brings up the display target
     //    (HostWindowOutputBackend in phase 1 = a host Wayland output window the
     //    GPU process is a client of, forwarding host pointer/keyboard over
@@ -118,15 +121,66 @@ int run(int wireFd, int ctrlFd, int inputFd, bool headless,
     //    HEADLESS mode has no output target at all -- the core renders into an
     //    offscreen texture and reads it back (tests). The size is fixed from
     //    argv. `output` is null in headless mode.
+    //
+    //    KMS mode needs the DRM card fd from the core BEFORE open() can run.
+    //    The core sends ipc::Tag::SetDrmFd (with the fd via SCM_RIGHTS) before
+    //    Hello -- we receive it here, then construct + open the backend.
     std::unique_ptr<gpu::OutputBackend> output;
+    // Borrowed (non-owning) pointer to the KMS-typed subclass, when KMS is
+    // active. Used for KMS-specific calls (initScanout, presentScanout)
+    // that aren't on the OutputBackend interface. nullptr in nested/headless.
+    gpu::KmsOutputBackend* kms = nullptr;
+
     if (!headless) {
-        output = std::make_unique<gpu::HostWindowOutputBackend>(inputFd);
-        if (!output->open("overdraw")) {
-            std::fprintf(stderr, "[gpu] failed to open host window (no WAYLAND_DISPLAY?)\n");
+        if (outputKms) {
+#if OVERDRAW_KMS
+            // Wait for SetDrmFd ctrl msg.
+            int drmFd = -1;
+            {
+                ipc::Message m{};
+                int fds[ipc::kMaxMsgFds];
+                int nfds = 0;
+                for (int i = 0; i < 500000 && drmFd < 0; ++i) {
+                    if (ipc::recvMessageNBFds(ctrlFd, m, fds, &nfds)
+                        && m.tag == ipc::Tag::SetDrmFd) {
+                        if (nfds >= 1) {
+                            drmFd = fds[0];
+                            for (int j = 1; j < nfds; ++j) ::close(fds[j]);
+                        } else {
+                            std::fprintf(stderr, "[gpu] SetDrmFd had no fd\n");
+                            return 1;
+                        }
+                        break;
+                    }
+                    usleepShort();
+                }
+                if (drmFd < 0) {
+                    std::fprintf(stderr, "[gpu] no SetDrmFd (kms requested)\n");
+                    return 1;
+                }
+            }
+            auto kmsUp = std::make_unique<gpu::KmsOutputBackend>(drmFd);
+            if (!kmsUp->open("overdraw")) {
+                std::fprintf(stderr, "[gpu] KmsOutputBackend::open failed\n");
+                return 1;
+            }
+            const gpu::OutputSize sz = kmsUp->size();
+            std::printf("[gpu] kms output %ux%u\n", sz.width, sz.height);
+            kms = kmsUp.get();  // borrowed view
+            output = std::move(kmsUp);  // OutputBackend takes ownership
+#else
+            std::fprintf(stderr, "[gpu] --output=kms requested but OVERDRAW_KMS=OFF at build\n");
             return 1;
+#endif
+        } else {
+            output = std::make_unique<gpu::HostWindowOutputBackend>(inputFd);
+            if (!output->open("overdraw")) {
+                std::fprintf(stderr, "[gpu] failed to open host window (no WAYLAND_DISPLAY?)\n");
+                return 1;
+            }
+            const gpu::OutputSize sz = output->size();
+            std::printf("[gpu] host window %ux%u\n", sz.width, sz.height);
         }
-        const gpu::OutputSize sz = output->size();
-        std::printf("[gpu] host window %ux%u\n", sz.width, sz.height);
     } else {
         std::printf("[gpu] HEADLESS %ux%u (no host window/surface)\n", headlessW, headlessH);
     }
@@ -269,13 +323,12 @@ int run(int wireFd, int ctrlFd, int inputFd, bool headless,
     wgpu::Adapter adapter(adapters[0].Get());
 
     // Nested: create the wgpu::Surface for this output from the backend.
-    // Headless: no surface (offscreen path). The KMS backend will return a
-    // null surface from createWgpuSurface (scanout via SharedTextureMemory,
-    // not Dawn WSI); slice 4 adds the branch that skips WSI bring-up in that
-    // case. For slice 2, only HostWindowOutputBackend exists so a non-null
-    // surface is required.
+    // Headless or KMS: no wgpu::Surface (KMS scans out via SharedTextureMemory
+    // textures dual-imported from GBM, not via Dawn WSI). The KMS backend's
+    // createWgpuSurface returns null intentionally; only the nested
+    // HostWindowOutputBackend returns a real surface.
     wgpu::Surface surface;
-    if (!headless) {
+    if (!headless && !outputKms) {
         surface = output->createWgpuSurface(inst);
         if (!surface) { std::fprintf(stderr, "[gpu] CreateSurface failed\n"); return 1; }
     }
@@ -329,7 +382,7 @@ int run(int wireFd, int ctrlFd, int inputFd, bool headless,
     uint32_t surfaceFormat = static_cast<uint32_t>(WGPUTextureFormat_BGRA8Unorm);
     uint32_t surfacePresentMode = static_cast<uint32_t>(wgpu::PresentMode::Fifo);
     constexpr uint32_t kSurfaceAlphaMode = static_cast<uint32_t>(WGPUCompositeAlphaMode_Opaque);
-    if (!headless) {
+    if (!headless && !outputKms) {
     wgpu::SurfaceCapabilities caps{};
     surface.GetCapabilities(adapter, &caps);
     // Choose a NON-sRGB swapchain format. Client buffers carry sRGB-encoded
@@ -411,10 +464,146 @@ int run(int wireFd, int ctrlFd, int inputFd, bool headless,
             info.width, info.height, info.refreshMhz, info.scale, info.transform,
             info.physicalWidthMm, info.physicalHeightMm, info.name, info.make, info.model);
     }
-    }  // if (!headless)
+    }  // if (!headless && !outputKms)
 
     // Wire-resolved core device (non-owning wrapper; addref'd by the ctor).
     wgpu::Device coreDevice(nativeDev);
+
+    // --- Surface-buffer machinery (used by plugin overlays AND KMS scanout) ---
+    // The full struct definition + helper lambdas live further down (search for
+    // "Producer/consumer surface buffers"); only the forward declaration moves
+    // up here so the KMS bring-up below can populate the map before the
+    // lambdas exist. The lambdas operate on the same `surfaceBufs` map and
+    // see entries seeded by KMS bring-up.
+    struct SurfaceBuf {
+        uint32_t connId = 0;
+        gpu::DmabufBuffer buf;
+        bool producerOnCore = false;
+        wgpu::SharedTextureMemory producerMem;
+        wgpu::Texture producerTex;
+        wgpu::Device producerDev;
+        wgpu::SharedTextureMemory consumerMem;
+        wgpu::Texture consumerTex;
+        wgpu::Device consumerDev;
+        int32_t layout = 0;
+        bool everProduced = false;
+        bool producerOpen = false;
+        bool consumerOpen = false;
+        wgpu::SharedFence producerFence;
+        wgpu::SharedFence consumerFence;
+    };
+    std::unordered_map<uint32_t, SurfaceBuf> surfaceBufs;
+
+#if OVERDRAW_KMS
+    // KMS scanout: maps surfaceBufId -> slot index (0..2) and slot -> last
+    // exported sync_file fd from EndAccess (handed to atomic commit as
+    // IN_FENCE_FD). The sync fd is owned here until consumed by the next
+    // ScanoutPresent for the same slot.
+    std::unordered_map<uint32_t, int> scanoutBufIdToSlot;
+    int scanoutSlotFenceFd[3] = {-1, -1, -1};
+#endif
+
+#if OVERDRAW_KMS
+    // KMS bring-up (analogue of the nested SurfaceReady -> swapchain Configure
+    // path above). The core's bringUp expects:
+    //   1) OutputDescriptor (so it knows the mode dims to reserve at)
+    //   2) ScanoutReserve (with three texture handles)
+    //   3) we reply ScanoutReady after building the ring + injecting
+    if (outputKms && kms) {
+        // Step 1: send OutputDescriptor.
+        gpu::OutputDescriptorInfo info{};
+        kms->describeOutput(info);
+        {
+            ipc::Message m{};
+            m.tag = ipc::Tag::OutputDescriptor;
+            m.width            = info.width;
+            m.height           = info.height;
+            m.refreshMhz       = info.refreshMhz;
+            m.outScale         = info.scale;
+            m.outTransform     = info.transform;
+            m.physicalWidthMm  = info.physicalWidthMm;
+            m.physicalHeightMm = info.physicalHeightMm;
+            std::memcpy(m.outputName,  info.name,  sizeof(m.outputName));
+            std::memcpy(m.outputMake,  info.make,  sizeof(m.outputMake));
+            std::memcpy(m.outputModel, info.model, sizeof(m.outputModel));
+            ipc::sendMessage(ctrlFd, m);
+            std::printf("[gpu] sent OutputDescriptor (kms): %ux%u @%umHz\n",
+                        info.width, info.height, info.refreshMhz);
+        }
+
+        // Step 2: build the scanout ring on the core device.
+        if (!kms->initScanout(coreDevice)) {
+            std::fprintf(stderr, "[gpu] KmsOutputBackend::initScanout failed\n");
+            return 1;
+        }
+
+        // Step 3: wait for ScanoutReserve.
+        ipc::Message reserveMsg{};
+        {
+            bool got = false;
+            for (int i = 0; i < 500000 && !got; ++i) {
+                ipc::Message m{};
+                if (ipc::recvMessageNB(ctrlFd, m) && m.tag == ipc::Tag::ScanoutReserve) {
+                    reserveMsg = m;
+                    got = true;
+                    break;
+                }
+                pumpWire();  // keep wire flowing during the wait
+                usleepShort();
+            }
+            if (!got) {
+                std::fprintf(stderr, "[gpu] no ScanoutReserve\n");
+                return 1;
+            }
+        }
+
+        // Step 4: InjectTexture at each reserved handle AND register the
+        // slot as a SurfaceBuf so the existing in-band BeginAccess/EndAccess
+        // machinery (originally for plugin overlays) handles scanout brackets
+        // too. Each scanout SurfaceBuf is one-sided: producer side is the
+        // core's wgpu device + the slot's STM/Texture; consumer side is
+        // empty (the kernel consumes via fb_id, not wgpu).
+        bool injectOk = true;
+        for (int i = 0; i < 3; ++i) {
+            const auto& slot = kms->scanoutSlot(i);
+            if (!server.InjectTexture(slot.tex.Get(),
+                                      {reserveMsg.scanoutHandles[i].id,
+                                       reserveMsg.scanoutHandles[i].generation},
+                                      {ready.device.id, ready.device.generation})) {
+                std::fprintf(stderr, "[gpu] InjectTexture failed for scanout slot %d\n", i);
+                injectOk = false;
+                break;
+            }
+            // Register the SurfaceBuf for this slot.
+            SurfaceBuf sb{};
+            sb.connId = 0;  // not a plugin buf
+            sb.producerOnCore = true;
+            sb.producerMem = slot.mem;
+            sb.producerTex = slot.tex;
+            sb.producerDev = coreDevice;
+            // Consumer side intentionally null -- kernel scanout, no wgpu.
+            sb.layout = 0;
+            sb.everProduced = false;
+            sb.producerOpen = false;
+            sb.consumerOpen = false;
+            const uint32_t sbufId = reserveMsg.scanoutBufIds[i];
+            surfaceBufs.emplace(sbufId, std::move(sb));
+            // Remember the mapping slot -> surfaceBufId so ScanoutPresent's
+            // surfaceBufId can route to the right scanout slot.
+            scanoutBufIdToSlot[sbufId] = i;
+        }
+
+        // Step 5: tell the core we're done.
+        {
+            ipc::Message m{};
+            m.tag = ipc::Tag::ScanoutReady;
+            m.ok = injectOk ? 1 : 0;
+            ipc::sendMessage(ctrlFd, m);
+        }
+        if (!injectOk) return 1;
+        std::printf("[gpu] kms scanout ready (3 slots injected as SurfaceBufs)\n");
+    }
+#endif  // OVERDRAW_KMS
 
     // Host-window resize handler (NESTED only). The host fires
     // xdg_toplevel.configure(w,h) when the user resizes the overdraw window;
@@ -438,7 +627,7 @@ int run(int wireFd, int ctrlFd, int inputFd, bool headless,
     // the core; the next time the JS compositor queries the output, it has
     // the updated state.outputs and the swapchain delivers correctly sized
     // textures.
-    if (!headless) {
+    if (!headless && !outputKms) {
         output->setResizeListener(
             [&surface, &coreDevice, &surfaceFormat, &surfacePresentMode, &output, ctrlFd]
             (uint32_t newW, uint32_t newH) {
@@ -595,7 +784,7 @@ int run(int wireFd, int ctrlFd, int inputFd, bool headless,
     // frame: producer EndAccess exports a sync-fd, which the consumer BeginAccess
     // waits on (and vice versa, for the next producer cycle).
     //
-    // Two directions exist:
+    // Two directions exist for plugin overlays / compose buffers:
     //
     //   AllocSurfaceBuf: producerOnCore=false. PRODUCER is the plugin device
     //     (plugin renders an overlay), CONSUMER is the core device (the JS
@@ -609,32 +798,24 @@ int run(int wireFd, int ctrlFd, int inputFd, bool headless,
     //     Begin/End ride the core wire; consumer Begin/End ride the plugin
     //     wire. Used by sdk.compose for Worker plugins.
     //
+    // A third direction exists for KMS scanout (one-sided): producerOnCore=
+    // true, consumer side empty. PRODUCER is the core device (renders into
+    // the scanout slot's STM); CONSUMER is the kernel display engine (reads
+    // the underlying dmabuf via fb_id). Producer Begin/End ride the core
+    // wire; there are no consumer Begin/End frames. runSurfaceEnd's KMS
+    // branch captures the producer EndAccess's sync_file fd into
+    // scanoutSlotFenceFd[slot] for the next ScanoutPresent to attach as
+    // the atomic commit's IN_FENCE_FD.
+    //
     // producerMem/Tex/Dev always points at the producing-device side, regardless
     // of whether that's plugin or core. consumerMem/Tex/Dev points at the
-    // consuming-device side. The producerOnCore flag tells the wire dispatchers
-    // which socket carries which role for each surface.
-    struct SurfaceBuf {
-        uint32_t connId = 0;  // owning plugin connection (for wire-serial ordering)
-        gpu::DmabufBuffer buf;
-        bool producerOnCore = false;             // false: plugin produces; true: core produces
-        wgpu::SharedTextureMemory producerMem;   // on the producing device
-        wgpu::Texture producerTex;
-        wgpu::Device producerDev;                // for fence import
-        wgpu::SharedTextureMemory consumerMem;   // on the consuming device
-        wgpu::Texture consumerTex;
-        wgpu::Device consumerDev;                // for fence import
-        // Per-frame fence dance state. The dmabuf's Vulkan image layout is shared
-        // across both devices; each EndAccess reports the end layout, which the
-        // next BeginAccess (on either side) begins from. The held fences carry
-        // producer-done -> consumer-wait and consumer-done -> producer-wait.
-        int32_t layout = 0;                  // current Vulkan image layout (0=UNDEFINED)
-        bool everProduced = false;           // first ProducerBegin starts UNDEFINED
-        bool producerOpen = false;           // a producer BeginAccess bracket is open
-        bool consumerOpen = false;           // a consumer BeginAccess bracket is open
-        wgpu::SharedFence producerFence;     // last producer EndAccess fence (for consumer)
-        wgpu::SharedFence consumerFence;     // last consumer EndAccess fence (for producer)
-    };
-    std::unordered_map<uint32_t, SurfaceBuf> surfaceBufs;
+    // consuming-device side (empty for scanout). The producerOnCore flag tells
+    // the wire dispatchers which socket carries which role for each surface.
+    //
+    // The SurfaceBuf struct + surfaceBufs map + KMS-scanout maps are forward-
+    // declared earlier in run() (search for "Surface-buffer machinery") so
+    // KMS bring-up can populate them before this section's helper lambdas
+    // exist; the helpers are defined here over the same data.
 
     // Close a producer/consumer bracket: EndAccess, export the produced sync-fd as
     // a SharedFence held for the OTHER side's next Begin wait, record the end
@@ -659,8 +840,37 @@ int run(int wireFd, int ctrlFd, int inputFd, bool headless,
         }
         if (producer) sb.producerOpen = false; else sb.consumerOpen = false;
         sb.layout = endLayout.newLayout;
-        // producerFence (waited by consumer/core) / consumerFence (waited by
-        // producer/plugin); import into the WAITING side's device.
+
+#if OVERDRAW_KMS
+        // KMS scanout: producer EndAccess on a scanout SurfaceBuf has no
+        // wgpu consumer device to import the fence into. Capture the raw
+        // sync_file fd instead -- it goes straight to the next ScanoutPresent
+        // as IN_FENCE_FD.
+        {
+            auto sit = scanoutBufIdToSlot.find(surfaceBufId);
+            if (sit != scanoutBufIdToSlot.end() && producer) {
+                int& slotFenceFd = scanoutSlotFenceFd[sit->second];
+                if (slotFenceFd >= 0) { ::close(slotFenceFd); slotFenceFd = -1; }
+                if (endState.fenceCount >= 1) {
+                    wgpu::SharedFenceExportInfo exp{};
+                    wgpu::SharedFenceSyncFDExportInfo syncExp{};
+                    exp.nextInChain = &syncExp;
+                    endState.fences[0].ExportInfo(&exp);
+                    if (syncExp.handle >= 0) {
+                        slotFenceFd = ::dup(syncExp.handle);
+                        if (slotFenceFd < 0) {
+                            std::fprintf(stderr, "[gpu] scanout EndAccess: dup(syncfd) failed\n");
+                        }
+                    }
+                }
+                return;  // skip the consumer-side fence import below
+            }
+        }
+#endif
+
+        // Plugin overlay path: producerFence (waited by consumer/core) /
+        // consumerFence (waited by producer/plugin); import into the WAITING
+        // side's device.
         wgpu::SharedFence& held = producer ? sb.producerFence : sb.consumerFence;
         wgpu::Device& waiterDev = producer ? sb.consumerDev : sb.producerDev;
         held = nullptr;
@@ -1242,6 +1452,30 @@ int run(int wireFd, int ctrlFd, int inputFd, bool headless,
         {
             if (m.tag == ipc::Tag::Shutdown) {
                 shutdown = true;
+#if OVERDRAW_KMS
+            } else if (m.tag == ipc::Tag::ScanoutPresent) {
+                // m.surfaceBufId is the scanout slot's surfaceBufId, NOT the
+                // slot index. Map it back to the slot, and pick up the
+                // sync_file fd captured at EndAccess time (stashed in
+                // scanoutSlotFenceFd[slot]).
+                if (kms) {
+                    auto sit = scanoutBufIdToSlot.find(m.surfaceBufId);
+                    if (sit == scanoutBufIdToSlot.end()) {
+                        std::fprintf(stderr,
+                            "[gpu] ScanoutPresent: unknown surfaceBufId=%u\n",
+                            m.surfaceBufId);
+                    } else {
+                        const int slot = sit->second;
+                        int& fenceFd = scanoutSlotFenceFd[slot];
+                        if (!kms->presentScanout(slot, fenceFd)) {
+                            std::fprintf(stderr,
+                                "[gpu] presentScanout(slot=%d) rejected by kernel\n", slot);
+                        }
+                        if (fenceFd >= 0) { ::close(fenceFd); fenceFd = -1; }
+                    }
+                }
+                for (int i = 0; i < nRecvFds; ++i) ::close(recvFds[i]);
+#endif
             } else if (m.tag == ipc::Tag::AddWireConn) {
                 // Register a new plugin wire connection from the fd the core sent
                 // (SCM_RIGHTS). No listening socket: only the trusted core, over
@@ -1502,6 +1736,35 @@ int run(int wireFd, int ctrlFd, int inputFd, bool headless,
     const int outputFd = output ? output->eventFd() : -1;
     if (outputFd >= 0)
         loop->add(outputFd, gpu::EventLoop::kRead, [&](uint32_t) { output->pump(); });
+
+#if OVERDRAW_KMS
+    // Page-flip → ScanoutFlipComplete: when KMS flips to a new slot, the
+    // backend's listener fires synchronously from drmHandleEvent (called
+    // from output->pump()). We send the retired slot index to the core so
+    // it advances its scanout state machine.
+    if (kms) {
+        kms->setFlipCompleteListener([&](int retiredSlotIdx) {
+            // The flip-complete handler receives the slot index that JUST
+            // became SCANOUT; the retiredSlotIdx parameter is the slot that
+            // was previously SCANOUT and is now FREE (-1 on the first flip).
+            // The CORE keeps the slot state -- we send the slot that flipped
+            // (=newly SCANOUT) and let the core deduce the rest.
+            (void)retiredSlotIdx;  // unused: see KmsScanoutRing for the inversion.
+            ipc::Message m{};
+            m.tag = ipc::Tag::ScanoutFlipComplete;
+            // KmsScanoutRing's listener semantics return retired (now-FREE)
+            // slot. The core needs to know which slot just became SCANOUT
+            // -- look up the ring state to find it.
+            for (int i = 0; i < 3; ++i) {
+                if (kms->scanoutSlot(i).state == gpu::KmsScanoutRing::SlotState::SCANOUT) {
+                    m.surfaceBufId = static_cast<uint32_t>(i);
+                    break;
+                }
+            }
+            ctrlSender.send(m);
+        });
+    }
+#endif
 
     // Re-arm a plugin connection's epoll interest (write only when output queued).
     auto armPluginConn = [&](PluginConn* pc) {
@@ -1908,13 +2171,20 @@ int main(int argc, char** argv) {
     // window/surface; the core renders into an offscreen texture (tests).
     bool headless = false;
     uint32_t hw = 0, hh = 0;
+    // Output-backend selector: "--output=kms" or "--output=nested" (default).
+    // Headless ignores this (no output backend exists in headless mode).
+    bool outputKms = false;
     for (int i = 3; i < argc; ++i) {
         if (std::strcmp(argv[i], "--headless") == 0 && i + 1 < argc) {
             headless = true;
             std::sscanf(argv[i + 1], "%ux%u", &hw, &hh);
             ++i;
+        } else if (std::strcmp(argv[i], "--output=kms") == 0) {
+            outputKms = true;
+        } else if (std::strcmp(argv[i], "--output=nested") == 0) {
+            outputKms = false;
         }
     }
     if (headless && (hw == 0 || hh == 0)) { hw = 1280; hh = 720; }  // default
-    return run(wireFd, ctrlFd, inputFd, headless, hw, hh);
+    return run(wireFd, ctrlFd, inputFd, headless, hw, hh, outputKms);
 }
