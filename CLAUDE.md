@@ -150,6 +150,14 @@ and cleaned up carefully.
   holding the shell's stdout/stderr fds open — the command logic completed; the
   tool is waiting on fd EOF. Redirect child output to files and/or fully detach
   to avoid this.
+- `node --test` (the GPU test driver) ALSO trips this in inline mode. With
+  output going straight to the bash tool's stdout, a multi-test suite stalls
+  *during a test* even though the test itself is fine -- the suite was simply
+  emitting output faster than the tool buffer drained, and the next `setTimeout`
+  / `await` happened to fire while the parent was blocked on the pipe. The
+  symptom is "second test in the file appears to hang." Redirect to a file
+  (`> /tmp/test.log 2>&1`) and the same suite runs to completion. **If you
+  think a GPU test has hung, redirect to a file before concluding so.**
 
 ## Testing policy (new protocols)
 
