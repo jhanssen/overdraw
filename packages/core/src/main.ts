@@ -78,8 +78,21 @@ const onInput = (ev: InputEvent): void => { state?.seat?.handleInput(ev); };
 // Per-frame: fire client frame callbacks so their render loops advance. The
 // argument is the presented-frame count; clients want a ms timestamp, so use a
 // monotonic clock here.
+//
+// After dispatch+render, if any subsystem still has continuous work (an
+// animation in mid-flight, a transition still running, an intercept plugin
+// that wants per-frame render callbacks), call addon.wake() so the next
+// flip-complete drives the next render. Without this, an animation would
+// stop after one frame because the addon's frame loop is otherwise idle
+// after a render with no incoming events.
+//
+// `wakeIfActive` is assigned after the evaluators + intercept broker exist
+// (the closure captures lexically, but the assignment happens at boot time
+// before any frame fires; an extra `?.` guards the early-call window).
+let wakeIfActive: (() => void) | null = null;
 const onFrame = (): void => {
   state?.dispatchFrameCallbacks?.(Math.round(performance.now()));
+  wakeIfActive?.();
 };
 
 let runtime: PluginRuntime | null = null;
@@ -488,6 +501,19 @@ state.beforeRender = (timeMs: number): void => {
   interceptBroker.tick(timeMs);
 };
 
+// Wired late so the forward-declared `wakeIfActive` (used by onFrame near
+// the top of this file) can consult these. After each frame's render, if
+// any continuous-work subsystem still has work, schedule another frame.
+// Idle is the default: no animation, no transition, no intercept = no
+// re-wake => no further renders until an external event (client commit,
+// input, host wl_surface.frame) wakes again.
+wakeIfActive = (): void => {
+  const animActive = evaluator.activeCount() > 0;
+  const transActive = transitionEvaluator.isActive();
+  const interceptActive = interceptBroker.hasActive();
+  if (animActive || transActive || interceptActive) addon.wake();
+};
+
 // Input broker: services plugin sdk.input.* calls by routing into the
 // seat's binding chain. emitToPlugin uses the runtime's per-plugin event
 // emit; the runtime is assigned below before any plugin loads.
@@ -694,3 +720,11 @@ if (!runtimeDir) {
 }
 
 console.log(`[overdraw] ctrl-c to quit.`);
+
+// Bootstrap the frame loop. addon.wake() schedules the first render now
+// that the JS compositor, protocol layer, and plugin runtime are all live;
+// subsequent renders are driven by the wake/flip-complete state machine
+// in the addon (KMS: ScanoutFlipComplete; nested: FrameComplete from the
+// GPU process's host wl_surface.frame listener). Without this call, an
+// idle compositor with no clients would never render its first frame.
+addon.wake();

@@ -11,6 +11,7 @@
 #ifndef OVERDRAW_WAYLAND_SERVER_H_
 #define OVERDRAW_WAYLAND_SERVER_H_
 
+#include <functional>
 #include <memory>
 #include <string>
 
@@ -40,6 +41,21 @@ class Server {
 
     wl_display* display() const { return display_; }
 
+    // Optional hook fired AFTER wl_event_loop_dispatch returns (i.e. after a
+    // libwayland poll tick handled any incoming client requests). Used by the
+    // addon's wake state machine to schedule a render when client activity
+    // arrived. Calls happen on the Node main thread, synchronously, from
+    // inside onLoopReadable.
+    using PumpHook = std::function<void()>;
+    void setOnPump(PumpHook cb) { onPump_ = std::move(cb); }
+
+    // Drain pending wayland-server events synchronously (without blocking
+    // libuv). Used by the frame-trigger path right before deciding what to
+    // render: if a client commit arrived between the last server-pump and
+    // the page-flip event we are now processing, drainEvents() pulls it in
+    // so the upcoming dispatchFrameCallbacks sees the new callback.
+    void drainEvents();
+
   private:
     static void onLoopReadable(uv_poll_t* handle, int status, int events);
     static void onPrepare(uv_prepare_t* handle);
@@ -47,6 +63,8 @@ class Server {
     wl_display* display_ = nullptr;
     wl_event_loop* eventLoop_ = nullptr;
     std::string socketName_;
+
+    PumpHook onPump_;
 
     uv_poll_t poll_{};
     uv_prepare_t prepare_{};

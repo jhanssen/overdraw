@@ -77,6 +77,15 @@ export interface Addon {
   // false in nested mode (no seat) or for out-of-range n.
   switchVT(n: number): boolean;
 
+  // Schedule a frame. Drives the wake/render state machine described in the
+  // addon's `wake()` C function. Idempotent and cheap when called repeatedly
+  // before the next render fires; the implementation coalesces. Call this
+  // when a JS-side change requests a render that no native event covers
+  // (e.g. an animation tick that still has more to do, an IPC action that
+  // mutated state). Native event sources (wayland-server pump, input poll,
+  // ScanoutFlipComplete/FrameComplete) wake automatically.
+  wake(): void;
+
   // XCursor theme resolver. Looks up a named shape in the current theme
   // (XCURSOR_THEME env, with [Icon Theme] Inherits= walk). Returns BGRA8
   // pixels tightly packed at width*height*4. For 'default', a built-in

@@ -255,9 +255,22 @@ bool KmsOutputBackend::presentScanout(int slotIdx, int inFenceFd) {
         return false;
     }
 
+    const bool wasInitial = !didInitialCommit_;
     didInitialCommit_ = true;
     ring_.markPendingFlip(slotIdx);
     pendingFlipSlot_ = slotIdx;
+    // Initial commit ran ALLOW_MODESET without PAGE_FLIP_EVENT (the kernel-
+    // docs path; combining them is unreliable on some drivers). That commit
+    // is synchronous -- the modeset is done by the time we return -- so the
+    // kernel will NOT deliver a flip event later, and the wake/render state
+    // machine would never get its first onFrameComplete. Fake one inline:
+    // transition the slot to SCANOUT now and fire the listener so the next
+    // render is scheduled.
+    if (wasInitial) {
+        const int retired = ring_.onFlipComplete(slotIdx);
+        pendingFlipSlot_ = -1;
+        if (flipCompleteListener_) flipCompleteListener_(retired);
+    }
     return true;
 }
 

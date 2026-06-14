@@ -127,6 +127,15 @@ enum class Tag : uint8_t {
                                 //   `surfaceBufId` field carries the slot index
                                 //   that just exited SCANOUT (now FREE). The core
                                 //   advances its slot state machine off this.
+                                //   Also doubles as the KMS frame-complete signal
+                                //   for the wake/render state machine.
+    FrameComplete = 'f',  // gpu -> core: nested mode's host wl_surface.frame
+                          //   callback fired (the host compositor is ready for
+                          //   the next frame). The KMS path uses
+                          //   ScanoutFlipComplete for the same purpose; the two
+                          //   exist as separate tags because KMS carries the
+                          //   retired slot idx in its payload and nested has
+                          //   no equivalent.
     OutputPause  = 'q',  // core -> gpu: VT-switch-away (libseat disable_seat).
                          //   GPU process stops atomic commits, clears any pending
                          //   flip wait, resets the scanout ring's per-slot state

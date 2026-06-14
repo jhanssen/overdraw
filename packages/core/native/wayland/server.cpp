@@ -51,6 +51,13 @@ void Server::onLoopReadable(uv_poll_t* handle, int status, int) {
     auto* self = static_cast<Server*>(handle->data);
     wl_event_loop_dispatch(self->eventLoop_, 0);
     wl_display_flush_clients(self->display_);
+    if (self->onPump_) self->onPump_();
+}
+
+void Server::drainEvents() {
+    if (!eventLoop_) return;
+    wl_event_loop_dispatch(eventLoop_, 0);  // 0 = non-blocking
+    wl_display_flush_clients(display_);
 }
 
 void Server::onPrepare(uv_prepare_t* handle) {
@@ -63,8 +70,22 @@ void Server::stop() {
     started_ = false;
     uv_poll_stop(&poll_);
     uv_prepare_stop(&prepare_);
-    uv_close(reinterpret_cast<uv_handle_t*>(&poll_), nullptr);
-    uv_close(reinterpret_cast<uv_handle_t*>(&prepare_), nullptr);
+    // Track close completion via a counter the callbacks decrement. uv_close
+    // is asynchronous: libuv runs the close callback on the NEXT loop tick.
+    // The Server's memory (including the uv handles) is freed by the
+    // destructor immediately after stop() returns, so we must not return
+    // until libuv has fully closed both handles -- otherwise libuv's
+    // pending-close list ends up with a stale pointer and trips its
+    // UV_HANDLE_CLOSING assertion on the next teardown sweep.
+    int pending = 2;
+    poll_.data    = &pending;
+    prepare_.data = &pending;
+    uv_close(reinterpret_cast<uv_handle_t*>(&poll_),
+             [](uv_handle_t* h) { --*static_cast<int*>(h->data); });
+    uv_close(reinterpret_cast<uv_handle_t*>(&prepare_),
+             [](uv_handle_t* h) { --*static_cast<int*>(h->data); });
+    uv_loop_t* loop = poll_.loop;
+    while (pending > 0) uv_run(loop, UV_RUN_NOWAIT);
     if (display_) {
         wl_display_destroy(display_);
         display_ = nullptr;

@@ -227,6 +227,18 @@ export class InterceptBroker {
   }
 
   // Per-frame tick. The launcher's beforeRender hook calls this BEFORE
+  // True iff at least one registration has at least one matched surface
+  // currently active. The frame-trigger loop (main.ts onFrame) consults
+  // this after each render to decide whether to wake again -- intercept
+  // wants per-frame render callbacks for every matched surface, so an
+  // active registration drives continuous re-render at vsync.
+  hasActive(): boolean {
+    for (const active of this.registrations.values()) {
+      if (active.surfaces.size > 0) return true;
+    }
+    return false;
+  }
+
   // the compositor's renderFrame. Iterates every active state across
   // every registration and dispatches its render.
   tick(timeMs: number): void {

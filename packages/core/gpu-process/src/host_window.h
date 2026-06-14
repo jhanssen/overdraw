@@ -14,6 +14,7 @@
 struct wl_display;
 struct wl_compositor;
 struct wl_surface;
+struct wl_callback;
 struct wl_seat;
 struct wl_pointer;
 struct wl_keyboard;
@@ -66,6 +67,24 @@ class HostWindow {
     // be set before open() returns.
     using ResizeListener = std::function<void(uint32_t, uint32_t)>;
     void setResizeListener(ResizeListener cb) { onResize_ = std::move(cb); }
+
+    // Fired when a host wl_surface.frame callback's `done` event arrives,
+    // i.e. the host compositor is ready for the next frame. This is the
+    // nested-mode equivalent of KMS's page-flip-complete signal: the main
+    // loop forwards it to the core as `ipc::Tag::FrameComplete`, where
+    // the addon's wake state machine drives the next render.
+    using FrameDoneListener = std::function<void()>;
+    void setFrameDoneListener(FrameDoneListener cb) { onFrameDone_ = std::move(cb); }
+
+    // Ensure exactly one wl_surface.frame callback is in flight; called from
+    // the GPU process pump after each successful event drain. The very first
+    // call (after open()) primes the chain; subsequent calls are no-ops while
+    // a callback is in flight, then arm a new one inside the `done` handler.
+    // Idempotent.
+    void armFrameCallback();
+
+    // Listener trampoline (frame.done). Public for the C listener glue.
+    void onFrameCallbackDone();
 
     // Seat handling: bind on registry, then (re)create pointer/keyboard as the
     // seat advertises capabilities. Public for the C listener trampolines.
@@ -149,7 +168,15 @@ class HostWindow {
     uint32_t width_ = 800;
     uint32_t height_ = 600;
 
+    // One-shot wl_surface.frame callback chain. Each `done` fires the
+    // onFrameDone_ listener and arms a fresh callback. nullptr when none is
+    // in flight (e.g. before armFrameCallback() has been called the first
+    // time, or while the listener has just fired and a new one hasn't been
+    // requested yet).
+    wl_callback* frameCallback_ = nullptr;
+
     ResizeListener onResize_;
+    FrameDoneListener onFrameDone_;
 };
 
 }  // namespace overdraw::gpu

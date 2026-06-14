@@ -128,31 +128,22 @@ bool KmsScanoutRing::init(int drmFd, gbm_device* gbm,
     height_ = height;
     fourcc_ = fourcc;
 
-    // Build the candidate modifier list. ORDER: DRM_FORMAT_MOD_LINEAR first,
-    // then any other single-plane modifiers from IN_FORMATS.
+    // Build the candidate modifier list. ORDER: tiled modifiers (advertised
+    // by the plane's IN_FORMATS) first, since LINEAR scanout targets on
+    // integrated GPUs render multiple ms slower (no GPU tile compression).
+    // LINEAR is appended last as a guaranteed-single-plane fallback.
     //
-    // Tiled modifiers (e.g. I915_FORMAT_MOD_4_TILED, AFBC, ...) advertised by
-    // IN_FORMATS often require auxiliary planes (CCS / compression metadata)
-    // that our single-plane import path does NOT handle today. Trying them
-    // produces Dawn ImportSharedTextureMemory failures like "plane count (2)
-    // does not match provided (1)" and is wasted work. LINEAR is guaranteed
-    // single-plane and works on every driver we care about.
-    //
-    // Future perf work: extend the import path to multi-plane (passing both
-    // a primary and a CCS dmabuf to Dawn) and reintroduce tiled modifiers as
-    // preferred. For slice 4 LINEAR is sufficient.
+    // tryAllocateSlot below uses GBM + Dawn ImportSharedTextureMemory; if
+    // a modifier requires auxiliary planes (CCS / compression metadata)
+    // not in our single-plane import path, Dawn rejects with "plane count
+    // (N) does not match provided (1)" and we move to the next candidate.
     std::vector<uint64_t> candidates;
-    candidates.push_back(DRM_FORMAT_MOD_LINEAR);
     for (const auto& pm : planeModifiers) {
         if (pm.fourcc != fourcc) continue;
-        if (pm.modifier == DRM_FORMAT_MOD_LINEAR) continue;  // already added
-        // Skip modifiers known to require auxiliary planes. Without
-        // per-modifier metadata we can't be 100% precise, so the safe path
-        // for v1 is "only LINEAR." Leaving the loop in place so future work
-        // can re-enable tiled modifiers with a filter once multi-plane
-        // import lands.
-        continue;
+        if (pm.modifier == DRM_FORMAT_MOD_LINEAR) continue;  // LINEAR added last
+        candidates.push_back(pm.modifier);
     }
+    candidates.push_back(DRM_FORMAT_MOD_LINEAR);
 
     // Try modifiers in order until one succeeds for slot 0. The remaining
     // slots use the SAME modifier (the kernel requires every plane->fb of a

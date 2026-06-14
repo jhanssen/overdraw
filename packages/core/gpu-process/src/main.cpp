@@ -662,6 +662,22 @@ int run(int wireFd, int ctrlFd, int inputFd, bool headless,
             });
     }
 
+    // Nested-mode frame-done plumbing (drm-design.md "Frame clock"): the host
+    // wl_surface.frame callback fires when the host compositor is ready for
+    // the next frame; the GPU process forwards that as ipc::Tag::FrameComplete
+    // to the core, where the addon's wake state machine drives the next
+    // render. KMS uses ScanoutFlipComplete for the same role (see further
+    // below). The callback is one-shot per host vsync; HostWindow re-arms it
+    // inside `done`, plus we arm one here at startup to prime the chain.
+    if (!headless && !outputKms) {
+        output->setFrameDoneListener([ctrlFd]() {
+            ipc::Message m{};
+            m.tag = ipc::Tag::FrameComplete;
+            ipc::sendMessage(ctrlFd, m);
+        });
+        output->armFrameCallback();
+    }
+
     // B3: persistent dmabuf-backed texture injected at the client's reserved
     // handle. Allocated + imported on demand when the core sends ReserveTex.
     gpu::DmabufBuffer dmaBuf{};

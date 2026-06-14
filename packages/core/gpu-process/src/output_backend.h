@@ -117,6 +117,23 @@ class OutputBackend {
     // wgpu::Surface::Configure.
     using ResizeListener = std::function<void(uint32_t, uint32_t)>;
     virtual void setResizeListener(ResizeListener cb) = 0;
+
+    // Frame-done signal (the nested-mode equivalent of KMS's flip-complete).
+    // The host-window backend wires this to a `wl_surface.frame` callback on
+    // its host wl_surface; the KMS backend has its own page-flip path
+    // (KmsOutputBackend::setFlipCompleteListener) and leaves this as a
+    // no-op. Both ultimately drive the core's wake/render state machine
+    // through ctrl messages (FrameComplete from nested, ScanoutFlipComplete
+    // from KMS).
+    using FrameDoneListener = std::function<void()>;
+    virtual void setFrameDoneListener(FrameDoneListener /*cb*/) {}
+
+    // Ensure the backend has a frame-done callback armed (i.e. the host
+    // compositor will fire FrameDoneListener at the next vsync). Called from
+    // the GPU process pump after open() and after each FrameDoneListener
+    // fires. KMS leaves this as a no-op (page-flip events arm themselves on
+    // each atomic commit).
+    virtual void armFrameCallback() {}
 };
 
 }  // namespace overdraw::gpu

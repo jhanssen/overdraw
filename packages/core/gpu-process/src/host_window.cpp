@@ -156,10 +156,40 @@ const xdg_toplevel_listener kTlListener = {tlConfigure, tlClose, nullptr, nullpt
 }  // namespace
 
 HostWindow::~HostWindow() {
+    if (frameCallback_) wl_callback_destroy(frameCallback_);
     if (toplevel_) xdg_toplevel_destroy(toplevel_);
     if (xdgSurface_) xdg_surface_destroy(xdgSurface_);
     if (surface_) wl_surface_destroy(surface_);
     if (display_) wl_display_disconnect(display_);
+}
+
+namespace {
+void hostFrameDone(void* data, wl_callback* cb, uint32_t /*ts*/) {
+    auto* self = static_cast<HostWindow*>(data);
+    // The libwayland-client convention is to destroy the one-shot callback
+    // inside its done handler; the trampoline does NOT do this so the host
+    // window can null out its own pointer first.
+    wl_callback_destroy(cb);
+    self->onFrameCallbackDone();
+}
+const wl_callback_listener kFrameListener = { &hostFrameDone };
+}  // namespace
+
+void HostWindow::armFrameCallback() {
+    if (!surface_) return;
+    if (frameCallback_) return;  // one is already in flight
+    frameCallback_ = wl_surface_frame(surface_);
+    wl_callback_add_listener(frameCallback_, &kFrameListener, this);
+    // The host needs the request to actually go out for the callback to be
+    // scheduled. Commits flush implicitly, but we may arm well before any
+    // commit; flush explicitly so we never wait on the next render to push
+    // it out.
+    if (display_) wl_display_flush(display_);
+}
+
+void HostWindow::onFrameCallbackDone() {
+    frameCallback_ = nullptr;
+    if (onFrameDone_) onFrameDone_();
 }
 
 bool HostWindow::open(const char* title) {

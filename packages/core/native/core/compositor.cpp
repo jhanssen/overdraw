@@ -470,6 +470,14 @@ void Compositor::drainCtrl() {
                 }
                 scanoutSlots_[flipped].state = ScanoutSlotState::SCANOUT;
             }
+            frameCompleteSeen_ = true;
+            continue;
+        }
+        if (r.tag == ipc::Tag::FrameComplete) {
+            // Nested: the host wl_surface.frame listener fired (host
+            // compositor is ready for the next frame). Routes to the addon's
+            // wake state machine.
+            frameCompleteSeen_ = true;
             continue;
         }
         if (r.tag == ipc::Tag::OutputDescriptor) {

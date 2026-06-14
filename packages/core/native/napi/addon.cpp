@@ -111,13 +111,29 @@ struct Addon {
     uv_poll_t wirePoll{};
     uv_poll_t ctrlPoll{};
     uv_poll_t inputPoll{};
-    uv_timer_t frameTimer{};
     int inputFd = -1;  // core-side input socket; owned here, closed in Stop()
     bool loopRunning = false;
 
+    // Frame-trigger state machine. The frame loop is driven by wake() calls
+    // (something changed and wants a frame) plus FrameComplete signals from
+    // the GPU process (KMS: ScanoutFlipComplete; nested: host wl_surface.frame
+    // callback forwarded as FrameComplete). No uv_timer -- a static scene
+    // with no client activity, animations, or input is fully idle.
+    //
+    //   inFrame      true while the JS onFrame callback is on the stack; a
+    //                wake() during this window sets wantNext instead of
+    //                re-entering the render path.
+    //   wantNext     a wake() arrived while inFrame or while a flip was
+    //                pending; the next opportunity to render fires this off.
+    //   flipPending  (KMS only) the atomic commit is queued and we haven't
+    //                received ScanoutFlipComplete yet. Queried from the
+    //                compositor's scanout slot state machine.
+    bool inFrame = false;
+    bool wantNext = false;
+
     // Optional JS callback for frame events. Stored as a ref; called directly
-    // from the frame timer (same thread as Node, so no threadsafe function is
-    // needed). Cross-thread events (e.g. Dawn callbacks on Dawn-internal
+    // from the frame trigger (same thread as Node, so no threadsafe function
+    // is needed). Cross-thread events (e.g. Dawn callbacks on Dawn-internal
     // threads) will need napi_threadsafe_function -- not exercised yet.
     napi_env env = nullptr;
     napi_ref onFrame = nullptr;
@@ -175,6 +191,72 @@ void notifyFrame() {
     napi_create_uint32(env, static_cast<uint32_t>(g_addon.compositor->presented()), &arg);
     napi_call_function(env, undefined, cb, 1, &arg, nullptr);
     napi_close_handle_scope(env, scope);
+}
+
+// Declared here; defined below.
+void armWirePoll();
+
+// Frame trigger. Two entry points:
+//   wake()             called from event-loop callbacks (wayland-server poll,
+//                      input poll, ctrl poll, bringUp bootstrap, JS via the
+//                      `wake` export) to say "something changed; render
+//                      soon."
+//   onFrameComplete()  called from the ctrl poll when ScanoutFlipComplete (KMS)
+//                      or FrameComplete (nested) arrives.
+//
+// Both funnel into runFrameIfReady() which checks inFrame and flipPending
+// before invoking notifyFrame(). After notifyFrame returns, if wantNext was
+// set during the render (e.g. an animation tick called wake), and we are no
+// longer flipPending, we loop to render again. The "no flip-pending" gate is
+// load-bearing on KMS -- the kernel only accepts one queued flip per CRTC,
+// so a second render now would just spin acquireOutputTexture() into nulls.
+void runFrameIfReady();
+
+void wake() {
+    if (!g_addon.compositor || !g_addon.loopRunning) return;
+    g_addon.wantNext = true;
+    runFrameIfReady();
+}
+
+void runFrameIfReady() {
+    if (!g_addon.compositor || !g_addon.loopRunning) return;
+    if (!g_addon.wantNext) return;
+    if (g_addon.inFrame) return;                       // re-entrant; post-render loop picks it up
+    if (g_addon.compositor->flipPending()) return;     // KMS: wait for ScanoutFlipComplete
+
+    do {
+        g_addon.wantNext = false;
+        g_addon.inFrame = true;
+        notifyFrame();           // → JS dispatchFrameCallbacks + JS renderFrame + JS presentOutput
+        if (g_addon.compositor) {
+            g_addon.lastNotified = g_addon.compositor->presented();
+            g_addon.compositor->renderFrame();
+        }
+        g_addon.inFrame = false;
+        armWirePoll();
+    } while (g_addon.wantNext
+             && !g_addon.compositor->flipPending());
+}
+
+void onFrameComplete() {
+    if (!g_addon.compositor || !g_addon.loopRunning) return;
+    // Drain pending wayland-server events first: a client commit may have
+    // arrived between the last server-pump and now. Without this, the
+    // upcoming render's dispatchFrameCallbacks would miss the new
+    // wl_callback installed by that commit, deferring the client's `done`
+    // to the next render -- a full vsync of extra latency, halving the
+    // client's observable frame rate (one commit per two compositor
+    // renders instead of one per one).
+    if (g_addon.server) {
+        g_addon.server->drainEvents();
+    }
+    // Steady-state KMS frame pacing: each flip-complete is a vsync edge. If
+    // the JS side wants another frame (animation in flight, client commit
+    // pending, cursor moving, etc.), it will have called wake() -- runFrame-
+    // IfReady is gated on wantNext, so an idle scene with no work pending
+    // simply falls through to nothing here. That is the "no work = no draw"
+    // behavior the timer-driven loop did not have.
+    runFrameIfReady();
 }
 
 napi_value throwError(napi_env env, const char* msg) {
@@ -409,6 +491,9 @@ void onWireReadable(uv_poll_t*, int status, int events) {
         // drainCtrl above may have consumed plugin-broker replies (alloc/begin/...);
         // advance them here too, else they are stranded (see advanceAllPending).
         advanceAllPending(g_addon.env);
+        // drainCtrl may have observed a ScanoutFlipComplete / FrameComplete;
+        // route it to the wake state machine.
+        if (g_addon.compositor->takeFrameComplete()) onFrameComplete();
         napi_close_handle_scope(g_addon.env, scope);
     }
     armWirePoll();  // update WRITABLE arming based on remaining queue
@@ -427,6 +512,7 @@ void onCtrlReadable(uv_poll_t*, int status, int events) {
         fireJsImports(g_addon.env);  // resolve JS dmabuf imports (opens its own scope)
         fireOutputDescriptors(g_addon.env);
         advanceAllPending(g_addon.env);
+        if (g_addon.compositor->takeFrameComplete()) onFrameComplete();
         armWirePoll();  // finishing an import flushes wire output (bind group etc.)
     }
     armCtrlPoll();  // re-arm UV_WRITABLE based on remaining queue
@@ -442,6 +528,10 @@ void armCtrlPoll() {
 void onInputReadable(uv_poll_t*, int status, int) {
     if (status < 0 || !g_addon.input) return;
     g_addon.input->drain();
+    // Pointer motion changes the cursor, key presses may change focus +
+    // alter what should be rendered; clients react via wl events and want
+    // their frame callbacks dispatched. Wake the frame loop.
+    wake();
 }
 
 #if OVERDRAW_KMS
@@ -515,20 +605,6 @@ void advanceInjects(napi_env env) {
         invokePluginCb(env, pi.cb, result);
         g_pendingInjects.erase(g_pendingInjects.begin() + static_cast<long>(i));
     }
-}
-
-void onFrameTimer(uv_timer_t*) {
-    if (!g_addon.compositor) return;
-    // Dispatch client frame callbacks + dmabuf buffer releases FIRST, before
-    // rendering. renderFrame() calls GetCurrentTexture on the HOST swapchain,
-    // which can block/stall on host present pacing; if releases were gated
-    // behind it, a Vulkan-WSI client would starve in vkAcquireNextImageKHR
-    // whenever overdraw's own present stalled. Releasing first decouples the
-    // client's buffer recycling from overdraw's host present cadence.
-    notifyFrame();
-    g_addon.lastNotified = g_addon.compositor->presented();
-    g_addon.compositor->renderFrame();
-    armWirePoll();  // renderFrame may have queued wire output (Submit/Present)
 }
 
 // start(gpuBinPath, onFrame?, onInput?, opts?) -> { width, height }
@@ -800,9 +876,11 @@ napi_value Start(napi_env env, napi_callback_info info) {
         uv_poll_start(&g_addon.inputPoll, UV_READABLE, onInputReadable);
     }
 
-    uv_timer_init(loop, &g_addon.frameTimer);
-    uv_timer_start(&g_addon.frameTimer, onFrameTimer, 0, 16);  // ~60Hz
     g_addon.loopRunning = true;
+    // The bootstrap wake is JS-driven (main.ts calls addon.wake() once
+    // compositor + plugin setup is complete). Firing wake() here would
+    // render against an un-wired JS side (state.dispatchFrameCallbacks
+    // not yet attached).
 
     napi_value result, w, h;
     napi_create_object(env, &result);
@@ -1241,10 +1319,8 @@ napi_value ShmView(napi_env env, napi_callback_info info) {
 
 napi_value Stop(napi_env env, napi_callback_info) {
     if (g_addon.loopRunning) {
-        uv_timer_stop(&g_addon.frameTimer);
         uv_poll_stop(&g_addon.wirePoll);
         uv_poll_stop(&g_addon.ctrlPoll);
-        uv_close(reinterpret_cast<uv_handle_t*>(&g_addon.frameTimer), nullptr);
         uv_close(reinterpret_cast<uv_handle_t*>(&g_addon.wirePoll), nullptr);
         uv_close(reinterpret_cast<uv_handle_t*>(&g_addon.ctrlPoll), nullptr);
         if (g_addon.input) {
@@ -1344,6 +1420,9 @@ napi_value StartServer(napi_env env, napi_callback_info) {
         g_addon.server.reset();
         return throwError(env, "failed to start wayland server");
     }
+    // Wake the frame loop after every Wayland-server pump tick: a client
+    // commit/attach/etc arrived and the frame callbacks + render need to run.
+    g_addon.server->setOnPump([]() { wake(); });
     napi_value name;
     napi_create_string_utf8(env, g_addon.server->socketName().c_str(), NAPI_AUTO_LENGTH, &name);
     return name;
@@ -1597,6 +1676,22 @@ napi_value SwitchVT(napi_env env, napi_callback_info info) {
     napi_get_boolean(env, ok, &out);
 #endif
     return out;
+}
+
+// wake() -> undefined
+// Schedule a frame. If the frame loop is idle (no render in flight, no flip
+// pending on KMS), the render fires synchronously on the same call; otherwise
+// it is queued and runs on the next opportunity. Idempotent and cheap when
+// the loop is already busy; coalesces multiple wake() in a row into one frame.
+//
+// JS calls this when a JS-side change requests a render that no native event
+// covers (an animation/transition tick that wants to continue, an IPC action
+// that mutated state, etc.). Native poll callbacks (wayland-server pump,
+// input poll, ctrl poll with FrameComplete) wake automatically.
+napi_value Wake(napi_env env, napi_callback_info) {
+    wake();
+    napi_value undef; napi_get_undefined(env, &undef);
+    return undef;
 }
 
 // resolveCursorShape(name, sizePx, scale)
@@ -1921,7 +2016,8 @@ napi_value DmabufFeedbackInfo(napi_env env, napi_callback_info) {
 }
 
 napi_value Init(napi_env env, napi_value exports) {
-    installCoreCrashHandler();
+    // TEMP DIAG: skip crash handler install
+    // installCoreCrashHandler();
     napi_value fnStart, fnStop, fnPresented, fnStartServer, fnStopServer;
     napi_create_function(env, "start", NAPI_AUTO_LENGTH, Start, nullptr, &fnStart);
     napi_create_function(env, "stop", NAPI_AUTO_LENGTH, Stop, nullptr, &fnStop);
@@ -1980,6 +2076,7 @@ napi_value Init(napi_env env, napi_value exports) {
     reg("keymapInfo", KeymapInfo);
     reg("keyUpdate", KeyUpdate);
     reg("switchVT", SwitchVT);
+    reg("wake", Wake);
     reg("resolveCursorShape", ResolveCursorShape);
     reg("dmabufFeedbackInfo", DmabufFeedbackInfo);
     reg("pluginCreateConnection", PluginCreateConnection);

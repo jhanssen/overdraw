@@ -227,6 +227,29 @@ class Compositor {
     ScanoutSlotState scanoutSlotState(int idx) const {
         return idx >= 0 && idx < 3 ? scanoutSlots_[idx].state : ScanoutSlotState::SCANOUT;
     }
+    // True iff at least one slot is PENDING_FLIP (an atomic commit is queued
+    // with the kernel, awaiting page-flip). The frame trigger uses this to
+    // avoid rendering a second frame while one is already in flight (the
+    // kernel only accepts one queued flip per CRTC). KMS-only; nested mode
+    // always returns false (the nested backend has no equivalent gate
+    // exposed; it relies on inFrame + the host frame callback).
+    bool flipPending() const {
+        if (!kmsMode_) return false;
+        for (int i = 0; i < 3; ++i)
+            if (scanoutSlots_[i].state == ScanoutSlotState::PENDING_FLIP) return true;
+        return false;
+    }
+
+    // Set inside drainCtrl when a frame-complete signal arrives from the GPU
+    // process (KMS: ScanoutFlipComplete; nested: FrameComplete from the host
+    // wl_surface.frame listener). The addon's poll handler reads + clears it
+    // and routes to its wake state machine. The signal is coalesced (the flag
+    // is just a bool); multiple flips between addon polls trigger one frame.
+    bool takeFrameComplete() {
+        bool v = frameCompleteSeen_;
+        frameCompleteSeen_ = false;
+        return v;
+    }
 
     // Release a JS dmabuf import: tells the GPU process to drop the imported STM +
     // dmabuf fd for this importId (generation-matched, so a recycled handle id is
@@ -505,6 +528,7 @@ class Compositor {
     };
     bool kmsMode_ = false;
     bool kmsPaused_ = false;  // VT-switch disable_seat; cleared on enable_seat
+    bool frameCompleteSeen_ = false;  // set in drainCtrl on ScanoutFlipComplete / FrameComplete
     ScanoutSlot scanoutSlots_[3] = {};
     int currentSlot_ = -1;            // slot acquired by the current frame; -1 if none
     int pendingScanoutFenceFd_ = -1;  // attached to next presentOutput, then closed

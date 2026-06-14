@@ -40,6 +40,10 @@ class HostWindowOutputBackend : public OutputBackend {
     void setResizeListener(ResizeListener cb) override {
         window_.setResizeListener(std::move(cb));
     }
+    void setFrameDoneListener(FrameDoneListener cb) override {
+        window_.setFrameDoneListener(std::move(cb));
+    }
+    void armFrameCallback() override { window_.armFrameCallback(); }
 
   private:
     HostWindow window_;
