@@ -118,9 +118,11 @@ target_link_libraries(overdraw_core PUBLIC
     overdraw_wire dawn::webgpu_dawn_wire ${WAYLAND_SERVER_LIBRARIES} pthread dl rt)
 if(OVERDRAW_KMS)
     target_include_directories(overdraw_core PUBLIC
-        ${LIBINPUT_INCLUDE_DIRS} ${LIBSEAT_INCLUDE_DIRS} ${LIBUDEV_INCLUDE_DIRS})
+        ${LIBINPUT_INCLUDE_DIRS} ${LIBSEAT_INCLUDE_DIRS} ${LIBUDEV_INCLUDE_DIRS}
+        ${LIBDRM_INCLUDE_DIRS})
     target_link_libraries(overdraw_core PUBLIC
-        ${LIBINPUT_LIBRARIES} ${LIBSEAT_LIBRARIES} ${LIBUDEV_LIBRARIES})
+        ${LIBINPUT_LIBRARIES} ${LIBSEAT_LIBRARIES} ${LIBUDEV_LIBRARIES}
+        ${LIBDRM_LIBRARIES})
     target_compile_definitions(overdraw_core PUBLIC OVERDRAW_KMS=1)
 endif()
 set_target_properties(overdraw_core PROPERTIES POSITION_INDEPENDENT_CODE ON)

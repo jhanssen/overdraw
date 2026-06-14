@@ -83,6 +83,14 @@ class Seat {
     // must be passed to closeDevice() when done.
     bool openDevice(const char* path, int& outFd, int& outDeviceId);
 
+    // Probe /dev/dri/card* in order and open the first one that has a
+    // connected connector (i.e. the card currently driving a display).
+    // Cards opened during probing that are not selected are released again.
+    // On success fills outPath (the chosen node), outFd, outDeviceId (same
+    // ownership contract as openDevice). Returns false with error() set when
+    // no card has a connected connector or the seat is not active.
+    bool openFirstConnectedCard(std::string& outPath, int& outFd, int& outDeviceId);
+
     // Release libseat's accounting for a previously opened device. The caller
     // is responsible for closing the fd separately (this does not).
     bool closeDevice(int deviceId);

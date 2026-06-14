@@ -6,8 +6,13 @@ extern "C" {
 #include <libseat.h>
 }
 
+#include <xf86drm.h>
+#include <xf86drmMode.h>
+
 #include <cerrno>
+#include <cstdio>
 #include <cstring>
+#include <unistd.h>
 
 namespace overdraw::core {
 
@@ -105,6 +110,45 @@ bool Seat::openDevice(const char* path, int& outFd, int& outDeviceId) {
     outFd       = fd;
     outDeviceId = id;
     return true;
+}
+
+// Does the card behind `fd` have at least one connected connector?
+static bool cardHasConnectedConnector(int fd) {
+    drmModeRes* res = drmModeGetResources(fd);
+    if (!res) return false;
+    bool connected = false;
+    for (int i = 0; i < res->count_connectors && !connected; i++) {
+        drmModeConnector* conn = drmModeGetConnector(fd, res->connectors[i]);
+        if (conn) {
+            connected = (conn->connection == DRM_MODE_CONNECTED);
+            drmModeFreeConnector(conn);
+        }
+    }
+    drmModeFreeResources(res);
+    return connected;
+}
+
+bool Seat::openFirstConnectedCard(std::string& outPath, int& outFd, int& outDeviceId) {
+    if (!seat_)   { error_ = "seat not open";   return false; }
+    if (!active_) { error_ = "seat not active"; return false; }
+
+    constexpr int kMaxCards = 16;
+    for (int i = 0; i < kMaxCards; i++) {
+        char path[32];
+        std::snprintf(path, sizeof(path), "/dev/dri/card%d", i);
+        int fd = -1, id = -1;
+        if (!openDevice(path, fd, id)) continue;  // absent / not on this seat
+        if (cardHasConnectedConnector(fd)) {
+            outPath     = path;
+            outFd       = fd;
+            outDeviceId = id;
+            return true;
+        }
+        closeDevice(id);
+        ::close(fd);
+    }
+    error_ = "no DRM card with a connected connector found";
+    return false;
 }
 
 bool Seat::closeDevice(int deviceId) {

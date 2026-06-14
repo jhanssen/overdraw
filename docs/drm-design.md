@@ -211,9 +211,13 @@ The choice is threaded into both processes:
 For the KMS backend, the core also passes:
 
 - `--seat=<name>` (default `seat0`)
-- `--card=<path>` (default: the first card libseat hands back; an
-  override is useful on hybrid GPUs like the test box where you might
-  want card1 specifically).
+- `--card=<path>` (override). Default: auto-detect — the core probes
+  `/dev/dri/card*` and opens the first with a connected connector (the
+  card driving a display). Config `output.card` is an override between
+  the CLI flag and auto-detect. On a hybrid box this auto-selects the
+  GPU whose connector is live (e.g. the Intel card driving the internal
+  panel) rather than a fixed node. The GPU process then pins its Dawn
+  adapter and GBM render node to that same card (see "GPU selection").
 
 ## Seat / VT lifecycle
 
@@ -836,17 +840,21 @@ These were the pre-slice-4 design questions. All resolved through slices
    Originally proposed as a slice-5 follow-on; merged forward to
    slice 4+5 because slice 4+5 now runs at vsync rate where in-flight
    GPU work is the steady state.
-5. **Verify Dawn picks the iGPU adapter.** Hybrid laptops have multiple
-   Vulkan-capable adapters; the GPU process today calls
-   `EnumerateAdapters` and uses the first one. On the test box that
-   happens to resolve to Intel (verified by inspecting `main_device` in
-   the dmabuf feedback message — `0xe280` = major 226 minor 128 =
-   `/dev/dri/renderD128` = Intel). We need this to remain true after KMS
-   slice 4: the compositor's GBM device is opened on `/dev/dri/card1`
-   (Intel, the scanout target), and the Dawn adapter must allocate
-   textures on the same physical GPU or the dual-import will fail. A
-   sanity check (assert `gbm_device_get_fd`'s major/minor matches the
-   adapter's device id) catches drift.
+5. **GPU selection: Dawn adapter + render node follow the scanout card**
+   — RESOLVED. Hybrid laptops have multiple Vulkan adapters; relying on
+   `EnumerateAdapters()[0]` (and a hardcoded `renderD128` allocator)
+   only worked because both happened to resolve to the same GPU. Now the
+   GPU process matches explicitly: it `fstat`s the scanout card fd for
+   the DRM primary major:minor and selects the adapter whose
+   `WGPUAdapterPropertiesDrm.primary{Major,Minor}` equals it; the GBM
+   allocator's render node is derived from that adapter's
+   `render{Major,Minor}` (`/dev/dri/renderD<minor>`). Allocation and the
+   wgpu device therefore always sit on the GPU that owns the connected
+   card. No matching adapter is a hard error (cross-GPU scanout
+   unsupported). `WGPUAdapterPropertiesDrm` was confirmed populated for
+   both Intel Mesa and the NVIDIA proprietary driver on the test box; a
+   driver that does not populate it fails the match rather than silently
+   diverging.
 
 ## Verification target ✅
 

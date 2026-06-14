@@ -25,6 +25,10 @@ export interface OutputConfig {
   // handling is not built (see docs/status.md).
   width?: number;
   height?: number;
+  // DRM card override for the KMS backend, e.g. "/dev/dri/card1". When
+  // omitted, the first card with a connected connector is used. Ignored by
+  // the nested backend.
+  card?: string;
 }
 
 // Restart behavior when a plugin fails (crash, OOM, watchdog termination, or
@@ -129,6 +133,9 @@ export interface ResolvedPlugin {
 // Fully-resolved config: every field present, defaults applied.
 export interface ResolvedConfig {
   output: { width: number; height: number } | null; // null = follow host window
+  // DRM card override for the KMS backend (e.g. "/dev/dri/card1"), or null to
+  // auto-detect the first card with a connected connector.
+  card: string | null;
   // Verbatim user value (or undefined). Threaded to the bundled focus
   // plugin via bundled.ts's configFrom; the plugin validates.
   focus: unknown;

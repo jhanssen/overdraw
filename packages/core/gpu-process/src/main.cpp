@@ -22,7 +22,11 @@
 #include <signal.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
+#include <sys/stat.h>
+#include <sys/sysmacros.h>
 #include <unistd.h>
+
+#include <string>
 
 #include <linux/dma-buf.h>
 
@@ -320,7 +324,61 @@ int run(int wireFd, int ctrlFd, int inputFd, bool headless,
     auto adapters = instance.EnumerateAdapters(
         reinterpret_cast<const WGPURequestAdapterOptions*>(&ao));
     if (adapters.empty()) { std::fprintf(stderr, "[gpu] no adapter\n"); return 1; }
-    wgpu::Adapter adapter(adapters[0].Get());
+
+    // Read an adapter's DRM node numbers (WGPUAdapterPropertiesDrm chained on
+    // GetInfo). has* is false when the backend exposes no DRM node (e.g. a CPU
+    // adapter). Uses the C API on the borrowed handle to avoid touching refs.
+    auto adapterDrm = [](WGPUAdapter h) {
+        WGPUAdapterPropertiesDrm drm{};
+        drm.chain.sType = WGPUSType_AdapterPropertiesDrm;
+        WGPUAdapterInfo info{};
+        info.nextInChain = &drm.chain;
+        wgpuAdapterGetInfo(h, &info);
+        wgpuAdapterInfoFreeMembers(info);
+        return drm;
+    };
+
+    // Pick the adapter to drive the device. In KMS mode it must be the GPU
+    // that owns the scanout card, otherwise GBM buffers allocated on that card
+    // can't be imported into the device (cross-GPU). Match by the card's DRM
+    // primary node. In nested/headless mode there is no card; take the first.
+    size_t chosenIdx = 0;
+    if (kms) {
+        struct stat cst{};
+        if (::fstat(kms->drmFd(), &cst) != 0) {
+            std::perror("[gpu] fstat drm card fd");
+            return 1;
+        }
+        const uint64_t wantMajor = major(cst.st_rdev);
+        const uint64_t wantMinor = minor(cst.st_rdev);
+        int found = -1;
+        for (size_t i = 0; i < adapters.size(); i++) {
+            WGPUAdapterPropertiesDrm drm = adapterDrm(adapters[i].Get());
+            if (drm.hasPrimary && drm.primaryMajor == wantMajor
+                && drm.primaryMinor == wantMinor) { found = (int)i; break; }
+        }
+        if (found < 0) {
+            std::fprintf(stderr,
+                "[gpu] no Vulkan adapter matches scanout card %llu:%llu "
+                "(cross-GPU scanout is unsupported)\n",
+                (unsigned long long)wantMajor, (unsigned long long)wantMinor);
+            return 1;
+        }
+        chosenIdx = static_cast<size_t>(found);
+    }
+
+    // Open the GBM allocator on the chosen adapter's render node so allocation
+    // and the device share a GPU. Falls back to renderD128 when the adapter
+    // advertises no render node.
+    std::string renderNode = "/dev/dri/renderD128";
+    {
+        WGPUAdapterPropertiesDrm drm = adapterDrm(adapters[chosenIdx].Get());
+        if (drm.hasRender)
+            renderNode = "/dev/dri/renderD" + std::to_string(drm.renderMinor);
+    }
+    std::printf("[gpu] selected adapter[%zu], render node %s\n",
+                chosenIdx, renderNode.c_str());
+    wgpu::Adapter adapter(adapters[chosenIdx].Get());
 
     // Nested: create the wgpu::Surface for this output from the backend.
     // Headless or KMS: no wgpu::Surface (KMS scans out via SharedTextureMemory
@@ -339,7 +397,7 @@ int run(int wireFd, int ctrlFd, int inputFd, bool headless,
                 adapter.HasFeature(wgpu::FeatureName::DawnDrmFormatCapabilities) ? 1 : 0,
                 adapter.HasFeature(wgpu::FeatureName::SharedTextureMemoryDmaBuf) ? 1 : 0);
     gpu::Allocator alloc;
-    if (!alloc.open()) { std::fprintf(stderr, "[gpu] allocator open failed\n"); return 1; }
+    if (!alloc.open(renderNode.c_str())) { std::fprintf(stderr, "[gpu] allocator open failed\n"); return 1; }
     if (!alloc.probe(adapter)) {
         std::fprintf(stderr, "[gpu] modifier probe found nothing importable\n");
         return 1;

@@ -72,6 +72,8 @@ class KmsOutputBackend : public OutputBackend {
     }
 
     int eventFd() const override { return drmFd_; }
+    // The scanout card fd. Used to match the Dawn adapter to this GPU.
+    int drmFd() const { return drmFd_; }
     void pump() override;
     bool shouldClose() const override { return shouldClose_; }
     void setResizeListener(ResizeListener cb) override { resizeListener_ = std::move(cb); }

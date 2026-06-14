@@ -435,8 +435,12 @@ explicitly via `setupCompositor({ headless: false, backend: "kms" })`.
 
 ### Bring-up flow
 
-1. Core opens `/dev/dri/card0` (or `--card=<path>`) via libseat
-   (`Seat::openDevice`), holds the fd as long as the compositor runs.
+1. Core selects the DRM card via libseat and holds the fd as long as the
+   compositor runs. Selection precedence: `--card=<path>` CLI > config
+   `output.card` > auto-detect. Auto-detect (`Seat::openFirstConnectedCard`)
+   probes `/dev/dri/card*` in order and opens the first with a connected
+   connector — the card driving a display. An explicit override uses
+   `Seat::openDevice` on that exact node.
 2. Core sends `ipc::Tag::SetDrmFd` to the GPU process via SCM_RIGHTS
    BEFORE the regular Hello handshake.
 3. GPU process constructs `KmsOutputBackend(drmFd)`, calls `open()`:
@@ -445,6 +449,15 @@ explicitly via `setupCompositor({ headless: false, backend: "kms" })`.
    preferred mode (or mode 0), finds a compatible CRTC, finds a primary
    plane, resolves all the atomic-commit property ids, creates a GBM
    device on the DRM fd.
+3a. GPU process selects the Dawn adapter that owns the scanout card —
+   it `fstat`s the card fd for the DRM primary major:minor and matches it
+   against each Vulkan adapter's `WGPUAdapterPropertiesDrm` (the first
+   adapter is no longer assumed). The GBM allocator's render node is
+   derived from the chosen adapter's render major:minor, so buffer
+   allocation and the wgpu device always land on the same GPU. No adapter
+   matching the scanout card is a hard error (cross-GPU scanout is
+   unsupported). In nested/headless mode there is no card; the first
+   adapter is taken and the render node still follows it.
 4. GPU process sends `OutputDescriptor` to the core with the connector's
    mode dimensions + EDID-derived physical mm + product name.
 5. Core (now knowing the dims) ReserveTexture's 3 wire handles for the
@@ -546,9 +559,26 @@ connector→CRTC link, CRTC mode blob, and CRTC active.
 - **No KMS coverage in the test suite** (per user direction, option A
   in the slice planning). KMS path verified only by manual run; tests
   use nested or headless. A future virtual-DRM (vkms) test harness
-  would close this.
-- **NVIDIA / non-Intel scanout** unverified. Code is driver-agnostic
-  (libdrm atomic + libgbm) but only tested on Intel i915.
+  would close this. The card auto-detect (`Seat::openFirstConnectedCard`)
+  and the adapter↔card matching (`WGPUAdapterPropertiesDrm`) are part of
+  the KMS bring-up and share this gap: both were verified by direct
+  execution against the live seat / live Dawn enumeration on the test
+  box (the compiled `openFirstConnectedCard` picked the connected card;
+  the matcher selected the adapter whose primary node equals the card),
+  not by an automated test. The config `output.card` override IS covered
+  GPU-free in `test/config.test.js`.
+- **NVIDIA / non-Intel scanout** unverified end-to-end. Code is
+  driver-agnostic (libdrm atomic + libgbm) and the adapter/render-node
+  matching reads real `WGPUAdapterPropertiesDrm` values from the NVIDIA
+  proprietary driver as well as Intel (confirmed by probe), but a full
+  scanout has only been driven on Intel i915. On a hybrid box the matcher
+  pins the device + render node to whichever GPU owns the connected card.
+- **`WGPUAdapterPropertiesDrm`-dependent matching.** Adapter↔card
+  matching needs the Vulkan adapter to advertise its DRM nodes. Verified
+  populated for Intel Mesa and NVIDIA proprietary on the test box. A
+  driver that does not populate it would fail the KMS match (hard error,
+  not a silent cross-GPU fallback); the render-node derivation then falls
+  back to `renderD128`, which is only correct when that is the right GPU.
 - **No mode changes** (the `SetOutputMode` core→gpu message family is
   not wired). The connector's preferred mode is used at bring-up and
   not changed thereafter.

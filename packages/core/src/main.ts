@@ -149,11 +149,13 @@ console.log(`[overdraw] config: ${config.sourcePath ?? "(defaults; no config fil
 // Backend selection. Production default: KMS (bare-metal). Override:
 //   --backend=nested (e.g. running under Hyprland during dev)
 //   OVERDRAW_BACKEND=nested
-// `--card=/dev/dri/cardN` selects which DRM device libseat opens for KMS;
-// default /dev/dri/card0.
-function parseBackendOpts(argv: string[]): { backend: "kms" | "nested"; card?: string } {
+// KMS card override precedence: `--card=/dev/dri/cardN` > config `output.card`
+// > auto-detect (the GPU process opens the first card with a connected
+// connector).
+function parseBackendOpts(argv: string[], configCard: string | null):
+    { backend: "kms" | "nested"; card?: string } {
   let backend: "kms" | "nested" = "kms";
-  let card: string | undefined;
+  let card: string | undefined = configCard ?? undefined;
   const envBackend = process.env.OVERDRAW_BACKEND;
   if (envBackend === "nested" || envBackend === "kms") backend = envBackend;
   for (const a of argv) {
@@ -163,7 +165,7 @@ function parseBackendOpts(argv: string[]): { backend: "kms" | "nested"; card?: s
   }
   return card ? { backend, card } : { backend };
 }
-const backendOpts = parseBackendOpts(process.argv.slice(2));
+const backendOpts = parseBackendOpts(process.argv.slice(2), config.card);
 console.log(`[overdraw] backend: ${backendOpts.backend}`
   + (backendOpts.card ? ` card=${backendOpts.card}` : ""));
 

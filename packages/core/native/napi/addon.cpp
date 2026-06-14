@@ -614,8 +614,9 @@ void advanceInjects(napi_env env) {
 //                                         -> select output backend.
 //                                         -> default if absent: KMS.
 //                                         -> headless takes precedence if width+height set.
-// `card` defaults to "/dev/dri/card0" for KMS (libseat picks the first
-// connected if absent). Used only when backend == "kms".
+// `card` is an optional override used only when backend == "kms". When absent,
+// the seat probes /dev/dri/card* and opens the first with a connected
+// connector (the card driving a display).
 napi_value Start(napi_env env, napi_callback_info info) {
     size_t argc = 4;
     napi_value argv[4];
@@ -644,7 +645,7 @@ napi_value Start(napi_env env, napi_callback_info info) {
     // otherwise the backend choice picks KMS or nested.
     uint32_t hw = 0, hh = 0;
     std::string backend = "kms";  // production default
-    std::string drmCardPath = "/dev/dri/card0";
+    std::string drmCardPath;      // empty -> probe for first connected card
     if (argc >= 4) {
         napi_valuetype t;
         napi_typeof(env, argv[3], &t);
@@ -706,13 +707,23 @@ napi_value Start(napi_env env, napi_callback_info info) {
         }
         int drmFd = -1;
         int drmDeviceId = -1;
-        if (!g_addon.seat->openDevice(drmCardPath.c_str(), drmFd, drmDeviceId)) {
-            const std::string err = "libseat openDevice(" + drmCardPath + ") failed: "
-                                  + g_addon.seat->error();
+        bool opened;
+        std::string chosenCard = drmCardPath;
+        if (drmCardPath.empty()) {
+            opened = g_addon.seat->openFirstConnectedCard(chosenCard, drmFd, drmDeviceId);
+        } else {
+            opened = g_addon.seat->openDevice(drmCardPath.c_str(), drmFd, drmDeviceId);
+        }
+        if (!opened) {
+            const std::string what = drmCardPath.empty()
+                ? std::string("DRM card auto-detect")
+                : ("libseat openDevice(" + drmCardPath + ")");
+            const std::string err = what + " failed: " + g_addon.seat->error();
             g_addon.seat.reset();
             if (g_addon.inputFd >= 0) { ::close(g_addon.inputFd); g_addon.inputFd = -1; }
             return throwError(env, err.c_str());
         }
+        std::fprintf(stderr, "[overdraw] KMS card: %s\n", chosenCard.c_str());
         // Track for later closeDevice on Stop().
         g_addon.drmCardFd = drmFd;
         g_addon.drmCardDeviceId = drmDeviceId;

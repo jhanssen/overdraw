@@ -1,6 +1,8 @@
 #include "allocator.h"
 
+#include <cerrno>
 #include <cstdio>
+#include <cstring>
 #include <fcntl.h>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -50,10 +52,10 @@ Allocator::~Allocator() {
     if (drmFd_ >= 0) ::close(drmFd_);
 }
 
-bool Allocator::open() {
-    drmFd_ = ::open("/dev/dri/renderD128", O_RDWR | O_CLOEXEC);
+bool Allocator::open(const char* renderNode) {
+    drmFd_ = ::open(renderNode, O_RDWR | O_CLOEXEC);
     if (drmFd_ < 0) {
-        std::perror("[gpu] open renderD128");
+        std::fprintf(stderr, "[gpu] open %s: %s\n", renderNode, std::strerror(errno));
         return false;
     }
     gbm_ = gbm_create_device(drmFd_);

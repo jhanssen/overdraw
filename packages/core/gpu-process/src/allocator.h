@@ -50,8 +50,10 @@ class Allocator {
     Allocator(const Allocator&) = delete;
     Allocator& operator=(const Allocator&) = delete;
 
-    // Opens a DRM render node and creates the GBM device.
-    bool open();
+    // Opens a DRM render node and creates the GBM device. The caller passes
+    // the node matching the device GPU so allocation and import stay on one
+    // GPU; the default is a fallback for diagnostics only.
+    bool open(const char* renderNode = "/dev/dri/renderD128");
 
     // Probes Dawn for the full importable (format, modifier) set on `adapter`,
     // building the dmabuf-feedback format table. Mirrors a GL compositor's

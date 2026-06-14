@@ -59,6 +59,32 @@ test('function default export is invoked (async)', async () => {
   rmSync(dir, { recursive: true, force: true });
 });
 
+test('output.card: override, default, and validation', async () => {
+  const dir = tmp();
+  let n = 0;
+  const write = (body) => {
+    const p = join(dir, `card-${n++}.mjs`);
+    writeFileSync(p, body);
+    return p;
+  };
+  // override honored
+  let c = await loadConfig(write('export default { output: { card: "/dev/dri/card1" } }'));
+  assert.equal(c.card, '/dev/dri/card1');
+  // absent -> null (auto-detect)
+  c = await loadConfig(write('export default { output: { width: 800, height: 600 } }'));
+  assert.equal(c.card, null);
+  // no output block at all -> null
+  c = await loadConfig(write('export default {}'));
+  assert.equal(c.card, null);
+  // invalid: empty string
+  await assert.rejects(() => loadConfig(write('export default { output: { card: "" } }')),
+    /output\.card/);
+  // invalid: non-string
+  await assert.rejects(() => loadConfig(write('export default { output: { card: 1 } }')),
+    /output\.card/);
+  rmSync(dir, { recursive: true, force: true });
+});
+
 test('focus is verbatim pass-through (core does NOT validate)', async () => {
   // Core accepts any value; the focus plugin owns the schema and throws
   // from init on bad config (surfacing as a fatal startup error).
