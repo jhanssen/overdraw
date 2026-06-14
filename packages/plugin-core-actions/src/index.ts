@@ -99,6 +99,19 @@ export default async function init(sdk: SdkLike): Promise<void> {
     },
   });
 
+  // Ask the keyboard-focused toplevel to close (xdg_toplevel.close -- the
+  // client decides what to do). The launcher resolves focus + sends the
+  // event; plugin context has neither the seat nor the event senders.
+  sdk.actions.register({
+    name: "window.close",
+    description: "Request the keyboard-focused toplevel to close " +
+      "(sends xdg_toplevel.close; the client decides). No params.",
+    handler: async (): Promise<null> => {
+      sdk.events.emit("window.close-requested", {});
+      return null;
+    },
+  });
+
   sdk.log("core-actions registered");
 }
 

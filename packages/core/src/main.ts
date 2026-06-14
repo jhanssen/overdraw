@@ -647,6 +647,16 @@ pluginBus.subscribe("window.grab-requested", async (_n, payload) => {
 pluginBus.subscribe("window.grab-end-requested", () => {
   state?.seat?.endGrab();
 });
+
+// The `window.close` action (plugin-core-actions) emits this; close the
+// keyboard-focused toplevel by sending xdg_toplevel.close (the client decides
+// how to react). No-op if nothing is focused or the focus isn't a toplevel.
+pluginBus.subscribe("window.close-requested", () => {
+  const focused = state?.seat?.kbFocus?.surfaceRec?.resource;
+  if (!focused || !state?.surfaces || !state.events) return;
+  const top = state.surfaces.get(focused)?.xdgSurface?.toplevel;
+  if (top && !top.destroyed) state.events.xdg_toplevel.send_close(top);
+});
 const { buildResolver } = await import("./plugins/deferred-refs.js");
 const deferredRefResolver = buildResolver({
   surfaceUnderPointer: () => state?.seat?.focus?.surfaceId ?? null,

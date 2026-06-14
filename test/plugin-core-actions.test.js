@@ -54,3 +54,12 @@ test('spawn filters non-string args', async () => {
   await handlers.get('spawn')({ command: 'foo', args: ['a', 3, 'b', null] });
   assert.deepEqual(emitted.at(-1)[1], { command: 'foo', args: ['a', 'b'] });
 });
+
+test('window.close emits window.close-requested', async () => {
+  const { sdk, handlers, emitted } = makeSdk();
+  await init(sdk);
+  const close = handlers.get('window.close');
+  assert.ok(close, 'window.close action registered');
+  await close();
+  assert.deepEqual(emitted.at(-1), ['window.close-requested', {}]);
+});
