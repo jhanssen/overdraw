@@ -23,6 +23,26 @@ with no error. Worst-first.
 - **`wl_region` is a no-op stub.** `add`/`subtract` do nothing; opaque/input
   regions are not tracked (hit-testing uses whole-window rects). Low urgency.
 
+- **`wl_surface.damage` / `damage_buffer` are no-op stubs; every commit
+  re-uploads the whole shm surface.** `wl_surface.ts` (`damage` and
+  `damage_buffer`) accept the rect args and drop them. `commitSurfaceBuffer`
+  in `compositor.ts` always calls `queue.writeTexture` over the full
+  surface stride×height. A 4K shm client that changes a 200×50 status bar
+  still uploads 32MB through Dawn every commit. The protocol requires
+  honoring the damage region (the spec-correct behavior is "only the
+  damaged sub-rects need to have new pixels"); we just upload all of it.
+  Real-world impact is small for small clients (the burst tests are
+  full-surface anyway) but real for shm clients with sparse updates --
+  terminal scrolling, GTK partial repaints. Hyprland honors damage:
+  `damage.copy().intersect(...).forEachRect(...)` drives one
+  `glTexSubImage2D` per rect, against the same single GL texture per
+  surface (`hyprland/src/render/gl/GLTexture.cpp:146`). Fixing this is
+  bounded: have `damage_buffer` accumulate rects on `s.pending.damage`,
+  promote on commit, and split the `queue.writeTexture` upload into one
+  call per damage rect with a `bytesPerRow + offset` describing each
+  rect's slice of the shm mapping. The damage subsystem is also a
+  prereq for hardware cursor planes and direct-scanout heuristics.
+
 - **Large shm clients (e.g. fullscreen software-decoded video) may serialize
   against vsync.** Each `wl_surface.commit` with new shm content triggers a
   `queue.writeTexture` upload (CPU memcpy into a Dawn staging buffer, then
@@ -37,12 +57,19 @@ with no error. Worst-first.
   rate the same way the LINEAR-scanout-target bug did before slice 9. Real
   dmabuf-producing video clients (mpv with `--hwdec=auto`, VLC with vaapi,
   any zero-copy GBM path) are unaffected — they hand us a sampled
-  `SharedTextureMemory` import, no `writeTexture` runs. The mitigation when
-  shm video becomes a real concern is per-surface ring buffers of textures
-  (rotate write target each commit so the new write doesn't barrier against
-  the previous sample); not done yet because it costs 3× VRAM per shm
-  surface (~64MB extra for one 4K surface) with no measurable benefit on
-  the workloads we run today. Not exercised end-to-end with a video client.
+  `SharedTextureMemory` import, no `writeTexture` runs. Notable:
+  Hyprland uploads through `glTexSubImage2D` against a single GL texture
+  per surface, exactly the same write-after-read pattern we use, and
+  does NOT see this stall — because Mesa's GL implementation
+  automatically renames/ghosts the texture's backing storage when the
+  GPU still references the old contents. Vulkan/Dawn makes that the
+  application's job. The mitigations are: (a) honor damage regions
+  (above), so the upload is sub-rect sized and the barrier wait is
+  short; (b) per-surface ring of textures, rotating the write target
+  each commit so the new write doesn't barrier against the previous
+  sample. (b) is the explicit form of what Mesa does for Hyprland
+  implicitly. Neither is implemented; we have no shm-video client
+  measurement today.
 
 - **No `wl_resource_post_error` mechanism.** Requests that the spec defines
   as protocol errors (e.g. `zwlr_layer_surface_v1.invalid_size` when set_size
