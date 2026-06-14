@@ -731,15 +731,25 @@ visible and interactive. `sudo chvt 2 && sleep 2 && sudo chvt 1` from
 SSH produces the same round trip. Overdraw stays alive across the
 switch, DRM master is released + reacquired cleanly, no leftover fds.
 
-### Slice 8 — Documentation cleanup
+### Slice 8 — Documentation cleanup ✅ landed
 
-`status.md` "Read first" entries that are now done (`wl_output`
-fabricated; frame clock is a timer for the KMS path) are removed or
-moved. `architecture.md` "Phase 2" references are updated to reflect
-what shipped vs what's still deferred (multi-output, hardware
-cursor, scanout from non-Intel GPUs, hotplug).
+Reconciles `status.md` and `architecture.md` against what slices 1-7
+shipped. The `wl_output`-is-fabricated claim in `status.md` (and a
+handful of cross-references) was stale -- slice 3 made it real -- so
+those references are corrected, framed as "real but single-output."
+The frame-clock entry in `status.md` "Read first" stays because the JS
+render trigger remains a `uv_timer` in both backends (only the KMS
+scanout-slot state machine is page-flip-driven); the language is
+sharpened to reflect that. `architecture.md` "Phase 2 — bare metal"
+gains a "Shipped (slices 1-7)" + "Deferred" block at the top, pointing
+back here and to `status.md`. The session-supervisor mention in
+`architecture.md` Phase 2 is explicitly called out as deferred (it was
+never built; the core fork/execs the GPU process directly).
 
-## Open points (resolve before slice 4)
+## Open points (all resolved; kept for the rationale)
+
+These were the pre-slice-4 design questions. All resolved through slices
+4-7; left here so the reasoning is preserved.
 
 1. **Buffer release ordering with KMS** — RESOLVED: no change needed.
    The original analysis claimed `onSubmittedWorkDone` was wrong for
@@ -790,17 +800,19 @@ cursor, scanout from non-Intel GPUs, hotplug).
    sanity check (assert `gbm_device_get_fd`'s major/minor matches the
    adapter's device id) catches drift.
 
-## Verification target
+## Verification target ✅
 
-Slice 6 done = the project meets the architecture-doc claim "phase 2
-bare metal (DRM/KMS)" for a single-output, single-GPU, software-cursor
-configuration. From a user's perspective:
+The architecture-doc claim "phase 2 bare metal (DRM/KMS)" is met for a
+single-output, single-GPU, software-cursor configuration. From a user's
+perspective:
 
 - SSH to a Linux box with no graphical session running.
 - `overdraw --backend=kms` on the local TTY.
-- The panel lights up; foot / kitty / WSI clients run; keyboard and
-  pointer work; you can `chvt` away and back.
+- The panel lights up; kitty (and other Wayland clients) runs;
+  keyboard and pointer work; `Ctrl+Alt+Fn` (or `sudo chvt N`) switches
+  away cleanly and switches back without state loss.
 
-That's the bar for declaring this design closed. Everything beyond
-(multi-output, hardware cursor, NVIDIA, hotplug) is incremental on
-the same skeleton.
+Verified on the 2560×1600 @165Hz Intel iGPU laptop (`lenovo-ubuntu`,
+`/dev/dri/card1`). Everything beyond (multi-output, hardware cursor,
+NVIDIA-driven scanout, hotplug, mode changes, DRM lease) is
+incremental on the same skeleton.

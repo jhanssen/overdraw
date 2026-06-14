@@ -1252,6 +1252,10 @@ No discovery, no drop-in directories. Single source of truth.
 
 ### Phase 2 — bare metal
 
+The implementation work for phase 2 is in `drm-design.md` (8 slices, all
+landed). What this section describes is the target shape; what actually
+shipped is below it, with the still-deferred bullets called out.
+
 - Session supervisor process owns the listening Wayland socket fd and
   libseat session. Spawns and restarts core and GPU process; crash-loop
   guards both.
@@ -1265,6 +1269,49 @@ No discovery, no drop-in directories. Single source of truth.
   export `SharedFence` sync-fd, pass as `IN_FENCE_FD` to atomic commit,
   import `OUT_FENCE` back.
 - Core's main thread `SCHED_RR`.
+
+**Shipped (drm-design.md slices 1–7):**
+- libseat + libinput (slice 1). Single seat opened per session, shared
+  between the DRM card and evdev devices. Input backend paired with
+  output backend: `--backend=kms` ⇒ libinput; `--backend=nested` ⇒ host-
+  forwarded `WaylandInputBackend`.
+- Output-backend seam in the GPU process (slice 2). `HostWindowOutputBackend`
+  and `KmsOutputBackend` behind the same interface.
+- Real `wl_output` (slice 3). EDID-derived geometry + active mode in KMS;
+  host `wl_output` values in nested mode. `OutputDescriptor` ctrl message
+  + on-change re-emission to bound `wl_output` and `xdg_output` resources.
+- KMS scanout, page-flip-paced, with explicit sync (slice 4+5). `--backend=kms`
+  drives `/dev/dri/card*` directly, allocates a 3-slot GBM scanout ring at
+  LINEAR modifier, dual-imports each slot via `SharedTextureMemory`, runs
+  the compositor render loop on atomic commits with `IN_FENCE_FD`.
+- Interactive clients on KMS (slice 6). Real clients (kitty verified)
+  render + accept keyboard + mouse input on the bare panel.
+- VT switch (slice 7). `enable_seat` / `disable_seat` drive a full pause/
+  resume lifecycle. `Ctrl+Alt+Fn` intercepted via xkbcommon's
+  `XKB_KEY_XF86Switch_VT_N` keysyms; `sudo chvt N` from SSH works
+  identically.
+
+**Deferred:**
+- **Session supervisor process.** Not built. Today the core fork/execs
+  the GPU process directly and reaps it; if either crashes the user
+  restarts. The supervisor is a future change, not currently planned.
+- **Multi-output.** Single connector only. Multi-output requires
+  `wl_output` registry pluralization, per-output frame clocks, per-output
+  layout state.
+- **Hardware cursor plane.** Software cursor only.
+- **Hotplug.** Connector enumeration is read at startup; live hotplug
+  not handled.
+- **Mode changes.** `SetOutputMode` ctrl message family designed in
+  `drm-design.md` but not wired. Connector's preferred mode is used at
+  bring-up and not changed thereafter.
+- **Non-Intel scanout.** Code is driver-agnostic (libdrm atomic + libgbm)
+  but only verified on Intel i915. NVIDIA-driven scanout (some desktops /
+  eGPU rigs) is not in the test matrix.
+- **DRM lease, content protection, gamma/CTM, tearing/VRR, explicit-sync
+  KMS API.** Not needed for v1.
+
+See `status.md` "KMS scanout backend" and `drm-design.md` "Out (deferred)"
+for the up-to-date list.
 
 #### Phase-2 present: a self-managed scanout swapchain (no Dawn surface)
 

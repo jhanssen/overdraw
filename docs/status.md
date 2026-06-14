@@ -232,9 +232,13 @@ instance; a wrapped device is borrowed, not destroyed). Built with
   overlap, and survivors reflow on unmap.
 
 Still absent: per-surface transforms/opacity/rotation/scale, fractional scale,
-multi-output, damage, host-window/output resize (`wl_output` still fabricated),
-floating windows, fullscreen/maximize, workspaces/tags, compositor keybindings
-(no key interception yet — every key is forwarded to the focused client).
+multi-output, damage, floating windows, fullscreen/maximize, workspaces/tags,
+compositor keybindings (no general key interception yet beyond the VT-switch
+chord — every other key is forwarded to the focused client). `wl_output` now
+reports real values: in nested mode they come from the host's `wl_output`
+(slice 3 of `drm-design.md`); in KMS mode from the connector's EDID + mode
+(slice 4+5). Output resize (nested) propagates end-to-end. Multi-output is
+still single-output-only.
 
 ## Client buffers
 
@@ -1187,9 +1191,9 @@ chain is not yet applied to compose textures.
   `sdk.ts` / `loader.ts` only when the loader is the in-thread
   path; Worker plugins receive `sdk.compose === undefined`
   (capability-by-shape; Phase 5b adds the dmabuf-import transport
-  for them). `outputId` validation rejects anything other than
-  `OUTPUT_DEFAULT` -- the `wl_output` substrate is single-output
-  today (fabricated; status.md §"Read first").
+  for them).   `outputId` validation rejects anything other than
+  `OUTPUT_DEFAULT` -- overdraw is single-output today (drm-design.md
+  defers multi-output enumeration + per-output frame clocks).
 
 - **Tests** (`test/compose.gpu.mjs`, 7 tests, all real Wayland clients
   through `setupCompositor`): snapshot byte-identical to on-screen
@@ -2310,9 +2314,9 @@ Priority resolution (cursor-design.md):
   enablement: the rule engine bumps a refcount per rule that uses
   each capability; pointer-motion updates are no-ops while the
   refcount is zero. Hardcoded 60Hz for the sample-count math (the
-  frame clock is fabricated; status.md "Read first"). When the
-  display-driven clock lands, the count math becomes correct
-  without code change.
+  JS render trigger is a uv_timer; status.md "Read first"). When
+  the render trigger becomes display-driven, the count math becomes
+  correct without code change.
 
 - **Rule engine**
   (`packages/core/src/cursor/rule-engine.ts`): stores `CursorRuleSpec`
@@ -2767,8 +2771,8 @@ toplevels.
 
 - **Single output** (`OUTPUT_DEFAULT = 0` only). The `output` arg to
   `get_layer_surface` is accepted but ignored; every layer surface
-  targets the single fabricated output. Multi-output is a `wl_output`
-  reconfiguration pre-condition (see "Read first").
+  targets the single output. Multi-output enumeration + per-output
+  frame clocks are deferred (drm-design.md "Out (deferred)").
 - **Protocol-error posts are silent-drops.** This compositor has no
   `wl_resource_post_error` mechanism (cursor-shape, seat, subsurfaces
   follow the same convention). Each silent-drop site in the layer-shell
@@ -2890,24 +2894,30 @@ required resources'" to "runs". Advertised at protocol version 3.
 
 `state.outputs: Map<number, OutputRecord>` is the underlying registry the
 handler reads from. One entry today (`OUTPUT_DEFAULT = 0`) populated in
-`installProtocols` from the fabricated output dims. The fields are:
-`logicalPosition` (`{0, 0}` today; multi-output puts each connector at a
-real position), `logicalSize` (the output dims at scale 1), `scale`
-(`1`), `name` (`"overdraw-0"`), `description` (`"overdraw nested
-output"`). When real KMS lands, the GPU process publishes connector data
-into this map; the xdg-output handler is unchanged.
+`installProtocols` from a seed (overdraw-internal default), then overwritten
+by the GPU process's `OutputDescriptor` ctrl message during bring-up
+(real host `wl_output` data in nested mode; connector EDID + active mode
+in KMS). The fields are: `logicalPosition` (`{0, 0}` today; multi-output
+will put each connector at a real position), `logicalSize` (the output
+dims at scale 1), `scale`, `refreshMhz`, `transform`, `physicalWidthMm`/
+`physicalHeightMm`, `name`, `make`, `model`, `description`. Re-emission
+on output reconfigure is wired for nested host-window resize (slice 3 of
+drm-design.md) and runs through `bus.emit("output.changed")` to the
+`wl_output` + `xdg_output` re-emit subscribers.
 
 `get_xdg_output(wl_output)` emits the full burst on creation:
 `logical_position` -> `logical_size` -> `name` -> `description` -> `done`.
 The `done` event is marked deprecated since v3 in favor of `wl_output.done`
 but compositors must still support it; we emit it for v1/v2 clients.
 
-**Not wired**: re-emission on output change. The single output is constant
-today; when multi-output reconfiguration lands, the handler will need to
-walk bound `zxdg_output_v1` resources on each output and re-emit the
-changed properties + `done`. The data path (state.outputs) is ready for
-this; the only piece missing is a per-resource bookkeeping map and the
-hook on registry mutation.
+**Wired**: re-emission on output change. The `xdg-output` handler walks
+its bound resources on every `output.changed` bus emission and re-sends
+the full burst + `done` (`reemitXdgOutput` in
+`protocols/zxdg_output_manager_v1.ts`). Same for `wl_output`. Today this
+fires on nested host-window resize; KMS mode change would route through
+the same path once `SetOutputMode` lands (drm-design.md "Output
+configuration"). Multi-output (multiple outputs in state.outputs) is
+still deferred.
 
 Files: `packages/core/src/protocols/zxdg_output_manager_v1.ts` (both
 interfaces), `test/xdg-output.test.js` (4 unit tests). Type:
@@ -3265,9 +3275,10 @@ capabilities exist to grant).
   arg but core only ever passes 1); continuous cursor transforms
   (tilt/rotate/stretch); intercept chains + per-stage caching +
   hold-last-output + A1 input optimization + popups/subsurfaces
-  (10b); output observation beyond a fabricated `wl_output`;
-  protocol SDK surface; interactive-region hit-testing;
-  `sdk.onFrame` (Phase 5+).
+  (10b); plugin-visible output observation (multi-output / mode
+  changes / DPI / refresh changes -- the core's `wl_output` is
+  real today but the SDK does not expose it); protocol SDK
+  surface; interactive-region hit-testing; `sdk.onFrame` (Phase 5+).
 - **Capability enforcement.** No capability gate on `sdk.gpu`/`sdk.window`/
   `sdk.decorations` (every plugin gets them); no native-import restriction (a
   plugin's `import()` is unrestricted — deferred until there is an SDK native addon
@@ -3281,11 +3292,17 @@ capabilities exist to grant).
   A typed request map is wanted; not done.
 - **Cross-thread N-API marshaling.** `napi_threadsafe_function` for Dawn-thread
   callbacks not exercised.
-- **Crash recovery.** GPU-process respawn + state replay not implemented. A crash
-  handler in the GPU process dumps a backtrace to `/tmp/overdraw-gpu-crash.txt`.
+- **Crash recovery.** GPU-process respawn + state replay not implemented.
+  Crash handlers in both processes dump a backtrace -- GPU process to
+  `/tmp/overdraw-gpu-crash.txt`, core addon to `/tmp/overdraw-core-crash.txt`.
 - **Linear compositing.** Alpha blending currently happens in sRGB space.
-- **Phase 2 / Phase 3.** KMS/DRM, libinput, libseat, the session supervisor, and
-  XWayland are untouched.
+- **Phase 2 partially shipped:** KMS/DRM scanout, libinput, libseat, VT
+  switching (drm-design.md slices 1-7). Still deferred from phase 2:
+  multi-output enumeration + per-output frame clocks, hardware cursor
+  plane, hotplug, scanout from a GPU other than the laptop's iGPU,
+  DRM lease, content protection, mode changes (`SetOutputMode` not wired).
+  See drm-design.md "Out (deferred)".
+- **Phase 3 (XWayland, session supervisor).** Untouched.
 - **Live reload.** Not built.
 
 ## Spikes
