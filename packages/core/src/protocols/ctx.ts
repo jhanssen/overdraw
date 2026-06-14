@@ -727,6 +727,16 @@ export interface SeatState {
   // Called from the layer-shell apply / teardown paths whenever the set
   // of qualifying surfaces might have changed.
   reevaluateExclusiveLayerFocus(): void;
+  // Purge state that references a wl_resource the client (or compositor)
+  // destroyed: stale pointer/keyboard focus, destroyed wl_pointer/wl_keyboard
+  // resources in the per-client sets. Required because libwayland recycles
+  // wl_client* pointer values across disconnects -- without this, a new client
+  // whose wl_client* happens to match a disconnected one would inherit the
+  // dead client's keyboard set, causing wl_keyboard.leave to reference a
+  // foreign-client surface (libwayland disconnects the client). Called from
+  // the per-frame sweep in dispatchFrameCallbacks alongside surface/buffer
+  // disconnect cleanup.
+  sweepDestroyed(): void;
 }
 
 export interface ClientCursor {

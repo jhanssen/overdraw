@@ -712,6 +712,31 @@ export default function makeSeat(ctx: Ctx, driver: FocusDriver): SeatHandler {
       // After ending the grab, the next pointer motion will land an
       // enter on whichever surface is now under the pointer.
     },
+    sweepDestroyed() {
+      // Stale focus pointing at a torn-down surface: clearing without
+      // sending leave -- the resource is already destroyed (libwayland will
+      // not let us post events to it) and any new focus assignment from
+      // here would correctly not see this as `cur`.
+      if (seat0?.kbFocus && seat0.kbFocus.surfaceRec.resource.destroyed) {
+        seat0.kbFocus = null;
+      }
+      if (seat0?.focus && seat0.focus.surfaceRec.resource.destroyed) {
+        seat0.focus = null;
+      }
+      // Destroyed wl_keyboard / wl_pointer resources: drop them from the
+      // per-client sets so they cannot become entries the next focus change
+      // sends events to. (libwayland's recycled-pointer hazard: a new client
+      // can land at the same wl_client* value as the disconnected one, so
+      // these sets must not hold dead resources past disconnect.)
+      for (const [cid, set] of keyboardsByClient) {
+        for (const k of [...set]) if (k.destroyed) set.delete(k);
+        if (set.size === 0) keyboardsByClient.delete(cid);
+      }
+      for (const [cid, set] of pointersByClient) {
+        for (const p of [...set]) if (p.destroyed) set.delete(p);
+        if (set.size === 0) pointersByClient.delete(cid);
+      }
+    },
   };
   const seat0 = ctx.state.seat;
 

@@ -338,6 +338,17 @@ export async function installProtocols(
       unmappedAny = true;
     }
 
+    // Seat-state sweep: drop stale focus pointing at a destroyed surface, and
+    // purge destroyed wl_pointer/wl_keyboard resources from the per-client
+    // sets. libwayland recycles wl_client* pointer values across disconnects
+    // (clientId is the pointer value), so without this sweep a new client at
+    // the recycled address would inherit the dead client's keyboards and a
+    // subsequent focus change would post wl_keyboard.leave referencing the
+    // dead client's surface -- libwayland rejects that as a cross-client object
+    // mismatch and disconnects the new client. Surface-destroy must precede
+    // this so the kbFocus.surfaceRec.resource.destroyed flag is current.
+    state.seat?.sweepDestroyed();
+
     // Same disconnect case for wl_buffers: a client that drops without
     // wl_buffer.destroy leaves its descriptor in state.buffers, and a dmabuf
     // descriptor holds an open WaylandFd. The destroy handler did not run, so close
