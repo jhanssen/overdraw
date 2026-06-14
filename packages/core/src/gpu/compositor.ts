@@ -383,8 +383,12 @@ interface Surface {
   // group; updated each frame via writeBuffer.
   uniformBuf: GPUBuffer | null;
   bindGroup: GPUBindGroup | null;
+  // Buffer pixel dimensions (device pixels).
   width: number;
   height: number;
+  // Device pixels per logical pixel in the buffer (wl_surface.set_buffer_scale).
+  // Intrinsic logical size = width/height divided by this. Default 1.
+  bufferScale: number;
   x: number;
   y: number;
   layoutW: number;
@@ -908,6 +912,11 @@ export class JsCompositor implements CompositorSink {
     else this.surfaces.set(id, blankSurface(x, y, w, h));
   }
 
+  setSurfaceBufferScale(id: number, scale: number): void {
+    const s = this.surfaces.get(id) ?? this.ensureSurface(id);
+    s.bufferScale = scale > 0 ? scale : 1;
+  }
+
   // Per-surface render-state setters (core-plugin-api.md §1). Cheap: they
   // mutate the per-surface SurfaceFx; the values flow into the WGSL Uniforms
   // each frame via updateUniforms. Auto-create the Surface so callers don't
@@ -1377,10 +1386,14 @@ export class JsCompositor implements CompositorSink {
     },
   ): void {
     if (!s.uniformBuf) return;
+    // A surface with no WM-assigned layout (subsurface, overlay, cursor) falls
+    // back to its intrinsic logical size = buffer dims / buffer scale, so a
+    // HiDPI buffer is placed at its logical extent, not its device extent.
+    const bs = s.bufferScale || 1;
     const px = overrides?.placement?.x ?? s.x;
     const py = overrides?.placement?.y ?? s.y;
-    const pw = overrides?.placement?.w ?? (s.layoutW || s.width);
-    const ph = overrides?.placement?.h ?? (s.layoutH || s.height);
+    const pw = overrides?.placement?.w ?? (s.layoutW || s.width / bs);
+    const ph = overrides?.placement?.h ?? (s.layoutH || s.height / bs);
     const fx = s.fx;
     const data = new Float32Array(UNIFORM_FLOATS);
     // placement
@@ -2543,7 +2556,7 @@ export class JsCompositor implements CompositorSink {
 function blankSurface(x: number, y: number, w: number, h: number): Surface {
   return {
     texture: null, view: null, uniformBuf: null, bindGroup: null,
-    width: 0, height: 0, x, y, layoutW: w, layoutH: h, present: false,
+    width: 0, height: 0, bufferScale: 1, x, y, layoutW: w, layoutH: h, present: false,
     currentBufferId: 0,
     fx: defaultFx(),
     maskView: null,

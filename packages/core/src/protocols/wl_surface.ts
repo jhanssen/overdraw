@@ -101,6 +101,7 @@ function snapshotRegion(
 // is the spec's "cached state applied immediately after the parent's state".
 function applySurfaceState(ctx: Ctx, s: SurfaceRecord): void {
   uploadBuffer(ctx, s, s.committed.buffer);
+  ctx.state.compositor.setSurfaceBufferScale?.(s.id, s.committed.bufferScale ?? 1);
 
   // Promote this surface's pending frame callbacks to "armed" (fired by the
   // per-frame dispatch). Double-buffered: they arm on apply, not on request.
@@ -134,6 +135,9 @@ function applySurfaceState(ctx: Ctx, s: SurfaceRecord): void {
       const childRec = ctx.state.surfaces.get(sub.surface);
       if (childRec && effectiveSync(ctx, childRec) && childRec.cached) {
         childRec.committed.buffer = childRec.cached.buffer ?? childRec.committed.buffer;
+        if (childRec.cached.bufferScale !== undefined) {
+          childRec.committed.bufferScale = childRec.cached.bufferScale;
+        }
         if (childRec.cached.frameCallbacks?.length) {
           (childRec.pending.frameCallbacks ??= []).push(...childRec.cached.frameCallbacks);
         }
@@ -181,7 +185,15 @@ export default function makeSurface(ctx: Ctx): WlSurfaceHandler {
       s.pending.inputRegion = region;
     },
     set_buffer_transform(_resource, _transform) {},
-    set_buffer_scale(_resource, _scale) {},
+    set_buffer_scale(resource, scale) {
+      const s = rec(resource);
+      if (!s) return;
+      // Double-buffered; applied on commit. A non-positive or non-integer
+      // scale is a protocol error (wl_surface.invalid_scale, v6); silent-drop
+      // per this compositor's convention (no post_error path).
+      if (!Number.isInteger(scale) || scale < 1) return;
+      s.pending.bufferScale = scale;
+    },
     offset(_resource, _x, _y) {},
     commit(resource) {
       const s = rec(resource);
@@ -191,6 +203,11 @@ export default function makeSurface(ctx: Ctx): WlSurfaceHandler {
       if (s.pending.buffer !== undefined) {
         s.committed.buffer = s.pending.buffer;
         s.pending.buffer = undefined;
+      }
+      // buffer_scale travels with the buffer (double-buffered).
+      if (s.pending.bufferScale !== undefined) {
+        s.committed.bufferScale = s.pending.bufferScale;
+        s.pending.bufferScale = undefined;
       }
 
       // Layer-shell: a buffer attached before the first configure-ack is
@@ -207,6 +224,7 @@ export default function makeSurface(ctx: Ctx): WlSurfaceHandler {
         // applied when the parent commits (via applySurfaceState's cascade).
         s.cached ??= {};
         s.cached.buffer = s.committed.buffer;
+        if (s.committed.bufferScale !== undefined) s.cached.bufferScale = s.committed.bufferScale;
         if (s.pending.frameCallbacks?.length) {
           (s.cached.frameCallbacks ??= []).push(...s.pending.frameCallbacks);
           s.pending.frameCallbacks = undefined;
@@ -224,6 +242,7 @@ export default function makeSurface(ctx: Ctx): WlSurfaceHandler {
         // it was sync then switched to desync), it is flushed as part of apply.
         if (s.cached) {
           s.committed.buffer = s.cached.buffer ?? s.committed.buffer;
+          if (s.cached.bufferScale !== undefined) s.committed.bufferScale = s.cached.bufferScale;
           if (s.cached.frameCallbacks?.length) {
             (s.pending.frameCallbacks ??= []).push(...s.cached.frameCallbacks);
           }

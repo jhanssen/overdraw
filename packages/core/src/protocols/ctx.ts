@@ -43,13 +43,15 @@ export interface SurfaceRecord {
     frameCallbacks?: Resource[];
     inputRegion?: Resource | null;
     opaqueRegion?: Resource | null;
+    bufferScale?: number;
   };
-  committed: { buffer: Resource | null };
+  committed: { buffer: Resource | null; bufferScale?: number };
   cached?: {
     buffer?: Resource | null;
     frameCallbacks?: Resource[];
     inputRegion?: Resource | null;
     opaqueRegion?: Resource | null;
+    bufferScale?: number;
   };
   // Applied input region. Used for hit-testing in surface-local coords.
   // null = "infinite" (whole surface accepts input -- the spec's initial
@@ -104,6 +106,10 @@ export interface CompositorSink {
                       fourcc: number, modHi: number, modLo: number,
                       offset: number, stride: number, bufferId: number): boolean;
   setSurfaceLayout(id: number, x: number, y: number, w: number, h: number): void;
+  // Buffer scale (wl_surface.set_buffer_scale): device pixels per logical
+  // pixel in the surface's buffer. The surface's intrinsic logical size is
+  // buffer dims / bufferScale. Default 1.
+  setSurfaceBufferScale?(id: number, scale: number): void;
   // The `content` layer's ordered draw list (windows + subsurfaces + popups).
   // rebuildStackWithPopups remains its single owner. Acts as the DEFAULT
   // content stack; an output may override it via setOutputStack.
