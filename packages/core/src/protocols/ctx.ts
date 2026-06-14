@@ -20,6 +20,10 @@ import type { WindowChangeField } from "../events/types.js";
 // CURRENT region resource here; commit() snapshots it via Region.clone().
 type RegionSlot = import("./region.js").Region | null | undefined;
 
+// wp_viewport source crop (surface coordinates) and destination size.
+export interface ViewportSrc { x: number; y: number; width: number; height: number }
+export interface ViewportDst { width: number; height: number }
+
 export interface SurfaceRecord {
   id: number;
   resource: Resource;
@@ -44,6 +48,11 @@ export interface SurfaceRecord {
     inputRegion?: Resource | null;
     opaqueRegion?: Resource | null;
     bufferScale?: number;
+    // wp_viewport state (double-buffered): undefined = unchanged this cycle,
+    // null = unset/clear, value = set. src crop in surface coords; dst is the
+    // surface's logical size override.
+    viewportSrc?: ViewportSrc | null;
+    viewportDst?: ViewportDst | null;
   };
   committed: { buffer: Resource | null; bufferScale?: number };
   cached?: {
@@ -52,7 +61,14 @@ export interface SurfaceRecord {
     inputRegion?: Resource | null;
     opaqueRegion?: Resource | null;
     bufferScale?: number;
+    viewportSrc?: ViewportSrc | null;
+    viewportDst?: ViewportDst | null;
   };
+  // Applied viewport state (from wp_viewport, double-buffered on commit).
+  viewportSrc?: ViewportSrc | null;
+  viewportDst?: ViewportDst | null;
+  // True once a wp_viewport has been created for this surface (one per surface).
+  hasViewport?: boolean;
   // Applied input region. Used for hit-testing in surface-local coords.
   // null = "infinite" (whole surface accepts input -- the spec's initial
   // state). A non-null empty Region (no rects) = "no input anywhere" --
@@ -110,6 +126,9 @@ export interface CompositorSink {
   // pixel in the surface's buffer. The surface's intrinsic logical size is
   // buffer dims / bufferScale. Default 1.
   setSurfaceBufferScale?(id: number, scale: number): void;
+  // wp_viewport: dst overrides the surface's logical size; src crops the
+  // sampled buffer region (surface coords). null clears either.
+  setSurfaceViewport?(id: number, dst: ViewportDst | null, src: ViewportSrc | null): void;
   // The `content` layer's ordered draw list (windows + subsurfaces + popups).
   // rebuildStackWithPopups remains its single owner. Acts as the DEFAULT
   // content stack; an output may override it via setOutputStack.
@@ -301,6 +320,10 @@ export interface CompositorState {
   // Bound zxdg_output_v1 resources keyed by their underlying outputId. Same
   // shape and lifetime as wlOutputResources.
   xdgOutputResources?: Map<number, Set<Resource>>;
+  // wp_viewport resource -> its wl_surface resource (one viewport per surface).
+  viewports?: Map<Resource, Resource>;
+  // Bound wp_fractional_scale_v1 resources, for preferred_scale re-emit.
+  fractionalScaleResources?: Set<Resource>;
   // surfaceId -> record, for native->JS lookups keyed by the integer id (e.g. the
   // imported-surface map-on-first-content sweep).
   surfacesById?: Map<number, SurfaceRecord>;

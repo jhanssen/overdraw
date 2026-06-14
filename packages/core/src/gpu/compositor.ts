@@ -389,6 +389,10 @@ interface Surface {
   // Device pixels per logical pixel in the buffer (wl_surface.set_buffer_scale).
   // Intrinsic logical size = width/height divided by this. Default 1.
   bufferScale: number;
+  // wp_viewport: dst overrides the surface's logical size; src crops the
+  // sampled buffer region (surface coords). null/undefined = unset.
+  viewportDst?: { width: number; height: number } | null;
+  viewportSrc?: { x: number; y: number; width: number; height: number } | null;
   x: number;
   y: number;
   layoutW: number;
@@ -917,6 +921,16 @@ export class JsCompositor implements CompositorSink {
     s.bufferScale = scale > 0 ? scale : 1;
   }
 
+  setSurfaceViewport(
+    id: number,
+    dst: { width: number; height: number } | null,
+    src: { x: number; y: number; width: number; height: number } | null,
+  ): void {
+    const s = this.surfaces.get(id) ?? this.ensureSurface(id);
+    s.viewportDst = dst;
+    s.viewportSrc = src;
+  }
+
   // Per-surface render-state setters (core-plugin-api.md §1). Cheap: they
   // mutate the per-surface SurfaceFx; the values flow into the WGSL Uniforms
   // each frame via updateUniforms. Auto-create the Surface so callers don't
@@ -1387,13 +1401,16 @@ export class JsCompositor implements CompositorSink {
   ): void {
     if (!s.uniformBuf) return;
     // A surface with no WM-assigned layout (subsurface, overlay, cursor) falls
-    // back to its intrinsic logical size = buffer dims / buffer scale, so a
-    // HiDPI buffer is placed at its logical extent, not its device extent.
+    // back to its intrinsic logical size: a wp_viewport destination overrides
+    // it, else buffer dims / buffer scale -- so a HiDPI buffer is placed at its
+    // logical extent, not its device extent.
     const bs = s.bufferScale || 1;
+    const intrinsicW = s.viewportDst?.width ?? s.width / bs;
+    const intrinsicH = s.viewportDst?.height ?? s.height / bs;
     const px = overrides?.placement?.x ?? s.x;
     const py = overrides?.placement?.y ?? s.y;
-    const pw = overrides?.placement?.w ?? (s.layoutW || s.width / bs);
-    const ph = overrides?.placement?.h ?? (s.layoutH || s.height / bs);
+    const pw = overrides?.placement?.w ?? (s.layoutW || intrinsicW);
+    const ph = overrides?.placement?.h ?? (s.layoutH || intrinsicH);
     const fx = s.fx;
     const data = new Float32Array(UNIFORM_FLOATS);
     // placement
@@ -1409,8 +1426,18 @@ export class JsCompositor implements CompositorSink {
     data[11] = fx.marginLeft   / ow;
     // fx: opacity in x; rest reserved
     data[12] = fx.opacity;
-    // cropUV: u0, v0, u1, v1 (defaults identity = full surface texture)
-    const cu = overrides?.cropUV;
+    // cropUV: u0, v0, u1, v1 (defaults identity = full surface texture). A
+    // wp_viewport source rect (surface coords) crops the sampled buffer;
+    // computed from current buffer dims so it survives a buffer resize.
+    let cu = overrides?.cropUV;
+    if (!cu && s.viewportSrc && s.width > 0 && s.height > 0) {
+      const W = s.width, H = s.height;
+      cu = {
+        u0: (s.viewportSrc.x * bs) / W, v0: (s.viewportSrc.y * bs) / H,
+        u1: ((s.viewportSrc.x + s.viewportSrc.width) * bs) / W,
+        v1: ((s.viewportSrc.y + s.viewportSrc.height) * bs) / H,
+      };
+    }
     data[16] = cu?.u0 ?? 0; data[17] = cu?.v0 ?? 0;
     data[18] = cu?.u1 ?? 1; data[19] = cu?.v1 ?? 1;
     // tint: r, g, b, a (defaults identity = (1,1,1,1))

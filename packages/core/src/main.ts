@@ -51,6 +51,7 @@ import type { CompositorSink, CompositorState } from "./protocols/ctx.js";
 import { OUTPUT_DEFAULT } from "./protocols/ctx.js";
 import { reemitWlOutput } from "./protocols/wl_output.js";
 import { reemitXdgOutput } from "./protocols/zxdg_output_manager_v1.js";
+import { reemitFractionalScale } from "./protocols/wp_fractional_scale_manager_v1.js";
 import { WINDOW_EVENT } from "./events/types.js";
 import { createCompositorBus } from "./events/window-bus.js";
 import { DynamicBus } from "./events/dynamic-bus.js";
@@ -277,15 +278,15 @@ addon.setOnOutputDescriptor((d) => {
   const rec = state.outputs?.get(OUTPUT_DEFAULT);
   if (!rec) return;
   // The descriptor reports device pixels (the scanout mode). Scale is core
-  // policy: an explicit config value wins; the EDID-DPI auto fallback is
-  // deferred until client-side fractional scaling lands (until then it would
-  // only upscale legacy buffers), so allowEdidAuto is false here.
+  // policy: an explicit config value wins, else the EDID-DPI auto fallback
+  // (KMS only -- a nested host window's physical dims describe the host
+  // monitor, not our render target).
   const device = { width: d.width, height: d.height };
   const scale = resolveScale({
     configScale: config.scale,
     deviceWidth: device.width, deviceHeight: device.height,
     physicalWidthMm: d.physicalWidthMm, physicalHeightMm: d.physicalHeightMm,
-    allowEdidAuto: false,
+    allowEdidAuto: backendOpts.backend === "kms",
   });
   const logical = logicalSize(device.width, device.height, scale);
   const sizeChanged = rec.logicalSize.width !== logical.width
@@ -340,6 +341,7 @@ pluginBus.subscribe("output.changed", (_name, payload) => {
   const outputId = (payload as { outputId: number }).outputId;
   reemitWlOutput(state, outputId);
   reemitXdgOutput(state, outputId);
+  reemitFractionalScale(state);
 });
 
 console.log(`[overdraw] Wayland server listening.`);

@@ -56,6 +56,8 @@ const GLOBALS = [
   "zxdg_decoration_manager_v1",
   "zxdg_output_manager_v1",
   "zwlr_foreign_toplevel_manager_v1",
+  "wp_viewporter",
+  "wp_fractional_scale_manager_v1",
 ];
 
 // Interfaces created via requests (new_id), registered without a global so
@@ -72,6 +74,8 @@ const CHILD_INTERFACES = [
   "zxdg_toplevel_decoration_v1",
   "zxdg_output_v1",
   "zwlr_foreign_toplevel_handle_v1",
+  "wp_viewport",
+  "wp_fractional_scale_v1",
 ];
 
 // Load all generated signature modules, keyed by interface name.
@@ -462,6 +466,8 @@ export async function installProtocols(
     zxdg_decoration_manager_v1: await import("./zxdg_decoration_manager_v1.js"),
     zxdg_output_manager_v1: await import("./zxdg_output_manager_v1.js"),
     zwlr_foreign_toplevel_manager_v1: await import("./zwlr_foreign_toplevel_manager_v1.js"),
+    wp_viewporter: await import("./wp_viewporter.js"),
+    wp_fractional_scale_manager_v1: await import("./wp_fractional_scale_manager_v1.js"),
   };
 
   // Some child interfaces have handlers from a sibling module's named exports.
@@ -474,6 +480,8 @@ export async function installProtocols(
   const decorationMod = await import("./zxdg_decoration_manager_v1.js");
   const xdgOutputMod = await import("./zxdg_output_manager_v1.js");
   const foreignTopMod = await import("./zwlr_foreign_toplevel_manager_v1.js");
+  const viewporterMod = await import("./wp_viewporter.js");
+  const fracScaleMod = await import("./wp_fractional_scale_manager_v1.js");
   const childHandlers: Record<string, object> = {
     wl_pointer: seatMod.makePointer(ctx),
     wl_keyboard: seatMod.makeKeyboard(ctx),
@@ -491,6 +499,8 @@ export async function installProtocols(
     zxdg_toplevel_decoration_v1: decorationMod.makeToplevelDecoration(ctx),
     zxdg_output_v1: xdgOutputMod.makeXdgOutput(ctx),
     zwlr_foreign_toplevel_handle_v1: foreignTopMod.makeForeignToplevelHandle(ctx),
+    wp_viewport: viewporterMod.makeViewport(ctx),
+    wp_fractional_scale_v1: fracScaleMod.makeFractionalScale(ctx),
   };
 
   // The apply target forwards lazily: the seat is constructed below and

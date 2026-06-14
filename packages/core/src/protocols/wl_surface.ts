@@ -121,6 +121,23 @@ function applySurfaceState(ctx: Ctx, s: SurfaceRecord): void {
     s.pending.opaqueRegion = undefined;
   }
 
+  // Apply wp_viewport state. undefined = unchanged; push to the compositor
+  // only when src or dst changed this cycle.
+  let viewportChanged = false;
+  if (s.pending.viewportSrc !== undefined) {
+    s.viewportSrc = s.pending.viewportSrc;
+    s.pending.viewportSrc = undefined;
+    viewportChanged = true;
+  }
+  if (s.pending.viewportDst !== undefined) {
+    s.viewportDst = s.pending.viewportDst;
+    s.pending.viewportDst = undefined;
+    viewportChanged = true;
+  }
+  if (viewportChanged) {
+    ctx.state.compositor.setSurfaceViewport?.(s.id, s.viewportDst ?? null, s.viewportSrc ?? null);
+  }
+
   // Subsurface-managed state (position + sibling reorder) of THIS
   // surface's children is applied on THIS surface's commit, regardless
   // of child mode (spec).
@@ -146,6 +163,12 @@ function applySurfaceState(ctx: Ctx, s: SurfaceRecord): void {
         }
         if (childRec.cached.opaqueRegion !== undefined) {
           childRec.pending.opaqueRegion = childRec.cached.opaqueRegion;
+        }
+        if (childRec.cached.viewportSrc !== undefined) {
+          childRec.pending.viewportSrc = childRec.cached.viewportSrc;
+        }
+        if (childRec.cached.viewportDst !== undefined) {
+          childRec.pending.viewportDst = childRec.cached.viewportDst;
         }
         childRec.cached = undefined;
         applySurfaceState(ctx, childRec);
@@ -237,6 +260,14 @@ export default function makeSurface(ctx: Ctx): WlSurfaceHandler {
           s.cached.opaqueRegion = s.pending.opaqueRegion;
           s.pending.opaqueRegion = undefined;
         }
+        if (s.pending.viewportSrc !== undefined) {
+          s.cached.viewportSrc = s.pending.viewportSrc;
+          s.pending.viewportSrc = undefined;
+        }
+        if (s.pending.viewportDst !== undefined) {
+          s.cached.viewportDst = s.pending.viewportDst;
+          s.pending.viewportDst = undefined;
+        }
       } else {
         // Desynchronized (incl. main surface): apply now. If a cache exists (e.g.
         // it was sync then switched to desync), it is flushed as part of apply.
@@ -251,6 +282,12 @@ export default function makeSurface(ctx: Ctx): WlSurfaceHandler {
           }
           if (s.cached.opaqueRegion !== undefined) {
             s.pending.opaqueRegion = s.cached.opaqueRegion;
+          }
+          if (s.cached.viewportSrc !== undefined) {
+            s.pending.viewportSrc = s.cached.viewportSrc;
+          }
+          if (s.cached.viewportDst !== undefined) {
+            s.pending.viewportDst = s.cached.viewportDst;
           }
           s.cached = undefined;
         }
