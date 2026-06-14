@@ -59,6 +59,12 @@ GpuProcess spawnGpuProcess(const char* binPath, uint32_t headlessW, uint32_t hea
         ::fcntl(wireFds[1], F_SETFD, 0);
         ::fcntl(ctrlFds[1], F_SETFD, 0);
         ::fcntl(inputFds[1], F_SETFD, 0);
+        // The parent runtime marks stdout/stderr close-on-exec; clear it so the
+        // GPU process's diagnostics reach the same destination as the core's.
+        // Otherwise these fds close at exec and the first device the Vulkan
+        // driver opens reuses fd 1/2, silently swallowing all GPU-side output.
+        ::fcntl(STDOUT_FILENO, F_SETFD, 0);
+        ::fcntl(STDERR_FILENO, F_SETFD, 0);
         char a1[16], a2[16], a3[16], asize[32];
         std::snprintf(a1, sizeof(a1), "%d", wireFds[1]);
         std::snprintf(a2, sizeof(a2), "%d", ctrlFds[1]);
