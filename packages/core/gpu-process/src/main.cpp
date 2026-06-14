@@ -1475,6 +1475,12 @@ int run(int wireFd, int ctrlFd, int inputFd, bool headless,
                     }
                 }
                 for (int i = 0; i < nRecvFds; ++i) ::close(recvFds[i]);
+            } else if (m.tag == ipc::Tag::OutputPause) {
+                if (kms) kms->pause();
+                for (int i = 0; i < nRecvFds; ++i) ::close(recvFds[i]);
+            } else if (m.tag == ipc::Tag::OutputResume) {
+                if (kms) kms->resume();
+                for (int i = 0; i < nRecvFds; ++i) ::close(recvFds[i]);
 #endif
             } else if (m.tag == ipc::Tag::AddWireConn) {
                 // Register a new plugin wire connection from the fd the core sent

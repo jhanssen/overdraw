@@ -98,6 +98,12 @@ class KmsScanoutRing {
     void markPendingFlip(int idx);
     int  onFlipComplete(int flippedIdx);
 
+    // VT-switch resume helper: force every slot back to FREE. The kernel
+    // revoked DRM master across the switch so any in-flight flip will never
+    // arrive; without this, slots stuck in PENDING_FLIP / SCANOUT can never
+    // be acquired again. Called by KmsOutputBackend::pause(). Idempotent.
+    void resetAllSlotsToFree();
+
     SlotState state(int idx) const { return slots_[idx].state; }
     const Slot& slot(int idx) const { return slots_[idx]; }
     uint32_t width()  const { return width_; }

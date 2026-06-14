@@ -71,6 +71,12 @@ export interface Addon {
     keysym: number;
   };
 
+  // Request a kernel VT switch via libseat. Returns true if libseat accepted;
+  // the actual switch is asynchronous and signaled through the seat's
+  // enable/disable callbacks (which trigger overdraw's pause/resume). Returns
+  // false in nested mode (no seat) or for out-of-range n.
+  switchVT(n: number): boolean;
+
   // XCursor theme resolver. Looks up a named shape in the current theme
   // (XCURSOR_THEME env, with [Icon Theme] Inherits= walk). Returns BGRA8
   // pixels tightly packed at width*height*4. For 'default', a built-in

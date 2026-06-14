@@ -695,16 +695,41 @@ window renders on the bare-metal panel; keyboard and mouse input
 work. Five sequential kitty connect/disconnect cycles against the
 same overdraw also pass (regression coverage for the seat sweep).
 
-### Slice 7 — VT switch
+### Slice 7 — VT switch ✅ landed
 
-Implement `enable_seat` / `disable_seat` handlers + the side-channel
-pause/resume. Test: `chvt 2` while overdraw is running; the panel
-goes blank cleanly (GDM/etc would take over if it were on vt2, in
-practice it's empty); `chvt 1` returns to overdraw without crashing.
+Implements `enable_seat` / `disable_seat` handlers + the side-channel
+pause/resume. The seat callbacks are attached after compositor +
+libinput bring-up (open() runs earlier, when those subsystems don't
+yet exist; `Seat::setCallbacks` installs them later).
 
-Validation: VT switching does not crash the GPU process or leak the
-DRM master. The before/after pixel output is identical (render state
-preserved across the pause).
+On `disable_seat` the core sends `OutputPause` to the GPU process
+(stops atomic commits, drops any pending flip wait, resets the scanout
+ring to FREE, clears `didInitialCommit_` so the next post-resume
+present runs the ALLOW_MODESET path), calls `libinput_suspend` (which
+fires `close_restricted` through the seat for every device fd), stops
+the libinput libuv poll, and acks the disable to libseat. While paused
+`acquireOutputTextureHandle()` returns null so the JS compositor skips
+its frames.
+
+On `enable_seat` the core calls `libinput_resume` (re-opens every
+device through the seat -- libseat hands us fresh fds), restarts the
+libinput libuv poll, and sends `OutputResume`. The next render's
+ScanoutPresent re-runs the initial modeset.
+
+Ctrl+Alt+Fn is wired through xkbcommon's `XKB_KEY_XF86Switch_VT_1..12`
+keysyms: the keyboardKey handler intercepts those before forwarding,
+calls `addon.switchVT(n)` which calls `libseat_switch_session(seat, n)`,
+and the disable/enable lifecycle does the rest. Press AND release are
+consumed so the focused client never sees the keys. `sudo chvt N` from
+a separate SSH session also works (libseat's session-switch signal
+fires either way).
+
+Validation: on the 2560×1600 @165Hz Intel iGPU laptop with gdm stopped,
+`Ctrl+Alt+F2` leaves overdraw cleanly (panel shows the bare TTY),
+`Ctrl+Alt+F1` returns to overdraw with the open kitty window still
+visible and interactive. `sudo chvt 2 && sleep 2 && sudo chvt 1` from
+SSH produces the same round trip. Overdraw stays alive across the
+switch, DRM master is released + reacquired cleanly, no leftover fds.
 
 ### Slice 8 — Documentation cleanup
 

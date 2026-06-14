@@ -199,6 +199,28 @@ class Compositor {
     // right before presentOutput().
     void setPendingScanoutFenceFd(int fd) { pendingScanoutFenceFd_ = fd; }
 
+    // VT-switch lifecycle (drm-design.md "Seat / VT lifecycle"). The libseat
+    // disable_seat / enable_seat callbacks land in the addon; the addon then
+    // calls pauseOutput() (immediately, before ackDisable) and resumeOutput()
+    // (right after enable_seat fires). Both are KMS-only (nested path is a
+    // no-op).
+    //
+    // pauseOutput: send OutputPause to the GPU process and reset every
+    // local scanout slot to FREE -- the kernel revoked DRM master, any
+    // in-flight flip is gone, and the next acquire after resume must start
+    // from scratch. Sets a `kmsPaused_` flag so the JS compositor's per-frame
+    // acquireOutputTextureHandle() returns null (skips the frame) until
+    // resume.
+    //
+    // resumeOutput: clear the pause flag and send OutputResume to the GPU
+    // process. The GPU process's didInitialCommit_ was cleared on pause so
+    // the next ScanoutPresent re-runs the ALLOW_MODESET commit path. No
+    // explicit modeset retrigger here -- the next render naturally drives
+    // it. Idempotent.
+    void pauseOutput();
+    void resumeOutput();
+    bool kmsPaused() const { return kmsPaused_; }
+
     // KMS state machine -- exposed for testing / introspection only. Production
     // paths use acquireOutputTextureHandle / presentOutput.
     enum class ScanoutSlotState : uint8_t { FREE, PENDING_FLIP, SCANOUT };
@@ -482,6 +504,7 @@ class Compositor {
         WGPUTexture tex     = nullptr;  // resolved from (handleId, handleGen) at first use
     };
     bool kmsMode_ = false;
+    bool kmsPaused_ = false;  // VT-switch disable_seat; cleared on enable_seat
     ScanoutSlot scanoutSlots_[3] = {};
     int currentSlot_ = -1;            // slot acquired by the current frame; -1 if none
     int pendingScanoutFenceFd_ = -1;  // attached to next presentOutput, then closed

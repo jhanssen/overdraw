@@ -767,6 +767,7 @@ int Compositor::pluginInstanceInjected(uint32_t connId) const {
 WGPUTexture Compositor::acquireOutputTextureHandle() {
     if (headless_) return nullptr;
     if (kmsMode_) {
+        if (kmsPaused_) return nullptr;  // VT-switched away; skip the frame.
         // Pick the next FREE slot. Returns nullptr (frame skipped) if all
         // three are PENDING_FLIP/SCANOUT -- the JS compositor's render path
         // already handles a null acquire. The texture handle was returned
@@ -837,6 +838,36 @@ void Compositor::renderFrame() {
     // acquireOutputTextureHandle/presentOutput). This per-frame hook just flushes
     // queued wire output.
     link_->flush();
+}
+
+void Compositor::pauseOutput() {
+    if (!kmsMode_) return;
+    if (kmsPaused_) return;
+    kmsPaused_ = true;
+    // Local slot state: any in-flight present is gone. Reset to FREE so the
+    // post-resume acquire starts cleanly.
+    for (int i = 0; i < 3; ++i) scanoutSlots_[i].state = ScanoutSlotState::FREE;
+    currentSlot_ = -1;
+    if (pendingScanoutFenceFd_ >= 0) {
+        ::close(pendingScanoutFenceFd_);
+        pendingScanoutFenceFd_ = -1;
+    }
+    if (ctrlSender_) {
+        ipc::Message m{};
+        m.tag = ipc::Tag::OutputPause;
+        ctrlSender_->send(m);
+    }
+}
+
+void Compositor::resumeOutput() {
+    if (!kmsMode_) return;
+    if (!kmsPaused_) return;
+    kmsPaused_ = false;
+    if (ctrlSender_) {
+        ipc::Message m{};
+        m.tag = ipc::Tag::OutputResume;
+        ctrlSender_->send(m);
+    }
 }
 
 void Compositor::shutdown() {

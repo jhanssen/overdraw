@@ -56,6 +56,16 @@ class LibinputBackend : public InputBackend {
     int pollFd() const override;
     void drain() override;
 
+    // VT-switch lifecycle. On suspend(): tell libinput to release all device
+    // fds; libinput then asks our close_restricted trampoline (which calls
+    // seat->closeDevice). After this no more events flow until resume().
+    // On resume(): libinput re-opens devices through open_restricted (which
+    // calls seat->openDevice -- libseat hands us fresh fds now that the seat
+    // is active again). Both are idempotent. Called from the addon's Seat
+    // enable/disable callbacks.
+    void suspend();
+    void resume();
+
     // Update the output logical size used for cursor clamping (resize).
     void setOutputSize(uint32_t width, uint32_t height) override {
         width_ = width; height_ = height;

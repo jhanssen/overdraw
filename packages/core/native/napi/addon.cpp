@@ -99,6 +99,7 @@ struct Addon {
     std::unique_ptr<overdraw::core::InputBackend> input;
     WaylandInputBackend* waylandInput = nullptr;  // non-owning; points into `input` when active
 #if OVERDRAW_KMS
+    overdraw::core::LibinputBackend* libinputBackend = nullptr;  // non-owning; points into `input` on KMS
     std::unique_ptr<overdraw::core::Seat> seat;
     uv_poll_t seatPoll{};
     bool seatPollActive = false;
@@ -727,6 +728,7 @@ napi_value Start(napi_env env, napi_callback_info info) {
         }
         const int liFd = libiBackend->pollFd();
         libiBackend->start(&g_inputSink);
+        g_addon.libinputBackend = libiBackend.get();
         g_addon.input = std::move(libiBackend);
         uv_poll_init(loop, &g_addon.inputPoll, liFd);
         uv_poll_start(&g_addon.inputPoll, UV_READABLE, onInputReadable);
@@ -737,6 +739,45 @@ napi_value Start(napi_env env, napi_callback_info info) {
             uv_poll_start(&g_addon.seatPoll, UV_READABLE, onSeatReadable);
             g_addon.seatPollActive = true;
         }
+
+        // VT-switch lifecycle (drm-design.md "Seat / VT lifecycle"). Now that
+        // compositor + libinput are up, attach the seat enable/disable
+        // callbacks. open() was called earlier with nullptr callbacks because
+        // those subsystems didn't exist yet.
+        //
+        // disable_seat (VT switch away): tell the GPU process to pause
+        // (OutputPause; KmsOutputBackend drops any pending flip + clears
+        // didInitialCommit_), suspend libinput (releases device fds via the
+        // libseat close_restricted trampoline), stop the input poll, then ack
+        // the disable back to libseat so the seat provider knows we're done.
+        //
+        // enable_seat (VT switch back): resume libinput (libseat hands us
+        // fresh fds via open_restricted), restart the input poll, and tell
+        // the GPU process to resume. The next render's ScanoutPresent will
+        // re-run the ALLOW_MODESET commit.
+        g_addon.seat->setCallbacks(
+            /*onEnable=*/ []() {
+                if (!g_addon.compositor) return;
+                std::printf("[seat] enable_seat (VT switched back)\n");
+                if (g_addon.libinputBackend) g_addon.libinputBackend->resume();
+                if (g_addon.loopRunning && g_addon.libinputBackend) {
+                    // The input poll was stopped on disable; restart it on the
+                    // same fd (libinput keeps its single context fd across
+                    // suspend/resume).
+                    uv_poll_start(&g_addon.inputPoll, UV_READABLE, onInputReadable);
+                }
+                g_addon.compositor->resumeOutput();
+            },
+            /*onDisable=*/ []() {
+                if (!g_addon.compositor) return;
+                std::printf("[seat] disable_seat (VT switched away)\n");
+                g_addon.compositor->pauseOutput();
+                if (g_addon.loopRunning && g_addon.libinputBackend) {
+                    uv_poll_stop(&g_addon.inputPoll);
+                }
+                if (g_addon.libinputBackend) g_addon.libinputBackend->suspend();
+                g_addon.seat->ackDisable();
+            });
 
         // The input socket forwarded from the GPU process carries no events
         // in KMS mode (no host wl_seat on that side); close it.
@@ -1230,6 +1271,9 @@ napi_value Stop(napi_env env, napi_callback_info) {
         g_addon.input->stop();
         g_addon.input.reset();
         g_addon.waylandInput = nullptr;
+#if OVERDRAW_KMS
+        g_addon.libinputBackend = nullptr;
+#endif
     }
 #if OVERDRAW_KMS
     // Release the DRM card (if we opened one for KMS) BEFORE closing the seat,
@@ -1530,6 +1574,29 @@ napi_value KeyUpdate(napi_env env, napi_callback_info info) {
     setU("group", grp);
     setU("keysym", sym);
     return obj;
+}
+
+// switchVT(n) -> boolean
+// Request a kernel VT switch to session `n` (1..12). Routes through libseat,
+// which fires disable_seat → kernel performs the switch → on switch back the
+// kernel fires enable_seat. Both transitions are handled by the addon's seat
+// callbacks (compositor pause/resume + libinput suspend/resume). Returns
+// false in nested mode (no seat) or if libseat rejects.
+napi_value SwitchVT(napi_env env, napi_callback_info info) {
+    napi_value out;
+    napi_get_boolean(env, false, &out);
+#if OVERDRAW_KMS
+    if (!g_addon.seat) return out;
+    size_t argc = 1; napi_value argv[1];
+    napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+    if (argc < 1) return out;
+    uint32_t n = 0;
+    if (napi_get_value_uint32(env, argv[0], &n) != napi_ok) return out;
+    if (n < 1 || n > 12) return out;
+    bool ok = g_addon.seat->switchSession(static_cast<int>(n));
+    napi_get_boolean(env, ok, &out);
+#endif
+    return out;
 }
 
 // resolveCursorShape(name, sizePx, scale)
@@ -1912,6 +1979,7 @@ napi_value Init(napi_env env, napi_value exports) {
     reg("destroyResource", DestroyResource);
     reg("keymapInfo", KeymapInfo);
     reg("keyUpdate", KeyUpdate);
+    reg("switchVT", SwitchVT);
     reg("resolveCursorShape", ResolveCursorShape);
     reg("dmabufFeedbackInfo", DmabufFeedbackInfo);
     reg("pluginCreateConnection", PluginCreateConnection);

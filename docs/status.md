@@ -4,7 +4,7 @@ Ground truth for what exists right now: current capabilities, known gaps, and
 what remains. The design lives in `architecture.md`; this file does not restate
 it. Present-tense only — no change history.
 
-Last updated: 2026-06-13 (post-slice-6 of phase-2 DRM/KMS work — interactive clients on bare-metal. Slice 6 connects the input backend to the output backend (`--backend=kms` ⇒ libinput on the same libseat handle that opened the DRM card; `--backend=nested` ⇒ host-forwarded `WaylandInputBackend`; no separate selector) and ships three other fixes that surfaced when real clients first ran on KMS: `acquireOutputTexture()`'s "no FREE slot" return value (`nullptr` from N-API arrives in JS as `undefined`, not `null`) is now correctly treated as "skip frame"; a SIGSEGV/SIGABRT handler in the core addon writes a backtrace to `/tmp/overdraw-core-crash.txt` (mirroring the GPU process); and the per-frame disconnect sweep now purges `kbFocus`/`focus` pointing at destroyed surfaces and removes destroyed `wl_keyboard`/`wl_pointer` resources from the per-client sets (libwayland recycles `wl_client*` pointer values across disconnects, so the second client on KMS or nested would inherit the dead client's keyboards and trip libwayland's cross-client-object check on the next focus change). Verified on the 2560×1600 @165Hz Intel iGPU laptop: a kitty window renders on the bare-metal panel and accepts keyboard + mouse input. All 1006 unit tests pass; KMS still has no automated coverage (manual verification only with explicit user signoff). Slices 1-5 (libseat + libinput; output-backend seam; real `wl_output`; KMS scanout) remain in place. Design: `docs/drm-design.md`.
+Last updated: 2026-06-13 (post-slice-7 of phase-2 DRM/KMS work — VT switching. The libseat `enable_seat` / `disable_seat` callbacks now drive a full pause/resume lifecycle: on disable, the core sends `OutputPause` to the GPU process (drops any pending flip, resets the scanout ring, clears `didInitialCommit_` so the next post-resume present re-runs ALLOW_MODESET), calls `libinput_suspend` to release the evdev fds, stops the libinput libuv poll, and acks the disable; on enable, the inverse. `acquireOutputTextureHandle()` returns null while paused so the JS compositor's frame timer harmlessly skips renders. `Ctrl+Alt+Fn` is wired via the xkbcommon `XKB_KEY_XF86Switch_VT_1..12` keysyms (intercepted in the `keyboardKey` handler before client delivery, calling `addon.switchVT(n)` -> `libseat_switch_session`); `sudo chvt N` from SSH triggers the same signal. Verified on the 2560×1600 @165Hz Intel iGPU laptop with gdm stopped: `Ctrl+Alt+F2` cleanly leaves overdraw (panel shows the bare TTY), `Ctrl+Alt+F1` returns to overdraw with the open kitty window still visible and interactive. Slices 1-6 remain in place; KMS still has no automated coverage. All 1016 unit tests pass. Design: `docs/drm-design.md`.
 
 ## Read first: gaps in advertised protocols (silent-gap risks)
 
@@ -493,15 +493,22 @@ connector→CRTC link, CRTC mode blob, and CRTC active.
 - **No mode changes** (the `SetOutputMode` core→gpu message family is
   not wired). The connector's preferred mode is used at bring-up and
   not changed thereafter.
-- **No VT switch handling** (slice 7). Switching VTs while overdraw
-  has DRM master is undefined behavior today.
+- **No reactive output reconfiguration on resume.** Slice 7's
+  `enable_seat` handler relies on the next render naturally re-running
+  the modeset (via the GPU process's `didInitialCommit_` cleared on
+  pause). If a frame is somehow not driven for a while after resume,
+  the panel stays dark until one is. In practice the addon's frame
+  timer ticks every ~16ms so the gap is invisible, but a future
+  refactor that moves the JS render onto the flip-event clock will
+  want to either force a render on resume or have `OutputResume`
+  carry an explicit "re-run modeset now" intent.
 
 ### Files
 
 - `packages/core/native/core/seat.{h,cpp}` — libseat wrapper (slice 1).
 - `packages/core/native/ipc/side_channel.h` — `SetDrmFd`,
   `ScanoutReserve`, `ScanoutReady`, `ScanoutPresent`,
-  `ScanoutFlipComplete` messages.
+  `ScanoutFlipComplete`, `OutputPause`, `OutputResume` messages.
 - `packages/core/native/core/compositor.{h,cpp}` — KMS-aware
   `acquireOutputTextureHandle` / `presentOutput`, scanout slot state
   machine, in-band Begin/End writes.

@@ -127,6 +127,21 @@ enum class Tag : uint8_t {
                                 //   `surfaceBufId` field carries the slot index
                                 //   that just exited SCANOUT (now FREE). The core
                                 //   advances its slot state machine off this.
+    OutputPause  = 'q',  // core -> gpu: VT-switch-away (libseat disable_seat).
+                         //   GPU process stops atomic commits, clears any pending
+                         //   flip wait, resets the scanout ring's per-slot state
+                         //   to FREE, and clears didInitialCommit_ so the next
+                         //   ScanoutPresent after resume runs the ALLOW_MODESET
+                         //   commit path. Idempotent. See drm-design.md "Seat /
+                         //   VT lifecycle".
+    OutputResume = 'Q',  // core -> gpu: VT-switch-back (libseat enable_seat).
+                         //   Today this is informational on the GPU side: the
+                         //   first ScanoutPresent after pause will re-run modeset
+                         //   because didInitialCommit_ was cleared on Pause. The
+                         //   message exists so the GPU can log + assert state
+                         //   invariants on resume, and so a future change can
+                         //   trigger a forced modeset without waiting for the
+                         //   next render.
     Shutdown     = 'X',  // core -> gpu : clean termination request
 };
 

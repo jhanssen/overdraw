@@ -77,6 +77,16 @@ void Seat::ackDisable() {
     libseat_disable_seat(seat_);
 }
 
+void Seat::setCallbacks(StateCb onEnable, StateCb onDisable) {
+    onEnable_cb_  = std::move(onEnable);
+    onDisable_cb_ = std::move(onDisable);
+}
+
+bool Seat::switchSession(int n) {
+    if (!seat_) return false;
+    return libseat_switch_session(seat_, n) == 0;
+}
+
 bool Seat::openDevice(const char* path, int& outFd, int& outDeviceId) {
     if (!seat_) {
         error_ = "seat not open";

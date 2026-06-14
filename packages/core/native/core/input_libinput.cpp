@@ -108,6 +108,26 @@ void LibinputBackend::drain() {
     }
 }
 
+void LibinputBackend::suspend() {
+    if (!li_) return;
+    // libinput_suspend triggers close_restricted on every owned device. Our
+    // trampoline calls Seat::closeDevice + ::close(fd) per device, draining
+    // devices_ to empty. After this, no events flow until resume().
+    libinput_suspend(li_);
+}
+
+void LibinputBackend::resume() {
+    if (!li_) return;
+    // Mirror of suspend. libinput walks its internal device list and calls
+    // open_restricted on each via the seat -- libseat issues fresh fds.
+    // Returns 0 on success, non-zero if at least one device failed to open;
+    // we log but keep going (some devices may simply be unavailable now).
+    if (libinput_resume(li_) != 0) {
+        error_ = std::string("libinput_resume reported errors: ") +
+                 std::strerror(errno);
+    }
+}
+
 namespace {
 inline ButtonState toButtonState(libinput_button_state s) {
     return s == LIBINPUT_BUTTON_STATE_PRESSED ? ButtonState::Pressed : ButtonState::Released;

@@ -636,6 +636,20 @@ export default function makeSeat(ctx: Ctx, driver: FocusDriver): SeatHandler {
         const mods = ctx.addon.keyUpdate(ev.key ?? 0, pressed);
         lastModsDepressed = mods.modsDepressed;
 
+        // VT-switch keysyms (Ctrl+Alt+Fn under standard keymaps translate to
+        // XKB_KEY_XF86Switch_VT_N): intercept before forwarding to clients
+        // so the user's focused window never sees these. Both press and
+        // release are consumed. addon.switchVT routes through libseat
+        // -> kernel; the seat's disable_seat callback then pauses overdraw.
+        // No-op in nested mode (addon.switchVT returns false).
+        if (mods.keysym >= 0x1008fe01 && mods.keysym <= 0x1008fe0c) {
+          if (pressed) {
+            const vt = mods.keysym - 0x1008fe00;
+            ctx.addon.switchVT(vt);
+          }
+          return;  // never deliver VT keys (press or release) to clients
+        }
+
         // Consult the binding chain.
         //   - press: dispatchPress; consume on match.
         //   - release: dispatchRelease for (a) the released keysym AND

@@ -148,7 +148,29 @@ wgpu::Texture KmsOutputBackend::acquireScanout(int& outSlotIdx) {
     return ring_.slot(idx).tex;
 }
 
+void KmsOutputBackend::pause() {
+    if (paused_) return;
+    paused_ = true;
+    pendingFlipSlot_ = -1;
+    ring_.resetAllSlotsToFree();
+    didInitialCommit_ = false;
+    std::printf("[kms] paused (VT switched away or seat disabled)\n");
+}
+
+void KmsOutputBackend::resume() {
+    if (!paused_) return;
+    paused_ = false;
+    std::printf("[kms] resumed (next present will re-run modeset)\n");
+}
+
 bool KmsOutputBackend::presentScanout(int slotIdx, int inFenceFd) {
+    if (paused_) {
+        // The seat is disabled; the kernel has revoked DRM master and any
+        // commit would EACCES. Swallow the present and discard the fence
+        // fd (caller already closed its copy via the SCM_RIGHTS receive).
+        (void)inFenceFd;
+        return true;
+    }
     if (slotIdx < 0 || drmFd_ < 0) return false;
     const auto& s = ring_.slot(slotIdx);
     drmModeAtomicReq* req = drmModeAtomicAlloc();

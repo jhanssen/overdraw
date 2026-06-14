@@ -98,6 +98,18 @@ class KmsOutputBackend : public OutputBackend {
     using FlipCompleteCb = std::function<void(int retiredSlotIdx)>;
     void setFlipCompleteListener(FlipCompleteCb cb) { flipCompleteListener_ = std::move(cb); }
 
+    // VT-switch lifecycle. On pause(): drop any pending flip wait, reset every
+    // ring slot to FREE, clear didInitialCommit_ so the next post-resume
+    // present runs the ALLOW_MODESET path (the kernel has revoked DRM master
+    // under us; on resume libseat hands it back and we must modeset again).
+    // While paused, presentScanout() is a no-op (returns true). On resume():
+    // a clarifying no-op today -- the state was already reset on pause; the
+    // call exists so a future change can force an immediate modeset without
+    // waiting for the next render. Both are idempotent.
+    void pause();
+    void resume();
+    bool isPaused() const { return paused_; }
+
     // The card's dev_t (for the dmabuf-feedback main_device + sanity-check
     // that Dawn picked an adapter on the same physical GPU). 0 if open()
     // didn't succeed.
@@ -122,6 +134,7 @@ class KmsOutputBackend : public OutputBackend {
     bool didInitialCommit_ = false;
     bool shouldClose_ = false;
     int pendingFlipSlot_ = -1;  // -1 = no flip in flight
+    bool paused_ = false;
     ResizeListener resizeListener_;
     FlipCompleteCb flipCompleteListener_;
 };

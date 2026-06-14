@@ -214,4 +214,8 @@ int KmsScanoutRing::onFlipComplete(int flippedIdx) {
     return retiredIdx;
 }
 
+void KmsScanoutRing::resetAllSlotsToFree() {
+    for (auto& s : slots_) s.state = SlotState::FREE;
+}
+
 }  // namespace overdraw::gpu

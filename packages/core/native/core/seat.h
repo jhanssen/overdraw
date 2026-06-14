@@ -64,6 +64,20 @@ class Seat {
     // released the devices.
     void ackDisable();
 
+    // Replace the enable/disable callbacks. Used when the caller wants to
+    // attach handlers AFTER open() -- the addon needs the compositor + the
+    // libinput backend to exist before its pause/resume logic can reference
+    // them, but open() runs earlier in startup. Either argument may be null
+    // to leave that side unchanged; pass null+null to clear both. Idempotent.
+    void setCallbacks(StateCb onEnable, StateCb onDisable);
+
+    // Request a VT switch to session `n` (1..12 in practice). Returns true if
+    // libseat accepted the request; libseat fires disable_seat → kernel
+    // performs the VT change → enable_seat once we land back on this seat
+    // (which only happens when the user switches BACK; the switch-away
+    // direction stays disabled until then). No-op + false if not open.
+    bool switchSession(int n);
+
     // Open a device on the seat. Returns true and fills out_fd / out_deviceId
     // on success. The fd is open-on-success; caller closes it. The deviceId
     // must be passed to closeDevice() when done.
