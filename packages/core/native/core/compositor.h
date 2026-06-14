@@ -419,7 +419,14 @@ class Compositor {
     // True if wire bytes are queued awaiting a writable socket (the addon then
     // arms UV_WRITABLE on the wire poll).
     bool wireHasPendingOut() const { return link_->hasPendingOut(); }
-    // Per-frame hook from the addon's frame timer: flush queued wire output. The
+    // Commit any staged Dawn wire commands into the outbound queue (cheap
+    // no-op when nothing is staged). Driven every libuv iteration so a
+    // device-async op issued OUTSIDE the (event-driven) frame loop -- e.g. a
+    // headless readback's buffer mapAsync with no client commit or flip to
+    // trigger a render -- still reaches the GPU process instead of sitting
+    // un-flushed in the serializer.
+    void flushWire() { link_->flush(); }
+    // Per-frame hook from the addon's frame loop: flush queued wire output. The
     // JS compositor records + presents the frame; this just drains the wire.
     void renderFrame();
 

@@ -110,6 +110,7 @@ struct Addon {
     ShmRegistry shm;  // wl_shm pool mappings (CPU-side, independent of the loop)
     uv_poll_t wirePoll{};
     uv_poll_t ctrlPoll{};
+    uv_prepare_t flushPrepare{};  // flushes queued wire/ctrl output each loop turn
     uv_poll_t inputPoll{};
     int inputFd = -1;  // core-side input socket; owned here, closed in Stop()
     bool loopRunning = false;
@@ -525,6 +526,21 @@ void armCtrlPoll() {
     uv_poll_start(&g_addon.ctrlPoll, events, onCtrlReadable);
 }
 
+// libuv prepare hook: arm the WRITABLE poll for any queued wire/ctrl output
+// before the loop blocks. The steady-state frame loop is event-driven (no
+// periodic timer), so a device-async op issued OUTSIDE a frame -- e.g. a
+// headless buffer mapAsync for readback() with no client commit or flip to
+// drive a render -- would otherwise sit in the serializer un-flushed and
+// never reach the GPU process, hanging the awaited map. This decouples
+// flushing from the frame clock; it only re-arms when output is actually
+// pending, so an idle loop still blocks normally.
+void onFlushPrepare(uv_prepare_t*) {
+    if (!g_addon.compositor) return;
+    g_addon.compositor->flushWire();  // commit staged wire commands (no-op if none)
+    if (g_addon.compositor->wireHasPendingOut()) armWirePoll();
+    if (g_addon.compositor->ctrlHasPendingOut()) armCtrlPoll();
+}
+
 void onInputReadable(uv_poll_t*, int status, int) {
     if (status < 0 || !g_addon.input) return;
     g_addon.input->drain();
@@ -781,6 +797,12 @@ napi_value Start(napi_env env, napi_callback_info info) {
     // never blocks waiting for the round-trip.
     uv_poll_init(loop, &g_addon.ctrlPoll, g_addon.compositor->ctrlFd());
     uv_poll_start(&g_addon.ctrlPoll, UV_READABLE, onCtrlReadable);
+
+    // Flush queued wire/ctrl output each loop iteration (see onFlushPrepare):
+    // device-async ops outside the event-driven frame loop must still reach
+    // the GPU process.
+    uv_prepare_init(loop, &g_addon.flushPrepare);
+    uv_prepare_start(&g_addon.flushPrepare, onFlushPrepare);
 
     // Input backend follows the output backend: KMS uses libinput (the seat
     // already opened above for the DRM card opens evdev devices on libinput's
@@ -1332,8 +1354,10 @@ napi_value Stop(napi_env env, napi_callback_info) {
     if (g_addon.loopRunning) {
         uv_poll_stop(&g_addon.wirePoll);
         uv_poll_stop(&g_addon.ctrlPoll);
+        uv_prepare_stop(&g_addon.flushPrepare);
         uv_close(reinterpret_cast<uv_handle_t*>(&g_addon.wirePoll), nullptr);
         uv_close(reinterpret_cast<uv_handle_t*>(&g_addon.ctrlPoll), nullptr);
+        uv_close(reinterpret_cast<uv_handle_t*>(&g_addon.flushPrepare), nullptr);
         if (g_addon.input) {
             uv_poll_stop(&g_addon.inputPoll);
             uv_close(reinterpret_cast<uv_handle_t*>(&g_addon.inputPoll), nullptr);
