@@ -29,6 +29,10 @@ export interface OutputConfig {
   // omitted, the first card with a connected connector is used. Ignored by
   // the nested backend.
   card?: string;
+  // Output scale factor (HiDPI). Logical size = device pixels / scale.
+  // Fractional values (e.g. 1.5) are allowed. When omitted, the scale is
+  // auto-derived from the display's EDID DPI (KMS), falling back to 1.
+  scale?: number;
 }
 
 // Restart behavior when a plugin fails (crash, OOM, watchdog termination, or
@@ -136,6 +140,8 @@ export interface ResolvedConfig {
   // DRM card override for the KMS backend (e.g. "/dev/dri/card1"), or null to
   // auto-detect the first card with a connected connector.
   card: string | null;
+  // Output scale override, or null to auto-derive (EDID DPI on KMS, else 1).
+  scale: number | null;
   // Verbatim user value (or undefined). Threaded to the bundled focus
   // plugin via bundled.ts's configFrom; the plugin validates.
   focus: unknown;

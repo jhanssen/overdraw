@@ -81,6 +81,7 @@ function normalize(raw: unknown, path: string): ResolvedConfig {
   // output
   let output: ResolvedConfig["output"] = null;
   let card: string | null = null;
+  let scale: number | null = null;
   if (cfg.output !== undefined) {
     const o = cfg.output;
     if (o === null || typeof o !== "object") fail("`output` must be an object", path);
@@ -96,6 +97,12 @@ function normalize(raw: unknown, path: string): ResolvedConfig {
         fail("`output.card` must be a non-empty string", path);
       }
       card = o.card;
+    }
+    if (o.scale !== undefined) {
+      if (typeof o.scale !== "number" || !Number.isFinite(o.scale) || o.scale <= 0) {
+        fail("`output.scale` must be a positive number", path);
+      }
+      scale = o.scale;
     }
   }
 
@@ -144,7 +151,7 @@ function normalize(raw: unknown, path: string): ResolvedConfig {
     });
   }
 
-  return { output, card, focus, hotkeys, actions, plugins, sourcePath: path };
+  return { output, card, scale, focus, hotkeys, actions, plugins, sourcePath: path };
 }
 
 // Resolve, import, and normalize the config. `explicit` is the --config path (or
@@ -153,8 +160,8 @@ export async function loadConfig(explicit: string | null): Promise<ResolvedConfi
   const path = resolveConfigPath(explicit);
   if (path === null) {
     return {
-      output: null, card: null, focus: undefined, hotkeys: undefined, actions: undefined,
-      plugins: [], sourcePath: null,
+      output: null, card: null, scale: null, focus: undefined, hotkeys: undefined,
+      actions: undefined, plugins: [], sourcePath: null,
     };
   }
   const mod = (await import(pathToFileURL(path).href)) as { default?: ConfigExport };

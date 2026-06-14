@@ -44,6 +44,7 @@ function defaultRecord() {
     id: 0,
     logicalPosition: { x: 0, y: 0 },
     logicalSize: { width: 1920, height: 1080 },
+    deviceSize: { width: 1920, height: 1080 },
     scale: 1,
     name: "overdraw-0",
     description: "overdraw nested output",
@@ -69,7 +70,8 @@ test("bind sources values from the current OutputRecord", () => {
   const ctx = mockCtx({
     id: 0,
     logicalPosition: { x: 10, y: 20 },
-    logicalSize: { width: 2560, height: 1440 },
+    logicalSize: { width: 1280, height: 720 },
+    deviceSize: { width: 2560, height: 1440 },
     scale: 2,
     name: "DP-1",
     description: "Dell U2718Q",
@@ -123,6 +125,7 @@ test("reemitWlOutput resends the full burst to every bound resource", () => {
   // Simulate a reconfigure: mutate the record in place (what main.ts does).
   const rec = ctx.state.outputs.get(0);
   rec.logicalSize = { width: 2400, height: 1300 };
+  rec.deviceSize = { width: 2400, height: 1300 };
   rec.refreshMhz = 120000;
   reemitWlOutput(ctx.state, 0);
   // Both resources see the burst again.

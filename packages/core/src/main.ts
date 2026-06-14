@@ -32,6 +32,7 @@ import {
   createCursorBroker, CURSOR_NOT_HANDLED,
 } from "./plugins/cursor-broker.js";
 import { createCursorThemeResolver } from "./cursor/theme-resolver.js";
+import { resolveScale, logicalSize } from "./output/scale.js";
 import { Kinematics } from "./cursor/kinematics.js";
 import { CursorRuleEngine } from "./cursor/rule-engine.js";
 import { InterceptBroker } from "./intercept/broker.js";
@@ -275,9 +276,23 @@ state = await installProtocols(addon, {
 addon.setOnOutputDescriptor((d) => {
   const rec = state.outputs?.get(OUTPUT_DEFAULT);
   if (!rec) return;
-  const sizeChanged = rec.logicalSize.width !== d.width || rec.logicalSize.height !== d.height;
-  rec.logicalSize = { width: d.width, height: d.height };
-  rec.scale = d.scale;
+  // The descriptor reports device pixels (the scanout mode). Scale is core
+  // policy: an explicit config value wins; the EDID-DPI auto fallback is
+  // deferred until client-side fractional scaling lands (until then it would
+  // only upscale legacy buffers), so allowEdidAuto is false here.
+  const device = { width: d.width, height: d.height };
+  const scale = resolveScale({
+    configScale: config.scale,
+    deviceWidth: device.width, deviceHeight: device.height,
+    physicalWidthMm: d.physicalWidthMm, physicalHeightMm: d.physicalHeightMm,
+    allowEdidAuto: false,
+  });
+  const logical = logicalSize(device.width, device.height, scale);
+  const sizeChanged = rec.logicalSize.width !== logical.width
+    || rec.logicalSize.height !== logical.height;
+  rec.deviceSize = device;
+  rec.logicalSize = logical;
+  rec.scale = scale;
   rec.refreshMhz = d.refreshMhz;
   rec.transform = d.transform;
   rec.physicalWidthMm = d.physicalWidthMm;
@@ -289,26 +304,29 @@ addon.setOnOutputDescriptor((d) => {
   // doesn't carry one (xdg-output's description is overdraw-owned policy).
 
   console.log(
-    `[overdraw] output: ${d.width}x${d.height} @${d.refreshMhz}mHz scale=${d.scale} `
-    + `xform=${d.transform} phys=${d.physicalWidthMm}x${d.physicalHeightMm}mm `
-    + `name=${d.name} make=${d.make} model=${d.model}`,
+    `[overdraw] output: ${device.width}x${device.height} device, ${logical.width}x${logical.height} `
+    + `logical @${d.refreshMhz}mHz scale=${scale} xform=${d.transform} `
+    + `phys=${d.physicalWidthMm}x${d.physicalHeightMm}mm name=${d.name}`,
   );
 
-  // Internal reconfigurations, in dependency order.
-  if (compositor instanceof JsCompositor) compositor.setOutputSize(d.width, d.height);
-  addon.updateOutputSize(d.width, d.height);
+  // Internal reconfigurations, in dependency order. The compositor renders at
+  // device resolution; the WM and input work in logical coordinates.
+  if (compositor instanceof JsCompositor) {
+    compositor.setOutputSize(device.width, device.height, scale);
+  }
+  addon.updateOutputSize(logical.width, logical.height);
   if (state.wm) {
-    state.wm.state.output.width = d.width;
-    state.wm.state.output.height = d.height;
+    state.wm.state.output.width = logical.width;
+    state.wm.state.output.height = logical.height;
   }
   if (sizeChanged) state.relayout?.("output-resized");
 
   // External: tell clients (via the re-emit subscribers wired below).
   pluginBus.emit("output.changed", {
     outputId: OUTPUT_DEFAULT,
-    width: d.width,
-    height: d.height,
-    scale: d.scale,
+    width: logical.width,
+    height: logical.height,
+    scale,
     refreshMhz: d.refreshMhz,
   });
 });

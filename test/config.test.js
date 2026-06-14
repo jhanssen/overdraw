@@ -85,6 +85,33 @@ test('output.card: override, default, and validation', async () => {
   rmSync(dir, { recursive: true, force: true });
 });
 
+test('output.scale: override, default, and validation', async () => {
+  const dir = tmp();
+  let n = 0;
+  const write = (body) => {
+    const p = join(dir, `scale-${n++}.mjs`);
+    writeFileSync(p, body);
+    return p;
+  };
+  // fractional override honored
+  let c = await loadConfig(write('export default { output: { scale: 1.5 } }'));
+  assert.equal(c.scale, 1.5);
+  // absent -> null (auto-derive downstream)
+  c = await loadConfig(write('export default { output: { width: 800, height: 600 } }'));
+  assert.equal(c.scale, null);
+  // no output block -> null
+  c = await loadConfig(write('export default {}'));
+  assert.equal(c.scale, null);
+  // invalid: zero / negative / non-number
+  await assert.rejects(() => loadConfig(write('export default { output: { scale: 0 } }')),
+    /output\.scale/);
+  await assert.rejects(() => loadConfig(write('export default { output: { scale: -1 } }')),
+    /output\.scale/);
+  await assert.rejects(() => loadConfig(write('export default { output: { scale: "2" } }')),
+    /output\.scale/);
+  rmSync(dir, { recursive: true, force: true });
+});
+
 test('focus is verbatim pass-through (core does NOT validate)', async () => {
   // Core accepts any value; the focus plugin owns the schema and throws
   // from init on bad config (surfacing as a fatal startup error).

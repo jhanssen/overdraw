@@ -160,6 +160,7 @@ export async function installProtocols(
     id: OUTPUT_DEFAULT,
     logicalPosition: { x: 0, y: 0 },
     logicalSize: { width: output.width, height: output.height },
+    deviceSize: { width: output.width, height: output.height },
     scale: 1,
     name: "overdraw-0",
     description: "overdraw nested output",

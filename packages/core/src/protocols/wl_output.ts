@@ -47,11 +47,15 @@ function emitTo(
     SUBPIXEL_UNKNOWN,
     out.make, out.model,
     out.transform);
+  // wl_output.mode is in device pixels (the real scanout mode); the logical
+  // size is conveyed via scale (here) and xdg_output.logical_size. wl_output
+  // scale is an integer, so a fractional scale advertises its ceiling --
+  // fractional-aware clients use wp_fractional_scale_v1 for the exact value.
   events.wl_output.send_mode(
     resource, MODE_CURRENT | MODE_PREFERRED,
-    out.logicalSize.width, out.logicalSize.height,
+    out.deviceSize.width, out.deviceSize.height,
     out.refreshMhz);
-  events.wl_output.send_scale(resource, out.scale);
+  events.wl_output.send_scale(resource, Math.ceil(out.scale));
   events.wl_output.send_name(resource, out.name);
   events.wl_output.send_description(resource, out.description);
   events.wl_output.send_done(resource);
@@ -61,10 +65,12 @@ function fallback(state: CompositorState): OutputRecord {
   // Defensive fallback: if state.outputs is somehow empty (GPU-free harness
   // that skipped the registry seed), advertise something matching the WM's
   // known output size so clients don't abort.
+  const size = state.wm?.state.output ?? { width: 1920, height: 1080 };
   return {
     id: OUTPUT_DEFAULT,
     logicalPosition: { x: 0, y: 0 },
-    logicalSize: state.wm?.state.output ?? { width: 1920, height: 1080 },
+    logicalSize: size,
+    deviceSize: size,
     scale: 1,
     name: "overdraw-0",
     description: "overdraw nested output",

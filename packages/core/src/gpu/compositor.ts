@@ -598,8 +598,15 @@ export class JsCompositor implements CompositorSink {
   private device: GPUDevice;
   private g: DawnGlobals;
   private addon: CompositorAddon;
+  // Render-target size in device pixels (the scanout / offscreen texture).
   private width: number;
   private height: number;
+  // Output scale. Surface placement rects are in logical pixels and are
+  // normalized to [0,1] by the logical output size (device / scale) so a
+  // logical rect maps onto the full device target. 1 unless HiDPI is active.
+  private scale = 1;
+  private logicalWidth: number;
+  private logicalHeight: number;
   // Surfaces that gained presentable content since the last takeImportedSurfaces.
   private imported: Array<{ id: number; width: number; height: number }> = [];
   private warnedDmabuf = false;
@@ -728,6 +735,8 @@ export class JsCompositor implements CompositorSink {
     this.addon = addon;
     this.width = output.width;
     this.height = output.height;
+    this.logicalWidth = output.width;
+    this.logicalHeight = output.height;
     this.dawn = dawn;
     this.deviceHandle = deviceHandle;
     this.nested = opts.nested ?? false;
@@ -831,9 +840,14 @@ export class JsCompositor implements CompositorSink {
   // is a precondition, not a missed reconfiguration; if a future path
   // wants headless resize, this method has to grow the target-recreate
   // logic at that point.
-  setOutputSize(width: number, height: number): void {
+  // width/height are device pixels (the render target). scale derives the
+  // logical output size used to normalize surface placement.
+  setOutputSize(width: number, height: number, scale = 1): void {
     this.width = width;
     this.height = height;
+    this.scale = scale > 0 ? scale : 1;
+    this.logicalWidth = Math.max(1, Math.round(width / this.scale));
+    this.logicalHeight = Math.max(1, Math.round(height / this.scale));
   }
 
   setStack(ids: number[]): void { this.stack = ids.slice(); }
@@ -1570,7 +1584,7 @@ export class JsCompositor implements CompositorSink {
       } else {
         this.composite({
           encoder: enc, targetView, drawList: draw,
-          outW: this.width, outH: this.height,
+          outW: this.logicalWidth, outH: this.logicalHeight,
         });
       }
       // Live composers, in registration order. Each pass writes to its
@@ -1734,8 +1748,8 @@ export class JsCompositor implements CompositorSink {
     outW?: number;
     outH?: number;
   }): { texture: GPUTexture; outW: number; outH: number } {
-    const outW = args.outW ?? this.width;
-    const outH = args.outH ?? this.height;
+    const outW = args.outW ?? this.logicalWidth;
+    const outH = args.outH ?? this.logicalHeight;
     const texture = this.allocComposeTexture(outW, outH);
     this.composeSnapshot({
       targetView: texture.createView(),
@@ -2424,8 +2438,8 @@ export class JsCompositor implements CompositorSink {
     outW?: number;
     outH?: number;
   }): LiveSceneHandle {
-    const outW = args.outW ?? this.width;
-    const outH = args.outH ?? this.height;
+    const outW = args.outW ?? this.logicalWidth;
+    const outH = args.outH ?? this.logicalHeight;
     const texture = this.allocComposeTexture(outW, outH);
     const entry: LiveScene = {
       texture, view: texture.createView(),

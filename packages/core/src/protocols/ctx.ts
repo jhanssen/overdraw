@@ -560,6 +560,9 @@ export interface OutputRecord {
   id: number;
   logicalPosition: { x: number; y: number };
   logicalSize: { width: number; height: number };
+  // Physical scanout/render-target size in device pixels. logicalSize =
+  // round(deviceSize / scale). Equal to logicalSize when scale is 1.
+  deviceSize: { width: number; height: number };
   scale: number;
   name: string;
   description: string;
