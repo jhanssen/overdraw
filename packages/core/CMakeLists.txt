@@ -152,6 +152,8 @@ target_include_directories(overdraw_native PRIVATE
     ${IPC_INCLUDE} ${NATIVE_INCLUDE} ${NODE_INCLUDE_DIR} ${XKBCOMMON_INCLUDE_DIRS})
 target_link_libraries(overdraw_native PRIVATE
     overdraw_core dawn::webgpu_dawn_wire ${XKBCOMMON_LIBRARIES} pthread dl rt)
+# -rdynamic so backtrace_symbols_fd can resolve symbols in the crash handler.
+target_link_options(overdraw_native PRIVATE -rdynamic)
 # N-API symbols (napi_*) are resolved from the host node process at load time;
 # a MODULE/shared object leaves them undefined at link by default.
 

@@ -9,9 +9,13 @@
 #include <node_api.h>
 #include <uv.h>
 
+#include <execinfo.h>
+#include <fcntl.h>
+#include <signal.h>
 #include <sys/types.h>  // dev_t
 #include <unistd.h>
 
+#include <cstdio>
 #include <cstring>
 #include <memory>
 #include <vector>
@@ -50,6 +54,36 @@ using overdraw::wayland::Trampoline;
 using overdraw::wayland::Keymap;
 
 namespace {
+
+// Crash handler: dump a native backtrace to a file then re-raise. Mirrors the
+// GPU-process handler in `gpu-process/src/main.cpp`. Without this, a SIGSEGV
+// inside the addon (or inside any code reachable from a libuv handle the
+// addon installed) leaves no trace -- Node prints nothing to stderr because
+// the fatal signal short-circuits the runtime. The file is the only artifact.
+void coreCrashHandler(int sig) {
+    const char* path = "/tmp/overdraw-core-crash.txt";
+    int fd = ::open(path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (fd >= 0) {
+        char hdr[64];
+        int n = std::snprintf(hdr, sizeof(hdr), "core (node addon) caught signal %d\n", sig);
+        ssize_t w = ::write(fd, hdr, static_cast<size_t>(n));
+        (void)w;
+        void* frames[64];
+        int got = ::backtrace(frames, 64);
+        ::backtrace_symbols_fd(frames, got, fd);
+        ::close(fd);
+    }
+    ::signal(sig, SIG_DFL);
+    ::raise(sig);
+}
+
+void installCoreCrashHandler() {
+    ::signal(SIGSEGV, coreCrashHandler);
+    ::signal(SIGABRT, coreCrashHandler);
+    ::signal(SIGBUS,  coreCrashHandler);
+    ::signal(SIGILL,  coreCrashHandler);
+    ::signal(SIGFPE,  coreCrashHandler);
+}
 
 struct Addon {
     std::unique_ptr<Compositor> compositor;
@@ -1820,6 +1854,7 @@ napi_value DmabufFeedbackInfo(napi_env env, napi_callback_info) {
 }
 
 napi_value Init(napi_env env, napi_value exports) {
+    installCoreCrashHandler();
     napi_value fnStart, fnStop, fnPresented, fnStartServer, fnStopServer;
     napi_create_function(env, "start", NAPI_AUTO_LENGTH, Start, nullptr, &fnStart);
     napi_create_function(env, "stop", NAPI_AUTO_LENGTH, Stop, nullptr, &fnStop);

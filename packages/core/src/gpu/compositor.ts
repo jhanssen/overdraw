@@ -1516,7 +1516,10 @@ export class JsCompositor implements CompositorSink {
     let frameOpen = false;
     if (this.nested) {
       const handle = this.addon.acquireOutputTexture();
-      if (handle === null) return;  // no swapchain texture this frame; no frame opened
+      // The native addon returns nullptr from N-API on "no slot available"
+      // (no FREE scanout in KMS mode; no swapchain texture in nested mode);
+      // that arrives in JS as undefined, not null. Treat both as "skip frame."
+      if (handle === null || handle === undefined) return;
       if (!this.dawn) return;
       this.outputTex = this.dawn.wrapTexture(this.deviceHandle, handle);
       targetView = this.outputTex.createView();
