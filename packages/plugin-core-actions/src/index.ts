@@ -39,6 +39,26 @@ export default async function init(sdk: SdkLike): Promise<void> {
     },
   });
 
+  // Launch a process, detached, connected to this compositor. The actual
+  // spawn runs in the launcher (it has child_process + the WAYLAND_DISPLAY
+  // name); plugin context has neither, so this emits a bus event.
+  sdk.actions.register({
+    name: "spawn",
+    description: "Launch a process detached, with WAYLAND_DISPLAY pointing at " +
+      "this compositor. Params: { command: string, args?: string[] }.",
+    handler: async (params: unknown): Promise<null> => {
+      const p = (params ?? {}) as { command?: unknown; args?: unknown };
+      if (typeof p.command !== "string" || p.command.length === 0) {
+        sdk.log("spawn: params.command must be a non-empty string");
+        return null;
+      }
+      const args = Array.isArray(p.args)
+        ? p.args.filter((a): a is string => typeof a === "string") : [];
+      sdk.events.emit("process.spawn-requested", { command: p.command, args });
+      return null;
+    },
+  });
+
   // Interactive move/resize/end-grab. These emit bus events; the launcher
   // subscribes and calls into state.seat.beginGrab / endGrab. (The action
   // handler runs in plugin context which doesn't have direct access to the

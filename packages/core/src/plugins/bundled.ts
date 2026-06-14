@@ -5,6 +5,22 @@
 
 import type { ResolvedPlugin, ResolvedConfig } from "../config/types.js";
 
+// Default keybindings when the user supplies no `hotkeys` config. Deliberately
+// minimal: a terminal launcher and an exit. Everything else is left to the
+// user to bind. A user `hotkeys` config replaces this wholesale (so they can
+// rebind or clear these). Bindings reference actions from the bundled action
+// plugins (spawn, compositor.quit).
+const DEFAULT_HOTKEYS = {
+  modes: {
+    default: {
+      bindings: [
+        { keys: "Super+t", action: "spawn", params: { command: "kitty" } },
+        { keys: "Super+x", action: "compositor.quit" },
+      ],
+    },
+  },
+};
+
 export interface BundledPluginSpec {
   name: string;
   // Bare specifier (e.g. "@overdraw/plugin-layout-default") or absolute path.
@@ -62,7 +78,7 @@ export const BUNDLED_PLUGINS: ReadonlyArray<BundledPluginSpec> = [
     // exists.
     name: "hotkey-default",
     module: "@overdraw/plugin-hotkey-default",
-    configFrom: (config) => config.hotkeys,
+    configFrom: (config) => config.hotkeys ?? DEFAULT_HOTKEYS,
   },
 ];
 

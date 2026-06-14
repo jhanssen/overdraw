@@ -10,6 +10,7 @@
 //   WAYLAND_DISPLAY=<printed name> your-client
 
 import { createRequire } from "node:module";
+import { spawn as spawnProcess } from "node:child_process";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { dirname, join, isAbsolute, resolve as resolvePath } from "node:path";
 import { globSync } from "node:fs";
@@ -346,6 +347,25 @@ pluginBus.subscribe("output.changed", (_name, payload) => {
 
 console.log(`[overdraw] Wayland server listening.`);
 console.log(`[overdraw] run a client with:  WAYLAND_DISPLAY=${sock} <your-client>`);
+
+// The `spawn` action (plugin-core-actions) emits this; the launcher runs the
+// actual process detached, with WAYLAND_DISPLAY pointed at our socket so the
+// child connects to us. stdio is discarded; the child outlives a compositor
+// restart only if it reparents (detached), which is the intent for a launcher.
+pluginBus.subscribe("process.spawn-requested", (_name, payload) => {
+  const { command, args } = payload as { command?: unknown; args?: unknown };
+  if (typeof command !== "string" || command.length === 0) return;
+  const argv = Array.isArray(args) ? args.filter((a): a is string => typeof a === "string") : [];
+  try {
+    spawnProcess(command, argv, {
+      detached: true,
+      stdio: "ignore",
+      env: { ...process.env, WAYLAND_DISPLAY: sock },
+    }).unref();
+  } catch (e) {
+    console.warn(`[overdraw] spawn failed: ${command}: ${(e as Error).message}`);
+  }
+});
 
 // Bundled plugins first (priority 0 floor), then user-config plugins
 // (default priority 100). A `module` that looks like a path (absolute or
