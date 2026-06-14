@@ -16,8 +16,9 @@
     "build:native:configure": "test -f packages/core/build/CMakeCache.txt || cmake -S packages/core -B packages/core/build -G Ninja",
     "build:native": "npm run build:native:configure && cmake --build packages/core/build --parallel",
     "build": "npm run build:js && npm run build:native",
-    "test": "npm run build:js && node --test 'test/**/*.test.js'",
-    "test:gpu": "npm run build:js && node --test --test-concurrency=1 'test/**/*.gpu.mjs'"
+    "test:unit": "node --test 'test/**/*.test.js'",
+    "test:gpu": "node --test --test-concurrency=1 'test/**/*.gpu.mjs'",
+    "test": "npm run build && npm run test:unit && npm run test:gpu"
   },
   "devDependencies": {
     "@eslint/js": "^10.0.1",
