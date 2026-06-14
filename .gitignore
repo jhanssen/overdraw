@@ -24,3 +24,4 @@ node_modules/
 
 # TypeScript project-references incremental build info.
 *.tsbuildinfo
+*.mp4
