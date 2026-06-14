@@ -746,6 +746,54 @@ back here and to `status.md`. The session-supervisor mention in
 `architecture.md` Phase 2 is explicitly called out as deferred (it was
 never built; the core fork/execs the GPU process directly).
 
+### Slice 9 — Flip-driven frame loop + tiled scanout ✅ landed
+
+Replaces the 60Hz `uv_timer` frame trigger with a wake/runFrameIfReady
+state machine driven by `ScanoutFlipComplete` (KMS) and `FrameComplete`
+(nested host `wl_surface.frame` chain). `wake()` raises `wantNext`;
+`runFrameIfReady` calls `notifyFrame` (JS dispatchFrameCallbacks + JS
+renderFrame + JS presentOutput) when `wantNext && !flipPending && !inFrame`.
+Idle scenes draw zero frames; subsystems with continuous work
+(animation, transition, intercept, client commits) raise hands via
+`wakeIfActive`. On every `onFrameComplete` the core runs
+`Server::drainEvents` (non-blocking `wl_event_loop_dispatch`) before the
+render so a client commit that arrived between the last server-pump and
+the page-flip event is visible to `dispatchFrameCallbacks` this vsync,
+not next.
+
+Scanout candidate modifiers now try the plane's `IN_FORMATS` advertised
+modifiers in advertised order (typically tiled-first), with
+`DRM_FORMAT_MOD_LINEAR` appended last as fallback. The prior LINEAR-only
+choice — added in slice 4 to dodge multi-plane CCS modifiers Dawn can't
+import — also dodged perfectly-fine single-plane tiled modifiers
+(`I915_FORMAT_MOD_X_TILED` / `_Y_TILED` / `_4_TILED`), making the
+scanout target slow enough that the frame fence missed the kernel's
+vblank deadline. `tryAllocateSlot` validates each candidate via Dawn
+`ImportSharedTextureMemory`; multi-plane CCS modifiers self-reject and
+we fall through. The slot's chosen modifier is logged at bring-up
+(`[kms] scanout ring: ... modifier=0x...`).
+
+`Server::stop` synchronously drains its `uv_close` pending list with
+`uv_run(loop, UV_RUN_NOWAIT)` until clear. Without this, adding the
+non-trivial `PumpHook` `std::function` member to `Server` was tripping
+libuv's pending-close assertion at teardown.
+
+Verified by client-paced burst: `test/shm-burst-client.c` (a wl_shm
+client that does `attach + damage + frame + commit` and waits for
+`done` before the next commit, recording avg `commit → done` wait
+time) at 256×256 ARGB8888. Before: 80 commits/sec, avg-wait 12.5ms
+(=2 vsyncs on a 165Hz panel; kernel skipping every other flip).
+After: 154 commits/sec, avg-wait 6.5ms (=panel rate).
+
+Deferred: full panel-rate validation with dmabuf clients (mpv hwdec /
+foot etc.); large-upload `wl_shm` clients (4K software-decoded video)
+may still serialize against vsync because each frame's `writeTexture`
+write barriers against the previous frame's sample of the SAME
+`s.texture` VkImage. Mitigation when this matters is a per-surface
+texture ring (rotate the write target each commit so the new write
+doesn't barrier against the previous sample); not done because it
+costs 3× VRAM per shm surface. See `status.md` "Read first".
+
 ## Open points (all resolved; kept for the rationale)
 
 These were the pre-slice-4 design questions. All resolved through slices

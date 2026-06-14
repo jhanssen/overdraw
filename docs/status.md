@@ -4,7 +4,7 @@ Ground truth for what exists right now: current capabilities, known gaps, and
 what remains. The design lives in `architecture.md`; this file does not restate
 it. Present-tense only — no change history.
 
-Last updated: 2026-06-13 (post-slice-7 of phase-2 DRM/KMS work — VT switching. The libseat `enable_seat` / `disable_seat` callbacks now drive a full pause/resume lifecycle: on disable, the core sends `OutputPause` to the GPU process (drops any pending flip, resets the scanout ring, clears `didInitialCommit_` so the next post-resume present re-runs ALLOW_MODESET), calls `libinput_suspend` to release the evdev fds, stops the libinput libuv poll, and acks the disable; on enable, the inverse. `acquireOutputTextureHandle()` returns null while paused so the JS compositor's frame timer harmlessly skips renders. `Ctrl+Alt+Fn` is wired via the xkbcommon `XKB_KEY_XF86Switch_VT_1..12` keysyms (intercepted in the `keyboardKey` handler before client delivery, calling `addon.switchVT(n)` -> `libseat_switch_session`); `sudo chvt N` from SSH triggers the same signal. Verified on the 2560×1600 @165Hz Intel iGPU laptop with gdm stopped: `Ctrl+Alt+F2` cleanly leaves overdraw (panel shows the bare TTY), `Ctrl+Alt+F1` returns to overdraw with the open kitty window still visible and interactive. Slices 1-6 remain in place; KMS still has no automated coverage. All 1016 unit tests pass. Design: `docs/drm-design.md`.
+Last updated: 2026-06-13 (post-slice-9 of phase-2 DRM/KMS work — flip-driven frame loop + tiled scanout. The 60Hz `uv_timer` trigger is gone: the core now wakes on `ScanoutFlipComplete` (KMS) and `FrameComplete` (nested-host `wl_surface.frame`) and dispatches the JS render from `runFrameIfReady` when a subsystem has set `wantNext` (animation, transition, intercept, client commit, etc.). Idle scenes draw zero frames. `onFrameComplete` runs `Server::drainEvents` before the render so a client commit that arrived between the last server-pump and the page-flip event is visible to `dispatchFrameCallbacks` this vsync, not next. Scanout buffers pick the first single-plane modifier the kernel advertises (typically `I915_FORMAT_MOD_X_TILED` on this Intel iGPU), with `DRM_FORMAT_MOD_LINEAR` as last fallback — the previous LINEAR-only choice forced render-to-scanout through the non-tiled GPU path, pushing the frame fence past the kernel's vblank deadline and capping a client-paced 256×256 shm-burst client at 80 commits/sec on a 165Hz panel; tiled scanout puts the fence under one vsync, same client now lands at ~154 commits/sec. Slices 1-7 remain in place; KMS still has no automated coverage. All 1016 unit tests pass. Design: `docs/drm-design.md`.
 
 ## Read first: gaps in advertised protocols (silent-gap risks)
 
@@ -23,17 +23,26 @@ with no error. Worst-first.
 - **`wl_region` is a no-op stub.** `add`/`subtract` do nothing; opaque/input
   regions are not tracked (hit-testing uses whole-window rects). Low urgency.
 
-- **The JS render trigger is a ~16ms timer, not display-driven.** The
-  architecture's frame loop is event-driven off a display-side completion
-  signal (host `wl_surface.frame` in phase 1, KMS page-flip in phase 2).
-  Today a `uv_timer` paces the JS compositor's `renderFrame()` invocations in
-  both backends, with no causal link to refresh. On the KMS path the scanout-
-  slot state machine IS page-flip-driven (the slot ring advances on
-  `ScanoutFlipComplete`), and the JS render harmlessly skips a tick when
-  `acquireOutputTexture()` returns no FREE slot, so vsync is observed in
-  practice; but the trigger remains the timer. Phase-1 nested has neither the
-  flip-pacing nor the host `wl_surface.frame` callback. See architecture.md
-  "Frame clock" and "Phase-2 present".
+- **Large shm clients (e.g. fullscreen software-decoded video) may serialize
+  against vsync.** Each `wl_surface.commit` with new shm content triggers a
+  `queue.writeTexture` upload (CPU memcpy into a Dawn staging buffer, then
+  `vkCmdCopyBufferToImage` into the surface's single `s.texture` VkImage) in
+  the same vkQueueSubmit as the compose pass that samples it. Vulkan inserts a
+  write-after-read barrier against the previous frame's sample of that same
+  `s.texture`. For small uploads (e.g. 256×256 burst client = 256KB) the
+  barrier is logical and the cycle still fits under one vsync. For large
+  uploads — a 4K shm video at 32MB/frame is the canonical concern — the
+  combined CPU memcpy + GPU copy + barrier wait may push GPU completion past
+  the kernel's vblank deadline, capping observable frame rate at half panel
+  rate the same way the LINEAR-scanout-target bug did before slice 9. Real
+  dmabuf-producing video clients (mpv with `--hwdec=auto`, VLC with vaapi,
+  any zero-copy GBM path) are unaffected — they hand us a sampled
+  `SharedTextureMemory` import, no `writeTexture` runs. The mitigation when
+  shm video becomes a real concern is per-surface ring buffers of textures
+  (rotate write target each commit so the new write doesn't barrier against
+  the previous sample); not done yet because it costs 3× VRAM per shm
+  surface (~64MB extra for one 4K surface) with no measurable benefit on
+  the workloads we run today. Not exercised end-to-end with a video client.
 
 - **No `wl_resource_post_error` mechanism.** Requests that the spec defines
   as protocol errors (e.g. `zwlr_layer_surface_v1.invalid_size` when set_size
@@ -160,12 +169,13 @@ blocker found. Not built.
 ### JS layer / event loop
 
 One-shot bring-up runs blocking inside `start()`; the steady-state present loop is
-libuv-driven (a `uv_poll_t` on the wire fd drains inbound frames, a `uv_timer_t`
-paces render+present). No hand-rolled C++ spin loop in steady state.
+libuv-driven (a `uv_poll_t` on the wire fd drains inbound frames; renders fire
+from `runFrameIfReady` on `wake()` or `onFrameComplete` — no `uv_timer`). No
+hand-rolled C++ spin loop in steady state.
 
-A C++→JS path works: an optional `onFrame` callback fires from the frame timer
-(direct `napi_call_function`, same Node thread). The cross-thread path
-(Dawn-internal callbacks → `napi_threadsafe_function`) is not yet exercised.
+A C++→JS path works: an optional `onFrame` callback fires from the frame
+trigger (direct `napi_call_function`, same Node thread). The cross-thread
+path (Dawn-internal callbacks → `napi_threadsafe_function`) is not yet exercised.
 
 Server-side Wayland (`wl_event_loop`) is integrated into the libuv loop (see
 "Wayland server + trampoline"); the core is a real Wayland server. Protocol
@@ -415,13 +425,20 @@ explicitly via `setupCompositor({ headless: false, backend: "kms" })`.
    existing producer/consumer SurfaceBuf machinery for access brackets),
    sends `ScanoutReserve { handles[3], bufIds[3], width, height }`.
 6. GPU process calls `KmsOutputBackend::initScanout(coreDevice)`:
-   allocates 3 GBM bo's (LINEAR modifier only in v1; see below),
-   dual-imports each as `SharedTextureMemory` + `wgpu::Texture` via
-   the existing `Allocator::importTexture` helper, `AddFB2WithModifiers`
-   per slot. For each slot it also registers a `SurfaceBuf` in the
-   surface-buf machinery (`producerOnCore=true`, consumer side empty
-   because the consumer is the kernel display engine, not another wgpu
-   device).
+   allocates 3 GBM bo's. The modifier candidates come from the plane's
+   `IN_FORMATS` list, tiled-first (typically `I915_FORMAT_MOD_X_TILED`
+   / `_Y_TILED` / `_4_TILED` on Intel), with `DRM_FORMAT_MOD_LINEAR`
+   appended last as a guaranteed-single-plane fallback. Per-modifier
+   `tryAllocateSlot` does the GBM allocation + Dawn `ImportSharedTextureMemory`
+   probe; if Dawn rejects (e.g. multi-plane CCS modifier), we fall through
+   to the next candidate. Multi-plane support is not implemented in Dawn's
+   dmabuf import (CCS RGB modifiers produce two separate FDs which Dawn
+   rejects; see `Limitations of v1` below). Dual-imports each slot's bo as
+   `SharedTextureMemory` + `wgpu::Texture` via the existing
+   `Allocator::importTexture` helper, `AddFB2WithModifiers` per slot.
+   For each slot it also registers a `SurfaceBuf` in the surface-buf
+   machinery (`producerOnCore=true`, consumer side empty because the
+   consumer is the kernel display engine, not another wgpu device).
 7. GPU process `InjectTexture`s each slot's `wgpu::Texture` at the
    matching reserved wire handle, then sends `ScanoutReady { ok=1 }`.
 8. Core proceeds with steady-state.
@@ -469,13 +486,24 @@ connector→CRTC link, CRTC mode blob, and CRTC active.
 
 ### Limitations of v1
 
-- **LINEAR modifier only** for scanout buffers. `IN_FORMATS` on the
-  plane advertises tiled modifiers (e.g. `I915_FORMAT_MOD_4_TILED`)
-  but those require auxiliary CCS planes for Dawn's
-  `ImportSharedTextureMemory`. Our import path is single-plane, so we
-  skip tiled modifiers and use LINEAR (universally supported, single-
-  plane). Tiled support is a perf follow-on requiring a multi-plane
-  import path; until then scanout is slightly slower than it could be.
+- **Single-plane tiled modifiers only** for scanout buffers; CCS / AFBC
+  (compressed multi-plane) modifiers fall back to plain tiled or LINEAR.
+  On Intel iGPU the picked modifier is typically `I915_FORMAT_MOD_X_TILED`
+  (whatever the plane's `IN_FORMATS` advertises first that Dawn imports).
+  Compressed-color modifiers like `I915_FORMAT_MOD_4_TILED_MTL_RC_CCS`
+  (gen 12+ Intel) and `I915_FORMAT_MOD_*_DCC*` (AMD) would save ~30%
+  memory bandwidth on full-screen renders but Mesa allocates them with
+  separate FDs per plane (`res->bo` for main + `res->aux.bo` for CCS),
+  which Dawn rejects (Dawn supports `planeCount > 1` only when all FDs
+  are the same — `crbug.com/42240514`, single-FD requirement at
+  `SharedTextureMemoryVk.cpp:382-388`). On ARM platforms with AFBC the
+  same constraint reduces us to LINEAR, which on AFBC-centric GPUs
+  re-creates the slow-scanout problem this slice fixed on Intel.
+  Mitigation if/when ARM matters: bypass Dawn's dmabuf import for the
+  scanout slot — do `VK_KHR_external_memory_dma_buf` ourselves with
+  `VK_IMAGE_CREATE_DISJOINT_BIT` in the GPU process, then `InjectTexture`
+  the resulting wgpu handle. Scoped to overdraw's GPU process; ~1 week
+  of work. Deferred until ARM/AFBC becomes a target.
 - **`wl_buffer.release` is gated on `onSubmittedWorkDone`** (the
   compositor's submit completing). The slice 4+5 commit message and
   earlier revisions of `drm-design.md` claimed this was wrong for KMS
@@ -2313,10 +2341,12 @@ Priority resolution (cursor-design.md):
   idle timer driven by `beforeRender(timeMs)`. Refcounted lazy
   enablement: the rule engine bumps a refcount per rule that uses
   each capability; pointer-motion updates are no-ops while the
-  refcount is zero. Hardcoded 60Hz for the sample-count math (the
-  JS render trigger is a uv_timer; status.md "Read first"). When
-  the render trigger becomes display-driven, the count math becomes
-  correct without code change.
+  refcount is zero. The sample-count math still uses a hardcoded
+  60Hz constant; the actual frame rate is now panel-rate (165Hz on
+  the verification box), so smoothing windows are ~2.75× shorter
+  than the math assumes. Low impact (the math is forgiving) but
+  worth fixing — replace the constant with the dispatched `timeMs`
+  delta when this becomes user-visible.
 
 - **Rule engine**
   (`packages/core/src/cursor/rule-engine.ts`): stores `CursorRuleSpec`
