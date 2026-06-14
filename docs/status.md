@@ -462,8 +462,16 @@ scale>1 (a 1× bitmap upscaled -- needs a device-density cursor resolve + the
 internal cursor's buffer scale; the theme resolver already takes a `scale`
 arg, only 1 is passed). The subsurface logical-sizing render path is covered
 at the protocol layer but not by a scale-aware-subsurface GPU test. Nested
-mode does not auto-derive scale (config only). `wl_surface.set_buffer_transform`
-remains a no-op (rotation/flip unhandled).
+mode does not auto-derive scale (config only).
+
+`wl_surface.set_buffer_transform` is implemented: all 8 wl_output.transform
+orientations (4 rotations x optional flip) are undone in the compose shader
+when sampling, 90/270 swap the surface's logical w/h, and it is double-
+buffered. Pixel-verified for all 8 against the spec (`buffer-transform.gpu.mjs`).
+Limitation: combining a buffer transform with a `wp_viewport` source crop is
+not spec-exact (the crop is composed after the transform rather than in
+pre-transform surface coords); transform-alone and crop-alone are correct,
+and no known client uses both together.
 
 ## KMS scanout backend (`--backend=kms`)
 
@@ -3335,7 +3343,7 @@ per-surface render state primitives (`compositor-fx.gpu.mjs`).
   direct-surface crop are covered). See "HiDPI / output scaling".
 - **Implemented, not behaviorally tested**: `wl_region` (no-op stub);
   `zwp_linux_dmabuf_feedback_v1` (exercised by real WSI clients, no automated
-  assertion); `wl_surface.set_buffer_transform` (no-op).
+  assertion).
 
 ### Headless mode
 

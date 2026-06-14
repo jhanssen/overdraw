@@ -48,19 +48,23 @@ export interface SurfaceRecord {
     inputRegion?: Resource | null;
     opaqueRegion?: Resource | null;
     bufferScale?: number;
+    // wl_surface.set_buffer_transform (double-buffered): wl_output.transform
+    // enum 0..7. Default 0 (normal).
+    bufferTransform?: number;
     // wp_viewport state (double-buffered): undefined = unchanged this cycle,
     // null = unset/clear, value = set. src crop in surface coords; dst is the
     // surface's logical size override.
     viewportSrc?: ViewportSrc | null;
     viewportDst?: ViewportDst | null;
   };
-  committed: { buffer: Resource | null; bufferScale?: number };
+  committed: { buffer: Resource | null; bufferScale?: number; bufferTransform?: number };
   cached?: {
     buffer?: Resource | null;
     frameCallbacks?: Resource[];
     inputRegion?: Resource | null;
     opaqueRegion?: Resource | null;
     bufferScale?: number;
+    bufferTransform?: number;
     viewportSrc?: ViewportSrc | null;
     viewportDst?: ViewportDst | null;
   };
@@ -126,6 +130,10 @@ export interface CompositorSink {
   // pixel in the surface's buffer. The surface's intrinsic logical size is
   // buffer dims / bufferScale. Default 1.
   setSurfaceBufferScale?(id: number, scale: number): void;
+  // wl_surface.set_buffer_transform: wl_output.transform enum (0..7). The
+  // buffer is sampled with this orientation undone; 90/270 swap the surface's
+  // logical w/h. Default 0.
+  setSurfaceBufferTransform?(id: number, transform: number): void;
   // wp_viewport: dst overrides the surface's logical size; src crops the
   // sampled buffer region (surface coords). null clears either.
   setSurfaceViewport?(id: number, dst: ViewportDst | null, src: ViewportSrc | null): void;

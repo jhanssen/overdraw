@@ -109,6 +109,21 @@ struct Uniforms {
 @group(0) @binding(1) var tex : texture_2d<f32>;
 @group(0) @binding(3) var maskSamp : sampler;
 @group(0) @binding(4) var maskTex : texture_2d<f32>;
+// Undo a wl_surface buffer transform: map a surface-space [0,1] coordinate to
+// the buffer-space coordinate to sample. Codes are the wl_output.transform
+// enum (0 normal, 1 90, 2 180, 3 270, 4 flipped, 5..7 flipped+rotated). Axis-
+// aligned, so this is swap/negate only (no resampling).
+fn applyBufferTransform(uv : vec2f, t : f32) -> vec2f {
+  let u = uv.x; let v = uv.y;
+  if (t < 0.5)      { return vec2f(u, v); }              // normal
+  else if (t < 1.5) { return vec2f(v, 1.0 - u); }        // 90
+  else if (t < 2.5) { return vec2f(1.0 - u, 1.0 - v); }  // 180
+  else if (t < 3.5) { return vec2f(1.0 - v, u); }        // 270
+  else if (t < 4.5) { return vec2f(1.0 - u, v); }        // flipped
+  else if (t < 5.5) { return vec2f(v, u); }              // flipped_90
+  else if (t < 6.5) { return vec2f(u, 1.0 - v); }        // flipped_180
+  else              { return vec2f(1.0 - v, 1.0 - u); }  // flipped_270
+}
 @fragment fn fs(in : VsOut) -> @location(0) vec4f {
   // Mask is always sampled (the default mask is 1x1 white, so this is a no-op
   // when the plugin hasn't installed one). The alpha channel is the mask
@@ -126,7 +141,11 @@ struct Uniforms {
   // into the actual texture coords to sample (compose.windows uses this to
   // render a sub-region of a surface). Default cropUV = (0,0,1,1) =
   // identity (sample the full texture).
-  let sampleUV = mix(u.cropUV.xy, u.cropUV.zw, in.surfUV);
+  // Reorient the surface coordinate into buffer space (set_buffer_transform),
+  // then crop. transform-alone (identity crop) and crop-alone (identity
+  // transform = normal) each reduce to the obvious case.
+  let tuv = applyBufferTransform(in.surfUV, u.fx.y);
+  let sampleUV = mix(u.cropUV.xy, u.cropUV.zw, tuv);
   var surf = textureSampleLevel(tex, samp, sampleUV, 0.0);
   let inside = step(0.0, in.surfUV.x) * step(in.surfUV.x, 1.0)
              * step(0.0, in.surfUV.y) * step(in.surfUV.y, 1.0);
@@ -389,6 +408,10 @@ interface Surface {
   // Device pixels per logical pixel in the buffer (wl_surface.set_buffer_scale).
   // Intrinsic logical size = width/height divided by this. Default 1.
   bufferScale: number;
+  // wl_surface.set_buffer_transform: wl_output.transform enum 0..7. The shader
+  // undoes this when sampling; 90/270 (and flipped variants) swap the surface's
+  // logical width/height. Default 0 (normal).
+  bufferTransform: number;
   // wp_viewport: dst overrides the surface's logical size; src crops the
   // sampled buffer region (surface coords). null/undefined = unset.
   viewportDst?: { width: number; height: number } | null;
@@ -921,6 +944,11 @@ export class JsCompositor implements CompositorSink {
     s.bufferScale = scale > 0 ? scale : 1;
   }
 
+  setSurfaceBufferTransform(id: number, transform: number): void {
+    const s = this.surfaces.get(id) ?? this.ensureSurface(id);
+    s.bufferTransform = (transform >= 0 && transform <= 7) ? transform : 0;
+  }
+
   setSurfaceViewport(
     id: number,
     dst: { width: number; height: number } | null,
@@ -1409,8 +1437,15 @@ export class JsCompositor implements CompositorSink {
     // dimensions are already logical -- a non-integer src here is bad_size,
     // silent-dropped); else buffer dims / buffer scale.
     const bs = s.bufferScale || 1;
-    const intrinsicW = s.viewportDst?.width ?? s.viewportSrc?.width ?? s.width / bs;
-    const intrinsicH = s.viewportDst?.height ?? s.viewportSrc?.height ?? s.height / bs;
+    // 90/270 (and their flipped variants) swap the buffer's axes relative to
+    // the surface, so the buffer-derived logical size uses swapped dims. A
+    // viewport dst/src is already in (post-transform) surface coords.
+    const swapAxes = s.bufferTransform === 1 || s.bufferTransform === 3
+      || s.bufferTransform === 5 || s.bufferTransform === 7;
+    const bw = swapAxes ? s.height : s.width;
+    const bh = swapAxes ? s.width : s.height;
+    const intrinsicW = s.viewportDst?.width ?? s.viewportSrc?.width ?? bw / bs;
+    const intrinsicH = s.viewportDst?.height ?? s.viewportSrc?.height ?? bh / bs;
     const px = overrides?.placement?.x ?? s.x;
     const py = overrides?.placement?.y ?? s.y;
     const pw = overrides?.placement?.w ?? (s.layoutW || intrinsicW);
@@ -1428,8 +1463,9 @@ export class JsCompositor implements CompositorSink {
     data[9]  = fx.marginRight  / ow;
     data[10] = fx.marginBottom / oh;
     data[11] = fx.marginLeft   / ow;
-    // fx: opacity in x; rest reserved
+    // fx: opacity in x; buffer-transform code (0..7) in y; rest reserved
     data[12] = fx.opacity;
+    data[13] = s.bufferTransform || 0;
     // cropUV: u0, v0, u1, v1 (defaults identity = full surface texture). A
     // wp_viewport source rect (surface coords) crops the sampled buffer;
     // computed from current buffer dims so it survives a buffer resize.
@@ -2587,7 +2623,7 @@ export class JsCompositor implements CompositorSink {
 function blankSurface(x: number, y: number, w: number, h: number): Surface {
   return {
     texture: null, view: null, uniformBuf: null, bindGroup: null,
-    width: 0, height: 0, bufferScale: 1, x, y, layoutW: w, layoutH: h, present: false,
+    width: 0, height: 0, bufferScale: 1, bufferTransform: 0, x, y, layoutW: w, layoutH: h, present: false,
     currentBufferId: 0,
     fx: defaultFx(),
     maskView: null,

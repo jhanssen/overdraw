@@ -102,6 +102,7 @@ function snapshotRegion(
 function applySurfaceState(ctx: Ctx, s: SurfaceRecord): void {
   uploadBuffer(ctx, s, s.committed.buffer);
   ctx.state.compositor.setSurfaceBufferScale?.(s.id, s.committed.bufferScale ?? 1);
+  ctx.state.compositor.setSurfaceBufferTransform?.(s.id, s.committed.bufferTransform ?? 0);
 
   // Promote this surface's pending frame callbacks to "armed" (fired by the
   // per-frame dispatch). Double-buffered: they arm on apply, not on request.
@@ -155,6 +156,9 @@ function applySurfaceState(ctx: Ctx, s: SurfaceRecord): void {
         if (childRec.cached.bufferScale !== undefined) {
           childRec.committed.bufferScale = childRec.cached.bufferScale;
         }
+        if (childRec.cached.bufferTransform !== undefined) {
+          childRec.committed.bufferTransform = childRec.cached.bufferTransform;
+        }
         if (childRec.cached.frameCallbacks?.length) {
           (childRec.pending.frameCallbacks ??= []).push(...childRec.cached.frameCallbacks);
         }
@@ -207,7 +211,16 @@ export default function makeSurface(ctx: Ctx): WlSurfaceHandler {
       if (!s) return;
       s.pending.inputRegion = region;
     },
-    set_buffer_transform(_resource, _transform) {},
+    set_buffer_transform(resource, transform) {
+      const s = rec(resource);
+      if (!s) return;
+      // Double-buffered; applied on commit. Out-of-range is a protocol error
+      // (wl_surface.invalid_transform, v6); silent-drop per convention. Values
+      // are the wl_output.transform enum (0=normal,1=90,2=180,3=270, 4..7 the
+      // mirrored variants).
+      if (!Number.isInteger(transform) || transform < 0 || transform > 7) return;
+      s.pending.bufferTransform = transform;
+    },
     set_buffer_scale(resource, scale) {
       const s = rec(resource);
       if (!s) return;
@@ -232,6 +245,10 @@ export default function makeSurface(ctx: Ctx): WlSurfaceHandler {
         s.committed.bufferScale = s.pending.bufferScale;
         s.pending.bufferScale = undefined;
       }
+      if (s.pending.bufferTransform !== undefined) {
+        s.committed.bufferTransform = s.pending.bufferTransform;
+        s.pending.bufferTransform = undefined;
+      }
 
       // Layer-shell: a buffer attached before the first configure-ack is
       // invalid_surface_state per spec. Silent-drop convention (no
@@ -248,6 +265,7 @@ export default function makeSurface(ctx: Ctx): WlSurfaceHandler {
         s.cached ??= {};
         s.cached.buffer = s.committed.buffer;
         if (s.committed.bufferScale !== undefined) s.cached.bufferScale = s.committed.bufferScale;
+        if (s.committed.bufferTransform !== undefined) s.cached.bufferTransform = s.committed.bufferTransform;
         if (s.pending.frameCallbacks?.length) {
           (s.cached.frameCallbacks ??= []).push(...s.pending.frameCallbacks);
           s.pending.frameCallbacks = undefined;
@@ -274,6 +292,7 @@ export default function makeSurface(ctx: Ctx): WlSurfaceHandler {
         if (s.cached) {
           s.committed.buffer = s.cached.buffer ?? s.committed.buffer;
           if (s.cached.bufferScale !== undefined) s.committed.bufferScale = s.cached.bufferScale;
+          if (s.cached.bufferTransform !== undefined) s.committed.bufferTransform = s.cached.bufferTransform;
           if (s.cached.frameCallbacks?.length) {
             (s.pending.frameCallbacks ??= []).push(...s.cached.frameCallbacks);
           }
