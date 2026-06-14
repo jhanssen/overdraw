@@ -3322,14 +3322,17 @@ per-surface render state primitives (`compositor-fx.gpu.mjs`).
   (taskbar protocol; window list + state observation + inbound state
   requests routed through wm.propose; unit-tested wire shape, no GPU
   test client today).
-- **HiDPI (unit-tested + hardware-verified, no automated GPU test)**:
+- **HiDPI (unit + GPU-readback tested)**:
   `wl_surface.set_buffer_scale` (double-buffer + compositor propagation +
   invalid-drop), `wp_viewporter`/`wp_viewport` (one-per-surface, double-buffered
   set_source/set_destination apply, validation, destroy-clears),
   `wp_fractional_scale_manager_v1`/`wp_fractional_scale_v1` (preferred_scale
-  value + re-emit + untrack). Crisp rendering at `output.scale` 2 (integer) and
-  1.5 (fractional) confirmed by eye on the Intel panel; the scale-aware
-  subsurface render path has no GPU test. See "HiDPI / output scaling".
+  value + re-emit + untrack). `viewport-crop.gpu.mjs` pixel-verifies the
+  source-crop path headless (src->cropUV conversion, X/Y orientation,
+  size-from-source). Crisp rendering at `output.scale` 2 (integer) and 1.5
+  (fractional) also confirmed by eye on the Intel panel. The scale-aware
+  *subsurface* render path still has no dedicated GPU test (toplevel +
+  direct-surface crop are covered). See "HiDPI / output scaling".
 - **Implemented, not behaviorally tested**: `wl_region` (no-op stub);
   `zwp_linux_dmabuf_feedback_v1` (exercised by real WSI clients, no automated
   assertion); `wl_surface.set_buffer_transform` (no-op).

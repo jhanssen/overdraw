@@ -177,8 +177,15 @@ and cleaned up carefully.
   a stub with no test is an untested path, which violates the no-gaps rule above.
   If you believe a protocol truly cannot/should not be tested yet, flag it to the
   user with the reason rather than silently leaving it uncovered.
-- Keep `npm test` GPU-free; GPU/host-Wayland tests go in `test/*.gpu.mjs`
-  (`npm run test:gpu`). No interactive (human-in-the-loop) tests.
+- `npm test` runs BOTH tiers: it builds (js + native) then runs the GPU-free
+  unit tests (`test/**/*.test.js`) AND the GPU tests (`test/**/*.gpu.mjs`,
+  serialized). GPU tests must stay self-skipping so this is safe everywhere:
+  headless tests skip without `dawn.node`; nested tests skip without a Wayland
+  session (`canRunGpu()` = `WAYLAND_DISPLAY` set). `test:unit` / `test:gpu` are
+  build-less sub-targets for iteration. GPU tests are part of the default run
+  ON PURPOSE — keeping them separate let a readback regression slip through
+  unnoticed across many commits. Do NOT split them back out. No interactive
+  (human-in-the-loop) tests.
 - **Do not COMMIT artifacts you already know you'll delete.** Verifying
   throwaway / scaffolding code (incremental milestone steps you'll replace,
   spikes) is still required — surface problems early. But the act of *committing*
