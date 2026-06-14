@@ -1122,8 +1122,10 @@ int run(int wireFd, int ctrlFd, int inputFd, bool headless,
         auto it = clientTextures.find(textureId);
         if (it == clientTextures.end() || it->second.generation != textureGen) {
             std::fprintf(stderr,
-                "[gpu] BeginClientAccess: unknown texture {%u,%u}\n",
-                textureId, textureGen);
+                "[gpu] BeginClientAccess: unknown texture {%u,%u} (have gen %d) @wire=%zu\n",
+                textureId, textureGen,
+                it == clientTextures.end() ? -1 : (int)it->second.generation,
+                wireReader.bytesConsumed());
             return false;
         }
         ClientTex& ct = it->second;
@@ -1747,24 +1749,36 @@ int run(int wireFd, int ctrlFd, int inputFd, bool headless,
                 }
             } else if (m.tag == ipc::Tag::ReleaseClientTex) {
                 // Release a JS-compositor dmabuf import: drop the STM + close the
-                // fd, but only if the entry's generation still matches (the handle
-                // id may have been recycled into a newer import).
-                auto it = clientTextures.find(m.texture.id);
-                if (it != clientTextures.end() && it->second.generation == m.texture.generation) {
-                    ClientTex& ct = it->second;
-                    // If a per-frame bracket is still open (the core released
-                    // mid-frame -- typically a bug, but defensive), end it so
-                    // the STM destructor doesn't run with a live access.
-                    if (ct.accessOpen) {
-                        wgpu::SharedTextureMemoryVkImageLayoutEndState endLayout{};
-                        wgpu::SharedTextureMemoryEndAccessState endState{};
-                        endState.nextInChain = &endLayout;
-                        (void)ct.mem.EndAccess(ct.tex, &endState);
-                        ct.accessOpen = false;
-                    }
-                    if (ct.fd >= 0) ::close(ct.fd);
-                    clientTextures.erase(it);
-                }
+                // fd. The per-frame BeginClientAccess/EndAccess brackets for this
+                // handle travel the WIRE; this release came over the CTRL channel,
+                // so a bracket may still be unread in the wire pipeline. Gate the
+                // erase on the core wire reader catching up past m.wireSerial (the
+                // write cursor the core sampled at release time) so a pending Begin
+                // still finds the texture. If the reader is already past it, the
+                // barrier runs the erase synchronously (the common case).
+                const ipc::WireHandle tex = m.texture;
+                coreWireBarrier.after(
+                    m.wireSerial,
+                    [&clientTextures, tex]() {
+                        auto it = clientTextures.find(tex.id);
+                        if (it == clientTextures.end() || it->second.generation != tex.generation) {
+                            return;  // already recycled into a newer import
+                        }
+                        ClientTex& ct = it->second;
+                        // Defensive: end a still-open bracket so the STM destructor
+                        // doesn't run with a live access (should not happen now that
+                        // the erase waits for the wire to drain past the brackets).
+                        if (ct.accessOpen) {
+                            wgpu::SharedTextureMemoryVkImageLayoutEndState endLayout{};
+                            wgpu::SharedTextureMemoryEndAccessState endState{};
+                            endState.nextInChain = &endLayout;
+                            (void)ct.mem.EndAccess(ct.tex, &endState);
+                            ct.accessOpen = false;
+                        }
+                        if (ct.fd >= 0) ::close(ct.fd);
+                        clientTextures.erase(it);
+                    },
+                    wireReader.bytesConsumed());
             }
         }
     };

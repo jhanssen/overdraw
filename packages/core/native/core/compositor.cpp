@@ -413,6 +413,14 @@ void Compositor::releaseDmabufImport(uint32_t importId) {
     ipc::Message m{};
     m.tag = ipc::Tag::ReleaseClientTex;
     m.texture = {it->second.id, it->second.generation};
+    // Cross-channel ordering serial: the per-frame BeginClientAccess/EndAccess
+    // brackets for this handle travel the WIRE; this release travels the CTRL
+    // channel. A bracket may still be in the wire pipeline. Sample the wire
+    // write cursor so the GPU process holds the erase until its wire reader has
+    // drained past every bracket written before this release -- otherwise a
+    // pending Begin would find the texture already gone. (The brackets are
+    // appended frames, already counted by wireBytesQueued(); no flush needed.)
+    m.wireSerial = link_->wireBytesQueued();
     ctrlSender_->send(m);
     jsImportHandles_.erase(it);
 }
