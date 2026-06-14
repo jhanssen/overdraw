@@ -81,4 +81,15 @@ uint32_t Keymap::keysym(uint32_t evdevKeycode) const {
     return xkb_state_key_get_one_sym(state_, evdevKeycode + 8);
 }
 
+uint32_t Keymap::baseKeysym(uint32_t evdevKeycode) const {
+    if (!state_ || !keymap_) return 0;
+    const xkb_keycode_t kc = evdevKeycode + 8;
+    // Look up the keysym at the active layout's level 0 (no Shift / level
+    // modifiers applied) so binding matching is invariant to Shift.
+    const xkb_layout_index_t layout = xkb_state_key_get_layout(state_, kc);
+    const xkb_keysym_t* syms = nullptr;
+    const int n = xkb_keymap_key_get_syms_by_level(keymap_, kc, layout, 0, &syms);
+    return n >= 1 ? static_cast<uint32_t>(syms[0]) : 0;
+}
+
 }  // namespace overdraw::wayland

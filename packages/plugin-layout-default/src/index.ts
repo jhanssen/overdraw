@@ -9,8 +9,14 @@
 // core's layout driver invokes compute() via sdk.plugin('layout').compute(...)
 // (in the driver's case: directly via runtime.invokeNamespace).
 
-import type { LayoutAPI, LayoutInputs, LayoutResult } from "@overdraw/layout-types";
+import type {
+  LayoutAPI, LayoutInputs, LayoutResult, LayoutParamUpdate, LayoutParamSnapshot,
+} from "@overdraw/layout-types";
 import { masterStackLayout, DEFAULT_LAYOUT, type LayoutParams } from "./master-stack.js";
+
+// Master-fraction bounds; matches the clamp masterStackLayout applies.
+const MASTER_MIN = 0.05;
+const MASTER_MAX = 0.95;
 
 // The plugin SDK shape we need. Importing PluginSdk from the core types
 // would couple this plugin to core's internal type packaging; instead we
@@ -56,6 +62,14 @@ export default async function init(sdk: SdkLike): Promise<void> {
           },
         })),
       };
+    },
+
+    async setParams(update: LayoutParamUpdate): Promise<LayoutParamSnapshot> {
+      if (typeof update?.masterFractionDelta === "number") {
+        params.masterFraction = Math.min(MASTER_MAX, Math.max(MASTER_MIN,
+          params.masterFraction + update.masterFractionDelta));
+      }
+      return { masterFraction: params.masterFraction, gap: params.gap };
     },
   };
 

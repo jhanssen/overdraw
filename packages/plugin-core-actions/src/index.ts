@@ -112,8 +112,89 @@ export default async function init(sdk: SdkLike): Promise<void> {
     },
   });
 
+  // Keyboard focus navigation. Cycles the keyboard focus through the WM's
+  // toplevel stack (wrapping at the ends). The launcher resolves the current
+  // focus + the stack order and applies the new focus; plugin context has
+  // neither the seat nor the WM.
+  sdk.actions.register({
+    name: "focus.next",
+    description: "Move keyboard focus to the next toplevel in the stack " +
+      "(wraps). No params.",
+    handler: async (): Promise<null> => {
+      sdk.events.emit("focus.cycle-requested", { direction: "next" });
+      return null;
+    },
+  });
+
+  sdk.actions.register({
+    name: "focus.prev",
+    description: "Move keyboard focus to the previous toplevel in the stack " +
+      "(wraps). No params.",
+    handler: async (): Promise<null> => {
+      sdk.events.emit("focus.cycle-requested", { direction: "prev" });
+      return null;
+    },
+  });
+
+  // Layout manipulation. Reorders the focused window within the WM's stack
+  // (promote to master / swap with a neighbour) and relayouts. The launcher
+  // resolves focus + performs the reorder.
+  sdk.actions.register({
+    name: "layout.promote",
+    description: "Move the keyboard-focused window to the master slot " +
+      "(front of the stack). No params.",
+    handler: async (): Promise<null> => {
+      sdk.events.emit("layout.reorder-requested", { op: "promote" });
+      return null;
+    },
+  });
+
+  sdk.actions.register({
+    name: "layout.swap-next",
+    description: "Swap the keyboard-focused window with the next toplevel in " +
+      "the stack. No params.",
+    handler: async (): Promise<null> => {
+      sdk.events.emit("layout.reorder-requested", { op: "swap-next" });
+      return null;
+    },
+  });
+
+  sdk.actions.register({
+    name: "layout.swap-prev",
+    description: "Swap the keyboard-focused window with the previous toplevel " +
+      "in the stack. No params.",
+    handler: async (): Promise<null> => {
+      sdk.events.emit("layout.reorder-requested", { op: "swap-prev" });
+      return null;
+    },
+  });
+
+  // Master-fraction tuning. The active layout plugin owns the parameter; the
+  // launcher routes the relative delta to it and relayouts. No-op if the
+  // active layout doesn't implement setParams.
+  sdk.actions.register({
+    name: "layout.grow-master",
+    description: "Grow the master column by one step. No params.",
+    handler: async (): Promise<null> => {
+      sdk.events.emit("layout.master-fraction-requested", { delta: MASTER_STEP });
+      return null;
+    },
+  });
+
+  sdk.actions.register({
+    name: "layout.shrink-master",
+    description: "Shrink the master column by one step. No params.",
+    handler: async (): Promise<null> => {
+      sdk.events.emit("layout.master-fraction-requested", { delta: -MASTER_STEP });
+      return null;
+    },
+  });
+
   sdk.log("core-actions registered");
 }
+
+// Per-command master-fraction increment for layout.grow-master / shrink-master.
+const MASTER_STEP = 0.05;
 
 const EDGES = [
   "top", "bottom", "left", "right",

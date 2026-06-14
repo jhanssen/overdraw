@@ -109,11 +109,29 @@ export interface LayoutResult {
   hidden?: ReadonlyArray<number>;
 }
 
-// The contract a plugin claiming 'layout' implements. compute() is the only
-// method today; future revisions may add others (e.g. an animation hook).
+// Relative adjustment to a layout's tunable parameters. Fields are deltas,
+// not absolutes, so successive grow/shrink commands accumulate. A layout
+// applies only the fields it understands and clamps to its own bounds.
+export interface LayoutParamUpdate {
+  // Change to the master-column fraction (the share of the working area the
+  // master tile gets). Positive grows the master, negative shrinks it.
+  masterFractionDelta?: number;
+}
+
+// The resolved parameter values after a setParams() call.
+export interface LayoutParamSnapshot {
+  masterFraction: number;
+  gap: number;
+}
+
+// The contract a plugin claiming 'layout' implements. compute() is required;
+// setParams() is optional (a layout with no tunable parameters may omit it).
 //
 // All methods async per the SDK contract; the master-stack plugin returns
 // synchronously (Promise.resolve(...)).
 export interface LayoutAPI {
   compute(inputs: LayoutInputs): Promise<LayoutResult>;
+  // Adjust runtime parameters (master fraction, gap) and return the resolved
+  // values. Bound via the layout.grow-master / layout.shrink-master actions.
+  setParams?(update: LayoutParamUpdate): Promise<LayoutParamSnapshot>;
 }

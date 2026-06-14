@@ -65,10 +65,14 @@ export interface Addon {
   } | null;
   keyUpdate(evdevKey: number, pressed: boolean): {
     modsDepressed: number; modsLatched: number; modsLocked: number; group: number;
-    // The keysym resolved against the post-update xkb state. 0 = no symbol
-    // (XKB_KEY_NoSymbol). Used by the binding-chain match path; not sent on
-    // the wire (wl_keyboard.key carries the raw evdev keycode).
+    // The Shift-translated keysym against the post-update xkb state ('j' with
+    // Shift held -> 'J'). 0 = no symbol (XKB_KEY_NoSymbol). Used for VT-switch
+    // detection. Not sent on the wire (wl_keyboard.key carries the raw keycode).
     keysym: number;
+    // The keysym at shift-level 0 (Shift-independent: 'j' stays 'j' under
+    // Shift). Used by the binding-chain match path so a held Shift counts only
+    // as a modifier bit. 0 = no symbol.
+    baseKeysym: number;
   };
 
   // Request a kernel VT switch via libseat. Returns true if libseat accepted;

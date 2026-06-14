@@ -73,3 +73,44 @@ test('end-to-end: bundled master-stack plugin assigns tiles via the runtime', as
     assert.deepEqual(lastByConfId[2], { id: 2, w: 500, h: 600 });
   });
 });
+
+test('setParams: master-fraction delta widens the master on the next compute', async () => {
+  await withRuntime({}, async (rt) => {
+    await rt.load([bundledToResolved(layoutPluginSpec, layoutPluginSpec.module)]);
+    await rt.waitForNamespace('layout');
+
+    const inputs = {
+      output: { id: 0, rect: { x: 0, y: 0, width: 1000, height: 600 }, scale: 1 },
+      tileRegion: { x: 0, y: 0, width: 1000, height: 600 },
+      windows: [
+        { id: 1, role: 'toplevel' },
+        { id: 2, role: 'toplevel' },
+      ],
+      reason: 'mapped',
+    };
+
+    // Default fraction 0.5: master is the left half.
+    const before = await rt.invokeNamespace('layout', 'compute', [inputs]);
+    assert.equal(before.rects.find((r) => r.id === 1).outer.width, 500);
+
+    // Grow the master by 0.2 -> 0.7. setParams returns the resolved snapshot.
+    const snap = await rt.invokeNamespace('layout', 'setParams', [{ masterFractionDelta: 0.2 }]);
+    assert.equal(snap.masterFraction, 0.7);
+
+    const after = await rt.invokeNamespace('layout', 'compute', [inputs]);
+    assert.equal(after.rects.find((r) => r.id === 1).outer.width, 700);
+    assert.equal(after.rects.find((r) => r.id === 2).outer.width, 300);
+  });
+});
+
+test('setParams: master fraction clamps to [0.05, 0.95]', async () => {
+  await withRuntime({}, async (rt) => {
+    await rt.load([bundledToResolved(layoutPluginSpec, layoutPluginSpec.module)]);
+    await rt.waitForNamespace('layout');
+
+    const hi = await rt.invokeNamespace('layout', 'setParams', [{ masterFractionDelta: 10 }]);
+    assert.equal(hi.masterFraction, 0.95);
+    const lo = await rt.invokeNamespace('layout', 'setParams', [{ masterFractionDelta: -10 }]);
+    assert.equal(lo.masterFraction, 0.05);
+  });
+});

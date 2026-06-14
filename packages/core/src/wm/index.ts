@@ -237,6 +237,20 @@ export interface Wm {
 
   getSnapshot(surfaceId: number): WindowSnapshot | null;
   listSnapshots(): WindowSnapshot[];
+
+  // Surface ids of the mapped, non-minimized toplevels in stack order
+  // (master-front; index 0 is the master). The basis for keyboard focus
+  // cycling and the reorder ops.
+  focusOrder(): number[];
+
+  // Reorder the window list relative to one surface:
+  //   'promote'    move it to the master slot (front of the list);
+  //   'swap-next'  exchange it with the next toplevel toward the stack tail;
+  //   'swap-prev'  exchange it with the previous toplevel toward the head.
+  // Neighbours are chosen among focusOrder() windows (mapped, non-minimized).
+  // swap-* do not wrap at the ends. Returns true and schedules a relayout +
+  // restacks when the order changed; false (no-op) otherwise.
+  reorder(surfaceId: number, op: "promote" | "swap-next" | "swap-prev"): boolean;
 }
 
 // Structured-clone-safe snapshot of a window's observable state. The shape
@@ -840,6 +854,48 @@ export function createWm(
 
     listSnapshots() {
       return windows.map(snapshotOf);
+    },
+
+    focusOrder() {
+      const out: number[] = [];
+      for (const w of windows) {
+        if (w.hasContent && w.windowState.presentation !== "minimized") {
+          out.push(w.surfaceId);
+        }
+      }
+      return out;
+    },
+
+    reorder(surfaceId, op) {
+      const idx = windows.findIndex((w) => w.surfaceId === surfaceId);
+      if (idx < 0) return false;
+
+      if (op === "promote") {
+        if (idx === 0) return false;
+        const [win] = windows.splice(idx, 1);
+        windows.unshift(win);
+        driver.schedule("reorder");
+        pushStack();
+        return true;
+      }
+
+      // swap-next / swap-prev: swap with the adjacent focusable neighbour.
+      // Build the focusable subset's array indices so a contentless or
+      // minimized window between two tiles isn't treated as a neighbour.
+      const focusable: number[] = [];
+      for (let i = 0; i < windows.length; i++) {
+        const w = windows[i];
+        if (w.hasContent && w.windowState.presentation !== "minimized") focusable.push(i);
+      }
+      const pos = focusable.indexOf(idx);
+      if (pos < 0) return false;
+      const neighbourPos = op === "swap-next" ? pos + 1 : pos - 1;
+      if (neighbourPos < 0 || neighbourPos >= focusable.length) return false;
+      const j = focusable[neighbourPos];
+      [windows[idx], windows[j]] = [windows[j], windows[idx]];
+      driver.schedule("reorder");
+      pushStack();
+      return true;
     },
   };
 }

@@ -658,13 +658,17 @@ export default function makeSeat(ctx: Ctx, driver: FocusDriver): SeatHandler {
         // Key-up events bypass the press path (bindings fire on press
         // only); xkb still sees them so subsequent presses have the
         // right modifier state.
+        // Bindings match the shift-level-0 keysym so a held Shift is purely a
+        // modifier bit (Mod+Shift+j matches the 'j' symbol, not 'J'). Fall
+        // back to the translated keysym if the keymap reported no base symbol.
+        const matchSym = mods.baseKeysym || mods.keysym;
         let consumed = false;
         const chain = ctx.state.bindingChain;
         if (chain) {
-          if (pressed && mods.keysym !== 0) {
+          if (pressed && matchSym !== 0) {
             const r = chain.dispatchPress({
               kind: "key",
-              mods: mods.modsDepressed, keysym: mods.keysym,
+              mods: mods.modsDepressed, keysym: matchSym,
             });
             consumed = r.consume;
           } else if (!pressed) {
@@ -677,12 +681,11 @@ export default function makeSeat(ctx: Ctx, driver: FocusDriver): SeatHandler {
                 if (r.consume) consumed = true;
               }
             }
-            // Released a non-mod key? Look up its keysym from xkb. The
-            // current modsDepressed already reflects the release; the
-            // keysym field on the return is the symbol for the released
-            // keycode.
-            if (mods.keysym !== 0) {
-              const r = chain.dispatchRelease({ kind: "key", keysym: mods.keysym });
+            // Released a non-mod key? Dispatch the release for the same
+            // (base) keysym the press matched on, so a press/release pair
+            // tracks consistently regardless of Shift.
+            if (matchSym !== 0) {
+              const r = chain.dispatchRelease({ kind: "key", keysym: matchSym });
               if (r.consume) consumed = true;
             }
           }

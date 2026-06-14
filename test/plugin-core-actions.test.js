@@ -63,3 +63,36 @@ test('window.close emits window.close-requested', async () => {
   await close();
   assert.deepEqual(emitted.at(-1), ['window.close-requested', {}]);
 });
+
+test('focus.next / focus.prev emit focus.cycle-requested with a direction', async () => {
+  const { sdk, handlers, emitted } = makeSdk();
+  await init(sdk);
+  await handlers.get('focus.next')();
+  assert.deepEqual(emitted.at(-1), ['focus.cycle-requested', { direction: 'next' }]);
+  await handlers.get('focus.prev')();
+  assert.deepEqual(emitted.at(-1), ['focus.cycle-requested', { direction: 'prev' }]);
+});
+
+test('layout.promote / swap-next / swap-prev emit layout.reorder-requested with an op', async () => {
+  const { sdk, handlers, emitted } = makeSdk();
+  await init(sdk);
+  await handlers.get('layout.promote')();
+  assert.deepEqual(emitted.at(-1), ['layout.reorder-requested', { op: 'promote' }]);
+  await handlers.get('layout.swap-next')();
+  assert.deepEqual(emitted.at(-1), ['layout.reorder-requested', { op: 'swap-next' }]);
+  await handlers.get('layout.swap-prev')();
+  assert.deepEqual(emitted.at(-1), ['layout.reorder-requested', { op: 'swap-prev' }]);
+});
+
+test('layout.grow-master / shrink-master emit signed master-fraction deltas', async () => {
+  const { sdk, handlers, emitted } = makeSdk();
+  await init(sdk);
+  await handlers.get('layout.grow-master')();
+  const grow = emitted.at(-1);
+  assert.equal(grow[0], 'layout.master-fraction-requested');
+  assert.ok(grow[1].delta > 0, 'grow delta is positive');
+  await handlers.get('layout.shrink-master')();
+  const shrink = emitted.at(-1);
+  assert.equal(shrink[0], 'layout.master-fraction-requested');
+  assert.equal(shrink[1].delta, -grow[1].delta, 'shrink delta is the negated grow delta');
+});

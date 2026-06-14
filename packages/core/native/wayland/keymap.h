@@ -47,9 +47,15 @@ class Keymap {
                    uint32_t& locked, uint32_t& group) const;
     // Resolve a raw evdev keycode to its keysym under the CURRENT xkb state
     // (modifier + layout). Returns 0 (XKB_KEY_NoSymbol) if the keymap isn't
-    // built or the key has no symbol bound. The seat uses this to look up
-    // the keysym for binding-chain match decisions.
+    // built or the key has no symbol bound. Shift-translated ('j' with Shift
+    // held resolves to 'J'). Used for VT-switch detection, which keys off the
+    // modifier-translated symbol.
     uint32_t keysym(uint32_t evdevKeycode) const;
+    // The keycode's keysym at shift-level 0 in the effective layout, i.e.
+    // independent of Shift / level modifiers ('j' stays 'j' with Shift held).
+    // Binding matching uses this so a held Shift counts only as a modifier
+    // bit, not as a different symbol. Returns 0 if unbuilt / no symbol.
+    uint32_t baseKeysym(uint32_t evdevKeycode) const;
 
   private:
     ::xkb_context* ctx_ = nullptr;

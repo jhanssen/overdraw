@@ -657,6 +657,52 @@ pluginBus.subscribe("window.close-requested", () => {
   const top = state.surfaces.get(focused)?.xdgSurface?.toplevel;
   if (top && !top.destroyed) state.events.xdg_toplevel.send_close(top);
 });
+
+// The focus.next / focus.prev actions emit this; cycle keyboard focus
+// through the WM's toplevel stack (wrapping) and apply it directly via the
+// seat (an explicit user command, not a focus-plugin policy decision).
+pluginBus.subscribe("focus.cycle-requested", (_n, payload) => {
+  if (!state?.seat || !state.wm) return;
+  const dir = (payload as { direction?: unknown }).direction;
+  if (dir !== "next" && dir !== "prev") return;
+  const order = state.wm.focusOrder();
+  if (order.length === 0) return;
+  const cur = state.seat.kbFocus?.surfaceId ?? null;
+  const i = cur === null ? -1 : order.indexOf(cur);
+  const n = order.length;
+  let next: number;
+  if (i < 0) {
+    next = dir === "next" ? order[0] : order[n - 1];
+  } else {
+    next = dir === "next" ? order[(i + 1) % n] : order[(i - 1 + n) % n];
+  }
+  state.seat.applyKeyboardFocus(next);
+});
+
+// The layout.promote / swap-next / swap-prev actions emit this; reorder the
+// keyboard-focused window in the WM stack (the WM schedules the relayout).
+pluginBus.subscribe("layout.reorder-requested", (_n, payload) => {
+  if (!state?.seat || !state.wm) return;
+  const op = (payload as { op?: unknown }).op;
+  if (op !== "promote" && op !== "swap-next" && op !== "swap-prev") return;
+  const focused = state.seat.kbFocus?.surfaceId;
+  if (typeof focused !== "number") return;
+  state.wm.reorder(focused, op);
+});
+
+// The layout.grow-master / shrink-master actions emit this; route the
+// relative delta to the active layout plugin's setParams and relayout.
+// No-op (logged) if the active layout plugin doesn't implement setParams.
+pluginBus.subscribe("layout.master-fraction-requested", (_n, payload) => {
+  const delta = (payload as { delta?: unknown }).delta;
+  if (typeof delta !== "number" || !runtime) return;
+  void runtime.invokeNamespace("layout", "setParams", [{ masterFractionDelta: delta }])
+    .then(() => { state?.relayout?.("param-changed"); })
+    .catch((e: unknown) => {
+      console.warn(`[overdraw] layout.setParams failed: ${(e as Error).message}`);
+    });
+});
+
 const { buildResolver } = await import("./plugins/deferred-refs.js");
 const deferredRefResolver = buildResolver({
   surfaceUnderPointer: () => state?.seat?.focus?.surfaceId ?? null,
