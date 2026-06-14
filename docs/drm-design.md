@@ -328,7 +328,8 @@ SetOutputMode {
   width       // pixel dimensions of the target mode
   height
   refreshMhz  // 0 = "any mode at this width/height" (GPU picks)
-  scale       // logical scale (1 in v1; placeholder for HiDPI)
+  scale       // unused: output scale is core policy (config/EDID), not a
+              // gpu-side mode property -- see status.md "HiDPI / output scaling"
   transform   // normal in v1; placeholder for 90/180/270/flipped
 }
 → result:
@@ -430,8 +431,10 @@ output:
 
 - The GPU process reads the connector's EDID (`drmModeGetConnector` →
   EDID blob → parse make/model/serial/physical size) and the active
-  mode (width, height, refresh, scale=1 in v1) and sends the result
-  to the core in a new "OutputDescriptor" side-channel message.
+  mode (width, height, refresh; device pixels) and sends the result to
+  the core in the "OutputDescriptor" side-channel message. The GPU reports
+  scale=1; the core derives the effective output scale from config /
+  EDID DPI (see status.md "HiDPI / output scaling").
 - The core's `state.outputs` registry (already added for `xdg-output`
   per status.md) receives the descriptor and re-emits `wl_output`
   events to bound clients.

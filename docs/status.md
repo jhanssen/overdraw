@@ -4,7 +4,11 @@ Ground truth for what exists right now: current capabilities, known gaps, and
 what remains. The design lives in `architecture.md`; this file does not restate
 it. Present-tense only — no change history.
 
-Last updated: 2026-06-13 (post-slice-9 of phase-2 DRM/KMS work — flip-driven frame loop + tiled scanout. The 60Hz `uv_timer` trigger is gone: the core now wakes on `ScanoutFlipComplete` (KMS) and `FrameComplete` (nested-host `wl_surface.frame`) and dispatches the JS render from `runFrameIfReady` when a subsystem has set `wantNext` (animation, transition, intercept, client commit, etc.). Idle scenes draw zero frames. `onFrameComplete` runs `Server::drainEvents` before the render so a client commit that arrived between the last server-pump and the page-flip event is visible to `dispatchFrameCallbacks` this vsync, not next. Scanout buffers pick the first single-plane modifier the kernel advertises (typically `I915_FORMAT_MOD_X_TILED` on this Intel iGPU), with `DRM_FORMAT_MOD_LINEAR` as last fallback — the previous LINEAR-only choice forced render-to-scanout through the non-tiled GPU path, pushing the frame fence past the kernel's vblank deadline and capping a client-paced 256×256 shm-burst client at 80 commits/sec on a 165Hz panel; tiled scanout puts the fence under one vsync, same client now lands at ~154 commits/sec. Slices 1-7 remain in place; KMS still has no automated coverage. All 1016 unit tests pass. Design: `docs/drm-design.md`.
+Last updated: 2026-06-14 (HiDPI: device/logical coordinate split + integer
+`set_buffer_scale` + fractional `wp_viewporter`/`wp_fractional_scale_v1`,
+EDID-DPI scale auto-derivation, config `output.scale`; plus KMS card
+auto-detect and adapter↔card GPU matching. See "HiDPI / output scaling".
+All 1031 unit tests pass. Earlier: post-slice-9 of phase-2 DRM/KMS work — flip-driven frame loop + tiled scanout. The 60Hz `uv_timer` trigger is gone: the core now wakes on `ScanoutFlipComplete` (KMS) and `FrameComplete` (nested-host `wl_surface.frame`) and dispatches the JS render from `runFrameIfReady` when a subsystem has set `wantNext` (animation, transition, intercept, client commit, etc.). Idle scenes draw zero frames. `onFrameComplete` runs `Server::drainEvents` before the render so a client commit that arrived between the last server-pump and the page-flip event is visible to `dispatchFrameCallbacks` this vsync, not next. Scanout buffers pick the first single-plane modifier the kernel advertises (typically `I915_FORMAT_MOD_X_TILED` on this Intel iGPU), with `DRM_FORMAT_MOD_LINEAR` as last fallback — the previous LINEAR-only choice forced render-to-scanout through the non-tiled GPU path, pushing the frame fence past the kernel's vblank deadline and capping a client-paced 256×256 shm-burst client at 80 commits/sec on a 165Hz panel; tiled scanout puts the fence under one vsync, same client now lands at ~154 commits/sec. Slices 1-7 remain in place; KMS still has no automated coverage. Design: `docs/drm-design.md`.
 
 ## Read first: gaps in advertised protocols (silent-gap risks)
 
@@ -97,10 +101,11 @@ with no error. Worst-first.
   works for both in-thread and Worker plugins.
 
 - **Advertised-absent (clean fallback, not gaps):**
-  fractional-scale, text-input, xdg-activation, toplevel-icon,
+  text-input, xdg-activation, toplevel-icon,
   system-bell. Clients warn and fall back. See the protocol-coverage matrix.
-  (`wp_cursor_shape_v1` and `zxdg_decoration_manager_v1` are now advertised;
-  see their sections.)
+  (`wp_cursor_shape_v1`, `zxdg_decoration_manager_v1`, `wp_viewporter`, and
+  `wp_fractional_scale_manager_v1` are now advertised; see their sections and
+  "HiDPI / output scaling".)
 
 ## Verification environment
 
@@ -268,7 +273,7 @@ instance; a wrapped device is borrowed, not destroyed). Built with
   the master-stack rects, fill their tiles via the configure→resize loop, do not
   overlap, and survivors reflow on unmap.
 
-Still absent: per-surface transforms/opacity/rotation/scale, fractional scale,
+Still absent: per-surface transforms/opacity/rotation/scale,
 multi-output, damage, floating windows, fullscreen/maximize, workspaces/tags,
 compositor keybindings (no general key interception yet beyond the VT-switch
 chord — every other key is forwarded to the focused client). `wl_output` now
@@ -401,11 +406,64 @@ bind + re-emit + destroyed-resource scrub: `test/wl-output.test.js` (8
 tests), `test/xdg-output.test.js` (8 tests including the 4 added for
 re-emit).
 
-Out of scope today: HiDPI fractional scale (`wp_fractional_scale_v1` not
-advertised); multi-output (single OUTPUT_DEFAULT entry; the registry is
-sized for many, no second binding yet); KMS-side mode changes
+HiDPI scaling (integer + fractional) is implemented -- see "HiDPI / output
+scaling". Out of scope today: multi-output (single OUTPUT_DEFAULT entry; the
+registry is sized for many, no second binding yet); KMS-side mode changes
 (`SetOutputMode` core→gpu request from drm-design.md is not wired — only
 the gpu→core direction is). Subpixel hint is hardcoded UNKNOWN.
+
+## HiDPI / output scaling
+
+The compositor works in two pixel spaces: **device** pixels (the scanout /
+render target) and **logical** pixels (everything client-facing: WM layout,
+`xdg_toplevel.configure` sizes, `xdg-output`, pointer coordinates). The bridge
+is the output **scale**: `logical = round(device / scale)`. There is no
+intermediate logical-resolution framebuffer -- each surface's buffer is
+sampled directly into its `logical_rect × scale` device rectangle, so a
+scale-aware client is pixel-perfect and a non-cooperating client is upscaled
+(correct size, soft).
+
+**Scale selection** is core policy (`src/output/scale.ts`, `resolveScale`):
+an explicit `output.scale` config value wins; otherwise an EDID-DPI auto
+fallback (KMS only -- a nested host window's physical dims describe the host
+monitor, not our render target); otherwise 1. The fallback snaps DPI/96 to
+quarter steps, clamped to [1,3]. `onOutputDescriptor` treats the descriptor
+dims as device pixels, computes scale + logical, and routes device → the
+compositor render target, logical → WM/input/xdg-output.
+
+**Client negotiation** (no per-client branching in the compositor; clients
+self-select a tier and we sample uniformly):
+
+- **Integer** (`wl_surface.set_buffer_scale`, double-buffered): the surface's
+  intrinsic logical size = buffer dims / buffer scale. `wl_output.mode`
+  reports device pixels; `wl_output.scale` reports the integer ceiling of the
+  (possibly fractional) scale, so integer-only clients oversample and stay
+  crisp.
+- **Fractional** (`wp_fractional_scale_v1` + `wp_viewporter`): the compositor
+  sends `preferred_scale = round(scale × 120)` (re-emitted on scale change);
+  the client renders a denser buffer and declares its logical size via
+  `wp_viewport.set_destination`, which overrides the surface's logical size.
+  `wp_viewport.set_source` crops the sampled buffer region (→ compositor
+  `cropUV`). Both are double-buffered on `wl_surface.commit`.
+
+`xdg_output.logical_size` reports logical; `wl_output.mode` reports device.
+Surface placement uses the WM-assigned logical layout for toplevels, else the
+viewport destination, else buffer/bufferScale.
+
+**Verified** on the 2560×1600 @165Hz Intel panel: `output.scale=2` (integer,
+kitty) and `output.scale=1.5` (fractional, kitty) both render crisp at the
+correct logical size; default (no config) auto-derives ~2.0 from EDID. Unit
+coverage: `output-scale.test.js`, `wl-surface-buffer-scale.test.js`,
+`wp-viewporter.test.js`, `wp-fractional-scale.test.js`, plus `config.test.js`
+(`output.scale`).
+
+**Known gaps (deferred):** the software cursor is correct-size but **soft** at
+scale>1 (a 1× bitmap upscaled -- needs a device-density cursor resolve + the
+internal cursor's buffer scale; the theme resolver already takes a `scale`
+arg, only 1 is passed). The subsurface logical-sizing render path is covered
+at the protocol layer but not by a scale-aware-subsurface GPU test. Nested
+mode does not auto-derive scale (config only). `wl_surface.set_buffer_transform`
+remains a no-op (rotation/flip unhandled).
 
 ## KMS scanout backend (`--backend=kms`)
 
@@ -654,8 +712,9 @@ Output size on resize is propagated to the input backend via
 `addon.updateOutputSize`, called from main.ts's onOutputDescriptor callback
 (see "Output reconfiguration" below); both `WaylandInputBackend` and
 `LibinputBackend` update their pointer-mapping / cursor-clamp rect from it.
-Scale is still 1 (HiDPI fractional / integer scale is not applied to pointer
-coordinates yet).
+The rect is the LOGICAL output size (device / scale), so pointer coordinates
+are in logical space end-to-end (matching surface placement + hit-testing).
+See "HiDPI / output scaling".
 
 Limitations: touch not forwarded; no keymap translation at this layer (raw
 evdev codes). The libinput backend has no per-backend unit test in this
@@ -3263,9 +3322,17 @@ per-surface render state primitives (`compositor-fx.gpu.mjs`).
   (taskbar protocol; window list + state observation + inbound state
   requests routed through wm.propose; unit-tested wire shape, no GPU
   test client today).
+- **HiDPI (unit-tested + hardware-verified, no automated GPU test)**:
+  `wl_surface.set_buffer_scale` (double-buffer + compositor propagation +
+  invalid-drop), `wp_viewporter`/`wp_viewport` (one-per-surface, double-buffered
+  set_source/set_destination apply, validation, destroy-clears),
+  `wp_fractional_scale_manager_v1`/`wp_fractional_scale_v1` (preferred_scale
+  value + re-emit + untrack). Crisp rendering at `output.scale` 2 (integer) and
+  1.5 (fractional) confirmed by eye on the Intel panel; the scale-aware
+  subsurface render path has no GPU test. See "HiDPI / output scaling".
 - **Implemented, not behaviorally tested**: `wl_region` (no-op stub);
   `zwp_linux_dmabuf_feedback_v1` (exercised by real WSI clients, no automated
-  assertion).
+  assertion); `wl_surface.set_buffer_transform` (no-op).
 
 ### Headless mode
 
@@ -3294,7 +3361,8 @@ The real launcher passes no headless arg → stays nested + presents on screen.
 `$XDG_CONFIG_HOME/overdraw/config.*` then `~/.config/overdraw/config.*`, probing
 `.ts/.cts/.mts/.js/.cjs/.mjs` (Node 24 native type-stripping, no transpile).
 Default export may be an object or a (sync/async) function. Validates
-`focus`/`output`; the launcher applies them. The `plugins` array is parsed,
+`focus`/`output` (`output.width`/`height`, `output.card` for the KMS DRM
+node, `output.scale` for HiDPI); the launcher applies them. The `plugins` array is parsed,
 validated, resolved, and consumed by the runtime (module paths resolve relative to
 the config file's dir); bundled plugins (from
 `packages/core/src/plugins/bundled.ts`) are resolved separately and load
