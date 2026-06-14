@@ -551,8 +551,9 @@ that swaps.
 
 - New `Seat` class (libseat wrapper) in the core.
 - New `LibinputBackend` in the core, parallel to
-  `WaylandInputBackend`. Selectable via env var
-  (`OVERDRAW_INPUT_BACKEND=libinput|wayland`).
+  `WaylandInputBackend`. Paired with the output backend (no separate
+  env var): `--backend=kms` uses libinput, `--backend=nested` uses
+  `WaylandInputBackend`.
 - Add to CMake; minimal config-driven enable.
 
 Validation: run the existing nested compositor on the remote box from

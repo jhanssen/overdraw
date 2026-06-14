@@ -527,11 +527,12 @@ doubles + raw evdev keycodes + ms timestamps, `InputSink`, `InputBackend`).
 is the bare-metal sibling: opens `/dev/input/event*` via libseat, reads from
 libinput's pollable fd on the same libuv loop, accumulates relative pointer
 motion into output-space coordinates with bounds clamping, and emits the same
-`InputEvent`s (raw evdev keycodes, no XKB +8 offset). Selectable at startup via
-`OVERDRAW_INPUT_BACKEND=libinput|wayland` (default `wayland`); libinput requires
-the build option `OVERDRAW_KMS=ON` (default ON on Linux). The addon drains the
-backend on the Node thread (`uv_poll_t`) and delivers to an optional `onInput`
-JS callback.
+`InputEvent`s (raw evdev keycodes, no XKB +8 offset). The input backend is
+paired with the output backend (no separate selector): `--backend=kms` uses
+`LibinputBackend`, `--backend=nested` uses `WaylandInputBackend`. libinput
+requires the build option `OVERDRAW_KMS=ON` (default ON on Linux). The addon
+drains the backend on the Node thread (`uv_poll_t`) and delivers to an
+optional `onInput` JS callback.
 
 Seat acquisition (`native/core/seat.{h,cpp}`) wraps libseat. libseat picks its
 backend (logind or seatd) per `LIBSEAT_BACKEND`. For headless / SSH dev where

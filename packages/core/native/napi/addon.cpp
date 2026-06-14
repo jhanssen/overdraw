@@ -56,11 +56,12 @@ struct Addon {
     std::unique_ptr<Server> server;
     std::unique_ptr<InterfaceRegistry> registry;
     std::unique_ptr<Trampoline> trampoline;
-    // The active input backend. Today either a WaylandInputBackend (nested,
-    // input forwarded from the GPU process) or a LibinputBackend (bare metal,
-    // reads /dev/input/* via libseat). Exactly one is active per Start(). The
-    // wayland pointer is kept separately for the injectHostInput test seam,
-    // which only applies to the nested path.
+    // The active input backend, paired with the output backend:
+    //   backend=kms    -> LibinputBackend (reads /dev/input/* via libseat).
+    //   backend=nested -> WaylandInputBackend (events forwarded from the GPU
+    //                     process's host wl_seat).
+    // Exactly one is active per Start(). The wayland pointer is kept separately
+    // for the injectHostInput test seam, which only applies to the nested path.
     std::unique_ptr<overdraw::core::InputBackend> input;
     WaylandInputBackend* waylandInput = nullptr;  // non-owning; points into `input` when active
 #if OVERDRAW_KMS
@@ -659,37 +660,15 @@ napi_value Start(napi_env env, napi_callback_info info) {
     uv_poll_init(loop, &g_addon.ctrlPoll, g_addon.compositor->ctrlFd());
     uv_poll_start(&g_addon.ctrlPoll, UV_READABLE, onCtrlReadable);
 
-    // Input backend selection. Default: WaylandInputBackend (events forwarded
-    // from the GPU process's host wl_seat). OVERDRAW_INPUT_BACKEND=libinput
-    // selects the bare-metal path (libseat + libinput on /dev/input/*); this
-    // requires OVERDRAW_KMS=ON at build and a working logind session at run.
-    // The seat itself is unused for display in slice 1 -- the existing nested
-    // output path stays in place. Slices 4-7 will reuse this seat for DRM.
-    const char* inputBackendEnv = ::getenv("OVERDRAW_INPUT_BACKEND");
-    const bool wantLibinput = inputBackendEnv && std::strcmp(inputBackendEnv, "libinput") == 0;
-
-    if (wantLibinput) {
+    // Input backend follows the output backend: KMS uses libinput (the seat
+    // already opened above for the DRM card opens evdev devices on libinput's
+    // behalf); nested uses WaylandInputBackend (host-forwarded events from the
+    // GPU process's host wl_seat). Headless has no display and no input source
+    // on libuv -- it accepts injected events via injectHostInput from tests.
+    if (wantKms) {
 #if OVERDRAW_KMS
-        g_addon.seat = std::make_unique<overdraw::core::Seat>();
-        // Slice 1: no VT-switch handling yet. The callbacks just track state;
-        // slice 7 wires the GPU-process pause/resume side-channel messages.
-        if (!g_addon.seat->open(/*onEnable*/ nullptr, /*onDisable*/ nullptr)) {
-            const std::string err = "libseat open failed: " + g_addon.seat->error();
-            g_addon.seat.reset();
-            g_addon.compositor.reset();
-            if (g_addon.inputFd >= 0) { ::close(g_addon.inputFd); g_addon.inputFd = -1; }
-            return throwError(env, err.c_str());
-        }
-        // libseat needs its event fd dispatched on libuv. Synchronously poll
-        // once so the initial enable_seat fires before we open devices.
-        g_addon.seat->dispatch();
-        if (!g_addon.seat->isActive()) {
-            const std::string err = "libseat opened but seat not active (logind session?)";
-            g_addon.seat.reset();
-            g_addon.compositor.reset();
-            if (g_addon.inputFd >= 0) { ::close(g_addon.inputFd); g_addon.inputFd = -1; }
-            return throwError(env, err.c_str());
-        }
+        // The seat is already open (KMS bring-up above opened it for the DRM
+        // card). Reuse it for libinput device opens.
         const std::string seatName = g_addon.seat->name();
         auto libiBackend = std::make_unique<overdraw::core::LibinputBackend>(
             *g_addon.seat, seatName,
@@ -697,6 +676,16 @@ napi_value Start(napi_env env, napi_callback_info info) {
             g_addon.compositor->windowHeight());
         if (!libiBackend->init()) {
             const std::string err = "libinput init failed: " + libiBackend->error();
+            // Mirror the bringUp() failure cleanup above: release the DRM card
+            // and the seat so a retry sees a clean slate.
+            if (g_addon.drmCardFd >= 0) {
+                if (g_addon.drmCardDeviceId >= 0)
+                    g_addon.seat->closeDevice(g_addon.drmCardDeviceId);
+                ::close(g_addon.drmCardFd);
+                g_addon.drmCardFd = -1;
+                g_addon.drmCardDeviceId = -1;
+            }
+            g_addon.seat->close();
             g_addon.seat.reset();
             g_addon.compositor.reset();
             if (g_addon.inputFd >= 0) { ::close(g_addon.inputFd); g_addon.inputFd = -1; }
@@ -715,13 +704,13 @@ napi_value Start(napi_env env, napi_callback_info info) {
             g_addon.seatPollActive = true;
         }
 
-        // The input socket forwarded from the GPU process is unused on the
-        // libinput path; close it so it doesn't accumulate.
+        // The input socket forwarded from the GPU process carries no events
+        // in KMS mode (no host wl_seat on that side); close it.
         if (g_addon.inputFd >= 0) { ::close(g_addon.inputFd); g_addon.inputFd = -1; }
 #else
         g_addon.compositor.reset();
         if (g_addon.inputFd >= 0) { ::close(g_addon.inputFd); g_addon.inputFd = -1; }
-        return throwError(env, "OVERDRAW_INPUT_BACKEND=libinput but build has OVERDRAW_KMS=OFF");
+        return throwError(env, "backend=kms but build has OVERDRAW_KMS=OFF");
 #endif
     } else if (g_addon.inputFd >= 0) {
         // Nested input backend: maps host-forwarded events to normalized
