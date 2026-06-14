@@ -47,6 +47,16 @@ function quads() {
   return { data: buf, stride };
 }
 
+// 64x64 solid-color buffer (BGRA channel order matching quads()).
+function solid(c) {
+  const w = 64, h = 64, stride = w * 4;
+  const buf = new Uint8Array(stride * h);
+  for (let i = 0; i < w * h; i++) {
+    buf[i * 4] = c[0]; buf[i * 4 + 1] = c[1]; buf[i * 4 + 2] = c[2]; buf[i * 4 + 3] = c[3];
+  }
+  return { data: buf, stride };
+}
+
 test("wp_viewport source crop: conversion, orientation, size-from-source",
   { skip: !dawn ? "dawn.node not built" : false }, async () => {
   const { JsCompositor } = await import(join(OD, "dist", "gpu", "compositor.js"));
@@ -73,7 +83,17 @@ test("wp_viewport source crop: conversion, orientation, size-from-source",
     up(3); comp.setSurfaceLayout(3, 0, 64, 0, 0);
     comp.setSurfaceViewport(3, null, { x: 0, y: 0, width: 32, height: 32 });
 
-    comp.setStack([1, 2, 3]);
+    // S4 @ tile (64,64,64,64), solid red, viewport DESTINATION 64x32 (half the
+    // tile height) and no source crop. A destination is the surface's declared
+    // logical size, so it overrides the tile: the surface draws 64x32 at the
+    // tile origin (top half red), NOT stretched to fill the 64x64 tile (the
+    // bottom half stays background). This is the media-player letterbox case.
+    const red = solid(RED);
+    comp.uploadPixels(4, { width: 64, height: 64, stride: red.stride }, red.data);
+    comp.setSurfaceLayout(4, 64, 64, 64, 64);
+    comp.setSurfaceViewport(4, { width: 64, height: 32 }, null);
+
+    comp.setStack([1, 2, 3, 4]);
     comp.renderFrame();
     const { data } = await comp.readback();
     const px = (x, y) => { const i = (y * W + x) * 4; return [data[i], data[i + 1], data[i + 2], data[i + 3]]; };
@@ -89,6 +109,11 @@ test("wp_viewport source crop: conversion, orientation, size-from-source",
     assert.deepEqual(px(8, 72), RED, "S3: inside 32x32 = cropped red");
     assert.deepEqual(px(40, 72), BLACK, "S3: x>32 outside surface = black");
     assert.deepEqual(px(8, 104), BLACK, "S3: y>32 outside surface = black");
+    // S4: viewport destination overrides the tile -> 64x32 red filling the top
+    // half of the tile, the bottom half background (not stretched to 64x64).
+    assert.deepEqual(px(72, 72), RED, "S4: inside dst (top) = red");
+    assert.deepEqual(px(120, 72), RED, "S4: dst spans full tile width");
+    assert.deepEqual(px(72, 110), BLACK, "S4: below 32px dst = background (not stretched to fill)");
   } finally {
     addon.stop();
   }

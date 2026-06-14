@@ -1428,14 +1428,23 @@ export class JsCompositor implements CompositorSink {
     },
   ): void {
     if (!s.uniformBuf) return;
-    // A surface with no WM-assigned layout (subsurface, overlay, cursor) falls
-    // back to its intrinsic logical size: a wp_viewport destination overrides
-    // it, else buffer dims / buffer scale -- so a HiDPI buffer is placed at its
-    // logical extent, not its device extent.
+    // Placement size policy: a surface fills its WM-assigned tile
+    // (layoutW/layoutH) by default, falling back to its intrinsic logical size
+    // when it has no layout (subsurface, overlay, cursor). The exception is an
+    // explicit wp_viewport destination: that sets the surface's logical size,
+    // so it overrides the tile and the surface is drawn at the destination
+    // size, positioned at the tile origin -- a client that declares a logical
+    // size smaller than its tile (e.g. a media player sizing its surface to
+    // the video via a viewport destination) is drawn at that size, not
+    // stretched to fill. A source crop without a destination does NOT shrink
+    // the surface: the cropped region scales to the tile (the layout still
+    // sizes the window).
+    //
     // Intrinsic logical size precedence (wp_viewport): destination size wins;
     // else the source crop's size (the crop rect is in surface coords, so its
     // dimensions are already logical -- a non-integer src here is bad_size,
-    // silent-dropped); else buffer dims / buffer scale.
+    // silent-dropped); else buffer dims / buffer scale (so a HiDPI buffer is
+    // placed at its logical extent, not its device extent).
     const bs = s.bufferScale || 1;
     // 90/270 (and their flipped variants) swap the buffer's axes relative to
     // the surface, so the buffer-derived logical size uses swapped dims. A
@@ -1448,8 +1457,11 @@ export class JsCompositor implements CompositorSink {
     const intrinsicH = s.viewportDst?.height ?? s.viewportSrc?.height ?? bh / bs;
     const px = overrides?.placement?.x ?? s.x;
     const py = overrides?.placement?.y ?? s.y;
-    const pw = overrides?.placement?.w ?? (s.layoutW || intrinsicW);
-    const ph = overrides?.placement?.h ?? (s.layoutH || intrinsicH);
+    // A wp_viewport destination is the surface's declared logical size; it wins
+    // over the tile. Otherwise the tile sizes the surface, falling back to the
+    // intrinsic size when there is no layout.
+    const pw = overrides?.placement?.w ?? (s.viewportDst ? intrinsicW : (s.layoutW || intrinsicW));
+    const ph = overrides?.placement?.h ?? (s.viewportDst ? intrinsicH : (s.layoutH || intrinsicH));
     const fx = s.fx;
     const data = new Float32Array(UNIFORM_FLOATS);
     // placement

@@ -82,7 +82,7 @@ test('deferInitialCommit: no configure fires during addWindow + propose phase', 
   assert.equal(configures.length, 0); // still suppressed
 });
 
-test('markInitialCommitComplete: forces a single configure with the resolved size', async () => {
+test('markInitialCommitComplete: throwaway 0x0 first configure; real size on first content', async () => {
   const configures = [];
   const wm = createWm(mockSink(), { width: 1000, height: 600 }, {
     configure: (id, w, h) => configures.push({ id, w, h }),
@@ -91,8 +91,13 @@ test('markInitialCommitComplete: forces a single configure with the resolved siz
   wm.addWindow(1, res(1), { deferInitialCommit: true });
   await wm.settled();
   await wm.markInitialCommitComplete(1, { appId: null, title: null });
-  assert.equal(configures.length, 1);
-  assert.deepEqual(configures[0], { id: 1, w: 1000, h: 600 });
+  // First configure is the throwaway 0x0: the client gets a serial to ack and
+  // may pick its own size; the real tile size lands as the SECOND configure.
+  assert.deepEqual(configures, [{ id: 1, w: 0, h: 0 }]);
+  // First content commit -> the real tile size goes out as a resize.
+  wm.windowHasContent(1);
+  assert.deepEqual(configures.at(-1), { id: 1, w: 1000, h: 600 });
+  assert.equal(configures.length, 2);
 });
 
 test('markInitialCommitComplete: subsequent layout changes resume configure flow', async () => {

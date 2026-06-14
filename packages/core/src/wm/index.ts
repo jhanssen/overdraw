@@ -90,6 +90,12 @@ export interface Window {
   // any modifications, and forces a configure with the resolved size.
   // Default false; production opts in via addWindow(..., {deferInitialCommit:true}).
   pendingInitialCommit?: boolean;
+  // Set when markInitialCommitComplete has sent the throwaway 0x0 first
+  // configure and the real tile size is still owed. windowHasContent() sends
+  // that size as the SECOND configure (a resize) once the client commits
+  // content -- clients that ignore the geometry of their first configure
+  // (some media players size to their own content) honor the resize.
+  pendingSizeConfigure?: boolean;
   // Behavioral state (presentation, layoutMode, layoutData, constraints,
   // parent, restoreRect). Mutated only through propose().
   windowState: WindowState;
@@ -568,6 +574,13 @@ export function createWm(
         win.hasContent = true;
         compositor.setSurfaceLayout(win.surfaceId, win.rect.x, win.rect.y, win.rect.width, win.rect.height);
         pushStack();
+        // Real tile size as the second configure (a resize) after the throwaway
+        // 0x0 sent at the initial commit. See pendingSizeConfigure.
+        if (win.pendingSizeConfigure && configure) {
+          win.pendingSizeConfigure = false;
+          const content = contentOf(win);
+          configure(win.surfaceId, content.width, content.height);
+        }
       }
       return { ...win.rect };
     },
@@ -789,12 +802,15 @@ export function createWm(
         await driver.settled();
         if (!windows.includes(win)) return;
 
-        // Force the initial configure. applyLayout normally only fires
-        // configure when content size changed, but the first configure
-        // must ALWAYS go out so the client has a serial to ack.
+        // Send a throwaway 0x0 first configure (the client picks its own size
+        // and gets a serial to ack). The real tile size follows as a SECOND
+        // configure from windowHasContent once the client has content -- a
+        // resize, which clients that ignore the geometry of their first
+        // configure honor. The 0x0 still carries the resolved state array
+        // (maximized/tiled), so the client knows it is tiled immediately.
         if (configure) {
-          const content = contentOf(win);
-          configure(win.surfaceId, content.width, content.height);
+          configure(win.surfaceId, 0, 0);
+          win.pendingSizeConfigure = true;
         }
       } finally {
         resolveSelf();

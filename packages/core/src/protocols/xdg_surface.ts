@@ -46,15 +46,29 @@ export function configureToplevel(ctx: Ctx, xs: XdgSurfaceRecord, width: number,
 function buildStatesArray(ctx: Ctx, xs: XdgSurfaceRecord): Uint8Array {
   const states: number[] = [];
   const id = xs.surface?.id;
+  // A managed (tiled) window is told it is maximized so the configured size is
+  // BINDING -- xdg-shell requires a maximized client to use the given size,
+  // whereas a stateless configure size is only advisory and the tiled states
+  // alone are advisory too (a media player honors 'maximized' but ignores
+  // 'tiled', and otherwise sizes its surface to its content). The four tiled
+  // edges are additionally advertised (v2+) so the client suppresses resize
+  // affordances on every side -- a master-stack tile is fully managed.
+  const tiledOk = (xs.toplevel?.version ?? 0) >= 2;
   if (id !== undefined && ctx.state.wm) {
     const ws = ctx.state.wm.getWindowState(id);
     if (ws) {
       switch (ws.presentation) {
         case "maximized": states.push(STATE.maximized); break;
         case "fullscreen": states.push(STATE.fullscreen); break;
-        // 'managed' and 'minimized' have no corresponding xdg_toplevel
-        // state. (Minimized clients aren't expected to render; we just
-        // exclude them from the layout.)
+        case "managed":
+          states.push(STATE.maximized);
+          if (tiledOk) {
+            states.push(STATE.tiled_left, STATE.tiled_right,
+                        STATE.tiled_top, STATE.tiled_bottom);
+          }
+          break;
+        // 'minimized' clients aren't expected to render (excluded from the
+        // layout); 'floating' is free-floating, not tiled. Neither gets a state.
       }
     }
   }

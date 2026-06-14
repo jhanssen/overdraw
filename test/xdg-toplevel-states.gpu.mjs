@@ -21,31 +21,37 @@ const STATE_ACTIVATED = 4;
 
 const OUT = { width: 1280, height: 720 };
 
-test("set_maximized before initial commit: first configure carries full output size + maximized state", { skip }, async () => {
+// Parse a harness-client configure log line into { w, h, states }.
+function parseConfigure(line) {
+  const m = line.match(/configure (\d+)x(\d+) states=\[([^\]]*)\]/);
+  if (!m) return null;
+  return {
+    w: parseInt(m[1], 10),
+    h: parseInt(m[2], 10),
+    states: m[3].length ? m[3].split(",").map((s) => parseInt(s, 10)) : [],
+  };
+}
+
+test("set_maximized before initial commit: state known from the first configure; full size follows", { skip }, async () => {
   const c = await setupCompositor({ headless: OUT });
   try {
     const cl = c.spawnClient(["--initial-state", "maximized"]);
     await cl.ready;
 
-    // The client logs each configure with the states array. The FIRST
-    // configure must already carry full-output size + maximized state
-    // (this is the no-flicker contract: the client renders at the right
-    // size + state from frame zero, never at a wrong-state intermediate).
-    // Subsequent reconfigures are fine; we only assert the first.
-    const configures = cl.stdout.split("\n").filter((l) => /\[harness-client\] configure /.test(l));
-    assert.ok(configures.length >= 1,
-      `expected at least one configure; got ${configures.length}`);
-    const m = configures[0].match(/configure (\d+)x(\d+) states=\[([^\]]*)\]/);
-    assert.ok(m, `couldn't parse configure line: ${configures[0]}`);
-    const w = parseInt(m[1], 10);
-    const h = parseInt(m[2], 10);
-    const states = m[3].length ? m[3].split(",").map((s) => parseInt(s, 10)) : [];
-    assert.equal(w, OUT.width,
-      `first configure width should match output (${OUT.width}); got ${w}`);
-    assert.equal(h, OUT.height,
-      `first configure height should match output (${OUT.height}); got ${h}`);
-    assert.ok(states.includes(STATE_MAXIMIZED),
-      `first configure states array should include maximized (${STATE_MAXIMIZED}); got [${states.join(",")}]`);
+    // The first configure is a throwaway 0x0 (the client gets a serial to ack
+    // and may pick its own size), but it ALREADY carries the resolved state
+    // array -- so the client never renders at a wrong state. The full output
+    // size then arrives as a follow-up configure (the binding resize).
+    const configures = cl.stdout.split("\n")
+      .filter((l) => /\[harness-client\] configure /.test(l)).map(parseConfigure);
+    assert.ok(configures.length >= 1, `expected at least one configure; got ${configures.length}`);
+    assert.ok(configures[0].states.includes(STATE_MAXIMIZED),
+      `first configure should carry maximized (${STATE_MAXIMIZED}); got [${configures[0].states.join(",")}]`);
+    const sized = configures.find((cfg) => cfg.w > 0 && cfg.h > 0);
+    assert.ok(sized, "expected a configure carrying a non-zero size");
+    assert.equal(sized.w, OUT.width, `sized configure width should match output; got ${sized.w}`);
+    assert.equal(sized.h, OUT.height, `sized configure height should match output; got ${sized.h}`);
+    assert.ok(sized.states.includes(STATE_MAXIMIZED), "sized configure should still carry maximized");
 
     // WM state agrees.
     const snap = c.query();
@@ -63,13 +69,16 @@ test("set_fullscreen before initial commit: configure has fullscreen state + ful
   try {
     const cl = c.spawnClient(["--initial-state", "fullscreen"]);
     await cl.ready;
-    const configures = cl.stdout.split("\n").filter((l) => /\[harness-client\] configure /.test(l));
+    const configures = cl.stdout.split("\n")
+      .filter((l) => /\[harness-client\] configure /.test(l)).map(parseConfigure);
     assert.ok(configures.length >= 1);
-    const m = configures[0].match(/configure (\d+)x(\d+) states=\[([^\]]*)\]/);
-    assert.equal(parseInt(m[1], 10), OUT.width);
-    assert.equal(parseInt(m[2], 10), OUT.height);
-    const states = m[3].length ? m[3].split(",").map((s) => parseInt(s, 10)) : [];
-    assert.ok(states.includes(STATE_FULLSCREEN));
+    // State is carried from the throwaway 0x0 first configure; full size follows.
+    assert.ok(configures[0].states.includes(STATE_FULLSCREEN));
+    const sized = configures.find((cfg) => cfg.w > 0 && cfg.h > 0);
+    assert.ok(sized, "expected a configure carrying a non-zero size");
+    assert.equal(sized.w, OUT.width);
+    assert.equal(sized.h, OUT.height);
+    assert.ok(sized.states.includes(STATE_FULLSCREEN));
     const snap = c.query();
     const ws = c.state.wm.getWindowState(snap.windows[0].surfaceId);
     assert.equal(ws.presentation, "fullscreen");
@@ -78,17 +87,19 @@ test("set_fullscreen before initial commit: configure has fullscreen state + ful
   }
 });
 
-test("no initial-state request: configure has neither maximized nor fullscreen", { skip }, async () => {
+test("no initial-state request: managed/tiled window is told maximized (size-binding), not fullscreen", { skip }, async () => {
   const c = await setupCompositor({ headless: OUT });
   try {
     const cl = c.spawnClient([]);
     await cl.ready;
     const configures = cl.stdout.split("\n").filter((l) => /\[harness-client\] configure /.test(l));
     assert.ok(configures.length >= 1, "at least one configure expected");
-    // The first configure should NOT carry maximized or fullscreen.
+    // A managed window is tiled: it carries the maximized state so the
+    // compositor-assigned size is binding (clients otherwise size to content),
+    // but never fullscreen.
     const m = configures[0].match(/states=\[([^\]]*)\]/);
     const states = m[1].length ? m[1].split(",").map((s) => parseInt(s, 10)) : [];
-    assert.ok(!states.includes(STATE_MAXIMIZED));
+    assert.ok(states.includes(STATE_MAXIMIZED), "managed/tiled window is told maximized");
     assert.ok(!states.includes(STATE_FULLSCREEN));
     // Focus follows the client (single window), so activated may be present.
     // We don't assert on activated here; that's a separate concern.

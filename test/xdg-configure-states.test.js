@@ -1,7 +1,7 @@
 // Unit test for configureToplevel's states-array contents. The states array
-// in xdg_toplevel.configure must reflect the window's current presentation
-// (maximized -> [1], fullscreen -> [2], managed -> []) plus 'activated' (4)
-// when this window has keyboard focus.
+// in xdg_toplevel.configure reflects the window's current presentation
+// (maximized -> [1], fullscreen -> [2], managed -> the four tiled states on a
+// v2+ toplevel) plus 'activated' (4) when this window has keyboard focus.
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
@@ -50,7 +50,7 @@ function setup() {
     },
   };
   const surface = { id: 1 };
-  const toplevel = { id: 100 };
+  const toplevel = { id: 100, version: 6 };
   const xs = {
     resource: { id: 50 },
     toplevel,
@@ -62,13 +62,28 @@ function setup() {
 const STATE_MAXIMIZED = 1;
 const STATE_FULLSCREEN = 2;
 const STATE_ACTIVATED = 4;
+const STATE_TILED_LEFT = 5;
+const STATE_TILED_RIGHT = 6;
+const STATE_TILED_TOP = 7;
+const STATE_TILED_BOTTOM = 8;
+const TILED = [STATE_TILED_LEFT, STATE_TILED_RIGHT, STATE_TILED_TOP, STATE_TILED_BOTTOM];
 
-test('managed window with no focus: states is empty', async () => {
+test('managed window (v2+): maximized (size is binding) plus the four tiled edges', async () => {
   const s = setup();
   s.wm.addWindow(1, { resource: {} });
   configureToplevel(s.ctx, s.xs, 800, 600);
-  assert.deepEqual(s.getConfigure().states, []);
-  assert.deepEqual(s.getConfigure(), { w: 800, h: 600, states: [] });
+  assert.deepEqual(s.getConfigure().states.slice().sort(),
+    [STATE_MAXIMIZED, ...TILED].slice().sort());
+  assert.equal(s.getConfigure().w, 800);
+  assert.equal(s.getConfigure().h, 600);
+});
+
+test('managed window on a v1 toplevel: maximized only (tiled states are v2+)', async () => {
+  const s = setup();
+  s.xs.toplevel.version = 1;
+  s.wm.addWindow(1, { resource: {} });
+  configureToplevel(s.ctx, s.xs, 800, 600);
+  assert.deepEqual(s.getConfigure().states, [STATE_MAXIMIZED]);
 });
 
 test('maximized window: states contains maximized', async () => {
@@ -87,12 +102,13 @@ test('fullscreen window: states contains fullscreen', async () => {
   assert.deepEqual(s.getConfigure().states, [STATE_FULLSCREEN]);
 });
 
-test('focused window: states contains activated', async () => {
+test('focused managed window: maximized + tiled states + activated', async () => {
   const s = setup();
   s.wm.addWindow(1, { resource: {} });
   s.ctx.state.seat = { kbFocus: { surfaceId: 1 } };
   configureToplevel(s.ctx, s.xs, 800, 600);
-  assert.deepEqual(s.getConfigure().states, [STATE_ACTIVATED]);
+  assert.deepEqual(s.getConfigure().states.slice().sort(),
+    [STATE_MAXIMIZED, ...TILED, STATE_ACTIVATED].slice().sort());
 });
 
 test('maximized + focused: states contains both', async () => {
