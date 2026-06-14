@@ -4,7 +4,7 @@ Ground truth for what exists right now: current capabilities, known gaps, and
 what remains. The design lives in `architecture.md`; this file does not restate
 it. Present-tense only — no change history.
 
-Last updated: 2026-06-13 (post-slice-4+5 of phase-2 DRM/KMS work — bare-metal scanout. `--backend=kms` end-to-end: libseat opens `/dev/dri/cardN`, the GPU process runs DRM/atomic bring-up (connector + CRTC + primary plane + modeset), allocates a 3-slot GBM scanout ring at LINEAR modifier, dual-imports each slot as `wgpu::Texture` via `SharedTextureMemory`, and runs the JS compositor's render loop at vsync via page-flip-driven atomic commits with `IN_FENCE_FD` for explicit-sync. Verified on a 2560×1600 @165Hz Intel iGPU laptop: panel lights up at the compositor's clear color, clean shutdown. Reuses the existing producer/consumer SurfaceBuf machinery (with the consumer side empty -- kernel is the consumer, not a wgpu device) so in-band BeginAccess/EndAccess wire frames cover scanout brackets too. Production default is now KMS; tests default to nested when an output backend is needed. All 1006 unit + 129 GPU tests still pass. KMS path itself has no automated test coverage (manual verification only, with explicit user signoff). Slices 1-3 (libseat + libinput; output-backend seam; real wl_output + resize) remain in place. Design: `docs/drm-design.md`.
+Last updated: 2026-06-13 (post-slice-6 of phase-2 DRM/KMS work — interactive clients on bare-metal. Slice 6 connects the input backend to the output backend (`--backend=kms` ⇒ libinput on the same libseat handle that opened the DRM card; `--backend=nested` ⇒ host-forwarded `WaylandInputBackend`; no separate selector) and ships three other fixes that surfaced when real clients first ran on KMS: `acquireOutputTexture()`'s "no FREE slot" return value (`nullptr` from N-API arrives in JS as `undefined`, not `null`) is now correctly treated as "skip frame"; a SIGSEGV/SIGABRT handler in the core addon writes a backtrace to `/tmp/overdraw-core-crash.txt` (mirroring the GPU process); and the per-frame disconnect sweep now purges `kbFocus`/`focus` pointing at destroyed surfaces and removes destroyed `wl_keyboard`/`wl_pointer` resources from the per-client sets (libwayland recycles `wl_client*` pointer values across disconnects, so the second client on KMS or nested would inherit the dead client's keyboards and trip libwayland's cross-client-object check on the next focus change). Verified on the 2560×1600 @165Hz Intel iGPU laptop: a kitty window renders on the bare-metal panel and accepts keyboard + mouse input. All 1006 unit tests pass; KMS still has no automated coverage (manual verification only with explicit user signoff). Slices 1-5 (libseat + libinput; output-backend seam; real `wl_output`; KMS scanout) remain in place. Design: `docs/drm-design.md`.
 
 ## Read first: gaps in advertised protocols (silent-gap risks)
 
@@ -23,13 +23,17 @@ with no error. Worst-first.
 - **`wl_region` is a no-op stub.** `add`/`subtract` do nothing; opaque/input
   regions are not tracked (hit-testing uses whole-window rects). Low urgency.
 
-- **Frame clock is a ~16ms timer, not display-driven.** The architecture's frame
-  loop is event-driven off a display-side completion signal (host
-  `wl_surface.frame` in phase 1, KMS page-flip in phase 2). Today a `uv_timer`
-  paces render+present, which has no causal link to refresh and beats against real
-  vsync. This is a phase-1 shortcut because Dawn's WSI swapchain owns `Present` and
-  hides the host frame callback. See architecture.md "Frame clock" and "Phase-2
-  present".
+- **The JS render trigger is a ~16ms timer, not display-driven.** The
+  architecture's frame loop is event-driven off a display-side completion
+  signal (host `wl_surface.frame` in phase 1, KMS page-flip in phase 2).
+  Today a `uv_timer` paces the JS compositor's `renderFrame()` invocations in
+  both backends, with no causal link to refresh. On the KMS path the scanout-
+  slot state machine IS page-flip-driven (the slot ring advances on
+  `ScanoutFlipComplete`), and the JS render harmlessly skips a tick when
+  `acquireOutputTexture()` returns no FREE slot, so vsync is observed in
+  practice; but the trigger remains the timer. Phase-1 nested has neither the
+  flip-pacing nor the host `wl_surface.frame` callback. See architecture.md
+  "Frame clock" and "Phase-2 present".
 
 - **No `wl_resource_post_error` mechanism.** Requests that the spec defines
   as protocol errors (e.g. `zwlr_layer_surface_v1.invalid_size` when set_size
@@ -468,12 +472,18 @@ connector→CRTC link, CRTC mode blob, and CRTC active.
   skip tiled modifiers and use LINEAR (universally supported, single-
   plane). Tiled support is a perf follow-on requiring a multi-plane
   import path; until then scanout is slightly slower than it could be.
-- **No buffer-release-via-flip yet** (deferred to slice 6 per
-  `drm-design.md`). Today's `wl_buffer.release` is gated by
-  `onSubmittedWorkDone`, which is wrong for KMS in the presence of
-  clients — a client buffer can be released while still being scanned
-  out. **Latent in slice 4** because slice 4 has no clients. Slice 6
-  is where the gate change has to land, by design.
+- **`wl_buffer.release` is gated on `onSubmittedWorkDone`** (the
+  compositor's submit completing). The slice 4+5 commit message and
+  earlier revisions of `drm-design.md` claimed this was wrong for KMS
+  ("a client buffer can be released while still being scanned out"),
+  but the pipeline doesn't actually create that hazard: the compositor
+  samples each client dmabuf into the scanout-ring slot's texture; the
+  client buffer is read-only-input, not the scanout buffer itself.
+  Once the render submit completes, the client's pixels have been
+  consumed; what continues to be scanned out is the scanout slot, not
+  the client buffer. A future zero-copy direct-scanout path (client
+  dmabuf assigned to the plane) would resurrect this concern; until
+  then `onSubmittedWorkDone` is correct.
 - **No KMS coverage in the test suite** (per user direction, option A
   in the slice planning). KMS path verified only by manual run; tests
   use nested or headless. A future virtual-DRM (vkms) test harness

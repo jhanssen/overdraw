@@ -626,37 +626,74 @@ returns.
 This is the first time the project drives hardware. Everything from
 here on is layering existing functionality on top.
 
-Acknowledged deferral (NOT silent): `wl_buffer.release` is still gated
-by `onSubmittedWorkDone` (the JS compositor's submit-complete signal),
-not by the scanout-slot's flip-complete. That's the right gate for
-nested mode but wrong for KMS — a client buffer could be released
-back to its client while still being scanned out. The bug is latent
-in slice 4+5 because there ARE NO CLIENTS in the merged slice.
-Slice 6 (libinput → real clients on KMS) is where the gate change
-has to land, by design, because that's when client buffers start
-flowing through KMS. This is an explicit, user-approved deferral —
-not a silent gap.
+`wl_buffer.release` continues to be gated on `onSubmittedWorkDone`.
+Earlier drafts called this out as an "acknowledged deferral" with the
+reasoning that a client buffer could be released while still being
+scanned out. That reasoning was wrong given today's pipeline: the
+compositor samples each client dmabuf into the scanout-ring slot's
+texture (`acquireOutputTexture()` returns the slot texture; the render
+pass writes into it). The client buffer is read-only-input, not the
+scanout buffer itself. Once `onSubmittedWorkDone` resolves, the
+client's pixels have been consumed; what continues to be scanned out
+is the scanout slot, not the client buffer. If a future revision
+introduces zero-copy direct-scanout (a client dmabuf assigned to the
+plane), the concern returns and the gate must move to flip-complete;
+until then no change is needed.
 
 ### Slice 5 — (merged into slice 4) ✅ landed
 
 See slice 4.
 
-### Slice 6 — libinput routed into real clients
+### Slice 6 — libinput routed into real clients ✅ landed
 
-Connect Slice 1's libinput input to the running KMS compositor. Real
-clients (`foot`, `kitty`) become interactive on the bare-metal panel.
+Connect libinput input to the running KMS compositor. Real clients
+(`foot`, `kitty`) become interactive on the bare-metal panel. The
+input backend is paired with the output backend (`--backend=kms`
+implies libinput; `--backend=nested` implies the WaylandInputBackend
+host-forwarding path); there is no separate selector. The libseat
+handle is shared: KMS bring-up opens the DRM card via libseat, and
+libinput opens evdev devices through the same `Seat` (one libseat
+instance per session).
 
-Includes the buffer-release-via-flip-complete change deferred from
-slice 4+5: client `wl_buffer.release` is gated on the scanout slot's
-flip-complete instead of `onSubmittedWorkDone`. This is the slice
-where it has to land because it's the first slice where client
-buffers actually flow through KMS scanout.
+Three secondary fixes landed alongside the input coupling, all
+surfaced by the first real-client run on KMS:
 
-Validation: launch `foot` over SSH against the running KMS overdraw,
-type into it, click on it. Everything that worked nested now works
-on KMS. Buffer release timing is correct: a client that
-double-buffers does not see its just-released buffer torn between
-old and new content.
+- `acquireOutputTexture()` returning "no FREE scanout slot" as
+  `nullptr` from N-API arrives in JS as `undefined`, not `null`.
+  The JS check was `=== null` only, so on the very first frame
+  before any slot was FREE the JS compositor fell through to
+  `dawn.wrapTexture(deviceHandle, undefined)`, which threw and
+  killed the node process. Fix: check both `null` and `undefined`.
+- The core (node) addon lacked a crash handler. A SIGSEGV in the
+  addon path left no artifact. Slice 6 adds a `SIGSEGV/SIGABRT/
+  SIGBUS/SIGILL/SIGFPE` handler that writes a backtrace to
+  `/tmp/overdraw-core-crash.txt` (mirroring the GPU process's
+  handler in `gpu-process/src/main.cpp`).
+- The per-frame disconnect sweep purges seat state referencing
+  destroyed surfaces (clearing `seat.kbFocus`/`seat.focus`) and
+  removes destroyed `wl_keyboard`/`wl_pointer` resources from
+  the per-client sets. Without this, the second client to connect
+  after a disconnect was disconnected by libwayland with "compositor
+  tried to use an object from one client in 'wl_keyboard.leave' for
+  a different client": `clientId` is the `wl_client*` pointer
+  value, libwayland recycles those across disconnects, and the
+  new client at a recycled address inherited the dead client's
+  keyboards via `keyboardsByClient[recycled_ptr]`. Bug existed in
+  nested too; only surfaced once slice 6 made client reconnect a
+  routine path. This is also why the "buffer-release-via-flip-
+  complete" deferral that earlier drafts of this slice carried is
+  irrelevant — the compositor samples each client dmabuf into the
+  scanout-ring slot rather than scanning the client buffer out
+  directly, so the client buffer is consumed by
+  `onSubmittedWorkDone` and the slice 4+5 gate is correct. See
+  the slice 4+5 note above for the full reasoning; slice 6 leaves
+  the buffer-release gate as-is.
+
+Validation: launched `kitty` against the running KMS overdraw on
+the 2560×1600 @165Hz Intel iGPU laptop with gdm stopped. The kitty
+window renders on the bare-metal panel; keyboard and mouse input
+work. Five sequential kitty connect/disconnect cycles against the
+same overdraw also pass (regression coverage for the seat sweep).
 
 ### Slice 7 — VT switch
 
@@ -679,17 +716,17 @@ cursor, scanout from non-Intel GPUs, hotplug).
 
 ## Open points (resolve before slice 4)
 
-1. **Buffer release ordering with KMS** — RESOLVED: deferred to slice 6
-   with explicit acknowledgment in slice 4+5's notes. Today's
-   `onSubmittedWorkDone` gating is wrong for KMS in the presence of
-   clients (a client buffer can be released while still being scanned
-   out), but slice 4+5 has no clients so the bug is latent. Slice 6 is
-   where clients arrive on KMS and is the natural home for the gate
-   change. The chain: compositor submit → flip-complete (carried by
-   `drmHandleEvent`) → GPU process sends a new
-   `ScanoutSlotReleased{slotIdx, retireSerial}` side-channel msg → core
-   advances the per-serial release list that `client-buffer-lifecycle.ts`
-   already maintains. Code design lives in slice 6.
+1. **Buffer release ordering with KMS** — RESOLVED: no change needed.
+   The original analysis claimed `onSubmittedWorkDone` was wrong for
+   KMS because "a client buffer can be released while still being
+   scanned out." That doesn't match the pipeline: the compositor
+   samples each client dmabuf into a scanout-ring slot texture; the
+   client buffer is read-only-input, never the scanout buffer itself.
+   `onSubmittedWorkDone` is the moment the compositor has finished
+   reading the client buffer, which is the right gate for release.
+   A future zero-copy direct-scanout path (a client dmabuf assigned
+   to the plane) would resurrect this and require a flip-complete
+   gate then; today's pipeline does not.
 2. **GPU-process pump fairness.** The GPU process's epoll loop today
    multiplexes wire/ctrl/host-display fds. KMS adds the DRM fd. The
    fd-arming policy (arm-on-need) extends naturally, but worth
