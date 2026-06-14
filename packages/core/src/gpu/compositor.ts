@@ -1404,9 +1404,13 @@ export class JsCompositor implements CompositorSink {
     // back to its intrinsic logical size: a wp_viewport destination overrides
     // it, else buffer dims / buffer scale -- so a HiDPI buffer is placed at its
     // logical extent, not its device extent.
+    // Intrinsic logical size precedence (wp_viewport): destination size wins;
+    // else the source crop's size (the crop rect is in surface coords, so its
+    // dimensions are already logical -- a non-integer src here is bad_size,
+    // silent-dropped); else buffer dims / buffer scale.
     const bs = s.bufferScale || 1;
-    const intrinsicW = s.viewportDst?.width ?? s.width / bs;
-    const intrinsicH = s.viewportDst?.height ?? s.height / bs;
+    const intrinsicW = s.viewportDst?.width ?? s.viewportSrc?.width ?? s.width / bs;
+    const intrinsicH = s.viewportDst?.height ?? s.viewportSrc?.height ?? s.height / bs;
     const px = overrides?.placement?.x ?? s.x;
     const py = overrides?.placement?.y ?? s.y;
     const pw = overrides?.placement?.w ?? (s.layoutW || intrinsicW);
