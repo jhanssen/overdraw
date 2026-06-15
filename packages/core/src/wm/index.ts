@@ -473,16 +473,27 @@ export function createWm(
     outer: Rect;
     content: Rect;
     // Serial of the configure last sent for this held size, or null for a
-    // move-only hold (no re-render needed). Matched against the client's acked
-    // serial to flip `ready`.
+    // move-only hold (no re-render needed).
     serial: number | null;
     // The content size `serial` configured -- lets a merged reorder skip
     // re-configuring an already-asked size.
     cfgW: number;
     cfgH: number;
-    ready: boolean;
+    // Move-only holds need no re-render and are always ready. A resize hold is
+    // ready once the client has acked the configure AND the compositor reports
+    // a drawable buffer at the new size (surfaceReadyAt) -- the latter matters
+    // because dmabuf imports are async, so a commit alone doesn't mean drawable.
+    moveOnly: boolean;
+    acked: boolean;
   }
   const pendingResizes = new Map<number, PendingResize>();
+  function pendingReady(id: number, p: PendingResize): boolean {
+    if (p.moveOnly) return true;
+    if (!p.acked) return false;
+    return compositor.surfaceReadyAt
+      ? compositor.surfaceReadyAt(id, p.content.width, p.content.height)
+      : true;
+  }
   let txTimer: ReturnType<typeof setTimeout> | null = null;
   const TX_TIMEOUT_MS = 150;
 
@@ -529,6 +540,9 @@ export function createWm(
     const entries = [...pendingResizes];
     pendingResizes.clear();
     for (const [id, p] of entries) {
+      // Thaw (resume the live buffer) and set the new geometry in the same
+      // batch, so the freshly-rendered content and the new size land together.
+      compositor.thawSurface?.(id);
       const win = windows.find((w) => w.surfaceId === id);
       if (win) pushGeometry(win, p.outer, p.content);
     }
@@ -538,7 +552,7 @@ export function createWm(
   // size, or move-only). A not-yet-ready member keeps the whole batch waiting.
   function maybeApplyTransaction(): void {
     if (pendingResizes.size === 0) { clearTxTimer(); return; }
-    for (const p of pendingResizes.values()) { if (!p.ready) return; }
+    for (const [id, p] of pendingResizes) { if (!pendingReady(id, p)) return; }
     applyPendingGeometry();
   }
 
@@ -547,6 +561,12 @@ export function createWm(
     txTimer = setTimeout(() => { txTimer = null; applyPendingGeometry(); }, TX_TIMEOUT_MS);
     txTimer.unref?.();
   }
+
+  // The compositor pokes this when a frozen surface's new buffer becomes
+  // drawable; re-check whether the held batch can now apply.
+  compositor.setFrozenReadyHandler?.((id) => {
+    if (pendingResizes.has(id)) maybeApplyTransaction();
+  });
 
   // Apply a LayoutResult: emit window.relayout, then update each window's
   // outer rect, push the compositor's setSurfaceLayout, fire configure where
@@ -597,8 +617,10 @@ export function createWm(
             ? configure(win.surfaceId, newContent.width, newContent.height) : null;
           pendingResizes.set(win.surfaceId, {
             outer: newOuter, content: newContent,
-            serial, cfgW: newContent.width, cfgH: newContent.height, ready: false,
+            serial, cfgW: newContent.width, cfgH: newContent.height, moveOnly: false, acked: false,
           });
+          // Hold the surface's current frame while it re-renders at the new size.
+          compositor.freezeSurface?.(win.surfaceId);
           txTouched = true;
         } else if (pend) {
           pend.outer = newOuter;
@@ -607,7 +629,7 @@ export function createWm(
         } else if (moved) {
           pendingResizes.set(win.surfaceId, {
             outer: newOuter, content: newContent, serial: null,
-            cfgW: newContent.width, cfgH: newContent.height, ready: true,
+            cfgW: newContent.width, cfgH: newContent.height, moveOnly: true, acked: true,
           });
           txTouched = true;
         }
@@ -640,10 +662,14 @@ export function createWm(
     if (useTx) {
       // Drop holds for windows no longer in this layout result.
       for (const id of [...pendingResizes.keys()]) {
-        if (!byId.has(id)) { pendingResizes.delete(id); txTouched = true; }
+        if (!byId.has(id)) {
+          pendingResizes.delete(id);
+          compositor.thawSurface?.(id);
+          txTouched = true;
+        }
       }
       if (txTouched) {
-        if ([...pendingResizes.values()].some((p) => !p.ready)) armTxTimer();
+        if ([...pendingResizes].some(([id, p]) => !pendingReady(id, p))) armTxTimer();
         maybeApplyTransaction();
       }
     }
@@ -722,7 +748,7 @@ export function createWm(
       const i = windows.findIndex((w) => w.surfaceId === surfaceId);
       if (i < 0) return;
       windows.splice(i, 1);
-      if (pendingResizes.delete(surfaceId)) maybeApplyTransaction();
+      if (pendingResizes.delete(surfaceId)) { compositor.thawSurface?.(surfaceId); maybeApplyTransaction(); }
       driver.schedule("unmapped");
       pushStack();
     },
@@ -1050,9 +1076,9 @@ export function createWm(
 
     notifyToplevelCommit(surfaceId, ackedSerial) {
       const p = pendingResizes.get(surfaceId);
-      if (!p || p.ready) return;
+      if (!p || p.moveOnly || p.acked) return;
       if (p.serial !== null && ackedSerial !== null && ackedSerial >= p.serial) {
-        p.ready = true;
+        p.acked = true;
         maybeApplyTransaction();
       }
     },

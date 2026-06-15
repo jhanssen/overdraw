@@ -445,7 +445,17 @@ interface Surface {
   // broker each frame; reset when the intercept clears or the plugin
   // returns no outputRect.
   interceptPlacement: { x: number; y: number; w: number; h: number } | null;
+  // The captured snapshot. While set, the surface samples this compositor-owned
+  // texture (its frozen frame) instead of its client buffer and draws at its
+  // held layout rect -- so a held resize never shows a half-resized buffer. The
+  // client's buffers keep flowing through their normal lifecycle meanwhile.
+  // Cleared by thawSurface, which returns the texture to the pool.
+  frozen?: FrozenSnapshot | null;
 }
+
+// A frozen surface snapshot: the surface's appearance rendered into a
+// compositor-owned (pooled) texture at its on-screen device resolution.
+interface FrozenSnapshot { tex: GPUTexture; view: GPUTextureView; w: number; h: number; }
 
 // 6 vec4s (placement, transform, margin, fx, cropUV, tint) + 1 mat4x4f
 // (colorMatrix, packed as 4 vec4 columns) = 10 vec4s = 40 floats = 160 bytes.
@@ -641,6 +651,14 @@ export class JsCompositor implements CompositorSink {
   // Surfaces that gained presentable content since the last takeImportedSurfaces.
   private imported: Array<{ id: number; width: number; height: number }> = [];
   private warnedDmabuf = false;
+
+  // Pool of compositor-owned textures reused for frozen-surface snapshots,
+  // keyed by "WxH" device size. Bounded per size so a one-off large resize
+  // doesn't pin memory.
+  private snapPool = new Map<string, GPUTexture[]>();
+  // Fired when a frozen surface's new buffer becomes drawable (the WM gates the
+  // thaw on this + the new size). Set by setFrozenReadyHandler.
+  private frozenReadyCb: ((id: number) => void) | null = null;
 
   private sampler: GPUSampler;
   // Mask sampler: linear filtering so soft mask edges (rounded corners with
@@ -939,6 +957,87 @@ export class JsCompositor implements CompositorSink {
     else this.surfaces.set(id, blankSurface(x, y, w, h));
   }
 
+  // Resize transaction: snapshot this surface's CURRENT appearance right now,
+  // synchronously, into a pooled texture, and draw that snapshot at its held
+  // layout rect until thawed. Capturing synchronously (rather than on the next
+  // frame) is essential -- it happens before the client has processed the
+  // configure and re-rendered, so the snapshot is the pre-resize frame, not a
+  // half-resized one. Idempotent; no-op for a surface with no live content.
+  freezeSurface(id: number): void {
+    const s = this.surfaces.get(id);
+    if (!s || s.frozen || !s.present || !s.bindGroup || s.currentBufferId === 0) return;
+    const imp = this.dmabufImports.get(s.currentBufferId);
+    if (!imp) return;
+    const w = Math.max(1, Math.round(s.layoutW * this.scale));
+    const h = Math.max(1, Math.round(s.layoutH * this.scale));
+    const snap = this.acquireSnapTex(w, h);
+    // Standalone bracketed submit: open the client import's access bracket,
+    // render the surface filling the snapshot (its crop/transform apply), close
+    // the bracket. FIFO-ordered on the wire like any other sample.
+    if (!this.addon.writeBeginAccess(imp.importId)) { this.releaseSnapTex(snap); return; }
+    const enc = this.device.createCommandEncoder();
+    this.composite({
+      encoder: enc, targetView: snap.view, drawList: [id],
+      outW: s.layoutW, outH: s.layoutH,
+      placements: new Map([[id, { x: 0, y: 0, w: s.layoutW, h: s.layoutH }]]),
+    });
+    this.device.queue.submit([enc.finish()]);
+    this.addon.writeEndAccess(imp.importId);
+    s.frozen = snap;
+    if (s.view) this.rebuildBindGroup(s, s.view);
+  }
+
+  // Drop the frozen snapshot: return its texture to the pool and resume drawing
+  // the live client buffer. Called when the WM applies the held geometry (in the
+  // same batch as setSurfaceLayout, so content + size land together) or cancels
+  // the hold. Idempotent.
+  thawSurface(id: number): void {
+    const s = this.surfaces.get(id);
+    if (!s || !s.frozen) return;
+    this.releaseSnapTex(s.frozen);
+    s.frozen = null;
+    // Resume sampling the live buffer. If there is none (shouldn't happen --
+    // the WM only thaws once surfaceReadyAt confirms a drawable buffer), drop
+    // the bind group so the surface isn't drawn from the recycled snapshot view.
+    if (s.view) this.rebuildBindGroup(s, s.view);
+    else { s.bindGroup = null; s.present = false; }
+  }
+
+  // The WM registers a handler invoked when a frozen surface's new buffer
+  // becomes drawable, so it can re-check whether a held resize is ready.
+  setFrozenReadyHandler(cb: (id: number) => void): void { this.frozenReadyCb = cb; }
+
+  // True if the surface has a drawable buffer at logical size (w, h). The WM
+  // gates a held resize's apply on this so it never thaws onto a not-yet-
+  // imported (or stale-size) buffer.
+  surfaceReadyAt(id: number, w: number, h: number): boolean {
+    const s = this.surfaces.get(id);
+    if (!s || !s.present || !s.view || s.currentBufferId === 0) return false;
+    const bs = s.bufferScale || 1;
+    const lw = s.viewportDst?.width ?? s.viewportSrc?.width ?? (s.width / bs);
+    const lh = s.viewportDst?.height ?? s.viewportSrc?.height ?? (s.height / bs);
+    return Math.round(lw) === w && Math.round(lh) === h;
+  }
+
+  private acquireSnapTex(w: number, h: number): FrozenSnapshot {
+    const free = this.snapPool.get(`${w}x${h}`);
+    const pooled = free && free.length > 0 ? free.pop() : undefined;
+    const tex = pooled ?? this.device.createTexture({
+      size: { width: w, height: h },
+      format: this.format,
+      usage: this.g.GPUTextureUsage.RENDER_ATTACHMENT | this.g.GPUTextureUsage.TEXTURE_BINDING,
+    });
+    return { tex, view: tex.createView(), w, h };
+  }
+
+  private releaseSnapTex(snap: FrozenSnapshot): void {
+    const key = `${snap.w}x${snap.h}`;
+    let free = this.snapPool.get(key);
+    if (!free) { free = []; this.snapPool.set(key, free); }
+    if (free.length < 4) free.push(snap.tex);
+    else snap.tex.destroy();
+  }
+
   setSurfaceBufferScale(id: number, scale: number): void {
     const s = this.surfaces.get(id) ?? this.ensureSurface(id);
     s.bufferScale = scale > 0 ? scale : 1;
@@ -1056,6 +1155,8 @@ export class JsCompositor implements CompositorSink {
       // complete). Explicitly .destroy()-ing the wrapped client texture
       // here caused intermittent fatal dawn.node throws during teardown.
       s.uniformBuf?.destroy();
+      // Return any frozen snapshot to the pool.
+      if (s.frozen) { this.releaseSnapTex(s.frozen); s.frozen = null; }
     }
     this.surfaces.delete(id);
   }
@@ -1149,9 +1250,13 @@ export class JsCompositor implements CompositorSink {
     s.view = imp.view;
     s.width = imp.width;
     s.height = imp.height;
+    // rebuildBindGroup keeps sampling the snapshot while frozen; the live view
+    // is stored for thaw. A new drawable buffer on a frozen surface is the
+    // re-render the WM's held resize is waiting for -- poke it to re-check.
     this.rebuildBindGroup(s, imp.view);
     s.present = true;
     this.imported.push({ id, width: imp.width, height: imp.height });
+    if (s.frozen) this.frozenReadyCb?.(id);
   }
 
   // Allocate (lazily) the per-surface uniform buffer + rebuild the bind group
@@ -1170,7 +1275,9 @@ export class JsCompositor implements CompositorSink {
     // view; this chokepoint substitutes the intercept view when
     // present. installInterceptOutput passes the intercept view
     // directly (the substitution here is a no-op for that path).
-    const sampledView = s.interceptOutputView ?? view;
+    // A frozen surface samples its captured snapshot; an intercept samples the
+    // plugin output; otherwise the client view.
+    const sampledView = s.frozen?.view ?? s.interceptOutputView ?? view;
     const mask = s.maskView ?? this.defaultMaskView;
     s.bindGroup = this.device.createBindGroup({
       layout: this.layout,
@@ -1404,6 +1511,7 @@ export class JsCompositor implements CompositorSink {
       { width: c.width, height: c.height },
     );
     s.present = true;
+    if (s.frozen) this.frozenReadyCb?.(id);
   }
 
   // Pack the per-surface render state (placement + transform + margin + fx +
@@ -1428,23 +1536,13 @@ export class JsCompositor implements CompositorSink {
     },
   ): void {
     if (!s.uniformBuf) return;
-    // Placement size policy: a surface fills its WM-assigned tile
-    // (layoutW/layoutH) by default, falling back to its intrinsic logical size
-    // when it has no layout (subsurface, overlay, cursor). The exception is an
-    // explicit wp_viewport destination: that sets the surface's logical size,
-    // so it overrides the tile and the surface is drawn at the destination
-    // size, positioned at the tile origin -- a client that declares a logical
-    // size smaller than its tile (e.g. a media player sizing its surface to
-    // the video via a viewport destination) is drawn at that size, not
-    // stretched to fill. A source crop without a destination does NOT shrink
-    // the surface: the cropped region scales to the tile (the layout still
-    // sizes the window).
-    //
-    // Intrinsic logical size precedence (wp_viewport): destination size wins;
-    // else the source crop's size (the crop rect is in surface coords, so its
-    // dimensions are already logical -- a non-integer src here is bad_size,
-    // silent-dropped); else buffer dims / buffer scale (so a HiDPI buffer is
-    // placed at its logical extent, not its device extent).
+    // A surface fills its WM-assigned tile (layoutW/layoutH), falling back to
+    // its intrinsic logical size when it has no layout (subsurface, overlay,
+    // cursor). Intrinsic logical size precedence (wp_viewport): destination
+    // size wins; else the source crop's size (the crop rect is in surface
+    // coords, so its dimensions are already logical -- a non-integer src here
+    // is bad_size, silent-dropped); else buffer dims / buffer scale (so a HiDPI
+    // buffer is placed at its logical extent, not its device extent).
     const bs = s.bufferScale || 1;
     // 90/270 (and their flipped variants) swap the buffer's axes relative to
     // the surface, so the buffer-derived logical size uses swapped dims. A
@@ -1457,11 +1555,8 @@ export class JsCompositor implements CompositorSink {
     const intrinsicH = s.viewportDst?.height ?? s.viewportSrc?.height ?? bh / bs;
     const px = overrides?.placement?.x ?? s.x;
     const py = overrides?.placement?.y ?? s.y;
-    // A wp_viewport destination is the surface's declared logical size; it wins
-    // over the tile. Otherwise the tile sizes the surface, falling back to the
-    // intrinsic size when there is no layout.
-    const pw = overrides?.placement?.w ?? (s.viewportDst ? intrinsicW : (s.layoutW || intrinsicW));
-    const ph = overrides?.placement?.h ?? (s.viewportDst ? intrinsicH : (s.layoutH || intrinsicH));
+    const pw = overrides?.placement?.w ?? (s.layoutW || intrinsicW);
+    const ph = overrides?.placement?.h ?? (s.layoutH || intrinsicH);
     const fx = s.fx;
     const data = new Float32Array(UNIFORM_FLOATS);
     // placement
@@ -1475,14 +1570,18 @@ export class JsCompositor implements CompositorSink {
     data[9]  = fx.marginRight  / ow;
     data[10] = fx.marginBottom / oh;
     data[11] = fx.marginLeft   / ow;
+    // A frozen surface draws its snapshot, which already baked in the buffer
+    // transform + crop, so it samples full with no transform. Otherwise the
+    // client buffer's transform applies.
+    const frozenDraw = !!s.frozen && !overrides;
     // fx: opacity in x; buffer-transform code (0..7) in y; rest reserved
     data[12] = fx.opacity;
-    data[13] = s.bufferTransform || 0;
+    data[13] = frozenDraw ? 0 : (s.bufferTransform || 0);
     // cropUV: u0, v0, u1, v1 (defaults identity = full surface texture). A
     // wp_viewport source rect (surface coords) crops the sampled buffer;
     // computed from current buffer dims so it survives a buffer resize.
     let cu = overrides?.cropUV;
-    if (!cu && s.viewportSrc && s.width > 0 && s.height > 0) {
+    if (!frozenDraw && !cu && s.viewportSrc && s.width > 0 && s.height > 0) {
       const W = s.width, H = s.height;
       cu = {
         u0: (s.viewportSrc.x * bs) / W, v0: (s.viewportSrc.y * bs) / H,
@@ -1517,6 +1616,9 @@ export class JsCompositor implements CompositorSink {
     for (const id of drawList) {
       const s = this.surfaces.get(id);
       if (!s || !s.present || !s.bindGroup) continue;
+      // A frozen surface samples its snapshot, not the client buffer -- no
+      // bracket (and no frameSampled) for its import this frame.
+      if (s.frozen) continue;
       if (s.currentBufferId === 0) continue;  // shm or plugin overlay; no lifecycle
       const imp = this.dmabufImports.get(s.currentBufferId);
       if (!imp) continue;  // import not yet resolved (async); will draw next frame

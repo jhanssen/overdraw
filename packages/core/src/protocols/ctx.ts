@@ -126,6 +126,18 @@ export interface CompositorSink {
                       fourcc: number, modHi: number, modLo: number,
                       offset: number, stride: number, bufferId: number): boolean;
   setSurfaceLayout(id: number, x: number, y: number, w: number, h: number): void;
+  // Resize transaction: freezeSurface synchronously snapshots the surface's
+  // current appearance so it keeps showing its pre-resize frame while the WM
+  // holds a resize; thawSurface drops the snapshot and resumes the live buffer.
+  // surfaceReadyAt reports whether the surface has a drawable buffer at a given
+  // logical size (the WM gates the thaw on it, since dmabuf imports are async).
+  // setFrozenReadyHandler registers a callback fired when a frozen surface's new
+  // buffer becomes drawable (so the WM re-checks readiness). All optional
+  // (GPU-free test sinks omit them; the WM degrades to the ack-serial gate).
+  freezeSurface?(id: number): void;
+  thawSurface?(id: number): void;
+  surfaceReadyAt?(id: number, w: number, h: number): boolean;
+  setFrozenReadyHandler?(cb: (id: number) => void): void;
   // Buffer scale (wl_surface.set_buffer_scale): device pixels per logical
   // pixel in the surface's buffer. The surface's intrinsic logical size is
   // buffer dims / bufferScale. Default 1.
