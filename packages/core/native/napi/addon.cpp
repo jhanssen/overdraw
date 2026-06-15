@@ -1165,6 +1165,13 @@ void fireJsImports(napi_env env) {
     napi_close_handle_scope(env, scope);
     // `done` destructs here: each JsImportDone.tex releases the core's ref, having
     // handed ownership to JS (wrapTexture AddRef'd inside the callback).
+
+    // A completed import makes its surface drawable. The dmabuf import is async,
+    // so the render that committed the buffer may have already finished (drawing
+    // the surface blank because its texture wasn't ready) and left the frame loop
+    // idle. Wake it so the now-ready surface is rendered; without this the
+    // surface stays blank until some other event happens to wake the loop.
+    wake();
 }
 
 // Drain queued OutputDescriptor messages and invoke the JS onOutput callback
