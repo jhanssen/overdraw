@@ -10,7 +10,7 @@ import assert from "node:assert/strict";
 
 import { setupCompositor, canRunGpu, loadDawn, pixelAt, pixelMatches } from "./harness.mjs";
 
-const skip = !canRunGpu() ? "needs GPU (WAYLAND_DISPLAY unset)"
+const skip = !canRunGpu() ? "needs GPU (no render node / dawn.node)"
   : (!loadDawn() ? "dawn.node not built" : false);
 const OUT = { width: 1280, height: 720 };
 

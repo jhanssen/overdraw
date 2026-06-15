@@ -8,7 +8,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { setupCompositor, canRunGpu, buildBin, pixelAt, pixelMatches } from "./harness.mjs";
 
-const skip = canRunGpu() ? false : "needs GPU (WAYLAND_DISPLAY unset)";
+const skip = canRunGpu() ? false : "needs GPU (no render node / dawn.node)";
 const POPUP = buildBin("popup-test-client");
 const OUT = { width: 1280, height: 720 };
 

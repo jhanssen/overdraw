@@ -51,6 +51,10 @@ export interface WaylandFd {
   write(data: Uint8Array): Promise<number>;
   takeRawFd(): number;
   close(): void;
+  // An independent dup of this fd in a fresh WaylandFd; this wrapper is left
+  // intact. For forwarding a request fd onto an async wire event (the original
+  // is closed by libwayland when the dispatch returns).
+  dup(): WaylandFd;
 }
 `;
 

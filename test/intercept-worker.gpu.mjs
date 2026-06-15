@@ -21,7 +21,7 @@ const [dawnPath] = globSync(join(OD, "build", "3rdparty", "dawn", "Dawn-*", "daw
 const pluginAddonPath = join(OD, "build", "overdraw_plugin_native.node");
 
 const skip = !canRunGpu()
-  ? "needs GPU (WAYLAND_DISPLAY unset)"
+  ? "needs GPU (no render node / dawn.node)"
   : (!dawnPath ? "dawn.node not built" : false);
 
 const RED_ARGB = "FFFF0000";

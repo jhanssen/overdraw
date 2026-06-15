@@ -28,7 +28,7 @@ import { WINDOW_EVENT } from "../packages/core/dist/events/types.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const OD = join(__dirname, "..", "packages", "core");
-const skip = !canRunGpu() ? "no host Wayland" : !loadDawn() ? "dawn.node not built" : false;
+const skip = !canRunGpu() ? "needs GPU (no render node / dawn.node)" : !loadDawn() ? "dawn.node not built" : false;
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 const W = 256, H = 256;

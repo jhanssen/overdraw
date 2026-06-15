@@ -12,7 +12,7 @@ import assert from "node:assert/strict";
 
 import { setupCompositor, canRunGpu } from "./harness.mjs";
 
-const skip = canRunGpu() ? false : "needs GPU (WAYLAND_DISPLAY unset)";
+const skip = canRunGpu() ? false : "needs GPU (no render node / dawn.node)";
 
 // xdg_toplevel.state enum (from the XML)
 const STATE_MAXIMIZED = 1;

@@ -18,7 +18,7 @@ import { PluginRuntime } from "../packages/core/dist/plugins/index.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const OD = join(__dirname, "..", "packages", "core");
-const skip = !canRunGpu() ? "no host Wayland (WAYLAND_DISPLAY unset)"
+const skip = !canRunGpu() ? "needs GPU (no render node / dawn.node)"
   : !loadDawn() ? "dawn.node not built" : false;
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));

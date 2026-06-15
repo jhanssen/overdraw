@@ -15,9 +15,10 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { createRequire } from "node:module";
 import { resolve } from "node:path";
+import { canRunGpu } from "./harness.mjs";
 
 const require = createRequire(import.meta.url);
-const skip = process.env.WAYLAND_DISPLAY ? false : "needs host Wayland (WAYLAND_DISPLAY unset)";
+const skip = canRunGpu() ? false : "needs GPU (no render node / dawn.node)";
 const addonPath = resolve("packages/core/build/overdraw_native.node");
 const gpuBin = resolve("packages/core/build/overdraw-gpu-process");
 

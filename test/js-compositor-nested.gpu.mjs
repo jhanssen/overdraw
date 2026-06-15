@@ -15,10 +15,10 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 
-import { setupCompositor, canRunGpu, loadDawn } from "./harness.mjs";
+import { setupCompositor, canRunNested, loadDawn } from "./harness.mjs";
 
-const skip = !canRunGpu() ? "needs GPU + host Wayland (nested)"
-  : (!loadDawn() ? "dawn.node not built" : false);
+const skip = !loadDawn() ? "dawn.node not built"
+  : (!canRunNested() ? "needs GPU + host Wayland (nested)" : false);
 
 test("JS compositor presents to the host swapchain (nested)", { skip }, async () => {
   // headless:false -> nested host window + WSI swapchain, JS-driven present.

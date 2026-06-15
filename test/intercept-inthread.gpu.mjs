@@ -25,7 +25,7 @@ const here = dirname(fileURLToPath(import.meta.url));
 const HARNESS_BIN = buildBin("harness-client");
 const FIXTURE = join(here, "fixtures", "plugins", "intercept-invert.mjs");
 
-const skip = canRunGpu() ? false : "needs GPU (WAYLAND_DISPLAY unset)";
+const skip = canRunGpu() ? false : "needs GPU (no render node / dawn.node)";
 
 // Solid color BGRA value -> ARGB8888 hex string for the client's --color.
 // harness-client expects an ARGB hex (`AARRGGBB`); we test with opaque red.

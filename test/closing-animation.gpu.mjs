@@ -26,7 +26,7 @@ import {
 } from "./harness.mjs";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
-const skip = canRunGpu() ? false : "needs GPU (WAYLAND_DISPLAY unset)";
+const skip = canRunGpu() ? false : "needs GPU (no render node / dawn.node)";
 const OUT = { width: 320, height: 240 };
 const FILL = "--fill-configured";
 

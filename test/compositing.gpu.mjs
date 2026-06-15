@@ -10,7 +10,7 @@ import assert from "node:assert/strict";
 
 import { setupCompositor, canRunGpu, pixelAt, pixelMatches } from "./harness.mjs";
 
-const skip = canRunGpu() ? false : "needs GPU (WAYLAND_DISPLAY unset)";
+const skip = canRunGpu() ? false : "needs GPU (no render node / dawn.node)";
 const OUT = { width: 1280, height: 720 };
 
 // ARGB 0xFFRRGGBB as the client stores it -> BGRA readback bytes [B,G,R,A].

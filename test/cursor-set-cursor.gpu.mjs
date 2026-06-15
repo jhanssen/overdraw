@@ -16,7 +16,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { setupCompositor, canRunGpu, buildBin } from "./harness.mjs";
 
-const skip = canRunGpu() ? false : "needs GPU (WAYLAND_DISPLAY unset)";
+const skip = canRunGpu() ? false : "needs GPU (no render node / dawn.node)";
 const CURSOR_BIN = buildBin("cursor-test-client");
 
 test("wl_pointer.set_cursor: client cursor composites over the focused window",

@@ -10,7 +10,7 @@ import assert from "node:assert/strict";
 
 import { setupCompositor, canRunGpu, settled } from "../harness.mjs";
 
-const skip = canRunGpu() ? false : "needs GPU (WAYLAND_DISPLAY unset)";
+const skip = canRunGpu() ? false : "needs GPU (no render node / dawn.node)";
 const OUT = { width: 1280, height: 720 };
 const FILL = "--fill-configured";
 const KEY_U = 22;            // evdev keycode for 'u'

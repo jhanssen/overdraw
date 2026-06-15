@@ -13,7 +13,7 @@ import assert from "node:assert/strict";
 
 import { setupCompositor, canRunGpu, pixelAt, pixelMatches } from "./harness.mjs";
 
-const skip = canRunGpu() ? false : "needs GPU (WAYLAND_DISPLAY unset)";
+const skip = canRunGpu() ? false : "needs GPU (no render node / dawn.node)";
 const OUT = { width: 320, height: 240 };
 
 // Allocate a TEXTURE_BINDING|RENDER_ATTACHMENT|COPY_SRC|COPY_DST texture

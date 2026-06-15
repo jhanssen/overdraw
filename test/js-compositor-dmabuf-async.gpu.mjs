@@ -11,7 +11,7 @@ import { once } from "node:events";
 
 import { setupCompositor, canRunGpu, loadDawn, buildBin, pixelAt, pixelMatches } from "./harness.mjs";
 
-const skip = !canRunGpu() ? "needs GPU (WAYLAND_DISPLAY unset)"
+const skip = !canRunGpu() ? "needs GPU (no render node / dawn.node)"
   : (!loadDawn() ? "dawn.node not built" : false);
 const OUT = { width: 1280, height: 720 };
 const RED_BGRA = [0, 0, 255, 255]; // ARGB 0xFFFF0000 -> BGRA readback

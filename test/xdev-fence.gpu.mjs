@@ -10,7 +10,7 @@
 // (exports a SharedFenceSyncFD); device B BeginAccess WAITS that fence, samples
 // the dmabuf, reads it back, and asserts the color. It prints XDEV: PASS/FAIL.
 //
-// Needs the GPU/DRM render node (no host Wayland surface; the selftest is fully
+// Needs the GPU/DRM render node (needs GPU (no render node / dawn.node) surface; the selftest is fully
 // internal). Gated on canRunGpu() for consistency with the other gpu.mjs tests.
 
 import { test } from "node:test";

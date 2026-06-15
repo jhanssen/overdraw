@@ -112,6 +112,12 @@ struct Addon {
     uv_poll_t ctrlPoll{};
     uv_prepare_t flushPrepare{};  // flushes queued wire/ctrl output each loop turn
     uv_poll_t inputPoll{};
+    // Headless frame driver. KMS re-arms the loop from ScanoutFlipComplete and
+    // nested from the host wl_surface.frame; headless has neither, so a steady
+    // timer drives wake() to keep continuous work (animations, transitions,
+    // cursor settle) advancing. Active only in headless mode.
+    uv_timer_t headlessFrameTimer{};
+    bool headlessFrameTimerActive = false;
     int inputFd = -1;  // core-side input socket; owned here, closed in Stop()
     bool loopRunning = false;
 
@@ -237,6 +243,16 @@ void runFrameIfReady() {
         armWirePoll();
     } while (g_addon.wantNext
              && !g_addon.compositor->flipPending());
+}
+
+// Headless frame pacing: KMS/nested re-arm runFrameIfReady from a flip /
+// host-frame signal, but headless has no such signal. This timer is that
+// signal -- a steady ~60Hz wake so animations/transitions/cursor settle keep
+// rendering. It renders unconditionally each tick (the headless analogue of
+// the pre-flip-driven 60Hz frame timer); headless is a test-only mode where
+// continuous frames are the expectation.
+void onHeadlessFrameTimer(uv_timer_t*) {
+    wake();
 }
 
 void onFrameComplete() {
@@ -915,6 +931,17 @@ napi_value Start(napi_env env, napi_callback_info info) {
     // render against an un-wired JS side (state.dispatchFrameCallbacks
     // not yet attached).
 
+    // Headless has no flip / host-frame to re-arm the wake-driven loop, so
+    // drive frames from a steady ~60Hz timer. The first ticks may land before
+    // the JS side is wired; notifyFrame's onFrame callback no-ops until then
+    // (dispatchFrameCallbacks is optional-chained). KMS/nested skip this --
+    // they pace off real present completion.
+    if (headless) {
+        uv_timer_init(loop, &g_addon.headlessFrameTimer);
+        uv_timer_start(&g_addon.headlessFrameTimer, onHeadlessFrameTimer, 16, 16);
+        g_addon.headlessFrameTimerActive = true;
+    }
+
     napi_value result, w, h;
     napi_create_object(env, &result);
     napi_create_uint32(env, g_addon.compositor->windowWidth(), &w);
@@ -1359,6 +1386,13 @@ napi_value ShmView(napi_env env, napi_callback_info info) {
 
 napi_value Stop(napi_env env, napi_callback_info) {
     if (g_addon.loopRunning) {
+        // Stop the headless frame driver first so no render fires while the
+        // polls + wire are torn down below.
+        if (g_addon.headlessFrameTimerActive) {
+            uv_timer_stop(&g_addon.headlessFrameTimer);
+            uv_close(reinterpret_cast<uv_handle_t*>(&g_addon.headlessFrameTimer), nullptr);
+            g_addon.headlessFrameTimerActive = false;
+        }
         uv_poll_stop(&g_addon.wirePoll);
         uv_poll_stop(&g_addon.ctrlPoll);
         uv_prepare_stop(&g_addon.flushPrepare);

@@ -316,7 +316,6 @@ export async function installProtocols(
         // identifier instead, not surfaced on this event today).
         s.mapped = true;
         const ls = s.layerSurface;
-        ls.mapped = true;
         const rect = ls.rect;
         if (rect) {
           state.bus?.emit(WINDOW_EVENT.map, {
@@ -326,7 +325,10 @@ export async function installProtocols(
             role: "layer-shell",
           });
         }
-        // Push the layer stack so the compositor includes this surface.
+        // Mark the record mapped + push the layer stack. markLayerSurfaceMapped
+        // owns the rec.mapped flag so its exclusive-keyboard focus reevaluation
+        // runs with mapped=true; setting ls.mapped here first would make it
+        // early-return and skip that focus override.
         markLayerSurfaceMapped(state, ls);
         mappedAny = true;
       }

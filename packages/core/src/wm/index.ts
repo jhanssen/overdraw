@@ -849,6 +849,17 @@ export function createWm(
     async propose(surfaceId, proposal, reason) {
       const win = windows.find((w) => w.surfaceId === surfaceId);
       if (!win) return null;
+      // Before the initial commit, the throwaway 0x0 first configure is sent
+      // SYNCHRONOUSLY (sendInitialConfigure) and its states array is read from
+      // win.windowState. A set_maximized / set_fullscreen that arrived in the
+      // same wayland-batch goes through this async pipeline, which only writes
+      // windowState after a microtask hop -- too late for that first configure.
+      // Stamp the client-declared presentation synchronously so the first
+      // configure carries it; the async pass below still runs the
+      // proposed-interceptor + layout for the sized second configure.
+      if (win.pendingInitialCommit && proposal.presentation !== undefined) {
+        win.windowState = { ...win.windowState, presentation: proposal.presentation };
+      }
       // Serialize against any in-flight mutation on this window so a
       // second caller doesn't read stale state mid-microtask. Two
       // requests in the same wayland-batch (e.g. set_maximized then

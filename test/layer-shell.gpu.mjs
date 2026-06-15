@@ -12,7 +12,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { setupCompositor, canRunGpu, buildBin } from "./harness.mjs";
 
-const skip = canRunGpu() ? false : "needs GPU (WAYLAND_DISPLAY unset)";
+const skip = canRunGpu() ? false : "needs GPU (no render node / dawn.node)";
 const LS_BIN = buildBin("layer-shell-test-client");
 
 // Anchor bits matching the protocol enum.

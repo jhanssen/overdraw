@@ -11,7 +11,7 @@ import assert from "node:assert/strict";
 import { setupCompositor, canRunGpu, loadDawn } from "./harness.mjs";
 import { masterStackLayout } from "../packages/plugin-layout-default/dist/master-stack.js";
 
-const skip = !canRunGpu() ? "needs GPU (WAYLAND_DISPLAY unset)"
+const skip = !canRunGpu() ? "needs GPU (no render node / dawn.node)"
   : (!loadDawn() ? "dawn.node not built" : false);
 
 const LAYOUT = { masterFraction: 0.5, gap: 0 };

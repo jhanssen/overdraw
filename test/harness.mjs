@@ -7,14 +7,17 @@
 // focus -- not pixels. This mirrors how the reference compositors structure
 // integration tests (drive + query state).
 //
-// Requires a live host Wayland session (WAYLAND_DISPLAY) and the GPU, same as the
-// *-upload-smoke tests. Use canRunGpu() to skip gracefully when absent.
+// The default backend is HEADLESS (offscreen render target read back via
+// frameReadback()), which needs only a DRM render node + dawn.node -- no host
+// Wayland session. Use canRunGpu() to skip gracefully when those are absent.
+// Tests that present into a real host window (nested backend) additionally need
+// a live host session; they gate on canRunNested().
 
 import { createRequire } from "node:module";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 import { spawn } from "node:child_process";
-import { readdirSync, readFileSync, globSync } from "node:fs";
+import { readdirSync, readFileSync, globSync, accessSync, constants as fsConstants } from "node:fs";
 
 import { installProtocols } from "../packages/core/dist/protocols/index.js";
 import { createLayoutDriver } from "../packages/core/dist/wm/layout-driver.js";
@@ -42,9 +45,32 @@ const clientBin = join(coreRoot, "build", "harness-client");
 // Absolute path to a built binary in build/ (for spawnClient({ bin })).
 export const buildBin = (name) => join(coreRoot, "build", name);
 
-// True if the environment can run GPU + host-Wayland integration tests.
+// True if at least one DRM render node is present and accessible. The headless
+// GPU backend (Dawn/Vulkan) renders through a render node; this is the hardware
+// half of the headless gate.
+function hasRenderNode() {
+  let nodes;
+  try { nodes = readdirSync("/dev/dri"); } catch { return false; }
+  for (const n of nodes) {
+    if (!n.startsWith("render")) continue;
+    try { accessSync(`/dev/dri/${n}`, fsConstants.R_OK); return true; }
+    catch { /* node not accessible */ }
+  }
+  return false;
+}
+
+// True if the environment can run HEADLESS GPU tests: a usable DRM render node
+// plus the wire-retargeted dawn.node. No host Wayland session is required --
+// setupCompositor defaults to the headless backend. Tests that present into a
+// real host window (nested backend) gate on canRunNested() instead.
 export function canRunGpu() {
-  return !!process.env.WAYLAND_DISPLAY;
+  return hasRenderNode() && loadDawn() !== null;
+}
+
+// True if the environment can run NESTED GPU tests: the headless prerequisites
+// plus a live host Wayland session to host the nested window.
+export function canRunNested() {
+  return canRunGpu() && !!process.env.WAYLAND_DISPLAY;
 }
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -617,9 +643,21 @@ export async function setupCompositor(opts = {}) {
     } catch { /* ignore */ }
     try { addon.stopServer(); } catch { /* ignore */ }
     try { addon.stop(); } catch { /* ignore */ }
-    // addon.stop() reaps the GPU process; confirm none leaked (by exact comm).
-    await sleep(50);
-    const leaked = countGpuProcs();
+    // addon.stop() reaps the GPU process and closes the addon's libuv handles
+    // (server + client poll handles, GPU pipe). Those close callbacks run on a
+    // later loop iteration, so the loop MUST be yielded to at least once before
+    // this returns -- a subsequent setupCompositor()/addon.start() in the same
+    // process otherwise races the pending closes and libuv aborts on a half-
+    // closed handle. The do/while guarantees that first yield. Past it, keep
+    // polling: the GPU reap is asynchronous and can exceed 50ms on some drivers
+    // (NVIDIA teardown is slow), so wait until the child is gone rather than
+    // guessing a fixed delay.
+    const reapDeadline = Date.now() + 3000;
+    let leaked;
+    do {
+      await sleep(20);
+      leaked = countGpuProcs();
+    } while (leaked > 0 && Date.now() < reapDeadline);
     if (leaked > 0) throw new Error(`leaked ${leaked} GPU process(es) after teardown`);
   }
 

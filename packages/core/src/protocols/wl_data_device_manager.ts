@@ -325,14 +325,16 @@ export function makeDataOffer(ctx: Ctx): WlDataOfferHandler {
     },
     receive(resource, mimeType, fd: WaylandFd) {
       // Forward the receiver's pipe write-fd to the source: data_source.send.
-      // The WaylandFd is consumed by the event encoder (takeWaylandFd). Used by
-      // both clipboard and DnD (the offer->source map is shared).
+      // send_send queues a WIRE EVENT that transfers the fd when the connection
+      // next flushes -- AFTER this dispatch returns, by which point libwayland
+      // has closed the demarshalled request fd. So forward an independent dup
+      // (the wire owns + closes it), and release the original from its wrapper
+      // so its finalizer doesn't double-close the fd libwayland already owns.
       const source = offerToSource.get(resource);
       if (source && !source.destroyed) {
-        ctx.events.wl_data_source.send_send(source, mimeType, fd);
-      } else {
-        try { fd.close(); } catch { /* already closed */ }
+        ctx.events.wl_data_source.send_send(source, mimeType, fd.dup());
       }
+      fd.takeRawFd();
     },
     destroy(resource) {
       offerToSource.delete(resource);
@@ -398,12 +400,13 @@ export function makePrimarySource(ctx: Ctx): ZwpPrimarySelectionSourceV1Handler 
 export function makePrimaryOffer(ctx: Ctx): ZwpPrimarySelectionOfferV1Handler {
   return {
     receive(resource, mimeType, fd: WaylandFd) {
+      // See the wl_data_offer.receive forward above: dup for the async wire
+      // transfer, release the original (libwayland closes the request fd).
       const source = primaryOfferToSource.get(resource);
       if (source && !source.destroyed) {
-        ctx.events.zwp_primary_selection_source_v1.send_send(source, mimeType, fd);
-      } else {
-        try { fd.close(); } catch { /* already closed */ }
+        ctx.events.zwp_primary_selection_source_v1.send_send(source, mimeType, fd.dup());
       }
+      fd.takeRawFd();
     },
     destroy(resource) { primaryOfferToSource.delete(resource); },
   };

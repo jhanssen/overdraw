@@ -4,7 +4,7 @@
 //
 // Run: npm run test:gpu   (node --test 'test/*.gpu.mjs')
 // Deliberately NOT in the default `npm test` glob ('test/**/*.test.js'), which
-// stays GPU-free; these are gated on a GPU + WAYLAND_DISPLAY (auto-skip if unset).
+// stays GPU-free; these are gated on a GPU render node + dawn.node (auto-skip if absent).
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
@@ -15,7 +15,7 @@ import {
 } from "./harness.mjs";
 
 const BTN_LEFT = 0x110;
-const skip = canRunGpu() ? false : "needs GPU + host Wayland (WAYLAND_DISPLAY unset)";
+const skip = canRunGpu() ? false : "needs GPU (no render node / dawn.node)";
 
 test("client maps -> appears in query() with title/app_id; tiled to full output", { skip }, async () => {
   const c = await setupCompositor();

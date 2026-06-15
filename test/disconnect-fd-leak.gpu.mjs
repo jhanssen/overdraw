@@ -23,7 +23,7 @@ import { readdirSync, readlinkSync } from "node:fs";
 
 import { setupCompositor, canRunGpu, loadDawn, buildBin } from "./harness.mjs";
 
-const skip = !canRunGpu() ? "needs GPU (WAYLAND_DISPLAY unset)"
+const skip = !canRunGpu() ? "needs GPU (no render node / dawn.node)"
   : (!loadDawn() ? "dawn.node not built" : false);
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));

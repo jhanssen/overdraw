@@ -31,7 +31,7 @@ try {
 const [dawnPath] = globSync(join(OD, "build", "3rdparty", "dawn", "Dawn-*", "dawn.node"));
 const pluginAddonPath = join(OD, "build", "overdraw_plugin_native.node");
 
-const skip = !canRunGpu() ? "needs GPU (WAYLAND_DISPLAY unset)"
+const skip = !canRunGpu() ? "needs GPU (no render node / dawn.node)"
            : !dawn ? "dawn.node not built" : false;
 const OUT = { width: 320, height: 240 };
 const FILL = "--fill-configured";

@@ -10,7 +10,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { setupCompositor, canRunGpu, buildBin, pointerMotion, pointerButton } from "./harness.mjs";
 
-const skip = canRunGpu() ? false : "needs GPU (WAYLAND_DISPLAY unset)";
+const skip = canRunGpu() ? false : "needs GPU (no render node / dawn.node)";
 const DND = buildBin("dnd-test-client");
 const MIME = "text/plain;charset=utf-8";
 const PAYLOAD = "overdraw-dnd-drop-99";

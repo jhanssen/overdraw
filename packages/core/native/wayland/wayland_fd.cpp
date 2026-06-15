@@ -71,6 +71,22 @@ napi_value jsClose(napi_env env, napi_callback_info info) {
     return undef;
 }
 
+// dup(): return a NEW WaylandFd owning an independent F_DUPFD_CLOEXEC copy of
+// this fd, leaving this wrapper untouched. For forwarding a request fd onto an
+// async wire event: libwayland closes the demarshalled request fd when the
+// dispatch returns, so the copy that outlives dispatch must be one we own.
+napi_value jsDup(napi_env env, napi_callback_info info) {
+    napi_value self;
+    napi_get_cb_info(env, info, nullptr, nullptr, &self, nullptr);
+    WaylandFdState* st = stateOf(env, self);
+    if (!st || st->taken || st->closed || st->fd < 0) {
+        napi_throw_error(env, nullptr, "WaylandFd not dup-able (taken/closed)");
+        return nullptr;
+    }
+    int dupFd = ::fcntl(st->fd, F_DUPFD_CLOEXEC, 0);
+    return makeWaylandFd(env, dupFd);
+}
+
 // fd getter: the raw fd, or -1 if taken/closed. (Borrow; does not transfer.)
 napi_value jsGetFd(napi_env env, napi_callback_info info) {
     napi_value self;
@@ -106,6 +122,8 @@ napi_value makeWaylandFd(napi_env env, int fd) {
     napi_set_named_property(env, obj, "takeRawFd", fn);
     napi_create_function(env, "close", NAPI_AUTO_LENGTH, jsClose, nullptr, &fn);
     napi_set_named_property(env, obj, "close", fn);
+    napi_create_function(env, "dup", NAPI_AUTO_LENGTH, jsDup, nullptr, &fn);
+    napi_set_named_property(env, obj, "dup", fn);
 
     // fd / closed as accessor getters.
     napi_property_descriptor props[] = {

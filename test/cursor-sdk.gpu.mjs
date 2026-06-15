@@ -20,7 +20,7 @@ import { setupCompositor, canRunGpu } from "./harness.mjs";
 const here = dirname(fileURLToPath(import.meta.url));
 const FIXTURE = join(here, "fixtures", "plugins", "cursor-rule.mjs");
 
-const skip = canRunGpu() ? false : "needs GPU (WAYLAND_DISPLAY unset)";
+const skip = canRunGpu() ? false : "needs GPU (no render node / dawn.node)";
 
 function px(data, W, x, y) {
   const i = (y * W + x) * 4;

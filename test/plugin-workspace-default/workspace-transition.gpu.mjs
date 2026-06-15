@@ -22,7 +22,7 @@ import {
   setupCompositor, canRunGpu, pixelAt, pixelMatches, settled,
 } from "../harness.mjs";
 
-const skip = canRunGpu() ? false : "needs GPU (WAYLAND_DISPLAY unset)";
+const skip = canRunGpu() ? false : "needs GPU (no render node / dawn.node)";
 const OUT = { width: 320, height: 240 };
 const FILL = "--fill-configured";
 const DURATION = 400;
