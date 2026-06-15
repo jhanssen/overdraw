@@ -2055,8 +2055,7 @@ napi_value DmabufFeedbackInfo(napi_env env, napi_callback_info) {
 }
 
 napi_value Init(napi_env env, napi_value exports) {
-    // TEMP DIAG: skip crash handler install
-    // installCoreCrashHandler();
+    installCoreCrashHandler();
     napi_value fnStart, fnStop, fnPresented, fnStartServer, fnStopServer;
     napi_create_function(env, "start", NAPI_AUTO_LENGTH, Start, nullptr, &fnStart);
     napi_create_function(env, "stop", NAPI_AUTO_LENGTH, Stop, nullptr, &fnStop);
