@@ -36,6 +36,8 @@
 #include "wayland/wayland_fd.h"
 #include "wayland/keymap.h"
 #include "cursor/xcursor.h"
+#include "log/log.h"
+#include "log/ipc_source.h"
 
 using overdraw::core::Compositor;
 using overdraw::core::InputEvent;
@@ -147,6 +149,10 @@ struct Addon {
     napi_ref onInput = nullptr;  // optional JS callback(event) for input events
     napi_ref onOutput = nullptr; // optional JS callback(descriptor) for OutputDescriptor msgs
     uint64_t lastNotified = 0;
+
+    // Host-side reader for the GPU process's log socket. Started after
+    // spawnGpuProcess returns; stops on Stop().
+    std::unique_ptr<overdraw::log::IpcSource> logSource;
 };
 Addon g_addon;
 
@@ -717,6 +723,14 @@ napi_value Start(napi_env env, napi_callback_info info) {
     if (gpu.pid < 0) return throwError(env, "failed to spawn gpu process");
     g_addon.inputFd = gpu.inputFd;
 
+    // Start the GPU-process log reader thread on the host side of the log
+    // socket. Records are dispatched into host spdlog loggers; if logInit()
+    // has not been called yet a pre-init fallback logger handles them.
+    if (gpu.logFd >= 0) {
+        g_addon.logSource = std::make_unique<overdraw::log::IpcSource>();
+        g_addon.logSource->start(gpu.logFd);
+    }
+
 #if OVERDRAW_KMS
     // In KMS mode, open the DRM card via libseat and SCM_RIGHTS-pass the fd
     // to the GPU process BEFORE bringUp's Hello dance. The GPU process is
@@ -956,6 +970,85 @@ napi_value PresentedCount(napi_env env, napi_callback_info) {
     napi_value v;
     napi_create_uint32(env, n, &v);
     return v;
+}
+
+// logInit({ levelSpec?: string, logFile?: string })
+// Configures the global spdlog registry: builds stdout/stderr/(optional file)
+// sinks and per-area level table from the spec. Idempotent. Call before start()
+// so the GPU-process log reader dispatches into a configured registry.
+napi_value LogInit(napi_env env, napi_callback_info info) {
+    size_t argc = 1;
+    napi_value argv[1];
+    napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+
+    overdraw::log::Config cfg{};
+    if (argc >= 1) {
+        napi_valuetype t;
+        napi_typeof(env, argv[0], &t);
+        if (t == napi_object) {
+            char buf[1024] = {};
+            size_t n = 0;
+            napi_value v;
+            if (napi_get_named_property(env, argv[0], "levelSpec", &v) == napi_ok) {
+                napi_valuetype vt; napi_typeof(env, v, &vt);
+                if (vt == napi_string) {
+                    napi_get_value_string_utf8(env, v, buf, sizeof(buf), &n);
+                    std::string err;
+                    if (!overdraw::log::parseLevelSpec(std::string_view(buf, n), &cfg, &err)) {
+                        const std::string msg = "logInit: bad levelSpec: " + err;
+                        napi_throw_error(env, nullptr, msg.c_str());
+                        napi_value u; napi_get_undefined(env, &u); return u;
+                    }
+                }
+            }
+            char fbuf[4096] = {};
+            if (napi_get_named_property(env, argv[0], "logFile", &v) == napi_ok) {
+                napi_valuetype vt; napi_typeof(env, v, &vt);
+                if (vt == napi_string) {
+                    napi_get_value_string_utf8(env, v, fbuf, sizeof(fbuf), &n);
+                    cfg.filePath = std::string(fbuf, n);
+                }
+            }
+        }
+    }
+    overdraw::log::logInit(cfg);
+    napi_value u; napi_get_undefined(env, &u); return u;
+}
+
+// nativeLog(level: number, area: string, message: string)
+// Routes a log record from JS into the host's spdlog registry. The level
+// matches spdlog::level::level_enum (trace=0..critical=5). Unknown areas
+// fall back to "js". Format-string interpolation is done by the caller
+// (the log module / console shim); this is the plain-text entry point.
+napi_value NativeLog(napi_env env, napi_callback_info info) {
+    size_t argc = 3;
+    napi_value argv[3];
+    napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+    if (argc < 3) {
+        napi_value u; napi_get_undefined(env, &u); return u;
+    }
+    uint32_t level = 0;
+    napi_get_value_uint32(env, argv[0], &level);
+    if (level > 6) level = 2;  // clamp to spdlog::level::off
+
+    char areaBuf[32] = {};
+    size_t areaLen = 0;
+    napi_get_value_string_utf8(env, argv[1], areaBuf, sizeof(areaBuf), &areaLen);
+    auto area = overdraw::log::areaFromName(std::string_view(areaBuf, areaLen));
+    if (area == overdraw::log::Area::Count_) area = overdraw::log::Area::Js;
+
+    // Message: variable length. Two-step to handle long messages.
+    size_t msgLen = 0;
+    napi_get_value_string_utf8(env, argv[2], nullptr, 0, &msgLen);
+    std::string msg(msgLen, '\0');
+    size_t actual = 0;
+    if (msgLen > 0) {
+        napi_get_value_string_utf8(env, argv[2], msg.data(), msgLen + 1, &actual);
+    }
+    overdraw::log::logger(area).log(
+        static_cast<spdlog::level::level_enum>(level), msg);
+
+    napi_value u; napi_get_undefined(env, &u); return u;
 }
 
 // gpuHandles() -> { instance: bigint, device: bigint } | null
@@ -1411,6 +1504,11 @@ napi_value Stop(napi_env env, napi_callback_info) {
         }
 #endif
         g_addon.loopRunning = false;
+    }
+    // Stop the log reader thread (drains its socket; closes the host-side fd).
+    if (g_addon.logSource) {
+        g_addon.logSource->stop();
+        g_addon.logSource.reset();
     }
     // Reject any still-pending plugin broker requests.
     for (auto& b : g_pendingConnBrokers) { ::close(b.clientFd); napi_delete_reference(env, b.cb); }
@@ -2171,6 +2269,8 @@ napi_value Init(napi_env env, napi_value exports) {
     reg("pluginReleaseSurfaceBuffer", PluginReleaseSurfaceBuffer);
     reg("setOnOutputDescriptor", SetOnOutputDescriptor);
     reg("updateOutputSize", UpdateOutputSize);
+    reg("logInit", LogInit);
+    reg("nativeLog", NativeLog);
 
     napi_set_named_property(env, exports, "start", fnStart);
     napi_set_named_property(env, exports, "stop", fnStop);

@@ -9,6 +9,7 @@ import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 
 import type { Addon } from "./types.js";
+import { bindAddon, installConsoleShim, parseLogArgs, log } from "./log.js";
 
 const require = createRequire(import.meta.url);
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -19,15 +20,19 @@ const addon = require(join(__dirname, "..", "build", "overdraw_native.node")) as
 const gpuBin = process.env.OVERDRAW_GPU_PROCESS
   ?? join(__dirname, "..", "build", "overdraw-gpu-process");
 
+bindAddon(addon);
+addon.logInit(parseLogArgs(process.argv.slice(2)));
+installConsoleShim();
+
 // onFrame is invoked by the native frame timer (C++ -> JS event path).
 let frameEvents = 0;
 const onFrame = (presented: number): void => {
   frameEvents++;
-  console.log(`[core/js] onFrame event #${frameEvents}: ${presented} frames presented`);
+  log.info("core", `onFrame event #${frameEvents}: ${presented} frames presented`);
 };
 
 const { width, height } = addon.start(gpuBin, onFrame);
-console.log(`[core/js] up; host window ${width}x${height}; libuv driving frames`);
+log.info("core", `up; host window ${width}x${height}; libuv driving frames`);
 
 // Run for a bounded time (the libuv frame timer keeps the loop alive), then
 // stop. A real run would stop on window close / signal.
@@ -35,5 +40,5 @@ const runMs = Number(process.env.OVERDRAW_RUN_MS ?? 4000);
 setTimeout(() => {
   const n = addon.presentedCount();
   addon.stop();
-  console.log(`[core/js] presented ${n} frames over libuv; ${frameEvents} onFrame events; stopped cleanly`);
+  log.info("core", `presented ${n} frames over libuv; ${frameEvents} onFrame events; stopped cleanly`);
 }, runMs);

@@ -12,6 +12,9 @@ endif()
 # Sets Dawn_DIR (downloads/extracts the prebuilt wire bundle on first configure).
 add_subdirectory(3rdparty/dawn)
 
+# spdlog (FetchContent, compiled static lib). Provides spdlog::spdlog target.
+add_subdirectory(3rdparty/spdlog)
+
 find_package(Dawn REQUIRED)
 find_package(PkgConfig REQUIRED)
 pkg_check_modules(WAYLAND_CLIENT REQUIRED wayland-client)
@@ -60,7 +63,7 @@ target_include_directories(overdraw-gpu-process PRIVATE
     ${IPC_INCLUDE} ${XDG_SHELL_DIR} ${WAYLAND_CLIENT_INCLUDE_DIRS}
     ${GBM_INCLUDE_DIRS} ${LIBDRM_INCLUDE_DIRS})
 target_link_libraries(overdraw-gpu-process PRIVATE
-    dawn::webgpu_dawn ${WAYLAND_CLIENT_LIBRARIES}
+    overdraw_log dawn::webgpu_dawn ${WAYLAND_CLIENT_LIBRARIES}
     ${GBM_LIBRARIES} ${LIBDRM_LIBRARIES} pthread dl rt)
 if(OVERDRAW_KMS)
     target_compile_definitions(overdraw-gpu-process PRIVATE OVERDRAW_KMS=1)
@@ -90,11 +93,23 @@ message(STATUS "Node addon headers: ${NODE_INCLUDE_DIR}")
 # Reusable Dawn wire transport (WireLink + transport/side_channel headers). No
 # Wayland/Node deps, so BOTH the core addon and the plugin Worker addon can link
 # it without pulling in wayland-server etc.
+# Logging static lib. No Dawn / Wayland / Node dep: just spdlog + the
+# log-record IPC frame format. Linked by every binary that produces or
+# consumes log records (host addon, plugin addon, GPU process).
+add_library(overdraw_log STATIC
+    native/log/log.cpp
+    native/log/ipc_sink.cpp
+    native/log/ipc_source.cpp)
+target_include_directories(overdraw_log PUBLIC
+    ${IPC_INCLUDE} ${NATIVE_INCLUDE})
+target_link_libraries(overdraw_log PUBLIC spdlog::spdlog pthread)
+set_target_properties(overdraw_log PROPERTIES POSITION_INDEPENDENT_CODE ON)
+
 add_library(overdraw_wire STATIC
     native/core/wire_link.cpp)
 target_include_directories(overdraw_wire PUBLIC
     ${IPC_INCLUDE} ${NATIVE_INCLUDE})
-target_link_libraries(overdraw_wire PUBLIC dawn::webgpu_dawn_wire pthread)
+target_link_libraries(overdraw_wire PUBLIC overdraw_log dawn::webgpu_dawn_wire pthread)
 set_target_properties(overdraw_wire PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
 # Compiled once and linked by the addon (and any future native consumer), so
@@ -289,6 +304,10 @@ target_link_libraries(ctrl-sender-test PRIVATE dawn::webgpu_dawn_wire)
 # drainAll. No Dawn dep; the include path is just the shared ipc/ dir.
 add_executable(wire-barrier-test test/wire-barrier-test.cpp)
 target_include_directories(wire-barrier-test PRIVATE ${IPC_INCLUDE})
+
+# ---- Logging native unit test (areas, --log-level parser, ipc sink/source) ----
+add_executable(log-test test/log-test.cpp)
+target_link_libraries(log-test PRIVATE overdraw_log)
 
 # ---- dmabuf test client (linux-dmabuf-v1 import + composite) ----
 add_executable(dmabuf-test-client

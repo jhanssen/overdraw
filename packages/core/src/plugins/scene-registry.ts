@@ -18,6 +18,8 @@
 // as the JsCompositor + the gpu-broker; the Worker plugin holds only
 // the integer id.
 
+import { log } from "../log.js";
+
 export type SceneId = number;
 
 // What the transitions broker (or any future consumer) needs from a
@@ -142,12 +144,12 @@ export function createSceneRegistry(): SceneRegistry {
     // bracket close orders before the resource free.
     if (slot.release) {
       try { slot.release(); }
-      catch (e) { console.error(`[scene-registry] release(${id}) threw:`, e); }
+      catch (e) { log.err("plugin", `scene-registry: release(${id}) threw: %o`, e); }
       slot.release = null;
     }
     slots.delete(id);
     try { slot.onTeardown(); }
-    catch (e) { console.error(`[scene-registry] onTeardown(${id}) threw:`, e); }
+    catch (e) { log.err("plugin", `scene-registry: onTeardown(${id}) threw: %o`, e); }
   }
 
   return {
@@ -194,7 +196,7 @@ export function createSceneRegistry(): SceneRegistry {
         if (slot.pinned === 0 && slot.release) {
           try { slot.release(); }
           catch (e) {
-            console.error(`[scene-registry] release(${id}) threw:`, e);
+            log.err("plugin", `scene-registry: release(${id}) threw: %o`, e);
           }
           slot.release = null;
         }

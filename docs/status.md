@@ -3382,6 +3382,56 @@ capabilities exist to grant).
 
 ## Not yet built (design only)
 
+- **Logging.** TS surface migrated; native surface not yet migrated.
+  Infrastructure (designed in `architecture.md` Logging section) is in
+  place: spdlog 1.17.0 (`3rdparty/spdlog` via FetchContent, compiled
+  mode), fixed area set (`core`/`wayland`/`xdg`/`ipc`/`seat`/`input`/
+  `gpu`/`dawn`/`plugin`/`js`), severity-based stdout/stderr split (≤info
+  to stdout, ≥warn to stderr), opt-in `--log-file=PATH` (truncate on
+  start, no rotation), per-area `--log-level=SPEC` (e.g.
+  `--log-level=debug` or `--log-level=core=debug,gpu=info`). The host
+  parses these in `packages/core/src/log.ts` and calls
+  `addon.logInit(...)`; `installConsoleShim()` replaces
+  `globalThis.console.{log,info,warn,error,debug,trace}` so every
+  `console.*` routes via `addon.nativeLog` on area `"js"`. Per-area
+  emission uses `import { log } from "./log.js"; log.info("wayland",
+  "client %d", id)` (TypeScript-checked area string). All TS call sites
+  in `packages/core/src/**/*.ts` are migrated to either the `log` module
+  (with a specific area) or `console.*` (catch-all `"js"` area); the only
+  intentional exceptions are `packages/core/src/log.ts` itself (the shim
+  installer) and `packages/core/src/plugins/runtime-warnings.ts` (which
+  deliberately uses raw `console.error` to bypass test log stubs).
+  Cross-process flow: the GPU process is spawned with a fourth socket
+  (`--log-fd=N`, `SOCK_SEQPACKET`); records are fragmented into
+  `LogPacket`s (480-byte payload per fragment, header carries
+  level/area/seq/fragIdx/fragCount); the host's `IpcSource` thread
+  reassembles + dispatches into the host registry's logger for that
+  area. A bounded ring (256 records) in the GPU-process `IpcSink` buffers
+  records emitted before `--log-fd` is parsed; oldest drops with a
+  single `warn`-level overflow notice on `ipc`. The advertised-but-
+  unimplemented `Fault { reason }` GPU→core event listed in
+  `architecture.md` is subsumed (no separate event; a fault becomes a
+  normal `err`-level log on `gpu`).
+
+  **Not yet migrated:** native call sites (140 `fprintf(stderr, "[gpu] ...")` /
+  `printf("[core] ...")` sites across `packages/core/native/**` and
+  `packages/core/gpu-process/src/**`). These still write directly to the
+  inherited stderr instead of going through `LOG_*(Area, ...)` macros.
+  Result: GPU/core native diagnostics bypass the `--log-file` sink and
+  the runtime level filter, but everything still appears on the
+  terminal. Migration is a mechanical sweep with judgment on the right
+  area per file.
+
+  **Known soundness gap (low impact):** `overdraw::log::logger(Area)`
+  returns a `spdlog::logger&` to a `shared_ptr` held in a mutex-guarded
+  registry; the lock is dropped on return, so a concurrent `logInit`
+  could in principle delete the pointee while the reference is in
+  use. `IpcSource` works around this by resolving via
+  `spdlog::get(name)` (returns `shared_ptr`, keeps the logger alive
+  across the call). The hot path is fine in practice (`logInit` is
+  called once before any records flow) but the API is technically
+  unsound; a future change would either return `shared_ptr` or hand
+  out a wrapper that owns the lifetime.
 - **WM behavioral state.** Layout policy is a bundled plugin (master-stack
   tiler, Phase 2) — that piece is built. What is not: behavioral handling of
   the `xdg_toplevel` state requests (move/resize/maximize/fullscreen/

@@ -172,7 +172,9 @@ GPU process → core events:
 - `Hello` — handshake reply.
 - `DeviceLost { deviceWireHandle, reason }` — deterministic device-lost
   notification.
-- `Fault { reason }` — non-fatal error log.
+
+Non-fatal errors and general diagnostics from the GPU process go through
+the logging IPC sink (see Logging), not a dedicated event.
 
 Notes:
 
@@ -1452,6 +1454,167 @@ overdraw/
 - wlroots is not used: its main value is its C protocol implementations,
   which we deliberately reimplement in JS; its backend abstraction we
   provide ourselves.
+- spdlog (FetchContent, compiled mode) — see Logging.
+
+## Logging
+
+Unified logging across the three execution contexts (Node host JS, core
+native addon, GPU process). One library (spdlog), one configuration, one
+set of sinks, owned by the host process.
+
+### Levels
+
+`trace`, `debug`, `info`, `warn`, `err`, `critical`, `off`. `SPDLOG_ACTIVE_LEVEL`
+is set by build type: debug builds compile in `trace`; release builds compile
+in `info` (trace/debug calls strip to zero cost). Runtime level is set per
+area (see below).
+
+### Areas
+
+A fixed set of named loggers declared in one header. Adding one is a
+single-line change there.
+
+| area      | purpose                                                  |
+|-----------|----------------------------------------------------------|
+| `core`    | core compositor glue, lifecycle                          |
+| `wayland` | `wl_*` protocol handlers, server, trampoline             |
+| `xdg`     | `xdg_*` protocols (shell, decoration, popups)            |
+| `ipc`     | core ↔ GPU process wire transport, side channels         |
+| `seat`    | `wl_seat`, focus, capabilities                           |
+| `input`   | libinput / pointer / keyboard / xkb                      |
+| `gpu`     | GPU process internals (Dawn host, KMS, DRM, allocator)   |
+| `dawn`    | messages routed from Dawn's internal logger              |
+| `plugin`  | plugin runtime (host side); per-plugin lines are tagged  |
+| `js`      | catch-all for `console.*` calls without an explicit area |
+
+Free-form area strings are rejected; the C++ API takes a typed enum and
+the JS `console.*` shim always uses `js`. JS code that wants a different
+area uses a `log` module (`import { log } from "@overdraw/log"; log.info("core", "...")`)
+that wraps the same napi binding.
+
+### Sinks
+
+Two sinks, both attached to every area, split by severity:
+
+- **stdout sink**, level filter ≤ `info` (`trace`/`debug`/`info`).
+- **stderr sink**, level filter ≥ `warn` (`warn`/`err`/`critical`).
+
+This means `console.log` → stdout, `console.warn`/`console.error` → stderr,
+and the same severity-based split applies uniformly to C++ `LOG_*` calls
+regardless of which process they originated in.
+
+A third **file sink** is attached only if `--log-file=PATH` is passed.
+The file sink accepts all levels (subject to per-area runtime filtering)
+and writes truncate-on-start (no rotation in v1; rotation is a future
+addition if logs get big). Without `--log-file`, no file is written.
+
+All sinks live in the host process. The GPU process forwards records
+over IPC; it has no sinks of its own.
+
+### CLI
+
+Two flags on the host process (and forwarded conceptually — the GPU
+process inherits the filter table over IPC, not the CLI):
+
+- `--log-level=SPEC` where `SPEC` is a comma-separated list of `area=level`
+  pairs. A bare level with no `=` applies as the default for all areas.
+  Examples:
+  - `--log-level=debug` — every area at debug.
+  - `--log-level=core=debug,gpu=info,wayland=trace` — per-area, areas not
+    listed stay at the built-in default (`info`).
+  - `--log-level=warn,gpu=debug` — default warn, gpu at debug.
+  Unknown areas are an error at startup.
+
+- `--log-file=PATH` — enable the file sink at `PATH` (truncated on start).
+  Omitted = no file written.
+
+### JS integration
+
+The native addon installs a shim onto `globalThis.console` during addon
+init that replaces `log`, `info`, `warn`, `error`, `debug`, `trace` with
+calls into `nativeLog(level, area, message)`. The original `console.*`
+functions are not preserved; redirecting them is the whole point (future
+contributors writing `console.log` is the expected path, not a fallback).
+
+`console.log` maps to `info`, `console.warn` to `warn`, `console.error`
+to `err`, `console.debug` to `debug`, `console.trace` to `trace`,
+`console.info` to `info`. All `console.*` calls use area `js`.
+
+Code that wants a specific area imports the `log` module:
+
+```ts
+import { log } from "@overdraw/log";
+log.info("wayland", "client connected fd=%d", fd);
+log.warn("ipc", "wire backpressure depth=%d", depth);
+```
+
+The `log` module is a thin wrapper over `nativeLog`. Format-string handling
+matches `util.format` (lazy: only invoked if the level passes the runtime
+filter).
+
+### GPU process forwarding
+
+The GPU process is a separate binary. It links spdlog the same way the
+core addon does, but configures only an **IPC sink** that serializes each
+log record into a wire frame on the existing side channel
+(`packages/core/native/ipc/side_channel.h`). The host receives these
+frames and replays them into its own spdlog (preserving level, area,
+message, originating-process tag, and the record's monotonic timestamp).
+
+**Pre-IPC bring-up.** Before the GPU process's wire connection is
+established, log records cannot be sent. They are accumulated in a
+fixed-capacity in-memory ring (e.g. 256 records) and flushed in order
+once the IPC sink comes up. If the ring overflows before flush, oldest
+records are dropped and a single `warn`-level "log buffer overflow:
+N records dropped" record is enqueued in their place. The GPU process
+makes **no** direct writes to its inherited stderr — the existing
+`FD_CLOEXEC`-cleared inheritance from `gpu_process.cpp:62` is no longer
+relied upon for logging (it remains for the crash handler, which writes
+`/tmp/overdraw-gpu-crash.txt` per CLAUDE.md and is not part of normal
+logging).
+
+**Filter table.** When the host applies `--log-level`, the per-area
+filter is sent to the GPU process over the same side channel so the
+GPU process can drop records below threshold at the source rather than
+spending wire bandwidth on them. Changes to the table after startup are
+broadcast the same way (no JS API in v1, but the mechanism supports one).
+
+This also subsumes the currently-advertised-but-unimplemented `Fault {
+reason }` event listed at "GPU → core events": a fault becomes a normal
+`err`-level log record on the `gpu` area. The `Fault` line in that
+table is replaced by this.
+
+### Implementation surface
+
+- **`packages/core/native/log/Log.h`** — public API: `LOG_TRACE/DEBUG/
+  INFO/WARN/ERR/CRIT(area, fmt, ...)` macros, area enum, init function
+  (`log_init(const LogConfig&)`), CLI-spec parser
+  (`parse_log_level_spec(string)` → table).
+- **`packages/core/native/log/Log.cpp`** — sink construction, filter
+  table application, area→logger map.
+- **`packages/core/native/log/ipc_sink.{h,cpp}`** — spdlog sink subclass
+  that writes records to the side channel; symmetric `ipc_source` on
+  the host side that reads frames and replays.
+- **`packages/core/native/log/console_shim.{h,cpp}`** + napi binding
+  `nativeLog(level, area, msg)`.
+- **`packages/core/src/log.ts`** — `log` module + `console.*` install
+  (called from addon init).
+- **`packages/core/gpu-process/src/log_ringbuf.{h,cpp}`** — pre-IPC ring
+  buffer.
+- CMake: spdlog via `FetchContent` in compiled mode, linked into
+  `overdraw_wire` (so both the addon and the GPU process pick it up
+  through their existing dependency on the wire lib).
+
+### Non-goals (v1)
+
+- Async logging sink. spdlog supports it; v1 stays synchronous for
+  determinism in tests.
+- File rotation. Single truncate-on-start file is enough; rotation
+  added if/when needed.
+- Structured/JSON output. Plain text only. A JSON sink is a future
+  addition.
+- Runtime level changes from JS. Mechanism exists (IPC broadcasts the
+  filter table) but no JS API is exposed in v1.
 
 ## Open items
 
@@ -1481,8 +1644,6 @@ overdraw/
 ### Not yet designed (still needed before/during v1)
 
 - **Configuration format.** JS / TOML / JSON not chosen.
-- **Logging.** Multi-process consistent log output. Mechanism not
-  designed.
 - **Plugin naming.** Stable identifier for capability grants, logging,
   restart counting. Probably the config-supplied name.
 - **Plugin SDK native addon shape.** Same `.node` as core's addon

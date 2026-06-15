@@ -29,6 +29,7 @@
 
 import type { InputStep, KeyStep, ButtonStep } from "./keyspec.js";
 import { MOD_LOCK, MOD_MOD2, formatStep, formatChord, isButtonStep } from "./keyspec.js";
+import { log } from "../log.js";
 
 // A press handler. Returns a boolean to indicate consume (true) or forward
 // (false). Returning void/undefined means consume. May be async; the
@@ -434,12 +435,12 @@ export class BindingChain {
           if (r && typeof (r as Promise<unknown>).then === "function") {
             (r as Promise<unknown>).catch((err: unknown) => {
               const msg = err instanceof Error ? err.message : String(err);
-              console.error(`[binding-chain] handler for '${formatChord(chord)}' failed: ${msg}`);
+              log.err("input", `binding-chain: handler for '${formatChord(chord)}' failed: ${msg}`);
             });
           }
         } catch (err) {
           const msg = err instanceof Error ? err.message : String(err);
-          console.error(`[binding-chain] handler for '${formatChord(chord)}' threw: ${msg}`);
+          log.err("input", `binding-chain: handler for '${formatChord(chord)}' threw: ${msg}`);
         }
         return { consume: true, matched: true };
       }
@@ -533,12 +534,12 @@ export class BindingChain {
         if (r && typeof (r as Promise<unknown>).then === "function") {
           (r as Promise<unknown>).catch((err: unknown) => {
             const msg = err instanceof Error ? err.message : String(err);
-            console.error(`[binding-chain] release for '${formatChord(inst.binding.steps)}' failed: ${msg}`);
+            log.err("input", `binding-chain: release for '${formatChord(inst.binding.steps)}' failed: ${msg}`);
           });
         }
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
-        console.error(`[binding-chain] release for '${formatChord(inst.binding.steps)}' threw: ${msg}`);
+        log.err("input", `binding-chain: release for '${formatChord(inst.binding.steps)}' threw: ${msg}`);
       }
     }
     return { consume: anyParticipated };
@@ -553,7 +554,7 @@ export class BindingChain {
     if (!this.listener) return;
     try { this.listener(ev); } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
-      console.error(`[binding-chain] listener threw on '${ev.kind}': ${msg}`);
+      log.err("input", `binding-chain: listener threw on '${ev.kind}': ${msg}`);
     }
   }
 }

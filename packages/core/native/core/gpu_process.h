@@ -14,6 +14,7 @@ struct GpuProcess {
     int wireFd = -1;    // core-side end of the Dawn wire socket
     int ctrlFd = -1;    // core-side end of the control side-channel socket
     int inputFd = -1;   // core-side end of the input socket (GPU process -> core)
+    int logFd = -1;     // core-side end of the log socket (GPU process -> core)
 };
 
 // Output backend selection passed to the GPU process via argv.

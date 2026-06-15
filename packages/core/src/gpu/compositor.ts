@@ -301,6 +301,7 @@ import type { CompositorSink, Layer } from "../protocols/ctx.js";
 import { LAYER_ORDER, OUTPUT_DEFAULT } from "../protocols/ctx.js";
 import type { TransitionKind } from "@overdraw/transition-types";
 import type { WaylandFd } from "../types.js";
+import { log } from "../log.js";
 
 // Map a TransitionKind name to its WGSL u32 encoding (must match the
 // kind switch in TRANSITION_WGSL.fs above).
@@ -1187,7 +1188,7 @@ export class JsCompositor implements CompositorSink {
                       bufferId: number): boolean {
     if (!this.dawn || this.deviceHandle === 0n) {
       if (!this.warnedDmabuf) {
-        console.warn("[js-compositor] dmabuf needs dawn.wrapTexture + deviceHandle");
+        log.warn("core", "js-compositor: dmabuf needs dawn.wrapTexture + deviceHandle");
         this.warnedDmabuf = true;
       }
       return false;
@@ -1323,7 +1324,7 @@ export class JsCompositor implements CompositorSink {
     if (this.dmabufImports.has(bufferId)) return;  // defensive: never re-import
     const pending = this.dmabufPending.get(bufferId);
     if (!pending) {
-      console.warn(`[js-compositor] importBuffer(${bufferId}) without pending descriptor (executor/state-machine drift)`);
+      log.warn("core", `js-compositor: importBuffer(${bufferId}) without pending descriptor (executor/state-machine drift)`);
       return;
     }
     const dawn = this.dawn;
@@ -1461,7 +1462,7 @@ export class JsCompositor implements CompositorSink {
     const keep: Array<{ serial: number; cb: () => void }> = [];
     for (const e of this.afterFrame) {
       if (e.serial <= this.completedSerial) {
-        try { e.cb(); } catch (err) { console.warn("[js-compositor] afterCurrentFrame cb threw", err); }
+        try { e.cb(); } catch (err) { log.warn("core", "js-compositor: afterCurrentFrame cb threw %o", err); }
       } else {
         keep.push(e);
       }
@@ -1825,7 +1826,7 @@ export class JsCompositor implements CompositorSink {
         const endRead = this.activeTransition.pendingEndRead;
         this.activeTransition.pendingEndRead = null;
         try { endRead(); }
-        catch (e) { console.error("[js-compositor] transition endRead threw:", e); }
+        catch (e) { log.err("core", "js-compositor: transition endRead threw: %o", e); }
       }
 
       this.closeImportBrackets(bracketed);
@@ -1846,7 +1847,7 @@ export class JsCompositor implements CompositorSink {
       // the GPU process's bracket-decode invariants).
       for (const cb of this.liveProducers) {
         try { cb(); }
-        catch (e) { console.warn("[js-compositor] liveProducer threw:", e); }
+        catch (e) { log.warn("core", "js-compositor: liveProducer threw: %o", e); }
       }
 
       if (presenting) {

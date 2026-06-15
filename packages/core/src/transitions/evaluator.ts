@@ -16,6 +16,7 @@
 
 import type { EasingSpec } from "@overdraw/animation-types";
 import { resolveEasing, type EasingFn } from "../animations/easing.js";
+import { log } from "../log.js";
 
 export interface TransitionInstallOpts {
   // Duration in ms. Must be > 0.
@@ -110,7 +111,7 @@ export function createTransitionEvaluator(): TransitionEvaluator {
         active = null;
         if (a.commit) {
           try { a.commit(); }
-          catch (e) { console.error("[transitions] commit threw:", e); }
+          catch (e) { log.err("core", "transitions: commit threw: %o", e); }
         }
         a.resolve();
         return;

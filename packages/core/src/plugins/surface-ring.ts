@@ -27,6 +27,7 @@
 // plugin's overdraw_plugin_native) or which device (core's vs the worker's).
 
 import { SlotStates, SLOT_FREE, SLOT_PRESENTED } from "./surface-slots.js";
+import { log } from "../log.js";
 
 // --- shared types ------------------------------------------------------------
 
@@ -212,7 +213,7 @@ export class SurfaceProducer {
     // that need to observe failures should use present().
     if (r && typeof (r as Promise<void>).then === "function") {
       (r as Promise<void>).catch((e) => {
-        console.error("[SurfaceProducer.presentSync] onPresented rejected:", e);
+        log.err("plugin", "SurfaceProducer.presentSync onPresented rejected: %o", e);
       });
     }
   }

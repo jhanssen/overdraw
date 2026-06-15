@@ -45,6 +45,9 @@
 #include "transport.h"
 #include "wire_barrier.h"
 
+#include "log/log.h"
+#include "log/ipc_sink.h"
+
 using namespace overdraw;
 
 namespace {
@@ -118,6 +121,9 @@ int buildFormatTableMemfd(const std::vector<gpu::FormatTableEntry>& entries) {
 
 int run(int wireFd, int ctrlFd, int inputFd, bool headless,
         uint32_t headlessW, uint32_t headlessH, bool outputKms) {
+    LOG_INFO(Gpu, "overdraw-gpu-process up: pid={} headless={} output={}",
+             ::getpid(), headless ? "yes" : "no",
+             headless ? "none" : (outputKms ? "kms" : "nested"));
     // 1) Output: in nested mode, an OutputBackend brings up the display target
     //    (HostWindowOutputBackend in phase 1 = a host Wayland output window the
     //    GPU process is a client of, forwarding host pointer/keyboard over
@@ -2268,6 +2274,7 @@ int main(int argc, char** argv) {
     // Output-backend selector: "--output=kms" or "--output=nested" (default).
     // Headless ignores this (no output backend exists in headless mode).
     bool outputKms = false;
+    int logFd = -1;
     for (int i = 3; i < argc; ++i) {
         if (std::strcmp(argv[i], "--headless") == 0 && i + 1 < argc) {
             headless = true;
@@ -2277,8 +2284,23 @@ int main(int argc, char** argv) {
             outputKms = true;
         } else if (std::strcmp(argv[i], "--output=nested") == 0) {
             outputKms = false;
+        } else if (std::strncmp(argv[i], "--log-fd=", 9) == 0) {
+            logFd = std::atoi(argv[i] + 9);
         }
     }
     if (headless && (hw == 0 || hh == 0)) { hw = 1280; hh = 720; }  // default
+
+    // Route every LOG_* through the IPC sink. Until --log-fd is set the sink
+    // buffers in a bounded ring (kRingCapacity); records flush in order once
+    // the fd is attached. logInit() registers a logger per area against this
+    // sink so logger(Area) returns the right thing.
+    auto ipcSink = std::make_shared<overdraw::log::IpcSink>();
+    if (logFd >= 0) ipcSink->setFd(logFd);
+    {
+        overdraw::log::Config cfg{};
+        cfg.defaultLevel = spdlog::level::trace;
+        cfg.senderSink = ipcSink;
+        overdraw::log::logInit(cfg);
+    }
     return run(wireFd, ctrlFd, inputFd, headless, hw, hh, outputKms);
 }

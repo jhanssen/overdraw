@@ -24,6 +24,7 @@ import type { TransitionKind } from "@overdraw/transition-types";
 import { TRANSITION_KINDS } from "@overdraw/transition-types";
 import type { EasingSpec } from "@overdraw/animation-types";
 import { OUTPUT_DEFAULT } from "../protocols/ctx.js";
+import { log } from "../log.js";
 
 export const NOT_HANDLED = Symbol("transitions-broker:not-handled");
 
@@ -106,8 +107,8 @@ export function createTransitionsBroker(
           setOutputStack(item.outputId,
             item.ids === null ? null : item.ids.slice());
         } catch (e) {
-          console.error(
-            `[transitions] commit setOutputStack(${item.outputId}) threw:`, e);
+          log.err("plugin",
+            `transitions: commit setOutputStack(${item.outputId}) threw: %o`, e);
         }
       }
     }

@@ -32,6 +32,7 @@ import type {
 import type { Presentation } from "../events/types.js";
 import type { ReservedZoneRegistry } from "./reserved-zones.js";
 import { OUTPUT_DEFAULT } from "../protocols/ctx.js";
+import { log as coreLog } from "../log.js";
 
 export type { LayoutInputs, LayoutResult, LayoutReason } from "@overdraw/layout-types";
 
@@ -79,12 +80,12 @@ export interface LayoutDriverDeps {
   // Reserved-zone registry. Optional: if absent, the driver treats the
   // full output rect as the tile region (no reservations).
   reservedZones?: ReservedZoneRegistry;
-  // Diagnostic sink. Default: console.warn.
+  // Diagnostic sink. Default: log.warn on 'core' area.
   log?: (msg: string) => void;
 }
 
 export function createLayoutDriver(deps: LayoutDriverDeps): LayoutDriver {
-  const log = deps.log ?? ((m) => console.warn(`[layout] ${m}`));
+  const log = deps.log ?? ((m) => coreLog.warn("core", `layout: ${m}`));
 
   let running = false;
   let pendingReason: LayoutReason | null = null;

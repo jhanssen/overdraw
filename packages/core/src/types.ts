@@ -198,6 +198,20 @@ export interface Addon {
   // wayland and libinput backends to map / clamp pointer coordinates). Called
   // when the output reconfigures. Silent no-op if no input backend is active.
   updateOutputSize(width: number, height: number): void;
+
+  // Initialize the global spdlog registry (stdout + stderr sinks, optional
+  // file sink) and the per-area level table. Idempotent. Call before start()
+  // so cross-process records dispatched by the GPU log reader thread land in
+  // a configured registry. `levelSpec` is the --log-level argument value
+  // (`area=level` pairs, comma-separated; a bare level becomes the default).
+  // Throws on a malformed levelSpec.
+  logInit(opts?: { levelSpec?: string; logFile?: string }): void;
+
+  // Emit a log record on the named area. The level matches
+  // spdlog::level::level_enum (trace=0, debug=1, info=2, warn=3, err=4,
+  // critical=5). Used by the log module and the console.* shim. Unknown
+  // areas fall back to "js".
+  nativeLog(level: number, area: string, message: string): void;
 }
 
 // One OutputDescriptor message delivered from the GPU process. Mirrors the

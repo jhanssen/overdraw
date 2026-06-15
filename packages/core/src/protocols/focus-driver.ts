@@ -14,6 +14,7 @@
 import type {
   FocusReason, FocusInputs, FocusResult,
 } from "@overdraw/focus-types";
+import { log as coreLog } from "../log.js";
 
 export type { FocusReason, FocusInputs, FocusResult } from "@overdraw/focus-types";
 
@@ -47,7 +48,7 @@ export interface FocusDriverDeps {
 }
 
 export function createFocusDriver(deps: FocusDriverDeps): FocusDriver {
-  const log = deps.log ?? ((m) => console.warn(`[focus] ${m}`));
+  const log = deps.log ?? ((m) => coreLog.warn("core", `focus: ${m}`));
 
   let seq = 0;
   let latestSeq = 0;

@@ -26,6 +26,7 @@ import type { Resource } from "../types.js";
 import type { CompositorState, SurfaceRecord, SubsurfaceRecord } from "./ctx.js";
 import { WINDOW_EVENT } from "../events/types.js";
 import type { WindowClosingEvent } from "../events/types.js";
+import { log } from "../log.js";
 
 // Closing-driver dependencies. Wired by installProtocols when the
 // surrounding harness/launcher provides them; absent means "no closing
@@ -96,7 +97,7 @@ export function createClosingDriver(deps: ClosingDriverDeps): ClosingDriver {
           outerRect: { x: outer.x, y: outer.y, w: outer.width, h: outer.height },
         });
       } catch (e) {
-        console.error("[closing-driver] createClosingPhantom threw:", e);
+        log.err("core", "closing-driver: createClosingPhantom threw: %o", e);
         return false;
       }
 
@@ -125,7 +126,7 @@ export function createClosingDriver(deps: ClosingDriverDeps): ClosingDriver {
       try {
         state.bus?.emit(WINDOW_EVENT.closing, payload);
       } catch (e) {
-        console.error("[closing-driver] window.closing subscriber threw:", e);
+        log.err("core", "closing-driver: window.closing subscriber threw: %o", e);
       }
 
       // Arm the backstop. If the plugin's animation completes and
@@ -138,7 +139,7 @@ export function createClosingDriver(deps: ClosingDriverDeps): ClosingDriver {
         // teardown, etc.); call the optional destroy guarded.
         try { state.compositor.destroyClosingPhantom?.(phantomSurfaceId); }
         catch (e) {
-          console.error("[closing-driver] backstop destroy threw:", e);
+          log.err("core", "closing-driver: backstop destroy threw: %o", e);
         }
       }, backstopMs);
       // Some test runners reference timers; mark unref'd so the

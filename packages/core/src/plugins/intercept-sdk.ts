@@ -70,6 +70,7 @@ import {
   SlotStates, SLOT_FREE, SLOT_PRESENTED,
 } from "./surface-slots.js";
 import { SurfaceConsumer, SurfaceProducer, awaitPresentedSlot } from "./surface-ring.js";
+import { log } from "../log.js";
 
 export interface WorkerInterceptDeps {
   pluginName: string;
@@ -124,13 +125,13 @@ export function createWorkerInterceptSdk(deps: WorkerInterceptDeps): InterceptAP
   registerEventHandler("intercept.matched", (data) => {
     handleMatched(data as MatchedEvent).catch((e: unknown) => {
       const msg = e instanceof Error ? e.message : String(e);
-      console.error(`[intercept ${pluginName}] matched handler threw: ${msg}`);
+      log.err("plugin", `intercept ${pluginName}: matched handler threw: ${msg}`);
     });
   });
   registerEventHandler("intercept.unmatched", (data) => {
     handleUnmatched(data as UnmatchedEvent).catch((e: unknown) => {
       const msg = e instanceof Error ? e.message : String(e);
-      console.error(`[intercept ${pluginName}] unmatched handler threw: ${msg}`);
+      log.err("plugin", `intercept ${pluginName}: unmatched handler threw: ${msg}`);
     });
   });
 
@@ -161,7 +162,7 @@ export function createWorkerInterceptSdk(deps: WorkerInterceptDeps): InterceptAP
             handlers.destroy?.();
           } catch (e: unknown) {
             const msg = e instanceof Error ? e.message : String(e);
-            console.error(`[intercept ${pluginName}] destroy threw: ${msg}`);
+            log.err("plugin", `intercept ${pluginName}: destroy threw: ${msg}`);
           }
           await endpoint.request("intercept.unregister", { registrationId: reg.id });
         },
@@ -183,8 +184,8 @@ export function createWorkerInterceptSdk(deps: WorkerInterceptDeps): InterceptAP
     const w = ev.width;
     const h = ev.height;
     if (!w || !h) {
-      console.error(
-        `[intercept ${pluginName}] matched ${ev.surfaceId} missing width/height`);
+      log.err("plugin",
+        `intercept ${pluginName}: matched ${ev.surfaceId} missing width/height`);
       return;
     }
 
@@ -369,7 +370,7 @@ class WorkerPerSurfaceState {
       afterReadDone: (cb) => {
         deps.device.queue.onSubmittedWorkDone().then(cb).catch((e: unknown) => {
           const msg = e instanceof Error ? e.message : String(e);
-          console.error(`[intercept ${cfg.pluginName}] onSubmittedWorkDone rejected: ${msg}`);
+          log.err("plugin", `intercept ${cfg.pluginName}: onSubmittedWorkDone rejected: ${msg}`);
         });
       },
     });
@@ -407,12 +408,12 @@ class WorkerPerSurfaceState {
       this.cfg.handlers.onSurfaceMatched?.(this.cfg.info);
     } catch (e: unknown) {
       const msg = e instanceof Error ? e.message : String(e);
-      console.error(`[intercept ${this.cfg.pluginName}] onSurfaceMatched threw: ${msg}`);
+      log.err("plugin", `intercept ${this.cfg.pluginName}: onSurfaceMatched threw: ${msg}`);
     }
     activeStatesInWorker.add(this);
     this.runLoop().catch((e: unknown) => {
       const msg = e instanceof Error ? e.message : String(e);
-      console.error(`[intercept ${this.cfg.pluginName}] runLoop threw: ${msg}`);
+      log.err("plugin", `intercept ${this.cfg.pluginName}: runLoop threw: ${msg}`);
     });
   }
 
@@ -431,7 +432,7 @@ class WorkerPerSurfaceState {
       this.cfg.handlers.onSurfaceUnmatched?.(this.cfg.info);
     } catch (e: unknown) {
       const msg = e instanceof Error ? e.message : String(e);
-      console.error(`[intercept ${this.cfg.pluginName}] onSurfaceUnmatched threw: ${msg}`);
+      log.err("plugin", `intercept ${this.cfg.pluginName}: onSurfaceUnmatched threw: ${msg}`);
     }
   }
 
@@ -473,8 +474,8 @@ class WorkerPerSurfaceState {
         });
       } catch (e: unknown) {
         const msg = e instanceof Error ? e.message : String(e);
-        console.error(
-          `[intercept ${this.cfg.pluginName}] render threw: ${msg}; ` +
+        log.err("plugin",
+          `intercept ${this.cfg.pluginName}: render threw: ${msg}; ` +
           `surface ${this.cfg.surfaceId} draws raw this frame`);
         // Don't present; the output slot stays ACQUIRED. We can't
         // unwind the writeBegin cleanly; presentSync to close the

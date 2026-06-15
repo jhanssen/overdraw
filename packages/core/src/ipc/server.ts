@@ -29,6 +29,7 @@ import {
   JSONRPC_ERRORS, encode, isRequest, ok, err, notify, parseMessage,
   type Json, type Request,
 } from "./protocol.js";
+import { log as coreLog } from "../log.js";
 
 export interface IpcServerOptions {
   // Absolute path of the Unix socket to listen on. Overdraw chooses
@@ -38,7 +39,7 @@ export interface IpcServerOptions {
   runtime: PluginRuntime;
   // The dynamic event bus: backs subscribe / unsubscribe.
   bus: DynamicBus;
-  // Diagnostics sink (default: console.warn for errors). Tests can capture.
+  // Diagnostics sink. Default: log.warn on 'ipc' area. Tests can capture.
   log?: (msg: string) => void;
 }
 
@@ -50,7 +51,7 @@ export class IpcServer {
 
   constructor(opts: IpcServerOptions) {
     this.opts = opts;
-    this.log = opts.log ?? ((m) => console.warn(`[ipc] ${m}`));
+    this.log = opts.log ?? ((m) => coreLog.warn("ipc", m));
   }
 
   // Start listening. Removes any stale socket file first (a previous overdraw

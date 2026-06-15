@@ -26,6 +26,7 @@ import { InThreadPlugin } from "./inthread-plugin.js";
 import type { InThreadGpuDeps } from "./inthread-gpu.js";
 import type { PluginController, PluginHandle, PluginState } from "./plugin-host.js";
 import { BusBridge } from "./bus-bridge.js";
+import { log } from "../log.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 // The built bootstrap (this file lives in dist/plugins/ after tsc).
@@ -129,7 +130,7 @@ class ManagedPlugin implements PluginHandle {
     this.cfg = cfg;
     this.opts = opts;
     this.ns = ns;
-    this.log = opts.log ?? ((m) => console.log(m));
+    this.log = opts.log ?? ((m) => log.info("plugin", m));
     this.ready = new Promise<void>((resolve) => { this.firstSettle = { resolve }; });
     const self = this;
     this.bridge = new BusBridge({

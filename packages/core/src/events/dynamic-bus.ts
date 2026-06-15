@@ -37,6 +37,8 @@
 // will be discarded. markSyncOnly() declares a name as sync-only up front so
 // the warning fires at intercept-register time.
 
+import { log } from "../log.js";
+
 export type DynamicListener = (name: string, payload: unknown) => void;
 export type ErrorReporter = (msg: string, err: unknown) => void;
 
@@ -111,7 +113,7 @@ export class DynamicBus {
   private warn: ErrorReporter;
 
   constructor(onError?: ErrorReporter) {
-    this.warn = onError ?? ((msg, err) => { console.warn(msg, err); });
+    this.warn = onError ?? ((msg, err) => { log.warn("core", "%s %o", msg, err); });
   }
 
   // Subscribe to an event by exact name or pattern. Returns a Subscription

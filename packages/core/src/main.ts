@@ -57,6 +57,7 @@ import { WINDOW_EVENT } from "./events/types.js";
 import { createCompositorBus } from "./events/window-bus.js";
 import { DynamicBus } from "./events/dynamic-bus.js";
 import { IpcServer } from "./ipc/server.js";
+import { bindAddon, installConsoleShim, parseLogArgs, log } from "./log.js";
 
 const require = createRequire(import.meta.url);
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -64,6 +65,23 @@ const __dirname = dirname(fileURLToPath(import.meta.url));
 const addon = require(join(__dirname, "..", "build", "overdraw_native.node")) as Addon;
 const gpuBin = process.env.OVERDRAW_GPU_PROCESS
   ?? join(__dirname, "..", "build", "overdraw-gpu-process");
+
+// Logging: configure spdlog from --log-level / --log-file BEFORE start() so
+// the GPU-process log reader thread (started inside addon.start) dispatches
+// records into a fully-configured registry. installConsoleShim replaces
+// globalThis.console.{log,info,warn,error,debug,trace} -- everything that
+// uses console.* from this point on routes through nativeLog on area "js".
+bindAddon(addon);
+{
+  const logArgs = parseLogArgs(process.argv.slice(2));
+  try {
+    addon.logInit(logArgs);
+  } catch (e) {
+    process.stderr.write(`overdraw: ${(e as Error).message}\n`);
+    process.exit(2);
+  }
+  installConsoleShim();
+}
 
 // The compositing pass runs in core JS over the Dawn wire (dawn.node).
 interface DawnModule extends DawnWire {
@@ -117,7 +135,7 @@ let stopped = false;
 function shutdown(signal: string): void {
   if (stopped) return;
   stopped = true;
-  console.log(`[overdraw] ${signal}; shutting down`);
+  log.info("core", `${signal}; shutting down`);
   // Graceful plugin shutdown is async (onShutdown callbacks). Give it a brief
   // chance, then tear down the compositor and exit regardless.
   const finish = (): void => {
@@ -147,7 +165,7 @@ process.on("SIGTERM", () => shutdown("SIGTERM"));
 pluginBus.subscribe("compositor.shutdown", () => shutdown("compositor.shutdown"));
 
 const config = await loadConfig(parseConfigArg(process.argv.slice(2)));
-console.log(`[overdraw] config: ${config.sourcePath ?? "(defaults; no config file)"}`);
+log.info("core", `config: ${config.sourcePath ?? "(defaults; no config file)"}`);
 
 // Backend selection. Production default: KMS (bare-metal). Override:
 //   --backend=nested (e.g. running under Hyprland during dev)
@@ -169,11 +187,11 @@ function parseBackendOpts(argv: string[], configCard: string | null):
   return card ? { backend, card } : { backend };
 }
 const backendOpts = parseBackendOpts(process.argv.slice(2), config.card);
-console.log(`[overdraw] backend: ${backendOpts.backend}`
+log.info("core", `backend: ${backendOpts.backend}`
   + (backendOpts.card ? ` card=${backendOpts.card}` : ""));
 
 const dims = addon.start(gpuBin, onFrame, onInput, backendOpts);
-console.log(`[overdraw] compositor up; output ${dims.width}x${dims.height}`);
+log.info("core", `compositor up; output ${dims.width}x${dims.height}`);
 
 // Bring up the JS compositor (nested present to the host swapchain over the wire).
 const dawn = loadDawn();
@@ -184,7 +202,7 @@ const device = dawn.wrapDevice(h.instance, h.device);
 const compositor: CompositorSink = new JsCompositor(device, dawn.globals, addon,
   { width: dims.width, height: dims.height }, dawn, h.device,
   { nested: true, format: addon.outputFormat() });
-console.log("[overdraw] compositor: JS (over the Dawn wire)");
+log.info("core", "compositor: JS (over the Dawn wire)");
 
 // Phase 9c: install the built-in default cursor. The XCursor theme
 // resolver picks up XCURSOR_THEME / XCURSOR_SIZE from env; for
@@ -197,9 +215,9 @@ console.log("[overdraw] compositor: JS (over the Dawn wire)");
   if (r) {
     compositor.setCursorPixels?.(r.rgba, r.width, r.height, r.hotspotX, r.hotspotY);
     compositor.setCursorVisible?.(true);
-    console.log(`[overdraw] cursor: default ${r.width}x${r.height} hotspot=(${r.hotspotX},${r.hotspotY})`);
+    log.info("core", `cursor: default ${r.width}x${r.height} hotspot=(${r.hotspotX},${r.hotspotY})`);
   } else {
-    console.warn("[overdraw] cursor: default shape not resolved; no cursor shown");
+    log.warn("core", "cursor: default shape not resolved; no cursor shown");
   }
 }
 
@@ -305,11 +323,10 @@ addon.setOnOutputDescriptor((d) => {
   // description stays as set by installProtocols's seed; the descriptor
   // doesn't carry one (xdg-output's description is overdraw-owned policy).
 
-  console.log(
-    `[overdraw] output: ${device.width}x${device.height} device, ${logical.width}x${logical.height} `
+  log.info("core",
+    `output: ${device.width}x${device.height} device, ${logical.width}x${logical.height} `
     + `logical @${d.refreshMhz}mHz scale=${scale} xform=${d.transform} `
-    + `phys=${d.physicalWidthMm}x${d.physicalHeightMm}mm name=${d.name}`,
-  );
+    + `phys=${d.physicalWidthMm}x${d.physicalHeightMm}mm name=${d.name}`);
 
   // Internal reconfigurations, in dependency order. The compositor renders at
   // device resolution; the WM and input work in logical coordinates.
@@ -345,8 +362,8 @@ pluginBus.subscribe("output.changed", (_name, payload) => {
   reemitFractionalScale(state);
 });
 
-console.log(`[overdraw] Wayland server listening.`);
-console.log(`[overdraw] run a client with:  WAYLAND_DISPLAY=${sock} <your-client>`);
+log.info("core", `Wayland server listening.`);
+log.info("core", `run a client with:  WAYLAND_DISPLAY=${sock} <your-client>`);
 
 // The `spawn` action (plugin-core-actions) emits this; the launcher runs the
 // actual process detached, with WAYLAND_DISPLAY pointed at our socket so the
@@ -363,7 +380,7 @@ pluginBus.subscribe("process.spawn-requested", (_name, payload) => {
       env: { ...process.env, WAYLAND_DISPLAY: sock },
     }).unref();
   } catch (e) {
-    console.warn(`[overdraw] spawn failed: ${command}: ${(e as Error).message}`);
+    log.warn("core", `spawn failed: ${command}: ${(e as Error).message}`);
   }
 });
 
@@ -516,7 +533,7 @@ const interceptBroker = new InterceptBroker({
     allocSurface: (connId, w, hh, ptId, ptGen, pdId, pdGen, wireSerial) =>
       gpuBroker.allocSurface(connId, w, hh, ptId, ptGen, pdId, pdGen, wireSerial),
   },
-  log: (line) => console.log(line),
+  log: (line) => log.info("plugin", line),
 });
 const interceptPluginBroker = createInterceptPluginBroker({
   interceptBroker,
@@ -699,7 +716,7 @@ pluginBus.subscribe("layout.master-fraction-requested", (_n, payload) => {
   void runtime.invokeNamespace("layout", "setParams", [{ masterFractionDelta: delta }])
     .then(() => { state?.relayout?.("param-changed"); })
     .catch((e: unknown) => {
-      console.warn(`[overdraw] layout.setParams failed: ${(e as Error).message}`);
+      log.warn("core", `layout.setParams failed: ${(e as Error).message}`);
     });
 });
 
@@ -739,7 +756,7 @@ runtime = new PluginRuntime({
   bus: pluginBus,
   resolveDeferredRefs: deferredRefResolver,
   onEvent: (plugin, name, data) => {
-    if (name === "log") console.log(`[plugin ${plugin}] ${String(data)}`);
+    if (name === "log") log.info("plugin", `${plugin}: ${String(data)}`);
   },
   onRequest: (plugin, method, params) => {
     if (method.startsWith("decoration.")) {
@@ -802,22 +819,22 @@ runtime = new PluginRuntime({
 });
 await runtime.load(resolved);
 const summary = runtime.states().map((s) => `${s.name}=${s.state}`).join(", ");
-console.log(`[overdraw] plugins: ${summary.length > 0 ? summary : "(none)"}`);
+log.info("core", `plugins: ${summary.length > 0 ? summary : "(none)"}`);
 
 // IPC server: JSON-RPC 2.0 over a Unix socket. Plugins register actions and
 // emit events; overdrawctl / status bars / scripts connect here.
 // core-plugin-api.md §12.
 const runtimeDir = process.env.XDG_RUNTIME_DIR;
 if (!runtimeDir) {
-  console.warn("[overdraw] XDG_RUNTIME_DIR not set; IPC server disabled");
+  log.warn("ipc", "XDG_RUNTIME_DIR not set; IPC server disabled");
 } else {
   const socketPath = join(runtimeDir, `overdraw-${sock}.sock`);
   ipcServer = new IpcServer({ socketPath, runtime, bus: pluginBus });
   await ipcServer.start();
-  console.log(`[overdraw] IPC: ${socketPath}`);
+  log.info("ipc", `IPC: ${socketPath}`);
 }
 
-console.log(`[overdraw] ctrl-c to quit.`);
+log.info("core", `ctrl-c to quit.`);
 
 // Bootstrap the frame loop. addon.wake() schedules the first render now
 // that the JS compositor, protocol layer, and plugin runtime are all live;

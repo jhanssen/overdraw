@@ -20,6 +20,7 @@ import type { CompositorState } from "../protocols/ctx.js";
 import { createDecorationRegistry } from "../decorations.js";
 import type { DecorationRegistry } from "../decorations.js";
 import { DECORATION_EVENT } from "../events/types.js";
+import { log } from "../log.js";
 import type { DecorationAssignedEvent, DecorationDeregisteredEvent,
   DecorationResizedEvent } from "../events/types.js";
 
@@ -103,7 +104,7 @@ export function createDecorationBroker(deps: DecorationBrokerDeps): DecorationBr
   function onTimeout(windowId: number): void {
     const g = gates.get(windowId);
     if (!g || g.released) return;
-    console.error(`[decoration] provider '${g.pluginName}' did not draw window ${windowId} `
+    log.err("plugin", `decoration: provider '${g.pluginName}' did not draw window ${windowId} `
       + `within ${timeoutMs}ms; deregistering (window shown undecorated)`);
     registry.unregisterPlugin(g.pluginName);
     emitToPlugin(g.pluginName, DECORATION_EVENT.deregistered,

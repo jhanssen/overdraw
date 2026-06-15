@@ -9,6 +9,8 @@
 // emit() is synchronous and fan-out in registration order. on() returns an
 // unsubscribe function (cleaner than removeListener + holding the reference).
 
+import { log } from "../log.js";
+
 export type Listener<T> = (ev: T) => void;
 
 // Bus instances are parameterized by an event map ({ name: payload }). No
@@ -19,9 +21,10 @@ export class TypedBus<M> {
   private listeners: { [K in keyof M]?: Set<Listener<M[K]>> } = {};
   private warn: (msg: string, err: unknown) => void;
 
-  // `onError` lets the host route listener exceptions (default: console.warn).
+  // `onError` lets the host route listener exceptions (default: log.warn on
+  // the 'core' area).
   constructor(onError?: (msg: string, err: unknown) => void) {
-    this.warn = onError ?? ((msg, err) => { console.warn(msg, err); });
+    this.warn = onError ?? ((msg, err) => { log.warn("core", "%s %o", msg, err); });
   }
 
   // Subscribe to an event. Returns an unsubscribe function. Subscribing the same
