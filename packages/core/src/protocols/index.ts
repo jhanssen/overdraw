@@ -358,11 +358,11 @@ export async function installProtocols(
     state.seat?.sweepDestroyed();
 
     // Same disconnect case for wl_buffers: a client that drops without
-    // wl_buffer.destroy leaves its descriptor in state.buffers, and a dmabuf
-    // descriptor holds an open WaylandFd. The destroy handler did not run, so close
-    // the fd + drop the descriptor here (otherwise the wrapper GC-warns + leaks an
-    // fd per buffer the client allocated). shm pools are reclaimed via their own
-    // refcount on pool destroy.
+    // wl_buffer.destroy leaves its descriptor in state.buffers. A dmabuf
+    // descriptor holds an open WaylandFd; an shm descriptor holds a ref on its
+    // pool's mapping. The destroy handler did not run, so mirror it here: close
+    // the fd / release the pool ref + drop the descriptor (otherwise the wrapper
+    // GC-warns and leaks a fd, or the pool mapping never frees).
     //
     // For dmabuf buffers this is ALSO the cache-invalidation trigger for the
     // client-buffer lifecycle (rule A): notifyBufferDestroyed releases the
@@ -380,10 +380,24 @@ export async function installProtocols(
             state.dmabufById?.delete(bufferId);
           }
         }
+        if (desc.poolId) addon.shmBufferUnref(desc.poolId);
         if (desc.fd && !desc.fd.closed) {
           try { desc.fd.close(); } catch { /* already closed/taken */ }
         }
         state.buffers.delete(resource);
+      }
+    }
+
+    // Disconnect sweep for shm pools: a client that drops without
+    // wl_shm_pool.destroy never runs the destroy handler, so the pool's mmap +
+    // dup'd fd would leak. Free each destroyed pool now; its buffers were
+    // ref-released in the wl_buffer sweep above, so the pool's refcount can
+    // reach 0 and freePool runs.
+    if (state.pools) {
+      for (const [resource, pool] of [...state.pools.entries()]) {
+        if (!resource.destroyed) continue;
+        addon.shmDestroyPool(pool.poolId);
+        state.pools.delete(resource);
       }
     }
 

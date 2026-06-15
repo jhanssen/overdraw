@@ -184,6 +184,11 @@ add_executable(fd-test-client test/fd-test-client.c)
 target_include_directories(fd-test-client PRIVATE ${WAYLAND_CLIENT_INCLUDE_DIRS})
 target_link_libraries(fd-test-client PRIVATE ${WAYLAND_CLIENT_LIBRARIES})
 
+# ---- shm disconnect client (pools + buffers, drops without destroying) ----
+add_executable(shm-disconnect-client test/shm-disconnect-client.c)
+target_include_directories(shm-disconnect-client PRIVATE ${WAYLAND_CLIENT_INCLUDE_DIRS})
+target_link_libraries(shm-disconnect-client PRIVATE ${WAYLAND_CLIENT_LIBRARIES})
+
 # ---- shm test client (shm buffer upload + composite) ----
 add_executable(shm-test-client
     test/shm-test-client.c

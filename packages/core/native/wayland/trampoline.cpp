@@ -172,6 +172,10 @@ uint64_t Trampoline::clientIdOf(napi_value resourceHandle) {
     void* ptr = nullptr;
     if (napi_get_value_external(env, ext, &ptr) != napi_ok || !ptr) return 0;
     auto* resource = static_cast<wl_resource*>(ptr);
+    // Destroyed resource (client gone) while JS holds a stale wrapper: the
+    // external still points at freed memory. Treat a wrappers_ miss as "no
+    // client" rather than dereferencing the dangling pointer.
+    if (wrappers_.find(resource) == wrappers_.end()) return 0;
     return reinterpret_cast<uint64_t>(wl_resource_get_client(resource));
 }
 
@@ -184,6 +188,15 @@ bool Trampoline::postEvent(napi_value resourceHandle, uint32_t opcode, napi_valu
     void* ptr = nullptr;
     if (napi_get_value_external(env, ext, &ptr) != napi_ok || !ptr) return false;
     auto* resource = static_cast<wl_resource*>(ptr);
+
+    // The wl_resource may already be destroyed (its client died) while JS still
+    // holds the wrapper: an external's stored pointer is immutable, so it keeps
+    // pointing at freed memory. wrappers_ tracks live resources -- the destroy
+    // listener erases the entry before libwayland frees the resource -- so a
+    // miss means dereferencing `resource` here would be a use-after-free. The
+    // target is gone; drop the event as a no-op (posting to a dead client is one
+    // in wayland too) rather than reporting failure to JS.
+    if (wrappers_.find(resource) == wrappers_.end()) return true;
 
     // Resolve the resource's interface (for the event signature) via its class.
     const char* className = wl_resource_get_class(resource);
@@ -409,14 +422,14 @@ int Trampoline::onDispatch(const void* implData, void* target, uint32_t opcode,
                 break;
             }
             case 'h': {
-                // libwayland hands us the demarshalled fd for this dispatch.
-                // Its ownership across dispatch is version-dependent, so dup()
-                // immediately -- correct whether libwayland keeps or closes the
-                // original. JS gets a WaylandFd wrapper owning the dup; native
-                // consumers take the raw fd out of it (takeWaylandFd).
-                int rawFd = args[argIndex].h;
-                int dupFd = rawFd >= 0 ? ::dup(rawFd) : -1;
-                v = makeWaylandFd(env, dupFd);
+                // libwayland transfers ownership of the demarshalled request fd
+                // to the dispatcher and does NOT close it after dispatch -- the
+                // callee owns it. Wrap it directly; the WaylandFd closes it on
+                // close()/finalize, or a native consumer takes it out
+                // (takeWaylandFd). Duping and leaving the original open would
+                // leak one fd per request that carries one (e.g. every dmabuf
+                // plane add).
+                v = makeWaylandFd(env, args[argIndex].h);
                 break;
             }
             default: napi_get_undefined(env, &v); break;
