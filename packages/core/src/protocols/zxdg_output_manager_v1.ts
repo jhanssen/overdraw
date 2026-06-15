@@ -83,6 +83,15 @@ export default function makeXdgOutputManager(ctx: Ctx): ZxdgOutputManagerV1Handl
       if (!rec) return;
       trackedSet(ctx.state, rec.id).add(id);
       emitTo(ctx.events, id, rec);
+      // GTK <= 4.22 derives the monitor scale as wl_output mode size /
+      // xdg_output logical size, but recomputes it ONLY on wl_output.done.
+      // wl_output.done was already sent at bind -- before this xdg_output's
+      // logical_size existed -- so that computation divided by a zero logical
+      // size (-> a bogus scale_factor, then a scale-0 surface that crashes
+      // toolkits). Re-send wl_output.done now, after the logical_size, so the
+      // client recomputes with a valid logical size. send_done is the output's
+      // atomic-commit signal and is safe to repeat.
+      ctx.events.wl_output.send_done(output);
     },
   };
 }

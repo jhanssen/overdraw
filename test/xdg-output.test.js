@@ -19,6 +19,11 @@ function mockCtx(outputRecord) {
       send_description(resource, description) { calls.push(["description", { resource, description }]); },
       send_done(resource) { calls.push(["done", { resource }]); },
     },
+    wl_output: {
+      // get_xdg_output re-sends wl_output.done after the xdg_output burst so
+      // GTK <= 4.22 recomputes the monitor scale with a valid logical size.
+      send_done(resource) { calls.push(["wl_output_done", { resource }]); },
+    },
   };
   return {
     addon: { clientId: () => 1 },
@@ -61,13 +66,17 @@ test("get_xdg_output emits the full burst then done", () => {
   const xdgOutput = mockResource("zxdg_output_v1");
   mgr.get_xdg_output(mockResource("mgr"), xdgOutput, wlOutput);
   const names = ctx._calls.map(([k]) => k);
+  // The xdg_output burst, then a re-sent wl_output.done (so GTK <= 4.22
+  // recomputes the monitor scale now that the logical size has arrived).
   assert.deepEqual(names,
-    ["logical_position", "logical_size", "name", "description", "done"]);
+    ["logical_position", "logical_size", "name", "description", "done", "wl_output_done"]);
   // Spot-check the values.
   assert.deepEqual(ctx._calls[0][1], { resource: xdgOutput, x: 0, y: 0 });
   assert.deepEqual(ctx._calls[1][1], { resource: xdgOutput, w: 1920, h: 1080 });
   assert.equal(ctx._calls[2][1].name, "overdraw-0");
   assert.equal(ctx._calls[3][1].description, "overdraw nested output");
+  // The trailing wl_output.done targets the wl_output, not the xdg_output.
+  assert.deepEqual(ctx._calls[5][1], { resource: wlOutput });
 });
 
 test("get_xdg_output reads the current OutputRecord values", () => {
