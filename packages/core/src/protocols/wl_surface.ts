@@ -334,6 +334,12 @@ export default function makeSurface(ctx: Ctx): WlSurfaceHandler {
         const appId = t?.appId ?? null;
         const title = t?.title ?? null;
         void ctx.state.wm?.markInitialCommitComplete(s.id, { appId, title });
+      } else if (xs?.toplevel) {
+        // A non-initial commit: the client re-rendered, which may satisfy a
+        // held resize (it has acked the size the WM asked for). Pass the
+        // highest acked serial; the WM releases that window's hold and applies
+        // the batch once every held window is ready.
+        ctx.state.wm?.notifyToplevelCommit(s.id, xs.lastAckedSerial ?? null);
       }
 
       // Phase 9c: if this surface has the "cursor" role and is the

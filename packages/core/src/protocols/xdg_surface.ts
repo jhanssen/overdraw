@@ -30,8 +30,8 @@ function packStates(states: number[]): Uint8Array {
 // reflects the window's current presentation: 'maximized' / 'fullscreen' /
 // 'activated' (latter when this window has keyboard focus). The wire shape is
 // a wl_array of uint32 state values.
-export function configureToplevel(ctx: Ctx, xs: XdgSurfaceRecord, width: number, height: number): void {
-  if (!xs.toplevel) return;
+export function configureToplevel(ctx: Ctx, xs: XdgSurfaceRecord, width: number, height: number): number | null {
+  if (!xs.toplevel) return null;
   const states = buildStatesArray(ctx, xs);
   ctx.events.xdg_toplevel.send_configure(xs.toplevel, Math.max(0, width | 0), Math.max(0, height | 0), states);
   const serial = ctx.state.serial();
@@ -39,6 +39,7 @@ export function configureToplevel(ctx: Ctx, xs: XdgSurfaceRecord, width: number,
   xs.configuredWidth = width;
   xs.configuredHeight = height;
   ctx.events.xdg_surface.send_configure(xs.resource, serial);
+  return serial;
 }
 
 // Build the xdg_toplevel.configure states[] array from current WM + focus
@@ -141,7 +142,14 @@ export default function makeXdgSurface(ctx: Ctx): XdgSurfaceHandler {
     },
     ack_configure(resource, serial) {
       const xs = rec(resource);
-      if (xs && serial === xs.lastConfigureSerial) xs.configured = true;
+      if (!xs) return;
+      if (serial === xs.lastConfigureSerial) xs.configured = true;
+      // Track the highest acked serial so the WM's resize transaction can tell
+      // when a toplevel has accepted a size it asked for (the geometry apply is
+      // gated on the matching ack + the buffer commit that follows it).
+      if (xs.lastAckedSerial === undefined || serial > xs.lastAckedSerial) {
+        xs.lastAckedSerial = serial;
+      }
     },
     destroy(resource) {
       const xs = rec(resource);

@@ -552,6 +552,11 @@ export interface XdgSurfaceRecord {
   // for an unchanged size. Undefined until the WM has configured a size.
   configuredWidth?: number;
   configuredHeight?: number;
+  // Highest xdg_surface.configure serial the client has acked. The WM resize
+  // transaction matches this against the serial of the configure it sent for a
+  // window's new size to know when the client has accepted it. Undefined until
+  // the first ack.
+  lastAckedSerial?: number;
 }
 
 // An xdg_popup: a compositor-positioned child surface. `parent` is the

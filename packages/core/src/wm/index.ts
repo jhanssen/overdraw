@@ -122,8 +122,10 @@ export function defaultWindowState(): WindowState {
 export interface WmState { output: Output; windows: Window[]; }
 
 // Configure sink: ask the protocol layer to send a sized configure to a window's
-// toplevel. Wired by installProtocols.
-export type ConfigureSink = (surfaceId: number, contentW: number, contentH: number) => void;
+// toplevel. Returns the configure serial (for the resize transaction to match
+// against the client's ack), or null if no configure was sent. Wired by
+// installProtocols.
+export type ConfigureSink = (surfaceId: number, contentW: number, contentH: number) => number | null;
 
 // Decoration-resize sink: fired when a decorated window's OUTER tile changes
 // (move and/or size).
@@ -257,6 +259,13 @@ export interface Wm {
   // swap-* do not wrap at the ends. Returns true and schedules a relayout +
   // restacks when the order changed; false (no-op) otherwise.
   reorder(surfaceId: number, op: "promote" | "swap-next" | "swap-prev"): boolean;
+
+  // The protocol layer calls this on a toplevel's content commit, with the
+  // highest configure serial the client has acked. It releases that window's
+  // held resize (if its configured serial is satisfied) and applies the
+  // transaction once every held window is ready. No-op when nothing is held
+  // for the surface.
+  notifyToplevelCommit(surfaceId: number, ackedSerial: number | null): void;
 }
 
 // Structured-clone-safe snapshot of a window's observable state. The shape
@@ -451,6 +460,32 @@ export function createWm(
   const windows: Window[] = [];
   const wm: WmState = { output, windows };
 
+  // Resize transaction (reorder relayouts only). A window that changes size must
+  // not jump to its new tile before it has re-rendered at the new size, or it
+  // flashes at the wrong size/position for a frame. Instead the new geometry is
+  // HELD here: the window keeps its current drawn rect until it acks the
+  // configure and commits a matching buffer, then every held window is applied
+  // together in one batch (an atomic swap, so two windows trading places never
+  // overlap). A timeout applies whatever is held if a client is slow. Repeated
+  // reorders merge into the same held set, so a burst of swaps never flickers --
+  // the drawn geometry only moves once the input settles and clients catch up.
+  interface PendingResize {
+    outer: Rect;
+    content: Rect;
+    // Serial of the configure last sent for this held size, or null for a
+    // move-only hold (no re-render needed). Matched against the client's acked
+    // serial to flip `ready`.
+    serial: number | null;
+    // The content size `serial` configured -- lets a merged reorder skip
+    // re-configuring an already-asked size.
+    cfgW: number;
+    cfgH: number;
+    ready: boolean;
+  }
+  const pendingResizes = new Map<number, PendingResize>();
+  let txTimer: ReturnType<typeof setTimeout> | null = null;
+  const TX_TIMEOUT_MS = 150;
+
   function pushStack(): void {
     if (rebuild) { rebuild(); return; }
     const ids: number[] = [];
@@ -462,14 +497,68 @@ export function createWm(
     compositor.setStack(ids);
   }
 
+  function clearTxTimer(): void {
+    if (txTimer !== null) { clearTimeout(txTimer); txTimer = null; }
+  }
+
+  // Push one window's held geometry to the compositor: content layout, the
+  // decoration's outer layout, and the decoration-resize hook. Mirrors the
+  // immediate apply path in applyLayout.
+  function pushGeometry(win: Window, outer: Rect, content: Rect): void {
+    const prevOuter = win.outer;
+    win.outer = outer;
+    win.rect = content;
+    if (win.hasContent) {
+      compositor.setSurfaceLayout(win.surfaceId, content.x, content.y, content.width, content.height);
+    }
+    const outerMoved = prevOuter.x !== outer.x || prevOuter.y !== outer.y
+                    || prevOuter.width !== outer.width || prevOuter.height !== outer.height;
+    if (win.decorationSurfaceId !== undefined && outerMoved) {
+      compositor.setSurfaceLayout(win.decorationSurfaceId, outer.x, outer.y, outer.width, outer.height);
+      if (decorationResize && win.insets) {
+        decorationResize(win.surfaceId, { ...outer }, { ...content }, { ...win.insets });
+      }
+    }
+  }
+
+  // Apply every held window's geometry in one batch (atomic from the on-screen
+  // point of view: a single render sees them all moved) and clear the
+  // transaction.
+  function applyPendingGeometry(): void {
+    clearTxTimer();
+    const entries = [...pendingResizes];
+    pendingResizes.clear();
+    for (const [id, p] of entries) {
+      const win = windows.find((w) => w.surfaceId === id);
+      if (win) pushGeometry(win, p.outer, p.content);
+    }
+  }
+
+  // Apply the held set once every member is ready (acked + committed its new
+  // size, or move-only). A not-yet-ready member keeps the whole batch waiting.
+  function maybeApplyTransaction(): void {
+    if (pendingResizes.size === 0) { clearTxTimer(); return; }
+    for (const p of pendingResizes.values()) { if (!p.ready) return; }
+    applyPendingGeometry();
+  }
+
+  function armTxTimer(): void {
+    if (txTimer !== null) return;
+    txTimer = setTimeout(() => { txTimer = null; applyPendingGeometry(); }, TX_TIMEOUT_MS);
+    txTimer.unref?.();
+  }
+
   // Apply a LayoutResult: emit window.relayout, then update each window's
-  // outer rect, push the compositor's setSurfaceLayout, fire configure
-  // where size changed, and update bound decorations.
-  async function applyLayout(result: LayoutResult, _reason: LayoutReason): Promise<void> {
-    void _reason;
+  // outer rect, push the compositor's setSurfaceLayout, fire configure where
+  // size changed, and update bound decorations. For a "reorder" relayout the
+  // geometry is routed through the resize transaction (held until the client
+  // re-renders) instead of being applied immediately.
+  async function applyLayout(result: LayoutResult, reason: LayoutReason): Promise<void> {
+    const useTx = reason === "reorder" && !!configure;
     const byId = new Map<number, { id: number; outer: Rect }>();
     for (const r of result.rects) byId.set(r.id, r);
     const snapshotWindows = [...windows];
+    let txTouched = false;
     for (const win of snapshotWindows) {
       const r = byId.get(win.surfaceId);
       if (!r) continue;
@@ -490,18 +579,51 @@ export function createWm(
         if (ev && isRect(ev.newOuter)) newOuter = { ...ev.newOuter };
       }
 
+      const newContent = win.insets ? shrink(newOuter, win.insets) : { ...newOuter };
+      const sizeChanged = newContent.width !== prevContent.width || newContent.height !== prevContent.height;
+      const moved = prevOuter.x !== newOuter.x || prevOuter.y !== newOuter.y
+                 || prevOuter.width !== newOuter.width || prevOuter.height !== newOuter.height;
+
+      if (useTx && win.hasContent && !win.pendingInitialCommit) {
+        // Transaction path: hold the new geometry; (re)configure on a size that
+        // differs from what the client was last asked for. The window keeps its
+        // current drawn rect until applyPendingGeometry.
+        const pend = pendingResizes.get(win.surfaceId);
+        const lastCfgW = pend ? pend.cfgW : prevContent.width;
+        const lastCfgH = pend ? pend.cfgH : prevContent.height;
+        if (newContent.width !== lastCfgW || newContent.height !== lastCfgH) {
+          // configure is non-null here (useTx requires it); guard for the type.
+          const serial = configure
+            ? configure(win.surfaceId, newContent.width, newContent.height) : null;
+          pendingResizes.set(win.surfaceId, {
+            outer: newOuter, content: newContent,
+            serial, cfgW: newContent.width, cfgH: newContent.height, ready: false,
+          });
+          txTouched = true;
+        } else if (pend) {
+          pend.outer = newOuter;
+          pend.content = newContent;
+          txTouched = true;
+        } else if (moved) {
+          pendingResizes.set(win.surfaceId, {
+            outer: newOuter, content: newContent, serial: null,
+            cfgW: newContent.width, cfgH: newContent.height, ready: true,
+          });
+          txTouched = true;
+        }
+        continue;
+      }
+
+      // Immediate path (non-reorder reasons, or initial / not-yet-content
+      // windows). Suppress configure during the deferred-initial-commit phase.
+      if (!moved && !sizeChanged) continue;
       win.outer = newOuter;
       const content = contentOf(win);
       win.rect = content;
       if (win.hasContent) {
         compositor.setSurfaceLayout(win.surfaceId, content.x, content.y, content.width, content.height);
       }
-      // Suppress configure while in the deferred-initial-commit phase: the
-      // client hasn't yet sent its initial commit, so any configure we
-      // emit now would be redundant (the markInitialCommitComplete path
-      // sends the first configure with the final accumulated state).
-      if (configure && !win.pendingInitialCommit
-          && (content.width !== prevContent.width || content.height !== prevContent.height)) {
+      if (configure && !win.pendingInitialCommit && sizeChanged) {
         configure(win.surfaceId, content.width, content.height);
       }
       const outerMoved = prevOuter.x !== win.outer.x || prevOuter.y !== win.outer.y
@@ -512,6 +634,17 @@ export function createWm(
         if (decorationResize && win.insets) {
           decorationResize(win.surfaceId, { ...win.outer }, { ...content }, { ...win.insets });
         }
+      }
+    }
+
+    if (useTx) {
+      // Drop holds for windows no longer in this layout result.
+      for (const id of [...pendingResizes.keys()]) {
+        if (!byId.has(id)) { pendingResizes.delete(id); txTouched = true; }
+      }
+      if (txTouched) {
+        if ([...pendingResizes.values()].some((p) => !p.ready)) armTxTimer();
+        maybeApplyTransaction();
       }
     }
   }
@@ -589,6 +722,7 @@ export function createWm(
       const i = windows.findIndex((w) => w.surfaceId === surfaceId);
       if (i < 0) return;
       windows.splice(i, 1);
+      if (pendingResizes.delete(surfaceId)) maybeApplyTransaction();
       driver.schedule("unmapped");
       pushStack();
     },
@@ -912,6 +1046,15 @@ export function createWm(
       driver.schedule("reorder");
       pushStack();
       return true;
+    },
+
+    notifyToplevelCommit(surfaceId, ackedSerial) {
+      const p = pendingResizes.get(surfaceId);
+      if (!p || p.ready) return;
+      if (p.serial !== null && ackedSerial !== null && ackedSerial >= p.serial) {
+        p.ready = true;
+        maybeApplyTransaction();
+      }
     },
   };
 }

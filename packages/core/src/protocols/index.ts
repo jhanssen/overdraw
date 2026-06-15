@@ -214,9 +214,12 @@ export async function installProtocols(
   state.events = events;
   // ConfigureSink: the WM calls this to (re)configure a window to a content size.
   // Resolve surfaceId -> xdg_surface record and send the sized configure.
-  const configureSink = (surfaceId: number, w: number, h: number): void => {
+  // Returns the configure serial (so the WM's resize transaction can match the
+  // client's ack), or null if no configure was sent.
+  const configureSink = (surfaceId: number, w: number, h: number): number | null => {
     const xs = state.surfacesById?.get(surfaceId)?.xdgSurface;
-    if (xs?.toplevel) configureToplevel(ctx, xs, w, h);
+    if (xs?.toplevel) return configureToplevel(ctx, xs, w, h);
+    return null;
   };
   // The WM delegates its stack push to the full rebuild (windows interleaved with
   // their decorations + subsurfaces + popups via computeBaseStack), keeping
