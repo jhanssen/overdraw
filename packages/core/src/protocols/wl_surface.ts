@@ -318,18 +318,20 @@ export default function makeSurface(ctx: Ctx): WlSurfaceHandler {
       // Initial-commit detection (xdg-shell): the first commit on a
       // toplevel-roled surface whose xdg_surface has not yet sent any
       // configure. Per spec the client commits the xdg_surface with no
-      // buffer to signal "ready for configure"; the server then sends the
-      // first configure carrying the accumulated client-declared state
-      // (set_maximized / set_min_size / etc. that may have arrived after
-      // get_toplevel). We trigger markInitialCommitComplete which emits
-      // window.preconfigure (interceptable by window-rules plugins) and
-      // forces the first configure with the resolved size.
+      // buffer to signal "ready for configure".
       //
-      // Fire-and-forget: the configure sink may take a microtask hop.
-      // The client is expected to wait for the configure before attaching
-      // a buffer (the ack_configure handshake).
+      // Complete the handshake IN THIS DISPATCH: send the throwaway 0x0 first
+      // configure synchronously (carrying the resolved state array) so a client
+      // that does a single wl_display_roundtrip after its initial commit sees
+      // the configure within that roundtrip -- the common idiom. The real tile
+      // size follows as a SECOND configure once layout/plugins resolve.
+      //
+      // markInitialCommitComplete then runs async: it emits window.preconfigure
+      // (window-rules plugins may change presentation), commits the final state,
+      // and schedules the layout pass that drives the sized second configure.
       const xs = s.xdgSurface;
       if (xs?.toplevel && xs.lastConfigureSerial === null) {
+        ctx.state.wm?.sendInitialConfigure(s.id);
         const t = ctx.state.toplevels?.get(xs.toplevel);
         const appId = t?.appId ?? null;
         const title = t?.title ?? null;

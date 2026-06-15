@@ -100,6 +100,32 @@ test('markInitialCommitComplete: throwaway 0x0 first configure; real size on fir
   assert.equal(configures.length, 2);
 });
 
+test('sendInitialConfigure: 0x0 first configure is sent SYNCHRONOUSLY (single-roundtrip handshake)', async () => {
+  const configures = [];
+  const wm = createWm(mockSink(), { width: 1000, height: 600 }, {
+    configure: (id, w, h) => configures.push({ id, w, h }),
+    layoutDriverFactory: immediateLayoutDriver,
+  });
+  wm.addWindow(1, res(1), { deferInitialCommit: true });
+  await wm.settled();
+
+  // The handshake must complete WITHOUT awaiting: a client doing a single
+  // wl_display_roundtrip after its initial commit has to see the configure
+  // within that roundtrip. sendInitialConfigure sends it synchronously.
+  wm.sendInitialConfigure(1);
+  assert.deepEqual(configures, [{ id: 1, w: 0, h: 0 }], 'configure sent synchronously');
+
+  // The async preconfigure/layout pass must NOT send a second 0x0 -- the
+  // synchronous one already satisfied the handshake.
+  await wm.markInitialCommitComplete(1, { appId: null, title: null });
+  assert.equal(configures.filter((c) => c.w === 0 && c.h === 0).length, 1,
+    'exactly one 0x0 configure (no double-send)');
+
+  // The real tile size still lands as the second configure on first content.
+  wm.windowHasContent(1);
+  assert.deepEqual(configures.at(-1), { id: 1, w: 1000, h: 600 });
+});
+
 test('markInitialCommitComplete: subsequent layout changes resume configure flow', async () => {
   const configures = [];
   const wm = createWm(mockSink(), { width: 1000, height: 600 }, {

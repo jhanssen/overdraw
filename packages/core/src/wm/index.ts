@@ -186,6 +186,12 @@ export interface Wm {
     surfaceId: number,
     info: { appId: string | null; title: string | null },
   ): Promise<void>;
+  // Synchronously send the throwaway 0x0 first configure (with the resolved
+  // state array) so the xdg-shell handshake completes within the client's
+  // initial-commit dispatch. Sets pendingSizeConfigure so the real tile size
+  // follows as a second configure. No-op if the window isn't in the
+  // deferred-initial-commit phase or already got its first configure.
+  sendInitialConfigure(surfaceId: number): void;
   windowHasContent(surfaceId: number): Rect | undefined;
   unmapWindow(surfaceId: number): void;
   settled(): Promise<void>;
@@ -904,6 +910,15 @@ export function createWm(
       }
     },
 
+    sendInitialConfigure(surfaceId) {
+      const win = windows.find((w) => w.surfaceId === surfaceId);
+      if (!win || !win.pendingInitialCommit || win.pendingSizeConfigure) return;
+      if (configure) {
+        configure(win.surfaceId, 0, 0);
+        win.pendingSizeConfigure = true;
+      }
+    },
+
     async markInitialCommitComplete(surfaceId, info) {
       const win = windows.find((w) => w.surfaceId === surfaceId);
       if (!win || !win.pendingInitialCommit) return;
@@ -962,13 +977,14 @@ export function createWm(
         await driver.settled();
         if (!windows.includes(win)) return;
 
-        // Send a throwaway 0x0 first configure (the client picks its own size
-        // and gets a serial to ack). The real tile size follows as a SECOND
-        // configure from windowHasContent once the client has content -- a
-        // resize, which clients that ignore the geometry of their first
-        // configure honor. The 0x0 still carries the resolved state array
-        // (maximized/tiled), so the client knows it is tiled immediately.
-        if (configure) {
+        // The throwaway 0x0 first configure is normally sent synchronously by
+        // sendInitialConfigure (in the initial-commit dispatch) so a
+        // single-roundtrip client sees it. Send it here only as a fallback --
+        // e.g. a direct test caller, or if no configure had gone out yet. The
+        // real tile size follows as a SECOND configure from windowHasContent
+        // once the client has content (a resize). The 0x0 carries the resolved
+        // state array (maximized/tiled) so the client knows it is tiled.
+        if (configure && !win.pendingSizeConfigure) {
           configure(win.surfaceId, 0, 0);
           win.pendingSizeConfigure = true;
         }
