@@ -431,7 +431,33 @@ int Trampoline::onDispatch(const void* implData, void* target, uint32_t opcode,
     if (s != napi_ok) {
         napi_value ex;
         if (napi_get_and_clear_last_exception(env, &ex) == napi_ok) {
-            std::fprintf(stderr, "[wl] handler %s.%s threw\n", st->name.c_str(), msg->name);
+            // Surface the actual error: prefer the stack (message + trace),
+            // fall back to coercing the thrown value to a string.
+            auto toStr = [&](napi_value v) -> std::string {
+                napi_value str;
+                if (napi_coerce_to_string(env, v, &str) != napi_ok) {
+                    napi_value pending;
+                    napi_get_and_clear_last_exception(env, &pending);
+                    return "";
+                }
+                size_t len = 0;
+                napi_get_value_string_utf8(env, str, nullptr, 0, &len);
+                std::string out;
+                out.resize(len);
+                size_t got = 0;
+                napi_get_value_string_utf8(env, str, out.data(), len + 1, &got);
+                return out;
+            };
+            std::string detail;
+            napi_value stack;
+            napi_valuetype t = napi_undefined;
+            if (napi_get_named_property(env, ex, "stack", &stack) == napi_ok) {
+                napi_typeof(env, stack, &t);
+                if (t == napi_string) detail = toStr(stack);
+            }
+            if (detail.empty()) detail = toStr(ex);
+            std::fprintf(stderr, "[wl] handler %s.%s threw: %s\n",
+                         st->name.c_str(), msg->name, detail.c_str());
         }
     }
     napi_close_handle_scope(env, scope);
