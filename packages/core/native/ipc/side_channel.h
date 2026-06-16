@@ -326,6 +326,83 @@ struct SurfaceAccessPayload {
     }
 };
 
+// ---------------------------------------------------------------------------
+// In-band ImportClientTex (kind=3, core -> gpu) and ClientTexImported (kind=4,
+// gpu -> core) frame payloads. See FrameKind in transport.h for the FIFO-
+// ordering rationale.
+
+// ImportClientTex payload: the reserved CORE-wire texture+device handle the
+// GPU process should InjectTexture at, plus single-plane dmabuf parameters.
+// The dmabuf fd rides as SCM_RIGHTS on the sendmsg that carried this frame.
+struct ImportClientTexPayload {
+    uint32_t textureId;
+    uint32_t textureGeneration;
+    uint32_t deviceId;
+    uint32_t deviceGeneration;
+    uint32_t width;
+    uint32_t height;
+    uint32_t drmFourcc;
+    uint64_t modifier;
+    uint32_t planeOffset;
+    uint32_t planeStride;
+    static constexpr size_t kSize = 9 * 4 + 8;  // 9 u32 + 1 u64 = 44 bytes
+    void encode(uint8_t* out) const {
+        putU32LE(out +  0, textureId);
+        putU32LE(out +  4, textureGeneration);
+        putU32LE(out +  8, deviceId);
+        putU32LE(out + 12, deviceGeneration);
+        putU32LE(out + 16, width);
+        putU32LE(out + 20, height);
+        putU32LE(out + 24, drmFourcc);
+        // u64 LE: low then high
+        putU32LE(out + 28, static_cast<uint32_t>(modifier));
+        putU32LE(out + 32, static_cast<uint32_t>(modifier >> 32));
+        putU32LE(out + 36, planeOffset);
+        putU32LE(out + 40, planeStride);
+    }
+    static ImportClientTexPayload decode(const uint8_t* p) {
+        ImportClientTexPayload r{};
+        r.textureId         = getU32LE(p +  0);
+        r.textureGeneration = getU32LE(p +  4);
+        r.deviceId          = getU32LE(p +  8);
+        r.deviceGeneration  = getU32LE(p + 12);
+        r.width             = getU32LE(p + 16);
+        r.height            = getU32LE(p + 20);
+        r.drmFourcc         = getU32LE(p + 24);
+        r.modifier          = static_cast<uint64_t>(getU32LE(p + 28)) |
+                              (static_cast<uint64_t>(getU32LE(p + 32)) << 32);
+        r.planeOffset       = getU32LE(p + 36);
+        r.planeStride       = getU32LE(p + 40);
+        return r;
+    }
+};
+static_assert(ImportClientTexPayload::kSize == 44,
+              "ImportClientTexPayload size mismatch with hand-counted layout");
+
+// ClientTexImported payload (no fd): echo the texture handle and the
+// import-ok flag. The core matches replies to its pendingJsImports list by
+// texture id (imports complete in send order on a single wire).
+struct ClientTexImportedPayload {
+    uint32_t textureId;
+    uint32_t textureGeneration;
+    uint8_t  importOk;
+    static constexpr size_t kSize = 4 + 4 + 1;  // 9 bytes
+    void encode(uint8_t* out) const {
+        putU32LE(out + 0, textureId);
+        putU32LE(out + 4, textureGeneration);
+        out[8] = importOk;
+    }
+    static ClientTexImportedPayload decode(const uint8_t* p) {
+        ClientTexImportedPayload r{};
+        r.textureId         = getU32LE(p + 0);
+        r.textureGeneration = getU32LE(p + 4);
+        r.importOk          = p[8];
+        return r;
+    }
+};
+static_assert(ClientTexImportedPayload::kSize == 9,
+              "ClientTexImportedPayload size mismatch with hand-counted layout");
+
 }  // namespace overdraw::ipc
 
 #endif  // OVERDRAW_IPC_SIDE_CHANNEL_H_

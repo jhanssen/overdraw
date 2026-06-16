@@ -456,6 +456,11 @@ class Compositor {
   private:
     bool handshake();
 
+    // Handle one inbound ClientTexImported (in-band kind=4 on the wire): match
+    // the texture id against pendingJsImports_ and finalize the reservation.
+    // Wire-frame inbound handler in the ctor calls this.
+    void onClientTexImported(uint32_t textureId, bool importOk);
+
     // Encode a wire-frame payload into a stack buffer sized by Payload::kSize
     // and append it as `kind`. The six write*Access helpers above differ only
     // in payload type + frame kind; this collapses the boilerplate.

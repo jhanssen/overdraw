@@ -235,19 +235,24 @@ int run(int wireFd, int ctrlFd, int inputFd, bool headless,
     // Dispatch a non-Dawn (kind != 0) core-wire control frame to the matching
     // access-bracket helper. Assigned after the helpers are defined below; until
     // then no control frame can legitimately arrive (no textures/surfaces exist
-    // pre-bring-up), so a non-null check guards the bring-up window.
-    std::function<void(ipc::FrameKind, const std::vector<uint8_t>&)> dispatchCoreControlFrame;
+    // pre-bring-up), so a non-null check guards the bring-up window. The fds
+    // pointer is non-null only for fd-bearing frames (ImportClientTex); the
+    // dispatcher takes ownership of those fds.
+    std::function<void(ipc::FrameKind, const std::vector<uint8_t>&,
+                       const int*, int)> dispatchCoreControlFrame;
 
     auto pumpWire = [&]() -> bool {
         bool alive = wireReader.readAvailable();
         ipc::FrameKind kind;
         std::vector<uint8_t> frame;
-        while (wireReader.nextFrame(kind, frame)) {
+        int recvFds[ipc::kMaxMsgFds];
+        int nRecvFds = 0;
+        while (wireReader.nextFrame(kind, frame, recvFds, &nRecvFds)) {
             if (kind == ipc::FrameKind::WireBytes) {
                 server.HandleCommands(reinterpret_cast<const char*>(frame.data()), frame.size());
                 serializer.Flush();
             } else if (dispatchCoreControlFrame) {
-                dispatchCoreControlFrame(kind, frame);
+                dispatchCoreControlFrame(kind, frame, nRecvFds ? recvFds : nullptr, nRecvFds);
             } else {
                 std::fprintf(stderr,
                     "[gpu] core wire: control frame kind=%u before dispatch ready\n",
@@ -779,25 +784,13 @@ int run(int wireFd, int ctrlFd, int inputFd, bool headless,
     };
     std::unordered_map<uint32_t, ClientTex> clientTextures;
 
-    // Cross-channel barrier on the CORE wire reader. Used by ImportClientTex:
-    // an inject at a recycled texture handle id must wait for the prior
-    // UnregisterObjectCmd (and the new ReserveTexture) to have been applied on
-    // the wire server, otherwise InjectTexture targets a stale handle. The
-    // ctrl message carries msg.wireSerial captured AFTER the core flushed the
-    // reserve; we drain the barrier each time the wire reader advances.
-    //
-    // Tagging: each deferred ImportClientTex action carries `tag = importFdTag(
-    // texture.id)` so shutdown can pair queued entries with their captured fds
-    // (held in `importPendingFds` until the action runs or shutdown sweeps).
+    // Cross-channel barrier on the CORE wire reader. Used by ReleaseClientTex
+    // (ctrl, with a wire-byte serial sampled at release time): the erase must
+    // wait until the wire reader has consumed past every in-band BeginAccess /
+    // EndAccess frame already queued ahead of the release, otherwise a pending
+    // Begin would find the texture gone. ImportClientTex no longer rides ctrl
+    // (it's in-band kind=3 on the wire now, so naturally FIFO-ordered).
     ipc::WireBarrier coreWireBarrier;
-    // texture.id -> fd queued in a deferred ImportClientTex action. The action's
-    // first step erases this entry; on shutdown any leftover fds are closed.
-    // (The action also owns the fd via capture; this map exists ONLY so the
-    // shutdown sweep can close fds whose actions never ran.)
-    std::unordered_map<uint32_t, int> importPendingFds;
-    auto importFdTag = [](uint32_t textureId) -> ipc::WireBarrier::Tag {
-        return static_cast<ipc::WireBarrier::Tag>(textureId);
-    };
 
     // 9) Service Dawn + the host window until the core requests shutdown or the
     //    host window is closed. The core drives the swapchain over the wire.
@@ -1074,19 +1067,14 @@ int run(int wireFd, int ctrlFd, int inputFd, bool headless,
     };
 
     // Import a client dmabuf (fd owned by us) and inject the texture. Sends the
-    // ClientTexImported reply. Caller must ensure the wire reader has reached
-    // m.wireSerial first (so the prior UnregisterObjectCmd for this recycled
-    // handle id has been applied). Closes fd.
+    // ClientTexImported reply (in-band kind=4 on the core wire, FIFO-ordered
+    // with the InjectTexture's effect on the wire server's mKnown). Closes fd
+    // on failure.
     //
     // Does NOT open a BeginAccess bracket -- the per-frame Begin/End model
     // opens one per compositing submit (BeginClientAccess). The cached entry
     // starts at layout=0 (UNDEFINED), accessOpen=false, lastEndFence=null.
     auto runImport = [&](const ipc::Message& m, int fd) {
-        ipc::Message reply{};
-        reply.tag = ipc::Tag::ClientTexImported;
-        reply.texture = m.texture;
-        reply.importOk = 0;
-
         gpu::DmabufBuffer cb{};
         cb.fd = fd;
         cb.modifier = m.modifier;
@@ -1109,11 +1097,20 @@ int run(int wireFd, int ctrlFd, int inputFd, bool headless,
             ct.fd = cb.fd;
             ct.generation = m.texture.generation;
             clientTextures[m.texture.id] = std::move(ct);
-            reply.importOk = 1;
         } else {
             ::close(cb.fd);
         }
-        ctrlSender.send(reply);
+
+        // Reply on the core wire as kind=4. FIFO-ordered after the wire bytes
+        // that this InjectTexture's effect on mKnown enables -- the core's
+        // pendingJsImports list matches by texture id.
+        ipc::ClientTexImportedPayload rp{};
+        rp.textureId = m.texture.id;
+        rp.textureGeneration = m.texture.generation;
+        rp.importOk = ok ? 1 : 0;
+        uint8_t rbuf[ipc::ClientTexImportedPayload::kSize];
+        rp.encode(rbuf);
+        serializer.appendFrame(ipc::FrameKind::ClientTexImported, rbuf, sizeof(rbuf));
     };
 
     // Open a per-frame BeginAccess on a cached client texture. Re-exports the
@@ -1173,13 +1170,15 @@ int run(int wireFd, int ctrlFd, int inputFd, bool headless,
         if (ct.lastEndFence) fences[fenceCount++] = ct.lastEndFence;
 
         wgpu::SharedTextureMemoryVkImageLayoutBeginState layoutBegin{};
-        // First-ever Begin: oldLayout=0 (UNDEFINED) + initialized=false (the
-        // first commit hasn't written via OUR access yet -- but the CLIENT did
-        // write the pixels, so initialized=true is actually correct here too;
-        // mirrors the prior import-time BeginAccess descriptor). Subsequent:
-        // continue from the previous EndAccess's newLayout.
+        // Begin/End hand-off pattern (matches Dawn's own SharedTextureMemoryTests):
+        // echo the prior End's newLayout straight back as the next Begin's pair so
+        // Dawn's queue-family-transfer barrier and any subsequent sample-path
+        // transition agree on the texture's current layout. First-ever Begin:
+        // oldLayout=UNDEFINED (the texture has no prior internal layout from this
+        // device's perspective); newLayout=SHADER_READ_ONLY_OPTIMAL since the very
+        // next thing Dawn does is transition for sampling.
         layoutBegin.oldLayout = ct.everSampled ? ct.layout : 0;
-        layoutBegin.newLayout = 1;  // GENERAL
+        layoutBegin.newLayout = ct.everSampled ? ct.layout : 5;  // SHADER_READ_ONLY_OPTIMAL
         wgpu::SharedTextureMemoryBeginAccessDescriptor bad{};
         bad.nextInChain = &layoutBegin;
         bad.initialized = true;
@@ -1218,7 +1217,18 @@ int run(int wireFd, int ctrlFd, int inputFd, bool headless,
                 textureId, textureGen);
             return;
         }
+        // SharedTextureMemoryVkImageLayoutEndState's default ctor does NOT
+        // value-initialize oldLayout/newLayout (they are int32_t fields after a
+        // user-provided ctor in the generated header). If EndAccess returns
+        // without Dawn's backend writing them -- which happens when the access
+        // bracket did NOT use the texture (lastUsageSerial == kBeginningOfGPUTime
+        // skips EndAccessImpl in src/dawn/native/SharedResourceMemory.cpp) -- we
+        // would read uninitialized stack memory and cache garbage into ct.layout,
+        // poisoning every subsequent Begin's oldLayout. Initialize to a known
+        // sentinel (UNDEFINED=0) so a no-op End leaves the entry's layout sane.
         wgpu::SharedTextureMemoryVkImageLayoutEndState endLayout{};
+        endLayout.oldLayout = 0;  // VK_IMAGE_LAYOUT_UNDEFINED
+        endLayout.newLayout = 0;
         wgpu::SharedTextureMemoryEndAccessState endState{};
         endState.nextInChain = &endLayout;
         if (ct.mem.EndAccess(ct.tex, &endState) != wgpu::Status::Success) {
@@ -1229,7 +1239,13 @@ int run(int wireFd, int ctrlFd, int inputFd, bool headless,
             return;
         }
         ct.accessOpen = false;
-        ct.layout = endLayout.newLayout;
+        // Only adopt the returned layout if Dawn actually wrote one (i.e. the
+        // texture was used in this access bracket). A 0 (UNDEFINED) return is
+        // the no-work case: keep the prior layout so the next Begin's chain
+        // (oldLayout = ct.layout) stays consistent with the last real End.
+        if (endLayout.newLayout != 0) {
+            ct.layout = endLayout.newLayout;
+        }
         // Re-import the exported fence into the SAME coreDevice for the next
         // BeginAccess to chain. Mirrors runSurfaceEnd's pattern but consumer-
         // side and intra-process.
@@ -1265,10 +1281,42 @@ int run(int wireFd, int ctrlFd, int inputFd, bool headless,
     // / "bracket already open" / Dawn rejection are state-machine or JS-gate bugs,
     // not transient races. The old ctrl path soft-failed (reply ok=0, skip the
     // surface), which masked the bug as a silent glitch. A loud abort surfaces it.
-    dispatchCoreControlFrame = [&](ipc::FrameKind kind, const std::vector<uint8_t>& frame) {
+    dispatchCoreControlFrame = [&](ipc::FrameKind kind, const std::vector<uint8_t>& frame,
+                                   const int* fds, int nfds) {
         if (frame.empty()) {
             std::fprintf(stderr, "[gpu] core wire: empty control frame\n");
             std::abort();
+        }
+        if (kind == ipc::FrameKind::ImportClientTex) {
+            // In-band dmabuf import: FIFO-ordered with surrounding wire commands
+            // so the just-Reserved texture slot at handle.id (which grew the wire
+            // client's id allocator one past anything prior) is server-allocated
+            // BEFORE any subsequent wire command tries to allocate id+1.
+            if (frame.size() != ipc::ImportClientTexPayload::kSize) {
+                std::fprintf(stderr, "[gpu] core wire: bad ImportClientTex payload size %zu\n",
+                             frame.size());
+                std::abort();
+            }
+            if (nfds != 1 || !fds) {
+                std::fprintf(stderr, "[gpu] core wire: ImportClientTex with nfds=%d\n", nfds);
+                std::abort();
+            }
+            auto p = ipc::ImportClientTexPayload::decode(frame.data());
+            // Bridge the in-band payload into the existing runImport (which
+            // expects ipc::Message + a single fd). Synthesize an ipc::Message.
+            ipc::Message m{};
+            m.tag = ipc::Tag::ImportClientTex;
+            m.texture = {p.textureId, p.textureGeneration};
+            m.device  = {p.deviceId, p.deviceGeneration};
+            m.width = p.width;
+            m.height = p.height;
+            m.drmFourcc = p.drmFourcc;
+            m.modifier = p.modifier;
+            m.planeOffset = p.planeOffset;
+            m.planeStride = p.planeStride;
+            m.planeCount = 1;
+            runImport(m, fds[0]);
+            return;
         }
         auto variant = static_cast<ipc::AccessVariant>(frame[0]);
         if (variant == ipc::AccessVariant::ClientTex) {
@@ -1725,34 +1773,6 @@ int run(int wireFd, int ctrlFd, int inputFd, bool headless,
                     alloc.release(sb.buf);     // closes the dmabuf fd + GBM bo
                     surfaceBufs.erase(it);
                 }
-            } else if (m.tag == ipc::Tag::ImportClientTex) {
-                if (nRecvFds < 1) {
-                    std::fprintf(stderr, "[gpu] ImportClientTex: no fd received (nRecvFds=%d)\n", nRecvFds);
-                    ipc::Message reply{};
-                    reply.tag = ipc::Tag::ClientTexImported;
-                    reply.texture = m.texture;
-                    reply.importOk = 0;
-                    ctrlSender.send(reply);
-                } else {
-                    // Defer (or run immediately) via the core wire barrier: the
-                    // inject must wait for the wire reader to have applied the
-                    // prior UnregisterObjectCmd (recycling this handle id) and
-                    // the new ReserveTexture. The action OWNS the fd; the side
-                    // map `importPendingFds` exists ONLY for the shutdown sweep
-                    // to close fds whose actions never ran.
-                    const int fd = recvFds[0];
-                    const ipc::Message msg = m;          // copy for the lambda
-                    const uint32_t texId = m.texture.id;
-                    importPendingFds[texId] = fd;
-                    coreWireBarrier.after(
-                        m.wireSerial,
-                        [&importPendingFds, &runImport, msg, fd, texId]() {
-                            importPendingFds.erase(texId);
-                            runImport(msg, fd);
-                        },
-                        wireReader.bytesConsumed(),
-                        importFdTag(texId));
-                }
             } else if (m.tag == ipc::Tag::ReleaseClientTex) {
                 // Release a JS-compositor dmabuf import: drop the STM + close the
                 // fd. The per-frame BeginClientAccess/EndAccess brackets for this
@@ -1917,12 +1937,9 @@ int run(int wireFd, int ctrlFd, int inputFd, bool headless,
     }
     clientTextures.clear();
     // Discard any deferred ctrl ops on the core barrier (their wire serial may
-    // never arrive). The action captures own no other state we need to close;
-    // queued ImportClientTex fds are also tracked in `importPendingFds` so we
-    // can close them here without inspecting std::function captures.
+    // never arrive). Action captures own no fds we need to close; ReleaseClientTex
+    // (the only barrier user now) captures no fds.
     coreWireBarrier.takePending();
-    for (auto& [texId, fd] : importPendingFds) if (fd >= 0) ::close(fd);
-    importPendingFds.clear();
     for (auto& [id, sb] : surfaceBufs) {
         sb.producerTex = nullptr; sb.producerMem = nullptr;
         sb.consumerTex = nullptr; sb.consumerMem = nullptr;

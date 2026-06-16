@@ -31,6 +31,26 @@ Compositor::Compositor(int wireFd, int ctrlFd, pid_t gpuPid,
     // is flipped to non-blocking in handshake() after the one-shot blocking
     // Hello completes. The CtrlSender is constructed at that same point.
     ipc::setNonBlocking(wireFd_);
+
+    // ClientTexImported arrives in-band on the wire (kind=4) as the reply to
+    // a kind=3 ImportClientTex. Route it through to the existing import-done
+    // handler logic.
+    link_->setInboundFrameHandler([this](ipc::FrameKind kind,
+                                         const std::vector<uint8_t>& frame) {
+        if (kind == ipc::FrameKind::ClientTexImported) {
+            if (frame.size() != ipc::ClientTexImportedPayload::kSize) {
+                std::fprintf(stderr,
+                    "[core] ClientTexImported: bad payload size %zu\n", frame.size());
+                return;
+            }
+            auto p = ipc::ClientTexImportedPayload::decode(frame.data());
+            onClientTexImported(p.textureId, p.importOk != 0);
+        } else {
+            std::fprintf(stderr,
+                "[core] WireLink inbound: unexpected kind=%u\n",
+                static_cast<unsigned>(kind));
+        }
+    });
 }
 
 Compositor::~Compositor() { shutdown(); }
@@ -381,27 +401,36 @@ uint32_t Compositor::importDmabufForJs(int fd, uint32_t width, uint32_t height,
         wgpu::TextureUsage::TextureBinding | wgpu::TextureUsage::CopySrc);
     const auto& rt = tr.reservation();
 
-    ipc::Message m{};
-    m.tag = ipc::Tag::ImportClientTex;
-    m.wireSerial = tr.wireSerial();
-    m.device = {rt.deviceHandle.id, rt.deviceHandle.generation};
-    m.texture = {rt.handle.id, rt.handle.generation};
-    m.width = width;
-    m.height = height;
-    m.drmFourcc = drmFourcc;
-    m.modifier = modifier;
-    m.planeOffset = offset;
-    m.planeStride = stride;
-    m.planeCount = 1;
+    // The import travels in-band on the WIRE socket as a kind=3 frame. This
+    // keeps it FIFO-ordered with the surrounding wire commands -- crucial
+    // because Server::Allocate rejects a texture slot whose id exceeds
+    // mKnown.size(), which grows monotonically as wire commands (including
+    // this InjectTexture) are processed. A later Surface::APIGetCurrentTexture
+    // allocates the NEXT sequential id; if its wire command arrived before
+    // ImportClientTex (as happened when ImportClientTex rode the ctrl socket),
+    // the gap would silently zero the slot and the surface would render black.
+    ipc::ImportClientTexPayload p{};
+    p.textureId         = rt.handle.id;
+    p.textureGeneration = rt.handle.generation;
+    p.deviceId          = rt.deviceHandle.id;
+    p.deviceGeneration  = rt.deviceHandle.generation;
+    p.width             = width;
+    p.height            = height;
+    p.drmFourcc         = drmFourcc;
+    p.modifier          = modifier;
+    p.planeOffset       = offset;
+    p.planeStride       = stride;
+    uint8_t buf[ipc::ImportClientTexPayload::kSize];
+    p.encode(buf);
     int fds[1] = {fd};
-    if (!ctrlSender_->send(m, fds, 1)) {
-        // The peer never observed this reservation; safe to recycle the id.
+    if (!link_->appendFrameWithFds(ipc::FrameKind::ImportClientTex,
+                                   buf, sizeof(buf), fds, 1)) {
         tr.discard();
         return 0;
     }
-    // Ctrl message handed to the peer -> the GPU process WILL act on it (will
-    // run InjectTexture, success or failure). Move the holder into the pending
-    // list; final commit()/discard() happens in drainCtrl on the reply.
+    // Wire frame queued -> the GPU process WILL act on it. Move the holder
+    // into the pending list; final commit()/discard() happens on the
+    // ClientTexImported reply, also arriving in-band (kind=4).
     uint32_t importId = nextJsImportId_++;
     pendingJsImports_.push_back({importId, width, height, std::move(tr)});
     return importId;
@@ -536,37 +565,42 @@ void Compositor::drainCtrl() {
             }
             continue;
         }
-        if (r.tag != ipc::Tag::ClientTexImported) continue;
-        // JS-compositor dmabuf import: report the injected texture handle to JS.
-        // Match by reserved texture handle id (the reply echoes it); imports
-        // complete in send order, so matching by id is exact.
-        auto jit = std::find_if(pendingJsImports_.begin(), pendingJsImports_.end(),
-            [&](const PendingJsImport& pi) {
-                return pi.reservation.reservation().handle.id == r.texture.id;
-            });
-        if (jit == pendingJsImports_.end()) continue;
-        // commit() on BOTH branches under the deferred-reclaim policy: success
-        // means the GPU server registered the texture; failure means it tried
-        // and the WireServer state at the id may be partial. Either way the id
-        // must not be recycled. (The holder is destroyed when the vector entry
-        // is erased; commit() suppresses the destructor's default reclaim.)
-        if (r.importOk) {
-            const auto& rt = jit->reservation.reservation();
-            jsImportHandles_[jit->importId] = {rt.handle.id, rt.handle.generation};
-            // Take ownership of the wgpu::Texture handle for hand-off to JS;
-            // marks the reservation as committed.
-            auto taken = jit->reservation.commitAndTake();
-            completedJsImports_.push_back(
-                {jit->importId, jit->width, jit->height,
-                 wgpu::Texture::Acquire(taken.texture), true});
-        } else {
-            std::fprintf(stderr, "[core] dmabuf JS import FAILED id=%u %ux%u\n",
-                         jit->importId, jit->width, jit->height);
-            jit->reservation.commit();
-            completedJsImports_.push_back({jit->importId, 0, 0, wgpu::Texture(), false});
-        }
-        pendingJsImports_.erase(jit);
+        // ClientTexImported now arrives in-band on the wire (kind=4), routed
+        // through onClientTexImported via the WireLink inbound handler. Any
+        // other tag here is ignored.
     }
+}
+
+void Compositor::onClientTexImported(uint32_t textureId, bool importOk) {
+    // JS-compositor dmabuf import: report the injected texture handle to JS.
+    // Match by reserved texture handle id (the reply echoes it); imports
+    // complete in send order, so matching by id is exact.
+    auto jit = std::find_if(pendingJsImports_.begin(), pendingJsImports_.end(),
+        [&](const PendingJsImport& pi) {
+            return pi.reservation.reservation().handle.id == textureId;
+        });
+    if (jit == pendingJsImports_.end()) return;
+    // commit() on BOTH branches under the deferred-reclaim policy: success
+    // means the GPU server registered the texture; failure means it tried
+    // and the WireServer state at the id may be partial. Either way the id
+    // must not be recycled. (The holder is destroyed when the vector entry
+    // is erased; commit() suppresses the destructor's default reclaim.)
+    if (importOk) {
+        const auto& rt = jit->reservation.reservation();
+        jsImportHandles_[jit->importId] = {rt.handle.id, rt.handle.generation};
+        // Take ownership of the wgpu::Texture handle for hand-off to JS;
+        // marks the reservation as committed.
+        auto taken = jit->reservation.commitAndTake();
+        completedJsImports_.push_back(
+            {jit->importId, jit->width, jit->height,
+             wgpu::Texture::Acquire(taken.texture), true});
+    } else {
+        std::fprintf(stderr, "[core] dmabuf JS import FAILED id=%u %ux%u\n",
+                     jit->importId, jit->width, jit->height);
+        jit->reservation.commit();
+        completedJsImports_.push_back({jit->importId, 0, 0, wgpu::Texture(), false});
+    }
+    pendingJsImports_.erase(jit);
 }
 
 Compositor::CoreSurfaceReservation Compositor::reserveCoreSurfaceTexture(

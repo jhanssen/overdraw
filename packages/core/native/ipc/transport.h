@@ -50,11 +50,35 @@ inline bool setNonBlocking(int fd) {
 // only payload Dawn ever produces); kind != 0 are overdraw-internal control
 // frames (access brackets) that ride the same FIFO so they are ordered against
 // the Dawn commands around them without a cross-channel barrier.
+//
+// ImportClientTex / ClientTexImported also ride this FIFO (not the ctrl
+// channel): the request allocates a server-side wire texture slot
+// (Server::InjectTexture), and a wire command issued AFTER the matching
+// ReserveTexture (e.g. Surface::APIGetCurrentTexture allocating the next
+// sequential id) requires that slot to already exist on the server -- otherwise
+// the server's Allocate sees `handle.id > mKnown.size()` and rejects the
+// subsequent wire command, producing a silent missing-texture (black surface).
+// Putting ImportClientTex on the wire makes it naturally FIFO-ordered with the
+// surrounding wire commands so this gap cannot open. The dmabuf fd rides as
+// SCM_RIGHTS on the sendmsg that delivers the kind=3 frame.
 enum class FrameKind : uint8_t {
-    WireBytes = 0,    // Dawn wire command batch -> WireServer::HandleCommands
-    BeginAccess = 1,  // overdraw BeginAccess bracket (payload: variant + ids)
-    EndAccess = 2,    // overdraw EndAccess bracket   (payload: variant + ids)
+    WireBytes = 0,            // Dawn wire command batch -> WireServer::HandleCommands
+    BeginAccess = 1,          // overdraw BeginAccess bracket (payload: variant + ids)
+    EndAccess = 2,            // overdraw EndAccess bracket   (payload: variant + ids)
+    ImportClientTex = 3,      // core -> gpu: import a CLIENT dmabuf into a reserved
+                              // texture slot. fd attached via SCM_RIGHTS on the
+                              // sendmsg that carried this frame.
+    ClientTexImported = 4,    // gpu -> core: import done (ok=1) or failed (ok=0).
+                              // No fd; the reply payload echoes the texture handle
+                              // so the core's pendingJsImports list matches by id.
 };
+
+// Max fds attachable in one message (control msg OR in-band wire frame).
+// Single-plane dmabuf is the only fd-bearing payload today, which needs 1; we
+// keep headroom up to 4. Defined here (not next to the ctrl helpers below)
+// because the wire-socket sendmsg / recvmsg paths in FdSerializer / FrameReader
+// also reference it.
+inline constexpr int kMaxMsgFds = 4;
 
 // Per-frame header overhead in the byte-accounting counters. The wire format is
 // [length: u32 LE][kind: u8][payload...], where `length` counts kind + payload.
@@ -73,9 +97,22 @@ inline constexpr uint64_t kFrameHeaderBytes = 4u /*length prefix*/ + 1u /*kind*/
 // writable (and may call it opportunistically) to drain the rest. appendFrame()
 // emits non-Dawn (kind != 0) control frames on the SAME queue, flushing any
 // staged Dawn bytes first so the kind switch is a clean FIFO boundary.
+//
+// appendFrameWithFds() is the variant for frames that carry SCM_RIGHTS fds
+// (ImportClientTex). The fds attach to the first byte of the frame's queued
+// region; pumpOut uses sendmsg+SCM_RIGHTS for that exact send, plain write()
+// for the rest. Out-of-the-pumpOut-path fd ownership is tracked here so that a
+// queued-but-unsent fd is closed only when its bytes ship (the caller's fd is
+// dup'd into the queue at enqueue time to keep ownership clean).
 class FdSerializer : public dawn::wire::CommandSerializer {
   public:
     explicit FdSerializer(int fd) : fd_(fd) { buf_.resize(kCapacity); }
+    ~FdSerializer() {
+        // Close any unsent dup'd fds.
+        for (auto& a : fdAttachments_) {
+            for (int fd : a.fds) if (fd >= 0) ::close(fd);
+        }
+    }
 
     size_t GetMaximumAllocationSize() const override { return kMaxAllocation; }
 
@@ -113,6 +150,35 @@ class FdSerializer : public dawn::wire::CommandSerializer {
         return pumpOut();
     }
 
+    // Emit a non-Dawn frame with attached SCM_RIGHTS fds. Same Flush-first
+    // discipline as appendFrame. The fds are dup'd into the queue so the caller
+    // can close its originals immediately; the queued copies are closed when
+    // their bytes ship (or when the serializer is destroyed). Returns false on
+    // fatal socket error OR on fd dup failure.
+    bool appendFrameWithFds(FrameKind kind, const void* payload, size_t len,
+                            const int* fds, int nfds) {
+        if (nfds <= 0 || nfds > kMaxMsgFds) return false;
+        Flush();
+        // Record the byte offset (within the running out_ deque) where this
+        // frame starts; pumpOut uses this to know when to switch to sendmsg
+        // with SCM_RIGHTS.
+        FdAttachment a{};
+        a.startOffset = bytesQueued_;  // cumulative bytes ever queued (before adding this frame)
+        a.frameBytes = kFrameHeaderBytes + len;
+        for (int i = 0; i < nfds; ++i) {
+            int duped = fds[i] >= 0 ? ::fcntl(fds[i], F_DUPFD_CLOEXEC, 0) : -1;
+            if (duped < 0) {
+                // Close any successful dups so we don't leak.
+                for (int d : a.fds) if (d >= 0) ::close(d);
+                return false;
+            }
+            a.fds.push_back(duped);
+        }
+        fdAttachments_.push_back(std::move(a));
+        frame(kind, payload, len);
+        return pumpOut();
+    }
+
     // Cumulative count of framed bytes ever enqueued (header + payload, see
     // kFrameHeaderBytes). Used as a cross-channel ordering serial: a side-channel
     // request tagged with the value sampled after a Flush is only acted on by the
@@ -123,11 +189,72 @@ class FdSerializer : public dawn::wire::CommandSerializer {
 
     // Write as much of the outbound queue as the socket accepts right now.
     // Non-blocking. Returns false on a fatal error. Call on fd-writable.
+    //
+    // The pump is fd-attachment aware: when the queue head is the start of an
+    // fd-bearing frame, the entire frame is sent in one sendmsg with SCM_RIGHTS.
+    // Otherwise plain write() chunks are used. This preserves FIFO order across
+    // mixed plain / fd-bearing frames.
     bool pumpOut() {
         while (!out_.empty()) {
-            // Copy a contiguous chunk out of the deque for write().
+            // Sent-so-far counter: bytes already drained from the front of out_.
+            // totalQueuedBytes_ - out_.size() is the cumulative byte offset of
+            // the front of out_; compare to fdAttachments_.front().startOffset
+            // to know whether the next chunk is the head of an fd-bearing frame.
+            uint64_t headOffset = bytesQueued_ - out_.size();
+            if (!fdAttachments_.empty() && fdAttachments_.front().startOffset == headOffset) {
+                // Send the entire fd-bearing frame as one sendmsg + SCM_RIGHTS.
+                FdAttachment& a = fdAttachments_.front();
+                size_t n = a.frameBytes;
+                if (n > out_.size()) return true;  // shouldn't happen, but defensive
+                if (n > kChunk) n = kChunk;        // never exceeds frame size in any
+                                                   // sane configuration; the frame
+                                                   // is small (~44 bytes)
+                scratch_.assign(out_.begin(), out_.begin() + static_cast<long>(n));
+                iovec iov{scratch_.data(), n};
+                msghdr mh{};
+                mh.msg_iov = &iov;
+                mh.msg_iovlen = 1;
+                char ctrl[CMSG_SPACE(sizeof(int) * kMaxMsgFds)];
+                std::memset(ctrl, 0, sizeof(ctrl));
+                const int nfds = static_cast<int>(a.fds.size());
+                mh.msg_control = ctrl;
+                mh.msg_controllen = CMSG_SPACE(sizeof(int) * nfds);
+                cmsghdr* cm = CMSG_FIRSTHDR(&mh);
+                cm->cmsg_level = SOL_SOCKET;
+                cm->cmsg_type = SCM_RIGHTS;
+                cm->cmsg_len = CMSG_LEN(sizeof(int) * nfds);
+                std::memcpy(CMSG_DATA(cm), a.fds.data(), sizeof(int) * nfds);
+                mh.msg_controllen = cm->cmsg_len;
+                ssize_t s = ::sendmsg(fd_, &mh, MSG_DONTWAIT | MSG_NOSIGNAL);
+                if (s == static_cast<ssize_t>(n)) {
+                    out_.erase(out_.begin(), out_.begin() + s);
+                    // fds delivered; close our dup'd copies.
+                    for (int d : a.fds) if (d >= 0) ::close(d);
+                    fdAttachments_.pop_front();
+                    continue;
+                }
+                if (s >= 0) {
+                    // Partial: cannot happen for a single message smaller than
+                    // socket-buffer space on AF_UNIX/STREAM with sendmsg one-iov,
+                    // but be defensive. Bail; pump again later.
+                    return true;
+                }
+                if (errno == EAGAIN || errno == EWOULDBLOCK) return true;
+                if (errno == EINTR) continue;
+                return false;  // fatal
+            }
+            // Plain bytes path. Copy a contiguous chunk out of the deque for write().
             size_t n = out_.size();
             if (n > kChunk) n = kChunk;
+            // If an fd-bearing frame starts inside this chunk, shorten the chunk
+            // so we stop at the fd-frame boundary (next iteration takes the
+            // sendmsg path).
+            if (!fdAttachments_.empty()) {
+                uint64_t nextFdOffset = fdAttachments_.front().startOffset;
+                uint64_t bytesUntilFd = nextFdOffset - headOffset;
+                if (bytesUntilFd < n) n = bytesUntilFd;
+            }
+            if (n == 0) continue;  // immediate next iter takes the sendmsg path
             scratch_.assign(out_.begin(), out_.begin() + static_cast<long>(n));
             ssize_t w = ::write(fd_, scratch_.data(), n);
             if (w > 0) {
@@ -162,28 +289,74 @@ class FdSerializer : public dawn::wire::CommandSerializer {
         bytesQueued_ += kFrameHeaderBytes + payloadLen;
     }
 
+    // Fd-bearing frame metadata: at which cumulative byte offset (in the running
+    // queued stream) does the frame start, how many bytes is it, and what fds
+    // attach to it. In FIFO order with the byte stream.
+    struct FdAttachment {
+        uint64_t startOffset;
+        size_t frameBytes;
+        std::vector<int> fds;
+    };
+
     int fd_;
     std::vector<uint8_t> buf_;       // current Dawn batch (pre-frame)
     size_t pending_ = 0;
     std::deque<uint8_t> out_;        // framed bytes awaiting the socket
     std::vector<uint8_t> scratch_;   // contiguous staging for write()
-    uint64_t bytesQueued_ = 0;       // cumulative framed bytes enqueued (ordering serial)
+    uint64_t bytesQueued_ = 0;       // cumulative framed bytes enqueued (ordering serial,
+                                     // also used to compute out_'s front offset:
+                                     // bytesQueued_ - out_.size()).
+    std::deque<FdAttachment> fdAttachments_;
 };
 
 // Accumulates bytes from a non-blocking stream socket and yields complete
 // length-prefixed frames. readAvailable() drains the socket once (call on
 // fd-readable); nextFrame() pops one decoded frame if fully buffered.
+//
+// SCM_RIGHTS support: readAvailable uses recvmsg so it can pick up fds that
+// arrive attached to fd-bearing frames (ImportClientTex carries the dmabuf fd
+// this way). Received fds are pushed onto a FIFO and yielded alongside the
+// next fd-bearing frame via the (FrameKind&, payload, fds&) overload.
+//
+// The kernel attaches SCM_RIGHTS fds to a specific recvmsg's return -- the one
+// that returns the first byte of the data the sender sent with that sendmsg.
+// On a stream socket this means a recvmsg's ancillary fds are delivered AT or
+// BEFORE the bytes of the frame they describe. We exploit that by pushing
+// arriving fds into a FIFO at recv time and popping them when the matching
+// fd-bearing frame is decoded. This is correct as long as the wire's frame
+// FIFO order is preserved (it is: TCP/UNIX-stream-socket bytes are in order).
 class FrameReader {
   public:
     explicit FrameReader(int fd) : fd_(fd) {}
+    ~FrameReader() {
+        // Close any received-but-unclaimed fds.
+        for (int fd : recvFds_) if (fd >= 0) ::close(fd);
+    }
 
     // Read whatever the socket has right now into the inbound buffer. Returns
     // false if the peer closed (recv returned 0); true otherwise (incl. EAGAIN).
     bool readAvailable() {
         uint8_t tmp[64 * 1024];
         for (;;) {
-            ssize_t r = ::read(fd_, tmp, sizeof(tmp));
-            if (r > 0) { in_.insert(in_.end(), tmp, tmp + r); continue; }
+            iovec iov{tmp, sizeof(tmp)};
+            msghdr mh{};
+            mh.msg_iov = &iov;
+            mh.msg_iovlen = 1;
+            char ctrl[CMSG_SPACE(sizeof(int) * kMaxMsgFds) * 4];  // headroom: a few attachments per recv
+            mh.msg_control = ctrl;
+            mh.msg_controllen = sizeof(ctrl);
+            ssize_t r = ::recvmsg(fd_, &mh, MSG_DONTWAIT | MSG_CMSG_CLOEXEC);
+            if (r > 0) {
+                in_.insert(in_.end(), tmp, tmp + r);
+                for (cmsghdr* cm = CMSG_FIRSTHDR(&mh); cm; cm = CMSG_NXTHDR(&mh, cm)) {
+                    if (cm->cmsg_level == SOL_SOCKET && cm->cmsg_type == SCM_RIGHTS) {
+                        int n = static_cast<int>((cm->cmsg_len - CMSG_LEN(0)) / sizeof(int));
+                        const int* fds = reinterpret_cast<const int*>(CMSG_DATA(cm));
+                        for (int i = 0; i < n; ++i) recvFds_.push_back(fds[i]);
+                    }
+                }
+                continue;
+            }
             if (r == 0) return false;  // peer closed
             if (errno == EAGAIN || errno == EWOULDBLOCK) break;
             if (errno == EINTR) continue;
@@ -196,6 +369,9 @@ class FrameReader {
     // Pop one complete frame: its kind byte into `kind`, payload into `out`.
     // Returns true if a whole frame was buffered. Wire format is
     // [length: u32 LE][kind: u8][payload], length counting kind + payload.
+    // Frames carrying SCM_RIGHTS fds must use the overload below; this one
+    // surfaces nothing about attached fds (any fd that arrives still in the
+    // FIFO without a caller claiming it is leaked-then-closed at teardown).
     bool nextFrame(FrameKind& kind, std::vector<uint8_t>& out) {
         size_t avail = in_.size() - rd_;
         if (avail < 4) return false;
@@ -209,6 +385,37 @@ class FrameReader {
         rd_ += 4u + len;
         // Header (kFrameHeaderBytes) + payload; mirrors FdSerializer exactly.
         bytesConsumed_ += kFrameHeaderBytes + payloadLen;
+        return true;
+    }
+
+    // Overload that ALSO claims any fds that arrived attached to this frame.
+    // Caller-owned fds are returned via `fdsOut`; the number is written to
+    // `nfdsOut` (0 if no fds were attached). Used by callers that may receive
+    // fd-bearing frames (FrameKind::ImportClientTex on the core->gpu wire).
+    bool nextFrame(FrameKind& kind, std::vector<uint8_t>& out,
+                   int* fdsOut, int* nfdsOut) {
+        if (!nextFrame(kind, out)) return false;
+        // For fd-bearing kinds, pop the expected number of fds from the FIFO.
+        // The convention is hard-coded per kind because the payload doesn't
+        // carry an "nfds" field (frames are point-to-point so both ends agree
+        // on the per-kind fd shape).
+        int expect = 0;
+        if (kind == FrameKind::ImportClientTex) expect = 1;
+        if (expect > 0) {
+            if (static_cast<int>(recvFds_.size()) < expect) {
+                std::fprintf(stderr,
+                    "[ipc] FrameReader: frame kind=%u expects %d fd(s), have %zu\n",
+                    static_cast<unsigned>(kind), expect, recvFds_.size());
+                std::abort();
+            }
+            for (int i = 0; i < expect; ++i) {
+                fdsOut[i] = recvFds_.front();
+                recvFds_.pop_front();
+            }
+            *nfdsOut = expect;
+        } else {
+            *nfdsOut = 0;
+        }
         return true;
     }
 
@@ -248,14 +455,12 @@ class FrameReader {
     std::vector<uint8_t> in_;
     size_t rd_ = 0;
     uint64_t bytesConsumed_ = 0;
+    std::deque<int> recvFds_;  // fds arriving via SCM_RIGHTS, FIFO with frames
 };
 
 // ---------------------------------------------------------------------------
 // Control side channel (SOCK_SEQPACKET): fixed Message + optional SCM_RIGHTS.
 // ---------------------------------------------------------------------------
-
-// Max fds attachable to one side-channel message (single-plane dmabuf needs 1).
-constexpr int kMaxMsgFds = 4;
 
 // Buffered non-blocking control sender. Each datagram is one Message plus 0..N
 // fds. If the socket can't accept it now, the message is queued (with dup'd fds

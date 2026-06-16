@@ -52,6 +52,15 @@ class WireLink {
         return serializer_->appendFrame(kind, payload, len);
     }
 
+    // Same, but attaches SCM_RIGHTS fds to the frame (for ImportClientTex,
+    // whose dmabuf fd rides in-band so the slot allocation is FIFO-ordered
+    // with surrounding wire commands). The caller still owns its fds and may
+    // close them once this returns; the serializer dup's them into the queue.
+    bool appendFrameWithFds(ipc::FrameKind kind, const void* payload, size_t len,
+                            const int* fds, int nfds) {
+        return serializer_->appendFrameWithFds(kind, payload, len, fds, nfds);
+    }
+
     // Drain the outbound wire queue as far as the socket accepts. Call when the
     // wire fd is writable. Returns false on fatal error.
     bool pumpOut() { return serializer_->pumpOut(); }
@@ -66,6 +75,16 @@ class WireLink {
     // process wire-client events. Non-blocking. For the libuv steady state.
     // Returns false if the peer closed the wire.
     bool drainInbound();
+
+    // Install a handler for inbound non-Dawn frames (kind != WireBytes).
+    // Today the only inbound non-Dawn frame is ClientTexImported (kind=4),
+    // the reply to a kind=3 ImportClientTex. The dispatcher decodes payload
+    // bytes (no fds on inbound, today).
+    using InboundFrameHandler =
+        std::function<void(ipc::FrameKind, const std::vector<uint8_t>&)>;
+    void setInboundFrameHandler(InboundFrameHandler h) {
+        inboundHandler_ = std::move(h);
+    }
 
     // Spin (flush + drain one frame + process events) until `done()` or a bound
     // is hit. One-shot bring-up only. Returns done().
@@ -86,6 +105,7 @@ class WireLink {
     dawn::wire::WireClient* client_ = nullptr;
     WGPUInstance instance_ = nullptr;
     bool sharedWithExternal_ = false;
+    InboundFrameHandler inboundHandler_;
 };
 
 }  // namespace overdraw::core

@@ -1,5 +1,7 @@
 #include "wire_link.h"
 
+#include <cstdio>
+#include <cstdlib>
 #include <vector>
 
 #include <unistd.h>
@@ -35,9 +37,20 @@ WireLink::~WireLink() {
 
 bool WireLink::drainInbound() {
     bool alive = reader_->readAvailable();  // false => peer closed
+    ipc::FrameKind kind;
     std::vector<uint8_t> f;
-    while (reader_->nextFrame(f))
-        client_->HandleCommands(reinterpret_cast<const char*>(f.data()), f.size());
+    while (reader_->nextFrame(kind, f)) {
+        if (kind == ipc::FrameKind::WireBytes) {
+            client_->HandleCommands(reinterpret_cast<const char*>(f.data()), f.size());
+        } else if (inboundHandler_) {
+            inboundHandler_(kind, f);
+        } else {
+            std::fprintf(stderr,
+                "[ipc] WireLink::drainInbound: non-Dawn frame kind=%u with no handler\n",
+                static_cast<unsigned>(kind));
+            std::abort();
+        }
+    }
     if (instance_) wgpuInstanceProcessEvents(instance_);
     return alive;
 }

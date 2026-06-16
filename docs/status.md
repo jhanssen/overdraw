@@ -4,11 +4,16 @@ Ground truth for what exists right now: current capabilities, known gaps, and
 what remains. The design lives in `architecture.md`; this file does not restate
 it. Present-tense only — no change history.
 
-Last updated: 2026-06-14 (HiDPI: device/logical coordinate split + integer
-`set_buffer_scale` + fractional `wp_viewporter`/`wp_fractional_scale_v1`,
-EDID-DPI scale auto-derivation, config `output.scale`; plus KMS card
-auto-detect and adapter↔card GPU matching. See "HiDPI / output scaling".
-All 1031 unit tests pass. Earlier: post-slice-9 of phase-2 DRM/KMS work — flip-driven frame loop + tiled scanout. The 60Hz `uv_timer` trigger is gone: the core now wakes on `ScanoutFlipComplete` (KMS) and `FrameComplete` (nested-host `wl_surface.frame`) and dispatches the JS render from `runFrameIfReady` when a subsystem has set `wantNext` (animation, transition, intercept, client commit, etc.). Idle scenes draw zero frames. `onFrameComplete` runs `Server::drainEvents` before the render so a client commit that arrived between the last server-pump and the page-flip event is visible to `dispatchFrameCallbacks` this vsync, not next. Scanout buffers pick the first single-plane modifier the kernel advertises (typically `I915_FORMAT_MOD_X_TILED` on this Intel iGPU), with `DRM_FORMAT_MOD_LINEAR` as last fallback — the previous LINEAR-only choice forced render-to-scanout through the non-tiled GPU path, pushing the frame fence past the kernel's vblank deadline and capping a client-paced 256×256 shm-burst client at 80 commits/sec on a 165Hz panel; tiled scanout puts the fence under one vsync, same client now lands at ~154 commits/sec. Slices 1-7 remain in place; KMS still has no automated coverage. Design: `docs/drm-design.md`.
+Last updated: 2026-06-15 (client dmabuf `ImportClientTex` moved from ctrl to
+in-band on the wire as `kind=3`/`kind=4` frames with SCM_RIGHTS; fixes a
+~1/20-launches silent-blank-surface bug where the dmabuf-import's
+`InjectTexture` could be overtaken by a subsequent `SurfaceGetCurrentTextureCmd`
+that allocated the next sequential wire texture id, hitting `Server::Allocate`'s
+`id > mKnown.size()` gap-rejection. See "IPC" + "dmabuf"). Earlier: HiDPI:
+device/logical coordinate split + integer `set_buffer_scale` + fractional
+`wp_viewporter`/`wp_fractional_scale_v1`, EDID-DPI scale auto-derivation, config
+`output.scale`; plus KMS card auto-detect and adapter↔card GPU matching. See
+"HiDPI / output scaling". All 1061 unit + 134 GPU tests pass. Earlier: post-slice-9 of phase-2 DRM/KMS work — flip-driven frame loop + tiled scanout. The 60Hz `uv_timer` trigger is gone: the core now wakes on `ScanoutFlipComplete` (KMS) and `FrameComplete` (nested-host `wl_surface.frame`) and dispatches the JS render from `runFrameIfReady` when a subsystem has set `wantNext` (animation, transition, intercept, client commit, etc.). Idle scenes draw zero frames. `onFrameComplete` runs `Server::drainEvents` before the render so a client commit that arrived between the last server-pump and the page-flip event is visible to `dispatchFrameCallbacks` this vsync, not next. Scanout buffers pick the first single-plane modifier the kernel advertises (typically `I915_FORMAT_MOD_X_TILED` on this Intel iGPU), with `DRM_FORMAT_MOD_LINEAR` as last fallback — the previous LINEAR-only choice forced render-to-scanout through the non-tiled GPU path, pushing the frame fence past the kernel's vblank deadline and capping a client-paced 256×256 shm-burst client at 80 commits/sec on a 165Hz panel; tiled scanout puts the fence under one vsync, same client now lands at ~154 commits/sec. Slices 1-7 remain in place; KMS still has no automated coverage. Design: `docs/drm-design.md`.
 
 ## Read first: gaps in advertised protocols (silent-gap risks)
 
@@ -151,11 +156,23 @@ node-addon-api, to avoid exception/RTTI dependence under `-fno-rtti`).
 ### IPC (three sockets, fully non-blocking)
 
 - **Dawn wire** over one `SOCK_STREAM` socket (length-prefixed, kind-tagged
-  frames: `[len][kind][payload]`; kind=0 is Dawn wire bytes, kind=1/kind=2 are
-  in-band access-bracket Begin/End frames — see INBAND-ACCESS.md).
+  frames: `[len][kind][payload]`). `kind=0` is Dawn wire bytes; `kind=1`/`kind=2`
+  are in-band access-bracket Begin/End frames (see INBAND-ACCESS.md);
+  `kind=3` is `ImportClientTex` (client dmabuf fd attached via SCM_RIGHTS on the
+  sendmsg that delivers the frame); `kind=4` is the matching `ClientTexImported`
+  reply. The dmabuf import rides the wire because the server-side slot it
+  allocates (`Server::InjectTexture`) shares the wire-client's texture id space
+  with subsequent wire commands like `Surface::APIGetCurrentTexture` — putting
+  the import on a separate ctrl channel let those later wire commands overtake
+  it on the server, causing `Server::Allocate` to fail (id beyond `mKnown.size()`)
+  and the surface to silently render black for the rest of the run on 1/~20
+  launches. Linux AF_UNIX/STREAM sockets accept SCM_RIGHTS just fine; the
+  per-frame fd attachment FIFO in `FdSerializer`/`FrameReader` is the wire-
+  socket analogue of `CtrlSender`'s per-message SCM_RIGHTS path.
 - **Control side channel** over a `SOCK_SEQPACKET` socket carrying fixed-size
   tagged POD messages (`native/ipc/side_channel.h`) — not flatbuffers. SCM_RIGHTS
-  fd passing is used (e.g. `ImportClientTex` carries a client dmabuf fd).
+  fd passing is used for transports that don't share an id space with the wire
+  (e.g. `SetDrmFd`, `AddWireConn`, `FeedbackData`'s format-table memfd).
 - **Input** over a dedicated `SOCK_SEQPACKET` socket (separate from control so
   unsolicited input never interleaves with request/reply traffic).
 
@@ -173,19 +190,18 @@ when queued). Blocking shims remain only for one-shot startup/handshake.
   output is queued (`armWirePoll`/`wirePumpOut`).
 - Wire socket buffers enlarged to 8 MiB; userspace buffering covers overflow.
 
-**Cross-channel ordering.** A control request (`ImportClientTex`, and the
-producer/consumer `AllocSurfaceBuf` injects) must not overtake the wire commands it
-depends on (the GPU's `InjectTexture` requires the server to have processed the
-prior `UnregisterObjectCmd` that recycles the handle at generation+1). Enforced by
-a wire serial: `FdSerializer` counts cumulative framed wire bytes; the core tags
-the request with that value; the GPU process defers it (via `ipc::WireBarrier`)
-until its consumed-byte count reaches the serial. An explicit happens-before across
-the two sockets, no blocking. These are the only remaining per-buffer-lifetime
-cross-channel deferrals: the per-FRAME access brackets (client-texture Begin/End,
-producer/consumer Begin/End) no longer ride ctrl at all — they are multiplexed
-in-band on the wire socket as kind=1/kind=2 frames, FIFO-ordered against the Dawn
-commands, removing both the synchronous Begin round-trip and the EndAccess
-WireBarrier deferral (see INBAND-ACCESS.md).
+**Cross-channel ordering.** A control request that allocates a wire-server-side
+slot (`AllocSurfaceBuf`'s producer/consumer `InjectTexture`s) must not overtake
+the wire commands it depends on (the prior `UnregisterObjectCmd` that recycles a
+handle at generation+1, the new `ReserveTexture`). Enforced by a wire serial:
+`FdSerializer` counts cumulative framed wire bytes; the core tags the request
+with that value; the GPU process defers it (via `ipc::WireBarrier`) until its
+consumed-byte count reaches the serial. An explicit happens-before across the
+two sockets, no blocking. Likewise `ReleaseClientTex` (ctrl) is gated on the
+wire reader catching up past every in-band Begin/End bracket queued ahead of it.
+`ImportClientTex` no longer rides ctrl at all (it is in-band on the wire as
+`kind=3`, naturally FIFO-ordered); the per-FRAME access brackets are also wire
+in-band (`kind=1`/`kind=2`). See INBAND-ACCESS.md.
 
 ### GPU process threading
 
@@ -299,12 +315,19 @@ clients (e.g. kitty) that destroy the pool before rendering.
 Advertises ARGB8888/XRGB8888 with LINEAR+INVALID modifiers; `add` records the plane
 (fd + offset/stride/modifier); `create_immed` builds a dmabuf-tagged buffer. On
 commit: `createTextureFromDmabuf` (async, returns a Promise of the wire handle) →
-`wrapTexture` → sample. The fd travels over the side channel via SCM_RIGHTS
-(`ImportClientTex`); the GPU process imports it as `SharedTextureMemory` (reusing
-`Allocator::importTexture`), does an initialized `BeginAccess`, and `InjectTexture`s
-at the core's reserved handle. The commit is non-blocking (reserve → send →
-`PendingImport`, return; the `ClientTexImported` reply is dispatched on the Node
-thread).
+`wrapTexture` → sample. The dmabuf fd travels in-band on the wire socket as a
+`kind=3` `ImportClientTex` frame with SCM_RIGHTS ancillary; the GPU process
+imports it as `SharedTextureMemory` (reusing `Allocator::importTexture`), does an
+initialized `BeginAccess`, `InjectTexture`s at the core's reserved handle, and
+writes a `kind=4` `ClientTexImported` reply on the same wire. The commit is
+non-blocking (reserve → enqueue wire frame → `PendingImport`, return; the reply
+is dispatched from the wire reader on the Node thread). In-band on the wire
+(rather than the older ctrl-channel `ImportClientTex`) so the server-side slot
+allocation is FIFO-ordered with subsequent wire commands that allocate the next
+sequential id (`Surface::APIGetCurrentTexture`) — splitting wire-state mutation
+across two transports let those later commands overtake the import and fail
+`Server::Allocate` with `id > mKnown.size()`, silently blanking the surface for
+the rest of the run on ~1/20 launches.
 
 **Buffer-release lifecycle (zero-copy).** A buffer is released only once the
 compositor frame that sampled it completes on the GPU: the submit is tagged with a
