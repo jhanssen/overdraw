@@ -30,14 +30,20 @@ device/logical coordinate split + integer `set_buffer_scale` + fractional
 These are wired/advertised but incomplete. A client may use them and get nothing,
 with no error. Worst-first.
 
-- **`xdg_toplevel` window-management *state* requests are silent no-ops.** `move`,
-  `resize`, `set_maximized`/`unset`, `set_fullscreen`/`unset`, `set_minimized`,
-  `set_min_size`/`set_max_size`, `show_window_menu`, `set_parent` are accepted and
-  ignored (no effect, no signal). Only `set_title`/`set_app_id` do anything. The WM
-  is a fixed master-stack tiler that owns all geometry, so these client-initiated
-  state requests have no meaning yet — there is no maximize/fullscreen/floating/
-  interactive-move concept. They stay no-ops until those land (M2: floating +
-  fullscreen + keybindings), but they are advertised, so clients think they work.
+- **`xdg_toplevel` window-management state is implemented; residual no-ops are
+  narrow.** `set_maximized`/`unset`, `set_fullscreen`/`unset`, `set_minimized`,
+  `set_min_size`/`set_max_size`, and interactive `move`/`resize` route through
+  `wm.propose` and take effect: maximized fills the reserved-zone tile region,
+  fullscreen fills the whole output, minimized is excluded from the layout
+  (hidden), floating uses a per-window stored rect, and `move`/`resize` start a
+  seat pointer grab against that floating rect (`protocols/xdg_toplevel.ts` →
+  `wm/index.ts` `propose` → `wm/layout-driver.ts` resolver; `wl_seat.ts`
+  `beginGrab`). The next `configure` carries the resolved state in its states
+  array (`protocols/xdg_surface.ts` `buildStatesArray`). **Genuinely still no-op
+  / limited:** `show_window_menu` (no compositor-side menu); `set_fullscreen`'s
+  per-output target hint is ignored (single output); `set_parent` is stored but
+  does not drive stacking or modal behavior; reserved-zone exclusion applies to
+  maximized/tiled windows but not to floating ones.
 
 - **`wl_region` is a no-op stub.** `add`/`subtract` do nothing; opaque/input
   regions are not tracked (hit-testing uses whole-window rects). Low urgency.
@@ -299,11 +305,13 @@ instance; a wrapped device is borrowed, not destroyed). Built with
   the master-stack rects, fill their tiles via the configure→resize loop, do not
   overlap, and survivors reflow on unmap.
 
-Still absent: per-surface transforms/opacity/rotation/scale,
-multi-output, damage, floating windows, fullscreen/maximize, workspaces/tags,
-compositor keybindings (no general key interception yet beyond the VT-switch
-chord — every other key is forwarded to the focused client). `wl_output` now
-reports real values: in nested mode they come from the host's `wl_output`
+Still absent: multi-output, damage tracking, and linear-space alpha
+compositing. (Per-surface opacity/transform/tint/mask, floating/fullscreen/
+maximize/minimize, interactive move/resize, workspaces, and compositor
+keybindings with general key interception — `wl_seat.ts` consults
+`bindingChain` and suppresses client forwarding on a match — are all
+implemented; see the WM behavioral-state, plugin SDK, and binding-chain
+sections.) `wl_output` now reports real values: in nested mode they come from the host's `wl_output`
 (slice 3 of `drm-design.md`); in KMS mode from the connector's EDID + mode
 (slice 4+5). Output resize (nested) propagates end-to-end. Multi-output is
 still single-output-only.
@@ -855,11 +863,15 @@ type-check under `tsc --strict`.
 
 A real client can create + configure an `xdg_toplevel`. `wl_compositor`/
 `xdg_wm_base` are globals; `wl_surface`/`wl_region`/`xdg_surface`/`xdg_toplevel`
-are request-created. The configure handshake (`xdg_toplevel.configure`
-empty-states → `xdg_surface.configure` serial → client `ack_configure`) works, plus
-`set_title`/`set_app_id`. configure sends `states = [activated]` (the on-wire proof
-of non-empty array encoding) and 0×0 (client picks size). See the WM-request no-ops
-in "Read first".
+are request-created. The configure handshake (`xdg_toplevel.configure` with a
+sized rect + states array → `xdg_surface.configure` serial → client
+`ack_configure`) works, plus `set_title`/`set_app_id`. The states array
+(`xdg_surface.ts` `buildStatesArray`) carries the resolved presentation:
+`maximized`/`fullscreen`, the four `tiled_*` edges for a managed tile, and
+`activated` for the keyboard-focused window. The behavioral-state requests
+(`set_maximized`/`set_fullscreen`/`set_minimized`/`set_min_size`/`set_max_size`/
+`move`/`resize`) route through `wm.propose`; see the "Read first" entry for the
+residual no-ops.
 
 ### Subsurfaces (`wl_subsurface`, pixel-verified)
 
@@ -994,9 +1006,11 @@ side: `sdk.window` `onMap`/`onUnmap`/`onChange`
 (`packages/core/src/plugins/window-observer.ts`), validating each payload at
 the trust boundary; `main.ts` forwards window.* to the runtime
 (`broadcast`/`emit`). **Gap:** `window.change` covers only
-title/appId/activated — maximized/fullscreen/minimized/resized/parent are not
-emitted (those `xdg_toplevel` requests are no-ops with no backing state); the
-bus is ready for them.
+title/appId/activated. Presentation changes (maximized/fullscreen/minimized/
+floating/parent) are not folded into `window.change`; they surface instead on
+the `window.proposed`/`window.committed` events emitted by `wm.propose`. The
+bus is ready to also carry them on `window.change` if a consumer needs the
+unified stream.
 
 **Pattern subscribe + plugin emit** (`dynamic-bus.ts`): on top of the
 typed bus, a dynamic, string-keyed event bus supports
@@ -1053,12 +1067,14 @@ sequencing.
   point; the bundled actions surface today is empty (Phase 6+ greenfield
   plugins add their own actions).
 
-- **Per-window state bag + hint setters** (Phase 0d,
+- **Per-window state bag + `propose` + snapshots** (Phase 0d,
   `packages/core/src/plugins/windows-sdk.ts` + `windows-broker.ts`):
-  `sdk.windows.setFloating` / `setFullscreen` / `setMaximized` /
-  `setMinimized` store opaque hint state (no behavioral change in core
-  today; the WM is still a fixed tiler — see "Read first" silent-gap
-  list). `setState(id, key, value)` / `getState` / `deleteState` is the
+  `sdk.windows.propose(id, proposal, reason)` drives behavioral state
+  (presentation maximized/fullscreen/minimized/floating, layoutMode,
+  constraints, parent) through `wm.propose` and returns the committed
+  `WindowState`; presentation changes take effect in the layout (see the WM
+  behavioral-state section). `setState(id, key, value)` / `getState` /
+  `deleteState` is the
   untyped per-window state bag; structured-clone-validated at the
   bundled/external boundary. `get(id)` / `list()` snapshot windows for
   the plugin (used by the layout driver and any plugin needing inputs
@@ -1411,8 +1427,9 @@ not per-snapshot). The intercept chain (Phase 10) that
 -- the per-surface state currently baked in is opacity / transform /
 mask / outputMargin plus decoration surface splicing, but no
 per-pixel plugin transform. Multi-output: `outputId` is plumbed
-honestly but only `OUTPUT_DEFAULT` is meaningful until the
-`wl_output` reconfiguration pre-condition lands.
+honestly but only `OUTPUT_DEFAULT` is meaningful until multi-output
+enumeration lands (output resize/reconfiguration itself is built --
+see "Output reconfiguration").
 
 ### Cross-device compose for Worker plugins (Phase 5b — snapshot + live)
 
@@ -1648,8 +1665,8 @@ window is on.
 **Caveats:**
 - Single-output today. `outputId` defaults to `OUTPUT_DEFAULT=0`;
   passing anything else routes through the registry but only output 0
-  is meaningful until `wl_output` reconfiguration lands ("Read first"
-  silent-gap list).
+  is meaningful until multi-output enumeration lands (output
+  resize/reconfiguration is built; multi-output is not).
 - Animated transitions (Phase 8) land via the optional
   `transition: {kind, duration, easing?}` arg on `workspace.show`
   (action + namespace API). When omitted, the swap is instant
@@ -1943,7 +1960,7 @@ async. Recognized refs:
 - `ref.focusedWindow` -> number | null (state.seat.kbFocus.surfaceId).
 - `ref.pointerX` / `ref.pointerY` -> number (state.seat.pointerPosition).
 - `ref.activeOutput` -> number (OUTPUT_DEFAULT=0 today; multi-output
-  is a wl_output reconfiguration pre-condition).
+  enumeration is not yet built).
 - `ref.currentWorkspace` -> number | null (cached from workspace.shown
   events; the workspace plugin's namespace methods are async, so a
   bus subscription keeps the value live without blocking the resolver).
@@ -2053,8 +2070,8 @@ GPU tests on the target set still pass.
   in that case; action handlers should treat it as "no current
   workspace info available."
 - `ref.activeOutput` is constant 0 today (single-output). When
-  multi-output lands (depends on `wl_output` reconfiguration), the
-  resolver will read from the seat's notion of the active output.
+  multi-output enumeration lands, the resolver will read from the
+  seat's notion of the active output.
 - The user-config `actions` map is a verbatim pass-through to the
   in-thread `plugin-config-actions`. A Worker plugin can't be the
   receiver of `config.actions` because function references can't
@@ -2142,8 +2159,8 @@ before propagating to the caller.
 
 **Pre-conditions / limitations.**
 - Single-output (`outputId === 0` only) -- the broker validates
-  loudly. Multi-output transitions wait for `wl_output`
-  reconfiguration ("Read first" silent-gap list).
+  loudly. Multi-output transitions wait for multi-output
+  enumeration (not yet built).
 - No `AbortSignal` / cancellation in v1. A plugin can choose
   not to await `run()` -- but the transition still runs to
   completion on the compositor's clock.
@@ -2601,8 +2618,9 @@ pre-Phase-9c; +9 cursor compositing + 1 set_cursor + 1 cursor-shape
   (v1 picks subimage 0). Real themes' `wait` / `progress` /
   `left_ptr_watch` display as a single frame.
 - **HiDPI cursor not scaled**: resolver takes a `scale` arg from
-  day one (so no retrofit), but only scale 1 is ever passed.
-  Awaits the `wl_output` reconfiguration pre-condition.
+  day one (so no retrofit), but core only ever passes scale 1, so the
+  cursor is correct-size but soft at output scale > 1 (see "HiDPI /
+  output scaling"). Independent of multi-output.
 - **`enlarge` rule outcome is no-op in v1**: the rule engine accepts
   the field but doesn't apply a scale to the cursor texture. Would
   need either pre-scaled uploads or a compositor scale uniform on
@@ -3190,7 +3208,7 @@ the resource.
 **Limitations / known gaps**:
 
 - **`output_enter` / `output_leave` not emitted.** Single-output today
-  (`OUTPUT_DEFAULT` only). When multi-output reconfiguration lands, a
+  (`OUTPUT_DEFAULT` only). When multi-output enumeration lands, a
   per-client wl_output resource accessor is needed to find the bound
   resources for a given client + output before this can fire. Most
   consumers (waybar's taskbar in single-output configurations) don't
@@ -3354,7 +3372,9 @@ per-surface render state primitives (`compositor-fx.gpu.mjs`).
 ### Protocol coverage matrix
 
 - **Tested end-to-end**: `wl_compositor`, `wl_surface` (attach/commit/frame),
-  `xdg_wm_base`/`xdg_surface`/`xdg_toplevel` (configure, title/app_id),
+  `xdg_wm_base`/`xdg_surface`/`xdg_toplevel` (configure + states array,
+  title/app_id, maximize/fullscreen/minimize/floating via `wm.propose`,
+  interactive move/resize grab),
   `wl_shm`/`wl_shm_pool`/`wl_buffer` (pixel), `zwp_linux_dmabuf_v1`/
   `..._buffer_params_v1` (pixel), `wl_seat`/`wl_pointer`/`wl_keyboard` (focus +
   key delivery), `wl_output` (mode/geometry), `wl_callback`, `wl_data_device*`/
@@ -3477,16 +3497,24 @@ capabilities exist to grant).
   called once before any records flow) but the API is technically
   unsound; a future change would either return `shared_ptr` or hand
   out a wrapper that owns the lifetime.
-- **WM behavioral state.** Layout policy is a bundled plugin (master-stack
-  tiler, Phase 2) — that piece is built. What is not: behavioral handling of
-  the `xdg_toplevel` state requests (move/resize/maximize/fullscreen/
-  minimize). The hint setters (`sdk.windows.setFloating` etc., Phase 0d)
-  store opaque state and emit on the bus, but the WM and the bundled
-  layout do not react to those hints. This is the gate for the `xdg_toplevel`
-  WM-state silent-gap items in "Read first", and for any user-driven
-  interactive move/resize/keybinding feature.
-- **`wl_output` reconfiguration + host-window resize.** See "Read first".
-- **Display-driven frame clock.** See "Read first" and architecture.md.
+- **WM behavioral-state residual gaps.** The behavioral handling of
+  `xdg_toplevel` state requests is built: `move`/`resize`/`set_maximized`/
+  `set_fullscreen`/`set_minimized`/`set_min_size`/`set_max_size` route through
+  `wm.propose` → the `layout-driver` resolver (maximized → reserved-zone tile
+  region, fullscreen → full output, minimized → hidden, floating → stored rect),
+  with interactive move/resize as seat pointer grabs and the resolved state
+  reflected in the next configure's states array. Covered by
+  `xdg-toplevel-state-requests.test.js`, `xdg-toplevel-states.gpu.mjs`,
+  `wm-floating.test.js`, `wm-state.test.js`, `seat-grab.test.js`,
+  `xdg-toplevel-grab.test.js`, `layout-driver-resolver.test.js`. **Still not
+  done:** `show_window_menu` (no compositor menu); `set_parent` stored but not
+  driving stacking/modality; per-output fullscreen target (single output);
+  floating windows ignore reserved zones.
+- **Multi-output.** Single `OUTPUT_DEFAULT` binding only (output resize /
+  reconfiguration on that one output is built and verified -- see "Output
+  reconfiguration"). Multi-output enumeration, per-output frame clocks, and
+  `output_enter`/`output_leave` are deferred (also noted under "Phase 2
+  partially shipped").
 - **User-facing diagnostic surfacing.** Plugin errors (in-thread init
   throws, per-call method exceptions, bad config from the focus plugin's
   validateConfig) currently only log. A real channel for surfacing them
