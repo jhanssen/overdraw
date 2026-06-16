@@ -253,6 +253,13 @@ struct Message {
     char outputMake [64] = {};
     char outputModel[64] = {};
 
+    // Routing id of the output this message concerns, for every output-scoped
+    // tag: OutputDescriptor, ScanoutReserve, ScanoutReady, ScanoutPresent,
+    // ScanoutFlipComplete. The core keys state.outputs by it and the GPU process
+    // routes per-output scanout state by it. 0 is the first output; one output
+    // exists today, so it is always 0 until multi-output enumeration lands.
+    uint32_t outputId = 0;
+
     // ScanoutReserve: the three texture wire handles (id+generation) the core
     // ReserveTexture'd for the KMS scanout ring slots, plus the three
     // surfaceBufId values the core assigned for in-band access brackets on

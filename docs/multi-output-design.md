@@ -1,0 +1,527 @@
+# Multi-output design + sequencing
+
+Scoping/implementation plan for driving more than one output. **No code yet** —
+this is the plan. Target: **KMS first** (real monitors), **independent outputs**
+(each output owns its own layout/workspace/window stack, positioned in a shared
+global logical coordinate space).
+
+Design rationale lives here; ground-truth status stays in `docs/status.md`. When
+work lands, fold the residual gaps into status.md's "Read first" section and trim
+this doc to what is still future.
+
+## 1. What "independent outputs" means here
+
+- Each `OutputRecord` has a `logicalPosition` in a **global logical coordinate
+  space** (already a field: `ctx.ts` `OutputRecord.logicalPosition`). Outputs are
+  laid out side-by-side / stacked by an arrangement policy (config first; hotplug
+  later). A window's rect is in global logical coords; each output renders the
+  sub-rectangle of that space it covers.
+- Each output runs its **own layout pass** over its own subset of windows. The WM
+  window list gains a per-window output assignment; moving a window across the
+  arrangement boundary reassigns it.
+- Each output has its **own vblank clock** and presents independently. A commit
+  to a window on output A must not force output B to repaint.
+- `wl_surface.enter`/`leave` reflect which output(s) a surface overlaps;
+  `wp_fractional_scale` preferred scale follows the surface's primary output.
+
+Out of scope for v1 (call out explicitly, do not silently drop):
+- **Mirrored/cloned** outputs (same content, two CRTCs) — different model, defer.
+- **Spanning** a single surface across outputs with per-output scale is handled by
+  the global-space render (each output samples its sub-rect); no extra work, but
+  not separately tested in v1.
+- **Mixed-backend** (one KMS + one nested) — not a real use case; nested
+  multi-output is a separate, lower-priority track.
+
+## 2. Where single-output is baked in today
+
+Two depths. The JS layer has the seams **cut but defaulted**; the native/IPC layer
+has single-output **in the contract**.
+
+### JS/TS — refactor (thread an `outputId` through marked seams)
+
+- `state.outputs: Map<number, OutputRecord>` already exists (`ctx.ts:510`), holds
+  exactly one entry seeded at `protocols/index.ts:163` with `id = OUTPUT_DEFAULT`.
+- `OUTPUT_DEFAULT = 0` (`ctx.ts:137`) is hardcoded at every output-keyed call:
+  - `protocols/wl_output.ts` — one global, one resource → `OUTPUT_DEFAULT`.
+  - `protocols/zxdg_output_manager_v1.ts` — `outputFor()` returns the default.
+  - `protocols/zwlr_layer_shell_v1.ts` — reserved zones + layer-surface output all
+    `OUTPUT_DEFAULT`; the `output` arg to `get_layer_surface` is ignored.
+  - `wm/layout-driver.ts:116,172` — one `outputRect` from `snap.output`, reserved
+    zones keyed `OUTPUT_DEFAULT`, layout plugin sees `output.id = OUTPUT_DEFAULT`.
+  - `gpu/compositor.ts` — `outputStacks` is a `Map` but `drawOrder` reads only
+    `OUTPUT_DEFAULT` (`compositor.ts:941`); `renderFrame` acquires/presents one
+    target; `activeTransition` is one (comment at `:740`).
+  - `plugins/compose-sdk.ts`, `plugins/transitions-broker.ts`,
+    `plugins/windows-sdk.ts` — actively **reject** any non-zero `outputId` with a
+    thrown error (`compose-sdk.ts:120`, `transitions-broker.ts:127`).
+  - `main.ts:296` — `setOnOutputDescriptor` callback mutates `OUTPUT_DEFAULT` only.
+
+### Native / IPC — contract change (no `outputId` exists on the wire)
+
+- `gpu-process/src/output_backend.h` — `OutputBackend` owns exactly one target:
+  `size()`, `describeOutput()`, one `FrameDoneListener`, one `eventFd`, one
+  `armFrameCallback()`.
+- `gpu-process/src/kms_output.{h,cpp}` — picks **the first connected connector**
+  (`drm_utils.cpp` `pickConnector`) and ignores the rest; one `DrmTopology topo_`,
+  one `KmsScanoutRing ring_` (`kms_output.h:133-134`).
+- `gpu-process/src/kms_scanout_ring.{h,cpp}` — 3-slot ring, one per backend.
+- `native/ipc/side_channel.h` — `OutputDescriptor`, `ScanoutReserve`,
+  `ScanoutReady`, `ScanoutPresent`, `ScanoutFlipComplete` carry **no output id**.
+  `ScanoutPresent`/`FlipComplete` carry only a slot index 0..2.
+- `native/core/compositor.{h,cpp}` — `acquireOutputTextureHandle()` /
+  `presentOutput()` take no args; `scanoutSlots_[0..2]` is global; `flipPending()`
+  is global.
+- `native/napi/addon.cpp` — `AcquireOutputTexture` / `PresentOutput` /
+  `updateOutputSize` / `setOutputSize` take no output id.
+- `gpu-process/src/main.cpp` — one `OutputBackend`, one `output->pump()` per loop
+  iteration, one epoll registration on one `eventFd`.
+
+## 3. Output identity model
+
+Pick **one stable small-int `outputId`** assigned by the GPU process at
+enumeration time and carried on every output-scoped IPC message. The KMS
+connector id is the natural source but is large/sparse; map it to a dense index
+(0, 1, 2…) in a GPU-process-side table and send the dense id. The core's
+`state.outputs` is keyed by this dense id. `OUTPUT_DEFAULT = 0` remains the id of
+the first output, so single-output behavior is unchanged when N=1.
+
+`OutputRecord` already carries `name` (e.g. "DP-1") for client-facing keying; the
+dense `id` is the internal routing key. Do **not** expose the connector id to
+clients.
+
+**Two kinds of identity — keep them separate.** The dense `outputId` is a
+**runtime routing key**: assigned at enumeration order, reused, and *not* stable
+across unplug/replug (the same physical monitor can come back as a different dense
+id). Anything that must remember an output *across its disappearance* — the
+window-migration preference in Section 10 — must key on a **durable string
+identifier**, never the dense id. Two durable keys, checked in order:
+
+- **EDID identifier** (make + model + serial) — survives the monitor moving to a
+  different port.
+- **Connector name** (e.g. "DP-1") — fallback for EDID-less / identical monitors
+  swapped on the same port.
+
+`OutputRecord` carries `name` today; add a stable `edidId` field (empty when the
+connector has no usable EDID) so the migration layer can match on either. The
+"current output of a workspace" is then *derived* (resolve the durable key to
+whatever live `outputId` currently matches), not stored as a field.
+
+**The dividing rule (decided): the dense `outputId` is transient; durable
+identifiers are the source of truth for anything that survives an output
+disappearing.** Concretely:
+
+- The dense `outputId` appears **only at runtime routing boundaries** —
+  `state.outputs` key, the IPC messages, the compositor's
+  `acquireOutputTexture`/`presentOutput`, and `setOutputStack(outputId, …)`. It is
+  fine to keep (the existing code is already `Map<number>`, so this is the
+  low-churn choice) precisely because nothing *persists* it.
+- **No persistence-bearing structure keys on the dense id.** The workspace
+  registry's per-workspace home is `preferredOutputs` (durable identifiers,
+  Section 8); the live "which workspace is on which dense `outputId`" mapping is
+  **derived** from that on each output change, never the stored truth. This is what
+  removes any "re-key the maps when a monitor's dense id changes" step — there is
+  no stored dense key to re-key.
+
+## 4. IPC contract changes (foundational — do first)
+
+Add `uint32_t outputId` to, in `native/ipc/side_channel.h`:
+
+- `OutputDescriptor` — sent once per output at bring-up, and again per output on
+  change. The core's `fireOutputDescriptors` / `setOnOutputDescriptor` path passes
+  it through to JS (Section 7).
+- `ScanoutReserve` — the core reserves a 3-slot ring **per output**: 3 wire
+  handles + 3 bufIds + width/height **+ outputId**.
+- `ScanoutReady` — per output (ok/fail for that output's ring).
+- `ScanoutPresent` — `{ outputId, surfaceBufId }`.
+- `ScanoutFlipComplete` — `{ outputId, surfaceBufId }`.
+- Add `OutputAdded` / `OutputRemoved` for hotplug (Section 10) — deferrable to a
+  later milestone, but reserve the tags now so the enum is stable.
+
+This is a wire-format change between core and GPU process; both sides ship
+together (no version negotiation across the private socket). Land it as a
+mechanical "add the field, plumb it, still N=1" change **before** any behavior
+changes, so each later milestone is a smaller diff.
+
+## 5. GPU process: OutputBackend → N targets
+
+Two viable shapes; **recommend (a)**:
+
+**(a) `OutputBackend` owns N outputs internally.** The interface gains an
+`outputId` parameter on the per-output methods (`size(id)`, `describeOutput(id,…)`,
+`acquireScanout(id)`/`presentScanout(id)`), plus an enumeration method returning
+the list of output ids. `eventFd()` stays a single shared fd (the DRM fd carries
+all CRTCs' page-flip events). `KmsOutputBackend` holds `Map<outputId, PerOutput>`
+where `PerOutput = { DrmTopology, KmsScanoutRing }`. The page-flip handler routes
+each event to the right ring by CRTC id (the `drmEventContext` page-flip callback
+receives user_data — stash the `PerOutput*` there).
+
+**(b) one `OutputBackend` instance per output.** Cleaner per-instance state but
+duplicates the GBM device / instance ownership and complicates the shared DRM fd
+and shared epoll registration. Rejected for KMS (one DRM fd, one GBM device, N
+CRTCs is the natural grouping).
+
+`main.cpp` changes: enumerate all outputs at `open()`, send one `OutputDescriptor`
+per output, run `initScanout` per output (each reserves its own 3 handles from the
+core — see the reserve handshake in `status.md` "KMS scanout backend → Bring-up
+flow"), and in the present loop dispatch flips per output. The `output->pump()`
+call stays single (one fd) but now advances N rings.
+
+`drm_utils.cpp`: `pickConnector` becomes `enumerateConnectors` returning all
+connected connectors with modes. CRTC assignment must avoid collisions — walk each
+connector's `possible_crtcs` mask and assign distinct CRTCs greedily; a connector
+with no free compatible CRTC is dropped with a logged warning (do not silently
+skip — Section 12).
+
+## 6. Core compositor: per-output scanout state
+
+`native/core/compositor.{h,cpp}`:
+
+- `scanoutSlots_[0..2]` → `Map<outputId, ScanoutSlot[3]>` (or a small vector
+  indexed by dense id).
+- `acquireOutputTextureHandle(outputId)` / `presentOutput(outputId)` take the id;
+  `currentSlot_` becomes per-output (the acquire→present pair must not interleave
+  across outputs within one render, or track `{outputId, slot}` on acquire).
+- `ScanoutReserve`/`Ready` issued per output during bring-up; `drainCtrl` parses
+  the `outputId` on `ScanoutFlipComplete` and advances that output's slot machine.
+- `flipPending()` → `flipPending(outputId)`.
+
+`native/napi/addon.cpp`: `AcquireOutputTexture(outputId)`,
+`PresentOutput(outputId)`, `updateOutputSize(outputId, w, h)`,
+`setOutputSize(outputId, w, h, scale)`.
+
+## 7. JS compositor + frame loop (the hard part)
+
+This is where independent-outputs is more than plumbing.
+
+### Render
+
+`JsCompositor.renderFrame` today: acquire one output texture → composite the
+global stack → present. Multi-output: **for each output that needs a frame**,
+acquire that output's texture, set the render-pass viewport/scissor to that
+output's rect in the global logical space (scaled to device), composite the
+surfaces that intersect that output's region, present that output.
+
+- `outputStacks` (`compositor.ts:691`) generalizes directly — already keyed by
+  outputId; `drawOrder(outputId)` instead of reading only `OUTPUT_DEFAULT`.
+- The **composite-scissor damage ring** (`OutputDamageRing`, keyed by the stable
+  `acquireOutputTexture` handle, see status.md) already generalizes: each output's
+  slots have distinct handles, so per-output buffer-age damage falls out for free.
+- `activeTransition`, `liveScenes`, phantoms become per-output maps (or carry an
+  outputId). A transition runs on the output its window lives on.
+
+### Pacing
+
+Today the core wakes on `ScanoutFlipComplete` and renders one frame when
+`wantNext` is set (`runFrameIfReady`). With N independent vblank clocks:
+
+- Track `wantNext` **per output** (damage on output A sets only A's flag).
+- `runFrameIfReady` iterates outputs; for each output whose `wantNext` is set AND
+  whose ring has a FREE slot (not mid-flip), render+present just that output.
+- A surface that overlaps two outputs dirties both.
+- `dispatchFrameCallbacks` fires a surface's frame callback when **an output it is
+  visible on** flips — needs surface→output(s) visibility, computed from the
+  surface's global rect vs each output's rect.
+
+This per-output pacing is the single biggest behavior change and the main
+correctness risk. It should be its own milestone with its own focused testing.
+
+## 8. WM / layout: per-output
+
+- `wm/index.ts`: each window gains an `outputId` (which output it is laid out on).
+  Insertion assigns it (initially the focused/primary output); a move across the
+  arrangement boundary reassigns and triggers relayout on both outputs.
+- `wm/layout-driver.ts:runOnce`: loop over outputs. For each output build its
+  `outputRect` from that output's `OutputRecord.logicalPosition + logicalSize`,
+  subtract that output's reserved zones, partition windows by `outputId`, run the
+  layout plugin once per output (`output.id` = real id, `output.rect` =
+  global-space rect). Plugin contract is already per-output-shaped
+  (`LayoutInputs.output`), so the plugin needs no change for independent layouts.
+- Concrete single-output caps to lift for the existing workspace plumbing:
+  `main.ts:603` caches "only the default-output workspace"; `outputToplevelStacks`
+  (`ctx.ts:491`) and the per-output stack overrides need to be exercised for
+  `outputId != 0` (the `setOutputStack(outputId, …)` seam already accepts any id).
+
+### The relocation unit is the workspace (already built)
+
+Workspaces already exist and were built per-output-aware (status.md "Workspaces
+(Phase 6)"): the bundled `@overdraw/plugin-workspace-default` owns a registry
+keyed by output — `positionsByOutput`, `shownByOutput`, `surfaceToHandle` — and
+every action/event carries an `outputId`. The plugin owns the registry; core sees
+only `sdk.windows.setOutputStack(outputId, ids[])`. The WM has **no** concept of
+workspaces — it lays out all windows; the workspace plugin filters what each output
+draws. The system is single-output only because enumeration caps `outputId` to 0
+(status.md caveat: "only output 0 is meaningful until multi-output enumeration
+lands"), not because the model is single-output.
+
+So the unit that moves between outputs on a hotplug (Section 10) is the
+**workspace**, and the migration state attaches to **workspace records in the
+plugin's registry** — there is no separate "layout group" abstraction to invent.
+This also locates the policy: the workspace plugin already owns `positionsByOutput`,
+so the migration logic most naturally lives **in the plugin**, driven by
+`output.added` / `output.removed` bus events (the multi-output extension of the
+existing `output.changed` event), with core/WM supplying only those signals plus
+the virtual fallback output (Section 10).
+
+A workspace's home is **not** a stored live `outputId`. It is a **durable
+preferred-output list** (Section 3 identity), most-preferred first, resolved on
+demand to whatever live output currently matches:
+
+- **`preferredOutputs: string[]`** per workspace record — durable identifiers (EDID
+  id or connector name), never the runtime dense id. This is a new field on the
+  registry's `byHandle` record.
+- The workspace's *current* output is **derived**: the first entry in
+  `preferredOutputs` that resolves to a connected output. `positionsByOutput` /
+  `shownByOutput` are then indexed by that derived live id. There is no separate
+  durable "current output" to keep in sync.
+- The list **only grows or reorders, never shrinks** — a workspace accumulates the
+  history of every output it has lived on, so a returning monitor can reclaim it.
+
+Mutations (the only three):
+1. **Config seed** at workspace creation: a user rule (`workspace → output order`)
+   pre-populates `preferredOutputs` (the existing `workspace.create({outputId?})`
+   gains a durable-identifier seed path).
+2. **Append on placement**: when a workspace is forced onto an output not already
+   in its list (a fallback during evacuation), that output is appended at *lowest*
+   priority — remembered, but not preferred.
+3. **Promote on explicit move**: `workspace.move-window` / a future "move workspace
+   to output X" raises X to just above the workspace's previous output in the list.
+   Manual moves teach the order; they do not reset it.
+
+## 9. Protocol layer: per-output resources
+
+- `wl_output.ts`: create **one `wl_global` per output** (not one global mapped to
+  the default). On bind, associate the resource with its output's id; emit that
+  output's geometry/mode/scale/name/done. `state.wlOutputResources` is already
+  keyed by outputId (`ctx.ts:359`), so the tracking-set + re-emit machinery
+  generalizes; the missing piece is creating/destroying the global per output on
+  add/remove.
+- `zxdg_output_manager_v1.ts`: `outputFor(resource)` resolves the bound output id
+  instead of always returning default; `logical_position` now reports the output's
+  real `logicalPosition` (today always 0,0).
+- `zwlr_layer_shell_v1.ts`: honor the `output` arg to `get_layer_surface`
+  (NULL = compositor picks primary); reserved zones keyed by that output.
+- `wl_surface.enter`/`leave`: emit when a surface's global rect starts/stops
+  overlapping an output (not wired today — single output meant always-entered).
+
+## 10. Output arrangement + hotplug
+
+- **Arrangement is user-declared, not inferred.** There is **no compositor policy
+  for physical placement** — nothing in EDID or the connection tells us where
+  monitors physically sit relative to each other, so the user must declare it. Core
+  resolves the user's declaration into each output's `logicalPosition`; it applies
+  no heuristic. The config model must express **full 2D placement, including
+  vertical stacking** — a 1D left-to-right ordering cannot represent e.g. one
+  monitor on the left with two monitors stacked above/below each other on the
+  right. With mismatched resolutions/scales the covered global space is
+  **non-rectangular** (overhangs and gaps between outputs); pointer edge-traversal
+  (Section: pointer mapping) must handle non-contiguous coverage — moving the
+  pointer toward a gap has no destination output.
+
+  **v1: absolute logical position** per output — `output."DP-1".position = {x, y}`.
+  Unambiguous, full 2D, and the durable ground-truth form: a future GUI canvas
+  (drag monitors to replicate the physical layout) emits exactly these coordinates,
+  so absolute is what any higher-level tool resolves *to*. Two accepted v1 sharp
+  edges, fixable later: (a) the coordinates are **logical**, so under HiDPI they are
+  not the monitor's pixel resolution — `x` of a right-hand output equals the
+  left output's *logical* width (device width / scale); (b) the user must **know
+  that width** to butt a second monitor against the first's right edge. Relative
+  placement (`right-of DP-1` / `below DP-2`, topologically resolved to absolute,
+  with edge-alignment rules) removes (b) and is the natural later sugar; a GUI
+  canvas removes both. Neither is v1.
+  Undeclared outputs need a **deterministic fallback** (e.g. placed to the right of
+  the last, top-aligned, enumeration order) so multi-output works before the user
+  configures — this is a fallback to keep the system usable, **not** a placement
+  policy; user config is authoritative.
+- **Hotplug detection**: monitor connect/disconnect does **not** arrive on the DRM
+  fd (that fd carries only page-flip / vblank). It comes on a separate **udev
+  netlink monitor** fd, filtered to the `drm` subsystem, added to the GPU process's
+  epoll loop (`event_loop.h`). The uevent is a generic "card changed" with a
+  `HOTPLUG=1` property (and optional `CONNECTOR=<id>` hint); the robust response is
+  to re-probe — `drmModeGetResources` → `drmModeGetConnector` per connector — and
+  diff each connector's `connection` status against the prior snapshot to find what
+  added/removed. This is a genuinely new dependency: the GPU process uses libseat
+  for the card today but has no udev monitor.
+
+  **Hotplug is required, not optional.** A multi-output compositor that only
+  enumerates at startup is not a complete system — dock/undock and external-monitor
+  plug/unplug are the common case, not an edge case. It is the **last** milestone
+  only because it builds on the per-output workspace model (milestone 5), not
+  because it can be dropped. Milestones 1-6 are intermediate states of one
+  in-progress feature, not a shippable endpoint that omits hotplug; "multi-output"
+  is not done until live plug/unplug works.
+- **Hotplug propagation**: `OutputAdded`/`OutputRemoved` IPC (Section 4) → core
+  adds/removes the `state.outputs` entry, creates/destroys that output's `wl_output`
+  global (clients see `wl_registry.global` / `global_remove` and re-bind),
+  re-arranges, relayouts, and emits `output.added`/`output.removed` on the plugin
+  bus so the workspace plugin runs the migration (below). Its own milestone.
+
+### Workspace migration on output change
+
+The "where do windows go when a monitor disappears, and do they come back" policy.
+The unit is the **workspace** (Section 8 — already built, per-output-keyed). The
+policy lives in the **workspace plugin** (it owns `positionsByOutput` /
+`shownByOutput`), reacting to `output.added`/`output.removed`. It relies on the
+durable preferred-output list, the derive-current-from-list rule, and one piece
+core must provide:
+
+- **A persistent virtual fallback output.** Always keep one never-scanned-out
+  output in `state.outputs` (`OUTPUT_DEFAULT = 0` is the natural identity for it).
+  When the **last real monitor disappears**, workspaces park on it: their windows
+  stay fully alive in the WM tree, clients keep running, nothing is presented. This
+  is the reason to always have ≥1 output rather than make every layer (render,
+  layout, protocol) tolerate an empty `state.outputs`.
+
+The whole policy is one operation: **on any output add/remove, recompute every
+workspace's current live output as the highest-ranked entry in its
+`preferredOutputs` that resolves to a connected output, then push `setOutputStack`
+for the resulting per-output draw lists.** Because the current output is derived,
+not stored, there is no map to re-key — removal and return below are just the two
+interesting cases of that recompute.
+
+**On output removal** — each workspace whose derived output was the dying one
+recomputes its home:
+1. The highest-ranked `preferredOutputs` entry that still resolves to a connected
+   *real* output.
+2. If none of its remembered outputs survive → the first remaining real output
+   (and append it to `preferredOutputs` at lowest priority — now remembered).
+3. If there is no real output at all → the virtual fallback output (parked, alive,
+   invisible).
+4. Re-push `setOutputStack` for the affected outputs and relayout. Windows sized
+   against the zero-area fallback are re-sized/re-centered when they next land on a
+   real output.
+
+**On output return** (a monitor reappears, or any output is enabled): the recompute
+naturally produces two effects.
+1. **Reclaim by preference.** Any workspace whose highest-ranked resolvable
+   preferred output is now the *returning* output derives back onto it — it leaves
+   wherever it had fallen back. A workspace that fell onto another monitor when its
+   preferred one unplugged migrates **back** the instant that monitor returns — the
+   durable preference outranks "it's fine where it is." (This is why the preferred
+   list holds durable identifiers, not the dense id, and why entries are never
+   removed.)
+2. **Restore parked workspaces.** Everything that had derived onto the virtual
+   fallback output now derives onto the returning monitor; re-size zero-area
+   floaters.
+
+Because the preferred list holds durable identifiers, a monitor unplugged and
+replugged on a different port (new dense `outputId`, same EDID id) still reclaims
+its workspaces. Preserve the existing per-output invariant (≥1 workspace per
+touched output) across all of this.
+
+## 11. Sequencing (milestones)
+
+Each milestone is independently landable and leaves the tree working at N=1. The
+ordering is a build sequence, not a scope boundary: the feature is complete only
+after milestone 7 (hotplug). Milestones 1-6 are intermediate states of one feature,
+not a shippable "multi-output without hotplug."
+
+1. **IPC outputId plumbing (no behavior change).** Add `outputId` to the messages
+   (Section 4), thread through compositor/addon/main.cpp, still drive one output.
+   Tree behaves identically. Smallest foundational diff.
+2. **JS outputId threading (no behavior change).** Replace hardcoded
+   `OUTPUT_DEFAULT` at the seams (Section 2) with a passed id that is still always
+   0. Plugin SDKs stop rejecting non-zero in principle but nothing sends non-zero.
+3. **Native N-connector enumeration.** `KmsOutputBackend` enumerates all
+   connectors, assigns distinct CRTCs, builds N rings, sends N descriptors, N
+   reserve/ready handshakes, routes flips per CRTC (Sections 5-6). Core now has N
+   `state.outputs` entries but JS still renders only output 0 → second monitor
+   stays dark (acceptable *interim*, flagged).
+4. **Per-output render + pacing.** `renderFrame` loops outputs, per-output
+   `wantNext`, per-output present (Section 7). Second monitor lights up. Highest
+   risk; gets the most testing.
+5. **Per-output WM + layout + workspaces.** Per-output layout pass, global-space
+   arrangement policy (Sections 8, 10-arrangement), and lift the workspace plugin's
+   single-output caps so `outputId != 0` is meaningful (`positionsByOutput` /
+   `shownByOutput` / `setOutputStack` already accept it). Add the durable
+   `preferredOutputs` field to the workspace registry (Section 8). Windows tile and
+   workspaces switch independently on each monitor. Land the virtual fallback output
+   here too (it simplifies every later layer by guaranteeing ≥1 output), even though
+   nothing removes the last real monitor until milestone 7.
+6. **Per-output protocol resources.** N `wl_output` globals, real xdg-output
+   positions, `wl_surface.enter/leave`, layer-shell output targeting (Section 9).
+7. **Hotplug (required for completeness).** udev-monitor detection +
+   `OutputAdded`/`Removed` end-to-end, and the workspace-migration policy in the
+   workspace plugin — removal evacuation, return-reclaim by preference,
+   restore-from-fallback (Section 10). The per-output workspace model +
+   `preferredOutputs` from milestone 5 is the prerequisite; this milestone makes it
+   react to live plug/unplug. Not optional — multi-output is incomplete without it
+   (Section 10).
+
+## 12. Testing — and a real gap to settle first
+
+Per the project testing policy, every new protocol/behavior gets a test at the
+cheapest tier that proves it. Most of this plan is testable GPU-free or via the
+nested harness:
+
+- **GPU-free / unit**: outputId threading, `state.outputs` multi-entry, arrangement
+  policy (`resolveScale` sibling), per-output layout-driver partitioning,
+  `wl_output` per-output bind/re-emit/scrub, xdg-output positions, window→output
+  assignment + reassignment, surface→output overlap → enter/leave. The whole
+  **workspace-migration policy** (Section 10) is pure logic over the workspace
+  registry + `state.outputs`, so it extends the existing
+  `test/plugin-workspace-default/registry.test.js` without any GPU: preferred-list
+  resolution (highest-ranked live output), the three mutation rules, removal
+  evacuation, return-reclaim by durable identifier, fallback parking + restore,
+  replug-on-different-port (same EDID id, new dense id) reclaim, and the ≥1
+  workspace-per-output invariant holding across migrations.
+- **Nested harness** (`*.gpu.mjs`): a **fabricated second output** in the nested
+  backend (a second host window, or a synthetic second `OutputRecord` + second
+  scanout target) exercises per-output render, per-output `wantNext` pacing,
+  per-output damage, and frame-callback routing without bare metal.
+
+**The gap (flagging, not deciding silently):** the milestone-3/4 work that is
+*genuinely KMS-only* — N-connector enumeration, distinct-CRTC assignment, and
+per-CRTC page-flip routing — **has no automated coverage today and cannot get it
+under the current harness.** `status.md` records "No KMS coverage in the test
+suite (per user direction, option A)" for the existing single-output KMS path; the
+honest extension is that the per-CRTC routing logic inherits that gap and is the
+most fragile new native code. Two options, neither chosen yet:
+
+- **Accept the same gap**: verify N-connector KMS by manual run on real
+  multi-monitor hardware only, mirroring the current single-output KMS decision.
+- **Build a vkms (virtual DRM) harness**: lets CI drive 2+ virtual connectors and
+  automate the enumeration/routing logic. This is real new infrastructure (its own
+  piece of work) but is the only way milestones 3/4's KMS-specific code gets
+  regression coverage.
+
+**Decision (taken): accept the gap — manual verification for now.** N-connector
+enumeration, distinct-CRTC assignment, and per-CRTC page-flip routing are verified
+by manual run on real multi-monitor hardware, mirroring the existing single-output
+KMS decision in `status.md`. This is a *flagged* gap, not a silent one: the
+KMS-specific native code in milestones 3/4 ships without automated coverage, and
+that must be stated in `status.md` when it lands. A vkms harness remains the
+future path to close it if the manual-only risk proves too high.
+
+## 13. Open questions for the user
+
+None outstanding — all decisions below are resolved. Reopen if a constraint
+changes.
+
+Resolved:
+- Arrangement ownership — **user-declared, core-resolved; no placement policy.**
+  Physical placement cannot be inferred, so the user declares it; core resolves the
+  declaration into `logicalPosition` with no heuristic. Must support full 2D incl.
+  vertical stacking. A deterministic fallback covers undeclared outputs (usability,
+  not policy). Not a plugin seam in v1 (Section 10).
+- Arrangement config form — **absolute logical `{x,y}` per output** for v1
+  (ground-truth form a future GUI canvas resolves to). Accepted v1 awkwardness: the
+  user must know an output's logical width to butt another against its edge.
+  Relative placement / GUI canvas are later sugar, not v1 (Section 10).
+- KMS test coverage — manual verification (Section 12).
+- Migration unit — the **workspace** (already built, per-output-keyed); no new
+  "layout group" abstraction. Single-output only because enumeration caps
+  `outputId` to 0 (Section 8).
+- Output identity — **keep the dense `outputId`** as the transient runtime routing
+  handle (low-churn, existing `Map<number>`); it is never persisted. The durable
+  preferred-output list (EDID id / connector name) is the source of truth for
+  persistence; the live workspace→output mapping is derived from it (Section 3).
+- Migration policy owner — the **workspace plugin** holds `preferredOutputs` and
+  runs the recompute on `output.added`/`output.removed`; core supplies only those
+  bus signals and the virtual fallback output (Sections 8, 10).
+- Per-output pacing — **independent per-output clocks** (per-output `wantNext`,
+  render+present only the dirty output on its own vblank). Section 7; the
+  milestone-4 risk, gets the most testing.
+- Hotplug — **required, not deferrable.** Sequenced last (milestone 7) because it
+  builds on the per-output workspace model, but multi-output is not complete
+  without live plug/unplug. Milestones 1-6 are intermediate states, not a shippable
+  endpoint (Sections 10, 11).

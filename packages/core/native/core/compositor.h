@@ -163,6 +163,7 @@ class Compositor {
     // queued here and drained by the addon, which fires the JS onOutput
     // callback per entry. Fields mirror ipc::Tag::OutputDescriptor.
     struct OutputDescriptorMsg {
+        uint32_t outputId         = 0;
         uint32_t width            = 0;
         uint32_t height           = 0;
         uint32_t refreshMhz       = 0;

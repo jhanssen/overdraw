@@ -217,6 +217,7 @@ bool Compositor::bringUp() {
                 // also push it to the steady-state queue so main.ts's
                 // onOutputDescriptor callback fires normally.
                 OutputDescriptorMsg msg{};
+                msg.outputId = m.outputId;
                 msg.width = m.width; msg.height = m.height;
                 msg.refreshMhz = m.refreshMhz; msg.scale = m.outScale;
                 msg.transform = m.outTransform;
@@ -273,6 +274,7 @@ bool Compositor::bringUp() {
         td.usage = WGPUTextureUsage_RenderAttachment | WGPUTextureUsage_TextureBinding;
         ipc::Message rsMsg{};
         rsMsg.tag = ipc::Tag::ScanoutReserve;
+        rsMsg.outputId = 0;  // the one output today; per-output when enumeration lands
         rsMsg.width = windowWidth_;
         rsMsg.height = windowHeight_;
         for (int i = 0; i < 3; ++i) {
@@ -519,6 +521,7 @@ void Compositor::drainCtrl() {
         }
         if (r.tag == ipc::Tag::OutputDescriptor) {
             OutputDescriptorMsg msg{};
+            msg.outputId         = r.outputId;
             msg.width            = r.width;
             msg.height           = r.height;
             msg.refreshMhz       = r.refreshMhz;
@@ -870,6 +873,7 @@ void Compositor::presentOutput() {
 
         ipc::Message m{};
         m.tag = ipc::Tag::ScanoutPresent;
+        m.outputId = 0;  // the one output today; per-output when enumeration lands
         m.surfaceBufId = scanoutSlots_[slot].surfaceBufId;
         ipc::sendMessage(ctrlFd_, m);
         presented_++;

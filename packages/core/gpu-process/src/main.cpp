@@ -516,6 +516,7 @@ int run(int wireFd, int ctrlFd, int inputFd, bool headless,
         output->describeOutput(info);
         ipc::Message m{};
         m.tag = ipc::Tag::OutputDescriptor;
+        m.outputId         = 0;  // the one output today; per-output when enumeration lands
         m.width            = info.width;
         m.height           = info.height;
         m.refreshMhz       = info.refreshMhz;
@@ -585,6 +586,7 @@ int run(int wireFd, int ctrlFd, int inputFd, bool headless,
         {
             ipc::Message m{};
             m.tag = ipc::Tag::OutputDescriptor;
+            m.outputId         = 0;  // the one output today; per-output when enumeration lands
             m.width            = info.width;
             m.height           = info.height;
             m.refreshMhz       = info.refreshMhz;
@@ -666,6 +668,7 @@ int run(int wireFd, int ctrlFd, int inputFd, bool headless,
         {
             ipc::Message m{};
             m.tag = ipc::Tag::ScanoutReady;
+            m.outputId = reserveMsg.outputId;  // echo the reserved output
             m.ok = injectOk ? 1 : 0;
             ipc::sendMessage(ctrlFd, m);
         }
@@ -715,6 +718,7 @@ int run(int wireFd, int ctrlFd, int inputFd, bool headless,
                 output->describeOutput(info);
                 ipc::Message m{};
                 m.tag              = ipc::Tag::OutputDescriptor;
+                m.outputId         = 0;  // the one output today; per-output when enumeration lands
                 m.width            = info.width;
                 m.height           = info.height;
                 m.refreshMhz       = info.refreshMhz;
@@ -1872,6 +1876,7 @@ int run(int wireFd, int ctrlFd, int inputFd, bool headless,
             (void)retiredSlotIdx;  // unused: see KmsScanoutRing for the inversion.
             ipc::Message m{};
             m.tag = ipc::Tag::ScanoutFlipComplete;
+            m.outputId = 0;  // the one output today; per-output when enumeration lands
             // KmsScanoutRing's listener semantics return retired (now-FREE)
             // slot. The core needs to know which slot just became SCANOUT
             // -- look up the ring state to find it.

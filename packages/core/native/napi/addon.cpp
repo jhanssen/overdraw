@@ -1310,6 +1310,7 @@ void fireOutputDescriptors(napi_env env) {
     for (const auto& d : descs) {
         napi_value obj, v, sname, smake, smodel;
         napi_create_object(env, &obj);
+        napi_create_uint32(env, d.outputId,         &v); napi_set_named_property(env, obj, "outputId", v);
         napi_create_uint32(env, d.width,            &v); napi_set_named_property(env, obj, "width", v);
         napi_create_uint32(env, d.height,           &v); napi_set_named_property(env, obj, "height", v);
         napi_create_uint32(env, d.refreshMhz,       &v); napi_set_named_property(env, obj, "refreshMhz", v);
