@@ -48,25 +48,25 @@ with no error. Worst-first.
 - **`wl_region` is a no-op stub.** `add`/`subtract` do nothing; opaque/input
   regions are not tracked (hit-testing uses whole-window rects). Low urgency.
 
-- **`wl_surface.damage` / `damage_buffer` are no-op stubs; every commit
-  re-uploads the whole shm surface.** `wl_surface.ts` (`damage` and
-  `damage_buffer`) accept the rect args and drop them. `commitSurfaceBuffer`
-  in `compositor.ts` always calls `queue.writeTexture` over the full
-  surface stride×height. A 4K shm client that changes a 200×50 status bar
-  still uploads 32MB through Dawn every commit. The protocol requires
-  honoring the damage region (the spec-correct behavior is "only the
-  damaged sub-rects need to have new pixels"); we just upload all of it.
-  Real-world impact is small for small clients (the burst tests are
-  full-surface anyway) but real for shm clients with sparse updates --
-  terminal scrolling, GTK partial repaints. Hyprland honors damage:
-  `damage.copy().intersect(...).forEachRect(...)` drives one
-  `glTexSubImage2D` per rect, against the same single GL texture per
-  surface (`hyprland/src/render/gl/GLTexture.cpp:146`). Fixing this is
-  bounded: have `damage_buffer` accumulate rects on `s.pending.damage`,
-  promote on commit, and split the `queue.writeTexture` upload into one
-  call per damage rect with a `bytesPerRow + offset` describing each
-  rect's slice of the shm mapping. The damage subsystem is also a
-  prereq for hardware cursor planes and direct-scanout heuristics.
+- **`wl_surface.damage` / `damage_buffer` upload damage is implemented for
+  shm; residual gaps are narrow.** `wl_surface.ts` accumulates damage rects
+  (double-buffered, promoted on commit), reconciles them to buffer
+  coordinates, and `commitSurfaceBuffer` → `uploadPixels` (`compositor.ts`)
+  issues one `queue.writeTexture` per damage rect into the surface's
+  persistent texture; the undamaged region retains prior pixels. A 4K shm
+  client that changes a 200×50 status bar now uploads ~40KB, not 32MB.
+  Residuals: (a) **surface-coordinate `damage` combined with a non-normal
+  buffer transform or an active viewport falls back to a full-surface
+  upload** — buffer-coordinate `damage_buffer` (what GTK/Qt/SDL/terminals
+  use) is always honored regardless of scale/transform/viewport, and
+  surface-coordinate `damage` is honored when scale-only; the fallback only
+  costs the optimization, never correctness. (b) dmabuf is imported
+  wholesale (no CPU upload, so upload-damage does not apply). (c) damage is
+  not yet propagated to the compositing pass as a scissor (every frame still
+  fully recomposites + clears) — see "composite-scissor damage" below; it is
+  also a prereq for hardware cursor planes and direct-scanout heuristics.
+  Tests: `wl-surface-damage.test.js` (accumulation + reconcile + fallbacks),
+  `wl-surface-damage.gpu.mjs` (partial upload preserves the undamaged region).
 
 - **Large shm clients (e.g. fullscreen software-decoded video) may serialize
   against vsync.** Each `wl_surface.commit` with new shm content triggers a
@@ -89,12 +89,14 @@ with no error. Worst-first.
   automatically renames/ghosts the texture's backing storage when the
   GPU still references the old contents. Vulkan/Dawn makes that the
   application's job. The mitigations are: (a) honor damage regions
-  (above), so the upload is sub-rect sized and the barrier wait is
-  short; (b) per-surface ring of textures, rotating the write target
-  each commit so the new write doesn't barrier against the previous
-  sample. (b) is the explicit form of what Mesa does for Hyprland
-  implicitly. Neither is implemented; we have no shm-video client
-  measurement today.
+  (now implemented for shm, see the "Read first" damage entry), so an
+  incremental upload is sub-rect sized and the barrier wait is short --
+  but a full-frame shm video still re-damages the whole surface every
+  commit, so this does not help that case; (b) per-surface ring of
+  textures, rotating the write target each commit so the new write
+  doesn't barrier against the previous sample. (b) is the explicit form
+  of what Mesa does for Hyprland implicitly, and is not implemented; we
+  have no shm-video client measurement today.
 
 - **No `wl_resource_post_error` mechanism.** Requests that the spec defines
   as protocol errors (e.g. `zwlr_layer_surface_v1.invalid_size` when set_size
@@ -305,7 +307,9 @@ instance; a wrapped device is borrowed, not destroyed). Built with
   the master-stack rects, fill their tiles via the configure→resize loop, do not
   overlap, and survivors reflow on unmap.
 
-Still absent: multi-output, damage tracking, and linear-space alpha
+Still absent: multi-output, composite-scissor damage (per-output damage ring
++ scissored partial-frame rendering; shm *upload* damage is implemented, see
+the "Read first" damage entry), and linear-space alpha
 compositing. (Per-surface opacity/transform/tint/mask, floating/fullscreen/
 maximize/minimize, interactive move/resize, workspaces, and compositor
 keybindings with general key interception — `wl_seat.ts` consults

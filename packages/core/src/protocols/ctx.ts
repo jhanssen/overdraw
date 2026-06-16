@@ -20,6 +20,11 @@ import type { WindowChangeField } from "../events/types.js";
 // CURRENT region resource here; commit() snapshots it via Region.clone().
 type RegionSlot = import("./region.js").Region | null | undefined;
 
+// A damage rectangle (wl_surface.damage / damage_buffer). `damage` rects are
+// surface-local; `damage_buffer` rects are buffer-local. Both accumulate
+// double-buffered and are reconciled to buffer coordinates on commit.
+type DamageRect = import("./region.js").RegionRect;
+
 // wp_viewport source crop (surface coordinates) and destination size.
 export interface ViewportSrc { x: number; y: number; width: number; height: number }
 export interface ViewportDst { width: number; height: number }
@@ -56,8 +61,18 @@ export interface SurfaceRecord {
     // surface's logical size override.
     viewportSrc?: ViewportSrc | null;
     viewportDst?: ViewportDst | null;
+    // Damage accumulated since the last commit. surfaceDamage is in
+    // surface-local coords (wl_surface.damage); bufferDamage is in buffer
+    // coords (wl_surface.damage_buffer). Promoted to `committed` on commit.
+    surfaceDamage?: DamageRect[];
+    bufferDamage?: DamageRect[];
   };
-  committed: { buffer: Resource | null; bufferScale?: number; bufferTransform?: number };
+  committed: {
+    buffer: Resource | null; bufferScale?: number; bufferTransform?: number;
+    // Damage for the committed buffer, consumed (and cleared) by the upload.
+    surfaceDamage?: DamageRect[];
+    bufferDamage?: DamageRect[];
+  };
   cached?: {
     buffer?: Resource | null;
     frameCallbacks?: Resource[];
@@ -67,6 +82,8 @@ export interface SurfaceRecord {
     bufferTransform?: number;
     viewportSrc?: ViewportSrc | null;
     viewportDst?: ViewportDst | null;
+    surfaceDamage?: DamageRect[];
+    bufferDamage?: DamageRect[];
   };
   // Applied viewport state (from wp_viewport, double-buffered on commit).
   viewportSrc?: ViewportSrc | null;
@@ -120,8 +137,13 @@ export const LAYER_ORDER: readonly Layer[] =
 export const OUTPUT_DEFAULT = 0;
 
 export interface CompositorSink {
+  // `damage` (optional) lists buffer-pixel rects that changed since the last
+  // commit; when present the sink may upload only those rects instead of the
+  // whole buffer. Omitted/empty = full-surface upload. Sinks that don't
+  // optimize partial uploads ignore it.
   commitSurfaceBuffer(id: number, poolId: number, offset: number, w: number,
-                      h: number, stride: number): boolean;
+                      h: number, stride: number,
+                      damage?: ReadonlyArray<DamageRect>): boolean;
   commitSurfaceDmabuf(id: number, fd: WaylandFd, w: number, h: number,
                       fourcc: number, modHi: number, modLo: number,
                       offset: number, stride: number, bufferId: number): boolean;

@@ -4,7 +4,8 @@ Project-specific operational notes. Design lives in `docs/architecture.md`;
 ground-truth status in `docs/status.md`. Before working on any protocol, read the
 "Read first: gaps in advertised protocols (silent-gap risks)" section at the top
 of `docs/status.md` — it lists what is advertised-but-incomplete (silent-gap
-risks: `wl_region` no-op stub, `wl_surface.damage`/`damage_buffer` no-op stubs,
+risks: `wl_region` no-op stub, `wl_surface.damage`/`damage_buffer` honored for
+shm upload but not yet as a compositing scissor (every frame fully recomposites),
 no `wl_resource_post_error` mechanism, single-output only).
 
 ## Comments describe the code, not its history

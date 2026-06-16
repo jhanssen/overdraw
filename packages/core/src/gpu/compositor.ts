@@ -1168,10 +1168,11 @@ export class JsCompositor implements CompositorSink {
   // Upload a committed shm buffer into the surface's sampled texture (zero-copy
   // from the client mapping via addon.shmView), and report it as presentable.
   commitSurfaceBuffer(id: number, poolId: number, offset: number,
-                      width: number, height: number, stride: number): boolean {
+                      width: number, height: number, stride: number,
+                      damage?: ReadonlyArray<{ x: number; y: number; width: number; height: number }>): boolean {
     const ab = this.addon.shmView(poolId, offset, stride * height);
     if (!ab) return false;
-    this.uploadPixels(id, { width, height, stride }, ab);
+    this.uploadPixels(id, { width, height, stride }, ab, damage);
     this.imported.push({ id, width, height });
     return true;
   }
@@ -1477,12 +1478,15 @@ export class JsCompositor implements CompositorSink {
   // texture, creating/recreating it on size change. Used by uploadShm and by
   // tests / future producers that supply pixels directly.
   uploadPixels(id: number, c: { width: number; height: number; stride: number },
-               data: ArrayBuffer | ArrayBufferView): void {
+               data: ArrayBuffer | ArrayBufferView,
+               damage?: ReadonlyArray<{ x: number; y: number; width: number; height: number }>): void {
     let s = this.surfaces.get(id);
     if (!s) { s = blankSurface(0, 0, 0, 0); this.surfaces.set(id, s); }
 
     let tex = s.texture;
+    let recreated = false;
     if (!tex || s.width !== c.width || s.height !== c.height) {
+      recreated = true;
       if (tex) tex.destroy();
       // Sampled client textures are always BGRA8 (shm ARGB8888 byte-for-byte;
       // dmabuf imported as BGRA8Unorm), independent of the output format.
@@ -1507,13 +1511,30 @@ export class JsCompositor implements CompositorSink {
       this.rebuildBindGroup(s, view);
     }
 
-    // `data` begins at the buffer's first pixel row, so dataLayout offset is 0.
-    this.device.queue.writeTexture(
-      { texture: tex },
-      data,
-      { offset: 0, bytesPerRow: c.stride, rowsPerImage: c.height },
-      { width: c.width, height: c.height },
-    );
+    // A freshly (re)created texture has no prior contents, so a damage-only
+    // upload would leave the undamaged region undefined: force a full upload.
+    if (recreated || !damage || damage.length === 0) {
+      // `data` begins at the buffer's first pixel row, so dataLayout offset is 0.
+      this.device.queue.writeTexture(
+        { texture: tex },
+        data,
+        { offset: 0, bytesPerRow: c.stride, rowsPerImage: c.height },
+        { width: c.width, height: c.height },
+      );
+    } else {
+      // Partial upload: one writeTexture per damage rect. The undamaged region
+      // retains the previous frame's pixels (the texture is persistent). Each
+      // rect's source slice starts at its top-left pixel; bytesPerRow stays the
+      // full buffer stride so successive rows are found correctly (BGRA8, 4 B/px).
+      for (const r of damage) {
+        this.device.queue.writeTexture(
+          { texture: tex, origin: { x: r.x, y: r.y } },
+          data,
+          { offset: r.y * c.stride + r.x * 4, bytesPerRow: c.stride, rowsPerImage: r.height },
+          { width: r.width, height: r.height },
+        );
+      }
+    }
     s.present = true;
     if (s.frozen) this.frozenReadyCb?.(id);
   }

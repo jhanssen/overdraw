@@ -12,6 +12,7 @@
 import type { WlSurfaceHandler } from "#protocols-gen/wl_surface.js";
 import type { Ctx, CompositorState, SurfaceRecord, SubsurfaceRecord } from "./ctx.js";
 import type { Resource } from "../types.js";
+import type { RegionRect } from "./region.js";
 import { applySubsurfaces, applySubsurfaceReorder } from "../subsurfaces.js";
 import { WINDOW_EVENT } from "../events/types.js";
 import {
@@ -58,6 +59,60 @@ function effectiveSync(ctx: Ctx, s: SurfaceRecord): boolean {
   return parentRec ? effectiveSync(ctx, parentRec) : false;
 }
 
+// Cap on pending damage rects per surface (request flood guard) and on
+// reconciled rects passed to the upload (beyond this a full upload is cheaper
+// than many sub-uploads).
+const MAX_PENDING_DAMAGE = 64;
+const MAX_DAMAGE_RECTS = 16;
+
+// Intersect a rect with [0,W]x[0,H], snapping outward to whole pixels. Returns
+// null if the result is empty.
+function clipDamageRect(r: RegionRect, w: number, h: number): RegionRect | null {
+  const x0 = Math.max(0, Math.floor(r.x));
+  const y0 = Math.max(0, Math.floor(r.y));
+  const x1 = Math.min(w, Math.ceil(r.x + r.width));
+  const y1 = Math.min(h, Math.ceil(r.y + r.height));
+  if (x1 <= x0 || y1 <= y0) return null;
+  return { x: x0, y: y0, width: x1 - x0, height: y1 - y0 };
+}
+
+// Reconcile the committed surface- and buffer-coordinate damage into a list of
+// buffer-pixel rects for a partial upload, or null to request a full upload.
+// buffer_damage maps directly (clip to bounds). surface_damage is mapped only
+// when the buffer transform is normal and no viewport is active -- with a
+// transform or viewport, inverting surface->buffer here is not worth the cost,
+// so the whole surface is re-uploaded (correct, just not optimized).
+function reconcileBufferDamage(
+  s: SurfaceRecord, bufW: number, bufH: number,
+): RegionRect[] | null {
+  const sd = s.committed.surfaceDamage;
+  const bd = s.committed.bufferDamage;
+  if ((!sd || sd.length === 0) && (!bd || bd.length === 0)) return null;
+
+  const out: RegionRect[] = [];
+  if (bd) {
+    for (const r of bd) {
+      const c = clipDamageRect(r, bufW, bufH);
+      if (c) out.push(c);
+    }
+  }
+  if (sd && sd.length) {
+    const transform = s.committed.bufferTransform ?? 0;
+    const vpSrc = s.pending.viewportSrc !== undefined ? s.pending.viewportSrc : s.viewportSrc;
+    const vpDst = s.pending.viewportDst !== undefined ? s.pending.viewportDst : s.viewportDst;
+    if (transform !== 0 || vpSrc || vpDst) return null;
+    const scale = s.committed.bufferScale ?? 1;
+    for (const r of sd) {
+      const c = clipDamageRect(
+        { x: r.x * scale, y: r.y * scale, width: r.width * scale, height: r.height * scale },
+        bufW, bufH);
+      if (c) out.push(c);
+    }
+  }
+  if (out.length === 0 || out.length > MAX_DAMAGE_RECTS) return null;
+  return out;
+}
+
 // Apply one surface's committed buffer to the GPU (upload/import). Sets
 // hasContent. Releases shm buffers (copied at upload). dmabuf import is async.
 function uploadBuffer(ctx: Ctx, s: SurfaceRecord, buffer: Resource | null): void {
@@ -70,8 +125,10 @@ function uploadBuffer(ctx: Ctx, s: SurfaceRecord, buffer: Resource | null): void
       desc.modifierHi ?? 0, desc.modifierLo ?? 0, desc.offset, desc.stride, bufferId);
     if (ok) { ctx.state.lastCommittedSurfaceId = s.id; s.hasContent = true; }
   } else if (desc && desc.poolId) {
+    const damage = reconcileBufferDamage(s, desc.width, desc.height);
     const ok = ctx.state.compositor.commitSurfaceBuffer(
-      s.id, desc.poolId, desc.offset, desc.width, desc.height, desc.stride);
+      s.id, desc.poolId, desc.offset, desc.width, desc.height, desc.stride,
+      damage ?? undefined);
     if (ok) {
       ctx.state.lastCommittedSurfaceId = s.id;
       s.hasContent = true;
@@ -101,6 +158,9 @@ function snapshotRegion(
 // is the spec's "cached state applied immediately after the parent's state".
 function applySurfaceState(ctx: Ctx, s: SurfaceRecord): void {
   uploadBuffer(ctx, s, s.committed.buffer);
+  // Damage is consumed by the upload; the next commit re-accumulates it.
+  s.committed.surfaceDamage = undefined;
+  s.committed.bufferDamage = undefined;
   ctx.state.compositor.setSurfaceBufferScale?.(s.id, s.committed.bufferScale ?? 1);
   ctx.state.compositor.setSurfaceBufferTransform?.(s.id, s.committed.bufferTransform ?? 0);
 
@@ -174,6 +234,12 @@ function applySurfaceState(ctx: Ctx, s: SurfaceRecord): void {
         if (childRec.cached.viewportDst !== undefined) {
           childRec.pending.viewportDst = childRec.cached.viewportDst;
         }
+        if (childRec.cached.surfaceDamage) {
+          (childRec.committed.surfaceDamage ??= []).push(...childRec.cached.surfaceDamage);
+        }
+        if (childRec.cached.bufferDamage) {
+          (childRec.committed.bufferDamage ??= []).push(...childRec.cached.bufferDamage);
+        }
         childRec.cached = undefined;
         applySurfaceState(ctx, childRec);
       }
@@ -191,8 +257,18 @@ export default function makeSurface(ctx: Ctx): WlSurfaceHandler {
       const s = rec(resource);
       if (s) s.pending.buffer = buffer; // wl_buffer wrapper or null
     },
-    damage(_resource, _x, _y, _w, _h) {},
-    damage_buffer(_resource, _x, _y, _w, _h) {},
+    damage(resource, x, y, w, h) {
+      const s = rec(resource);
+      if (!s || w <= 0 || h <= 0) return;
+      const list = (s.pending.surfaceDamage ??= []);
+      if (list.length < MAX_PENDING_DAMAGE) list.push({ x, y, width: w, height: h });
+    },
+    damage_buffer(resource, x, y, w, h) {
+      const s = rec(resource);
+      if (!s || w <= 0 || h <= 0) return;
+      const list = (s.pending.bufferDamage ??= []);
+      if (list.length < MAX_PENDING_DAMAGE) list.push({ x, y, width: w, height: h });
+    },
     frame(resource, callback) {
       const s = rec(resource);
       if (!s) return;
@@ -249,6 +325,16 @@ export default function makeSurface(ctx: Ctx): WlSurfaceHandler {
         s.committed.bufferTransform = s.pending.bufferTransform;
         s.pending.bufferTransform = undefined;
       }
+      // Damage travels with the buffer (double-buffered); accumulate into the
+      // commit set (cleared by the upload in applySurfaceState).
+      if (s.pending.surfaceDamage) {
+        (s.committed.surfaceDamage ??= []).push(...s.pending.surfaceDamage);
+        s.pending.surfaceDamage = undefined;
+      }
+      if (s.pending.bufferDamage) {
+        (s.committed.bufferDamage ??= []).push(...s.pending.bufferDamage);
+        s.pending.bufferDamage = undefined;
+      }
 
       // Layer-shell: a buffer attached before the first configure-ack is
       // invalid_surface_state per spec. Silent-drop convention (no
@@ -266,6 +352,14 @@ export default function makeSurface(ctx: Ctx): WlSurfaceHandler {
         s.cached.buffer = s.committed.buffer;
         if (s.committed.bufferScale !== undefined) s.cached.bufferScale = s.committed.bufferScale;
         if (s.committed.bufferTransform !== undefined) s.cached.bufferTransform = s.committed.bufferTransform;
+        if (s.committed.surfaceDamage) {
+          (s.cached.surfaceDamage ??= []).push(...s.committed.surfaceDamage);
+          s.committed.surfaceDamage = undefined;
+        }
+        if (s.committed.bufferDamage) {
+          (s.cached.bufferDamage ??= []).push(...s.committed.bufferDamage);
+          s.committed.bufferDamage = undefined;
+        }
         if (s.pending.frameCallbacks?.length) {
           (s.cached.frameCallbacks ??= []).push(...s.pending.frameCallbacks);
           s.pending.frameCallbacks = undefined;
@@ -293,6 +387,12 @@ export default function makeSurface(ctx: Ctx): WlSurfaceHandler {
           s.committed.buffer = s.cached.buffer ?? s.committed.buffer;
           if (s.cached.bufferScale !== undefined) s.committed.bufferScale = s.cached.bufferScale;
           if (s.cached.bufferTransform !== undefined) s.committed.bufferTransform = s.cached.bufferTransform;
+          if (s.cached.surfaceDamage) {
+            (s.committed.surfaceDamage ??= []).push(...s.cached.surfaceDamage);
+          }
+          if (s.cached.bufferDamage) {
+            (s.committed.bufferDamage ??= []).push(...s.cached.bufferDamage);
+          }
           if (s.cached.frameCallbacks?.length) {
             (s.pending.frameCallbacks ??= []).push(...s.cached.frameCallbacks);
           }
