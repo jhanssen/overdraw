@@ -73,6 +73,37 @@ export function canRunNested() {
   return canRunGpu() && !!process.env.WAYLAND_DISPLAY;
 }
 
+// True if at least one DRM connector reports "connected" -- a real panel to
+// scan out to. Read-only (/sys); does not open the card or take DRM-master.
+function hasConnectedConnector() {
+  let cards;
+  try { cards = readdirSync("/sys/class/drm"); } catch { return false; }
+  for (const c of cards) {
+    if (!/^card\d+-/.test(c)) continue;  // connector dirs are cardN-<name>
+    try {
+      if (readFileSync(`/sys/class/drm/${c}/status`, "utf8").trim() === "connected") return true;
+    } catch { /* no status */ }
+  }
+  return false;
+}
+
+// True if the environment can run KMS tests: the headless prerequisites plus a
+// connected DRM connector to modeset, and NO active graphical session (a
+// running compositor would already hold DRM-master, so the test would fail to
+// acquire it rather than skip). Mirrors canRunNested()'s "is the backend
+// usable" gate.
+//
+// CAUTION: a KMS test that passes this gate takes DRM-master and modesets the
+// connected panel for real -- it drives the physical display with test frames
+// and (since the backend does not restore the prior CRTC on teardown) leaves
+// the last frame on screen until a VT switch repaints the console.
+export function canRunKms() {
+  return canRunGpu()
+    && hasConnectedConnector()
+    && !process.env.WAYLAND_DISPLAY
+    && !process.env.DISPLAY;
+}
+
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 // Load the wire-retargeted dawn.node bundled in the extracted Dawn release.
