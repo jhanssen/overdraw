@@ -86,11 +86,15 @@ with no error. Worst-first.
   window rect on screen, though Layer 1 already trimmed the upload). Tests:
   `output-damage-ring.test.js` (per-slot reset + multi-slot buffer-age),
   `composite-scissor.gpu.mjs` (partial frame preserves the untouched surface;
-  black-fill clears the damaged region). **Verification caveat:** the live
-  KMS/nested *slot* path (rotating handles across 3 scanout buffers) was not
-  exercised on hardware in-session — it shares all damage logic with the
-  headless 1-slot path (GPU-verified) and the multi-slot ring is unit-tested,
-  but a real KMS/nested run is still pending.
+  black-fill clears the damaged region), and `composite-scissor-kms.gpu.mjs`
+  (the live KMS slot path: real `acquireOutputTexture` slot rotation +
+  `presentOutput` DRM page-flips). The KMS test self-skips unless
+  `canRunKms()` (connected DRM connector + no active graphical session + dawn),
+  since it takes DRM-master and modesets the panel for real and does not restore
+  the prior CRTC on teardown; scanout slots are not readable back, so it asserts
+  real page-flips occur (`presentedCount` advances) rather than pixel values.
+  Verified live on Intel i915 (eDP-1, 2560x1600, 3-slot ring) — pixel
+  correctness of the partial path is covered headlessly above.
 
 - **Large shm clients (e.g. fullscreen software-decoded video) may serialize
   against vsync.** Each `wl_surface.commit` with new shm content triggers a
