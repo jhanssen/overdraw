@@ -61,12 +61,36 @@ with no error. Worst-first.
   use) is always honored regardless of scale/transform/viewport, and
   surface-coordinate `damage` is honored when scale-only; the fallback only
   costs the optimization, never correctness. (b) dmabuf is imported
-  wholesale (no CPU upload, so upload-damage does not apply). (c) damage is
-  not yet propagated to the compositing pass as a scissor (every frame still
-  fully recomposites + clears) — see "composite-scissor damage" below; it is
+  wholesale (no CPU upload, so upload-damage does not apply). Upload damage is
   also a prereq for hardware cursor planes and direct-scanout heuristics.
   Tests: `wl-surface-damage.test.js` (accumulation + reconcile + fallbacks),
   `wl-surface-damage.gpu.mjs` (partial upload preserves the undamaged region).
+
+- **Composite-scissor damage is implemented (in-frame partial rendering);
+  residual gaps are narrow.** The JS compositor (`compositor.ts`) tracks
+  per-scanout-slot damage in output coords (`OutputDamageRing`, keyed by the
+  stable `acquireOutputTexture` handle so buffer age is handled — a slot
+  unrendered for N frames repaints all damage since). When a frame renders, the
+  on-screen composite is scissored to the slot's damage with `loadOp:"load"` +
+  a black-fill quad (so the bottom of the stack blends against black inside the
+  scissor, not stale pixels); a whole-output or first-sight slot takes the full
+  clear path. Frame *cadence* is unchanged (still gated by the native
+  `wantNext`/`wake()` loop — idle already skips). Residuals (optimization-only,
+  never correctness): (a) the scissor is the damage **bounding box**, not
+  per-rect, so scattered damage over-draws; (b) only content commits, layout
+  move/resize, cursor moves, and surface removal produce **precise** rects —
+  stack reorders and bounds-affecting fx (transform/margin/mask, and opacity
+  during animation) conservatively damage the whole output; (c) a content
+  commit damages the surface's **full output rect**, not the Layer-1 buffer
+  damage mapped to an output sub-region (a terminal scrolling repaints its whole
+  window rect on screen, though Layer 1 already trimmed the upload). Tests:
+  `output-damage-ring.test.js` (per-slot reset + multi-slot buffer-age),
+  `composite-scissor.gpu.mjs` (partial frame preserves the untouched surface;
+  black-fill clears the damaged region). **Verification caveat:** the live
+  KMS/nested *slot* path (rotating handles across 3 scanout buffers) was not
+  exercised on hardware in-session — it shares all damage logic with the
+  headless 1-slot path (GPU-verified) and the multi-slot ring is unit-tested,
+  but a real KMS/nested run is still pending.
 
 - **Large shm clients (e.g. fullscreen software-decoded video) may serialize
   against vsync.** Each `wl_surface.commit` with new shm content triggers a
@@ -307,10 +331,10 @@ instance; a wrapped device is borrowed, not destroyed). Built with
   the master-stack rects, fill their tiles via the configure→resize loop, do not
   overlap, and survivors reflow on unmap.
 
-Still absent: multi-output, composite-scissor damage (per-output damage ring
-+ scissored partial-frame rendering; shm *upload* damage is implemented, see
-the "Read first" damage entry), and linear-space alpha
-compositing. (Per-surface opacity/transform/tint/mask, floating/fullscreen/
+Still absent: multi-output and linear-space alpha
+compositing. (Shm upload damage AND composite-scissor damage are implemented;
+see the two "Read first" damage entries for their residual gaps. Per-surface
+opacity/transform/tint/mask, floating/fullscreen/
 maximize/minimize, interactive move/resize, workspaces, and compositor
 keybindings with general key interception — `wl_seat.ts` consults
 `bindingChain` and suppresses client forwarding on a match — are all

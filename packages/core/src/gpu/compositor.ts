@@ -299,6 +299,7 @@ fn sampleClamped(t : texture_2d<f32>, uv : vec2f) -> vec4f {
 
 import type { CompositorSink, Layer } from "../protocols/ctx.js";
 import { LAYER_ORDER, OUTPUT_DEFAULT } from "../protocols/ctx.js";
+import { OutputDamageRing } from "./output-damage-ring.js";
 import type { TransitionKind } from "@overdraw/transition-types";
 import type { WaylandFd } from "../types.js";
 import { log } from "../log.js";
@@ -779,6 +780,18 @@ export class JsCompositor implements CompositorSink {
   private format: GPUTextureFormat;
   private outputTex: GPUTexture | null = null;  // wrapped swapchain texture, held during a frame
 
+  // Composite-scissor damage in output LOGICAL coords (converted to device px
+  // at scissor time), one region per scanout-ring slot keyed by the stable
+  // acquireOutputTexture handle. The on-screen composite scissors to the slot's
+  // accumulated damage; see OutputDamageRing.
+  private readonly outputDamage = new OutputDamageRing();
+  private static readonly HEADLESS_DAMAGE_KEY = 0n;
+  // 1x1 opaque-black quad reused to clear the damaged region to black before
+  // the scissored composite (loadOp:"load" preserves pixels OUTSIDE the
+  // scissor; inside it, the bottom of the surface stack must blend against
+  // black, not stale pixels). Lazily built on first partial frame.
+  private blackFill: Surface | null = null;
+
   constructor(device: GPUDevice, globals: DawnGlobals, addon: CompositorAddon,
               output: { width: number; height: number },
               dawn: DawnWire | null = null, deviceHandle: bigint = 0n,
@@ -901,18 +914,22 @@ export class JsCompositor implements CompositorSink {
     this.scale = scale > 0 ? scale : 1;
     this.logicalWidth = Math.max(1, Math.round(width / this.scale));
     this.logicalHeight = Math.max(1, Math.round(height / this.scale));
+    this.damageFull();  // slot textures are recreated; everything is stale
   }
 
-  setStack(ids: number[]): void { this.stack = ids.slice(); }
+  // Stack/layer reorders change occlusion at arbitrary places; repaint full.
+  setStack(ids: number[]): void { this.stack = ids.slice(); this.damageFull(); }
 
   setOutputStack(outputId: number, ids: number[] | null): void {
     if (ids === null) this.outputStacks.delete(outputId);
     else this.outputStacks.set(outputId, ids.slice());
+    this.damageFull();
   }
 
   setLayerSurfaces(layer: Layer, ids: number[]): void {
-    if (layer === "content") { this.stack = ids.slice(); return; }
+    if (layer === "content") { this.stack = ids.slice(); this.damageFull(); return; }
     this.layers.set(layer, ids.slice());
+    this.damageFull();
   }
 
   // The full back-to-front draw order: each layer in LAYER_ORDER, with the
@@ -957,8 +974,15 @@ export class JsCompositor implements CompositorSink {
 
   setSurfaceLayout(id: number, x: number, y: number, w: number, h: number): void {
     const s = this.surfaces.get(id);
-    if (s) { s.x = x; s.y = y; s.layoutW = w; s.layoutH = h; }
-    else this.surfaces.set(id, blankSurface(x, y, w, h));
+    if (s) {
+      // Damage both the vacated and the new rect (move/resize).
+      this.addOutputDamage(s.x, s.y, s.layoutW, s.layoutH);
+      s.x = x; s.y = y; s.layoutW = w; s.layoutH = h;
+      this.addOutputDamage(x, y, w, h);
+    } else {
+      this.surfaces.set(id, blankSurface(x, y, w, h));
+      this.addOutputDamage(x, y, w, h);
+    }
   }
 
   // Resize transaction: snapshot this surface's CURRENT appearance right now,
@@ -1045,11 +1069,13 @@ export class JsCompositor implements CompositorSink {
   setSurfaceBufferScale(id: number, scale: number): void {
     const s = this.surfaces.get(id) ?? this.ensureSurface(id);
     s.bufferScale = scale > 0 ? scale : 1;
+    this.damageSurface(id);
   }
 
   setSurfaceBufferTransform(id: number, transform: number): void {
     const s = this.surfaces.get(id) ?? this.ensureSurface(id);
     s.bufferTransform = (transform >= 0 && transform <= 7) ? transform : 0;
+    this.damageSurface(id);
   }
 
   setSurfaceViewport(
@@ -1060,6 +1086,7 @@ export class JsCompositor implements CompositorSink {
     const s = this.surfaces.get(id) ?? this.ensureSurface(id);
     s.viewportDst = dst;
     s.viewportSrc = src;
+    this.damageSurface(id);
   }
 
   // Per-surface render-state setters (core-plugin-api.md §1). Cheap: they
@@ -1068,6 +1095,7 @@ export class JsCompositor implements CompositorSink {
   // race the protocol layer's setSurfaceLayout.
   setSurfaceOpacity(id: number, opacity: number): void {
     this.ensureSurface(id).fx.opacity = clamp(opacity, 0, 1);
+    this.damageSurface(id);  // alpha change stays within the surface rect
   }
 
   setSurfaceTransform(id: number, t: SurfaceTransform): void {
@@ -1076,6 +1104,7 @@ export class JsCompositor implements CompositorSink {
     fx.translateY = t.translateY ?? 0;
     fx.scaleX = t.scaleX ?? 1;
     fx.scaleY = t.scaleY ?? 1;
+    this.damageFull();  // translate/scale can draw outside the layout rect
   }
 
   setSurfaceOutputMargin(id: number, m: SurfaceMargin): void {
@@ -1084,6 +1113,7 @@ export class JsCompositor implements CompositorSink {
     fx.marginRight = m.right ?? 0;
     fx.marginBottom = m.bottom ?? 0;
     fx.marginLeft = m.left ?? 0;
+    this.damageFull();  // margin expands the drawn region beyond the rect
   }
 
   setSurfaceTint(id: number, t: SurfaceTint): void {
@@ -1092,6 +1122,7 @@ export class JsCompositor implements CompositorSink {
     fx.tintG = t.g ?? 1;
     fx.tintB = t.b ?? 1;
     fx.tintA = t.a ?? 1;
+    this.damageSurface(id);
   }
 
   // Install a 4x4 color matrix applied to the sampled rgba each frame. The
@@ -1101,6 +1132,7 @@ export class JsCompositor implements CompositorSink {
     const fx = this.ensureSurface(id).fx;
     if (m === null) {
       fx.colorMatrix = identityColorMatrix();
+      this.damageSurface(id);
       return;
     }
     if (m.length !== 16) {
@@ -1111,6 +1143,7 @@ export class JsCompositor implements CompositorSink {
     const dst = new Float32Array(16);
     for (let i = 0; i < 16; i++) dst[i] = m[i] ?? 0;
     fx.colorMatrix = dst;
+    this.damageSurface(id);
   }
 
   // Install (or clear) an alpha mask on a surface. The mask is sampled across
@@ -1132,6 +1165,7 @@ export class JsCompositor implements CompositorSink {
     // texture is committed yet, the mask installs into the Surface struct;
     // the next rebuildBindGroup (on first content) will pick it up.
     if (s.view) this.rebuildBindGroup(s, s.view);
+    this.damageFull();  // mask spans the expanded (surface + margin) region
   }
 
   private ensureSurface(id: number): Surface {
@@ -1161,6 +1195,8 @@ export class JsCompositor implements CompositorSink {
       s.uniformBuf?.destroy();
       // Return any frozen snapshot to the pool.
       if (s.frozen) { this.releaseSnapTex(s.frozen); s.frozen = null; }
+      // Repaint the rect the surface vacated.
+      this.addOutputDamage(s.x, s.y, s.layoutW, s.layoutH);
     }
     this.surfaces.delete(id);
   }
@@ -1261,6 +1297,7 @@ export class JsCompositor implements CompositorSink {
     this.rebuildBindGroup(s, imp.view);
     s.present = true;
     this.imported.push({ id, width: imp.width, height: imp.height });
+    this.damageSurface(id);  // new dmabuf content -> repaint this surface's rect
     if (s.frozen) this.frozenReadyCb?.(id);
   }
 
@@ -1436,6 +1473,7 @@ export class JsCompositor implements CompositorSink {
     s.view = view;
     this.rebuildBindGroup(s, view);
     s.present = true;
+    this.damageSurface(id);  // new overlay/cursor content -> repaint its rect
   }
 
   takeImportedSurfaces(): Array<{ id: number; width: number; height: number }> {
@@ -1536,7 +1574,61 @@ export class JsCompositor implements CompositorSink {
       }
     }
     s.present = true;
+    this.damageSurface(id);
     if (s.frozen) this.frozenReadyCb?.(id);
+  }
+
+  // --- Composite-scissor damage -------------------------------------------
+
+  // Mark the whole output stale for every tracked slot: the next frame on any
+  // slot repaints fully. Used for changes that can affect arbitrary screen
+  // regions (stack reorders, per-surface fx, output resize).
+  private damageFull(): void {
+    this.outputDamage.full();
+  }
+
+  // Accumulate an output-LOGICAL-space rect into every tracked slot's region.
+  private addOutputDamage(x: number, y: number, w: number, h: number): void {
+    this.outputDamage.setBounds(this.logicalWidth, this.logicalHeight);
+    this.outputDamage.damageRect(x, y, w, h);
+  }
+
+  // Damage a surface's current on-screen rect (placement). Content commits and
+  // buffer scale/transform changes route here. If the surface's fx can draw
+  // outside its nominal rect (transform / margin / mask), repaint the whole
+  // output instead -- the rect would undercount the affected region.
+  private damageSurface(id: number): void {
+    const s = this.surfaces.get(id);
+    if (!s) return;
+    const fx = s.fx;
+    if (fx.translateX !== 0 || fx.translateY !== 0 || fx.scaleX !== 1 || fx.scaleY !== 1
+      || fx.marginTop !== 0 || fx.marginRight !== 0 || fx.marginBottom !== 0 || fx.marginLeft !== 0
+      || s.maskView !== null) {
+      this.damageFull();
+      return;
+    }
+    this.addOutputDamage(s.x, s.y, s.layoutW, s.layoutH);
+  }
+
+  // The 1x1 opaque-black quad used to clear a scissored region to black.
+  private ensureBlackFill(): Surface {
+    if (this.blackFill && this.blackFill.bindGroup) return this.blackFill;
+    const tex = this.device.createTexture({
+      size: { width: 1, height: 1 },
+      format: "bgra8unorm",
+      usage: this.g.GPUTextureUsage.TEXTURE_BINDING | this.g.GPUTextureUsage.COPY_DST,
+    });
+    this.device.queue.writeTexture(
+      { texture: tex }, new Uint8Array([0, 0, 0, 255]),
+      { offset: 0, bytesPerRow: 4, rowsPerImage: 1 }, { width: 1, height: 1 },
+    );
+    const s = blankSurface(0, 0, 0, 0);
+    s.texture = tex;
+    s.view = tex.createView();
+    s.width = 1; s.height = 1; s.present = true;
+    this.rebuildBindGroup(s, s.view);
+    this.blackFill = s;
+    return s;
   }
 
   // Pack the per-surface render state (placement + transform + margin + fx +
@@ -1704,15 +1796,37 @@ export class JsCompositor implements CompositorSink {
     outH: number;
     placements?: Map<number, { x: number; y: number; w: number; h: number }>;
     cropUV?: Map<number, { u0: number; v0: number; u1: number; v1: number }>;
+    // Composite-scissor: when `scissor` is set, the pass loads (preserves) the
+    // target outside the box and redraws only inside it; a black-fill quad
+    // clears the box first so the stack blends against black. The box is in
+    // output LOGICAL coords. Absent = full-frame clear (the default).
+    scissor?: { x: number; y: number; w: number; h: number };
   }): void {
+    const partial = !!args.scissor;
     const pass = args.encoder.beginRenderPass({
       colorAttachments: [{
         view: args.targetView,
-        loadOp: "clear",
+        loadOp: partial ? "load" : "clear",
         storeOp: "store",
         clearValue: { r: 0, g: 0, b: 0, a: 1 },
       }],
     });
+    if (args.scissor) {
+      // Logical -> device px (the attachment's space).
+      const sx = Math.max(0, Math.floor(args.scissor.x * this.scale));
+      const sy = Math.max(0, Math.floor(args.scissor.y * this.scale));
+      const sw = Math.min(this.width - sx, Math.ceil(args.scissor.w * this.scale));
+      const sh = Math.min(this.height - sy, Math.ceil(args.scissor.h * this.scale));
+      pass.setScissorRect(sx, sy, Math.max(0, sw), Math.max(0, sh));
+      // Clear the scissored box to black (loadOp:load preserved old pixels).
+      const black = this.ensureBlackFill();
+      if (black.bindGroup) {
+        this.updateUniforms(black, args.outW, args.outH, { placement: args.scissor });
+        pass.setPipeline(this.pipeline);
+        pass.setBindGroup(0, black.bindGroup);
+        pass.draw(4);
+      }
+    }
     pass.setPipeline(this.pipeline);
     for (const id of args.drawList) {
       const s = this.surfaces.get(id);
@@ -1747,6 +1861,7 @@ export class JsCompositor implements CompositorSink {
     let targetView = this.targetView;
     let presenting = false;
     let frameOpen = false;
+    let damageKey = JsCompositor.HEADLESS_DAMAGE_KEY;
     if (this.nested) {
       const handle = this.addon.acquireOutputTexture();
       // The native addon returns nullptr from N-API on "no slot available"
@@ -1757,8 +1872,17 @@ export class JsCompositor implements CompositorSink {
       this.outputTex = this.dawn.wrapTexture(this.deviceHandle, handle);
       targetView = this.outputTex.createView();
       presenting = true;
+      damageKey = handle;  // stable per scanout-ring slot
     }
     if (!targetView) return;  // headless before the target exists (shouldn't happen)
+
+    // Composite-scissor: how much of this slot to repaint. Always consume the
+    // slot's accumulated damage (so it resets). A transition animates the whole
+    // output, so force full while one is active.
+    this.outputDamage.setBounds(this.logicalWidth, this.logicalHeight);
+    const repaint = this.outputDamage.take(damageKey);
+    const onScreenScissor = (repaint.mode === "partial" && !this.activeTransition)
+      ? repaint.box : undefined;
 
     this.dispatch(this.lifecycle.step({ kind: "frameStart" }));
     frameOpen = true;
@@ -1804,6 +1928,7 @@ export class JsCompositor implements CompositorSink {
         this.composite({
           encoder: enc, targetView, drawList: draw,
           outW: this.logicalWidth, outH: this.logicalHeight,
+          scissor: onScreenScissor,
         });
       }
       // Live composers, in registration order. Each pass writes to its
@@ -2204,6 +2329,9 @@ export class JsCompositor implements CompositorSink {
     if (this.cursorTargetSurfaceId === null) return;
     const s = this.surfaces.get(this.cursorTargetSurfaceId);
     if (!s) return;
+    // Damage the cursor's old rect, move it, damage the new rect: a cursor
+    // move repaints just the two small regions, not the whole output.
+    if (this.cursorVisible) this.addOutputDamage(s.x, s.y, s.layoutW, s.layoutH);
     const x = this.cursorPointerX - this.cursorHotspotX;
     const y = this.cursorPointerY - this.cursorHotspotY;
     s.x = x; s.y = y;
@@ -2214,6 +2342,7 @@ export class JsCompositor implements CompositorSink {
       s.layoutW = s.width;
       s.layoutH = s.height;
     }
+    if (this.cursorVisible) this.addOutputDamage(s.x, s.y, s.layoutW, s.layoutH);
   }
 
   // Install a CPU-side BGRA8 cursor image into the internal cursor surface
@@ -2314,7 +2443,13 @@ export class JsCompositor implements CompositorSink {
   }
 
   setCursorVisible(visible: boolean): void {
+    if (visible === this.cursorVisible) return;
     this.cursorVisible = visible;
+    // Repaint the cursor's rect so it appears / is erased.
+    if (this.cursorTargetSurfaceId !== null) {
+      const s = this.surfaces.get(this.cursorTargetSurfaceId);
+      if (s) this.addOutputDamage(s.x, s.y, s.layoutW, s.layoutH);
+    }
   }
 
   // Tear down the cursor entirely. Called on compositor shutdown; tests use

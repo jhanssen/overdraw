@@ -5,7 +5,8 @@ ground-truth status in `docs/status.md`. Before working on any protocol, read th
 "Read first: gaps in advertised protocols (silent-gap risks)" section at the top
 of `docs/status.md` — it lists what is advertised-but-incomplete (silent-gap
 risks: `wl_region` no-op stub, `wl_surface.damage`/`damage_buffer` honored for
-shm upload but not yet as a compositing scissor (every frame fully recomposites),
+shm upload AND as a composite scissor (residual gaps: bbox-not-per-rect, full
+fallback for stack/fx, live KMS slot path unverified on hardware),
 no `wl_resource_post_error` mechanism, single-output only).
 
 ## Comments describe the code, not its history
