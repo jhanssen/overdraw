@@ -353,6 +353,9 @@ export interface CompositorAddon {
   // (null if none this frame) and present it after rendering.
   acquireOutputTexture(): bigint | null;
   presentOutput(): void;
+  // Schedule a frame. Drives the wake/render state machine (see addon's
+  // wake()). Idempotent; cheap when called repeatedly with no work pending.
+  wake(): void;
 }
 
 // The dawn.node wire binding bits the compositor needs for dmabuf surfaces.
@@ -1833,8 +1836,18 @@ export class JsCompositor implements CompositorSink {
 
       this.device.queue.onSubmittedWorkDone().then(() => {
         if (serial > this.completedSerial) this.completedSerial = serial;
+        const freedBefore = this.freed.length;
         this.dispatch(this.lifecycle.step({ kind: "gpuCompleted", serial }));
         this.runAfterFrame();
+        // The gpuCompleted lifecycle step can emit sendWlRelease intents
+        // (their bufferIds land in this.freed). Those are picked up only by
+        // dispatchFrameCallbacks, which is driven from notifyFrame, which
+        // is gated on wantNext. If the client has stopped committing because
+        // it is waiting for THIS release (e.g. a 3-buffer pool with all in
+        // our hands), nothing else will wake the loop -- a missed-release
+        // deadlock. Force a wake so the next runFrameIfReady drains
+        // freed[] via dispatchFrameCallbacks.
+        if (this.freed.length > freedBefore) this.addon.wake();
       });
 
       // Phase 5b-live: invoke each registered live-producer callback. They

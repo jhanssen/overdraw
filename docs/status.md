@@ -4,12 +4,22 @@ Ground truth for what exists right now: current capabilities, known gaps, and
 what remains. The design lives in `architecture.md`; this file does not restate
 it. Present-tense only — no change history.
 
-Last updated: 2026-06-15 (client dmabuf `ImportClientTex` moved from ctrl to
-in-band on the wire as `kind=3`/`kind=4` frames with SCM_RIGHTS; fixes a
-~1/20-launches silent-blank-surface bug where the dmabuf-import's
-`InjectTexture` could be overtaken by a subsequent `SurfaceGetCurrentTextureCmd`
-that allocated the next sequential wire texture id, hitting `Server::Allocate`'s
-`id > mKnown.size()` gap-rejection. See "IPC" + "dmabuf"). Earlier: HiDPI:
+Last updated: 2026-06-15 (two GPU-flow fixes:
+1. Client dmabuf `ImportClientTex` moved from ctrl to in-band on the wire as
+   `kind=3`/`kind=4` frames with SCM_RIGHTS; fixes a ~1/20-launches silent-
+   blank-surface bug where the dmabuf-import's `InjectTexture` could be
+   overtaken by a subsequent `SurfaceGetCurrentTextureCmd` that allocated the
+   next sequential wire texture id, hitting `Server::Allocate`'s
+   `id > mKnown.size()` gap-rejection.
+2. `onSubmittedWorkDone` now wakes the frame loop when the `gpuCompleted`
+   lifecycle step queued a `sendWlRelease`. Fixes a hard deadlock observable
+   under heavy client output (e.g. `find / -name '*'` in kitty): the client
+   drains its dmabuf pool, all buffers are in-flight on our side, the GPU
+   completes the last frame and queues releases, but no path picks them up
+   because `wantNext=0` and nothing else wakes the loop. The buffer releases
+   sit unsent; the client waits forever for them. The wake from
+   `onSubmittedWorkDone` keeps the loop turning past the pool-drain moment.
+See "IPC" + "dmabuf"). Earlier: HiDPI:
 device/logical coordinate split + integer `set_buffer_scale` + fractional
 `wp_viewporter`/`wp_fractional_scale_v1`, EDID-DPI scale auto-derivation, config
 `output.scale`; plus KMS card auto-detect and adapter↔card GPU matching. See
@@ -335,6 +345,18 @@ serial + `onSubmittedWorkDone`; a buffer superseded by a newer commit is freed w
 its retire-serial completes; freed ids drive `wl_buffer.release` + explicit
 `ReleaseClientTex` of the server STM/fd. Verified by a buffer-cycling leak test
 (GPU-process fd count bounded over 40 cycled buffers).
+
+The `onSubmittedWorkDone` callback that delivers the gpuCompleted lifecycle
+intent calls `addon.wake()` when its dispatch grew the pending-release set
+(`this.freed`). Frame callbacks + buffer releases are sent only from
+`dispatchFrameCallbacks`, which runs only from `notifyFrame` → only from
+`runFrameIfReady` → only when `wantNext` is set. Without an explicit wake here,
+a client that has just exhausted its dmabuf pool waiting on the very release
+the GPU just produced will see no `wl_buffer.release` event -- the release sits
+in `freed[]` while `wantNext=false` and nothing else schedules a frame. The
+result is a hard deadlock that recovers only on the next external wake (mouse
+motion, keypress). The wake from `gpuCompleted` keeps the loop turning past
+the moment the client drained its pool.
 
 Limitations: single plane only; `create` (async server-minted `wl_buffer`) not
 wired (the trampoline can now mint server-side new_ids, so this is wiring, not a
