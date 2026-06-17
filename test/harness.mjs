@@ -227,6 +227,12 @@ export async function setupCompositor(opts = {}) {
   const dims = addon.start(gpuBin, onFrame, onInput, startOpts);
   const sock = addon.startServer();
 
+  // The DRM render node the GPU process renders on. Spawned dmabuf clients must
+  // allocate on the SAME GPU, else on a multi-GPU box the compositor imports a
+  // buffer from the wrong card (cross-GPU). Passed to clients via env.
+  const gpuRenderNode = typeof addon.gpuRenderNode === "function"
+    ? addon.gpuRenderNode() : "/dev/dri/renderD128";
+
   let jsCompositor = null;
   let coreDevice = null;
   let dawn = null;
@@ -600,7 +606,8 @@ export async function setupCompositor(opts = {}) {
   // another client (e.g. subsurface-test-client).
   function spawnClient(args = [], { bin = clientBin, readyMarker = "] mapped", stdin = false } = {}) {
     const child = spawn(bin, ["--socket", sock, ...args],
-      { stdio: [stdin ? "pipe" : "ignore", "pipe", "pipe"] });
+      { stdio: [stdin ? "pipe" : "ignore", "pipe", "pipe"],
+        env: { ...process.env, OVERDRAW_RENDER_NODE: gpuRenderNode } });
     clients.push(child);
     const handle = {
       child, stdout: "", ready: null,

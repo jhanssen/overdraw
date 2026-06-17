@@ -103,8 +103,9 @@ int main(int argc, char** argv) {
     wl_display_roundtrip(display);
     if (!compositor || !wm_base || !dmabuf) { fprintf(stderr, "[cycle] missing globals\n"); return 1; }
 
-    int drm = open("/dev/dri/renderD128", O_RDWR | O_CLOEXEC);
-    if (drm < 0) { perror("open renderD128"); return 1; }
+    const char* rnode = getenv("OVERDRAW_RENDER_NODE"); if (!rnode || !*rnode) rnode = "/dev/dri/renderD128";
+    int drm = open(rnode, O_RDWR | O_CLOEXEC);
+    if (drm < 0) { perror("open render node"); return 1; }
     struct gbm_device* gbm = gbm_create_device(drm);
     if (!gbm) { fprintf(stderr, "[cycle] gbm_create_device failed\n"); return 1; }
 

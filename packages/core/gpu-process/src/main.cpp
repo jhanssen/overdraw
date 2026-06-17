@@ -376,16 +376,34 @@ int run(int wireFd, int ctrlFd, int inputFd, bool headless,
             return 1;
         }
         chosenIdx = static_cast<size_t>(found);
+    } else {
+        // Headless/nested: no card to match against. Prefer the first adapter
+        // that advertises a DRM render node, so the GBM allocator opens on the
+        // SAME GPU as the device. On a multi-GPU box, taking adapter 0 blindly
+        // and then guessing the render node lands GBM on a different card than
+        // the device -- buffers fail to import (cross-GPU). Fall back to
+        // adapter 0 only if no adapter advertises a render node.
+        for (size_t i = 0; i < adapters.size(); i++) {
+            if (adapterDrm(adapters[i].Get()).hasRender) { chosenIdx = i; break; }
+        }
     }
 
-    // Open the GBM allocator on the chosen adapter's render node so allocation
-    // and the device share a GPU. Falls back to renderD128 when the adapter
-    // advertises no render node.
-    std::string renderNode = "/dev/dri/renderD128";
+    // The GBM allocator MUST open the chosen adapter's OWN render node, so
+    // allocation and the wgpu device share a GPU. Derive it from the chosen
+    // adapter; only if that adapter advertises no node do we guess renderD128
+    // (correct on a single-GPU box, wrong on multi-GPU -- which is why we prefer
+    // a render-capable adapter above).
+    std::string renderNode;
     {
         WGPUAdapterPropertiesDrm drm = adapterDrm(adapters[chosenIdx].Get());
-        if (drm.hasRender)
+        if (drm.hasRender) {
             renderNode = "/dev/dri/renderD" + std::to_string(drm.renderMinor);
+        } else {
+            renderNode = "/dev/dri/renderD128";
+            std::fprintf(stderr, "[gpu] WARNING: adapter[%zu] advertises no DRM "
+                         "render node; guessing %s (correct only on single-GPU)\n",
+                         chosenIdx, renderNode.c_str());
+        }
     }
     std::printf("[gpu] selected adapter[%zu], render node %s\n",
                 chosenIdx, renderNode.c_str());

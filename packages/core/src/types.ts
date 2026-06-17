@@ -108,8 +108,11 @@ export interface Addon {
   // present), dmabuf import, and shm pixel access.
   gpuHandles(): { instance: bigint; device: bigint } | null;
   outputFormat(): GPUTextureFormat;
-  acquireOutputTexture(): bigint | null;
-  presentOutput(): void;
+  acquireOutputTexture(outputId: number): bigint | null;
+  presentOutput(outputId: number): void;
+  // The /dev/dri/renderD* node the GPU process renders on (same GPU as the
+  // compositor's device). Tests allocate client dmabufs on this node.
+  gpuRenderNode(): string;
   shmView(poolId: number, offset: number, length: number): ArrayBuffer | null;
   createTextureFromDmabuf(fd: WaylandFd, w: number, h: number, fourcc: number,
                           modHi: number, modLo: number, offset: number, stride: number,

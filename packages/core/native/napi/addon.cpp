@@ -13,6 +13,7 @@
 #include <fcntl.h>
 #include <signal.h>
 #include <sys/types.h>  // dev_t
+#include <sys/sysmacros.h>  // minor()
 #include <unistd.h>
 
 #include <cstdio>
@@ -1404,6 +1405,22 @@ napi_value PresentOutput(napi_env env, napi_callback_info info) {
     return nullptr;
 }
 
+// gpuRenderNode() -> string. The /dev/dri/renderD* node the GPU process opened
+// for GBM allocation, derived from the dmabuf-feedback main_device dev_t. Tests
+// use it to allocate client dmabufs on the SAME GPU as the compositor (else a
+// multi-GPU box imports a buffer from the wrong card). Falls back to renderD128.
+napi_value GpuRenderNode(napi_env env, napi_callback_info) {
+    std::string node = "/dev/dri/renderD128";
+    if (g_addon.compositor) {
+        uint64_t dev = g_addon.compositor->dmabufFeedback().mainDevice;
+        if (dev != 0)
+            node = "/dev/dri/renderD" + std::to_string(minor(static_cast<dev_t>(dev)));
+    }
+    napi_value out;
+    napi_create_string_utf8(env, node.c_str(), node.size(), &out);
+    return out;
+}
+
 // outputFormat() -> string. The swapchain's WGPUTextureFormat as a WebGPU format
 // string, so the JS pipeline's color target matches the swapchain.
 napi_value OutputFormat(napi_env env, napi_callback_info) {
@@ -2236,6 +2253,7 @@ napi_value Init(napi_env env, napi_value exports) {
     for (auto& [name, fn] : std::initializer_list<std::pair<const char*, napi_callback>>{
              {"acquireOutputTexture", AcquireOutputTexture},
              {"presentOutput", PresentOutput},
+             {"gpuRenderNode", GpuRenderNode},
              {"outputFormat", OutputFormat}}) {
         napi_value f; napi_create_function(env, name, NAPI_AUTO_LENGTH, fn, nullptr, &f);
         napi_set_named_property(env, exports, name, f);
