@@ -217,6 +217,9 @@ export interface Addon {
 // One OutputDescriptor message delivered from the GPU process. Mirrors the
 // fields in ipc::Tag::OutputDescriptor; updates state.outputs.
 export interface OutputDescriptor {
+  // Routing id of the output this descriptor concerns. The first output is 0;
+  // one output exists today, so it is always 0 until multi-output enumeration.
+  outputId: number;
   width: number;
   height: number;
   refreshMhz: number;

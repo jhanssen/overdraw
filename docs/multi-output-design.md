@@ -418,14 +418,26 @@ not a shippable "multi-output without hotplug."
 1. **IPC outputId plumbing (no behavior change).** Add `outputId` to the messages
    (Section 4), thread through compositor/addon/main.cpp, still drive one output.
    Tree behaves identically. Smallest foundational diff.
-2. **JS outputId threading (no behavior change).** Replace hardcoded
-   `OUTPUT_DEFAULT` at the seams (Section 2) with a passed id that is still always
-   0. Plugin SDKs stop rejecting non-zero in principle but nothing sends non-zero.
+2. **JS outputId threading (no behavior change).** Thread the descriptor entry
+   point: `onOutputDescriptor` routes by `d.outputId` (record lookup + bus emit)
+   instead of hardcoded `OUTPUT_DEFAULT`. This is the seam where real per-output ids
+   first arrive from M3; everything still resolves to output 0 today. The remaining
+   `OUTPUT_DEFAULT` seams in Section 2 are NOT threaded here — they fold into the
+   later milestone that builds their per-output machinery: `wl_output` globals +
+   xdg-output → M6; layout-driver + reserved zones → M5; compositor `drawOrder` /
+   render → M4. The **plugin-SDK validation** (compose/transitions reject
+   `outputId != OUTPUT_DEFAULT`) also moves later: relaxing it *correctly* means
+   "reject unknown output," which needs the live `state.outputs` registry plumbed
+   into those SDKs as a dependency (it is not today) — done in M3/M5 when >1 output
+   first exists. Relaxing to "accept any id" now would route to a nonexistent
+   output and silently fail, so it is deliberately deferred, not done half-way.
 3. **Native N-connector enumeration.** `KmsOutputBackend` enumerates all
    connectors, assigns distinct CRTCs, builds N rings, sends N descriptors, N
    reserve/ready handshakes, routes flips per CRTC (Sections 5-6). Core now has N
    `state.outputs` entries but JS still renders only output 0 → second monitor
-   stays dark (acceptable *interim*, flagged).
+   stays dark (acceptable *interim*, flagged). Includes plumbing the live-output
+   registry into the compose/transitions SDKs and switching their validation from
+   `== OUTPUT_DEFAULT` to `state.outputs.has(id)`.
 4. **Per-output render + pacing.** `renderFrame` loops outputs, per-output
    `wantNext`, per-output present (Section 7). Second monitor lights up. Highest
    risk; gets the most testing.

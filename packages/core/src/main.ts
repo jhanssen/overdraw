@@ -49,7 +49,6 @@ import { JsCompositor } from "./gpu/compositor.js";
 import type { DawnWire, DawnGlobals } from "./gpu/compositor.js";
 import type { Addon, InputEvent } from "./types.js";
 import type { CompositorSink, CompositorState } from "./protocols/ctx.js";
-import { OUTPUT_DEFAULT } from "./protocols/ctx.js";
 import { reemitWlOutput } from "./protocols/wl_output.js";
 import { reemitXdgOutput } from "./protocols/zxdg_output_manager_v1.js";
 import { reemitFractionalScale } from "./protocols/wp_fractional_scale_manager_v1.js";
@@ -294,7 +293,7 @@ state = await installProtocols(addon, {
 // setOnOutputDescriptor) and sets up state.outputs before any clients have
 // bound wl_output, so the re-emit on that first call is a no-op.
 addon.setOnOutputDescriptor((d) => {
-  const rec = state.outputs?.get(OUTPUT_DEFAULT);
+  const rec = state.outputs?.get(d.outputId);
   if (!rec) return;
   // The descriptor reports device pixels (the scanout mode). Scale is core
   // policy: an explicit config value wins, else the EDID-DPI auto fallback
@@ -342,7 +341,7 @@ addon.setOnOutputDescriptor((d) => {
 
   // External: tell clients (via the re-emit subscribers wired below).
   pluginBus.emit("output.changed", {
-    outputId: OUTPUT_DEFAULT,
+    outputId: d.outputId,
     width: logical.width,
     height: logical.height,
     scale,
