@@ -24,13 +24,24 @@ this doc to what is still future.
 - `wl_surface.enter`/`leave` reflect which output(s) a surface overlaps;
   `wp_fractional_scale` preferred scale follows the surface's primary output.
 
+**Multi-GPU (monitors on different DRM cards) is in scope, as a required later
+milestone — not v1, not optional.** Hybrid laptops (iGPU drives the built-in
+panel, dGPU drives the external ports) and discrete multi-GPU boxes put monitors
+on *different* cards. Sections 3-10 below assume all connectors hang off one card;
+that gets every monitor working only when they share a card. Section 11 covers the
+multi-card architecture (render on a primary card, blit to secondary cards for
+scanout) and it is the last milestone. **Multi-output is not considered complete
+until a monitor on a non-primary card displays** (same standing as hotplug,
+Section 10).
+
 Out of scope for v1 (call out explicitly, do not silently drop):
 - **Mirrored/cloned** outputs (same content, two CRTCs) — different model, defer.
 - **Spanning** a single surface across outputs with per-output scale is handled by
   the global-space render (each output samples its sub-rect); no extra work, but
   not separately tested in v1.
-- **Mixed-backend** (one KMS + one nested) — not a real use case; nested
-  multi-output is a separate, lower-priority track.
+- **Mixed-backend** (one KMS card + one nested host window) — not a real use case;
+  nested multi-output is a separate, lower-priority track. (Multiple KMS *cards* is
+  in scope — Section 11.)
 
 ## 2. Where single-output is baked in today
 
@@ -170,7 +181,7 @@ call stays single (one fd) but now advances N rings.
 connected connectors with modes. CRTC assignment must avoid collisions — walk each
 connector's `possible_crtcs` mask and assign distinct CRTCs greedily; a connector
 with no free compatible CRTC is dropped with a logged warning (do not silently
-skip — Section 12).
+skip — Section 13).
 
 ## 6. Core compositor: per-output scanout state
 
@@ -408,12 +419,79 @@ replugged on a different port (new dense `outputId`, same EDID id) still reclaim
 its workspaces. Preserve the existing per-output invariant (≥1 workspace per
 touched output) across all of this.
 
-## 11. Sequencing (milestones)
+## 11. Multi-GPU (multiple DRM cards)
+
+Required, not optional (Section 1). Monitors split across cards — hybrid
+iGPU+dGPU laptops (built-in panel on the integrated GPU, external ports on the
+discrete GPU) and discrete multi-GPU boxes — cannot all be driven by the
+single-card path Sections 3-10 build. This is its own milestone on top, and
+multi-output is not complete until a monitor on a non-primary card displays.
+
+### Model: one primary renderer, secondary cards scan out a copy
+
+- **Enumerate every DRM card**, not just the first. Today the GPU process opens one
+  card (`Seat::openFirstConnectedCard`); multi-GPU opens every connected card via
+  libseat and constructs one Dawn device per card.
+- **One primary card renders.** The compositor's WebGPU passes run on the primary
+  card's Dawn device exactly as today; the primary's own connectors scan out
+  directly (the per-output ring from M4).
+- **Secondary cards are scanout-only** — connectors but no compositing. Each frame
+  bound for a secondary card's output is copied from the primary to that card and
+  scanned out there.
+- **The bridge is a cross-GPU blit, never zero-copy.** The primary's rendered buffer
+  is exported as a dmabuf, imported on the secondary card's device, and blitted (a
+  Dawn pass on the secondary device) into that card's scanout-ring buffer, then
+  page-flipped. The copy is unavoidable — two cards cannot share a scanout buffer.
+- **Cross-card sync rides explicit fences:** the secondary's blit waits on the
+  primary's render-complete fence; the page-flip's `IN_FENCE_FD` waits on the blit.
+  Same explicit-sync machinery the single-card scanout path uses, extended across
+  the device boundary.
+- **Shared buffers use linear (or a vendor-neutral) modifier** — tiled modifiers are
+  not portable across vendors. The per-card tiled-scanout win is given up on the
+  secondary path only.
+
+### Primary card selection is user-controlled
+
+The user picks the primary renderer — config `output.primaryCard` (or
+`--primary-card=/dev/dri/cardN`). Default when unset: the card with a built-in
+panel / `boot_vga` (the integrated GPU), else the first enumerated card. The
+integrated GPU is usually the right renderer (lower power, drives the internal
+panel directly), but a user may want the discrete GPU as primary for performance —
+only they know their intent, so beyond the default we do not guess.
+
+### overdraw specifics + landmines
+
+- Adapter↔card matching already exists (each card's render node matched to a Dawn
+  adapter via `WGPUAdapterPropertiesDrm`); multi-GPU generalizes it from one card to
+  a device-per-card map.
+- The cross-card blit is a Dawn pass between two independent `wgpu::Device`s — the
+  hard new primitive. Needs dmabuf export on the primary + import on the secondary,
+  device-to-device (client-dmabuf import already exists, but to one device).
+- Dawn's single-FD dmabuf import limit (status.md) constrains the shared buffer to a
+  single-plane format — fine for a linear RGBA blit target.
+- A non-Intel secondary is the hardest case: that vendor's scanout is unverified
+  end-to-end (status.md) and its linear-buffer / cursor-plane scanout path is a known
+  trouble spot. The integrated-primary + discrete-secondary hybrid laptop is exactly
+  this case.
+- M4 already takes the scanout ring / page-flip routing / `OutputBackend` per-output;
+  multi-GPU adds a per-card dimension above that (each card owns a subset of outputs
+  plus its own device / allocator / blit).
+
+### Testing
+
+Cannot be exercised on a single-GPU box. A discrete multi-GPU box, or any machine
+where two monitors sit on two cards, is required; verified manually (Section 13)
+like the rest of the KMS path. Note a hybrid laptop with only one external connector
+cannot produce the single-card two-monitor case at all (its two monitors are always
+on two cards), so the single-card path (M3-M7) and the multi-card path (this
+section) need different test hardware.
+
+## 12. Sequencing (milestones)
 
 Each milestone is independently landable and leaves the tree working at N=1. The
 ordering is a build sequence, not a scope boundary: the feature is complete only
-after milestone 7 (hotplug). Milestones 1-6 are intermediate states of one feature,
-not a shippable "multi-output without hotplug."
+after **both** hotplug (M7) and multi-GPU (M8). Milestones 1-7 are intermediate
+states of one feature, not a shippable endpoint.
 
 1. **IPC outputId plumbing (no behavior change).** Add `outputId` to the messages
    (Section 4), thread through compositor/addon/main.cpp, still drive one output.
@@ -442,7 +520,7 @@ not a shippable "multi-output without hotplug."
    CRTC-assignment / modeset / per-CRTC flip-routing machinery deliberately moves to
    M4 (below) — building idle scanout rings for monitors nothing renders to is
    wasteful and would mean refactoring the working single-output scanout path with
-   no way to render the result. KMS-only parts verified manually (Section 12); the
+   no way to render the result. KMS-only parts verified manually (Section 13); the
    JS record-creation + arrangement fallback are unit-tested. Plumbing the
    live-output registry into the compose/transitions SDKs (validation
    `== OUTPUT_DEFAULT` → `state.outputs.has(id)`) lands here or in M5 once a second
@@ -468,8 +546,13 @@ not a shippable "multi-output without hotplug."
    `preferredOutputs` from milestone 5 is the prerequisite; this milestone makes it
    react to live plug/unplug. Not optional — multi-output is incomplete without it
    (Section 10).
+8. **Multi-GPU (required for completeness).** Enumerate all cards, one Dawn device
+   per card, user-selectable primary renderer, cross-card dmabuf blit + explicit-sync
+   for secondary-card scanout (Section 11). The per-output machinery from M4-M7 is
+   the prerequisite; this adds the per-card dimension. Not optional — a monitor on a
+   non-primary card (the hybrid-laptop case) does not work until this lands.
 
-## 12. Testing — and a real gap to settle first
+## 13. Testing — and a real gap to settle first
 
 Per the project testing policy, every new protocol/behavior gets a test at the
 cheapest tier that proves it. Most of this plan is testable GPU-free or via the
@@ -514,7 +597,7 @@ KMS-specific native code in milestones 3/4 ships without automated coverage, and
 that must be stated in `status.md` when it lands. A vkms harness remains the
 future path to close it if the manual-only risk proves too high.
 
-## 13. Open questions for the user
+## 14. Open questions for the user
 
 None outstanding — all decisions below are resolved. Reopen if a constraint
 changes.
@@ -529,7 +612,7 @@ Resolved:
   (ground-truth form a future GUI canvas resolves to). Accepted v1 awkwardness: the
   user must know an output's logical width to butt another against its edge.
   Relative placement / GUI canvas are later sugar, not v1 (Section 10).
-- KMS test coverage — manual verification (Section 12).
+- KMS test coverage — manual verification (Section 13).
 - Migration unit — the **workspace** (already built, per-output-keyed); no new
   "layout group" abstraction. Single-output only because enumeration caps
   `outputId` to 0 (Section 8).
@@ -543,7 +626,12 @@ Resolved:
 - Per-output pacing — **independent per-output clocks** (per-output `wantNext`,
   render+present only the dirty output on its own vblank). Section 7; the
   milestone-4 risk, gets the most testing.
-- Hotplug — **required, not deferrable.** Sequenced last (milestone 7) because it
+- Hotplug — **required, not deferrable.** Sequenced as milestone 7 because it
   builds on the per-output workspace model, but multi-output is not complete
-  without live plug/unplug. Milestones 1-6 are intermediate states, not a shippable
-  endpoint (Sections 10, 11).
+  without live plug/unplug (Sections 10, 12).
+- Multi-GPU (multiple DRM cards) — **required, not deferrable; its own milestone
+  (M8) on top.** Render on a user-selected primary card, blit to secondary cards for
+  scanout. The feature is not complete until a monitor on a non-primary card (the
+  hybrid-laptop case) displays. Primary card is **user-selectable** (`output.
+  primaryCard` / `--primary-card`), defaulting to the integrated/built-in-panel GPU
+  (Section 11).
