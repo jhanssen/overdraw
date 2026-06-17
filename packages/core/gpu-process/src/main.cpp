@@ -2055,8 +2055,22 @@ int selftestXDev() {
     wgpu::Adapter probeAdapter = makeAdapter();
     if (!probeAdapter) { std::fprintf(stderr, "XDEV: FAIL (no adapter)\n"); return 1; }
 
+    // Open the GBM allocator on the probe adapter's OWN render node, else on a
+    // multi-GPU box GBM lands on a different card than the device.
+    std::string xnode = "/dev/dri/renderD128";
+    {
+        WGPUAdapterPropertiesDrm drm{};
+        drm.chain.sType = WGPUSType_AdapterPropertiesDrm;
+        WGPUAdapterInfo info{};
+        info.nextInChain = &drm.chain;
+        wgpuAdapterGetInfo(probeAdapter.Get(), &info);
+        const bool hasRender = drm.hasRender;
+        const uint32_t rmin = drm.renderMinor;
+        wgpuAdapterInfoFreeMembers(info);
+        if (hasRender) xnode = "/dev/dri/renderD" + std::to_string(rmin);
+    }
     gpu::Allocator alloc;
-    if (!alloc.open() || !alloc.probe(probeAdapter)) {
+    if (!alloc.open(xnode.c_str()) || !alloc.probe(probeAdapter)) {
         std::fprintf(stderr, "XDEV: FAIL (allocator open/probe)\n"); return 1;
     }
 

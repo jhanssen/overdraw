@@ -82,7 +82,7 @@ int main(int argc, char** argv) {
     }
 
     // Allocate a LINEAR ARGB8888 dmabuf via GBM on the primary render node.
-    const char* rnode = getenv("OVERDRAW_RENDER_NODE"); if (!rnode || !*rnode) rnode = "/dev/dri/renderD128";
+    const char* rnode = getenv("OVERDRAW_RENDER_NODE"); if (!rnode || !*rnode) { fprintf(stderr, "[client] OVERDRAW_RENDER_NODE not set\n"); return 1; }
     int drm = open(rnode, O_RDWR | O_CLOEXEC);
     if (drm < 0) { perror("open render node"); return 1; }
     struct gbm_device* gbm = gbm_create_device(drm);

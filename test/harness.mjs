@@ -229,9 +229,13 @@ export async function setupCompositor(opts = {}) {
 
   // The DRM render node the GPU process renders on. Spawned dmabuf clients must
   // allocate on the SAME GPU, else on a multi-GPU box the compositor imports a
-  // buffer from the wrong card (cross-GPU). Passed to clients via env.
+  // buffer from the wrong card (cross-GPU import -> ENOMEM). Export it so EVERY
+  // spawned client inherits it -- both spawnClient() below and tests that spawn
+  // a client binary directly. The GPU process ignores it (it picks its node from
+  // its own adapter); only the GBM test clients read it.
   const gpuRenderNode = typeof addon.gpuRenderNode === "function"
     ? addon.gpuRenderNode() : "/dev/dri/renderD128";
+  process.env.OVERDRAW_RENDER_NODE = gpuRenderNode;
 
   let jsCompositor = null;
   let coreDevice = null;
