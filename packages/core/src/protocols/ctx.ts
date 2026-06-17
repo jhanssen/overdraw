@@ -214,6 +214,10 @@ export interface CompositorSink {
   removeSurface(id: number): void;
   takeImportedSurfaces(): Array<{ id: number; width: number; height: number }>;
   takeFreedBuffers(): number[];
+  // Which output ids overlap this surface's current rect. Empty for an
+  // unmapped / off-screen surface. Used by the per-output frame-callback
+  // dispatch (a surface on a 60Hz output gets wl_callback.done at 60Hz).
+  surfaceOutputs?(surfaceId: number): number[];
   // Notify the compositor that a client wl_buffer was destroyed (explicit
   // wl_buffer.destroy or disconnect sweep). Drives cache invalidation in
   // the client-buffer lifecycle (rule A: along with surfaceRemoved, the
@@ -415,6 +419,11 @@ export interface CompositorState {
   // Fire all surfaces' pending wl_surface.frame callbacks (set by installProtocols;
   // called once per compositor frame). timeMs is a millisecond timestamp.
   dispatchFrameCallbacks?: (timeMs: number) => void;
+  // Per-output wl_callback.done dispatch, fired by the addon on each KMS
+  // ScanoutFlipComplete. Sends done only to callbacks whose surface overlaps
+  // `outputId` -- so a 60Hz surface is paced at 60Hz even when a 240Hz peer
+  // output is also flipping. Set alongside dispatchFrameCallbacks.
+  dispatchFrameCallbacksForOutput?: (timeMs: number, outputId: number) => void;
   // Run just before the per-frame renderFrame. Used by the animation
   // evaluator (core-plugin-api.md §9) to advance active animations and
   // write the new per-surface state values for this frame. Set by

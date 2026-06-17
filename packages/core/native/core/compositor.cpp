@@ -535,13 +535,17 @@ void Compositor::drainCtrl() {
                 slots[flipped].state = ScanoutSlotState::SCANOUT;
             }
             frameCompleteSeen_ = true;
+            flipCompletes_.push_back(r.outputId);
             continue;
         }
         if (r.tag == ipc::Tag::FrameComplete) {
             // Nested: the host wl_surface.frame listener fired (host
             // compositor is ready for the next frame). Routes to the addon's
-            // wake state machine.
+            // wake state machine. Push the primary outputId so the per-output
+            // frame-callback dispatch fires for the nested-host's single
+            // output too (multi-output is KMS-only today).
             frameCompleteSeen_ = true;
+            flipCompletes_.push_back(0);
             continue;
         }
         if (r.tag == ipc::Tag::OutputDescriptor) {
@@ -849,11 +853,22 @@ WGPUTexture Compositor::acquireOutputTextureHandle(uint32_t outputId) {
         auto it = scanoutOutputs_.find(outputId);
         if (it == scanoutOutputs_.end()) return nullptr;  // no ring for this output
         ScanoutOutput& so = it->second;
-        // Pick the next FREE slot. Returns nullptr (frame skipped) if all
-        // three are PENDING_FLIP/SCANOUT -- the JS compositor's render path
-        // already handles a null acquire. The texture handle was returned
-        // by the wire-client ReserveTexture during bring-up; the GPU process
-        // has InjectTexture'd at it (ScanoutReady ok=1 attests).
+        // Per-output flip gate: the kernel accepts only one queued page-flip
+        // per CRTC. If this output already has a slot in PENDING_FLIP, the
+        // next atomic commit would be rejected with EBUSY -- and even if it
+        // weren't, queueing a second present before the first one is on screen
+        // means the panel never displays the intermediate frame. Wait for the
+        // pending flip's completion event before letting the JS compositor
+        // render this output again. With different per-output refresh rates,
+        // each output is independently paced: a 240Hz panel's flip-complete
+        // re-triggers the loop every ~4ms but the 60Hz panel stays gated on
+        // its own ~16ms flip-complete.
+        for (int i = 0; i < 3; ++i) {
+            if (so.slots[i].state == ScanoutSlotState::PENDING_FLIP) return nullptr;
+        }
+        // Pick the next FREE slot. The texture handle was returned by the
+        // wire-client ReserveTexture during bring-up; the GPU process has
+        // InjectTexture'd at it (ScanoutReady ok=1 attests).
         //
         // Open a producer BeginAccess bracket on the slot's SharedTextureMemory.
         // Reuses the same in-band kind=1 wire frame the plugin overlay path

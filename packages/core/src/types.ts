@@ -197,6 +197,11 @@ export interface Addon {
   // Passing null clears the callback. Descriptors that arrived before the
   // callback was registered (during bring-up) are drained synchronously.
   setOnOutputDescriptor(cb: ((d: OutputDescriptor) => void) | null): void;
+  // Register a callback fired once per drained KMS flip-complete; the outputId
+  // identifies WHICH output just flipped. JS uses this to dispatch
+  // wl_callback.done per output (surfaces on a 60Hz output get `done` at 60Hz
+  // even when a 240Hz output is flipping). Passing null clears.
+  setOnFlipComplete(cb: ((outputId: number) => void) | null): void;
   // Update the input backend's notion of output size (used by both the
   // wayland and libinput backends to map / clamp pointer coordinates). Called
   // when the output reconfigures. Silent no-op if no input backend is active.

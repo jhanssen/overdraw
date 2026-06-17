@@ -689,20 +689,6 @@ export class JsCompositor implements CompositorSink {
   // into its own scanout target. Before setOutputs is ever called this holds a
   // single entry {id:0, x:0, y:0} so nested/headless/single-KMS are unchanged.
   private outputsGeom = new Map<number, OutputGeom>();
-  // Per-output dirty tracking for independent frame pacing. An output is
-  // rendered+presented only when it is dirty AND its scanout ring has a free
-  // slot; a clean output is skipped (not repainted) when only another output
-  // changed. `dirtyAll` is the sentinel "every current output is dirty" (set by
-  // markAllOutputsDirty for changes whose affected region can't be localized to
-  // a subset of outputs). The set holds individually-marked output ids.
-  //
-  // Safety: under-marking drops a frame (a correctness bug); over-marking only
-  // repaints a clean output (a perf cost). Every marking path errs toward
-  // marking. Single-output modes (nested / headless / one-monitor KMS) bypass
-  // this entirely -- renderFrame treats a lone output as always dirty, so their
-  // behavior is identical regardless of this set's contents.
-  private dirtyOutputs = new Set<number>();
-  private dirtyAll = false;
   // Surfaces that gained presentable content since the last takeImportedSurfaces.
   private imported: Array<{ id: number; width: number; height: number }> = [];
   private warnedDmabuf = false;
@@ -1615,6 +1601,49 @@ export class JsCompositor implements CompositorSink {
     return out;
   }
 
+  // Which output ids does the surface currently overlap? Used by the per-output
+  // frame-callback dispatch: a surface on a 60Hz output gets wl_callback.done
+  // at 60Hz; a surface spanning two outputs gets `done` from EITHER output's
+  // flip-complete (the spec allows either, but in practice the faster one
+  // dominates -- per spec, returning the slowest would be ideal but adds
+  // bookkeeping). Returns empty if the surface has no layout rect yet or
+  // overlaps no output (unmapped / off-screen). The placement uses the same
+  // (s.x, s.y, s.layoutW, s.layoutH) the composite reads, so a surface that
+  // would draw on output N is counted as resident on output N.
+  surfaceOutputs(surfaceId: number): number[] {
+    const s = this.surfaces.get(surfaceId);
+    if (!s) return [];
+    const w = s.layoutW > 0 ? s.layoutW : s.width;
+    const h = s.layoutH > 0 ? s.layoutH : s.height;
+    // Surface has no extent yet (no commit, no layout): pre-buffer-frame
+    // request, an unplaced subsurface, or similar. Return every output so
+    // wl_callback.done fires on the next flip-complete regardless of where
+    // the surface eventually lands; otherwise a client driving its render
+    // loop off `frame` would never see its first `done` and stall before
+    // committing a buffer.
+    if (w <= 0 || h <= 0) {
+      return [...this.outputsGeom.keys()];
+    }
+    const sx0 = s.x;
+    const sy0 = s.y;
+    const sx1 = sx0 + w;
+    const sy1 = sy0 + h;
+    const out: number[] = [];
+    for (const o of this.outputsGeom.values()) {
+      const scale = o.scale > 0 ? o.scale : 1;
+      const ox0 = o.logicalX;
+      const oy0 = o.logicalY;
+      const ox1 = o.logicalX + o.deviceWidth / scale;
+      const oy1 = o.logicalY + o.deviceHeight / scale;
+      if (sx0 < ox1 && sx1 > ox0 && sy0 < oy1 && sy1 > oy0) out.push(o.id);
+    }
+    // Mapped but placed off-screen / outside every output's region: fall back
+    // to every output so the client doesn't hang. Real off-screen surfaces are
+    // rare; correctness > optimal pacing for the degenerate case.
+    if (out.length === 0) return [...this.outputsGeom.keys()];
+    return out;
+  }
+
   // dmabuf buffers freed since the last call (their last sampling frame completed
   // on the GPU). shm buffers are copied at upload, so they never appear here.
   takeFreedBuffers(): number[] {
@@ -1718,54 +1747,13 @@ export class JsCompositor implements CompositorSink {
   // regions (stack reorders, per-surface fx, output resize).
   private damageFull(): void {
     this.outputDamage.full();
-    this.markAllOutputsDirty();
   }
 
   // Accumulate an output-LOGICAL-space rect into every tracked slot's region.
-  // The rect is in GLOBAL logical coordinates; mark every output whose logical
-  // region intersects it dirty (a region change only the intersecting outputs
-  // need to repaint).
+  // The rect is in GLOBAL logical coordinates.
   private addOutputDamage(x: number, y: number, w: number, h: number): void {
     this.outputDamage.setBounds(this.logicalWidth, this.logicalHeight);
     this.outputDamage.damageRect(x, y, w, h);
-    this.markOutputsIntersecting(x, y, w, h);
-  }
-
-  // Mark every output (by id) currently in outputsGeom dirty. Used when a
-  // change's affected region can't be localized (stack/layer reorder, per-
-  // surface fx, transform/opacity/mask, transition, output geometry change).
-  markAllOutputsDirty(): void {
-    this.dirtyAll = true;
-  }
-
-  // Mark a single output dirty by id. Adding an id not in outputsGeom is
-  // harmless (renderFrame only consults the set for ids it iterates).
-  markOutputDirty(outputId: number): void {
-    this.dirtyOutputs.add(outputId);
-  }
-
-  // Mark every output whose logical region intersects the given GLOBAL-logical
-  // rect. An output's logical region is [logicalX, logicalY] sized by its
-  // device dims / scale. A zero-area rect intersects nothing; callers that
-  // can't bound the region call markAllOutputsDirty instead.
-  private markOutputsIntersecting(x: number, y: number, w: number, h: number): void {
-    if (this.dirtyAll) return;
-    for (const o of this.outputsGeom.values()) {
-      const scale = o.scale > 0 ? o.scale : 1;
-      const ox0 = o.logicalX;
-      const oy0 = o.logicalY;
-      const ox1 = o.logicalX + o.deviceWidth / scale;
-      const oy1 = o.logicalY + o.deviceHeight / scale;
-      if (x < ox1 && x + w > ox0 && y < oy1 && y + h > oy0) {
-        this.dirtyOutputs.add(o.id);
-      }
-    }
-  }
-
-  // True if output `id` should be rendered this frame (individually marked, or
-  // the dirtyAll sentinel is set). Single-output callers bypass this.
-  private isOutputDirty(id: number): boolean {
-    return this.dirtyAll || this.dirtyOutputs.has(id);
   }
 
   // Damage a surface's current on-screen rect (placement). Content commits and
@@ -2060,13 +2048,11 @@ export class JsCompositor implements CompositorSink {
     // transform (origin + scale + dims) so a surface at global-logical (lx, ly)
     // lands at device ((lx - originX) * scale, (ly - originY) * scale).
     //
-    // Pacing: each output renders + presents on its OWN vblank. An output is
-    // serviced only when it is dirty (this.isOutputDirty) AND its ring has a
-    // free slot; a clean output is skipped (not repainted) when only another
-    // output changed, and a dirty-but-busy output stays dirty until its own
-    // flip-complete frees its ring. A lone output (single-output modes) is
-    // always treated as dirty so behavior is identical to rendering it every
-    // triggered frame.
+    // Pacing: each output renders + presents on its OWN vblank. Every output
+    // with a free scanout slot is rendered this pass; a busy output (ring full
+    // mid-flip) is skipped and serviced when its own flip-complete frees a
+    // slot. Per-output composite-scissor damage (see OutputDamageRing) keeps
+    // the per-pixel cost cheap when nothing changed on a given output.
     const targets: Array<{
       ctx: OutputCtx;
       view: GPUTextureView;
@@ -2077,26 +2063,15 @@ export class JsCompositor implements CompositorSink {
 
     if (this.nested) {
       if (!this.dawn) return;
-      const single = this.outputsGeom.size === 1;
       const outs = [...this.outputsGeom.values()].sort((a, b) => a.id - b.id);
       for (const o of outs) {
-        // Skip clean outputs (single-output mode forces dirty). A skipped
-        // clean output keeps its (absent) dirty flag.
-        if (!single && !this.isOutputDirty(o.id)) continue;
         const handle = this.addon.acquireOutputTexture(o.id);
         // The native addon returns nullptr from N-API on "no slot available"
         // (no FREE scanout in KMS mode; no swapchain texture in nested mode);
         // that arrives in JS as undefined, not null. Both mean "skip this
-        // output this frame" -- its ring slot is busy. Leave it dirty so its
-        // flip-complete re-triggers a render for it.
-        if (handle === null || handle === undefined) {
-          if (!single) this.dirtyOutputs.add(o.id);
-          continue;
-        }
-        // This output is being rendered + presented; clear its individual dirty
-        // flag now. The dirtyAll sentinel is cleared after the loop only if no
-        // output was left dirty-but-busy.
-        this.dirtyOutputs.delete(o.id);
+        // output this frame" -- its ring slot is busy. Its own flip-complete
+        // will re-trigger the frame loop.
+        if (handle === null || handle === undefined) continue;
         const tex = this.dawn.wrapTexture(this.deviceHandle, handle);
         targets.push({
           ctx: this.outputCtx(o),
@@ -2108,13 +2083,8 @@ export class JsCompositor implements CompositorSink {
           scissor: this.takeScissor(o, handle),
         });
       }
-      // Every output that was dirtyAll has either been serviced (and its
-      // individual flag cleared) or re-added to dirtyOutputs because its ring
-      // was busy; the sentinel itself is now consumed.
-      this.dirtyAll = false;
-      // Every selected output's ring was busy this frame -- nothing to present,
-      // and the lifecycle/bracket machinery would otherwise open a frame with no
-      // draw. The busy outputs stay dirty (re-added above) for their flip.
+      // Every output's ring was busy this frame -- nothing to present, and the
+      // lifecycle/bracket machinery would otherwise open a frame with no draw.
       if (targets.length === 0) return;
     } else {
       if (!this.targetView) return;  // headless before the target exists
@@ -2161,17 +2131,25 @@ export class JsCompositor implements CompositorSink {
         this.openImportBrackets(lw.windows.map((w) => w.id), bracketed);
       }
 
-      const enc = this.device.createCommandEncoder();
       // On-screen pass: either a transition pass (Phase 8) or the normal
-      // per-surface composite, encoded once per output into that output's
-      // target. The two are mutually exclusive -- a transition replaces the
-      // on-screen output entirely while active; the input textures it samples
-      // are not part of any surface in the WM's draw list. The transition's
-      // textures (and its one-shot wire bracket) are resolved once for the
-      // frame, then drawn into every output target.
+      // per-surface composite. Each output is its OWN encoder+submit because
+      // updateUniforms() writes per-surface uniform buffers via
+      // queue.writeBuffer, and all writes within a single submit land at the
+      // SAME GPU-timeline point (queue.writeBuffer is per-submit, not per-
+      // encoded-command). With one encoder for all outputs, the cursor's
+      // uniform for output 0 was being overwritten by output 1's value
+      // before either pass ran, so both passes drew with output 1's
+      // transform -- the cursor (and any shared surface) would draw in the
+      // wrong place or off-screen on output 0, manifesting as cursor /
+      // client flicker on a multi-output configuration. Per-output submit
+      // serializes the writes: writeBuffer(o0) ; submit(pass0) ;
+      // writeBuffer(o1) ; submit(pass1) -- each pass sees its own values.
+      // GPU queue submits execute serially, so the at-most-one-pending-flip
+      // and bracket invariants are unchanged.
       const transition = this.activeTransition
         ? this.resolveTransitionFrame() : null;
       for (const t of targets) {
+        const enc = this.device.createCommandEncoder();
         if (this.activeTransition) {
           this.encodeTransitionInto(enc, t.view, transition);
         } else {
@@ -2181,14 +2159,19 @@ export class JsCompositor implements CompositorSink {
             scissor: t.scissor, output: t.ctx,
           });
         }
+        this.device.queue.submit([enc.finish()]);
       }
-      // Live composers, in registration order. Each pass writes to its
-      // own target texture; they don't blend against each other.
+      // Live composers, in registration order. Each pass writes to its own
+      // target texture and may sample any surface; for the same reason as
+      // above, each gets its own submit so its uniform writes are isolated
+      // from the previous pass's.
       for (const ls of this.liveScenes) {
+        const enc = this.device.createCommandEncoder();
         this.composite({
           encoder: enc, targetView: ls.view, drawList: ls.windows,
           outW: ls.outW, outH: ls.outH,
         });
+        this.device.queue.submit([enc.finish()]);
       }
       for (const lw of this.liveWindowComps) {
         for (const w of lw.windows) {
@@ -2203,14 +2186,15 @@ export class JsCompositor implements CompositorSink {
                 v1: (w.rect.y + w.rect.h) / w.surfH,
               }]])
             : undefined;
+          const enc = this.device.createCommandEncoder();
           this.composite({
             encoder: enc, targetView: w.view, drawList: [w.id],
             outW: w.rect.w, outH: w.rect.h,
             placements, cropUV,
           });
+          this.device.queue.submit([enc.finish()]);
         }
       }
-      this.device.queue.submit([enc.finish()]);
 
       // Tag the submit; on GPU completion advance completedSerial and emit
       // gpuCompleted to the lifecycle (which fires deferred release intents).

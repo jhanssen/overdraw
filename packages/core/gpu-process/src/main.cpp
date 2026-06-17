@@ -953,17 +953,29 @@ int run(int wireFd, int ctrlFd, int inputFd, bool headless,
         {
             auto sit = scanoutBufIdToSlot.find(surfaceBufId);
             if (sit != scanoutBufIdToSlot.end() && producer) {
-                int& slotFenceFd = scanoutFenceFdByBufId[surfaceBufId];
-                if (slotFenceFd >= 0) { ::close(slotFenceFd); slotFenceFd = -1; }
+                // Drop any previously-captured fence fd before overwriting.
+                // Look up by find() -- operator[] would value-initialize the
+                // map entry to 0, which close() would then interpret as fd 0
+                // (typically the DRM card fd, since stdin is closed in this
+                // child); closing that wedges every subsequent KMS ioctl.
+                auto fit = scanoutFenceFdByBufId.find(surfaceBufId);
+                if (fit != scanoutFenceFdByBufId.end()) {
+                    if (fit->second >= 0) ::close(fit->second);
+                    scanoutFenceFdByBufId.erase(fit);
+                }
                 if (endState.fenceCount >= 1) {
                     wgpu::SharedFenceExportInfo exp{};
                     wgpu::SharedFenceSyncFDExportInfo syncExp{};
                     exp.nextInChain = &syncExp;
                     endState.fences[0].ExportInfo(&exp);
                     if (syncExp.handle >= 0) {
-                        slotFenceFd = ::dup(syncExp.handle);
-                        if (slotFenceFd < 0) {
-                            std::fprintf(stderr, "[gpu] scanout EndAccess: dup(syncfd) failed\n");
+                        int dupFd = ::dup(syncExp.handle);
+                        if (dupFd >= 0) {
+                            scanoutFenceFdByBufId[surfaceBufId] = dupFd;
+                        } else {
+                            std::fprintf(stderr,
+                                "[gpu] scanout EndAccess: dup(syncfd=%d) failed: %s\n",
+                                syncExp.handle, std::strerror(errno));
                         }
                     }
                 }

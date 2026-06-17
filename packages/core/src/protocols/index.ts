@@ -430,19 +430,12 @@ export async function installProtocols(
       }
     }
 
-    for (const s of state.surfaces.values()) {
-      const cbs = s.frameCallbacks;
-      if (!cbs || cbs.length === 0) continue;
-      s.frameCallbacks = [];
-      for (const cb of cbs) {
-        if (cb.destroyed) continue;
-        events.wl_callback.send_done(cb, timeMs >>> 0);
-        // wl_callback.done is type="destructor": the protocol says the
-        // resource is gone after this event. Without this call the
-        // libwayland resource + napi_ref leaks per frame per surface.
-        addon.destroyResource(cb);
-      }
-    }
+    // Frame callbacks are NOT dispatched here -- they're per-output, fired by
+    // dispatchFrameCallbacksForOutput on each KMS flip-complete. A surface on
+    // a 60Hz output gets wl_callback.done at 60Hz even when a 240Hz output is
+    // also flipping. The per-tick housekeeping above (imports/maps/unmaps,
+    // buffer-release, window-changes, animation tick) still runs at the full
+    // wake cadence.
 
     // Animation evaluator: advance active animations and write the new
     // per-surface state values for this frame. Runs BEFORE renderFrame so
@@ -454,6 +447,36 @@ export async function installProtocols(
     // commits + any newly-mapped windows. The native path renders on its own
     // libuv timer, so its renderFrame is undefined (no-op here).
     state.compositor.renderFrame?.();
+  };
+
+  // Per-output frame-callback dispatch. Called by the addon when a KMS
+  // ScanoutFlipComplete is drained for `outputId`. Sends wl_callback.done to
+  // each pending callback whose surface overlaps that output -- so a surface
+  // resident only on a 60Hz output is paced by its flips, not by a faster
+  // peer output's. A surface with no current output overlap (unmapped /
+  // off-screen) keeps its callbacks queued until it overlaps an output again
+  // OR the surface tears down (callbacks released with the SurfaceRecord).
+  state.dispatchFrameCallbacksForOutput = (timeMs: number, outputId: number): void => {
+    const surfaceOutputs = state.compositor.surfaceOutputs;
+    for (const s of state.surfaces.values()) {
+      const cbs = s.frameCallbacks;
+      if (!cbs || cbs.length === 0) continue;
+      // If the compositor can't report residency, fall back to "all outputs"
+      // (back-compat for harnesses with a stub compositor).
+      if (surfaceOutputs) {
+        const outs = surfaceOutputs.call(state.compositor, s.id);
+        if (!outs.includes(outputId)) continue;
+      }
+      s.frameCallbacks = [];
+      for (const cb of cbs) {
+        if (cb.destroyed) continue;
+        events.wl_callback.send_done(cb, timeMs >>> 0);
+        // wl_callback.done is type="destructor": the protocol says the
+        // resource is gone after this event. Without this call the
+        // libwayland resource + napi_ref leaks per frame per surface.
+        addon.destroyResource(cb);
+      }
+    }
   };
 
   // Popup click-away dismissal: the seat calls this on a button press.

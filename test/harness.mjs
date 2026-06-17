@@ -209,6 +209,12 @@ export async function setupCompositor(opts = {}) {
   let state = null;
   const onInput = (ev) => { state?.seat?.handleInput(ev); };
   const onFrame = () => { state?.dispatchFrameCallbacks?.(Math.round(performance.now())); };
+  // Per-output wl_callback.done dispatch (paces clients at their resident
+  // output's vblank, not the union of all outputs'). Headless synthesizes
+  // this from the ~60Hz frame timer; nested gets one per host FrameComplete.
+  const onFlipComplete = (outputId) => {
+    state?.dispatchFrameCallbacksForOutput?.(Math.round(performance.now()), outputId);
+  };
 
   // Headless by default: the JS compositor renders into an offscreen target
   // read back via frameReadback(). Pass `headless: null` or `headless: false`
@@ -225,6 +231,7 @@ export async function setupCompositor(opts = {}) {
   else headless = null;  // null or false -> use an output backend
   const startOpts = headless ?? { backend: opts.backend ?? "nested" };
   const dims = addon.start(gpuBin, onFrame, onInput, startOpts);
+  addon.setOnFlipComplete?.(onFlipComplete);
   const sock = addon.startServer();
 
   // The DRM render node the GPU process renders on. Spawned dmabuf clients must

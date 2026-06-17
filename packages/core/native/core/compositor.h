@@ -258,6 +258,18 @@ class Compositor {
         return v;
     }
 
+    // Pop the queued KMS flip-completes (one outputId per ScanoutFlipComplete
+    // since the last call). Empty in nested/headless modes; the addon dispatches
+    // per-output frame-callback work using this. Distinct from takeFrameComplete
+    // because callers need the SPECIFIC output that flipped to know which
+    // surfaces should receive wl_callback.done this tick. Coalescing by output
+    // (one entry per outputId per call) is the caller's responsibility.
+    std::vector<uint32_t> takeFlipCompletes() {
+        std::vector<uint32_t> out;
+        out.swap(flipCompletes_);
+        return out;
+    }
+
     // Release a JS dmabuf import: tells the GPU process to drop the imported STM +
     // dmabuf fd for this importId (generation-matched, so a recycled handle id is
     // not freed by mistake). Called when the JS compositor frees the buffer (its
@@ -550,6 +562,10 @@ class Compositor {
     bool kmsMode_ = false;
     bool kmsPaused_ = false;  // VT-switch disable_seat; cleared on enable_seat
     bool frameCompleteSeen_ = false;  // set in drainCtrl on ScanoutFlipComplete / FrameComplete
+    // KMS-only queue of outputIds whose ScanoutFlipComplete arrived since the
+    // last takeFlipCompletes(). Drained by the addon to dispatch per-output
+    // wl_callback.done. Nested/headless never push here.
+    std::vector<uint32_t> flipCompletes_;
     // Per-output scanout state, keyed by outputId. Each output owns a 3-slot ring
     // and the slot acquired by its in-flight frame. One entry today (the primary,
     // outputId 0); per-output rings populate this as each output's scanout is

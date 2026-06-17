@@ -147,6 +147,7 @@ struct Addon {
     napi_ref onFrame = nullptr;
     napi_ref onInput = nullptr;  // optional JS callback(event) for input events
     napi_ref onOutput = nullptr; // optional JS callback(descriptor) for OutputDescriptor msgs
+    napi_ref onFlipComplete = nullptr;  // optional JS callback(outputId) for KMS flip-completes
     uint64_t lastNotified = 0;
 
     // Host-side reader for the GPU process's log socket. Started after
@@ -205,6 +206,22 @@ void notifyFrame() {
     napi_close_handle_scope(env, scope);
 }
 
+// Call the JS onFlipComplete(outputId) callback if registered. Fired once per
+// drained ScanoutFlipComplete (one outputId at a time). JS uses this to
+// dispatch wl_callback.done for surfaces resident on that output. Same-thread.
+void notifyFlipComplete(uint32_t outputId) {
+    if (!g_addon.onFlipComplete) return;
+    napi_env env = g_addon.env;
+    napi_handle_scope scope;
+    napi_open_handle_scope(env, &scope);
+    napi_value cb, undefined, arg;
+    napi_get_reference_value(env, g_addon.onFlipComplete, &cb);
+    napi_get_undefined(env, &undefined);
+    napi_create_uint32(env, outputId, &arg);
+    napi_call_function(env, undefined, cb, 1, &arg, nullptr);
+    napi_close_handle_scope(env, scope);
+}
+
 // Declared here; defined below.
 void armWirePoll();
 
@@ -254,12 +271,12 @@ void runFrameIfReady() {
         armWirePoll();
         // Re-loop only while progress is being made: renderFrame presented at
         // least one output this pass AND something still wants a frame. A pass
-        // that presents nothing (every dirty output's ring busy, or no output
-        // dirty) stops here -- the pending work is serviced on the next wake or
-        // flip-complete, not by spinning. Headless presents nothing (presentOutput
-        // is a no-op with no swapchain/scanout), so its progress can't be measured
-        // by the present count; it loops on wantNext alone as before, paced by the
-        // ~60Hz headless frame timer.
+        // that presents nothing (every output's ring busy) stops here -- the
+        // pending work is serviced on the next wake or flip-complete, not by
+        // spinning. Headless presents nothing (presentOutput is a no-op with no
+        // swapchain/scanout), so its progress can't be measured by the present
+        // count; it loops on wantNext alone, paced by the ~60Hz headless frame
+        // timer.
         const bool headless = g_addon.compositor && g_addon.compositor->headless();
         if (!headless && presentedAfter <= presentedBefore) break;
     } while (g_addon.wantNext);
@@ -272,29 +289,46 @@ void runFrameIfReady() {
 // the pre-flip-driven 60Hz frame timer); headless is a test-only mode where
 // continuous frames are the expectation.
 void onHeadlessFrameTimer(uv_timer_t*) {
+    // Headless has no flip-complete events; synthesize one for the primary
+    // output so dispatchFrameCallbacksForOutput still fires per tick. Tests
+    // (which are the headless use case) depend on wl_callback.done arriving
+    // on the steady ~60Hz cadence.
+    if (g_addon.onFlipComplete) notifyFlipComplete(0);
     wake();
+}
+
+// Drain the queued KMS flip-completes and fire JS onFlipComplete(outputId) for
+// each. Frame-callback dispatch happens in JS per outputId, so a surface
+// resident only on output 0 (60Hz) wakes at ~60Hz even when output 1 (240Hz)
+// is also flipping. Nested pushes its FrameComplete as outputId=0; headless
+// synthesizes one in the frame-timer trampoline.
+void drainFlipCompletes() {
+    if (!g_addon.compositor) return;
+    auto outputs = g_addon.compositor->takeFlipCompletes();
+    for (uint32_t outputId : outputs) notifyFlipComplete(outputId);
 }
 
 void onFrameComplete() {
     if (!g_addon.compositor || !g_addon.loopRunning) return;
     // Drain pending wayland-server events first: a client commit may have
     // arrived between the last server-pump and now. Without this, the
-    // upcoming render's dispatchFrameCallbacks would miss the new
-    // wl_callback installed by that commit, deferring the client's `done`
-    // to the next render -- a full vsync of extra latency, halving the
-    // client's observable frame rate (one commit per two compositor
-    // renders instead of one per one).
+    // upcoming dispatchFrameCallbacks would miss the new wl_callback
+    // installed by that commit, deferring the client's `done` to the next
+    // render -- a full vsync of extra latency, halving the client's
+    // observable frame rate (one commit per two compositor renders instead
+    // of one per one).
     if (g_addon.server) {
         g_addon.server->drainEvents();
     }
-    // Steady-state KMS frame pacing: each flip-complete is a vsync edge AND
-    // means some output's scanout ring just freed a slot. A dirty output that
-    // was skipped earlier because its ring was busy can now be rendered, so
-    // force wantNext before re-evaluating -- otherwise, if wantNext had been
-    // cleared (the prior pass presented everything it could), the freed output
-    // would not be serviced until an unrelated wake. renderFrame still renders
-    // only the outputs that are actually dirty, so an idle scene with nothing
-    // dirty presents nothing and falls through to no draw.
+    // Per-output flip-complete dispatch (KMS). Each output's queued flip
+    // wakes its resident surfaces' frame-callbacks at that output's vblank,
+    // independent of other outputs' refresh rates.
+    drainFlipCompletes();
+    // Steady-state frame pacing: each flip-complete is a vsync edge AND means
+    // some output's scanout ring just freed a slot. An output that was skipped
+    // earlier because its ring was busy can now be rendered, so force wantNext
+    // before re-evaluating. Per-output composite-scissor damage keeps the
+    // per-pixel cost cheap when the output's content hasn't changed.
     g_addon.wantNext = true;
     runFrameIfReady();
 }
@@ -1620,6 +1654,10 @@ napi_value Stop(napi_env env, napi_callback_info) {
         napi_delete_reference(env, g_addon.onOutput);
         g_addon.onOutput = nullptr;
     }
+    if (g_addon.onFlipComplete) {
+        napi_delete_reference(env, g_addon.onFlipComplete);
+        g_addon.onFlipComplete = nullptr;
+    }
     // Release the xkb keymap singleton. Built on demand by ensureKeymap()
     // from either keymapInfo (client wl_keyboard bind) or keyUpdate (host
     // key-down); a subsequent start()/stop() cycle must see fresh state.
@@ -1798,6 +1836,25 @@ napi_value UpdateOutputSize(napi_env env, napi_callback_info info) {
     napi_get_value_uint32(env, argv[0], &w);
     napi_get_value_uint32(env, argv[1], &h);
     if (g_addon.input) g_addon.input->setOutputSize(w, h);
+    napi_value u; napi_get_undefined(env, &u); return u;
+}
+
+// setOnFlipComplete(cb) -> undefined
+// Register a JS callback fired once per drained KMS flip-complete. The callback
+// receives one outputId per call. JS dispatches wl_callback.done for surfaces
+// resident on that output here -- so a surface on a 60Hz output sees `done` at
+// 60Hz even when a 240Hz output is also flipping. Pass null/omit to clear.
+napi_value SetOnFlipComplete(napi_env env, napi_callback_info info) {
+    size_t argc = 1; napi_value argv[1];
+    napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+    if (g_addon.onFlipComplete) {
+        napi_delete_reference(env, g_addon.onFlipComplete);
+        g_addon.onFlipComplete = nullptr;
+    }
+    if (argc >= 1) {
+        napi_valuetype t; napi_typeof(env, argv[0], &t);
+        if (t == napi_function) napi_create_reference(env, argv[0], 1, &g_addon.onFlipComplete);
+    }
     napi_value u; napi_get_undefined(env, &u); return u;
 }
 
@@ -2314,6 +2371,7 @@ napi_value Init(napi_env env, napi_value exports) {
     reg("writeProducerEnd", WriteProducerEnd);
     reg("pluginReleaseSurfaceBuffer", PluginReleaseSurfaceBuffer);
     reg("setOnOutputDescriptor", SetOnOutputDescriptor);
+    reg("setOnFlipComplete", SetOnFlipComplete);
     reg("updateOutputSize", UpdateOutputSize);
     reg("logInit", LogInit);
     reg("nativeLog", NativeLog);
