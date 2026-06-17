@@ -493,6 +493,13 @@ ordering is a build sequence, not a scope boundary: the feature is complete only
 after **both** hotplug (M7) and multi-GPU (M8). Milestones 1-7 are intermediate
 states of one feature, not a shippable endpoint.
 
+**Status: M1-M4 built** (single-output byte-identical, full GPU + 1083 unit green;
+KMS multi-output build-verified, display-verify pending on 2-monitor-on-one-card
+hardware). M4 has two tracked hardening items (4h-a pacing, 4h-b damage; below).
+M5-M8 remain. A multi-GPU render-node robustness fix also landed en route (the GBM
+allocator + dmabuf clients now follow the chosen adapter's GPU, not a hardcoded
+`renderD128`).
+
 1. **IPC outputId plumbing (no behavior change).** Add `outputId` to the messages
    (Section 4), thread through compositor/addon/main.cpp, still drive one output.
    Tree behaves identically. Smallest foundational diff.
@@ -525,10 +532,23 @@ states of one feature, not a shippable endpoint.
    live-output registry into the compose/transitions SDKs (validation
    `== OUTPUT_DEFAULT` → `state.outputs.has(id)`) lands here or in M5 once a second
    output is renderable.
-4. **Per-output render + pacing.** Per-output scanout rings + distinct-CRTC
-   assignment + modeset (the machinery moved from M3), then `renderFrame` loops
-   outputs, per-output `wantNext`, per-output present (Sections 5-7). Second monitor
-   lights up. Highest risk; gets the most testing.
+4. **Per-output render + pacing. [BUILT — KMS display-verify pending]** Per-output
+   scanout rings + distinct-CRTC assignment + modeset, per-output bring-up
+   handshake + fence routing, and `renderFrame` loops outputs rendering each
+   output's slice of the global space (Sections 5-7). Second monitor lights up.
+   Single-output is byte-identical (full GPU + unit suite green); the KMS
+   multi-output path is build-verified, display-verify on single-card-two-monitor
+   hardware. **Two M4-hardening items shipped as the simpler interim, tracked to
+   land once basic M4 is hardware-confirmed (both are only meaningfully verifiable
+   on a real 2-monitor setup):**
+   - **(4h-a) Independent per-output pacing.** Shipped: render all outputs on each
+     frame trigger. Target (the §14-resolved decision): per-output `wantNext` +
+     per-output frame clock so an idle output is not repainted when only another
+     changes. Lives in the native frame loop (addon).
+   - **(4h-b) Per-output composite-damage bounds.** Shipped: a multi-output (or
+     non-origin) layout forces a full repaint per output (correct, not optimal),
+     because `OutputDamageRing` tracks a single global-bounds space. Target:
+     per-output damage bounds so partial-scissor repaint works for N outputs.
 5. **Per-output WM + layout + workspaces.** Per-output layout pass, global-space
    arrangement policy (Sections 8, 10-arrangement), and lift the workspace plugin's
    single-output caps so `outputId != 0` is meaningful (`positionsByOutput` /
