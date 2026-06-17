@@ -111,8 +111,11 @@ std::vector<ConnectorInfo> enumerateConnectors(int drmFd);
 
 // Pick a CRTC compatible with `connectorId` (walking the connector's encoders
 // and their possible_crtcs masks) that is not already bound to another
-// connector. Returns false if no CRTC is available.
-bool pickCrtc(int drmFd, uint32_t connectorId, uint32_t& outCrtcId);
+// connector and not in `excludeCrtcs` (CRTCs already claimed for other outputs
+// this session — the kernel's current binding doesn't reflect our own in-progress
+// multi-output assignment). Returns false if no CRTC is available.
+bool pickCrtc(int drmFd, uint32_t connectorId, uint32_t& outCrtcId,
+              const std::vector<uint32_t>& excludeCrtcs = {});
 
 // Pick the primary plane attached to (or attachable to) `crtcId`. Returns
 // false if no primary plane is found.

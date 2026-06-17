@@ -1,5 +1,6 @@
 #include "drm_utils.h"
 
+#include <algorithm>
 #include <cerrno>
 #include <cstdio>
 #include <cstring>
@@ -178,7 +179,8 @@ std::vector<ConnectorInfo> enumerateConnectors(int drmFd) {
     return out;
 }
 
-bool pickCrtc(int drmFd, uint32_t connectorId, uint32_t& outCrtcId) {
+bool pickCrtc(int drmFd, uint32_t connectorId, uint32_t& outCrtcId,
+              const std::vector<uint32_t>& excludeCrtcs) {
     drmModeRes* res = drmModeGetResources(drmFd);
     if (!res) return false;
     drmModeConnector* conn = drmModeGetConnector(drmFd, connectorId);
@@ -218,6 +220,8 @@ bool pickCrtc(int drmFd, uint32_t connectorId, uint32_t& outCrtcId) {
             if ((enc->possible_crtcs & mask) == 0) continue;
             const uint32_t crtcId = res->crtcs[c];
             if (crtcInUse(crtcId)) continue;
+            if (std::find(excludeCrtcs.begin(), excludeCrtcs.end(), crtcId)
+                != excludeCrtcs.end()) continue;  // already claimed this session
             outCrtcId = crtcId;
             ok = true;
         }
