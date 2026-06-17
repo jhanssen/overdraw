@@ -586,7 +586,7 @@ int run(int wireFd, int ctrlFd, int inputFd, bool headless,
         {
             ipc::Message m{};
             m.tag = ipc::Tag::OutputDescriptor;
-            m.outputId         = 0;  // the one output today; per-output when enumeration lands
+            m.outputId         = 0;  // primary: the output the scanout ring drives
             m.width            = info.width;
             m.height           = info.height;
             m.refreshMhz       = info.refreshMhz;
@@ -600,6 +600,30 @@ int run(int wireFd, int ctrlFd, int inputFd, bool headless,
             ipc::sendMessage(ctrlFd, m);
             std::printf("[gpu] sent OutputDescriptor (kms): %ux%u @%umHz\n",
                         info.width, info.height, info.refreshMhz);
+        }
+
+        // Report every other attached monitor (outputId 1..N). These are not
+        // scanned out yet (no CRTC/ring); they appear in the core's
+        // state.outputs so the rest of the system learns the real topology.
+        for (size_t i = 0; i < kms->extraOutputCount(); ++i) {
+            gpu::OutputDescriptorInfo extra{};
+            kms->describeExtraOutput(i, extra);
+            ipc::Message m{};
+            m.tag = ipc::Tag::OutputDescriptor;
+            m.outputId         = static_cast<uint32_t>(1 + i);
+            m.width            = extra.width;
+            m.height           = extra.height;
+            m.refreshMhz       = extra.refreshMhz;
+            m.outScale         = extra.scale;
+            m.outTransform     = extra.transform;
+            m.physicalWidthMm  = extra.physicalWidthMm;
+            m.physicalHeightMm = extra.physicalHeightMm;
+            std::memcpy(m.outputName,  extra.name,  sizeof(m.outputName));
+            std::memcpy(m.outputMake,  extra.make,  sizeof(m.outputMake));
+            std::memcpy(m.outputModel, extra.model, sizeof(m.outputModel));
+            ipc::sendMessage(ctrlFd, m);
+            std::printf("[gpu] sent OutputDescriptor (kms output %zu): %ux%u @%umHz name=%s\n",
+                        1 + i, extra.width, extra.height, extra.refreshMhz, extra.name);
         }
 
         // Step 2: build the scanout ring on the core device.

@@ -65,6 +65,14 @@ class KmsOutputBackend : public OutputBackend {
     OutputSize size() const override { return { topo_.mode.hdisplay, topo_.mode.vdisplay }; }
     void describeOutput(OutputDescriptorInfo& out) const override;
 
+    // Connected monitors beyond the primary (the one the scanout ring drives).
+    // open() enumerates all connected connectors and records the non-primary
+    // ones here; main.cpp sends an OutputDescriptor for each so every attached
+    // monitor appears in the core's state.outputs. These are not yet assigned a
+    // CRTC or scanned out -- per-output rings + modeset are a later step.
+    size_t extraOutputCount() const { return extraConnectors_.size(); }
+    void describeExtraOutput(size_t i, OutputDescriptorInfo& out) const;
+
     // Dawn WSI is not used on KMS. Return null; the GPU process main loop
     // branches on a null surface to skip WSI bring-up.
     wgpu::Surface createWgpuSurface(wgpu::Instance& /*instance*/) override {
@@ -127,6 +135,12 @@ class KmsOutputBackend : public OutputBackend {
                                     unsigned int /*tv_sec*/, unsigned int /*tv_usec*/,
                                     unsigned int /*crtc_id*/, void* userdata);
 
+    // Fill the make/model/name + physical-dims identity fields from the
+    // connector's EDID (best-effort). Shared by describeOutput (primary) and
+    // describeExtraOutput. The caller fills width/height/refresh/scale/transform.
+    void fillIdentity(uint32_t connectorId, const std::string& name,
+                      OutputDescriptorInfo& out) const;
+
     int drmFd_ = -1;   // borrowed; not closed
     gbm_device* gbm_ = nullptr;
     uint64_t deviceId_ = 0;
@@ -137,6 +151,7 @@ class KmsOutputBackend : public OutputBackend {
     bool shouldClose_ = false;
     int pendingFlipSlot_ = -1;  // -1 = no flip in flight
     bool paused_ = false;
+    std::vector<ConnectorInfo> extraConnectors_;  // connected monitors beyond the primary
     ResizeListener resizeListener_;
     FlipCompleteCb flipCompleteListener_;
 };

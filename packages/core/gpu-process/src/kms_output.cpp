@@ -83,6 +83,18 @@ bool KmsOutputBackend::open(const char* /*title*/) {
         return false;
     }
 
+    // Record every other connected monitor so the core learns about all
+    // attached outputs (the primary above is the one we scan out). Driving
+    // these (CRTC + modeset + ring) is a later step; for now they are reported
+    // only.
+    for (auto& c : enumerateConnectors(drmFd_)) {
+        if (c.connectorId == topo_.connectorId) continue;
+        std::printf("[kms] additional connector %s id=%u mode=%ux%u @%umHz\n",
+                    c.name.c_str(), c.connectorId,
+                    c.mode.hdisplay, c.mode.vdisplay, c.mode.vrefreshMhz);
+        extraConnectors_.push_back(std::move(c));
+    }
+
     // Steps 9-13 (scanout ring + initial modeset) happen in initScanout(),
     // which needs the GPU device.
     return true;
@@ -114,31 +126,44 @@ bool KmsOutputBackend::initScanout(const wgpu::Device& device) {
     return true;
 }
 
+void KmsOutputBackend::fillIdentity(uint32_t connectorId, const std::string& name,
+                                    OutputDescriptorInfo& out) const {
+    EdidInfo edid;
+    if (drmFd_ >= 0 && connectorId && readEdid(drmFd_, connectorId, edid)) {
+        out.physicalWidthMm  = edid.physicalWidthMm;
+        out.physicalHeightMm = edid.physicalHeightMm;
+        // Connector name: e.g. "eDP-1". Real, drm-known identity.
+        std::strncpy(out.name, name.c_str(), sizeof(out.name) - 1);
+        // Make = "overdraw" (we don't expose the host manufacturer; same as
+        // nested-mode policy).
+        std::strncpy(out.make, "overdraw", sizeof(out.make) - 1);
+        // Model: EDID product name if available, else the connector name.
+        const std::string& model = !edid.productName.empty() ? edid.productName : name;
+        std::strncpy(out.model, model.c_str(), sizeof(out.model) - 1);
+    } else {
+        std::strncpy(out.name, name.c_str(), sizeof(out.name) - 1);
+        std::strncpy(out.make, "overdraw", sizeof(out.make) - 1);
+        std::strncpy(out.model, name.c_str(), sizeof(out.model) - 1);
+    }
+}
+
 void KmsOutputBackend::describeOutput(OutputDescriptorInfo& out) const {
     out.width            = topo_.mode.hdisplay;
     out.height           = topo_.mode.vdisplay;
     out.refreshMhz       = topo_.mode.vrefreshMhz;
     out.scale            = 1;
     out.transform        = 0;
+    fillIdentity(topo_.connectorId, topo_.connectorName, out);
+}
 
-    EdidInfo edid;
-    if (drmFd_ >= 0 && topo_.connectorId &&
-        readEdid(drmFd_, topo_.connectorId, edid)) {
-        out.physicalWidthMm  = edid.physicalWidthMm;
-        out.physicalHeightMm = edid.physicalHeightMm;
-        // Connector name: e.g. "eDP-1". Real, drm-known identity.
-        std::strncpy(out.name, topo_.connectorName.c_str(), sizeof(out.name) - 1);
-        // Make = "overdraw" (we don't expose the host manufacturer; same as
-        // nested-mode policy).
-        std::strncpy(out.make, "overdraw", sizeof(out.make) - 1);
-        // Model: EDID product name if available, else the connector name.
-        const std::string& model = !edid.productName.empty() ? edid.productName : topo_.connectorName;
-        std::strncpy(out.model, model.c_str(), sizeof(out.model) - 1);
-    } else {
-        std::strncpy(out.name, topo_.connectorName.c_str(), sizeof(out.name) - 1);
-        std::strncpy(out.make, "overdraw", sizeof(out.make) - 1);
-        std::strncpy(out.model, topo_.connectorName.c_str(), sizeof(out.model) - 1);
-    }
+void KmsOutputBackend::describeExtraOutput(size_t i, OutputDescriptorInfo& out) const {
+    const ConnectorInfo& c = extraConnectors_[i];
+    out.width            = c.mode.hdisplay;
+    out.height           = c.mode.vdisplay;
+    out.refreshMhz       = c.mode.vrefreshMhz;
+    out.scale            = 1;
+    out.transform        = 0;
+    fillIdentity(c.connectorId, c.name, out);
 }
 
 wgpu::Texture KmsOutputBackend::acquireScanout(int& outSlotIdx) {

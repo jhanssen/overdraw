@@ -49,6 +49,8 @@ import { JsCompositor } from "./gpu/compositor.js";
 import type { DawnWire, DawnGlobals } from "./gpu/compositor.js";
 import type { Addon, InputEvent } from "./types.js";
 import type { CompositorSink, CompositorState } from "./protocols/ctx.js";
+import { OUTPUT_DEFAULT } from "./protocols/ctx.js";
+import { nextOutputPosition } from "./output/arrangement.js";
 import { reemitWlOutput } from "./protocols/wl_output.js";
 import { reemitXdgOutput } from "./protocols/zxdg_output_manager_v1.js";
 import { reemitFractionalScale } from "./protocols/wp_fractional_scale_manager_v1.js";
@@ -293,8 +295,14 @@ state = await installProtocols(addon, {
 // setOnOutputDescriptor) and sets up state.outputs before any clients have
 // bound wl_output, so the re-emit on that first call is a no-op.
 addon.setOnOutputDescriptor((d) => {
-  const rec = state.outputs?.get(d.outputId);
-  if (!rec) return;
+  const outputs = state.outputs;
+  if (!outputs) return;
+  // The compositor renders a single output target today; only the primary
+  // (OUTPUT_DEFAULT) drives the render/WM/input globals. Non-primary monitors
+  // are recorded in state.outputs (so the topology is known) but not yet laid
+  // out or scanned out.
+  const isPrimary = d.outputId === OUTPUT_DEFAULT;
+
   // The descriptor reports device pixels (the scanout mode). Scale is core
   // policy: an explicit config value wins, else the EDID-DPI auto fallback
   // (KMS only -- a nested host window's physical dims describe the host
@@ -307,37 +315,68 @@ addon.setOnOutputDescriptor((d) => {
     allowEdidAuto: backendOpts.backend === "kms",
   });
   const logical = logicalSize(device.width, device.height, scale);
-  const sizeChanged = rec.logicalSize.width !== logical.width
-    || rec.logicalSize.height !== logical.height;
-  rec.deviceSize = device;
-  rec.logicalSize = logical;
-  rec.scale = scale;
-  rec.refreshMhz = d.refreshMhz;
-  rec.transform = d.transform;
-  rec.physicalWidthMm = d.physicalWidthMm;
-  rec.physicalHeightMm = d.physicalHeightMm;
-  rec.name = d.name;
-  rec.make = d.make;
-  rec.model = d.model;
-  // description stays as set by installProtocols's seed; the descriptor
-  // doesn't carry one (xdg-output's description is overdraw-owned policy).
 
-  log.info("core",
-    `output: ${device.width}x${device.height} device, ${logical.width}x${logical.height} `
-    + `logical @${d.refreshMhz}mHz scale=${scale} xform=${d.transform} `
-    + `phys=${d.physicalWidthMm}x${d.physicalHeightMm}mm name=${d.name}`);
+  let rec = outputs.get(d.outputId);
+  let sizeChanged = false;
+  if (!rec) {
+    // A monitor beyond the primary. Place it with the deterministic fallback
+    // (right of the current rightmost output) until user-declared arrangement
+    // lands (see multi-output-design §10).
+    const pos = nextOutputPosition(outputs.values());
+    rec = {
+      id: d.outputId,
+      logicalPosition: pos,
+      logicalSize: logical,
+      deviceSize: device,
+      scale,
+      name: d.name,
+      description: d.model || d.name,
+      refreshMhz: d.refreshMhz,
+      transform: d.transform,
+      physicalWidthMm: d.physicalWidthMm,
+      physicalHeightMm: d.physicalHeightMm,
+      make: d.make,
+      model: d.model,
+    };
+    outputs.set(d.outputId, rec);
+    log.info("core",
+      `output ${d.outputId} added at (${pos.x},${pos.y}): ${device.width}x${device.height} `
+      + `device, ${logical.width}x${logical.height} logical name=${d.name}`);
+  } else {
+    sizeChanged = rec.logicalSize.width !== logical.width
+      || rec.logicalSize.height !== logical.height;
+    rec.deviceSize = device;
+    rec.logicalSize = logical;
+    rec.scale = scale;
+    rec.refreshMhz = d.refreshMhz;
+    rec.transform = d.transform;
+    rec.physicalWidthMm = d.physicalWidthMm;
+    rec.physicalHeightMm = d.physicalHeightMm;
+    rec.name = d.name;
+    rec.make = d.make;
+    rec.model = d.model;
+    // description stays as set by installProtocols's seed; the descriptor
+    // doesn't carry one (xdg-output's description is overdraw-owned policy).
+    log.info("core",
+      `output ${d.outputId}: ${device.width}x${device.height} device, `
+      + `${logical.width}x${logical.height} logical @${d.refreshMhz}mHz scale=${scale} `
+      + `xform=${d.transform} phys=${d.physicalWidthMm}x${d.physicalHeightMm}mm name=${d.name}`);
+  }
 
-  // Internal reconfigurations, in dependency order. The compositor renders at
-  // device resolution; the WM and input work in logical coordinates.
-  if (compositor instanceof JsCompositor) {
-    compositor.setOutputSize(device.width, device.height, scale);
+  // Internal reconfigurations, in dependency order, for the primary only --
+  // the compositor renders at device resolution and the WM/input work in
+  // logical coordinates against the single render target.
+  if (isPrimary) {
+    if (compositor instanceof JsCompositor) {
+      compositor.setOutputSize(device.width, device.height, scale);
+    }
+    addon.updateOutputSize(logical.width, logical.height);
+    if (state.wm) {
+      state.wm.state.output.width = logical.width;
+      state.wm.state.output.height = logical.height;
+    }
+    if (sizeChanged) state.relayout?.("output-resized");
   }
-  addon.updateOutputSize(logical.width, logical.height);
-  if (state.wm) {
-    state.wm.state.output.width = logical.width;
-    state.wm.state.output.height = logical.height;
-  }
-  if (sizeChanged) state.relayout?.("output-resized");
 
   // External: tell clients (via the re-emit subscribers wired below).
   pluginBus.emit("output.changed", {

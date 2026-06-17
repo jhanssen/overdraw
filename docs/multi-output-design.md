@@ -431,16 +431,26 @@ not a shippable "multi-output without hotplug."
    into those SDKs as a dependency (it is not today) — done in M3/M5 when >1 output
    first exists. Relaxing to "accept any id" now would route to a nonexistent
    output and silently fail, so it is deliberately deferred, not done half-way.
-3. **Native N-connector enumeration.** `KmsOutputBackend` enumerates all
-   connectors, assigns distinct CRTCs, builds N rings, sends N descriptors, N
-   reserve/ready handshakes, routes flips per CRTC (Sections 5-6). Core now has N
-   `state.outputs` entries but JS still renders only output 0 → second monitor
-   stays dark (acceptable *interim*, flagged). Includes plumbing the live-output
-   registry into the compose/transitions SDKs and switching their validation from
-   `== OUTPUT_DEFAULT` to `state.outputs.has(id)`.
-4. **Per-output render + pacing.** `renderFrame` loops outputs, per-output
-   `wantNext`, per-output present (Section 7). Second monitor lights up. Highest
-   risk; gets the most testing.
+3. **Native connector enumeration + N output descriptors.** `KmsOutputBackend`
+   enumerates all connected connectors (`enumerateConnectors`); the GPU process
+   sends an `OutputDescriptor` per connector (primary = outputId 0, the
+   scanout-driven one; extras = 1..N). The core's `onOutputDescriptor` creates a
+   `state.outputs` record on first sight of a new id (deterministic right-of
+   placement via `output/arrangement.ts` until real arrangement lands) and applies
+   the render/WM/input globals only for the primary. **Result: core knows the full
+   topology; extra monitors are detected and reported but not yet lit.** The ring /
+   CRTC-assignment / modeset / per-CRTC flip-routing machinery deliberately moves to
+   M4 (below) — building idle scanout rings for monitors nothing renders to is
+   wasteful and would mean refactoring the working single-output scanout path with
+   no way to render the result. KMS-only parts verified manually (Section 12); the
+   JS record-creation + arrangement fallback are unit-tested. Plumbing the
+   live-output registry into the compose/transitions SDKs (validation
+   `== OUTPUT_DEFAULT` → `state.outputs.has(id)`) lands here or in M5 once a second
+   output is renderable.
+4. **Per-output render + pacing.** Per-output scanout rings + distinct-CRTC
+   assignment + modeset (the machinery moved from M3), then `renderFrame` loops
+   outputs, per-output `wantNext`, per-output present (Sections 5-7). Second monitor
+   lights up. Highest risk; gets the most testing.
 5. **Per-output WM + layout + workspaces.** Per-output layout pass, global-space
    arrangement policy (Sections 8, 10-arrangement), and lift the workspace plugin's
    single-output caps so `outputId != 0` is meaningful (`positionsByOutput` /

@@ -94,6 +94,21 @@ bool pickConnector(int drmFd, const std::string& preferConnectorName,
                    uint32_t& outConnectorId, std::string& outConnectorName,
                    DrmMode& outMode);
 
+// One connected connector with a usable mode list, for multi-output
+// enumeration. Mode is the preferred one (else mode 0), same policy as
+// pickConnector.
+struct ConnectorInfo {
+    uint32_t connectorId = 0;
+    std::string name;     // e.g. "DP-1"
+    DrmMode mode{};
+};
+
+// Enumerate ALL connected connectors with a non-empty mode list, in DRM
+// resource order. The first entry is what pickConnector(.., "") would have
+// returned. Used to report every attached monitor to the core; driving more
+// than the first (CRTC assignment + modeset + scanout) is a later step.
+std::vector<ConnectorInfo> enumerateConnectors(int drmFd);
+
 // Pick a CRTC compatible with `connectorId` (walking the connector's encoders
 // and their possible_crtcs masks) that is not already bound to another
 // connector. Returns false if no CRTC is available.

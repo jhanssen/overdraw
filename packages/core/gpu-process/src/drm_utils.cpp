@@ -145,6 +145,39 @@ bool pickConnector(int drmFd, const std::string& preferConnectorName,
     return false;
 }
 
+std::vector<ConnectorInfo> enumerateConnectors(int drmFd) {
+    std::vector<ConnectorInfo> out;
+    drmModeRes* res = drmModeGetResources(drmFd);
+    if (!res) return out;
+    for (int i = 0; i < res->count_connectors; ++i) {
+        drmModeConnector* c = drmModeGetConnector(drmFd, res->connectors[i]);
+        if (!c) continue;
+        if (c->connection == DRM_MODE_CONNECTED && c->count_modes > 0) {
+            ConnectorInfo info;
+            info.connectorId = res->connectors[i];
+            char name[64];
+            std::snprintf(name, sizeof(name), "%s-%u",
+                          connectorTypeName(c->connector_type),
+                          c->connector_type_id);
+            info.name = name;
+            int chosen = 0;
+            for (int m = 0; m < c->count_modes; ++m) {
+                if (c->modes[m].type & DRM_MODE_TYPE_PREFERRED) { chosen = m; break; }
+            }
+            const drmModeModeInfo& m = c->modes[chosen];
+            info.mode.hdisplay    = m.hdisplay;
+            info.mode.vdisplay    = m.vdisplay;
+            info.mode.vrefreshMhz = modeRefreshMhz(m);
+            info.mode.preferred   = (m.type & DRM_MODE_TYPE_PREFERRED) != 0;
+            info.mode.raw         = m;
+            out.push_back(std::move(info));
+        }
+        drmModeFreeConnector(c);
+    }
+    drmModeFreeResources(res);
+    return out;
+}
+
 bool pickCrtc(int drmFd, uint32_t connectorId, uint32_t& outCrtcId) {
     drmModeRes* res = drmModeGetResources(drmFd);
     if (!res) return false;
