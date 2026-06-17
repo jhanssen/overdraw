@@ -225,8 +225,11 @@ class Compositor {
     // KMS state machine -- exposed for testing / introspection only. Production
     // paths use acquireOutputTextureHandle / presentOutput.
     enum class ScanoutSlotState : uint8_t { FREE, PENDING_FLIP, SCANOUT };
-    ScanoutSlotState scanoutSlotState(int idx) const {
-        return idx >= 0 && idx < 3 ? scanoutSlots_[idx].state : ScanoutSlotState::SCANOUT;
+    ScanoutSlotState scanoutSlotState(uint32_t outputId, int idx) const {
+        auto it = scanoutOutputs_.find(outputId);
+        if (it == scanoutOutputs_.end() || idx < 0 || idx >= 3)
+            return ScanoutSlotState::SCANOUT;
+        return it->second.slots[idx].state;
     }
     // True iff at least one slot is PENDING_FLIP (an atomic commit is queued
     // with the kernel, awaiting page-flip). The frame trigger uses this to
@@ -236,8 +239,11 @@ class Compositor {
     // exposed; it relies on inFrame + the host frame callback).
     bool flipPending() const {
         if (!kmsMode_) return false;
-        for (int i = 0; i < 3; ++i)
-            if (scanoutSlots_[i].state == ScanoutSlotState::PENDING_FLIP) return true;
+        for (const auto& [id, o] : scanoutOutputs_) {
+            (void)id;
+            for (int i = 0; i < 3; ++i)
+                if (o.slots[i].state == ScanoutSlotState::PENDING_FLIP) return true;
+        }
         return false;
     }
 
@@ -402,13 +408,15 @@ class Compositor {
     // has a compositing pass -- it provides WSI (surface/acquire/present), dmabuf
     // import, and the wire link.
     //
-    // Acquire the host swapchain's current texture (nested only). Holds a ref
-    // until presentOutput(); returns the wire texture handle (or null headless /
-    // no surface). JS wraps it (dawn.node wrapTexture) as the render target.
-    WGPUTexture acquireOutputTextureHandle();
-    // Present the previously-acquired output texture (Present over the wire) and
-    // drop the held ref. No-op headless.
-    void presentOutput();
+    // Acquire the render target for `outputId`. In KMS mode returns the next FREE
+    // scanout slot's texture for that output (or null if all busy / paused). In
+    // nested mode returns the host swapchain's current texture (the outputId is
+    // the single output). Holds a ref until presentOutput(); JS wraps it
+    // (dawn.node wrapTexture) as the render target.
+    WGPUTexture acquireOutputTextureHandle(uint32_t outputId);
+    // Present the previously-acquired target for `outputId` and drop the held ref.
+    // No-op headless.
+    void presentOutput(uint32_t outputId);
     // The swapchain's texture format (the JS pipeline's color-target format must
     // match). Valid after bringUp().
     wgpu::TextureFormat outputFormat() const { return renderFormat_; }
@@ -542,8 +550,15 @@ class Compositor {
     bool kmsMode_ = false;
     bool kmsPaused_ = false;  // VT-switch disable_seat; cleared on enable_seat
     bool frameCompleteSeen_ = false;  // set in drainCtrl on ScanoutFlipComplete / FrameComplete
-    ScanoutSlot scanoutSlots_[3] = {};
-    int currentSlot_ = -1;            // slot acquired by the current frame; -1 if none
+    // Per-output scanout state, keyed by outputId. Each output owns a 3-slot ring
+    // and the slot acquired by its in-flight frame. One entry today (the primary,
+    // outputId 0); per-output rings populate this as each output's scanout is
+    // reserved.
+    struct ScanoutOutput {
+        ScanoutSlot slots[3] = {};
+        int currentSlot = -1;  // slot acquired by the current frame; -1 if none
+    };
+    std::unordered_map<uint32_t, ScanoutOutput> scanoutOutputs_;
     int pendingScanoutFenceFd_ = -1;  // attached to next presentOutput, then closed
     uint32_t nextJsImportId_ = 1;
     // importId -> the injected texture's wire handle {id,generation}, kept so a

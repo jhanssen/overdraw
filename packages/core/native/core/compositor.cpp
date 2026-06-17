@@ -274,18 +274,19 @@ bool Compositor::bringUp() {
         td.usage = WGPUTextureUsage_RenderAttachment | WGPUTextureUsage_TextureBinding;
         ipc::Message rsMsg{};
         rsMsg.tag = ipc::Tag::ScanoutReserve;
-        rsMsg.outputId = 0;  // the one output today; per-output when enumeration lands
+        rsMsg.outputId = 0;  // primary; per-output rings reserve the rest in M4
         rsMsg.width = windowWidth_;
         rsMsg.height = windowHeight_;
+        ScanoutOutput& so = scanoutOutputs_[rsMsg.outputId];
         for (int i = 0; i < 3; ++i) {
             auto r = link_->client().ReserveTexture(device_.Get(), &td);
-            scanoutSlots_[i].handleId  = r.handle.id;
-            scanoutSlots_[i].handleGen = r.handle.generation;
-            scanoutSlots_[i].state     = ScanoutSlotState::FREE;
-            scanoutSlots_[i].tex       = r.texture;  // wire-side handle, valid pre-inject
-            scanoutSlots_[i].surfaceBufId = nextSurfaceBufId_++;
+            so.slots[i].handleId  = r.handle.id;
+            so.slots[i].handleGen = r.handle.generation;
+            so.slots[i].state     = ScanoutSlotState::FREE;
+            so.slots[i].tex       = r.texture;  // wire-side handle, valid pre-inject
+            so.slots[i].surfaceBufId = nextSurfaceBufId_++;
             rsMsg.scanoutHandles[i]    = { r.handle.id, r.handle.generation };
-            rsMsg.scanoutBufIds[i]     = scanoutSlots_[i].surfaceBufId;
+            rsMsg.scanoutBufIds[i]     = so.slots[i].surfaceBufId;
         }
         // Flush the reserves into the wire before sending ScanoutReserve so the
         // GPU process's wire reader has consumed any reservation-related bytes
@@ -496,18 +497,20 @@ void Compositor::drainCtrl() {
     ipc::Message r{};
     while (ipc::recvMessageNB(ctrlFd_, r)) {
         if (r.tag == ipc::Tag::ScanoutFlipComplete) {
-            // The GPU process flipped to slot `surfaceBufId`. Advance the
-            // local state machine: that slot is now SCANOUT, the prior
-            // SCANOUT slot becomes FREE.
+            // The GPU process flipped output `outputId` to slot `surfaceBufId`
+            // (the slot index). Advance that output's local state machine: that
+            // slot is now SCANOUT, the prior SCANOUT slot becomes FREE.
             const int flipped = static_cast<int>(r.surfaceBufId);
-            if (flipped >= 0 && flipped < 3) {
+            auto it = scanoutOutputs_.find(r.outputId);
+            if (it != scanoutOutputs_.end() && flipped >= 0 && flipped < 3) {
+                ScanoutSlot* slots = it->second.slots;
                 for (int i = 0; i < 3; ++i) {
                     if (i == flipped) continue;
-                    if (scanoutSlots_[i].state == ScanoutSlotState::SCANOUT) {
-                        scanoutSlots_[i].state = ScanoutSlotState::FREE;
+                    if (slots[i].state == ScanoutSlotState::SCANOUT) {
+                        slots[i].state = ScanoutSlotState::FREE;
                     }
                 }
-                scanoutSlots_[flipped].state = ScanoutSlotState::SCANOUT;
+                slots[flipped].state = ScanoutSlotState::SCANOUT;
             }
             frameCompleteSeen_ = true;
             continue;
@@ -817,10 +820,13 @@ int Compositor::pluginInstanceInjected(uint32_t connId) const {
     return it == pluginInstanceInjected_.end() ? 0 : it->second;
 }
 
-WGPUTexture Compositor::acquireOutputTextureHandle() {
+WGPUTexture Compositor::acquireOutputTextureHandle(uint32_t outputId) {
     if (headless_) return nullptr;
     if (kmsMode_) {
         if (kmsPaused_) return nullptr;  // VT-switched away; skip the frame.
+        auto it = scanoutOutputs_.find(outputId);
+        if (it == scanoutOutputs_.end()) return nullptr;  // no ring for this output
+        ScanoutOutput& so = it->second;
         // Pick the next FREE slot. Returns nullptr (frame skipped) if all
         // three are PENDING_FLIP/SCANOUT -- the JS compositor's render path
         // already handles a null acquire. The texture handle was returned
@@ -835,10 +841,10 @@ WGPUTexture Compositor::acquireOutputTextureHandle() {
         // queue submit that uses the scanout texture with "used in a submit
         // without current access to SharedTextureMemory".
         for (int i = 0; i < 3; ++i) {
-            if (scanoutSlots_[i].state != ScanoutSlotState::FREE) continue;
-            currentSlot_ = i;
-            writeProducerBeginAccess(scanoutSlots_[i].surfaceBufId);
-            return scanoutSlots_[i].tex;
+            if (so.slots[i].state != ScanoutSlotState::FREE) continue;
+            so.currentSlot = i;
+            writeProducerBeginAccess(so.slots[i].surfaceBufId);
+            return so.slots[i].tex;
         }
         return nullptr;  // all slots busy
     }
@@ -850,13 +856,16 @@ WGPUTexture Compositor::acquireOutputTextureHandle() {
     return st.texture.Get();
 }
 
-void Compositor::presentOutput() {
+void Compositor::presentOutput(uint32_t outputId) {
     if (headless_) return;
     if (kmsMode_) {
-        if (currentSlot_ < 0) return;  // no slot was acquired this frame
-        const int slot = currentSlot_;
-        currentSlot_ = -1;
-        scanoutSlots_[slot].state = ScanoutSlotState::PENDING_FLIP;
+        auto it = scanoutOutputs_.find(outputId);
+        if (it == scanoutOutputs_.end()) return;
+        ScanoutOutput& so = it->second;
+        if (so.currentSlot < 0) return;  // no slot was acquired this frame
+        const int slot = so.currentSlot;
+        so.currentSlot = -1;
+        so.slots[slot].state = ScanoutSlotState::PENDING_FLIP;
 
         // Close the producer access bracket on this slot's STM. The
         // EndAccess writes are in-band on the wire (kind=2), FIFO-ordered
@@ -869,12 +878,12 @@ void Compositor::presentOutput() {
         // the atomic commit. So the core does NOT need to ship a fence fd
         // through the ScanoutPresent SCM_RIGHTS path -- it's already in the
         // GPU process's hands by then.
-        writeProducerEndAccess(scanoutSlots_[slot].surfaceBufId);
+        writeProducerEndAccess(so.slots[slot].surfaceBufId);
 
         ipc::Message m{};
         m.tag = ipc::Tag::ScanoutPresent;
-        m.outputId = 0;  // the one output today; per-output when enumeration lands
-        m.surfaceBufId = scanoutSlots_[slot].surfaceBufId;
+        m.outputId = outputId;
+        m.surfaceBufId = so.slots[slot].surfaceBufId;
         ipc::sendMessage(ctrlFd_, m);
         presented_++;
         link_->flush();
@@ -898,10 +907,13 @@ void Compositor::pauseOutput() {
     if (!kmsMode_) return;
     if (kmsPaused_) return;
     kmsPaused_ = true;
-    // Local slot state: any in-flight present is gone. Reset to FREE so the
-    // post-resume acquire starts cleanly.
-    for (int i = 0; i < 3; ++i) scanoutSlots_[i].state = ScanoutSlotState::FREE;
-    currentSlot_ = -1;
+    // Local slot state: any in-flight present is gone. Reset every output's slots
+    // to FREE so the post-resume acquire starts cleanly.
+    for (auto& [id, o] : scanoutOutputs_) {
+        (void)id;
+        for (int i = 0; i < 3; ++i) o.slots[i].state = ScanoutSlotState::FREE;
+        o.currentSlot = -1;
+    }
     if (pendingScanoutFenceFd_ >= 0) {
         ::close(pendingScanoutFenceFd_);
         pendingScanoutFenceFd_ = -1;

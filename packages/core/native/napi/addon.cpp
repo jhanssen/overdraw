@@ -1376,20 +1376,31 @@ napi_value CreateTextureFromDmabuf(napi_env env, napi_callback_info info) {
 // setExternalCompositor(bool) -> undefined. When true, the C++ Compositor stops
 // rendering/presenting (the JS compositor drives the frame via acquireOutputTexture
 // + presentOutput).
-// acquireOutputTexture() -> bigint | null. The host swapchain's current texture
-// handle (nested), for the JS compositor to wrap + render into this frame.
-napi_value AcquireOutputTexture(napi_env env, napi_callback_info) {
+// acquireOutputTexture(outputId) -> bigint | null. The render target for the given
+// output (KMS: that output's next free scanout slot; nested: the host swapchain),
+// for the JS compositor to wrap + render into this frame. outputId defaults to 0.
+napi_value AcquireOutputTexture(napi_env env, napi_callback_info info) {
     if (!g_addon.compositor) return nullptr;
-    WGPUTexture t = g_addon.compositor->acquireOutputTextureHandle();
+    size_t argc = 1; napi_value argv[1];
+    napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+    uint32_t outputId = 0;
+    if (argc >= 1) napi_get_value_uint32(env, argv[0], &outputId);
+    WGPUTexture t = g_addon.compositor->acquireOutputTextureHandle(outputId);
     if (!t) return nullptr;
     napi_value out;
     napi_create_bigint_uint64(env, reinterpret_cast<uint64_t>(t), &out);
     return out;
 }
 
-// presentOutput() -> undefined. Present the acquired output texture.
-napi_value PresentOutput(napi_env env, napi_callback_info) {
-    if (g_addon.compositor) g_addon.compositor->presentOutput();
+// presentOutput(outputId) -> undefined. Present the acquired target for the given
+// output. outputId defaults to 0.
+napi_value PresentOutput(napi_env env, napi_callback_info info) {
+    if (!g_addon.compositor) return nullptr;
+    size_t argc = 1; napi_value argv[1];
+    napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+    uint32_t outputId = 0;
+    if (argc >= 1) napi_get_value_uint32(env, argv[0], &outputId);
+    g_addon.compositor->presentOutput(outputId);
     return nullptr;
 }
 

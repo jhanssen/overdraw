@@ -350,10 +350,11 @@ export interface CompositorAddon {
   // target is a wire-wrapped dmabuf with a producerSurfaceBufId.
   writeProducerBegin(surfaceBufId: number): void;
   writeProducerEnd(surfaceBufId: number): void;
-  // Nested present (slice 3): acquire the host swapchain's current texture handle
-  // (null if none this frame) and present it after rendering.
-  acquireOutputTexture(): bigint | null;
-  presentOutput(): void;
+  // Acquire the render target handle for the given output (null if none this
+  // frame) and present it after rendering. outputId selects the output (KMS
+  // scanout ring; nested has the single output 0).
+  acquireOutputTexture(outputId: number): bigint | null;
+  presentOutput(outputId: number): void;
   // Schedule a frame. Drives the wake/render state machine (see addon's
   // wake()). Idempotent; cheap when called repeatedly with no work pending.
   wake(): void;
@@ -1863,7 +1864,7 @@ export class JsCompositor implements CompositorSink {
     let frameOpen = false;
     let damageKey = JsCompositor.HEADLESS_DAMAGE_KEY;
     if (this.nested) {
-      const handle = this.addon.acquireOutputTexture();
+      const handle = this.addon.acquireOutputTexture(OUTPUT_DEFAULT);
       // The native addon returns nullptr from N-API on "no slot available"
       // (no FREE scanout in KMS mode; no swapchain texture in nested mode);
       // that arrives in JS as undefined, not null. Treat both as "skip frame."
@@ -2010,7 +2011,7 @@ export class JsCompositor implements CompositorSink {
       }
 
       if (presenting) {
-        this.addon.presentOutput();
+        this.addon.presentOutput(OUTPUT_DEFAULT);
         this.outputTex = null;
       }
     } catch (e) {
