@@ -1909,7 +1909,7 @@ int run(int wireFd, int ctrlFd, int inputFd, bool headless,
     // from output->pump()). We send the retired slot index to the core so
     // it advances its scanout state machine.
     if (kms) {
-        kms->setFlipCompleteListener([&](int retiredSlotIdx) {
+        kms->setFlipCompleteListener([&](uint32_t outputId, int retiredSlotIdx) {
             // The flip-complete handler receives the slot index that JUST
             // became SCANOUT; the retiredSlotIdx parameter is the slot that
             // was previously SCANOUT and is now FREE (-1 on the first flip).
@@ -1918,7 +1918,7 @@ int run(int wireFd, int ctrlFd, int inputFd, bool headless,
             (void)retiredSlotIdx;  // unused: see KmsScanoutRing for the inversion.
             ipc::Message m{};
             m.tag = ipc::Tag::ScanoutFlipComplete;
-            m.outputId = 0;  // the one output today; per-output when enumeration lands
+            m.outputId = outputId;
             // KmsScanoutRing's listener semantics return retired (now-FREE)
             // slot. The core needs to know which slot just became SCANOUT
             // -- look up the ring state to find it.

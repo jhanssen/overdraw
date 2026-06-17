@@ -21,22 +21,24 @@ KmsOutputBackend::~KmsOutputBackend() {
 
 void KmsOutputBackend::close() {
     // Tear down in reverse construction order:
-    //   ring (wgpu refs + dmabuf fds + GBM bo's + KMS fb_ids)
-    //   mode blob
+    //   each output's ring (wgpu refs + dmabuf fds + GBM bo's + KMS fb_ids)
+    //   each output's mode blob
     //   GBM device
     //   topology / properties (no owned resources, just ids)
     // The DRM fd itself is owned by the core's libseat; we don't close it.
-    ring_.clear();
-    if (modeBlobId_ != 0 && drmFd_ >= 0) {
-        drmModeDestroyPropertyBlob(drmFd_, modeBlobId_);
-        modeBlobId_ = 0;
+    for (auto& o : outputs_) {
+        o->ring.clear();
+        if (o->modeBlobId != 0 && drmFd_ >= 0) {
+            drmModeDestroyPropertyBlob(drmFd_, o->modeBlobId);
+            o->modeBlobId = 0;
+        }
     }
+    outputs_.clear();
     if (gbm_) {
         gbm_device_destroy(gbm_);
         gbm_ = nullptr;
     }
     deviceId_ = 0;
-    didInitialCommit_ = false;
 }
 
 bool KmsOutputBackend::open(const char* /*title*/) {
@@ -53,55 +55,80 @@ bool KmsOutputBackend::open(const char* /*title*/) {
     struct stat st{};
     if (::fstat(drmFd_, &st) == 0) deviceId_ = static_cast<uint64_t>(st.st_rdev);
 
-    // 4: pick a connector (env var OVERDRAW_CONNECTOR may pin a name).
+    // 4: pick the primary connector (env var OVERDRAW_CONNECTOR may pin a name).
+    DrmTopology primaryTopo{};
     const char* prefer = ::getenv("OVERDRAW_CONNECTOR");
     if (!pickConnector(drmFd_, prefer ? prefer : std::string{},
-                       topo_.connectorId, topo_.connectorName, topo_.mode)) {
+                       primaryTopo.connectorId, primaryTopo.connectorName,
+                       primaryTopo.mode)) {
         return false;
     }
-    std::printf("[kms] connector %s id=%u mode=%ux%u @%umHz\n",
-                topo_.connectorName.c_str(), topo_.connectorId,
-                topo_.mode.hdisplay, topo_.mode.vdisplay, topo_.mode.vrefreshMhz);
 
-    // 5: mode picked alongside the connector (preferred or mode 0).
-    // 6: CRTC.
-    if (!pickCrtc(drmFd_, topo_.connectorId, topo_.crtcId)) return false;
-    std::printf("[kms] crtc id=%u\n", topo_.crtcId);
-
-    // 7: primary plane.
-    if (!pickPrimaryPlane(drmFd_, topo_.crtcId, topo_.planeId)) return false;
-    std::printf("[kms] plane id=%u\n", topo_.planeId);
-
-    // Resolve all property ids we'll set in atomic commits.
-    if (!resolveProperties(drmFd_, topo_)) return false;
-
-    // 8: GBM device on the DRM fd. Created here so initScanout()'s scanout
-    // ring can call gbm_bo_create_with_modifiers directly without re-opening.
+    // 8: GBM device on the DRM fd, shared by every output's scanout ring.
     gbm_ = gbm_create_device(drmFd_);
     if (!gbm_) {
         std::fprintf(stderr, "[kms] gbm_create_device failed: %s\n", std::strerror(errno));
         return false;
     }
 
-    // Record every other connected monitor so the core learns about all
-    // attached outputs (the primary above is the one we scan out). Driving
-    // these (CRTC + modeset + ring) is a later step; for now they are reported
-    // only.
+    // Build the driven-output list: the primary connector first, then every
+    // other connected connector in enumeration order. Each gets a DISTINCT
+    // CRTC (excluding ones already claimed this session) + primary plane +
+    // resolved property ids. A connector that can't get a distinct CRTC/plane
+    // is logged and skipped -- the others still work.
+    std::vector<uint32_t> usedCrtcs;
+
+    auto buildOutput = [&](DrmTopology topo, uint32_t outputId) -> bool {
+        if (!pickCrtc(drmFd_, topo.connectorId, topo.crtcId, usedCrtcs)) {
+            std::fprintf(stderr, "[kms] connector %s id=%u: no distinct CRTC; skipping\n",
+                         topo.connectorName.c_str(), topo.connectorId);
+            return false;
+        }
+        if (!pickPrimaryPlane(drmFd_, topo.crtcId, topo.planeId)) {
+            std::fprintf(stderr, "[kms] connector %s id=%u crtc=%u: no primary plane; skipping\n",
+                         topo.connectorName.c_str(), topo.connectorId, topo.crtcId);
+            return false;
+        }
+        if (!resolveProperties(drmFd_, topo)) {
+            std::fprintf(stderr, "[kms] connector %s id=%u: property resolve failed; skipping\n",
+                         topo.connectorName.c_str(), topo.connectorId);
+            return false;
+        }
+        usedCrtcs.push_back(topo.crtcId);
+        std::printf("[kms] output %u connector %s id=%u mode=%ux%u @%umHz crtc=%u plane=%u\n",
+                    outputId, topo.connectorName.c_str(), topo.connectorId,
+                    topo.mode.hdisplay, topo.mode.vdisplay, topo.mode.vrefreshMhz,
+                    topo.crtcId, topo.planeId);
+        auto out = std::make_unique<PerOutput>();
+        out->outputId = outputId;
+        out->topo = std::move(topo);
+        outputs_.push_back(std::move(out));
+        return true;
+    };
+
+    // Primary must succeed (it drives the main output).
+    if (!buildOutput(std::move(primaryTopo), 0)) {
+        std::fprintf(stderr, "[kms] primary output bring-up failed\n");
+        return false;
+    }
+    const uint32_t primaryConnectorId = outputs_[0]->topo.connectorId;
+
     for (auto& c : enumerateConnectors(drmFd_)) {
-        if (c.connectorId == topo_.connectorId) continue;
-        std::printf("[kms] additional connector %s id=%u mode=%ux%u @%umHz\n",
-                    c.name.c_str(), c.connectorId,
-                    c.mode.hdisplay, c.mode.vdisplay, c.mode.vrefreshMhz);
-        extraConnectors_.push_back(std::move(c));
+        if (c.connectorId == primaryConnectorId) continue;
+        DrmTopology topo{};
+        topo.connectorId = c.connectorId;
+        topo.connectorName = c.name;
+        topo.mode = c.mode;
+        buildOutput(std::move(topo), static_cast<uint32_t>(outputs_.size()));
     }
 
-    // Steps 9-13 (scanout ring + initial modeset) happen in initScanout(),
+    // Steps 9-13 (scanout rings + initial modeset) happen in initScanout(),
     // which needs the GPU device.
     return true;
 }
 
 bool KmsOutputBackend::initScanout(const wgpu::Device& device) {
-    if (drmFd_ < 0 || !gbm_) {
+    if (drmFd_ < 0 || !gbm_ || outputs_.empty()) {
         std::fprintf(stderr, "[kms] initScanout: open() not completed\n");
         return false;
     }
@@ -112,16 +139,28 @@ bool KmsOutputBackend::initScanout(const wgpu::Device& device) {
     // the format here keeps the JS side's render passes unchanged.
     constexpr uint32_t kFourcc = DRM_FORMAT_XRGB8888;
 
-    // Per-plane modifier set the kernel advertises for this format. May be
-    // empty on older drivers; the ring then falls back to LINEAR.
-    std::vector<PlaneFormatModifier> planeFormats =
-        readPlaneFormats(drmFd_, topo_.planeId, topo_.planeProps.in_formats);
+    auto initRing = [&](PerOutput& o) -> bool {
+        // Per-plane modifier set the kernel advertises for this format. May be
+        // empty on older drivers; the ring then falls back to LINEAR.
+        std::vector<PlaneFormatModifier> planeFormats =
+            readPlaneFormats(drmFd_, o.topo.planeId, o.topo.planeProps.in_formats);
+        return o.ring.init(drmFd_, gbm_, device,
+                           o.topo.mode.hdisplay, o.topo.mode.vdisplay, kFourcc,
+                           planeFormats);
+    };
 
-    if (!ring_.init(drmFd_, gbm_, device,
-                    topo_.mode.hdisplay, topo_.mode.vdisplay, kFourcc,
-                    planeFormats)) {
-        std::fprintf(stderr, "[kms] scanout ring init failed\n");
+    // Primary ring failure is fatal; a secondary ring failure drops that output.
+    if (!initRing(*outputs_[0])) {
+        std::fprintf(stderr, "[kms] primary scanout ring init failed\n");
         return false;
+    }
+    for (size_t i = outputs_.size(); i-- > 1;) {
+        if (!initRing(*outputs_[i])) {
+            std::fprintf(stderr, "[kms] output %u scanout ring init failed; dropping\n",
+                         outputs_[i]->outputId);
+            outputs_[i]->ring.clear();
+            outputs_.erase(outputs_.begin() + static_cast<std::ptrdiff_t>(i));
+        }
     }
     return true;
 }
@@ -147,38 +186,67 @@ void KmsOutputBackend::fillIdentity(uint32_t connectorId, const std::string& nam
     }
 }
 
-void KmsOutputBackend::describeOutput(OutputDescriptorInfo& out) const {
-    out.width            = topo_.mode.hdisplay;
-    out.height           = topo_.mode.vdisplay;
-    out.refreshMhz       = topo_.mode.vrefreshMhz;
+void KmsOutputBackend::describeFrom(const PerOutput& o, OutputDescriptorInfo& out) const {
+    out.width            = o.topo.mode.hdisplay;
+    out.height           = o.topo.mode.vdisplay;
+    out.refreshMhz       = o.topo.mode.vrefreshMhz;
     out.scale            = 1;
     out.transform        = 0;
-    fillIdentity(topo_.connectorId, topo_.connectorName, out);
+    fillIdentity(o.topo.connectorId, o.topo.connectorName, out);
+}
+
+OutputSize KmsOutputBackend::size() const {
+    if (outputs_.empty()) return { 0, 0 };
+    return { outputs_[0]->topo.mode.hdisplay, outputs_[0]->topo.mode.vdisplay };
+}
+
+void KmsOutputBackend::describeOutput(OutputDescriptorInfo& out) const {
+    describeFrom(*outputs_[0], out);
 }
 
 void KmsOutputBackend::describeExtraOutput(size_t i, OutputDescriptorInfo& out) const {
-    const ConnectorInfo& c = extraConnectors_[i];
-    out.width            = c.mode.hdisplay;
-    out.height           = c.mode.vdisplay;
-    out.refreshMhz       = c.mode.vrefreshMhz;
-    out.scale            = 1;
-    out.transform        = 0;
-    fillIdentity(c.connectorId, c.name, out);
+    describeFrom(*outputs_[1 + i], out);
+}
+
+void KmsOutputBackend::describeOutputAt(size_t outputIdx, OutputDescriptorInfo& out) const {
+    describeFrom(*outputs_[outputIdx], out);
+}
+
+uint32_t KmsOutputBackend::crtcIdAt(size_t outputIdx) const {
+    return outputs_[outputIdx]->topo.crtcId;
+}
+
+const KmsScanoutRing::Slot& KmsOutputBackend::scanoutSlot(int idx) const {
+    return outputs_[0]->ring.slot(idx);
+}
+
+const KmsScanoutRing::Slot& KmsOutputBackend::scanoutSlotAt(size_t outputIdx, int slotIdx) const {
+    return outputs_[outputIdx]->ring.slot(slotIdx);
+}
+
+wgpu::Texture KmsOutputBackend::acquireOutputImpl(PerOutput& o, int& outSlotIdx) {
+    const int idx = o.ring.acquireFree();
+    outSlotIdx = idx;
+    if (idx < 0) return wgpu::Texture();
+    return o.ring.slot(idx).tex;
 }
 
 wgpu::Texture KmsOutputBackend::acquireScanout(int& outSlotIdx) {
-    const int idx = ring_.acquireFree();
-    outSlotIdx = idx;
-    if (idx < 0) return wgpu::Texture();
-    return ring_.slot(idx).tex;
+    return acquireOutputImpl(*outputs_[0], outSlotIdx);
+}
+
+wgpu::Texture KmsOutputBackend::acquireScanoutAt(size_t outputIdx, int& outSlotIdx) {
+    return acquireOutputImpl(*outputs_[outputIdx], outSlotIdx);
 }
 
 void KmsOutputBackend::pause() {
     if (paused_) return;
     paused_ = true;
-    pendingFlipSlot_ = -1;
-    ring_.resetAllSlotsToFree();
-    didInitialCommit_ = false;
+    for (auto& o : outputs_) {
+        o->pendingFlipSlot = -1;
+        o->ring.resetAllSlotsToFree();
+        o->didInitialCommit = false;
+    }
     std::printf("[kms] paused (VT switched away or seat disabled)\n");
 }
 
@@ -188,7 +256,7 @@ void KmsOutputBackend::resume() {
     std::printf("[kms] resumed (next present will re-run modeset)\n");
 }
 
-bool KmsOutputBackend::presentScanout(int slotIdx, int inFenceFd) {
+bool KmsOutputBackend::presentOutputImpl(PerOutput& o, int slotIdx, int inFenceFd) {
     if (paused_) {
         // The seat is disabled; the kernel has revoked DRM master and any
         // commit would EACCES. Swallow the present and discard the fence
@@ -197,42 +265,43 @@ bool KmsOutputBackend::presentScanout(int slotIdx, int inFenceFd) {
         return true;
     }
     if (slotIdx < 0 || drmFd_ < 0) return false;
-    const auto& s = ring_.slot(slotIdx);
+    const auto& s = o.ring.slot(slotIdx);
+    const DrmTopology& topo = o.topo;
     drmModeAtomicReq* req = drmModeAtomicAlloc();
     if (!req) {
         std::fprintf(stderr, "[kms] drmModeAtomicAlloc failed\n");
         return false;
     }
 
-    const uint32_t modeW = topo_.mode.hdisplay;
-    const uint32_t modeH = topo_.mode.vdisplay;
+    const uint32_t modeW = topo.mode.hdisplay;
+    const uint32_t modeH = topo.mode.vdisplay;
     auto add = [&](uint32_t obj, uint32_t prop, uint64_t v) {
         if (prop) drmModeAtomicAddProperty(req, obj, prop, v);
     };
 
     // Plane: which CRTC, which FB, src + crtc rects. src_* are 16.16 fixed-
     // point in buffer space; crtc_* are integers in mode space.
-    add(topo_.planeId, topo_.planeProps.fb_id,   s.fbId);
-    add(topo_.planeId, topo_.planeProps.crtc_id, topo_.crtcId);
-    add(topo_.planeId, topo_.planeProps.src_x,   0);
-    add(topo_.planeId, topo_.planeProps.src_y,   0);
-    add(topo_.planeId, topo_.planeProps.src_w,   static_cast<uint64_t>(ring_.width())  << 16);
-    add(topo_.planeId, topo_.planeProps.src_h,   static_cast<uint64_t>(ring_.height()) << 16);
-    add(topo_.planeId, topo_.planeProps.crtc_x,  0);
-    add(topo_.planeId, topo_.planeProps.crtc_y,  0);
-    add(topo_.planeId, topo_.planeProps.crtc_w,  modeW);
-    add(topo_.planeId, topo_.planeProps.crtc_h,  modeH);
+    add(topo.planeId, topo.planeProps.fb_id,   s.fbId);
+    add(topo.planeId, topo.planeProps.crtc_id, topo.crtcId);
+    add(topo.planeId, topo.planeProps.src_x,   0);
+    add(topo.planeId, topo.planeProps.src_y,   0);
+    add(topo.planeId, topo.planeProps.src_w,   static_cast<uint64_t>(o.ring.width())  << 16);
+    add(topo.planeId, topo.planeProps.src_h,   static_cast<uint64_t>(o.ring.height()) << 16);
+    add(topo.planeId, topo.planeProps.crtc_x,  0);
+    add(topo.planeId, topo.planeProps.crtc_y,  0);
+    add(topo.planeId, topo.planeProps.crtc_w,  modeW);
+    add(topo.planeId, topo.planeProps.crtc_h,  modeH);
 
     // Explicit sync: tell the kernel to wait for this fence before latching.
     // The fd is dup'd by the kernel; caller still owns the original.
-    if (inFenceFd >= 0 && topo_.planeProps.in_fence_fd) {
-        add(topo_.planeId, topo_.planeProps.in_fence_fd, static_cast<uint64_t>(inFenceFd));
+    if (inFenceFd >= 0 && topo.planeProps.in_fence_fd) {
+        add(topo.planeId, topo.planeProps.in_fence_fd, static_cast<uint64_t>(inFenceFd));
     }
 
     // Atomic commit flags differ between the initial modeset and steady-state
     // page flips.
     //
-    // Initial (didInitialCommit_ == false):
+    // Initial (didInitialCommit == false):
     //   ALLOW_MODESET only. The initial commit synchronously sets up the CRTC
     //   / connector / mode; it does not produce a page-flip event (kernel
     //   docs: ALLOW_MODESET and PAGE_FLIP_EVENT together are accepted but
@@ -240,20 +309,20 @@ bool KmsOutputBackend::presentScanout(int slotIdx, int inFenceFd) {
     //   separate). NONBLOCK is not used: the modeset takes effect when the
     //   commit returns.
     //
-    // Steady-state (didInitialCommit_ == true):
+    // Steady-state (didInitialCommit == true):
     //   PAGE_FLIP_EVENT | NONBLOCK. The kernel queues the flip for the next
     //   vblank and the page-flip event arrives via drmHandleEvent on the
     //   DRM fd in pump().
     uint32_t flags = 0;
-    if (!didInitialCommit_) {
+    if (!o.didInitialCommit) {
         // First commit also sets up CRTC + connector + mode.
-        add(topo_.connectorId, topo_.connectorProps.crtc_id, topo_.crtcId);
-        if (modeBlobId_ == 0) {
-            modeBlobId_ = createModeBlob(drmFd_, topo_.mode.raw);
-            if (modeBlobId_ == 0) { drmModeAtomicFree(req); return false; }
+        add(topo.connectorId, topo.connectorProps.crtc_id, topo.crtcId);
+        if (o.modeBlobId == 0) {
+            o.modeBlobId = createModeBlob(drmFd_, topo.mode.raw);
+            if (o.modeBlobId == 0) { drmModeAtomicFree(req); return false; }
         }
-        add(topo_.crtcId, topo_.crtcProps.mode_id, modeBlobId_);
-        add(topo_.crtcId, topo_.crtcProps.active,  1);
+        add(topo.crtcId, topo.crtcProps.mode_id, o.modeBlobId);
+        add(topo.crtcId, topo.crtcProps.active,  1);
         flags = DRM_MODE_ATOMIC_ALLOW_MODESET;
     } else {
         flags = DRM_MODE_PAGE_FLIP_EVENT | DRM_MODE_ATOMIC_NONBLOCK;
@@ -280,10 +349,10 @@ bool KmsOutputBackend::presentScanout(int slotIdx, int inFenceFd) {
         return false;
     }
 
-    const bool wasInitial = !didInitialCommit_;
-    didInitialCommit_ = true;
-    ring_.markPendingFlip(slotIdx);
-    pendingFlipSlot_ = slotIdx;
+    const bool wasInitial = !o.didInitialCommit;
+    o.didInitialCommit = true;
+    o.ring.markPendingFlip(slotIdx);
+    o.pendingFlipSlot = slotIdx;
     // Initial commit ran ALLOW_MODESET without PAGE_FLIP_EVENT (the kernel-
     // docs path; combining them is unreliable on some drivers). That commit
     // is synchronous -- the modeset is done by the time we return -- so the
@@ -292,23 +361,36 @@ bool KmsOutputBackend::presentScanout(int slotIdx, int inFenceFd) {
     // transition the slot to SCANOUT now and fire the listener so the next
     // render is scheduled.
     if (wasInitial) {
-        const int retired = ring_.onFlipComplete(slotIdx);
-        pendingFlipSlot_ = -1;
-        if (flipCompleteListener_) flipCompleteListener_(retired);
+        const int retired = o.ring.onFlipComplete(slotIdx);
+        o.pendingFlipSlot = -1;
+        if (flipCompleteListener_) flipCompleteListener_(o.outputId, retired);
     }
     return true;
 }
 
+bool KmsOutputBackend::presentScanout(int slotIdx, int inFenceFd) {
+    return presentOutputImpl(*outputs_[0], slotIdx, inFenceFd);
+}
+
+bool KmsOutputBackend::presentScanoutAt(size_t outputIdx, int slotIdx, int inFenceFd) {
+    return presentOutputImpl(*outputs_[outputIdx], slotIdx, inFenceFd);
+}
+
 void KmsOutputBackend::pageFlipTrampoline(int /*fd*/, unsigned int /*sequence*/,
                                           unsigned int /*tv_sec*/, unsigned int /*tv_usec*/,
-                                          unsigned int /*crtc_id*/, void* userdata) {
+                                          unsigned int crtc_id, void* userdata) {
     auto* self = static_cast<KmsOutputBackend*>(userdata);
     if (!self) return;
-    const int flipped = self->pendingFlipSlot_;
-    self->pendingFlipSlot_ = -1;
-    if (flipped < 0) return;
-    const int retired = self->ring_.onFlipComplete(flipped);
-    if (self->flipCompleteListener_) self->flipCompleteListener_(retired);
+    // Route the flip to the output whose CRTC the kernel reported.
+    for (auto& o : self->outputs_) {
+        if (o->topo.crtcId != crtc_id) continue;
+        const int flipped = o->pendingFlipSlot;
+        o->pendingFlipSlot = -1;
+        if (flipped < 0) return;
+        const int retired = o->ring.onFlipComplete(flipped);
+        if (self->flipCompleteListener_) self->flipCompleteListener_(o->outputId, retired);
+        return;
+    }
 }
 
 void KmsOutputBackend::pump() {
