@@ -641,6 +641,34 @@ export interface JsCompositorOpts {
   format?: GPUTextureFormat;
 }
 
+// One scanout/host output's geometry. deviceWidth/Height are the render
+// target's pixel size; logicalX/Y are the output's top-left in the GLOBAL
+// logical coordinate space; scale bridges the two (logical = device / scale).
+// A surface at global-logical (lx, ly) draws on this output at device
+// ((lx - logicalX) * scale, (ly - logicalY) * scale).
+export interface OutputGeom {
+  id: number;
+  deviceWidth: number;
+  deviceHeight: number;
+  logicalX: number;
+  logicalY: number;
+  scale: number;
+}
+
+// Derived per-output context used by the on-screen composite: the logical
+// origin to subtract before placement, the output's scale, and its target
+// dims (device px) + logical extent (device / scale, for normalization).
+interface OutputCtx {
+  id: number;
+  originX: number;
+  originY: number;
+  scale: number;
+  deviceWidth: number;
+  deviceHeight: number;
+  logicalWidth: number;
+  logicalHeight: number;
+}
+
 export class JsCompositor implements CompositorSink {
   private device: GPUDevice;
   private g: DawnGlobals;
@@ -654,6 +682,13 @@ export class JsCompositor implements CompositorSink {
   private scale = 1;
   private logicalWidth: number;
   private logicalHeight: number;
+  // Per-output geometry, keyed by outputId. Output 0 is the primary, kept in
+  // sync with setOutputSize (width/height/scale; logicalX/Y stay 0). setOutputs
+  // replaces the whole map for true multi-output. renderFrame iterates this
+  // (sorted by id), rendering each output's slice of the global logical space
+  // into its own scanout target. Before setOutputs is ever called this holds a
+  // single entry {id:0, x:0, y:0} so nested/headless/single-KMS are unchanged.
+  private outputsGeom = new Map<number, OutputGeom>();
   // Surfaces that gained presentable content since the last takeImportedSurfaces.
   private imported: Array<{ id: number; width: number; height: number }> = [];
   private warnedDmabuf = false;
@@ -804,6 +839,11 @@ export class JsCompositor implements CompositorSink {
     this.height = output.height;
     this.logicalWidth = output.width;
     this.logicalHeight = output.height;
+    this.outputsGeom.set(OUTPUT_DEFAULT, {
+      id: OUTPUT_DEFAULT,
+      deviceWidth: output.width, deviceHeight: output.height,
+      logicalX: 0, logicalY: 0, scale: 1,
+    });
     this.dawn = dawn;
     this.deviceHandle = deviceHandle;
     this.nested = opts.nested ?? false;
@@ -915,7 +955,85 @@ export class JsCompositor implements CompositorSink {
     this.scale = scale > 0 ? scale : 1;
     this.logicalWidth = Math.max(1, Math.round(width / this.scale));
     this.logicalHeight = Math.max(1, Math.round(height / this.scale));
+    // Keep the primary output's geometry (output 0) in sync. Its logical
+    // origin stays (0,0); only its device dims + scale track this call.
+    const prev = this.outputsGeom.get(OUTPUT_DEFAULT);
+    this.outputsGeom.set(OUTPUT_DEFAULT, {
+      id: OUTPUT_DEFAULT,
+      deviceWidth: width, deviceHeight: height,
+      logicalX: prev?.logicalX ?? 0, logicalY: prev?.logicalY ?? 0,
+      scale: this.scale,
+    });
     this.damageFull();  // slot textures are recreated; everything is stale
+  }
+
+  // Replace the full set of output geometries (multi-output). Each entry is a
+  // monitor's slice of the global logical space + its scanout target dims.
+  // renderFrame renders every entry per frame into its own target. Empty input
+  // is ignored (keeps the existing single primary rather than blanking output).
+  setOutputs(outputs: ReadonlyArray<OutputGeom>): void {
+    if (outputs.length === 0) return;
+    this.outputsGeom.clear();
+    for (const o of outputs) {
+      const scale = o.scale > 0 ? o.scale : 1;
+      this.outputsGeom.set(o.id, {
+        id: o.id,
+        deviceWidth: o.deviceWidth, deviceHeight: o.deviceHeight,
+        logicalX: o.logicalX, logicalY: o.logicalY, scale,
+      });
+    }
+    // Mirror output 0's device dims/scale into the primary fields so paths that
+    // still read this.width/height/scale (readback, freeze snapshots) match it.
+    const primary = this.outputsGeom.get(OUTPUT_DEFAULT);
+    if (primary) {
+      this.width = primary.deviceWidth;
+      this.height = primary.deviceHeight;
+      this.scale = primary.scale;
+      this.logicalWidth = Math.max(1, Math.round(primary.deviceWidth / primary.scale));
+      this.logicalHeight = Math.max(1, Math.round(primary.deviceHeight / primary.scale));
+    }
+    this.damageFull();
+  }
+
+  // Derive the per-output render context from its geometry: scale, target
+  // device dims, and the logical extent (device / scale) used to normalize
+  // placement. originX/Y is the output's logical top-left, subtracted from a
+  // surface's global-logical position before the ×scale placement.
+  private outputCtx(o: OutputGeom): OutputCtx {
+    const scale = o.scale > 0 ? o.scale : 1;
+    return {
+      id: o.id,
+      originX: o.logicalX, originY: o.logicalY, scale,
+      deviceWidth: o.deviceWidth, deviceHeight: o.deviceHeight,
+      logicalWidth: Math.max(1, Math.round(o.deviceWidth / scale)),
+      logicalHeight: Math.max(1, Math.round(o.deviceHeight / scale)),
+    };
+  }
+
+  // Consume this output's accumulated damage for the frame, keyed by the stable
+  // per-slot key (the scanout-ring handle, or the headless sentinel). Returns
+  // the scissor box (in GLOBAL logical coords; composite() shifts it by the
+  // output's origin) for a partial repaint, or undefined for a full repaint. A
+  // transition animates the whole output, so it forces full while one is active.
+  //
+  // Composite-scissor is only taken when there is a single output at the global
+  // origin. OutputDamageRing tracks damage in a single global-bounds coordinate
+  // space (addOutputDamage clips to the primary's logical size); for a
+  // multi-output layout that model would clip/drop a non-primary output's
+  // damage, so those layouts force a full repaint per output instead. This is
+  // correct (not damage-optimal); per-output damage bounds are a later step.
+  private takeScissor(
+    o: OutputGeom, key: bigint,
+  ): { x: number; y: number; w: number; h: number } | undefined {
+    const scale = o.scale > 0 ? o.scale : 1;
+    const lw = Math.max(1, Math.round(o.deviceWidth / scale));
+    const lh = Math.max(1, Math.round(o.deviceHeight / scale));
+    this.outputDamage.setBounds(lw, lh);
+    const repaint = this.outputDamage.take(key);
+    const singleAtOrigin = this.outputsGeom.size === 1
+      && o.logicalX === 0 && o.logicalY === 0;
+    return (singleAtOrigin && repaint.mode === "partial" && !this.activeTransition)
+      ? repaint.box : undefined;
   }
 
   // Stack/layer reorders change occlusion at arbitrary places; repaint full.
@@ -1652,6 +1770,10 @@ export class JsCompositor implements CompositorSink {
       placement?: { x: number; y: number; w: number; h: number };
       cropUV?: { u0: number; v0: number; u1: number; v1: number };
     },
+    // When set, placement is in the GLOBAL logical space and is shifted by the
+    // output's logical origin so it lands at the correct device position within
+    // this output's target. Absent for origin-anchored offscreen targets.
+    output?: OutputCtx,
   ): void {
     if (!s.uniformBuf) return;
     // A surface fills its WM-assigned tile (layoutW/layoutH), falling back to
@@ -1671,8 +1793,10 @@ export class JsCompositor implements CompositorSink {
     const bh = swapAxes ? s.width : s.height;
     const intrinsicW = s.viewportDst?.width ?? s.viewportSrc?.width ?? bw / bs;
     const intrinsicH = s.viewportDst?.height ?? s.viewportSrc?.height ?? bh / bs;
-    const px = overrides?.placement?.x ?? s.x;
-    const py = overrides?.placement?.y ?? s.y;
+    const ox = output ? output.originX : 0;
+    const oy = output ? output.originY : 0;
+    const px = (overrides?.placement?.x ?? s.x) - ox;
+    const py = (overrides?.placement?.y ?? s.y) - oy;
     const pw = overrides?.placement?.w ?? (s.layoutW || intrinsicW);
     const ph = overrides?.placement?.h ?? (s.layoutH || intrinsicH);
     const fx = s.fx;
@@ -1802,7 +1926,16 @@ export class JsCompositor implements CompositorSink {
     // clears the box first so the stack blends against black. The box is in
     // output LOGICAL coords. Absent = full-frame clear (the default).
     scissor?: { x: number; y: number; w: number; h: number };
+    // On-screen output context. When set, surface placement subtracts this
+    // output's logical origin and the scissor uses this output's scale +
+    // device dims. Absent for offscreen/compose targets (live scenes, window
+    // crops, freeze snapshots), which sit at the origin with no per-output map.
+    output?: OutputCtx;
   }): void {
+    const out = args.output;
+    const scale = out ? out.scale : this.scale;
+    const devW = out ? out.deviceWidth : this.width;
+    const devH = out ? out.deviceHeight : this.height;
     const partial = !!args.scissor;
     const pass = args.encoder.beginRenderPass({
       colorAttachments: [{
@@ -1813,16 +1946,20 @@ export class JsCompositor implements CompositorSink {
       }],
     });
     if (args.scissor) {
-      // Logical -> device px (the attachment's space).
-      const sx = Math.max(0, Math.floor(args.scissor.x * this.scale));
-      const sy = Math.max(0, Math.floor(args.scissor.y * this.scale));
-      const sw = Math.min(this.width - sx, Math.ceil(args.scissor.w * this.scale));
-      const sh = Math.min(this.height - sy, Math.ceil(args.scissor.h * this.scale));
+      // The scissor box is in this output's LOGICAL coords; shift to the
+      // output-local logical origin, then to device px (the attachment's space).
+      const lx = args.scissor.x - (out ? out.originX : 0);
+      const ly = args.scissor.y - (out ? out.originY : 0);
+      const sx = Math.max(0, Math.floor(lx * scale));
+      const sy = Math.max(0, Math.floor(ly * scale));
+      const sw = Math.min(devW - sx, Math.ceil(args.scissor.w * scale));
+      const sh = Math.min(devH - sy, Math.ceil(args.scissor.h * scale));
       pass.setScissorRect(sx, sy, Math.max(0, sw), Math.max(0, sh));
       // Clear the scissored box to black (loadOp:load preserved old pixels).
       const black = this.ensureBlackFill();
       if (black.bindGroup) {
-        this.updateUniforms(black, args.outW, args.outH, { placement: args.scissor });
+        this.updateUniforms(black, args.outW, args.outH,
+          { placement: args.scissor }, out);
         pass.setPipeline(this.pipeline);
         pass.setBindGroup(0, black.bindGroup);
         pass.draw(4);
@@ -1839,7 +1976,7 @@ export class JsCompositor implements CompositorSink {
           ?? s.interceptPlacement ?? undefined;
         const cropUV = args.cropUV?.get(id);
         this.updateUniforms(s, args.outW, args.outH,
-          placement || cropUV ? { placement, cropUV } : undefined);
+          placement || cropUV ? { placement, cropUV } : undefined, out);
         pass.setBindGroup(0, s.bindGroup);
         pass.draw(4);
       }
@@ -1859,31 +1996,60 @@ export class JsCompositor implements CompositorSink {
   // the lifecycle's open begin is rolled back without leaving a dangling
   // access bracket.
   renderFrame(): void {
-    let targetView = this.targetView;
-    let presenting = false;
     let frameOpen = false;
-    let damageKey = JsCompositor.HEADLESS_DAMAGE_KEY;
-    if (this.nested) {
-      const handle = this.addon.acquireOutputTexture(OUTPUT_DEFAULT);
-      // The native addon returns nullptr from N-API on "no slot available"
-      // (no FREE scanout in KMS mode; no swapchain texture in nested mode);
-      // that arrives in JS as undefined, not null. Treat both as "skip frame."
-      if (handle === null || handle === undefined) return;
-      if (!this.dawn) return;
-      this.outputTex = this.dawn.wrapTexture(this.deviceHandle, handle);
-      targetView = this.outputTex.createView();
-      presenting = true;
-      damageKey = handle;  // stable per scanout-ring slot
-    }
-    if (!targetView) return;  // headless before the target exists (shouldn't happen)
 
-    // Composite-scissor: how much of this slot to repaint. Always consume the
-    // slot's accumulated damage (so it resets). A transition animates the whole
-    // output, so force full while one is active.
-    this.outputDamage.setBounds(this.logicalWidth, this.logicalHeight);
-    const repaint = this.outputDamage.take(damageKey);
-    const onScreenScissor = (repaint.mode === "partial" && !this.activeTransition)
-      ? repaint.box : undefined;
+    // One render target per output. Nested/KMS: acquire each output's scanout
+    // texture (skip the ones whose ring has no free slot this frame). Headless:
+    // a single offscreen target at output 0. Each entry carries the per-output
+    // transform (origin + scale + dims) so a surface at global-logical (lx, ly)
+    // lands at device ((lx - originX) * scale, (ly - originY) * scale).
+    //
+    // Pacing: every output is rendered on each renderFrame trigger; independent
+    // per-output vblank clocks are a later refinement.
+    const targets: Array<{
+      ctx: OutputCtx;
+      view: GPUTextureView;
+      tex: GPUTexture | null;  // wrapped scanout texture to drop after present
+      present: boolean;
+      scissor?: { x: number; y: number; w: number; h: number };
+    }> = [];
+
+    if (this.nested) {
+      if (!this.dawn) return;
+      const outs = [...this.outputsGeom.values()].sort((a, b) => a.id - b.id);
+      for (const o of outs) {
+        const handle = this.addon.acquireOutputTexture(o.id);
+        // The native addon returns nullptr from N-API on "no slot available"
+        // (no FREE scanout in KMS mode; no swapchain texture in nested mode);
+        // that arrives in JS as undefined, not null. Both mean "skip this
+        // output this frame" -- its ring slot is busy.
+        if (handle === null || handle === undefined) continue;
+        const tex = this.dawn.wrapTexture(this.deviceHandle, handle);
+        targets.push({
+          ctx: this.outputCtx(o),
+          view: tex.createView(),
+          tex,
+          present: true,
+          // Composite-scissor: keyed by the stable per-slot scanout handle so
+          // each output gets its own damage accounting.
+          scissor: this.takeScissor(o, handle),
+        });
+      }
+      // Every output's ring was busy this frame -- nothing to present, and the
+      // lifecycle/bracket machinery would otherwise open a frame with no draw.
+      if (targets.length === 0) return;
+    } else {
+      if (!this.targetView) return;  // headless before the target exists
+      const o = this.outputsGeom.get(OUTPUT_DEFAULT);
+      if (!o) return;
+      targets.push({
+        ctx: this.outputCtx(o),
+        view: this.targetView,
+        tex: null,
+        present: false,
+        scissor: this.takeScissor(o, JsCompositor.HEADLESS_DAMAGE_KEY),
+      });
+    }
 
     this.dispatch(this.lifecycle.step({ kind: "frameStart" }));
     frameOpen = true;
@@ -1918,19 +2084,25 @@ export class JsCompositor implements CompositorSink {
       }
 
       const enc = this.device.createCommandEncoder();
-      // On-screen pass: either a transition pass (Phase 8) or the
-      // normal per-surface composite. The two are mutually exclusive
-      // -- a transition replaces the on-screen output entirely while
-      // active; the input textures it samples are not part of any
-      // surface in the WM's draw list.
-      if (this.activeTransition) {
-        this.encodeTransitionPass(enc, targetView);
-      } else {
-        this.composite({
-          encoder: enc, targetView, drawList: draw,
-          outW: this.logicalWidth, outH: this.logicalHeight,
-          scissor: onScreenScissor,
-        });
+      // On-screen pass: either a transition pass (Phase 8) or the normal
+      // per-surface composite, encoded once per output into that output's
+      // target. The two are mutually exclusive -- a transition replaces the
+      // on-screen output entirely while active; the input textures it samples
+      // are not part of any surface in the WM's draw list. The transition's
+      // textures (and its one-shot wire bracket) are resolved once for the
+      // frame, then drawn into every output target.
+      const transition = this.activeTransition
+        ? this.resolveTransitionFrame() : null;
+      for (const t of targets) {
+        if (this.activeTransition) {
+          this.encodeTransitionInto(enc, t.view, transition);
+        } else {
+          this.composite({
+            encoder: enc, targetView: t.view, drawList: draw,
+            outW: t.ctx.logicalWidth, outH: t.ctx.logicalHeight,
+            scissor: t.scissor, output: t.ctx,
+          });
+        }
       }
       // Live composers, in registration order. Each pass writes to its
       // own target texture; they don't blend against each other.
@@ -1969,7 +2141,7 @@ export class JsCompositor implements CompositorSink {
       frameOpen = false;
 
       // Phase 8: close the per-frame transition read bracket on the
-      // wire AFTER the submit. encodeTransitionPass stashed endRead in
+      // wire AFTER the submit. resolveTransitionFrame stashed endRead in
       // pendingEndRead (only when this frame's transition resolver
       // returned bracket hooks -- Worker-live). One-shot per frame.
       if (this.activeTransition?.pendingEndRead) {
@@ -2010,10 +2182,11 @@ export class JsCompositor implements CompositorSink {
         catch (e) { log.warn("core", "js-compositor: liveProducer threw: %o", e); }
       }
 
-      if (presenting) {
-        this.addon.presentOutput(OUTPUT_DEFAULT);
-        this.outputTex = null;
+      // Present each acquired output and drop its wrapped scanout texture.
+      for (const t of targets) {
+        if (t.present) this.addon.presentOutput(t.ctx.id);
       }
+      this.outputTex = null;
     } catch (e) {
       // If anything threw between frameStart and submitted, close any begin
       // brackets that DID open (the GPU process's wire-side Begin/End
@@ -2644,18 +2817,22 @@ export class JsCompositor implements CompositorSink {
   // For tests: true while a transition is installed.
   hasActiveTransition(): boolean { return this.activeTransition !== null; }
 
-  // Encode the transition pass into targetView. Called from renderFrame
-  // when activeTransition is non-null. The caller has already opened
-  // any import brackets it needs (none for transitions today -- the
-  // input textures are not client dmabufs, they're compose-output
-  // textures or live-scene targets whose lifetimes the broker pins
+  // Resolve the active transition's inputs ONCE for the frame: re-pick textures
+  // (resolver case), open its one-shot wire read bracket, refresh the bind group
+  // on identity change, and write the kind+progress uniform. Returns the bind
+  // group to draw, or null when no texture is available this frame (the caller
+  // clears each output target to black). Called from renderFrame before the
+  // per-output loop so the producer Begin/End bracket fires exactly once even
+  // when the transition is drawn into multiple output targets.
+  //
+  // The caller has already opened any client-surface import brackets it needs
+  // (none for transitions today -- the input textures are not client dmabufs,
+  // they're compose-output / live-scene targets whose lifetimes the broker pins
   // for the transition's duration).
-  private encodeTransitionPass(
-    encoder: GPUCommandEncoder, targetView: GPUTextureView,
-  ): void {
+  private resolveTransitionFrame(): GPUBindGroup | null {
     const t = this.activeTransition;
     if (!t || !this.transitionPipeline || !this.transitionLayout
-        || !this.transitionUniformBuf) return;
+        || !this.transitionUniformBuf) return null;
 
     // Re-pick textures if a resolver is installed; rebuild the bind
     // group on identity change. For the stable case the cached bind
@@ -2673,21 +2850,8 @@ export class JsCompositor implements CompositorSink {
     let toTex = t.toTex;
     if (t.resolveTextures) {
       const r = t.resolveTextures();
-      if (r === null) {
-        // No texture available this frame (e.g. ring has nothing
-        // PRESENTED yet). Skip the transition pass; clear the target
-        // to opaque black so the on-screen output isn't undefined.
-        const pass = encoder.beginRenderPass({
-          colorAttachments: [{
-            view: targetView,
-            loadOp: "clear",
-            storeOp: "store",
-            clearValue: { r: 0, g: 0, b: 0, a: 1 },
-          }],
-        });
-        pass.end();
-        return;
-      }
+      // No texture available this frame (e.g. ring has nothing PRESENTED yet).
+      if (r === null) return null;
       fromTex = r.fromTex;
       toTex = r.toTex;
       // Open the wire bracket on the core side BEFORE encoding the
@@ -2720,17 +2884,36 @@ export class JsCompositor implements CompositorSink {
     new Uint32Array(u, 0, 1)[0] = TRANSITION_KIND_CODE[t.kind];
     new Float32Array(u, 4, 1)[0] = t.getProgress();
     this.device.queue.writeBuffer(this.transitionUniformBuf, 0, u);
+    return t.cachedBindGroup;
+  }
 
+  // Encode the transition pass into one output's targetView using the bind
+  // group resolved for this frame. A null bindGroup (no texture available)
+  // clears the target to opaque black so the output isn't left undefined.
+  // The transition is a full-output replacement: every output draws the same
+  // blended result (no per-output transform applies to a full-screen quad).
+  private encodeTransitionInto(
+    encoder: GPUCommandEncoder, targetView: GPUTextureView,
+    bindGroup: GPUBindGroup | null,
+  ): void {
+    if (!bindGroup || !this.transitionPipeline) {
+      const pass = encoder.beginRenderPass({
+        colorAttachments: [{
+          view: targetView, loadOp: "clear", storeOp: "store",
+          clearValue: { r: 0, g: 0, b: 0, a: 1 },
+        }],
+      });
+      pass.end();
+      return;
+    }
     const pass = encoder.beginRenderPass({
       colorAttachments: [{
-        view: targetView,
-        loadOp: "clear",
-        storeOp: "store",
+        view: targetView, loadOp: "clear", storeOp: "store",
         clearValue: { r: 0, g: 0, b: 0, a: 1 },
       }],
     });
     pass.setPipeline(this.transitionPipeline);
-    pass.setBindGroup(0, t.cachedBindGroup);
+    pass.setBindGroup(0, bindGroup);
     pass.draw(4);
     pass.end();
   }

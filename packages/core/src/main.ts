@@ -297,10 +297,9 @@ state = await installProtocols(addon, {
 addon.setOnOutputDescriptor((d) => {
   const outputs = state.outputs;
   if (!outputs) return;
-  // The compositor renders a single output target today; only the primary
-  // (OUTPUT_DEFAULT) drives the render/WM/input globals. Non-primary monitors
-  // are recorded in state.outputs (so the topology is known) but not yet laid
-  // out or scanned out.
+  // The compositor renders every output's slice of the global logical space.
+  // The primary (OUTPUT_DEFAULT) additionally drives the WM/input globals,
+  // which still work against a single logical output rect.
   const isPrimary = d.outputId === OUTPUT_DEFAULT;
 
   // The descriptor reports device pixels (the scanout mode). Scale is core
@@ -361,6 +360,20 @@ addon.setOnOutputDescriptor((d) => {
       `output ${d.outputId}: ${device.width}x${device.height} device, `
       + `${logical.width}x${logical.height} logical @${d.refreshMhz}mHz scale=${scale} `
       + `xform=${d.transform} phys=${d.physicalWidthMm}x${d.physicalHeightMm}mm name=${d.name}`);
+  }
+
+  // Feed the full per-output geometry to the compositor so renderFrame draws
+  // each monitor's slice of the global logical space into its own scanout
+  // target. Covers ALL outputs (not just the primary); setOutputSize below
+  // still drives the primary's render dims (harmless overlap -- setOutputs is
+  // the fuller picture).
+  if (compositor instanceof JsCompositor && compositor.setOutputs) {
+    compositor.setOutputs([...outputs.values()].map((r) => ({
+      id: r.id,
+      deviceWidth: r.deviceSize.width, deviceHeight: r.deviceSize.height,
+      logicalX: r.logicalPosition.x, logicalY: r.logicalPosition.y,
+      scale: r.scale,
+    })));
   }
 
   // Internal reconfigurations, in dependency order, for the primary only --
