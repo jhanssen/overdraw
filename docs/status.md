@@ -419,6 +419,14 @@ made `renderD128` the NVIDIA node: the full GPU suite passes; a prior hardcoded
 `renderD128` allocated client buffers on NVIDIA while the compositor imported on
 Intel, ENOMEM'ing the dmabuf path.
 
+**KNOWN BUG (open): 1-in-3 client buffers presents black on the 3-slot scanout
+ring.** Observable with kitty (every third frame is black). Predates the
+multi-output work and is independent of it (single-output KMS, the 3-slot
+`KmsScanoutRing`); surfaced while surface-verifying multi-output. Symptom points at
+a buffer-presentation/lifecycle interaction with the 3-slot ring rotation (a slot
+scanned out before its client content landed, or a release/age miscount), not at
+pacing or per-output routing. Tracked for a focused fix.
+
 ## Real clients run end-to-end
 
 - **`foot`** (1.25.0, shm) connects, renders, and is interactive: prompt renders,

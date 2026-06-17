@@ -493,12 +493,12 @@ ordering is a build sequence, not a scope boundary: the feature is complete only
 after **both** hotplug (M7) and multi-GPU (M8). Milestones 1-7 are intermediate
 states of one feature, not a shippable endpoint.
 
-**Status: M1-M4 built** (single-output byte-identical, full GPU + 1083 unit green;
-KMS multi-output build-verified, display-verify pending on 2-monitor-on-one-card
-hardware). M4 has two tracked hardening items (4h-a pacing, 4h-b damage; below).
-M5-M8 remain. A multi-GPU render-node robustness fix also landed en route (the GBM
-allocator + dmabuf clients now follow the chosen adapter's GPU, not a hardcoded
-`renderD128`).
+**Status: M1-M4 done — surface-verified** on a single-card two-monitor setup
+(HDMI 60Hz + DP 240Hz both lit; 1083 unit + 136 GPU green). 4h-a (independent
+per-output pacing) is done; residuals 4h-b (per-output damage bounds) and 4h-c
+(pointer can't cross into a secondary output) are tracked below. M5-M8 remain. A
+multi-GPU render-node robustness fix also landed en route (the GBM allocator +
+dmabuf clients follow the chosen adapter's GPU, not a hardcoded `renderD128`).
 
 1. **IPC outputId plumbing (no behavior change).** Add `outputId` to the messages
    (Section 4), thread through compositor/addon/main.cpp, still drive one output.
@@ -532,27 +532,36 @@ allocator + dmabuf clients now follow the chosen adapter's GPU, not a hardcoded
    live-output registry into the compose/transitions SDKs (validation
    `== OUTPUT_DEFAULT` → `state.outputs.has(id)`) lands here or in M5 once a second
    output is renderable.
-4. **Per-output render + pacing. [BUILT — KMS display-verify pending]** Per-output
-   scanout rings + distinct-CRTC assignment + modeset, per-output bring-up
-   handshake + fence routing, and `renderFrame` loops outputs rendering each
-   output's slice of the global space (Sections 5-7). Second monitor lights up.
-   Single-output is byte-identical (full GPU + unit suite green); the KMS
-   multi-output path is build-verified, display-verify on single-card-two-monitor
-   hardware. **Two M4-hardening items shipped as the simpler interim, tracked to
-   land once basic M4 is hardware-confirmed (both are only meaningfully verifiable
-   on a real 2-monitor setup):**
-   - **(4h-a) Independent per-output pacing. [DONE]** Each output renders + presents
-     on its own vblank: the native frame loop dropped the global flip stall (one
-     output's in-flight flip no longer blocks the others) and re-evaluates per
-     output; the JS compositor tracks per-output dirty (routed through the
-     centralized damage primitives — `damageFull` → all, `addOutputDamage` →
-     outputs intersecting the rect — so a frame is never missed) and skips clean
-     outputs. Single-output byte-identical (full GPU + 1083 unit green). The §14
-     resolved decision, now implemented. KMS multi-output display-verify pending.
-   - **(4h-b) Per-output composite-damage bounds.** Shipped: a multi-output (or
-     non-origin) layout forces a full repaint per output (correct, not optimal),
-     because `OutputDamageRing` tracks a single global-bounds space. Target:
-     per-output damage bounds so partial-scissor repaint works for N outputs.
+4. **Per-output render + pacing. [DONE — surface-verified]** Per-output scanout
+   rings + distinct-CRTC assignment + modeset, per-output bring-up handshake +
+   fence routing, and `renderFrame` rendering each output's slice of the global
+   space (Sections 5-7). **Verified lit on real hardware: a single-card two-monitor
+   setup (HDMI 60Hz + DP 240Hz) both display.** Single-output byte-identical; 1083
+   unit + 136 GPU green. Hardware testing found four real bugs that build + headless
+   could not (a fence-routing `close(0)` that closed the DRM card fd — fd 0 holds
+   the card in the GPU child; the per-output flip gate; per-output frame-callback
+   dispatch; a shared-uniform-buffer overwrite across per-output passes), all fixed.
+   - **(4h-a) Independent per-output pacing. [DONE]** Each output is clocked by its
+     OWN vblank, not the union of all outputs' flips. Mechanism: a **per-output flip
+     gate** (`acquireOutputTextureHandle(outputId)` returns null when that output
+     has a slot in PENDING_FLIP, so the render skips it until its own flip-complete)
+     plus **per-output frame-callback dispatch** (a queue of flipped outputIds drives
+     `dispatchFrameCallbacksForOutput`, so a client on the 60Hz panel gets `done` at
+     60Hz, not the 240Hz peer's rate, keyed by surface→output residency). The §14
+     resolved decision, satisfied. (An earlier per-output *dirty-set* short-circuit
+     was removed: it skipped frame-callback dispatch for "clean" outputs — stalling
+     their clients — and its mark heuristics were fragile. Idle-output cost is now
+     one cheap empty composite-scissored pass per vblank, not a skipped render.)
+   - **(4h-b) Per-output composite-damage bounds. [residual]** `OutputDamageRing`
+     still tracks a single global-bounds space, so a non-origin output's partial
+     damage can't be trusted for a partial-scissor repaint — idle outputs do a cheap
+     empty pass rather than a damage-optimal partial one. Per-output damage bounds is
+     the follow-up.
+   - **(4h-c) Pointer cannot cross into a secondary output. [residual]** The
+     libinput backend gets only the primary's dims via `setOutputSize`, so the cursor
+     is clamped to the primary. Needs per-output layout in the input backend (a
+     bounding-box clamp is the cheap interim; full per-output mapping is the right
+     fix). Folds into M5 (per-output WM/layout).
 5. **Per-output WM + layout + workspaces.** Per-output layout pass, global-space
    arrangement policy (Sections 8, 10-arrangement), and lift the workspace plugin's
    single-output caps so `outputId != 0` is meaningful (`positionsByOutput` /
@@ -647,9 +656,9 @@ Resolved:
 - Migration policy owner — the **workspace plugin** holds `preferredOutputs` and
   runs the recompute on `output.added`/`output.removed`; core supplies only those
   bus signals and the virtual fallback output (Sections 8, 10).
-- Per-output pacing — **independent per-output clocks** (per-output `wantNext`,
-  render+present only the dirty output on its own vblank). Section 7; the
-  milestone-4 risk, gets the most testing.
+- Per-output pacing — **independent per-output clocks**, DONE. Each output is
+  clocked by its own vblank via a per-output flip gate + per-output frame-callback
+  dispatch (not the removed dirty-set short-circuit). See M4 / 4h-a in Section 12.
 - Hotplug — **required, not deferrable.** Sequenced as milestone 7 because it
   builds on the per-output workspace model, but multi-output is not complete
   without live plug/unplug (Sections 10, 12).
