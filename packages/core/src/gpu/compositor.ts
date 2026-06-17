@@ -689,6 +689,20 @@ export class JsCompositor implements CompositorSink {
   // into its own scanout target. Before setOutputs is ever called this holds a
   // single entry {id:0, x:0, y:0} so nested/headless/single-KMS are unchanged.
   private outputsGeom = new Map<number, OutputGeom>();
+  // Per-output dirty tracking for independent frame pacing. An output is
+  // rendered+presented only when it is dirty AND its scanout ring has a free
+  // slot; a clean output is skipped (not repainted) when only another output
+  // changed. `dirtyAll` is the sentinel "every current output is dirty" (set by
+  // markAllOutputsDirty for changes whose affected region can't be localized to
+  // a subset of outputs). The set holds individually-marked output ids.
+  //
+  // Safety: under-marking drops a frame (a correctness bug); over-marking only
+  // repaints a clean output (a perf cost). Every marking path errs toward
+  // marking. Single-output modes (nested / headless / one-monitor KMS) bypass
+  // this entirely -- renderFrame treats a lone output as always dirty, so their
+  // behavior is identical regardless of this set's contents.
+  private dirtyOutputs = new Set<number>();
+  private dirtyAll = false;
   // Surfaces that gained presentable content since the last takeImportedSurfaces.
   private imported: Array<{ id: number; width: number; height: number }> = [];
   private warnedDmabuf = false;
@@ -1704,12 +1718,54 @@ export class JsCompositor implements CompositorSink {
   // regions (stack reorders, per-surface fx, output resize).
   private damageFull(): void {
     this.outputDamage.full();
+    this.markAllOutputsDirty();
   }
 
   // Accumulate an output-LOGICAL-space rect into every tracked slot's region.
+  // The rect is in GLOBAL logical coordinates; mark every output whose logical
+  // region intersects it dirty (a region change only the intersecting outputs
+  // need to repaint).
   private addOutputDamage(x: number, y: number, w: number, h: number): void {
     this.outputDamage.setBounds(this.logicalWidth, this.logicalHeight);
     this.outputDamage.damageRect(x, y, w, h);
+    this.markOutputsIntersecting(x, y, w, h);
+  }
+
+  // Mark every output (by id) currently in outputsGeom dirty. Used when a
+  // change's affected region can't be localized (stack/layer reorder, per-
+  // surface fx, transform/opacity/mask, transition, output geometry change).
+  markAllOutputsDirty(): void {
+    this.dirtyAll = true;
+  }
+
+  // Mark a single output dirty by id. Adding an id not in outputsGeom is
+  // harmless (renderFrame only consults the set for ids it iterates).
+  markOutputDirty(outputId: number): void {
+    this.dirtyOutputs.add(outputId);
+  }
+
+  // Mark every output whose logical region intersects the given GLOBAL-logical
+  // rect. An output's logical region is [logicalX, logicalY] sized by its
+  // device dims / scale. A zero-area rect intersects nothing; callers that
+  // can't bound the region call markAllOutputsDirty instead.
+  private markOutputsIntersecting(x: number, y: number, w: number, h: number): void {
+    if (this.dirtyAll) return;
+    for (const o of this.outputsGeom.values()) {
+      const scale = o.scale > 0 ? o.scale : 1;
+      const ox0 = o.logicalX;
+      const oy0 = o.logicalY;
+      const ox1 = o.logicalX + o.deviceWidth / scale;
+      const oy1 = o.logicalY + o.deviceHeight / scale;
+      if (x < ox1 && x + w > ox0 && y < oy1 && y + h > oy0) {
+        this.dirtyOutputs.add(o.id);
+      }
+    }
+  }
+
+  // True if output `id` should be rendered this frame (individually marked, or
+  // the dirtyAll sentinel is set). Single-output callers bypass this.
+  private isOutputDirty(id: number): boolean {
+    return this.dirtyAll || this.dirtyOutputs.has(id);
   }
 
   // Damage a surface's current on-screen rect (placement). Content commits and
@@ -2004,8 +2060,13 @@ export class JsCompositor implements CompositorSink {
     // transform (origin + scale + dims) so a surface at global-logical (lx, ly)
     // lands at device ((lx - originX) * scale, (ly - originY) * scale).
     //
-    // Pacing: every output is rendered on each renderFrame trigger; independent
-    // per-output vblank clocks are a later refinement.
+    // Pacing: each output renders + presents on its OWN vblank. An output is
+    // serviced only when it is dirty (this.isOutputDirty) AND its ring has a
+    // free slot; a clean output is skipped (not repainted) when only another
+    // output changed, and a dirty-but-busy output stays dirty until its own
+    // flip-complete frees its ring. A lone output (single-output modes) is
+    // always treated as dirty so behavior is identical to rendering it every
+    // triggered frame.
     const targets: Array<{
       ctx: OutputCtx;
       view: GPUTextureView;
@@ -2016,14 +2077,26 @@ export class JsCompositor implements CompositorSink {
 
     if (this.nested) {
       if (!this.dawn) return;
+      const single = this.outputsGeom.size === 1;
       const outs = [...this.outputsGeom.values()].sort((a, b) => a.id - b.id);
       for (const o of outs) {
+        // Skip clean outputs (single-output mode forces dirty). A skipped
+        // clean output keeps its (absent) dirty flag.
+        if (!single && !this.isOutputDirty(o.id)) continue;
         const handle = this.addon.acquireOutputTexture(o.id);
         // The native addon returns nullptr from N-API on "no slot available"
         // (no FREE scanout in KMS mode; no swapchain texture in nested mode);
         // that arrives in JS as undefined, not null. Both mean "skip this
-        // output this frame" -- its ring slot is busy.
-        if (handle === null || handle === undefined) continue;
+        // output this frame" -- its ring slot is busy. Leave it dirty so its
+        // flip-complete re-triggers a render for it.
+        if (handle === null || handle === undefined) {
+          if (!single) this.dirtyOutputs.add(o.id);
+          continue;
+        }
+        // This output is being rendered + presented; clear its individual dirty
+        // flag now. The dirtyAll sentinel is cleared after the loop only if no
+        // output was left dirty-but-busy.
+        this.dirtyOutputs.delete(o.id);
         const tex = this.dawn.wrapTexture(this.deviceHandle, handle);
         targets.push({
           ctx: this.outputCtx(o),
@@ -2035,8 +2108,13 @@ export class JsCompositor implements CompositorSink {
           scissor: this.takeScissor(o, handle),
         });
       }
-      // Every output's ring was busy this frame -- nothing to present, and the
-      // lifecycle/bracket machinery would otherwise open a frame with no draw.
+      // Every output that was dirtyAll has either been serviced (and its
+      // individual flag cleared) or re-added to dirtyOutputs because its ring
+      // was busy; the sentinel itself is now consumed.
+      this.dirtyAll = false;
+      // Every selected output's ring was busy this frame -- nothing to present,
+      // and the lifecycle/bracket machinery would otherwise open a frame with no
+      // draw. The busy outputs stay dirty (re-added above) for their flip.
       if (targets.length === 0) return;
     } else {
       if (!this.targetView) return;  // headless before the target exists

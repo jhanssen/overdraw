@@ -541,10 +541,14 @@ allocator + dmabuf clients now follow the chosen adapter's GPU, not a hardcoded
    hardware. **Two M4-hardening items shipped as the simpler interim, tracked to
    land once basic M4 is hardware-confirmed (both are only meaningfully verifiable
    on a real 2-monitor setup):**
-   - **(4h-a) Independent per-output pacing.** Shipped: render all outputs on each
-     frame trigger. Target (the §14-resolved decision): per-output `wantNext` +
-     per-output frame clock so an idle output is not repainted when only another
-     changes. Lives in the native frame loop (addon).
+   - **(4h-a) Independent per-output pacing. [DONE]** Each output renders + presents
+     on its own vblank: the native frame loop dropped the global flip stall (one
+     output's in-flight flip no longer blocks the others) and re-evaluates per
+     output; the JS compositor tracks per-output dirty (routed through the
+     centralized damage primitives — `damageFull` → all, `addOutputDamage` →
+     outputs intersecting the rect — so a frame is never missed) and skips clean
+     outputs. Single-output byte-identical (full GPU + 1083 unit green). The §14
+     resolved decision, now implemented. KMS multi-output display-verify pending.
    - **(4h-b) Per-output composite-damage bounds.** Shipped: a multi-output (or
      non-origin) layout forces a full repaint per output (correct, not optimal),
      because `OutputDamageRing` tracks a single global-bounds space. Target:

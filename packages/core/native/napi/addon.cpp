@@ -133,11 +133,9 @@ struct Addon {
     //   inFrame      true while the JS onFrame callback is on the stack; a
     //                wake() during this window sets wantNext instead of
     //                re-entering the render path.
-    //   wantNext     a wake() arrived while inFrame or while a flip was
-    //                pending; the next opportunity to render fires this off.
-    //   flipPending  (KMS only) the atomic commit is queued and we haven't
-    //                received ScanoutFlipComplete yet. Queried from the
-    //                compositor's scanout slot state machine.
+    //   wantNext     a wake() arrived while inFrame, or a flip-complete freed a
+    //                scanout slot; the next opportunity to render fires this off.
+    //                Per-output busy gating lives in the JS compositor, not here.
     bool inFrame = false;
     bool wantNext = false;
 
@@ -218,12 +216,15 @@ void armWirePoll();
 //   onFrameComplete()  called from the ctrl poll when ScanoutFlipComplete (KMS)
 //                      or FrameComplete (nested) arrives.
 //
-// Both funnel into runFrameIfReady() which checks inFrame and flipPending
-// before invoking notifyFrame(). After notifyFrame returns, if wantNext was
-// set during the render (e.g. an animation tick called wake), and we are no
-// longer flipPending, we loop to render again. The "no flip-pending" gate is
-// load-bearing on KMS -- the kernel only accepts one queued flip per CRTC,
-// so a second render now would just spin acquireOutputTexture() into nulls.
+// Both funnel into runFrameIfReady() which checks inFrame before invoking
+// notifyFrame(). There is NO global flip gate: per-output pacing lives in the
+// JS compositor, which renders only the outputs that are both dirty and have a
+// free scanout slot. A busy output (its ring full mid-flip) is simply skipped
+// by renderFrame and picked up on its OWN flip-complete -- it does not stall
+// the other outputs. After notifyFrame returns, we loop only while renderFrame
+// actually presented at least one output this pass (and wantNext is still set):
+// a pass that presents nothing (all dirty outputs busy, or all clean) means the
+// remaining work waits for the next wake / flip-complete rather than spinning.
 void runFrameIfReady();
 
 void wake() {
@@ -236,20 +237,32 @@ void runFrameIfReady() {
     if (!g_addon.compositor || !g_addon.loopRunning) return;
     if (!g_addon.wantNext) return;
     if (g_addon.inFrame) return;                       // re-entrant; post-render loop picks it up
-    if (g_addon.compositor->flipPending()) return;     // KMS: wait for ScanoutFlipComplete
 
     do {
         g_addon.wantNext = false;
         g_addon.inFrame = true;
+        const uint64_t presentedBefore =
+            g_addon.compositor ? g_addon.compositor->presented() : 0;
         notifyFrame();           // → JS dispatchFrameCallbacks + JS renderFrame + JS presentOutput
+        uint64_t presentedAfter = presentedBefore;
         if (g_addon.compositor) {
             g_addon.lastNotified = g_addon.compositor->presented();
             g_addon.compositor->renderFrame();
+            presentedAfter = g_addon.compositor->presented();
         }
         g_addon.inFrame = false;
         armWirePoll();
-    } while (g_addon.wantNext
-             && !g_addon.compositor->flipPending());
+        // Re-loop only while progress is being made: renderFrame presented at
+        // least one output this pass AND something still wants a frame. A pass
+        // that presents nothing (every dirty output's ring busy, or no output
+        // dirty) stops here -- the pending work is serviced on the next wake or
+        // flip-complete, not by spinning. Headless presents nothing (presentOutput
+        // is a no-op with no swapchain/scanout), so its progress can't be measured
+        // by the present count; it loops on wantNext alone as before, paced by the
+        // ~60Hz headless frame timer.
+        const bool headless = g_addon.compositor && g_addon.compositor->headless();
+        if (!headless && presentedAfter <= presentedBefore) break;
+    } while (g_addon.wantNext);
 }
 
 // Headless frame pacing: KMS/nested re-arm runFrameIfReady from a flip /
@@ -274,12 +287,15 @@ void onFrameComplete() {
     if (g_addon.server) {
         g_addon.server->drainEvents();
     }
-    // Steady-state KMS frame pacing: each flip-complete is a vsync edge. If
-    // the JS side wants another frame (animation in flight, client commit
-    // pending, cursor moving, etc.), it will have called wake() -- runFrame-
-    // IfReady is gated on wantNext, so an idle scene with no work pending
-    // simply falls through to nothing here. That is the "no work = no draw"
-    // behavior the timer-driven loop did not have.
+    // Steady-state KMS frame pacing: each flip-complete is a vsync edge AND
+    // means some output's scanout ring just freed a slot. A dirty output that
+    // was skipped earlier because its ring was busy can now be rendered, so
+    // force wantNext before re-evaluating -- otherwise, if wantNext had been
+    // cleared (the prior pass presented everything it could), the freed output
+    // would not be serviced until an unrelated wake. renderFrame still renders
+    // only the outputs that are actually dirty, so an idle scene with nothing
+    // dirty presents nothing and falls through to no draw.
+    g_addon.wantNext = true;
     runFrameIfReady();
 }
 
