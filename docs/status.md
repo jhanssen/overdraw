@@ -405,6 +405,24 @@ is never ended until teardown (fine single-device); no modifier negotiation beyo
 a static advertised set (an unadvertised client modifier surfaces as a failed
 commit).
 
+**KNOWN BUG (open): dmabuf-import GPU tests crash on a multi-GPU host.** On a
+hybrid box (Intel iGPU + NVIDIA dGPU) the `*dmabuf*.gpu.mjs` tests SIGABRT/hang
+with `intel: the execbuf ioctl keeps returning ENOMEM` from the compositor's
+Intel Vulkan (ANV) device during the dmabuf import+sample. Isolated facts:
+non-dmabuf Intel-Vulkan tests pass (command submission works); only the
+dmabuf-*import* path fails; it still fails with only the Intel Vulkan ICD visible
+(`VK_ICD_FILENAMES`), so it is not the NVIDIA adapter's mere presence /
+cross-adapter; it passed before a reboot that brought the NVIDIA GPU out of a
+runtime-PM error state and swapped the render-node numbers (`renderD128`↔
+`renderD129`). Partial mitigation landed (clients no longer hardcode
+`/dev/dri/renderD128` — they honor `OVERDRAW_RENDER_NODE`, set by the harness to
+the compositor's render node; headless adapter selection prefers a render-capable
+adapter), but this did NOT resolve the symptom, so the root cause is still open.
+Prime remaining suspect: the client dmabuf is still allocated on a different DRM
+node than the compositor imports on (cross-GPU import) — the next diagnostic is to
+confirm the node the client actually opens vs. the compositor's. Reproduces only
+on a multi-GPU host; a single-GPU box does not hit it. Tracked for a proper fix.
+
 ## Real clients run end-to-end
 
 - **`foot`** (1.25.0, shm) connects, renders, and is interactive: prompt renders,
