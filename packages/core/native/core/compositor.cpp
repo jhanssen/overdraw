@@ -184,14 +184,22 @@ bool Compositor::bringUp() {
     //             wait for ScanoutReady.
     //   headless-> FeedbackData alone is enough.
     ipc::Message surfReady{};
-    ipc::Message kmsDescriptor{};
+    ipc::Message kmsDescriptor{};  // the PRIMARY (outputId 0) descriptor
     bool gotFeedback = false;
     bool gotKmsDescriptor = false;
+
+    // KMS multi-output: the GPU process sends one OutputDescriptor per driven
+    // output, each carrying outputCount. We collect all N here (each output's
+    // dims so the second phase reserves textures of the right size), keyed by
+    // arrival order.
+    struct KmsOutputDims { uint32_t outputId; uint32_t width; uint32_t height; };
+    std::vector<KmsOutputDims> kmsOutputs;
+    uint32_t kmsExpectedOutputs = 0;  // 0 until the first descriptor arrives
     auto firstPhaseDone = [&] {
         if (headless_) return gotFeedback;
         if (wantSurface) return surfReady.tag == ipc::Tag::SurfaceReady;
-        // kms
-        return gotKmsDescriptor;
+        // kms: all advertised outputs' descriptors have arrived.
+        return gotKmsDescriptor && kmsOutputs.size() >= kmsExpectedOutputs;
     };
     if (!link_->pumpUntil([&] {
             ipc::Message m{};
@@ -210,12 +218,21 @@ bool Compositor::bringUp() {
             }
             if (kmsMode_ && m.tag == ipc::Tag::OutputDescriptor) {
                 for (int i = 0; i < nfds; ++i) ::close(fds[i]);
-                kmsDescriptor = m;
-                gotKmsDescriptor = true;
+                // Learn the total output count from the first descriptor that
+                // carries it (fallback 1 if the GPU left it unset).
+                if (kmsExpectedOutputs == 0)
+                    kmsExpectedOutputs = m.outputCount ? m.outputCount : 1;
+                // The primary (outputId 0) descriptor drives windowWidth_/Height_.
+                if (m.outputId == 0) {
+                    kmsDescriptor = m;
+                    gotKmsDescriptor = true;
+                }
+                // Record this output's dims for the second-phase reserve.
+                kmsOutputs.push_back({ m.outputId, m.width, m.height });
                 // OutputDescriptor will be drained again in steady state too,
-                // but during bring-up we capture it once for our own use AND
-                // also push it to the steady-state queue so main.ts's
-                // onOutputDescriptor callback fires normally.
+                // but during bring-up we capture it for our own use AND also
+                // push it to the steady-state queue so main.ts's
+                // onOutputDescriptor callback fires per output.
                 OutputDescriptorMsg msg{};
                 msg.outputId = m.outputId;
                 msg.width = m.width; msg.height = m.height;
@@ -260,43 +277,49 @@ bool Compositor::bringUp() {
     } else if (kmsMode_) {
         // Scanout texture format matches the compositor's render path.
         renderFormat_ = wgpu::TextureFormat::BGRA8Unorm;
+        // The primary (outputId 0) descriptor drives the window size.
         windowWidth_  = kmsDescriptor.width;
         windowHeight_ = kmsDescriptor.height;
 
-        // Reserve three texture handles for the scanout ring slots, send them
-        // to the GPU process, and wait for ScanoutReady.
-        WGPUTextureDescriptor td{};
-        td.size = { windowWidth_, windowHeight_, 1 };
-        td.mipLevelCount = 1;
-        td.sampleCount = 1;
-        td.dimension = WGPUTextureDimension_2D;
-        td.format = static_cast<WGPUTextureFormat>(renderFormat_);
-        td.usage = WGPUTextureUsage_RenderAttachment | WGPUTextureUsage_TextureBinding;
-        ipc::Message rsMsg{};
-        rsMsg.tag = ipc::Tag::ScanoutReserve;
-        rsMsg.outputId = 0;  // primary; per-output rings reserve the rest in M4
-        rsMsg.width = windowWidth_;
-        rsMsg.height = windowHeight_;
-        ScanoutOutput& so = scanoutOutputs_[rsMsg.outputId];
-        for (int i = 0; i < 3; ++i) {
-            auto r = link_->client().ReserveTexture(device_.Get(), &td);
-            so.slots[i].handleId  = r.handle.id;
-            so.slots[i].handleGen = r.handle.generation;
-            so.slots[i].state     = ScanoutSlotState::FREE;
-            so.slots[i].tex       = r.texture;  // wire-side handle, valid pre-inject
-            so.slots[i].surfaceBufId = nextSurfaceBufId_++;
-            rsMsg.scanoutHandles[i]    = { r.handle.id, r.handle.generation };
-            rsMsg.scanoutBufIds[i]     = so.slots[i].surfaceBufId;
+        // Reserve a three-slot scanout ring per output: for each output,
+        // ReserveTexture three wire handles sized to that output's mode, send a
+        // ScanoutReserve carrying the handles + surfaceBufIds, then collect the
+        // matching ScanoutReady. The GPU process replies in outputId order.
+        for (const auto& out : kmsOutputs) {
+            WGPUTextureDescriptor td{};
+            td.size = { out.width, out.height, 1 };
+            td.mipLevelCount = 1;
+            td.sampleCount = 1;
+            td.dimension = WGPUTextureDimension_2D;
+            td.format = static_cast<WGPUTextureFormat>(renderFormat_);
+            td.usage = WGPUTextureUsage_RenderAttachment | WGPUTextureUsage_TextureBinding;
+            ipc::Message rsMsg{};
+            rsMsg.tag = ipc::Tag::ScanoutReserve;
+            rsMsg.outputId = out.outputId;
+            rsMsg.width = out.width;
+            rsMsg.height = out.height;
+            ScanoutOutput& so = scanoutOutputs_[out.outputId];
+            for (int i = 0; i < 3; ++i) {
+                auto r = link_->client().ReserveTexture(device_.Get(), &td);
+                so.slots[i].handleId  = r.handle.id;
+                so.slots[i].handleGen = r.handle.generation;
+                so.slots[i].state     = ScanoutSlotState::FREE;
+                so.slots[i].tex       = r.texture;  // wire-side handle, valid pre-inject
+                so.slots[i].surfaceBufId = nextSurfaceBufId_++;
+                rsMsg.scanoutHandles[i] = { r.handle.id, r.handle.generation };
+                rsMsg.scanoutBufIds[i]  = so.slots[i].surfaceBufId;
+            }
+            // Flush the reserves into the wire before sending ScanoutReserve so
+            // the GPU process's wire reader has consumed the reservation bytes
+            // by the time it InjectTexture's at our handles. Flush before each
+            // send to keep the per-output wire ordering the GPU expects.
+            link_->flush();
+            ipc::sendMessage(ctrlFd_, rsMsg);
         }
-        // Flush the reserves into the wire before sending ScanoutReserve so the
-        // GPU process's wire reader has consumed any reservation-related bytes
-        // by the time it tries to InjectTexture at our handles.
-        link_->flush();
-        ipc::sendMessage(ctrlFd_, rsMsg);
 
-        // Wait for ScanoutReady.
-        bool ready = false;
-        bool ok = false;
+        // Wait for one ScanoutReady per output (matched by outputId); every one
+        // must report ok.
+        size_t readyCount = 0;
         if (!link_->pumpUntil([&] {
                 ipc::Message m{};
                 int fds[ipc::kMaxMsgFds];
@@ -304,20 +327,19 @@ bool Compositor::bringUp() {
                 if (!ipc::recvMessageNBFds(ctrlFd_, m, fds, &nfds)) return false;
                 for (int i = 0; i < nfds; ++i) ::close(fds[i]);
                 if (m.tag == ipc::Tag::ScanoutReady) {
-                    ready = true;
-                    ok = m.ok != 0;
-                    return true;
+                    if (m.ok == 0) {
+                        error_ = "ScanoutReady reported failure";
+                        return true;  // stop pumping; error_ set
+                    }
+                    ++readyCount;
+                    return readyCount >= kmsOutputs.size();
                 }
                 return false;
             })) {
             error_ = "no ScanoutReady";
             return false;
         }
-        (void)ready;
-        if (!ok) {
-            error_ = "ScanoutReady reported failure";
-            return false;
-        }
+        if (!error_.empty()) return false;
     } else {
         // Headless: no swapchain. The JS compositor renders into its own
         // offscreen target; the format it samples client buffers as is BGRA8Unorm.

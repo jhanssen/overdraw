@@ -260,6 +260,12 @@ struct Message {
     // exists today, so it is always 0 until multi-output enumeration lands.
     uint32_t outputId = 0;
 
+    // OutputDescriptor: total number of outputs the GPU process is driving. Set
+    // on every OutputDescriptor send so the core learns how many scanout rings
+    // to reserve before the first descriptor's reply path proceeds. 0 means
+    // unset (the core falls back to a single output).
+    uint32_t outputCount = 0;
+
     // ScanoutReserve: the three texture wire handles (id+generation) the core
     // ReserveTexture'd for the KMS scanout ring slots, plus the three
     // surfaceBufId values the core assigned for in-band access brackets on
