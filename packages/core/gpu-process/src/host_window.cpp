@@ -190,6 +190,15 @@ void HostWindow::armFrameCallback() {
 void HostWindow::onFrameCallbackDone() {
     frameCallback_ = nullptr;
     if (onFrameDone_) onFrameDone_();
+    // Re-arm the one-shot host wl_surface.frame chain so the next host
+    // vblank delivers another done. The request is queued onto the host
+    // surface; the host compositor fires the callback the next time it
+    // takes a frame from this surface (i.e. after the next Present's
+    // commit). Without this, exactly one FrameComplete reaches the core
+    // and per-output frame-callback dispatch never re-fires -- clients
+    // gated on wl_callback.done (kitty, most well-behaved Wayland apps)
+    // commit once and then deadlock.
+    armFrameCallback();
 }
 
 bool HostWindow::open(const char* title) {

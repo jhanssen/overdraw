@@ -890,10 +890,13 @@ log.info("core", `ctrl-c to quit.`);
 // Per-output frame-callback dispatch. The addon drains one ScanoutFlipComplete
 // per call (KMS), so a 60Hz output fires this at 60Hz and a 240Hz output at
 // 240Hz independently. dispatchFrameCallbacksForOutput sends wl_callback.done
-// only to surfaces overlapping `outputId` -- so a client window on the 60Hz
-// monitor sees done events at 60Hz, even when the 240Hz monitor is also
-// flipping. Nested/headless don't fire this (the addon's flipCompletes queue
-// stays empty); they use the legacy dispatchFrameCallbacks path via onFrame.
+// only to surfaces overlapping `outputId`, so a client window on the 60Hz
+// monitor sees done events at 60Hz even when the 240Hz monitor is also
+// flipping. Nested pushes outputId=0 once per host wl_surface.frame done;
+// headless synthesizes one per tick of the addon's frame timer. This is the
+// ONLY path that fires wl_callback.done -- the per-tick dispatchFrameCallbacks
+// runs housekeeping (imports/maps/unmaps, buffer-release, animation tick) but
+// no longer dispatches frame callbacks.
 addon.setOnFlipComplete?.((outputId) => {
   state?.dispatchFrameCallbacksForOutput?.(Math.round(performance.now()), outputId);
 });

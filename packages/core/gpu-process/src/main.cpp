@@ -766,9 +766,11 @@ int run(int wireFd, int ctrlFd, int inputFd, bool headless,
     // wl_surface.frame callback fires when the host compositor is ready for
     // the next frame; the GPU process forwards that as ipc::Tag::FrameComplete
     // to the core, where the addon's wake state machine drives the next
-    // render. KMS uses ScanoutFlipComplete for the same role (see further
-    // below). The callback is one-shot per host vsync; HostWindow re-arms it
-    // inside `done`, plus we arm one here at startup to prime the chain.
+    // render and dispatchFrameCallbacksForOutput delivers wl_callback.done to
+    // the resident clients. KMS uses ScanoutFlipComplete for the same role
+    // (see further below). The callback is one-shot per host vsync;
+    // HostWindow::onFrameCallbackDone re-arms it for the next vblank, so we
+    // only need to prime the chain once here.
     if (!headless && !outputKms) {
         output->setFrameDoneListener([ctrlFd]() {
             ipc::Message m{};
