@@ -7,8 +7,12 @@
 // process and arrive as wire texture handles wrapped on this device.
 //
 // Two render targets: an owned offscreen target (read back via readback())
-// and the host swapchain's current texture (acquired + presented per frame).
-// Constructor picks via JsCompositorOpts.nested.
+// and per-output addon-acquired textures (KMS scanout slots OR a nested-host
+// swapchain texture, acquired + presented per frame via addon.acquireOutput
+// Texture / presentOutput). Constructor picks via JsCompositorOpts.headless.
+// "Headless" here is a JS-compositor concern: own + render into an offscreen
+// target with readback. It is independent of the addon's backend choice
+// (`kms` vs `nested`), both of which drive the addon-acquired path.
 //
 // WebGPU objects come from dawn.node and conform to the standard JS API; the
 // types are @webgpu/types (GPUDevice/GPUTexture/...).
@@ -634,10 +638,16 @@ export interface LiveWindowCompHandle {
 }
 
 export interface JsCompositorOpts {
-  // Present to the host swapchain (slice 3) instead of an offscreen target.
-  // Requires dawn + deviceHandle (for wrapTexture) and the addon acquire/present.
-  nested?: boolean;
-  // The render-target color format (must match the swapchain when nested).
+  // Render into an owned offscreen target read back via readback() (tests /
+  // pixel verification), instead of acquiring + presenting per output via
+  // addon.acquireOutputTexture / presentOutput. Default true: a bare
+  // JsCompositor with no opts is self-contained for unit-ish GPU tests.
+  // Production (main.ts) passes false to drive the addon path; the addon's
+  // backend choice (kms vs nested-host) is the layer that picks where the
+  // acquired texture comes from. The addon-driven path requires dawn +
+  // deviceHandle (for wrapTexture).
+  headless?: boolean;
+  // The render-target color format (must match the swapchain when not headless).
   format?: GPUTextureFormat;
 }
 
@@ -810,11 +820,14 @@ export class JsCompositor implements CompositorSink {
   private dawn: DawnWire | null;
   private deviceHandle: bigint;
 
-  // Nested present (slice 3): render into the host swapchain + present, instead
-  // of an offscreen target.
-  private nested: boolean;
+  // When false, render through the addon's per-output acquire/present API
+  // (KMS scanout slots OR a nested-host swapchain texture, picked by the
+  // addon's backend). When true, render into an owned offscreen target read
+  // back via readback(). The headless path is exercised by tests; production
+  // and dev both run !headless.
+  private headless: boolean;
   private format: GPUTextureFormat;
-  private outputTex: GPUTexture | null = null;  // wrapped swapchain texture, held during a frame
+  private outputTex: GPUTexture | null = null;  // wrapped output texture, held during a frame
 
   // Composite-scissor damage in output LOGICAL coords (converted to device px
   // at scissor time), one region per scanout-ring slot keyed by the stable
@@ -846,7 +859,7 @@ export class JsCompositor implements CompositorSink {
     });
     this.dawn = dawn;
     this.deviceHandle = deviceHandle;
-    this.nested = opts.nested ?? false;
+    this.headless = opts.headless ?? true;
     this.format = opts.format ?? DEFAULT_FORMAT;
 
     this.sampler = device.createSampler({ magFilter: "nearest", minFilter: "nearest" });
@@ -915,9 +928,10 @@ export class JsCompositor implements CompositorSink {
       usage: this.g.GPUBufferUsage.UNIFORM | this.g.GPUBufferUsage.COPY_DST,
     });
 
-    // Headless: an owned offscreen target (read back via readback()). Nested: the
-    // target is the swapchain's current texture, acquired per frame.
-    if (!this.nested) {
+    // Headless: allocate an owned offscreen target (read back via readback()).
+    // Otherwise the render target is acquired per output per frame from the
+    // addon (KMS scanout slot or nested-host swapchain).
+    if (this.headless) {
       this.target = device.createTexture({
         size: { width: this.width, height: this.height },
         format: this.format,
@@ -2061,32 +2075,7 @@ export class JsCompositor implements CompositorSink {
       scissor?: { x: number; y: number; w: number; h: number };
     }> = [];
 
-    if (this.nested) {
-      if (!this.dawn) return;
-      const outs = [...this.outputsGeom.values()].sort((a, b) => a.id - b.id);
-      for (const o of outs) {
-        const handle = this.addon.acquireOutputTexture(o.id);
-        // The native addon returns nullptr from N-API on "no slot available"
-        // (no FREE scanout in KMS mode; no swapchain texture in nested mode);
-        // that arrives in JS as undefined, not null. Both mean "skip this
-        // output this frame" -- its ring slot is busy. Its own flip-complete
-        // will re-trigger the frame loop.
-        if (handle === null || handle === undefined) continue;
-        const tex = this.dawn.wrapTexture(this.deviceHandle, handle);
-        targets.push({
-          ctx: this.outputCtx(o),
-          view: tex.createView(),
-          tex,
-          present: true,
-          // Composite-scissor: keyed by the stable per-slot scanout handle so
-          // each output gets its own damage accounting.
-          scissor: this.takeScissor(o, handle),
-        });
-      }
-      // Every output's ring was busy this frame -- nothing to present, and the
-      // lifecycle/bracket machinery would otherwise open a frame with no draw.
-      if (targets.length === 0) return;
-    } else {
+    if (this.headless) {
       if (!this.targetView) return;  // headless before the target exists
       const o = this.outputsGeom.get(OUTPUT_DEFAULT);
       if (!o) return;
@@ -2097,6 +2086,31 @@ export class JsCompositor implements CompositorSink {
         present: false,
         scissor: this.takeScissor(o, JsCompositor.HEADLESS_DAMAGE_KEY),
       });
+    } else {
+      if (!this.dawn) return;
+      const outs = [...this.outputsGeom.values()].sort((a, b) => a.id - b.id);
+      for (const o of outs) {
+        const handle = this.addon.acquireOutputTexture(o.id);
+        // The native addon returns nullptr from N-API on "no slot available"
+        // (no FREE scanout in KMS mode; no swapchain texture in nested-host
+        // mode); that arrives in JS as undefined, not null. Both mean "skip
+        // this output this frame" -- its ring slot is busy. Its own flip-
+        // complete will re-trigger the frame loop.
+        if (handle === null || handle === undefined) continue;
+        const tex = this.dawn.wrapTexture(this.deviceHandle, handle);
+        targets.push({
+          ctx: this.outputCtx(o),
+          view: tex.createView(),
+          tex,
+          present: true,
+          // Composite-scissor: keyed by the stable per-slot output handle so
+          // each output gets its own damage accounting.
+          scissor: this.takeScissor(o, handle),
+        });
+      }
+      // Every output's ring was busy this frame -- nothing to present, and the
+      // lifecycle/bracket machinery would otherwise open a frame with no draw.
+      if (targets.length === 0) return;
     }
 
     this.dispatch(this.lifecycle.step({ kind: "frameStart" }));
@@ -3143,8 +3157,8 @@ export class JsCompositor implements CompositorSink {
   // Async readback of the headless offscreen target. Convenience wrapper
   // around readbackTexture for the on-screen composite (used by tests).
   async readback(): Promise<{ width: number; height: number; data: Uint8Array }> {
-    if (this.nested || !this.target) {
-      throw new Error("readback() is headless-only (nested presents to the swapchain)");
+    if (!this.headless || !this.target) {
+      throw new Error("readback() is headless-only (non-headless renders into an addon-acquired texture)");
     }
     return this.readbackTexture(this.target, this.width, this.height);
   }

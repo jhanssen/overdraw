@@ -253,10 +253,9 @@ export async function setupCompositor(opts = {}) {
     const h = addon.gpuHandles();
     coreDevice = dawn.wrapDevice(h.instance, h.device);
     const { JsCompositor } = await import("../packages/core/dist/gpu/compositor.js");
-    const nested = !headless;
     jsCompositor = new JsCompositor(coreDevice, dawn.globals, addon,
       { width: dims.width, height: dims.height }, dawn, h.device,
-      { nested, format: addon.outputFormat() });
+      { headless: !!headless, format: addon.outputFormat() });
   }
 
   const pluginBus = opts.pluginBus ?? new DynamicBus();

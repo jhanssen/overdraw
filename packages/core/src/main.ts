@@ -194,7 +194,10 @@ log.info("core", `backend: ${backendOpts.backend}`
 const dims = addon.start(gpuBin, onFrame, onInput, backendOpts);
 log.info("core", `compositor up; output ${dims.width}x${dims.height}`);
 
-// Bring up the JS compositor (nested present to the host swapchain over the wire).
+// Bring up the JS compositor. Production runs through the addon's per-output
+// acquire/present API (KMS scanout slots or a nested-host swapchain texture,
+// depending on the addon's backend). Headless mode (offscreen target +
+// readback) is test-only and not constructed here.
 const dawn = loadDawn();
 if (!dawn) throw new Error("dawn.node not found (build the Dawn release with --node)");
 const h = addon.gpuHandles();
@@ -202,7 +205,7 @@ if (!h) throw new Error("gpuHandles() returned null; compositor not running");
 const device = dawn.wrapDevice(h.instance, h.device);
 const compositor: CompositorSink = new JsCompositor(device, dawn.globals, addon,
   { width: dims.width, height: dims.height }, dawn, h.device,
-  { nested: true, format: addon.outputFormat() });
+  { headless: false, format: addon.outputFormat() });
 log.info("core", "compositor: JS (over the Dawn wire)");
 
 // Phase 9c: install the built-in default cursor. The XCursor theme
