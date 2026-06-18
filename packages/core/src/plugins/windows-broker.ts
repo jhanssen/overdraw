@@ -78,6 +78,7 @@ export function createWindowsBroker(deps: WindowsBrokerDeps): WindowsBroker {
     if (method === "windows.set-transform") return handleSetTransform(params);
     if (method === "windows.set-output-margin") return handleSetOutputMargin(params);
     if (method === "windows.set-mask") return handleSetMask(params);
+    if (method === "windows.set-shape") return handleSetShape(params);
     if (method === "windows.set-tint") return handleSetTint(params);
     if (method === "windows.set-color-matrix") return handleSetColorMatrix(params);
     if (method === "windows.destroy-phantom") return handleDestroyPhantom(params);
@@ -127,6 +128,15 @@ export function createWindowsBroker(deps: WindowsBrokerDeps): WindowsBroker {
       throw new Error("windows.set-mask: not supported by this compositor");
     }
     compositor.setSurfaceMask(p.id, p.mask);
+    return null;
+  }
+
+  function handleSetShape(p: unknown): null {
+    if (!isSetShapePayload(p)) throw new Error("windows.set-shape: malformed payload");
+    if (!compositor.setSurfaceShape) {
+      throw new Error("windows.set-shape: not supported by this compositor");
+    }
+    compositor.setSurfaceShape(p.id, p.shape);
     return null;
   }
 
@@ -383,6 +393,33 @@ function isSetMaskPayload(d: unknown): d is { id: number; mask: GPUTexture | nul
   // without false positives. Accept null or "looks like an object" and
   // let the compositor surface a clear error if the wrong thing was passed.
   return o.mask === null || typeof o.mask === "object";
+}
+
+function isFiniteNumber(v: unknown): v is number {
+  return typeof v === "number" && Number.isFinite(v);
+}
+
+function isSetShapePayload(d: unknown): d is {
+  id: number; shape: import("../gpu/compositor.js").SurfaceShape;
+} {
+  if (typeof d !== "object" || d === null) return false;
+  const o = d as { [k: string]: unknown };
+  if (typeof o.id !== "number") return false;
+  if (o.shape === null) return true;
+  if (typeof o.shape !== "object") return false;
+  const s = o.shape as { [k: string]: unknown };
+  switch (s.kind) {
+    case "rounded-rect":
+      return isFiniteNumber(s.radius) && s.radius >= 0;
+    case "rounded-rect-per-corner":
+      return (["tl", "tr", "br", "bl"] as const).every(
+        (k) => isFiniteNumber(s[k]) && (s[k] as number) >= 0);
+    case "superellipse":
+      return isFiniteNumber(s.radius) && s.radius >= 0
+        && isFiniteNumber(s.exponent) && (s.exponent as number) >= 2;
+    default:
+      return false;
+  }
 }
 
 function isSetTintPayload(d: unknown): d is {

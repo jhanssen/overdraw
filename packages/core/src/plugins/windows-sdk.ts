@@ -76,6 +76,28 @@ export interface SurfaceTint {
 // path (Phase 10), not core primitives.
 export type ColorMatrix = readonly number[] | Float32Array;
 
+// Analytic per-surface shape evaluated by the compositor's fragment shader.
+// Composes multiplicatively with the optional alpha mask, so a plugin may use
+// both (mask for arbitrary shapes, shape for rounded corners; the intersection
+// is rendered). null = rectangle (default; shader early-out, zero cost). Radii
+// / extents are in surface LOGICAL pixels.
+//
+// Vocabulary:
+//   rounded-rect:           uniform corner radius
+//   rounded-rect-per-corner: independent (tl, tr, br, bl) radii
+//   superellipse:           |x/a|^n + |y/b|^n = 1 (n=4..6 is a macOS-like
+//                           squircle; n=2 is an ellipse; n -> inf approaches
+//                           a sharp rect). `radius` is the half-extent in the
+//                           SHORTER axis -- exposed for symmetry with the
+//                           rounded-rect variants and the compositor uses the
+//                           surface's actual extents in both axes regardless.
+export type SurfaceShape =
+  | null
+  | { kind: "rounded-rect"; radius: number }
+  | { kind: "rounded-rect-per-corner";
+      tl: number; tr: number; br: number; bl: number }
+  | { kind: "superellipse"; exponent: number; radius: number };
+
 // Snapshot of a window. Matches WindowSnapshot in wm/index.ts (kept in sync
 // by hand because wm/ is core-side; this is what arrives over the wire).
 export interface WindowSnapshot {
@@ -159,6 +181,14 @@ export interface PluginWindows extends PluginWindowObserver {
   // boundary -- their textures live on a separate device, so the cross-device
   // mask path is unimplemented; calling this from a Worker plugin rejects.
   setMask(id: number, mask: GPUTexture | null): Promise<void>;
+
+  // Analytic per-surface shape (rounded rect, per-corner radii, superellipse,
+  // or null = rectangle). Evaluated by an SDF in the compositor's fragment
+  // shader and multiplied into the surface's premultiplied output -- composes
+  // with setMask. Cheap: a uniform-write only, no GPU resources. Available to
+  // both in-thread and Worker plugins (the payload is plain data, not a
+  // GPUTexture). Radii are in surface LOGICAL pixels.
+  setShape(id: number, shape: SurfaceShape): Promise<void>;
 
   // Per-channel tint multiplier on the sampled rgba (Phase 5.5a). Identity
   // = (1,1,1,1); missing fields default to 1. Cheap (uniform write next
@@ -347,6 +377,16 @@ export function createPluginWindows(
       await endpoint.request("windows.set-mask", { id, mask: mask as unknown as Json });
     },
 
+    async setShape(id, shape): Promise<void> {
+      if (typeof id !== "number") {
+        throw new TypeError("setShape id must be a number");
+      }
+      validateShape(shape);
+      // SurfaceShape is plain numbers + a discriminator string, Json-safe.
+      // eslint-disable-next-line no-restricted-syntax
+      await endpoint.request("windows.set-shape", { id, shape: shape as unknown as Json });
+    },
+
     async setTint(id, t): Promise<void> {
       if (typeof id !== "number") {
         throw new TypeError("setTint id must be a number");
@@ -445,6 +485,43 @@ function validateMargin(m: SurfaceMargin): void {
     const v = m[k];
     if (v !== undefined && (typeof v !== "number" || !Number.isFinite(v) || v < 0)) {
       throw new TypeError(`setOutputMargin ${k} must be a non-negative finite number`);
+    }
+  }
+}
+
+function validateShape(shape: SurfaceShape): void {
+  if (shape === null) return;
+  if (typeof shape !== "object") {
+    throw new TypeError("setShape shape must be a SurfaceShape object or null");
+  }
+  const requireNonNeg = (name: string, v: unknown): void => {
+    if (typeof v !== "number" || !Number.isFinite(v) || v < 0) {
+      throw new TypeError(`setShape: ${name} must be a non-negative finite number`);
+    }
+  };
+  switch (shape.kind) {
+    case "rounded-rect":
+      requireNonNeg("radius", shape.radius);
+      return;
+    case "rounded-rect-per-corner":
+      requireNonNeg("tl", shape.tl);
+      requireNonNeg("tr", shape.tr);
+      requireNonNeg("br", shape.br);
+      requireNonNeg("bl", shape.bl);
+      return;
+    case "superellipse":
+      requireNonNeg("radius", shape.radius);
+      if (typeof shape.exponent !== "number" || !Number.isFinite(shape.exponent)
+          || shape.exponent < 2) {
+        throw new TypeError("setShape: exponent must be a finite number >= 2");
+      }
+      return;
+    default: {
+      // The discriminator was something else; surface a useful error.
+      const k = (shape as { kind?: unknown }).kind;
+      throw new TypeError(
+        `setShape: unknown shape kind ${JSON.stringify(k)} `
+        + `(expected "rounded-rect", "rounded-rect-per-corner", or "superellipse")`);
     }
   }
 }

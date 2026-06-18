@@ -77,6 +77,16 @@ struct Uniforms {
   cropUV      : vec4f,
   tint        : vec4f,
   colorMatrix : mat4x4f,
+  // Per-surface shape. .x = kind (0=rect / 1=rounded-rect uniform /
+  // 2=rounded-rect per-corner / 3=superellipse); .y = surface logical width
+  // (px) the SDF eval works against; .z = surface logical height (px);
+  // .w = uniform corner radius (px) when kind=1, superellipse outer radius
+  // (px) when kind=3, unused when kind=0/2.
+  shape       : vec4f,
+  // kind=2 (per-corner): tl, tr, br, bl radii in px.
+  // kind=3 (superellipse): .x = exponent (>= 2), .yzw unused.
+  // kind=0/1: unused.
+  shapeExtra  : vec4f,
 };
 @group(0) @binding(2) var<uniform> u : Uniforms;
 @vertex fn vs(@builtin(vertex_index) i : u32) -> VsOut {
@@ -113,6 +123,71 @@ struct Uniforms {
 @group(0) @binding(1) var tex : texture_2d<f32>;
 @group(0) @binding(3) var maskSamp : sampler;
 @group(0) @binding(4) var maskTex : texture_2d<f32>;
+// Signed distance to an axis-aligned rounded rectangle centered at the origin
+// with half-extents \`he\` and corner radius \`r\`. Negative inside, positive
+// outside; |grad| = 1 wherever the field is smooth. Standard rounded-rect SDF.
+fn sdfRoundedRect(p : vec2f, he : vec2f, r : f32) -> f32 {
+  let q = abs(p) - he + vec2f(r);
+  return min(max(q.x, q.y), 0.0) + length(max(q, vec2f(0.0))) - r;
+}
+
+// Per-corner rounded rect: pick the radius for the quadrant \`p\` falls into,
+// then evaluate the same SDF in that quadrant only. Radii order is
+// (tl, tr, br, bl). p.x<0 is left half; p.y<0 is top half.
+fn sdfRoundedRectPerCorner(p : vec2f, he : vec2f,
+                           tl : f32, tr : f32, br : f32, bl : f32) -> f32 {
+  var r : f32 = 0.0;
+  if (p.x < 0.0) { if (p.y < 0.0) { r = tl; } else { r = bl; } }
+  else           { if (p.y < 0.0) { r = tr; } else { r = br; } }
+  return sdfRoundedRect(p, he, r);
+}
+
+// Signed distance to a superellipse |x/a|^n + |y/b|^n = 1, approximated as
+// (R(p) - 1) * min(a, b), where R(p) = (|x/a|^n + |y/b|^n)^(1/n). The factor
+// makes the field roughly unit-scaled near the boundary, so the smoothstep
+// AA width below has the same look as for the other shapes. Negative inside,
+// positive outside. \`he\` are the half-extents (a, b); \`n\` is the exponent
+// (n=2 -> ellipse; n=4..6 -> macOS-like squircle; n -> inf approaches rect).
+// Guards against n < 2 by clamping (n < 2 gives concave shapes that are not
+// the intended use).
+fn sdfSuperellipse(p : vec2f, he : vec2f, n : f32) -> f32 {
+  let exp = max(n, 2.0);
+  let ax = abs(p.x) / max(he.x, 1e-5);
+  let ay = abs(p.y) / max(he.y, 1e-5);
+  let r = pow(pow(ax, exp) + pow(ay, exp), 1.0 / exp);
+  let scale = min(he.x, he.y);
+  return (r - 1.0) * scale;
+}
+
+// Convert a signed-distance value into [0,1] coverage with ~1px wide
+// smoothstep anti-aliasing (the SDFs above have |grad| ~ 1 so the smoothstep
+// width is in the same units the SDF returns -- logical pixels).
+fn sdfCoverage(d : f32) -> f32 {
+  return 1.0 - smoothstep(-0.5, 0.5, d);
+}
+
+// Evaluate the per-surface shape SDF and return [0,1] coverage. \`uv\` is the
+// surfUV inside [0,1]; positions outside that range are caller-handled (the
+// margin band gets coverage from the existing \`inside\` step). Kind 0 returns
+// 1.0 (rect; the early-out keeps the common case cheap).
+fn shapeCoverage(uv : vec2f, kind : u32,
+                 sizePx : vec2f, r : f32, extra : vec4f) -> f32 {
+  if (kind == 0u) { return 1.0; }
+  let p  = (uv - vec2f(0.5)) * sizePx;
+  let he = sizePx * 0.5;
+  if (kind == 1u) {
+    return sdfCoverage(sdfRoundedRect(p, he, r));
+  }
+  if (kind == 2u) {
+    return sdfCoverage(
+      sdfRoundedRectPerCorner(p, he, extra.x, extra.y, extra.z, extra.w));
+  }
+  if (kind == 3u) {
+    return sdfCoverage(sdfSuperellipse(p, he, extra.x));
+  }
+  return 1.0;
+}
+
 // Undo a wl_surface buffer transform: map a surface-space [0,1] coordinate to
 // the buffer-space coordinate to sample. Codes are the wl_output.transform
 // enum (0 normal, 1 90, 2 180, 3 270, 4 flipped, 5..7 flipped+rotated). Axis-
@@ -160,9 +235,20 @@ fn applyBufferTransform(uv : vec2f, t : f32) -> vec2f {
   surf = u.colorMatrix * surf;
   surf = surf * u.tint;
 
-  // Premultiplied: rgb and alpha both multiplied by inside * mAlpha * opacity.
-  // Matches the pipeline's premultiplied blend.
-  let k = inside * mAlpha * u.fx.x;
+  // Per-surface shape coverage: SDF-based rounded-rect / per-corner / super-
+  // ellipse. Evaluated only inside the surface's nominal [0,1] region (the
+  // margin band's contribution to surf is already 0 via the \`inside\` factor;
+  // evaluating shape there would just multiply 0 by another value -- still 0,
+  // so the clamp here is just a micro-optimization). Composes multiplicatively
+  // with the existing mask alpha so a plugin can use BOTH (mask for arbitrary
+  // shapes, shape for rounded corners; the intersection is rendered).
+  let shapeCov = shapeCoverage(
+    clamp(in.surfUV, vec2f(0.0), vec2f(1.0)),
+    u32(u.shape.x), u.shape.yz, u.shape.w, u.shapeExtra);
+
+  // Premultiplied: rgb and alpha both multiplied by inside * shapeCov *
+  // mAlpha * opacity. Matches the pipeline's premultiplied blend.
+  let k = inside * shapeCov * mAlpha * u.fx.x;
   return vec4f(surf.rgb * k, surf.a * k);
 }
 `;
@@ -377,6 +463,19 @@ export interface DawnGlobals {
   GPUMapMode: typeof GPUMapMode;
 }
 
+// Per-surface analytic shape used to mask the on-screen coverage. Composed
+// MULTIPLICATIVELY with the optional alpha-mask texture (so a plugin can use
+// either or both -- a rounded rect for the corners + a custom alpha texture
+// for, say, a non-rectangular shadow). Evaluated by an SDF in the fragment
+// shader; the rectangular case (`null`) is an early-out and pays no extra
+// cost. Radii / extents are in surface logical pixels.
+export type SurfaceShape =
+  | null                                    // rectangle (default)
+  | { kind: "rounded-rect"; radius: number }
+  | { kind: "rounded-rect-per-corner";
+      tl: number; tr: number; br: number; bl: number }
+  | { kind: "superellipse"; exponent: number; radius: number };
+
 // Per-surface render state mutated by setSurfaceOpacity/Transform/OutputMargin
 // (core-plugin-api.md §1) and consumed by the WGSL Uniforms struct each frame.
 // Defaults: opacity=1, identity transform, zero margin -- equivalent to the
@@ -401,6 +500,9 @@ interface SurfaceFx {
   // = 4 columns of 4 components). Identity by default. WGSL mat4x4f is
   // column-major; we pack the same way.
   colorMatrix: Float32Array;
+  // Analytic shape mask (rounded rect / superellipse / ...). null = full
+  // rectangular coverage; the shader's kind=0 branch is an early-out.
+  shape: SurfaceShape;
 }
 
 interface Surface {
@@ -468,8 +570,9 @@ interface Surface {
 interface FrozenSnapshot { tex: GPUTexture; view: GPUTextureView; w: number; h: number; }
 
 // 6 vec4s (placement, transform, margin, fx, cropUV, tint) + 1 mat4x4f
-// (colorMatrix, packed as 4 vec4 columns) = 10 vec4s = 40 floats = 160 bytes.
-const UNIFORM_BYTES = 160;
+// (colorMatrix, packed as 4 vec4 columns) + 2 vec4s (shape, shapeExtra) =
+// 12 vec4s = 48 floats = 192 bytes.
+const UNIFORM_BYTES = 192;
 const UNIFORM_FLOATS = UNIFORM_BYTES / 4;
 
 function identityColorMatrix(): Float32Array {
@@ -486,7 +589,47 @@ function defaultFx(): SurfaceFx {
     marginTop: 0, marginRight: 0, marginBottom: 0, marginLeft: 0,
     tintR: 1, tintG: 1, tintB: 1, tintA: 1,
     colorMatrix: identityColorMatrix(),
+    shape: null,
   };
+}
+
+// Pack a SurfaceShape into the per-surface uniform buffer at the shape /
+// shapeExtra vec4 slots (float indices 40..47). `sizeXPx`/`sizeYPx` are the
+// surface's logical pixel size used by the SDF eval; radii / per-corner /
+// superellipse params are clamped to non-negative finite numbers (a bad
+// value would propagate as NaN through the smoothstep and zero coverage --
+// "weird invisible window" failure mode, easier to reason about with a
+// clamp than with NaN propagation).
+function packShape(data: Float32Array, shape: SurfaceShape,
+                   sizeXPx: number, sizeYPx: number): void {
+  // shape (vec4 #10, floats 40..43): kind, sizeXpx, sizeYpx, radius
+  // shapeExtra (vec4 #11, floats 44..47): kind-specific
+  data[41] = sizeXPx;
+  data[42] = sizeYPx;
+  if (shape === null) { data[40] = 0; return; }
+  switch (shape.kind) {
+    case "rounded-rect":
+      data[40] = 1;
+      data[43] = sanitizeNonNeg(shape.radius);
+      return;
+    case "rounded-rect-per-corner":
+      data[40] = 2;
+      data[44] = sanitizeNonNeg(shape.tl);
+      data[45] = sanitizeNonNeg(shape.tr);
+      data[46] = sanitizeNonNeg(shape.br);
+      data[47] = sanitizeNonNeg(shape.bl);
+      return;
+    case "superellipse":
+      data[40] = 3;
+      data[43] = sanitizeNonNeg(shape.radius);
+      // The shader clamps n>=2 inline; pass through here.
+      data[44] = Number.isFinite(shape.exponent) ? shape.exponent : 2;
+      return;
+  }
+}
+
+function sanitizeNonNeg(v: number): number {
+  return Number.isFinite(v) && v >= 0 ? v : 0;
 }
 
 // The executor's per-bufferId record. Holds the GPU side of a cached client
@@ -1279,6 +1422,21 @@ export class JsCompositor implements CompositorSink {
     this.damageSurface(id);
   }
 
+  // Install an analytic shape on a surface: a rounded rect (uniform radius or
+  // per-corner), a superellipse (squircle), or null to restore a plain
+  // rectangle. The compositor evaluates an SDF in the fragment shader and
+  // multiplies its [0,1] coverage into the surface's premultiplied output --
+  // composes with the (optional) alpha mask, so a plugin may use both. Radii
+  // / extents are in surface LOGICAL pixels.
+  //
+  // Cheap: uniform-write only (no bind-group rebuild, no GPU resources). A
+  // null shape is the default and an early-out in the shader.
+  setSurfaceShape(id: number, shape: SurfaceShape): void {
+    const s = this.ensureSurface(id);
+    s.fx.shape = shape;
+    this.damageFull();  // shape changes the entire visible footprint
+  }
+
   // Install (or clear) an alpha mask on a surface. The mask is sampled across
   // the full expanded (surface + outputMargin) region; its .a channel modulates
   // the surface's alpha (and premultiplied rgb). null restores the default
@@ -1896,6 +2054,12 @@ export class JsCompositor implements CompositorSink {
     data[22] = fx.tintB; data[23] = fx.tintA;
     // colorMatrix: 4 column vectors of 4 components each (mat4x4f, column-major)
     data.set(fx.colorMatrix, 24);
+    // shape: (kind, sizeXpx, sizeYpx, radius) + shapeExtra (4 params per kind).
+    // The SDF evaluates in surface-LOGICAL pixel space; pw/ph are already in
+    // logical pixels (the placement is in logical output coords, not device).
+    // Frozen surfaces sample the snapshot at the same on-screen rect; the
+    // shape applies the same way.
+    packShape(data, fx.shape, pw, ph);
     this.device.queue.writeBuffer(s.uniformBuf, 0, data);
   }
 

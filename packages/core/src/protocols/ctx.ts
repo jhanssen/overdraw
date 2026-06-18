@@ -211,6 +211,12 @@ export interface CompositorSink {
   // device; Worker plugins do not, so the cross-device handle path is
   // currently unimplemented for them).
   setSurfaceMask?(id: number, mask: GPUTexture | null): void;
+  // Analytic shape mask: rounded rect / per-corner / superellipse. The
+  // compositor evaluates an SDF in the fragment shader and multiplies the
+  // coverage into the surface's premultiplied output -- composes with the
+  // optional alpha mask. null = rectangle (default; shader early-out).
+  // Radii are in surface LOGICAL pixels.
+  setSurfaceShape?(id: number, shape: import("../gpu/compositor.js").SurfaceShape): void;
   removeSurface(id: number): void;
   takeImportedSurfaces(): Array<{ id: number; width: number; height: number }>;
   takeFreedBuffers(): number[];
