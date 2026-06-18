@@ -30,6 +30,33 @@ device/logical coordinate split + integer `set_buffer_scale` + fractional
 These are wired/advertised but incomplete. A client may use them and get nothing,
 with no error. Worst-first.
 
+- **NVIDIA proprietary clients race the compositor's sample (no explicit-sync
+  protocol).** `wp_linux_drm_syncobj_v1` is NOT implemented. The compositor's
+  per-frame `BeginAccess` exports the dmabuf's implicit-sync acquire fence
+  (`DMA_BUF_IOCTL_EXPORT_SYNC_FILE` with `DMA_BUF_SYNC_WRITE`) and Dawn waits
+  on it before sampling — this works correctly for Mesa producers (kernel
+  attaches the GPU write fence to the dmabuf on submit). The NVIDIA
+  proprietary GL/GLES driver, by design, does NOT attach implicit fences to
+  dmabufs: it expects the compositor to use explicit-sync via
+  `wp_linux_drm_syncobj_v1`. Without that protocol, our `EXPORT_SYNC_FILE`
+  returns an already-signaled stub fence (verified empirically:
+  `SYNC_IOC_FILE_INFO` reports `num_fences=1 status=1` for every export, and
+  CPU-blocking on the fence is instant). Sampling proceeds with no
+  ordering guarantee against the client's pending GPU writes.
+  Observable as intermittent black / decoration-only frames under high
+  frame rate (mouse motion, cursor blink) — roughly 1-in-N. The bundled
+  decoration plugin's solid backdrop makes the same race visually
+  distinctive (gradient shows through where client pixels are
+  uninitialized); without decoration the missed frame is a black flash
+  that's easy to dismiss. Fix: implement `wp_linux_drm_syncobj_v1`
+  (manager / timeline / per-surface objects; capture acquire+release
+  timeline points at commit; convert acquire point to a sync_file via
+  `drmSyncobjExportSyncFile` and feed into the per-frame `BeginAccess`
+  instead of the implicit-sync `EXPORT_SYNC_FILE`; signal the release
+  point when the compositor's sample submit completes). wlroots'
+  `wlr_linux_drm_syncobj_v1.c` is a reasonable reference (~553 lines).
+  Until then, NVIDIA clients are visually unreliable under load.
+
 - **`xdg_toplevel` window-management state is implemented; residual no-ops are
   narrow.** `set_maximized`/`unset`, `set_fullscreen`/`unset`, `set_minimized`,
   `set_min_size`/`set_max_size`, and interactive `move`/`resize` route through
@@ -440,9 +467,12 @@ pacing or per-output routing. Tracked for a focused fix.
   advertising both the alpha and opaque DRM fourcc per format (e.g. ARGB8888 +
   XRGB8888); `wl_seat`/`wl_pointer`/`wl_keyboard` event version gating to the
   resource's bound version; and the dmabuf buffer-release lifecycle above. The
-  implicit-sync acquire (export the client dmabuf's read fence via
-  `DMA_BUF_IOCTL_EXPORT_SYNC_FILE`, import as a Dawn `SharedFence`, wait in
-  `BeginAccess`) is implemented.
+  implicit-sync acquire (export the client dmabuf's write fence via
+  `DMA_BUF_IOCTL_EXPORT_SYNC_FILE` with `DMA_BUF_SYNC_WRITE`, import as a Dawn
+  `SharedFence`, wait in `BeginAccess`) is implemented and works for Mesa
+  producers. NVIDIA proprietary clients DO NOT attach implicit fences to
+  their dmabufs and need `wp_linux_drm_syncobj_v1`, which is unimplemented;
+  see the "Read first" entry.
 
 **Color:** the GPU process picks the first non-sRGB advertised swapchain format and
 the shader passes client bytes (already sRGB) through. Correct for opaque content;
