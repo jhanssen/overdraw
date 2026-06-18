@@ -82,17 +82,19 @@ void installCrashHandler() {
 
 void usleepShort() { ::usleep(200); }
 
-// Export a dmabuf's implicit READ-acquire fence (the producer's outstanding
-// WRITE work) as a sync_file fd, so the consumer can make its GPU work wait on
-// it. Returns -1 if unavailable (then there is nothing to wait on). This is the
-// implicit-sync acquire a compositor must perform before sampling a client
-// dmabuf that did not use explicit sync (wp_linux_drm_syncobj_v1). The returned
-// fd is owned by the caller. Export the sync_file, then wait on it on the GPU
-// timeline -- a CPU poll does NOT order the GPU work, so the fence must be
-// imported into the access bracket.
+// Export a dmabuf's implicit-sync acquire fence (the producer's outstanding
+// WRITE work) as a sync_file fd. A consumer that wants to wait on the
+// producer's writes asks for SYNC_WRITE (the kernel returns a sync_file of
+// the dmabuf's attached WRITE fences -- exactly the work the producer has
+// pending that the consumer's read must happen-after). The flag is the
+// inverse of what intuition suggests: SYNC_READ would return the dmabuf's
+// outstanding READ fences (what a producer waits on before writing again).
+// Returns -1 on failure; the returned fd is owned by the caller. Export the
+// sync_file, then import into the per-frame BeginAccess so the GPU waits on
+// it -- a CPU poll does NOT order the GPU work.
 int exportDmabufAcquireFence(int dmabufFd) {
     struct dma_buf_export_sync_file req{};
-    req.flags = DMA_BUF_SYNC_READ;
+    req.flags = DMA_BUF_SYNC_WRITE;
     req.fd = -1;
     if (::ioctl(dmabufFd, DMA_BUF_IOCTL_EXPORT_SYNC_FILE, &req) != 0) {
         std::fprintf(stderr, "[gpu] EXPORT_SYNC_FILE failed errno=%d\n", errno);
