@@ -104,14 +104,36 @@ bool Allocator::probe(const wgpu::Adapter& adapter) {
             for (size_t i = 0; i < drmCaps.propertiesCount; ++i) {
                 if (drmCaps.properties[i].modifierPlaneCount != 1) continue;  // single-plane only
                 uint64_t mod = drmCaps.properties[i].modifier;
+
+                // Cross-check that GBM can actually allocate this modifier
+                // with GBM_BO_USE_RENDERING. Dawn's `drmCaps` lists every
+                // modifier that Dawn would IMPORT successfully for sampling,
+                // but the client (kitty / any Wayland dmabuf client) allocates
+                // its buffers through GBM, which intersects the requested
+                // usage with what the chipset can render to. Without this
+                // filter we advertise some modifiers that GBM picks but can't
+                // render coherently -- the GPU writes bytes in one tile layout
+                // while the sampler reads another, producing periodic black /
+                // garbage frames (the symptom kitty's cursor blink exposes;
+                // mirror of the KMS scanout-ring fix that intersected the
+                // SCANOUT+RENDERING set for compositor-allocated buffers).
+                gbm_bo* probe = gbm_bo_create_with_modifiers2(
+                    gbm_, 64, 64, fourcc, &mod, 1, GBM_BO_USE_RENDERING);
+                if (!probe) continue;
+                // Also reject multi-plane (aux-plane) layouts here: the import
+                // path is single-plane (linux-dmabuf-v1 + SharedTextureMemory
+                // both assume one plane).
+                const bool singlePlane = gbm_bo_get_plane_count(probe) == 1;
+                gbm_bo_destroy(probe);
+                if (!singlePlane) continue;
+
                 table_.push_back(FormatTableEntry{fourcc, 0, mod});
 
-                // For the primary fourcc (ARGB8888), record the GBM-allocatable
-                // subset, used when WE allocate server-side buffers.
+                // Server-side allocator subset (used when WE allocate buffers
+                // for overlay surfaces, compose bufs, etc). Same intersection
+                // we just verified, so record it for the primary fourcc.
                 if (fourcc == DRM_FORMAT_ARGB8888) {
-                    gbm_bo* bo = gbm_bo_create_with_modifiers2(
-                        gbm_, 64, 64, fourcc, &mod, 1, GBM_BO_USE_RENDERING);
-                    if (bo) { modifiers_.push_back(mod); gbm_bo_destroy(bo); }
+                    modifiers_.push_back(mod);
                 }
             }
             table_.push_back(FormatTableEntry{fourcc, 0, DRM_FORMAT_MOD_INVALID});
