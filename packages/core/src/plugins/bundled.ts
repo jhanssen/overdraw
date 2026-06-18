@@ -80,6 +80,16 @@ export const BUNDLED_PLUGINS: ReadonlyArray<BundledPluginSpec> = [
     module: "@overdraw/plugin-hotkey-default",
     configFrom: (config) => config.hotkeys ?? DEFAULT_HOTKEYS,
   },
+  {
+    // Decoration provider. Loads after everything else; the broker only
+    // assigns windows when a provider is registered AND a window matches,
+    // so load order relative to other plugins doesn't matter beyond core
+    // bring-up. Placed last to keep boot-error surface for missing GPU
+    // dependencies isolated.
+    name: "decoration-default",
+    module: "@overdraw/plugin-decoration-default",
+    configFrom: (config) => config.decoration,
+  },
 ];
 
 // Convert a spec to the runtime's ResolvedPlugin shape. The restart fields

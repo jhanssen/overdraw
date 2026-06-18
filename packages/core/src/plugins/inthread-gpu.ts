@@ -86,6 +86,15 @@ export interface InThreadGpuDeps {
   // mirroring how sdk.transitions only works when sceneRegistry is
   // wired).
   interceptBroker?: import("../intercept/broker.js").InterceptBroker;
+  // Generic ring-surface lifecycle hooks the decoration broker reads.
+  // The Worker GPU broker calls equivalents on surface.alloc /
+  // surface.present; the in-thread path mirrors them here so the broker's
+  // first-frame gate releases regardless of which transport the decoration
+  // plugin uses. onSurfaceAllocated fires with the `decorates` tag's window
+  // id (only present for the decoration path). onSurfacePresented fires
+  // on every present (the broker filters its own).
+  onSurfaceAllocated?: (surfaceId: number, decoratesWindowId: number) => void;
+  onSurfacePresented?: (surfaceId: number) => void;
 }
 
 // Per-plugin GPU SDK construction. The plugin's name flows in so the overlay
@@ -96,7 +105,8 @@ export interface InThreadGpuDeps {
 export function createInThreadGpu(
   pluginName: string, deps: InThreadGpuDeps,
 ): { gpu: PluginGpu; makeRingSurface: RingMaker; stop: () => void } {
-  const { coreDevice, globals, overlays, compositor } = deps;
+  const { coreDevice, globals, overlays, compositor,
+          onSurfaceAllocated, onSurfacePresented } = deps;
   installWebGPUGlobalsOnce(globals);
   let stopped = false;
 
@@ -138,6 +148,13 @@ export function createInThreadGpu(
             width, height,
             margin: allocExtra.margin as number | undefined,
           });
+    // Fire the decoration-broker alloc hook for decoration surfaces. The
+    // Worker GPU broker does the equivalent for surface.alloc; we mirror it
+    // here so the broker's first-frame gate releases for in-thread bundled
+    // decoration plugins too.
+    if (typeof decorates === "number") {
+      onSurfaceAllocated?.(handle.surfaceId, decorates);
+    }
 
     const slots = allocSlots(width, height);
     // -1 = no slot held; otherwise the index getCurrentTexture last handed
@@ -164,7 +181,7 @@ export function createInThreadGpu(
     }
 
     const surface: Surface = {
-      width, height, rect: handle.rect,
+      width, height, rect: handle.rect, surfaceId: handle.surfaceId,
 
       async getCurrentTexture(): Promise<GPUTexture> {
         if (destroyed) throw new Error("surface used after destroy()");
@@ -196,6 +213,9 @@ export function createInThreadGpu(
         // ordering carries the plugin's writes into the compositor's read.
         compositor.setSurfaceTexture?.(handle.surfaceId,
           slots[justPresented], width, height);
+        // Mirror the Worker path's surface.present hook so the decoration
+        // broker's first-present gate releases for in-thread plugins too.
+        onSurfacePresented?.(handle.surfaceId);
 
         // Demote the previously presented slot to DRAINING + free it once
         // the compositor's last-sampling submit completes. Same-device

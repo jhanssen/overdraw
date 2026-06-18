@@ -129,6 +129,12 @@ export interface Surface {
   readonly width: number;
   readonly height: number;
   readonly rect: { x: number; y: number; width: number; height: number };
+  // The compositor's surface id this ring is wired into. Stable for the
+  // surface's lifetime; useful for callers that want to apply a per-surface
+  // primitive that the SDK exposes only by surface id (sdk.windows.setShape /
+  // setMask / setTint / etc.). Hidden by the core for non-decorator overlays
+  // would be a separate capability gate; not enforced today.
+  readonly surfaceId: number;
   // Acquire the GPUTexture to render into this frame (dmabuf-backed, BGRA8). ASYNC:
   // a swapchain-style acquire -- it claims a FREE ring slot, awaiting one if every
   // slot is in use (producer rendering / consumer reading / draining). The returned
@@ -283,7 +289,7 @@ export async function createPluginGpu(
       isStopped: () => stopped,
     });
     return {
-      width, height, rect: r.rect,
+      width, height, rect: r.rect, surfaceId: r.overlayId,
       async getCurrentTexture(): Promise<GPUTexture> {
         if (destroyed) throw new Error("surface used after destroy()");
         const r = await producer.acquire();

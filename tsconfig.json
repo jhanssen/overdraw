@@ -17,6 +17,8 @@
     { "path": "./packages/plugin-core-actions" },
     { "path": "./packages/plugin-cursor-actions" },
     { "path": "./packages/plugin-config-actions" },
+    { "path": "./packages/decoration-types" },
+    { "path": "./packages/plugin-decoration-default" },
     { "path": "./packages/core" }
   ]
 }

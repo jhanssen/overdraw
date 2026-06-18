@@ -1,0 +1,16 @@
+{
+  "name": "@overdraw/plugin-decoration-default",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Bundled decoration plugin: draws a rounded-corner border with optional gradient around every (or pattern-matched) window. Ships with overdraw and registers in the decoration namespace at priority 0 (the floor). User configs may override by registering a higher-priority decoration plugin that registers the same app_id pattern earlier.",
+  "type": "module",
+  "main": "./dist/index.js",
+  "exports": {
+    ".": {
+      "default": "./dist/index.js"
+    }
+  },
+  "dependencies": {
+    "@overdraw/decoration-types": "*"
+  }
+}

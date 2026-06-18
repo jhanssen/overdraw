@@ -79,6 +79,13 @@ export interface OverdrawConfig {
   // `import type { KeyboardConfig } from "@overdraw/hotkey-types"` and
   // write `hotkeys: cfg satisfies KeyboardConfig`.
   hotkeys?: unknown;
+  // Bundled-plugin config slice for the decoration provider. Same verbatim
+  // pass-through pattern: the bundled decoration plugin owns the schema
+  // (`DecorationPluginConfig` from `@overdraw/decoration-types`). For typed
+  // editing, users may
+  // `import type { DecorationPluginConfig } from "@overdraw/decoration-types"`
+  // and write `decoration: cfg satisfies DecorationPluginConfig`.
+  decoration?: unknown;
   // User-defined actions. Each entry is a name -> handler function
   // registered into the core action registry by the bundled
   // @overdraw/plugin-config-actions. Handlers run in the main thread
@@ -147,6 +154,8 @@ export interface ResolvedConfig {
   focus: unknown;
   // Same verbatim pass-through to the bundled hotkey plugin.
   hotkeys: unknown;
+  // Same verbatim pass-through to the bundled decoration plugin.
+  decoration: unknown;
   // User-defined action handlers. The bundled @overdraw/plugin-config-
   // actions registers each entry into the action registry. Function
   // references survive only because the plugin is in-thread (bundled);

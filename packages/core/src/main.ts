@@ -806,6 +806,11 @@ runtime = new PluginRuntime({
     compositor,
     sceneRegistry,
     interceptBroker,
+    // Same decoration-broker plumbing the GPU broker uses for Worker plugins:
+    // notify on alloc (with the `decorates` window id) and on present, so the
+    // broker's first-frame gate releases for in-thread decoration plugins too.
+    onSurfaceAllocated: (sid, win) => decorationBroker.onSurfaceAllocated(sid, win),
+    onSurfacePresented: (sid) => decorationBroker.onSurfacePresented(sid),
   },
   bus: pluginBus,
   resolveDeferredRefs: deferredRefResolver,
