@@ -112,6 +112,48 @@ export default async function init(sdk: SdkLike): Promise<void> {
     },
   });
 
+  // Move the focused window to a specific output. The launcher resolves the
+  // focus + the target output's shown workspace and applies the move
+  // (workspace plugin's moveWindow). The new window's rect comes from the
+  // target output's tile region via relayout.
+  sdk.actions.register({
+    name: "window.move-to-output",
+    description: "Move the keyboard-focused window to the workspace currently " +
+      "shown on the given output. Params: { outputId: number }.",
+    handler: async (params: unknown): Promise<null> => {
+      if (typeof params !== "object" || params === null
+          || typeof (params as { outputId?: unknown }).outputId !== "number") {
+        throw new TypeError("window.move-to-output: expected { outputId: number }");
+      }
+      sdk.events.emit("window.move-to-output-requested",
+        { outputId: (params as { outputId: number }).outputId });
+      return null;
+    },
+  });
+
+  // Cycle the focused window to the next / previous output by ascending id
+  // (wraps). Convenience for the common Mod+Shift+arrow-key hotkey bind;
+  // resolves the target outputId from the live output set.
+  sdk.actions.register({
+    name: "window.move-to-next-output",
+    description: "Move the keyboard-focused window to the next output by id " +
+      "(wraps). No params.",
+    handler: async (): Promise<null> => {
+      sdk.events.emit("window.move-to-output-cycle-requested", { dir: "next" });
+      return null;
+    },
+  });
+
+  sdk.actions.register({
+    name: "window.move-to-prev-output",
+    description: "Move the keyboard-focused window to the previous output by id " +
+      "(wraps). No params.",
+    handler: async (): Promise<null> => {
+      sdk.events.emit("window.move-to-output-cycle-requested", { dir: "prev" });
+      return null;
+    },
+  });
+
   // Keyboard focus navigation. Cycles the keyboard focus through the WM's
   // toplevel stack (wrapping at the ends). The launcher resolves the current
   // focus + the stack order and applies the new focus; plugin context has

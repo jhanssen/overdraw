@@ -19,11 +19,20 @@ function captureTarget() {
 
 function snap(windows) {
   // Default every window to outputId 0 unless explicitly set; lets test
-  // inline objects stay terse.
-  const w = windows.map((win) => ({ outputId: 0, ...win }));
+  // inline objects stay terse. The driver consumes a windows Map keyed by
+  // surfaceId + an outputContent map of ordered ids per output; both are
+  // built from the flat array here.
+  const wins = windows.map((win) => ({ outputId: 0, ...win }));
+  const windowMap = new Map();
+  const outputContent = new Map([[0, []]]);
+  for (const w of wins) {
+    windowMap.set(w.id, w);
+    outputContent.get(0).push(w.id);
+  }
   return {
     outputs: [{ id: 0, rect: { x: 0, y: 0, width: 1000, height: 600 }, scale: 1 }],
-    windows: w,
+    windows: windowMap,
+    outputContent,
   };
 }
 

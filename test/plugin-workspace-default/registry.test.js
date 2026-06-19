@@ -338,12 +338,14 @@ test('applyMap: assigns to the shown workspace; emits state-bag + setOutputStack
   assert.deepEqual(sos[0].ids, [101]);
 });
 
-test('applyMap: members preserve insertion order', () => {
+test('applyMap: new windows become master (index 0); previous master shifts down', () => {
+  // Mapping 101, 102, 103 in order -> master is 103 (newest); 102 next; 101
+  // at the tail. dwm-style: new window IS master until promoted/reordered.
   let state = init('test').state;
   let r = applyMap(state, 101, 0, 'test'); state = r.state;
   r = applyMap(state, 102, 0, 'test'); state = r.state;
   r = applyMap(state, 103, 0, 'test'); state = r.state;
-  assert.deepEqual(current(state).members, [101, 102, 103]);
+  assert.deepEqual(current(state).members, [103, 102, 101]);
 });
 
 test('applyMap: idempotent for an already-tracked surface', () => {

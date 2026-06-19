@@ -110,28 +110,28 @@ test("workspace plugin: move-window + show isolates a workspace's clients (pixel
       (l) => l.length === 2 && l[0].members.length === 1 && l[1].members.length === 1,
       { what: "B moved to workspace 2" });
 
-    // The WM keeps tiling both windows (it has no concept of workspaces).
-    // The COMPOSITOR's setOutputStack now lists only A's surfaceId, so
-    // the master-tile (B's location) renders black; the stack-tile renders
-    // A's color. The WM's layout is unchanged: A still at half-output.
+    // After the move, workspace 1 has only A: the layout-driver lays out a
+    // 1-window master-stack, A spans the full tile region. The old master
+    // tile (formerly B) and the old stack tile (formerly A) both now show
+    // A's color.
     const px1 = await readUntil(c, (p) =>
-      pixelMatches(pixelAt(p, OUT.width, mcx, mcy), BLACK, 4)
+      pixelMatches(pixelAt(p, OUT.width, mcx, mcy), bgraA, 4)
       && pixelMatches(pixelAt(p, OUT.width, scx, scy), bgraA, 4));
-    assert.ok(pixelMatches(pixelAt(px1, OUT.width, mcx, mcy), BLACK, 4),
-      `B's tile should be cleared to black after moving B to ws2; got ${pixelAt(px1, OUT.width, mcx, mcy)}`);
+    assert.ok(pixelMatches(pixelAt(px1, OUT.width, mcx, mcy), bgraA, 4),
+      `master tile shows A after move; got ${pixelAt(px1, OUT.width, mcx, mcy)}`);
     assert.ok(pixelMatches(pixelAt(px1, OUT.width, scx, scy), bgraA, 4),
-      `A's tile should still show A's color; got ${pixelAt(px1, OUT.width, scx, scy)}`);
+      `stack tile shows A after move; got ${pixelAt(px1, OUT.width, scx, scy)}`);
 
-    // Show workspace 2 (B). Compositor's setOutputStack now lists only B;
-    // master-tile renders B, stack-tile renders black.
+    // Show workspace 2 (B). Now workspace 2 has only B: B spans the full
+    // tile region; A is gone from this output.
     await c.runtime.invokeAction("workspace.show", { index: 2 });
     const px2 = await readUntil(c, (p) =>
       pixelMatches(pixelAt(p, OUT.width, mcx, mcy), bgraB, 4)
-      && pixelMatches(pixelAt(p, OUT.width, scx, scy), BLACK, 4));
+      && pixelMatches(pixelAt(p, OUT.width, scx, scy), bgraB, 4));
     assert.ok(pixelMatches(pixelAt(px2, OUT.width, mcx, mcy), bgraB, 4),
-      `B's tile should show B's color on workspace 2; got ${pixelAt(px2, OUT.width, mcx, mcy)}`);
-    assert.ok(pixelMatches(pixelAt(px2, OUT.width, scx, scy), BLACK, 4),
-      `A's tile should be cleared (A hidden on workspace 1); got ${pixelAt(px2, OUT.width, scx, scy)}`);
+      `master tile shows B on workspace 2; got ${pixelAt(px2, OUT.width, mcx, mcy)}`);
+    assert.ok(pixelMatches(pixelAt(px2, OUT.width, scx, scy), bgraB, 4),
+      `stack tile shows B on workspace 2; got ${pixelAt(px2, OUT.width, scx, scy)}`);
 
     const cur = await c.runtime.invokeAction("workspace.current", { outputId: 0 });
     assert.equal(cur.index, 2);

@@ -18,6 +18,7 @@ import { globSync } from "node:fs";
 import { installProtocols } from "./protocols/index.js";
 import { makeOutputForOutput as makeWlOutputForOutput } from "./protocols/wl_output.js";
 import { updateAllSurfaceResidency } from "./protocols/surface-residency.js";
+import { rebuildStackWithPopups } from "./protocols/xdg_popup.js";
 import { createLayoutDriver } from "./wm/layout-driver.js";
 import { createReservedZoneRegistry } from "./wm/reserved-zones.js";
 import { createFocusDriver } from "./protocols/focus-driver.js";
@@ -560,6 +561,19 @@ const animationsBroker = createAnimationsBroker(evaluator);
 const transitionsBroker = createTransitionsBroker({
   compositor, sceneRegistry,
   hasOutput: (outputId) => state.outputs?.has(outputId) ?? false,
+  // The transition's commit-time setOutputStack bypasses the windows-broker
+  // path (it calls compositor.setOutputStack directly with the bare
+  // toplevel ids). Mirror the windows-broker's full bookkeeping here so the
+  // post-transition state is fully consistent: update the filter registry,
+  // expand it via rebuildStackWithPopups (subsurfaces + popups), schedule a
+  // relayout so the layout-driver lays out the new visible set.
+  onSetOutputStackCommit: (outputId, ids) => {
+    state.outputToplevelStacks ??= new Map();
+    if (ids === null) state.outputToplevelStacks.delete(outputId);
+    else state.outputToplevelStacks.set(outputId, ids.slice());
+    rebuildStackWithPopups(state);
+    state.relayout?.("state-changed");
+  },
 });
 
 // Cursor (Phase 9c). Theme resolver + kinematic state + rule engine
@@ -783,6 +797,66 @@ pluginBus.subscribe("window.close-requested", () => {
   if (top && !top.destroyed) state.events.xdg_toplevel.send_close(top);
 });
 
+// window.move-to-output (explicit outputId): move the focused window to the
+// shown workspace on the target output. Resolves via the workspace
+// namespace's moveWindow (which knows the shown workspace per output) so
+// the WM + plugin stay consistent. The workspace plugin's moveWindow side
+// effect pushes setOutputStack on both source and target outputs, which the
+// windows-broker turns into a relayout.
+pluginBus.subscribe("window.move-to-output-requested", (_n, payload) => {
+  if (!state?.seat || !runtime || !state.outputs) return;
+  const targetOutputId = (payload as { outputId?: unknown }).outputId;
+  if (typeof targetOutputId !== "number") return;
+  if (!state.outputs.has(targetOutputId)) return;
+  const focused = state.seat.kbFocus?.surfaceId;
+  if (typeof focused !== "number") return;
+  // Move to workspace 1 on the target output: M5+ semantics is "the shown
+  // workspace on that output." We call the namespace's `current` to resolve
+  // its index, then moveWindow to that index.
+  const rt = runtime;
+  void (async () => {
+    const cur = await rt.invokeNamespace("workspace", "current", [targetOutputId]);
+    const targetIndex = (cur && typeof cur === "object"
+                         && typeof (cur as { index?: unknown }).index === "number")
+      ? (cur as { index: number }).index
+      : 1;
+    await rt.invokeNamespace(
+      "workspace", "moveWindow", [focused, targetIndex, targetOutputId]);
+  })().catch((e: unknown) => {
+    log.warn("core", `window.move-to-output failed: ${(e as Error).message}`);
+  });
+});
+
+// window.move-to-{next,prev}-output: resolve target by ascending outputId
+// (wraps), then route through the same move logic above. The current
+// output comes from the workspace plugin (the window's workspace's
+// outputId is the source of truth), not from the WM's cached
+// Window.outputId which may lag behind explicit workspace moves.
+pluginBus.subscribe("window.move-to-output-cycle-requested", (_n, payload) => {
+  if (!state?.seat || !runtime || !state.outputs) return;
+  const dir = (payload as { dir?: unknown }).dir;
+  if (dir !== "next" && dir !== "prev") return;
+  const focused = state.seat.kbFocus?.surfaceId;
+  if (typeof focused !== "number") return;
+  const ids = [...state.outputs.keys()].sort((a, b) => a - b);
+  if (ids.length <= 1) return;
+  // Resolve the focused window's current output from the workspace plugin's
+  // outputToplevelStacks. The window appears in exactly one output's
+  // visible list (its workspace's output, when its workspace is shown).
+  let currentOutput = ids[0];
+  const stacks = state.outputToplevelStacks;
+  if (stacks) {
+    for (const [oid, list] of stacks) {
+      if (list.includes(focused)) { currentOutput = oid; break; }
+    }
+  }
+  const i = ids.indexOf(currentOutput);
+  if (i < 0) return;
+  const n = ids.length;
+  const targetOutputId = dir === "next" ? ids[(i + 1) % n] : ids[(i - 1 + n) % n];
+  pluginBus.emit("window.move-to-output-requested", { outputId: targetOutputId });
+});
+
 // The focus.next / focus.prev actions emit this; cycle keyboard focus
 // through the WM's toplevel stack (wrapping) and apply it directly via the
 // seat (an explicit user command, not a focus-plugin policy decision).
@@ -805,14 +879,20 @@ pluginBus.subscribe("focus.cycle-requested", (_n, payload) => {
 });
 
 // The layout.promote / swap-next / swap-prev actions emit this; reorder the
-// keyboard-focused window in the WM stack (the WM schedules the relayout).
+// keyboard-focused window in the workspace plugin's per-workspace member
+// list (which IS the master-stack order the layout-driver consumes). The
+// plugin's reorder side effect pushes a fresh setOutputStack -> windows-
+// broker triggers a relayout.
 pluginBus.subscribe("layout.reorder-requested", (_n, payload) => {
-  if (!state?.seat || !state.wm) return;
+  if (!state?.seat || !runtime) return;
   const op = (payload as { op?: unknown }).op;
   if (op !== "promote" && op !== "swap-next" && op !== "swap-prev") return;
   const focused = state.seat.kbFocus?.surfaceId;
   if (typeof focused !== "number") return;
-  state.wm.reorder(focused, op);
+  void runtime.invokeNamespace("workspace", "reorder", [focused, op])
+    .catch((e: unknown) => {
+      log.warn("core", `workspace.reorder failed: ${(e as Error).message}`);
+    });
 });
 
 // The layout.grow-master / shrink-master actions emit this; route the

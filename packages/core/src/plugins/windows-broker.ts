@@ -212,6 +212,9 @@ export function createWindowsBroker(deps: WindowsBrokerDeps): WindowsBroker {
       state.outputToplevelStacks.set(p.outputId, p.ids.slice());
     }
     rebuildStackWithPopups(state);
+    // The visible window set on this output changed; trigger a relayout so
+    // the layout-driver picks up the new ordering / membership.
+    state.relayout?.("state-changed");
     return null;
   }
 

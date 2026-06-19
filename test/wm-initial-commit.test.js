@@ -45,13 +45,12 @@ function immediateLayoutDriver(target, snapshot) {
       // Single-output fake: assign every window the primary output's rect.
       const primary = snap.outputs[0];
       const outRect = { x: 0, y: 0, width: primary.rect.width, height: primary.rect.height };
-      // Compute rects only for the managed subset (the driver normally
-      // splits these out before calling the plugin; this fake mimics the
-      // managed-only behavior so the test asserts on the same rect set).
-      const managed = snap.windows.filter((w) => w.presentation === 'managed');
+      // snap.windows is a Map<surfaceId, LayoutSnapshotWindow>; iterate values
+      // for the same filter-by-presentation pass as the real resolver.
+      const allWindows = [...snap.windows.values()];
+      const managed = allWindows.filter((w) => w.presentation === 'managed');
       const rects = managed.map((w) => ({ id: w.id, outer: outRect }));
-      // Maximized -> full output too (matches the real resolver).
-      for (const w of snap.windows) {
+      for (const w of allWindows) {
         if (w.presentation === 'maximized' || w.presentation === 'fullscreen') {
           rects.push({ id: w.id, outer: outRect });
         }

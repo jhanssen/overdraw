@@ -25,7 +25,17 @@ const TWO_OUTPUTS = [
 ];
 
 function snap(windows, outputs = TWO_OUTPUTS) {
-  return { outputs, windows };
+  // Build the (id -> window) map + per-output ordered visible lists from the
+  // flat windows array. The driver now consumes per-output ids; the test
+  // input still expresses "window W is on output O" for brevity.
+  const windowMap = new Map();
+  const outputContent = new Map();
+  for (const w of windows) {
+    windowMap.set(w.id, w);
+    if (!outputContent.has(w.outputId)) outputContent.set(w.outputId, []);
+    outputContent.get(w.outputId).push(w.id);
+  }
+  return { outputs, windows: windowMap, outputContent };
 }
 
 function managedOn(id, outputId) {

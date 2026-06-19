@@ -43,9 +43,13 @@ export interface WorkspaceRecord {
   //   3. Promote: an explicit move to output X raises X above the
   //      previously-current entry.
   preferredOutputs: string[];
-  // Insertion-ordered (JS Map iteration order). The order surfaceIds appear
-  // in setOutputStack pushes is the order they were added.
-  members: Set<number>;
+  // Ordered surface ids belonging to this workspace, master-front (index 0
+  // is the layout's master, the tail is the bottom of the stack). This list
+  // IS the per-workspace draw order: setOutputStack pushes it verbatim, the
+  // layout-driver consumes it (master-stack uses index 0 as the master), the
+  // hit-tester walks it front-to-back. Reorder ops (promote/swap-next/
+  // swap-prev) mutate it.
+  members: number[];
 }
 
 export interface WorkspaceState {
@@ -187,7 +191,7 @@ function ensureOutput(state: WorkspaceState, outputId: number, seedName: string,
   }
   const handle = asHandle(state.nextHandle);
   const rec: WorkspaceRecord = {
-    handle, outputId, members: new Set(),
+    handle, outputId, members: [],
     preferredOutputs: [seedName],
   };
   state.byHandle.set(handle, rec);
@@ -288,7 +292,7 @@ export function create(state: WorkspaceState,
   if (!preferred.includes(outputName)) preferred.push(outputName);
 
   const rec: WorkspaceRecord = {
-    handle, outputId, members: new Set(),
+    handle, outputId, members: [],
     preferredOutputs: preferred,
     ...(spec.name !== undefined ? { name: spec.name } : {}),
   };
@@ -362,7 +366,7 @@ export function destroy(state: WorkspaceState,
     const fresh = asHandle(state.nextHandle);
     state.nextHandle += 1;
     state.byHandle.set(fresh, {
-      handle: fresh, outputId, members: new Set(),
+      handle: fresh, outputId, members: [],
       preferredOutputs: outputName !== "" ? [outputName] : [],
     });
     positions.push(fresh);
@@ -381,11 +385,14 @@ export function destroy(state: WorkspaceState,
   }
 
   // Relocate members. Update both record + reverse index + state-bag.
-  if (rec.members.size > 0 && target !== null) {
+  // Preserves the destroyed workspace's order at the tail of the target's
+  // member list (the target's existing members stay master-front; relocated
+  // ones land below).
+  if (rec.members.length > 0 && target !== null) {
     const targetRec = state.byHandle.get(target);
     if (!targetRec) throw new Error("internal: relocation target missing");
     for (const sid of rec.members) {
-      targetRec.members.add(sid);
+      if (!targetRec.members.includes(sid)) targetRec.members.push(sid);
       state.surfaceToHandle.set(sid, target);
       sideEffects.push({ kind: "setStateBag", surfaceId: sid, handle: target });
     }
@@ -436,7 +443,7 @@ export function destroy(state: WorkspaceState,
       kind: "setOutputStack", outputId, ids: stackFor(state, outputId),
     });
     sideEffects.push({ kind: "requestFocusDecision", reason: "workspace-changed" });
-  } else if (rec.members.size > 0) {
+  } else if (rec.members.length > 0) {
     // Not shown ourselves, but our members moved to the target; if the
     // target IS shown, its stack just grew.
     if (target !== null && state.shownByOutput.get(outputId) === target) {
@@ -519,8 +526,10 @@ export function moveWindow(state: WorkspaceState,
   const fromIdx = findIndex(state, fromHandle, fromOutputId);
   if (fromIdx === null) throw new Error("internal: from handle has no index");
 
-  fromRec.members.delete(surfaceId);
-  targetRec.members.add(surfaceId);
+  const fromIdxInMembers = fromRec.members.indexOf(surfaceId);
+  if (fromIdxInMembers >= 0) fromRec.members.splice(fromIdxInMembers, 1);
+  // New windows on the target land at the tail (matches applyMap's append).
+  if (!targetRec.members.includes(surfaceId)) targetRec.members.push(surfaceId);
   state.surfaceToHandle.set(surfaceId, targetHandle);
 
   // Cross-output move: explicit user action; promote the destination on the
@@ -562,6 +571,55 @@ export function moveWindow(state: WorkspaceState,
   }
 
   return { state, sideEffects };
+}
+
+// Reorder a surfaceId within its workspace's member list. Operates in three
+// modes that mirror the WM's previous wm.reorder API:
+//   "promote"   move the surface to the master slot (index 0).
+//   "swap-next" swap with the surface immediately AFTER it (tail-ward).
+//   "swap-prev" swap with the surface immediately BEFORE it (master-ward).
+// swap-next/swap-prev do NOT wrap. Returns true and emits a setOutputStack
+// side effect when the order changed; false (no-op) otherwise. Throws if
+// the surface is unknown.
+export function reorder(state: WorkspaceState,
+                        surfaceId: number,
+                        op: "promote" | "swap-next" | "swap-prev",
+                        ): { state: WorkspaceState; changed: boolean;
+                             sideEffects: SideEffect[] } {
+  const handle = state.surfaceToHandle.get(surfaceId);
+  if (handle === undefined) {
+    throw new Error(`reorder: surface ${surfaceId} is not tracked by any workspace`);
+  }
+  const rec = state.byHandle.get(handle);
+  if (!rec) throw new Error("internal: handle without record");
+
+  const i = rec.members.indexOf(surfaceId);
+  if (i < 0) return { state, changed: false, sideEffects: [] };
+
+  let mutated = false;
+  if (op === "promote") {
+    if (i === 0) return { state, changed: false, sideEffects: [] };
+    rec.members.splice(i, 1);
+    rec.members.unshift(surfaceId);
+    mutated = true;
+  } else if (op === "swap-next") {
+    if (i >= rec.members.length - 1) return { state, changed: false, sideEffects: [] };
+    [rec.members[i], rec.members[i + 1]] = [rec.members[i + 1], rec.members[i]];
+    mutated = true;
+  } else {
+    if (i <= 0) return { state, changed: false, sideEffects: [] };
+    [rec.members[i], rec.members[i - 1]] = [rec.members[i - 1], rec.members[i]];
+    mutated = true;
+  }
+
+  const sideEffects: SideEffect[] = [];
+  if (mutated && state.shownByOutput.get(rec.outputId) === handle) {
+    sideEffects.push({
+      kind: "setOutputStack", outputId: rec.outputId,
+      ids: stackFor(state, rec.outputId),
+    });
+  }
+  return { state, changed: mutated, sideEffects };
 }
 
 // Set or clear a workspace's name. Idempotent if the value already matches.
@@ -616,7 +674,10 @@ export function applyMap(state: WorkspaceState,
   }
   const rec = state.byHandle.get(shown);
   if (!rec) throw new Error("internal: shown handle has no record");
-  rec.members.add(surfaceId);
+  // New windows take the master slot (index 0); the previous master shifts
+  // down one. Matches dwm semantics + the WM's previous addWindow(unshift)
+  // behavior. The `promote` action lets the user rearrange explicitly.
+  if (!rec.members.includes(surfaceId)) rec.members.unshift(surfaceId);
   state.surfaceToHandle.set(surfaceId, shown);
 
   sideEffects.push({ kind: "setStateBag", surfaceId, handle: shown });
@@ -643,7 +704,8 @@ export function applyUnmap(state: WorkspaceState,
     return { state, sideEffects: [] };
   }
 
-  rec.members.delete(surfaceId);
+  const idxInMembers = rec.members.indexOf(surfaceId);
+  if (idxInMembers >= 0) rec.members.splice(idxInMembers, 1);
   state.surfaceToHandle.delete(surfaceId);
 
   const sideEffects: SideEffect[] = [

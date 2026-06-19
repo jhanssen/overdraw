@@ -104,7 +104,30 @@ export default function makeXdgSurface(ctx: Ctx): XdgSurfaceHandler {
         // The WM's SurfaceHandle must carry the wl_surface record (its .resource is
         // the wl_surface, used for subsurface child lookup in emitSubtree and for
         // input/client-id routing), NOT the xdg_toplevel resource.
-        ctx.state.wm.addWindow(surfaceId, xs.surface, { deferInitialCommit: true });
+        //
+        // Spawn-follows-pointer: place the new window on the output the user
+        // is currently looking at. Pointer position is in global logical
+        // coordinates; map to the output it lies inside. Fall back to the
+        // primary when no seat / no pointer position / pointer outside every
+        // real output (the non-rectangular coverage gap between monitors).
+        let outputId: number | undefined;
+        const seat = ctx.state.seat;
+        const outputs = ctx.state.outputs;
+        if (seat && outputs) {
+          const { x, y } = seat.pointerPosition();
+          for (const o of outputs.values()) {
+            const r = o.logicalPosition;
+            const s = o.logicalSize;
+            if (x >= r.x && x < r.x + s.width && y >= r.y && y < r.y + s.height) {
+              outputId = o.id;
+              break;
+            }
+          }
+        }
+        ctx.state.wm.addWindow(surfaceId, xs.surface, {
+          deferInitialCommit: true,
+          ...(outputId !== undefined ? { outputId } : {}),
+        });
       } else {
         // No WM (e.g. bare protocol unit tests): fall back to the 0x0 handshake so
         // the client still completes its initial configure/ack.

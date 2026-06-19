@@ -432,9 +432,36 @@ the client has not bound the relevant wl_output); output add / arrangement
 change calls `updateAllSurfaceResidency` so every mapped surface refreshes;
 `wp_fractional_scale_v1` tracks per-surface `Map<Resource, wl_surface
 Resource>` and emits the scale of each surface's primary overlapping output,
-re-emitting when residency shifts. M7 (hotplug + workspace migration via
-`preferredOutputs` recompute on `output.added`/`removed`) and M8 (multi-GPU)
-remain.
+re-emitting when residency shifts.
+
+Beyond the milestone list, two pieces of follow-up work landed on top of M5
++ M6 to make multi-output usable end-to-end before M7's hotplug arrives:
+
+1. **The workspace plugin is now authoritative for "ordered visible windows
+   per output."** The layout-driver, `windowAt`, and `focusOrder` all read
+   from a callback (`WmOptions.outputContent`) wired to
+   `state.outputToplevelStacks` — which the workspace plugin keeps in sync
+   via its setOutputStack side effects. The WM iterates only the visible
+   subset per output instead of every window partitioned by
+   `Window.outputId`, so workspace switching, move-to-workspace, and
+   per-window reorder no longer waste cycles laying out hidden windows or
+   tile them at the wrong size. `workspace.reorder(surfaceId, op)` replaces
+   `wm.reorder`; the bundled `layout.promote` / `layout.swap-{next,prev}`
+   actions route there. `Window.outputId` survives as a cache (no longer
+   the source of truth for "which output this window is on"); dropping it
+   is follow-up work.
+
+2. **Placement actions for getting windows to a specific output.**
+   `xdg_surface.get_toplevel` consults the pointer's current output and
+   spawns the new window there (spawn-follows-pointer; falls back to the
+   primary). `window.move-to-output { outputId }` /
+   `window.move-to-next-output` / `window.move-to-prev-output` actions in
+   `plugin-core-actions` route through the workspace plugin's `moveWindow`
+   to the shown workspace on the target output; the cycle resolver picks
+   the next/prev outputId sorted by ascending id.
+
+M7 (hotplug + workspace migration via `preferredOutputs` recompute on
+`output.added`/`removed`) and M8 (multi-GPU) remain.
 
 ## Client buffers
 

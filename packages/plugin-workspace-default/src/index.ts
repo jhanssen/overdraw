@@ -395,6 +395,12 @@ export default async function init(sdk: SdkLike, _config?: unknown): Promise<voi
     async current(outputId): Promise<WorkspaceSnapshot | null> {
       return reg.current(state, outputId);
     },
+    async reorder(surfaceId, op): Promise<boolean> {
+      const r = reg.reorder(state, surfaceId, op);
+      state = r.state;
+      await applyEffects(r.sideEffects);
+      return r.changed;
+    },
   };
 
   await sdk.registerPlugin("workspace", () => api);

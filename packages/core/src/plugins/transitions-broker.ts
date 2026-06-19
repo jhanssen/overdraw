@@ -79,6 +79,14 @@ export interface TransitionsBrokerDeps {
   // the trust boundary. Today the live registry is state.outputs; the
   // broker accepts a predicate so it does not couple to CompositorState.
   hasOutput: (outputId: number) => boolean;
+  // Optional post-commit hook fired AFTER the broker applies a setOutputStack
+  // instruction in the transition's commit phase. The host wires this to
+  // sync state.outputToplevelStacks + schedule a relayout so the layout-
+  // driver picks up the new visible set on the next pass. Without it, the
+  // workspace plugin's transition-driven swap would update only the
+  // compositor's stack filter; the layout-driver would still see the old
+  // ids (the workspace plugin's normal setOutputStack path is bypassed).
+  onSetOutputStackCommit?: (outputId: number, ids: number[] | null) => void;
 }
 
 // The broker is both a request handler (for plugin transitions.* calls)
@@ -135,8 +143,9 @@ export function createTransitionsBroker(
     if (c.setOutputStack && setOutputStack) {
       for (const item of c.setOutputStack) {
         try {
-          setOutputStack(item.outputId,
-            item.ids === null ? null : item.ids.slice());
+          const idsCopy = item.ids === null ? null : item.ids.slice();
+          setOutputStack(item.outputId, idsCopy);
+          deps.onSetOutputStackCommit?.(item.outputId, idsCopy);
         } catch (e) {
           log.err("plugin",
             `transitions: commit setOutputStack(${item.outputId}) threw: %o`, e);

@@ -292,6 +292,12 @@ export async function installProtocols(
       },
       layoutDriverFactory: opts.layoutDriverFactory,
       pluginBus: opts.pluginBus,
+      // outputContent: the workspace plugin's view of "ordered visible
+      // windows per output" -- the layout-driver consumes this so it only
+      // lays out the workspace currently shown on each output. Reads live
+      // from state.outputToplevelStacks (populated via the workspace
+      // plugin's setOutputStack side effects).
+      outputContent: () => state.outputToplevelStacks ?? new Map(),
     },
   );
   // Expose wm.schedule via state.relayout for callers outside the WM that

@@ -474,6 +474,14 @@ export interface WmOptions {
   //     'window.committed' (observe-only).
   // Omitting it skips both emit paths (GPU-free tests with no bus).
   pluginBus?: DynamicBus;
+  // Ordered per-output visible-window lists, master-front. Called at
+  // snapshot() time; the result drives which windows the layout-driver
+  // lays out on each output. The workspace plugin keeps the underlying
+  // map in sync via setOutputStack; main.ts wires this callback to read
+  // from state.outputToplevelStacks. Tests without a workspace plugin can
+  // omit it -- the WM then defaults to "every mapped window on the
+  // primary output" so non-workspace harnesses still produce a layout.
+  outputContent?: () => ReadonlyMap<number, ReadonlyArray<number>>;
 }
 
 // Convenience: build the WM's per-output map from a list of descriptors,
@@ -505,6 +513,7 @@ export function createWm(
   const decorationResize = opts?.decorationResize;
   const layoutDriverFactory = opts?.layoutDriverFactory;
   const pluginBus = opts?.pluginBus;
+  const outputContent = opts?.outputContent;
   const windows: Window[] = [];
   const wm: WmState = { outputs: outputsMap(outputs), windows };
   // The primary is the lowest live id; computed on demand to track setOutputs.
@@ -738,13 +747,14 @@ export function createWm(
     }
   }
 
-  // Build a LayoutSnapshot from the current WM state. Carries presentation
-  // so the driver's resolver can dispatch mode-specific rects without
-  // calling the plugin, and each window's outputId so the driver can
-  // partition the layout pass across outputs.
+  // Build a LayoutSnapshot from the current WM state. The windows map
+  // carries every mapped window keyed by surfaceId; outputContent (from the
+  // workspace plugin via the WmOptions callback) drives which subset is
+  // laid out on each output and in what order.
   function snapshot(): LayoutSnapshot {
-    const snapshotWindows: import("./layout-driver.js").LayoutSnapshotWindow[] =
-      windows.map((w) => ({
+    const windowMap = new Map<number, import("./layout-driver.js").LayoutSnapshotWindow>();
+    for (const w of windows) {
+      windowMap.set(w.surfaceId, {
         id: w.surfaceId,
         role: "toplevel" as const,
         outputId: w.outputId,
@@ -758,12 +768,28 @@ export function createWm(
         currentRect: { ...w.outer },
         ...(w.floatingRect ? { floatingRect: { ...w.floatingRect } } : {}),
         ...(w.windowState.restoreRect ? { restoreRect: { ...w.windowState.restoreRect } } : {}),
-      }));
+      });
+    }
     const outputDescs: Array<{ id: number; rect: Rect; scale: number }> = [];
     for (const o of wm.outputs.values()) {
       outputDescs.push({ id: o.id, rect: { ...o.rect }, scale: o.scale });
     }
-    return { outputs: outputDescs, windows: snapshotWindows };
+    // Workspace plugin's view, or a fallback when no plugin is wired:
+    // every known window on the primary output, in master-front insertion
+    // order. The fallback keeps GPU-free tests (no workspace plugin) and
+    // pre-workspace bring-up paths producing a layout. Pre-content windows
+    // are included so their rect is ready by the time their first commit
+    // lands (windowHasContent just flips the gate; no relayout needed).
+    let content: ReadonlyMap<number, ReadonlyArray<number>>;
+    if (outputContent) {
+      content = outputContent();
+    } else {
+      const ids = windows.map((w) => w.surfaceId);
+      const m = new Map<number, ReadonlyArray<number>>();
+      if (ids.length > 0) m.set(primaryOutputId(), ids);
+      content = m;
+    }
+    return { outputs: outputDescs, windows: windowMap, outputContent: content };
   }
 
   const target: LayoutApplyTarget = { apply: applyLayout };
@@ -913,19 +939,33 @@ export function createWm(
     },
 
     windowAt(x, y, accept) {
-      // master-front order: index 0 is the master. The drawn stack draws
-      // back-to-front from the END of `windows` (older windows are below
-      // newer ones). Hit-testing wants front-to-back: start at index 0
-      // (the master is typically the on-top focused window in dwm-style
-      // tilers), but actually with the master-stack the layout puts the
-      // master in a fixed left column -- visual order matters for
-      // overlap (popups, subsurfaces) which aren't in this list. For
-      // toplevel-only hit-testing, master-front == hit-test order works
-      // for non-overlapping tiled layouts. With floating windows in the
-      // mix, the front-most is index 0 -- the layout plugin's job to
-      // keep z-order consistent with intended layering.
-      //
-      // We use the windows array in declared order: front first.
+      // Hit-test the visible windows only. The workspace plugin's per-output
+      // ordered list (outputContent) drives visibility; without it, fall back
+      // to every WM window (test harnesses without a workspace plugin). The
+      // master-front order is preserved: index 0 of an output's list is the
+      // master, which in dwm-style tilers is typically the visually on-top
+      // window of its tile region. (For non-overlapping tiled layouts the
+      // master-front order matches hit-test order; floating windows on top
+      // are at index 0 by layout-plugin convention.)
+      const content = outputContent ? outputContent() : null;
+      if (content) {
+        for (const ids of content.values()) {
+          for (const id of ids) {
+            const win = windows.find((w) => w.surfaceId === id);
+            if (!win) continue;
+            const r = win.rect;
+            if (x < r.x || x >= r.x + r.width || y < r.y || y >= r.y + r.height) continue;
+            if (accept) {
+              const localX = x - r.x;
+              const localY = y - r.y;
+              if (!accept(win, localX, localY)) continue;
+            }
+            return win;
+          }
+        }
+        return null;
+      }
+      // No workspace plugin: walk every window in declared order.
       for (let i = 0; i < windows.length; i++) {
         const win = windows[i];
         const r = win.rect;
@@ -1169,7 +1209,25 @@ export function createWm(
     },
 
     focusOrder() {
+      // Visible windows only, master-front per output (workspace plugin's
+      // ordering). Across outputs we walk by ascending outputId for a
+      // deterministic enumeration. Fall back to every WM window when no
+      // workspace plugin is wired.
       const out: number[] = [];
+      const content = outputContent ? outputContent() : null;
+      if (content) {
+        const ordered = [...content.entries()].sort((a, b) => a[0] - b[0]);
+        for (const [, ids] of ordered) {
+          for (const id of ids) {
+            const win = windows.find((w) => w.surfaceId === id);
+            if (!win) continue;
+            if (win.hasContent && win.windowState.presentation !== "minimized") {
+              out.push(win.surfaceId);
+            }
+          }
+        }
+        return out;
+      }
       for (const w of windows) {
         if (w.hasContent && w.windowState.presentation !== "minimized") {
           out.push(w.surfaceId);

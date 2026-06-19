@@ -88,10 +88,11 @@ test("workspace.show with transition: animated swap, post-transition state visib
       { surfaceId: master.surfaceId, index: 2 });
     await c.runtime.flush();
 
-    // Baseline after move: master-tile (B's location) is black
-    // (B is on hidden workspace 2), stack-tile shows A's red.
+    // Baseline after move: workspace 1 has only A, A spans the full tile
+    // region (1-window master-stack), both the former master- and stack-
+    // tile centers show A's red.
     await readUntil(c, (px) =>
-      pixelMatches(pixelAt(px, OUT.width, mcx, mcy), BLACK, 4)
+      pixelMatches(pixelAt(px, OUT.width, mcx, mcy), bgraA, 4)
       && pixelMatches(pixelAt(px, OUT.width, scx, scy), bgraA, 4));
 
     // Now: animated show of workspace 2. This is the path under test.
@@ -135,15 +136,15 @@ test("workspace.show with transition: animated swap, post-transition state visib
     // Wait for the transition to complete + commit to apply.
     await showPromise;
 
-    // After the transition, the new stack is in place. Master-tile
-    // shows B's blue; stack-tile shows black (A is on hidden ws1).
+    // After the transition, workspace 2 has only B; B spans the full tile
+    // region (1-window master-stack). Both center positions show B's blue.
     const px2 = await readUntil(c, (p) =>
       pixelMatches(pixelAt(p, OUT.width, mcx, mcy), bgraB, 4)
-      && pixelMatches(pixelAt(p, OUT.width, scx, scy), BLACK, 4));
+      && pixelMatches(pixelAt(p, OUT.width, scx, scy), bgraB, 4));
     assert.ok(pixelMatches(pixelAt(px2, OUT.width, mcx, mcy), bgraB, 4),
       `post-transition: master-tile should show B; got ${pixelAt(px2, OUT.width, mcx, mcy)}`);
-    assert.ok(pixelMatches(pixelAt(px2, OUT.width, scx, scy), BLACK, 4),
-      `post-transition: stack-tile should be cleared; got ${pixelAt(px2, OUT.width, scx, scy)}`);
+    assert.ok(pixelMatches(pixelAt(px2, OUT.width, scx, scy), bgraB, 4),
+      `post-transition: stack-tile should show B; got ${pixelAt(px2, OUT.width, scx, scy)}`);
 
     // And the workspace plugin's state-of-record reflects the shown ws.
     const cur = await c.runtime.invokeAction("workspace.current", { outputId: 0 });
@@ -188,14 +189,18 @@ test("workspace.show without transition: plain swap still works (regression)",
     await c.runtime.invokeAction("workspace.move-window",
       { surfaceId: master.surfaceId, index: 2 });
     await c.runtime.flush();
+    // After the move workspace 1 has only A: A spans the full tile region
+    // (1-window master-stack); both old tile positions show A.
     await readUntil(c, (px) =>
-      pixelMatches(pixelAt(px, OUT.width, mcx, mcy), BLACK, 4));
+      pixelMatches(pixelAt(px, OUT.width, mcx, mcy), bgraA, 4)
+      && pixelMatches(pixelAt(px, OUT.width, scx, scy), bgraA, 4));
 
-    // No transition field -> instant swap.
+    // No transition field -> instant swap. Workspace 2 has only B; B
+    // spans the full tile region; both tile positions show B.
     await c.runtime.invokeAction("workspace.show", { index: 2 });
     await readUntil(c, (px) =>
       pixelMatches(pixelAt(px, OUT.width, mcx, mcy), bgraB, 4)
-      && pixelMatches(pixelAt(px, OUT.width, scx, scy), BLACK, 4));
+      && pixelMatches(pixelAt(px, OUT.width, scx, scy), bgraB, 4));
   } finally {
     await c.teardown();
   }

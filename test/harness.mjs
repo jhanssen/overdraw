@@ -144,14 +144,23 @@ export async function settled(producer, pred, { timeoutMs = 5000, intervalMs = 2
     last = await producer();
     if (pred(last)) return last;
     if (Date.now() - t0 > timeoutMs) {
-      throw new Error(`settled timed out (${what}); last value: ${safeStringify(last)}`);
+      // Truncate huge values (e.g. frameReadback's pixel buffer) so the
+      // assertion error doesn't blow past the test-runner's IPC serializer
+      // limit and become a generic "Unable to deserialize cloned data."
+      throw new Error(`settled timed out (${what}); last value: ${safeStringify(last, 4096)}`);
     }
     await sleep(intervalMs);
   }
 }
 
-function safeStringify(v) {
-  try { return JSON.stringify(v); } catch { return String(v); }
+function safeStringify(v, maxLen = Infinity) {
+  let s;
+  try { s = JSON.stringify(v); }
+  catch { s = String(v); }
+  if (s !== undefined && s.length > maxLen) {
+    return s.slice(0, maxLen) + `… (truncated, ${s.length} chars)`;
+  }
+  return s;
 }
 
 // Count live GPU processes by EXACT comm (truncated to "overdraw-gpu-pr"), per
@@ -367,10 +376,21 @@ export async function setupCompositor(opts = {}) {
     const tx = await import(
       "../packages/core/dist/plugins/transitions-broker.js");
     sceneRegistry = createSceneRegistry();
+    const xdgPopupMod = await import("../packages/core/dist/protocols/xdg_popup.js");
     transitionsBroker = tx.createTransitionsBroker({
       compositor: jsCompositor,
       sceneRegistry,
       hasOutput: (outputId) => state.outputs?.has(outputId) ?? false,
+      // Mirror main.ts: the transition's commit-time setOutputStack bypasses
+      // the windows-broker path; sync state.outputToplevelStacks + rebuild +
+      // schedule a relayout so the layout-driver picks up the new visible set.
+      onSetOutputStackCommit: (outputId, ids) => {
+        state.outputToplevelStacks ??= new Map();
+        if (ids === null) state.outputToplevelStacks.delete(outputId);
+        else state.outputToplevelStacks.set(outputId, ids.slice());
+        xdgPopupMod.rebuildStackWithPopups(state);
+        state.relayout?.("state-changed");
+      },
     });
     TRANSITIONS_NOT_HANDLED = tx.NOT_HANDLED;
     const priorBefore = state.beforeRender;

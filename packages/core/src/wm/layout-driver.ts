@@ -40,14 +40,19 @@ export type { LayoutInputs, LayoutResult, LayoutReason } from "@overdraw/layout-
 // and never holds onto references.
 export interface LayoutSnapshot {
   // The WM's outputs, each carrying its global-logical-space rect + HiDPI
-  // scale. The driver runs the layout plugin once per output, partitioning
-  // windows by their `outputId`.
+  // scale. The driver runs the layout plugin once per output.
   outputs: ReadonlyArray<{ id: number; rect: Rect; scale: number }>;
-  // Ordered windows (master-front; index 0 is the layout's master in the
-  // managed subset). Carries presentation so the resolver can dispatch
-  // before calling the plugin, and outputId so the driver knows which
-  // output each window belongs to.
-  windows: ReadonlyArray<LayoutSnapshotWindow>;
+  // Every known window (every mapped toplevel), keyed by surfaceId for
+  // lookup. The driver does NOT iterate this map -- it iterates
+  // outputContent per output and looks up each id here.
+  windows: ReadonlyMap<number, LayoutSnapshotWindow>;
+  // Ordered per-output visible-window lists, master-front. When set for an
+  // output, the layout-driver lays out EXACTLY these windows in this order.
+  // Absent or empty for an output -> the driver lays out nothing on that
+  // output. Provided by the workspace plugin via state.outputToplevelStacks
+  // (which it keeps in sync as workspaces switch and windows move); the WM
+  // copies that map into the snapshot at snapshot() time.
+  outputContent: ReadonlyMap<number, ReadonlyArray<number>>;
 }
 
 // The driver's view of a window. Carries everything needed to either pass
@@ -108,17 +113,6 @@ export function createLayoutDriver(deps: LayoutDriverDeps): LayoutDriver {
     try {
       const snap = deps.snapshot();
 
-      // Partition windows by outputId. Windows assigned to an output the
-      // snapshot doesn't know about are skipped: the WM should have either
-      // reassigned them on setOutputs or never set such an id, so reaching
-      // this branch means the snapshot is stale.
-      const byOutput = new Map<number, LayoutSnapshotWindow[]>();
-      for (const o of snap.outputs) byOutput.set(o.id, []);
-      for (const w of snap.windows) {
-        const bucket = byOutput.get(w.outputId);
-        if (bucket) bucket.push(w);
-      }
-
       // Accumulate the merged result across every output's pass; one final
       // apply() at the end so the WM sees a single transactional update.
       const mergedRects: Array<{ id: number; outer: Rect }> = [];
@@ -134,7 +128,15 @@ export function createLayoutDriver(deps: LayoutDriverDeps): LayoutDriver {
         const resolvedRects: Array<{ id: number; outer: Rect }> = [];
         const hidden: number[] = [];
         const managed: LayoutWindow[] = [];
-        const bucket = byOutput.get(o.id) ?? [];
+        // The visible window order on this output comes from the workspace
+        // plugin's outputContent map. An absent entry means "no workspace
+        // is shown on this output," and nothing should be laid out there.
+        const ids = snap.outputContent.get(o.id) ?? [];
+        const bucket: LayoutSnapshotWindow[] = [];
+        for (const id of ids) {
+          const w = snap.windows.get(id);
+          if (w) bucket.push(w);
+        }
 
         for (const w of bucket) {
           switch (w.presentation) {
