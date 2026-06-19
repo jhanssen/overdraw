@@ -1,46 +1,59 @@
 // Transitions broker: routes plugin transitions.run requests to the
 // core transition evaluator + compositor (core-plugin-api.md §8).
 //
-// The plugin calls sdk.transitions.run(outputId, {kind, duration, easing,
-// fromSceneId, toSceneId, commit?}). The broker:
+// The plugin calls sdk.transitions.run({outputId, kind, duration, easing,
+// from, to, commit?}). The broker:
 //   1. Resolves fromSceneId/toSceneId via the SceneRegistry to core-side
 //      GPUTextures + outW/outH.
 //   2. Pins both registry entries so a buggy plugin's SceneHandle.release()
 //      during the transition defers, not yanks the textures.
-//   3. Installs the transition on the compositor (setActiveTransition).
-//   4. Installs the time machine on the evaluator (install()).
+//   3. Installs the transition on the compositor for that output
+//      (setActiveTransition(outputId, ...)).
+//   4. Allocates a per-output TransitionEvaluator and installs the time
+//      machine on it (install()).
 //   5. On completion (evaluator's commit callback): runs the plugin's
-//      commit, clears the compositor's transition slot, unpins both
-//      scenes, resolves the plugin's run() Promise.
+//      commit, clears the compositor's transition slot for that output,
+//      releases the evaluator, unpins both scenes, resolves the plugin's
+//      run() Promise.
 //
-// Conflict policy: reject overlapping transitions on the same output.
-// Today we only validate against the evaluator's "already active" check
-// (single-output compositor); when multi-output lands, this becomes a
-// per-output evaluator + active map.
+// Conflict policy: per-output. Two simultaneous transitions on different
+// outputs are allowed (each output owns its own active-transition slot
+// and its own evaluator). A second install on an output that already has
+// an active transition throws.
+//
+// Worker-live scene sharing: when two outputs' transitions sample the
+// same scene (e.g. b->a on output 0, c->b on output 1, sharing b), the
+// compositor dedups the producer Begin/End brackets across outputs in
+// the same frame via the per-side fromBracket/toBracket carrying the
+// sceneId. This broker emits per-side brackets keyed by sceneId; it does
+// not compose the two sides' brackets into a single pair (that would
+// defeat the cross-output dedup).
 
 import type { TransitionEvaluator } from "../transitions/evaluator.js";
+import { createTransitionEvaluator } from "../transitions/evaluator.js";
 import type { SceneRegistry } from "./scene-registry.js";
 import type { TransitionKind } from "@overdraw/transition-types";
 import { TRANSITION_KINDS } from "@overdraw/transition-types";
 import type { EasingSpec } from "@overdraw/animation-types";
-import { OUTPUT_DEFAULT } from "../protocols/ctx.js";
 import { log } from "../log.js";
 
 export const NOT_HANDLED = Symbol("transitions-broker:not-handled");
+
+// Per-side scene bracket: producer Begin/End on one scene's surfaceBufId
+// for one frame. The compositor groups Begins by sceneId so simultaneous
+// per-output transitions sharing a scene open it exactly once per frame.
+interface TransitionBracket {
+  sceneId: number;
+  beginRead: () => void;
+  endRead: () => void;
+}
 
 // Minimal slice of JsCompositor the broker calls. Implemented by
 // JsCompositor in production; tests pass a mock. The two methods are
 // optional on CompositorSink (the native compositor doesn't have
 // them) -- the broker validates at construction.
-//
-// resolveTextures' return shape carries optional per-frame bracket
-// hooks (beginRead/endRead). For ring-backed inputs (Worker-live)
-// the compositor must call beginRead BEFORE encoding the transition
-// pass and endRead AFTER the submit so the GPU process holds the
-// STM-backed texture's access open across the sample. Stable inputs
-// (in-thread, Worker snapshot) leave the hooks undefined.
 export interface TransitionCompositorSink {
-  setActiveTransition?: (opts: {
+  setActiveTransition?: (outputId: number, opts: {
     fromTex: GPUTexture;
     toTex: GPUTexture;
     kind: TransitionKind;
@@ -48,27 +61,38 @@ export interface TransitionCompositorSink {
     resolveTextures?: () => {
       fromTex: GPUTexture;
       toTex: GPUTexture;
-      beginRead?: () => void;
-      endRead?: () => void;
+      fromBracket?: TransitionBracket;
+      toBracket?: TransitionBracket;
     } | null;
   }) => void;
-  clearActiveTransition?: () => void;
-  // Phase 8 commit interpreter dependency: the broker applies
-  // setOutputStack instructions on the completion tick directly
-  // against the compositor, bypassing the SDK's postMessage hop
+  clearActiveTransition?: (outputId: number) => void;
+  // The broker applies setOutputStack instructions on the completion tick
+  // directly against the compositor, bypassing the SDK's postMessage hop
   // (which would resolve too late to be visible on the next frame).
   setOutputStack?: (outputId: number, ids: number[] | null) => void;
 }
 
 export interface TransitionsBrokerDeps {
   compositor: TransitionCompositorSink;
-  evaluator: TransitionEvaluator;
   sceneRegistry: SceneRegistry;
+  // Predicate the broker uses to validate transitions.run's outputId at
+  // the trust boundary. Today the live registry is state.outputs; the
+  // broker accepts a predicate so it does not couple to CompositorState.
+  hasOutput: (outputId: number) => boolean;
 }
 
-export type TransitionsBroker = (
-  pluginName: string, method: string, params: unknown,
-) => Promise<unknown> | unknown | typeof NOT_HANDLED;
+// The broker is both a request handler (for plugin transitions.* calls)
+// and a per-output evaluator pool the host ticks each frame.
+export interface TransitionsBroker {
+  // Request handler. Returns NOT_HANDLED for unknown methods.
+  handle(pluginName: string, method: string, params: unknown):
+    Promise<unknown> | unknown | typeof NOT_HANDLED;
+  // Tick every active per-output evaluator. Called from beforeRender each
+  // frame with the same timeMs all evaluators consume.
+  tick(timeMs: number): void;
+  // True iff any output has an active transition. Drives wakeIfActive.
+  anyActive(): boolean;
+}
 
 // Atomic-commit instructions the broker applies synchronously inside
 // the evaluator's completion tick. Mirror of TransitionCommit in
@@ -86,15 +110,22 @@ interface BrokerCommit {
 export function createTransitionsBroker(
   deps: TransitionsBrokerDeps,
 ): TransitionsBroker {
-  const { compositor, evaluator, sceneRegistry } = deps;
+  const { compositor, sceneRegistry, hasOutput } = deps;
   if (!compositor.setActiveTransition || !compositor.clearActiveTransition) {
     throw new Error(
       "createTransitionsBroker: compositor lacks setActiveTransition / " +
-      "clearActiveTransition (JS compositor required for phase 8)");
+      "clearActiveTransition (JS compositor required)");
   }
   const setActiveTransition = compositor.setActiveTransition.bind(compositor);
   const clearActiveTransition = compositor.clearActiveTransition.bind(compositor);
   const setOutputStack = compositor.setOutputStack?.bind(compositor);
+
+  // Per-output evaluator pool. Allocated lazily on first transition for an
+  // outputId; removed when that output's transition completes (commit
+  // callback) or its install fails. Each evaluator is a pure single-active
+  // state machine, oblivious to output identity -- the pool layer here
+  // turns N independent transitions into N independent evaluators.
+  const evaluators = new Map<number, TransitionEvaluator>();
 
   // Apply declarative commit instructions. Each kind is independent;
   // the broker runs them in array order. Errors are caught + logged
@@ -114,21 +145,13 @@ export function createTransitionsBroker(
     }
   }
 
-  return (pluginName: string, method: string, params: unknown) => {
-    void pluginName;
-    if (method === "transitions.run") return handleRun(params);
-    return NOT_HANDLED;
-  };
-
   async function handleRun(p: unknown): Promise<void> {
     if (!isRunPayload(p)) {
       throw new Error("transitions.run: malformed payload");
     }
-    if (p.outputId !== OUTPUT_DEFAULT) {
+    if (!hasOutput(p.outputId)) {
       throw new Error(
-        `transitions.run: outputId=${p.outputId} not recognized ` +
-        `(only OUTPUT_DEFAULT=${OUTPUT_DEFAULT} exists today)`,
-      );
+        `transitions.run: outputId=${p.outputId} is not a known output`);
     }
     if (!TRANSITION_KINDS.includes(p.kind)) {
       throw new Error(`transitions.run: unknown kind '${p.kind}'`);
@@ -154,35 +177,43 @@ export function createTransitionsBroker(
     }
 
     // Resolve the commit instructions. Declarative shape; the broker
-    // applies each instruction synchronously inside the completion
-    // tick. p.commit was validated by the SDK on the plugin side;
-    // re-check structurally here at the trust boundary.
+    // applies each instruction synchronously inside the completion tick.
+    // p.commit was validated by the SDK on the plugin side; re-check
+    // structurally here at the trust boundary.
     const commit = parseCommit(p.commit);
 
-    // Pin the scenes BEFORE installing on the compositor. Failure to
-    // pin (entry being torn down) throws here and the install never
-    // happens.
+    // Allocate the per-output evaluator. A pre-existing entry means this
+    // output already has an in-flight transition -- reject before pinning
+    // scenes or touching the compositor.
+    if (evaluators.has(p.outputId)) {
+      throw new Error(
+        `transitions.run: a transition is already active on output ${p.outputId}`);
+    }
+    const evaluator = createTransitionEvaluator();
+    evaluators.set(p.outputId, evaluator);
+
+    // Pin the scenes BEFORE installing on the compositor. Failure to pin
+    // (entry being torn down) throws here and the install never happens.
     sceneRegistry.pin(p.fromSceneId);
     try {
       sceneRegistry.pin(p.toSceneId);
     } catch (e) {
       sceneRegistry.unpin(p.fromSceneId);
+      evaluators.delete(p.outputId);
       throw e;
     }
 
-    // Build the per-frame resolver. For stable scenes (no resolveTexture
-    // on either entry) skip the callback entirely; the compositor uses
-    // the install-time fromTex/toTex every frame. For ring-backed
-    // scenes (Worker-live), each scene's resolveTexture returns the
-    // latest PRESENTED slot's texture plus per-frame Begin/End wire
-    // brackets; the broker composes the two sides' brackets so the
-    // compositor sees a single beginRead/endRead pair that wraps
-    // both sample sources.
+    // Per-frame resolver. Stable scenes (no resolveTexture on either side)
+    // skip the callback entirely; the compositor uses fromTex/toTex every
+    // frame. Worker-live scenes return per-frame textures plus producer
+    // Begin/End brackets KEYED BY sceneId so the compositor dedups Begins
+    // across simultaneous per-output transitions sharing a scene.
     const usesResolver = from.resolveTexture || to.resolveTexture;
     const resolveTextures = usesResolver
       ? (): {
           fromTex: GPUTexture; toTex: GPUTexture;
-          beginRead?: () => void; endRead?: () => void;
+          fromBracket?: TransitionBracket;
+          toBracket?: TransitionBracket;
         } | null => {
           const fRes = from.resolveTexture
             ? from.resolveTexture()
@@ -191,35 +222,28 @@ export function createTransitionsBroker(
             ? to.resolveTexture()
             : { texture: to.texture };
           if (!fRes || !tRes) return null;
-          // Compose brackets across the two sides. Both sides being
-          // bracketed (Worker-live <-> Worker-live) is the most common
-          // ring case; the snapshot+live or live+snapshot mixes also
-          // work because the snapshot side's resolveTexture is
-          // undefined and we fall through to the stable texture.
-          const beginAll = (fRes.beginRead || tRes.beginRead)
-            ? (): void => {
-                fRes.beginRead?.();
-                tRes.beginRead?.();
-              }
-            : undefined;
-          const endAll = (fRes.endRead || tRes.endRead)
-            ? (): void => {
-                // End in reverse order: last opened, first closed.
-                // GPU process FIFO-orders per-surfaceBufId so this is
-                // mainly hygiene, but matches Begin/End pairing rules.
-                tRes.endRead?.();
-                fRes.endRead?.();
-              }
-            : undefined;
+          // The two sides flow as independent brackets; the compositor
+          // groups them by sceneId per frame. A side without beginRead/
+          // endRead (snapshot scene) contributes no bracket -- it's
+          // sampled freely.
+          const fromBracket: TransitionBracket | undefined =
+            fRes.beginRead && fRes.endRead
+              ? { sceneId: p.fromSceneId,
+                  beginRead: fRes.beginRead, endRead: fRes.endRead }
+              : undefined;
+          const toBracket: TransitionBracket | undefined =
+            tRes.beginRead && tRes.endRead
+              ? { sceneId: p.toSceneId,
+                  beginRead: tRes.beginRead, endRead: tRes.endRead }
+              : undefined;
           return {
             fromTex: fRes.texture, toTex: tRes.texture,
-            beginRead: beginAll, endRead: endAll,
+            fromBracket, toBracket,
           };
         }
       : undefined;
 
-    // Build the unpin closure once; the same path runs whether we
-    // succeed normally or fail after install. Idempotent.
+    // Idempotent unpin used on success and on rollback paths.
     let unpinned = false;
     const unpinScenes = (): void => {
       if (unpinned) return;
@@ -228,10 +252,10 @@ export function createTransitionsBroker(
       sceneRegistry.unpin(p.toSceneId);
     };
 
-    // Install on compositor + evaluator. Both throw synchronously on
-    // conflict; we must roll back the OTHER if one fails.
+    // Install on compositor + evaluator. Either may throw synchronously
+    // on conflict; the rollback path mirrors success.
     try {
-      setActiveTransition({
+      setActiveTransition(p.outputId, {
         fromTex: from.texture,
         toTex: to.texture,
         kind: p.kind,
@@ -240,6 +264,7 @@ export function createTransitionsBroker(
       });
     } catch (e) {
       unpinScenes();
+      evaluators.delete(p.outputId);
       throw e;
     }
     let runPromise: Promise<void>;
@@ -248,22 +273,22 @@ export function createTransitionsBroker(
         durationMs: p.duration,
         easing: p.easing,
         commit: () => {
-          // Order: apply the declarative commit (atomic with
-          // transition end, BEFORE the next renderFrame, so the post-
-          // transition state is visible on the very next frame), THEN
-          // clear the compositor's transition slot so the next frame
-          // draws via the normal composite path, THEN release the
-          // scene pins (deferred-teardown gates the underlying
-          // surfaceBuf release). All synchronous; evaluator's resolve
-          // fires after this returns.
+          // Order: apply the declarative commit (atomic with transition
+          // end, BEFORE the next renderFrame, so the post-transition
+          // state is visible on the very next frame), THEN clear the
+          // compositor's transition slot for this output, THEN release
+          // the scene pins, THEN drop the evaluator from the pool. All
+          // synchronous; evaluator's resolve fires after this returns.
           if (commit) applyCommit(commit);
-          clearActiveTransition();
+          clearActiveTransition(p.outputId);
           unpinScenes();
+          evaluators.delete(p.outputId);
         },
       });
     } catch (e) {
-      clearActiveTransition();
+      clearActiveTransition(p.outputId);
       unpinScenes();
+      evaluators.delete(p.outputId);
       throw e;
     }
 
@@ -271,6 +296,24 @@ export function createTransitionsBroker(
     // (after our wrapper above). Plugin awaits this.
     await runPromise;
   }
+
+  return {
+    handle(pluginName, method, params) {
+      void pluginName;
+      if (method === "transitions.run") return handleRun(params);
+      return NOT_HANDLED;
+    },
+    tick(timeMs) {
+      // Snapshot before tick: commit callbacks may mutate the map (delete
+      // their own entry) and a Map's iteration over concurrent deletes is
+      // implementation-defined enough to avoid relying on.
+      const all = [...evaluators.values()];
+      for (const ev of all) ev.tick(timeMs);
+    },
+    anyActive() {
+      return evaluators.size > 0;
+    },
+  };
 }
 
 interface RunPayload {

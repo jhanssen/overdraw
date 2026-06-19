@@ -46,7 +46,6 @@ test("bundled in-thread plugin runs sdk.transitions.run (crossfade)",
   const { PluginRuntime } = await import(join(OD, "dist", "plugins", "index.js"));
   const { createOverlayBroker } = await import(join(OD, "dist", "overlay.js"));
   const { createSceneRegistry } = await import(join(OD, "dist", "plugins", "scene-registry.js"));
-  const { createTransitionEvaluator } = await import(join(OD, "dist", "transitions", "evaluator.js"));
   const {
     createTransitionsBroker, NOT_HANDLED: TX_NOT_HANDLED,
   } = await import(join(OD, "dist", "plugins", "transitions-broker.js"));
@@ -80,9 +79,10 @@ test("bundled in-thread plugin runs sdk.transitions.run (crossfade)",
     const overlays = createOverlayBroker(ovState, { width: W, height: H });
 
     const sceneRegistry = createSceneRegistry();
-    const transitionEvaluator = createTransitionEvaluator();
     const transitionsBroker = createTransitionsBroker({
-      compositor, evaluator: transitionEvaluator, sceneRegistry,
+      compositor, sceneRegistry,
+      // No state.outputs in this minimal test rig; accept any outputId.
+      hasOutput: () => true,
     });
 
     const logs = [];
@@ -94,7 +94,7 @@ test("bundled in-thread plugin runs sdk.transitions.run (crossfade)",
       onEvent: (_p, name, data) => { if (name === "log") logs.push(String(data)); },
       onRequest: (plugin, method, params) => {
         if (method.startsWith("transitions.")) {
-          const r = transitionsBroker(plugin, method, params);
+          const r = transitionsBroker.handle(plugin, method, params);
           if (r === TX_NOT_HANDLED) throw new Error(`no handler for '${method}'`);
           return r;
         }
@@ -144,7 +144,7 @@ test("bundled in-thread plugin runs sdk.transitions.run (crossfade)",
     };
 
     // Tick to t=0 -> progress=0 -> output should be FROM (red).
-    transitionEvaluator.tick(0);
+    transitionsBroker.tick(0);
     compositor.renderFrame();
     let { data } = await compositor.readback();
     let p = px(data, W >> 1, H >> 1);
@@ -152,7 +152,7 @@ test("bundled in-thread plugin runs sdk.transitions.run (crossfade)",
       `progress=0 expected red, got ${p}`);
 
     // Tick to midpoint -> progress=0.5 -> ~50/50 blend.
-    transitionEvaluator.tick(DURATION / 2);
+    transitionsBroker.tick(DURATION / 2);
     compositor.renderFrame();
     ({ data } = await compositor.readback());
     p = px(data, W >> 1, H >> 1);
@@ -161,7 +161,7 @@ test("bundled in-thread plugin runs sdk.transitions.run (crossfade)",
     assert.ok(Math.abs(p[2] - 128) < 8, `mid R: expected ~128, got ${p[2]}`);
 
     // Tick past the end -> commit fires sync, then run promise resolves.
-    transitionEvaluator.tick(DURATION + 10);
+    transitionsBroker.tick(DURATION + 10);
     compositor.renderFrame();
     // After completion the compositor's transition slot is cleared and
     // hasActiveTransition is false. The framebuffer drew the post-

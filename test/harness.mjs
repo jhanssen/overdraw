@@ -353,37 +353,30 @@ export async function setupCompositor(opts = {}) {
     state,
     emitToPlugin: (plugin, name, data) => { runtime?.emit(plugin, name, data); },
   });
-  // Phase 8: optional transitions broker. Tests that exercise
-  // sdk.transitions (workspace animations etc.) set opts.transitions
-  // = true and the harness brings up the scene registry + transition
-  // evaluator + broker + wires evaluator.tick into beforeRender so
-  // the renderFrame loop drives the transition.
+  // Optional transitions broker. Tests that exercise sdk.transitions set
+  // opts.transitions = true; the harness brings up the scene registry +
+  // broker (the broker owns its per-output evaluators internally) and
+  // wires broker.tick into beforeRender so the renderFrame loop drives
+  // every in-flight transition.
   let sceneRegistry = null;
-  let transitionEvaluator = null;
   let transitionsBroker = null;
   let TRANSITIONS_NOT_HANDLED = null;
   if (opts.transitions && jsCompositor) {
     const { createSceneRegistry } = await import(
       "../packages/core/dist/plugins/scene-registry.js");
-    const { createTransitionEvaluator } = await import(
-      "../packages/core/dist/transitions/evaluator.js");
     const tx = await import(
       "../packages/core/dist/plugins/transitions-broker.js");
     sceneRegistry = createSceneRegistry();
-    transitionEvaluator = createTransitionEvaluator();
     transitionsBroker = tx.createTransitionsBroker({
       compositor: jsCompositor,
-      evaluator: transitionEvaluator,
       sceneRegistry,
+      hasOutput: (outputId) => state.outputs?.has(outputId) ?? false,
     });
     TRANSITIONS_NOT_HANDLED = tx.NOT_HANDLED;
-    // Hook the evaluator into the frame clock. dispatchFrameCallbacks
-    // calls state.beforeRender(timeMs) before renderFrame, so the
-    // compositor's getProgress callback reads a fresh value each frame.
     const priorBefore = state.beforeRender;
     state.beforeRender = (timeMs) => {
       priorBefore?.(timeMs);
-      transitionEvaluator.tick(timeMs);
+      transitionsBroker.tick(timeMs);
     };
   }
 
@@ -458,7 +451,7 @@ export async function setupCompositor(opts = {}) {
       if (r !== INPUT_NOT_HANDLED) return r;
     }
     if (transitionsBroker && method.startsWith("transitions.")) {
-      const r = transitionsBroker(plugin, method, params);
+      const r = transitionsBroker.handle(plugin, method, params);
       if (r !== TRANSITIONS_NOT_HANDLED) return r;
     }
     if (animationsBroker && method.startsWith("animations.")) {

@@ -42,14 +42,12 @@ test("Worker plugin: sdk.transitions.run drives a transition end to end (snapsho
   const { createGpuBroker } = await import(join(OD, "dist", "plugins", "gpu-broker.js"));
   const { createOverlayBroker } = await import(join(OD, "dist", "overlay.js"));
   const { createSceneRegistry } = await import(join(OD, "dist", "plugins", "scene-registry.js"));
-  const { createTransitionEvaluator } = await import(join(OD, "dist", "transitions", "evaluator.js"));
   const { createTransitionsBroker, NOT_HANDLED: TX_NOT_HANDLED } =
     await import(join(OD, "dist", "plugins", "transitions-broker.js"));
 
   const logs = [];
   let gpuBroker = null;
   let transitionsBroker = null;
-  let transitionEvaluator = null;
 
   const c = await setupCompositor({
     headless: OUT,
@@ -64,7 +62,7 @@ test("Worker plugin: sdk.transitions.run drives a transition end to end (snapsho
         return gpuBroker.onRequest(plugin, method, params);
       }
       if (method.startsWith("transitions.")) {
-        const r = transitionsBroker(plugin, method, params);
+        const r = transitionsBroker.handle(plugin, method, params);
         if (r === TX_NOT_HANDLED) throw new Error(`no handler for ${method}`);
         return r;
       }
@@ -85,20 +83,19 @@ test("Worker plugin: sdk.transitions.run drives a transition end to end (snapsho
       coreDeviceHandle: h.device,
       sceneRegistry,
     });
-    transitionEvaluator = createTransitionEvaluator();
     transitionsBroker = createTransitionsBroker({
       compositor: c.jsCompositor,
-      evaluator: transitionEvaluator,
       sceneRegistry,
+      hasOutput: (outputId) => c.state.outputs?.has(outputId) ?? false,
     });
 
-    // The transition evaluator needs a clock. Hook it into the
-    // existing state.beforeRender so renderFrame ticks it (the
-    // harness leaves beforeRender unset by default).
+    // The broker owns the per-output evaluator pool; it needs a clock.
+    // Hook tick into beforeRender so renderFrame drives every in-flight
+    // transition (the harness leaves beforeRender unset by default).
     const priorBefore = c.state.beforeRender;
     c.state.beforeRender = (timeMs) => {
       priorBefore?.(timeMs);
-      transitionEvaluator.tick(timeMs);
+      transitionsBroker.tick(timeMs);
     };
 
     // Spawn a client. Color doesn't matter -- the Worker captures the
@@ -135,8 +132,8 @@ test("Worker plugin: sdk.transitions.run drives a transition end to end (snapsho
     // installed. Confirm compositor sees it as active.
     assert.equal(c.jsCompositor.hasActiveTransition(), true,
       "compositor should have an active transition after Worker submit");
-    assert.equal(transitionEvaluator.isActive(), true,
-      "evaluator should be running");
+    assert.equal(transitionsBroker.anyActive(), true,
+      "broker should report at least one transition running");
 
     // The addon's native frame timer ticks dispatchFrameCallbacks
     // on its own; our beforeRender hook above advances the transition
@@ -151,8 +148,8 @@ test("Worker plugin: sdk.transitions.run drives a transition end to end (snapsho
     // Compositor should be back to no active transition.
     assert.equal(c.jsCompositor.hasActiveTransition(), false,
       "compositor should clear transition after done");
-    assert.equal(transitionEvaluator.isActive(), false,
-      "evaluator should be idle after done");
+    assert.equal(transitionsBroker.anyActive(), false,
+      "broker should be idle after done");
 
     // Wait for scenes to be released by the plugin's then() chain.
     const t2 = Date.now();

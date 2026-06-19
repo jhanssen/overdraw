@@ -40,14 +40,12 @@ test("Worker plugin: sdk.transitions.run on LIVE scenes (per-frame brackets)",
   const { createGpuBroker } = await import(join(OD, "dist", "plugins", "gpu-broker.js"));
   const { createOverlayBroker } = await import(join(OD, "dist", "overlay.js"));
   const { createSceneRegistry } = await import(join(OD, "dist", "plugins", "scene-registry.js"));
-  const { createTransitionEvaluator } = await import(join(OD, "dist", "transitions", "evaluator.js"));
   const { createTransitionsBroker, NOT_HANDLED: TX_NOT_HANDLED } =
     await import(join(OD, "dist", "plugins", "transitions-broker.js"));
 
   const logs = [];
   let gpuBroker = null;
   let transitionsBroker = null;
-  let transitionEvaluator = null;
 
   // Capture stderr so we can scan for Dawn validation errors after.
   // Dawn writes them to stderr via fprintf in the GPU process; the
@@ -73,7 +71,7 @@ test("Worker plugin: sdk.transitions.run on LIVE scenes (per-frame brackets)",
         return gpuBroker.onRequest(plugin, method, params);
       }
       if (method.startsWith("transitions.")) {
-        const r = transitionsBroker(plugin, method, params);
+        const r = transitionsBroker.handle(plugin, method, params);
         if (r === TX_NOT_HANDLED) throw new Error(`no handler for ${method}`);
         return r;
       }
@@ -91,17 +89,16 @@ test("Worker plugin: sdk.transitions.run on LIVE scenes (per-frame brackets)",
       coreDeviceHandle: h.device,
       sceneRegistry,
     });
-    transitionEvaluator = createTransitionEvaluator();
     transitionsBroker = createTransitionsBroker({
       compositor: c.jsCompositor,
-      evaluator: transitionEvaluator,
       sceneRegistry,
+      hasOutput: (outputId) => c.state.outputs?.has(outputId) ?? false,
     });
 
     const priorBefore = c.state.beforeRender;
     c.state.beforeRender = (timeMs) => {
       priorBefore?.(timeMs);
-      transitionEvaluator.tick(timeMs);
+      transitionsBroker.tick(timeMs);
     };
 
     // Spawn a client. Single client, single window; both live scenes

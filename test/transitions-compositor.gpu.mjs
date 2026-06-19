@@ -65,7 +65,7 @@ test("transition crossfade: progress=0 -> from, progress=1 -> to, mid -> blend",
     const fromTex = solidTexture(c, RED,  OUT.width, OUT.height);
     const toTex   = solidTexture(c, BLUE, OUT.width, OUT.height);
     let progress = 0;
-    c.jsCompositor.setActiveTransition({
+    c.jsCompositor.setActiveTransition(0, {
       fromTex, toTex, kind: "crossfade", getProgress: () => progress,
     });
 
@@ -87,7 +87,7 @@ test("transition crossfade: progress=0 -> from, progress=1 -> to, mid -> blend",
     assert.ok(p[1] < 8, `mid G: expected ~0, got ${p[1]}`);
     assert.ok(Math.abs(p[2] - 128) < 8, `mid R: expected ~128, got ${p[2]}`);
 
-    c.jsCompositor.clearActiveTransition();
+    c.jsCompositor.clearActiveTransition(0);
     fromTex.destroy();
     toTex.destroy();
   } finally {
@@ -107,7 +107,7 @@ test("transition slide-left: midpoint puts from on the LEFT, to on the RIGHT",
     const fromTex = solidTexture(c, RED,  OUT.width, OUT.height);
     const toTex   = solidTexture(c, BLUE, OUT.width, OUT.height);
     let progress = 0.5;
-    c.jsCompositor.setActiveTransition({
+    c.jsCompositor.setActiveTransition(0, {
       fromTex, toTex, kind: "slide-left", getProgress: () => progress,
     });
 
@@ -117,7 +117,7 @@ test("transition slide-left: midpoint puts from on the LEFT, to on the RIGHT",
     assert.ok(pixelMatches(left,  RED,  4), `left expected red, got ${left}`);
     assert.ok(pixelMatches(right, BLUE, 4), `right expected blue, got ${right}`);
 
-    c.jsCompositor.clearActiveTransition();
+    c.jsCompositor.clearActiveTransition(0);
     fromTex.destroy();
     toTex.destroy();
   } finally {
@@ -134,7 +134,7 @@ test("transition slide-right: midpoint puts to on the LEFT, from on the RIGHT",
     const fromTex = solidTexture(c, RED,  OUT.width, OUT.height);
     const toTex   = solidTexture(c, BLUE, OUT.width, OUT.height);
     let progress = 0.5;
-    c.jsCompositor.setActiveTransition({
+    c.jsCompositor.setActiveTransition(0, {
       fromTex, toTex, kind: "slide-right", getProgress: () => progress,
     });
 
@@ -144,7 +144,7 @@ test("transition slide-right: midpoint puts to on the LEFT, from on the RIGHT",
     assert.ok(pixelMatches(left,  BLUE, 4), `left expected blue, got ${left}`);
     assert.ok(pixelMatches(right, RED,  4), `right expected red, got ${right}`);
 
-    c.jsCompositor.clearActiveTransition();
+    c.jsCompositor.clearActiveTransition(0);
     fromTex.destroy();
     toTex.destroy();
   } finally {
@@ -161,7 +161,7 @@ test("transition slide-up: midpoint puts from on TOP, to on BOTTOM",
     const fromTex = solidTexture(c, RED,  OUT.width, OUT.height);
     const toTex   = solidTexture(c, BLUE, OUT.width, OUT.height);
     let progress = 0.5;
-    c.jsCompositor.setActiveTransition({
+    c.jsCompositor.setActiveTransition(0, {
       fromTex, toTex, kind: "slide-up", getProgress: () => progress,
     });
 
@@ -171,7 +171,7 @@ test("transition slide-up: midpoint puts from on TOP, to on BOTTOM",
     assert.ok(pixelMatches(top,    RED,  4), `top expected red, got ${top}`);
     assert.ok(pixelMatches(bottom, BLUE, 4), `bottom expected blue, got ${bottom}`);
 
-    c.jsCompositor.clearActiveTransition();
+    c.jsCompositor.clearActiveTransition(0);
     fromTex.destroy();
     toTex.destroy();
   } finally {
@@ -188,7 +188,7 @@ test("transition slide-down: midpoint puts to on TOP, from on BOTTOM",
     const fromTex = solidTexture(c, RED,  OUT.width, OUT.height);
     const toTex   = solidTexture(c, BLUE, OUT.width, OUT.height);
     let progress = 0.5;
-    c.jsCompositor.setActiveTransition({
+    c.jsCompositor.setActiveTransition(0, {
       fromTex, toTex, kind: "slide-down", getProgress: () => progress,
     });
 
@@ -198,7 +198,7 @@ test("transition slide-down: midpoint puts to on TOP, from on BOTTOM",
     assert.ok(pixelMatches(top,    BLUE, 4), `top expected blue, got ${top}`);
     assert.ok(pixelMatches(bottom, RED,  4), `bottom expected red, got ${bottom}`);
 
-    c.jsCompositor.clearActiveTransition();
+    c.jsCompositor.clearActiveTransition(0);
     fromTex.destroy();
     toTex.destroy();
   } finally {
@@ -215,7 +215,7 @@ test("transition scale: progress=1 shows to; midpoint shows blended center",
     const fromTex = solidTexture(c, RED,  OUT.width, OUT.height);
     const toTex   = solidTexture(c, BLUE, OUT.width, OUT.height);
     let progress = 1;
-    c.jsCompositor.setActiveTransition({
+    c.jsCompositor.setActiveTransition(0, {
       fromTex, toTex, kind: "scale", getProgress: () => progress,
     });
 
@@ -233,7 +233,7 @@ test("transition scale: progress=1 shows to; midpoint shows blended center",
     assert.ok(mid[1] < 16, `mid G: expected ~0, got ${mid[1]}`);
     assert.ok(Math.abs(mid[2] - 128) < 16, `mid R: expected ~128, got ${mid[2]}`);
 
-    c.jsCompositor.clearActiveTransition();
+    c.jsCompositor.clearActiveTransition(0);
     fromTex.destroy();
     toTex.destroy();
   } finally {
@@ -253,7 +253,7 @@ test("renderFrame: while transition active, on-screen output ignores draw list",
   try {
     const fromTex = solidTexture(c, RED,  OUT.width, OUT.height);
     const toTex   = solidTexture(c, RED,  OUT.width, OUT.height);  // same
-    c.jsCompositor.setActiveTransition({
+    c.jsCompositor.setActiveTransition(0, {
       fromTex, toTex, kind: "crossfade", getProgress: () => 0,
     });
 
@@ -269,7 +269,7 @@ test("renderFrame: while transition active, on-screen output ignores draw list",
       assert.ok(pixelMatches(p, RED, 4), `corner expected red, got ${p}`);
     }
 
-    c.jsCompositor.clearActiveTransition();
+    c.jsCompositor.clearActiveTransition(0);
     fromTex.destroy();
     toTex.destroy();
   } finally {
@@ -284,18 +284,18 @@ test("setActiveTransition: rejects double install", { skip }, async () => {
   try {
     const fromTex = solidTexture(c, RED,  4, 4);
     const toTex   = solidTexture(c, BLUE, 4, 4);
-    c.jsCompositor.setActiveTransition({
+    c.jsCompositor.setActiveTransition(0, {
       fromTex, toTex, kind: "crossfade", getProgress: () => 0,
     });
-    assert.throws(() => c.jsCompositor.setActiveTransition({
+    assert.throws(() => c.jsCompositor.setActiveTransition(0, {
       fromTex, toTex, kind: "crossfade", getProgress: () => 0,
     }), /already active/);
-    c.jsCompositor.clearActiveTransition();
+    c.jsCompositor.clearActiveTransition(0);
     // After clear, install succeeds again.
-    c.jsCompositor.setActiveTransition({
+    c.jsCompositor.setActiveTransition(0, {
       fromTex, toTex, kind: "crossfade", getProgress: () => 0,
     });
-    c.jsCompositor.clearActiveTransition();
+    c.jsCompositor.clearActiveTransition(0);
     fromTex.destroy();
     toTex.destroy();
   } finally {
@@ -309,11 +309,11 @@ test("hasActiveTransition: reflects install/clear", { skip }, async () => {
     assert.equal(c.jsCompositor.hasActiveTransition(), false);
     const fromTex = solidTexture(c, RED,  4, 4);
     const toTex   = solidTexture(c, BLUE, 4, 4);
-    c.jsCompositor.setActiveTransition({
+    c.jsCompositor.setActiveTransition(0, {
       fromTex, toTex, kind: "crossfade", getProgress: () => 0,
     });
     assert.equal(c.jsCompositor.hasActiveTransition(), true);
-    c.jsCompositor.clearActiveTransition();
+    c.jsCompositor.clearActiveTransition(0);
     assert.equal(c.jsCompositor.hasActiveTransition(), false);
     fromTex.destroy();
     toTex.destroy();
@@ -335,7 +335,7 @@ test("setActiveTransition: resolveTextures called per frame; bind group rebuilds
     const toTex1   = solidTexture(c, BLUE, OUT.width, OUT.height);
     const toTex2   = solidTexture(c, [0, 0xff, 0, 0xff], OUT.width, OUT.height); // green
     let toTex = toTex1;
-    c.jsCompositor.setActiveTransition({
+    c.jsCompositor.setActiveTransition(0, {
       fromTex, toTex,
       kind: "crossfade", getProgress: () => 1,  // fully TO
       resolveTextures: () => ({ fromTex, toTex }),
@@ -351,7 +351,7 @@ test("setActiveTransition: resolveTextures called per frame; bind group rebuilds
     p = pixelAt(px, OUT.width, OUT.width >> 1, OUT.height >> 1);
     assert.ok(pixelMatches(p, [0, 0xff, 0, 0xff], 4), `expected green, got ${p}`);
 
-    c.jsCompositor.clearActiveTransition();
+    c.jsCompositor.clearActiveTransition(0);
     fromTex.destroy();
     toTex1.destroy();
     toTex2.destroy();
@@ -366,7 +366,7 @@ test("setActiveTransition: resolveTextures returns null -> opaque-black clear",
   try {
     const fromTex = solidTexture(c, RED,  4, 4);
     const toTex   = solidTexture(c, BLUE, 4, 4);
-    c.jsCompositor.setActiveTransition({
+    c.jsCompositor.setActiveTransition(0, {
       fromTex, toTex, kind: "crossfade", getProgress: () => 0.5,
       resolveTextures: () => null,
     });
@@ -374,7 +374,7 @@ test("setActiveTransition: resolveTextures returns null -> opaque-black clear",
     const p = pixelAt(px, OUT.width, OUT.width >> 1, OUT.height >> 1);
     // null resolver -> clear to (0,0,0,1).
     assert.ok(pixelMatches(p, [0, 0, 0, 0xff], 4), `expected black, got ${p}`);
-    c.jsCompositor.clearActiveTransition();
+    c.jsCompositor.clearActiveTransition(0);
     fromTex.destroy();
     toTex.destroy();
   } finally {

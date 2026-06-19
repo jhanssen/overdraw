@@ -745,17 +745,22 @@ export interface LiveSceneHandle {
 }
 
 // Active-transition state held by the compositor while a transition is
-// running. setActiveTransition installs; clearActiveTransition (or the
-// install-er calling clear themselves on completion) tears down. The
-// compositor itself does not manage transition timing -- it reads
-// progress from getProgress each frame and the broker / evaluator
-// decide when to clear.
+// running on one output. setActiveTransition installs; clearActiveTransition
+// (or the install-er calling clear themselves on completion) tears down.
+// The compositor itself does not manage transition timing -- it reads
+// progress from getProgress each frame and the broker / evaluator decide
+// when to clear.
 //
-// resolveTextures is optional: when set, it's called each frame to
-// re-pick which textures to sample (the Worker-live case, where the
-// presented slot rotates). When unset, the install-time fromTex/toTex
-// are used every frame (the stable case: in-thread snapshot/live,
-// Worker snapshot).
+// resolveTextures is optional: when set, it's called each frame to re-pick
+// which textures to sample (the Worker-live case, where the presented slot
+// rotates). When unset, the install-time fromTex/toTex are used every frame
+// (the stable case: in-thread snapshot/live, Worker snapshot).
+//
+// Per-side fromBracket / toBracket carry the producer Begin/End hooks for
+// ring-backed scenes, identified by sceneId so the compositor can dedup
+// across multiple per-output transitions that share a scene in the same
+// frame (b->a on output 0 + c->b on output 1 must Begin scene b once, not
+// twice -- the GPU process enforces Begin/End alternation per surfaceBufId).
 interface ActiveTransition {
   fromTex: GPUTexture;
   toTex: GPUTexture;
@@ -764,8 +769,8 @@ interface ActiveTransition {
   resolveTextures?: () => {
     fromTex: GPUTexture;
     toTex: GPUTexture;
-    beginRead?: () => void;
-    endRead?: () => void;
+    fromBracket?: TransitionBracket;
+    toBracket?: TransitionBracket;
   } | null;
   // Per-frame bind group cache. Invalidated when textures change
   // (resolveTextures returns different handles). Keyed on (fromTex,
@@ -773,11 +778,15 @@ interface ActiveTransition {
   cachedFromTex: GPUTexture | null;
   cachedToTex: GPUTexture | null;
   cachedBindGroup: GPUBindGroup | null;
-  // Per-frame endRead closure captured by encodeTransitionPass; the
-  // renderFrame caller runs it after submit so the wire End fires
-  // FIFO-after the sample commands. null when the resolver this frame
-  // didn't request brackets.
-  pendingEndRead: (() => void) | null;
+}
+
+// A producer Begin/End pair for one scene's sample, identified by sceneId
+// so the compositor can ensure exactly one Begin per scene per frame even
+// when multiple outputs sample it concurrently.
+interface TransitionBracket {
+  sceneId: number;
+  beginRead: () => void;
+  endRead: () => void;
 }
 
 export interface LiveWindowCompHandle {
@@ -929,18 +938,18 @@ export class JsCompositor implements CompositorSink {
   // bindGroup wiring (setSurfaceTexture installs it).
   private phantomTextures = new Map<number, GPUTexture>();
 
-  // Phase 8: active transition (core-plugin-api.md §8). When non-null,
-  // renderFrame replaces the on-screen surface-list composite with a
-  // single transition pass blending two textures via a kind-specific
-  // shader. Live composers (above) + live producers continue to run --
-  // their content keeps tracking, so a transition over live scenes
-  // sees in-flight client buffer commits. Only one transition per
-  // compositor at a time (single output today; multi-output is a
-  // future per-output map).
+  // Active transition state. Each entry in activeTransitions is keyed by
+  // the outputId it runs on; on every renderFrame the per-output composite
+  // pass is replaced (for that output only) with a transition pass blending
+  // fromTex/toTex via the kind-specific shader. Live composers + live
+  // producers continue to run -- their content keeps tracking, so a
+  // transition over live scenes sees in-flight client buffer commits.
+  // Simultaneous transitions on different outputs are allowed (one slot per
+  // output); the broker rejects two installs on the same output.
   private transitionPipeline: GPURenderPipeline | null = null;
   private transitionLayout: GPUBindGroupLayout | null = null;
   private transitionUniformBuf: GPUBuffer | null = null;
-  private activeTransition: ActiveTransition | null = null;
+  private activeTransitions = new Map<number, ActiveTransition>();
 
   // dmabuf buffer-release lifecycle. The pure state machine (no GPU, no Dawn)
   // is the source of truth; the executor here translates events <-> intents.
@@ -1227,7 +1236,8 @@ export class JsCompositor implements CompositorSink {
     const repaint = this.outputDamage.take(key);
     const singleAtOrigin = this.outputsGeom.size === 1
       && o.logicalX === 0 && o.logicalY === 0;
-    return (singleAtOrigin && repaint.mode === "partial" && !this.activeTransition)
+    return (singleAtOrigin && repaint.mode === "partial"
+            && !this.activeTransitions.has(o.id))
       ? repaint.box : undefined;
   }
 
@@ -2403,33 +2413,38 @@ export class JsCompositor implements CompositorSink {
     this.dispatch(this.lifecycle.step({ kind: "frameStart" }));
     frameOpen = true;
 
-    // One draw list per output (per-output content stacks via setOutputStack).
-    // Brackets open on the UNION so each sampled import gets exactly one Begin
-    // even when shared across outputs (openImportBrackets de-dupes on
-    // importId; building a deduped union here keeps the union itself cheap).
+    // Per-output draw lists (per-output content stacks via setOutputStack).
+    // Outputs with an active transition contribute NO surfaces to the import-
+    // bracket union -- their transition pass samples compose-output textures,
+    // not client dmabufs. Outputs without a transition contribute their full
+    // draw list; the union is de-duplicated so each importId opens exactly
+    // one Begin (openImportBrackets also de-dupes; this dedup keeps the
+    // union itself cheap).
     const drawByOutput = new Map<number, number[]>();
-    let drawUnion: number[];
-    if (targets.length === 1) {
-      const only = this.drawOrder(targets[0].ctx.id);
-      drawByOutput.set(targets[0].ctx.id, only);
-      drawUnion = only;
-    } else {
+    const bracketUnion: number[] = [];
+    {
       const seen = new Set<number>();
-      drawUnion = [];
       for (const t of targets) {
         const d = this.drawOrder(t.ctx.id);
         drawByOutput.set(t.ctx.id, d);
-        for (const id of d) if (!seen.has(id)) { seen.add(id); drawUnion.push(id); }
+        if (this.activeTransitions.has(t.ctx.id)) continue;
+        for (const id of d) if (!seen.has(id)) { seen.add(id); bracketUnion.push(id); }
       }
     }
     const bracketed: Array<{ importId: number; bufferId: number }> = [];
 
+    // Per-frame transition bracket dedup. Scene producer Begin/End fires once
+    // per unique sceneId across all per-output transitions this frame
+    // (b->a on output 0 + c->b on output 1 share b -- one Begin, one End).
+    const openedScenes = new Set<number>();
+    const pendingEnds = new Map<number, () => void>();
+
     try {
-      // Brackets must cover the UNION of imports sampled this frame --
-      // on-screen draw order plus every live composer's window list.
-      // openImportBrackets de-dupes on importId so any import shared
-      // across these lists opens exactly one Begin (the GPU process
-      // forbids two Begins without an End).
+      // Brackets cover the UNION of imports sampled on the on-screen passes
+      // of NON-TRANSITIONING outputs plus every live composer's window list.
+      // openImportBrackets de-dupes on importId so any import shared across
+      // these lists opens exactly one Begin (the GPU process forbids two
+      // Begins without an End).
       //
       // Bracket opening lives INSIDE the try so a throw from writeBeginAccess
       // (the JS-gate vs core-handle desync at openImportBrackets) or from the
@@ -2437,40 +2452,31 @@ export class JsCompositor implements CompositorSink {
       // the catch below. Without that, the lifecycle's frameStart was
       // dispatched but never paired with frameAborted, and every subsequent
       // renderFrame throws "frame already in flight" forever.
-      // When a transition is active the on-screen pass does NOT sample
-      // any client surfaces (it samples the two compose-output textures
-      // the transition was installed with). Skip the on-screen draw's
-      // bracket open + frameSampled dispatch. The live composers still
-      // sample real surfaces, so their bracket opens stay.
-      if (!this.activeTransition) {
-        this.openImportBrackets(drawUnion, bracketed);
+      if (bracketUnion.length > 0) {
+        this.openImportBrackets(bracketUnion, bracketed);
       }
       for (const ls of this.liveScenes) this.openImportBrackets(ls.windows, bracketed);
       for (const lw of this.liveWindowComps) {
         this.openImportBrackets(lw.windows.map((w) => w.id), bracketed);
       }
 
-      // On-screen pass: either a transition pass (Phase 8) or the normal
-      // per-surface composite. Each output is its OWN encoder+submit because
-      // updateUniforms() writes per-surface uniform buffers via
-      // queue.writeBuffer, and all writes within a single submit land at the
-      // SAME GPU-timeline point (queue.writeBuffer is per-submit, not per-
-      // encoded-command). With one encoder for all outputs, the cursor's
-      // uniform for output 0 was being overwritten by output 1's value
-      // before either pass ran, so both passes drew with output 1's
-      // transform -- the cursor (and any shared surface) would draw in the
-      // wrong place or off-screen on output 0, manifesting as cursor /
-      // client flicker on a multi-output configuration. Per-output submit
-      // serializes the writes: writeBuffer(o0) ; submit(pass0) ;
-      // writeBuffer(o1) ; submit(pass1) -- each pass sees its own values.
-      // GPU queue submits execute serially, so the at-most-one-pending-flip
-      // and bracket invariants are unchanged.
-      const transition = this.activeTransition
-        ? this.resolveTransitionFrame() : null;
+      // On-screen pass: each output is either a transition pass or a normal
+      // per-surface composite, decided per output. Each output is its OWN
+      // encoder+submit because updateUniforms() writes per-surface uniform
+      // buffers via queue.writeBuffer, and all writes within a single submit
+      // land at the SAME GPU-timeline point. With one encoder for all
+      // outputs, the cursor's uniform for output 0 was being overwritten by
+      // output 1's value before either pass ran, so both passes drew with
+      // output 1's transform. Per-output submit serializes the writes:
+      // writeBuffer(o0) ; submit(pass0) ; writeBuffer(o1) ; submit(pass1) --
+      // each pass sees its own values. GPU queue submits execute serially,
+      // so the at-most-one-pending-flip and bracket invariants are unchanged.
       for (const t of targets) {
         const enc = this.device.createCommandEncoder();
-        if (this.activeTransition) {
-          this.encodeTransitionInto(enc, t.view, transition);
+        if (this.activeTransitions.has(t.ctx.id)) {
+          const bindGroup = this.resolveTransitionFrame(
+            t.ctx.id, openedScenes, pendingEnds);
+          this.encodeTransitionInto(enc, t.view, bindGroup);
         } else {
           const d = drawByOutput.get(t.ctx.id);
           if (d === undefined) {
@@ -2526,15 +2532,17 @@ export class JsCompositor implements CompositorSink {
       this.dispatch(this.lifecycle.step({ kind: "submitted", serial }));
       frameOpen = false;
 
-      // Phase 8: close the per-frame transition read bracket on the
-      // wire AFTER the submit. resolveTransitionFrame stashed endRead in
-      // pendingEndRead (only when this frame's transition resolver
-      // returned bracket hooks -- Worker-live). One-shot per frame.
-      if (this.activeTransition?.pendingEndRead) {
-        const endRead = this.activeTransition.pendingEndRead;
-        this.activeTransition.pendingEndRead = null;
-        try { endRead(); }
-        catch (e) { log.err("core", "js-compositor: transition endRead threw: %o", e); }
+      // Close the per-frame transition read brackets on the wire AFTER all
+      // submits, one End per unique sceneId opened this frame (dedup
+      // mirrors the per-frame Begin in resolveTransitionFrame). Order
+      // within the map is irrelevant -- each End targets a distinct
+      // surfaceBufId; the GPU process FIFO-orders per buf.
+      if (pendingEnds.size > 0) {
+        for (const endRead of pendingEnds.values()) {
+          try { endRead(); }
+          catch (e) { log.err("core", "js-compositor: transition endRead threw: %o", e); }
+        }
+        pendingEnds.clear();
       }
 
       this.closeImportBrackets(bracketed);
@@ -2584,16 +2592,16 @@ export class JsCompositor implements CompositorSink {
       // secondary throw so the original `e` propagates.
       try { this.closeImportBrackets(bracketed); }
       catch { /* secondary throw -- intentionally swallowed */ }
-      // Phase 8: same alternation invariant for the transition's
-      // per-frame Begin/End. encodeTransitionPass sets pendingEndRead
-      // before calling beginRead, so if either threw the End needs to
-      // run here to close the bracket the Begin opened.
-      if (this.activeTransition?.pendingEndRead) {
-        const endRead = this.activeTransition.pendingEndRead;
-        this.activeTransition.pendingEndRead = null;
+      // Same alternation invariant for transition Begin/End. resolveTransition-
+      // Frame opens producer Begins keyed by sceneId and stashes their Ends in
+      // pendingEnds before encoding; if anything between the first Begin and
+      // the closeImportBrackets above threw, the Ends need to fire here to
+      // close every bracket whose Begin opened.
+      for (const endRead of pendingEnds.values()) {
         try { endRead(); }
         catch { /* secondary throw -- intentionally swallowed */ }
       }
+      pendingEnds.clear();
       if (frameOpen) {
         try { this.dispatch(this.lifecycle.step({ kind: "frameAborted" })); }
         catch { /* secondary throw -- intentionally swallowed */ }
@@ -3137,50 +3145,46 @@ export class JsCompositor implements CompositorSink {
     };
   }
 
-  // Phase 8: install a transition (core-plugin-api.md §8). While set,
-  // renderFrame replaces the on-screen surface-list composite with a
-  // transition pass blending fromTex/toTex via the kind-specific
-  // shader. getProgress is called once per frame to read the eased
+  // Install a transition on `outputId`. While set, renderFrame replaces
+  // that output's surface-list composite with a transition pass blending
+  // fromTex/toTex via the kind-specific shader. Other outputs continue to
+  // composite normally; simultaneous transitions on different outputs are
+  // allowed. getProgress is called once per frame to read the eased
   // progress in [0, 1]; the broker / evaluator owns that state.
   //
-  // resolveTextures is for the Worker-live case: when the producer's
-  // ring rotates between frames the textures change identity; passing
-  // a resolver lets the compositor re-pick per frame and rebuild the
-  // bind group only when identity changes. Omit for stable cases
-  // (snapshot scenes, in-thread live scenes, where the texture handle
-  // is stable across frames).
+  // resolveTextures is for the Worker-live case: when the producer's ring
+  // rotates between frames the textures change identity; passing a resolver
+  // lets the compositor re-pick per frame and rebuild the bind group only
+  // when identity changes. Per-side fromBracket / toBracket identify the
+  // producer Begin/End hooks by sceneId so the compositor can dedup across
+  // outputs that sample the same scene in the same frame (b->a on output 0
+  // + c->b on output 1 must Begin scene b once, not twice). Omit for stable
+  // cases (snapshot scenes, in-thread live scenes -- the texture handle is
+  // stable and no producer brackets are needed).
   //
-  // Throws if a transition is already active -- the broker pre-rejects
-  // concurrent installs, this is defense in depth.
-  setActiveTransition(opts: {
+  // Throws if `outputId` already has an active transition -- the broker
+  // pre-rejects concurrent installs on the same output, this is defense in
+  // depth.
+  setActiveTransition(outputId: number, opts: {
     fromTex: GPUTexture;
     toTex: GPUTexture;
     kind: TransitionKind;
     getProgress: () => number;
-    // Optional per-frame resolver. When set, called inside each
-    // renderFrame to re-pick this frame's textures + optional bracket
-    // hooks. The hooks (beginRead/endRead) ride the core wire FIFO-
-    // ordered against the transition pass: beginRead writes a
-    // producer Begin BEFORE the encode (so the GPU process opens the
-    // STM access before HandleCommands reaches the sample); endRead
-    // writes End AFTER the submit (so the access stays open through
-    // the sample's wire commands). Used by Worker-live scenes whose
-    // ring slot's STM-backed wgpu::Texture needs an active access on
-    // the core side.
     resolveTextures?: () => {
       fromTex: GPUTexture;
       toTex: GPUTexture;
-      beginRead?: () => void;
-      endRead?: () => void;
+      fromBracket?: TransitionBracket;
+      toBracket?: TransitionBracket;
     } | null;
   }): void {
-    if (this.activeTransition !== null) {
-      throw new Error("setActiveTransition: a transition is already active");
+    if (this.activeTransitions.has(outputId)) {
+      throw new Error(
+        `setActiveTransition: a transition is already active on output ${outputId}`);
     }
     if (this.transitionPipeline === null || this.transitionLayout === null) {
       throw new Error("setActiveTransition: pipeline not initialized");
     }
-    this.activeTransition = {
+    this.activeTransitions.set(outputId, {
       fromTex: opts.fromTex,
       toTex: opts.toTex,
       kind: opts.kind,
@@ -3189,49 +3193,54 @@ export class JsCompositor implements CompositorSink {
       cachedFromTex: null,
       cachedToTex: null,
       cachedBindGroup: null,
-      pendingEndRead: null,
-    };
+    });
   }
 
-  // Tear down the active transition. The broker calls this from inside
-  // the evaluator's commit callback so the very next frame draws the
-  // post-transition state through the normal composite path. Idempotent.
-  clearActiveTransition(): void {
-    this.activeTransition = null;
+  // Tear down the active transition on `outputId`. The broker calls this
+  // from inside the evaluator's commit callback so the very next frame
+  // draws that output's post-transition state through the normal composite
+  // path. Idempotent.
+  clearActiveTransition(outputId: number): void {
+    this.activeTransitions.delete(outputId);
   }
 
-  // For tests: true while a transition is installed.
-  hasActiveTransition(): boolean { return this.activeTransition !== null; }
+  // For tests: true while a transition is installed on `outputId`. Omit
+  // outputId to ask "is any transition active anywhere?".
+  hasActiveTransition(outputId?: number): boolean {
+    if (outputId === undefined) return this.activeTransitions.size > 0;
+    return this.activeTransitions.has(outputId);
+  }
 
-  // Resolve the active transition's inputs ONCE for the frame: re-pick textures
-  // (resolver case), open its one-shot wire read bracket, refresh the bind group
-  // on identity change, and write the kind+progress uniform. Returns the bind
-  // group to draw, or null when no texture is available this frame (the caller
-  // clears each output target to black). Called from renderFrame before the
-  // per-output loop so the producer Begin/End bracket fires exactly once even
-  // when the transition is drawn into multiple output targets.
+  // Resolve one output's active-transition inputs for this frame: re-pick
+  // textures (resolver case), open producer Begin brackets exactly once per
+  // unique scene this frame (across all outputs), refresh the bind group on
+  // identity change, and write the kind+progress uniform. Returns the bind
+  // group to draw, or null when a texture is unavailable this frame (the
+  // caller clears that output target to black).
   //
-  // The caller has already opened any client-surface import brackets it needs
-  // (none for transitions today -- the input textures are not client dmabufs,
-  // they're compose-output / live-scene targets whose lifetimes the broker pins
-  // for the transition's duration).
-  private resolveTransitionFrame(): GPUBindGroup | null {
-    const t = this.activeTransition;
+  // Frame-scoped dedup state is passed in: `openedScenes` is a Set of scene
+  // ids whose Begin has already fired this frame; `pendingEnds` collects End
+  // closures keyed by sceneId for renderFrame to fire after all submits.
+  // Two simultaneous per-output transitions that share a scene (e.g. b->a on
+  // output 0 + c->b on output 1, sharing b) open scene b exactly once and
+  // close it exactly once. The GPU process requires Begin/End alternation
+  // per surfaceBufId; without dedup, two Begins on the same scene would
+  // trip alternation and fail the next access.
+  //
+  // The caller has already opened any client-surface import brackets it
+  // needs for the outputs WITHOUT an active transition. Transition inputs
+  // are not client dmabufs (they're compose-output / live-scene targets
+  // pinned by the broker for the transition's duration), so no on-screen
+  // import brackets are needed on a transitioning output.
+  private resolveTransitionFrame(
+    outputId: number,
+    openedScenes: Set<number>,
+    pendingEnds: Map<number, () => void>,
+  ): GPUBindGroup | null {
+    const t = this.activeTransitions.get(outputId);
     if (!t || !this.transitionPipeline || !this.transitionLayout
         || !this.transitionUniformBuf) return null;
 
-    // Re-pick textures if a resolver is installed; rebuild the bind
-    // group on identity change. For the stable case the cached bind
-    // group is reused every frame. For ring-backed scenes the
-    // resolver also returns optional per-frame beginRead/endRead
-    // wire-bracket closures: beginRead fires here (BEFORE the pass
-    // is encoded, so the wire Begin is FIFO-ordered before the
-    // sample's Dawn commands); endRead is stashed in pendingEndRead
-    // and run by renderFrame after the submit (FIFO-after the sample).
-    // Defensive: clear any stale endRead from a prior frame -- the
-    // resolver may transition from bracketed (Worker-live) to stable
-    // (the producer ring tore down mid-transition) or vice versa.
-    t.pendingEndRead = null;
     let fromTex = t.fromTex;
     let toTex = t.toTex;
     if (t.resolveTextures) {
@@ -3240,13 +3249,19 @@ export class JsCompositor implements CompositorSink {
       if (r === null) return null;
       fromTex = r.fromTex;
       toTex = r.toTex;
-      // Open the wire bracket on the core side BEFORE encoding the
-      // sample. Stash endRead FIRST so a throw between Begin and the
-      // pass encode still leaves the cleanup reachable to the catch
-      // path in renderFrame (which fires pendingEndRead before
-      // rethrowing).
-      t.pendingEndRead = r.endRead ?? null;
-      if (r.beginRead) r.beginRead();
+      // Open each side's producer Begin exactly once per scene per frame.
+      // pendingEnds captures the End closure (overwrites are fine: every
+      // sceneId maps to the same End closure shape -- a producer End on
+      // that scene's surfaceBufId -- so a second resolver returning the
+      // same sceneId's bracket just re-asserts the same End).
+      for (const b of [r.fromBracket, r.toBracket]) {
+        if (!b) continue;
+        if (!openedScenes.has(b.sceneId)) {
+          openedScenes.add(b.sceneId);
+          pendingEnds.set(b.sceneId, b.endRead);
+          b.beginRead();
+        }
+      }
     }
     if (t.cachedBindGroup === null
         || t.cachedFromTex !== fromTex
@@ -3265,7 +3280,9 @@ export class JsCompositor implements CompositorSink {
     }
 
     // Update the kind + progress uniform. 16 bytes (matches WGSL
-    // TUniforms padding).
+    // TUniforms padding). Each output writes its own value because every
+    // output's transition pass is its own submit -- queue.writeBuffer is
+    // per-submit, so successive outputs don't clobber each other.
     const u = new ArrayBuffer(16);
     new Uint32Array(u, 0, 1)[0] = TRANSITION_KIND_CODE[t.kind];
     new Float32Array(u, 4, 1)[0] = t.getProgress();

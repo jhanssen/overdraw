@@ -334,19 +334,21 @@ export interface CompositorSink {
   // slot (skipping if all slots are busy). Returns a token used to
   // unregister.
   registerLiveProducer?(onFrame: () => void): { unregister: () => void };
-  // Phase 8: install a transition that replaces the on-screen pass for
-  // the duration of the transition. Pulled here so the transitions
+  // Install a transition that replaces the on-screen pass on `outputId`
+  // for the duration of the transition. Pulled here so the transitions
   // broker can drive the compositor through the sink interface (rather
   // than coupling to the JsCompositor class). Optional because the
   // native compositor path doesn't implement transitions today.
-  setActiveTransition?(opts: {
+  // Per-output: each output owns its own active-transition slot;
+  // simultaneous transitions on different outputs are allowed.
+  setActiveTransition?(outputId: number, opts: {
     fromTex: GPUTexture;
     toTex: GPUTexture;
     kind: import("@overdraw/transition-types").TransitionKind;
     getProgress: () => number;
     resolveTextures?: () => { fromTex: GPUTexture; toTex: GPUTexture } | null;
   }): void;
-  clearActiveTransition?(): void;
+  clearActiveTransition?(outputId: number): void;
   // Phase 9a: snapshot the surfaces of a closing window into a fresh
   // phantom surface entry. The phantom is a regular surface (the
   // standard per-surface setters work on it) but its texture is

@@ -28,7 +28,6 @@ import { createWindowsBroker, NOT_HANDLED as WINDOWS_NOT_HANDLED } from "./plugi
 import { createAnimationsBroker, NOT_HANDLED as ANIM_NOT_HANDLED } from "./plugins/animations-broker.js";
 import { createInputBroker, NOT_HANDLED as INPUT_NOT_HANDLED } from "./plugins/input-broker.js";
 import { createEvaluator } from "./animations/evaluator.js";
-import { createTransitionEvaluator } from "./transitions/evaluator.js";
 import {
   createCursorBroker, CURSOR_NOT_HANDLED,
 } from "./plugins/cursor-broker.js";
@@ -515,14 +514,14 @@ const windowsBroker = createWindowsBroker({
 const evaluator = createEvaluator(compositor);
 const animationsBroker = createAnimationsBroker(evaluator);
 
-// Transition evaluator + broker (core-plugin-api.md §8). Shares the
-// same frame clock as animations; ticks BEFORE the compositor's
-// renderFrame so the compositor's per-frame getProgress callback reads
-// a fresh value. The broker holds the registry + the compositor +
-// the evaluator together; plugin transitions.run requests route to it.
-const transitionEvaluator = createTransitionEvaluator();
+// Transitions broker (core-plugin-api.md §8). Owns one TransitionEvaluator
+// per output with an in-flight transition (allocated lazily); the broker
+// ticks them all from beforeRender each frame and exposes anyActive() for
+// wakeIfActive. Plugin transitions.run requests route through handle();
+// hasOutput validates the outputId at the trust boundary.
 const transitionsBroker = createTransitionsBroker({
-  compositor, evaluator: transitionEvaluator, sceneRegistry,
+  compositor, sceneRegistry,
+  hasOutput: (outputId) => state.outputs?.has(outputId) ?? false,
 });
 
 // Cursor (Phase 9c). Theme resolver + kinematic state + rule engine
@@ -602,7 +601,7 @@ const interceptPluginBroker = createInterceptPluginBroker({
 
 state.beforeRender = (timeMs: number): void => {
   evaluator.tick(timeMs);
-  transitionEvaluator.tick(timeMs);
+  transitionsBroker.tick(timeMs);
   // Cursor: tick the kinematic state (idle accumulator) and re-evaluate
   // rules. Lazy: kinematics.tick is a no-op while no rule is registered;
   // rule engine evaluate is cheap when no rule is active.
@@ -622,7 +621,7 @@ state.beforeRender = (timeMs: number): void => {
 // input, host wl_surface.frame) wakes again.
 wakeIfActive = (): void => {
   const animActive = evaluator.activeCount() > 0;
-  const transActive = transitionEvaluator.isActive();
+  const transActive = transitionsBroker.anyActive();
   const interceptActive = interceptBroker.hasActive();
   if (animActive || transActive || interceptActive) addon.wake();
 };
@@ -843,7 +842,7 @@ runtime = new PluginRuntime({
       return r;
     }
     if (method.startsWith("transitions.")) {
-      const r = transitionsBroker(plugin, method, params);
+      const r = transitionsBroker.handle(plugin, method, params);
       if (r === TRANSITIONS_NOT_HANDLED) {
         throw new Error(`no handler for transitions method '${method}'`);
       }
