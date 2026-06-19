@@ -66,10 +66,11 @@ class LibinputBackend : public InputBackend {
     void suspend();
     void resume();
 
-    // Update the output logical size used for cursor clamping (resize).
-    void setOutputSize(uint32_t width, uint32_t height) override {
-        width_ = width; height_ = height;
-    }
+    // Update the multi-output layout used for cursor clamping. If the
+    // current cursor position is no longer inside any output, snaps it
+    // into the first output's center (reseat) so subsequent motion has
+    // a valid starting invariant.
+    void setOutputLayout(const std::vector<OutputRect>& outputs) override;
 
     const std::string& error() const { return error_; }
 
@@ -83,10 +84,13 @@ class LibinputBackend : public InputBackend {
 
     Seat&        seat_;
     std::string  seatName_;
-    uint32_t     width_  = 0;
-    uint32_t     height_ = 0;
+    // Output rects in global logical space. The cursor must always lie
+    // inside the union of these rects; relative motion is clamped against
+    // them with edge-sliding through gaps. Initial layout is a single
+    // {0, 0, width, height} so the cursor starts at the center.
+    std::vector<OutputRect> outputs_;
 
-    // Cursor position accumulator (output-space logical pixels).
+    // Cursor position accumulator (global logical pixels).
     double       cursorX_ = 0.0;
     double       cursorY_ = 0.0;
 

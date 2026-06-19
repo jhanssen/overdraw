@@ -1867,19 +1867,49 @@ bool ensureKeymap() {
     return true;
 }
 
-// updateOutputSize(width, height) -> undefined
-// Update the input backend's notion of output size (used for pointer coordinate
-// mapping / cursor clamping). Called when state.outputs's logicalSize changes
-// (host-window resize in nested mode; KMS mode change later). Silent no-op if
-// no input backend is active.
-napi_value UpdateOutputSize(napi_env env, napi_callback_info info) {
-    size_t argc = 2; napi_value argv[2];
+// updateOutputLayout(rects) -> undefined
+// Update the input backend's view of the multi-output layout (used for
+// pointer-space mapping and cursor clamping). `rects` is an Array<{x, y, w, h}>
+// in global logical pixels. Called whenever state.outputs changes
+// (add/remove/resize). Silent no-op if no input backend is active.
+napi_value UpdateOutputLayout(napi_env env, napi_callback_info info) {
+    size_t argc = 1; napi_value argv[1];
     napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
-    if (argc < 2) return throwError(env, "updateOutputSize(width, height) requires 2 args");
-    uint32_t w = 0, h = 0;
-    napi_get_value_uint32(env, argv[0], &w);
-    napi_get_value_uint32(env, argv[1], &h);
-    if (g_addon.input) g_addon.input->setOutputSize(w, h);
+    if (argc < 1) return throwError(env, "updateOutputLayout(rects) requires 1 arg");
+
+    bool isArr = false;
+    napi_is_array(env, argv[0], &isArr);
+    if (!isArr) return throwError(env, "updateOutputLayout: rects must be an Array");
+
+    uint32_t n = 0;
+    napi_get_array_length(env, argv[0], &n);
+    std::vector<overdraw::core::OutputRect> outs;
+    outs.reserve(n);
+    for (uint32_t i = 0; i < n; ++i) {
+        napi_value item;
+        napi_get_element(env, argv[0], i, &item);
+        napi_valuetype t;
+        napi_typeof(env, item, &t);
+        if (t != napi_object) {
+            return throwError(env, "updateOutputLayout: each rect must be an object");
+        }
+        overdraw::core::OutputRect r{};
+        napi_value v;
+        if (napi_get_named_property(env, item, "x", &v) == napi_ok) {
+            int32_t x = 0; napi_get_value_int32(env, v, &x); r.x = x;
+        }
+        if (napi_get_named_property(env, item, "y", &v) == napi_ok) {
+            int32_t y = 0; napi_get_value_int32(env, v, &y); r.y = y;
+        }
+        if (napi_get_named_property(env, item, "w", &v) == napi_ok) {
+            uint32_t w = 0; napi_get_value_uint32(env, v, &w); r.w = w;
+        }
+        if (napi_get_named_property(env, item, "h", &v) == napi_ok) {
+            uint32_t h = 0; napi_get_value_uint32(env, v, &h); r.h = h;
+        }
+        outs.push_back(r);
+    }
+    if (g_addon.input) g_addon.input->setOutputLayout(outs);
     napi_value u; napi_get_undefined(env, &u); return u;
 }
 
@@ -2556,7 +2586,7 @@ napi_value Init(napi_env env, napi_value exports) {
     reg("pluginReleaseSurfaceBuffer", PluginReleaseSurfaceBuffer);
     reg("setOnOutputDescriptor", SetOnOutputDescriptor);
     reg("setOnFlipComplete", SetOnFlipComplete);
-    reg("updateOutputSize", UpdateOutputSize);
+    reg("updateOutputLayout", UpdateOutputLayout);
     reg("logInit", LogInit);
     reg("nativeLog", NativeLog);
 

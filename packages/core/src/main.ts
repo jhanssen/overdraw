@@ -286,7 +286,8 @@ state = await installProtocols(addon, {
 // Two propagation styles per the design:
 //   - INTERNAL system layers are called directly here in known order:
 //       compositor.setOutputSize  -> render passes know the new dims
-//       addon.updateOutputSize    -> input backend's pointer mapping clamp
+//       addon.updateOutputLayout  -> input backend's pointer-space layout
+//                                    (all outputs, with edge-sliding clamp)
 //       wm.state.output           -> mutated so subsequent layout snapshots
 //                                    pick up the new dims; relayout scheduled
 //   - EXTERNAL protocol layers (wl_output + zxdg_output_v1 re-emit to bound
@@ -378,14 +379,22 @@ addon.setOnOutputDescriptor((d) => {
     })));
   }
 
+  // Push the full multi-output layout to the input backend so the cursor
+  // is clamped against the union of every monitor's rect (with edge-sliding
+  // for gaps), not just the primary's dims. Covers every output, not just
+  // primary -- the cursor must be free to cross output boundaries.
+  addon.updateOutputLayout([...outputs.values()].map((r) => ({
+    x: r.logicalPosition.x, y: r.logicalPosition.y,
+    w: r.logicalSize.width, h: r.logicalSize.height,
+  })));
+
   // Internal reconfigurations, in dependency order, for the primary only --
-  // the compositor renders at device resolution and the WM/input work in
-  // logical coordinates against the single render target.
+  // the compositor's single render-target dims and the WM's logical output
+  // still drive against the primary. (M5 lifts the WM single-output cap.)
   if (isPrimary) {
     if (compositor instanceof JsCompositor) {
       compositor.setOutputSize(device.width, device.height, scale);
     }
-    addon.updateOutputSize(logical.width, logical.height);
     if (state.wm) {
       state.wm.state.output.width = logical.width;
       state.wm.state.output.height = logical.height;

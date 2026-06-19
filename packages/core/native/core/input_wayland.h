@@ -35,9 +35,11 @@ class WaylandInputBackend : public InputBackend {
     int pollFd() const override { return inputFd_; }
     void drain() override;
 
-    // Update the output logical size used for coordinate mapping (resize).
-    void setOutputSize(uint32_t width, uint32_t height) override {
-        width_ = width; height_ = height;
+    // The wayland backend forwards already-mapped coordinates (the GPU
+    // process maps host-surface-local to output space before sending),
+    // so layout is ignored here. Stub for the InputBackend interface.
+    void setOutputLayout(const std::vector<OutputRect>& outputs) override {
+        (void)outputs;
     }
 
     // Test seam: feed a forwarded InputMessage through the SAME conversion path

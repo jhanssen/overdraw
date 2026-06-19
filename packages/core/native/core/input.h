@@ -27,8 +27,21 @@
 #define OVERDRAW_CORE_INPUT_H_
 
 #include <cstdint>
+#include <vector>
 
 namespace overdraw::core {
+
+// One output's rectangle in the global logical coordinate space. Used by
+// the libinput backend to clamp accumulated pointer motion against a
+// multi-output layout (non-rectangular unions slide along edges; see
+// src/output/pointer-clamp.ts for the algorithm, mirrored byte-for-byte
+// in input_libinput.cpp).
+struct OutputRect {
+    int32_t x;
+    int32_t y;
+    uint32_t w;
+    uint32_t h;
+};
 
 enum class InputEventType : uint8_t {
     PointerEnter,
@@ -120,12 +133,14 @@ class InputBackend {
     // main thread (no cross-thread marshaling needed at this layer).
     virtual void drain() = 0;
 
-    // Update the output's logical size used by the backend for coordinate
-    // mapping or clamping. Both backends apply it to the pointer-space rect
-    // (wayland: host-surface-local -> output mapping; libinput: cursor
-    // accumulator clamp). Called when the output is reconfigured (host
-    // window resize in nested mode; KMS mode change later).
-    virtual void setOutputSize(uint32_t width, uint32_t height) = 0;
+    // Update the multi-output layout the backend uses for pointer-space
+    // mapping or clamping. The libinput backend clamps the accumulated
+    // pointer position to the union of these rects (with edge-sliding for
+    // gaps in non-rectangular unions). The wayland backend currently
+    // ignores layout (host forwards already-mapped coords); the override
+    // is kept to satisfy the interface. Called whenever state.outputs
+    // changes (add/remove/resize).
+    virtual void setOutputLayout(const std::vector<OutputRect>& outputs) = 0;
 };
 
 }  // namespace overdraw::core

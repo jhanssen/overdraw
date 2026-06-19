@@ -7,18 +7,98 @@
 #include <cerrno>
 #include <cstring>
 #include <fcntl.h>
+#include <limits>
 #include <unistd.h>
 
 #include "seat.h"
 
 namespace overdraw::core {
 
+namespace {
+
+// Pointer clamp against a multi-output layout. Mirrors the algorithm in
+// packages/core/src/output/pointer-clamp.ts byte-for-byte (which is the
+// canonical version + has unit tests). Keep them in sync.
+//
+// Outputs may form a non-rectangular union. A relative motion that would
+// leave the union slides along an axis to the nearest valid in-bounds
+// position; if no axis-aligned slide finds a valid landing, the cursor
+// stays where it was.
+
+inline bool insideAny(const std::vector<OutputRect>& outs, double x, double y) {
+    for (const auto& r : outs) {
+        const double rxh = static_cast<double>(r.x) + static_cast<double>(r.w);
+        const double ryh = static_cast<double>(r.y) + static_cast<double>(r.h);
+        if (x >= r.x && x < rxh && y >= r.y && y < ryh) return true;
+    }
+    return false;
+}
+
+inline double clampToRange(double v, double lo, double hi) {
+    return v < lo ? lo : (v > hi ? hi : v);
+}
+
+// X-slide: keep `x` as the target X; among outputs whose x-range covers `x`,
+// pick the one whose y-range is closest to refY; snap y into its bounds.
+// Returns true on success with out_y written.
+bool slideAlongX(const std::vector<OutputRect>& outs,
+                 double x, double refY, double& out_y) {
+    const OutputRect* best = nullptr;
+    double bestDist = std::numeric_limits<double>::infinity();
+    for (const auto& r : outs) {
+        const double rxh = static_cast<double>(r.x) + static_cast<double>(r.w);
+        if (!(x >= r.x && x < rxh)) continue;
+        const double ry  = static_cast<double>(r.y);
+        const double ryh = ry + static_cast<double>(r.h);
+        double d;
+        if (refY < ry)        d = ry - refY;
+        else if (refY >= ryh) d = refY - (ryh - 1.0);
+        else                  d = 0.0;
+        if (d < bestDist) { bestDist = d; best = &r; }
+    }
+    if (!best) return false;
+    out_y = clampToRange(refY,
+        static_cast<double>(best->y),
+        static_cast<double>(best->y) + static_cast<double>(best->h) - 1.0);
+    return true;
+}
+
+// Y-slide: symmetric of slideAlongX.
+bool slideAlongY(const std::vector<OutputRect>& outs,
+                 double refX, double y, double& out_x) {
+    const OutputRect* best = nullptr;
+    double bestDist = std::numeric_limits<double>::infinity();
+    for (const auto& r : outs) {
+        const double ryh = static_cast<double>(r.y) + static_cast<double>(r.h);
+        if (!(y >= r.y && y < ryh)) continue;
+        const double rx  = static_cast<double>(r.x);
+        const double rxh = rx + static_cast<double>(r.w);
+        double d;
+        if (refX < rx)        d = rx - refX;
+        else if (refX >= rxh) d = refX - (rxh - 1.0);
+        else                  d = 0.0;
+        if (d < bestDist) { bestDist = d; best = &r; }
+    }
+    if (!best) return false;
+    out_x = clampToRange(refX,
+        static_cast<double>(best->x),
+        static_cast<double>(best->x) + static_cast<double>(best->w) - 1.0);
+    return true;
+}
+
+}  // namespace
+
+
 LibinputBackend::LibinputBackend(Seat& seat, std::string seatName,
                                  uint32_t width, uint32_t height)
-    : seat_(seat), seatName_(std::move(seatName)), width_(width), height_(height) {
-    // Start cursor at the center of the output. Arbitrary but visible.
-    cursorX_ = width_ * 0.5;
-    cursorY_ = height_ * 0.5;
+    : seat_(seat), seatName_(std::move(seatName)) {
+    // Initial layout: one rect at (0,0). The JS side replaces this with
+    // the real per-output layout via setOutputLayout once state.outputs
+    // has been built from descriptors.
+    outputs_.push_back({0, 0, width, height});
+    // Start cursor at the center of that rect. Arbitrary but visible.
+    cursorX_ = width * 0.5;
+    cursorY_ = height * 0.5;
 }
 
 LibinputBackend::~LibinputBackend() {
@@ -148,15 +228,26 @@ void LibinputBackend::dispatchEvent(libinput_event* ev) {
             auto* pe = libinput_event_get_pointer_event(ev);
             const double dx = libinput_event_pointer_get_dx(pe);
             const double dy = libinput_event_pointer_get_dy(pe);
-            cursorX_ += dx;
-            cursorY_ += dy;
-            // Clamp to output bounds. Single output in v1.
-            if (cursorX_ < 0) cursorX_ = 0;
-            if (cursorY_ < 0) cursorY_ = 0;
-            const double maxX = static_cast<double>(width_  ? width_  - 1 : 0);
-            const double maxY = static_cast<double>(height_ ? height_ - 1 : 0);
-            if (cursorX_ > maxX) cursorX_ = maxX;
-            if (cursorY_ > maxY) cursorY_ = maxY;
+            // Clamp against the multi-output union with edge-sliding.
+            // (oldX, oldY) is guaranteed inside some rect by the invariant
+            // setOutputLayout maintains.
+            const double oldX = cursorX_, oldY = cursorY_;
+            const double tx = oldX + dx, ty = oldY + dy;
+            if (insideAny(outputs_, tx, ty)) {
+                cursorX_ = tx;
+                cursorY_ = ty;
+            } else {
+                double snapY;
+                if (slideAlongX(outputs_, tx, ty, snapY)) {
+                    cursorX_ = tx; cursorY_ = snapY;
+                } else {
+                    double snapX;
+                    if (slideAlongY(outputs_, tx, ty, snapX)) {
+                        cursorX_ = snapX; cursorY_ = ty;
+                    }
+                    // else both axes rejected; cursor stays at (oldX, oldY).
+                }
+            }
 
             InputEvent e{};
             e.type = InputEventType::PointerMotion;
@@ -225,6 +316,20 @@ void LibinputBackend::dispatchEvent(libinput_event* ev) {
         default:
             // Touch, gestures, switches, tablet — out of scope for v1.
             break;
+    }
+}
+
+void LibinputBackend::setOutputLayout(const std::vector<OutputRect>& outputs) {
+    outputs_ = outputs;
+    // Maintain the cursor invariant: (cursorX_, cursorY_) inside some rect.
+    // If the new layout stranded the cursor, reseat it into the first rect's
+    // center. Empty layout leaves the cursor wherever it was (no valid
+    // landing exists; the next motion will be a no-op until layout returns).
+    if (outputs_.empty()) return;
+    if (!insideAny(outputs_, cursorX_, cursorY_)) {
+        const auto& r = outputs_.front();
+        cursorX_ = static_cast<double>(r.x) + r.w / 2.0;
+        cursorY_ = static_cast<double>(r.y) + r.h / 2.0;
     }
 }
 
