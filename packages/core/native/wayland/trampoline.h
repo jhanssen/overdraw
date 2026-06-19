@@ -46,6 +46,15 @@ class Trampoline {
     // the interface is unknown.
     bool createGlobal(const std::string& interfaceName, napi_value handler);
 
+    // Like createGlobal, but tags the global with an outputId so multiple
+    // globals can be advertised for the same interface -- one per output --
+    // each with its own JS bind handler. wl_output is the only consumer
+    // today: a client binding the wl_output for output 1 reaches output 1's
+    // handler, which emits output 1's geometry. Returns false if the
+    // interface is unknown.
+    bool createGlobalForOutput(const std::string& interfaceName,
+                               uint32_t outputId, napi_value handler);
+
     // Post an event to a client: encode the JS args per the event's signature
     // and call wl_resource_post_event_array. `resourceHandle` is a wrapped
     // resource (from wrapResource); `opcode` is the event index; `argsArray` is
@@ -102,6 +111,10 @@ class Trampoline {
     wl_display* display_;
     InterfaceRegistry* registry_;
     std::unordered_map<std::string, std::unique_ptr<InterfaceState>> interfaces_;
+    // Per-output globals (today: wl_output, one per dense outputId). Each entry
+    // owns its own InterfaceState (separate JS bind handler ref) so the bind
+    // routes to the right output's handler. Keyed by "<interfaceName>:<outputId>".
+    std::unordered_map<std::string, std::unique_ptr<InterfaceState>> outputGlobals_;
     // Stable JS wrapper per wl_resource (napi_ref keeps it alive while the
     // resource lives). Cleared on resource destroy.
     std::unordered_map<wl_resource*, napi_ref> wrappers_;

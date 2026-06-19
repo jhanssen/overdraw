@@ -38,6 +38,9 @@ Trampoline::~Trampoline() {
     for (auto& [name, st] : interfaces_) {
         if (st->handler) napi_delete_reference(env_, st->handler);
     }
+    for (auto& [key, st] : outputGlobals_) {
+        if (st->handler) napi_delete_reference(env_, st->handler);
+    }
 }
 
 Trampoline::InterfaceState* Trampoline::ensureInterface(
@@ -64,6 +67,25 @@ bool Trampoline::createGlobal(const std::string& interfaceName, napi_value handl
     InterfaceState* st = ensureInterface(interfaceName, handler);
     if (!st) return false;
     wl_global_create(display_, st->iface, st->iface->version, st, &Trampoline::onBind);
+    return true;
+}
+
+bool Trampoline::createGlobalForOutput(const std::string& interfaceName,
+                                       uint32_t outputId, napi_value handler) {
+    const wl_interface* iface = registry_->get(interfaceName);
+    if (!iface) return false;
+    // Allocate a fresh InterfaceState whose handler is the per-output JS
+    // object. Stored in outputGlobals_ keyed by "<name>:<outputId>" so it
+    // survives the call and the destructor can drop the napi_ref.
+    auto st = std::make_unique<InterfaceState>();
+    st->name = interfaceName;
+    st->iface = iface;
+    st->owner = this;
+    napi_create_reference(env_, handler, 1, &st->handler);
+    InterfaceState* raw = st.get();
+    std::string key = interfaceName + ":" + std::to_string(outputId);
+    outputGlobals_[key] = std::move(st);
+    wl_global_create(display_, raw->iface, raw->iface->version, raw, &Trampoline::onBind);
     return true;
 }
 

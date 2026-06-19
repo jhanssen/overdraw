@@ -44,6 +44,11 @@ export interface Addon {
   registerProtocols(signatures: unknown[]): void;
   registerInterface(name: string, handler: unknown): void;
   createGlobal(name: string, handler: unknown): void;
+  // Like createGlobal, but advertises another global for `name` tagged with
+  // `outputId`. Each global gets its own bind handler so multiple wl_outputs
+  // (etc.) can be advertised, one per dense outputId. The interface must
+  // already be registered (registerProtocols). M6+ uses this for wl_output.
+  createGlobalForOutput(name: string, outputId: number, handler: unknown): void;
   postEvent(resource: Resource, opcode: number, args: unknown[]): void;
   // Server-initiated destruction: drop the libwayland resource + wrapper.
   // For client-issued destructor requests (wl_buffer.destroy etc.) the

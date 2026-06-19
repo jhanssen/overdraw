@@ -512,10 +512,12 @@ ordering is a build sequence, not a scope boundary: the feature is complete only
 after **both** hotplug (M7) and multi-GPU (M8). Milestones 1-7 are intermediate
 states of one feature, not a shippable endpoint.
 
-**Status: M1-M5 done.** M1-M4 surface-verified on a single-card two-monitor
-setup (HDMI 60Hz + DP 240Hz both lit). M5 unit-tested GPU-free (1186 unit green
-+ GPU green); structural multi-output is now end-to-end through every JS layer
-except the wire-protocol globals (M6). 4h-a, 4h-b, and 4h-c all done in M4;
+**Status: M1-M6 done.** M1-M4 surface-verified on a single-card two-monitor
+setup (HDMI 60Hz + DP 240Hz both lit). M5 + M6 unit-tested GPU-free + GPU
+green; structural multi-output is now end-to-end through every JS layer AND
+visible to clients over the Wayland wire (N `wl_output` globals; per-surface
+enter/leave; per-output xdg-output; per-surface fractional scale tracking the
+primary overlapping output). 4h-a, 4h-b, and 4h-c all done in M4;
 the M4 follow-ups originally listed as "done" but not actually implemented
 (`drawOrder(outputId)`, per-output `activeTransition` with cross-output bracket
 dedup) also landed. M6-M8 remain. A multi-GPU render-node robustness fix landed
@@ -637,8 +639,30 @@ the resolved decision.
    the WM/workspace structure is now complete and ready for hotplug (M7) to
    drive `setOutputs` and `preferredOutputs` recompute on connector
    add/remove events.
-6. **Per-output protocol resources.** N `wl_output` globals, real xdg-output
-   positions, `wl_surface.enter/leave`, layer-shell output targeting (Section 9).
+6. **Per-output protocol resources. [DONE — unit-tested + GPU green.]**
+   N `wl_output` globals via a new addon API `createGlobalForOutput`: the
+   native trampoline allocates a per-output `InterfaceState` (separate JS
+   bind handler ref per outputId) and calls `wl_global_create` for each, so
+   a client binding `wl_output` for output 1 reaches output 1's handler.
+   Descriptor arrivals after `installProtocols` create globals on demand
+   (hotplug-ready). `zxdg_output_v1.get_xdg_output(wl_output)` reverse-
+   resolves the bound resource to its outputId via the shared
+   `output-resolve` helpers, then emits that output's real
+   logical_position/logical_size. `wl_surface.enter`/`leave` emission is
+   driven by a setSurfaceLayout interceptor (Proxy wrapping
+   `state.compositor`) and the new `surface-residency` module: each
+   geometry change diffs `compositor.surfaceOutputs(id)` against the
+   per-surface `enteredOutputs` set and emits enter/leave on the wl_output
+   resource bound by the surface's CLIENT (silently suppressed when the
+   client has not bound the relevant wl_output -- the spec allows this).
+   Output add / arrangement-change calls `updateAllSurfaceResidency` so
+   every mapped surface refreshes. `wp_fractional_scale_v1` resources are
+   tracked as `Map<Resource, wl_surface Resource>`; preferred_scale picks
+   the scale of each surface's primary overlapping output and re-emits
+   when residency shifts. Layer-shell output targeting (the `output` arg
+   to `get_layer_surface`) was already wired server-side in M5; M6's
+   per-output globals make it reachable from clients (a layer-shell
+   client binding wl_output for output 1 now actually targets output 1).
 7. **Hotplug (required for completeness).** udev-monitor detection +
    `OutputAdded`/`Removed` end-to-end, and the workspace-migration policy in the
    workspace plugin — removal evacuation, return-reclaim by preference,

@@ -1,35 +1,88 @@
-// wp_fractional_scale_manager_v1 / wp_fractional_scale_v1: tells a surface the
-// compositor's preferred fractional scale so it can render at that density and
-// declare its logical size via wp_viewport.set_destination.
+// wp_fractional_scale_manager_v1 / wp_fractional_scale_v1: tells a surface
+// the compositor's preferred fractional scale so it can render at that
+// density and declare its logical size via wp_viewport.set_destination.
 //
-// get_fractional_scale(wl_surface) creates a wp_fractional_scale_v1; the
-// compositor sends preferred_scale (the scale * 120, rounded) immediately and
-// again whenever the output scale changes (reemitFractionalScale, hooked to
-// the output.changed bus in main.ts). Single-output today: every surface gets
-// the one output's scale.
+// get_fractional_scale(wl_surface) creates a wp_fractional_scale_v1 and
+// stores the wl_surface in state.fractionalScaleResources. preferred_scale
+// is the scale of the surface's primary output (the one with the largest
+// overlap area). Re-emitted when state.outputs changes (output.changed bus
+// in main.ts) and when surface residency shifts.
 
 import { signature as fsSig } from "#protocols-gen/wp_fractional_scale_v1.js";
 import type { WpFractionalScaleManagerV1Handler } from "#protocols-gen/wp_fractional_scale_manager_v1.js";
 import type { WpFractionalScaleV1Handler } from "#protocols-gen/wp_fractional_scale_v1.js";
 
 import type { Ctx, CompositorState } from "./ctx.js";
-import { OUTPUT_DEFAULT } from "./ctx.js";
+import type { Resource } from "../types.js";
+import { primaryOutputId } from "./output-resolve.js";
 
 void fsSig;
 
 // The protocol expresses scale in 120ths (scale * 120), so 1.5 -> 180.
-function preferredScaleValue(state: CompositorState): number {
-  const scale = state.outputs?.get(OUTPUT_DEFAULT)?.scale ?? 1;
+function asProtocolValue(scale: number): number {
   return Math.max(120, Math.round(scale * 120));
 }
 
+// Surface's "primary output" for scale purposes: the output containing the
+// largest fraction of its rect. Falls back to the compositor's primary if
+// the surface doesn't yet overlap anything.
+function primaryOutputOfSurface(
+  state: CompositorState, surfaceRes: Resource,
+): number {
+  // Resolve the SurfaceRecord via the resource->record map; surface ids are
+  // unique per session.
+  let surfaceId = -1;
+  for (const [id, rec] of state.surfacesById ?? []) {
+    if (rec.resource === surfaceRes) { surfaceId = id; break; }
+  }
+  if (surfaceId < 0) return primaryOutputId(state);
+  const surfaceOutputs = state.compositor.surfaceOutputs;
+  if (!surfaceOutputs) return primaryOutputId(state);
+  const overlapping = surfaceOutputs.call(state.compositor, surfaceId);
+  // Pick the output the surface most likely lives on. surfaceOutputs() is
+  // unweighted (any overlap counts) so without per-output overlap areas we
+  // fall back to "lowest id wins" -- deterministic, matches what most
+  // clients see as their "main" output.
+  if (overlapping.length === 0) return primaryOutputId(state);
+  let lo = Infinity;
+  for (const id of overlapping) if (id < lo) lo = id;
+  return lo === Infinity ? primaryOutputId(state) : lo;
+}
+
+// The preferred scale (in protocol units, scale * 120) for `surfaceRes`'s
+// primary output. Falls back to the compositor's primary when no output
+// resolves.
+function preferredScaleFor(state: CompositorState, surfaceRes: Resource): number {
+  const outputId = primaryOutputOfSurface(state, surfaceRes);
+  const scale = state.outputs?.get(outputId)?.scale ?? 1;
+  return asProtocolValue(scale);
+}
+
+// Re-emit preferred_scale for every bound wp_fractional_scale_v1 resource.
+// Called on output.changed (main.ts) and surface-residency changes (M6
+// surface-residency module). Destroyed resources are pruned in-line.
 export function reemitFractionalScale(state: CompositorState): void {
-  const set = state.fractionalScaleResources;
-  if (!set || set.size === 0 || !state.events) return;
-  const v = preferredScaleValue(state);
-  for (const r of [...set]) {
-    if (r.destroyed) { set.delete(r); continue; }
-    state.events.wp_fractional_scale_v1.send_preferred_scale(r, v);
+  const map = state.fractionalScaleResources;
+  if (!map || map.size === 0 || !state.events) return;
+  for (const [r, surfaceRes] of [...map]) {
+    if (r.destroyed) { map.delete(r); continue; }
+    state.events.wp_fractional_scale_v1.send_preferred_scale(r, preferredScaleFor(state, surfaceRes));
+  }
+}
+
+// Re-emit preferred_scale for a single surface's fractional-scale resources
+// (the surface's residency just changed; output set may differ from last
+// emission). Cheap: a single linear walk; most surfaces have 0-1 fractional
+// scale resources.
+export function reemitFractionalScaleForSurface(
+  state: CompositorState, surfaceRes: Resource,
+): void {
+  const map = state.fractionalScaleResources;
+  if (!map || map.size === 0 || !state.events) return;
+  for (const [r, owner] of [...map]) {
+    if (owner !== surfaceRes) continue;
+    if (r.destroyed) { map.delete(r); continue; }
+    state.events.wp_fractional_scale_v1.send_preferred_scale(r, preferredScaleFor(state, surfaceRes));
   }
 }
 
@@ -38,9 +91,10 @@ export default function makeFractionalScaleManager(ctx: Ctx): WpFractionalScaleM
     destroy(_resource) {
       // Destructor. Existing wp_fractional_scale_v1 objects survive.
     },
-    get_fractional_scale(_manager, id, _surface) {
-      (ctx.state.fractionalScaleResources ??= new Set()).add(id);
-      ctx.events.wp_fractional_scale_v1.send_preferred_scale(id, preferredScaleValue(ctx.state));
+    get_fractional_scale(_manager, id, surface) {
+      (ctx.state.fractionalScaleResources ??= new Map()).set(id, surface as Resource);
+      ctx.events.wp_fractional_scale_v1.send_preferred_scale(
+        id, preferredScaleFor(ctx.state, surface as Resource));
     },
   };
 }

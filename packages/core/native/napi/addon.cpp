@@ -1786,6 +1786,35 @@ napi_value CreateGlobal(napi_env env, napi_callback_info info) {
     return undef;
 }
 
+// createGlobalForOutput(interfaceName: string, outputId: number,
+//                       handler: object) -> undefined
+//
+// Advertise another global for `interfaceName` tagged with `outputId`. Each
+// global has its own JS bind handler, so multiple outputs can each advertise
+// their own wl_output (etc.). The interface must already be registered.
+napi_value CreateGlobalForOutput(napi_env env, napi_callback_info info) {
+    size_t argc = 3; napi_value argv[3];
+    napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+    if (argc < 3) return throwError(env,
+        "createGlobalForOutput(name, outputId, handler) requires three args");
+    if (!g_addon.server || !g_addon.registry)
+        return throwError(env, "server + protocols must be registered first");
+
+    if (!g_addon.trampoline)
+        g_addon.trampoline = std::make_unique<Trampoline>(
+            env, g_addon.server->display(), g_addon.registry.get());
+
+    char name[256]; size_t len = 0;
+    napi_get_value_string_utf8(env, argv[0], name, sizeof(name), &len);
+    uint32_t outputId = 0;
+    napi_get_value_uint32(env, argv[1], &outputId);
+    if (!g_addon.trampoline->createGlobalForOutput(name, outputId, argv[2]))
+        return throwError(env, "createGlobalForOutput: unknown interface");
+
+    napi_value undef; napi_get_undefined(env, &undef);
+    return undef;
+}
+
 // registerInterface(interfaceName: string, handler: object) -> undefined
 // Register a request handler for an interface created via requests (new_id),
 // e.g. xdg_surface / xdg_toplevel, without advertising a global.
@@ -2543,10 +2572,11 @@ napi_value Init(napi_env env, napi_value exports) {
     }
     napi_create_function(env, "startServer", NAPI_AUTO_LENGTH, StartServer, nullptr, &fnStartServer);
     napi_create_function(env, "stopServer", NAPI_AUTO_LENGTH, StopServer, nullptr, &fnStopServer);
-    napi_value fnRegister, fnCreateGlobal, fnPostEvent, fnRegisterIface;
+    napi_value fnRegister, fnCreateGlobal, fnCreateGlobalForOutput, fnPostEvent, fnRegisterIface;
     napi_create_function(env, "registerProtocols", NAPI_AUTO_LENGTH, RegisterProtocols, nullptr, &fnRegister);
     napi_create_function(env, "registerInterface", NAPI_AUTO_LENGTH, RegisterInterface, nullptr, &fnRegisterIface);
     napi_create_function(env, "createGlobal", NAPI_AUTO_LENGTH, CreateGlobal, nullptr, &fnCreateGlobal);
+    napi_create_function(env, "createGlobalForOutput", NAPI_AUTO_LENGTH, CreateGlobalForOutput, nullptr, &fnCreateGlobalForOutput);
     napi_create_function(env, "postEvent", NAPI_AUTO_LENGTH, PostEvent, nullptr, &fnPostEvent);
 
     // shm / client-surface bridge (the first server <-> compositor connection).
@@ -2598,6 +2628,7 @@ napi_value Init(napi_env env, napi_value exports) {
     napi_set_named_property(env, exports, "registerProtocols", fnRegister);
     napi_set_named_property(env, exports, "registerInterface", fnRegisterIface);
     napi_set_named_property(env, exports, "createGlobal", fnCreateGlobal);
+    napi_set_named_property(env, exports, "createGlobalForOutput", fnCreateGlobalForOutput);
     napi_set_named_property(env, exports, "postEvent", fnPostEvent);
     return exports;
 }

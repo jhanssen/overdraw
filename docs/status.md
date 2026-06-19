@@ -390,7 +390,7 @@ keybindings with general key interception — `wl_seat.ts` consults
 implemented; see the WM behavioral-state, plugin SDK, and binding-chain
 sections.) `wl_output` now reports real values: in nested mode they come from the host's `wl_output`
 (slice 3 of `drm-design.md`); in KMS mode from the connector's EDID + mode
-(slice 4+5). Output resize (nested) propagates end-to-end. Multi-output M1-M5
+(slice 4+5). Output resize (nested) propagates end-to-end. Multi-output M1-M6
 are done (see `docs/multi-output-design.md` §12). M1-M4 (surface-verified on a
 single-card two-monitor setup, HDMI 60Hz + DP 240Hz both lit): N-connector
 enumeration, per-output scanout rings + distinct CRTC + fence routing, per-
@@ -415,11 +415,26 @@ virtual output (sentinel id `OUTPUT_FALLBACK = -1`, durable name
 output map skip it automatically; `sdk.compose` validates outputIds against
 the live `state.outputs` set via a plumbed `hasOutput` (worker plugins get a
 spawn-time snapshot of live ids in `workerData`); `setOnOutputDescriptor`
-feeds every output (not just the primary) into `wm.setOutputs`. M6 (per-
-output protocol resources — one `wl_output` global today, no
-`wl_surface.enter/leave`), M7 (hotplug + workspace migration via
-`preferredOutputs` recompute on `output.added`/`removed`), and M8 (multi-
-GPU) remain.
+feeds every output (not just the primary) into `wm.setOutputs`. M6 (GPU-
+free, unit-tested + GPU green via existing layer-shell / buffer-transform /
+compose tests): N `wl_output` globals, one per entry in `state.outputs`, via
+a new addon API `createGlobalForOutput` (native trampoline tracks per-output
+InterfaceStates separate from the request-handler interfaces map; descriptor
+arrivals after install create globals on demand); `zxdg_output_v1`'s
+`get_xdg_output(wl_output)` reverse-resolves the bound resource to its
+outputId (shared `output-resolve.ts` helpers `resolveWlOutputToId` /
+`primaryOutputId`); `wl_surface.enter`/`leave` emission via a new
+`surface-residency` module driven by a `setSurfaceLayout` Proxy on the
+compositor sink — every geometry change diffs `compositor.surfaceOutputs(id)`
+against the per-surface `enteredOutputs` set and emits enter/leave on the
+right wl_output resource for the surface's CLIENT (silently suppressed when
+the client has not bound the relevant wl_output); output add / arrangement
+change calls `updateAllSurfaceResidency` so every mapped surface refreshes;
+`wp_fractional_scale_v1` tracks per-surface `Map<Resource, wl_surface
+Resource>` and emits the scale of each surface's primary overlapping output,
+re-emitting when residency shifts. M7 (hotplug + workspace migration via
+`preferredOutputs` recompute on `output.added`/`removed`) and M8 (multi-GPU)
+remain.
 
 ## Client buffers
 

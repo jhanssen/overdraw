@@ -20,17 +20,18 @@ import type { ZxdgOutputManagerV1Handler } from "#protocols-gen/zxdg_output_mana
 import type { ZxdgOutputV1Handler } from "#protocols-gen/zxdg_output_v1.js";
 
 import type { Ctx, CompositorState, OutputRecord } from "./ctx.js";
-import { OUTPUT_DEFAULT } from "./ctx.js";
 import type { Resource } from "../types.js";
+import { resolveWlOutputToId, primaryOutputId } from "./output-resolve.js";
 
 void outputSig;
 
-// Resolve the output the client's wl_output resource refers to. Today
-// every wl_output resource maps to OUTPUT_DEFAULT (single output). When
-// multi-output lands, this becomes a Map<wl_output resource, outputId>
-// populated at wl_output bind time.
-function outputFor(ctx: Ctx, _wlOutput: unknown): OutputRecord | null {
-  return ctx.state.outputs?.get(OUTPUT_DEFAULT) ?? null;
+// Resolve the output the client's wl_output resource refers to. Reverse-walks
+// state.wlOutputResources (Map<outputId, Set<Resource>>); falls back to the
+// primary outputId if the resource is unrecognized so xdg-output still emits
+// something rather than dropping the request.
+function outputFor(ctx: Ctx, wlOutput: unknown): OutputRecord | null {
+  const id = resolveWlOutputToId(ctx.state, wlOutput) ?? primaryOutputId(ctx.state);
+  return ctx.state.outputs?.get(id) ?? null;
 }
 
 // Bound xdg_output_v1 resources live on state.xdgOutputResources (state-

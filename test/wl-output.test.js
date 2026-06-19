@@ -5,7 +5,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 
-import makeOutput, { reemitWlOutput } from
+import { makeOutputForOutput as makeOutput, reemitWlOutput } from
   "../packages/core/dist/protocols/wl_output.js";
 
 function mockCtx(outputRecord) {
@@ -59,7 +59,7 @@ function defaultRecord() {
 
 test("bind emits the full burst then done", () => {
   const ctx = mockCtx(defaultRecord());
-  const handler = makeOutput(ctx);
+  const handler = makeOutput(ctx, 0);
   handler.bind(mockResource("wl_output"));
   const kinds = ctx._calls.map(([k]) => k);
   assert.deepEqual(kinds,
@@ -82,7 +82,7 @@ test("bind sources values from the current OutputRecord", () => {
     make: "Dell",
     model: "U2718Q",
   });
-  const handler = makeOutput(ctx);
+  const handler = makeOutput(ctx, 0);
   handler.bind(mockResource("wl_output"));
   const byKind = new Map(ctx._calls);
   const g = byKind.get("geometry");
@@ -106,7 +106,7 @@ test("bind falls back when state.outputs is empty (defensive)", () => {
   // GPU-free harness that skipped seeding the registry: bind must still
   // emit something (clients like foot abort with no wl_output present).
   const ctx = mockCtx(null);
-  const handler = makeOutput(ctx);
+  const handler = makeOutput(ctx, 0);
   handler.bind(mockResource("wl_output"));
   const kinds = ctx._calls.map(([k]) => k);
   assert.deepEqual(kinds,
@@ -115,7 +115,7 @@ test("bind falls back when state.outputs is empty (defensive)", () => {
 
 test("reemitWlOutput resends the full burst to every bound resource", () => {
   const ctx = mockCtx(defaultRecord());
-  const handler = makeOutput(ctx);
+  const handler = makeOutput(ctx, 0);
   const a = mockResource("wl_output-a");
   const b = mockResource("wl_output-b");
   handler.bind(a);
@@ -142,7 +142,7 @@ test("reemitWlOutput resends the full burst to every bound resource", () => {
 
 test("reemitWlOutput skips destroyed resources and lazily prunes them", () => {
   const ctx = mockCtx(defaultRecord());
-  const handler = makeOutput(ctx);
+  const handler = makeOutput(ctx, 0);
   const a = mockResource("wl_output-a");
   const b = mockResource("wl_output-b");
   handler.bind(a);
@@ -162,7 +162,7 @@ test("reemitWlOutput skips destroyed resources and lazily prunes them", () => {
 
 test("release drops the resource from tracking (no later re-emit to it)", () => {
   const ctx = mockCtx(defaultRecord());
-  const handler = makeOutput(ctx);
+  const handler = makeOutput(ctx, 0);
   const a = mockResource("wl_output-a");
   const b = mockResource("wl_output-b");
   handler.bind(a);
@@ -182,7 +182,7 @@ test("reemitWlOutput is a no-op when no resources are bound", () => {
 
 test("reemitWlOutput is a no-op when state.events is missing", () => {
   const ctx = mockCtx(defaultRecord());
-  const handler = makeOutput(ctx);
+  const handler = makeOutput(ctx, 0);
   handler.bind(mockResource("wl_output"));
   ctx._calls.length = 0;
   ctx.state.events = undefined;

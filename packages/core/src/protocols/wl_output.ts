@@ -1,14 +1,12 @@
-// wl_output: advertises the (single, phase-1) output. Clients like foot abort if
-// no monitor is present, and use geometry/mode/scale to size themselves. The
-// values come from state.outputs (OUTPUT_DEFAULT entry), populated from the
-// GPU process's OutputDescriptor ctrl message; until that arrives, the seed
-// values in installProtocols are used.
+// wl_output: one global per output (M6). Each global has its own bind
+// handler tagged with its outputId; on bind, the handler emits that
+// output's geometry/mode/scale/name/done burst and registers the resource
+// against state.wlOutputResources[outputId].
 //
-// Re-emission: when the output reconfigures (host-window resize today; KMS
-// mode change later), state.outputs is updated and reemitWlOutput() walks
-// the bound-resource set, resending the same geometry/mode/scale/name/
-// description/done burst with the new values. Per spec the events are not
-// delta -- the full set is resent and `done` is the atomic-commit signal.
+// Re-emission: when an output reconfigures (host-window resize, KMS mode
+// change), reemitWlOutput() walks the bound-resource set for that outputId
+// and resends the same burst with the new values. Per spec the events are
+// not delta; the full set is resent and `done` is the atomic-commit signal.
 // main.ts hooks this to bus.emit('output.changed').
 
 import { signature as outSig } from "#protocols-gen/wl_output.js";
@@ -89,9 +87,8 @@ function fallback(state: CompositorState): OutputRecord {
 
 // Re-emit the full event burst to every bound wl_output resource for the
 // given output id. Destroyed resources are removed from the tracking set
-// in-line. Single-output today: outputId is always OUTPUT_DEFAULT.
-// Silent no-op if state.events isn't populated yet (e.g. mid-bring-up
-// before installProtocols finishes) or if no resources are bound.
+// in-line. Silent no-op if state.events isn't populated yet (e.g. mid-
+// bring-up before installProtocols finishes) or if no resources are bound.
 export function reemitWlOutput(state: CompositorState, outputId: number): void {
   const set = state.wlOutputResources?.get(outputId);
   if (!set || set.size === 0) return;
@@ -103,17 +100,41 @@ export function reemitWlOutput(state: CompositorState, outputId: number): void {
   }
 }
 
-export default function makeOutput(ctx: Ctx): OutputHandler {
+// Build a per-output bind handler. installProtocols calls this once per
+// outputId in state.outputs and passes the result to
+// addon.createGlobalForOutput("wl_output", outputId, handler). On bind, the
+// handler tracks the resource against this output's id and emits the full
+// burst sourced from state.outputs[outputId] (or the fallback when missing).
+export function makeOutputForOutput(ctx: Ctx, outputId: number): OutputHandler {
   return {
     bind(resource) {
-      trackedSet(ctx.state, OUTPUT_DEFAULT).add(resource);
-      const rec = ctx.state.outputs?.get(OUTPUT_DEFAULT) ?? fallback(ctx.state);
+      trackedSet(ctx.state, outputId).add(resource);
+      const rec = ctx.state.outputs?.get(outputId) ?? fallback(ctx.state);
       emitTo(ctx.events, resource, rec);
     },
     release(resource) {
       // wl_output.release is the v3+ destructor request. Drop tracking; the
       // trampoline handles libwayland teardown.
-      ctx.state.wlOutputResources?.get(OUTPUT_DEFAULT)?.delete(resource);
+      ctx.state.wlOutputResources?.get(outputId)?.delete(resource);
+    },
+  };
+}
+
+// Default export retained for the request-handler registry (wl_output has
+// only `release`, which is per-resource and outputId-independent). The
+// registerInterface path uses this; the per-output bind handlers from
+// makeOutputForOutput route over their own globals via createGlobalForOutput.
+export default function makeOutput(ctx: Ctx): WlOutputHandler {
+  return {
+    release(resource) {
+      // Walk every tracked set to find which output owns the resource. Cheap;
+      // outputs are few. Mirrors makeOutputForOutput.release so the request
+      // dispatch path doesn't need to know which global the resource came from.
+      const tracked = ctx.state.wlOutputResources;
+      if (!tracked) return;
+      for (const set of tracked.values()) {
+        if (set.delete(resource)) return;
+      }
     },
   };
 }

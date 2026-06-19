@@ -154,6 +154,12 @@ export interface SurfaceRecord {
   // window.unmap / tearing down twice.
   unmapped?: boolean;
   frameCallbacks?: Resource[];
+  // Outputs the surface has been told it occupies via wl_surface.enter.
+  // Updated by updateSurfaceOutputResidency: diff the compositor's
+  // surfaceOutputs(id) against this set, emit enter for each newly-overlapped
+  // outputId, leave for each newly-disjoint one. The diff is the only signal
+  // a client gets about which monitor its window is on (M6).
+  enteredOutputs?: Set<number>;
 }
 
 // The compositor operations the protocol/WM layer drives, abstracted so either
@@ -459,8 +465,11 @@ export interface CompositorState {
   // Reverse: wl_surface -> wp_linux_drm_syncobj_surface_v1, for the
   // surface_exists check in manager.get_surface.
   syncobjSurfaceBySurface?: Map<Resource, Resource>;
-  // Bound wp_fractional_scale_v1 resources, for preferred_scale re-emit.
-  fractionalScaleResources?: Set<Resource>;
+  // Bound wp_fractional_scale_v1 resources mapped to their associated
+  // wl_surface (the `surface` arg of get_fractional_scale). The mapping
+  // drives per-surface scale selection: re-emit picks the scale of the
+  // surface's primary output (the one with the largest overlap area).
+  fractionalScaleResources?: Map<Resource, Resource>;
   // surfaceId -> record, for native->JS lookups keyed by the integer id (e.g. the
   // imported-surface map-on-first-content sweep).
   surfacesById?: Map<number, SurfaceRecord>;

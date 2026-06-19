@@ -16,6 +16,8 @@ import { dirname, join, isAbsolute, resolve as resolvePath } from "node:path";
 import { globSync } from "node:fs";
 
 import { installProtocols } from "./protocols/index.js";
+import { makeOutputForOutput as makeWlOutputForOutput } from "./protocols/wl_output.js";
+import { updateAllSurfaceResidency } from "./protocols/surface-residency.js";
 import { createLayoutDriver } from "./wm/layout-driver.js";
 import { createReservedZoneRegistry } from "./wm/reserved-zones.js";
 import { createFocusDriver } from "./protocols/focus-driver.js";
@@ -341,6 +343,17 @@ addon.setOnOutputDescriptor((d) => {
       model: d.model,
     };
     outputs.set(d.outputId, rec);
+    // Advertise a wl_output global for this new connector so clients see it
+    // via wl_registry. installProtocols created globals for the outputs
+    // present at seed time (OUTPUT_DEFAULT); descriptors that introduce a
+    // new outputId need their own global now. The bind handler is closed
+    // over the new outputId.
+    if (state.events) {
+      addon.createGlobalForOutput(
+        "wl_output", d.outputId,
+        makeWlOutputForOutput({ events: state.events, state, addon }, d.outputId),
+      );
+    }
     log.info("core",
       `output ${d.outputId} added at (${pos.x},${pos.y}): ${device.width}x${device.height} `
       + `device, ${logical.width}x${logical.height} logical name=${d.name}`);
@@ -408,6 +421,12 @@ addon.setOnOutputDescriptor((d) => {
     })));
   }
   if (sizeChanged) state.relayout?.("output-resized");
+
+  // Recompute wl_surface.enter/leave for every mapped surface: an output's
+  // rect may have shifted, so previously-disjoint surfaces may now overlap
+  // (or vice versa). Cheap when nothing crosses a boundary -- the diff
+  // emits zero events.
+  updateAllSurfaceResidency(state, addon);
 
   // External: tell clients (via the re-emit subscribers wired below).
   // `name` is the durable identifier the workspace plugin keys preferred-

@@ -43,7 +43,7 @@ import type {
   LayerShellLayer,
   LayerShellKeyboardInteractivity,
 } from "./ctx.js";
-import { OUTPUT_DEFAULT } from "./ctx.js";
+import { resolveOutputArg } from "./output-resolve.js";
 import type { Resource } from "../types.js";
 
 import {
@@ -87,37 +87,6 @@ function defaultApplied(layer: LayerShellLayer): LayerSurfaceRecord["applied"] {
     layer,
     exclusiveEdge: 0,
   };
-}
-
-// Resolve the `output` arg of get_layer_surface to a target outputId.
-// NULL / no binding / unknown all collapse to the primary; a resource that
-// was bound through this server resolves via the tracked-resources reverse
-// walk. wlOutputResources is Map<outputId, Set<Resource>>, so the reverse is
-// O(N_outputs * resources_per_output) -- both small.
-function resolveOutputArg(state: CompositorState, output: unknown): number {
-  const primary = primaryOutputId(state);
-  if (output === null || output === undefined) return primary;
-  const tracked = state.wlOutputResources;
-  if (!tracked) return primary;
-  for (const [outputId, set] of tracked) {
-    if (set.has(output as import("../types.js").Resource)) return outputId;
-  }
-  return primary;
-}
-
-// The lowest live outputId, used as the "primary" fallback when an output arg
-// is missing or unrecognized. Mirrors the WM's primaryOutputId so layer-shell
-// and the WM agree on which output is "the default."
-function primaryOutputId(state: CompositorState): number {
-  if (state.wm) return state.wm.primaryOutputId();
-  // Pre-WM (or GPU-free fixtures without one): fall back to the outputs map's
-  // lowest key, then to OUTPUT_DEFAULT if nothing is registered yet.
-  if (state.outputs && state.outputs.size > 0) {
-    let lo = Infinity;
-    for (const id of state.outputs.keys()) if (id < lo) lo = id;
-    if (lo !== Infinity) return lo;
-  }
-  return OUTPUT_DEFAULT;
 }
 
 // The output rect the named layer surface targets, in global logical

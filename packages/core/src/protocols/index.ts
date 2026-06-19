@@ -21,6 +21,8 @@ import { applySubsurfaces } from "../subsurfaces.js";
 import { unmapAndTeardownSurface } from "./wl_surface.js";
 import { rebuildStackWithPopups, maybeDismissGrabbedPopup } from "./xdg_popup.js";
 import { configureToplevel } from "./xdg_surface.js";
+import { updateSurfaceOutputResidency } from "./surface-residency.js";
+import { makeOutputForOutput } from "./wl_output.js";
 import type { Addon, EventsByInterface, EventSenders } from "../types.js";
 import type { Ctx, CompositorState, CompositorSink } from "./ctx.js";
 import { OUTPUT_DEFAULT, OUTPUT_FALLBACK, FALLBACK_OUTPUT_NAME } from "./ctx.js";
@@ -47,9 +49,12 @@ type HandlerFactory = (ctx: Ctx) => object;
 interface HandlerModule { default: HandlerFactory; }
 
 // Interfaces advertised as globals (clients bind them from the registry).
+// wl_output is intentionally absent: it is advertised one global per output
+// via addon.createGlobalForOutput, so a client binding wl_output for output
+// 1 reaches output 1's bind handler and gets output 1's geometry.
 const GLOBALS = [
   "wl_compositor", "xdg_wm_base", "wl_shm", "zwp_linux_dmabuf_v1", "wl_seat",
-  "wl_subcompositor", "wl_output", "wl_data_device_manager",
+  "wl_subcompositor", "wl_data_device_manager",
   "zwp_primary_selection_device_manager_v1",
   "wp_cursor_shape_manager_v1",
   "zwlr_layer_shell_v1",
@@ -146,9 +151,26 @@ export async function installProtocols(
   if (!opts.compositor) {
     throw new Error("installProtocols requires opts.compositor (the JS compositor)");
   }
+  // Wrap the compositor sink with a setSurfaceLayout interceptor so any
+  // geometry change triggers a wl_surface.enter/leave diff for the affected
+  // surface. The wrapper delegates to the underlying sink first (so
+  // surfaceOutputs sees the new rect) then runs the residency update.
+  const rawCompositor = opts.compositor;
+  const layoutInterceptor: import("./ctx.js").CompositorSink = new Proxy(rawCompositor, {
+    get(target, prop, receiver) {
+      if (prop !== "setSurfaceLayout") return Reflect.get(target, prop, receiver);
+      return function setSurfaceLayoutWrapped(
+        id: number, x: number, y: number, w: number, h: number,
+      ): void {
+        target.setSurfaceLayout(id, x, y, w, h);
+        const rec = state.surfacesById?.get(id);
+        if (rec) updateSurfaceOutputResidency(state, addon, rec);
+      };
+    },
+  });
   const state: CompositorState = {
     surfaces: new Map(),
-    compositor: opts.compositor,
+    compositor: layoutInterceptor,
     nextSerial: 1,
     serial() { return this.nextSerial++; },
   };
@@ -612,6 +634,14 @@ export async function installProtocols(
   for (const name of GLOBALS) {
     const handler = globalHandlers[name] ?? handlerMods[name].default(ctx);
     addon.createGlobal(name, handler);
+  }
+  // wl_output: register the request-handler (release is per-resource and
+  // output-independent), then create one global per entry in state.outputs.
+  // Each global has its own bind handler tagged with its outputId so a
+  // client binding wl_output for output 1 gets output 1's burst.
+  addon.registerInterface("wl_output", handlerMods.wl_output.default(ctx));
+  for (const outputId of state.outputs.keys()) {
+    addon.createGlobalForOutput("wl_output", outputId, makeOutputForOutput(ctx, outputId));
   }
 
   // Foreign-toplevel manager: subscribe to the typed bus + plugin bus for
