@@ -70,7 +70,7 @@ test("KMS scanout: composite-scissor drives real page-flips across the slot ring
     const device = dawn.wrapDevice(h.instance, h.device);
     const comp = new JsCompositor(device, dawn.globals, addon,
       { width: dims.width, height: dims.height }, dawn, h.device,
-      { nested: true, format: addon.outputFormat() });
+      { headless: false, format: addon.outputFormat() });
 
     // Let KMS bringup finish injecting the scanout slots.
     await sleep(150);
