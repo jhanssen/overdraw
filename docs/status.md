@@ -109,13 +109,15 @@ with no error. Worst-first.
 
 - **Composite-scissor damage is implemented (in-frame partial rendering);
   residual gaps are narrow.** The JS compositor (`compositor.ts`) tracks
-  per-scanout-slot damage in output coords (`OutputDamageRing`, keyed by the
-  stable `acquireOutputTexture` handle so buffer age is handled — a slot
-  unrendered for N frames repaints all damage since). When a frame renders, the
-  on-screen composite is scissored to the slot's damage with `loadOp:"load"` +
-  a black-fill quad (so the bottom of the stack blends against black inside the
-  scissor, not stale pixels); a whole-output or first-sight slot takes the full
-  clear path. Frame *cadence* is unchanged (still gated by the native
+  per-scanout-slot damage in output coords (one `OutputDamageRing` per output,
+  multiplexed by `OutputDamageMap`, each keyed by the stable
+  `acquireOutputTexture` handle so buffer age is handled — a slot unrendered
+  for N frames repaints all damage since). Damage rects in global logical
+  space are clipped into each overlapping output's local space and translated
+  back on take. When a frame renders, each output's on-screen composite is
+  scissored to its slot's damage with `loadOp:"load"` + a black-fill quad (so
+  the bottom of the stack blends against black inside the scissor, not stale
+  pixels); a whole-output or first-sight slot takes the full clear path. Frame *cadence* is unchanged (still gated by the native
   `wantNext`/`wake()` loop — idle already skips). Residuals (optimization-only,
   never correctness): (a) the scissor is the damage **bounding box**, not
   per-rect, so scattered damage over-draws; (b) only content commits, layout
@@ -124,10 +126,12 @@ with no error. Worst-first.
   during animation) conservatively damage the whole output; (c) a content
   commit damages the surface's **full output rect**, not the Layer-1 buffer
   damage mapped to an output sub-region (a terminal scrolling repaints its whole
-  window rect on screen, though Layer 1 already trimmed the upload). Tests:
+  window rect on screen, though Layer 1 already trimmed the upload).   Tests:
   `output-damage-ring.test.js` (per-slot reset + multi-slot buffer-age),
-  `composite-scissor.gpu.mjs` (partial frame preserves the untouched surface;
-  black-fill clears the damaged region), and `composite-scissor-kms.gpu.mjs`
+  `output-damage-map.test.js` (per-output dispatch, clipping, output set
+  lifecycle), `composite-scissor.gpu.mjs` (partial frame preserves the
+  untouched surface; black-fill clears the damaged region), and
+  `composite-scissor-kms.gpu.mjs`
   (the live KMS slot path: real `acquireOutputTexture` slot rotation +
   `presentOutput` DRM page-flips). The KMS test self-skips unless
   `canRunKms()` (connected DRM connector + no active graphical session + dawn),
@@ -386,8 +390,19 @@ keybindings with general key interception — `wl_seat.ts` consults
 implemented; see the WM behavioral-state, plugin SDK, and binding-chain
 sections.) `wl_output` now reports real values: in nested mode they come from the host's `wl_output`
 (slice 3 of `drm-design.md`); in KMS mode from the connector's EDID + mode
-(slice 4+5). Output resize (nested) propagates end-to-end. Multi-output is
-still single-output-only.
+(slice 4+5). Output resize (nested) propagates end-to-end. Multi-output M1-M4
+are done (see `docs/multi-output-design.md` §12): N-connector enumeration,
+per-output scanout rings + distinct CRTC + fence routing, per-output render
+slicing of the global logical space, independent per-output vblank pacing,
+per-output frame-callback dispatch keyed by surface→output residency,
+per-output content stacks (`drawOrder(outputId)`), per-output `activeTransition`
+with cross-output Worker-live bracket dedup, per-output composite-scissor
+damage (`OutputDamageMap`), and the libinput backend's full-layout cursor
+clamp. Surface-verified on a single-card two-monitor setup (HDMI 60Hz + DP
+240Hz both lit). M5 (per-output WM/layout/workspaces — windows still don't
+carry an `outputId`, layout-driver still single-output), M6 (per-output
+protocol resources — one `wl_output` global today, no `wl_surface.enter/leave`),
+M7 (hotplug), and M8 (multi-GPU) remain.
 
 ## Client buffers
 

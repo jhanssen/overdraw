@@ -212,29 +212,40 @@ acquire that output's texture, set the render-pass viewport/scissor to that
 output's rect in the global logical space (scaled to device), composite the
 surfaces that intersect that output's region, present that output.
 
-- `outputStacks` (`compositor.ts:691`) generalizes directly — already keyed by
-  outputId; `drawOrder(outputId)` instead of reading only `OUTPUT_DEFAULT`.
-- The **composite-scissor damage ring** (`OutputDamageRing`, keyed by the stable
-  `acquireOutputTexture` handle, see status.md) already generalizes: each output's
-  slots have distinct handles, so per-output buffer-age damage falls out for free.
-- `activeTransition`, `liveScenes`, phantoms become per-output maps (or carry an
-  outputId). A transition runs on the output its window lives on.
+- `outputStacks` is keyed by outputId; `drawOrder(outputId)` reads that output's
+  override and falls back to the global stack.
+- The **composite-scissor damage ring** is multiplexed by `OutputDamageMap`: one
+  `OutputDamageRing` per output, keyed by that output's scanout-slot handles and
+  bounded by its own logical size. Damage rects in global space are clipped into
+  each output's local space and translated back on take().
+- **`activeTransition` is per-output** (`Map<outputId, ActiveTransition>`). A
+  transition runs on one output; two simultaneous transitions on different
+  outputs are allowed, and the compositor dedups producer Begin/End brackets
+  across outputs by sceneId so two transitions sharing a Worker-live scene fire
+  exactly one Begin and one End per frame for that scene.
+- **`liveScenes` and `phantoms` stay global**: each `liveScene` writes into its
+  own offscreen target texture (unrelated to any on-screen output), and a
+  phantom's global-space rect plus the renderer's per-output viewport+scissor
+  confines it to where it belongs without per-output bookkeeping. Section-12
+  M4's earlier note "`activeTransition`, `liveScenes`, phantoms become per-
+  output maps" was wrong for the last two.
 
 ### Pacing
 
-Today the core wakes on `ScanoutFlipComplete` and renders one frame when
-`wantNext` is set (`runFrameIfReady`). With N independent vblank clocks:
+`wantNext` stays a single global flag. Per-output independence comes from two
+mechanisms below it:
 
-- Track `wantNext` **per output** (damage on output A sets only A's flag).
-- `runFrameIfReady` iterates outputs; for each output whose `wantNext` is set AND
-  whose ring has a FREE slot (not mid-flip), render+present just that output.
-- A surface that overlaps two outputs dirties both.
-- `dispatchFrameCallbacks` fires a surface's frame callback when **an output it is
-  visible on** flips — needs surface→output(s) visibility, computed from the
-  surface's global rect vs each output's rect.
+- `acquireOutputTextureHandle(outputId)` returns null when that output's ring
+  has any slot in `PENDING_FLIP`, so a busy output is skipped this frame and
+  re-triggered by its own flip-complete.
+- `dispatchFrameCallbacksForOutput(timeMs, outputId)` fires `wl_callback.done`
+  only for surfaces resident on the flipped output (surface→output residency is
+  computed from the surface's global rect vs each output's rect).
 
-This per-output pacing is the single biggest behavior change and the main
-correctness risk. It should be its own milestone with its own focused testing.
+A "per-output `wantNext`" was explored but adds no behavior the acquire-time
+gate doesn't already give; busy outputs are skipped, free ones render. The cost
+is one cheap empty composite-scissored pass per idle vblank, which is what the
+per-output damage map's "nothing changed → tiny scissor" path produces today.
 
 ## 8. WM / layout: per-output
 
@@ -494,11 +505,12 @@ after **both** hotplug (M7) and multi-GPU (M8). Milestones 1-7 are intermediate
 states of one feature, not a shippable endpoint.
 
 **Status: M1-M4 done — surface-verified** on a single-card two-monitor setup
-(HDMI 60Hz + DP 240Hz both lit; 1083 unit + 136 GPU green). 4h-a (independent
-per-output pacing) is done; residuals 4h-b (per-output damage bounds) and 4h-c
-(pointer can't cross into a secondary output) are tracked below. M5-M8 remain. A
-multi-GPU render-node robustness fix also landed en route (the GBM allocator +
-dmabuf clients follow the chosen adapter's GPU, not a hardcoded `renderD128`).
+(HDMI 60Hz + DP 240Hz both lit; 1147 unit green). 4h-a, 4h-b, and 4h-c are all
+done; the M4 follow-ups originally listed as "done" but not actually implemented
+(`drawOrder(outputId)`, per-output `activeTransition` with cross-output bracket
+dedup) also landed. M5-M8 remain. A multi-GPU render-node robustness fix landed
+en route (the GBM allocator + dmabuf clients follow the chosen adapter's GPU,
+not a hardcoded `renderD128`).
 
 1. **IPC outputId plumbing (no behavior change).** Add `outputId` to the messages
    (Section 4), thread through compositor/addon/main.cpp, still drive one output.
@@ -552,16 +564,32 @@ dmabuf clients follow the chosen adapter's GPU, not a hardcoded `renderD128`).
      was removed: it skipped frame-callback dispatch for "clean" outputs — stalling
      their clients — and its mark heuristics were fragile. Idle-output cost is now
      one cheap empty composite-scissored pass per vblank, not a skipped render.)
-   - **(4h-b) Per-output composite-damage bounds. [residual]** `OutputDamageRing`
-     still tracks a single global-bounds space, so a non-origin output's partial
-     damage can't be trusted for a partial-scissor repaint — idle outputs do a cheap
-     empty pass rather than a damage-optimal partial one. Per-output damage bounds is
-     the follow-up.
-   - **(4h-c) Pointer cannot cross into a secondary output. [residual]** The
-     libinput backend gets only the primary's dims via `setOutputSize`, so the cursor
-     is clamped to the primary. Needs per-output layout in the input backend (a
-     bounding-box clamp is the cheap interim; full per-output mapping is the right
-     fix). Folds into M5 (per-output WM/layout).
+   - **(4h-b) Per-output composite-damage bounds. [DONE]** Each output owns an
+     `OutputDamageRing` (multiplexed by `OutputDamageMap`) keyed by its scanout-
+     slot handles, bounded by its own logical size. The map dispatches a global-
+     space damage rect into the rings of every output it overlaps, clipping into
+     each output's local space and translating back to global on take(). The
+     prior "single output at the global origin" gate on partial scissor is gone —
+     every output now gets a damage-optimal partial scissor when nothing else on
+     it changed.
+   - **(4h-c) Pointer crosses freely between outputs. [DONE]** The libinput
+     backend's `setOutputSize(w, h)` was replaced with `setOutputLayout(rects)`:
+     it stores the full set of per-output rects and clamps accumulated relative
+     motion against their union by closest-point projection (each rect's
+     projection keeps the result strictly inside its half-open right/bottom edge
+     by `EDGE_EPSILON = 1/256`, eliminating event-to-event jitter at the wall).
+     `main.ts` pushes the full layout to the input backend on every descriptor
+     change, dropping the prior isPrimary gate. The algorithm is mirrored in
+     `src/output/pointer-clamp.ts` (canonical TypeScript with unit tests) and
+     ported byte-for-byte into `input_libinput.cpp`.
+   - **(M4 polish, not originally listed)** Two items Section 12's M4 listed as
+     done but weren't, fixed in this round: `drawOrder(outputId)` so per-output
+     content stacks (set via `setOutputStack`) actually render on their target
+     output, and per-output `activeTransition` (`Map<outputId, ActiveTransition>`
+     with cross-output Worker-live producer-bracket dedup keyed by sceneId) so
+     two simultaneous workspace transitions on two monitors work without
+     tripping the GPU process's Begin/End alternation rule when they share a
+     scene texture.
 5. **Per-output WM + layout + workspaces.** Per-output layout pass, global-space
    arrangement policy (Sections 8, 10-arrangement), and lift the workspace plugin's
    single-output caps so `outputId != 0` is meaningful (`positionsByOutput` /
