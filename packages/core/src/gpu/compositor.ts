@@ -1246,13 +1246,15 @@ export class JsCompositor implements CompositorSink {
     this.damageFull();
   }
 
-  // The full back-to-front draw order: each layer in LAYER_ORDER, with the
-  // content layer taken from either the per-output override (when set) or the
-  // global `this.stack`. Single-output today: the per-output query is keyed
-  // on OUTPUT_DEFAULT. Future multi-output: drawOrder takes outputId arg.
-  private drawOrder(): number[] {
+  // The full back-to-front draw order for one output: each layer in
+  // LAYER_ORDER, with the content layer taken from that output's override
+  // (setOutputStack) when set, else the global `this.stack`. Phantoms, layers,
+  // and cursor are global (drawn into every output's viewport; the renderer's
+  // per-output viewport + scissor confines them to where they belong in global
+  // logical space).
+  private drawOrder(outputId: number): number[] {
     const out: number[] = [];
-    const content = this.outputStacks.get(OUTPUT_DEFAULT) ?? this.stack;
+    const content = this.outputStacks.get(outputId) ?? this.stack;
     for (const layer of LAYER_ORDER) {
       if (layer === "content") {
         out.push(...content);
@@ -2401,7 +2403,25 @@ export class JsCompositor implements CompositorSink {
     this.dispatch(this.lifecycle.step({ kind: "frameStart" }));
     frameOpen = true;
 
-    const draw = this.drawOrder();
+    // One draw list per output (per-output content stacks via setOutputStack).
+    // Brackets open on the UNION so each sampled import gets exactly one Begin
+    // even when shared across outputs (openImportBrackets de-dupes on
+    // importId; building a deduped union here keeps the union itself cheap).
+    const drawByOutput = new Map<number, number[]>();
+    let drawUnion: number[];
+    if (targets.length === 1) {
+      const only = this.drawOrder(targets[0].ctx.id);
+      drawByOutput.set(targets[0].ctx.id, only);
+      drawUnion = only;
+    } else {
+      const seen = new Set<number>();
+      drawUnion = [];
+      for (const t of targets) {
+        const d = this.drawOrder(t.ctx.id);
+        drawByOutput.set(t.ctx.id, d);
+        for (const id of d) if (!seen.has(id)) { seen.add(id); drawUnion.push(id); }
+      }
+    }
     const bracketed: Array<{ importId: number; bufferId: number }> = [];
 
     try {
@@ -2423,7 +2443,7 @@ export class JsCompositor implements CompositorSink {
       // bracket open + frameSampled dispatch. The live composers still
       // sample real surfaces, so their bracket opens stay.
       if (!this.activeTransition) {
-        this.openImportBrackets(draw, bracketed);
+        this.openImportBrackets(drawUnion, bracketed);
       }
       for (const ls of this.liveScenes) this.openImportBrackets(ls.windows, bracketed);
       for (const lw of this.liveWindowComps) {
@@ -2452,8 +2472,13 @@ export class JsCompositor implements CompositorSink {
         if (this.activeTransition) {
           this.encodeTransitionInto(enc, t.view, transition);
         } else {
+          const d = drawByOutput.get(t.ctx.id);
+          if (d === undefined) {
+            throw new Error(
+              `renderFrame: missing draw list for outputId=${t.ctx.id}`);
+          }
           this.composite({
-            encoder: enc, targetView: t.view, drawList: draw,
+            encoder: enc, targetView: t.view, drawList: d,
             outW: t.ctx.logicalWidth, outH: t.ctx.logicalHeight,
             scissor: t.scissor, output: t.ctx,
           });
