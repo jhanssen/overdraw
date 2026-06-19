@@ -10,7 +10,7 @@ import { createWm } from "../packages/core/dist/wm/index.js";
 import { createLayoutDriver } from "../packages/core/dist/wm/layout-driver.js";
 import { createReservedZoneRegistry } from "../packages/core/dist/wm/reserved-zones.js";
 
-const OUT = { width: 1000, height: 600 };
+const OUT = [{ id: 0, rect: { x: 0, y: 0, width: 1000, height: 600 }, scale: 1 }];
 const rec = (id) => ({ resource: { __id: id } });
 
 function mockCompositor() {

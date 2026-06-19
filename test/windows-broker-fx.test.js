@@ -43,7 +43,7 @@ function mockSink() {
 
 function makeBroker(sinkOverride) {
   const sink = sinkOverride ?? mockSink();
-  const wm = createWm(sink, { width: 800, height: 600 });
+  const wm = createWm(sink, [{ id: 0, rect: { x: 0, y: 0, width: 800, height: 600 }, scale: 1 }]);
   const bus = createCompositorBus();
   const pluginBus = new DynamicBus();
   const state = { bus, wm, surfaces: new Map(), seat: null, compositor: null,

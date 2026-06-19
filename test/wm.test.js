@@ -26,7 +26,7 @@ function mockCompositor() {
 }
 
 const rec = (id) => ({ resource: { __id: id } });
-const OUT = { width: 1000, height: 600 };
+const OUT = [{ id: 0, rect: { x: 0, y: 0, width: 1000, height: 600 }, scale: 1 }];
 
 // Build a WM with a configure-sink recorder + the inline master-stack driver.
 function setup(out = OUT) {

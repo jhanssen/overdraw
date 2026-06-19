@@ -52,6 +52,7 @@ test("broken decoration provider times out: content shown undecorated + deregist
 
   const logs = [];
   runtime = new PluginRuntime({
+    liveOutputIds: () => [0],
     pluginAddonPath: join(OD, "build", "overdraw_plugin_native.node"),
     dawnPath: dawnNodePath,
     pingIntervalMs: 500, maxMissedPongs: 10, shutdownTimeoutMs: 800, heapMb: 128,

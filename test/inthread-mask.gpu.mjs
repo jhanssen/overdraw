@@ -63,7 +63,7 @@ test("bundled in-thread plugin installs a mask via sdk.windows.setMask",
     // sdk.windows.setMask routes through to JsCompositor.setSurfaceMask.
     const bus = createCompositorBus();
     const pluginBus = new DynamicBus();
-    const wm = createWm(compositor, { width: W, height: H });
+    const wm = createWm(compositor, [{ id: 0, rect: { x: 0, y: 0, width: W, height: H }, scale: 1 }]);
     const state = { bus, wm, surfaces: new Map(), seat: null,
                     compositor, decorationResize: null };
     const windowsBroker = createWindowsBroker({
@@ -76,6 +76,7 @@ test("bundled in-thread plugin installs a mask via sdk.windows.setMask",
 
     const logs = [];
     runtime = new PluginRuntime({
+    liveOutputIds: () => [0],
       inThreadGpu: { coreDevice: device, globals: dawn.globals, overlays, compositor },
       bus: pluginBus,
       onEvent: (_p, name, data) => { if (name === "log") logs.push(String(data)); },

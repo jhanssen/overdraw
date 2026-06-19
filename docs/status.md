@@ -390,19 +390,36 @@ keybindings with general key interception — `wl_seat.ts` consults
 implemented; see the WM behavioral-state, plugin SDK, and binding-chain
 sections.) `wl_output` now reports real values: in nested mode they come from the host's `wl_output`
 (slice 3 of `drm-design.md`); in KMS mode from the connector's EDID + mode
-(slice 4+5). Output resize (nested) propagates end-to-end. Multi-output M1-M4
-are done (see `docs/multi-output-design.md` §12): N-connector enumeration,
-per-output scanout rings + distinct CRTC + fence routing, per-output render
-slicing of the global logical space, independent per-output vblank pacing,
-per-output frame-callback dispatch keyed by surface→output residency,
-per-output content stacks (`drawOrder(outputId)`), per-output `activeTransition`
-with cross-output Worker-live bracket dedup, per-output composite-scissor
-damage (`OutputDamageMap`), and the libinput backend's full-layout cursor
-clamp. Surface-verified on a single-card two-monitor setup (HDMI 60Hz + DP
-240Hz both lit). M5 (per-output WM/layout/workspaces — windows still don't
-carry an `outputId`, layout-driver still single-output), M6 (per-output
-protocol resources — one `wl_output` global today, no `wl_surface.enter/leave`),
-M7 (hotplug), and M8 (multi-GPU) remain.
+(slice 4+5). Output resize (nested) propagates end-to-end. Multi-output M1-M5
+are done (see `docs/multi-output-design.md` §12). M1-M4 (surface-verified on a
+single-card two-monitor setup, HDMI 60Hz + DP 240Hz both lit): N-connector
+enumeration, per-output scanout rings + distinct CRTC + fence routing, per-
+output render slicing of the global logical space, independent per-output
+vblank pacing, per-output frame-callback dispatch keyed by surface→output
+residency, per-output content stacks (`drawOrder(outputId)`), per-output
+`activeTransition` with cross-output Worker-live bracket dedup, per-output
+composite-scissor damage (`OutputDamageMap`), and the libinput backend's full-
+layout cursor clamp. M5 (GPU-free, unit-tested): every WM window carries an
+`outputId`; the WM holds a `Map<outputId, WmOutput>` set wholesale via
+`setOutputs`; the layout-driver loops per output, partitioning windows by
+`outputId` and computing each output's own tile region; `setFloatingRect`
+reassigns a window's output when the rect's center crosses a boundary;
+layer-shell honors the `output` arg to `get_layer_surface` (resolving a
+bound `wl_output` to its outputId) and keys reserved zones per output; the
+workspace plugin's registry carries a durable `preferredOutputs: string[]`
+list per workspace (config seed + append-on-forced-placement + promote-on-
+explicit-move mutations) with a `currentLiveOutput` resolver that picks the
+highest-ranked live entry by durable identifier; a `state.fallbackOutput`
+virtual output (sentinel id `OUTPUT_FALLBACK = -1`, durable name
+`__fallback__`) lives outside `state.outputs` so iterations over the live
+output map skip it automatically; `sdk.compose` validates outputIds against
+the live `state.outputs` set via a plumbed `hasOutput` (worker plugins get a
+spawn-time snapshot of live ids in `workerData`); `setOnOutputDescriptor`
+feeds every output (not just the primary) into `wm.setOutputs`. M6 (per-
+output protocol resources — one `wl_output` global today, no
+`wl_surface.enter/leave`), M7 (hotplug + workspace migration via
+`preferredOutputs` recompute on `output.added`/`removed`), and M8 (multi-
+GPU) remain.
 
 ## Client buffers
 

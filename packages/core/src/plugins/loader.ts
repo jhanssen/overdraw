@@ -53,6 +53,10 @@ export interface LoaderInput {
   // In-thread path: the core-device dependency bundle. When set, sdk.gpu
   // shares core's device and the Worker path is not used.
   inThreadGpu?: InThreadGpuDeps;
+  // Liveness check for outputIds. Plumbed into sdk.compose / sdk.windows so
+  // those SDKs reject ids that don't resolve to a live output. The core
+  // wires it as `(id) => state.outputs.has(id)`; tests may pass a stub.
+  hasOutput: (outputId: number) => boolean;
 }
 
 type InitFn = (sdk: PluginSdk, config?: unknown) => unknown | Promise<unknown>;
@@ -77,6 +81,7 @@ export async function runLoader(channel: Channel, input: LoaderInput): Promise<v
     stopGpu = g.stop;
     compose = createInThreadCompose(
       input.inThreadGpu.compositor,
+      input.hasOutput,
       input.inThreadGpu.sceneRegistry,
     ) ?? undefined;
     transitions = createTransitions(endpoint);
@@ -106,6 +111,7 @@ export async function runLoader(channel: Channel, input: LoaderInput): Promise<v
       pluginDeviceHandle: g.internals.devHandle,
       endpoint,
       allocSurfaceBufId: g.internals.allocSurfaceBufId,
+      hasOutput: input.hasOutput,
     });
     transitions = createTransitions(endpoint);
     // Phase 10a Worker intercept: full cross-device dmabuf wiring.

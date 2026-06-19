@@ -18,11 +18,17 @@ function captureTarget() {
 }
 
 function snap(windows) {
-  return { output: { width: 1000, height: 600 }, windows };
+  // Default every window to outputId 0 unless explicitly set; lets test
+  // inline objects stay terse.
+  const w = windows.map((win) => ({ outputId: 0, ...win }));
+  return {
+    outputs: [{ id: 0, rect: { x: 0, y: 0, width: 1000, height: 600 }, scale: 1 }],
+    windows: w,
+  };
 }
 
 function managedWin(id) {
-  return { id, role: 'toplevel', presentation: 'managed' };
+  return { id, role: 'toplevel', presentation: 'managed', outputId: 0 };
 }
 
 test('all managed: plugin gets every window; tile region = full output', async () => {

@@ -593,6 +593,7 @@ export async function setupCompositor(opts = {}) {
     pluginAddonPath: opts.pluginAddonPath,
     dawnPath: opts.dawnPath,
     inThreadGpu: inThreadGpuDeps,
+    liveOutputIds: () => state.outputs ? [...state.outputs.keys()] : [],
   });
   const resolved = BUNDLED_PLUGINS.map((spec) => bundledToResolved(spec, spec.module, resolvedConfig));
   // Optional extra plugins (ResolvedPlugin shape) from the test. Loaded

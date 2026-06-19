@@ -89,29 +89,67 @@ function defaultApplied(layer: LayerShellLayer): LayerSurfaceRecord["applied"] {
   };
 }
 
-// Output dims today come from the WM's tracked output. wl_output is fabricated
-// (status.md "Read first") so there is one output, identified by
-// OUTPUT_DEFAULT.
-function outputRectFor(state: CompositorState): { x: number; y: number; width: number; height: number } {
-  const out = state.wm?.state.output ?? { width: 1920, height: 1080 };
-  return { x: 0, y: 0, width: out.width, height: out.height };
+// Resolve the `output` arg of get_layer_surface to a target outputId.
+// NULL / no binding / unknown all collapse to the primary; a resource that
+// was bound through this server resolves via the tracked-resources reverse
+// walk. wlOutputResources is Map<outputId, Set<Resource>>, so the reverse is
+// O(N_outputs * resources_per_output) -- both small.
+function resolveOutputArg(state: CompositorState, output: unknown): number {
+  const primary = primaryOutputId(state);
+  if (output === null || output === undefined) return primary;
+  const tracked = state.wlOutputResources;
+  if (!tracked) return primary;
+  for (const [outputId, set] of tracked) {
+    if (set.has(output as import("../types.js").Resource)) return outputId;
+  }
+  return primary;
 }
 
-// Effective rect for a layer surface: the output minus every OTHER layer
-// surface's currently-registered reservation. A surface does not see its own
-// reservation in its effective rect (so updating zone in place doesn't make
-// the surface shrink itself out of existence).
+// The lowest live outputId, used as the "primary" fallback when an output arg
+// is missing or unrecognized. Mirrors the WM's primaryOutputId so layer-shell
+// and the WM agree on which output is "the default."
+function primaryOutputId(state: CompositorState): number {
+  if (state.wm) return state.wm.primaryOutputId();
+  // Pre-WM (or GPU-free fixtures without one): fall back to the outputs map's
+  // lowest key, then to OUTPUT_DEFAULT if nothing is registered yet.
+  if (state.outputs && state.outputs.size > 0) {
+    let lo = Infinity;
+    for (const id of state.outputs.keys()) if (id < lo) lo = id;
+    if (lo !== Infinity) return lo;
+  }
+  return OUTPUT_DEFAULT;
+}
+
+// The output rect the named layer surface targets, in global logical
+// coordinates. Falls back to a sensible default when no OutputRecord exists
+// (a GPU-free harness that never ran setOnOutputDescriptor) so the placement
+// math has something to operate against.
+function outputRectFor(state: CompositorState, outputId: number): { x: number; y: number; width: number; height: number } {
+  const rec = state.outputs?.get(outputId);
+  if (rec) {
+    return {
+      x: rec.logicalPosition.x, y: rec.logicalPosition.y,
+      width: rec.logicalSize.width, height: rec.logicalSize.height,
+    };
+  }
+  return { x: 0, y: 0, width: 1920, height: 1080 };
+}
+
+// Effective rect for a layer surface: its target output minus every OTHER
+// layer surface's currently-registered reservation on that output. A surface
+// does not see its own reservation in its effective rect (so updating zone
+// in place doesn't make the surface shrink itself out of existence).
 function effectiveRectExcluding(state: CompositorState, exclude: LayerSurfaceRecord): { x: number; y: number; width: number; height: number } {
-  const raw = outputRectFor(state);
+  const raw = outputRectFor(state, exclude.output);
   if (!state.reservedZones) return raw;
   const myId = exclude.reservedZoneId;
-  if (!myId) return state.reservedZones.effectiveRect(OUTPUT_DEFAULT, raw);
+  if (!myId) return state.reservedZones.effectiveRect(exclude.output, raw);
   // Temporarily drop this surface's reservation, compute, restore. Avoid
   // allocating a fresh registry: snapshot the surface's zone, clear it,
   // compute, restore.
-  const zones = state.reservedZones.list(OUTPUT_DEFAULT).filter((z) => z.owner === exclude.surface.id);
+  const zones = state.reservedZones.list(exclude.output).filter((z) => z.owner === exclude.surface.id);
   for (const z of zones) state.reservedZones.clear(`${myId}`);
-  const r = state.reservedZones.effectiveRect(OUTPUT_DEFAULT, raw);
+  const r = state.reservedZones.effectiveRect(exclude.output, raw);
   for (const z of zones) state.reservedZones.set(myId, z);
   return r;
 }
@@ -153,7 +191,7 @@ function applyLayerSurface(ctx: Ctx, rec: LayerSurfaceRecord, opts: { firstConfi
   rec.pending = {};
 
   // Compute placement against the appropriate base rect.
-  const outputRect = outputRectFor(state);
+  const outputRect = outputRectFor(state, rec.output);
   const effective = effectiveRectExcluding(state, rec);
   const placement = placeLayerSurface({
     outputRect, effectiveRect: effective,
@@ -215,7 +253,7 @@ function updateReservedZone(state: CompositorState, rec: LayerSurfaceRecord): vo
     return;
   }
   state.reservedZones.set(myId, {
-    outputId: OUTPUT_DEFAULT,
+    outputId: rec.output,
     edge: r.edge,
     thickness,
     owner: rec.surface.id,
@@ -231,7 +269,7 @@ function reflowOtherLayerSurfaces(ctx: Ctx, changed: LayerSurfaceRecord): void {
   if (!others) return;
   for (const rec of others.values()) {
     if (rec === changed || rec.destroyed) continue;
-    const outputRect = outputRectFor(state);
+    const outputRect = outputRectFor(state, rec.output);
     const effective = effectiveRectExcluding(state, rec);
     const placement = placeLayerSurface({
       outputRect, effectiveRect: effective,
@@ -347,7 +385,7 @@ function reflowOtherLayerSurfacesForTeardown(state: CompositorState, changed: La
   if (!others) return;
   for (const rec of others.values()) {
     if (rec === changed || rec.destroyed) continue;
-    const outputRect = outputRectFor(state);
+    const outputRect = outputRectFor(state, rec.output);
     const effective = effectiveRectExcluding(state, rec);
     const placement = placeLayerSurface({
       outputRect, effectiveRect: effective,
@@ -407,13 +445,11 @@ export default function makeLayerShell(ctx: Ctx): ZwlrLayerShellV1Handler {
       const layerStr = layerFromInt(layer);
       if (!layerStr) return;
 
-      // `output` arg: NULL = compositor chooses (we have only OUTPUT_DEFAULT);
-      // a wl_output resource resolves to its id. Multi-output is a wl_output
-      // reconfiguration pre-condition (status.md "Read first"); for now every
-      // layer surface targets OUTPUT_DEFAULT. The output resource itself is
-      // accepted but its identity is ignored.
-      void output;
-      const outputId = OUTPUT_DEFAULT;
+      // `output` arg: NULL (or unbound) = compositor chooses the primary;
+      // otherwise the resource is reverse-looked-up to its outputId via the
+      // tracked wl_output bindings. An unknown resource (e.g. a wl_output the
+      // client never bound through this server) collapses to the primary.
+      const outputId = resolveOutputArg(state, output);
 
       const rec: LayerSurfaceRecord = {
         resource: id,

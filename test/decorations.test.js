@@ -119,7 +119,7 @@ function brokerSetup(timeoutMs) {
   const bus = new TypedBus();
   const stacks = [];
   const sink = { setSurfaceLayout() {}, setStack(ids) { stacks.push([...ids]); } };
-  const wm = createWm(sink, { width: 1280, height: 720 }, {
+  const wm = createWm(sink, [{ id: 0, rect: { x: 0, y: 0, width: 1280, height: 720 }, scale: 1 }], {
     layoutDriverFactory: inlineMasterStackDriverFactory,
   });
   const emits = [];

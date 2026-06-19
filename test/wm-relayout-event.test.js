@@ -23,7 +23,7 @@ function mockCompositor() {
 }
 
 const rec = (id) => ({ resource: { __id: id } });
-const OUT = { width: 1000, height: 600 };
+const OUT = [{ id: 0, rect: { x: 0, y: 0, width: 1000, height: 600 }, scale: 1 }];
 
 function setup() {
   const comp = mockCompositor();

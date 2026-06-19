@@ -91,6 +91,9 @@ test("bundled in-thread plugin runs sdk.transitions.run (crossfade)",
         coreDevice: device, globals: dawn.globals,
         overlays, compositor, sceneRegistry,
       },
+      // No state.outputs in this minimal test rig; accept any outputId so
+      // sdk.compose validation matches the transitions broker's hasOutput.
+      liveOutputIds: () => [0],
       onEvent: (_p, name, data) => { if (name === "log") logs.push(String(data)); },
       onRequest: (plugin, method, params) => {
         if (method.startsWith("transitions.")) {

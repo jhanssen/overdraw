@@ -86,6 +86,10 @@ export type WindowMapRole = "toplevel" | "layer-shell";
 // elsewhere. Omitted on emit defaults to "toplevel" at the consumer.
 export type WindowMapEvent = {
   surfaceId: number;
+  // The output this window was placed on (the WM's primaryOutputId at
+  // addWindow time, or whatever an explicit handler picked). Carried on map
+  // so subscribers (workspace, status bar, ...) don't have to look it up.
+  outputId: number;
   rect: WindowRect;
   appId: string | null;
   title: string | null;

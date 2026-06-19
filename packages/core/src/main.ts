@@ -388,23 +388,33 @@ addon.setOnOutputDescriptor((d) => {
     w: r.logicalSize.width, h: r.logicalSize.height,
   })));
 
-  // Internal reconfigurations, in dependency order, for the primary only --
-  // the compositor's single render-target dims and the WM's logical output
-  // still drive against the primary. (M5 lifts the WM single-output cap.)
-  if (isPrimary) {
-    if (compositor instanceof JsCompositor) {
-      compositor.setOutputSize(device.width, device.height, scale);
-    }
-    if (state.wm) {
-      state.wm.state.output.width = logical.width;
-      state.wm.state.output.height = logical.height;
-    }
-    if (sizeChanged) state.relayout?.("output-resized");
+  // Compositor's primary render-target dims still ride setOutputSize on the
+  // primary output; setOutputs (above) drives every other output's render
+  // slot. (Harmless overlap for the primary.)
+  if (isPrimary && compositor instanceof JsCompositor) {
+    compositor.setOutputSize(device.width, device.height, scale);
   }
 
+  // WM: feed the full per-output set every time, so a freshly-arrived monitor
+  // joins the WM's layout pass without a separate add/remove protocol.
+  if (state.wm) {
+    state.wm.setOutputs([...outputs.values()].map((r) => ({
+      id: r.id,
+      rect: {
+        x: r.logicalPosition.x, y: r.logicalPosition.y,
+        width: r.logicalSize.width, height: r.logicalSize.height,
+      },
+      scale: r.scale,
+    })));
+  }
+  if (sizeChanged) state.relayout?.("output-resized");
+
   // External: tell clients (via the re-emit subscribers wired below).
+  // `name` is the durable identifier the workspace plugin keys preferred-
+  // outputs lists on; subscribers building output-aware policy use it.
   pluginBus.emit("output.changed", {
     outputId: d.outputId,
+    name: d.name,
     width: logical.width,
     height: logical.height,
     scale,
@@ -654,20 +664,37 @@ const inputBroker = createInputBroker({
 // every action invocation, so resolvers see the current pointer / focus
 // / workspace.
 //
-// currentWorkspace is cached via a bus subscription rather than read
-// synchronously from the workspace plugin (whose namespace methods are
-// async); workspace.shown updates the cache.
-let currentWorkspaceIndex: number | null = null;
+// Per-output cache of the currently-shown workspace index. Kept in sync via
+// the workspace.shown bus event so resolver hot paths don't have to await
+// the workspace plugin's async API. activeOutput() picks which entry the
+// `currentWorkspace` resolver returns.
+const shownWorkspaceByOutput = new Map<number, number>();
 pluginBus.subscribe("workspace.shown", (_n, payload) => {
   if (payload && typeof payload === "object") {
     const p = payload as { index?: unknown; outputId?: unknown };
-    if (typeof p.index === "number"
-        // Cache only the default-output workspace (single-output today).
-        && (p.outputId === undefined || p.outputId === 0)) {
-      currentWorkspaceIndex = p.index;
+    if (typeof p.index === "number") {
+      const outputId = typeof p.outputId === "number" ? p.outputId : OUTPUT_DEFAULT;
+      shownWorkspaceByOutput.set(outputId, p.index);
     }
   }
 });
+
+// The output the pointer is currently inside, in global logical coordinates.
+// Falls back to OUTPUT_DEFAULT when the pointer hasn't landed on any output
+// (e.g. before the first pointer event in a GPU-free harness, or in the
+// non-rectangular coverage gap between two monitors).
+function activeOutputId(): number {
+  if (!state || !state.seat || !state.outputs) return OUTPUT_DEFAULT;
+  const { x, y } = state.seat.pointerPosition();
+  for (const o of state.outputs.values()) {
+    const r = o.logicalPosition;
+    const s = o.logicalSize;
+    if (x >= r.x && x < r.x + s.width && y >= r.y && y < r.y + s.height) {
+      return o.id;
+    }
+  }
+  return OUTPUT_DEFAULT;
+}
 
 // Interactive grab plumbing: the bundled core-actions plugin's
 // window.begin-move / .begin-resize / .end-grab actions emit on the bus;
@@ -788,9 +815,8 @@ const deferredRefResolver = buildResolver({
   focusedWindow: () => state?.seat?.kbFocus?.surfaceId ?? null,
   pointerX: () => state?.seat?.pointerPosition().x ?? 0,
   pointerY: () => state?.seat?.pointerPosition().y ?? 0,
-  // Single-output today (wl_output is fabricated); always 0.
-  activeOutput: () => 0,
-  currentWorkspace: () => currentWorkspaceIndex,
+  activeOutput: activeOutputId,
+  currentWorkspace: () => shownWorkspaceByOutput.get(activeOutputId()) ?? null,
 });
 
 // The runtime is created unconditionally so the IPC server has an action
@@ -822,6 +848,10 @@ runtime = new PluginRuntime({
   },
   bus: pluginBus,
   resolveDeferredRefs: deferredRefResolver,
+  // The runtime ships this to each Worker's bootstrap; in-thread bundled
+  // plugins re-read it on every compose-SDK call so a freshly-added monitor
+  // is immediately visible.
+  liveOutputIds: () => state.outputs ? [...state.outputs.keys()] : [],
   onEvent: (plugin, name, data) => {
     if (name === "log") log.info("plugin", `${plugin}: ${String(data)}`);
   },

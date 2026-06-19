@@ -25,7 +25,7 @@ function makeFakeToplevel(id) {
 }
 
 function setupToplevelHandler() {
-  const wm = createWm(mockSink(), { width: 1000, height: 600 });
+  const wm = createWm(mockSink(), [{ id: 0, rect: { x: 0, y: 0, width: 1000, height: 600 }, scale: 1 }]);
   const toplevels = new Map();
   // Mock seat capturing beginGrab + endGrab.
   const grabCalls = [];

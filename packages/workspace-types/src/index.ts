@@ -36,6 +36,13 @@ export interface WorkspaceCreateSpec {
   name?: string;
   // Defaults to OUTPUT_DEFAULT (0) when omitted.
   outputId?: number;
+  // Optional durable preferred-output list, most-preferred first. Entries
+  // are stable output identifiers (the wl_output.name string, e.g. "DP-1").
+  // When supplied, the workspace will reclaim a returning output that
+  // appears in this list ahead of any output it has fallen back to. Omitted
+  // -> the live boot output's name becomes the sole entry, so a workspace
+  // still tracks where it was born.
+  preferredOutputs?: ReadonlyArray<string>;
 }
 
 // Transition spec accepted by show() / moveWindow() to animate the swap.

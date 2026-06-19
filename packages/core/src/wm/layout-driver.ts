@@ -31,7 +31,6 @@ import type {
 } from "@overdraw/layout-types";
 import type { Presentation } from "../events/types.js";
 import type { ReservedZoneRegistry } from "./reserved-zones.js";
-import { OUTPUT_DEFAULT } from "../protocols/ctx.js";
 import { log as coreLog } from "../log.js";
 
 export type { LayoutInputs, LayoutResult, LayoutReason } from "@overdraw/layout-types";
@@ -40,10 +39,14 @@ export type { LayoutInputs, LayoutResult, LayoutReason } from "@overdraw/layout-
 // mode resolver. The WM produces this on demand; the driver consumes it
 // and never holds onto references.
 export interface LayoutSnapshot {
-  output: { width: number; height: number };
+  // The WM's outputs, each carrying its global-logical-space rect + HiDPI
+  // scale. The driver runs the layout plugin once per output, partitioning
+  // windows by their `outputId`.
+  outputs: ReadonlyArray<{ id: number; rect: Rect; scale: number }>;
   // Ordered windows (master-front; index 0 is the layout's master in the
   // managed subset). Carries presentation so the resolver can dispatch
-  // before calling the plugin.
+  // before calling the plugin, and outputId so the driver knows which
+  // output each window belongs to.
   windows: ReadonlyArray<LayoutSnapshotWindow>;
 }
 
@@ -51,6 +54,7 @@ export interface LayoutSnapshot {
 // to the layout plugin (for managed) or resolve internally (for other
 // presentations).
 export interface LayoutSnapshotWindow extends LayoutWindow {
+  outputId: number;
   presentation: Presentation;
   // The rect to place a floating window at. Used only when
   // presentation === 'floating'. Absent for other modes.
@@ -103,92 +107,107 @@ export function createLayoutDriver(deps: LayoutDriverDeps): LayoutDriver {
     running = true;
     try {
       const snap = deps.snapshot();
-      const outputRect: Rect = {
-        x: 0, y: 0,
-        width: snap.output.width,
-        height: snap.output.height,
-      };
 
-      // Subtract reserved zones to get the tile region. Used by both the
-      // resolver (maximized -> effectiveRect) and the layout plugin
-      // (its working area).
-      const tileRegion = deps.reservedZones
-        ? deps.reservedZones.effectiveRect(OUTPUT_DEFAULT, outputRect)
-        : outputRect;
-
-      // Split windows by presentation. The driver resolves mode-specific
-      // rects itself; only 'managed' windows go to the plugin.
-      const resolvedRects: Array<{ id: number; outer: Rect }> = [];
-      const hidden: number[] = [];
-      const managed: LayoutWindow[] = [];
-
+      // Partition windows by outputId. Windows assigned to an output the
+      // snapshot doesn't know about are skipped: the WM should have either
+      // reassigned them on setOutputs or never set such an id, so reaching
+      // this branch means the snapshot is stale.
+      const byOutput = new Map<number, LayoutSnapshotWindow[]>();
+      for (const o of snap.outputs) byOutput.set(o.id, []);
       for (const w of snap.windows) {
-        switch (w.presentation) {
-          case "maximized":
-            resolvedRects.push({ id: w.id, outer: tileRegion });
-            break;
-          case "fullscreen":
-            resolvedRects.push({ id: w.id, outer: outputRect });
-            break;
-          case "minimized":
-            hidden.push(w.id);
-            break;
-          case "floating":
-            // Floating: the WM's stored floatingRect is the assigned
-            // outer rect. The layout plugin doesn't see floating windows.
-            // If no floatingRect is stored (shouldn't happen -- the WM
-            // captures one on the transition into 'floating'), fall
-            // back to the window's currentRect so it doesn't vanish.
-            resolvedRects.push({
-              id: w.id,
-              outer: w.floatingRect ?? w.currentRect ?? outputRect,
-            });
-            break;
-          case "managed":
-          default:
-            // Strip the presentation + WM-internal fields before handing
-            // to the plugin; the plugin's LayoutWindow type doesn't
-            // include them.
-            managed.push({
-              id: w.id,
-              appId: w.appId,
-              title: w.title,
-              role: w.role,
-              layoutMode: w.layoutMode,
-              layoutData: w.layoutData,
-              constraints: w.constraints,
-              currentRect: w.currentRect,
-            });
-            break;
+        const bucket = byOutput.get(w.outputId);
+        if (bucket) bucket.push(w);
+      }
+
+      // Accumulate the merged result across every output's pass; one final
+      // apply() at the end so the WM sees a single transactional update.
+      const mergedRects: Array<{ id: number; outer: Rect }> = [];
+      const mergedHidden: number[] = [];
+      let anyComputeFailed = false;
+
+      for (const o of snap.outputs) {
+        const outputRect: Rect = { ...o.rect };
+        const tileRegion = deps.reservedZones
+          ? deps.reservedZones.effectiveRect(o.id, outputRect)
+          : outputRect;
+
+        const resolvedRects: Array<{ id: number; outer: Rect }> = [];
+        const hidden: number[] = [];
+        const managed: LayoutWindow[] = [];
+        const bucket = byOutput.get(o.id) ?? [];
+
+        for (const w of bucket) {
+          switch (w.presentation) {
+            case "maximized":
+              resolvedRects.push({ id: w.id, outer: tileRegion });
+              break;
+            case "fullscreen":
+              resolvedRects.push({ id: w.id, outer: outputRect });
+              break;
+            case "minimized":
+              hidden.push(w.id);
+              break;
+            case "floating":
+              // Floating windows keep their stored rect. Fall back to the
+              // window's currentRect if none was captured, then to the
+              // output rect so the window never vanishes.
+              resolvedRects.push({
+                id: w.id,
+                outer: w.floatingRect ?? w.currentRect ?? outputRect,
+              });
+              break;
+            case "managed":
+            default:
+              managed.push({
+                id: w.id,
+                appId: w.appId,
+                title: w.title,
+                role: w.role,
+                layoutMode: w.layoutMode,
+                layoutData: w.layoutData,
+                constraints: w.constraints,
+                currentRect: w.currentRect,
+              });
+              break;
+          }
         }
+
+        let pluginResult: LayoutResult = { rects: [] };
+        if (managed.length > 0) {
+          const inputs: LayoutInputs = {
+            output: { id: o.id, rect: outputRect, scale: o.scale },
+            tileRegion,
+            windows: managed,
+            reason,
+          };
+          try {
+            pluginResult = await deps.compute(inputs);
+          } catch (e: unknown) {
+            anyComputeFailed = true;
+            const msg = e instanceof Error ? e.message : String(e);
+            log(`compute(${reason}, output=${o.id}) failed: ${msg}`);
+            // Skip this output's contribution; other outputs still apply.
+            continue;
+          }
+        }
+
+        for (const r of pluginResult.rects) mergedRects.push(r);
+        for (const r of resolvedRects) mergedRects.push(r);
+        for (const h of hidden) mergedHidden.push(h);
+        if (pluginResult.hidden) for (const h of pluginResult.hidden) mergedHidden.push(h);
       }
 
-      // Call the plugin only when there are managed windows; otherwise
-      // skip the round-trip.
-      let pluginResult: LayoutResult = { rects: [] };
-      if (managed.length > 0) {
-        const inputs: LayoutInputs = {
-          output: {
-            id: OUTPUT_DEFAULT,
-            rect: outputRect,
-            scale: 1,
-          },
-          tileRegion,
-          windows: managed,
-          reason,
-        };
-        pluginResult = await deps.compute(inputs);
+      // Match the pre-multi-output behavior: if EVERY managed pass failed and
+      // nothing was resolved either, suppress apply() rather than push an
+      // empty result. Otherwise apply -- partial-success is preferable to
+      // letting one output's plugin failure freeze every other output.
+      if (anyComputeFailed && mergedRects.length === 0 && mergedHidden.length === 0) {
+        return;
       }
-
-      // Merge: plugin rects + resolver-computed rects. The plugin's hidden
-      // list adds to the resolver's (minimized) list.
-      const mergedHidden = [...hidden];
-      if (pluginResult.hidden) mergedHidden.push(...pluginResult.hidden);
       const merged: LayoutResult = {
-        rects: [...pluginResult.rects, ...resolvedRects],
+        rects: mergedRects,
         ...(mergedHidden.length > 0 ? { hidden: mergedHidden } : {}),
       };
-
       await deps.target.apply(merged, reason);
     } catch (e: unknown) {
       const msg = e instanceof Error ? e.message : String(e);

@@ -25,7 +25,7 @@ async function addMapped(wm, id) {
 }
 
 test('windowAt: hits the rect when no predicate', async () => {
-  const wm = createWm(mockSink(), { width: 1000, height: 600 }, {
+  const wm = createWm(mockSink(), [{ id: 0, rect: { x: 0, y: 0, width: 1000, height: 600 }, scale: 1 }], {
     layoutDriverFactory: inlineMasterStackDriverFactory,
   });
   await addMapped(wm, 1);
@@ -34,7 +34,7 @@ test('windowAt: hits the rect when no predicate', async () => {
 });
 
 test('windowAt: predicate accepting always returns the topmost', async () => {
-  const wm = createWm(mockSink(), { width: 1000, height: 600 }, {
+  const wm = createWm(mockSink(), [{ id: 0, rect: { x: 0, y: 0, width: 1000, height: 600 }, scale: 1 }], {
     layoutDriverFactory: inlineMasterStackDriverFactory,
   });
   await addMapped(wm, 1);
@@ -43,7 +43,7 @@ test('windowAt: predicate accepting always returns the topmost', async () => {
 });
 
 test('windowAt: predicate rejecting falls through (single window) -> null', async () => {
-  const wm = createWm(mockSink(), { width: 1000, height: 600 }, {
+  const wm = createWm(mockSink(), [{ id: 0, rect: { x: 0, y: 0, width: 1000, height: 600 }, scale: 1 }], {
     layoutDriverFactory: inlineMasterStackDriverFactory,
   });
   await addMapped(wm, 1);
@@ -52,7 +52,7 @@ test('windowAt: predicate rejecting falls through (single window) -> null', asyn
 });
 
 test('windowAt: predicate rejecting front window falls through to back', async () => {
-  const wm = createWm(mockSink(), { width: 1000, height: 600 }, {
+  const wm = createWm(mockSink(), [{ id: 0, rect: { x: 0, y: 0, width: 1000, height: 600 }, scale: 1 }], {
     layoutDriverFactory: inlineMasterStackDriverFactory,
   });
   // With two windows in master-stack, tiles don't overlap. To exercise
@@ -69,7 +69,7 @@ test('windowAt: predicate rejecting front window falls through to back', async (
 });
 
 test('windowAt: predicate receives surface-local coords', async () => {
-  const wm = createWm(mockSink(), { width: 1000, height: 600 }, {
+  const wm = createWm(mockSink(), [{ id: 0, rect: { x: 0, y: 0, width: 1000, height: 600 }, scale: 1 }], {
     layoutDriverFactory: inlineMasterStackDriverFactory,
   });
   await addMapped(wm, 1);
@@ -83,7 +83,7 @@ test('windowAt: predicate receives surface-local coords', async () => {
 });
 
 test('windowAt: predicate sees translated coords when window is at non-origin rect', async () => {
-  const wm = createWm(mockSink(), { width: 1000, height: 600 }, {
+  const wm = createWm(mockSink(), [{ id: 0, rect: { x: 0, y: 0, width: 1000, height: 600 }, scale: 1 }], {
     layoutDriverFactory: inlineMasterStackDriverFactory,
   });
   await addMapped(wm, 1);

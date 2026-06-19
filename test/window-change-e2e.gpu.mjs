@@ -39,6 +39,7 @@ test("client set_app_id after map -> plugin sees window.change with new app_id",
   // pluginAddonPath/dawnPath so the bootstrap does NOT bring up a device (faster,
   // and proves sdk.window works without the gpu capability).
   runtime = new PluginRuntime({
+    liveOutputIds: () => [0],
     pingIntervalMs: 200, maxMissedPongs: 5, shutdownTimeoutMs: 500, heapMb: 64,
     log: () => {},
     bus: pluginBus,

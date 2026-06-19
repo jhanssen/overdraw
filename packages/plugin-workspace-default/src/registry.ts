@@ -27,8 +27,22 @@ export const OUTPUT_DEFAULT = 0;
 
 export interface WorkspaceRecord {
   handle: WorkspaceHandle;
+  // The workspace's *current* live output. Derived from preferredOutputs +
+  // the live output set whenever outputs change; the field is the cached
+  // result so map lookups (positionsByOutput, shownByOutput) stay O(1).
   outputId: number;
   name?: string;
+  // Durable, prioritized list of output identifiers this workspace prefers
+  // to live on. Most-preferred first. NEVER shrinks: a workspace remembers
+  // every output it has ever lived on. Identifiers are stable across
+  // unplug/replug -- a returning monitor with a matching identifier
+  // reclaims its workspaces. Three mutations are allowed:
+  //   1. Config seed at create time (workspace.create({preferredOutputs}));
+  //   2. Append at lowest priority when a workspace is forced onto an
+  //      output not already in its list (an evacuation fallback);
+  //   3. Promote: an explicit move to output X raises X above the
+  //      previously-current entry.
+  preferredOutputs: string[];
   // Insertion-ordered (JS Map iteration order). The order surfaceIds appear
   // in setOutputStack pushes is the order they were added.
   members: Set<number>;
@@ -143,10 +157,13 @@ export function stackFor(state: WorkspaceState, outputId: number): number[] {
 }
 
 // Construct the initial state: one workspace (handle=1) on OUTPUT_DEFAULT,
-// shown there. No name, no members. Returns the state + the workspace.created
-// side effect for the initial workspace -- the caller emits it on the bus
-// so subscribers see the boot-time workspace.
-export function init(): { state: WorkspaceState; sideEffects: SideEffect[] } {
+// shown there. Its preferredOutputs is seeded with the boot output's name
+// (passed in by the caller). No additional members. Returns the state + the
+// workspace.created side effect for the initial workspace -- the caller
+// emits it on the bus so subscribers see the boot-time workspace.
+export function init(
+  bootOutputName: string,
+): { state: WorkspaceState; sideEffects: SideEffect[] } {
   const state: WorkspaceState = {
     byHandle: new Map(),
     positionsByOutput: new Map(),
@@ -154,19 +171,25 @@ export function init(): { state: WorkspaceState; sideEffects: SideEffect[] } {
     surfaceToHandle: new Map(),
     nextHandle: 1,
   };
-  return ensureOutput(state, OUTPUT_DEFAULT);
+  return ensureOutput(state, OUTPUT_DEFAULT, bootOutputName);
 }
 
 // Internal: guarantee outputId has at least one workspace, creating one if
 // needed. Returns the (possibly mutated) state + any sideEffects emitted
-// (only 'workspace.created' on first creation).
-function ensureOutput(state: WorkspaceState, outputId: number,
+// (only 'workspace.created' on first creation). `seedName` is the durable
+// output identifier seeded into the new workspace's preferredOutputs list;
+// callers should pass the live output's name so the workspace remembers its
+// boot home.
+function ensureOutput(state: WorkspaceState, outputId: number, seedName: string,
                       ): { state: WorkspaceState; sideEffects: SideEffect[] } {
   if ((state.positionsByOutput.get(outputId) ?? []).length > 0) {
     return { state, sideEffects: [] };
   }
   const handle = asHandle(state.nextHandle);
-  const rec: WorkspaceRecord = { handle, outputId, members: new Set() };
+  const rec: WorkspaceRecord = {
+    handle, outputId, members: new Set(),
+    preferredOutputs: [seedName],
+  };
   state.byHandle.set(handle, rec);
   state.positionsByOutput.set(outputId, [handle]);
   state.shownByOutput.set(outputId, handle);
@@ -180,23 +203,93 @@ function ensureOutput(state: WorkspaceState, outputId: number,
   return { state, sideEffects };
 }
 
+// Resolve a workspace's current live output: the highest-ranked entry in its
+// preferredOutputs that maps to a connected output, by name. Returns null
+// when nothing in the list resolves (the caller falls back to the virtual
+// fallback output). Used by the output-add/remove recompute the plugin runs
+// on bus events.
+export function currentLiveOutput(
+  rec: WorkspaceRecord,
+  liveOutputs: ReadonlyMap<number, string>,  // outputId -> name
+): number | null {
+  // Build a reverse lookup once. Small N (live outputs); cheap.
+  const byName = new Map<string, number>();
+  for (const [id, name] of liveOutputs) byName.set(name, id);
+  for (const name of rec.preferredOutputs) {
+    const id = byName.get(name);
+    if (id !== undefined) return id;
+  }
+  return null;
+}
+
+// Mutation 2: append an output identifier at LOWEST priority (workspace was
+// forced here as a fallback). Idempotent: a name already in the list is not
+// re-appended. Returns true if the list changed.
+export function appendPreferredOutput(
+  state: WorkspaceState, handle: WorkspaceHandle, name: string,
+): boolean {
+  const rec = state.byHandle.get(handle);
+  if (!rec) return false;
+  if (rec.preferredOutputs.includes(name)) return false;
+  rec.preferredOutputs.push(name);
+  return true;
+}
+
+// Mutation 3: promote an output identifier to just above the workspace's
+// current entry (raises it on explicit move). Idempotent: if the name is
+// already at or above the head, no change. Returns true if the list changed.
+export function promotePreferredOutput(
+  state: WorkspaceState, handle: WorkspaceHandle, name: string,
+): boolean {
+  const rec = state.byHandle.get(handle);
+  if (!rec) return false;
+  const idx = rec.preferredOutputs.indexOf(name);
+  if (idx === 0) return false;       // already most-preferred
+  if (idx === -1) {
+    rec.preferredOutputs.unshift(name);
+    return true;
+  }
+  rec.preferredOutputs.splice(idx, 1);
+  rec.preferredOutputs.unshift(name);
+  return true;
+}
+
 // Create a new workspace, appended at the end of the position list for
 // outputId. Does NOT auto-show. Returns the snapshot of the new workspace.
+//
+// `outputName` is the durable identifier of the live output the workspace
+// will be created on -- seeds the workspace's preferredOutputs list so a
+// future hotplug can restore the workspace to its boot home. `spec.preferredOutputs`
+// is an optional CONFIG-supplied list; when present it is used verbatim (with
+// `outputName` appended at the end if not already in it so the list always
+// covers the live boot output).
 export function create(state: WorkspaceState,
-                       spec: { name?: string; outputId?: number } = {},
+                       spec: { name?: string; outputId?: number;
+                               preferredOutputs?: ReadonlyArray<string>;
+                             } = {},
+                       outputName: string,
                        ): { state: WorkspaceState; snapshot: WorkspaceSnapshot;
                             sideEffects: SideEffect[] } {
   const outputId = spec.outputId ?? OUTPUT_DEFAULT;
   // ensureOutput first so the very-first workspace on a brand-new output is
   // still appended at the end (it'll just be the only one).
-  const e = ensureOutput(state, outputId);
+  const e = ensureOutput(state, outputId, outputName);
   state = e.state;
   const sideEffects = [...e.sideEffects];
 
   const handle = asHandle(state.nextHandle);
   state.nextHandle += 1;
+  // Seed preferredOutputs from the config spec when present; otherwise the
+  // live output's name is the sole entry. Either way, ensure `outputName` is
+  // in the list so the workspace remembers its boot home.
+  const preferred: string[] = spec.preferredOutputs
+    ? [...spec.preferredOutputs]
+    : [outputName];
+  if (!preferred.includes(outputName)) preferred.push(outputName);
+
   const rec: WorkspaceRecord = {
     handle, outputId, members: new Set(),
+    preferredOutputs: preferred,
     ...(spec.name !== undefined ? { name: spec.name } : {}),
   };
   state.byHandle.set(handle, rec);
@@ -217,10 +310,15 @@ export function create(state: WorkspaceState,
 
 // Destroy the workspace at `index` on outputId. Relocates members; renumbers
 // the rest; re-creates if destroying the last workspace; updates the shown
-// workspace if it was the destroyed one.
+// workspace if it was the destroyed one. `outputName` seeds the replacement
+// workspace's preferredOutputs if a fresh one is created for the last slot;
+// callers without name context can pass an empty string (the fresh workspace
+// then gets a preferredOutputs covering only the live outputId, no durable
+// identity -- the next config-seeded create supplies one).
 export function destroy(state: WorkspaceState,
                         index: WorkspaceIndex,
                         outputId: number = OUTPUT_DEFAULT,
+                        outputName: string = "",
                         ): { state: WorkspaceState; sideEffects: SideEffect[];
                              renumbered: RenumberChange[] } {
   const handle = findHandle(state, index, outputId);
@@ -258,11 +356,14 @@ export function destroy(state: WorkspaceState,
   let createdFresh = false;
   if (positions.length === 0) {
     // Always-at-least-one invariant: create a fresh workspace for this
-    // output. New handle, no name.
+    // output. New handle, no name. preferredOutputs is seeded with the live
+    // output's name when known (mutation rule 2 -- forced placement), else
+    // left empty for the next config-seeded create to populate.
     const fresh = asHandle(state.nextHandle);
     state.nextHandle += 1;
     state.byHandle.set(fresh, {
       handle: fresh, outputId, members: new Set(),
+      preferredOutputs: outputName !== "" ? [outputName] : [],
     });
     positions.push(fresh);
     sideEffects.push({
@@ -387,11 +488,16 @@ export function show(state: WorkspaceState,
 
 // Move a surfaceId to the workspace at `index` on outputId. If the surface
 // is unknown (never seen by applyMap), throws. If the target is already its
-// owner, no-op.
+// owner, no-op. When the move crosses outputs, the target workspace's
+// preferredOutputs is promoted: the target output's name is raised to the
+// front of the list (mutation rule 3). `outputName` is the durable identifier
+// of `outputId`; passing the empty string suppresses the promotion (used by
+// tests that don't model output names).
 export function moveWindow(state: WorkspaceState,
                            surfaceId: number,
                            targetIndex: WorkspaceIndex,
                            outputId: number = OUTPUT_DEFAULT,
+                           outputName: string = "",
                            ): { state: WorkspaceState; sideEffects: SideEffect[] } {
   const targetHandle = findHandle(state, targetIndex, outputId);
   if (targetHandle === null) {
@@ -416,6 +522,13 @@ export function moveWindow(state: WorkspaceState,
   fromRec.members.delete(surfaceId);
   targetRec.members.add(surfaceId);
   state.surfaceToHandle.set(surfaceId, targetHandle);
+
+  // Cross-output move: explicit user action; promote the destination on the
+  // target workspace's preferred list so a future replug of that output
+  // reclaims the workspace.
+  if (outputId !== fromOutputId && outputName !== "") {
+    promotePreferredOutput(state, targetHandle, outputName);
+  }
 
   const sideEffects: SideEffect[] = [
     { kind: "setStateBag", surfaceId, handle: targetHandle },
@@ -481,21 +594,23 @@ export function setName(state: WorkspaceState,
   };
 }
 
-// A new window mapped. Assign to the currently-shown workspace on
-// OUTPUT_DEFAULT (multi-output assignment policy needs the real wl_output
-// reconfiguration substrate before it's meaningful). Idempotent: if the
-// surface is already tracked, no-op.
+// A new window mapped on `outputId`. Assigns to that output's currently-
+// shown workspace. Idempotent: if the surface is already tracked, no-op.
+// `outputName` is the durable identifier of the output -- used to seed
+// preferredOutputs if this is the first workspace on `outputId`.
 export function applyMap(state: WorkspaceState,
                          surfaceId: number,
+                         outputId: number,
+                         outputName: string,
                          ): { state: WorkspaceState; sideEffects: SideEffect[] } {
   if (state.surfaceToHandle.has(surfaceId)) {
     return { state, sideEffects: [] };
   }
-  const e = ensureOutput(state, OUTPUT_DEFAULT);
+  const e = ensureOutput(state, outputId, outputName);
   state = e.state;
   const sideEffects = [...e.sideEffects];
 
-  const shown = state.shownByOutput.get(OUTPUT_DEFAULT);
+  const shown = state.shownByOutput.get(outputId);
   if (shown === undefined) {
     throw new Error("internal: shownByOutput missing post-ensureOutput");
   }
@@ -506,8 +621,8 @@ export function applyMap(state: WorkspaceState,
 
   sideEffects.push({ kind: "setStateBag", surfaceId, handle: shown });
   sideEffects.push({
-    kind: "setOutputStack", outputId: OUTPUT_DEFAULT,
-    ids: stackFor(state, OUTPUT_DEFAULT),
+    kind: "setOutputStack", outputId,
+    ids: stackFor(state, outputId),
   });
   return { state, sideEffects };
 }

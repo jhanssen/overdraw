@@ -19,7 +19,7 @@ import { computeBaseStack } from "../packages/core/dist/subsurfaces.js";
 // the real createWm; we drive addWindow/windowHasContent + setDecorationSurface.
 function makeState() {
   const comp = { setSurfaceLayout() {}, setStack() {} };
-  const wm = createWm(comp, { width: 1000, height: 600 });
+  const wm = createWm(comp, [{ id: 0, rect: { x: 0, y: 0, width: 1000, height: 600 }, scale: 1 }]);
   // No configure sink / no rebuild hook: pushStack falls back to setStack (unused
   // here; we call computeBaseStack directly).
   const state = { wm, surfaces: new Map() };

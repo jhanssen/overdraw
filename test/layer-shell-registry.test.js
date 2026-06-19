@@ -42,6 +42,18 @@ function mockResource(name = "res") {
 function mockState(opts = {}) {
   let n = 0;
   const compositor = mockSink();
+  // Seed both `outputs` (the per-output record map the layer-shell handler
+  // reads logical dims from) and a WM-like stub with primaryOutputId / outputs.
+  const outputs = new Map([[0, {
+    id: 0,
+    logicalPosition: { x: 0, y: 0 },
+    logicalSize: { width: 1000, height: 600 },
+    deviceSize: { width: 1000, height: 600 },
+    scale: 1,
+    name: "test-0", description: "test", refreshMhz: 60000,
+    transform: 0, physicalWidthMm: 0, physicalHeightMm: 0,
+    make: "test", model: "test",
+  }]]);
   const state = {
     compositor,
     surfaces: new Map(),
@@ -51,7 +63,14 @@ function mockState(opts = {}) {
     layerSurfaces: new Map(),
     layerSurfacesBySurface: new Map(),
     reservedZones: opts.withReservedZones ? createReservedZoneRegistry() : undefined,
-    wm: { state: { output: { width: 1000, height: 600 }, windows: [] } },
+    outputs,
+    wm: {
+      state: {
+        outputs: new Map([[0, { id: 0, rect: { x: 0, y: 0, width: 1000, height: 600 }, scale: 1 }]]),
+        windows: [],
+      },
+      primaryOutputId() { return 0; },
+    },
     relayoutCalls: [],
   };
   state.relayout = (reason) => state.relayoutCalls.push(reason);

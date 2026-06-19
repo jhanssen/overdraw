@@ -22,7 +22,12 @@ const FIX = join(__dirname, 'fixtures', 'plugins');
 export const fixture = (f) => pathToFileURL(join(FIX, f)).href;
 
 // Fast watchdog defaults for tests. Real overdraw uses longer intervals.
-export const FAST = { pingIntervalMs: 50, maxMissedPongs: 2, shutdownTimeoutMs: 300, heapMb: 32 };
+// Default to a primary-only liveOutputIds for plugin-runtime unit tests.
+// Tests that exercise multi-output behavior can override via runtimeOpts.
+export const FAST = {
+  pingIntervalMs: 50, maxMissedPongs: 2, shutdownTimeoutMs: 300, heapMb: 32,
+  liveOutputIds: () => [0],
+};
 
 // Build a ResolvedPlugin entry from a fixture filename. `over` lets a test
 // override any field (name, restart policy, raw, etc.).

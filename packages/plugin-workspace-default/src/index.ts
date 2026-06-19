@@ -30,6 +30,7 @@ interface PluginEventsLike {
 }
 interface WindowSnapshotLike {
   surfaceId: number;
+  outputId: number;
   state: { [key: string]: unknown };
 }
 interface PluginWindowsLike {
@@ -38,7 +39,7 @@ interface PluginWindowsLike {
   setOutputStack(outputId: number, ids: number[] | null): Promise<void>;
   requestFocusDecision(reason: FocusReason, trigger?: number): Promise<void>;
   list(): Promise<WindowSnapshotLike[]>;
-  onMap(cb: (ev: { surfaceId: number }) => void): void;
+  onMap(cb: (ev: { surfaceId: number; outputId: number }) => void): void;
   onUnmap(cb: (ev: { surfaceId: number }) => void): void;
 }
 // Compose + transitions surfaces the plugin uses for animated
@@ -94,7 +95,31 @@ const STATE_KEY = "workspace.id";
 const asIndex = (n: number): WorkspaceIndex => n as WorkspaceIndex;
 
 export default async function init(sdk: SdkLike, _config?: unknown): Promise<void> {
-  const r0 = reg.init();
+  // Live output identifiers, kept in sync via the output.changed bus event.
+  // Maps outputId -> durable name. Seeded below with the boot output when
+  // the plugin starts; subsequent connector adds/removes will keep this
+  // accurate. Used to resolve preferredOutputs entries to a live id when
+  // hotplug migration lands (M7).
+  const liveOutputs = new Map<number, string>();
+  // Bootstrap name for the primary output: callers may not have published
+  // output.changed yet, so the registry uses this as the seed identifier on
+  // any ensureOutput in the meantime. Real names flow in via the subscription
+  // and update preferredOutputs entries created with this placeholder.
+  const BOOT_OUTPUT_NAME = "primary";
+  function outputNameOf(outputId: number): string {
+    return liveOutputs.get(outputId) ?? BOOT_OUTPUT_NAME;
+  }
+  // Subscribe BEFORE init so a synchronous emit during startup doesn't drop.
+  sdk.events.subscribe("output.changed", (_name, payload) => {
+    if (payload && typeof payload === "object") {
+      const p = payload as { outputId?: unknown; name?: unknown };
+      if (typeof p.outputId === "number" && typeof p.name === "string") {
+        liveOutputs.set(p.outputId, p.name);
+      }
+    }
+  });
+
+  const r0 = reg.init(BOOT_OUTPUT_NAME);
   let state: WorkspaceState = r0.state;
 
   // Apply each side effect against the SDK. Errors from SDK calls bubble up;
@@ -217,14 +242,15 @@ export default async function init(sdk: SdkLike, _config?: unknown): Promise<voi
   // this is usually empty, but the runtime makes no such guarantee).
   const existing = await sdk.windows.list();
   for (const w of existing) {
-    const r = reg.applyMap(state, w.surfaceId);
+    const r = reg.applyMap(state, w.surfaceId, w.outputId, outputNameOf(w.outputId));
     state = r.state;
     await applyEffects(r.sideEffects);
   }
 
-  // Map/unmap drive workspace membership.
+  // Map/unmap drive workspace membership. The map event carries the WM's
+  // assigned outputId; the plugin honors that as the window's home output.
   sdk.windows.onMap((ev) => {
-    const r = reg.applyMap(state, ev.surfaceId);
+    const r = reg.applyMap(state, ev.surfaceId, ev.outputId, outputNameOf(ev.outputId));
     state = r.state;
     void applyEffects(r.sideEffects);
   });
@@ -243,7 +269,8 @@ export default async function init(sdk: SdkLike, _config?: unknown): Promise<voi
     description: "Append a new workspace; returns its snapshot.",
     handler: async (params: unknown): Promise<WorkspaceSnapshot> => {
       const p = parseCreateParams(params);
-      const r = reg.create(state, p);
+      const outId = p.outputId ?? reg.OUTPUT_DEFAULT;
+      const r = reg.create(state, p, outputNameOf(outId));
       state = r.state;
       await applyEffects(r.sideEffects);
       return r.snapshot;
@@ -255,7 +282,7 @@ export default async function init(sdk: SdkLike, _config?: unknown): Promise<voi
     description: "Destroy the workspace at the given index; renumbers + relocates members.",
     handler: async (params: unknown): Promise<null> => {
       const p = parseIndexParams(params, "workspace.destroy");
-      const r = reg.destroy(state, p.index, p.outputId);
+      const r = reg.destroy(state, p.index, p.outputId, outputNameOf(p.outputId));
       state = r.state;
       await applyEffects(r.sideEffects);
       return null;
@@ -284,7 +311,7 @@ export default async function init(sdk: SdkLike, _config?: unknown): Promise<voi
     description: "Move a window to the workspace at the given index (or matching name).",
     handler: async (params: unknown): Promise<null> => {
       const p = parseMoveParams(state, params);
-      const r = reg.moveWindow(state, p.surfaceId, p.index, p.outputId);
+      const r = reg.moveWindow(state, p.surfaceId, p.index, p.outputId, outputNameOf(p.outputId));
       state = r.state;
       await applyEffects(r.sideEffects);
       return null;
@@ -327,13 +354,15 @@ export default async function init(sdk: SdkLike, _config?: unknown): Promise<voi
 
   const api: WorkspaceAPI = {
     async create(spec): Promise<WorkspaceSnapshot> {
-      const r = reg.create(state, spec ?? {});
+      const outId = spec?.outputId ?? reg.OUTPUT_DEFAULT;
+      const r = reg.create(state, spec ?? {}, outputNameOf(outId));
       state = r.state;
       await applyEffects(r.sideEffects);
       return r.snapshot;
     },
     async destroy(index, outputId): Promise<void> {
-      const r = reg.destroy(state, index, outputId);
+      const outId = outputId ?? reg.OUTPUT_DEFAULT;
+      const r = reg.destroy(state, index, outId, outputNameOf(outId));
       state = r.state;
       await applyEffects(r.sideEffects);
     },
@@ -350,7 +379,8 @@ export default async function init(sdk: SdkLike, _config?: unknown): Promise<voi
       await applyEffects(r.sideEffects);
     },
     async moveWindow(surfaceId, index, outputId): Promise<void> {
-      const r = reg.moveWindow(state, surfaceId, index, outputId);
+      const outId = outputId ?? reg.OUTPUT_DEFAULT;
+      const r = reg.moveWindow(state, surfaceId, index, outId, outputNameOf(outId));
       state = r.state;
       await applyEffects(r.sideEffects);
     },
@@ -390,10 +420,12 @@ function parseOptionalOutputId(params: unknown): number {
   return o;
 }
 
-function parseCreateParams(params: unknown): { name?: string; outputId?: number } {
+function parseCreateParams(params: unknown): {
+  name?: string; outputId?: number; preferredOutputs?: string[];
+} {
   if (params === undefined || params === null) return {};
   if (!isObj(params)) throw new TypeError("workspace.create: expected an object");
-  const out: { name?: string; outputId?: number } = {};
+  const out: { name?: string; outputId?: number; preferredOutputs?: string[] } = {};
   if (params.name !== undefined) {
     if (typeof params.name !== "string") {
       throw new TypeError("workspace.create: name must be a string");
@@ -405,6 +437,14 @@ function parseCreateParams(params: unknown): { name?: string; outputId?: number 
       throw new TypeError("workspace.create: outputId must be a number");
     }
     out.outputId = params.outputId;
+  }
+  if (params.preferredOutputs !== undefined) {
+    if (!Array.isArray(params.preferredOutputs)
+        || !params.preferredOutputs.every((n): n is string => typeof n === "string")) {
+      throw new TypeError(
+        "workspace.create: preferredOutputs must be an array of strings");
+    }
+    out.preferredOutputs = params.preferredOutputs;
   }
   return out;
 }

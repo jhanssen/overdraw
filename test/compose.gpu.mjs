@@ -319,7 +319,7 @@ test("createInThreadCompose wraps the compositor compose methods", { skip }, asy
     await ready;
     const { w } = await waitMappedColored(c, color);
 
-    const sdkCompose = createInThreadCompose(c.jsCompositor);
+    const sdkCompose = createInThreadCompose(c.jsCompositor, (id) => id === 0);
     assert.ok(sdkCompose, "createInThreadCompose returns non-null when compositor exposes the methods");
 
     // snapshot

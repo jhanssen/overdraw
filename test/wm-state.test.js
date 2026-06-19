@@ -38,7 +38,7 @@ function addMapped(wm, id) {
 // --- defaults -------------------------------------------------------------
 
 test('windowState: new window starts in managed mode with default fields', () => {
-  const wm = createWm(mockSink(), { width: 800, height: 600 });
+  const wm = createWm(mockSink(), [{ id: 0, rect: { x: 0, y: 0, width: 800, height: 600 }, scale: 1 }]);
   addMapped(wm, 1);
   const s = wm.getWindowState(1);
   assert.equal(s.presentation, 'managed');
@@ -50,14 +50,14 @@ test('windowState: new window starts in managed mode with default fields', () =>
 });
 
 test('getWindowState: unknown window returns null', () => {
-  const wm = createWm(mockSink(), { width: 800, height: 600 });
+  const wm = createWm(mockSink(), [{ id: 0, rect: { x: 0, y: 0, width: 800, height: 600 }, scale: 1 }]);
   assert.equal(wm.getWindowState(999), null);
 });
 
 // --- propose: basic commits -----------------------------------------------
 
 test('propose: changes presentation and returns committed state', async () => {
-  const wm = createWm(mockSink(), { width: 800, height: 600 });
+  const wm = createWm(mockSink(), [{ id: 0, rect: { x: 0, y: 0, width: 800, height: 600 }, scale: 1 }]);
   addMapped(wm, 1);
   const committed = await wm.propose(1, { presentation: 'maximized' }, 'client-request');
   assert.equal(committed.presentation, 'maximized');
@@ -65,13 +65,13 @@ test('propose: changes presentation and returns committed state', async () => {
 });
 
 test('propose: unknown window returns null', async () => {
-  const wm = createWm(mockSink(), { width: 800, height: 600 });
+  const wm = createWm(mockSink(), [{ id: 0, rect: { x: 0, y: 0, width: 800, height: 600 }, scale: 1 }]);
   const r = await wm.propose(999, { presentation: 'maximized' }, 'plugin');
   assert.equal(r, null);
 });
 
 test('propose: empty proposal returns current state unchanged', async () => {
-  const wm = createWm(mockSink(), { width: 800, height: 600 });
+  const wm = createWm(mockSink(), [{ id: 0, rect: { x: 0, y: 0, width: 800, height: 600 }, scale: 1 }]);
   addMapped(wm, 1);
   const r = await wm.propose(1, {}, 'plugin');
   assert.equal(r.presentation, 'managed');
@@ -79,7 +79,7 @@ test('propose: empty proposal returns current state unchanged', async () => {
 
 test('propose: identical proposal is a no-op (no committed event)', async () => {
   const bus = createDynamicBus();
-  const wm = createWm(mockSink(), { width: 800, height: 600 }, { pluginBus: bus });
+  const wm = createWm(mockSink(), [{ id: 0, rect: { x: 0, y: 0, width: 800, height: 600 }, scale: 1 }], { pluginBus: bus });
   addMapped(wm, 1);
   const events = [];
   bus.subscribe('window.committed', (_n, p) => { events.push(p); });
@@ -88,7 +88,7 @@ test('propose: identical proposal is a no-op (no committed event)', async () => 
 });
 
 test('propose: partial proposal merges with current state', async () => {
-  const wm = createWm(mockSink(), { width: 800, height: 600 });
+  const wm = createWm(mockSink(), [{ id: 0, rect: { x: 0, y: 0, width: 800, height: 600 }, scale: 1 }]);
   addMapped(wm, 1);
   await wm.propose(1, { layoutMode: 'floating' }, 'plugin');
   const after = await wm.propose(1, { constraints: { minSize: { width: 100, height: 50 } } }, 'plugin');
@@ -98,7 +98,7 @@ test('propose: partial proposal merges with current state', async () => {
 });
 
 test('propose: layoutData passes through as opaque value', async () => {
-  const wm = createWm(mockSink(), { width: 800, height: 600 });
+  const wm = createWm(mockSink(), [{ id: 0, rect: { x: 0, y: 0, width: 800, height: 600 }, scale: 1 }]);
   addMapped(wm, 1);
   const data = { tabIndex: 3, group: 'A' };
   const r = await wm.propose(1, { layoutData: data }, 'plugin');
@@ -106,7 +106,7 @@ test('propose: layoutData passes through as opaque value', async () => {
 });
 
 test('propose: layoutMode can be set to null to clear', async () => {
-  const wm = createWm(mockSink(), { width: 800, height: 600 });
+  const wm = createWm(mockSink(), [{ id: 0, rect: { x: 0, y: 0, width: 800, height: 600 }, scale: 1 }]);
   addMapped(wm, 1);
   await wm.propose(1, { layoutMode: 'tabbed' }, 'plugin');
   const r = await wm.propose(1, { layoutMode: null }, 'plugin');
@@ -114,7 +114,7 @@ test('propose: layoutMode can be set to null to clear', async () => {
 });
 
 test('propose: parent can be set and cleared', async () => {
-  const wm = createWm(mockSink(), { width: 800, height: 600 });
+  const wm = createWm(mockSink(), [{ id: 0, rect: { x: 0, y: 0, width: 800, height: 600 }, scale: 1 }]);
   addMapped(wm, 1);
   addMapped(wm, 2);
   await wm.propose(2, { parent: 1 }, 'client-request');
@@ -127,7 +127,7 @@ test('propose: parent can be set and cleared', async () => {
 
 test('propose: emits window.proposed and window.committed (no interceptor)', async () => {
   const bus = createDynamicBus();
-  const wm = createWm(mockSink(), { width: 800, height: 600 }, { pluginBus: bus });
+  const wm = createWm(mockSink(), [{ id: 0, rect: { x: 0, y: 0, width: 800, height: 600 }, scale: 1 }], { pluginBus: bus });
   addMapped(wm, 1);
   const proposed = [];
   const committed = [];
@@ -147,7 +147,7 @@ test('propose: emits window.proposed and window.committed (no interceptor)', asy
 
 test('propose: interceptor modifies candidate and the modified state is committed', async () => {
   const bus = createDynamicBus();
-  const wm = createWm(mockSink(), { width: 800, height: 600 }, { pluginBus: bus });
+  const wm = createWm(mockSink(), [{ id: 0, rect: { x: 0, y: 0, width: 800, height: 600 }, scale: 1 }], { pluginBus: bus });
   addMapped(wm, 1);
   // Coerce any 'fullscreen' proposal to 'maximized' instead.
   bus.intercept('window.proposed', (_n, p) => {
@@ -162,7 +162,7 @@ test('propose: interceptor modifies candidate and the modified state is committe
 
 test('propose: interceptor reverting a field (modify-to-revert) is a veto', async () => {
   const bus = createDynamicBus();
-  const wm = createWm(mockSink(), { width: 800, height: 600 }, { pluginBus: bus });
+  const wm = createWm(mockSink(), [{ id: 0, rect: { x: 0, y: 0, width: 800, height: 600 }, scale: 1 }], { pluginBus: bus });
   addMapped(wm, 1);
   bus.intercept('window.proposed', (_n, p) => {
     const ev = p;
@@ -179,7 +179,7 @@ test('propose: interceptor reverting a field (modify-to-revert) is a veto', asyn
 
 test('propose: interceptor returning garbage candidate is ignored (fallback)', async () => {
   const bus = createDynamicBus();
-  const wm = createWm(mockSink(), { width: 800, height: 600 }, { pluginBus: bus });
+  const wm = createWm(mockSink(), [{ id: 0, rect: { x: 0, y: 0, width: 800, height: 600 }, scale: 1 }], { pluginBus: bus });
   addMapped(wm, 1);
   bus.intercept('window.proposed', () => ({ candidate: 'not-a-state-object' }));
   const r = await wm.propose(1, { presentation: 'maximized' }, 'plugin');
@@ -189,7 +189,7 @@ test('propose: interceptor returning garbage candidate is ignored (fallback)', a
 
 test('propose: observe-only interceptor (undefined return) does not modify', async () => {
   const bus = createDynamicBus();
-  const wm = createWm(mockSink(), { width: 800, height: 600 }, { pluginBus: bus });
+  const wm = createWm(mockSink(), [{ id: 0, rect: { x: 0, y: 0, width: 800, height: 600 }, scale: 1 }], { pluginBus: bus });
   addMapped(wm, 1);
   bus.intercept('window.proposed', () => undefined);
   const r = await wm.propose(1, { presentation: 'maximized' }, 'plugin');
@@ -200,7 +200,7 @@ test('propose: observe-only interceptor (undefined return) does not modify', asy
 
 test('propose: geometry-affecting field triggers layout pass', async () => {
   let scheduled = [];
-  const wm = createWm(mockSink(), { width: 800, height: 600 }, {
+  const wm = createWm(mockSink(), [{ id: 0, rect: { x: 0, y: 0, width: 800, height: 600 }, scale: 1 }], {
     layoutDriverFactory: (target, snapshot) => {
       void target; void snapshot;
       return {
@@ -217,7 +217,7 @@ test('propose: geometry-affecting field triggers layout pass', async () => {
 
 test('propose: non-geometry field (parent) does not schedule a layout', async () => {
   let scheduled = [];
-  const wm = createWm(mockSink(), { width: 800, height: 600 }, {
+  const wm = createWm(mockSink(), [{ id: 0, rect: { x: 0, y: 0, width: 800, height: 600 }, scale: 1 }], {
     layoutDriverFactory: (target, snapshot) => {
       void target; void snapshot;
       return {
@@ -235,7 +235,7 @@ test('propose: non-geometry field (parent) does not schedule a layout', async ()
 
 test('propose: layoutData change schedules a relayout', async () => {
   let scheduled = [];
-  const wm = createWm(mockSink(), { width: 800, height: 600 }, {
+  const wm = createWm(mockSink(), [{ id: 0, rect: { x: 0, y: 0, width: 800, height: 600 }, scale: 1 }], {
     layoutDriverFactory: (target, snapshot) => {
       void target; void snapshot;
       return {
@@ -253,21 +253,21 @@ test('propose: layoutData change schedules a relayout', async () => {
 // --- state bag ------------------------------------------------------------
 
 test('state-bag: setState stores the value', () => {
-  const wm = createWm(mockSink(), { width: 800, height: 600 });
+  const wm = createWm(mockSink(), [{ id: 0, rect: { x: 0, y: 0, width: 800, height: 600 }, scale: 1 }]);
   addMapped(wm, 1);
   wm.setState(1, 'workspace.id', 3);
   assert.equal(wm.getState(1, 'workspace.id'), 3);
 });
 
 test('state-bag: setState returns true on first set, false on identical re-set', () => {
-  const wm = createWm(mockSink(), { width: 800, height: 600 });
+  const wm = createWm(mockSink(), [{ id: 0, rect: { x: 0, y: 0, width: 800, height: 600 }, scale: 1 }]);
   addMapped(wm, 1);
   assert.equal(wm.setState(1, 'k', 42), true);
   assert.equal(wm.setState(1, 'k', 42), false);
 });
 
 test('state-bag: deleteState removes the value', () => {
-  const wm = createWm(mockSink(), { width: 800, height: 600 });
+  const wm = createWm(mockSink(), [{ id: 0, rect: { x: 0, y: 0, width: 800, height: 600 }, scale: 1 }]);
   addMapped(wm, 1);
   wm.setState(1, 'k', 'v');
   assert.equal(wm.deleteState(1, 'k'), true);
@@ -275,7 +275,7 @@ test('state-bag: deleteState removes the value', () => {
 });
 
 test('state-bag: setting null is distinct from delete', () => {
-  const wm = createWm(mockSink(), { width: 800, height: 600 });
+  const wm = createWm(mockSink(), [{ id: 0, rect: { x: 0, y: 0, width: 800, height: 600 }, scale: 1 }]);
   addMapped(wm, 1);
   wm.setState(1, 'k', null);
   assert.equal(wm.getState(1, 'k'), null);
@@ -283,7 +283,7 @@ test('state-bag: setting null is distinct from delete', () => {
 });
 
 test('state-bag: getStateAll returns all entries; empty when none', () => {
-  const wm = createWm(mockSink(), { width: 800, height: 600 });
+  const wm = createWm(mockSink(), [{ id: 0, rect: { x: 0, y: 0, width: 800, height: 600 }, scale: 1 }]);
   addMapped(wm, 1);
   wm.setState(1, 'a', 1);
   wm.setState(1, 'b', 'two');
@@ -293,7 +293,7 @@ test('state-bag: getStateAll returns all entries; empty when none', () => {
 // --- snapshots ------------------------------------------------------------
 
 test('getSnapshot: includes windowState + state bag + geometry', async () => {
-  const wm = createWm(mockSink(), { width: 800, height: 600 });
+  const wm = createWm(mockSink(), [{ id: 0, rect: { x: 0, y: 0, width: 800, height: 600 }, scale: 1 }]);
   addMapped(wm, 1);
   await wm.propose(1, { presentation: 'fullscreen', layoutMode: 'floating' }, 'plugin');
   wm.setState(1, 'workspace.id', 5);
@@ -307,12 +307,12 @@ test('getSnapshot: includes windowState + state bag + geometry', async () => {
 });
 
 test('getSnapshot: returns null for unknown window', () => {
-  const wm = createWm(mockSink(), { width: 800, height: 600 });
+  const wm = createWm(mockSink(), [{ id: 0, rect: { x: 0, y: 0, width: 800, height: 600 }, scale: 1 }]);
   assert.equal(wm.getSnapshot(999), null);
 });
 
 test('listSnapshots: returns one entry per tracked window in WM order', () => {
-  const wm = createWm(mockSink(), { width: 800, height: 600 });
+  const wm = createWm(mockSink(), [{ id: 0, rect: { x: 0, y: 0, width: 800, height: 600 }, scale: 1 }]);
   addMapped(wm, 1);
   addMapped(wm, 2);
   addMapped(wm, 3);
@@ -322,7 +322,7 @@ test('listSnapshots: returns one entry per tracked window in WM order', () => {
 });
 
 test('snapshot: state map is copied (mutations on the snapshot do not affect WM)', () => {
-  const wm = createWm(mockSink(), { width: 800, height: 600 });
+  const wm = createWm(mockSink(), [{ id: 0, rect: { x: 0, y: 0, width: 800, height: 600 }, scale: 1 }]);
   addMapped(wm, 1);
   wm.setState(1, 'k', 'v');
   const s = wm.getSnapshot(1);
@@ -331,7 +331,7 @@ test('snapshot: state map is copied (mutations on the snapshot do not affect WM)
 });
 
 test('snapshot: windowState is a deep copy (mutations do not affect WM)', () => {
-  const wm = createWm(mockSink(), { width: 800, height: 600 });
+  const wm = createWm(mockSink(), [{ id: 0, rect: { x: 0, y: 0, width: 800, height: 600 }, scale: 1 }]);
   addMapped(wm, 1);
   const s = wm.getSnapshot(1);
   s.windowState.presentation = 'maximized';

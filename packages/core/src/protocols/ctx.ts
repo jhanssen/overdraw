@@ -172,12 +172,23 @@ export type Layer = "background" | "below" | "content" | "above" | "overlay";
 export const LAYER_ORDER: readonly Layer[] =
   ["background", "below", "content", "above", "overlay"];
 
-// The placeholder id of the single output today. wl_output is fabricated
-// (status.md "Read first") and core renders one output; OUTPUT_DEFAULT is the
-// id every output-keyed API uses until real multi-output reconfiguration
-// lands. New output handlers MUST assign real ids; this constant is the
-// transitional value, not a magic default to keep.
+// The id of the first/primary output. Used as the seed for state.outputs at
+// installProtocols, the default destination for newly-mapped windows, and the
+// fallback for protocol entry points that take a NULL or unrecognized output
+// arg. Higher outputIds (1, 2, ...) are assigned by the GPU process for
+// additional connectors.
 export const OUTPUT_DEFAULT = 0;
+
+// The id of the virtual fallback output (`state.fallbackOutput`). Negative
+// so it can never collide with a dense connector id (which is always >= 0).
+// Workspaces park here when no real output resolves their preferredOutputs;
+// no rendering, IPC, or wl_output binding ever touches it.
+export const OUTPUT_FALLBACK = -1;
+
+// Reserved durable identifier for the virtual fallback output. Real
+// connector names follow patterns like "DP-1", "HDMI-A-2"; the double
+// underscore prefix guarantees no collision with anything DRM produces.
+export const FALLBACK_OUTPUT_NAME = "__fallback__";
 
 export interface CompositorSink {
   // `damage` (optional) lists buffer-pixel rects that changed since the last
@@ -427,9 +438,8 @@ export interface CompositorState {
   // can dispatch the same events handlers would.
   events?: import("../types.js").EventsByInterface;
   // Bound wl_output resources keyed by outputId. wl_output.bind populates
-  // this; reemitWlOutput walks it on output reconfigure. Single-output
-  // today: only OUTPUT_DEFAULT (=0) has an entry. State-scoped (not module-
-  // level) so test fixtures get a fresh map per ctx.
+  // this; reemitWlOutput walks it on output reconfigure. State-scoped (not
+  // module-level) so test fixtures get a fresh map per ctx.
   wlOutputResources?: Map<number, Set<Resource>>;
   // Bound zxdg_output_v1 resources keyed by their underlying outputId. Same
   // shape and lifetime as wlOutputResources.
@@ -594,10 +604,21 @@ export interface CompositorState {
   reservedZones?: import("../wm/reserved-zones.js").ReservedZoneRegistry;
   // Output registry: per-output identity + geometry consumed by wire layers
   // that need to describe outputs (xdg-output today; future wl_output-on-
-  // change emissions). One entry today (OUTPUT_DEFAULT) reflecting the
-  // fabricated single output. The map is the integration seam DRM/KMS
-  // plugs into later.
+  // change emissions). One entry per real connector reported by the GPU
+  // process; never includes the virtual fallback (that lives in
+  // `fallbackOutput`).
   outputs?: Map<number, OutputRecord>;
+  // The virtual fallback output. Always present once installProtocols runs;
+  // never scanned out; deliberately NOT a member of `outputs` so every
+  // iteration over the live output map (render passes, wl_output globals,
+  // xdg-output emit, layout-driver per-output loop, IPC enumeration) skips
+  // it automatically. The workspace migration policy is its only consumer:
+  // when no real output resolves a workspace's preferredOutputs list, the
+  // workspace parks here -- its windows stay alive in the WM tree, clients
+  // keep running, nothing is presented. Its `id` is a reserved sentinel
+  // (OUTPUT_FALLBACK = -1) and its `name` is the reserved durable
+  // identifier "__fallback__" (no real connector ever produces this).
+  fallbackOutput?: OutputRecord;
   // The plugin-visible dynamic bus (carries window.committed / window.proposed
   // / window.relayout / arbitrary plugin events). Stored on state so handlers
   // outside installProtocols (e.g. foreign-toplevel-manager) can subscribe.
@@ -790,7 +811,10 @@ export interface LayerSurfaceApplied {
 export interface LayerSurfaceRecord {
   resource: Resource;            // the zwlr_layer_surface_v1
   surface: SurfaceRecord;        // the wl_surface this is roled onto
-  output: number;                // OUTPUT_DEFAULT today
+  // The outputId this layer surface targets (resolved from the `output` arg
+   // of get_layer_surface). Reserved zones are keyed on this; reflow uses
+   // this output's rect.
+  output: number;
   namespace: string;             // client-supplied identifier (e.g. "panel")
   pending: LayerSurfacePending;
   applied: LayerSurfaceApplied;

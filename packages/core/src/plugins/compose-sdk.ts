@@ -16,7 +16,6 @@ import type {
   LiveSceneHandle, LiveWindowCompHandle,
 } from "../gpu/compositor.js";
 import type { CompositorSink } from "../protocols/ctx.js";
-import { OUTPUT_DEFAULT } from "../protocols/ctx.js";
 import type { Endpoint } from "./protocol.js";
 import type { SceneRegistry } from "./scene-registry.js";
 import { createSceneRegistry } from "./scene-registry.js";
@@ -96,6 +95,7 @@ export interface PluginCompose {
 // is 0 and transitions.run will reject them with a clear error.
 export function createInThreadCompose(
   compositor: CompositorSink,
+  hasOutput: (outputId: number) => boolean,
   sceneRegistry?: SceneRegistry,
 ): PluginCompose | null {
   if (!compositor.composeScene || !compositor.composeWindows
@@ -114,14 +114,12 @@ export function createInThreadCompose(
   // (the broker's registry is separate). For tests that don't exercise
   // transitions this is invisible.
   const registry = sceneRegistry ?? createSceneRegistry();
-  // outputId validation: today only OUTPUT_DEFAULT exists. Reject anything
-  // else explicitly rather than silently treat it as 0.
+  // outputId validation: reject ids that don't resolve to a live output
+  // (state.outputs is the source of truth; the virtual fallback is never a
+  // legal SDK target).
   function checkOutput(outputId: number): void {
-    if (outputId !== OUTPUT_DEFAULT) {
-      throw new Error(
-        `sdk.compose: outputId=${outputId} not recognized ` +
-        `(only OUTPUT_DEFAULT=${OUTPUT_DEFAULT} exists today)`,
-      );
+    if (!hasOutput(outputId)) {
+      throw new Error(`sdk.compose: outputId=${outputId} is not a live output`);
     }
   }
 
@@ -241,19 +239,20 @@ export interface WorkerComposeDeps {
   // the worker only reserves consumer textures (the producer side is in the
   // core), the worker just needs unique ids.
   allocSurfaceBufId: () => number;
+  // Liveness check for outputIds. Reads state.outputs in the host process;
+  // returns true for ids the compositor would actually render onto. The
+  // virtual fallback is never live.
+  hasOutput: (outputId: number) => boolean;
 }
 
 // Construct sdk.compose for a Worker plugin. Snapshot mode (phase 5b);
 // live mode raises if requested (phase 5b-live adds it).
 export function createWorkerCompose(deps: WorkerComposeDeps): PluginCompose {
-  const { clientId, plugin, dawn, pluginDeviceHandle, endpoint, allocSurfaceBufId } = deps;
+  const { clientId, plugin, dawn, pluginDeviceHandle, endpoint, allocSurfaceBufId, hasOutput } = deps;
 
   function checkOutput(outputId: number): void {
-    if (outputId !== OUTPUT_DEFAULT) {
-      throw new Error(
-        `sdk.compose: outputId=${outputId} not recognized ` +
-        `(only OUTPUT_DEFAULT=${OUTPUT_DEFAULT} exists today)`,
-      );
+    if (!hasOutput(outputId)) {
+      throw new Error(`sdk.compose: outputId=${outputId} is not a live output`);
     }
   }
 

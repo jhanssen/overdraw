@@ -45,6 +45,7 @@ test("plugin overlay composites on top, pixel-verified", { skip: !dawn ? "dawn.n
 
     const logs = [];
     runtime = new PluginRuntime({
+    liveOutputIds: () => [0],
       pluginAddonPath: join(OD, "build", "overdraw_plugin_native.node"),
       dawnPath: dawnNodePath,
       onEvent: (_p, name, data) => { if (name === "log") logs.push(String(data)); },

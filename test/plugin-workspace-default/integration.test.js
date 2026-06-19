@@ -45,7 +45,7 @@ async function withWorkspacePlugin(fn) {
   const pluginBus = new DynamicBus();
   const bus = createCompositorBus();
   const sink = mockSink();
-  const wm = createWm(sink, { width: 800, height: 600 });
+  const wm = createWm(sink, [{ id: 0, rect: { x: 0, y: 0, width: 800, height: 600 }, scale: 1 }]);
   const seatCalls = { focus: [] };
   const seat = {
     applyKeyboardFocus(id) { seatCalls.focus.push(id); },
@@ -93,7 +93,8 @@ async function withWorkspacePlugin(fn) {
         wm.addWindow(id, res(id));
         wm.windowHasContent(id);
         bus.emit(WINDOW_EVENT.map, {
-          surfaceId: id, rect: { x: 0, y: 0, width: 1, height: 1 },
+          surfaceId: id, outputId: 0,
+          rect: { x: 0, y: 0, width: 1, height: 1 },
           appId: null, title: null,
         });
       },

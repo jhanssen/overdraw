@@ -36,7 +36,7 @@ function makeSeat() {
 
 function brokerWithSeat(seat) {
   const sink = mockSink();
-  const wm = createWm(sink, { width: 800, height: 600 });
+  const wm = createWm(sink, [{ id: 0, rect: { x: 0, y: 0, width: 800, height: 600 }, scale: 1 }]);
   const bus = createCompositorBus();
   const pluginBus = new DynamicBus();
   const state = { bus, wm, surfaces: new Map(), compositor: sink, seat };
@@ -101,7 +101,7 @@ test('request-focus-decision: no seat bound -> silent no-op', () => {
   // state.seat is null until installProtocols runs; the broker should
   // tolerate this (same pattern as windows.focus).
   const sink = mockSink();
-  const wm = createWm(sink, { width: 800, height: 600 });
+  const wm = createWm(sink, [{ id: 0, rect: { x: 0, y: 0, width: 800, height: 600 }, scale: 1 }]);
   const bus = createCompositorBus();
   const pluginBus = new DynamicBus();
   const state = { bus, wm, surfaces: new Map(), compositor: sink, seat: null };

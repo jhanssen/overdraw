@@ -20,7 +20,11 @@ function makeState(output = { width: 1920, height: 1080 }) {
   const toplevels = new Map();  // toplevel resource -> ToplevelRecord
   // Inline master-stack driver so addToplevel windows pick up real rects on
   // settle (otherwise the WM's no-op driver leaves them as placeholders).
-  const wm = createWm(mockAddon(), output, {
+  const wm = createWm(mockAddon(), [{
+    id: 0,
+    rect: { x: 0, y: 0, width: output.width, height: output.height },
+    scale: 1,
+  }], {
     layoutDriverFactory: inlineMasterStackDriverFactory,
   });
 
@@ -57,7 +61,8 @@ function makeState(output = { width: 1920, height: 1080 }) {
 test('queryState: empty compositor', () => {
   const { state } = makeState();
   const snap = queryState(state);
-  assert.deepEqual(snap.output, { width: 1920, height: 1080 });
+  assert.equal(snap.outputs.length, 1);
+  assert.deepEqual(snap.outputs[0], { id: 0, x: 0, y: 0, width: 1920, height: 1080, scale: 1 });
   assert.deepEqual(snap.windows, []);
   assert.deepEqual(snap.stack, []);
   assert.equal(snap.pointerFocus, null);

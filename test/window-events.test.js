@@ -105,7 +105,7 @@ test('observer routes window.map to onMap handlers', () => {
   const { observer } = createWindowObserver(fe.handle);
   const got = [];
   observer.onMap((ev) => got.push(ev));
-  const ev = { surfaceId: 7, rect: { x: 1, y: 2, width: 3, height: 4 }, appId: 'a', title: 't' };
+  const ev = { surfaceId: 7, outputId: 0, rect: { x: 1, y: 2, width: 3, height: 4 }, appId: 'a', title: 't' };
   fe.deliver(WINDOW_EVENT.map, ev);
   assert.deepEqual(got, [ev]);
 });
@@ -125,7 +125,7 @@ test('observer supports multiple handlers and null app_id/title', () => {
   const a = [], b = [];
   observer.onMap((ev) => a.push(ev));
   observer.onMap((ev) => b.push(ev));
-  const ev = { surfaceId: 1, rect: { x: 0, y: 0, width: 10, height: 10 }, appId: null, title: null };
+  const ev = { surfaceId: 1, outputId: 0, rect: { x: 0, y: 0, width: 10, height: 10 }, appId: null, title: null };
   fe.deliver(WINDOW_EVENT.map, ev);
   assert.deepEqual(a, [ev]);
   assert.deepEqual(b, [ev]);
@@ -183,7 +183,7 @@ test('observer release() detaches the bus subscription', () => {
   const { observer, release } = createWindowObserver(fe.handle);
   const got = [];
   observer.onMap((ev) => got.push(ev));
-  const ev = { surfaceId: 7, rect: { x: 1, y: 2, width: 3, height: 4 }, appId: 'a', title: 't' };
+  const ev = { surfaceId: 7, outputId: 0, rect: { x: 1, y: 2, width: 3, height: 4 }, appId: 'a', title: 't' };
   fe.deliver(WINDOW_EVENT.map, ev);
   release();
   fe.deliver(WINDOW_EVENT.map, ev);
@@ -205,7 +205,7 @@ test('dynamic bus delivers window.map/change/unmap to a live plugin', async () =
     // Allow the bootstrap's events.subscribe message to traverse the wire.
     await new Promise((r) => setTimeout(r, 50));
 
-    const mapEv = { surfaceId: 42, rect: { x: 5, y: 6, width: 100, height: 60 }, appId: 'foo', title: 'Foo' };
+    const mapEv = { surfaceId: 42, outputId: 0, rect: { x: 5, y: 6, width: 100, height: 60 }, appId: 'foo', title: 'Foo' };
     const changeEv = {
       surfaceId: 42, changed: ['title'],
       appId: 'foo', title: 'Renamed', activated: true,

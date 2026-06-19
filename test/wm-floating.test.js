@@ -53,7 +53,7 @@ function recordingDriver(pluginVisible) {
 // --- presentation dispatch -----------------------------------------------
 
 test('floating window: captures initial rect from current outer on first transition', async () => {
-  const wm = createWm(mockSink(), { width: 1000, height: 600 }, {
+  const wm = createWm(mockSink(), [{ id: 0, rect: { x: 0, y: 0, width: 1000, height: 600 }, scale: 1 }], {
     layoutDriverFactory: inlineMasterStackDriverFactory,
   });
   await addMapped(wm, 1);
@@ -69,7 +69,7 @@ test('floating window: captures initial rect from current outer on first transit
 });
 
 test('setFloatingRect: updates stored rect', async () => {
-  const wm = createWm(mockSink(), { width: 1000, height: 600 }, {
+  const wm = createWm(mockSink(), [{ id: 0, rect: { x: 0, y: 0, width: 1000, height: 600 }, scale: 1 }], {
     layoutDriverFactory: inlineMasterStackDriverFactory,
   });
   await addMapped(wm, 1);
@@ -80,7 +80,7 @@ test('setFloatingRect: updates stored rect', async () => {
 
 test('setFloatingRect: schedules a layout pass', () => {
   let scheduled = 0;
-  const wm = createWm(mockSink(), { width: 1000, height: 600 }, {
+  const wm = createWm(mockSink(), [{ id: 0, rect: { x: 0, y: 0, width: 1000, height: 600 }, scale: 1 }], {
     layoutDriverFactory: (target, snapshot) => {
       void target; void snapshot;
       return {
@@ -102,7 +102,7 @@ test('resolver: floating window uses its floatingRect, not the plugin output', a
     ...mockSink(),
     setSurfaceLayout(id, x, y, w, h) { layouts.push({ id, x, y, w, h }); },
   };
-  const wm = createWm(sink, { width: 1000, height: 600 }, {
+  const wm = createWm(sink, [{ id: 0, rect: { x: 0, y: 0, width: 1000, height: 600 }, scale: 1 }], {
     layoutDriverFactory: recordingDriver(visible),
   });
   await addMapped(wm, 1);
@@ -120,7 +120,7 @@ test('resolver: floating window uses its floatingRect, not the plugin output', a
 
 test('resolver: layout plugin only sees managed windows, not floating', async () => {
   const visible = [];
-  const wm = createWm(mockSink(), { width: 1000, height: 600 }, {
+  const wm = createWm(mockSink(), [{ id: 0, rect: { x: 0, y: 0, width: 1000, height: 600 }, scale: 1 }], {
     layoutDriverFactory: recordingDriver(visible),
   });
   await addMapped(wm, 1);
@@ -136,7 +136,7 @@ test('resolver: layout plugin only sees managed windows, not floating', async ()
 
 test('resolver: empty managed set with floating window: plugin not called', async () => {
   const visible = [];
-  const wm = createWm(mockSink(), { width: 1000, height: 600 }, {
+  const wm = createWm(mockSink(), [{ id: 0, rect: { x: 0, y: 0, width: 1000, height: 600 }, scale: 1 }], {
     layoutDriverFactory: recordingDriver(visible),
   });
   await addMapped(wm, 1);
@@ -148,7 +148,7 @@ test('resolver: empty managed set with floating window: plugin not called', asyn
 });
 
 test('floating rect preserved across floating -> managed -> floating', async () => {
-  const wm = createWm(mockSink(), { width: 1000, height: 600 }, {
+  const wm = createWm(mockSink(), [{ id: 0, rect: { x: 0, y: 0, width: 1000, height: 600 }, scale: 1 }], {
     layoutDriverFactory: inlineMasterStackDriverFactory,
   });
   await addMapped(wm, 1);
@@ -169,12 +169,12 @@ test('floating rect preserved across floating -> managed -> floating', async () 
 });
 
 test('getFloatingRect: unknown window returns null', () => {
-  const wm = createWm(mockSink(), { width: 1000, height: 600 });
+  const wm = createWm(mockSink(), [{ id: 0, rect: { x: 0, y: 0, width: 1000, height: 600 }, scale: 1 }]);
   assert.equal(wm.getFloatingRect(999), null);
 });
 
 test('setFloatingRect: unknown window is a no-op (no throw)', () => {
-  const wm = createWm(mockSink(), { width: 1000, height: 600 });
+  const wm = createWm(mockSink(), [{ id: 0, rect: { x: 0, y: 0, width: 1000, height: 600 }, scale: 1 }]);
   wm.setFloatingRect(999, { x: 0, y: 0, width: 1, height: 1 });
   // Just confirms no throw.
   assert.equal(wm.getFloatingRect(999), null);
@@ -183,7 +183,7 @@ test('setFloatingRect: unknown window is a no-op (no throw)', () => {
 // --- presentation enum widened to include 'floating' --------------------
 
 test('propose: floating presentation is accepted', async () => {
-  const wm = createWm(mockSink(), { width: 1000, height: 600 }, {
+  const wm = createWm(mockSink(), [{ id: 0, rect: { x: 0, y: 0, width: 1000, height: 600 }, scale: 1 }], {
     layoutDriverFactory: inlineMasterStackDriverFactory,
   });
   await addMapped(wm, 1);

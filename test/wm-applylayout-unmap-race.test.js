@@ -36,7 +36,7 @@ function mockCompositor() {
 }
 
 const rec = (id) => ({ resource: { __id: id } });
-const OUT = { width: 1000, height: 600 };
+const OUT = [{ id: 0, rect: { x: 0, y: 0, width: 1000, height: 600 }, scale: 1 }];
 
 test('applyLayout: window unmapped during interceptor await is NOT pushed to compositor',
   async () => {

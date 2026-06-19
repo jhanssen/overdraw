@@ -23,7 +23,7 @@ import { rebuildStackWithPopups, maybeDismissGrabbedPopup } from "./xdg_popup.js
 import { configureToplevel } from "./xdg_surface.js";
 import type { Addon, EventsByInterface, EventSenders } from "../types.js";
 import type { Ctx, CompositorState, CompositorSink } from "./ctx.js";
-import { OUTPUT_DEFAULT } from "./ctx.js";
+import { OUTPUT_DEFAULT, OUTPUT_FALLBACK, FALLBACK_OUTPUT_NAME } from "./ctx.js";
 import type { FocusDriver, FocusApplyTarget } from "./focus-driver.js";
 import { titleAppId } from "../query.js";
 import { WINDOW_EVENT } from "../events/types.js";
@@ -155,13 +155,13 @@ export async function installProtocols(
   if (opts.bus) state.bus = opts.bus;
   if (opts.pluginBus) state.pluginBus = opts.pluginBus;
   if (opts.reservedZones) state.reservedZones = opts.reservedZones;
-  // Single output. The GPU process sends an OutputDescriptor over the ctrl
-  // channel after surface bring-up that updates this record with real
-  // host-derived values (refresh, scale, transform, physical dims) and the
-  // nested-window size; main.ts registers a callback (addon.onOutputDescriptor)
-  // that applies the descriptor. Until that arrives (or in GPU-free
-  // harnesses that never wire the callback), this seed record keeps
-  // wl_output/xdg-output emitting something sensible.
+  // Seed the primary output. The GPU process sends an OutputDescriptor per
+  // connector over the ctrl channel after surface bring-up; main.ts's
+  // setOnOutputDescriptor callback adds extras and replaces this record's
+  // host-derived values (refresh, scale, transform, physical dims, nested-
+  // window size). Until that arrives -- and in GPU-free harnesses that never
+  // wire the callback -- this seed record keeps wl_output/xdg-output emitting
+  // something sensible.
   state.outputs = new Map();
   state.outputs.set(OUTPUT_DEFAULT, {
     id: OUTPUT_DEFAULT,
@@ -178,6 +178,26 @@ export async function installProtocols(
     make: "overdraw",
     model: "overdraw nested output",
   });
+  // Virtual fallback output. Lives outside state.outputs so every iteration
+  // over the live output map automatically skips it; only the workspace
+  // migration code references it directly. Zero-area rect: parked workspaces
+  // do not size their windows against it; clients keep their last-known
+  // sizes until a real output resolves them again.
+  state.fallbackOutput = {
+    id: OUTPUT_FALLBACK,
+    logicalPosition: { x: 0, y: 0 },
+    logicalSize: { width: 0, height: 0 },
+    deviceSize: { width: 0, height: 0 },
+    scale: 1,
+    name: FALLBACK_OUTPUT_NAME,
+    description: "overdraw fallback output",
+    refreshMhz: 0,
+    transform: 0,
+    physicalWidthMm: 0,
+    physicalHeightMm: 0,
+    make: "overdraw",
+    model: "fallback",
+  };
   // The binding chain owns the input modes + chord trie. Plugins
   // register bindings via the windows broker; the seat dispatches each
   // key-down here. Chain events (mode-pushed/popped, chord-*) re-emit on
@@ -232,15 +252,26 @@ export async function installProtocols(
   // the broker (using broker.onDecorationResized). When unset (GPU-free tests
   // / pre-broker bring-up), the WM still updates the decoration's compositor
   // layout directly -- only the plugin-side redraw is skipped.
-  state.wm = createWm(state.compositor, output, {
-    rebuild: () => rebuildStackWithPopups(state),
-    configure: configureSink,
-    decorationResize: (windowId, outerRect, contentRect, insets) => {
-      state.decorationResize?.(windowId, outerRect, contentRect, insets);
+  // Seed the WM's primary output from the same dims used for state.outputs's
+  // OUTPUT_DEFAULT entry. main.ts's setOnOutputDescriptor updates both maps
+  // when the GPU process sends real geometry, including any extra connectors.
+  state.wm = createWm(
+    state.compositor,
+    [{
+      id: OUTPUT_DEFAULT,
+      rect: { x: 0, y: 0, width: output.width, height: output.height },
+      scale: 1,
+    }],
+    {
+      rebuild: () => rebuildStackWithPopups(state),
+      configure: configureSink,
+      decorationResize: (windowId, outerRect, contentRect, insets) => {
+        state.decorationResize?.(windowId, outerRect, contentRect, insets);
+      },
+      layoutDriverFactory: opts.layoutDriverFactory,
+      pluginBus: opts.pluginBus,
     },
-    layoutDriverFactory: opts.layoutDriverFactory,
-    pluginBus: opts.pluginBus,
-  });
+  );
   // Expose wm.schedule via state.relayout for callers outside the WM that
   // affect the tile region (layer-shell reserved-zone changes).
   state.relayout = (reason) => state.wm?.schedule(reason);
@@ -293,6 +324,7 @@ export async function installProtocols(
           const ta = titleAppId(state, id);
           state.bus?.emit(WINDOW_EVENT.map, {
             surfaceId: id,
+            outputId: state.wm?.outputIdOf(id) ?? OUTPUT_DEFAULT,
             rect: { x: rect.x, y: rect.y, width: rect.width, height: rect.height },
             appId: ta.appId, title: ta.title,
           });
@@ -323,6 +355,7 @@ export async function installProtocols(
         if (rect) {
           state.bus?.emit(WINDOW_EVENT.map, {
             surfaceId: id,
+            outputId: ls.output,
             rect: { x: rect.x, y: rect.y, width: rect.width, height: rect.height },
             appId: null, title: null,
             role: "layer-shell",

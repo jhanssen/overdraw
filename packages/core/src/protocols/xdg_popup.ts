@@ -58,8 +58,20 @@ export function popupOutputOrigin(state: CompositorState, pr: PopupRecord): { x:
 export function configurePopup(ctx: Ctx, pr: PopupRecord): void {
   const origin = popupOutputOrigin(ctx.state, pr);
   if (!origin) return; // unparented; defer the configure
-  const out = ctx.state.wm?.state.output ?? { width: 1920, height: 1080 };
-  pr.rect = solvePopupPosition(pr.positioner, origin.x, origin.y, out.width, out.height);
+  // Position-constrain the popup against its parent's output. Popups attach
+  // to a toplevel (or layer surface) whose outputId is known; look up that
+  // output's rect from the WM and use its dims. Falls back to the primary if
+  // the parent is mid-detach. This is "good enough" for single-output and
+  // for popups that don't straddle output boundaries; full edge-aware
+  // multi-output popup constraints are not in v1's scope.
+  const wm = ctx.state.wm;
+  let outRect = { width: 1920, height: 1080 };
+  if (wm) {
+    const primaryId = wm.primaryOutputId();
+    const wmOut = wm.state.outputs.get(primaryId);
+    if (wmOut) outRect = { width: wmOut.rect.width, height: wmOut.rect.height };
+  }
+  pr.rect = solvePopupPosition(pr.positioner, origin.x, origin.y, outRect.width, outRect.height);
   ctx.events.xdg_popup.send_configure(pr.resource, pr.rect.x, pr.rect.y, pr.rect.width, pr.rect.height);
   const serial = ctx.state.serial();
   pr.xdgSurface.lastConfigureSerial = serial;

@@ -31,7 +31,17 @@ import type {
 } from "../events/types.js";
 
 export interface Rect { x: number; y: number; width: number; height: number; }
-export interface Output { width: number; height: number; }
+
+// One output the WM lays windows out on. The `rect` is the output's region in
+// the global logical coordinate space (logicalPosition + logicalSize); each
+// output renders its sub-rectangle of that space. `scale` is the HiDPI factor;
+// the layout plugin receives it and may use it to derive minimum-size
+// thresholds.
+export interface WmOutput {
+  id: number;
+  rect: Rect;
+  scale: number;
+}
 
 // Edge insets (output px). Decoration reserves border space around a window.
 export interface Insets { top: number; right: number; bottom: number; left: number; }
@@ -43,6 +53,12 @@ export interface SurfaceHandle { resource: Resource; }
 
 export interface Window {
   surfaceId: number;
+  // Which output this window is laid out on. Set at addWindow (defaulting to
+  // the primary live output); updated by setWindowOutput when an explicit move
+  // crosses a boundary, or by setFloatingRect when an interactive drag carries
+  // the window into another output's rect. The layout-driver partitions
+  // windows by this field and runs the plugin once per output.
+  outputId: number;
   // The CONTENT rect (where the client draws). In the tiling model this is the
   // window's OUTER tile shrunk by its decoration insets: the layout owns the
   // outer tile; decoration eats into it; the client is configured to `rect`.
@@ -119,7 +135,11 @@ export function defaultWindowState(): WindowState {
   };
 }
 
-export interface WmState { output: Output; windows: Window[]; }
+// The WM's per-output table, keyed by `outputId`. Always non-empty: at least
+// the primary live output, or the virtual fallback when no real output exists.
+// Replaced wholesale by setOutputs; each output's `rect` is its slice of the
+// global logical coordinate space.
+export interface WmState { outputs: Map<number, WmOutput>; windows: Window[]; }
 
 // Configure sink: ask the protocol layer to send a sized configure to a window's
 // toplevel. Returns the configure serial (for the resize transaction to match
@@ -157,6 +177,20 @@ export interface Wm {
   // a new exclusive zone shrinks the tile region for every managed window).
   // Coalesces with in-flight passes via the driver's existing scheduling.
   schedule(reason: import("@overdraw/layout-types").LayoutReason): void;
+  // Replace the WM's output set. The new set must be non-empty (the WM
+  // requires ≥1 output at all times -- the virtual fallback is what the host
+  // installs when no real output exists). Windows whose outputId is not in
+  // the new set are reassigned to the primary (lowest id) of the new set so
+  // no window is orphaned. Schedules an output-resized relayout.
+  setOutputs(outputs: ReadonlyArray<WmOutput>): void;
+  // The id of the primary output -- the lowest id in state.outputs, used as
+  // the default home for newly-mapped windows. Throws if the WM has no
+  // outputs (the construction invariant forbids this).
+  primaryOutputId(): number;
+  // Explicitly reassign a window to a different output. Schedules a relayout
+  // (both the old and new outputs may need to repartition). No-op if the
+  // window doesn't exist or is already on the target output.
+  setWindowOutput(surfaceId: number, outputId: number): void;
   // Proactive: called at get_toplevel (role assignment), BEFORE the client has
   // content. Inserts the window into the layout (as the new master) and
   // schedules a layout pass. Idempotent for an already-added surface. The
@@ -171,7 +205,7 @@ export interface Wm {
   addWindow(
     surfaceId: number,
     surfaceRec: SurfaceHandle,
-    opts?: { deferInitialCommit?: boolean },
+    opts?: { deferInitialCommit?: boolean; outputId?: number },
   ): Rect;
   // Mark the initial-commit phase complete for a deferred window: emit
   // window.proposed with the accumulated state as the candidate so a
@@ -208,6 +242,10 @@ export interface Wm {
   setInsets(surfaceId: number, insets: Insets): InsetGrant | undefined;
   outerRectOf(surfaceId: number): Rect | undefined;
   rectOf(surfaceId: number): Rect | undefined;
+  // Which output the given window is laid out on. Undefined when the window
+  // doesn't exist. The window.map emitter uses this to populate the event's
+  // outputId field without taking a full snapshot.
+  outputIdOf(surfaceId: number): number | undefined;
   setContentGated(surfaceId: number, gated: boolean): void;
   isContentGated(surfaceId: number): boolean;
   setDecorationSurface(windowId: number, decoSurfaceId: number | null): void;
@@ -279,6 +317,7 @@ export interface Wm {
 // event payloads. surfaceRec / Resource are NOT included (not cloneable).
 export interface WindowSnapshot {
   surfaceId: number;
+  outputId: number;
   rect: Rect;
   outer: Rect;
   insets?: Insets;
@@ -437,6 +476,15 @@ export interface WmOptions {
   pluginBus?: DynamicBus;
 }
 
+// Convenience: build the WM's per-output map from a list of descriptors,
+// preserving iteration order so primaryOutputId() is deterministic when ids
+// are unsorted.
+function outputsMap(outputs: ReadonlyArray<WmOutput>): Map<number, WmOutput> {
+  const m = new Map<number, WmOutput>();
+  for (const o of outputs) m.set(o.id, { id: o.id, rect: { ...o.rect }, scale: o.scale });
+  return m;
+}
+
 // Window state convenience helpers re-exported here so callers reading the
 // WM module don't need a parallel events/types.js import.
 export type { Presentation, WindowState, ProposalReason } from "../events/types.js";
@@ -446,25 +494,34 @@ const INTERCEPTOR_TIMEOUT_MS = 100;
 
 export function createWm(
   compositor: CompositorSink,
-  output: Output,
-  optsOrRebuild?: WmOptions | (() => void),
-  configure?: ConfigureSink,
+  outputs: ReadonlyArray<WmOutput>,
+  opts?: WmOptions,
 ): Wm {
-  let rebuild: (() => void) | undefined;
-  let decorationResize: DecorationResizeSink | undefined;
-  let layoutDriverFactory: WmOptions["layoutDriverFactory"];
-  let pluginBus: DynamicBus | undefined;
-  if (optsOrRebuild && typeof optsOrRebuild === "object") {
-    rebuild = optsOrRebuild.rebuild;
-    configure = optsOrRebuild.configure ?? configure;
-    decorationResize = optsOrRebuild.decorationResize;
-    layoutDriverFactory = optsOrRebuild.layoutDriverFactory;
-    pluginBus = optsOrRebuild.pluginBus;
-  } else {
-    rebuild = optsOrRebuild as (() => void) | undefined;
+  if (outputs.length === 0) {
+    throw new Error("createWm: outputs must be non-empty");
   }
+  const rebuild = opts?.rebuild;
+  const configure = opts?.configure;
+  const decorationResize = opts?.decorationResize;
+  const layoutDriverFactory = opts?.layoutDriverFactory;
+  const pluginBus = opts?.pluginBus;
   const windows: Window[] = [];
-  const wm: WmState = { output, windows };
+  const wm: WmState = { outputs: outputsMap(outputs), windows };
+  // The primary is the lowest live id; computed on demand to track setOutputs.
+  function primaryOutputId(): number {
+    let lo = Infinity;
+    for (const id of wm.outputs.keys()) if (id < lo) lo = id;
+    if (lo === Infinity) throw new Error("internal: WM has no outputs");
+    return lo;
+  }
+  // Resolve an explicit/optional outputId to a concrete live id. Unknown ids
+  // collapse to the primary; the WM never silently drops a window onto a
+  // nonexistent output.
+  function resolveOutputId(requested: number | undefined): number {
+    if (requested === undefined) return primaryOutputId();
+    if (wm.outputs.has(requested)) return requested;
+    return primaryOutputId();
+  }
 
   // Resize transaction (reorder relayouts only). A window that changes size must
   // not jump to its new tile before it has re-rendered at the new size, or it
@@ -683,12 +740,14 @@ export function createWm(
 
   // Build a LayoutSnapshot from the current WM state. Carries presentation
   // so the driver's resolver can dispatch mode-specific rects without
-  // calling the plugin.
+  // calling the plugin, and each window's outputId so the driver can
+  // partition the layout pass across outputs.
   function snapshot(): LayoutSnapshot {
     const snapshotWindows: import("./layout-driver.js").LayoutSnapshotWindow[] =
       windows.map((w) => ({
         id: w.surfaceId,
         role: "toplevel" as const,
+        outputId: w.outputId,
         presentation: w.windowState.presentation,
         layoutMode: w.windowState.layoutMode ?? undefined,
         layoutData: w.windowState.layoutData,
@@ -700,7 +759,11 @@ export function createWm(
         ...(w.floatingRect ? { floatingRect: { ...w.floatingRect } } : {}),
         ...(w.windowState.restoreRect ? { restoreRect: { ...w.windowState.restoreRect } } : {}),
       }));
-    return { output: { width: output.width, height: output.height }, windows: snapshotWindows };
+    const outputDescs: Array<{ id: number; rect: Rect; scale: number }> = [];
+    for (const o of wm.outputs.values()) {
+      outputDescs.push({ id: o.id, rect: { ...o.rect }, scale: o.scale });
+    }
+    return { outputs: outputDescs, windows: snapshotWindows };
   }
 
   const target: LayoutApplyTarget = { apply: applyLayout };
@@ -720,6 +783,7 @@ export function createWm(
       if (existing) return contentOf(existing);
       const win: Window = {
         surfaceId,
+        outputId: resolveOutputId(opts?.outputId),
         outer: { x: 0, y: 0, width: -1, height: -1 },
         rect: { x: 0, y: 0, width: -1, height: -1 },
         surfaceRec,
@@ -730,6 +794,31 @@ export function createWm(
       windows.unshift(win);
       driver.schedule("mapped");
       return win.rect;
+    },
+
+    primaryOutputId,
+
+    setOutputs(newOutputs) {
+      if (newOutputs.length === 0) {
+        throw new Error("setOutputs: outputs must be non-empty");
+      }
+      wm.outputs = outputsMap(newOutputs);
+      // Reassign any window whose output disappeared. The new primary takes
+      // them; their outer rect will be reflowed when the layout pass runs.
+      const primary = primaryOutputId();
+      for (const w of windows) {
+        if (!wm.outputs.has(w.outputId)) w.outputId = primary;
+      }
+      driver.schedule("output-resized");
+    },
+
+    setWindowOutput(surfaceId, outputId) {
+      const win = windows.find((w) => w.surfaceId === surfaceId);
+      if (!win) return;
+      if (!wm.outputs.has(outputId)) return;
+      if (win.outputId === outputId) return;
+      win.outputId = outputId;
+      driver.schedule("state-changed");
     },
 
     windowHasContent(surfaceId) {
@@ -790,6 +879,11 @@ export function createWm(
     rectOf(surfaceId) {
       const win = windows.find((w) => w.surfaceId === surfaceId);
       return win ? { ...win.rect } : undefined;
+    },
+
+    outputIdOf(surfaceId) {
+      const win = windows.find((w) => w.surfaceId === surfaceId);
+      return win?.outputId;
     },
 
     setContentGated(surfaceId, gated) {
@@ -1013,6 +1107,21 @@ export function createWm(
       const win = windows.find((w) => w.surfaceId === surfaceId);
       if (!win) return;
       win.floatingRect = { ...rect };
+      // Boundary-crossing: if the rect's center now lies inside a different
+      // output's rect, reassign. Using the center (rather than full-
+      // containment) keeps the reassignment well-defined for a window whose
+      // rect straddles two outputs -- the dominant output owns it.
+      const cx = rect.x + rect.width / 2;
+      const cy = rect.y + rect.height / 2;
+      let target = win.outputId;
+      for (const o of wm.outputs.values()) {
+        const r = o.rect;
+        if (cx >= r.x && cx < r.x + r.width && cy >= r.y && cy < r.y + r.height) {
+          target = o.id;
+          break;
+        }
+      }
+      if (target !== win.outputId) win.outputId = target;
       driver.schedule("state-changed");
     },
 
@@ -1117,6 +1226,7 @@ function snapshotOf(win: Window): WindowSnapshot {
   for (const [k, v] of win.state.entries()) state[k] = v;
   const snap: WindowSnapshot = {
     surfaceId: win.surfaceId,
+    outputId: win.outputId,
     rect: { ...win.rect },
     outer: { ...win.outer },
     hasContent: !!win.hasContent,

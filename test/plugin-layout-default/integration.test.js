@@ -40,7 +40,7 @@ test('end-to-end: bundled master-stack plugin assigns tiles via the runtime', as
     await rt.waitForNamespace('layout');
 
     // Build a WM backed by the real runtime-backed driver.
-    const wm = createWm(mockCompositor(), { width: 1000, height: 600 }, {
+    const wm = createWm(mockCompositor(), [{ id: 0, rect: { x: 0, y: 0, width: 1000, height: 600 }, scale: 1 }], {
       configure: (id, w, h) => configures.push({ id, w, h }),
       layoutDriverFactory: (target, snapshot) => createLayoutDriver({
         target, snapshot,

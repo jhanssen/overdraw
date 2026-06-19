@@ -7,6 +7,7 @@ import type { CompositorState } from "./protocols/ctx.js";
 
 export interface WindowSnapshot {
   surfaceId: number;
+  outputId: number;
   rect: { x: number; y: number; width: number; height: number };
   title: string | null;
   appId: string | null;
@@ -14,8 +15,21 @@ export interface WindowSnapshot {
   mapped: boolean;
 }
 
+export interface OutputSummary {
+  id: number;
+  // Position in the global logical coordinate space.
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+  scale: number;
+}
+
 export interface StateSnapshot {
-  output: { width: number; height: number };
+  // Every WM output, ordered by id ascending. The first entry is the
+  // primary; an empty array indicates a misconfigured harness (the WM
+  // always has ≥1 output in production).
+  outputs: OutputSummary[];
   // Windows in WM layout order (index 0 = master/front; tiling does not overlap,
   // so this is the layout order, not a z-stack).
   windows: WindowSnapshot[];
@@ -44,7 +58,16 @@ export function titleAppId(state: CompositorState, surfaceId: number): { title: 
 // Snapshot the current compositor state. Stable, serializable, GPU-free.
 export function queryState(state: CompositorState): StateSnapshot {
   const wm = state.wm;
-  const output = wm?.state.output ?? { width: 0, height: 0 };
+  const outputs: OutputSummary[] = wm
+    ? [...wm.state.outputs.values()]
+        .sort((a, b) => a.id - b.id)
+        .map((o) => ({
+          id: o.id,
+          x: o.rect.x, y: o.rect.y,
+          width: o.rect.width, height: o.rect.height,
+          scale: o.scale,
+        }))
+    : [];
 
   const windows: WindowSnapshot[] = (wm?.state.windows ?? []).map((w) => {
     const ta = titleAppId(state, w.surfaceId);
@@ -56,6 +79,7 @@ export function queryState(state: CompositorState): StateSnapshot {
     }
     return {
       surfaceId: w.surfaceId,
+      outputId: w.outputId,
       rect: { x: w.rect.x, y: w.rect.y, width: w.rect.width, height: w.rect.height },
       title: ta.title,
       appId: ta.appId,
@@ -65,7 +89,7 @@ export function queryState(state: CompositorState): StateSnapshot {
   });
 
   return {
-    output: { width: output.width, height: output.height },
+    outputs,
     windows,
     stack: (wm?.state.windows ?? []).map((w) => w.surfaceId),
     pointerFocus: state.seat?.focus?.surfaceId ?? null,

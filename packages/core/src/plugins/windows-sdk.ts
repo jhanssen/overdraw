@@ -145,8 +145,9 @@ export interface PluginWindows extends PluginWindowObserver {
   list(): Promise<WindowSnapshot[]>;
 
   // Override the content-layer draw order for an output. null clears the
-  // override and falls back to the global stack. Use OUTPUT_DEFAULT (=0)
-  // until multi-output reconfiguration is built (see status.md).
+  // override and falls back to the global stack. `outputId` is one of the
+  // dense ids in state.outputs (see core-plugin-api.md §1); the workspace
+  // plugin uses it to multiplex per-output workspace stacks.
   setOutputStack(outputId: number, ids: number[] | null): Promise<void>;
 
   // Explicit focus override; bypasses the focus plugin's decide()
@@ -213,7 +214,7 @@ export interface PluginWindows extends PluginWindowObserver {
   destroyPhantom(id: number): Promise<void>;
 }
 
-// The single-output placeholder id (kept in sync with OUTPUT_DEFAULT in
+// The id of the primary output (kept in sync with OUTPUT_DEFAULT in
 // protocols/ctx.ts). Re-exported for plugin authors so they don't import
 // from internal core paths.
 export const OUTPUT_DEFAULT = 0;

@@ -106,7 +106,17 @@ function asMapEvent(data: unknown): WindowMapEvent | null {
   if (typeof data.surfaceId !== "number") return null;
   if (!isRect(data.rect)) return null;
   if (!isNullableString(data.appId) || !isNullableString(data.title)) return null;
-  return { surfaceId: data.surfaceId, rect: data.rect, appId: data.appId, title: data.title };
+  // outputId defaults to the primary (0) when absent so legacy test fixtures
+  // emitting bare {surfaceId, rect, appId, title} payloads still pass; real
+  // emitters in core always set it.
+  const outputId = typeof data.outputId === "number" ? data.outputId : 0;
+  return {
+    surfaceId: data.surfaceId,
+    outputId,
+    rect: data.rect,
+    appId: data.appId,
+    title: data.title,
+  };
 }
 
 function asUnmapEvent(data: unknown): WindowUnmapEvent | null {

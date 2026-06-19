@@ -81,6 +81,12 @@ export interface RuntimeOptions {
   // core state (seat, wm, workspace plugin). Tests stub it. When unset,
   // params pass through unchanged.
   resolveDeferredRefs?: (params: unknown) => unknown;
+  // Snapshot of live outputIds at plugin-spawn time. The runtime ships this
+  // list to each worker's bootstrap; the worker's sdk.compose rejects an
+  // outputId not in the snapshot. In-thread bundled plugins read state.outputs
+  // directly via a different path (set up in main.ts). Tests with no real
+  // outputs may return an empty array; sdk.compose then rejects everything.
+  liveOutputIds?: () => number[];
 }
 
 export const DEFAULT_OPTIONS: RuntimeOptions = {
@@ -165,6 +171,7 @@ class ManagedPlugin implements PluginHandle {
         // it. Plugins that take no config ignore the second arg.
         config: this.cfg.raw,
         pluginAddonPath: this.opts.pluginAddonPath, dawnPath: this.opts.dawnPath,
+        liveOutputIds: this.opts.liveOutputIds ? this.opts.liveOutputIds() : [],
       },
       resourceLimits: { maxOldGenerationSizeMb: this.opts.heapMb },
     });
@@ -402,6 +409,7 @@ export class PluginRuntime implements PluginController {
           bus: this.opts.bus,
           shutdownTimeoutMs: this.opts.shutdownTimeoutMs,
           inThreadGpu: this.opts.inThreadGpu,
+          liveOutputIds: this.opts.liveOutputIds,
         }, this);
         itp.spawn();
         p = itp;

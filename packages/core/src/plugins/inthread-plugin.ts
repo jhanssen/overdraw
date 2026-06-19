@@ -32,6 +32,11 @@ export interface InThreadOptions {
   // SDK construction in loader.ts skips both GPU and decorations when the
   // bundle is missing.
   inThreadGpu?: InThreadGpuDeps;
+  // Live outputId snapshot accessor. Used by sdk.compose to validate
+  // outputId args; the closure reads state.outputs in the host so a freshly-
+  // added monitor is immediately visible. Unset -> sdk.compose rejects every
+  // outputId (test fixtures with no real outputs).
+  liveOutputIds?: () => number[];
 }
 
 export class InThreadPlugin implements PluginHandle {
@@ -81,11 +86,19 @@ export class InThreadPlugin implements PluginHandle {
     this.state = "spawning";
     const pair = createChannelPair();
     this.wireCoreEndpoint(pair.a);
+    // In-thread plugins read live outputIds directly (no Worker postMessage
+    // boundary), so hasOutput reflects state.outputs in real time -- not a
+    // spawn-time snapshot like the Worker path. opts.liveOutputIds() returns
+    // a fresh array; the closure reads it on each compose-SDK call.
+    const liveOutputIds = this.opts.liveOutputIds;
     void runLoader(pair.b, {
       module: this.cfg.module,
       name: this.cfg.name,
       config: this.cfg.raw,
       inThreadGpu: this.opts.inThreadGpu,
+      hasOutput: liveOutputIds
+        ? (id) => liveOutputIds().includes(id)
+        : () => false,
     }).catch((err: unknown) => {
       // runLoader converts init errors into the 'init' event; a reject
       // here means something more fundamental failed (channel setup, SDK

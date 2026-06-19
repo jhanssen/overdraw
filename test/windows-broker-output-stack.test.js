@@ -32,7 +32,7 @@ function makeState(wm, bus, sink) {
 
 function makeBroker() {
   const sink = mockSink();
-  const wm = createWm(sink, { width: 800, height: 600 });
+  const wm = createWm(sink, [{ id: 0, rect: { x: 0, y: 0, width: 800, height: 600 }, scale: 1 }]);
   const bus = createCompositorBus();
   const pluginBus = new DynamicBus();
   const broker = createWindowsBroker({
@@ -113,7 +113,7 @@ test('set-output-stack: array with non-numbers throws', () => {
 function brokerWithSeat() {
   const seatCalls = [];
   const sink = mockSink();
-  const wm = createWm(sink, { width: 800, height: 600 });
+  const wm = createWm(sink, [{ id: 0, rect: { x: 0, y: 0, width: 800, height: 600 }, scale: 1 }]);
   const bus = createCompositorBus();
   const pluginBus = new DynamicBus();
   const state = makeState(wm, bus, sink);
@@ -151,7 +151,7 @@ test('windows.focus: no seat bound -> silent no-op', () => {
   // state.seat is null until installProtocols runs; the broker should
   // tolerate this (some lifecycle stage where the seat doesn't exist).
   const sink = mockSink();
-  const wm = createWm(sink, { width: 800, height: 600 });
+  const wm = createWm(sink, [{ id: 0, rect: { x: 0, y: 0, width: 800, height: 600 }, scale: 1 }]);
   const bus = createCompositorBus();
   const pluginBus = new DynamicBus();
   const broker = createWindowsBroker({
@@ -172,7 +172,7 @@ test('set-output-stack: missing compositor.setOutputStack rejects', () => {
     takeFreedBuffers() { return []; }, afterCurrentFrame() {}, renderFrame() {},
     // no setOutputStack
   };
-  const wm = createWm(sinkNoOut, { width: 800, height: 600 });
+  const wm = createWm(sinkNoOut, [{ id: 0, rect: { x: 0, y: 0, width: 800, height: 600 }, scale: 1 }]);
   const bus = createCompositorBus();
   const pluginBus = new DynamicBus();
   const broker = createWindowsBroker({

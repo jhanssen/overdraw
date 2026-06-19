@@ -64,8 +64,12 @@ function emitTo(
 function fallback(state: CompositorState): OutputRecord {
   // Defensive fallback: if state.outputs is somehow empty (GPU-free harness
   // that skipped the registry seed), advertise something matching the WM's
-  // known output size so clients don't abort.
-  const size = state.wm?.state.output ?? { width: 1920, height: 1080 };
+  // primary output size so clients don't abort.
+  const primary = state.wm?.primaryOutputId();
+  const wmOut = primary !== undefined ? state.wm?.state.outputs.get(primary) : undefined;
+  const size = wmOut
+    ? { width: wmOut.rect.width, height: wmOut.rect.height }
+    : { width: 1920, height: 1080 };
   return {
     id: OUTPUT_DEFAULT,
     logicalPosition: { x: 0, y: 0 },

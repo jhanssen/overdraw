@@ -386,12 +386,20 @@ policy lives in the **workspace plugin** (it owns `positionsByOutput` /
 durable preferred-output list, the derive-current-from-list rule, and one piece
 core must provide:
 
-- **A persistent virtual fallback output.** Always keep one never-scanned-out
-  output in `state.outputs` (`OUTPUT_DEFAULT = 0` is the natural identity for it).
-  When the **last real monitor disappears**, workspaces park on it: their windows
-  stay fully alive in the WM tree, clients keep running, nothing is presented. This
-  is the reason to always have ≥1 output rather than make every layer (render,
-  layout, protocol) tolerate an empty `state.outputs`.
+- **A persistent virtual fallback output, stored OUTSIDE `state.outputs`.**
+  Always keep one never-scanned-out output handle alive — but as a separate
+  field (`state.fallbackOutput`), not as an entry in `state.outputs`. When the
+  **last real monitor disappears**, workspaces park on it: their windows stay
+  fully alive in the WM tree, clients keep running, nothing is presented.
+  Keeping it parallel to `state.outputs` (rather than inside it) means every
+  iteration over `state.outputs` (render passes, wl_output globals, xdg-output,
+  layout-driver, IPC enumeration, output-management v1) is automatically free
+  of the fallback — no per-layer "skip the sentinel" branches. Only the
+  workspace migration code (and a tiny amount of WM/layout logic that asks
+  "where does an orphaned workspace live") references `state.fallbackOutput`
+  directly. The fallback output has a stable durable identifier reserved for
+  it (a sentinel `name` and empty `edidId`) so `preferredOutputs` resolution
+  treats it like any other output identifier without special casing.
 
 The whole policy is one operation: **on any output add/remove, recompute every
 workspace's current live output as the highest-ranked entry in its
@@ -406,8 +414,8 @@ recomputes its home:
    *real* output.
 2. If none of its remembered outputs survive → the first remaining real output
    (and append it to `preferredOutputs` at lowest priority — now remembered).
-3. If there is no real output at all → the virtual fallback output (parked, alive,
-   invisible).
+3. If there is no real output at all → `state.fallbackOutput` (parked, alive,
+   invisible; not in `state.outputs`).
 4. Re-push `setOutputStack` for the affected outputs and relayout. Windows sized
    against the zero-area fallback are re-sized/re-centered when they next land on a
    real output.
@@ -504,13 +512,29 @@ ordering is a build sequence, not a scope boundary: the feature is complete only
 after **both** hotplug (M7) and multi-GPU (M8). Milestones 1-7 are intermediate
 states of one feature, not a shippable endpoint.
 
-**Status: M1-M4 done — surface-verified** on a single-card two-monitor setup
-(HDMI 60Hz + DP 240Hz both lit; 1147 unit green). 4h-a, 4h-b, and 4h-c are all
-done; the M4 follow-ups originally listed as "done" but not actually implemented
+**Status: M1-M5 done.** M1-M4 surface-verified on a single-card two-monitor
+setup (HDMI 60Hz + DP 240Hz both lit). M5 unit-tested GPU-free (1186 unit green
++ GPU green); structural multi-output is now end-to-end through every JS layer
+except the wire-protocol globals (M6). 4h-a, 4h-b, and 4h-c all done in M4;
+the M4 follow-ups originally listed as "done" but not actually implemented
 (`drawOrder(outputId)`, per-output `activeTransition` with cross-output bracket
-dedup) also landed. M5-M8 remain. A multi-GPU render-node robustness fix landed
+dedup) also landed. M6-M8 remain. A multi-GPU render-node robustness fix landed
 en route (the GBM allocator + dmabuf clients follow the chosen adapter's GPU,
 not a hardcoded `renderD128`).
+
+**Deviation from this doc, taken in M5:** the virtual fallback output lives at
+`state.fallbackOutput` — a separate field — and NOT as an entry in
+`state.outputs`. The doc originally proposed putting it inside `state.outputs`
+("`OUTPUT_DEFAULT = 0` is the natural identity for it"); keeping it parallel
+instead means every iteration over the live output map (renderer, wl_output
+globals, xdg-output, layout-driver, IPC enumeration, wl_output bind paths) is
+automatically free of the fallback with no per-layer "skip the sentinel"
+branches. Only the workspace migration code (M7) references
+`state.fallbackOutput` directly. The fallback's sentinel id is `OUTPUT_FALLBACK
+= -1` (negative so it cannot collide with a dense connector id) and its
+durable identifier is the reserved name `"__fallback__"` (no real DRM
+connector name starts with double-underscore). Sections 3, 10, and 14 carry
+the resolved decision.
 
 1. **IPC outputId plumbing (no behavior change).** Add `outputId` to the messages
    (Section 4), thread through compositor/addon/main.cpp, still drive one output.
@@ -590,14 +614,29 @@ not a hardcoded `renderD128`).
      two simultaneous workspace transitions on two monitors work without
      tripping the GPU process's Begin/End alternation rule when they share a
      scene texture.
-5. **Per-output WM + layout + workspaces.** Per-output layout pass, global-space
-   arrangement policy (Sections 8, 10-arrangement), and lift the workspace plugin's
-   single-output caps so `outputId != 0` is meaningful (`positionsByOutput` /
-   `shownByOutput` / `setOutputStack` already accept it). Add the durable
-   `preferredOutputs` field to the workspace registry (Section 8). Windows tile and
-   workspaces switch independently on each monitor. Land the virtual fallback output
-   here too (it simplifies every later layer by guaranteeing ≥1 output), even though
-   nothing removes the last real monitor until milestone 7.
+5. **Per-output WM + layout + workspaces. [DONE — GPU-free unit + GPU green.]**
+   Per-output layout pass: each window carries an `outputId`; the WM holds a
+   `Map<outputId, WmOutput>` set wholesale via `setOutputs`; the layout-driver
+   loops per output, partitions windows by `outputId`, and computes each output's
+   own tile region (its rect minus its own reserved zones). Boundary-crossing
+   reassignment: `setFloatingRect` picks the output the rect's center lands on.
+   Layer-shell honors the `output` arg to `get_layer_surface` (resolves a bound
+   wl_output → outputId), and reserved zones key on the resolved outputId so a
+   status bar on output 1 doesn't shrink output 0. Workspace registry gains
+   `preferredOutputs: string[]` (durable identifiers, never the dense id) with
+   three mutations: config seed at create, append-on-forced-placement,
+   promote-on-explicit-move; plus `currentLiveOutput` resolver and unit coverage
+   for replug-on-different-port reclaim. Virtual fallback output landed at
+   `state.fallbackOutput` (NOT inside `state.outputs` — see "Deviation" note in
+   §12). `sdk.compose` validates outputId against the live output set via a
+   plumbed `hasOutput`; Worker plugins get a spawn-time snapshot of live ids in
+   `workerData`. `setOnOutputDescriptor` feeds every output (not just the
+   primary) into `wm.setOutputs`. The per-output `wantNext` cache became a
+   `Map<outputId, number>` keyed for activeOutput resolution off pointer
+   position. M6 (per-output protocol resources) is the wire-side counterpart;
+   the WM/workspace structure is now complete and ready for hotplug (M7) to
+   drive `setOutputs` and `preferredOutputs` recompute on connector
+   add/remove events.
 6. **Per-output protocol resources.** N `wl_output` globals, real xdg-output
    positions, `wl_surface.enter/leave`, layer-shell output targeting (Section 9).
 7. **Hotplug (required for completeness).** udev-monitor detection +
@@ -684,6 +723,14 @@ Resolved:
 - Migration policy owner — the **workspace plugin** holds `preferredOutputs` and
   runs the recompute on `output.added`/`output.removed`; core supplies only those
   bus signals and the virtual fallback output (Sections 8, 10).
+- Virtual fallback output location — **stored as `state.fallbackOutput`, NOT as
+  an entry in `state.outputs`.** Keeping it out of the live-outputs map means
+  every iteration over `state.outputs` (renderer, wl_output globals, xdg-output,
+  layout-driver, IPC enumeration) is automatically free of it without any
+  per-layer "skip the sentinel" branches; only the workspace migration code
+  references it directly. Its durable identifier is a reserved sentinel name
+  (no real connector ever produces it) so `preferredOutputs` resolution treats
+  it uniformly (Section 10).
 - Per-output pacing — **independent per-output clocks**, DONE. Each output is
   clocked by its own vblank via a per-output flip gate + per-output frame-callback
   dispatch (not the removed dirty-set short-circuit). See M4 / 4h-a in Section 12.

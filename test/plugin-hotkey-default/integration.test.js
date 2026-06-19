@@ -52,7 +52,7 @@ async function withHotkeyPlugin(hotkeysConfig, fn, opts = {}) {
   const pluginBus = new DynamicBus();
   const bus = createCompositorBus();
   const sink = mockSink();
-  const wm = createWm(sink, { width: 800, height: 600 });
+  const wm = createWm(sink, [{ id: 0, rect: { x: 0, y: 0, width: 800, height: 600 }, scale: 1 }]);
   const chain = new BindingChain();
   const state = {
     bus, wm, surfaces: new Map(), compositor: sink,
