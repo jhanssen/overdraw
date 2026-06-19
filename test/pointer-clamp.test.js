@@ -7,6 +7,20 @@ import {
 
 function r(x, y, w, h) { return { x, y, w, h }; }
 
+// EDGE_EPSILON in the implementation. Boundary tests assert that the
+// clamped cursor sits at the rect's exclusive edge minus this epsilon.
+const EPS = 1 / 256;
+
+// Helper: assert two doubles are equal modulo a tiny rounding tolerance.
+function eq(a, b, tol = 1e-9) {
+  assert.ok(Math.abs(a - b) < tol, `${a} !== ${b}`);
+}
+
+function eqPoint(p, x, y, tol = 1e-9) {
+  eq(p.x, x, tol);
+  eq(p.y, y, tol);
+}
+
 // --- insideAny ---
 
 test("insideAny: outside the only rect", () => {
@@ -29,95 +43,99 @@ test("insideAny: empty layout is always outside", () => {
   assert.equal(insideAny([], 0, 0), false);
 });
 
-// --- clampPointerMotion: single output ---
+// --- clampPointerMotion: single output, in-bounds motion ---
 
-test("clamp: motion entirely inside one output", () => {
+test("clamp: motion entirely inside one output passes through unchanged", () => {
   const out = [r(0, 0, 1000, 1000)];
   assert.deepEqual(clampPointerMotion(out, 500, 500, 10, -20),
     { x: 510, y: 480 });
 });
 
-test("clamp: motion past the right edge clamps to the right edge", () => {
-  const out = [r(0, 0, 100, 100)];
-  // From (50, 50), move (200, 0). Target (250, 50) is outside.
-  // X-slide fails (no output covers x=250). Y-slide: keep ty=50; output covers
-  // y=50; refX=250 is past the right edge so x snaps to 99.
-  assert.deepEqual(clampPointerMotion(out, 50, 50, 200, 0),
-    { x: 99, y: 50 });
+test("clamp: motion that lands exactly on an interior pixel is preserved", () => {
+  const out = [r(0, 0, 1000, 1000)];
+  assert.deepEqual(clampPointerMotion(out, 100.3, 200.7, 5, 5),
+    { x: 105.3, y: 205.7 });
 });
 
-test("clamp: motion past the left edge clamps to the left edge", () => {
+// --- clampPointerMotion: single output, wall press ---
+
+test("clamp: motion past the right edge snaps just inside the wall", () => {
+  // From (50, 50), motion (+200, 0) -> target (250, 50). Snap x to
+  // 100 - EPS, y unchanged (already in range).
   const out = [r(0, 0, 100, 100)];
-  assert.deepEqual(clampPointerMotion(out, 50, 50, -200, 0),
-    { x: 0, y: 50 });
+  eqPoint(clampPointerMotion(out, 50, 50, 200, 0), 100 - EPS, 50);
 });
 
-test("clamp: motion past the bottom edge clamps to the bottom edge", () => {
+test("clamp: motion past the left edge snaps to x=0", () => {
   const out = [r(0, 0, 100, 100)];
-  // Target (50, 250). X-slide: keep tx=50; output covers x=50; refY=250 snaps to 99.
-  assert.deepEqual(clampPointerMotion(out, 50, 50, 0, 200),
-    { x: 50, y: 99 });
+  eqPoint(clampPointerMotion(out, 50, 50, -200, 0), 0, 50);
+});
+
+test("clamp: motion past the bottom edge snaps just inside that wall", () => {
+  const out = [r(0, 0, 100, 100)];
+  eqPoint(clampPointerMotion(out, 50, 50, 0, 200), 50, 100 - EPS);
+});
+
+test("clamp: repeated outward motion at the wall produces a stable position (no jitter)", () => {
+  // Regression for the right-edge flicker. Cursor near the wall, repeated
+  // outward deltas should converge to the same (just-inside-edge) position
+  // and stay there -- no event-to-event back-and-forth.
+  const out = [r(0, 0, 1920, 1080)];
+  let p = { x: 1919.7, y: 500 };
+  for (let i = 0; i < 50; i++) {
+    p = clampPointerMotion(out, p.x, p.y, 5, 0);
+  }
+  eqPoint(p, 1920 - EPS, 500);
+  // And one more outward delta keeps it pinned to the same position.
+  const q = clampPointerMotion(out, p.x, p.y, 5, 0);
+  eqPoint(q, p.x, p.y);
 });
 
 // --- clampPointerMotion: two outputs side by side ---
 
 test("clamp: crossing between two side-by-side outputs is accepted", () => {
-  // 0: x in [0, 1920); 1: x in [1920, 3840). Both 1080 tall.
   const out = [r(0, 0, 1920, 1080), r(1920, 0, 1920, 1080)];
-  // Move from output 0 to output 1.
   assert.deepEqual(clampPointerMotion(out, 1900, 500, 50, 0),
     { x: 1950, y: 500 });
 });
 
-test("clamp: motion past the right edge of the union clamps to the union's right edge", () => {
+test("clamp: motion past the union's right edge snaps to the union's right wall", () => {
   const out = [r(0, 0, 1920, 1080), r(1920, 0, 1920, 1080)];
-  // From (3800, 500), move (100, 0) -> target (3900, 500). X-slide: no output
-  // covers x=3900. Y-slide: keep ty=500; the right output covers y=500 with
-  // x-range [1920, 3840); refX=3900 snaps to 3839.
-  assert.deepEqual(clampPointerMotion(out, 3800, 500, 100, 0),
-    { x: 3839, y: 500 });
+  eqPoint(clampPointerMotion(out, 3800, 500, 100, 0), 3840 - EPS, 500);
 });
 
-// --- clampPointerMotion: mismatched-height side by side (the L-shape case) ---
+// --- clampPointerMotion: mismatched / non-rectangular unions ---
 
-test("clamp: diagonal into a gap slides along the edge", () => {
-  // Left: 1080p tall. Right: 1440p tall, top-aligned, the lower strip below
-  // the 1080's bottom is outside the left output but inside the right.
-  // Layout: left [0, 1920) x [0, 1080); right [1920, 3840) x [0, 1440).
-  // From cursor at (1900, 1070) (near left's bottom-right corner), move
-  // diagonally down-right (50, 50) -> target (1950, 1120).
-  // Target inside? x=1950 inside right [1920, 3840), y=1120 inside right [0, 1440) -> YES.
-  // So the diagonal is accepted (target is inside the right output's tall column).
+test("clamp: diagonal that lands inside the taller output (overhang) is accepted", () => {
+  // Left: 1080p tall. Right: 1440p tall, top-aligned. The strip y in
+  // [1080, 1440) is below the left's bottom but inside the right.
   const out = [r(0, 0, 1920, 1080), r(1920, 0, 1920, 1440)];
+  // From near left's bottom-right, diagonal into the overhang.
   assert.deepEqual(clampPointerMotion(out, 1900, 1070, 50, 50),
     { x: 1950, y: 1120 });
 });
 
-test("clamp: diagonal into a true gap (stacked monitors with horizontal offset) slides", () => {
-  // Top monitor: [0, 0, 1920, 1080]. Bottom monitor: [500, 1080, 1920, 1080]
-  // (offset right). The strip x in [0, 500) below y=1080 is a gap.
-  // From (100, 1070), move (0, 50) -> target (100, 1120) in the gap.
-  // X-slide: keep target X=100. Outputs covering x=100: only top (y range
-  // [0, 1080)). refY=1070, snap into [0, 1079]. -> (100, 1079).
-  // Y-slide: keep target Y=1120. Outputs covering y=1120: only bottom (x range
-  // [500, 2420)). refX=100, snap into [500, 2419]. -> (500, 1120).
-  // X-slide returns first and wins.
+test("clamp: diagonal into a true gap projects to whichever rect is closer", () => {
+  // Top: [0, 0, 1920, 1080]. Bottom: [500, 1080, 1920, 1080] (offset right).
+  // The strip x in [0, 500) below y=1080 is a gap.
+  // From (100, 1070), motion (0, +50) -> target (100, 1120) in the gap.
+  // Top's projection: (100, 1079.996...) dist = ~40.
+  // Bottom's projection: (500, 1120) dist = 400.
+  // Closest is the top -> snap y to just inside top's bottom edge.
   const out = [r(0, 0, 1920, 1080), r(500, 1080, 1920, 1080)];
-  const got = clampPointerMotion(out, 100, 1070, 0, 50);
-  assert.deepEqual(got, { x: 100, y: 1079 });
+  eqPoint(clampPointerMotion(out, 100, 1070, 0, 50), 100, 1080 - EPS);
 });
 
-test("clamp: diagonal that misses both axes' slides stays put", () => {
-  // Two disjoint monitors with both axes mismatched. Cursor in monitor A,
-  // motion vector goes into a region not covered by either monitor on either
-  // axis-aligned slide.
+test("clamp: diagonal past disjoint monitors projects to the closer rect's corner", () => {
+  // Two disjoint monitors. Motion vector lands in the void between them.
+  // The algorithm picks whichever rect's closest-projection is nearer
+  // (not "stay put"); the visible effect is the cursor slides along the
+  // edge of the nearer monitor toward the projection target.
   const out = [r(0, 0, 100, 100), r(500, 500, 100, 100)];
-  // From (50, 50) (in A), move (300, 300) -> target (350, 350). Outside both.
-  // X-slide: keep x=350. No output covers x=350. Fails.
-  // Y-slide: keep y=350. No output covers y=350. Fails.
-  // Stay at (50, 50).
-  assert.deepEqual(clampPointerMotion(out, 50, 50, 300, 300),
-    { x: 50, y: 50 });
+  // From (50, 50) (in A), motion (300, 300) -> target (350, 350).
+  // A's projection: (100 - EPS, 100 - EPS) dist ~ 250*250 + 250*250.
+  // B's projection: (500, 500) dist ~ 150*150 + 150*150. B wins.
+  eqPoint(clampPointerMotion(out, 50, 50, 300, 300), 500, 500);
 });
 
 // --- empty layout ---

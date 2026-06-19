@@ -17,13 +17,18 @@ namespace overdraw::core {
 namespace {
 
 // Pointer clamp against a multi-output layout. Mirrors the algorithm in
-// packages/core/src/output/pointer-clamp.ts byte-for-byte (which is the
-// canonical version + has unit tests). Keep them in sync.
+// packages/core/src/output/pointer-clamp.ts (which is the canonical
+// version + has unit tests). Keep them in sync.
 //
-// Outputs may form a non-rectangular union. A relative motion that would
-// leave the union slides along an axis to the nearest valid in-bounds
-// position; if no axis-aligned slide finds a valid landing, the cursor
-// stays where it was.
+// Outputs may form a non-rectangular union. The target (oldX+dx, oldY+dy)
+// is projected to the closest point in the union by minimum squared
+// distance across each rect's individual projection. The result lies
+// strictly inside the half-open range of whichever rect won (by
+// EDGE_EPSILON) so consecutive outward motion at a wall produces no
+// event-to-event jitter -- the cursor sits just inside the boundary and
+// stays there.
+
+constexpr double EDGE_EPSILON = 1.0 / 256.0;
 
 inline bool insideAny(const std::vector<OutputRect>& outs, double x, double y) {
     for (const auto& r : outs) {
@@ -34,56 +39,29 @@ inline bool insideAny(const std::vector<OutputRect>& outs, double x, double y) {
     return false;
 }
 
-inline double clampToRange(double v, double lo, double hi) {
-    return v < lo ? lo : (v > hi ? hi : v);
-}
+// Project (x, y) into the union of `outs` by closest squared distance.
+// Each rect contributes its own clamped projection (each axis clamped to
+// [r.x, r.x + r.w - EDGE_EPSILON] / [r.y, r.y + r.h - EDGE_EPSILON]); the
+// rect with the smallest distance from (x, y) to its projection wins.
+struct ClampPoint { double x; double y; };
 
-// X-slide: keep `x` as the target X; among outputs whose x-range covers `x`,
-// pick the one whose y-range is closest to refY; snap y into its bounds.
-// Returns true on success with out_y written.
-bool slideAlongX(const std::vector<OutputRect>& outs,
-                 double x, double refY, double& out_y) {
-    const OutputRect* best = nullptr;
+ClampPoint closestPointInUnion(const std::vector<OutputRect>& outs,
+                               double x, double y) {
+    ClampPoint best{x, y};
     double bestDist = std::numeric_limits<double>::infinity();
     for (const auto& r : outs) {
-        const double rxh = static_cast<double>(r.x) + static_cast<double>(r.w);
-        if (!(x >= r.x && x < rxh)) continue;
-        const double ry  = static_cast<double>(r.y);
-        const double ryh = ry + static_cast<double>(r.h);
-        double d;
-        if (refY < ry)        d = ry - refY;
-        else if (refY >= ryh) d = refY - (ryh - 1.0);
-        else                  d = 0.0;
-        if (d < bestDist) { bestDist = d; best = &r; }
+        const double rx = static_cast<double>(r.x);
+        const double ry = static_cast<double>(r.y);
+        const double rxMax = rx + static_cast<double>(r.w) - EDGE_EPSILON;
+        const double ryMax = ry + static_cast<double>(r.h) - EDGE_EPSILON;
+        const double cx = x < rx ? rx : (x > rxMax ? rxMax : x);
+        const double cy = y < ry ? ry : (y > ryMax ? ryMax : y);
+        const double dx = x - cx;
+        const double dy = y - cy;
+        const double d = dx * dx + dy * dy;
+        if (d < bestDist) { bestDist = d; best = {cx, cy}; }
     }
-    if (!best) return false;
-    out_y = clampToRange(refY,
-        static_cast<double>(best->y),
-        static_cast<double>(best->y) + static_cast<double>(best->h) - 1.0);
-    return true;
-}
-
-// Y-slide: symmetric of slideAlongX.
-bool slideAlongY(const std::vector<OutputRect>& outs,
-                 double refX, double y, double& out_x) {
-    const OutputRect* best = nullptr;
-    double bestDist = std::numeric_limits<double>::infinity();
-    for (const auto& r : outs) {
-        const double ryh = static_cast<double>(r.y) + static_cast<double>(r.h);
-        if (!(y >= r.y && y < ryh)) continue;
-        const double rx  = static_cast<double>(r.x);
-        const double rxh = rx + static_cast<double>(r.w);
-        double d;
-        if (refX < rx)        d = rx - refX;
-        else if (refX >= rxh) d = refX - (rxh - 1.0);
-        else                  d = 0.0;
-        if (d < bestDist) { bestDist = d; best = &r; }
-    }
-    if (!best) return false;
-    out_x = clampToRange(refX,
-        static_cast<double>(best->x),
-        static_cast<double>(best->x) + static_cast<double>(best->w) - 1.0);
-    return true;
+    return best;
 }
 
 }  // namespace
@@ -228,25 +206,15 @@ void LibinputBackend::dispatchEvent(libinput_event* ev) {
             auto* pe = libinput_event_get_pointer_event(ev);
             const double dx = libinput_event_pointer_get_dx(pe);
             const double dy = libinput_event_pointer_get_dy(pe);
-            // Clamp against the multi-output union with edge-sliding.
-            // (oldX, oldY) is guaranteed inside some rect by the invariant
-            // setOutputLayout maintains.
-            const double oldX = cursorX_, oldY = cursorY_;
-            const double tx = oldX + dx, ty = oldY + dy;
-            if (insideAny(outputs_, tx, ty)) {
-                cursorX_ = tx;
-                cursorY_ = ty;
-            } else {
-                double snapY;
-                if (slideAlongX(outputs_, tx, ty, snapY)) {
-                    cursorX_ = tx; cursorY_ = snapY;
-                } else {
-                    double snapX;
-                    if (slideAlongY(outputs_, tx, ty, snapX)) {
-                        cursorX_ = snapX; cursorY_ = ty;
-                    }
-                    // else both axes rejected; cursor stays at (oldX, oldY).
-                }
+            // Clamp against the multi-output union by closest-point
+            // projection. An empty layout leaves the cursor pinned (no
+            // valid landing exists); this normally only happens transiently
+            // during layout changes.
+            if (!outputs_.empty()) {
+                const ClampPoint p =
+                    closestPointInUnion(outputs_, cursorX_ + dx, cursorY_ + dy);
+                cursorX_ = p.x;
+                cursorY_ = p.y;
             }
 
             InputEvent e{};
