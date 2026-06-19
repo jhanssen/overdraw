@@ -432,7 +432,16 @@ export interface CompositorAddon {
   // JS does NOT flush explicitly. writeBeginAccess returns false iff the import
   // is unknown (JS-gate bug; the GPU process hard-fails on its side too).
   writeBeginAccess(importId: number): boolean;
+  // Same as writeBeginAccess plus an attached sync_file fd (SCM_RIGHTS) for
+  // wp_linux_drm_syncobj_v1. The GPU process uses the fence as the Dawn
+  // acquire fence INSTEAD of running EXPORT_SYNC_FILE on the dmabuf.
+  // Consumes the WaylandFd. Same false-on-import-miss contract.
+  writeBeginAccessWithFence(importId: number, acquireFenceFd: WaylandFd): boolean;
   writeEndAccess(importId: number): void;
+  // wp_linux_drm_syncobj_v1: signal a release timeline point. Called from
+  // queue.onSubmittedWorkDone for each pending release point queued via
+  // queueSurfaceReleasePoint on the JsCompositor.
+  syncobjTimelineSignal(handle: number, pointHi: number, pointLo: number): boolean;
   // Phase 5b: in-band producer Begin/End on the core wire for compose buffers
   // (AllocComposeBuf). The core IS the producer for compose buffers, so
   // producer Begin/End ride the core wire (inverted from sdk.gpu overlays
@@ -948,6 +957,35 @@ export class JsCompositor implements CompositorSink {
   // Buffers freed by the lifecycle (sendWlRelease intents). Drained per-frame
   // by src/protocols/index.ts via takeFreedBuffers() (the wire layer).
   private freed: number[] = [];
+
+  // wp_linux_drm_syncobj_v1 release-point bookkeeping: bufferId -> the latest
+  // syncobj release point promoted at commit time. Signaled exactly when the
+  // lifecycle emits sendWlRelease for that bufferId (i.e. the buffer is
+  // superseded on its surface AND its last GPU sample completed) -- same
+  // semantic as wl_buffer.release, which is what the protocol demands.
+  // Signaling on every onSubmittedWorkDone would tell the client it can reuse
+  // a buffer while the compositor is still presenting it; that is the bug
+  // that produced the "every-other-cursor-blink frame is decoration-only"
+  // observation. Map (not queue) because the spec says repeated set_release_point
+  // calls on the same commit cycle replace the prior point.
+  private bufferIdToSyncobjRelease = new Map<
+    number, { handle: number; pointHi: number; pointLo: number }>();
+
+  // wp_linux_drm_syncobj_v1 acquire-fence handoff: bufferId -> the sync_file
+  // exported from the most recent commit's acquire timeline point. Consumed by
+  // openImportBrackets the FIRST time we sample that bufferId; on subsequent
+  // samples of the same buffer (kitty re-renders the same buffer across blink
+  // toggles) the implicit-sync fallback engages, which is correct -- the
+  // client signaled their writes when the FIRST acquire point fired; nothing
+  // else is pending on that dmabuf until the buffer is re-committed.
+  //
+  // Keyed by bufferId (not surfaceId) because the fence is paired with the
+  // specific buffer it accompanies. A surface that's still presenting an OLD
+  // buffer while the NEW buffer's import is in flight must NOT consume the
+  // new buffer's fence on its sample of the old one -- that's the
+  // every-third-present bug.
+  private bufferIdToAcquireFenceFd = new Map<
+    number, import("../types.js").WaylandFd>();
 
   // Submit-serial bookkeeping. completedSerial is what onSubmittedWorkDone
   // turns into gpuCompleted(serial) events; both also drive afterCurrentFrame.
@@ -1516,17 +1554,37 @@ export class JsCompositor implements CompositorSink {
   // let the lifecycle drive the rest.)
   commitSurfaceDmabuf(id: number, fd: WaylandFd, w: number, h: number, fourcc: number,
                       modHi: number, modLo: number, offset: number, stride: number,
-                      bufferId: number): boolean {
+                      bufferId: number,
+                      acquireFenceFd?: WaylandFd): boolean {
     if (!this.dawn || this.deviceHandle === 0n) {
       if (!this.warnedDmabuf) {
         log.warn("core", "js-compositor: dmabuf needs dawn.wrapTexture + deviceHandle");
         this.warnedDmabuf = true;
+      }
+      // Caller owns the WaylandFd on a false return; close the explicit-sync
+      // fence (if any) so it doesn't leak.
+      if (acquireFenceFd && !acquireFenceFd.closed) {
+        try { acquireFenceFd.close(); } catch { /* already closed */ }
       }
       return false;
     }
 
     // Ensure the surface exists (the layout sweep may not have created it).
     if (!this.surfaces.has(id)) this.surfaces.set(id, blankSurface(0, 0, 0, 0));
+
+    // wp_linux_drm_syncobj_v1: stash the explicit-sync acquire fence keyed by
+    // BUFFER (not surface). openImportBrackets consumes the fence the first
+    // time it samples this bufferId; on re-samples of the same buffer the
+    // implicit fallback engages (which is correct: the client signaled their
+    // writes on the first acquire point; subsequent samples are read-only on
+    // an unchanged dmabuf). Replacing a stale fence for the same bufferId is
+    // the legitimate case where a client commits the same buffer twice with
+    // two acquire points -- the newer one wins; close the older one.
+    if (acquireFenceFd) {
+      const prev = this.bufferIdToAcquireFenceFd.get(bufferId);
+      if (prev && !prev.closed) { try { prev.close(); } catch { /* */ } }
+      this.bufferIdToAcquireFenceFd.set(bufferId, acquireFenceFd);
+    }
 
     // Stash the descriptor BEFORE the commit event: if the lifecycle emits an
     // importBuffer intent, the intent handler reads dmabufPending to find the
@@ -1569,6 +1627,19 @@ export class JsCompositor implements CompositorSink {
     }
 
     return true;
+  }
+
+  // wp_linux_drm_syncobj_v1: record the release point for `bufferId`. Signaled
+  // when the client-buffer-lifecycle emits sendWlRelease for the same bufferId
+  // (mirroring wl_buffer.release semantics: buffer is superseded AND its last
+  // GPU sample is done). Replaces any prior release point for this bufferId
+  // (the spec says a repeated set_release_point on the same commit cycle
+  // replaces the prior; we extend that to "the latest commit using this
+  // bufferId wins" which is what kitty actually does -- it cycles a pool of
+  // buffers, each commit's release_point is fresh).
+  setBufferReleasePoint(bufferId: number, handle: number,
+                        pointHi: number, pointLo: number): void {
+    this.bufferIdToSyncobjRelease.set(bufferId, { handle, pointHi, pointLo });
   }
 
   // Wire a (possibly-just-imported) cached GPU import into the given surface:
@@ -1636,7 +1707,20 @@ export class JsCompositor implements CompositorSink {
     switch (intent.kind) {
       case "importBuffer": this.runImportBuffer(intent.bufferId); break;
       case "releaseImport": this.runReleaseImport(intent.bufferId); break;
-      case "sendWlRelease": this.freed.push(intent.bufferId); break;
+      case "sendWlRelease": {
+        this.freed.push(intent.bufferId);
+        // wp_linux_drm_syncobj_v1: signal the recorded release point in the
+        // SAME atomic step the wire layer sends wl_buffer.release. Same
+        // semantic ("buffer free for reuse"), driven by the same lifecycle
+        // event. If this bufferId has no explicit-sync release point
+        // (implicit-sync client), the map miss is the no-op fallback.
+        const rp = this.bufferIdToSyncobjRelease.get(intent.bufferId);
+        if (rp) {
+          this.bufferIdToSyncobjRelease.delete(intent.bufferId);
+          this.addon.syncobjTimelineSignal(rp.handle, rp.pointHi, rp.pointLo);
+        }
+        break;
+      }
       case "beginAccess":
       case "endAccess":
         // The actual GPU-process BeginAccess/EndAccess are written in-band in
@@ -1735,6 +1819,22 @@ export class JsCompositor implements CompositorSink {
         s.bindGroup = null;
         s.present = false;
       }
+    }
+    // wp_linux_drm_syncobj_v1: the buffer is going away without a normal
+    // release path (bufferDestroyed or surfaceRemoved teardown). Per spec
+    // "release point delivery is undefined" once the surface is gone or
+    // wl_buffer is destroyed without release; drop the recorded point.
+    // (We do NOT signal it -- the client tore down the buffer; nothing is
+    // waiting on the point.) Without this, the map leaks one entry per
+    // destroyed buffer over the run.
+    this.bufferIdToSyncobjRelease.delete(bufferId);
+    // Same for any pending acquire fence stashed for a buffer that never got
+    // sampled (e.g. the surface tore down before the import resolved). Close
+    // the fence fd so we do not leak it.
+    const stale = this.bufferIdToAcquireFenceFd.get(bufferId);
+    if (stale) {
+      if (!stale.closed) { try { stale.close(); } catch { /* */ } }
+      this.bufferIdToAcquireFenceFd.delete(bufferId);
     }
     // Native release: drops the server-side STM + texture + dmabuf fd.
     if (imp.importId !== 0) this.addon.releaseDmabufImport(imp.importId);
@@ -2095,7 +2195,28 @@ export class JsCompositor implements CompositorSink {
       // writeBeginAccess therefore must succeed; a false return means the
       // JS-side import gate and the core's jsImportHandles_ map have desynced
       // -- a contract violation, not a recoverable per-frame condition.
-      if (!this.addon.writeBeginAccess(imp.importId)) {
+      //
+      // wp_linux_drm_syncobj_v1: if the surface has an explicit-sync acquire
+      // fence stashed from the most recent commit, hand it to the GPU process
+      // via writeBeginAccessWithFence. The GPU process then waits on THAT
+      // sync_file as the acquire fence instead of running EXPORT_SYNC_FILE on
+      // the dmabuf (the implicit-sync path) -- this is the fix for clients
+      // like the NVIDIA proprietary driver that don't attach implicit fences.
+      // Consumed one-shot per commit; an explicit fence covers one Begin.
+      let beginOk: boolean;
+      // Consume a per-buffer acquire fence if one is pending for THIS bufferId.
+      // The fence is one-shot per commit: kitty signals the acquire timeline
+      // point when its GPU writes complete; once Dawn waits on it for our
+      // first sample of the buffer, no later sample of the same buffer needs
+      // a fence (the dmabuf isn't being written until the client re-commits).
+      const fenceFd = this.bufferIdToAcquireFenceFd.get(s.currentBufferId);
+      if (fenceFd && !fenceFd.closed) {
+        this.bufferIdToAcquireFenceFd.delete(s.currentBufferId);
+        beginOk = this.addon.writeBeginAccessWithFence(imp.importId, fenceFd);
+      } else {
+        beginOk = this.addon.writeBeginAccess(imp.importId);
+      }
+      if (!beginOk) {
         throw new Error(
           `writeBeginAccess returned false for live import ` +
           `(bufferId=${s.currentBufferId}, importId=${imp.importId}): ` +

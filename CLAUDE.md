@@ -161,6 +161,17 @@ and cleaned up carefully.
   symptom is "second test in the file appears to hang." Redirect to a file
   (`> /tmp/test.log 2>&1`) and the same suite runs to completion. **If you
   think a GPU test has hung, redirect to a file before concluding so.**
+- **ALWAYS capture full output to a file on the FIRST run, not the second.**
+  When you run `npm test` (or any longish test command), redirect to a file
+  on that first invocation -- do NOT rely on grep'ing `npm test 2>&1 | tail`
+  output and then re-running to dig for failures. Re-running 2.5 minutes of
+  GPU tests just to read the failure context is a waste. The pattern:
+  ```
+  npm test > /tmp/overdraw-test-run.log 2>&1; echo exit=$?
+  ```
+  Then `grep -nE "✖|fail" /tmp/overdraw-test-run.log` and `read` the file at
+  the failure line offset. Same goes for `npm run build`, `cmake --build`,
+  etc. The log file is cheap; a second run is not.
 
 ## Testing policy (new protocols)
 

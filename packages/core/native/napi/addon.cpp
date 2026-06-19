@@ -16,6 +16,8 @@
 #include <sys/sysmacros.h>  // minor()
 #include <unistd.h>
 
+#include <xf86drm.h>
+
 #include <cstdio>
 #include <cstring>
 #include <memory>
@@ -153,6 +155,18 @@ struct Addon {
     // Host-side reader for the GPU process's log socket. Started after
     // spawnGpuProcess returns; stops on Stop().
     std::unique_ptr<overdraw::log::IpcSource> logSource;
+
+    // DRM fd used for explicit-sync (wp_linux_drm_syncobj_v1) ioctls:
+    // drmSyncobjFDToHandle, drmSyncobjExportSyncFile, drmSyncobjTimelineSignal,
+    // drmSyncobjDestroy. Resolved on first use by syncobjFd():
+    //   - KMS mode: aliases drmCardFd (libseat-owned; not closed here).
+    //   - Nested mode: a /dev/dri/renderD* we open ourselves (derived from the
+    //     GPU process's dmabuf-feedback main_device) and close in Stop().
+    // syncobjFdOwned distinguishes the two so Stop() only closes the fd we
+    // opened. Syncobj handles are per-fd-context, so every ioctl against a
+    // handle must use this same fd.
+    int syncobjFdValue = -1;
+    bool syncobjFdOwned = false;
 };
 Addon g_addon;
 
@@ -1517,6 +1531,28 @@ napi_value WriteBeginAccess(napi_env env, napi_callback_info info) {
     napi_value out; napi_get_boolean(env, ok, &out); return out;
 }
 
+// writeBeginAccessWithFence(importId, acquireFenceFd: WaylandFd) -> bool.
+// In-band per-frame BeginAccess that ATTACHES the given sync_file fd via
+// SCM_RIGHTS. The GPU process uses it as the Dawn acquire fence instead of
+// running EXPORT_SYNC_FILE on the dmabuf (the implicit-sync path). Driven by
+// wp_linux_drm_syncobj_v1: the JS layer exports a sync_file from the client's
+// acquire timeline point and hands it here. Consumes the WaylandFd (the wire
+// serializer dups; we close the original).
+napi_value WriteBeginAccessWithFence(napi_env env, napi_callback_info info) {
+    size_t argc = 2; napi_value argv[2];
+    napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+    if (!g_addon.compositor) { napi_value f; napi_get_boolean(env, false, &f); return f; }
+    uint32_t importId = 0;
+    napi_get_value_uint32(env, argv[0], &importId);
+    int fenceFd = overdraw::wayland::takeWaylandFd(env, argv[1]);
+    if (importId == 0 || fenceFd < 0) {
+        if (fenceFd >= 0) ::close(fenceFd);
+        napi_value f; napi_get_boolean(env, false, &f); return f;
+    }
+    const bool ok = g_addon.compositor->writeClientTexBeginAccessWithFence(importId, fenceFd);
+    napi_value out; napi_get_boolean(env, ok, &out); return out;
+}
+
 // writeEndAccess(importId) -> undefined. In-band per-frame EndAccess: write a
 // kind=2 frame on the core WIRE socket. Its FIFO position after the submit's
 // wire batch guarantees the GPU process closes the bracket only after decoding
@@ -1604,6 +1640,14 @@ napi_value Stop(napi_env env, napi_callback_info) {
         g_addon.libinputBackend = nullptr;
 #endif
     }
+    // Close the syncobj DRM fd. In KMS mode this aliased drmCardFd and is
+    // closed below with the card; in nested mode we opened it and must close
+    // it here.
+    if (g_addon.syncobjFdValue >= 0 && g_addon.syncobjFdOwned) {
+        ::close(g_addon.syncobjFdValue);
+    }
+    g_addon.syncobjFdValue = -1;
+    g_addon.syncobjFdOwned = false;
 #if OVERDRAW_KMS
     // Release the DRM card (if we opened one for KMS) BEFORE closing the seat,
     // so libseat's accounting stays consistent.
@@ -2244,6 +2288,137 @@ napi_value InjectHostInput(napi_env env, napi_callback_info info) {
 // Node thread when the GPU map completes. Returns false if no capture texture
 // exists (e.g. not headless). Use this (not surfaceReadback) to verify
 // compositing correctness.
+// Resolve (and on first nested-mode call, open) the DRM fd used for syncobj
+// ioctls. In KMS mode this aliases the libseat-owned card fd; in nested mode
+// it lazily opens the /dev/dri/renderD* the GPU process picked. Returns -1
+// only when no DRM device can be located (no compositor + KMS not active).
+int syncobjFd() {
+    if (g_addon.syncobjFdValue >= 0) return g_addon.syncobjFdValue;
+#if OVERDRAW_KMS
+    if (g_addon.drmCardFd >= 0) {
+        // Borrow libseat's card fd. syncobj ioctls don't need exclusive
+        // ownership and don't disturb KMS state.
+        g_addon.syncobjFdValue = g_addon.drmCardFd;
+        g_addon.syncobjFdOwned = false;
+        return g_addon.syncobjFdValue;
+    }
+#endif
+    // Nested (or KMS bring-up failed before card open): open the same
+    // render node the GPU process picked. Falls back to renderD128 when
+    // dmabuf-feedback main_device isn't available yet.
+    std::string node = "/dev/dri/renderD128";
+    if (g_addon.compositor) {
+        uint64_t dev = g_addon.compositor->dmabufFeedback().mainDevice;
+        if (dev != 0) {
+            node = "/dev/dri/renderD" + std::to_string(minor(static_cast<dev_t>(dev)));
+        }
+    }
+    int fd = ::open(node.c_str(), O_RDWR | O_CLOEXEC);
+    if (fd < 0) {
+        std::fprintf(stderr, "[overdraw] syncobjFd: open %s failed errno=%d\n",
+                     node.c_str(), errno);
+        return -1;
+    }
+    g_addon.syncobjFdValue = fd;
+    g_addon.syncobjFdOwned = true;
+    return fd;
+}
+
+// syncobjImportTimeline(timelineFd: WaylandFd) -> handle: number | 0 on failure.
+// Calls drmSyncobjFDToHandle; the returned handle is per-syncobjFd() context.
+// Consumes the WaylandFd (takes its raw fd); the wrapper is left closed.
+napi_value SyncobjImportTimeline(napi_env env, napi_callback_info info) {
+    size_t argc = 1; napi_value argv[1];
+    napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+    int fd = overdraw::wayland::takeWaylandFd(env, argv[0]);
+    if (fd < 0) { napi_value z; napi_create_uint32(env, 0, &z); return z; }
+    int drmFd = syncobjFd();
+    if (drmFd < 0) { ::close(fd); napi_value z; napi_create_uint32(env, 0, &z); return z; }
+    uint32_t handle = 0;
+    int r = drmSyncobjFDToHandle(drmFd, fd, &handle);
+    ::close(fd);  // the kernel duped the underlying syncobj reference
+    if (r != 0) {
+        std::fprintf(stderr, "[overdraw] drmSyncobjFDToHandle failed errno=%d\n", errno);
+        napi_value z; napi_create_uint32(env, 0, &z); return z;
+    }
+    napi_value out; napi_create_uint32(env, handle, &out); return out;
+}
+
+// syncobjDestroy(handle) -> undefined. Releases a handle imported via
+// syncobjImportTimeline. Caller (the timeline's destroy handler) ensures this
+// is the matching destroy.
+napi_value SyncobjDestroy(napi_env env, napi_callback_info info) {
+    size_t argc = 1; napi_value argv[1];
+    napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+    uint32_t handle = 0;
+    napi_get_value_uint32(env, argv[0], &handle);
+    int drmFd = g_addon.syncobjFdValue;
+    if (drmFd >= 0 && handle != 0) {
+        drmSyncobjDestroy(drmFd, handle);
+    }
+    return nullptr;
+}
+
+// syncobjExportSyncFile(handle, pointHi, pointLo) -> WaylandFd | null.
+// Materializes the fence at (handle, point) into a sync_file fd suitable for
+// passing to the GPU process (Dawn's SharedFenceSyncFD). The DRM uAPI has no
+// direct export-from-timeline ioctl, so the sequence is: create a fresh
+// binary syncobj, drmSyncobjTransfer (handle, point) -> (binary, 0),
+// drmSyncobjExportSyncFile on the binary, destroy the binary.
+napi_value SyncobjExportSyncFile(napi_env env, napi_callback_info info) {
+    size_t argc = 3; napi_value argv[3];
+    napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+    uint32_t handle = 0, hi = 0, lo = 0;
+    napi_get_value_uint32(env, argv[0], &handle);
+    napi_get_value_uint32(env, argv[1], &hi);
+    napi_get_value_uint32(env, argv[2], &lo);
+    int drmFd = syncobjFd();
+    if (drmFd < 0 || handle == 0) { napi_value n; napi_get_null(env, &n); return n; }
+    uint64_t point = (static_cast<uint64_t>(hi) << 32) | lo;
+
+    uint32_t bin = 0;
+    if (drmSyncobjCreate(drmFd, 0, &bin) != 0) {
+        std::fprintf(stderr, "[overdraw] drmSyncobjCreate failed errno=%d\n", errno);
+        napi_value n; napi_get_null(env, &n); return n;
+    }
+    int syncFileFd = -1;
+    if (drmSyncobjTransfer(drmFd, bin, 0, handle, point, 0) != 0) {
+        std::fprintf(stderr, "[overdraw] drmSyncobjTransfer (export) failed errno=%d\n", errno);
+        drmSyncobjDestroy(drmFd, bin);
+        napi_value n; napi_get_null(env, &n); return n;
+    }
+    if (drmSyncobjExportSyncFile(drmFd, bin, &syncFileFd) != 0) {
+        std::fprintf(stderr, "[overdraw] drmSyncobjExportSyncFile failed errno=%d\n", errno);
+        drmSyncobjDestroy(drmFd, bin);
+        napi_value n; napi_get_null(env, &n); return n;
+    }
+    drmSyncobjDestroy(drmFd, bin);
+    return overdraw::wayland::makeWaylandFd(env, syncFileFd);
+}
+
+// syncobjTimelineSignal(handle, pointHi, pointLo) -> boolean.
+// Signal the (handle, point) timeline point. Called from JS when the
+// compositor's GPU sample submit completes (queue.onSubmittedWorkDone),
+// so the client's release_point fires and the buffer can be re-used.
+napi_value SyncobjTimelineSignal(napi_env env, napi_callback_info info) {
+    size_t argc = 3; napi_value argv[3];
+    napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+    uint32_t handle = 0, hi = 0, lo = 0;
+    napi_get_value_uint32(env, argv[0], &handle);
+    napi_get_value_uint32(env, argv[1], &hi);
+    napi_get_value_uint32(env, argv[2], &lo);
+    int drmFd = syncobjFd();
+    if (drmFd < 0 || handle == 0) {
+        napi_value f; napi_get_boolean(env, false, &f); return f;
+    }
+    uint64_t point = (static_cast<uint64_t>(hi) << 32) | lo;
+    const bool ok = drmSyncobjTimelineSignal(drmFd, &handle, &point, 1) == 0;
+    if (!ok) {
+        std::fprintf(stderr, "[overdraw] drmSyncobjTimelineSignal failed errno=%d\n", errno);
+    }
+    napi_value out; napi_get_boolean(env, ok, &out); return out;
+}
+
 // dmabufFeedbackInfo() -> {
 //   formatTableFd: WaylandFd, formatTableSize, entryCount,
 //   mainDevice: Uint8Array(dev_t bytes), trancheFormats: Uint8Array(u16 indices)
@@ -2319,6 +2494,11 @@ napi_value Init(napi_env env, napi_value exports) {
     napi_create_function(env, "writeBeginAccess", NAPI_AUTO_LENGTH,
                          WriteBeginAccess, nullptr, &fnWriteBeginAccess);
     napi_set_named_property(env, exports, "writeBeginAccess", fnWriteBeginAccess);
+    napi_value fnWriteBeginAccessFence;
+    napi_create_function(env, "writeBeginAccessWithFence", NAPI_AUTO_LENGTH,
+                         WriteBeginAccessWithFence, nullptr, &fnWriteBeginAccessFence);
+    napi_set_named_property(env, exports, "writeBeginAccessWithFence",
+                            fnWriteBeginAccessFence);
     napi_value fnWriteEndAccess;
     napi_create_function(env, "writeEndAccess", NAPI_AUTO_LENGTH,
                          WriteEndAccess, nullptr, &fnWriteEndAccess);
@@ -2359,6 +2539,10 @@ napi_value Init(napi_env env, napi_value exports) {
     reg("wake", Wake);
     reg("resolveCursorShape", ResolveCursorShape);
     reg("dmabufFeedbackInfo", DmabufFeedbackInfo);
+    reg("syncobjImportTimeline", SyncobjImportTimeline);
+    reg("syncobjDestroy", SyncobjDestroy);
+    reg("syncobjExportSyncFile", SyncobjExportSyncFile);
+    reg("syncobjTimelineSignal", SyncobjTimelineSignal);
     reg("pluginCreateConnection", PluginCreateConnection);
     reg("pluginInjectInstance", PluginInjectInstance);
     reg("pluginSetTickDevice", PluginSetTickDevice);

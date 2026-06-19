@@ -127,6 +127,31 @@ export interface Addon {
   // desync the caller surfaces).
   writeBeginAccess(importId: number): boolean;
   writeEndAccess(importId: number): void;
+  // Same as writeBeginAccess, but additionally attaches `acquireFenceFd` (a
+  // sync_file fd from wp_linux_drm_syncobj_v1's acquire timeline point) to
+  // the BeginAccess wire frame via SCM_RIGHTS. The GPU process uses that
+  // fence as the Dawn acquire fence INSTEAD of running EXPORT_SYNC_FILE on
+  // the dmabuf -- this is the explicit-sync path required for clients (e.g.
+  // NVIDIA proprietary) that do not attach implicit fences to their dmabufs.
+  // Consumes the WaylandFd. Returns false iff the import is unknown (same
+  // JS-gate contract as writeBeginAccess).
+  writeBeginAccessWithFence(importId: number, acquireFenceFd: WaylandFd): boolean;
+  // wp_linux_drm_syncobj_v1 explicit-sync syncobj operations. The DRM fd is
+  // opened lazily by the addon (KMS card fd in KMS mode; render node in
+  // nested mode). All handles are per-fd-context: every ioctl against a
+  // handle must use the same DRM fd, which is why these calls live in the
+  // addon rather than being open-coded in JS.
+  //   syncobjImportTimeline consumes the WaylandFd (drmSyncobjFDToHandle);
+  //     returns 0 on failure.
+  //   syncobjDestroy releases an imported timeline handle.
+  //   syncobjExportSyncFile materializes (handle, point) into a sync_file
+  //     WaylandFd suitable for writeBeginAccessWithFence; null on failure.
+  //   syncobjTimelineSignal signals (handle, point) -- the client's
+  //     release_point fires after the compositor's GPU sample completes.
+  syncobjImportTimeline(fd: WaylandFd): number;
+  syncobjDestroy(handle: number): void;
+  syncobjExportSyncFile(handle: number, pointHi: number, pointLo: number): WaylandFd | null;
+  syncobjTimelineSignal(handle: number, pointHi: number, pointLo: number): boolean;
 
   // Plugin GPU brokering (core side; the Worker owns the wire client). Callbacks
   // are node-style (result|null or ok); the broker Promise-wraps them.

@@ -393,6 +393,14 @@ class Compositor {
     // unknown -- the JS side gates Begin on the import being live, so a miss is
     // a JS-gate bug the caller should surface.
     bool writeClientTexBeginAccess(uint32_t importId);
+    // Same as writeClientTexBeginAccess, but additionally attaches a sync_file
+    // fd as SCM_RIGHTS on the BeginAccess frame. The GPU process uses that fd
+    // as the Dawn acquire fence INSTEAD of running EXPORT_SYNC_FILE on the
+    // dmabuf (the implicit-sync path). Driven by wp_linux_drm_syncobj_v1:
+    // the JS layer exports the sync_file from the client's acquire timeline
+    // point and hands it here. Takes ownership of acquireFenceFd (closes it on
+    // failure; on success the wire serializer dups it for in-flight retention).
+    bool writeClientTexBeginAccessWithFence(uint32_t importId, int acquireFenceFd);
     void writeClientTexEndAccess(uint32_t importId);
 
     // In-band consumer Begin/End on a plugin surface buffer: write a kind=1/

@@ -113,6 +113,28 @@ function reconcileBufferDamage(
   return out;
 }
 
+// Promote a per-commit (acquire, release) pair into the surface's state for
+// the upload path (acquire) and the GPU-completion path (release). Only
+// honored when the committed buffer is a dmabuf; for shm or no-buffer commits
+// the points are dropped (spec's unsupported_buffer / no_buffer territory --
+// silent-drop here per the no post_error convention).
+function promoteSyncobjForCommit(
+  s: SurfaceRecord,
+  acq: import("./ctx.js").SyncobjPoint | undefined,
+  rel: import("./ctx.js").SyncobjPoint | undefined,
+  ctx: Ctx,
+): void {
+  const buf = s.committed.buffer;
+  const desc = buf ? ctx.state.buffers?.get(buf) : undefined;
+  if (!desc?.dmabuf) return;
+  if (acq) s.acquireForUpload = acq;
+  if (rel) s.committed.syncobjRelease = rel;
+  // Note: the release point is registered on the compositor in uploadBuffer
+  // (it needs the bufferId, which is assigned inside the upload path). That
+  // registration triggers signaling when the lifecycle's sendWlRelease for
+  // the same bufferId fires -- the same atomic point as wl_buffer.release.
+}
+
 // Apply one surface's committed buffer to the GPU (upload/import). Sets
 // hasContent. Releases shm buffers (copied at upload). dmabuf import is async.
 function uploadBuffer(ctx: Ctx, s: SurfaceRecord, buffer: Resource | null): void {
@@ -120,10 +142,43 @@ function uploadBuffer(ctx: Ctx, s: SurfaceRecord, buffer: Resource | null): void
   const desc = ctx.state.buffers?.get(buffer);
   if (desc && desc.dmabuf && desc.fd) {
     const bufferId = bufferIdOf(ctx, buffer);
+    // Explicit-sync (wp_linux_drm_syncobj_v1): when commit() promoted an
+    // acquire point, export a sync_file from it here (one-shot, per-commit)
+    // and hand it to the compositor. The compositor passes it to the GPU
+    // process at BeginAccess time INSTEAD of running the implicit-sync
+    // EXPORT_SYNC_FILE on the dmabuf -- this is the fix for the NVIDIA
+    // flicker race. No acquire point = implicit-sync fallback.
+    let acquireFenceFd: import("../types.js").WaylandFd | null = null;
+    const acqPt = s.acquireForUpload;
+    if (acqPt) {
+      acquireFenceFd = ctx.addon.syncobjExportSyncFile(
+        acqPt.handle, acqPt.pointHi, acqPt.pointLo);
+      s.acquireForUpload = undefined;  // one-shot
+    }
+    // Register the release point on the compositor BEFORE the commit
+    // (commit may trigger immediate intents, including a sendWlRelease for
+    // an earlier buffer; binding by bufferId keeps the two paths
+    // independent). The release point is signaled when the
+    // client-buffer-lifecycle emits sendWlRelease for this bufferId --
+    // same atomic step the wire layer sends wl_buffer.release. Cleared
+    // after registration so a follow-up commit with no new release point
+    // does not re-register the stale one.
+    const relPt = s.committed.syncobjRelease;
+    if (relPt) {
+      ctx.state.compositor.setBufferReleasePoint?.(
+        bufferId, relPt.handle, relPt.pointHi, relPt.pointLo);
+      s.committed.syncobjRelease = undefined;
+    }
     const ok = ctx.state.compositor.commitSurfaceDmabuf(
       s.id, desc.fd, desc.width, desc.height, desc.format,
-      desc.modifierHi ?? 0, desc.modifierLo ?? 0, desc.offset, desc.stride, bufferId);
+      desc.modifierHi ?? 0, desc.modifierLo ?? 0, desc.offset, desc.stride, bufferId,
+      acquireFenceFd ?? undefined);
     if (ok) { ctx.state.lastCommittedSurfaceId = s.id; s.hasContent = true; }
+    else if (acquireFenceFd && !acquireFenceFd.closed) {
+      // Commit refused (no Dawn wire / no device). Close our sync_file dup so
+      // we don't leak the fd; the GPU process never sees it.
+      try { acquireFenceFd.close(); } catch { /* already closed */ }
+    }
   } else if (desc && desc.poolId) {
     const damage = reconcileBufferDamage(s, desc.width, desc.height);
     const ok = ctx.state.compositor.commitSurfaceBuffer(
@@ -336,6 +391,17 @@ export default function makeSurface(ctx: Ctx): WlSurfaceHandler {
         s.pending.bufferDamage = undefined;
       }
 
+      // wp_linux_drm_syncobj_v1: acquire/release timeline points are
+      // double-buffered, applied to exactly one commit. The spec error checks
+      // (no_buffer / no_acquire_point / no_release_point / conflicting_points)
+      // would fire here in a compositor with wl_resource_post_error; today
+      // we silently drop the point on violation (status.md "no post_error").
+      // What we DO enforce locally: only honor points when a dmabuf buffer
+      // accompanies them -- otherwise the points are dropped (the shm path
+      // has no fence to wait on and no submit-completion to signal).
+      // promotePoints lives below the layer-shell discard so a discarded
+      // initial commit doesn't carry phantom points forward.
+
       // Layer-shell: a buffer attached before the first configure-ack is
       // invalid_surface_state per spec. Silent-drop convention (no
       // post_error path in this compositor today; see top of
@@ -344,6 +410,16 @@ export default function makeSurface(ctx: Ctx): WlSurfaceHandler {
       if (s.layerSurface && isLayerSurfaceInitialCommit(s.layerSurface) && s.committed.buffer) {
         s.committed.buffer = null;
       }
+
+      // Promote the pending syncobj points. Only honored when a dmabuf is
+      // attached this commit (a buffer-less commit drops the points outright;
+      // an shm commit logs and drops, since explicit-sync is undefined there
+      // -- spec's unsupported_buffer error). Cleared from pending whatever the
+      // outcome so they don't leak forward.
+      const pendAcq = s.pending.syncobjAcquire;
+      const pendRel = s.pending.syncobjRelease;
+      s.pending.syncobjAcquire = undefined;
+      s.pending.syncobjRelease = undefined;
 
       if (effectiveSync(ctx, s)) {
         // Synchronized subsurface: CACHE this commit; do not apply. The cache is
@@ -380,6 +456,10 @@ export default function makeSurface(ctx: Ctx): WlSurfaceHandler {
           s.cached.viewportDst = s.pending.viewportDst;
           s.pending.viewportDst = undefined;
         }
+        // Cache the syncobj points to be promoted alongside the buffer when
+        // the parent commits.
+        if (pendAcq) s.cached.syncobjAcquire = pendAcq;
+        if (pendRel) s.cached.syncobjRelease = pendRel;
       } else {
         // Desynchronized (incl. main surface): apply now. If a cache exists (e.g.
         // it was sync then switched to desync), it is flushed as part of apply.
@@ -408,7 +488,17 @@ export default function makeSurface(ctx: Ctx): WlSurfaceHandler {
           if (s.cached.viewportDst !== undefined) {
             s.pending.viewportDst = s.cached.viewportDst;
           }
+          // Flushed cached syncobj points alongside the buffer.
+          const cachedAcq = s.cached.syncobjAcquire;
+          const cachedRel = s.cached.syncobjRelease;
           s.cached = undefined;
+          if (cachedAcq || cachedRel) {
+            promoteSyncobjForCommit(s, cachedAcq, cachedRel, ctx);
+          }
+        }
+        // Desync promotion of THIS commit's own pending points (if any).
+        if (pendAcq || pendRel) {
+          promoteSyncobjForCommit(s, pendAcq, pendRel, ctx);
         }
         applySurfaceState(ctx, s);
       }

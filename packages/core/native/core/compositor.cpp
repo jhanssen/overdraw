@@ -756,6 +756,26 @@ bool Compositor::writeClientTexBeginAccess(uint32_t importId) {
     return true;
 }
 
+bool Compositor::writeClientTexBeginAccessWithFence(uint32_t importId, int acquireFenceFd) {
+    auto wh = jsImportHandles_.find(importId);
+    if (wh == jsImportHandles_.end()) {
+        std::fprintf(stderr,
+            "[core] writeClientTexBeginAccessWithFence: no handle for importId=%u\n",
+            importId);
+        if (acquireFenceFd >= 0) ::close(acquireFenceFd);
+        return false;
+    }
+    ipc::ClientTexAccessPayload payload{wh->second.id, wh->second.generation};
+    uint8_t buf[ipc::ClientTexAccessPayload::kSize];
+    payload.encode(buf);
+    const int fds[1] = { acquireFenceFd };
+    const bool ok = link_->appendFrameWithFds(ipc::FrameKind::BeginAccessWithFence,
+                                              buf, sizeof(buf), fds, 1);
+    // appendFrameWithFds dups its fds into the wire queue; we always close ours.
+    ::close(acquireFenceFd);
+    return ok;
+}
+
 void Compositor::writeClientTexEndAccess(uint32_t importId) {
     auto wh = jsImportHandles_.find(importId);
     if (wh == jsImportHandles_.end()) {

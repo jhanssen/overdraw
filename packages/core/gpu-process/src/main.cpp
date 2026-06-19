@@ -1160,15 +1160,17 @@ int run(int wireFd, int ctrlFd, int inputFd, bool headless,
         serializer.appendFrame(ipc::FrameKind::ClientTexImported, rbuf, sizeof(rbuf));
     };
 
-    // Open a per-frame BeginAccess on a cached client texture. Re-exports the
-    // dmabuf's implicit-sync acquire fence at THIS moment (covers all of the
-    // client's writes up to now, including ones from re-commits since the last
-    // sample -- this is the fix for the same-buffer re-commit flicker), and
-    // chains the prior frame's EndAccess fence too. Sends BeginClientAccessDone
-    // back (round-trip; the core only flushes wire sample commands after the
-    // reply lands, because ctrl-after-wire is the only one-way ordering the
-    // existing infrastructure provides).
-    auto runBeginClientAccess = [&](uint32_t textureId, uint32_t textureGen) -> bool {
+    // Open a per-frame BeginAccess on a cached client texture. When the core
+    // passes an explicit acquire sync_file fd (>= 0) -- the wp_linux_drm_syncobj_v1
+    // path -- that fd is used as the Dawn acquire fence. Otherwise the dmabuf's
+    // implicit-sync acquire fence is re-exported here via EXPORT_SYNC_FILE
+    // (the implicit-sync path). Either way, the prior frame's EndAccess fence
+    // is also chained so Dawn waits on both.
+    //
+    // explicitAcquireFd, when >= 0, is owned by this function (it closes it
+    // after import).
+    auto runBeginClientAccess = [&](uint32_t textureId, uint32_t textureGen,
+                                    int explicitAcquireFd) -> bool {
         auto it = clientTextures.find(textureId);
         if (it == clientTextures.end() || it->second.generation != textureGen) {
             std::fprintf(stderr,
@@ -1188,15 +1190,19 @@ int run(int wireFd, int ctrlFd, int inputFd, bool headless,
             std::fprintf(stderr,
                 "[gpu] BeginClientAccess: bracket already open on {%u,%u}\n",
                 textureId, textureGen);
+            if (explicitAcquireFd >= 0) ::close(explicitAcquireFd);
             return false;
         }
 
-        // Acquire fence: the dmabuf's current implicit-sync read-acquire
-        // sync_file. Covers every write the client has issued on this dmabuf
-        // up to this ioctl. Re-running the ioctl per-frame is the per-commit
-        // re-export the spec calls for (functionally equivalent: the latest
-        // sync_file dominates any earlier one).
-        int syncFd = exportDmabufAcquireFence(ct.fd);
+        // Acquire fence: explicit when the core (wp_linux_drm_syncobj_v1) sent
+        // a sync_file fd alongside this BeginAccess; otherwise the dmabuf's
+        // current implicit-sync read-acquire sync_file. Explicit sync is
+        // required for clients (e.g. the NVIDIA proprietary driver) that do
+        // not attach implicit fences to their dmabufs -- their EXPORT_SYNC_FILE
+        // returns an already-signaled stub fence, so without the explicit path
+        // the compositor's sample races the client's pending GPU writes.
+        int syncFd = explicitAcquireFd;
+        if (syncFd < 0) syncFd = exportDmabufAcquireFence(ct.fd);
         wgpu::SharedFence acquireFence;
         if (syncFd >= 0) {
             wgpu::SharedFenceSyncFDDescriptor sfd{};
@@ -1374,9 +1380,37 @@ int run(int wireFd, int ctrlFd, int inputFd, bool headless,
             }
             uint32_t texId = ipc::getU32LE(frame.data() + 1);
             uint32_t texGen = ipc::getU32LE(frame.data() + 5);
-            bool ok = (kind == ipc::FrameKind::BeginAccess)
-                          ? runBeginClientAccess(texId, texGen)
-                          : (runEndClientAccess(texId, texGen), true);
+            bool ok;
+            if (kind == ipc::FrameKind::BeginAccess) {
+                // Implicit-sync BeginAccess: zero fds (BeginAccessWithFence
+                // carries the explicit-sync fd as kind=5 instead).
+                if (nfds != 0) {
+                    std::fprintf(stderr,
+                        "[gpu] core wire: BeginAccess with nfds=%d (must be 0; "
+                        "explicit sync uses BeginAccessWithFence)\n", nfds);
+                    std::abort();
+                }
+                ok = runBeginClientAccess(texId, texGen, -1);
+            } else if (kind == ipc::FrameKind::BeginAccessWithFence) {
+                // Explicit-sync (wp_linux_drm_syncobj_v1) BeginAccess: exactly
+                // one SCM_RIGHTS fd, a sync_file the GPU process passes to
+                // Dawn as the acquire fence instead of EXPORT_SYNC_FILE.
+                if (nfds != 1 || !fds) {
+                    std::fprintf(stderr,
+                        "[gpu] core wire: BeginAccessWithFence with nfds=%d (must be 1)\n",
+                        nfds);
+                    std::abort();
+                }
+                ok = runBeginClientAccess(texId, texGen, fds[0]);
+            } else {
+                if (nfds != 0) {
+                    std::fprintf(stderr,
+                        "[gpu] core wire: ClientTex End with nfds=%d (must be 0)\n", nfds);
+                    std::abort();
+                }
+                runEndClientAccess(texId, texGen);
+                ok = true;
+            }
             if (!ok) {
                 std::fprintf(stderr,
                     "[gpu] in-band client-texture Begin failed {%u,%u} -- "
@@ -1421,8 +1455,16 @@ int run(int wireFd, int ctrlFd, int inputFd, bool headless,
                         producer ? "producer" : "consumer", surfaceBufId);
                     std::abort();
                 }
-            } else {
+            } else if (kind == ipc::FrameKind::EndAccess) {
                 runSurfaceEnd(surfaceBufId, producer);
+            } else {
+                // BeginAccessWithFence on a Surface frame is a wire bug:
+                // explicit-sync only applies to client textures.
+                std::fprintf(stderr,
+                    "[gpu] core wire: kind=%u on Surface variant (only client "
+                    "textures support explicit-sync)\n",
+                    static_cast<unsigned>(kind));
+                std::abort();
             }
         } else {
             std::fprintf(stderr, "[gpu] core wire: unknown access variant %u\n",

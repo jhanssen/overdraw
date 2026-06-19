@@ -63,7 +63,8 @@ inline bool setNonBlocking(int fd) {
 // SCM_RIGHTS on the sendmsg that delivers the kind=3 frame.
 enum class FrameKind : uint8_t {
     WireBytes = 0,            // Dawn wire command batch -> WireServer::HandleCommands
-    BeginAccess = 1,          // overdraw BeginAccess bracket (payload: variant + ids)
+    BeginAccess = 1,          // overdraw BeginAccess bracket (payload: variant + ids).
+                              // No SCM_RIGHTS fds.
     EndAccess = 2,            // overdraw EndAccess bracket   (payload: variant + ids)
     ImportClientTex = 3,      // core -> gpu: import a CLIENT dmabuf into a reserved
                               // texture slot. fd attached via SCM_RIGHTS on the
@@ -71,6 +72,12 @@ enum class FrameKind : uint8_t {
     ClientTexImported = 4,    // gpu -> core: import done (ok=1) or failed (ok=0).
                               // No fd; the reply payload echoes the texture handle
                               // so the core's pendingJsImports list matches by id.
+    BeginAccessWithFence = 5, // wp_linux_drm_syncobj_v1 BeginAccess variant: same
+                              // payload as BeginAccess plus exactly ONE SCM_RIGHTS
+                              // fd (the explicit-sync acquire sync_file). Distinct
+                              // kind so the FrameReader knows to claim the fd --
+                              // BeginAccess (kind=1) MUST stay fd-less, otherwise
+                              // a stale fd would leak into the next ImportClientTex.
 };
 
 // Max fds attachable in one message (control msg OR in-band wire frame).
@@ -401,6 +408,7 @@ class FrameReader {
         // on the per-kind fd shape).
         int expect = 0;
         if (kind == FrameKind::ImportClientTex) expect = 1;
+        if (kind == FrameKind::BeginAccessWithFence) expect = 1;
         if (expect > 0) {
             if (static_cast<int>(recvFds_.size()) < expect) {
                 std::fprintf(stderr,

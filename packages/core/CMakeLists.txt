@@ -166,9 +166,11 @@ set_target_properties(overdraw_native PROPERTIES
 target_compile_definitions(overdraw_native PRIVATE
     NODE_GYP_MODULE_NAME=overdraw_native BUILDING_NODE_EXTENSION)
 target_include_directories(overdraw_native PRIVATE
-    ${IPC_INCLUDE} ${NATIVE_INCLUDE} ${NODE_INCLUDE_DIR} ${XKBCOMMON_INCLUDE_DIRS})
+    ${IPC_INCLUDE} ${NATIVE_INCLUDE} ${NODE_INCLUDE_DIR} ${XKBCOMMON_INCLUDE_DIRS}
+    ${LIBDRM_INCLUDE_DIRS})
 target_link_libraries(overdraw_native PRIVATE
-    overdraw_core dawn::webgpu_dawn_wire ${XKBCOMMON_LIBRARIES} pthread dl rt)
+    overdraw_core dawn::webgpu_dawn_wire ${XKBCOMMON_LIBRARIES}
+    ${LIBDRM_LIBRARIES} pthread dl rt)
 # -rdynamic so backtrace_symbols_fd can resolve symbols in the crash handler.
 target_link_options(overdraw_native PRIVATE -rdynamic)
 # N-API symbols (napi_*) are resolved from the host node process at load time;

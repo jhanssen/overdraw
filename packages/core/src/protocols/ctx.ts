@@ -29,6 +29,22 @@ type DamageRect = import("./region.js").RegionRect;
 export interface ViewportSrc { x: number; y: number; width: number; height: number }
 export interface ViewportDst { width: number; height: number }
 
+// wp_linux_drm_syncobj_v1 acquire/release timeline points captured at commit.
+// The timeline handle is the per-DRM-fd handle returned by addon.syncobjImportTimeline
+// (kept alive by the wp_linux_drm_syncobj_timeline_v1 resource). The point is a
+// 64-bit value stored as (hi, lo) u32s to match the wire encoding.
+export interface SyncobjPoint {
+  // Resource of the wp_linux_drm_syncobj_timeline_v1 that owns the DRM handle.
+  // Holding the resource lets a teardown sweep find the syncobj record (which
+  // owns the kernel-side handle); set_acquire_point / set_release_point store
+  // both the resource and the handle so the commit path doesn't need to
+  // re-look-up.
+  timelineResource: import("../types.js").Resource;
+  handle: number;     // DRM syncobj handle (per-addon.syncobjFd context)
+  pointHi: number;
+  pointLo: number;
+}
+
 export interface SurfaceRecord {
   id: number;
   resource: Resource;
@@ -66,12 +82,24 @@ export interface SurfaceRecord {
     // coords (wl_surface.damage_buffer). Promoted to `committed` on commit.
     surfaceDamage?: DamageRect[];
     bufferDamage?: DamageRect[];
+    // wp_linux_drm_syncobj_v1 timeline points set since the last commit.
+    // Cleared (set to undefined) on commit -- the spec is clear that
+    // points apply to exactly one commit and are not carried over.
+    syncobjAcquire?: SyncobjPoint;
+    syncobjRelease?: SyncobjPoint;
   };
   committed: {
     buffer: Resource | null; bufferScale?: number; bufferTransform?: number;
     // Damage for the committed buffer, consumed (and cleared) by the upload.
     surfaceDamage?: DamageRect[];
     bufferDamage?: DamageRect[];
+    // The release timeline point the compositor must signal once it is done
+    // sampling the committed buffer. Set from pending on commit; consumed by
+    // the GPU-completion path (queue.onSubmittedWorkDone -> syncobjTimelineSignal)
+    // and then cleared. Acquire is NOT stored here -- it's exported into a
+    // sync_file and handed straight to the GPU process at commit time, so the
+    // surface record never holds a fence fd.
+    syncobjRelease?: SyncobjPoint;
   };
   cached?: {
     buffer?: Resource | null;
@@ -84,7 +112,22 @@ export interface SurfaceRecord {
     viewportDst?: ViewportDst | null;
     surfaceDamage?: DamageRect[];
     bufferDamage?: DamageRect[];
+    syncobjAcquire?: SyncobjPoint;
+    syncobjRelease?: SyncobjPoint;
   };
+  // Set once the client has called wp_linux_drm_syncobj_manager_v1.get_surface
+  // for this wl_surface. While set, the surface is in explicit-sync mode: an
+  // acquire+release point MUST accompany every buffer-attaching commit (per
+  // protocol; silent-drop on violation in this compositor today), and
+  // wl_buffer.release is suppressed -- the client gets release signaling
+  // exclusively via the release_point.
+  syncobjEnabled?: boolean;
+  // One-shot per-commit slot: the acquire point promoted from `pending`
+  // during commit, consumed by the dmabuf-upload path that exports a
+  // sync_file and hands it to the compositor. Lives outside `committed`
+  // because it is fence-fd material, not state to keep around across
+  // frames; cleared as soon as uploadBuffer reads it.
+  acquireForUpload?: SyncobjPoint;
   // Applied viewport state (from wp_viewport, double-buffered on commit).
   viewportSrc?: ViewportSrc | null;
   viewportDst?: ViewportDst | null;
@@ -144,9 +187,26 @@ export interface CompositorSink {
   commitSurfaceBuffer(id: number, poolId: number, offset: number, w: number,
                       h: number, stride: number,
                       damage?: ReadonlyArray<DamageRect>): boolean;
+  // `acquireFenceFd` (optional) is a sync_file fd exported by the protocol
+  // layer from a wp_linux_drm_syncobj_v1 acquire point. When present, the
+  // compositor passes it to the GPU process at the next BeginAccess for this
+  // bufferId, INSTEAD of the GPU process's implicit-sync EXPORT_SYNC_FILE.
+  // The compositor takes ownership of the WaylandFd (closes / consumes it).
+  // Omit for implicit-sync clients.
   commitSurfaceDmabuf(id: number, fd: WaylandFd, w: number, h: number,
                       fourcc: number, modHi: number, modLo: number,
-                      offset: number, stride: number, bufferId: number): boolean;
+                      offset: number, stride: number, bufferId: number,
+                      acquireFenceFd?: WaylandFd): boolean;
+  // wp_linux_drm_syncobj_v1: record the release timeline point bound to
+  // `bufferId`. Signaled when the client-buffer-lifecycle emits sendWlRelease
+  // for the same bufferId (i.e. the buffer is superseded on its surface AND
+  // its last GPU sample completed) -- the same semantic as wl_buffer.release.
+  // Signaling earlier (e.g. on every submit completion) would tell the
+  // client it can reuse a buffer that the compositor is still presenting.
+  // Optional: GPU-free test sinks may omit it (release signaling is then a
+  // no-op).
+  setBufferReleasePoint?(bufferId: number, handle: number,
+                         pointHi: number, pointLo: number): void;
   setSurfaceLayout(id: number, x: number, y: number, w: number, h: number): void;
   // Resize transaction: freezeSurface synchronously snapshots the surface's
   // current appearance so it keeps showing its pre-resize frame while the WM
@@ -374,6 +434,19 @@ export interface CompositorState {
   xdgOutputResources?: Map<number, Set<Resource>>;
   // wp_viewport resource -> its wl_surface resource (one viewport per surface).
   viewports?: Map<Resource, Resource>;
+  // wp_linux_drm_syncobj_timeline_v1 resource -> the DRM syncobj handle the
+  // addon imported from the client's fd (drmSyncobjFDToHandle). Destroying the
+  // timeline resource releases the handle (drmSyncobjDestroy).
+  syncobjTimelines?: Map<Resource, number>;
+  // wp_linux_drm_syncobj_surface_v1 resource -> the wl_surface resource it is
+  // bound to. The surface record carries the per-commit acquire/release points;
+  // this reverse map exists so the surface object's destroy can clear
+  // syncobjEnabled on the wl_surface, and so manager.get_surface can detect a
+  // double-create (surface_exists).
+  syncobjSurfaces?: Map<Resource, Resource>;
+  // Reverse: wl_surface -> wp_linux_drm_syncobj_surface_v1, for the
+  // surface_exists check in manager.get_surface.
+  syncobjSurfaceBySurface?: Map<Resource, Resource>;
   // Bound wp_fractional_scale_v1 resources, for preferred_scale re-emit.
   fractionalScaleResources?: Set<Resource>;
   // surfaceId -> record, for native->JS lookups keyed by the integer id (e.g. the

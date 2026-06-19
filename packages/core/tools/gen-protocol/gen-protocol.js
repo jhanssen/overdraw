@@ -68,6 +68,7 @@ const DEFAULT_INPUTS = [
   '/usr/share/wayland-protocols/staging/cursor-shape/cursor-shape-v1.xml',
   '/usr/share/wayland-protocols/stable/viewporter/viewporter.xml',
   '/usr/share/wayland-protocols/staging/fractional-scale/fractional-scale-v1.xml',
+  '/usr/share/wayland-protocols/staging/linux-drm-syncobj/linux-drm-syncobj-v1.xml',
   // wlr-* protocols are not in wayland-protocols upstream; vendor copies.
   join(repoRoot, 'protocols', 'wlr-layer-shell-unstable-v1.xml'),
   join(repoRoot, 'protocols', 'wlr-foreign-toplevel-management-unstable-v1.xml'),

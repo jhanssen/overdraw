@@ -58,6 +58,7 @@ const GLOBALS = [
   "zwlr_foreign_toplevel_manager_v1",
   "wp_viewporter",
   "wp_fractional_scale_manager_v1",
+  "wp_linux_drm_syncobj_manager_v1",
 ];
 
 // Interfaces created via requests (new_id), registered without a global so
@@ -76,6 +77,8 @@ const CHILD_INTERFACES = [
   "zwlr_foreign_toplevel_handle_v1",
   "wp_viewport",
   "wp_fractional_scale_v1",
+  "wp_linux_drm_syncobj_timeline_v1",
+  "wp_linux_drm_syncobj_surface_v1",
 ];
 
 // Load all generated signature modules, keyed by interface name.
@@ -510,6 +513,7 @@ export async function installProtocols(
     zwlr_foreign_toplevel_manager_v1: await import("./zwlr_foreign_toplevel_manager_v1.js"),
     wp_viewporter: await import("./wp_viewporter.js"),
     wp_fractional_scale_manager_v1: await import("./wp_fractional_scale_manager_v1.js"),
+    wp_linux_drm_syncobj_manager_v1: await import("./wp_linux_drm_syncobj_v1.js"),
   };
 
   // Some child interfaces have handlers from a sibling module's named exports.
@@ -524,6 +528,7 @@ export async function installProtocols(
   const foreignTopMod = await import("./zwlr_foreign_toplevel_manager_v1.js");
   const viewporterMod = await import("./wp_viewporter.js");
   const fracScaleMod = await import("./wp_fractional_scale_manager_v1.js");
+  const syncobjMod = await import("./wp_linux_drm_syncobj_v1.js");
   const childHandlers: Record<string, object> = {
     wl_pointer: seatMod.makePointer(ctx),
     wl_keyboard: seatMod.makeKeyboard(ctx),
@@ -543,6 +548,8 @@ export async function installProtocols(
     zwlr_foreign_toplevel_handle_v1: foreignTopMod.makeForeignToplevelHandle(ctx),
     wp_viewport: viewporterMod.makeViewport(ctx),
     wp_fractional_scale_v1: fracScaleMod.makeFractionalScale(ctx),
+    wp_linux_drm_syncobj_timeline_v1: syncobjMod.makeSyncobjTimeline(ctx),
+    wp_linux_drm_syncobj_surface_v1: syncobjMod.makeSyncobjSurface(ctx),
   };
 
   // The apply target forwards lazily: the seat is constructed below and

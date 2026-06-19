@@ -30,32 +30,46 @@ device/logical coordinate split + integer `set_buffer_scale` + fractional
 These are wired/advertised but incomplete. A client may use them and get nothing,
 with no error. Worst-first.
 
-- **NVIDIA proprietary clients race the compositor's sample (no explicit-sync
-  protocol).** `wp_linux_drm_syncobj_v1` is NOT implemented. The compositor's
-  per-frame `BeginAccess` exports the dmabuf's implicit-sync acquire fence
-  (`DMA_BUF_IOCTL_EXPORT_SYNC_FILE` with `DMA_BUF_SYNC_WRITE`) and Dawn waits
-  on it before sampling — this works correctly for Mesa producers (kernel
-  attaches the GPU write fence to the dmabuf on submit). The NVIDIA
-  proprietary GL/GLES driver, by design, does NOT attach implicit fences to
-  dmabufs: it expects the compositor to use explicit-sync via
-  `wp_linux_drm_syncobj_v1`. Without that protocol, our `EXPORT_SYNC_FILE`
-  returns an already-signaled stub fence (verified empirically:
-  `SYNC_IOC_FILE_INFO` reports `num_fences=1 status=1` for every export, and
-  CPU-blocking on the fence is instant). Sampling proceeds with no
-  ordering guarantee against the client's pending GPU writes.
-  Observable as intermittent black / decoration-only frames under high
-  frame rate (mouse motion, cursor blink) — roughly 1-in-N. The bundled
-  decoration plugin's solid backdrop makes the same race visually
-  distinctive (gradient shows through where client pixels are
-  uninitialized); without decoration the missed frame is a black flash
-  that's easy to dismiss. Fix: implement `wp_linux_drm_syncobj_v1`
-  (manager / timeline / per-surface objects; capture acquire+release
-  timeline points at commit; convert acquire point to a sync_file via
-  `drmSyncobjExportSyncFile` and feed into the per-frame `BeginAccess`
-  instead of the implicit-sync `EXPORT_SYNC_FILE`; signal the release
-  point when the compositor's sample submit completes). wlroots'
-  `wlr_linux_drm_syncobj_v1.c` is a reasonable reference (~553 lines).
-  Until then, NVIDIA clients are visually unreliable under load.
+- **NVIDIA proprietary clients work; both explicit-sync and a Dawn dmabuf-
+  import fix were needed.** `wp_linux_drm_syncobj_v1` is implemented (manager
+  global advertises; timeline / per-surface child interfaces wired; per-commit
+  acquire/release timeline points captured in `wl_surface.commit` and stored
+  on the SurfaceRecord). On a dmabuf commit, the acquire point is exported as
+  a sync_file via `drmSyncobjExportSyncFile` and attached as SCM_RIGHTS to a
+  new in-band wire frame kind (`BeginAccessWithFence`); the GPU process uses
+  it as the Dawn acquire fence INSTEAD of running `DMA_BUF_IOCTL_EXPORT_SYNC_FILE`
+  on the dmabuf. The release point is signaled (`drmSyncobjTimelineSignal`)
+  at the same atomic moment the client-buffer-lifecycle emits `sendWlRelease`
+  (the buffer is superseded on its surface AND its last GPU sample has
+  completed). Implicit-sync remains as the fallback when the client does not
+  speak the protocol or does not set points; for Mesa clients that path is
+  fine because the kernel attaches the GPU write fence to the dmabuf on submit.
+
+  Required Dawn-side fix: `SharedTextureMemory::Create` for
+  `SharedTextureMemoryDmaBufDescriptor` did not query
+  `VkMemoryDedicatedRequirements` for the imported image, and never attached a
+  `VkMemoryDedicatedAllocateInfo` to `vkAllocateMemory`. NVIDIA's proprietary
+  driver reports `prefersDedicatedAllocation=true` for tiled-modifier dmabuf
+  images, and without the dedicated-allocate-info, `vkAllocateMemory` succeeds
+  but the returned `VkDeviceMemory` is not actually bound to the dmabuf-backed
+  memory; the subsequent `vkBindImageMemory` points the image at unrelated
+  memory and sampling returns garbage / zeros. Symptom: kitty's NVIDIA dmabufs
+  consistently sample as transparent for one buffer per cycle (regardless of
+  explicit vs implicit sync), producing periodic "decoration only" frames
+  under cursor blink. The same import descriptor (drm format / modifier /
+  offset / stride / size) byte-identical to its peers that read back correctly
+  -- so the import was non-deterministic at the Vulkan memory binding layer.
+  Fix lives in the bundled Dawn at
+  `src/dawn/native/vulkan/SharedTextureMemoryVk.cpp`; queries
+  `VkMemoryDedicatedRequirements` via `VkImageMemoryRequirementsInfo2` and,
+  when requires/prefers is set, passes `VkMemoryDedicatedAllocateInfo` to
+  `AllocateDeviceMemory`. Same pattern the opaque-fd path next to it already
+  uses, and the legacy `ExternalVkImageTexture` import via
+  `ServiceImplementation::RequiresDedicatedAllocation`.
+
+  Tests: pure-unit `wp-linux-drm-syncobj.test.js`, `wl-surface-syncobj.test.js`
+  (1115 unit tests pass). GPU-side coverage of the per-frame fence handoff is
+  implicit through the existing dmabuf GPU tests, which pass.
 
 - **`xdg_toplevel` window-management state is implemented; residual no-ops are
   narrow.** `set_maximized`/`unset`, `set_fullscreen`/`unset`, `set_minimized`,
