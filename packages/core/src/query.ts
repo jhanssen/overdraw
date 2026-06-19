@@ -7,7 +7,6 @@ import type { CompositorState } from "./protocols/ctx.js";
 
 export interface WindowSnapshot {
   surfaceId: number;
-  outputId: number;
   rect: { x: number; y: number; width: number; height: number };
   title: string | null;
   appId: string | null;
@@ -79,7 +78,6 @@ export function queryState(state: CompositorState): StateSnapshot {
     }
     return {
       surfaceId: w.surfaceId,
-      outputId: w.outputId,
       rect: { x: w.rect.x, y: w.rect.y, width: w.rect.width, height: w.rect.height },
       title: ta.title,
       appId: ta.appId,

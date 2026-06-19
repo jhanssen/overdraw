@@ -110,6 +110,9 @@ export default function makeXdgSurface(ctx: Ctx): XdgSurfaceHandler {
         // coordinates; map to the output it lies inside. Fall back to the
         // primary when no seat / no pointer position / pointer outside every
         // real output (the non-rectangular coverage gap between monitors).
+        // The resolved outputId is stashed on the SurfaceRecord so the
+        // window.map emission (in wl_surface.commit's first-content path)
+        // carries it without going through the WM.
         let outputId: number | undefined;
         const seat = ctx.state.seat;
         const outputs = ctx.state.outputs;
@@ -124,9 +127,9 @@ export default function makeXdgSurface(ctx: Ctx): XdgSurfaceHandler {
             }
           }
         }
+        xs.surface.spawnOutputId = outputId ?? ctx.state.wm.primaryOutputId();
         ctx.state.wm.addWindow(surfaceId, xs.surface, {
           deferInitialCommit: true,
-          ...(outputId !== undefined ? { outputId } : {}),
         });
       } else {
         // No WM (e.g. bare protocol unit tests): fall back to the 0x0 handshake so

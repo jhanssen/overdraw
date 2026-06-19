@@ -154,6 +154,13 @@ export interface SurfaceRecord {
   // window.unmap / tearing down twice.
   unmapped?: boolean;
   frameCallbacks?: Resource[];
+  // The outputId the surface was spawned on (xdg_surface.get_toplevel
+   // resolves it from spawn-follows-pointer or an explicit hint). Carried
+   // here so the bus's window.map emission can include it without going
+   // through the WM. Undefined for non-toplevel surfaces (popups,
+   // subsurfaces) and pre-role surfaces. Layer-shell surfaces don't use
+   // this -- their outputId lives on LayerSurfaceRecord.output.
+  spawnOutputId?: number;
   // Outputs the surface has been told it occupies via wl_surface.enter.
   // Updated by updateSurfaceOutputResidency: diff the compositor's
   // surfaceOutputs(id) against this set, emit enter for each newly-overlapped

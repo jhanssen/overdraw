@@ -53,12 +53,6 @@ export interface SurfaceHandle { resource: Resource; }
 
 export interface Window {
   surfaceId: number;
-  // Which output this window is laid out on. Set at addWindow (defaulting to
-  // the primary live output); updated by setWindowOutput when an explicit move
-  // crosses a boundary, or by setFloatingRect when an interactive drag carries
-  // the window into another output's rect. The layout-driver partitions
-  // windows by this field and runs the plugin once per output.
-  outputId: number;
   // The CONTENT rect (where the client draws). In the tiling model this is the
   // window's OUTER tile shrunk by its decoration insets: the layout owns the
   // outer tile; decoration eats into it; the client is configured to `rect`.
@@ -187,10 +181,6 @@ export interface Wm {
   // the default home for newly-mapped windows. Throws if the WM has no
   // outputs (the construction invariant forbids this).
   primaryOutputId(): number;
-  // Explicitly reassign a window to a different output. Schedules a relayout
-  // (both the old and new outputs may need to repartition). No-op if the
-  // window doesn't exist or is already on the target output.
-  setWindowOutput(surfaceId: number, outputId: number): void;
   // Proactive: called at get_toplevel (role assignment), BEFORE the client has
   // content. Inserts the window into the layout (as the new master) and
   // schedules a layout pass. Idempotent for an already-added surface. The
@@ -202,10 +192,17 @@ export interface Wm {
   // state arriving between get_toplevel and the initial commit can fold
   // into a single first configure. Tests calling addWindow directly omit
   // this; the production xdg_surface.get_toplevel handler opts in.
+  //
+  // The WM does NOT track "which output is this window on" -- that is the
+  // workspace plugin's domain (the layout-driver reads ordered visible
+  // windows per output from outputContent). The output a newly-mapped
+  // window lands on is decided in the protocol layer (xdg_surface.get_
+  // toplevel: spawn-follows-pointer) and carried in the window.map event
+  // payload to the workspace plugin's onMap handler.
   addWindow(
     surfaceId: number,
     surfaceRec: SurfaceHandle,
-    opts?: { deferInitialCommit?: boolean; outputId?: number },
+    opts?: { deferInitialCommit?: boolean },
   ): Rect;
   // Mark the initial-commit phase complete for a deferred window: emit
   // window.proposed with the accumulated state as the candidate so a
@@ -242,10 +239,6 @@ export interface Wm {
   setInsets(surfaceId: number, insets: Insets): InsetGrant | undefined;
   outerRectOf(surfaceId: number): Rect | undefined;
   rectOf(surfaceId: number): Rect | undefined;
-  // Which output the given window is laid out on. Undefined when the window
-  // doesn't exist. The window.map emitter uses this to populate the event's
-  // outputId field without taking a full snapshot.
-  outputIdOf(surfaceId: number): number | undefined;
   setContentGated(surfaceId: number, gated: boolean): void;
   isContentGated(surfaceId: number): boolean;
   setDecorationSurface(windowId: number, decoSurfaceId: number | null): void;
@@ -317,7 +310,6 @@ export interface Wm {
 // event payloads. surfaceRec / Resource are NOT included (not cloneable).
 export interface WindowSnapshot {
   surfaceId: number;
-  outputId: number;
   rect: Rect;
   outer: Rect;
   insets?: Insets;
@@ -523,15 +515,6 @@ export function createWm(
     if (lo === Infinity) throw new Error("internal: WM has no outputs");
     return lo;
   }
-  // Resolve an explicit/optional outputId to a concrete live id. Unknown ids
-  // collapse to the primary; the WM never silently drops a window onto a
-  // nonexistent output.
-  function resolveOutputId(requested: number | undefined): number {
-    if (requested === undefined) return primaryOutputId();
-    if (wm.outputs.has(requested)) return requested;
-    return primaryOutputId();
-  }
-
   // Resize transaction (reorder relayouts only). A window that changes size must
   // not jump to its new tile before it has re-rendered at the new size, or it
   // flashes at the wrong size/position for a frame. Instead the new geometry is
@@ -757,7 +740,6 @@ export function createWm(
       windowMap.set(w.surfaceId, {
         id: w.surfaceId,
         role: "toplevel" as const,
-        outputId: w.outputId,
         presentation: w.windowState.presentation,
         layoutMode: w.windowState.layoutMode ?? undefined,
         layoutData: w.windowState.layoutData,
@@ -809,7 +791,6 @@ export function createWm(
       if (existing) return contentOf(existing);
       const win: Window = {
         surfaceId,
-        outputId: resolveOutputId(opts?.outputId),
         outer: { x: 0, y: 0, width: -1, height: -1 },
         rect: { x: 0, y: 0, width: -1, height: -1 },
         surfaceRec,
@@ -829,22 +810,7 @@ export function createWm(
         throw new Error("setOutputs: outputs must be non-empty");
       }
       wm.outputs = outputsMap(newOutputs);
-      // Reassign any window whose output disappeared. The new primary takes
-      // them; their outer rect will be reflowed when the layout pass runs.
-      const primary = primaryOutputId();
-      for (const w of windows) {
-        if (!wm.outputs.has(w.outputId)) w.outputId = primary;
-      }
       driver.schedule("output-resized");
-    },
-
-    setWindowOutput(surfaceId, outputId) {
-      const win = windows.find((w) => w.surfaceId === surfaceId);
-      if (!win) return;
-      if (!wm.outputs.has(outputId)) return;
-      if (win.outputId === outputId) return;
-      win.outputId = outputId;
-      driver.schedule("state-changed");
     },
 
     windowHasContent(surfaceId) {
@@ -905,11 +871,6 @@ export function createWm(
     rectOf(surfaceId) {
       const win = windows.find((w) => w.surfaceId === surfaceId);
       return win ? { ...win.rect } : undefined;
-    },
-
-    outputIdOf(surfaceId) {
-      const win = windows.find((w) => w.surfaceId === surfaceId);
-      return win?.outputId;
     },
 
     setContentGated(surfaceId, gated) {
@@ -1147,21 +1108,10 @@ export function createWm(
       const win = windows.find((w) => w.surfaceId === surfaceId);
       if (!win) return;
       win.floatingRect = { ...rect };
-      // Boundary-crossing: if the rect's center now lies inside a different
-      // output's rect, reassign. Using the center (rather than full-
-      // containment) keeps the reassignment well-defined for a window whose
-      // rect straddles two outputs -- the dominant output owns it.
-      const cx = rect.x + rect.width / 2;
-      const cy = rect.y + rect.height / 2;
-      let target = win.outputId;
-      for (const o of wm.outputs.values()) {
-        const r = o.rect;
-        if (cx >= r.x && cx < r.x + r.width && cy >= r.y && cy < r.y + r.height) {
-          target = o.id;
-          break;
-        }
-      }
-      if (target !== win.outputId) win.outputId = target;
+      // Boundary-crossing between outputs is a workspace-plugin concern
+      // now: a future window-rules / interactive-drag policy will detect
+      // the cross and call workspace.moveWindow to update membership. The
+      // WM itself only tracks the rect.
       driver.schedule("state-changed");
     },
 
@@ -1284,7 +1234,6 @@ function snapshotOf(win: Window): WindowSnapshot {
   for (const [k, v] of win.state.entries()) state[k] = v;
   const snap: WindowSnapshot = {
     surfaceId: win.surfaceId,
-    outputId: win.outputId,
     rect: { ...win.rect },
     outer: { ...win.outer },
     hasContent: !!win.hasContent,

@@ -59,7 +59,6 @@ export interface LayoutSnapshot {
 // to the layout plugin (for managed) or resolve internally (for other
 // presentations).
 export interface LayoutSnapshotWindow extends LayoutWindow {
-  outputId: number;
   presentation: Presentation;
   // The rect to place a floating window at. Used only when
   // presentation === 'floating'. Absent for other modes.

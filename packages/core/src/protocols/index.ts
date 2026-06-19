@@ -352,7 +352,7 @@ export async function installProtocols(
           const ta = titleAppId(state, id);
           state.bus?.emit(WINDOW_EVENT.map, {
             surfaceId: id,
-            outputId: state.wm?.outputIdOf(id) ?? OUTPUT_DEFAULT,
+            outputId: s.spawnOutputId ?? OUTPUT_DEFAULT,
             rect: { x: rect.x, y: rect.y, width: rect.width, height: rect.height },
             appId: ta.appId, title: ta.title,
           });
