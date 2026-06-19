@@ -389,7 +389,7 @@ fn sampleClamped(t : texture_2d<f32>, uv : vec2f) -> vec4f {
 
 import type { CompositorSink, Layer } from "../protocols/ctx.js";
 import { LAYER_ORDER, OUTPUT_DEFAULT } from "../protocols/ctx.js";
-import { OutputDamageRing } from "./output-damage-ring.js";
+import { OutputDamageMap } from "./output-damage-map.js";
 import type { TransitionKind } from "@overdraw/transition-types";
 import type { WaylandFd } from "../types.js";
 import { log } from "../log.js";
@@ -1019,11 +1019,12 @@ export class JsCompositor implements CompositorSink {
   private format: GPUTextureFormat;
   private outputTex: GPUTexture | null = null;  // wrapped output texture, held during a frame
 
-  // Composite-scissor damage in output LOGICAL coords (converted to device px
-  // at scissor time), one region per scanout-ring slot keyed by the stable
-  // acquireOutputTexture handle. The on-screen composite scissors to the slot's
-  // accumulated damage; see OutputDamageRing.
-  private readonly outputDamage = new OutputDamageRing();
+  // Composite-scissor damage in GLOBAL logical coords, partitioned per
+  // output (one OutputDamageRing per output, each keyed by the stable
+  // acquireOutputTexture handle of its slots). The map clips global damage
+  // rects into each output's local space and back, so callers operate
+  // entirely in global space.
+  private readonly outputDamage = new OutputDamageMap();
   private static readonly HEADLESS_DAMAGE_KEY = 0n;
   // 1x1 opaque-black quad reused to clear the damaged region to black before
   // the scissored composite (loadOp:"load" preserves pixels OUTSIDE the
@@ -1129,6 +1130,10 @@ export class JsCompositor implements CompositorSink {
       });
       this.targetView = this.target.createView();
     }
+    // Seed the damage map with the constructor's initial output. Subsequent
+    // setOutputSize / setOutputs replace this; in-between calls to
+    // addOutputDamage have a bounded ring to land in.
+    this.pushDamageBounds();
   }
 
   // --- CompositorSink ---
@@ -1168,6 +1173,7 @@ export class JsCompositor implements CompositorSink {
       logicalX: prev?.logicalX ?? 0, logicalY: prev?.logicalY ?? 0,
       scale: this.scale,
     });
+    this.pushDamageBounds();
     this.damageFull();  // slot textures are recreated; everything is stale
   }
 
@@ -1196,7 +1202,32 @@ export class JsCompositor implements CompositorSink {
       this.logicalWidth = Math.max(1, Math.round(primary.deviceWidth / primary.scale));
       this.logicalHeight = Math.max(1, Math.round(primary.deviceHeight / primary.scale));
     }
+    this.pushDamageBounds();
     this.damageFull();
+  }
+
+  // Translate the current outputsGeom into the damage map's per-output
+  // bounds (logical position + logical size). Called whenever the output
+  // set changes (setOutputSize, setOutputs). The map's setOutputs preserves
+  // damage state for outputs whose logical size is unchanged; resized
+  // outputs get their ring rebuilt (their slot textures will be recreated
+  // anyway, so the prior damage is moot).
+  private pushDamageBounds(): void {
+    const bounds: Array<{
+      outputId: number;
+      logicalX: number; logicalY: number;
+      logicalWidth: number; logicalHeight: number;
+    }> = [];
+    for (const o of this.outputsGeom.values()) {
+      const scale = o.scale > 0 ? o.scale : 1;
+      bounds.push({
+        outputId: o.id,
+        logicalX: o.logicalX, logicalY: o.logicalY,
+        logicalWidth: Math.max(1, Math.round(o.deviceWidth / scale)),
+        logicalHeight: Math.max(1, Math.round(o.deviceHeight / scale)),
+      });
+    }
+    this.outputDamage.setOutputs(bounds);
   }
 
   // Derive the per-output render context from its geometry: scale, target
@@ -1214,31 +1245,18 @@ export class JsCompositor implements CompositorSink {
     };
   }
 
-  // Consume this output's accumulated damage for the frame, keyed by the stable
-  // per-slot key (the scanout-ring handle, or the headless sentinel). Returns
-  // the scissor box (in GLOBAL logical coords; composite() shifts it by the
-  // output's origin) for a partial repaint, or undefined for a full repaint. A
-  // transition animates the whole output, so it forces full while one is active.
-  //
-  // Composite-scissor is only taken when there is a single output at the global
-  // origin. OutputDamageRing tracks damage in a single global-bounds coordinate
-  // space (addOutputDamage clips to the primary's logical size); for a
-  // multi-output layout that model would clip/drop a non-primary output's
-  // damage, so those layouts force a full repaint per output instead. This is
-  // correct (not damage-optimal); per-output damage bounds are a later step.
+  // Consume this output's accumulated damage for the frame, keyed by the
+  // stable per-slot key (the scanout-ring handle, or the headless sentinel).
+  // Returns the scissor box in GLOBAL logical coords (composite() shifts it
+  // by the output's origin) for a partial repaint, or undefined for a full
+  // repaint. A transition animates the whole output, so it forces full
+  // while one is active on this output.
   private takeScissor(
     o: OutputGeom, key: bigint,
   ): { x: number; y: number; w: number; h: number } | undefined {
-    const scale = o.scale > 0 ? o.scale : 1;
-    const lw = Math.max(1, Math.round(o.deviceWidth / scale));
-    const lh = Math.max(1, Math.round(o.deviceHeight / scale));
-    this.outputDamage.setBounds(lw, lh);
-    const repaint = this.outputDamage.take(key);
-    const singleAtOrigin = this.outputsGeom.size === 1
-      && o.logicalX === 0 && o.logicalY === 0;
-    return (singleAtOrigin && repaint.mode === "partial"
-            && !this.activeTransitions.has(o.id))
-      ? repaint.box : undefined;
+    if (this.activeTransitions.has(o.id)) return undefined;
+    const repaint = this.outputDamage.take(o.id, key);
+    return repaint.mode === "partial" ? repaint.box : undefined;
   }
 
   // Stack/layer reorders change occlusion at arbitrary places; repaint full.
@@ -2026,17 +2044,17 @@ export class JsCompositor implements CompositorSink {
 
   // --- Composite-scissor damage -------------------------------------------
 
-  // Mark the whole output stale for every tracked slot: the next frame on any
-  // slot repaints fully. Used for changes that can affect arbitrary screen
-  // regions (stack reorders, per-surface fx, output resize).
+  // Mark every output's tracked slots stale: the next frame on any slot of
+  // any output repaints fully. Used for changes that can affect arbitrary
+  // screen regions (stack reorders, per-surface fx, output resize).
   private damageFull(): void {
     this.outputDamage.full();
   }
 
-  // Accumulate an output-LOGICAL-space rect into every tracked slot's region.
-  // The rect is in GLOBAL logical coordinates.
+  // Accumulate a GLOBAL-logical-space rect into the damage rings of every
+  // output it overlaps (the map clips into each output's local space).
+  // Rects entirely outside the union are silent no-ops.
   private addOutputDamage(x: number, y: number, w: number, h: number): void {
-    this.outputDamage.setBounds(this.logicalWidth, this.logicalHeight);
     this.outputDamage.damageRect(x, y, w, h);
   }
 
