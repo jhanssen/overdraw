@@ -20,6 +20,10 @@ import type { LayoutResult, LayoutReason } from "@overdraw/layout-types";
 import type { LayoutDriver, LayoutSnapshot, LayoutApplyTarget } from "./layout-driver.js";
 import type { DynamicBus } from "../events/dynamic-bus.js";
 import { WINDOW_EVENT } from "../events/types.js";
+import {
+  createSurfaceTransactionBroker,
+  type SurfaceTransactionBroker,
+} from "../surface-transaction.js";
 import type {
   WindowRelayoutEvent,
   WindowState,
@@ -474,6 +478,12 @@ export interface WmOptions {
   // omit it -- the WM then defaults to "every mapped window on the
   // primary output" so non-workspace harnesses still produce a layout.
   outputContent?: () => ReadonlyMap<number, ReadonlyArray<number>>;
+  // Optional shared surface-transaction broker. When provided, the WM
+  // routes its resize-tx through it (and the cross-output handler shares
+  // the same broker so holds on a single surface from both sources
+  // coexist). When absent, the WM constructs an internal broker -- fine
+  // for GPU-free unit tests that build a WM standalone.
+  surfaceTx?: SurfaceTransactionBroker;
 }
 
 // Convenience: build the WM's per-output map from a list of descriptors,
@@ -506,6 +516,12 @@ export function createWm(
   const layoutDriverFactory = opts?.layoutDriverFactory;
   const pluginBus = opts?.pluginBus;
   const outputContent = opts?.outputContent;
+  // Shared broker if one was provided; otherwise a private one wired to
+  // this compositor sink. The broker absorbs freeze/thaw/timer/frozen-
+  // ready plumbing; the WM keeps the resize-specific data (configure
+  // serial, target size, etc.) in pendingResizes.
+  const surfaceTx: SurfaceTransactionBroker = opts?.surfaceTx
+    ?? createSurfaceTransactionBroker(compositor);
   const windows: Window[] = [];
   const wm: WmState = { outputs: outputsMap(outputs), windows };
   // The primary is the lowest live id; computed on demand to track setOutputs.
@@ -541,16 +557,42 @@ export function createWm(
     moveOnly: boolean;
     acked: boolean;
   }
+  // The WM-local resize-data store, separate from the broker's hold
+  // registry. The broker's ready() closure reads back from this map so a
+  // coalescing relayout (mutate-in-place rather than re-begin) is picked
+  // up automatically.
   const pendingResizes = new Map<number, PendingResize>();
-  function pendingReady(id: number, p: PendingResize): boolean {
+  // Shared batchKey: every WM resize-tx hold goes in the same batch, so
+  // they apply atomically (two windows trading places never overlap).
+  const WM_TX_BATCH = "wm-tx";
+  // Resolve the output whose logical rect contains the given point. Used to
+  // attribute a pending resize to its destination output so surfaceReadyAt
+  // can verify the buffer dims match that output's scale (not just the
+  // logical size, which doesn't catch a client that committed at the new
+  // logical size but rasterized at the old scale).
+  function outputScaleForPoint(x: number, y: number): number | undefined {
+    for (const o of wm.outputs.values()) {
+      const r = o.rect;
+      if (x >= r.x && x < r.x + r.width && y >= r.y && y < r.y + r.height) {
+        return o.scale;
+      }
+    }
+    return undefined;
+  }
+
+  function pendingReady(id: number): boolean {
+    const p = pendingResizes.get(id);
+    if (!p) return true;
     if (p.moveOnly) return true;
     if (!p.acked) return false;
-    return compositor.surfaceReadyAt
-      ? compositor.surfaceReadyAt(id, p.content.width, p.content.height)
-      : true;
+    if (!compositor.surfaceReadyAt) return true;
+    // Determine the destination output's scale from p.outer's center; gate
+    // the apply on the buffer matching both logical size AND that scale.
+    const cx = p.outer.x + p.outer.width / 2;
+    const cy = p.outer.y + p.outer.height / 2;
+    const scale = outputScaleForPoint(cx, cy);
+    return compositor.surfaceReadyAt(id, p.content.width, p.content.height, scale);
   }
-  let txTimer: ReturnType<typeof setTimeout> | null = null;
-  const TX_TIMEOUT_MS = 150;
 
   function pushStack(): void {
     if (rebuild) { rebuild(); return; }
@@ -561,10 +603,6 @@ export function createWm(
       ids.push(w.surfaceId);
     }
     compositor.setStack(ids);
-  }
-
-  function clearTxTimer(): void {
-    if (txTimer !== null) { clearTimeout(txTimer); txTimer = null; }
   }
 
   // Push one window's held geometry to the compositor: content layout, the
@@ -587,41 +625,25 @@ export function createWm(
     }
   }
 
-  // Apply every held window's geometry in one batch (atomic from the on-screen
-  // point of view: a single render sees them all moved) and clear the
-  // transaction.
-  function applyPendingGeometry(): void {
-    clearTxTimer();
-    const entries = [...pendingResizes];
-    pendingResizes.clear();
-    for (const [id, p] of entries) {
-      // Thaw (resume the live buffer) and set the new geometry in the same
-      // batch, so the freshly-rendered content and the new size land together.
-      compositor.thawSurface?.(id);
-      const win = windows.find((w) => w.surfaceId === id);
-      if (win) pushGeometry(win, p.outer, p.content);
-    }
+  // Register a resize-tx hold for surfaceId. The broker freezes the
+  // surface (if not already frozen by an earlier requirement, e.g. the
+  // cross-output handler) and waits for ready() before applying. onApply
+  // pushes the held geometry; the broker thaws afterwards.
+  function beginResizeTx(surfaceId: number): void {
+    surfaceTx.begin(surfaceId, {
+      tag: "wm-tx",
+      batchKey: WM_TX_BATCH,
+      ready: () => pendingReady(surfaceId),
+      onApply: () => {
+        const p = pendingResizes.get(surfaceId);
+        if (!p) return;
+        pendingResizes.delete(surfaceId);
+        const win = windows.find((w) => w.surfaceId === surfaceId);
+        if (win) pushGeometry(win, p.outer, p.content);
+      },
+      onCancel: () => { pendingResizes.delete(surfaceId); },
+    });
   }
-
-  // Apply the held set once every member is ready (acked + committed its new
-  // size, or move-only). A not-yet-ready member keeps the whole batch waiting.
-  function maybeApplyTransaction(): void {
-    if (pendingResizes.size === 0) { clearTxTimer(); return; }
-    for (const [id, p] of pendingResizes) { if (!pendingReady(id, p)) return; }
-    applyPendingGeometry();
-  }
-
-  function armTxTimer(): void {
-    if (txTimer !== null) return;
-    txTimer = setTimeout(() => { txTimer = null; applyPendingGeometry(); }, TX_TIMEOUT_MS);
-    txTimer.unref?.();
-  }
-
-  // The compositor pokes this when a frozen surface's new buffer becomes
-  // drawable; re-check whether the held batch can now apply.
-  compositor.setFrozenReadyHandler?.((id) => {
-    if (pendingResizes.has(id)) maybeApplyTransaction();
-  });
 
   // Apply a LayoutResult: emit window.relayout, then update each window's
   // outer rect, push the compositor's setSurfaceLayout, fire configure where
@@ -633,7 +655,6 @@ export function createWm(
     const byId = new Map<number, { id: number; outer: Rect }>();
     for (const r of result.rects) byId.set(r.id, r);
     const snapshotWindows = [...windows];
-    let txTouched = false;
     for (const win of snapshotWindows) {
       const r = byId.get(win.surfaceId);
       if (!r) continue;
@@ -662,7 +683,7 @@ export function createWm(
       if (useTx && win.hasContent && !win.pendingInitialCommit) {
         // Transaction path: hold the new geometry; (re)configure on a size that
         // differs from what the client was last asked for. The window keeps its
-        // current drawn rect until applyPendingGeometry.
+        // current drawn rect until the broker applies the tx batch.
         const pend = pendingResizes.get(win.surfaceId);
         const lastCfgW = pend ? pend.cfgW : prevContent.width;
         const lastCfgH = pend ? pend.cfgH : prevContent.height;
@@ -670,23 +691,31 @@ export function createWm(
           // configure is non-null here (useTx requires it); guard for the type.
           const serial = configure
             ? configure(win.surfaceId, newContent.width, newContent.height) : null;
-          pendingResizes.set(win.surfaceId, {
-            outer: newOuter, content: newContent,
-            serial, cfgW: newContent.width, cfgH: newContent.height, moveOnly: false, acked: false,
-          });
-          // Hold the surface's current frame while it re-renders at the new size.
-          compositor.freezeSurface?.(win.surfaceId);
-          txTouched = true;
+          if (pend) {
+            // Coalesce: mutate the existing entry. The broker's ready()
+            // re-reads from the map so it picks up the new size + ack
+            // requirement without re-registering.
+            pend.outer = newOuter; pend.content = newContent;
+            pend.serial = serial; pend.cfgW = newContent.width; pend.cfgH = newContent.height;
+            pend.moveOnly = false; pend.acked = false;
+          } else {
+            pendingResizes.set(win.surfaceId, {
+              outer: newOuter, content: newContent,
+              serial, cfgW: newContent.width, cfgH: newContent.height,
+              moveOnly: false, acked: false,
+            });
+            beginResizeTx(win.surfaceId);
+          }
         } else if (pend) {
           pend.outer = newOuter;
           pend.content = newContent;
-          txTouched = true;
         } else if (moved) {
           pendingResizes.set(win.surfaceId, {
             outer: newOuter, content: newContent, serial: null,
-            cfgW: newContent.width, cfgH: newContent.height, moveOnly: true, acked: true,
+            cfgW: newContent.width, cfgH: newContent.height,
+            moveOnly: true, acked: true,
           });
-          txTouched = true;
+          beginResizeTx(win.surfaceId);
         }
         continue;
       }
@@ -717,16 +746,11 @@ export function createWm(
     if (useTx) {
       // Drop holds for windows no longer in this layout result.
       for (const id of [...pendingResizes.keys()]) {
-        if (!byId.has(id)) {
-          pendingResizes.delete(id);
-          compositor.thawSurface?.(id);
-          txTouched = true;
-        }
+        if (!byId.has(id)) surfaceTx.cancel(id);
       }
-      if (txTouched) {
-        if ([...pendingResizes].some(([id, p]) => !pendingReady(id, p))) armTxTimer();
-        maybeApplyTransaction();
-      }
+      // Coalescing path may have flipped existing entries' ready state
+      // (e.g. a re-issued configure resets acked); poke the broker.
+      surfaceTx.evaluate();
     }
   }
 
@@ -821,8 +845,13 @@ export function createWm(
         compositor.setSurfaceLayout(win.surfaceId, win.rect.x, win.rect.y, win.rect.width, win.rect.height);
         pushStack();
         // Real tile size as the second configure (a resize) after the throwaway
-        // 0x0 sent at the initial commit. See pendingSizeConfigure.
-        if (win.pendingSizeConfigure && configure) {
+        // 0x0 sent at the initial commit. See pendingSizeConfigure. Skip when
+        // the layout-driver hasn't produced a real outer rect yet (still the
+        // -1x-1 placeholder from addWindow); the layout pass itself will send
+        // the sized configure once it runs. Sending now would clamp to 0x0,
+        // which the client reads as "you pick" and overrides our intent.
+        if (win.pendingSizeConfigure && configure
+            && win.outer.width > 0 && win.outer.height > 0) {
           win.pendingSizeConfigure = false;
           const content = contentOf(win);
           configure(win.surfaceId, content.width, content.height);
@@ -835,7 +864,9 @@ export function createWm(
       const i = windows.findIndex((w) => w.surfaceId === surfaceId);
       if (i < 0) return;
       windows.splice(i, 1);
-      if (pendingResizes.delete(surfaceId)) { compositor.thawSurface?.(surfaceId); maybeApplyTransaction(); }
+      // Cancel any pending resize-tx hold; the broker thaws and removes
+      // the entry from pendingResizes via onCancel.
+      if (surfaceTx.has(surfaceId)) surfaceTx.cancel(surfaceId);
       driver.schedule("unmapped");
       pushStack();
     },
@@ -857,7 +888,13 @@ export function createWm(
       if (win.hasContent) {
         compositor.setSurfaceLayout(win.surfaceId, contentRect.x, contentRect.y, contentRect.width, contentRect.height);
       }
-      if (configure && (contentRect.width !== prevContent.width || contentRect.height !== prevContent.height)) {
+      // Skip the configure when the outer rect is still the addWindow
+      // placeholder (-1x-1); contentRect derived from it will be negative
+      // and get clamped to 0x0 on the wire -- the client reads that as
+      // "you pick" and ignores our intent. The layout pass that will run
+      // shortly sends the real sized configure.
+      if (configure && win.outer.width > 0 && win.outer.height > 0
+          && (contentRect.width !== prevContent.width || contentRect.height !== prevContent.height)) {
         configure(win.surfaceId, contentRect.width, contentRect.height);
       }
       return { insets: granted, outerRect, contentRect };
@@ -1223,7 +1260,7 @@ export function createWm(
       if (!p || p.moveOnly || p.acked) return;
       if (p.serial !== null && ackedSerial !== null && ackedSerial >= p.serial) {
         p.acked = true;
-        maybeApplyTransaction();
+        surfaceTx.evaluate();
       }
     },
   };

@@ -194,6 +194,17 @@ function appendPopups(
 // the global stack, so the filter must contain the full draw list -- a
 // toplevels-only list would clobber subsurfaces and popups (workspace plugin
 // only knows toplevels). Single owner of all setStack / setOutputStack pushes.
+//
+// Per-output stack pushes are HELD when the surface-transaction broker has
+// active holds. Reason: an outputStack change is a geometry change (it
+// alters which output's pass draws a surface). If we pushed it immediately
+// during a cross-output workspace move, the compositor would start
+// rendering the moving surface in the destination output's pass while its
+// `s.x`/`s.layoutW` (held by the WM resize-tx) are still on the source
+// output -- the surface would draw at the wrong position, often
+// straddling the output boundary at the wrong scale. The broker's
+// onAfterApply hook flushes the cached per-output stacks atomically with
+// the surface's new geometry.
 export function rebuildStackWithPopups(state: CompositorState): void {
   const wm = state.wm;
   if (!wm) return;
@@ -209,10 +220,10 @@ export function rebuildStackWithPopups(state: CompositorState): void {
   if (!filters || filters.size === 0) return;
   if (!state.compositor.setOutputStack) return;
 
+  // Compute every per-output stack, then either push directly to the
+  // compositor or stash for the broker's onAfterApply to flush.
+  const computed = new Map<number, number[]>();
   for (const [outputId, toplevelIds] of filters) {
-    // Build the WM-window list in the filter's order. Surfaces in the filter
-    // that aren't (yet) WM windows are dropped silently -- matches the
-    // global pass, which only iterates WM windows.
     const byId = new Map<number, typeof wm.state.windows[number]>();
     for (const w of wm.state.windows) byId.set(w.surfaceId, w);
     const ordered: typeof wm.state.windows = [];
@@ -221,18 +232,40 @@ export function rebuildStackWithPopups(state: CompositorState): void {
       if (w) ordered.push(w);
     }
     const stack: number[] = computeBaseStack(state, ordered);
-
-    // Popups whose root toplevel is in the filter, plus layer-shell-parented
-    // popups (no root toplevel; always include them per output since the
-    // layer surface itself is per-output-by-construction and workspaces
-    // don't model layer surfaces).
     const inFilter = new Set(toplevelIds);
     appendPopups(state, stack, (pr) => {
       if (pr.layerParent) return true;
       const root = popupRootToplevelId(state, pr);
       return root !== null && inFilter.has(root);
     });
+    computed.set(outputId, stack);
+  }
 
+  const broker = state.surfaceTx;
+  const heldDuringTx = broker && broker.size() > 0;
+  if (heldDuringTx) {
+    // Defer: the per-output stack push will happen in the broker's
+    // onAfterApply hook (installed once by installProtocols). Stash the
+    // latest computed stacks; later rebuilds will overwrite.
+    state.deferredOutputStacks = computed;
+    return;
+  }
+  // No active hold: push immediately.
+  for (const [outputId, stack] of computed) {
     state.compositor.setOutputStack(outputId, stack);
   }
+  state.deferredOutputStacks = undefined;
+}
+
+// Flush any per-output stacks that were deferred because the broker had
+// holds when rebuildStackWithPopups was called. Invoked by the broker's
+// onAfterApply hook.
+export function flushDeferredOutputStacks(state: CompositorState): void {
+  const cached = state.deferredOutputStacks;
+  if (!cached) return;
+  if (!state.compositor.setOutputStack) { state.deferredOutputStacks = undefined; return; }
+  for (const [outputId, stack] of cached) {
+    state.compositor.setOutputStack(outputId, stack);
+  }
+  state.deferredOutputStacks = undefined;
 }

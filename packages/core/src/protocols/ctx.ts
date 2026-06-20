@@ -242,7 +242,12 @@ export interface CompositorSink {
   // (GPU-free test sinks omit them; the WM degrades to the ack-serial gate).
   freezeSurface?(id: number): void;
   thawSurface?(id: number): void;
-  surfaceReadyAt?(id: number, w: number, h: number): boolean;
+  surfaceReadyAt?(id: number, w: number, h: number, scale?: number): boolean;
+  // Current committed buffer's device-pixel dimensions, or null when the
+  // surface has no drawable buffer yet. Used by the cross-output move
+  // hold to detect that a fractional-scale client has reallocated at the
+  // new output's scale (= buffer dims changed to match new scale).
+  surfaceBufferDims?(id: number): { width: number; height: number } | null;
   setFrozenReadyHandler?(cb: (id: number) => void): void;
   // Buffer scale (wl_surface.set_buffer_scale): device pixels per logical
   // pixel in the surface's buffer. The surface's intrinsic logical size is
@@ -541,6 +546,17 @@ export interface CompositorState {
   // State-query channel: snapshot compositor state (geometry/focus/stack) for
   // tests + introspection, without reading pixels. Set by installProtocols.
   query?: () => import("../query.js").StateSnapshot;
+  // Shared surface-transaction broker: the WM's resize-tx and the cross-
+  // output residency handler both route their "freeze surface until X
+  // happens" plumbing through this. installProtocols creates it; main.ts
+  // (and tests) reach in via state.surfaceTx to register additional holds.
+  surfaceTx?: import("../surface-transaction.js").SurfaceTransactionBroker;
+  // Per-output stacks computed by rebuildStackWithPopups while the
+  // surface-transaction broker had active holds. The broker's onAfterApply
+  // flushes these to compositor.setOutputStack atomically with the
+  // surface's new geometry. See xdg_popup.ts:rebuildStackWithPopups for
+  // why we defer.
+  deferredOutputStacks?: Map<number, number[]>;
   // Per-protocol bookkeeping maps, created lazily by handlers.
   pools?: Map<Resource, { poolId: number; size: number }>;
   buffers?: Map<Resource, BufferDesc>;

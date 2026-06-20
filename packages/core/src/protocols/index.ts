@@ -15,11 +15,12 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 import { dirname, join } from "node:path";
 
 import { createWm } from "../wm/index.js";
+import { createSurfaceTransactionBroker } from "../surface-transaction.js";
 import type { LayoutDriver, LayoutSnapshot, LayoutApplyTarget } from "../wm/layout-driver.js";
 import { queryState } from "../query.js";
 import { applySubsurfaces } from "../subsurfaces.js";
 import { unmapAndTeardownSurface } from "./wl_surface.js";
-import { rebuildStackWithPopups, maybeDismissGrabbedPopup } from "./xdg_popup.js";
+import { rebuildStackWithPopups, maybeDismissGrabbedPopup, flushDeferredOutputStacks } from "./xdg_popup.js";
 import { configureToplevel } from "./xdg_surface.js";
 import { updateSurfaceOutputResidency } from "./surface-residency.js";
 import { makeOutputForOutput } from "./wl_output.js";
@@ -277,6 +278,18 @@ export async function installProtocols(
   // Seed the WM's primary output from the same dims used for state.outputs's
   // OUTPUT_DEFAULT entry. main.ts's setOnOutputDescriptor updates both maps
   // when the GPU process sends real geometry, including any extra connectors.
+  // Shared "freeze surface until X" broker. The WM uses it for its
+  // resize-tx (batched, atomic); the cross-output residency handler
+  // wired in main.ts uses it for the "client must reallocate at the new
+  // scale" wait. Holds on the same surface from both sources coalesce
+  // into a single hold whose requirements all must be satisfied.
+  const surfaceTx = createSurfaceTransactionBroker(state.compositor);
+  state.surfaceTx = surfaceTx;
+  // After every broker apply, push any per-output stacks that were
+  // deferred during the hold (rebuildStackWithPopups stashed them in
+  // state.deferredOutputStacks). This makes the outputStack flip
+  // atomic with the surface's new geometry.
+  surfaceTx.onAfterApply(() => { flushDeferredOutputStacks(state); });
   state.wm = createWm(
     state.compositor,
     [{
@@ -292,6 +305,7 @@ export async function installProtocols(
       },
       layoutDriverFactory: opts.layoutDriverFactory,
       pluginBus: opts.pluginBus,
+      surfaceTx,
       // outputContent: the workspace plugin's view of "ordered visible
       // windows per output" -- the layout-driver consumes this so it only
       // lays out the workspace currently shown on each output. Reads live

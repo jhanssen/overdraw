@@ -829,6 +829,8 @@ export interface OutputGeom {
 // Derived per-output context used by the on-screen composite: the logical
 // origin to subtract before placement, the output's scale, and its target
 // dims (device px) + logical extent (device / scale, for normalization).
+const EMPTY_STACK: ReadonlyArray<number> = [];
+
 interface OutputCtx {
   id: number;
   originX: number;
@@ -1282,7 +1284,16 @@ export class JsCompositor implements CompositorSink {
   // logical space).
   private drawOrder(outputId: number): number[] {
     const out: number[] = [];
-    const content = this.outputStacks.get(outputId) ?? this.stack;
+    // Per-output content stack via setOutputStack when set. The fallback
+    // to the global setStack list is for callers that don't push per-
+    // output stacks (single-output tests, pre-workspace bring-up); once
+    // ANY output has a per-output stack, missing entries are treated as
+    // empty rather than mirroring the global stack -- otherwise an
+    // output with no workspace shown ends up drawing every toplevel
+    // (wrong position, wrong scale, wrong everything).
+    const useGlobal = this.outputStacks.size === 0;
+    const content = this.outputStacks.get(outputId)
+                 ?? (useGlobal ? this.stack : EMPTY_STACK);
     for (const layer of LAYER_ORDER) {
       if (layer === "content") {
         out.push(...content);
@@ -1382,13 +1393,41 @@ export class JsCompositor implements CompositorSink {
   // True if the surface has a drawable buffer at logical size (w, h). The WM
   // gates a held resize's apply on this so it never thaws onto a not-yet-
   // imported (or stale-size) buffer.
-  surfaceReadyAt(id: number, w: number, h: number): boolean {
+  // `scale` (optional): when provided, also require the committed buffer's
+  // device dimensions to match `round(w * scale, h * scale)`. This catches
+  // a fractional-scale-aware client that acked our configure with the new
+  // logical size (viewportDst matches) but rendered its glyphs at the OLD
+  // scale's pixel density (buffer dims still reflect the old scale). The
+  // logical-only check alone returns true on that lie. The WM resize-tx
+  // passes the target output's scale here when known so it gates apply on
+  // a buffer that truly matches the new scale, not just the new logical
+  // size.
+  surfaceReadyAt(id: number, w: number, h: number, scale?: number): boolean {
     const s = this.surfaces.get(id);
     if (!s || !s.present || !s.view || s.currentBufferId === 0) return false;
     const bs = s.bufferScale || 1;
     const lw = s.viewportDst?.width ?? s.viewportSrc?.width ?? (s.width / bs);
     const lh = s.viewportDst?.height ?? s.viewportSrc?.height ?? (s.height / bs);
-    return Math.round(lw) === w && Math.round(lh) === h;
+    if (Math.round(lw) !== w || Math.round(lh) !== h) return false;
+    if (scale && scale > 0) {
+      // Allow a 1px tolerance: round-trip rounding can drift by one.
+      const expectedW = Math.round(w * scale);
+      const expectedH = Math.round(h * scale);
+      if (Math.abs(s.width - expectedW) > 1) return false;
+      if (Math.abs(s.height - expectedH) > 1) return false;
+    }
+    return true;
+  }
+
+  // Current committed buffer's device-pixel dimensions for surface `id`, or
+  // null if the surface has no drawable buffer yet. Used by the cross-
+  // output move hold to detect that a fractional-scale-aware client has
+  // reallocated at the new output's scale (= buffer dims changed to match
+  // round(logical * newScale)).
+  surfaceBufferDims(id: number): { width: number; height: number } | null {
+    const s = this.surfaces.get(id);
+    if (!s || !s.present || s.currentBufferId === 0) return null;
+    return { width: s.width, height: s.height };
   }
 
   private acquireSnapTex(w: number, h: number): FrozenSnapshot {
@@ -2341,18 +2380,38 @@ export class JsCompositor implements CompositorSink {
     pass.setPipeline(this.pipeline);
     for (const id of args.drawList) {
       const s = this.surfaces.get(id);
-      if (s && s.present && s.bindGroup) {
-        // Placement override priority: caller-supplied `placements` map
-        // (compose paths use this for crop) > per-surface intercept
-        // placement (Phase 10a outputRect) > surface's natural rect.
-        const placement = args.placements?.get(id)
-          ?? s.interceptPlacement ?? undefined;
-        const cropUV = args.cropUV?.get(id);
-        this.updateUniforms(s, args.outW, args.outH,
-          placement || cropUV ? { placement, cropUV } : undefined, out);
-        pass.setBindGroup(0, s.bindGroup);
-        pass.draw(4);
+      if (!s || !s.present || !s.bindGroup) continue;
+      const placement = args.placements?.get(id)
+        ?? s.interceptPlacement ?? undefined;
+      const cropUV = args.cropUV?.get(id);
+      // Geometric filter: a per-output drawList is the content POLICY
+      // (which surfaces are eligible to draw on this output via
+      // setOutputStack); the actual visibility filter is geometric
+      // overlap. Skip when the surface's rect doesn't overlap the
+      // output -- handles the brief window during a cross-output move
+      // when the new output's stack already includes the surface but
+      // the WM resize-tx hasn't applied the new geometry yet, so the
+      // surface would otherwise draw at the OLD position inside the
+      // NEW output's pass (straddling the boundary, wrong scale).
+      // Compose-path callers (explicit placements or intercept) bypass
+      // -- they place the surface explicitly.
+      if (out && !placement && !s.interceptPlacement) {
+        const sw = s.layoutW > 0 ? s.layoutW : s.width / (s.bufferScale || 1);
+        const sh = s.layoutH > 0 ? s.layoutH : s.height / (s.bufferScale || 1);
+        if (sw > 0 && sh > 0) {
+          const sx0 = s.x, sy0 = s.y;
+          const sx1 = sx0 + sw, sy1 = sy0 + sh;
+          const oscale = out.scale > 0 ? out.scale : 1;
+          const ox0 = out.originX, oy0 = out.originY;
+          const ox1 = ox0 + out.deviceWidth / oscale;
+          const oy1 = oy0 + out.deviceHeight / oscale;
+          if (sx1 <= ox0 || sx0 >= ox1 || sy1 <= oy0 || sy0 >= oy1) continue;
+        }
       }
+      this.updateUniforms(s, args.outW, args.outH,
+        placement || cropUV ? { placement, cropUV } : undefined, out);
+      pass.setBindGroup(0, s.bindGroup);
+      pass.draw(4);
     }
     pass.end();
   }
