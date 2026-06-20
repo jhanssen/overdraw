@@ -35,6 +35,7 @@ void KmsOutputBackend::close() {
         }
     }
     outputs_.clear();
+    usedCrtcs_.clear();
     if (gbm_) {
         gbm_device_destroy(gbm_);
         gbm_ = nullptr;
@@ -73,60 +74,147 @@ bool KmsOutputBackend::open(const char* /*title*/) {
     }
 
     // Build the driven-output list: the primary connector first (outputId 0),
-    // then every other connected connector in enumeration order (1..). Each
-    // gets a DISTINCT CRTC (excluding ones already claimed this session) +
-    // primary plane + resolved property ids. A connector that can't get a
-    // distinct CRTC/plane is logged and skipped -- the others still work.
-    std::vector<uint32_t> usedCrtcs;
-
-    auto buildOutput = [&](DrmTopology topo, uint32_t outputId) -> bool {
-        if (!pickCrtc(drmFd_, topo.connectorId, topo.crtcId, usedCrtcs)) {
-            std::fprintf(stderr, "[kms] connector %s id=%u: no distinct CRTC; skipping\n",
-                         topo.connectorName.c_str(), topo.connectorId);
-            return false;
-        }
-        if (!pickPrimaryPlane(drmFd_, topo.crtcId, topo.planeId)) {
-            std::fprintf(stderr, "[kms] connector %s id=%u crtc=%u: no primary plane; skipping\n",
-                         topo.connectorName.c_str(), topo.connectorId, topo.crtcId);
-            return false;
-        }
-        if (!resolveProperties(drmFd_, topo)) {
-            std::fprintf(stderr, "[kms] connector %s id=%u: property resolve failed; skipping\n",
-                         topo.connectorName.c_str(), topo.connectorId);
-            return false;
-        }
-        usedCrtcs.push_back(topo.crtcId);
-        std::printf("[kms] output %u connector %s id=%u mode=%ux%u @%umHz crtc=%u plane=%u\n",
-                    outputId, topo.connectorName.c_str(), topo.connectorId,
-                    topo.mode.hdisplay, topo.mode.vdisplay, topo.mode.vrefreshMhz,
-                    topo.crtcId, topo.planeId);
-        auto out = std::make_unique<PerOutput>();
-        out->outputId = outputId;
-        out->topo = std::move(topo);
-        outputs_.emplace(outputId, std::move(out));
-        return true;
-    };
-
-    // Primary must succeed (it drives the main output).
-    if (!buildOutput(std::move(primaryTopo), 0)) {
+    // then every other connected connector in enumeration order. Each gets a
+    // DISTINCT CRTC (excluding ones already claimed this session) + primary
+    // plane + resolved property ids via connectOutput(). A connector that
+    // can't get a distinct CRTC/plane is logged and skipped -- the others
+    // still work. Skipped connectors are NOT retried inside open(); a later
+    // rescan() (e.g. after an existing output disconnects, freeing its CRTC)
+    // does retry.
+    if (!connectOutput(std::move(primaryTopo), 0)) {
         std::fprintf(stderr, "[kms] primary output bring-up failed\n");
         return false;
     }
     const uint32_t primaryConnectorId = outputs_[0]->topo.connectorId;
 
-    uint32_t nextId = 1;
     for (auto& c : enumerateConnectors(drmFd_)) {
         if (c.connectorId == primaryConnectorId) continue;
         DrmTopology topo{};
         topo.connectorId = c.connectorId;
         topo.connectorName = c.name;
         topo.mode = c.mode;
-        if (buildOutput(std::move(topo), nextId)) ++nextId;
+        connectOutput(std::move(topo), allocateOutputId());
     }
 
     // Steps 9-13 (scanout rings + initial modeset) happen in initScanout(),
     // which needs the GPU device.
     return true;
+}
+
+bool KmsOutputBackend::connectOutput(DrmTopology topo, uint32_t outputId) {
+    // pickCrtc takes a vector view of the used set; rebuild it cheaply each
+    // call. usedCrtcs_ is the source of truth.
+    std::vector<uint32_t> usedView(usedCrtcs_.begin(), usedCrtcs_.end());
+    if (!pickCrtc(drmFd_, topo.connectorId, topo.crtcId, usedView)) {
+        std::fprintf(stderr, "[kms] connector %s id=%u: no distinct CRTC; skipping\n",
+                     topo.connectorName.c_str(), topo.connectorId);
+        return false;
+    }
+    if (!pickPrimaryPlane(drmFd_, topo.crtcId, topo.planeId)) {
+        std::fprintf(stderr, "[kms] connector %s id=%u crtc=%u: no primary plane; skipping\n",
+                     topo.connectorName.c_str(), topo.connectorId, topo.crtcId);
+        return false;
+    }
+    if (!resolveProperties(drmFd_, topo)) {
+        std::fprintf(stderr, "[kms] connector %s id=%u: property resolve failed; skipping\n",
+                     topo.connectorName.c_str(), topo.connectorId);
+        return false;
+    }
+    usedCrtcs_.insert(topo.crtcId);
+    std::printf("[kms] output %u connector %s id=%u mode=%ux%u @%umHz crtc=%u plane=%u\n",
+                outputId, topo.connectorName.c_str(), topo.connectorId,
+                topo.mode.hdisplay, topo.mode.vdisplay, topo.mode.vrefreshMhz,
+                topo.crtcId, topo.planeId);
+    auto out = std::make_unique<PerOutput>();
+    out->outputId = outputId;
+    out->topo = std::move(topo);
+    outputs_.emplace(outputId, std::move(out));
+    return true;
+}
+
+void KmsOutputBackend::disconnectOutput(uint32_t outputId) {
+    auto it = outputs_.find(outputId);
+    if (it == outputs_.end()) return;
+    PerOutput& o = *it->second;
+
+    // Software teardown only. The connector is already off (it vanished, or
+    // the kernel disabled it on our behalf via udev). The next time this
+    // CRTC is reused for a different connector, that connect's initial
+    // ALLOW_MODESET commit fully reprograms it. If we ever support
+    // electively disabling an output while it's still physically connected
+    // (M8 \"disabled output\"), we'd want an atomic-disable commit here.
+    usedCrtcs_.erase(o.topo.crtcId);
+    o.ring.clear();
+    if (o.modeBlobId != 0 && drmFd_ >= 0) {
+        drmModeDestroyPropertyBlob(drmFd_, o.modeBlobId);
+        o.modeBlobId = 0;
+    }
+    std::printf("[kms] output %u connector %s disconnected (crtc %u released)\n",
+                outputId, o.topo.connectorName.c_str(), o.topo.crtcId);
+    outputs_.erase(it);
+}
+
+uint32_t KmsOutputBackend::allocateOutputId() const {
+    for (uint32_t i = 0; ; ++i) {
+        if (outputs_.find(i) == outputs_.end()) return i;
+    }
+}
+
+KmsOutputBackend::RescanResult KmsOutputBackend::rescan() {
+    RescanResult result;
+    if (drmFd_ < 0) return result;
+
+    // Phase 1: scan. enumerateConnectors() returns every connector that
+    // currently reports connection==CONNECTED with a usable mode.
+    auto live = enumerateConnectors(drmFd_);
+
+    // Index live connectors by id for fast lookup, and build the
+    // already-claimed connector set for phase 4 dedup.
+    std::unordered_map<uint32_t, const ConnectorInfo*> liveById;
+    liveById.reserve(live.size());
+    for (const auto& c : live) liveById.emplace(c.connectorId, &c);
+
+    std::unordered_set<uint32_t> claimedConnectors;
+    claimedConnectors.reserve(outputs_.size());
+    for (const auto& [id, o] : outputs_) claimedConnectors.insert(o->topo.connectorId);
+
+    // Phase 2: disconnect-vanished. An output's connector that is no longer
+    // in the live set goes away. Iterate over a snapshot of ids so we can
+    // erase from outputs_ during the walk.
+    std::vector<uint32_t> ids = outputIds();
+    for (uint32_t id : ids) {
+        const auto it = outputs_.find(id);
+        if (it == outputs_.end()) continue;
+        const uint32_t connId = it->second->topo.connectorId;
+        if (liveById.find(connId) == liveById.end()) {
+            result.removed.push_back(id);
+            disconnectOutput(id);
+        }
+    }
+
+    // Phase 3: recheck-CRTCs is currently a no-op for already-assigned
+    // outputs (see RescanResult docstring for the limitation). Phase 4
+    // (below) is the actual two-pass for connectors-without-an-output:
+    // they try to claim a free CRTC each rescan, picking up CRTCs freed by
+    // phase 2.
+
+    // Phase 4: connect-new. Any live connector that doesn't already back
+    // a live output tries to claim a free CRTC + plane and join outputs_.
+    // A connector that fails (e.g. no matching free CRTC) is silently
+    // skipped this rescan; the next rescan retries it.
+    for (const auto& c : live) {
+        if (claimedConnectors.count(c.connectorId)) continue;
+        DrmTopology topo{};
+        topo.connectorId   = c.connectorId;
+        topo.connectorName = c.name;
+        topo.mode          = c.mode;
+        const uint32_t newId = allocateOutputId();
+        if (connectOutput(std::move(topo), newId)) {
+            result.added.push_back(newId);
+        }
+    }
+
+    return result;
 }
 
 bool KmsOutputBackend::initScanout(const wgpu::Device& device) {

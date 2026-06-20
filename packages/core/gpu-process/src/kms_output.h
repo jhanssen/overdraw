@@ -30,6 +30,7 @@
 #include <cstdint>
 #include <memory>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include "dawn/webgpu_cpp.h"
@@ -129,6 +130,32 @@ class KmsOutputBackend : public OutputBackend {
     // didn't succeed.
     uint64_t deviceId() const { return deviceId_; }
 
+    // Rescan result: which outputIds vanished and which were freshly
+    // created. The caller (GPU process main loop) uses these to send the
+    // OutputRemoved / OutputAdded IPC tags; descriptors for added ids can
+    // be queried via describeOutputAt().
+    struct RescanResult {
+        std::vector<uint32_t> removed;
+        std::vector<uint32_t> added;
+    };
+
+    // Re-probe every DRM connector and reconcile against the current
+    // outputs_ set. Implements multi-output-design.md §10's two-pass
+    // (scan -> disconnect-vanished -> recheck-CRTCs -> connect-new). Idempotent
+    // when nothing changed (empty added/removed). Safe to call any time
+    // after open() has succeeded; does NOT allocate scanout rings -- those
+    // come from the core's ScanoutReserve after the OutputAdded IPC.
+    //
+    // Limitations:
+    //   - The two-pass "recheck-CRTCs" pass is a no-op for already-assigned
+    //     outputs: an output never loses its CRTC mid-run unless it itself
+    //     disconnects. So connector X that was previously skipped for
+    //     lack of a free CRTC IS retried (it's just a new connect-new), but
+    //     a swap like \"X has CRTC 0; Y wants CRTC 0; if we moved X to CRTC
+    //     1 then Y fits\" is NOT performed. That cornered case stays a TODO
+    //     pending a real reproduction; the design doc (§10) calls it out.
+    RescanResult rescan();
+
   private:
     // One driven monitor: its topology, scanout ring, mode blob, and page-flip
     // state. Held by unique_ptr because KmsScanoutRing is non-movable (deleted
@@ -166,12 +193,38 @@ class KmsOutputBackend : public OutputBackend {
     PerOutput* find(uint32_t outputId);
     const PerOutput* find(uint32_t outputId) const;
 
+    // Build a fresh PerOutput for a connector that has just come up (or
+    // was just enumerated at startup). Picks a free CRTC + primary plane
+    // matching the connector's possible_crtcs mask, resolves all property
+    // ids, and inserts into outputs_ keyed by outputId. Returns false on
+    // any sub-step failure (logged); leaves outputs_ unchanged on failure.
+    // Used by both open() and rescan(); each call grows usedCrtcs_ on
+    // success.
+    bool connectOutput(DrmTopology topo, uint32_t outputId);
+
+    // Tear down one PerOutput's software state: drop the CRTC from
+    // usedCrtcs_, destroy the mode blob, clear the ring slots, remove the
+    // entry from outputs_. Does NOT issue an atomic-disable commit -- a
+    // vanished connector is already off, and the next time the CRTC is
+    // reused, the new initial commit's ALLOW_MODESET fully reprograms it.
+    // No-op if outputId is not live.
+    void disconnectOutput(uint32_t outputId);
+
+    // Smallest non-negative uint32 not currently in use by outputs_. Today
+    // outputs_ stays small (<10), so the linear scan is fine; revisit if
+    // outputs ever go into the hundreds (multi-card territory, M9+).
+    uint32_t allocateOutputId() const;
+
     int drmFd_ = -1;   // borrowed; not closed
     gbm_device* gbm_ = nullptr;
     uint64_t deviceId_ = 0;
     bool shouldClose_ = false;
     bool paused_ = false;
     std::unordered_map<uint32_t, std::unique_ptr<PerOutput>> outputs_;
+    // CRTC ids currently bound to a live output. Mutated by connectOutput
+    // (insert) / disconnectOutput (erase). connectOutput passes a transient
+    // vector view of this set into the existing pickCrtc helper.
+    std::unordered_set<uint32_t> usedCrtcs_;
     ResizeListener resizeListener_;
     FlipCompleteCb flipCompleteListener_;
 };
