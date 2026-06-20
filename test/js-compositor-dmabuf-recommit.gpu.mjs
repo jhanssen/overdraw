@@ -52,9 +52,15 @@ test("Layer C: same-buffer re-commit shows pixels every frame (black-frame regre
     let stdout = "";
     client.stdout.on("data", (d) => { stdout += d.toString(); });
 
-    // Wait for the surface to map.
-    const snap = await c.waitFor(c.query, (s) => s.windows.length === 1,
-      { what: "window", timeoutMs: 4000 });
+    // Wait for the surface to map AND for its tile rect to settle (the layout
+    // driver schedules async; until the workspace plugin's setOutputStack
+    // populates outputContent, the WM holds the addWindow placeholder
+    // rect{0,0,-1,-1}). Polling on windows.length alone would read a
+    // placeholder rect and produce a center at (-1,-1) -> pixelAt yields null
+    // samples, which would falsely trip the BLACK-readback assertion.
+    const snap = await c.waitFor(c.query,
+      (s) => s.windows.length === 1 && s.windows[0].rect.width > 0,
+      { what: "window with real tile", timeoutMs: 4000 });
     const w = snap.windows[0];
     const cx = w.rect.x + (w.rect.width >> 1);
     const cy = w.rect.y + (w.rect.height >> 1);

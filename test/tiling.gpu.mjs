@@ -16,12 +16,24 @@ const skip = !canRunGpu() ? "needs GPU (no render node / dawn.node)"
 
 const LAYOUT = { masterFraction: 0.5, gap: 0 };
 
-// Spawn a client and wait until exactly `n` windows are present in query().
+// Spawn a client and wait until exactly `n` windows are present in query()
+// AND their rects have settled to the predicted master-stack layout. The
+// settle step is necessary because retiling existing windows routes through
+// the resize transaction (the test's harness-client doesn't re-render on
+// configure, so the broker's 150ms deadline drives the apply); without
+// waiting, query() would return stale rects.
 async function spawnAndWait(c, n, appId) {
   const h = c.spawnClient(["--app-id", appId, "--title", appId]);
   await h.ready;
-  await c.waitFor(c.query, (s) => s.windows.length === n,
-    { what: `${n} window(s)`, timeoutMs: 4000 });
+  const out = { width: c.dims.width, height: c.dims.height };
+  const expect = masterStackLayout(n, out, LAYOUT);
+  const settled = (s) =>
+    s.windows.length === n
+    && s.windows.every((w, i) =>
+      w.rect.x === expect[i].x && w.rect.y === expect[i].y
+      && w.rect.width === expect[i].width && w.rect.height === expect[i].height);
+  await c.waitFor(c.query, settled,
+    { what: `${n} window(s) tiled`, timeoutMs: 4000 });
   return h;
 }
 

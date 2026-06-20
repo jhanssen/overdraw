@@ -71,11 +71,17 @@ test("headless: two clients tile side-by-side; each fills its half", { skip }, a
     const a = c.spawnClient([FILL, "--color", cA.toString(16)]); await a.ready;
     await c.waitFor(c.query, (s) => s.windows.length === 1, { what: "first" });
     const b = c.spawnClient([FILL, "--color", cB.toString(16)]); await b.ready;
-    const snap = await c.waitFor(c.query, (s) => s.windows.length === 2, { what: "second" });
+    // Wait for both windows to be present + the layout's resize transaction
+    // to settle (each client must re-render at its new tile size before the
+    // WM commits the geometry; see wm/index.ts applyLayout transaction path).
+    // Poll on tile width: master tiles at masterFraction=0.5 -> 640px wide.
+    const settled = await c.waitFor(c.query,
+      (s) => s.windows.length === 2 && s.windows.every((w) => w.rect.width === 640),
+      { what: "two tiles settled at 640px" });
 
     // windows[0] = master (newest = B), windows[1] = stack (A).
-    const master = snap.windows[0];   // B, left half
-    const stack = snap.windows[1];    // A, right half
+    const master = settled.windows[0];   // B, left half
+    const stack = settled.windows[1];    // A, right half
     const bgraMaster = argbToBgra(cB);
     const bgraStack = argbToBgra(cA);
 

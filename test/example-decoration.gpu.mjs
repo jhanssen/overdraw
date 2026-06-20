@@ -30,7 +30,11 @@ const W = 256, H = 256;
 test("example animated-gradient decoration composites + animates", { skip }, async () => {
   const bus = createCompositorBus();
   const pluginBus = new DynamicBus();
-  const c = await setupCompositor({ bus, headless: { width: W, height: H } });
+  // Pass pluginBus so the WM's window.relayout reaches the decoration
+  // registry's notifyRelayout (wired below). Without this the broker leaves
+  // the assignment in its pending map -- window.map fires with the WM
+  // placeholder rect, layout-driver is async.
+  const c = await setupCompositor({ bus, pluginBus, headless: { width: W, height: H } });
   let runtime = null;
   // Republish core window.* events onto the plugin bus, where the runtime
   // delivers them to subscribed plugins.
@@ -42,6 +46,16 @@ test("example animated-gradient decoration composites + animates", { skip }, asy
   const h = c.addon.gpuHandles();
   const overlays = createOverlayBroker(c.state, { width: W, height: H });
   const decoBroker = createDecorationBroker({ bus, state: c.state, emitToPlugin: (p, n, d) => runtime?.emit(p, n, d) });
+  // window.relayout -> decoration registry (mirrors main.ts).
+  pluginBus.subscribe(WINDOW_EVENT.relayout, (_n, payload) => {
+    const ev = payload;
+    if (!ev || typeof ev.surfaceId !== "number") return;
+    const r = ev.newOuter;
+    if (!r || typeof r.x !== "number" || typeof r.y !== "number"
+        || typeof r.width !== "number" || typeof r.height !== "number") return;
+    decoBroker.registry.notifyRelayout(ev.surfaceId,
+      { x: r.x, y: r.y, width: r.width, height: r.height });
+  });
   const gpuBroker = createGpuBroker({
     addon: c.addon, compositor: c.jsCompositor, overlays, dawn, coreDeviceHandle: h.device,
     onSurfaceAllocated: (sid, win) => decoBroker.onSurfaceAllocated(sid, win),
@@ -66,7 +80,16 @@ test("example animated-gradient decoration composites + animates", { skip }, asy
     const filler = c.spawnClient(["--app-id", "filler", "--size", "50x50"]);
     await filler.ready; await waitFor(c.query, (s) => s.windows.length === 1);
     const client = c.spawnClient(["--app-id", "org.test.app", "--size", "200x100", "--color", "FFFF0000"]);
-    await client.ready; await waitFor(c.query, (s) => s.windows.length === 2);
+    await client.ready;
+    // Wait for both windows to settle to their tiles. The filler ignores
+    // configure (no --fill-configured), so its resize transaction relies
+    // on the WM's 150ms deadline to force-apply -- poll query() until
+    // the two rects no longer overlap horizontally (master/stack split).
+    await waitFor(c.query, (s) => {
+      if (s.windows.length !== 2) return false;
+      const [a, b] = s.windows.map((w) => w.rect).sort((p, q) => p.x - q.x);
+      return a.x + a.width <= b.x;
+    }, { what: "two tiles non-overlapping" });
 
     const win = c.query().windows.find((w) => w.appId === "org.test.app");
     // Atomic appearance: wait for the decoration to be bound AND the gate to

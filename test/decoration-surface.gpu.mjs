@@ -29,7 +29,13 @@ const W = 256, H = 256;
 test("decoration surface composites at the inset rect above the window", { skip }, async () => {
   const bus = createCompositorBus();
   const pluginBus = new DynamicBus();
-  const c = await setupCompositor({ bus, headless: { width: W, height: H } });
+  // Pass our pluginBus to the harness so the WM's window.relayout emits land
+  // on it -- the decoration registry's notifyRelayout (below) listens here to
+  // promote a "pending" tentative match into a real assignment when the WM
+  // finally publishes a valid outer rect. Without this, the broker's pending
+  // map traps the assignment forever (window.map fires with the WM's
+  // placeholder rect since the layout-driver schedule is async).
+  const c = await setupCompositor({ bus, pluginBus, headless: { width: W, height: H } });
 
   // Forward window.* to the runtime (mirrors main.ts).
   let runtime = null;
@@ -43,6 +49,16 @@ test("decoration surface composites at the inset rect above the window", { skip 
   const overlays = createOverlayBroker(c.state, { width: W, height: H });
   const decoBroker = createDecorationBroker({
     bus, state: c.state, emitToPlugin: (p, n, d) => { runtime?.emit(p, n, d); },
+  });
+  // Wire window.relayout -> decorationRegistry.notifyRelayout (mirrors main.ts).
+  pluginBus.subscribe(WINDOW_EVENT.relayout, (_n, payload) => {
+    const ev = payload;
+    if (!ev || typeof ev.surfaceId !== "number") return;
+    const r = ev.newOuter;
+    if (!r || typeof r.x !== "number" || typeof r.y !== "number"
+        || typeof r.width !== "number" || typeof r.height !== "number") return;
+    decoBroker.registry.notifyRelayout(ev.surfaceId,
+      { x: r.x, y: r.y, width: r.width, height: r.height });
   });
   const gpuBroker = createGpuBroker({
     addon: c.addon, compositor: c.jsCompositor, overlays, dawn, coreDeviceHandle: h.device,
@@ -87,6 +103,16 @@ test("decoration surface composites at the inset rect above the window", { skip 
     // The provider draws on assignment; wait for its "decorated" log + the rect.
     await waitForLog(logs, (l) => l.startsWith("decorated "), 6000);
     const outer = JSON.parse(logs.find((l) => l.startsWith("decorated ")).slice("decorated ".length));
+    // After the decorated window maps the WM retiles both windows to the
+    // master-stack split (master = left half, stack = right half). The filler
+    // ignores configure, so its resize transaction relies on the broker's
+    // 150ms deadline to force-apply -- poll query() until both rects are
+    // non-overlapping and partition the output before sampling pixels.
+    await waitFor(c.query, (s) => {
+      if (s.windows.length !== 2) return false;
+      const widths = s.windows.map((w) => w.rect.width).sort((a, b) => a - b);
+      return widths[0] + widths[1] === W;
+    }, { what: "two non-overlapping tiles", timeoutMs: 4000 });
 
     // The decorated window's content rect (from query); cascaded below the filler
     // so its top inset band (cr.y-24 .. cr.y) is on-screen.

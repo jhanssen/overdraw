@@ -28,7 +28,11 @@ const W = 256, H = 256;
 test("broken decoration provider times out: content shown undecorated + deregistered", { skip }, async () => {
   const bus = createCompositorBus();
   const pluginBus = new DynamicBus();
-  const c = await setupCompositor({ bus, headless: { width: W, height: H } });
+  // Pass pluginBus to the harness so the WM's window.relayout reaches the
+  // decoration registry's notifyRelayout (wired below). Without this the
+  // broker leaves the assignment in its pending map (window.map fires with
+  // the WM placeholder rect, layout-driver is async).
+  const c = await setupCompositor({ bus, pluginBus, headless: { width: W, height: H } });
 
   let runtime = null;
   bus.on(WINDOW_EVENT.map, (ev) => pluginBus.emit(WINDOW_EVENT.map, ev));
@@ -42,6 +46,16 @@ test("broken decoration provider times out: content shown undecorated + deregist
   const decoBroker = createDecorationBroker({
     bus, state: c.state, timeoutMs: 150,
     emitToPlugin: (p, n, d) => { runtime?.emit(p, n, d); },
+  });
+  // window.relayout -> decoration registry (mirrors main.ts).
+  pluginBus.subscribe(WINDOW_EVENT.relayout, (_n, payload) => {
+    const ev = payload;
+    if (!ev || typeof ev.surfaceId !== "number") return;
+    const r = ev.newOuter;
+    if (!r || typeof r.x !== "number" || typeof r.y !== "number"
+        || typeof r.width !== "number" || typeof r.height !== "number") return;
+    decoBroker.registry.notifyRelayout(ev.surfaceId,
+      { x: r.x, y: r.y, width: r.width, height: r.height });
   });
   const gpuBroker = createGpuBroker({
     addon: c.addon, compositor: c.jsCompositor, overlays, dawn, coreDeviceHandle: h.device,
@@ -83,6 +97,15 @@ test("broken decoration provider times out: content shown undecorated + deregist
     // release the gate.
     await waitForLog(logs, (l) => l.startsWith("assigned "));
     await waitForLog(logs, (l) => l.startsWith("deregistered "), 3000);
+
+    // Wait for the post-second-window retile to settle (filler ignores
+    // configure, so the WM's resize transaction relies on the broker's
+    // deadline; query() until both tiles partition the output).
+    await waitFor(c.query, (s) => {
+      if (s.windows.length !== 2) return false;
+      const widths = s.windows.map((w) => w.rect.width).sort((a, b) => a - b);
+      return widths[0] + widths[1] === W;
+    }, { what: "two tiles settled", timeoutMs: 4000 });
 
     const win = c.query().windows.find((w) => w.appId === "org.test.broken");
     assert.ok(win, "window in query");

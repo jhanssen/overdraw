@@ -38,7 +38,11 @@ test("two tiled decorated windows both show their own content after retile",
      { skip }, async () => {
   const bus = createCompositorBus();
   const pluginBus = new DynamicBus();
-  const c = await setupCompositor({ bus, headless: { width: W, height: H }, layout: LAYOUT });
+  // Pass pluginBus so the WM's window.relayout reaches the decoration
+  // registry's notifyRelayout (wired below). Without this the broker
+  // leaves the assignment in its pending map -- window.map fires with
+  // the WM placeholder rect, layout-driver is async.
+  const c = await setupCompositor({ bus, pluginBus, headless: { width: W, height: H }, layout: LAYOUT });
 
   // Forward window.* to the runtime so the decoration broker sees them.
   let runtime = null;
@@ -51,6 +55,16 @@ test("two tiled decorated windows both show their own content after retile",
   const overlays = createOverlayBroker(c.state, { width: W, height: H });
   const decoBroker = createDecorationBroker({
     bus, state: c.state, emitToPlugin: (p, n, d) => { runtime?.emit(p, n, d); },
+  });
+  // window.relayout -> decoration registry (mirrors main.ts).
+  pluginBus.subscribe(WINDOW_EVENT.relayout, (_n, payload) => {
+    const ev = payload;
+    if (!ev || typeof ev.surfaceId !== "number") return;
+    const r = ev.newOuter;
+    if (!r || typeof r.x !== "number" || typeof r.y !== "number"
+        || typeof r.width !== "number" || typeof r.height !== "number") return;
+    decoBroker.registry.notifyRelayout(ev.surfaceId,
+      { x: r.x, y: r.y, width: r.width, height: r.height });
   });
   // Wire the WM's decoration-resize indirection so an outer-tile change emits
   // decoration.resized to the owning plugin (mirrors src/main.ts).

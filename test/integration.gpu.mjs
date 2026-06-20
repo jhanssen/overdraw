@@ -43,7 +43,14 @@ test("two clients -> both windows; newest is master (front of layout order)", { 
     const a = c.spawnClient(["--title", "a"]); await a.ready;
     await c.waitFor(c.query, (s) => s.windows.length === 1, { what: "first window" });
     const b = c.spawnClient(["--title", "b"]); await b.ready;
-    const snap = await c.waitFor(c.query, (s) => s.windows.length === 2, { what: "second window" });
+    // Wait for the resize transaction to settle (each client must re-render
+    // at its new tile size before the WM commits the new geometry; see
+    // wm/index.ts applyLayout transaction path). Without this we'd read
+    // stale rects: A still 1280-wide, B already 640-wide.
+    const snap = await c.waitFor(c.query,
+      (s) => s.windows.length === 2
+        && s.windows[0].rect.width + s.windows[1].rect.width === c.dims.width,
+      { what: "two tiles settled" });
     assert.equal(snap.stack.length, 2);
     // Master-stack: the most recently mapped window becomes master = front of the
     // layout order (windows[0]).
