@@ -791,6 +791,11 @@ export interface OutputRecord {
   physicalHeightMm: number;
   make: string;
   model: string;
+  // Durable identifier from EDID (mfr-product-serial). Empty when the
+  // connector has no usable EDID. The workspace plugin (M7 step 5) keys
+  // `preferredOutputs` on this when non-empty and falls back to `name`
+  // otherwise -- see multi-output-design §3.
+  edidId: string;
 }
 
 // Protocol-level layer enum from zwlr_layer_shell_v1.layer. Uses the

@@ -82,6 +82,7 @@ function fallback(state: CompositorState): OutputRecord {
     physicalHeightMm: 0,
     make: "overdraw",
     model: "overdraw nested output",
+    edidId: "",
   };
 }
 

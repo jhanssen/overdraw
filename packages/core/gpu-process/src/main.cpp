@@ -547,15 +547,17 @@ int run(int wireFd, int ctrlFd, int inputFd, bool headless,
         m.outTransform     = info.transform;
         m.physicalWidthMm  = info.physicalWidthMm;
         m.physicalHeightMm = info.physicalHeightMm;
-        std::memcpy(m.outputName,  info.name,  sizeof(m.outputName));
-        std::memcpy(m.outputMake,  info.make,  sizeof(m.outputMake));
-        std::memcpy(m.outputModel, info.model, sizeof(m.outputModel));
+        std::memcpy(m.outputName,   info.name,   sizeof(m.outputName));
+        std::memcpy(m.outputMake,   info.make,   sizeof(m.outputMake));
+        std::memcpy(m.outputModel,  info.model,  sizeof(m.outputModel));
+        std::memcpy(m.outputEdidId, info.edidId, sizeof(m.outputEdidId));
         ipc::sendMessage(ctrlFd, m);
         std::printf(
             "[gpu] sent OutputDescriptor: %ux%u @%umHz scale=%u xform=%u "
-            "phys=%ux%umm name=%s make=%s model=%s\n",
+            "phys=%ux%umm name=%s make=%s model=%s edid=%s\n",
             info.width, info.height, info.refreshMhz, info.scale, info.transform,
-            info.physicalWidthMm, info.physicalHeightMm, info.name, info.make, info.model);
+            info.physicalWidthMm, info.physicalHeightMm, info.name, info.make, info.model,
+            info.edidId);
     }
     }  // if (!headless && !outputKms)
 
@@ -683,9 +685,10 @@ int run(int wireFd, int ctrlFd, int inputFd, bool headless,
         m.outTransform     = info.transform;
         m.physicalWidthMm  = info.physicalWidthMm;
         m.physicalHeightMm = info.physicalHeightMm;
-        std::memcpy(m.outputName,  info.name,  sizeof(m.outputName));
-        std::memcpy(m.outputMake,  info.make,  sizeof(m.outputMake));
-        std::memcpy(m.outputModel, info.model, sizeof(m.outputModel));
+        std::memcpy(m.outputName,   info.name,   sizeof(m.outputName));
+        std::memcpy(m.outputMake,   info.make,   sizeof(m.outputMake));
+        std::memcpy(m.outputModel,  info.model,  sizeof(m.outputModel));
+        std::memcpy(m.outputEdidId, info.edidId, sizeof(m.outputEdidId));
     };
 #endif
 
@@ -802,9 +805,10 @@ int run(int wireFd, int ctrlFd, int inputFd, bool headless,
                 m.outTransform     = info.transform;
                 m.physicalWidthMm  = info.physicalWidthMm;
                 m.physicalHeightMm = info.physicalHeightMm;
-                std::memcpy(m.outputName,  info.name,  sizeof(m.outputName));
-                std::memcpy(m.outputMake,  info.make,  sizeof(m.outputMake));
-                std::memcpy(m.outputModel, info.model, sizeof(m.outputModel));
+                std::memcpy(m.outputName,   info.name,   sizeof(m.outputName));
+                std::memcpy(m.outputMake,   info.make,   sizeof(m.outputMake));
+                std::memcpy(m.outputModel,  info.model,  sizeof(m.outputModel));
+                std::memcpy(m.outputEdidId, info.edidId, sizeof(m.outputEdidId));
                 ipc::sendMessage(ctrlFd, m);
                 std::printf("[gpu] resize -> %ux%u; reconfigured surface; sent OutputDescriptor\n",
                             newW, newH);

@@ -72,6 +72,19 @@ struct EdidInfo {
     uint32_t physicalWidthMm  = 0;
     uint32_t physicalHeightMm = 0;
     std::string productName;
+    // Stable durable identifier built from the EDID header bytes:
+    // "<MFR>-<PRODUCT_HEX>-<SERIAL_HEX>". MFR is 3 ASCII letters encoded
+    // in EDID bytes 8-9 (5 bits each, big-endian). PRODUCT_HEX is the
+    // 16-bit little-endian product code (bytes 10-11), uppercase hex.
+    // SERIAL_HEX is the 32-bit little-endian serial (bytes 12-15),
+    // uppercase hex. Empty when the EDID is unreadable or malformed
+    // (caller falls back to the connector name as durable key).
+    // Two identical-model monitors with distinct factory serials produce
+    // distinct stableId values; two identical monitors with no serial
+    // (serial bytes = 0) alias to the same stableId, which §3 acknowledges
+    // as a known limitation -- the connector-name fallback disambiguates
+    // them by port at the cost of port-swap robustness.
+    std::string stableId;
 };
 
 // One (format, modifier) tuple advertised by a plane's IN_FORMATS property.

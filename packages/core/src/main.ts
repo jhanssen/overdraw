@@ -56,6 +56,7 @@ import { nextOutputPosition } from "./output/arrangement.js";
 import { reemitWlOutput } from "./protocols/wl_output.js";
 import { reemitXdgOutput } from "./protocols/zxdg_output_manager_v1.js";
 import { reemitFractionalScale } from "./protocols/wp_fractional_scale_manager_v1.js";
+import { makeOnOutputAdded, makeOnOutputRemoved } from "./output/hotplug.js";
 import { WINDOW_EVENT } from "./events/types.js";
 import { createCompositorBus } from "./events/window-bus.js";
 import { DynamicBus } from "./events/dynamic-bus.js";
@@ -342,6 +343,7 @@ addon.setOnOutputDescriptor((d) => {
       physicalHeightMm: d.physicalHeightMm,
       make: d.make,
       model: d.model,
+      edidId: d.edidId,
     };
     outputs.set(d.outputId, rec);
     // Advertise a wl_output global for this new connector so clients see it
@@ -371,6 +373,12 @@ addon.setOnOutputDescriptor((d) => {
     rec.name = d.name;
     rec.make = d.make;
     rec.model = d.model;
+    // edidId is durable: an OutputDescriptor re-emit (e.g. nested resize) for
+    // the same outputId reflects the same physical connector. Only adopt the
+    // descriptor's value when the record is missing one (defensive: empty
+    // would mean the GPU process couldn't parse the EDID at all, not "the
+    // identity changed"); otherwise leave the previous durable id intact.
+    if (!rec.edidId) rec.edidId = d.edidId;
     // description stays as set by installProtocols's seed; the descriptor
     // doesn't carry one (xdg-output's description is overdraw-owned policy).
     log.info("core",
@@ -453,6 +461,21 @@ pluginBus.subscribe("output.changed", (_name, payload) => {
   reemitXdgOutput(state, outputId);
   reemitFractionalScale(state);
 });
+
+// M7 hotplug handlers. Logic factored out into output/hotplug.ts so tests
+// can call the handler directly with a mocked addon/state.
+{
+  if (!state) throw new Error("internal: state not set before hotplug wiring");
+  const hotplugDeps = {
+    addon, state, compositor, pluginBus,
+    config: { scale: config.scale },
+    allowEdidAutoScale: backendOpts.backend === "kms",
+    log: { info: (m: string) => log.info("core", m),
+           warn: (m: string) => log.warn("core", m) },
+  };
+  addon.setOnOutputAdded(makeOnOutputAdded(hotplugDeps));
+  addon.setOnOutputRemoved(makeOnOutputRemoved(hotplugDeps));
+}
 
 log.info("core", `Wayland server listening.`);
 log.info("core", `run a client with:  WAYLAND_DISPLAY=${sock} <your-client>`);

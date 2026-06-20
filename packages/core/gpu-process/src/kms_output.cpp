@@ -296,10 +296,14 @@ void KmsOutputBackend::fillIdentity(uint32_t connectorId, const std::string& nam
         // Model: EDID product name if available, else the connector name.
         const std::string& model = !edid.productName.empty() ? edid.productName : name;
         std::strncpy(out.model, model.c_str(), sizeof(out.model) - 1);
+        // Durable identifier (multi-output-design §3). Empty when the EDID
+        // header didn't parse; the core falls back to the connector name.
+        std::strncpy(out.edidId, edid.stableId.c_str(), sizeof(out.edidId) - 1);
     } else {
         std::strncpy(out.name, name.c_str(), sizeof(out.name) - 1);
         std::strncpy(out.make, "overdraw", sizeof(out.make) - 1);
         std::strncpy(out.model, name.c_str(), sizeof(out.model) - 1);
+        // edidId stays empty (default-constructed); core falls back to name.
     }
 }
 

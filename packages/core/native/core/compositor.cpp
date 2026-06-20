@@ -244,9 +244,10 @@ bool Compositor::bringUp() {
                     size_t n = ::strnlen(s, cap);
                     return std::string(s, n);
                 };
-                msg.name  = bounded(m.outputName,  sizeof(m.outputName));
-                msg.make  = bounded(m.outputMake,  sizeof(m.outputMake));
-                msg.model = bounded(m.outputModel, sizeof(m.outputModel));
+                msg.name   = bounded(m.outputName,   sizeof(m.outputName));
+                msg.make   = bounded(m.outputMake,   sizeof(m.outputMake));
+                msg.model  = bounded(m.outputModel,  sizeof(m.outputModel));
+                msg.edidId = bounded(m.outputEdidId, sizeof(m.outputEdidId));
                 pendingOutputDescriptors_.push_back(std::move(msg));
                 return firstPhaseDone();
             }
@@ -512,6 +513,57 @@ void Compositor::takePendingOutputDescriptors(std::vector<OutputDescriptorMsg>& 
     pendingOutputDescriptors_.clear();
 }
 
+void Compositor::takePendingOutputsAdded(std::vector<OutputDescriptorMsg>& out) {
+    out.insert(out.end(),
+               std::make_move_iterator(pendingOutputsAdded_.begin()),
+               std::make_move_iterator(pendingOutputsAdded_.end()));
+    pendingOutputsAdded_.clear();
+}
+
+void Compositor::takePendingOutputsRemoved(std::vector<uint32_t>& out) {
+    out.insert(out.end(),
+               pendingOutputsRemoved_.begin(), pendingOutputsRemoved_.end());
+    pendingOutputsRemoved_.clear();
+}
+
+void Compositor::reserveScanoutForOutput(uint32_t outputId, uint32_t width, uint32_t height) {
+    if (!kmsMode_) return;
+    WGPUTextureDescriptor td{};
+    td.size = { width, height, 1 };
+    td.mipLevelCount = 1;
+    td.sampleCount = 1;
+    td.dimension = WGPUTextureDimension_2D;
+    td.format = static_cast<WGPUTextureFormat>(renderFormat_);
+    td.usage = WGPUTextureUsage_RenderAttachment | WGPUTextureUsage_TextureBinding;
+    ipc::Message rsMsg{};
+    rsMsg.tag = ipc::Tag::ScanoutReserve;
+    rsMsg.outputId = outputId;
+    rsMsg.width = width;
+    rsMsg.height = height;
+    ScanoutOutput& so = scanoutOutputs_[outputId];
+    for (int i = 0; i < 3; ++i) {
+        auto r = link_->client().ReserveTexture(device_.Get(), &td);
+        so.slots[i].handleId  = r.handle.id;
+        so.slots[i].handleGen = r.handle.generation;
+        so.slots[i].state     = ScanoutSlotState::FREE;
+        so.slots[i].tex       = r.texture;
+        so.slots[i].surfaceBufId = nextSurfaceBufId_++;
+        rsMsg.scanoutHandles[i] = { r.handle.id, r.handle.generation };
+        rsMsg.scanoutBufIds[i]  = so.slots[i].surfaceBufId;
+    }
+    so.currentSlot = -1;
+    // Flush reserves before publishing ScanoutReserve so the GPU process's wire
+    // reader has consumed the reservation bytes by the time it InjectTextures.
+    link_->flush();
+    if (ctrlSender_) ctrlSender_->send(rsMsg);
+    else ipc::sendMessage(ctrlFd_, rsMsg);  // pre-handshake call site is unreachable today
+}
+
+void Compositor::releaseScanoutForOutput(uint32_t outputId) {
+    if (!kmsMode_) return;
+    scanoutOutputs_.erase(outputId);
+}
+
 void Compositor::drainCtrl() {
     // Dispatch any available side-channel control messages. In steady state the
     // only message the GPU process sends unsolicited (relative to the present
@@ -548,27 +600,62 @@ void Compositor::drainCtrl() {
             flipCompletes_.push_back(0);
             continue;
         }
-        if (r.tag == ipc::Tag::OutputDescriptor) {
+        // Helper: build an OutputDescriptorMsg from the wire message's
+        // descriptor-bearing fields. Shared by OutputDescriptor and OutputAdded.
+        auto bounded = [](const char* s, size_t cap) {
+            size_t n = ::strnlen(s, cap);
+            return std::string(s, n);
+        };
+        auto buildDesc = [&](const ipc::Message& m) {
             OutputDescriptorMsg msg{};
-            msg.outputId         = r.outputId;
-            msg.width            = r.width;
-            msg.height           = r.height;
-            msg.refreshMhz       = r.refreshMhz;
-            msg.scale            = r.outScale;
-            msg.transform        = r.outTransform;
-            msg.physicalWidthMm  = r.physicalWidthMm;
-            msg.physicalHeightMm = r.physicalHeightMm;
-            // Bounded NUL-terminated strings on the wire; trust the source's
-            // bound (the GPU process wrote with copyBounded which guarantees
-            // NUL-termination within the buffer), but cap defensively.
-            auto bounded = [](const char* s, size_t cap) {
-                size_t n = ::strnlen(s, cap);
-                return std::string(s, n);
-            };
-            msg.name  = bounded(r.outputName,  sizeof(r.outputName));
-            msg.make  = bounded(r.outputMake,  sizeof(r.outputMake));
-            msg.model = bounded(r.outputModel, sizeof(r.outputModel));
-            pendingOutputDescriptors_.push_back(std::move(msg));
+            msg.outputId         = m.outputId;
+            msg.width            = m.width;
+            msg.height           = m.height;
+            msg.refreshMhz       = m.refreshMhz;
+            msg.scale            = m.outScale;
+            msg.transform        = m.outTransform;
+            msg.physicalWidthMm  = m.physicalWidthMm;
+            msg.physicalHeightMm = m.physicalHeightMm;
+            msg.name   = bounded(m.outputName,   sizeof(m.outputName));
+            msg.make   = bounded(m.outputMake,   sizeof(m.outputMake));
+            msg.model  = bounded(m.outputModel,  sizeof(m.outputModel));
+            msg.edidId = bounded(m.outputEdidId, sizeof(m.outputEdidId));
+            return msg;
+        };
+        if (r.tag == ipc::Tag::OutputDescriptor) {
+            pendingOutputDescriptors_.push_back(buildDesc(r));
+            continue;
+        }
+        if (r.tag == ipc::Tag::OutputAdded) {
+            // Hotplug: the connector at this dense outputId is now connected
+            // with a usable CRTC. The GPU process built its ring before
+            // emitting; the core's JS handler creates state.outputs[outputId]
+            // and replies with ScanoutReserve via reserveScanoutForOutput.
+            pendingOutputsAdded_.push_back(buildDesc(r));
+            continue;
+        }
+        if (r.tag == ipc::Tag::OutputRemoved) {
+            // Hotplug: the connector vanished or was disabled. The GPU
+            // process has already torn down the ring; queue the outputId for
+            // the JS handler to fire output.pre-remove / removed and call
+            // releaseScanoutForOutput.
+            pendingOutputsRemoved_.push_back(r.outputId);
+            continue;
+        }
+        if (r.tag == ipc::Tag::ScanoutReady) {
+            // Steady-state ScanoutReady (a runtime OutputAdded handshake or a
+            // future ScanoutRebuild). Failure leaves the ring in a state
+            // where acquireOutputTextureHandle returns null (no usable slots)
+            // and the JS side has already observed the OutputAdded event; the
+            // JS layer will see no frames present and the GPU process logs
+            // the failure. Erase the entry so a future re-attempt starts
+            // clean. (Startup ScanoutReady is consumed by bringUp's tight
+            // loop and never reaches here.)
+            if (r.ok == 0) {
+                scanoutOutputs_.erase(r.outputId);
+                std::fprintf(stderr, "[core] ScanoutReady ok=0 for outputId=%u; ring discarded\n",
+                             r.outputId);
+            }
             continue;
         }
         if (r.tag == ipc::Tag::WireConnAdded) {

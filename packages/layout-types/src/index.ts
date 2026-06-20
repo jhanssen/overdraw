@@ -31,7 +31,9 @@ export interface Output {
 export type LayoutReason =
   | "mapped"          // a window mapped (was added to the layout)
   | "unmapped"        // a window unmapped (was removed from the layout)
-  | "output-resized"  // the output dimensions changed
+  | "output-resized"  // an existing output's dimensions changed
+  | "output-added"    // a new output joined the set (hotplug add)
+  | "output-removed"  // an existing output left the set (hotplug remove)
   | "focus-changed"   // keyboard / pointer focus changed
   | "reorder"         // explicit stack-order change (e.g. raise)
   | "param-changed"   // layout-specific config (master fraction, gap) changed

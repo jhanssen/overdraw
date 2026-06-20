@@ -283,6 +283,13 @@ struct Message {
     char outputName [64] = {};
     char outputMake [64] = {};
     char outputModel[64] = {};
+    // Stable durable identifier derived from EDID (manufacturer + product
+    // code + serial). Empty when the connector has no usable EDID. The
+    // workspace plugin (M7 step 5) keys its `preferredOutputs` list on this
+    // when present, falling back to `outputName` -- see multi-output-design
+    // §3 ("Output identity model"). Fixed 64-byte NUL-terminated buffer;
+    // 64 covers `mfr3+u16+u32` plus headroom for a future format change.
+    char outputEdidId[64] = {};
 
     // Routing id of the output this message concerns, for every output-scoped
     // tag: OutputDescriptor, ScanoutReserve, ScanoutReady, ScanoutPresent,

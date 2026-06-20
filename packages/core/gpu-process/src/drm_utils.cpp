@@ -340,6 +340,37 @@ bool readEdid(int drmFd, uint32_t connectorId, EdidInfo& out) {
         return false;
     }
 
+    // Build the durable stableId from the EDID header (multi-output-design §3).
+    // EDID v1.x layout:
+    //   bytes 8-9   manufacturer (3 5-bit ASCII letters, packed big-endian:
+    //               byte8 = (l1-1)<<2 | (l2-1)>>3; byte9 = ((l2-1)&0x7)<<5 | (l3-1))
+    //   bytes 10-11 product code (16-bit little-endian)
+    //   bytes 12-15 serial number (32-bit little-endian; may be 0)
+    {
+        const uint8_t m0 = edid[8];
+        const uint8_t m1 = edid[9];
+        char mfr[4] = {0, 0, 0, 0};
+        mfr[0] = static_cast<char>('A' + ((m0 >> 2) & 0x1f) - 1);
+        mfr[1] = static_cast<char>('A' + (((m0 & 0x3) << 3) | ((m1 >> 5) & 0x7)) - 1);
+        mfr[2] = static_cast<char>('A' + (m1 & 0x1f) - 1);
+        // Guard against garbage: if any letter falls outside A-Z, treat the
+        // whole id as absent. (Some virtual / KVM EDIDs emit zeros here.)
+        bool mfrOk = (mfr[0] >= 'A' && mfr[0] <= 'Z')
+                  && (mfr[1] >= 'A' && mfr[1] <= 'Z')
+                  && (mfr[2] >= 'A' && mfr[2] <= 'Z');
+        if (mfrOk) {
+            const uint16_t product = static_cast<uint16_t>(edid[10])
+                                   | (static_cast<uint16_t>(edid[11]) << 8);
+            const uint32_t serial = static_cast<uint32_t>(edid[12])
+                                  | (static_cast<uint32_t>(edid[13]) << 8)
+                                  | (static_cast<uint32_t>(edid[14]) << 16)
+                                  | (static_cast<uint32_t>(edid[15]) << 24);
+            char buf[32];
+            std::snprintf(buf, sizeof(buf), "%s-%04X-%08X", mfr, product, serial);
+            out.stableId = buf;
+        }
+    }
+
     // Detailed Timing Descriptor 1 starts at offset 54 (18 bytes). Physical
     // size in mm is bytes 12 (horiz low), 13 (vert low), 14 (4-bit upper
     // nibbles: hi nibble = horiz upper 4, lo nibble = vert upper 4).

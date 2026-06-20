@@ -174,8 +174,42 @@ class Compositor {
         std::string name;
         std::string make;
         std::string model;
+        // Stable durable identifier from EDID (mfr-product-serial). Empty
+        // when the connector has no usable EDID; the JS layer falls back
+        // to `name` as the durable key in that case.
+        std::string edidId;
     };
     void takePendingOutputDescriptors(std::vector<OutputDescriptorMsg>& out);
+
+    // OutputAdded / OutputRemoved delivery (multi-output hotplug, M7). The GPU
+    // process sends OutputAdded with the same descriptor fields as
+    // OutputDescriptor when a connector transitions to connected with a usable
+    // CRTC; OutputRemoved carries only the dense outputId of the vanished
+    // connector. drainCtrl queues these and the addon fires per-message JS
+    // callbacks (setOnOutputAdded / setOnOutputRemoved). The JS handler for
+    // added must call reserveScanoutForOutput to complete the runtime
+    // bring-up handshake (the GPU process emitted OutputAdded BEFORE the
+    // ScanoutReserve reply path; the core's standard bringUp path runs only
+    // for startup outputs).
+    void takePendingOutputsAdded(std::vector<OutputDescriptorMsg>& out);
+    void takePendingOutputsRemoved(std::vector<uint32_t>& out);
+
+    // Send ScanoutReserve for a runtime-added output. Reserves three wire
+    // texture handles + three surfaceBufIds at the given dims and writes the
+    // ScanoutReserve message; the GPU process replies ScanoutReady, which is
+    // consumed by drainCtrl (the ring slot's state stays FREE on success;
+    // an ok=0 reply leaves the entry torn down so acquireOutputTextureHandle
+    // returns null). KMS only; nested/headless are no-ops. Idempotent against
+    // double-call for the same outputId only when called after the prior ring
+    // was released via releaseScanoutForOutput.
+    void reserveScanoutForOutput(uint32_t outputId, uint32_t width, uint32_t height);
+
+    // Drop the per-output scanout state on output removal. The GPU process
+    // has already released the ring's GBM bo's / dmabuf fds / mode blob; the
+    // core just discards its slot bookkeeping so a future OutputAdded at the
+    // same outputId can build a fresh ring. KMS only; nested/headless are
+    // no-ops.
+    void releaseScanoutForOutput(uint32_t outputId);
 
     // --- KMS scanout path (slice 4) -------------------------------------------
     //
@@ -554,6 +588,11 @@ class Compositor {
     std::vector<PendingJsImport> pendingJsImports_;
     std::vector<JsImportDone> completedJsImports_;
     std::vector<OutputDescriptorMsg> pendingOutputDescriptors_;
+    // Hotplug deliveries drained alongside OutputDescriptor (M7). Added carries
+    // the full descriptor body (same struct reused); removed carries only the
+    // dense outputId.
+    std::vector<OutputDescriptorMsg> pendingOutputsAdded_;
+    std::vector<uint32_t> pendingOutputsRemoved_;
 
     // KMS scanout state. Populated on receipt of ipc::Tag::ScanoutInjected
     // during bring-up. Each slot holds the wire handle id+generation (resolved

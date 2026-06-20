@@ -84,8 +84,33 @@ bool Trampoline::createGlobalForOutput(const std::string& interfaceName,
     napi_create_reference(env_, handler, 1, &st->handler);
     InterfaceState* raw = st.get();
     std::string key = interfaceName + ":" + std::to_string(outputId);
+    // Remember the wl_global so destroyGlobalForOutput can tear it down on
+    // hotplug remove (M7). createGlobal (non-per-output) doesn't keep the
+    // pointer; those globals live for the process.
+    raw->global = wl_global_create(display_, raw->iface, raw->iface->version,
+                                   raw, &Trampoline::onBind);
     outputGlobals_[key] = std::move(st);
-    wl_global_create(display_, raw->iface, raw->iface->version, raw, &Trampoline::onBind);
+    return true;
+}
+
+bool Trampoline::destroyGlobalForOutput(const std::string& interfaceName,
+                                        uint32_t outputId) {
+    std::string key = interfaceName + ":" + std::to_string(outputId);
+    auto it = outputGlobals_.find(key);
+    if (it == outputGlobals_.end()) {
+        // Already removed (or never created) -- treat as a successful no-op so
+        // the JS handler is idempotent across pre-remove / removed firings.
+        return true;
+    }
+    if (it->second->global) {
+        wl_global_destroy(it->second->global);
+        it->second->global = nullptr;
+    }
+    if (it->second->handler) {
+        napi_delete_reference(env_, it->second->handler);
+        it->second->handler = nullptr;
+    }
+    outputGlobals_.erase(it);
     return true;
 }
 

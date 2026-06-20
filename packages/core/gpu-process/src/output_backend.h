@@ -61,6 +61,12 @@ struct OutputDescriptorInfo {
     char name [64]  = {};               // short identifier (e.g. "DP-1" / "overdraw-0")
     char make [64]  = {};               // monitor make (or "overdraw" in nested mode)
     char model[64]  = {};               // monitor model (or a nested description)
+    // Stable durable identifier derived from EDID (manufacturer PNP id +
+    // product code + serial). Empty when the connector has no usable EDID
+    // (e.g. nested-host backend, or a KMS connector that exposes none).
+    // Format: "<MFR>-<PRODUCT_HEX>-<SERIAL_HEX>" (matches the workspace
+    // plugin's stable-key shape). See multi-output-design §3.
+    char edidId[64] = {};
 };
 
 class OutputBackend {

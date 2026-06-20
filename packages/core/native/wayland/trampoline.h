@@ -25,6 +25,7 @@ struct wl_display;
 struct wl_client;
 struct wl_resource;
 struct wl_message;
+struct wl_global;
 union wl_argument;
 
 namespace overdraw::wayland {
@@ -54,6 +55,19 @@ class Trampoline {
     // interface is unknown.
     bool createGlobalForOutput(const std::string& interfaceName,
                                uint32_t outputId, napi_value handler);
+
+    // Destroy a previously-advertised per-output global. Clients see
+    // wl_registry.global_remove for the global's name, then existing
+    // resources continue to exist until the client destroys them (libwayland
+    // delivers the destroy on the next display flush). Callers must emit
+    // any protocol-level "leave" events (e.g. wl_surface.leave) BEFORE
+    // calling this -- once the global is gone, clients cannot identify the
+    // wl_output the leave referenced. Returns false if no global is
+    // registered at (interfaceName, outputId); idempotent re-call is a no-op
+    // (returns true on the second call because the map miss is treated as
+    // already-removed).
+    bool destroyGlobalForOutput(const std::string& interfaceName,
+                                uint32_t outputId);
 
     // Post an event to a client: encode the JS args per the event's signature
     // and call wl_resource_post_event_array. `resourceHandle` is a wrapped
@@ -91,6 +105,11 @@ class Trampoline {
         const wl_interface* iface = nullptr;
         napi_ref handler = nullptr;
         Trampoline* owner = nullptr;
+        // Owning wl_global pointer (set for entries in outputGlobals_; null for
+        // entries in interfaces_, which use either createGlobal's anonymous
+        // global creation or no global at all). Used to wl_global_destroy on
+        // per-output removal.
+        wl_global* global = nullptr;
     };
 
     // Build + store an InterfaceState for `interfaceName`, taking a strong ref

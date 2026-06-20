@@ -149,6 +149,8 @@ struct Addon {
     napi_ref onFrame = nullptr;
     napi_ref onInput = nullptr;  // optional JS callback(event) for input events
     napi_ref onOutput = nullptr; // optional JS callback(descriptor) for OutputDescriptor msgs
+    napi_ref onOutputAdded = nullptr;   // optional JS callback(descriptor) for hotplug add
+    napi_ref onOutputRemoved = nullptr; // optional JS callback({outputId}) for hotplug remove
     napi_ref onFlipComplete = nullptr;  // optional JS callback(outputId) for KMS flip-completes
     uint64_t lastNotified = 0;
 
@@ -523,6 +525,8 @@ void readMessages(napi_env env, napi_value arr, std::vector<MessageDesc>& out) {
 void onWireReadable(uv_poll_t*, int status, int events);
 void fireJsImports(napi_env env);
 void fireOutputDescriptors(napi_env env);
+void fireOutputsAdded(napi_env env);
+void fireOutputsRemoved(napi_env env);
 
 // Arm the wire poll for READABLE always, plus WRITABLE iff outbound wire bytes
 // are queued (so we get told when the socket can take more). Call after anything
@@ -575,7 +579,14 @@ void onWireReadable(uv_poll_t*, int status, int events) {
         // whose ClientTexImported replies arrive on the ctrl fd; drain it too.
         g_addon.compositor->drainCtrl();
         fireJsImports(g_addon.env);
+        // Order: Removed before Descriptor/Added. The GPU process emits all
+        // removeds for a rescan pass before any addeds (CRTC pool clean before
+        // assignment); the JS workspace migration policy depends on that
+        // ordering. OutputDescriptor (re-emit on identity change) doesn't
+        // interact with the hotplug pair and runs alongside.
+        fireOutputsRemoved(g_addon.env);
         fireOutputDescriptors(g_addon.env);
+        fireOutputsAdded(g_addon.env);
         // drainCtrl above may have consumed plugin-broker replies (alloc/begin/...);
         // advance them here too, else they are stranded (see advanceAllPending).
         advanceAllPending(g_addon.env);
@@ -598,7 +609,10 @@ void onCtrlReadable(uv_poll_t*, int status, int events) {
     if (events & UV_READABLE) {
         g_addon.compositor->drainCtrl();
         fireJsImports(g_addon.env);  // resolve JS dmabuf imports (opens its own scope)
+        // Removed before Descriptor/Added (see onWireReadable for rationale).
+        fireOutputsRemoved(g_addon.env);
         fireOutputDescriptors(g_addon.env);
+        fireOutputsAdded(g_addon.env);
         advanceAllPending(g_addon.env);
         if (g_addon.compositor->takeFrameComplete()) onFrameComplete();
         armWirePoll();  // finishing an import flushes wire output (bind group etc.)
@@ -1359,6 +1373,33 @@ void fireJsImports(napi_env env) {
     wake();
 }
 
+// Build the JS descriptor object for an OutputDescriptorMsg. Shared by
+// fireOutputDescriptors and fireOutputsAdded (the OutputAdded payload reuses
+// the descriptor shape).
+static napi_value buildDescriptorObject(napi_env env,
+                                        const Compositor::OutputDescriptorMsg& d) {
+    napi_value obj, v, sname, smake, smodel;
+    napi_create_object(env, &obj);
+    napi_create_uint32(env, d.outputId,         &v); napi_set_named_property(env, obj, "outputId", v);
+    napi_create_uint32(env, d.width,            &v); napi_set_named_property(env, obj, "width", v);
+    napi_create_uint32(env, d.height,           &v); napi_set_named_property(env, obj, "height", v);
+    napi_create_uint32(env, d.refreshMhz,       &v); napi_set_named_property(env, obj, "refreshMhz", v);
+    napi_create_uint32(env, d.scale,            &v); napi_set_named_property(env, obj, "scale", v);
+    napi_create_uint32(env, d.transform,        &v); napi_set_named_property(env, obj, "transform", v);
+    napi_create_uint32(env, d.physicalWidthMm,  &v); napi_set_named_property(env, obj, "physicalWidthMm", v);
+    napi_create_uint32(env, d.physicalHeightMm, &v); napi_set_named_property(env, obj, "physicalHeightMm", v);
+    napi_create_string_utf8(env, d.name.c_str(),   d.name.size(),   &sname);
+    napi_create_string_utf8(env, d.make.c_str(),   d.make.size(),   &smake);
+    napi_create_string_utf8(env, d.model.c_str(),  d.model.size(),  &smodel);
+    napi_set_named_property(env, obj, "name",  sname);
+    napi_set_named_property(env, obj, "make",  smake);
+    napi_set_named_property(env, obj, "model", smodel);
+    napi_value sedid;
+    napi_create_string_utf8(env, d.edidId.c_str(), d.edidId.size(), &sedid);
+    napi_set_named_property(env, obj, "edidId", sedid);
+    return obj;
+}
+
 // Drain queued OutputDescriptor messages and invoke the JS onOutput callback
 // for each (one call per descriptor; the JS layer applies the per-descriptor
 // update to state.outputs). Same Node thread as ctrl/wire poll.
@@ -1373,22 +1414,54 @@ void fireOutputDescriptors(napi_env env) {
     napi_get_reference_value(env, g_addon.onOutput, &cb);
     napi_get_undefined(env, &undefined);
     for (const auto& d : descs) {
-        napi_value obj, v, sname, smake, smodel;
+        napi_value obj = buildDescriptorObject(env, d);
+        napi_call_function(env, undefined, cb, 1, &obj, nullptr);
+    }
+    napi_close_handle_scope(env, scope);
+}
+
+// Drain queued OutputAdded messages and invoke the JS onOutputAdded callback
+// per message. Same Node thread; same pattern as fireOutputDescriptors.
+//
+// Ordering: callers MUST run fireOutputsRemoved BEFORE this. The GPU process
+// emits all OutputRemoveds for a rescan pass before any OutputAddeds (so the
+// CRTC pool is maximally free when adds run); preserving that ordering on the
+// JS side gives the workspace migration policy a clean "removed -> added"
+// sequence to operate on.
+void fireOutputsAdded(napi_env env) {
+    if (!g_addon.compositor || !g_addon.onOutputAdded) return;
+    std::vector<Compositor::OutputDescriptorMsg> descs;
+    g_addon.compositor->takePendingOutputsAdded(descs);
+    if (descs.empty()) return;
+    napi_handle_scope scope;
+    napi_open_handle_scope(env, &scope);
+    napi_value cb, undefined;
+    napi_get_reference_value(env, g_addon.onOutputAdded, &cb);
+    napi_get_undefined(env, &undefined);
+    for (const auto& d : descs) {
+        napi_value obj = buildDescriptorObject(env, d);
+        napi_call_function(env, undefined, cb, 1, &obj, nullptr);
+    }
+    napi_close_handle_scope(env, scope);
+}
+
+// Drain queued OutputRemoved messages and invoke the JS onOutputRemoved
+// callback per message. The payload is { outputId } only.
+void fireOutputsRemoved(napi_env env) {
+    if (!g_addon.compositor || !g_addon.onOutputRemoved) return;
+    std::vector<uint32_t> ids;
+    g_addon.compositor->takePendingOutputsRemoved(ids);
+    if (ids.empty()) return;
+    napi_handle_scope scope;
+    napi_open_handle_scope(env, &scope);
+    napi_value cb, undefined;
+    napi_get_reference_value(env, g_addon.onOutputRemoved, &cb);
+    napi_get_undefined(env, &undefined);
+    for (uint32_t id : ids) {
+        napi_value obj, v;
         napi_create_object(env, &obj);
-        napi_create_uint32(env, d.outputId,         &v); napi_set_named_property(env, obj, "outputId", v);
-        napi_create_uint32(env, d.width,            &v); napi_set_named_property(env, obj, "width", v);
-        napi_create_uint32(env, d.height,           &v); napi_set_named_property(env, obj, "height", v);
-        napi_create_uint32(env, d.refreshMhz,       &v); napi_set_named_property(env, obj, "refreshMhz", v);
-        napi_create_uint32(env, d.scale,            &v); napi_set_named_property(env, obj, "scale", v);
-        napi_create_uint32(env, d.transform,        &v); napi_set_named_property(env, obj, "transform", v);
-        napi_create_uint32(env, d.physicalWidthMm,  &v); napi_set_named_property(env, obj, "physicalWidthMm", v);
-        napi_create_uint32(env, d.physicalHeightMm, &v); napi_set_named_property(env, obj, "physicalHeightMm", v);
-        napi_create_string_utf8(env, d.name.c_str(),  d.name.size(),  &sname);
-        napi_create_string_utf8(env, d.make.c_str(),  d.make.size(),  &smake);
-        napi_create_string_utf8(env, d.model.c_str(), d.model.size(), &smodel);
-        napi_set_named_property(env, obj, "name",  sname);
-        napi_set_named_property(env, obj, "make",  smake);
-        napi_set_named_property(env, obj, "model", smodel);
+        napi_create_uint32(env, id, &v);
+        napi_set_named_property(env, obj, "outputId", v);
         napi_call_function(env, undefined, cb, 1, &obj, nullptr);
     }
     napi_close_handle_scope(env, scope);
@@ -1698,6 +1771,14 @@ napi_value Stop(napi_env env, napi_callback_info) {
         napi_delete_reference(env, g_addon.onOutput);
         g_addon.onOutput = nullptr;
     }
+    if (g_addon.onOutputAdded) {
+        napi_delete_reference(env, g_addon.onOutputAdded);
+        g_addon.onOutputAdded = nullptr;
+    }
+    if (g_addon.onOutputRemoved) {
+        napi_delete_reference(env, g_addon.onOutputRemoved);
+        g_addon.onOutputRemoved = nullptr;
+    }
     if (g_addon.onFlipComplete) {
         napi_delete_reference(env, g_addon.onFlipComplete);
         g_addon.onFlipComplete = nullptr;
@@ -1810,6 +1891,29 @@ napi_value CreateGlobalForOutput(napi_env env, napi_callback_info info) {
     napi_get_value_uint32(env, argv[1], &outputId);
     if (!g_addon.trampoline->createGlobalForOutput(name, outputId, argv[2]))
         return throwError(env, "createGlobalForOutput: unknown interface");
+
+    napi_value undef; napi_get_undefined(env, &undef);
+    return undef;
+}
+
+// destroyGlobalForOutput(interfaceName: string, outputId: number) -> undefined
+//
+// Tear down a previously-advertised per-output global (the inverse of
+// createGlobalForOutput). Clients see wl_registry.global_remove and any
+// existing resources become destroyable. Used by the M7 hotplug handler on
+// output removal AFTER protocol-level "leave" events have fired.
+napi_value DestroyGlobalForOutput(napi_env env, napi_callback_info info) {
+    size_t argc = 2; napi_value argv[2];
+    napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+    if (argc < 2) return throwError(env,
+        "destroyGlobalForOutput(name, outputId) requires two args");
+    if (!g_addon.trampoline) return throwError(env, "trampoline not initialized");
+
+    char name[256]; size_t len = 0;
+    napi_get_value_string_utf8(env, argv[0], name, sizeof(name), &len);
+    uint32_t outputId = 0;
+    napi_get_value_uint32(env, argv[1], &outputId);
+    g_addon.trampoline->destroyGlobalForOutput(name, outputId);
 
     napi_value undef; napi_get_undefined(env, &undef);
     return undef;
@@ -1986,6 +2090,85 @@ napi_value SetOnOutputDescriptor(napi_env env, napi_callback_info info) {
     // can be the seed values when the first client binds wl_output.
     if (g_addon.compositor) g_addon.compositor->drainCtrl();
     fireOutputDescriptors(env);
+    napi_value u; napi_get_undefined(env, &u); return u;
+}
+
+// setOnOutputAdded(cb) -> undefined
+// Register a JS callback fired for each OutputAdded message arriving from
+// the GPU process (M7 hotplug). Same payload shape as OutputDescriptor
+// (outputId + width/height/refreshMhz/scale/transform/physical/name/make/
+// model). The handler creates state.outputs[outputId], calls
+// reserveScanoutForOutput to complete the runtime ring handshake, and emits
+// output.added on the plugin bus. Pass null/omit to clear.
+napi_value SetOnOutputAdded(napi_env env, napi_callback_info info) {
+    size_t argc = 1; napi_value argv[1];
+    napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+    if (g_addon.onOutputAdded) {
+        napi_delete_reference(env, g_addon.onOutputAdded);
+        g_addon.onOutputAdded = nullptr;
+    }
+    if (argc >= 1) {
+        napi_valuetype t; napi_typeof(env, argv[0], &t);
+        if (t == napi_function) napi_create_reference(env, argv[0], 1, &g_addon.onOutputAdded);
+    }
+    napi_value u; napi_get_undefined(env, &u); return u;
+}
+
+// setOnOutputRemoved(cb) -> undefined
+// Register a JS callback fired for each OutputRemoved message arriving from
+// the GPU process (M7 hotplug). Payload is { outputId }. The handler fires
+// output.pre-remove (workspace migration + wl_surface.leave), tears down
+// state.outputs[outputId], destroys that output's wl_output global, and
+// fires output.removed. Pass null/omit to clear.
+napi_value SetOnOutputRemoved(napi_env env, napi_callback_info info) {
+    size_t argc = 1; napi_value argv[1];
+    napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+    if (g_addon.onOutputRemoved) {
+        napi_delete_reference(env, g_addon.onOutputRemoved);
+        g_addon.onOutputRemoved = nullptr;
+    }
+    if (argc >= 1) {
+        napi_valuetype t; napi_typeof(env, argv[0], &t);
+        if (t == napi_function) napi_create_reference(env, argv[0], 1, &g_addon.onOutputRemoved);
+    }
+    napi_value u; napi_get_undefined(env, &u); return u;
+}
+
+// reserveScanoutForOutput(outputId, width, height) -> undefined
+// Send ScanoutReserve for a runtime-added output (M7). Called by the
+// output.added JS handler after OutputAdded arrives so the GPU process can
+// complete its bring-up handshake (it InjectTextures at the reserved handles
+// and replies ScanoutReady, consumed by drainCtrl). KMS only; nested/headless
+// are silent no-ops.
+napi_value ReserveScanoutForOutput(napi_env env, napi_callback_info info) {
+    size_t argc = 3; napi_value argv[3];
+    napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+    if (argc < 3) return throwError(env,
+        "reserveScanoutForOutput(outputId, width, height) requires three args");
+    if (!g_addon.compositor) return throwError(env, "compositor not running");
+    uint32_t outputId = 0, w = 0, h = 0;
+    napi_get_value_uint32(env, argv[0], &outputId);
+    napi_get_value_uint32(env, argv[1], &w);
+    napi_get_value_uint32(env, argv[2], &h);
+    g_addon.compositor->reserveScanoutForOutput(outputId, w, h);
+    armCtrlPoll();  // CtrlSender may have queued bytes; drain when writable.
+    napi_value u; napi_get_undefined(env, &u); return u;
+}
+
+// releaseScanoutForOutput(outputId) -> undefined
+// Drop the core-side per-output scanout state on output removal (M7). The GPU
+// process has already torn down its ring; this clears the core's slot
+// bookkeeping so a future OutputAdded at the same outputId can build a fresh
+// ring. KMS only; nested/headless are silent no-ops.
+napi_value ReleaseScanoutForOutput(napi_env env, napi_callback_info info) {
+    size_t argc = 1; napi_value argv[1];
+    napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+    if (argc < 1) return throwError(env,
+        "releaseScanoutForOutput(outputId) requires outputId");
+    if (!g_addon.compositor) return throwError(env, "compositor not running");
+    uint32_t outputId = 0;
+    napi_get_value_uint32(env, argv[0], &outputId);
+    g_addon.compositor->releaseScanoutForOutput(outputId);
     napi_value u; napi_get_undefined(env, &u); return u;
 }
 
@@ -2615,7 +2798,12 @@ napi_value Init(napi_env env, napi_value exports) {
     reg("writeProducerEnd", WriteProducerEnd);
     reg("pluginReleaseSurfaceBuffer", PluginReleaseSurfaceBuffer);
     reg("setOnOutputDescriptor", SetOnOutputDescriptor);
+    reg("setOnOutputAdded", SetOnOutputAdded);
+    reg("setOnOutputRemoved", SetOnOutputRemoved);
     reg("setOnFlipComplete", SetOnFlipComplete);
+    reg("reserveScanoutForOutput", ReserveScanoutForOutput);
+    reg("releaseScanoutForOutput", ReleaseScanoutForOutput);
+    reg("destroyGlobalForOutput", DestroyGlobalForOutput);
     reg("updateOutputLayout", UpdateOutputLayout);
     reg("logInit", LogInit);
     reg("nativeLog", NativeLog);

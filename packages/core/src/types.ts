@@ -49,6 +49,13 @@ export interface Addon {
   // (etc.) can be advertised, one per dense outputId. The interface must
   // already be registered (registerProtocols). M6+ uses this for wl_output.
   createGlobalForOutput(name: string, outputId: number, handler: unknown): void;
+  // Inverse of createGlobalForOutput: tear down the per-output global so
+  // clients see wl_registry.global_remove. Idempotent (a missing entry is a
+  // silent no-op). Used on output removal in M7. Callers must emit any
+  // protocol-level "leave" events (wl_surface.leave, fractional-scale
+  // re-emit) BEFORE this -- once the global is gone clients cannot identify
+  // the wl_output the leave referenced.
+  destroyGlobalForOutput(name: string, outputId: number): void;
   postEvent(resource: Resource, opcode: number, args: unknown[]): void;
   // Server-initiated destruction: drop the libwayland resource + wrapper.
   // For client-issued destructor requests (wl_buffer.destroy etc.) the
@@ -227,6 +234,29 @@ export interface Addon {
   // Passing null clears the callback. Descriptors that arrived before the
   // callback was registered (during bring-up) are drained synchronously.
   setOnOutputDescriptor(cb: ((d: OutputDescriptor) => void) | null): void;
+  // Register callbacks fired on hotplug add / remove (M7). OutputAdded
+  // carries the same fields as OutputDescriptor; OutputRemoved carries only
+  // outputId. Called on the Node thread; pass null to clear.
+  //
+  // The handlers must run in this contract:
+  //   onOutputAdded: create state.outputs[outputId]; call
+  //     reserveScanoutForOutput(outputId, width, height) so the GPU process
+  //     can finish its bring-up handshake; emit `output.added` on pluginBus.
+  //   onOutputRemoved: emit `output.pre-remove` synchronously (workspace
+  //     migration + wl_surface.leave run here while state.outputs[outputId]
+  //     still exists); tear down state.outputs[outputId]; destroy the
+  //     output's wl_output global via destroyGlobalForOutput; emit
+  //     `output.removed`; call releaseScanoutForOutput(outputId).
+  setOnOutputAdded(cb: ((d: OutputDescriptor) => void) | null): void;
+  setOnOutputRemoved(cb: ((d: { outputId: number }) => void) | null): void;
+  // Send a ScanoutReserve to the GPU process for a runtime-added output
+  // (M7). Called by the onOutputAdded handler. KMS only; nested/headless are
+  // silent no-ops.
+  reserveScanoutForOutput(outputId: number, width: number, height: number): void;
+  // Drop the core-side scanout state for an outputId on removal (M7). The
+  // GPU process has already torn down its ring. KMS only; nested/headless
+  // are silent no-ops.
+  releaseScanoutForOutput(outputId: number): void;
   // Register a callback fired once per drained KMS flip-complete; the outputId
   // identifies WHICH output just flipped. JS uses this to dispatch
   // wl_callback.done per output (surfaces on a 60Hz output get `done` at 60Hz
@@ -256,8 +286,8 @@ export interface Addon {
 // One OutputDescriptor message delivered from the GPU process. Mirrors the
 // fields in ipc::Tag::OutputDescriptor; updates state.outputs.
 export interface OutputDescriptor {
-  // Routing id of the output this descriptor concerns. The first output is 0;
-  // one output exists today, so it is always 0 until multi-output enumeration.
+  // Routing id of the output this descriptor concerns. Transient (a dense
+  // index reused across hotplug); see multi-output-design §3.
   outputId: number;
   width: number;
   height: number;
@@ -269,6 +299,11 @@ export interface OutputDescriptor {
   name: string;
   make: string;
   model: string;
+  // Durable identifier derived from EDID (mfr-product-serial). Empty when
+  // the connector has no usable EDID (e.g. nested-host backend). The
+  // workspace plugin's `preferredOutputs` keys on this when non-empty and
+  // falls back to `name` otherwise -- see multi-output-design §3.
+  edidId: string;
 }
 
 // Normalized input event delivered to the onInput callback (mirror of

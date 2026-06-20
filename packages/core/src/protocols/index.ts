@@ -201,6 +201,7 @@ export async function installProtocols(
     physicalHeightMm: 0,
     make: "overdraw",
     model: "overdraw nested output",
+    edidId: "",  // GPU process supplies the real one via OutputDescriptor
   });
   // Virtual fallback output. Lives outside state.outputs so every iteration
   // over the live output map automatically skips it; only the workspace
@@ -221,6 +222,10 @@ export async function installProtocols(
     physicalHeightMm: 0,
     make: "overdraw",
     model: "fallback",
+    // Fallback output has no physical connector and so no EDID. The
+    // workspace migration code keys on FALLBACK_OUTPUT_NAME (see §10) when
+    // routing here.
+    edidId: "",
   };
   // The binding chain owns the input modes + chord trie. Plugins
   // register bindings via the windows broker; the seat dispatches each
