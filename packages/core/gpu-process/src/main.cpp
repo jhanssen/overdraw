@@ -592,7 +592,11 @@ int run(int wireFd, int ctrlFd, int inputFd, bool headless,
     // (handed to that output's atomic commit as IN_FENCE_FD). The sync fd is
     // owned here until consumed by the next ScanoutPresent for the same buffer;
     // absence means no fence to attach.
-    std::unordered_map<uint32_t, std::pair<size_t, int>> scanoutBufIdToSlot;
+    // Routes each scanout surfaceBufId -> {outputId, slot index 0..2}. The
+    // outputId is the dense, lowest-free-allocated routing key the KMS backend
+    // assigns (see KmsOutputBackend); it is the same id carried on the
+    // ScanoutPresent / ScanoutFlipComplete tags.
+    std::unordered_map<uint32_t, std::pair<uint32_t, int>> scanoutBufIdToSlot;
     std::unordered_map<uint32_t, int> scanoutFenceFdByBufId;
 #endif
 
@@ -603,18 +607,20 @@ int run(int wireFd, int ctrlFd, int inputFd, bool headless,
     //   2) ScanoutReserve (with three texture handles)
     //   3) we reply ScanoutReady after building the ring + injecting
     if (outputKms && kms) {
-        const size_t nOutputs = kms->outputCount();
+        const std::vector<uint32_t> outputIds = kms->outputIds();
+        const uint32_t nOutputs = static_cast<uint32_t>(outputIds.size());
 
-        // Step 1: send an OutputDescriptor for every driven output (index 0 is
-        // the primary). outputCount on every message tells the core how many
-        // scanout rings to reserve before it starts replying.
-        for (size_t k = 0; k < nOutputs; ++k) {
+        // Step 1: send an OutputDescriptor for every driven output (lowest id
+        // first; ids are dense routing keys, see KmsOutputBackend / multi-
+        // output-design §3). outputCount on every message tells the core how
+        // many scanout rings to reserve before it starts replying.
+        for (uint32_t outputId : outputIds) {
             gpu::OutputDescriptorInfo info{};
-            kms->describeOutputAt(k, info);
+            kms->describeOutputAt(outputId, info);
             ipc::Message m{};
             m.tag = ipc::Tag::OutputDescriptor;
-            m.outputId         = static_cast<uint32_t>(k);
-            m.outputCount      = static_cast<uint32_t>(nOutputs);
+            m.outputId         = outputId;
+            m.outputCount      = nOutputs;
             m.width            = info.width;
             m.height           = info.height;
             m.refreshMhz       = info.refreshMhz;
@@ -626,8 +632,8 @@ int run(int wireFd, int ctrlFd, int inputFd, bool headless,
             std::memcpy(m.outputMake,  info.make,  sizeof(m.outputMake));
             std::memcpy(m.outputModel, info.model, sizeof(m.outputModel));
             ipc::sendMessage(ctrlFd, m);
-            std::printf("[gpu] sent OutputDescriptor (kms output %zu/%zu): %ux%u @%umHz name=%s\n",
-                        k, nOutputs, info.width, info.height, info.refreshMhz, info.name);
+            std::printf("[gpu] sent OutputDescriptor (kms output %u/%u): %ux%u @%umHz name=%s\n",
+                        outputId, nOutputs, info.width, info.height, info.refreshMhz, info.name);
         }
 
         // Step 2: build all N scanout rings on the core device.
@@ -640,9 +646,10 @@ int run(int wireFd, int ctrlFd, int inputFd, bool headless,
         // the ring's three slots at the reserved handles, register each slot as
         // a one-sided SurfaceBuf (producer = core device + the slot's STM/
         // Texture; consumer = empty, the kernel scans out via fb_id), and reply
-        // ScanoutReady. The core sends one ScanoutReserve per output in outputId
-        // order; the inject keys off the reserve's outputId.
-        for (size_t k = 0; k < nOutputs; ++k) {
+        // ScanoutReady. The core sends one ScanoutReserve per output; the
+        // inject keys off the reserve's outputId (the core may send them in
+        // any order).
+        for (uint32_t k = 0; k < nOutputs; ++k) {
             ipc::Message reserveMsg{};
             {
                 bool got = false;
@@ -657,22 +664,23 @@ int run(int wireFd, int ctrlFd, int inputFd, bool headless,
                     usleepShort();
                 }
                 if (!got) {
-                    std::fprintf(stderr, "[gpu] no ScanoutReserve for output %zu\n", k);
+                    std::fprintf(stderr, "[gpu] no ScanoutReserve (received %u/%u)\n",
+                                 k, nOutputs);
                     return 1;
                 }
             }
-            const size_t outIdx = reserveMsg.outputId;
+            const uint32_t outputId = reserveMsg.outputId;
 
             bool injectOk = true;
             for (int i = 0; i < 3; ++i) {
-                const auto& slot = kms->scanoutSlotAt(outIdx, i);
+                const auto& slot = kms->scanoutSlotAt(outputId, i);
                 if (!server.InjectTexture(slot.tex.Get(),
                                           {reserveMsg.scanoutHandles[i].id,
                                            reserveMsg.scanoutHandles[i].generation},
                                           {ready.device.id, ready.device.generation})) {
                     std::fprintf(stderr,
-                                 "[gpu] InjectTexture failed for output %zu scanout slot %d\n",
-                                 outIdx, i);
+                                 "[gpu] InjectTexture failed for output %u scanout slot %d\n",
+                                 outputId, i);
                     injectOk = false;
                     break;
                 }
@@ -689,20 +697,20 @@ int run(int wireFd, int ctrlFd, int inputFd, bool headless,
                 sb.consumerOpen = false;
                 const uint32_t sbufId = reserveMsg.scanoutBufIds[i];
                 surfaceBufs.emplace(sbufId, std::move(sb));
-                // Route ScanoutPresent's surfaceBufId back to {output, slot}.
-                scanoutBufIdToSlot[sbufId] = {outIdx, i};
+                // Route ScanoutPresent's surfaceBufId back to {outputId, slot}.
+                scanoutBufIdToSlot[sbufId] = {outputId, i};
             }
 
             {
                 ipc::Message m{};
                 m.tag = ipc::Tag::ScanoutReady;
-                m.outputId = static_cast<uint32_t>(outIdx);
+                m.outputId = outputId;
                 m.ok = injectOk ? 1 : 0;
                 ipc::sendMessage(ctrlFd, m);
             }
             if (!injectOk) return 1;
-            std::printf("[gpu] kms scanout ready for output %zu (3 slots injected as SurfaceBufs)\n",
-                        outIdx);
+            std::printf("[gpu] kms scanout ready for output %u (3 slots injected as SurfaceBufs)\n",
+                        outputId);
         }
     }
 #endif  // OVERDRAW_KMS
@@ -1684,7 +1692,7 @@ int run(int wireFd, int ctrlFd, int inputFd, bool headless,
                             "[gpu] ScanoutPresent: unknown surfaceBufId=%u\n",
                             m.surfaceBufId);
                     } else {
-                        const size_t outIdx = sit->second.first;
+                        const uint32_t outputId = sit->second.first;
                         const int slot = sit->second.second;
                         int fenceFd = -1;
                         auto fit = scanoutFenceFdByBufId.find(m.surfaceBufId);
@@ -1692,10 +1700,10 @@ int run(int wireFd, int ctrlFd, int inputFd, bool headless,
                             fenceFd = fit->second;
                             scanoutFenceFdByBufId.erase(fit);
                         }
-                        if (!kms->presentScanoutAt(outIdx, slot, fenceFd)) {
+                        if (!kms->presentScanoutAt(outputId, slot, fenceFd)) {
                             std::fprintf(stderr,
-                                "[gpu] presentScanoutAt(output=%zu, slot=%d) rejected by kernel\n",
-                                outIdx, slot);
+                                "[gpu] presentScanoutAt(output=%u, slot=%d) rejected by kernel\n",
+                                outputId, slot);
                         }
                         if (fenceFd >= 0) ::close(fenceFd);
                     }

@@ -9,15 +9,15 @@
 //   - one PerOutput per driven monitor: its resolved topology (connector +
 //     CRTC + plane + property ids), a 3-slot scanout ring (KmsScanoutRing)
 //     whose textures back the compositor's render passes, and its page-flip
-//     state. outputs_[0] is the primary.
+//     state. Keyed by the dense `outputId` assigned at enumeration order.
 //   - the page-flip event handling (DRM event fd, drmHandleEvent); flips are
 //     routed to the owning output by the CRTC id the kernel reports.
 //
 // Bring-up sequence (open()): see drm-design.md "DRM/KMS bring-up" §1-13.
 // Steady state (per output):
-//   - acquireScanout() returns the next FREE slot's wgpu::Texture (or nullptr
+//   - acquireScanoutAt() returns the next FREE slot's wgpu::Texture (or null
 //     if all slots are in flight; the JS compositor's frame is skipped).
-//   - presentScanout() issues drmModeAtomicCommit with PAGE_FLIP_EVENT and
+//   - presentScanoutAt() issues drmModeAtomicCommit with PAGE_FLIP_EVENT and
 //     (when available) IN_FENCE_FD on the plane.
 //   - pump() drains DRM events; on flip-complete the owning ring's state
 //     machine advances and the frame clock signals the next acquire is ready.
@@ -29,6 +29,7 @@
 
 #include <cstdint>
 #include <memory>
+#include <unordered_map>
 #include <vector>
 
 #include "dawn/webgpu_cpp.h"
@@ -69,21 +70,26 @@ class KmsOutputBackend : public OutputBackend {
     bool initScanout(const wgpu::Device& device);
 
     OutputSize size() const override;
+    // OutputBackend hook: fills `out` with the LOWEST live outputId's
+    // descriptor (or zeroed when no outputs are live). The KMS code path
+    // doesn't use this -- main.cpp iterates outputIds() + describeOutputAt()
+    // -- but the base class requires it for the nested host-window backend.
     void describeOutput(OutputDescriptorInfo& out) const override;
 
-    // Connected monitors beyond the primary (outputs_[1..]). Each is driven
-    // with its own CRTC + plane + ring, same as the primary; these accessors
-    // exist for the legacy primary-plus-extras reporting shape in main.cpp.
-    size_t extraOutputCount() const { return outputs_.empty() ? 0 : outputs_.size() - 1; }
-    void describeExtraOutput(size_t i, OutputDescriptorInfo& out) const;
-
-    // Per-output access by dense output index (0 = primary).
+    // Per-output access keyed by dense outputId (assigned by allocateOutputId,
+    // lowest-free; see multi-output-design.md §3). The dense id is a TRANSIENT
+    // runtime routing key, not stable across unplug/replug; durable identity
+    // lives on the connector name + EDID.
     size_t outputCount() const { return outputs_.size(); }
-    void describeOutputAt(size_t outputIdx, OutputDescriptorInfo& out) const;
-    wgpu::Texture acquireScanoutAt(size_t outputIdx, int& outSlotIdx);
-    bool presentScanoutAt(size_t outputIdx, int slotIdx, int inFenceFd);
-    const KmsScanoutRing::Slot& scanoutSlotAt(size_t outputIdx, int slotIdx) const;
-    uint32_t crtcIdAt(size_t outputIdx) const;
+    bool   hasOutput(uint32_t outputId) const { return outputs_.count(outputId) != 0; }
+    // Returns every live outputId in ascending order. Snapshot copy; safe to
+    // use across mutating calls.
+    std::vector<uint32_t> outputIds() const;
+    void describeOutputAt(uint32_t outputId, OutputDescriptorInfo& out) const;
+    wgpu::Texture acquireScanoutAt(uint32_t outputId, int& outSlotIdx);
+    bool presentScanoutAt(uint32_t outputId, int slotIdx, int inFenceFd);
+    const KmsScanoutRing::Slot& scanoutSlotAt(uint32_t outputId, int slotIdx) const;
+    uint32_t crtcIdAt(uint32_t outputId) const;
 
     // Dawn WSI is not used on KMS. Return null; the GPU process main loop
     // branches on a null surface to skip WSI bring-up.
@@ -98,23 +104,6 @@ class KmsOutputBackend : public OutputBackend {
     bool shouldClose() const override { return shouldClose_; }
     void setResizeListener(ResizeListener cb) override { resizeListener_ = std::move(cb); }
 
-    // KMS-specific entry points used by main.cpp's render loop, operating on
-    // the primary output. Both return -1 / false on failure (slot exhausted;
-    // commit rejected).
-    //
-    // acquireScanout() returns the wgpu::Texture for the next FREE slot
-    // (or null if none are free) and stashes the slot idx for present.
-    // The returned texture lives until the corresponding presentScanout()
-    // is followed by the flip-complete that retires it.
-    wgpu::Texture acquireScanout(int& outSlotIdx);
-
-    // presentScanout commits the just-rendered slot to the display. If
-    // inFenceFd >= 0, it's attached to the plane via the IN_FENCE_FD
-    // property so the kernel waits for the GPU render to complete before
-    // latching. The fd is dup'd by the kernel; the caller closes it.
-    // Returns false if the atomic commit was rejected.
-    bool presentScanout(int slotIdx, int inFenceFd);
-
     // Callback invoked when a page-flip retires a slot on some output. Carries
     // the dense outputId that flipped and the slot index that just exited
     // SCANOUT and is now FREE (-1 on that output's first flip). Used by the
@@ -126,10 +115,11 @@ class KmsOutputBackend : public OutputBackend {
     // ring slot to FREE on every output, clear each didInitialCommit so the
     // next post-resume present runs the ALLOW_MODESET path (the kernel has
     // revoked DRM master under us; on resume libseat hands it back and we must
-    // modeset again). While paused, presentScanout() is a no-op (returns true).
-    // On resume(): a clarifying no-op today -- the state was already reset on
-    // pause; the call exists so a future change can force an immediate modeset
-    // without waiting for the next render. Both are idempotent.
+    // modeset again). While paused, presentScanoutAt() is a no-op (returns
+    // true). On resume(): a clarifying no-op today -- the state was already
+    // reset on pause; the call exists so a future change can force an
+    // immediate modeset without waiting for the next render. Both are
+    // idempotent.
     void pause();
     void resume();
     bool isPaused() const { return paused_; }
@@ -139,17 +129,13 @@ class KmsOutputBackend : public OutputBackend {
     // didn't succeed.
     uint64_t deviceId() const { return deviceId_; }
 
-    // Borrowed access to the primary ring's slot, for main.cpp's InjectTexture
-    // path. Returns the slot's underlying GBM bo + dmabuf fd + wgpu::Texture.
-    const KmsScanoutRing::Slot& scanoutSlot(int idx) const;
-
   private:
     // One driven monitor: its topology, scanout ring, mode blob, and page-flip
     // state. Held by unique_ptr because KmsScanoutRing is non-movable (deleted
-    // copy + a user dtor), so PerOutput cannot live by value in a vector that
-    // reallocates.
+    // copy + a user dtor), so PerOutput cannot live by value in containers
+    // that reallocate / rehash.
     struct PerOutput {
-        uint32_t outputId = 0;       // dense id: 0 = primary, 1.. = extras
+        uint32_t outputId = 0;
         DrmTopology topo{};
         KmsScanoutRing ring;
         uint32_t modeBlobId = 0;
@@ -176,12 +162,16 @@ class KmsOutputBackend : public OutputBackend {
     wgpu::Texture acquireOutputImpl(PerOutput& o, int& outSlotIdx);
     bool presentOutputImpl(PerOutput& o, int slotIdx, int inFenceFd);
 
+    // Lookup helper: returns nullptr if outputId is not live.
+    PerOutput* find(uint32_t outputId);
+    const PerOutput* find(uint32_t outputId) const;
+
     int drmFd_ = -1;   // borrowed; not closed
     gbm_device* gbm_ = nullptr;
     uint64_t deviceId_ = 0;
     bool shouldClose_ = false;
     bool paused_ = false;
-    std::vector<std::unique_ptr<PerOutput>> outputs_;  // outputs_[0] is the primary
+    std::unordered_map<uint32_t, std::unique_ptr<PerOutput>> outputs_;
     ResizeListener resizeListener_;
     FlipCompleteCb flipCompleteListener_;
 };

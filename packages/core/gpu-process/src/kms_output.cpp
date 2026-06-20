@@ -1,5 +1,6 @@
 #include "kms_output.h"
 
+#include <algorithm>
 #include <cerrno>
 #include <cstdio>
 #include <cstring>
@@ -26,7 +27,7 @@ void KmsOutputBackend::close() {
     //   GBM device
     //   topology / properties (no owned resources, just ids)
     // The DRM fd itself is owned by the core's libseat; we don't close it.
-    for (auto& o : outputs_) {
+    for (auto& [id, o] : outputs_) {
         o->ring.clear();
         if (o->modeBlobId != 0 && drmFd_ >= 0) {
             drmModeDestroyPropertyBlob(drmFd_, o->modeBlobId);
@@ -71,11 +72,11 @@ bool KmsOutputBackend::open(const char* /*title*/) {
         return false;
     }
 
-    // Build the driven-output list: the primary connector first, then every
-    // other connected connector in enumeration order. Each gets a DISTINCT
-    // CRTC (excluding ones already claimed this session) + primary plane +
-    // resolved property ids. A connector that can't get a distinct CRTC/plane
-    // is logged and skipped -- the others still work.
+    // Build the driven-output list: the primary connector first (outputId 0),
+    // then every other connected connector in enumeration order (1..). Each
+    // gets a DISTINCT CRTC (excluding ones already claimed this session) +
+    // primary plane + resolved property ids. A connector that can't get a
+    // distinct CRTC/plane is logged and skipped -- the others still work.
     std::vector<uint32_t> usedCrtcs;
 
     auto buildOutput = [&](DrmTopology topo, uint32_t outputId) -> bool {
@@ -102,7 +103,7 @@ bool KmsOutputBackend::open(const char* /*title*/) {
         auto out = std::make_unique<PerOutput>();
         out->outputId = outputId;
         out->topo = std::move(topo);
-        outputs_.push_back(std::move(out));
+        outputs_.emplace(outputId, std::move(out));
         return true;
     };
 
@@ -113,13 +114,14 @@ bool KmsOutputBackend::open(const char* /*title*/) {
     }
     const uint32_t primaryConnectorId = outputs_[0]->topo.connectorId;
 
+    uint32_t nextId = 1;
     for (auto& c : enumerateConnectors(drmFd_)) {
         if (c.connectorId == primaryConnectorId) continue;
         DrmTopology topo{};
         topo.connectorId = c.connectorId;
         topo.connectorName = c.name;
         topo.mode = c.mode;
-        buildOutput(std::move(topo), static_cast<uint32_t>(outputs_.size()));
+        if (buildOutput(std::move(topo), nextId)) ++nextId;
     }
 
     // Steps 9-13 (scanout rings + initial modeset) happen in initScanout(),
@@ -149,17 +151,20 @@ bool KmsOutputBackend::initScanout(const wgpu::Device& device) {
                            planeFormats);
     };
 
-    // Primary ring failure is fatal; a secondary ring failure drops that output.
-    if (!initRing(*outputs_[0])) {
+    // Primary (lowest live id) ring failure is fatal; a secondary ring failure
+    // drops that output. The lowest id is 0 right after open(); using outputIds()
+    // keeps this correct under churn.
+    std::vector<uint32_t> ids = outputIds();
+    if (!initRing(*outputs_[ids[0]])) {
         std::fprintf(stderr, "[kms] primary scanout ring init failed\n");
         return false;
     }
-    for (size_t i = outputs_.size(); i-- > 1;) {
-        if (!initRing(*outputs_[i])) {
-            std::fprintf(stderr, "[kms] output %u scanout ring init failed; dropping\n",
-                         outputs_[i]->outputId);
-            outputs_[i]->ring.clear();
-            outputs_.erase(outputs_.begin() + static_cast<std::ptrdiff_t>(i));
+    for (size_t i = 1; i < ids.size(); ++i) {
+        const uint32_t id = ids[i];
+        if (!initRing(*outputs_[id])) {
+            std::fprintf(stderr, "[kms] output %u scanout ring init failed; dropping\n", id);
+            outputs_[id]->ring.clear();
+            outputs_.erase(id);
         }
     }
     return true;
@@ -197,31 +202,59 @@ void KmsOutputBackend::describeFrom(const PerOutput& o, OutputDescriptorInfo& ou
 
 OutputSize KmsOutputBackend::size() const {
     if (outputs_.empty()) return { 0, 0 };
-    return { outputs_[0]->topo.mode.hdisplay, outputs_[0]->topo.mode.vdisplay };
+    // Lowest live outputId -- "primary"-ish, in the sense relevant to legacy
+    // single-output callers (the OutputBackend interface). After churn this
+    // may not be the connector that was outputId 0 at startup; that's fine,
+    // the OutputBackend interface doesn't promise identity stability.
+    std::vector<uint32_t> ids = outputIds();
+    auto it = outputs_.find(ids[0]);
+    return { it->second->topo.mode.hdisplay, it->second->topo.mode.vdisplay };
 }
 
 void KmsOutputBackend::describeOutput(OutputDescriptorInfo& out) const {
-    describeFrom(*outputs_[0], out);
+    if (outputs_.empty()) {
+        out = OutputDescriptorInfo{};
+        return;
+    }
+    std::vector<uint32_t> ids = outputIds();
+    describeFrom(*outputs_.find(ids[0])->second, out);
 }
 
-void KmsOutputBackend::describeExtraOutput(size_t i, OutputDescriptorInfo& out) const {
-    describeFrom(*outputs_[1 + i], out);
+std::vector<uint32_t> KmsOutputBackend::outputIds() const {
+    std::vector<uint32_t> ids;
+    ids.reserve(outputs_.size());
+    for (const auto& [id, _o] : outputs_) ids.push_back(id);
+    std::sort(ids.begin(), ids.end());
+    return ids;
 }
 
-void KmsOutputBackend::describeOutputAt(size_t outputIdx, OutputDescriptorInfo& out) const {
-    describeFrom(*outputs_[outputIdx], out);
+KmsOutputBackend::PerOutput* KmsOutputBackend::find(uint32_t outputId) {
+    auto it = outputs_.find(outputId);
+    return it == outputs_.end() ? nullptr : it->second.get();
 }
 
-uint32_t KmsOutputBackend::crtcIdAt(size_t outputIdx) const {
-    return outputs_[outputIdx]->topo.crtcId;
+const KmsOutputBackend::PerOutput* KmsOutputBackend::find(uint32_t outputId) const {
+    auto it = outputs_.find(outputId);
+    return it == outputs_.end() ? nullptr : it->second.get();
 }
 
-const KmsScanoutRing::Slot& KmsOutputBackend::scanoutSlot(int idx) const {
-    return outputs_[0]->ring.slot(idx);
+void KmsOutputBackend::describeOutputAt(uint32_t outputId, OutputDescriptorInfo& out) const {
+    const PerOutput* o = find(outputId);
+    if (!o) { out = OutputDescriptorInfo{}; return; }
+    describeFrom(*o, out);
 }
 
-const KmsScanoutRing::Slot& KmsOutputBackend::scanoutSlotAt(size_t outputIdx, int slotIdx) const {
-    return outputs_[outputIdx]->ring.slot(slotIdx);
+uint32_t KmsOutputBackend::crtcIdAt(uint32_t outputId) const {
+    const PerOutput* o = find(outputId);
+    return o ? o->topo.crtcId : 0;
+}
+
+const KmsScanoutRing::Slot& KmsOutputBackend::scanoutSlotAt(uint32_t outputId, int slotIdx) const {
+    // Callers must only ask about live outputIds; we do not synthesize an
+    // empty slot for absent ids (the legacy API contract is unchanged from
+    // the prior outputs_[outputIdx] indexing -- accessing an absent id was
+    // a precondition violation then too).
+    return find(outputId)->ring.slot(slotIdx);
 }
 
 wgpu::Texture KmsOutputBackend::acquireOutputImpl(PerOutput& o, int& outSlotIdx) {
@@ -231,18 +264,16 @@ wgpu::Texture KmsOutputBackend::acquireOutputImpl(PerOutput& o, int& outSlotIdx)
     return o.ring.slot(idx).tex;
 }
 
-wgpu::Texture KmsOutputBackend::acquireScanout(int& outSlotIdx) {
-    return acquireOutputImpl(*outputs_[0], outSlotIdx);
-}
-
-wgpu::Texture KmsOutputBackend::acquireScanoutAt(size_t outputIdx, int& outSlotIdx) {
-    return acquireOutputImpl(*outputs_[outputIdx], outSlotIdx);
+wgpu::Texture KmsOutputBackend::acquireScanoutAt(uint32_t outputId, int& outSlotIdx) {
+    PerOutput* o = find(outputId);
+    if (!o) { outSlotIdx = -1; return wgpu::Texture(); }
+    return acquireOutputImpl(*o, outSlotIdx);
 }
 
 void KmsOutputBackend::pause() {
     if (paused_) return;
     paused_ = true;
-    for (auto& o : outputs_) {
+    for (auto& [id, o] : outputs_) {
         o->pendingFlipSlot = -1;
         o->ring.resetAllSlotsToFree();
         o->didInitialCommit = false;
@@ -368,12 +399,10 @@ bool KmsOutputBackend::presentOutputImpl(PerOutput& o, int slotIdx, int inFenceF
     return true;
 }
 
-bool KmsOutputBackend::presentScanout(int slotIdx, int inFenceFd) {
-    return presentOutputImpl(*outputs_[0], slotIdx, inFenceFd);
-}
-
-bool KmsOutputBackend::presentScanoutAt(size_t outputIdx, int slotIdx, int inFenceFd) {
-    return presentOutputImpl(*outputs_[outputIdx], slotIdx, inFenceFd);
+bool KmsOutputBackend::presentScanoutAt(uint32_t outputId, int slotIdx, int inFenceFd) {
+    PerOutput* o = find(outputId);
+    if (!o) return false;
+    return presentOutputImpl(*o, slotIdx, inFenceFd);
 }
 
 void KmsOutputBackend::pageFlipTrampoline(int /*fd*/, unsigned int /*sequence*/,
@@ -382,7 +411,7 @@ void KmsOutputBackend::pageFlipTrampoline(int /*fd*/, unsigned int /*sequence*/,
     auto* self = static_cast<KmsOutputBackend*>(userdata);
     if (!self) return;
     // Route the flip to the output whose CRTC the kernel reported.
-    for (auto& o : self->outputs_) {
+    for (auto& [id, o] : self->outputs_) {
         if (o->topo.crtcId != crtc_id) continue;
         const int flipped = o->pendingFlipSlot;
         o->pendingFlipSlot = -1;
