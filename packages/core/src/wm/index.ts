@@ -680,7 +680,18 @@ export function createWm(
       const moved = prevOuter.x !== newOuter.x || prevOuter.y !== newOuter.y
                  || prevOuter.width !== newOuter.width || prevOuter.height !== newOuter.height;
 
-      if (useTx && win.hasContent && !win.pendingInitialCommit) {
+      // Pre-tile state: addWindow seeds outer = {0,0,-1,-1} (the placeholder
+      // sentinel). A "reorder" relayout that lands BEFORE the window has ever
+      // been tiled (e.g. mapped relayout arrived before the workspace plugin's
+      // setOutputStack populated outputToplevelStacks, then setOutputStack
+      // ran and triggered this "reorder") has no prior geometry to hold --
+      // routing this initial assignment through the resize transaction would
+      // defer indefinitely, because the client never saw a real size to
+      // re-render against. Treat width<=0 as "never tiled" and take the
+      // immediate path so the window gets its first real rect.
+      const hadPriorTile = prevOuter.width > 0 && prevOuter.height > 0;
+
+      if (useTx && win.hasContent && !win.pendingInitialCommit && hadPriorTile) {
         // Transaction path: hold the new geometry; (re)configure on a size that
         // differs from what the client was last asked for. The window keeps its
         // current drawn rect until the broker applies the tx batch.
