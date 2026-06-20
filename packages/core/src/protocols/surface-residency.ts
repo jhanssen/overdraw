@@ -36,13 +36,25 @@ function clientWlOutputFor(
 // Recompute and emit enter/leave for a single surface. No-op if the
 // compositor doesn't expose surfaceOutputs (test stubs without one) or if
 // state.events is unavailable.
+//
+// `overrideOutputs`: when provided, treat that set as the surface's
+// outputs INSTEAD of querying the compositor's geometry-derived set.
+// Used by the cross-output move path: the WM has frozen the surface at
+// its OLD location while it waits for the client to reallocate at the
+// NEW output's scale; calling this with the NEW outputs proactively
+// drives wl_surface.enter/leave + wp_fractional_scale.preferred_scale
+// so the client starts reallocating without waiting for the geometry to
+// actually apply.
 export function updateSurfaceOutputResidency(
   state: CompositorState, addon: Addon, rec: SurfaceRecord,
+  overrideOutputs?: ReadonlyArray<number>,
 ): void {
   const surfaceOutputs = state.compositor.surfaceOutputs;
   if (!surfaceOutputs) return;
   if (!state.events) return;
-  const current = new Set(surfaceOutputs.call(state.compositor, rec.id));
+  const current = overrideOutputs
+    ? new Set(overrideOutputs)
+    : new Set(surfaceOutputs.call(state.compositor, rec.id));
   const prev = rec.enteredOutputs ?? new Set<number>();
   // Diff: emit leave for outputs the surface no longer overlaps.
   for (const id of prev) {

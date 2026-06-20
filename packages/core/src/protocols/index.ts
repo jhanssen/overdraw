@@ -23,6 +23,7 @@ import { unmapAndTeardownSurface } from "./wl_surface.js";
 import { rebuildStackWithPopups, maybeDismissGrabbedPopup, flushDeferredOutputStacks } from "./xdg_popup.js";
 import { configureToplevel } from "./xdg_surface.js";
 import { updateSurfaceOutputResidency } from "./surface-residency.js";
+import { installCrossOutputMove } from "./cross-output-move.js";
 import { makeOutputForOutput } from "./wl_output.js";
 import type { Addon, EventsByInterface, EventSenders } from "../types.js";
 import type { Ctx, CompositorState, CompositorSink } from "./ctx.js";
@@ -317,6 +318,13 @@ export async function installProtocols(
   // Expose wm.schedule via state.relayout for callers outside the WM that
   // affect the tile region (layer-shell reserved-zone changes).
   state.relayout = (reason) => state.wm?.schedule(reason);
+  // Cross-output workspace-move residency: subscribe to
+  // workspace.window-moved so a window crossing outputs freezes at the
+  // OLD location and waits for the client to reallocate at the new
+  // scale before applying. The WM's resize-tx (engaged by the same
+  // move's "reorder" relayout) shares the broker hold, so the two
+  // requirements gate the same atomic apply.
+  if (opts.pluginBus) installCrossOutputMove(state, addon, opts.pluginBus);
   // State-query channel (tests / introspection): a GPU-free snapshot of
   // geometry / focus / stacking. See src/query.ts.
   state.query = () => queryState(state);

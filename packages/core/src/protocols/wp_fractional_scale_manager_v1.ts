@@ -23,26 +23,34 @@ function asProtocolValue(scale: number): number {
   return Math.max(120, Math.round(scale * 120));
 }
 
-// Surface's "primary output" for scale purposes: the output containing the
-// largest fraction of its rect. Falls back to the compositor's primary if
-// the surface doesn't yet overlap anything.
+// Surface's "primary output" for scale purposes. Prefers the authoritative
+// rec.enteredOutputs set (kept in sync by updateSurfaceOutputResidency, and
+// overrideable by callers driving a residency change before geometry has
+// moved -- e.g. cross-output workspace moves) over the geometric overlap.
+// Falls back to the compositor's primary when the surface doesn't yet
+// resolve to any output.
 function primaryOutputOfSurface(
   state: CompositorState, surfaceRes: Resource,
 ): number {
-  // Resolve the SurfaceRecord via the resource->record map; surface ids are
-  // unique per session.
   let surfaceId = -1;
-  for (const [id, rec] of state.surfacesById ?? []) {
-    if (rec.resource === surfaceRes) { surfaceId = id; break; }
+  let rec = undefined;
+  for (const [id, r] of state.surfacesById ?? []) {
+    if (r.resource === surfaceRes) { surfaceId = id; rec = r; break; }
   }
   if (surfaceId < 0) return primaryOutputId(state);
+  // Authoritative residency set first: residency drives enter/leave AND
+  // preferred_scale together, so the just-updated set is what kitty just
+  // saw on the wire and should match what scale we send.
+  if (rec && rec.enteredOutputs && rec.enteredOutputs.size > 0) {
+    let lo = Infinity;
+    for (const id of rec.enteredOutputs) if (id < lo) lo = id;
+    if (Number.isFinite(lo)) return lo;
+  }
+  // Geometric overlap fallback (residency not yet computed for this
+  // surface, e.g. very first commit).
   const surfaceOutputs = state.compositor.surfaceOutputs;
   if (!surfaceOutputs) return primaryOutputId(state);
   const overlapping = surfaceOutputs.call(state.compositor, surfaceId);
-  // Pick the output the surface most likely lives on. surfaceOutputs() is
-  // unweighted (any overlap counts) so without per-output overlap areas we
-  // fall back to "lowest id wins" -- deterministic, matches what most
-  // clients see as their "main" output.
   if (overlapping.length === 0) return primaryOutputId(state);
   let lo = Infinity;
   for (const id of overlapping) if (id < lo) lo = id;
@@ -82,7 +90,8 @@ export function reemitFractionalScaleForSurface(
   for (const [r, owner] of [...map]) {
     if (owner !== surfaceRes) continue;
     if (r.destroyed) { map.delete(r); continue; }
-    state.events.wp_fractional_scale_v1.send_preferred_scale(r, preferredScaleFor(state, surfaceRes));
+    state.events.wp_fractional_scale_v1.send_preferred_scale(
+      r, preferredScaleFor(state, surfaceRes));
   }
 }
 
