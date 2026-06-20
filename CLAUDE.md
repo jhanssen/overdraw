@@ -213,6 +213,49 @@ and cleaned up carefully.
   plugin path in one commit, then deleting them when the Worker path landed — the
   verification was right; committing the transient tests was not.
 
+## IPC: wire by default, NEVER ctrl (without justification)
+
+Two sockets connect core and GPU process: **ctrl** (`SOCK_SEQPACKET`,
+fixed-size `ipc::Message` POD, `native/ipc/side_channel.h`) and **wire**
+(stream socket, Dawn batch + `FrameKind`-tagged variable-length frames,
+`native/ipc/transport.h`).
+
+**Wire is the default for ANY new GPU-process IPC.** Ctrl is reserved
+for three things:
+
+1. Pre-wire handshake (`Hello` / `HelloReply` configure the wire).
+2. Wire fd passing (`SetDrmFd`, `AddWireConn` carry the very fds wire
+   frames will travel on; sent before the destination wire exists).
+3. Out-of-band hard kill / lifecycle (`Shutdown`, `OutputPause` /
+   `OutputResume`).
+
+Everything else goes on wire. Adding a new ctrl tag without one of
+those reasons recreates the **cross-fd race** class that has already
+bitten this codebase twice (M7 step 4's `ScanoutReserve` / commit
+`447a905`; `ImportClientTex` moving to `kind=3`/`kind=4`). The race:
+two independent fds, no kernel-level ordering between them; a recipient
+draining wire before ctrl finds a wire frame that references a
+resource the ctrl message hadn't introduced yet, then aborts.
+
+The repo is mid-migration; a handful of older tags (output lifecycle,
+surface-buffer alloc/release, `ReleaseClientTex`) still live on ctrl
+for historical reasons. **Do not add to that list.** When you need a
+new core↔gpu message:
+
+- Define a `FrameKind::Foo = N` in `transport.h`.
+- Define a `FooPayload` with `encode`/`decode` helpers in
+  `side_channel.h` (variable-length is fine; `[length:u32][kind:u8]
+  [payload...]` framing absorbs it).
+- Send with `link_->appendFrame(FrameKind::Foo, buf, sizeof(buf))` (or
+  `appendFrameWithFds` for SCM_RIGHTS).
+- Dispatch in `setInboundFrameHandler` (core) / `dispatchCoreControlFrame`
+  (GPU process) by switching on `kind`.
+
+Working models: `ScanoutReserve`, `SwitchMode`, `ScanoutRebuild`,
+`ImportClientTex`. Copy their pattern, don't reach for ctrl.
+
+See `docs/architecture.md` "Why wire, not ctrl" for the full rationale.
+
 ## Bisecting wire / device-async issues
 
 - Device/queue-level async ops over the Dawn wire (buffer `MapAsync`,

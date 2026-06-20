@@ -130,6 +130,59 @@ Two processes in v1: core and GPU. Phase 2 adds a small session supervisor.
   do *not* speak to the GPU process directly except via the wire. All
   control traffic goes through the core.
 
+#### Why wire, not ctrl: the cross-fd ordering rule
+
+**Load-bearing invariant.** The ctrl socket is for boot handshake and
+out-of-band hard-kill ONLY. Once the wire is up, every GPU-process /
+output / surface message rides the **wire** as a non-Dawn frame
+(`FrameKind != 0`). New IPC messages MUST go on the wire by default;
+adding a new ctrl tag is a code smell and needs a documented reason
+falling under one of the carve-outs below.
+
+**Why.** Wire and ctrl are two independent fds. The kernel orders bytes
+within ONE fd (FIFO) but makes no ordering guarantees across two fds.
+When a message on ctrl logically precedes a wire frame the recipient
+relies on (e.g. ctrl tells the GPU "this surface buffer now exists";
+the next frame on wire references it), the recipient may dispatch the
+wire frame BEFORE the ctrl message and fail on the unknown reference.
+This is the cross-fd race class. It bit M7 step 4 (`ScanoutReserve`
+on ctrl raced `ProducerBegin` on wire — fixed by moving Reserve to
+wire, commit `447a905`), then bit `ImportClientTex` (`m`/`M` tags moved
+to wire as `kind=3`/`kind=4`), and the same hazard exists today for
+every remaining ctrl tag that has a wire dependency.
+
+Putting BOTH dependent messages on the wire makes the recipient
+dispatch them in FIFO order by construction — no per-message
+synchronization, no spin-pump, no buffering. The wire framing
+(`[length:u32][kind:u8][payload]`) cleanly separates Dawn-byte frames
+(`kind=0`) from control frames (`kind=1..N`), and SCM_RIGHTS attaches
+to specific frames via `sendmsg`, so the wire can carry the SAME
+messages ctrl carries with no loss of fidelity.
+
+**Tags that legitimately stay on ctrl.** Three categories, all about
+the wire NOT existing yet OR needing to outlive the wire:
+
+1. **Pre-wire handshake.** `Hello` / `HelloReply` build the wire's
+   peer configuration. They cannot ride a wire that hasn't been
+   constructed.
+2. **Wire fd passing.** `SetDrmFd` (drm card fd via SCM_RIGHTS, sent
+   BEFORE Hello in KMS mode) and `AddWireConn` (passes the plugin's
+   wire-connection fd) carry the very fds wire frames will travel on.
+3. **Out-of-band lifecycle.** `Shutdown` and `OutputPause` /
+   `OutputResume` are informational; they exist deliberately
+   separated so a wedged wire can still be killed and so VT-switch
+   pause cannot race the wire it is pausing.
+
+Everything else SHOULD be on the wire. The repo is mid-migration: a
+few tier-1 tags (output lifecycle, surface-buffer alloc/release,
+`ReleaseClientTex`) still live on ctrl for historical reasons. New
+work MUST NOT add to that list; new messages start on wire.
+
+When in doubt, **wire by default**. Look at how `ScanoutReserve` /
+`SwitchMode` / `ScanoutRebuild` / `ImportClientTex` are dispatched
+(transport.h `FrameKind` + side_channel.h variable-length payload
+helpers) and copy the pattern.
+
 #### Side-channel message set (v1)
 
 Core → GPU process requests:
