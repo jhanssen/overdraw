@@ -591,7 +591,10 @@ const transitionsBroker = createTransitionsBroker({
     if (ids === null) state.outputToplevelStacks.delete(outputId);
     else state.outputToplevelStacks.set(outputId, ids.slice());
     rebuildStackWithPopups(state);
-    state.relayout?.("state-changed");
+    // "reorder" so the WM's resize transaction holds new geometry until
+    // each client re-renders -- avoids a stale-size flash during workspace
+    // transitions that change a window's tile.
+    state.relayout?.("reorder");
   },
 });
 

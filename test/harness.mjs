@@ -389,7 +389,7 @@ export async function setupCompositor(opts = {}) {
         if (ids === null) state.outputToplevelStacks.delete(outputId);
         else state.outputToplevelStacks.set(outputId, ids.slice());
         xdgPopupMod.rebuildStackWithPopups(state);
-        state.relayout?.("state-changed");
+        state.relayout?.("reorder");
       },
     });
     TRANSITIONS_NOT_HANDLED = tx.NOT_HANDLED;

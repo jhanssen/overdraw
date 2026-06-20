@@ -213,8 +213,11 @@ export function createWindowsBroker(deps: WindowsBrokerDeps): WindowsBroker {
     }
     rebuildStackWithPopups(state);
     // The visible window set on this output changed; trigger a relayout so
-    // the layout-driver picks up the new ordering / membership.
-    state.relayout?.("state-changed");
+    // the layout-driver picks up the new ordering / membership. "reorder"
+    // routes through the WM's resize transaction (geometry held until
+    // clients re-render at the new size), avoiding a frame or two where
+    // a moved window shows scaled at its old size on the new tile.
+    state.relayout?.("reorder");
     return null;
   }
 
