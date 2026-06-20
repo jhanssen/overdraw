@@ -41,6 +41,7 @@
 #include "output_host_window.h"
 #if OVERDRAW_KMS
 #include "kms_output.h"
+#include "udev_monitor.h"
 #endif
 #include "side_channel.h"
 #include "transport.h"
@@ -1980,6 +1981,49 @@ int run(int wireFd, int ctrlFd, int inputFd, bool headless,
             }
             ctrlSender.send(m);
         });
+    }
+
+    // Udev hotplug monitor (DRM subsystem). KMS-only; nested mode has no
+    // connectors to plug/unplug. Registered with the event loop right next
+    // to libseat / the DRM card fd -- it lives in this process because libseat
+    // does. Today this is LOG-ONLY: subsequent M7 commits add the actual
+    // connector rescan + OutputAdded/OutputRemoved IPC. Card-level add/remove
+    // is logged for awareness; acting on it is M9.
+    gpu::UdevHotplugMonitor udevMon;
+    if (outputKms && kms) {
+        if (!udevMon.open()) {
+            // Not fatal: hotplug is added incrementally; the rest of the GPU
+            // process still works (just no live plug/unplug). Log once.
+            std::fprintf(stderr, "[gpu] udev monitor open failed: %s (hotplug disabled)\n",
+                         udevMon.error().c_str());
+        } else {
+            const int udevFd = udevMon.fd();
+            loop->add(udevFd, gpu::EventLoop::kRead, [&udevMon](uint32_t) {
+                udevMon.drain([](const gpu::UdevHotplugEvent& ev) {
+                    using Kind = gpu::UdevHotplugEvent::Kind;
+                    switch (ev.kind) {
+                        case Kind::kConnectorChange:
+                            std::printf("[gpu] udev: connector change on %s devnum=%lu hint=%u\n",
+                                        ev.sysname.c_str(),
+                                        static_cast<unsigned long>(ev.devnum),
+                                        ev.connectorIdHint);
+                            // M7 next step: trigger a connector rescan here.
+                            break;
+                        case Kind::kCardAdded:
+                            std::printf("[gpu] udev: DRM card added (%s); M9 territory, ignored\n",
+                                        ev.sysname.c_str());
+                            break;
+                        case Kind::kCardRemoved:
+                            std::printf("[gpu] udev: DRM card removed (%s); M9 territory, ignored\n",
+                                        ev.sysname.c_str());
+                            break;
+                        case Kind::kIgnore:
+                            break;
+                    }
+                });
+            });
+            std::printf("[gpu] udev hotplug monitor up (fd=%d)\n", udevFd);
+        }
     }
 #endif
 

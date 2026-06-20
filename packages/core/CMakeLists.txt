@@ -56,7 +56,8 @@ if(OVERDRAW_KMS)
     list(APPEND OVERDRAW_GPU_PROCESS_SOURCES
         gpu-process/src/drm_utils.cpp
         gpu-process/src/kms_scanout_ring.cpp
-        gpu-process/src/kms_output.cpp)
+        gpu-process/src/kms_output.cpp
+        gpu-process/src/udev_monitor.cpp)
 endif()
 add_executable(overdraw-gpu-process ${OVERDRAW_GPU_PROCESS_SOURCES})
 target_include_directories(overdraw-gpu-process PRIVATE
@@ -67,6 +68,10 @@ target_link_libraries(overdraw-gpu-process PRIVATE
     ${GBM_LIBRARIES} ${LIBDRM_LIBRARIES} pthread dl rt)
 if(OVERDRAW_KMS)
     target_compile_definitions(overdraw-gpu-process PRIVATE OVERDRAW_KMS=1)
+    target_include_directories(overdraw-gpu-process PRIVATE
+        ${LIBUDEV_INCLUDE_DIRS})
+    target_link_libraries(overdraw-gpu-process PRIVATE
+        ${LIBUDEV_LIBRARIES})
 endif()
 # -rdynamic so backtrace_symbols_fd can resolve function names in the crash handler.
 target_link_options(overdraw-gpu-process PRIVATE -rdynamic)
@@ -310,6 +315,18 @@ target_include_directories(wire-barrier-test PRIVATE ${IPC_INCLUDE})
 # ---- Logging native unit test (areas, --log-level parser, ipc sink/source) ----
 add_executable(log-test test/log-test.cpp)
 target_link_libraries(log-test PRIVATE overdraw_log)
+
+# ---- Udev hotplug classifier unit test (pure functions; no daemon required)
+# KMS-only because the .cpp pulls in <libudev.h>. The classifier itself doesn't
+# use libudev, but the file compiles against the header so we still link the lib.
+if(OVERDRAW_KMS)
+    add_executable(udev-classifier-test
+        test/udev-classifier-test.cpp
+        gpu-process/src/udev_monitor.cpp)
+    target_include_directories(udev-classifier-test PRIVATE
+        gpu-process/src ${LIBUDEV_INCLUDE_DIRS})
+    target_link_libraries(udev-classifier-test PRIVATE ${LIBUDEV_LIBRARIES})
+endif()
 
 # ---- dmabuf test client (linux-dmabuf-v1 import + composite) ----
 add_executable(dmabuf-test-client
