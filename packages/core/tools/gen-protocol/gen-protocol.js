@@ -72,6 +72,7 @@ const DEFAULT_INPUTS = [
   // wlr-* protocols are not in wayland-protocols upstream; vendor copies.
   join(repoRoot, 'protocols', 'wlr-layer-shell-unstable-v1.xml'),
   join(repoRoot, 'protocols', 'wlr-foreign-toplevel-management-unstable-v1.xml'),
+  join(repoRoot, 'protocols', 'wlr-output-management-unstable-v1.xml'),
 ];
 
 function main(argv) {

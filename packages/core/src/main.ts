@@ -52,7 +52,7 @@ import type { DawnWire, DawnGlobals } from "./gpu/compositor.js";
 import type { Addon, InputEvent } from "./types.js";
 import type { CompositorSink, CompositorState } from "./protocols/ctx.js";
 import { OUTPUT_DEFAULT } from "./protocols/ctx.js";
-import { nextOutputPosition } from "./output/arrangement.js";
+import { nextOutputPosition, durableKeyOf, formatRefreshHz } from "./output/arrangement.js";
 import { reemitWlOutput } from "./protocols/wl_output.js";
 import { reemitXdgOutput } from "./protocols/zxdg_output_manager_v1.js";
 import { reemitFractionalScale } from "./protocols/wp_fractional_scale_manager_v1.js";
@@ -283,6 +283,26 @@ state = await installProtocols(addon, {
   }),
 });
 
+// Seed the per-durable-key memory maps from the user config. These are
+// consulted by:
+//   - the OutputDescriptor handler below (for the primary on boot AND for
+//     any host-window resize re-emit), and
+//   - hotplug.ts's OutputAdded handler (for connectors hot-plugged at
+//     runtime).
+// Both call sites resolve a descriptor's durable key (edidId || name) and
+// pick the memorized position/scale when present, falling back to the
+// deterministic right-of-rightmost / EDID-DPI defaults otherwise. The
+// wlr-output-management apply path mutates the same maps, so runtime
+// reconfiguration persists for the rest of the session.
+if (Object.keys(config.outputsByKey).length > 0) {
+  state.outputPositionMemory = new Map();
+  state.outputScaleMemory = new Map();
+  for (const [key, entry] of Object.entries(config.outputsByKey)) {
+    if (entry.position) state.outputPositionMemory.set(key, { ...entry.position });
+    if (entry.scale !== undefined) state.outputScaleMemory.set(key, entry.scale);
+  }
+}
+
 // OutputDescriptor from the GPU process: update state.outputs's seed record
 // with real host-derived values, then propagate to every layer that needs to
 // know about the output's size or geometry.
@@ -314,21 +334,28 @@ addon.setOnOutputDescriptor((d) => {
   // (KMS only -- a nested host window's physical dims describe the host
   // monitor, not our render target).
   const device = { width: d.width, height: d.height };
+  // Per-output durable key. Used to consult the memorized position / scale
+  // maps populated by user config OR by prior wlr-output-management apply.
+  const durable = durableKeyOf({ edidId: d.edidId, name: d.name });
+  const memorizedScale = durable !== ""
+    ? state.outputScaleMemory?.get(durable) ?? null : null;
   const scale = resolveScale({
-    configScale: config.scale,
+    configScale: config.scale ?? memorizedScale,
     deviceWidth: device.width, deviceHeight: device.height,
     physicalWidthMm: d.physicalWidthMm, physicalHeightMm: d.physicalHeightMm,
     allowEdidAuto: backendOpts.backend === "kms",
   });
   const logical = logicalSize(device.width, device.height, scale);
+  const memorizedPos = durable !== ""
+    ? state.outputPositionMemory?.get(durable) : undefined;
 
   let rec = outputs.get(d.outputId);
   let sizeChanged = false;
   if (!rec) {
-    // A monitor beyond the primary. Place it with the deterministic fallback
-    // (right of the current rightmost output) until user-declared arrangement
-    // lands (see multi-output-design §10).
-    const pos = nextOutputPosition(outputs.values());
+    // A monitor beyond the primary. Place it with the memorized position if
+    // present (config / prior set_position), else the deterministic
+    // right-of-rightmost fallback. See multi-output-design §10.
+    const pos = memorizedPos ?? nextOutputPosition(outputs.values());
     rec = {
       id: d.outputId,
       logicalPosition: pos,
@@ -369,6 +396,15 @@ addon.setOnOutputDescriptor((d) => {
     // setOnOutputAdded -> hotplug.ts which fires output.added with the
     // workspace plugin already subscribed.
   } else {
+    // First-time identity arrival on the seed record: the GPU process's
+    // first OutputDescriptor for the primary brings non-empty name/edidId
+    // where the installProtocols seed had empty/placeholder. Consult the
+    // memorized position once at that moment. Subsequent descriptors
+    // (host-window resize re-emit) skip this -- the user may have moved
+    // the output via the protocol since, and that runtime change must
+    // win over a stale seed-time consult.
+    const firstIdentity = rec.edidId === "" && d.edidId !== "";
+    if (firstIdentity && memorizedPos) rec.logicalPosition = memorizedPos;
     sizeChanged = rec.logicalSize.width !== logical.width
       || rec.logicalSize.height !== logical.height;
     rec.deviceSize = device;
@@ -391,7 +427,7 @@ addon.setOnOutputDescriptor((d) => {
     // doesn't carry one (xdg-output's description is overdraw-owned policy).
     log.info("core",
       `output ${d.outputId}: ${device.width}x${device.height} device, `
-      + `${logical.width}x${logical.height} logical @${d.refreshMhz}mHz scale=${scale} `
+      + `${logical.width}x${logical.height} logical @${formatRefreshHz(d.refreshMhz)} scale=${scale} `
       + `xform=${d.transform} phys=${d.physicalWidthMm}x${d.physicalHeightMm}mm name=${d.name}`);
   }
 

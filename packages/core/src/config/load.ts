@@ -106,6 +106,41 @@ function normalize(raw: unknown, path: string): ResolvedConfig {
     }
   }
 
+  // Per-key overrides. Mapped to its own normalized record so the rest of
+  // the runtime sees a stable shape (and rejects bogus user input early).
+  const outputsByKey: ResolvedConfig["outputsByKey"] = {};
+  if (cfg.output?.byKey !== undefined) {
+    const m = cfg.output.byKey;
+    if (m === null || typeof m !== "object") {
+      fail("`output.byKey` must be an object", path);
+    }
+    for (const [key, raw] of Object.entries(m)) {
+      if (typeof key !== "string" || key.length === 0) {
+        fail("`output.byKey` keys must be non-empty strings", path);
+      }
+      if (raw === null || typeof raw !== "object") {
+        fail(`\`output.byKey["${key}"]\` must be an object`, path);
+      }
+      const entry: { position?: { x: number; y: number }; scale?: number } = {};
+      if (raw.position !== undefined) {
+        const p = raw.position;
+        if (p === null || typeof p !== "object"
+            || !Number.isInteger((p as { x: unknown }).x)
+            || !Number.isInteger((p as { y: unknown }).y)) {
+          fail(`\`output.byKey["${key}"].position\` must be { x: int, y: int }`, path);
+        }
+        entry.position = { x: (p as { x: number }).x, y: (p as { y: number }).y };
+      }
+      if (raw.scale !== undefined) {
+        if (typeof raw.scale !== "number" || !Number.isFinite(raw.scale) || raw.scale <= 0) {
+          fail(`\`output.byKey["${key}"].scale\` must be a positive number`, path);
+        }
+        entry.scale = raw.scale;
+      }
+      outputsByKey[key] = entry;
+    }
+  }
+
   // Verbatim pass-through; the active focus plugin owns the schema.
   const focus: unknown = cfg.focus;
   // Verbatim pass-through; the active hotkey plugin owns the schema.
@@ -153,7 +188,10 @@ function normalize(raw: unknown, path: string): ResolvedConfig {
     });
   }
 
-  return { output, card, scale, focus, hotkeys, decoration, actions, plugins, sourcePath: path };
+  return {
+    output, card, scale, outputsByKey,
+    focus, hotkeys, decoration, actions, plugins, sourcePath: path,
+  };
 }
 
 // Resolve, import, and normalize the config. `explicit` is the --config path (or
@@ -162,7 +200,8 @@ export async function loadConfig(explicit: string | null): Promise<ResolvedConfi
   const path = resolveConfigPath(explicit);
   if (path === null) {
     return {
-      output: null, card: null, scale: null, focus: undefined, hotkeys: undefined,
+      output: null, card: null, scale: null, outputsByKey: {},
+      focus: undefined, hotkeys: undefined,
       decoration: undefined, actions: undefined, plugins: [], sourcePath: null,
     };
   }

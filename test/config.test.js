@@ -112,6 +112,48 @@ test('output.scale: override, default, and validation', async () => {
   rmSync(dir, { recursive: true, force: true });
 });
 
+test('output.byKey: per-durable-key position + scale overrides', async () => {
+  const dir = tmp();
+  let n = 0;
+  const write = (body) => {
+    const p = join(dir, `byKey-${n++}.mjs`);
+    writeFileSync(p, body);
+    return p;
+  };
+  // Happy path: a position-only entry and a scale-only entry coexist.
+  let c = await loadConfig(write(`export default {
+    output: {
+      byKey: {
+        "DP-1": { position: { x: 0, y: 0 } },
+        "ACM-1234-CAFEBABE": { position: { x: 1920, y: 0 }, scale: 2 },
+        "HDMI-A-1": { scale: 1.5 },
+      },
+    },
+  }`));
+  assert.deepEqual(c.outputsByKey, {
+    "DP-1": { position: { x: 0, y: 0 } },
+    "ACM-1234-CAFEBABE": { position: { x: 1920, y: 0 }, scale: 2 },
+    "HDMI-A-1": { scale: 1.5 },
+  });
+
+  // Absent -> empty map.
+  c = await loadConfig(write('export default {}'));
+  assert.deepEqual(c.outputsByKey, {});
+
+  // Invalid shapes are hard errors at boot.
+  await assert.rejects(() => loadConfig(write(
+    'export default { output: { byKey: "nope" } }')), /output\.byKey/);
+  await assert.rejects(() => loadConfig(write(
+    'export default { output: { byKey: { "DP-1": null } } }')), /output\.byKey/);
+  await assert.rejects(() => loadConfig(write(
+    'export default { output: { byKey: { "DP-1": { position: { x: 1.5, y: 0 } } } } }')),
+    /position/);
+  await assert.rejects(() => loadConfig(write(
+    'export default { output: { byKey: { "DP-1": { scale: 0 } } } }')),
+    /scale/);
+  rmSync(dir, { recursive: true, force: true });
+});
+
 test('focus is verbatim pass-through (core does NOT validate)', async () => {
   // Core accepts any value; the focus plugin owns the schema and throws
   // from init on bad config (surfacing as a fatal startup error).

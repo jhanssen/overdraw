@@ -344,6 +344,66 @@ test('OutputRemoved: unknown id is ignored with a warn', () => {
   assert.ok(warned, "warned about unknown outputId");
 });
 
+test('OutputAdded: memorized position is restored when durable key matches', () => {
+  const { deps, fixture } = makeDeps();
+  // Seed an existing output occupying the [0, 1920) slot so the
+  // deterministic fallback would otherwise place a fresh add at x=1920.
+  fixture.state.outputs.set(0, {
+    id: 0, name: "DP-1",
+    logicalPosition: { x: 0, y: 0 },
+    logicalSize: { width: 1920, height: 1080 },
+    deviceSize: { width: 1920, height: 1080 },
+    scale: 1, description: "DP-1", refreshMhz: 60000, transform: 0,
+    physicalWidthMm: 500, physicalHeightMm: 280, make: "t", model: "DP-1",
+    edidId: "TST-0001-00000000",
+  });
+  // Memorize a position for the durable key of the about-to-add output.
+  const edid = "TST-0001-00000001";
+  fixture.state.outputPositionMemory = new Map([[edid, { x: 500, y: 200 }]]);
+
+  const onAdded = makeOnOutputAdded(deps);
+  onAdded(descriptor(1, "DP-2", 1920, 1080, edid));
+
+  const rec = fixture.state.outputs.get(1);
+  assert.deepEqual(rec.logicalPosition, { x: 500, y: 200 });
+});
+
+test('OutputAdded: missing memorized position falls back to deterministic right-of-rightmost', () => {
+  const { deps, fixture } = makeDeps();
+  fixture.state.outputs.set(0, {
+    id: 0, name: "DP-1",
+    logicalPosition: { x: 0, y: 0 },
+    logicalSize: { width: 1920, height: 1080 },
+    deviceSize: { width: 1920, height: 1080 },
+    scale: 1, description: "DP-1", refreshMhz: 60000, transform: 0,
+    physicalWidthMm: 500, physicalHeightMm: 280, make: "t", model: "DP-1",
+    edidId: "TST-0001-00000000",
+  });
+  const onAdded = makeOnOutputAdded(deps);
+  onAdded(descriptor(1, "DP-2"));
+  assert.deepEqual(fixture.state.outputs.get(1).logicalPosition, { x: 1920, y: 0 });
+});
+
+test('OutputAdded: memorized scale wins over EDID-DPI auto when no config scale set', () => {
+  const { deps, fixture } = makeDeps();
+  deps.allowEdidAutoScale = true; // would normally pick scale from physical dims
+  fixture.state.outputScaleMemory = new Map([["TST-0001-00000001", 2]]);
+  const onAdded = makeOnOutputAdded(deps);
+  onAdded(descriptor(1, "DP-2", 1920, 1080, "TST-0001-00000001"));
+  assert.equal(fixture.state.outputs.get(1).scale, 2);
+  // logical = device / scale
+  assert.equal(fixture.state.outputs.get(1).logicalSize.width, 960);
+});
+
+test('OutputAdded: memorized position uses connector name when EDID is empty', () => {
+  const { deps, fixture } = makeDeps();
+  // Empty edidId -> durable key is the connector name.
+  fixture.state.outputPositionMemory = new Map([["DP-2", { x: 1234, y: 567 }]]);
+  const onAdded = makeOnOutputAdded(deps);
+  onAdded(descriptor(1, "DP-2", 1920, 1080, ""));
+  assert.deepEqual(fixture.state.outputs.get(1).logicalPosition, { x: 1234, y: 567 });
+});
+
 test('OutputRemoved: state.wlOutputResources entry for X is cleared', () => {
   const { deps, fixture } = makeDeps();
   fixture.state.outputs.set(0, {

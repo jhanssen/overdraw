@@ -19,6 +19,22 @@
 // Every field is optional; an absent config (or absent field) uses
 // defaults.
 
+// Per-output overrides keyed by the output's durable identifier. The key
+// is checked first against EDID (an OutputRecord whose `edidId` is
+// non-empty); if no entry matches, the connector name (e.g. "DP-1") is
+// tried. Same precedence the workspace plugin's preferredOutputs list
+// uses. Values are restored on boot AND on hotplug add for the matching
+// output -- they are equivalent to a sticky `wlr-output-management`
+// set_position / set_scale, just declared statically.
+export interface OutputConfigEntry {
+  // Logical position in the global compositor coordinate space. Used by
+  // the WM's layout rect, pointer clamping, and surface-residency.
+  position?: { x: number; y: number };
+  // HiDPI scale factor. Same semantics as the top-level `scale` field,
+  // but scoped to one output. Fractional values allowed.
+  scale?: number;
+}
+
 export interface OutputConfig {
   // Logical output size. The host window size drives this in nested mode;
   // a value here is only an override hint. Real wl_output / resize
@@ -32,7 +48,14 @@ export interface OutputConfig {
   // Output scale factor (HiDPI). Logical size = device pixels / scale.
   // Fractional values (e.g. 1.5) are allowed. When omitted, the scale is
   // auto-derived from the display's EDID DPI (KMS), falling back to 1.
+  // Applies to every output that lacks a more-specific `byKey[<key>].scale`.
   scale?: number;
+  // Per-output overrides. Keys are durable identifiers (EDID-derived
+  // `<MFR>-<PRODUCT_HEX>-<SERIAL_HEX>`, or the connector name when EDID
+  // is unavailable). Used at boot AND on hotplug add for the matching
+  // output -- restoring `position` and `scale` after a replug or
+  // session restart. See multi-output-design §10.
+  byKey?: Record<string, OutputConfigEntry>;
 }
 
 // Restart behavior when a plugin fails (crash, OOM, watchdog termination, or
@@ -149,6 +172,12 @@ export interface ResolvedConfig {
   card: string | null;
   // Output scale override, or null to auto-derive (EDID DPI on KMS, else 1).
   scale: number | null;
+  // Per-durable-key overrides ({position, scale}). Maps from the durable
+  // identifier (edidId when non-empty, else connector name) to the
+  // user-declared overrides. Seeded into state.outputPositionMemory /
+  // state.outputScaleMemory at boot so they take effect both at startup
+  // and on hotplug add. Empty map = no per-output overrides.
+  outputsByKey: Record<string, { position?: { x: number; y: number }; scale?: number }>;
   // Verbatim user value (or undefined). Threaded to the bundled focus
   // plugin via bundled.ts's configFrom; the plugin validates.
   focus: unknown;

@@ -651,6 +651,18 @@ export interface CompositorState {
   // (OUTPUT_FALLBACK = -1) and its `name` is the reserved durable
   // identifier "__fallback__" (no real connector ever produces this).
   fallbackOutput?: OutputRecord;
+  // Per-durable-key memorized position. Populated by:
+  //   (a) user config (output.byKey[<key>].position),
+  //   (b) zwlr_output_management apply set_position succeeding.
+  // Consulted by hotplug add (output/hotplug.ts) to restore an output's
+  // prior logical position on replug, BEFORE the deterministic right-of-
+  // rightmost fallback is used. Keys: edidId when non-empty, else name.
+  // Lives only for the compositor session (not persisted across restarts).
+  outputPositionMemory?: Map<string, { x: number; y: number }>;
+  // Same shape as outputPositionMemory, but for scale. Auth precedence on
+  // hotplug add: explicit config-resolved scale (already handled by
+  // resolveScale) -> memorized scale (this map) -> EDID-DPI auto.
+  outputScaleMemory?: Map<string, number>;
   // The plugin-visible dynamic bus (carries window.committed / window.proposed
   // / window.relayout / arbitrary plugin events). Stored on state so handlers
   // outside installProtocols (e.g. foreign-toplevel-manager) can subscribe.

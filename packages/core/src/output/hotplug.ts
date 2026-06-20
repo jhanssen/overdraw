@@ -27,7 +27,7 @@ import type { CompositorState, OutputRecord } from "../protocols/ctx.js";
 import type { CompositorSink } from "../protocols/ctx.js";
 import { JsCompositor } from "../gpu/compositor.js";
 import { resolveScale, logicalSize } from "./scale.js";
-import { nextOutputPosition } from "./arrangement.js";
+import { nextOutputPosition, durableKeyOf } from "./arrangement.js";
 import { makeOutputForOutput } from "../protocols/wl_output.js";
 import { updateAllSurfaceResidency } from "../protocols/surface-residency.js";
 import { reemitFractionalScale } from "../protocols/wp_fractional_scale_manager_v1.js";
@@ -49,7 +49,17 @@ export interface HotplugDeps {
   log?: { info: (msg: string) => void; warn: (msg: string) => void };
 }
 
-function pushOutputsToLayers(deps: HotplugDeps): void {
+// Push the current state.outputs snapshot to every layer that mirrors it:
+// the JsCompositor's per-output geometry, the input backend's pointer
+// layout, the WM's output rects. Shared between hotplug add/remove and
+// the wlr-output-management apply path (any source that mutates an
+// output's position or scale calls this, then schedules relayout +
+// residency diff).
+export function pushOutputsToLayers(deps: {
+  addon: Addon;
+  state: CompositorState;
+  compositor: CompositorSink;
+}): void {
   const { addon, state, compositor } = deps;
   const outputs = state.outputs;
   if (!outputs) return;
@@ -81,14 +91,26 @@ export function makeOnOutputAdded(deps: HotplugDeps): (d: OutputDescriptor) => v
     const outputs = state.outputs;
     if (!outputs) return;
     const device = { width: d.width, height: d.height };
+    // Durable identifier the memory maps key on. Same precedence the
+    // workspace plugin uses (edidId first, name fallback).
+    const durable = durableKeyOf({ edidId: d.edidId, name: d.name });
+    // Scale precedence: explicit config scale wins (handled inside
+    // resolveScale); else memorized scale from a prior set_scale or
+    // config.byKey; else EDID-DPI auto / 1.
+    const memorizedScale = durable !== ""
+      ? state.outputScaleMemory?.get(durable) ?? null : null;
     const scale = resolveScale({
-      configScale: config.scale ?? null,
+      configScale: config.scale ?? memorizedScale,
       deviceWidth: device.width, deviceHeight: device.height,
       physicalWidthMm: d.physicalWidthMm, physicalHeightMm: d.physicalHeightMm,
       allowEdidAuto: allowEdidAutoScale,
     });
     const logical = logicalSize(device.width, device.height, scale);
-    const pos = nextOutputPosition(outputs.values());
+    // Position precedence: memorized position (config or prior set_position)
+    // wins; else the deterministic right-of-rightmost fallback.
+    const memorizedPos = durable !== ""
+      ? state.outputPositionMemory?.get(durable) : undefined;
+    const pos = memorizedPos ?? nextOutputPosition(outputs.values());
 
     // Dense id reuse without a paired OutputRemoved is a contract violation
     // upstream. The design (§3) allows reuse only after a remove. Warn and

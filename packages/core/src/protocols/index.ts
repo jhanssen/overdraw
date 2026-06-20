@@ -66,6 +66,7 @@ const GLOBALS = [
   "wp_viewporter",
   "wp_fractional_scale_manager_v1",
   "wp_linux_drm_syncobj_manager_v1",
+  "zwlr_output_manager_v1",
 ];
 
 // Interfaces created via requests (new_id), registered without a global so
@@ -86,6 +87,10 @@ const CHILD_INTERFACES = [
   "wp_fractional_scale_v1",
   "wp_linux_drm_syncobj_timeline_v1",
   "wp_linux_drm_syncobj_surface_v1",
+  "zwlr_output_head_v1",
+  "zwlr_output_mode_v1",
+  "zwlr_output_configuration_v1",
+  "zwlr_output_configuration_head_v1",
 ];
 
 // Load all generated signature modules, keyed by interface name.
@@ -602,6 +607,7 @@ export async function installProtocols(
     wp_viewporter: await import("./wp_viewporter.js"),
     wp_fractional_scale_manager_v1: await import("./wp_fractional_scale_manager_v1.js"),
     wp_linux_drm_syncobj_manager_v1: await import("./wp_linux_drm_syncobj_v1.js"),
+    zwlr_output_manager_v1: await import("./zwlr_output_manager_v1.js"),
   };
 
   // Some child interfaces have handlers from a sibling module's named exports.
@@ -617,6 +623,7 @@ export async function installProtocols(
   const viewporterMod = await import("./wp_viewporter.js");
   const fracScaleMod = await import("./wp_fractional_scale_manager_v1.js");
   const syncobjMod = await import("./wp_linux_drm_syncobj_v1.js");
+  const outputMgmtMod = await import("./zwlr_output_manager_v1.js");
   const childHandlers: Record<string, object> = {
     wl_pointer: seatMod.makePointer(ctx),
     wl_keyboard: seatMod.makeKeyboard(ctx),
@@ -638,6 +645,10 @@ export async function installProtocols(
     wp_fractional_scale_v1: fracScaleMod.makeFractionalScale(ctx),
     wp_linux_drm_syncobj_timeline_v1: syncobjMod.makeSyncobjTimeline(ctx),
     wp_linux_drm_syncobj_surface_v1: syncobjMod.makeSyncobjSurface(ctx),
+    zwlr_output_head_v1: outputMgmtMod.makeOutputHead(ctx),
+    zwlr_output_mode_v1: outputMgmtMod.makeOutputMode(ctx),
+    zwlr_output_configuration_v1: outputMgmtMod.makeOutputConfiguration(ctx),
+    zwlr_output_configuration_head_v1: outputMgmtMod.makeOutputConfigurationHead(ctx),
   };
 
   // The apply target forwards lazily: the seat is constructed below and
@@ -682,6 +693,11 @@ export async function installProtocols(
   // handler factory has already been constructed by the GLOBALS loop above
   // and registered its module-local manager set.
   foreignTopMod.installForeignToplevelBusHooks(ctx);
+
+  // wlr-output-management: subscribe to output.added / output.removed /
+  // output.changed on the plugin bus so bound managers see head/mode
+  // updates and bumped done(serial) events.
+  outputMgmtMod.installOutputManagerBusHooks(ctx);
 
   return state;
 }
