@@ -94,33 +94,160 @@ const STATE_KEY = "workspace.id";
 // Helpers: cast a plain number to a branded id at the boundary.
 const asIndex = (n: number): WorkspaceIndex => n as WorkspaceIndex;
 
-export default async function init(sdk: SdkLike, _config?: unknown): Promise<void> {
-  // Live output identifiers, kept in sync via the output.changed bus event.
-  // Maps outputId -> durable name. Seeded below with the boot output when
-  // the plugin starts; subsequent connector adds/removes will keep this
-  // accurate. Used to resolve preferredOutputs entries to a live id when
-  // hotplug migration lands (M7).
+// Config passed by the core bundled bootstrap (packages/core/src/plugins/
+// bundled.ts). The fallback constants are core-owned sentinels; the boot
+// durable key is the primary output's durable identifier known to the core
+// at plugin-resolution time. Passed through this surface rather than
+// imported across packages so the plugin module stays cross-package-clean.
+// Tests can pass synthetic values (or omit them entirely).
+interface WorkspacePluginConfig {
+  // Sentinel outputId for the virtual fallback output (state.fallbackOutput
+  // on the core). Workspaces park here when no real output is live. -1 in
+  // the core today; the plugin treats it as opaque.
+  fallbackOutputId?: number;
+  // Durable identifier of the fallback. Used as the preferredOutputs entry
+  // for parked workspaces so the resolver treats it like any real output.
+  fallbackOutputName?: string;
+  // Durable identifier of the boot primary output (edidId when non-empty,
+  // else connector name). Seeds the very first workspace's preferredOutputs
+  // so the boot output is remembered correctly from frame zero. When empty
+  // (test harness without a real output), the registry falls back to a
+  // placeholder that the bus output.changed handler will NOT rewrite --
+  // preferredOutputs entries are never rewritten by design.
+  bootOutputDurableKey?: string;
+  // Snapshot of every live output known to the core at plugin-resolution
+  // time. Each entry maps an outputId to its durable key. Lets the plugin
+  // seed its liveOutputs map without missing the boot enumeration of
+  // secondary outputs (the OutputDescriptor burst that introduces them
+  // fires BEFORE the plugin runtime spawns, so the plugin can't observe
+  // those via subscribe). After seeding the plugin recomputes once so
+  // secondary outputs immediately satisfy the ≥1-workspace-per-output
+  // invariant. When omitted (test harness), the plugin starts with an
+  // empty liveOutputs map and learns outputs lazily from bus events.
+  initialOutputs?: ReadonlyArray<{ outputId: number; durableKey: string }>;
+}
+
+export default async function init(
+  sdk: SdkLike, config?: WorkspacePluginConfig,
+): Promise<void> {
+  // Resolve fallback config. Empty defaults make this safe to run in
+  // non-core harnesses (the recompute will throw if a workspace ever has
+  // no live home in such a harness; tests stay clear of that case).
+  const fallbackOutputId = config?.fallbackOutputId ?? -1;
+  const fallbackOutputName = config?.fallbackOutputName ?? "";
+  // The durable identifier of the boot primary output. The core's main.ts
+  // populates this from state.outputs[OUTPUT_DEFAULT] before the plugin
+  // runtime spawns -- so by the time we initialize the registry, the boot
+  // workspace's preferredOutputs entry is the real key (edidId or
+  // connector name), not a placeholder. A test harness without core
+  // wiring receives "" and we fall back to a stable placeholder; the
+  // placeholder remains in preferredOutputs forever (entries are durable),
+  // which is fine for tests but would be a small wart in production (the
+  // user would never see "boot" as their durable id because main.ts
+  // always populates a real one).
+  const bootOutputDurableKey = config?.bootOutputDurableKey ?? "";
+  const BOOT_OUTPUT_NAME = bootOutputDurableKey !== ""
+    ? bootOutputDurableKey
+    // Stable placeholder used only in test harnesses that don't wire core.
+    // Never overwritten (the design forbids rewrites of durable identifiers).
+    : "boot";
+
+  // Live output identifiers, kept in sync via output.added / output.removed /
+  // output.changed. Maps outputId -> durable key (edidId when non-empty,
+  // else name). Used by recomputeOutputs to resolve preferredOutputs entries
+  // to a live outputId on every hotplug.
   const liveOutputs = new Map<number, string>();
-  // Bootstrap name for the primary output: callers may not have published
-  // output.changed yet, so the registry uses this as the seed identifier on
-  // any ensureOutput in the meantime. Real names flow in via the subscription
-  // and update preferredOutputs entries created with this placeholder.
-  const BOOT_OUTPUT_NAME = "primary";
   function outputNameOf(outputId: number): string {
     return liveOutputs.get(outputId) ?? BOOT_OUTPUT_NAME;
   }
+  // Pick the durable key for an output: prefer edidId when non-empty (stable
+  // across port swaps); fall back to name when EDID is unreadable. Matches
+  // the "two durable keys checked in order" rule from multi-output-design §3.
+  function durableKeyOf(p: { edidId?: unknown; name?: unknown }): string | null {
+    if (typeof p.edidId === "string" && p.edidId.length > 0) return p.edidId;
+    if (typeof p.name === "string" && p.name.length > 0) return p.name;
+    return null;
+  }
   // Subscribe BEFORE init so a synchronous emit during startup doesn't drop.
   sdk.events.subscribe("output.changed", (_name, payload) => {
-    if (payload && typeof payload === "object") {
-      const p = payload as { outputId?: unknown; name?: unknown };
-      if (typeof p.outputId === "number" && typeof p.name === "string") {
-        liveOutputs.set(p.outputId, p.name);
-      }
+    if (!payload || typeof payload !== "object") return;
+    const p = payload as { outputId?: unknown };
+    if (typeof p.outputId !== "number") return;
+    const key = durableKeyOf(payload as { edidId?: unknown; name?: unknown });
+    if (key !== null) liveOutputs.set(p.outputId, key);
+  });
+  // Guard against hotplug events that arrive between subscribe() and reg.init
+  // returning. reg.init runs synchronously right below; in practice nothing
+  // emits during that window, but the closure references `state` so a hotplug
+  // landing too early would dereference undefined.
+  let stateReady = false;
+  // M7 hotplug: workspace migration on add / remove.
+  sdk.events.subscribe("output.added", (_name, payload) => {
+    if (!stateReady) return;
+    if (!payload || typeof payload !== "object") return;
+    const p = payload as { outputId?: unknown };
+    if (typeof p.outputId !== "number") return;
+    const key = durableKeyOf(payload as { edidId?: unknown; name?: unknown });
+    if (key === null) return;
+    liveOutputs.set(p.outputId, key);
+    const r = reg.recomputeOutputs(
+      state, liveOutputs, fallbackOutputId, fallbackOutputName);
+    state = r.state;
+    void applyEffects(r.sideEffects);
+  });
+  sdk.events.subscribe("output.pre-remove", (_name, payload) => {
+    if (!stateReady) return;
+    if (!payload || typeof payload !== "object") return;
+    const p = payload as { outputId?: unknown };
+    if (typeof p.outputId !== "number") return;
+    const key = durableKeyOf(payload as { edidId?: unknown; name?: unknown });
+    if (key === null) return;
+    // Refresh lastActiveByOutputName one last time, while the output is
+    // still in our liveOutputs map and has a shown workspace. The design
+    // (§10 "Active workspace memory") calls this out specifically: focus
+    // changes during the output's lifetime may not have routed through a
+    // workspace.show() call (e.g. shown by ensureOutput on first map), so
+    // we record the current shown here as the definitive last-active.
+    const shown = state.shownByOutput.get(p.outputId);
+    if (shown !== undefined) {
+      state.lastActiveByOutputName.set(key, shown);
     }
+    // Migration runs on output.removed below (after core has updated its
+    // state.outputs); doing it here would race the residency diff and the
+    // destroyGlobalForOutput step in hotplug.ts.
+  });
+  sdk.events.subscribe("output.removed", (_name, payload) => {
+    if (!stateReady) return;
+    if (!payload || typeof payload !== "object") return;
+    const p = payload as { outputId?: unknown };
+    if (typeof p.outputId !== "number") return;
+    liveOutputs.delete(p.outputId);
+    const r = reg.recomputeOutputs(
+      state, liveOutputs, fallbackOutputId, fallbackOutputName);
+    state = r.state;
+    void applyEffects(r.sideEffects);
   });
 
   const r0 = reg.init(BOOT_OUTPUT_NAME);
   let state: WorkspaceState = r0.state;
+  stateReady = true;
+
+  // Seed liveOutputs from the boot snapshot the core passed in. The boot
+  // OutputDescriptor burst happens before the plugin runtime spawns, so
+  // we cannot observe the resulting output.added emits via subscribe;
+  // initialOutputs is the catch-up mechanism. After seeding we run a
+  // recompute so the donor invariant creates a fresh workspace on every
+  // secondary output (the boot workspace already lives on the primary).
+  let bootRecomputeEffects: SideEffect[] = [];
+  if (config?.initialOutputs && config.initialOutputs.length > 0) {
+    for (const o of config.initialOutputs) {
+      if (o.durableKey !== "") liveOutputs.set(o.outputId, o.durableKey);
+    }
+    const r = reg.recomputeOutputs(
+      state, liveOutputs, fallbackOutputId, fallbackOutputName);
+    state = r.state;
+    bootRecomputeEffects = r.sideEffects;
+  }
 
   // Apply each side effect against the SDK. Errors from SDK calls bubble up;
   // the registry's invariants are preserved either way (state is updated
@@ -180,7 +307,7 @@ export default async function init(sdk: SdkLike, _config?: unknown): Promise<voi
     // side effects. The setOutputStack effect carries the TO ids; we
     // extract it and skip the normal apply because the transition's
     // commit will apply it atomically with completion.
-    const r = reg.show(state, index, outputId);
+    const r = reg.show(state, index, outputId, outputNameOf(outputId));
     state = r.state;
     const setStackEffect = r.sideEffects.find(
       (e): e is Extract<SideEffect, { kind: "setOutputStack" }> =>
@@ -232,10 +359,13 @@ export default async function init(sdk: SdkLike, _config?: unknown): Promise<voi
     }
   }
 
-  // Emit the boot-time workspace.created for workspace 1. Subscribers that
-  // attached before plugin init see this; status bars / IPC listeners that
-  // attach later observe the workspace via list/current.
+  // Emit the boot-time workspace.created for workspace 1, plus any side
+  // effects from the boot-time recompute (donor-replenishment workspaces
+  // for secondary outputs, setOutputStack for each, etc.). Subscribers
+  // that attached before plugin init see these; status bars / IPC
+  // listeners that attach later observe via list/current.
   await applyEffects(r0.sideEffects);
+  await applyEffects(bootRecomputeEffects);
 
   // Seed membership from windows that are already mapped at plugin init
   // (defensive: bundled plugins load before any client maps in practice, so
@@ -299,7 +429,7 @@ export default async function init(sdk: SdkLike, _config?: unknown): Promise<voi
         await showWithTransition(p.index, p.outputId, t);
         return null;
       }
-      const r = reg.show(state, p.index, p.outputId);
+      const r = reg.show(state, p.index, p.outputId, outputNameOf(p.outputId));
       state = r.state;
       await applyEffects(r.sideEffects);
       return null;
@@ -374,7 +504,8 @@ export default async function init(sdk: SdkLike, _config?: unknown): Promise<voi
         );
         return;
       }
-      const r = reg.show(state, index, outputId);
+      const outId = outputId ?? reg.OUTPUT_DEFAULT;
+      const r = reg.show(state, index, outId, outputNameOf(outId));
       state = r.state;
       await applyEffects(r.sideEffects);
     },

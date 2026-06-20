@@ -61,6 +61,14 @@ export interface WorkspaceState {
   // unmapped).
   surfaceToHandle: Map<number, WorkspaceHandle>;
   nextHandle: number;
+  // Per-output focus memory keyed by durable output identifier (the same
+  // string used in preferredOutputs). Updated on every show() so the
+  // workspace last active on output X is restored when X reappears after a
+  // hotplug. Survives evacuations: if output X disappears, the entry stays;
+  // when X returns and recomputeOutputs reclaims workspaces onto X, the
+  // remembered workspace becomes shown there again. See multi-output-design
+  // §10 "Active workspace memory".
+  lastActiveByOutputName: Map<string, WorkspaceHandle>;
 }
 
 // Discriminated union of side effects the registry produces. The wrapper
@@ -174,8 +182,17 @@ export function init(
     shownByOutput: new Map(),
     surfaceToHandle: new Map(),
     nextHandle: 1,
+    lastActiveByOutputName: new Map(),
   };
-  return ensureOutput(state, OUTPUT_DEFAULT, bootOutputName);
+  const ensured = ensureOutput(state, OUTPUT_DEFAULT, bootOutputName);
+  // Seed lastActive for the boot output so a hotplug-on-boot path that
+  // never observed a show() before the first remove still has a focus
+  // anchor when the output returns.
+  const shown = ensured.state.shownByOutput.get(OUTPUT_DEFAULT);
+  if (shown !== undefined && bootOutputName !== "") {
+    ensured.state.lastActiveByOutputName.set(bootOutputName, shown);
+  }
+  return ensured;
 }
 
 // Internal: guarantee outputId has at least one workspace, creating one if
@@ -192,7 +209,11 @@ export function ensureOutput(state: WorkspaceState, outputId: number, seedName: 
   const handle = asHandle(state.nextHandle);
   const rec: WorkspaceRecord = {
     handle, outputId, members: [],
-    preferredOutputs: [seedName],
+    // Empty seedName leaves preferredOutputs empty (no durable identity);
+    // the registry's resolver returns null in that case and the next
+    // recomputeOutputs / config-seeded create populates it. Matches the
+    // destroy()-replacement-workspace path.
+    preferredOutputs: seedName !== "" ? [seedName] : [],
   };
   state.byHandle.set(handle, rec);
   state.positionsByOutput.set(outputId, [handle]);
@@ -458,9 +479,15 @@ export function destroy(state: WorkspaceState,
 
 // Make the workspace at `index` the shown one on outputId. Pushes the new
 // stack and triggers a focus re-decide. No-op if already shown.
+//
+// `outputName` is the durable identifier of `outputId`; when non-empty it
+// updates lastActiveByOutputName so a future hotplug restoration knows
+// which workspace to re-show on this output. Passing an empty string
+// suppresses the update (used by tests that don't model output names).
 export function show(state: WorkspaceState,
                      index: WorkspaceIndex,
                      outputId: number = OUTPUT_DEFAULT,
+                     outputName: string = "",
                      ): { state: WorkspaceState; sideEffects: SideEffect[] } {
   const handle = findHandle(state, index, outputId);
   if (handle === null) {
@@ -468,9 +495,15 @@ export function show(state: WorkspaceState,
       `show: no workspace at index ${index as number} on output ${outputId}`);
   }
   const prev = state.shownByOutput.get(outputId);
-  if (prev === handle) return { state, sideEffects: [] };
+  if (prev === handle) {
+    // Even if already shown, refresh the focus-memory entry: a re-show
+    // (e.g. after a focus action) re-anchors the output's last active.
+    if (outputName !== "") state.lastActiveByOutputName.set(outputName, handle);
+    return { state, sideEffects: [] };
+  }
 
   state.shownByOutput.set(outputId, handle);
+  if (outputName !== "") state.lastActiveByOutputName.set(outputName, handle);
 
   const sideEffects: SideEffect[] = [];
   if (prev !== undefined) {
@@ -729,4 +762,299 @@ export function current(state: WorkspaceState,
   const handle = state.shownByOutput.get(outputId);
   if (handle === undefined) return null;
   return snapshotOf(state, handle);
+}
+
+// Migration record returned by recomputeOutputs (one per workspace whose
+// outputId changed). Diagnostics + drives the `workspace.migrated` bus
+// event; callers shouldn't need to consume it for state-mutating logic
+// (the state has already been updated in place).
+export interface MigrationChange {
+  handle: WorkspaceHandle;
+  fromOutputId: number;
+  toOutputId: number;
+}
+
+// Recompute every workspace's derived live output against the current set
+// of live outputs (real connectors only -- the fallback is passed
+// separately). Implements the full M7 §10 migration policy:
+//
+//   1. Each workspace's new home is the highest-ranked entry in its
+//      preferredOutputs that resolves to a live output (currentLiveOutput).
+//   2. A workspace whose preferred list has no live match falls onto the
+//      lowest-id remaining live output AND has that output's durable name
+//      appended at lowest priority (mutation rule 2: remembered as a
+//      fallback). When no live outputs exist, the workspace parks on
+//      fallbackOutputId and gets fallbackOutputName appended (so a future
+//      recompute that reincludes the fallback in liveOutputs resolves it).
+//   3. ≥1-workspace-per-touched-output invariant: any live output that
+//      ends with zero workspaces after the migration (a donor drained by
+//      reclaim) gets a fresh empty workspace created on it. The fallback
+//      output is exempt from this invariant -- a non-empty fallback exists
+//      only when something parked there; an empty one stays empty.
+//   4. Per-output focus restore: for any output whose `shownByOutput` was
+//      cleared (its shown workspace migrated away) OR whose `shownByOutput`
+//      is unset because the output just gained its first workspaces (a
+//      returning monitor reclaiming workspaces), set `shownByOutput` to:
+//        a) lastActiveByOutputName[durableName] if it resolves to a
+//           workspace currently on this output (the design's "Active
+//           workspace memory" rule), else
+//        b) the lowest-position workspace on this output.
+//   5. Side effects:
+//      - workspace.migrated emit per changed workspace.
+//      - workspace.hidden + workspace.shown emits where shown changed.
+//      - workspace.created emit for each donor-replenishment workspace.
+//      - setOutputStack push for each output whose visible stack changed
+//        (shown changed, or its only workspace moved away and was
+//        replaced by a fresh one).
+//      - requestFocusDecision once if any shown changed.
+//
+// `liveOutputs` MUST NOT include the fallback (the caller filters real
+// outputs only). `fallbackOutputId` is the sentinel id used for parked
+// workspaces; `fallbackOutputName` is its durable identifier (matches
+// state.fallbackOutput.name on the core side). When the workspace plugin
+// runs in a non-core harness without a fallback, pass an empty string
+// for `fallbackOutputName` -- workspaces with no live home then have no
+// place to park and throw.
+export function recomputeOutputs(
+  state: WorkspaceState,
+  liveOutputs: ReadonlyMap<number, string>,
+  fallbackOutputId: number,
+  fallbackOutputName: string,
+): {
+  state: WorkspaceState;
+  sideEffects: SideEffect[];
+  migrations: MigrationChange[];
+} {
+  const sideEffects: SideEffect[] = [];
+  const migrations: MigrationChange[] = [];
+
+  // Snapshot the per-output "shown" workspace BEFORE we mutate anything --
+  // the per-output diff at the end of this function consults it to decide
+  // which outputs need a setOutputStack push.
+  const shownBefore = new Map<number, WorkspaceHandle | undefined>();
+  // Every output that currently has workspaces, plus every live output
+  // (so a returning monitor with no workspaces yet still gets diffed).
+  const allOutputsToCheck = new Set<number>();
+  for (const id of state.positionsByOutput.keys()) allOutputsToCheck.add(id);
+  for (const id of liveOutputs.keys()) allOutputsToCheck.add(id);
+  allOutputsToCheck.add(fallbackOutputId);
+  for (const id of allOutputsToCheck) {
+    shownBefore.set(id, state.shownByOutput.get(id));
+  }
+
+  // Determine the lowest-id real output (used as the no-preference fallback
+  // when a workspace's preferred list has no live match but live outputs
+  // exist). Sorting by outputId keeps this deterministic across runs.
+  const liveOutputIds = [...liveOutputs.keys()].sort((a, b) => a - b);
+
+  // Step 1+2: derive each workspace's new home.
+  for (const [handle, rec] of state.byHandle) {
+    const oldOutputId = rec.outputId;
+    let newOutputId: number;
+
+    const resolved = currentLiveOutput(rec, liveOutputs);
+    if (resolved !== null) {
+      newOutputId = resolved;
+    } else if (liveOutputIds.length > 0) {
+      // No remembered output is live; fall onto the lowest-id remaining
+      // real output and remember it at lowest priority (mutation rule 2).
+      newOutputId = liveOutputIds[0];
+      const name = liveOutputs.get(newOutputId);
+      if (name !== undefined) appendPreferredOutput(state, handle, name);
+    } else {
+      // No real outputs at all -- park on the fallback. Append the
+      // fallback's durable name at lowest priority so a future recompute
+      // that includes the fallback in liveOutputs (currently never; the
+      // fallback is parallel state) still resolves it via the same code
+      // path as any other entry.
+      newOutputId = fallbackOutputId;
+      if (fallbackOutputName !== "") {
+        appendPreferredOutput(state, handle, fallbackOutputName);
+      }
+    }
+
+    if (newOutputId === oldOutputId) continue;
+
+    // Move the workspace between positionsByOutput entries.
+    const fromPositions = state.positionsByOutput.get(oldOutputId);
+    if (fromPositions) {
+      const idx = fromPositions.indexOf(handle);
+      if (idx >= 0) fromPositions.splice(idx, 1);
+      // Leave an empty array in the map so step 3 can still pick a
+      // shown one (if any) and so we know which outputs were drained.
+    }
+    let toPositions = state.positionsByOutput.get(newOutputId);
+    if (!toPositions) {
+      toPositions = [];
+      state.positionsByOutput.set(newOutputId, toPositions);
+    }
+    toPositions.push(handle);
+
+    // If this workspace was the shown one on its old output, clear that
+    // entry; step 3 picks a replacement (or leaves it unset if the old
+    // output is now workspaceless).
+    if (state.shownByOutput.get(oldOutputId) === handle) {
+      state.shownByOutput.delete(oldOutputId);
+    }
+
+    rec.outputId = newOutputId;
+    migrations.push({ handle, fromOutputId: oldOutputId, toOutputId: newOutputId });
+  }
+
+  // Step 3: ≥1-workspace-per-touched-output invariant. Any LIVE output
+  // (not fallback) that ended with zero workspaces because reclaim drained
+  // it gets a fresh empty workspace. Done before the focus restore so the
+  // newly-created workspace participates in the lowest-position fallback.
+  for (const liveId of liveOutputIds) {
+    const positions = state.positionsByOutput.get(liveId);
+    if (positions && positions.length > 0) continue;
+    const name = liveOutputs.get(liveId);
+    if (name === undefined) continue;  // unreachable; liveOutputIds came from liveOutputs
+    const freshHandle = asHandle(state.nextHandle);
+    state.nextHandle += 1;
+    state.byHandle.set(freshHandle, {
+      handle: freshHandle, outputId: liveId, members: [],
+      // Seed preferredOutputs with the live name so the replenishment
+      // workspace stays anchored to this output across future churn.
+      preferredOutputs: [name],
+    });
+    if (positions) positions.push(freshHandle);
+    else state.positionsByOutput.set(liveId, [freshHandle]);
+    sideEffects.push({
+      kind: "emit", name: "workspace.created",
+      payload: { handle: freshHandle, index: 1, outputId: liveId },
+    });
+  }
+
+  // Step 4: per-output focus restore. For each output that needs a new
+  // shown (its shown was cleared, or it has workspaces but no shown
+  // because it just appeared), pick:
+  //   a) lastActiveByOutputName[name] if it resolves to a workspace
+  //      currently on this output;
+  //   b) else the lowest-position workspace on this output.
+  // Iterate over every output that has workspaces -- a returning monitor
+  // that just reclaimed workspaces has positions but no shown entry yet.
+  const outputsWithWorkspaces = new Set<number>(state.positionsByOutput.keys());
+  for (const outputId of outputsWithWorkspaces) {
+    const positions = state.positionsByOutput.get(outputId);
+    if (!positions || positions.length === 0) continue;
+    if (state.shownByOutput.has(outputId)) continue;
+
+    // Determine durable name for this output: liveOutputs is the source of
+    // truth for real outputs; the fallback has its own name; unknown means
+    // we don't have a name (test harness or transient state) and lastActive
+    // lookup is skipped.
+    let durableName = "";
+    if (outputId === fallbackOutputId) {
+      durableName = fallbackOutputName;
+    } else {
+      const liveName = liveOutputs.get(outputId);
+      if (liveName !== undefined) durableName = liveName;
+    }
+
+    let chosen: WorkspaceHandle | null = null;
+    let fromRemembered = false;
+    if (durableName !== "") {
+      const remembered = state.lastActiveByOutputName.get(durableName);
+      if (remembered !== undefined && positions.includes(remembered)) {
+        chosen = remembered;
+        fromRemembered = true;
+      }
+    }
+    if (chosen === null) chosen = positions[0];
+    state.shownByOutput.set(outputId, chosen);
+    // Only update lastActive when the choice CAME from a successful
+    // lookup (round-trip preservation). When we fell back to the
+    // lowest-position workspace because the remembered one is no longer
+    // on this output, leave the remembered entry alone -- if that
+    // workspace comes back to this output later (via another hotplug),
+    // a subsequent recompute restores its focus. Overwriting now would
+    // permanently lose that intent.
+    if (fromRemembered && durableName !== "") {
+      state.lastActiveByOutputName.set(durableName, chosen);
+    }
+  }
+
+  // Step 5: emit per-output side effects.
+  //   - Every output whose shown changed: emit workspace.hidden (if
+  //     applicable) + workspace.shown + setOutputStack.
+  //   - Every output whose shown DID NOT change but whose workspaces set
+  //     was touched (migration moved a non-shown workspace away or onto
+  //     it): the visible stack didn't change, so no setOutputStack.
+  //   - One requestFocusDecision at the end if anything changed.
+  let anyShownChanged = false;
+  for (const [outputId, before] of shownBefore) {
+    const after = state.shownByOutput.get(outputId);
+    if (before === after) continue;
+    anyShownChanged = true;
+
+    if (before !== undefined) {
+      // The previously-shown workspace may have migrated away (it now
+      // lives on another output) or just been hidden by a focus change
+      // here. findIndex returns null when the handle no longer lives on
+      // outputId; we still emit hidden with the formerIndex 0 (sentinel)
+      // because subscribers track the handle, not the index.
+      const rec = state.byHandle.get(before);
+      const formerIdx = rec && rec.outputId === outputId
+        ? findIndex(state, before, outputId)
+        : null;
+      sideEffects.push({
+        kind: "emit", name: "workspace.hidden",
+        payload: {
+          handle: before,
+          // formerIndex 0 = sentinel "no longer on this output" (the
+          // workspace migrated). Normal hides carry the live index.
+          index: (formerIdx ?? 0) as number,
+          outputId,
+        },
+      });
+    }
+    if (after !== undefined) {
+      const idx = findIndex(state, after, outputId);
+      sideEffects.push({
+        kind: "emit", name: "workspace.shown",
+        payload: { handle: after, index: (idx ?? 1) as number, outputId },
+      });
+    }
+
+    // setOutputStack for every output whose shown changed -- including
+    // the case where after is undefined (output disappeared from
+    // positionsByOutput entirely; tell the compositor to clear the
+    // stack via null). The compositor accepts null to clear.
+    if (after === undefined) {
+      sideEffects.push({ kind: "setOutputStack", outputId, ids: [] });
+    } else {
+      sideEffects.push({
+        kind: "setOutputStack", outputId, ids: stackFor(state, outputId),
+      });
+    }
+  }
+
+  // Step 6: workspace.migrated events for diagnostics + plugin observers
+  // that want per-workspace movement. Emitted AFTER hidden/shown so a
+  // status bar that re-renders on migrated sees the resolved state.
+  for (const m of migrations) {
+    sideEffects.push({
+      kind: "emit", name: "workspace.migrated",
+      payload: {
+        handle: m.handle,
+        fromOutputId: m.fromOutputId,
+        toOutputId: m.toOutputId,
+      },
+    });
+  }
+
+  // Step 7: cleanup empty position arrays so future iterations of
+  // positionsByOutput don't iterate over phantom outputs. Done last so
+  // step 5's shownBefore-based diff already ran against the pre-cleanup
+  // state.
+  for (const [outputId, positions] of [...state.positionsByOutput.entries()]) {
+    if (positions.length === 0) state.positionsByOutput.delete(outputId);
+  }
+
+  if (anyShownChanged) {
+    sideEffects.push({ kind: "requestFocusDecision", reason: "workspace-changed" });
+  }
+
+  return { state, sideEffects, migrations };
 }

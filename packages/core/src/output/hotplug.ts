@@ -144,6 +144,7 @@ export function makeOnOutputAdded(deps: HotplugDeps): (d: OutputDescriptor) => v
     pluginBus.emit("output.added", {
       outputId: d.outputId,
       name: d.name,
+      edidId: d.edidId,
       width: logical.width,
       height: logical.height,
       scale,
@@ -167,7 +168,7 @@ export function makeOnOutputRemoved(deps: HotplugDeps): (d: { outputId: number }
     // 1. Synchronous bus subscribers -- workspace plugin migrates, anyone
     //    else reading the durable identifier of the dying output gets it
     //    here. state.outputs[outputId] is still present.
-    pluginBus.emit("output.pre-remove", { outputId, name });
+    pluginBus.emit("output.pre-remove", { outputId, name, edidId: rec.edidId });
 
     // 2. Strip X from the data-driven layers. wl_output X still exists in
     //    the trampoline so wl_surface.leave (next step) can reference it.
@@ -190,7 +191,7 @@ export function makeOnOutputRemoved(deps: HotplugDeps): (d: { outputId: number }
 
     // 5. Post-teardown subscribers (e.g. plugin bookkeeping that needs the
     //    output already gone).
-    pluginBus.emit("output.removed", { outputId, name });
+    pluginBus.emit("output.removed", { outputId, name, edidId: rec.edidId });
 
     // 6. Release the core-side scanout state. Any in-flight present for X
     //    has already failed (compositor.acquireOutputTextureHandle returns

@@ -360,6 +360,14 @@ addon.setOnOutputDescriptor((d) => {
     log.info("core",
       `output ${d.outputId} added at (${pos.x},${pos.y}): ${device.width}x${device.height} `
       + `device, ${logical.width}x${logical.height} logical name=${d.name}`);
+    // Note: no output.added emit here. Boot enumeration of secondaries
+    // happens BEFORE the plugin runtime spawns; any subscriber would miss
+    // it anyway. Bundled plugins that need a boot snapshot read it via
+    // `runtime.initialOutputs` (passed through configFrom). The
+    // OutputDescriptor channel "new id" branch is purely for boot
+    // enumeration -- runtime hotplug adds go through OutputAdded ->
+    // setOnOutputAdded -> hotplug.ts which fires output.added with the
+    // workspace plugin already subscribed.
   } else {
     sizeChanged = rec.logicalSize.width !== logical.width
       || rec.logicalSize.height !== logical.height;
@@ -438,11 +446,13 @@ addon.setOnOutputDescriptor((d) => {
   updateAllSurfaceResidency(state, addon);
 
   // External: tell clients (via the re-emit subscribers wired below).
-  // `name` is the durable identifier the workspace plugin keys preferred-
-  // outputs lists on; subscribers building output-aware policy use it.
+  // Workspace plugin keys on the durable identifier (edidId when available;
+  // name otherwise) -- both are reported here so the plugin doesn't have
+  // to keep a separate map.
   pluginBus.emit("output.changed", {
     outputId: d.outputId,
     name: d.name,
+    edidId: d.edidId,
     width: logical.width,
     height: logical.height,
     scale,
@@ -499,6 +509,33 @@ pluginBus.subscribe("process.spawn-requested", (_name, payload) => {
   }
 });
 
+// Build the runtime context bundled plugins may need. The workspace plugin
+// reads bootOutputDurableKey to seed preferredOutputs with the real durable
+// identifier of the primary output (so the very-first workspace's home is
+// expressed in terms of edidId / connector name from the start; no
+// placeholder to rebind on the first hotplug).
+//
+// state.outputs is populated by installProtocols + the first OutputDescriptor
+// drain that addon.setOnOutputDescriptor triggered above. By here, the
+// primary record is real (or the protocol seed fallback if the GPU process
+// hasn't pushed yet, e.g. a GPU-free harness -- the seed has name
+// "overdraw-0" and empty edidId, which is what durableKey resolves to).
+const bootPrimary = state?.outputs?.get(OUTPUT_DEFAULT);
+const bootOutputDurableKey = bootPrimary
+  ? (bootPrimary.edidId !== "" ? bootPrimary.edidId : bootPrimary.name)
+  : "";
+// Snapshot every live output so the workspace plugin (and any future bundled
+// plugin that cares) can seed itself with the full set, not just the primary.
+// Boot enumeration of secondaries lands in state.outputs via the
+// OutputDescriptor drain triggered above; by here it's complete.
+const initialOutputs = state?.outputs
+  ? [...state.outputs.values()].map((rec) => ({
+      outputId: rec.id,
+      durableKey: rec.edidId !== "" ? rec.edidId : rec.name,
+    }))
+  : [];
+const bundledRuntime = { bootOutputDurableKey, initialOutputs };
+
 // Bundled plugins first (priority 0 floor), then user-config plugins
 // (default priority 100). A `module` that looks like a path (absolute or
 // ./ ../) resolves to a file:// URL; bare specifiers pass through to
@@ -509,7 +546,7 @@ const bundledResolved = BUNDLED_PLUGINS.map((spec) => {
   const module = isPath
     ? pathToFileURL(resolvePath(process.cwd(), spec.module)).href
     : spec.module;
-  return bundledToResolved(spec, module, config);
+  return bundledToResolved(spec, module, config, bundledRuntime);
 });
 
 const base = config.sourcePath ? dirname(config.sourcePath) : process.cwd();
