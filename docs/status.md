@@ -4,7 +4,17 @@ Ground truth for what exists right now: current capabilities, known gaps, and
 what remains. The design lives in `architecture.md`; this file does not restate
 it. Present-tense only — no change history.
 
-Last updated: 2026-06-15 (two GPU-flow fixes:
+Last updated: 2026-06-20. M7 steps 4 + 5 landed: JS hotplug handlers,
+workspace migration on `output.added`/`removed` with durable-identifier
+reclaim, and a cross-fd race fix that moves `ScanoutReserve`/`ScanoutReady`
+from the ctrl socket to the wire socket -- wire FIFO ordering eliminates
+the race class. Hardware-verified on a two-monitor setup with one
+unplug/replug cycle. Known follow-up: replug currently re-places the
+returning monitor with the right-of-rightmost fallback policy rather
+than restoring its prior `logicalPosition`. See M7 paragraph + "Read
+first" hotplug-replug entry.
+
+Earlier: two GPU-flow fixes:
 1. Client dmabuf `ImportClientTex` moved from ctrl to in-band on the wire as
    `kind=3`/`kind=4` frames with SCM_RIGHTS; fixes a ~1/20-launches silent-
    blank-surface bug where the dmabuf-import's `InjectTexture` could be
@@ -196,7 +206,20 @@ with no error. Worst-first.
   variants. `sdk.compose.scene` (the single-composed-result variant)
   works for both in-thread and Worker plugins.
 
-- **Advertised-absent (clean fallback, not gaps):**
+- **Hotplug-replug does NOT restore the monitor's prior logical
+  position.** M7 step 5's workspace migration recompute correctly
+  reclaims a returning monitor's workspaces by durable identifier
+  (edidId, else connector name), so the windows reappear there. But the
+  monitor's `logicalPosition` is recomputed by the deterministic
+  fallback (`nextOutputPosition`: right of the rightmost surviving
+  output, top-aligned) every time it returns -- so a monitor that was
+  on the LEFT before unplug reappears on the RIGHT after replug. The
+  workspace plugin tracks durable identity through `preferredOutputs`
+  but does not track layout position. Visible symptom: the user's
+  mental map of "screen left / screen right" is wrong after any
+  unplug/replug cycle until the user reconfigures. Fix is a separate
+  follow-up (remember `logicalPosition` per durable id and restore on
+  hotplug add when the durable id is seen again).
   text-input, xdg-activation, toplevel-icon,
   system-bell. Clients warn and fall back. See the protocol-coverage matrix.
   (`wp_cursor_shape_v1`, `zxdg_decoration_manager_v1`, `wp_viewporter`, and
@@ -435,7 +458,8 @@ Resource>` and emits the scale of each surface's primary overlapping output,
 re-emitting when residency shifts.
 
 Beyond the milestone list, two pieces of follow-up work landed on top of M5
-+ M6 to make multi-output usable end-to-end before M7's hotplug arrives:
++ M6 to make multi-output usable end-to-end ahead of the M7 hotplug work
+(now landed):
 
 1. **The workspace plugin is now authoritative for "ordered visible windows
    per output."** The layout-driver, `windowAt`, and `focusOrder` all read
@@ -461,7 +485,35 @@ Beyond the milestone list, two pieces of follow-up work landed on top of M5
    the next/prev outputId sorted by ascending id.
 
 M7 (hotplug + workspace migration via `preferredOutputs` recompute on
-`output.added`/`removed`) and M8 (multi-GPU) remain.
+`output.added`/`removed`) is partially landed:
+
+- **Steps 1-5 (the GPU-side rescan + the JS hotplug handlers + the
+  workspace-plugin migration recompute) are working end-to-end on real
+  hardware.** Unplug + replug of a monitor on a single card keeps the GPU
+  process alive, the wl_output global is destroyed/re-created so clients see
+  `wl_registry.global_remove` / `global` events, `wl_surface.leave` /
+  `enter` fire from the surface-residency differ, the workspace that lived
+  on the unplugged monitor evacuates to the survivor, and on replug
+  reclaims back via its durable `preferredOutputs` entry. Verified on a
+  two-monitor setup (HDMI-A-1 60Hz + DP-1 240Hz).
+- **Steps 6 (verify wl_surface.leave / global_remove ordering with a real
+  client) and 7 (ScanoutRebuild plumbing for mode change) remain.**
+- **Cross-fd race fix landed alongside step 5.** The original step 4
+  design sent `ScanoutReserve` on the ctrl channel and subsequent
+  `ProducerBegin` on the wire channel; the GPU process could drain wire
+  first and abort on the unknown `surfaceBufId`. The two scanout-handshake
+  messages (`ScanoutReserve` core→gpu, `ScanoutReady` gpu→core) now ride
+  the wire socket as `FrameKind::ScanoutReserve` (6) and
+  `FrameKind::ScanoutReady` (7). Wire FIFO ordering eliminates the race
+  class for these messages -- a future `ScanoutRebuild` (step 7) follows
+  the same pattern. `OutputAdded` / `OutputRemoved` stay on ctrl because
+  nothing wire-side races against them. The unused
+  `ipc::Tag::ScanoutReserve` / `ipc::Tag::ScanoutReady` enum values remain
+  in `side_channel.h` as dead code; no external tooling references them
+  (private IPC), but removing risks rebuild churn so they stay until a
+  later cleanup.
+
+M8 (multi-GPU) remains.
 
 ## Client buffers
 
