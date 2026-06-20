@@ -72,6 +72,28 @@ Compositor::Compositor(int wireFd, int ctrlFd, pid_t gpuPid,
             }
             return;
         }
+        if (kind == ipc::FrameKind::ScanoutRebuild) {
+            // The GPU process has torn down the named output's ring at new
+            // dims and needs a fresh ScanoutReserve. Clear our prior
+            // ScanoutOutput bookkeeping (the old surfaceBufIds will never
+            // be referenced again -- the GPU dropped them too), then run
+            // the standard per-output reserve path. Wire-FIFO ordering
+            // guarantees the GPU has already cleaned its surfaceBufs map
+            // for this output BEFORE this frame arrived, so any in-flight
+            // ProducerBegin for the OLD ring is also already drained.
+            if (frame.size() != ipc::ScanoutRebuildPayload::kSize) {
+                std::fprintf(stderr,
+                    "[core] ScanoutRebuild: bad payload size %zu\n", frame.size());
+                return;
+            }
+            auto p = ipc::ScanoutRebuildPayload::decode(frame.data());
+            scanoutOutputs_.erase(p.outputId);
+            reserveScanoutForOutput(p.outputId, p.width, p.height);
+            std::printf("[core] ScanoutRebuild handled for outputId=%u %ux%u "
+                        "(fresh ScanoutReserve dispatched)\n",
+                        p.outputId, p.width, p.height);
+            return;
+        }
         std::fprintf(stderr,
             "[core] WireLink inbound: unexpected kind=%u\n",
             static_cast<unsigned>(kind));
@@ -613,6 +635,21 @@ void Compositor::reserveScanoutForOutput(uint32_t outputId, uint32_t width, uint
 void Compositor::releaseScanoutForOutput(uint32_t outputId) {
     if (!kmsMode_) return;
     scanoutOutputs_.erase(outputId);
+}
+
+void Compositor::switchOutputMode(uint32_t outputId,
+                                  uint32_t width, uint32_t height,
+                                  uint32_t refreshMhz) {
+    if (!kmsMode_) return;
+    if (!link_) return;
+    ipc::SwitchModePayload pl{};
+    pl.outputId   = outputId;
+    pl.width      = width;
+    pl.height     = height;
+    pl.refreshMhz = refreshMhz;
+    uint8_t buf[ipc::SwitchModePayload::kSize];
+    pl.encode(buf);
+    link_->appendFrame(ipc::FrameKind::SwitchMode, buf, sizeof(buf));
 }
 
 void Compositor::drainCtrl() {

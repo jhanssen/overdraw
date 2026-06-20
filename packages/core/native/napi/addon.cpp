@@ -2155,6 +2155,31 @@ napi_value ReserveScanoutForOutput(napi_env env, napi_callback_info info) {
     napi_value u; napi_get_undefined(env, &u); return u;
 }
 
+// switchOutputMode(outputId, width, height, refreshMhz) -> undefined
+// Request a KMS mode swap on `outputId`. Width/height/refreshMhz must match
+// a mode the connector advertises (no custom modes in v1). Sends a
+// SwitchMode wire frame to the GPU process; the GPU process tears down and
+// rebuilds the ring, then sends ScanoutRebuild on the wire, which
+// re-runs the ScanoutReserve handshake at the new dims. The
+// matching OutputDescriptor follows on ctrl so JS state.outputs[].deviceSize
+// updates and the existing output.changed re-emit chain runs.
+// Asynchronous: returns once the SwitchMode frame is appended to the
+// outbound wire queue.
+napi_value SwitchOutputMode(napi_env env, napi_callback_info info) {
+    size_t argc = 4; napi_value argv[4];
+    napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+    if (argc < 4) return throwError(env,
+        "switchOutputMode(outputId, width, height, refreshMhz) requires four args");
+    if (!g_addon.compositor) return throwError(env, "compositor not running");
+    uint32_t outputId = 0, w = 0, h = 0, refreshMhz = 0;
+    napi_get_value_uint32(env, argv[0], &outputId);
+    napi_get_value_uint32(env, argv[1], &w);
+    napi_get_value_uint32(env, argv[2], &h);
+    napi_get_value_uint32(env, argv[3], &refreshMhz);
+    g_addon.compositor->switchOutputMode(outputId, w, h, refreshMhz);
+    napi_value u; napi_get_undefined(env, &u); return u;
+}
+
 // releaseScanoutForOutput(outputId) -> undefined
 // Drop the core-side per-output scanout state on output removal (M7). The GPU
 // process has already torn down its ring; this clears the core's slot
@@ -2803,6 +2828,7 @@ napi_value Init(napi_env env, napi_value exports) {
     reg("setOnFlipComplete", SetOnFlipComplete);
     reg("reserveScanoutForOutput", ReserveScanoutForOutput);
     reg("releaseScanoutForOutput", ReleaseScanoutForOutput);
+    reg("switchOutputMode", SwitchOutputMode);
     reg("destroyGlobalForOutput", DestroyGlobalForOutput);
     reg("updateOutputLayout", UpdateOutputLayout);
     reg("logInit", LogInit);

@@ -163,6 +163,22 @@ class KmsOutputBackend : public OutputBackend {
     //     pending a real reproduction; the design doc (§10) calls it out.
     RescanResult rescan();
 
+    // Switch one connected output to a new mode. The new mode MUST already
+    // exist in the connector's mode list (no custom-mode validation here;
+    // see drm_utils::findMode). On success: the prior ring is torn down,
+    // the mode blob is destroyed, topo.mode is updated, didInitialCommit
+    // is cleared (so the next present runs ALLOW_MODESET with a fresh
+    // blob), and a fresh ring is allocated at the new dims. Returns true
+    // on success; false on unknown outputId / mode-not-found / ring
+    // re-alloc failure (in which case the output is left in a torn-down
+    // state -- the caller is expected to disconnect it and re-add).
+    //
+    // The CALLER is responsible for emitting the ScanoutRebuild wire
+    // frame after this returns true; KmsOutputBackend has no IPC.
+    // See multi-output-design §10.5.
+    bool switchMode(uint32_t outputId, uint32_t width, uint32_t height,
+                    uint32_t refreshMhz, const wgpu::Device& device);
+
   private:
     // One driven monitor: its topology, scanout ring, mode blob, and page-flip
     // state. Held by unique_ptr because KmsScanoutRing is non-movable (deleted

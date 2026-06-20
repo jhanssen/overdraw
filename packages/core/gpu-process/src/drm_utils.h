@@ -153,6 +153,17 @@ readPlaneFormats(int drmFd, uint32_t planeId, uint32_t inFormatsPropId);
 // drmModeDestroyPropertyBlob. Returns 0 on failure.
 uint32_t createModeBlob(int drmFd, const drmModeModeInfo& mode);
 
+// Find a mode on `connectorId` whose active dims and refresh match the
+// request. Width/height match exactly; refresh tolerates a small delta
+// (the modeline rate computed from clock/htotal/vtotal can be off by a
+// few mHz from the nominal value EDID advertises -- 60.000 Hz vs
+// 59.940 Hz, 144000 mHz vs 143999 mHz are common). When refreshMhz is 0
+// the caller doesn't care about refresh; pick the first matching mode.
+// Returns true on match; leaves `outMode` untouched on miss.
+bool findMode(int drmFd, uint32_t connectorId,
+              uint32_t width, uint32_t height, uint32_t refreshMhz,
+              DrmMode& outMode);
+
 }  // namespace overdraw::gpu
 
 #endif  // OVERDRAW_GPU_DRM_UTILS_H_

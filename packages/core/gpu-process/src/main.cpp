@@ -553,9 +553,11 @@ int run(int wireFd, int ctrlFd, int inputFd, bool headless,
         std::memcpy(m.outputEdidId, info.edidId, sizeof(m.outputEdidId));
         ipc::sendMessage(ctrlFd, m);
         std::printf(
-            "[gpu] sent OutputDescriptor: %ux%u @%umHz scale=%u xform=%u "
+            "[gpu] sent OutputDescriptor: %ux%u @%u.%03uHz scale=%u xform=%u "
             "phys=%ux%umm name=%s make=%s model=%s edid=%s\n",
-            info.width, info.height, info.refreshMhz, info.scale, info.transform,
+            info.width, info.height,
+            info.refreshMhz / 1000, info.refreshMhz % 1000,
+            info.scale, info.transform,
             info.physicalWidthMm, info.physicalHeightMm, info.name, info.make, info.model,
             info.edidId);
     }
@@ -721,8 +723,9 @@ int run(int wireFd, int ctrlFd, int inputFd, bool headless,
             m.outputCount = nOutputs;
             fillOutputMsg(outputId, m);
             ipc::sendMessage(ctrlFd, m);
-            std::printf("[gpu] sent OutputDescriptor (kms output %u/%u): %ux%u @%umHz name=%s\n",
-                        outputId, nOutputs, m.width, m.height, m.refreshMhz, m.outputName);
+            std::printf("[gpu] sent OutputDescriptor (kms output %u/%u): %ux%u @%u.%03uHz name=%s\n",
+                        outputId, nOutputs, m.width, m.height,
+                        m.refreshMhz / 1000, m.refreshMhz % 1000, m.outputName);
         }
 
         // Step 2: build all N scanout rings on the core device. Done before
@@ -1439,6 +1442,88 @@ int run(int wireFd, int ctrlFd, int inputFd, bool headless,
             }
             auto p = ipc::ScanoutReservePayload::decode(frame.data());
             (void)handleScanoutReserve(p);  // ScanoutReady (ok=0/1) emitted from inside
+            return;
+        }
+        if (kind == ipc::FrameKind::SwitchMode) {
+            // Mode change for one already-connected output. Wire-FIFO with
+            // any in-flight ProducerBegin/End on this output's prior ring:
+            // the brackets above us close first (their surfaceBufs entries
+            // are still live), then we tear down + reallocate, then we emit
+            // ScanoutRebuild on the wire. The core's reply (ScanoutReserve
+            // for the new dims) lands back in this same handler later.
+            if (nfds != 0) {
+                std::fprintf(stderr,
+                    "[gpu] core wire: SwitchMode with nfds=%d (must be 0)\n", nfds);
+                std::abort();
+            }
+            if (frame.size() != ipc::SwitchModePayload::kSize) {
+                std::fprintf(stderr,
+                    "[gpu] core wire: bad SwitchMode payload size %zu\n", frame.size());
+                std::abort();
+            }
+            auto p = ipc::SwitchModePayload::decode(frame.data());
+            if (!kms) {
+                std::fprintf(stderr,
+                    "[gpu] SwitchMode: no kms backend (nested mode?) outputId=%u\n",
+                    p.outputId);
+                return;
+            }
+            // Erase the old ring's surfaceBufs / fence-fd / slot-routing
+            // entries BEFORE the ring is torn down. The wgpu::Texture refs
+            // in surfaceBufs would keep the old textures alive otherwise.
+            for (auto it = scanoutBufIdToSlot.begin();
+                 it != scanoutBufIdToSlot.end();) {
+                if (it->second.first == p.outputId) {
+                    const uint32_t bufId = it->first;
+                    surfaceBufs.erase(bufId);
+                    auto fit = scanoutFenceFdByBufId.find(bufId);
+                    if (fit != scanoutFenceFdByBufId.end()) {
+                        if (fit->second >= 0) ::close(fit->second);
+                        scanoutFenceFdByBufId.erase(fit);
+                    }
+                    it = scanoutBufIdToSlot.erase(it);
+                } else {
+                    ++it;
+                }
+            }
+            if (!kms->switchMode(p.outputId, p.width, p.height, p.refreshMhz,
+                                  coreDevice)) {
+                // switchMode logs the cause. The output stays in outputs_ but
+                // its ring is torn down; acquireScanoutAt() returns null,
+                // so JS-side renders for it are silently dropped. Do NOT
+                // emit ScanoutRebuild -- there is no new ring for the core
+                // to reserve into.
+                std::fprintf(stderr,
+                    "[gpu] SwitchMode failed for outputId=%u (mode missing or "
+                    "ring re-init failed); output is dark until a successful "
+                    "switch or hotplug cycle\n", p.outputId);
+                return;
+            }
+            // Emit ScanoutRebuild so the core releases its prior
+            // ScanoutOutput bookkeeping and reserves fresh wire handles
+            // at the new dims. handleScanoutReserve will run when the
+            // reply lands.
+            gpu::OutputDescriptorInfo info{};
+            kms->describeOutputAt(p.outputId, info);
+            ipc::ScanoutRebuildPayload reply{};
+            reply.outputId = p.outputId;
+            reply.width    = info.width;
+            reply.height   = info.height;
+            uint8_t buf[ipc::ScanoutRebuildPayload::kSize];
+            reply.encode(buf);
+            serializer.appendFrame(ipc::FrameKind::ScanoutRebuild, buf, sizeof(buf));
+            // Also send an OutputDescriptor on ctrl so the core's JS-side
+            // state.outputs[outputId] picks up the new device dims / refresh.
+            // OutputDescriptor handler in main.ts's setOnOutputDescriptor
+            // already covers the existing-rec branch (no global churn).
+            ipc::Message m{};
+            m.tag = ipc::Tag::OutputDescriptor;
+            fillOutputMsg(p.outputId, m);
+            ctrlSender.send(m);
+            std::printf("[gpu] SwitchMode applied + ScanoutRebuild sent for "
+                        "outputId=%u %ux%u @%u.%03uHz\n",
+                        p.outputId, info.width, info.height,
+                        info.refreshMhz / 1000, info.refreshMhz % 1000);
             return;
         }
         if (kind == ipc::FrameKind::ImportClientTex) {
@@ -2170,8 +2255,10 @@ int run(int wireFd, int ctrlFd, int inputFd, bool headless,
                                 m.tag = ipc::Tag::OutputAdded;
                                 fillOutputMsg(id, m);
                                 ctrlSender.send(m);
-                                std::printf("[gpu] sent OutputAdded outputId=%u %ux%u @%umHz name=%s\n",
-                                            id, m.width, m.height, m.refreshMhz, m.outputName);
+                                std::printf("[gpu] sent OutputAdded outputId=%u %ux%u @%u.%03uHz name=%s\n",
+                                            id, m.width, m.height,
+                                            m.refreshMhz / 1000, m.refreshMhz % 1000,
+                                            m.outputName);
                             }
                             break;
                         }

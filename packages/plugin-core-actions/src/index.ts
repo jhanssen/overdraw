@@ -232,6 +232,51 @@ export default async function init(sdk: SdkLike): Promise<void> {
     },
   });
 
+  // KMS mode switch on one output. Params:
+  //   { output: "DP-1" | "ACM-1234-...", width: 2560, height: 1440,
+  //     refreshMhz?: 60000 }
+  // `output` matches either the durable EDID id or the connector name --
+  // same precedence the workspace plugin uses. `refreshMhz` is mHz
+  // (Hz * 1000); when omitted the launcher picks any matching mode at the
+  // requested dims. Emits 'output.switch-mode-requested' on the bus; the
+  // launcher subscribes and calls addon.switchOutputMode after resolving
+  // the durable id to a live dense outputId.
+  sdk.actions.register({
+    name: "output.switch-mode",
+    description: "Switch a KMS-connected output to a new mode. Params: " +
+      "{ output: string (durable id or connector name), width: int, " +
+      "height: int, refreshMhz?: int (mHz; omit to match any refresh) }. " +
+      "Both width and height must match a mode the connector advertises " +
+      "(no custom-mode validation). Asynchronous; the next output.changed " +
+      "event reflects the new mode.",
+    handler: async (params: unknown): Promise<null> => {
+      const p = (params ?? {}) as {
+        output?: unknown; width?: unknown; height?: unknown; refreshMhz?: unknown;
+      };
+      if (typeof p.output !== "string" || p.output.length === 0) {
+        throw new TypeError("output.switch-mode: params.output must be a non-empty string");
+      }
+      if (!Number.isInteger(p.width) || (p.width as number) <= 0) {
+        throw new TypeError("output.switch-mode: params.width must be a positive integer");
+      }
+      if (!Number.isInteger(p.height) || (p.height as number) <= 0) {
+        throw new TypeError("output.switch-mode: params.height must be a positive integer");
+      }
+      if (p.refreshMhz !== undefined
+          && (!Number.isInteger(p.refreshMhz) || (p.refreshMhz as number) <= 0)) {
+        throw new TypeError(
+          "output.switch-mode: params.refreshMhz must be a positive integer (mHz)");
+      }
+      sdk.events.emit("output.switch-mode-requested", {
+        output: p.output,
+        width: p.width as number,
+        height: p.height as number,
+        refreshMhz: p.refreshMhz === undefined ? 0 : (p.refreshMhz as number),
+      });
+      return null;
+    },
+  });
+
   sdk.log("core-actions registered");
 }
 

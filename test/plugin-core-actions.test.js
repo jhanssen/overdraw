@@ -96,3 +96,39 @@ test('layout.grow-master / shrink-master emit signed master-fraction deltas', as
   assert.equal(shrink[0], 'layout.master-fraction-requested');
   assert.equal(shrink[1].delta, -grow[1].delta, 'shrink delta is the negated grow delta');
 });
+
+test('output.switch-mode emits a request with output + dims + refresh', async () => {
+  const { sdk, handlers, emitted } = makeSdk();
+  await init(sdk);
+  const switchMode = handlers.get('output.switch-mode');
+  assert.ok(switchMode, 'output.switch-mode action registered');
+  await switchMode({ output: 'DP-1', width: 2560, height: 1440, refreshMhz: 60000 });
+  assert.deepEqual(emitted.at(-1), ['output.switch-mode-requested',
+    { output: 'DP-1', width: 2560, height: 1440, refreshMhz: 60000 }]);
+});
+
+test('output.switch-mode allows refreshMhz omitted (carries 0 -> any rate at dims)', async () => {
+  const { sdk, handlers, emitted } = makeSdk();
+  await init(sdk);
+  await handlers.get('output.switch-mode')({
+    output: 'ACM-1234-CAFEBABE', width: 1920, height: 1080,
+  });
+  assert.deepEqual(emitted.at(-1), ['output.switch-mode-requested',
+    { output: 'ACM-1234-CAFEBABE', width: 1920, height: 1080, refreshMhz: 0 }]);
+});
+
+test('output.switch-mode rejects missing / invalid params', async () => {
+  const { sdk, handlers } = makeSdk();
+  await init(sdk);
+  const switchMode = handlers.get('output.switch-mode');
+  await assert.rejects(() => switchMode({}), /output must be a non-empty string/);
+  await assert.rejects(() => switchMode({ output: '' }), /output must be a non-empty string/);
+  await assert.rejects(() => switchMode({ output: 'DP-1' }), /width must be a positive integer/);
+  await assert.rejects(() => switchMode({ output: 'DP-1', width: 0 }), /width/);
+  await assert.rejects(() => switchMode({ output: 'DP-1', width: 1.5, height: 1080 }), /width/);
+  await assert.rejects(() => switchMode({ output: 'DP-1', width: 1920 }), /height/);
+  await assert.rejects(() => switchMode({ output: 'DP-1', width: 1920, height: 1080, refreshMhz: -1 }),
+    /refreshMhz/);
+  await assert.rejects(() => switchMode({ output: 'DP-1', width: 1920, height: 1080, refreshMhz: 1.5 }),
+    /refreshMhz/);
+});

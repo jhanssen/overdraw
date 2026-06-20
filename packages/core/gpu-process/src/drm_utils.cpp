@@ -463,4 +463,33 @@ uint32_t createModeBlob(int drmFd, const drmModeModeInfo& mode) {
     return id;
 }
 
+bool findMode(int drmFd, uint32_t connectorId,
+              uint32_t width, uint32_t height, uint32_t refreshMhz,
+              DrmMode& outMode) {
+    drmModeConnector* c = drmModeGetConnector(drmFd, connectorId);
+    if (!c) return false;
+    bool found = false;
+    // ~100 mHz tolerance: a real connector reports 59940 / 60000 / 60001
+    // for nominal 60 Hz; an EDID-derived request may quote any of those.
+    constexpr uint32_t kRefreshTolerance = 100;
+    for (int i = 0; i < c->count_modes; ++i) {
+        const drmModeModeInfo& m = c->modes[i];
+        if (m.hdisplay != width || m.vdisplay != height) continue;
+        if (refreshMhz != 0) {
+            const uint32_t mr = modeRefreshMhz(m);
+            const uint32_t delta = mr > refreshMhz ? mr - refreshMhz : refreshMhz - mr;
+            if (delta > kRefreshTolerance) continue;
+        }
+        outMode.hdisplay    = m.hdisplay;
+        outMode.vdisplay    = m.vdisplay;
+        outMode.vrefreshMhz = modeRefreshMhz(m);
+        outMode.preferred   = (m.type & DRM_MODE_TYPE_PREFERRED) != 0;
+        outMode.raw         = m;
+        found = true;
+        break;
+    }
+    drmModeFreeConnector(c);
+    return found;
+}
+
 }  // namespace overdraw::gpu

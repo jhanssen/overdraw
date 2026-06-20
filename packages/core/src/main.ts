@@ -1027,6 +1027,34 @@ pluginBus.subscribe("layout.master-fraction-requested", (_n, payload) => {
     });
 });
 
+// KMS mode switch. Resolves the durable identifier (EDID id or connector
+// name) to a live outputId via state.outputs, then forwards to the
+// addon's switchOutputMode native call. Same durable-key precedence as
+// the workspace plugin: edidId first, name fallback.
+pluginBus.subscribe("output.switch-mode-requested", (_n, payload) => {
+  const p = payload as { output?: unknown; width?: unknown; height?: unknown;
+                         refreshMhz?: unknown };
+  if (!state?.outputs) return;
+  if (typeof p.output !== "string" || typeof p.width !== "number"
+      || typeof p.height !== "number") return;
+  let outputId: number | null = null;
+  for (const rec of state.outputs.values()) {
+    if (rec.edidId === p.output || rec.name === p.output) {
+      outputId = rec.id;
+      break;
+    }
+  }
+  if (outputId === null) {
+    log.warn("core", `output.switch-mode: no output matches '${p.output}'`);
+    return;
+  }
+  const refreshMhz = typeof p.refreshMhz === "number" ? p.refreshMhz : 0;
+  log.info("core",
+    `output.switch-mode: outputId=${outputId} (${p.output}) -> `
+    + `${p.width}x${p.height}@${formatRefreshHz(refreshMhz)}`);
+  addon.switchOutputMode(outputId, p.width, p.height, refreshMhz);
+});
+
 const { buildResolver } = await import("./plugins/deferred-refs.js");
 const deferredRefResolver = buildResolver({
   surfaceUnderPointer: () => state?.seat?.focus?.surfaceId ?? null,

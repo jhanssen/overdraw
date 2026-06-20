@@ -121,9 +121,10 @@ bool KmsOutputBackend::connectOutput(DrmTopology topo, uint32_t outputId) {
         return false;
     }
     usedCrtcs_.insert(topo.crtcId);
-    std::printf("[kms] output %u connector %s id=%u mode=%ux%u @%umHz crtc=%u plane=%u\n",
+    std::printf("[kms] output %u connector %s id=%u mode=%ux%u @%u.%03uHz crtc=%u plane=%u\n",
                 outputId, topo.connectorName.c_str(), topo.connectorId,
-                topo.mode.hdisplay, topo.mode.vdisplay, topo.mode.vrefreshMhz,
+                topo.mode.hdisplay, topo.mode.vdisplay,
+                topo.mode.vrefreshMhz / 1000, topo.mode.vrefreshMhz % 1000,
                 topo.crtcId, topo.planeId);
     auto out = std::make_unique<PerOutput>();
     out->outputId = outputId;
@@ -279,6 +280,64 @@ bool KmsOutputBackend::initScanoutForOutput(uint32_t outputId,
         disconnectOutput(outputId);
         return false;
     }
+    return true;
+}
+
+bool KmsOutputBackend::switchMode(uint32_t outputId,
+                                  uint32_t width, uint32_t height,
+                                  uint32_t refreshMhz,
+                                  const wgpu::Device& device) {
+    PerOutput* o = find(outputId);
+    if (!o) {
+        std::fprintf(stderr, "[kms] switchMode: unknown outputId=%u\n", outputId);
+        return false;
+    }
+    DrmMode newMode{};
+    if (!findMode(drmFd_, o->topo.connectorId, width, height, refreshMhz, newMode)) {
+        std::fprintf(stderr,
+            "[kms] switchMode: connector %u has no mode matching %ux%u@%u.%03uHz; ignoring\n",
+            o->topo.connectorId, width, height,
+            refreshMhz / 1000, refreshMhz % 1000);
+        return false;
+    }
+    // No-op if already on that mode (same active dims AND refresh within
+    // tolerance). Cheap to check; saves an unnecessary teardown.
+    if (o->topo.mode.hdisplay == newMode.hdisplay
+        && o->topo.mode.vdisplay == newMode.vdisplay
+        && o->topo.mode.vrefreshMhz == newMode.vrefreshMhz) {
+        return true;
+    }
+
+    // Tear down. Order matches disconnectOutput's, minus the outputs_.erase
+    // (we keep the PerOutput alive across the swap; only the ring + mode
+    // blob churn).
+    o->ring.clear();  // releases GBM bo's, dmabuf fds, wgpu::Textures, fb_ids
+    if (o->modeBlobId != 0 && drmFd_ >= 0) {
+        drmModeDestroyPropertyBlob(drmFd_, o->modeBlobId);
+        o->modeBlobId = 0;
+    }
+    // Any pending atomic flip the kernel had queued is silently cancelled by
+    // the next ALLOW_MODESET commit; clear our shadow so onFlipComplete won't
+    // try to advance a slot that no longer exists.
+    o->pendingFlipSlot = -1;
+    o->didInitialCommit = false;
+
+    // Adopt the new mode.
+    o->topo.mode = newMode;
+
+    // Allocate the fresh ring at the new dims. Failure here is fatal for
+    // this output -- the connector stays in outputs_ but with no ring, so
+    // acquireScanoutAt() returns null and no frames are written for it
+    // until the caller redoes the bring-up.
+    if (!initRingFor(*o, device)) {
+        std::fprintf(stderr,
+            "[kms] switchMode: ring re-init failed for outputId=%u at %ux%u\n",
+            outputId, newMode.hdisplay, newMode.vdisplay);
+        return false;
+    }
+    std::printf("[kms] output %u switched to %ux%u@%u.%03uHz\n",
+                outputId, newMode.hdisplay, newMode.vdisplay,
+                newMode.vrefreshMhz / 1000, newMode.vrefreshMhz % 1000);
     return true;
 }
 

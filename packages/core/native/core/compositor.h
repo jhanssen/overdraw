@@ -211,6 +211,27 @@ class Compositor {
     // no-ops.
     void releaseScanoutForOutput(uint32_t outputId);
 
+    // Request a mode swap on `outputId`. Width/height/refreshMhz must
+    // match a mode the underlying KMS connector advertises (no custom-mode
+    // validation in v1). KMS only; nested / headless are no-ops.
+    //
+    // Sends a SwitchMode wire frame to the GPU process, which tears down
+    // the affected output's ring + mode blob, allocates a fresh ring at the
+    // new dims, and replies with a ScanoutRebuild wire frame. The
+    // ScanoutRebuild handler in drainCtrl issues the matching
+    // ScanoutReserve so the new ring's textures get InjectTexture'd at
+    // freshly-reserved wire handles. The output's wl_output global is NOT
+    // recreated -- clients see a mode-event burst, not global_remove/global.
+    // See multi-output-design §10.5.
+    //
+    // Asynchronous: returns immediately after appending the wire frame.
+    // The caller observes completion via the next OutputDescriptor for
+    // this outputId (which carries the new dims) and/or via the JS-side
+    // output.changed bus subscriber.
+    void switchOutputMode(uint32_t outputId,
+                          uint32_t width, uint32_t height,
+                          uint32_t refreshMhz);
+
     // --- KMS scanout path (slice 4) -------------------------------------------
     //
     // In KMS mode the wire `wgpu::Surface` is absent. Instead the GPU process

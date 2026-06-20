@@ -172,17 +172,13 @@ enum class Tag : uint8_t {
                           //   leave), tears down state.outputs[outputId], fires
                           //   output.removed, then destroys that output's
                           //   wl_output global. See multi-output-design §10.
-    ScanoutRebuild = 'B', // gpu -> core: the ring at `outputId` is stale (e.g.
-                          //   mode change at the same connector); reply with a
-                          //   fresh ScanoutReserve for it. Same reply path as
-                          //   OutputAdded. Used so a mode change reuses one
-                          //   already-known outputId rather than going through
-                          //   add/remove (which would churn the wl_output global
-                          //   and force clients to re-bind). OutputDescriptor
-                          //   (above) keeps its narrow "identity changed, no
-                          //   ring action needed" meaning; the GPU process
-                          //   emits it AFTER ScanoutReady confirms the new
-                          //   ring. See multi-output-design §4 / §10.5.
+    // ScanoutRebuild and SwitchMode now ride the WIRE socket as FrameKind
+    // variants (transport.h), not Tag-on-ctrl. The wire-FIFO ordering is
+    // load-bearing: a SwitchMode arriving on ctrl while ProducerBegin
+    // frames for the same output are still queued on wire would tear down
+    // the surfaceBufs the GPU is still in the middle of accessing. See
+    // multi-output-design §10.5 and the M7 step 4 cross-fd race fix
+    // (commit 447a905). The 'B' tag letter is intentionally not reused.
 };
 
 // Wire object handle {id, generation}, matching dawn::wire::Handle layout.
@@ -506,6 +502,67 @@ struct ScanoutReservePayload {
 };
 static_assert(ScanoutReservePayload::kSize == 48,
               "ScanoutReservePayload size mismatch with hand-counted layout");
+
+// SwitchMode payload (core -> gpu, FrameKind::SwitchMode): swap the
+// named output to a new mode. Width/height are in device pixels; refreshMhz
+// is in mHz (Hz * 1000, same units as wl_output.mode). The GPU process
+// must match these against the connector's mode list -- v1 has no
+// support for custom modes (DRM mode validation is its own piece of
+// work; see multi-output-design §10.5). When no matching mode exists,
+// the GPU logs a warning and skips the switch (the output stays on its
+// current mode; the client receives no protocol-level error today).
+struct SwitchModePayload {
+    uint32_t outputId;
+    uint32_t width;
+    uint32_t height;
+    uint32_t refreshMhz;
+    static constexpr size_t kSize = 4 * 4;  // 16
+    void encode(uint8_t* out) const {
+        putU32LE(out + 0,  outputId);
+        putU32LE(out + 4,  width);
+        putU32LE(out + 8,  height);
+        putU32LE(out + 12, refreshMhz);
+    }
+    static SwitchModePayload decode(const uint8_t* p) {
+        SwitchModePayload r{};
+        r.outputId   = getU32LE(p + 0);
+        r.width      = getU32LE(p + 4);
+        r.height     = getU32LE(p + 8);
+        r.refreshMhz = getU32LE(p + 12);
+        return r;
+    }
+};
+static_assert(SwitchModePayload::kSize == 16,
+              "SwitchModePayload size mismatch with hand-counted layout");
+
+// ScanoutRebuild payload (gpu -> core, FrameKind::ScanoutRebuild): the
+// GPU has torn down the named output's ring and the new dims are
+// width/height. The core releases the prior bookkeeping (the old
+// surfaceBufIds will not be referenced again) and then runs the
+// per-output ScanoutReserve handshake exactly as for OutputAdded --
+// fresh wire handles, fresh surfaceBufIds. The GPU process meanwhile has
+// already allocated the new ring's wgpu::Textures at the new dims;
+// handleScanoutReserve InjectTextures them.
+struct ScanoutRebuildPayload {
+    uint32_t outputId;
+    uint32_t width;
+    uint32_t height;
+    static constexpr size_t kSize = 3 * 4;  // 12
+    void encode(uint8_t* out) const {
+        putU32LE(out + 0, outputId);
+        putU32LE(out + 4, width);
+        putU32LE(out + 8, height);
+    }
+    static ScanoutRebuildPayload decode(const uint8_t* p) {
+        ScanoutRebuildPayload r{};
+        r.outputId = getU32LE(p + 0);
+        r.width    = getU32LE(p + 4);
+        r.height   = getU32LE(p + 8);
+        return r;
+    }
+};
+static_assert(ScanoutRebuildPayload::kSize == 12,
+              "ScanoutRebuildPayload size mismatch with hand-counted layout");
 
 // ScanoutReady payload: outputId + ok. The GPU process emits this AFTER
 // InjectTexture'ing all three slots for the named outputId; ok=0 signals a

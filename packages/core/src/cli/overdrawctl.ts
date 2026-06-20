@@ -23,11 +23,16 @@ import {
 } from "../ipc/protocol.js";
 
 type Args = {
-  command: "invoke" | "list-actions" | "subscribe" | "help";
+  command: "invoke" | "list-actions" | "subscribe" | "switch-mode" | "help";
   socket?: string;
   action?: string;
   pattern?: string;
   actionArgs?: unknown;
+  // switch-mode parsed args
+  outputKey?: string;
+  modeWidth?: number;
+  modeHeight?: number;
+  modeRefreshMhz?: number;
 };
 
 const USAGE = `\
@@ -43,6 +48,16 @@ Commands:
                                 line as JSON). Pattern grammar matches the bus:
                                 exact ('window.map'), prefix-glob ('workspace.*'),
                                 or catch-all ('*').
+  switch-mode --output NAME --mode WxH[@RATE]
+                                Switch a KMS output to a new mode. NAME is the
+                                connector name (e.g. 'DP-1') OR the durable EDID
+                                id ('ACM-1234-CAFEBABE'); same precedence as the
+                                workspace plugin. RATE is the refresh in Hz
+                                (e.g. 60, 144); omit to match any rate at the
+                                given dims. Equivalent to:
+                                  invoke output.switch-mode
+                                    '{"output":NAME,"width":W,"height":H,
+                                      "refreshMhz":RATE*1000}'
   -h, --help                    Show this help.
 
 Socket discovery (highest priority first):
@@ -79,11 +94,29 @@ async function main(): Promise<void> {
       if (args.pattern === undefined) die("internal: subscribe without pattern");
       await runSubscribe(sock, args.pattern);
       return;
+    case "switch-mode":
+      if (args.outputKey === undefined
+          || args.modeWidth === undefined
+          || args.modeHeight === undefined) {
+        die("internal: switch-mode without parsed args");
+      }
+      await runInvoke(sock, "output.switch-mode", {
+        output: args.outputKey,
+        width: args.modeWidth,
+        height: args.modeHeight,
+        ...(args.modeRefreshMhz !== undefined && args.modeRefreshMhz > 0
+            ? { refreshMhz: args.modeRefreshMhz } : {}),
+      });
+      return;
   }
 }
 
 function parseArgs(argv: string[]): Args {
   let socket: string | undefined;
+  // switch-mode flags. Captured here so they can appear in any position
+  // relative to the positional command.
+  let outputKey: string | undefined;
+  let modeSpec: string | undefined;
   const positional: string[] = [];
   let i = 0;
   while (i < argv.length) {
@@ -97,6 +130,22 @@ function parseArgs(argv: string[]): Args {
       continue;
     }
     if (a.startsWith("--socket=")) { socket = a.slice("--socket=".length); i++; continue; }
+    if (a === "--output") {
+      const next = argv[i + 1];
+      if (!next) die("--output requires a value");
+      outputKey = next;
+      i += 2;
+      continue;
+    }
+    if (a.startsWith("--output=")) { outputKey = a.slice("--output=".length); i++; continue; }
+    if (a === "--mode") {
+      const next = argv[i + 1];
+      if (!next) die("--mode requires a value");
+      modeSpec = next;
+      i += 2;
+      continue;
+    }
+    if (a.startsWith("--mode=")) { modeSpec = a.slice("--mode=".length); i++; continue; }
     if (a.startsWith("--")) die(`unknown option: ${a}`);
     positional.push(a);
     i++;
@@ -121,6 +170,27 @@ function parseArgs(argv: string[]): Args {
   if (cmd === "subscribe") {
     if (positional.length < 2) die("subscribe requires a pattern");
     return { command: "subscribe", socket, pattern: positional[1] };
+  }
+  if (cmd === "switch-mode") {
+    if (!outputKey) die("switch-mode requires --output NAME");
+    if (!modeSpec) die("switch-mode requires --mode WxH[@RATE]");
+    const m = /^(\d+)x(\d+)(?:@(\d+(?:\.\d+)?))?$/.exec(modeSpec);
+    if (!m) die(`switch-mode: invalid --mode '${modeSpec}' (expected WxH[@RATE])`);
+    const w = parseInt(m[1], 10);
+    const h = parseInt(m[2], 10);
+    if (!(w > 0) || !(h > 0)) die("switch-mode: width/height must be positive");
+    let refreshMhz = 0;
+    if (m[3] !== undefined) {
+      // Rate is in Hz on the CLI; the wire carries mHz (Hz * 1000).
+      // parseFloat handles 60, 59.94, 144, etc.
+      const hz = parseFloat(m[3]);
+      if (!(hz > 0)) die("switch-mode: rate must be positive");
+      refreshMhz = Math.round(hz * 1000);
+    }
+    return {
+      command: "switch-mode", socket, outputKey,
+      modeWidth: w, modeHeight: h, modeRefreshMhz: refreshMhz,
+    };
   }
   die(`unknown command: ${cmd}`);
 }

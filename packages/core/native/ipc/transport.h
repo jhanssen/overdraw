@@ -99,6 +99,32 @@ enum class FrameKind : uint8_t {
                               // covers correctness), but the message still rides
                               // wire so the failure path (ok=0) is observable in
                               // FIFO order with surrounding frames.
+    SwitchMode = 8,           // core -> gpu: switch a connected output to a new
+                              // mode (width/height/refreshMhz). The GPU process
+                              // tears down that output's ring, picks the matching
+                              // drmModeModeInfo from the connector's mode list,
+                              // updates its mode blob lazily on the next commit
+                              // (didInitialCommit=false), allocates a fresh ring
+                              // at the new dims, then emits ScanoutRebuild so
+                              // the core reserves fresh wire handles. Rides the
+                              // wire to FIFO-order against any in-flight
+                              // ProducerBegin for the same output -- a
+                              // ProducerBegin against the old ring already
+                              // queued on wire MUST complete before SwitchMode
+                              // tears down the ring's surfaceBufs. Payload:
+                              // SwitchModePayload (outputId/width/height/refresh).
+    ScanoutRebuild = 9,       // gpu -> core: the named output's ring has been
+                              // rebuilt at new dims (e.g. after SwitchMode).
+                              // The core resets its per-output bookkeeping
+                              // (releaseScanoutForOutput) and reserves fresh
+                              // wire handles + surfaceBufIds via the normal
+                              // ScanoutReserve path, scoped to one outputId.
+                              // Payload: ScanoutRebuildPayload (outputId +
+                              // new width/height). Wire-FIFO ordered so the
+                              // ScanoutReserve reply lands at the GPU AFTER
+                              // any prior frames the GPU emitted; the GPU's
+                              // dispatchCoreControlFrame then InjectTextures
+                              // the new ring slots at the reserved handles.
 };
 
 // Max fds attachable in one message (control msg OR in-band wire frame).

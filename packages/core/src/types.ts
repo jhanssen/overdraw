@@ -257,6 +257,18 @@ export interface Addon {
   // GPU process has already torn down its ring. KMS only; nested/headless
   // are silent no-ops.
   releaseScanoutForOutput(outputId: number): void;
+  // Request a KMS mode swap on `outputId`. width/height/refreshMhz MUST
+  // match a mode the connector advertises (no custom modes today).
+  // Asynchronous: the addon appends a SwitchMode wire frame and returns;
+  // the GPU process tears down the ring + mode blob, allocates a fresh
+  // ring at the new dims, and replies with ScanoutRebuild on the wire.
+  // The core handler issues a fresh ScanoutReserve which the GPU
+  // InjectTextures into the new ring. The OutputDescriptor that follows
+  // updates JS state.outputs[outputId].deviceSize and triggers the
+  // output.changed bus re-emit chain (wl_output.mode burst to bound
+  // clients, etc.). KMS only; nested/headless are silent no-ops.
+  switchOutputMode(outputId: number, width: number, height: number,
+                   refreshMhz: number): void;
   // Register a callback fired once per drained KMS flip-complete; the outputId
   // identifies WHICH output just flipped. JS uses this to dispatch
   // wl_callback.done per output (surfaces on a 60Hz output get `done` at 60Hz
