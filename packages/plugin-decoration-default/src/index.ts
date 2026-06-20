@@ -117,7 +117,8 @@ export default async function init(sdk: PluginSdk, rawConfig?: unknown): Promise
     perWindow.clear();
   });
 
-  async function onAssigned(ev: DecorationAssignedEvent): Promise<void> {
+  async function onAssigned(ev: DecorationAssignedEvent,
+                             opts: { initialFocused?: boolean } = {}): Promise<void> {
     const windowId = ev.surfaceId;
     if (perWindow.has(windowId)) return;   // defensive; broker doesn't double-assign
 
@@ -130,7 +131,7 @@ export default async function init(sdk: PluginSdk, rawConfig?: unknown): Promise
       layer: "below",
     });
     const draw = createDecorationDraw(pipeline);
-    const w: PerWindow = { surface, draw, focused: false };
+    const w: PerWindow = { surface, draw, focused: opts.initialFocused ?? false };
     perWindow.set(windowId, w);
 
     // Apply analytic shapes: decoration takes the OUTER rounded rect; the
@@ -151,6 +152,7 @@ export default async function init(sdk: PluginSdk, rawConfig?: unknown): Promise
   async function onResized(ev: DecorationResizedEvent): Promise<void> {
     const windowId = ev.windowId;
     const prev = perWindow.get(windowId);
+    const wasFocused = prev?.focused ?? false;
     if (prev) {
       teardownWindow(prev);
       perWindow.delete(windowId);
@@ -158,11 +160,15 @@ export default async function init(sdk: PluginSdk, rawConfig?: unknown): Promise
     // Re-assign via the existing onAssigned flow (it allocates a new ring at
     // the new outer rect and redraws). createDecoration is the one path that
     // reserves the insets in the WM; recreating it is what onResized is for.
+    // Carry over the focused state so a window that's focused at resize/
+    // workspace-move time keeps its focused frame rendered (otherwise the
+    // re-created surface defaults to unfocused until the next activation
+    // event, which doesn't fire because the seat's focus didn't change).
     await onAssigned({
       surfaceId: windowId, appId: null, title: null,
       rect: { x: ev.outerRect.x, y: ev.outerRect.y,
               width: ev.outerRect.width, height: ev.outerRect.height },
-    });
+    }, { initialFocused: wasFocused });
   }
 
   function teardownWindow(w: PerWindow): void {
