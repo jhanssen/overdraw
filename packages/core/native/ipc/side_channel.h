@@ -152,6 +152,37 @@ enum class Tag : uint8_t {
                          //   trigger a forced modeset without waiting for the
                          //   next render.
     Shutdown     = 'X',  // core -> gpu : clean termination request
+    OutputAdded   = 'N',  // gpu -> core: a previously-disconnected connector is now
+                          //   connected and has a usable CRTC + plane. Carries the
+                          //   full descriptor (same fields OutputDescriptor uses:
+                          //   width/height/refresh/scale/transform/physical
+                          //   dimensions + name/make/model) plus the dense
+                          //   `outputId` the GPU process assigned. The core
+                          //   creates a state.outputs entry, replies with a
+                          //   ScanoutReserve for that outputId, and the GPU
+                          //   process replies ScanoutReady once the ring is
+                          //   built -- same handshake as startup bring-up,
+                          //   scoped to one outputId. See multi-output-design
+                          //   §4 / §10.
+    OutputRemoved = 'n',  // gpu -> core: the connector at `outputId` vanished or
+                          //   was disabled. The GPU process has already released
+                          //   the ring's GBM bo's / dmabuf fds / mode blob and
+                          //   dropped its PerOutput. The core fires
+                          //   output.pre-remove (workspace migration, surface
+                          //   leave), tears down state.outputs[outputId], fires
+                          //   output.removed, then destroys that output's
+                          //   wl_output global. See multi-output-design §10.
+    ScanoutRebuild = 'B', // gpu -> core: the ring at `outputId` is stale (e.g.
+                          //   mode change at the same connector); reply with a
+                          //   fresh ScanoutReserve for it. Same reply path as
+                          //   OutputAdded. Used so a mode change reuses one
+                          //   already-known outputId rather than going through
+                          //   add/remove (which would churn the wl_output global
+                          //   and force clients to re-bind). OutputDescriptor
+                          //   (above) keeps its narrow "identity changed, no
+                          //   ring action needed" meaning; the GPU process
+                          //   emits it AFTER ScanoutReady confirms the new
+                          //   ring. See multi-output-design §4 / §10.5.
 };
 
 // Wire object handle {id, generation}, matching dawn::wire::Handle layout.
