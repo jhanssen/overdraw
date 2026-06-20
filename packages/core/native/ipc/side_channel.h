@@ -454,6 +454,82 @@ struct ClientTexImportedPayload {
 static_assert(ClientTexImportedPayload::kSize == 9,
               "ClientTexImportedPayload size mismatch with hand-counted layout");
 
+// ---------------------------------------------------------------------------
+// In-band ScanoutReserve (kind=6, core -> gpu) and ScanoutReady (kind=7,
+// gpu -> core) frame payloads. Reserves a 3-slot scanout ring per output;
+// the GPU process InjectTextures at the reserved handles and replies ready.
+//
+// These ride the WIRE socket so they are FIFO-ordered with the
+// per-frame Begin/End access frames that reference the same
+// surfaceBufIds. Putting them on ctrl (as M7 step 4 originally did) is
+// unsafe: wire and ctrl are independent fds, and on a hotplug add the
+// core writes ProducerBegin on wire moments after ScanoutReserve on
+// ctrl -- the GPU process can drain wire first and abort on an
+// unregistered surfaceBufId. See multi-output-design §4 / the M7
+// step 5 follow-up.
+
+// ScanoutReserve payload: outputId, scanout dims, plus 3 (handleId,
+// handleGeneration, surfaceBufId) tuples. The core has already
+// ReserveTexture'd each handle on the wire BEFORE this frame is appended
+// (appendFrame flushes pending Dawn bytes first), so the GPU process's
+// wire reader has consumed the reservation bytes by the time it sees
+// this frame -- InjectTexture at each handle then succeeds.
+struct ScanoutReservePayload {
+    uint32_t outputId;
+    uint32_t width;
+    uint32_t height;
+    struct Slot { uint32_t handleId; uint32_t handleGeneration; uint32_t surfaceBufId; };
+    Slot slots[3];
+    static constexpr size_t kSize = 4 + 4 + 4 + 3 * (4 + 4 + 4);  // 48
+    void encode(uint8_t* out) const {
+        putU32LE(out + 0,  outputId);
+        putU32LE(out + 4,  width);
+        putU32LE(out + 8,  height);
+        for (int i = 0; i < 3; ++i) {
+            putU32LE(out + 12 + i * 12 + 0, slots[i].handleId);
+            putU32LE(out + 12 + i * 12 + 4, slots[i].handleGeneration);
+            putU32LE(out + 12 + i * 12 + 8, slots[i].surfaceBufId);
+        }
+    }
+    static ScanoutReservePayload decode(const uint8_t* p) {
+        ScanoutReservePayload r{};
+        r.outputId = getU32LE(p + 0);
+        r.width    = getU32LE(p + 4);
+        r.height   = getU32LE(p + 8);
+        for (int i = 0; i < 3; ++i) {
+            r.slots[i].handleId         = getU32LE(p + 12 + i * 12 + 0);
+            r.slots[i].handleGeneration = getU32LE(p + 12 + i * 12 + 4);
+            r.slots[i].surfaceBufId     = getU32LE(p + 12 + i * 12 + 8);
+        }
+        return r;
+    }
+};
+static_assert(ScanoutReservePayload::kSize == 48,
+              "ScanoutReservePayload size mismatch with hand-counted layout");
+
+// ScanoutReady payload: outputId + ok. The GPU process emits this AFTER
+// InjectTexture'ing all three slots for the named outputId; ok=0 signals a
+// fatal injection failure (the bringup path aborts; runtime hotplug logs and
+// abandons the output -- it stays in scanoutOutputs_ but acquireOutputTextureHandle
+// returns null so no frames are written for it).
+struct ScanoutReadyPayload {
+    uint32_t outputId;
+    uint8_t  ok;
+    static constexpr size_t kSize = 4 + 1;  // 5 bytes
+    void encode(uint8_t* out) const {
+        putU32LE(out + 0, outputId);
+        out[4] = ok;
+    }
+    static ScanoutReadyPayload decode(const uint8_t* p) {
+        ScanoutReadyPayload r{};
+        r.outputId = getU32LE(p + 0);
+        r.ok       = p[4];
+        return r;
+    }
+};
+static_assert(ScanoutReadyPayload::kSize == 5,
+              "ScanoutReadyPayload size mismatch with hand-counted layout");
+
 }  // namespace overdraw::ipc
 
 #endif  // OVERDRAW_IPC_SIDE_CHANNEL_H_

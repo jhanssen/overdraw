@@ -617,25 +617,38 @@ int run(int wireFd, int ctrlFd, int inputFd, bool headless,
     // handles, registers the slots as one-sided SurfaceBufs and routes them
     // in scanoutBufIdToSlot, and replies ScanoutReady. Returns false on any
     // failure (caller decides whether fatal).
-    auto handleScanoutReserve = [&](const ipc::Message& reserveMsg) -> bool {
-        if (!kms) return false;
-        const uint32_t outputId = reserveMsg.outputId;
+    // Send a ScanoutReady reply on the WIRE. The matching ScanoutReserve
+    // arrived on the wire (kind=6), so the reply also rides the wire to keep
+    // the handshake's two sides on the same FIFO. The core's inboundHandler
+    // routes ok=0 frames to ring discard.
+    auto sendScanoutReady = [&](uint32_t outputId, bool ok) {
+        ipc::ScanoutReadyPayload pl{};
+        pl.outputId = outputId;
+        pl.ok = ok ? 1 : 0;
+        uint8_t buf[ipc::ScanoutReadyPayload::kSize];
+        pl.encode(buf);
+        serializer.appendFrame(ipc::FrameKind::ScanoutReady, buf, sizeof(buf));
+    };
+
+    auto handleScanoutReserve = [&](const ipc::ScanoutReservePayload& p) -> bool {
+        if (!kms) {
+            std::fprintf(stderr,
+                "[gpu] handleScanoutReserve: no kms (nested mode?) outputId=%u\n",
+                p.outputId);
+            return false;
+        }
+        const uint32_t outputId = p.outputId;
         if (!kms->hasOutput(outputId)) {
             std::fprintf(stderr,
                 "[gpu] ScanoutReserve for unknown output %u\n", outputId);
-            ipc::Message reply{};
-            reply.tag = ipc::Tag::ScanoutReady;
-            reply.outputId = outputId;
-            reply.ok = 0;
-            ctrlSender.send(reply);
+            sendScanoutReady(outputId, false);
             return false;
         }
         bool injectOk = true;
         for (int i = 0; i < 3; ++i) {
             const auto& slot = kms->scanoutSlotAt(outputId, i);
             if (!server.InjectTexture(slot.tex.Get(),
-                                      {reserveMsg.scanoutHandles[i].id,
-                                       reserveMsg.scanoutHandles[i].generation},
+                                      {p.slots[i].handleId, p.slots[i].handleGeneration},
                                       {ready.device.id, ready.device.generation})) {
                 std::fprintf(stderr,
                     "[gpu] InjectTexture failed for output %u scanout slot %d\n",
@@ -654,15 +667,11 @@ int run(int wireFd, int ctrlFd, int inputFd, bool headless,
             sb.everProduced = false;
             sb.producerOpen = false;
             sb.consumerOpen = false;
-            const uint32_t sbufId = reserveMsg.scanoutBufIds[i];
+            const uint32_t sbufId = p.slots[i].surfaceBufId;
             surfaceBufs.emplace(sbufId, std::move(sb));
             scanoutBufIdToSlot[sbufId] = {outputId, i};
         }
-        ipc::Message reply{};
-        reply.tag = ipc::Tag::ScanoutReady;
-        reply.outputId = outputId;
-        reply.ok = injectOk ? 1 : 0;
-        ctrlSender.send(reply);
+        sendScanoutReady(outputId, injectOk);
         if (injectOk) {
             std::printf("[gpu] kms scanout ready for output %u (3 slots injected)\n",
                         outputId);
@@ -724,35 +733,54 @@ int run(int wireFd, int ctrlFd, int inputFd, bool headless,
             return 1;
         }
 
-        // Step 3: for each output, wait for its ScanoutReserve and run the
-        // shared handler. The core sends one ScanoutReserve per output; the
-        // inject keys off the reserve's outputId (the core may send them in
-        // any order).
-        for (uint32_t k = 0; k < nOutputs; ++k) {
-            ipc::Message reserveMsg{};
-            bool got = false;
-            for (int i = 0; i < 500000 && !got; ++i) {
-                ipc::Message m{};
-                if (ipc::recvMessageNB(ctrlFd, m) && m.tag == ipc::Tag::ScanoutReserve) {
-                    reserveMsg = m;
-                    got = true;
-                    break;
-                }
-                pumpWire();  // keep wire flowing during the wait
-                usleepShort();
+        // Step 3: wait for one ScanoutReserve per output on the WIRE. They
+        // come through the FrameReader as kind=ScanoutReserve frames; we
+        // install a small startup dispatcher that calls handleScanoutReserve
+        // on each. (The full dispatchCoreControlFrame -- for steady-state
+        // BeginAccess / ImportClientTex etc. -- is bound further down; before
+        // it overwrites this one, pumpWire still won't see any non-ScanoutReserve
+        // wire control frames because no client has connected yet.)
+        uint32_t reservesHandled = 0;
+        dispatchCoreControlFrame = [&](ipc::FrameKind kind,
+                                       const std::vector<uint8_t>& frame,
+                                       const int* /*fds*/, int nfds) {
+            if (kind != ipc::FrameKind::ScanoutReserve) {
+                std::fprintf(stderr,
+                    "[gpu] startup: unexpected wire frame kind=%u (expected ScanoutReserve)\n",
+                    static_cast<unsigned>(kind));
+                std::abort();
             }
-            if (!got) {
-                std::fprintf(stderr, "[gpu] no ScanoutReserve (received %u/%u)\n",
-                             k, nOutputs);
-                return 1;
+            if (nfds != 0) {
+                std::fprintf(stderr,
+                    "[gpu] startup: ScanoutReserve with nfds=%d (must be 0)\n", nfds);
+                std::abort();
             }
-            if (!handleScanoutReserve(reserveMsg)) {
+            if (frame.size() != ipc::ScanoutReservePayload::kSize) {
+                std::fprintf(stderr,
+                    "[gpu] startup: ScanoutReserve bad payload size %zu\n", frame.size());
+                std::abort();
+            }
+            auto p = ipc::ScanoutReservePayload::decode(frame.data());
+            if (!handleScanoutReserve(p)) {
                 std::fprintf(stderr,
                     "[gpu] startup ScanoutReserve handling failed for output %u\n",
-                    reserveMsg.outputId);
-                return 1;
+                    p.outputId);
+                std::abort();
             }
+            ++reservesHandled;
+        };
+        // Spin-pump until all N ScanoutReserves have been processed.
+        for (int i = 0; i < 500000 && reservesHandled < nOutputs; ++i) {
+            pumpWire();
+            usleepShort();
         }
+        if (reservesHandled < nOutputs) {
+            std::fprintf(stderr, "[gpu] no ScanoutReserve (received %u/%u)\n",
+                         reservesHandled, nOutputs);
+            return 1;
+        }
+        // Reset the startup dispatcher; the full one is bound below.
+        dispatchCoreControlFrame = nullptr;
     }
 #endif  // OVERDRAW_KMS
 
@@ -1391,6 +1419,28 @@ int run(int wireFd, int ctrlFd, int inputFd, bool headless,
             std::fprintf(stderr, "[gpu] core wire: empty control frame\n");
             std::abort();
         }
+        if (kind == ipc::FrameKind::ScanoutReserve) {
+            // Runtime hotplug ring bring-up. The core ReserveTexture'd three
+            // wire handles + appended this ScanoutReserve frame; the FIFO
+            // ordering of the wire socket guarantees that by here the wire
+            // server has already processed the ReserveTexture commands, so
+            // InjectTexture at each handle succeeds. Any subsequent
+            // ProducerBegin frame referencing the new bufIds is FIFO-after
+            // this frame and will find the bufIds registered in surfaceBufs.
+            if (nfds != 0) {
+                std::fprintf(stderr,
+                    "[gpu] core wire: ScanoutReserve with nfds=%d (must be 0)\n", nfds);
+                std::abort();
+            }
+            if (frame.size() != ipc::ScanoutReservePayload::kSize) {
+                std::fprintf(stderr,
+                    "[gpu] core wire: bad ScanoutReserve payload size %zu\n", frame.size());
+                std::abort();
+            }
+            auto p = ipc::ScanoutReservePayload::decode(frame.data());
+            (void)handleScanoutReserve(p);  // ScanoutReady (ok=0/1) emitted from inside
+            return;
+        }
         if (kind == ipc::FrameKind::ImportClientTex) {
             // In-band dmabuf import: FIFO-ordered with surrounding wire commands
             // so the just-Reserved texture slot at handle.id (which grew the wire
@@ -1756,16 +1806,6 @@ int run(int wireFd, int ctrlFd, int inputFd, bool headless,
                 for (int i = 0; i < nRecvFds; ++i) ::close(recvFds[i]);
             } else if (m.tag == ipc::Tag::OutputResume) {
                 if (kms) kms->resume();
-                for (int i = 0; i < nRecvFds; ++i) ::close(recvFds[i]);
-            } else if (m.tag == ipc::Tag::ScanoutReserve) {
-                // Runtime ScanoutReserve: the core is responding to an
-                // OutputAdded we sent (from the udev hotplug path). The ring
-                // was already built by initScanoutForOutput before we emitted
-                // OutputAdded, so handleScanoutReserve just InjectTextures
-                // and replies ScanoutReady. (Startup-phase ScanoutReserves
-                // are drained by the tight-loop receive above, before the
-                // event loop ever runs; this branch never sees them.)
-                handleScanoutReserve(m);
                 for (int i = 0; i < nRecvFds; ++i) ::close(recvFds[i]);
 #endif
             } else if (m.tag == ipc::Tag::AddWireConn) {

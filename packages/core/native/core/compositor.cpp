@@ -32,9 +32,12 @@ Compositor::Compositor(int wireFd, int ctrlFd, pid_t gpuPid,
     // Hello completes. The CtrlSender is constructed at that same point.
     ipc::setNonBlocking(wireFd_);
 
-    // ClientTexImported arrives in-band on the wire (kind=4) as the reply to
-    // a kind=3 ImportClientTex. Route it through to the existing import-done
-    // handler logic.
+    // Inbound non-Dawn wire frames:
+    //   ClientTexImported (kind=4) -- reply to a kind=3 ImportClientTex.
+    //   ScanoutReady (kind=7)      -- runtime hotplug ring handshake
+    //                                  completion (bringUp installs its own
+    //                                  transient handler during startup;
+    //                                  this one handles steady-state).
     link_->setInboundFrameHandler([this](ipc::FrameKind kind,
                                          const std::vector<uint8_t>& frame) {
         if (kind == ipc::FrameKind::ClientTexImported) {
@@ -45,11 +48,33 @@ Compositor::Compositor(int wireFd, int ctrlFd, pid_t gpuPid,
             }
             auto p = ipc::ClientTexImportedPayload::decode(frame.data());
             onClientTexImported(p.textureId, p.importOk != 0);
-        } else {
-            std::fprintf(stderr,
-                "[core] WireLink inbound: unexpected kind=%u\n",
-                static_cast<unsigned>(kind));
+            return;
         }
+        if (kind == ipc::FrameKind::ScanoutReady) {
+            // Runtime hotplug: a previous reserveScanoutForOutput completed.
+            // ok=1 is informational here (wire FIFO already guarantees any
+            // ProducerBegin frame after the matching ScanoutReserve sees the
+            // ring; we don't need to gate JS-side rendering on this). ok=0
+            // is a fatal injection failure -- discard the ring so
+            // acquireOutputTextureHandle returns null and no frames are
+            // written for the dead output.
+            if (frame.size() != ipc::ScanoutReadyPayload::kSize) {
+                std::fprintf(stderr,
+                    "[core] ScanoutReady: bad payload size %zu\n", frame.size());
+                return;
+            }
+            auto p = ipc::ScanoutReadyPayload::decode(frame.data());
+            if (p.ok == 0) {
+                scanoutOutputs_.erase(p.outputId);
+                std::fprintf(stderr,
+                    "[core] ScanoutReady ok=0 for outputId=%u; ring discarded\n",
+                    p.outputId);
+            }
+            return;
+        }
+        std::fprintf(stderr,
+            "[core] WireLink inbound: unexpected kind=%u\n",
+            static_cast<unsigned>(kind));
     });
 }
 
@@ -282,10 +307,42 @@ bool Compositor::bringUp() {
         windowWidth_  = kmsDescriptor.width;
         windowHeight_ = kmsDescriptor.height;
 
-        // Reserve a three-slot scanout ring per output: for each output,
-        // ReserveTexture three wire handles sized to that output's mode, send a
-        // ScanoutReserve carrying the handles + surfaceBufIds, then collect the
-        // matching ScanoutReady. The GPU process replies in outputId order.
+        // Reserve a three-slot scanout ring per output. For each output:
+        // ReserveTexture three wire handles, then write the ScanoutReserve
+        // frame on the WIRE socket. The wire's FIFO ordering guarantees the
+        // GPU process's wire reader sees the Reserve bytes before any
+        // subsequent ProducerBegin frame referencing the same handles -- the
+        // race that broke ctrl-delivery is eliminated by construction.
+        //
+        // ScanoutReady comes back on wire too; we consume it via the
+        // inboundHandler that the bringUp sets up below.
+        size_t readyCount = 0;
+        bool readyFailed = false;
+        // Snapshot the existing inbound handler (set by Compositor's ctor for
+        // ClientTexImported) so we can chain to it for non-ScanoutReady frames.
+        // bringUp runs before any client surfaces are imported, so this is
+        // really only a defensive coding measure.
+        auto priorHandler = link_->takeInboundFrameHandler();
+        link_->setInboundFrameHandler([&](ipc::FrameKind kind,
+                                          const std::vector<uint8_t>& frame) {
+            if (kind == ipc::FrameKind::ScanoutReady) {
+                if (frame.size() != ipc::ScanoutReadyPayload::kSize) {
+                    error_ = "ScanoutReady wire frame: bad size";
+                    readyFailed = true;
+                    return;
+                }
+                auto p = ipc::ScanoutReadyPayload::decode(frame.data());
+                if (p.ok == 0) {
+                    error_ = "ScanoutReady reported failure";
+                    readyFailed = true;
+                    return;
+                }
+                ++readyCount;
+                return;
+            }
+            if (priorHandler) priorHandler(kind, frame);
+        });
+
         for (const auto& out : kmsOutputs) {
             WGPUTextureDescriptor td{};
             td.size = { out.width, out.height, 1 };
@@ -294,11 +351,10 @@ bool Compositor::bringUp() {
             td.dimension = WGPUTextureDimension_2D;
             td.format = static_cast<WGPUTextureFormat>(renderFormat_);
             td.usage = WGPUTextureUsage_RenderAttachment | WGPUTextureUsage_TextureBinding;
-            ipc::Message rsMsg{};
-            rsMsg.tag = ipc::Tag::ScanoutReserve;
-            rsMsg.outputId = out.outputId;
-            rsMsg.width = out.width;
-            rsMsg.height = out.height;
+            ipc::ScanoutReservePayload pl{};
+            pl.outputId = out.outputId;
+            pl.width = out.width;
+            pl.height = out.height;
             ScanoutOutput& so = scanoutOutputs_[out.outputId];
             for (int i = 0; i < 3; ++i) {
                 auto r = link_->client().ReserveTexture(device_.Get(), &td);
@@ -307,40 +363,32 @@ bool Compositor::bringUp() {
                 so.slots[i].state     = ScanoutSlotState::FREE;
                 so.slots[i].tex       = r.texture;  // wire-side handle, valid pre-inject
                 so.slots[i].surfaceBufId = nextSurfaceBufId_++;
-                rsMsg.scanoutHandles[i] = { r.handle.id, r.handle.generation };
-                rsMsg.scanoutBufIds[i]  = so.slots[i].surfaceBufId;
+                pl.slots[i] = { r.handle.id, r.handle.generation, so.slots[i].surfaceBufId };
             }
-            // Flush the reserves into the wire before sending ScanoutReserve so
-            // the GPU process's wire reader has consumed the reservation bytes
-            // by the time it InjectTexture's at our handles. Flush before each
-            // send to keep the per-output wire ordering the GPU expects.
-            link_->flush();
-            ipc::sendMessage(ctrlFd_, rsMsg);
+            // appendFrame flushes pending Dawn bytes (the ReserveTexture
+            // commands) before the frame, so on the wire we get:
+            // ReserveTexture commands -> ScanoutReserve frame -> any later
+            // frames referencing these handles. The GPU process processes them
+            // in that order.
+            uint8_t buf[ipc::ScanoutReservePayload::kSize];
+            pl.encode(buf);
+            link_->appendFrame(ipc::FrameKind::ScanoutReserve, buf, sizeof(buf));
         }
 
-        // Wait for one ScanoutReady per output (matched by outputId); every one
-        // must report ok.
-        size_t readyCount = 0;
         if (!link_->pumpUntil([&] {
-                ipc::Message m{};
-                int fds[ipc::kMaxMsgFds];
-                int nfds = 0;
-                if (!ipc::recvMessageNBFds(ctrlFd_, m, fds, &nfds)) return false;
-                for (int i = 0; i < nfds; ++i) ::close(fds[i]);
-                if (m.tag == ipc::Tag::ScanoutReady) {
-                    if (m.ok == 0) {
-                        error_ = "ScanoutReady reported failure";
-                        return true;  // stop pumping; error_ set
-                    }
-                    ++readyCount;
-                    return readyCount >= kmsOutputs.size();
-                }
-                return false;
+                return readyFailed || readyCount >= kmsOutputs.size();
             })) {
+            // Restore the prior handler before returning so the destructor /
+            // any subsequent ctor-set handler runs cleanly. (The temporary
+            // bringUp handler observes ScanoutReady; after this it would
+            // observe future ScanoutReady frames as no-ops, but it also
+            // overlaps with ClientTexImported, so restore.)
+            link_->setInboundFrameHandler(std::move(priorHandler));
             error_ = "no ScanoutReady";
             return false;
         }
-        if (!error_.empty()) return false;
+        link_->setInboundFrameHandler(std::move(priorHandler));
+        if (readyFailed) return false;
     } else {
         // Headless: no swapchain. The JS compositor renders into its own
         // offscreen target; the format it samples client buffers as is BGRA8Unorm.
@@ -535,11 +583,10 @@ void Compositor::reserveScanoutForOutput(uint32_t outputId, uint32_t width, uint
     td.dimension = WGPUTextureDimension_2D;
     td.format = static_cast<WGPUTextureFormat>(renderFormat_);
     td.usage = WGPUTextureUsage_RenderAttachment | WGPUTextureUsage_TextureBinding;
-    ipc::Message rsMsg{};
-    rsMsg.tag = ipc::Tag::ScanoutReserve;
-    rsMsg.outputId = outputId;
-    rsMsg.width = width;
-    rsMsg.height = height;
+    ipc::ScanoutReservePayload pl{};
+    pl.outputId = outputId;
+    pl.width = width;
+    pl.height = height;
     ScanoutOutput& so = scanoutOutputs_[outputId];
     for (int i = 0; i < 3; ++i) {
         auto r = link_->client().ReserveTexture(device_.Get(), &td);
@@ -548,15 +595,19 @@ void Compositor::reserveScanoutForOutput(uint32_t outputId, uint32_t width, uint
         so.slots[i].state     = ScanoutSlotState::FREE;
         so.slots[i].tex       = r.texture;
         so.slots[i].surfaceBufId = nextSurfaceBufId_++;
-        rsMsg.scanoutHandles[i] = { r.handle.id, r.handle.generation };
-        rsMsg.scanoutBufIds[i]  = so.slots[i].surfaceBufId;
+        pl.slots[i] = { r.handle.id, r.handle.generation, so.slots[i].surfaceBufId };
     }
     so.currentSlot = -1;
-    // Flush reserves before publishing ScanoutReserve so the GPU process's wire
-    // reader has consumed the reservation bytes by the time it InjectTextures.
-    link_->flush();
-    if (ctrlSender_) ctrlSender_->send(rsMsg);
-    else ipc::sendMessage(ctrlFd_, rsMsg);  // pre-handshake call site is unreachable today
+    // appendFrame flushes pending Dawn bytes first so the wire order is:
+    // ReserveTexture commands -> ScanoutReserve frame -> any later
+    // ProducerBegin frames referencing the new handles. Wire FIFO + the
+    // GPU process's single-threaded wire dispatch guarantee the
+    // ScanoutReserve handler (InjectTexture + surfaceBufs register) runs
+    // BEFORE any frame referencing the new bufIds -- this is the fix for
+    // the ctrl/wire cross-fd race that broke M7 step 4.
+    uint8_t buf[ipc::ScanoutReservePayload::kSize];
+    pl.encode(buf);
+    link_->appendFrame(ipc::FrameKind::ScanoutReserve, buf, sizeof(buf));
 }
 
 void Compositor::releaseScanoutForOutput(uint32_t outputId) {
@@ -642,22 +693,10 @@ void Compositor::drainCtrl() {
             pendingOutputsRemoved_.push_back(r.outputId);
             continue;
         }
-        if (r.tag == ipc::Tag::ScanoutReady) {
-            // Steady-state ScanoutReady (a runtime OutputAdded handshake or a
-            // future ScanoutRebuild). Failure leaves the ring in a state
-            // where acquireOutputTextureHandle returns null (no usable slots)
-            // and the JS side has already observed the OutputAdded event; the
-            // JS layer will see no frames present and the GPU process logs
-            // the failure. Erase the entry so a future re-attempt starts
-            // clean. (Startup ScanoutReady is consumed by bringUp's tight
-            // loop and never reaches here.)
-            if (r.ok == 0) {
-                scanoutOutputs_.erase(r.outputId);
-                std::fprintf(stderr, "[core] ScanoutReady ok=0 for outputId=%u; ring discarded\n",
-                             r.outputId);
-            }
-            continue;
-        }
+        // Note: ScanoutReady arrives on the WIRE (not ctrl) -- see the
+        // inboundHandler in Compositor::Compositor and the bringUp's
+        // transient handler. Keeping ctrl free of this avoids the cross-fd
+        // race that broke M7 step 4.
         if (r.tag == ipc::Tag::WireConnAdded) {
             wireConnAdded_[r.connId] = r.ok ? 1 : 2;
             continue;

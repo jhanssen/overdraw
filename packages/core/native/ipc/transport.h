@@ -78,6 +78,27 @@ enum class FrameKind : uint8_t {
                               // kind so the FrameReader knows to claim the fd --
                               // BeginAccess (kind=1) MUST stay fd-less, otherwise
                               // a stale fd would leak into the next ImportClientTex.
+    ScanoutReserve = 6,       // core -> gpu: reserve N scanout slots for an output
+                              // (M7 hotplug add + startup ring bring-up). Rides
+                              // the wire (not ctrl) so the followup ProducerBegin
+                              // frames the core writes for the new ring are FIFO-
+                              // ordered AFTER the InjectTexture work the GPU
+                              // process runs in response. ctrl can't carry this
+                              // safely because wire and ctrl are separate fds with
+                              // no kernel-level ordering between them -- if the
+                              // core sent ScanoutReserve on ctrl and the next
+                              // frame's ProducerBegin on wire, the GPU process
+                              // could drain wire first and abort on the unknown
+                              // surfaceBufId. See multi-output-design §4.
+    ScanoutReady = 7,         // gpu -> core: ScanoutReserve handshake completed.
+                              // Payload carries outputId + ok flag. Used by the
+                              // startup bring-up spinloop to wait for all rings
+                              // to be ready; runtime hotplug doesn't need to
+                              // synchronously wait (wire FIFO ordering between
+                              // ScanoutReserve and subsequent ProducerBegins
+                              // covers correctness), but the message still rides
+                              // wire so the failure path (ok=0) is observable in
+                              // FIFO order with surrounding frames.
 };
 
 // Max fds attachable in one message (control msg OR in-band wire frame).

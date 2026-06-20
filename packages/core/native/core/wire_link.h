@@ -85,6 +85,12 @@ class WireLink {
     void setInboundFrameHandler(InboundFrameHandler h) {
         inboundHandler_ = std::move(h);
     }
+    // For bringUp's transient handler stacking: capture the current handler so
+    // a wrapper can chain to it for frame kinds it does not handle itself.
+    // Returns the prior handler (possibly empty).
+    InboundFrameHandler takeInboundFrameHandler() {
+        return std::move(inboundHandler_);
+    }
 
     // Spin (flush + drain one frame + process events) until `done()` or a bound
     // is hit. One-shot bring-up only. Returns done().
