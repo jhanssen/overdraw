@@ -125,6 +125,47 @@ enum class FrameKind : uint8_t {
                               // any prior frames the GPU emitted; the GPU's
                               // dispatchCoreControlFrame then InjectTextures
                               // the new ring slots at the reserved handles.
+    AllocSurfaceBuf = 10,     // core -> gpu: allocate ONE GBM dmabuf + import
+                              // it as wgpu::Texture on BOTH the plugin (producer)
+                              // device and the core (consumer) device, injecting
+                              // at the reserved wire handles on each side.
+                              // Payload: AllocSurfaceBufPayload (surfaceBufId +
+                              // dims + producer/consumer device + texture wire
+                              // handles + producer/consumer reservePointSerials).
+                              // Rides wire so the SurfaceBufAllocated reply +
+                              // any subsequent ProducerBegin / ConsumerBegin
+                              // frames FIFO-order against this one and the
+                              // surfaceBufs map insert it triggers.
+    AllocComposeBuf = 11,     // core -> gpu: SAME as AllocSurfaceBuf but with
+                              // the producer/consumer roles swapped (the core
+                              // device produces -- sdk.compose Worker
+                              // transport -- and the plugin device consumes).
+                              // Payload reuses AllocSurfaceBufPayload; the
+                              // FrameKind distinguishes the direction.
+    SurfaceBufAllocated = 12, // gpu -> core: AllocSurfaceBuf / AllocComposeBuf
+                              // completed (both injects done). Payload:
+                              // SurfaceBufAllocatedPayload (surfaceBufId, connId,
+                              // ok). The surfaceBufs map insert happens BEFORE
+                              // this frame is emitted, so any ProducerBegin /
+                              // ConsumerBegin the core writes after observing
+                              // this reply is FIFO-ordered after the insert
+                              // (wire is single-threaded on each end).
+    ReleaseSurfaceBuf = 13,   // core -> gpu: destroy a surfaceBuf -- end any
+                              // open access bracket, drop the SharedTextureMemory
+                              // / textures / fences, release the GBM dmabuf.
+                              // Payload: ReleaseSurfaceBufPayload (surfaceBufId).
+                              // Rides wire so a still-pending ProducerEnd /
+                              // ConsumerEnd for this buf has already been
+                              // decoded by the time the destroy runs -- no
+                              // teardown-vs-open-bracket race.
+    ReleaseClientTex = 14,    // core -> gpu: release a JS-compositor dmabuf
+                              // import: drop the STM + close the fd. Payload:
+                              // ReleaseClientTexPayload (textureId,
+                              // textureGeneration). Rides wire so the prior
+                              // per-frame BeginAccess/EndAccess brackets for
+                              // this handle (also on wire) have drained before
+                              // the erase runs -- no wireSerial workaround
+                              // needed, FIFO ordering covers it.
 };
 
 // Max fds attachable in one message (control msg OR in-band wire frame).

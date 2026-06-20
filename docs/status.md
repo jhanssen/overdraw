@@ -270,52 +270,109 @@ node-addon-api, to avoid exception/RTTI dependence under `-fno-rtti`).
 ### IPC (three sockets, fully non-blocking)
 
 - **Dawn wire** over one `SOCK_STREAM` socket (length-prefixed, kind-tagged
-  frames: `[len][kind][payload]`). `kind=0` is Dawn wire bytes; `kind=1`/`kind=2`
-  are in-band access-bracket Begin/End frames (see INBAND-ACCESS.md);
-  `kind=3` is `ImportClientTex` (client dmabuf fd attached via SCM_RIGHTS on the
-  sendmsg that delivers the frame); `kind=4` is the matching `ClientTexImported`
-  reply. The dmabuf import rides the wire because the server-side slot it
-  allocates (`Server::InjectTexture`) shares the wire-client's texture id space
-  with subsequent wire commands like `Surface::APIGetCurrentTexture` — putting
-  the import on a separate ctrl channel let those later wire commands overtake
-  it on the server, causing `Server::Allocate` to fail (id beyond `mKnown.size()`)
-  and the surface to silently render black for the rest of the run on 1/~20
-  launches. Linux AF_UNIX/STREAM sockets accept SCM_RIGHTS just fine; the
-  per-frame fd attachment FIFO in `FdSerializer`/`FrameReader` is the wire-
-  socket analogue of `CtrlSender`'s per-message SCM_RIGHTS path.
-- **Control side channel** over a `SOCK_SEQPACKET` socket carrying fixed-size
-  tagged POD messages (`native/ipc/side_channel.h`) — not flatbuffers. SCM_RIGHTS
-  fd passing is used for transports that don't share an id space with the wire
-  (e.g. `SetDrmFd`, `AddWireConn`, `FeedbackData`'s format-table memfd).
-- **Input** over a dedicated `SOCK_SEQPACKET` socket (separate from control so
-  unsolicited input never interleaves with request/reply traffic).
+  frames: `[len][kind][payload]`). The full FrameKind set is in
+  `native/ipc/transport.h`; `kind=0` is Dawn wire bytes, every other kind
+  is an overdraw control frame. Today: `kind=1`/`kind=2` access-bracket
+  Begin/End, `kind=3`/`kind=4` ImportClientTex + reply (dmabuf fd via
+  SCM_RIGHTS on the same sendmsg), `kind=5` BeginAccess-with-fence,
+  `kind=6`/`kind=7` ScanoutReserve + ScanoutReady, `kind=8` SwitchMode,
+  `kind=9` ScanoutRebuild, `kind=10`/`kind=11` AllocSurfaceBuf /
+  AllocComposeBuf, `kind=12` SurfaceBufAllocated reply, `kind=13`
+  ReleaseSurfaceBuf, `kind=14` ReleaseClientTex.
+- **Control side channel (ctrl)** over a `SOCK_SEQPACKET` socket carrying
+  fixed-size tagged POD messages (`native/ipc/side_channel.h`). Reserved
+  for boot handshake + hard-kill + wire-fd-passing only (see
+  `architecture.md` "Why wire, not ctrl"): `Hello`/`HelloReply`,
+  `SetDrmFd`, `AddWireConn`, `WireConnAdded`, `FeedbackData`,
+  `Shutdown`, `OutputPause`/`OutputResume`, plus a few remaining
+  pre-wire setup tags (`InstanceReserved`, `DeviceReady`,
+  `SurfaceReady`, `InjectPluginInstance`/`PluginInstanceInjected`,
+  `SetPluginTickDevice`) and runtime hotplug add/remove
+  (`OutputAdded`/`OutputRemoved`, `OutputDescriptor`,
+  `ScanoutPresent`/`ScanoutFlipComplete`/`FrameComplete`).
+  The output-lifecycle tags are next on the ctrl-removal list; not yet
+  moved because they aren't actively racing.
+- **Input** over a dedicated `SOCK_SEQPACKET` socket (separate from
+  control so unsolicited input never interleaves with request/reply
+  traffic).
 
-No write may ever park: all fds are `O_NONBLOCK`; writers buffer what the socket
-can't take and drain on writable. `native/ipc/transport.h` provides `FdSerializer`
-(queues framed wire batches; `pumpOut` drains on writable), `FrameReader`
-(accumulates whole frames), `CtrlSender` (buffers SEQPACKET datagrams, dup'ing fds
-when queued). Blocking shims remain only for one-shot startup/handshake.
+No write may ever park: all fds are `O_NONBLOCK`; writers buffer what
+the socket can't take and drain on writable. `native/ipc/transport.h`
+provides `FdSerializer` (queues framed wire batches; `pumpOut` drains
+on writable), `FrameReader` (accumulates whole frames), `CtrlSender`
+(buffers SEQPACKET datagrams, dup'ing fds when queued). Blocking shims
+remain only for one-shot startup/handshake.
 
 - **GPU process** drives an `EventLoop` abstraction (`gpu-process/src/
   event_loop.h`) with an epoll backend, multiplexing wire / ctrl / host-
-  `wl_display` fds; arms write-interest only when output is queued. Backend-
-  agnostic so kqueue can be added. Steady-state loop ~190 Hz.
-- **Core** uses libuv `uv_poll`, arming `UV_WRITABLE` on the wire fd only when
-  output is queued (`armWirePoll`/`wirePumpOut`).
-- Wire socket buffers enlarged to 8 MiB; userspace buffering covers overflow.
+  `wl_display` fds; arms write-interest only when output is queued.
+  Backend-agnostic so kqueue can be added. Steady-state loop ~190 Hz.
+- **Core** uses libuv `uv_poll`, arming `UV_WRITABLE` on the wire fd
+  only when output is queued (`armWirePoll`/`wirePumpOut`).
+- Wire socket buffers enlarged to 8 MiB; userspace buffering covers
+  overflow.
 
-**Cross-channel ordering.** A control request that allocates a wire-server-side
-slot (`AllocSurfaceBuf`'s producer/consumer `InjectTexture`s) must not overtake
-the wire commands it depends on (the prior `UnregisterObjectCmd` that recycles a
-handle at generation+1, the new `ReserveTexture`). Enforced by a wire serial:
-`FdSerializer` counts cumulative framed wire bytes; the core tags the request
-with that value; the GPU process defers it (via `ipc::WireBarrier`) until its
-consumed-byte count reaches the serial. An explicit happens-before across the
-two sockets, no blocking. Likewise `ReleaseClientTex` (ctrl) is gated on the
-wire reader catching up past every in-band Begin/End bracket queued ahead of it.
-`ImportClientTex` no longer rides ctrl at all (it is in-band on the wire as
-`kind=3`, naturally FIFO-ordered); the per-FRAME access brackets are also wire
-in-band (`kind=1`/`kind=2`). See INBAND-ACCESS.md.
+**Cross-channel ordering.** Wire FIFO between dependent messages is the
+load-bearing invariant. An AllocSurfaceBuf inject MUST land before the
+matching ProducerBegin/ConsumerBegin that references the new slot; a
+ReleaseSurfaceBuf MUST land after any still-pending End on that slot;
+an `InjectTexture` MUST land after the prior `UnregisterObjectCmd` that
+recycled a handle id. With both messages on the wire (FIFO by
+construction, single-threaded reader), no per-message synchronization
+is needed. Where a Dawn id-recycle hazard remains (the
+`Server::InjectTexture` slot allocator), `ipc::WireBarrier` defers an
+action until the wire reader has consumed past a sampled byte cursor;
+this is the same pattern AllocSurfaceBuf's two-sided inject still uses
+(plugin-wire barrier for the producer side, core-wire barrier for the
+consumer side).
+
+The historical workaround `wireSerial` field on `ReleaseClientTex` is
+gone — `ReleaseClientTex` now rides the wire too (`kind=14`), so the
+prior brackets are FIFO-ahead by construction.
+
+### Known race: intercept-worker teardown (Worker keeps writing after
+core releases)
+
+`test/intercept-worker.gpu.mjs` is flaky (~24% failure rate) with a
+characteristic abort: `[gpu] ProducerBegin: unknown surfaceBufId=N`
+followed by GPU-process crash. Root cause is **NOT** a cross-fd race
+in the IPC migration — it is a missing teardown handshake between the
+core and the plugin Worker:
+
+1. Test winds down. Core's `WorkerSurfaceState.destroy()` runs.
+2. Core writes `ReleaseSurfaceBuf` for all 6 surface bufs to the
+   wire (immediately, no gate).
+3. Concurrently, core sends an `intercept.unmatched` event to the
+   Worker via the plugin event channel (async; relayed through the
+   plugin's dawn-wire postMessage path).
+4. The Worker's `runLoop` is a separate execution context. It only
+   observes the unmatched event when its event handler runs.
+5. Between step 2 and step 4, the Worker's `runLoop` may call
+   `outputProducer.acquire()` which writes a `ProducerBegin` for one
+   of the just-released bufIds on the PLUGIN wire.
+6. The GPU process sees ReleaseSurfaceBuf on core wire → erases the
+   surfaceBuf. Then sees ProducerBegin on plugin wire → unknown id →
+   abort.
+
+The two writes ride independent fds (core wire vs plugin wire), so
+neither wire-FIFO ordering nor moving more ctrl traffic to wire can
+fix this. The cross-FD class of race that the wire-migration work IS
+addressing (`ProducerBegin overtaking AllocSurfaceBuf` and friends) is
+a different race; this one is a teardown-ordering race that requires
+a handshake.
+
+**Fix (deferred, not silent):** Worker→core teardown handshake. The
+Worker receives `intercept.unmatched`, sets `stopped=true`, drains the
+runLoop, then sends a `unmatched-acked` event back to core. Core's
+`WorkerSurfaceState.destroy()` waits for the ack before issuing the
+ReleaseSurfaceBuf frames. ~50 lines including the bus event roundtrip
+and timeout fallback (default to releasing after some bounded wait so
+a dead Worker can't leak buffers indefinitely).
+
+Until that lands the test is rerun-flaky; CI accepts the
+non-deterministic pass-rate. No production impact (the user's runtime
+compositor doesn't tear down `intercept` plugins mid-frame in normal
+operation).
 
 ### GPU process threading
 

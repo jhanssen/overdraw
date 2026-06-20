@@ -72,6 +72,36 @@ Compositor::Compositor(int wireFd, int ctrlFd, pid_t gpuPid,
             }
             return;
         }
+        if (kind == ipc::FrameKind::SurfaceBufAllocated) {
+            // AllocSurfaceBuf / AllocComposeBuf completion. The GPU has
+            // already inserted the surfaceBuf into its surfaceBufs map
+            // before sending this frame, so any subsequent ProducerBegin /
+            // ConsumerBegin we write is FIFO-after the insert and finds
+            // the buf populated.
+            if (frame.size() != ipc::SurfaceBufAllocatedPayload::kSize) {
+                std::fprintf(stderr,
+                    "[core] SurfaceBufAllocated: bad payload size %zu\n", frame.size());
+                return;
+            }
+            auto p = ipc::SurfaceBufAllocatedPayload::decode(frame.data());
+            surfaceBufAllocated_[p.surfaceBufId] = p.ok ? 1 : 2;
+            if (!p.ok) {
+                // The GPU process REACHED InjectTexture and it failed. Its
+                // WireServer may already have a partial registration at our
+                // reserved id (Dawn's wire-server state on a failed Inject
+                // is not contractually defined, so we conservatively assume
+                // the slot is occupied). commit() -> the deferred-reclaim
+                // policy keeps the id from being recycled into a future
+                // caller's reserve, which would let an unrelated Inject
+                // collide.
+                auto it = coreSurfaceReservations_.find(p.surfaceBufId);
+                if (it != coreSurfaceReservations_.end()) {
+                    it->second.commit();
+                    coreSurfaceReservations_.erase(it);
+                }
+            }
+            return;
+        }
         if (kind == ipc::FrameKind::ScanoutRebuild) {
             // The GPU process has torn down the named output's ring at new
             // dims and needs a fresh ScanoutReserve. Clear our prior
@@ -535,29 +565,28 @@ uint32_t Compositor::importDmabufForJs(int fd, uint32_t width, uint32_t height,
 void Compositor::releaseDmabufImport(uint32_t importId) {
     auto it = jsImportHandles_.find(importId);
     if (it == jsImportHandles_.end()) return;
-    ipc::Message m{};
-    m.tag = ipc::Tag::ReleaseClientTex;
-    m.texture = {it->second.id, it->second.generation};
-    // Cross-channel ordering serial: the per-frame BeginClientAccess/EndAccess
-    // brackets for this handle travel the WIRE; this release travels the CTRL
-    // channel. A bracket may still be in the wire pipeline. Sample the wire
-    // write cursor so the GPU process holds the erase until its wire reader has
-    // drained past every bracket written before this release -- otherwise a
-    // pending Begin would find the texture already gone. (The brackets are
-    // appended frames, already counted by wireBytesQueued(); no flush needed.)
-    m.wireSerial = link_->wireBytesQueued();
-    ctrlSender_->send(m);
+    // Wire-FIFO with the per-frame BeginAccess/EndAccess brackets for this
+    // handle (also kind=1/kind=2 frames on the same wire): by the time the
+    // GPU's wire reader sees this release, every bracket the core wrote
+    // before it has already been decoded. No wireSerial workaround needed.
+    ipc::ReleaseClientTexPayload p{{it->second.id, it->second.generation}};
+    uint8_t buf[ipc::ReleaseClientTexPayload::kSize];
+    p.encode(buf);
+    link_->appendFrame(ipc::FrameKind::ReleaseClientTex, buf, sizeof(buf));
     jsImportHandles_.erase(it);
 }
 
 void Compositor::releaseSurfaceBuf(uint32_t surfaceBufId) {
-    // Tell the GPU process to destroy the slot's surfaceBuf (end brackets, drop
-    // STM/textures/fences, release the dmabuf). The caller (JS gpu-broker) has
-    // already gated this on the consumer's GPU read completing.
-    ipc::Message m{};
-    m.tag = ipc::Tag::ReleaseSurfaceBuf;
-    m.surfaceBufId = surfaceBufId;
-    ctrlSender_->send(m);
+    // Tell the GPU process to destroy the surfaceBuf (end brackets, drop
+    // STM/textures/fences, release the dmabuf). The caller (JS gpu-broker)
+    // has already gated this on the consumer's GPU read completing. Wire-
+    // FIFO with the producer/consumer Begin/End brackets for this buf
+    // (also on wire), so the GPU's wire reader has decoded any in-flight
+    // bracket before the destroy runs.
+    ipc::ReleaseSurfaceBufPayload p{surfaceBufId};
+    uint8_t buf[ipc::ReleaseSurfaceBufPayload::kSize];
+    p.encode(buf);
+    link_->appendFrame(ipc::FrameKind::ReleaseSurfaceBuf, buf, sizeof(buf));
     // The reservation was PUBLISHED to the GPU process (which InjectTexture'd
     // it server-side). commit() it -- the deferred-reclaim policy keeps the
     // wire id from being recycled even after we drop our bookkeeping. See
@@ -742,27 +771,10 @@ void Compositor::drainCtrl() {
             pluginInstanceInjected_[r.connId] = r.ok ? 1 : 2;
             continue;
         }
-        if (r.tag == ipc::Tag::SurfaceBufAllocated) {
-            surfaceBufAllocated_[r.surfaceBufId] = r.ok ? 1 : 2;
-            if (!r.ok) {
-                // The GPU process REACHED InjectTexture and it failed. Its
-                // WireServer may already have a partial registration at our
-                // reserved id (Dawn's wire-server state on a failed Inject is
-                // not contractually defined, so we conservatively assume the
-                // slot is occupied). commit() -> the deferred-reclaim policy
-                // keeps the id from being recycled into a future caller's
-                // reserve, which would let an unrelated Inject collide.
-                auto it = coreSurfaceReservations_.find(r.surfaceBufId);
-                if (it != coreSurfaceReservations_.end()) {
-                    it->second.commit();
-                    coreSurfaceReservations_.erase(it);
-                }
-            }
-            continue;
-        }
-        // ClientTexImported now arrives in-band on the wire (kind=4), routed
-        // through onClientTexImported via the WireLink inbound handler. Any
-        // other tag here is ignored.
+        // SurfaceBufAllocated and ClientTexImported now arrive in-band on
+        // the wire (FrameKind::SurfaceBufAllocated / ClientTexImported),
+        // routed through setInboundFrameHandler in the ctor. Any other tag
+        // here is ignored.
     }
 }
 
@@ -836,27 +848,31 @@ Compositor::CoreSurfaceReservation Compositor::reserveCoreComposeTexture(
     return out;
 }
 
-// Shared message builder for AllocSurfaceBuf / AllocComposeBuf.
-static void buildAllocMessage(ipc::Message& m, ipc::Tag tag,
-                              uint32_t surfaceBufId, uint32_t connId,
-                              uint32_t width, uint32_t height,
-                              Compositor::ReservedHandle pluginDevice,
-                              Compositor::ReservedHandle pluginTexture,
-                              Compositor::ReservedHandle coreDevice,
-                              Compositor::ReservedHandle coreTexture,
-                              uint64_t pluginReservePointSerial,
-                              uint64_t coreReservePointSerial) {
-    m.tag = tag;
-    m.surfaceBufId = surfaceBufId;
-    m.connId = connId;
-    m.width = width;
-    m.height = height;
-    m.pluginDevice = {pluginDevice.id, pluginDevice.generation};
-    m.pluginTexture = {pluginTexture.id, pluginTexture.generation};
-    m.device = {coreDevice.id, coreDevice.generation};
-    m.texture = {coreTexture.id, coreTexture.generation};
-    m.reservePointSerial = pluginReservePointSerial;
-    m.wireSerial = coreReservePointSerial;
+// Shared wire-frame builder for AllocSurfaceBuf / AllocComposeBuf.
+// FrameKind discriminates direction; payload shape is identical.
+void Compositor::appendAllocFrame(ipc::FrameKind kind,
+                                  uint32_t surfaceBufId, uint32_t connId,
+                                  uint32_t width, uint32_t height,
+                                  ReservedHandle pluginDevice,
+                                  ReservedHandle pluginTexture,
+                                  ReservedHandle coreDevice,
+                                  ReservedHandle coreTexture,
+                                  uint64_t pluginReservePointSerial,
+                                  uint64_t coreReservePointSerial) {
+    ipc::AllocSurfaceBufPayload p{};
+    p.surfaceBufId       = surfaceBufId;
+    p.connId             = connId;
+    p.width              = width;
+    p.height             = height;
+    p.pluginDevice       = {pluginDevice.id, pluginDevice.generation};
+    p.pluginTexture      = {pluginTexture.id, pluginTexture.generation};
+    p.coreDevice         = {coreDevice.id, coreDevice.generation};
+    p.coreTexture        = {coreTexture.id, coreTexture.generation};
+    p.reservePointSerial = pluginReservePointSerial;
+    p.wireSerial         = coreReservePointSerial;
+    uint8_t buf[ipc::AllocSurfaceBufPayload::kSize];
+    p.encode(buf);
+    link_->appendFrame(kind, buf, sizeof(buf));
 }
 
 void Compositor::sendAllocSurfaceBuf(uint32_t surfaceBufId, uint32_t connId,
@@ -865,11 +881,9 @@ void Compositor::sendAllocSurfaceBuf(uint32_t surfaceBufId, uint32_t connId,
                                      ReservedHandle coreDevice, ReservedHandle coreTexture,
                                      uint64_t pluginReservePointSerial,
                                      uint64_t coreReservePointSerial) {
-    ipc::Message m{};
-    buildAllocMessage(m, ipc::Tag::AllocSurfaceBuf, surfaceBufId, connId,
+    appendAllocFrame(ipc::FrameKind::AllocSurfaceBuf, surfaceBufId, connId,
         width, height, pluginDevice, pluginTexture, coreDevice, coreTexture,
         pluginReservePointSerial, coreReservePointSerial);
-    ctrlSender_->send(m);
 }
 
 void Compositor::sendAllocComposeBuf(uint32_t surfaceBufId, uint32_t connId,
@@ -878,11 +892,9 @@ void Compositor::sendAllocComposeBuf(uint32_t surfaceBufId, uint32_t connId,
                                      ReservedHandle coreDevice, ReservedHandle coreTexture,
                                      uint64_t pluginReservePointSerial,
                                      uint64_t coreReservePointSerial) {
-    ipc::Message m{};
-    buildAllocMessage(m, ipc::Tag::AllocComposeBuf, surfaceBufId, connId,
+    appendAllocFrame(ipc::FrameKind::AllocComposeBuf, surfaceBufId, connId,
         width, height, pluginDevice, pluginTexture, coreDevice, coreTexture,
         pluginReservePointSerial, coreReservePointSerial);
-    ctrlSender_->send(m);
 }
 
 int Compositor::surfaceBufAllocated(uint32_t surfaceBufId) const {

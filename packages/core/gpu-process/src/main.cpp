@@ -1404,6 +1404,193 @@ int run(int wireFd, int ctrlFd, int inputFd, bool headless,
         }
     };
 
+    // Shared AllocSurfaceBuf / AllocComposeBuf handler. Allocates ONE GBM dmabuf;
+    // imports it as SharedTextureMemory on both the plugin device and the core
+    // device; injects a wire texture at each side's reserved handle; replies
+    // SurfaceBufAllocated.
+    //
+    // The two directions:
+    //   producerOnCore=false (AllocSurfaceBuf):
+    //     pluginDevice/pluginTexture = producer (on plugin wire)
+    //     device/texture             = consumer (on core wire)
+    //     reservePointSerial gates the producer inject on the plugin wire;
+    //     wireSerial gates the consumer inject on the core wire.
+    //
+    //   producerOnCore=true (AllocComposeBuf):
+    //     device/texture             = producer (on core wire)
+    //     pluginDevice/pluginTexture = consumer (on plugin wire)
+    //     wireSerial gates the producer inject on the core wire;
+    //     reservePointSerial gates the consumer inject on the plugin wire.
+    //
+    // The barrier serials use the same fields in both directions; only their
+    // role labels swap. The producer always rides the producer-device's wire
+    // and the consumer always rides the consumer-device's wire, by definition.
+    // Helper: send a SurfaceBufAllocated reply over the wire (FIFO with the
+    // outgoing Dawn injection commands the alloc just appended, so any
+    // ProducerBegin / ConsumerBegin the core writes after seeing this reply
+    // is FIFO-after the surfaceBufs map insert).
+    auto sendSurfaceBufAllocated = [&serializer](uint32_t surfaceBufId,
+                                                  uint32_t connId, bool ok) {
+        ipc::SurfaceBufAllocatedPayload reply{};
+        reply.surfaceBufId = surfaceBufId;
+        reply.connId       = connId;
+        reply.ok           = ok ? 1 : 0;
+        uint8_t buf[ipc::SurfaceBufAllocatedPayload::kSize];
+        reply.encode(buf);
+        serializer.appendFrame(ipc::FrameKind::SurfaceBufAllocated, buf, sizeof(buf));
+    };
+
+    auto allocSurfaceBufImpl = [&](const ipc::AllocSurfaceBufPayload& m,
+                                    bool producerOnCore) {
+        // Identify the plugin connection that owns the plugin-side device, in
+        // both directions: the surface buffer is associated with one plugin
+        // (connId) regardless of which side produces.
+        PluginConn* pc = nullptr;
+        for (auto& c : pluginConns) if (c->connId == m.connId) { pc = c.get(); break; }
+
+        // Resolve the producer and consumer devices according to producerOnCore.
+        WGPUDevice producerNative = nullptr;
+        WGPUDevice consumerNative = nullptr;
+        if (producerOnCore) {
+            producerNative = server.GetDevice(m.coreDevice.id, m.coreDevice.generation);
+            consumerNative = pc ?
+                pc->server->GetDevice(m.pluginDevice.id, m.pluginDevice.generation) : nullptr;
+        } else {
+            producerNative = pc ?
+                pc->server->GetDevice(m.pluginDevice.id, m.pluginDevice.generation) : nullptr;
+            consumerNative = server.GetDevice(m.coreDevice.id, m.coreDevice.generation);
+        }
+        const char* tagName = producerOnCore ? "AllocComposeBuf" : "AllocSurfaceBuf";
+        if (!pc || !producerNative || !consumerNative) {
+            std::fprintf(stderr, "[gpu] %s: device resolve failed "
+                         "(pc=%d producer=%p consumer=%p)\n", tagName, pc ? 1 : 0,
+                         static_cast<void*>(producerNative),
+                         static_cast<void*>(consumerNative));
+            sendSurfaceBufAllocated(m.surfaceBufId, m.connId, false);
+            return;
+        }
+        // The plugin connection always needs a ticked device (its own queue
+        // advances mapAsync / onSubmittedWorkDone there). For the consumer-on-
+        // plugin direction, the plugin's device still needs ticking because
+        // BeginAccess/EndAccess on the consumer side rides its queue.
+        if (!pc->tickDev) {
+            pc->tickDev = producerOnCore ? consumerNative : producerNative;
+        }
+
+        SurfaceBuf sb{};
+        wgpu::Device producerDev(producerNative);
+        wgpu::Device consumerDev(consumerNative);
+        bool ok = alloc.allocate(m.width, m.height, sb.buf);
+        if (ok) ok = gpu::Allocator::importTexture(
+            producerDev, alloc.fourcc(), sb.buf, sb.producerMem, sb.producerTex);
+        if (ok) ok = gpu::Allocator::importTexture(
+            consumerDev, alloc.fourcc(), sb.buf, sb.consumerMem, sb.consumerTex);
+        if (!ok) {
+            std::fprintf(stderr, "[gpu] %s id=%u: alloc/import failed\n",
+                         tagName, m.surfaceBufId);
+            alloc.release(sb.buf);
+            sendSurfaceBufAllocated(m.surfaceBufId, m.connId, false);
+            return;
+        }
+        // Stage the SurfaceBuf NOW (its textures/STMs are imported on both
+        // devices). The deferred injects move it into surfaceBufs once both
+        // are in. The shared state below counts down the two sides; the
+        // second one that runs fires the reply.
+        sb.producerOnCore = producerOnCore;
+        sb.producerDev = producerDev;
+        sb.consumerDev = consumerDev;
+        sb.connId = m.connId;
+        struct InjectState {
+            ipc::AllocSurfaceBufPayload msg;
+            bool producerOnCore = false;
+            SurfaceBuf sb;
+            int remaining = 2;
+            bool producerOk = false;
+            bool consumerOk = false;
+        };
+        auto state = std::make_shared<InjectState>();
+        state->msg = m;
+        state->producerOnCore = producerOnCore;
+        state->sb = std::move(sb);
+        auto finalize = [&surfaceBufs, &alloc, &serializer, sendSurfaceBufAllocated,
+                         state, tagName]() {
+            const bool ok = state->producerOk && state->consumerOk;
+            if (ok) {
+                std::printf("[gpu] %s id=%u %ux%u: imported on producer+consumer, injected\n",
+                            tagName, state->msg.surfaceBufId,
+                            state->msg.width, state->msg.height);
+                surfaceBufs[state->msg.surfaceBufId] = std::move(state->sb);
+                serializer.Flush();
+            } else {
+                std::fprintf(stderr, "[gpu] %s id=%u: inject failed (p=%d c=%d)\n",
+                             tagName, state->msg.surfaceBufId,
+                             static_cast<int>(state->producerOk),
+                             static_cast<int>(state->consumerOk));
+                state->sb.producerTex = nullptr;
+                state->sb.producerMem = nullptr;
+                state->sb.consumerTex = nullptr;
+                state->sb.consumerMem = nullptr;
+                alloc.release(state->sb.buf);
+            }
+            sendSurfaceBufAllocated(state->msg.surfaceBufId, state->msg.connId, ok);
+        };
+        // The two injects go on the wires their target device lives on. The
+        // serial each waits for is the reserve-point on that wire.
+        //   producerOnCore=false: producer on plugin wire, consumer on core wire.
+        //   producerOnCore=true:  producer on core wire, consumer on plugin wire.
+        const uint64_t producerSerial = producerOnCore ? m.wireSerial : m.reservePointSerial;
+        const uint64_t consumerSerial = producerOnCore ? m.reservePointSerial : m.wireSerial;
+
+        auto doProducerInject = [pc, &server, &serializer, state, finalize]() {
+            const auto& msg = state->msg;
+            if (state->producerOnCore) {
+                state->producerOk = server.InjectTexture(
+                    state->sb.producerTex.Get(),
+                    {msg.coreTexture.id, msg.coreTexture.generation},
+                    {msg.coreDevice.id, msg.coreDevice.generation});
+                if (state->producerOk) serializer.Flush();
+            } else {
+                state->producerOk = pc->server->InjectTexture(
+                    state->sb.producerTex.Get(),
+                    {msg.pluginTexture.id, msg.pluginTexture.generation},
+                    {msg.pluginDevice.id, msg.pluginDevice.generation});
+                if (state->producerOk) pc->serializer->Flush();
+            }
+            if (--state->remaining == 0) finalize();
+        };
+        auto doConsumerInject = [pc, &server, &serializer, state, finalize]() {
+            const auto& msg = state->msg;
+            if (state->producerOnCore) {
+                state->consumerOk = pc->server->InjectTexture(
+                    state->sb.consumerTex.Get(),
+                    {msg.pluginTexture.id, msg.pluginTexture.generation},
+                    {msg.pluginDevice.id, msg.pluginDevice.generation});
+                if (state->consumerOk) pc->serializer->Flush();
+            } else {
+                state->consumerOk = server.InjectTexture(
+                    state->sb.consumerTex.Get(),
+                    {msg.coreTexture.id, msg.coreTexture.generation},
+                    {msg.coreDevice.id, msg.coreDevice.generation});
+                if (state->consumerOk) serializer.Flush();
+            }
+            if (--state->remaining == 0) finalize();
+        };
+
+        // Schedule injects on each side's barrier.
+        if (producerOnCore) {
+            coreWireBarrier.after(
+                producerSerial, doProducerInject, wireReader.bytesConsumed());
+            pc->barrier.after(
+                consumerSerial, doConsumerInject,
+                pc->reader->bytesConsumed(), allocSurfaceBufTag(m.surfaceBufId));
+        } else {
+            pc->barrier.after(
+                producerSerial, doProducerInject,
+                pc->reader->bytesConsumed(), allocSurfaceBufTag(m.surfaceBufId));
+            coreWireBarrier.after(
+                consumerSerial, doConsumerInject, wireReader.bytesConsumed());
+        }
+    };
     // In-band core-wire control-frame dispatch (kind=1 BeginAccess / kind=2
     // EndAccess). The frame is FIFO-ordered against the Dawn (kind=0) commands
     // around it: a kind=1 written before the sample's kind=0 batch is processed
@@ -1557,6 +1744,109 @@ int run(int wireFd, int ctrlFd, int inputFd, bool headless,
             runImport(m, fds[0]);
             return;
         }
+        if (kind == ipc::FrameKind::ReleaseClientTex) {
+            // Release a JS-compositor dmabuf import: drop the STM + close
+            // the fd. Wire-FIFO with the per-frame BeginAccess/EndAccess
+            // brackets for this handle (also wire frames), so every
+            // bracket the core wrote before this release has already been
+            // decoded by here -- no wireSerial workaround needed.
+            if (nfds != 0) {
+                std::fprintf(stderr,
+                    "[gpu] core wire: ReleaseClientTex with nfds=%d (must be 0)\n", nfds);
+                std::abort();
+            }
+            if (frame.size() != ipc::ReleaseClientTexPayload::kSize) {
+                std::fprintf(stderr,
+                    "[gpu] core wire: bad ReleaseClientTex payload size %zu\n",
+                    frame.size());
+                std::abort();
+            }
+            auto p = ipc::ReleaseClientTexPayload::decode(frame.data());
+            auto it = clientTextures.find(p.texture.id);
+            if (it == clientTextures.end() || it->second.generation != p.texture.generation) {
+                return;  // already recycled into a newer import
+            }
+            ClientTex& ct = it->second;
+            // Defensive: end a still-open bracket. Shouldn't happen now
+            // that the erase waits for the wire to drain past the
+            // brackets, but covers a misbehaved core.
+            if (ct.accessOpen) {
+                wgpu::SharedTextureMemoryVkImageLayoutEndState endLayout{};
+                wgpu::SharedTextureMemoryEndAccessState endState{};
+                endState.nextInChain = &endLayout;
+                (void)ct.mem.EndAccess(ct.tex, &endState);
+                ct.accessOpen = false;
+            }
+            if (ct.fd >= 0) ::close(ct.fd);
+            clientTextures.erase(it);
+            return;
+        }
+        if (kind == ipc::FrameKind::AllocSurfaceBuf
+            || kind == ipc::FrameKind::AllocComposeBuf) {
+            if (nfds != 0) {
+                std::fprintf(stderr,
+                    "[gpu] core wire: Alloc*Buf with nfds=%d (must be 0)\n", nfds);
+                std::abort();
+            }
+            if (frame.size() != ipc::AllocSurfaceBufPayload::kSize) {
+                std::fprintf(stderr,
+                    "[gpu] core wire: bad AllocSurfaceBuf payload size %zu\n",
+                    frame.size());
+                std::abort();
+            }
+            auto p = ipc::AllocSurfaceBufPayload::decode(frame.data());
+            const bool producerOnCore = (kind == ipc::FrameKind::AllocComposeBuf);
+            allocSurfaceBufImpl(p, producerOnCore);
+            return;
+        }
+        if (kind == ipc::FrameKind::ReleaseSurfaceBuf) {
+            // Destroy a surfaceBuf -- end any still-open access bracket
+            // before dropping the SharedTextureMemory + textures + fences
+            // + dmabuf. Wire-FIFO with the producer/consumer Begin/End
+            // brackets for this buf (also wire frames), so any in-flight
+            // bracket is already decoded by here.
+            if (nfds != 0) {
+                std::fprintf(stderr,
+                    "[gpu] core wire: ReleaseSurfaceBuf with nfds=%d (must be 0)\n", nfds);
+                std::abort();
+            }
+            if (frame.size() != ipc::ReleaseSurfaceBufPayload::kSize) {
+                std::fprintf(stderr,
+                    "[gpu] core wire: bad ReleaseSurfaceBuf payload size %zu\n",
+                    frame.size());
+                std::abort();
+            }
+            auto p = ipc::ReleaseSurfaceBufPayload::decode(frame.data());
+            auto it = surfaceBufs.find(p.surfaceBufId);
+            if (it != surfaceBufs.end()) {
+                SurfaceBuf& sb = it->second;
+                // Drop any deferred AllocSurfaceBuf inject for this buf on
+                // the owning plugin conn's barrier (its wire serial may
+                // never arrive now; a yet-to-run alloc inject would target
+                // a surfaceBuf we're tearing down). Producer/consumer End
+                // are wire-FIFO so they've already drained.
+                PluginConn* pc = nullptr;
+                for (auto& c : pluginConns)
+                    if (c->connId == sb.connId) { pc = c.get(); break; }
+                if (pc) {
+                    const auto aTag = allocSurfaceBufTag(p.surfaceBufId);
+                    pc->barrier.cancel([aTag](ipc::WireBarrier::Tag t) {
+                        return t == aTag;
+                    });
+                }
+                if (sb.producerOpen) runSurfaceEnd(p.surfaceBufId, true);
+                if (sb.consumerOpen) runSurfaceEnd(p.surfaceBufId, false);
+                sb.producerFence = nullptr;
+                sb.consumerFence = nullptr;
+                sb.producerTex = nullptr;
+                sb.consumerTex = nullptr;
+                sb.producerMem = nullptr;
+                sb.consumerMem = nullptr;
+                alloc.release(sb.buf);  // closes the dmabuf fd + GBM bo
+                surfaceBufs.erase(it);
+            }
+            return;
+        }
         auto variant = static_cast<ipc::AccessVariant>(frame[0]);
         if (variant == ipc::AccessVariant::ClientTex) {
             if (frame.size() != ipc::ClientTexAccessPayload::kSize) {
@@ -1666,191 +1956,6 @@ int run(int wireFd, int ctrlFd, int inputFd, bool headless,
         coreWireBarrier.drain(wireReader.bytesConsumed());
     };
 
-    // Shared AllocSurfaceBuf / AllocComposeBuf handler. Allocates ONE GBM dmabuf;
-    // imports it as SharedTextureMemory on both the plugin device and the core
-    // device; injects a wire texture at each side's reserved handle; replies
-    // SurfaceBufAllocated.
-    //
-    // The two directions:
-    //   producerOnCore=false (AllocSurfaceBuf):
-    //     pluginDevice/pluginTexture = producer (on plugin wire)
-    //     device/texture             = consumer (on core wire)
-    //     reservePointSerial gates the producer inject on the plugin wire;
-    //     wireSerial gates the consumer inject on the core wire.
-    //
-    //   producerOnCore=true (AllocComposeBuf):
-    //     device/texture             = producer (on core wire)
-    //     pluginDevice/pluginTexture = consumer (on plugin wire)
-    //     wireSerial gates the producer inject on the core wire;
-    //     reservePointSerial gates the consumer inject on the plugin wire.
-    //
-    // The barrier serials use the same fields in both directions; only their
-    // role labels swap. The producer always rides the producer-device's wire
-    // and the consumer always rides the consumer-device's wire, by definition.
-    auto allocSurfaceBufImpl = [&](const ipc::Message& m, bool producerOnCore) {
-        // Identify the plugin connection that owns the plugin-side device, in
-        // both directions: the surface buffer is associated with one plugin
-        // (connId) regardless of which side produces.
-        PluginConn* pc = nullptr;
-        for (auto& c : pluginConns) if (c->connId == m.connId) { pc = c.get(); break; }
-
-        // Resolve the producer and consumer devices according to producerOnCore.
-        WGPUDevice producerNative = nullptr;
-        WGPUDevice consumerNative = nullptr;
-        if (producerOnCore) {
-            producerNative = server.GetDevice(m.device.id, m.device.generation);
-            consumerNative = pc ?
-                pc->server->GetDevice(m.pluginDevice.id, m.pluginDevice.generation) : nullptr;
-        } else {
-            producerNative = pc ?
-                pc->server->GetDevice(m.pluginDevice.id, m.pluginDevice.generation) : nullptr;
-            consumerNative = server.GetDevice(m.device.id, m.device.generation);
-        }
-        const char* tagName = producerOnCore ? "AllocComposeBuf" : "AllocSurfaceBuf";
-        if (!pc || !producerNative || !consumerNative) {
-            std::fprintf(stderr, "[gpu] %s: device resolve failed "
-                         "(pc=%d producer=%p consumer=%p)\n", tagName, pc ? 1 : 0,
-                         static_cast<void*>(producerNative),
-                         static_cast<void*>(consumerNative));
-            ipc::Message reply{};
-            reply.tag = ipc::Tag::SurfaceBufAllocated;
-            reply.surfaceBufId = m.surfaceBufId;
-            reply.connId = m.connId;
-            reply.ok = 0;
-            ctrlSender.send(reply);
-            return;
-        }
-        // The plugin connection always needs a ticked device (its own queue
-        // advances mapAsync / onSubmittedWorkDone there). For the consumer-on-
-        // plugin direction, the plugin's device still needs ticking because
-        // BeginAccess/EndAccess on the consumer side rides its queue.
-        if (!pc->tickDev) {
-            pc->tickDev = producerOnCore ? consumerNative : producerNative;
-        }
-
-        SurfaceBuf sb{};
-        wgpu::Device producerDev(producerNative);
-        wgpu::Device consumerDev(consumerNative);
-        bool ok = alloc.allocate(m.width, m.height, sb.buf);
-        if (ok) ok = gpu::Allocator::importTexture(
-            producerDev, alloc.fourcc(), sb.buf, sb.producerMem, sb.producerTex);
-        if (ok) ok = gpu::Allocator::importTexture(
-            consumerDev, alloc.fourcc(), sb.buf, sb.consumerMem, sb.consumerTex);
-        if (!ok) {
-            std::fprintf(stderr, "[gpu] %s id=%u: alloc/import failed\n",
-                         tagName, m.surfaceBufId);
-            alloc.release(sb.buf);
-            ipc::Message reply{};
-            reply.tag = ipc::Tag::SurfaceBufAllocated;
-            reply.surfaceBufId = m.surfaceBufId;
-            reply.connId = m.connId;
-            reply.ok = 0;
-            ctrlSender.send(reply);
-            return;
-        }
-        // Stage the SurfaceBuf NOW (its textures/STMs are imported on both
-        // devices). The deferred injects move it into surfaceBufs once both
-        // are in. The shared state below counts down the two sides; the
-        // second one that runs fires the reply.
-        sb.producerOnCore = producerOnCore;
-        sb.producerDev = producerDev;
-        sb.consumerDev = consumerDev;
-        sb.connId = m.connId;
-        struct InjectState {
-            ipc::Message msg;
-            bool producerOnCore = false;
-            SurfaceBuf sb;
-            int remaining = 2;
-            bool producerOk = false;
-            bool consumerOk = false;
-        };
-        auto state = std::make_shared<InjectState>();
-        state->msg = m;
-        state->producerOnCore = producerOnCore;
-        state->sb = std::move(sb);
-        auto finalize = [&surfaceBufs, &alloc, &serializer, &ctrlSender, state, tagName]() {
-            ipc::Message reply{};
-            reply.tag = ipc::Tag::SurfaceBufAllocated;
-            reply.surfaceBufId = state->msg.surfaceBufId;
-            reply.connId = state->msg.connId;
-            const bool ok = state->producerOk && state->consumerOk;
-            reply.ok = ok ? 1 : 0;
-            if (ok) {
-                std::printf("[gpu] %s id=%u %ux%u: imported on producer+consumer, injected\n",
-                            tagName, state->msg.surfaceBufId,
-                            state->msg.width, state->msg.height);
-                surfaceBufs[state->msg.surfaceBufId] = std::move(state->sb);
-                serializer.Flush();
-            } else {
-                std::fprintf(stderr, "[gpu] %s id=%u: inject failed (p=%d c=%d)\n",
-                             tagName, state->msg.surfaceBufId,
-                             static_cast<int>(state->producerOk),
-                             static_cast<int>(state->consumerOk));
-                state->sb.producerTex = nullptr;
-                state->sb.producerMem = nullptr;
-                state->sb.consumerTex = nullptr;
-                state->sb.consumerMem = nullptr;
-                alloc.release(state->sb.buf);
-            }
-            ctrlSender.send(reply);
-        };
-        // The two injects go on the wires their target device lives on. The
-        // serial each waits for is the reserve-point on that wire.
-        //   producerOnCore=false: producer on plugin wire, consumer on core wire.
-        //   producerOnCore=true:  producer on core wire, consumer on plugin wire.
-        const uint32_t producerSerial = producerOnCore ? m.wireSerial : m.reservePointSerial;
-        const uint32_t consumerSerial = producerOnCore ? m.reservePointSerial : m.wireSerial;
-
-        auto doProducerInject = [pc, &server, &serializer, state, finalize]() {
-            const auto& msg = state->msg;
-            if (state->producerOnCore) {
-                state->producerOk = server.InjectTexture(
-                    state->sb.producerTex.Get(),
-                    {msg.texture.id, msg.texture.generation},
-                    {msg.device.id, msg.device.generation});
-                if (state->producerOk) serializer.Flush();
-            } else {
-                state->producerOk = pc->server->InjectTexture(
-                    state->sb.producerTex.Get(),
-                    {msg.pluginTexture.id, msg.pluginTexture.generation},
-                    {msg.pluginDevice.id, msg.pluginDevice.generation});
-                if (state->producerOk) pc->serializer->Flush();
-            }
-            if (--state->remaining == 0) finalize();
-        };
-        auto doConsumerInject = [pc, &server, &serializer, state, finalize]() {
-            const auto& msg = state->msg;
-            if (state->producerOnCore) {
-                state->consumerOk = pc->server->InjectTexture(
-                    state->sb.consumerTex.Get(),
-                    {msg.pluginTexture.id, msg.pluginTexture.generation},
-                    {msg.pluginDevice.id, msg.pluginDevice.generation});
-                if (state->consumerOk) pc->serializer->Flush();
-            } else {
-                state->consumerOk = server.InjectTexture(
-                    state->sb.consumerTex.Get(),
-                    {msg.texture.id, msg.texture.generation},
-                    {msg.device.id, msg.device.generation});
-                if (state->consumerOk) serializer.Flush();
-            }
-            if (--state->remaining == 0) finalize();
-        };
-
-        // Schedule injects on each side's barrier.
-        if (producerOnCore) {
-            coreWireBarrier.after(
-                producerSerial, doProducerInject, wireReader.bytesConsumed());
-            pc->barrier.after(
-                consumerSerial, doConsumerInject,
-                pc->reader->bytesConsumed(), allocSurfaceBufTag(m.surfaceBufId));
-        } else {
-            pc->barrier.after(
-                producerSerial, doProducerInject,
-                pc->reader->bytesConsumed(), allocSurfaceBufTag(m.surfaceBufId));
-            coreWireBarrier.after(
-                consumerSerial, doConsumerInject, wireReader.bytesConsumed());
-        }
-    };
 
     // Control-message dispatch. Returns false if the core requested shutdown.
     auto dispatchCtrl = [&](const ipc::Message& m, int* recvFds, int nRecvFds) -> void {
@@ -2011,82 +2116,10 @@ int run(int wireFd, int ctrlFd, int inputFd, bool headless,
                         std::fprintf(stderr, "[gpu] SetPluginTickDevice: GetDevice null connId=%u\n", m.connId);
                     }
                 }
-            } else if (m.tag == ipc::Tag::AllocSurfaceBuf) {
-                // Plugin produces, core consumes. See allocSurfaceBufImpl above
-                // for the shared shape; this just picks the direction.
-                allocSurfaceBufImpl(m, /*producerOnCore=*/false);
-            } else if (m.tag == ipc::Tag::AllocComposeBuf) {
-                // Core produces (sdk.compose result), plugin consumes. Same
-                // allocate-and-import machinery as AllocSurfaceBuf but with
-                // producer/consumer roles swapped.
-                allocSurfaceBufImpl(m, /*producerOnCore=*/true);
-            } else if (m.tag == ipc::Tag::ReleaseSurfaceBuf) {
-                 // Destroy a ring slot's surfaceBuf. The core sends this only after it
-                 // has gated on its own GPU read completing (afterCurrentFrame), so no
-                 // consumer read is in flight. End any still-open access bracket before
-                 // dropping the SharedTextureMemory + textures + fences + dmabuf, or
-                 // EndAccess/teardown would race an open bracket.
-                 auto it = surfaceBufs.find(m.surfaceBufId);
-                if (it != surfaceBufs.end()) {
-                    SurfaceBuf& sb = it->second;
-                    // Drop any deferred AllocSurfaceBuf inject for this buf on the
-                    // owning plugin conn's barrier (its wire serial may never
-                    // arrive now; a yet-to-run alloc inject would target a
-                    // surfaceBuf we're tearing down). Producer/consumer End are
-                    // in-band on the wire now, not deferred ctrl ops.
-                    PluginConn* pc = nullptr;
-                    for (auto& c : pluginConns)
-                        if (c->connId == sb.connId) { pc = c.get(); break; }
-                    if (pc) {
-                        const auto aTag = allocSurfaceBufTag(m.surfaceBufId);
-                        pc->barrier.cancel([aTag](ipc::WireBarrier::Tag t) {
-                            return t == aTag;
-                        });
-                    }
-                    if (sb.producerOpen) runSurfaceEnd(m.surfaceBufId, true);
-                    if (sb.consumerOpen) runSurfaceEnd(m.surfaceBufId, false);
-                    sb.producerFence = nullptr;
-                    sb.consumerFence = nullptr;
-                    sb.producerTex = nullptr;
-                    sb.consumerTex = nullptr;
-                    sb.producerMem = nullptr;
-                    sb.consumerMem = nullptr;
-                    alloc.release(sb.buf);     // closes the dmabuf fd + GBM bo
-                    surfaceBufs.erase(it);
-                }
-            } else if (m.tag == ipc::Tag::ReleaseClientTex) {
-                // Release a JS-compositor dmabuf import: drop the STM + close the
-                // fd. The per-frame BeginClientAccess/EndAccess brackets for this
-                // handle travel the WIRE; this release came over the CTRL channel,
-                // so a bracket may still be unread in the wire pipeline. Gate the
-                // erase on the core wire reader catching up past m.wireSerial (the
-                // write cursor the core sampled at release time) so a pending Begin
-                // still finds the texture. If the reader is already past it, the
-                // barrier runs the erase synchronously (the common case).
-                const ipc::WireHandle tex = m.texture;
-                coreWireBarrier.after(
-                    m.wireSerial,
-                    [&clientTextures, tex]() {
-                        auto it = clientTextures.find(tex.id);
-                        if (it == clientTextures.end() || it->second.generation != tex.generation) {
-                            return;  // already recycled into a newer import
-                        }
-                        ClientTex& ct = it->second;
-                        // Defensive: end a still-open bracket so the STM destructor
-                        // doesn't run with a live access (should not happen now that
-                        // the erase waits for the wire to drain past the brackets).
-                        if (ct.accessOpen) {
-                            wgpu::SharedTextureMemoryVkImageLayoutEndState endLayout{};
-                            wgpu::SharedTextureMemoryEndAccessState endState{};
-                            endState.nextInChain = &endLayout;
-                            (void)ct.mem.EndAccess(ct.tex, &endState);
-                            ct.accessOpen = false;
-                        }
-                        if (ct.fd >= 0) ::close(ct.fd);
-                        clientTextures.erase(it);
-                    },
-                    wireReader.bytesConsumed());
             }
+            // AllocSurfaceBuf / AllocComposeBuf / ReleaseSurfaceBuf /
+            // ReleaseClientTex now ride the WIRE socket as FrameKind
+            // frames (transport.h); see dispatchCoreControlFrame above.
         }
     };
 

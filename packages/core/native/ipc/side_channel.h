@@ -28,13 +28,17 @@ enum class Tag : uint8_t {
     ImportClientTex = 'M',  // core -> gpu : import a CLIENT dmabuf fd (SCM_RIGHTS) into
                             //              a texture at the reserved handle
     ClientTexImported = 'm',  // gpu -> core: client dmabuf imported + injected (or failed)
-    ReleaseClientTex = 'r',   // core -> gpu : release a client-dmabuf import (texture =
-                              //              {id,generation}); GPU drops the STM + fd if
-                              //              the entry's generation still matches.
     // The per-frame CLIENT-dmabuf BeginAccess/EndAccess bracket is multiplexed
     // in-band on the WIRE socket as a kind=1/kind=2 frame (see transport.h
     // FrameKind + ClientTexAccessPayload below), FIFO-ordered against the Dawn
     // sample commands -- no ctrl round-trip, no WireBarrier.
+    //
+    // Likewise the surface-buffer alloc/release and client-texture release tags
+    // now ride the WIRE socket (FrameKind::AllocSurfaceBuf / AllocComposeBuf /
+    // SurfaceBufAllocated / ReleaseSurfaceBuf / ReleaseClientTex). The retired
+    // letters 'A' / 'a' / 'c' / 'D' / 'r' are intentionally not reused -- do
+    // not assign them to new tags without checking no in-flight build still
+    // emits them. See architecture.md "Why wire, not ctrl".
     AddWireConn  = 'W',  // core -> gpu : register a NEW wire connection for a plugin.
                          //   The plugin's wire socket (GPU end) rides as SCM_RIGHTS
                          //   on this message; `connId` names it for later messages.
@@ -56,44 +60,18 @@ enum class Tag : uint8_t {
                                 //   each pump -- without this the plugin device's
                                 //   queue never advances (map/work-done never
                                 //   complete). connId + device handle.
-    AllocSurfaceBuf = 'A',  // core -> gpu : allocate ONE GBM dmabuf and import it
-                            //   into BOTH the plugin device (producer) and the
-                            //   core device (consumer), injecting a texture at
-                            //   each side's reserved handle. This is the
-                            //   producer/consumer surface buffer (architecture.md
-                            //   "Dmabuf-backed surfaces"). connId names the plugin
-                            //   connection; pluginDevice/pluginTexture are on the
-                            //   plugin wire, device/texture (core fields) on the
-                            //   core wire. width/height/format describe the buffer.
-    SurfaceBufAllocated = 'a',  // gpu -> core: allocated + imported + injected on
-                                //   both devices (ok=1), or failed (ok=0). Carries
-                                //   the surfaceBufId the core uses for later
-                                //   Begin/EndAccess on this buffer.
-    AllocComposeBuf = 'c',  // core -> gpu : SAME as AllocSurfaceBuf, but the
-                            //   producer is the CORE device and the consumer
-                            //   is the plugin device (sdk.compose Worker
-                            //   transport, phase 5b). Wire fields are the
-                            //   same shape -- device/texture name the CORE
-                            //   (producer) side; pluginDevice/pluginTexture
-                            //   name the PLUGIN (consumer) side. Reply is
-                            //   SurfaceBufAllocated like AllocSurfaceBuf.
-                            //   The resulting SurfaceBuf has producerOnCore=
-                            //   true; producer Begin/End ride the CORE wire
-                            //   and consumer Begin/End ride the OWNING plugin
-                            //   wire (inverted from AllocSurfaceBuf).
-    // NOTE: the per-frame producer/consumer fence-dance brackets on a surface
-    // buffer also no longer ride ctrl. Consumer Begin/End ride the CORE wire and
-    // producer Begin/End ride the owning PLUGIN wire, both as in-band kind=1/
-    // kind=2 Surface frames (SurfaceAccessPayload), FIFO-ordered against the
-    // render/sample commands on the same wire. The former tags ('G'/'q'/'g'
-    // Producer*, 'V'/'k'/'v' Consumer*) are retired; do not reuse those letters
-    // without checking no in-flight build still emits them. The cross-device
-    // fence dance itself is unchanged (runSurfaceBegin/runSurfaceEnd in the GPU
-    // process); only the trigger moved from ctrl to the wire.
-    ReleaseSurfaceBuf = 'D',  // core->gpu: destroy a ring slot's surfaceBuf -- end any
-                          //   open access bracket, drop the SharedTextureMemory/textures/
-                          //   fences, release the GBM dmabuf. Fire-and-forget (the core
-                          //   has already gated this on its own GPU read completing).
+    // Surface-buffer alloc / release rides the WIRE socket as FrameKind
+    // AllocSurfaceBuf / AllocComposeBuf / SurfaceBufAllocated /
+    // ReleaseSurfaceBuf (transport.h). The per-frame producer/consumer
+    // fence-dance brackets on a surface buffer also ride wire as kind=1/
+    // kind=2 Surface frames (SurfaceAccessPayload), FIFO-ordered against
+    // the render/sample commands on the same wire. Retired ctrl letters
+    // (do not reuse): 'A' AllocSurfaceBuf, 'a' SurfaceBufAllocated,
+    // 'c' AllocComposeBuf, 'D' ReleaseSurfaceBuf, plus 'G'/'q'/'g'
+    // (Producer*) and 'V'/'k'/'v' (Consumer*) from the prior per-frame
+    // ctrl brackets. The cross-device fence dance itself is unchanged
+    // (runSurfaceBegin/runSurfaceEnd in the GPU process); only the
+    // trigger moved from ctrl to the wire.
     OutputDescriptor = 'O',  // gpu -> core: the output's identity + geometry. Sent
                              //   once after surface bring-up and again whenever the
                              //   GPU process detects a change (host-window resize in
@@ -346,6 +324,14 @@ inline uint32_t getU32LE(const uint8_t* p) {
     return static_cast<uint32_t>(p[0]) | (static_cast<uint32_t>(p[1]) << 8) |
            (static_cast<uint32_t>(p[2]) << 16) | (static_cast<uint32_t>(p[3]) << 24);
 }
+inline void putU64LE(uint8_t* p, uint64_t v) {
+    putU32LE(p + 0, static_cast<uint32_t>(v));
+    putU32LE(p + 4, static_cast<uint32_t>(v >> 32));
+}
+inline uint64_t getU64LE(const uint8_t* p) {
+    return static_cast<uint64_t>(getU32LE(p))
+         | (static_cast<uint64_t>(getU32LE(p + 4)) << 32);
+}
 
 // Client-texture Begin/End payload: variant + (id, generation). 9 bytes.
 struct ClientTexAccessPayload {
@@ -586,6 +572,142 @@ struct ScanoutReadyPayload {
 };
 static_assert(ScanoutReadyPayload::kSize == 5,
               "ScanoutReadyPayload size mismatch with hand-counted layout");
+
+// AllocSurfaceBufPayload (core -> gpu; FrameKind::AllocSurfaceBuf or
+// FrameKind::AllocComposeBuf -- the FrameKind discriminates which side
+// produces, the payload shape is identical). Carries the surfaceBufId
+// the core picked, the plugin connection (connId), the buffer dims,
+// the producer/consumer wire device + texture handles already reserved
+// on each side's wire, and the cross-wire ordering serials each inject
+// must wait for. See multi-output-design + architecture.md "Why wire,
+// not ctrl".
+//
+// Layout (little-endian, 48 bytes total):
+//   [0..3]   surfaceBufId   u32
+//   [4..7]   connId         u32
+//   [8..11]  width          u32
+//   [12..15] height         u32
+//   [16..19] pluginDeviceId u32
+//   [20..23] pluginDeviceGen u32
+//   [24..27] pluginTexId    u32
+//   [28..31] pluginTexGen   u32
+//   [32..35] coreDeviceId   u32
+//   [36..39] coreDeviceGen  u32
+//   [40..43] coreTexId      u32
+//   [44..47] coreTexGen     u32
+//   [48..55] reservePointSerial u64  (plugin-wire reserve point)
+//   [56..63] wireSerial         u64  (core-wire reserve point)
+struct AllocSurfaceBufPayload {
+    uint32_t surfaceBufId;
+    uint32_t connId;
+    uint32_t width;
+    uint32_t height;
+    WireHandle pluginDevice;
+    WireHandle pluginTexture;
+    WireHandle coreDevice;
+    WireHandle coreTexture;
+    uint64_t reservePointSerial;
+    uint64_t wireSerial;
+    static constexpr size_t kSize = 4 * 4 + 4 * 8 + 2 * 8;  // 64
+    void encode(uint8_t* out) const {
+        putU32LE(out + 0,  surfaceBufId);
+        putU32LE(out + 4,  connId);
+        putU32LE(out + 8,  width);
+        putU32LE(out + 12, height);
+        putU32LE(out + 16, pluginDevice.id);
+        putU32LE(out + 20, pluginDevice.generation);
+        putU32LE(out + 24, pluginTexture.id);
+        putU32LE(out + 28, pluginTexture.generation);
+        putU32LE(out + 32, coreDevice.id);
+        putU32LE(out + 36, coreDevice.generation);
+        putU32LE(out + 40, coreTexture.id);
+        putU32LE(out + 44, coreTexture.generation);
+        putU64LE(out + 48, reservePointSerial);
+        putU64LE(out + 56, wireSerial);
+    }
+    static AllocSurfaceBufPayload decode(const uint8_t* p) {
+        AllocSurfaceBufPayload r{};
+        r.surfaceBufId            = getU32LE(p + 0);
+        r.connId                  = getU32LE(p + 4);
+        r.width                   = getU32LE(p + 8);
+        r.height                  = getU32LE(p + 12);
+        r.pluginDevice.id         = getU32LE(p + 16);
+        r.pluginDevice.generation = getU32LE(p + 20);
+        r.pluginTexture.id        = getU32LE(p + 24);
+        r.pluginTexture.generation = getU32LE(p + 28);
+        r.coreDevice.id           = getU32LE(p + 32);
+        r.coreDevice.generation   = getU32LE(p + 36);
+        r.coreTexture.id          = getU32LE(p + 40);
+        r.coreTexture.generation  = getU32LE(p + 44);
+        r.reservePointSerial      = getU64LE(p + 48);
+        r.wireSerial              = getU64LE(p + 56);
+        return r;
+    }
+};
+static_assert(AllocSurfaceBufPayload::kSize == 64,
+              "AllocSurfaceBufPayload size mismatch with hand-counted layout");
+
+// SurfaceBufAllocatedPayload (gpu -> core; FrameKind::SurfaceBufAllocated):
+// the alloc + inject sequence on both sides completed (ok=1) or failed
+// (ok=0). The surfaceBufs map entry is INSERTED on the GPU side BEFORE
+// this frame is written, so the next ProducerBegin / ConsumerBegin the
+// core writes is FIFO-ordered after that insert -- the GPU's wire reader
+// will dispatch it against a populated map.
+struct SurfaceBufAllocatedPayload {
+    uint32_t surfaceBufId;
+    uint32_t connId;
+    uint8_t  ok;
+    static constexpr size_t kSize = 4 + 4 + 1;  // 9
+    void encode(uint8_t* out) const {
+        putU32LE(out + 0, surfaceBufId);
+        putU32LE(out + 4, connId);
+        out[8] = ok;
+    }
+    static SurfaceBufAllocatedPayload decode(const uint8_t* p) {
+        SurfaceBufAllocatedPayload r{};
+        r.surfaceBufId = getU32LE(p + 0);
+        r.connId       = getU32LE(p + 4);
+        r.ok           = p[8];
+        return r;
+    }
+};
+static_assert(SurfaceBufAllocatedPayload::kSize == 9,
+              "SurfaceBufAllocatedPayload size mismatch with hand-counted layout");
+
+// ReleaseSurfaceBufPayload (core -> gpu; FrameKind::ReleaseSurfaceBuf):
+// destroy a surfaceBuf. Wire-FIFO ordering means any still-pending
+// ProducerEnd / ConsumerEnd for this buf has already been decoded by
+// the GPU's wire reader before this frame runs -- no teardown-vs-open-
+// bracket race possible.
+struct ReleaseSurfaceBufPayload {
+    uint32_t surfaceBufId;
+    static constexpr size_t kSize = 4;
+    void encode(uint8_t* out) const { putU32LE(out, surfaceBufId); }
+    static ReleaseSurfaceBufPayload decode(const uint8_t* p) {
+        return { getU32LE(p) };
+    }
+};
+static_assert(ReleaseSurfaceBufPayload::kSize == 4,
+              "ReleaseSurfaceBufPayload size mismatch with hand-counted layout");
+
+// ReleaseClientTexPayload (core -> gpu; FrameKind::ReleaseClientTex):
+// release a JS-compositor dmabuf import. FIFO-ordered with the
+// per-frame BeginAccess/EndAccess brackets for this handle (also on
+// wire), so the GPU's wire reader is guaranteed to have decoded every
+// in-flight bracket before the release runs. No wireSerial workaround.
+struct ReleaseClientTexPayload {
+    WireHandle texture;
+    static constexpr size_t kSize = 8;
+    void encode(uint8_t* out) const {
+        putU32LE(out + 0, texture.id);
+        putU32LE(out + 4, texture.generation);
+    }
+    static ReleaseClientTexPayload decode(const uint8_t* p) {
+        return { { getU32LE(p + 0), getU32LE(p + 4) } };
+    }
+};
+static_assert(ReleaseClientTexPayload::kSize == 8,
+              "ReleaseClientTexPayload size mismatch with hand-counted layout");
 
 }  // namespace overdraw::ipc
 

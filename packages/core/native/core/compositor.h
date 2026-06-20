@@ -551,6 +551,17 @@ class Compositor {
     template <typename Payload>
     void writeAccessFrame(ipc::FrameKind kind, const Payload& payload);
 
+    // Shared encode + appendFrame for AllocSurfaceBuf / AllocComposeBuf:
+    // identical payload, different FrameKind. Called by sendAllocSurfaceBuf
+    // and sendAllocComposeBuf.
+    void appendAllocFrame(ipc::FrameKind kind,
+                          uint32_t surfaceBufId, uint32_t connId,
+                          uint32_t width, uint32_t height,
+                          ReservedHandle pluginDevice, ReservedHandle pluginTexture,
+                          ReservedHandle coreDevice, ReservedHandle coreTexture,
+                          uint64_t pluginReservePointSerial,
+                          uint64_t coreReservePointSerial);
+
     std::unique_ptr<WireLink> link_;
     pid_t gpuPid_ = -1;
     int wireFd_ = -1;  // owned by Compositor; closed in shutdown()
