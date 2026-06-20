@@ -145,8 +145,34 @@ Add `uint32_t outputId` to, in `native/ipc/side_channel.h`:
 - `ScanoutReady` — per output (ok/fail for that output's ring).
 - `ScanoutPresent` — `{ outputId, surfaceBufId }`.
 - `ScanoutFlipComplete` — `{ outputId, surfaceBufId }`.
-- Add `OutputAdded` / `OutputRemoved` for hotplug (Section 10) — deferrable to a
-  later milestone, but reserve the tags now so the enum is stable.
+- Add three messages for hotplug + mode change (Section 10) — reserve the tags
+  now so the enum is stable, even though the handlers land in M7:
+  - `OutputAdded` — gpu→core, `{ outputId, full descriptor fields }`. A connector
+    transitioned to connected and has a usable CRTC+plane. The core creates the
+    `state.outputs` entry and replies with `ScanoutReserve` for that outputId; the
+    GPU process replies `ScanoutReady` once the ring is built (same handshake as
+    startup bring-up, scoped to one outputId).
+  - `OutputRemoved` — gpu→core, `{ outputId }`. The connector vanished or
+    disabled. The core tears down `state.outputs[outputId]`, fires
+    `output.pre-remove` (so the workspace plugin migrates and surface-residency
+    emits `wl_surface.leave`) then `output.removed`, and finally destroys that
+    output's `wl_output` global. The GPU process has already released the ring's
+    GBM bo's / dmabuf fds / mode blob and dropped its `PerOutput` entry.
+  - `ScanoutRebuild` — gpu→core, `{ outputId }`. The ring at this outputId is
+    stale (mode change, or a deliberate re-init); reply with a fresh
+    `ScanoutReserve` for it. Same reply path as `OutputAdded`. Used for mode
+    change so a connector swapping resolutions reuses one already-known
+    outputId rather than going through add/remove (which would churn the
+    `wl_output` global and `wl_registry`). `OutputDescriptor` (existing) keeps
+    its narrow "identity changed, no ring action needed" meaning; emit it
+    after `ScanoutReady` confirms the new ring.
+
+  Rationale for three tags, not two: a mode change must NOT round-trip through
+  `OutputRemoved`+`OutputAdded` because that destroys and recreates the
+  output's `wl_output` global. Clients see `wl_registry.global_remove` →
+  `global` and have to re-bind, which is jarring for what should be a seamless
+  resolution swap. `ScanoutRebuild` keeps the output's identity stable and just
+  swaps the underlying ring textures.
 
 This is a wire-format change between core and GPU process; both sides ship
 together (no version negotiation across the private socket). Land it as a
@@ -357,12 +383,50 @@ Mutations (the only three):
 - **Hotplug detection**: monitor connect/disconnect does **not** arrive on the DRM
   fd (that fd carries only page-flip / vblank). It comes on a separate **udev
   netlink monitor** fd, filtered to the `drm` subsystem, added to the GPU process's
-  epoll loop (`event_loop.h`). The uevent is a generic "card changed" with a
-  `HOTPLUG=1` property (and optional `CONNECTOR=<id>` hint); the robust response is
-  to re-probe — `drmModeGetResources` → `drmModeGetConnector` per connector — and
-  diff each connector's `connection` status against the prior snapshot to find what
-  added/removed. This is a genuinely new dependency: the GPU process uses libseat
-  for the card today but has no udev monitor.
+  event loop alongside the existing DRM and libseat fds. The udev monitor lives
+  in the same process that owns libseat — the GPU process here — and udev netlink
+  is unprivileged, so there is no permission question to resolve. The uevent is a
+  generic "card changed" with a `HOTPLUG=1` property (and optional
+  `CONNECTOR=<id>` hint).
+- **Re-probe algorithm.** Classify by `udev_device_get_action()`:
+  - `"change"` with `HOTPLUG=1` — connector-level change on the current card.
+    Run the rescan below. This is the only action M7 acts on.
+  - `"add"` / `"remove"` of a DRM card itself — out of scope until M9 (dynamic
+    GPU); log and ignore.
+  - Anything else — log and ignore.
+
+  Rescan = a two-pass walk that drops vanished connectors before reassigning
+  CRTCs, so newly-freed slots become available to whatever needs them:
+  1. **Scan**: `drmModeGetResources` → `drmModeGetConnector` for every
+     connector, refresh each `PerOutput`'s `connection` status. Create entries
+     for new connector ids; mark vanished ids for removal. Use the
+     `CONNECTOR=<id>` hint as a per-connector filter when present (skip the
+     `drmModeGetConnector` work for non-matching ids, but still iterate the
+     full list to maintain the survivor set).
+  2. **Disconnect-vanished**: for every `PerOutput` whose connector is now
+     `DRM_MODE_DISCONNECTED` (or whose id disappeared entirely), release its
+     CRTC into the free pool, destroy its mode blob, clear its ring (reset all
+     slots to FREE — same path `pause()` uses; do not try to drain
+     in-flight flips, the kernel cancels them when the connector vanishes),
+     send `OutputRemoved { outputId }`. Order matters: all removals before
+     any additions, so the next step sees a maximally-free CRTC pool.
+  3. **Recheck CRTCs**: two-pass greedy assignment. Pass 1 hands free CRTCs
+     to connected-and-enabled connectors that need one (respecting each
+     connector's `possible_crtcs` mask, releasing the CRTC of any
+     connected-but-disabled output to free it for an enabled peer). Pass 2
+     hands remaining free CRTCs to connected-but-disabled connectors as
+     backup slots. The primary output never loses its CRTC mid-run unless it
+     itself disconnects.
+  4. **Connect-new**: for every connected connector that now has a CRTC and
+     no live `PerOutput`, build its topology, allocate a `KmsScanoutRing` on
+     the existing shared `gbm_` device + core `wgpu::Device`, send
+     `OutputAdded { outputId, descriptor }`, wait for `ScanoutReserve`,
+     `InjectTexture` the three slots at the reserved handles, reply
+     `ScanoutReady`. This is the same handshake startup uses, just scoped to
+     one outputId.
+
+  This is a new dependency in the GPU process: libudev (the GPU process uses
+  libseat for the card today but has no udev monitor yet).
 
   **Hotplug is required, not optional.** A multi-output compositor that only
   enumerates at startup is not a complete system — dock/undock and external-monitor
@@ -371,11 +435,25 @@ Mutations (the only three):
   because it can be dropped. Milestones 1-6 are intermediate states of one
   in-progress feature, not a shippable endpoint that omits hotplug; "multi-output"
   is not done until live plug/unplug works.
-- **Hotplug propagation**: `OutputAdded`/`OutputRemoved` IPC (Section 4) → core
-  adds/removes the `state.outputs` entry, creates/destroys that output's `wl_output`
-  global (clients see `wl_registry.global` / `global_remove` and re-bind),
-  re-arranges, relayouts, and emits `output.added`/`output.removed` on the plugin
-  bus so the workspace plugin runs the migration (below). Its own milestone.
+- **Hotplug propagation (bus event order).** The core fires two bus events per
+  removal, in this order, splitting work that must happen WHILE the output still
+  exists from work that must happen AFTER it is gone:
+  1. `output.pre-remove { outputId, name }` — synchronous subscribers run while
+     `state.outputs[outputId]` still exists. The workspace plugin runs its
+     migration (below). Surface-residency diffs and emits `wl_surface.leave`
+     for surfaces leaving the dying output. `wp_fractional_scale_v1`
+     `preferred_scale` re-emits for surfaces whose primary output was the
+     dying one.
+  2. `output.removed { outputId, name }` — fires after `state.outputs[outputId]`
+     is gone. WM `setOutputs`, compositor `setOutputs`, input layout
+     `updateOutputLayout` run against the surviving set. Last action: destroy
+     that output's `wl_output` global so clients see `wl_registry.global_remove`
+     **after** they've already seen `wl_surface.leave` for any affected
+     surfaces (otherwise the leave has no resource to refer to).
+
+  Add is simpler: the existing `onOutputDescriptor` "this id is new" branch
+  already creates the global, runs `setOutputs`, etc.; emit `output.added`
+  after that so the workspace plugin's reclaim runs against the new live set.
 
 ### Workspace migration on output change
 
@@ -436,7 +514,85 @@ naturally produces two effects.
 Because the preferred list holds durable identifiers, a monitor unplugged and
 replugged on a different port (new dense `outputId`, same EDID id) still reclaims
 its workspaces. Preserve the existing per-output invariant (≥1 workspace per
-touched output) across all of this.
+touched output) across all of this — specifically: **reclaim first, then if
+reclaiming drained a donor output to zero workspaces, create one fresh empty
+workspace on the donor**, not on the receiver. Net effect is that reclaim wins
+(workspaces go home) and the empty workspace appears wherever was just drained,
+never on the freshly-returning monitor.
+
+### Active workspace memory (per-output focus)
+
+The durable `preferredOutputs` list says *where workspaces live*. It does not
+say *which* workspace is focused on a given output — a second piece of state
+worth keeping: on disconnect, remember which workspace was active on the dying
+output; on its return, restore that focus.
+
+- The workspace registry gains `lastActiveByOutputName: Map<string, workspaceId>`,
+  keyed by durable identifier (the same key `preferredOutputs` uses, so the
+  reserved fallback name participates without special-casing).
+- Updated on every focus change (workspace becomes active on output X →
+  `lastActive[X.name] = workspaceId`). Updated on `output.pre-remove` with the
+  currently-active workspace one last time, in case nothing else triggered it.
+- Consulted on `output.added` for output X: after the reclaim pass has finished
+  populating X with workspaces, set focus to `lastActive[X.name]` if it resolves
+  to a workspace currently on X. Falls back to the lowest-id workspace on X if
+  the remembered one moved elsewhere.
+- Cascaded-disconnect ownership is implicit. When monitor A unplugs and its
+  workspaces fall onto B, then B unplugs and they fall onto C: the durable
+  `preferredOutputs` of each workspace ends with `[A, B, C]` (forced-placement
+  appends at lowest priority, §8 rule 2), so on A's return, A still outranks B
+  and C, and the workspaces return to A — not to B as an intermediate stop. No
+  separate cascade-tracking mechanism is needed.
+
+### Mode change (resolution / refresh swap on an existing output)
+
+A connector swapping mode mid-run is structurally close to remove+add but must
+**not** go through `OutputRemoved` + `OutputAdded` — that would destroy and
+recreate the output's `wl_output` global, forcing every client to re-bind and
+re-derive state for what should be a transparent resolution change. Use
+`ScanoutRebuild` instead (§4):
+
+1. **Trigger.** Today, only nested host-window resize triggers the
+   `OutputDescriptor` re-emit path (`main.cpp` resize listener). For KMS, a
+   future user-driven mode change (config update, `wlr-output-management`-style
+   protocol when added) calls into the GPU process to switch a `PerOutput`'s
+   `topo.mode`. The trigger is out of scope until that protocol lands; the IPC
+   shape is committed here so the wire is ready.
+2. **GPU process steps** (one outputId at a time, primary or secondary):
+   - Reset the `PerOutput`'s ring slots to FREE (same path `pause()` uses).
+     Cancel any in-flight flip; the kernel will drop it.
+   - Destroy the old `modeBlobId` (`drmModeDestroyPropertyBlob`).
+   - Tear down the `KmsScanoutRing` (releases GBM bo's, dmabuf fds, the
+     `wgpu::Texture`s the core holds via `InjectTexture`).
+   - Update `topo.mode` to the new mode.
+   - Send `ScanoutRebuild { outputId }` to the core. The core treats this as a
+     fresh per-output bring-up: it reserves three new wire handles + new
+     surfaceBufIds and replies `ScanoutReserve { outputId, scanoutHandles[3],
+     scanoutBufIds[3] }` with the new width/height.
+   - Allocate a fresh `KmsScanoutRing` at the new dims on the existing shared
+     `gbm_` device and core `wgpu::Device`; `InjectTexture` the three slots at
+     the new reserved handles; reply `ScanoutReady { outputId, ok }`.
+   - Set `didInitialCommit = false` so the next present runs `ALLOW_MODESET`
+     with a fresh mode blob.
+   - Send `OutputDescriptor { outputId, … }` with the new dims so the JS side
+     updates `state.outputs[outputId]`, relayouts, and re-emits wl_output /
+     xdg_output / fractional-scale to bound clients. The output's identity
+     (`name`, `edidId`, durable identifier) does not change, so
+     `preferredOutputs` is undisturbed and no workspace migration runs.
+3. **Client visibility.** Same `wl_output` global, same bind; clients receive
+   a new `mode` event (and `geometry`/`done` burst) reflecting the new dims.
+   `wl_surface.enter`/`leave` re-runs because output rects may have shifted.
+   No `wl_registry.global_remove`.
+4. **Damage and pacing.** The compositor's `OutputDamageMap.setOutputs` is
+   re-called with the new rect; the per-output damage ring is rebuilt keyed
+   by the new scanout-slot handles. `wantNext` for this outputId clears so
+   the next frame redraws the full new-sized output (the prior ring's damage
+   history doesn't translate to the new buffer geometry).
+
+This path is what makes `wlr-output-management`-style runtime reconfig possible
+later without revisiting the IPC. M7 lands the `ScanoutRebuild` tag + the GPU
+process plumbing; an actual mode-change-triggering protocol is a separate piece
+of work past M7.
 
 ## 11. Multi-GPU (multiple DRM cards)
 
@@ -495,6 +651,20 @@ only they know their intent, so beyond the default we do not guess.
 - M4 already takes the scanout ring / page-flip routing / `OutputBackend` per-output;
   multi-GPU adds a per-card dimension above that (each card owns a subset of outputs
   plus its own device / allocator / blit).
+- **Per-card backend shape, structured for future runtime add/remove (M9).** The
+  per-card state — DRM fd, GBM device, Dawn device, the set of `PerOutput`s on
+  this card, the page-flip event handling, and (for secondaries) the cross-card
+  blit pipeline — lives in one object (`KmsCardBackend`, replacing today's
+  single-instance `KmsOutputBackend`). The GPU process owns a collection of
+  these. Even though M8 only ever creates them at startup, designing the
+  per-card object so it can be created and destroyed at runtime (no global
+  state, no startup-only initialization in shared scope) is the structural
+  prerequisite for M9. Concretely that means: the udev monitor and the card
+  collection both live in `main.cpp`, not inside any per-card object; cross-
+  card resources (the primary's blit-source texture, the per-card
+  blit-destination textures) are owned by a `MultiCardBlit` object whose
+  membership can change at runtime. Without this discipline, M9 becomes a
+  rewrite.
 
 ### Testing
 
@@ -508,9 +678,11 @@ section) need different test hardware.
 ## 12. Sequencing (milestones)
 
 Each milestone is independently landable and leaves the tree working at N=1. The
-ordering is a build sequence, not a scope boundary: the feature is complete only
-after **both** hotplug (M7) and multi-GPU (M8). Milestones 1-7 are intermediate
-states of one feature, not a shippable endpoint.
+ordering is a build sequence, not a scope boundary: the feature is complete
+through static multi-GPU only after **both** hotplug (M7) and multi-GPU (M8).
+Milestones 1-7 are intermediate states of one feature, not a shippable endpoint.
+M9 (dynamic GPU add/remove) is a real milestone — deferred for lack of test
+hardware, not dropped.
 
 **Status: M1-M6 done.** M1-M4 surface-verified on a single-card two-monitor
 setup (HDMI 60Hz + DP 240Hz both lit). M5 + M6 unit-tested GPU-free + GPU
@@ -670,11 +842,40 @@ the resolved decision.
    `preferredOutputs` from milestone 5 is the prerequisite; this milestone makes it
    react to live plug/unplug. Not optional — multi-output is incomplete without it
    (Section 10).
-8. **Multi-GPU (required for completeness).** Enumerate all cards, one Dawn device
-   per card, user-selectable primary renderer, cross-card dmabuf blit + explicit-sync
-   for secondary-card scanout (Section 11). The per-output machinery from M4-M7 is
-   the prerequisite; this adds the per-card dimension. Not optional — a monitor on a
-   non-primary card (the hybrid-laptop case) does not work until this lands.
+8. **Multi-GPU, static (required for completeness through static).** Enumerate
+   all cards at startup, one Dawn device per card, user-selectable primary
+   renderer, cross-card dmabuf blit + explicit-sync for secondary-card scanout
+   (Section 11). The per-output machinery from M4-M7 is the prerequisite; this
+   adds the per-card dimension. Not optional — a monitor on a non-primary card
+   (the hybrid-laptop case) does not work until this lands. M8 also locks in the
+   per-card backend shape (`KmsCardBackend`, §11 "Per-card backend shape") so
+   M9 is additive, not a rewrite.
+9. **Dynamic GPU add/remove (deferred for lack of test hardware).** udev `add`
+   on a DRM card → open via libseat, build a fresh `KmsCardBackend` for it,
+   run that card's own connector scan, emit `OutputAdded` per newly-lit
+   connector; udev `remove` → destroy the card backend, which cascades
+   `OutputRemoved` for every connector it owned. Mechanism mirrors M7 lifted
+   one level (per-card instead of per-connector); the per-card object from M8
+   is the prerequisite. Two interesting cases beyond pure plumbing:
+   - **Primary card removal.** If the user-selected primary card vanishes while
+     secondaries remain, fall back to auto-promoting the first remaining card
+     to primary (re-running adapter-pick), tear down all `MultiCardBlit`
+     pipelines that fed from the dead primary, and let the next render rebuild
+     them with the new primary as source. Document this fallback in the design
+     when the milestone lands; M9 is the first time we have to decide it
+     concretely.
+   - **eGPU dock/undock.** The expected real-world trigger. Behaves the same
+     as a card add/remove from the kernel's perspective; the only platform
+     subtlety is that an eGPU may also bring its own monitors hot-plugging in
+     and out independently — M7's per-connector hotplug already covers that
+     once the card's backend exists.
+
+   **Deferred for lack of test hardware** (no eGPU / multi-card box available);
+   not dropped. The structural prerequisites in M8 keep the deferral cheap. A
+   user-visible status entry in `status.md` should call out that this path is
+   present at the contract level (`KmsCardBackend`'s lifecycle is built to
+   support it) but its M9 wiring — the udev `add`/`remove` handling and the
+   primary-promotion fallback — is not implemented and untested.
 
 ## 13. Testing — and a real gap to settle first
 
@@ -761,9 +962,22 @@ Resolved:
 - Hotplug — **required, not deferrable.** Sequenced as milestone 7 because it
   builds on the per-output workspace model, but multi-output is not complete
   without live plug/unplug (Sections 10, 12).
-- Multi-GPU (multiple DRM cards) — **required, not deferrable; its own milestone
-  (M8) on top.** Render on a user-selected primary card, blit to secondary cards for
-  scanout. The feature is not complete until a monitor on a non-primary card (the
-  hybrid-laptop case) displays. Primary card is **user-selectable** (`output.
-  primaryCard` / `--primary-card`), defaulting to the integrated/built-in-panel GPU
-  (Section 11).
+- Multi-GPU, static (multiple DRM cards enumerated at startup) — **required,
+  not deferrable; its own milestone (M8) on top.** Render on a user-selected
+  primary card, blit to secondary cards for scanout. The feature is not complete
+  until a monitor on a non-primary card (the hybrid-laptop case) displays.
+  Primary card is **user-selectable** (`output.primaryCard` / `--primary-card`),
+  defaulting to the integrated/built-in-panel GPU (Section 11).
+- Multi-GPU, dynamic (runtime card add/remove) — **own milestone (M9); deferred
+  for lack of test hardware (no eGPU / multi-card box available), not dropped.**
+  Mechanism mirrors M7's per-connector hotplug lifted to per-card; the
+  structural prerequisite is M8's per-card backend shape. Primary-card removal
+  fallback (auto-promote a remaining card to primary) is decided at M9 time, not
+  now (Sections 11, 12).
+- Mode change on an existing output (resolution / refresh swap) — **own IPC
+  tag (`ScanoutRebuild`), reusing the per-output bring-up handshake; does NOT
+  go through `OutputRemoved`+`OutputAdded`.** Keeps the `wl_output` global
+  stable so clients see a `mode` event burst, not a `global_remove`/`global`
+  round-trip. The IPC + GPU process plumbing lands in M7; an actual
+  mode-change-triggering protocol (`wlr-output-management`-style) is separate,
+  past M7 (Sections 4, 10.5).
