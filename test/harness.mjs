@@ -87,21 +87,26 @@ function hasConnectedConnector() {
   return false;
 }
 
-// True if the environment can run KMS tests: the headless prerequisites plus a
-// connected DRM connector to modeset, and NO active graphical session (a
-// running compositor would already hold DRM-master, so the test would fail to
-// acquire it rather than skip). Mirrors canRunNested()'s "is the backend
-// usable" gate.
+// True if the environment can run KMS tests: headless prerequisites + a
+// connected DRM connector + no active graphical session + we are actually
+// on the local VT (not SSH'd in). The SSH check is the critical one --
+// a session SSH'd into the same box has no WAYLAND_DISPLAY/DISPLAY set
+// but cannot take DRM-master (the foreground VT's session owns it), so
+// the test would hang in libseat acquisition rather than skip cleanly.
 //
-// CAUTION: a KMS test that passes this gate takes DRM-master and modesets the
-// connected panel for real -- it drives the physical display with test frames
-// and (since the backend does not restore the prior CRTC on teardown) leaves
-// the last frame on screen until a VT switch repaints the console.
+// CAUTION: a KMS test that passes this gate takes DRM-master and modesets
+// the connected panel for real -- it drives the physical display with
+// test frames and (since the backend does not restore the prior CRTC on
+// teardown) leaves the last frame on screen until a VT switch repaints
+// the console.
 export function canRunKms() {
   return canRunGpu()
     && hasConnectedConnector()
     && !process.env.WAYLAND_DISPLAY
-    && !process.env.DISPLAY;
+    && !process.env.DISPLAY
+    && !process.env.SSH_CONNECTION
+    && !process.env.SSH_CLIENT
+    && !process.env.SSH_TTY;
 }
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
