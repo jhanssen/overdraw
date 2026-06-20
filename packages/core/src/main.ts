@@ -513,6 +513,25 @@ const decorationBroker = createDecorationBroker({
 state.decorationResize = (windowId, outerRect, contentRect, insets) =>
   decorationBroker.onDecorationResized(windowId, outerRect, contentRect, insets);
 
+// Drive the decoration registry's deferred-assignment from window.relayout
+// (plugin bus): a tentative match at window.map time is held until the WM
+// publishes a valid outer rect, so the decoration plugin's first
+// createDecoration receives a real size and avoids the placeholder
+// allocation + teardown race.
+pluginBus.subscribe(WINDOW_EVENT.relayout, (_n, payload) => {
+  if (!payload || typeof payload !== "object") return;
+  const ev = payload as { surfaceId?: unknown;
+                          newOuter?: { x?: unknown; y?: unknown;
+                                       width?: unknown; height?: unknown } };
+  const sid = ev.surfaceId;
+  const r = ev.newOuter;
+  if (typeof sid !== "number" || !r
+      || typeof r.x !== "number" || typeof r.y !== "number"
+      || typeof r.width !== "number" || typeof r.height !== "number") return;
+  decorationBroker.registry.notifyRelayout(sid,
+    { x: r.x, y: r.y, width: r.width, height: r.height });
+});
+
 // Scene registry (phase 8): every SceneHandle minted by in-thread or
 // Worker compose registers here so transitions (and any future
 // cross-SDK consumer) can resolve a sceneId back to a core-side

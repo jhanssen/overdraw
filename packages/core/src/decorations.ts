@@ -14,7 +14,8 @@ import {
   WINDOW_EVENT, DECORATION_EVENT,
 } from "./events/types.js";
 import type {
-  WindowMapEvent, WindowChangeEvent, WindowUnmapEvent, DecorationAssignedEvent, WindowRect,
+  WindowMapEvent, WindowChangeEvent, WindowUnmapEvent,
+  DecorationAssignedEvent, WindowRect,
 } from "./events/types.js";
 
 // One registered provider: the plugin and its compiled app_id matcher.
@@ -32,6 +33,11 @@ export interface DecorationRegistry {
   register(pluginName: string, pattern: string, flags?: string): void;
   // Drop all providers for a plugin (plugin teardown, or a timed-out provider).
   unregisterPlugin(pluginName: string): void;
+  // Push the WM's post-relayout outer rect for a window. The registry holds
+  // tentative matches whose map-time rect was the placeholder (-1,-1) and
+  // fires onAssigned only when the first valid outer rect arrives. The
+  // broker calls this on window.relayout (plugin-bus event).
+  notifyRelayout(surfaceId: number, newOuter: WindowRect): void;
   // Introspection (tests).
   assignmentOf(surfaceId: number): string | undefined;
 }
@@ -52,16 +58,37 @@ export function createDecorationRegistry(
   // a late-app_id-change assignment reuses the last-known geometry from here.
   const lastRect = new Map<number, WindowRect>();
 
+  // Pending tentative assignments: window matched a provider but the WM's
+  // outer rect is still the placeholder (-1,-1). We hold these here and
+  // fire onAssigned only when window.relayout lands a real outer rect.
+  // The decoration broker's first-frame timer doesn't start until
+  // onAssigned fires, so this defers the 500ms gate to "real-rect time"
+  // instead of "window.map time", eliminating the placeholder allocation
+  // + teardown race in the decoration plugin.
+  interface Pending { appId: string; title: string | null; pluginName: string; }
+  const pending = new Map<number, Pending>();
+
+  function isValidRect(r: WindowRect): boolean {
+    return r.width > 0 && r.height > 0;
+  }
+
   // Try to assign a window to the first registered provider whose regex matches its
   // app_id. No-op if already assigned (match-once) or app_id is null/unmatched.
+  // If the rect is the placeholder, the assignment is parked until
+  // window.relayout fires with a real outer rect.
   function tryAssign(surfaceId: number, appId: string | null, title: string | null,
                      rect: WindowRect): void {
     if (assignments.has(surfaceId)) return;   // match-once
+    if (pending.has(surfaceId)) return;       // already waiting on a real rect
     if (appId === null) return;                // no app_id yet -> wait for window.change
     for (const p of providers) {
       if (p.regex.test(appId)) {
-        assignments.set(surfaceId, p.pluginName);
-        onAssigned({ surfaceId, appId, title, rect }, p.pluginName);
+        if (isValidRect(rect)) {
+          assignments.set(surfaceId, p.pluginName);
+          onAssigned({ surfaceId, appId, title, rect }, p.pluginName);
+        } else {
+          pending.set(surfaceId, { appId, title, pluginName: p.pluginName });
+        }
         return;   // first match wins
       }
     }
@@ -85,6 +112,7 @@ export function createDecorationRegistry(
   bus.on(WINDOW_EVENT.unmap, (ev: WindowUnmapEvent) => {
     lastRect.delete(ev.surfaceId);
     assignments.delete(ev.surfaceId);
+    pending.delete(ev.surfaceId);
     onUnmapped(ev.surfaceId);
   });
 
@@ -101,6 +129,17 @@ export function createDecorationRegistry(
       }
       // Leave existing assignments; a torn-down/timed-out plugin's windows simply
       // lose their (already-delivered) provider.
+    },
+    notifyRelayout(surfaceId, newOuter) {
+      // First valid outer rect for a deferred match -> deliver onAssigned now.
+      lastRect.set(surfaceId, newOuter);
+      const p = pending.get(surfaceId);
+      if (!p) return;
+      if (!isValidRect(newOuter)) return;
+      pending.delete(surfaceId);
+      assignments.set(surfaceId, p.pluginName);
+      onAssigned({ surfaceId, appId: p.appId, title: p.title,
+                   rect: newOuter }, p.pluginName);
     },
     assignmentOf(surfaceId) { return assignments.get(surfaceId); },
   };
