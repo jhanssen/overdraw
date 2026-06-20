@@ -70,6 +70,13 @@ class KmsOutputBackend : public OutputBackend {
     // drops that output and keeps going.
     bool initScanout(const wgpu::Device& device);
 
+    // Per-output ring init for runtime adds (post-rescan). Called from the
+    // OutputAdded -> ScanoutReserve handshake; the caller already knows the
+    // specific outputId that just came up. Returns false on ring-allocation
+    // failure (in which case the entry is dropped from outputs_ so the next
+    // rescan can retry from scratch).
+    bool initScanoutForOutput(uint32_t outputId, const wgpu::Device& device);
+
     OutputSize size() const override;
     // OutputBackend hook: fills `out` with the LOWEST live outputId's
     // descriptor (or zeroed when no outputs are live). The KMS code path
@@ -188,6 +195,11 @@ class KmsOutputBackend : public OutputBackend {
     // Acquire/present implementations operating on a given output.
     wgpu::Texture acquireOutputImpl(PerOutput& o, int& outSlotIdx);
     bool presentOutputImpl(PerOutput& o, int slotIdx, int inFenceFd);
+
+    // Allocate the 3-slot scanout ring for one PerOutput against `device`.
+    // Shared by initScanout (startup, every output) and initScanoutForOutput
+    // (post-rescan, single output).
+    bool initRingFor(PerOutput& o, const wgpu::Device& device);
 
     // Lookup helper: returns nullptr if outputId is not live.
     PerOutput* find(uint32_t outputId);

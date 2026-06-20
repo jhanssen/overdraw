@@ -217,43 +217,67 @@ KmsOutputBackend::RescanResult KmsOutputBackend::rescan() {
     return result;
 }
 
-bool KmsOutputBackend::initScanout(const wgpu::Device& device) {
-    if (drmFd_ < 0 || !gbm_ || outputs_.empty()) {
-        std::fprintf(stderr, "[kms] initScanout: open() not completed\n");
-        return false;
-    }
-
+bool KmsOutputBackend::initRingFor(PerOutput& o, const wgpu::Device& device) {
     // The compositor's render format. We use BGRA8Unorm-equivalent on the
     // wgpu side; the matching DRM fourcc is XRGB8888 (alpha discarded at
     // scanout). The compositor's clear-color path uses BGRA8Unorm; matching
     // the format here keeps the JS side's render passes unchanged.
     constexpr uint32_t kFourcc = DRM_FORMAT_XRGB8888;
 
-    auto initRing = [&](PerOutput& o) -> bool {
-        // Per-plane modifier set the kernel advertises for this format. May be
-        // empty on older drivers; the ring then falls back to LINEAR.
-        std::vector<PlaneFormatModifier> planeFormats =
-            readPlaneFormats(drmFd_, o.topo.planeId, o.topo.planeProps.in_formats);
-        return o.ring.init(drmFd_, gbm_, device,
-                           o.topo.mode.hdisplay, o.topo.mode.vdisplay, kFourcc,
-                           planeFormats);
-    };
+    // Per-plane modifier set the kernel advertises for this format. May be
+    // empty on older drivers; the ring then falls back to LINEAR.
+    std::vector<PlaneFormatModifier> planeFormats =
+        readPlaneFormats(drmFd_, o.topo.planeId, o.topo.planeProps.in_formats);
+    return o.ring.init(drmFd_, gbm_, device,
+                       o.topo.mode.hdisplay, o.topo.mode.vdisplay, kFourcc,
+                       planeFormats);
+}
+
+bool KmsOutputBackend::initScanout(const wgpu::Device& device) {
+    if (drmFd_ < 0 || !gbm_ || outputs_.empty()) {
+        std::fprintf(stderr, "[kms] initScanout: open() not completed\n");
+        return false;
+    }
 
     // Primary (lowest live id) ring failure is fatal; a secondary ring failure
     // drops that output. The lowest id is 0 right after open(); using outputIds()
     // keeps this correct under churn.
     std::vector<uint32_t> ids = outputIds();
-    if (!initRing(*outputs_[ids[0]])) {
+    if (!initRingFor(*outputs_[ids[0]], device)) {
         std::fprintf(stderr, "[kms] primary scanout ring init failed\n");
         return false;
     }
     for (size_t i = 1; i < ids.size(); ++i) {
         const uint32_t id = ids[i];
-        if (!initRing(*outputs_[id])) {
+        if (!initRingFor(*outputs_[id], device)) {
             std::fprintf(stderr, "[kms] output %u scanout ring init failed; dropping\n", id);
             outputs_[id]->ring.clear();
             outputs_.erase(id);
         }
+    }
+    return true;
+}
+
+bool KmsOutputBackend::initScanoutForOutput(uint32_t outputId,
+                                            const wgpu::Device& device) {
+    if (drmFd_ < 0 || !gbm_) {
+        std::fprintf(stderr, "[kms] initScanoutForOutput: backend not open\n");
+        return false;
+    }
+    PerOutput* o = find(outputId);
+    if (!o) {
+        std::fprintf(stderr, "[kms] initScanoutForOutput: unknown outputId=%u\n", outputId);
+        return false;
+    }
+    if (!initRingFor(*o, device)) {
+        std::fprintf(stderr, "[kms] output %u scanout ring init failed; dropping\n",
+                     outputId);
+        // Caller treats this as a hard-drop: the connector came up but the
+        // ring wouldn't allocate (modifier mismatch, GBM exhaustion, ...).
+        // Remove from outputs_ so the next rescan can retry it from scratch
+        // rather than leaving a half-built entry.
+        disconnectOutput(outputId);
+        return false;
     }
     return true;
 }
