@@ -184,7 +184,7 @@ export function init(
 // output identifier seeded into the new workspace's preferredOutputs list;
 // callers should pass the live output's name so the workspace remembers its
 // boot home.
-function ensureOutput(state: WorkspaceState, outputId: number, seedName: string,
+export function ensureOutput(state: WorkspaceState, outputId: number, seedName: string,
                       ): { state: WorkspaceState; sideEffects: SideEffect[] } {
   if ((state.positionsByOutput.get(outputId) ?? []).length > 0) {
     return { state, sideEffects: [] };

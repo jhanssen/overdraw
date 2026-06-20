@@ -401,6 +401,19 @@ export default async function init(sdk: SdkLike, _config?: unknown): Promise<voi
       await applyEffects(r.sideEffects);
       return r.changed;
     },
+    async ensureOutput(outputId): Promise<WorkspaceSnapshot> {
+      // Idempotent: if outputId already has any workspaces, return the
+      // shown one; otherwise create workspace 1 there (no extra workspaces
+      // appended). Useful for callers that need to land a window on an
+      // output that hasn't been touched yet (e.g. window.move-to-output
+      // when the target output has no windows of its own).
+      const r = reg.ensureOutput(state, outputId, outputNameOf(outputId));
+      state = r.state;
+      await applyEffects(r.sideEffects);
+      const cur = reg.current(state, outputId);
+      if (!cur) throw new Error(`ensureOutput: no shown workspace on output ${outputId}`);
+      return cur;
+    },
   };
 
   await sdk.registerPlugin("workspace", () => api);

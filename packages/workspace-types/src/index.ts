@@ -135,4 +135,14 @@ export interface WorkspaceAPI {
    * swap-next on the tail).
    */
   reorder(surfaceId: number, op: "promote" | "swap-next" | "swap-prev"): Promise<boolean>;
+
+  /**
+   * Idempotently ensure `outputId` has at least one workspace. If a workspace
+   * already exists there, returns the currently-shown one; otherwise creates
+   * workspace 1 and shows it. Returns the shown workspace's snapshot.
+   * Used by callers that need to land a window on an output that has had
+   * no windows of its own (so the workspace plugin hasn't auto-created any
+   * workspaces there yet).
+   */
+  ensureOutput(outputId: number): Promise<WorkspaceSnapshot>;
 }

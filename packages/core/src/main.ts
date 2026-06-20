@@ -810,18 +810,19 @@ pluginBus.subscribe("window.move-to-output-requested", (_n, payload) => {
   if (!state.outputs.has(targetOutputId)) return;
   const focused = state.seat.kbFocus?.surfaceId;
   if (typeof focused !== "number") return;
-  // Move to workspace 1 on the target output: M5+ semantics is "the shown
-  // workspace on that output." We call the namespace's `current` to resolve
-  // its index, then moveWindow to that index.
+  // Move to the shown workspace on the target output. Workspaces are
+  // created lazily; ensureOutput guarantees the target output has one
+  // (idempotent if it already does) before the move.
   const rt = runtime;
   void (async () => {
-    const cur = await rt.invokeNamespace("workspace", "current", [targetOutputId]);
-    const targetIndex = (cur && typeof cur === "object"
-                         && typeof (cur as { index?: unknown }).index === "number")
-      ? (cur as { index: number }).index
-      : 1;
+    const cur = await rt.invokeNamespace("workspace", "ensureOutput", [targetOutputId]);
+    if (!cur || typeof cur !== "object"
+        || typeof (cur as { index?: unknown }).index !== "number") {
+      throw new Error(`ensureOutput returned no workspace for ${targetOutputId}`);
+    }
     await rt.invokeNamespace(
-      "workspace", "moveWindow", [focused, targetIndex, targetOutputId]);
+      "workspace", "moveWindow",
+      [focused, (cur as { index: number }).index, targetOutputId]);
   })().catch((e: unknown) => {
     log.warn("core", `window.move-to-output failed: ${(e as Error).message}`);
   });
