@@ -17,7 +17,7 @@
     "build:native": "npm run build:native:configure && cmake --build packages/core/build --parallel",
     "build": "npm run build:js && npm run build:native",
     "test:unit": "node --test 'test/**/*.test.js'",
-    "test:gpu": "node --test --test-concurrency=1 'test/**/*.gpu.mjs'",
+    "test:gpu": "node scripts/run-gpu-tests.mjs",
     "test": "npm run build && npm run test:unit && npm run test:gpu"
   },
   "devDependencies": {
