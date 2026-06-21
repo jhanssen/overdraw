@@ -2462,8 +2462,27 @@ export class JsCompositor implements CompositorSink {
       });
     } else {
       if (!this.dawn) return;
+      // Any live composer is "every-frame" by contract: its caller produces
+      // a fresh sample each tick whether or not anything else changed.
+      // While at least one is registered, all outputs are treated as dirty
+      // so the on-screen pass keeps running alongside the live producer.
+      // Empty in steady state, so the common idle path falls through to the
+      // per-output dirty gate below.
+      const liveActive = this.liveProducers.length > 0
+        || this.liveScenes.length > 0
+        || this.liveWindowComps.length > 0;
       const outs = [...this.outputsGeom.values()].sort((a, b) => a.id - b.id);
       for (const o of outs) {
+        // Per-output render gate. Skip this output if nothing changed on it
+        // since its last present (no damage accumulated, no active
+        // transition, no live composer in flight). Without this gate every
+        // flip-complete on every output would trigger a full re-render at
+        // that panel's refresh rate -- two outputs at 60Hz + 240Hz burn
+        // 300 idle composites per second on an empty desk.
+        const dirty = liveActive
+          || this.outputDamage.isDirty(o.id)
+          || this.activeTransitions.has(o.id);
+        if (!dirty) continue;
         const handle = this.addon.acquireOutputTexture(o.id);
         // The native addon returns nullptr from N-API on "no slot available"
         // (no FREE scanout in KMS mode; no swapchain texture in nested-host
@@ -2482,8 +2501,9 @@ export class JsCompositor implements CompositorSink {
           scissor: this.takeScissor(o, handle),
         });
       }
-      // Every output's ring was busy this frame -- nothing to present, and the
-      // lifecycle/bracket machinery would otherwise open a frame with no draw.
+      // No output needs rendering this pass (every output's ring was busy,
+      // or no output is dirty). The lifecycle/bracket machinery would
+      // otherwise open a frame with no draw.
       if (targets.length === 0) return;
     }
 
@@ -2654,8 +2674,14 @@ export class JsCompositor implements CompositorSink {
       }
 
       // Present each acquired output and drop its wrapped scanout texture.
+      // Clearing the per-output dirty bit happens here, AFTER the present
+      // call returns, so an exception thrown between gate-check and present
+      // does not silently drop the dirty signal. A subsequent damageRect or
+      // markDirty between this clear and the next vblank re-sets the bit
+      // and the gate fires again on the next pass.
       for (const t of targets) {
         if (t.present) this.addon.presentOutput(t.ctx.id);
+        this.outputDamage.clearDirty(t.ctx.id);
       }
       this.outputTex = null;
     } catch (e) {
@@ -3277,8 +3303,16 @@ export class JsCompositor implements CompositorSink {
   // from inside the evaluator's commit callback so the very next frame
   // draws that output's post-transition state through the normal composite
   // path. Idempotent.
+  //
+  // Marks the output dirty: the broker's commit may not include a
+  // setOutputStack (which would have damaged-full), in which case
+  // nothing else has signaled the per-output render gate that the
+  // post-transition state needs to be drawn. Without this, the gate
+  // would skip the next frame and the screen would freeze on the last
+  // mid-transition image.
   clearActiveTransition(outputId: number): void {
     this.activeTransitions.delete(outputId);
+    this.outputDamage.markDirty(outputId);
   }
 
   // For tests: true while a transition is installed on `outputId`. Omit

@@ -194,7 +194,11 @@ Compositing lives entirely in core main-thread JS (`compositor.ts`,
   scanout rings + CRTC + fence routing, per-output render slicing,
   independent per-output vblank pacing, per-output frame-callback
   dispatch, per-output content stacks, per-output composite-scissor
-  damage, libinput full-layout cursor clamp. Per-window `outputId`;
+  damage, per-output dirty gate (an output's flip-complete does NOT
+  re-render that output unless damage / a transition / a live producer
+  marked it dirty since the last present -- an idle compositor with no
+  clients consumes ~0% CPU), libinput full-layout cursor clamp.
+  Per-window `outputId`;
   layout-driver loops per output; layer-shell honors the `output` arg;
   workspace plugin carries `preferredOutputs`. `wl_output` globals per
   entry in `state.outputs`. `wl_surface.enter`/`leave` via residency

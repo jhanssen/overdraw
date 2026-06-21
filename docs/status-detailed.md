@@ -127,8 +127,20 @@ with no error. Worst-first.
   back on take. When a frame renders, each output's on-screen composite is
   scissored to its slot's damage with `loadOp:"load"` + a black-fill quad (so
   the bottom of the stack blends against black inside the scissor, not stale
-  pixels); a whole-output or first-sight slot takes the full clear path. Frame *cadence* is unchanged (still gated by the native
-  `wantNext`/`wake()` loop — idle already skips). Residuals (optimization-only,
+  pixels); a whole-output or first-sight slot takes the full clear path.
+  **Per-output dirty gate (sibling to the scissor):** alongside the per-slot
+  region, `OutputDamageMap` tracks a per-output dirty bit set by every
+  `damageRect`/`full` call and by `markDirty(outputId)`, cleared on present.
+  `JsCompositor.renderFrame` consults it before `acquireOutputTexture`: an
+  output that is clean and has no active transition and no live producer is
+  skipped entirely (no acquire, no present, no flip-complete). Without this
+  gate, every flip-complete on every output re-triggered a full per-output
+  composite at that panel's refresh rate (two outputs at 60Hz + 240Hz =
+  ~300 idle composites/sec, ≈100% CPU on the node process even with zero
+  clients connected); with it, the steady-state idle compositor consumes
+  ~0% CPU until something dirties an output. Mirrors wlroots
+  (`wlr_scene_output_needs_frame`) / Hyprland (`m_output->needsFrame`).
+  Residuals (optimization-only,
   never correctness): (a) the scissor is the damage **bounding box**, not
   per-rect, so scattered damage over-draws; (b) only content commits, layout
   move/resize, cursor moves, and surface removal produce **precise** rects —

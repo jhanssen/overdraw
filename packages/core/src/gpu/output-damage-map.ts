@@ -33,6 +33,15 @@ interface Entry {
 
 export class OutputDamageMap {
   private entries = new Map<number, Entry>();
+  // Per-output dirty bit. Set by every damageRect/full call for an output
+  // the dirty signal touches; cleared by clearDirty(outputId) on successful
+  // present. Independent of the per-slot damage rings: the rings answer
+  // "what region needs to be redrawn" given that we ARE drawing this slot;
+  // the dirty bit answers "should this output be rendered at all this
+  // vblank." Without the second predicate, an idle compositor would re-
+  // render every output every flip-complete (set wantNext + acquire a free
+  // slot + present) at the panel's refresh rate, burning CPU.
+  private dirty = new Set<number>();
 
   // Replace the full set of known outputs. Outputs no longer present have
   // their rings dropped; outputs present in both old and new sets keep
@@ -58,7 +67,13 @@ export class OutputDamageMap {
         ring.setBounds(b.logicalWidth, b.logicalHeight);
         if (prev) ring.full();  // size changed; carry over the stale signal
         next.set(b.outputId, { bounds: b, ring });
+        // A new or resized output needs an initial frame.
+        this.dirty.add(b.outputId);
       }
+    }
+    // Drop dirty bits for outputs that went away.
+    for (const id of [...this.dirty]) {
+      if (!next.has(id)) this.dirty.delete(id);
     }
     this.entries = next;
   }
@@ -68,7 +83,10 @@ export class OutputDamageMap {
   // regions (stack reorder, per-surface fx, full repaint on output set
   // change).
   full(): void {
-    for (const e of this.entries.values()) e.ring.full();
+    for (const e of this.entries.values()) {
+      e.ring.full();
+      this.dirty.add(e.bounds.outputId);
+    }
   }
 
   // Union a global-logical-space rect into the rings of every output it
@@ -91,7 +109,33 @@ export class OutputDamageMap {
       // already-clipped local rect.
       e.ring.damageRect(lx0 - b.logicalX, ly0 - b.logicalY,
                         lx1 - lx0, ly1 - ly0);
+      this.dirty.add(b.outputId);
     }
+  }
+
+  // True iff `outputId` has work to draw this vblank: a damageRect/full
+  // signal landed on it since the last clearDirty. Unknown outputIds
+  // return false (the map has no entry for them). Consulted by the
+  // compositor's per-output render gate.
+  isDirty(outputId: number): boolean {
+    return this.dirty.has(outputId);
+  }
+
+  // Mark an output dirty without supplying geometry. For sources that want
+  // the per-output render gate to fire but don't know (or don't care
+  // about) the affected region -- e.g. an active animation evaluator that
+  // hasn't yet pushed its per-surface damage, an active transition pass,
+  // a live producer that re-samples every frame. The per-slot damage ring
+  // is not modified here; the slot's take() will return its usual region
+  // (or full() if first-sight), which is correct.
+  markDirty(outputId: number): void {
+    if (this.entries.has(outputId)) this.dirty.add(outputId);
+  }
+
+  // Drop the dirty bit for `outputId`. Called by the compositor after the
+  // output's present commits, so the next vblank is gated on fresh damage.
+  clearDirty(outputId: number): void {
+    this.dirty.delete(outputId);
   }
 
   // Consume the accumulated damage for `outputId`'s slot identified by
