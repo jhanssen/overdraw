@@ -25,6 +25,22 @@ test("edidScaleFallback derives from DPI (snapped)", () => {
   assert.equal(edidScaleFallback(2560, 1600, 0, 0), 1);
 });
 
+// 4K monitor at 1.75x raw scale: a naive quarter-step round would produce
+// 1.75, but 3840/1.75 = 2194.286 (not integer). The integer-logical search
+// retargets to a nearby scale that divides cleanly. 1.6 yields 2400x1350
+// exact; further-away candidates like 2.0 (1920x1080) are passed over in
+// favor of the closer 1.6.
+test("snapScale (with device dims) avoids fractional logical pixels", () => {
+  // 3840x2160 with raw 1.75 -> snap to integer-logical neighbor.
+  const s = edidScaleFallback(3840, 2160, 600, 340);  // ~1.75 raw DPI
+  const lw = 3840 / s;
+  const lh = 2160 / s;
+  assert.equal(lw, Math.round(lw), `logical width ${lw} not integer at scale ${s}`);
+  assert.equal(lh, Math.round(lh), `logical height ${lh} not integer at scale ${s}`);
+  // Reality check: should land within a sensible range, not jump to 1.0.
+  assert.ok(s > 1.0 && s <= 2.0, `scale ${s} outside expected range`);
+});
+
 test("resolveScale: config wins, else EDID auto (gated), else 1", () => {
   // Explicit config overrides everything (snapped).
   assert.equal(resolveScale({
