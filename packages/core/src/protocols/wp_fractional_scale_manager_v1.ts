@@ -14,47 +14,13 @@ import type { WpFractionalScaleV1Handler } from "#protocols-gen/wp_fractional_sc
 
 import type { Ctx, CompositorState } from "./ctx.js";
 import type { Resource } from "../types.js";
-import { primaryOutputId } from "./output-resolve.js";
+import { primaryOutputOfSurface } from "./output-resolve.js";
 
 void fsSig;
 
 // The protocol expresses scale in 120ths (scale * 120), so 1.5 -> 180.
 function asProtocolValue(scale: number): number {
   return Math.max(120, Math.round(scale * 120));
-}
-
-// Surface's "primary output" for scale purposes. Prefers the authoritative
-// rec.enteredOutputs set (kept in sync by updateSurfaceOutputResidency, and
-// overrideable by callers driving a residency change before geometry has
-// moved -- e.g. cross-output workspace moves) over the geometric overlap.
-// Falls back to the compositor's primary when the surface doesn't yet
-// resolve to any output.
-function primaryOutputOfSurface(
-  state: CompositorState, surfaceRes: Resource,
-): number {
-  let surfaceId = -1;
-  let rec = undefined;
-  for (const [id, r] of state.surfacesById ?? []) {
-    if (r.resource === surfaceRes) { surfaceId = id; rec = r; break; }
-  }
-  if (surfaceId < 0) return primaryOutputId(state);
-  // Authoritative residency set first: residency drives enter/leave AND
-  // preferred_scale together, so the just-updated set is what kitty just
-  // saw on the wire and should match what scale we send.
-  if (rec && rec.enteredOutputs && rec.enteredOutputs.size > 0) {
-    let lo = Infinity;
-    for (const id of rec.enteredOutputs) if (id < lo) lo = id;
-    if (Number.isFinite(lo)) return lo;
-  }
-  // Geometric overlap fallback (residency not yet computed for this
-  // surface, e.g. very first commit).
-  const surfaceOutputs = state.compositor.surfaceOutputs;
-  if (!surfaceOutputs) return primaryOutputId(state);
-  const overlapping = surfaceOutputs.call(state.compositor, surfaceId);
-  if (overlapping.length === 0) return primaryOutputId(state);
-  let lo = Infinity;
-  for (const id of overlapping) if (id < lo) lo = id;
-  return lo === Infinity ? primaryOutputId(state) : lo;
 }
 
 // The preferred scale (in protocol units, scale * 120) for `surfaceRes`'s

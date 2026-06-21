@@ -10,6 +10,8 @@ import type { Ctx, XdgSurfaceRecord, PopupRecord, CompositorState } from "./ctx.
 import type { Resource } from "../types.js";
 import { solvePopupPosition } from "../popup-position.js";
 import { computeBaseStack, emitSubtree } from "../subsurfaces.js";
+import { primaryOutputOfSurface, primaryOutputId } from "./output-resolve.js";
+import { detachSurfaceRole } from "./wl_surface.js";
 
 // Output-space top-left of a parent xdg_surface: a toplevel uses its WM window
 // rect; a popup parent uses its own resolved output position (recursively);
@@ -58,24 +60,46 @@ export function popupOutputOrigin(state: CompositorState, pr: PopupRecord): { x:
 export function configurePopup(ctx: Ctx, pr: PopupRecord): void {
   const origin = popupOutputOrigin(ctx.state, pr);
   if (!origin) return; // unparented; defer the configure
-  // Position-constrain the popup against its parent's output. Popups attach
-  // to a toplevel (or layer surface) whose outputId is known; look up that
-  // output's rect from the WM and use its dims. Falls back to the primary if
-  // the parent is mid-detach. This is "good enough" for single-output and
-  // for popups that don't straddle output boundaries; full edge-aware
-  // multi-output popup constraints are not in v1's scope.
-  const wm = ctx.state.wm;
-  let outRect = { width: 1920, height: 1080 };
-  if (wm) {
-    const primaryId = wm.primaryOutputId();
-    const wmOut = wm.state.outputs.get(primaryId);
-    if (wmOut) outRect = { width: wmOut.rect.width, height: wmOut.rect.height };
-  }
-  pr.rect = solvePopupPosition(pr.positioner, origin.x, origin.y, outRect.width, outRect.height);
+  // Position-constrain the popup against its parent surface's CURRENT
+  // output. A popup parented to a toplevel that has been moved to a
+  // second monitor must be solved against that monitor's GLOBAL rect,
+  // not output 0's -- otherwise the constraint solver pushes the popup
+  // into negative parent-relative space (the parent's global X exceeds
+  // output 0's right edge, so every candidate position is "outside" and
+  // slide_x clamps left, landing the popup far to the left of the
+  // parent on the wrong monitor).
+  const parentSurfaceRes = parentSurfaceResourceOf(ctx.state, pr);
+  const parentOutputId = parentSurfaceRes
+    ? primaryOutputOfSurface(ctx.state, parentSurfaceRes)
+    : primaryOutputId(ctx.state);
+  const outEntry = ctx.state.outputs?.get(parentOutputId);
+  // outputs[*].logicalPosition + logicalSize are the GLOBAL rect of
+  // that output. Fall back to a safe single-output area at origin when
+  // outputs is absent (test stubs).
+  const outRect = outEntry
+    ? {
+        x: outEntry.logicalPosition.x, y: outEntry.logicalPosition.y,
+        width: outEntry.logicalSize.width, height: outEntry.logicalSize.height,
+      }
+    : { x: 0, y: 0, width: 1920, height: 1080 };
+  pr.rect = solvePopupPosition(
+    pr.positioner, origin.x, origin.y,
+    outRect.x, outRect.y, outRect.width, outRect.height);
   ctx.events.xdg_popup.send_configure(pr.resource, pr.rect.x, pr.rect.y, pr.rect.width, pr.rect.height);
   const serial = ctx.state.serial();
   pr.xdgSurface.lastConfigureSerial = serial;
   ctx.events.xdg_surface.send_configure(pr.xdgSurface.resource, serial);
+}
+
+// The wl_surface this popup is parented to: the root toplevel's wl_surface,
+// the immediate parent popup's wl_surface, or the layer parent's wl_surface.
+// Returns null only for malformed records (no resolvable parent).
+function parentSurfaceResourceOf(
+  state: CompositorState, pr: PopupRecord,
+): Resource | null {
+  if (pr.layerParent) return pr.layerParent.surface.resource;
+  if (pr.parent && pr.parent.surface) return pr.parent.surface.resource;
+  return null;
 }
 
 export default function makeXdgPopup(ctx: Ctx): XdgPopupHandler {
@@ -99,8 +123,16 @@ export default function makeXdgPopup(ctx: Ctx): XdgPopupHandler {
     destroy(resource) {
       const pr = rec(resource);
       if (pr) {
+        // Detach the popup role: tear down the WM/compositor entry,
+        // reset the wl_surface's mapped state so the SAME wl_surface
+        // can be re-used for a fresh popup (the common GTK menu-open
+        // pattern: destroy xdg_popup + xdg_surface, then
+        // get_xdg_surface + get_popup again on the same wl_surface).
+        // Without this reset, the next buffer commit's map sweep sees
+        // s.mapped === true from this binding and silently skips the
+        // re-map.
         const surf = pr.xdgSurface.surface;
-        if (pr.mapped && surf) ctx.state.compositor.removeSurface(surf.id);
+        if (surf) detachSurfaceRole(ctx.state, surf);
         if (ctx.state.grabbedPopup === resource) ctx.state.grabbedPopup = undefined;
         ctx.state.popups?.delete(resource);
         rebuildStackWithPopups(ctx.state);

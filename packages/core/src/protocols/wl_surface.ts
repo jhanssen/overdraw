@@ -238,8 +238,11 @@ function applySurfaceState(ctx: Ctx, s: SurfaceRecord): void {
   }
 
   // Apply wp_viewport state. undefined = unchanged; push to the compositor
-  // only when src or dst changed this cycle.
-  let viewportChanged = false;
+  // only when src or dst changed this cycle (OR the compositor surface
+  // was torn down since the last apply -- after a role-detach the
+  // compositor Surface entry is a blank slate that needs every latched
+  // protocol-side value re-pushed).
+  let viewportChanged = !!s.needsCompositorResync;
   if (s.pending.viewportSrc !== undefined) {
     s.viewportSrc = s.pending.viewportSrc;
     s.pending.viewportSrc = undefined;
@@ -253,6 +256,7 @@ function applySurfaceState(ctx: Ctx, s: SurfaceRecord): void {
   if (viewportChanged) {
     ctx.state.compositor.setSurfaceViewport?.(s.id, s.viewportDst ?? null, s.viewportSrc ?? null);
   }
+  s.needsCompositorResync = false;
 
   // Subsurface-managed state (position + sibling reorder) of THIS
   // surface's children is applied on THIS surface's commit, regardless
@@ -505,6 +509,20 @@ export default function makeSurface(ctx: Ctx): WlSurfaceHandler {
 
       if (s.xdgSurface) s.xdgSurface.lastCommitSerial = ctx.state.nextSerial - 1;
 
+      // Null-buffer-commit unmap: per xdg-shell, attaching null and
+      // committing on a mapped surface unmaps it (without destroying
+      // the role). The client may then commit a new buffer to re-map
+      // under the same role. detachSurfaceRole resets the wl_surface
+      // to the same state a role-destroy would (window.unmap fired,
+      // WM/compositor entries dropped, mapped flag cleared) so the
+      // next non-null commit re-runs the map sweep cleanly.
+      if (s.mapped && s.committed.buffer === null
+          && (s.role === "xdg_popup" || s.role === "xdg_toplevel"
+              || s.role === "layer_surface")) {
+        detachSurfaceRole(ctx.state, s);
+        s.hasContent = false;
+      }
+
       // Initial-commit detection (xdg-shell): the first commit on a
       // toplevel-roled surface whose xdg_surface has not yet sent any
       // configure. Per spec the client commits the xdg_surface with no
@@ -564,38 +582,85 @@ export default function makeSurface(ctx: Ctx): WlSurfaceHandler {
   };
 }
 
-// Run a surface's window-unmap teardown: emit window.unmap (mapped toplevels only,
-// mirroring window.map), drop pending coalesced changes, unmap in the WM, and
-// remove it from the compositor + id map. IDEMPOTENT via the `unmapped` guard, so
-// it is safe to call from BOTH the explicit wl_surface.destroy request AND the
-// resource-destroyed sweep (client disconnect): whichever runs first does the work;
-// the second is a no-op. Without the sweep path, a client that disconnects without
-// explicitly destroying its wl_surface would never emit window.unmap, leaking any
-// decoration ring bound to that window (the provider frees it on sdk.windows.onUnmap).
-export function unmapAndTeardownSurface(state: CompositorState, s: SurfaceRecord): void {
-  if (s.unmapped) return;
-  s.unmapped = true;
-  // Phase 9a: BEFORE the WM/compositor teardown, give the closing
-  // driver a chance to capture a phantom. The driver is a no-op when
-  // no plugin claims the 'window-closing' namespace, so when nothing
-  // is registered we proceed straight to instant unmap (the original
-  // pre-9a behavior). When the driver DOES capture, it emits
-  // window.closing on the bus + arms a backstop; the phantom lives
-  // in the compositor independently until the plugin (or the
-  // backstop) destroys it.
-  state.closingDriver?.beforeUnmap(state, s);
-  if (s.mapped && (s.role === "xdg_toplevel" || s.role === "layer_surface")) {
-    state.bus?.emit(WINDOW_EVENT.unmap, { surfaceId: s.id });
-  }
-  state.pendingWindowChanges?.delete(s.id);
-  // Layer-shell teardown: clear reservations + drop from the layer stack.
-  // Idempotent so the explicit zwlr_layer_surface_v1.destroy AND this
-  // wl_surface sweep can each run safely.
+// Logical unmap of a surface in its current role: emit window.unmap
+// (mapped toplevels / layer surfaces), drop WM tracking + compositor
+// stack entry, tear down layer-shell reservations, and reset the
+// wl_surface's role-bound state so re-roling on the same wl_surface
+// works. The wl_surface itself is NOT destroyed -- callers that need
+// the full destroy path (the wl_surface resource itself going away)
+// use unmapAndTeardownSurface, which adds the s.unmapped guard +
+// surfacesById removal on top.
+//
+// Used by xdg_popup.destroy, xdg_toplevel.destroy,
+// zwlr_layer_surface_v1.destroy, and the null-buffer commit unmap
+// path. The common GTK pattern is destroy xdg_popup + xdg_surface +
+// re-bind on the same wl_surface for the next menu open; without this
+// the second open's map-on-first-content sweep sees s.mapped === true
+// from the prior role and silently skips it.
+//
+// Two phases. The role-state cleanup runs UNCONDITIONALLY (layer-shell
+// reservations are registered at apply-time, before the surface ever
+// maps -- destroying an applied-but-never-mapped layer surface must
+// still clear its zone). The mapped-state reset (events + WM unmap +
+// compositor stack drop + flag reset) runs only when the surface
+// actually mapped.
+export function detachSurfaceRole(state: CompositorState, s: SurfaceRecord): void {
+  // Role-state cleanup -- runs even when never-mapped. Layer-shell
+  // reservations register on apply, not on map; the zone must be
+  // released regardless of whether the surface ever showed content.
   if (s.layerSurface) {
     teardownLayerSurface(state, s.layerSurface);
     s.layerSurface = null;
   }
+  if (!s.mapped) return;
+  // Mapped-only path: emit unmap event + clear runtime state.
+  // BEFORE the WM/compositor teardown, give the closing driver a chance
+  // to capture a phantom. No-op when no plugin claims the
+  // 'window-closing' namespace.
+  state.closingDriver?.beforeUnmap(state, s);
+  if (s.role === "xdg_toplevel" || s.role === "layer_surface") {
+    state.bus?.emit(WINDOW_EVENT.unmap, { surfaceId: s.id });
+  }
+  state.pendingWindowChanges?.delete(s.id);
   state.wm?.unmapWindow(s.id);
   state.compositor.removeSurface(s.id);
+  // The compositor-side Surface entry is gone; the next first-commit
+  // recreates it as blank. Force the next applySurfaceState to
+  // re-push every latched protocol-side state value (viewport, etc.)
+  // that the change-detect path would otherwise skip.
+  s.needsCompositorResync = true;
+  // Reset the wl_surface's mapped/role state so a fresh role binding
+  // on the same wl_surface re-runs through the map-on-first-content
+  // sweep.
+  s.mapped = false;
+  // Drop pending wl_surface.frame callbacks: an unmapped surface can't
+  // produce frame callbacks; leaving them queued would deliver them at
+  // some unrelated future render after a re-bind.
+  s.frameCallbacks = undefined;
+  s.pending.frameCallbacks = undefined;
+  // Output residency must rebuild from scratch: a re-roled surface may
+  // land on a different output, and the residency differ would
+  // otherwise miss the implicit "left every output" transition.
+  s.enteredOutputs?.clear();
+  // hasContent stays as a "the surface has presentable bytes" flag;
+  // next commit refreshes it. A null-buffer-commit unmap clears it
+  // explicitly because the surface no longer has presentable content.
+}
+
+// Run a surface's full destroy teardown for the case where the
+// wl_surface itself is going away (explicit wl_surface.destroy OR
+// resource-destroyed sweep on client disconnect). Builds on
+// detachSurfaceRole for the role-detach work, then marks the surface
+// permanently unmapped and removes its surfacesById entry. IDEMPOTENT
+// via the `unmapped` guard so both the explicit-destroy path AND the
+// disconnect sweep can each call it safely; whichever runs first does
+// the work, the second is a no-op. Without the sweep path, a client
+// that disconnects without explicitly destroying its wl_surface would
+// never emit window.unmap, leaking any decoration ring bound to that
+// window (the provider frees it on sdk.windows.onUnmap).
+export function unmapAndTeardownSurface(state: CompositorState, s: SurfaceRecord): void {
+  if (s.unmapped) return;
+  s.unmapped = true;
+  detachSurfaceRole(state, s);
   state.surfacesById?.delete(s.id);
 }

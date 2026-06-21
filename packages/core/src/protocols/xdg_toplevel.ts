@@ -14,6 +14,7 @@ import { signature as toplevelSig } from "#protocols-gen/xdg_toplevel.js";
 import type { Ctx, ResizeEdges } from "./ctx.js";
 import type { Resource } from "../types.js";
 import { markWindowChanged } from "./window-changes.js";
+import { detachSurfaceRole } from "./wl_surface.js";
 
 const RESIZE_EDGE = toplevelSig.enums.resize_edge.entries;
 //   none=0 top=1 bottom=2 left=4 top_left=5 bottom_left=6
@@ -177,6 +178,16 @@ export default function makeToplevel(ctx: Ctx): XdgToplevelHandler {
       propose(resource, { presentation: "minimized" });
     },
     destroy(resource) {
+      // Tear down the WM + compositor + bus state attached to this
+      // toplevel BEFORE dropping the toplevel record itself. A client
+      // is allowed to destroy xdg_toplevel without destroying its
+      // wl_surface (the spec permits re-roling). detachSurfaceRole
+      // emits window.unmap, drops the WM entry + compositor stack
+      // slot, and resets the wl_surface's mapped flag so a fresh
+      // role binding works.
+      const t = ctx.state.toplevels?.get(resource);
+      const surface = t?.xdgSurface.surface;
+      if (surface) detachSurfaceRole(ctx.state, surface);
       ctx.state.toplevels?.delete(resource);
     },
   };

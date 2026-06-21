@@ -44,3 +44,37 @@ export function resolveOutputArg(state: CompositorState, output: unknown): numbe
   const id = resolveWlOutputToId(state, output);
   return id ?? primaryOutputId(state);
 }
+
+// The outputId a wl_surface is currently "on" -- its primary output for
+// the purposes of protocols that pick ONE output per surface (preferred
+// scale, popup positioning, etc.). Authoritative source: the surface's
+// residency set (driven by surfaceOutputs() + the residency updater).
+// Falls back to geometric overlap when residency hasn't yet been computed
+// (very first commit), then to the compositor's primary when neither is
+// available.
+//
+// Picks the LOWEST overlapping outputId for determinism: a surface that
+// straddles outputs 0 and 1 reports output 0 consistently across runs,
+// so re-emits across output reconfigurations don't oscillate.
+export function primaryOutputOfSurface(
+  state: CompositorState, surfaceRes: Resource,
+): number {
+  let surfaceId = -1;
+  let rec = undefined;
+  for (const [id, r] of state.surfacesById ?? []) {
+    if (r.resource === surfaceRes) { surfaceId = id; rec = r; break; }
+  }
+  if (surfaceId < 0) return primaryOutputId(state);
+  if (rec && rec.enteredOutputs && rec.enteredOutputs.size > 0) {
+    let lo = Infinity;
+    for (const id of rec.enteredOutputs) if (id < lo) lo = id;
+    if (Number.isFinite(lo)) return lo;
+  }
+  const surfaceOutputs = state.compositor.surfaceOutputs;
+  if (!surfaceOutputs) return primaryOutputId(state);
+  const overlapping = surfaceOutputs.call(state.compositor, surfaceId);
+  if (overlapping.length === 0) return primaryOutputId(state);
+  let lo = Infinity;
+  for (const id of overlapping) if (id < lo) lo = id;
+  return lo === Infinity ? primaryOutputId(state) : lo;
+}

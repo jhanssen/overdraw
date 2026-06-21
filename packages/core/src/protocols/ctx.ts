@@ -153,6 +153,12 @@ export interface SurfaceRecord {
   // the resource-destroyed sweep on client disconnect). Guards against emitting
   // window.unmap / tearing down twice.
   unmapped?: boolean;
+  // True when the compositor-side Surface entry was torn down (via
+  // detachSurfaceRole / removeSurface) but the protocol-side
+  // SurfaceRecord still holds latched state (viewport, etc.) that
+  // wasn't pushed via the change-detect path. The next applySurfaceState
+  // re-pushes the latched state unconditionally and clears this.
+  needsCompositorResync?: boolean;
   frameCallbacks?: Resource[];
   // The outputId the surface was spawned on (xdg_surface.get_toplevel
    // resolves it from spawn-follows-pointer or an explicit hint). Carried

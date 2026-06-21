@@ -608,9 +608,16 @@ export default function makeSeat(ctx: Ctx, driver: FocusDriver): SeatHandler {
         break;
       }
       case "pointerButton": {
-        // A press outside a grabbing popup dismisses it (and is swallowed,
-        // not delivered to the client) -- standard menu behavior.
-        if (ev.pressed && ctx.state.dismissGrabbedPopup?.(lastX, lastY)) return;
+        // A press outside a grabbing popup dismisses it but is STILL
+        // delivered to whatever surface is under it. Swallowing the
+        // press makes the user click twice to interact with anything
+        // else (once to dismiss, once to act) -- and on the popup's
+        // own opener button (the GTK4 hamburger menu being the canonical
+        // case) the swallowed first click means the button never sees
+        // its toggle press, so the menu won't reopen. wlroots' popup
+        // grab follows the same model: the press is sent, the client
+        // dismisses the popup itself in response.
+        if (ev.pressed) ctx.state.dismissGrabbedPopup?.(lastX, lastY);
         const button = ev.button ?? 0;
 
         // Consult the binding chain. Press: dispatchPress (with the

@@ -56,6 +56,7 @@ import {
 
 import { rebuildLayerStack, protocolLayerToCompositorLayer } from "../layer-stack.js";
 import { configurePopup } from "./xdg_popup.js";
+import { detachSurfaceRole } from "./wl_surface.js";
 
 // ---- helpers --------------------------------------------------------------
 
@@ -520,7 +521,11 @@ export function makeLayerSurface(ctx: Ctx): ZwlrLayerSurfaceV1Handler {
     },
     destroy(resource) {
       const r = rec(resource);
-      if (r) teardownLayerSurface(ctx.state, r);
+      if (!r) return;
+      // detachSurfaceRole drives teardownLayerSurface internally
+      // (and emits window.unmap, drops WM tracking, resets mapped),
+      // so the wl_surface can be re-bound under a fresh role.
+      detachSurfaceRole(ctx.state, r.surface);
     },
     set_layer(resource, layer) {
       const r = rec(resource);

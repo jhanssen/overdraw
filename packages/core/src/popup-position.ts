@@ -4,9 +4,12 @@
 //
 // Coordinates: the positioner's anchor_rect and the result are in the PARENT
 // surface's window-geometry space (origin = parent's top-left). `parentX/parentY`
-// is the parent's top-left in output space; the output is [0,0,outW,outH]. The
-// returned rect is in parent-relative coords (the caller adds parentX/Y to place
-// it in output space) so xdg_popup.configure reports parent-relative position.
+// is the parent's top-left in GLOBAL (output-space) coords. `outX/outY/outW/outH`
+// is the relevant output's rect, also in GLOBAL coords -- so the solver works
+// equally well when the parent is on a non-primary output whose origin is not
+// at (0, 0). The returned rect is in parent-relative coords (the caller adds
+// parentX/Y to place it in output space) so xdg_popup.configure reports
+// parent-relative position.
 
 export interface Positioner {
   width: number;
@@ -83,19 +86,22 @@ function computeRaw(p: Positioner, anchor: number, gravity: number): { x: number
   return { x: pl.x + p.offsetX, y: pl.y + p.offsetY };
 }
 
-// Solve the popup rect (parent-relative). `parentX/Y` = parent top-left in output
-// space; output = [0,0,outW,outH]. Applies flip (preferred), then slide, then
-// resize per the constraint_adjustment mask, independently per axis.
+// Solve the popup rect (parent-relative). `parentX/Y` = parent top-left in
+// GLOBAL output space; output rect = `[outX, outY, outX+outW, outY+outH]`
+// in the same coords. Applies flip (preferred), then slide, then resize per
+// the constraint_adjustment mask, independently per axis.
 export function solvePopupPosition(
-  p: Positioner, parentX: number, parentY: number, outW: number, outH: number,
+  p: Positioner,
+  parentX: number, parentY: number,
+  outX: number, outY: number, outW: number, outH: number,
 ): Rect {
   let w = p.width, h = p.height;
   let anchor = p.anchor, gravity = p.gravity;
   let { x, y } = computeRaw(p, anchor, gravity);
 
   // Output bounds in parent-relative coords.
-  const minX = -parentX, maxX = outW - parentX;
-  const minY = -parentY, maxY = outH - parentY;
+  const minX = outX - parentX, maxX = outX + outW - parentX;
+  const minY = outY - parentY, maxY = outY + outH - parentY;
 
   // --- X axis ---
   if (x < minX || x + w > maxX) {
