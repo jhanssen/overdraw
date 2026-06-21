@@ -9,8 +9,8 @@ import assert from 'node:assert/strict';
 import makeXdgOutputManager from
   '../packages/core/dist/protocols/zxdg_output_manager_v1.js';
 
-function mockResource(name) {
-  return { __resource: name, interfaceName: name, version: 3, destroyed: false };
+function mockResource(name, version = 2) {
+  return { __resource: name, interfaceName: name, version, destroyed: false };
 }
 
 function makeRec(id, name, x, w, h) {

@@ -38,8 +38,8 @@ function mockCtx(outputRecord) {
   };
 }
 
-function mockResource(name = "res") {
-  return { __resource: name, interfaceName: name, version: 3, destroyed: false };
+function mockResource(name = "res", version = 2) {
+  return { __resource: name, interfaceName: name, version, destroyed: false };
 }
 
 function defaultRecord() {
@@ -59,24 +59,42 @@ function defaultRecord() {
   };
 }
 
-test("get_xdg_output emits the full burst then done", () => {
+test("get_xdg_output emits the full burst then done for v<3 clients", () => {
   const ctx = mockCtx(defaultRecord());
   const mgr = makeXdgOutputManager(ctx);
-  const wlOutput = mockResource("wl_output");
-  const xdgOutput = mockResource("zxdg_output_v1");
-  mgr.get_xdg_output(mockResource("mgr"), xdgOutput, wlOutput);
+  const wlOutput = mockResource("wl_output", 2);
+  const xdgOutput = mockResource("zxdg_output_v1", 2);
+  mgr.get_xdg_output(mockResource("mgr", 2), xdgOutput, wlOutput);
   const names = ctx._calls.map(([k]) => k);
-  // The xdg_output burst, then a re-sent wl_output.done (so GTK <= 4.22
-  // recomputes the monitor scale now that the logical size has arrived).
+  // The xdg_output burst (with done; v<3), then a re-sent wl_output.done
+  // (so GTK <= 4.22 recomputes the monitor scale now that the logical
+  // size has arrived).
   assert.deepEqual(names,
     ["logical_position", "logical_size", "name", "description", "done", "wl_output_done"]);
-  // Spot-check the values.
   assert.deepEqual(ctx._calls[0][1], { resource: xdgOutput, x: 0, y: 0 });
   assert.deepEqual(ctx._calls[1][1], { resource: xdgOutput, w: 1920, h: 1080 });
   assert.equal(ctx._calls[2][1].name, "overdraw-0");
   assert.equal(ctx._calls[3][1].description, "overdraw nested output");
-  // The trailing wl_output.done targets the wl_output, not the xdg_output.
   assert.deepEqual(ctx._calls[5][1], { resource: wlOutput });
+});
+
+// xdg_output.done was deprecated in v3: clients bound at v3+ derive
+// atomic-commit boundaries from wl_output.done instead. Sending the
+// event to a v3+ client triggers Qt's "most likely a bug in the
+// compositor" warning. Verify it's suppressed.
+test("get_xdg_output does NOT emit xdg_output.done for v>=3 clients (deprecated)", () => {
+  const ctx = mockCtx(defaultRecord());
+  const mgr = makeXdgOutputManager(ctx);
+  const wlOutput = mockResource("wl_output", 3);
+  const xdgOutput = mockResource("zxdg_output_v1", 3);
+  mgr.get_xdg_output(mockResource("mgr", 3), xdgOutput, wlOutput);
+  const names = ctx._calls.map(([k]) => k);
+  // No xdg_output `done`; only the wl_output.done at the end serves as
+  // the atomic-commit signal for v3+ clients.
+  assert.deepEqual(names,
+    ["logical_position", "logical_size", "name", "description", "wl_output_done"]);
+  // Spot-check the trailing wl_output.done still targets the wl_output.
+  assert.deepEqual(ctx._calls[4][1], { resource: wlOutput });
 });
 
 test("get_xdg_output reads the current OutputRecord values", () => {

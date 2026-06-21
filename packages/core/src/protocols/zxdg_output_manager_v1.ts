@@ -56,7 +56,15 @@ function emitTo(
     resource, rec.logicalSize.width, rec.logicalSize.height);
   events.zxdg_output_v1.send_name(resource, rec.name);
   events.zxdg_output_v1.send_description(resource, rec.description);
-  events.zxdg_output_v1.send_done(resource);
+  // xdg_output.done was deprecated in v3 -- clients bound at v3+ derive
+  // atomic-commit boundaries from wl_output.done instead. Sending the
+  // event to a v3+ client triggers Qt's "most likely a bug in the
+  // compositor" warning. The wl_output.done re-emit in get_xdg_output
+  // is still required to seed the logical-size for GTK <= 4.22, and to
+  // serve as the atomic-commit signal for v3+ clients here.
+  if (resource.version < 3) {
+    events.zxdg_output_v1.send_done(resource);
+  }
 }
 
 // Re-emit the full event burst to every bound xdg_output_v1 resource for
