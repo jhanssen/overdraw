@@ -1,6 +1,6 @@
 // GPU integration: real wayland clients + the bundled workspace plugin.
 // Covers the plugin seeing window.map (single-client wiring) and the
-// effect of workspace.move-window + workspace.show on what composites
+// effect of workspace.move-window + workspace.show-at-index on what composites
 // (two-client pixel verification).
 
 import { test } from "node:test";
@@ -124,7 +124,7 @@ test("workspace plugin: move-window + show isolates a workspace's clients (pixel
 
     // Show workspace 2 (B). Now workspace 2 has only B: B spans the full
     // tile region; A is gone from this output.
-    await c.runtime.invokeAction("workspace.show", { index: 2 });
+    await c.runtime.invokeAction("workspace.show-at-index", { index: 2 });
     const px2 = await readUntil(c, (p) =>
       pixelMatches(pixelAt(p, OUT.width, mcx, mcy), bgraB, 4)
       && pixelMatches(pixelAt(p, OUT.width, scx, scy), bgraB, 4));

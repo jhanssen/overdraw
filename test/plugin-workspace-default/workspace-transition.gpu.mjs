@@ -1,7 +1,7 @@
 // Phase 8 step 5: workspace plugin uses sdk.transitions for animated
 // show. Two clients tile the output; we move one to workspace 2; then
-// workspace.show({index:2, transition:{kind, duration}}) animates the
-// swap. Verifies:
+// workspace.show-at-index({index:2, transition:{kind, duration}})
+// animates the swap. Verifies:
 //
 //   1. While the transition runs, the on-screen output shows
 //      transition-pass pixels (a blend of the FROM and TO snapshots),
@@ -98,7 +98,7 @@ test("workspace.show with transition: animated swap, post-transition state visib
     // Now: animated show of workspace 2. This is the path under test.
     // The plugin: captures FROM snapshot of [A], captures TO snapshot
     // of [B], runs the transition, applies setOutputStack on commit.
-    const showPromise = c.runtime.invokeAction("workspace.show",
+    const showPromise = c.runtime.invokeAction("workspace.show-at-index",
       { index: 2, transition: { kind: "crossfade", duration: DURATION } });
 
     // Mid-transition: somewhere between baseline FROM (red at A's tile,
@@ -197,7 +197,7 @@ test("workspace.show without transition: plain swap still works (regression)",
 
     // No transition field -> instant swap. Workspace 2 has only B; B
     // spans the full tile region; both tile positions show B.
-    await c.runtime.invokeAction("workspace.show", { index: 2 });
+    await c.runtime.invokeAction("workspace.show-at-index", { index: 2 });
     await readUntil(c, (px) =>
       pixelMatches(pixelAt(px, OUT.width, mcx, mcy), bgraB, 4)
       && pixelMatches(pixelAt(px, OUT.width, scx, scy), bgraB, 4));
