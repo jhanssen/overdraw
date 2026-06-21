@@ -217,6 +217,19 @@ export interface CompositorSink {
   commitSurfaceBuffer(id: number, poolId: number, offset: number, w: number,
                       h: number, stride: number,
                       damage?: ReadonlyArray<DamageRect>): boolean;
+  // Shm fast path: route the pixel upload through the GPU process's mmap
+  // of the pool (queue.WriteTexture in-process there) instead of marshaling
+  // the pixel bytes across the Dawn wire from the protocol thread. Returns
+  // a non-zero uploadSeq the caller defers wl_buffer.release on; 0 means
+  // the fast path isn't available (test sink, addon predates the API, or
+  // the wire is down) and the caller should fall back to commitSurfaceBuffer.
+  commitSurfaceBufferShm?(id: number, poolId: number, offset: number, w: number,
+                          h: number, stride: number,
+                          damage?: ReadonlyArray<DamageRect>): number;
+  // Drain GPU-process ShmUploaded acks accumulated since the last call.
+  // The protocol layer drains this each tick (dispatchFrameCallbacks)
+  // and fires the wl_buffer.release events keyed on each seq.
+  takeShmUploadAcks?(): number[];
   // `acquireFenceFd` (optional) is a sync_file fd exported by the protocol
   // layer from a wp_linux_drm_syncobj_v1 acquire point. When present, the
   // compositor passes it to the GPU process at the next BeginAccess for this
@@ -575,6 +588,14 @@ export interface CompositorState {
   // surface's new geometry. See xdg_popup.ts:rebuildStackWithPopups for
   // why we defer.
   deferredOutputStacks?: Map<number, number[]>;
+  // Shm fast-path deferred releases: when commitSurfaceBufferShm returns a
+  // non-zero uploadSeq, the protocol layer parks the wl_buffer resource here
+  // keyed by seq. dispatchFrameCallbacks drains compositor.takeShmUploadAcks()
+  // each tick and fires wl_buffer.release for each acked seq. (Mirrors
+  // Hyprland's copy-then-release: the client gets its buffer back as soon as
+  // the GPU process has memcpy'd the bytes into its staging upload, never
+  // earlier.)
+  pendingShmReleases?: Map<number, Resource>;
   // Per-protocol bookkeeping maps, created lazily by handlers.
   pools?: Map<Resource, { poolId: number; size: number }>;
   buffers?: Map<Resource, BufferDesc>;

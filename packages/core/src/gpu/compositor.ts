@@ -421,6 +421,21 @@ export interface CompositorAddon {
   // Release a dmabuf import (drops the server STM + fd). Called once the buffer
   // is freed (GPU-completion-gated) or the surface is removed.
   releaseDmabufImport(importId: number): void;
+  // Shm fast-path: reserve a wire-allocated BGRA8 texture for an shm surface
+  // (the GPU process Injects the matching native VkImage on the AllocShmTex
+  // frame the reservation triggers). Returns the WGPUTexture pointer for
+  // dawn.wrapTexture, or null when the wire is down.
+  reserveShmTexture?(surfaceId: number, w: number, h: number): bigint | null;
+  // Shm fast-path: send a per-commit ShmUpload frame. The GPU process does
+  // queue.WriteTexture from its own mmap of the pool; bytes don't cross
+  // the Dawn wire. Returns a non-zero uploadSeq the caller defers
+  // wl_buffer.release on; 0 means the path isn't available.
+  commitShmUpload?(surfaceId: number, poolId: number, offset: number,
+                   w: number, h: number, stride: number,
+                   damage?: ReadonlyArray<{ x: number; y: number; width: number; height: number }>):
+      number;
+  // Drain GPU-process ShmUploaded reply seqs received since the last call.
+  takeShmUploadAcks?(): number[];
   // In-band per-frame BeginAccess/EndAccess on a cached client dmabuf import
   // (Layer C of docs/client-buffer-lifecycle.md): write a kind=1/kind=2 control
   // frame on the core WIRE socket (not ctrl). The frame is FIFO-ordered against
@@ -555,6 +570,12 @@ interface Surface {
   // with the right buffer id, and to know what to (re)bind into the bind group
   // when an import completes.
   currentBufferId: number;
+  // Shm fast-path texture handle (wire-allocated by Compositor::reserveShmTexture).
+  // When set, this surface's `texture` is sampled but never written by the JS
+  // device queue (the GPU process does queue.WriteTexture from its own mmap of
+  // the pool, driven by ShmUpload frames). Reset when the surface switches
+  // back to a dmabuf import or its dims change.
+  shmTextureHandle?: bigint;
   fx: SurfaceFx;
   // Alpha mask sampled across the full expanded (surface + outputMargin)
   // region. null = use the compositor's shared 1x1-white default (no
@@ -1616,16 +1637,111 @@ export class JsCompositor implements CompositorSink {
     this.surfaces.delete(id);
   }
 
-  // Upload a committed shm buffer into the surface's sampled texture (zero-copy
-  // from the client mapping via addon.shmView), and report it as presentable.
+  // Upload a committed shm buffer into the surface's sampled texture.
+  // FAST PATH: when the addon exposes reserveShmTexture/commitShmUpload AND
+  // the wire is up, route the upload through the GPU process: it mmaps the
+  // shm pool itself and does queue.WriteTexture in-process, so we pay only
+  // the cost of a small wire frame on the JS thread (microseconds) instead
+  // of the per-frame 47 MiB writeTexture marshaling that pegs libuv for
+  // tens of ms with Qt-style raster clients. Returns the uploadSeq the
+  // caller waits on for the wl_buffer.release (0 means fall back to the
+  // local upload). The slow fallback uses addon.shmView + queue.writeTexture
+  // directly (in-process Dawn wire); used by tests with no GPU process or
+  // when the addon predates the shm fast-path API.
   commitSurfaceBuffer(id: number, poolId: number, offset: number,
                       width: number, height: number, stride: number,
                       damage?: ReadonlyArray<{ x: number; y: number; width: number; height: number }>): boolean {
+    if (this.tryCommitShmFast(id, poolId, offset, width, height, stride, damage) > 0) {
+      return true;
+    }
     const ab = this.addon.shmView(poolId, offset, stride * height);
     if (!ab) return false;
     this.uploadPixels(id, { width, height, stride }, ab, damage);
     this.imported.push({ id, width, height });
     return true;
+  }
+
+  // Per-surface shm-fast-path uploadSeq. Non-zero on success. The protocol
+  // layer (wl_surface.ts) calls commitSurfaceBufferShm to drive the path
+  // and defer the wl_buffer.release until takeShmUploadAcks reports the
+  // matching seq.
+  commitSurfaceBufferShm(id: number, poolId: number, offset: number,
+                         width: number, height: number, stride: number,
+                         damage?: ReadonlyArray<{ x: number; y: number; width: number; height: number }>): number {
+    return this.tryCommitShmFast(id, poolId, offset, width, height, stride, damage);
+  }
+
+  // Drain GPU-process ShmUploaded reply seqs. The wl_surface layer drains
+  // this each tick (in dispatchFrameCallbacks) and fires deferred releases.
+  // No-op when the addon predates the fast-path API.
+  takeShmUploadAcks(): number[] {
+    return this.addon.takeShmUploadAcks?.() ?? [];
+  }
+
+  // Wire up a wgpu::Texture (already InjectTexture'd at the GPU process by
+  // a prior AllocShmTex frame) as the surface's sampleable texture. Builds
+  // the view + bind group, sets dims, pushes to `imported` so the first-
+  // content map flow runs. Idempotent under matching (id, width, height,
+  // texture handle).
+  private installShmTexture(id: number, width: number, height: number,
+                            wireTexHandle: bigint): boolean {
+    if (!this.dawn || this.deviceHandle === 0n) return false;
+    let s = this.surfaces.get(id);
+    if (!s) { s = blankSurface(0, 0, 0, 0); this.surfaces.set(id, s); }
+    // If the surface already has a wire-shm texture at these dims, keep it.
+    if (s.shmTextureHandle === wireTexHandle
+        && s.texture && s.width === width && s.height === height) {
+      return true;
+    }
+    // Destroy any prior client-owned texture (e.g. a writeTexture-path one,
+    // or a stale shm wire texture at different dims).
+    if (s.texture) { try { s.texture.destroy(); } catch { /* */ } }
+    const tex = this.dawn.wrapTexture(this.deviceHandle, wireTexHandle);
+    s.texture = tex;
+    const view = tex.createView();
+    s.view = view;
+    s.width = width;
+    s.height = height;
+    s.shmTextureHandle = wireTexHandle;
+    this.rebuildBindGroup(s, view);
+    return true;
+  }
+
+  // Implementation of the shm fast path. Allocates a per-surface wire
+  // texture lazily (or on dim change), sends the ShmUpload frame, and
+  // returns the uploadSeq. Returns 0 if the addon doesn't support the
+  // fast path or the wire is down -- the caller falls back to writeTexture.
+  private tryCommitShmFast(id: number, poolId: number, offset: number,
+                           width: number, height: number, stride: number,
+                           damage?: ReadonlyArray<{ x: number; y: number; width: number; height: number }>): number {
+    const reserve = this.addon.reserveShmTexture;
+    const upload = this.addon.commitShmUpload;
+    if (!reserve || !upload || !this.dawn || this.deviceHandle === 0n) return 0;
+    // (Re)allocate the wire-side texture on first commit or on size change.
+    const s = this.surfaces.get(id);
+    const needNewTex = !s || !s.texture || s.shmTextureHandle === undefined
+        || s.width !== width || s.height !== height;
+    if (needNewTex) {
+      const handle = reserve(id, width, height);
+      if (handle === null) return 0;
+      if (!this.installShmTexture(id, width, height, handle)) return 0;
+    }
+    // Freshly allocated wire textures have undefined VkImage contents
+    // (VK_IMAGE_LAYOUT_UNDEFINED at creation). A partial-damage upload
+    // would only initialize the damaged rows; the rest of the texture
+    // would sample as garbage. Mirror the local uploadPixels rule:
+    // first upload after (re)allocate is always full-buffer. Empty
+    // damage in ShmUpload means "full buffer" on the GPU process.
+    const sendDamage = needNewTex ? undefined : damage;
+    // Send the upload frame. The GPU process resolves surfaceId to the
+    // injected texture and runs queue.WriteTexture from its own mmap of
+    // the pool; the bytes never cross the Dawn wire.
+    const seq = upload(id, poolId, offset, width, height, stride, sendDamage);
+    if (seq === 0) return 0;
+    const sFinal = this.surfaces.get(id);
+    if (sFinal) sFinal.present = true;
+    this.imported.push({ id, width, height });
+    return seq;
   }
 
   // Commit a client dmabuf wl_buffer to a surface. Feeds the lifecycle machine

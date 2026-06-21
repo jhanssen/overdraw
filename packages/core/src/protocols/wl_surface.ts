@@ -181,7 +181,24 @@ function uploadBuffer(ctx: Ctx, s: SurfaceRecord, buffer: Resource | null): void
     }
   } else if (desc && desc.poolId) {
     const damage = reconcileBufferDamage(s, desc.width, desc.height);
-    const ok = ctx.state.compositor.commitSurfaceBuffer(
+    // Shm fast path: routes the upload through the GPU process's mmap of
+    // the pool so the JS thread doesn't pay the Dawn-wire marshaling cost.
+    // Returns a non-zero uploadSeq; we defer wl_buffer.release until the
+    // matching ShmUploaded ack arrives (drained in dispatchFrameCallbacks).
+    // 0 means the path isn't available (no GPU-process build, test sink) --
+    // fall back to the synchronous commitSurfaceBuffer.
+    const compositor = ctx.state.compositor;
+    const fastSeq = compositor.commitSurfaceBufferShm?.(
+      s.id, desc.poolId, desc.offset, desc.width, desc.height, desc.stride,
+      damage ?? undefined) ?? 0;
+    if (fastSeq > 0) {
+      ctx.state.lastCommittedSurfaceId = s.id;
+      s.hasContent = true;
+      ctx.state.pendingShmReleases ??= new Map();
+      ctx.state.pendingShmReleases.set(fastSeq, buffer);
+      return;
+    }
+    const ok = compositor.commitSurfaceBuffer(
       s.id, desc.poolId, desc.offset, desc.width, desc.height, desc.stride,
       damage ?? undefined);
     if (ok) {

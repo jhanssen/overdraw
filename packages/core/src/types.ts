@@ -130,6 +130,23 @@ export interface Addon {
                           modHi: number, modLo: number, offset: number, stride: number,
                           cb: (handle: bigint | null) => void): number;
   releaseDmabufImport(importId: number): void;
+  // Allocate a sampleable BGRA8 wire texture for shm content on the named
+  // surface. Returns the WGPUTexture pointer (as a bigint) for
+  // dawn.wrapTexture, or null if the wire link is down. Internally:
+  // ReserveTexture + AllocShmTex frame so the GPU process injects the
+  // matching native VkImage.
+  reserveShmTexture?(surfaceId: number, w: number, h: number): bigint | null;
+  // Upload an shm region into a previously-reserveShmTexture'd texture.
+  // The GPU process does queue.WriteTexture from its own mmap'd pool view,
+  // so no large IPC transfer happens on this call. Returns the uploadSeq
+  // (0 on failure). `damage` may be empty/undefined for full-buffer.
+  commitShmUpload?(surfaceId: number, poolId: number, offset: number,
+                   w: number, h: number, stride: number,
+                   damage?: ReadonlyArray<{ x: number; y: number; width: number; height: number }>):
+      number;
+  // Drain the GPU-process ShmUploaded reply seqs received since the last
+  // call. The JS layer keys a deferred wl_buffer.release on each seq.
+  takeShmUploadAcks?(): number[];
   // In-band per-frame BeginAccess/EndAccess on a cached client dmabuf import
   // (Layer C of docs/client-buffer-lifecycle.md): write a kind=1/kind=2 control
   // frame on the core WIRE socket (not ctrl). FIFO-ordered against the Dawn

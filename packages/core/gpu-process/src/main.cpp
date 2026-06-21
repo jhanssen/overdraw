@@ -1963,6 +1963,170 @@ int run(int wireFd, int ctrlFd, int inputFd, bool headless,
             shmPools.erase(it);
             return;
         }
+        if (kind == ipc::FrameKind::AllocShmTex) {
+            // Core reserved a wire texture handle for an shm surface. Create
+            // a native BGRA8 texture and Inject at the reserved handle.
+            if (nfds != 0) {
+                std::fprintf(stderr,
+                    "[gpu] core wire: AllocShmTex with nfds=%d (must be 0)\n", nfds);
+                std::abort();
+            }
+            if (frame.size() != ipc::AllocShmTexPayload::kSize) {
+                std::fprintf(stderr,
+                    "[gpu] core wire: bad AllocShmTex payload size %zu\n",
+                    frame.size());
+                std::abort();
+            }
+            auto p = ipc::AllocShmTexPayload::decode(frame.data());
+            wgpu::TextureDescriptor td{};
+            td.size = {p.width, p.height, 1};
+            td.format = wgpu::TextureFormat::BGRA8Unorm;
+            // Same usage shape as the JS-side `device.createTexture` used to
+            // pick: sampled + copy dst (queue.WriteTexture target) + copy src
+            // (intercepts copy the client texture into a dmabuf consumer).
+            td.usage = wgpu::TextureUsage::TextureBinding
+                     | wgpu::TextureUsage::CopyDst
+                     | wgpu::TextureUsage::CopySrc;
+            wgpu::Texture tex = coreDevice.CreateTexture(&td);
+            if (!server.InjectTexture(tex.Get(),
+                                      {p.texture.id, p.texture.generation},
+                                      {p.device.id, p.device.generation})) {
+                std::fprintf(stderr,
+                    "[gpu] AllocShmTex: InjectTexture failed (surfaceId=%u, "
+                    "handle=%u/%u)\n",
+                    p.surfaceId, p.texture.id, p.texture.generation);
+                return;
+            }
+            serializer.Flush();
+            // Replace any prior texture at this surfaceId (resize: the core
+            // discards the old wrapTexture'd handle and reserves a new one).
+            shmTextures[p.surfaceId] = ShmTex{std::move(tex), p.width, p.height};
+            return;
+        }
+        if (kind == ipc::FrameKind::ShmUpload) {
+            // Upload an shm region into a previously-AllocShmTex'd texture.
+            // queue.WriteTexture runs natively in-process; no wire bulk
+            // transfer. Sends ShmUploaded back so the core can release the
+            // wl_buffer to the client (Hyprland-style copy-then-release).
+            if (nfds != 0) {
+                std::fprintf(stderr,
+                    "[gpu] core wire: ShmUpload with nfds=%d (must be 0)\n", nfds);
+                std::abort();
+            }
+            ipc::ShmUploadPayload p{};
+            if (!ipc::ShmUploadPayload::decode(frame.data(), frame.size(), p)) {
+                std::fprintf(stderr,
+                    "[gpu] core wire: bad ShmUpload payload (size %zu)\n",
+                    frame.size());
+                std::abort();
+            }
+            // Look up the destination texture + pool.
+            auto tit = shmTextures.find(p.surfaceId);
+            auto pit = shmPools.find(p.poolId);
+            const bool haveTex = tit != shmTextures.end();
+            const bool havePool = pit != shmPools.end();
+            if (!haveTex || !havePool) {
+                std::fprintf(stderr,
+                    "[gpu] ShmUpload: missing %s%s (surfaceId=%u poolId=%u "
+                    "uploadSeq=%u)\n",
+                    !haveTex ? "texture" : "",
+                    !havePool ? (!haveTex ? "+pool" : "pool") : "",
+                    p.surfaceId, p.poolId, p.uploadSeq);
+                // Still ack so the core's pending-release map doesn't leak.
+            } else {
+                // Bounds-check the upload region against the pool mapping.
+                // The source bytes for damage rect (rx, ry, rw, rh) start at
+                // pool[offset + ry*stride + rx*4] and need rh*stride - rx*4
+                // bytes accessible. For the no-damage (full-buffer) case the
+                // region covers offset..offset + height*stride.
+                const uint8_t* base = pit->second.base;
+                const size_t poolSize = pit->second.size;
+                const uint64_t off = p.offset;
+                const uint64_t needFull = static_cast<uint64_t>(p.stride) *
+                                          static_cast<uint64_t>(p.height);
+                if (off > poolSize || needFull > poolSize - off) {
+                    std::fprintf(stderr,
+                        "[gpu] ShmUpload: region out of pool bounds "
+                        "(off=%llu need=%llu pool=%zu)\n",
+                        static_cast<unsigned long long>(off),
+                        static_cast<unsigned long long>(needFull),
+                        poolSize);
+                } else {
+                    wgpu::Queue queue = coreDevice.GetQueue();
+                    wgpu::TexelCopyTextureInfo dst{};
+                    dst.texture = tit->second.tex;
+                    dst.mipLevel = 0;
+                    wgpu::TexelCopyBufferLayout layout{};
+                    layout.offset = 0;
+                    layout.bytesPerRow = p.stride;
+                    layout.rowsPerImage = p.height;
+                    auto doFull = [&]() {
+                        dst.origin = {0, 0, 0};
+                        wgpu::Extent3D ext{p.width, p.height, 1};
+                        queue.WriteTexture(&dst, base + off,
+                                           static_cast<size_t>(needFull),
+                                           &layout, &ext);
+                    };
+                    if (p.damage.empty()) {
+                        doFull();
+                    } else {
+                        for (const auto& r : p.damage) {
+                            // Clamp the damage rect against the buffer extent.
+                            if (r.w == 0 || r.h == 0) continue;
+                            int32_t x0 = r.x, y0 = r.y;
+                            if (x0 < 0) x0 = 0;
+                            if (y0 < 0) y0 = 0;
+                            int32_t x1 = r.x + static_cast<int32_t>(r.w);
+                            int32_t y1 = r.y + static_cast<int32_t>(r.h);
+                            if (x1 > static_cast<int32_t>(p.width))
+                                x1 = static_cast<int32_t>(p.width);
+                            if (y1 > static_cast<int32_t>(p.height))
+                                y1 = static_cast<int32_t>(p.height);
+                            if (x1 <= x0 || y1 <= y0) continue;
+                            const uint32_t cw = static_cast<uint32_t>(x1 - x0);
+                            const uint32_t ch = static_cast<uint32_t>(y1 - y0);
+                            const uint64_t rectOff = off
+                                + static_cast<uint64_t>(y0) * p.stride
+                                + static_cast<uint64_t>(x0) * 4;
+                            // WriteTexture from the per-row slice: bytesPerRow
+                            // stays the full buffer stride so successive rows
+                            // land correctly; rowsPerImage matches the rect
+                            // height. The data span runs from the rect's
+                            // first-row start to its last-row end inside the
+                            // pool.
+                            const uint64_t spanBytes =
+                                static_cast<uint64_t>(ch - 1) * p.stride
+                                + static_cast<uint64_t>(cw) * 4;
+                            if (rectOff > poolSize || spanBytes > poolSize - rectOff) {
+                                std::fprintf(stderr,
+                                    "[gpu] ShmUpload: rect out of pool bounds "
+                                    "(rect %d,%d,%u,%u rectOff=%llu span=%llu pool=%zu)\n",
+                                    r.x, r.y, r.w, r.h,
+                                    static_cast<unsigned long long>(rectOff),
+                                    static_cast<unsigned long long>(spanBytes),
+                                    poolSize);
+                                continue;
+                            }
+                            dst.origin = {static_cast<uint32_t>(x0),
+                                          static_cast<uint32_t>(y0), 0};
+                            wgpu::Extent3D ext{cw, ch, 1};
+                            queue.WriteTexture(&dst, base + rectOff,
+                                               static_cast<size_t>(spanBytes),
+                                               &layout, &ext);
+                        }
+                    }
+                }
+            }
+            // Ack regardless of success: the core's deferred-release map must
+            // not leak. The client is free to reuse its shm region now; any
+            // missed pixels show up as stale content on the texture, not as
+            // protocol-level wedge.
+            ipc::ShmUploadedPayload rp{p.uploadSeq};
+            uint8_t rbuf[ipc::ShmUploadedPayload::kSize];
+            rp.encode(rbuf);
+            serializer.appendFrame(ipc::FrameKind::ShmUploaded, rbuf, sizeof(rbuf));
+            return;
+        }
         if (kind == ipc::FrameKind::AllocSurfaceBuf
             || kind == ipc::FrameKind::AllocComposeBuf) {
             if (nfds != 0) {

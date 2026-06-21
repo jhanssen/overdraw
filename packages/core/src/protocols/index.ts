@@ -531,6 +531,21 @@ export async function installProtocols(
       }
     }
 
+    // Shm fast-path releases: the GPU process has acked one or more
+    // ShmUpload frames since the last tick. Fire the deferred
+    // wl_buffer.release for each acked seq. The buffer was queued at
+    // commit time keyed by uploadSeq; we drop the entry on release so
+    // the map doesn't grow with the client.
+    const shmAcks = state.compositor.takeShmUploadAcks?.() ?? [];
+    if (shmAcks.length > 0 && state.pendingShmReleases) {
+      for (const seq of shmAcks) {
+        const buf = state.pendingShmReleases.get(seq);
+        if (!buf) continue;
+        state.pendingShmReleases.delete(seq);
+        if (!buf.destroyed) events.wl_buffer.send_release(buf);
+      }
+    }
+
     // Frame callbacks are NOT dispatched here -- they're per-output, fired by
     // dispatchFrameCallbacksForOutput on each KMS flip-complete. A surface on
     // a 60Hz output gets wl_callback.done at 60Hz even when a 240Hz output is

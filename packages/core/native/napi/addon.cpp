@@ -1630,6 +1630,96 @@ napi_value ReleaseDmabufImport(napi_env env, napi_callback_info info) {
     return nullptr;
 }
 
+// reserveShmTexture(surfaceId, width, height) -> bigint | null
+// Allocate a sampleable BGRA8 wire texture (handed to JS as a raw pointer
+// for dawn.wrapTexture). Internally: ReserveTexture + AllocShmTex wire frame
+// so the GPU process injects the matching native VkImage. Returns null on
+// failure (compositor not running, dims zero, wire link down).
+napi_value ReserveShmTexture(napi_env env, napi_callback_info info) {
+    size_t argc = 3; napi_value argv[3];
+    napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+    if (argc < 3) return throwError(env,
+        "reserveShmTexture(surfaceId, width, height)");
+    if (!g_addon.compositor) {
+        napi_value n; napi_get_null(env, &n); return n;
+    }
+    uint32_t surfaceId = 0, w = 0, h = 0;
+    napi_get_value_uint32(env, argv[0], &surfaceId);
+    napi_get_value_uint32(env, argv[1], &w);
+    napi_get_value_uint32(env, argv[2], &h);
+    WGPUTexture tex = g_addon.compositor->reserveShmTexture(surfaceId, w, h);
+    if (!tex) { napi_value n; napi_get_null(env, &n); return n; }
+    napi_value out;
+    napi_create_bigint_uint64(env,
+        static_cast<uint64_t>(reinterpret_cast<uintptr_t>(tex)), &out);
+    return out;
+}
+
+// commitShmUpload(surfaceId, poolId, offset, width, height, stride, damage) -> uint
+// damage: optional array of {x, y, width, height}; empty / undefined = full
+// buffer. Returns uploadSeq (0 on failure). The matching wl_buffer.release
+// is deferred until takeShmUploadAcks() reports this seq.
+napi_value CommitShmUpload(napi_env env, napi_callback_info info) {
+    size_t argc = 7; napi_value argv[7];
+    napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+    if (argc < 6) return throwError(env,
+        "commitShmUpload(surfaceId, poolId, offset, width, height, stride[, damage])");
+    if (!g_addon.compositor) {
+        napi_value zero; napi_create_uint32(env, 0, &zero); return zero;
+    }
+    uint32_t surfaceId = 0, poolId = 0, w = 0, h = 0, stride = 0;
+    int64_t offset64 = 0;
+    napi_get_value_uint32(env, argv[0], &surfaceId);
+    napi_get_value_uint32(env, argv[1], &poolId);
+    napi_get_value_int64(env, argv[2], &offset64);
+    napi_get_value_uint32(env, argv[3], &w);
+    napi_get_value_uint32(env, argv[4], &h);
+    napi_get_value_uint32(env, argv[5], &stride);
+
+    std::vector<overdraw::core::Compositor::DamageRect> damage;
+    if (argc >= 7) {
+        bool isArr = false;
+        napi_is_array(env, argv[6], &isArr);
+        if (isArr) {
+            uint32_t n = 0;
+            napi_get_array_length(env, argv[6], &n);
+            damage.reserve(n);
+            for (uint32_t i = 0; i < n; ++i) {
+                napi_value el;
+                napi_get_element(env, argv[6], i, &el);
+                overdraw::core::Compositor::DamageRect r{};
+                r.x = static_cast<int32_t>(getU32(env, el, "x"));
+                r.y = static_cast<int32_t>(getU32(env, el, "y"));
+                r.w = getU32(env, el, "width");
+                r.h = getU32(env, el, "height");
+                damage.push_back(r);
+            }
+        }
+    }
+    const uint32_t seq = g_addon.compositor->commitShmUpload(
+        surfaceId, poolId, static_cast<uint64_t>(offset64), w, h, stride,
+        damage.data(), damage.size());
+    napi_value out; napi_create_uint32(env, seq, &out);
+    return out;
+}
+
+// takeShmUploadAcks() -> uint32_t[]
+// Drain pending ShmUploaded reply seqs. The JS layer uses each one to
+// release the matching deferred wl_buffer.
+napi_value TakeShmUploadAcks(napi_env env, napi_callback_info /*info*/) {
+    if (!g_addon.compositor) {
+        napi_value arr; napi_create_array_with_length(env, 0, &arr); return arr;
+    }
+    auto acks = g_addon.compositor->takeShmUploadAcks();
+    napi_value arr;
+    napi_create_array_with_length(env, acks.size(), &arr);
+    for (size_t i = 0; i < acks.size(); ++i) {
+        napi_value v; napi_create_uint32(env, acks[i], &v);
+        napi_set_element(env, arr, i, v);
+    }
+    return arr;
+}
+
 // writeBeginAccess(importId) -> bool. In-band per-frame BeginAccess: write a
 // kind=1 frame on the core WIRE socket for the client texture importId resolves
 // to. Replaces beginClientAccessSync's ctrl round-trip; does NOT block the Node
@@ -2854,6 +2944,18 @@ napi_value Init(napi_env env, napi_value exports) {
     napi_create_function(env, "releaseDmabufImport", NAPI_AUTO_LENGTH,
                          ReleaseDmabufImport, nullptr, &fnReleaseDmabuf);
     napi_set_named_property(env, exports, "releaseDmabufImport", fnReleaseDmabuf);
+    napi_value fnReserveShmTex;
+    napi_create_function(env, "reserveShmTexture", NAPI_AUTO_LENGTH,
+                         ReserveShmTexture, nullptr, &fnReserveShmTex);
+    napi_set_named_property(env, exports, "reserveShmTexture", fnReserveShmTex);
+    napi_value fnCommitShmUpload;
+    napi_create_function(env, "commitShmUpload", NAPI_AUTO_LENGTH,
+                         CommitShmUpload, nullptr, &fnCommitShmUpload);
+    napi_set_named_property(env, exports, "commitShmUpload", fnCommitShmUpload);
+    napi_value fnTakeShmAcks;
+    napi_create_function(env, "takeShmUploadAcks", NAPI_AUTO_LENGTH,
+                         TakeShmUploadAcks, nullptr, &fnTakeShmAcks);
+    napi_set_named_property(env, exports, "takeShmUploadAcks", fnTakeShmAcks);
     napi_value fnWriteBeginAccess;
     napi_create_function(env, "writeBeginAccess", NAPI_AUTO_LENGTH,
                          WriteBeginAccess, nullptr, &fnWriteBeginAccess);

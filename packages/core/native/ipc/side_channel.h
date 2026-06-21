@@ -974,9 +974,13 @@ struct ShmUploadPayload {
         static constexpr size_t kSize = 16;
     };
     std::vector<DamageRect> damage;
-    static constexpr size_t kHeaderSize = 32;
+    // Fixed-field header (surfaceId..stride) ends at offset 36; the
+    // damageCount u32 follows at offset 36 and damage rects start at 40.
+    // kHeaderSize is "fixed header + count field"; encodedSize adds the
+    // variable-length rect tail.
+    static constexpr size_t kHeaderSize = 40;
     size_t encodedSize() const {
-        return kHeaderSize + 4 + damage.size() * DamageRect::kSize;
+        return kHeaderSize + damage.size() * DamageRect::kSize;
     }
     void encode(uint8_t* out) const {
         putU32LE(out + 0,  surfaceId);
@@ -998,7 +1002,7 @@ struct ShmUploadPayload {
         }
     }
     static bool decode(const uint8_t* p, size_t len, ShmUploadPayload& out) {
-        if (len < kHeaderSize + 4) return false;
+        if (len < kHeaderSize) return false;
         out.surfaceId = getU32LE(p + 0);
         out.uploadSeq = getU32LE(p + 4);
         out.poolId    = getU32LE(p + 8);
@@ -1007,10 +1011,10 @@ struct ShmUploadPayload {
         out.height    = getU32LE(p + 28);
         out.stride    = getU32LE(p + 32);
         const uint32_t count = getU32LE(p + 36);
-        if (len != kHeaderSize + 4 + count * DamageRect::kSize) return false;
+        if (len != kHeaderSize + count * DamageRect::kSize) return false;
         out.damage.clear();
         out.damage.reserve(count);
-        size_t off = 40;
+        size_t off = kHeaderSize;
         for (uint32_t i = 0; i < count; ++i) {
             DamageRect r{};
             r.x = getI32LE(p + off + 0);

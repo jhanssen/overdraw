@@ -358,6 +358,43 @@ class Compositor {
     // a matching identifier on both sides.
     void registerShmPool(uint32_t poolId, int fd, uint64_t size);
     void unregisterShmPool(uint32_t poolId);
+
+    // Allocate a sampleable BGRA8 wire texture for shm content on the
+    // surface and return its WGPUTexture pointer so JS can wrap it.
+    // Internally: ReserveTexture on the core wire-client (committed
+    // immediately so the reservation is never reclaimed) + sends an
+    // AllocShmTex frame so the GPU process Injects the matching native
+    // VkImage at the reserved wire handle. Wire-FIFO ordering guarantees
+    // a subsequent ShmUpload frame from the same surfaceId finds the
+    // injected texture on the GPU side.
+    //
+    // Returns nullptr if the wire link is down. The returned pointer is
+    // owned by Dawn's wire client (refcounted), suitable for handoff to
+    // dawn.node's wrapTexture.
+    WGPUTexture reserveShmTexture(uint32_t surfaceId,
+                                  uint32_t width, uint32_t height);
+
+    // Upload an shm region into a previously-reserveShmTexture'd texture.
+    // The GPU process resolves surfaceId to the native wgpu::Texture and
+    // does queue.WriteTexture from its own mmap'd pool view (no IPC bulk
+    // transfer). Returns the uploadSeq for the caller to wait on the
+    // matching ShmUploaded reply (held over a small per-Compositor map);
+    // 0 if the wire link is down. damage may be empty -> full-buffer.
+    struct DamageRect { int32_t x, y; uint32_t w, h; };
+    uint32_t commitShmUpload(uint32_t surfaceId, uint32_t poolId,
+                             uint64_t offset, uint32_t width, uint32_t height,
+                             uint32_t stride,
+                             const DamageRect* damage, size_t damageCount);
+
+    // Drain ShmUploaded acks received since the last call. Returns the list
+    // of uploadSeq values the GPU process has now committed; the JS layer
+    // uses each to release the deferred wl_buffer (mirrors Hyprland's
+    // copy-then-release timing). FIFO with the surrounding wire frames.
+    std::vector<uint32_t> takeShmUploadAcks() {
+        std::vector<uint32_t> out;
+        out.swap(shmUploadAcks_);
+        return out;
+    }
     // Destroy a plugin ring slot's surfaceBuf on the GPU process + reclaim the
     // core-side reservation/status. Caller gates on the consumer GPU read completing.
     void releaseSurfaceBuf(uint32_t surfaceBufId);
@@ -689,6 +726,15 @@ class Compositor {
     // later releaseDmabufImport can address the GPU-side entry. Erased on release.
     struct WireHandleId { uint32_t id; uint32_t generation; };
     std::unordered_map<uint32_t, WireHandleId> jsImportHandles_;
+
+    // FrameKind::ShmUpload bookkeeping. nextShmUploadSeq_ allocates a fresh
+    // u32 per upload (monotonic); the GPU process echoes it back on
+    // ShmUploaded so JS can release the matching wl_buffer. Wrap at 2^32 is
+    // fine (the JS-side map keyed on the seq cleans up on each ack).
+    // shmUploadAcks_ buffers reply seqs between renderer pumps; the JS layer
+    // drains via takeShmUploadAcks() inside dispatchFrameCallbacks.
+    uint32_t nextShmUploadSeq_ = 1;
+    std::vector<uint32_t> shmUploadAcks_;
 
     uint32_t windowWidth_ = 0;
     uint32_t windowHeight_ = 0;

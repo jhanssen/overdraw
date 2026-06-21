@@ -50,6 +50,19 @@ Compositor::Compositor(int wireFd, int ctrlFd, pid_t gpuPid,
             onClientTexImported(p.textureId, p.importOk != 0);
             return;
         }
+        if (kind == ipc::FrameKind::ShmUploaded) {
+            // GPU process committed an shm upload. JS will drain via
+            // takeShmUploadAcks() in dispatchFrameCallbacks and call
+            // wl_buffer.send_release on the deferred bufferId.
+            if (frame.size() != ipc::ShmUploadedPayload::kSize) {
+                std::fprintf(stderr,
+                    "[core] ShmUploaded: bad payload size %zu\n", frame.size());
+                return;
+            }
+            auto p = ipc::ShmUploadedPayload::decode(frame.data());
+            shmUploadAcks_.push_back(p.uploadSeq);
+            return;
+        }
         if (kind == ipc::FrameKind::ScanoutReady) {
             // Runtime hotplug: a previous reserveScanoutForOutput completed.
             // ok=1 is informational here (wire FIFO already guarantees any
@@ -671,6 +684,69 @@ void Compositor::unregisterShmPool(uint32_t poolId) {
     uint8_t buf[ipc::UnregisterShmPoolPayload::kSize];
     p.encode(buf);
     link_->appendFrame(ipc::FrameKind::UnregisterShmPool, buf, sizeof(buf));
+}
+
+WGPUTexture Compositor::reserveShmTexture(uint32_t surfaceId,
+                                          uint32_t width, uint32_t height) {
+    if (!link_ || !device_ || width == 0 || height == 0) return nullptr;
+    // BGRA8 sampled texture, mirrored to the shm content bytes via
+    // Queue::WriteTexture in the GPU process.
+    TaggedReservation tr = reserveTextureTagged(width, height,
+        wgpu::TextureUsage::TextureBinding | wgpu::TextureUsage::CopyDst |
+        wgpu::TextureUsage::CopySrc);
+    const auto& rt = tr.reservation();
+    ipc::AllocShmTexPayload p{};
+    p.surfaceId          = surfaceId;
+    p.width              = width;
+    p.height             = height;
+    p.texture.id         = rt.handle.id;
+    p.texture.generation = rt.handle.generation;
+    p.device.id          = rt.deviceHandle.id;
+    p.device.generation  = rt.deviceHandle.generation;
+    uint8_t buf[ipc::AllocShmTexPayload::kSize];
+    p.encode(buf);
+    if (!link_->appendFrame(ipc::FrameKind::AllocShmTex, buf, sizeof(buf))) {
+        tr.discard();
+        return nullptr;
+    }
+    // Commit immediately: the GPU process will Inject at the reserved
+    // handle. The wgpu::Texture handle returned is the wire-client pointer;
+    // ownership transfers to the caller (handed to wrapTexture on the JS
+    // side; refcount survives until the JS GPUTexture is destroyed).
+    auto reserved = tr.commitAndTake();
+    return reserved.texture;
+}
+
+uint32_t Compositor::commitShmUpload(uint32_t surfaceId, uint32_t poolId,
+                                     uint64_t offset, uint32_t width, uint32_t height,
+                                     uint32_t stride,
+                                     const DamageRect* damage, size_t damageCount) {
+    if (!link_) return 0;
+    const uint32_t seq = nextShmUploadSeq_++;
+    if (seq == 0) {
+        // wraparound: 0 is reserved as "failure" return.
+        return nextShmUploadSeq_++;
+    }
+    ipc::ShmUploadPayload p{};
+    p.surfaceId = surfaceId;
+    p.uploadSeq = seq;
+    p.poolId    = poolId;
+    p.offset    = offset;
+    p.width     = width;
+    p.height    = height;
+    p.stride    = stride;
+    p.damage.reserve(damageCount);
+    for (size_t i = 0; i < damageCount; ++i) {
+        const DamageRect& r = damage[i];
+        p.damage.push_back({r.x, r.y, r.w, r.h});
+    }
+    const size_t bytes = p.encodedSize();
+    std::vector<uint8_t> buf(bytes);
+    p.encode(buf.data());
+    if (!link_->appendFrame(ipc::FrameKind::ShmUpload, buf.data(), buf.size())) {
+        return 0;
+    }
+    return seq;
 }
 
 void Compositor::releaseSurfaceBuf(uint32_t surfaceBufId) {
