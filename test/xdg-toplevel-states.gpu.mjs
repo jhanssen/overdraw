@@ -32,26 +32,33 @@ function parseConfigure(line) {
   };
 }
 
-test("set_maximized before initial commit: state known from the first configure; full size follows", { skip }, async () => {
+test("set_maximized before initial commit: maximized arrives with the sized configure", { skip }, async () => {
   const c = await setupCompositor({ headless: OUT });
   try {
     const cl = c.spawnClient(["--initial-state", "maximized"]);
     await cl.ready;
 
-    // The first configure is a throwaway 0x0 (the client gets a serial to ack
-    // and may pick its own size), but it ALREADY carries the resolved state
-    // array -- so the client never renders at a wrong state. The full output
-    // size then arrives as a follow-up configure (the binding resize).
+    // xdg-shell spec: 'maximized' requires the client to obey the configure
+    // geometry. A 0x0 configure means "client picks size", which is
+    // contradictory with 'maximized' (Qt explicitly warns). The compositor
+    // suppresses size-binding states until it can also send a real size.
+    // Verify: the 0x0 configure carries NO size-binding states, and the
+    // sized configure carries maximized + the full output size.
     const configures = cl.stdout.split("\n")
       .filter((l) => /\[harness-client\] configure /.test(l)).map(parseConfigure);
     assert.ok(configures.length >= 1, `expected at least one configure; got ${configures.length}`);
-    assert.ok(configures[0].states.includes(STATE_MAXIMIZED),
-      `first configure should carry maximized (${STATE_MAXIMIZED}); got [${configures[0].states.join(",")}]`);
+    const zero = configures.find((cfg) => cfg.w === 0 && cfg.h === 0);
+    if (zero) {
+      assert.ok(!zero.states.includes(STATE_MAXIMIZED),
+        `0x0 configure must NOT carry maximized; got [${zero.states.join(",")}]`);
+      assert.ok(!zero.states.includes(STATE_FULLSCREEN),
+        `0x0 configure must NOT carry fullscreen; got [${zero.states.join(",")}]`);
+    }
     const sized = configures.find((cfg) => cfg.w > 0 && cfg.h > 0);
     assert.ok(sized, "expected a configure carrying a non-zero size");
     assert.equal(sized.w, OUT.width, `sized configure width should match output; got ${sized.w}`);
     assert.equal(sized.h, OUT.height, `sized configure height should match output; got ${sized.h}`);
-    assert.ok(sized.states.includes(STATE_MAXIMIZED), "sized configure should still carry maximized");
+    assert.ok(sized.states.includes(STATE_MAXIMIZED), "sized configure should carry maximized");
 
     // WM state agrees.
     const snap = c.query();
@@ -64,7 +71,7 @@ test("set_maximized before initial commit: state known from the first configure;
   }
 });
 
-test("set_fullscreen before initial commit: configure has fullscreen state + full output size", { skip }, async () => {
+test("set_fullscreen before initial commit: fullscreen arrives with the sized configure", { skip }, async () => {
   const c = await setupCompositor({ headless: OUT });
   try {
     const cl = c.spawnClient(["--initial-state", "fullscreen"]);
@@ -72,8 +79,14 @@ test("set_fullscreen before initial commit: configure has fullscreen state + ful
     const configures = cl.stdout.split("\n")
       .filter((l) => /\[harness-client\] configure /.test(l)).map(parseConfigure);
     assert.ok(configures.length >= 1);
-    // State is carried from the throwaway 0x0 first configure; full size follows.
-    assert.ok(configures[0].states.includes(STATE_FULLSCREEN));
+    // Same rule as the maximized case: size-binding states only on sized configures.
+    const zero = configures.find((cfg) => cfg.w === 0 && cfg.h === 0);
+    if (zero) {
+      assert.ok(!zero.states.includes(STATE_FULLSCREEN),
+        `0x0 configure must NOT carry fullscreen; got [${zero.states.join(",")}]`);
+      assert.ok(!zero.states.includes(STATE_MAXIMIZED),
+        `0x0 configure must NOT carry maximized; got [${zero.states.join(",")}]`);
+    }
     const sized = configures.find((cfg) => cfg.w > 0 && cfg.h > 0);
     assert.ok(sized, "expected a configure carrying a non-zero size");
     assert.equal(sized.w, OUT.width);
@@ -87,20 +100,23 @@ test("set_fullscreen before initial commit: configure has fullscreen state + ful
   }
 });
 
-test("no initial-state request: managed/tiled window is told maximized (size-binding), not fullscreen", { skip }, async () => {
+test("no initial-state request: managed/tiled window's sized configure carries maximized (size-binding), not fullscreen", { skip }, async () => {
   const c = await setupCompositor({ headless: OUT });
   try {
     const cl = c.spawnClient([]);
     await cl.ready;
-    const configures = cl.stdout.split("\n").filter((l) => /\[harness-client\] configure /.test(l));
+    const configures = cl.stdout.split("\n")
+      .filter((l) => /\[harness-client\] configure /.test(l)).map(parseConfigure);
     assert.ok(configures.length >= 1, "at least one configure expected");
-    // A managed window is tiled: it carries the maximized state so the
-    // compositor-assigned size is binding (clients otherwise size to content),
-    // but never fullscreen.
-    const m = configures[0].match(/states=\[([^\]]*)\]/);
-    const states = m[1].length ? m[1].split(",").map((s) => parseInt(s, 10)) : [];
-    assert.ok(states.includes(STATE_MAXIMIZED), "managed/tiled window is told maximized");
-    assert.ok(!states.includes(STATE_FULLSCREEN));
+    // A managed window is tiled: the SIZED configure carries the maximized
+    // state so the compositor-assigned size is binding (clients otherwise
+    // size to content), but never fullscreen. The 0x0 handshake carries
+    // neither (size-binding states require a real size; see the maximized /
+    // fullscreen tests above).
+    const sized = configures.find((cfg) => cfg.w > 0 && cfg.h > 0);
+    assert.ok(sized, "expected a configure carrying a non-zero size");
+    assert.ok(sized.states.includes(STATE_MAXIMIZED), "sized configure should carry maximized");
+    assert.ok(!sized.states.includes(STATE_FULLSCREEN));
     // Focus follows the client (single window), so activated may be present.
     // We don't assert on activated here; that's a separate concern.
   } finally {

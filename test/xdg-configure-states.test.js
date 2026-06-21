@@ -137,3 +137,49 @@ test('configure records serial on the xdg_surface and fires both events', async 
   assert.equal(s.xs.lastConfigureSerial, 1);
   assert.equal(s.getSurfaceConfigure().serial, 1);
 });
+
+// xdg-shell 'maximized' / 'fullscreen' require the client to obey the
+// configure geometry. A 0x0 configure means "client picks size", which
+// contradicts those states (Qt explicitly warns). The compositor suppresses
+// size-binding states until a real size is available.
+
+test('0x0 configure: managed window omits maximized + tiled (size-binding states)', async () => {
+  const s = setup();
+  s.wm.addWindow(1, { resource: {} });
+  configureToplevel(s.ctx, s.xs, 0, 0);
+  assert.deepEqual(s.getConfigure().states, []);
+});
+
+test('0x0 configure: maximized window omits maximized', async () => {
+  const s = setup();
+  s.wm.addWindow(1, { resource: {} });
+  await s.wm.propose(1, { presentation: 'maximized' }, 'client-request');
+  configureToplevel(s.ctx, s.xs, 0, 0);
+  assert.deepEqual(s.getConfigure().states, []);
+});
+
+test('0x0 configure: fullscreen window omits fullscreen', async () => {
+  const s = setup();
+  s.wm.addWindow(1, { resource: {} });
+  await s.wm.propose(1, { presentation: 'fullscreen' }, 'client-request');
+  configureToplevel(s.ctx, s.xs, 0, 0);
+  assert.deepEqual(s.getConfigure().states, []);
+});
+
+test('0x0 configure: activated is independent of size and still ships', async () => {
+  const s = setup();
+  s.wm.addWindow(1, { resource: {} });
+  s.ctx.state.seat = { kbFocus: { surfaceId: 1 } };
+  configureToplevel(s.ctx, s.xs, 0, 0);
+  // No size-binding states (managed -> maximized + tiled would normally be
+  // here); activated remains because it carries no size constraint.
+  assert.deepEqual(s.getConfigure().states, [STATE_ACTIVATED]);
+});
+
+test('partially-zero configure (height = 0): size-binding states still suppressed', async () => {
+  const s = setup();
+  s.wm.addWindow(1, { resource: {} });
+  await s.wm.propose(1, { presentation: 'maximized' }, 'client-request');
+  configureToplevel(s.ctx, s.xs, 800, 0);
+  assert.deepEqual(s.getConfigure().states, []);
+});

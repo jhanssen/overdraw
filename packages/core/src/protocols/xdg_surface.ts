@@ -32,8 +32,19 @@ function packStates(states: number[]): Uint8Array {
 // a wl_array of uint32 state values.
 export function configureToplevel(ctx: Ctx, xs: XdgSurfaceRecord, width: number, height: number): number | null {
   if (!xs.toplevel) return null;
-  const states = buildStatesArray(ctx, xs);
-  ctx.events.xdg_toplevel.send_configure(xs.toplevel, Math.max(0, width | 0), Math.max(0, height | 0), states);
+  const w = Math.max(0, width | 0);
+  const h = Math.max(0, height | 0);
+  // xdg-shell maximized: "The window geometry specified in the configure event
+  // must be obeyed by the client". fullscreen: "the geometry dimensions must
+  // be obeyed". A 0x0 size means "client picks", which contradicts those
+  // states. Qt enforces the contradiction with a warning and falls back to
+  // its own size, so the configured states are ignored on the initial
+  // handshake anyway. Suppress size-binding states (maximized, fullscreen,
+  // tiled-edges) until the WM has computed a real layout rect; the follow-up
+  // configure carries both the size AND the states atomically.
+  const sizeUnknown = w === 0 || h === 0;
+  const states = buildStatesArray(ctx, xs, sizeUnknown);
+  ctx.events.xdg_toplevel.send_configure(xs.toplevel, w, h, states);
   const serial = ctx.state.serial();
   xs.lastConfigureSerial = serial;
   xs.configuredWidth = width;
@@ -44,7 +55,16 @@ export function configureToplevel(ctx: Ctx, xs: XdgSurfaceRecord, width: number,
 
 // Build the xdg_toplevel.configure states[] array from current WM + focus
 // state. Order doesn't matter on the wire; clients iterate the array.
-function buildStatesArray(ctx: Ctx, xs: XdgSurfaceRecord): Uint8Array {
+//
+// `sizeUnknown` is true when the caller is sending a 0x0 (or partially-0) size.
+// The size-binding states (maximized, fullscreen, and managed/tiled which we
+// model as maximized) require the client to obey the configured geometry per
+// xdg-shell. With a 0 size that requirement is contradictory, so suppress
+// those states for this configure; the next one (after the WM has computed a
+// layout) carries the real size AND the resolved states atomically.
+// `activated` is unaffected: it tracks keyboard focus and has no size
+// implication, so it ships on every configure.
+function buildStatesArray(ctx: Ctx, xs: XdgSurfaceRecord, sizeUnknown: boolean): Uint8Array {
   const states: number[] = [];
   const id = xs.surface?.id;
   // A managed (tiled) window is told it is maximized so the configured size is
@@ -55,7 +75,7 @@ function buildStatesArray(ctx: Ctx, xs: XdgSurfaceRecord): Uint8Array {
   // edges are additionally advertised (v2+) so the client suppresses resize
   // affordances on every side -- a master-stack tile is fully managed.
   const tiledOk = (xs.toplevel?.version ?? 0) >= 2;
-  if (id !== undefined && ctx.state.wm) {
+  if (!sizeUnknown && id !== undefined && ctx.state.wm) {
     const ws = ctx.state.wm.getWindowState(id);
     if (ws) {
       switch (ws.presentation) {
