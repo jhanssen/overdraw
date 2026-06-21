@@ -135,6 +135,27 @@ All "verified" claims were exercised on a single machine, single driver
   (`6cfd29c89b`); `dawn.node` `v20260531-linux-wayland-wire-alpha`
   (`f01cb22e5c`).
 
+## Running from a bare TTY: session bus
+
+When overdraw is launched from a bare TTY / getty / SSH session (no
+existing graphical session), there is no `DBUS_SESSION_BUS_ADDRESS` in
+the environment. GTK4 (and any other client that talks to portals /
+accessibility / GSettings over dbus) will then block on a connect-with-
+timeout to a nonexistent session bus for every service it probes,
+adding ~20-30s of dead time before its first wayland call. The symptom
+looks like "the compositor is slow to map the window" but the wayland
+exchange itself is fast (~200ms once it starts); WAYLAND_DEBUG=client
+shows a long silent gap before any request.
+
+Workarounds (pick one):
+- `dbus-run-session -- overdraw` -- starts a private session bus that
+  dies when overdraw exits.
+- `eval "$(dbus-launch --sh-syntax)" && export DBUS_SESSION_BUS_ADDRESS
+  DBUS_SESSION_BUS_PID` in the launch shell, then run overdraw and
+  client apps from the same shell.
+
+No overdraw-side fix; documented here so the diagnosis is in one place.
+
 ## Architecture as built
 
 Two processes: a core (Node + N-API addon, Dawn wire client, JS
