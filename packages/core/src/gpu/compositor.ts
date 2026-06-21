@@ -537,6 +537,14 @@ interface Surface {
   // sampled buffer region (surface coords). null/undefined = unset.
   viewportDst?: { width: number; height: number } | null;
   viewportSrc?: { x: number; y: number; width: number; height: number } | null;
+  // xdg_surface.set_window_geometry: surface-local sub-rect the
+  // client considers its "window" (excluding shadow / pop-out
+  // chrome). When set, the buffer renders anchored so this rect's
+  // (x, y) lands at the WM-assigned position; the surrounding
+  // surface area overflows naturally. null/undefined = unset
+  // (buffer top-left lines up with WM-assigned position, pre-CSD
+  // behavior).
+  geometry?: { x: number; y: number; width: number; height: number } | null;
   x: number;
   y: number;
   layoutW: number;
@@ -1472,6 +1480,15 @@ export class JsCompositor implements CompositorSink {
     this.damageSurface(id);
   }
 
+  setSurfaceGeometry(
+    id: number,
+    geom: { x: number; y: number; width: number; height: number } | null,
+  ): void {
+    const s = this.surfaces.get(id) ?? this.ensureSurface(id);
+    s.geometry = geom;
+    this.damageSurface(id);
+  }
+
   // Per-surface render-state setters (core-plugin-api.md §1). Cheap: they
   // mutate the per-surface SurfaceFx; the values flow into the WGSL Uniforms
   // each frame via updateUniforms. Auto-create the Surface so callers don't
@@ -2180,10 +2197,30 @@ export class JsCompositor implements CompositorSink {
     const intrinsicH = s.viewportDst?.height ?? s.viewportSrc?.height ?? bh / bs;
     const ox = output ? output.originX : 0;
     const oy = output ? output.originY : 0;
-    const px = (overrides?.placement?.x ?? s.x) - ox;
-    const py = (overrides?.placement?.y ?? s.y) - oy;
-    const pw = overrides?.placement?.w ?? (s.layoutW || intrinsicW);
-    const ph = overrides?.placement?.h ?? (s.layoutH || intrinsicH);
+    // xdg_surface.set_window_geometry: when set (CSD clients like GTK
+    // draw shadow / overflow chrome around their content; the
+    // geometry rect declares the sub-region of the surface that is
+    // "the window" -- the rest is outside-the-window pixels we
+    // discard). Render the geometry rect at the WM position, sampling
+    // only that sub-region of the buffer via UV crop. The shadow
+    // band stays inside the buffer but is never painted -- it would
+    // otherwise overflow onto the decoration ring around the window.
+    // An explicit override (intercept / compose placement) bypasses
+    // geometry entirely (the override IS the placement).
+    const overrideP = overrides?.placement;
+    const geom = s.geometry ?? null;
+    const px = (overrideP?.x ?? s.x) - ox;
+    const py = (overrideP?.y ?? s.y) - oy;
+    // When the WM has assigned a layout rect (any decorated window),
+    // use it: it's the rect we configured the client to render into
+    // AND the rect we hit-test against, so visual extent and input
+    // extent stay aligned. When no layout (subsurface, popup) and
+    // window-geometry is set (CSD client), fall back to the geometry
+    // size. Otherwise the surface's intrinsic logical size.
+    const pw = overrideP?.w
+      ?? (s.layoutW || (geom ? geom.width : intrinsicW));
+    const ph = overrideP?.h
+      ?? (s.layoutH || (geom ? geom.height : intrinsicH));
     const fx = s.fx;
     const data = new Float32Array(UNIFORM_FLOATS);
     // placement
@@ -2207,6 +2244,10 @@ export class JsCompositor implements CompositorSink {
     // cropUV: u0, v0, u1, v1 (defaults identity = full surface texture). A
     // wp_viewport source rect (surface coords) crops the sampled buffer;
     // computed from current buffer dims so it survives a buffer resize.
+    // When window-geometry is set without an explicit override or
+    // viewportSrc, crop to the geometry sub-rect (normalized over the
+    // surface's intrinsic logical extent) so the shadow / overflow
+    // around the geometry is not sampled.
     let cu = overrides?.cropUV;
     if (!frozenDraw && !cu && s.viewportSrc && s.width > 0 && s.height > 0) {
       const W = s.width, H = s.height;
@@ -2214,6 +2255,14 @@ export class JsCompositor implements CompositorSink {
         u0: (s.viewportSrc.x * bs) / W, v0: (s.viewportSrc.y * bs) / H,
         u1: ((s.viewportSrc.x + s.viewportSrc.width) * bs) / W,
         v1: ((s.viewportSrc.y + s.viewportSrc.height) * bs) / H,
+      };
+    }
+    if (!frozenDraw && !cu && geom && intrinsicW > 0 && intrinsicH > 0) {
+      cu = {
+        u0: geom.x / intrinsicW,
+        v0: geom.y / intrinsicH,
+        u1: (geom.x + geom.width) / intrinsicW,
+        v1: (geom.y + geom.height) / intrinsicH,
       };
     }
     data[16] = cu?.u0 ?? 0; data[17] = cu?.v0 ?? 0;

@@ -57,6 +57,14 @@ export interface SurfaceHandle { resource: Resource; }
 
 export interface Window {
   surfaceId: number;
+  // Z-order index inside the compositor's content layer (higher = on
+  // top). Tiled toplevels share a single z value (they don't overlap,
+  // so internal order is irrelevant; one click raises the whole
+  // tiled stack together). Floating windows each get their own z >=
+  // the tiled value; modal dialogs sit at z > their parent. See
+  // raiseWindow() for the maintenance rules; computeBaseStack sorts
+  // by ascending z to build the draw stack.
+  z: number;
   // The CONTENT rect (where the client draws). In the tiling model this is the
   // window's OUTER tile shrunk by its decoration insets: the layout owns the
   // outer tile; decoration eats into it; the client is configured to `rect`.
@@ -246,6 +254,15 @@ export interface Wm {
   setContentGated(surfaceId: number, gated: boolean): void;
   isContentGated(surfaceId: number): boolean;
   setDecorationSurface(windowId: number, decoSurfaceId: number | null): void;
+
+  // Raise a window to the top of its z-bucket. If the target is a
+  // modal dialog (windowState.parent != null), the raise redirects up
+  // the modal chain to the first non-modal ancestor; that ancestor is
+  // raised, and the modal subtree below it (this dialog plus any
+  // nested modals) is renormalized to stay above. Click-to-raise
+  // calls this; focus changes do NOT (focus and raise are decoupled).
+  // No-op when the window doesn't exist.
+  raiseWindow(surfaceId: number): void;
 
   // Propose a behavioral-state change. Builds a candidate by merging the
   // proposal onto the current state, runs the candidate through the
@@ -495,6 +512,22 @@ function outputsMap(outputs: ReadonlyArray<WmOutput>): Map<number, WmOutput> {
   return m;
 }
 
+// Resolve the output a (mapped) parent toplevel is currently on, by
+// scanning the workspace plugin's outputContent map for its surfaceId.
+// Returns null when the parent is unknown, not yet placed, or no
+// workspace plugin is wired.
+function resolveParentOutputId(
+  parentSurfaceId: number | null,
+  outputContent: (() => ReadonlyMap<number, ReadonlyArray<number>>) | undefined,
+): number | null {
+  if (parentSurfaceId === null || !outputContent) return null;
+  const content = outputContent();
+  for (const [outputId, ids] of content) {
+    if (ids.includes(parentSurfaceId)) return outputId;
+  }
+  return null;
+}
+
 // Window state convenience helpers re-exported here so callers reading the
 // WM module don't need a parallel events/types.js import.
 export type { Presentation, WindowState, ProposalReason } from "../events/types.js";
@@ -524,6 +557,103 @@ export function createWm(
     ?? createSurfaceTransactionBroker(compositor);
   const windows: Window[] = [];
   const wm: WmState = { outputs: outputsMap(outputs), windows };
+
+  // Z-order state. tiledZ is the single z value shared by every
+  // tiled (master-stack) window: tiled windows don't overlap each
+  // other, so internal order is irrelevant, but the whole tiled
+  // stack moves as a unit when any tiled window is raised. Floating
+  // and modal windows each get their own z above the tiled value
+  // (see assignZForMap and raiseWindow). Starts at 0 so the very
+  // first tiled window sits at z=0.
+  let tiledZ = 0;
+
+  // Re-derive tiledZ + the floating high-water mark from the current
+  // window list. Run after any z mutation so subsequent z assignments
+  // (new map, raise) reflect the actual peak.
+  function maxFloatingZ(): number {
+    let m = tiledZ;
+    for (const w of windows) {
+      if (w.windowState.presentation !== "managed"
+          && w.windowState.presentation !== "maximized"
+          && w.windowState.presentation !== "minimized"
+          && w.z > m) {
+        m = w.z;
+      }
+    }
+    return m;
+  }
+
+  // Children (modals) of a given parent window, by surfaceId. The
+  // child is any window whose windowState.parent points at the
+  // parentId. Used to raise an entire modal subtree above its root
+  // when the user clicks anywhere in the chain.
+  function modalChildrenOf(parentSurfaceId: number): Window[] {
+    const out: Window[] = [];
+    for (const w of windows) {
+      if (w.windowState.parent === parentSurfaceId) out.push(w);
+    }
+    return out;
+  }
+
+  // Walk a modal chain bottom-up: any window whose parent is non-null
+  // is treated as a modal; chase parents until we hit a non-modal
+  // (parent === null) or run out of windows. Used to redirect a raise
+  // request on a modal dialog up to its root toplevel; the modal
+  // subtree then rides along via raiseModalDescendants.
+  function rootOfModalChain(start: Window): Window {
+    let cur = start;
+    for (let i = 0; i < 64; i++) {
+      const parentId = cur.windowState.parent;
+      if (parentId === null) return cur;
+      const parent = windows.find((w) => w.surfaceId === parentId);
+      if (!parent) return cur;
+      cur = parent;
+    }
+    return cur;
+  }
+
+  // After raising `root`, walk its modal descendants and set each one's
+  // z to at least root.z + (depth+1) so the modal-above-parent
+  // invariant holds. Recurses through nested modals.
+  function raiseModalDescendants(root: Window): void {
+    function visit(parent: Window, depth: number): void {
+      const targetZ = parent.z + 1;
+      for (const child of modalChildrenOf(parent.surfaceId)) {
+        if (child.z <= parent.z) child.z = targetZ;
+        visit(child, depth + 1);
+      }
+    }
+    visit(root, 0);
+  }
+
+  // Assign z on map per the documented rules:
+  //   tiled toplevel (managed / maximized / minimized presentation):
+  //     z = tiledZ (joins the shared tiled stack).
+  //   floating window with no parent:
+  //     z = max(highestFloating, tiledZ) + 1.
+  //   modal dialog (parent != null):
+  //     z = max(parent.z, highestFloating) + 1; the parent's modal
+  //     subtree is normalized via raiseModalDescendants so deeper
+  //     modals stay above this one.
+  function assignZForMap(win: Window): void {
+    const p = win.windowState.presentation;
+    const isFloating = p === "floating";
+    const parentId = win.windowState.parent;
+    if (!isFloating && parentId === null) {
+      win.z = tiledZ;
+      return;
+    }
+    if (parentId !== null) {
+      const parent = windows.find((w) => w.surfaceId === parentId);
+      const baseZ = Math.max(parent?.z ?? tiledZ, maxFloatingZ());
+      win.z = baseZ + 1;
+      // A nested modal chain may exist (modal-of-modal); ensure
+      // descendants stay above.
+      raiseModalDescendants(win);
+      return;
+    }
+    win.z = maxFloatingZ() + 1;
+  }
   // The primary is the lowest live id; computed on demand to track setOutputs.
   function primaryOutputId(): number {
     let lo = Infinity;
@@ -826,6 +956,7 @@ export function createWm(
       if (existing) return contentOf(existing);
       const win: Window = {
         surfaceId,
+        z: tiledZ,
         outer: { x: 0, y: 0, width: -1, height: -1 },
         rect: { x: 0, y: 0, width: -1, height: -1 },
         surfaceRec,
@@ -853,8 +984,75 @@ export function createWm(
       if (!win) return undefined;
       if (!win.hasContent) {
         win.hasContent = true;
+        // Default-floating policy for windows the client signaled as
+        // transient/fixed-size. By this point the client has sent
+        // set_parent / set_min_size / set_max_size; those proposes run
+        // through markInitialCommitComplete's await chain, but a client
+        // that sends set_min_size AFTER the initial 0x0 configure (the
+        // GTK4 pattern for About-style dialogs) only has those
+        // constraints reflected here, after the first buffer commit.
+        // Conditions:
+        //   - parent set (xdg_toplevel.set_parent != null), OR
+        //   - min and max are both non-zero AND either axis is locked
+        //     (min == max on width OR height).
+        // A plugin's preconfigure interceptor would have already
+        // overridden if it wanted to; this is a default that fires
+        // only when the WM is still in the post-preconfigure
+        // 'managed' state.
+        let dialogPolicyMutated = false;
+        if (win.windowState.presentation === "managed") {
+          const c = win.windowState.constraints;
+          const minW = c.minSize?.width ?? 0;
+          const minH = c.minSize?.height ?? 0;
+          const maxW = c.maxSize?.width ?? 0;
+          const maxH = c.maxSize?.height ?? 0;
+          const fixedSize = minW !== 0 && minH !== 0
+            && (minW === maxW || minH === maxH);
+          if (win.windowState.parent !== null || fixedSize) {
+            win.windowState = { ...win.windowState, presentation: "floating" };
+            dialogPolicyMutated = true;
+            if (win.floatingRect === undefined) {
+              // Seed the floating rect at the client's preferred
+              // CONTENT size (locked-axis from set_min_size /
+              // set_max_size when present, else the current
+              // layout-assigned outer). Center on the parent's output
+              // when known, else the primary. The decoration broker's
+              // subsequent setInsets call grows this outer to
+              // (content + insets), preserving the client's content
+              // rect.
+              const fw = (minW !== 0 && minW === maxW) ? minW : (win.outer.width > 0 ? win.outer.width : minW || 800);
+              const fh = (minH !== 0 && minH === maxH) ? minH : (win.outer.height > 0 ? win.outer.height : minH || 600);
+              const targetOutputId = resolveParentOutputId(
+                win.windowState.parent, outputContent)
+                ?? primaryOutputId();
+              const out = wm.outputs.get(targetOutputId);
+              const ox = out?.rect.x ?? 0;
+              const oy = out?.rect.y ?? 0;
+              const ow = out?.rect.width ?? fw;
+              const oh = out?.rect.height ?? fh;
+              win.floatingRect = {
+                x: ox + Math.max(0, Math.round((ow - fw) / 2)),
+                y: oy + Math.max(0, Math.round((oh - fh) / 2)),
+                width: fw, height: fh,
+              };
+            }
+          }
+        }
+        // Assign z per the map-time rules (tiled joins the shared
+        // tiledZ; floating sits above the floating peak; modal sits
+        // above its parent). Runs AFTER the dialog policy promotion
+        // above so a fresh dialog lands at the correct z. Without
+        // this every newly-mapped window would keep the placeholder
+        // z=0 from addWindow, putting it under everything.
+        assignZForMap(win);
         compositor.setSurfaceLayout(win.surfaceId, win.rect.x, win.rect.y, win.rect.width, win.rect.height);
         pushStack();
+        // Dialog policy may have promoted this window to floating; the
+        // floatingRect we just seeded won't take effect until a
+        // relayout runs.
+        if (dialogPolicyMutated) {
+          driver.schedule("state-changed");
+        }
         // Real tile size as the second configure (a resize) after the throwaway
         // 0x0 sent at the initial commit. See pendingSizeConfigure. Skip when
         // the layout-driver hasn't produced a real outer rect yet (still the
@@ -893,6 +1091,33 @@ export function createWm(
       };
       const prevContent = contentOf(win);
       win.insets = granted;
+      // For floating windows, GROW the outer so the content rect (=
+      // what the client is configured to render at) is unchanged.
+      // Tiled windows keep the existing "outer is authoritative;
+      // decoration eats into it" semantics: the WM owns the outer
+      // tile; setting insets shrinks the content. A floating window's
+      // outer is sized to match the client's preferred content
+      // (e.g. a fixed-size About dialog's set_min == set_max);
+      // shrinking content there forces a configure the client refuses,
+      // and the resulting buffer-rendered-larger-than-tile shows
+      // hit-test misalignment + decoration overlap on the right /
+      // bottom.
+      if (win.windowState.presentation === "floating"
+          && win.outer.width > 0 && win.outer.height > 0) {
+        const insetLR = granted.left + granted.right;
+        const insetTB = granted.top + granted.bottom;
+        win.outer = {
+          x: win.outer.x, y: win.outer.y,
+          width: prevContent.width + insetLR,
+          height: prevContent.height + insetTB,
+        };
+        if (win.floatingRect) {
+          win.floatingRect = {
+            x: win.floatingRect.x, y: win.floatingRect.y,
+            width: win.outer.width, height: win.outer.height,
+          };
+        }
+      }
       const contentRect = contentOf(win);
       win.rect = contentRect;
       const outerRect = { ...win.outer };
@@ -943,6 +1168,54 @@ export function createWm(
       if (next !== undefined && win.outer.width > 0 && win.outer.height > 0) {
         compositor.setSurfaceLayout(next, win.outer.x, win.outer.y,
                                     win.outer.width, win.outer.height);
+      }
+      pushStack();
+    },
+
+    raiseWindow(surfaceId) {
+      const win = windows.find((w) => w.surfaceId === surfaceId);
+      if (!win) return;
+      // Redirect modal-chain clicks to the chain's root so a click on
+      // a dialog brings the whole modal subtree up together.
+      const root = rootOfModalChain(win);
+      const p = root.windowState.presentation;
+      const isTiled = p === "managed" || p === "maximized" || p === "minimized";
+      const highestFloating = maxFloatingZ();
+      if (isTiled) {
+        // Tiled stack: if the shared tiled z is already at the peak,
+        // nothing to do beyond renormalizing modal subtrees (the
+        // modal-above-parent invariant might be stale on a previously
+        // raised tiled stack whose modals weren't re-checked).
+        // Otherwise raise the ENTIRE tiled stack to sit at
+        // highestFloating + 1; every tiled window keeps a shared z.
+        if (tiledZ <= highestFloating) {
+          const newZ = highestFloating + 1;
+          tiledZ = newZ;
+          for (const w of windows) {
+            const wp = w.windowState.presentation;
+            if (wp === "managed" || wp === "maximized" || wp === "minimized") {
+              w.z = newZ;
+            }
+          }
+        }
+        // Raising tiled re-elevated EVERY tiled window's z, so EVERY
+        // tiled window's modal subtree may now be below its (newly-
+        // raised) parent. Renormalize every tiled window's modals,
+        // not just the clicked one's.
+        for (const w of windows) {
+          const wp = w.windowState.presentation;
+          if (wp === "managed" || wp === "maximized" || wp === "minimized") {
+            raiseModalDescendants(w);
+          }
+        }
+      } else {
+        // Floating root: if it's already on top, only renormalize its
+        // own modal subtree (in case a modal got out of order).
+        // Otherwise bump it above the current peak.
+        if (root.z <= highestFloating) {
+          root.z = highestFloating + 1;
+        }
+        raiseModalDescendants(root);
       }
       pushStack();
     },

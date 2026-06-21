@@ -66,6 +66,22 @@ export function sweepDestroyedSeatState(
 
 const CAP = seatSig.enums.capability.entries; // { pointer:1, keyboard:2, touch:4 }
 
+// Geometry offset of a wl_surface's xdg_surface.set_window_geometry,
+// or (0, 0) when none is set. CSD clients (GTK4 etc.) declare a
+// sub-rect of the buffer as "the window content"; surface-local
+// coords are relative to the BUFFER, not the geometry rect, so
+// translating output-space pointer positions back to surface-local
+// requires adding the geometry offset back after subtracting the
+// WM-assigned content position. Layer-shell / popup / cursor
+// surfaces don't carry an xdg_surface and naturally return (0, 0).
+function surfaceGeometryOffset(
+  ctx: Ctx, res: Resource,
+): { x: number; y: number } {
+  const sRec = ctx.state.surfaces.get(res);
+  const g = sRec?.xdgSurface?.geometry;
+  return g ? { x: g.x, y: g.y } : { x: 0, y: 0 };
+}
+
 export default function makeSeat(ctx: Ctx, driver: FocusDriver): SeatHandler {
   // wl_pointer resources grouped by owning client id. A client may have several
   // (one per wl_seat bind); events go to all of that client's pointers.
@@ -574,8 +590,15 @@ export default function makeSeat(ctx: Ctx, driver: FocusDriver): SeatHandler {
           }
           return;
         }
-        const sx = x - hit.rect.x;
-        const sy = y - hit.rect.y;
+        // Surface-local coords are relative to the wl_surface's
+        // origin, which (for CSD clients with set_window_geometry) is
+        // NOT the same as the WM-assigned content rect's origin: the
+        // geometry rect declares a sub-region of the buffer, so the
+        // visible top-left of the window corresponds to surface-local
+        // (geom.x, geom.y), not (0, 0). Add the offset back.
+        const goff = surfaceGeometryOffset(ctx, hit.surfaceRec.resource);
+        const sx = (x - hit.rect.x) + goff.x;
+        const sy = (y - hit.rect.y) + goff.y;
         if (!seat.focus) {
           seat.focus = hit;
           sendEnter(hit, sx, sy);
@@ -666,6 +689,13 @@ export default function makeSeat(ctx: Ctx, driver: FocusDriver): SeatHandler {
         }
         if (ev.pressed) {
           dispatchFocus("pointer-button", seat.focus.surfaceId, seat.focus.surfaceId);
+          // Click-to-raise: a press on a toplevel's content surface
+          // raises it (and its modal subtree, redirecting up the
+          // chain if the press landed on a modal dialog). Focus and
+          // raise are decoupled here on purpose; a pointer-follows-
+          // focus policy can still walk over windows without
+          // reordering them.
+          ctx.state.wm?.raiseWindow(seat.focus.surfaceId);
         }
         break;
       }

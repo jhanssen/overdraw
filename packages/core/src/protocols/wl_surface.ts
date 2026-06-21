@@ -218,6 +218,13 @@ function applySurfaceState(ctx: Ctx, s: SurfaceRecord): void {
   s.committed.bufferDamage = undefined;
   ctx.state.compositor.setSurfaceBufferScale?.(s.id, s.committed.bufferScale ?? 1);
   ctx.state.compositor.setSurfaceBufferTransform?.(s.id, s.committed.bufferTransform ?? 0);
+  // xdg_surface.set_window_geometry: push the declared "window" sub-
+  // rect to the compositor so it anchors the buffer with the geometry
+  // origin at the WM-assigned position (shadow / pop-out chrome
+  // overflows naturally). Null = no geometry set; the compositor
+  // anchors at the buffer's top-left (pre-CSD behavior).
+  const xsGeom = s.xdgSurface?.geometry ?? null;
+  ctx.state.compositor.setSurfaceGeometry?.(s.id, xsGeom);
 
   // Promote this surface's pending frame callbacks to "armed" (fired by the
   // per-frame dispatch). Double-buffered: they arm on apply, not on request.

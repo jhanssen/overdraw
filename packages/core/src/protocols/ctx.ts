@@ -266,6 +266,18 @@ export interface CompositorSink {
   // wp_viewport: dst overrides the surface's logical size; src crops the
   // sampled buffer region (surface coords). null clears either.
   setSurfaceViewport?(id: number, dst: ViewportDst | null, src: ViewportSrc | null): void;
+  // xdg_surface.set_window_geometry: the sub-rect of the surface (in
+  // surface-local logical coords) that the client considers its
+  // "window" -- the rest is shadow / pop-out that should render
+  // outside the WM-assigned tile. setSurfaceLayout supplies the
+  // OUTPUT-space rect where the geometry's (0, 0) anchor lands; the
+  // compositor uses this offset to position the buffer so the
+  // geometry rect aligns with the WM-assigned position and the
+  // surrounding shadow overflows naturally. (x, y) is the offset
+  // into the surface; (w, h) is the geometry size. Pass null to
+  // clear (surfaces with no geometry render anchored at
+  // setSurfaceLayout's (x, y), matching pre-CSD behavior).
+  setSurfaceGeometry?(id: number, geom: { x: number; y: number; width: number; height: number } | null): void;
   // The `content` layer's ordered draw list (windows + subsurfaces + popups).
   // rebuildStackWithPopups remains its single owner. Acts as the DEFAULT
   // content stack; an output may override it via setOutputStack.

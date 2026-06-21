@@ -73,6 +73,13 @@ const DEFAULT_INPUTS = [
   join(repoRoot, 'protocols', 'wlr-layer-shell-unstable-v1.xml'),
   join(repoRoot, 'protocols', 'wlr-foreign-toplevel-management-unstable-v1.xml'),
   join(repoRoot, 'protocols', 'wlr-output-management-unstable-v1.xml'),
+  // KDE server-decoration (the older SSD-negotiation protocol that
+  // pre-dates zxdg_decoration_manager_v1). GTK4 binds this one in
+  // preference to the xdg variant, so a compositor that only
+  // advertises zxdg gets ignored by GTK and the client keeps drawing
+  // CSD (visible as a 28x29 GTK shadow band around every window).
+  // Vendored copy lifted from wlroots' protocols/.
+  join(repoRoot, 'protocols', 'kde-server-decoration.xml'),
 ];
 
 function main(argv) {

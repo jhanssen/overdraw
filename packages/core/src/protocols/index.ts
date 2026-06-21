@@ -61,6 +61,7 @@ const GLOBALS = [
   "wp_cursor_shape_manager_v1",
   "zwlr_layer_shell_v1",
   "zxdg_decoration_manager_v1",
+  "org_kde_kwin_server_decoration_manager",
   "zxdg_output_manager_v1",
   "zwlr_foreign_toplevel_manager_v1",
   "wp_viewporter",
@@ -81,6 +82,7 @@ const CHILD_INTERFACES = [
   "wp_cursor_shape_device_v1",
   "zwlr_layer_surface_v1",
   "zxdg_toplevel_decoration_v1",
+  "org_kde_kwin_server_decoration",
   "zxdg_output_v1",
   "zwlr_foreign_toplevel_handle_v1",
   "wp_viewport",
@@ -602,6 +604,7 @@ export async function installProtocols(
     // module's helper factories aren't a default export.
     zwlr_layer_shell_v1: await import("./zwlr_layer_shell_v1.js"),
     zxdg_decoration_manager_v1: await import("./zxdg_decoration_manager_v1.js"),
+    org_kde_kwin_server_decoration_manager: await import("./org_kde_kwin_server_decoration_manager.js"),
     zxdg_output_manager_v1: await import("./zxdg_output_manager_v1.js"),
     zwlr_foreign_toplevel_manager_v1: await import("./zwlr_foreign_toplevel_manager_v1.js"),
     wp_viewporter: await import("./wp_viewporter.js"),
@@ -618,6 +621,7 @@ export async function installProtocols(
   const cursorShapeMod = await import("./cursor_shape.js");
   const layerShellMod = await import("./zwlr_layer_shell_v1.js");
   const decorationMod = await import("./zxdg_decoration_manager_v1.js");
+  const kdeDecorationMod = await import("./org_kde_kwin_server_decoration_manager.js");
   const xdgOutputMod = await import("./zxdg_output_manager_v1.js");
   const foreignTopMod = await import("./zwlr_foreign_toplevel_manager_v1.js");
   const viewporterMod = await import("./wp_viewporter.js");
@@ -639,6 +643,7 @@ export async function installProtocols(
     wp_cursor_shape_device_v1: cursorShapeMod.makeCursorShapeDevice(ctx),
     zwlr_layer_surface_v1: layerShellMod.makeLayerSurface(ctx),
     zxdg_toplevel_decoration_v1: decorationMod.makeToplevelDecoration(ctx),
+    org_kde_kwin_server_decoration: kdeDecorationMod.makeKdeDecoration(ctx),
     zxdg_output_v1: xdgOutputMod.makeXdgOutput(ctx),
     zwlr_foreign_toplevel_handle_v1: foreignTopMod.makeForeignToplevelHandle(ctx),
     wp_viewport: viewporterMod.makeViewport(ctx),

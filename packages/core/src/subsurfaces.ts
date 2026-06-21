@@ -148,8 +148,15 @@ export function computeBaseStack(
 ): number[] {
   const list = windows ?? state.wm?.state.windows;
   if (!list) return [];
+  // Sort by ascending z (bottom-to-top). Ties keep input list order
+  // (stable sort) -- callers passing wm.state.windows get the
+  // master-front order preserved within a z-bucket, which matters
+  // only when a bucket has multiple windows AND the layout puts them
+  // overlapping (the tiled bucket never overlaps; the floating
+  // bucket gets one z per window from raiseWindow).
+  const sorted = [...list].sort((a, b) => (a.z ?? 0) - (b.z ?? 0));
   const stack: number[] = [];
-  for (const win of list) {
+  for (const win of sorted) {
     // Content-gated windows (waiting for their decoration's first frame) are held
     // out of the draw stack so content + decoration appear together (piece 3).
     if (win.contentGated) continue;
@@ -167,13 +174,15 @@ export function computeBaseStack(
 
 // Minimal WM window shape consumed by computeBaseStack. Avoids importing the
 // WM's full WmWindow type into the protocols layer (it lives outside this
-// module's package), and keeps the contract narrow.
+// module's package), and keeps the contract narrow. `z` (optional with a
+// default of 0) drives draw order: ascending z = bottom-to-top.
 export interface WmWindowLike {
   surfaceId: number;
   surfaceRec: { resource: Resource };
   rect: { x: number; y: number };
   contentGated?: boolean;
   decorationSurfaceId?: number;
+  z?: number;
 }
 
 // Recompute subsurface layouts + the full draw stack and push to native. Delegates
