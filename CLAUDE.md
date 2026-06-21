@@ -1,13 +1,15 @@
 # overdraw — agent notes
 
 Project-specific operational notes. Design lives in `docs/architecture.md`;
-ground-truth status in `docs/status.md`. Before working on any protocol, read the
-"Read first: gaps in advertised protocols (silent-gap risks)" section at the top
-of `docs/status.md` — it lists what is advertised-but-incomplete (silent-gap
-risks: `wl_region` no-op stub, `wl_surface.damage`/`damage_buffer` honored for
-shm upload AND as a composite scissor (residual gaps: bbox-not-per-rect, full
-fallback for stack/fx, live KMS slot path unverified on hardware),
-no `wl_resource_post_error` mechanism, single-output only).
+ground-truth status in `docs/status.md` (short read; consult
+`docs/status-detailed.md` for per-phase narrative, test counts, and
+historical rationale when investigating a specific subsystem). Before
+working on any protocol, read the "Read first: gaps in advertised
+protocols (silent-gap risks)" section at the top of `docs/status.md` — it
+lists what is advertised-but-incomplete (silent-gap risks: `wl_region`
+no-op stub, `wl_surface.damage`/`damage_buffer` residuals, no
+`wl_resource_post_error` mechanism, hotplug-replug logical-position not
+restored, intercept-worker teardown race).
 
 ## Comments describe the code, not its history
 
