@@ -3117,18 +3117,14 @@ export class JsCompositor implements CompositorSink {
   // is cleared.
   setCursorFromSurface(surfaceId: number | null,
                        hotspotX: number, hotspotY: number): void {
-    // If switching away from the internal surface, free the owned
-    // texture -- the slot won't be using it anymore.
-    if (surfaceId !== this.internalCursorSurfaceId && this.cursorOwnedTexture) {
-      this.cursorOwnedTexture.destroy();
-      this.cursorOwnedTexture = null;
-      // Drop the internal surface entry too (it's no longer needed).
-      const intern = this.surfaces.get(this.internalCursorSurfaceId);
-      if (intern && surfaceId !== this.internalCursorSurfaceId) {
-        if (intern.uniformBuf) intern.uniformBuf.destroy();
-        this.surfaces.delete(this.internalCursorSurfaceId);
-      }
-    }
+    // The internal cursor surface (set up by setCursorPixels at boot
+    // from the XCursor theme) is the FALLBACK target whenever no client
+    // owns the cursor. Switching the slot to a client cursor surface
+    // does NOT free it: pointer leaving that client immediately reverts
+    // to the internal surface, and a destroyed internal surface would
+    // mean the next revert finds nothing to draw and the cursor
+    // disappears. Keeping it alive across slot switches is the right
+    // trade -- the owned texture is small (one mouse-sized BGRA image).
     this.cursorTargetSurfaceId = surfaceId;
     this.cursorHotspotX = hotspotX;
     this.cursorHotspotY = hotspotY;
