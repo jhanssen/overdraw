@@ -453,10 +453,18 @@ active; failure demotes).
 - `@overdraw/plugin-workspace-default` (namespace `'workspace'`):
   dynamic workspaces, two-id model (stable `WorkspaceHandle` vs.
   1-based `WorkspaceIndex`); action surface (create/destroy/show/
-  move-window/set-name/list/current); event family
-  (`workspace.created`/`destroyed`/`shown`/`hidden`/`renumbered`/
-  `renamed`/`window-moved`); workspace `preferredOutputs` for
-  durable-identity reclaim.
+  show-at-index/move-window/set-name/set-urgent/list/current); event
+  family (`workspace.created`/`destroyed`/`shown`/`hidden`/`renumbered`/
+  `renamed`/`urgency-changed`/`window-moved`); workspace
+  `preferredOutputs` for durable-identity reclaim. Urgency
+  auto-clears when a workspace becomes shown on its output. All
+  action params accept `output: string` (a connector name like
+  `"DP-1"` or an EDID id), never numeric `outputId`; `workspace.show`
+  takes `{ name }` with name lookup then a digit-string fallback to
+  `WorkspaceHandle` (stable identity for `Mod+N` keybinds);
+  positional access lives behind `workspace.show-at-index`. Default
+  output for omitted-`output` is the focused output (tracked via
+  `window.change.activated`).
 - `@overdraw/plugin-hotkey-default` (namespace `'hotkey'`):
   binding chain (chord + mode) driven by `config.hotkeys`.
 - `@overdraw/plugin-core-actions`: `compositor.quit`.

@@ -50,6 +50,11 @@ export interface WorkspaceRecord {
   // hit-tester walks it front-to-back. Reorder ops (promote/swap-next/
   // swap-prev) mutate it.
   members: number[];
+  // Attention flag. Set by setUrgent(), cleared automatically when the
+  // workspace becomes the shown one on its output. Surfaces via
+  // snapshotOf(). External consumers (status bars, the ext-workspace-v1
+  // protocol) read it via 'workspace.urgency-changed' bus events.
+  urgent: boolean;
 }
 
 export interface WorkspaceState {
@@ -109,6 +114,7 @@ export function snapshotOf(state: WorkspaceState,
     ...(rec.name !== undefined ? { name: rec.name } : {}),
     outputId: rec.outputId,
     members: [...rec.members],
+    urgent: rec.urgent,
   };
 }
 
@@ -208,7 +214,7 @@ export function ensureOutput(state: WorkspaceState, outputId: number, seedName: 
   }
   const handle = asHandle(state.nextHandle);
   const rec: WorkspaceRecord = {
-    handle, outputId, members: [],
+    handle, outputId, members: [], urgent: false,
     // Empty seedName leaves preferredOutputs empty (no durable identity);
     // the registry's resolver returns null in that case and the next
     // recomputeOutputs / config-seeded create populates it. Matches the
@@ -219,9 +225,20 @@ export function ensureOutput(state: WorkspaceState, outputId: number, seedName: 
   state.positionsByOutput.set(outputId, [handle]);
   state.shownByOutput.set(outputId, handle);
   state.nextHandle += 1;
+  // Two events: workspace.created announces the workspace; workspace.shown
+  // announces it is the (newly-and-only-possible) shown workspace on its
+  // output. Subscribers tracking shown state (status bars, the
+  // ext-workspace-v1 protocol layer) need the shown emit even for the very
+  // first workspace on an output -- recomputeOutputs's per-output diff only
+  // emits .shown on a TRANSITION, and a brand-new output has no prior
+  // shown to transition from.
   const sideEffects: SideEffect[] = [
     {
       kind: "emit", name: "workspace.created",
+      payload: { handle, index: 1, outputId },
+    },
+    {
+      kind: "emit", name: "workspace.shown",
       payload: { handle, index: 1, outputId },
     },
   ];
@@ -313,7 +330,7 @@ export function create(state: WorkspaceState,
   if (!preferred.includes(outputName)) preferred.push(outputName);
 
   const rec: WorkspaceRecord = {
-    handle, outputId, members: [],
+    handle, outputId, members: [], urgent: false,
     preferredOutputs: preferred,
     ...(spec.name !== undefined ? { name: spec.name } : {}),
   };
@@ -387,7 +404,7 @@ export function destroy(state: WorkspaceState,
     const fresh = asHandle(state.nextHandle);
     state.nextHandle += 1;
     state.byHandle.set(fresh, {
-      handle: fresh, outputId, members: [],
+      handle: fresh, outputId, members: [], urgent: false,
       preferredOutputs: outputName !== "" ? [outputName] : [],
     });
     positions.push(fresh);
@@ -480,6 +497,11 @@ export function destroy(state: WorkspaceState,
 // Make the workspace at `index` the shown one on outputId. Pushes the new
 // stack and triggers a focus re-decide. No-op if already shown.
 //
+// Auto-clears urgent on the workspace that becomes shown: if `rec.urgent`
+// was true, it is cleared and a `workspace.urgency-changed` emit is
+// prepended to the side-effect list (before workspace.hidden / .shown) so
+// subscribers observe urgency falling before the activation event.
+//
 // `outputName` is the durable identifier of `outputId`; when non-empty it
 // updates lastActiveByOutputName so a future hotplug restoration knows
 // which workspace to re-show on this output. Passing an empty string
@@ -506,6 +528,17 @@ export function show(state: WorkspaceState,
   if (outputName !== "") state.lastActiveByOutputName.set(outputName, handle);
 
   const sideEffects: SideEffect[] = [];
+  // Auto-clear urgency on the newly-shown workspace. Emitted first so a
+  // protocol subscriber translating both into one wire state event sees
+  // the cleared urgent bit and the new active bit together.
+  const rec = state.byHandle.get(handle);
+  if (rec && rec.urgent) {
+    rec.urgent = false;
+    sideEffects.push({
+      kind: "emit", name: "workspace.urgency-changed",
+      payload: { workspaceId: handle, urgent: false, outputId },
+    });
+  }
   if (prev !== undefined) {
     const prevIdx = findIndex(state, prev, outputId);
     if (prevIdx !== null) {
@@ -524,6 +557,34 @@ export function show(state: WorkspaceState,
   });
   sideEffects.push({ kind: "requestFocusDecision", reason: "workspace-changed" });
   return { state, sideEffects };
+}
+
+// Set or clear the urgent flag on the workspace at `index` on outputId.
+// Idempotent: when the flag already matches the request, returns no side
+// effects (no event emitted). When the flag flips, emits
+// 'workspace.urgency-changed'. Throws if `index` is out of range, matching
+// the behavior of show/destroy/setName.
+export function setUrgent(state: WorkspaceState,
+                          index: WorkspaceIndex,
+                          urgent: boolean,
+                          outputId: number = OUTPUT_DEFAULT,
+                          ): { state: WorkspaceState; sideEffects: SideEffect[] } {
+  const handle = findHandle(state, index, outputId);
+  if (handle === null) {
+    throw new Error(
+      `setUrgent: no workspace at index ${index as number} on output ${outputId}`);
+  }
+  const rec = state.byHandle.get(handle);
+  if (!rec) throw new Error("internal: handle without record");
+  if (rec.urgent === urgent) return { state, sideEffects: [] };
+  rec.urgent = urgent;
+  return {
+    state,
+    sideEffects: [{
+      kind: "emit", name: "workspace.urgency-changed",
+      payload: { workspaceId: handle, urgent, outputId },
+    }],
+  };
 }
 
 // Move a surfaceId to the workspace at `index` on outputId. If the surface
@@ -913,7 +974,7 @@ export function recomputeOutputs(
     const freshHandle = asHandle(state.nextHandle);
     state.nextHandle += 1;
     state.byHandle.set(freshHandle, {
-      handle: freshHandle, outputId: liveId, members: [],
+      handle: freshHandle, outputId: liveId, members: [], urgent: false,
       // Seed preferredOutputs with the live name so the replenishment
       // workspace stays anchored to this output across future churn.
       preferredOutputs: [name],

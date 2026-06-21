@@ -298,11 +298,12 @@ test('actions: workspace.* actions are registered + listable', async () => {
   });
 });
 
-test('actions: workspace.show via invokeAction triggers the same effects', async () => {
+test('actions: workspace.show-at-index via invokeAction triggers the same effects', async () => {
   await withWorkspacePlugin(async ({ rt, sink }) => {
     await call(rt, 'create', [{}]);
     sink.outputStackCalls.length = 0;
-    await rt.invokeAction('workspace.show', { index: 2 });
+    // No `output` -> defaults to focused (OUTPUT_DEFAULT in this harness).
+    await rt.invokeAction('workspace.show-at-index', { index: 2 });
     assert.equal(sink.outputStackCalls.length, 1);
     assert.equal(sink.outputStackCalls[0].outputId, 0);
   });
@@ -318,14 +319,19 @@ test('actions: workspace.create returns the snapshot', async () => {
 
 test('actions: malformed params throw', async () => {
   await withWorkspacePlugin(async ({ rt }) => {
-    await assert.rejects(() => rt.invokeAction('workspace.show', { index: 'x' }),
+    // workspace.show requires `name` as a string.
+    await assert.rejects(() => rt.invokeAction('workspace.show', { name: 123 }),
+      /name must be a non-empty string/);
+    // workspace.show-at-index requires a positive-integer index.
+    await assert.rejects(() => rt.invokeAction('workspace.show-at-index', { index: 'x' }),
       /index must be a positive integer/);
+    // workspace.move-window requires a surfaceId.
     await assert.rejects(() => rt.invokeAction('workspace.move-window', { index: 1 }),
       /surfaceId must be a number/);
   });
 });
 
-// ---- name lookup (Phase 7b) ----------------------------------------------
+// ---- name lookup ----------------------------------------------------------
 
 test('workspace.show by name: resolves a named workspace', async () => {
   await withWorkspacePlugin(async ({ rt, sink }) => {
@@ -345,19 +351,102 @@ test('workspace.show by name: unknown name rejects', async () => {
   });
 });
 
-test('workspace.show: both index and name rejects', async () => {
-  await withWorkspacePlugin(async ({ rt }) => {
-    await assert.rejects(
-      () => rt.invokeAction('workspace.show', { index: 1, name: 'foo' }),
-      /pass either index or name, not both/);
+// workspace.show falls back to treating an all-digits `name` as a durable
+// WorkspaceHandle when no user-set name matches. The boot workspace has
+// handle 1 and no user-set name; `{ name: "1" }` resolves to it via the
+// handle-cast pass.
+test('workspace.show by handle-string: falls back to durable handle when no name matches', async () => {
+  await withWorkspacePlugin(async ({ rt, sink, wsEvents }) => {
+    // Move off the boot workspace (handle 1) so showing it later actually
+    // transitions and emits the side effects we're asserting on.
+    await rt.invokeAction('workspace.create', { name: 'work' });
+    await rt.invokeAction('workspace.show', { name: 'work' });
+    sink.outputStackCalls.length = 0;
+    wsEvents.length = 0;
+    // No workspace is named "1"; falls back to handle 1 (the boot workspace).
+    await rt.invokeAction('workspace.show', { name: '1' });
+    const shown = wsEvents.find((e) => e.name === 'workspace.shown');
+    assert.equal(shown?.payload?.handle, 1,
+      `expected handle 1 shown; got ${JSON.stringify(shown)}`);
   });
 });
 
-test('workspace.show: neither index nor name rejects', async () => {
+// When a user explicitly names a workspace "1", the name match wins over
+// the handle-string fallback -- the user's name is explicit intent.
+test('workspace.show by handle-string: user-set name shadows the handle-string fallback', async () => {
+  await withWorkspacePlugin(async ({ rt, sink, wsEvents }) => {
+    // Create a second workspace and name it "1" -- shadows handle 1.
+    const snap = await rt.invokeAction('workspace.create', { name: '1' });
+    sink.outputStackCalls.length = 0;
+    wsEvents.length = 0;
+    await rt.invokeAction('workspace.show', { name: '1' });
+    // The named workspace (index 2) wins, not handle 1 (index 1).
+    const shown = wsEvents.find((e) => e.name === 'workspace.shown');
+    assert.equal(shown?.payload?.handle, snap.handle);
+  });
+});
+
+// ---- urgency --------------------------------------------------------------
+
+test('setUrgent via namespace: flips flag; snapshot reflects; bus event emitted', async () => {
+  await withWorkspacePlugin(async ({ rt, wsEvents }) => {
+    await call(rt, 'create', [{}]);
+    wsEvents.length = 0;
+
+    await call(rt, 'setUrgent', [2, true, 0]);
+    const list = await call(rt, 'list', [0]);
+    assert.equal(list[1].urgent, true);
+
+    const evs = wsEvents.filter((e) => e.name === 'workspace.urgency-changed');
+    assert.equal(evs.length, 1);
+    assert.equal(evs[0].payload.urgent, true);
+    assert.equal(evs[0].payload.outputId, 0);
+    assert.equal(evs[0].payload.workspaceId, list[1].handle);
+  });
+});
+
+test('setUrgent: idempotent — second identical call emits nothing', async () => {
+  await withWorkspacePlugin(async ({ rt, wsEvents }) => {
+    await call(rt, 'create', [{}]);
+    await call(rt, 'setUrgent', [2, true, 0]);
+    wsEvents.length = 0;
+
+    await call(rt, 'setUrgent', [2, true, 0]);
+    const evs = wsEvents.filter((e) => e.name === 'workspace.urgency-changed');
+    assert.equal(evs.length, 0);
+  });
+});
+
+test('show auto-clears urgent: urgency-changed fires before workspace.shown', async () => {
+  await withWorkspacePlugin(async ({ rt, wsEvents }) => {
+    await call(rt, 'create', [{}]);
+    await call(rt, 'setUrgent', [2, true, 0]);
+    wsEvents.length = 0;
+
+    await call(rt, 'show', [2, 0]);
+    const names = wsEvents.map((e) => e.name);
+    const urgencyIdx = names.indexOf('workspace.urgency-changed');
+    const shownIdx = names.indexOf('workspace.shown');
+    assert.ok(urgencyIdx !== -1, `expected urgency-changed; got ${names.join(',')}`);
+    assert.ok(shownIdx !== -1, `expected workspace.shown; got ${names.join(',')}`);
+    assert.ok(urgencyIdx < shownIdx,
+      `urgency-changed must precede workspace.shown; got ${names.join(',')}`);
+
+    const list = await call(rt, 'list', [0]);
+    assert.equal(list[1].urgent, false);
+  });
+});
+
+test('workspace.set-urgent action: validates params and flips flag', async () => {
   await withWorkspacePlugin(async ({ rt }) => {
+    await rt.invokeAction('workspace.create', {});
+    await rt.invokeAction('workspace.set-urgent', { index: 2, urgent: true });
+    const list = await rt.invokeAction('workspace.list', {});
+    assert.equal(list[1].urgent, true);
+
     await assert.rejects(
-      () => rt.invokeAction('workspace.show', {}),
-      /missing required field/);
+      () => rt.invokeAction('workspace.set-urgent', { index: 2 }),
+      /urgent must be a boolean/);
   });
 });
 
@@ -372,7 +461,7 @@ test('workspace.move-window by name: moves to the named workspace', async () => 
     assert.ok(sink.outputStackCalls.some((c) =>
       c.outputId === 0 && Array.isArray(c.ids) && c.ids.length === 0));
     // Workspace 2 ("mail") now has 101.
-    const list = await rt.invokeAction('workspace.list', { outputId: 0 });
+    const list = await rt.invokeAction('workspace.list', {});
     assert.deepEqual(list[1].members, [101]);
   });
 });

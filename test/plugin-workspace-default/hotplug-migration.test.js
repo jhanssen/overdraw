@@ -88,7 +88,7 @@ async function withPlugin(ctx, fn) {
 }
 
 test('hotplug add: output.added triggers recompute creating a workspace on the new output', async () => {
-  const ctx = harness([{ outputId: 0, durableKey: 'DP-1' }]);
+  const ctx = harness([{ outputId: 0, name: 'DP-1', edidId: '' }]);
   await withPlugin(ctx, async (rt) => {
     // Before add: only one workspace on output 0.
     let ws1 = await rt.invokeNamespace('workspace', 'list', [1]);
@@ -115,8 +115,8 @@ test('hotplug add: output.added triggers recompute creating a workspace on the n
 
 test('hotplug remove: workspace evacuates to the surviving output', async () => {
   const ctx = harness([
-    { outputId: 0, durableKey: 'DP-1' },
-    { outputId: 1, durableKey: 'HDMI-1' },
+    { outputId: 0, name: 'DP-1', edidId: '' },
+    { outputId: 1, name: 'HDMI-1', edidId: '' },
   ]);
   await withPlugin(ctx, async (rt) => {
     // Output 1 has a replenishment workspace from the boot recompute.
@@ -151,8 +151,8 @@ test('hotplug remove+add round trip: workspace returns to its original output', 
   // hotplug events report (the plugin prefers edidId when non-empty -- if
   // boot says 'HDMI-1' but hotplug says 'HDMI-1-edid', reclaim fails).
   const ctx = harness([
-    { outputId: 0, durableKey: 'DP-1-edid' },
-    { outputId: 1, durableKey: 'HDMI-1-edid' },
+    { outputId: 0, name: 'DP-1-edid', edidId: '' },
+    { outputId: 1, name: 'HDMI-1-edid', edidId: '' },
   ], 'DP-1-edid');
   await withPlugin(ctx, async (rt) => {
     // Find the workspace on HDMI-1 (the replenishment one).
@@ -179,7 +179,7 @@ test('hotplug remove+add round trip: workspace returns to its original output', 
 
 test('hotplug remove+add: edidId is the durable key (preferred over name)', async () => {
   // Boot with one output whose durable key is its edidId.
-  const ctx = harness([{ outputId: 0, durableKey: 'MFR-0001-12345678' }],
+  const ctx = harness([{ outputId: 0, name: 'MFR-0001-12345678', edidId: '' }],
                       'MFR-0001-12345678');
   await withPlugin(ctx, async (rt) => {
     // Add a second monitor.

@@ -771,10 +771,26 @@ declare module 'overdraw' {
   interface EventMap {
     'workspace.shown':  { workspaceId: WorkspaceId; outputId: OutputId };
     'workspace.hidden': { workspaceId: WorkspaceId; outputId: OutputId };
+    'workspace.urgency-changed':
+        { workspaceId: WorkspaceId; urgent: boolean; outputId: OutputId };
     // ...
   }
   interface ActionMap {
-    'workspace.show': { params: { id: WorkspaceId; outputId: OutputId }; result: void };
+    // workspace.show takes a name string with handle-string fallback.
+    // The action layer's `output` is the user-facing durable name (a
+    // connector name like "DP-1" or an EDID id); resolution to the
+    // numeric outputId happens inside the action handler.
+    'workspace.show':
+        { params: { name: string; output?: string;
+                    transition?: { kind: string; duration: number } };
+          result: void };
+    // Per-output positional sister-action for `Mod+N`-style positional
+    // bindings; output defaults to the focused output.
+    'workspace.show-at-index':
+        { params: { index: WorkspaceIndex; output?: string }; result: void };
+    'workspace.set-urgent':
+        { params: { index: WorkspaceIndex; urgent: boolean; output?: string };
+          result: void };
     // ...
   }
 
@@ -783,6 +799,11 @@ declare module 'overdraw' {
     create(spec?: { name?: string }): Promise<WorkspaceId>;
     destroy(id: WorkspaceId): Promise<void>;
     show(id: WorkspaceId, outputId: OutputId): Promise<void>;
+    // setUrgent: mark a workspace urgent (typically when a window on it
+    // requests attention while the workspace isn't shown). Auto-clears
+    // when the workspace becomes shown on its output.
+    setUrgent(index: WorkspaceIndex, urgent: boolean,
+              outputId?: OutputId): Promise<void>;
     // ...
   }
 }

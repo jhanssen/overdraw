@@ -119,14 +119,16 @@ export default async function init(sdk: SdkLike): Promise<void> {
   sdk.actions.register({
     name: "window.move-to-output",
     description: "Move the keyboard-focused window to the workspace currently " +
-      "shown on the given output. Params: { outputId: number }.",
+      "shown on the given output. Params: { output: string } -- a connector " +
+      "name ('DP-1') or EDID id. The launcher resolves it against the live " +
+      "output set; an unknown name is a silent no-op.",
     handler: async (params: unknown): Promise<null> => {
       if (typeof params !== "object" || params === null
-          || typeof (params as { outputId?: unknown }).outputId !== "number") {
-        throw new TypeError("window.move-to-output: expected { outputId: number }");
+          || typeof (params as { output?: unknown }).output !== "string") {
+        throw new TypeError("window.move-to-output: expected { output: string }");
       }
       sdk.events.emit("window.move-to-output-requested",
-        { outputId: (params as { outputId: number }).outputId });
+        { output: (params as { output: string }).output });
       return null;
     },
   });

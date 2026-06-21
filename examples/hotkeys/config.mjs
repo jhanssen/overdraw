@@ -20,18 +20,24 @@ export default {
       default: [
         { keys: "Mod+q", action: "compositor.quit" },
 
-        // Workspace switching (Phase 6).
-        { keys: "Mod+1", action: "workspace.show", params: { index: 1 } },
-        { keys: "Mod+2", action: "workspace.show", params: { index: 2 } },
-        { keys: "Mod+3", action: "workspace.show", params: { index: 3 } },
+        // Workspace switching. `workspace.show` takes a `name`: matches a
+        // user-set workspace name first (across every output), then falls
+        // back to treating an all-digits name as a durable WorkspaceHandle.
+        // So Mod+1 targets the workspace whose handle is 1, stable across
+        // hotplug + multi-output. For per-output positional indexing use
+        // `workspace.show-at-index` (defaults `output` to the focused one).
+        { keys: "Mod+1", action: "workspace.show", params: { name: "1" } },
+        { keys: "Mod+2", action: "workspace.show", params: { name: "2" } },
+        { keys: "Mod+3", action: "workspace.show", params: { name: "3" } },
         { keys: "Mod+n", action: "workspace.create" },
 
-        // Move the focused window to workspace 1 / 2 (deferred ref
-        // resolves at chord-match time, not config-load time).
+        // Move the focused window to workspace 1 / 2 (deferred ref resolves
+        // at chord-match time, not config-load time). Mirror the show shape:
+        // `name` is the durable identity, `index` + `output` is positional.
         { keys: "Mod+Shift+1", action: "workspace.move-window",
-          params: { surfaceId: ref.focusedWindow, index: 1 } },
+          params: { surfaceId: ref.focusedWindow, name: "1" } },
         { keys: "Mod+Shift+2", action: "workspace.move-window",
-          params: { surfaceId: ref.focusedWindow, index: 2 } },
+          params: { surfaceId: ref.focusedWindow, name: "2" } },
 
         // Move the focused window between outputs. The "to-next" / "to-
         // prev" variants cycle by ascending outputId (wraps). The explicit
@@ -39,9 +45,9 @@ export default {
         { keys: "Mod+Shift+Right", action: "window.move-to-next-output" },
         { keys: "Mod+Shift+Left",  action: "window.move-to-prev-output" },
         { keys: "Mod+Ctrl+Shift+1", action: "window.move-to-output",
-          params: { outputId: 0 } },
+          params: { output: "DP-1" } },
         { keys: "Mod+Ctrl+Shift+2", action: "window.move-to-output",
-          params: { outputId: 1 } },
+          params: { output: "HDMI-A-1" } },
 
         // Master/stack rearrangement within the focused window's workspace.
         // Promote = make this window the master (index 0); swap-next/prev

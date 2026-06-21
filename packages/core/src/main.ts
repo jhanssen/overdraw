@@ -589,7 +589,8 @@ const bootOutputDurableKey = bootPrimary
 const initialOutputs = state?.outputs
   ? [...state.outputs.values()].map((rec) => ({
       outputId: rec.id,
-      durableKey: rec.edidId !== "" ? rec.edidId : rec.name,
+      name: rec.name,
+      edidId: rec.edidId,
     }))
   : [];
 const bundledRuntime = { bootOutputDurableKey, initialOutputs };
@@ -945,8 +946,24 @@ pluginBus.subscribe("window.close-requested", () => {
 // windows-broker turns into a relayout.
 pluginBus.subscribe("window.move-to-output-requested", (_n, payload) => {
   if (!state?.seat || !runtime || !state.outputs) return;
-  const targetOutputId = (payload as { outputId?: unknown }).outputId;
-  if (typeof targetOutputId !== "number") return;
+  // Resolve `output` (a connector name or EDID id) to an outputId
+  // against the live output set. Internal callers (e.g. the cycle
+  // handler below) emit a numeric `outputId` directly; honor that
+  // form too so the cycle path doesn't have to round-trip strings.
+  let targetOutputId: number | null = null;
+  const rawOutput = (payload as { output?: unknown }).output;
+  if (typeof rawOutput === "string" && rawOutput.length > 0) {
+    for (const rec of state.outputs.values()) {
+      if (rec.name === rawOutput || rec.edidId === rawOutput) {
+        targetOutputId = rec.id;
+        break;
+      }
+    }
+  } else {
+    const rawId = (payload as { outputId?: unknown }).outputId;
+    if (typeof rawId === "number") targetOutputId = rawId;
+  }
+  if (targetOutputId === null) return;
   if (!state.outputs.has(targetOutputId)) return;
   const focused = state.seat.kbFocus?.surfaceId;
   if (typeof focused !== "number") return;
@@ -954,15 +971,16 @@ pluginBus.subscribe("window.move-to-output-requested", (_n, payload) => {
   // created lazily; ensureOutput guarantees the target output has one
   // (idempotent if it already does) before the move.
   const rt = runtime;
+  const targetId = targetOutputId;
   void (async () => {
-    const cur = await rt.invokeNamespace("workspace", "ensureOutput", [targetOutputId]);
+    const cur = await rt.invokeNamespace("workspace", "ensureOutput", [targetId]);
     if (!cur || typeof cur !== "object"
         || typeof (cur as { index?: unknown }).index !== "number") {
-      throw new Error(`ensureOutput returned no workspace for ${targetOutputId}`);
+      throw new Error(`ensureOutput returned no workspace for ${targetId}`);
     }
     await rt.invokeNamespace(
       "workspace", "moveWindow",
-      [focused, (cur as { index: number }).index, targetOutputId]);
+      [focused, (cur as { index: number }).index, targetId]);
   })().catch((e: unknown) => {
     log.warn("core", `window.move-to-output failed: ${(e as Error).message}`);
   });

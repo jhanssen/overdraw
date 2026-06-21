@@ -17,13 +17,17 @@ export interface BundledRuntimeContext {
   // may pass empty when they don't model outputs (the workspace plugin
   // then falls back to its no-runtime-context defaults).
   bootOutputDurableKey: string;
-  // Snapshot of every live output known at plugin-resolution time. Maps
-  // outputId -> durable key (edidId || name). Workspace plugin uses this to
-  // seed its liveOutputs map without missing the boot enumeration of
-  // secondary outputs (the OutputDescriptor burst that fires output.added
-  // happens BEFORE the plugin runtime spawns, so the plugin can't observe
-  // those events via subscribe).
-  initialOutputs: ReadonlyArray<{ outputId: number; durableKey: string }>;
+  // Snapshot of every live output known at plugin-resolution time. Each
+  // entry carries the connector name (e.g. "DP-1") AND the EDID-derived
+  // durable id, both as raw strings (empty when not present). The
+  // workspace plugin computes its durable key as edidId-when-non-empty-
+  // else-name AND keeps the pair around so a user-supplied output
+  // string (typically the connector name) can be resolved back to an
+  // outputId.  The boot OutputDescriptor burst that fires output.added
+  // happens BEFORE the plugin runtime spawns, so the plugin can't
+  // observe those events via subscribe -- this snapshot is the
+  // catch-up mechanism.
+  initialOutputs: ReadonlyArray<{ outputId: number; name: string; edidId: string }>;
 }
 
 // Default keybindings when the user supplies no `hotkeys` config. Deliberately

@@ -116,15 +116,17 @@ interface WorkspacePluginConfig {
   // preferredOutputs entries are never rewritten by design.
   bootOutputDurableKey?: string;
   // Snapshot of every live output known to the core at plugin-resolution
-  // time. Each entry maps an outputId to its durable key. Lets the plugin
-  // seed its liveOutputs map without missing the boot enumeration of
-  // secondary outputs (the OutputDescriptor burst that introduces them
-  // fires BEFORE the plugin runtime spawns, so the plugin can't observe
-  // those via subscribe). After seeding the plugin recomputes once so
-  // secondary outputs immediately satisfy the ≥1-workspace-per-output
-  // invariant. When omitted (test harness), the plugin starts with an
-  // empty liveOutputs map and learns outputs lazily from bus events.
-  initialOutputs?: ReadonlyArray<{ outputId: number; durableKey: string }>;
+  // time. Each entry carries the connector name and EDID-derived id
+  // separately so user-supplied output strings can be resolved against
+  // either alias. Lets the plugin seed its liveOutputs + alias maps
+  // without missing the boot enumeration of secondary outputs (the
+  // OutputDescriptor burst that introduces them fires BEFORE the
+  // plugin runtime spawns, so the plugin can't observe those via
+  // subscribe). After seeding the plugin recomputes once so secondary
+  // outputs immediately satisfy the ≥1-workspace-per-output invariant.
+  // When omitted (test harness), the plugin starts with empty maps and
+  // learns outputs lazily from bus events.
+  initialOutputs?: ReadonlyArray<{ outputId: number; name: string; edidId: string }>;
 }
 
 export default async function init(
@@ -157,6 +159,11 @@ export default async function init(
   // else name). Used by recomputeOutputs to resolve preferredOutputs entries
   // to a live outputId on every hotplug.
   const liveOutputs = new Map<number, string>();
+  // Parallel map tracking both connector name (e.g. "DP-1") and EDID id for
+  // each live output. Used by resolveOutputName so user-supplied strings
+  // can match against either identifier -- a user typing "DP-1" in a
+  // config keybind should not have to know the EDID string.
+  const outputAliasesById = new Map<number, { name: string; edidId: string }>();
   function outputNameOf(outputId: number): string {
     return liveOutputs.get(outputId) ?? BOOT_OUTPUT_NAME;
   }
@@ -168,6 +175,38 @@ export default async function init(
     if (typeof p.name === "string" && p.name.length > 0) return p.name;
     return null;
   }
+  // Extract a payload's name + edidId for the aliases map. Unknown values
+  // default to "" -- the resolver skips empties.
+  function aliasesOf(p: { name?: unknown; edidId?: unknown }): { name: string; edidId: string } {
+    return {
+      name: typeof p.name === "string" ? p.name : "",
+      edidId: typeof p.edidId === "string" ? p.edidId : "",
+    };
+  }
+  // Resolve a user-supplied output identifier (e.g. "DP-1", or an EDID
+  // string) to its live outputId. Tries each alias on each output; returns
+  // the first match. Null when no live output matches the input. Empty
+  // input never matches (an output's empty name/edidId are not addressable
+  // by name).
+  function resolveOutputName(input: string): number | null {
+    if (input === "") return null;
+    for (const [outputId, alias] of outputAliasesById) {
+      if (alias.name === input || alias.edidId === input) return outputId;
+    }
+    return null;
+  }
+  // The output currently containing the keyboard-focused window. Tracks
+  // window.change events whose `activated: true` field carries the new
+  // focus. When the focused window unmaps or the workspace it's on is
+  // hidden, the last-known focused output is retained -- so a hotkey
+  // pressed on an empty workspace still resolves to the output the user
+  // was last interacting with. Falls back to OUTPUT_DEFAULT when no
+  // focus has ever been observed (test harness or boot-time keybind).
+  let focusedSurfaceId: number | null = null;
+  let focusedOutputIdCache = reg.OUTPUT_DEFAULT;
+  function focusedOutputId(): number {
+    return focusedOutputIdCache;
+  }
   // Subscribe BEFORE init so a synchronous emit during startup doesn't drop.
   sdk.events.subscribe("output.changed", (_name, payload) => {
     if (!payload || typeof payload !== "object") return;
@@ -175,6 +214,38 @@ export default async function init(
     if (typeof p.outputId !== "number") return;
     const key = durableKeyOf(payload as { edidId?: unknown; name?: unknown });
     if (key !== null) liveOutputs.set(p.outputId, key);
+    outputAliasesById.set(p.outputId, aliasesOf(payload as { name?: unknown; edidId?: unknown }));
+  });
+  // Keyboard focus tracking. Each window.change carries activated: bool; a
+  // surface becoming activated is our signal that its output is the
+  // user-facing focused output. When the focused surface unmaps (no
+  // explicit "loses activation" event arrives), the cache retains the
+  // last-known output so a hotkey on an empty workspace still targets
+  // where the user was working.
+  sdk.events.subscribe("window.change", (_name, payload) => {
+    if (!payload || typeof payload !== "object") return;
+    const p = payload as { surfaceId?: unknown; activated?: unknown; changed?: unknown };
+    if (typeof p.surfaceId !== "number") return;
+    if (typeof p.activated !== "boolean") return;
+    // Only react to events that actually carry an activation transition;
+    // a window.change for a pure title/appId update may not have its
+    // activated bit toggling.
+    const changed = Array.isArray(p.changed) ? p.changed as unknown[] : [];
+    if (!changed.includes("activated")) return;
+    if (p.activated) {
+      focusedSurfaceId = p.surfaceId;
+      // Resolve surface -> workspace -> output. If the surface isn't
+      // tracked (unmapped, layer-shell, popup) leave the cache as-is.
+      const handle = state.surfaceToHandle.get(p.surfaceId);
+      if (handle !== undefined) {
+        const rec = state.byHandle.get(handle);
+        if (rec) focusedOutputIdCache = rec.outputId;
+      }
+    } else if (focusedSurfaceId === p.surfaceId) {
+      focusedSurfaceId = null;
+      // Keep focusedOutputIdCache: the focus departed but the user's
+      // pointer/keyboard is still anchored on that output.
+    }
   });
   // Guard against hotplug events that arrive between subscribe() and reg.init
   // returning. reg.init runs synchronously right below; in practice nothing
@@ -190,6 +261,7 @@ export default async function init(
     const key = durableKeyOf(payload as { edidId?: unknown; name?: unknown });
     if (key === null) return;
     liveOutputs.set(p.outputId, key);
+    outputAliasesById.set(p.outputId, aliasesOf(payload as { name?: unknown; edidId?: unknown }));
     const r = reg.recomputeOutputs(
       state, liveOutputs, fallbackOutputId, fallbackOutputName);
     state = r.state;
@@ -222,6 +294,13 @@ export default async function init(
     const p = payload as { outputId?: unknown };
     if (typeof p.outputId !== "number") return;
     liveOutputs.delete(p.outputId);
+    outputAliasesById.delete(p.outputId);
+    // Focus may have been on this output; reset to OUTPUT_DEFAULT so the
+    // next action targets a live output rather than the vanished one.
+    if (focusedOutputIdCache === p.outputId) {
+      focusedOutputIdCache = reg.OUTPUT_DEFAULT;
+      focusedSurfaceId = null;
+    }
     const r = reg.recomputeOutputs(
       state, liveOutputs, fallbackOutputId, fallbackOutputName);
     state = r.state;
@@ -241,7 +320,9 @@ export default async function init(
   let bootRecomputeEffects: SideEffect[] = [];
   if (config?.initialOutputs && config.initialOutputs.length > 0) {
     for (const o of config.initialOutputs) {
-      if (o.durableKey !== "") liveOutputs.set(o.outputId, o.durableKey);
+      const durable = durableKeyOf(o);
+      if (durable !== null) liveOutputs.set(o.outputId, durable);
+      outputAliasesById.set(o.outputId, { name: o.name, edidId: o.edidId });
     }
     const r = reg.recomputeOutputs(
       state, liveOutputs, fallbackOutputId, fallbackOutputName);
@@ -396,11 +477,11 @@ export default async function init(
 
   sdk.actions.register({
     name: "workspace.create",
-    description: "Append a new workspace; returns its snapshot.",
+    description:
+      "Append a new workspace on the given output (defaults to the focused output); returns its snapshot.",
     handler: async (params: unknown): Promise<WorkspaceSnapshot> => {
-      const p = parseCreateParams(params);
-      const outId = p.outputId ?? reg.OUTPUT_DEFAULT;
-      const r = reg.create(state, p, outputNameOf(outId));
+      const p = parseCreateParams(params, resolveOutputName, focusedOutputId());
+      const r = reg.create(state, p, outputNameOf(p.outputId));
       state = r.state;
       await applyEffects(r.sideEffects);
       return r.snapshot;
@@ -409,9 +490,10 @@ export default async function init(
 
   sdk.actions.register({
     name: "workspace.destroy",
-    description: "Destroy the workspace at the given index; renumbers + relocates members.",
+    description:
+      "Destroy the workspace at the given per-output index on the given output (defaults to the focused output); renumbers + relocates members.",
     handler: async (params: unknown): Promise<null> => {
-      const p = parseIndexParams(params, "workspace.destroy");
+      const p = parseIndexParams(params, resolveOutputName, focusedOutputId(), "workspace.destroy");
       const r = reg.destroy(state, p.index, p.outputId, outputNameOf(p.outputId));
       state = r.state;
       await applyEffects(r.sideEffects);
@@ -421,9 +503,10 @@ export default async function init(
 
   sdk.actions.register({
     name: "workspace.show",
-    description: "Make the workspace at the given index (or matching name) the visible one.",
+    description:
+      "Show the workspace matching `name`. Matches user-set names first across all outputs; falls back to the durable handle when `name` is a digit string. Use `output` to restrict the search.",
     handler: async (params: unknown): Promise<null> => {
-      const p = parseIndexOrNameParams(state, params, "workspace.show");
+      const p = parseShowParams(state, params, resolveOutputName);
       const t = parseShowTransition(params, "workspace.show");
       if (t) {
         await showWithTransition(p.index, p.outputId, t);
@@ -437,10 +520,30 @@ export default async function init(
   });
 
   sdk.actions.register({
-    name: "workspace.move-window",
-    description: "Move a window to the workspace at the given index (or matching name).",
+    name: "workspace.show-at-index",
+    description:
+      "Show the workspace at the given per-output index on the given output (defaults to the focused output).",
     handler: async (params: unknown): Promise<null> => {
-      const p = parseMoveParams(state, params);
+      const p = parseIndexParams(
+        params, resolveOutputName, focusedOutputId(), "workspace.show-at-index");
+      const t = parseShowTransition(params, "workspace.show-at-index");
+      if (t) {
+        await showWithTransition(p.index, p.outputId, t);
+        return null;
+      }
+      const r = reg.show(state, p.index, p.outputId, outputNameOf(p.outputId));
+      state = r.state;
+      await applyEffects(r.sideEffects);
+      return null;
+    },
+  });
+
+  sdk.actions.register({
+    name: "workspace.move-window",
+    description:
+      "Move a window (by surfaceId) to a workspace identified by `name` (with handle-string fallback) or by `{index, output}`.",
+    handler: async (params: unknown): Promise<null> => {
+      const p = parseMoveParams(state, params, resolveOutputName, focusedOutputId());
       const r = reg.moveWindow(state, p.surfaceId, p.index, p.outputId, outputNameOf(p.outputId));
       state = r.state;
       await applyEffects(r.sideEffects);
@@ -450,9 +553,9 @@ export default async function init(
 
   sdk.actions.register({
     name: "workspace.set-name",
-    description: "Set or clear a workspace's display name.",
+    description: "Set or clear a workspace's display name (positional, requires per-output index).",
     handler: async (params: unknown): Promise<null> => {
-      const p = parseSetNameParams(params);
+      const p = parseSetNameParams(params, resolveOutputName, focusedOutputId());
       const r = reg.setName(state, p.index, p.name, p.outputId);
       state = r.state;
       await applyEffects(r.sideEffects);
@@ -461,19 +564,50 @@ export default async function init(
   });
 
   sdk.actions.register({
+    name: "workspace.set-urgent",
+    description: "Set or clear the urgent flag on a workspace (positional). Auto-clears on show.",
+    handler: async (params: unknown): Promise<null> => {
+      const p = parseSetUrgentParams(params, resolveOutputName, focusedOutputId());
+      const r = reg.setUrgent(state, p.index, p.urgent, p.outputId);
+      state = r.state;
+      await applyEffects(r.sideEffects);
+      return null;
+    },
+  });
+
+  sdk.actions.register({
     name: "workspace.list",
-    description: "All workspaces on the given output, sorted by index.",
+    description:
+      "Workspaces on the given output, sorted by per-output index. Omit `output` to list every workspace on every live output.",
     handler: async (params: unknown): Promise<WorkspaceSnapshot[]> => {
-      const outputId = parseOptionalOutputId(params);
+      if (params === undefined || params === null) {
+        // No output requested -> every workspace, every output.
+        const out: WorkspaceSnapshot[] = [];
+        for (const outputId of state.positionsByOutput.keys()) {
+          out.push(...reg.snapshotsForOutput(state, outputId));
+        }
+        return out;
+      }
+      if (!isObj(params)) throw new TypeError("workspace.list: expected an object");
+      if (params.output === undefined) {
+        const out: WorkspaceSnapshot[] = [];
+        for (const outputId of state.positionsByOutput.keys()) {
+          out.push(...reg.snapshotsForOutput(state, outputId));
+        }
+        return out;
+      }
+      const outputId = parseOptionalOutput(params, resolveOutputName, -1, "workspace.list");
       return reg.snapshotsForOutput(state, outputId);
     },
   });
 
   sdk.actions.register({
     name: "workspace.current",
-    description: "The currently-shown workspace on the given output.",
+    description:
+      "The currently-shown workspace on the given output (defaults to the focused output).",
     handler: async (params: unknown): Promise<WorkspaceSnapshot | null> => {
-      const outputId = parseOptionalOutputId(params);
+      const outputId = parseOptionalOutput(
+        params, resolveOutputName, focusedOutputId(), "workspace.current");
       return reg.current(state, outputId);
     },
   });
@@ -520,6 +654,12 @@ export default async function init(
       state = r.state;
       await applyEffects(r.sideEffects);
     },
+    async setUrgent(index, urgent, outputId): Promise<void> {
+      const outId = outputId ?? reg.OUTPUT_DEFAULT;
+      const r = reg.setUrgent(state, index, urgent, outId);
+      state = r.state;
+      await applyEffects(r.sideEffects);
+    },
     async list(outputId): Promise<WorkspaceSnapshot[]> {
       return reg.snapshotsForOutput(state, outputId ?? reg.OUTPUT_DEFAULT);
     },
@@ -554,39 +694,57 @@ export default async function init(
 // ---- Param parsers -------------------------------------------------------
 // IPC / action callers send JSON-shaped objects; resolve to the branded
 // types the registry uses. Throws TypeError on shape mismatch.
+//
+// User-facing actions take `output: string` (a connector name like "DP-1"
+// or an EDID id); resolution happens here so the rest of the plugin
+// works with the numeric outputId the registry uses.
 
 function isObj(v: unknown): v is { [k: string]: unknown } {
   return typeof v === "object" && v !== null && !Array.isArray(v);
 }
 
-function parseOptionalOutputId(params: unknown): number {
-  if (params === undefined || params === null) return reg.OUTPUT_DEFAULT;
-  if (!isObj(params)) {
-    throw new TypeError("expected an object or null for params");
+// Resolve an action's `output: string` field to a live outputId. When
+// the field is absent, returns `defaultOutputId` (typically the focused
+// output, sometimes OUTPUT_DEFAULT for actions that don't have a
+// natural focused-output semantic). Throws when an explicit output
+// string doesn't match any live output -- silently falling back would
+// hide misconfigured keybinds.
+function parseOptionalOutput(
+  params: unknown,
+  resolve: (input: string) => number | null,
+  defaultOutputId: number,
+  label: string,
+): number {
+  if (params === undefined || params === null) return defaultOutputId;
+  if (!isObj(params)) throw new TypeError(`${label}: expected an object`);
+  const o = params.output;
+  if (o === undefined) return defaultOutputId;
+  if (typeof o !== "string" || o.length === 0) {
+    throw new TypeError(`${label}: output must be a non-empty string`);
   }
-  const o = params.outputId;
-  if (o === undefined) return reg.OUTPUT_DEFAULT;
-  if (typeof o !== "number") throw new TypeError("outputId must be a number");
-  return o;
+  const id = resolve(o);
+  if (id === null) {
+    throw new Error(`${label}: no live output matches '${o}'`);
+  }
+  return id;
 }
 
-function parseCreateParams(params: unknown): {
-  name?: string; outputId?: number; preferredOutputs?: string[];
-} {
-  if (params === undefined || params === null) return {};
+function parseCreateParams(
+  params: unknown,
+  resolveOutput: (input: string) => number | null,
+  defaultOutputId: number,
+): { name?: string; outputId: number; preferredOutputs?: string[] } {
+  if (params === undefined || params === null) {
+    return { outputId: defaultOutputId };
+  }
   if (!isObj(params)) throw new TypeError("workspace.create: expected an object");
-  const out: { name?: string; outputId?: number; preferredOutputs?: string[] } = {};
+  const outputId = parseOptionalOutput(params, resolveOutput, defaultOutputId, "workspace.create");
+  const out: { name?: string; outputId: number; preferredOutputs?: string[] } = { outputId };
   if (params.name !== undefined) {
     if (typeof params.name !== "string") {
       throw new TypeError("workspace.create: name must be a string");
     }
     out.name = params.name;
-  }
-  if (params.outputId !== undefined) {
-    if (typeof params.outputId !== "number") {
-      throw new TypeError("workspace.create: outputId must be a number");
-    }
-    out.outputId = params.outputId;
   }
   if (params.preferredOutputs !== undefined) {
     if (!Array.isArray(params.preferredOutputs)
@@ -599,57 +757,87 @@ function parseCreateParams(params: unknown): {
   return out;
 }
 
-// Parse params that strictly identify a workspace by its 1-based
-// index. Used by destroy + set-name (where adding name lookup would
-// be ambiguous with the value being set).
-function parseIndexParams(params: unknown, label: string,
-                          ): { index: WorkspaceIndex; outputId: number } {
+// Strict per-output positional. Used by destroy + set-name + set-urgent
+// + workspace.show-at-index. `output` defaults to the focused output.
+function parseIndexParams(
+  params: unknown,
+  resolveOutput: (input: string) => number | null,
+  defaultOutputId: number,
+  label: string,
+): { index: WorkspaceIndex; outputId: number } {
   if (!isObj(params)) {
-    throw new TypeError(`${label}: expected an object with { index, outputId? }`);
+    throw new TypeError(`${label}: expected an object with { index, output? }`);
   }
   if (typeof params.index !== "number" || !Number.isInteger(params.index)
       || params.index < 1) {
     throw new TypeError(`${label}: index must be a positive integer`);
   }
-  return { index: asIndex(params.index), outputId: parseOptionalOutputId(params) };
+  const outputId = parseOptionalOutput(params, resolveOutput, defaultOutputId, label);
+  return { index: asIndex(params.index), outputId };
 }
 
-// Parse params that identify a workspace EITHER by 1-based index OR by
-// display name. Exactly one must be set (both is ambiguous; neither is
-// missing). When `name` is set, the registry's findIndexByName resolves
-// it to an index at parse time (so the rest of the handler treats it
-// uniformly). A name that doesn't match any workspace throws.
-function parseIndexOrNameParams(
-  state: WorkspaceState, params: unknown, label: string,
+// workspace.show parameter parser. The action takes EITHER:
+//   - a workspace name (user-set label OR a digit-string that resolves
+//     to a durable WorkspaceHandle as a fallback), with optional
+//     `output` to scope the lookup; or
+//   - nothing else -- positional index is exposed via
+//     workspace.show-at-index.
+//
+// Resolution order when `output` is omitted:
+//   1. Match `name` against any workspace's user-set name across all
+//      outputs. First positional match wins (insertion order across
+//      outputs; positional order within an output).
+//   2. If no user-set name matched AND `name` is an all-digits string
+//      parseable as a positive integer, treat it as a durable handle;
+//      return that workspace's (index, outputId).
+//   3. Otherwise throw.
+//
+// When `output` is set, restrict the lookup to that output.
+function parseShowParams(
+  state: WorkspaceState,
+  params: unknown,
+  resolveOutput: (input: string) => number | null,
 ): { index: WorkspaceIndex; outputId: number } {
   if (!isObj(params)) {
-    throw new TypeError(`${label}: expected an object with { index | name, outputId? }`);
-  }
-  const outputId = parseOptionalOutputId(params);
-  const hasIndex = params.index !== undefined;
-  const hasName = params.name !== undefined;
-  if (hasIndex && hasName) {
-    throw new TypeError(`${label}: pass either index or name, not both`);
-  }
-  if (!hasIndex && !hasName) {
-    throw new TypeError(`${label}: missing required field 'index' or 'name'`);
-  }
-  if (hasIndex) {
-    if (typeof params.index !== "number" || !Number.isInteger(params.index)
-        || params.index < 1) {
-      throw new TypeError(`${label}: index must be a positive integer`);
-    }
-    return { index: asIndex(params.index), outputId };
+    throw new TypeError("workspace.show: expected an object with { name, output? }");
   }
   if (typeof params.name !== "string" || params.name.length === 0) {
-    throw new TypeError(`${label}: name must be a non-empty string`);
+    throw new TypeError("workspace.show: name must be a non-empty string");
   }
-  const resolved = reg.findIndexByName(state, params.name, outputId);
-  if (resolved === null) {
-    throw new Error(
-      `${label}: no workspace named '${params.name}' on output ${outputId}`);
+  const explicitOutput = params.output !== undefined;
+  // resolveOutput throws on unknown explicit output; pass a never-fire
+  // default since we don't fall back to it.
+  const restrictTo = explicitOutput
+    ? parseOptionalOutput(params, resolveOutput, -1, "workspace.show")
+    : null;
+
+  // Pass 1: user-set name lookup.
+  const outputsToSearch = restrictTo !== null
+    ? [restrictTo]
+    : [...state.positionsByOutput.keys()];
+  for (const outputId of outputsToSearch) {
+    const idx = reg.findIndexByName(state, params.name, outputId);
+    if (idx !== null) return { index: idx, outputId };
   }
-  return { index: resolved, outputId };
+
+  // Pass 2: digit-string -> durable handle.
+  if (/^[1-9][0-9]*$/.test(params.name)) {
+    const handle = Number(params.name) as WorkspaceHandle;
+    const rec = state.byHandle.get(handle);
+    if (rec) {
+      if (restrictTo !== null && rec.outputId !== restrictTo) {
+        throw new Error(
+          `workspace.show: workspace handle ${params.name} is on a different output`);
+      }
+      const idx = reg.findIndex(state, handle, rec.outputId);
+      if (idx !== null) return { index: idx, outputId: rec.outputId };
+    }
+  }
+
+  throw new Error(
+    restrictTo !== null
+      ? `workspace.show: no workspace named '${params.name}' on the requested output`
+      : `workspace.show: no workspace named '${params.name}'`);
 }
 
 // Optional transition spec for workspace.show (and friends). When the
@@ -683,19 +871,56 @@ function parseShowTransition(params: unknown, label: string): ShowTransitionSpec
   };
 }
 
-function parseMoveParams(state: WorkspaceState, params: unknown,
-                         ): { surfaceId: number; index: WorkspaceIndex; outputId: number } {
-  const base = parseIndexOrNameParams(state, params, "workspace.move-window");
-  if (!isObj(params)) throw new TypeError("unreachable");
+// workspace.move-window: explicit surfaceId + workspace identifier
+// (name or positional index) + optional output. Mirrors the show
+// shape: a `name` field that resolves through the same two-pass
+// rules; or a positional `index` with `output`.
+function parseMoveParams(
+  state: WorkspaceState,
+  params: unknown,
+  resolveOutput: (input: string) => number | null,
+  defaultOutputId: number,
+): { surfaceId: number; index: WorkspaceIndex; outputId: number } {
+  if (!isObj(params)) {
+    throw new TypeError(
+      "workspace.move-window: expected an object with { surfaceId, name|index, output? }");
+  }
   if (typeof params.surfaceId !== "number") {
     throw new TypeError("workspace.move-window: surfaceId must be a number");
   }
-  return { surfaceId: params.surfaceId, index: base.index, outputId: base.outputId };
+  const hasName = params.name !== undefined;
+  const hasIndex = params.index !== undefined;
+  if (hasName === hasIndex) {
+    throw new TypeError(
+      "workspace.move-window: pass exactly one of name or index");
+  }
+  if (hasName) {
+    const r = parseShowParams(state, params, resolveOutput);
+    return { surfaceId: params.surfaceId, index: r.index, outputId: r.outputId };
+  }
+  const r = parseIndexParams(params, resolveOutput, defaultOutputId, "workspace.move-window");
+  return { surfaceId: params.surfaceId, index: r.index, outputId: r.outputId };
 }
 
-function parseSetNameParams(params: unknown,
-                            ): { index: WorkspaceIndex; name: string | undefined; outputId: number } {
-  const base = parseIndexParams(params, "workspace.set-name");
+function parseSetUrgentParams(
+  params: unknown,
+  resolveOutput: (input: string) => number | null,
+  defaultOutputId: number,
+): { index: WorkspaceIndex; urgent: boolean; outputId: number } {
+  const base = parseIndexParams(params, resolveOutput, defaultOutputId, "workspace.set-urgent");
+  if (!isObj(params)) throw new TypeError("unreachable");
+  if (typeof params.urgent !== "boolean") {
+    throw new TypeError("workspace.set-urgent: urgent must be a boolean");
+  }
+  return { index: base.index, urgent: params.urgent, outputId: base.outputId };
+}
+
+function parseSetNameParams(
+  params: unknown,
+  resolveOutput: (input: string) => number | null,
+  defaultOutputId: number,
+): { index: WorkspaceIndex; name: string | undefined; outputId: number } {
+  const base = parseIndexParams(params, resolveOutput, defaultOutputId, "workspace.set-name");
   if (!isObj(params)) throw new TypeError("unreachable");
   let name: string | undefined;
   if (params.name === undefined || params.name === null) {

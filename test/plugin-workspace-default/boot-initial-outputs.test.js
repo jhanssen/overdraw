@@ -75,8 +75,8 @@ function bootWith(initialOutputs, bootKey = 'DP-1') {
 
 test('boot: initialOutputs with two outputs creates a workspace on each', async () => {
   const ctx = bootWith([
-    { outputId: 0, durableKey: 'DP-1' },
-    { outputId: 1, durableKey: 'HDMI-1' },
+    { outputId: 0, name: 'DP-1', edidId: '' },
+    { outputId: 1, name: 'HDMI-1', edidId: '' },
   ]);
   await withRuntime({
     bus: ctx.pluginBus,
@@ -106,8 +106,8 @@ test('boot: initialOutputs with two outputs creates a workspace on each', async 
 
 test('boot: replenishment workspace anchors to the secondary output', async () => {
   const ctx = bootWith([
-    { outputId: 0, durableKey: 'DP-1' },
-    { outputId: 1, durableKey: 'HDMI-1' },
+    { outputId: 0, name: 'DP-1', edidId: '' },
+    { outputId: 1, name: 'HDMI-1', edidId: '' },
   ]);
   await withRuntime({
     bus: ctx.pluginBus,
