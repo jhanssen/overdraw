@@ -1088,7 +1088,19 @@ int run(int wireFd, int ctrlFd, int inputFd, bool headless,
         SurfaceBuf& sb = it->second;
         wgpu::SharedTextureMemory& mem = producer ? sb.producerMem : sb.consumerMem;
         wgpu::Texture& tex = producer ? sb.producerTex : sb.consumerTex;
+        // SharedTextureMemoryVkImageLayoutEndState's generated ctor does NOT
+        // zero its int32_t fields (it sets sType only). EndAccess writes them
+        // only when the bracket actually used the texture; a no-op bracket
+        // (lastUsageSerial == kBeginningOfGPUTime in Dawn's
+        // SharedResourceMemory.cpp) leaves them as uninitialized stack memory.
+        // Reading that into sb.layout then feeds garbage into the NEXT Begin's
+        // oldLayout, producing VUID-VkImageMemoryBarrier-oldLayout-parameter
+        // ("oldLayout (N) does not fall within the begin..end range of the
+        // VkImageLayout enumeration tokens"). Pre-zero + only-adopt-if-set
+        // mirrors the same defensive pattern used by runEndClientAccess.
         wgpu::SharedTextureMemoryVkImageLayoutEndState endLayout{};
+        endLayout.oldLayout = 0;  // VK_IMAGE_LAYOUT_UNDEFINED
+        endLayout.newLayout = 0;
         wgpu::SharedTextureMemoryEndAccessState endState{};
         endState.nextInChain = &endLayout;
         if (mem.EndAccess(tex, &endState) != wgpu::Status::Success) {
@@ -1101,7 +1113,13 @@ int run(int wireFd, int ctrlFd, int inputFd, bool headless,
             return;
         }
         if (producer) sb.producerOpen = false; else sb.consumerOpen = false;
-        sb.layout = endLayout.newLayout;
+        // Only adopt the returned layout when Dawn actually wrote one (the
+        // texture was used in this bracket). A 0 (UNDEFINED) return is the
+        // no-work case: keep sb.layout's prior value so the next Begin's
+        // oldLayout chain stays consistent with the last real End.
+        if (endLayout.newLayout != 0) {
+            sb.layout = endLayout.newLayout;
+        }
 
 #if OVERDRAW_KMS
         // KMS scanout: producer EndAccess on a scanout SurfaceBuf has no
