@@ -89,6 +89,19 @@ nothing, with no error. Worst-first.
   disconnect. Each silent-drop site is commented with the error it would
   otherwise post.
 
+- **`ext_workspace_v1`: capability-gated requests are no-ops by design.**
+  The compositor advertises only the `activate` and `remove`
+  per-workspace capabilities (no `deactivate`, no `assign`) and only the
+  `create_workspace` group capability. The protocol spec requires the
+  compositor to ignore unadvertised requests, which is what this
+  implementation does: `deactivate` / `assign` arrive as no-ops. The
+  model justification: every output always has exactly one shown
+  workspace (so "deactivate to nothing" has no meaning), and the plugin
+  moves windows between workspaces (not workspaces between groups).
+  `manager.commit` IS batched per spec: requests buffer per-manager
+  between commits and apply atomically on commit; the bound manager
+  sees exactly one `done` covering the entire batch, regardless of how
+  many state events the batch triggers.
 - **Smaller advertised-incomplete items:** `wl_subsurface` `place_above`/
   `place_below` sibling reordering (no-op); DnD drag-icon compositing
   (implemented, not pixel-tested); dmabuf `create` (async server-minted
@@ -424,6 +437,8 @@ type-check under `tsc --strict`.
   `zxdg_output_manager_v1`/`zxdg_output_v1`,
   `zwlr_foreign_toplevel_manager_v1`/`..._handle_v1` (unit-tested
   wire shape; no GPU test client today),
+  `ext_workspace_v1` (manager + group + handle; unit-tested wire shape;
+  Waybar `ext/workspaces` module consumes it),
   `wp_linux_drm_syncobj_v1` (NVIDIA proprietary clients),
   `wp_viewporter`/`wp_viewport`, `wp_fractional_scale_manager_v1`/
   `wp_fractional_scale_v1`, `wp_cursor_shape_v1`.

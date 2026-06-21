@@ -1204,6 +1204,23 @@ await runtime.load(resolved);
 const summary = runtime.states().map((s) => `${s.name}=${s.state}`).join(", ");
 log.info("core", `plugins: ${summary.length > 0 ? summary : "(none)"}`);
 
+// ext-workspace-v1: route inbound activate / remove / create requests to
+// the bundled workspace plugin via runtime.invokeNamespace. The protocol
+// handler installed inside installProtocols already subscribes to
+// workspace.* bus events for outbound emissions; this driver closes the
+// inbound loop. Wired AFTER runtime.load so the namespace is registered
+// when the first protocol request arrives.
+{
+  const rt = runtime;
+  state.workspaceDriver = {
+    create: (spec) => rt.invokeNamespace("workspace", "create", [spec as import("./plugins/protocol.js").Json]),
+    destroy: (index, outputId) =>
+      rt.invokeNamespace("workspace", "destroy", [index, outputId]),
+    show: (index, outputId) =>
+      rt.invokeNamespace("workspace", "show", [index, outputId]),
+  };
+}
+
 // IPC server: JSON-RPC 2.0 over a Unix socket. Plugins register actions and
 // emit events; overdrawctl / status bars / scripts connect here.
 // core-plugin-api.md §12.

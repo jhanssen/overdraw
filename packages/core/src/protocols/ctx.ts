@@ -697,6 +697,15 @@ export interface CompositorState {
   // reserved-zone change reflows tiled / maximized windows. Absent in
   // GPU-free harnesses that bring up the protocol layer without a real WM.
   relayout?: (reason: import("@overdraw/layout-types").LayoutReason) => void;
+  // Driver routing ext_workspace_v1 inbound requests (activate / remove /
+  // create_workspace) to the bundled workspace plugin. Wired by main.ts
+  // after both the runtime and installProtocols have run. Absent in
+  // GPU-free harnesses; ext_workspace_v1 handler then silently drops
+  // inbound requests (matching the spec's "compositor ignores requests
+  // for capabilities it doesn't support" framing -- a manager bound
+  // against this state still sees zero workspaces, so a client cannot
+  // address one).
+  workspaceDriver?: import("./ext_workspace_v1.js").WorkspaceDriver;
 }
 
 export interface SubsurfaceRecord {
