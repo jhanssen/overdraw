@@ -973,6 +973,30 @@ int run(int wireFd, int ctrlFd, int inputFd, bool headless,
     };
     std::unordered_map<uint32_t, ClientTex> clientTextures;
 
+    // wl_shm pools the core has registered with us. The core dups its shm fd
+    // and sends it on FrameKind::RegisterShmPool; we mmap it as a read-only
+    // CPU view used to stage shm-upload bytes into Vulkan staging buffers
+    // (see FrameKind::ShmUpload). munmap + close on FrameKind::UnregisterShmPool.
+    struct ShmPool {
+        int fd = -1;
+        const uint8_t* base = nullptr;
+        size_t size = 0;
+    };
+    std::unordered_map<uint32_t, ShmPool> shmPools;
+
+    // Per-surface textures injected via FrameKind::AllocShmTex. The core's
+    // wire-client ReserveTexture'd a wire handle for a sampleable BGRA8
+    // texture; we created the native wgpu::Texture and InjectTexture'd it
+    // at that handle, and we keep a ref here so subsequent ShmUpload frames
+    // can resolve surfaceId -> native texture (where we read the underlying
+    // VkImage via WGPUTexture and do vkCmdCopyBufferToImage).
+    struct ShmTex {
+        wgpu::Texture tex;
+        uint32_t width = 0;
+        uint32_t height = 0;
+    };
+    std::unordered_map<uint32_t, ShmTex> shmTextures;
+
     // Cross-channel barrier on the CORE wire reader. Used by ReleaseClientTex
     // (ctrl, with a wire-byte serial sampled at release time): the erase must
     // wait until the wire reader has consumed past every in-band BeginAccess /
@@ -1869,6 +1893,74 @@ int run(int wireFd, int ctrlFd, int inputFd, bool headless,
             }
             if (ct.fd >= 0) ::close(ct.fd);
             clientTextures.erase(it);
+            return;
+        }
+        if (kind == ipc::FrameKind::RegisterShmPool) {
+            // Core registered a wl_shm pool. The memfd rides as exactly one
+            // SCM_RIGHTS fd. mmap it read-only so ShmUpload can stage from it.
+            if (nfds != 1) {
+                std::fprintf(stderr,
+                    "[gpu] core wire: RegisterShmPool expects nfds=1, got %d\n", nfds);
+                std::abort();
+            }
+            if (frame.size() != ipc::RegisterShmPoolPayload::kSize) {
+                std::fprintf(stderr,
+                    "[gpu] core wire: bad RegisterShmPool payload size %zu\n",
+                    frame.size());
+                std::abort();
+            }
+            auto p = ipc::RegisterShmPoolPayload::decode(frame.data());
+            const int fd = fds[0];
+            if (p.size == 0 || p.size > static_cast<uint64_t>(SIZE_MAX)) {
+                std::fprintf(stderr,
+                    "[gpu] RegisterShmPool: bad size %llu (poolId=%u)\n",
+                    static_cast<unsigned long long>(p.size), p.poolId);
+                ::close(fd);
+                return;
+            }
+            void* base = ::mmap(nullptr, static_cast<size_t>(p.size),
+                                PROT_READ, MAP_SHARED, fd, 0);
+            if (base == MAP_FAILED) {
+                std::fprintf(stderr,
+                    "[gpu] RegisterShmPool: mmap failed (poolId=%u, size=%zu): %s\n",
+                    p.poolId, static_cast<size_t>(p.size), std::strerror(errno));
+                ::close(fd);
+                return;
+            }
+            // Replace any existing pool with the same id (shouldn't happen --
+            // poolIds are monotonic in the core's registry, never reused -- but
+            // be defensive: unmap the old one if it's there).
+            auto [it, inserted] = shmPools.try_emplace(p.poolId);
+            if (!inserted) {
+                if (it->second.base) ::munmap(const_cast<uint8_t*>(it->second.base),
+                                              it->second.size);
+                if (it->second.fd >= 0) ::close(it->second.fd);
+            }
+            it->second.fd = fd;
+            it->second.base = static_cast<const uint8_t*>(base);
+            it->second.size = static_cast<size_t>(p.size);
+            return;
+        }
+        if (kind == ipc::FrameKind::UnregisterShmPool) {
+            if (nfds != 0) {
+                std::fprintf(stderr,
+                    "[gpu] core wire: UnregisterShmPool with nfds=%d (must be 0)\n", nfds);
+                std::abort();
+            }
+            if (frame.size() != ipc::UnregisterShmPoolPayload::kSize) {
+                std::fprintf(stderr,
+                    "[gpu] core wire: bad UnregisterShmPool payload size %zu\n",
+                    frame.size());
+                std::abort();
+            }
+            auto p = ipc::UnregisterShmPoolPayload::decode(frame.data());
+            auto it = shmPools.find(p.poolId);
+            if (it == shmPools.end()) return;
+            if (it->second.base) {
+                ::munmap(const_cast<uint8_t*>(it->second.base), it->second.size);
+            }
+            if (it->second.fd >= 0) ::close(it->second.fd);
+            shmPools.erase(it);
             return;
         }
         if (kind == ipc::FrameKind::AllocSurfaceBuf

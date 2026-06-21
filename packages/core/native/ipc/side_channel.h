@@ -323,6 +323,13 @@ inline uint64_t getU64LE(const uint8_t* p) {
     return static_cast<uint64_t>(getU32LE(p))
          | (static_cast<uint64_t>(getU32LE(p + 4)) << 32);
 }
+// i32 variants: bitcast through u32 so negative values round-trip.
+inline void putI32LE(uint8_t* p, int32_t v) {
+    putU32LE(p, static_cast<uint32_t>(v));
+}
+inline int32_t getI32LE(const uint8_t* p) {
+    return static_cast<int32_t>(getU32LE(p));
+}
 
 // Client-texture Begin/End payload: variant + (id, generation). 9 bytes.
 struct ClientTexAccessPayload {
@@ -860,6 +867,180 @@ struct ReleaseClientTexPayload {
 };
 static_assert(ReleaseClientTexPayload::kSize == 8,
               "ReleaseClientTexPayload size mismatch with hand-counted layout");
+
+// RegisterShmPoolPayload (core -> gpu; FrameKind::RegisterShmPool):
+// the client created a wl_shm pool. The memfd rides as exactly ONE
+// SCM_RIGHTS fd on the sendmsg carrying this frame. The GPU process
+// mmap's the fd and stashes (poolId -> {ptr, size, fd}).
+struct RegisterShmPoolPayload {
+    uint32_t poolId;
+    uint32_t _pad;   // explicit align: size is u64, layout is u32/u32/u64
+    uint64_t size;
+    static constexpr size_t kSize = 16;
+    void encode(uint8_t* out) const {
+        putU32LE(out + 0, poolId);
+        putU32LE(out + 4, 0);
+        putU64LE(out + 8, size);
+    }
+    static RegisterShmPoolPayload decode(const uint8_t* p) {
+        RegisterShmPoolPayload r{};
+        r.poolId = getU32LE(p + 0);
+        r.size   = getU64LE(p + 8);
+        return r;
+    }
+};
+static_assert(RegisterShmPoolPayload::kSize == 16,
+              "RegisterShmPoolPayload size mismatch with hand-counted layout");
+
+// UnregisterShmPoolPayload (core -> gpu; FrameKind::UnregisterShmPool):
+// the wl_shm pool was destroyed (or its last buffer-ref dropped). The
+// GPU process munmaps + closes the cached fd.
+struct UnregisterShmPoolPayload {
+    uint32_t poolId;
+    static constexpr size_t kSize = 4;
+    void encode(uint8_t* out) const {
+        putU32LE(out + 0, poolId);
+    }
+    static UnregisterShmPoolPayload decode(const uint8_t* p) {
+        return { getU32LE(p + 0) };
+    }
+};
+static_assert(UnregisterShmPoolPayload::kSize == 4,
+              "UnregisterShmPoolPayload size mismatch with hand-counted layout");
+
+// AllocShmTexPayload (core -> gpu; FrameKind::AllocShmTex):
+// the core wire-client has ReserveTexture'd a wire handle for a
+// sampleable BGRA8 texture sized to the current shm buffer. The GPU
+// process creates a native wgpu::Texture on the GPU device matching
+// `texture.deviceHandle` and calls WireServer::InjectTexture to fill
+// the reservation, then stashes (surfaceId -> wgpu::Texture) so
+// subsequent ShmUpload frames can resolve it.
+struct AllocShmTexPayload {
+    uint32_t surfaceId;
+    uint32_t width;
+    uint32_t height;
+    uint32_t _pad;
+    WireHandle texture;
+    WireHandle device;
+    static constexpr size_t kSize = 4 * 4 + 2 * 8;  // 32
+    void encode(uint8_t* out) const {
+        putU32LE(out + 0,  surfaceId);
+        putU32LE(out + 4,  width);
+        putU32LE(out + 8,  height);
+        putU32LE(out + 12, 0);
+        putU32LE(out + 16, texture.id);
+        putU32LE(out + 20, texture.generation);
+        putU32LE(out + 24, device.id);
+        putU32LE(out + 28, device.generation);
+    }
+    static AllocShmTexPayload decode(const uint8_t* p) {
+        AllocShmTexPayload r{};
+        r.surfaceId          = getU32LE(p + 0);
+        r.width              = getU32LE(p + 4);
+        r.height             = getU32LE(p + 8);
+        r.texture.id         = getU32LE(p + 16);
+        r.texture.generation = getU32LE(p + 20);
+        r.device.id          = getU32LE(p + 24);
+        r.device.generation  = getU32LE(p + 28);
+        return r;
+    }
+};
+static_assert(AllocShmTexPayload::kSize == 32,
+              "AllocShmTexPayload size mismatch with hand-counted layout");
+
+// ShmUploadPayload (core -> gpu; FrameKind::ShmUpload):
+// upload a committed shm region into a previously-AllocShmTex'd
+// texture. Variable-length (damageRects suffix). Empty damageRects
+// (count = 0) means "full buffer upload" -- the GPU process treats
+// it as one rect covering (0,0)-(width,height).
+//
+// The GPU process resolves surfaceId to its native wgpu::Texture,
+// memcpys the damaged bytes from the mmap'd pool into a staging
+// VkBuffer, runs copyBufferToTexture, submits, and replies with
+// ShmUploaded(uploadSeq). The core defers wl_buffer.release until
+// that reply (mirrors Hyprland's "copy then release").
+struct ShmUploadPayload {
+    uint32_t surfaceId;
+    uint32_t uploadSeq;
+    uint32_t poolId;
+    uint32_t _pad;
+    uint64_t offset;
+    uint32_t width;
+    uint32_t height;
+    uint32_t stride;
+    struct DamageRect {
+        int32_t x, y;
+        uint32_t w, h;
+        static constexpr size_t kSize = 16;
+    };
+    std::vector<DamageRect> damage;
+    static constexpr size_t kHeaderSize = 32;
+    size_t encodedSize() const {
+        return kHeaderSize + 4 + damage.size() * DamageRect::kSize;
+    }
+    void encode(uint8_t* out) const {
+        putU32LE(out + 0,  surfaceId);
+        putU32LE(out + 4,  uploadSeq);
+        putU32LE(out + 8,  poolId);
+        putU32LE(out + 12, 0);
+        putU64LE(out + 16, offset);
+        putU32LE(out + 24, width);
+        putU32LE(out + 28, height);
+        putU32LE(out + 32, stride);
+        putU32LE(out + 36, static_cast<uint32_t>(damage.size()));
+        size_t off = 40;
+        for (const DamageRect& r : damage) {
+            putI32LE(out + off + 0,  r.x);
+            putI32LE(out + off + 4,  r.y);
+            putU32LE(out + off + 8,  r.w);
+            putU32LE(out + off + 12, r.h);
+            off += DamageRect::kSize;
+        }
+    }
+    static bool decode(const uint8_t* p, size_t len, ShmUploadPayload& out) {
+        if (len < kHeaderSize + 4) return false;
+        out.surfaceId = getU32LE(p + 0);
+        out.uploadSeq = getU32LE(p + 4);
+        out.poolId    = getU32LE(p + 8);
+        out.offset    = getU64LE(p + 16);
+        out.width     = getU32LE(p + 24);
+        out.height    = getU32LE(p + 28);
+        out.stride    = getU32LE(p + 32);
+        const uint32_t count = getU32LE(p + 36);
+        if (len != kHeaderSize + 4 + count * DamageRect::kSize) return false;
+        out.damage.clear();
+        out.damage.reserve(count);
+        size_t off = 40;
+        for (uint32_t i = 0; i < count; ++i) {
+            DamageRect r{};
+            r.x = getI32LE(p + off + 0);
+            r.y = getI32LE(p + off + 4);
+            r.w = getU32LE(p + off + 8);
+            r.h = getU32LE(p + off + 12);
+            out.damage.push_back(r);
+            off += DamageRect::kSize;
+        }
+        return true;
+    }
+};
+
+// ShmUploadedPayload (gpu -> core; FrameKind::ShmUploaded):
+// the matching ShmUpload's vkCmdCopyBufferToImage has been submitted
+// (the source bytes have been memcpy'd into the staging VkBuffer).
+// The core uses uploadSeq to find the deferred wl_buffer.release and
+// sends it now -- the client's shm region is safe to reuse.
+struct ShmUploadedPayload {
+    uint32_t uploadSeq;
+    static constexpr size_t kSize = 4;
+    void encode(uint8_t* out) const {
+        putU32LE(out + 0, uploadSeq);
+    }
+    static ShmUploadedPayload decode(const uint8_t* p) {
+        return { getU32LE(p + 0) };
+    }
+};
+static_assert(ShmUploadedPayload::kSize == 4,
+              "ShmUploadedPayload size mismatch with hand-counted layout");
 
 }  // namespace overdraw::ipc
 

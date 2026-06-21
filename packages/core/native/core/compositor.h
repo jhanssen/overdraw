@@ -346,6 +346,18 @@ class Compositor {
     // not freed by mistake). Called when the JS compositor frees the buffer (its
     // last sampling frame completed) or the surface is removed. No-op if unknown.
     void releaseDmabufImport(uint32_t importId);
+
+    // wl_shm pool lifecycle, mirrored to the GPU process. The core's shm
+    // registry mmaps each pool too (for shmView), but the GPU process needs
+    // its own mmap so the writeTexture replacement (FrameKind::ShmUpload)
+    // can stage the bytes via vkCmdCopyBufferToImage without round-tripping
+    // 47 MiB through the Dawn wire on every commit. fd ownership transfers
+    // to the GPU process (we dup at the napi entry point so the core's
+    // shmRegistry still owns its independent fd). poolId is the same value
+    // the core's shmRegistry uses, so subsequent ShmUpload frames key on
+    // a matching identifier on both sides.
+    void registerShmPool(uint32_t poolId, int fd, uint64_t size);
+    void unregisterShmPool(uint32_t poolId);
     // Destroy a plugin ring slot's surfaceBuf on the GPU process + reclaim the
     // core-side reservation/status. Caller gates on the consumer GPU read completing.
     void releaseSurfaceBuf(uint32_t surfaceBufId);

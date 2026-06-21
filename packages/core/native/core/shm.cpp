@@ -48,12 +48,16 @@ void ShmRegistry::freePool(uint32_t poolId) {
     pools_.erase(it);
 }
 
-void ShmRegistry::destroyPool(uint32_t poolId) {
+bool ShmRegistry::destroyPool(uint32_t poolId) {
     auto it = pools_.find(poolId);
-    if (it == pools_.end()) return;
+    if (it == pools_.end()) return false;
     // Spec: buffers outlive the pool. Defer the unmap until no buffers remain.
     it->second.destroyed = true;
-    if (it->second.bufferRefs == 0) freePool(poolId);
+    if (it->second.bufferRefs == 0) {
+        freePool(poolId);
+        return true;
+    }
+    return false;
 }
 
 void ShmRegistry::addBufferRef(uint32_t poolId) {
@@ -61,11 +65,15 @@ void ShmRegistry::addBufferRef(uint32_t poolId) {
     if (it != pools_.end()) it->second.bufferRefs++;
 }
 
-void ShmRegistry::releaseBufferRef(uint32_t poolId) {
+bool ShmRegistry::releaseBufferRef(uint32_t poolId) {
     auto it = pools_.find(poolId);
-    if (it == pools_.end()) return;
+    if (it == pools_.end()) return false;
     if (it->second.bufferRefs > 0) it->second.bufferRefs--;
-    if (it->second.destroyed && it->second.bufferRefs == 0) freePool(poolId);
+    if (it->second.destroyed && it->second.bufferRefs == 0) {
+        freePool(poolId);
+        return true;
+    }
+    return false;
 }
 
 size_t ShmRegistry::poolSize(uint32_t poolId) const {

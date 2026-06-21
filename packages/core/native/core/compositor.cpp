@@ -643,6 +643,36 @@ void Compositor::releaseDmabufImport(uint32_t importId) {
     jsImportHandles_.erase(it);
 }
 
+void Compositor::registerShmPool(uint32_t poolId, int fd, uint64_t size) {
+    if (!link_) {
+        if (fd >= 0) ::close(fd);
+        return;
+    }
+    ipc::RegisterShmPoolPayload p{};
+    p.poolId = poolId;
+    p.size   = size;
+    uint8_t buf[ipc::RegisterShmPoolPayload::kSize];
+    p.encode(buf);
+    int fds[1] = {fd};
+    // appendFrameWithFds dup's the fd into its own queue; close ours after.
+    bool ok = link_->appendFrameWithFds(ipc::FrameKind::RegisterShmPool,
+                                        buf, sizeof(buf), fds, 1);
+    if (fd >= 0) ::close(fd);
+    if (!ok) {
+        std::fprintf(stderr,
+            "[core] registerShmPool: appendFrameWithFds failed (poolId=%u)\n",
+            poolId);
+    }
+}
+
+void Compositor::unregisterShmPool(uint32_t poolId) {
+    if (!link_) return;
+    ipc::UnregisterShmPoolPayload p{poolId};
+    uint8_t buf[ipc::UnregisterShmPoolPayload::kSize];
+    p.encode(buf);
+    link_->appendFrame(ipc::FrameKind::UnregisterShmPool, buf, sizeof(buf));
+}
+
 void Compositor::releaseSurfaceBuf(uint32_t surfaceBufId) {
     // Tell the GPU process to destroy the surfaceBuf (end brackets, drop
     // STM/textures/fences, release the dmabuf). The caller (JS gpu-broker)

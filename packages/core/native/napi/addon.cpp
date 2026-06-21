@@ -2410,15 +2410,30 @@ napi_value ResolveCursorShape(napi_env env, napi_callback_info info) {
 }
 
 // shmCreatePool(fd, size) -> poolId (0 on failure)
-// `fd` is a WaylandFd; we take the raw fd out of it (transferring ownership) and
-// mmap it.
+// `fd` is a WaylandFd; we take the raw fd out of it (transferring ownership)
+// and mmap it. Also dup's a copy to the GPU process via FrameKind::RegisterShmPool
+// so the GPU process can stage upload bytes directly from the mmap (the shm-upload
+// fast path that replaces queue.writeTexture for shm content).
 napi_value ShmCreatePool(napi_env env, napi_callback_info info) {
     size_t argc = 2; napi_value argv[2];
     napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
     if (argc < 2) return throwError(env, "shmCreatePool(fd, size) requires two args");
     uint32_t size = 0; napi_get_value_uint32(env, argv[1], &size);
     int fd = overdraw::wayland::takeWaylandFd(env, argv[0]);
+    // Dup BEFORE handing fd to the shm registry; the registry takes ownership
+    // (closes on destroy / failure), and the GPU process needs its own
+    // independent fd to mmap. Failure to dup is non-fatal -- the upload path
+    // falls back to writeTexture for this pool. ::fcntl(F_DUPFD_CLOEXEC, 0)
+    // matches the semantics dawn-wire's appendFrameWithFds uses elsewhere.
+    int gpuFd = fd >= 0 ? ::fcntl(fd, F_DUPFD_CLOEXEC, 0) : -1;
     uint32_t poolId = g_addon.shm.createPool(fd, size);  // closes fd on failure
+    if (poolId != 0 && gpuFd >= 0 && g_addon.compositor) {
+        // Transfers ownership of gpuFd into registerShmPool, which appends a
+        // wire frame carrying the fd as SCM_RIGHTS and then closes it.
+        g_addon.compositor->registerShmPool(poolId, gpuFd, size);
+    } else if (gpuFd >= 0) {
+        ::close(gpuFd);
+    }
     napi_value out; napi_create_uint32(env, poolId, &out);
     return out;
 }
@@ -2440,7 +2455,13 @@ napi_value ShmDestroyPool(napi_env env, napi_callback_info info) {
     napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
     if (argc < 1) return throwError(env, "shmDestroyPool(poolId) requires a poolId");
     uint32_t poolId = 0; napi_get_value_uint32(env, argv[0], &poolId);
-    g_addon.shm.destroyPool(poolId);
+    const bool freed = g_addon.shm.destroyPool(poolId);
+    // Mirror the unmap to the GPU process iff the local registry actually
+    // freed (no outstanding wl_buffer refs); otherwise the unregister waits
+    // for the matching shmBufferUnref below.
+    if (freed && g_addon.compositor) {
+        g_addon.compositor->unregisterShmPool(poolId);
+    }
     napi_value undef; napi_get_undefined(env, &undef);
     return undef;
 }
@@ -2459,7 +2480,10 @@ napi_value ShmBufferUnref(napi_env env, napi_callback_info info) {
     size_t argc = 1; napi_value argv[1];
     napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
     uint32_t poolId = 0; if (argc >= 1) napi_get_value_uint32(env, argv[0], &poolId);
-    g_addon.shm.releaseBufferRef(poolId);
+    const bool freed = g_addon.shm.releaseBufferRef(poolId);
+    if (freed && g_addon.compositor) {
+        g_addon.compositor->unregisterShmPool(poolId);
+    }
     napi_value undef; napi_get_undefined(env, &undef);
     return undef;
 }

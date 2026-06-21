@@ -195,6 +195,53 @@ enum class FrameKind : uint8_t {
                               // events for every mode the connector
                               // supports, so a client can pick one and
                               // drive SwitchMode through the protocol.
+    RegisterShmPool = 18,     // core -> gpu: client created a wl_shm pool.
+                              // GPU process mmap's the fd and stores it by
+                              // poolId for subsequent ShmUpload frames. The
+                              // memfd rides as SCM_RIGHTS on the sendmsg
+                              // that carried this frame (exactly one fd).
+                              // Payload: RegisterShmPoolPayload (poolId +
+                              // size). Rides wire so the GPU process has
+                              // the pool mmap'd before any ShmUpload that
+                              // references its poolId arrives.
+    UnregisterShmPool = 19,   // core -> gpu: client destroyed a wl_shm
+                              // pool (or its last buffer-ref dropped).
+                              // GPU process munmaps + closes the fd.
+                              // Payload: UnregisterShmPoolPayload (poolId).
+                              // Wire FIFO with prior ShmUpload guarantees
+                              // no in-flight upload references the pool
+                              // after this point.
+    AllocShmTex = 20,         // core -> gpu: the core wire-client has
+                              // ReserveTexture'd a wire handle for a
+                              // sampleable BGRA8 texture. Inject a native
+                              // wgpu::Texture on the GPU device at that
+                              // handle so the core's wrapTexture'd
+                              // GPUTexture is backed by a real VkImage.
+                              // Payload: AllocShmTexPayload (surfaceId,
+                              // texHandle.id, texHandle.generation,
+                              // deviceHandle.id, deviceHandle.generation,
+                              // width, height). Replaces uploadPixels'
+                              // device.createTexture + writeTexture path
+                              // for shm content; the upload itself rides
+                              // on ShmUpload frames.
+    ShmUpload = 21,           // core -> gpu: upload a committed shm region
+                              // into a previously-AllocShmTex'd texture.
+                              // Payload: ShmUploadPayload (surfaceId,
+                              // uploadSeq, poolId, offset, width, height,
+                              // stride, damageRectCount, damageRects[]).
+                              // The GPU process resolves surfaceId to its
+                              // native texture, memcpys from the mmap'd
+                              // pool into a staging VkBuffer, runs
+                              // copyBufferToTexture, submits, and replies
+                              // with ShmUploaded(uploadSeq). The core
+                              // defers wl_buffer.release until that reply,
+                              // mirroring Hyprland's "copy then release"
+                              // behavior without paying the writeTexture
+                              // marshaling cost on the JS thread.
+    ShmUploaded = 22,         // gpu -> core: ShmUpload(uploadSeq) is now
+                              // observable on the GPU device. Payload:
+                              // ShmUploadedPayload (uploadSeq). The core
+                              // releases the wl_buffer keyed by uploadSeq.
 };
 
 // Max fds attachable in one message (control msg OR in-band wire frame).
@@ -548,6 +595,7 @@ class FrameReader {
         int expect = 0;
         if (kind == FrameKind::ImportClientTex) expect = 1;
         if (kind == FrameKind::BeginAccessWithFence) expect = 1;
+        if (kind == FrameKind::RegisterShmPool) expect = 1;
         if (expect > 0) {
             if (static_cast<int>(recvFds_.size()) < expect) {
                 std::fprintf(stderr,

@@ -29,12 +29,17 @@ class ShmRegistry {
     // Mark a pool destroyed (wl_shm_pool.destroy). Per the Wayland spec, buffers
     // created from the pool remain valid after the pool is destroyed, so the
     // mapping is freed only once destroyed AND no buffers still reference it.
-    void destroyPool(uint32_t poolId);
+    // Returns true iff the mmap was unmapped + fd closed by this call (i.e.
+    // no live buffers were holding it) so the caller can mirror that
+    // teardown to a peer (the GPU process's matching mmap).
+    bool destroyPool(uint32_t poolId);
 
     // Buffer lifetime refcounting: a wl_buffer carved from a pool keeps the
     // mapping alive. create_buffer -> addRef; wl_buffer.destroy -> releaseRef.
+    // releaseBufferRef returns true iff dropping this ref triggered the
+    // pool teardown (same mirroring contract as destroyPool).
     void addBufferRef(uint32_t poolId);
-    void releaseBufferRef(uint32_t poolId);
+    bool releaseBufferRef(uint32_t poolId);
 
     // Resolve a byte region within a pool. Returns nullptr if the pool is
     // unknown or [offset, offset+len) is out of range.
