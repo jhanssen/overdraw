@@ -19,6 +19,8 @@ import type { Resource, InputEvent } from "../types.js";
 import { KEYBOARD_EVENT } from "../events/window-bus.js";
 import { markWindowChanged } from "./window-changes.js";
 import type { FocusDriver } from "./focus-driver.js";
+import { hitTestSurfaceTree, type SurfaceHit } from "../surface-hit-test.js";
+import { popupOutputOrigin } from "./xdg_popup.js";
 
 // `bind` is a synthetic on-bind hook, not a protocol request.
 type SeatHandler = WlSeatHandler & { bind(resource: Resource): void };
@@ -199,44 +201,100 @@ export default function makeSeat(ctx: Ctx, driver: FocusDriver): SeatHandler {
     if (p.version >= 5) ctx.events.wl_pointer.send_frame(p);
   }
 
-  // Find the topmost surface under an output-space point. Searches layer-
-  // shell surfaces above toplevels first (overlay then top layers), then
-  // WM toplevels via the WM, then layer-shell surfaces below toplevels
-  // (bottom then background). Respects wl_surface input regions on all
-  // candidates: when a region rejects the surface-local point, the search
-  // falls through.
+  // Find the topmost surface under an output-space point. Searches the
+  // full compositor z-order from top to bottom: overlay layer-shell,
+  // top layer-shell, popups (above their parent toplevel), WM
+  // toplevels, bottom layer-shell, background layer-shell. Every
+  // candidate's full surface tree (root + subsurfaces) is walked via
+  // `hitTestSurfaceTree`, so subsurfaces with their own input regions
+  // receive input directly. Respects wl_surface input regions on every
+  // surface in every tree.
   //
   // The default (no applied input region, or null applied = "infinite")
-  // matches the whole rect, so most surfaces hit-test exactly like before.
-  // An empty input region (Region with no rects) makes the surface entirely
-  // click-through.
+  // matches the whole surface rect; an empty input region (Region with
+  // no rects) makes that surface entirely click-through and the search
+  // falls through to whatever is behind it.
   function pick(x: number, y: number): SeatFocus | null {
-    // Compositor z-order for hit-testing: overlay > top > toplevels >
-    // bottom > background.
     const above = pickLayer(x, y, ["overlay", "top"]);
     if (above) return above;
-    const win = ctx.state.wm?.windowAt(x, y, (w, lx, ly) => {
-      const sRec = ctx.state.surfaces.get(w.surfaceRec.resource);
-      const region = sRec?.inputRegion;
-      if (region === undefined || region === null) return true;
-      return region.contains(lx, ly);
-    });
-    if (win) {
-      const rec = win.surfaceRec;
-      if (rec && !rec.resource.destroyed) {
-        const clientId = ctx.addon.clientId(rec.resource);
-        return { surfaceId: win.surfaceId, surfaceRec: rec, clientId, rect: win.rect };
-      }
-    }
+    const popup = pickPopup(x, y);
+    if (popup) return popup;
+    const win = pickToplevel(x, y);
+    if (win) return win;
     return pickLayer(x, y, ["bottom", "background"]);
   }
 
-  // Topmost layer-shell surface in the given protocol-layer set under the
-  // point, with input-region filtering. Iterates state.layerSurfaces in
-  // insertion order; within the same layer the most-recently-mapped surface
-  // ought to win, but layer-shell's spec says ordering within a layer is
-  // undefined so insertion-order is acceptable. Caller passes layers in the
-  // desired check order (overlay before top, etc.).
+  // Build a SeatFocus from a SurfaceHit produced by hitTestSurfaceTree.
+  // The accepting surface may be the candidate root or any subsurface
+  // descendant; either way, the hit carries the output-space rect of
+  // the surface that actually accepted, so motion events can compute
+  // surface-local coords against the right surface.
+  function toFocus(hit: SurfaceHit): SeatFocus {
+    const clientId = ctx.addon.clientId(hit.surfaceRec.resource);
+    return {
+      surfaceId: hit.surfaceRec.id,
+      surfaceRec: hit.surfaceRec,
+      clientId,
+      rect: hit.rect,
+    };
+  }
+
+  // WM-toplevel candidate. windowAt walks the visible toplevel order;
+  // each toplevel's tree (toplevel + subsurfaces) is hit-tested in
+  // turn. The acceptor on windowAt rejects toplevels whose ROOT input
+  // region drops the point so windowAt keeps walking; the subsurface-
+  // aware tree hit happens once windowAt returns a candidate.
+  function pickToplevel(x: number, y: number): SeatFocus | null {
+    const wm = ctx.state.wm;
+    if (!wm) return null;
+    // walked: per windowAt's accept callback, the toplevel is a
+    // candidate iff its tree hits at all (root OR a subsurface).
+    let bestHit: SurfaceHit | null = null;
+    const win = wm.windowAt(x, y, (w) => {
+      const root = ctx.state.surfaces.get(w.surfaceRec.resource);
+      if (!root) return false;
+      const hit = hitTestSurfaceTree(ctx.state, root, w.rect, x, y);
+      if (!hit) return false;
+      bestHit = hit;
+      return true;
+    });
+    if (!win || !bestHit) return null;
+    return toFocus(bestHit);
+  }
+
+  // Topmost mapped popup under the point, walking each popup's full
+  // tree. Popups are above their parent toplevel; within the popup map
+  // insertion order approximates parent-before-child, so iterate in
+  // REVERSE so a child popup (a submenu) wins over its parent popup.
+  function pickPopup(x: number, y: number): SeatFocus | null {
+    const popups = ctx.state.popups;
+    if (!popups || popups.size === 0) return null;
+    const ordered = [...popups.values()].reverse();
+    for (const pr of ordered) {
+      if (!pr.mapped) continue;
+      const root = pr.xdgSurface.surface;
+      if (!root) continue;
+      const origin = popupOutputOrigin(ctx.state, pr);
+      if (!origin) continue;
+      const rect = {
+        x: origin.x + pr.rect.x,
+        y: origin.y + pr.rect.y,
+        width: pr.rect.width,
+        height: pr.rect.height,
+      };
+      const hit = hitTestSurfaceTree(ctx.state, root, rect, x, y);
+      if (hit) return toFocus(hit);
+    }
+    return null;
+  }
+
+  // Topmost layer-shell surface in the given protocol-layer set under
+  // the point, walking each candidate's full tree. Iterates
+  // state.layerSurfaces in reverse insertion order; within the same
+  // layer the most-recently-mapped surface wins (the spec says ordering
+  // within a layer is undefined, so insertion-order is acceptable).
+  // Caller passes layers in the desired check order (overlay before
+  // top, etc.).
   function pickLayer(
     x: number, y: number,
     layers: ReadonlyArray<"background" | "bottom" | "top" | "overlay">,
@@ -244,28 +302,16 @@ export default function makeSeat(ctx: Ctx, driver: FocusDriver): SeatHandler {
     const ls = ctx.state.layerSurfaces;
     if (!ls) return null;
     for (const layer of layers) {
-      // Iterate in reverse so a later-mapped surface in the same layer wins.
       const candidates = [...ls.values()].reverse();
       for (const rec of candidates) {
         if (!rec.mapped || rec.destroyed) continue;
         if (rec.applied.layer !== layer) continue;
         const r = rec.rect;
         if (!r) continue;
-        if (x < r.x || x >= r.x + r.width || y < r.y || y >= r.y + r.height) continue;
-        const sRec = rec.surface;
-        // Input region (surface-local): respect set_input_region as the WM
-        // path does.
-        const region = sRec.inputRegion;
-        const lx = x - r.x, ly = y - r.y;
-        if (region !== undefined && region !== null && !region.contains(lx, ly)) continue;
-        if (sRec.resource.destroyed) continue;
-        const clientId = ctx.addon.clientId(sRec.resource);
-        return {
-          surfaceId: sRec.id,
-          surfaceRec: sRec,
-          clientId,
-          rect: { x: r.x, y: r.y, width: r.width, height: r.height },
-        };
+        const root = rec.surface;
+        if (root.resource.destroyed) continue;
+        const hit = hitTestSurfaceTree(ctx.state, root, r, x, y);
+        if (hit) return toFocus(hit);
       }
     }
     return null;
