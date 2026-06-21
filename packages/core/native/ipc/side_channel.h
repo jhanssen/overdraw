@@ -14,6 +14,7 @@
 #include <cstdint>
 #include <cstring>
 #include <string>
+#include <vector>
 
 namespace overdraw::ipc {
 
@@ -764,6 +765,67 @@ struct OutputDescriptorPayload {
             off += slen;
         }
         return off == len;
+    }
+};
+
+// One mode record carried in OutputModesPayload. Mirrors the subset of
+// drmModeModeInfo wlr-output-management exposes per zwlr_output_mode_v1.
+struct ModeRecord {
+    uint32_t width;       // hdisplay (device pixels)
+    uint32_t height;      // vdisplay
+    uint32_t refreshMhz;  // Hz * 1000
+    uint32_t flags;       // bit 0 = preferred; remaining bits reserved (zero).
+    static constexpr size_t kSize = 4 * 4;  // 16
+};
+static_assert(ModeRecord::kSize == 16,
+              "ModeRecord size mismatch with hand-counted layout");
+
+// Flag bits for ModeRecord::flags.
+inline constexpr uint32_t kModeFlagPreferred = 1u << 0;
+
+// OutputModesPayload (gpu -> core; FrameKind::OutputModes): the full
+// advertised mode list for one output. Layout:
+//   [0..3]   outputId           u32
+//   [4..7]   modeCount          u32   (cap kMaxModesPerOutput = 64)
+//   [8..]    modes[modeCount]   ModeRecord (16 bytes each)
+inline constexpr uint32_t kMaxModesPerOutput = 64;
+struct OutputModesPayload {
+    uint32_t outputId = 0;
+    std::vector<ModeRecord> modes;
+    size_t encodedSize() const {
+        return 8 + modes.size() * ModeRecord::kSize;
+    }
+    void encode(uint8_t* out) const {
+        putU32LE(out + 0, outputId);
+        putU32LE(out + 4, static_cast<uint32_t>(modes.size()));
+        size_t off = 8;
+        for (const ModeRecord& m : modes) {
+            putU32LE(out + off + 0,  m.width);
+            putU32LE(out + off + 4,  m.height);
+            putU32LE(out + off + 8,  m.refreshMhz);
+            putU32LE(out + off + 12, m.flags);
+            off += ModeRecord::kSize;
+        }
+    }
+    static bool decode(const uint8_t* p, size_t len, OutputModesPayload& out) {
+        if (len < 8) return false;
+        out.outputId = getU32LE(p + 0);
+        const uint32_t count = getU32LE(p + 4);
+        if (count > kMaxModesPerOutput) return false;
+        if (len != 8 + count * ModeRecord::kSize) return false;
+        out.modes.clear();
+        out.modes.reserve(count);
+        size_t off = 8;
+        for (uint32_t i = 0; i < count; ++i) {
+            ModeRecord r{};
+            r.width      = getU32LE(p + off + 0);
+            r.height     = getU32LE(p + off + 4);
+            r.refreshMhz = getU32LE(p + off + 8);
+            r.flags      = getU32LE(p + off + 12);
+            out.modes.push_back(r);
+            off += ModeRecord::kSize;
+        }
+        return true;
     }
 };
 

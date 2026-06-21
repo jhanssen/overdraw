@@ -194,6 +194,22 @@ class Compositor {
     void takePendingOutputsAdded(std::vector<OutputDescriptorMsg>& out);
     void takePendingOutputsRemoved(std::vector<uint32_t>& out);
 
+    // OutputModes delivery (gpu -> core; FrameKind::OutputModes). The GPU
+    // process emits one frame per output's full mode list right after
+    // OutputAdded (or its startup equivalent). wlr-output-management
+    // surfaces these as `head.mode` events.
+    struct OutputModesMsg {
+        uint32_t outputId = 0;
+        struct Mode {
+            uint32_t width;       // hdisplay
+            uint32_t height;      // vdisplay
+            uint32_t refreshMhz;  // Hz * 1000
+            bool     preferred;   // DRM_MODE_TYPE_PREFERRED
+        };
+        std::vector<Mode> modes;
+    };
+    void takePendingOutputModes(std::vector<OutputModesMsg>& out);
+
     // Send ScanoutReserve for a runtime-added output. Reserves three wire
     // texture handles + three surfaceBufIds at the given dims and writes the
     // ScanoutReserve message; the GPU process replies ScanoutReady, which is
@@ -625,6 +641,7 @@ class Compositor {
     // dense outputId.
     std::vector<OutputDescriptorMsg> pendingOutputsAdded_;
     std::vector<uint32_t> pendingOutputsRemoved_;
+    std::vector<OutputModesMsg> pendingOutputModes_;
 
     // KMS scanout state. Populated on receipt of ipc::Tag::ScanoutInjected
     // during bring-up. Each slot holds the wire handle id+generation (resolved

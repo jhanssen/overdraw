@@ -518,7 +518,42 @@ test("test() with set_position validates but does NOT commit", () => {
   assert.equal(ctx.state.outputPositionMemory, undefined);
 });
 
-test("apply with set_mode / set_custom_mode / set_transform / set_adaptive_sync rejected", () => {
+test("apply with set_mode against an unadvertised mode rejected", () => {
+  // A mode resource the manager never minted (or one from a different head)
+  // can't resolve to dims/refresh; the apply rejects.
+  const ctx = mockCtx([makeOutput(0)]);
+  const mgr = makeManager(ctx);
+  const mgrRes = mockResource("mgr");
+  mgr.bind(mgrRes);
+  const cfg = makeOutputConfiguration(ctx);
+  const cfgHead = makeOutputConfigurationHead(ctx);
+  const cfgRes = buildConfig(ctx, mgr, mgrRes, 0);
+  const headRes = findHeadResource(ctx, 0);
+  const cfgHeadRes = mockResource("cfghead");
+  cfg.enable_head(cfgRes, cfgHeadRes, headRes);
+  // Mint a fresh mode resource that isn't tracked by any head.
+  cfgHead.set_mode(cfgHeadRes, mockResource("zwlr_output_mode_v1"));
+  cfg.apply(cfgRes);
+  assert.ok(ctx.state._sent.find(([k]) => k === "config.failed"));
+});
+
+test("apply with set_custom_mode rejected (no DRM mode-table validation)", () => {
+  const ctx = mockCtx([makeOutput(0)]);
+  const mgr = makeManager(ctx);
+  const mgrRes = mockResource("mgr");
+  mgr.bind(mgrRes);
+  const cfg = makeOutputConfiguration(ctx);
+  const cfgHead = makeOutputConfigurationHead(ctx);
+  const cfgRes = buildConfig(ctx, mgr, mgrRes, 0);
+  const headRes = findHeadResource(ctx, 0);
+  const cfgHeadRes = mockResource("cfghead");
+  cfg.enable_head(cfgRes, cfgHeadRes, headRes);
+  cfgHead.set_custom_mode(cfgHeadRes, 2560, 1440, 60000);
+  cfg.apply(cfgRes);
+  assert.ok(ctx.state._sent.find(([k]) => k === "config.failed"));
+});
+
+test("apply with set_transform != 0 / set_adaptive_sync rejected", () => {
   const ctx = mockCtx([makeOutput(0)]);
   const mgr = makeManager(ctx);
   const mgrRes = mockResource("mgr");
@@ -526,19 +561,10 @@ test("apply with set_mode / set_custom_mode / set_transform / set_adaptive_sync 
   const cfg = makeOutputConfiguration(ctx);
   const cfgHead = makeOutputConfigurationHead(ctx);
 
-  // set_mode
+  // set_transform != 0
   let cfgRes = buildConfig(ctx, mgr, mgrRes, 0);
   let headRes = findHeadResource(ctx, 0);
   let cfgHeadRes = mockResource("cfghead");
-  cfg.enable_head(cfgRes, cfgHeadRes, headRes);
-  cfgHead.set_mode(cfgHeadRes, mockResource("zwlr_output_mode_v1"));
-  cfg.apply(cfgRes);
-  assert.ok(ctx.state._sent.find(([k]) => k === "config.failed"));
-
-  // set_transform != 0
-  ctx.state._sent.length = 0;
-  cfgRes = buildConfig(ctx, mgr, mgrRes, 0);
-  cfgHeadRes = mockResource("cfghead");
   cfg.enable_head(cfgRes, cfgHeadRes, headRes);
   cfgHead.set_transform(cfgHeadRes, 1);
   cfg.apply(cfgRes);
@@ -552,6 +578,57 @@ test("apply with set_mode / set_custom_mode / set_transform / set_adaptive_sync 
   cfgHead.set_adaptive_sync(cfgHeadRes, 1);
   cfg.apply(cfgRes);
   assert.ok(ctx.state._sent.find(([k]) => k === "config.failed"));
+});
+
+test("apply with set_mode picks the advertised mode and dispatches switchOutputMode", async () => {
+  const out = makeOutput(0, {
+    deviceSize: { width: 1920, height: 1080 },
+    refreshMhz: 60000,
+    edidId: "ACM-1234-CAFEBABE",
+  });
+  const ctx = mockCtx([out]);
+  withApplyDeps(ctx);
+  installOutputManagerBusHooks(ctx);
+
+  // Advertise three modes on the output BEFORE binding (the simulation
+  // mirrors what the GPU process's OutputModes frame populates).
+  out.availableModes = [
+    { width: 1920, height: 1080, refreshMhz: 60000,  preferred: true },
+    { width: 2560, height: 1440, refreshMhz: 144000, preferred: false },
+    { width: 3840, height: 2160, refreshMhz: 60000,  preferred: false },
+  ];
+
+  // Capture switchOutputMode dispatches.
+  const switches = [];
+  ctx.addon.switchOutputMode = (outputId, w, h, refresh) =>
+    switches.push({ outputId, w, h, refresh });
+
+  const mgr = makeManager(ctx);
+  const mgrRes = mockResource("mgr");
+  mgr.bind(mgrRes);
+
+  // The three advertised modes appeared as head.mode children.
+  const modeResources = ctx.state._sent
+    .filter(([k]) => k === "head.mode")
+    .map(([, ev]) => ev.mode);
+  assert.equal(modeResources.length, 3, "all three advertised modes minted");
+  // Pick the 2560x1440 mode (the third in our list).
+  const targetMode = modeResources[1];
+
+  // Build a config that picks that mode.
+  const cfg = makeOutputConfiguration(ctx);
+  const cfgHead = makeOutputConfigurationHead(ctx);
+  const cfgRes = buildConfig(ctx, mgr, mgrRes, 0);
+  const headRes = findHeadResource(ctx, 0);
+  const cfgHeadRes = mockResource("cfghead");
+  cfg.enable_head(cfgRes, cfgHeadRes, headRes);
+  cfgHead.set_mode(cfgHeadRes, targetMode);
+  cfg.apply(cfgRes);
+
+  assert.ok(ctx.state._sent.find(([k]) => k === "config.succeeded"));
+  assert.equal(switches.length, 1);
+  assert.deepEqual(switches[0],
+    { outputId: 0, w: 2560, h: 1440, refresh: 144000 });
 });
 
 test("apply with disable_head rejected as `failed` in v1", () => {

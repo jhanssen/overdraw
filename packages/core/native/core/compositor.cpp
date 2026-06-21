@@ -132,6 +132,29 @@ Compositor::Compositor(int wireFd, int ctrlFd, pid_t gpuPid,
             pendingOutputsAdded_.push_back(std::move(msg));
             return;
         }
+        if (kind == ipc::FrameKind::OutputModes) {
+            // Full advertised mode list for one output. Emitted FIFO-
+            // after the OutputAdded (or startup OutputDescriptor) for
+            // the same outputId, so by the time the JS handler runs
+            // state.outputs[outputId] already exists.
+            ipc::OutputModesPayload p;
+            if (!ipc::OutputModesPayload::decode(frame.data(), frame.size(), p)) {
+                std::fprintf(stderr,
+                    "[core] OutputModes: bad payload (size %zu)\n", frame.size());
+                return;
+            }
+            OutputModesMsg msg{};
+            msg.outputId = p.outputId;
+            msg.modes.reserve(p.modes.size());
+            for (const auto& r : p.modes) {
+                msg.modes.push_back({
+                    r.width, r.height, r.refreshMhz,
+                    (r.flags & ipc::kModeFlagPreferred) != 0,
+                });
+            }
+            pendingOutputModes_.push_back(std::move(msg));
+            return;
+        }
         if (kind == ipc::FrameKind::OutputRemoved) {
             // Hotplug: the connector vanished. The GPU process already
             // tore down its ring before this frame; the JS-side handler
@@ -654,6 +677,13 @@ void Compositor::takePendingOutputDescriptors(std::vector<OutputDescriptorMsg>& 
                std::make_move_iterator(pendingOutputDescriptors_.begin()),
                std::make_move_iterator(pendingOutputDescriptors_.end()));
     pendingOutputDescriptors_.clear();
+}
+
+void Compositor::takePendingOutputModes(std::vector<OutputModesMsg>& out) {
+    out.insert(out.end(),
+               std::make_move_iterator(pendingOutputModes_.begin()),
+               std::make_move_iterator(pendingOutputModes_.end()));
+    pendingOutputModes_.clear();
 }
 
 void Compositor::takePendingOutputsAdded(std::vector<OutputDescriptorMsg>& out) {

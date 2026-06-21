@@ -808,6 +808,18 @@ export interface OutputRecord {
   // `preferredOutputs` on this when non-empty and falls back to `name`
   // otherwise -- see multi-output-design §3.
   edidId: string;
+  // Full advertised mode list for this connector. Populated from the
+  // GPU process's OutputModes frame on hotplug add and at startup.
+  // wlr-output-management exposes one head.mode event per entry; the
+  // configuration apply path resolves a client-picked
+  // zwlr_output_mode_v1 back to (width, height, refreshMhz) via this
+  // list. Empty in nested-host mode (no DRM connector advertises modes).
+  availableModes?: ReadonlyArray<{
+    width: number;
+    height: number;
+    refreshMhz: number;
+    preferred: boolean;
+  }>;
 }
 
 // Protocol-level layer enum from zwlr_layer_shell_v1.layer. Uses the

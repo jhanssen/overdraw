@@ -23,18 +23,30 @@
 // Apply side: create_configuration(serial) returns a new config object.
 // The client populates it via enable_head/disable_head + per-head
 // set_position/set_scale/set_mode/set_transform/set_adaptive_sync, then
-// applies (or tests). Current scope (read-only-with-rejecting-apply):
+// applies (or tests). Current scope:
 //
-//   - Any head mutation -- set_position, set_scale, set_mode,
-//     set_custom_mode, set_transform != normal, set_adaptive_sync,
-//     disable_head -- replies `failed`. Position + scale will route
-//     through the existing runtime layout path in a follow-up commit;
-//     mode swap requires the ScanoutRebuild plumbing also landing as a
-//     follow-up. set_transform != 0 / set_adaptive_sync / disable_head
-//     are out of v1's scope entirely (no rotated rendering, no VRR
-//     connector property, no "connected but dark" state machine).
-//   - A configuration with NO head mutations applies as `succeeded` (the
-//     client is just probing).
+//   - set_position / set_scale: applied through state.outputs and the
+//     existing layer-push path (pushOutputsToLayers); output.changed
+//     fires synchronously.
+//   - set_mode: ACCEPTED for a mode that was advertised on the same
+//     head (looked up via the per-head mode list). Dispatched to
+//     addon.switchOutputMode, which sends a SwitchMode wire frame to
+//     the GPU process. The protocol's apply replies `succeeded`
+//     immediately; the actual mode swap completes asynchronously and
+//     the resulting OutputDescriptor re-emit drives output.changed
+//     to bound clients (per spec: "In case the configuration is
+//     successfully applied, there is no guarantee that the new output
+//     state matches completely the requested configuration").
+//   - set_custom_mode: REJECTED with `failed` (no DRM mode-table
+//     validation today).
+//   - set_transform != normal: REJECTED with `failed` (no rotated-
+//     output rendering).
+//   - set_adaptive_sync: REJECTED with `failed` (VRR_ENABLED connector
+//     property not wired).
+//   - disable_head: REJECTED with `failed` ("connected but dark" is
+//     new state-machine territory and not v1).
+//   - A configuration with NO head mutations applies as `succeeded`
+//     (the client is just probing).
 //   - A configuration whose serial is stale replies `cancelled` per
 //     spec; the client re-creates with a fresh serial after the next
 //     done event.
@@ -63,12 +75,24 @@ import { reemitFractionalScale } from "./wp_fractional_scale_manager_v1.js";
 void headSig;
 void modeSig;
 
-// Per-head bookkeeping inside one bound manager: the head resource, its
-// mode resource, and the source outputId so request handlers (release,
-// configuration_head requests) can resolve back to state.outputs.
+// One advertised mode object, with the dims/refresh used to resolve a
+// client-picked zwlr_output_mode_v1 back to (width, height, refreshMhz).
+interface ModeEntry {
+  resource: Resource;
+  width: number;
+  height: number;
+  refreshMhz: number;
+}
+
+// Per-head bookkeeping inside one bound manager. `modes` is keyed by
+// the mode resource itself (clients reference modes by that resource on
+// configuration_head.set_mode). The configurations look up dims/refresh
+// via the matching ModeEntry. `currentModeRes` is the mode resource the
+// head reports as `current_mode` -- one of the entries in `modes`.
 interface HeadEntry {
   head: Resource;
-  mode: Resource;
+  modes: ModeEntry[];
+  currentModeRes: Resource | null;
   outputId: number;
 }
 
@@ -167,14 +191,67 @@ function fixedToDouble(v: number): number {
 // non-static events (current_mode/position/transform/scale/etc.). The
 // done event is emitted by the caller after the whole burst across all
 // affected heads.
+// Emit one zwlr_output_mode_v1 child of `headRes` carrying the given
+// dims + refresh + preferred bit. Returns the ModeEntry for tracking.
+function emitOneMode(
+  ctx: Ctx, mgr: ManagerState, outputId: number, headRes: Resource,
+  width: number, height: number, refreshMhz: number, preferred: boolean,
+): ModeEntry {
+  const modeRes = ctx.events.zwlr_output_head_v1.send_mode(headRes, null) as Resource;
+  modeOwners.set(modeRes, { manager: mgr, outputId });
+  ctx.events.zwlr_output_mode_v1.send_size(modeRes, width, height);
+  if (refreshMhz > 0) {
+    ctx.events.zwlr_output_mode_v1.send_refresh(modeRes, refreshMhz);
+  }
+  if (preferred) ctx.events.zwlr_output_mode_v1.send_preferred(modeRes);
+  return { resource: modeRes, width, height, refreshMhz };
+}
+
+// Build the list of modes to advertise for a head. KMS-mode records
+// drive the list when rec.availableModes is populated; the nested
+// fallback synthesizes a single mode from the current dims (matching
+// the pre-multi-mode behavior).
+function buildModeList(rec: OutputRecord):
+    Array<{ width: number; height: number; refreshMhz: number; preferred: boolean }> {
+  if (rec.availableModes && rec.availableModes.length > 0) {
+    return rec.availableModes.map((m) => ({
+      width: m.width, height: m.height,
+      refreshMhz: m.refreshMhz, preferred: m.preferred,
+    }));
+  }
+  // Synthetic single-mode advertisement for nested-host outputs (no
+  // connector mode list). Marked preferred so a client picking by
+  // preferred-only finds it.
+  return [{
+    width: rec.deviceSize.width, height: rec.deviceSize.height,
+    refreshMhz: rec.refreshMhz, preferred: true,
+  }];
+}
+
+// Pick the ModeEntry whose dims + refresh match the OutputRecord's
+// current state. Refresh tolerance ~100 mHz (matches drm_utils::findMode).
+// Returns null when no match (no current_mode event emitted).
+function findCurrentMode(rec: OutputRecord, modes: ModeEntry[]): ModeEntry | null {
+  for (const m of modes) {
+    if (m.width !== rec.deviceSize.width || m.height !== rec.deviceSize.height) continue;
+    const delta = Math.abs(m.refreshMhz - rec.refreshMhz);
+    if (delta > 100 && rec.refreshMhz > 0) continue;
+    return m;
+  }
+  return null;
+}
+
 function emitHeadInitial(ctx: Ctx, mgr: ManagerState, rec: OutputRecord): HeadEntry {
   const headRes = ctx.events.zwlr_output_manager_v1.send_head(mgr.resource, null) as Resource;
-  const modeRes = ctx.events.zwlr_output_head_v1.send_mode(headRes, null) as Resource;
 
-  const entry: HeadEntry = { head: headRes, mode: modeRes, outputId: rec.id };
+  const entry: HeadEntry = {
+    head: headRes,
+    modes: [],
+    currentModeRes: null,
+    outputId: rec.id,
+  };
   mgr.heads.set(rec.id, entry);
   headOwners.set(headRes, { manager: mgr, entry });
-  modeOwners.set(modeRes, { manager: mgr, outputId: rec.id });
 
   // Static events (sent once per object).
   ctx.events.zwlr_output_head_v1.send_name(headRes, rec.name);
@@ -191,21 +268,22 @@ function emitHeadInitial(ctx: Ctx, mgr: ManagerState, rec: OutputRecord): HeadEn
     if (sn !== "") ctx.events.zwlr_output_head_v1.send_serial_number(headRes, sn);
   }
 
-  // Mode object's own static events. Each mode advertises size, refresh,
-  // and preferred. Today there's one mode per head -- the current one --
-  // so it's marked preferred. Multi-mode advertising lands with the
-  // KMS-side mode enumeration; see status.md "Read first".
-  ctx.events.zwlr_output_mode_v1.send_size(modeRes, rec.deviceSize.width, rec.deviceSize.height);
-  if (rec.refreshMhz > 0) {
-    ctx.events.zwlr_output_mode_v1.send_refresh(modeRes, rec.refreshMhz);
+  // Advertise every mode the connector supports. Each is a child
+  // zwlr_output_mode_v1 object; static events (size/refresh/preferred)
+  // fire once per object.
+  for (const m of buildModeList(rec)) {
+    entry.modes.push(emitOneMode(ctx, mgr, rec.id, headRes,
+      m.width, m.height, m.refreshMhz, m.preferred));
   }
-  ctx.events.zwlr_output_mode_v1.send_preferred(modeRes);
+  entry.currentModeRes = findCurrentMode(rec, entry.modes)?.resource ?? null;
 
   // Mutable state. enabled is implicitly true for every output in
   // state.outputs (disabled outputs aren't yet a thing here); when it
   // becomes representable, drive it from rec.
   ctx.events.zwlr_output_head_v1.send_enabled(headRes, 1);
-  ctx.events.zwlr_output_head_v1.send_current_mode(headRes, modeRes);
+  if (entry.currentModeRes !== null) {
+    ctx.events.zwlr_output_head_v1.send_current_mode(headRes, entry.currentModeRes);
+  }
   ctx.events.zwlr_output_head_v1.send_position(
     headRes, rec.logicalPosition.x, rec.logicalPosition.y);
   // wl_output.transform: normal=0. The protocol field is typed enum but the
@@ -222,27 +300,18 @@ function emitHeadInitial(ctx: Ctx, mgr: ManagerState, rec: OutputRecord): HeadEn
 }
 
 // Re-emit the MUTABLE portion of a head's state (position / transform /
-// scale / current_mode / enabled / adaptive_sync). Static events are
-// emit-once per object lifetime per spec, so this can't re-emit them.
-// Used on output.changed -- the head object identity persists.
+// scale / current_mode / enabled / adaptive_sync). Static events on
+// mode objects are emit-once per spec; this resolves the new
+// `current_mode` pointer against the already-advertised mode list. A
+// mode swap that drops to a different advertised mode just changes
+// which entry the head points at -- no new mode object is created.
 function emitHeadUpdate(ctx: Ctx, entry: HeadEntry, rec: OutputRecord): void {
-  // Mode size/refresh may have shifted (host-window resize today; KMS mode
-  // change later via ScanoutRebuild). Per spec, mode events are emit-once
-  // and the mode object becomes inert when the mode disappears -- so a
-  // mode change is "mode finished, new mode advertised, current_mode
-  // pointed at the new one." For v1 we only support host-window resize
-  // (single mode per head), so we keep the existing mode object and
-  // simply update its events. This is technically a spec deviation but
-  // every real wlroots-based compositor does the same thing for
-  // host-window-resize. Note: this is moot in M7 because KMS mode change
-  // lands separately.
-  ctx.events.zwlr_output_mode_v1.send_size(entry.mode, rec.deviceSize.width, rec.deviceSize.height);
-  if (rec.refreshMhz > 0) {
-    ctx.events.zwlr_output_mode_v1.send_refresh(entry.mode, rec.refreshMhz);
-  }
+  entry.currentModeRes = findCurrentMode(rec, entry.modes)?.resource ?? null;
 
   ctx.events.zwlr_output_head_v1.send_enabled(entry.head, 1);
-  ctx.events.zwlr_output_head_v1.send_current_mode(entry.head, entry.mode);
+  if (entry.currentModeRes !== null) {
+    ctx.events.zwlr_output_head_v1.send_current_mode(entry.head, entry.currentModeRes);
+  }
   ctx.events.zwlr_output_head_v1.send_position(
     entry.head, rec.logicalPosition.x, rec.logicalPosition.y);
   ctx.events.zwlr_output_head_v1.send_transform(entry.head, rec.transform as 0);
@@ -258,8 +327,11 @@ function emitHeadUpdate(ctx: Ctx, entry: HeadEntry, rec: OutputRecord): void {
 function finishHead(ctx: Ctx, mgr: ManagerState, outputId: number): void {
   const entry = mgr.heads.get(outputId);
   if (!entry) return;
-  // mode.finished first (the head holds a current_mode reference to it).
-  ctx.events.zwlr_output_mode_v1.send_finished(entry.mode);
+  // Every mode object becomes inert before the head itself (the head
+  // holds current_mode references to one of them).
+  for (const m of entry.modes) {
+    ctx.events.zwlr_output_mode_v1.send_finished(m.resource);
+  }
   ctx.events.zwlr_output_head_v1.send_finished(entry.head);
   mgr.heads.delete(outputId);
 }
@@ -298,6 +370,40 @@ export function installOutputManagerBusHooks(ctx: Ctx): void {
     for (const mgr of managers) {
       if (!mgr.active) continue;
       finishHead(ctx, mgr, p.outputId);
+    }
+    bumpSerialAndAnnounce(ctx);
+  });
+
+  pb.subscribe("output.modes-changed", (_name, payload) => {
+    // The advertised mode list for one output changed (initial KMS
+    // OutputModes arrival; hot-plugged connector). The protocol spec
+    // says zwlr_output_mode_v1 events are emit-once and a mode going
+    // away sends `finished`. We honor that here: every existing mode
+    // resource on every bound manager gets a `finished`, then we
+    // advertise the fresh list as new resources and repoint current_mode.
+    const p = payload as { outputId?: number } | undefined;
+    if (!p || typeof p.outputId !== "number") return;
+    const rec = ctx.state.outputs?.get(p.outputId);
+    if (!rec) return;
+    for (const mgr of managers) {
+      if (!mgr.active) continue;
+      const entry = mgr.heads.get(p.outputId);
+      if (!entry) continue;
+      // Finish the old mode objects.
+      for (const m of entry.modes) {
+        ctx.events.zwlr_output_mode_v1.send_finished(m.resource);
+        modeOwners.delete(m.resource);
+      }
+      entry.modes = [];
+      // Re-advertise from the new list.
+      for (const m of buildModeList(rec)) {
+        entry.modes.push(emitOneMode(ctx, mgr, rec.id, entry.head,
+          m.width, m.height, m.refreshMhz, m.preferred));
+      }
+      entry.currentModeRes = findCurrentMode(rec, entry.modes)?.resource ?? null;
+      if (entry.currentModeRes !== null) {
+        ctx.events.zwlr_output_head_v1.send_current_mode(entry.head, entry.currentModeRes);
+      }
     }
     bumpSerialAndAnnounce(ctx);
   });
@@ -558,6 +664,22 @@ function runApplyOrTest(ctx: Ctx, resource: Resource, commit: boolean): void {
 //   - set_transform != 0: no rotated rendering today.
 //   - set_adaptive_sync: VRR_ENABLED connector property not wired.
 //   - any head not in state.outputs (stale reference).
+// Resolve a client-picked zwlr_output_mode_v1 resource to its dims and
+// refresh by walking the owning head's mode list. Returns null when the
+// mode doesn't belong to a tracked head (stale resource, never finished
+// by the client) -- the protocol treats that as an apply-time error.
+function resolveModeResource(modeRes: Resource):
+    { entry: ModeEntry; outputId: number } | null {
+  const owner = modeOwners.get(modeRes);
+  if (!owner) return null;
+  const head = owner.manager.heads.get(owner.outputId);
+  if (!head) return null;
+  for (const m of head.modes) {
+    if (m.resource === modeRes) return { entry: m, outputId: owner.outputId };
+  }
+  return null;
+}
+
 function validateConfig(ctx: Ctx, cfg: ConfigState): string | null {
   if (cfg.disabled.size > 0) return "disable_head not supported";
   for (const ch of cfg.enabled.values()) {
@@ -566,7 +688,17 @@ function validateConfig(ctx: Ctx, cfg: ConfigState): string | null {
       return "non-normal transform not supported";
     }
     if (ch.adaptiveSyncSet) return "adaptive_sync not supported";
-    if (ch.modeSet) return "mode change not supported (follow-up)";
+    if (ch.modeSet) {
+      // set_custom_mode (no mode resource, just dims) is rejected in v1.
+      if (ch.customMode !== undefined) return "set_custom_mode not supported";
+      if (!ch.mode) return "set_mode without mode resource";
+      const resolved = resolveModeResource(ch.mode);
+      if (!resolved) return "set_mode: mode not advertised on this head";
+      if (resolved.outputId !== ch.outputId) {
+        // Spec: invalid_mode (mode doesn't belong to head).
+        return "set_mode: mode does not belong to this head";
+      }
+    }
     if (ch.scaleSet) {
       const s = ch.scale !== undefined ? fixedToDouble(ch.scale) : 0;
       if (!(s > 0)) return "scale must be positive";
@@ -609,6 +741,28 @@ function commitConfig(ctx: Ctx, cfg: ConfigState): void {
           ctx.state.outputScaleMemory.set(durable, newScale);
         }
         mutated = true;
+      }
+    }
+    if (ch.modeSet && ch.mode) {
+      // validateConfig already resolved the mode and confirmed it
+      // belongs to the head. Look it up again to get dims/refresh,
+      // then dispatch to the addon's async switchOutputMode. The
+      // protocol's apply replies `succeeded` immediately; the actual
+      // mode swap completes asynchronously and the resulting
+      // OutputDescriptor re-emit drives the subsequent output.changed
+      // event to bound clients.
+      const resolved = resolveModeResource(ch.mode);
+      if (resolved) {
+        const m = resolved.entry;
+        // No-op when the requested mode already matches current dims.
+        if (m.width !== rec.deviceSize.width
+            || m.height !== rec.deviceSize.height
+            || (rec.refreshMhz > 0 && Math.abs(m.refreshMhz - rec.refreshMhz) > 100)) {
+          ctx.addon.switchOutputMode(ch.outputId, m.width, m.height, m.refreshMhz);
+          // Mode change is async: don't set mutated. The
+          // OutputDescriptor re-emit from the GPU process will fire
+          // output.changed later, which the bus subscribers handle.
+        }
       }
     }
   }

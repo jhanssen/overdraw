@@ -151,6 +151,7 @@ struct Addon {
     napi_ref onOutput = nullptr; // optional JS callback(descriptor) for OutputDescriptor msgs
     napi_ref onOutputAdded = nullptr;   // optional JS callback(descriptor) for hotplug add
     napi_ref onOutputRemoved = nullptr; // optional JS callback({outputId}) for hotplug remove
+    napi_ref onOutputModes = nullptr;   // optional JS callback({outputId, modes}) for full mode list
     napi_ref onFlipComplete = nullptr;  // optional JS callback(outputId) for KMS flip-completes
     uint64_t lastNotified = 0;
 
@@ -527,6 +528,7 @@ void fireJsImports(napi_env env);
 void fireOutputDescriptors(napi_env env);
 void fireOutputsAdded(napi_env env);
 void fireOutputsRemoved(napi_env env);
+void fireOutputModes(napi_env env);
 
 // Arm the wire poll for READABLE always, plus WRITABLE iff outbound wire bytes
 // are queued (so we get told when the socket can take more). Call after anything
@@ -587,6 +589,9 @@ void onWireReadable(uv_poll_t*, int status, int events) {
         fireOutputsRemoved(g_addon.env);
         fireOutputDescriptors(g_addon.env);
         fireOutputsAdded(g_addon.env);
+        // OutputModes after Added: the mode list applies to an
+        // already-created state.outputs entry.
+        fireOutputModes(g_addon.env);
         // drainCtrl above may have consumed plugin-broker replies (alloc/begin/...);
         // advance them here too, else they are stranded (see advanceAllPending).
         advanceAllPending(g_addon.env);
@@ -613,6 +618,7 @@ void onCtrlReadable(uv_poll_t*, int status, int events) {
         fireOutputsRemoved(g_addon.env);
         fireOutputDescriptors(g_addon.env);
         fireOutputsAdded(g_addon.env);
+        fireOutputModes(g_addon.env);
         advanceAllPending(g_addon.env);
         if (g_addon.compositor->takeFrameComplete()) onFrameComplete();
         armWirePoll();  // finishing an import flushes wire output (bind group etc.)
@@ -1467,6 +1473,43 @@ void fireOutputsRemoved(napi_env env) {
     napi_close_handle_scope(env, scope);
 }
 
+// Drain queued OutputModes messages and invoke the JS onOutputModes
+// callback per output. Each call carries { outputId, modes: [{ width,
+// height, refreshMhz, preferred }] }. Same Node thread; same pattern
+// as fireOutputDescriptors.
+void fireOutputModes(napi_env env) {
+    if (!g_addon.compositor || !g_addon.onOutputModes) return;
+    std::vector<Compositor::OutputModesMsg> msgs;
+    g_addon.compositor->takePendingOutputModes(msgs);
+    if (msgs.empty()) return;
+    napi_handle_scope scope;
+    napi_open_handle_scope(env, &scope);
+    napi_value cb, undefined;
+    napi_get_reference_value(env, g_addon.onOutputModes, &cb);
+    napi_get_undefined(env, &undefined);
+    for (const auto& msg : msgs) {
+        napi_value obj, v, arr;
+        napi_create_object(env, &obj);
+        napi_create_uint32(env, msg.outputId, &v);
+        napi_set_named_property(env, obj, "outputId", v);
+        napi_create_array_with_length(env, msg.modes.size(), &arr);
+        for (size_t i = 0; i < msg.modes.size(); ++i) {
+            const auto& m = msg.modes[i];
+            napi_value entry, ev;
+            napi_create_object(env, &entry);
+            napi_create_uint32(env, m.width,      &ev); napi_set_named_property(env, entry, "width", ev);
+            napi_create_uint32(env, m.height,     &ev); napi_set_named_property(env, entry, "height", ev);
+            napi_create_uint32(env, m.refreshMhz, &ev); napi_set_named_property(env, entry, "refreshMhz", ev);
+            napi_get_boolean(env, m.preferred, &ev);
+            napi_set_named_property(env, entry, "preferred", ev);
+            napi_set_element(env, arr, static_cast<uint32_t>(i), entry);
+        }
+        napi_set_named_property(env, obj, "modes", arr);
+        napi_call_function(env, undefined, cb, 1, &obj, nullptr);
+    }
+    napi_close_handle_scope(env, scope);
+}
+
 // createTextureFromDmabuf(fd, w, h, fourcc, modHi, modLo, offset, stride, cb)
 // Async: imports a client dmabuf as a wire texture (server-side reserve/inject)
 // and invokes cb(handleBigInt | null) when done. JS wraps the handle via
@@ -1778,6 +1821,10 @@ napi_value Stop(napi_env env, napi_callback_info) {
     if (g_addon.onOutputRemoved) {
         napi_delete_reference(env, g_addon.onOutputRemoved);
         g_addon.onOutputRemoved = nullptr;
+    }
+    if (g_addon.onOutputModes) {
+        napi_delete_reference(env, g_addon.onOutputModes);
+        g_addon.onOutputModes = nullptr;
     }
     if (g_addon.onFlipComplete) {
         napi_delete_reference(env, g_addon.onFlipComplete);
@@ -2131,6 +2178,32 @@ napi_value SetOnOutputRemoved(napi_env env, napi_callback_info info) {
         napi_valuetype t; napi_typeof(env, argv[0], &t);
         if (t == napi_function) napi_create_reference(env, argv[0], 1, &g_addon.onOutputRemoved);
     }
+    napi_value u; napi_get_undefined(env, &u); return u;
+}
+
+// setOnOutputModes(cb) -> undefined
+// Register a JS callback fired for each OutputModes message arriving
+// from the GPU process. The GPU emits these right after OutputAdded
+// (or the startup OutputDescriptor) so the JS handler can update
+// state.outputs[outputId].availableModes for already-existing outputs.
+// Callback receives { outputId: number, modes: [{ width, height,
+// refreshMhz, preferred }] }. Pass null/omit to clear.
+napi_value SetOnOutputModes(napi_env env, napi_callback_info info) {
+    size_t argc = 1; napi_value argv[1];
+    napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+    if (g_addon.onOutputModes) {
+        napi_delete_reference(env, g_addon.onOutputModes);
+        g_addon.onOutputModes = nullptr;
+    }
+    if (argc >= 1) {
+        napi_valuetype t; napi_typeof(env, argv[0], &t);
+        if (t == napi_function) napi_create_reference(env, argv[0], 1, &g_addon.onOutputModes);
+    }
+    // Same bring-up consideration as setOnOutputDescriptor: drain ctrl
+    // / wire and fire any already-queued modes so the freshly-registered
+    // callback sees them.
+    if (g_addon.compositor) g_addon.compositor->drainCtrl();
+    fireOutputModes(env);
     napi_value u; napi_get_undefined(env, &u); return u;
 }
 
@@ -2825,6 +2898,7 @@ napi_value Init(napi_env env, napi_value exports) {
     reg("setOnOutputDescriptor", SetOnOutputDescriptor);
     reg("setOnOutputAdded", SetOnOutputAdded);
     reg("setOnOutputRemoved", SetOnOutputRemoved);
+    reg("setOnOutputModes", SetOnOutputModes);
     reg("setOnFlipComplete", SetOnFlipComplete);
     reg("reserveScanoutForOutput", ReserveScanoutForOutput);
     reg("releaseScanoutForOutput", ReleaseScanoutForOutput);

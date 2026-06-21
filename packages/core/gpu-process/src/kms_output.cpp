@@ -283,6 +283,12 @@ bool KmsOutputBackend::initScanoutForOutput(uint32_t outputId,
     return true;
 }
 
+std::vector<DrmMode> KmsOutputBackend::enumerateModes(uint32_t outputId) const {
+    const PerOutput* o = find(outputId);
+    if (!o) return {};
+    return enumerateModesForConnector(drmFd_, o->topo.connectorId);
+}
+
 bool KmsOutputBackend::switchMode(uint32_t outputId,
                                   uint32_t width, uint32_t height,
                                   uint32_t refreshMhz,

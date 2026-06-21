@@ -179,6 +179,12 @@ class KmsOutputBackend : public OutputBackend {
     bool switchMode(uint32_t outputId, uint32_t width, uint32_t height,
                     uint32_t refreshMhz, const wgpu::Device& device);
 
+    // Return every mode the connector backing `outputId` advertises.
+    // Empty when the outputId is unknown or the connector has no modes.
+    // Used by the OutputModes wire emit so the core can surface the
+    // full mode list to wlr-output-management clients.
+    std::vector<DrmMode> enumerateModes(uint32_t outputId) const;
+
   private:
     // One driven monitor: its topology, scanout ring, mode blob, and page-flip
     // state. Held by unique_ptr because KmsScanoutRing is non-movable (deleted

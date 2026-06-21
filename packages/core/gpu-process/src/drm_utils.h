@@ -164,6 +164,12 @@ bool findMode(int drmFd, uint32_t connectorId,
               uint32_t width, uint32_t height, uint32_t refreshMhz,
               DrmMode& outMode);
 
+// Enumerate every mode the connector advertises. Returns the mode list
+// in connector-defined order (typically preferred / EDID DTD first,
+// then established / standard). Empty result when the connector has no
+// modes or the lookup fails.
+std::vector<DrmMode> enumerateModesForConnector(int drmFd, uint32_t connectorId);
+
 }  // namespace overdraw::gpu
 
 #endif  // OVERDRAW_GPU_DRM_UTILS_H_

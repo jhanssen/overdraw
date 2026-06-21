@@ -184,6 +184,17 @@ enum class FrameKind : uint8_t {
                               // expected -- disconnectOutput tore down the
                               // ring before the rescan emit -- but kept
                               // consistent so the pair is uniform).
+    OutputModes = 17,         // gpu -> core: the full list of modes a
+                              // connected output advertises. Sent right
+                              // after each OutputAdded (or its startup
+                              // equivalent for the initial output set).
+                              // Payload: OutputModesPayload (outputId +
+                              // mode count + (width, height, refreshMhz,
+                              // flags) records). Used by
+                              // wlr-output-management to emit head.mode
+                              // events for every mode the connector
+                              // supports, so a client can pick one and
+                              // drive SwitchMode through the protocol.
 };
 
 // Max fds attachable in one message (control msg OR in-band wire frame).

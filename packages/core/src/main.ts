@@ -521,6 +521,28 @@ pluginBus.subscribe("output.changed", (_name, payload) => {
   };
   addon.setOnOutputAdded(makeOnOutputAdded(hotplugDeps));
   addon.setOnOutputRemoved(makeOnOutputRemoved(hotplugDeps));
+  // OutputModes carries the full advertised mode list per output. Arrives
+  // FIFO-after the matching OutputAdded (hotplug) or OutputDescriptor
+  // (startup); the JS handler can therefore assume state.outputs[id]
+  // exists. wlr-output-management re-emits head.mode events when this
+  // list changes (e.g. on a hotplug add of a new monitor).
+  addon.setOnOutputModes((d) => {
+    const rec = state.outputs?.get(d.outputId);
+    if (!rec) {
+      log.warn("core", `OutputModes for unknown outputId=${d.outputId}; ignoring`);
+      return;
+    }
+    rec.availableModes = d.modes.map((m) => ({
+      width: m.width,
+      height: m.height,
+      refreshMhz: m.refreshMhz,
+      preferred: m.preferred,
+    }));
+    pluginBus.emit("output.modes-changed", {
+      outputId: d.outputId,
+      modes: rec.availableModes,
+    });
+  });
 }
 
 log.info("core", `Wayland server listening.`);

@@ -249,6 +249,20 @@ export interface Addon {
   //     `output.removed`; call releaseScanoutForOutput(outputId).
   setOnOutputAdded(cb: ((d: OutputDescriptor) => void) | null): void;
   setOnOutputRemoved(cb: ((d: { outputId: number }) => void) | null): void;
+  // Register a callback fired for each OutputModes frame from the GPU
+  // process. Carries the full advertised mode list for one output;
+  // arrives after the matching OutputDescriptor / OutputAdded so the
+  // handler may assume state.outputs[outputId] exists. KMS only;
+  // nested-host doesn't emit OutputModes. Passing null clears.
+  setOnOutputModes(cb: ((d: {
+    outputId: number;
+    modes: ReadonlyArray<{
+      width: number;
+      height: number;
+      refreshMhz: number;
+      preferred: boolean;
+    }>;
+  }) => void) | null): void;
   // Send a ScanoutReserve to the GPU process for a runtime-added output
   // (M7). Called by the onOutputAdded handler. KMS only; nested/headless are
   // silent no-ops.

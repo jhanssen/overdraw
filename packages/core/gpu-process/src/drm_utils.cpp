@@ -463,6 +463,25 @@ uint32_t createModeBlob(int drmFd, const drmModeModeInfo& mode) {
     return id;
 }
 
+std::vector<DrmMode> enumerateModesForConnector(int drmFd, uint32_t connectorId) {
+    std::vector<DrmMode> out;
+    drmModeConnector* c = drmModeGetConnector(drmFd, connectorId);
+    if (!c) return out;
+    out.reserve(c->count_modes);
+    for (int i = 0; i < c->count_modes; ++i) {
+        const drmModeModeInfo& m = c->modes[i];
+        DrmMode entry{};
+        entry.hdisplay    = m.hdisplay;
+        entry.vdisplay    = m.vdisplay;
+        entry.vrefreshMhz = modeRefreshMhz(m);
+        entry.preferred   = (m.type & DRM_MODE_TYPE_PREFERRED) != 0;
+        entry.raw         = m;
+        out.push_back(entry);
+    }
+    drmModeFreeConnector(c);
+    return out;
+}
+
 bool findMode(int drmFd, uint32_t connectorId,
               uint32_t width, uint32_t height, uint32_t refreshMhz,
               DrmMode& outMode) {

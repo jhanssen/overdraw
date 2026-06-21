@@ -702,6 +702,41 @@ int run(int wireFd, int ctrlFd, int inputFd, bool headless,
         std::memcpy(m.outputEdidId, info.edidId, sizeof(m.outputEdidId));
     };
 
+    // Emit OutputModes for an output. Walks the connector's mode list,
+    // truncates at ipc::kMaxModesPerOutput if needed (with a warning),
+    // packs into a wire frame, and appends. The frame rides the wire
+    // FIFO-after the OutputAdded frame (or after the startup
+    // OutputDescriptor send) so the core processes them in order;
+    // wlr-output-management exposes one head.mode event per record.
+    auto emitOutputModes = [&](uint32_t outputId) {
+        if (!kms) return;
+        auto modes = kms->enumerateModes(outputId);
+        if (modes.empty()) return;
+        ipc::OutputModesPayload p{};
+        p.outputId = outputId;
+        const size_t cap = ipc::kMaxModesPerOutput;
+        if (modes.size() > cap) {
+            std::fprintf(stderr,
+                "[gpu] OutputModes: connector for outputId=%u has %zu modes, "
+                "truncating to %zu\n", outputId, modes.size(), cap);
+            modes.resize(cap);
+        }
+        p.modes.reserve(modes.size());
+        for (const auto& m : modes) {
+            ipc::ModeRecord r{};
+            r.width      = m.hdisplay;
+            r.height     = m.vdisplay;
+            r.refreshMhz = m.vrefreshMhz;
+            r.flags      = m.preferred ? ipc::kModeFlagPreferred : 0;
+            p.modes.push_back(r);
+        }
+        std::vector<uint8_t> buf(p.encodedSize());
+        p.encode(buf.data());
+        serializer.appendFrame(ipc::FrameKind::OutputModes, buf.data(), buf.size());
+        std::printf("[gpu] sent OutputModes outputId=%u count=%zu\n",
+                    outputId, p.modes.size());
+    };
+
     // Pack one output's identity into an OutputDescriptorPayload. Used by
     // OutputAdded sends (runtime hotplug); the still-ctrl-bound startup
     // OutputDescriptor / resize re-emit path uses fillOutputMsg above.
@@ -756,6 +791,13 @@ int run(int wireFd, int ctrlFd, int inputFd, bool headless,
             std::printf("[gpu] sent OutputDescriptor (kms output %u/%u): %ux%u @%u.%03uHz name=%s\n",
                         outputId, nOutputs, m.width, m.height,
                         m.refreshMhz / 1000, m.refreshMhz % 1000, m.outputName);
+            // OutputModes rides wire (FrameKind), the descriptor above
+            // rides ctrl. Different fds, but the core's startup pump
+            // drains both before handing control to the JS layer, so
+            // either order is fine; the JS handler ordering
+            // (fireOutputDescriptors then fireOutputModes) gives modes
+            // the existing OutputRecord to update.
+            emitOutputModes(outputId);
         }
 
         // Step 2: build all N scanout rings on the core device. Done before
@@ -2326,6 +2368,11 @@ int run(int wireFd, int ctrlFd, int inputFd, bool headless,
                                             id, p.width, p.height,
                                             p.refreshMhz / 1000, p.refreshMhz % 1000,
                                             p.name.c_str());
+                                // Wire-FIFO: this OutputModes lands after
+                                // the OutputAdded above, so the JS handler
+                                // sees the existing OutputRecord before
+                                // applying modes to it.
+                                emitOutputModes(id);
                             }
                             break;
                         }
