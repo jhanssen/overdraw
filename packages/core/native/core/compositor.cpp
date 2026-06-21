@@ -102,6 +102,50 @@ Compositor::Compositor(int wireFd, int ctrlFd, pid_t gpuPid,
             }
             return;
         }
+        if (kind == ipc::FrameKind::OutputAdded) {
+            // Hotplug: the connector at this dense outputId is now
+            // connected with a usable CRTC. The GPU process built its
+            // ring before emitting; the JS-side handler creates
+            // state.outputs[outputId] and replies with ScanoutReserve
+            // via reserveScanoutForOutput. Wire-FIFO with that reply
+            // means the GPU's wire reader processes any preceding
+            // frames before handling ScanoutReserve.
+            ipc::OutputDescriptorPayload p;
+            if (!ipc::OutputDescriptorPayload::decode(frame.data(), frame.size(), p)) {
+                std::fprintf(stderr,
+                    "[core] OutputAdded: bad payload (size %zu)\n", frame.size());
+                return;
+            }
+            OutputDescriptorMsg msg{};
+            msg.outputId         = p.outputId;
+            msg.width            = p.width;
+            msg.height           = p.height;
+            msg.refreshMhz       = p.refreshMhz;
+            msg.scale            = p.scale;
+            msg.transform        = p.transform;
+            msg.physicalWidthMm  = p.physicalWidthMm;
+            msg.physicalHeightMm = p.physicalHeightMm;
+            msg.name             = std::move(p.name);
+            msg.make             = std::move(p.make);
+            msg.model            = std::move(p.model);
+            msg.edidId           = std::move(p.edidId);
+            pendingOutputsAdded_.push_back(std::move(msg));
+            return;
+        }
+        if (kind == ipc::FrameKind::OutputRemoved) {
+            // Hotplug: the connector vanished. The GPU process already
+            // tore down its ring before this frame; the JS-side handler
+            // fires output.pre-remove / removed and calls
+            // releaseScanoutForOutput.
+            if (frame.size() != ipc::OutputRemovedPayload::kSize) {
+                std::fprintf(stderr,
+                    "[core] OutputRemoved: bad payload size %zu\n", frame.size());
+                return;
+            }
+            auto p = ipc::OutputRemovedPayload::decode(frame.data());
+            pendingOutputsRemoved_.push_back(p.outputId);
+            return;
+        }
         if (kind == ipc::FrameKind::ScanoutRebuild) {
             // The GPU process has torn down the named output's ring at new
             // dims and needs a fresh ScanoutReserve. Clear our prior
@@ -717,46 +761,31 @@ void Compositor::drainCtrl() {
             flipCompletes_.push_back(0);
             continue;
         }
-        // Helper: build an OutputDescriptorMsg from the wire message's
-        // descriptor-bearing fields. Shared by OutputDescriptor and OutputAdded.
+        // OutputDescriptor (re-emit) still rides ctrl -- it has no wire
+        // dependency, so cross-fd ordering doesn't apply. The hotplug pair
+        // OutputAdded / OutputRemoved DO have wire dependencies
+        // (reserveScanoutForOutput writes ScanoutReserve on the wire from
+        // the JS handler) and ride wire as FrameKind frames; see
+        // setInboundFrameHandler in the ctor.
         auto bounded = [](const char* s, size_t cap) {
             size_t n = ::strnlen(s, cap);
             return std::string(s, n);
         };
-        auto buildDesc = [&](const ipc::Message& m) {
-            OutputDescriptorMsg msg{};
-            msg.outputId         = m.outputId;
-            msg.width            = m.width;
-            msg.height           = m.height;
-            msg.refreshMhz       = m.refreshMhz;
-            msg.scale            = m.outScale;
-            msg.transform        = m.outTransform;
-            msg.physicalWidthMm  = m.physicalWidthMm;
-            msg.physicalHeightMm = m.physicalHeightMm;
-            msg.name   = bounded(m.outputName,   sizeof(m.outputName));
-            msg.make   = bounded(m.outputMake,   sizeof(m.outputMake));
-            msg.model  = bounded(m.outputModel,  sizeof(m.outputModel));
-            msg.edidId = bounded(m.outputEdidId, sizeof(m.outputEdidId));
-            return msg;
-        };
         if (r.tag == ipc::Tag::OutputDescriptor) {
-            pendingOutputDescriptors_.push_back(buildDesc(r));
-            continue;
-        }
-        if (r.tag == ipc::Tag::OutputAdded) {
-            // Hotplug: the connector at this dense outputId is now connected
-            // with a usable CRTC. The GPU process built its ring before
-            // emitting; the core's JS handler creates state.outputs[outputId]
-            // and replies with ScanoutReserve via reserveScanoutForOutput.
-            pendingOutputsAdded_.push_back(buildDesc(r));
-            continue;
-        }
-        if (r.tag == ipc::Tag::OutputRemoved) {
-            // Hotplug: the connector vanished or was disabled. The GPU
-            // process has already torn down the ring; queue the outputId for
-            // the JS handler to fire output.pre-remove / removed and call
-            // releaseScanoutForOutput.
-            pendingOutputsRemoved_.push_back(r.outputId);
+            OutputDescriptorMsg msg{};
+            msg.outputId         = r.outputId;
+            msg.width            = r.width;
+            msg.height           = r.height;
+            msg.refreshMhz       = r.refreshMhz;
+            msg.scale            = r.outScale;
+            msg.transform        = r.outTransform;
+            msg.physicalWidthMm  = r.physicalWidthMm;
+            msg.physicalHeightMm = r.physicalHeightMm;
+            msg.name   = bounded(r.outputName,   sizeof(r.outputName));
+            msg.make   = bounded(r.outputMake,   sizeof(r.outputMake));
+            msg.model  = bounded(r.outputModel,  sizeof(r.outputModel));
+            msg.edidId = bounded(r.outputEdidId, sizeof(r.outputEdidId));
+            pendingOutputDescriptors_.push_back(std::move(msg));
             continue;
         }
         // Note: ScanoutReady arrives on the WIRE (not ctrl) -- see the

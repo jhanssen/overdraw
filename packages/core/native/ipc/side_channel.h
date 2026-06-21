@@ -12,6 +12,8 @@
 #define OVERDRAW_IPC_SIDE_CHANNEL_H_
 
 #include <cstdint>
+#include <cstring>
+#include <string>
 
 namespace overdraw::ipc {
 
@@ -130,26 +132,14 @@ enum class Tag : uint8_t {
                          //   trigger a forced modeset without waiting for the
                          //   next render.
     Shutdown     = 'X',  // core -> gpu : clean termination request
-    OutputAdded   = 'N',  // gpu -> core: a previously-disconnected connector is now
-                          //   connected and has a usable CRTC + plane. Carries the
-                          //   full descriptor (same fields OutputDescriptor uses:
-                          //   width/height/refresh/scale/transform/physical
-                          //   dimensions + name/make/model) plus the dense
-                          //   `outputId` the GPU process assigned. The core
-                          //   creates a state.outputs entry, replies with a
-                          //   ScanoutReserve for that outputId, and the GPU
-                          //   process replies ScanoutReady once the ring is
-                          //   built -- same handshake as startup bring-up,
-                          //   scoped to one outputId. See multi-output-design
-                          //   §4 / §10.
-    OutputRemoved = 'n',  // gpu -> core: the connector at `outputId` vanished or
-                          //   was disabled. The GPU process has already released
-                          //   the ring's GBM bo's / dmabuf fds / mode blob and
-                          //   dropped its PerOutput. The core fires
-                          //   output.pre-remove (workspace migration, surface
-                          //   leave), tears down state.outputs[outputId], fires
-                          //   output.removed, then destroys that output's
-                          //   wl_output global. See multi-output-design §10.
+    // OutputAdded / OutputRemoved ride the WIRE socket as FrameKind
+    // frames (transport.h FrameKind::OutputAdded / OutputRemoved). The
+    // wire-FIFO ordering is load-bearing: the core's reaction to
+    // OutputAdded is reserveScanoutForOutput, which writes a
+    // ScanoutReserve wire frame -- having OutputAdded on ctrl while
+    // ScanoutReserve rides wire created a cross-fd window. Retired
+    // ctrl letters (do not reuse): 'N' OutputAdded, 'n' OutputRemoved.
+    // See architecture.md "Why wire, not ctrl".
     // ScanoutRebuild and SwitchMode now ride the WIRE socket as FrameKind
     // variants (transport.h), not Tag-on-ctrl. The wire-FIFO ordering is
     // load-bearing: a SwitchMode arriving on ctrl while ProducerBegin
@@ -689,6 +679,106 @@ struct ReleaseSurfaceBufPayload {
 };
 static_assert(ReleaseSurfaceBufPayload::kSize == 4,
               "ReleaseSurfaceBufPayload size mismatch with hand-counted layout");
+
+// OutputDescriptorPayload (gpu -> core; FrameKind::OutputAdded).
+// Carries one output's full identity + geometry. Layout (little-endian):
+//
+//   [0..3]   outputId          u32
+//   [4..7]   width             u32 (device pixels)
+//   [8..11]  height            u32
+//   [12..15] refreshMhz        u32 (Hz * 1000)
+//   [16..19] scale             u32 (integer wl_output scale)
+//   [20..23] transform         u32 (wl_output.transform enum value)
+//   [24..27] physicalWidthMm   u32
+//   [28..31] physicalHeightMm  u32
+//   [32..35] nameLen           u32
+//   [36..36+nameLen]            name  bytes (no NUL terminator)
+//   [...]   makeLen u32 + makeLen bytes
+//   [...]   modelLen u32 + modelLen bytes
+//   [...]   edidIdLen u32 + edidIdLen bytes
+//
+// Strings cap at 63 bytes each (the source buffers are 64 bytes
+// NUL-terminated). Variable-length so the on-wire size is exactly
+// what's needed, no padding.
+struct OutputDescriptorPayload {
+    uint32_t outputId         = 0;
+    uint32_t width            = 0;
+    uint32_t height           = 0;
+    uint32_t refreshMhz       = 0;
+    uint32_t scale            = 1;
+    uint32_t transform        = 0;
+    uint32_t physicalWidthMm  = 0;
+    uint32_t physicalHeightMm = 0;
+    std::string name;
+    std::string make;
+    std::string model;
+    std::string edidId;
+
+    // Compute the encoded byte length WITHOUT allocating.
+    size_t encodedSize() const {
+        return 8 * 4
+             + 4 + name.size()
+             + 4 + make.size()
+             + 4 + model.size()
+             + 4 + edidId.size();
+    }
+
+    void encode(uint8_t* out) const {
+        putU32LE(out + 0,  outputId);
+        putU32LE(out + 4,  width);
+        putU32LE(out + 8,  height);
+        putU32LE(out + 12, refreshMhz);
+        putU32LE(out + 16, scale);
+        putU32LE(out + 20, transform);
+        putU32LE(out + 24, physicalWidthMm);
+        putU32LE(out + 28, physicalHeightMm);
+        size_t off = 32;
+        for (const std::string* s : { &name, &make, &model, &edidId }) {
+            putU32LE(out + off, static_cast<uint32_t>(s->size()));
+            off += 4;
+            std::memcpy(out + off, s->data(), s->size());
+            off += s->size();
+        }
+    }
+
+    // Decode from a payload of `len` bytes. Returns true on success;
+    // returns false (output untouched) on truncated / malformed input.
+    static bool decode(const uint8_t* p, size_t len, OutputDescriptorPayload& out) {
+        if (len < 8 * 4) return false;
+        out.outputId         = getU32LE(p + 0);
+        out.width            = getU32LE(p + 4);
+        out.height           = getU32LE(p + 8);
+        out.refreshMhz       = getU32LE(p + 12);
+        out.scale            = getU32LE(p + 16);
+        out.transform        = getU32LE(p + 20);
+        out.physicalWidthMm  = getU32LE(p + 24);
+        out.physicalHeightMm = getU32LE(p + 28);
+        size_t off = 32;
+        std::string* fields[] = { &out.name, &out.make, &out.model, &out.edidId };
+        for (std::string* s : fields) {
+            if (off + 4 > len) return false;
+            const uint32_t slen = getU32LE(p + off);
+            off += 4;
+            if (off + slen > len) return false;
+            s->assign(reinterpret_cast<const char*>(p + off), slen);
+            off += slen;
+        }
+        return off == len;
+    }
+};
+
+// OutputRemovedPayload (gpu -> core; FrameKind::OutputRemoved):
+// just the outputId. Symmetric pair to OutputAdded.
+struct OutputRemovedPayload {
+    uint32_t outputId;
+    static constexpr size_t kSize = 4;
+    void encode(uint8_t* out) const { putU32LE(out, outputId); }
+    static OutputRemovedPayload decode(const uint8_t* p) {
+        return { getU32LE(p) };
+    }
+};
+static_assert(OutputRemovedPayload::kSize == 4,
+              "OutputRemovedPayload size mismatch with hand-counted layout");
 
 // ReleaseClientTexPayload (core -> gpu; FrameKind::ReleaseClientTex):
 // release a JS-compositor dmabuf import. FIFO-ordered with the

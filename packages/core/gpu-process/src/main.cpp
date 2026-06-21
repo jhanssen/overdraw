@@ -701,6 +701,36 @@ int run(int wireFd, int ctrlFd, int inputFd, bool headless,
         std::memcpy(m.outputModel,  info.model,  sizeof(m.outputModel));
         std::memcpy(m.outputEdidId, info.edidId, sizeof(m.outputEdidId));
     };
+
+    // Pack one output's identity into an OutputDescriptorPayload. Used by
+    // OutputAdded sends (runtime hotplug); the still-ctrl-bound startup
+    // OutputDescriptor / resize re-emit path uses fillOutputMsg above.
+    auto buildOutputDescPayload = [&](uint32_t outputId,
+                                       ipc::OutputDescriptorPayload& p) {
+        if (!kms) return;
+        gpu::OutputDescriptorInfo info{};
+        kms->describeOutputAt(outputId, info);
+        p.outputId         = outputId;
+        p.width            = info.width;
+        p.height           = info.height;
+        p.refreshMhz       = info.refreshMhz;
+        p.scale            = info.scale;
+        p.transform        = info.transform;
+        p.physicalWidthMm  = info.physicalWidthMm;
+        p.physicalHeightMm = info.physicalHeightMm;
+        // info.name/make/model/edidId are NUL-terminated; strnlen caps at
+        // the source buffer size (64). The payload's string carries the
+        // bytes without NUL.
+        const size_t kCap = 64;
+        p.name.assign(info.name,
+            ::strnlen(info.name, kCap));
+        p.make.assign(info.make,
+            ::strnlen(info.make, kCap));
+        p.model.assign(info.model,
+            ::strnlen(info.model, kCap));
+        p.edidId.assign(info.edidId,
+            ::strnlen(info.edidId, kCap));
+    };
 #endif
 
 #if OVERDRAW_KMS
@@ -2262,21 +2292,23 @@ int run(int wireFd, int ctrlFd, int inputFd, bool headless,
                             // releases CRTC-style state on removed before
                             // assigning to added).
                             for (uint32_t id : result.removed) {
-                                ipc::Message m{};
-                                m.tag = ipc::Tag::OutputRemoved;
-                                m.outputId = id;
-                                ctrlSender.send(m);
+                                ipc::OutputRemovedPayload p{ id };
+                                uint8_t buf[ipc::OutputRemovedPayload::kSize];
+                                p.encode(buf);
+                                serializer.appendFrame(
+                                    ipc::FrameKind::OutputRemoved, buf, sizeof(buf));
                                 std::printf("[gpu] sent OutputRemoved outputId=%u\n", id);
                             }
 
                             // Build the ring NOW for each newly-connected
                             // output, then emit OutputAdded. The core's
-                            // ScanoutReserve reply lands in dispatchCtrl,
-                            // which runs handleScanoutReserve to InjectTexture
-                            // the slots and send ScanoutReady. If the ring
-                            // build fails the entry is already removed from
-                            // outputs_ by initScanoutForOutput's fallback;
-                            // skip the OutputAdded for that id.
+                            // ScanoutReserve reply lands in
+                            // dispatchCoreControlFrame, which runs
+                            // handleScanoutReserve to InjectTexture the slots
+                            // and send ScanoutReady. If the ring build fails
+                            // the entry is already removed from outputs_ by
+                            // initScanoutForOutput's fallback; skip the
+                            // OutputAdded for that id.
                             for (uint32_t id : result.added) {
                                 if (!kms->initScanoutForOutput(id, coreDevice)) {
                                     std::fprintf(stderr,
@@ -2284,14 +2316,16 @@ int run(int wireFd, int ctrlFd, int inputFd, bool headless,
                                         id);
                                     continue;
                                 }
-                                ipc::Message m{};
-                                m.tag = ipc::Tag::OutputAdded;
-                                fillOutputMsg(id, m);
-                                ctrlSender.send(m);
+                                ipc::OutputDescriptorPayload p{};
+                                buildOutputDescPayload(id, p);
+                                std::vector<uint8_t> buf(p.encodedSize());
+                                p.encode(buf.data());
+                                serializer.appendFrame(
+                                    ipc::FrameKind::OutputAdded, buf.data(), buf.size());
                                 std::printf("[gpu] sent OutputAdded outputId=%u %ux%u @%u.%03uHz name=%s\n",
-                                            id, m.width, m.height,
-                                            m.refreshMhz / 1000, m.refreshMhz % 1000,
-                                            m.outputName);
+                                            id, p.width, p.height,
+                                            p.refreshMhz / 1000, p.refreshMhz % 1000,
+                                            p.name.c_str());
                             }
                             break;
                         }

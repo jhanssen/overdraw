@@ -220,22 +220,29 @@ fixed-size `ipc::Message` POD, `native/ipc/side_channel.h`) and **wire**
 (stream socket, Dawn batch + `FrameKind`-tagged variable-length frames,
 `native/ipc/transport.h`).
 
-**Wire is the default for ANY new GPU-process IPC.** Ctrl is reserved
-for three things:
+**Wire is the default for ANY new GPU-process IPC.** A new message
+may ride ctrl ONLY IF it satisfies BOTH:
 
-1. Pre-wire handshake (`Hello` / `HelloReply` configure the wire).
-2. Wire fd passing (`SetDrmFd`, `AddWireConn` carry the very fds wire
-   frames will travel on; sent before the destination wire exists).
-3. Out-of-band hard kill / lifecycle (`Shutdown`, `OutputPause` /
-   `OutputResume`).
+  (a) it falls under one of the three structural carve-outs:
+    1. Pre-wire handshake (`Hello` / `HelloReply` configure the wire),
+    2. Wire fd passing (`SetDrmFd`, `AddWireConn` carry the very fds
+       wire frames will travel on; sent before the destination wire
+       exists),
+    3. Out-of-band hard kill / lifecycle (`Shutdown`, `OutputPause` /
+       `OutputResume`); AND
+  (b) it has NO wire dependency on either side — nothing the recipient
+      processes for this message triggers a wire send that races
+      against in-flight wire frames, and the message itself doesn't
+      reference a resource that a concurrent wire frame might be
+      about to introduce.
 
-Everything else goes on wire. Adding a new ctrl tag without one of
-those reasons recreates the **cross-fd race** class that has already
-bitten this codebase twice (M7 step 4's `ScanoutReserve` / commit
-`447a905`; `ImportClientTex` moving to `kind=3`/`kind=4`). The race:
-two independent fds, no kernel-level ordering between them; a recipient
-draining wire before ctrl finds a wire frame that references a
-resource the ctrl message hadn't introduced yet, then aborts.
+Adding a new ctrl tag that fails (b) recreates the **cross-fd race**
+class that has already bitten this codebase twice (M7 step 4's
+`ScanoutReserve` / commit `447a905`; `ImportClientTex` moving to
+`kind=3`/`kind=4`). The race: two independent fds, no kernel-level
+ordering between them; a recipient draining wire before ctrl finds a
+wire frame that references a resource the ctrl message hadn't
+introduced yet, then aborts.
 
 The repo is mid-migration; a handful of older tags (output lifecycle,
 surface-buffer alloc/release, `ReleaseClientTex`) still live on ctrl

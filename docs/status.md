@@ -278,20 +278,25 @@ node-addon-api, to avoid exception/RTTI dependence under `-fno-rtti`).
   `kind=6`/`kind=7` ScanoutReserve + ScanoutReady, `kind=8` SwitchMode,
   `kind=9` ScanoutRebuild, `kind=10`/`kind=11` AllocSurfaceBuf /
   AllocComposeBuf, `kind=12` SurfaceBufAllocated reply, `kind=13`
-  ReleaseSurfaceBuf, `kind=14` ReleaseClientTex.
+  ReleaseSurfaceBuf, `kind=14` ReleaseClientTex, `kind=15` OutputAdded,
+  `kind=16` OutputRemoved.
 - **Control side channel (ctrl)** over a `SOCK_SEQPACKET` socket carrying
   fixed-size tagged POD messages (`native/ipc/side_channel.h`). Reserved
-  for boot handshake + hard-kill + wire-fd-passing only (see
-  `architecture.md` "Why wire, not ctrl"): `Hello`/`HelloReply`,
-  `SetDrmFd`, `AddWireConn`, `WireConnAdded`, `FeedbackData`,
-  `Shutdown`, `OutputPause`/`OutputResume`, plus a few remaining
-  pre-wire setup tags (`InstanceReserved`, `DeviceReady`,
-  `SurfaceReady`, `InjectPluginInstance`/`PluginInstanceInjected`,
-  `SetPluginTickDevice`) and runtime hotplug add/remove
-  (`OutputAdded`/`OutputRemoved`, `OutputDescriptor`,
-  `ScanoutPresent`/`ScanoutFlipComplete`/`FrameComplete`).
-  The output-lifecycle tags are next on the ctrl-removal list; not yet
-  moved because they aren't actively racing.
+  for boot handshake + hard-kill + wire-fd-passing (see
+  `architecture.md` "Why wire, not ctrl") plus a few tags that have no
+  wire dependency. The current ctrl tags:
+  - Pre-wire handshake / startup: `Hello`/`HelloReply`,
+    `InstanceReserved`, `DeviceReady`, `SurfaceReady`.
+  - Wire fd passing (SCM_RIGHTS sent before the destination wire
+    exists): `SetDrmFd`, `AddWireConn`/`WireConnAdded`,
+    `FeedbackData` (format-table memfd).
+  - Out-of-band lifecycle: `Shutdown`, `OutputPause`/`OutputResume`.
+  - Plugin instance setup: `InjectPluginInstance`/
+    `PluginInstanceInjected`, `SetPluginTickDevice`.
+  - Steady-state without a wire dependency: `OutputDescriptor` (the
+    re-emit notifies JS that state.outputs needs refresh; nothing
+    keys subsequent wire frames off it), `ScanoutPresent`,
+    `ScanoutFlipComplete`, `FrameComplete`.
 - **Input** over a dedicated `SOCK_SEQPACKET` socket (separate from
   control so unsolicited input never interleaves with request/reply
   traffic).

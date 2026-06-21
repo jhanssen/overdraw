@@ -166,6 +166,24 @@ enum class FrameKind : uint8_t {
                               // this handle (also on wire) have drained before
                               // the erase runs -- no wireSerial workaround
                               // needed, FIFO ordering covers it.
+    OutputAdded = 15,         // gpu -> core: a previously-disconnected
+                              // connector is now connected with a usable CRTC.
+                              // Payload: OutputDescriptorPayload (outputId +
+                              // width/height/refreshMhz/scale/transform/
+                              // physical dims + name/make/model/edidId).
+                              // Rides wire so the core's JS-side
+                              // reserveScanoutForOutput call -- which itself
+                              // sends a ScanoutReserve frame on the wire --
+                              // FIFO-orders with any other in-flight wire
+                              // activity for this outputId.
+    OutputRemoved = 16,       // gpu -> core: the connector at this outputId
+                              // vanished. Payload: just the outputId (4
+                              // bytes). Rides wire as the symmetric pair to
+                              // OutputAdded; FIFO with the GPU's still-in-
+                              // flight wire frames for this output (none
+                              // expected -- disconnectOutput tore down the
+                              // ring before the rescan emit -- but kept
+                              // consistent so the pair is uniform).
 };
 
 // Max fds attachable in one message (control msg OR in-band wire frame).
