@@ -244,9 +244,31 @@ class FdSerializer : public dawn::wire::CommandSerializer {
     // assuming kWireBufferAlignment=8; an unaligned start mis-reads u64 fields).
     // The batch buffer base is max_align_t-aligned and we only hand out the
     // current offset, which Dawn advances by 8-aligned sizes.
+    //
+    // Dawn's CommandSerializer contract (dawn/wire/Wire.h): nullptr is a FATAL
+    // error. When the batch is full we must drain it (frame the pending bytes
+    // into the outbound queue + try a non-blocking pumpOut) and serve the
+    // request from the now-empty batch. Dawn promises `size <= kMaxAllocation`
+    // and kMaxAllocation < kCapacity, so the post-flush retry always fits.
+    // The only nullptr path is a fatal socket error during the flush itself.
+    //
+    // Why this is load-bearing: Dawn's ChunkedCommandSerializer auto-splits a
+    // single large WriteTexture into 1 MiB-or-less chunks and calls
+    // SerializeCommand for each chunk inline. A 47 MiB upload (a 4600x2584
+    // BGRA8 client buffer) issues ~47 sequential 1 MiB GetCmdSpace calls; the
+    // 16 MiB batch fills after ~16 of them. Returning nullptr there silently
+    // drops every subsequent chunk (Dawn ignores nullptr returns from
+    // GetCmdSpace, per src/dawn/wire/ChunkedCommandSerializer.cpp).
     void* GetCmdSpace(size_t size) override {
+        if (pending_ + size > buf_.size()) {
+            // Drain the staged batch + opportunistic pumpOut. Flush() never
+            // blocks; out_ may grow if the kernel can't accept all bytes yet
+            // (its drain is driven by the owner's pumpOut on EPOLLOUT).
+            if (!Flush()) return nullptr;  // fatal socket error
+            // Flush sets pending_ = 0; retry the alloc.
+            if (size > buf_.size()) return nullptr;  // exceeds entire batch (shouldn't happen)
+        }
         size_t offset = pending_;
-        if (offset + size > buf_.size()) return nullptr;  // batch overflow
         pending_ = offset + size;
         return buf_.data() + offset;
     }

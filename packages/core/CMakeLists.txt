@@ -17,6 +17,7 @@ add_subdirectory(3rdparty/spdlog)
 
 find_package(Dawn REQUIRED)
 find_package(PkgConfig REQUIRED)
+find_package(Threads REQUIRED)
 pkg_check_modules(WAYLAND_CLIENT REQUIRED wayland-client)
 pkg_check_modules(WAYLAND_SERVER REQUIRED wayland-server)
 pkg_check_modules(GBM REQUIRED gbm)
@@ -311,6 +312,15 @@ target_link_libraries(ctrl-sender-test PRIVATE dawn::webgpu_dawn_wire)
 # drainAll. No Dawn dep; the include path is just the shared ipc/ dir.
 add_executable(wire-barrier-test test/wire-barrier-test.cpp)
 target_include_directories(wire-barrier-test PRIVATE ${IPC_INCLUDE})
+
+# ---- FdSerializer batch-overflow regression test ----
+# Drives many GetCmdSpace calls whose cumulative bytes exceed kCapacity
+# (16 MiB) and verifies the bytes round-trip through the socket. Catches the
+# silent-drop regression where GetCmdSpace returns nullptr on batch overflow
+# instead of flushing-and-retrying (Dawn's contract treats nullptr as fatal).
+add_executable(wire-serializer-overflow-test test/wire-serializer-overflow-test.cpp)
+target_include_directories(wire-serializer-overflow-test PRIVATE ${IPC_INCLUDE})
+target_link_libraries(wire-serializer-overflow-test PRIVATE dawn::webgpu_dawn_wire Threads::Threads)
 
 # ---- Logging native unit test (areas, --log-level parser, ipc sink/source) ----
 add_executable(log-test test/log-test.cpp)
