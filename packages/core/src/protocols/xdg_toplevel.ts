@@ -158,11 +158,19 @@ export default function makeToplevel(ctx: Ctx): XdgToplevelHandler {
       propose(resource, { presentation: "maximized" });
     },
     unset_maximized(resource) {
-      // Spec: "after this request, the compositor will respond by emitting
-      // a configure event without the maximized state." We go back to
-      // managed (the default tiled state). If the client also wanted
-      // floating, it must propose that separately.
-      propose(resource, { presentation: "managed" });
+      // Spec: "after this request, the compositor will respond by
+      // emitting a configure event without the maximized state."
+      // Revert only when the window IS currently maximized; for any
+      // other presentation this is a no-op. Without the guard,
+      // floating windows that send unset_maximized (defensively, in
+      // their drag-to-move path) get yanked into the managed/tiled
+      // stack and end up resized to the master-stack slot.
+      const id = surfaceIdOf(resource);
+      if (id === null) return;
+      const ws = ctx.state.wm?.getWindowState(id);
+      if (ws?.presentation === "maximized") {
+        propose(resource, { presentation: "managed" });
+      }
     },
     set_fullscreen(resource, _output) {
       // `_output` is optional: when present, the client requests fullscreen
@@ -172,7 +180,17 @@ export default function makeToplevel(ctx: Ctx): XdgToplevelHandler {
       propose(resource, { presentation: "fullscreen" });
     },
     unset_fullscreen(resource) {
-      propose(resource, { presentation: "managed" });
+      // Same no-op-when-not-currently-applied guard as unset_maximized:
+      // GTK4 sends unset_fullscreen prophylactically before
+      // xdg_toplevel.move on a window that was never fullscreen, and
+      // unconditional revert-to-managed would tile the (then-floating)
+      // dialog into the master-stack mid-drag.
+      const id = surfaceIdOf(resource);
+      if (id === null) return;
+      const ws = ctx.state.wm?.getWindowState(id);
+      if (ws?.presentation === "fullscreen") {
+        propose(resource, { presentation: "managed" });
+      }
     },
     set_minimized(resource) {
       propose(resource, { presentation: "minimized" });
