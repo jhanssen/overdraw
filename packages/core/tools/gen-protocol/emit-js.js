@@ -8,6 +8,8 @@
 // wl_argument array and calls wl_resource_post_event_array). Kept as a factory
 // so the generated module has no native dependency and is inspectable in tests.
 
+import { pascal, tsEnumKey } from './util.js';
+
 function argData(a) {
   // Mirror the XML arg, normalized. The trampoline reads this to marshal.
   return {
@@ -66,6 +68,16 @@ export function emitJs(iface) {
   lines.push(``);
   lines.push(`export const signature = ${JSON.stringify(signature, null, 2)};`);
   lines.push(``);
+  // Enum value objects, names matching the .d.ts consts (e.g. WlSurface_Error).
+  // The runtime backing for those declarations: handlers import these to pass
+  // typed error codes to postError / to compare enum args.
+  const R = pascal(iface.name);
+  for (const e of iface.enums) {
+    lines.push(`export const ${R}_${pascal(e.name)} = {`);
+    for (const entry of e.entries) lines.push(`  ${tsEnumKey(entry.name)}: ${entry.value},`);
+    lines.push(`};`);
+    lines.push(``);
+  }
   // Event-sender factory: one send_<event> per event, calling the injected post.
   lines.push(`// makeEvents(post) -> { send_<event>(resource, ...args) }`);
   lines.push(`// post(resource, opcode, args) is supplied by the trampoline.`);

@@ -9,16 +9,19 @@
 //   - set_source(x,y,w,h): the sampled region of the buffer (surface coords).
 // Destroying the wp_viewport clears both on the next commit.
 //
-// Protocol errors (viewport_exists, bad_value, no_surface) are silent-drop
-// per this compositor's convention (no wl_resource_post_error path).
+// Protocol errors: viewport_exists (get_viewport when the surface already has
+// one) and bad_value (negative/zero crop or destination) are posted as fatal
+// protocol errors. no_surface (set_* after the surface is destroyed) stays a
+// silent drop -- the surface-gone case is not cleanly distinguishable here from
+// an untracked viewport, and posting on the wrong cause would disconnect a
+// valid client.
 
-import { signature as vpSig } from "#protocols-gen/wp_viewport.js";
+import { WpViewport_Error } from "#protocols-gen/wp_viewport.js";
+import { WpViewporter_Error } from "#protocols-gen/wp_viewporter.js";
 import type { WpViewporterHandler } from "#protocols-gen/wp_viewporter.js";
 import type { WpViewportHandler } from "#protocols-gen/wp_viewport.js";
 
 import type { Ctx, SurfaceRecord } from "./ctx.js";
-
-void vpSig;
 
 function surfaceOf(ctx: Ctx, viewport: import("../types.js").Resource): SurfaceRecord | undefined {
   const surf = ctx.state.viewports?.get(viewport);
@@ -30,10 +33,14 @@ export default function makeViewporter(ctx: Ctx): WpViewporterHandler {
     destroy(_resource) {
       // Destructor. Existing wp_viewport objects survive (per spec).
     },
-    get_viewport(_manager, id, surface) {
+    get_viewport(manager, id, surface) {
       const s = ctx.state.surfaces.get(surface);
-      if (!s) return;            // no_surface
-      if (s.hasViewport) return; // viewport_exists (one per surface)
+      if (!s) return;
+      if (s.hasViewport) {
+        ctx.addon.postError(manager, WpViewporter_Error.viewport_exists,
+          "wl_surface already has a wp_viewport");
+        return;
+      }
       s.hasViewport = true;
       (ctx.state.viewports ??= new Map()).set(id, surface);
     },
@@ -61,7 +68,11 @@ export function makeViewport(ctx: Ctx): WpViewportHandler {
         s.pending.viewportSrc = null;  // unset
         return;
       }
-      if (x < 0 || y < 0 || width <= 0 || height <= 0) return; // bad_value
+      if (x < 0 || y < 0 || width <= 0 || height <= 0) {
+        ctx.addon.postError(resource, WpViewport_Error.bad_value,
+          "wp_viewport.set_source values must be non-negative (or all -1 to unset)");
+        return;
+      }
       s.pending.viewportSrc = { x, y, width, height };
     },
     set_destination(resource, width, height) {
@@ -71,7 +82,11 @@ export function makeViewport(ctx: Ctx): WpViewportHandler {
         s.pending.viewportDst = null;  // unset
         return;
       }
-      if (width <= 0 || height <= 0) return; // bad_value
+      if (width <= 0 || height <= 0) {
+        ctx.addon.postError(resource, WpViewport_Error.bad_value,
+          "wp_viewport.set_destination size must be positive (or -1,-1 to unset)");
+        return;
+      }
       s.pending.viewportDst = { width, height };
     },
   };

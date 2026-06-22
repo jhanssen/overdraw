@@ -16,6 +16,8 @@
 //   enum=...    -> the generated enum type for that arg
 //   allow-null  -> `| null`
 
+import { pascal, tsEnumKey } from './util.js';
+
 const SHARED_IMPORT = `import type { Resource, ResourceOf, WaylandFd } from './wayland-types.js';`;
 
 // Reserved words that appear as Wayland arg names; sanitize for TS params.
@@ -30,9 +32,6 @@ function safeParam(name) {
 }
 
 // wl_surface -> WlSurface
-function pascal(name) {
-  return name.split('_').map((s) => s.charAt(0).toUpperCase() + s.slice(1)).join('');
-}
 
 function resourceType(ifaceName) {
   return ifaceName ? `ResourceOf<'${ifaceName}'>` : 'Resource';
@@ -190,6 +189,3 @@ export function emitDts(iface) {
 }
 
 // Enum entry names may start with a digit (illegal as a bare key) -> quote.
-function tsEnumKey(name) {
-  return /^[A-Za-z_$][\w$]*$/.test(name) ? name : `'${name}'`;
-}

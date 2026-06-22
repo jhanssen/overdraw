@@ -11,18 +11,16 @@
 // that doesn't bind it continues to self-decorate (so an app_id with no
 // matching decoration plugin shows its CSD).
 //
-// Spec errors that this compositor silently drops (no post_error wired;
-// see status.md "Read first"):
-//   - already_constructed: a second get_toplevel_decoration on the same
-//     xdg_toplevel.
-//   - unconfigured_buffer: a buffer attached before the decoration's first
-//     configure. The xdg_toplevel itself owns first-configure-then-buffer
-//     ordering, so the practical effect here is that the decoration
-//     configure raced with the buffer attach.
-//   - orphaned: the xdg_toplevel was destroyed before the decoration.
-//   - invalid_mode: set_mode with an out-of-range enum value.
+// Spec error handling:
+//   - already_constructed (a second get_toplevel_decoration on the same
+//     xdg_toplevel) is posted as a fatal protocol error.
+//   - unconfigured_buffer / orphaned are commit-/lifetime-ordering errors the
+//     xdg_toplevel itself already orders (first-configure-then-buffer), so they
+//     don't arise on this path. set_mode takes a typed `mode` enum arg with no
+//     spec error for out-of-range values, so it stays a no-op.
 
 import { signature as decoSig } from "#protocols-gen/zxdg_toplevel_decoration_v1.js";
+import { ZxdgToplevelDecorationV1_Error } from "#protocols-gen/zxdg_toplevel_decoration_v1.js";
 import type { ZxdgDecorationManagerV1Handler } from "#protocols-gen/zxdg_decoration_manager_v1.js";
 import type { ZxdgToplevelDecorationV1Handler } from "#protocols-gen/zxdg_toplevel_decoration_v1.js";
 
@@ -46,9 +44,12 @@ export default function makeDecorationManager(ctx: Ctx): ZxdgDecorationManagerV1
       // Destructor: trampoline tears the resource down. Existing
       // decoration objects survive (per spec).
     },
-    get_toplevel_decoration(_resource, id, toplevel) {
-      // already_constructed: silent-drop convention.
-      if (decoratedToplevels.has(toplevel)) return;
+    get_toplevel_decoration(resource, id, toplevel) {
+      if (decoratedToplevels.has(toplevel)) {
+        ctx.addon.postError(resource, ZxdgToplevelDecorationV1_Error.already_constructed,
+          "xdg_toplevel already has a decoration object");
+        return;
+      }
       decoratedToplevels.add(toplevel);
       toplevelOfDecoration.set(id, toplevel);
       // Initial configure: send SERVER_SIDE up-front, before the client

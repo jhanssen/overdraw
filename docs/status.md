@@ -85,13 +85,24 @@ nothing, with no error. Worst-first.
   are unaffected. Mitigation: per-surface ring of textures (not built);
   damage helps for partial updates but not for full-frame video.
 
-- **No `wl_resource_post_error` mechanism.** Spec-defined protocol errors
-  (e.g. `zwlr_layer_surface_v1.invalid_size`, `wp_cursor_shape_v1.
-  invalid_shape`, cross-role surface assignment) are silently dropped
-  rather than disconnected. Compliant clients see no behavior change in
-  the successful path; non-compliant clients don't get the spec'd
-  disconnect. Each silent-drop site is commented with the error it would
-  otherwise post.
+- **`wl_resource_post_error` is wired; request-time errors post, some
+  commit-time ones still drop.** A native `addon.postError(resource, code,
+  message)` (`trampoline.cpp` → `wl_resource_post_error`) disconnects the
+  client with the spec'd error; handlers pass typed codes from the generated
+  `<Iface>_Error` consts. **Now posted:** `wl_surface.invalid_scale` /
+  `invalid_transform`, `wp_viewporter.viewport_exists`, `wp_viewport.bad_value`,
+  `wp_cursor_shape_device_v1.invalid_shape`, `wl_pointer.role` (set_cursor on a
+  roled surface), `zxdg_toplevel_decoration_v1.already_constructed`,
+  `wp_linux_drm_syncobj_manager_v1.surface_exists`. End-to-end test:
+  `test/post-error.test.js` + `wl-error-client`. **Still silent (deliberate,
+  each commented why):** commit-time errors that would need ctx threaded into
+  state-only apply functions (`zwlr_layer_surface_v1.invalid_size` /
+  `invalid_exclusive_edge`, layer-shell pre-configure buffer, syncobj
+  acquire/release point checks); cases that conflate a client violation with a
+  driver/teardown fallback (`invalid_timeline`, syncobj `no_surface`);
+  ambiguous ones (subsurface place_above/below bad sibling).
+  `zwlr_output_manager_v1` correctly uses its own `cancelled`/`failed` events,
+  not `post_error`.
 
 - **`ext_workspace_v1`: capability-gated requests are no-ops by design.**
   The compositor advertises only the `activate` and `remove`

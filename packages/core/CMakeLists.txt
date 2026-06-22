@@ -193,6 +193,12 @@ add_executable(wl-destructor-client test/wl-destructor-client.c)
 target_include_directories(wl-destructor-client PRIVATE ${WAYLAND_CLIENT_INCLUDE_DIRS})
 target_link_libraries(wl-destructor-client PRIVATE ${WAYLAND_CLIENT_LIBRARIES})
 
+# Protocol-error test client: validates wl_resource_post_error reaches the
+# client with the right error code + interface and disconnects it.
+add_executable(wl-error-client test/wl-error-client.c)
+target_include_directories(wl-error-client PRIVATE ${WAYLAND_CLIENT_INCLUDE_DIRS})
+target_link_libraries(wl-error-client PRIVATE ${WAYLAND_CLIENT_LIBRARIES})
+
 # ---- xdg-shell test client (toplevel-creation / configure handshake) ----
 add_executable(xdg-test-client
     test/xdg-test-client.c

@@ -19,8 +19,12 @@ const MODE_SERVER_SIDE = 2;
 
 function mockCtx() {
   const calls = [];
+  const errors = [];
   return {
-    addon: { clientId: () => 1 },
+    addon: {
+      clientId: () => 1,
+      postError: (resource, code, msg) => errors.push([code, msg]),
+    },
     state: {},
     events: {
       zxdg_toplevel_decoration_v1: {
@@ -30,6 +34,7 @@ function mockCtx() {
       },
     },
     _calls: calls,
+    _errors: errors,
   };
 }
 
@@ -46,7 +51,7 @@ test("get_toplevel_decoration sends an initial configure(server_side)", () => {
   assert.deepEqual(ctx._calls, [{ resource: deco, mode: MODE_SERVER_SIDE }]);
 });
 
-test("get_toplevel_decoration twice on the same toplevel: second is silent-dropped", () => {
+test("get_toplevel_decoration twice on the same toplevel: second posts already_constructed", () => {
   const ctx = mockCtx();
   const mgr = makeDecorationManager(ctx);
   const toplevel = mockResource("xdg_toplevel");
@@ -54,9 +59,10 @@ test("get_toplevel_decoration twice on the same toplevel: second is silent-dropp
   const deco2 = mockResource("deco2");
   mgr.get_toplevel_decoration(mockResource("mgr"), deco1, toplevel);
   mgr.get_toplevel_decoration(mockResource("mgr"), deco2, toplevel);
-  // Only deco1 got a configure; deco2 was dropped.
+  // Only deco1 got a configure; the second request posts already_constructed (1).
   assert.equal(ctx._calls.length, 1);
   assert.equal(ctx._calls[0].resource, deco1);
+  assert.deepEqual(ctx._errors.map((c) => c[0]), [1], "second posts already_constructed");
 });
 
 test("set_mode(client_side): compositor still replies server_side", () => {

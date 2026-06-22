@@ -9,6 +9,7 @@ import makeSurface from '../packages/core/dist/protocols/wl_surface.js';
 
 function makeCtx() {
   const scaleCalls = [];
+  const errorCalls = [];
   const surfaces = new Map();
   const ctx = {
     state: {
@@ -25,8 +26,9 @@ function makeCtx() {
       },
     },
     events: { wl_buffer: { send_release: () => {} } },
+    addon: { postError: (resource, code, msg) => errorCalls.push([code, msg]) },
   };
-  return { ctx, scaleCalls, surfaces };
+  return { ctx, scaleCalls, errorCalls, surfaces };
 }
 
 function addSurface(surfaces, resource, id) {
@@ -62,17 +64,22 @@ test('set_buffer_scale: double-buffered, applied + pushed to compositor on commi
   assert.deepEqual(scaleCalls, [[7, 2], [7, 2]]);
 });
 
-test('set_buffer_scale: invalid scales are silently dropped', () => {
-  const { ctx, surfaces } = makeCtx();
+test('set_buffer_scale: invalid scales post invalid_scale', () => {
+  const { ctx, errorCalls, surfaces } = makeCtx();
   const h = makeSurface(ctx);
   const resource = { id: 2 };
   const rec = addSurface(surfaces, resource, 8);
 
   for (const bad of [0, -1, 1.5, NaN]) {
+    errorCalls.length = 0;
     h.set_buffer_scale(resource, bad);
-    assert.equal(rec.pending.bufferScale, undefined, `scale ${bad} should be dropped`);
+    assert.equal(rec.pending.bufferScale, undefined, `scale ${bad} should not apply`);
+    // invalid_scale == 0.
+    assert.deepEqual(errorCalls.map((c) => c[0]), [0], `scale ${bad} posts invalid_scale`);
   }
-  // A valid one still takes.
+  // A valid one still takes and posts nothing.
+  errorCalls.length = 0;
   h.set_buffer_scale(resource, 3);
   assert.equal(rec.pending.bufferScale, 3);
+  assert.equal(errorCalls.length, 0);
 });

@@ -26,6 +26,8 @@
 
 import type { WpLinuxDrmSyncobjManagerV1Handler }
   from "#protocols-gen/wp_linux_drm_syncobj_manager_v1.js";
+import { WpLinuxDrmSyncobjManagerV1_Error }
+  from "#protocols-gen/wp_linux_drm_syncobj_manager_v1.js";
 import type { WpLinuxDrmSyncobjTimelineV1Handler }
   from "#protocols-gen/wp_linux_drm_syncobj_timeline_v1.js";
 import type { WpLinuxDrmSyncobjSurfaceV1Handler }
@@ -49,13 +51,14 @@ export default function makeSyncobjManager(ctx: Ctx): WpLinuxDrmSyncobjManagerV1
     destroy(_resource) {
       // Per spec: existing timeline / surface objects are unaffected.
     },
-    get_surface(_resource, id, surface) {
-      // Spec: surface_exists protocol error (value 0) if a syncobj-surface
-      // already exists for this wl_surface. This compositor has no
-      // wl_resource_post_error path (see status.md "no post_error"); silent-
-      // drop with the contract that compliant clients don't repeat the call.
+    get_surface(resource, id, surface) {
+      // surface_exists: a syncobj-surface already exists for this wl_surface.
       const existing = ctx.state.syncobjSurfaceBySurface?.get(surface);
-      if (existing) return;
+      if (existing) {
+        ctx.addon.postError(resource, WpLinuxDrmSyncobjManagerV1_Error.surface_exists,
+          "wl_surface already has a wp_linux_drm_syncobj_surface_v1");
+        return;
+      }
 
       (ctx.state.syncobjSurfaces ??= new Map()).set(id, surface);
       (ctx.state.syncobjSurfaceBySurface ??= new Map()).set(surface, id);

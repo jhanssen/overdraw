@@ -12,6 +12,7 @@
 import { signature as seatSig } from "#protocols-gen/wl_seat.js";
 import type { WlSeatHandler } from "#protocols-gen/wl_seat.js";
 import type { WlPointerHandler } from "#protocols-gen/wl_pointer.js";
+import { WlPointer_Error } from "#protocols-gen/wl_pointer.js";
 import type { WlKeyboardHandler } from "#protocols-gen/wl_keyboard.js";
 import type { Ctx, SeatFocus } from "./ctx.js";
 import { computeGrabRect } from "../input/grab-math.js";
@@ -924,9 +925,8 @@ export function makePointer(ctx: Ctx): WlPointerHandler {
       const sRec = ctx.state.surfaces.get(surface);
       if (sRec) {
         if (sRec.role && sRec.role !== "cursor") {
-          // Surface already has a different role. Per spec this is a
-          // protocol error; for now drop silently (no post_error path).
-          // TODO(role-errors): wire post_error wlr-style.
+          ctx.addon.postError(resource, WlPointer_Error.role,
+            `wl_pointer.set_cursor: surface already has the "${sRec.role}" role`);
           return;
         }
         sRec.role = "cursor";

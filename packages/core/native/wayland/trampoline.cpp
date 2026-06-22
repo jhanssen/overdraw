@@ -226,6 +226,22 @@ uint64_t Trampoline::clientIdOf(napi_value resourceHandle) {
     return reinterpret_cast<uint64_t>(wl_resource_get_client(resource));
 }
 
+bool Trampoline::postError(napi_value resourceHandle, uint32_t code, const std::string& message) {
+    napi_env env = env_;
+    napi_value ext;
+    if (napi_get_named_property(env, resourceHandle, "__resource", &ext) != napi_ok) return false;
+    void* ptr = nullptr;
+    if (napi_get_value_external(env, ext, &ptr) != napi_ok || !ptr) return false;
+    auto* resource = static_cast<wl_resource*>(ptr);
+    // The wl_resource may already be destroyed (client died) while JS holds the
+    // wrapper -- same use-after-free guard as postEvent. Posting an error to a
+    // dead client is a no-op.
+    if (wrappers_.find(resource) == wrappers_.end()) return true;
+    // "%s" so client/handler-supplied text is never interpreted as a format.
+    wl_resource_post_error(resource, code, "%s", message.c_str());
+    return true;
+}
+
 bool Trampoline::postEvent(napi_value resourceHandle, uint32_t opcode, napi_value argsArray,
                            napi_value* minted) {
     napi_env env = env_;

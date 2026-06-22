@@ -10,6 +10,7 @@
 // parent commit atomically applies the parent + all its synchronized descendants.
 
 import type { WlSurfaceHandler } from "#protocols-gen/wl_surface.js";
+import { WlSurface_Error } from "#protocols-gen/wl_surface.js";
 import type { Ctx, CompositorState, SurfaceRecord, SubsurfaceRecord } from "./ctx.js";
 import type { Resource } from "../types.js";
 import type { RegionRect } from "./region.js";
@@ -377,16 +378,23 @@ export default function makeSurface(ctx: Ctx): WlSurfaceHandler {
       // (wl_surface.invalid_transform, v6); silent-drop per convention. Values
       // are the wl_output.transform enum (0=normal,1=90,2=180,3=270, 4..7 the
       // mirrored variants).
-      if (!Number.isInteger(transform) || transform < 0 || transform > 7) return;
+      if (!Number.isInteger(transform) || transform < 0 || transform > 7) {
+        ctx.addon.postError(resource, WlSurface_Error.invalid_transform,
+          `wl_surface.set_buffer_transform: invalid transform ${transform}`);
+        return;
+      }
       s.pending.bufferTransform = transform;
     },
     set_buffer_scale(resource, scale) {
       const s = rec(resource);
       if (!s) return;
-      // Double-buffered; applied on commit. A non-positive or non-integer
-      // scale is a protocol error (wl_surface.invalid_scale, v6); silent-drop
-      // per this compositor's convention (no post_error path).
-      if (!Number.isInteger(scale) || scale < 1) return;
+      // Double-buffered; applied on commit. A non-positive scale is a protocol
+      // error (wl_surface.invalid_scale, since v6).
+      if (!Number.isInteger(scale) || scale < 1) {
+        ctx.addon.postError(resource, WlSurface_Error.invalid_scale,
+          `wl_surface.set_buffer_scale: scale must be positive, got ${scale}`);
+        return;
+      }
       s.pending.bufferScale = scale;
     },
     offset(_resource, _x, _y) {},

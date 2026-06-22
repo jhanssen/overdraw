@@ -79,6 +79,13 @@ class Trampoline {
     bool postEvent(napi_value resourceHandle, uint32_t opcode, napi_value argsArray,
                    napi_value* minted = nullptr);
 
+    // Post a fatal protocol error on a client resource (wl_resource_post_error):
+    // sends the error event and flags the client for disconnection after the
+    // current dispatch. `code` is the interface's error enum value; `message` is
+    // a human-readable diagnostic. Returns true (no-op) if the resource is
+    // already gone, false only on a malformed handle.
+    bool postError(napi_value resourceHandle, uint32_t code, const std::string& message);
+
     // Return a stable per-client id (the wl_client pointer as a uint64) for a
     // wrapped resource, or 0 on error. Lets JS associate resources created by
     // the same client (e.g. route input to the wl_pointer of the client owning

@@ -9,6 +9,7 @@ import makeViewporter, { makeViewport } from '../packages/core/dist/protocols/wp
 
 function makeCtx() {
   const vpCalls = [];
+  const errorCalls = [];
   const surfaces = new Map();
   const ctx = {
     state: {
@@ -27,8 +28,9 @@ function makeCtx() {
       },
     },
     events: { wl_buffer: { send_release: () => {} } },
+    addon: { postError: (resource, code, msg) => errorCalls.push([code, msg]) },
   };
-  return { ctx, vpCalls, surfaces };
+  return { ctx, vpCalls, errorCalls, surfaces };
 }
 
 function addSurface(surfaces, resource, id) {
@@ -38,7 +40,7 @@ function addSurface(surfaces, resource, id) {
 }
 
 test('get_viewport binds at most one viewport per surface', () => {
-  const { ctx, surfaces } = makeCtx();
+  const { ctx, errorCalls, surfaces } = makeCtx();
   const mgr = makeViewporter(ctx);
   const surf = { id: 1 };
   const rec = addSurface(surfaces, surf, 5);
@@ -46,10 +48,11 @@ test('get_viewport binds at most one viewport per surface', () => {
   mgr.get_viewport(null, vp, surf);
   assert.equal(rec.hasViewport, true);
   assert.equal(ctx.state.viewports.get(vp), surf);
-  // second viewport on the same surface is rejected (viewport_exists)
+  // second viewport on the same surface is rejected (viewport_exists, code 0)
   const vp2 = { id: 3 };
   mgr.get_viewport(null, vp2, surf);
   assert.equal(ctx.state.viewports.has(vp2), false);
+  assert.deepEqual(errorCalls.map((c) => c[0]), [0], 'second get_viewport posts viewport_exists');
 });
 
 test('set_destination: double-buffered, applied + pushed on commit', () => {
@@ -72,7 +75,7 @@ test('set_destination: double-buffered, applied + pushed on commit', () => {
 });
 
 test('set_source: validation + unset', () => {
-  const { ctx, surfaces } = makeCtx();
+  const { ctx, errorCalls, surfaces } = makeCtx();
   const mgr = makeViewporter(ctx);
   const vh = makeViewport(ctx);
   const surf = { id: 1 };
@@ -82,9 +85,11 @@ test('set_source: validation + unset', () => {
 
   vh.set_source(vp, 10, 20, 100, 50);
   assert.deepEqual(rec.pending.viewportSrc, { x: 10, y: 20, width: 100, height: 50 });
-  // non-positive size is bad_value -> dropped, previous value stays
+  // non-positive size is bad_value (code 0) -> posts error, previous value stays
+  errorCalls.length = 0;
   vh.set_source(vp, 0, 0, 0, 0);
   assert.deepEqual(rec.pending.viewportSrc, { x: 10, y: 20, width: 100, height: 50 });
+  assert.deepEqual(errorCalls.map((c) => c[0]), [0], 'invalid set_source posts bad_value');
   // all -1 -> unset
   vh.set_source(vp, -1, -1, -1, -1);
   assert.equal(rec.pending.viewportSrc, null);

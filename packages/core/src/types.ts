@@ -57,6 +57,11 @@ export interface Addon {
   // the wl_output the leave referenced.
   destroyGlobalForOutput(name: string, outputId: number): void;
   postEvent(resource: Resource, opcode: number, args: unknown[]): void;
+  // Post a fatal protocol error on a client resource (wl_resource_post_error):
+  // sends the error event and disconnects the client after the current
+  // dispatch. `code` is the offending interface's error-enum value (from the
+  // generated `<Iface>_Error` consts); `message` is a human-readable diagnostic.
+  postError(resource: Resource, code: number, message: string): void;
   // Server-initiated destruction: drop the libwayland resource + wrapper.
   // For client-issued destructor requests (wl_buffer.destroy etc.) the
   // trampoline handles destruction automatically; JS only needs this for

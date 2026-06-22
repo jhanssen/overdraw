@@ -9,6 +9,7 @@ import makeSurface from '../packages/core/dist/protocols/wl_surface.js';
 
 function makeCtx() {
   const calls = [];
+  const errorCalls = [];
   const surfaces = new Map();
   const ctx = {
     state: {
@@ -26,8 +27,9 @@ function makeCtx() {
       },
     },
     events: { wl_buffer: { send_release: () => {} } },
+    addon: { postError: (resource, code, msg) => errorCalls.push([code, msg]) },
   };
-  return { ctx, calls, surfaces };
+  return { ctx, calls, errorCalls, surfaces };
 }
 
 function addSurface(surfaces, resource, id) {
@@ -56,18 +58,23 @@ test('set_buffer_transform: double-buffered, applied + pushed on commit', () => 
   assert.deepEqual(calls, [[4, 3], [4, 3]]);
 });
 
-test('set_buffer_transform: out-of-range and non-integer dropped', () => {
-  const { ctx, surfaces } = makeCtx();
+test('set_buffer_transform: out-of-range and non-integer post invalid_transform', () => {
+  const { ctx, errorCalls, surfaces } = makeCtx();
   const h = makeSurface(ctx);
   const resource = { id: 2 };
   const rec = addSurface(surfaces, resource, 5);
 
   for (const bad of [-1, 8, 2.5, NaN]) {
+    errorCalls.length = 0;
     h.set_buffer_transform(resource, bad);
-    assert.equal(rec.pending.bufferTransform, undefined, `transform ${bad} dropped`);
+    assert.equal(rec.pending.bufferTransform, undefined, `transform ${bad} should not apply`);
+    // invalid_transform == 1.
+    assert.deepEqual(errorCalls.map((c) => c[0]), [1], `transform ${bad} posts invalid_transform`);
   }
   for (const ok of [0, 1, 7]) {
+    errorCalls.length = 0;
     h.set_buffer_transform(resource, ok);
     assert.equal(rec.pending.bufferTransform, ok);
+    assert.equal(errorCalls.length, 0);
   }
 });

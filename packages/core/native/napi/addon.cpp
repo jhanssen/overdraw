@@ -2097,6 +2097,24 @@ napi_value PostEvent(napi_env env, napi_callback_info info) {
     return undef;
 }
 
+// postError(resourceHandle, code, message) -> undefined
+// Post a fatal protocol error on a client resource; the client is disconnected
+// after the current dispatch.
+napi_value PostError(napi_env env, napi_callback_info info) {
+    size_t argc = 3; napi_value argv[3];
+    napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+    if (argc < 3) return throwError(env, "postError(resource, code, message) requires three args");
+    if (!g_addon.trampoline) return throwError(env, "no trampoline");
+    uint32_t code = 0; napi_get_value_uint32(env, argv[1], &code);
+    size_t len = 0; napi_get_value_string_utf8(env, argv[2], nullptr, 0, &len);
+    std::string msg(len, '\0');
+    napi_get_value_string_utf8(env, argv[2], msg.data(), len + 1, &len);
+    if (!g_addon.trampoline->postError(argv[0], code, msg))
+        return throwError(env, "postError failed");
+    napi_value undef; napi_get_undefined(env, &undef);
+    return undef;
+}
+
 // destroyResource(resource) -> undefined
 // Server-initiated destruction (e.g. wl_callback after its `done` event was
 // sent: the protocol says the callback IS the event and the resource has no
@@ -3000,6 +3018,7 @@ napi_value Init(napi_env env, napi_value exports) {
     reg("injectHostInput", InjectHostInput);
     reg("clientId", ClientId);
     reg("destroyResource", DestroyResource);
+    reg("postError", PostError);
     reg("keymapInfo", KeymapInfo);
     reg("keyUpdate", KeyUpdate);
     reg("switchVT", SwitchVT);

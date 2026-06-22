@@ -19,6 +19,7 @@ import type { Ctx } from "./ctx.js";
 import type { WpCursorShapeManagerV1Handler } from "#protocols-gen/wp_cursor_shape_manager_v1.js";
 import type { WpCursorShapeDeviceV1Handler } from "#protocols-gen/wp_cursor_shape_device_v1.js";
 import { signature as devSig } from "#protocols-gen/wp_cursor_shape_device_v1.js";
+import { WpCursorShapeDeviceV1_Error } from "#protocols-gen/wp_cursor_shape_device_v1.js";
 import type { Resource } from "../types.js";
 
 // shape enum -> XCursor theme name. Values come from the protocol XML
@@ -107,9 +108,8 @@ export function makeCursorShapeDevice(ctx: Ctx): WpCursorShapeDeviceV1Handler {
 
       const name = SHAPE_NAMES[shape];
       if (!name) {
-        // Out-of-range enum value: spec says raise invalid_shape error.
-        // We don't have post_error wired today; silent drop.
-        // TODO(role-errors): post_error invalid_shape.
+        ctx.addon.postError(resource, WpCursorShapeDeviceV1_Error.invalid_shape,
+          `wp_cursor_shape_device_v1.set_shape: invalid shape ${shape}`);
         return;
       }
 

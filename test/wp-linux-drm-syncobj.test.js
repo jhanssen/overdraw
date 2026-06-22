@@ -21,7 +21,7 @@ import makeSyncobjManager, {
 
 // Build a minimal Ctx with a stub addon recording syncobj calls.
 function makeCtx() {
-  const calls = { import: [], destroy: [] };
+  const calls = { import: [], destroy: [], error: [] };
   let nextHandle = 100;
   const addon = {
     syncobjImportTimeline(fd) {
@@ -29,6 +29,7 @@ function makeCtx() {
       return nextHandle++;
     },
     syncobjDestroy(handle) { calls.destroy.push(handle); },
+    postError(resource, code, msg) { calls.error.push([code, msg]); },
     // The remaining members are unused by the handlers under test.
   };
   const state = { surfaces: new Map() };
@@ -57,8 +58,8 @@ test('manager.get_surface marks the wl_surface as explicit-sync', () => {
   assert.equal(state.syncobjSurfaceBySurface.get(surfRes), syncobjSurfRes);
 });
 
-test('manager.get_surface twice on the same wl_surface silent-drops (surface_exists)', () => {
-  const { ctx, state } = makeCtx();
+test('manager.get_surface twice on the same wl_surface posts surface_exists', () => {
+  const { ctx, state, calls } = makeCtx();
   const mgr = makeSyncobjManager(ctx);
   const surfRes = { id: 1 };
   addSurface(state, surfRes, 10);
@@ -66,10 +67,11 @@ test('manager.get_surface twice on the same wl_surface silent-drops (surface_exi
   mgr.get_surface(null, first, surfRes);
   const second = { id: 3 };
   mgr.get_surface(null, second, surfRes);
-  // The second create is silently dropped: the reverse map still points at
-  // the FIRST syncobj-surface; the second was not recorded.
+  // The second create posts surface_exists (code 0) and is not recorded: the
+  // reverse map still points at the FIRST syncobj-surface.
   assert.equal(state.syncobjSurfaceBySurface.get(surfRes), first);
   assert.equal(state.syncobjSurfaces.has(second), false);
+  assert.deepEqual(calls.error.map((c) => c[0]), [0], 'posts surface_exists');
 });
 
 test('manager.import_timeline records the addon-returned handle', () => {
