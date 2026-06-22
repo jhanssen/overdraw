@@ -327,6 +327,28 @@ Xwayland or a Wayland session is absent. Coverage targets, smallest tier first:
 
 ## Open questions (resolve before the relevant slice)
 
+- **Never block the node thread on Xwayland's progress (a deadlock class).**
+  The SIGKILL reap (Phase 2) is one instance of a general hazard: the node
+  thread *is* the single-threaded Wayland server, so any blocking native call
+  that waits on something Xwayland can only do by making Wayland progress will
+  deadlock. This directly threatens **Phase 3's synchronous xcb property reads**
+  (`xcb_get_property_reply`, `xcb_get_geometry_reply`): the X reply itself is
+  pure X protocol, but if Xwayland is simultaneously blocked writing to a *full*
+  Wayland socket (unread because we're blocked in the xcb reply) and so cannot
+  send our X reply, both wedge. Atom interning at startup is safe (quiet period,
+  empty buffers); per-window reads under live load are the risk. Phase 3 should
+  prefer pipelined/async property reads, or accept a low-probability synchronous
+  -read deadlock and say so. (Slice 3.)
+- **`WL_SURFACE_SERIAL` delivery mechanism is unverified.** The per-window
+  `FOCUS|PROPERTY` mask selected at CreateNotify is present (Phase 3 needs it for
+  PropertyNotify/FocusIn anyway) and association works, but it was NOT isolated
+  whether that mask *delivers* the client-message or whether it arrives via the
+  root's `SUBSTRUCTURE_REDIRECT` regardless. Cheap to confirm (drop the mask,
+  see if the serial still arrives). Related robustness gap: a serial sent before
+  we select events on a freshly-created window would be *dropped* -> a silently
+  invisible X window. X per-connection ordering (CreateNotify before the
+  message) should prevent this, but rapid create/map/destroy is untested; the
+  bidirectional pending-match handles a *late* serial, not a *missing* one.
 - **X-window resize readiness.** The WM resize transaction's serial gate is
   meaningless for X. Decide: gate `xwayland` resizes on `surfaceReadyAt`
   (buffer dims) only, accepting a possible one-frame imperfection, or add a
@@ -370,12 +392,14 @@ Xwayland or a Wayland session is absent. Coverage targets, smallest tier first:
   → napi), and `src/xwayland/xwm.ts` (serial join via the registry, allow maps,
   add mapped+associated toplevels to the WM). `test/xwayland-xwm.gpu.mjs` drives
   a real X11 client (`x11-test-client`) and confirms its window associates and
-  enters the WM. Two findings, both fixed: the `WL_SURFACE_SERIAL` client-message
-  needs the per-window `FOCUS|PROPERTY` event mask selected at CreateNotify to
-  reach the WM; and Xwayland must be reaped with **SIGKILL**, not SIGTERM -- a
-  synchronous SIGTERM reap deadlocks against Xwayland's Wayland-dependent clean
-  shutdown on the single-threaded loop. Geometry/properties/focus/override-
-  redirect are Phase 3.
+  enters the WM. Two findings: association works with the per-window
+  `FOCUS|PROPERTY` mask selected at CreateNotify (whether that mask is the
+  delivery path or the message arrives via root substructure-redirect is
+  unverified -- see Open questions); and Xwayland must be reaped with
+  **SIGKILL**, not SIGTERM -- a synchronous SIGTERM reap deadlocks against
+  Xwayland's Wayland-dependent clean shutdown on the single-threaded loop (the
+  visible tip of the "never block the node thread" hazard -- see Open
+  questions). Geometry/properties/focus/override-redirect are Phase 3.
 - **Phase 3 — window-management semantics.** Configure round-trip + router,
   properties → state, override-redirect overlays, stacking, close, focus.
 - **Phase 4 — clipboard.** `CLIPBOARD` + `PRIMARY`, including INCR.
