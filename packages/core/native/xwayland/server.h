@@ -20,6 +20,8 @@ namespace overdraw::xwayland {
 struct XwaylandSpawn {
     pid_t pid = -1;
     int displayReadFd = -1;  // read end of the -displayfd pipe (non-blocking)
+    int wmFd = -1;           // our end of the -wm socketpair (xcb connects here),
+                             // or -1 when enableWm is false
 };
 
 struct XwaylandOptions {
@@ -28,6 +30,9 @@ struct XwaylandOptions {
     // -terminate: Xwayland exits when its last X client disconnects. Off by
     // default so a freshly-spawned server (no clients yet) stays up.
     bool terminate = false;
+    // -wm: pass an X11 window-manager socket so the XWM (xcb) can manage
+    // windows. Off by default (the Phase 1 lifecycle path needs no WM).
+    bool enableWm = false;
 };
 
 // Fork/exec rootless Xwayland. Returns the pid and the read end of the

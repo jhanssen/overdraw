@@ -32,14 +32,14 @@ export default function makeXwaylandShell(ctx: Ctx): XwaylandShellV1Handler {
         return;
       }
       s.role = "xwayland";
-      bindSurface(ctx, id, s.id);
+      bindSurface(ctx.state, id, s.id);
     },
   };
 }
 
 export function makeXwaylandSurface(ctx: Ctx): XwaylandSurfaceV1Handler {
   return {
-    destroy(resource) { unbindSurface(ctx, resource); },
+    destroy(resource) { unbindSurface(ctx.state, resource); },
     set_serial(resource, serial_lo, serial_hi) {
       // Reassemble the 64-bit serial (lo = low 32 bits, hi = high 32 bits),
       // each half treated as unsigned.
@@ -49,7 +49,7 @@ export function makeXwaylandSurface(ctx: Ctx): XwaylandSurfaceV1Handler {
           "xwayland_surface_v1.set_serial: serial must be non-zero");
         return;
       }
-      if (setSerial(ctx, resource, serial) === "already") {
+      if (setSerial(ctx.state, resource, serial) === "already") {
         ctx.addon.postError(resource, XwaylandSurfaceV1_Error.already_associated,
           "xwayland_surface_v1.set_serial: wl_surface already associated");
       }

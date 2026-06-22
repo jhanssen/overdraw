@@ -8,7 +8,7 @@
 // wl_surface id so the window can enter the WM. The two halves may arrive in
 // either order; the registry simply holds whichever side is known.
 
-import type { Ctx } from "../protocols/ctx.js";
+import type { CompositorState } from "../protocols/ctx.js";
 import type { Resource } from "../types.js";
 
 export interface XwaylandSurfaceBinding {
@@ -20,15 +20,19 @@ export interface XwaylandSurfaceBinding {
 export interface XwaylandSurfaceState {
   byResource: Map<Resource, XwaylandSurfaceBinding>;
   bySerial: Map<bigint, number>;   // serial -> wl_surface id (the XWM's join)
+  // Fired (if set) when a serial registers, so the XWM can complete an X window
+  // that announced its WL_SURFACE_SERIAL before the wayland side caught up. The
+  // two halves race on independent fds; whichever lands second drives the join.
+  onSerialRegistered?: (serial: bigint, surfaceId: number) => void;
 }
 
-export function ensureXwaylandState(ctx: Ctx): XwaylandSurfaceState {
-  return (ctx.state.xwayland ??= { byResource: new Map(), bySerial: new Map() });
+export function ensureXwaylandState(state: CompositorState): XwaylandSurfaceState {
+  return (state.xwayland ??= { byResource: new Map(), bySerial: new Map() });
 }
 
 // Bind a freshly-created xwayland_surface_v1 to its wl_surface.
-export function bindSurface(ctx: Ctx, resource: Resource, surfaceId: number): void {
-  ensureXwaylandState(ctx).byResource.set(resource, { resource, surfaceId, serial: null });
+export function bindSurface(state: CompositorState, resource: Resource, surfaceId: number): void {
+  ensureXwaylandState(state).byResource.set(resource, { resource, surfaceId, serial: null });
 }
 
 export type SetSerialResult = "ok" | "already" | "unknown";
@@ -41,24 +45,25 @@ export type SetSerialResult = "ok" | "already" | "unknown";
 // wl_surface's next commit). We register on set_serial directly; the serial is
 // globally unique either way, so the XWM join is unaffected by the timing.
 // Commit-gated application is a future refinement.
-export function setSerial(ctx: Ctx, resource: Resource, serial: bigint): SetSerialResult {
-  const st = ensureXwaylandState(ctx);
+export function setSerial(state: CompositorState, resource: Resource, serial: bigint): SetSerialResult {
+  const st = ensureXwaylandState(state);
   const b = st.byResource.get(resource);
   if (!b) return "unknown";
   if (b.serial !== null) return "already";
   b.serial = serial;
   st.bySerial.set(serial, b.surfaceId);
+  st.onSerialRegistered?.(serial, b.surfaceId);
   return "ok";
 }
 
 // Resolve a serial to its wl_surface id; null if not (yet) known. The point the
 // native XWM calls when an X11 window announces its WL_SURFACE_SERIAL.
-export function lookupBySerial(ctx: Ctx, serial: bigint): number | null {
-  return ctx.state.xwayland?.bySerial.get(serial) ?? null;
+export function lookupBySerial(state: CompositorState, serial: bigint): number | null {
+  return state.xwayland?.bySerial.get(serial) ?? null;
 }
 
 // Drop the xwayland_surface_v1 binding on destroy. Per spec, existing
 // associations are unaffected, so the serial -> surface mapping persists.
-export function unbindSurface(ctx: Ctx, resource: Resource): void {
-  ctx.state.xwayland?.byResource.delete(resource);
+export function unbindSurface(state: CompositorState, resource: Resource): void {
+  state.xwayland?.byResource.delete(resource);
 }

@@ -362,11 +362,20 @@ Xwayland or a Wayland session is absent. Coverage targets, smallest tier first:
   (async `uv_poll` readiness + reap), `overdraw_xwayland` CMake lib,
   `src/xwayland/index.ts` orchestrator. `test/xwayland-server.gpu.mjs` confirms
   Xwayland initializes against overdraw and brings up an X display. No XWM yet.
-- **Phase 2 — `xwayland_shell_v1` + minimal XWM + association.** Generate the
-  protocol; add the shell handler + `XwaylandSurfaceRecord` + serial registry;
-  native XWM connects xcb, root event mask + composite redirect, intern atoms,
-  handle create/map/unmap/destroy/configure-request, report associations. Mapped
-  surfaces become WM windows.
+- **Phase 2 — `xwayland_shell_v1` + minimal XWM + association.** ✅ Landed.
+  2a (Wayland side): the protocol + handler + serial registry. 2b (native XWM):
+  the `-wm` socketpair through the spawn, `native/xwayland/xwm.cpp` (xcb connect,
+  root event mask + composite redirect, atom intern, decode create/map/unmap/
+  destroy/configure-request + the `WL_SURFACE_SERIAL` client-message → `uv_poll`
+  → napi), and `src/xwayland/xwm.ts` (serial join via the registry, allow maps,
+  add mapped+associated toplevels to the WM). `test/xwayland-xwm.gpu.mjs` drives
+  a real X11 client (`x11-test-client`) and confirms its window associates and
+  enters the WM. Two findings, both fixed: the `WL_SURFACE_SERIAL` client-message
+  needs the per-window `FOCUS|PROPERTY` event mask selected at CreateNotify to
+  reach the WM; and Xwayland must be reaped with **SIGKILL**, not SIGTERM -- a
+  synchronous SIGTERM reap deadlocks against Xwayland's Wayland-dependent clean
+  shutdown on the single-threaded loop. Geometry/properties/focus/override-
+  redirect are Phase 3.
 - **Phase 3 — window-management semantics.** Configure round-trip + router,
   properties → state, override-redirect overlays, stacking, close, focus.
 - **Phase 4 — clipboard.** `CLIPBOARD` + `PRIMARY`, including INCR.

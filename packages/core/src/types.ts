@@ -76,10 +76,19 @@ export interface Addon {
       waylandDisplay: string;   // our wl socket name -> child's WAYLAND_DISPLAY
       xwaylandPath?: string;    // default "Xwayland" on PATH
       terminate?: boolean;      // -terminate (default false)
+      enableWm?: boolean;       // pass -wm so the XWM can manage windows (default false)
     },
     onReady: (err: string | null, info?: { displayNumber: number; display: string }) => void,
-  ): { pid: number };
+  ): { pid: number; wmFd: number };  // wmFd is -1 unless enableWm was set
   xwaylandStop(pid: number): void;
+
+  // XWM (X11 window manager over the -wm socket). xwmStart connects xcb to the
+  // wmFd from xwaylandStart, becomes the WM, and polls the xcb fd on the libuv
+  // loop; each decoded X event is delivered to onEvent. One XWM at a time.
+  xwmStart(wmFd: number, onEvent: (ev: import("./xwayland/xwm.js").XwmEventMsg) => void): void;
+  xwmStop(): void;
+  xwmMapWindow(window: number): void;
+  xwmConfigureWindow(window: number, x: number, y: number, w: number, h: number): void;
   // Server-initiated destruction: drop the libwayland resource + wrapper.
   // For client-issued destructor requests (wl_buffer.destroy etc.) the
   // trampoline handles destruction automatically; JS only needs this for

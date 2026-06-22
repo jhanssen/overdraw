@@ -3881,12 +3881,15 @@ capabilities exist to grant).
   plane, hotplug, scanout from a GPU other than the laptop's iGPU,
   DRM lease, content protection, mode changes (`SetOutputMode` not wired).
   See drm-design.md "Out (deferred)".
-- **XWayland.** Phase 1 (server lifecycle) landed: rootless Xwayland is
-  fork/exec'd against the compositor and reports ready (async `uv_poll` on
-  `-displayfd`); it initializes cleanly against overdraw's Wayland server
-  (`test/xwayland-server.gpu.mjs`). No XWM / surface association /
-  `xwayland_shell_v1` yet (Phases 2+). See `docs/xwayland-design.md`. Session
-  supervisor untouched.
+- **XWayland.** Phases 1-2 landed. Rootless Xwayland is fork/exec'd against the
+  compositor and reports ready (async `uv_poll` on `-displayfd`). The
+  `xwayland_shell_v1` global + serial registry and a minimal native XWM
+  (`native/xwayland/xwm.cpp`: xcb, composite redirect, event decode →
+  `src/xwayland/xwm.ts`) associate an X11 window with its wl_surface (via
+  `WL_SURFACE_SERIAL`) and add it to the WM -- verified end-to-end
+  (`test/xwayland-xwm.gpu.mjs`). Geometry round-trip, properties, focus,
+  override-redirect, clipboard are Phase 3+. See `docs/xwayland-design.md`.
+  Session supervisor untouched.
 - **Live reload.** Not built.
 
 ## Spikes

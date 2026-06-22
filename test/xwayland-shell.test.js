@@ -56,8 +56,8 @@ test("set_serial registers a serial -> wl_surface lookup", () => {
   shell.get_xwayland_surface({ id: 9 }, xs, wlSurface);
   surf.set_serial(xs, 0xdeadbeef, 0x1234);  // lo, hi
   const serial = (0x1234n << 32n) | 0xdeadbeefn;
-  assert.equal(lookupBySerial(ctx, serial), 42);
-  assert.equal(lookupBySerial(ctx, 999n), null, "unknown serial -> null");
+  assert.equal(lookupBySerial(ctx.state, serial), 42);
+  assert.equal(lookupBySerial(ctx.state, 999n), null, "unknown serial -> null");
   assert.equal(errorCalls.length, 0);
 });
 

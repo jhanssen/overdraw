@@ -23,6 +23,10 @@ pkg_check_modules(WAYLAND_SERVER REQUIRED wayland-server)
 pkg_check_modules(GBM REQUIRED gbm)
 pkg_check_modules(LIBDRM REQUIRED libdrm)
 pkg_check_modules(XKBCOMMON REQUIRED xkbcommon)
+# Xwayland XWM (xcb). composite: redirect root subwindows so toplevels present
+# as wl_surfaces.
+pkg_check_modules(XCB REQUIRED xcb)
+pkg_check_modules(XCB_COMPOSITE REQUIRED xcb-composite)
 
 # Phase-2 (DRM/KMS/libinput) deps. ON by default on Linux; the build still
 # produces a working phase-1 nested compositor when OFF (no behavior change).
@@ -161,10 +165,14 @@ target_link_libraries(overdraw_plugin_native PRIVATE
     overdraw_wire dawn::webgpu_dawn_wire pthread dl rt)
 
 # ---- Xwayland support (X11/xcb isolated from the Wayland + core targets) ----
-# Phase 1 is the server lifecycle only (fork/exec + reap); no xcb yet. The XWM
-# (xwm.cpp + xcb deps) joins this target in Phase 2.
-add_library(overdraw_xwayland STATIC native/xwayland/server.cpp)
-target_include_directories(overdraw_xwayland PUBLIC ${NATIVE_INCLUDE})
+# server.cpp: spawn/reap (no xcb). xwm.cpp: the X11 window manager over xcb.
+add_library(overdraw_xwayland STATIC
+    native/xwayland/server.cpp
+    native/xwayland/xwm.cpp)
+target_include_directories(overdraw_xwayland PUBLIC
+    ${NATIVE_INCLUDE} ${XCB_INCLUDE_DIRS} ${XCB_COMPOSITE_INCLUDE_DIRS})
+target_link_libraries(overdraw_xwayland PUBLIC
+    ${XCB_LIBRARIES} ${XCB_COMPOSITE_LIBRARIES})
 set_target_properties(overdraw_xwayland PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
 # ---- Core N-API addon (Node-hosted core) ----
@@ -206,6 +214,12 @@ target_link_libraries(wl-destructor-client PRIVATE ${WAYLAND_CLIENT_LIBRARIES})
 add_executable(wl-error-client test/wl-error-client.c)
 target_include_directories(wl-error-client PRIVATE ${WAYLAND_CLIENT_INCLUDE_DIRS})
 target_link_libraries(wl-error-client PRIVATE ${WAYLAND_CLIENT_LIBRARIES})
+
+# X11 test client (xcb): creates + maps a window so the XWM test can observe an
+# X11 window associate and enter the WM.
+add_executable(x11-test-client test/x11-test-client.c)
+target_include_directories(x11-test-client PRIVATE ${XCB_INCLUDE_DIRS})
+target_link_libraries(x11-test-client PRIVATE ${XCB_LIBRARIES})
 
 # ---- xdg-shell test client (toplevel-creation / configure handshake) ----
 add_executable(xdg-test-client

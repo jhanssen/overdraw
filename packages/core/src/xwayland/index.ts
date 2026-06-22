@@ -13,6 +13,7 @@ export interface XwaylandHandle {
   pid: number;
   display: string;       // ":N" -- export as DISPLAY for X clients
   displayNumber: number;
+  wmFd: number;          // the XWM's xcb fd (-1 unless enableWm); pass to startXwm
 }
 
 export interface XwaylandConfig {
@@ -21,6 +22,7 @@ export interface XwaylandConfig {
   waylandDisplay: string;
   xwaylandPath?: string;
   terminate?: boolean;
+  enableWm?: boolean;    // pass -wm so the XWM (startXwm) can manage windows
 }
 
 // Start Xwayland and resolve once it reports its X display. Rejects if the
@@ -29,18 +31,19 @@ export interface XwaylandConfig {
 export function startXwayland(addon: Addon, config: XwaylandConfig): Promise<XwaylandHandle> {
   return new Promise<XwaylandHandle>((resolve, reject) => {
     try {
-      const { pid } = addon.xwaylandStart(
+      const { pid, wmFd } = addon.xwaylandStart(
         {
           waylandDisplay: config.waylandDisplay,
           ...(config.xwaylandPath !== undefined ? { xwaylandPath: config.xwaylandPath } : {}),
           ...(config.terminate !== undefined ? { terminate: config.terminate } : {}),
+          ...(config.enableWm !== undefined ? { enableWm: config.enableWm } : {}),
         },
         (err, infoArg) => {
           if (err || !infoArg) {
             reject(new Error(`Xwayland failed to start: ${err ?? "unknown"}`));
             return;
           }
-          resolve({ pid, display: infoArg.display, displayNumber: infoArg.displayNumber });
+          resolve({ pid, wmFd, display: infoArg.display, displayNumber: infoArg.displayNumber });
         },
       );
     } catch (e) {
