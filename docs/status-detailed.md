@@ -3881,7 +3881,9 @@ capabilities exist to grant).
   plane, hotplug, scanout from a GPU other than the laptop's iGPU,
   DRM lease, content protection, mode changes (`SetOutputMode` not wired).
   See drm-design.md "Out (deferred)".
-- **Phase 3 (XWayland, session supervisor).** Untouched.
+- **XWayland.** Not built; design complete. See `docs/xwayland-design.md`
+  (rootless Xwayland, `xwayland_shell_v1` serial association, native
+  policy-free xcb binding + TS XWM policy). Session supervisor untouched.
 - **Live reload.** Not built.
 
 ## Spikes

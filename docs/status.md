@@ -43,9 +43,13 @@ nothing, with no error. Worst-first.
   `set_parent` stored but does not drive stacking or modal behavior;
   reserved-zone exclusion applies to maximized/tiled but not floating.
 
-- **`wl_region` is a no-op stub.** `add`/`subtract` do nothing; opaque/
-  input regions are not tracked (hit-testing uses whole-window rects).
-  Low urgency.
+- **`wl_region` is implemented; only the opaque region is unconsumed.**
+  `add`/`subtract` build a real disjoint rect list (`region.ts`) snapshotted
+  at commit per copy-semantics. **Input** regions ARE consumed: hit-testing
+  calls `Region.contains` (`surface-hit-test.ts` `inputRegionAccepts`, gated
+  in both the subsurface walk and the root). The remaining gap is the
+  **opaque** region (a render optimization hint) -- stored but not used to
+  skip occluded draws. Low urgency.
 
 - **`wl_surface.damage` / `damage_buffer` upload damage is implemented for
   shm; residual gaps are narrow.** Damage rects are accumulated (double-
@@ -442,7 +446,8 @@ type-check under `tsc --strict`.
   `wp_linux_drm_syncobj_v1` (NVIDIA proprietary clients),
   `wp_viewporter`/`wp_viewport`, `wp_fractional_scale_manager_v1`/
   `wp_fractional_scale_v1`, `wp_cursor_shape_v1`.
-- **Implemented, not behaviorally tested:** `wl_region` (no-op stub);
+- **Implemented, input-region path exercised via hit-testing:** `wl_region`
+  (opaque region stored but unconsumed -- see "Read first");
   `zwp_linux_dmabuf_feedback_v1` (exercised by real WSI clients).
 
 ## Plugins
@@ -624,7 +629,9 @@ validated + resolved + consumed by the runtime + hotkey plugin.
   `/tmp/overdraw-gpu-crash.txt`, core to
   `/tmp/overdraw-core-crash.txt`).
 - **Linear compositing.** Alpha blending happens in sRGB space.
-- **Phase 3 (XWayland, session supervisor).** Untouched.
+- **XWayland.** Not built; design complete. See `docs/xwayland-design.md`
+  (rootless Xwayland, `xwayland_shell_v1` serial association, native
+  policy-free xcb binding + TS XWM policy). Session supervisor untouched.
 - **Live reload.** Not built.
 
 ## Spikes

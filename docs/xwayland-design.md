@@ -1,0 +1,372 @@
+# overdraw — XWayland design
+
+Scoping/implementation plan for running X11 clients under overdraw via a
+**rootless** Xwayland. **No code yet** — this is the plan. Design rationale
+lives here; ground-truth status stays in `docs/status.md`. When work lands,
+fold residual gaps into status.md's "Read first" section and trim this doc to
+what is still future.
+
+The governing constraint, set by the codebase: **xcb/X11 code and Wayland code
+never share a file.** The Wayland server, trampoline, and protocol handlers are
+already large; X11 is a second, unrelated wire protocol. The two meet only at
+narrow, typed seams (the configure-sink router, the focus driver, the
+data-device), never inside one another's source files.
+
+## Scope
+
+**In scope (v1):**
+
+- Rootless Xwayland launched + supervised as a child (like the GPU process).
+- Surface association via `xwayland_shell_v1` + `WL_SURFACE_SERIAL` **only**.
+- Window-management bridge: create/map/unmap/destroy, the configure
+  round-trip, ICCCM/EWMH property → window state, override-redirect
+  (menus/tooltips) as unmanaged overlays, stacking, close, and keyboard focus
+  wired through the existing focus driver.
+- Accelerated X11 clients render through the **existing dmabuf import path**
+  (Xwayland is itself a Wayland client using `zwp_linux_dmabuf_v1`); no new GPU
+  work.
+
+**Later phases (designed here, built after v1):**
+
+- Clipboard bridge (`CLIPBOARD` + `PRIMARY` ↔ `wl_data_device` / primary
+  selection), including INCR.
+- Drag-and-drop bridge (Xdnd ↔ `wl_data_device`).
+
+**Out of scope:**
+
+- **Legacy `WL_SURFACE_ID` association.** Advertising `xwayland_shell_v1` makes
+  any Xwayland ≥ 23.1 use the serial path *exclusively* — it never emits
+  `WL_SURFACE_ID`. The legacy path is also the racy one (a reused 32-bit wl
+  object id crossing the X socket against the wl socket) and resolving it would
+  force `wl_client_get_object` — i.e. xcb and Wayland in one file, the thing we
+  are avoiding. We pin a **≥ 23.1 minimum** (the host has 24.1.10) and emit one
+  loud error if a `WL_SURFACE_ID` message ever arrives, rather than silently
+  dropping the window.
+- Rootful Xwayland; X RANDR / multi-monitor *inside* X (overdraw owns outputs).
+- Per-window HiDPI scale (X has no such concept — see "HiDPI").
+- `xwayland-keyboard-grab` (games); window icons polish; `xcb-res` PID
+  attribution. All deferrable, isolated additions.
+
+## Decision summary
+
+- **Native = policy-free xcb binding; TS = all XWM policy.** The native module
+  owns only the X11 *wire*: the xcb connection, atom interning, request
+  wrappers, and event decode → structured JS. Every convention (ICCCM size
+  hints, EWMH state/type, focus model, `_NET_SUPPORTED`, stacking) is parsed
+  and decided in TypeScript, next to the rest of the WM policy. This is the
+  same native-mechanism / TS-policy seam the whole project uses, and is the
+  split already proven in `~/dev/owm` (a TS X11 WM over a thin xcb binding) —
+  minus that project's cairo/pango drawing, reparenting, RANDR, and input
+  grabs, none of which a rootless XWM needs.
+- **Parse property bytes in TS, not native.** `get_property` returns raw
+  `{type, format, data}`; TS interprets it. Keeps native policy-free and avoids
+  linking `xcb-icccm`/`xcb-ewmh` (the latter is not even installed here).
+- **Single libuv loop, no extra thread.** xcb integrates exactly like the
+  Wayland server and input sockets already do: `uv_poll` on
+  `xcb_get_file_descriptor`, drain `xcb_poll_for_event` in the callback,
+  `uv_async` to flush. No threadsafe-function marshaling.
+- **XWM lives in the core process**, not a third process: it shares the libuv
+  loop and the focus/selection state, and (for any future client-identity need)
+  sits next to the Wayland server.
+- **Xwayland connects over `WAYLAND_DISPLAY`, as a normal client.** Association
+  is by serial and is client-agnostic, so we do *not* need to pre-create the
+  client via a socketpair + `wl_client_create`. That keeps the Xwayland
+  spawn code from touching the Wayland server at all. (The socketpair +
+  `wl_client_create` route is an optional later refinement if we ever need the
+  client handle — legacy association, sandboxing.)
+- **The WM stays protocol-agnostic.** Xwayland windows enter through the
+  existing `wm.addWindow` / `propose` / `unmapWindow`. The only seam is the
+  `ConfigureSink`, which becomes a tiny router (xdg vs. xwayland) wired in
+  `main.ts` — *not* inside `wm/`.
+
+**Native dependencies** (all present on the host): `xcb`, `xcb-composite`
+(redirect root subwindows so toplevels present as wl_surfaces), `xcb-xfixes`
+(selection-owner change tracking). Optional: `xcb-render` (root cursor only —
+deferrable), `xcb-res` (`_NET_WM_PID`), `xcb-errors` (debug-readable error
+names). **Not** `xcb-icccm` / `xcb-ewmh` — we intern atoms ourselves and parse
+in TS.
+
+## Module / file layout
+
+```
+packages/core/
+  native/
+    xwayland/                  # NEW — all xcb/X11 native code, zero Wayland
+      server.cpp/.h            # spawn + supervise Xwayland (mirrors
+                               #   native/core/gpu_process.cpp)
+      xwm.cpp/.h               # xcb_connect_to_fd(wm_fd), uv_poll pump, atom
+                               #   intern, request wrappers, event decode →
+                               #   napi callback
+      napi_xwayland.cpp        # N-API exports; addon.cpp calls one init fn
+    wayland/                   # UNCHANGED
+  src/
+    xwayland/                  # NEW — all XWM *policy* in TS, zero wl-protocol
+      index.ts                 # start/stop orchestrator; owns the native handle
+      native.d.ts              # the native binding surface (see below)
+      atoms.ts                 # atom name list + typed accessors
+      properties.ts            # parse raw property buffers (ICCCM/EWMH in TS)
+      surface.ts               # XwaylandSurface model + serial-association join
+      xwm.ts                   # decoded-event handlers → drive the overdraw WM
+      selection.ts             # clipboard / primary bridge (Phase 4)
+      dnd.ts                   # Xdnd bridge (later)
+    protocols/
+      xwayland_shell_v1.ts     # NEW — the ONE Wayland-side file (it *is* a wl
+                               #   protocol); does serial bookkeeping only and
+                               #   delegates the join to src/xwayland/surface.ts
+```
+
+**Build:** a new CMake object lib `overdraw_xwayland` carries the xcb sources +
+deps and is linked into the addon. xcb never enters the `overdraw_core` /
+Wayland targets.
+
+**Protocol generation:** add
+`/usr/share/wayland-protocols/staging/xwayland-shell/xwayland-shell-v1.xml` to
+`tools/gen-protocol/gen-protocol.js` `DEFAULT_INPUTS`; the generator emits
+`protocols-gen/xwayland_shell_v1.{js,d.ts}` like every other interface. Add
+`xwayland_shell_v1` to the `GLOBALS` list in `protocols/index.ts`.
+
+## Native binding surface
+
+The TS-facing contract lives in `src/xwayland/native.d.ts`. It is the policy-free
+xcb subset a rootless XWM needs — owm's binding minus graphics, RANDR, grabs,
+reparenting, and pixmaps/GCs, with surface association left as a raw
+`client-message` for TS to interpret.
+
+**Lifecycle:** `start(opts, onEvent) → { handle, displayName, root, wmWindow,
+atoms }`; `stop(handle)`. `start` spawns Xwayland, connects xcb to the wm fd,
+runs XWM init (root event mask, composite redirect, intern atoms, create the
+`_NET_SUPPORTING_WM_CHECK` / selection-owner window), and begins the pump;
+resolves once Xwayland signals ready.
+
+**Requests (native → X):** `getProperty` / `changeProperty` / `deleteProperty`
+(raw bytes), `configureWindow`, `sendConfigureNotify` (synthetic, ICCCM
+§4.2.3), `changeWindowAttributes`, `mapWindow` / `unmapWindow` /
+`destroyWindow` / `killClient`, `changeSaveSet`, `setInputFocus`,
+`sendClientMessage` (DELETE_WINDOW / TAKE_FOCUS / Xdnd), `internAtom` /
+`getAtomName`, `getGeometry`, `flush`. Selection (Phase 4): `setSelectionOwner`,
+`getSelectionOwner`, `convertSelection`, `xfixesSelectSelectionInput`,
+`sendSelectionNotify`.
+
+**Decoded events (X → native → TS):** `server-ready`, `server-exit`, `create`
+(incl. `overrideRedirect`), `destroy`, `map-request`, `map`, `unmap`,
+`configure-request` (with `valueMask`), `configure`, `property`,
+`client-message` (carries `WL_SURFACE_SERIAL`), `focus-in`. Selection (Phase 4):
+`selection-request`, `selection-notify`, `selection-clear`,
+`xfixes-selection`.
+
+What is intentionally **absent** vs. a full xcb WM binding: the cairo/pango
+graphics engine, pixmaps/GCs/`copy_area`/`poly_fill`, `reparent_window`, every
+`grab_*` / `warp_pointer` / `allow_events`, xkb/keysyms, and RANDR/screens.
+Xwayland delivers input to X clients over *Wayland*, and overdraw owns keybinds,
+layout, outputs, and the cursor — so the XWM needs only the management subset.
+
+## Server lifecycle (`native/xwayland/server.cpp`)
+
+Mirrors `native/core/gpu_process.cpp` (socket setup → `fork` → child clears
+CLOEXEC + `execvp` → parent supervises + reaps).
+
+1. **Pick a display number `N`:** create `/tmp/.X{N}-lock`, then bind the X11
+   listening sockets `/tmp/.X11-unix/X{N}` (unix) and the abstract
+   `@/tmp/.X11-unix/X{N}` (Linux). We own these and pass them to Xwayland.
+2. **socketpair for the WM channel** (`SOCK_STREAM`): the XWM end is what
+   `xcb_connect_to_fd` consumes; the other end is Xwayland's `-wm`.
+3. **A pipe for `-displayfd`:** Xwayland writes the display number + newline
+   when the X server is initialized and listening — our readiness signal.
+4. **`fork` + `execvp`:**
+   `Xwayland :N -rootless -terminate <delay> -listenfd <unixFd> -listenfd
+   <abstractFd> -displayfd <pipeW> -wm <wmFd>` with `WAYLAND_DISPLAY=wayland-N`
+   in the child env and CLOEXEC cleared on the four passed fds. `PR_SET_PDEATHSIG`
+   + a `getppid()` recheck guard against the parent dying mid-exec (same as the
+   GPU process).
+5. **Parent:** `uv_poll` the displayfd pipe; on ready, `xcb_connect_to_fd(wmFd)`,
+   run XWM init, set `DISPLAY=:N` for subsequently spawned clients, and start
+   the xcb pump. Reap on shutdown with the `waitpid`/grace/`SIGTERM` pattern.
+
+`-terminate` lets Xwayland exit when the last X client disconnects; a re-spawn
+on the next X connection is a later refinement (lazy start). v1 may start eager
+or on first need — decided at wiring time, not a structural concern.
+
+## Surface association
+
+The join is the one genuinely new mechanism; native stays dumb (it is just a
+`client-message`).
+
+1. `protocols/xwayland_shell_v1.ts` handles `get_xwayland_surface(wl_surface)`
+   and `set_serial(lo, hi)` → `surface.ts: registerSerial(serial64, surfaceId,
+   surfaceRec)`. It marks `SurfaceRecord.role = "xwayland"` (already a `string`
+   field — no type change).
+2. The X window posts `WL_SURFACE_SERIAL(lo, hi)`; native emits a
+   `client-message`; `xwm.ts` decodes the u64 and calls
+   `surface.ts: associateBySerial(window, serial64)`.
+3. On the wl_surface's next content commit, the adapter calls `wm.addWindow` /
+   `windowHasContent` (managed) or the unmanaged-overlay placement
+   (override-redirect). The window then flows through overdraw's existing
+   pipeline.
+
+**Ordering:** the serial may be set on the wl_surface before or after the X
+client-message arrives; `surface.ts` holds both half-associations and completes
+when the second arrives (an `unpaired` set on each side), matching the
+reference XWM's unpaired-surface handling.
+
+**Legacy guard:** `xwm.ts` already sees every `client-message`; a branch on
+`messageType === atoms.WL_SURFACE_ID` logs one error
+(`unsupported Xwayland < 23.1`) instead of silently never mapping the window.
+
+## Window-management bridge (`src/xwayland/xwm.ts`)
+
+Decoded X events drive overdraw's existing WM; no X knowledge leaks into `wm/`.
+
+- **Create / map / unmap / destroy.** `create` records geometry +
+  `overrideRedirect`. Managed windows wait for `map-request` (we decide, then
+  `mapWindow`); override-redirect windows skip it (they only `map`). `unmap` /
+  `destroy` → `wm.unmapWindow` / teardown + dissociation.
+- **Configure round-trip.** `configure-request` → consult layout. The
+  compositor is authoritative for managed windows: we `configureWindow` to the
+  WM-chosen size (and to the window's position in the **global logical layout
+  space** — X apps that reason in absolute root coordinates, e.g. menu
+  placement, then land correctly), and always follow with a synthetic
+  `sendConfigureNotify` per ICCCM. The reverse direction — a layout pass
+  resizing the window — goes through the **configure-sink router**: for an
+  `xwayland`-role surface the sink calls `xwm.configure(window, rect)` instead
+  of `configureToplevel`.
+- **Properties → state.** On associate, batch `getProperty` for `WM_CLASS`,
+  `_NET_WM_NAME`/`WM_NAME`, `WM_NORMAL_HINTS`, `WM_HINTS`, `WM_PROTOCOLS`,
+  `_NET_WM_WINDOW_TYPE`, `_NET_WM_STATE`, `WM_TRANSIENT_FOR`. `property` events
+  re-read the one that changed. `properties.ts` parses the bytes →
+  `app_id` (class), `title` (name), `constraints` (min/max/base/inc),
+  `parent` (transient-for), and presentation hints
+  (`_NET_WM_STATE` fullscreen/maximized; `_NET_WM_WINDOW_TYPE`
+  dialog/utility/menu). These feed `wm.addWindow` initial state and
+  `wm.propose` — reusing the existing dialog/floating policy in
+  `windowHasContent` (transient-for + fixed min==max already promotes to
+  floating, which is exactly how X dialogs should behave).
+- **Override-redirect** surfaces (menus, tooltips, combo-boxes, DnD icons) are
+  **not** WM windows. `surface.ts` places them via `CompositorSink`
+  (`setSurfaceLayout` at their absolute X coords mapped into the layout space)
+  in a dedicated stack spliced **above** the content layer. They are composited
+  and may take keyboard focus (menus), but carry no tile/decoration/layout.
+- **Close.** If `WM_DELETE_WINDOW` is in `WM_PROTOCOLS`, send it as a
+  client-message; else `killClient`. Wired to the same close path as
+  `xdg_toplevel.close`.
+- **Focus.** When the focus driver selects an `xwayland`-role surface, `xwm.ts`
+  mirrors it to X: `setInputFocus` for the passive model, or send
+  `WM_TAKE_FOCUS` for the locally/globally-active model (decided from
+  `WM_HINTS.input` + `WM_TAKE_FOCUS` in `WM_PROTOCOLS`), and update
+  `_NET_ACTIVE_WINDOW` + `_NET_WM_STATE_FOCUSED`. Wayland keyboard-enter to
+  Xwayland's surface and X input-focus to the window must agree; the focus
+  driver is the single source of truth and the XWM is a mirror.
+
+## Clipboard / selection bridge (Phase 4, `src/xwayland/selection.ts`)
+
+Because raw `getProperty`/`changeProperty`/`sendClientMessage` are exposed, the
+whole bridge — including the INCR chunk loop driven by `property` events — lives
+in TS; no protocol dance forces it into C++ (clipboard is not a hot path). Three
+selections: `CLIPBOARD` ↔ `wl_data_device`, `PRIMARY` ↔ primary selection,
+`XdndSelection` (DnD, deferred to `dnd.ts`).
+
+- **X owns → Wayland pastes:** `xfixes-selection` tells us an X client took the
+  selection; we read its `TARGETS`, mint a `wl_data_source` advertising the
+  mapped MIME types, and on `wl_data_source.send` `convertSelection` + read the
+  result property (INCR if large) into the Wayland pipe fd.
+- **Wayland owns → X pastes:** own the X selection on our WM window; answer
+  `selection-request` by writing the Wayland source's bytes to the requestor's
+  property (INCR for large), then `sendSelectionNotify`.
+
+MIME ↔ X target translation table lives here. The transfer logic is mechanical;
+flag complexity (INCR state machines, target negotiation) in status.md when it
+lands.
+
+## Touchpoints in existing files (kept minimal, no xcb leaks in)
+
+- **`wm/index.ts`:** unchanged in spirit. The `ConfigureSink` it already calls
+  becomes a router *at the wiring site* (`main.ts` / `protocols/index.ts`): if
+  the surface role is `xwayland`, call `xwm.configure`; else `configureToplevel`.
+  The WM file gains zero X knowledge. One open item: the WM resize transaction
+  gates partly on the xdg configure **serial**; X has no ack-configure, so an
+  `xwayland` window's resize must gate on buffer-dims readiness
+  (`surfaceReadyAt`) alone. See "Open questions".
+- **`protocols/ctx.ts`:** set `SurfaceRecord.role = "xwayland"` (no type change);
+  the serial registry lives in `src/xwayland/`, not on `state`.
+- **`wl_seat.ts` / `wl_data_device_manager.ts`:** consumed from the xwayland
+  side through their existing public surface (focus driver result; data-device
+  functions). At most one or two functions get exported; no handler bodies
+  change.
+
+## HiDPI
+
+X11 has no per-window scale. v1 takes the standard compromise: present X clients
+at a single global scale (config-driven), upscaling non-cooperating clients —
+correct size, soft at scale > 1, exactly as overdraw already treats
+non-scale-aware Wayland clients. Per-window/ per-output fractional scaling of X
+apps is a known hard limitation across all compositors and is out of scope.
+
+## Testing
+
+A new harness tier: a real Xwayland child + a tiny X11 client (`xclock` or a
+purpose-built xcb client). It is **not** pure `node --test` (needs the GPU +
+host Wayland, like the existing `*.gpu.mjs` tier) and must self-skip when
+Xwayland or a Wayland session is absent. Coverage targets, smallest tier first:
+
+- **Structural / unit:** generator metadata for `xwayland_shell_v1`;
+  `properties.ts` byte-parsers (size hints, `_NET_WM_STATE`, `WM_CLASS`) against
+  fixed buffers; `surface.ts` association ordering (serial-before-message and
+  message-before-serial). All GPU-free.
+- **Integration (`*.gpu.mjs`):** spawn Xwayland, run an X client, assert via
+  `state.query()` that the window is mapped at the laid-out rect and takes
+  focus; assert override-redirect placement; assert close. Per the testing
+  policy, scaffolding X clients are verified in-tree and **not committed**;
+  only persistent tests enter git.
+
+## Open questions (resolve before the relevant slice)
+
+- **X-window resize readiness.** The WM resize transaction's serial gate is
+  meaningless for X. Decide: gate `xwayland` resizes on `surfaceReadyAt`
+  (buffer dims) only, accepting a possible one-frame imperfection, or add a
+  buffer-dims-only hold variant. (Slice 3.)
+- **Eager vs. lazy Xwayland start.** Eager is simpler; lazy (`-terminate` +
+  re-spawn on first X connection) saves idle resources. v1 may ship eager.
+- **Override-redirect focus & stacking.** Menus want focus and must sit above
+  their owner; nailing the exact stacking vs. overdraw's layer model is a
+  Slice-3 detail.
+- **Client identity.** v1 connects Xwayland over `WAYLAND_DISPLAY` and needs no
+  client handle. Revisit only if sandboxing or legacy association is ever
+  wanted (would add a socketpair + `wl_client_create` on the Wayland side).
+
+## Slices / sequencing
+
+- **Phase 0 — `wl_resource_post_error` (general server infra, prerequisite).**
+  The compositor has no way to post a spec protocol error; offending requests
+  are silently dropped (sites annotated across `wl_surface.ts`,
+  `cursor_shape.ts`, the viewporter + decoration handlers, `subsurfaces.ts`).
+  Wire it: a native `postError(resource, code, msg)` sibling of `postEvent`
+  (`trampoline.cpp` → `wl_resource_post_error`), a `ctx.postError` helper that
+  reads error codes from the generated `enums.error` metadata, a GPU-free unit
+  test (double-role a surface → assert error event + disconnect), and convert
+  the annotated silent-drop sites. Closes the status.md "no `post_error`" gap
+  and lets `xwayland_shell_v1.role` be posted properly (Phase 2) instead of
+  logged. Not Xwayland code, but sequenced first because Xwayland needs it.
+  No spike: overdraw's Wayland server is verified complete enough for rootless
+  Xwayland (all required globals present bar `xwayland_shell_v1`), so #2/#3
+  integration unknowns are retired inline during Phases 1-2 rather than in a
+  throwaway.
+- **Phase 1 — server lifecycle.** `native/xwayland/server.cpp`: sockets,
+  `fork`/`exec`, displayfd ready, `DISPLAY`, reap. No XWM yet. Verify Xwayland
+  starts and a client can connect (even if nothing maps).
+- **Phase 2 — `xwayland_shell_v1` + minimal XWM + association.** Generate the
+  protocol; add the shell handler + `XwaylandSurfaceRecord` + serial registry;
+  native XWM connects xcb, root event mask + composite redirect, intern atoms,
+  handle create/map/unmap/destroy/configure-request, report associations. Mapped
+  surfaces become WM windows.
+- **Phase 3 — window-management semantics.** Configure round-trip + router,
+  properties → state, override-redirect overlays, stacking, close, focus.
+- **Phase 4 — clipboard.** `CLIPBOARD` + `PRIMARY`, including INCR.
+- **Phase 5 — polish + DnD.** Xdnd, `_NET_SUPPORTED` completeness, startup
+  notification, window icons, `xwayland-keyboard-grab`, HiDPI policy knob.
+
+## Reference
+
+The canonical rootless-XWM architecture (socket setup, composite redirect, the
+event handlers, the selection bridge) is wlroots' `xwayland/` module; the
+TS-WM-over-thin-xcb-binding split is `~/dev/owm`. This design takes the binding
+split from the latter and the rootless mechanics from the former, and adapts
+both to overdraw's native-mechanism / TS-policy seam.
