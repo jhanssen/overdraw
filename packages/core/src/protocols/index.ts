@@ -69,6 +69,7 @@ const GLOBALS = [
   "wp_linux_drm_syncobj_manager_v1",
   "zwlr_output_manager_v1",
   "ext_workspace_manager_v1",
+  "xwayland_shell_v1",
 ];
 
 // Interfaces created via requests (new_id), registered without a global so
@@ -96,6 +97,7 @@ const CHILD_INTERFACES = [
   "zwlr_output_configuration_head_v1",
   "ext_workspace_group_handle_v1",
   "ext_workspace_handle_v1",
+  "xwayland_surface_v1",
 ];
 
 // Load all generated signature modules, keyed by interface name.
@@ -630,6 +632,7 @@ export async function installProtocols(
     wp_linux_drm_syncobj_manager_v1: await import("./wp_linux_drm_syncobj_v1.js"),
     zwlr_output_manager_v1: await import("./zwlr_output_manager_v1.js"),
     ext_workspace_manager_v1: await import("./ext_workspace_v1.js"),
+    xwayland_shell_v1: await import("./xwayland_shell_v1.js"),
   };
 
   // Some child interfaces have handlers from a sibling module's named exports.
@@ -648,6 +651,7 @@ export async function installProtocols(
   const syncobjMod = await import("./wp_linux_drm_syncobj_v1.js");
   const outputMgmtMod = await import("./zwlr_output_manager_v1.js");
   const extWorkspaceMod = await import("./ext_workspace_v1.js");
+  const xwlShellMod = await import("./xwayland_shell_v1.js");
   const childHandlers: Record<string, object> = {
     wl_pointer: seatMod.makePointer(ctx),
     wl_keyboard: seatMod.makeKeyboard(ctx),
@@ -676,6 +680,7 @@ export async function installProtocols(
     zwlr_output_configuration_head_v1: outputMgmtMod.makeOutputConfigurationHead(ctx),
     ext_workspace_group_handle_v1: extWorkspaceMod.makeExtWorkspaceGroupHandle(ctx),
     ext_workspace_handle_v1: extWorkspaceMod.makeExtWorkspaceHandle(ctx),
+    xwayland_surface_v1: xwlShellMod.makeXwaylandSurface(ctx),
   };
 
   // The apply target forwards lazily: the seat is constructed below and

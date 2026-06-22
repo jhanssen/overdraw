@@ -479,6 +479,11 @@ export interface CompositorSink {
 
 export interface CompositorState {
   surfaces: Map<Resource, SurfaceRecord>;
+  // Xwayland surface-association registry (xwayland_shell_v1 /
+  // xwayland_surface_v1): maps unique serials to wl_surfaces so the native XWM
+  // can pair X11 windows to the surfaces Xwayland created. Created lazily by
+  // the shell handler; logic lives in src/xwayland/surface.ts.
+  xwayland?: import("../xwayland/surface.js").XwaylandSurfaceState;
   // The compositor backend (native addon or JS compositor). Set by installProtocols.
   compositor: CompositorSink;
   // Per-interface event senders, built once by installProtocols. Exposed on
