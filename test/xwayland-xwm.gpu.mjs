@@ -12,7 +12,7 @@ import { existsSync } from "node:fs";
 import { execFile } from "node:child_process";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
-import { setupCompositor, canRunGpu } from "./harness.mjs";
+import { setupCompositor, canRunGpu, nextXDisplay } from "./harness.mjs";
 import { startXwayland } from "../packages/core/dist/xwayland/index.js";
 import { startXwm } from "../packages/core/dist/xwayland/xwm.js";
 
@@ -40,7 +40,7 @@ test("xwm: an X11 window associates with its wl_surface and enters the WM",
     let xwm;
     let child;
     try {
-      handle = await startXwayland(c.addon, { waylandDisplay: c.sock, enableWm: true });
+      handle = await startXwayland(c.addon, { waylandDisplay: c.sock, enableWm: true, displayNumber: nextXDisplay() });
       assert.ok(handle.wmFd >= 0, "got a wm fd");
       xwm = startXwm(c.state, c.addon, handle.wmFd);
 

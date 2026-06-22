@@ -10,7 +10,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { existsSync } from "node:fs";
-import { setupCompositor, canRunGpu } from "./harness.mjs";
+import { setupCompositor, canRunGpu, nextXDisplay } from "./harness.mjs";
 import { startXwayland, stopXwayland } from "../packages/core/dist/xwayland/index.js";
 
 function haveXwayland() {
@@ -27,7 +27,7 @@ test("xwayland: spawns rootless and brings up an X display", { skip }, async () 
   const c = await setupCompositor();
   let handle;
   try {
-    handle = await startXwayland(c.addon, { waylandDisplay: c.sock });
+    handle = await startXwayland(c.addon, { waylandDisplay: c.sock, displayNumber: nextXDisplay() });
     assert.ok(handle.pid > 0, "got a pid");
     assert.ok(Number.isInteger(handle.displayNumber) && handle.displayNumber >= 0,
       "got a display number");

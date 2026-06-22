@@ -33,6 +33,13 @@ struct XwaylandOptions {
     // -wm: pass an X11 window-manager socket so the XWM (xcb) can manage
     // windows. Off by default (the Phase 1 lifecycle path needs no WM).
     bool enableWm = false;
+    // Explicit display number to request. When >= 0, Xwayland is asked to
+    // bind ":N" -- it FAILS HARD if :N is already in use (no fallback). When
+    // < 0 (the default), -displayfd alone is used and Xwayland scans from :0
+    // upward; that path can collide with an existing X session, which is why
+    // production startups SHOULD set a number well outside the common range
+    // (e.g. 50).
+    int displayNumber = -1;
 };
 
 // Fork/exec rootless Xwayland. Returns the pid and the read end of the
@@ -40,7 +47,8 @@ struct XwaylandOptions {
 // pid < 0 and a message is written to stderr.
 XwaylandSpawn spawnXwayland(const XwaylandOptions& opts);
 
-// Reap: poll briefly for a clean exit, then SIGTERM + wait.
+// Reap: poll briefly for a clean exit, then SIGKILL + wait. SIGKILL (not
+// SIGTERM) is load-bearing -- see server.cpp for the deadlock rationale.
 void reapXwayland(pid_t pid);
 
 }  // namespace overdraw::xwayland

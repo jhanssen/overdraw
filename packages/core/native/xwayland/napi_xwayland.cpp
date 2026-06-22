@@ -157,6 +157,18 @@ napi_value Start(napi_env env, napi_callback_info info) {
     opts.xwaylandPath = getStr(env, argv[0], "xwaylandPath");
     opts.terminate = getBool(env, argv[0], "terminate", false);
     opts.enableWm = getBool(env, argv[0], "enableWm", false);
+    // displayNumber: optional number; <0 / absent / wrong-type leaves the
+    // default (-1 = let Xwayland autopick via -displayfd).
+    {
+        napi_value v;
+        napi_valuetype t;
+        if (napi_get_named_property(env, argv[0], "displayNumber", &v) == napi_ok
+            && napi_typeof(env, v, &t) == napi_ok && t == napi_number) {
+            int32_t n = -1;
+            napi_get_value_int32(env, v, &n);
+            opts.displayNumber = n;
+        }
+    }
 
     XwaylandSpawn sp = spawnXwayland(opts);
     if (sp.pid < 0) return throwErr(env, "failed to spawn Xwayland");

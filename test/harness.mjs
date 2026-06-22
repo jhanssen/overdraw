@@ -111,6 +111,15 @@ export function canRunKms() {
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
+// Allocate a unique X display number for an Xwayland-using test. startXwayland
+// requires displayNumber (autopick is rejected because it can steal :0 from the
+// host session). The GPU runner uses --test-concurrency=1 in a single
+// `node --test` child, so a process-wide counter is collision-free across all
+// .gpu.mjs files in one run. Starts at 60 to stay clear of typical session
+// ranges; bump if you ever exceed ~100 tests in one process.
+let _nextXDisplay = 60;
+export function nextXDisplay() { return _nextXDisplay++; }
+
 // Load the wire-retargeted dawn.node bundled in the extracted Dawn release.
 // Returns null if not present (so JS-compositor tests can skip).
 export function loadDawn() {

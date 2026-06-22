@@ -400,6 +400,11 @@ Xwayland or a Wayland session is absent. Coverage targets, smallest tier first:
   Xwayland's Wayland-dependent clean shutdown on the single-threaded loop (the
   visible tip of the "never block the node thread" hazard -- see Open
   questions). Geometry/properties/focus/override-redirect are Phase 3.
+  Host wiring: `main.ts` calls `startXwayland` + `startXwm` when
+  `config.xwayland.enabled` is set, exports `DISPLAY` to children spawned via
+  the spawn action, and reaps both on shutdown. With this, Phase 2 is
+  reachable from the binary -- an X11 client can connect to the running
+  compositor (no geometry/title/focus/menus/close yet, per Phase 3 scope).
 - **Phase 3 — window-management semantics.** Configure round-trip + router,
   properties → state, override-redirect overlays, stacking, close, focus.
 - **Phase 4 — clipboard.** `CLIPBOARD` + `PRIMARY`, including INCR.

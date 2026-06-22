@@ -71,11 +71,22 @@ XwaylandSpawn spawnXwayland(const XwaylandOptions& opts) {
         const std::string path =
             opts.xwaylandPath.empty() ? std::string("Xwayland") : opts.xwaylandPath;
 
-        // No display arg + -displayfd: Xwayland picks the first free display,
-        // creates its X11 sockets, and writes the chosen number to the pipe.
+        // Argv layout:
+        //   Xwayland [:<N>] -rootless [-terminate] -displayfd <fd> [-wm <fd>]
+        //
+        // With an explicit ":N" positional, Xwayland binds that display or
+        // exits with an error (no fallback). Without it, -displayfd alone
+        // makes Xwayland scan from :0 upward and write the chosen number to
+        // the pipe -- which can collide with an existing X session, so
+        // production paths should pass displayNumber.
         char wmfdArg[16];
+        char displayArg[16];
         std::vector<char*> argv;
         argv.push_back(const_cast<char*>(path.c_str()));
+        if (opts.displayNumber >= 0) {
+            std::snprintf(displayArg, sizeof(displayArg), ":%d", opts.displayNumber);
+            argv.push_back(displayArg);
+        }
         argv.push_back(const_cast<char*>("-rootless"));
         if (opts.terminate) argv.push_back(const_cast<char*>("-terminate"));
         argv.push_back(const_cast<char*>("-displayfd"));

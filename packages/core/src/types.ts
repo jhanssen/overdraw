@@ -77,6 +77,11 @@ export interface Addon {
       xwaylandPath?: string;    // default "Xwayland" on PATH
       terminate?: boolean;      // -terminate (default false)
       enableWm?: boolean;       // pass -wm so the XWM can manage windows (default false)
+      // Explicit display number to request. When set, Xwayland is asked to
+      // bind ":N" and fails hard if :N is in use (no fallback). When unset,
+      // -displayfd alone is used and Xwayland scans from :0 upward -- prone
+      // to colliding with an existing X session.
+      displayNumber?: number;
     },
     onReady: (err: string | null, info?: { displayNumber: number; display: string }) => void,
   ): { pid: number; wmFd: number };  // wmFd is -1 unless enableWm was set

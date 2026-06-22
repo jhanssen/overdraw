@@ -188,9 +188,40 @@ function normalize(raw: unknown, path: string): ResolvedConfig {
     });
   }
 
+  // xwayland (all fields optional). Default displayNumber = 50 (well outside
+  // the typical 0-9 range used by primary sessions); explicit null opts into
+  // Xwayland's autopick from :0 upward.
+  let xwayland: ResolvedConfig["xwayland"] =
+    { enabled: false, terminate: false, xwaylandPath: null, displayNumber: 50 };
+  if (cfg.xwayland !== undefined) {
+    const x = cfg.xwayland;
+    if (x === null || typeof x !== "object") fail("`xwayland` must be an object", path);
+    if (x.enabled !== undefined && typeof x.enabled !== "boolean") {
+      fail("`xwayland.enabled` must be a boolean", path);
+    }
+    if (x.terminate !== undefined && typeof x.terminate !== "boolean") {
+      fail("`xwayland.terminate` must be a boolean", path);
+    }
+    if (x.xwaylandPath !== undefined
+        && (typeof x.xwaylandPath !== "string" || x.xwaylandPath.length === 0)) {
+      fail("`xwayland.xwaylandPath` must be a non-empty string", path);
+    }
+    if (x.displayNumber !== undefined && x.displayNumber !== null
+        && (!Number.isInteger(x.displayNumber) || (x.displayNumber as number) < 0
+            || (x.displayNumber as number) > 65535)) {
+      fail("`xwayland.displayNumber` must be a non-negative integer (or null for autopick)", path);
+    }
+    xwayland = {
+      enabled: x.enabled ?? false,
+      terminate: x.terminate ?? false,
+      xwaylandPath: x.xwaylandPath ?? null,
+      displayNumber: x.displayNumber === undefined ? 50 : x.displayNumber,
+    };
+  }
+
   return {
     output, card, scale, outputsByKey,
-    focus, hotkeys, decoration, actions, plugins, sourcePath: path,
+    focus, hotkeys, decoration, actions, plugins, xwayland, sourcePath: path,
   };
 }
 
@@ -202,7 +233,9 @@ export async function loadConfig(explicit: string | null): Promise<ResolvedConfi
     return {
       output: null, card: null, scale: null, outputsByKey: {},
       focus: undefined, hotkeys: undefined,
-      decoration: undefined, actions: undefined, plugins: [], sourcePath: null,
+      decoration: undefined, actions: undefined, plugins: [],
+      xwayland: { enabled: false, terminate: false, xwaylandPath: null, displayNumber: 50 },
+      sourcePath: null,
     };
   }
   const mod = (await import(pathToFileURL(path).href)) as { default?: ConfigExport };

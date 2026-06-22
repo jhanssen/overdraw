@@ -62,6 +62,8 @@ import { createCompositorBus } from "./events/window-bus.js";
 import { DynamicBus } from "./events/dynamic-bus.js";
 import { IpcServer } from "./ipc/server.js";
 import { bindAddon, installConsoleShim, parseLogArgs, log } from "./log.js";
+import { startXwayland, stopXwayland, type XwaylandHandle } from "./xwayland/index.js";
+import { startXwm, type Xwm } from "./xwayland/xwm.js";
 
 const require = createRequire(import.meta.url);
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -135,6 +137,10 @@ bus.on(WINDOW_EVENT.closing, (ev) => { pluginBus.emit(WINDOW_EVENT.closing, ev);
 
 let ipcServer: IpcServer | null = null;
 
+// Optional rootless Xwayland. Both null when config.xwayland.enabled is false.
+let xwaylandHandle: XwaylandHandle | null = null;
+let xwm: Xwm | null = null;
+
 let stopped = false;
 function shutdown(signal: string): void {
   if (stopped) return;
@@ -143,6 +149,13 @@ function shutdown(signal: string): void {
   // Graceful plugin shutdown is async (onShutdown callbacks). Give it a brief
   // chance, then tear down the compositor and exit regardless.
   const finish = (): void => {
+    // Xwayland teardown order: stop the XWM poll first (it watches the wmFd
+    // that the SIGKILL will close), then reap Xwayland.
+    if (xwm) { try { xwm.stop(); } catch { /* ignore */ } xwm = null; }
+    if (xwaylandHandle) {
+      try { stopXwayland(addon, xwaylandHandle); } catch { /* ignore */ }
+      xwaylandHandle = null;
+    }
     try { addon.stopServer(); } catch { /* ignore */ }
     try { addon.stop(); } catch { /* ignore */ }
     process.exit(0);
@@ -548,6 +561,40 @@ pluginBus.subscribe("output.changed", (_name, payload) => {
 log.info("core", `Wayland server listening.`);
 log.info("core", `run a client with:  WAYLAND_DISPLAY=${sock} <your-client>`);
 
+// Rootless XWayland. Spawned only when config.xwayland.enabled is true.
+// startXwayland resolves once Xwayland reports its X display via -displayfd
+// (gated on an explicit displayNumber -- autopick is rejected upstream); the
+// XWM then connects xcb to the -wm socketpair and pumps X events on the
+// libuv loop. The shutdown path reaps both.
+if (config.xwayland.enabled) {
+  if (config.xwayland.displayNumber === null) {
+    log.err("core",
+      "Xwayland: `xwayland.displayNumber` is null in config; autopick is not "
+      + "supported (it can steal :0 from the host). Set a number (default 50).");
+  } else {
+    try {
+      xwaylandHandle = await startXwayland(addon, {
+        waylandDisplay: sock,
+        enableWm: true,
+        terminate: config.xwayland.terminate,
+        displayNumber: config.xwayland.displayNumber,
+        ...(config.xwayland.xwaylandPath !== null
+          ? { xwaylandPath: config.xwayland.xwaylandPath }
+          : {}),
+      });
+      xwm = startXwm(state, addon, xwaylandHandle.wmFd);
+      log.info("core", `Xwayland up; DISPLAY=${xwaylandHandle.display} (pid ${xwaylandHandle.pid})`);
+      log.info("core", `run an X client with:  DISPLAY=${xwaylandHandle.display} <x-client>`);
+    } catch (e) {
+      log.warn("core", `Xwayland start failed: ${(e as Error).message}`);
+      if (xwaylandHandle) {
+        try { stopXwayland(addon, xwaylandHandle); } catch { /* ignore */ }
+        xwaylandHandle = null;
+      }
+    }
+  }
+}
+
 // The `spawn` action (plugin-core-actions) emits this; the launcher runs the
 // actual process detached, with WAYLAND_DISPLAY pointed at our socket so the
 // child connects to us. stdio is discarded; the child outlives a compositor
@@ -560,7 +607,11 @@ pluginBus.subscribe("process.spawn-requested", (_name, payload) => {
     spawnProcess(command, argv, {
       detached: true,
       stdio: "ignore",
-      env: { ...process.env, WAYLAND_DISPLAY: sock },
+      env: {
+        ...process.env,
+        WAYLAND_DISPLAY: sock,
+        ...(xwaylandHandle !== null ? { DISPLAY: xwaylandHandle.display } : {}),
+      },
     }).unref();
   } catch (e) {
     log.warn("core", `spawn failed: ${command}: ${(e as Error).message}`);

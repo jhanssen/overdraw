@@ -129,6 +129,20 @@ export interface OverdrawConfig {
   actions?: { [name: string]: ActionHandler };
   // DEFERRED — see PluginConfig. Declared/validated but not yet consumed.
   plugins?: PluginConfig[];
+  // Rootless XWayland. When `enabled` is true, the compositor spawns a
+  // rootless Xwayland child at startup and exports its DISPLAY for X11
+  // clients. `terminate` toggles Xwayland's `-terminate` (exit when the last
+  // X client disconnects). `xwaylandPath` overrides the binary lookup (the
+  // default resolves "Xwayland" on PATH). `displayNumber` requests an
+  // explicit display (default 50, well outside the typical 0-9 range used
+  // by primary sessions); set null to let Xwayland autopick from :0 upward
+  // (NOT recommended on a host with an existing X session).
+  xwayland?: {
+    enabled?: boolean;
+    terminate?: boolean;
+    xwaylandPath?: string;
+    displayNumber?: number | null;
+  };
 }
 
 // Handler signature for OverdrawConfig.actions entries.
@@ -191,6 +205,16 @@ export interface ResolvedConfig {
   // verbatim pass-through.
   actions: unknown;
   plugins: ResolvedPlugin[];
+  // Rootless XWayland settings. `enabled=false` skips spawning Xwayland.
+  // `xwaylandPath` is null when the user did not override the lookup.
+  // `displayNumber` is the X display to bind (default 50); null means let
+  // Xwayland autopick from :0 upward (test-only; collides with live sessions).
+  xwayland: {
+    enabled: boolean;
+    terminate: boolean;
+    xwaylandPath: string | null;
+    displayNumber: number | null;
+  };
   // Absolute path of the config file that was loaded, or null if none was found
   // (built-in defaults in effect).
   sourcePath: string | null;

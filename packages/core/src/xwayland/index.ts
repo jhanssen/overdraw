@@ -23,13 +23,31 @@ export interface XwaylandConfig {
   xwaylandPath?: string;
   terminate?: boolean;
   enableWm?: boolean;    // pass -wm so the XWM (startXwm) can manage windows
+  // Explicit display number to request. Pass an integer N for Xwayland to
+  // bind ":N" (no fallback -- fails hard if taken). Omit to let Xwayland
+  // scan from :0 upward via -displayfd alone; the latter can collide with
+  // an existing X session and is only appropriate for tests.
+  displayNumber?: number;
 }
 
 // Start Xwayland and resolve once it reports its X display. Rejects if the
 // fork fails (synchronously, surfaced as a rejected promise) or if Xwayland
 // exits before becoming ready.
+//
+// `config.displayNumber` is REQUIRED. Without it, Xwayland's -displayfd
+// autopick scans from :0 upward and can steal a live host session's display
+// (the socket file gets replaced and the host can no longer connect to its
+// own X server). Callers must pick a number (50+ recommended to stay clear
+// of typical session ranges). Tests using this must each pick a UNIQUE
+// number so parallel runs don't collide on Xwayland's lock files.
 export function startXwayland(addon: Addon, config: XwaylandConfig): Promise<XwaylandHandle> {
   return new Promise<XwaylandHandle>((resolve, reject) => {
+    if (config.displayNumber === undefined) {
+      reject(new Error(
+        "startXwayland: `displayNumber` is required (autopick can steal :0 from "
+        + "the host session). Pick an integer >= 50, e.g. { displayNumber: 50 }."));
+      return;
+    }
     try {
       const { pid, wmFd } = addon.xwaylandStart(
         {
@@ -37,6 +55,7 @@ export function startXwayland(addon: Addon, config: XwaylandConfig): Promise<Xwa
           ...(config.xwaylandPath !== undefined ? { xwaylandPath: config.xwaylandPath } : {}),
           ...(config.terminate !== undefined ? { terminate: config.terminate } : {}),
           ...(config.enableWm !== undefined ? { enableWm: config.enableWm } : {}),
+          displayNumber: config.displayNumber,
         },
         (err, infoArg) => {
           if (err || !infoArg) {
@@ -52,7 +71,10 @@ export function startXwayland(addon: Addon, config: XwaylandConfig): Promise<Xwa
   });
 }
 
-// Stop Xwayland (SIGTERM + reap).
+// Stop Xwayland: synchronous SIGKILL + reap. SIGKILL (not SIGTERM) is
+// load-bearing -- the node thread also runs the Wayland server, and Xwayland's
+// clean-shutdown path needs that thread to service it, so a synchronous wait
+// on SIGTERM deadlocks. See native/xwayland/server.cpp.
 export function stopXwayland(addon: Addon, handle: XwaylandHandle): void {
   addon.xwaylandStop(handle.pid);
 }
