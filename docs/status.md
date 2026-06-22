@@ -640,9 +640,12 @@ validated + resolved + consumed by the runtime + hotkey plugin.
   `/tmp/overdraw-gpu-crash.txt`, core to
   `/tmp/overdraw-core-crash.txt`).
 - **Linear compositing.** Alpha blending happens in sRGB space.
-- **XWayland.** Not built; design complete. See `docs/xwayland-design.md`
-  (rootless Xwayland, `xwayland_shell_v1` serial association, native
-  policy-free xcb binding + TS XWM policy). Session supervisor untouched.
+- **XWayland.** Phase 1 (server lifecycle) landed: rootless Xwayland is
+  fork/exec'd against the compositor and reports ready (async `uv_poll` on
+  `-displayfd`); it initializes cleanly against overdraw's Wayland server
+  (`test/xwayland-server.gpu.mjs`). No XWM / surface association /
+  `xwayland_shell_v1` yet (Phases 2+). See `docs/xwayland-design.md`. Session
+  supervisor untouched.
 - **Live reload.** Not built.
 
 ## Spikes

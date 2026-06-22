@@ -160,13 +160,21 @@ target_include_directories(overdraw_plugin_native PRIVATE
 target_link_libraries(overdraw_plugin_native PRIVATE
     overdraw_wire dawn::webgpu_dawn_wire pthread dl rt)
 
+# ---- Xwayland support (X11/xcb isolated from the Wayland + core targets) ----
+# Phase 1 is the server lifecycle only (fork/exec + reap); no xcb yet. The XWM
+# (xwm.cpp + xcb deps) joins this target in Phase 2.
+add_library(overdraw_xwayland STATIC native/xwayland/server.cpp)
+target_include_directories(overdraw_xwayland PUBLIC ${NATIVE_INCLUDE})
+set_target_properties(overdraw_xwayland PROPERTIES POSITION_INDEPENDENT_CODE ON)
+
 # ---- Core N-API addon (Node-hosted core) ----
 add_library(overdraw_native MODULE
     native/napi/addon.cpp
     native/wayland/trampoline.cpp
     native/wayland/wayland_fd.cpp
     native/wayland/keymap.cpp
-    native/cursor/xcursor.cpp)
+    native/cursor/xcursor.cpp
+    native/xwayland/napi_xwayland.cpp)
 set_target_properties(overdraw_native PROPERTIES
     PREFIX "" SUFFIX ".node")
 target_compile_definitions(overdraw_native PRIVATE
@@ -175,7 +183,7 @@ target_include_directories(overdraw_native PRIVATE
     ${IPC_INCLUDE} ${NATIVE_INCLUDE} ${NODE_INCLUDE_DIR} ${XKBCOMMON_INCLUDE_DIRS}
     ${LIBDRM_INCLUDE_DIRS})
 target_link_libraries(overdraw_native PRIVATE
-    overdraw_core dawn::webgpu_dawn_wire ${XKBCOMMON_LIBRARIES}
+    overdraw_core overdraw_xwayland dawn::webgpu_dawn_wire ${XKBCOMMON_LIBRARIES}
     ${LIBDRM_LIBRARIES} pthread dl rt)
 # -rdynamic so backtrace_symbols_fd can resolve symbols in the crash handler.
 target_link_options(overdraw_native PRIVATE -rdynamic)

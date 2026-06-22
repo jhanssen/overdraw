@@ -27,6 +27,7 @@
 #include "core/gpu_process.h"
 #include "core/input.h"
 #include "core/input_wayland.h"
+#include "xwayland/napi_xwayland.h"
 #if OVERDRAW_KMS
 #include "core/seat.h"
 #include "core/input_libinput.h"
@@ -3063,6 +3064,8 @@ napi_value Init(napi_env env, napi_value exports) {
     napi_set_named_property(env, exports, "createGlobal", fnCreateGlobal);
     napi_set_named_property(env, exports, "createGlobalForOutput", fnCreateGlobalForOutput);
     napi_set_named_property(env, exports, "postEvent", fnPostEvent);
+
+    overdraw::xwayland::RegisterXwayland(env, exports);
     return exports;
 }
 

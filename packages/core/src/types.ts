@@ -62,6 +62,24 @@ export interface Addon {
   // dispatch. `code` is the offending interface's error-enum value (from the
   // generated `<Iface>_Error` consts); `message` is a human-readable diagnostic.
   postError(resource: Resource, code: number, message: string): void;
+
+  // Xwayland lifecycle (Phase 1: spawn a rootless Xwayland that connects to our
+  // Wayland server as a client and report when it is ready). Returns the pid
+  // synchronously; readiness is delivered asynchronously via `onReady` once
+  // Xwayland writes its display number to the -displayfd pipe (the pipe is
+  // polled on the libuv loop -- a blocking wait would deadlock the Wayland
+  // server Xwayland is handshaking with). `onReady` receives a non-null error
+  // string if Xwayland died before becoming ready. Throws only if the fork
+  // itself fails.
+  xwaylandStart(
+    opts: {
+      waylandDisplay: string;   // our wl socket name -> child's WAYLAND_DISPLAY
+      xwaylandPath?: string;    // default "Xwayland" on PATH
+      terminate?: boolean;      // -terminate (default false)
+    },
+    onReady: (err: string | null, info?: { displayNumber: number; display: string }) => void,
+  ): { pid: number };
+  xwaylandStop(pid: number): void;
   // Server-initiated destruction: drop the libwayland resource + wrapper.
   // For client-issued destructor requests (wl_buffer.destroy etc.) the
   // trampoline handles destruction automatically; JS only needs this for

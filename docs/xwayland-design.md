@@ -160,31 +160,39 @@ graphics engine, pixmaps/GCs/`copy_area`/`poly_fill`, `reparent_window`, every
 Xwayland delivers input to X clients over *Wayland*, and overdraw owns keybinds,
 layout, outputs, and the cursor — so the XWM needs only the management subset.
 
-## Server lifecycle (`native/xwayland/server.cpp`)
+## Server lifecycle (`native/xwayland/server.cpp`) — ✅ Phase 1 landed
 
-Mirrors `native/core/gpu_process.cpp` (socket setup → `fork` → child clears
-CLOEXEC + `execvp` → parent supervises + reaps).
+Mirrors `native/core/gpu_process.cpp` (`fork` → child clears CLOEXEC + `execvp`
+→ parent supervises + reaps). As built:
 
-1. **Pick a display number `N`:** create `/tmp/.X{N}-lock`, then bind the X11
-   listening sockets `/tmp/.X11-unix/X{N}` (unix) and the abstract
-   `@/tmp/.X11-unix/X{N}` (Linux). We own these and pass them to Xwayland.
-2. **socketpair for the WM channel** (`SOCK_STREAM`): the XWM end is what
-   `xcb_connect_to_fd` consumes; the other end is Xwayland's `-wm`.
-3. **A pipe for `-displayfd`:** Xwayland writes the display number + newline
-   when the X server is initialized and listening — our readiness signal.
-4. **`fork` + `execvp`:**
-   `Xwayland :N -rootless -terminate <delay> -listenfd <unixFd> -listenfd
-   <abstractFd> -displayfd <pipeW> -wm <wmFd>` with `WAYLAND_DISPLAY=wayland-N`
-   in the child env and CLOEXEC cleared on the four passed fds. `PR_SET_PDEATHSIG`
-   + a `getppid()` recheck guard against the parent dying mid-exec (same as the
-   GPU process).
-5. **Parent:** `uv_poll` the displayfd pipe; on ready, `xcb_connect_to_fd(wmFd)`,
-   run XWM init, set `DISPLAY=:N` for subsequently spawned clients, and start
-   the xcb pump. Reap on shutdown with the `waitpid`/grace/`SIGTERM` pattern.
+1. **A pipe for `-displayfd`:** the readiness signal. Xwayland writes its chosen
+   display number + newline once its X11 sockets are open and it has finished
+   the Wayland handshake.
+2. **`fork` + `execvp`:** `Xwayland -rootless -displayfd <pipeW>` (no display
+   arg → Xwayland picks the first free `N` and **creates its own X11 sockets**;
+   `-terminate` optional). `WAYLAND_DISPLAY=<our socket>` in the child env,
+   `DISPLAY` unset (rootless Xwayland is the X server, not a nested client),
+   CLOEXEC cleared on the displayfd write end + stdio. `PR_SET_PDEATHSIG` +
+   `getppid()` recheck guard the fork-vs-parent-death race.
+3. **Readiness is async, via `uv_poll` (load-bearing).** A *blocking* read of
+   the displayfd would deadlock: Xwayland only reports ready after its Wayland
+   handshake completes, and our Wayland server runs on the same libuv loop the
+   blocking read would freeze. So `server.cpp` only forks and returns the
+   (non-blocking) pipe read fd; `napi_xwayland.cpp` polls it on the loop and
+   fires a JS `onReady(err, {displayNumber, display})` callback. The TS
+   orchestrator (`src/xwayland/index.ts`) wraps that in a promise; `DISPLAY` is
+   set from the resolved display. Reap on shutdown with the
+   `waitpid`/grace/`SIGTERM` pattern. Verified by `test/xwayland-server.gpu.mjs`
+   (Xwayland comes up clean against headless overdraw — no missing-global or
+   glamor complaints).
 
-`-terminate` lets Xwayland exit when the last X client disconnects; a re-spawn
-on the next X connection is a later refinement (lazy start). v1 may start eager
-or on first need — decided at wiring time, not a structural concern.
+**Deferred (not needed for Phase 1):** the **WM socketpair + `-wm`** (the XWM's
+`xcb_connect_to_fd` channel) lands with Phase 2. Pre-creating the X11 sockets
+ourselves (lock file + unix + abstract + `-listenfd`), instead of letting
+Xwayland create them, is only needed for **lazy start** (socket-activation
+re-spawn on the next X connection) and is a later refinement; eager start needs
+none of it. `-terminate` (exit when the last X client disconnects) is wired but
+off by default.
 
 ## Surface association
 
@@ -349,9 +357,11 @@ Xwayland or a Wayland session is absent. Coverage targets, smallest tier first:
   Xwayland (all required globals present bar `xwayland_shell_v1`), so #2/#3
   integration unknowns are retired inline during Phases 1-2 rather than in a
   throwaway.
-- **Phase 1 — server lifecycle.** `native/xwayland/server.cpp`: sockets,
-  `fork`/`exec`, displayfd ready, `DISPLAY`, reap. No XWM yet. Verify Xwayland
-  starts and a client can connect (even if nothing maps).
+- **Phase 1 — server lifecycle.** ✅ Landed. `native/xwayland/server.cpp`
+  (fork/exec rootless Xwayland, `-displayfd` readiness), `napi_xwayland.cpp`
+  (async `uv_poll` readiness + reap), `overdraw_xwayland` CMake lib,
+  `src/xwayland/index.ts` orchestrator. `test/xwayland-server.gpu.mjs` confirms
+  Xwayland initializes against overdraw and brings up an X display. No XWM yet.
 - **Phase 2 — `xwayland_shell_v1` + minimal XWM + association.** Generate the
   protocol; add the shell handler + `XwaylandSurfaceRecord` + serial registry;
   native XWM connects xcb, root event mask + composite redirect, intern atoms,
