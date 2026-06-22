@@ -44,10 +44,14 @@ export function flushWindowChanges(state: CompositorState): void {
   pending.clear();
 }
 
-// True if `surfaceId` is a currently-mapped toplevel.
+// True if `surfaceId` is a currently-mapped toplevel. xwayland windows enter
+// the WM the same way xdg toplevels do (they are application windows from a
+// plugin's standpoint), so window.change must flush for them too.
 function isMappedToplevel(state: CompositorState, surfaceId: number): boolean {
   for (const s of state.surfaces.values()) {
-    if (s.id === surfaceId) return s.mapped === true && s.role === "xdg_toplevel";
+    if (s.id === surfaceId) {
+      return s.mapped === true && (s.role === "xdg_toplevel" || s.role === "xwayland");
+    }
   }
   return false;
 }

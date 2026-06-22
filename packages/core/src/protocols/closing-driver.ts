@@ -27,6 +27,7 @@ import type { CompositorState, SurfaceRecord, SubsurfaceRecord } from "./ctx.js"
 import { WINDOW_EVENT } from "../events/types.js";
 import type { WindowClosingEvent } from "../events/types.js";
 import { log } from "../log.js";
+import { titleAppId } from "../query.js";
 
 // Closing-driver dependencies. Wired by installProtocols when the
 // surrounding harness/launcher provides them; absent means "no closing
@@ -101,15 +102,12 @@ export function createClosingDriver(deps: ClosingDriverDeps): ClosingDriver {
         return false;
       }
 
-      // Pull title + appId from the toplevel record. Both may be null
-      // (client never set them, or never finished its first commit).
-      let appId: string | null = null;
-      let title: string | null = null;
-      const toplevelRes = s.xdgSurface?.toplevel;
-      if (toplevelRes && state.toplevels) {
-        const tl = state.toplevels.get(toplevelRes);
-        if (tl) { appId = tl.appId; title = tl.title; }
-      }
+      // Pull title + appId via the role-dispatched helper (xdg toplevel or
+      // xwayland). Both may be null (client never set them, or never finished
+      // its first commit).
+      const ta = titleAppId(state, s.id);
+      const appId = ta.appId;
+      const title = ta.title;
 
       const payload: WindowClosingEvent = {
         phantomSurfaceId,

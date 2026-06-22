@@ -39,7 +39,9 @@ import type { ZwlrForeignToplevelManagerV1Handler }
 import type { ZwlrForeignToplevelHandleV1Handler }
   from "#protocols-gen/zwlr_foreign_toplevel_handle_v1.js";
 
-import type { Ctx, CompositorState } from "./ctx.js";
+import type { Ctx } from "./ctx.js";
+import { titleAppId } from "../query.js";
+import { closeSurface } from "./close-surface.js";
 import { WINDOW_EVENT } from "../events/types.js";
 import type { Resource } from "../types.js";
 import type { WindowState } from "../events/types.js";
@@ -95,28 +97,6 @@ function buildStateArray(ws: WindowState | null, activated: boolean): Uint8Array
   return packStates(out);
 }
 
-// Resolve the xdg_toplevel resource backing a surfaceId. Linear walk; the
-// map is small (one entry per mapped toplevel).
-function toplevelResourceOf(state: CompositorState, surfaceId: number): Resource | null {
-  if (!state.toplevels) return null;
-  for (const rec of state.toplevels.values()) {
-    if (rec.xdgSurface.surface?.id === surfaceId) return rec.resource;
-  }
-  return null;
-}
-
-// app_id / title lookup. Mirrors query.ts titleAppId but folded inline so we
-// don't import circularly.
-function titleAppIdOf(state: CompositorState, surfaceId: number): { title: string | null; appId: string | null } {
-  if (!state.toplevels) return { title: null, appId: null };
-  for (const rec of state.toplevels.values()) {
-    if (rec.xdgSurface.surface?.id === surfaceId) {
-      return { title: rec.title, appId: rec.appId };
-    }
-  }
-  return { title: null, appId: null };
-}
-
 // Send the full initial burst for a freshly-tracked toplevel on a single
 // manager. Emits in order:
 //   toplevel -> app_id -> title -> state -> done
@@ -133,7 +113,7 @@ function emitInitial(ctx: Ctx, mgr: ManagerState, surfaceId: number): void {
   mgr.handles.set(surfaceId, handle);
   handleOwners.set(handle, { manager: mgr, surfaceId });
 
-  const ta = titleAppIdOf(state, surfaceId);
+  const ta = titleAppId(state, surfaceId);
   if (ta.appId !== null) ctx.events.zwlr_foreign_toplevel_handle_v1.send_app_id(handle, ta.appId);
   if (ta.title !== null) ctx.events.zwlr_foreign_toplevel_handle_v1.send_title(handle, ta.title);
   const ws = state.wm?.getWindowState(surfaceId) ?? null;
@@ -150,14 +130,14 @@ function emitChange(ctx: Ctx, mgr: ManagerState, surfaceId: number,
   const state = ctx.state;
   let any = false;
   if (fields.has("title")) {
-    const t = titleAppIdOf(state, surfaceId).title;
+    const t = titleAppId(state, surfaceId).title;
     if (t !== null) {
       ctx.events.zwlr_foreign_toplevel_handle_v1.send_title(handle, t);
       any = true;
     }
   }
   if (fields.has("appId")) {
-    const a = titleAppIdOf(state, surfaceId).appId;
+    const a = titleAppId(state, surfaceId).appId;
     if (a !== null) {
       ctx.events.zwlr_foreign_toplevel_handle_v1.send_app_id(handle, a);
       any = true;
@@ -334,8 +314,7 @@ export function makeForeignToplevelHandle(ctx: Ctx): ZwlrForeignToplevelHandleV1
     close(resource) {
       const id = surfaceIdOf(resource);
       if (id === null) return;
-      const tl = toplevelResourceOf(ctx.state, id);
-      if (tl) ctx.events.xdg_toplevel.send_close(tl);
+      closeSurface(ctx.state, id);
     },
     set_rectangle(_resource, _surface, _x, _y, _width, _height) {
       // Taskbar minimize-to-icon hint. Recorded by other compositors to

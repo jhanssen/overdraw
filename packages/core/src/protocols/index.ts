@@ -402,6 +402,26 @@ export async function installProtocols(
           state.wm?.windowHasContent(id);
           state.seat?.focusWindow(id, s, rect);
         }
+      } else if (s.role === "xwayland") {
+        // An xwayland window enters the WM at associate (xwm.ts maybeManage),
+        // so addWindow + initial-commit setup are already done. First content
+        // makes it drawable; mirror the xdg_toplevel flow for window.map +
+        // stack + focus. The XWM tracks the WM_DELETE_WINDOW / KillClient
+        // close path separately; from a plugin's view this is a toplevel.
+        s.mapped = true;
+        mappedAny = true;
+        const rect = state.wm?.rectOf(id);
+        if (rect) {
+          const ta = titleAppId(state, id);
+          state.bus?.emit(WINDOW_EVENT.map, {
+            surfaceId: id,
+            outputId: s.spawnOutputId ?? OUTPUT_DEFAULT,
+            rect: { x: rect.x, y: rect.y, width: rect.width, height: rect.height },
+            appId: ta.appId, title: ta.title,
+          });
+          state.wm?.windowHasContent(id);
+          state.seat?.focusWindow(id, s, rect);
+        }
       } else if (s.role === "xdg_popup") {
         // A popup maps on first content; it is compositor-positioned above its
         // parent (rect already computed at get_popup). Mark its PopupRecord mapped

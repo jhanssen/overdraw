@@ -49,7 +49,7 @@ export interface SurfaceRecord {
   id: number;
   resource: Resource;
   // The role assigned to this wl_surface. Values used today:
-  //   "xdg_toplevel" | "xdg_popup" | "cursor" | "layer_surface"
+  //   "xdg_toplevel" | "xdg_popup" | "cursor" | "layer_surface" | "xwayland"
   // null until a role is assigned. Once non-null, the wl_surface cannot
   // be re-roled (the role protocols enforce this; cross-role assignment
   // posts the appropriate protocol error).
@@ -484,6 +484,11 @@ export interface CompositorState {
   // can pair X11 windows to the surfaces Xwayland created. Created lazily by
   // the shell handler; logic lives in src/xwayland/surface.ts.
   xwayland?: import("../xwayland/surface.js").XwaylandSurfaceState;
+  // Narrow read-only view of the active XWM (when startXwm has run). Used by
+  // query.titleAppId and the close path to look up X-backed windows by
+  // surfaceId without taking a dep on the full Xwm shape. Cleared on
+  // xwm.stop().
+  xwm?: import("../xwayland/xwm.js").XwmStateView;
   // The compositor backend (native addon or JS compositor). Set by installProtocols.
   compositor: CompositorSink;
   // Per-interface event senders, built once by installProtocols. Exposed on

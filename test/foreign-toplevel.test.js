@@ -91,6 +91,7 @@ function mockCtx() {
     pluginBus: makeDynamicBus(),
     surfaces: new Map(),
     toplevels,
+    events,    // closeSurface() reads state.events.xdg_toplevel.send_close
     wm: {
       state: { windows: [] },
       getWindowState(id) {
@@ -123,15 +124,23 @@ function mockCtx() {
   return { addon: { clientId: () => 1 }, state, events };
 }
 
-// Add a toplevel entry that the handler's titleAppIdOf + toplevelResourceOf
-// can walk. The handler reads `xdgSurface.surface.id` to match a surfaceId.
+// Add a toplevel entry that the handler can walk via query.titleAppId. The
+// helper looks up the SurfaceRecord first (state.surfaces) and follows its
+// xdgSurface.toplevel into state.toplevels, so we mirror both sides here.
 function recordToplevel(ctx, surfaceId, { title = null, appId = null } = {}) {
   const xdgToplevel = mockResource("xdg_toplevel");
+  const surfaceRes = mockResource("wl_surface");
   ctx.state.toplevels.set(xdgToplevel, {
     resource: xdgToplevel,
-    xdgSurface: { surface: { id: surfaceId } },
+    xdgSurface: { surface: { id: surfaceId }, toplevel: xdgToplevel },
     title,
     appId,
+  });
+  ctx.state.surfaces.set(surfaceRes, {
+    id: surfaceId,
+    resource: surfaceRes,
+    role: "xdg_toplevel",
+    xdgSurface: { toplevel: xdgToplevel },
   });
   return xdgToplevel;
 }

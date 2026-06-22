@@ -40,10 +40,18 @@ export interface StateSnapshot {
   keyboardFocus: number | null;
 }
 
-// Look up a surface's title/app_id via its xdg_surface -> toplevel record.
+// Look up a surface's title/app_id. Both xdg_toplevels (via the
+// xdg_surface -> ToplevelRecord chain) and xwayland windows (via the active
+// XWM) carry these; this helper hides the role split from callers.
 export function titleAppId(state: CompositorState, surfaceId: number): { title: string | null; appId: string | null } {
   for (const s of state.surfaces.values()) {
     if (s.id !== surfaceId) continue;
+    if (s.role === "xwayland") {
+      const xw = state.xwm?.findBySurfaceId(surfaceId);
+      return xw
+        ? { title: xw.title, appId: xw.appId }
+        : { title: null, appId: null };
+    }
     const tl = s.xdgSurface?.toplevel;
     if (tl) {
       const rec = state.toplevels?.get(tl);

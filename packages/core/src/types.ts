@@ -90,10 +90,25 @@ export interface Addon {
   // XWM (X11 window manager over the -wm socket). xwmStart connects xcb to the
   // wmFd from xwaylandStart, becomes the WM, and polls the xcb fd on the libuv
   // loop; each decoded X event is delivered to onEvent. One XWM at a time.
-  xwmStart(wmFd: number, onEvent: (ev: import("./xwayland/xwm.js").XwmEventMsg) => void): void;
+  // Returns { atoms } -- the interned X11 atom values keyed by name, used by
+  // the TS XWM's property parsers to identify type/state/window-type atoms.
+  xwmStart(
+    wmFd: number,
+    onEvent: (ev: import("./xwayland/xwm.js").XwmEventMsg) => void,
+  ): { atoms: Record<string, number> };
   xwmStop(): void;
   xwmMapWindow(window: number): void;
   xwmConfigureWindow(window: number, x: number, y: number, w: number, h: number): void;
+  // Async property read. Returns a cookieId; the reply arrives as a
+  // "property-reply" event with the same cookieId. The reply may be empty
+  // (format=0) if the property is absent or the request errored.
+  xwmGetProperty(window: number, atom: number, maxLengthWords?: number): number;
+  // Send a WM_PROTOCOLS ClientMessage carrying `protocolAtom` (e.g.
+  // WM_DELETE_WINDOW) to the window's client. Standard ICCCM close path.
+  xwmSendWmProtocol(window: number, protocolAtom: number): void;
+  // Force-kill the window's owning client (the fallback for clients that don't
+  // advertise WM_DELETE_WINDOW).
+  xwmKillClient(window: number): void;
   // Server-initiated destruction: drop the libwayland resource + wrapper.
   // For client-issued destructor requests (wl_buffer.destroy etc.) the
   // trampoline handles destruction automatically; JS only needs this for

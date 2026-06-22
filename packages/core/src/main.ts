@@ -64,6 +64,7 @@ import { IpcServer } from "./ipc/server.js";
 import { bindAddon, installConsoleShim, parseLogArgs, log } from "./log.js";
 import { startXwayland, stopXwayland, type XwaylandHandle } from "./xwayland/index.js";
 import { startXwm, type Xwm } from "./xwayland/xwm.js";
+import { closeSurface } from "./protocols/close-surface.js";
 
 const require = createRequire(import.meta.url);
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -983,10 +984,9 @@ pluginBus.subscribe("window.grab-end-requested", () => {
 // keyboard-focused toplevel by sending xdg_toplevel.close (the client decides
 // how to react). No-op if nothing is focused or the focus isn't a toplevel.
 pluginBus.subscribe("window.close-requested", () => {
-  const focused = state?.seat?.kbFocus?.surfaceRec?.resource;
-  if (!focused || !state?.surfaces || !state.events) return;
-  const top = state.surfaces.get(focused)?.xdgSurface?.toplevel;
-  if (top && !top.destroyed) state.events.xdg_toplevel.send_close(top);
+  const focusedId = state?.seat?.kbFocus?.surfaceId;
+  if (focusedId === undefined || focusedId === null || !state) return;
+  closeSurface(state, focusedId);
 });
 
 // window.move-to-output (explicit outputId): move the focused window to the

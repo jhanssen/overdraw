@@ -237,6 +237,8 @@ void deliverXwmEvent(const XwmEvent& e) {
         case XwmEvent::UnmapNotify: typeStr = "unmap"; break;
         case XwmEvent::ConfigureRequest: typeStr = "configure-request"; break;
         case XwmEvent::SurfaceSerial: typeStr = "surface-serial"; break;
+        case XwmEvent::PropertyNotify: typeStr = "property-notify"; break;
+        case XwmEvent::PropertyReply: typeStr = "property-reply"; break;
     }
     napi_value obj;
     napi_create_object(env, &obj);
@@ -269,6 +271,27 @@ void deliverXwmEvent(const XwmEvent& e) {
     setU32("serialLo", static_cast<uint32_t>(e.serial & 0xffffffffu));
     setU32("serialHi", static_cast<uint32_t>(e.serial >> 32));
 
+    // PropertyNotify / PropertyReply payload.
+    if (e.type == XwmEvent::PropertyNotify || e.type == XwmEvent::PropertyReply) {
+        setU32("atom", e.atom);
+    }
+    if (e.type == XwmEvent::PropertyReply) {
+        setU32("cookieId", e.cookieId);
+        setU32("replyType", e.replyType);
+        setU32("format", e.format);
+        // Copy the borrowed bytes into a Node Buffer so JS may keep it past
+        // this callback. xcb owns the original storage and frees it when the
+        // reply object is freed.
+        napi_value buf;
+        if (e.data != nullptr && e.length > 0) {
+            void* dst = nullptr;
+            napi_create_buffer_copy(env, e.length, e.data, &dst, &buf);
+        } else {
+            napi_create_buffer(env, 0, nullptr, &buf);
+        }
+        napi_set_named_property(env, obj, "data", buf);
+    }
+
     napi_value cb, undef;
     napi_get_reference_value(env, g_xwm.cb, &cb);
     napi_get_undefined(env, &undef);
@@ -299,7 +322,12 @@ void onXcbReadable(uv_poll_t* /*h*/, int status, int /*events*/) {
     if (!xwmProcess(g_xwm.conn, deliverXwmEvent)) xwmTeardown();  // xcb errored
 }
 
-// xwmStart(wmFd, onEvent) -> undefined
+// xwmStart(wmFd, onEvent) -> { atoms: { [name]: number } }
+//
+// The atoms map carries the interned atom values for everything the TS XWM
+// needs to match against (property type atoms like _NET_WM_NAME, value atoms
+// inside _NET_WM_STATE / _NET_WM_WINDOW_TYPE, the protocol atoms for
+// WM_DELETE_WINDOW, etc.). Stable for the connection's lifetime.
 napi_value XwmStart(napi_env env, napi_callback_info info) {
     size_t argc = 2;
     napi_value argv[2];
@@ -329,9 +357,18 @@ napi_value XwmStart(napi_env env, napi_callback_info info) {
     // Drain anything already queued before the poll was armed.
     if (!xwmProcess(conn, deliverXwmEvent)) xwmTeardown();
 
-    napi_value u;
-    napi_get_undefined(env, &u);
-    return u;
+    // Return { atoms: { ... } }: the interned X11 atom values, keyed by name.
+    napi_value result;
+    napi_create_object(env, &result);
+    napi_value atomsObj;
+    napi_create_object(env, &atomsObj);
+    for (int i = 0; i < ATOM_COUNT; ++i) {
+        napi_value v;
+        napi_create_uint32(env, xwmAtom(conn, i), &v);
+        napi_set_named_property(env, atomsObj, atomName(i), v);
+    }
+    napi_set_named_property(env, result, "atoms", atomsObj);
+    return result;
 }
 
 napi_value XwmStop(napi_env env, napi_callback_info /*info*/) {
@@ -373,6 +410,64 @@ napi_value XwmConfigureWindow(napi_env env, napi_callback_info info) {
     return u;
 }
 
+// xwmGetProperty(window, atom, maxLengthWords?) -> cookieId
+//
+// Issues a GetProperty request asynchronously; the reply arrives as a
+// "property-reply" XwmEvent matched by cookieId. The default 1024 words
+// (4 KiB) covers titles + every standard list-of-atoms property comfortably.
+napi_value XwmGetProperty(napi_env env, napi_callback_info info) {
+    size_t argc = 3;
+    napi_value argv[3];
+    napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+    if (!g_xwm.active) return throwErr(env, "xwmGetProperty: no XWM running");
+    if (argc < 2) return throwErr(env, "xwmGetProperty(window, atom, maxLengthWords?)");
+    uint32_t window = 0, atom = 0, maxWords = 1024;
+    napi_get_value_uint32(env, argv[0], &window);
+    napi_get_value_uint32(env, argv[1], &atom);
+    if (argc >= 3) napi_get_value_uint32(env, argv[2], &maxWords);
+    const uint32_t cookieId = xwmGetProperty(g_xwm.conn, window, atom, maxWords);
+    napi_value out;
+    napi_create_uint32(env, cookieId, &out);
+    return out;
+}
+
+// xwmSendWmProtocol(window, protocolAtom) -> undefined
+//
+// Sends a WM_PROTOCOLS ClientMessage carrying `protocolAtom` in data[0]
+// (e.g. WM_DELETE_WINDOW). The ICCCM close path; the client is expected to
+// initiate its own shutdown on receipt.
+napi_value XwmSendWmProtocol(napi_env env, napi_callback_info info) {
+    size_t argc = 2;
+    napi_value argv[2];
+    napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+    if (!g_xwm.active) return throwErr(env, "xwmSendWmProtocol: no XWM running");
+    if (argc < 2) return throwErr(env, "xwmSendWmProtocol(window, protocolAtom)");
+    uint32_t window = 0, proto = 0;
+    napi_get_value_uint32(env, argv[0], &window);
+    napi_get_value_uint32(env, argv[1], &proto);
+    xwmSendWmProtocol(g_xwm.conn, window, proto);
+    napi_value u;
+    napi_get_undefined(env, &u);
+    return u;
+}
+
+// xwmKillClient(window) -> undefined
+//
+// Force-kill the window's owning X client. Fallback when the client doesn't
+// advertise WM_DELETE_WINDOW.
+napi_value XwmKillClient(napi_env env, napi_callback_info info) {
+    size_t argc = 1;
+    napi_value argv[1];
+    napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+    if (!g_xwm.active) return throwErr(env, "xwmKillClient: no XWM running");
+    uint32_t window = 0;
+    if (argc >= 1) napi_get_value_uint32(env, argv[0], &window);
+    xwmKillClient(g_xwm.conn, window);
+    napi_value u;
+    napi_get_undefined(env, &u);
+    return u;
+}
+
 }  // namespace
 
 void RegisterXwayland(napi_env env, napi_value exports) {
@@ -387,6 +482,9 @@ void RegisterXwayland(napi_env env, napi_value exports) {
     reg("xwmStop", XwmStop);
     reg("xwmMapWindow", XwmMapWindow);
     reg("xwmConfigureWindow", XwmConfigureWindow);
+    reg("xwmGetProperty", XwmGetProperty);
+    reg("xwmSendWmProtocol", XwmSendWmProtocol);
+    reg("xwmKillClient", XwmKillClient);
 }
 
 }  // namespace overdraw::xwayland
