@@ -270,6 +270,16 @@ void HostWindow::pump() {
     } else {
         wl_display_cancel_read(display_);
     }
+    // Surface protocol errors on the host connection. A fatal protocol
+    // error here means the host disconnected us silently; without this
+    // log, the only visible symptom is "everything just stops" with no
+    // diagnostic.
+    int err = wl_display_get_error(display_);
+    if (err != 0 && !shouldClose_) {
+        std::fprintf(stderr,
+            "[gpu] host wl_display fatal protocol error: errno=%d\n", err);
+        shouldClose_ = true;
+    }
 }
 
 int HostWindow::displayFd() const {

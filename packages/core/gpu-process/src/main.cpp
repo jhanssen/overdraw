@@ -414,16 +414,13 @@ int run(int wireFd, int ctrlFd, int inputFd, bool headless,
                 chosenIdx, renderNode.c_str());
     wgpu::Adapter adapter(adapters[chosenIdx].Get());
 
-    // Nested: create the wgpu::Surface for this output from the backend.
-    // Headless or KMS: no wgpu::Surface (KMS scans out via SharedTextureMemory
-    // textures dual-imported from GBM, not via Dawn WSI). The KMS backend's
-    // createWgpuSurface returns null intentionally; only the nested
-    // HostWindowOutputBackend returns a real surface.
-    wgpu::Surface surface;
-    if (!headless && !outputKms) {
-        surface = output->createWgpuSurface(inst);
-        if (!surface) { std::fprintf(stderr, "[gpu] CreateSurface failed\n"); return 1; }
-    }
+    // Headless / KMS / nested: no Dawn WSI surface. The nested on-screen
+    // present path runs through a GPU-process-owned dmabuf scanout ring
+    // whose slots are attached to the host wl_surface directly (mirroring
+    // KMS). Creating a wgpu::Surface would also auto-bind a
+    // wp_linux_drm_syncobj_surface_v1 to our host wl_surface (Mesa's
+    // Vulkan WSI does this on hosts that advertise explicit-sync), after
+    // which the host raises no_acquire_point on our direct attach + commit.
 
     // B1: GBM allocator + Dawn DRM modifier probe (persistent: the allocator
     // owns the gbm device and any allocated bo for the rest of the run).
@@ -464,76 +461,34 @@ int run(int wireFd, int ctrlFd, int inputFd, bool headless,
         }
     }
 
-    // 6b/7/8) Surface caps + inject + SurfaceReady -- NESTED only. Headless has
-    // no surface; the core renders into an offscreen texture (no swapchain) and
-    // does not wait for SurfaceReady.
-    //
-    // The swapchain config triple (format/presentMode/alphaMode) is cached in
-    // outer scope so the resize handler can re-apply Configure with the same
-    // values when the host window changes size.
-    uint32_t surfaceFormat = static_cast<uint32_t>(WGPUTextureFormat_BGRA8Unorm);
-    uint32_t surfacePresentMode = static_cast<uint32_t>(wgpu::PresentMode::Fifo);
-    constexpr uint32_t kSurfaceAlphaMode = static_cast<uint32_t>(WGPUCompositeAlphaMode_Opaque);
+    // Nested bring-up: SurfaceReady (size + zero surface handle, no WSI) +
+    // OutputDescriptor. Headless / KMS skip this entirely.
     if (!headless && !outputKms) {
-    wgpu::SurfaceCapabilities caps{};
-    surface.GetCapabilities(adapter, &caps);
-    // Choose a NON-sRGB swapchain format. Client buffers carry sRGB-encoded
-    // bytes and the compositing shader passes them through unchanged; an sRGB
-    // swapchain target would sRGB-encode the output a second time (visibly too
-    // bright). Prefer the first advertised non-*Srgb format; fall back to the
-    // first format, then BGRA8Unorm.
-    auto isSrgb = [](uint32_t f) {
-        return f == static_cast<uint32_t>(WGPUTextureFormat_RGBA8UnormSrgb) ||
-               f == static_cast<uint32_t>(WGPUTextureFormat_BGRA8UnormSrgb);
-    };
-    if (caps.formatCount) {
-        surfaceFormat = static_cast<uint32_t>(caps.formats[0]);
-        for (size_t i = 0; i < caps.formatCount; ++i) {
-            uint32_t f = static_cast<uint32_t>(caps.formats[i]);
-            if (!isSrgb(f)) { surfaceFormat = f; break; }
-        }
-    }
-
-    // Prefer Mailbox: GetCurrentTexture is a blocking wire call on the server's
-    // single command thread, and FIFO blocks it whenever the host compositor
-    // isn't consuming frames (e.g. the nested window is unviewed) -- which
-    // stalls all other wire work behind it (buffer map, etc.). Mailbox never
-    // blocks the acquire (it replaces the unpresented frame). Fall back to the
-    // first advertised mode if Mailbox is unsupported.
-    bool haveMailbox = false;
-    for (size_t i = 0; i < caps.presentModeCount; ++i)
-        if (caps.presentModes[i] == wgpu::PresentMode::Mailbox) haveMailbox = true;
-    if (haveMailbox) surfacePresentMode = static_cast<uint32_t>(wgpu::PresentMode::Mailbox);
-    else if (caps.presentModeCount) surfacePresentMode = static_cast<uint32_t>(caps.presentModes[0]);
-
-    // 7) Inject the surface at the client's reserved handle.
-    if (!server.InjectSurface(surface.Get(),
-                              {ready.surface.id, ready.surface.generation},
-                              {ready.instance.id, ready.instance.generation})) {
-        std::fprintf(stderr, "[gpu] InjectSurface failed\n");
-        return 1;
-    }
-    std::printf("[gpu] injected surface; format=%u\n", surfaceFormat);
-
-    // 8) Tell the core the surface is ready (caps + size).
+    // Nested bring-up.
+    // SurfaceReady: tell the core the surface is "ready" with the window's
+    // logical size. The surface handle is zero (no wgpu::Surface created;
+    // see above), the format / presentMode / alphaMode fields are ignored
+    // by the core's bringUp once it sees a zero handle. (The
+    // wp_linux_drm_syncobj_v1 dance Mesa would have set up if we'd created
+    // the WSI surface is also skipped, which is the point.)
     {
         ipc::Message m{};
         m.tag = ipc::Tag::SurfaceReady;
-        m.surface = ready.surface;
-        m.format = surfaceFormat;
-        m.presentMode = surfacePresentMode;
-        m.alphaMode = kSurfaceAlphaMode;
+        m.surface = {0, 0};  // no WSI surface
+        m.format = 0;
+        m.presentMode = 0;
+        m.alphaMode = 0;
         m.width = outW();
         m.height = outH();
         ipc::sendMessage(ctrlFd, m);
     }
 
-    // 8b) Output descriptor: nested-window size + host-derived
-    // refresh/scale/transform/physical, and overdraw-synthesized make/model/
-    // name. Sent ONCE here so the core's state.outputs starts with real
-    // values; the host wl_output bound during HostWindow::open() has its
-    // first done burst by now (open() does the second roundtrip). A future
-    // re-emit path (slice 3b) sends this again on host-window resize.
+    // OutputDescriptor: nested-window size + host-derived refresh / scale /
+    // transform / physical, and overdraw-synthesized make/model/name. Sent
+    // ONCE here so the core's state.outputs starts with real values; the
+    // host wl_output bound during HostWindow::open() has its first done
+    // burst by now (open() does the second roundtrip). The resize handler
+    // below re-sends this on host-window resize.
     {
         gpu::OutputDescriptorInfo info{};
         output->describeOutput(info);
@@ -880,6 +835,102 @@ int run(int wireFd, int ctrlFd, int inputFd, bool headless,
     }
 #endif  // OVERDRAW_KMS
 
+    // Nested scanout bring-up (analogue of the KMS block above): allocate
+    // the host-attached dmabuf scanout ring on the core device, wait for
+    // one ScanoutReserve from the core on the WIRE, and inject the slots
+    // at the reserved wire handles. The flow mirrors KMS exactly; the
+    // only differences are (a) one output instead of N, and (b) the
+    // sink-specific "wl_buffer for this dmabuf" lives in
+    // HostWindowOutputBackend rather than the kms kernel framebuffer id.
+    if (!headless && !outputKms) {
+        auto* hb = static_cast<gpu::HostWindowOutputBackend*>(output.get());
+        // The scanout fourcc is BGRA8Unorm's DRM fourcc (DRM_FORMAT_ARGB8888
+        // / 0x34325241). It must match the format the core advertises in
+        // its ReserveTexture; the core picks BGRA8Unorm for the scanout
+        // ring (see bringUp's wantSurface branch).
+        constexpr uint32_t kScanoutFourcc = 0x34325241u;  // DRM_FORMAT_ARGB8888
+        if (!hb->initScanout(alloc.gbm(), coreDevice, kScanoutFourcc)) {
+            std::fprintf(stderr, "[gpu] HostWindowOutputBackend::initScanout failed\n");
+            return 1;
+        }
+
+        // Wait for exactly one ScanoutReserve from the core for outputId=0.
+        uint32_t reservesHandled = 0;
+        dispatchCoreControlFrame = [&](ipc::FrameKind kind,
+                                       const std::vector<uint8_t>& frame,
+                                       const int* /*fds*/, int nfds) {
+            if (kind != ipc::FrameKind::ScanoutReserve) {
+                std::fprintf(stderr,
+                    "[gpu] nested startup: unexpected wire frame kind=%u (expected ScanoutReserve)\n",
+                    static_cast<unsigned>(kind));
+                std::abort();
+            }
+            if (nfds != 0) {
+                std::fprintf(stderr,
+                    "[gpu] nested startup: ScanoutReserve with nfds=%d (must be 0)\n", nfds);
+                std::abort();
+            }
+            if (frame.size() != ipc::ScanoutReservePayload::kSize) {
+                std::fprintf(stderr,
+                    "[gpu] nested startup: ScanoutReserve bad payload size %zu\n", frame.size());
+                std::abort();
+            }
+            auto p = ipc::ScanoutReservePayload::decode(frame.data());
+            if (p.outputId != 0) {
+                std::fprintf(stderr,
+                    "[gpu] nested startup: ScanoutReserve for unexpected output %u (only 0 supported)\n",
+                    p.outputId);
+                std::abort();
+            }
+            auto* ring = hb->scanoutRing();
+            if (!ring) {
+                std::fprintf(stderr,
+                    "[gpu] nested startup: scanout ring is not built\n");
+                std::abort();
+            }
+            wgpu::SharedTextureMemory mems[3];
+            wgpu::Texture texs[3];
+            for (int i = 0; i < 3; ++i) {
+                const auto& slot = ring->slot(i);
+                mems[i] = slot.mem;
+                texs[i] = slot.tex;
+            }
+            const bool injectOk = injectScanoutRingSlots(0, p, mems, texs);
+            sendScanoutReady(0, injectOk);
+            if (!injectOk) {
+                std::fprintf(stderr,
+                    "[gpu] nested startup: ScanoutReserve handling failed\n");
+                std::abort();
+            }
+            std::printf("[gpu] nested scanout ready for output 0 (3 slots injected)\n");
+            ++reservesHandled;
+        };
+        for (int i = 0; i < 500000 && reservesHandled < 1; ++i) {
+            pumpWire();
+            usleepShort();
+        }
+        if (reservesHandled < 1) {
+            std::fprintf(stderr, "[gpu] no ScanoutReserve received (nested)\n");
+            return 1;
+        }
+        dispatchCoreControlFrame = nullptr;
+
+        // Wire the host's wl_buffer.release event to a ScanoutFlipComplete
+        // ctrl message. This is the nested equivalent of KMS's
+        // ScanoutFlipComplete: the slot just released is now FREE on our
+        // side, the core advances its slot state machine, and the addon's
+        // wake state machine drives the next render. surfaceBufId carries
+        // the SLOT INDEX (matching the KMS encoding the core's drainCtrl
+        // already handles).
+        hb->setBufferReleaseListener([ctrlFd](int retiredSlotIdx) {
+            ipc::Message m{};
+            m.tag = ipc::Tag::ScanoutFlipComplete;
+            m.outputId = 0;
+            m.surfaceBufId = static_cast<uint32_t>(retiredSlotIdx);
+            ipc::sendMessage(ctrlFd, m);
+        });
+    }
+
     // Host-window resize handler (NESTED only). The host fires
     // xdg_toplevel.configure(w,h) when the user resizes the overdraw window;
     // HostWindow acks it and calls onSize, which invokes this listener with
@@ -904,19 +955,15 @@ int run(int wireFd, int ctrlFd, int inputFd, bool headless,
     // textures.
     if (!headless && !outputKms) {
         output->setResizeListener(
-            [&surface, &coreDevice, &surfaceFormat, &surfacePresentMode, &output, ctrlFd]
+            [&output, ctrlFd]
             (uint32_t newW, uint32_t newH) {
-                if (!surface) return;
-                wgpu::SurfaceConfiguration cfg{};
-                cfg.device      = coreDevice;
-                cfg.format      = static_cast<wgpu::TextureFormat>(surfaceFormat);
-                cfg.usage       = wgpu::TextureUsage::RenderAttachment;
-                cfg.width       = newW;
-                cfg.height      = newH;
-                cfg.alphaMode   = static_cast<wgpu::CompositeAlphaMode>(kSurfaceAlphaMode);
-                cfg.presentMode = static_cast<wgpu::PresentMode>(surfacePresentMode);
-                surface.Configure(&cfg);
-
+                // TODO(nested-dmabuf): rebuild the scanout ring at the new
+                // dimensions (DmabufScanoutRing reinit + re-wrap each slot
+                // as a fresh host wl_buffer + re-send a ScanoutReserve to
+                // the core so the new slot textures get InjectTexture'd at
+                // freshly reserved wire handles). Until then, the ring's
+                // slots stay at the bring-up size; the host scales the
+                // attached buffer, which is visibly wrong on shrink/grow.
                 gpu::OutputDescriptorInfo info{};
                 output->describeOutput(info);
                 ipc::Message m{};
@@ -934,20 +981,30 @@ int run(int wireFd, int ctrlFd, int inputFd, bool headless,
                 std::memcpy(m.outputModel,  info.model,  sizeof(m.outputModel));
                 std::memcpy(m.outputEdidId, info.edidId, sizeof(m.outputEdidId));
                 ipc::sendMessage(ctrlFd, m);
-                std::printf("[gpu] resize -> %ux%u; reconfigured surface; sent OutputDescriptor\n",
+                std::printf("[gpu] resize -> %ux%u; sent OutputDescriptor\n",
                             newW, newH);
             });
     }
 
-    // Nested-mode frame-done plumbing (drm-design.md "Frame clock"): the host
-    // wl_surface.frame callback fires when the host compositor is ready for
-    // the next frame; the GPU process forwards that as ipc::Tag::FrameComplete
-    // to the core, where the addon's wake state machine drives the next
-    // render and dispatchFrameCallbacksForOutput delivers wl_callback.done to
-    // the resident clients. KMS uses ScanoutFlipComplete for the same role
-    // (see further below). The callback is one-shot per host vsync;
-    // HostWindow::onFrameCallbackDone re-arms it for the next vblank, so we
-    // only need to prime the chain once here.
+    // Two host-side signals drive the present loop in nested mode:
+    //
+    //   (a) wl_surface.frame.done: the host is ready for the next frame.
+    //       Forwarded as Tag::FrameComplete to the core, which wakes the
+    //       JS compositor's render loop. Frame-callback chain self-arms
+    //       inside HostWindow::onFrameCallbackDone, so priming once here
+    //       is enough.
+    //
+    //   (b) wl_buffer.release(slot N): the host is done sampling slot N's
+    //       dmabuf; the slot is reusable. Forwarded as
+    //       Tag::ScanoutFlipComplete with surfaceBufId = slot index. The
+    //       core flips its slot state machine: slot N -> FREE. Wired up
+    //       via setBufferReleaseListener during the nested scanout
+    //       bring-up above.
+    //
+    // Both signals are needed: (a) is the per-vblank "you may render" beat,
+    // (b) is per-slot recyclability. Without (a) the loop never re-fires
+    // after the first present; without (b) a slot stays PENDING forever
+    // and acquireOutputTextureHandle eventually returns null.
     if (!headless && !outputKms) {
         output->setFrameDoneListener([ctrlFd]() {
             ipc::Message m{};

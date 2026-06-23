@@ -313,23 +313,22 @@ bool Compositor::bringUp() {
     };
 
     // DeviceReady; then dispatch on output mode:
-    //   nested  -> wait for SurfaceReady (+ FeedbackData)
-    //   kms     -> wait for ScanoutInjected (+ FeedbackData)
+    //   nested  -> wait for SurfaceReady (+ FeedbackData), then run the
+    //              scanout-ring bring-up (mirrors KMS).
+    //   kms     -> wait for OutputDescriptor (+ FeedbackData), then run
+    //              the scanout-ring bring-up.
     //   headless-> wait for FeedbackData only (no surface).
-    // KMS and headless DeviceReady carry a zero surface handle (the GPU
-    // process does not InjectSurface in either case).
-    WGPUSurfaceCapabilities emptyCaps{};
-    dawn::wire::ReservedSurface rs{};
+    // DeviceReady's surface handle is always zero: no wgpu::Surface lives
+    // on either side any more (KMS never had one; nested no longer creates
+    // one -- see the bringUp comment in the wantSurface branch below).
     const bool wantSurface = !headless_ && !kmsMode_;
-    if (wantSurface) rs = link_->client().ReserveSurface(instance_.Get(), &emptyCaps);
     {
         ipc::Message m{};
         m.tag = ipc::Tag::DeviceReady;
         m.instance = {ri.handle.id, ri.handle.generation};
         auto dh = link_->client().GetWireHandle(device_.Get());
         m.device = {dh.id, dh.generation};
-        m.surface = wantSurface ? ipc::WireHandle{rs.handle.id, rs.handle.generation}
-                                : ipc::WireHandle{0, 0};
+        m.surface = {0, 0};
         ipc::sendMessage(ctrlFd_, m);
     }
 
@@ -494,19 +493,22 @@ bool Compositor::bringUp() {
     };
 
     if (wantSurface) {
-        // Configure swapchain.
-        surface_ = wgpu::Surface::Acquire(rs.surface);
-        renderFormat_ = static_cast<wgpu::TextureFormat>(surfReady.format);
-        wgpu::SurfaceConfiguration cfg{};
-        cfg.device = device_;
-        cfg.format = renderFormat_;
-        cfg.usage = wgpu::TextureUsage::RenderAttachment;
-        cfg.width = surfReady.width;
-        cfg.height = surfReady.height;
-        cfg.alphaMode = static_cast<wgpu::CompositeAlphaMode>(surfReady.alphaMode);
-        cfg.presentMode = static_cast<wgpu::PresentMode>(surfReady.presentMode);
-        surface_.Configure(&cfg);
-        link_->flush();
+        // Nested: the GPU process no longer creates a Dawn WSI swapchain
+        // surface (its Mesa side-effect of auto-binding
+        // wp_linux_drm_syncobj_surface_v1 on the host wl_surface would
+        // conflict with our direct dmabuf attach + commit). SurfaceReady
+        // carries width/height and a zero surface handle. The on-screen
+        // present path runs through a scanout ring just like KMS:
+        // reserve 3 texture handles, send ScanoutReserve, wait for
+        // ScanoutReady. The scanout dmabufs the GPU process allocates are
+        // picked from the host's advertised modifier list for BGRA8Unorm.
+        windowWidth_  = surfReady.width;
+        windowHeight_ = surfReady.height;
+        renderFormat_ = wgpu::TextureFormat::BGRA8Unorm;
+        std::vector<KmsOutputDims> nestedOuts = {
+            { 0, surfReady.width, surfReady.height }
+        };
+        if (!runScanoutBringUp(nestedOuts)) return false;
     } else if (kmsMode_) {
         // Scanout texture format matches the compositor's render path.
         renderFormat_ = wgpu::TextureFormat::BGRA8Unorm;
@@ -861,13 +863,25 @@ void Compositor::drainCtrl() {
     ipc::Message r{};
     while (ipc::recvMessageNB(ctrlFd_, r)) {
         if (r.tag == ipc::Tag::ScanoutFlipComplete) {
-            // The GPU process flipped output `outputId` to slot `surfaceBufId`
-            // (the slot index). Advance that output's local state machine: that
-            // slot is now SCANOUT, the prior SCANOUT slot becomes FREE.
+            // Backend-specific slot-state advance.
+            //   KMS: a page-flip just completed on `outputId`; the slot at
+            //   index `surfaceBufId` is now SCANOUT, the prior SCANOUT
+            //   slot becomes FREE. This is also the per-output vblank
+            //   edge, so push to flipCompletes_ to wake the next render
+            //   cycle for that output.
+            //   Nested: a host wl_buffer.release just retired slot
+            //   `surfaceBufId` (it became FREE). The host's vblank-pacing
+            //   signal is Tag::FrameComplete (wl_surface.frame.done), not
+            //   this; releases can arrive multiple per vblank, so don't
+            //   push to flipCompletes_ here -- it would over-dispatch
+            //   client wl_callback.done.
             const int flipped = static_cast<int>(r.surfaceBufId);
             auto it = scanoutOutputs_.find(r.outputId);
-            if (it != scanoutOutputs_.end() && flipped >= 0 && flipped < 3) {
-                ScanoutSlot* slots = it->second.slots;
+            if (it == scanoutOutputs_.end() || flipped < 0 || flipped >= 3) {
+                continue;
+            }
+            ScanoutSlot* slots = it->second.slots;
+            if (kmsMode_) {
                 for (int i = 0; i < 3; ++i) {
                     if (i == flipped) continue;
                     if (slots[i].state == ScanoutSlotState::SCANOUT) {
@@ -875,9 +889,15 @@ void Compositor::drainCtrl() {
                     }
                 }
                 slots[flipped].state = ScanoutSlotState::SCANOUT;
+                frameCompleteSeen_ = true;
+                flipCompletes_.push_back(r.outputId);
+            } else {
+                // Nested: the released slot returns directly to FREE.
+                // There is no SCANOUT state in this model -- the host
+                // implicitly latches a buffer on commit; we only learn
+                // which slot is reusable from this release event.
+                slots[flipped].state = ScanoutSlotState::FREE;
             }
-            frameCompleteSeen_ = true;
-            flipCompletes_.push_back(r.outputId);
             continue;
         }
         if (r.tag == ipc::Tag::FrameComplete) {
@@ -1201,88 +1221,69 @@ int Compositor::pluginInstanceInjected(uint32_t connId) const {
 
 WGPUTexture Compositor::acquireOutputTextureHandle(uint32_t outputId) {
     if (headless_) return nullptr;
+    if (kmsMode_ && kmsPaused_) return nullptr;  // VT-switched away (KMS).
+    auto it = scanoutOutputs_.find(outputId);
+    if (it == scanoutOutputs_.end()) return nullptr;  // no ring for this output
+    ScanoutOutput& so = it->second;
+    // Per-output gate (KMS only): the kernel rejects a second atomic
+    // commit while one is queued (EBUSY), so block here while a flip is
+    // in flight. Nested has no such restriction: the host's
+    // wl_buffer.release fires the previous slot when we commit the next
+    // one, so multiple buffers can be in flight (one PENDING, one or two
+    // already retired and FREE). The ring depth (3) is enough slack.
     if (kmsMode_) {
-        if (kmsPaused_) return nullptr;  // VT-switched away; skip the frame.
-        auto it = scanoutOutputs_.find(outputId);
-        if (it == scanoutOutputs_.end()) return nullptr;  // no ring for this output
-        ScanoutOutput& so = it->second;
-        // Per-output flip gate: the kernel accepts only one queued page-flip
-        // per CRTC. If this output already has a slot in PENDING_FLIP, the
-        // next atomic commit would be rejected with EBUSY -- and even if it
-        // weren't, queueing a second present before the first one is on screen
-        // means the panel never displays the intermediate frame. Wait for the
-        // pending flip's completion event before letting the JS compositor
-        // render this output again. With different per-output refresh rates,
-        // each output is independently paced: a 240Hz panel's flip-complete
-        // re-triggers the loop every ~4ms but the 60Hz panel stays gated on
-        // its own ~16ms flip-complete.
         for (int i = 0; i < 3; ++i) {
             if (so.slots[i].state == ScanoutSlotState::PENDING_FLIP) return nullptr;
         }
-        // Pick the next FREE slot. The texture handle was returned by the
-        // wire-client ReserveTexture during bring-up; the GPU process has
-        // InjectTexture'd at it (ScanoutReady ok=1 attests).
-        //
-        // Open a producer BeginAccess bracket on the slot's SharedTextureMemory.
-        // Reuses the same in-band kind=1 wire frame the plugin overlay path
-        // uses (SurfaceAccessPayload{surfaceBufId, producer=true}); the GPU
-        // process has registered this surfaceBufId as a SurfaceBuf during
-        // ScanoutReady. Without this bracket, Dawn validation rejects every
-        // queue submit that uses the scanout texture with "used in a submit
-        // without current access to SharedTextureMemory".
-        for (int i = 0; i < 3; ++i) {
-            if (so.slots[i].state != ScanoutSlotState::FREE) continue;
-            so.currentSlot = i;
-            writeProducerBeginAccess(so.slots[i].surfaceBufId);
-            return so.slots[i].tex;
-        }
-        return nullptr;  // all slots busy
     }
-    if (!surface_) return nullptr;
-    wgpu::SurfaceTexture st{};
-    surface_.GetCurrentTexture(&st);
-    if (!st.texture) return nullptr;
-    currentOutputTexture_ = st.texture;  // hold a ref until present
-    return st.texture.Get();
+    // Pick the next FREE slot. The texture handle was returned by the
+    // wire-client ReserveTexture during bring-up; the GPU process has
+    // InjectTexture'd at it (ScanoutReady ok=1 attests).
+    //
+    // Open a producer BeginAccess bracket on the slot's SharedTextureMemory.
+    // Reuses the same in-band kind=1 wire frame the plugin overlay path
+    // uses (SurfaceAccessPayload{surfaceBufId, producer=true}); the GPU
+    // process has registered this surfaceBufId as a SurfaceBuf during
+    // ScanoutReady. Without this bracket, Dawn validation rejects every
+    // queue submit that uses the scanout texture with "used in a submit
+    // without current access to SharedTextureMemory".
+    for (int i = 0; i < 3; ++i) {
+        if (so.slots[i].state != ScanoutSlotState::FREE) continue;
+        so.currentSlot = i;
+        writeProducerBeginAccess(so.slots[i].surfaceBufId);
+        return so.slots[i].tex;
+    }
+    return nullptr;  // all slots busy
 }
 
 void Compositor::presentOutput(uint32_t outputId) {
     if (headless_) return;
-    if (kmsMode_) {
-        auto it = scanoutOutputs_.find(outputId);
-        if (it == scanoutOutputs_.end()) return;
-        ScanoutOutput& so = it->second;
-        if (so.currentSlot < 0) return;  // no slot was acquired this frame
-        const int slot = so.currentSlot;
-        so.currentSlot = -1;
-        so.slots[slot].state = ScanoutSlotState::PENDING_FLIP;
+    auto it = scanoutOutputs_.find(outputId);
+    if (it == scanoutOutputs_.end()) return;
+    ScanoutOutput& so = it->second;
+    if (so.currentSlot < 0) return;  // no slot was acquired this frame
+    const int slot = so.currentSlot;
+    so.currentSlot = -1;
+    so.slots[slot].state = ScanoutSlotState::PENDING_FLIP;
 
-        // Close the producer access bracket on this slot's STM. The
-        // EndAccess writes are in-band on the wire (kind=2), FIFO-ordered
-        // after the render submit, so the GPU process EndAccess's the STM
-        // AFTER the queue submit has been processed -- producing a sync_file
-        // fd that we then attach to the atomic commit's IN_FENCE_FD prop.
-        // The fence-fd attachment happens GPU-side: the GPU process pairs
-        // each EndAccess on a scanout surfaceBufId with the next
-        // ScanoutPresent on the same slot and stuffs the captured fd into
-        // the atomic commit. So the core does NOT need to ship a fence fd
-        // through the ScanoutPresent SCM_RIGHTS path -- it's already in the
-        // GPU process's hands by then.
-        writeProducerEndAccess(so.slots[slot].surfaceBufId);
+    // Close the producer access bracket on this slot's STM. The EndAccess
+    // writes are in-band on the wire (kind=2), FIFO-ordered after the
+    // render submit, so the GPU process EndAccess's the STM AFTER the
+    // queue submit has been processed -- producing a sync_file fd that the
+    // GPU process then attaches to the next ScanoutPresent for this slot
+    // (KMS: IN_FENCE_FD on the atomic commit; nested: the explicit-sync
+    // acquire fence on the host wl_surface commit, when the host
+    // advertises wp_linux_drm_syncobj_v1). The core does NOT need to ship
+    // a fence fd through the ScanoutPresent SCM_RIGHTS path -- the GPU
+    // process holds it.
+    writeProducerEndAccess(so.slots[slot].surfaceBufId);
 
-        ipc::Message m{};
-        m.tag = ipc::Tag::ScanoutPresent;
-        m.outputId = outputId;
-        m.surfaceBufId = so.slots[slot].surfaceBufId;
-        ipc::sendMessage(ctrlFd_, m);
-        presented_++;
-        link_->flush();
-        return;
-    }
-    if (!surface_) return;
-    surface_.Present();
+    ipc::Message m{};
+    m.tag = ipc::Tag::ScanoutPresent;
+    m.outputId = outputId;
+    m.surfaceBufId = so.slots[slot].surfaceBufId;
+    ipc::sendMessage(ctrlFd_, m);
     presented_++;
-    currentOutputTexture_ = nullptr;
     link_->flush();
 }
 
