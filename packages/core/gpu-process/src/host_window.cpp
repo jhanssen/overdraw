@@ -7,6 +7,7 @@
 
 #include <wayland-client.h>
 #include "xdg-shell-client-protocol.h"
+#include "linux-dmabuf-v1-client-protocol.h"
 
 #include "input_channel.h"
 #include "transport.h"
@@ -113,6 +114,21 @@ const wl_output_listener kOutputListener = {
     outGeometry, outMode, outDone, outScale, outName, outDescription,
 };
 
+// ---- Host linux-dmabuf-v1 listener --------------------------------------
+
+void hostDmabufFormat(void* /*data*/, zwp_linux_dmabuf_v1*, uint32_t /*fourcc*/) {
+    // v1 format-only events are superseded by the v3 modifier events the
+    // bind below requests. Ignore: a host advertising v1 has nothing to
+    // tell us about modifier support anyway.
+}
+void hostDmabufModifier(void* data, zwp_linux_dmabuf_v1*, uint32_t fourcc,
+                        uint32_t modHi, uint32_t modLo) {
+    static_cast<HostWindow*>(data)->onHostDmabufModifier(fourcc, modHi, modLo);
+}
+const zwp_linux_dmabuf_v1_listener kDmabufListener = {
+    hostDmabufFormat, hostDmabufModifier,
+};
+
 void regGlobal(void* data, wl_registry* reg, uint32_t name,
                const char* iface, uint32_t version) {
     auto* w = static_cast<HostWindow*>(data);
@@ -136,6 +152,14 @@ void regGlobal(void* data, wl_registry* reg, uint32_t name,
             w->bindOutput(static_cast<wl_output*>(
                 wl_registry_bind(reg, name, &wl_output_interface, version < 4 ? version : 4)));
         }
+    } else if (!std::strcmp(iface, zwp_linux_dmabuf_v1_interface.name)) {
+        // v3 carries per-(format, modifier) advertisements; v4 introduces the
+        // feedback object. We need only the v3 modifier list to pick a
+        // ring-allocation modifier the host can import, so bind at v3.
+        const uint32_t want = 3;
+        w->bindHostDmabuf(static_cast<zwp_linux_dmabuf_v1*>(
+            wl_registry_bind(reg, name, &zwp_linux_dmabuf_v1_interface,
+                             version < want ? version : want)));
     }
 }
 void regRemove(void*, wl_registry*, uint32_t) {}
@@ -268,6 +292,57 @@ void HostWindow::bindSeat(wl_seat* s) {
 void HostWindow::bindOutput(wl_output* o) {
     output_ = o;
     wl_output_add_listener(output_, &kOutputListener, this);
+}
+
+void HostWindow::bindHostDmabuf(zwp_linux_dmabuf_v1* d) {
+    hostDmabuf_ = d;
+    zwp_linux_dmabuf_v1_add_listener(hostDmabuf_, &kDmabufListener, this);
+}
+
+void HostWindow::onHostDmabufModifier(uint32_t fourcc, uint32_t modHi, uint32_t modLo) {
+    const uint64_t mod = (static_cast<uint64_t>(modHi) << 32) | modLo;
+    // De-dupe: a host that repeats an advertisement should not bloat the
+    // list. Linear scan is fine; the list is small (tens to low hundreds).
+    for (const auto& f : hostFormats_) {
+        if (f.fourcc == fourcc && f.modifier == mod) return;
+    }
+    hostFormats_.push_back({fourcc, mod});
+}
+
+wl_buffer* HostWindow::createWlBufferFromDmabuf(int fd, uint32_t width, uint32_t height,
+                                                uint32_t fourcc, uint64_t modifier,
+                                                uint32_t offset, uint32_t stride) {
+    if (!hostDmabuf_ || fd < 0) return nullptr;
+
+    zwp_linux_buffer_params_v1* params =
+        zwp_linux_dmabuf_v1_create_params(hostDmabuf_);
+    if (!params) return nullptr;
+
+    const uint32_t modHi = static_cast<uint32_t>(modifier >> 32);
+    const uint32_t modLo = static_cast<uint32_t>(modifier & 0xFFFFFFFFu);
+    // plane_idx=0: single-plane formats only for the scanout ring. The host
+    // closes its copy of the fd after create_immed reads it, so we dup here
+    // and let the host own the dup.
+    int dup = ::dup(fd);
+    if (dup < 0) {
+        zwp_linux_buffer_params_v1_destroy(params);
+        return nullptr;
+    }
+    zwp_linux_buffer_params_v1_add(params, dup, 0, offset, stride, modHi, modLo);
+    ::close(dup);
+
+    // create_immed returns a wl_buffer synchronously; the host is required
+    // to fail the import asynchronously via the buffer's wl_buffer.destroy
+    // path (or by raising a protocol error) if the params are unacceptable.
+    // For a single-plane dmabuf with a host-advertised modifier this is
+    // expected to succeed; failures show up as a protocol error during the
+    // next dispatch and abort the connection.
+    wl_buffer* buf = zwp_linux_buffer_params_v1_create_immed(
+        params,
+        static_cast<int32_t>(width), static_cast<int32_t>(height),
+        fourcc, /*flags=*/0);
+    zwp_linux_buffer_params_v1_destroy(params);
+    return buf;
 }
 
 void HostWindow::onOutputGeometry(int32_t physWMm, int32_t physHMm, int32_t transform,

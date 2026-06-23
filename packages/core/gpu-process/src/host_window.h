@@ -10,6 +10,7 @@
 #include <cstdint>
 #include <functional>
 #include <string>
+#include <vector>
 
 struct wl_display;
 struct wl_compositor;
@@ -22,6 +23,9 @@ struct wl_output;
 struct xdg_wm_base;
 struct xdg_surface;
 struct xdg_toplevel;
+struct zwp_linux_dmabuf_v1;
+struct zwp_linux_buffer_params_v1;
+struct wl_buffer;
 
 namespace overdraw::gpu {
 
@@ -122,6 +126,36 @@ class HostWindow {
     const std::string& hostOutputModel() const { return hostModel_; }
     const std::string& hostOutputName()  const { return hostName_; }
 
+    // Host-side linux-dmabuf-v1 (we are a CLIENT of the host compositor). The
+    // host advertises a list of (fourcc, modifier) pairs the host can import;
+    // we use that intersection with our own GPU's capabilities to pick the
+    // format+modifier for the per-output dmabuf scanout ring. Bound on
+    // registry; format/modifier advertisements arrive after a roundtrip.
+    void bindHostDmabuf(zwp_linux_dmabuf_v1* d);
+    void onHostDmabufModifier(uint32_t fourcc, uint32_t modHi, uint32_t modLo);
+    bool hasHostDmabuf() const { return hostDmabuf_ != nullptr; }
+
+    // One (fourcc, modifier) host-advertised pair. The version-3 protocol
+    // sends only modifier events; older versions' format-only events would
+    // collapse to (fourcc, DRM_FORMAT_MOD_INVALID). The accumulator
+    // de-duplicates so a host that repeats entries doesn't bloat the list.
+    struct HostDmabufFormat {
+        uint32_t fourcc;
+        uint64_t modifier;
+    };
+    const std::vector<HostDmabufFormat>& hostDmabufFormats() const { return hostFormats_; }
+
+    // Wrap an exported dmabuf fd as a host wl_buffer via the host's
+    // zwp_linux_dmabuf_v1. Returns nullptr on failure (host did not advertise
+    // dmabuf, or create_immed reported an error). The caller does NOT transfer
+    // ownership of the fd: this dups it for the params.add request (the host
+    // closes its copy after create_immed) and the caller retains ownership of
+    // the original. The returned wl_buffer is owned by the caller and must be
+    // destroyed with wl_buffer_destroy.
+    wl_buffer* createWlBufferFromDmabuf(int fd, uint32_t width, uint32_t height,
+                                        uint32_t fourcc, uint64_t modifier,
+                                        uint32_t offset, uint32_t stride);
+
     // Input forwarding (called from pointer/keyboard listener trampolines).
     // No-op when inputFd_ < 0. `surface` identifies the event target; events on
     // surfaces other than the output surface are ignored.
@@ -152,6 +186,9 @@ class HostWindow {
     wl_seat* seat_ = nullptr;
     wl_pointer* pointer_ = nullptr;
     wl_keyboard* keyboard_ = nullptr;
+
+    zwp_linux_dmabuf_v1* hostDmabuf_ = nullptr;
+    std::vector<HostDmabufFormat> hostFormats_;
 
     wl_output* output_ = nullptr;
     uint32_t hostRefreshMhz_ = 0;
