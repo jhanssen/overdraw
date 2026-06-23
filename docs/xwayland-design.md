@@ -450,9 +450,35 @@ Xwayland or a Wayland session is absent. Coverage targets, smallest tier first:
     create and map -- the standard menu-positioning pattern. GPU
     tests: OR placement at X-supplied coords; OR cleanup on destroy;
     OR focusability.
-  - **3.4 — Focus mirroring.** Pending (parses WM_HINTS.input today
-    but doesn't consume it; the SetInputFocus / WM_TAKE_FOCUS path is
-    not wired).
+  - **3.4 — Focus mirroring.** ✅ Landed. The XWM creates a 1x1
+    override-redirect bookkeeper window at connect-time; native gains
+    `xwmSetInputFocus`, `xwmChangeProperty`, `xwmDeleteProperty`, and
+    a `timestamp` arg on `xwmSendWmProtocol`. New atoms:
+    `_NET_ACTIVE_WINDOW`, `_NET_WM_STATE_FOCUSED`, `_NET_WM_PID`.
+    `KeyboardFocusEvent` widened to carry `{surfaceId, prevSurfaceId,
+    clientId}`. The XWM subscribes to `KEYBOARD_EVENT.focus` and
+    drives `xwayland/focus.ts:planFocusMirror` — the ICCCM truth
+    table collapsed to two booleans
+    (doSetInputFocus = input || !takeFocus; doSendTakeFocus = takeFocus)
+    — emitting SetInputFocus, WM_TAKE_FOCUS ClientMessage, and
+    EWMH state writes. Override-redirect windows are skipped (X
+    client owns OR focus). When focus leaves the X tree, SetInputFocus
+    parks on the bookkeeper and `_NET_ACTIVE_WINDOW` clears.
+    X -> compositor: native decodes FocusIn (dropping pointer-detail
+    + grab/ungrab variants); the TS handler filters stale events
+    via serial validation against the WM's most-recent SetInputFocus
+    sequence. Cross-window FocusIns from the same PID
+    (`_NET_WM_PID` read into XWindow.pid) update `_NET_ACTIVE_WINDOW`
+    + `_NET_WM_STATE_FOCUSED` without disturbing the seat; cross-PID
+    FocusIns are denied by SetInputFocus'ing the previous window
+    (focus-stealing prevention). 17 unit tests for the truth table +
+    OR skip + bookkeeper handoff + serial-validation wraparound;
+    3 GPU tests for the wire-level mirror.
+  Known limitations: _NET_WM_STATE_FOCUSED writes use ChangeProperty
+  REPLACE on the whole property (a client setting other state bits
+  loses them when we touch FOCUSED; clients that care re-assert via
+  change_property on their own state). The clean fix is read-modify-
+  write on the existing property — punted.
 - **Phase 4 — clipboard.** `CLIPBOARD` + `PRIMARY`, including INCR.
 - **Phase 5 — polish + DnD.** Xdnd, `_NET_SUPPORTED` completeness, startup
   notification, window icons, `xwayland-keyboard-grab`, HiDPI policy knob.

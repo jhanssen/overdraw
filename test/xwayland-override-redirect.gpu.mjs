@@ -70,8 +70,10 @@ test("override-redirect X11 window is placed at its X-supplied coords",
 
       // The OR overlay must be at the X-supplied (300, 200) 150x100.
       const ors = overrideRedirects();
-      assert.equal(ors.size, 1, "exactly one OR overlay");
-      const [, rect] = [...ors.entries()][0];
+      const entries = [...ors.entries()];
+      assert.equal(ors.size, 1,
+        `exactly one OR overlay; saw ${entries.length}: ${JSON.stringify(entries)}`);
+      const [, rect] = entries[0];
       assert.deepEqual(rect, { x: 300, y: 200, width: 150, height: 100 },
         "OR rect matches X-supplied coords (identity-mapped in rootless mode)");
 

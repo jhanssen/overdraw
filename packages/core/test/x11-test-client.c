@@ -93,6 +93,7 @@ int main(int argc, char** argv) {
     const xcb_atom_t WM_DELETE_WINDOW = intern(c, "WM_DELETE_WINDOW");
     const xcb_atom_t NET_WM_NAME = intern(c, "_NET_WM_NAME");
     const xcb_atom_t UTF8_STRING = intern(c, "UTF8_STRING");
+    const xcb_atom_t NET_WM_PID = intern(c, "_NET_WM_PID");
 
     // _NET_WM_NAME (UTF-8) -- the modern title; titleAppId reads this first.
     xcb_change_property(c, XCB_PROP_MODE_REPLACE, win, NET_WM_NAME, UTF8_STRING, 8,
@@ -103,22 +104,32 @@ int main(int argc, char** argv) {
     // WM_CLASS (instance\0class\0).
     xcb_change_property(c, XCB_PROP_MODE_REPLACE, win, WM_CLASS, XCB_ATOM_STRING, 8,
                         (uint32_t)wmClassLen, wmClass);
-    // WM_PROTOCOLS = {WM_DELETE_WINDOW}: opt in to the ICCCM close path.
-    xcb_atom_t protocols[1] = { WM_DELETE_WINDOW };
+    // WM_PROTOCOLS: opt in to the ICCCM close path AND advertise that we
+    // accept WM_TAKE_FOCUS (the locally-active input model). The test
+    // harness sets focus via applyKeyboardFocus and expects both signals.
+    const xcb_atom_t WM_TAKE_FOCUS = intern(c, "WM_TAKE_FOCUS");
+    xcb_atom_t protocols[2] = { WM_DELETE_WINDOW, WM_TAKE_FOCUS };
     xcb_change_property(c, XCB_PROP_MODE_REPLACE, win, WM_PROTOCOLS, 4 /*ATOM*/, 32,
-                        1, protocols);
+                        2, protocols);
+    // _NET_WM_PID: tell the WM our process id so the same-PID exception
+    // for focus stealing can match two windows from the same client.
+    const uint32_t mypid = (uint32_t)getpid();
+    xcb_change_property(c, XCB_PROP_MODE_REPLACE, win, NET_WM_PID, 6 /*CARDINAL*/, 32,
+                        1, &mypid);
 
     xcb_map_window(c, win);
     xcb_flush(c);
     printf("[x11] mapped 0x%x\n", win);
     fflush(stdout);
 
-    // We need to observe ConfigureNotify events (both real and synthetic) to
-    // assert the WM is sending its chosen rect. StructureNotify on the
-    // window's selected mask gives us both forms. The XCB_EVENT_MASK_EXPOSURE
-    // we set at create time stays; add StructureNotify on top.
+    // We need to observe ConfigureNotify events (both real and synthetic),
+    // FocusIn/FocusOut (so focus-mirror tests can see the WM landing focus
+    // on us). StructureNotify gives ConfigureNotify; FOCUS_CHANGE gives the
+    // focus events.
     {
-        const uint32_t mask = XCB_EVENT_MASK_EXPOSURE | XCB_EVENT_MASK_STRUCTURE_NOTIFY;
+        const uint32_t mask = XCB_EVENT_MASK_EXPOSURE
+                            | XCB_EVENT_MASK_STRUCTURE_NOTIFY
+                            | XCB_EVENT_MASK_FOCUS_CHANGE;
         xcb_change_window_attributes(c, win, XCB_CW_EVENT_MASK, &mask);
         xcb_flush(c);
     }
@@ -145,6 +156,12 @@ int main(int argc, char** argv) {
                        synthetic ? "synthetic" : "real",
                        cn->x, cn->y, cn->width, cn->height);
                 fflush(stdout);
+            } else if (type == XCB_FOCUS_IN) {
+                printf("[x11] focused\n");
+                fflush(stdout);
+            } else if (type == XCB_FOCUS_OUT) {
+                printf("[x11] unfocused\n");
+                fflush(stdout);
             } else if (type == XCB_CLIENT_MESSAGE) {
                 xcb_client_message_event_t* cm = (xcb_client_message_event_t*)ev;
                 if (cm->type == WM_PROTOCOLS
@@ -154,6 +171,13 @@ int main(int argc, char** argv) {
                     free(ev);
                     xcb_disconnect(c);
                     return 0;
+                }
+                if (cm->type == WM_PROTOCOLS
+                    && cm->data.data32[0] == WM_TAKE_FOCUS) {
+                    // ICCCM locally-active: take the focus the WM offered.
+                    // For tests, just print so the harness can assert.
+                    printf("[x11] take-focus\n");
+                    fflush(stdout);
                 }
             }
             free(ev);

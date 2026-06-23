@@ -345,8 +345,13 @@ export default function makeSeat(ctx: Ctx, driver: FocusDriver): SeatHandler {
     seat.kbFocus = target;
     if (target) sendKbEnter(target);
     // keyboard.focus event: the clipboard layer (re)sends the selection to the
-    // newly focused client (selection follows keyboard focus).
-    ctx.state.bus?.emit(KEYBOARD_EVENT.focus, { clientId: target ? target.clientId : null });
+    // newly focused client (selection follows keyboard focus); the XWM mirrors
+    // focus to X via SetInputFocus / WM_TAKE_FOCUS.
+    ctx.state.bus?.emit(KEYBOARD_EVENT.focus, {
+      surfaceId: target ? target.surfaceId : null,
+      prevSurfaceId: cur ? cur.surfaceId : null,
+      clientId: target ? target.clientId : null,
+    });
     // Activation changed for the window losing AND the window gaining focus; the
     // window.change stream reports each (decorations restyle active/inactive).
     if (cur && (!target || cur.surfaceId !== target.surfaceId)) {

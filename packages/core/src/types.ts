@@ -95,7 +95,7 @@ export interface Addon {
   xwmStart(
     wmFd: number,
     onEvent: (ev: import("./xwayland/xwm.js").XwmEventMsg) => void,
-  ): { atoms: Record<string, number> };
+  ): { atoms: Record<string, number>; root: number; bookkeeper: number };
   xwmStop(): void;
   xwmMapWindow(window: number): void;
   xwmConfigureWindow(window: number, x: number, y: number, w: number, h: number): void;
@@ -109,11 +109,28 @@ export interface Addon {
   // (format=0) if the property is absent or the request errored.
   xwmGetProperty(window: number, atom: number, maxLengthWords?: number): number;
   // Send a WM_PROTOCOLS ClientMessage carrying `protocolAtom` (e.g.
-  // WM_DELETE_WINDOW) to the window's client. Standard ICCCM close path.
-  xwmSendWmProtocol(window: number, protocolAtom: number): void;
+  // WM_DELETE_WINDOW or WM_TAKE_FOCUS) to the window's client. `timestamp`
+  // goes in data[1]; for WM_DELETE_WINDOW pass 0 (XCB_CURRENT_TIME), for
+  // WM_TAKE_FOCUS pass a real X timestamp so focus-stealing prevention in
+  // modern clients doesn't reject the focus offer.
+  xwmSendWmProtocol(window: number, protocolAtom: number, timestamp?: number): void;
   // Force-kill the window's owning client (the fallback for clients that don't
   // advertise WM_DELETE_WINDOW).
   xwmKillClient(window: number): void;
+  // SetInputFocus(window, RevertToPointerRoot, timestamp). Returns the X
+  // request sequence number (consumed by xwm.ts to filter stale FocusIn
+  // events from before the most recent WM-initiated focus change).
+  xwmSetInputFocus(window: number, timestamp?: number): number;
+  // Set/replace a property on a window. `format` is 8/16/32 (X11 units, not
+  // bytes); `nelements` is the count in those units. `data` is a Buffer or
+  // typed array whose byte-length matches nelements * format/8.
+  xwmChangeProperty(
+    window: number, atom: number, type: number, format: number,
+    data: Uint8Array | Uint16Array | Uint32Array | Int32Array, nelements: number,
+  ): void;
+  // Delete a property on a window (used to clear _NET_WM_STATE_FOCUSED on
+  // unfocus etc.).
+  xwmDeleteProperty(window: number, atom: number): void;
   // Server-initiated destruction: drop the libwayland resource + wrapper.
   // For client-issued destructor requests (wl_buffer.destroy etc.) the
   // trampoline handles destruction automatically; JS only needs this for

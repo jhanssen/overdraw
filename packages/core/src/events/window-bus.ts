@@ -14,10 +14,16 @@ import type {
   WindowClosingEvent,
 } from "./types.js";
 
-// Keyboard-focus change (active window). clientId is the newly focused client, or
-// null when focus cleared. In-core consumer: the clipboard layer (selection
-// follows keyboard focus).
-export type KeyboardFocusEvent = { clientId: number | null };
+// Keyboard-focus change (active window). surfaceId / clientId identify the
+// newly focused wl_surface (or null when focus cleared); prevSurfaceId is
+// the surface losing focus (null when focus came from nowhere). In-core
+// consumers: the clipboard layer (selection follows keyboard focus), the
+// XWM (mirror focus to X via SetInputFocus / WM_TAKE_FOCUS).
+export type KeyboardFocusEvent = {
+  surfaceId: number | null;
+  prevSurfaceId: number | null;
+  clientId: number | null;
+};
 
 export const KEYBOARD_EVENT = {
   focus: "keyboard.focus",
