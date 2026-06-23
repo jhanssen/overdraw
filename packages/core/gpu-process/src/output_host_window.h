@@ -9,14 +9,7 @@
 // host's zwp_linux_dmabuf_v1. The compositor renders into the next FREE
 // slot's dmabuf; presentScanout() attaches the slot's wl_buffer to the
 // host wl_surface, damages, commits, and marks the slot PENDING_FLIP. The
-// host's wl_buffer.release event drives a flip-complete callback that
-// transitions the prior SCANOUT slot to FREE and the just-presented one
-// to SCANOUT.
-//
-// createWgpuSurface() remains for compatibility with the older WSI-driven
-// path during the transition; once the scanout-ring path is the only
-// caller, it will be removed along with the rest of the Dawn WSI bring-up
-// in the GPU process.
+// host's wl_buffer.release event drives the slot back to FREE.
 
 #ifndef OVERDRAW_GPU_OUTPUT_HOST_WINDOW_H_
 #define OVERDRAW_GPU_OUTPUT_HOST_WINDOW_H_
@@ -48,8 +41,6 @@ class HostWindowOutputBackend : public OutputBackend {
     }
 
     void describeOutput(OutputDescriptorInfo& out) const override;
-
-    wgpu::Surface createWgpuSurface(wgpu::Instance& instance) override;
 
     int eventFd() const override { return window_.displayFd(); }
     void pump() override { window_.pump(); }

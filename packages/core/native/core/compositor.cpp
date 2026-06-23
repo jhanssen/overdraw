@@ -1382,8 +1382,6 @@ void Compositor::shutdown() {
     for (auto& [bufId, tr] : coreSurfaceReservations_) { (void)bufId; tr.commit(); }
     coreSurfaceReservations_.clear();
     completedJsImports_.clear();
-    currentOutputTexture_ = nullptr;
-    surface_ = nullptr;
     device_ = nullptr;
     instance_ = nullptr;
     link_.reset();  // disconnects the wire client

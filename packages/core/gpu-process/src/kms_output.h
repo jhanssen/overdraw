@@ -22,8 +22,6 @@
 //   - pump() drains DRM events; on flip-complete the owning ring's state
 //     machine advances and the frame clock signals the next acquire is ready.
 //
-// createWgpuSurface() returns null: KMS has no Dawn WSI surface.
-
 #ifndef OVERDRAW_GPU_KMS_OUTPUT_H_
 #define OVERDRAW_GPU_KMS_OUTPUT_H_
 
@@ -98,12 +96,6 @@ class KmsOutputBackend : public OutputBackend {
     bool presentScanoutAt(uint32_t outputId, int slotIdx, int inFenceFd);
     const KmsScanoutRing::Slot& scanoutSlotAt(uint32_t outputId, int slotIdx) const;
     uint32_t crtcIdAt(uint32_t outputId) const;
-
-    // Dawn WSI is not used on KMS. Return null; the GPU process main loop
-    // branches on a null surface to skip WSI bring-up.
-    wgpu::Surface createWgpuSurface(wgpu::Instance& /*instance*/) override {
-        return wgpu::Surface();
-    }
 
     int eventFd() const override { return drmFd_; }
     // The scanout card fd. Used to match the Dawn adapter to this GPU.

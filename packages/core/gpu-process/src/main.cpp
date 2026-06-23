@@ -1,8 +1,8 @@
-// overdraw GPU process (phase 1 nested mode).
+// overdraw GPU process.
 //
-// Native Dawn + wire server. Owns the host Wayland output window and creates
-// the wgpu::Surface from it; the core (wire client) drives the swapchain over
-// the wire. No JS. Spawned by the core with two inherited socket fds:
+// Native Dawn + wire server. Owns the output backend (KMS or host wl_surface)
+// and the GBM-backed scanout ring whose slots the core renders into and
+// presents through. No JS. Spawned by the core with two inherited socket fds:
 //   argv[1] = wire socket fd, argv[2] = side-channel socket fd.
 
 #include <cerrno>

@@ -4,7 +4,6 @@
 #include <cstring>
 
 #include <wayland-client.h>
-#include <webgpu/webgpu_cpp.h>
 
 namespace overdraw::gpu {
 
@@ -12,15 +11,6 @@ HostWindowOutputBackend::~HostWindowOutputBackend() {
     // The ring's dtor destroys its slot wl_buffers; do this BEFORE the
     // HostWindow inside `window_` disconnects from the host display.
     ring_.clear();
-}
-
-wgpu::Surface HostWindowOutputBackend::createWgpuSurface(wgpu::Instance& instance) {
-    wgpu::SurfaceSourceWaylandSurface src{};
-    src.display = window_.display();
-    src.surface = window_.surface();
-    wgpu::SurfaceDescriptor sd{};
-    sd.nextInChain = &src;
-    return instance.CreateSurface(&sd);
 }
 
 namespace {

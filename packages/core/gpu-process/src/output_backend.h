@@ -1,46 +1,38 @@
 // Output backend seam (GPU-process side).
 //
-// The GPU process drives one display target per run. Today that's a host
-// Wayland output window (phase 1, nested mode); the KMS slice replaces it
-// with a DRM connector + atomic modeset + GBM scanout ring. Both implement
-// the same interface so main.cpp's pump loop, surface bring-up flow, and
-// shutdown sequence are output-backend-agnostic.
+// The GPU process drives one display target per run: either a KMS-backed
+// DRM connector + atomic modeset + GBM scanout ring (bare-metal mode), or
+// a host wl_surface bound to a GBM-allocated dmabuf scanout ring attached
+// via the host's zwp_linux_dmabuf_v1 (nested mode). Both implement the
+// same interface so main.cpp's pump loop, bring-up flow, and shutdown
+// sequence are output-backend-agnostic.
 //
-// What this interface intentionally does NOT expose yet:
-//   - acquireScanoutTexture / presentScanoutTexture. The nested backend uses
-//     Dawn's WSI swapchain (created from createWgpuSurface) and the core
-//     drives it directly over the wire (GetCurrentTexture/Present); the GPU
-//     process side never touches it. The KMS slice introduces the
-//     acquire/present primitive when there's a real implementation behind it
-//     -- adding it now would be a stub.
-//   - OutputDescriptor / mode change requests. Same reason: the descriptor
-//     channel lands with slice 3 (wl_output reconfiguration) and the KMS
-//     mode-change request lands with slice 4. Both extend this interface.
-//
-// What the interface DOES expose:
+// What the interface exposes:
 //   - open / close: bring-up + teardown of the display target.
-//   - getSize: current output dimensions, used by the bring-up handshake to
-//     tell the core how big the swapchain / offscreen target should be.
-//   - createWgpuSurface: phase-1 only. Returns a wgpu::Surface for the host
-//     window so Dawn's WSI swapchain can be created on it; the KMS backend
-//     will return a null surface (the scanout is dual-imported via
-//     SharedTextureMemory, not allocated by Dawn through a wgpu::Surface).
+//   - size: current output dimensions, used to size the scanout ring.
+//   - describeOutput: identity (refresh / scale / transform / phys-dims /
+//     make / model / EDID) shipped to the core via OutputDescriptor.
 //   - eventFd / pump: integrate with the GPU process's epoll loop. The
 //     backend has a pollable fd; pump() drains pending events on readable.
 //   - shouldClose: an exit signal from the backend (the host user closed
-//     the window; in phase-2 the equivalent is e.g. a session-end signal).
+//     the window in nested; not used in KMS today).
+//   - setResizeListener: notified when the output dimensions change. In
+//     nested this is the host's xdg_toplevel.configure(w,h); in KMS this
+//     is a future runtime mode-switch hook.
+//   - setFrameDoneListener / armFrameCallback: the nested-mode vblank
+//     edge driving the present loop (the host's wl_surface.frame.done).
+//     KMS leaves these as no-ops; its page-flip path drives the same
+//     role via setFlipCompleteListener on the KMS subclass.
 //
-// Headless mode is NOT an OutputBackend -- there is no output target at all.
-// The GPU process branches on `headless` separately and never constructs an
-// OutputBackend in that case (consistent with today's HostWindow gating).
+// Headless mode is NOT an OutputBackend -- there is no output target at
+// all. The GPU process branches on `headless` separately and never
+// constructs an OutputBackend in that case.
 
 #ifndef OVERDRAW_GPU_OUTPUT_BACKEND_H_
 #define OVERDRAW_GPU_OUTPUT_BACKEND_H_
 
 #include <cstdint>
 #include <functional>
-
-namespace wgpu { class Instance; class Surface; }
 
 namespace overdraw::gpu {
 
@@ -91,13 +83,6 @@ class OutputBackend {
     // Valid only after open(). The core re-emits wl_output / xdg_output on
     // any change.
     virtual void describeOutput(OutputDescriptorInfo& out) const = 0;
-
-    // Build a wgpu::Surface for this output, used by Dawn's WSI swapchain.
-    // The phase-1 host-window backend returns a real surface created from
-    // its host wl_surface. The KMS backend returns a null surface; in that
-    // case the GPU process skips swapchain bring-up entirely and the
-    // scanout ring is dual-imported as wgpu::Texture via SharedTextureMemory.
-    virtual wgpu::Surface createWgpuSurface(wgpu::Instance& instance) = 0;
 
     // Pollable fd for the GPU process's event loop, or -1 if the backend
     // does not have one. The KMS backend's eventFd is the DRM device fd

@@ -31,16 +31,22 @@ namespace overdraw::core {
 
 class Compositor {
   public:
-    // `headless` (with a fixed width/height) brings up with NO swapchain: the
-    // compositing pass renders into an owned offscreen texture (read back via
-    // readbackFrame) instead of a surface, and nothing is presented. Used by
-    // tests; the GPU process must also be spawned with matching --headless WxH.
+    // `headless` (with a fixed width/height) brings up with no on-screen
+    // target: the compositing pass renders into an owned offscreen texture
+    // (read back via readbackFrame) and nothing is presented. Used by tests;
+    // the GPU process must also be spawned with matching --headless WxH.
     //
-    // `kms` selects the bare-metal output path: no wgpu::Surface, three
-    // scanout textures injected by the GPU process at GPU-chosen wire handles
-    // (received via ipc::Tag::ScanoutInjected during bring-up), atomic-commit
-    // driven by side-channel ScanoutPresent / ScanoutFlipComplete messages.
-    // Mutually exclusive with `headless`. Default false (nested mode).
+    // `kms` selects the bare-metal output path: scanout textures dual-imported
+    // from GBM dmabufs and driven by atomic-commit / page-flip-event traffic
+    // on the side channel (ScanoutPresent / ScanoutFlipComplete). Mutually
+    // exclusive with `headless`.
+    //
+    // Default (`kms`=false, `headless`=false): nested mode. The GPU process
+    // is a Wayland client of the host compositor; the on-screen target is
+    // the same 3-slot scanout ring (different per-slot resource: host
+    // wl_buffer wrapping the dmabuf instead of a KMS framebuffer id). The
+    // host's wl_surface.frame.done drives FrameComplete on the side channel,
+    // the host's wl_buffer.release drives ScanoutFlipComplete.
     Compositor(int wireFd, int ctrlFd, pid_t gpuPid,
                bool headless = false, uint32_t headlessW = 0, uint32_t headlessH = 0,
                bool kms = false);
@@ -248,21 +254,24 @@ class Compositor {
                           uint32_t width, uint32_t height,
                           uint32_t refreshMhz);
 
-    // --- KMS scanout path (slice 4) -------------------------------------------
+    // --- Scanout path (KMS or nested) -----------------------------------------
     //
-    // In KMS mode the wire `wgpu::Surface` is absent. Instead the GPU process
-    // owns three scanout textures (one per ring slot) injected at GPU-chosen
-    // wire handles and reported via ipc::Tag::ScanoutInjected during bring-up.
-    // The core tracks per-slot state locally and dispatches:
+    // The GPU process owns three scanout dmabufs per output (one per ring
+    // slot) and ReserveTexture-injects them at core-chosen wire handles
+    // during bring-up. The core tracks per-slot state locally and dispatches:
     //   acquireOutputTextureHandle() -> returns the next FREE slot's texture
     //     handle, or nullptr if no slot is currently free.
-    //   presentOutput() -> sends ScanoutPresent { slotIdx, fenceFd } and marks
-    //     the slot PENDING_FLIP.
-    // The GPU process's flip-complete handler sends ScanoutFlipComplete back;
-    // drainCtrl advances the local state machine on receipt.
+    //   presentOutput() -> writes the producer EndAccess on the wire, sends
+    //     ScanoutPresent on the side channel, and marks the slot PENDING_FLIP.
+    // KMS: the GPU process's page-flip handler sends ScanoutFlipComplete on
+    //   flip; drainCtrl advances the slot state machine.
+    // Nested: the GPU process's wl_buffer.release listener sends
+    //   ScanoutFlipComplete; drainCtrl frees the slot. The per-vblank wake
+    //   signal is FrameComplete (from wl_surface.frame.done) which also
+    //   clears the per-output presentedThisCycle gate.
 
-    // True if this compositor is in KMS mode (bring-up received ScanoutInjected
-    // instead of SurfaceReady). When false: WSI / headless paths.
+    // True if this compositor is in KMS mode. When false: headless or
+    // nested mode.
     bool kmsMode() const { return kmsMode_; }
 
     // Set the fence fd to attach to the next ScanoutPresent. Caller transfers
@@ -544,21 +553,21 @@ class Compositor {
     void writeProducerEndAccess(uint32_t surfaceBufId);
 
     // The JS compositor drives every frame: it acquires the output texture,
-    // renders into it over the wire, and presents. The C++ Compositor no longer
-    // has a compositing pass -- it provides WSI (surface/acquire/present), dmabuf
-    // import, and the wire link.
+    // renders into it over the wire, and presents. The C++ Compositor
+    // provides the acquire/present primitive over a 3-slot scanout ring per
+    // output (KMS and nested both use this path; headless returns null and
+    // the JS layer falls back to its own offscreen target).
     //
-    // Acquire the render target for `outputId`. In KMS mode returns the next FREE
-    // scanout slot's texture for that output (or null if all busy / paused). In
-    // nested mode returns the host swapchain's current texture (the outputId is
-    // the single output). Holds a ref until presentOutput(); JS wraps it
-    // (dawn.node wrapTexture) as the render target.
+    // Acquire returns the next FREE scanout slot's texture for `outputId`,
+    // or null if no slot is currently available (e.g. KMS paused, all slots
+    // PENDING_FLIP, nested per-vblank gate armed). Holds a ref until
+    // presentOutput(); JS wraps it (dawn.node wrapTexture) as the render
+    // target.
     WGPUTexture acquireOutputTextureHandle(uint32_t outputId);
-    // Present the previously-acquired target for `outputId` and drop the held ref.
-    // No-op headless.
+    // Present the previously-acquired target for `outputId`. No-op headless.
     void presentOutput(uint32_t outputId);
-    // The swapchain's texture format (the JS pipeline's color-target format must
-    // match). Valid after bringUp().
+    // The scanout-ring slot texture format (the JS pipeline's color-target
+    // format must match). Valid after bringUp().
     wgpu::TextureFormat outputFormat() const { return renderFormat_; }
 
     // Steady-state hooks (called from libuv handles in the addon).
@@ -660,10 +669,8 @@ class Compositor {
     std::unordered_map<uint32_t, int> surfaceBufAllocated_;
 
     bool headless_ = false;
-    wgpu::Texture currentOutputTexture_;  // held between acquire + present
     wgpu::Instance instance_;
     wgpu::Device device_;
-    wgpu::Surface surface_;            // nested only
     wgpu::TextureFormat renderFormat_ = wgpu::TextureFormat::BGRA8Unorm;
 
     // JS-compositor dmabuf imports (importDmabufForJs): reserve a texture, send
