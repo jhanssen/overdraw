@@ -640,14 +640,31 @@ validated + resolved + consumed by the runtime + hotkey plugin.
   `/tmp/overdraw-gpu-crash.txt`, core to
   `/tmp/overdraw-core-crash.txt`).
 - **Linear compositing.** Alpha blending happens in sRGB space.
-- **XWayland.** Phases 1-2 landed. Rootless Xwayland is fork/exec'd against the
-  compositor and reports ready (async `uv_poll` on `-displayfd`). The
-  `xwayland_shell_v1` global + serial registry (`src/xwayland/surface.ts`) and a
-  minimal native XWM (`native/xwayland/xwm.cpp`: xcb, composite redirect, event
-  decode → `src/xwayland/xwm.ts`) associate an X11 window with its wl_surface
-  (via `WL_SURFACE_SERIAL`) and add it to the WM -- verified end-to-end with a
-  real X client (`test/xwayland-xwm.gpu.mjs`). Geometry round-trip, properties,
-  focus, override-redirect, clipboard are Phase 3+. See `docs/xwayland-design.md`.
+- **XWayland.** Phases 1-3 landed (server lifecycle; `xwayland_shell_v1` +
+  serial-association XWM; ICCCM/EWMH properties → title/app_id/constraints/
+  parent/presentation + close path via `WM_DELETE_WINDOW`/`KillClient`;
+  configure round-trip with compositor authority + `holdUntilBufferDims`
+  resize-tx variant + synthetic ConfigureNotify; override-redirect overlays
+  with content-layer splicing; keyboard focus mirroring with the ICCCM
+  truth table + bookkeeper window + `_NET_ACTIVE_WINDOW`/`_NET_WM_STATE_FOCUSED`
+  + serial-validated FocusIn handling for cross-app focus-stealing
+  denial). Production wiring: `config.xwayland.enabled` (default false)
+  opts in; `config.xwayland.displayNumber` (default 50) selects the X
+  display. Autopick rejected upstream (would otherwise steal `:0` from a
+  live host session). 11 GPU tests + ~44 GPU-free unit tests cover the
+  surface. Clipboard / DnD are Phase 4 / 5. See `docs/xwayland-design.md`.
+  Known limitations:
+  - `_NET_WM_STATE_FOCUSED` writes replace the whole `_NET_WM_STATE`
+    property (clobbers client-set bits like fullscreen/maximized when
+    focus moves; clients re-assert via `change_property` on their own
+    state, so this is observable only between focus-change and the
+    next client commit). Clean fix is read-modify-write.
+  - Same-PID focus-stealing exception requires both windows to
+    advertise `_NET_WM_PID`; older / non-EWMH X clients fall back to
+    cross-PID denial.
+  - OR overlays appear on every output's stack regardless of which
+    toplevel they belong to (X has no workspace concept; per-toplevel
+    rooting would need `WM_TRANSIENT_FOR` chain following).
   Session supervisor untouched.
 - **Live reload.** Not built.
 
