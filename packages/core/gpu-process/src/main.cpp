@@ -835,6 +835,73 @@ int run(int wireFd, int ctrlFd, int inputFd, bool headless,
     }
 #endif  // OVERDRAW_KMS
 
+    // Nested-backend ScanoutReserve handler. Mirrors KMS's
+    // handleScanoutReserve in shape: walk the (already-built) ring for
+    // outputId, inject each slot's texture at the reserved wire handle,
+    // register the per-slot SurfaceBuf in surfaceBufs + scanoutBufIdToSlot,
+    // reply ScanoutReady. Used by startup AND by the steady-state wire
+    // dispatcher (the latter fires on resize, where the core sends a
+    // fresh ScanoutReserve after ScanoutRebuild).
+    auto handleNestedScanoutReserve =
+        [&](const ipc::ScanoutReservePayload& p) -> bool {
+        if (headless || outputKms) {
+            std::fprintf(stderr,
+                "[gpu] handleNestedScanoutReserve called without nested backend\n");
+            return false;
+        }
+        if (p.outputId != 0) {
+            std::fprintf(stderr,
+                "[gpu] nested ScanoutReserve for unexpected output %u (only 0 supported)\n",
+                p.outputId);
+            sendScanoutReady(p.outputId, false);
+            return false;
+        }
+        auto* hb = static_cast<gpu::HostWindowOutputBackend*>(output.get());
+        auto* ring = hb->scanoutRing();
+        if (!ring) {
+            std::fprintf(stderr,
+                "[gpu] nested ScanoutReserve: scanout ring is not built\n");
+            sendScanoutReady(0, false);
+            return false;
+        }
+        // Resize-time teardown: erase any surfaceBufs / fence-fd / slot-
+        // routing entries from a PRIOR ring on this outputId. By wire-FIFO
+        // ordering, every old ProducerBegin/EndAccess has already been
+        // processed by the time this frame is dispatched (the core sent
+        // ScanoutRebuild AFTER reading our prior ScanoutRebuild from the
+        // resize handler; the GPU process's wire dispatch is sequential
+        // per fd, so any old in-flight bracket frames already ran).
+        // First-time bring-up: the map is empty for outputId=0, no-op.
+        for (auto it = scanoutBufIdToSlot.begin();
+             it != scanoutBufIdToSlot.end();) {
+            if (it->second.first == 0) {
+                const uint32_t bufId = it->first;
+                surfaceBufs.erase(bufId);
+                auto fit = scanoutFenceFdByBufId.find(bufId);
+                if (fit != scanoutFenceFdByBufId.end()) {
+                    if (fit->second >= 0) ::close(fit->second);
+                    scanoutFenceFdByBufId.erase(fit);
+                }
+                it = scanoutBufIdToSlot.erase(it);
+            } else {
+                ++it;
+            }
+        }
+        wgpu::SharedTextureMemory mems[3];
+        wgpu::Texture texs[3];
+        for (int i = 0; i < 3; ++i) {
+            const auto& slot = ring->slot(i);
+            mems[i] = slot.mem;
+            texs[i] = slot.tex;
+        }
+        const bool injectOk = injectScanoutRingSlots(0, p, mems, texs);
+        sendScanoutReady(0, injectOk);
+        if (injectOk) {
+            std::printf("[gpu] nested scanout ready for output 0 (3 slots injected)\n");
+        }
+        return injectOk;
+    };
+
     // Nested scanout bring-up (analogue of the KMS block above): allocate
     // the host-attached dmabuf scanout ring on the core device, wait for
     // one ScanoutReserve from the core on the WIRE, and inject the slots
@@ -876,33 +943,11 @@ int run(int wireFd, int ctrlFd, int inputFd, bool headless,
                 std::abort();
             }
             auto p = ipc::ScanoutReservePayload::decode(frame.data());
-            if (p.outputId != 0) {
-                std::fprintf(stderr,
-                    "[gpu] nested startup: ScanoutReserve for unexpected output %u (only 0 supported)\n",
-                    p.outputId);
-                std::abort();
-            }
-            auto* ring = hb->scanoutRing();
-            if (!ring) {
-                std::fprintf(stderr,
-                    "[gpu] nested startup: scanout ring is not built\n");
-                std::abort();
-            }
-            wgpu::SharedTextureMemory mems[3];
-            wgpu::Texture texs[3];
-            for (int i = 0; i < 3; ++i) {
-                const auto& slot = ring->slot(i);
-                mems[i] = slot.mem;
-                texs[i] = slot.tex;
-            }
-            const bool injectOk = injectScanoutRingSlots(0, p, mems, texs);
-            sendScanoutReady(0, injectOk);
-            if (!injectOk) {
+            if (!handleNestedScanoutReserve(p)) {
                 std::fprintf(stderr,
                     "[gpu] nested startup: ScanoutReserve handling failed\n");
                 std::abort();
             }
-            std::printf("[gpu] nested scanout ready for output 0 (3 slots injected)\n");
             ++reservesHandled;
         };
         for (int i = 0; i < 500000 && reservesHandled < 1; ++i) {
@@ -934,36 +979,66 @@ int run(int wireFd, int ctrlFd, int inputFd, bool headless,
     // Host-window resize handler (NESTED only). The host fires
     // xdg_toplevel.configure(w,h) when the user resizes the overdraw window;
     // HostWindow acks it and calls onSize, which invokes this listener with
-    // the new dimensions. We do TWO things synchronously here, in order:
+    // the new dimensions. We do three things, in order:
     //
-    //   1) Re-Configure the wgpu::Surface at the new size. This is a native
-    //      Dawn call -- no wire round-trip, no core involvement. By the
-    //      time the next wire GetCurrentTexture request from the core
-    //      arrives at the wire server, the surface is already at the new
-    //      size. The host's "next attached frame must be at the acked size"
-    //      contract is met without a frame at the wrong size.
-    //
-    //   2) Send a fresh OutputDescriptor over ctrl with the new dimensions.
-    //      The core's drainCtrl picks it up; main.ts's onOutputDescriptor
-    //      callback updates state.outputs, reflows the WM, and re-emits
-    //      wl_output / xdg_output to bound clients (slice 3b).
-    //
-    // The two steps are independent: (1) is purely GPU-process-local and
-    // (2) is a one-way ctrl message. There's no acknowledgement back from
-    // the core; the next time the JS compositor queries the output, it has
-    // the updated state.outputs and the swapchain delivers correctly sized
-    // textures.
+    //   1) Erase the old ring's surfaceBufs / fence-fd / slot-routing for
+    //      outputId=0 BEFORE the ring is rebuilt. The wgpu::Texture refs in
+    //      surfaceBufs would otherwise keep the old slot textures alive
+    //      past their dmabuf-fd-close.
+    //   2) Re-init the host scanout ring at the new dimensions. This
+    //      re-allocates the per-slot dmabufs + re-wraps each as a fresh
+    //      host wl_buffer + re-imports each as a fresh wgpu::Texture.
+    //   3) Emit ScanoutRebuild on the wire. Wire-FIFO with any in-flight
+    //      ProducerBegin/End for the prior ring: those drain first, then
+    //      the core's ScanoutRebuild handler runs reserveScanoutForOutput
+    //      and the new ring's slots get InjectTexture'd at freshly
+    //      reserved wire handles. The OutputDescriptor also rides ctrl so
+    //      the JS layer reflows clients to the new size.
     if (!headless && !outputKms) {
+        auto* hb = static_cast<gpu::HostWindowOutputBackend*>(output.get());
+        constexpr uint32_t kScanoutFourcc = 0x34325241u;  // DRM_FORMAT_ARGB8888
         output->setResizeListener(
-            [&output, ctrlFd]
+            [&output, &serializer, hb, &alloc, &coreDevice, ctrlFd]
             (uint32_t newW, uint32_t newH) {
-                // TODO(nested-dmabuf): rebuild the scanout ring at the new
-                // dimensions (DmabufScanoutRing reinit + re-wrap each slot
-                // as a fresh host wl_buffer + re-send a ScanoutReserve to
-                // the core so the new slot textures get InjectTexture'd at
-                // freshly reserved wire handles). Until then, the ring's
-                // slots stay at the bring-up size; the host scales the
-                // attached buffer, which is visibly wrong on shrink/grow.
+                // Rebuild the ring at the new dimensions. initScanout()
+                // internally clear()s the old ring -- destroying its
+                // wl_buffers and closing its dmabuf fds -- BEFORE
+                // allocating fresh slots. But we do NOT erase the old
+                // bookkeeping (surfaceBufs / scanoutBufIdToSlot /
+                // scanoutFenceFdByBufId) here: the wire socket may still
+                // have queued ProducerBegin / EndAccess frames against
+                // the old slot bufIds in the kernel recv buffer, and
+                // dropping the SurfaceBuf entry before those drain would
+                // fail Begin with "unknown surfaceBufId" and abort. The
+                // teardown happens lazily inside handleNestedScanoutReserve,
+                // which runs AFTER the core's ScanoutRebuild reply and
+                // after any in-flight wire frames for the old ring have
+                // been processed by FIFO ordering.
+                if (!hb->initScanout(alloc.gbm(), coreDevice, kScanoutFourcc)) {
+                    std::fprintf(stderr,
+                        "[gpu] resize: HostWindowOutputBackend::initScanout(%ux%u) failed\n",
+                        newW, newH);
+                    return;
+                }
+                // Tell the core to re-reserve at the new dims. The core's
+                // ScanoutRebuild handler erases its prior ScanoutOutput,
+                // runs reserveScanoutForOutput, and writes a fresh
+                // ScanoutReserve back. Our steady-state wire dispatcher
+                // routes it to handleNestedScanoutReserve which sweeps
+                // the old slot bookkeeping and injects the new slots'
+                // textures.
+                ipc::ScanoutRebuildPayload reply{};
+                reply.outputId = 0;
+                reply.width    = newW;
+                reply.height   = newH;
+                uint8_t reBuf[ipc::ScanoutRebuildPayload::kSize];
+                reply.encode(reBuf);
+                serializer.appendFrame(ipc::FrameKind::ScanoutRebuild,
+                                       reBuf, sizeof(reBuf));
+
+                // Also send a fresh OutputDescriptor on ctrl so the JS
+                // layer updates state.outputs, reflows the WM, and re-
+                // emits wl_output / xdg_output to bound clients.
                 gpu::OutputDescriptorInfo info{};
                 output->describeOutput(info);
                 ipc::Message m{};
@@ -981,8 +1056,21 @@ int run(int wireFd, int ctrlFd, int inputFd, bool headless,
                 std::memcpy(m.outputModel,  info.model,  sizeof(m.outputModel));
                 std::memcpy(m.outputEdidId, info.edidId, sizeof(m.outputEdidId));
                 ipc::sendMessage(ctrlFd, m);
-                std::printf("[gpu] resize -> %ux%u; sent OutputDescriptor\n",
+                std::printf("[gpu] resize -> %ux%u; rebuilt scanout ring; sent ScanoutRebuild + OutputDescriptor\n",
                             newW, newH);
+                // Resize-deadlock break: after a rebuild the host won't
+                // fire wl_surface.frame.done until we commit something
+                // (its frame callback signals frame-actually-displayed,
+                // not a free-running vblank). The JS render loop is
+                // gated on FrameComplete via runFrameIfReady, so without
+                // a wake nothing commits and the host never fires
+                // frame.done -- deadlock. Send a one-shot FrameComplete
+                // to kick the JS loop into rendering a frame at the new
+                // size; that commit then resumes the normal frame.done
+                // chain.
+                ipc::Message kick{};
+                kick.tag = ipc::Tag::FrameComplete;
+                ipc::sendMessage(ctrlFd, kick);
             });
     }
 
@@ -1802,13 +1890,14 @@ int run(int wireFd, int ctrlFd, int inputFd, bool headless,
             std::abort();
         }
         if (kind == ipc::FrameKind::ScanoutReserve) {
-            // Runtime hotplug ring bring-up. The core ReserveTexture'd three
-            // wire handles + appended this ScanoutReserve frame; the FIFO
-            // ordering of the wire socket guarantees that by here the wire
-            // server has already processed the ReserveTexture commands, so
-            // InjectTexture at each handle succeeds. Any subsequent
-            // ProducerBegin frame referencing the new bufIds is FIFO-after
-            // this frame and will find the bufIds registered in surfaceBufs.
+            // Runtime ring bring-up (KMS hotplug; nested resize). The core
+            // ReserveTexture'd three wire handles + appended this
+            // ScanoutReserve frame; the FIFO ordering of the wire socket
+            // guarantees that by here the wire server has already
+            // processed the ReserveTexture commands, so InjectTexture at
+            // each handle succeeds. Any subsequent ProducerBegin frame
+            // referencing the new bufIds is FIFO-after this frame and
+            // will find the bufIds registered in surfaceBufs.
             if (nfds != 0) {
                 std::fprintf(stderr,
                     "[gpu] core wire: ScanoutReserve with nfds=%d (must be 0)\n", nfds);
@@ -1820,8 +1909,20 @@ int run(int wireFd, int ctrlFd, int inputFd, bool headless,
                 std::abort();
             }
             auto p = ipc::ScanoutReservePayload::decode(frame.data());
-            (void)handleScanoutReserve(p);  // ScanoutReady (ok=0/1) emitted from inside
-            return;
+#if OVERDRAW_KMS
+            if (kms) {
+                (void)handleScanoutReserve(p);  // ScanoutReady (ok=0/1) emitted from inside
+                return;
+            }
+#endif
+            if (!headless && !outputKms) {
+                (void)handleNestedScanoutReserve(p);
+                return;
+            }
+            std::fprintf(stderr,
+                "[gpu] core wire: ScanoutReserve with no backend to handle it (outputId=%u)\n",
+                p.outputId);
+            std::abort();
         }
         if (kind == ipc::FrameKind::SwitchMode) {
             // Mode change for one already-connected output. Wire-FIFO with

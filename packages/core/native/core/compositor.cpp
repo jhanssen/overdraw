@@ -801,7 +801,12 @@ void Compositor::takePendingOutputsRemoved(std::vector<uint32_t>& out) {
 }
 
 void Compositor::reserveScanoutForOutput(uint32_t outputId, uint32_t width, uint32_t height) {
-    if (!kmsMode_) return;
+    // Backend-neutral: used by KMS hotplug (initial output add via udev
+    // rescan), KMS mode-switch (ScanoutRebuild reply path), AND nested
+    // resize (ScanoutRebuild from the GPU process after the host
+    // reconfigures the window). The wire FIFO guarantees the GPU process's
+    // matching ScanoutReady handler sees the reserve before any later
+    // ProducerBegin that references the new bufIds.
     WGPUTextureDescriptor td{};
     td.size = { width, height, 1 };
     td.mipLevelCount = 1;
@@ -837,7 +842,6 @@ void Compositor::reserveScanoutForOutput(uint32_t outputId, uint32_t width, uint
 }
 
 void Compositor::releaseScanoutForOutput(uint32_t outputId) {
-    if (!kmsMode_) return;
     scanoutOutputs_.erase(outputId);
 }
 
@@ -901,14 +905,11 @@ void Compositor::drainCtrl() {
             continue;
         }
         if (r.tag == ipc::Tag::FrameComplete) {
-            // Nested: the host wl_surface.frame listener fired (host
-            // compositor is ready for the next frame). Routes to the
-            // addon's wake state machine. Push the primary outputId so
-            // the per-output frame-callback dispatch fires for the
-            // nested host's single output too (multi-output is KMS-only
-            // today). Also disarm the per-output per-vblank gate on
-            // every nested ScanoutOutput so the next acquireOutputTextureHandle
-            // is allowed to present again.
+            // Nested vblank edge: clear per-output presentedThisCycle so
+            // the next acquireOutputTextureHandle is allowed to commit
+            // again. Push to flipCompletes_ so the addon's notifyFrame
+            // dispatches client wl_callback.done for nested mode's single
+            // output too. (KMS uses ScanoutFlipComplete for both roles.)
             for (auto& [id, so] : scanoutOutputs_) {
                 (void)id;
                 so.presentedThisCycle = false;
