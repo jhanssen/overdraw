@@ -1284,13 +1284,12 @@ void Compositor::presentOutput(uint32_t outputId) {
     // Close the producer access bracket on this slot's STM. The EndAccess
     // writes are in-band on the wire (kind=2), FIFO-ordered after the
     // render submit, so the GPU process EndAccess's the STM AFTER the
-    // queue submit has been processed -- producing a sync_file fd that the
-    // GPU process then attaches to the next ScanoutPresent for this slot
-    // (KMS: IN_FENCE_FD on the atomic commit; nested: the explicit-sync
-    // acquire fence on the host wl_surface commit, when the host
-    // advertises wp_linux_drm_syncobj_v1). The core does NOT need to ship
-    // a fence fd through the ScanoutPresent SCM_RIGHTS path -- the GPU
-    // process holds it.
+    // queue submit has been processed. KMS captures the exported
+    // sync_file fd and attaches it as the next atomic commit's
+    // IN_FENCE_FD; nested relies on the dmabuf's kernel-attached
+    // implicit-sync reservation fence and discards the export. The core
+    // does NOT need to ship a fence fd through the ScanoutPresent
+    // SCM_RIGHTS path -- the GPU process owns it.
     writeProducerEndAccess(so.slots[slot].surfaceBufId);
 
     ipc::Message m{};

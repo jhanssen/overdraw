@@ -554,13 +554,13 @@ int run(int wireFd, int ctrlFd, int inputFd, bool headless,
     // carried on ScanoutPresent / ScanoutFlipComplete tags.
     //
     // scanoutFenceFdByBufId: surfaceBufId -> last exported sync_file fd from
-    // the producer EndAccess. The sync fd is owned here until consumed by the
-    // next ScanoutPresent for the same buffer (KMS: attached to the atomic
-    // commit's IN_FENCE_FD; host-window: attached to the explicit-sync
-    // acquire of the wl_surface commit, when the host advertises
-    // wp_linux_drm_syncobj_v1; if unsupported there, the fence falls back to
-    // implicit-sync via the dmabuf's reservation). Absence means no fence
-    // to attach.
+    // the producer EndAccess. Owned here until consumed by the next
+    // ScanoutPresent on the same buffer; KMS attaches it as the atomic
+    // commit's IN_FENCE_FD. Nested does NOT populate this map -- we rely
+    // on the kernel's dma-buf reservation fence (Mesa attaches it on
+    // queue submit and the host honors it). NVIDIA, which does not
+    // attach implicit fences, would need an explicit-sync host binding;
+    // that's a separate piece of work.
     std::unordered_map<uint32_t, std::pair<uint32_t, int>> scanoutBufIdToSlot;
     std::unordered_map<uint32_t, int> scanoutFenceFdByBufId;
 
@@ -1311,42 +1311,63 @@ int run(int wireFd, int ctrlFd, int inputFd, bool headless,
             sb.layout = endLayout.newLayout;
         }
 
-        // Scanout (KMS or host-window): producer EndAccess on a scanout
-        // SurfaceBuf has no wgpu consumer device to import the fence into.
-        // Capture the raw sync_file fd instead -- it goes straight to the
-        // next ScanoutPresent (KMS: IN_FENCE_FD on the atomic commit;
-        // host-window: the explicit-sync acquire fence on the wl_surface
-        // commit, when the host advertises wp_linux_drm_syncobj_v1).
+        // Scanout producer EndAccess: a scanout SurfaceBuf has no wgpu
+        // consumer device to import the fence into, so the regular
+        // cross-device fence-handoff path below doesn't apply.
+        //
+        //   KMS: capture the raw sync_file fd; the next ScanoutPresent
+        //   attaches it as the atomic commit's IN_FENCE_FD so the display
+        //   engine waits on our render.
+        //
+        //   Nested host-window: don't capture. We don't bind
+        //   wp_linux_drm_syncobj_v1 on the host connection, so we have
+        //   nowhere to deliver an explicit-sync acquire point. We rely
+        //   on the kernel's dma-buf reservation: Vulkan/GBM on Mesa
+        //   attaches an implicit write fence to the dmabuf as part of
+        //   the queue submit, and the host's display engine waits on
+        //   that fence before sampling. This is correct on Mesa. It is
+        //   NOT correct on the NVIDIA proprietary driver, which does
+        //   not attach implicit fences; see docs/status.md "silent-gap
+        //   risks" -- a follow-on commit will bind the host's
+        //   wp_linux_drm_syncobj_v1 and forward the captured sync_file
+        //   as an explicit acquire-timeline point.
         {
             auto sit = scanoutBufIdToSlot.find(surfaceBufId);
             if (sit != scanoutBufIdToSlot.end() && producer) {
-                // Drop any previously-captured fence fd before overwriting.
-                // Look up by find() -- operator[] would value-initialize the
-                // map entry to 0, which close() would then interpret as fd 0
-                // (typically the DRM card fd, since stdin is closed in this
-                // child); closing that wedges every subsequent ioctl.
-                auto fit = scanoutFenceFdByBufId.find(surfaceBufId);
-                if (fit != scanoutFenceFdByBufId.end()) {
-                    if (fit->second >= 0) ::close(fit->second);
-                    scanoutFenceFdByBufId.erase(fit);
-                }
-                if (endState.fenceCount >= 1) {
-                    wgpu::SharedFenceExportInfo exp{};
-                    wgpu::SharedFenceSyncFDExportInfo syncExp{};
-                    exp.nextInChain = &syncExp;
-                    endState.fences[0].ExportInfo(&exp);
-                    if (syncExp.handle >= 0) {
-                        int dupFd = ::dup(syncExp.handle);
-                        if (dupFd >= 0) {
-                            scanoutFenceFdByBufId[surfaceBufId] = dupFd;
-                        } else {
-                            std::fprintf(stderr,
-                                "[gpu] scanout EndAccess: dup(syncfd=%d) failed: %s\n",
-                                syncExp.handle, std::strerror(errno));
+#if OVERDRAW_KMS
+                if (kms) {
+                    // KMS path: capture for the next ScanoutPresent.
+                    // Look up by find() -- operator[] would value-
+                    // initialize the map entry to 0, which close() would
+                    // then interpret as fd 0 and wedge a subsequent
+                    // ioctl.
+                    auto fit = scanoutFenceFdByBufId.find(surfaceBufId);
+                    if (fit != scanoutFenceFdByBufId.end()) {
+                        if (fit->second >= 0) ::close(fit->second);
+                        scanoutFenceFdByBufId.erase(fit);
+                    }
+                    if (endState.fenceCount >= 1) {
+                        wgpu::SharedFenceExportInfo exp{};
+                        wgpu::SharedFenceSyncFDExportInfo syncExp{};
+                        exp.nextInChain = &syncExp;
+                        endState.fences[0].ExportInfo(&exp);
+                        if (syncExp.handle >= 0) {
+                            int dupFd = ::dup(syncExp.handle);
+                            if (dupFd >= 0) {
+                                scanoutFenceFdByBufId[surfaceBufId] = dupFd;
+                            } else {
+                                std::fprintf(stderr,
+                                    "[gpu] scanout EndAccess: dup(syncfd=%d) failed: %s\n",
+                                    syncExp.handle, std::strerror(errno));
+                            }
                         }
                     }
                 }
-                return;  // skip the consumer-side fence import below
+#endif
+                // Nested: no capture; implicit-sync via the dmabuf
+                // reservation handles the host's wait. Skip the consumer-
+                // side fence import below either way.
+                return;
             }
         }
 
@@ -2488,12 +2509,13 @@ int run(int wireFd, int ctrlFd, int inputFd, bool headless,
             if (m.tag == ipc::Tag::Shutdown) {
                 shutdown = true;
             } else if (m.tag == ipc::Tag::ScanoutPresent) {
-                // m.surfaceBufId is the scanout slot's surfaceBufId, NOT the
-                // slot index. Map it back to {output, slot} and pick up the
-                // sync_file fd captured at EndAccess time (keyed by
-                // surfaceBufId). Backend dispatch by which one owns this
-                // output: KMS routes to presentScanoutAt, the nested
-                // host-window backend routes to its scanout ring.
+                // m.surfaceBufId is the scanout slot's surfaceBufId, NOT
+                // the slot index. Map it back to {output, slot}. Backend
+                // dispatch by which one owns this output: KMS routes to
+                // presentScanoutAt with the producer-EndAccess sync_file
+                // fd captured earlier; the nested host-window backend
+                // routes to its scanout ring (no fence -- implicit sync
+                // via the dmabuf reservation).
                 auto sit = scanoutBufIdToSlot.find(m.surfaceBufId);
                 if (sit == scanoutBufIdToSlot.end()) {
                     std::fprintf(stderr,
@@ -2502,30 +2524,26 @@ int run(int wireFd, int ctrlFd, int inputFd, bool headless,
                 } else {
                     const uint32_t outputId = sit->second.first;
                     const int slot = sit->second.second;
-                    int fenceFd = -1;
-                    auto fit = scanoutFenceFdByBufId.find(m.surfaceBufId);
-                    if (fit != scanoutFenceFdByBufId.end()) {
-                        fenceFd = fit->second;
-                        scanoutFenceFdByBufId.erase(fit);
-                    }
 #if OVERDRAW_KMS
                     if (kms) {
+                        int fenceFd = -1;
+                        auto fit = scanoutFenceFdByBufId.find(m.surfaceBufId);
+                        if (fit != scanoutFenceFdByBufId.end()) {
+                            fenceFd = fit->second;
+                            scanoutFenceFdByBufId.erase(fit);
+                        }
                         if (!kms->presentScanoutAt(outputId, slot, fenceFd)) {
                             std::fprintf(stderr,
                                 "[gpu] presentScanoutAt(output=%u, slot=%d) rejected by kernel\n",
                                 outputId, slot);
                         }
+                        if (fenceFd >= 0) ::close(fenceFd);
                     } else
 #endif
                     if (!headless && !outputKms) {
-                        // Nested host-window backend: route the present to
-                        // the wayland scanout ring. fenceFd is not yet
-                        // forwarded -- explicit-sync against the host's
-                        // wp_linux_drm_syncobj_v1 will come in a follow-on.
                         auto* hb = static_cast<gpu::HostWindowOutputBackend*>(output.get());
                         hb->presentScanout(slot);
                     }
-                    if (fenceFd >= 0) ::close(fenceFd);
                 }
                 for (int i = 0; i < nRecvFds; ++i) ::close(recvFds[i]);
 #if OVERDRAW_KMS
