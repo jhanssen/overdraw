@@ -1,10 +1,18 @@
 #include "output_host_window.h"
 
+#include <cstdio>
 #include <cstring>
 
+#include <wayland-client.h>
 #include <webgpu/webgpu_cpp.h>
 
 namespace overdraw::gpu {
+
+HostWindowOutputBackend::~HostWindowOutputBackend() {
+    // The ring's dtor destroys its slot wl_buffers; do this BEFORE the
+    // HostWindow inside `window_` disconnects from the host display.
+    ring_.clear();
+}
 
 wgpu::Surface HostWindowOutputBackend::createWgpuSurface(wgpu::Instance& instance) {
     wgpu::SurfaceSourceWaylandSurface src{};
@@ -13,6 +21,94 @@ wgpu::Surface HostWindowOutputBackend::createWgpuSurface(wgpu::Instance& instanc
     wgpu::SurfaceDescriptor sd{};
     sd.nextInChain = &src;
     return instance.CreateSurface(&sd);
+}
+
+namespace {
+
+// Per-slot wl_buffer.release trampoline. The listener's userdata is the
+// HostWindowOutputBackend (set in installListenersOnRing); the buffer
+// pointer in the callback args identifies which slot retired.
+void hostBufferRelease(void* data, wl_buffer* buf) {
+    static_cast<HostWindowOutputBackend*>(data)->onBufferRelease(buf);
+}
+const wl_buffer_listener kHostBufferListener = { &hostBufferRelease };
+
+}  // namespace
+
+bool HostWindowOutputBackend::initScanout(gbm_device* gbm,
+                                          const wgpu::Device& device,
+                                          uint32_t fourcc) {
+    // Idempotent: tear down any prior ring first (e.g. host-window resize
+    // rebuilds at the new dimensions).
+    if (scanoutBuilt_) {
+        ring_.clear();
+        scanoutBuilt_ = false;
+    }
+    // Build the candidate modifier list from the host's per-fourcc
+    // advertisements: just the modifiers for THIS fourcc, in the order the
+    // host advertised them.
+    std::vector<uint64_t> hostMods;
+    for (const auto& f : window_.hostDmabufFormats()) {
+        if (f.fourcc == fourcc) hostMods.push_back(f.modifier);
+    }
+    if (!ring_.init(gbm, device, window_, window_.width(), window_.height(),
+                    fourcc, hostMods)) {
+        return false;
+    }
+    // Install the per-slot wl_buffer.release listener so slot retirement
+    // drives the flip-complete callback. The host owns the listener
+    // dispatch; we dispatch back to the configured BufferReleaseListener
+    // inside onBufferRelease.
+    for (size_t i = 0; i < WaylandScanoutRing::kSlotCount; ++i) {
+        wl_buffer* b = ring_.slot(static_cast<int>(i)).hostBuffer;
+        if (b) wl_buffer_add_listener(b, &kHostBufferListener, this);
+    }
+    scanoutBuilt_ = true;
+    return true;
+}
+
+wgpu::Texture HostWindowOutputBackend::acquireScanout(int& outSlotIdx) {
+    outSlotIdx = -1;
+    if (!scanoutBuilt_) return {};
+    const int idx = ring_.acquireFree();
+    if (idx < 0) return {};
+    outSlotIdx = idx;
+    return ring_.slot(idx).tex;
+}
+
+void HostWindowOutputBackend::presentScanout(int slotIdx) {
+    if (!scanoutBuilt_ || slotIdx < 0) return;
+    auto* surface = window_.surface();
+    if (!surface) return;
+    auto& s = ring_.slot(slotIdx);
+    if (!s.hostBuffer) return;
+
+    wl_surface_attach(surface, s.hostBuffer, 0, 0);
+    // For now: full-surface damage. A follow-on can forward the per-frame
+    // damage region from the JS compositor for the host-side optimization
+    // wlroots/Hyprland's wayland backends pass on.
+    wl_surface_damage_buffer(surface, 0, 0,
+                             static_cast<int32_t>(window_.width()),
+                             static_cast<int32_t>(window_.height()));
+    wl_surface_commit(surface);
+    // Flush so the request actually leaves our outbox; pump() also flushes
+    // but on the next loop iteration, which would delay the host's vsync
+    // callback chain.
+    if (auto* d = window_.display()) wl_display_flush(d);
+
+    ring_.markPendingFlip(slotIdx);
+}
+
+void HostWindowOutputBackend::onBufferRelease(wl_buffer* buf) {
+    if (!scanoutBuilt_) return;
+    const int idx = ring_.slotIndexForHostBuffer(buf);
+    if (idx < 0) return;  // stale release for a torn-down ring's buffer
+    // The host is no longer using this slot's buffer: the slot is now
+    // eligible for the next acquire. Fire the configured callback so the
+    // main loop can drive any per-frame-cadence work that gated on a free
+    // slot (analogous to KMS's flip-complete dispatch).
+    ring_.markFree(idx);
+    if (bufferReleaseListener_) bufferReleaseListener_(idx);
 }
 
 namespace {
