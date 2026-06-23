@@ -32,7 +32,7 @@ const OUT = [{ id: 0, rect: { x: 0, y: 0, width: 1000, height: 600 }, scale: 1 }
 function setup(out = OUT) {
   const comp = mockCompositor();
   const configures = [];
-  const sink = (id, w, h) => configures.push({ id, w, h });
+  const sink = (id, _x, _y, w, h) => configures.push({ id, w, h });
   const wm = createWm(comp, out, {
     configure: sink,
     layoutDriverFactory: inlineMasterStackDriverFactory,

@@ -27,7 +27,9 @@ function setup() {
   const comp = mockCompositor();
   let serial = 0;
   const configures = [];
-  const configure = (id, w, h) => { serial += 1; configures.push({ id, w, h, serial }); return serial; };
+  const configure = (id, _x, _y, w, h) => {
+    serial += 1; configures.push({ id, w, h, serial }); return serial;
+  };
   const wm = createWm(comp, OUT, { configure, layoutDriverFactory: inlineMasterStackDriverFactory });
   return { wm, comp, configures };
 }
@@ -141,4 +143,93 @@ test('non-reorder relayout still applies geometry immediately (no transaction)',
   await wm.settled();
   assert.deepEqual(rectOf(wm, 2), { x: 0, y: 0, width: 500, height: 600 }, '2 master immediately');
   assert.deepEqual(rectOf(wm, 1), { x: 500, y: 0, width: 500, height: 600 }, '1 stack immediately');
+});
+
+// ---- buffer-dims-only hold (xwayland path) -------------------------------
+// A configure sink that returns null signals "no ack expected" -- the
+// xwayland case (X has no ack_configure equivalent). The hold then gates
+// purely on surfaceReadyAt; notifyToplevelCommit is not part of the path.
+
+function setupBufferDimsOnly() {
+  // A surface-readiness store the mock compositor checks. The test flips
+  // entries to simulate the client committing a new buffer at the new dims.
+  const readyAt = new Map(); // surfaceId -> { w, h, scale? }
+  const comp = {
+    setSurfaceLayout() {},
+    setStack() {},
+    setFrozenReadyHandler(cb) { comp._frozenReady = cb; },
+    surfaceReadyAt(id, w, h, _scale) {
+      const r = readyAt.get(id);
+      return !!r && r.w === w && r.h === h;
+    },
+    _frozenReady: null,
+  };
+  // Sink returns null -- the xwayland convention (no ack to wait for).
+  const configures = [];
+  const configure = (id, _x, _y, w, h) => { configures.push({ id, w, h }); return null; };
+  const wm = createWm(comp, OUT, { configure, layoutDriverFactory: inlineMasterStackDriverFactory });
+  return { wm, comp, configures, readyAt };
+}
+
+test('xwayland-style hold: serial=null releases on surfaceReadyAt alone', async () => {
+  const { wm, comp, configures, readyAt } = setupBufferDimsOnly();
+  await addMapped(wm, 1);
+  await addMapped(wm, 2);
+  await addMapped(wm, 3);
+  await wm.settled();
+  configures.length = 0;
+
+  // Reorder triggers the resize-tx path. Sink returns null -> requireAck=false.
+  wm.reorder(3, 'swap-next');
+  await wm.settled();
+
+  // Configures were issued (the WM still sends the new size; the X side
+  // applies it via the configure-window + synthetic ConfigureNotify path).
+  const ids = configures.map((c) => c.id).sort();
+  assert.deepEqual(ids, [2, 3], 'both resizing windows configured');
+
+  // Geometry is HELD even without ack -- the broker is waiting on
+  // surfaceReadyAt, which hasn't been satisfied yet.
+  assert.deepEqual(rectOf(wm, 3), { x: 0, y: 0, width: 500, height: 600 }, '3 still old (held)');
+  assert.deepEqual(rectOf(wm, 2), { x: 500, y: 0, width: 500, height: 300 }, '2 still old (held)');
+
+  // notifyToplevelCommit is a no-op here -- there's no serial to ack
+  // against. The hold ignores it.
+  wm.notifyToplevelCommit(3, null);
+  wm.notifyToplevelCommit(2, null);
+  assert.deepEqual(rectOf(wm, 3), { x: 0, y: 0, width: 500, height: 600 }, 'still held: surfaceReadyAt is false');
+
+  // Simulate the X client committing the new buffer at the new dims and
+  // the GPU process reporting "frozen surface drawable now". Use the frozen-
+  // ready handler the broker registered so the broker re-evaluates.
+  readyAt.set(3, { w: 500, h: 300 });
+  readyAt.set(2, { w: 500, h: 600 });
+  comp._frozenReady?.(3);
+  comp._frozenReady?.(2);
+
+  // Both windows now read ready; the batch applies.
+  assert.deepEqual(rectOf(wm, 2), { x: 0, y: 0, width: 500, height: 600 }, '2 -> master');
+  assert.deepEqual(rectOf(wm, 3), { x: 500, y: 0, width: 500, height: 300 }, '3 -> stack-top');
+});
+
+test('xwayland-style hold: held until BOTH windows report buffer-ready (batched)', async () => {
+  const { wm, comp, readyAt } = setupBufferDimsOnly();
+  await addMapped(wm, 1);
+  await addMapped(wm, 2);
+  await addMapped(wm, 3);
+  await wm.settled();
+
+  wm.reorder(3, 'swap-next');
+  await wm.settled();
+
+  // Only one window reports ready: held (batched).
+  readyAt.set(3, { w: 500, h: 300 });
+  comp._frozenReady?.(3);
+  assert.deepEqual(rectOf(wm, 3), { x: 0, y: 0, width: 500, height: 600 }, 'still held: 2 not ready yet');
+
+  // Second reports ready: batch applies.
+  readyAt.set(2, { w: 500, h: 600 });
+  comp._frozenReady?.(2);
+  assert.deepEqual(rectOf(wm, 2), { x: 0, y: 0, width: 500, height: 600 }, '2 -> master');
+  assert.deepEqual(rectOf(wm, 3), { x: 500, y: 0, width: 500, height: 300 }, '3 -> stack-top');
 });

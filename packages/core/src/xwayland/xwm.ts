@@ -346,11 +346,25 @@ export function startXwm(state: CompositorState, addon: Addon, wmFd: number): Xw
         windows.delete(ev.window);
         break;
       }
-      case "configure-request":
-        // 3.1 still honors the client's requested geometry verbatim.
-        // Compositor-authoritative sizing + synthetic ConfigureNotify is 3.2.
+      case "configure-request": {
+        // The compositor is authoritative for managed windows: reply with
+        // the WM's current rect (and a synthetic ConfigureNotify per ICCCM
+        // §4.2.3) instead of honoring the client's request. For windows
+        // not yet in the WM (e.g. override-redirect, or pre-associate),
+        // fall back to honoring the request -- 3.3 will refine.
+        const w = windows.get(ev.window);
+        if (w && w.addedToWm && w.surfaceId !== null) {
+          const r = state.wm?.rectOf(w.surfaceId);
+          if (r) {
+            addon.xwmConfigureWindow(ev.window, r.x, r.y, r.width, r.height);
+            addon.xwmSendConfigureNotify(ev.window, r.x, r.y, r.width, r.height);
+            break;
+          }
+        }
         addon.xwmConfigureWindow(ev.window, ev.x, ev.y, ev.width, ev.height);
+        addon.xwmSendConfigureNotify(ev.window, ev.x, ev.y, ev.width, ev.height);
         break;
+      }
       case "surface-serial": {
         const serial = (BigInt(ev.serialHi >>> 0) << 32n) | BigInt(ev.serialLo >>> 0);
         const w = windows.get(ev.window);

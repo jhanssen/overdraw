@@ -410,6 +410,32 @@ napi_value XwmConfigureWindow(napi_env env, napi_callback_info info) {
     return u;
 }
 
+// xwmSendConfigureNotify(window, x, y, w, h) -> undefined
+//
+// Sends a synthetic ConfigureNotify per ICCCM §4.2.3 so the client reads
+// root-relative coordinates for the window's position. Pair with
+// xwmConfigureWindow whenever the WM applies a new rect: the real
+// ConfigureNotify the X server generates carries parent-relative
+// coordinates that some clients (gtk / qt) misinterpret.
+napi_value XwmSendConfigureNotify(napi_env env, napi_callback_info info) {
+    size_t argc = 5;
+    napi_value argv[5];
+    napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+    if (!g_xwm.active) return throwErr(env, "xwmSendConfigureNotify: no XWM running");
+    if (argc < 5) return throwErr(env, "xwmSendConfigureNotify(window, x, y, w, h)");
+    uint32_t window = 0;
+    int32_t x = 0, y = 0, w = 0, h = 0;
+    napi_get_value_uint32(env, argv[0], &window);
+    napi_get_value_int32(env, argv[1], &x);
+    napi_get_value_int32(env, argv[2], &y);
+    napi_get_value_int32(env, argv[3], &w);
+    napi_get_value_int32(env, argv[4], &h);
+    xwmSendConfigureNotify(g_xwm.conn, window, x, y, w, h);
+    napi_value u;
+    napi_get_undefined(env, &u);
+    return u;
+}
+
 // xwmGetProperty(window, atom, maxLengthWords?) -> cookieId
 //
 // Issues a GetProperty request asynchronously; the reply arrives as a
@@ -482,6 +508,7 @@ void RegisterXwayland(napi_env env, napi_value exports) {
     reg("xwmStop", XwmStop);
     reg("xwmMapWindow", XwmMapWindow);
     reg("xwmConfigureWindow", XwmConfigureWindow);
+    reg("xwmSendConfigureNotify", XwmSendConfigureNotify);
     reg("xwmGetProperty", XwmGetProperty);
     reg("xwmSendWmProtocol", XwmSendWmProtocol);
     reg("xwmKillClient", XwmKillClient);

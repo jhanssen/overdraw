@@ -94,7 +94,18 @@ int main(int argc, char** argv) {
     printf("[x11] mapped 0x%x\n", win);
     fflush(stdout);
 
+    // We need to observe ConfigureNotify events (both real and synthetic) to
+    // assert the WM is sending its chosen rect. StructureNotify on the
+    // window's selected mask gives us both forms. The XCB_EVENT_MASK_EXPOSURE
+    // we set at create time stays; add StructureNotify on top.
+    {
+        const uint32_t mask = XCB_EVENT_MASK_EXPOSURE | XCB_EVENT_MASK_STRUCTURE_NOTIFY;
+        xcb_change_window_attributes(c, win, XCB_CW_EVENT_MASK, &mask);
+        xcb_flush(c);
+    }
+
     // Event loop. Exit on WM_DELETE_WINDOW or after the safety timeout.
+    // Print every ConfigureNotify so tests can read the WM-chosen rect.
     const int fd = xcb_get_file_descriptor(c);
     const long deadlineMs = timeoutMs;
     long elapsedMs = 0;
@@ -106,7 +117,16 @@ int main(int argc, char** argv) {
         elapsedMs += stepMs;
         xcb_generic_event_t* ev;
         while ((ev = xcb_poll_for_event(c))) {
-            if ((ev->response_type & 0x7f) == XCB_CLIENT_MESSAGE) {
+            const uint8_t type = ev->response_type & 0x7f;
+            // Top bit of response_type distinguishes synthetic from real.
+            const int synthetic = (ev->response_type & 0x80) != 0;
+            if (type == XCB_CONFIGURE_NOTIFY) {
+                xcb_configure_notify_event_t* cn = (xcb_configure_notify_event_t*)ev;
+                printf("[x11] configure %s x=%d y=%d w=%u h=%u\n",
+                       synthetic ? "synthetic" : "real",
+                       cn->x, cn->y, cn->width, cn->height);
+                fflush(stdout);
+            } else if (type == XCB_CLIENT_MESSAGE) {
                 xcb_client_message_event_t* cm = (xcb_client_message_event_t*)ev;
                 if (cm->type == WM_PROTOCOLS
                     && cm->data.data32[0] == WM_DELETE_WINDOW) {

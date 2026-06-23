@@ -276,12 +276,28 @@ export async function installProtocols(
   // factories (e.g. wl_output / xdg_output re-emit on output.changed) can
   // dispatch through it.
   state.events = events;
-  // ConfigureSink: the WM calls this to (re)configure a window to a content size.
-  // Resolve surfaceId -> xdg_surface record and send the sized configure.
-  // Returns the configure serial (so the WM's resize transaction can match the
-  // client's ack), or null if no configure was sent.
-  const configureSink = (surfaceId: number, w: number, h: number): number | null => {
-    const xs = state.surfacesById?.get(surfaceId)?.xdgSurface;
+  // ConfigureSink: the WM calls this to (re)configure a window to a content
+  // rect. Role-dispatched:
+  //  - xdg_toplevel: send xdg_toplevel.configure + xdg_surface.configure;
+  //    return the serial so the resize-tx can match the client's ack.
+  //  - xwayland:     apply the rect on the X side (xwmConfigureWindow +
+  //    synthetic ConfigureNotify per ICCCM §4.2.3); return null because X
+  //    has no ack -- the resize-tx gates on buffer dims only via requireAck.
+  // state.xwm is populated by startXwm (which runs AFTER installProtocols);
+  // we therefore look it up dynamically per call, not at sink-construction.
+  const configureSink = (
+    surfaceId: number, x: number, y: number, w: number, h: number,
+  ): number | null => {
+    const rec = state.surfacesById?.get(surfaceId);
+    if (rec?.role === "xwayland") {
+      const xw = state.xwm?.findBySurfaceId(surfaceId);
+      if (xw) {
+        addon.xwmConfigureWindow(xw.window, x, y, w, h);
+        addon.xwmSendConfigureNotify(xw.window, x, y, w, h);
+      }
+      return null;
+    }
+    const xs = rec?.xdgSurface;
     if (xs?.toplevel) return configureToplevel(ctx, xs, w, h);
     return null;
   };

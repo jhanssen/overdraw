@@ -147,11 +147,18 @@ export function defaultWindowState(): WindowState {
 // global logical coordinate space.
 export interface WmState { outputs: Map<number, WmOutput>; windows: Window[]; }
 
-// Configure sink: ask the protocol layer to send a sized configure to a window's
-// toplevel. Returns the configure serial (for the resize transaction to match
-// against the client's ack), or null if no configure was sent. Wired by
-// installProtocols.
-export type ConfigureSink = (surfaceId: number, contentW: number, contentH: number) => number | null;
+// Configure sink: ask the protocol layer to (re)configure a window to a
+// content rect. Position is carried for the xwayland case (the X window needs
+// to be moved AND resized on the wire); the xdg path ignores position and
+// just sends the size in xdg_toplevel.configure. Returns a serial number for
+// the xdg case (so the WM's resize transaction can match the client's ack),
+// or null when no ack is expected -- xwayland (no ack_configure equivalent)
+// or no-op cases. Wired by installProtocols.
+export type ConfigureSink = (
+  surfaceId: number,
+  x: number, y: number,
+  contentW: number, contentH: number,
+) => number | null;
 
 // Decoration-resize sink: fired when a decorated window's OUTER tile changes
 // (move and/or size).
@@ -673,19 +680,25 @@ export function createWm(
   interface PendingResize {
     outer: Rect;
     content: Rect;
-    // Serial of the configure last sent for this held size, or null for a
-    // move-only hold (no re-render needed).
+    // Serial of the configure last sent for this held size, or null when no
+    // serial-based ack is expected (move-only holds; xwayland resizes, which
+    // have no ack_configure equivalent and gate on buffer dims only).
     serial: number | null;
     // The content size `serial` configured -- lets a merged reorder skip
     // re-configuring an already-asked size.
     cfgW: number;
     cfgH: number;
     // Move-only holds need no re-render and are always ready. A resize hold is
-    // ready once the client has acked the configure AND the compositor reports
-    // a drawable buffer at the new size (surfaceReadyAt) -- the latter matters
-    // because dmabuf imports are async, so a commit alone doesn't mean drawable.
+    // ready once the client has acked the configure (when requireAck) AND the
+    // compositor reports a drawable buffer at the new size (surfaceReadyAt --
+    // matters because dmabuf imports are async, so a commit alone doesn't
+    // mean drawable).
     moveOnly: boolean;
     acked: boolean;
+    // True for xdg windows (acked when ack_configure with the matching serial
+    // lands); false for xwayland windows, where no ack exists and the hold
+    // releases on the buffer-dims gate alone.
+    requireAck: boolean;
   }
   // The WM-local resize-data store, separate from the broker's hold
   // registry. The broker's ready() closure reads back from this map so a
@@ -714,7 +727,7 @@ export function createWm(
     const p = pendingResizes.get(id);
     if (!p) return true;
     if (p.moveOnly) return true;
-    if (!p.acked) return false;
+    if (p.requireAck && !p.acked) return false;
     if (!compositor.surfaceReadyAt) return true;
     // Determine the destination output's scale from p.outer's center; gate
     // the apply on the buffer matching both logical size AND that scale.
@@ -830,20 +843,25 @@ export function createWm(
         const lastCfgH = pend ? pend.cfgH : prevContent.height;
         if (newContent.width !== lastCfgW || newContent.height !== lastCfgH) {
           // configure is non-null here (useTx requires it); guard for the type.
+          // serial===null is the role signal: xdg returns a number (wait for
+          // ack_configure), xwayland returns null (no ack -- gate on buffer
+          // dims only).
           const serial = configure
-            ? configure(win.surfaceId, newContent.width, newContent.height) : null;
+            ? configure(win.surfaceId, newContent.x, newContent.y,
+                        newContent.width, newContent.height) : null;
+          const requireAck = serial !== null;
           if (pend) {
             // Coalesce: mutate the existing entry. The broker's ready()
             // re-reads from the map so it picks up the new size + ack
             // requirement without re-registering.
             pend.outer = newOuter; pend.content = newContent;
             pend.serial = serial; pend.cfgW = newContent.width; pend.cfgH = newContent.height;
-            pend.moveOnly = false; pend.acked = false;
+            pend.moveOnly = false; pend.acked = false; pend.requireAck = requireAck;
           } else {
             pendingResizes.set(win.surfaceId, {
               outer: newOuter, content: newContent,
               serial, cfgW: newContent.width, cfgH: newContent.height,
-              moveOnly: false, acked: false,
+              moveOnly: false, acked: false, requireAck,
             });
             beginResizeTx(win.surfaceId);
           }
@@ -854,7 +872,7 @@ export function createWm(
           pendingResizes.set(win.surfaceId, {
             outer: newOuter, content: newContent, serial: null,
             cfgW: newContent.width, cfgH: newContent.height,
-            moveOnly: true, acked: true,
+            moveOnly: true, acked: true, requireAck: false,
           });
           beginResizeTx(win.surfaceId);
         }
@@ -871,7 +889,7 @@ export function createWm(
         compositor.setSurfaceLayout(win.surfaceId, content.x, content.y, content.width, content.height);
       }
       if (configure && !win.pendingInitialCommit && sizeChanged) {
-        configure(win.surfaceId, content.width, content.height);
+        configure(win.surfaceId, content.x, content.y, content.width, content.height);
       }
       const outerMoved = prevOuter.x !== win.outer.x || prevOuter.y !== win.outer.y
                       || prevOuter.width !== win.outer.width || prevOuter.height !== win.outer.height;
@@ -1063,7 +1081,7 @@ export function createWm(
             && win.outer.width > 0 && win.outer.height > 0) {
           win.pendingSizeConfigure = false;
           const content = contentOf(win);
-          configure(win.surfaceId, content.width, content.height);
+          configure(win.surfaceId, content.x, content.y, content.width, content.height);
         }
       }
       return { ...win.rect };
@@ -1131,7 +1149,8 @@ export function createWm(
       // shortly sends the real sized configure.
       if (configure && win.outer.width > 0 && win.outer.height > 0
           && (contentRect.width !== prevContent.width || contentRect.height !== prevContent.height)) {
-        configure(win.surfaceId, contentRect.width, contentRect.height);
+        configure(win.surfaceId, contentRect.x, contentRect.y,
+                  contentRect.width, contentRect.height);
       }
       return { insets: granted, outerRect, contentRect };
     },
@@ -1341,7 +1360,7 @@ export function createWm(
       const win = windows.find((w) => w.surfaceId === surfaceId);
       if (!win || !win.pendingInitialCommit || win.pendingSizeConfigure) return;
       if (configure) {
-        configure(win.surfaceId, 0, 0);
+        configure(win.surfaceId, 0, 0, 0, 0);
         win.pendingSizeConfigure = true;
       }
     },
@@ -1412,7 +1431,7 @@ export function createWm(
         // once the client has content (a resize). The 0x0 carries the resolved
         // state array (maximized/tiled) so the client knows it is tiled.
         if (configure && !win.pendingSizeConfigure) {
-          configure(win.surfaceId, 0, 0);
+          configure(win.surfaceId, 0, 0, 0, 0);
           win.pendingSizeConfigure = true;
         }
       } finally {

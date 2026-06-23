@@ -286,6 +286,25 @@ void xwmConfigureWindow(XwmConn* x, uint32_t window,
     xcb_flush(x->conn);
 }
 
+void xwmSendConfigureNotify(XwmConn* x, uint32_t window,
+                            int32_t xx, int32_t yy, int32_t w, int32_t h) {
+    xcb_configure_notify_event_t ev = {};
+    ev.response_type = XCB_CONFIGURE_NOTIFY;
+    ev.event = window;
+    ev.window = window;
+    ev.above_sibling = XCB_NONE;
+    ev.x = static_cast<int16_t>(xx);
+    ev.y = static_cast<int16_t>(yy);
+    ev.width = static_cast<uint16_t>(w);
+    ev.height = static_cast<uint16_t>(h);
+    ev.border_width = 0;
+    ev.override_redirect = 0;
+    xcb_send_event(x->conn, /*propagate=*/0, window,
+                   XCB_EVENT_MASK_STRUCTURE_NOTIFY,
+                   reinterpret_cast<const char*>(&ev));
+    xcb_flush(x->conn);
+}
+
 uint32_t xwmGetProperty(XwmConn* x, uint32_t window, uint32_t atom,
                         uint32_t maxLengthWords) {
     // delete=0, type=AnyPropertyType(0), offset=0, long_length=maxLengthWords.

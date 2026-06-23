@@ -103,6 +103,16 @@ void xwmMapWindow(XwmConn* x, uint32_t window);
 void xwmConfigureWindow(XwmConn* x, uint32_t window,
                         int32_t xx, int32_t yy, int32_t w, int32_t h);
 
+// Send a synthetic ConfigureNotify per ICCCM §4.2.3. After the WM picks a
+// new rect for the window, X clients (gtk/qt) expect this event to read the
+// window's position in root coordinates -- the real ConfigureNotify generated
+// by xcb_configure_window reports parent-relative coordinates, which for
+// reparented windows are not what apps need for popup placement etc. We send
+// the synthetic form unconditionally after a configure so the client always
+// has authoritative root-relative geometry.
+void xwmSendConfigureNotify(XwmConn* x, uint32_t window,
+                            int32_t xx, int32_t yy, int32_t w, int32_t h);
+
 // Issue an async GetProperty. Returns a non-zero cookie id; the reply arrives
 // as a PropertyReply XwmEvent (matched by cookieId) during a later xwmProcess.
 // `maxLengthWords` is the property data cap in 32-bit words (xcb convention);

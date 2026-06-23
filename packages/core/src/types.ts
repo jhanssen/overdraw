@@ -99,6 +99,11 @@ export interface Addon {
   xwmStop(): void;
   xwmMapWindow(window: number): void;
   xwmConfigureWindow(window: number, x: number, y: number, w: number, h: number): void;
+  // Send a synthetic ConfigureNotify (ICCCM §4.2.3) carrying root-relative
+  // coordinates. Pair with xwmConfigureWindow whenever the WM applies a
+  // new rect -- some X clients (gtk/qt) rely on the synthetic form to read
+  // an authoritative window position.
+  xwmSendConfigureNotify(window: number, x: number, y: number, w: number, h: number): void;
   // Async property read. Returns a cookieId; the reply arrives as a
   // "property-reply" event with the same cookieId. The reply may be empty
   // (format=0) if the property is absent or the request errored.

@@ -287,12 +287,16 @@ lands.
 ## Touchpoints in existing files (kept minimal, no xcb leaks in)
 
 - **`wm/index.ts`:** unchanged in spirit. The `ConfigureSink` it already calls
-  becomes a router *at the wiring site* (`main.ts` / `protocols/index.ts`): if
-  the surface role is `xwayland`, call `xwm.configure`; else `configureToplevel`.
-  The WM file gains zero X knowledge. One open item: the WM resize transaction
-  gates partly on the xdg configure **serial**; X has no ack-configure, so an
-  `xwayland` window's resize must gate on buffer-dims readiness
-  (`surfaceReadyAt`) alone. See "Open questions".
+  is the router *at the wiring site* (`protocols/index.ts`, where the sink is
+  built; not `main.ts` -- the sink is built inside `installProtocols`): if
+  the surface role is `xwayland`, the sink calls `addon.xwmConfigureWindow` +
+  `addon.xwmSendConfigureNotify` (ICCCM §4.2.3 synthetic) and returns `null`;
+  else it calls `configureToplevel`. The WM file gains zero X knowledge.
+  Resize-readiness for X surfaces uses a `requireAck: false` flag on
+  `PendingResize` so the hold gates on buffer dims (`surfaceReadyAt`) only --
+  no ack_configure equivalent in X. The sink's return type (`number | null`)
+  carries the role intent: a serial means "wait for ack", null means
+  "buffer dims only". (Slice 3.2.)
 - **`protocols/ctx.ts`:** set `SurfaceRecord.role = "xwayland"` (no type change);
   the serial registry lives in `src/xwayland/`, not on `state`.
 - **`wl_seat.ts` / `wl_data_device_manager.ts`:** consumed from the xwayland
@@ -405,8 +409,30 @@ Xwayland or a Wayland session is absent. Coverage targets, smallest tier first:
   the spawn action, and reaps both on shutdown. With this, Phase 2 is
   reachable from the binary -- an X11 client can connect to the running
   compositor (no geometry/title/focus/menus/close yet, per Phase 3 scope).
-- **Phase 3 — window-management semantics.** Configure round-trip + router,
-  properties → state, override-redirect overlays, stacking, close, focus.
+- **Phase 3 — window-management semantics.** Subdivided 3.1-3.4.
+  - **3.1 — Properties + close.** ✅ Landed. ICCCM/EWMH property reads
+    (async, cookie-keyed); title/app_id/constraints/parent/presentation
+    plumbed into the WM (markInitialCommitComplete + propose); close
+    routes through `closeSurface(state, surfaceId)` (WM_DELETE_WINDOW
+    when advertised, else KillClient). window.map/unmap/change role
+    gates widened to include xwayland.
+  - **3.2 — Configure round-trip + holdUntilBufferDims.** ✅ Landed.
+    The ConfigureSink became a role-dispatched router in
+    `protocols/index.ts`: xdg returns a serial (ack path), xwayland
+    returns null and the resize-tx hold gates on buffer dims alone via
+    a new `requireAck: false` flag on `PendingResize`. Native
+    `xwmSendConfigureNotify` emits the ICCCM §4.2.3 synthetic form
+    alongside every `xwmConfigureWindow`. `configure-request` from a
+    managed X window is answered with the WM's current rect rather
+    than the client's request. GPU test asserts the synthetic
+    ConfigureNotify carrying the WM-chosen dims reaches the X client.
+    Pure-move (no resize) on an xwayland window does not yet fire a
+    ConfigureNotify (the sink isn't called for moveOnly holds); will
+    fold into 3.3 alongside override-redirect placement.
+  - **3.3 — Override-redirect overlays + stacking.** Pending.
+  - **3.4 — Focus mirroring.** Pending (parses WM_HINTS.input today
+    but doesn't consume it; the SetInputFocus / WM_TAKE_FOCUS path is
+    not wired).
 - **Phase 4 — clipboard.** `CLIPBOARD` + `PRIMARY`, including INCR.
 - **Phase 5 — polish + DnD.** Xdnd, `_NET_SUPPORTED` completeness, startup
   notification, window icons, `xwayland-keyboard-grab`, HiDPI policy knob.

@@ -66,7 +66,7 @@ function immediateLayoutDriver(target, snapshot) {
 test('deferInitialCommit: no configure fires during addWindow + propose phase', async () => {
   const configures = [];
   const wm = createWm(mockSink(), [{ id: 0, rect: { x: 0, y: 0, width: 1000, height: 600 }, scale: 1 }], {
-    configure: (id, w, h) => configures.push({ id, w, h }),
+    configure: (id, _x, _y, w, h) => configures.push({ id, w, h }),
     layoutDriverFactory: immediateLayoutDriver,
   });
   wm.addWindow(1, res(1), { deferInitialCommit: true });
@@ -81,7 +81,7 @@ test('deferInitialCommit: no configure fires during addWindow + propose phase', 
 test('markInitialCommitComplete: throwaway 0x0 first configure; real size on first content', async () => {
   const configures = [];
   const wm = createWm(mockSink(), [{ id: 0, rect: { x: 0, y: 0, width: 1000, height: 600 }, scale: 1 }], {
-    configure: (id, w, h) => configures.push({ id, w, h }),
+    configure: (id, _x, _y, w, h) => configures.push({ id, w, h }),
     layoutDriverFactory: immediateLayoutDriver,
   });
   wm.addWindow(1, res(1), { deferInitialCommit: true });
@@ -99,7 +99,7 @@ test('markInitialCommitComplete: throwaway 0x0 first configure; real size on fir
 test('sendInitialConfigure: 0x0 first configure is sent SYNCHRONOUSLY (single-roundtrip handshake)', async () => {
   const configures = [];
   const wm = createWm(mockSink(), [{ id: 0, rect: { x: 0, y: 0, width: 1000, height: 600 }, scale: 1 }], {
-    configure: (id, w, h) => configures.push({ id, w, h }),
+    configure: (id, _x, _y, w, h) => configures.push({ id, w, h }),
     layoutDriverFactory: immediateLayoutDriver,
   });
   wm.addWindow(1, res(1), { deferInitialCommit: true });
@@ -125,7 +125,7 @@ test('sendInitialConfigure: 0x0 first configure is sent SYNCHRONOUSLY (single-ro
 test('markInitialCommitComplete: subsequent layout changes resume configure flow', async () => {
   const configures = [];
   const wm = createWm(mockSink(), [{ id: 0, rect: { x: 0, y: 0, width: 1000, height: 600 }, scale: 1 }], {
-    configure: (id, w, h) => configures.push({ id, w, h }),
+    configure: (id, _x, _y, w, h) => configures.push({ id, w, h }),
     layoutDriverFactory: immediateLayoutDriver,
   });
   wm.addWindow(1, res(1), { deferInitialCommit: true });
@@ -151,7 +151,7 @@ test('markInitialCommitComplete: subsequent layout changes resume configure flow
 test('markInitialCommitComplete: unknown window is a no-op', async () => {
   const configures = [];
   const wm = createWm(mockSink(), [{ id: 0, rect: { x: 0, y: 0, width: 1000, height: 600 }, scale: 1 }], {
-    configure: (id, w, h) => configures.push({ id, w, h }),
+    configure: (id, _x, _y, w, h) => configures.push({ id, w, h }),
     layoutDriverFactory: immediateLayoutDriver,
   });
   // Don't throw; quietly do nothing.
@@ -162,7 +162,7 @@ test('markInitialCommitComplete: unknown window is a no-op', async () => {
 test('markInitialCommitComplete: not in deferred mode is a no-op', async () => {
   const configures = [];
   const wm = createWm(mockSink(), [{ id: 0, rect: { x: 0, y: 0, width: 1000, height: 600 }, scale: 1 }], {
-    configure: (id, w, h) => configures.push({ id, w, h }),
+    configure: (id, _x, _y, w, h) => configures.push({ id, w, h }),
     layoutDriverFactory: immediateLayoutDriver,
   });
   wm.addWindow(1, res(1)); // no deferInitialCommit
@@ -256,7 +256,7 @@ test('preconfigure: configure fires AFTER interceptor settles + state commits', 
   const configures = [];
   const wm = createWm(mockSink(), [{ id: 0, rect: { x: 0, y: 0, width: 1000, height: 600 }, scale: 1 }], {
     pluginBus: bus,
-    configure: (id, w, h) => configures.push({ id, w, h }),
+    configure: (id, _x, _y, w, h) => configures.push({ id, w, h }),
     layoutDriverFactory: immediateLayoutDriver,
   });
   // Slow interceptor: holds the configure until it returns.
