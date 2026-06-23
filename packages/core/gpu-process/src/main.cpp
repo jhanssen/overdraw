@@ -591,34 +591,24 @@ int run(int wireFd, int ctrlFd, int inputFd, bool headless,
     };
     std::unordered_map<uint32_t, SurfaceBuf> surfaceBufs;
 
-#if OVERDRAW_KMS
-    // KMS scanout: maps each scanout surfaceBufId -> {output index, slot index
-    // 0..2}, and surfaceBufId -> last exported sync_file fd from EndAccess
-    // (handed to that output's atomic commit as IN_FENCE_FD). The sync fd is
-    // owned here until consumed by the next ScanoutPresent for the same buffer;
-    // absence means no fence to attach.
-    // Routes each scanout surfaceBufId -> {outputId, slot index 0..2}. The
-    // outputId is the dense, lowest-free-allocated routing key the KMS backend
-    // assigns (see KmsOutputBackend); it is the same id carried on the
-    // ScanoutPresent / ScanoutFlipComplete tags.
+    // Scanout state shared by KMS and the host-window backend.
+    //
+    // scanoutBufIdToSlot: each scanout surfaceBufId -> {outputId, slot index
+    // 0..2}. The outputId is a dense routing key (KMS: assigned by
+    // KmsOutputBackend's allocator; nested host-window: always 0). Same id
+    // carried on ScanoutPresent / ScanoutFlipComplete tags.
+    //
+    // scanoutFenceFdByBufId: surfaceBufId -> last exported sync_file fd from
+    // the producer EndAccess. The sync fd is owned here until consumed by the
+    // next ScanoutPresent for the same buffer (KMS: attached to the atomic
+    // commit's IN_FENCE_FD; host-window: attached to the explicit-sync
+    // acquire of the wl_surface commit, when the host advertises
+    // wp_linux_drm_syncobj_v1; if unsupported there, the fence falls back to
+    // implicit-sync via the dmabuf's reservation). Absence means no fence
+    // to attach.
     std::unordered_map<uint32_t, std::pair<uint32_t, int>> scanoutBufIdToSlot;
     std::unordered_map<uint32_t, int> scanoutFenceFdByBufId;
 
-    // Per-output ScanoutReserve handler. Shared by:
-    //   - the startup bring-up loop (tight-loop receive, called once per
-    //     startup output), and
-    //   - the runtime ctrl dispatcher (called when a ScanoutReserve arrives
-    //     for an output that was added via OutputAdded mid-flight).
-    //
-    // The ring is expected to be already allocated by the time the
-    // ScanoutReserve arrives: at startup, kms->initScanout() builds all rings
-    // before the core sends its Reserves; at runtime, the udev rescan callback
-    // calls kms->initScanoutForOutput() before sending OutputAdded.
-    //
-    // The handler InjectTexture's the 3 slots at the core-reserved wire
-    // handles, registers the slots as one-sided SurfaceBufs and routes them
-    // in scanoutBufIdToSlot, and replies ScanoutReady. Returns false on any
-    // failure (caller decides whether fatal).
     // Send a ScanoutReady reply on the WIRE. The matching ScanoutReserve
     // arrived on the wire (kind=6), so the reply also rides the wire to keep
     // the handshake's two sides on the same FIFO. The core's inboundHandler
@@ -632,6 +622,56 @@ int run(int wireFd, int ctrlFd, int inputFd, bool headless,
         serializer.appendFrame(ipc::FrameKind::ScanoutReady, buf, sizeof(buf));
     };
 
+    // Inject one ring's 3 slot textures at the core-reserved wire handles
+    // and register them in surfaceBufs + scanoutBufIdToSlot for the
+    // producer Begin/End bracket path. Backend-neutral: caller passes the
+    // wgpu::SharedTextureMemory + wgpu::Texture for each slot and the
+    // payload's wire handles. Returns true if all 3 InjectTexture calls
+    // succeeded.
+    auto injectScanoutRingSlots =
+        [&](uint32_t outputId,
+            const ipc::ScanoutReservePayload& p,
+            const wgpu::SharedTextureMemory* mems,
+            const wgpu::Texture* texs) -> bool {
+        for (int i = 0; i < 3; ++i) {
+            if (!server.InjectTexture(texs[i].Get(),
+                                      {p.slots[i].handleId, p.slots[i].handleGeneration},
+                                      {ready.device.id, ready.device.generation})) {
+                std::fprintf(stderr,
+                    "[gpu] InjectTexture failed for output %u scanout slot %d\n",
+                    outputId, i);
+                return false;
+            }
+            SurfaceBuf sb{};
+            sb.connId = 0;  // not a plugin buf
+            sb.producerOnCore = true;
+            sb.producerMem = mems[i];
+            sb.producerTex = texs[i];
+            sb.producerDev = coreDevice;
+            // Consumer side intentionally null -- kernel / host scanout
+            // (no wgpu consumer device on our side).
+            sb.layout = 0;
+            sb.everProduced = false;
+            sb.producerOpen = false;
+            sb.consumerOpen = false;
+            const uint32_t sbufId = p.slots[i].surfaceBufId;
+            surfaceBufs.emplace(sbufId, std::move(sb));
+            scanoutBufIdToSlot[sbufId] = {outputId, i};
+        }
+        return true;
+    };
+
+#if OVERDRAW_KMS
+    // KMS-specific ScanoutReserve handler. Shared by:
+    //   - the startup bring-up loop (tight-loop receive, called once per
+    //     startup output), and
+    //   - the runtime ctrl dispatcher (called when a ScanoutReserve arrives
+    //     for an output that was added via OutputAdded mid-flight).
+    //
+    // The ring is expected to be already allocated by the time the
+    // ScanoutReserve arrives: at startup, kms->initScanout() builds all rings
+    // before the core sends its Reserves; at runtime, the udev rescan callback
+    // calls kms->initScanoutForOutput() before sending OutputAdded.
     auto handleScanoutReserve = [&](const ipc::ScanoutReservePayload& p) -> bool {
         if (!kms) {
             std::fprintf(stderr,
@@ -646,33 +686,14 @@ int run(int wireFd, int ctrlFd, int inputFd, bool headless,
             sendScanoutReady(outputId, false);
             return false;
         }
-        bool injectOk = true;
+        wgpu::SharedTextureMemory mems[3];
+        wgpu::Texture texs[3];
         for (int i = 0; i < 3; ++i) {
             const auto& slot = kms->scanoutSlotAt(outputId, i);
-            if (!server.InjectTexture(slot.tex.Get(),
-                                      {p.slots[i].handleId, p.slots[i].handleGeneration},
-                                      {ready.device.id, ready.device.generation})) {
-                std::fprintf(stderr,
-                    "[gpu] InjectTexture failed for output %u scanout slot %d\n",
-                    outputId, i);
-                injectOk = false;
-                break;
-            }
-            SurfaceBuf sb{};
-            sb.connId = 0;  // not a plugin buf
-            sb.producerOnCore = true;
-            sb.producerMem = slot.mem;
-            sb.producerTex = slot.tex;
-            sb.producerDev = coreDevice;
-            // Consumer side intentionally null -- kernel scanout, no wgpu.
-            sb.layout = 0;
-            sb.everProduced = false;
-            sb.producerOpen = false;
-            sb.consumerOpen = false;
-            const uint32_t sbufId = p.slots[i].surfaceBufId;
-            surfaceBufs.emplace(sbufId, std::move(sb));
-            scanoutBufIdToSlot[sbufId] = {outputId, i};
+            mems[i] = slot.mem;
+            texs[i] = slot.tex;
         }
+        const bool injectOk = injectScanoutRingSlots(outputId, p, mems, texs);
         sendScanoutReady(outputId, injectOk);
         if (injectOk) {
             std::printf("[gpu] kms scanout ready for output %u (3 slots injected)\n",
@@ -1145,11 +1166,12 @@ int run(int wireFd, int ctrlFd, int inputFd, bool headless,
             sb.layout = endLayout.newLayout;
         }
 
-#if OVERDRAW_KMS
-        // KMS scanout: producer EndAccess on a scanout SurfaceBuf has no
-        // wgpu consumer device to import the fence into. Capture the raw
-        // sync_file fd instead -- it goes straight to the next ScanoutPresent
-        // as IN_FENCE_FD.
+        // Scanout (KMS or host-window): producer EndAccess on a scanout
+        // SurfaceBuf has no wgpu consumer device to import the fence into.
+        // Capture the raw sync_file fd instead -- it goes straight to the
+        // next ScanoutPresent (KMS: IN_FENCE_FD on the atomic commit;
+        // host-window: the explicit-sync acquire fence on the wl_surface
+        // commit, when the host advertises wp_linux_drm_syncobj_v1).
         {
             auto sit = scanoutBufIdToSlot.find(surfaceBufId);
             if (sit != scanoutBufIdToSlot.end() && producer) {
@@ -1157,7 +1179,7 @@ int run(int wireFd, int ctrlFd, int inputFd, bool headless,
                 // Look up by find() -- operator[] would value-initialize the
                 // map entry to 0, which close() would then interpret as fd 0
                 // (typically the DRM card fd, since stdin is closed in this
-                // child); closing that wedges every subsequent KMS ioctl.
+                // child); closing that wedges every subsequent ioctl.
                 auto fit = scanoutFenceFdByBufId.find(surfaceBufId);
                 if (fit != scanoutFenceFdByBufId.end()) {
                     if (fit->second >= 0) ::close(fit->second);
@@ -1182,7 +1204,6 @@ int run(int wireFd, int ctrlFd, int inputFd, bool headless,
                 return;  // skip the consumer-side fence import below
             }
         }
-#endif
 
         // Plugin overlay path: producerFence (waited by consumer/core) /
         // consumerFence (waited by producer/plugin); import into the WAITING
@@ -2308,35 +2329,48 @@ int run(int wireFd, int ctrlFd, int inputFd, bool headless,
         {
             if (m.tag == ipc::Tag::Shutdown) {
                 shutdown = true;
-#if OVERDRAW_KMS
             } else if (m.tag == ipc::Tag::ScanoutPresent) {
                 // m.surfaceBufId is the scanout slot's surfaceBufId, NOT the
-                // slot index. Map it back to {output, slot}, and pick up the
-                // sync_file fd captured at EndAccess time (keyed by surfaceBufId).
-                if (kms) {
-                    auto sit = scanoutBufIdToSlot.find(m.surfaceBufId);
-                    if (sit == scanoutBufIdToSlot.end()) {
-                        std::fprintf(stderr,
-                            "[gpu] ScanoutPresent: unknown surfaceBufId=%u\n",
-                            m.surfaceBufId);
-                    } else {
-                        const uint32_t outputId = sit->second.first;
-                        const int slot = sit->second.second;
-                        int fenceFd = -1;
-                        auto fit = scanoutFenceFdByBufId.find(m.surfaceBufId);
-                        if (fit != scanoutFenceFdByBufId.end()) {
-                            fenceFd = fit->second;
-                            scanoutFenceFdByBufId.erase(fit);
-                        }
+                // slot index. Map it back to {output, slot} and pick up the
+                // sync_file fd captured at EndAccess time (keyed by
+                // surfaceBufId). Backend dispatch by which one owns this
+                // output: KMS routes to presentScanoutAt, the nested
+                // host-window backend routes to its scanout ring.
+                auto sit = scanoutBufIdToSlot.find(m.surfaceBufId);
+                if (sit == scanoutBufIdToSlot.end()) {
+                    std::fprintf(stderr,
+                        "[gpu] ScanoutPresent: unknown surfaceBufId=%u\n",
+                        m.surfaceBufId);
+                } else {
+                    const uint32_t outputId = sit->second.first;
+                    const int slot = sit->second.second;
+                    int fenceFd = -1;
+                    auto fit = scanoutFenceFdByBufId.find(m.surfaceBufId);
+                    if (fit != scanoutFenceFdByBufId.end()) {
+                        fenceFd = fit->second;
+                        scanoutFenceFdByBufId.erase(fit);
+                    }
+#if OVERDRAW_KMS
+                    if (kms) {
                         if (!kms->presentScanoutAt(outputId, slot, fenceFd)) {
                             std::fprintf(stderr,
                                 "[gpu] presentScanoutAt(output=%u, slot=%d) rejected by kernel\n",
                                 outputId, slot);
                         }
-                        if (fenceFd >= 0) ::close(fenceFd);
+                    } else
+#endif
+                    if (!headless && !outputKms) {
+                        // Nested host-window backend: route the present to
+                        // the wayland scanout ring. fenceFd is not yet
+                        // forwarded -- explicit-sync against the host's
+                        // wp_linux_drm_syncobj_v1 will come in a follow-on.
+                        auto* hb = static_cast<gpu::HostWindowOutputBackend*>(output.get());
+                        hb->presentScanout(slot);
                     }
+                    if (fenceFd >= 0) ::close(fenceFd);
                 }
                 for (int i = 0; i < nRecvFds; ++i) ::close(recvFds[i]);
+#if OVERDRAW_KMS
             } else if (m.tag == ipc::Tag::OutputPause) {
                 if (kms) kms->pause();
                 for (int i = 0; i < nRecvFds; ++i) ::close(recvFds[i]);
