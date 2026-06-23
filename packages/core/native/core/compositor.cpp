@@ -902,10 +902,17 @@ void Compositor::drainCtrl() {
         }
         if (r.tag == ipc::Tag::FrameComplete) {
             // Nested: the host wl_surface.frame listener fired (host
-            // compositor is ready for the next frame). Routes to the addon's
-            // wake state machine. Push the primary outputId so the per-output
-            // frame-callback dispatch fires for the nested-host's single
-            // output too (multi-output is KMS-only today).
+            // compositor is ready for the next frame). Routes to the
+            // addon's wake state machine. Push the primary outputId so
+            // the per-output frame-callback dispatch fires for the
+            // nested host's single output too (multi-output is KMS-only
+            // today). Also disarm the per-output per-vblank gate on
+            // every nested ScanoutOutput so the next acquireOutputTextureHandle
+            // is allowed to present again.
+            for (auto& [id, so] : scanoutOutputs_) {
+                (void)id;
+                so.presentedThisCycle = false;
+            }
             frameCompleteSeen_ = true;
             flipCompletes_.push_back(0);
             continue;
@@ -1225,16 +1232,23 @@ WGPUTexture Compositor::acquireOutputTextureHandle(uint32_t outputId) {
     auto it = scanoutOutputs_.find(outputId);
     if (it == scanoutOutputs_.end()) return nullptr;  // no ring for this output
     ScanoutOutput& so = it->second;
-    // Per-output gate (KMS only): the kernel rejects a second atomic
-    // commit while one is queued (EBUSY), so block here while a flip is
-    // in flight. Nested has no such restriction: the host's
-    // wl_buffer.release fires the previous slot when we commit the next
-    // one, so multiple buffers can be in flight (one PENDING, one or two
-    // already retired and FREE). The ring depth (3) is enough slack.
+    // Per-output per-vblank gate.
+    //   KMS: the kernel rejects a second atomic commit while one is
+    //   queued (EBUSY). PENDING_FLIP is set by presentOutput and cleared
+    //   by ScanoutFlipComplete -- exactly one present per vblank.
+    //   Nested: the host accepts as many commits as we send, but each
+    //   wl_surface.frame.done event is the host's "you may render again"
+    //   beat. presentedThisCycle blocks further acquires until the next
+    //   FrameComplete clears it. Slot state alone (PENDING_FLIP) is not
+    //   enough -- wl_buffer.release can fire mid-vblank and free a slot
+    //   before the host has actually presented; without this gate we'd
+    //   re-render and re-commit faster than the host displays.
     if (kmsMode_) {
         for (int i = 0; i < 3; ++i) {
             if (so.slots[i].state == ScanoutSlotState::PENDING_FLIP) return nullptr;
         }
+    } else if (so.presentedThisCycle) {
+        return nullptr;
     }
     // Pick the next FREE slot. The texture handle was returned by the
     // wire-client ReserveTexture during bring-up; the GPU process has
@@ -1284,6 +1298,10 @@ void Compositor::presentOutput(uint32_t outputId) {
     m.surfaceBufId = so.slots[slot].surfaceBufId;
     ipc::sendMessage(ctrlFd_, m);
     presented_++;
+    // Nested per-vblank gate: arm. drainCtrl clears this when the next
+    // FrameComplete arrives. (KMS doesn't need this -- the PENDING_FLIP
+    // slot state is the equivalent and the kernel enforces it.)
+    if (!kmsMode_) so.presentedThisCycle = true;
     link_->flush();
 }
 

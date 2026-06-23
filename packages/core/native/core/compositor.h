@@ -718,6 +718,13 @@ class Compositor {
     struct ScanoutOutput {
         ScanoutSlot slots[3] = {};
         int currentSlot = -1;  // slot acquired by the current frame; -1 if none
+        // Nested-mode per-vblank present gate. Set by presentOutput;
+        // cleared by drainCtrl when a FrameComplete arrives for outputId.
+        // While set, acquireOutputTextureHandle refuses further acquires
+        // on this output -- one present per host vblank. KMS doesn't use
+        // this (the kernel's single-queue rule + the PENDING_FLIP slot
+        // state already serialize at one in-flight present per CRTC).
+        bool presentedThisCycle = false;
     };
     std::unordered_map<uint32_t, ScanoutOutput> scanoutOutputs_;
     int pendingScanoutFenceFd_ = -1;  // attached to next presentOutput, then closed
