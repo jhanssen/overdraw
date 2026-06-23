@@ -355,8 +355,9 @@ export default function makeSeat(ctx: Ctx, driver: FocusDriver): SeatHandler {
     if (target) markWindowChanged(ctx.state, target.surfaceId, "activated");
   }
 
-  // Build a SeatFocus for a surface id, handling both WM toplevels (rect via
-  // wm.getSnapshot) and layer-shell surfaces (rect via state.layerSurfaces).
+  // Build a SeatFocus for a surface id, handling WM toplevels (rect via
+  // wm.getSnapshot), layer-shell surfaces (rect via state.layerSurfaces),
+  // and xwayland override-redirect overlays (rect via state.overrideRedirects).
   // Returns null when the surface is unknown or unmapped.
   function focusTargetFor(surfaceId: number): SeatFocus | null {
     const s = ctx.state.surfacesById?.get(surfaceId);
@@ -366,6 +367,16 @@ export default function makeSeat(ctx: Ctx, driver: FocusDriver): SeatHandler {
     if (s.layerSurface?.rect) {
       const r = s.layerSurface.rect;
       return { surfaceId, surfaceRec: s, clientId, rect: { x: r.x, y: r.y, width: r.width, height: r.height } };
+    }
+    // Override-redirect xwayland overlay: rect tracked separately from the
+    // WM (the overlay isn't in wm.state.windows). 3.4 will mirror focus to
+    // X via SetInputFocus / WM_TAKE_FOCUS; this just exposes the rect so
+    // the seat can deliver wl_keyboard.enter to the menu's wl_surface.
+    if (s.role === "xwayland") {
+      const orRect = ctx.state.overrideRedirects?.get(surfaceId);
+      if (orRect) {
+        return { surfaceId, surfaceRec: s, clientId, rect: { ...orRect } };
+      }
     }
     const snap = ctx.state.wm?.getSnapshot(surfaceId);
     if (!snap) return null;

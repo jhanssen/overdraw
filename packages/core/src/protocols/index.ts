@@ -285,21 +285,34 @@ export async function installProtocols(
   //    has no ack -- the resize-tx gates on buffer dims only via requireAck.
   // state.xwm is populated by startXwm (which runs AFTER installProtocols);
   // we therefore look it up dynamically per call, not at sink-construction.
-  const configureSink = (
-    surfaceId: number, x: number, y: number, w: number, h: number,
-  ): number | null => {
-    const rec = state.surfacesById?.get(surfaceId);
-    if (rec?.role === "xwayland") {
-      const xw = state.xwm?.findBySurfaceId(surfaceId);
-      if (xw) {
-        addon.xwmConfigureWindow(xw.window, x, y, w, h);
-        addon.xwmSendConfigureNotify(xw.window, x, y, w, h);
+  const configureSink: import("../wm/index.js").ConfigureSink = {
+    configure(surfaceId, x, y, w, h) {
+      const rec = state.surfacesById?.get(surfaceId);
+      if (rec?.role === "xwayland") {
+        const xw = state.xwm?.findBySurfaceId(surfaceId);
+        if (xw) {
+          addon.xwmConfigureWindow(xw.window, x, y, w, h);
+          addon.xwmSendConfigureNotify(xw.window, x, y, w, h);
+        }
+        return null;
       }
+      const xs = rec?.xdgSurface;
+      if (xs?.toplevel) return configureToplevel(ctx, xs, w, h);
       return null;
-    }
-    const xs = rec?.xdgSurface;
-    if (xs?.toplevel) return configureToplevel(ctx, xs, w, h);
-    return null;
+    },
+    // Pure move (no resize): xdg has no client-visible position concept, so
+    // a no-op. xwayland needs the synthetic ConfigureNotify so the client
+    // reads its new root coords. xwmConfigureWindow + xwmSendConfigureNotify
+    // is the same pair as the resize path; with same w/h, the real
+    // ConfigureNotify the X server generates is also fine.
+    configureMove(surfaceId, x, y, w, h) {
+      const rec = state.surfacesById?.get(surfaceId);
+      if (rec?.role !== "xwayland") return;
+      const xw = state.xwm?.findBySurfaceId(surfaceId);
+      if (!xw) return;
+      addon.xwmConfigureWindow(xw.window, x, y, w, h);
+      addon.xwmSendConfigureNotify(xw.window, x, y, w, h);
+    },
   };
   // The WM delegates its stack push to the full rebuild (windows interleaved with
   // their decorations + subsurfaces + popups via computeBaseStack), keeping
@@ -419,24 +432,36 @@ export async function installProtocols(
           state.seat?.focusWindow(id, s, rect);
         }
       } else if (s.role === "xwayland") {
-        // An xwayland window enters the WM at associate (xwm.ts maybeManage),
-        // so addWindow + initial-commit setup are already done. First content
-        // makes it drawable; mirror the xdg_toplevel flow for window.map +
-        // stack + focus. The XWM tracks the WM_DELETE_WINDOW / KillClient
-        // close path separately; from a plugin's view this is a toplevel.
+        // An xwayland window enters the WM at associate (xwm.ts maybeManage)
+        // for managed windows OR is registered as an override-redirect
+        // overlay (xwm.ts placeOverlay). Override-redirect surfaces are
+        // transient overlays (menus/tooltips/DnD icons); they don't enter
+        // the WM, don't emit window.map (plugins shouldn't see them),
+        // don't auto-focus, and rebuild the stack themselves via
+        // rebuildStackWithPopups. Managed xwayland windows mirror the
+        // xdg_toplevel flow.
         s.mapped = true;
         mappedAny = true;
-        const rect = state.wm?.rectOf(id);
-        if (rect) {
-          const ta = titleAppId(state, id);
-          state.bus?.emit(WINDOW_EVENT.map, {
-            surfaceId: id,
-            outputId: s.spawnOutputId ?? OUTPUT_DEFAULT,
-            rect: { x: rect.x, y: rect.y, width: rect.width, height: rect.height },
-            appId: ta.appId, title: ta.title,
-          });
-          state.wm?.windowHasContent(id);
-          state.seat?.focusWindow(id, s, rect);
+        const isOverrideRedirect = state.xwm?.findBySurfaceId(id)?.overrideRedirect ?? false;
+        if (isOverrideRedirect) {
+          // OR placement is owned by xwm.ts (state.overrideRedirects +
+          // rebuildStackWithPopups); first content just flips s.mapped.
+          // The rebuild already ran on MapNotify; trigger another so the
+          // stack actually picks up s.mapped flipping true.
+          mappedPopup = true;
+        } else {
+          const rect = state.wm?.rectOf(id);
+          if (rect) {
+            const ta = titleAppId(state, id);
+            state.bus?.emit(WINDOW_EVENT.map, {
+              surfaceId: id,
+              outputId: s.spawnOutputId ?? OUTPUT_DEFAULT,
+              rect: { x: rect.x, y: rect.y, width: rect.width, height: rect.height },
+              appId: ta.appId, title: ta.title,
+            });
+            state.wm?.windowHasContent(id);
+            state.seat?.focusWindow(id, s, rect);
+          }
         }
       } else if (s.role === "xdg_popup") {
         // A popup maps on first content; it is compositor-positioned above its

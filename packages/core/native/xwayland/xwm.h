@@ -61,6 +61,7 @@ struct XwmEvent {
         MapNotify,
         UnmapNotify,
         ConfigureRequest,
+        ConfigureNotify,  // X-side geometry changed (root's substructure-notify)
         SurfaceSerial,    // WL_SURFACE_SERIAL client-message (the association join)
         PropertyNotify,   // a watched property on a managed window changed
         PropertyReply,    // async reply to a prior xwmGetProperty call

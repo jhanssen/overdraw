@@ -189,6 +189,21 @@ function popupRootToplevelId(state: CompositorState, pr: PopupRecord): number | 
   return null;
 }
 
+// Append X11 override-redirect overlays (menus, tooltips, etc.) to the
+// content layer above all popups and toplevels. ORs are placed at the
+// absolute X-root coords the X client supplied (identity-mapped to layout
+// space in rootless mode); they have no parent-toplevel concept here, so
+// they go on top of every toplevel + popup in the (global / per-output)
+// stack pass.
+function appendOverrideRedirects(state: CompositorState, stack: number[]): void {
+  const ors = state.overrideRedirects;
+  if (!ors || ors.size === 0) return;
+  for (const [surfaceId, rect] of ors) {
+    state.compositor.setSurfaceLayout(surfaceId, rect.x, rect.y, rect.width, rect.height);
+    stack.push(surfaceId);
+  }
+}
+
 // Append the popup chain to `stack`, in parent-before-child order, setting each
 // popup's output-space layout rect. `includePopup` filters which popups draw
 // (per-output expansion uses the filter; global pass returns true for all).
@@ -241,9 +256,11 @@ export function rebuildStackWithPopups(state: CompositorState): void {
   const wm = state.wm;
   if (!wm) return;
 
-  // --- Global stack: all toplevels in WM order + their subsurfaces + all popups.
+  // --- Global stack: all toplevels in WM order + their subsurfaces + all
+  // popups + xwayland override-redirect overlays on top.
   const globalStack: number[] = computeBaseStack(state, wm.state.windows);
   appendPopups(state, globalStack, () => true);
+  appendOverrideRedirects(state, globalStack);
   state.compositor.setStack(globalStack);
 
   // --- Per-output filtered stacks. Each filter is a toplevel-id order; expand
@@ -270,6 +287,10 @@ export function rebuildStackWithPopups(state: CompositorState): void {
       const root = popupRootToplevelId(state, pr);
       return root !== null && inFilter.has(root);
     });
+    // Override-redirect overlays follow the same not-filtered behavior as the
+    // global pass: they appear on every output's stack. (X menus have no
+    // workspace concept; the X client positions them in absolute coords.)
+    appendOverrideRedirects(state, stack);
     computed.set(outputId, stack);
   }
 

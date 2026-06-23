@@ -27,11 +27,15 @@ function setup() {
   const comp = mockCompositor();
   let serial = 0;
   const configures = [];
-  const configure = (id, _x, _y, w, h) => {
-    serial += 1; configures.push({ id, w, h, serial }); return serial;
+  const moves = [];
+  const configure = {
+    configure: (id, _x, _y, w, h) => {
+      serial += 1; configures.push({ id, w, h, serial }); return serial;
+    },
+    configureMove: (id, x, y, w, h) => { moves.push({ id, x, y, w, h }); },
   };
   const wm = createWm(comp, OUT, { configure, layoutDriverFactory: inlineMasterStackDriverFactory });
-  return { wm, comp, configures };
+  return { wm, comp, configures, moves };
 }
 
 async function addMapped(wm, id) {
@@ -166,9 +170,13 @@ function setupBufferDimsOnly() {
   };
   // Sink returns null -- the xwayland convention (no ack to wait for).
   const configures = [];
-  const configure = (id, _x, _y, w, h) => { configures.push({ id, w, h }); return null; };
+  const moves = [];
+  const configure = {
+    configure: (id, _x, _y, w, h) => { configures.push({ id, w, h }); return null; },
+    configureMove: (id, x, y, w, h) => { moves.push({ id, x, y, w, h }); },
+  };
   const wm = createWm(comp, OUT, { configure, layoutDriverFactory: inlineMasterStackDriverFactory });
-  return { wm, comp, configures, readyAt };
+  return { wm, comp, configures, moves, readyAt };
 }
 
 test('xwayland-style hold: serial=null releases on surfaceReadyAt alone', async () => {
@@ -210,6 +218,56 @@ test('xwayland-style hold: serial=null releases on surfaceReadyAt alone', async 
   // Both windows now read ready; the batch applies.
   assert.deepEqual(rectOf(wm, 2), { x: 0, y: 0, width: 500, height: 600 }, '2 -> master');
   assert.deepEqual(rectOf(wm, 3), { x: 500, y: 0, width: 500, height: 300 }, '3 -> stack-top');
+});
+
+test('configureMove fires on a pure-move (no size change)', async () => {
+  // A small custom driver that ignores master-stack and lays the single
+  // window at a configurable offset; we shift the offset between settled()s
+  // to synthesize a pure move (same dims, different position).
+  const comp = mockCompositor();
+  const configures = [];
+  const moves = [];
+  const configure = {
+    configure: (id, _x, _y, w, h) => { configures.push({ id, w, h }); return 1; },
+    configureMove: (id, x, y, w, h) => { moves.push({ id, x, y, w, h }); },
+  };
+  // Shift state the driver reads to position the (single) window.
+  let dx = 0, dy = 0;
+  const { createLayoutDriver } = await import('../packages/core/dist/wm/layout-driver.js');
+  const driverFactory = (target, snapshot) => createLayoutDriver({
+    target, snapshot,
+    compute: async (inputs) => ({
+      rects: inputs.windows.map((w) => ({
+        id: w.id,
+        outer: { x: dx, y: dy, width: 400, height: 300 },
+      })),
+    }),
+  });
+  const wm = createWm(comp, OUT, { configure, layoutDriverFactory: driverFactory });
+  await addMapped(wm, 1);
+  await wm.settled();
+  configures.length = 0;
+
+  // Trigger a relayout (reason='reorder' via wm.reorder is the cleanest, but
+  // a single window can't reorder; use the public relayout entry point).
+  // Move dx,dy and have the WM re-run the layout. Simplest: add+remove a
+  // window so the layout pass fires for "mapped"/"unmapped"; the immediate
+  // path handles those.
+  dx = 100; dy = 50;
+  // Stage a follow-up "mapped" relayout: addWindow then unmap to provoke a
+  // layout pass that reads the new dx,dy.
+  await addMapped(wm, 2);
+  wm.unmapWindow(2);
+  await wm.settled();
+
+  // The single window should have moved (400x300) from (0,0) to (100,50).
+  // The configureMove path fires for pure moves with same dims.
+  const moveOf1 = moves.find((m) => m.id === 1);
+  assert.ok(moveOf1, `expected a configureMove for window 1; saw moves: ${JSON.stringify(moves)}`);
+  assert.deepEqual(moveOf1, { id: 1, x: 100, y: 50, w: 400, h: 300 });
+  // No size-change configure should have fired for the move (same 400x300).
+  const sizeChanges = configures.filter((c) => c.id === 1);
+  assert.equal(sizeChanges.length, 0, 'no size-change configure for pure move');
 });
 
 test('xwayland-style hold: held until BOTH windows report buffer-ready (batched)', async () => {

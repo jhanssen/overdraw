@@ -236,6 +236,7 @@ void deliverXwmEvent(const XwmEvent& e) {
         case XwmEvent::MapNotify: typeStr = "map"; break;
         case XwmEvent::UnmapNotify: typeStr = "unmap"; break;
         case XwmEvent::ConfigureRequest: typeStr = "configure-request"; break;
+        case XwmEvent::ConfigureNotify: typeStr = "configure-notify"; break;
         case XwmEvent::SurfaceSerial: typeStr = "surface-serial"; break;
         case XwmEvent::PropertyNotify: typeStr = "property-notify"; break;
         case XwmEvent::PropertyReply: typeStr = "property-reply"; break;

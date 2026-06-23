@@ -11,6 +11,7 @@
 import type { CompositorState, SurfaceRecord } from "../protocols/ctx.js";
 import type { Addon } from "../types.js";
 import { markWindowChanged } from "../protocols/window-changes.js";
+import { rebuildStackWithPopups } from "../protocols/xdg_popup.js";
 import { ensureXwaylandState, lookupBySerial } from "./surface.js";
 import {
   parseStringProperty,
@@ -35,6 +36,7 @@ export interface XwmEventMsg {
     | "map"
     | "unmap"
     | "configure-request"
+    | "configure-notify"
     | "surface-serial"
     | "property-notify"
     | "property-reply";
@@ -176,7 +178,9 @@ export function startXwm(state: CompositorState, addon: Addon, wmFd: number): Xw
   };
 
   // A non-override-redirect window that is both mapped and associated with a
-  // wl_surface enters the WM. (Override-redirect placement is Phase 3.3.)
+  // wl_surface enters the WM. Override-redirect windows take the placeOverlay
+  // path instead -- they're transient overlays (menus / tooltips), not WM
+  // windows.
   function maybeManage(w: XWindow): void {
     if (w.addedToWm || w.overrideRedirect || !w.mapped || w.surfaceId === null) return;
     const surfRec = state.surfacesById?.get(w.surfaceId);
@@ -199,6 +203,27 @@ export function startXwm(state: CompositorState, addon: Addon, wmFd: number): Xw
     w.addedToWm = false;
   }
 
+  // Override-redirect placement: record the X-supplied rect in
+  // state.overrideRedirects so the content-layer stack rebuild
+  // (xdg_popup.ts:appendOverrideRedirects) emits a setSurfaceLayout for
+  // each OR overlay alongside the popup chain. Identity-mapped: X-root
+  // coords == compositor logical coords in rootless mode (single global
+  // root rect).
+  function placeOverlay(w: XWindow): void {
+    if (!w.overrideRedirect || !w.mapped || w.surfaceId === null) return;
+    const ors = (state.overrideRedirects ??= new Map());
+    ors.set(w.surfaceId, { x: w.x, y: w.y, width: w.width, height: w.height });
+    rebuildStackWithPopups(state);
+  }
+
+  function removeOverlay(w: XWindow): void {
+    if (w.surfaceId === null) return;
+    const ors = state.overrideRedirects;
+    if (!ors || !ors.has(w.surfaceId)) return;
+    ors.delete(w.surfaceId);
+    rebuildStackWithPopups(state);
+  }
+
   // When a window first associates with a wl_surface: batch-read every
   // ICCCM/EWMH property we care about. Each reply lands as a "property-reply"
   // event; the cookieId routes it back to the right window.
@@ -209,12 +234,13 @@ export function startXwm(state: CompositorState, addon: Addon, wmFd: number): Xw
       const cookie = addon.xwmGetProperty(w.window, e.atom);
       pendingReads.set(cookie, { window: w.window, name: e.name });
     }
-    // The window may already be mapped; if so, try to manage it now (else
-    // wait for the map event). We do this AFTER firing the batch reads so
-    // markInitialCommitComplete sees the still-null title/appId only if no
-    // reply has come back yet -- and the subsequent property-replies will
-    // markWindowChanged to publish the real values.
-    maybeManage(w);
+    // The window may already be mapped; if so, try to manage or place it
+    // now (else wait for the map event). We do this AFTER firing the batch
+    // reads so markInitialCommitComplete sees the still-null title/appId
+    // only if no reply has come back yet -- and the subsequent
+    // property-replies will markWindowChanged to publish the real values.
+    if (w.overrideRedirect) placeOverlay(w);
+    else maybeManage(w);
   }
 
   // Translate the parsed property state into wm.markInitialCommitComplete /
@@ -329,29 +355,46 @@ export function startXwm(state: CompositorState, addon: Addon, wmFd: number): Xw
         break;
       case "map": {
         const w = windows.get(ev.window);
-        if (w) { w.mapped = true; maybeManage(w); }
+        if (!w) break;
+        // Native MapNotify carries the current X-side rect (it may differ
+        // from CreateNotify's initial rect if the client called
+        // ConfigureWindow in between, which OR windows often do to position
+        // a menu). Sync the XWindow record first.
+        if (ev.width > 0 && ev.height > 0) {
+          w.x = ev.x; w.y = ev.y;
+          w.width = ev.width; w.height = ev.height;
+        }
+        w.mapped = true;
+        if (w.overrideRedirect) placeOverlay(w);
+        else maybeManage(w);
         break;
       }
       case "unmap": {
         const w = windows.get(ev.window);
-        if (w) { w.mapped = false; unmanage(w); }
+        if (w) {
+          w.mapped = false;
+          if (w.overrideRedirect) removeOverlay(w);
+          else unmanage(w);
+        }
         break;
       }
       case "destroy": {
         const w = windows.get(ev.window);
         if (w) {
-          unmanage(w);
+          if (w.overrideRedirect) removeOverlay(w);
+          else unmanage(w);
           if (w.surfaceId !== null) bySurface.delete(w.surfaceId);
         }
         windows.delete(ev.window);
         break;
       }
       case "configure-request": {
-        // The compositor is authoritative for managed windows: reply with
+        // Managed windows: the compositor is authoritative -- reply with
         // the WM's current rect (and a synthetic ConfigureNotify per ICCCM
-        // §4.2.3) instead of honoring the client's request. For windows
-        // not yet in the WM (e.g. override-redirect, or pre-associate),
-        // fall back to honoring the request -- 3.3 will refine.
+        // §4.2.3) instead of honoring the client's request.
+        // Override-redirect: the X client positions menus/tooltips itself;
+        // honor the request, update our tracked rect, and re-place the
+        // overlay so the compositor draws it at the new coords.
         const w = windows.get(ev.window);
         if (w && w.addedToWm && w.surfaceId !== null) {
           const r = state.wm?.rectOf(w.surfaceId);
@@ -363,6 +406,23 @@ export function startXwm(state: CompositorState, addon: Addon, wmFd: number): Xw
         }
         addon.xwmConfigureWindow(ev.window, ev.x, ev.y, ev.width, ev.height);
         addon.xwmSendConfigureNotify(ev.window, ev.x, ev.y, ev.width, ev.height);
+        if (w) {
+          w.x = ev.x; w.y = ev.y;
+          w.width = ev.width; w.height = ev.height;
+          if (w.overrideRedirect && w.mapped) placeOverlay(w);
+        }
+        break;
+      }
+      case "configure-notify": {
+        // The X-side geometry actually changed (either our own
+        // xwmConfigureWindow reflected back, or an override-redirect
+        // client moved itself). Sync the XWindow record and -- for mapped
+        // OR overlays -- re-place via the overrideRedirects store.
+        const w = windows.get(ev.window);
+        if (!w) break;
+        w.x = ev.x; w.y = ev.y;
+        w.width = ev.width; w.height = ev.height;
+        if (w.overrideRedirect && w.mapped) placeOverlay(w);
         break;
       }
       case "surface-serial": {

@@ -650,7 +650,16 @@ export function detachSurfaceRole(state: CompositorState, s: SurfaceRecord): voi
   // to capture a phantom. No-op when no plugin claims the
   // 'window-closing' namespace.
   state.closingDriver?.beforeUnmap(state, s);
-  if (s.role === "xdg_toplevel" || s.role === "layer_surface" || s.role === "xwayland") {
+  // Emit window.unmap for toplevel-shaped surfaces only. Override-redirect
+  // xwayland overlays are transient (menus/tooltips/DnD icons); plugins
+  // never saw a corresponding window.map for them and shouldn't see an
+  // unmap either.
+  const isXwaylandOverrideRedirect = s.role === "xwayland"
+    && (state.xwm?.findBySurfaceId(s.id)?.overrideRedirect ?? false);
+  const emitsWindowEvents = (s.role === "xdg_toplevel"
+                          || s.role === "layer_surface"
+                          || (s.role === "xwayland" && !isXwaylandOverrideRedirect));
+  if (emitsWindowEvents) {
     state.bus?.emit(WINDOW_EVENT.unmap, { surfaceId: s.id });
   }
   state.pendingWindowChanges?.delete(s.id);

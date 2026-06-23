@@ -3,6 +3,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <unordered_map>
 #include <vector>
 
 #include <xcb/composite.h>
@@ -58,6 +59,15 @@ const char* atomName(int i) {
     return (i >= 0 && i < ATOM_COUNT) ? ATOM_NAMES[i] : "";
 }
 
+// Tracked X-side geometry of a window. Updated on CreateNotify and
+// ConfigureNotify; read on MapNotify so the TS side knows the rect Xwayland
+// has on the window at map time (which may differ from CreateNotify's
+// initial rect, e.g. for override-redirect windows that issue
+// ConfigureWindow between create and map to position their menu).
+struct TrackedRect {
+    int32_t x = 0, y = 0, width = 0, height = 0;
+};
+
 struct XwmConn {
     xcb_connection_t* conn = nullptr;
     xcb_screen_t* screen = nullptr;
@@ -67,6 +77,10 @@ struct XwmConn {
     // Pending GetProperty replies. Walked every xwmProcess call.
     std::vector<PendingProperty> pending;
     uint32_t nextCookieId = 1;
+
+    // Per-window geometry tracker. Populated on CreateNotify, updated on
+    // ConfigureNotify, cleared on DestroyNotify.
+    std::unordered_map<uint32_t, TrackedRect> rects;
 };
 
 XwmConn* xwmConnect(int wmFd) {
@@ -180,6 +194,9 @@ bool xwmProcess(XwmConn* x, const std::function<void(const XwmEvent&)>& cb) {
                 const uint32_t mask =
                     XCB_EVENT_MASK_FOCUS_CHANGE | XCB_EVENT_MASK_PROPERTY_CHANGE;
                 xcb_change_window_attributes(x->conn, e->window, XCB_CW_EVENT_MASK, &mask);
+                // Track the initial geometry so MapNotify can report the
+                // current rect even if no ConfigureNotify has fired yet.
+                x->rects[e->window] = { e->x, e->y, e->width, e->height };
                 XwmEvent o;
                 o.type = XwmEvent::Create;
                 o.window = e->window;
@@ -193,6 +210,7 @@ bool xwmProcess(XwmConn* x, const std::function<void(const XwmEvent&)>& cb) {
             }
             case XCB_DESTROY_NOTIFY: {
                 auto* e = reinterpret_cast<xcb_destroy_notify_event_t*>(ev);
+                x->rects.erase(e->window);
                 XwmEvent o;
                 o.type = XwmEvent::Destroy;
                 o.window = e->window;
@@ -213,6 +231,16 @@ bool xwmProcess(XwmConn* x, const std::function<void(const XwmEvent&)>& cb) {
                 o.type = XwmEvent::MapNotify;
                 o.window = e->window;
                 o.overrideRedirect = e->override_redirect;
+                // Carry the current tracked rect so the TS side has the X-side
+                // geometry at map time (CreateNotify's rect can be stale if
+                // the client called ConfigureWindow between create and map).
+                auto it = x->rects.find(e->window);
+                if (it != x->rects.end()) {
+                    o.x = it->second.x;
+                    o.y = it->second.y;
+                    o.width = it->second.width;
+                    o.height = it->second.height;
+                }
                 cb(o);
                 break;
             }
@@ -228,6 +256,24 @@ bool xwmProcess(XwmConn* x, const std::function<void(const XwmEvent&)>& cb) {
                 auto* e = reinterpret_cast<xcb_configure_request_event_t*>(ev);
                 XwmEvent o;
                 o.type = XwmEvent::ConfigureRequest;
+                o.window = e->window;
+                o.x = e->x;
+                o.y = e->y;
+                o.width = e->width;
+                o.height = e->height;
+                cb(o);
+                break;
+            }
+            case XCB_CONFIGURE_NOTIFY: {
+                auto* e = reinterpret_cast<xcb_configure_notify_event_t*>(ev);
+                // Track for future MapNotify reads. Skip our own synthetic
+                // ConfigureNotifies (top bit of response_type set by
+                // xcb_send_event) so we don't ping-pong on our own state.
+                if ((ev->response_type & 0x80) == 0) {
+                    x->rects[e->window] = { e->x, e->y, e->width, e->height };
+                }
+                XwmEvent o;
+                o.type = XwmEvent::ConfigureNotify;
                 o.window = e->window;
                 o.x = e->x;
                 o.y = e->y;

@@ -42,7 +42,7 @@ test('applyLayout: window unmapped during interceptor await is NOT pushed to com
   async () => {
   const comp = mockCompositor();
   const configures = [];
-  const configure = (surfaceId, w, h) => { configures.push({ surfaceId, w, h }); };
+  const configure = { configure: (surfaceId, _x, _y, w, h) => { configures.push({ surfaceId, w, h }); return null; }, configureMove: () => {} };
   const pluginBus = new DynamicBus();
   const wm = createWm(comp, OUT, {
     layoutDriverFactory: inlineMasterStackDriverFactory,
@@ -110,7 +110,7 @@ test('applyLayout: self-unmap during interceptor await -- stale-win post-await i
   // resurrecting the entry that removeSurface had just dropped.
   const comp = mockCompositor();
   const configures = [];
-  const configure = (surfaceId, w, h) => { configures.push({ surfaceId, w, h }); };
+  const configure = { configure: (surfaceId, _x, _y, w, h) => { configures.push({ surfaceId, w, h }); return null; }, configureMove: () => {} };
   const pluginBus = new DynamicBus();
   const wm = createWm(comp, OUT, {
     layoutDriverFactory: inlineMasterStackDriverFactory,

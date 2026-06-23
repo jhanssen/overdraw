@@ -44,14 +44,19 @@ export function flushWindowChanges(state: CompositorState): void {
   pending.clear();
 }
 
-// True if `surfaceId` is a currently-mapped toplevel. xwayland windows enter
-// the WM the same way xdg toplevels do (they are application windows from a
-// plugin's standpoint), so window.change must flush for them too.
+// True if `surfaceId` is a currently-mapped toplevel. Managed xwayland
+// windows count (plugins see them as toplevels); override-redirect xwayland
+// overlays (menus, tooltips) do not -- they never emitted window.map.
 function isMappedToplevel(state: CompositorState, surfaceId: number): boolean {
   for (const s of state.surfaces.values()) {
-    if (s.id === surfaceId) {
-      return s.mapped === true && (s.role === "xdg_toplevel" || s.role === "xwayland");
+    if (s.id !== surfaceId) continue;
+    if (!s.mapped) return false;
+    if (s.role === "xdg_toplevel") return true;
+    if (s.role === "xwayland") {
+      const xw = state.xwm?.findBySurfaceId(surfaceId);
+      return !(xw?.overrideRedirect ?? false);
     }
+    return false;
   }
   return false;
 }

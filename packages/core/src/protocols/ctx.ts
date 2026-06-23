@@ -489,6 +489,13 @@ export interface CompositorState {
   // surfaceId without taking a dep on the full Xwm shape. Cleared on
   // xwm.stop().
   xwm?: import("../xwayland/xwm.js").XwmStateView;
+  // Override-redirect overlay placements, keyed by surfaceId. Populated by
+  // the XWM when an OR window maps or is reconfigured; consulted by the
+  // content-layer stack rebuild (xdg_popup.ts:appendOverrideRedirects) to
+  // push setSurfaceLayout for each OR overlay, and by wl_seat.focusTargetFor
+  // to resolve focus on an OR surface (the WM doesn't track these). Cleared
+  // when the X window is destroyed.
+  overrideRedirects?: Map<number, { x: number; y: number; width: number; height: number }>;
   // The compositor backend (native addon or JS compositor). Set by installProtocols.
   compositor: CompositorSink;
   // Per-interface event senders, built once by installProtocols. Exposed on

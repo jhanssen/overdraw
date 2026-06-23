@@ -426,10 +426,30 @@ Xwayland or a Wayland session is absent. Coverage targets, smallest tier first:
     managed X window is answered with the WM's current rect rather
     than the client's request. GPU test asserts the synthetic
     ConfigureNotify carrying the WM-chosen dims reaches the X client.
-    Pure-move (no resize) on an xwayland window does not yet fire a
-    ConfigureNotify (the sink isn't called for moveOnly holds); will
-    fold into 3.3 alongside override-redirect placement.
-  - **3.3 — Override-redirect overlays + stacking.** Pending.
+  - **3.3 — Override-redirect overlays + pure-move ConfigureNotify.**
+    ✅ Landed. The sink interface gained `configureMove(surfaceId, x,
+    y, w, h)`; the WM calls it on pure-move (no size change), the
+    xdg branch no-ops, the xwayland branch sends
+    xwmConfigureWindow + xwmSendConfigureNotify so X clients see
+    their new root coords on workspace switches and the like.
+    Override-redirect xwayland windows (menus, tooltips, DnD icons)
+    are tracked in `state.overrideRedirects` (Map<surfaceId, rect>)
+    populated by xwm.ts on MapNotify / ConfigureNotify and cleared on
+    UnmapNotify / DestroyNotify. The content-layer stack rebuild
+    (`xdg_popup.ts:rebuildStackWithPopups`) appends OR ids above
+    popups via `appendOverrideRedirects`, calling
+    `setSurfaceLayout(id, x, y, w, h)` for each. OR surfaces never
+    enter the WM, never emit `window.map` / `window.unmap` /
+    `window.change` (those gates exclude OR by consulting
+    `state.xwm.findBySurfaceId(id).overrideRedirect`), and are NOT
+    auto-focused on map -- but `wl_seat.focusTargetFor` gained an OR
+    arm so an explicit `applyKeyboardFocus(orSurfaceId)` lands. The
+    native MapNotify event now carries x/y/w/h (sourced from a
+    per-window tracker updated on CreateNotify / ConfigureNotify) so
+    the placement at map time reflects any ConfigureWindow between
+    create and map -- the standard menu-positioning pattern. GPU
+    tests: OR placement at X-supplied coords; OR cleanup on destroy;
+    OR focusability.
   - **3.4 — Focus mirroring.** Pending (parses WM_HINTS.input today
     but doesn't consume it; the SetInputFocus / WM_TAKE_FOCUS path is
     not wired).

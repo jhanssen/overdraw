@@ -34,12 +34,19 @@ int main(int argc, char** argv) {
     const char* title = "overdraw test";
     const char* appId = "x11-test-client";
     int timeoutMs = 5000;
+    int overrideRedirect = 0;
+    int x = 0, y = 0, w = 200, h = 150;
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--title") && i + 1 < argc) { title = argv[++i]; }
         else if (!strcmp(argv[i], "--app-id") && i + 1 < argc) { appId = argv[++i]; }
         else if (!strcmp(argv[i], "--timeout-ms") && i + 1 < argc) {
             timeoutMs = atoi(argv[++i]);
         }
+        else if (!strcmp(argv[i], "--override-redirect")) { overrideRedirect = 1; }
+        else if (!strcmp(argv[i], "--x") && i + 1 < argc) { x = atoi(argv[++i]); }
+        else if (!strcmp(argv[i], "--y") && i + 1 < argc) { y = atoi(argv[++i]); }
+        else if (!strcmp(argv[i], "--w") && i + 1 < argc) { w = atoi(argv[++i]); }
+        else if (!strcmp(argv[i], "--h") && i + 1 < argc) { h = atoi(argv[++i]); }
     }
 
     xcb_connection_t* c = xcb_connect(NULL, NULL);
@@ -54,10 +61,22 @@ int main(int argc, char** argv) {
     }
 
     xcb_window_t win = xcb_generate_id(c);
-    uint32_t values[2] = { screen->white_pixel, XCB_EVENT_MASK_EXPOSURE };
+    // Override-redirect: CWOverrideRedirect=True tells the X server to bypass
+    // the WM for this window. Used by menus / tooltips / DnD icons.
+    // CW values must be supplied in CW bit-position order: BACK_PIXEL (2),
+    // OVERRIDE_REDIRECT (512), EVENT_MASK (2048).
+    uint32_t valuesMask = XCB_CW_BACK_PIXEL | XCB_CW_EVENT_MASK;
+    uint32_t values[3];
+    int vi = 0;
+    values[vi++] = screen->white_pixel;
+    if (overrideRedirect) {
+        valuesMask |= XCB_CW_OVERRIDE_REDIRECT;
+        values[vi++] = 1;
+    }
+    values[vi++] = XCB_EVENT_MASK_EXPOSURE;
     xcb_create_window(c, XCB_COPY_FROM_PARENT, win, screen->root,
-                      0, 0, 200, 150, 0, XCB_WINDOW_CLASS_INPUT_OUTPUT,
-                      screen->root_visual, XCB_CW_BACK_PIXEL | XCB_CW_EVENT_MASK, values);
+                      x, y, w, h, 0, XCB_WINDOW_CLASS_INPUT_OUTPUT,
+                      screen->root_visual, valuesMask, values);
 
     // WM_CLASS: "<instance>\0<class>\0". Many WMs treat the second as app_id;
     // overdraw's parseWmClass picks the second too.

@@ -148,17 +148,34 @@ export function defaultWindowState(): WindowState {
 export interface WmState { outputs: Map<number, WmOutput>; windows: Window[]; }
 
 // Configure sink: ask the protocol layer to (re)configure a window to a
-// content rect. Position is carried for the xwayland case (the X window needs
-// to be moved AND resized on the wire); the xdg path ignores position and
-// just sends the size in xdg_toplevel.configure. Returns a serial number for
-// the xdg case (so the WM's resize transaction can match the client's ack),
-// or null when no ack is expected -- xwayland (no ack_configure equivalent)
-// or no-op cases. Wired by installProtocols.
-export type ConfigureSink = (
+// content rect. Position is carried for the xwayland case (the X window
+// needs to be moved AND resized on the wire); the xdg path ignores position
+// and just sends the size in xdg_toplevel.configure. Returns a serial number
+// for the xdg case (so the WM's resize transaction can match the client's
+// ack), or null when no ack is expected -- xwayland (no ack_configure
+// equivalent) or no-op cases. Wired by installProtocols.
+export type ConfigureFn = (
   surfaceId: number,
   x: number, y: number,
   contentW: number, contentH: number,
 ) => number | null;
+
+// Pure-move sink: a window changed root position without resizing. For xdg
+// this is a no-op (xdg-shell hides position from clients); for xwayland the
+// X client expects a ConfigureNotify telling it the new root coords. Wired
+// by installProtocols alongside ConfigureFn.
+export type ConfigureMoveFn = (
+  surfaceId: number,
+  x: number, y: number,
+  contentW: number, contentH: number,
+) => void;
+
+// Bundle the two; the WM holds one ConfigureSink and calls .configure on
+// size-change paths, .configureMove on pure-move paths.
+export interface ConfigureSink {
+  configure: ConfigureFn;
+  configureMove: ConfigureMoveFn;
+}
 
 // Decoration-resize sink: fired when a decorated window's OUTER tile changes
 // (move and/or size).
@@ -753,6 +770,7 @@ export function createWm(
   // immediate apply path in applyLayout.
   function pushGeometry(win: Window, outer: Rect, content: Rect): void {
     const prevOuter = win.outer;
+    const prevContent = { ...win.rect };
     win.outer = outer;
     win.rect = content;
     if (win.hasContent) {
@@ -765,6 +783,17 @@ export function createWm(
       if (decorationResize && win.insets) {
         decorationResize(win.surfaceId, { ...outer }, { ...content }, { ...win.insets });
       }
+    }
+    // Pure-move: position changed but size didn't. xwayland clients need a
+    // ConfigureNotify with the new root coords (xdg-shell clients hide
+    // position from their windows, so the sink's xdg branch is a no-op).
+    // Guard prev-rect == placeholder (width <= 0): that is the first apply
+    // after addWindow and is a size-establishing event, not a pure move.
+    const hadPriorRect = prevContent.width > 0 && prevContent.height > 0;
+    const contentMoved = prevContent.x !== content.x || prevContent.y !== content.y;
+    const contentSized = prevContent.width !== content.width || prevContent.height !== content.height;
+    if (configure && win.hasContent && hadPriorRect && contentMoved && !contentSized) {
+      configure.configureMove(win.surfaceId, content.x, content.y, content.width, content.height);
     }
   }
 
@@ -847,7 +876,7 @@ export function createWm(
           // ack_configure), xwayland returns null (no ack -- gate on buffer
           // dims only).
           const serial = configure
-            ? configure(win.surfaceId, newContent.x, newContent.y,
+            ? configure.configure(win.surfaceId, newContent.x, newContent.y,
                         newContent.width, newContent.height) : null;
           const requireAck = serial !== null;
           if (pend) {
@@ -889,7 +918,12 @@ export function createWm(
         compositor.setSurfaceLayout(win.surfaceId, content.x, content.y, content.width, content.height);
       }
       if (configure && !win.pendingInitialCommit && sizeChanged) {
-        configure(win.surfaceId, content.x, content.y, content.width, content.height);
+        configure.configure(win.surfaceId, content.x, content.y, content.width, content.height);
+      } else if (configure && !win.pendingInitialCommit && moved && win.hasContent) {
+        // Pure move: configure.configure is for size changes only; route via
+        // the move-only sink so xwayland clients get a ConfigureNotify and
+        // xdg clients see a no-op.
+        configure.configureMove(win.surfaceId, content.x, content.y, content.width, content.height);
       }
       const outerMoved = prevOuter.x !== win.outer.x || prevOuter.y !== win.outer.y
                       || prevOuter.width !== win.outer.width || prevOuter.height !== win.outer.height;
@@ -1081,7 +1115,7 @@ export function createWm(
             && win.outer.width > 0 && win.outer.height > 0) {
           win.pendingSizeConfigure = false;
           const content = contentOf(win);
-          configure(win.surfaceId, content.x, content.y, content.width, content.height);
+          configure.configure(win.surfaceId, content.x, content.y, content.width, content.height);
         }
       }
       return { ...win.rect };
@@ -1149,7 +1183,7 @@ export function createWm(
       // shortly sends the real sized configure.
       if (configure && win.outer.width > 0 && win.outer.height > 0
           && (contentRect.width !== prevContent.width || contentRect.height !== prevContent.height)) {
-        configure(win.surfaceId, contentRect.x, contentRect.y,
+        configure.configure(win.surfaceId, contentRect.x, contentRect.y,
                   contentRect.width, contentRect.height);
       }
       return { insets: granted, outerRect, contentRect };
@@ -1360,7 +1394,7 @@ export function createWm(
       const win = windows.find((w) => w.surfaceId === surfaceId);
       if (!win || !win.pendingInitialCommit || win.pendingSizeConfigure) return;
       if (configure) {
-        configure(win.surfaceId, 0, 0, 0, 0);
+        configure.configure(win.surfaceId, 0, 0, 0, 0);
         win.pendingSizeConfigure = true;
       }
     },
@@ -1431,7 +1465,7 @@ export function createWm(
         // once the client has content (a resize). The 0x0 carries the resolved
         // state array (maximized/tiled) so the client knows it is tiled.
         if (configure && !win.pendingSizeConfigure) {
-          configure(win.surfaceId, 0, 0, 0, 0);
+          configure.configure(win.surfaceId, 0, 0, 0, 0);
           win.pendingSizeConfigure = true;
         }
       } finally {
