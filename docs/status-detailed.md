@@ -420,7 +420,8 @@ handlers, WM, compositing, and plugin runtime are in JS.
 ## Compositing (runs in JS over the Dawn wire)
 
 The compositing pass lives entirely in core main-thread JS. There is no C++
-compositing pass; the C++ `Compositor` is a WSI + interop service. WebGPU is
+compositing pass; the C++ `Compositor` is a wire / acquire-present /
+dmabuf-interop service. WebGPU is
 exposed to JS via a wire-retargeted `dawn.node` (proc table = wire client;
 `wrapDevice`/`wrapTexture` wrap host-provided wire handles; `AsyncRunner` pumps the
 instance; a wrapped device is borrowed, not destroyed). Built with
@@ -432,14 +433,14 @@ instance; a wrapped device is borrowed, not destroyed). Built with
   `CompositorSink` interface the protocol/WM layer drives
   (`commitSurfaceBuffer`/`commitSurfaceDmabuf`/`setSurfaceLayout`/`setStack`/
   `setLayerSurfaces`/`setSurfaceTexture`/`removeSurface`/`takeImportedSurfaces`/
-  `takeFreedBuffers`/`afterCurrentFrame`/`renderFrame`). Headless renders into an
-  owned offscreen target (read back, 256-aligned); nested presents to the host
-  swapchain.
-- **Native services kept** (non-wire-propagatable / WSI bits): surface bring-up +
-  `Configure`, `acquireOutputTexture`/`presentOutput`/`outputFormat`,
-  `createTextureFromDmabuf` + `releaseDmabufImport` (generation-matched), `shmView`
-  (zero-copy external `ArrayBuffer` over the client shm mapping), `gpuHandles`, the
-  wire link.
+  `takeFreedBuffers`/`afterCurrentFrame`/`renderFrame`). Headless renders into
+  an owned offscreen target (read back, 256-aligned); KMS and nested render
+  into the next FREE slot of a per-output 3-slot dmabuf scanout ring.
+- **Native services kept** (non-wire-propagatable bits):
+  `acquireOutputTexture`/`presentOutput`/`outputFormat` (scanout-ring slot
+  acquire/present), `createTextureFromDmabuf` + `releaseDmabufImport`
+  (generation-matched), `shmView` (zero-copy external `ArrayBuffer` over the
+  client shm mapping), `gpuHandles`, the wire link.
 
 ### Stack layers + placement
 
@@ -471,8 +472,9 @@ instance; a wrapped device is borrowed, not destroyed). Built with
   (the client is reconfigured to the shrunk size). The decoration draws in the band
   inside the outer tile, so it is always on-screen — fixing the prior additive model
   where a window at (0,0) put its titlebar off-screen at negative y.
-- Swapchain present mode is **Mailbox** (non-blocking acquire); FIFO blocks
-  `GetCurrentTexture` on the single command thread and stalls other wire work.
+- The on-screen present path uses a per-output 3-slot dmabuf scanout ring
+  (see `architecture.md` "Present" / `drm-design.md`); no Dawn WSI
+  `wgpu::Surface` lives in either backend.
 - **Tiling verified** (headless pixel readback + query): 1/2/3 real clients tile to
   the master-stack rects, fill their tiles via the configure→resize loop, do not
   overlap, and survivors reflow on unmap.
@@ -680,10 +682,11 @@ Intel, ENOMEM'ing the dmabuf path.
   their dmabufs and need `wp_linux_drm_syncobj_v1`, which is unimplemented;
   see the "Read first" entry.
 
-**Color:** the GPU process picks the first non-sRGB advertised swapchain format and
-the shader passes client bytes (already sRGB) through. Correct for opaque content;
-alpha blending currently happens in sRGB space (wrong for translucency — linear
-compositing is future work).
+**Color:** scanout rings are allocated as BGRA8Unorm dmabufs (the
+universal Mesa/KMS floor); the shader passes client bytes (already
+sRGB) through. Correct for opaque content; alpha blending currently
+happens in sRGB space (wrong for translucency — linear compositing is
+future work).
 
 **dmabuf feedback** is real for WSI format selection but the format_table is the
 full probed set, not a curated tranche; cosmetically kitty logs a fallback warning
@@ -706,13 +709,16 @@ overdraw's clients).
 
 **Resize path.** When the host fires `xdg_toplevel.configure(w,h)` and
 `HostWindow::onSize` observes a real change, an `OutputBackend`
-ResizeListener fires (installed in main.cpp). The listener does TWO things
-synchronously in the GPU process: (1) `wgpu::Surface::Configure` natively
-on the existing surface with the new w/h plus the cached
-format/presentMode/alphaMode triple — done locally in the GPU process so
-there's no "frame at the wrong size" between the host's configure-ack and
-the swapchain Configure; (2) re-emit `OutputDescriptor` over the ctrl
-socket.
+ResizeListener fires (installed in main.cpp). The listener does three
+things synchronously in the GPU process: (1) tear down the prior scanout
+ring and rebuild it at the new dimensions (new dmabufs + new host
+wl_buffer wraps), then write `ScanoutRebuild` on the wire (the core's
+matching `ScanoutReserve` reply triggers the new slots' inject and
+sweeps the old surfaceBufs entries); (2) re-emit `OutputDescriptor` over
+the ctrl socket; (3) send a one-shot `FrameComplete` on ctrl to wake the
+JS render loop into rendering at the new size (without this the loop
+deadlocks: the host won't fire `wl_surface.frame.done` until we commit
+a new buffer, but the loop is gated on `FrameComplete` to render).
 
 **Core dispatch.** `Compositor::drainCtrl` parses `OutputDescriptor` into a
 queue; the addon's `fireOutputDescriptors` invokes the JS callback
@@ -742,8 +748,8 @@ is resent and `done` is the atomic-commit signal.
 
 **Verified.** Nested-mode bring-up on a 240Hz host advertises real values
 (`mode 1900x1045 @240083mHz scale=1`, real physical dims, transform). On
-host-triggered resize the descriptor re-fires and the swapchain is
-reconfigured before the next acquire; the second `output:` log line appears
+host-triggered resize the descriptor re-fires and the scanout ring is
+rebuilt before the next acquire; the second `output:` log line appears
 with the new dims and the chain runs end-to-end. Pure-unit coverage for
 bind + re-emit + destroyed-resource scrub: `test/wl-output.test.js` (8
 tests), `test/xdg-output.test.js` (8 tests including the 4 added for

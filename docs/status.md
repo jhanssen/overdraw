@@ -33,6 +33,19 @@ nothing, with no error. Worst-first.
   (vkAllocateMemory succeeded but VkDeviceMemory was not actually bound to
   the dmabuf-backed memory).
 
+- **Nested-mode present uses implicit-sync; explicit-sync to the host not
+  wired.** In nested mode we present by attaching our scanout dmabuf to
+  the host `wl_surface` and committing. The producer EndAccess sync_file
+  fd is NOT forwarded to the host as a `wp_linux_drm_syncobj_v1` acquire
+  timeline point (we don't bind that protocol on the host connection).
+  We rely on the kernel's dma-buf reservation fence, which Mesa attaches
+  on queue submit. Correct on Mesa. NVIDIA proprietary does NOT attach
+  implicit fences, so a nested overdraw running on NVIDIA against a host
+  that requires explicit-sync will sample stale/torn frames. The fix is
+  binding the host's `wp_linux_drm_syncobj_manager_v1`, holding a
+  syncobj_surface for our wl_surface, and signaling an acquire-timeline
+  point per commit from the captured sync_file.
+
 - **`xdg_toplevel` window-management state is implemented; residual no-ops
   are narrow.** `set_maximized`/`unset`, `set_fullscreen`/`unset`,
   `set_minimized`, `set_min_size`/`set_max_size`, and interactive
@@ -225,7 +238,8 @@ designed but not built.
 ### Compositing (JS over the Dawn wire)
 
 Compositing lives entirely in core main-thread JS (`compositor.ts`,
-`JsCompositor`). C++ `Compositor` is a WSI + interop service.
+`JsCompositor`). C++ `Compositor` is a wire / acquire-present /
+dmabuf-interop service.
 
 - **Layers:** `background < below < content < above < overlay`,
   composited back-to-front. `content` holds windows + subsurfaces +
@@ -363,21 +377,26 @@ static advertised set.
   proprietary) `wp_linux_drm_syncobj_v1` + the Dawn dedicated-alloc
   fix.
 
-**Color:** GPU process picks the first non-sRGB advertised swapchain
-format; shader passes client bytes (already sRGB) through. Correct
-for opaque content; alpha blending happens in sRGB space (wrong for
-translucency -- linear compositing is future work).
+**Color:** scanout rings are allocated as BGRA8Unorm dmabufs (the
+universal Mesa/KMS floor); the shader passes client bytes (already
+sRGB) through. Correct for opaque content; alpha blending happens
+in sRGB space (wrong for translucency -- linear compositing is
+future work).
 
 ## Output reconfiguration
 
 GPU process owns the display target (`OutputBackend`); core owns
 client-facing protocol state. They coordinate via the
 `ipc::Tag::OutputDescriptor` ctrl message. On host-driven resize,
-the GPU process re-`Configure`s the swapchain synchronously and
-re-emits the descriptor; the core mutates `state.outputs`, the
-JS compositor, the input backend rect, the WM, fires
-`output.changed` on the plugin bus, and `wl_output` + `xdg_output`
-re-emit the full event burst per spec.
+the GPU process tears down the prior scanout ring, rebuilds it at
+the new dimensions, sends `ScanoutRebuild` on the wire (the core's
+matching `ScanoutReserve` reply triggers the new ring's slot inject
++ surfaceBufs replacement), re-emits the descriptor, and pokes the
+JS render loop with a one-shot `FrameComplete` to break the
+host-vblank deadlock. The core mutates `state.outputs`, the JS
+compositor, the input backend rect, the WM, fires `output.changed`
+on the plugin bus, and `wl_output` + `xdg_output` re-emit the full
+event burst per spec.
 
 Out of scope: multi-output enumeration past M7 step 5 (deferred
 items above), KMS-side mode changes (`SetOutputMode` not wired),

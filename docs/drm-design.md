@@ -822,16 +822,14 @@ These were the pre-slice-4 design questions. All resolved through slices
    fd-arming policy (arm-on-need) extends naturally, but worth
    confirming: a stuck DRM fd shouldn't starve the wire pump.
 3. **What happens to the wire / Dawn / WSI swapchain abstraction
-   when there's no `wgpu::Surface` to configure?** Today
-   `acquireOutputTexture` / `presentOutput` go through Dawn's WSI.
-   In KMS we have no `wgpu::Surface`. The GPU process side gets
-   replaced (Slice 4); but the CORE-side wrapper that JS calls
-   (`compositor.acquireOutputTexture`, status.md "Native services
-   kept") needs the same shape. Simplest: it stays the same on the
-   JS side; the GPU process's response uses the KMS scanout ring
-   instead of WSI. The wire-side handle is just a wire-wrapped
-   `wgpu::Texture` either way. Should be a transparent backend swap;
-   confirm during slice 4.
+   when there's no `wgpu::Surface` to configure?** RESOLVED. There
+   is no `wgpu::Surface` in either backend any more. The core's
+   `acquireOutputTextureHandle` / `presentOutput` route through a
+   per-output 3-slot scanout ring whose slot textures are reserved
+   by the core and `InjectTexture`'d by the GPU process from the
+   GBM-allocated dmabufs. KMS wraps each dmabuf as a KMS
+   framebuffer; nested wraps each as a host `wl_buffer` via
+   `zwp_linux_dmabuf_v1`. The JS side is unchanged.
 4. **Dawn explicit-sync over KMS** — RESOLVED: included in slice 4+5
    from day one. Today's `onSubmittedWorkDone` plus implicit-sync on
    client-buffer dmabufs is not enough on the scanout side: the kernel

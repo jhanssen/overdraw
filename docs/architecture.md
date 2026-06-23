@@ -9,8 +9,18 @@ versus what is still design only, see `status.md`.
 
 ## Goals
 
-- Wayland compositor. Phase 1 nested in a host Wayland session (the
-  compositor appears as a window); phase 2 bare metal (DRM/KMS).
+- Wayland compositor. Two display backends:
+  - **Nested**: runs as a Wayland client of a host compositor; the
+    compositor appears as a host window.
+  - **KMS / bare metal**: runs directly on DRM/KMS connectors with
+    libseat-managed device access.
+
+  Both backends drive the same on-screen present path: a GBM-allocated
+  dmabuf scanout ring whose slot textures are imported into Dawn via
+  `SharedTextureMemory`. The KMS-specific bits (atomic commit, page-flip
+  event) and the nested-specific bits (host `wl_buffer` wrap,
+  `wl_buffer.release`) are encapsulated behind a single `OutputBackend`
+  interface in the GPU process.
 - Plugins are JS, run in-process as worker threads. A plugin code problem
   must not take down the compositor.
 - Malicious plugins are out of scope. Containment targets accidental
@@ -45,25 +55,26 @@ versus what is still design only, see `status.md`.
 |   - Dawn wire server                                     |
 |   - GBM dmabuf allocator                                 |
 |   - SharedTextureMemory / SharedFence (dmabuf + sync-fd) |
-|   - KMS scanout (phase 2)                                |
+|   - Output backend: KMS scanout OR host wl_surface       |
+|     (both drive a per-output 3-slot dmabuf scanout ring) |
 +----------------------------------------------------------+
 ```
 
-Two processes in v1: core and GPU. Phase 2 adds a small session supervisor.
+Two processes in v1: core and GPU. KMS mode adds a session supervisor.
 
 ### Core process
 
 - C++ + Node. The N-API addon loads with the Node main script.
 - C++ owns: `libwayland-server` integration (overdraw's *own* clients), fd
-  handling (SCM_RIGHTS), DRM master / KMS / libinput / libseat (phase 2), the
-  Dawn wire client for the core's own compositing device, and a generic
+  handling (SCM_RIGHTS), DRM master / KMS / libinput / libseat (KMS mode),
+  the Dawn wire client for the core's own compositing device, and a generic
   protocol-trampoline surface that lets JS implement Wayland protocols.
-  - **Phase 1 caveat:** the host output window's Wayland *client* connection
-    lives in the GPU process, not the core (a `wl_surface` cannot be shared
-    across processes; the surface and device live GPU-side). The core remains
-    the Wayland *server* for overdraw's own clients and drives the host
-    swapchain over the wire. See "GPU process". This refines the original
-    framing of the core as "the Wayland client of the host."
+  - **Nested-mode caveat:** the host compositor connection (the *client*
+    side of a Wayland session) lives in the GPU process, not the core. The
+    host's advertised `zwp_linux_dmabuf_v1` modifier set drives the scanout
+    ring's allocation, and the host's `wl_surface` is the present target.
+    The core remains the Wayland *server* for overdraw's own clients and
+    drives the per-output scanout ring over the Dawn wire from there.
 - JS owns: protocol semantics, window management, focus policy, plugin
   registry, capability grants. Most protocols are implemented in JS;
   some hot or foundational ones may be in C++ (see "Protocol layers").
@@ -85,22 +96,33 @@ Two processes in v1: core and GPU. Phase 2 adds a small session supervisor.
 
 - Native, no Node, no JS. Forked + exec'd by the core at startup.
 - Owns Dawn (`wgpu::Instance` + every `wgpu::Device` — core's and one per
-  plugin), the wire server, the GBM allocator, and KMS scanout (phase 2).
+  plugin), the wire server, the GBM allocator, and the output backend
+  (KMS or nested host-window).
 - On crash, the core respawns it and replays state (see "GPU process
-  crash recovery"). In v1 the core does this directly; in phase 2 the
+  crash recovery"). In v1 the core does this directly; in KMS mode the
   session supervisor handles process lifecycle.
-- **Phase 1 only: owns the host Wayland *client* connection used for output
-  presentation.** A `wl_surface` is a client-side proxy bound to one
-  `wl_display` connection and cannot be shared across processes by pointer;
-  the `wgpu::Surface` is created from that `wl_surface` via
-  `SurfaceSourceWaylandSurface`. Since the surface and the compositing device
-  both live in the GPU process, the host output window's Wayland connection
-  must live there too. The core's wire client drives the swapchain
-  (`Configure`/`GetCurrentTexture`/`Present`) over the wire against that
-  server-side surface (validated; see "Validated against Dawn"). Host input
-  events arrive on this connection in the GPU process and are forwarded to the
-  core over the side channel. Phase 2 (KMS) has no host window, so this is
-  phase-1-specific.
+- **Nested mode: owns the host Wayland *client* connection used for
+  output presentation.** A `wl_surface` is a client-side proxy bound to
+  one `wl_display` connection and cannot be shared across processes by
+  pointer; since the host wl_surface and the compositing device both
+  live in the GPU process, the host connection must too. Host input
+  events arrive on this connection in the GPU process and are forwarded
+  to the core over the side channel. The KMS backend has no host window
+  and no host connection.
+- **Present path (both backends).** Per output, the GPU process owns a
+  3-slot scanout ring of dmabufs allocated via GBM, imported into Dawn
+  as `SharedTextureMemory`, and reserved at core-chosen wire handles
+  during bring-up. Per-output state is a small FREE / PENDING_FLIP /
+  SCANOUT machine. The KMS backend wraps each slot's dmabuf as a KMS
+  framebuffer (`drmModeAddFB2`) and drives flips via atomic commit + the
+  page-flip event. The nested backend wraps each slot's dmabuf as a host
+  `wl_buffer` via `zwp_linux_dmabuf_v1` and drives flips via
+  `wl_surface.attach` + `damage_buffer` + `commit`, with
+  `wl_buffer.release` retiring the prior slot. The two backends share
+  the slot allocator (`dmabuf_scanout_slot.{h,cpp}`), the producer
+  Begin/End access brackets, the fence-handoff path, and the wire
+  reservation handshake (`ScanoutReserve` / `ScanoutReady` /
+  `ScanoutPresent` / `ScanoutFlipComplete`).
 
 ### IPC
 
@@ -958,9 +980,10 @@ Mechanism:
   handles: dmabuf import (`SharedTextureMemory` reserve/inject) becomes a native
   `createTextureFromDmabuf(...) -> handle` that JS wraps via `wrapTexture`; shm
   pixels are exposed as a zero-copy external `ArrayBuffer` over the client
-  mapping for `queue.writeTexture`; the swapchain `GetCurrentTexture`/`Present`
-  stay native. The rule: *normal wire WebGPU ops happen in JS; only the
-  non-wire-propagatable bits are native calls returning wrappable handles.*
+  mapping for `queue.writeTexture`; the scanout-slot acquire/present
+  (`acquireOutputTexture` / `presentOutput`) stay native. The rule:
+  *normal wire WebGPU ops happen in JS; only the non-wire-propagatable
+  bits are native calls returning wrappable handles.*
 
 Lifetime constraint (load-bearing): JS WebGPU object finalizers run at process
 exit and call into the C++ wire client, so **the wire client must outlive the JS
@@ -1021,8 +1044,9 @@ Used for both plugin surfaces and real Wayland clients (via
 9. SDK calls `surface.present()` → posts to core via `postMessage`:
    "surface X, buffer Y ready, fence Z."
 10. Core's next frame snapshot picks up the new buffer + fence. Core
-    composites (phase 1: into swapchain) or hands buffer + fence to
-    KMS (phase 2).
+    composites into the next FREE scanout-ring slot (whose underlying
+    dmabuf the GPU process flips to KMS or attaches to the host
+    wl_surface, depending on backend).
 11. When the buffer is no longer in flight, core releases it back to
     the SDK pool. SDK rotates to the next slot (2–3 buffers per
     surface).
@@ -1085,39 +1109,24 @@ Wire-topology facts (cross-process spike, partially validated):
   the client's wire instance (with `CallbackMode::AllowProcessEvents`); the
   client event loop must pump it.
 
-Phase-1 presentation facts (cross-process spike, validated end-to-end on
-NVIDIA RTX 5060 / proprietary driver 595.71.05 / Vulkan backend, host Wayland
-session):
-
-- **The Wayland-backed swapchain works over the wire.** A wire *client* can
-  drive a `wgpu::Surface` whose `Surface` and `Device` live in the wire
-  *server*: `Surface::Configure`, `GetCurrentTexture`, render-pass submit, and
-  `Present` all propagate over the wire and produce visible frames in the host
-  window. 240/240 frames presented over the wire.
-- **`ReserveSurface`/`InjectSurface` exist and mirror the texture
-  reserve/inject pattern.** The client calls
-  `WireClient::ReserveSurface(instance, capabilities)` → `ReservedSurface
-  { surface, instanceHandle, handle }`; the server creates the native
-  `wgpu::Surface` and calls `WireServer::InjectSurface(surface, handle,
-  instanceHandle)` at that handle. Generation must match, as with instances.
-- **The host output window's Wayland connection must live in the GPU
-  process.** `SurfaceSourceWaylandSurface` takes raw `wl_display` + `wl_surface`
-  pointers; a `wl_surface` is a client-side proxy bound to one connection and
-  is not shareable across processes. Because the surface/device are GPU-side,
-  the host Wayland *client* connection is GPU-side too (phase 1 only). This
-  refines the original "core is the Wayland client of the host" framing; see
-  "GPU process" and "Core process".
-- **`SurfaceCapabilities` for `ReserveSurface` come from the server.** The
-  native side queries `Surface::GetCapabilities` against the underlying adapter
-  and ships format/present-mode/alpha-mode + size to the client over the side
-  channel; the client uses them to `Configure`. (In the spike the reservation
-  itself accepted an empty caps struct since it only allocates a handle.)
+Historical note: an earlier nested implementation drove a Dawn WSI
+`wgpu::Surface` (via `SurfaceSourceWaylandSurface`) over the wire and
+called `Configure` / `GetCurrentTexture` / `Present` from the core. That
+path is gone. It conflicted with hosts that advertise
+`wp_linux_drm_syncobj_v1` (Mesa's Vulkan WSI auto-binds a
+`wp_linux_drm_syncobj_surface_v1` to our host `wl_surface`, after which
+direct attach+commit fails with `no_acquire_point`), and the WSI
+swapchain's images do not have persistence guarantees for partial-repaint
+`loadOp:"load"`. Nested now drives the same GBM-dmabuf scanout ring as
+KMS; the only nested-specific code is host `wl_buffer` wrapping and
+`wl_buffer.release` handling. See "Present path" above.
 
 The reserve-texture / inject-texture handshake (server injecting the
-dmabuf-backed texture at the client's reserved handle, producer rendering into
-it) — flagged as "not yet validated" in the original spike — is now implemented
-and pixel-verified end to end, both for real client dmabufs and for the plugin
-overlay producer (status.md "Client buffers" → "dmabuf", "GPU SDK").
+dmabuf-backed texture at the client's reserved handle, producer rendering
+into it) is implemented and pixel-verified end to end, both for real
+client dmabufs and for the plugin overlay producer (status.md "Client
+buffers" → "dmabuf", "GPU SDK"). The same handshake builds the per-output
+scanout ring on both backends.
 
 ### Real Wayland client buffers
 
@@ -1129,10 +1138,11 @@ Compositing samples from this texture.
 
 ### Compositing
 
-- One render pass per output per frame. Phase 1 renders into the
-  swapchain texture obtained via `Surface::GetCurrentTexture` on the
-  Wayland surface source; phase 2 renders into a GBM-backed texture
-  imported as `SharedTextureMemory`, then hands it to KMS.
+- One render pass per output per frame. The render target is the next
+  FREE slot's `wgpu::Texture` from that output's scanout ring (a
+  GBM-allocated dmabuf imported as `SharedTextureMemory`). KMS scans out
+  the underlying dmabuf via an atomic commit; nested attaches it to the
+  host `wl_surface` via a one-time `wl_buffer` wrap.
 - Color space in v1: sRGB throughout, premultiplied alpha for all
   surfaces.
 - Compositing pipeline: textured-quad-per-surface with optional opacity,
@@ -1148,16 +1158,17 @@ Per output:
 
 ```
 on frame trigger
-    (phase 1: host wl_surface.frame callback)
-    (phase 2: KMS page-flip event):
+    (nested: host wl_surface.frame.done)
+    (KMS:    page-flip event):
   snapshot committed state for all surfaces visible on this output
+  acquire next FREE scanout slot's texture (skip frame if none free)
   for each surface:
     if a new buffer + fence arrived: queue wait on fence
   build render pass: draw surfaces back-to-front
   submit to GPU (via wire)
-  on submit completion (or via OUT_FENCE in phase 2):
-    phase 1: nothing more — Vulkan swapchain present handled by Dawn
-    phase 2: KMS atomic commit with IN_FENCE_FD = our submit fence
+  on submit completion (the producer EndAccess fence):
+    nested: wl_surface.attach(slot.wl_buffer) + damage_buffer + commit
+    KMS:    atomic commit with IN_FENCE_FD = producer-end fence
   request next frame trigger
   send wl_surface.frame callbacks to clients that requested them
 ```
@@ -1170,31 +1181,32 @@ origin (plugin vs. Wayland client) is invisible to compositing.
 #### Frame clock: the trigger must originate at the display
 
 The loop is **event-driven off a display-side completion signal, NOT a
-timer.** The clock originates where the display lives (the GPU process — the
-host `wl_surface` in phase 1, the KMS connector in phase 2) and is propagated
-to the core; the core does not invent its own cadence. A core-side fixed timer
-(e.g. a 16ms `uv_timer`) is wrong: it has no causal link to the display's
-refresh, so it beats against the real vsync (render frames the display never
-shows = waste/stutter; render late = jank; and under direct KMS it risks
-tearing/stalls). See status.md for the current implementation's divergence from
-this (it uses a timer today — a known shortcut, because Dawn's phase-1 WSI
-swapchain hides the host frame callback).
+timer.** The clock originates where the display lives (the GPU process —
+the host `wl_surface.frame.done` in nested, the KMS connector's page-flip
+event in KMS) and is propagated to the core via `FrameComplete` /
+`ScanoutFlipComplete` on the side channel; the core does not invent its
+own cadence. A core-side fixed timer (e.g. a 16ms `uv_timer`) is wrong:
+it has no causal link to the display's refresh, so it beats against the
+real vsync (render frames the display never shows = waste/stutter; render
+late = jank; and under direct KMS it risks tearing/stalls).
 
-- **Phase 2 (clean):** the GPU process owns KMS, so it directly receives the
-  DRM page-flip event. On page-flip it emits a side-channel `FrameDone` event
-  (vblank time, freed ring slot) to the core. The core's loop wakes on that
-  event → snapshot → render into the next ring slot over the wire → send
-  `Present { slot }` → GPU process commits. No timer. (`FrameDone`/`Present`
-  are the commit/page-flip side-channel messages noted as "not in v1" above;
-  they are the phase-2 frame clock.)
-- **Phase 1 (entangled):** Dawn's WSI swapchain owns `Present` and hides the
-  host `wl_surface.frame` callback, so the trigger above is not directly
-  available. Options: present FIFO so `GetCurrentTexture` blocks on host vsync
-  (rejected once — a blocking acquire on the GPU process's single command
-  thread stalled all other wire work; would need the acquire off that thread),
-  or present via our own `wl_surface` instead of Dawn's WSI so we can register
-  the frame callback explicitly. Until resolved, phase 1 uses the timer
-  shortcut (status.md).
+- **KMS:** the GPU process owns KMS, receives the DRM page-flip event,
+  and emits `ScanoutFlipComplete { outputId, slotIdx }` on the side
+  channel. The core's loop wakes on that event → snapshot → render into
+  the next FREE ring slot over the wire → send `ScanoutPresent { outputId,
+  surfaceBufId }` → GPU process atomic-commits.
+- **Nested:** the GPU process registers a `wl_surface.frame` callback on
+  the host wl_surface; the host fires `done` on its vblank when our last
+  commit was displayed. The GPU process forwards as `FrameComplete` on the
+  side channel; the core's drainCtrl clears the per-output
+  `presentedThisCycle` gate and pushes the output onto `flipCompletes_`
+  so per-output client wl_callback.done dispatch fires. The host's
+  `wl_buffer.release` is a separate signal that retires individual slots
+  (forwarded as `ScanoutFlipComplete`); it is NOT the per-vblank wake. A
+  one-shot `FrameComplete` is also sent from the GPU process after a ring
+  rebuild (host-window resize) to break the deadlock: the host won't
+  fire `frame.done` until we commit a new buffer, but the JS loop won't
+  commit until something wakes it.
 - **Plugin pacing:** the core fans the frame trigger out to plugin workers as
   `surface.onFrame` postMessage ticks (the rAF analog). The core's own
   compositing loop gets the trigger directly over the side channel (no extra
@@ -1216,17 +1228,18 @@ swapchain hides the host frame callback).
 
 ### Damage tracking
 
-Not implemented in v1. Full redraw every frame. The architecture leaves
-room for damage:
+Implemented. Per-output composite-scissor backed by an
+`OutputDamageRing` keyed by the per-slot scanout handle. Each commit /
+WM mutation marks the relevant rect dirty on every ring slot; when a
+slot is acquired for rendering, its accumulated damage is taken and
+used as the render-pass scissor (with `loadOp:"load"` to preserve
+outside-scissor pixels from the slot's previous content). The
+buffer-age union across N slots makes the per-slot rendered region
+cover everything that changed since this slot was last presented.
 
-- Wayland clients already send `wl_surface.damage_buffer`; the protocol
-  handler stores it but the compositor ignores it.
-- Plugin SDK accepts a damage region argument to `present()` (currently
-  ignored).
-- Adding damage later means: track per-surface damage region per output,
-  intersect into a per-output damage region, use as scissor in
-  compositing, hint to KMS via `wp_presentation_feedback` / damage
-  properties.
+The slot-content persistence assumption is satisfied by both backends:
+KMS owns the scanout dmabuf for the slot's lifetime; nested owns the
+dmabuf and wraps it as a host `wl_buffer` for the slot's lifetime.
 
 ### Compositor-side surface transforms (v2)
 
@@ -1289,19 +1302,26 @@ No discovery, no drop-in directories. Single source of truth.
 
 ### Phase 1 — nested compositor
 
-- Core is a Wayland *client* of the host. v1 default: one `xdg_toplevel`
-  window, one emulated output. The host window is resizable; the
-  overdraw output's logical size follows via standard `wl_output` mode
-  events. Scale fixed at 1; fractional scale and HiDPI handling
-  deferred.
-- Multi-output testing in phase 1 is opt-in via config (declare multiple
-  outputs explicitly, one host window per output). Default is single.
-- Core's compositing device presents via Dawn's Wayland surface source +
-  Vulkan swapchain.
+- The GPU process is a Wayland *client* of the host. v1 default: one
+  `xdg_toplevel` window, one emulated output. The host window is
+  resizable; the overdraw output's logical size follows via standard
+  `wl_output` mode events, and the scanout ring is rebuilt at the new
+  dimensions (ScanoutRebuild on the wire). Scale fixed at 1; fractional
+  scale and HiDPI handling deferred.
+- Multi-output nested is opt-in via config (declare multiple outputs
+  explicitly, one host window per output). Default is single.
+- Render path: the GPU process allocates a 3-slot dmabuf scanout ring
+  per output via GBM, imports each slot into Dawn as
+  `SharedTextureMemory`, and wraps each as a host `wl_buffer` via the
+  host's `zwp_linux_dmabuf_v1`. The core composites into the next FREE
+  slot's `wgpu::Texture` over the wire; presentOutput sends
+  `ScanoutPresent` on the side channel; the GPU process runs
+  `wl_surface.attach(slot.wl_buffer)` + `damage_buffer` + `commit`. The
+  host's `wl_buffer.release` retires the prior slot.
 - Core is also a Wayland *server* for its own clients. Imports their
-  `wl_buffer`s, composites into the swapchain texture.
+  `wl_buffer`s, composites into the scanout slot texture.
 - GPU process runs Dawn; holds compositing device, dmabuf allocator,
-  plugin devices.
+  plugin devices, the host wl_display connection.
 - No DRM/KMS, no libinput, no libseat, no supervisor. Core fork/execs
   the GPU process; either process dying = user restarts.
 
@@ -1368,57 +1388,67 @@ shipped is below it, with the still-deferred bullets called out.
 See `status.md` "KMS scanout backend" and `drm-design.md` "Out (deferred)"
 for the up-to-date list.
 
-#### Phase-2 present: a self-managed scanout swapchain (no Dawn surface)
+#### Present: a self-managed scanout ring (no Dawn surface)
 
-In phase 2 there is **no `wgpu::Surface` / Dawn swapchain** — that is a phase-1
-nested artifact (it exists only because we present into a host `wl_surface`).
-On bare KMS we render into GBM-backed `SharedTextureMemory` textures and KMS
-does the present. It is a hand-rolled swapchain: Dawn is reduced to "render into
-this texture"; acquire/present/sync are ours. Maps to classic Vulkan WSI as:
-the N GBM bos = swapchain images; "acquire" = pick a free ring slot (driven by
-page-flip + OUT_FENCE, not Dawn); "present" = `drmModeAtomicCommit`; the
+Both backends (KMS and nested) use a hand-rolled scanout ring instead of
+Dawn's WSI surface. Dawn is reduced to "render into this texture";
+acquire/present/sync are ours. Maps to classic Vulkan WSI as: the N GBM
+dmabufs = swapchain images; "acquire" = pick a free ring slot; "present"
+= the backend-specific commit (`drmModeAtomicCommit` for KMS;
+`wl_surface.attach`+`damage_buffer`+`commit` for nested); the
 acquire/present semaphores = the `SharedFence` sync-fds we manage via
 `BeginAccess`/`EndAccess`.
 
-A ring of **3 scanout buffers** (2 is the minimum that's correct; 3 to never
-stall — one front/scanning-out, one pending-flip, one free to render; only one
-flip may be pending at a time, so 2 buffers idle the GPU between commit and
-page-flip). Each ring slot:
+A ring of **3 scanout buffers per output** (2 is the minimum that's
+correct; 3 to never stall — one currently displayed, one pending-flip,
+one free to render). Each ring slot:
 
-- a `gbm_bo` (`SCANOUT | RENDERING`, modifier from the intersection of the
-  plane's `IN_FORMATS` ∩ Dawn-importable ∩ GBM-allocatable);
-- registered as a KMS framebuffer (`drmModeAddFB2WithModifiers` → `fb_id`);
+- a `gbm_bo` (`SCANOUT | RENDERING`, modifier from the intersection of
+  the per-backend candidate set ∩ Dawn-importable ∩ GBM-allocatable);
 - imported as `SharedTextureMemory` → `wgpu::Texture(RenderAttachment)`,
-  `InjectTexture`'d at a core-reserved wire handle (the core composites into it
-  over the wire, exactly as it injects client dmabufs today).
+  `InjectTexture`'d at a core-reserved wire handle (the core composites
+  into it over the wire);
+- per-backend display-sink resource:
+  - **KMS:** a KMS framebuffer via `drmModeAddFB2WithModifiers`.
+  - **Nested:** a host `wl_buffer` via the host's `zwp_linux_dmabuf_v1`.
 
-Per-frame fence dance (both are already-proven primitives; see "Validated
-against Dawn" and the implicit-sync acquire in status.md):
+Per-frame fence dance (KMS only, the producer EndAccess's exported
+sync_file fd):
 
-- **IN_FENCE (GPU → display):** after the core's composite submit, the GPU
-  process `EndAccess`es the slot → `SharedFenceSyncFD` → exports a sync-fd;
-  the atomic commit passes it as `IN_FENCE_FD`. The display waits on it before
-  scanout, so the commit can be issued before the render completes.
-- **OUT_FENCE (display → GPU):** request `OUT_FENCE_PTR`; it signals when the
-  buffer this commit *replaced* is free to reuse. Import it back as a Dawn
-  `SharedFence` and wait it in the next `BeginAccess` into that freed slot.
+- **IN_FENCE (GPU → display):** after the core's composite submit, the
+  GPU process `EndAccess`es the slot → `SharedFenceSyncFD` → exports a
+  sync-fd; the atomic commit passes it as `IN_FENCE_FD`. The display
+  waits on it before scanout, so the commit can be issued before the
+  render completes.
+- **OUT_FENCE (display → GPU):** not currently used; the next
+  `BeginAccess` chains to the prior `EndAccess`'s in-process fence
+  instead.
 
-Loop (page-flip driven; replaces the core-side timer entirely): DRM page-flip →
-GPU process emits `FrameDone { freedSlot, vblankTime }` → core renders the
-composite into the next free slot over the wire → core sends `Present { slot }`
-→ GPU process `EndAccess` + `drmModeAtomicCommit(fb_id, IN_FENCE_FD,
-PAGE_FLIP_EVENT, OUT_FENCE_PTR)`. Tearing is not a concern: atomic page-flips
-happen at vblank by construction; a missed deadline just repeats the front
-buffer (a dropped frame, not a tear).
+Nested does NOT attach the producer EndAccess fence. The kernel's
+dma-buf reservation fence is set implicitly by Vulkan's queue submit
+and is honored by the host's display engine on Mesa. NVIDIA, which
+doesn't attach implicit fences, needs an explicit-sync host binding
+(`wp_linux_drm_syncobj_v1` on the host connection); not implemented.
 
-Division of labor is unchanged: the **core** still records the compositing pass
-over the wire (it owns layout/stack/policy); the GPU process only adds GBM
-scanout allocation, the KMS commit, the fence plumbing, and the
-`FrameDone`/`Present` messages. `Compositor::renderFrame` barely changes — it
-renders into the current ring slot instead of calling `surface_.Present()`. The
-phase-1 headless path (render into an owned offscreen texture, no swapchain) is
-structurally the same; phase 2 = "headless + the offscreen texture is a scanout
-GBM buffer the GPU process flips."
+Loop (display-driven, no core-side timer):
+
+- **KMS:** DRM page-flip → GPU process emits `ScanoutFlipComplete
+  { outputId, slotIdx }` → core renders into the next free slot over
+  the wire → core sends `ScanoutPresent { outputId, surfaceBufId }` →
+  GPU process `EndAccess` + `drmModeAtomicCommit(fb_id, IN_FENCE_FD,
+  PAGE_FLIP_EVENT, OUT_FENCE_PTR)`. Tearing is not a concern: atomic
+  page-flips happen at vblank by construction.
+- **Nested:** host `wl_surface.frame.done` → GPU process emits
+  `FrameComplete` → core renders into the next free slot over the
+  wire → core sends `ScanoutPresent` → GPU process `EndAccess` +
+  `wl_surface.attach` + `damage_buffer(full)` + `commit`. The host's
+  `wl_buffer.release` event later retires the prior slot via
+  `ScanoutFlipComplete`.
+
+The headless mode is structurally the same as both above, with the
+"scanout buffer" replaced by an offscreen `wgpu::Texture` the JS
+compositor owns (no GBM, no scanout, no display sink). Read back via
+`frameReadback` for tests.
 
 ### Phase 3 — XWayland
 
