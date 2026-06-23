@@ -1,9 +1,8 @@
 // 3-slot KMS scanout ring.
 //
-// Each slot owns: a GBM bo (allocated with a modifier the plane supports +
-// Dawn can import), the dmabuf fd, the imported SharedTextureMemory + wgpu::
-// Texture (RENDER_ATTACHMENT | TEXTURE_BINDING), and the KMS fb_id created via
-// drmModeAddFB2WithModifiers. A slot is in one of three states:
+// Each slot owns: a dmabuf-backed scanout buffer (see DmabufScanoutSlot) plus
+// the KMS framebuffer id (fb_id) created via drmModeAddFB2WithModifiers. A
+// slot is in one of three states:
 //
 //   FREE          - the JS compositor may acquire it. The texture is not
 //                   currently being read by the display engine and is not
@@ -37,6 +36,8 @@
 
 #include "dawn/webgpu_cpp.h"
 
+#include "dmabuf_scanout_slot.h"
+
 struct gbm_bo;
 struct gbm_device;
 
@@ -46,20 +47,13 @@ struct PlaneFormatModifier;  // drm_utils.h
 
 class KmsScanoutRing {
   public:
-    static constexpr size_t kSlotCount = 3;
+    static constexpr size_t kSlotCount = kScanoutSlotCount;
 
-    enum class SlotState : uint8_t { FREE, PENDING_FLIP, SCANOUT };
+    using SlotState = ScanoutSlotState;
 
-    struct Slot {
-        gbm_bo* bo               = nullptr;
-        int       dmabufFd       = -1;   // owning fd; closed by release()
-        uint64_t  modifier       = 0;
-        uint32_t  stride         = 0;
-        uint32_t  offset         = 0;
-        uint32_t  fbId           = 0;    // KMS framebuffer id (drmModeAddFB2WithModifiers)
-        wgpu::SharedTextureMemory mem;
-        wgpu::Texture             tex;
-        SlotState state          = SlotState::FREE;
+    // KMS slot = the shared dmabuf scanout slot plus the KMS framebuffer id.
+    struct Slot : public DmabufScanoutSlot {
+        uint32_t fbId = 0;  // KMS framebuffer id (drmModeAddFB2WithModifiers)
     };
 
     KmsScanoutRing() = default;
@@ -78,10 +72,10 @@ class KmsScanoutRing {
     // is its GBM device. `width`/`height`/`fourcc` describe the scanout
     // surface. `planeModifiers` is the IN_FORMATS list intersected with what
     // we'd like to use; the ring picks a modifier from it that GBM will
-    // allocate + Dawn will import (probing each in order). If the list is
-    // empty (older driver without IN_FORMATS), falls back to
-    // DRM_FORMAT_MOD_LINEAR. Returns false on failure (and tears down any
-    // partially-allocated slots).
+    // allocate + Dawn will import + KMS will accept for AddFB2 (probing each
+    // in order). If the list is empty (older driver without IN_FORMATS),
+    // falls back to DRM_FORMAT_MOD_LINEAR. Returns false on failure (and
+    // tears down any partially-allocated slots).
     bool init(int drmFd, gbm_device* gbm,
               const wgpu::Device& device,
               uint32_t width, uint32_t height, uint32_t fourcc,
@@ -118,7 +112,7 @@ class KmsScanoutRing {
     uint64_t chosenModifier_ = 0;
     std::array<Slot, kSlotCount> slots_{};
 
-    void releaseSlot(Slot& s);
+    void releaseKmsSlot(Slot& s);
 };
 
 }  // namespace overdraw::gpu

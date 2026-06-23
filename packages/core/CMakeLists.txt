@@ -55,6 +55,7 @@ set(OVERDRAW_GPU_PROCESS_SOURCES
     gpu-process/src/host_window.cpp
     gpu-process/src/output_host_window.cpp
     gpu-process/src/allocator.cpp
+    gpu-process/src/dmabuf_scanout_slot.cpp
     gpu-process/src/event_loop_epoll.cpp
     ${XDG_SHELL_DIR}/xdg-shell-protocol.c
     ${XDG_SHELL_DIR}/linux-dmabuf-v1-protocol.c)
