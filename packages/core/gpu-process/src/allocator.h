@@ -75,6 +75,11 @@ class Allocator {
     // DRM fourcc for the probed format (valid after a successful probe()).
     uint32_t fourcc() const { return fourcc_; }
 
+    // The GBM device opened by open() (borrowed; lifetime tied to this
+    // Allocator). Used by the host-window scanout ring to allocate its own
+    // dmabufs on the same render device as the wgpu adapter.
+    gbm_device* gbm() const { return gbm_; }
+
     // The DRM device's dev_t (st_rdev of the opened render node), for the
     // linux-dmabuf-v1 feedback main_device / tranche_target_device events.
     // Valid after open(); 0 if unavailable.

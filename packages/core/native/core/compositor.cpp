@@ -418,42 +418,19 @@ bool Compositor::bringUp() {
     }
     (void)gotFeedback;
 
-    if (wantSurface) {
-        // Configure swapchain.
-        surface_ = wgpu::Surface::Acquire(rs.surface);
-        renderFormat_ = static_cast<wgpu::TextureFormat>(surfReady.format);
-        wgpu::SurfaceConfiguration cfg{};
-        cfg.device = device_;
-        cfg.format = renderFormat_;
-        cfg.usage = wgpu::TextureUsage::RenderAttachment;
-        cfg.width = surfReady.width;
-        cfg.height = surfReady.height;
-        cfg.alphaMode = static_cast<wgpu::CompositeAlphaMode>(surfReady.alphaMode);
-        cfg.presentMode = static_cast<wgpu::PresentMode>(surfReady.presentMode);
-        surface_.Configure(&cfg);
-        link_->flush();
-    } else if (kmsMode_) {
-        // Scanout texture format matches the compositor's render path.
-        renderFormat_ = wgpu::TextureFormat::BGRA8Unorm;
-        // The primary (outputId 0) descriptor drives the window size.
-        windowWidth_  = kmsDescriptor.width;
-        windowHeight_ = kmsDescriptor.height;
-
-        // Reserve a three-slot scanout ring per output. For each output:
-        // ReserveTexture three wire handles, then write the ScanoutReserve
-        // frame on the WIRE socket. The wire's FIFO ordering guarantees the
-        // GPU process's wire reader sees the Reserve bytes before any
-        // subsequent ProducerBegin frame referencing the same handles -- the
-        // race that broke ctrl-delivery is eliminated by construction.
-        //
-        // ScanoutReady comes back on wire too; we consume it via the
-        // inboundHandler that the bringUp sets up below.
+    // Scanout-ring set-up: ReserveTexture three wire handles per output, then
+    // write a ScanoutReserve frame on the WIRE socket. The GPU process's wire
+    // reader sees the Reserve bytes before any subsequent ProducerBegin frame
+    // referencing the same handles -- the cross-fd race that previously broke
+    // ctrl delivery is eliminated by construction. ScanoutReady comes back on
+    // the wire too; the inbound handler installed here consumes it.
+    //
+    // KMS uses the kmsOutputs list collected above; nested uses a single
+    // synthetic entry (outputId=0) sized to the surface bring-up dims. Both
+    // run the same loop; the GPU process side knows which backend is live.
+    auto runScanoutBringUp = [&](const std::vector<KmsOutputDims>& outs) -> bool {
         size_t readyCount = 0;
         bool readyFailed = false;
-        // Snapshot the existing inbound handler (set by Compositor's ctor for
-        // ClientTexImported) so we can chain to it for non-ScanoutReady frames.
-        // bringUp runs before any client surfaces are imported, so this is
-        // really only a defensive coding measure.
         auto priorHandler = link_->takeInboundFrameHandler();
         link_->setInboundFrameHandler([&](ipc::FrameKind kind,
                                           const std::vector<uint8_t>& frame) {
@@ -475,7 +452,7 @@ bool Compositor::bringUp() {
             if (priorHandler) priorHandler(kind, frame);
         });
 
-        for (const auto& out : kmsOutputs) {
+        for (const auto& out : outs) {
             WGPUTextureDescriptor td{};
             td.size = { out.width, out.height, 1 };
             td.mipLevelCount = 1;
@@ -507,20 +484,36 @@ bool Compositor::bringUp() {
             link_->appendFrame(ipc::FrameKind::ScanoutReserve, buf, sizeof(buf));
         }
 
-        if (!link_->pumpUntil([&] {
-                return readyFailed || readyCount >= kmsOutputs.size();
-            })) {
-            // Restore the prior handler before returning so the destructor /
-            // any subsequent ctor-set handler runs cleanly. (The temporary
-            // bringUp handler observes ScanoutReady; after this it would
-            // observe future ScanoutReady frames as no-ops, but it also
-            // overlaps with ClientTexImported, so restore.)
-            link_->setInboundFrameHandler(std::move(priorHandler));
-            error_ = "no ScanoutReady";
-            return false;
-        }
+        const bool pumpOk = link_->pumpUntil([&] {
+            return readyFailed || readyCount >= outs.size();
+        });
         link_->setInboundFrameHandler(std::move(priorHandler));
+        if (!pumpOk) { error_ = "no ScanoutReady"; return false; }
         if (readyFailed) return false;
+        return true;
+    };
+
+    if (wantSurface) {
+        // Configure swapchain.
+        surface_ = wgpu::Surface::Acquire(rs.surface);
+        renderFormat_ = static_cast<wgpu::TextureFormat>(surfReady.format);
+        wgpu::SurfaceConfiguration cfg{};
+        cfg.device = device_;
+        cfg.format = renderFormat_;
+        cfg.usage = wgpu::TextureUsage::RenderAttachment;
+        cfg.width = surfReady.width;
+        cfg.height = surfReady.height;
+        cfg.alphaMode = static_cast<wgpu::CompositeAlphaMode>(surfReady.alphaMode);
+        cfg.presentMode = static_cast<wgpu::PresentMode>(surfReady.presentMode);
+        surface_.Configure(&cfg);
+        link_->flush();
+    } else if (kmsMode_) {
+        // Scanout texture format matches the compositor's render path.
+        renderFormat_ = wgpu::TextureFormat::BGRA8Unorm;
+        // The primary (outputId 0) descriptor drives the window size.
+        windowWidth_  = kmsDescriptor.width;
+        windowHeight_ = kmsDescriptor.height;
+        if (!runScanoutBringUp(kmsOutputs)) return false;
     } else {
         // Headless: no swapchain. The JS compositor renders into its own
         // offscreen target; the format it samples client buffers as is BGRA8Unorm.
