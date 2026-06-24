@@ -27,6 +27,9 @@ pkg_check_modules(XKBCOMMON REQUIRED xkbcommon)
 # as wl_surfaces.
 pkg_check_modules(XCB REQUIRED xcb)
 pkg_check_modules(XCB_COMPOSITE REQUIRED xcb-composite)
+# xfixes: selection-owner change notifications (the X11 clipboard / primary
+# selection bridge depends on it).
+pkg_check_modules(XCB_XFIXES REQUIRED xcb-xfixes)
 
 # Phase-2 (DRM/KMS/libinput) deps. ON by default on Linux; the build still
 # produces a working phase-1 nested compositor when OFF (no behavior change).
@@ -173,9 +176,10 @@ add_library(overdraw_xwayland STATIC
     native/xwayland/server.cpp
     native/xwayland/xwm.cpp)
 target_include_directories(overdraw_xwayland PUBLIC
-    ${NATIVE_INCLUDE} ${XCB_INCLUDE_DIRS} ${XCB_COMPOSITE_INCLUDE_DIRS})
+    ${NATIVE_INCLUDE} ${XCB_INCLUDE_DIRS} ${XCB_COMPOSITE_INCLUDE_DIRS}
+    ${XCB_XFIXES_INCLUDE_DIRS})
 target_link_libraries(overdraw_xwayland PUBLIC
-    ${XCB_LIBRARIES} ${XCB_COMPOSITE_LIBRARIES})
+    ${XCB_LIBRARIES} ${XCB_COMPOSITE_LIBRARIES} ${XCB_XFIXES_LIBRARIES})
 set_target_properties(overdraw_xwayland PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
 # ---- Core N-API addon (Node-hosted core) ----
@@ -223,6 +227,13 @@ target_link_libraries(wl-error-client PRIVATE ${WAYLAND_CLIENT_LIBRARIES})
 add_executable(x11-test-client test/x11-test-client.c)
 target_include_directories(x11-test-client PRIVATE ${XCB_INCLUDE_DIRS})
 target_link_libraries(x11-test-client PRIVATE ${XCB_LIBRARIES})
+
+# X11 selection test client: takes / pastes a CLIPBOARD or PRIMARY value
+# over the X11 wire. Used by test/xwayland-selection.gpu.mjs to exercise
+# both directions of the selection bridge.
+add_executable(x11-selection-client test/x11-selection-client.c)
+target_include_directories(x11-selection-client PRIVATE ${XCB_INCLUDE_DIRS})
+target_link_libraries(x11-selection-client PRIVATE ${XCB_LIBRARIES})
 
 # ---- xdg-shell test client (toplevel-creation / configure handshake) ----
 add_executable(xdg-test-client

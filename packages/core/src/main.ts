@@ -141,6 +141,7 @@ let ipcServer: IpcServer | null = null;
 // Optional rootless Xwayland. Both null when config.xwayland.enabled is false.
 let xwaylandHandle: XwaylandHandle | null = null;
 let xwm: Xwm | null = null;
+let xwaylandSelection: import("./xwayland/selection.js").SelectionBridge | null = null;
 
 let stopped = false;
 function shutdown(signal: string): void {
@@ -152,6 +153,10 @@ function shutdown(signal: string): void {
   const finish = (): void => {
     // Xwayland teardown order: stop the XWM poll first (it watches the wmFd
     // that the SIGKILL will close), then reap Xwayland.
+    if (xwaylandSelection) {
+      try { xwaylandSelection.stop(); } catch { /* ignore */ }
+      xwaylandSelection = null;
+    }
     if (xwm) { try { xwm.stop(); } catch { /* ignore */ } xwm = null; }
     if (xwaylandHandle) {
       try { stopXwayland(addon, xwaylandHandle); } catch { /* ignore */ }
@@ -584,6 +589,12 @@ if (config.xwayland.enabled) {
           : {}),
       });
       xwm = startXwm(state, addon, xwaylandHandle.wmFd);
+      // Selection bridge: mediates CLIPBOARD / PRIMARY between X clients
+      // and wayland clients via wl_data_device / wp_primary_selection_v1.
+      const { startSelectionBridge } = await import("./xwayland/selection.js");
+      xwaylandSelection = startSelectionBridge(state, addon, xwm);
+      state.onWlSelectionChanged = xwaylandSelection.onWlSelectionChanged;
+      state.receiveForXSource = xwaylandSelection.receiveForXSource;
       log.info("core", `Xwayland up; DISPLAY=${xwaylandHandle.display} (pid ${xwaylandHandle.pid})`);
       log.info("core", `run an X client with:  DISPLAY=${xwaylandHandle.display} <x-client>`);
     } catch (e) {

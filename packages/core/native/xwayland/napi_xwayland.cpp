@@ -4,11 +4,13 @@
 #include <cstdlib>
 #include <string>
 
+#include <fcntl.h>
 #include <unistd.h>
 #include <uv.h>
 
 #include "xwayland/server.h"
 #include "xwayland/xwm.h"
+#include "wayland/wayland_fd.h"
 
 namespace overdraw::xwayland {
 namespace {
@@ -241,6 +243,11 @@ void deliverXwmEvent(const XwmEvent& e) {
         case XwmEvent::PropertyNotify: typeStr = "property-notify"; break;
         case XwmEvent::PropertyReply: typeStr = "property-reply"; break;
         case XwmEvent::FocusIn: typeStr = "focus-in"; break;
+        case XwmEvent::XfixesSelectionNotify:
+            typeStr = "xfixes-selection-notify"; break;
+        case XwmEvent::SelectionRequest: typeStr = "selection-request"; break;
+        case XwmEvent::SelectionNotify: typeStr = "selection-notify"; break;
+        case XwmEvent::AtomNameReply: typeStr = "atom-name-reply"; break;
     }
     napi_value obj;
     napi_create_object(env, &obj);
@@ -281,6 +288,10 @@ void deliverXwmEvent(const XwmEvent& e) {
     if (e.type == XwmEvent::PropertyNotify || e.type == XwmEvent::PropertyReply) {
         setU32("atom", e.atom);
     }
+    if (e.type == XwmEvent::PropertyNotify) {
+        // 0 = NewValue, 1 = Delete. Selection-bridge INCR pumps key off this.
+        setU32("propertyState", e.propertyState);
+    }
     if (e.type == XwmEvent::PropertyReply) {
         setU32("cookieId", e.cookieId);
         setU32("replyType", e.replyType);
@@ -296,6 +307,36 @@ void deliverXwmEvent(const XwmEvent& e) {
             napi_create_buffer(env, 0, nullptr, &buf);
         }
         napi_set_named_property(env, obj, "data", buf);
+    }
+    // Selection-bridge events.
+    if (e.type == XwmEvent::XfixesSelectionNotify
+        || e.type == XwmEvent::SelectionRequest
+        || e.type == XwmEvent::SelectionNotify) {
+        setU32("selection", e.selection);
+        setU32("timestamp", e.timestamp);
+    }
+    if (e.type == XwmEvent::SelectionRequest
+        || e.type == XwmEvent::SelectionNotify) {
+        setU32("requestor", e.requestor);
+        setU32("target", e.target);
+        setU32("property", e.property);
+    }
+    if (e.type == XwmEvent::XfixesSelectionNotify) {
+        setU32("selectionOwner", e.selectionOwner);
+    }
+    if (e.type == XwmEvent::AtomNameReply) {
+        setU32("cookieId", e.cookieId);
+        setU32("atom", e.atom);
+        // Atom names are UTF-8 (the X protocol is silent but every X server
+        // ships ASCII / UTF-8). Construct a JS string directly.
+        napi_value s;
+        if (e.data != nullptr && e.length > 0) {
+            napi_create_string_utf8(env,
+                reinterpret_cast<const char*>(e.data), e.length, &s);
+        } else {
+            napi_create_string_utf8(env, "", 0, &s);
+        }
+        napi_set_named_property(env, obj, "name", s);
     }
 
     napi_value cb, undef;
@@ -594,6 +635,240 @@ napi_value XwmDeleteProperty(napi_env env, napi_callback_info info) {
     return u;
 }
 
+// xwmCreateSelectionWindow(eventMask, inputOnly) -> window
+//
+// Spawns a 1x1 child of the root with the given event mask. The selection
+// bridge uses this for per-selection owner windows (long-lived, one per
+// CLIPBOARD / PRIMARY) and per-transfer requestor windows (short-lived,
+// one per in-flight incoming ConvertSelection). Returns 0 on failure.
+napi_value XwmCreateSelectionWindow(napi_env env, napi_callback_info info) {
+    size_t argc = 2;
+    napi_value argv[2];
+    napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+    if (!g_xwm.active) return throwErr(env, "xwmCreateSelectionWindow: no XWM running");
+    uint32_t mask = 0;
+    bool inputOnly = false;
+    if (argc >= 1) napi_get_value_uint32(env, argv[0], &mask);
+    if (argc >= 2) napi_get_value_bool(env, argv[1], &inputOnly);
+    napi_value out;
+    napi_create_uint32(env, xwmCreateSelectionWindow(g_xwm.conn, mask, inputOnly), &out);
+    return out;
+}
+
+// xwmDestroyWindow(window) -> undefined
+napi_value XwmDestroyWindow(napi_env env, napi_callback_info info) {
+    size_t argc = 1;
+    napi_value argv[1];
+    napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+    if (!g_xwm.active) return throwErr(env, "xwmDestroyWindow: no XWM running");
+    uint32_t window = 0;
+    if (argc >= 1) napi_get_value_uint32(env, argv[0], &window);
+    xwmDestroyWindow(g_xwm.conn, window);
+    napi_value u;
+    napi_get_undefined(env, &u);
+    return u;
+}
+
+// xwmSetSelectionOwner(selectionAtom, window, timestamp?) -> undefined
+//
+// window=0 releases (XCB_NONE). timestamp defaults to XCB_CURRENT_TIME (0).
+napi_value XwmSetSelectionOwner(napi_env env, napi_callback_info info) {
+    size_t argc = 3;
+    napi_value argv[3];
+    napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+    if (!g_xwm.active) return throwErr(env, "xwmSetSelectionOwner: no XWM running");
+    if (argc < 2) return throwErr(env, "xwmSetSelectionOwner(selectionAtom, window, timestamp?)");
+    uint32_t selectionAtom = 0, window = 0, timestamp = 0;
+    napi_get_value_uint32(env, argv[0], &selectionAtom);
+    napi_get_value_uint32(env, argv[1], &window);
+    if (argc >= 3) napi_get_value_uint32(env, argv[2], &timestamp);
+    xwmSetSelectionOwner(g_xwm.conn, selectionAtom, window, timestamp);
+    napi_value u;
+    napi_get_undefined(env, &u);
+    return u;
+}
+
+// xwmConvertSelection(requestor, selection, target, property, timestamp?)
+// -> undefined
+//
+// The reply arrives as a SelectionNotify XwmEvent matched by requestor +
+// selection + target.
+napi_value XwmConvertSelection(napi_env env, napi_callback_info info) {
+    size_t argc = 5;
+    napi_value argv[5];
+    napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+    if (!g_xwm.active) return throwErr(env, "xwmConvertSelection: no XWM running");
+    if (argc < 4) return throwErr(env,
+        "xwmConvertSelection(requestor, selection, target, property, timestamp?)");
+    uint32_t requestor = 0, selection = 0, target = 0, property = 0, timestamp = 0;
+    napi_get_value_uint32(env, argv[0], &requestor);
+    napi_get_value_uint32(env, argv[1], &selection);
+    napi_get_value_uint32(env, argv[2], &target);
+    napi_get_value_uint32(env, argv[3], &property);
+    if (argc >= 5) napi_get_value_uint32(env, argv[4], &timestamp);
+    xwmConvertSelection(g_xwm.conn, requestor, selection, target, property, timestamp);
+    napi_value u;
+    napi_get_undefined(env, &u);
+    return u;
+}
+
+// xwmSendSelectionNotify(requestor, selection, target, property,
+//                        timestamp?) -> undefined
+//
+// `property`=0 means refusal (the requestor will paste an empty string).
+napi_value XwmSendSelectionNotify(napi_env env, napi_callback_info info) {
+    size_t argc = 5;
+    napi_value argv[5];
+    napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+    if (!g_xwm.active) return throwErr(env, "xwmSendSelectionNotify: no XWM running");
+    if (argc < 4) return throwErr(env,
+        "xwmSendSelectionNotify(requestor, selection, target, property, timestamp?)");
+    uint32_t requestor = 0, selection = 0, target = 0, property = 0, timestamp = 0;
+    napi_get_value_uint32(env, argv[0], &requestor);
+    napi_get_value_uint32(env, argv[1], &selection);
+    napi_get_value_uint32(env, argv[2], &target);
+    napi_get_value_uint32(env, argv[3], &property);
+    if (argc >= 5) napi_get_value_uint32(env, argv[4], &timestamp);
+    xwmSendSelectionNotify(g_xwm.conn, requestor, selection, target, property, timestamp);
+    napi_value u;
+    napi_get_undefined(env, &u);
+    return u;
+}
+
+// xwmXfixesSelectSelectionInput(window, selectionAtom, mask) -> undefined
+//
+// Subscribe `window` to selection-owner-change events on `selectionAtom`.
+// The bridge uses mask = SET_SELECTION_OWNER | SELECTION_WINDOW_DESTROY |
+// SELECTION_CLIENT_CLOSE (1 | 2 | 4 = 7). Events arrive as
+// XfixesSelectionNotify XwmEvents.
+napi_value XwmXfixesSelectSelectionInput(napi_env env, napi_callback_info info) {
+    size_t argc = 3;
+    napi_value argv[3];
+    napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+    if (!g_xwm.active) return throwErr(env, "xwmXfixesSelectSelectionInput: no XWM running");
+    if (argc < 3) return throwErr(env,
+        "xwmXfixesSelectSelectionInput(window, selectionAtom, mask)");
+    uint32_t window = 0, sel = 0, mask = 0;
+    napi_get_value_uint32(env, argv[0], &window);
+    napi_get_value_uint32(env, argv[1], &sel);
+    napi_get_value_uint32(env, argv[2], &mask);
+    xwmXfixesSelectSelectionInput(g_xwm.conn, window, sel, mask);
+    napi_value u;
+    napi_get_undefined(env, &u);
+    return u;
+}
+
+// xwmInternAtom(name) -> atom
+//
+// Synchronously intern an atom. Used by the bridge to mint MIME-type atoms
+// on demand; safe synchronously because the round-trip does not depend on
+// Xwayland making wayland progress.
+napi_value XwmInternAtom(napi_env env, napi_callback_info info) {
+    size_t argc = 1;
+    napi_value argv[1];
+    napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+    if (!g_xwm.active) return throwErr(env, "xwmInternAtom: no XWM running");
+    if (argc < 1) return throwErr(env, "xwmInternAtom(name)");
+    size_t len = 0;
+    napi_get_value_string_utf8(env, argv[0], nullptr, 0, &len);
+    std::string name(len, '\0');
+    napi_get_value_string_utf8(env, argv[0], name.data(), len + 1, &len);
+    napi_value out;
+    napi_create_uint32(env, xwmInternAtom(g_xwm.conn, name.c_str()), &out);
+    return out;
+}
+
+// xwmGetAtomName(atom) -> cookieId
+//
+// Async. The reply arrives as an AtomNameReply XwmEvent matched by cookieId.
+napi_value XwmGetAtomName(napi_env env, napi_callback_info info) {
+    size_t argc = 1;
+    napi_value argv[1];
+    napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+    if (!g_xwm.active) return throwErr(env, "xwmGetAtomName: no XWM running");
+    if (argc < 1) return throwErr(env, "xwmGetAtomName(atom)");
+    uint32_t atom = 0;
+    napi_get_value_uint32(env, argv[0], &atom);
+    napi_value out;
+    napi_create_uint32(env, xwmGetAtomName(g_xwm.conn, atom), &out);
+    return out;
+}
+
+// xwmFlush() -> undefined
+napi_value XwmFlush(napi_env env, napi_callback_info /*info*/) {
+    if (!g_xwm.active) return throwErr(env, "xwmFlush: no XWM running");
+    xwmFlush(g_xwm.conn);
+    napi_value u;
+    napi_get_undefined(env, &u);
+    return u;
+}
+
+// wrapFd(rawFd) -> WaylandFd
+//
+// Wrap a raw int fd (e.g. one from makePipe) into the WaylandFd object the
+// trampoline expects for fd-bearing wayland events. After wrapping, the
+// WaylandFd owns the fd: hand it to events.wl_data_source.send_send (which
+// transfers it across the wire) and discard the wrapper, or call takeRawFd
+// to get the int back and close it yourself.
+napi_value WrapFd(napi_env env, napi_callback_info info) {
+    size_t argc = 1;
+    napi_value argv[1];
+    napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+    if (argc < 1) return throwErr(env, "wrapFd(rawFd)");
+    int32_t fd = -1;
+    napi_get_value_int32(env, argv[0], &fd);
+    return overdraw::wayland::makeWaylandFd(env, fd);
+}
+
+// makePipe() -> { readFd, writeFd }
+//
+// Open a pipe(2). The selection bridge hands the write end to a wayland
+// data source (via wl_data_source.send_send) and drains the read end on
+// the libuv loop via a node ReadStream. CLOEXEC is set on both ends; the
+// read end is also set non-blocking so the ReadStream's libuv poll path
+// works correctly.
+napi_value MakePipe(napi_env env, napi_callback_info /*info*/) {
+    int fds[2] = {-1, -1};
+    if (::pipe(fds) != 0) {
+        return throwErr(env, "makePipe: pipe(2) failed");
+    }
+    // FD_CLOEXEC on both. The read end is left blocking: node's
+    // fs.createReadStream + libuv handle blocking-fd semantics internally
+    // (the libuv loop polls the fd for readability before calling read),
+    // and setting O_NONBLOCK here makes read return EAGAIN which the
+    // ReadStream surfaces as a fatal error. The write end is also
+    // blocking: the wayland source writes synchronously into it; if the
+    // pipe buffer fills before the read end drains, the source will
+    // briefly block, which is acceptable for selection payloads.
+    ::fcntl(fds[0], F_SETFD, FD_CLOEXEC);
+    ::fcntl(fds[1], F_SETFD, FD_CLOEXEC);
+
+    napi_value obj;
+    napi_create_object(env, &obj);
+    napi_value r, w;
+    napi_create_int32(env, fds[0], &r);
+    napi_create_int32(env, fds[1], &w);
+    napi_set_named_property(env, obj, "readFd", r);
+    napi_set_named_property(env, obj, "writeFd", w);
+    return obj;
+}
+
+// xwmSelectWindowEvents(window, mask) -> undefined
+napi_value XwmSelectWindowEvents(napi_env env, napi_callback_info info) {
+    size_t argc = 2;
+    napi_value argv[2];
+    napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+    if (!g_xwm.active) return throwErr(env, "xwmSelectWindowEvents: no XWM running");
+    if (argc < 2) return throwErr(env, "xwmSelectWindowEvents(window, mask)");
+    uint32_t window = 0, mask = 0;
+    napi_get_value_uint32(env, argv[0], &window);
+    napi_get_value_uint32(env, argv[1], &mask);
+    xwmSelectWindowEvents(g_xwm.conn, window, mask);
+    napi_value u;
+    napi_get_undefined(env, &u);
+    return u;
+}
+
 }  // namespace
 
 void RegisterXwayland(napi_env env, napi_value exports) {
@@ -615,6 +890,18 @@ void RegisterXwayland(napi_env env, napi_value exports) {
     reg("xwmSetInputFocus", XwmSetInputFocus);
     reg("xwmChangeProperty", XwmChangeProperty);
     reg("xwmDeleteProperty", XwmDeleteProperty);
+    reg("xwmCreateSelectionWindow", XwmCreateSelectionWindow);
+    reg("xwmDestroyWindow", XwmDestroyWindow);
+    reg("xwmSetSelectionOwner", XwmSetSelectionOwner);
+    reg("xwmConvertSelection", XwmConvertSelection);
+    reg("xwmSendSelectionNotify", XwmSendSelectionNotify);
+    reg("xwmXfixesSelectSelectionInput", XwmXfixesSelectSelectionInput);
+    reg("xwmInternAtom", XwmInternAtom);
+    reg("xwmGetAtomName", XwmGetAtomName);
+    reg("xwmFlush", XwmFlush);
+    reg("xwmSelectWindowEvents", XwmSelectWindowEvents);
+    reg("makePipe", MakePipe);
+    reg("wrapFd", WrapFd);
 }
 
 }  // namespace overdraw::xwayland

@@ -131,6 +131,39 @@ export interface Addon {
   // Delete a property on a window (used to clear _NET_WM_STATE_FOCUSED on
   // unfocus etc.).
   xwmDeleteProperty(window: number, atom: number): void;
+  // Selection-bridge primitives. Used by src/xwayland/selection.ts to mediate
+  // X11 CLIPBOARD / PRIMARY between X clients and Wayland clients.
+  xwmCreateSelectionWindow(eventMask: number, inputOnly: boolean): number;
+  xwmDestroyWindow(window: number): void;
+  xwmSetSelectionOwner(selectionAtom: number, window: number, timestamp?: number): void;
+  xwmConvertSelection(
+    requestor: number, selection: number, target: number,
+    property: number, timestamp?: number,
+  ): void;
+  xwmSendSelectionNotify(
+    requestor: number, selection: number, target: number,
+    property: number, timestamp?: number,
+  ): void;
+  xwmXfixesSelectSelectionInput(window: number, selectionAtom: number, mask: number): void;
+  xwmInternAtom(name: string): number;
+  // Async atom-name lookup. Returns a cookieId; reply arrives as an
+  // "atom-name-reply" event with the same cookieId carrying `name`.
+  xwmGetAtomName(atom: number): number;
+  xwmFlush(): void;
+  // Replace the event mask on a non-bridge-owned X window (typically a
+  // client-owned requestor). Selecting our own mask is independent of any
+  // mask the owning client has selected. The bridge uses this for
+  // PROPERTY_CHANGE on requestor windows to observe INCR-continuation
+  // PropertyNotify(Delete) events.
+  xwmSelectWindowEvents(window: number, mask: number): void;
+  // pipe(2): allocate a kernel pipe. Returns { readFd, writeFd } with
+  // CLOEXEC on both and O_NONBLOCK on the read end. Used by the selection
+  // bridge: writeFd is handed to a wayland data source via
+  // events.wl_data_source.send_send; readFd is drained by the bridge.
+  makePipe(): { readFd: number; writeFd: number };
+  // Wrap a raw int fd into the WaylandFd object the trampoline expects for
+  // fd-bearing wayland events. The wrapper owns the fd from this point.
+  wrapFd(rawFd: number): WaylandFd;
   // Server-initiated destruction: drop the libwayland resource + wrapper.
   // For client-issued destructor requests (wl_buffer.destroy etc.) the
   // trampoline handles destruction automatically; JS only needs this for

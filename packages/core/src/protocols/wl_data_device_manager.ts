@@ -34,6 +34,11 @@ import { KEYBOARD_EVENT } from "../events/window-bus.js";
 // forward to the right source. Lives module-scope (keyed by offer resource).
 const offerToSource = new WeakMap<Resource, Resource>();
 
+// X-backed offers (clipboard or primary). When set, wl_data_offer.receive /
+// primary receive on the offer routes to the selection bridge instead of
+// forwarding to a wl source. Keyed by the offer resource.
+const xBackedOffer = new WeakMap<Resource, "clipboard" | "primary">();
+
 // dnd_action enum (wl_data_device_manager): none=0, copy=1, move=2, ask=4.
 const DND = { none: 0, copy: 1, move: 2, ask: 4 } as const;
 
@@ -187,24 +192,29 @@ function hideDragIcon(d: DragSession): void {
 // Send the current selection to one client's data_device(s). Mints a
 // wl_data_offer (server-side new_id event), advertises each mime, then points the
 // client at it via selection(). If there is no selection, sends selection(null).
+// Falls back to the Xwayland-backed source when no wl client owns the
+// selection and an X client does.
 function sendSelectionTo(ctx: Ctx, clientId: number): void {
   const devices = ctx.state.dataDevices?.get(clientId);
   if (!devices || devices.size === 0) return;
-  const source = ctx.state.selection ?? null;
-  const mimes = source ? (ctx.state.dataSources?.get(source)?.mimes ?? []) : [];
+  const wlSource = ctx.state.selection ?? null;
+  const xSource = ctx.state.xClipboardSource ?? null;
+  const mimes = wlSource ? (ctx.state.dataSources?.get(wlSource)?.mimes ?? [])
+              : xSource ? xSource.mimes : [];
 
   for (const device of devices) {
     if (device.destroyed) continue;
-    if (!source) {
+    if (!wlSource && !xSource) {
       ctx.events.wl_data_device.send_selection(device, null);
       continue;
     }
     // data_offer is an event carrying a server-minted new_id; postEvent returns
-    // the new wl_data_offer resource (see trampoline). Pass null as the new_id
-    // slot -- the trampoline treats a non-number new_id arg as "mint server-side".
+    // the new wl_data_offer resource. Pass null as the new_id slot -- the
+    // trampoline treats a non-number new_id arg as "mint server-side".
     const offer = ctx.events.wl_data_device.send_data_offer(device, null) as Resource;
     if (!offer) continue;
-    offerToSource.set(offer, source);
+    if (wlSource) offerToSource.set(offer, wlSource);
+    else xBackedOffer.set(offer, "clipboard");
     for (const mime of mimes) ctx.events.wl_data_offer.send_offer(offer, mime);
     ctx.events.wl_data_device.send_selection(device, offer);
   }
@@ -217,18 +227,21 @@ const primaryOfferToSource = new WeakMap<Resource, Resource>();
 function sendPrimaryTo(ctx: Ctx, clientId: number): void {
   const devices = ctx.state.primaryDevices?.get(clientId);
   if (!devices || devices.size === 0) return;
-  const source = ctx.state.primarySelection ?? null;
-  const mimes = source ? (ctx.state.primarySources?.get(source)?.mimes ?? []) : [];
+  const wlSource = ctx.state.primarySelection ?? null;
+  const xSource = ctx.state.xPrimarySource ?? null;
+  const mimes = wlSource ? (ctx.state.primarySources?.get(wlSource)?.mimes ?? [])
+              : xSource ? xSource.mimes : [];
   for (const device of devices) {
     if (device.destroyed) continue;
-    if (!source) {
+    if (!wlSource && !xSource) {
       ctx.events.zwp_primary_selection_device_v1.send_selection(device, null);
       continue;
     }
     const offer = ctx.events.zwp_primary_selection_device_v1
       .send_data_offer(device, null) as Resource;
     if (!offer) continue;
-    primaryOfferToSource.set(offer, source);
+    if (wlSource) primaryOfferToSource.set(offer, wlSource);
+    else xBackedOffer.set(offer, "primary");
     for (const mime of mimes) ctx.events.zwp_primary_selection_offer_v1.send_offer(offer, mime);
     ctx.events.zwp_primary_selection_device_v1.send_selection(device, offer);
   }
@@ -241,6 +254,18 @@ export default function makeDataDeviceManager(ctx: Ctx): WlDataDeviceManagerHand
   ctx.state.bus?.on(KEYBOARD_EVENT.focus, ({ clientId }) => {
     if (clientId != null) { sendSelectionTo(ctx, clientId); sendPrimaryTo(ctx, clientId); }
   });
+  // The Xwayland selection bridge fires this when an X client publishes a
+  // selection: re-push to the focused wayland client so it sees the X-backed
+  // offer. Composes with the bus subscription above for focus-driven pushes.
+  // The bridge installs / clears state.onXSelectionAvailable; we set our own
+  // closure once so subsequent installs land in the same path.
+  const onX = (kind: "clipboard" | "primary"): void => {
+    const focusClient = ctx.state.seat?.kbFocus?.clientId;
+    if (focusClient == null) return;
+    if (kind === "clipboard") sendSelectionTo(ctx, focusClient);
+    else sendPrimaryTo(ctx, focusClient);
+  };
+  ctx.state.onXSelectionAvailable = onX;
 
   return {
     create_data_source(_resource, id) {
@@ -279,6 +304,9 @@ export function makeDataDevice(ctx: Ctx): WlDataDeviceHandler {
     },
     set_selection(resource, source, _serial) {
       ctx.state.selection = source ?? null;
+      // Notify the Xwayland selection bridge so it can claim / release the
+      // X side. No-op when no bridge is installed.
+      ctx.state.onWlSelectionChanged?.("clipboard", source ?? null, "data");
       // Push to the currently keyboard-focused client (selection follows focus).
       const focusClient = ctx.state.seat?.kbFocus?.clientId;
       if (focusClient != null) sendSelectionTo(ctx, focusClient);
@@ -324,12 +352,23 @@ export function makeDataOffer(ctx: Ctx): WlDataOfferHandler {
       }
     },
     receive(resource, mimeType, fd: WaylandFd) {
-      // Forward the receiver's pipe write-fd to the source: data_source.send.
-      // send_send queues a WIRE EVENT that transfers the fd when the connection
-      // next flushes -- AFTER this dispatch returns, by which point libwayland
-      // has closed the demarshalled request fd. So forward an independent dup
-      // (the wire owns + closes it), and release the original from its wrapper
-      // so its finalizer doesn't double-close the fd libwayland already owns.
+      // X-backed offers (an X client owns the clipboard): hand a duped fd
+      // to the selection bridge so it survives libwayland closing the
+      // demarshalled request fd after this dispatch returns. The bridge
+      // owns the int fd; release the original wrapper.
+      const xKind = xBackedOffer.get(resource);
+      if (xKind && ctx.state.receiveForXSource) {
+        const owned = fd.dup().takeRawFd();
+        fd.takeRawFd();
+        ctx.state.receiveForXSource(xKind, mimeType, owned);
+        return;
+      }
+      // Wl-client source path. send_send queues a WIRE EVENT that transfers
+      // the fd when the connection next flushes -- AFTER this dispatch
+      // returns, by which point libwayland has closed the demarshalled
+      // request fd. So forward an independent dup (the wire owns + closes
+      // it) and release the original from its wrapper so its finalizer
+      // doesn't double-close the fd libwayland already owns.
       const source = offerToSource.get(resource);
       if (source && !source.destroyed) {
         ctx.events.wl_data_source.send_send(source, mimeType, fd.dup());
@@ -376,6 +415,7 @@ export function makePrimaryDevice(ctx: Ctx): ZwpPrimarySelectionDeviceV1Handler 
   return {
     set_selection(resource, source, _serial) {
       ctx.state.primarySelection = source ?? null;
+      ctx.state.onWlSelectionChanged?.("primary", source ?? null, "primary");
       const focusClient = ctx.state.seat?.kbFocus?.clientId;
       if (focusClient != null) sendPrimaryTo(ctx, focusClient);
       else sendPrimaryTo(ctx, ctx.addon.clientId(resource));
@@ -400,6 +440,13 @@ export function makePrimarySource(ctx: Ctx): ZwpPrimarySelectionSourceV1Handler 
 export function makePrimaryOffer(ctx: Ctx): ZwpPrimarySelectionOfferV1Handler {
   return {
     receive(resource, mimeType, fd: WaylandFd) {
+      const xKind = xBackedOffer.get(resource);
+      if (xKind && ctx.state.receiveForXSource) {
+        const owned = fd.dup().takeRawFd();
+        fd.takeRawFd();
+        ctx.state.receiveForXSource(xKind, mimeType, owned);
+        return;
+      }
       // See the wl_data_offer.receive forward above: dup for the async wire
       // transfer, release the original (libwayland closes the request fd).
       const source = primaryOfferToSource.get(resource);

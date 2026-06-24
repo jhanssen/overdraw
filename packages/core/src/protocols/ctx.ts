@@ -659,6 +659,27 @@ export interface CompositorState {
   primarySources?: Map<Resource, { mimes: string[] }>;
   primaryDevices?: Map<number, Set<Resource>>;
   primarySelection?: Resource | null;
+  // Xwayland selection bridge state. The bridge populates these when an X
+  // client owns the corresponding selection; the wl_data_device dispatch
+  // uses them to mint server-side offers backed by the X side.
+  xClipboardSource?: import("../xwayland/selection.js").XSelectionSource | null;
+  xPrimarySource?: import("../xwayland/selection.js").XSelectionSource | null;
+  // Hook the bridge fires after it (re)publishes an X-backed source, so
+  // the wl side re-pushes the focused client's data_device with a fresh
+  // offer minted from the new mime list.
+  onXSelectionAvailable?:
+    (kind: "clipboard" | "primary") => void;
+  // Hook the wl side calls when a wl client claims or releases a
+  // selection, so the bridge can claim or release the X selection in
+  // turn. The bridge installs this on startup.
+  onWlSelectionChanged?:
+    (kind: "clipboard" | "primary", source: Resource | null,
+     protocol: "data" | "primary") => void;
+  // Hook the wl_data_offer.receive / primary equivalent calls for an
+  // X-backed offer. Returns true iff the bridge handled it. Set by the
+  // bridge; null/undefined elsewhere.
+  receiveForXSource?:
+    (kind: "clipboard" | "primary", mime: string, fd: number) => boolean;
   // Core-internal event bus. Producers (this layer + the seat) emit window/
   // keyboard events; subscribers (the plugin-forwarding layer in main.ts, the
   // clipboard layer, the future decoration registry) listen. Set by

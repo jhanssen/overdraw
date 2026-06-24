@@ -9,6 +9,7 @@
 #include <xcb/composite.h>
 #include <xcb/xcb.h>
 #include <xcb/xcbext.h>  // xcb_poll_for_reply
+#include <xcb/xfixes.h>
 
 namespace overdraw::xwayland {
 
@@ -45,6 +46,17 @@ const char* const ATOM_NAMES[ATOM_COUNT] = {
     "_NET_WM_WINDOW_TYPE_TOOLTIP",
     "_NET_WM_WINDOW_TYPE_COMBO",
     "UTF8_STRING",
+    "CLIPBOARD",
+    "PRIMARY",
+    "TARGETS",
+    "TIMESTAMP",
+    "INCR",
+    "TEXT",
+    "STRING",
+    "MULTIPLE",
+    "DELETE",
+    "CLIPBOARD_MANAGER",
+    "_OVERDRAW_SELECTION",
 };
 
 // One outstanding xcb_get_property reply. Keyed by `cookieId` on the TS side;
@@ -54,6 +66,13 @@ struct PendingProperty {
     uint32_t window = 0;
     uint32_t atom = 0;
     unsigned int sequence = 0;  // xcb cookie's .sequence
+};
+
+// One outstanding xcb_get_atom_name reply.
+struct PendingAtomName {
+    uint32_t cookieId = 0;
+    uint32_t atom = 0;
+    unsigned int sequence = 0;
 };
 
 }  // namespace
@@ -79,7 +98,15 @@ struct XwmConn {
 
     // Pending GetProperty replies. Walked every xwmProcess call.
     std::vector<PendingProperty> pending;
+    // Pending GetAtomName replies.
+    std::vector<PendingAtomName> pendingAtomName;
     uint32_t nextCookieId = 1;
+
+    // xfixes extension: the first-event opcode for selection-notify
+    // (selection-bridge events arrive as (response_type & 0x7f) ==
+    // xfixesFirstEvent + XCB_XFIXES_SELECTION_NOTIFY).
+    uint8_t xfixesFirstEvent = 0;
+    bool xfixesAvailable = false;
 
     // Per-window geometry tracker. Populated on CreateNotify, updated on
     // ConfigureNotify, cleared on DestroyNotify.
@@ -127,6 +154,28 @@ XwmConn* xwmConnect(int wmFd) {
     // Composite-redirect the root's subwindows (manual) so Xwayland presents
     // each toplevel as its own wl_surface instead of painting the root.
     xcb_composite_redirect_subwindows(x->conn, x->root, XCB_COMPOSITE_REDIRECT_MANUAL);
+
+    // xfixes: required for selection-owner-change notifications. Query the
+    // extension first-event opcode and bump the negotiated version (any
+    // version that supports xfixes-selection is fine; we only need v1).
+    const xcb_query_extension_reply_t* xfixesExt =
+        xcb_get_extension_data(x->conn, &xcb_xfixes_id);
+    if (xfixesExt && xfixesExt->present) {
+        xcb_xfixes_query_version_cookie_t qvc = xcb_xfixes_query_version(
+            x->conn, XCB_XFIXES_MAJOR_VERSION, XCB_XFIXES_MINOR_VERSION);
+        xcb_xfixes_query_version_reply_t* qv =
+            xcb_xfixes_query_version_reply(x->conn, qvc, nullptr);
+        if (qv) {
+            x->xfixesFirstEvent = xfixesExt->first_event;
+            x->xfixesAvailable = true;
+            free(qv);
+        }
+    }
+    if (!x->xfixesAvailable) {
+        std::fprintf(stderr,
+            "[xwm] xfixes unavailable; clipboard / primary-selection bridge "
+            "will not function\n");
+    }
 
     // Intern atoms (pipelined: issue all, then collect).
     xcb_intern_atom_cookie_t cookies[ATOM_COUNT];
@@ -213,6 +262,37 @@ void drainPropertyReplies(XwmConn* x,
             if (err) free(err);
         }
         it = x->pending.erase(it);
+    }
+}
+
+// Drain pending GetAtomName replies. Mirrors drainPropertyReplies; the
+// reply carries a UTF-8 name borrowed from xcb's reply buffer.
+void drainAtomNameReplies(XwmConn* x,
+                          const std::function<void(const XwmEvent&)>& cb) {
+    auto it = x->pendingAtomName.begin();
+    while (it != x->pendingAtomName.end()) {
+        void* reply = nullptr;
+        xcb_generic_error_t* err = nullptr;
+        const int ready = xcb_poll_for_reply(x->conn, it->sequence, &reply, &err);
+        if (ready == 0) { ++it; continue; }
+
+        XwmEvent o;
+        o.type = XwmEvent::AtomNameReply;
+        o.atom = it->atom;
+        o.cookieId = it->cookieId;
+        if (reply != nullptr) {
+            auto* r = static_cast<xcb_get_atom_name_reply_t*>(reply);
+            o.data = reinterpret_cast<const uint8_t*>(xcb_get_atom_name_name(r));
+            o.length = static_cast<uint32_t>(xcb_get_atom_name_name_length(r));
+            cb(o);
+            free(reply);
+        } else {
+            // Error: deliver an empty name so the TS state machine clears
+            // the pending entry.
+            cb(o);
+            if (err) free(err);
+        }
+        it = x->pendingAtomName.erase(it);
     }
 }
 
@@ -354,6 +434,34 @@ bool xwmProcess(XwmConn* x, const std::function<void(const XwmEvent&)>& cb) {
                 o.type = XwmEvent::PropertyNotify;
                 o.window = e->window;
                 o.atom = e->atom;
+                // XCB_PROPERTY_NEW_VALUE = 0, XCB_PROPERTY_DELETE = 1.
+                // INCR pumps key off the distinction (incoming on NEW_VALUE,
+                // outgoing on DELETE).
+                o.propertyState = e->state;
+                cb(o);
+                break;
+            }
+            case XCB_SELECTION_REQUEST: {
+                auto* e = reinterpret_cast<xcb_selection_request_event_t*>(ev);
+                XwmEvent o;
+                o.type = XwmEvent::SelectionRequest;
+                o.requestor = e->requestor;
+                o.selection = e->selection;
+                o.target = e->target;
+                o.property = e->property;  // 0 = obsolete-client convention
+                o.timestamp = e->time;
+                cb(o);
+                break;
+            }
+            case XCB_SELECTION_NOTIFY: {
+                auto* e = reinterpret_cast<xcb_selection_notify_event_t*>(ev);
+                XwmEvent o;
+                o.type = XwmEvent::SelectionNotify;
+                o.requestor = e->requestor;
+                o.selection = e->selection;
+                o.target = e->target;
+                o.property = e->property;  // 0 = conversion refused
+                o.timestamp = e->time;
                 cb(o);
                 break;
             }
@@ -371,12 +479,25 @@ bool xwmProcess(XwmConn* x, const std::function<void(const XwmEvent&)>& cb) {
                 break;
             }
             default:
+                if (x->xfixesAvailable
+                    && (ev->response_type & 0x7f)
+                        == x->xfixesFirstEvent + XCB_XFIXES_SELECTION_NOTIFY) {
+                    auto* e = reinterpret_cast<
+                        xcb_xfixes_selection_notify_event_t*>(ev);
+                    XwmEvent o;
+                    o.type = XwmEvent::XfixesSelectionNotify;
+                    o.selection = e->selection;
+                    o.selectionOwner = e->owner;  // XCB_NONE = no owner
+                    o.timestamp = e->timestamp;
+                    cb(o);
+                }
                 break;
         }
         free(ev);
     }
 
     drainPropertyReplies(x, cb);
+    drainAtomNameReplies(x, cb);
 
     return !xcb_connection_has_error(x->conn);
 }
@@ -481,5 +602,98 @@ void xwmDeleteProperty(XwmConn* x, uint32_t window, uint32_t atom) {
 
 uint32_t xwmBookkeeperWindow(XwmConn* x) { return x->bookkeeper; }
 uint32_t xwmRootWindow(XwmConn* x) { return x->root; }
+
+uint32_t xwmCreateSelectionWindow(XwmConn* x, uint32_t eventMask, bool inputOnly) {
+    if (!x->conn) return 0;
+    const xcb_window_t w = xcb_generate_id(x->conn);
+    if (w == 0) return 0;
+    const uint32_t values[1] = { eventMask };
+    xcb_create_window(x->conn,
+        XCB_COPY_FROM_PARENT, w, x->root,
+        0, 0, 1, 1, 0,
+        inputOnly ? XCB_WINDOW_CLASS_INPUT_ONLY : XCB_WINDOW_CLASS_INPUT_OUTPUT,
+        XCB_COPY_FROM_PARENT,
+        XCB_CW_EVENT_MASK, values);
+    xcb_flush(x->conn);
+    return w;
+}
+
+void xwmDestroyWindow(XwmConn* x, uint32_t window) {
+    if (!x->conn || window == 0) return;
+    xcb_destroy_window(x->conn, window);
+    xcb_flush(x->conn);
+}
+
+void xwmSetSelectionOwner(XwmConn* x, uint32_t selectionAtom, uint32_t window,
+                          uint32_t timestamp) {
+    xcb_set_selection_owner(x->conn, window, selectionAtom, timestamp);
+    xcb_flush(x->conn);
+}
+
+void xwmConvertSelection(XwmConn* x, uint32_t requestor, uint32_t selection,
+                         uint32_t target, uint32_t property,
+                         uint32_t timestamp) {
+    xcb_convert_selection(x->conn, requestor, selection, target, property, timestamp);
+    xcb_flush(x->conn);
+}
+
+void xwmSendSelectionNotify(XwmConn* x, uint32_t requestor,
+                            uint32_t selection, uint32_t target,
+                            uint32_t property, uint32_t timestamp) {
+    xcb_selection_notify_event_t ev = {};
+    ev.response_type = XCB_SELECTION_NOTIFY;
+    ev.requestor = requestor;
+    ev.selection = selection;
+    ev.target = target;
+    ev.property = property;  // 0 = refusal
+    ev.time = timestamp;
+    xcb_send_event(x->conn, /*propagate=*/0, requestor,
+                   XCB_EVENT_MASK_NO_EVENT,
+                   reinterpret_cast<const char*>(&ev));
+    xcb_flush(x->conn);
+}
+
+void xwmXfixesSelectSelectionInput(XwmConn* x, uint32_t window,
+                                   uint32_t selectionAtom, uint32_t mask) {
+    if (!x->xfixesAvailable) return;
+    xcb_xfixes_select_selection_input(x->conn, window, selectionAtom, mask);
+    xcb_flush(x->conn);
+}
+
+uint32_t xwmInternAtom(XwmConn* x, const char* name) {
+    if (!name || !*name) return 0;
+    const size_t len = std::strlen(name);
+    xcb_intern_atom_cookie_t c = xcb_intern_atom(
+        x->conn, 0, static_cast<uint16_t>(len), name);
+    xcb_intern_atom_reply_t* r = xcb_intern_atom_reply(x->conn, c, nullptr);
+    if (!r) return 0;
+    const uint32_t atom = r->atom;
+    free(r);
+    return atom;
+}
+
+uint32_t xwmGetAtomName(XwmConn* x, uint32_t atom) {
+    if (atom == 0) return 0;
+    xcb_get_atom_name_cookie_t c = xcb_get_atom_name(x->conn, atom);
+    xcb_flush(x->conn);
+    PendingAtomName p;
+    p.cookieId = x->nextCookieId++;
+    if (p.cookieId == 0) p.cookieId = x->nextCookieId++;  // skip sentinel
+    p.atom = atom;
+    p.sequence = c.sequence;
+    x->pendingAtomName.push_back(p);
+    return p.cookieId;
+}
+
+void xwmFlush(XwmConn* x) {
+    if (x->conn) xcb_flush(x->conn);
+}
+
+void xwmSelectWindowEvents(XwmConn* x, uint32_t window, uint32_t mask) {
+    if (!x->conn || window == 0) return;
+    const uint32_t values[1] = { mask };
+    xcb_change_window_attributes(x->conn, window, XCB_CW_EVENT_MASK, values);
+    xcb_flush(x->conn);
+}
 
 }  // namespace overdraw::xwayland

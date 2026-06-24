@@ -50,6 +50,22 @@ enum AtomIndex {
     ATOM_NET_WM_WINDOW_TYPE_TOOLTIP,
     ATOM_NET_WM_WINDOW_TYPE_COMBO,
     ATOM_UTF8_STRING,
+    // Selection bridge atoms.
+    ATOM_CLIPBOARD,
+    ATOM_PRIMARY,
+    ATOM_TARGETS,
+    ATOM_TIMESTAMP,
+    ATOM_INCR,
+    ATOM_TEXT,
+    ATOM_STRING,
+    ATOM_MULTIPLE,
+    ATOM_DELETE,
+    ATOM_CLIPBOARD_MANAGER,
+    // The compositor's per-selection destination property (where converted
+    // selection bytes land on incoming transfers and where outgoing
+    // selection replies are written by us). Unique-per-WM name so it does
+    // not collide with the client's own property atoms.
+    ATOM_OVERDRAW_SELECTION,
     ATOM_COUNT,
 };
 
@@ -69,6 +85,10 @@ struct XwmEvent {
         PropertyNotify,   // a watched property on a managed window changed
         PropertyReply,    // async reply to a prior xwmGetProperty call
         FocusIn,          // X-side focus moved to this window (X -> compositor)
+        XfixesSelectionNotify, // an X client changed selection ownership
+        SelectionRequest, // an X requestor wants our selection's bytes
+        SelectionNotify,  // reply to one of our ConvertSelection requests
+        AtomNameReply,    // async reply to a prior xwmGetAtomName call
     } type;
     uint32_t window = 0;
     int32_t x = 0, y = 0, width = 0, height = 0;
@@ -80,10 +100,31 @@ struct XwmEvent {
     // PropertyNotify / PropertyReply only.
     uint32_t atom = 0;
     uint32_t replyType = 0;    // PropertyReply: the X type atom of the reply
-    uint32_t cookieId = 0;     // PropertyReply: the cookie returned by xwmGetProperty
+    uint32_t cookieId = 0;     // PropertyReply / AtomNameReply: cookie returned by
+                               // xwmGetProperty / xwmGetAtomName
     uint8_t format = 0;        // PropertyReply: 0 / 8 / 16 / 32
-    const uint8_t* data = nullptr;  // PropertyReply: borrowed bytes, valid only during cb()
-    uint32_t length = 0;       // PropertyReply: byte length of `data`
+    const uint8_t* data = nullptr;  // PropertyReply / AtomNameReply: borrowed
+                                    // bytes, valid only during cb()
+    uint32_t length = 0;       // PropertyReply / AtomNameReply: byte length of `data`
+    // PropertyNotify only: 0 = NewValue (set / appended), 1 = Delete (removed).
+    // The selection-bridge incoming INCR pump fires on NewValue (next chunk
+    // arrived); the outgoing INCR pump fires on Delete (requestor consumed
+    // the previous chunk and is ready for more).
+    uint8_t propertyState = 0;
+    // SelectionRequest / SelectionNotify / XfixesSelectionNotify:
+    //   selection       = the selection atom (CLIPBOARD / PRIMARY / XdndSelection)
+    //   target          = the requested target atom (TARGETS, a mime atom, ...)
+    //   property        = the requestor's destination property atom
+    //   requestor       = the X window receiving the bytes (SelectionRequest)
+    //                     or our window that asked for them (SelectionNotify)
+    //   selectionOwner  = the new selection owner window (XfixesSelectionNotify)
+    //   timestamp       = the X event timestamp
+    uint32_t selection = 0;
+    uint32_t target = 0;
+    uint32_t property = 0;
+    uint32_t requestor = 0;
+    uint32_t selectionOwner = 0;
+    uint32_t timestamp = 0;
 };
 
 struct XwmConn;  // opaque (defined in xwm.cpp)
@@ -164,6 +205,73 @@ uint32_t xwmBookkeeperWindow(XwmConn* x);
 
 // The X screen's root window id (for _NET_ACTIVE_WINDOW property writes).
 uint32_t xwmRootWindow(XwmConn* x);
+
+// ---- Selection bridge primitives. ----
+//
+// The XWM creates short-lived auxiliary X windows for each selection (one
+// owning window per CLIPBOARD / PRIMARY when the wayland side holds the
+// selection; one per in-flight ConvertSelection when an X client owns it
+// and a wayland receiver is reading the bytes). The TS bridge owns the
+// state machine; native exposes only the X primitives.
+
+// Create a 1x1 child of the root with the given event mask (typically
+// SUBSTRUCTURE_NOTIFY | PROPERTY_CHANGE). `inputOnly` selects INPUT_ONLY
+// vs INPUT_OUTPUT; geometry is fixed -- selection windows do not draw.
+// Returns 0 on failure.
+uint32_t xwmCreateSelectionWindow(XwmConn* x, uint32_t eventMask, bool inputOnly);
+
+// Destroy a window previously created with xwmCreateSelectionWindow (or any
+// WM-owned window). Safe to call on 0.
+void xwmDestroyWindow(XwmConn* x, uint32_t window);
+
+// Claim or release an X selection. `window`=0 releases (XCB_NONE).
+void xwmSetSelectionOwner(XwmConn* x, uint32_t selectionAtom, uint32_t window,
+                          uint32_t timestamp);
+
+// Ask the current selection owner to convert `selection` to `target` and
+// write it to `property` on `requestor`. The reply arrives as a
+// SelectionNotify XwmEvent.
+void xwmConvertSelection(XwmConn* x, uint32_t requestor, uint32_t selection,
+                         uint32_t target, uint32_t property,
+                         uint32_t timestamp);
+
+// Send a SelectionNotify event to `requestor` -- the reply leg of a
+// SelectionRequest we are handling as the selection owner. `property`=0
+// means refusal (XCB_NONE).
+void xwmSendSelectionNotify(XwmConn* x, uint32_t requestor,
+                            uint32_t selection, uint32_t target,
+                            uint32_t property, uint32_t timestamp);
+
+// Subscribe to selection-owner-change events on `selectionAtom`. The mask
+// is the standard SET_SELECTION_OWNER | SELECTION_WINDOW_DESTROY |
+// SELECTION_CLIENT_CLOSE. Events arrive as XfixesSelectionNotify.
+void xwmXfixesSelectSelectionInput(XwmConn* x, uint32_t window,
+                                   uint32_t selectionAtom, uint32_t mask);
+
+// Synchronously intern an atom by name. Used for MIME-type atoms minted on
+// demand. The TS bridge holds a small cache (mime <-> atom) and only calls
+// this on cache miss. Synchronous is safe at this point because the call
+// site (xfixes-notify or wl set_selection) doesn't carry the deadlock risk
+// the per-window property reads do: it does not require Xwayland to make
+// progress on its wayland socket to answer.
+uint32_t xwmInternAtom(XwmConn* x, const char* name);
+
+// Asynchronously fetch the name of an atom (the reverse direction: an X
+// target atom on the wire, e.g. when reading TARGETS from a non-standard
+// client). Returns a cookieId; the reply arrives as AtomNameReply.
+uint32_t xwmGetAtomName(XwmConn* x, uint32_t atom);
+
+// Flush pending xcb writes. Most request wrappers flush themselves; this
+// is for callers that issue several writes back-to-back and want one
+// explicit flush.
+void xwmFlush(XwmConn* x);
+
+// Replace the event mask on an arbitrary X window. The selection bridge uses
+// this to subscribe to PROPERTY_CHANGE on client-owned requestor windows so
+// it can observe PropertyNotify(Delete) -- the INCR-continuation signal.
+// Selecting events from our connection is independent of any masks the
+// owning client has selected (X serves one mask per (window, client) pair).
+void xwmSelectWindowEvents(XwmConn* x, uint32_t window, uint32_t mask);
 
 }  // namespace overdraw::xwayland
 
