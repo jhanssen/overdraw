@@ -1,12 +1,21 @@
-// X11 selection test client. Two modes:
+// X11 selection test client. Three modes:
 //
 //   --source CLIPBOARD|PRIMARY <mime> <payload>
 //     Claim the selection and serve `payload` for `mime` on every
 //     SelectionRequest. Stays alive until --timeout-ms.
 //
+//   --source-bytes CLIPBOARD|PRIMARY <mime> <N>
+//     Same, but serve N bytes of a deterministic pattern
+//     (byte i = (i ^ (i >> 8)) & 0xFF). Exists so the bridge's
+//     incoming pump can be driven across the INCR threshold
+//     (64 KiB) without passing huge argv strings.
+//
 //   --paste  CLIPBOARD|PRIMARY <mime>
-//     Convert the selection to <mime>, read the bytes, print
-//     "[x11-selection] received: <bytes>" and exit.
+//     Convert the selection to <mime>, read the bytes (handling
+//     INCR continuations), print
+//       "[x11-selection] received: <bytes>"               (default)
+//       "[x11-selection] received-summary len=N sum32=H"  (--summary)
+//     and exit.
 //
 // Common:
 //   --map         Create + map a 1x1 window so the X side has a focused
@@ -32,6 +41,10 @@
 
 #include <xcb/xcb.h>
 
+static unsigned char patternByte(size_t i) {
+    return (unsigned char)((i ^ (i >> 8)) & 0xFF);
+}
+
 static xcb_atom_t intern_atom(xcb_connection_t* c, const char* name) {
     xcb_intern_atom_cookie_t k = xcb_intern_atom(c, 0, (uint16_t)strlen(name), name);
     xcb_intern_atom_reply_t* r = xcb_intern_atom_reply(c, k, NULL);
@@ -40,9 +53,13 @@ static xcb_atom_t intern_atom(xcb_connection_t* c, const char* name) {
     return a;
 }
 
+// Either `payload` (NUL-terminated string) OR `patternBytes` > 0. When
+// patternBytes > 0, the SelectionRequest reply is built from patternByte()
+// for that many bytes.
 static int run_source(xcb_connection_t* c, xcb_screen_t* screen,
                       const char* selectionName, const char* mime,
-                      const char* payload, int timeoutMs,
+                      const char* payload, size_t patternBytes,
+                      int timeoutMs,
                       const char* title, int doMap) {
     xcb_window_t win = xcb_generate_id(c);
     const uint32_t valuesMask = XCB_CW_BACK_PIXEL | XCB_CW_EVENT_MASK;
@@ -104,7 +121,18 @@ static int run_source(xcb_connection_t* c, xcb_screen_t* screen,
     const int fd = xcb_get_file_descriptor(c);
     long elapsedMs = 0;
     const int stepMs = 50;
-    const size_t payloadLen = strlen(payload);
+    const size_t payloadLen = patternBytes > 0 ? patternBytes : strlen(payload);
+    // For the byte-pattern path, materialize the buffer once. The X server
+    // limits a single ChangeProperty to ~256 KiB by default; we use the
+    // bridge's INCR threshold (64 KiB) test sizes well under that.
+    unsigned char* patternBuf = NULL;
+    if (patternBytes > 0) {
+        patternBuf = (unsigned char*)malloc(patternBytes);
+        if (!patternBuf) return 4;
+        for (size_t i = 0; i < patternBytes; i++) patternBuf[i] = patternByte(i);
+    }
+    const unsigned char* payloadBytes =
+        patternBytes > 0 ? patternBuf : (const unsigned char*)payload;
     while (elapsedMs < timeoutMs) {
         struct pollfd p = { .fd = fd, .events = POLLIN };
         poll(&p, 1, stepMs);
@@ -124,8 +152,8 @@ static int run_source(xcb_connection_t* c, xcb_screen_t* screen,
                 } else if (sr->target == MIME_ATOM) {
                     xcb_change_property(c, XCB_PROP_MODE_REPLACE, sr->requestor,
                         replyProperty, sr->target, 8,
-                        (uint32_t)payloadLen, payload);
-                    printf("[x11-selection] selection-served %s\n", mime);
+                        (uint32_t)payloadLen, payloadBytes);
+                    printf("[x11-selection] selection-served %s len=%zu\n", mime, payloadLen);
                     fflush(stdout);
                 } else if (sr->target == TIMESTAMP) {
                     uint32_t t = XCB_CURRENT_TIME;
@@ -160,10 +188,20 @@ static int run_source(xcb_connection_t* c, xcb_screen_t* screen,
     return 0;
 }
 
+// Print result: `--summary` (sum32 + len) or raw bytes (NUL-padded).
+static void emit_paste_result(int summary, const unsigned char* buf, size_t len,
+                              uint32_t sum32) {
+    if (summary) {
+        printf("[x11-selection] received-summary len=%zu sum32=0x%08x\n", len, sum32);
+    } else {
+        printf("[x11-selection] received: %.*s\n", (int)len, (const char*)buf);
+    }
+    fflush(stdout);
+}
+
 static int run_paste(xcb_connection_t* c, xcb_screen_t* screen,
-                     const char* selectionName, const char* mime, int timeoutMs) {
-    // A small input-only requestor window. The selection bridge writes the
-    // converted bytes onto `_X_SEL_DATA` on this window.
+                     const char* selectionName, const char* mime,
+                     int timeoutMs, int summary) {
     xcb_window_t win = xcb_generate_id(c);
     const uint32_t mask = XCB_EVENT_MASK_PROPERTY_CHANGE;
     xcb_create_window(c, XCB_COPY_FROM_PARENT, win, screen->root,
@@ -175,12 +213,20 @@ static int run_paste(xcb_connection_t* c, xcb_screen_t* screen,
     else if (!strcmp(mime, "text/plain")) mimeAtomName = "TEXT";
     const xcb_atom_t MIME_ATOM = intern_atom(c, mimeAtomName);
     const xcb_atom_t DST = intern_atom(c, "_X_SEL_DATA");
-    if (SEL == 0 || MIME_ATOM == 0 || DST == 0) {
+    const xcb_atom_t INCR_ATOM = intern_atom(c, "INCR");
+    if (SEL == 0 || MIME_ATOM == 0 || DST == 0 || INCR_ATOM == 0) {
         fprintf(stderr, "[x11-selection] atom intern failed\n");
         return 1;
     }
     xcb_convert_selection(c, win, SEL, MIME_ATOM, DST, XCB_CURRENT_TIME);
     xcb_flush(c);
+
+    // Bytes accumulated across either a one-shot reply or all INCR chunks.
+    unsigned char* accum = NULL;
+    size_t accumLen = 0;
+    size_t accumCap = 0;
+    uint32_t sum32 = 0;
+    int incrActive = 0;
 
     const int fd = xcb_get_file_descriptor(c);
     long elapsedMs = 0;
@@ -197,34 +243,79 @@ static int run_paste(xcb_connection_t* c, xcb_screen_t* screen,
                     (xcb_selection_notify_event_t*)ev;
                 if (sn->property == 0) {
                     fprintf(stderr, "[x11-selection] paste refused\n");
-                    free(ev);
+                    free(ev); free(accum);
                     return 4;
                 }
                 xcb_get_property_cookie_t pk = xcb_get_property(
-                    c, 1 /*delete*/, win, DST, 0, 0, 65536 /*length words*/);
+                    c, 1 /*delete*/, win, DST, 0, 0, 65536);
                 xcb_get_property_reply_t* pr = xcb_get_property_reply(c, pk, NULL);
                 if (!pr) {
                     fprintf(stderr, "[x11-selection] paste GetProperty failed\n");
-                    free(ev);
+                    free(ev); free(accum);
                     return 5;
                 }
                 int len = xcb_get_property_value_length(pr);
-                char* val = (char*)xcb_get_property_value(pr);
-                // INCR not handled by this client (test payloads are small).
-                printf("[x11-selection] received: %.*s\n", len, val);
-                fflush(stdout);
-                free(pr);
-                free(ev);
+                unsigned char* val = (unsigned char*)xcb_get_property_value(pr);
+                if (pr->type == INCR_ATOM) {
+                    // INCR header. Subsequent PropertyNotify(NewValue) on
+                    // DST carry chunks; deleting DST (above) signals "ready
+                    // for first chunk."
+                    incrActive = 1;
+                    free(pr);
+                    free(ev);
+                    continue;
+                }
+                // Non-INCR: full payload in one property.
+                if (len > 0) {
+                    if (accumCap < (size_t)len) {
+                        accumCap = (size_t)len;
+                        accum = (unsigned char*)realloc(accum, accumCap);
+                    }
+                    memcpy(accum, val, (size_t)len);
+                    accumLen = (size_t)len;
+                    for (int i = 0; i < len; i++) sum32 += val[i];
+                }
+                emit_paste_result(summary, accum, accumLen, sum32);
+                free(pr); free(ev); free(accum);
                 return 0;
+            }
+            if (type == XCB_PROPERTY_NOTIFY) {
+                xcb_property_notify_event_t* pn =
+                    (xcb_property_notify_event_t*)ev;
+                // INCR continuation: only NEW_VALUE on DST. state=0 NewValue, 1 Delete.
+                if (!incrActive || pn->window != win || pn->atom != DST
+                    || pn->state != 0) { free(ev); continue; }
+                xcb_get_property_cookie_t pk = xcb_get_property(
+                    c, 1 /*delete*/, win, DST, 0, 0, 65536);
+                xcb_get_property_reply_t* pr = xcb_get_property_reply(c, pk, NULL);
+                if (!pr) { free(ev); continue; }
+                int len = xcb_get_property_value_length(pr);
+                if (len == 0) {
+                    // EOF.
+                    emit_paste_result(summary, accum, accumLen, sum32);
+                    free(pr); free(ev); free(accum);
+                    return 0;
+                }
+                unsigned char* val = (unsigned char*)xcb_get_property_value(pr);
+                if (accumLen + (size_t)len > accumCap) {
+                    accumCap = (accumLen + (size_t)len) * 2;
+                    accum = (unsigned char*)realloc(accum, accumCap);
+                }
+                memcpy(accum + accumLen, val, (size_t)len);
+                for (int i = 0; i < len; i++) sum32 += val[i];
+                accumLen += (size_t)len;
+                free(pr);
             }
             free(ev);
         }
         if (xcb_connection_has_error(c)) {
             fprintf(stderr, "[x11-selection] connection error\n");
+            free(accum);
             return 3;
         }
     }
     fprintf(stderr, "[x11-selection] paste timeout\n");
+    free(accum);
     return 6;
 }
 
@@ -233,6 +324,8 @@ int main(int argc, char** argv) {
     const char* selectionName = "CLIPBOARD";
     const char* mime = "text/plain;charset=utf-8";
     const char* payload = "x-selection-test-payload";
+    size_t patternBytes = 0;
+    int summary = 0;
     int timeoutMs = 10000;
     int doMap = 0;
     const char* title = "selection-client";
@@ -242,10 +335,17 @@ int main(int argc, char** argv) {
             selectionName = argv[++i];
             mime = argv[++i];
             payload = argv[++i];
+        } else if (!strcmp(argv[i], "--source-bytes") && i + 3 < argc) {
+            mode = 1;
+            selectionName = argv[++i];
+            mime = argv[++i];
+            patternBytes = (size_t)strtoull(argv[++i], NULL, 10);
         } else if (!strcmp(argv[i], "--paste") && i + 2 < argc) {
             mode = 2;
             selectionName = argv[++i];
             mime = argv[++i];
+        } else if (!strcmp(argv[i], "--summary")) {
+            summary = 1;
         } else if (!strcmp(argv[i], "--timeout-ms") && i + 1 < argc) {
             timeoutMs = atoi(argv[++i]);
         } else if (!strcmp(argv[i], "--map")) {
@@ -255,8 +355,9 @@ int main(int argc, char** argv) {
         }
     }
     if (mode == 0) {
-        fprintf(stderr, "usage: %s --source SEL MIME PAYLOAD | --paste SEL MIME\n",
-                argv[0]);
+        fprintf(stderr,
+            "usage: %s (--source SEL MIME PAYLOAD | --source-bytes SEL MIME N "
+            "| --paste SEL MIME [--summary])\n", argv[0]);
         return 1;
     }
 
@@ -272,6 +373,6 @@ int main(int argc, char** argv) {
     }
 
     if (mode == 1) return run_source(c, screen, selectionName, mime, payload,
-                                     timeoutMs, title, doMap);
-    return run_paste(c, screen, selectionName, mime, timeoutMs);
+                                     patternBytes, timeoutMs, title, doMap);
+    return run_paste(c, screen, selectionName, mime, timeoutMs, summary);
 }

@@ -1,13 +1,18 @@
-// Clipboard (wl_data_device selection) test client. Two roles, selected by arg:
+// Clipboard (wl_data_device selection) test client. Three roles, selected by arg:
 //
 //   --source MIME TEXT : create a wl_data_source offering MIME, set it as the
 //       selection, and serve TEXT whenever the compositor sends data_source.send
 //       (write TEXT to the fd, close it). Stays alive until SIGTERM.
 //
+//   --source-bytes MIME N : same, but serve N bytes of a deterministic pattern
+//       (byte i = (i ^ (i >> 8)) & 0xFF). Exists for INCR-range payloads where
+//       --source TEXT (argv string) is impractical.
+//
 //   --receive MIME : wait for a data_device.selection offer carrying MIME, then
-//       data_offer.receive(MIME, pipe-write-fd), read the data from the pipe read
-//       end, print "[clipboard-client] received: <data>", and exit 0. Exits 1 if
-//       no matching offer arrives in time.
+//       data_offer.receive(MIME, pipe-write-fd), read the data, print
+//       "[clipboard-client] received: <data>" (up to 4 KiB), and exit 0.
+//       For larger payloads pass --summary; then print
+//       "[clipboard-client] received-summary len=<N> sum32=<HEX>" instead.
 //
 // GPU-free: server + data-device protocol only.
 
@@ -38,12 +43,22 @@ static volatile sig_atomic_t running = 1;
 static int configured = 0;
 
 static const char* g_mime = NULL;
-static const char* g_text = NULL;       // source mode payload
+static const char* g_text = NULL;       // source mode payload (TEXT mode)
+static size_t g_bytes = 0;              // source-bytes mode payload length
+static int g_summary = 0;               // receive-mode: print len+sum32 summary
 static struct wl_data_offer* pending_offer = NULL;
 static int offer_has_mime = 0;          // the current offer advertised g_mime
 static int got_selection = 0;
 static char received[4096];
 static int received_done = 0;
+// For --summary mode: accumulate len + a running sum32 of the bytes.
+static uint64_t recv_len = 0;
+static uint32_t recv_sum32 = 0;
+
+// Deterministic byte pattern used by --source-bytes and verified by --summary.
+static unsigned char patternByte(size_t i) {
+    return (unsigned char)((i ^ (i >> 8)) & 0xFF);
+}
 
 static void onTerm(int sig) { (void)sig; running = 0; }
 
@@ -51,7 +66,28 @@ static void onTerm(int sig) { (void)sig; running = 0; }
 static void srcTarget(void* d, struct wl_data_source* s, const char* m) { (void)d;(void)s;(void)m; }
 static void srcSend(void* d, struct wl_data_source* s, const char* mime, int32_t fd) {
     (void)d;(void)s;(void)mime;
-    if (g_text) { ssize_t n = write(fd, g_text, strlen(g_text)); (void)n; }
+    if (g_text) {
+        ssize_t n = write(fd, g_text, strlen(g_text));
+        (void)n;
+    } else if (g_bytes > 0) {
+        // Write the deterministic pattern in chunks. The receive side (or
+        // bridge incoming-INCR pump) handles arbitrary chunking.
+        unsigned char chunk[8192];
+        size_t off = 0;
+        while (off < g_bytes) {
+            size_t take = sizeof(chunk);
+            if (off + take > g_bytes) take = g_bytes - off;
+            for (size_t i = 0; i < take; i++) chunk[i] = patternByte(off + i);
+            size_t written = 0;
+            while (written < take) {
+                ssize_t n = write(fd, chunk + written, take - written);
+                if (n < 0) { if (errno == EINTR) continue; goto done; }
+                written += (size_t)n;
+            }
+            off += take;
+        }
+done: ;
+    }
     close(fd);
 }
 static void srcCancelled(void* d, struct wl_data_source* s) { (void)d; wl_data_source_destroy(s); }
@@ -185,14 +221,21 @@ int main(int argc, char** argv) {
         if (strcmp(argv[i], "--socket") == 0 && i + 1 < argc) socket = argv[++i];
         else if (strcmp(argv[i], "--source") == 0 && i + 2 < argc) {
             source_mode = 1; g_mime = argv[++i]; g_text = argv[++i];
+        } else if (strcmp(argv[i], "--source-bytes") == 0 && i + 2 < argc) {
+            source_mode = 1; g_mime = argv[++i];
+            g_bytes = (size_t)strtoull(argv[++i], NULL, 10);
         } else if (strcmp(argv[i], "--receive") == 0 && i + 1 < argc) {
             receive_mode = 1; g_mime = argv[++i];
+        } else if (strcmp(argv[i], "--summary") == 0) {
+            g_summary = 1;
         } else if (strcmp(argv[i], "--primary") == 0) {
             primary = 1;
         }
     }
     if (!socket || (!source_mode && !receive_mode)) {
-        fprintf(stderr, "usage: %s --socket NAME (--source MIME TEXT | --receive MIME)\n", argv[0]);
+        fprintf(stderr,
+            "usage: %s --socket NAME (--source MIME TEXT | --source-bytes MIME N "
+            "| --receive MIME [--summary]) [--primary]\n", argv[0]);
         return 2;
     }
 
@@ -287,6 +330,30 @@ int main(int argc, char** argv) {
 
     // Read the data the source writes into the pipe, pumping the display so the
     // source's send callback runs (it lives in another client via the server).
+    if (g_summary) {
+        // Drain until EOF, tracking length + 32-bit unsigned sum of bytes.
+        unsigned char buf[16384];
+        for (;;) {
+            wl_display_flush(display);
+            struct pollfd pfd[2] = { { pipefd[0], POLLIN, 0 }, { wlfd, POLLIN, 0 } };
+            int r = poll(pfd, 2, 2000);
+            if (r <= 0) { break; }
+            if (pfd[1].revents & POLLIN) wl_display_dispatch(display);
+            if (pfd[0].revents & POLLIN) {
+                ssize_t n = read(pipefd[0], buf, sizeof(buf));
+                if (n < 0) { if (errno == EINTR) continue; break; }
+                if (n == 0) { received_done = 1; break; }
+                for (ssize_t i = 0; i < n; i++) recv_sum32 += buf[i];
+                recv_len += (uint64_t)n;
+            }
+        }
+        close(pipefd[0]);
+        printf("[clipboard-client] received-summary len=%llu sum32=0x%08x\n",
+               (unsigned long long)recv_len, recv_sum32);
+        fflush(stdout);
+        wl_display_disconnect(display);
+        return received_done || recv_len > 0 ? 0 : 1;
+    }
     size_t off = 0;
     while (off < sizeof(received) - 1) {
         wl_display_flush(display);
