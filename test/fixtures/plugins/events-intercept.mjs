@@ -16,8 +16,11 @@ export default async function init(sdk) {
   });
 
   // Defer path: async handler does work, then returns the new payload.
+  // The 25ms wait is the assertion floor minus jitter; setTimeout(_, N) in
+  // Node can fire slightly before N ms (timer resolution + load), so a 10ms
+  // wait + ">= 10ms" assertion is flaky under contention.
   const sub3 = sdk.events.intercept("defer", async (name, payload) => {
-    await new Promise((r) => setTimeout(r, 10));
+    await new Promise((r) => setTimeout(r, 25));
     sdk.log("DEFER " + JSON.stringify(payload));
     return { ...payload, deferred: true };
   });
