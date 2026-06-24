@@ -258,13 +258,13 @@ GPU test calls `harness.mjs:nextXDisplay()` to claim a fresh display
 number per test (starting at 60), so the suite never collides with
 `:0` even when run interactively.
 
-Coverage today: 16 GPU tests (`test/xwayland-*.gpu.mjs`) and ~60
+Coverage today: 17 GPU tests (`test/xwayland-*.gpu.mjs`) and 64
 GPU-free unit tests (`test/xwayland-*.test.js`) across server lifecycle,
 shell serial registry, property parsers, configure round-trip,
 override-redirect placement, focus mirror, ICCCM truth table, the
 resize-tx buffer-dims-only variant, the MIME↔atom translation table,
-and the selection bridge end-to-end in both directions (small payload +
-INCR >64 KiB).
+the selection bridge end-to-end in both directions (small payload +
+INCR >64 KiB), and the TIMESTAMP-target reply path.
 
 The selection-bridge end-to-end tests need a Wayland clipboard test
 client and a small purpose-built X11 selection client

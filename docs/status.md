@@ -8,11 +8,13 @@ specific subsystem.
 
 Last updated: 2026-06-23. Most recent landings: Xwayland Phase 4
 (CLIPBOARD + PRIMARY selection bridge, both directions, with INCR for
->64 KiB payloads; xcb-xfixes integration; 5 new GPU tests including
-two INCR end-to-end). Prior: M7 steps 4 + 5 (JS hotplug handlers,
-workspace migration on `output.added`/`removed` with durable-identifier
-reclaim, cross-fd race fix moving `ScanoutReserve`/`ScanoutReady` to
-the wire socket -- hardware-verified two-monitor unplug/replug).
+>64 KiB payloads; xcb-xfixes integration; 6 new selection GPU tests
+including two INCR end-to-end + TIMESTAMP-target reply; one
+wl->X INCR continuation-race fix). Prior: M7 steps 4 + 5 (JS hotplug
+handlers, workspace migration on `output.added`/`removed` with durable-
+identifier reclaim, cross-fd race fix moving `ScanoutReserve`/
+`ScanoutReady` to the wire socket -- hardware-verified two-monitor
+unplug/replug).
 
 ## Read first: gaps in advertised protocols (silent-gap risks)
 
@@ -676,7 +678,7 @@ validated + resolved + consumed by the runtime + hotkey plugin.
   wiring: `config.xwayland.enabled` (default false) opts in;
   `config.xwayland.displayNumber` (default 50) selects the X display.
   Autopick rejected upstream (would otherwise steal `:0` from a live
-  host session). 16 GPU tests + ~60 GPU-free unit tests cover the
+  host session). 17 GPU tests + 64 GPU-free unit tests cover the
   surface. DnD is Phase 5. See `docs/xwayland-design.md`.
   Known limitations:
   - `_NET_WM_STATE_FOCUSED` writes replace the whole `_NET_WM_STATE`
