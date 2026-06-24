@@ -2407,9 +2407,27 @@ export class JsCompositor implements CompositorSink {
   // so the on-wire layout is [begin...][sample submit batch][end...] --
   // every bracket is open by the time the GPU process's HandleCommands
   // decodes the samples.
+  // `tickleLifecycle` (default true) drives the per-buffer lifecycle's
+  // frameSampled event. The on-screen renderFrame wraps these calls in a
+  // matching frameStart/submitted pair, so the lifecycle's begin/end
+  // alternation is intact. Snapshot callers (composeSnapshot via
+  // composeScene/composeWindows, capture frames) do NOT run inside a
+  // lifecycle frame; the comment above composeSnapshot explicitly says
+  // the lifecycle state machine is not driven by snapshots, so they pass
+  // false to skip the lifecycle dispatch. The WIRE-level Begin/End is
+  // still written (snapshot dmabuf samples still need bracketing on the
+  // GPU process side; that's what the dedupe + writeBeginAccess/EndAccess
+  // do), but the JS-side lifecycle bookkeeping is bypassed so a snapshot
+  // taken outside a renderFrame doesn't trip "frameSampled without
+  // frameStart". Without this gate a snapshot pre-existing renderFrame
+  // wrote Begin to the wire, then threw inside lifecycle.step before the
+  // bracketed[] entry was pushed, leaving a wire bracket open with no End
+  // pairing -- which the GPU process detected on the next renderFrame's
+  // Begin as "bracket already open" and aborted.
   private openImportBrackets(
     drawList: number[],
     bracketed: Array<{ importId: number; bufferId: number }>,
+    tickleLifecycle = true,
   ): void {
     for (const id of drawList) {
       const s = this.surfaces.get(id);
@@ -2457,7 +2475,9 @@ export class JsCompositor implements CompositorSink {
           `dmabufImports gate / core handle map desync`,
         );
       }
-      this.dispatch(this.lifecycle.step({ kind: "frameSampled", surfaceId: id }));
+      if (tickleLifecycle) {
+        this.dispatch(this.lifecycle.step({ kind: "frameSampled", surfaceId: id }));
+      }
       bracketed.push({ importId: imp.importId, bufferId: s.currentBufferId });
     }
   }
@@ -2470,13 +2490,16 @@ export class JsCompositor implements CompositorSink {
   // process and is chained intra-process).
   private closeImportBrackets(
     bracketed: ReadonlyArray<{ importId: number; bufferId: number }>,
+    tickleLifecycle = true,
   ): void {
     for (const { importId, bufferId } of bracketed) {
       this.addon.writeEndAccess(importId);
-      this.dispatch(this.lifecycle.step({
-        kind: "endAccessFenceExported", bufferId,
-        fence: { kind: "syncFile", fd: -1 },
-      }));
+      if (tickleLifecycle) {
+        this.dispatch(this.lifecycle.step({
+          kind: "endAccessFenceExported", bufferId,
+          fence: { kind: "syncFile", fd: -1 },
+        }));
+      }
     }
   }
 
@@ -2908,8 +2931,13 @@ export class JsCompositor implements CompositorSink {
     placements?: Map<number, { x: number; y: number; w: number; h: number }>;
     cropUV?: Map<number, { u0: number; v0: number; u1: number; v1: number }>;
   }): void {
+    // tickleLifecycle=false: a snapshot is not on the on-screen lifecycle
+    // frame's submit serial chain; driving frameSampled/endAccessFenceExported
+    // outside a frameStart/submitted pair would throw and leave the wire
+    // brackets unpaired. The WIRE-level Begin/End still fires so the GPU
+    // process's per-texture bracket stays balanced.
     const bracketed: Array<{ importId: number; bufferId: number }> = [];
-    this.openImportBrackets(args.drawList, bracketed);
+    this.openImportBrackets(args.drawList, bracketed, /*tickleLifecycle*/ false);
     try {
       const enc = this.device.createCommandEncoder();
       this.composite({
@@ -2922,7 +2950,7 @@ export class JsCompositor implements CompositorSink {
       });
       this.device.queue.submit([enc.finish()]);
     } finally {
-      this.closeImportBrackets(bracketed);
+      this.closeImportBrackets(bracketed, /*tickleLifecycle*/ false);
     }
   }
 
@@ -3375,8 +3403,13 @@ export class JsCompositor implements CompositorSink {
     // GPU process needs to know about). Use the same import-bracket
     // mechanism the on-screen frame uses: openImportBrackets ->
     // copy -> closeImportBrackets.
+    // tickleLifecycle=false: this copy runs as a post-on-screen-submit
+    // callback, outside the on-screen lifecycle frame; the wire-level
+    // bracket still has to fire (the GPU process needs the per-texture
+    // BeginAccess) but the JS-side frameSampled would throw without an
+    // open frameStart.
     const bracketed: Array<{ importId: number; bufferId: number }> = [];
-    this.openImportBrackets([args.surfaceId], bracketed);
+    this.openImportBrackets([args.surfaceId], bracketed, /*tickleLifecycle*/ false);
     try {
       const enc = this.device.createCommandEncoder();
       enc.copyTextureToTexture(
@@ -3386,7 +3419,7 @@ export class JsCompositor implements CompositorSink {
       );
       this.device.queue.submit([enc.finish()]);
     } finally {
-      this.closeImportBrackets(bracketed);
+      this.closeImportBrackets(bracketed, /*tickleLifecycle*/ false);
     }
     return true;
   }
