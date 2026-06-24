@@ -17,6 +17,15 @@
 //       "[x11-selection] received-summary len=N sum32=H"  (--summary)
 //     and exit.
 //
+//   --paste-target  CLIPBOARD|PRIMARY <target-atom-name>
+//     ConvertSelection on an arbitrary target atom (e.g. TARGETS,
+//     TIMESTAMP). Prints a structured line per result:
+//       "[x11-selection] target=<NAME> type=<ATOM-NAME> format=<N>
+//          len=<N> u32[0]=<DECIMAL>"
+//     where u32[0] is the first 32-bit value when format=32 (used
+//     for TIMESTAMP). Useful for exercising bridge code paths that
+//     are not data-MIME transfers.
+//
 // Common:
 //   --map         Create + map a 1x1 window so the X side has a focused
 //                 surface (focus is required for the bridge to mediate).
@@ -188,6 +197,89 @@ static int run_source(xcb_connection_t* c, xcb_screen_t* screen,
     return 0;
 }
 
+// ConvertSelection on an arbitrary target atom and print one line
+// describing the reply (type / format / length / first u32 if any).
+// Used by the test suite to exercise TIMESTAMP / TARGETS replies the
+// bridge produces without going through a MIME-data transfer.
+static int run_paste_target(xcb_connection_t* c, xcb_screen_t* screen,
+                            const char* selectionName,
+                            const char* targetName, int timeoutMs) {
+    xcb_window_t win = xcb_generate_id(c);
+    const uint32_t mask = XCB_EVENT_MASK_PROPERTY_CHANGE;
+    xcb_create_window(c, XCB_COPY_FROM_PARENT, win, screen->root,
+                      0, 0, 1, 1, 0, XCB_WINDOW_CLASS_INPUT_ONLY,
+                      screen->root_visual, XCB_CW_EVENT_MASK, &mask);
+    const xcb_atom_t SEL = intern_atom(c, selectionName);
+    const xcb_atom_t TARGET = intern_atom(c, targetName);
+    const xcb_atom_t DST = intern_atom(c, "_X_SEL_DATA");
+    if (SEL == 0 || TARGET == 0 || DST == 0) {
+        fprintf(stderr, "[x11-selection] atom intern failed\n");
+        return 1;
+    }
+    xcb_convert_selection(c, win, SEL, TARGET, DST, XCB_CURRENT_TIME);
+    xcb_flush(c);
+
+    const int fd = xcb_get_file_descriptor(c);
+    long elapsedMs = 0;
+    const int stepMs = 50;
+    while (elapsedMs < timeoutMs) {
+        struct pollfd p = { .fd = fd, .events = POLLIN };
+        poll(&p, 1, stepMs);
+        elapsedMs += stepMs;
+        xcb_generic_event_t* ev;
+        while ((ev = xcb_poll_for_event(c))) {
+            const uint8_t type = ev->response_type & 0x7f;
+            if (type == XCB_SELECTION_NOTIFY) {
+                xcb_selection_notify_event_t* sn =
+                    (xcb_selection_notify_event_t*)ev;
+                if (sn->property == 0) {
+                    printf("[x11-selection] target=%s refused\n", targetName);
+                    fflush(stdout);
+                    free(ev);
+                    return 0;
+                }
+                xcb_get_property_cookie_t pk = xcb_get_property(
+                    c, 1 /*delete*/, win, DST, 0, 0, 65536);
+                xcb_get_property_reply_t* pr = xcb_get_property_reply(c, pk, NULL);
+                if (!pr) {
+                    fprintf(stderr, "[x11-selection] GetProperty failed\n");
+                    free(ev);
+                    return 5;
+                }
+                int len = xcb_get_property_value_length(pr);
+                // Resolve the reply type atom to its name (best-effort).
+                xcb_get_atom_name_cookie_t nk = xcb_get_atom_name(c, pr->type);
+                xcb_get_atom_name_reply_t* nr =
+                    xcb_get_atom_name_reply(c, nk, NULL);
+                char typeBuf[128] = "<unknown>";
+                if (nr) {
+                    int nlen = xcb_get_atom_name_name_length(nr);
+                    if (nlen > (int)sizeof(typeBuf) - 1) nlen = sizeof(typeBuf) - 1;
+                    memcpy(typeBuf, xcb_get_atom_name_name(nr), (size_t)nlen);
+                    typeBuf[nlen] = '\0';
+                    free(nr);
+                }
+                uint32_t firstU32 = 0;
+                if (pr->format == 32 && len >= 4) {
+                    memcpy(&firstU32, xcb_get_property_value(pr), 4);
+                }
+                printf("[x11-selection] target=%s type=%s format=%u len=%d u32[0]=%u\n",
+                       targetName, typeBuf, (unsigned)pr->format, len, firstU32);
+                fflush(stdout);
+                free(pr); free(ev);
+                return 0;
+            }
+            free(ev);
+        }
+        if (xcb_connection_has_error(c)) {
+            fprintf(stderr, "[x11-selection] connection error\n");
+            return 3;
+        }
+    }
+    fprintf(stderr, "[x11-selection] paste-target timeout\n");
+    return 6;
+}
+
 // Print result: `--summary` (sum32 + len) or raw bytes (NUL-padded).
 static void emit_paste_result(int summary, const unsigned char* buf, size_t len,
                               uint32_t sum32) {
@@ -320,10 +412,11 @@ static int run_paste(xcb_connection_t* c, xcb_screen_t* screen,
 }
 
 int main(int argc, char** argv) {
-    int mode = 0;            // 0 = unset, 1 = source, 2 = paste
+    int mode = 0;            // 0 = unset, 1 = source, 2 = paste, 3 = paste-target
     const char* selectionName = "CLIPBOARD";
     const char* mime = "text/plain;charset=utf-8";
     const char* payload = "x-selection-test-payload";
+    const char* targetName = NULL;
     size_t patternBytes = 0;
     int summary = 0;
     int timeoutMs = 10000;
@@ -344,6 +437,10 @@ int main(int argc, char** argv) {
             mode = 2;
             selectionName = argv[++i];
             mime = argv[++i];
+        } else if (!strcmp(argv[i], "--paste-target") && i + 2 < argc) {
+            mode = 3;
+            selectionName = argv[++i];
+            targetName = argv[++i];
         } else if (!strcmp(argv[i], "--summary")) {
             summary = 1;
         } else if (!strcmp(argv[i], "--timeout-ms") && i + 1 < argc) {
@@ -357,7 +454,8 @@ int main(int argc, char** argv) {
     if (mode == 0) {
         fprintf(stderr,
             "usage: %s (--source SEL MIME PAYLOAD | --source-bytes SEL MIME N "
-            "| --paste SEL MIME [--summary])\n", argv[0]);
+            "| --paste SEL MIME [--summary] "
+            "| --paste-target SEL TARGET-ATOM)\n", argv[0]);
         return 1;
     }
 
@@ -374,5 +472,7 @@ int main(int argc, char** argv) {
 
     if (mode == 1) return run_source(c, screen, selectionName, mime, payload,
                                      patternBytes, timeoutMs, title, doMap);
+    if (mode == 3) return run_paste_target(c, screen, selectionName, targetName,
+                                           timeoutMs);
     return run_paste(c, screen, selectionName, mime, timeoutMs, summary);
 }

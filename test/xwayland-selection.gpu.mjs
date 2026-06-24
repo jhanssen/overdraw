@@ -200,6 +200,65 @@ test("wl -> X: a wl client claims CLIPBOARD; an X client paste reads the bytes",
     }
   });
 
+test("wl -> X: TIMESTAMP target returns the cached owner timestamp",
+  { skip, timeout: 30000 }, async () => {
+    const c = await setupBridge();
+    let focusKeeper, wlSource, xPaste;
+    try {
+      focusKeeper = spawnFocusKeeper(c.display);
+      await focusKeeper.waitForLine(/\[x11\] mapped/, { what: "focus-keeper mapped" });
+      await waitFor(c.query,
+        (s) => s.windows.some((w) => w.role === "xwayland"),
+        { timeoutMs: 8000, what: "X window in WM" });
+      const snap = await c.query();
+      const xwin = snap.windows.find((w) => w.role === "xwayland");
+      c.state.seat?.applyKeyboardFocus(xwin.surfaceId);
+      await sleep(200);
+
+      // A wl source claims CLIPBOARD so the bridge takes X ownership.
+      wlSource = spawn(CLIP,
+        ["--socket", c.sock, "--source", MIME, "timestamp-test"],
+        { stdio: ["ignore", "pipe", "pipe"] });
+      let wlSrcOut = "";
+      wlSource.stdout.on("data", (d) => { wlSrcOut += d.toString(); });
+      wlSource.stderr.on("data", (d) => { wlSrcOut += d.toString(); });
+      const dl = Date.now() + 5000;
+      while (Date.now() < dl && !/selection set/.test(wlSrcOut)) await sleep(25);
+      // The bridge caches ownerTimestamp from its own xfixes self-notify; give
+      // that round-trip time to land.
+      await sleep(200);
+
+      // X requestor asks the bridge to convert CLIPBOARD to TIMESTAMP.
+      xPaste = spawnX11(X11_SEL,
+        ["--paste-target", "CLIPBOARD", "TIMESTAMP", "--timeout-ms", "5000"],
+        c.display);
+      await xPaste.waitForLine(/target=TIMESTAMP /, {
+        what: "x paste-target reply",
+        timeoutMs: 5000,
+      });
+      const m = xPaste.stdout.match(
+        /target=TIMESTAMP type=(\S+) format=(\d+) len=(\d+) u32\[0\]=(\d+)/);
+      assert.ok(m, `paste-target did not print structured reply; stdout was:\n${xPaste.stdout}`);
+      const replyType = m[1];
+      const format = Number(m[2]);
+      const len = Number(m[3]);
+      const value = Number(m[4]);
+      assert.equal(replyType, "INTEGER",
+        `TIMESTAMP reply type expected INTEGER, got ${replyType}`);
+      assert.equal(format, 32, `TIMESTAMP reply format expected 32, got ${format}`);
+      assert.equal(len, 4, `TIMESTAMP reply length expected 4 bytes, got ${len}`);
+      // The bridge caches ownerTimestamp from xfixes self-notify; X assigns
+      // a monotonic non-zero timestamp. A zero value would mean the cache
+      // wasn't populated.
+      assert.ok(value > 0, `TIMESTAMP value expected > 0, got ${value}`);
+    } finally {
+      if (xPaste) try { xPaste.child.kill("SIGKILL"); } catch { /* ignore */ }
+      if (wlSource) try { wlSource.kill("SIGKILL"); } catch { /* ignore */ }
+      if (focusKeeper) try { focusKeeper.child.kill("SIGKILL"); } catch { /* ignore */ }
+      await c.teardown();
+    }
+  });
+
 test("wl -> X: PRIMARY selection round-trips",
   { skip, timeout: 30000 }, async () => {
     const c = await setupBridge();
