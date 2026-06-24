@@ -20,7 +20,7 @@ import type { ZxdgOutputManagerV1Handler } from "#protocols-gen/zxdg_output_mana
 import type { ZxdgOutputV1Handler } from "#protocols-gen/zxdg_output_v1.js";
 
 import type { Ctx, CompositorState, OutputRecord } from "./ctx.js";
-import type { Resource } from "../types.js";
+import type { Addon, Resource } from "../types.js";
 import { resolveWlOutputToId, primaryOutputId } from "./output-resolve.js";
 
 void outputSig;
@@ -46,14 +46,22 @@ function trackedSet(state: CompositorState, outputId: number): Set<Resource> {
 }
 
 function emitTo(
-  events: import("../types.js").EventsByInterface,
+  ctx: Ctx,
   resource: Resource,
   rec: OutputRecord,
 ): void {
+  const events = ctx.events;
+  // X-backed clients see an oversized world: multiply the logical position
+  // and size by the global X scale so the X client's "device coords" match
+  // what we send it for window configures / pointer events. See
+  // docs/xwayland-design.md "HiDPI".
+  const cid = ctx.addon.clientId(resource);
+  const isX = ctx.state.xwaylandClientIds?.has(cid) ?? false;
+  const xn = isX ? (ctx.state.xwaylandScale ?? 1) : 1;
   events.zxdg_output_v1.send_logical_position(
-    resource, rec.logicalPosition.x, rec.logicalPosition.y);
+    resource, rec.logicalPosition.x * xn, rec.logicalPosition.y * xn);
   events.zxdg_output_v1.send_logical_size(
-    resource, rec.logicalSize.width, rec.logicalSize.height);
+    resource, rec.logicalSize.width * xn, rec.logicalSize.height * xn);
   events.zxdg_output_v1.send_name(resource, rec.name);
   events.zxdg_output_v1.send_description(resource, rec.description);
   // xdg_output.done was deprecated in v3 -- clients bound at v3+ derive
@@ -70,15 +78,18 @@ function emitTo(
 // Re-emit the full event burst to every bound xdg_output_v1 resource for
 // the given output id. Destroyed resources are removed from the tracking
 // set in-line. Silent no-op if state.events isn't populated yet (mid-bringup).
-export function reemitXdgOutput(state: CompositorState, outputId: number): void {
+export function reemitXdgOutput(
+  state: CompositorState, addon: Addon, outputId: number,
+): void {
   const set = state.xdgOutputResources?.get(outputId);
   if (!set || set.size === 0) return;
   if (!state.events) return;
   const rec = state.outputs?.get(outputId);
   if (!rec) return;
+  const ctx: Ctx = { events: state.events, state, addon };
   for (const resource of [...set]) {
     if (resource.destroyed) { set.delete(resource); continue; }
-    emitTo(state.events, resource, rec);
+    emitTo(ctx, resource, rec);
   }
 }
 
@@ -91,7 +102,7 @@ export default function makeXdgOutputManager(ctx: Ctx): ZxdgOutputManagerV1Handl
       const rec = outputFor(ctx, output);
       if (!rec) return;
       trackedSet(ctx.state, rec.id).add(id);
-      emitTo(ctx.events, id, rec);
+      emitTo(ctx, id, rec);
       // GTK <= 4.22 derives the monitor scale as wl_output mode size /
       // xdg_output logical size, but recomputes it ONLY on wl_output.done.
       // wl_output.done was already sent at bind -- before this xdg_output's

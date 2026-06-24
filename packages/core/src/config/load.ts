@@ -192,7 +192,7 @@ function normalize(raw: unknown, path: string): ResolvedConfig {
   // the typical 0-9 range used by primary sessions); explicit null opts into
   // Xwayland's autopick from :0 upward.
   let xwayland: ResolvedConfig["xwayland"] =
-    { enabled: false, terminate: false, xwaylandPath: null, displayNumber: 50 };
+    { enabled: false, terminate: false, xwaylandPath: null, displayNumber: 50, scale: 0 };
   if (cfg.xwayland !== undefined) {
     const x = cfg.xwayland;
     if (x === null || typeof x !== "object") fail("`xwayland` must be an object", path);
@@ -211,11 +211,17 @@ function normalize(raw: unknown, path: string): ResolvedConfig {
             || (x.displayNumber as number) > 65535)) {
       fail("`xwayland.displayNumber` must be a non-negative integer (or null for autopick)", path);
     }
+    if (x.scale !== undefined
+        && (!Number.isInteger(x.scale) || (x.scale as number) < 0
+            || (x.scale as number) > 3)) {
+      fail("`xwayland.scale` must be an integer in 0..3 (0=auto)", path);
+    }
     xwayland = {
       enabled: x.enabled ?? false,
       terminate: x.terminate ?? false,
       xwaylandPath: x.xwaylandPath ?? null,
       displayNumber: x.displayNumber === undefined ? 50 : x.displayNumber,
+      scale: x.scale ?? 0,
     };
   }
 
@@ -234,7 +240,7 @@ export async function loadConfig(explicit: string | null): Promise<ResolvedConfi
       output: null, card: null, scale: null, outputsByKey: {},
       focus: undefined, hotkeys: undefined,
       decoration: undefined, actions: undefined, plugins: [],
-      xwayland: { enabled: false, terminate: false, xwaylandPath: null, displayNumber: 50 },
+      xwayland: { enabled: false, terminate: false, xwaylandPath: null, displayNumber: 50, scale: 0 },
       sourcePath: null,
     };
   }

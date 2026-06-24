@@ -613,9 +613,14 @@ export default function makeSeat(ctx: Ctx, driver: FocusDriver): SeatHandler {
         // geometry rect declares a sub-region of the buffer, so the
         // visible top-left of the window corresponds to surface-local
         // (geom.x, geom.y), not (0, 0). Add the offset back.
+        // For X clients the surface buffer is oversized by the global X
+        // scale (see docs/xwayland-design.md "HiDPI"); the X client's
+        // surface-local frame is in those oversized pixels, so multiply.
         const goff = surfaceGeometryOffset(ctx, hit.surfaceRec.resource);
-        const sx = (x - hit.rect.x) + goff.x;
-        const sy = (y - hit.rect.y) + goff.y;
+        const hitRole = ctx.state.surfacesById?.get(hit.surfaceId)?.role;
+        const xn = hitRole === "xwayland" ? (ctx.state.xwaylandScale ?? 1) : 1;
+        const sx = ((x - hit.rect.x) + goff.x) * xn;
+        const sy = ((y - hit.rect.y) + goff.y) * xn;
         if (!seat.focus) {
           seat.focus = hit;
           sendEnter(hit, sx, sy);

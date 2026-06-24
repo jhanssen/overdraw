@@ -32,6 +32,7 @@ import {
   type PropertyAtoms,
   type PropertyReply,
 } from "./properties.js";
+import { xwaylandScaleOf } from "./scale.js";
 
 export interface XwmEventMsg {
   type:
@@ -260,13 +261,19 @@ export function startXwm(state: CompositorState, addon: Addon, wmFd: number): Xw
   // Override-redirect placement: record the X-supplied rect in
   // state.overrideRedirects so the content-layer stack rebuild
   // (xdg_popup.ts:appendOverrideRedirects) emits a setSurfaceLayout for
-  // each OR overlay alongside the popup chain. Identity-mapped: X-root
-  // coords == compositor logical coords in rootless mode (single global
-  // root rect).
+  // each OR overlay alongside the popup chain. The XWindow holds X-root
+  // coords (device pixels at the X side's oversized view); divide by the
+  // global X scale to land in compositor logical coords.
   function placeOverlay(w: XWindow): void {
     if (!w.overrideRedirect || !w.mapped || w.surfaceId === null) return;
     const ors = (state.overrideRedirects ??= new Map());
-    ors.set(w.surfaceId, { x: w.x, y: w.y, width: w.width, height: w.height });
+    const n = xwaylandScaleOf(state);
+    ors.set(w.surfaceId, {
+      x: Math.round(w.x / n),
+      y: Math.round(w.y / n),
+      width: Math.round(w.width / n),
+      height: Math.round(w.height / n),
+    });
     rebuildStackWithPopups(state);
   }
 
@@ -458,16 +465,22 @@ export function startXwm(state: CompositorState, addon: Addon, wmFd: number): Xw
       case "configure-request": {
         // Managed windows: the compositor is authoritative -- reply with
         // the WM's current rect (and a synthetic ConfigureNotify per ICCCM
-        // §4.2.3) instead of honoring the client's request.
+        // §4.2.3) instead of honoring the client's request. The WM rect
+        // is in compositor logical coords; multiply by the global X scale
+        // to land in X-device coords for the wire.
         // Override-redirect: the X client positions menus/tooltips itself;
-        // honor the request, update our tracked rect, and re-place the
-        // overlay so the compositor draws it at the new coords.
+        // honor the request (X coords passed through), update our tracked
+        // rect (also X coords), and re-place the overlay so the compositor
+        // draws it at the new coords.
+        const n = xwaylandScaleOf(state);
         const w = windows.get(ev.window);
         if (w && w.addedToWm && w.surfaceId !== null) {
           const r = state.wm?.rectOf(w.surfaceId);
           if (r) {
-            addon.xwmConfigureWindow(ev.window, r.x, r.y, r.width, r.height);
-            addon.xwmSendConfigureNotify(ev.window, r.x, r.y, r.width, r.height);
+            const xx = r.x * n, xy = r.y * n;
+            const xw = r.width * n, xh = r.height * n;
+            addon.xwmConfigureWindow(ev.window, xx, xy, xw, xh);
+            addon.xwmSendConfigureNotify(ev.window, xx, xy, xw, xh);
             break;
           }
         }

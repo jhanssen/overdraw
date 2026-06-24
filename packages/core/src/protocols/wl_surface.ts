@@ -234,6 +234,17 @@ function applySurfaceState(ctx: Ctx, s: SurfaceRecord): void {
   // Damage is consumed by the upload; the next commit re-accumulates it.
   s.committed.surfaceDamage = undefined;
   s.committed.bufferDamage = undefined;
+  // X clients never call wl_surface.set_buffer_scale; the compositor lies
+  // to the X side about pixel sizes by the global X scale (see
+  // docs/xwayland-design.md "HiDPI") so the X buffer arrives oversized by
+  // that factor. Stamp it as bufferScale=N so the composite path divides
+  // back down to the right logical intrinsic size. Also propagate to
+  // s.committed.bufferScale so the surface-damage scaling path
+  // (currentScaledDamage) sees the same value.
+  if (s.role === "xwayland") {
+    const n = ctx.state.xwaylandScale ?? 1;
+    if (n !== 1) s.committed.bufferScale = n;
+  }
   ctx.state.compositor.setSurfaceBufferScale?.(s.id, s.committed.bufferScale ?? 1);
   ctx.state.compositor.setSurfaceBufferTransform?.(s.id, s.committed.bufferTransform ?? 0);
   // xdg_surface.set_window_geometry: push the declared "window" sub-

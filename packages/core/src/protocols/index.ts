@@ -291,8 +291,13 @@ export async function installProtocols(
       if (rec?.role === "xwayland") {
         const xw = state.xwm?.findBySurfaceId(surfaceId);
         if (xw) {
-          addon.xwmConfigureWindow(xw.window, x, y, w, h);
-          addon.xwmSendConfigureNotify(xw.window, x, y, w, h);
+          // The WM rect (x,y,w,h) is in compositor logical coords;
+          // multiply by the frozen global X scale to land in X-device
+          // coords. See docs/xwayland-design.md "HiDPI".
+          const n = state.xwaylandScale ?? 1;
+          const xx = x * n, xy = y * n, xw2 = w * n, xh2 = h * n;
+          addon.xwmConfigureWindow(xw.window, xx, xy, xw2, xh2);
+          addon.xwmSendConfigureNotify(xw.window, xx, xy, xw2, xh2);
         }
         return null;
       }
@@ -310,8 +315,10 @@ export async function installProtocols(
       if (rec?.role !== "xwayland") return;
       const xw = state.xwm?.findBySurfaceId(surfaceId);
       if (!xw) return;
-      addon.xwmConfigureWindow(xw.window, x, y, w, h);
-      addon.xwmSendConfigureNotify(xw.window, x, y, w, h);
+      const n = state.xwaylandScale ?? 1;
+      const xx = x * n, xy = y * n, xw2 = w * n, xh2 = h * n;
+      addon.xwmConfigureWindow(xw.window, xx, xy, xw2, xh2);
+      addon.xwmSendConfigureNotify(xw.window, xx, xy, xw2, xh2);
     },
   };
   // The WM delegates its stack push to the full rebuild (windows interleaved with

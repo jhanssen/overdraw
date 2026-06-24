@@ -203,6 +203,32 @@ test('plugin restart-policy fields: defaults, overrides, and validation', async 
   rmSync(dir, { recursive: true, force: true });
 });
 
+test('xwayland.scale: defaults to 0 (auto), accepts 0..3, rejects others', async () => {
+  const dir = tmp();
+  const write = (src) => {
+    const p = join(dir, `cfg-${Math.random().toString(36).slice(2)}.mjs`);
+    writeFileSync(p, src);
+    return p;
+  };
+  // Default (no config block): scale = 0.
+  let c = await loadConfig(write('export default {}'));
+  assert.equal(c.xwayland.scale, 0);
+  // Default (xwayland block present but scale omitted): scale = 0.
+  c = await loadConfig(write('export default { xwayland: { enabled: true } }'));
+  assert.equal(c.xwayland.scale, 0);
+  // Explicit 0..3 accepted.
+  for (const n of [0, 1, 2, 3]) {
+    c = await loadConfig(write(`export default { xwayland: { scale: ${n} } }`));
+    assert.equal(c.xwayland.scale, n);
+  }
+  // Out of range / non-integer rejected.
+  for (const bad of ['-1', '4', '1.5', '"2"']) {
+    await assert.rejects(() => loadConfig(write(
+      `export default { xwayland: { scale: ${bad} } }`)), /xwayland\.scale/);
+  }
+  rmSync(dir, { recursive: true, force: true });
+});
+
 test('XDG resolution probes config.* and loads it', async () => {
   const base = tmp();
   mkdirSync(join(base, 'overdraw'), { recursive: true });

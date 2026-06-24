@@ -82,3 +82,56 @@ test("xwm: WM-chosen rect reaches the X client via synthetic ConfigureNotify",
       await c.teardown();
     }
   });
+
+test("xwm: with global X scale=2, the X client sees doubled configure dims",
+  { skip, timeout: 30000 }, async () => {
+    const c = await setupCompositor();
+    let handle;
+    let xwm;
+    let child;
+    try {
+      handle = await startXwayland(c.addon, {
+        waylandDisplay: c.sock, enableWm: true, displayNumber: nextXDisplay(),
+      });
+      // Freeze the global X scale BEFORE startXwm so the XWM and the
+      // ConfigureSink router see the same value. Production wires this
+      // through main.ts (resolveXwaylandScale + config.xwayland.scale);
+      // here we set it directly.
+      c.state.xwaylandScale = 2;
+      xwm = startXwm(c.state, c.addon, handle.wmFd);
+
+      // The WM tiles the X window to the full output (1280x720 logical).
+      // With X scale=2, the synthetic ConfigureNotify must carry the
+      // doubled (X-device) dims: 2560x1440.
+      let stdout = "";
+      child = execFile(X11_CLIENT,
+        ["--title", "configure-scale-test", "--timeout-ms", "20000"],
+        { env: { ...process.env, DISPLAY: handle.display } });
+      child.stdout?.on("data", (d) => { stdout += d.toString(); });
+
+      // Wait for the WM-side window snapshot (still in compositor logical
+      // coords).
+      await waitFor(c.query,
+        (s) => s.windows.some((w) =>
+          w.role === "xwayland" && w.rect.width === 1280 && w.rect.height === 720),
+        { timeoutMs: 8000, what: "xwayland window tiled to full output (logical)" });
+
+      // The X client must see the doubled dims (X-device coords).
+      const deadline = Date.now() + 5000;
+      let configureLine = null;
+      while (Date.now() < deadline) {
+        const lines = stdout.split("\n");
+        configureLine = lines.find((l) =>
+          l.includes("[x11] configure synthetic") && l.includes("w=2560") && l.includes("h=1440"));
+        if (configureLine) break;
+        await new Promise((r) => setTimeout(r, 50));
+      }
+      assert.ok(configureLine,
+        `expected synthetic ConfigureNotify with w=2560 h=1440 (scale=2); saw stdout:\n${stdout}`);
+    } finally {
+      if (child && child.exitCode === null) child.kill("SIGKILL");
+      if (xwm) xwm.stop();
+      if (handle) c.addon.xwaylandStop(handle.pid);
+      await c.teardown();
+    }
+  });

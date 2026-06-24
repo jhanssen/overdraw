@@ -138,6 +138,53 @@ test("an OR overlay surface is focusable (focusTargetFor resolves it)",
     }
   });
 
+test("with global X scale=2, an OR window's X coords land halved (compositor logical)",
+  { skip, timeout: 30000 }, async () => {
+    const c = await setupCompositor();
+    let handle;
+    let xwm;
+    let child;
+    try {
+      handle = await startXwayland(c.addon, {
+        waylandDisplay: c.sock, enableWm: true, displayNumber: nextXDisplay(),
+      });
+      // Freeze X scale=2 before the XWM starts so placeOverlay divides by
+      // the right number.
+      c.state.xwaylandScale = 2;
+      xwm = startXwm(c.state, c.addon, handle.wmFd);
+
+      // OR at X (400, 200) 200x100 -- in X-device coords. With X scale=2
+      // the compositor's logical rect must be (200, 100, 100, 50).
+      child = execFile(X11_CLIENT, [
+        "--override-redirect",
+        "--x", "400", "--y", "200", "--w", "200", "--h", "100",
+        "--title", "or-scaled",
+        "--timeout-ms", "20000",
+      ], { env: { ...process.env, DISPLAY: handle.display } });
+
+      const overrideRedirects = () => c.state.overrideRedirects ?? new Map();
+      await new Promise((resolve, reject) => {
+        const deadline = Date.now() + 8000;
+        const tick = () => {
+          if (overrideRedirects().size >= 1) return resolve();
+          if (Date.now() > deadline) return reject(new Error(
+            `OR overlay never appeared; state.overrideRedirects=${JSON.stringify([...overrideRedirects()])}`));
+          setTimeout(tick, 50);
+        };
+        tick();
+      });
+
+      const [, rect] = [...overrideRedirects().entries()][0];
+      assert.deepEqual(rect, { x: 200, y: 100, width: 100, height: 50 },
+        `OR rect halved by X scale=2 (X-device (400,200) 200x100 -> logical (200,100) 100x50); saw ${JSON.stringify(rect)}`);
+    } finally {
+      if (child && child.exitCode === null) child.kill("SIGKILL");
+      if (xwm) xwm.stop();
+      if (handle) c.addon.xwaylandStop(handle.pid);
+      await c.teardown();
+    }
+  });
+
 test("destroying an OR window cleans up state.overrideRedirects",
   { skip, timeout: 30000 }, async () => {
     const c = await setupCompositor();

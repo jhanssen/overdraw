@@ -137,11 +137,16 @@ export interface OverdrawConfig {
   // explicit display (default 50, well outside the typical 0-9 range used
   // by primary sessions); set null to let Xwayland autopick from :0 upward
   // (NOT recommended on a host with an existing X session).
+  // `scale` (integer 0..3) picks the global Xwayland scale (see
+  // docs/xwayland-design.md "HiDPI"). 0 = auto: ceil(max(output.scale)) at
+  // Xwayland start, clamped to [1,3]. 1..3 = explicit. Frozen for the
+  // Xwayland session; output hotplug after start does not change it.
   xwayland?: {
     enabled?: boolean;
     terminate?: boolean;
     xwaylandPath?: string;
     displayNumber?: number | null;
+    scale?: number;
   };
 }
 
@@ -214,6 +219,8 @@ export interface ResolvedConfig {
     terminate: boolean;
     xwaylandPath: string | null;
     displayNumber: number | null;
+    // 0 = auto (ceil(max output scale) at start, clamped to [1,3]); 1..3 = explicit.
+    scale: number;
   };
   // Absolute path of the config file that was loaded, or null if none was found
   // (built-in defaults in effect).

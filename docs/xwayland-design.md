@@ -110,13 +110,68 @@ Wayland progress.
 
 ## HiDPI
 
-X11 has no per-window scale. v1 takes the standard compromise: present
-X clients at a single global scale (config-driven), upscaling
-non-cooperating clients — correct size, soft at scale > 1, exactly as
-overdraw already treats non-scale-aware Wayland clients. Per-window /
+X11 has no per-window scale. overdraw takes the single-global-integer
+compromise that every Xwayland-hosting compositor lands on. Per-window /
 per-output fractional scaling of X apps is a known hard limitation
-across all compositors. The global-scale knob itself is not wired yet;
-v1 ships at scale=1.
+across the ecosystem and is out of scope.
+
+**Effective scale.** One integer per Xwayland session, in `[1,3]`. The
+config knob `config.xwayland.scale` selects it:
+
+- `0` (default) → auto: `ceil(max(output.scale))` over the outputs
+  present when Xwayland starts.
+- `1..3` → explicit override.
+
+The scale is computed once at Xwayland start and frozen for the session.
+Output hotplug after start changes nothing on the X side: a new monitor
+with a higher scale leaves X clients soft on that monitor until Xwayland
+is restarted. Restart-on-scale-change is intentionally not wired — it
+would kill every X client, which is more disruptive than the blur.
+
+**What "effective scale = N" means on the wire (path A — the only path
+implemented).** The X client sees an oversized world. The compositor
+lies to it about pixel sizes and coordinates by a factor of N; the X
+client renders into a buffer of that oversized size; the compositor
+treats that buffer as a wayland surface with `bufferScale = N` so the
+existing composite path renders it at the right *logical* size. The
+seams:
+
+- **Configure to X.** The WM-chosen logical rect `(x, y, w, h)` is
+  multiplied by N before reaching `xwmConfigureWindow` /
+  `xwmSendConfigureNotify`. X clients react by drawing at `N*w × N*h`.
+- **X surface bufferScale.** On surface association
+  (`xwayland_shell_v1.set_serial`), the wl surface is forced to
+  `bufferScale = N`. X clients never call `wl_surface.set_buffer_scale`;
+  the compositor sets it synthetically. The existing composite path
+  divides buffer dims by `bufferScale` to get intrinsic logical size,
+  so the oversized X buffer ends up drawn at the correct logical size.
+- **X → compositor coords** (`configure-notify`, override-redirect
+  placement, ICCCM size hints): divided by N.
+- **Compositor → X coords** (`configure-request` reply, pointer
+  surface-local coords sent to X clients, DnD enter/motion): multiplied
+  by N.
+- **`xdg_output` for X-backed clients** reports `logical_position *
+  N`, `logical_size * N` so the X client sees an output of its own
+  "device" pixels. `wl_output` for X-backed clients is unchanged
+  (Xwayland uses its own X-side RANDR view, not `wl_output`).
+
+Trade-offs versus the "do nothing, let the renderer filter upscale"
+approach (what wlroots-based compositors ship by default):
+
+- Pro: toolkit-aware X clients (Qt with `QT_AUTO_SCREEN_SCALE_FACTOR`,
+  GTK with `GDK_SCALE`, recent Chromium / Firefox / Electron) render
+  crisp at the higher scale because they actually paint more pixels.
+- Pro: non-cooperating X clients still get the right *logical* size;
+  the compositor downscales their oversized buffer instead of
+  upscaling a small one. End result is the same blur but starting from
+  more pixels, not fewer.
+- Con: every X client gets the same N. On a mixed-DPI setup the lower-
+  scale monitor wastes some pixels.
+- Con: `Xft.dpi` / `RESOURCE_MANAGER` writes are out of scope. X
+  clients that key off Xft.dpi for font sizing (older GTK2, Tk, some
+  Java toolkits) will not pick up the scale. This is a known gap; if
+  it bites in practice, the fix is a separate small piece of work
+  inside the XWM.
 
 ## Phase 4 — clipboard / selection bridge (landed)
 

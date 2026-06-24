@@ -484,6 +484,19 @@ export interface CompositorState {
   // can pair X11 windows to the surfaces Xwayland created. Created lazily by
   // the shell handler; logic lives in src/xwayland/surface.ts.
   xwayland?: import("../xwayland/surface.js").XwaylandSurfaceState;
+  // Global integer scale for the Xwayland session (1..3). The X client sees an
+  // oversized world: compositor logical coords/sizes are multiplied by this
+  // before reaching X and X coords/sizes are divided by it on the way back.
+  // The X surface's wl_buffer is treated as bufferScale=N so the composite
+  // path renders it at the right logical size. Set by main.ts before
+  // startXwm. Defaults to 1 (i.e. behaves as before for callers that never
+  // set it -- GPU-free tests, etc.). See docs/xwayland-design.md "HiDPI".
+  xwaylandScale?: number;
+  // wl_client ids whose connection has bound xwayland_shell_v1 at least
+  // once. Used by xdg_output to multiply logical_position / logical_size
+  // by xwaylandScale for those clients (they think in X device-pixel
+  // coords). Populated by the xwayland_shell_v1 bind path.
+  xwaylandClientIds?: Set<number>;
   // Narrow read-only view of the active XWM (when startXwm has run). Used by
   // query.titleAppId and the close path to look up X-backed windows by
   // surfaceId without taking a dep on the full Xwm shape. Cleared on

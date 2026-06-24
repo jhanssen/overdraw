@@ -15,7 +15,10 @@ function makeCtx() {
   const ctx = {
     state: { surfaces },
     events: {},
-    addon: { postError: (_resource, code, msg) => errorCalls.push([code, msg]) },
+    addon: {
+      postError: (_resource, code, msg) => errorCalls.push([code, msg]),
+      clientId: (_resource) => 1,
+    },
   };
   return { ctx, errorCalls, surfaces };
 }

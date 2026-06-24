@@ -155,7 +155,7 @@ test("reemitXdgOutput re-sends the full burst to every bound resource", () => {
   const rec = ctx.state.outputs.get(0);
   rec.logicalSize = { width: 2400, height: 1300 };
   rec.scale = 2;
-  reemitXdgOutput(ctx.state, 0);
+  reemitXdgOutput(ctx.state, ctx.addon, 0);
   // Both resources should receive the burst again (5 events each).
   const kinds = ctx._calls.map(([k]) => k);
   assert.deepEqual(kinds,
@@ -179,7 +179,7 @@ test("reemitXdgOutput skips destroyed resources and removes them from tracking",
   ctx._calls.length = 0;
   // Mark `a` destroyed (client disconnect / explicit destroy).
   a.destroyed = true;
-  reemitXdgOutput(ctx.state, 0);
+  reemitXdgOutput(ctx.state, ctx.addon, 0);
   // Only b should receive the burst (5 events).
   const kinds = ctx._calls.map(([k]) => k);
   assert.deepEqual(kinds,
@@ -188,7 +188,7 @@ test("reemitXdgOutput skips destroyed resources and removes them from tracking",
   // A second re-emit (with no further changes) should still only target b;
   // the prior re-emit's lazy scrub cleared a from the tracking set.
   ctx._calls.length = 0;
-  reemitXdgOutput(ctx.state, 0);
+  reemitXdgOutput(ctx.state, ctx.addon, 0);
   const kinds2 = ctx._calls.map(([k]) => k);
   assert.equal(kinds2.length, 5);
   assert.equal(ctx._calls[0][1].resource, b);
@@ -197,7 +197,7 @@ test("reemitXdgOutput skips destroyed resources and removes them from tracking",
 test("reemitXdgOutput is a no-op when no resources are bound", () => {
   const ctx = mockCtx(defaultRecord());
   // No get_xdg_output calls => empty tracking set.
-  reemitXdgOutput(ctx.state, 0);
+  reemitXdgOutput(ctx.state, ctx.addon, 0);
   assert.deepEqual(ctx._calls, []);
 });
 
@@ -208,6 +208,6 @@ test("reemitXdgOutput is a no-op when state.events is missing", () => {
   ctx._calls.length = 0;
   // Simulate mid-bring-up: events not yet attached.
   ctx.state.events = undefined;
-  reemitXdgOutput(ctx.state, 0);
+  reemitXdgOutput(ctx.state, ctx.addon, 0);
   assert.deepEqual(ctx._calls, []);
 });

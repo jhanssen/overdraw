@@ -127,11 +127,18 @@ function dragMotion(d: DragSession, x: number, y: number,
     d.offer = offer;
     const serial = d.ctx.state.serial();
     const surfaceRec = d.ctx.state.surfacesById?.get(hit.surfaceId);
-    const sx = x - hit.rect.x, sy = y - hit.rect.y;
+    // X target surfaces use oversized buffers (see docs/xwayland-design.md
+    // "HiDPI"); X clients expect surface-local coords in those oversized
+    // pixels. Other roles pass through 1:1.
+    const xn = surfaceRec?.role === "xwayland" ? (d.ctx.state.xwaylandScale ?? 1) : 1;
+    const sx = (x - hit.rect.x) * xn, sy = (y - hit.rect.y) * xn;
     if (surfaceRec)
       d.ctx.events.wl_data_device.send_enter(device, serial, surfaceRec.resource, sx, sy, offer);
   } else if (d.focusDevice && !d.focusDevice.destroyed) {
-    const sx = x - hit.rect.x, sy = y - hit.rect.y;
+    const surfaceRec = d.focusSurfaceId !== null
+      ? d.ctx.state.surfacesById?.get(d.focusSurfaceId) : null;
+    const xn = surfaceRec?.role === "xwayland" ? (d.ctx.state.xwaylandScale ?? 1) : 1;
+    const sx = (x - hit.rect.x) * xn, sy = (y - hit.rect.y) * xn;
     d.ctx.events.wl_data_device.send_motion(d.focusDevice, 0, sx, sy);
   }
 }

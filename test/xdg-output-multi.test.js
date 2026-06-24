@@ -46,7 +46,7 @@ function mockCtx(records) {
     wlOutputResources.set(rec.id, new Set([rec.wlOutputResource]));
   }
   const state = { outputs, wlOutputResources, events };
-  return { ctx: { state, events }, calls };
+  return { ctx: { state, events, addon: { clientId: () => 1 } }, calls };
 }
 
 test('get_xdg_output: emits the bound output\'s logical_position/size, not the primary\'s', () => {

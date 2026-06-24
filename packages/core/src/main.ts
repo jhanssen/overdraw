@@ -523,7 +523,7 @@ addon.setOnOutputDescriptor((d) => {
 pluginBus.subscribe("output.changed", (_name, payload) => {
   const outputId = (payload as { outputId: number }).outputId;
   reemitWlOutput(state, outputId);
-  reemitXdgOutput(state, outputId);
+  reemitXdgOutput(state, addon, outputId);
   reemitFractionalScale(state);
 });
 
@@ -588,6 +588,14 @@ if (config.xwayland.enabled) {
           ? { xwaylandPath: config.xwayland.xwaylandPath }
           : {}),
       });
+      // Freeze the global Xwayland scale for the session. See
+      // docs/xwayland-design.md "HiDPI".
+      const { resolveXwaylandScale } = await import("./xwayland/scale.js");
+      state.xwaylandScale = resolveXwaylandScale(state, config.xwayland.scale);
+      if (state.xwaylandScale !== 1) {
+        log.info("core", `Xwayland scale = ${state.xwaylandScale} `
+          + `(${config.xwayland.scale === 0 ? "auto" : "config"})`);
+      }
       xwm = startXwm(state, addon, xwaylandHandle.wmFd);
       // Selection bridge: mediates CLIPBOARD / PRIMARY between X clients
       // and wayland clients via wl_data_device / wp_primary_selection_v1.

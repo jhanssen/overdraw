@@ -33,6 +33,14 @@ export default function makeXwaylandShell(ctx: Ctx): XwaylandShellV1Handler {
       }
       s.role = "xwayland";
       bindSurface(ctx.state, id, s.id);
+      // Mark this client as an X client for the duration of its connection.
+      // xdg_output uses this to report oversized logical_position /
+      // logical_size to X clients (which think in X device pixels). See
+      // docs/xwayland-design.md "HiDPI". The set is not pruned on client
+      // disconnect today; the entries are tiny ints and the set survives
+      // a single Xwayland session.
+      const cid = ctx.addon.clientId(resource);
+      (ctx.state.xwaylandClientIds ??= new Set<number>()).add(cid);
     },
   };
 }
