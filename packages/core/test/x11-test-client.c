@@ -9,6 +9,14 @@
 //   --title <s>      Set both _NET_WM_NAME (UTF-8) and WM_NAME (Latin-1).
 //   --app-id <s>     Set WM_CLASS instance/class to <s>.
 //   --timeout-ms <n> Safety upper bound (default 5000).
+//   --startup-id <s> Set _NET_STARTUP_ID to <s> on the window.
+//   --probe-wm       After mapping, read root's _NET_SUPPORTING_WM_CHECK
+//                    and that child's _NET_WM_NAME + self-pointer; print
+//                    one line per result for the harness to assert on.
+//   --probe-wm-state After mapping, read this window's WM_STATE and print
+//                    "[x11] wm-state state=<N> icon=0x<W>" once.
+//   --probe-net-supported After mapping, read _NET_SUPPORTED on the root
+//                    and print "[x11] net-supported count=<N>".
 //
 // Prints "[x11] mapped 0x<window>" on map and "[x11] deleted" on
 // WM_DELETE_WINDOW receipt.
@@ -33,12 +41,20 @@ static xcb_atom_t intern(xcb_connection_t* c, const char* name) {
 int main(int argc, char** argv) {
     const char* title = "overdraw test";
     const char* appId = "x11-test-client";
+    const char* startupId = NULL;
+    int probeWm = 0;
+    int probeWmState = 0;
+    int probeNetSupported = 0;
     int timeoutMs = 5000;
     int overrideRedirect = 0;
     int x = 0, y = 0, w = 200, h = 150;
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--title") && i + 1 < argc) { title = argv[++i]; }
         else if (!strcmp(argv[i], "--app-id") && i + 1 < argc) { appId = argv[++i]; }
+        else if (!strcmp(argv[i], "--startup-id") && i + 1 < argc) { startupId = argv[++i]; }
+        else if (!strcmp(argv[i], "--probe-wm")) { probeWm = 1; }
+        else if (!strcmp(argv[i], "--probe-wm-state")) { probeWmState = 1; }
+        else if (!strcmp(argv[i], "--probe-net-supported")) { probeNetSupported = 1; }
         else if (!strcmp(argv[i], "--timeout-ms") && i + 1 < argc) {
             timeoutMs = atoi(argv[++i]);
         }
@@ -116,11 +132,69 @@ int main(int argc, char** argv) {
     const uint32_t mypid = (uint32_t)getpid();
     xcb_change_property(c, XCB_PROP_MODE_REPLACE, win, NET_WM_PID, 6 /*CARDINAL*/, 32,
                         1, &mypid);
+    // _NET_STARTUP_ID (opt-in via --startup-id): an opaque ASCII id the
+    // launcher set on the window for activation correlation.
+    if (startupId) {
+        const xcb_atom_t NET_STARTUP_ID = intern(c, "_NET_STARTUP_ID");
+        xcb_change_property(c, XCB_PROP_MODE_REPLACE, win, NET_STARTUP_ID,
+                            XCB_ATOM_STRING, 8,
+                            (uint32_t)strlen(startupId), startupId);
+    }
 
     xcb_map_window(c, win);
     xcb_flush(c);
     printf("[x11] mapped 0x%x\n", win);
     fflush(stdout);
+
+    // --probe-wm: read _NET_SUPPORTING_WM_CHECK on the root and on the
+    // child it names; verify _NET_WM_NAME on the child and that the child's
+    // own _NET_SUPPORTING_WM_CHECK points at itself.
+    if (probeWm) {
+        const xcb_atom_t NET_SUPPORTING_WM_CHECK = intern(c, "_NET_SUPPORTING_WM_CHECK");
+        xcb_get_property_cookie_t kRoot = xcb_get_property(c, 0, screen->root,
+            NET_SUPPORTING_WM_CHECK, 33 /*WINDOW*/, 0, 1);
+        xcb_get_property_reply_t* rRoot = xcb_get_property_reply(c, kRoot, NULL);
+        xcb_window_t child = 0;
+        if (rRoot && rRoot->format == 32 && xcb_get_property_value_length(rRoot) >= 4) {
+            child = *(uint32_t*)xcb_get_property_value(rRoot);
+        }
+        printf("[x11] wm-check root child=0x%x\n", child);
+        free(rRoot);
+        if (child) {
+            xcb_get_property_cookie_t kSelf = xcb_get_property(c, 0, child,
+                NET_SUPPORTING_WM_CHECK, 33 /*WINDOW*/, 0, 1);
+            xcb_get_property_reply_t* rSelf = xcb_get_property_reply(c, kSelf, NULL);
+            xcb_window_t selfPtr = 0;
+            if (rSelf && rSelf->format == 32 && xcb_get_property_value_length(rSelf) >= 4) {
+                selfPtr = *(uint32_t*)xcb_get_property_value(rSelf);
+            }
+            printf("[x11] wm-check child self=0x%x\n", selfPtr);
+            free(rSelf);
+            xcb_get_property_cookie_t kName = xcb_get_property(c, 0, child,
+                NET_WM_NAME, UTF8_STRING, 0, 256);
+            xcb_get_property_reply_t* rName = xcb_get_property_reply(c, kName, NULL);
+            if (rName && rName->format == 8) {
+                int len = xcb_get_property_value_length(rName);
+                printf("[x11] wm-name child='%.*s'\n",
+                       len, (const char*)xcb_get_property_value(rName));
+            }
+            free(rName);
+        }
+        fflush(stdout);
+    }
+
+    // --probe-net-supported: count the atoms in _NET_SUPPORTED on the root.
+    if (probeNetSupported) {
+        const xcb_atom_t NET_SUPPORTED = intern(c, "_NET_SUPPORTED");
+        xcb_get_property_cookie_t k = xcb_get_property(c, 0, screen->root,
+            NET_SUPPORTED, 4 /*ATOM*/, 0, 256);
+        xcb_get_property_reply_t* r = xcb_get_property_reply(c, k, NULL);
+        int count = 0;
+        if (r && r->format == 32) count = xcb_get_property_value_length(r) / 4;
+        printf("[x11] net-supported count=%d\n", count);
+        free(r);
+        fflush(stdout);
+    }
 
     // We need to observe ConfigureNotify events (both real and synthetic),
     // FocusIn/FocusOut (so focus-mirror tests can see the WM landing focus
@@ -140,7 +214,24 @@ int main(int argc, char** argv) {
     const long deadlineMs = timeoutMs;
     long elapsedMs = 0;
     const int stepMs = 50;
+    xcb_atom_t WM_STATE = 0;
+    int wmStateReported = 0;
+    if (probeWmState) WM_STATE = intern(c, "WM_STATE");
     for (;;) {
+        // --probe-wm-state: poll WM_STATE on this window every tick until
+        // it appears (the WM sets NormalState after taking us over).
+        if (probeWmState && !wmStateReported) {
+            xcb_get_property_cookie_t k = xcb_get_property(c, 0, win,
+                WM_STATE, WM_STATE, 0, 2);
+            xcb_get_property_reply_t* r = xcb_get_property_reply(c, k, NULL);
+            if (r && r->format == 32 && xcb_get_property_value_length(r) >= 8) {
+                const uint32_t* v = (const uint32_t*)xcb_get_property_value(r);
+                printf("[x11] wm-state state=%u icon=0x%x\n", v[0], v[1]);
+                fflush(stdout);
+                wmStateReported = 1;
+            }
+            free(r);
+        }
         if (elapsedMs >= deadlineMs) break;
         struct pollfd p = { .fd = fd, .events = POLLIN };
         poll(&p, 1, stepMs);

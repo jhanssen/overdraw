@@ -263,3 +263,37 @@ export function classifyWindowType(
   }
   return null;
 }
+
+// _NET_STARTUP_ID: an opaque ASCII id the launcher set on the window
+// (matched against the SI message the launcher emitted via dbus). Stored
+// as 8-bit data; spec is ASCII but we decode as Latin-1 since the bytes
+// are an opaque token. Returns null when the property is absent.
+export function parseStartupId(p: PropertyReply): string | null {
+  if (p.format !== 8 || p.data.length === 0) return null;
+  return trimTrailingNuls(decodeLatin1(p.data));
+}
+
+// _NET_WM_ICON: a CARDINAL[][2+N] of (width, height, ARGB pixels...). Each
+// icon is `2 + width*height` u32 words; the property is the concatenation
+// of one or more icons of different sizes. Returns the parsed list (empty
+// when the property is absent or malformed). Pixels are 0xAARRGGBB,
+// premultiplied alpha (EWMH §5.7).
+export function parseNetWmIcon(p: PropertyReply): Array<{
+  width: number; height: number; pixels: Uint32Array;
+}> {
+  if (p.format !== 32 || p.data.length < 12) return [];
+  const a = asU32(p.data);
+  const out: Array<{ width: number; height: number; pixels: Uint32Array }> = [];
+  let i = 0;
+  while (i + 2 <= a.length) {
+    const w = a[i], h = a[i + 1];
+    // Defensive: refuse zero / absurdly large dims (a malformed icon would
+    // otherwise mis-slice into the next entry).
+    if (w === 0 || h === 0 || w > 16384 || h > 16384) break;
+    const n = w * h;
+    if (i + 2 + n > a.length) break;  // truncated
+    out.push({ width: w, height: h, pixels: a.slice(i + 2, i + 2 + n) });
+    i += 2 + n;
+  }
+  return out;
+}

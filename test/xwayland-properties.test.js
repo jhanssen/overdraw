@@ -14,6 +14,8 @@ import {
   parseTransientFor,
   parseWmNormalHints,
   parseWmHints,
+  parseStartupId,
+  parseNetWmIcon,
   netWmStateToPresentation,
   classifyWindowType,
 } from "../packages/core/dist/xwayland/properties.js";
@@ -257,4 +259,72 @@ test("parseWmHints: InputHint bit not set -> input: null", () => {
   a[1] = 1;
   const got = parseWmHints(reply(32, 35, new Uint8Array(a.buffer)));
   assert.deepEqual(got, { input: null });
+});
+
+// ---- parseStartupId ------------------------------------------------------
+
+test("parseStartupId: ASCII id round-trips", () => {
+  const id = "gnome-shell-12345-launcher_TIME67890";
+  const data = new TextEncoder().encode(id);
+  const got = parseStartupId(reply(8, 31 /*STRING*/, data));
+  assert.equal(got, id);
+});
+
+test("parseStartupId: trailing NULs are trimmed", () => {
+  const data = new Uint8Array([0x66, 0x6f, 0x6f, 0x00, 0x00]);
+  assert.equal(parseStartupId(reply(8, 31, data)), "foo");
+});
+
+test("parseStartupId: absent property (format=0) -> null", () => {
+  assert.equal(parseStartupId(reply(0, 0, new Uint8Array(0))), null);
+});
+
+test("parseStartupId: wrong format (32 instead of 8) -> null", () => {
+  assert.equal(parseStartupId(reply(32, 31, u32([1, 2]))), null);
+});
+
+// ---- parseNetWmIcon ------------------------------------------------------
+
+test("parseNetWmIcon: one 2x2 icon decoded", () => {
+  // [width=2, height=2, p0..p3]
+  const data = u32([2, 2, 0xff111111, 0xff222222, 0xff333333, 0xff444444]);
+  const icons = parseNetWmIcon(reply(32, 6 /*CARDINAL*/, data));
+  assert.equal(icons.length, 1);
+  assert.equal(icons[0].width, 2);
+  assert.equal(icons[0].height, 2);
+  assert.deepEqual(Array.from(icons[0].pixels),
+    [0xff111111, 0xff222222, 0xff333333, 0xff444444]);
+});
+
+test("parseNetWmIcon: multiple icons of different sizes", () => {
+  const data = u32([
+    1, 1, 0xff000001,                 // 1x1 icon
+    2, 2, 0xff100000, 0xff200000, 0xff300000, 0xff400000,  // 2x2 icon
+  ]);
+  const icons = parseNetWmIcon(reply(32, 6, data));
+  assert.equal(icons.length, 2);
+  assert.equal(icons[0].width, 1); assert.equal(icons[0].height, 1);
+  assert.equal(icons[1].width, 2); assert.equal(icons[1].height, 2);
+  assert.deepEqual(Array.from(icons[1].pixels),
+    [0xff100000, 0xff200000, 0xff300000, 0xff400000]);
+});
+
+test("parseNetWmIcon: truncated (declared 3x3 but only 4 pixels follow) -> stops cleanly", () => {
+  const data = u32([3, 3, 1, 2, 3, 4]);
+  const icons = parseNetWmIcon(reply(32, 6, data));
+  assert.equal(icons.length, 0);
+});
+
+test("parseNetWmIcon: zero-dim icon is refused (malformed)", () => {
+  const data = u32([0, 5, 1, 2, 3, 4, 5]);
+  const icons = parseNetWmIcon(reply(32, 6, data));
+  assert.equal(icons.length, 0);
+});
+
+test("parseNetWmIcon: absent property (format=0) -> []", () => {
+  assert.deepEqual(parseNetWmIcon(reply(0, 0, new Uint8Array(0))), []);
+});
+
+test("parseNetWmIcon: wrong format (8 instead of 32) -> []", () => {
+  assert.deepEqual(parseNetWmIcon(reply(8, 6, new Uint8Array(16))), []);
 });

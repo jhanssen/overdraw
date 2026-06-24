@@ -674,18 +674,26 @@ validated + resolved + consumed by the runtime + hotkey plugin.
   `_NET_ACTIVE_WINDOW`/`_NET_WM_STATE_FOCUSED` + serial-validated
   FocusIn handling for cross-app focus-stealing denial; CLIPBOARD +
   PRIMARY selection bridge between X clients and wayland clients,
-  both directions, with INCR for >64 KiB payloads). Production
-  wiring: `config.xwayland.enabled` (default false) opts in;
+  both directions, with INCR for >64 KiB payloads).   Global Xwayland HiDPI scale wired
+  (`config.xwayland.scale`, default 0 = auto: `ceil(max(output.scale))`
+  at start, clamped to `[1,3]`; frozen for the session). X clients see
+  an oversized world by the scale factor; the X surface is treated as
+  `bufferScale=N` so the existing composite path renders it at the
+  right logical size. EWMH polish landed: `_NET_SUPPORTING_WM_CHECK`
+  (root + bookkeeper child + `_NET_WM_NAME="overdraw"`),
+  `_NET_SUPPORTED` lists every EWMH atom the WM acts on, ICCCM
+  `WM_STATE = NormalState` on managed windows (deleted on unmap),
+  `_NET_WM_STATE_FOCUSED` is now read-modify-write against the cached
+  atom list so client-set bits survive a focus change,
+  `_NET_STARTUP_ID` and `_NET_WM_ICON` are parsed and exposed via
+  `XwmStateView.{startupIdOf,iconsOf}`. Production wiring:
+  `config.xwayland.enabled` (default false) opts in;
   `config.xwayland.displayNumber` (default 50) selects the X display.
   Autopick rejected upstream (would otherwise steal `:0` from a live
-  host session). 17 GPU tests + 64 GPU-free unit tests cover the
-  surface. DnD is Phase 5. See `docs/xwayland-design.md`.
+  host session). 23 GPU tests + 80 GPU-free unit tests cover the
+  surface. DnD and `xwayland-keyboard-grab` are the remaining Phase 5
+  work. See `docs/xwayland-design.md`.
   Known limitations:
-  - `_NET_WM_STATE_FOCUSED` writes replace the whole `_NET_WM_STATE`
-    property (clobbers client-set bits like fullscreen/maximized when
-    focus moves; clients re-assert via `change_property` on their own
-    state, so this is observable only between focus-change and the
-    next client commit). Clean fix is read-modify-write.
   - Same-PID focus-stealing exception requires both windows to
     advertise `_NET_WM_PID`; older / non-EWMH X clients fall back to
     cross-PID denial.

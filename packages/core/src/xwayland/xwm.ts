@@ -27,6 +27,8 @@ import {
   parseTransientFor,
   parseWmNormalHints,
   parseWmHints,
+  parseStartupId,
+  parseNetWmIcon,
   netWmStateToPresentation,
   classifyWindowType,
   type PropertyAtoms,
@@ -111,6 +113,29 @@ export interface XWindow {
   // re-routing focus among its own windows is allowed; cross-PID
   // attempts are denied by refocusing the previous surface).
   pid: number | null;
+  // The full _NET_WM_STATE atom set as last observed. Cached so the
+  // focus mirror can do a read-modify-write on _NET_WM_STATE_FOCUSED
+  // without clobbering client-set bits (fullscreen / maximized /
+  // modal / etc.). Refreshed on every _NET_WM_STATE property reply.
+  netWmStateAtoms: Set<number>;
+  // _NET_STARTUP_ID: an opaque ASCII id the launcher set on the window
+  // (matched against the SI message the launcher emitted via dbus).
+  // Exposed read-only via the XwmStateView so launchers / plugins can
+  // correlate an X window to the activation that spawned it.
+  startupId: string | null;
+  // _NET_WM_ICON: ARGB icon image(s) set by the client. The full
+  // property is a concatenation of [width:u32][height:u32][argb_data
+  // ...] tuples; we keep the parsed list so plugins can pick the size
+  // they want. null until the property arrives (or absent).
+  icons: NetWmIcon[] | null;
+}
+
+// One decoded _NET_WM_ICON entry. ARGB premultiplied, top-to-bottom,
+// left-to-right; pixels.length === width * height (32 bits each).
+export interface NetWmIcon {
+  width: number;
+  height: number;
+  pixels: Uint32Array;
 }
 
 // A narrow view stashed on CompositorState so unrelated modules (titleAppId,
@@ -121,6 +146,13 @@ export interface XwmStateView {
   // Initiate close. Returns true iff a matching X window was found; the
   // close-surface helper uses that to skip the xdg branch.
   closeBySurfaceId(surfaceId: number): boolean;
+  // _NET_STARTUP_ID set on the X window (or null when the client never set
+  // one). Resolved by surfaceId so callers don't need an X window handle.
+  startupIdOf(surfaceId: number): string | null;
+  // _NET_WM_ICON entries set on the X window (or null when the client
+  // never set the property). Each entry is one ARGB icon at a particular
+  // size; pick the closest to your render target.
+  iconsOf(surfaceId: number): NetWmIcon[] | null;
 }
 
 export interface Xwm {
@@ -161,6 +193,8 @@ function pickWatchedAtoms(atoms: Record<string, number>): Array<{ name: string; 
     "_NET_WM_STATE",
     "_NET_WM_WINDOW_TYPE",
     "_NET_WM_PID",
+    "_NET_STARTUP_ID",
+    "_NET_WM_ICON",
   ];
   return names.map((n) => ({ name: n, atom: atoms[n] ?? 0 })).filter((e) => e.atom !== 0);
 }
@@ -178,6 +212,9 @@ function newXWindow(window: number, x: number, y: number, w: number, h: number,
     presentationHint: null,
     inputHint: null,
     pid: null,
+    netWmStateAtoms: new Set<number>(),
+    startupId: null,
+    icons: null,
   };
 }
 
@@ -247,6 +284,8 @@ export function startXwm(state: CompositorState, addon: Addon, wmFd: number): Xw
     }
     state.wm.addWindow(w.surfaceId, surfRec);
     w.addedToWm = true;
+    // ICCCM §4.1.3.1: a managed top-level holds WM_STATE = NormalState.
+    setWmStateNormal(w.window);
     // Plumb the parsed properties (title/appId/constraints/parent/presentation)
     // into the WM now that the window is managed. Order: first markInitial so
     // window.map carries title/appId; then proposals for structural fields.
@@ -256,6 +295,9 @@ export function startXwm(state: CompositorState, addon: Addon, wmFd: number): Xw
   function unmanage(w: XWindow): void {
     if (w.addedToWm && w.surfaceId !== null) state.wm?.unmapWindow(w.surfaceId);
     w.addedToWm = false;
+    // ICCCM: unmapping a managed window transitions it to WithdrawnState
+    // (= property removed).
+    clearWmState(w.window);
   }
 
   // Override-redirect placement: record the X-supplied rect in
@@ -391,6 +433,7 @@ export function startXwm(state: CompositorState, addon: Addon, wmFd: number): Xw
         break;
       case "_NET_WM_STATE": {
         const states = parseNetWmState(p);
+        w.netWmStateAtoms = states;
         w.presentationHint = netWmStateToPresentation(states, pa);
         sendStructuralProposals(w);
         break;
@@ -409,6 +452,14 @@ export function startXwm(state: CompositorState, addon: Addon, wmFd: number): Xw
           const pid = view.getUint32(0, true);
           w.pid = pid !== 0 ? pid : null;
         }
+        break;
+      }
+      case "_NET_STARTUP_ID":
+        w.startupId = parseStartupId(p);
+        break;
+      case "_NET_WM_ICON": {
+        const icons = parseNetWmIcon(p);
+        w.icons = icons.length > 0 ? icons : null;
         break;
       }
     }
@@ -599,6 +650,71 @@ export function startXwm(state: CompositorState, addon: Addon, wmFd: number): Xw
   const root = startResult.root;
   const bookkeeper = startResult.bookkeeper;
 
+  // EWMH WM identification (§2 "Root Window Properties"):
+  //   _NET_SUPPORTING_WM_CHECK on the root -> child window
+  //   _NET_SUPPORTING_WM_CHECK on the child  -> itself
+  //   _NET_WM_NAME on the child              = WM name
+  // Clients read these to verify the WM is alive (and which one). The
+  // bookkeeper is the natural child to point at -- it already exists, is
+  // override-redirect, and outlives every managed window.
+  publishWmIdentification(root, bookkeeper);
+  // _NET_SUPPORTED lists the EWMH atoms we honor. waybar / panel-helpers
+  // read this to decide what to ask us for.
+  publishNetSupported(root);
+
+  function publishWmIdentification(root: number, child: number): void {
+    const check = atomsByName._NET_SUPPORTING_WM_CHECK ?? 0;
+    const utf8 = atomsByName.UTF8_STRING ?? 0;
+    const name = atomsByName._NET_WM_NAME ?? 0;
+    if (check !== 0) {
+      const buf = new Uint32Array([child]);
+      addon.xwmChangeProperty(root, check, 33 /*WINDOW*/, 32, buf, 1);
+      addon.xwmChangeProperty(child, check, 33 /*WINDOW*/, 32, buf, 1);
+    }
+    if (name !== 0 && utf8 !== 0) {
+      const bytes = new TextEncoder().encode("overdraw");
+      addon.xwmChangeProperty(child, name, utf8, 8, bytes, bytes.length);
+    }
+  }
+
+  function publishNetSupported(root: number): void {
+    const supported = atomsByName._NET_SUPPORTED ?? 0;
+    if (supported === 0) return;
+    // Every EWMH atom the WM acts on. _NET_WM_NAME / WM_NAME drive titles,
+    // _NET_WM_STATE_FOCUSED tracks focus, _NET_WM_WINDOW_TYPE_* classifies
+    // window kind, _NET_ACTIVE_WINDOW carries the focused window, etc.
+    const want = [
+      "_NET_SUPPORTING_WM_CHECK",
+      "_NET_WM_NAME",
+      "_NET_WM_PID",
+      "_NET_ACTIVE_WINDOW",
+      "_NET_WM_STATE",
+      "_NET_WM_STATE_FULLSCREEN",
+      "_NET_WM_STATE_MAXIMIZED_VERT",
+      "_NET_WM_STATE_MAXIMIZED_HORZ",
+      "_NET_WM_STATE_MODAL",
+      "_NET_WM_STATE_FOCUSED",
+      "_NET_WM_WINDOW_TYPE",
+      "_NET_WM_WINDOW_TYPE_NORMAL",
+      "_NET_WM_WINDOW_TYPE_DIALOG",
+      "_NET_WM_WINDOW_TYPE_UTILITY",
+      "_NET_WM_WINDOW_TYPE_MENU",
+      "_NET_WM_WINDOW_TYPE_DROPDOWN_MENU",
+      "_NET_WM_WINDOW_TYPE_POPUP_MENU",
+      "_NET_WM_WINDOW_TYPE_TOOLTIP",
+      "_NET_WM_WINDOW_TYPE_COMBO",
+      "_NET_WM_ICON",
+      "_NET_STARTUP_ID",
+    ];
+    const buf = new Uint32Array(want.length);
+    let n = 0;
+    for (const name of want) {
+      const a = atomsByName[name] ?? 0;
+      if (a !== 0) buf[n++] = a;
+    }
+    addon.xwmChangeProperty(root, supported, 4 /*ATOM*/, 32, buf, n);
+  }
+
   // Sequence of the most recent WM-initiated SetInputFocus, mirrored from
   // xwmSetInputFocus return values. The TS side compares incoming FocusIn
   // event sequences to filter stale events (e.g. our own SetInputFocus
@@ -610,31 +726,49 @@ export function startXwm(state: CompositorState, addon: Addon, wmFd: number): Xw
   // next focus transition arrives.
   let xFocusedWindow: XWindow | null = null;
 
-  // Helper: convert _NET_WM_STATE_FOCUSED to/from a window's _NET_WM_STATE
-  // atom list. EWMH says the WM owns _NET_WM_STATE_FOCUSED; clients OR it
-  // with whatever client-set state atoms they keep (fullscreen, etc.). We
-  // write the full list since we already track it on XWindow.presentationHint
-  // -- but that's lossy (we collapse fullscreen/maximized down). Safer:
-  // re-read the current property and add/remove the FOCUSED atom on the
-  // existing list. Cheaper alternative: just always write either {FOCUSED}
-  // or {} -- clients that care about other _NET_WM_STATE bits set them
-  // themselves and overwrite us; clients that only react to FOCUSED don't
-  // care. Going with the cheap option for v1; flagged.
+  // ICCCM WM_STATE: format=32, type=WM_STATE atom, [state, icon-window].
+  // state: 0=Withdrawn, 1=Normal, 3=Iconic. icon: WINDOW or None (0). Some
+  // libXt-based clients refuse to behave until WM_STATE arrives. We set
+  // Normal on map and remove on unmap (== Withdrawn).
+  function setWmStateNormal(window: number): void {
+    const atom = atomsByName.WM_STATE ?? 0;
+    if (atom === 0) return;
+    const buf = new Uint32Array([1 /*NormalState*/, 0 /*None*/]);
+    addon.xwmChangeProperty(window, atom, atom /*WM_STATE type*/, 32, buf, 2);
+  }
+  function clearWmState(window: number): void {
+    const atom = atomsByName.WM_STATE ?? 0;
+    if (atom === 0) return;
+    addon.xwmDeleteProperty(window, atom);
+  }
+
+  // Set / clear _NET_WM_STATE_FOCUSED on a window's _NET_WM_STATE list.
+  // The WM owns FOCUSED; the client owns the rest (fullscreen, maximized,
+  // modal, ...). Read-modify-write against XWindow.netWmStateAtoms (which
+  // applyProperty refreshes every time a _NET_WM_STATE reply arrives) so
+  // client-set bits survive a focus change. EWMH §5.7.
   function setStateFocused(window: number, focused: boolean): void {
-    if (focused) {
-      const buf = new Uint32Array([pa.WM_TAKE_FOCUS]);  // placeholder; replaced below
-      // Reuse the buffer view to send a single _NET_WM_STATE_FOCUSED atom.
-      buf[0] = atomsByName._NET_WM_STATE_FOCUSED ?? 0;
-      if (buf[0] === 0) return;
-      addon.xwmChangeProperty(
-        window, atomsByName._NET_WM_STATE ?? 0,
-        4 /*ATOM*/, 32, buf, 1);
-    } else {
-      // Clear the property entirely. See the comment above: this clobbers
-      // any client-set _NET_WM_STATE bits; in practice the client just
-      // re-asserts them via change_property if it cares.
-      addon.xwmDeleteProperty(window, atomsByName._NET_WM_STATE ?? 0);
+    const focusedAtom = atomsByName._NET_WM_STATE_FOCUSED ?? 0;
+    const stateAtom = atomsByName._NET_WM_STATE ?? 0;
+    if (focusedAtom === 0 || stateAtom === 0) return;
+    const w = windows.get(window);
+    // Take a fresh copy: w.netWmStateAtoms is the live cache (mutated on
+    // every property-reply); composing a new Set ensures we don't see a
+    // mid-flight client-side update interleave.
+    const atoms = new Set<number>(w?.netWmStateAtoms ?? []);
+    if (focused) atoms.add(focusedAtom);
+    else atoms.delete(focusedAtom);
+    // Sync the cache with what we're about to write; the X server's
+    // own PropertyNotify will arrive later but the value matches.
+    if (w) w.netWmStateAtoms = atoms;
+    if (atoms.size === 0) {
+      addon.xwmDeleteProperty(window, stateAtom);
+      return;
     }
+    const buf = new Uint32Array(atoms.size);
+    let i = 0;
+    for (const a of atoms) buf[i++] = a;
+    addon.xwmChangeProperty(window, stateAtom, 4 /*ATOM*/, 32, buf, buf.length);
   }
 
   function setNetActiveWindow(window: number): void {
@@ -750,6 +884,8 @@ export function startXwm(state: CompositorState, addon: Addon, wmFd: number): Xw
   state.xwm = {
     findBySurfaceId(surfaceId) { return bySurface.get(surfaceId) ?? null; },
     closeBySurfaceId,
+    startupIdOf(surfaceId) { return bySurface.get(surfaceId)?.startupId ?? null; },
+    iconsOf(surfaceId) { return bySurface.get(surfaceId)?.icons ?? null; },
   };
 
   return {

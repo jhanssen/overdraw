@@ -40,9 +40,11 @@ truth — refer to:
 - `src/protocols/xwayland_shell_v1.ts` — the wl-side half of association.
 
 Production wiring: `config.xwayland.enabled` (default false) opts in;
-`config.xwayland.displayNumber` (default 50) selects the X display. The
-autopick path (no display arg, `-displayfd` alone) is rejected upstream
-in `startXwayland` — it can collide with an existing X session.
+`config.xwayland.displayNumber` (default 50) selects the X display;
+`config.xwayland.scale` (default 0 = auto) selects the global X scale
+(see "HiDPI" below). The autopick display path (no display arg,
+`-displayfd` alone) is rejected upstream in `startXwayland` — it can
+collide with an existing X session.
 
 ## Out of scope
 
@@ -254,30 +256,51 @@ Out of scope / known gaps:
 
 ## Phase 5 — polish + DnD
 
+EWMH identity, capability advertising, ICCCM `WM_STATE`,
+`_NET_WM_STATE_FOCUSED` read-modify-write, `_NET_STARTUP_ID`, and
+`_NET_WM_ICON` are landed; see "EWMH polish" below. DnD and
+`xwayland-keyboard-grab` remain.
+
+Remaining:
+
 - **Xdnd** ↔ `wl_data_device` drag-and-drop. Similar shape to
   selections: X protocol over ClientMessages + properties, all in TS
   over the existing native primitives plus possibly
   `xcb_query_pointer` for cursor-following.
-- **`_NET_SUPPORTED`** on the root: list of EWMH atoms we honor.
-  Cosmetic for most clients; some bars / desktop helpers read it.
-- **`_NET_SUPPORTING_WM_CHECK`** on the root and on the bookkeeper:
-  declares the WM is alive. Same audience as `_NET_SUPPORTED`.
-- **Startup notification** (`_NET_STARTUP_ID`): match X clients to the
-  launcher that spawned them.
-- **Window icons** (`_NET_WM_ICON`): expose to plugins.
 - **`xwayland-keyboard-grab`**: full-screen games grab the keyboard.
-- **HiDPI policy knob.** The global scale config knob proposed in
-  "HiDPI" above.
-- **WM_STATE**: set `WM_STATE = NormalState` on managed windows,
-  `WithdrawnState` on unmapped, `IconicState` on minimized. ICCCM
-  §4.1.3.1 requires it; some older clients (libXt-based) won't react
-  properly until WM_STATE shows up. Uses the existing
-  `xwmChangeProperty` primitive.
-- **`_NET_WM_STATE_FOCUSED` read-modify-write.** Phase 3.4 writes the
-  whole `_NET_WM_STATE` property with REPLACE when toggling FOCUSED,
-  clobbering client-set bits. Properly preserving the existing list
-  needs the same async read-then-write pattern the property batch
-  uses.
+  Separate Wayland protocol (a new global), not an X-side change.
+
+## EWMH polish (landed)
+
+- **`_NET_SUPPORTING_WM_CHECK`** on the root and on the bookkeeper
+  (self-pointer); `_NET_WM_NAME = "overdraw"` on the bookkeeper. EWMH
+  §2; clients use this triple to verify the WM is alive and which
+  one. Written once at XWM start.
+- **`_NET_SUPPORTED`** on the root: lists every EWMH atom the WM
+  acts on (the `_NET_WM_STATE_*` set, the `_NET_WM_WINDOW_TYPE_*`
+  set, `_NET_ACTIVE_WINDOW`, `_NET_WM_PID`, `_NET_WM_ICON`,
+  `_NET_STARTUP_ID`, the identity atoms above). waybar / panel
+  helpers read this.
+- **`WM_STATE`** (ICCCM §4.1.3.1). Written as `NormalState` (1) when a
+  window is taken over by the WM, deleted (= `WithdrawnState`) on
+  unmap. Some libXt-based clients refuse to behave until `WM_STATE`
+  shows up. `IconicState` not used — overdraw has no minimize concept.
+- **`_NET_WM_STATE_FOCUSED` read-modify-write.** The focus mirror
+  composes the new atom list from `XWindow.netWmStateAtoms` (refreshed
+  by every `_NET_WM_STATE` property reply) so toggling FOCUSED no
+  longer clobbers client-set bits (fullscreen / maximized / modal /
+  etc.). Race with a client `change_property(REPLACE)` between our
+  cached read and our write is benign: the X server's PropertyNotify
+  re-fills the cache, and the next focus change picks it up.
+- **`_NET_STARTUP_ID`** — parsed and stored on `XWindow.startupId`.
+  Exposed via `XwmStateView.startupIdOf(surfaceId)` so launchers /
+  plugins can correlate an X window to the activation that spawned
+  it. Not consumed (no SI dbus path yet); the value is available the
+  moment a plugin wants it.
+- **`_NET_WM_ICON`** — parsed into a list of `{width, height, pixels}`
+  ARGB-premultiplied entries (EWMH §5.7). Exposed via
+  `XwmStateView.iconsOf(surfaceId)`. Plugins pick the closest size to
+  their target.
 
 ## Open questions
 
