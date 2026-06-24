@@ -491,7 +491,12 @@ type-check under `tsc --strict`.
   `ext-data-control-client` test client),
   `wp_presentation` / `wp_presentation_feedback` (per-commit scanout
   timestamps for video apps; CLOCK_MONOTONIC; supersession on the
-  next commit per spec; tested end-to-end).
+  next commit per spec; tested end-to-end),
+  `ext_foreign_toplevel_list_v1` / `ext_foreign_toplevel_handle_v1`
+  (read-only toplevel enumeration with identifier + app_id + title
+  for status panels, window switchers, screen-share window pickers;
+  tested end-to-end via the `ext-foreign-toplevel-client` test
+  client).
 - **Implemented, input-region path exercised via hit-testing:** `wl_region`
   (opaque region stored but unconsumed -- see "Read first");
   `zwp_linux_dmabuf_feedback_v1` (exercised by real WSI clients).

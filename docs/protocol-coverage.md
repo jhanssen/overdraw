@@ -21,16 +21,19 @@ to keep in mind:
 
 ## Current state
 
-Overdraw advertises **20** registry-visible globals (one of which,
+Overdraw advertises **24** registry-visible globals (one of which,
 `wl_output`, is per-output). The full list, grouped:
 
 - Core wayland: `wl_compositor` v6, `wl_subcompositor` v1,
   `wl_shm` v2, `wl_seat` v10, `wl_data_device_manager` v3,
   `wl_output` v4.
-- Stable wayland-protocols: `xdg_wm_base` v7, `wp_viewporter` v1.
+- Stable wayland-protocols: `xdg_wm_base` v7, `wp_viewporter` v1,
+  `wp_presentation` v2.
 - Staging: `wp_cursor_shape_manager_v1` v2,
   `wp_fractional_scale_manager_v1` v1,
-  `wp_linux_drm_syncobj_manager_v1` v1, `ext_workspace_manager_v1` v1.
+  `wp_linux_drm_syncobj_manager_v1` v1, `ext_workspace_manager_v1` v1,
+  `ext_data_control_manager_v1` v1,
+  `ext_foreign_toplevel_list_v1` v1.
 - Unstable: `zwp_linux_dmabuf_v1` v5,
   `zwp_primary_selection_device_manager_v1` v1,
   `zxdg_decoration_manager_v1` v1, `zxdg_output_manager_v1` v3.
@@ -42,8 +45,8 @@ Overdraw advertises **20** registry-visible globals (one of which,
 
 For comparison: sway / wlroots advertise around 54 distinct
 globals; hyprland advertises around 63 (a chunk of which are
-hyprland-private and not portable). The gap is roughly 35–40
-protocols.
+hyprland-private and not portable). The remaining gap is roughly
+30 protocols.
 
 ## The gaps, by tier
 
@@ -190,12 +193,13 @@ the rest.
   the global registry. Effort: ~1 day; the trickier work is auditing
   which existing globals should be hidden from a sandboxed peer.
 
-- **`ext_foreign_toplevel_list_v1`** — the standardized successor to
-  the wlroots-extension `zwlr_foreign_toplevel_manager_v1` overdraw
-  already has. New panel code uses ext-foreign-toplevel; old code
-  still binds the zwlr one. Implementing both lets panels work
-  regardless of which they prefer. Effort: ~0.5 day (you have the
-  zwlr one as a template).
+- **`ext_foreign_toplevel_list_v1`** — landed. A read-only
+  enumeration of mapped toplevels (identifier + app_id + title +
+  done/closed lifecycle). The standardized successor to the older
+  `zwlr_foreign_toplevel_manager_v1` (which we also still advertise
+  for back-compat). Modern status panels, window switchers, and
+  screen-share window pickers bind it; it also serves as the input
+  source for the per-window half of `ext_image_copy_capture_v1`.
 
 ### Tier 3 — niche or cosmetic
 

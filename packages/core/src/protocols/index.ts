@@ -72,6 +72,7 @@ const GLOBALS = [
   "xwayland_shell_v1",
   "ext_data_control_manager_v1",
   "wp_presentation",
+  "ext_foreign_toplevel_list_v1",
 ];
 
 // Interfaces created via requests (new_id), registered without a global so
@@ -104,6 +105,7 @@ const CHILD_INTERFACES = [
   "ext_data_control_source_v1",
   "ext_data_control_offer_v1",
   "wp_presentation_feedback",
+  "ext_foreign_toplevel_handle_v1",
 ];
 
 // Load all generated signature modules, keyed by interface name.
@@ -720,6 +722,7 @@ export async function installProtocols(
     xwayland_shell_v1: await import("./xwayland_shell_v1.js"),
     ext_data_control_manager_v1: await import("./ext_data_control_v1.js"),
     wp_presentation: await import("./wp_presentation.js"),
+    ext_foreign_toplevel_list_v1: await import("./ext_foreign_toplevel_list_v1.js"),
   };
 
   // Some child interfaces have handlers from a sibling module's named exports.
@@ -740,6 +743,7 @@ export async function installProtocols(
   const extWorkspaceMod = await import("./ext_workspace_v1.js");
   const xwlShellMod = await import("./xwayland_shell_v1.js");
   const extDataControlMod = await import("./ext_data_control_v1.js");
+  const extForeignTopMod = await import("./ext_foreign_toplevel_list_v1.js");
   const childHandlers: Record<string, object> = {
     wl_pointer: seatMod.makePointer(ctx),
     wl_keyboard: seatMod.makeKeyboard(ctx),
@@ -775,6 +779,7 @@ export async function installProtocols(
     // wp_presentation_feedback has no requests (event-only); the protocol layer
     // still needs a handler-shaped object to register.
     wp_presentation_feedback: {},
+    ext_foreign_toplevel_handle_v1: extForeignTopMod.makeExtForeignToplevelHandle(ctx),
   };
 
   // The apply target forwards lazily: the seat is constructed below and
@@ -819,6 +824,10 @@ export async function installProtocols(
   // handler factory has already been constructed by the GLOBALS loop above
   // and registered its module-local manager set.
   foreignTopMod.installForeignToplevelBusHooks(ctx);
+  // Same shape for ext-foreign-toplevel-list; both protocols enumerate
+  // the same toplevels, so the wlr variant's lifecycle hooks aren't
+  // reused -- each protocol owns its own subscriber set.
+  extForeignTopMod.installExtForeignToplevelBusHooks(ctx);
 
   // wlr-output-management: subscribe to output.added / output.removed /
   // output.changed on the plugin bus so bound managers see head/mode

@@ -73,6 +73,7 @@ const DEFAULT_INPUTS = [
   '/usr/share/wayland-protocols/staging/xwayland-shell/xwayland-shell-v1.xml',
   '/usr/share/wayland-protocols/staging/ext-data-control/ext-data-control-v1.xml',
   '/usr/share/wayland-protocols/stable/presentation-time/presentation-time.xml',
+  '/usr/share/wayland-protocols/staging/ext-foreign-toplevel-list/ext-foreign-toplevel-list-v1.xml',
   // wlr-* protocols are not in wayland-protocols upstream; vendor copies.
   join(repoRoot, 'protocols', 'wlr-layer-shell-unstable-v1.xml'),
   join(repoRoot, 'protocols', 'wlr-foreign-toplevel-management-unstable-v1.xml'),
