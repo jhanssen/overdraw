@@ -48,6 +48,23 @@ class ShmRegistry {
     // Mapped size of a pool, or 0 if unknown. (Debug/diagnostics.)
     size_t poolSize(uint32_t poolId) const;
 
+    // Allocate an independent writable mmap (PROT_READ|PROT_WRITE, MAP_SHARED)
+    // covering [offset, offset+len) of the pool's fd. The returned pointer is
+    // the START of [offset, ...) (the caller does not see the page-alignment
+    // padding); `out_mmap_base` and `out_mmap_size` receive the actual mmap
+    // base + size so the caller can munmap when done. The default `view()`
+    // mapping (MAP_PRIVATE, PROT_READ) is unaffected.
+    //
+    // Capture-destination buffers need this: a client carves a wl_buffer out
+    // of its shm pool, attaches it to an ext_image_copy_capture_frame_v1, and
+    // expects the compositor to WRITE captured pixels into the underlying
+    // file/memfd. The default read-only private mapping cannot serve that:
+    // PROT_READ disallows writes outright, and MAP_PRIVATE writes wouldn't
+    // propagate back to the client. Returns nullptr on out-of-range, unknown
+    // pool, or mmap failure.
+    uint8_t* mapWritable(uint32_t poolId, size_t offset, size_t len,
+                         void** out_mmap_base, size_t* out_mmap_size);
+
   private:
     struct Pool {
         int fd = -1;

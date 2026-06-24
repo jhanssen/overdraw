@@ -161,6 +161,50 @@ nothing, with no error. Worst-first.
   `docs/protocol-coverage.md` for the gap analysis vs. sway / hyprland
   and the suggested landing order for what isn't.
 
+- **`ext_image_copy_capture_v1` advertises shm destinations only; dmabuf
+  destinations and the cursor sub-session are stubbed.** Sessions
+  send `shm_format(argb8888, xrgb8888)` + `buffer_size` + `done` and
+  emit NO `dmabuf_format` / `dmabuf_device` events. Per-frame cost is
+  a full GPU→CPU readback (`copyTextureToBuffer` + `mapAsync`) plus a
+  memcpy into the client's writable shm mapping. Impact per client:
+  - **Works fine:** `grim` (one-shot PNG screenshot, always shm),
+    `xdg-desktop-portal-wlr` shm path (Firefox/Chrome WebRTC,
+    portal-mediated screen-share), OBS's shm fallback, GNOME-style
+    screenshot tools.
+  - **Refuses to record:** `gpu-screen-recorder` and any client that
+    hard-requires dmabuf (sees no `dmabuf_format` in the constraints
+    burst, finds no acceptable choice, backs off cleanly).
+  - **Works but CPU-bound at high res:** OBS native ext-image-copy-
+    capture + wf-recorder + live-streaming setups at 4K@60 — the
+    ~32 MB/frame readback at 60Hz (~1.9 GB/s) saturates a memory
+    channel that dmabuf would have avoided. 1080p is fine.
+
+  The gap is that importing a client dmabuf as a Dawn render/copy
+  target on the core process's compositing device needs
+  `SharedTextureMemory` machinery that lives in the GPU process today
+  — the existing `createTextureFromDmabuf` import is sampler-only via
+  the GPU process (`TextureBinding` usage, perpetual `BeginAccess`,
+  no `EndAccess` until teardown). A render-target import path would
+  need: (a) a new wire frame analogous to `ImportClientTex` but with
+  `RenderAttachment | CopyDst` usage and proper per-frame
+  `BeginAccess`/`EndAccess` brackets; (b) per-modifier usage probing
+  against Dawn — most tiled modifiers (NVIDIA PCI_BAR1 etc.) reject
+  `RenderAttachment`, so the compose path likely has to go through
+  an intermediate texture + `copyTextureToTexture` for those; (c) a
+  release-lifecycle tracker for the imported textures. Sized roughly
+  3-5 days, with portability work likely on top (the bundled Dawn
+  already needed a dedicated-alloc fix for sampler-only dmabuf on
+  NVIDIA tiled modifiers — render-target imports likely surface a
+  similar second round). Before sizing for real, spike: probe whether
+  Dawn's `SharedTextureMemory::Create` accepts `RenderAttachment |
+  CopyDst` for representative Mesa + NVIDIA client modifiers.
+
+  The cursor sub-session
+  (`ext_image_copy_capture_cursor_session_v1.get_capture_session`)
+  is a similar stub: it constructs the inner session but advertises
+  zero formats + done so clients gracefully read "cursor capture not
+  available."
+
 - **Known race: intercept-worker teardown** (`test/intercept-worker.gpu.
   mjs` flake ~24%). Missing Worker→core teardown handshake -- the
   Worker keeps calling `outputProducer.acquire()` after core has
@@ -496,7 +540,14 @@ type-check under `tsc --strict`.
   (read-only toplevel enumeration with identifier + app_id + title
   for status panels, window switchers, screen-share window pickers;
   tested end-to-end via the `ext-foreign-toplevel-client` test
-  client).
+  client),
+  `ext_image_copy_capture_manager_v1` / `_session_v1` / `_frame_v1`
+  + `ext_image_capture_source_v1` +
+  `ext_output_image_capture_source_manager_v1` +
+  `ext_foreign_toplevel_image_capture_source_manager_v1`
+  (output and per-toplevel screenshot/screen-share capture into
+  client shm buffers; tested end-to-end via the
+  `ext-image-copy-capture-client` test client).
 - **Implemented, input-region path exercised via hit-testing:** `wl_region`
   (opaque region stored but unconsumed -- see "Read first");
   `zwp_linux_dmabuf_feedback_v1` (exercised by real WSI clients).

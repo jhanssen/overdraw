@@ -21,7 +21,7 @@ to keep in mind:
 
 ## Current state
 
-Overdraw advertises **24** registry-visible globals (one of which,
+Overdraw advertises **27** registry-visible globals (one of which,
 `wl_output`, is per-output). The full list, grouped:
 
 - Core wayland: `wl_compositor` v6, `wl_subcompositor` v1,
@@ -33,7 +33,10 @@ Overdraw advertises **24** registry-visible globals (one of which,
   `wp_fractional_scale_manager_v1` v1,
   `wp_linux_drm_syncobj_manager_v1` v1, `ext_workspace_manager_v1` v1,
   `ext_data_control_manager_v1` v1,
-  `ext_foreign_toplevel_list_v1` v1.
+  `ext_foreign_toplevel_list_v1` v1,
+  `ext_image_copy_capture_manager_v1` v1,
+  `ext_output_image_capture_source_manager_v1` v1,
+  `ext_foreign_toplevel_image_capture_source_manager_v1` v1.
 - Unstable: `zwp_linux_dmabuf_v1` v5,
   `zwp_primary_selection_device_manager_v1` v1,
   `zxdg_decoration_manager_v1` v1, `zxdg_output_manager_v1` v3.
@@ -90,18 +93,30 @@ within the first hour of using the compositor.
 
 - **`ext_image_copy_capture_manager_v1`** plus
   **`ext_output_image_capture_source_manager_v1`** plus
-  **`ext_foreign_toplevel_image_capture_source_manager_v1`** — the
-  standardized successor to `zwlr_screencopy_manager_v1`. Used by
-  modern `grim`, by `xdg-desktop-portal-wlr`, by OBS, by Discord
-  screen-share, by any tool that wants pixels off the screen.
-  Implements as a one-shot or repeated CPU/GPU copy of an output's
-  framebuffer (or a single toplevel's contents) into a client-mapped
-  shm or dmabuf. Effort: ~2 days as a group; needs GPU-process help
-  to copy a scanout texture into a client buffer.
+  **`ext_foreign_toplevel_image_capture_source_manager_v1`** —
+  landed. Output and per-toplevel capture into client shm buffers.
+  Sessions advertise `buffer_size` + `shm_format(argb8888,xrgb8888)`
+  + `done`; frames arm on `capture()` and fire `ready` on the next
+  scanout flip-complete (the same edge that drives wp_presentation
+  feedback, so `presentation_time` carries the actual page-flip
+  timestamp). Per-output source composes the resident content stack
+  via `composeScene` + `readbackTexture`; per-toplevel source
+  composes the single window via `composeWindows`. Toplevel unmap
+  fires `session.stopped`; output mode change re-advertises
+  constraints. **Gaps:** dmabuf destination buffers not advertised
+  (importing a client dmabuf as a render/copy target on coreDevice
+  needs Dawn SharedTextureMemory wiring that does not exist in the
+  core process today — the existing dmabuf import is sampler-only
+  via the GPU process). Clients that bind the manager and find no
+  `dmabuf_format` in a session fall back to shm; this is fine for
+  `grim`, `xdg-desktop-portal-wlr`'s shm path, and OBS's shm
+  fallback. The cursor sub-session
+  (`ext_image_copy_capture_cursor_session_v1`) is stubbed:
+  `get_capture_session` advertises zero formats so clients see "no
+  cursor capture available" and back off.
   - Alternative: `zwlr_screencopy_manager_v1` is the older variant
-    of the same thing; it is what existing tools tend to still bind
-    against. Implementing both costs little extra once the underlying
-    copy path exists. Pick one and document; clients fall back.
+    of the same thing; some existing tools still bind it. Not
+    implemented; clients fall back to `ext_image_copy_capture`.
 
 - **`ext_data_control_manager_v1`** — landed. The control device
   bypasses keyboard focus: a clipboard manager, `wl-copy`, or
@@ -253,7 +268,7 @@ break a user's day.
   effects; hyprland-only of the three. Wait for adoption.
 
 - **`zwlr_screencopy_manager_v1`** + **`zwlr_export_dmabuf_manager_v1`**
-  — older screen-capture protocols, subsumed by the
+  — older screen-capture protocols, subsumed by the now-landed
   `ext_image_copy_capture_*` set in Tier 1. Land if real users still
   bind these; otherwise let `ext_image_copy_capture` cover the surface.
 
@@ -269,8 +284,9 @@ public release:
 4. `ext_idle_notifier_v1` + `zwp_idle_inhibit_manager_v1` (~1 day
    together; idle infrastructure).
 5. `ext_session_lock_manager_v1` (~1.5 days; screen lock).
-6. `ext_image_copy_capture_manager_v1` + companions (~2 days;
-   screenshots, screen share, OBS).
+6. ~~`ext_image_copy_capture_manager_v1` + companions~~ — landed
+   (shm destinations; dmabuf destination + cursor sub-session are
+   gaps).
 
 That's roughly a week of work and brings overdraw to "a non-hostile
 reviewer can use it for an afternoon without immediately hitting a

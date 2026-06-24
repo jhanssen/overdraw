@@ -238,6 +238,7 @@ export async function setupCompositor(opts = {}) {
   const onFlipComplete = (outputId, tvSec, tvNsec, seq) => {
     state?.dispatchFrameCallbacksForOutput?.(Math.round(performance.now()), outputId);
     state?.dispatchPresentationFeedbackForOutput?.(outputId, tvSec, tvNsec, seq);
+    state?.dispatchCaptureForOutput?.(outputId, tvSec, tvNsec);
   };
 
   // Headless by default: the JS compositor renders into an offscreen target

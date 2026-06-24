@@ -319,6 +319,17 @@ target_include_directories(ext-foreign-toplevel-client PRIVATE
     ${CMAKE_SOURCE_DIR}/native/wayland/generated)
 target_link_libraries(ext-foreign-toplevel-client PRIVATE ${WAYLAND_CLIENT_LIBRARIES})
 
+# ---- ext_image_copy_capture test client (output + per-toplevel shm capture) ----
+add_executable(ext-image-copy-capture-client
+    test/ext-image-copy-capture-client.c
+    native/wayland/generated/ext-image-capture-source-v1-protocol.c
+    native/wayland/generated/ext-image-copy-capture-v1-protocol.c
+    native/wayland/generated/ext-foreign-toplevel-list-v1-protocol.c)
+target_include_directories(ext-image-copy-capture-client PRIVATE
+    ${WAYLAND_CLIENT_INCLUDE_DIRS}
+    ${CMAKE_SOURCE_DIR}/native/wayland/generated)
+target_link_libraries(ext-image-copy-capture-client PRIVATE ${WAYLAND_CLIENT_LIBRARIES})
+
 # ---- DnD test client (drag-and-drop) ----
 add_executable(dnd-test-client
     test/dnd-test-client.c

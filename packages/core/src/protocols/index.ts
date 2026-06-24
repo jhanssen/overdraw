@@ -73,6 +73,9 @@ const GLOBALS = [
   "ext_data_control_manager_v1",
   "wp_presentation",
   "ext_foreign_toplevel_list_v1",
+  "ext_output_image_capture_source_manager_v1",
+  "ext_foreign_toplevel_image_capture_source_manager_v1",
+  "ext_image_copy_capture_manager_v1",
 ];
 
 // Interfaces created via requests (new_id), registered without a global so
@@ -106,6 +109,10 @@ const CHILD_INTERFACES = [
   "ext_data_control_offer_v1",
   "wp_presentation_feedback",
   "ext_foreign_toplevel_handle_v1",
+  "ext_image_capture_source_v1",
+  "ext_image_copy_capture_session_v1",
+  "ext_image_copy_capture_frame_v1",
+  "ext_image_copy_capture_cursor_session_v1",
 ];
 
 // Load all generated signature modules, keyed by interface name.
@@ -723,6 +730,7 @@ export async function installProtocols(
     ext_data_control_manager_v1: await import("./ext_data_control_v1.js"),
     wp_presentation: await import("./wp_presentation.js"),
     ext_foreign_toplevel_list_v1: await import("./ext_foreign_toplevel_list_v1.js"),
+    ext_output_image_capture_source_manager_v1: await import("./ext_image_copy_capture_v1.js"),
   };
 
   // Some child interfaces have handlers from a sibling module's named exports.
@@ -744,6 +752,7 @@ export async function installProtocols(
   const xwlShellMod = await import("./xwayland_shell_v1.js");
   const extDataControlMod = await import("./ext_data_control_v1.js");
   const extForeignTopMod = await import("./ext_foreign_toplevel_list_v1.js");
+  const captureMod = await import("./ext_image_copy_capture_v1.js");
   const childHandlers: Record<string, object> = {
     wl_pointer: seatMod.makePointer(ctx),
     wl_keyboard: seatMod.makeKeyboard(ctx),
@@ -780,6 +789,10 @@ export async function installProtocols(
     // still needs a handler-shaped object to register.
     wp_presentation_feedback: {},
     ext_foreign_toplevel_handle_v1: extForeignTopMod.makeExtForeignToplevelHandle(ctx),
+    ext_image_capture_source_v1: captureMod.makeImageCaptureSource(ctx),
+    ext_image_copy_capture_session_v1: captureMod.makeImageCopyCaptureSession(ctx),
+    ext_image_copy_capture_frame_v1: captureMod.makeImageCopyCaptureFrame(ctx),
+    ext_image_copy_capture_cursor_session_v1: captureMod.makeImageCopyCaptureCursorSession(ctx),
   };
 
   // The apply target forwards lazily: the seat is constructed below and
@@ -800,6 +813,10 @@ export async function installProtocols(
     wl_seat: seatMod.default(ctx, focusDriver),
     zwp_primary_selection_device_manager_v1: ddmMod.makePrimaryManager(ctx),
     wp_cursor_shape_manager_v1: cursorShapeMod.makeCursorShapeManager(ctx),
+    ext_foreign_toplevel_image_capture_source_manager_v1:
+      captureMod.makeForeignToplevelImageCaptureSourceManager(ctx),
+    ext_image_copy_capture_manager_v1:
+      captureMod.makeImageCopyCaptureManager(ctx),
   };
 
   for (const name of CHILD_INTERFACES) {
@@ -840,6 +857,20 @@ export async function installProtocols(
   // after the runtime is up so inbound activate / remove / create
   // requests route to the bundled workspace plugin.
   extWorkspaceMod.installExtWorkspaceBusHooks(ctx);
+
+  // ext_image_copy_capture_v1: subscribe to window.unmap (toplevel-source
+  // session.stopped) and output.pre-remove (output-source session.stopped),
+  // and re-advertise constraints on output.changed (mode swap / resize).
+  captureMod.installImageCopyCaptureBusHooks(ctx);
+
+  // Capture-frame dispatch. The protocol fires `ready` on the same flip-
+  // complete edge that drives wp_presentation feedback (so the
+  // presentation_time event carries the actual scanout timestamp).
+  // dispatchCaptureForOutput walks armed frames whose source matches
+  // outputId and writes pixels into their attached buffers.
+  state.dispatchCaptureForOutput = (outputId, tvSec, tvNsec) => {
+    captureMod.dispatchCaptureForOutput(ctx, outputId, tvSec, tvNsec);
+  };
 
   return state;
 }

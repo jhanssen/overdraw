@@ -390,6 +390,12 @@ export interface CompositorSink {
     outputId: number;
     windows: ReadonlyArray<{ id: number; rect?: { x: number; y: number; w: number; h: number } }>;
   }): import("../gpu/compositor.js").LiveWindowCompHandle;
+  // Async GPU->CPU readback of an arbitrary texture (compose target or
+  // similar). Returns tightly-packed BGRA bytes (w*h*4). Used by the
+  // ext_image_copy_capture_v1 shm destination path. Optional so non-
+  // JsCompositor sinks (none today) need not implement it.
+  readbackTexture?(tex: GPUTexture, w: number, h: number):
+    Promise<{ width: number; height: number; data: Uint8Array }>;
   // Phase 5b: render the listed windows into a pre-allocated target view.
   // When producerSurfaceBufId is set, the compose pass is wrapped in
   // producer Begin/End frames on the core wire keyed on that surfaceBufId
@@ -619,6 +625,13 @@ export interface CompositorState {
   // CLOCK_MONOTONIC seconds-since-boot. Set by installProtocols.
   dispatchPresentationFeedbackForOutput?: (outputId: number, tvSec: bigint,
                                            tvNsec: number, seq: number) => void;
+  // Per-output ext_image_copy_capture_v1 frame dispatch. Fired on the same
+  // flip-complete edge as wp_presentation feedback: walks the set of armed
+  // capture frames whose source matches outputId (output sources directly,
+  // toplevel sources picked up wherever the toplevel resides) and writes
+  // pixels into their attached client buffers, then sends `ready` with the
+  // scanout timestamp threaded through `presentation_time`.
+  dispatchCaptureForOutput?: (outputId: number, tvSec: bigint, tvNsec: number) => void;
   // Run just before the per-frame renderFrame. Used by the animation
   // evaluator (core-plugin-api.md §9) to advance active animations and
   // write the new per-surface state values for this frame. Set by

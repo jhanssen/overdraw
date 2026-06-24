@@ -1323,6 +1323,11 @@ addon.setOnFlipComplete?.((outputId, tvSec, tvNsec, seq) => {
   // timestamp. Optional-chained so a state without the dispatcher (mid-
   // bring-up) is silent.
   state?.dispatchPresentationFeedbackForOutput?.(outputId, tvSec, tvNsec, seq);
+  // ext_image_copy_capture_v1 frame dispatch: capture frames armed against
+  // this output (or against a toplevel residing on it) capture pixels into
+  // their attached client buffers and fire `ready` carrying the scanout
+  // timestamp via presentation_time.
+  state?.dispatchCaptureForOutput?.(outputId, tvSec, tvNsec);
 });
 
 // Bootstrap the frame loop. addon.wake() schedules the first render now

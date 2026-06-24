@@ -97,6 +97,20 @@ function fallback(state: CompositorState): OutputRecord {
   };
 }
 
+// Resolve a wl_output resource back to its outputId. Walks the tracked
+// set; outputs are few, so the cost is negligible. Returns null if the
+// resource is unknown (destroyed / never bound on this state).
+export function outputIdForWlOutput(state: CompositorState, resource: Resource):
+  number | null
+{
+  const tracked = state.wlOutputResources;
+  if (!tracked) return null;
+  for (const [outputId, set] of tracked) {
+    if (set.has(resource)) return outputId;
+  }
+  return null;
+}
+
 // Re-emit the full event burst to every bound wl_output resource for the
 // given output id. Destroyed resources are removed from the tracking set
 // in-line. Silent no-op if state.events isn't populated yet (e.g. mid-

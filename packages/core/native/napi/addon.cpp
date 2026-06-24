@@ -12,6 +12,7 @@
 #include <execinfo.h>
 #include <fcntl.h>
 #include <signal.h>
+#include <sys/mman.h>  // munmap (capture-destination writable mappings)
 #include <sys/types.h>  // dev_t
 #include <sys/sysmacros.h>  // minor()
 #include <unistd.h>
@@ -1818,6 +1819,47 @@ napi_value ShmView(napi_env env, napi_callback_info info) {
     return ab;
 }
 
+// shmMapWritable(poolId, offset, length) -> ArrayBuffer | null
+// An INDEPENDENT writable mapping over the pool's fd, covering the requested
+// region. The default shmView mapping is MAP_PRIVATE / PROT_READ; capture-
+// destination buffers need MAP_SHARED / PROT_READ|PROT_WRITE so writes the
+// compositor performs into the buffer are visible to the client when it
+// re-reads the shm contents. The returned ArrayBuffer owns its own mmap;
+// finalization runs munmap. Returns null on out-of-range / mmap failure.
+struct WritableMmapHandle {
+    void* base;
+    size_t size;
+};
+void WritableMmapFinalize(napi_env /*env*/, void* /*data*/, void* hint) {
+    auto* h = static_cast<WritableMmapHandle*>(hint);
+    if (h) {
+        if (h->base && h->size) ::munmap(h->base, h->size);
+        delete h;
+    }
+}
+napi_value ShmMapWritable(napi_env env, napi_callback_info info) {
+    size_t argc = 3;
+    napi_value argv[3];
+    napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+    uint32_t poolId = 0, offset = 0, length = 0;
+    napi_get_value_uint32(env, argv[0], &poolId);
+    napi_get_value_uint32(env, argv[1], &offset);
+    napi_get_value_uint32(env, argv[2], &length);
+    void* mmapBase = nullptr;
+    size_t mmapSize = 0;
+    uint8_t* p = g_addon.shm.mapWritable(poolId, offset, length, &mmapBase, &mmapSize);
+    if (!p) return nullptr;
+    auto* hint = new WritableMmapHandle{mmapBase, mmapSize};
+    napi_value ab;
+    if (napi_create_external_arraybuffer(env, p, length, WritableMmapFinalize,
+                                         hint, &ab) != napi_ok) {
+        if (mmapBase) ::munmap(mmapBase, mmapSize);
+        delete hint;
+        return nullptr;
+    }
+    return ab;
+}
+
 napi_value Stop(napi_env env, napi_callback_info) {
     if (g_addon.loopRunning) {
         // Stop the headless frame driver first so no render fires while the
@@ -2974,6 +3016,10 @@ napi_value Init(napi_env env, napi_value exports) {
     napi_value fnShmView;
     napi_create_function(env, "shmView", NAPI_AUTO_LENGTH, ShmView, nullptr, &fnShmView);
     napi_set_named_property(env, exports, "shmView", fnShmView);
+    napi_value fnShmMapWritable;
+    napi_create_function(env, "shmMapWritable", NAPI_AUTO_LENGTH,
+                         ShmMapWritable, nullptr, &fnShmMapWritable);
+    napi_set_named_property(env, exports, "shmMapWritable", fnShmMapWritable);
     napi_value fnCreateTexDmabuf;
     napi_create_function(env, "createTextureFromDmabuf", NAPI_AUTO_LENGTH,
                          CreateTextureFromDmabuf, nullptr, &fnCreateTexDmabuf);

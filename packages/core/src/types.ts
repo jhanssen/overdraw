@@ -350,6 +350,13 @@ export interface Addon {
   // wl_shm_pool.destroy (Wayland spec).
   shmBufferRef(poolId: number): void;
   shmBufferUnref(poolId: number): void;
+  // Independent MAP_SHARED / PROT_READ|PROT_WRITE mapping over the pool's
+  // fd for the requested region. The returned ArrayBuffer owns its own
+  // mmap (finalized on GC). The default shmView mapping is read-only
+  // private; capture destinations (ext_image_copy_capture_v1 shm output)
+  // need writes to propagate back to the client's view of the fd. Returns
+  // null on out-of-range or mmap failure.
+  shmMapWritable(poolId: number, offset: number, length: number): ArrayBuffer | null;
 
   // Register a callback fired once per OutputDescriptor message from the GPU
   // process. The descriptor carries the output's identity + geometry (see

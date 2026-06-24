@@ -89,4 +89,28 @@ const uint8_t* ShmRegistry::view(uint32_t poolId, size_t offset, size_t len) con
     return static_cast<const uint8_t*>(p.base) + offset;
 }
 
+uint8_t* ShmRegistry::mapWritable(uint32_t poolId, size_t offset, size_t len,
+                                  void** out_mmap_base, size_t* out_mmap_size) {
+    if (out_mmap_base) *out_mmap_base = nullptr;
+    if (out_mmap_size) *out_mmap_size = 0;
+    auto it = pools_.find(poolId);
+    if (it == pools_.end()) return nullptr;
+    const Pool& p = it->second;
+    if (p.fd < 0) return nullptr;
+    if (offset > p.size || len > p.size - offset) return nullptr;
+    // mmap offset must be page-aligned; widen the window to the surrounding
+    // page boundary and return a pointer that points at the requested byte.
+    const size_t pageSize = static_cast<size_t>(::sysconf(_SC_PAGESIZE));
+    const size_t pageMask = pageSize - 1;
+    const size_t aligned = offset & ~pageMask;
+    const size_t inset = offset - aligned;
+    const size_t mapLen = inset + len;
+    void* base = ::mmap(nullptr, mapLen, PROT_READ | PROT_WRITE, MAP_SHARED,
+                        p.fd, static_cast<off_t>(aligned));
+    if (base == MAP_FAILED) return nullptr;
+    if (out_mmap_base) *out_mmap_base = base;
+    if (out_mmap_size) *out_mmap_size = mapLen;
+    return static_cast<uint8_t*>(base) + inset;
+}
+
 }  // namespace overdraw::core
