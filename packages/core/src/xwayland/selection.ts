@@ -191,9 +191,13 @@ interface OutgoingTransfer {
   incr: boolean;
   eof: boolean;
   selectionNotifySent: boolean;
-  // For INCR transfers: bytes staged waiting for the next PROPERTY_DELETE.
-  // null when nothing is staged.
-  pendingChunk: Buffer | null;
+  // INCR continuation gating: true after we've written a chunk (or the
+  // INCR header) and are waiting for the requestor's PROPERTY_DELETE.
+  // While true, no further property writes happen -- a second
+  // ChangeProperty(REPLACE) before the requestor reads would clobber
+  // the prior chunk. Flipped to false in onRequestorPropertyDelete; the
+  // delete handler immediately writes the next chunk and flips back true.
+  awaitingRequestorAck: boolean;
   // For INCR transfers: set once we've written the final empty property
   // (EOF signal). The next PROPERTY_DELETE on the requestor's destination
   // property destroys the transfer.
@@ -653,23 +657,37 @@ export function startSelectionBridge(
       pipeReadFd: readFd, readStream,
       buffer: [], bufferTotal: 0,
       incr: false, eof: false, selectionNotifySent: false,
-      pendingChunk: null, eofPropertyWritten: false,
+      awaitingRequestorAck: false, eofPropertyWritten: false,
     };
     sel.outgoingTransfers.set(requestor, transfer);
 
+    const onDataOrEof = (): void => {
+      // Two phases:
+      //   - Pre-INCR: pumpOutgoing decides whether to switch to INCR or
+      //     emit a single small property. Bytes accumulate in the buffer.
+      //   - INCR: pumpOutgoing is a no-op; chunks are written only in
+      //     response to the requestor's PROPERTY_DELETE. EOF, however,
+      //     may need to flush a terminator immediately if the requestor
+      //     is already waiting -- otherwise the transfer deadlocks.
+      if (!transfer.incr) {
+        pumpOutgoing(sel, transfer);
+      } else {
+        maybeWriteNextIncrChunk(transfer);
+      }
+    };
     readStream.on("data", (chunk: string | Buffer) => {
       const buf = typeof chunk === "string" ? Buffer.from(chunk) : chunk;
       transfer.buffer.push(buf);
       transfer.bufferTotal += buf.byteLength;
-      pumpOutgoing(sel, transfer);
+      onDataOrEof();
     });
     readStream.on("end", () => {
       transfer.eof = true;
-      pumpOutgoing(sel, transfer);
+      onDataOrEof();
     });
-    readStream.on("error", (err) => {
+    readStream.on("error", () => {
       transfer.eof = true;
-      pumpOutgoing(sel, transfer);
+      onDataOrEof();
     });
 
     // Hand the write-fd to the wayland source. send_send expects a WaylandFd
@@ -686,18 +704,12 @@ export function startSelectionBridge(
 
   function pumpOutgoing(sel: SelectionInstance, t: OutgoingTransfer): void {
     if (t.incr) {
-      // INCR: stage at most one chunk waiting for PROPERTY_DELETE.
-      if (t.pendingChunk !== null) return;
-      if (t.eofPropertyWritten) return;
-      if (t.bufferTotal === 0 && !t.eof) return;
-      const next = takeBytes(t, INCR_CHUNK_SIZE);
-      if (next.byteLength === 0 && !t.eof) return;
-      // Write immediately. Either:
-      //   - the requestor just consumed the previous chunk (PROPERTY_DELETE
-      //     called us via the property-notify hook) and is ready for the next;
-      //   - we are writing the first chunk after the INCR-declaration property
-      //     (SelectionNotify has been sent; requestor processes new value).
-      writeOutgoingChunk(t, next);
+      // Once we're in INCR mode, the requestor's PROPERTY_DELETE on its
+      // destination property is the SOLE driver of chunk writes -- not
+      // ReadStream data events. Buffer accumulates; the next PROPERTY_DELETE
+      // calls maybeWriteNextIncrChunk to actually write. This avoids racing
+      // the X server with two ChangeProperty(REPLACE)s back-to-back (the
+      // second would clobber the first before the requestor reads it).
       return;
     }
 
@@ -718,14 +730,37 @@ export function startSelectionBridge(
     // Large: switch to INCR. Write the INCR-typed property (value = size
     // hint, 4 bytes), send SelectionNotify, then continue chunking on
     // PROPERTY_DELETE.
+    //
+    // The size hint is just informational for the requestor (most ignore
+    // it). We don't know the final size yet (the wl source hasn't EOF'd);
+    // pass the current buffered size as a best-effort upper bound and
+    // accept that this is approximate.
     t.incr = true;
     const hint = new Uint32Array([t.bufferTotal]);
     addon.xwmChangeProperty(t.requestor, t.property, atoms.INCR, 32, hint, 1);
     addon.xwmSendSelectionNotify(
       t.requestor, t.selection, t.target, t.property, t.timestamp);
     t.selectionNotifySent = true;
+    t.awaitingRequestorAck = true;
     // The requestor will PROPERTY_DELETE the destination property after it
-    // reads the INCR header; that triggers the first chunk write.
+    // reads the INCR header; that triggers the first chunk write via
+    // maybeWriteNextIncrChunk.
+  }
+
+  // Write the next INCR chunk if the requestor is ready (i.e. has acked
+  // the previous one via PROPERTY_DELETE). Skip if we're still awaiting
+  // ack, or if EOF has already been signaled. Called from:
+  //   - onRequestorPropertyDelete (the requestor just acked)
+  //   - ReadStream 'end' (EOF arrived while requestor was already ready;
+  //     write the zero-length terminator now rather than wait for data
+  //     that will never come)
+  function maybeWriteNextIncrChunk(t: OutgoingTransfer): void {
+    if (t.eofPropertyWritten) return;
+    if (t.awaitingRequestorAck) return;
+    if (t.bufferTotal === 0 && !t.eof) return;
+    const chunk = takeBytes(t, INCR_CHUNK_SIZE);
+    writeOutgoingChunk(t, chunk);
+    t.awaitingRequestorAck = true;
   }
 
   function writeBytesProperty(
@@ -771,8 +806,11 @@ export function startSelectionBridge(
       destroyOutgoingTransfer(sel, t);
       return;
     }
-    // Ready for the next chunk.
-    pumpOutgoing(sel, t);
+    // Requestor consumed the previous chunk (or the INCR header) and is
+    // ready for the next. Flip the gate, then write whatever's queued
+    // (or wait, if no data has arrived yet on the pipe).
+    t.awaitingRequestorAck = false;
+    maybeWriteNextIncrChunk(t);
   }
 
   function destroyOutgoingTransfer(sel: SelectionInstance, t: OutgoingTransfer): void {
@@ -842,7 +880,10 @@ export function startSelectionBridge(
     // Outgoing transfer INCR continuation (DELETE on requestor).
     if (ev.propertyState === PROPERTY_DELETE && watchedRequestors.has(window)) {
       const out = findOutgoingTransferByRequestor(window);
-      if (out && ev.atom === out.t.property) onRequestorPropertyDelete(out.t);
+      if (out && ev.atom === out.t.property) {
+        onRequestorPropertyDelete(out.t);
+      } else {
+      }
     }
   }
 
