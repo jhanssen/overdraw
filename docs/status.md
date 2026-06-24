@@ -461,6 +461,9 @@ type-check under `tsc --strict`.
 
 ### Protocol coverage matrix
 
+(For what's NOT implemented, plus a planning order, see
+`docs/protocol-coverage.md`.)
+
 - **Tested end-to-end** (pixel or behavioral): `wl_compositor`,
   `wl_surface` (attach/commit/frame/damage/transform/buffer-scale),
   `xdg_wm_base`/`xdg_surface`/`xdg_toplevel` (configure + states,
@@ -482,7 +485,10 @@ type-check under `tsc --strict`.
   Waybar `ext/workspaces` module consumes it),
   `wp_linux_drm_syncobj_v1` (NVIDIA proprietary clients),
   `wp_viewporter`/`wp_viewport`, `wp_fractional_scale_manager_v1`/
-  `wp_fractional_scale_v1`, `wp_cursor_shape_v1`.
+  `wp_fractional_scale_v1`, `wp_cursor_shape_v1`,
+  `ext_data_control_manager_v1` (clipboard + primary selection control
+  for unfocused clients; tested end-to-end via the
+  `ext-data-control-client` test client).
 - **Implemented, input-region path exercised via hit-testing:** `wl_region`
   (opaque region stored but unconsumed -- see "Read first");
   `zwp_linux_dmabuf_feedback_v1` (exercised by real WSI clients).

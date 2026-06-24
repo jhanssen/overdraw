@@ -29,6 +29,21 @@ export const KEYBOARD_EVENT = {
   focus: "keyboard.focus",
 } as const;
 
+// Selection (clipboard / primary) ownership changed -- a wl client set or
+// cleared a source, OR the Xwayland selection bridge published an X-owned
+// source. Subscribers (the data-control protocol layer; bookkeeping that
+// wants to react to "the active clipboard owner is different now") see one
+// event per logical change. The payload only names which selection moved;
+// readers consult state.{selection,primarySelection,xClipboardSource,
+// xPrimarySource} for the new owner.
+export type SelectionChangedEvent = {
+  kind: "clipboard" | "primary";
+};
+
+export const SELECTION_EVENT = {
+  changed: "selection.changed",
+} as const;
+
 // The event map: name -> payload. Extend here as new producers land.
 export interface CompositorEventMap {
   [WINDOW_EVENT.map]: WindowMapEvent;
@@ -37,6 +52,7 @@ export interface CompositorEventMap {
   [WINDOW_EVENT.stateBagChanged]: WindowStateBagChangedEvent;
   [WINDOW_EVENT.closing]: WindowClosingEvent;
   [KEYBOARD_EVENT.focus]: KeyboardFocusEvent;
+  [SELECTION_EVENT.changed]: SelectionChangedEvent;
 }
 
 export type CompositorBus = TypedBus<CompositorEventMap>;

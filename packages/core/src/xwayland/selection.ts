@@ -36,6 +36,7 @@ import * as fs from "node:fs";
 import type { CompositorState } from "../protocols/ctx.js";
 import type { Addon, Resource } from "../types.js";
 import type { Xwm, XwmEventMsg } from "./xwm.js";
+import { SELECTION_EVENT } from "../events/window-bus.js";
 
 // 64 KiB. Above this, outgoing transfers switch to INCR.
 const INCR_CHUNK_SIZE = 64 * 1024;
@@ -336,6 +337,10 @@ export function startSelectionBridge(
     if (sel.kind === "clipboard") state.xClipboardSource = sel.xSource;
     else state.xPrimarySource = sel.xSource;
     state.onXSelectionAvailable?.(sel.kind);
+    // Same broadcast wl_data_device's set_selection makes -- subscribers
+    // that bypass keyboard-focus gating (data-control) need to learn that
+    // an X-backed source took ownership of this selection.
+    state.bus?.emit(SELECTION_EVENT.changed, { kind: sel.kind });
   }
 
   // ---- focus gate ----

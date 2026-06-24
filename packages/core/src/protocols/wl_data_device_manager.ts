@@ -28,7 +28,7 @@ import type { ZwpPrimarySelectionSourceV1Handler } from "#protocols-gen/zwp_prim
 import type { ZwpPrimarySelectionOfferV1Handler } from "#protocols-gen/zwp_primary_selection_offer_v1.js";
 import type { Ctx } from "./ctx.js";
 import type { Resource, WaylandFd } from "../types.js";
-import { KEYBOARD_EVENT } from "../events/window-bus.js";
+import { KEYBOARD_EVENT, SELECTION_EVENT } from "../events/window-bus.js";
 
 // Map a wl_data_offer resource back to the source it represents, so receive() can
 // forward to the right source. Lives module-scope (keyed by offer resource).
@@ -255,6 +255,12 @@ function sendPrimaryTo(ctx: Ctx, clientId: number): void {
 }
 
 export default function makeDataDeviceManager(ctx: Ctx): WlDataDeviceManagerHandler {
+  // Expose the per-client push helpers so sibling protocol modules
+  // (ext_data_control) can re-fan a selection change to the keyboard-
+  // focused client without duplicating offer-minting code.
+  ctx.state.sendSelectionToClient = (clientId) => sendSelectionTo(ctx, clientId);
+  ctx.state.sendPrimaryToClient = (clientId) => sendPrimaryTo(ctx, clientId);
+
   // Resend BOTH selections to a client when it gains keyboard focus (selection
   // follows keyboard focus). Subscribe to the bus keyboard.focus event. The bus is
   // optional (GPU-free tests may omit it); subscribe only when present.
@@ -314,6 +320,9 @@ export function makeDataDevice(ctx: Ctx): WlDataDeviceHandler {
       // Notify the Xwayland selection bridge so it can claim / release the
       // X side. No-op when no bridge is installed.
       ctx.state.onWlSelectionChanged?.("clipboard", source ?? null, "data");
+      // Broadcast the change so any subscriber that bypasses keyboard-
+      // focus gating (the data-control protocol) re-pushes its offers.
+      ctx.state.bus?.emit(SELECTION_EVENT.changed, { kind: "clipboard" });
       // Push to the currently keyboard-focused client (selection follows focus).
       const focusClient = ctx.state.seat?.kbFocus?.clientId;
       if (focusClient != null) sendSelectionTo(ctx, focusClient);
@@ -336,7 +345,10 @@ export function makeDataSource(ctx: Ctx): WlDataSourceHandler {
     },
     destroy(resource) {
       ctx.state.dataSources?.delete(resource);
-      if (ctx.state.selection === resource) ctx.state.selection = null;
+      if (ctx.state.selection === resource) {
+        ctx.state.selection = null;
+        ctx.state.bus?.emit(SELECTION_EVENT.changed, { kind: "clipboard" });
+      }
     },
     set_actions(resource, dndActions) {
       // Source declares the DnD actions it supports (copy/move/ask).
@@ -423,6 +435,7 @@ export function makePrimaryDevice(ctx: Ctx): ZwpPrimarySelectionDeviceV1Handler 
     set_selection(resource, source, _serial) {
       ctx.state.primarySelection = source ?? null;
       ctx.state.onWlSelectionChanged?.("primary", source ?? null, "primary");
+      ctx.state.bus?.emit(SELECTION_EVENT.changed, { kind: "primary" });
       const focusClient = ctx.state.seat?.kbFocus?.clientId;
       if (focusClient != null) sendPrimaryTo(ctx, focusClient);
       else sendPrimaryTo(ctx, ctx.addon.clientId(resource));
@@ -439,7 +452,10 @@ export function makePrimarySource(ctx: Ctx): ZwpPrimarySelectionSourceV1Handler 
     },
     destroy(resource) {
       ctx.state.primarySources?.delete(resource);
-      if (ctx.state.primarySelection === resource) ctx.state.primarySelection = null;
+      if (ctx.state.primarySelection === resource) {
+        ctx.state.primarySelection = null;
+        ctx.state.bus?.emit(SELECTION_EVENT.changed, { kind: "primary" });
+      }
     },
   };
 }

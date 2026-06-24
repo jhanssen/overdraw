@@ -693,6 +693,18 @@ export interface CompositorState {
   // bridge; null/undefined elsewhere.
   receiveForXSource?:
     (kind: "clipboard" | "primary", mime: string, fd: number) => boolean;
+  // ext_data_control_v1 state. The control protocol exposes
+  // selection management for unfocused clients; each device subscribes
+  // to selection.changed and re-pushes the offer burst to every bound
+  // resource. Sentinel for the bus-subscribe-once guard lives alongside.
+  dataControlDevices?: Map<number, Set<Resource>>;
+  dataControlBusInstalled?: boolean;
+  // Helpers exposed by wl_data_device_manager so ext_data_control's
+  // set_selection / set_primary_selection can re-push to the keyboard-
+  // focused wl_data_device without duplicating the offer-minting code.
+  // Set by makeDataDeviceManager; null in pre-bring-up paths.
+  sendSelectionToClient?: (clientId: number) => void;
+  sendPrimaryToClient?: (clientId: number) => void;
   // Core-internal event bus. Producers (this layer + the seat) emit window/
   // keyboard events; subscribers (the plugin-forwarding layer in main.ts, the
   // clipboard layer, the future decoration registry) listen. Set by

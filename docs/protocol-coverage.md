@@ -93,11 +93,16 @@ within the first hour of using the compositor.
     against. Implementing both costs little extra once the underlying
     copy path exists. Pick one and document; clients fall back.
 
-- **`ext_data_control_manager_v1`** (or the older
-  `zwlr_data_control_manager_v1`) — what `wl-copy` / `wl-paste`
-  bind. Clipboard manager / history apps also use it. The selection
-  bridge already exists for the Xwayland direction; this is the
-  same pattern on the wl side. Effort: ~0.5 day.
+- **`ext_data_control_manager_v1`** — landed. The control device
+  bypasses keyboard focus: a clipboard manager, `wl-copy`, or
+  `wl-paste` can read or set both the clipboard and the primary
+  selection without needing any surface to be mapped or focused.
+  Backed by a new `selection.changed` event on the internal bus
+  that the control protocol layer subscribes to; the same event is
+  emitted from the standard `wl_data_device.set_selection` path and
+  from the Xwayland selection bridge so X-owned and wl-owned
+  selections fan out identically. Older `zwlr_data_control_manager_v1`
+  is not implemented; tools fall back to the ext variant.
 
 - **`xdg_activation_v1`** — focus-stealing protection. A launcher
   issues an activation token to the client it spawned; the client
@@ -248,7 +253,7 @@ public release:
 
 1. `xdg_activation_v1` (half day; trivial; biggest "feels right"
    improvement per hour spent).
-2. `ext_data_control_manager_v1` (half day; clipboard tools).
+2. ~~`ext_data_control_manager_v1`~~ — landed.
 3. `wp_presentation` (half day; video playback).
 4. `ext_idle_notifier_v1` + `zwp_idle_inhibit_manager_v1` (~1 day
    together; idle infrastructure).

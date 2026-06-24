@@ -291,6 +291,15 @@ target_include_directories(clipboard-test-client PRIVATE
     ${CMAKE_SOURCE_DIR}/native/wayland/generated)
 target_link_libraries(clipboard-test-client PRIVATE ${WAYLAND_CLIENT_LIBRARIES})
 
+# ---- ext-data-control test client (clipboard / primary selection without focus) ----
+add_executable(ext-data-control-client
+    test/ext-data-control-client.c
+    native/wayland/generated/ext-data-control-v1-protocol.c)
+target_include_directories(ext-data-control-client PRIVATE
+    ${WAYLAND_CLIENT_INCLUDE_DIRS}
+    ${CMAKE_SOURCE_DIR}/native/wayland/generated)
+target_link_libraries(ext-data-control-client PRIVATE ${WAYLAND_CLIENT_LIBRARIES})
+
 # ---- DnD test client (drag-and-drop) ----
 add_executable(dnd-test-client
     test/dnd-test-client.c

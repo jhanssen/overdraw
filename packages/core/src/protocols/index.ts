@@ -70,6 +70,7 @@ const GLOBALS = [
   "zwlr_output_manager_v1",
   "ext_workspace_manager_v1",
   "xwayland_shell_v1",
+  "ext_data_control_manager_v1",
 ];
 
 // Interfaces created via requests (new_id), registered without a global so
@@ -98,6 +99,9 @@ const CHILD_INTERFACES = [
   "ext_workspace_group_handle_v1",
   "ext_workspace_handle_v1",
   "xwayland_surface_v1",
+  "ext_data_control_device_v1",
+  "ext_data_control_source_v1",
+  "ext_data_control_offer_v1",
 ];
 
 // Load all generated signature modules, keyed by interface name.
@@ -701,6 +705,7 @@ export async function installProtocols(
     zwlr_output_manager_v1: await import("./zwlr_output_manager_v1.js"),
     ext_workspace_manager_v1: await import("./ext_workspace_v1.js"),
     xwayland_shell_v1: await import("./xwayland_shell_v1.js"),
+    ext_data_control_manager_v1: await import("./ext_data_control_v1.js"),
   };
 
   // Some child interfaces have handlers from a sibling module's named exports.
@@ -720,6 +725,7 @@ export async function installProtocols(
   const outputMgmtMod = await import("./zwlr_output_manager_v1.js");
   const extWorkspaceMod = await import("./ext_workspace_v1.js");
   const xwlShellMod = await import("./xwayland_shell_v1.js");
+  const extDataControlMod = await import("./ext_data_control_v1.js");
   const childHandlers: Record<string, object> = {
     wl_pointer: seatMod.makePointer(ctx),
     wl_keyboard: seatMod.makeKeyboard(ctx),
@@ -749,6 +755,9 @@ export async function installProtocols(
     ext_workspace_group_handle_v1: extWorkspaceMod.makeExtWorkspaceGroupHandle(ctx),
     ext_workspace_handle_v1: extWorkspaceMod.makeExtWorkspaceHandle(ctx),
     xwayland_surface_v1: xwlShellMod.makeXwaylandSurface(ctx),
+    ext_data_control_device_v1: extDataControlMod.makeExtDataControlDevice(ctx),
+    ext_data_control_source_v1: extDataControlMod.makeExtDataControlSource(ctx),
+    ext_data_control_offer_v1: extDataControlMod.makeExtDataControlOffer(ctx),
   };
 
   // The apply target forwards lazily: the seat is constructed below and
