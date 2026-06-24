@@ -157,7 +157,9 @@ nothing, with no error. Worst-first.
 
 - **Advertised-incomplete protocols (clients warn and fall back):**
   text-input, xdg-activation, toplevel-icon, system-bell. See the
-  protocol-coverage matrix.
+  protocol-coverage matrix below for what is implemented; see
+  `docs/protocol-coverage.md` for the gap analysis vs. sway / hyprland
+  and the suggested landing order for what isn't.
 
 - **Known race: intercept-worker teardown** (`test/intercept-worker.gpu.
   mjs` flake ~24%). Missing Worker→core teardown handshake -- the
