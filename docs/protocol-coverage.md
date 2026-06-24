@@ -57,11 +57,18 @@ tests, GPU tests, and doc updates.
 What a regular Wayland user (no games, no VMs, no IME) discovers
 within the first hour of using the compositor.
 
-- **`wp_presentation`** — feedback events report when a frame
-  actually scanned out. mpv uses it to align frames to vsync, profilers
-  use it for end-to-end timing. Without it video clients fall back to
-  estimated timestamps and show subtle stutter. Effort: ~0.5 day; the
-  GPU process already times scanout completion, this is plumbing.
+- **`wp_presentation`** — landed. Per-commit feedback resources carry
+  the actual scanout timestamp + refresh + vsync sequence + capability
+  flags. Clock advertised is `CLOCK_MONOTONIC`. Timestamps come from
+  the kernel `page_flip_handler2` on KMS (with the real vsync
+  sequence) and from the host `wl_surface.frame` time on nested mode
+  (sequence stays 0); the headless backend synthesizes a per-tick
+  monotonic timestamp. Supersession is implemented: if a new commit
+  arrives before the previous one scanned out, the old commit's
+  feedback is `discarded` per spec. Surface unmap discards any queued
+  feedbacks. The `sync_output` event names the wl_output the
+  presentation actually went to, resolved from the surface's residency
+  set.
 
 - **`ext_idle_notifier_v1`** — emits idle / resumed signals on a
   configured timeout. `swayidle` and equivalents are the only way to
@@ -254,7 +261,7 @@ public release:
 1. `xdg_activation_v1` (half day; trivial; biggest "feels right"
    improvement per hour spent).
 2. ~~`ext_data_control_manager_v1`~~ — landed.
-3. `wp_presentation` (half day; video playback).
+3. ~~`wp_presentation`~~ — landed.
 4. `ext_idle_notifier_v1` + `zwp_idle_inhibit_manager_v1` (~1 day
    together; idle infrastructure).
 5. `ext_session_lock_manager_v1` (~1.5 days; screen lock).

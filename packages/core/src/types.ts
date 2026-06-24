@@ -408,10 +408,14 @@ export interface Addon {
   switchOutputMode(outputId: number, width: number, height: number,
                    refreshMhz: number): void;
   // Register a callback fired once per drained KMS flip-complete; the outputId
-  // identifies WHICH output just flipped. JS uses this to dispatch
-  // wl_callback.done per output (surfaces on a 60Hz output get `done` at 60Hz
-  // even when a 240Hz output is flipping). Passing null clears.
-  setOnFlipComplete(cb: ((outputId: number) => void) | null): void;
+  // identifies WHICH output just flipped. tvSec / tvNsec are the page-flip /
+  // host-frame timestamp components on CLOCK_MONOTONIC (0/0 when no real
+  // timestamp is available); seq is the kernel vsync sequence on KMS (0
+  // elsewhere). JS uses (outputId) to dispatch wl_callback.done per output
+  // and (tvSec, tvNsec, seq) to drive wp_presentation. tvSec is a bigint to
+  // survive the u64 monotonic-clock range. Passing null clears.
+  setOnFlipComplete(cb: ((outputId: number, tvSec: bigint, tvNsec: number,
+                          seq: number) => void) | null): void;
   // Update the input backend's view of the multi-output layout (used for
   // pointer-space mapping and cursor clamping). Rects are in global logical
   // pixels. Called whenever state.outputs changes. Silent no-op if no input

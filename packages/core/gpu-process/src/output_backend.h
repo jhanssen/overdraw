@@ -116,7 +116,10 @@ class OutputBackend {
     // no-op. Both ultimately drive the core's wake/render state machine
     // through ctrl messages (FrameComplete from nested, ScanoutFlipComplete
     // from KMS).
-    using FrameDoneListener = std::function<void()>;
+    // Carries the host-frame timestamp (CLOCK_MONOTONIC components) for
+    // wp_presentation; the KMS backend's flip-complete listener has its own
+    // signature with the kernel vsync sequence included.
+    using FrameDoneListener = std::function<void(uint64_t tvSec, uint32_t tvNsec)>;
     virtual void setFrameDoneListener(FrameDoneListener /*cb*/) {}
 
     // Ensure the backend has a frame-done callback armed (i.e. the host

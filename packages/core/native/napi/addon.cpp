@@ -224,19 +224,31 @@ void notifyFrame() {
     napi_close_handle_scope(env, scope);
 }
 
-// Call the JS onFlipComplete(outputId) callback if registered. Fired once per
-// drained ScanoutFlipComplete (one outputId at a time). JS uses this to
-// dispatch wl_callback.done for surfaces resident on that output. Same-thread.
-void notifyFlipComplete(uint32_t outputId) {
+// Call the JS onFlipComplete(outputId, tvSec, tvNsec, seq) callback if
+// registered. Fired once per drained ScanoutFlipComplete (one outputId at a
+// time). JS uses this to dispatch wl_callback.done for surfaces resident on
+// that output AND to deliver wp_presentation feedback. tvSec / tvNsec are
+// CLOCK_MONOTONIC at the page-flip / host-frame moment (0/0 when unknown);
+// seq is the kernel-supplied vsync sequence on KMS (0 elsewhere).
+// Same-thread.
+void notifyFlipComplete(uint32_t outputId, uint64_t tvSec, uint32_t tvNsec, uint32_t seq) {
     if (!g_addon.onFlipComplete) return;
     napi_env env = g_addon.env;
     napi_handle_scope scope;
     napi_open_handle_scope(env, &scope);
-    napi_value cb, undefined, arg;
+    napi_value cb, undefined;
     napi_get_reference_value(env, g_addon.onFlipComplete, &cb);
     napi_get_undefined(env, &undefined);
-    napi_create_uint32(env, outputId, &arg);
-    napi_call_function(env, undefined, cb, 1, &arg, nullptr);
+    napi_value args[4];
+    napi_create_uint32(env, outputId, &args[0]);
+    // u64 -> bigint for tvSec to survive Number's 2^53 ceiling on long-lived
+    // monotonic clocks (CLOCK_MONOTONIC counts seconds since boot; ~292 years
+    // of headroom at u64, decades at i53). JS can convert to ms via
+    // Number(BigInt) when needed.
+    napi_create_bigint_uint64(env, tvSec, &args[1]);
+    napi_create_uint32(env, tvNsec, &args[2]);
+    napi_create_uint32(env, seq, &args[3]);
+    napi_call_function(env, undefined, cb, 4, args, nullptr);
     napi_close_handle_scope(env, scope);
 }
 
@@ -311,19 +323,26 @@ void onHeadlessFrameTimer(uv_timer_t*) {
     // output so dispatchFrameCallbacksForOutput still fires per tick. Tests
     // (which are the headless use case) depend on wl_callback.done arriving
     // on the steady ~60Hz cadence.
-    if (g_addon.onFlipComplete) notifyFlipComplete(0);
+    if (g_addon.onFlipComplete) {
+        // Headless has no real page-flip; sample CLOCK_MONOTONIC now so JS
+        // sees a plausible "presented" timestamp.
+        struct timespec ts{};
+        clock_gettime(CLOCK_MONOTONIC, &ts);
+        notifyFlipComplete(0, static_cast<uint64_t>(ts.tv_sec),
+                              static_cast<uint32_t>(ts.tv_nsec), 0);
+    }
     wake();
 }
 
-// Drain the queued KMS flip-completes and fire JS onFlipComplete(outputId) for
-// each. Frame-callback dispatch happens in JS per outputId, so a surface
-// resident only on output 0 (60Hz) wakes at ~60Hz even when output 1 (240Hz)
-// is also flipping. Nested pushes its FrameComplete as outputId=0; headless
-// synthesizes one in the frame-timer trampoline.
+// Drain the queued KMS flip-completes and fire JS onFlipComplete(outputId,
+// tvSec, tvNsec, seq) for each. Frame-callback dispatch happens in JS per
+// outputId, so a surface resident only on output 0 (60Hz) wakes at ~60Hz even
+// when output 1 (240Hz) is also flipping. Nested pushes its FrameComplete as
+// outputId=0; headless synthesizes one in the frame-timer trampoline.
 void drainFlipCompletes() {
     if (!g_addon.compositor) return;
-    auto outputs = g_addon.compositor->takeFlipCompletes();
-    for (uint32_t outputId : outputs) notifyFlipComplete(outputId);
+    auto entries = g_addon.compositor->takeFlipCompletes();
+    for (auto& e : entries) notifyFlipComplete(e.outputId, e.tvSec, e.tvNsec, e.seq);
 }
 
 void onFrameComplete() {

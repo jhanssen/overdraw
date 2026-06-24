@@ -1094,9 +1094,15 @@ int run(int wireFd, int ctrlFd, int inputFd, bool headless,
     // after the first present; without (b) a slot stays PENDING forever
     // and acquireOutputTextureHandle eventually returns null.
     if (!headless && !outputKms) {
-        output->setFrameDoneListener([ctrlFd]() {
+        output->setFrameDoneListener([ctrlFd](uint64_t tvSec, uint32_t tvNsec) {
             ipc::Message m{};
             m.tag = ipc::Tag::FrameComplete;
+            // Host wl_surface.frame timestamp -- forwarded for
+            // wp_presentation. Sequence stays 0 (the wl protocol has no
+            // vsync sequence number).
+            m.tvSec  = tvSec;
+            m.tvNsec = tvNsec;
+            m.seq    = 0;
             ipc::sendMessage(ctrlFd, m);
         });
         output->armFrameCallback();
@@ -2733,7 +2739,8 @@ int run(int wireFd, int ctrlFd, int inputFd, bool headless,
     // from output->pump()). We send the retired slot index to the core so
     // it advances its scanout state machine.
     if (kms) {
-        kms->setFlipCompleteListener([&](uint32_t outputId, int retiredSlotIdx) {
+        kms->setFlipCompleteListener([&](uint32_t outputId, int retiredSlotIdx,
+                                         uint64_t tvSec, uint32_t tvNsec, uint32_t seq) {
             // The flip-complete handler receives the slot index that JUST
             // became SCANOUT; the retiredSlotIdx parameter is the slot that
             // was previously SCANOUT and is now FREE (-1 on the first flip).
@@ -2743,6 +2750,11 @@ int run(int wireFd, int ctrlFd, int inputFd, bool headless,
             ipc::Message m{};
             m.tag = ipc::Tag::ScanoutFlipComplete;
             m.outputId = outputId;
+            // Kernel-supplied page-flip timestamp + vsync sequence -- carried
+            // through for wp_presentation. tvSec/tvNsec are CLOCK_MONOTONIC.
+            m.tvSec  = tvSec;
+            m.tvNsec = tvNsec;
+            m.seq    = seq;
             // KmsScanoutRing's listener semantics return the retired (now-FREE)
             // slot. The core needs the slot that just became SCANOUT for THIS
             // output -- look up that output's ring state to find it.

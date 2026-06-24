@@ -279,6 +279,18 @@ struct Message {
     // height (above) carry the scanout dims.
     WireHandle scanoutHandles[3] = {};
     uint32_t   scanoutBufIds[3]  = {};
+
+    // ScanoutFlipComplete / FrameComplete: presentation-time data for the
+    // just-retired frame, used to drive wp_presentation. tv_sec is the
+    // monotonic-clock seconds part of the page-flip / host frame timestamp;
+    // tv_nsec is the nanoseconds part within the second. seq is the
+    // hardware vsync sequence number on KMS (kernel-supplied); the nested
+    // path leaves it 0 (host wl_surface.frame has no equivalent). All
+    // three are 0 when the timing data was not available (legacy callers
+    // / GPU process versions that did not populate them).
+    uint64_t tvSec  = 0;
+    uint32_t tvNsec = 0;
+    uint32_t seq    = 0;
 };
 
 constexpr uint32_t kProtocolVersion = 1;

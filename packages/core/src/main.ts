@@ -1316,8 +1316,13 @@ log.info("core", `ctrl-c to quit.`);
 // ONLY path that fires wl_callback.done -- the per-tick dispatchFrameCallbacks
 // runs housekeeping (imports/maps/unmaps, buffer-release, animation tick) but
 // no longer dispatches frame callbacks.
-addon.setOnFlipComplete?.((outputId) => {
+addon.setOnFlipComplete?.((outputId, tvSec, tvNsec, seq) => {
   state?.dispatchFrameCallbacksForOutput?.(Math.round(performance.now()), outputId);
+  // wp_presentation feedback dispatch -- surfaces that intersect this
+  // output get their pending feedback fired with the same scanout
+  // timestamp. Optional-chained so a state without the dispatcher (mid-
+  // bring-up) is silent.
+  state?.dispatchPresentationFeedbackForOutput?.(outputId, tvSec, tvNsec, seq);
 });
 
 // Bootstrap the frame loop. addon.wake() schedules the first render now

@@ -894,7 +894,7 @@ void Compositor::drainCtrl() {
                 }
                 slots[flipped].state = ScanoutSlotState::SCANOUT;
                 frameCompleteSeen_ = true;
-                flipCompletes_.push_back(r.outputId);
+                flipCompletes_.push_back({ r.outputId, r.tvSec, r.tvNsec, r.seq });
             } else {
                 // Nested: the released slot returns directly to FREE.
                 // There is no SCANOUT state in this model -- the host
@@ -915,7 +915,7 @@ void Compositor::drainCtrl() {
                 so.presentedThisCycle = false;
             }
             frameCompleteSeen_ = true;
-            flipCompletes_.push_back(0);
+            flipCompletes_.push_back({ 0, r.tvSec, r.tvNsec, r.seq });
             continue;
         }
         // OutputDescriptor (re-emit) still rides ctrl -- it has no wire

@@ -77,7 +77,11 @@ class HostWindow {
     // nested-mode equivalent of KMS's page-flip-complete signal: the main
     // loop forwards it to the core as `ipc::Tag::FrameComplete`, where
     // the addon's wake state machine drives the next render.
-    using FrameDoneListener = std::function<void()>;
+    // Frame-done from the host compositor. tvSec / tvNsec are the
+    // CLOCK_MONOTONIC components of the host wl_surface.frame timestamp
+    // (host compositors deliver one millisecond-quantized 32-bit count,
+    // which we widen here). Used to drive wp_presentation.
+    using FrameDoneListener = std::function<void(uint64_t tvSec, uint32_t tvNsec)>;
     void setFrameDoneListener(FrameDoneListener cb) { onFrameDone_ = std::move(cb); }
 
     // Ensure exactly one wl_surface.frame callback is in flight; called from
@@ -88,7 +92,7 @@ class HostWindow {
     void armFrameCallback();
 
     // Listener trampoline (frame.done). Public for the C listener glue.
-    void onFrameCallbackDone();
+    void onFrameCallbackDone(uint64_t tvSec, uint32_t tvNsec);
 
     // Seat handling: bind on registry, then (re)create pointer/keyboard as the
     // seat advertises capabilities. Public for the C listener trampolines.

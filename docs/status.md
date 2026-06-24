@@ -488,7 +488,10 @@ type-check under `tsc --strict`.
   `wp_fractional_scale_v1`, `wp_cursor_shape_v1`,
   `ext_data_control_manager_v1` (clipboard + primary selection control
   for unfocused clients; tested end-to-end via the
-  `ext-data-control-client` test client).
+  `ext-data-control-client` test client),
+  `wp_presentation` / `wp_presentation_feedback` (per-commit scanout
+  timestamps for video apps; CLOCK_MONOTONIC; supersession on the
+  next commit per spec; tested end-to-end).
 - **Implemented, input-region path exercised via hit-testing:** `wl_region`
   (opaque region stored but unconsumed -- see "Read first");
   `zwp_linux_dmabuf_feedback_v1` (exercised by real WSI clients).

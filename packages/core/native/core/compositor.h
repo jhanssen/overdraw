@@ -338,14 +338,25 @@ class Compositor {
         return v;
     }
 
-    // Pop the queued KMS flip-completes (one outputId per ScanoutFlipComplete
-    // since the last call). Empty in nested/headless modes; the addon dispatches
+    // One entry per ScanoutFlipComplete (or nested-mode FrameComplete) since
+    // the last takeFlipCompletes(). Carries the page-flip / host-frame
+    // timestamp + vsync sequence for wp_presentation. tvSec / tvNsec are
+    // CLOCK_MONOTONIC; seq is the kernel vsync counter on KMS and 0 in
+    // nested mode (wl_surface.frame has no equivalent).
+    struct FlipCompleteEntry {
+        uint32_t outputId;
+        uint64_t tvSec;
+        uint32_t tvNsec;
+        uint32_t seq;
+    };
+    // Pop the queued KMS flip-completes (one entry per ScanoutFlipComplete
+    // since the last call). Empty in headless mode; the addon dispatches
     // per-output frame-callback work using this. Distinct from takeFrameComplete
     // because callers need the SPECIFIC output that flipped to know which
     // surfaces should receive wl_callback.done this tick. Coalescing by output
     // (one entry per outputId per call) is the caller's responsibility.
-    std::vector<uint32_t> takeFlipCompletes() {
-        std::vector<uint32_t> out;
+    std::vector<FlipCompleteEntry> takeFlipCompletes() {
+        std::vector<FlipCompleteEntry> out;
         out.swap(flipCompletes_);
         return out;
     }
@@ -717,7 +728,7 @@ class Compositor {
     // KMS-only queue of outputIds whose ScanoutFlipComplete arrived since the
     // last takeFlipCompletes(). Drained by the addon to dispatch per-output
     // wl_callback.done. Nested/headless never push here.
-    std::vector<uint32_t> flipCompletes_;
+    std::vector<FlipCompleteEntry> flipCompletes_;
     // Per-output scanout state, keyed by outputId. Each output owns a 3-slot ring
     // and the slot acquired by its in-flight frame. One entry today (the primary,
     // outputId 0); per-output rings populate this as each output's scanout is

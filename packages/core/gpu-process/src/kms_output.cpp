@@ -575,7 +575,16 @@ bool KmsOutputBackend::presentOutputImpl(PerOutput& o, int slotIdx, int inFenceF
     if (wasInitial) {
         const int retired = o.ring.onFlipComplete(slotIdx);
         o.pendingFlipSlot = -1;
-        if (flipCompleteListener_) flipCompleteListener_(o.outputId, retired);
+        if (flipCompleteListener_) {
+            // Synthetic flip: no kernel timestamp / sequence available yet.
+            // Sample CLOCK_MONOTONIC now so wp_presentation has something
+            // sensible to report; the real next page-flip will overwrite.
+            struct timespec ts{};
+            clock_gettime(CLOCK_MONOTONIC, &ts);
+            flipCompleteListener_(o.outputId, retired,
+                                  static_cast<uint64_t>(ts.tv_sec),
+                                  static_cast<uint32_t>(ts.tv_nsec), 0);
+        }
     }
     return true;
 }
@@ -586,8 +595,8 @@ bool KmsOutputBackend::presentScanoutAt(uint32_t outputId, int slotIdx, int inFe
     return presentOutputImpl(*o, slotIdx, inFenceFd);
 }
 
-void KmsOutputBackend::pageFlipTrampoline(int /*fd*/, unsigned int /*sequence*/,
-                                          unsigned int /*tv_sec*/, unsigned int /*tv_usec*/,
+void KmsOutputBackend::pageFlipTrampoline(int /*fd*/, unsigned int sequence,
+                                          unsigned int tv_sec, unsigned int tv_usec,
                                           unsigned int crtc_id, void* userdata) {
     auto* self = static_cast<KmsOutputBackend*>(userdata);
     if (!self) return;
@@ -598,7 +607,14 @@ void KmsOutputBackend::pageFlipTrampoline(int /*fd*/, unsigned int /*sequence*/,
         o->pendingFlipSlot = -1;
         if (flipped < 0) return;
         const int retired = o->ring.onFlipComplete(flipped);
-        if (self->flipCompleteListener_) self->flipCompleteListener_(o->outputId, retired);
+        if (self->flipCompleteListener_) {
+            // Promote kernel-supplied (tv_sec, tv_usec) to (tv_sec, tv_nsec)
+            // and pass the vsync sequence number. The kernel clock is
+            // CLOCK_MONOTONIC by default for DRM page-flip events.
+            const uint64_t sec = static_cast<uint64_t>(tv_sec);
+            const uint32_t nsec = static_cast<uint32_t>(tv_usec) * 1000u;
+            self->flipCompleteListener_(o->outputId, retired, sec, nsec, sequence);
+        }
         return;
     }
 }

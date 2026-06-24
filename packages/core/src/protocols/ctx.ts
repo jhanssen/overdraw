@@ -66,6 +66,11 @@ export interface SurfaceRecord {
   pending: {
     buffer?: Resource | null;
     frameCallbacks?: Resource[];
+    // wp_presentation feedback resources queued via wp_presentation.feedback
+    // since the last commit. Promoted to `frameCallbacks`-style applied
+    // state on commit; the dispatcher consumes them on the next scanout
+    // (presented) or supersession (discarded).
+    presentationFeedbacks?: Resource[];
     inputRegion?: Resource | null;
     opaqueRegion?: Resource | null;
     bufferScale?: number;
@@ -104,6 +109,7 @@ export interface SurfaceRecord {
   cached?: {
     buffer?: Resource | null;
     frameCallbacks?: Resource[];
+    presentationFeedbacks?: Resource[];
     inputRegion?: Resource | null;
     opaqueRegion?: Resource | null;
     bufferScale?: number;
@@ -160,6 +166,14 @@ export interface SurfaceRecord {
   // re-pushes the latched state unconditionally and clears this.
   needsCompositorResync?: boolean;
   frameCallbacks?: Resource[];
+  // wp_presentation feedback resources committed (i.e. their associated
+  // wl_surface.commit applied) but not yet dispatched. Drained by the
+  // dispatcher when the surface's resident output flips, OR by the next
+  // commit's apply (the old feedback is discarded). One commit's worth
+  // at a time -- if a client queues a feedback then commits again before
+  // the prior commit scanned out, the old feedback is discarded; the
+  // dispatcher takes care of that on each apply.
+  presentationFeedbacks?: Resource[];
   // The outputId the surface was spawned on (xdg_surface.get_toplevel
    // resolves it from spawn-follows-pointer or an explicit hint). Carried
    // here so the bus's window.map emission can include it without going
@@ -597,6 +611,14 @@ export interface CompositorState {
   // `outputId` -- so a 60Hz surface is paced at 60Hz even when a 240Hz peer
   // output is also flipping. Set alongside dispatchFrameCallbacks.
   dispatchFrameCallbacksForOutput?: (timeMs: number, outputId: number) => void;
+  // Per-output wp_presentation feedback dispatch. Fires `presented` on
+  // every queued feedback for surfaces overlapping `outputId`, with the
+  // scanout timestamp + vsync sequence carried up from the GPU process.
+  // Surfaces not overlapping the output keep their feedbacks queued for
+  // the next intersecting flip. tvSec is a bigint to carry the u64
+  // CLOCK_MONOTONIC seconds-since-boot. Set by installProtocols.
+  dispatchPresentationFeedbackForOutput?: (outputId: number, tvSec: bigint,
+                                           tvNsec: number, seq: number) => void;
   // Run just before the per-frame renderFrame. Used by the animation
   // evaluator (core-plugin-api.md §9) to advance active animations and
   // write the new per-surface state values for this frame. Set by

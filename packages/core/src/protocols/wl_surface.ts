@@ -15,6 +15,7 @@ import type { Ctx, CompositorState, SurfaceRecord, SubsurfaceRecord } from "./ct
 import type { Resource } from "../types.js";
 import type { RegionRect } from "./region.js";
 import { applySubsurfaces, applySubsurfaceReorder } from "../subsurfaces.js";
+import { applyPresentationFeedbacks } from "./wp_presentation.js";
 import { WINDOW_EVENT } from "../events/types.js";
 import {
   isLayerSurfaceInitialCommit,
@@ -261,6 +262,11 @@ function applySurfaceState(ctx: Ctx, s: SurfaceRecord): void {
     (s.frameCallbacks ??= []).push(...s.pending.frameCallbacks);
     s.pending.frameCallbacks = undefined;
   }
+  // wp_presentation: supersede any previously-applied feedback that the
+  // prior commit queued but that hasn't scanned out yet (the new commit
+  // means the old one never will), then promote pending feedbacks to
+  // applied for the new commit.
+  applyPresentationFeedbacks(ctx, s);
 
   // Apply input/opaque regions. undefined = no set_*_region call this
   // cycle, leave applied region alone.
@@ -316,6 +322,10 @@ function applySurfaceState(ctx: Ctx, s: SurfaceRecord): void {
         }
         if (childRec.cached.frameCallbacks?.length) {
           (childRec.pending.frameCallbacks ??= []).push(...childRec.cached.frameCallbacks);
+        }
+        if (childRec.cached.presentationFeedbacks?.length) {
+          (childRec.pending.presentationFeedbacks ??= [])
+            .push(...childRec.cached.presentationFeedbacks);
         }
         if (childRec.cached.inputRegion !== undefined) {
           childRec.pending.inputRegion = childRec.cached.inputRegion;
@@ -486,6 +496,11 @@ export default function makeSurface(ctx: Ctx): WlSurfaceHandler {
         if (s.pending.frameCallbacks?.length) {
           (s.cached.frameCallbacks ??= []).push(...s.pending.frameCallbacks);
           s.pending.frameCallbacks = undefined;
+        }
+        if (s.pending.presentationFeedbacks?.length) {
+          (s.cached.presentationFeedbacks ??= [])
+            .push(...s.pending.presentationFeedbacks);
+          s.pending.presentationFeedbacks = undefined;
         }
         if (s.pending.inputRegion !== undefined) {
           s.cached.inputRegion = s.pending.inputRegion;
@@ -690,6 +705,23 @@ export function detachSurfaceRole(state: CompositorState, s: SurfaceRecord): voi
   // some unrelated future render after a re-bind.
   s.frameCallbacks = undefined;
   s.pending.frameCallbacks = undefined;
+  // wp_presentation: send `discarded` on any feedback still queued for
+  // this surface (applied or pending) so the client isn't left waiting
+  // on a dead surface.
+  const fbEvents = state.events?.wp_presentation_feedback;
+  if (fbEvents) {
+    const sweep = (arr: Resource[] | undefined): void => {
+      if (!arr) return;
+      for (const cb of arr) {
+        if (cb.destroyed) continue;
+        fbEvents.send_discarded(cb);
+      }
+    };
+    sweep(s.presentationFeedbacks);
+    sweep(s.pending.presentationFeedbacks);
+  }
+  s.presentationFeedbacks = undefined;
+  s.pending.presentationFeedbacks = undefined;
   // Output residency must rebuild from scratch: a re-roled surface may
   // land on a different output, and the residency differ would
   // otherwise miss the implicit "left every output" transition.

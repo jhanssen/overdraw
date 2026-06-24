@@ -235,8 +235,9 @@ export async function setupCompositor(opts = {}) {
   // Per-output wl_callback.done dispatch (paces clients at their resident
   // output's vblank, not the union of all outputs'). Headless synthesizes
   // this from the ~60Hz frame timer; nested gets one per host FrameComplete.
-  const onFlipComplete = (outputId) => {
+  const onFlipComplete = (outputId, tvSec, tvNsec, seq) => {
     state?.dispatchFrameCallbacksForOutput?.(Math.round(performance.now()), outputId);
+    state?.dispatchPresentationFeedbackForOutput?.(outputId, tvSec, tvNsec, seq);
   };
 
   // Headless by default: the JS compositor renders into an offscreen target

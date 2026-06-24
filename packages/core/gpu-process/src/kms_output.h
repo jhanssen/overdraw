@@ -106,9 +106,13 @@ class KmsOutputBackend : public OutputBackend {
 
     // Callback invoked when a page-flip retires a slot on some output. Carries
     // the dense outputId that flipped and the slot index that just exited
-    // SCANOUT and is now FREE (-1 on that output's first flip). Used by the
-    // main loop to drive per-output frame pacing and buffer-release.
-    using FlipCompleteCb = std::function<void(uint32_t outputId, int retiredSlotIdx)>;
+    // SCANOUT and is now FREE (-1 on that output's first flip). tv_sec /
+    // tv_nsec / seq are the kernel-supplied page-flip timestamp + vsync
+    // sequence (drmEventContext version 3, page_flip_handler2), used to
+    // drive wp_presentation. Used by the main loop to drive per-output
+    // frame pacing and buffer-release.
+    using FlipCompleteCb = std::function<void(uint32_t outputId, int retiredSlotIdx,
+                                              uint64_t tvSec, uint32_t tvNsec, uint32_t seq)>;
     void setFlipCompleteListener(FlipCompleteCb cb) { flipCompleteListener_ = std::move(cb); }
 
     // VT-switch lifecycle. On pause(): drop any pending flip wait, reset every

@@ -71,6 +71,7 @@ const GLOBALS = [
   "ext_workspace_manager_v1",
   "xwayland_shell_v1",
   "ext_data_control_manager_v1",
+  "wp_presentation",
 ];
 
 // Interfaces created via requests (new_id), registered without a global so
@@ -102,6 +103,7 @@ const CHILD_INTERFACES = [
   "ext_data_control_device_v1",
   "ext_data_control_source_v1",
   "ext_data_control_offer_v1",
+  "wp_presentation_feedback",
 ];
 
 // Load all generated signature modules, keyed by interface name.
@@ -672,6 +674,17 @@ export async function installProtocols(
   // Popup click-away dismissal: the seat calls this on a button press.
   state.dismissGrabbedPopup = (x, y) => maybeDismissGrabbedPopup(ctx, x, y);
 
+  // wp_presentation per-output feedback dispatch. Mirror shape of
+  // dispatchFrameCallbacksForOutput: addon fires this on each KMS
+  // flip-complete (and nested FrameComplete); we walk surfaces that
+  // overlap the output and send `presented` with the scanout
+  // timestamp.
+  const presentationMod = await import("./wp_presentation.js");
+  state.dispatchPresentationFeedbackForOutput = (outputId, tvSec, tvNsec, seq) => {
+    presentationMod.dispatchPresentationFeedbackForOutput(
+      state, addon, outputId, tvSec, tvNsec, seq);
+  };
+
   // Import handler modules. A handler module default-exports a factory.
   const handlerMods: Record<string, HandlerModule> = {
     wl_compositor: await import("./wl_compositor.js"),
@@ -706,6 +719,7 @@ export async function installProtocols(
     ext_workspace_manager_v1: await import("./ext_workspace_v1.js"),
     xwayland_shell_v1: await import("./xwayland_shell_v1.js"),
     ext_data_control_manager_v1: await import("./ext_data_control_v1.js"),
+    wp_presentation: await import("./wp_presentation.js"),
   };
 
   // Some child interfaces have handlers from a sibling module's named exports.
@@ -758,6 +772,9 @@ export async function installProtocols(
     ext_data_control_device_v1: extDataControlMod.makeExtDataControlDevice(ctx),
     ext_data_control_source_v1: extDataControlMod.makeExtDataControlSource(ctx),
     ext_data_control_offer_v1: extDataControlMod.makeExtDataControlOffer(ctx),
+    // wp_presentation_feedback has no requests (event-only); the protocol layer
+    // still needs a handler-shaped object to register.
+    wp_presentation_feedback: {},
   };
 
   // The apply target forwards lazily: the seat is constructed below and

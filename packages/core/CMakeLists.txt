@@ -300,6 +300,16 @@ target_include_directories(ext-data-control-client PRIVATE
     ${CMAKE_SOURCE_DIR}/native/wayland/generated)
 target_link_libraries(ext-data-control-client PRIVATE ${WAYLAND_CLIENT_LIBRARIES})
 
+# ---- wp_presentation test client ----
+add_executable(wp-presentation-client
+    test/wp-presentation-client.c
+    native/wayland/generated/xdg-shell-protocol.c
+    native/wayland/generated/presentation-time-protocol.c)
+target_include_directories(wp-presentation-client PRIVATE
+    ${WAYLAND_CLIENT_INCLUDE_DIRS}
+    ${CMAKE_SOURCE_DIR}/native/wayland/generated)
+target_link_libraries(wp-presentation-client PRIVATE ${WAYLAND_CLIENT_LIBRARIES})
+
 # ---- DnD test client (drag-and-drop) ----
 add_executable(dnd-test-client
     test/dnd-test-client.c

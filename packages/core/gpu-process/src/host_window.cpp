@@ -188,13 +188,18 @@ HostWindow::~HostWindow() {
 }
 
 namespace {
-void hostFrameDone(void* data, wl_callback* cb, uint32_t /*ts*/) {
+void hostFrameDone(void* data, wl_callback* cb, uint32_t ts) {
     auto* self = static_cast<HostWindow*>(data);
     // The libwayland-client convention is to destroy the one-shot callback
     // inside its done handler; the trampoline does NOT do this so the host
     // window can null out its own pointer first.
     wl_callback_destroy(cb);
-    self->onFrameCallbackDone();
+    // wl_surface.frame's `time` is a 32-bit millisecond count in the host
+    // compositor's CLOCK_MONOTONIC. Decompose to (sec, nsec) for the
+    // presentation-feedback wire shape.
+    const uint64_t tvSec  = static_cast<uint64_t>(ts) / 1000u;
+    const uint32_t tvNsec = (static_cast<uint32_t>(ts) % 1000u) * 1000000u;
+    self->onFrameCallbackDone(tvSec, tvNsec);
 }
 const wl_callback_listener kFrameListener = { &hostFrameDone };
 }  // namespace
@@ -211,9 +216,9 @@ void HostWindow::armFrameCallback() {
     if (display_) wl_display_flush(display_);
 }
 
-void HostWindow::onFrameCallbackDone() {
+void HostWindow::onFrameCallbackDone(uint64_t tvSec, uint32_t tvNsec) {
     frameCallback_ = nullptr;
-    if (onFrameDone_) onFrameDone_();
+    if (onFrameDone_) onFrameDone_(tvSec, tvNsec);
     // Re-arm the one-shot host wl_surface.frame chain so the next host
     // vblank delivers another done. The request is queued onto the host
     // surface; the host compositor fires the callback the next time it
