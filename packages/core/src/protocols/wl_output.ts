@@ -53,10 +53,21 @@ function emitTo(
     resource, MODE_CURRENT | MODE_PREFERRED,
     out.deviceSize.width, out.deviceSize.height,
     out.refreshMhz);
-  events.wl_output.send_scale(resource, Math.ceil(out.scale));
-  events.wl_output.send_name(resource, out.name);
-  events.wl_output.send_description(resource, out.description);
-  events.wl_output.send_done(resource);
+  // Gate version-since events on the resource's bound version.
+  // wl_output v1 clients (e.g. `grim`) have no listener entries past
+  // opcode 1 (mode); sending opcode 2+ trips a libwayland-client
+  // NULL-listener assertion that SIGABRTs the client. v2 added
+  // scale + done; v4 added name + description.
+  if (resource.version >= 2) {
+    events.wl_output.send_scale(resource, Math.ceil(out.scale));
+  }
+  if (resource.version >= 4) {
+    events.wl_output.send_name(resource, out.name);
+    events.wl_output.send_description(resource, out.description);
+  }
+  if (resource.version >= 2) {
+    events.wl_output.send_done(resource);
+  }
 }
 
 function fallback(state: CompositorState): OutputRecord {
