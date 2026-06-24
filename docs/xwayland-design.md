@@ -15,7 +15,7 @@ TS XWM under `src/xwayland/`.
 
 ## What is built
 
-Phases 0-3 are landed; see `docs/status.md` for the per-feature summary
+Phases 0-4 are landed; see `docs/status.md` for the per-feature summary
 and the (small) known limitations. The code itself is the source of
 truth — refer to:
 
@@ -24,13 +24,19 @@ truth — refer to:
 - `native/xwayland/xwm.cpp` — xcb connection, atom interning, event
   decode, the bookkeeper window, ICCCM/EWMH writers
   (`xwmChangeProperty`, `xwmDeleteProperty`, `xwmSetInputFocus`,
-  `xwmSendWmProtocol`).
+  `xwmSendWmProtocol`), selection-bridge primitives (xfixes init +
+  `xwmCreateSelectionWindow` / `xwmSetSelectionOwner` /
+  `xwmConvertSelection` / `xwmSendSelectionNotify` /
+  `xwmXfixesSelectSelectionInput` / `xwmInternAtom` /
+  `xwmGetAtomName` / `xwmSelectWindowEvents`).
 - `src/xwayland/xwm.ts` — TS XWM policy (ICCCM/EWMH consumption, focus
-  mirror dispatch, override-redirect overlay placement).
+  mirror dispatch, override-redirect overlay placement, selection
+  hook dispatch).
 - `src/xwayland/focus.ts` — pure-logic ICCCM focus truth table.
 - `src/xwayland/properties.ts` — pure-byte ICCCM/EWMH property parsers.
 - `src/xwayland/surface.ts` — serial registry for `WL_SURFACE_SERIAL`
   association.
+- `src/xwayland/selection.ts` — CLIPBOARD / PRIMARY selection bridge.
 - `src/protocols/xwayland_shell_v1.ts` — the wl-side half of association.
 
 Production wiring: `config.xwayland.enabled` (default false) opts in;
@@ -112,48 +118,84 @@ per-output fractional scaling of X apps is a known hard limitation
 across all compositors. The global-scale knob itself is not wired yet;
 v1 ships at scale=1.
 
-## Phase 4 — clipboard / selection bridge
+## Phase 4 — clipboard / selection bridge (landed)
 
-Path: `src/xwayland/selection.ts` (new). Because the native side already
-exposes raw `xcb_get_property` / `xcb_change_property` / `xcb_send_event`,
-the whole bridge — including the INCR chunk loop driven by `property`
-events — lives in TS; no protocol dance forces it into C++ (clipboard is
-not a hot path).
+`src/xwayland/selection.ts` mediates two of the three X selections to
+their wayland counterparts; the native side exposes raw xcb primitives
+and the state machine lives in TS.
 
-Three selections:
 - `CLIPBOARD` ↔ `wl_data_device`
-- `PRIMARY` ↔ primary selection (`wp_primary_selection_v1`)
+- `PRIMARY` ↔ `zwp_primary_selection_v1`
 - `XdndSelection` — DnD, deferred to Phase 5
 
-### X owns → Wayland pastes
+Both directions are wired and tested end-to-end:
 
-`xfixes-selection` tells us an X client took the selection; we read its
-`TARGETS`, mint a `wl_data_source` advertising the mapped MIME types,
-and on `wl_data_source.send` issue `convertSelection` + read the result
-property (INCR if large) into the Wayland pipe fd.
+- **X owns → Wayland pastes.** `xfixes-selection-notify` fires when an
+  X client claims `CLIPBOARD` / `PRIMARY`. The bridge issues
+  `ConvertSelection(TARGETS)` onto our owner window, reads the property,
+  resolves each atom to a MIME (standard set inline, async
+  `xwmGetAtomName` for the rest), and publishes `state.xClipboardSource`
+  / `xPrimarySource`. `wl_data_device_manager.sendSelectionTo` falls
+  back to that source when no wl client owns the selection; the
+  focused wl client gets a server-minted offer carrying the mapped
+  mimes. `wl_data_offer.receive` on an X-backed offer kicks off a
+  per-mime `ConvertSelection` on a fresh per-transfer window;
+  `SelectionNotify` reads the property; INCR fires when the reply type
+  is `INCR` and continues via `PropertyNotify(NewValue)` until a
+  zero-length new value signals end-of-stream.
 
-### Wayland owns → X pastes
+- **Wayland owns → X pastes.** `wl_data_device.set_selection` (and the
+  primary equivalent) calls into the bridge; the bridge
+  `SetSelectionOwner`s our owner window. `xfixes-selection-notify`
+  self-confirms; we cache the X timestamp for `TIMESTAMP`-target
+  replies. `SelectionRequest` from an X requestor: `TARGETS` is built
+  from `state.dataSources[source].mimes`; `TIMESTAMP` echoes the
+  cached timestamp; otherwise we allocate a pipe (`addon.makePipe`),
+  hand the write-fd to the wl source via `send_send`, drain the read
+  end on the libuv loop, and write the requestor's property. Above 64
+  KiB we switch to INCR (property type `INCR` + size hint; subsequent
+  chunks on each `PropertyNotify(Delete)` on the requestor's
+  destination property, observed via `addon.xwmSelectWindowEvents(req,
+  PROPERTY_CHANGE)`). EOF closes with one empty-property write.
 
-Own the X selection on a dedicated selection-owner window (created
-alongside the bookkeeper at xwmConnect); answer `selection-request` by
-writing the Wayland source's bytes to the requestor's property (INCR
-for large), then `sendSelectionNotify`.
+Per-requestor stale-transfer purge: a second SelectionRequest from the
+same requestor drops the previous transfer (real X apps only read the
+latest reply; leaving the prior pending hangs the bridge).
 
-### Required additions
+Focus gate: the bridge only probes `TARGETS` when an X client is
+X-focused. This avoids minting wayland-side X-backed sources for X
+clients running in the background.
 
-- New native dep: `xcb-xfixes` (selection-owner change tracking).
-- New atoms: `CLIPBOARD`, `PRIMARY`, `TARGETS`, `INCR`, `TIMESTAMP`,
-  `MULTIPLE`, `_XEMBED`, plus MIME-type atoms minted on demand.
-- New native primitives: `xwmSetSelectionOwner`, `xwmGetSelectionOwner`,
-  `xwmConvertSelection`, `xwmSendSelectionNotify`,
-  `xwmXfixesSelectSelectionInput`.
-- An X-side selection-owner window (similar shape to the bookkeeper but
-  with selection event mask).
-- MIME ↔ X target translation table.
+Atoms / native primitives added in Phase 4:
+- 11 atoms: `CLIPBOARD`, `PRIMARY`, `TARGETS`, `TIMESTAMP`, `INCR`,
+  `TEXT`, `STRING`, `MULTIPLE`, `DELETE`, `CLIPBOARD_MANAGER`,
+  `_OVERDRAW_SELECTION`.
+- Event kinds: `xfixes-selection-notify`, `selection-request`,
+  `selection-notify`, `atom-name-reply`. `property-notify` now also
+  carries the `NEW_VALUE` / `DELETE` state (the bridge's two INCR
+  pumps key off this distinction).
+- Primitives: `xwmCreateSelectionWindow`, `xwmDestroyWindow`,
+  `xwmSetSelectionOwner`, `xwmConvertSelection`,
+  `xwmSendSelectionNotify`, `xwmXfixesSelectSelectionInput`,
+  `xwmInternAtom`, `xwmGetAtomName`, `xwmSelectWindowEvents`,
+  `xwmFlush`. Plus `addon.makePipe()` (pipe(2) returning `{readFd,
+  writeFd}`, both blocking + CLOEXEC) and `addon.wrapFd(rawFd)`
+  (raw int → `WaylandFd` so the bridge can pass the write end through
+  `wl_data_source.send_send`).
+- New dep: `xcb-xfixes`.
 
-INCR is the gnarly part: large transfers chunk via repeated property
-writes, signaled by `PropertyNotify`. The state machine fits in TS; the
-native side just round-trips `get_property` / `change_property` calls.
+Out of scope / known gaps:
+- **`MULTIPLE` target.** Refused. Real apps rarely use it.
+- **`CLIPBOARD_MANAGER`.** Short-circuited with a success notify
+  without actually doing anything (matches the convention used by
+  other rootless WMs; clipboard managers that need bytes use the
+  normal CLIPBOARD path).
+- **Async target → MIME resolution on the outgoing path.** If an X
+  client requests a target atom we have not minted (i.e. has not been
+  in our `TARGETS` reply), we refuse rather than block on
+  `xwmGetAtomName`. SelectionRequest requires a bounded-time reply.
+- **Read-modify-write of `_NET_WM_STATE_FOCUSED`** — the same gap
+  already flagged in Phase 3.4 / "polish."
 
 ## Phase 5 — polish + DnD
 
@@ -182,20 +224,21 @@ native side just round-trips `get_property` / `change_property` calls.
   needs the same async read-then-write pattern the property batch
   uses.
 
-## Open questions (still applicable)
+## Open questions
 
-- **`WL_SURFACE_SERIAL` delivery mechanism is unverified.** The
-  per-window `FOCUS|PROPERTY` mask selected at CreateNotify is present
-  (needed for PropertyNotify/FocusIn anyway) and association works, but
-  it has NOT been isolated whether that mask delivers the client-message
-  or whether it arrives via root `SUBSTRUCTURE_REDIRECT` regardless.
-  Cheap to confirm (drop the mask, see if the serial still arrives).
-  Related robustness gap: a serial sent before we select events on a
-  freshly-created window would be dropped → silently invisible X window.
-  X per-connection ordering (CreateNotify before the message) should
-  prevent this, but rapid create/map/destroy is untested; the
-  bidirectional pending-match handles a *late* serial, not a *missing*
-  one.
+- **`WL_SURFACE_SERIAL` delivery: answered.** Verified empirically by
+  removing the per-window `FOCUS_CHANGE | PROPERTY_CHANGE` mask at
+  CreateNotify and re-running the serial-association GPU test; the
+  serial still arrives. ClientMessages routed to a managed window are
+  delivered via the root's `SUBSTRUCTURE_REDIRECT`, not the per-window
+  mask. The per-window mask remains load-bearing for FocusIn and
+  PropertyNotify on the WM-managed window itself, just not for
+  client-messages.
+- **Related: serial sent before CreateNotify is processed.** Still a
+  silent-gap risk in principle. Per-X-connection ordering (CreateNotify
+  before the ClientMessage on the same xcb stream) prevents it in
+  practice; rapid create/map/destroy is untested. `pendingBySerial`
+  handles a *late* serial, not a *missing* one.
 - **Eager vs. lazy Xwayland start.** Eager is what we ship. Lazy
   (`-terminate` + socket-activation re-spawn on the next X connection)
   saves idle resources; requires pre-creating the X11 sockets ourselves
@@ -215,9 +258,15 @@ GPU test calls `harness.mjs:nextXDisplay()` to claim a fresh display
 number per test (starting at 60), so the suite never collides with
 `:0` even when run interactively.
 
-Coverage today: 11 GPU tests (`test/xwayland-*.gpu.mjs`) and ~44 GPU-free
-unit tests (`test/xwayland-*.test.js`) across server lifecycle, shell
-serial registry, property parsers, configure round-trip, override-
-redirect placement, focus mirror, ICCCM truth table, and the resize-tx
-buffer-dims-only variant. Phase 4 will add selection-bridge tests at
-both tiers (INCR chunking is a unit-testable state machine).
+Coverage today: 16 GPU tests (`test/xwayland-*.gpu.mjs`) and ~60
+GPU-free unit tests (`test/xwayland-*.test.js`) across server lifecycle,
+shell serial registry, property parsers, configure round-trip,
+override-redirect placement, focus mirror, ICCCM truth table, the
+resize-tx buffer-dims-only variant, the MIME↔atom translation table,
+and the selection bridge end-to-end in both directions (small payload +
+INCR >64 KiB).
+
+The selection-bridge end-to-end tests need a Wayland clipboard test
+client and a small purpose-built X11 selection client
+(`packages/core/test/x11-selection-client.c`) that can both serve and
+paste a selection (handling INCR continuations on the paste side).

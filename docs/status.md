@@ -6,10 +6,13 @@ test counts, and historical rationale live in `status-detailed.md`. This
 file is the short read; consult the detailed doc when investigating a
 specific subsystem.
 
-Last updated: 2026-06-20. Most recent landings: M7 steps 4 + 5 (JS hotplug
-handlers, workspace migration on `output.added`/`removed` with durable-
-identifier reclaim, cross-fd race fix moving `ScanoutReserve`/`ScanoutReady`
-to the wire socket -- hardware-verified two-monitor unplug/replug).
+Last updated: 2026-06-23. Most recent landings: Xwayland Phase 4
+(CLIPBOARD + PRIMARY selection bridge, both directions, with INCR for
+>64 KiB payloads; xcb-xfixes integration; 5 new GPU tests including
+two INCR end-to-end). Prior: M7 steps 4 + 5 (JS hotplug handlers,
+workspace migration on `output.added`/`removed` with durable-identifier
+reclaim, cross-fd race fix moving `ScanoutReserve`/`ScanoutReady` to
+the wire socket -- hardware-verified two-monitor unplug/replug).
 
 ## Read first: gaps in advertised protocols (silent-gap risks)
 
@@ -659,19 +662,22 @@ validated + resolved + consumed by the runtime + hotkey plugin.
   `/tmp/overdraw-gpu-crash.txt`, core to
   `/tmp/overdraw-core-crash.txt`).
 - **Linear compositing.** Alpha blending happens in sRGB space.
-- **XWayland.** Phases 1-3 landed (server lifecycle; `xwayland_shell_v1` +
-  serial-association XWM; ICCCM/EWMH properties → title/app_id/constraints/
-  parent/presentation + close path via `WM_DELETE_WINDOW`/`KillClient`;
-  configure round-trip with compositor authority + `holdUntilBufferDims`
-  resize-tx variant + synthetic ConfigureNotify; override-redirect overlays
-  with content-layer splicing; keyboard focus mirroring with the ICCCM
-  truth table + bookkeeper window + `_NET_ACTIVE_WINDOW`/`_NET_WM_STATE_FOCUSED`
-  + serial-validated FocusIn handling for cross-app focus-stealing
-  denial). Production wiring: `config.xwayland.enabled` (default false)
-  opts in; `config.xwayland.displayNumber` (default 50) selects the X
-  display. Autopick rejected upstream (would otherwise steal `:0` from a
-  live host session). 11 GPU tests + ~44 GPU-free unit tests cover the
-  surface. Clipboard / DnD are Phase 4 / 5. See `docs/xwayland-design.md`.
+- **XWayland.** Phases 1-4 landed (server lifecycle; `xwayland_shell_v1`
+  + serial-association XWM; ICCCM/EWMH properties → title/app_id/
+  constraints/parent/presentation + close path via `WM_DELETE_WINDOW`/
+  `KillClient`; configure round-trip with compositor authority +
+  `holdUntilBufferDims` resize-tx variant + synthetic ConfigureNotify;
+  override-redirect overlays with content-layer splicing; keyboard
+  focus mirroring with the ICCCM truth table + bookkeeper window +
+  `_NET_ACTIVE_WINDOW`/`_NET_WM_STATE_FOCUSED` + serial-validated
+  FocusIn handling for cross-app focus-stealing denial; CLIPBOARD +
+  PRIMARY selection bridge between X clients and wayland clients,
+  both directions, with INCR for >64 KiB payloads). Production
+  wiring: `config.xwayland.enabled` (default false) opts in;
+  `config.xwayland.displayNumber` (default 50) selects the X display.
+  Autopick rejected upstream (would otherwise steal `:0` from a live
+  host session). 16 GPU tests + ~60 GPU-free unit tests cover the
+  surface. DnD is Phase 5. See `docs/xwayland-design.md`.
   Known limitations:
   - `_NET_WM_STATE_FOCUSED` writes replace the whole `_NET_WM_STATE`
     property (clobbers client-set bits like fullscreen/maximized when
@@ -684,6 +690,11 @@ validated + resolved + consumed by the runtime + hotkey plugin.
   - OR overlays appear on every output's stack regardless of which
     toplevel they belong to (X has no workspace concept; per-toplevel
     rooting would need `WM_TRANSIENT_FOR` chain following).
+  - Selection bridge refuses outgoing targets for X requestors that
+    ask for atoms we never advertised (would require async
+    `xwmGetAtomName` which violates SelectionRequest's bounded-time
+    reply expectation); `MULTIPLE` target refused; `CLIPBOARD_MANAGER`
+    short-circuited with a success notify.
   Session supervisor untouched.
 - **Live reload.** Not built.
 
