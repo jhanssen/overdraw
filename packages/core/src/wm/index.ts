@@ -1329,6 +1329,27 @@ export function createWm(
       if (win.pendingInitialCommit && proposal.presentation !== undefined) {
         win.windowState = { ...win.windowState, presentation: proposal.presentation };
       }
+      // Same race for client-declared constraints (set_min_size /
+      // set_max_size): a client (the GIMP splash, GTK About dialogs)
+      // sends these together with its first-content commit, then the
+      // map handler in protocols/index.ts synchronously calls
+      // windowHasContent, which classifies the window's presentation
+      // based on whether min == max in either axis. Without a
+      // synchronous stamp the constraints aren't in windowState yet
+      // (still queued behind the async proposed-interceptor pass),
+      // the fixed-size rule sees zeros, and the window stays managed
+      // when it should default to floating. Constraints are
+      // append-only data with no downstream invariants beyond the
+      // floating classification; stamping them eagerly is safe.
+      if (proposal.constraints !== undefined) {
+        win.windowState = {
+          ...win.windowState,
+          constraints: {
+            ...win.windowState.constraints,
+            ...proposal.constraints,
+          },
+        };
+      }
       // Serialize against any in-flight mutation on this window so a
       // second caller doesn't read stale state mid-microtask. Two
       // requests in the same wayland-batch (e.g. set_maximized then
