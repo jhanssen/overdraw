@@ -234,6 +234,29 @@ export default async function init(sdk: SdkLike): Promise<void> {
     },
   });
 
+  // Gap tuning. Same shape as the master-fraction actions: the launcher
+  // forwards the delta to the active layout plugin's setParams. No-op if
+  // the active layout doesn't implement setParams or doesn't recognize
+  // the gapDelta field.
+  sdk.actions.register({
+    name: "layout.grow-gap",
+    description: "Grow the inter-tile gap by one step (px). No params.",
+    handler: async (): Promise<null> => {
+      sdk.events.emit("layout.gap-requested", { delta: GAP_STEP });
+      return null;
+    },
+  });
+
+  sdk.actions.register({
+    name: "layout.shrink-gap",
+    description: "Shrink the inter-tile gap by one step (px). " +
+      "Clamps to 0 at the bottom. No params.",
+    handler: async (): Promise<null> => {
+      sdk.events.emit("layout.gap-requested", { delta: -GAP_STEP });
+      return null;
+    },
+  });
+
   // KMS mode switch on one output. Params:
   //   { output: "DP-1" | "ACM-1234-...", width: 2560, height: 1440,
   //     refreshMhz?: 60000 }
@@ -284,6 +307,9 @@ export default async function init(sdk: SdkLike): Promise<void> {
 
 // Per-command master-fraction increment for layout.grow-master / shrink-master.
 const MASTER_STEP = 0.05;
+
+// Per-command gap increment for layout.grow-gap / shrink-gap (logical px).
+const GAP_STEP = 4;
 
 const EDGES = [
   "top", "bottom", "left", "right",

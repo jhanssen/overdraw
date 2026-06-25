@@ -147,6 +147,8 @@ function normalize(raw: unknown, path: string): ResolvedConfig {
   const hotkeys: unknown = cfg.hotkeys;
   // Verbatim pass-through; the bundled decoration plugin owns the schema.
   const decoration: unknown = cfg.decoration;
+  // Verbatim pass-through; the bundled layout plugin owns the schema.
+  const layout: unknown = cfg.layout;
   // Verbatim pass-through to the bundled config-actions plugin. The
   // plugin validates the shape ({ [name: string]: function }) and
   // registers each entry into the action registry.
@@ -227,7 +229,7 @@ function normalize(raw: unknown, path: string): ResolvedConfig {
 
   return {
     output, card, scale, outputsByKey,
-    focus, hotkeys, decoration, actions, plugins, xwayland, sourcePath: path,
+    focus, hotkeys, decoration, layout, actions, plugins, xwayland, sourcePath: path,
   };
 }
 
@@ -239,7 +241,7 @@ export async function loadConfig(explicit: string | null): Promise<ResolvedConfi
     return {
       output: null, card: null, scale: null, outputsByKey: {},
       focus: undefined, hotkeys: undefined,
-      decoration: undefined, actions: undefined, plugins: [],
+      decoration: undefined, layout: undefined, actions: undefined, plugins: [],
       xwayland: { enabled: false, terminate: false, xwaylandPath: null, displayNumber: 50, scale: 0 },
       sourcePath: null,
     };

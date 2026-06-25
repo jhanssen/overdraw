@@ -119,12 +119,30 @@ export interface LayoutParamUpdate {
   // Change to the master-column fraction (the share of the working area the
   // master tile gets). Positive grows the master, negative shrinks it.
   masterFractionDelta?: number;
+  // Change to the gap between tiles (and around the work-area edge), in px.
+  // Positive grows the gap, negative shrinks it. The layout clamps to a
+  // non-negative result.
+  gapDelta?: number;
 }
 
 // The resolved parameter values after a setParams() call.
 export interface LayoutParamSnapshot {
   masterFraction: number;
   gap: number;
+}
+
+// Startup config for the bundled master-stack layout plugin. Read from
+// the user's `config.layout` slice. Every field is optional; missing
+// fields take the documented defaults.
+export interface LayoutPluginConfig {
+  // Initial master-column fraction in [0.05, 0.95]. Default 0.5. The
+  // layout.grow-master / shrink-master actions adjust this at runtime.
+  masterFraction?: number;
+  // Initial gap (logical px) between tiles AND around the outer edge of
+  // the work area. Default 0 (no gap; tiles touch). The runtime gap
+  // delta actions (layout.grow-gap / shrink-gap) adjust this on the
+  // fly; the value is clamped to >= 0.
+  gap?: number;
 }
 
 // The contract a plugin claiming 'layout' implements. compute() is required;

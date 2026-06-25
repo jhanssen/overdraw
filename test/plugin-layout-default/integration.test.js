@@ -114,3 +114,114 @@ test('setParams: master fraction clamps to [0.05, 0.95]', async () => {
     assert.equal(lo.masterFraction, 0.05);
   });
 });
+
+// ---- config-driven gap + masterFraction ---------------------------------
+
+test('init config: gap shrinks every tile by the gap amount + outer band', async () => {
+  await withRuntime({}, async (rt) => {
+    // Pass a non-default config: 8px gap + masterFraction 0.5.
+    await rt.load([
+      bundledToResolved(layoutPluginSpec, layoutPluginSpec.module, { layout: { gap: 8 } }),
+    ]);
+    await rt.waitForNamespace('layout');
+
+    const inputs = {
+      output: { id: 0, rect: { x: 0, y: 0, width: 1000, height: 600 }, scale: 1 },
+      tileRegion: { x: 0, y: 0, width: 1000, height: 600 },
+      windows: [
+        { id: 1, role: 'toplevel' },
+        { id: 2, role: 'toplevel' },
+      ],
+      reason: 'mapped',
+    };
+    const r = await rt.invokeNamespace('layout', 'compute', [inputs]);
+    // Master starts at x=8 (left outer gap), width = (1000 - 16 - 8) / 2 = 488.
+    // Stack starts at x = 8 + 488 + 8 = 504, width = 488 again.
+    const m = r.rects.find((x) => x.id === 1).outer;
+    const s = r.rects.find((x) => x.id === 2).outer;
+    assert.deepEqual(m, { x: 8, y: 8, width: 488, height: 584 });
+    assert.deepEqual(s, { x: 504, y: 8, width: 488, height: 584 });
+  });
+});
+
+test('init config: masterFraction is honored', async () => {
+  await withRuntime({}, async (rt) => {
+    await rt.load([
+      bundledToResolved(layoutPluginSpec, layoutPluginSpec.module,
+        { layout: { masterFraction: 0.7 } }),
+    ]);
+    await rt.waitForNamespace('layout');
+    const inputs = {
+      output: { id: 0, rect: { x: 0, y: 0, width: 1000, height: 600 }, scale: 1 },
+      tileRegion: { x: 0, y: 0, width: 1000, height: 600 },
+      windows: [{ id: 1, role: 'toplevel' }, { id: 2, role: 'toplevel' }],
+      reason: 'mapped',
+    };
+    const r = await rt.invokeNamespace('layout', 'compute', [inputs]);
+    assert.equal(r.rects.find((x) => x.id === 1).outer.width, 700);
+    assert.equal(r.rects.find((x) => x.id === 2).outer.width, 300);
+  });
+});
+
+test('init config: invalid gap puts the plugin in failed state', async () => {
+  const logs = [];
+  await withRuntime({ log: (m) => logs.push(m) }, async (rt) => {
+    await rt.load([
+      bundledToResolved(layoutPluginSpec, layoutPluginSpec.module,
+        { layout: { gap: -1 } }),
+    ]);
+    const states = rt.states();
+    assert.equal(states[0].state, 'failed');
+    assert.ok(logs.some((l) => l.includes('init failed') && l.includes('non-negative')),
+      `expected layout.gap error in logs; got: ${logs.join('\n')}`);
+  });
+});
+
+test('init config: invalid masterFraction puts the plugin in failed state', async () => {
+  const logs = [];
+  await withRuntime({ log: (m) => logs.push(m) }, async (rt) => {
+    await rt.load([
+      bundledToResolved(layoutPluginSpec, layoutPluginSpec.module,
+        { layout: { masterFraction: 1.5 } }),
+    ]);
+    const states = rt.states();
+    assert.equal(states[0].state, 'failed');
+    assert.ok(logs.some((l) => l.includes('init failed') && l.includes('masterFraction')),
+      `expected masterFraction error in logs; got: ${logs.join('\n')}`);
+  });
+});
+
+// ---- setParams: gap delta -----------------------------------------------
+
+test('setParams: gapDelta grows the gap', async () => {
+  await withRuntime({}, async (rt) => {
+    await rt.load([bundledToResolved(layoutPluginSpec, layoutPluginSpec.module)]);
+    await rt.waitForNamespace('layout');
+    const snap = await rt.invokeNamespace('layout', 'setParams', [{ gapDelta: 8 }]);
+    assert.equal(snap.gap, 8);
+  });
+});
+
+test('setParams: gapDelta clamps to >= 0', async () => {
+  await withRuntime({}, async (rt) => {
+    await rt.load([
+      bundledToResolved(layoutPluginSpec, layoutPluginSpec.module,
+        { layout: { gap: 4 } }),
+    ]);
+    await rt.waitForNamespace('layout');
+    // From gap=4, request -100; the result clamps to 0, not negative.
+    const snap = await rt.invokeNamespace('layout', 'setParams', [{ gapDelta: -100 }]);
+    assert.equal(snap.gap, 0);
+  });
+});
+
+test('setParams: combined gap + master deltas in a single call', async () => {
+  await withRuntime({}, async (rt) => {
+    await rt.load([bundledToResolved(layoutPluginSpec, layoutPluginSpec.module)]);
+    await rt.waitForNamespace('layout');
+    const snap = await rt.invokeNamespace('layout', 'setParams',
+      [{ masterFractionDelta: 0.1, gapDelta: 12 }]);
+    assert.equal(snap.masterFraction, 0.6);
+    assert.equal(snap.gap, 12);
+  });
+});

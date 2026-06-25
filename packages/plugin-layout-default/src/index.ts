@@ -11,12 +11,40 @@
 
 import type {
   LayoutAPI, LayoutInputs, LayoutResult, LayoutParamUpdate, LayoutParamSnapshot,
+  LayoutPluginConfig,
 } from "@overdraw/layout-types";
 import { masterStackLayout, DEFAULT_LAYOUT, type LayoutParams } from "./master-stack.js";
 
 // Master-fraction bounds; matches the clamp masterStackLayout applies.
 const MASTER_MIN = 0.05;
 const MASTER_MAX = 0.95;
+
+// Validate the raw config. Returns a populated LayoutParams; throws on
+// schema deviation. Missing fields take the DEFAULT_LAYOUT values.
+function validateConfig(raw: unknown): LayoutParams {
+  if (raw === null || raw === undefined) return { ...DEFAULT_LAYOUT };
+  if (typeof raw !== "object" || Array.isArray(raw)) {
+    throw new TypeError(`layout config must be an object (got ${typeof raw})`);
+  }
+  const o = raw as { [k: string]: unknown };
+  const out: LayoutParams = { ...DEFAULT_LAYOUT };
+  if (o.masterFraction !== undefined) {
+    if (typeof o.masterFraction !== "number"
+        || !Number.isFinite(o.masterFraction)
+        || o.masterFraction < MASTER_MIN || o.masterFraction > MASTER_MAX) {
+      throw new TypeError(
+        `layout.masterFraction must be a finite number in [${MASTER_MIN}, ${MASTER_MAX}]`);
+    }
+    out.masterFraction = o.masterFraction;
+  }
+  if (o.gap !== undefined) {
+    if (typeof o.gap !== "number" || !Number.isFinite(o.gap) || o.gap < 0) {
+      throw new TypeError(`layout.gap must be a non-negative finite number`);
+    }
+    out.gap = o.gap;
+  }
+  return out;
+}
 
 // The plugin SDK shape we need. Importing PluginSdk from the core types
 // would couple this plugin to core's internal type packaging; instead we
@@ -33,8 +61,8 @@ interface SdkLike {
                    opts?: { priority?: number }): Promise<{ unregister(): void }>;
 }
 
-export default async function init(sdk: SdkLike): Promise<void> {
-  const params: LayoutParams = { ...DEFAULT_LAYOUT };
+export default async function init(sdk: SdkLike, rawConfig?: unknown): Promise<void> {
+  const params: LayoutParams = validateConfig(rawConfig);
 
   const api: LayoutAPI = {
     async compute(inputs: LayoutInputs): Promise<LayoutResult> {
@@ -65,9 +93,14 @@ export default async function init(sdk: SdkLike): Promise<void> {
     },
 
     async setParams(update: LayoutParamUpdate): Promise<LayoutParamSnapshot> {
-      if (typeof update?.masterFractionDelta === "number") {
+      if (typeof update?.masterFractionDelta === "number"
+          && Number.isFinite(update.masterFractionDelta)) {
         params.masterFraction = Math.min(MASTER_MAX, Math.max(MASTER_MIN,
           params.masterFraction + update.masterFractionDelta));
+      }
+      if (typeof update?.gapDelta === "number"
+          && Number.isFinite(update.gapDelta)) {
+        params.gap = Math.max(0, params.gap + update.gapDelta);
       }
       return { masterFraction: params.masterFraction, gap: params.gap };
     },
@@ -77,5 +110,9 @@ export default async function init(sdk: SdkLike): Promise<void> {
   // ResolvedPlugin.bundled is true). Pass undefined here so the runtime's
   // default applies; an explicit value would shadow the bundled marker.
   await sdk.registerPlugin("layout", () => api);
-  sdk.log("master-stack layout registered");
+  sdk.log(`master-stack layout registered (masterFraction=${params.masterFraction}, gap=${params.gap})`);
 }
+
+// Re-export the user-facing config type so plugin authors can
+// `satisfies LayoutPluginConfig` from a single import.
+export type { LayoutPluginConfig } from "@overdraw/layout-types";

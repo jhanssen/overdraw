@@ -109,6 +109,14 @@ export interface OverdrawConfig {
   // `import type { DecorationPluginConfig } from "@overdraw/decoration-types"`
   // and write `decoration: cfg satisfies DecorationPluginConfig`.
   decoration?: unknown;
+  // Bundled-plugin config slice for the 'layout' namespace. Same verbatim
+  // pass-through pattern: the bundled master-stack layout plugin owns the
+  // schema (`LayoutPluginConfig` from `@overdraw/layout-types`: optional
+  // `masterFraction` in [0.05, 0.95] and `gap` in px). For typed editing
+  // users may
+  // `import type { LayoutPluginConfig } from "@overdraw/layout-types"`
+  // and write `layout: cfg satisfies LayoutPluginConfig`.
+  layout?: unknown;
   // User-defined actions. Each entry is a name -> handler function
   // registered into the core action registry by the bundled
   // @overdraw/plugin-config-actions. Handlers run in the main thread
@@ -204,6 +212,8 @@ export interface ResolvedConfig {
   hotkeys: unknown;
   // Same verbatim pass-through to the bundled decoration plugin.
   decoration: unknown;
+  // Same verbatim pass-through to the bundled layout plugin.
+  layout: unknown;
   // User-defined action handlers. The bundled @overdraw/plugin-config-
   // actions registers each entry into the action registry. Function
   // references survive only because the plugin is in-thread (bundled);

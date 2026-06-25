@@ -76,6 +76,7 @@ export const BUNDLED_PLUGINS: ReadonlyArray<BundledPluginSpec> = [
   {
     name: "layout-default",
     module: "@overdraw/plugin-layout-default",
+    configFrom: (config) => config.layout,
   },
   {
     name: "focus-default",

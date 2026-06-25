@@ -1137,6 +1137,18 @@ pluginBus.subscribe("layout.master-fraction-requested", (_n, payload) => {
     });
 });
 
+// The layout.grow-gap / shrink-gap actions emit this; route to the
+// active layout plugin's setParams.
+pluginBus.subscribe("layout.gap-requested", (_n, payload) => {
+  const delta = (payload as { delta?: unknown }).delta;
+  if (typeof delta !== "number" || !runtime) return;
+  void runtime.invokeNamespace("layout", "setParams", [{ gapDelta: delta }])
+    .then(() => { state?.relayout?.("param-changed"); })
+    .catch((e: unknown) => {
+      log.warn("core", `layout.setParams failed: ${(e as Error).message}`);
+    });
+});
+
 // KMS mode switch. Resolves the durable identifier (EDID id or connector
 // name) to a live outputId via state.outputs, then forwards to the
 // addon's switchOutputMode native call. Same durable-key precedence as
