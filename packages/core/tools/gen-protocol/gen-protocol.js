@@ -76,6 +76,8 @@ const DEFAULT_INPUTS = [
   '/usr/share/wayland-protocols/staging/ext-foreign-toplevel-list/ext-foreign-toplevel-list-v1.xml',
   '/usr/share/wayland-protocols/staging/ext-image-capture-source/ext-image-capture-source-v1.xml',
   '/usr/share/wayland-protocols/staging/ext-image-copy-capture/ext-image-copy-capture-v1.xml',
+  '/usr/share/wayland-protocols/staging/xdg-dialog/xdg-dialog-v1.xml',
+  '/usr/share/wayland-protocols/unstable/xdg-foreign/xdg-foreign-unstable-v2.xml',
   // wlr-* protocols are not in wayland-protocols upstream; vendor copies.
   join(repoRoot, 'protocols', 'wlr-layer-shell-unstable-v1.xml'),
   join(repoRoot, 'protocols', 'wlr-foreign-toplevel-management-unstable-v1.xml'),

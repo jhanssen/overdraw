@@ -130,25 +130,34 @@ export type WindowStateBagChangedEvent = {
   deleted: boolean;
 };
 
-// Per-window behavioral state. Three orthogonal compositor-decided axes
-// plus a stash of client wishes:
+// Per-window behavioral state. Compositor-decided axes plus a stash of
+// client wishes:
 //   - `tiling`     -- which lane the window lives in within the layout
 //                     partition (managed = tile-flow; floating = free).
 //   - `exclusive`  -- does this window own the workspace by itself
 //                     (maximized = tileRegion; fullscreen = full output).
 //   - `visible`    -- whether the window is drawn at all (false ≡ minimized).
+//   - `modal`      -- this window blocks interaction with its parent chain
+//                     (focus is tethered; input on the parent is gated).
+//                     A modal child of an absent parent (orphan) is treated
+//                     as a top-level floating modal (no parent to gate; just
+//                     stays on top of the floating peak).
+//   - `parent`     -- the transient-for relationship (xdg_toplevel.set_parent,
+//                     WM_TRANSIENT_FOR, xdg_foreign set_parent_of). Affects
+//                     stacking (children raise with their parent under the
+//                     "raise-with" rule -- see wm/index.ts assignZForMap).
 //   - `layoutMode` / `layoutData` -- open vocabulary owned by the active
 //                                    layout plugin; opaque to core.
-//   - `constraints` + `parent` -- protocol-defined fields from
-//                                 xdg_toplevel.set_min_size / set_max_size
-//                                 / set_parent.
+//   - `constraints` -- protocol-defined fields from xdg_toplevel.set_min_size
+//                      / set_max_size.
 //   - `clientRequests` -- the client's STATED WISHES, set synchronously by
-//                         xdg_toplevel.set_*. The compositor's policy seam
-//                         (window.preconfigure for pre-content, and the
-//                         resolveDecisions step on later proposals) reads
-//                         these and decides whether to honor them on the
-//                         three decision axes above. The renderer + the
-//                         configure-states encoder NEVER read these.
+//                         xdg_toplevel.set_*, xdg_dialog.set_modal, etc.
+//                         The compositor's policy seam (window.preconfigure
+//                         for pre-content, and the resolveDecisions step on
+//                         later proposals) reads these and decides whether
+//                         to honor them on the decision axes above. The
+//                         renderer + the configure-states encoder NEVER read
+//                         these.
 export type Tiling = "managed" | "floating";
 export type Exclusive = "none" | "maximized" | "fullscreen";
 
@@ -156,13 +165,16 @@ export type ClientRequests = {
   wantsMaximized: boolean;
   wantsFullscreen: boolean;
   wantsMinimized: boolean;
+  wantsModal: boolean;
 };
 
 export type WindowState = {
-  // Compositor decisions (what to render; what to send in configure):
+  // Compositor decisions (what to render; what to send in configure;
+  // what to gate focus + input on):
   tiling: Tiling;
   exclusive: Exclusive;
   visible: boolean;
+  modal: boolean;
   // Client wishes (read by the policy seam; not by the renderer):
   clientRequests: ClientRequests;
   layoutMode: string | null;

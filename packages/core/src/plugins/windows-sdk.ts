@@ -31,6 +31,7 @@ export interface WindowStateProposal {
   tiling?: Tiling;
   exclusive?: Exclusive;
   visible?: boolean;
+  modal?: boolean;
   clientRequests?: Partial<ClientRequests>;
   layoutMode?: string | null;
   layoutData?: unknown;
@@ -450,11 +451,14 @@ function validateProposal(p: WindowStateProposal): void {
   if (p.visible !== undefined && typeof p.visible !== "boolean") {
     throw new TypeError("propose visible must be a boolean");
   }
+  if (p.modal !== undefined && typeof p.modal !== "boolean") {
+    throw new TypeError("propose modal must be a boolean");
+  }
   if (p.clientRequests !== undefined) {
     if (typeof p.clientRequests !== "object" || p.clientRequests === null) {
       throw new TypeError("propose clientRequests must be an object");
     }
-    for (const k of ["wantsMaximized", "wantsFullscreen", "wantsMinimized"] as const) {
+    for (const k of ["wantsMaximized", "wantsFullscreen", "wantsMinimized", "wantsModal"] as const) {
       const v = p.clientRequests[k];
       if (v !== undefined && typeof v !== "boolean") {
         throw new TypeError(`propose clientRequests.${k} must be a boolean`);

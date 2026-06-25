@@ -232,6 +232,16 @@ export function netWmStateToPresentation(
   return null;
 }
 
+// _NET_WM_STATE_MODAL: the client wishes the window to be treated as
+// modal relative to its WM_TRANSIENT_FOR. The X equivalent of
+// xdg_dialog_v1.set_modal. Mapped onto clientRequests.wantsModal in xwm.
+export function netWmStateIsModal(
+  states: Set<number>,
+  atoms: Pick<PropertyAtoms, "_NET_WM_STATE_MODAL">,
+): boolean {
+  return states.has(atoms._NET_WM_STATE_MODAL);
+}
+
 // _NET_WM_WINDOW_TYPE: classify the highest-priority recognized type. Used by
 // the WM to promote dialogs/utility/menus to floating (Phase 3 reuses the
 // existing xdg dialog/transient-for floating policy via wm.propose).

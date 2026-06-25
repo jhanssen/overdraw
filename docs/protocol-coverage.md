@@ -221,11 +221,15 @@ the rest.
 These are present in the reference compositors but rarely make or
 break a user's day.
 
-- **`zxdg_exporter_v2`** plus **`zxdg_importer_v2`** — export a
-  surface handle to another process; the other process can import it
+- **`zxdg_exporter_v2`** plus **`zxdg_importer_v2`** — landed. Export
+  a surface handle to another process; the other process can import it
   to set up a transient-parent relationship. File-chooser portals
-  use it so the chooser opens "transient for" the calling app.
-  Effort: ~0.5 day.
+  use it so the chooser opens "transient for" the calling app. The
+  importer's `set_parent_of` routes through `wm.propose({ parent })`
+  with the same stacking semantics as `xdg_toplevel.set_parent`. The
+  exporter's destroy + the imported's destroy correctly clear the
+  parent edge on the child surface so a dangling foreign reference
+  doesn't survive the originator's death.
 
 - **`wp_alpha_modifier_v1`** — per-surface alpha override. Mostly
   cosmetic. Effort: ~0.5 day.
@@ -240,9 +244,17 @@ break a user's day.
 - **`xdg_system_bell_v1`** — terminal bells via the compositor.
   Effort: ~0.5 day.
 
-- **`xdg_wm_dialog_v1`** — a hint that an `xdg_toplevel` is a dialog
-  (compositor may pick different decoration / placement). Cosmetic.
-  Effort: ~0.5 day.
+- **`xdg_wm_dialog_v1`** — landed. A toplevel may register as a
+  dialog (via `xdg_wm_dialog_v1.get_xdg_dialog`) and optionally mark
+  itself modal via `xdg_dialog_v1.set_modal`. Modal routes through
+  `wm.propose({ clientRequests: { wantsModal: true } })` and the
+  policy seam decides; default policy honors. Modal triggers focus
+  tethering (focus follows the modal if the parent chain was focused)
+  and strict input gating (clicks on the parent of an open modal are
+  redirected to the modal). Non-modal dialogs are a hint only -- they
+  still benefit from the dialog-floating promotion in
+  `windowHasContent` when transient-for + fixed-size constraints are
+  set.
 
 - **`xdg_toplevel_tag_manager_v1`** — clients tag toplevels to help
   the compositor group related windows. Cosmetic. Effort: ~0.5 day.

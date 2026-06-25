@@ -30,6 +30,7 @@ import {
   parseStartupId,
   parseNetWmIcon,
   netWmStateToPresentation,
+  netWmStateIsModal,
   classifyWindowType,
   type PropertyAtoms,
   type PropertyReply,
@@ -104,6 +105,10 @@ export interface XWindow {
   maxSize: { width: number; height: number } | null;
   windowKind: ReturnType<typeof classifyWindowType>;
   presentationHint: "fullscreen" | "maximized" | null;
+  // _NET_WM_STATE_MODAL: the client wishes the window to be modal
+  // relative to its WM_TRANSIENT_FOR. Mapped onto
+  // windowState.clientRequests.wantsModal so the policy seam decides.
+  modalHint: boolean;
   // WM_HINTS.input: null when the InputHint bit isn't set (ICCCM default
   // means treat as true). Drives the SetInputFocus vs WM_TAKE_FOCUS
   // decision per the ICCCM truth table.
@@ -210,6 +215,7 @@ function newXWindow(window: number, x: number, y: number, w: number, h: number,
     minSize: null, maxSize: null,
     windowKind: null,
     presentationHint: null,
+    modalHint: false,
     inputHint: null,
     pid: null,
     netWmStateAtoms: new Set<number>(),
@@ -372,16 +378,14 @@ export function startXwm(state: CompositorState, addon: Addon, wmFd: number): Xw
       if (parent && parent.surfaceId !== null) proposal.parent = parent.surfaceId;
     }
     // _NET_WM_STATE -> clientRequests. EWMH sends "this window WANTS
-    // to be fullscreen/maximized"; that's a wish, not a decision. The
-    // policy seam in wm.propose maps it onto the exclusive axis the
-    // same way it does for xdg_toplevel.set_*.
-    if (w.presentationHint === "fullscreen") {
-      proposal.clientRequests = { wantsFullscreen: true, wantsMaximized: false };
-    } else if (w.presentationHint === "maximized") {
-      proposal.clientRequests = { wantsMaximized: true, wantsFullscreen: false };
-    } else {
-      proposal.clientRequests = { wantsMaximized: false, wantsFullscreen: false };
-    }
+    // to be fullscreen/maximized/modal"; that's a wish, not a decision.
+    // The policy seam in wm.propose maps it onto the decision axes the
+    // same way it does for xdg_toplevel.set_* and xdg_dialog.set_modal.
+    proposal.clientRequests = {
+      wantsFullscreen: w.presentationHint === "fullscreen",
+      wantsMaximized: w.presentationHint === "maximized",
+      wantsModal: w.modalHint,
+    };
     if (Object.keys(proposal).length > 0) {
       void state.wm.propose(w.surfaceId, proposal, "client-request");
     }
@@ -438,6 +442,7 @@ export function startXwm(state: CompositorState, addon: Addon, wmFd: number): Xw
         const states = parseNetWmState(p);
         w.netWmStateAtoms = states;
         w.presentationHint = netWmStateToPresentation(states, pa);
+        w.modalHint = netWmStateIsModal(states, pa);
         sendStructuralProposals(w);
         break;
       }

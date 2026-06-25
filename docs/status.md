@@ -55,20 +55,39 @@ nothing, with no error. Worst-first.
   are narrow.** `set_maximized`/`unset`, `set_fullscreen`/`unset`,
   `set_minimized`, `set_min_size`/`set_max_size`, and interactive
   `move`/`resize` route through `wm.propose` and take effect. The next
-  configure carries resolved state in its states array. **Genuinely still
+  configure carries resolved state in its states array. `set_parent`
+  drives stacking via the "raise-with" rule (a modal child always
+  raises with its parent; a non-modal child raises with a managed
+  parent but is independent of a floating parent). **Genuinely still
   no-op / limited:** `show_window_menu` (no compositor-side menu);
   `set_fullscreen` per-output target hint ignored (single output);
-  `set_parent` stored but does not drive stacking or modal behavior;
   reserved-zone exclusion applies to maximized/tiled but not floating.
 
-- **`WindowState` splits the three orthogonal axes and separates client
-  requests from compositor decisions.** `WindowState` carries three
+- **Modality is a first-class concept (`WindowState.modal`), separate
+  from `parent`.** A modal window (set via `xdg_dialog_v1.set_modal`,
+  `_NET_WM_STATE_MODAL`, or `sdk.windows.propose({ modal: true })`)
+  triggers two behaviors. (1) **Focus tethering**: if the modal's
+  parent chain has keyboard focus at the moment the modal becomes
+  modal, focus is transferred to the modal; if focus is somewhere
+  else, the modal opens quietly without stealing. On modal close /
+  `modal=false`, focus returns to the modal's live parent (if any).
+  (2) **Strict input gating**: a hit on any window in a modal's
+  ancestor chain redirects to the topmost visible modal descendant.
+  Non-modal children do NOT gate -- a floating dialog of a floating
+  parent stays independently interactive. Orphan modals (parent gone)
+  become non-blocking floating windows; the WM does not auto-close
+  transient children when their parent closes (toolkit-level
+  concern).
+
+- **`WindowState` splits the orthogonal axes and separates client
+  requests from compositor decisions.** `WindowState` carries four
   decision fields the compositor owns -- `tiling` (`managed |
   floating`), `exclusive` (`none | maximized | fullscreen`), `visible`
-  (boolean) -- plus a `clientRequests` sub-object (`wantsMaximized`,
-  `wantsFullscreen`, `wantsMinimized`) that records the client's stated
-  wishes. The renderer + the configure-states encoder read the decision
-  fields only; the policy seam reads `clientRequests`.
+  (boolean), `modal` (boolean) -- plus a `clientRequests` sub-object
+  (`wantsMaximized`, `wantsFullscreen`, `wantsMinimized`, `wantsModal`)
+  that records the client's stated wishes. The renderer + the
+  configure-states encoder read the decision fields only; the policy
+  seam reads `clientRequests`.
 
   - `xdg_toplevel.set_maximized` writes `clientRequests.wantsMaximized
     = true`; it does NOT directly touch `exclusive`. Same for

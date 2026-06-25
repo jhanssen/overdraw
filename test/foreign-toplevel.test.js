@@ -102,8 +102,11 @@ function mockCtx() {
         propose.push({ id, partial, reason });
         // Merge into the recorded state so the test can observe the result.
         const cur = state._wmStates.get(id) ?? {
-          tiling: "managed", exclusive: "none", visible: true,
-          clientRequests: { wantsMaximized: false, wantsFullscreen: false, wantsMinimized: false },
+          tiling: "managed", exclusive: "none", visible: true, modal: false,
+          clientRequests: {
+            wantsMaximized: false, wantsFullscreen: false,
+            wantsMinimized: false, wantsModal: false,
+          },
           parent: null,
         };
         const next = { ...cur, ...partial };
@@ -298,8 +301,11 @@ test("window.change(activated): handle re-emits state + done", () => {
 
 function ws(over = {}) {
   return {
-    tiling: "managed", exclusive: "none", visible: true,
-    clientRequests: { wantsMaximized: false, wantsFullscreen: false, wantsMinimized: false },
+    tiling: "managed", exclusive: "none", visible: true, modal: false,
+    clientRequests: {
+      wantsMaximized: false, wantsFullscreen: false,
+      wantsMinimized: false, wantsModal: false,
+    },
     parent: null,
     ...over,
   };

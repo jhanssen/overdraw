@@ -76,6 +76,9 @@ const GLOBALS = [
   "ext_output_image_capture_source_manager_v1",
   "ext_foreign_toplevel_image_capture_source_manager_v1",
   "ext_image_copy_capture_manager_v1",
+  "xdg_wm_dialog_v1",
+  "zxdg_exporter_v2",
+  "zxdg_importer_v2",
 ];
 
 // Interfaces created via requests (new_id), registered without a global so
@@ -113,6 +116,9 @@ const CHILD_INTERFACES = [
   "ext_image_copy_capture_session_v1",
   "ext_image_copy_capture_frame_v1",
   "ext_image_copy_capture_cursor_session_v1",
+  "xdg_dialog_v1",
+  "zxdg_exported_v2",
+  "zxdg_imported_v2",
 ];
 
 // Load all generated signature modules, keyed by interface name.
@@ -381,6 +387,14 @@ export async function installProtocols(
       // from state.outputToplevelStacks (populated via the workspace
       // plugin's setOutputStack side effects).
       outputContent: () => state.outputToplevelStacks ?? new Map(),
+      // Modal focus tethering: the WM observes when a modal becomes
+      // active (or loses modality) and tells the seat to move focus.
+      // The seat is constructed AFTER createWm (see GLOBALS loop
+      // below), so these closures resolve state.seat lazily. When
+      // the seat isn't wired yet (very early-life), tethering is a
+      // no-op.
+      currentFocusedSurfaceId: () => state.seat?.kbFocus?.surfaceId ?? null,
+      requestFocus: (surfaceId) => state.seat?.applyKeyboardFocus(surfaceId),
     },
   );
   // Expose wm.schedule via state.relayout for callers outside the WM that
@@ -731,6 +745,9 @@ export async function installProtocols(
     wp_presentation: await import("./wp_presentation.js"),
     ext_foreign_toplevel_list_v1: await import("./ext_foreign_toplevel_list_v1.js"),
     ext_output_image_capture_source_manager_v1: await import("./ext_image_copy_capture_v1.js"),
+    xdg_wm_dialog_v1: await import("./xdg_dialog_v1.js"),
+    zxdg_exporter_v2: await import("./xdg_foreign_v2.js"),
+    zxdg_importer_v2: await import("./xdg_foreign_v2.js"),
   };
 
   // Some child interfaces have handlers from a sibling module's named exports.
@@ -753,6 +770,8 @@ export async function installProtocols(
   const extDataControlMod = await import("./ext_data_control_v1.js");
   const extForeignTopMod = await import("./ext_foreign_toplevel_list_v1.js");
   const captureMod = await import("./ext_image_copy_capture_v1.js");
+  const xdgDialogMod = await import("./xdg_dialog_v1.js");
+  const xdgForeignMod = await import("./xdg_foreign_v2.js");
   const childHandlers: Record<string, object> = {
     wl_pointer: seatMod.makePointer(ctx),
     wl_keyboard: seatMod.makeKeyboard(ctx),
@@ -793,6 +812,9 @@ export async function installProtocols(
     ext_image_copy_capture_session_v1: captureMod.makeImageCopyCaptureSession(ctx),
     ext_image_copy_capture_frame_v1: captureMod.makeImageCopyCaptureFrame(ctx),
     ext_image_copy_capture_cursor_session_v1: captureMod.makeImageCopyCaptureCursorSession(ctx),
+    xdg_dialog_v1: xdgDialogMod.makeXdgDialog(ctx),
+    zxdg_exported_v2: xdgForeignMod.makeExported(ctx),
+    zxdg_imported_v2: xdgForeignMod.makeImported(ctx),
   };
 
   // The apply target forwards lazily: the seat is constructed below and
@@ -817,6 +839,7 @@ export async function installProtocols(
       captureMod.makeForeignToplevelImageCaptureSourceManager(ctx),
     ext_image_copy_capture_manager_v1:
       captureMod.makeImageCopyCaptureManager(ctx),
+    zxdg_importer_v2: xdgForeignMod.makeImporter(ctx),
   };
 
   for (const name of CHILD_INTERFACES) {

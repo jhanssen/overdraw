@@ -138,10 +138,12 @@ export function defaultWindowState(): WindowState {
     tiling: "managed",
     exclusive: "none",
     visible: true,
+    modal: false,
     clientRequests: {
       wantsMaximized: false,
       wantsFullscreen: false,
       wantsMinimized: false,
+      wantsModal: false,
     },
     layoutMode: null,
     layoutData: undefined,
@@ -208,6 +210,7 @@ export interface WindowStateProposal {
   tiling?: Tiling;
   exclusive?: Exclusive;
   visible?: boolean;
+  modal?: boolean;
   clientRequests?: Partial<ClientRequests>;
   layoutMode?: string | null;
   layoutData?: unknown;
@@ -416,6 +419,7 @@ function cloneState(s: WindowState): WindowState {
     tiling: s.tiling,
     exclusive: s.exclusive,
     visible: s.visible,
+    modal: s.modal,
     clientRequests: { ...s.clientRequests },
     layoutMode: s.layoutMode,
     layoutData: s.layoutData,
@@ -437,10 +441,11 @@ function validateState(v: unknown): WindowState | null {
   if (o.tiling !== "managed" && o.tiling !== "floating") return null;
   if (o.exclusive !== "none" && o.exclusive !== "maximized" && o.exclusive !== "fullscreen") return null;
   if (typeof o.visible !== "boolean") return null;
+  if (typeof o.modal !== "boolean") return null;
   const cr = o.clientRequests;
   if (typeof cr !== "object" || cr === null) return null;
   const crr = cr as { [k: string]: unknown };
-  for (const k of ["wantsMaximized", "wantsFullscreen", "wantsMinimized"] as const) {
+  for (const k of ["wantsMaximized", "wantsFullscreen", "wantsMinimized", "wantsModal"] as const) {
     if (typeof crr[k] !== "boolean") return null;
   }
   if (o.layoutMode !== null && typeof o.layoutMode !== "string") return null;
@@ -470,12 +475,20 @@ const GEOMETRY_FIELDS: ReadonlyArray<keyof WindowState> = [
   "tiling", "exclusive", "visible", "layoutMode", "layoutData", "constraints",
 ];
 
+// Fields whose change requires a stacking pass (z-recompute + raise of any
+// child chains). Disjoint from GEOMETRY_FIELDS so a stacking-only change
+// (e.g. set_modal post-content) doesn't trigger a full relayout.
+const STACKING_FIELDS: ReadonlyArray<keyof WindowState> = [
+  "parent", "modal",
+];
+
 // Diff two WindowState values; returns the list of differing field names.
 function diffState(prev: WindowState, next: WindowState): Array<keyof WindowState> {
   const out: Array<keyof WindowState> = [];
   if (prev.tiling !== next.tiling) out.push("tiling");
   if (prev.exclusive !== next.exclusive) out.push("exclusive");
   if (prev.visible !== next.visible) out.push("visible");
+  if (prev.modal !== next.modal) out.push("modal");
   if (!clientRequestsEqual(prev.clientRequests, next.clientRequests)) out.push("clientRequests");
   if (prev.layoutMode !== next.layoutMode) out.push("layoutMode");
   // layoutData identity-compare; plugins are expected to replace, not mutate.
@@ -489,7 +502,8 @@ function diffState(prev: WindowState, next: WindowState): Array<keyof WindowStat
 function clientRequestsEqual(a: ClientRequests, b: ClientRequests): boolean {
   return a.wantsMaximized === b.wantsMaximized
       && a.wantsFullscreen === b.wantsFullscreen
-      && a.wantsMinimized === b.wantsMinimized;
+      && a.wantsMinimized === b.wantsMinimized
+      && a.wantsModal === b.wantsModal;
 }
 
 function constraintsEqual(a: WindowState["constraints"], b: WindowState["constraints"]): boolean {
@@ -518,6 +532,7 @@ function mergeProposal(current: WindowState, p: WindowStateProposal): WindowStat
   if (p.tiling !== undefined) next.tiling = p.tiling;
   if (p.exclusive !== undefined) next.exclusive = p.exclusive;
   if (p.visible !== undefined) next.visible = p.visible;
+  if (p.modal !== undefined) next.modal = p.modal;
   if (p.clientRequests !== undefined) {
     if (p.clientRequests.wantsMaximized !== undefined) {
       next.clientRequests.wantsMaximized = p.clientRequests.wantsMaximized;
@@ -527,6 +542,9 @@ function mergeProposal(current: WindowState, p: WindowStateProposal): WindowStat
     }
     if (p.clientRequests.wantsMinimized !== undefined) {
       next.clientRequests.wantsMinimized = p.clientRequests.wantsMinimized;
+    }
+    if (p.clientRequests.wantsModal !== undefined) {
+      next.clientRequests.wantsModal = p.clientRequests.wantsModal;
     }
   }
   if (p.layoutMode !== undefined) next.layoutMode = p.layoutMode;
@@ -574,7 +592,8 @@ function resolveDecisions(
   const decisionDirectlySet =
     prev.tiling !== candidate.tiling
     || prev.exclusive !== candidate.exclusive
-    || prev.visible !== candidate.visible;
+    || prev.visible !== candidate.visible
+    || prev.modal !== candidate.modal;
   if (decisionDirectlySet) return out;
 
   // wantsFullscreen wins over wantsMaximized (matches EWMH precedence).
@@ -600,6 +619,13 @@ function resolveDecisions(
     } else {
       out.visible = true;
     }
+  }
+
+  // wantsModal is honored at both phases. xdg_dialog_v1 is the typical
+  // source; a window-rules plugin may pre-empt by writing `modal`
+  // directly (caught by the decisionDirectlySet guard above).
+  if (req.wantsModal !== prevReq.wantsModal) {
+    out.modal = req.wantsModal;
   }
 
   return out;
@@ -631,6 +657,18 @@ export interface WmOptions {
   // coexist). When absent, the WM constructs an internal broker -- fine
   // for GPU-free unit tests that build a WM standalone.
   surfaceTx?: SurfaceTransactionBroker;
+  // Focus driver hook for modal tethering. When a modal child takes
+  // effect (modal map, or modal=true transition on a live window) and
+  // the focused window is in the modal's parent chain, the WM calls
+  // this with the modal's surfaceId so the seat hands keyboard focus
+  // over. Symmetrically on modal close / modal=false transition: the
+  // WM calls back with the parent's surfaceId. Tests / harnesses that
+  // don't wire a seat can omit it (focus tethering is then a no-op).
+  // The hook returns the surfaceId that currently has keyboard focus
+  // (null when no focus), so the WM can check whether tethering is
+  // needed at all. requestFocus(id) applies focus.
+  currentFocusedSurfaceId?: () => number | null;
+  requestFocus?: (surfaceId: number | null) => void;
 }
 
 // Convenience: build the WM's per-output map from a list of descriptors,
@@ -664,6 +702,12 @@ export type {
   Tiling, Exclusive, ClientRequests, WindowState, ProposalReason,
 } from "../events/types.js";
 
+// Re-exported for the test that wants to assert modal-tether behavior
+// against a known modal. Internal helpers (childrenOf, rootOfChain,
+// raiseStackedDescendants, topmostModalDescendant) are not exported;
+// tests exercise them through the public surface (propose / raiseWindow
+// / windowAt).
+
 // Per-handler ceiling for window.relayout + window.proposed interceptors.
 const INTERCEPTOR_TIMEOUT_MS = 100;
 
@@ -681,6 +725,8 @@ export function createWm(
   const layoutDriverFactory = opts?.layoutDriverFactory;
   const pluginBus = opts?.pluginBus;
   const outputContent = opts?.outputContent;
+  const currentFocusedSurfaceId = opts?.currentFocusedSurfaceId;
+  const requestFocus = opts?.requestFocus;
   // Shared broker if one was provided; otherwise a private one wired to
   // this compositor sink. The broker absorbs freeze/thaw/timer/frozen-
   // ready plumbing; the WM keeps the resize-specific data (configure
@@ -702,19 +748,24 @@ export function createWm(
   // Re-derive tiledZ + the floating high-water mark from the current
   // window list. Run after any z mutation so subsequent z assignments
   // (new map, raise) reflect the actual peak.
+  // High-water mark for "above the tile stack" windows. Includes
+  // floating windows AND modals (a modal of a tiled parent sits at
+  // parent.z + 1 = tiledZ + 1, which is above the tile stack and
+  // should count toward the peak so subsequent floats/modals land
+  // above it).
   function maxFloatingZ(): number {
     let m = tiledZ;
     for (const w of windows) {
-      if (w.windowState.tiling === "floating" && w.z > m) m = w.z;
+      const isAboveTile =
+        w.windowState.tiling === "floating" || w.windowState.modal;
+      if (isAboveTile && w.z > m) m = w.z;
     }
     return m;
   }
 
-  // Children (modals) of a given parent window, by surfaceId. The
-  // child is any window whose windowState.parent points at the
-  // parentId. Used to raise an entire modal subtree above its root
-  // when the user clicks anywhere in the chain.
-  function modalChildrenOf(parentSurfaceId: number): Window[] {
+  // Direct children of `parentSurfaceId` -- every window whose
+  // windowState.parent points at it. Unfiltered (modal + non-modal).
+  function childrenOf(parentSurfaceId: number): Window[] {
     const out: Window[] = [];
     for (const w of windows) {
       if (w.windowState.parent === parentSurfaceId) out.push(w);
@@ -722,63 +773,151 @@ export function createWm(
     return out;
   }
 
-  // Walk a modal chain bottom-up: any window whose parent is non-null
-  // is treated as a modal; chase parents until we hit a non-modal
-  // (parent === null) or run out of windows. Used to redirect a raise
-  // request on a modal dialog up to its root toplevel; the modal
-  // subtree then rides along via raiseModalDescendants.
-  function rootOfModalChain(start: Window): Window {
+  // The "raise-with" rule. A child raises along with its parent when
+  // EITHER the child is modal (modal always tops the parent) OR the
+  // parent is managed (a tiled parent + its dialog form one logical
+  // unit; raising the tile raises the dialog). The negation -- a
+  // non-modal child of a floating parent -- has independent z and is
+  // left alone on parent raise; the user can interact with both
+  // windows freely and re-stack them by clicking either.
+  function raisesWithParent(child: Window, parent: Window): boolean {
+    return child.windowState.modal || parent.windowState.tiling === "managed";
+  }
+
+  // Walk up the parent chain from `start` across raise-with links
+  // only. Stops at the first link that doesn't raise (a non-modal
+  // child of a floating parent) -- that ancestor is the raise target.
+  // Used to redirect a click on a tethered child up to the window that
+  // owns the stack.
+  function rootOfChain(start: Window): Window {
     let cur = start;
     for (let i = 0; i < 64; i++) {
       const parentId = cur.windowState.parent;
       if (parentId === null) return cur;
       const parent = windows.find((w) => w.surfaceId === parentId);
       if (!parent) return cur;
+      if (!raisesWithParent(cur, parent)) return cur;
       cur = parent;
     }
     return cur;
   }
 
-  // After raising `root`, walk its modal descendants and set each one's
-  // z to at least root.z + (depth+1) so the modal-above-parent
-  // invariant holds. Recurses through nested modals.
-  function raiseModalDescendants(root: Window): void {
-    function visit(parent: Window, depth: number): void {
+  // After raising `root`, walk descendants and re-elevate every child
+  // that raises with its parent. A non-modal child of a floating
+  // parent is skipped (independent z).
+  function raiseStackedDescendants(root: Window): void {
+    function visit(parent: Window): void {
       const targetZ = parent.z + 1;
-      for (const child of modalChildrenOf(parent.surfaceId)) {
-        if (child.z <= parent.z) child.z = targetZ;
-        visit(child, depth + 1);
+      for (const child of childrenOf(parent.surfaceId)) {
+        if (raisesWithParent(child, parent)) {
+          if (child.z <= parent.z) child.z = targetZ;
+        }
+        visit(child);
       }
     }
-    visit(root, 0);
+    visit(root);
   }
 
-  // Assign z on map per the documented rules:
-  //   tiled toplevel (tiling === "managed", any exclusive/visible):
-  //     z = tiledZ (joins the shared tiled stack).
-  //   floating window with no parent:
-  //     z = max(highestFloating, tiledZ) + 1.
-  //   modal dialog (parent != null):
-  //     z = max(parent.z, highestFloating) + 1; the parent's modal
-  //     subtree is normalized via raiseModalDescendants so deeper
-  //     modals stay above this one.
+  // Walk the parent chain of `start` (unrestricted by raise-with) and
+  // return every ancestor including `start` itself, oldest-first. Used
+  // by focus tethering: when a modal becomes active, check whether the
+  // current focus target is anywhere in the chain.
+  function chainOf(start: Window): Window[] {
+    const out: Window[] = [];
+    let cur: Window | null = start;
+    for (let i = 0; i < 64; i++) {
+      if (!cur) break;
+      out.push(cur);
+      const parentId: number | null = cur.windowState.parent;
+      if (parentId === null) break;
+      cur = windows.find((w) => w.surfaceId === parentId) ?? null;
+    }
+    return out;
+  }
+
+  // Topmost visible modal descendant of `parentSurfaceId` (transitive,
+  // modal-only). null if none. Used by input gating (windowAt redirect)
+  // and focus tethering (block focus on parent that has open modal).
+  function topmostModalDescendant(parentSurfaceId: number): Window | null {
+    let best: Window | null = null;
+    function visit(parent: Window): void {
+      for (const child of childrenOf(parent.surfaceId)) {
+        if (child.windowState.modal && child.windowState.visible
+            && child.hasContent && !child.contentGated) {
+          if (!best || child.z > best.z) best = child;
+        }
+        visit(child);
+      }
+    }
+    const start = windows.find((w) => w.surfaceId === parentSurfaceId);
+    if (start) visit(start);
+    return best;
+  }
+
+  // Apply the focus-tethering rule for a window that just became modal
+  // (or was just mapped as modal). If any ancestor in the modal's
+  // parent chain currently has keyboard focus, transfer focus to the
+  // modal. If focus is somewhere else entirely (or no focus driver),
+  // do nothing -- the modal opens quietly.
+  function tetherFocusOnModal(modal: Window): void {
+    if (!requestFocus || !currentFocusedSurfaceId) return;
+    if (!modal.windowState.modal) return;
+    if (!modal.windowState.visible) return;
+    const focused = currentFocusedSurfaceId();
+    if (focused === null || focused === modal.surfaceId) return;
+    // Walk up modal's parent chain; if focused is anywhere in it,
+    // tether.
+    const chain = chainOf(modal);
+    for (const ancestor of chain) {
+      if (ancestor.surfaceId === modal.surfaceId) continue;
+      if (ancestor.surfaceId === focused) {
+        requestFocus(modal.surfaceId);
+        return;
+      }
+    }
+  }
+
+  // Apply the focus-untether rule for a modal that just lost modality
+  // (modal=false transition, or unmap). If the focused window is the
+  // modal itself, return focus to the first live parent in its chain.
+  // If the chain is dead / orphan, clear focus.
+  function untetherFocusOnUnmodal(modal: Window, modalSurfaceId: number): void {
+    if (!requestFocus || !currentFocusedSurfaceId) return;
+    const focused = currentFocusedSurfaceId();
+    if (focused !== modalSurfaceId) return;
+    const parentId = modal.windowState.parent;
+    if (parentId === null) { requestFocus(null); return; }
+    const parent = windows.find((w) => w.surfaceId === parentId);
+    if (!parent) { requestFocus(null); return; }
+    requestFocus(parent.surfaceId);
+  }
+
+  // Assign z on map. Five cases:
+  //   modal && parent live      -> max(parent.z, maxFloatingZ()) + 1
+  //   modal && (no parent)      -> maxFloatingZ() + 1  (orphan modal)
+  //   tiling===managed          -> tiledZ              (joins tile stack)
+  //   floating && parent managed-> max(parent.z, maxFloatingZ()) + 1
+  //   floating && (no parent or parent floating) -> maxFloatingZ() + 1
+  // After placing the window, `raiseStackedDescendants` runs so a
+  // newly-mapped node carrying a chain of own descendants (rare on
+  // map, but possible if a plugin pre-populates state) is consistent.
   function assignZForMap(win: Window): void {
-    const isFloating = win.windowState.tiling === "floating";
     const parentId = win.windowState.parent;
-    if (!isFloating && parentId === null) {
+    const parent = parentId !== null
+      ? windows.find((w) => w.surfaceId === parentId) ?? null
+      : null;
+    const isModal = win.windowState.modal;
+    const isFloating = win.windowState.tiling === "floating";
+    if (isModal && parent) {
+      win.z = Math.max(parent.z, maxFloatingZ()) + 1;
+    } else if (!isFloating && !isModal) {
       win.z = tiledZ;
-      return;
+    } else if (parent && raisesWithParent(win, parent)) {
+      win.z = Math.max(parent.z, maxFloatingZ()) + 1;
+    } else {
+      win.z = maxFloatingZ() + 1;
     }
-    if (parentId !== null) {
-      const parent = windows.find((w) => w.surfaceId === parentId);
-      const baseZ = Math.max(parent?.z ?? tiledZ, maxFloatingZ());
-      win.z = baseZ + 1;
-      // A nested modal chain may exist (modal-of-modal); ensure
-      // descendants stay above.
-      raiseModalDescendants(win);
-      return;
-    }
-    win.z = maxFloatingZ() + 1;
+    raiseStackedDescendants(win);
   }
   // The primary is the lowest live id; computed on demand to track setOutputs.
   function primaryOutputId(): number {
@@ -1250,6 +1389,10 @@ export function createWm(
         assignZForMap(win);
         compositor.setSurfaceLayout(win.surfaceId, win.rect.x, win.rect.y, win.rect.width, win.rect.height);
         pushStack();
+        // Modal map: tether keyboard focus to the modal if its parent
+        // chain currently holds focus. Runs after pushStack so a focus
+        // change here can observe the modal as drawable.
+        if (win.windowState.modal) tetherFocusOnModal(win);
         // Dialog policy may have promoted this window to floating; the
         // floatingRect we just seeded won't take effect until a
         // relayout runs.
@@ -1275,12 +1418,18 @@ export function createWm(
     unmapWindow(surfaceId) {
       const i = windows.findIndex((w) => w.surfaceId === surfaceId);
       if (i < 0) return;
+      const unmapped = windows[i];
+      // If the unmapped window is modal and currently focused, return
+      // focus to the parent (or null if the parent is gone). Read state
+      // BEFORE splicing -- untetherFocusOnUnmodal needs the parent ref.
+      const wasModal = unmapped.windowState.modal;
       windows.splice(i, 1);
       // Cancel any pending resize-tx hold; the broker thaws and removes
       // the entry from pendingResizes via onCancel.
       if (surfaceTx.has(surfaceId)) surfaceTx.cancel(surfaceId);
       driver.schedule("unmapped");
       pushStack();
+      if (wasModal) untetherFocusOnUnmodal(unmapped, surfaceId);
     },
 
     settled() { return driver.settled(); },
@@ -1379,18 +1528,19 @@ export function createWm(
     raiseWindow(surfaceId) {
       const win = windows.find((w) => w.surfaceId === surfaceId);
       if (!win) return;
-      // Redirect modal-chain clicks to the chain's root so a click on
-      // a dialog brings the whole modal subtree up together.
-      const root = rootOfModalChain(win);
+      // Walk up the chain across raise-with links only. A click on a
+      // tethered child (modal, or non-modal child of a managed parent)
+      // redirects to the topmost owner; a click on an independent
+      // floating child (non-modal of a floating parent) raises just
+      // that child.
+      const root = rootOfChain(win);
       const isTiled = root.windowState.tiling === "managed";
       const highestFloating = maxFloatingZ();
       if (isTiled) {
         // Tiled stack: if the shared tiled z is already at the peak,
-        // nothing to do beyond renormalizing modal subtrees (the
-        // modal-above-parent invariant might be stale on a previously
-        // raised tiled stack whose modals weren't re-checked).
-        // Otherwise raise the ENTIRE tiled stack to sit at
-        // highestFloating + 1; every tiled window keeps a shared z.
+        // nothing to do beyond renormalizing descendant chains. Otherwise
+        // raise the ENTIRE tiled stack to sit at highestFloating + 1;
+        // every tiled window keeps a shared z.
         if (tiledZ <= highestFloating) {
           const newZ = highestFloating + 1;
           tiledZ = newZ;
@@ -1399,20 +1549,20 @@ export function createWm(
           }
         }
         // Raising tiled re-elevated EVERY tiled window's z, so EVERY
-        // tiled window's modal subtree may now be below its (newly-
-        // raised) parent. Renormalize every tiled window's modals,
-        // not just the clicked one's.
+        // tiled window's descendant chain may now be below its (newly-
+        // raised) parent. Renormalize every tiled window's chain, not
+        // just the clicked one's. raiseStackedDescendants honors the
+        // raise-with rule (modal-or-managed-parent only).
         for (const w of windows) {
-          if (w.windowState.tiling === "managed") raiseModalDescendants(w);
+          if (w.windowState.tiling === "managed") raiseStackedDescendants(w);
         }
       } else {
         // Floating root: if it's already on top, only renormalize its
-        // own modal subtree (in case a modal got out of order).
-        // Otherwise bump it above the current peak.
+        // own descendant chain. Otherwise bump it above the current peak.
         if (root.z <= highestFloating) {
           root.z = highestFloating + 1;
         }
-        raiseModalDescendants(root);
+        raiseStackedDescendants(root);
       }
       pushStack();
     },
@@ -1426,6 +1576,17 @@ export function createWm(
       // window of its tile region. (For non-overlapping tiled layouts the
       // master-front order matches hit-test order; floating windows on top
       // are at index 0 by layout-plugin convention.)
+      //
+      // Modal gating: when the hit window has a live modal descendant, the
+      // click is redirected to the topmost such descendant. This is the
+      // strict-modality contract -- a click anywhere on a window that owns
+      // an open modal targets the modal instead. Non-modal children do not
+      // gate (a floating dialog of a floating parent is independently
+      // clickable).
+      const gate = (win: Window): Window => {
+        const modal = topmostModalDescendant(win.surfaceId);
+        return modal ?? win;
+      };
       const content = outputContent ? outputContent() : null;
       if (content) {
         for (const ids of content.values()) {
@@ -1439,7 +1600,7 @@ export function createWm(
               const localY = y - r.y;
               if (!accept(win, localX, localY)) continue;
             }
-            return win;
+            return gate(win);
           }
         }
         return null;
@@ -1454,7 +1615,7 @@ export function createWm(
           const localY = y - r.y;
           if (!accept(win, localX, localY)) continue;
         }
-        return win;
+        return gate(win);
       }
       return null;
     },
@@ -1476,6 +1637,8 @@ export function createWm(
         if (proposal.tiling !== undefined) stamp.tiling = proposal.tiling;
         if (proposal.exclusive !== undefined) stamp.exclusive = proposal.exclusive;
         if (proposal.visible !== undefined) stamp.visible = proposal.visible;
+        if (proposal.modal !== undefined) stamp.modal = proposal.modal;
+        if (proposal.parent !== undefined) stamp.parent = proposal.parent;
         if (Object.keys(stamp).length > 0) {
           win.windowState = { ...win.windowState, ...stamp };
         }
@@ -1488,6 +1651,7 @@ export function createWm(
             wantsMaximized: proposal.clientRequests.wantsMaximized ?? prevCR.wantsMaximized,
             wantsFullscreen: proposal.clientRequests.wantsFullscreen ?? prevCR.wantsFullscreen,
             wantsMinimized: proposal.clientRequests.wantsMinimized ?? prevCR.wantsMinimized,
+            wantsModal: proposal.clientRequests.wantsModal ?? prevCR.wantsModal,
           };
           const merged: WindowState = { ...win.windowState, clientRequests: nextCR };
           win.windowState = resolveDecisions(win.windowState, merged, "pre-content");
@@ -1592,6 +1756,22 @@ export function createWm(
 
         if (changed.some((f) => GEOMETRY_FIELDS.includes(f))) {
           driver.schedule("state-changed");
+        }
+        // Stacking-axis change (parent or modal): recompute the
+        // window's z and renormalize the chain. Skip if the window
+        // hasn't reached first content yet (assignZForMap will run
+        // from windowHasContent for that case).
+        if (win.hasContent && changed.some((f) => STACKING_FIELDS.includes(f))) {
+          assignZForMap(win);
+          pushStack();
+        }
+        // Modal transitions: tether or untether focus.
+        if (changed.includes("modal")) {
+          if (candidate.modal && !current.modal) {
+            tetherFocusOnModal(win);
+          } else if (!candidate.modal && current.modal) {
+            untetherFocusOnUnmodal(win, surfaceId);
+          }
         }
         return cloneState(candidate);
       } finally {
@@ -1825,6 +2005,7 @@ function snapshotOf(win: Window): WindowSnapshot {
       tiling: win.windowState.tiling,
       exclusive: win.windowState.exclusive,
       visible: win.windowState.visible,
+      modal: win.windowState.modal,
       clientRequests: { ...win.windowState.clientRequests },
       layoutMode: win.windowState.layoutMode,
       layoutData: win.windowState.layoutData,

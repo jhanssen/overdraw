@@ -45,8 +45,10 @@ test('windowState: new window starts with default fields', () => {
   assert.equal(s.exclusive, 'none');
   assert.equal(s.visible, true);
   assert.deepEqual(s.clientRequests, {
-    wantsMaximized: false, wantsFullscreen: false, wantsMinimized: false,
+    wantsMaximized: false, wantsFullscreen: false,
+    wantsMinimized: false, wantsModal: false,
   });
+  assert.equal(s.modal, false);
   assert.equal(s.layoutMode, null);
   assert.equal(s.layoutData, undefined);
   assert.deepEqual(s.constraints, { minSize: null, maxSize: null });

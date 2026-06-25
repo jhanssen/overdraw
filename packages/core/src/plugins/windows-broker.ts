@@ -287,10 +287,13 @@ function isProposePayload(d: unknown): d is {
   if (p.visible !== undefined) {
     if (typeof p.visible !== "boolean") return false;
   }
+  if (p.modal !== undefined) {
+    if (typeof p.modal !== "boolean") return false;
+  }
   if (p.clientRequests !== undefined) {
     if (typeof p.clientRequests !== "object" || p.clientRequests === null) return false;
     const cr = p.clientRequests as { [k: string]: unknown };
-    for (const k of ["wantsMaximized", "wantsFullscreen", "wantsMinimized"]) {
+    for (const k of ["wantsMaximized", "wantsFullscreen", "wantsMinimized", "wantsModal"]) {
       if (cr[k] !== undefined && typeof cr[k] !== "boolean") return false;
     }
   }
