@@ -53,17 +53,27 @@ content — so all three problems above resolve.
 
 ## Approach
 
-**Border becomes an intercept; the WM's outer rect IS the
-decoration-inclusive rect.** Reusing how today's decoration model
-treats insets: the WM tracks per-window insets, the layout assigns
-each window an outer rect (decoration-inclusive), and the content
-rect is the outer rect shrunk by the insets. The client receives
-configures sized to the CONTENT rect and commits buffers at that
-size. The intercept output is the FULL OUTER rect (= input
-dimensions + 2B on each axis). Critically, the intercept does NOT
-move the surface placement — the output replaces the client texture
-in-place at the WM's outer rect. Subsurfaces anchor to the
-toplevel's outer rect (unchanged behavior).
+**Border becomes an intercept; the plugin returns an outputRect
+sized to the WM outer rect.** The WM tracks per-window insets: the
+layout assigns an outer rect (decoration-inclusive), and the
+content rect is outer minus insets. The client receives configures
+sized to the CONTENT rect and commits buffers at that size — that's
+also what `compositor.setSurfaceLayout` passes for the toplevel
+surface (`wm/index.ts` `pushGeometry` and `applyLayout`).
+
+The intercept output is sized to the FULL OUTER rect (= input
+dimensions + 2B on each axis). To make the compositor place the
+larger output texture at the outer rect instead of stretching it to
+fit the content-rect placement, the plugin returns an outputRect
+shifted to cover the outer:
+
+```
+outputRect = { x: surfaceRect.x - B, y: surfaceRect.y - B,
+               w: surfaceRect.w + 2*B, h: surfaceRect.h + 2*B }
+```
+
+`ctx.surfaceRect` is the surface's WM placement (the content rect);
+the plugin grows it by B on each axis to the outer rect.
 
 The bundled `plugin-decoration-default` no longer owns a decoration
 surface. It registers an intercept that matches `.*` (or the
@@ -75,11 +85,9 @@ Its `render(args)` callback:
 - Draws the border band (gradient / shape / focus-state fill) into
   the perimeter of `args.output.texture`.
 - Samples `args.input.texture` and writes it into the inset (B px)
-  region of `args.output.texture`.
-- **Does NOT return an outputRect.** The output texture replaces
-  the client at the WM-assigned outer rect. The compositor's
-  `setSurfaceLayout` for the toplevel is the OUTER rect; the
-  intercept output is sized to match.
+  region of `args.output.texture` with antialiased inner-shape
+  coverage.
+- Returns `outputRect` shifted/expanded to the outer rect (above).
 
 The output texture is the WM outer rect's full size = client
 texture (content rect) + a B-pixel ring on every side. ~1% texture
@@ -87,20 +95,21 @@ overhead (2-pixel band on the perimeter of a typical window),
 versus the previous full-window-sized texture for ~0 pixels of
 information.
 
-**Why this model avoids the subsurface placement bug.** A
-`render`-returned `outputRect` overrides the surface's draw
-placement. Subsurfaces anchor to the toplevel's WM-assigned
-`s.x/s.y` (subsurfaces.ts emitSubtree); they do NOT follow
-`outputRect`. So shifting the toplevel via `outputRect: { x: -B,
-y: -B, ... }` would visually break a decorated GTK app with
-embedded scrollbar subsurfaces. The insets-based model puts the
-border band INSIDE the outer rect (the area the WM was already
-reserving), no placement shift needed, subsurfaces compose
-correctly.
+**Subsurface placement is correct under this model.** A
+`render`-returned `outputRect` overrides the TOPLEVEL surface's
+compositor draw placement (the compositor's `s.x/s.y/s.layoutW/
+s.layoutH` for the toplevel surface). It does NOT change the
+toplevel's WM `win.rect` (the content rect on the WM side).
+Subsurfaces are positioned in `subsurfaces.ts:emitSubtree` using
+`win.rect.x, win.rect.y` — the content rect — NOT the toplevel
+surface's compositor placement. So shifting the toplevel's draw to
+the outer rect leaves subsurfaces at the correct content-relative
+screen positions automatically.
 
-The `outputRect` mechanism stays in the SDK for plugins that
-genuinely want to override placement (e.g. a slide-out animation
-effect operating on the whole window). Decoration doesn't use it.
+(An earlier draft of this design rejected the outputRect approach
+on the assumption that subsurfaces followed the toplevel surface's
+draw placement. They don't; they follow the WM's content rect via
+emitSubtree. The outputRect path is correct.)
 
 ## SDK extensions (new in 10a)
 
@@ -724,16 +733,23 @@ Step 2 (rewrite bundled plugin):
 
 1. Rewrite `plugin-decoration-default/src/index.ts` as an
    intercept registration. Keep config compat. Implement strict
-   gate-release (compare `ctx.surfaceRect.w - 2*B` against
-   `input.rect.w`, only call `releaseGate` when they match).
+   gate-release (compare `input.rect.w/h` against
+   `ctx.surfaceRect.w/h` — the WM's content-rect placement —
+   only call `releaseGate` when they match).
 2. Implement the inner-clip SDF in the blit WGSL with
    antialiased coverage (see "What stays the same" §
-   setShape). Verify visual parity with today's plugin on
-   rounded-corner configs.
-3. Measure GPU frame time with 10 and 20 decorated windows at
+   setShape).
+3. Return outputRect from render: `{x: surfaceRect.x - B,
+   y: surfaceRect.y - B, w: surfaceRect.w + 2*B,
+   h: surfaceRect.h + 2*B}`. This shifts the toplevel surface's
+   compositor draw placement from the content rect to the outer
+   rect, so the larger output texture composites without
+   distortion. Subsurfaces continue to position via the WM's
+   win.rect (the content rect), so they remain correctly placed.
+4. Measure GPU frame time with 10 and 20 decorated windows at
    60Hz (see "Focus redraw frequency" §). If delta exceeds
    threshold, defer step 3 until per-frame skip lands.
-4. Tests pass against the new plugin (existing config tests,
+5. Tests pass against the new plugin (existing config tests,
    pixel tests for border + inset + rounded corners, late-match
    catch-up gate test, multi-output decoration test).
 
@@ -912,18 +928,17 @@ These are NOT showstoppers but should be documented:
 
 These are findings from a careful review pass; not noted earlier:
 
-1. **Subsurface placement does NOT follow outputRect.**
-   subsurfaces.ts emitSubtree computes child placement as
-   `parent.x + sub.x, parent.y + sub.y` using the toplevel's
-   stored `s.x/s.y` — the WM rect, NOT the outputRect override.
-   If decoration used `outputRect` to shift the toplevel, the
-   subsurfaces would render at the un-shifted toplevel position,
-   visually breaking GTK/Qt apps with embedded subsurfaces. The
-   insets-based model in this doc avoids the issue by not
-   shifting placement; the band is INSIDE the outer rect the WM
-   already assigned. If a future intercept (not decoration) DOES
-   need to shift placement, subsurfaces.ts would need an update
-   to consult the intercept's placement override — separate work.
+1. **Subsurface placement follows the WM content rect, NOT the
+   toplevel's compositor placement.** subsurfaces.ts emitSubtree
+   computes child placement as `parent.x + sub.x, parent.y +
+   sub.y` where `parent.x, parent.y` is `win.rect.x, win.rect.y`
+   from the WM (the content rect). It does NOT consult the
+   toplevel surface's compositor `s.x/s.y`. So the decoration
+   plugin's `outputRect` (which shifts the TOPLEVEL'S compositor
+   draw placement to the outer rect) leaves subsurfaces drawing
+   at their correct content-relative screen positions
+   automatically. Verified with `test/subsurface.gpu.mjs`
+   continuing to pass after the rewrite.
 
 2. **Insets timing relative to first commit.** The intercept's
    `onSurfaceMatched` fires from `window.map` which fires BEFORE
