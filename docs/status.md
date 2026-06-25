@@ -61,6 +61,51 @@ nothing, with no error. Worst-first.
   `set_parent` stored but does not drive stacking or modal behavior;
   reserved-zone exclusion applies to maximized/tiled but not floating.
 
+- **`presentation` is a single-value enum; the model wants a set with
+  precedence.** `WindowState.presentation` holds exactly one of
+  `managed | floating | maximized | fullscreen | minimized`. The real
+  underlying model is THREE orthogonal axes: tiling (`managed | floating`,
+  exactly one), exclusive (`none | maximized | fullscreen`, at most one),
+  visibility (`visible | minimized`). A minimized-but-was-maximized window
+  cannot be represented today; `unset_maximized` on a window that was
+  floating before set_maximized currently restores to `managed` instead
+  of `floating`. The fix is to store the membership set and derive an
+  `effectivePresentation` via precedence (minimized > fullscreen >
+  maximized > floating > managed). Existing readers stay as
+  `effectivePresentation() === "X"`; new axis-specific callers use
+  `presentations.has("X")`. The configure-states array sent to clients
+  should also emit the full set membership (multiple states are
+  legal). Deferred until a session can do the full refactor (touches
+  ~9 src + ~9 test files; the legacy `WindowStateProposal.presentation`
+  field becomes axis-aware mutation).
+
+- **Maximized / fullscreen do not hide tiled peers, so windows
+  overlap.** When any window is in `presentation: "maximized"` or
+  `"fullscreen"`, the layout-driver assigns it the full work-area
+  (maximized) or output (fullscreen) rect AND continues to lay out
+  other managed peers in the same workspace using the same area.
+  Both end up rendered at the same rect; z-order (stack-order today,
+  no explicit z for exclusive windows) decides which is visible. The
+  most visible client trigger is GTK toolkits sending
+  `xdg_toplevel.set_maximized` as part of their startup boilerplate
+  (gimp does this on its main window): the maximized window ends up
+  drawn behind any later-mapped tiled window like a kitty terminal.
+  The architectural fix is: when a workspace contains an exclusive
+  (maximized or fullscreen) window, the layout-driver hides all other
+  tiled peers; for fullscreen specifically, it also hides floating
+  peers. The WM's apply path currently ignores the
+  `LayoutResult.hidden` list (no-op contract violation -- the field
+  is emitted but nothing acts on it); the fix needs a
+  `hiddenByLayout` flag on `Window` honored in `pushStack` so the
+  workspace plugin's per-output stack excludes them. A separate
+  policy seam is also needed for "should the compositor honor a
+  client's pre-content set_maximized at all in a tiling workspace"
+  -- ideally the WM tracks client REQUESTS (`wantsMaximized`)
+  distinct from compositor DECISIONS (the `presentations` set), so a
+  window-rules plugin can decide per-app; the configure-states
+  encoder sends the decided state, not the requested one.
+  Tied to the presentation-set refactor above.
+
 - **`wl_region` is implemented; only the opaque region is unconsumed.**
   `add`/`subtract` build a real disjoint rect list (`region.ts`) snapshotted
   at commit per copy-semantics. **Input** regions ARE consumed: hit-testing
