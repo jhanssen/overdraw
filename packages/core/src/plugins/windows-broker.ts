@@ -14,6 +14,7 @@ import type {
 } from "../events/types.js";
 import type { CompositorState, CompositorSink } from "../protocols/ctx.js";
 import { rebuildStackWithPopups } from "../protocols/xdg_popup.js";
+import { resolveWindowGroup } from "../protocols/window-group.js";
 import { FOCUS_REASONS } from "@overdraw/focus-types";
 
 const TILINGS: ReadonlyArray<Tiling> = ["managed", "floating"];
@@ -118,11 +119,11 @@ export function createWindowsBroker(deps: WindowsBrokerDeps): WindowsBroker {
     // and the gate clear, it'd log a spurious warning even though
     // the plugin did its job.
     openingDriver?.cancelBackstop(p.id);
-    // Clear the gate. setContentGated is idempotent and a no-op when
-    // the gate isn't engaged, so releasing on a non-gated window is
-    // a safe call (covers the "plugin received window.opening but
-    // the gate was already cleared by the backstop in between" race).
-    wm.setContentGated(p.id, false);
+    // Clear the opening-owner gate. releaseContentGate is idempotent
+    // and a no-op when the owner wasn't engaged, so releasing on a
+    // non-gated window (or one whose backstop already fired) is
+    // safe.
+    wm.releaseContentGate(p.id, "opening");
     return null;
   }
 
@@ -131,7 +132,13 @@ export function createWindowsBroker(deps: WindowsBrokerDeps): WindowsBroker {
     if (!compositor.setSurfaceTint) {
       throw new Error("windows.set-tint: not supported by this compositor");
     }
-    compositor.setSurfaceTint(p.id, p.t);
+    // Group-aware: a tint on a window applies uniformly to the
+    // content surface, its decoration, and every subsurface in the
+    // window's subtree. Single-surface fallback (no WM entry) when
+    // `id` is e.g. a phantom or a layer-shell surface.
+    for (const sid of resolveWindowGroup(state, p.id)) {
+      compositor.setSurfaceTint(sid, p.t);
+    }
     return null;
   }
 
@@ -142,7 +149,10 @@ export function createWindowsBroker(deps: WindowsBrokerDeps): WindowsBroker {
     if (!compositor.setSurfaceColorMatrix) {
       throw new Error("windows.set-color-matrix: not supported by this compositor");
     }
-    compositor.setSurfaceColorMatrix(p.id, p.m);
+    // Group-aware: see handleSetTint for the rationale.
+    for (const sid of resolveWindowGroup(state, p.id)) {
+      compositor.setSurfaceColorMatrix(sid, p.m);
+    }
     return null;
   }
 
@@ -169,7 +179,18 @@ export function createWindowsBroker(deps: WindowsBrokerDeps): WindowsBroker {
     if (!compositor.setSurfaceOpacity) {
       throw new Error("windows.set-opacity: not supported by this compositor");
     }
-    compositor.setSurfaceOpacity(p.id, p.opacity);
+    // Group-aware: see handleSetTransform. Note that applying the
+    // same opacity to two independently-composited surfaces (content
+    // + decoration) is NOT colorimetrically equivalent to compositing
+    // the window as one layer at that opacity -- the mid-animation
+    // alpha math is slightly off -- but the visual is monotonic and
+    // looks correct at typical 200ms animation timescales. Strict
+    // window-level opacity would require offscreen-rendering the
+    // group to a single texture then compositing that at the target
+    // alpha (the closing-phantom pattern), which is out of scope.
+    for (const sid of resolveWindowGroup(state, p.id)) {
+      compositor.setSurfaceOpacity(sid, p.opacity);
+    }
     return null;
   }
 
@@ -178,7 +199,28 @@ export function createWindowsBroker(deps: WindowsBrokerDeps): WindowsBroker {
     if (!compositor.setSurfaceTransform) {
       throw new Error("windows.set-transform: not supported by this compositor");
     }
-    compositor.setSurfaceTransform(p.id, p.t);
+    // Group-aware: a transform on a window applies to every surface
+    // visually belonging to it (content + decoration + subsurface
+    // subtree). Without this, animating a decorated window's
+    // transform moves only the content; the decoration stays glued
+    // to its destination rect and the animation looks broken.
+    //
+    // Subsurface placement is computed by subsurfaces.ts as
+    // parent.placement + sub.offset (absolute output coords); the
+    // compositor's per-surface transform is then layered on top of
+    // that placement at composite time. So applying the same
+    // transform to the parent + every subsurface produces correct
+    // visual translation: each surface's final position is its own
+    // (already-placed) rect + the shared transform. Nested
+    // subsurfaces work the same way -- the transform applies to
+    // each in turn.
+    //
+    // Non-WM ids (phantoms, layer surfaces, etc.) fall back to a
+    // single-surface application via the resolveWindowGroup
+    // singleton path.
+    for (const sid of resolveWindowGroup(state, p.id)) {
+      compositor.setSurfaceTransform(sid, p.t);
+    }
     return null;
   }
 

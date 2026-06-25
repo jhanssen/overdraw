@@ -84,10 +84,14 @@ export interface Window {
   // window. computeBaseStack splices it directly BELOW this window's content id,
   // so each decoration is z-bound to its own window. Absent = none.
   decorationSurfaceId?: number;
-  // Content gating: true while the window is held out of the draw stack
-  // waiting for its decoration's first frame, so content + decoration appear
-  // together (atomic).
-  contentGated?: boolean;
+  // Content gating: the window is held out of the draw stack as long as
+  // this set is non-empty. Multiple owners can engage independently
+  // (decoration broker waits for first decoration frame; opening driver
+  // waits for the opening-animation plugin to release after setting
+  // initial transform/opacity). Each owner uses a distinct string key
+  // and is responsible for its own release; the gate clears only when
+  // every owner has released.
+  contentGateOwners?: Set<string>;
   // True once the client has committed presentable content (the map-on-first-
   // content signal). A window is in the layout (and configured) from addWindow,
   // but only drawn once it has content.
@@ -296,7 +300,16 @@ export interface Wm {
   setInsets(surfaceId: number, insets: Insets): InsetGrant | undefined;
   outerRectOf(surfaceId: number): Rect | undefined;
   rectOf(surfaceId: number): Rect | undefined;
-  setContentGated(surfaceId: number, gated: boolean): void;
+  // Engage the content gate for `surfaceId` under `owner`. While any
+  // owner is engaged, the window is held out of the draw stack. Each
+  // owner is a distinct string key (e.g. "decoration", "opening");
+  // calling engage twice with the same key is idempotent.
+  engageContentGate(surfaceId: number, owner: string): void;
+  // Release `owner`'s hold on the content gate. The window enters the
+  // draw stack only when EVERY owner has released. Calling release
+  // for an owner that wasn't engaged is a no-op (idempotent).
+  releaseContentGate(surfaceId: number, owner: string): void;
+  // True iff at least one owner is currently holding the gate.
   isContentGated(surfaceId: number): boolean;
   setDecorationSurface(windowId: number, decoSurfaceId: number | null): void;
 
@@ -400,6 +413,11 @@ function shrink(outer: Rect, i: Insets): Rect {
 
 function contentOf(win: Window): Rect {
   return win.insets ? shrink(win.outer, win.insets) : { ...win.outer };
+}
+
+// True iff at least one owner is currently holding the content gate.
+function isGated(win: Window): boolean {
+  return win.contentGateOwners !== undefined && win.contentGateOwners.size > 0;
 }
 
 // Validate that an arbitrary value matches the Rect shape with finite numbers.
@@ -853,7 +871,7 @@ export function createWm(
     function visit(parent: Window): void {
       for (const child of childrenOf(parent.surfaceId)) {
         if (child.windowState.modal && child.windowState.visible
-            && child.hasContent && !child.contentGated) {
+            && child.hasContent && !isGated(child)) {
           if (!best || child.z > best.z) best = child;
         }
         visit(child);
@@ -1015,7 +1033,7 @@ export function createWm(
     // (visible === false) are also omitted regardless.
     const exclusiveByOutput = exclusiveWindowsByOutput();
     for (const w of windows) {
-      if (w.contentGated || !w.hasContent) continue;
+      if (isGated(w) || !w.hasContent) continue;
       if (!w.windowState.visible) continue;
       const ownerOutput = outputOf(w.surfaceId);
       if (ownerOutput !== null) {
@@ -1518,17 +1536,29 @@ export function createWm(
       return win ? { ...win.rect } : undefined;
     },
 
-    setContentGated(surfaceId, gated) {
+    engageContentGate(surfaceId, owner) {
       const win = windows.find((w) => w.surfaceId === surfaceId);
       if (!win) return;
-      if (!!win.contentGated === gated) return;
-      win.contentGated = gated;
-      pushStack();
+      if (!win.contentGateOwners) win.contentGateOwners = new Set();
+      if (win.contentGateOwners.has(owner)) return;  // idempotent
+      const wasGated = win.contentGateOwners.size > 0;
+      win.contentGateOwners.add(owner);
+      if (!wasGated) pushStack();  // first owner engaged; restack needed
+    },
+
+    releaseContentGate(surfaceId, owner) {
+      const win = windows.find((w) => w.surfaceId === surfaceId);
+      if (!win || !win.contentGateOwners) return;
+      if (!win.contentGateOwners.delete(owner)) return;  // wasn't engaged
+      if (win.contentGateOwners.size === 0) {
+        win.contentGateOwners = undefined;
+        pushStack();  // last owner released; window joins the stack
+      }
     },
 
     isContentGated(surfaceId) {
       const win = windows.find((w) => w.surfaceId === surfaceId);
-      return win?.contentGated === true;
+      return win?.contentGateOwners !== undefined && win.contentGateOwners.size > 0;
     },
 
     setDecorationSurface(windowId, decoSurfaceId) {
@@ -2019,7 +2049,7 @@ function snapshotOf(win: Window): WindowSnapshot {
     rect: { ...win.rect },
     outer: { ...win.outer },
     hasContent: !!win.hasContent,
-    contentGated: !!win.contentGated,
+    contentGated: win.contentGateOwners !== undefined && win.contentGateOwners.size > 0,
     windowState: {
       tiling: win.windowState.tiling,
       exclusive: win.windowState.exclusive,

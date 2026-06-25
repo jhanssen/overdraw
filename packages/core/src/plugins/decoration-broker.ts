@@ -93,7 +93,7 @@ export function createDecorationBroker(deps: DecorationBrokerDeps): DecorationBr
     if (!g || g.released) return;
     g.released = true;
     clearTimeout(g.timer);
-    state.wm?.setContentGated(windowId, false);
+    state.wm?.releaseContentGate(windowId, "decoration");
     if (g.decoSurfaceId !== null) decoToWindow.delete(g.decoSurfaceId);
     gates.delete(windowId);
     void reason;
@@ -116,7 +116,7 @@ export function createDecorationBroker(deps: DecorationBrokerDeps): DecorationBr
   // the window's content, and arm the first-frame timeout.
   function onAssigned(ev: DecorationAssignedEvent, pluginName: string): void {
     emitToPlugin(pluginName, DECORATION_EVENT.assigned, ev);
-    state.wm?.setContentGated(ev.surfaceId, true);
+    state.wm?.engageContentGate(ev.surfaceId, "decoration");
     const timer = setTimeout(() => onTimeout(ev.surfaceId), timeoutMs);
     timer.unref?.();
     gates.set(ev.surfaceId, {

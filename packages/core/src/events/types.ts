@@ -306,11 +306,16 @@ export type WindowClosingEvent = {
 // animation plays over visible frames.
 //
 // `outerRect` is the window's outer rect at the time of first content
-// (= the layout-driver's assignment for this tile). `appId` / `title`
+// (= the layout-driver's assignment for this tile). `outputRect` is
+// the rect of the output the window is mapped on, in compositor
+// coordinates, so a plugin computing "slide in from the output edge"
+// can do the math without a separate outputs lookup. `appId` / `title`
 // may be null (client hasn't set them yet).
 export type WindowOpeningEvent = {
   surfaceId: number;
   outerRect: WindowRect;
+  outputId: number;
+  outputRect: WindowRect;
   appId: string | null;
   title: string | null;
 };

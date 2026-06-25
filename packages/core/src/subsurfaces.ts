@@ -157,9 +157,11 @@ export function computeBaseStack(
   const sorted = [...list].sort((a, b) => (a.z ?? 0) - (b.z ?? 0));
   const stack: number[] = [];
   for (const win of sorted) {
-    // Content-gated windows (waiting for their decoration's first frame) are held
-    // out of the draw stack so content + decoration appear together (piece 3).
-    if (win.contentGated) continue;
+    // Content-gated windows (waiting for their decoration's first frame,
+    // for an opening-animation plugin's release, or for any other
+    // owner) are held out of the draw stack so the window enters
+    // visibly intact.
+    if (win.contentGateOwners !== undefined && win.contentGateOwners.size > 0) continue;
     // The window's decoration (if any) draws directly BELOW its own content, so the
     // decoration is z-bound to the window: a window stacked above occludes it just
     // as it occludes the window below. (A flat decoration layer would put ALL
@@ -180,7 +182,9 @@ export interface WmWindowLike {
   surfaceId: number;
   surfaceRec: { resource: Resource };
   rect: { x: number; y: number };
-  contentGated?: boolean;
+  // Set of owners currently holding this window's content gate. The
+  // window is held out of the draw stack iff non-empty.
+  contentGateOwners?: ReadonlySet<string>;
   decorationSurfaceId?: number;
   z?: number;
 }

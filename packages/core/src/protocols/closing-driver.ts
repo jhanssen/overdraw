@@ -22,12 +22,12 @@
 // (setOpacity / setTransform / animations.run / etc.) and releases
 // it by calling sdk.windows.destroyPhantom (added in this phase).
 
-import type { Resource } from "../types.js";
-import type { CompositorState, SurfaceRecord, SubsurfaceRecord } from "./ctx.js";
+import type { CompositorState, SurfaceRecord } from "./ctx.js";
 import { WINDOW_EVENT } from "../events/types.js";
 import type { WindowClosingEvent } from "../events/types.js";
 import { log } from "../log.js";
 import { titleAppId } from "../query.js";
+import { collectSubsurfaceIds } from "./window-group.js";
 
 // Closing-driver dependencies. Wired by installProtocols when the
 // surrounding harness/launcher provides them; absent means "no closing
@@ -161,28 +161,4 @@ export function createClosingDriver(deps: ClosingDriverDeps): ClosingDriver {
   };
 }
 
-// Walk a surface's subsurface tree in z order and append each child's
-// surface id to `out`. Mirrors the order computeBaseStack uses for a
-// window, but only the ids -- no placement / rect computation
-// (createClosingPhantom reads each surface's absolute screen
-// position from its compositor state).
-function collectSubsurfaceIds(
-  state: CompositorState, parent: Resource, out: number[],
-): void {
-  if (!state.subsurfaces) return;
-  // Iterate subsurfaces whose parent is `parent`, in z order. The
-  // existing subsurface ordering is by insertion (place_above /
-  // place_below would alter it; today both are no-ops per "Read
-  // first"). Match that order.
-  const children: SubsurfaceRecord[] = [];
-  for (const sub of state.subsurfaces.values()) {
-    if (sub.parent === parent) children.push(sub);
-  }
-  for (const sub of children) {
-    const child = state.surfaces.get(sub.surface);
-    if (!child) continue;
-    out.push(child.id);
-    // Recurse into nested subsurfaces.
-    collectSubsurfaceIds(state, sub.surface, out);
-  }
-}
+

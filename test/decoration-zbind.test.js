@@ -72,7 +72,7 @@ test("computeBaseStack: a content-gated window is omitted entirely (deco + conte
   addMapped(wm, 2);
   wm.setDecorationSurface(1, 510);
   wm.setDecorationSurface(2, 520);
-  wm.setContentGated(2, true);   // B held out until its decoration's first frame
+  wm.engageContentGate(2, "decoration");   // B held out until its decoration's first frame
   // B (and its decoration) are excluded; only A's pair remains.
   assert.deepEqual(computeBaseStack(state), [510, 1]);
 });

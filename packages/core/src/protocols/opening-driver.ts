@@ -71,20 +71,35 @@ export function createOpeningDriver(deps: OpeningDriverDeps): OpeningDriver {
       if (!state.wm) return false;
       const outer = state.wm.outerRectOf(s.id);
       if (!outer || outer.width <= 0 || outer.height <= 0) return false;
-      // Already gated by something else? Don't double-gate.
-      if (state.wm.isContentGated(s.id)) return false;
 
-      // Engage the gate. The compositor's pushStack now omits this
-      // surfaceId until the gate clears.
-      state.wm.setContentGated(s.id, true);
+      // Engage the gate under our own owner key so we stack
+      // cleanly with other gate owners (notably the decoration
+      // broker, which engages from window.map for windows that
+      // match a decoration provider). The window stays out of the
+      // draw stack until ALL owners release.
+      state.wm.engageContentGate(s.id, "opening");
 
       const ta = titleAppId(state, s.id);
+      // Resolve the output the window mapped on. Falls back to the
+      // primary output if the surface never had a spawnOutputId set
+      // (defensive; shouldn't happen for a real toplevel that reached
+      // first content). The output's rect is in compositor coords --
+      // plugins use it to compute slide distances ("from the output
+      // edge to the tile") without a separate outputs lookup.
+      const outputId = s.spawnOutputId ?? state.wm.primaryOutputId();
+      const wmOutput = state.wm.state.outputs.get(outputId);
+      const outputRect = wmOutput
+        ? { x: wmOutput.rect.x, y: wmOutput.rect.y,
+            width: wmOutput.rect.width, height: wmOutput.rect.height }
+        : { x: 0, y: 0, width: outer.width, height: outer.height };
       const payload: WindowOpeningEvent = {
         surfaceId: s.id,
         outerRect: {
           x: outer.x, y: outer.y,
           width: outer.width, height: outer.height,
         },
+        outputId,
+        outputRect,
         appId: ta.appId, title: ta.title,
       };
       try {
@@ -104,7 +119,7 @@ export function createOpeningDriver(deps: OpeningDriverDeps): OpeningDriver {
           `opening-driver: backstop fired for surfaceId=${s.id} `
           + `(plugin did not call releaseOpeningGate within ${backstopMs}ms); `
           + `forcing visible`);
-        try { state.wm?.setContentGated(s.id, false); }
+        try { state.wm?.releaseContentGate(s.id, "opening"); }
         catch (e) {
           log.err("core", "opening-driver: backstop ungate threw: %o", e);
         }
