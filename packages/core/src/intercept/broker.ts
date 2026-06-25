@@ -343,6 +343,22 @@ export class InterceptBroker {
   private onMapped(top: ToplevelData): void {
     const events = this.engine.onToplevelMapped(top);
     for (const e of events) this.dispatchMatchEvent(e);
+    // Retry dispatch for any surface already assigned in the engine
+    // but not yet active in any registration's surfaces map. This
+    // covers the Worker silent-gap: dispatchMatchedWorker bails when
+    // matched fires before the client has committed a buffer (e.g. at
+    // preconfigure time). window.map fires once a buffer exists; re-
+    // dispatch now so the Worker fixture finally receives its matched
+    // event. dispatchMatched is idempotent (early-out on
+    // active.surfaces.has). The in-thread path is unaffected (its
+    // onSurfaceMatched fires synchronously on the original dispatch).
+    const assignedRegId = this.engine.registrationFor(top.surfaceId);
+    if (assignedRegId !== undefined) {
+      const active = this.registrations.get(assignedRegId);
+      if (active && !active.surfaces.has(top.surfaceId)) {
+        this.dispatchMatched(active, top.surfaceId);
+      }
+    }
   }
 
   private dispatchMatchEvent(event: MatchEvent): void {

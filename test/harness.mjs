@@ -295,6 +295,13 @@ export async function setupCompositor(opts = {}) {
   coreBus.on(WINDOW_EVENT.unmap, (ev) => { pluginBus.emit(WINDOW_EVENT.unmap, ev); });
   coreBus.on(WINDOW_EVENT.change, (ev) => { pluginBus.emit(WINDOW_EVENT.change, ev); });
   coreBus.on(WINDOW_EVENT.closing, (ev) => { pluginBus.emit(WINDOW_EVENT.closing, ev); });
+  // Reverse bridge: the WM emits window.preconfigure on the plugin bus
+  // synchronously inside markInitialCommitComplete. Mirror it onto the
+  // typed bus so the intercept broker (subscribed to coreBus) sees it.
+  // Same pattern as main.ts.
+  pluginBus.subscribe(WINDOW_EVENT.preconfigure, (_name, ev) => {
+    coreBus.emit(WINDOW_EVENT.preconfigure, ev);
+  });
 
   // The driver factories close over `runtime`, which is built after
   // installProtocols below. waitForNamespace inside compute()/decide()
@@ -343,6 +350,10 @@ export async function setupCompositor(opts = {}) {
     actions: opts.actions,
     plugins: [],
     sourcePath: null,
+    // Allow tests to pass bundled-plugin configs (opts.config = { layout,
+    // decoration, ... }). Each bundled spec's configFrom() reads the
+    // matching field; unset fields fall back to plugin defaults.
+    ...(opts.config ?? {}),
   };
   // Phase 9a closing driver: snapshots a phantom of a closing toplevel
   // when a 'window-closing' plugin is registered. hasPluginHandler reads
@@ -362,6 +373,9 @@ export async function setupCompositor(opts = {}) {
   // Wire a windows broker so bundled / fixture plugins can call
   // sdk.windows.*. The test's onRequest is consulted for any method the
   // broker doesn't handle.
+  // sdk.windows.setInsets requires the intercept broker for its
+  // authorization check; the intercept broker is constructed below, so
+  // we plumb a late-binding indirection (same pattern as main.ts).
   let windowsBroker = null;
   if (state.wm) {
     windowsBroker = createWindowsBroker({
@@ -369,6 +383,11 @@ export async function setupCompositor(opts = {}) {
       compositor: jsCompositor ?? noopSinkForBroker(),
       state, pluginBus, bus: coreBus,
       closingDriver: closingDriver ?? undefined,
+      interceptBroker: {
+        pluginNameForSurface(surfaceId) {
+          return interceptBroker?.pluginNameForSurface(surfaceId);
+        },
+      },
     });
   }
   // The input broker emits 'input.binding-fired' to the originating plugin
@@ -560,6 +579,10 @@ export async function setupCompositor(opts = {}) {
       const interceptBrokerOpts = {
         bus: coreBus,
         compositor: jsCompositor,
+        // Wire the WM as the gate sink so intercepts that declare
+        // `gates: true` (e.g. the bundled decoration plugin) can engage
+        // the WM content gate. Mirrors main.ts wiring.
+        gateSink: state.wm,
         inThread: {
           device: coreDevice,
           textureUsage: dawn.globals.GPUTextureUsage,

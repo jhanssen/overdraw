@@ -172,11 +172,40 @@ function resolveShape(raw: unknown): DecorationShape {
   }
 }
 
+// Encode a DecorationShape as the (kind, radius, tl, tr, br, bl,
+// exponent) tuple the blit shader's uniform packer consumes. Kind 0 =
+// sharp rectangle (no inner clip; full coverage in the inset region).
+// kind 1 = rounded-rect uniform; kind 2 = per-corner; kind 3 = squircle.
+//
+// Used by the plugin to pack the inner SDF parameters into the blit
+// uniform buffer. The OUTER shape is applied to the combined output
+// texture via the compositor's setShape; the INNER shape is what the
+// blit shader evaluates pixel-by-pixel inside the inset region.
+export function encodeShape(shape: DecorationShape): {
+  kind: 0 | 1 | 2 | 3;
+  radius: number;
+  tl?: number; tr?: number; br?: number; bl?: number;
+  exponent?: number;
+} {
+  if (shape === null) return { kind: 0, radius: 0 };
+  switch (shape.kind) {
+    case "rounded-rect":
+      return { kind: 1, radius: shape.radius };
+    case "rounded-rect-per-corner":
+      return {
+        kind: 2, radius: 0,
+        tl: shape.tl, tr: shape.tr, br: shape.br, bl: shape.bl,
+      };
+    case "superellipse":
+      return { kind: 3, radius: shape.radius, exponent: shape.exponent };
+  }
+}
+
 // Inset every radius / extent of a shape by `borderWidth`. The result
-// is the shape applied to the WINDOW CONTENT surface (inside the
-// border band). Negative values are floored at 0 -- a content shape
-// with all radii at 0 is a sharp rectangle (null) which the compositor
-// renders as an early-out.
+// is the shape applied to the CLIENT CONTENT region inside the border
+// band. Negative values are floored at 0 -- a content shape with all
+// radii at 0 is a sharp rectangle (null) which the blit shader renders
+// as full coverage in the inset region (no inner curve).
 export function insetShape(outer: DecorationShape, borderWidth: number): DecorationShape {
   if (outer === null) return null;
   switch (outer.kind) {

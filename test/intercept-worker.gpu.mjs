@@ -55,6 +55,11 @@ test("intercept (Worker): invert plugin displaces a red client buffer with its c
     onEvent: (plugin, name, data) => {
       if (name === "log") logs.push(`[${plugin}] ${data}`);
     },
+    // Disable the bundled decoration plugin so the Worker fixture is
+    // the only intercept active for the test client (the bundled
+    // plugin's default ".*" pattern would otherwise win against the
+    // worker fixture's narrower pattern at the same priority).
+    config: { decoration: { appIdPattern: "^never-matches-anyone$" } },
     plugins: [workerFixture("invert-worker", {
       appIdSource: "^intercept-worker-test$",
       appIdFlags: "",

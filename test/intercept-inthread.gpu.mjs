@@ -141,6 +141,11 @@ test("intercept: only matching clients are intercepted; others draw raw",
     onEvent: (plugin, name, data) => {
       if (name === "log") logs.push(`[${plugin}] ${data}`);
     },
+    // Disable the bundled decoration plugin (which otherwise matches
+    // ".*" and would decorate the unmatched-by-the-test-fixture client,
+    // replacing its raw red pixels with the band texture). This test
+    // is about intercept matching scope, not decoration.
+    config: { decoration: { appIdPattern: "^never-matches-anyone$" } },
     plugins: [fixturePlugin("invert", {
       appIdSource: "^matches-this$",
       appIdFlags: "",
