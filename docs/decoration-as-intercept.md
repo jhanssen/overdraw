@@ -53,25 +53,54 @@ content — so all three problems above resolve.
 
 ## Approach
 
-**Border becomes an intercept.** The bundled
-`plugin-decoration-default` no longer owns a decoration surface. It
-registers an intercept that matches `.*` (or the user-configured
-appId pattern) at priority 10. Its `render(args)` callback:
+**Border becomes an intercept; the WM's outer rect IS the
+decoration-inclusive rect.** Reusing how today's decoration model
+treats insets: the WM tracks per-window insets, the layout assigns
+each window an outer rect (decoration-inclusive), and the content
+rect is the outer rect shrunk by the insets. The client receives
+configures sized to the CONTENT rect and commits buffers at that
+size. The intercept output is the FULL OUTER rect (= input
+dimensions + 2B on each axis). Critically, the intercept does NOT
+move the surface placement — the output replaces the client texture
+in-place at the WM's outer rect. Subsurfaces anchor to the
+toplevel's outer rect (unchanged behavior).
+
+The bundled `plugin-decoration-default` no longer owns a decoration
+surface. It registers an intercept that matches `.*` (or the
+user-configured appId pattern) at priority 10. On match it calls
+`sdk.windows.setInsets(surfaceId, { top: B, right: B, bottom: B,
+left: B })` so the WM tells the layout to shrink the content rect.
+Its `render(args)` callback:
 
 - Draws the border band (gradient / shape / focus-state fill) into
-  `args.output.texture` using a render pass the plugin set up in
-  `setup`.
-- Samples `args.input.texture` (the client's content) and writes
-  it into the inset (B px) region of `args.output.texture`.
-- Returns `{ outputRect: { x: surfaceRect.x - B, y: surfaceRect.y - B,
-  w: surfaceRect.w + 2B, h: surfaceRect.h + 2B } }` so the
-  compositor places the larger output texture at the expanded rect.
+  the perimeter of `args.output.texture`.
+- Samples `args.input.texture` and writes it into the inset (B px)
+  region of `args.output.texture`.
+- **Does NOT return an outputRect.** The output texture replaces
+  the client at the WM-assigned outer rect. The compositor's
+  `setSurfaceLayout` for the toplevel is the OUTER rect; the
+  intercept output is sized to match.
 
-The output texture is the client's logical rect plus a B-pixel ring
-on every side, holding the border band's pixels. ~1% texture
+The output texture is the WM outer rect's full size = client
+texture (content rect) + a B-pixel ring on every side. ~1% texture
 overhead (2-pixel band on the perimeter of a typical window),
 versus the previous full-window-sized texture for ~0 pixels of
 information.
+
+**Why this model avoids the subsurface placement bug.** A
+`render`-returned `outputRect` overrides the surface's draw
+placement. Subsurfaces anchor to the toplevel's WM-assigned
+`s.x/s.y` (subsurfaces.ts emitSubtree); they do NOT follow
+`outputRect`. So shifting the toplevel via `outputRect: { x: -B,
+y: -B, ... }` would visually break a decorated GTK app with
+embedded scrollbar subsurfaces. The insets-based model puts the
+border band INSIDE the outer rect (the area the WM was already
+reserving), no placement shift needed, subsurfaces compose
+correctly.
+
+The `outputRect` mechanism stays in the SDK for plugins that
+genuinely want to override placement (e.g. a slide-out animation
+effect operating on the whole window). Decoration doesn't use it.
 
 ## SDK extensions (new in 10a)
 
@@ -102,12 +131,23 @@ Implementation:
   `ensureRing(inputW, inputH)`, calls `handlers.outputDimensions?.(inputW, inputH)
   ?? { w: inputW, h: inputH }`, and allocates 3 slots of the
   returned dimensions.
-- `intercept/worker-state.ts WorkerStateDeps.{width, height}` is
-  split into `inputWidth/inputHeight` and `outputWidth/outputHeight`.
-  The broker calls `outputDimensions` once at allocate time and
-  on every input-dimension change.
-- `intercept-sdk.ts` (Worker side) accepts the broker-supplied
-  output dimensions when reserving consumer/producer textures.
+- `intercept/worker-state.ts` currently treats `width`/`height` as
+  readonly at allocation time (worker-state.ts:92-93) and has no
+  resize path. Implementing this for Worker is a meaningful piece
+  of work: a new round-trip protocol where the SDK signals the
+  broker that input dimensions changed, the broker reallocates
+  both rings with the plugin-declared output dimensions, ships
+  the new SAB + surfaceBufIds back to the Worker. The in-thread
+  path already re-runs `ensureRing` per tick, so the in-thread
+  decoration plugin works out of the box.
+
+  **For step 1 of the migration (intercept SDK extension), the
+  decoration plugin is in-thread, so we can land `outputDimensions`
+  for the in-thread path only and explicitly leave Worker as a
+  follow-up TODO.** Worker decoration is a non-goal in this
+  migration; Worker effects (blur, etc.) don't change dimensions
+  so the current "fixed at allocate time" behavior is acceptable
+  for them.
 
 ### 2. `priority?: number` on `InterceptSpec`
 
@@ -140,6 +180,54 @@ Implementation:
 That's the entire SDK delta. Both extensions are additive (default
 behavior matches 10a today).
 
+## Content gate (decoration first-frame)
+
+Today the decoration broker engages a content gate on
+`onAssigned` and releases on the decoration plugin's first
+present (or backstop). The gate exists because:
+
+- Client maps with no insets known; layout assigns it full outer.
+- Decoration plugin matches, calls `createDecoration({ insets })`,
+  which calls `wm.setInsets`, which schedules a relayout shrinking
+  the content rect.
+- The client receives a new configure with the smaller content
+  size and re-commits at that size.
+- Without the gate, between (a) the client's first commit at the
+  full size and (b) the re-commit at the inset size, the window
+  would briefly draw at the wrong size.
+
+With intercept-as-decoration the same race exists. The intercept's
+`onSurfaceMatched` fires synchronously from `window.map` (which
+fires BEFORE `windowHasContent` in `dispatchFrameCallbacks`), so
+the plugin's `sdk.windows.setInsets` call lands before content
+becomes drawable. But the WM has already given the client a
+configure at the full outer size (during `addWindow` / first
+layout pass); the client commits at that size; only after the
+post-setInsets relayout does it get reconfigured to the smaller
+content size.
+
+The decoration intercept must engage the content gate so the
+window doesn't draw until the inset relayout completes AND the
+client has re-committed at the new size AND the intercept's first
+render with the new dimensions has produced an output texture.
+This is the same lifecycle the existing decoration broker
+implements; the migration moves it into the intercept SDK or the
+plugin itself.
+
+Recommended: extend the intercept SDK so a registration can
+declare `gates: true` in its spec. When the SDK matches a
+surface with `gates: true`, it engages the content gate under
+owner `"intercept-decoration"` at `onSurfaceMatched` time and
+releases on the first successful `render` whose input dimensions
+match the post-insets content rect (i.e. the client has
+re-committed at the smaller size). This keeps the gating
+mechanism mechanical and reusable: any intercept that needs to
+hold content until its first render can opt in.
+
+The opening-driver content gate (engaged by a separate
+`window-opening` plugin) is independent; both gates can coexist
+under the multi-owner gate system already implemented.
+
 ## Bundled decoration plugin (rewrite)
 
 `packages/plugin-decoration-default/src/index.ts` becomes:
@@ -159,6 +247,7 @@ export default async function init(sdk, rawConfig) {
     name: "decoration-default",
     match: { appId: { source: config.appIdPattern, flags: config.appIdFlags } },
     priority: 10,  // last-resort fallback; user effects at priority 0 win
+    gates: true,   // engage WM content gate until first render at post-insets size
     setup: ({ device }) => {
       const borderPipeline = createBorderPipeline(device);
       const blitPipeline = createBlitPipeline(device);
@@ -212,21 +301,13 @@ export default async function init(sdk, rawConfig) {
           passBlit.end();
           device.queue.submit([enc.finish()]);
 
-          // Tell compositor to place the larger output at the
-          // expanded rect. The compositor's existing surface
-          // placement code applies setSurfaceLayout at the WM's
-          // outer rect; outputRect overrides for this frame.
-          return { outputRect: {
-            x: -B, y: -B,
-            w: input.rect.w + 2 * B, h: input.rect.h + 2 * B,
-          } };
-          // NOTE: outputRect's x/y are the OFFSET from the WM's
-          // assigned position. (-B, -B) shifts the output up-left
-          // by B px so its inset center aligns with the WM rect.
-          // Confirm this matches the existing intercept outputRect
-          // semantics; if outputRect is absolute output-space, the
-          // plugin needs the surface's rect from sdk.windows.get(id)
-          // at render time.
+          // No outputRect. The output texture is sized to the
+          // WM outer rect; the compositor's setSurfaceLayout for
+          // this toplevel already targets the outer rect; the
+          // intercept output replaces the client texture at that
+          // placement. Subsurfaces anchor to the WM rect (correct)
+          // and compose at their offsets relative to it.
+          return undefined;
         },
         destroy: () => {
           // Tear down pipelines, etc.
@@ -271,6 +352,9 @@ goes away:
     inside `pushGeometry` and `applyLayout`
   - `decorationResize(...)` callback fires inside `pushGeometry`
     and `applyLayout`
+  - The decoration-surface splice in `pushStack` (~line 1042-1045
+    in current code): `if (w.decorationSurfaceId !== undefined)
+    ids.push(w.decorationSurfaceId)` before pushing the window id.
 - `packages/core/src/plugins/decoration-broker.ts` — delete entirely.
 - `packages/core/src/decorations.ts` — delete entirely (the
   decoration registry).
@@ -363,18 +447,29 @@ into a phantom. With the changes:
 - **The snapshot still happens** (explicit GPU composite into a
   phantom texture) because subsurfaces are still independent
   surfaces and need to be combined for the phantom.
-- **The intercept's output texture is what the compositor was
-  sampling for the closing window's content.** When taking the
-  snapshot, the closing-driver should sample from the intercept
-  output (with the border baked in) rather than the raw client
-  texture. Otherwise the closing animation shows a borderless
-  window briefly.
+- **The phantom's content surface entry automatically samples
+  the intercept's output texture.** Confirmed: `composeSnapshot`
+  iterates the draw list and uses each surface's `s.bindGroup`
+  (compositor.ts:2614 `pass.setBindGroup(0, s.bindGroup)`). When
+  an intercept is installed, `installInterceptOutput` swaps the
+  surface's bind group to point at the intercept output texture.
+  At snapshot time, `s.bindGroup` reflects whatever was most
+  recently installed — which is the intercept output for any
+  surface with an active intercept. So the phantom snapshot
+  composites the bordered output, not the raw client buffer.
+  No code change needed here; just preserve the invariant.
 
-  Implementation detail: `createClosingPhantom` already samples
-  from the per-surface "current displayed texture" (which is the
-  intercept output if an intercept is installed; the raw client
-  buffer otherwise). Confirm; if not, route through the same
-  texture resolution the per-frame composite uses.
+  One subtlety: if the closing-driver's `beforeUnmap` fires
+  AFTER the intercept's output ring has been recycled or
+  destroyed (because the surface unmapped, the intercept torn
+  down, the ring freed), the bind group could point at a
+  destroyed view. The intercept teardown order needs to be:
+  closing-driver snapshot first → THEN tear down the intercept
+  output ring. The closing-driver currently runs `beforeUnmap`
+  before `wm.unmapWindow`; the intercept teardown is wired via
+  `onSurfaceUnmatched` which fires from `window.unmap` (after
+  `beforeUnmap`). So today's order is correct: snapshot first,
+  unmatch second. Preserve.
 
 ## Limitations (10a, with explicit deferrals)
 
@@ -515,46 +610,36 @@ Total: ~1.5 to 2 days.
   decoration intercept's `onSurfaceMatched` rather than from
   the old `createDecoration`.
 
-## Open questions / decisions to revisit
+## Open questions / decisions resolved
 
-1. **`outputRect` coordinate space.** Confirm whether
-   `outputRect.x/y` is absolute compositor coords or an offset
-   from the surface's WM placement. Need either docs read or a
-   test of the existing intercept-invert with a non-default
-   outputRect.
+These were open in an earlier draft; resolved here:
 
-2. **`ctx.surfaceRect`.** Adding it to the render context is
-   slightly extra plumbing but cleaner than `sdk.windows.get`
-   every frame. Verify the WM rect is stable through the frame
-   (it is; layout is applied synchronously before draw).
+1. **`outputRect` coordinate space.** Verified by reading the
+   code: `outputRect.x/y` is ABSOLUTE compositor coords, not an
+   offset. (intercept-sdk.ts wraps the value as a placement
+   override consumed by `installInterceptOutput` →
+   compositor.ts:2298-2411 + test/intercept-inthread.gpu.mjs
+   uses literal absolute coords.) The decoration plugin doesn't
+   use `outputRect` (per the "Approach" section above), so this
+   doesn't affect it. Other intercept users should know.
 
-3. **First-frame ordering.** With decoration intercepted, there
-   is no "decoration first frame" event. The window's
-   first-content-commit triggers the intercept's `render`,
-   which produces the first output texture with border baked
-   in. The opening-driver's content gate (engaged by the
-   `window-opening` plugin) still applies. Sequence:
-   - Client commits first buffer.
-   - `wm.windowHasContent` runs, opening-driver engages the
-     content gate via `engageContentGate(id, "opening")`.
-   - Animation plugin sets initial transform/opacity, calls
-     `releaseOpeningGate`.
-   - The intercept's render() fires (it always fires when the
-     client commits). Output texture is produced.
-   - Compositor samples the output texture (with border) on
-     the next frame.
+2. **`ctx.surfaceRect`.** Not needed by the decoration plugin
+   (no outputRect override). Worth adding to the render context
+   for OTHER intercept use cases (e.g. an intercept that wants
+   to position itself relative to the window). Optional; defer.
 
-   The decoration-broker's old content gate (for waiting on
-   decoration's first frame) GOES AWAY. Decoration is now
-   baked into the same output texture as the first content;
-   there's no separate "decoration first frame" to wait for.
-   Removing that gate is one of the cleanups in step 3.
+3. **First-frame ordering.** Resolved via the content-gate
+   section above. The intercept SDK gains a `gates: true`
+   declaration; the SDK engages the content gate on
+   onSurfaceMatched and releases on first successful render at
+   the post-insets dimensions. Coexists with opening-driver's
+   gate via the existing multi-owner gate system.
 
 4. **Configuration migration.** Users with existing
-   `decoration: { ... }` config in their `config.layout.layout`
-   slice: the bundled plugin's config schema doesn't change
-   (still `DecorationPluginConfig` with appIdPattern, border,
-   focused, unfocused). Existing user configs keep working.
+   `decoration: { ... }` config in their config slice: the
+   bundled plugin's config schema doesn't change (still
+   `DecorationPluginConfig` with appIdPattern, border, focused,
+   unfocused). Existing user configs keep working.
 
 5. **Removed `sdk.decorations` API impact.** The SDK surface
    shrinks: `sdk.decorations.register` / `createDecoration` /
@@ -563,3 +648,78 @@ Total: ~1.5 to 2 days.
    etc.) would break. The codebase's only consumer is the
    bundled decoration plugin which we're rewriting. Out-of-
    tree consumers don't exist yet (early days). Safe to delete.
+
+## Known limitations / acknowledged gaps
+
+These are NOT showstoppers but should be documented:
+
+- **Worker intercepts can't change output dimensions today.**
+  worker-state.ts treats input/output dimensions as readonly at
+  allocate time. The decoration plugin runs in-thread so this
+  doesn't matter for the migration. A future Worker-located
+  decoration plugin would need a new SDK round-trip protocol to
+  renegotiate ring dimensions. Left as TODO; `outputDimensions`
+  is implemented for in-thread in step 1, throws or no-ops in
+  the Worker path. Document this in the SDK comment.
+
+- **Worker intercepts' `outputRect` is silently dropped today.**
+  worker-state.ts:317 hardcodes `null` for placement; the
+  plugin's returned `outputRect` is thrown away. Existing 10a
+  gap, not caused by this migration. Worth fixing eventually
+  but not required for decoration (which doesn't use outputRect).
+
+- **Match engine title-change re-evaluation is wired but not
+  consumed.** match-engine.ts tracks title and fires for changes
+  but `matches()` only consults appId + role. Today's decoration
+  matches on appId only so functionally fine. A future
+  decoration-by-title use case ("Firefox - Private Browsing"
+  gets red border) would hit a dead-code path. Defer.
+
+- **xdg_decoration / kde_decoration protocols remain unchanged.**
+  Both always reply `server_side` regardless of whether an
+  intercept actually decorates. This is correct behavior: the
+  client suppresses its CSD whether or not we draw a border;
+  matching is per-window via the intercept's appId filter,
+  independent of the protocol negotiation.
+
+## Implementation gotchas (do not skip)
+
+These are findings from a careful review pass; not noted earlier:
+
+1. **Subsurface placement does NOT follow outputRect.**
+   subsurfaces.ts emitSubtree computes child placement as
+   `parent.x + sub.x, parent.y + sub.y` using the toplevel's
+   stored `s.x/s.y` — the WM rect, NOT the outputRect override.
+   If decoration used `outputRect` to shift the toplevel, the
+   subsurfaces would render at the un-shifted toplevel position,
+   visually breaking GTK/Qt apps with embedded subsurfaces. The
+   insets-based model in this doc avoids the issue by not
+   shifting placement; the band is INSIDE the outer rect the WM
+   already assigned. If a future intercept (not decoration) DOES
+   need to shift placement, subsurfaces.ts would need an update
+   to consult the intercept's placement override — separate work.
+
+2. **Insets timing relative to first commit.** The intercept's
+   `onSurfaceMatched` fires from `window.map` which fires BEFORE
+   `windowHasContent` in `dispatchFrameCallbacks`. Synchronous
+   `setInsets` calls in the handler land before the window
+   becomes drawable. But: by `window.map` time, the client has
+   already received its initial configure (sent at
+   `addWindow`/first layout pass) at the full outer size; the
+   client has committed at that size. The post-`setInsets`
+   relayout sends a NEW configure with the inset content size;
+   the client re-commits. Without a content gate, the window
+   draws once at the full-outer size (no border, wrong content
+   size) before the re-commit lands. The `gates: true` mechanism
+   in the SDK extension is what closes this race.
+
+3. **Closing-driver phantom samples correct texture.** Verified:
+   `composeSnapshot` uses `s.bindGroup` which reflects the
+   currently-installed intercept output. Teardown order
+   (snapshot first, then onSurfaceUnmatched) preserves the
+   bind group's validity during snapshot.
+
+4. **`pushStack` decoration splice.** Two paths exist
+   (wm/index.ts:1042-1045 in the WM's local pushStack, and
+   subsurfaces.ts computeBaseStack via the SDK). Both must
+   be updated to drop the decoration insertion.
