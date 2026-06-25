@@ -54,9 +54,11 @@ export interface SizeConstraints {
 // What the layout sees about each window. The layout's compute() iterates
 // these in order; index 0 is conventionally the 'master' in tiling layouts.
 //
-// `presentation` is NOT on this type because the WM's resolver dispatches
-// non-managed modes (maximized / fullscreen / minimized) itself, before
-// calling the plugin. The plugin only sees `managed` windows.
+// The three decision axes (`tiling`, `exclusive`, `visible`) are NOT on
+// this type because the WM's resolver dispatches non-managed lanes
+// (exclusive, invisible, floating) itself, before calling the plugin.
+// The plugin only sees windows whose tiling is "managed" AND exclusive
+// is "none" AND visible is true.
 export interface LayoutWindow {
   id: number;             // surface id (matches core's window record)
   appId?: string | null;
@@ -99,16 +101,15 @@ export interface LayoutInputs {
 // fires xdg_toplevel.configure for windows whose size changed.
 //
 // `rects` is for windows the layout chose to place. Omitting a window
-// from rects[] means "no opinion, leave its geometry alone." Use
-// `hidden[]` to explicitly hide a window this frame (tabbed inactive
-// tab, scratchpad-hidden, etc.) -- the WM will not draw it until the
-// next layout pass restores it.
+// from rects[] means "do not draw this window this frame" -- the WM
+// will not assign it a rect, the workspace plugin's outputToplevelStacks
+// filtering will see no rect for it, and the compositor will not render
+// it. The next layout pass that includes its id restores it.
 //
 // rects[] order does NOT need to match windows[] order; the driver
 // matches by id.
 export interface LayoutResult {
   rects: ReadonlyArray<{ id: number; outer: Rect }>;
-  hidden?: ReadonlyArray<number>;
 }
 
 // Relative adjustment to a layout's tunable parameters. Fields are deltas,

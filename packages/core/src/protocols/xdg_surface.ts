@@ -67,30 +67,35 @@ export function configureToplevel(ctx: Ctx, xs: XdgSurfaceRecord, width: number,
 function buildStatesArray(ctx: Ctx, xs: XdgSurfaceRecord, sizeUnknown: boolean): Uint8Array {
   const states: number[] = [];
   const id = xs.surface?.id;
-  // A managed (tiled) window is told it is maximized so the configured size is
-  // BINDING -- xdg-shell requires a maximized client to use the given size,
-  // whereas a stateless configure size is only advisory and the tiled states
-  // alone are advisory too (a media player honors 'maximized' but ignores
-  // 'tiled', and otherwise sizes its surface to its content). The four tiled
-  // edges are additionally advertised (v2+) so the client suppresses resize
-  // affordances on every side -- a master-stack tile is fully managed.
+  // A managed (tiled), non-exclusive window is told it is maximized so the
+  // configured size is BINDING -- xdg-shell requires a maximized client to
+  // use the given size, whereas a stateless configure size is only advisory
+  // and the tiled states alone are advisory too (a media player honors
+  // 'maximized' but ignores 'tiled', and otherwise sizes its surface to its
+  // content). The four tiled edges are additionally advertised (v2+) so the
+  // client suppresses resize affordances on every side.
+  //
+  // The encoder reads the compositor's DECISION fields (tiling, exclusive,
+  // visible) only -- never `clientRequests`. A client that asked maximized
+  // but had its request declined by the policy seam sees a configure with
+  // no maximized state, matching the spec.
   const tiledOk = (xs.toplevel?.version ?? 0) >= 2;
   if (!sizeUnknown && id !== undefined && ctx.state.wm) {
     const ws = ctx.state.wm.getWindowState(id);
     if (ws) {
-      switch (ws.presentation) {
-        case "maximized": states.push(STATE.maximized); break;
-        case "fullscreen": states.push(STATE.fullscreen); break;
-        case "managed":
-          states.push(STATE.maximized);
-          if (tiledOk) {
-            states.push(STATE.tiled_left, STATE.tiled_right,
-                        STATE.tiled_top, STATE.tiled_bottom);
-          }
-          break;
-        // 'minimized' clients aren't expected to render (excluded from the
-        // layout); 'floating' is free-floating, not tiled. Neither gets a state.
+      if (ws.exclusive === "maximized") {
+        states.push(STATE.maximized);
+      } else if (ws.exclusive === "fullscreen") {
+        states.push(STATE.fullscreen);
+      } else if (ws.tiling === "managed") {
+        // Non-exclusive tiled window: maximized + tiled-edges.
+        states.push(STATE.maximized);
+        if (tiledOk) {
+          states.push(STATE.tiled_left, STATE.tiled_right,
+                      STATE.tiled_top, STATE.tiled_bottom);
+        }
       }
+      // tiling === "floating", non-exclusive, visible: no state.
     }
   }
   // 'activated' tracks keyboard focus.

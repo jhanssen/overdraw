@@ -83,14 +83,18 @@ function isCommittedPayload(p: unknown): p is { surfaceId: number; previous: Win
 }
 
 // Build the state array from current window state + the activated focus.
+// Reads the compositor's decision fields only; client requests are not
+// reflected here (a foreign-toplevel observer sees the post-policy
+// decisions).
 function buildStateArray(ws: WindowState | null, activated: boolean): Uint8Array {
   const out: number[] = [];
   if (ws) {
-    switch (ws.presentation) {
-      case "maximized": out.push(STATE.maximized); break;
-      case "fullscreen": out.push(STATE.fullscreen); break;
-      case "minimized": out.push(STATE.minimized); break;
-      // "managed" and "floating" have no foreign-toplevel state.
+    if (!ws.visible) {
+      out.push(STATE.minimized);
+    } else if (ws.exclusive === "maximized") {
+      out.push(STATE.maximized);
+    } else if (ws.exclusive === "fullscreen") {
+      out.push(STATE.fullscreen);
     }
   }
   if (activated) out.push(STATE.activated);
@@ -159,7 +163,10 @@ function emitCommitted(ctx: Ctx, mgr: ManagerState, surfaceId: number,
   const handle = mgr.handles.get(surfaceId);
   if (!handle) return;
   let any = false;
-  if (prev.presentation !== next.presentation) {
+  const stateChanged = prev.tiling !== next.tiling
+    || prev.exclusive !== next.exclusive
+    || prev.visible !== next.visible;
+  if (stateChanged) {
     const activated = ctx.state.seat?.kbFocus?.surfaceId === surfaceId;
     ctx.events.zwlr_foreign_toplevel_handle_v1.send_state(handle, buildStateArray(next, activated));
     any = true;
@@ -273,34 +280,34 @@ export function makeForeignToplevelHandle(ctx: Ctx): ZwlrForeignToplevelHandleV1
     set_maximized(resource) {
       const id = surfaceIdOf(resource);
       if (id === null) return;
-      void ctx.state.wm?.propose(id, { presentation: "maximized" }, "plugin");
+      void ctx.state.wm?.propose(id, { clientRequests: { wantsMaximized: true } }, "plugin");
     },
     unset_maximized(resource) {
       const id = surfaceIdOf(resource);
       if (id === null) return;
-      void ctx.state.wm?.propose(id, { presentation: "managed" }, "plugin");
+      void ctx.state.wm?.propose(id, { clientRequests: { wantsMaximized: false } }, "plugin");
     },
     set_minimized(resource) {
       const id = surfaceIdOf(resource);
       if (id === null) return;
-      void ctx.state.wm?.propose(id, { presentation: "minimized" }, "plugin");
+      void ctx.state.wm?.propose(id, { clientRequests: { wantsMinimized: true } }, "plugin");
     },
     unset_minimized(resource) {
       const id = surfaceIdOf(resource);
       if (id === null) return;
-      void ctx.state.wm?.propose(id, { presentation: "managed" }, "plugin");
+      void ctx.state.wm?.propose(id, { clientRequests: { wantsMinimized: false } }, "plugin");
     },
     set_fullscreen(resource, _output) {
       // _output is a hint we ignore today (single-output; see status.md
       // "Read first").
       const id = surfaceIdOf(resource);
       if (id === null) return;
-      void ctx.state.wm?.propose(id, { presentation: "fullscreen" }, "plugin");
+      void ctx.state.wm?.propose(id, { clientRequests: { wantsFullscreen: true } }, "plugin");
     },
     unset_fullscreen(resource) {
       const id = surfaceIdOf(resource);
       if (id === null) return;
-      void ctx.state.wm?.propose(id, { presentation: "managed" }, "plugin");
+      void ctx.state.wm?.propose(id, { clientRequests: { wantsFullscreen: false } }, "plugin");
     },
     activate(resource, _seat) {
       // _seat is ignored: there's only one seat in this compositor.

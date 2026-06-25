@@ -39,7 +39,10 @@ function snap(windows, outputs = TWO_OUTPUTS) {
 }
 
 function managedOn(id, outputId) {
-  return { id, role: 'toplevel', outputId, presentation: 'managed' };
+  return {
+    id, role: 'toplevel', outputId,
+    tiling: 'managed', exclusive: 'none', visible: true,
+  };
 }
 
 test('two outputs: compute() called once per output with its own windows', async () => {
@@ -120,12 +123,15 @@ test('one output empty (no windows): plugin NOT called for that output', async (
   assert.equal(calls, 1);  // only output 0
 });
 
-test('per-output presentation: fullscreen on output 1 covers output 1 only', async () => {
+test('per-output exclusive: fullscreen on output 1 covers output 1 only', async () => {
   const target = captureTarget();
   const driver = createLayoutDriver({
     snapshot: () => snap([
       managedOn(1, 0),
-      { id: 2, role: 'toplevel', outputId: 1, presentation: 'fullscreen' },
+      {
+        id: 2, role: 'toplevel', outputId: 1,
+        tiling: 'managed', exclusive: 'fullscreen', visible: true,
+      },
     ]),
     target,
     compute: async (inputs) => ({

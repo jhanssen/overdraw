@@ -16,17 +16,22 @@ import type { PluginEvents } from "./events.js";
 import { createWindowObserver } from "./window-observer.js";
 import { FOCUS_REASONS, type FocusReason } from "@overdraw/focus-types";
 import type {
-  Presentation, ProposalReason, WindowState,
+  Tiling, Exclusive, ClientRequests, ProposalReason, WindowState,
 } from "../events/types.js";
 
 // Re-exported so plugins building proposals don't need a parallel import.
-export type { Presentation, ProposalReason, WindowState } from "../events/types.js";
+export type {
+  Tiling, Exclusive, ClientRequests, ProposalReason, WindowState,
+} from "../events/types.js";
 
 // A partial WindowState. Fields omitted from the proposal stay at their
 // current value. constraints is a partial of its sub-object too: missing
 // min/max stays put.
 export interface WindowStateProposal {
-  presentation?: Presentation;
+  tiling?: Tiling;
+  exclusive?: Exclusive;
+  visible?: boolean;
+  clientRequests?: Partial<ClientRequests>;
   layoutMode?: string | null;
   layoutData?: unknown;
   constraints?: {
@@ -425,18 +430,36 @@ export function createPluginWindows(
   };
 }
 
-const PRESENTATIONS: ReadonlyArray<Presentation> = [
-  "managed", "floating", "maximized", "fullscreen", "minimized",
-];
+const TILINGS: ReadonlyArray<Tiling> = ["managed", "floating"];
+const EXCLUSIVES: ReadonlyArray<Exclusive> = ["none", "maximized", "fullscreen"];
 
 function validateProposal(p: WindowStateProposal): void {
   if (typeof p !== "object" || p === null) {
     throw new TypeError("propose proposal must be an object");
   }
-  if (p.presentation !== undefined
-      && !(PRESENTATIONS as readonly string[]).includes(p.presentation)) {
+  if (p.tiling !== undefined
+      && !(TILINGS as readonly string[]).includes(p.tiling)) {
     throw new TypeError(
-      `propose presentation must be one of ${PRESENTATIONS.join("|")}`);
+      `propose tiling must be one of ${TILINGS.join("|")}`);
+  }
+  if (p.exclusive !== undefined
+      && !(EXCLUSIVES as readonly string[]).includes(p.exclusive)) {
+    throw new TypeError(
+      `propose exclusive must be one of ${EXCLUSIVES.join("|")}`);
+  }
+  if (p.visible !== undefined && typeof p.visible !== "boolean") {
+    throw new TypeError("propose visible must be a boolean");
+  }
+  if (p.clientRequests !== undefined) {
+    if (typeof p.clientRequests !== "object" || p.clientRequests === null) {
+      throw new TypeError("propose clientRequests must be an object");
+    }
+    for (const k of ["wantsMaximized", "wantsFullscreen", "wantsMinimized"] as const) {
+      const v = p.clientRequests[k];
+      if (v !== undefined && typeof v !== "boolean") {
+        throw new TypeError(`propose clientRequests.${k} must be a boolean`);
+      }
+    }
   }
   if (p.layoutMode !== undefined
       && p.layoutMode !== null

@@ -10,15 +10,14 @@ import type { CompositorBus } from "../events/window-bus.js";
 import type { DynamicBus } from "../events/dynamic-bus.js";
 import { WINDOW_EVENT } from "../events/types.js";
 import type {
-  WindowStateBagChangedEvent, ProposalReason, Presentation,
+  WindowStateBagChangedEvent, ProposalReason, Tiling, Exclusive,
 } from "../events/types.js";
 import type { CompositorState, CompositorSink } from "../protocols/ctx.js";
 import { rebuildStackWithPopups } from "../protocols/xdg_popup.js";
 import { FOCUS_REASONS } from "@overdraw/focus-types";
 
-const PRESENTATIONS: ReadonlyArray<Presentation> = [
-  "managed", "floating", "maximized", "fullscreen", "minimized",
-];
+const TILINGS: ReadonlyArray<Tiling> = ["managed", "floating"];
+const EXCLUSIVES: ReadonlyArray<Exclusive> = ["none", "maximized", "fullscreen"];
 const PROPOSAL_REASONS: ReadonlyArray<ProposalReason> = [
   "client-request", "plugin", "user-input", "window-rule", "core",
 ];
@@ -277,9 +276,23 @@ function isProposePayload(d: unknown): d is {
   if (typeof o.proposal !== "object" || o.proposal === null) return false;
   const p = o.proposal as { [k: string]: unknown };
   // Validate each known field shape. Missing fields are allowed.
-  if (p.presentation !== undefined) {
-    if (typeof p.presentation !== "string"
-        || !(PRESENTATIONS as readonly string[]).includes(p.presentation)) return false;
+  if (p.tiling !== undefined) {
+    if (typeof p.tiling !== "string"
+        || !(TILINGS as readonly string[]).includes(p.tiling)) return false;
+  }
+  if (p.exclusive !== undefined) {
+    if (typeof p.exclusive !== "string"
+        || !(EXCLUSIVES as readonly string[]).includes(p.exclusive)) return false;
+  }
+  if (p.visible !== undefined) {
+    if (typeof p.visible !== "boolean") return false;
+  }
+  if (p.clientRequests !== undefined) {
+    if (typeof p.clientRequests !== "object" || p.clientRequests === null) return false;
+    const cr = p.clientRequests as { [k: string]: unknown };
+    for (const k of ["wantsMaximized", "wantsFullscreen", "wantsMinimized"]) {
+      if (cr[k] !== undefined && typeof cr[k] !== "boolean") return false;
+    }
   }
   if (p.layoutMode !== undefined) {
     if (p.layoutMode !== null && typeof p.layoutMode !== "string") return false;

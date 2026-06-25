@@ -3,8 +3,9 @@
 // Owns the window list + stacking order and pushes layout/stack to the
 // compositor sink. The geometry policy (where windows go) lives in
 // layout-driver.ts (the resolver) + the bundled layout plugin. The
-// behavioral state of each window (presentation, layoutMode, constraints,
-// parent) lives here, mutated through propose().
+// behavioral state of each window (tiling, exclusive, visible, layoutMode,
+// constraints, parent, clientRequests) lives here, mutated through
+// propose().
 //
 // propose() is the single entry point for behavioral-state changes. It
 // emits 'window.proposed' (interceptable), commits the final candidate,
@@ -27,7 +28,9 @@ import {
 import type {
   WindowRelayoutEvent,
   WindowState,
-  Presentation,
+  Tiling,
+  Exclusive,
+  ClientRequests,
   ProposalReason,
   WindowProposedEvent,
   WindowCommittedEvent,
@@ -132,7 +135,14 @@ export interface Window {
 // returned object is safe (it's a fresh literal per call).
 export function defaultWindowState(): WindowState {
   return {
-    presentation: "managed",
+    tiling: "managed",
+    exclusive: "none",
+    visible: true,
+    clientRequests: {
+      wantsMaximized: false,
+      wantsFullscreen: false,
+      wantsMinimized: false,
+    },
     layoutMode: null,
     layoutData: undefined,
     constraints: { minSize: null, maxSize: null },
@@ -189,8 +199,16 @@ export interface InsetGrant { insets: Insets; outerRect: Rect; contentRect: Rect
 // A field-subset of WindowState. propose() merges this into the current
 // state, runs the candidate through the proposed-event chain, then commits.
 // Fields omitted from the proposal stay at their current value.
+//
+// `tiling`, `exclusive`, `visible` are the compositor's decisions; a plugin
+// (or core) writes them directly. Client requests (xdg_toplevel.set_*)
+// arrive as `clientRequests` and go through resolveDecisions() to become
+// decision-axis writes.
 export interface WindowStateProposal {
-  presentation?: Presentation;
+  tiling?: Tiling;
+  exclusive?: Exclusive;
+  visible?: boolean;
+  clientRequests?: Partial<ClientRequests>;
   layoutMode?: string | null;
   layoutData?: unknown;
   constraints?: {
@@ -309,10 +327,10 @@ export interface Wm {
   // Set the floating rect for a window. Used by the pointer-grab path
   // to update geometry per motion event; bypasses the proposal pipeline
   // because per-frame interactive drags are continuous geometric
-  // updates, not policy decisions. The window must be in 'floating'
-  // presentation for the rect to take effect (otherwise the resolver
-  // ignores it -- the rect is still stored for later transitions).
-  // Triggers a relayout pass.
+  // updates, not policy decisions. The window must be in the floating
+  // lane (tiling === "floating") and non-exclusive for the rect to
+  // take effect (otherwise the resolver ignores it -- the rect is
+  // still stored for later transitions). Triggers a relayout pass.
   setFloatingRect(surfaceId: number, rect: Rect): void;
   // Read a window's stored floating rect, or null if none.
   getFloatingRect(surfaceId: number): Rect | null;
@@ -395,7 +413,10 @@ function isRect(v: unknown): v is Rect {
 // objects we copy explicitly.
 function cloneState(s: WindowState): WindowState {
   return {
-    presentation: s.presentation,
+    tiling: s.tiling,
+    exclusive: s.exclusive,
+    visible: s.visible,
+    clientRequests: { ...s.clientRequests },
     layoutMode: s.layoutMode,
     layoutData: s.layoutData,
     constraints: {
@@ -413,9 +434,14 @@ function cloneState(s: WindowState): WindowState {
 function validateState(v: unknown): WindowState | null {
   if (typeof v !== "object" || v === null) return null;
   const o = v as { [k: string]: unknown };
-  const p = o.presentation;
-  if (p !== "managed" && p !== "maximized" && p !== "fullscreen" && p !== "minimized") {
-    return null;
+  if (o.tiling !== "managed" && o.tiling !== "floating") return null;
+  if (o.exclusive !== "none" && o.exclusive !== "maximized" && o.exclusive !== "fullscreen") return null;
+  if (typeof o.visible !== "boolean") return null;
+  const cr = o.clientRequests;
+  if (typeof cr !== "object" || cr === null) return null;
+  const crr = cr as { [k: string]: unknown };
+  for (const k of ["wantsMaximized", "wantsFullscreen", "wantsMinimized"] as const) {
+    if (typeof crr[k] !== "boolean") return null;
   }
   if (o.layoutMode !== null && typeof o.layoutMode !== "string") return null;
   const c = o.constraints;
@@ -441,13 +467,16 @@ function validateState(v: unknown): WindowState | null {
 
 // Fields whose change requires a layout pass.
 const GEOMETRY_FIELDS: ReadonlyArray<keyof WindowState> = [
-  "presentation", "layoutMode", "layoutData", "constraints",
+  "tiling", "exclusive", "visible", "layoutMode", "layoutData", "constraints",
 ];
 
 // Diff two WindowState values; returns the list of differing field names.
 function diffState(prev: WindowState, next: WindowState): Array<keyof WindowState> {
   const out: Array<keyof WindowState> = [];
-  if (prev.presentation !== next.presentation) out.push("presentation");
+  if (prev.tiling !== next.tiling) out.push("tiling");
+  if (prev.exclusive !== next.exclusive) out.push("exclusive");
+  if (prev.visible !== next.visible) out.push("visible");
+  if (!clientRequestsEqual(prev.clientRequests, next.clientRequests)) out.push("clientRequests");
   if (prev.layoutMode !== next.layoutMode) out.push("layoutMode");
   // layoutData identity-compare; plugins are expected to replace, not mutate.
   if (prev.layoutData !== next.layoutData) out.push("layoutData");
@@ -455,6 +484,12 @@ function diffState(prev: WindowState, next: WindowState): Array<keyof WindowStat
   if (prev.parent !== next.parent) out.push("parent");
   if (!restoreRectEqual(prev.restoreRect, next.restoreRect)) out.push("restoreRect");
   return out;
+}
+
+function clientRequestsEqual(a: ClientRequests, b: ClientRequests): boolean {
+  return a.wantsMaximized === b.wantsMaximized
+      && a.wantsFullscreen === b.wantsFullscreen
+      && a.wantsMinimized === b.wantsMinimized;
 }
 
 function constraintsEqual(a: WindowState["constraints"], b: WindowState["constraints"]): boolean {
@@ -480,7 +515,20 @@ function restoreRectEqual(a: Rect | null, b: Rect | null): boolean {
 // not mutate `current`.
 function mergeProposal(current: WindowState, p: WindowStateProposal): WindowState {
   const next = cloneState(current);
-  if (p.presentation !== undefined) next.presentation = p.presentation;
+  if (p.tiling !== undefined) next.tiling = p.tiling;
+  if (p.exclusive !== undefined) next.exclusive = p.exclusive;
+  if (p.visible !== undefined) next.visible = p.visible;
+  if (p.clientRequests !== undefined) {
+    if (p.clientRequests.wantsMaximized !== undefined) {
+      next.clientRequests.wantsMaximized = p.clientRequests.wantsMaximized;
+    }
+    if (p.clientRequests.wantsFullscreen !== undefined) {
+      next.clientRequests.wantsFullscreen = p.clientRequests.wantsFullscreen;
+    }
+    if (p.clientRequests.wantsMinimized !== undefined) {
+      next.clientRequests.wantsMinimized = p.clientRequests.wantsMinimized;
+    }
+  }
   if (p.layoutMode !== undefined) next.layoutMode = p.layoutMode;
   if ("layoutData" in p) next.layoutData = p.layoutData;
   if (p.constraints !== undefined) {
@@ -497,6 +545,64 @@ function mergeProposal(current: WindowState, p: WindowStateProposal): WindowStat
   }
   if (p.parent !== undefined) next.parent = p.parent;
   return next;
+}
+
+// Apply the default policy that maps clientRequests onto the decision axes.
+// This runs AFTER the proposed-interceptor chain (so a plugin sees the
+// post-merge candidate including the new clientRequests and may pre-empt
+// the resolution by writing tiling/exclusive/visible directly). The
+// candidate passed in here is the one the WM is about to commit; the
+// returned state reflects the policy-resolved decisions.
+//
+// `phase` distinguishes pre-first-content from post-first-content. Pre-
+// content `wantsMaximized` is suppressed by default (the GTK boilerplate
+// case the doc calls out); post-content set_maximized is honored.
+//
+// Plugins that want full control of this logic intercept window.proposed
+// and write the decision axes directly; resolveDecisions only fills the
+// gap when the proposal's diff is on clientRequests alone.
+type PolicyPhase = "pre-content" | "post-content";
+
+function resolveDecisions(
+  prev: WindowState,
+  candidate: WindowState,
+  phase: PolicyPhase,
+): WindowState {
+  const out = cloneState(candidate);
+  const prevReq = prev.clientRequests;
+  const req = candidate.clientRequests;
+  const decisionDirectlySet =
+    prev.tiling !== candidate.tiling
+    || prev.exclusive !== candidate.exclusive
+    || prev.visible !== candidate.visible;
+  if (decisionDirectlySet) return out;
+
+  // wantsFullscreen wins over wantsMaximized (matches EWMH precedence).
+  if (req.wantsFullscreen !== prevReq.wantsFullscreen) {
+    out.exclusive = req.wantsFullscreen ? "fullscreen" : "none";
+  } else if (req.wantsMaximized !== prevReq.wantsMaximized) {
+    if (req.wantsMaximized) {
+      // Default policy: pre-content set_maximized from a client is
+      // suppressed (GTK/Qt startup boilerplate that demands maximize
+      // before the user has seen the window). A window-rules plugin
+      // intercepting window.preconfigure may override.
+      if (phase === "post-content") out.exclusive = "maximized";
+    } else if (out.exclusive === "maximized") {
+      out.exclusive = "none";
+    }
+  }
+
+  if (req.wantsMinimized !== prevReq.wantsMinimized) {
+    // wantsMinimized is only honored post-content (a window can't be
+    // minimized before it exists). On unset, restore visibility.
+    if (req.wantsMinimized) {
+      if (phase === "post-content") out.visible = false;
+    } else {
+      out.visible = true;
+    }
+  }
+
+  return out;
 }
 
 export interface WmOptions {
@@ -554,7 +660,9 @@ function resolveParentOutputId(
 
 // Window state convenience helpers re-exported here so callers reading the
 // WM module don't need a parallel events/types.js import.
-export type { Presentation, WindowState, ProposalReason } from "../events/types.js";
+export type {
+  Tiling, Exclusive, ClientRequests, WindowState, ProposalReason,
+} from "../events/types.js";
 
 // Per-handler ceiling for window.relayout + window.proposed interceptors.
 const INTERCEPTOR_TIMEOUT_MS = 100;
@@ -597,12 +705,7 @@ export function createWm(
   function maxFloatingZ(): number {
     let m = tiledZ;
     for (const w of windows) {
-      if (w.windowState.presentation !== "managed"
-          && w.windowState.presentation !== "maximized"
-          && w.windowState.presentation !== "minimized"
-          && w.z > m) {
-        m = w.z;
-      }
+      if (w.windowState.tiling === "floating" && w.z > m) m = w.z;
     }
     return m;
   }
@@ -651,7 +754,7 @@ export function createWm(
   }
 
   // Assign z on map per the documented rules:
-  //   tiled toplevel (managed / maximized / minimized presentation):
+  //   tiled toplevel (tiling === "managed", any exclusive/visible):
   //     z = tiledZ (joins the shared tiled stack).
   //   floating window with no parent:
   //     z = max(highestFloating, tiledZ) + 1.
@@ -660,8 +763,7 @@ export function createWm(
   //     subtree is normalized via raiseModalDescendants so deeper
   //     modals stay above this one.
   function assignZForMap(win: Window): void {
-    const p = win.windowState.presentation;
-    const isFloating = p === "floating";
+    const isFloating = win.windowState.tiling === "floating";
     const parentId = win.windowState.parent;
     if (!isFloating && parentId === null) {
       win.z = tiledZ;
@@ -757,12 +859,58 @@ export function createWm(
   function pushStack(): void {
     if (rebuild) { rebuild(); return; }
     const ids: number[] = [];
+    // When some window on a workspace has exclusive !== "none", it owns
+    // the workspace and every peer is omitted from the draw stack
+    // (matches the layout-driver's resolver, which only emits a rect
+    // for the exclusive window on that output). Invisible windows
+    // (visible === false) are also omitted regardless.
+    const exclusiveByOutput = exclusiveWindowsByOutput();
     for (const w of windows) {
       if (w.contentGated || !w.hasContent) continue;
+      if (!w.windowState.visible) continue;
+      const ownerOutput = outputOf(w.surfaceId);
+      if (ownerOutput !== null) {
+        const exclusiveId = exclusiveByOutput.get(ownerOutput);
+        if (exclusiveId !== undefined && exclusiveId !== w.surfaceId) continue;
+      }
       if (w.decorationSurfaceId !== undefined) ids.push(w.decorationSurfaceId);
       ids.push(w.surfaceId);
     }
     compositor.setStack(ids);
+  }
+
+  // Resolve which window (if any) holds exclusive ownership of each
+  // output. Iterates outputContent (the workspace plugin's per-output
+  // visible-window order) and picks the first window in each list whose
+  // `exclusive` is not "none" and whose `visible` is true.
+  function exclusiveWindowsByOutput(): Map<number, number> {
+    const out = new Map<number, number>();
+    if (!outputContent) return out;
+    const content = outputContent();
+    for (const [outputId, ids] of content) {
+      for (const id of ids) {
+        const w = windows.find((x) => x.surfaceId === id);
+        if (!w) continue;
+        if (!w.windowState.visible) continue;
+        if (w.windowState.exclusive !== "none") {
+          out.set(outputId, id);
+          break;
+        }
+      }
+    }
+    return out;
+  }
+
+  // Resolve the output a window currently lives on by scanning
+  // outputContent. Returns null when no workspace plugin is wired or
+  // the window is unplaced.
+  function outputOf(surfaceId: number): number | null {
+    if (!outputContent) return null;
+    const content = outputContent();
+    for (const [outputId, ids] of content) {
+      if (ids.includes(surfaceId)) return outputId;
+    }
+    return null;
   }
 
   // Push one window's held geometry to the compositor: content layout, the
@@ -957,7 +1105,9 @@ export function createWm(
       windowMap.set(w.surfaceId, {
         id: w.surfaceId,
         role: "toplevel" as const,
-        presentation: w.windowState.presentation,
+        tiling: w.windowState.tiling,
+        exclusive: w.windowState.exclusive,
+        visible: w.windowState.visible,
         layoutMode: w.windowState.layoutMode ?? undefined,
         layoutData: w.windowState.layoutData,
         constraints: {
@@ -1052,7 +1202,8 @@ export function createWm(
         // only when the WM is still in the post-preconfigure
         // 'managed' state.
         let dialogPolicyMutated = false;
-        if (win.windowState.presentation === "managed") {
+        if (win.windowState.tiling === "managed"
+            && win.windowState.exclusive === "none") {
           const c = win.windowState.constraints;
           const minW = c.minSize?.width ?? 0;
           const minH = c.minSize?.height ?? 0;
@@ -1061,7 +1212,7 @@ export function createWm(
           const fixedSize = minW !== 0 && minH !== 0
             && (minW === maxW || minH === maxH);
           if (win.windowState.parent !== null || fixedSize) {
-            win.windowState = { ...win.windowState, presentation: "floating" };
+            win.windowState = { ...win.windowState, tiling: "floating" };
             dialogPolicyMutated = true;
             if (win.floatingRect === undefined) {
               // Seed the floating rect at the client's preferred
@@ -1154,7 +1305,7 @@ export function createWm(
       // and the resulting buffer-rendered-larger-than-tile shows
       // hit-test misalignment + decoration overlap on the right /
       // bottom.
-      if (win.windowState.presentation === "floating"
+      if (win.windowState.tiling === "floating"
           && win.outer.width > 0 && win.outer.height > 0) {
         const insetLR = granted.left + granted.right;
         const insetTB = granted.top + granted.bottom;
@@ -1231,8 +1382,7 @@ export function createWm(
       // Redirect modal-chain clicks to the chain's root so a click on
       // a dialog brings the whole modal subtree up together.
       const root = rootOfModalChain(win);
-      const p = root.windowState.presentation;
-      const isTiled = p === "managed" || p === "maximized" || p === "minimized";
+      const isTiled = root.windowState.tiling === "managed";
       const highestFloating = maxFloatingZ();
       if (isTiled) {
         // Tiled stack: if the shared tiled z is already at the peak,
@@ -1245,10 +1395,7 @@ export function createWm(
           const newZ = highestFloating + 1;
           tiledZ = newZ;
           for (const w of windows) {
-            const wp = w.windowState.presentation;
-            if (wp === "managed" || wp === "maximized" || wp === "minimized") {
-              w.z = newZ;
-            }
+            if (w.windowState.tiling === "managed") w.z = newZ;
           }
         }
         // Raising tiled re-elevated EVERY tiled window's z, so EVERY
@@ -1256,10 +1403,7 @@ export function createWm(
         // raised) parent. Renormalize every tiled window's modals,
         // not just the clicked one's.
         for (const w of windows) {
-          const wp = w.windowState.presentation;
-          if (wp === "managed" || wp === "maximized" || wp === "minimized") {
-            raiseModalDescendants(w);
-          }
+          if (w.windowState.tiling === "managed") raiseModalDescendants(w);
         }
       } else {
         // Floating root: if it's already on top, only renormalize its
@@ -1320,27 +1464,47 @@ export function createWm(
       if (!win) return null;
       // Before the initial commit, the throwaway 0x0 first configure is sent
       // SYNCHRONOUSLY (sendInitialConfigure) and its states array is read from
-      // win.windowState. A set_maximized / set_fullscreen that arrived in the
-      // same wayland-batch goes through this async pipeline, which only writes
-      // windowState after a microtask hop -- too late for that first configure.
-      // Stamp the client-declared presentation synchronously so the first
-      // configure carries it; the async pass below still runs the
-      // proposed-interceptor + layout for the sized second configure.
-      if (win.pendingInitialCommit && proposal.presentation !== undefined) {
-        win.windowState = { ...win.windowState, presentation: proposal.presentation };
+      // win.windowState (tiling/exclusive/visible). A direct decision-axis
+      // write that arrived in the same wayland-batch goes through this async
+      // pipeline, which only writes windowState after a microtask hop -- too
+      // late for that first configure. Stamp the client-declared decision
+      // axes synchronously so the first configure carries them; the async
+      // pass below still runs the proposed-interceptor + layout for the
+      // sized second configure.
+      if (win.pendingInitialCommit) {
+        const stamp: Partial<WindowState> = {};
+        if (proposal.tiling !== undefined) stamp.tiling = proposal.tiling;
+        if (proposal.exclusive !== undefined) stamp.exclusive = proposal.exclusive;
+        if (proposal.visible !== undefined) stamp.visible = proposal.visible;
+        if (Object.keys(stamp).length > 0) {
+          win.windowState = { ...win.windowState, ...stamp };
+        }
+        // Client requests arriving pre-content go through the policy seam
+        // (resolveDecisions with phase="pre-content") synchronously so the
+        // first configure reflects the decided state, not the raw request.
+        if (proposal.clientRequests !== undefined) {
+          const prevCR = win.windowState.clientRequests;
+          const nextCR: ClientRequests = {
+            wantsMaximized: proposal.clientRequests.wantsMaximized ?? prevCR.wantsMaximized,
+            wantsFullscreen: proposal.clientRequests.wantsFullscreen ?? prevCR.wantsFullscreen,
+            wantsMinimized: proposal.clientRequests.wantsMinimized ?? prevCR.wantsMinimized,
+          };
+          const merged: WindowState = { ...win.windowState, clientRequests: nextCR };
+          win.windowState = resolveDecisions(win.windowState, merged, "pre-content");
+        }
       }
       // Same race for client-declared constraints (set_min_size /
       // set_max_size): a client (the GIMP splash, GTK About dialogs)
       // sends these together with its first-content commit, then the
       // map handler in protocols/index.ts synchronously calls
-      // windowHasContent, which classifies the window's presentation
-      // based on whether min == max in either axis. Without a
-      // synchronous stamp the constraints aren't in windowState yet
-      // (still queued behind the async proposed-interceptor pass),
-      // the fixed-size rule sees zeros, and the window stays managed
-      // when it should default to floating. Constraints are
-      // append-only data with no downstream invariants beyond the
-      // floating classification; stamping them eagerly is safe.
+      // windowHasContent, which classifies the window based on whether
+      // min == max in either axis. Without a synchronous stamp the
+      // constraints aren't in windowState yet (still queued behind the
+      // async proposed-interceptor pass), the fixed-size rule sees
+      // zeros, and the window stays in the managed lane when it should
+      // default to floating. Constraints are append-only data with no
+      // downstream invariants beyond the floating classification;
+      // stamping them eagerly is safe.
       if (proposal.constraints !== undefined) {
         win.windowState = {
           ...win.windowState,
@@ -1363,8 +1527,6 @@ export function createWm(
 
         const current = cloneState(win.windowState);
         let candidate = mergeProposal(current, proposal);
-        const wasFloating = current.presentation === "floating";
-        const becomingFloating = candidate.presentation === "floating";
 
         if (pluginBus) {
           const initial: WindowProposedEvent = {
@@ -1379,15 +1541,41 @@ export function createWm(
           if (modified) candidate = cloneState(modified);
         }
 
+        // Apply default policy after the interceptor chain: if the
+        // proposal only touched clientRequests (the typical
+        // xdg_toplevel.set_* path) and no interceptor took a position,
+        // resolveDecisions maps wants -> decisions per the default
+        // policy. phase post-content (pre-content is handled
+        // synchronously in the pendingInitialCommit branch above).
+        const phase: PolicyPhase = win.pendingInitialCommit ? "pre-content" : "post-content";
+        candidate = resolveDecisions(current, candidate, phase);
+
         const changed = diffState(current, candidate);
         if (changed.length === 0) return cloneState(current);
 
+        const wasFloating = current.tiling === "floating";
+        const becomingFloating = candidate.tiling === "floating";
+
         // Capture the initial floating rect when a window enters
-        // 'floating' for the first time. The window stays visually in
-        // place across the transition: its current outer becomes the
-        // floating rect.
+        // the floating lane for the first time. The window stays
+        // visually in place across the transition: its current
+        // outer becomes the floating rect.
         if (!wasFloating && becomingFloating && win.floatingRect === undefined) {
           win.floatingRect = { ...win.outer };
+        }
+
+        // Capture restoreRect on entry into exclusive, restore on exit.
+        const wasExclusive = current.exclusive !== "none";
+        const becomingExclusive = candidate.exclusive !== "none";
+        if (!wasExclusive && becomingExclusive && candidate.restoreRect === null) {
+          candidate.restoreRect = { ...win.outer };
+        }
+        if (wasExclusive && !becomingExclusive && candidate.restoreRect !== null) {
+          // restoreRect consumed; layout-driver will read it via the
+          // snapshot for the destination lane (floating uses it as
+          // floatingRect fallback). Clear so a subsequent re-entry
+          // captures a fresh rect.
+          candidate.restoreRect = null;
         }
 
         win.windowState = candidate;
@@ -1566,7 +1754,7 @@ export function createWm(
           for (const id of ids) {
             const win = windows.find((w) => w.surfaceId === id);
             if (!win) continue;
-            if (win.hasContent && win.windowState.presentation !== "minimized") {
+            if (win.hasContent && win.windowState.visible) {
               out.push(win.surfaceId);
             }
           }
@@ -1574,7 +1762,7 @@ export function createWm(
         return out;
       }
       for (const w of windows) {
-        if (w.hasContent && w.windowState.presentation !== "minimized") {
+        if (w.hasContent && w.windowState.visible) {
           out.push(w.surfaceId);
         }
       }
@@ -1600,7 +1788,7 @@ export function createWm(
       const focusable: number[] = [];
       for (let i = 0; i < windows.length; i++) {
         const w = windows[i];
-        if (w.hasContent && w.windowState.presentation !== "minimized") focusable.push(i);
+        if (w.hasContent && w.windowState.visible) focusable.push(i);
       }
       const pos = focusable.indexOf(idx);
       if (pos < 0) return false;
@@ -1634,7 +1822,10 @@ function snapshotOf(win: Window): WindowSnapshot {
     hasContent: !!win.hasContent,
     contentGated: !!win.contentGated,
     windowState: {
-      presentation: win.windowState.presentation,
+      tiling: win.windowState.tiling,
+      exclusive: win.windowState.exclusive,
+      visible: win.windowState.visible,
+      clientRequests: { ...win.windowState.clientRequests },
       layoutMode: win.windowState.layoutMode,
       layoutData: win.windowState.layoutData,
       constraints: {

@@ -1,7 +1,7 @@
-// Pure-unit tests for the WM's floating presentation:
+// Pure-unit tests for the WM's floating tiling lane:
 //   - The resolver dispatches floating windows in core (plugin not called).
-//   - First transition into 'floating' captures the current outer as the
-//     initial floating rect.
+//   - First transition into the floating lane captures the current outer
+//     as the initial floating rect.
 //   - setFloatingRect updates the stored rect and schedules a relayout.
 //   - The bundled master-stack plugin doesn't see floating windows.
 
@@ -50,7 +50,7 @@ function recordingDriver(pluginVisible) {
   });
 }
 
-// --- presentation dispatch -----------------------------------------------
+// --- tiling lane dispatch -----------------------------------------------
 
 test('floating window: captures initial rect from current outer on first transition', async () => {
   const wm = createWm(mockSink(), [{ id: 0, rect: { x: 0, y: 0, width: 1000, height: 600 }, scale: 1 }], {
@@ -60,7 +60,7 @@ test('floating window: captures initial rect from current outer on first transit
   // Currently no floatingRect.
   assert.equal(wm.getFloatingRect(1), null);
 
-  await wm.propose(1, { presentation: 'floating' }, 'user-input');
+  await wm.propose(1, { tiling: 'floating' }, 'user-input');
   const fr = wm.getFloatingRect(1);
   assert.ok(fr);
   // Initial floating rect = current outer at the time of transition.
@@ -110,7 +110,7 @@ test('resolver: floating window uses its floatingRect, not the plugin output', a
 
   // Transition to floating with an explicit rect.
   wm.setFloatingRect(1, { x: 100, y: 50, width: 300, height: 200 });
-  await wm.propose(1, { presentation: 'floating' }, 'user-input');
+  await wm.propose(1, { tiling: 'floating' }, 'user-input');
   await wm.settled();
   // The plugin should NOT have been called for the floating window (no
   // managed windows). The resolver assigned the floating rect.
@@ -127,7 +127,7 @@ test('resolver: layout plugin only sees managed windows, not floating', async ()
   await addMapped(wm, 2);
   visible.length = 0;
 
-  await wm.propose(2, { presentation: 'floating' }, 'user-input');
+  await wm.propose(2, { tiling: 'floating' }, 'user-input');
   await wm.settled();
   // The plugin's last invocation saw only window 1 (managed); window 2 is
   // floating and resolved in core.
@@ -141,7 +141,7 @@ test('resolver: empty managed set with floating window: plugin not called', asyn
   });
   await addMapped(wm, 1);
   visible.length = 0;
-  await wm.propose(1, { presentation: 'floating' }, 'user-input');
+  await wm.propose(1, { tiling: 'floating' }, 'user-input');
   await wm.settled();
   // No managed windows -> plugin not called.
   assert.equal(visible.length, 0);
@@ -153,16 +153,16 @@ test('floating rect preserved across floating -> managed -> floating', async () 
   });
   await addMapped(wm, 1);
   // First float at default rect (= current outer at transition).
-  await wm.propose(1, { presentation: 'floating' }, 'user-input');
+  await wm.propose(1, { tiling: 'floating' }, 'user-input');
   const initial = wm.getFloatingRect(1);
   // User drags to a new position.
   wm.setFloatingRect(1, { x: 200, y: 100, width: 500, height: 400 });
   // Back to managed.
-  await wm.propose(1, { presentation: 'managed' }, 'user-input');
+  await wm.propose(1, { tiling: 'managed' }, 'user-input');
   assert.deepEqual(wm.getFloatingRect(1),
     { x: 200, y: 100, width: 500, height: 400 });
   // Float again -- rect is preserved (no re-capture).
-  await wm.propose(1, { presentation: 'floating' }, 'user-input');
+  await wm.propose(1, { tiling: 'floating' }, 'user-input');
   assert.deepEqual(wm.getFloatingRect(1),
     { x: 200, y: 100, width: 500, height: 400 });
   assert.notDeepEqual(wm.getFloatingRect(1), initial);
@@ -180,13 +180,13 @@ test('setFloatingRect: unknown window is a no-op (no throw)', () => {
   assert.equal(wm.getFloatingRect(999), null);
 });
 
-// --- presentation enum widened to include 'floating' --------------------
+// --- tiling-lane propose accepted ---------------------------------------
 
-test('propose: floating presentation is accepted', async () => {
+test('propose: tiling=floating is accepted', async () => {
   const wm = createWm(mockSink(), [{ id: 0, rect: { x: 0, y: 0, width: 1000, height: 600 }, scale: 1 }], {
     layoutDriverFactory: inlineMasterStackDriverFactory,
   });
   await addMapped(wm, 1);
-  const r = await wm.propose(1, { presentation: 'floating' }, 'user-input');
-  assert.equal(r.presentation, 'floating');
+  const r = await wm.propose(1, { tiling: 'floating' }, 'user-input');
+  assert.equal(r.tiling, 'floating');
 });

@@ -60,7 +60,7 @@ test('windowAt: predicate rejecting front window falls through to back', async (
   await addMapped(wm, 1);
   await addMapped(wm, 2);   // 2 is master (front), 1 is stack
   // Float window 2 over the area where window 1 is (the stack column).
-  await wm.propose(2, { presentation: 'floating' }, 'user-input');
+  await wm.propose(2, { tiling: 'floating' }, 'user-input');
   wm.setFloatingRect(2, { x: 500, y: 0, width: 400, height: 400 });
   await wm.settled();
   // A point in the overlap: front (2) rejects, falls through to back (1).
@@ -87,7 +87,7 @@ test('windowAt: predicate sees translated coords when window is at non-origin re
     layoutDriverFactory: inlineMasterStackDriverFactory,
   });
   await addMapped(wm, 1);
-  await wm.propose(1, { presentation: 'floating' }, 'user-input');
+  await wm.propose(1, { tiling: 'floating' }, 'user-input');
   wm.setFloatingRect(1, { x: 100, y: 50, width: 400, height: 300 });
   await wm.settled();
   let seen = null;

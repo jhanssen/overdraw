@@ -371,13 +371,16 @@ export function startXwm(state: CompositorState, addon: Addon, wmFd: number): Xw
       const parent = windows.get(w.transientFor);
       if (parent && parent.surfaceId !== null) proposal.parent = parent.surfaceId;
     }
-    // Presentation: derived from _NET_WM_STATE first, then a fallback
-    // dialog-hint from _NET_WM_WINDOW_TYPE / WM_TRANSIENT_FOR. The dialog /
-    // utility / menu kinds promote to floating via xdg's existing min==max
-    // policy when constraints are set; we don't override presentation for
-    // them.
-    if (w.presentationHint !== null) {
-      proposal.presentation = w.presentationHint;
+    // _NET_WM_STATE -> clientRequests. EWMH sends "this window WANTS
+    // to be fullscreen/maximized"; that's a wish, not a decision. The
+    // policy seam in wm.propose maps it onto the exclusive axis the
+    // same way it does for xdg_toplevel.set_*.
+    if (w.presentationHint === "fullscreen") {
+      proposal.clientRequests = { wantsFullscreen: true, wantsMaximized: false };
+    } else if (w.presentationHint === "maximized") {
+      proposal.clientRequests = { wantsMaximized: true, wantsFullscreen: false };
+    } else {
+      proposal.clientRequests = { wantsMaximized: false, wantsFullscreen: false };
     }
     if (Object.keys(proposal).length > 0) {
       void state.wm.propose(w.surfaceId, proposal, "client-request");

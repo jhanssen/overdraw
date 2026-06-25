@@ -51,11 +51,11 @@ test('focusOrder: lists mapped toplevels in stack order; skips contentless', asy
   assert.deepEqual(wm.focusOrder(), [3, 2, 1]);
 });
 
-test('focusOrder: skips minimized windows', async () => {
+test('focusOrder: skips invisible windows (visible=false)', async () => {
   const { wm } = setup();
   await addMapped(wm, 1);
   await addMapped(wm, 2);
-  await wm.propose(1, { presentation: 'minimized' }, 'user-input');
+  await wm.propose(1, { visible: false }, 'user-input');
   assert.deepEqual(wm.focusOrder(), [2]);
 });
 

@@ -26,11 +26,12 @@ export const WINDOW_EVENT = {
   // (lower-frequency, typed) and from window.committed (behavioral state).
   stateBagChanged: "window.state-bag-changed",
   // Pre-action interceptable event: someone wants to change a window's
-  // behavioral state (presentation, layoutMode, layoutData, constraints,
-  // parent). Interceptors receive the current state and a candidate; they
-  // may modify the candidate (return a new payload) or revert it (return
-  // the candidate with the disputed field set back to current = veto).
-  // After interceptors resolve, the final candidate is committed.
+  // behavioral state (tiling, exclusive, visible, layoutMode, layoutData,
+  // constraints, parent, clientRequests). Interceptors receive the
+  // current state and a candidate; they may modify the candidate
+  // (return a new payload) or revert it (return the candidate with the
+  // disputed field set back to current = veto). After interceptors
+  // resolve, the final candidate is committed.
   proposed: "window.proposed",
   // Post-commit observe-only event: a window's behavioral state was just
   // committed. Carries previous + current + which fields changed.
@@ -102,9 +103,9 @@ export type WindowUnmapEvent = {
 };
 
 // Which fields of a mapped window changed since the last emit. Window
-// behavioral state (presentation, layoutMode, etc.) is NOT a change field --
-// those go through 'window.committed'. This event is for the metadata
-// stream: title, appId, focus activation.
+// behavioral state (tiling, exclusive, visible, layoutMode, ...) is NOT a
+// change field -- those go through 'window.committed'. This event is for
+// the metadata stream: title, appId, focus activation.
 export type WindowChangeField = "title" | "appId" | "activated";
 
 // Emitted (coalesced per frame) when a mapped toplevel's metadata changes.
@@ -129,29 +130,41 @@ export type WindowStateBagChangedEvent = {
   deleted: boolean;
 };
 
-// Per-window behavioral state. Carried in the proposed/committed event
-// payloads + the window snapshot. Three layers:
-//   - `presentation`: closed enum, drives xdg_toplevel.configure states +
-//     core's mode dispatch in the geometry resolver.
-//   - `layoutMode` / `layoutData`: open vocabulary owned by the active
-//     layout plugin; opaque to core. Carried so other plugins can intercept
-//     transitions ("don't let Firefox go floating") without coupling to a
-//     specific layout plugin.
-//   - `constraints` + `parent`: protocol-defined fields from xdg_toplevel.
-//     set_min_size / set_max_size / set_parent.
-// Per-window presentation mode. Closed set; drives core's geometry
-// resolver dispatch + the xdg_toplevel.configure states array.
-//   managed     -- layout plugin assigns the rect (tiled).
-//   floating    -- user-positioned, not in the tile flow. Rect is the
-//                  WM's per-window floatingRect store; the layout plugin
-//                  is not asked about this window.
-//   maximized   -- full tileRegion (output minus reserved zones).
-//   fullscreen  -- full output (ignores reserved zones).
-//   minimized   -- not drawn this frame.
-export type Presentation = "managed" | "floating" | "maximized" | "fullscreen" | "minimized";
+// Per-window behavioral state. Three orthogonal compositor-decided axes
+// plus a stash of client wishes:
+//   - `tiling`     -- which lane the window lives in within the layout
+//                     partition (managed = tile-flow; floating = free).
+//   - `exclusive`  -- does this window own the workspace by itself
+//                     (maximized = tileRegion; fullscreen = full output).
+//   - `visible`    -- whether the window is drawn at all (false ≡ minimized).
+//   - `layoutMode` / `layoutData` -- open vocabulary owned by the active
+//                                    layout plugin; opaque to core.
+//   - `constraints` + `parent` -- protocol-defined fields from
+//                                 xdg_toplevel.set_min_size / set_max_size
+//                                 / set_parent.
+//   - `clientRequests` -- the client's STATED WISHES, set synchronously by
+//                         xdg_toplevel.set_*. The compositor's policy seam
+//                         (window.preconfigure for pre-content, and the
+//                         resolveDecisions step on later proposals) reads
+//                         these and decides whether to honor them on the
+//                         three decision axes above. The renderer + the
+//                         configure-states encoder NEVER read these.
+export type Tiling = "managed" | "floating";
+export type Exclusive = "none" | "maximized" | "fullscreen";
+
+export type ClientRequests = {
+  wantsMaximized: boolean;
+  wantsFullscreen: boolean;
+  wantsMinimized: boolean;
+};
 
 export type WindowState = {
-  presentation: Presentation;
+  // Compositor decisions (what to render; what to send in configure):
+  tiling: Tiling;
+  exclusive: Exclusive;
+  visible: boolean;
+  // Client wishes (read by the policy seam; not by the renderer):
+  clientRequests: ClientRequests;
   layoutMode: string | null;
   layoutData: unknown;
   constraints: {
@@ -159,10 +172,10 @@ export type WindowState = {
     maxSize: { width: number; height: number } | null;
   };
   parent: number | null;
-  // The rect to restore to when leaving maximized/fullscreen back to
-  // 'managed'. Captured at the propose() that transitions OUT of 'managed'
-  // and consumed at the propose() that transitions back in. null until
-  // the first such transition.
+  // The rect to restore to when leaving exclusive (maximized/fullscreen)
+  // back to non-exclusive. Captured at the propose() that transitions
+  // INTO exclusive and consumed at the propose() that transitions back
+  // out. null until the first such transition.
   restoreRect: { x: number; y: number; width: number; height: number } | null;
 };
 

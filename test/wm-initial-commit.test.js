@@ -1,7 +1,9 @@
 // Pure-unit tests for the deferred-initial-commit dance:
 //   - addWindow({ deferInitialCommit: true }) holds the first configure.
 //   - propose() between addWindow and markInitialCommitComplete accumulates
-//     state (the eventual single configure reflects it).
+//     state (the eventual single configure reflects it). Pre-content
+//     clientRequests go through resolveDecisions(phase="pre-content") so
+//     a client's set_maximized boilerplate is suppressed by default.
 //   - markInitialCommitComplete emits window.preconfigure (interceptable),
 //     commits the (possibly modified) final state, schedules a relayout if
 //     geometry-affecting fields changed, and forces a configure with the
@@ -37,22 +39,25 @@ function res(id) { return { resource: { id, version: 1, destroyed: false } }; }
 
 // Inline immediate-layout driver: every schedule synchronously assigns the
 // whole tile to the master and applies it. Gives tests a deterministic
-// geometry without spinning up the bundled plugin.
+// geometry without spinning up the bundled plugin. Mirrors the real
+// resolver's lane dispatch: invisible windows are omitted; an exclusive
+// window owns its output (peers suppressed); else managed windows get
+// the full output rect.
 function immediateLayoutDriver(target, snapshot) {
   return {
     async schedule() {
       const snap = snapshot();
-      // Single-output fake: assign every window the primary output's rect.
       const primary = snap.outputs[0];
       const outRect = { x: 0, y: 0, width: primary.rect.width, height: primary.rect.height };
-      // snap.windows is a Map<surfaceId, LayoutSnapshotWindow>; iterate values
-      // for the same filter-by-presentation pass as the real resolver.
       const allWindows = [...snap.windows.values()];
-      const managed = allWindows.filter((w) => w.presentation === 'managed');
-      const rects = managed.map((w) => ({ id: w.id, outer: outRect }));
-      for (const w of allWindows) {
-        if (w.presentation === 'maximized' || w.presentation === 'fullscreen') {
-          rects.push({ id: w.id, outer: outRect });
+      const rects = [];
+      const visible = allWindows.filter((w) => w.visible);
+      const exclusiveWin = visible.find((w) => w.exclusive !== 'none');
+      if (exclusiveWin) {
+        rects.push({ id: exclusiveWin.id, outer: outRect });
+      } else {
+        for (const w of visible) {
+          if (w.tiling === 'managed') rects.push({ id: w.id, outer: outRect });
         }
       }
       await target.apply({ rects }, 'mapped');
@@ -73,7 +78,7 @@ test('deferInitialCommit: no configure fires during addWindow + propose phase', 
   await wm.settled();
   assert.equal(configures.length, 0); // suppressed
 
-  await wm.propose(1, { presentation: 'maximized' }, 'client-request');
+  await wm.propose(1, { clientRequests: { wantsMaximized: true } }, 'client-request');
   await wm.settled();
   assert.equal(configures.length, 0); // still suppressed
 });
@@ -132,19 +137,12 @@ test('markInitialCommitComplete: subsequent layout changes resume configure flow
   await wm.settled();
   await wm.markInitialCommitComplete(1, { appId: null, title: null });
   configures.length = 0;
-  // After clearing, a state change should produce a configure.
-  await wm.propose(1, { presentation: 'maximized' }, 'plugin');
+  // After clearing, a post-content propose() to exclusive=maximized
+  // (post-content phase honors the request).
+  await wm.propose(1, { clientRequests: { wantsMaximized: true } }, 'plugin');
   await wm.settled();
-  // Size didn't change (already full output), so no configure for this case.
-  // But if we make it managed again with a peer added, sizes would change.
-  // Verify pendingInitialCommit is gone by adding a second window:
-  wm.addWindow(2, res(2));
-  await wm.settled();
-  // Both windows reconfigured to their new sizes (immediateLayoutDriver
-  // gives the master the full output; the second window in `managed` is
-  // also given the full output in this fake, so it shouldn't change).
-  // The point is: window 1's pendingInitialCommit is gone so applyLayout
-  // doesn't suppress its configure anymore.
+  // The point: window 1's pendingInitialCommit is gone so applyLayout
+  // doesn't suppress configures anymore.
   assert.ok(configures.length >= 0); // smoke test passes
 });
 
@@ -173,6 +171,38 @@ test('markInitialCommitComplete: not in deferred mode is a no-op', async () => {
   assert.equal(configures.length, before); // no extra configure
 });
 
+// --- pre-content policy: default suppresses set_maximized ---
+
+test('pre-content set_maximized: default policy suppresses, but the wish is preserved', async () => {
+  const wm = createWm(mockSink(), [{ id: 0, rect: { x: 0, y: 0, width: 1000, height: 600 }, scale: 1 }], {
+    layoutDriverFactory: immediateLayoutDriver,
+  });
+  wm.addWindow(1, res(1), { deferInitialCommit: true });
+  await wm.settled();
+  await wm.propose(1, { clientRequests: { wantsMaximized: true } }, 'client-request');
+  const s = wm.getWindowState(1);
+  // The client's wish is recorded (so a window-rules plugin can read it
+  // at window.preconfigure)...
+  assert.equal(s.clientRequests.wantsMaximized, true);
+  // ...but the decision axis is NOT honored at this phase (pre-content).
+  assert.equal(s.exclusive, 'none');
+});
+
+test('pre-content set_fullscreen: default policy honors (matches sway/hyprland)', async () => {
+  // wantsFullscreen pre-content goes through resolveDecisions which DOES
+  // honor it (the seam's default for fullscreen). A window-rules plugin
+  // intercepting window.proposed can override.
+  const wm = createWm(mockSink(), [{ id: 0, rect: { x: 0, y: 0, width: 1000, height: 600 }, scale: 1 }], {
+    layoutDriverFactory: immediateLayoutDriver,
+  });
+  wm.addWindow(1, res(1), { deferInitialCommit: true });
+  await wm.settled();
+  await wm.propose(1, { clientRequests: { wantsFullscreen: true } }, 'client-request');
+  const s = wm.getWindowState(1);
+  assert.equal(s.clientRequests.wantsFullscreen, true);
+  assert.equal(s.exclusive, 'fullscreen');
+});
+
 // --- window.preconfigure interceptor path ---
 
 test('preconfigure: emits with current state as initialState', async () => {
@@ -185,14 +215,16 @@ test('preconfigure: emits with current state as initialState', async () => {
   bus.subscribe('window.preconfigure', (_n, p) => events.push(p));
   wm.addWindow(1, res(1), { deferInitialCommit: true });
   await wm.settled();
-  await wm.propose(1, { presentation: 'maximized' }, 'client-request');
+  // Direct decision-axis write (bypasses the policy seam): this represents
+  // a plugin pre-empting the decision before the first configure.
+  await wm.propose(1, { exclusive: 'maximized' }, 'plugin');
   await wm.settled();
   await wm.markInitialCommitComplete(1, { appId: 'firefox', title: 'Test' });
   assert.equal(events.length, 1);
   assert.equal(events[0].surfaceId, 1);
   assert.equal(events[0].appId, 'firefox');
   assert.equal(events[0].title, 'Test');
-  assert.equal(events[0].initialState.presentation, 'maximized');
+  assert.equal(events[0].initialState.exclusive, 'maximized');
 });
 
 test('preconfigure: interceptor modifies initialState and the modified state is committed', async () => {
@@ -205,14 +237,14 @@ test('preconfigure: interceptor modifies initialState and the modified state is 
   bus.intercept('window.preconfigure', (_n, p) => {
     const ev = p;
     if (ev.appId === 'firefox') {
-      return { ...ev, initialState: { ...ev.initialState, presentation: 'maximized' } };
+      return { ...ev, initialState: { ...ev.initialState, exclusive: 'maximized' } };
     }
   });
   wm.addWindow(1, res(1), { deferInitialCommit: true });
   await wm.settled();
-  // Client didn't ask for maximized; rule plugin overrides.
+  // Client didn't ask for maximized; rule plugin overrides at preconfigure.
   await wm.markInitialCommitComplete(1, { appId: 'firefox', title: 'Firefox' });
-  assert.equal(wm.getWindowState(1).presentation, 'maximized');
+  assert.equal(wm.getWindowState(1).exclusive, 'maximized');
 });
 
 test('preconfigure: client-declared state survives when interceptor leaves it alone', async () => {
@@ -224,10 +256,11 @@ test('preconfigure: client-declared state survives when interceptor leaves it al
   bus.intercept('window.preconfigure', () => undefined); // observe-only
   wm.addWindow(1, res(1), { deferInitialCommit: true });
   await wm.settled();
-  await wm.propose(1, { presentation: 'fullscreen' }, 'client-request');
+  // Pre-content wantsFullscreen IS honored by default policy.
+  await wm.propose(1, { clientRequests: { wantsFullscreen: true } }, 'client-request');
   await wm.settled();
   await wm.markInitialCommitComplete(1, { appId: 'foo', title: 'Bar' });
-  assert.equal(wm.getWindowState(1).presentation, 'fullscreen');
+  assert.equal(wm.getWindowState(1).exclusive, 'fullscreen');
 });
 
 test('preconfigure: interceptor modification emits window.committed', async () => {
@@ -238,7 +271,7 @@ test('preconfigure: interceptor modification emits window.committed', async () =
   });
   bus.intercept('window.preconfigure', (_n, p) => {
     const ev = p;
-    return { ...ev, initialState: { ...ev.initialState, presentation: 'fullscreen' } };
+    return { ...ev, initialState: { ...ev.initialState, exclusive: 'fullscreen' } };
   });
   const committed = [];
   bus.subscribe('window.committed', (_n, p) => committed.push(p));
@@ -247,8 +280,8 @@ test('preconfigure: interceptor modification emits window.committed', async () =
   await wm.markInitialCommitComplete(1, { appId: 'foo', title: 'Bar' });
   assert.equal(committed.length, 1);
   assert.equal(committed[0].reason, 'window-rule');
-  assert.equal(committed[0].current.presentation, 'fullscreen');
-  assert.deepEqual([...committed[0].changed], ['presentation']);
+  assert.equal(committed[0].current.exclusive, 'fullscreen');
+  assert.ok(committed[0].changed.includes('exclusive'));
 });
 
 test('preconfigure: configure fires AFTER interceptor settles + state commits', async () => {

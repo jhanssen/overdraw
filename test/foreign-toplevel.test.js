@@ -101,7 +101,11 @@ function mockCtx() {
       propose(id, partial, reason) {
         propose.push({ id, partial, reason });
         // Merge into the recorded state so the test can observe the result.
-        const cur = state._wmStates.get(id) ?? { presentation: "managed", parent: null };
+        const cur = state._wmStates.get(id) ?? {
+          tiling: "managed", exclusive: "none", visible: true,
+          clientRequests: { wantsMaximized: false, wantsFullscreen: false, wantsMinimized: false },
+          parent: null,
+        };
         const next = { ...cur, ...partial };
         state._wmStates.set(id, next);
         return Promise.resolve(next);
@@ -290,9 +294,18 @@ test("window.change(activated): handle re-emits state + done", () => {
   assert.deepEqual(stateEv.state, [STATE.activated]);
 });
 
-// ---- window.committed (presentation / parent) ---------------------------
+// ---- window.committed (tiling/exclusive/visible / parent) ---------------
 
-test("window.committed(presentation maximized): handle emits state + done", () => {
+function ws(over = {}) {
+  return {
+    tiling: "managed", exclusive: "none", visible: true,
+    clientRequests: { wantsMaximized: false, wantsFullscreen: false, wantsMinimized: false },
+    parent: null,
+    ...over,
+  };
+}
+
+test("window.committed(exclusive maximized): handle emits state + done", () => {
   const ctx = mockCtx();
   recordToplevel(ctx, 200, { title: "T", appId: "a" });
   const mgr = makeManager(ctx);
@@ -306,8 +319,8 @@ test("window.committed(presentation maximized): handle emits state + done", () =
 
   ctx.state.pluginBus.emit("window.committed", {
     surfaceId: 200,
-    previous: { presentation: "managed", parent: null },
-    current: { presentation: "maximized", parent: null },
+    previous: ws(),
+    current: ws({ exclusive: "maximized" }),
   });
 
   const stateEv = ctx.state._sent.find(([k]) => k === "state");
@@ -336,8 +349,8 @@ test("window.committed(parent change): handle emits parent + done", () => {
 
   ctx.state.pluginBus.emit("window.committed", {
     surfaceId: 200,
-    previous: { presentation: "managed", parent: null },
-    current: { presentation: "managed", parent: 201 },
+    previous: ws(),
+    current: ws({ parent: 201 }),
   });
 
   const parentEv = ctx.state._sent.find(([k]) => k === "parent");
@@ -349,7 +362,7 @@ test("window.committed(parent change): handle emits parent + done", () => {
 
 // ---- inbound state requests --------------------------------------------
 
-test("set_maximized: routes through wm.propose with presentation 'maximized'", () => {
+test("set_maximized: routes through wm.propose with clientRequests.wantsMaximized=true", () => {
   const ctx = mockCtx();
   recordToplevel(ctx, 200, { title: "T", appId: "a" });
   const mgr = makeManager(ctx);
@@ -366,10 +379,10 @@ test("set_maximized: routes through wm.propose with presentation 'maximized'", (
   handle.set_maximized(handleResource);
   assert.equal(ctx.state._propose.length, 1);
   assert.deepEqual(ctx.state._propose[0],
-    { id: 200, partial: { presentation: "maximized" }, reason: "plugin" });
+    { id: 200, partial: { clientRequests: { wantsMaximized: true } }, reason: "plugin" });
 });
 
-test("unset_maximized routes to presentation 'managed'", () => {
+test("unset_maximized routes to clientRequests.wantsMaximized=false", () => {
   const ctx = mockCtx();
   recordToplevel(ctx, 200);
   const mgr = makeManager(ctx);
@@ -382,7 +395,8 @@ test("unset_maximized routes to presentation 'managed'", () => {
   });
   const h = ctx.state._sent.find(([k]) => k === "toplevel")[1].handle;
   handle.unset_maximized(h);
-  assert.equal(ctx.state._propose.at(-1).partial.presentation, "managed");
+  assert.deepEqual(ctx.state._propose.at(-1).partial,
+    { clientRequests: { wantsMaximized: false } });
 });
 
 test("set_fullscreen / unset_fullscreen / set_minimized / unset_minimized all route through propose", () => {
@@ -403,8 +417,12 @@ test("set_fullscreen / unset_fullscreen / set_minimized / unset_minimized all ro
   handle.unset_fullscreen(h);
   handle.set_minimized(h);
   handle.unset_minimized(h);
-  assert.deepEqual(ctx.state._propose.map((p) => p.partial.presentation),
-    ["fullscreen", "managed", "minimized", "managed"]);
+  assert.deepEqual(ctx.state._propose.map((p) => p.partial), [
+    { clientRequests: { wantsFullscreen: true } },
+    { clientRequests: { wantsFullscreen: false } },
+    { clientRequests: { wantsMinimized: true } },
+    { clientRequests: { wantsMinimized: false } },
+  ]);
 });
 
 test("activate: calls seat.applyKeyboardFocus(surfaceId), bypassing the focus driver", () => {

@@ -1,10 +1,12 @@
 // Unit tests for the xdg_toplevel state request wiring:
-//   - set_maximized / unset_maximized -> propose presentation
-//   - set_fullscreen / unset_fullscreen -> propose presentation
-//   - set_minimized -> propose presentation
+//   - set_maximized / unset_maximized -> propose clientRequests.wantsMaximized
+//   - set_fullscreen / unset_fullscreen -> propose clientRequests.wantsFullscreen
+//   - set_minimized -> propose clientRequests.wantsMinimized
 //   - set_min_size / set_max_size -> propose constraints (0,0 = null)
 //   - set_parent -> propose parent
 // The tests drive the protocol handler directly (no real wayland server).
+// The default policy in resolveDecisions (post-content) honors a client's
+// maximize/fullscreen wish, so the decision axis follows the request.
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
@@ -44,50 +46,60 @@ function addToplevel(setup, id) {
   return resource;
 }
 
-// --- presentation requests ---
+// --- state requests ---
 
-test('set_maximized: proposes presentation=maximized', async () => {
+test('set_maximized: post-content default policy honors -> exclusive=maximized', async () => {
   const setup = setupToplevelHandler();
   const r = addToplevel(setup, 1);
   setup.handler.set_maximized(r);
   await new Promise((resolve) => setImmediate(resolve));
-  assert.equal(setup.wm.getWindowState(1).presentation, 'maximized');
+  const s = setup.wm.getWindowState(1);
+  assert.equal(s.clientRequests.wantsMaximized, true);
+  assert.equal(s.exclusive, 'maximized');
 });
 
-test('unset_maximized: proposes presentation=managed', async () => {
+test('unset_maximized: clears wantsMaximized and reverts exclusive to none', async () => {
   const setup = setupToplevelHandler();
   const r = addToplevel(setup, 1);
   setup.handler.set_maximized(r);
   await new Promise((resolve) => setImmediate(resolve));
   setup.handler.unset_maximized(r);
   await new Promise((resolve) => setImmediate(resolve));
-  assert.equal(setup.wm.getWindowState(1).presentation, 'managed');
+  const s = setup.wm.getWindowState(1);
+  assert.equal(s.clientRequests.wantsMaximized, false);
+  assert.equal(s.exclusive, 'none');
 });
 
-test('set_fullscreen: proposes presentation=fullscreen', async () => {
+test('set_fullscreen: post-content default policy honors -> exclusive=fullscreen', async () => {
   const setup = setupToplevelHandler();
   const r = addToplevel(setup, 1);
   setup.handler.set_fullscreen(r, null);
   await new Promise((resolve) => setImmediate(resolve));
-  assert.equal(setup.wm.getWindowState(1).presentation, 'fullscreen');
+  const s = setup.wm.getWindowState(1);
+  assert.equal(s.clientRequests.wantsFullscreen, true);
+  assert.equal(s.exclusive, 'fullscreen');
 });
 
-test('unset_fullscreen: proposes presentation=managed', async () => {
+test('unset_fullscreen: clears wantsFullscreen and reverts exclusive to none', async () => {
   const setup = setupToplevelHandler();
   const r = addToplevel(setup, 1);
   setup.handler.set_fullscreen(r, null);
   await new Promise((resolve) => setImmediate(resolve));
   setup.handler.unset_fullscreen(r);
   await new Promise((resolve) => setImmediate(resolve));
-  assert.equal(setup.wm.getWindowState(1).presentation, 'managed');
+  const s = setup.wm.getWindowState(1);
+  assert.equal(s.clientRequests.wantsFullscreen, false);
+  assert.equal(s.exclusive, 'none');
 });
 
-test('set_minimized: proposes presentation=minimized', async () => {
+test('set_minimized: post-content default policy honors -> visible=false', async () => {
   const setup = setupToplevelHandler();
   const r = addToplevel(setup, 1);
   setup.handler.set_minimized(r);
   await new Promise((resolve) => setImmediate(resolve));
-  assert.equal(setup.wm.getWindowState(1).presentation, 'minimized');
+  const s = setup.wm.getWindowState(1);
+  assert.equal(s.clientRequests.wantsMinimized, true);
+  assert.equal(s.visible, false);
 });
 
 // --- size constraints ---
@@ -174,6 +186,7 @@ test('multiple state requests accumulate; getWindowState reflects final state', 
   setup.handler.set_maximized(r);
   await new Promise((resolve) => setImmediate(resolve));
   const s = setup.wm.getWindowState(1);
-  assert.equal(s.presentation, 'maximized');
+  assert.equal(s.exclusive, 'maximized');
+  assert.equal(s.clientRequests.wantsMaximized, true);
   assert.deepEqual(s.constraints.minSize, { width: 400, height: 300 });
 });

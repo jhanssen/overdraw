@@ -84,10 +84,12 @@ export default function makeToplevel(ctx: Ctx): XdgToplevelHandler {
     const startRect = ctx.state.wm.outerRectOf(id);
     if (!startRect) return;
 
-    // Transition to floating if needed.
+    // Transition to the floating lane if needed. Interactive
+    // move/resize is a compositor decision (user-input), not a client
+    // request, so it writes `tiling` directly.
     const ws = ctx.state.wm.getWindowState(id);
-    if (ws && ws.presentation !== "floating") {
-      await ctx.state.wm.propose(id, { presentation: "floating" }, "client-request");
+    if (ws && ws.tiling !== "floating") {
+      await ctx.state.wm.propose(id, { tiling: "floating" }, "user-input");
     }
     if (!ctx.state.seat) return;
     const pos = ctx.state.seat.pointerPosition();
@@ -155,45 +157,34 @@ export default function makeToplevel(ctx: Ctx): XdgToplevelHandler {
       propose(resource, { constraints: { minSize } });
     },
     set_maximized(resource) {
-      propose(resource, { presentation: "maximized" });
+      // The client wishes to be maximized. The decision (whether to
+      // honor) is made by the policy seam in wm.propose -- pre-content
+      // requests are suppressed by default; post-content requests are
+      // honored by default. A window-rules plugin may override either
+      // way via window.proposed / window.preconfigure.
+      propose(resource, { clientRequests: { wantsMaximized: true } });
     },
     unset_maximized(resource) {
       // Spec: "after this request, the compositor will respond by
       // emitting a configure event without the maximized state."
-      // Revert only when the window IS currently maximized; for any
-      // other presentation this is a no-op. Without the guard,
-      // floating windows that send unset_maximized (defensively, in
-      // their drag-to-move path) get yanked into the managed/tiled
-      // stack and end up resized to the master-stack slot.
-      const id = surfaceIdOf(resource);
-      if (id === null) return;
-      const ws = ctx.state.wm?.getWindowState(id);
-      if (ws?.presentation === "maximized") {
-        propose(resource, { presentation: "managed" });
-      }
+      // Clearing the wish lets resolveDecisions revert exclusive to
+      // "none" only when the WM is currently in exclusive=maximized
+      // (so a floating window prophylactically sending unset_maximized
+      // doesn't leak into the tiling lane).
+      propose(resource, { clientRequests: { wantsMaximized: false } });
     },
     set_fullscreen(resource, _output) {
       // `_output` is optional: when present, the client requests fullscreen
       // on a specific output. Multi-output is not yet supported (wl_output
       // is fabricated); ignore the hint and fullscreen on the single
       // output.
-      propose(resource, { presentation: "fullscreen" });
+      propose(resource, { clientRequests: { wantsFullscreen: true } });
     },
     unset_fullscreen(resource) {
-      // Same no-op-when-not-currently-applied guard as unset_maximized:
-      // GTK4 sends unset_fullscreen prophylactically before
-      // xdg_toplevel.move on a window that was never fullscreen, and
-      // unconditional revert-to-managed would tile the (then-floating)
-      // dialog into the master-stack mid-drag.
-      const id = surfaceIdOf(resource);
-      if (id === null) return;
-      const ws = ctx.state.wm?.getWindowState(id);
-      if (ws?.presentation === "fullscreen") {
-        propose(resource, { presentation: "managed" });
-      }
+      propose(resource, { clientRequests: { wantsFullscreen: false } });
     },
     set_minimized(resource) {
-      propose(resource, { presentation: "minimized" });
+      propose(resource, { clientRequests: { wantsMinimized: true } });
     },
     destroy(resource) {
       // Tear down the WM + compositor + bus state attached to this

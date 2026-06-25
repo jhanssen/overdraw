@@ -70,13 +70,13 @@ test('move: calls seat.beginGrab with kind=move and endOnButtonUp=true', async (
   assert.deepEqual(s.grabCalls[0].startRect, { x: 0, y: 0, width: -1, height: -1 });
 });
 
-test('move: transitions the window to floating presentation', async () => {
+test('move: transitions the window into the floating tiling lane', async () => {
   const s = setupToplevelHandler();
   const r = addToplevel(s, 1);
   s.handler.move(r, null, 99);
   await new Promise((resolve) => setImmediate(resolve));
   await new Promise((resolve) => setImmediate(resolve));
-  assert.equal(s.wm.getWindowState(1).presentation, 'floating');
+  assert.equal(s.wm.getWindowState(1).tiling, 'floating');
 });
 
 test('move: stale serial is dropped', async () => {

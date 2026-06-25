@@ -5,19 +5,21 @@
 // Responsibilities:
 //   - Coalesce relayout requests (at most one compute() in flight; subsequent
 //     invalidations queue and replace).
-//   - Resolve mode-specific rects in core: presentation === 'maximized' /
-//     'fullscreen' / 'minimized' are dispatched by the driver without
-//     calling the plugin.
-//   - Build LayoutInputs from the WM's `managed` windows + the tile region
-//     (output minus reserved zones), invoke compute() on the active layout
-//     plugin.
-//   - Merge the plugin's result with the driver-resolved rects + hidden
-//     list and hand the unified LayoutResult to the WM for apply.
+//   - Resolve non-managed lanes in core: a window with exclusive !== "none"
+//     covers the workspace (tileRegion for maximized, full output for
+//     fullscreen) and suppresses peers; an invisible (visible === false)
+//     window is omitted from the result; a floating (tiling === "floating")
+//     window uses its stored floatingRect.
+//   - Build LayoutInputs from the WM's `managed`, non-exclusive, visible
+//     windows + the tile region (output minus reserved zones), invoke
+//     compute() on the active layout plugin.
+//   - Merge the plugin's result with the driver-resolved rects and hand
+//     the unified LayoutResult to the WM for apply.
 //
 // On compute failure (plugin throws, no plugin registered after timeout,
 // permanent restart-budget exhaustion), the driver logs and leaves
-// managed-window geometry untouched. Non-managed rects (maximize /
-// fullscreen) still apply since the resolver computed them.
+// managed-window geometry untouched. Non-managed rects (exclusive,
+// floating) still apply since the resolver computed them.
 //
 // The plugin contract is async. Tests inject a synchronous fake driver to
 // stay deterministic without spinning up a worker.
@@ -29,7 +31,7 @@ import type {
   LayoutReason,
   Rect,
 } from "@overdraw/layout-types";
-import type { Presentation } from "../events/types.js";
+import type { Tiling, Exclusive } from "../events/types.js";
 import type { ReservedZoneRegistry } from "./reserved-zones.js";
 import { log as coreLog } from "../log.js";
 
@@ -56,14 +58,16 @@ export interface LayoutSnapshot {
 }
 
 // The driver's view of a window. Carries everything needed to either pass
-// to the layout plugin (for managed) or resolve internally (for other
-// presentations).
+// to the layout plugin (for managed/non-exclusive/visible) or resolve
+// internally (for other lanes).
 export interface LayoutSnapshotWindow extends LayoutWindow {
-  presentation: Presentation;
+  tiling: Tiling;
+  exclusive: Exclusive;
+  visible: boolean;
   // The rect to place a floating window at. Used only when
-  // presentation === 'floating'. Absent for other modes.
+  // tiling === "floating". Absent otherwise.
   floatingRect?: Rect;
-  // For windows transitioning out of maximize/fullscreen back to managed.
+  // For windows transitioning out of exclusive back to non-exclusive.
   restoreRect?: Rect;
 }
 
@@ -115,7 +119,6 @@ export function createLayoutDriver(deps: LayoutDriverDeps): LayoutDriver {
       // Accumulate the merged result across every output's pass; one final
       // apply() at the end so the WM sees a single transactional update.
       const mergedRects: Array<{ id: number; outer: Rect }> = [];
-      const mergedHidden: number[] = [];
       let anyComputeFailed = false;
 
       for (const o of snap.outputs) {
@@ -125,7 +128,6 @@ export function createLayoutDriver(deps: LayoutDriverDeps): LayoutDriver {
           : outputRect;
 
         const resolvedRects: Array<{ id: number; outer: Rect }> = [];
-        const hidden: number[] = [];
         const managed: LayoutWindow[] = [];
         // The visible window order on this output comes from the workspace
         // plugin's outputContent map. An absent entry means "no workspace
@@ -137,40 +139,52 @@ export function createLayoutDriver(deps: LayoutDriverDeps): LayoutDriver {
           if (w) bucket.push(w);
         }
 
+        // First pass: find an exclusive (maximized or fullscreen) window.
+        // If one exists and is visible, it owns the workspace and every
+        // peer (except a fullscreen-on-top floating, which is also owned
+        // out of the way) is suppressed from this frame.
+        let exclusiveWin: LayoutSnapshotWindow | null = null;
         for (const w of bucket) {
-          switch (w.presentation) {
-            case "maximized":
-              resolvedRects.push({ id: w.id, outer: tileRegion });
-              break;
-            case "fullscreen":
-              resolvedRects.push({ id: w.id, outer: outputRect });
-              break;
-            case "minimized":
-              hidden.push(w.id);
-              break;
-            case "floating":
-              // Floating windows keep their stored rect. Fall back to the
-              // window's currentRect if none was captured, then to the
-              // output rect so the window never vanishes.
-              resolvedRects.push({
-                id: w.id,
-                outer: w.floatingRect ?? w.currentRect ?? outputRect,
-              });
-              break;
-            case "managed":
-            default:
-              managed.push({
-                id: w.id,
-                appId: w.appId,
-                title: w.title,
-                role: w.role,
-                layoutMode: w.layoutMode,
-                layoutData: w.layoutData,
-                constraints: w.constraints,
-                currentRect: w.currentRect,
-              });
-              break;
+          if (!w.visible) continue;
+          if (w.exclusive !== "none") { exclusiveWin = w; break; }
+        }
+
+        if (exclusiveWin !== null) {
+          const outer = exclusiveWin.exclusive === "fullscreen" ? outputRect : tileRegion;
+          resolvedRects.push({ id: exclusiveWin.id, outer });
+          for (const r of resolvedRects) mergedRects.push(r);
+          continue;
+        }
+
+        for (const w of bucket) {
+          // Invisible windows (visible === false) are simply omitted from
+          // the result. The WM's applyLayout iterates only the windows in
+          // result.rects, so an omitted window keeps its current rect and
+          // the compositor's setStack (driven by outputToplevelStacks
+          // filtered by visibility in the workspace plugin) ensures it is
+          // not drawn.
+          if (!w.visible) continue;
+          if (w.tiling === "floating") {
+            // Floating windows keep their stored rect. Fall back to the
+            // window's currentRect if none was captured, then to the
+            // output rect so the window never vanishes.
+            resolvedRects.push({
+              id: w.id,
+              outer: w.floatingRect ?? w.currentRect ?? outputRect,
+            });
+            continue;
           }
+          // Managed lane: hand to the plugin.
+          managed.push({
+            id: w.id,
+            appId: w.appId,
+            title: w.title,
+            role: w.role,
+            layoutMode: w.layoutMode,
+            layoutData: w.layoutData,
+            constraints: w.constraints,
+            currentRect: w.currentRect,
+          });
         }
 
         let pluginResult: LayoutResult = { rects: [] };
@@ -194,21 +208,16 @@ export function createLayoutDriver(deps: LayoutDriverDeps): LayoutDriver {
 
         for (const r of pluginResult.rects) mergedRects.push(r);
         for (const r of resolvedRects) mergedRects.push(r);
-        for (const h of hidden) mergedHidden.push(h);
-        if (pluginResult.hidden) for (const h of pluginResult.hidden) mergedHidden.push(h);
       }
 
       // Match the pre-multi-output behavior: if EVERY managed pass failed and
       // nothing was resolved either, suppress apply() rather than push an
       // empty result. Otherwise apply -- partial-success is preferable to
       // letting one output's plugin failure freeze every other output.
-      if (anyComputeFailed && mergedRects.length === 0 && mergedHidden.length === 0) {
+      if (anyComputeFailed && mergedRects.length === 0) {
         return;
       }
-      const merged: LayoutResult = {
-        rects: mergedRects,
-        ...(mergedHidden.length > 0 ? { hidden: mergedHidden } : {}),
-      };
+      const merged: LayoutResult = { rects: mergedRects };
       await deps.target.apply(merged, reason);
     } catch (e: unknown) {
       const msg = e instanceof Error ? e.message : String(e);

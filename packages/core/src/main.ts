@@ -966,8 +966,8 @@ pluginBus.subscribe("window.grab-requested", async (_n, payload) => {
   if (!startOuter) return;
 
   const ws = state.wm.getWindowState(surfaceId);
-  if (ws && ws.presentation !== "floating") {
-    await state.wm.propose(surfaceId, { presentation: "floating" }, "user-input");
+  if (ws && ws.tiling !== "floating") {
+    await state.wm.propose(surfaceId, { tiling: "floating" }, "user-input");
   }
 
   const pos = state.seat.pointerPosition();

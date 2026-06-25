@@ -37,11 +37,16 @@ function addMapped(wm, id) {
 
 // --- defaults -------------------------------------------------------------
 
-test('windowState: new window starts in managed mode with default fields', () => {
+test('windowState: new window starts with default fields', () => {
   const wm = createWm(mockSink(), [{ id: 0, rect: { x: 0, y: 0, width: 800, height: 600 }, scale: 1 }]);
   addMapped(wm, 1);
   const s = wm.getWindowState(1);
-  assert.equal(s.presentation, 'managed');
+  assert.equal(s.tiling, 'managed');
+  assert.equal(s.exclusive, 'none');
+  assert.equal(s.visible, true);
+  assert.deepEqual(s.clientRequests, {
+    wantsMaximized: false, wantsFullscreen: false, wantsMinimized: false,
+  });
   assert.equal(s.layoutMode, null);
   assert.equal(s.layoutData, undefined);
   assert.deepEqual(s.constraints, { minSize: null, maxSize: null });
@@ -56,17 +61,25 @@ test('getWindowState: unknown window returns null', () => {
 
 // --- propose: basic commits -----------------------------------------------
 
-test('propose: changes presentation and returns committed state', async () => {
+test('propose: writes exclusive directly and returns committed state', async () => {
   const wm = createWm(mockSink(), [{ id: 0, rect: { x: 0, y: 0, width: 800, height: 600 }, scale: 1 }]);
   addMapped(wm, 1);
-  const committed = await wm.propose(1, { presentation: 'maximized' }, 'client-request');
-  assert.equal(committed.presentation, 'maximized');
-  assert.equal(wm.getWindowState(1).presentation, 'maximized');
+  const committed = await wm.propose(1, { exclusive: 'maximized' }, 'client-request');
+  assert.equal(committed.exclusive, 'maximized');
+  assert.equal(wm.getWindowState(1).exclusive, 'maximized');
+});
+
+test('propose: client wantsMaximized post-content -> exclusive becomes maximized', async () => {
+  const wm = createWm(mockSink(), [{ id: 0, rect: { x: 0, y: 0, width: 800, height: 600 }, scale: 1 }]);
+  addMapped(wm, 1);
+  const r = await wm.propose(1, { clientRequests: { wantsMaximized: true } }, 'client-request');
+  assert.equal(r.exclusive, 'maximized');
+  assert.equal(r.clientRequests.wantsMaximized, true);
 });
 
 test('propose: unknown window returns null', async () => {
   const wm = createWm(mockSink(), [{ id: 0, rect: { x: 0, y: 0, width: 800, height: 600 }, scale: 1 }]);
-  const r = await wm.propose(999, { presentation: 'maximized' }, 'plugin');
+  const r = await wm.propose(999, { exclusive: 'maximized' }, 'plugin');
   assert.equal(r, null);
 });
 
@@ -74,7 +87,8 @@ test('propose: empty proposal returns current state unchanged', async () => {
   const wm = createWm(mockSink(), [{ id: 0, rect: { x: 0, y: 0, width: 800, height: 600 }, scale: 1 }]);
   addMapped(wm, 1);
   const r = await wm.propose(1, {}, 'plugin');
-  assert.equal(r.presentation, 'managed');
+  assert.equal(r.tiling, 'managed');
+  assert.equal(r.exclusive, 'none');
 });
 
 test('propose: identical proposal is a no-op (no committed event)', async () => {
@@ -83,7 +97,7 @@ test('propose: identical proposal is a no-op (no committed event)', async () => 
   addMapped(wm, 1);
   const events = [];
   bus.subscribe('window.committed', (_n, p) => { events.push(p); });
-  await wm.propose(1, { presentation: 'managed' }, 'plugin');
+  await wm.propose(1, { tiling: 'managed' }, 'plugin');
   assert.equal(events.length, 0);
 });
 
@@ -133,31 +147,32 @@ test('propose: emits window.proposed and window.committed (no interceptor)', asy
   const committed = [];
   bus.subscribe('window.proposed', (_n, p) => { proposed.push(p); });
   bus.subscribe('window.committed', (_n, p) => { committed.push(p); });
-  await wm.propose(1, { presentation: 'fullscreen' }, 'client-request');
+  await wm.propose(1, { exclusive: 'fullscreen' }, 'client-request');
   assert.equal(proposed.length, 1);
   assert.equal(proposed[0].surfaceId, 1);
   assert.equal(proposed[0].reason, 'client-request');
-  assert.equal(proposed[0].current.presentation, 'managed');
-  assert.equal(proposed[0].candidate.presentation, 'fullscreen');
+  assert.equal(proposed[0].current.exclusive, 'none');
+  assert.equal(proposed[0].candidate.exclusive, 'fullscreen');
   assert.equal(committed.length, 1);
-  assert.equal(committed[0].previous.presentation, 'managed');
-  assert.equal(committed[0].current.presentation, 'fullscreen');
-  assert.deepEqual([...committed[0].changed], ['presentation']);
+  assert.equal(committed[0].previous.exclusive, 'none');
+  assert.equal(committed[0].current.exclusive, 'fullscreen');
+  // The exclusive transition also captures restoreRect as a side effect.
+  assert.ok(committed[0].changed.includes('exclusive'));
 });
 
 test('propose: interceptor modifies candidate and the modified state is committed', async () => {
   const bus = createDynamicBus();
   const wm = createWm(mockSink(), [{ id: 0, rect: { x: 0, y: 0, width: 800, height: 600 }, scale: 1 }], { pluginBus: bus });
   addMapped(wm, 1);
-  // Coerce any 'fullscreen' proposal to 'maximized' instead.
+  // Coerce any 'fullscreen' candidate to 'maximized' instead.
   bus.intercept('window.proposed', (_n, p) => {
     const ev = p;
-    if (ev.candidate.presentation === 'fullscreen') {
-      return { ...ev, candidate: { ...ev.candidate, presentation: 'maximized' } };
+    if (ev.candidate.exclusive === 'fullscreen') {
+      return { ...ev, candidate: { ...ev.candidate, exclusive: 'maximized' } };
     }
   });
-  const r = await wm.propose(1, { presentation: 'fullscreen' }, 'client-request');
-  assert.equal(r.presentation, 'maximized');
+  const r = await wm.propose(1, { exclusive: 'fullscreen' }, 'client-request');
+  assert.equal(r.exclusive, 'maximized');
 });
 
 test('propose: interceptor reverting a field (modify-to-revert) is a veto', async () => {
@@ -166,15 +181,15 @@ test('propose: interceptor reverting a field (modify-to-revert) is a veto', asyn
   addMapped(wm, 1);
   bus.intercept('window.proposed', (_n, p) => {
     const ev = p;
-    // Revert presentation back to current = no change to that field.
-    return { ...ev, candidate: { ...ev.candidate, presentation: ev.current.presentation } };
+    // Revert exclusive back to current = no change to that field.
+    return { ...ev, candidate: { ...ev.candidate, exclusive: ev.current.exclusive } };
   });
   const committed = [];
   bus.subscribe('window.committed', (_n, p) => { committed.push(p); });
-  await wm.propose(1, { presentation: 'maximized' }, 'client-request');
+  await wm.propose(1, { exclusive: 'maximized' }, 'client-request');
   // The veto leaves the field unchanged -> no diff -> no commit event.
   assert.equal(committed.length, 0);
-  assert.equal(wm.getWindowState(1).presentation, 'managed');
+  assert.equal(wm.getWindowState(1).exclusive, 'none');
 });
 
 test('propose: interceptor returning garbage candidate is ignored (fallback)', async () => {
@@ -182,9 +197,9 @@ test('propose: interceptor returning garbage candidate is ignored (fallback)', a
   const wm = createWm(mockSink(), [{ id: 0, rect: { x: 0, y: 0, width: 800, height: 600 }, scale: 1 }], { pluginBus: bus });
   addMapped(wm, 1);
   bus.intercept('window.proposed', () => ({ candidate: 'not-a-state-object' }));
-  const r = await wm.propose(1, { presentation: 'maximized' }, 'plugin');
+  const r = await wm.propose(1, { exclusive: 'maximized' }, 'plugin');
   // Fallback: use the original (unmodified) candidate.
-  assert.equal(r.presentation, 'maximized');
+  assert.equal(r.exclusive, 'maximized');
 });
 
 test('propose: observe-only interceptor (undefined return) does not modify', async () => {
@@ -192,8 +207,8 @@ test('propose: observe-only interceptor (undefined return) does not modify', asy
   const wm = createWm(mockSink(), [{ id: 0, rect: { x: 0, y: 0, width: 800, height: 600 }, scale: 1 }], { pluginBus: bus });
   addMapped(wm, 1);
   bus.intercept('window.proposed', () => undefined);
-  const r = await wm.propose(1, { presentation: 'maximized' }, 'plugin');
-  assert.equal(r.presentation, 'maximized');
+  const r = await wm.propose(1, { exclusive: 'maximized' }, 'plugin');
+  assert.equal(r.exclusive, 'maximized');
 });
 
 // --- propose: scheduling --------------------------------------------------
@@ -211,7 +226,7 @@ test('propose: geometry-affecting field triggers layout pass', async () => {
   });
   addMapped(wm, 1);
   scheduled = [];   // ignore the schedule from addWindow
-  await wm.propose(1, { presentation: 'maximized' }, 'plugin');
+  await wm.propose(1, { exclusive: 'maximized' }, 'plugin');
   assert.deepEqual(scheduled, ['state-changed']);
 });
 
@@ -295,11 +310,11 @@ test('state-bag: getStateAll returns all entries; empty when none', () => {
 test('getSnapshot: includes windowState + state bag + geometry', async () => {
   const wm = createWm(mockSink(), [{ id: 0, rect: { x: 0, y: 0, width: 800, height: 600 }, scale: 1 }]);
   addMapped(wm, 1);
-  await wm.propose(1, { presentation: 'fullscreen', layoutMode: 'floating' }, 'plugin');
+  await wm.propose(1, { exclusive: 'fullscreen', layoutMode: 'floating' }, 'plugin');
   wm.setState(1, 'workspace.id', 5);
   const s = wm.getSnapshot(1);
   assert.equal(s.surfaceId, 1);
-  assert.equal(s.windowState.presentation, 'fullscreen');
+  assert.equal(s.windowState.exclusive, 'fullscreen');
   assert.equal(s.windowState.layoutMode, 'floating');
   assert.equal(s.state['workspace.id'], 5);
   assert.equal(s.hasContent, true);
@@ -334,6 +349,6 @@ test('snapshot: windowState is a deep copy (mutations do not affect WM)', () => 
   const wm = createWm(mockSink(), [{ id: 0, rect: { x: 0, y: 0, width: 800, height: 600 }, scale: 1 }]);
   addMapped(wm, 1);
   const s = wm.getSnapshot(1);
-  s.windowState.presentation = 'maximized';
-  assert.equal(wm.getWindowState(1).presentation, 'managed');
+  s.windowState.exclusive = 'maximized';
+  assert.equal(wm.getWindowState(1).exclusive, 'none');
 });

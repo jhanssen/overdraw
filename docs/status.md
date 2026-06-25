@@ -61,93 +61,39 @@ nothing, with no error. Worst-first.
   `set_parent` stored but does not drive stacking or modal behavior;
   reserved-zone exclusion applies to maximized/tiled but not floating.
 
-- **`WindowState.presentation` conflates three orthogonal axes and
-  conflates client requests with compositor decisions.** Today
-  `presentation` is a single enum value (`managed | floating |
-  maximized | fullscreen | minimized`) that's mutated directly by
-  client `xdg_toplevel.set_*` requests AND by the compositor's
-  layout/policy decisions; the encoder reads it both ways. Three
-  things are wrong:
+- **`WindowState` splits the three orthogonal axes and separates client
+  requests from compositor decisions.** `WindowState` carries three
+  decision fields the compositor owns -- `tiling` (`managed |
+  floating`), `exclusive` (`none | maximized | fullscreen`), `visible`
+  (boolean) -- plus a `clientRequests` sub-object (`wantsMaximized`,
+  `wantsFullscreen`, `wantsMinimized`) that records the client's stated
+  wishes. The renderer + the configure-states encoder read the decision
+  fields only; the policy seam reads `clientRequests`.
 
-  (1) The five values mix THREE independent axes. **Tiling**
-  (`managed | floating`) is which lane the window lives in when it's
-  participating in the layout partition. **Exclusive** (`none |
-  maximized | fullscreen`) is whether the window owns the workspace
-  by itself, covering work-area or full output. **Visibility**
-  (`visible | minimized`) is whether the window is rendered at all.
-  A window can legitimately be all three at once (a minimized
-  window that was maximized that lives in the floating lane;
-  unminimize restores all of it). The single-enum model can only
-  hold one of those at a time, so `unset_maximized` on a
-  maximized-floating window currently returns to `managed`
-  (forgetting the floating), `set_minimized` forgets whatever the
-  window was before, etc.
-
-  (2) Client requests and compositor decisions are stored in the
-  same field. There's no way to ask "what does the client want to
-  be?" separately from "what did the compositor decide it is."
-  Plugins that implement window-rules ("Firefox is always
-  maximized") have to fight the propose pipeline rather than
-  declaring a policy; the configure-states encoder sends whatever
-  the propose path most recently mutated rather than the
-  compositor's actual decision; a client's startup-boilerplate
-  set_maximized blots out the workspace because there's no seam
-  between "client asked" and "compositor agreed."
-
-  (3) The layout-driver emits `LayoutResult.hidden` (the contract
-  for "do not render this window this frame") but the WM apply
-  path ignores it. So even when the driver tries to hide tiled
-  peers behind a maximized window, the workspace plugin's
-  `outputToplevelStacks` still includes them and they render
-  underneath, producing the visible overlap (a maximized GTK app
-  drawn behind a later-mapped kitty terminal is the canonical
-  example).
-
-  The proper refactor splits storage into three explicit fields and
-  separates request-from-decision:
-
-  ```
-  WindowState {
-    // The compositor's decisions (what to render):
-    tiling:     "managed" | "floating"
-    exclusive:  "none" | "maximized" | "fullscreen"
-    visible:    boolean   // visible=false ≡ minimized
-    // The client's stated wishes (never read by the renderer):
-    clientRequests: {
-      wantsMaximized:  boolean
-      wantsFullscreen: boolean
-      wantsMinimized:  boolean
-    }
-  }
-  ```
-
-  - `xdg_toplevel.set_maximized` synchronously updates
-    `clientRequests.wantsMaximized = true`. It does NOT directly
-    touch `exclusive`.
-  - A policy seam (default + plugin-replaceable) reads
-    `clientRequests` at first-content (and on subsequent change)
-    and decides whether to honor: "should `exclusive` become
-    `maximized`?" The default for pre-content GTK boilerplate is
-    "no in a tiling workspace"; a window-rules plugin overrides
-    per-app.
-  - The configure-states encoder reads the compositor's decision
-    fields (`tiling`, `exclusive`, `visible`) and emits states
-    accordingly -- maximized/fullscreen/tiled-edges from the
-    decisions, never from the client's wishes. If the client asked
-    maximized but the compositor declined, the configure carries
-    no maximized state, matching the spec ("the compositor
+  - `xdg_toplevel.set_maximized` writes `clientRequests.wantsMaximized
+    = true`; it does NOT directly touch `exclusive`. Same for
+    set_fullscreen / set_minimized and their unset_ counterparts.
+    Interactive move/resize and plugin-driven layout decisions write
+    `tiling`/`exclusive`/`visible` directly.
+  - `resolveDecisions(prev, candidate, phase)` is the default policy.
+    Pre-content `wantsMaximized` is **suppressed by default** (the
+    GTK/Qt startup boilerplate case); pre-content `wantsFullscreen` is
+    honored (matches sway/hyprland for video apps); post-content
+    requests are honored on both axes. A window-rules plugin overrides
+    via `window.preconfigure` (for first-content) or `window.proposed`
+    (for later changes).
+  - The xdg_toplevel.configure encoder reads `tiling`/`exclusive`/
+    `visible` only. A client whose `wantsMaximized` was declined sees
+    a configure with no maximized state (spec-correct: "the compositor
     responds with a configure event without the maximized state").
-  - The layout-driver reads `exclusive` directly: if any window on
-    a workspace has `exclusive !== "none"`, lay out only that
-    window (at work-area or full output respectively); for
-    fullscreen, hide floating peers too. No `hidden[]` contract
-    needed -- the driver simply doesn't emit a rect for peers, and
-    the workspace plugin reads the driver's output set when
-    computing `outputToplevelStacks`.
-
-  Deferred as a focused refactor session (touches ~9 src + ~9 test
-  files for the storage split; the policy-seam + window-rules
-  plugin path is additional work on top of that)."
+  - The layout-driver reads `exclusive` and `visible` directly:
+    when any window on an output has `exclusive !== "none"`, only that
+    window is laid out (peers suppressed); invisible windows are
+    omitted from `rects[]` entirely. `LayoutResult.hidden` is gone.
+    `wm.applyLayout` already iterates only the ids in `rects[]`, so
+    omitted windows keep their geometry; `pushStack` filters by
+    `visible` and the per-output exclusive owner so invisible /
+    peer-suppressed windows are not in the draw stack.
 
 - **`wl_region` is implemented; only the opaque region is unconsumed.**
   `add`/`subtract` build a real disjoint rect list (`region.ts`) snapshotted
