@@ -25,7 +25,10 @@ import type {
 import type { PluginSdk } from "../../core/dist/plugins/sdk.js";
 import type { Surface } from "../../core/dist/plugins/gpu.js";
 
-import { validateConfig, type ResolvedConfig, type ResolvedFill } from "./config.js";
+import {
+  validateConfig, insetShape,
+  type ResolvedConfig, type ResolvedFill,
+} from "./config.js";
 import {
   createDecorationPipeline, createDecorationDraw, destroyDecorationDraw,
   writeUniforms, recordDraw,
@@ -60,7 +63,7 @@ export default async function init(sdk: PluginSdk, rawConfig?: unknown): Promise
 
   await decorationsSdk.register(config.appIdPattern, config.appIdFlags);
   sdk.log(`decoration-default: registered (pattern=${JSON.stringify(config.appIdPattern)}`
-    + `, border=${config.borderWidth}, radius=${config.borderRadius})`);
+    + `, border=${config.borderWidth}, shape=${JSON.stringify(config.outerShape)})`);
 
   decorationsSdk.onAssigned(async (ev: DecorationAssignedEvent) => {
     try { await onAssigned(ev); }
@@ -134,16 +137,17 @@ export default async function init(sdk: PluginSdk, rawConfig?: unknown): Promise
     const w: PerWindow = { surface, draw, focused: opts.initialFocused ?? false };
     perWindow.set(windowId, w);
 
-    // Apply analytic shapes: decoration takes the OUTER rounded rect; the
-    // window's content surface takes the INNER rounded rect (= outer radius
-    // minus border width, floored at 0). The compositor's SDF clips both.
-    const outerRadius = config.borderRadius;
-    const innerRadius = Math.max(0, outerRadius - config.borderWidth);
-    if (outerRadius > 0) {
-      await windowsSdk.setShape(surface.surfaceId,
-        { kind: "rounded-rect", radius: outerRadius });
-      await windowsSdk.setShape(windowId,
-        { kind: "rounded-rect", radius: innerRadius });
+    // Apply analytic shapes: decoration takes the OUTER shape; the
+    // window's content surface takes the inset INNER shape (every
+    // radius / extent shrunk by borderWidth, floored at 0). The
+    // compositor's SDF clips both. When outerShape is null (rectangle)
+    // skip the calls entirely -- the compositor's default is rectangle
+    // and an explicit null still walks the SDF early-out, but skipping
+    // saves two round-trip messages on every map.
+    if (config.outerShape !== null) {
+      const inner = insetShape(config.outerShape, config.borderWidth);
+      await windowsSdk.setShape(surface.surfaceId, config.outerShape);
+      await windowsSdk.setShape(windowId, inner);
     }
 
     await redraw(w, config);

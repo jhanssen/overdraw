@@ -6,7 +6,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 
 import {
-  validateConfig, parseColor,
+  validateConfig, parseColor, insetShape,
 } from '../../packages/plugin-decoration-default/dist/config.js';
 
 // ---- validateConfig: defaults ----------------------------------------------
@@ -17,7 +17,7 @@ test('validateConfig: null / undefined / {} use the same defaults', () => {
   const c = validateConfig({});
   assert.equal(a.appIdPattern, '.*');
   assert.equal(a.borderWidth, 2);
-  assert.equal(a.borderRadius, 8);
+  assert.deepEqual(a.outerShape, { kind: 'rounded-rect', radius: 8 });
   assert.equal(a.focused.stops.length, 2);    // gradient
   assert.equal(a.unfocused.stops.length, 1);  // solid
   // All three call shapes return structurally-equal config.
@@ -54,16 +54,16 @@ test('validateConfig: rejects non-string appIdFlags', () => {
 
 // ---- border -----------------------------------------------------------------
 
-test('validateConfig: custom border values pass through', () => {
+test('validateConfig: custom border.radius shorthand -> rounded-rect outerShape', () => {
   const c = validateConfig({ border: { width: 4, radius: 16 } });
   assert.equal(c.borderWidth, 4);
-  assert.equal(c.borderRadius, 16);
+  assert.deepEqual(c.outerShape, { kind: 'rounded-rect', radius: 16 });
 });
 
-test('validateConfig: border.width and border.radius accept 0 (no rounding)', () => {
+test('validateConfig: border.radius=0 collapses to a null (rectangle) outerShape', () => {
   const c = validateConfig({ border: { width: 0, radius: 0 } });
   assert.equal(c.borderWidth, 0);
-  assert.equal(c.borderRadius, 0);
+  assert.equal(c.outerShape, null);
 });
 
 test('validateConfig: rejects negative border.width / radius', () => {
@@ -74,6 +74,94 @@ test('validateConfig: rejects negative border.width / radius', () => {
 test('validateConfig: rejects non-finite border values (NaN, Infinity)', () => {
   assert.throws(() => validateConfig({ border: { width: NaN } }), /non-negative finite/);
   assert.throws(() => validateConfig({ border: { radius: Infinity } }), /non-negative finite/);
+});
+
+// ---- border.shape: explicit shape overrides radius ------------------------
+
+test('validateConfig: explicit border.shape rounded-rect passes through', () => {
+  const c = validateConfig({ border: { shape: { kind: 'rounded-rect', radius: 12 } } });
+  assert.deepEqual(c.outerShape, { kind: 'rounded-rect', radius: 12 });
+});
+
+test('validateConfig: explicit border.shape per-corner', () => {
+  const c = validateConfig({
+    border: { shape: { kind: 'rounded-rect-per-corner', tl: 12, tr: 12, br: 0, bl: 0 } },
+  });
+  assert.deepEqual(c.outerShape,
+    { kind: 'rounded-rect-per-corner', tl: 12, tr: 12, br: 0, bl: 0 });
+});
+
+test('validateConfig: explicit border.shape superellipse (macOS squircle)', () => {
+  const c = validateConfig({
+    border: { shape: { kind: 'superellipse', exponent: 5, radius: 24 } },
+  });
+  assert.deepEqual(c.outerShape,
+    { kind: 'superellipse', exponent: 5, radius: 24 });
+});
+
+test('validateConfig: border.shape null -> sharp rectangle', () => {
+  const c = validateConfig({ border: { shape: null } });
+  assert.equal(c.outerShape, null);
+});
+
+test('validateConfig: border.shape wins over border.radius when both given', () => {
+  const c = validateConfig({
+    border: { radius: 999, shape: { kind: 'rounded-rect', radius: 7 } },
+  });
+  assert.deepEqual(c.outerShape, { kind: 'rounded-rect', radius: 7 });
+});
+
+test('validateConfig: rejects unknown shape kind', () => {
+  assert.throws(() => validateConfig({
+    border: { shape: { kind: 'circle' } },
+  }), /rounded-rect.*per-corner.*superellipse/);
+});
+
+test('validateConfig: rejects per-corner with missing corner', () => {
+  assert.throws(() => validateConfig({
+    border: { shape: { kind: 'rounded-rect-per-corner', tl: 8, tr: 8, br: 8 } },
+  }), /must be a non-negative finite number/);
+});
+
+test('validateConfig: rejects superellipse with non-positive exponent', () => {
+  assert.throws(() => validateConfig({
+    border: { shape: { kind: 'superellipse', exponent: 0, radius: 12 } },
+  }), /positive finite/);
+  assert.throws(() => validateConfig({
+    border: { shape: { kind: 'superellipse', exponent: -1, radius: 12 } },
+  }), /positive finite/);
+});
+
+// ---- insetShape: derives the content-side shape -----------------------
+
+test('insetShape: rounded-rect shrinks radius by borderWidth', () => {
+  assert.deepEqual(insetShape({ kind: 'rounded-rect', radius: 10 }, 2),
+    { kind: 'rounded-rect', radius: 8 });
+});
+
+test('insetShape: rounded-rect floors at 0 (returns null when fully consumed)', () => {
+  assert.equal(insetShape({ kind: 'rounded-rect', radius: 4 }, 8), null);
+});
+
+test('insetShape: per-corner shrinks each corner independently', () => {
+  assert.deepEqual(insetShape(
+    { kind: 'rounded-rect-per-corner', tl: 12, tr: 12, br: 4, bl: 0 }, 4,
+  ), { kind: 'rounded-rect-per-corner', tl: 8, tr: 8, br: 0, bl: 0 });
+});
+
+test('insetShape: per-corner with all-zero result collapses to null', () => {
+  assert.equal(insetShape(
+    { kind: 'rounded-rect-per-corner', tl: 2, tr: 2, br: 2, bl: 2 }, 4,
+  ), null);
+});
+
+test('insetShape: superellipse shrinks radius, preserves exponent', () => {
+  assert.deepEqual(insetShape({ kind: 'superellipse', exponent: 5, radius: 20 }, 4),
+    { kind: 'superellipse', exponent: 5, radius: 16 });
+});
+
+test('insetShape: null is invariant', () => {
+  assert.equal(insetShape(null, 4), null);
 });
 
 // ---- DecorationFill: solid / linear-gradient --------------------------------

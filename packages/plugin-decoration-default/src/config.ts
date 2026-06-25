@@ -4,7 +4,7 @@
 // errors, which is what we want for bad config.
 
 import type {
-  DecorationPluginConfig, DecorationFill,
+  DecorationPluginConfig, DecorationFill, DecorationShape,
 } from "@overdraw/decoration-types";
 
 // RGBA in [0,1]. Used downstream by the shader uniform packer.
@@ -26,7 +26,11 @@ export interface ResolvedConfig {
   appIdPattern: string;
   appIdFlags: string | undefined;
   borderWidth: number;
-  borderRadius: number;
+  // The shape applied to the decoration's OUTER rect. The inner shape
+  // (applied to the content surface) is derived at apply time by
+  // insetting every radius / extent by `borderWidth`. null = a sharp
+  // rectangle; no setShape call is issued (compositor early-out).
+  outerShape: DecorationShape;
   focused: ResolvedFill;
   unfocused: ResolvedFill;
 }
@@ -82,7 +86,8 @@ export function validateConfig(raw: unknown): ResolvedConfig {
 
   const border = o.border;
   let borderWidth = DEFAULT_BORDER_WIDTH;
-  let borderRadius = DEFAULT_BORDER_RADIUS;
+  let borderRadius: number | undefined;
+  let explicitShape: DecorationShape | undefined;
   if (border !== undefined) {
     if (border === null || typeof border !== "object" || Array.isArray(border)) {
       throw new TypeError(`decoration.border must be an object`);
@@ -100,12 +105,103 @@ export function validateConfig(raw: unknown): ResolvedConfig {
       }
       borderRadius = b.radius;
     }
+    if (b.shape !== undefined) {
+      explicitShape = resolveShape(b.shape);
+    }
+  }
+
+  // Shape resolution: explicit `shape` wins; then `radius` shorthand;
+  // then the default radius (rounded-rect 8). A `radius: 0` collapses
+  // to a null (rectangle) shape so the compositor skips the SDF.
+  let outerShape: DecorationShape;
+  if (explicitShape !== undefined) {
+    outerShape = explicitShape;
+  } else if (borderRadius !== undefined) {
+    outerShape = borderRadius > 0 ? { kind: "rounded-rect", radius: borderRadius } : null;
+  } else {
+    outerShape = { kind: "rounded-rect", radius: DEFAULT_BORDER_RADIUS };
   }
 
   const focused = resolveFill(o.focused ?? DEFAULT_FOCUSED_FILL, "focused");
   const unfocused = resolveFill(o.unfocused ?? DEFAULT_UNFOCUSED_FILL, "unfocused");
 
-  return { appIdPattern, appIdFlags, borderWidth, borderRadius, focused, unfocused };
+  return { appIdPattern, appIdFlags, borderWidth, outerShape, focused, unfocused };
+}
+
+// Validate a DecorationShape literal. Mirrors the compositor's
+// SurfaceShape validator (windows-sdk.ts validateShape) so a bad config
+// fails at boot, not at the first setShape call.
+function resolveShape(raw: unknown): DecorationShape {
+  if (raw === null) return null;
+  if (typeof raw !== "object" || Array.isArray(raw)) {
+    throw new TypeError(`decoration.border.shape must be a DecorationShape object or null`);
+  }
+  const s = raw as { [k: string]: unknown };
+  const requireNonNeg = (name: string, v: unknown): number => {
+    if (typeof v !== "number" || !Number.isFinite(v) || v < 0) {
+      throw new TypeError(`decoration.border.shape.${name} must be a non-negative finite number`);
+    }
+    return v;
+  };
+  switch (s.kind) {
+    case "rounded-rect":
+      return { kind: "rounded-rect", radius: requireNonNeg("radius", s.radius) };
+    case "rounded-rect-per-corner":
+      return {
+        kind: "rounded-rect-per-corner",
+        tl: requireNonNeg("tl", s.tl),
+        tr: requireNonNeg("tr", s.tr),
+        br: requireNonNeg("br", s.br),
+        bl: requireNonNeg("bl", s.bl),
+      };
+    case "superellipse": {
+      if (typeof s.exponent !== "number" || !Number.isFinite(s.exponent) || s.exponent <= 0) {
+        throw new TypeError(
+          `decoration.border.shape.exponent must be a positive finite number`);
+      }
+      return {
+        kind: "superellipse",
+        exponent: s.exponent,
+        radius: requireNonNeg("radius", s.radius),
+      };
+    }
+    default:
+      throw new TypeError(
+        `decoration.border.shape.kind must be "rounded-rect" | "rounded-rect-per-corner" | "superellipse" `
+        + `(got ${JSON.stringify(s.kind)})`);
+  }
+}
+
+// Inset every radius / extent of a shape by `borderWidth`. The result
+// is the shape applied to the WINDOW CONTENT surface (inside the
+// border band). Negative values are floored at 0 -- a content shape
+// with all radii at 0 is a sharp rectangle (null) which the compositor
+// renders as an early-out.
+export function insetShape(outer: DecorationShape, borderWidth: number): DecorationShape {
+  if (outer === null) return null;
+  switch (outer.kind) {
+    case "rounded-rect": {
+      const r = Math.max(0, outer.radius - borderWidth);
+      return r > 0 ? { kind: "rounded-rect", radius: r } : null;
+    }
+    case "rounded-rect-per-corner": {
+      const tl = Math.max(0, outer.tl - borderWidth);
+      const tr = Math.max(0, outer.tr - borderWidth);
+      const br = Math.max(0, outer.br - borderWidth);
+      const bl = Math.max(0, outer.bl - borderWidth);
+      if (tl === 0 && tr === 0 && br === 0 && bl === 0) return null;
+      return { kind: "rounded-rect-per-corner", tl, tr, br, bl };
+    }
+    case "superellipse": {
+      // The superellipse "radius" is the half-extent on the shorter
+      // axis; shrinking it by borderWidth produces the inner curve.
+      // exponent is preserved (the shape family is the same).
+      const r = Math.max(0, outer.radius - borderWidth);
+      return r > 0
+        ? { kind: "superellipse", exponent: outer.exponent, radius: r }
+        : null;
+    }
+  }
 }
 
 // Validate a DecorationFill and bake its stops into normalized form.
@@ -194,4 +290,6 @@ export function parseColor(s: string, field: string): RgbaF {
 
 // Re-export the typed slot so users / callers can `satisfies DecorationPluginConfig`
 // in one import.
-export type { DecorationPluginConfig, DecorationFill } from "@overdraw/decoration-types";
+export type {
+  DecorationPluginConfig, DecorationFill, DecorationShape,
+} from "@overdraw/decoration-types";

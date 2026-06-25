@@ -5,6 +5,32 @@
 // `decoration: cfg satisfies DecorationPluginConfig` for IDE help without
 // committing the core to the shape (core treats it as `unknown`).
 
+// Decoration shape vocabulary. Mirrors the compositor's SurfaceShape but
+// declared here so users writing `decoration: cfg satisfies
+// DecorationPluginConfig` don't need to import a core-internal type.
+// `null` is a rectangle. Per-corner and superellipse map directly onto
+// the compositor's analytic SDF; the plugin applies one shape to the
+// decoration's outer rect and derives an inset shape for the window's
+// content rect (per-corner: each corner shrunk by `border.width`;
+// superellipse: the radius half-extent shrunk).
+export type DecorationShape =
+  | null
+  | { kind: "rounded-rect"; radius: number }
+  | {
+      kind: "rounded-rect-per-corner";
+      tl: number; tr: number; br: number; bl: number;
+    }
+  | {
+      // |x/a|^n + |y/b|^n = 1. n=4..6 is the macOS-style squircle;
+      // n=2 is an ellipse; large n approaches a sharp rect. `radius`
+      // is the half-extent on the shorter axis (mirrors the
+      // rounded-rect API; the compositor uses the surface's actual
+      // extents in both axes).
+      kind: "superellipse";
+      exponent: number;
+      radius: number;
+    };
+
 // A solid fill or a multi-stop linear gradient. Used for the focused/
 // unfocused border appearance.
 //
@@ -38,10 +64,15 @@ export interface DecorationPluginConfig {
     // Border thickness in (logical) pixels. Applied to all four edges.
     // Default 2.
     width?: number;
-    // Outer-corner radius in (logical) pixels. 0 = sharp corners. Default 8.
-    // The inner rounded rect that masks the window's content is offset
-    // inward by `width`, so the inner radius derives as max(0, radius - width).
+    // Shorthand: outer-corner radius in (logical) pixels, equivalent to
+    // `shape: { kind: "rounded-rect", radius }`. 0 = sharp corners.
+    // Default 8. Mutually exclusive with `shape` (when both are given,
+    // `shape` wins). The inner shape that masks the window's content is
+    // derived by insetting every radius / extent by `width`.
     radius?: number;
+    // Explicit shape. Overrides `radius` if both are present. `null`
+    // is a sharp-edged rectangle (= radius: 0).
+    shape?: DecorationShape;
   };
 
   // Frame fill when the decorated window is the keyboard-focused window.
