@@ -97,7 +97,7 @@ test("example animated-gradient decoration composites + animates", { skip }, asy
     // Checking `isContentGated === false` ALONE is not enough: the gate's
     // never-armed initial state is also false, so the wait would sail through
     // the window between `windows.length === 2` (addWindow at get_toplevel)
-    // and `window.map` (first content) firing onAssigned -> setContentGated.
+    // and `window.map` (first content) firing onAssigned -> engageContentGate.
     // Requiring decorationSurfaceId !== undefined first sequences this: the
     // surface id is set by setDecorationSurface AFTER the broker's
     // surface.alloc completes for this window's decoration, which only
@@ -105,7 +105,12 @@ test("example animated-gradient decoration composites + animates", { skip }, asy
     // are met, the gate has been armed and then released by first-present.
     await waitFor(() => {
       const w = c.state.wm.state.windows.find((x) => x.surfaceId === win.surfaceId);
-      return { d: w?.decorationSurfaceId, g: w?.contentGated };
+      // contentGateOwners is a Set when any owner is engaged; undefined
+      // (or empty) once every owner has released. Map to a boolean for
+      // the existing predicate.
+      const gated = w?.contentGateOwners !== undefined
+        && w.contentGateOwners.size > 0;
+      return { d: w?.decorationSurfaceId, g: gated };
     }, (s) => s.d !== undefined && s.g === false,
        { what: "decoration bound + gate released" });
     const cr = c.state.wm.state.windows.find((w) => w.surfaceId === win.surfaceId).rect;
