@@ -44,6 +44,33 @@ export interface InterceptRenderCtx {
   surfaceId: number;
   frameNumber: number;
   time: number;
+  // The surface's WM-assigned outer rect.
+  //
+  // In-thread transport: live (re-read each tick from the WM state).
+  // Worker transport: static (snapshot taken at match time; the
+  //   Worker-side ctx does not subscribe to WM rect changes in 10a).
+  //
+  // Useful for plugins that compute placement-relative output (e.g.
+  // border plugins comparing input dims against expected post-inset
+  // content dims). Coordinates are in global compositor logical space
+  // (same as surface placement; per-output origin is applied by the
+  // compositor downstream).
+  surfaceRect: Rect;
+  // Release the WM content gate engaged by gates:true at match time.
+  // Idempotent: subsequent calls are no-ops. The window enters the
+  // draw stack on the next composite; the intercept output produced
+  // by THIS render is what the compositor samples.
+  //
+  // Typical strict-release-policy pattern for a border plugin:
+  //
+  //   render({ input, ctx, releaseGate }) {
+  //     const expectedW = ctx.surfaceRect.w - 2 * B;
+  //     // ... encode the frame ...
+  //     if (input.rect.w === expectedW) releaseGate();
+  //   }
+  //
+  // No-op when the registration did not declare `gates`.
+  releaseGate: () => void;
 }
 
 // Per-frame input/output texture handles. The plugin must NOT retain
@@ -78,6 +105,25 @@ export interface InterceptSurfaceInfo {
 }
 
 export interface InterceptHandlers {
+  // Optional. Called when the SDK is about to allocate or reallocate
+  // the output ring. Receives the current input texture dimensions
+  // (the client's committed buffer size). Returns the dimensions to
+  // use for the output ring. Default: identity (output = input).
+  //
+  // Reallocation triggers when input dimensions change (client commits
+  // a buffer at a new size). The output ring follows by recomputing
+  // through this callback. Throwing or returning invalid dimensions
+  // (zero, negative, exceeding GPU limits) increments the per-surface
+  // failure counter; sustained failure auto-unregisters the plugin.
+  //
+  // Border-style intercepts return { w: inputW + 2*B, h: inputH + 2*B }
+  // to extend the output by B on every side (the band).
+  //
+  // 10a: in-thread transport only. Worker plugins that declare a
+  // non-identity outputDimensions are rejected at registration; the
+  // Worker ring lifecycle does not yet renegotiate dimensions.
+  outputDimensions?(inputW: number, inputH: number): { w: number; h: number };
+
   // Fired once per matched surface, immediately after the registration
   // is set up (for already-matched surfaces) or when a new surface
   // newly satisfies the match.
@@ -115,6 +161,36 @@ export interface InterceptSpec {
   name: string;
   match: InterceptMatch;
   contributes?: ReadonlyArray<ContributesCategory>;
+  // Lower numbers match first. Same-priority falls back to registration
+  // order. Default 0. Bundled fallback intercepts (e.g. the decoration
+  // plugin matching ".*") use a higher number so user-installed
+  // narrower-pattern effects win.
+  priority?: number;
+  // When set, the SDK engages a WM content gate under owner
+  // `"intercept-${spec.name}"` at onSurfaceMatched time so the window
+  // does NOT enter the draw stack until the plugin releases it via
+  // ctx.releaseGate() inside a render call. Used by decoration-like
+  // intercepts that need to hold the window invisible until their
+  // first render at the post-insets size lands.
+  //
+  //   gates: true                  -> engage gate; 10s backstop timeout.
+  //   gates: { timeoutMs: 500 }    -> engage gate; explicit timeout.
+  //   gates: false / omitted       -> no gate (default; observe-only).
+  //
+  // Backstop semantics: if the plugin does not call releaseGate() and
+  // does not produce a successful render within timeoutMs, the SDK
+  // force-releases the gate so a stuck/broken plugin cannot hold a
+  // window invisible indefinitely. Default backstop is 10000 (10s).
+  //
+  // The gate also auto-releases on:
+  //  - onSurfaceUnmatched (the surface unmapped / the registration is
+  //    being torn down): the gate would otherwise stay engaged on a
+  //    surface that may be re-matched by a peer.
+  //  - render throw: a broken render call should not hold the window
+  //    invisible. The intercept falls back to raw client; the gate
+  //    releases. Mirrors today's "broken decoration provider →
+  //    undecorated window" semantics.
+  gates?: boolean | { timeoutMs?: number };
   // Called once when the registration becomes active. Returns the
   // per-surface handlers used for the lifetime of the registration.
   setup(ctx: InterceptSetupCtx): Promise<InterceptHandlers> | InterceptHandlers;

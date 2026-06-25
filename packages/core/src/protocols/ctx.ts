@@ -460,6 +460,13 @@ export interface CompositorSink {
   // render dispatch to surfaces actually being composited.
   surfaceClientTexture?(surfaceId: number): { texture: GPUTexture; w: number; h: number } | null;
   surfaceIsPresentable?(surfaceId: number): boolean;
+  // The surface's WM-assigned outer rect (x/y in compositor logical
+  // coords, w/h from setSurfaceLayout). Threaded into the intercept
+  // render context as ctx.surfaceRect so plugins can compute
+  // post-inset content dimensions (e.g. border gate-release policy
+  // compares input.w against surfaceRect.w - 2*B). Returns null
+  // for unknown surfaces.
+  surfaceWmRect?(surfaceId: number): { x: number; y: number; w: number; h: number } | null;
   // Phase 10a Worker intercept: copy the surface's currently-
   // committed client texture into a dmabuf the Worker plugin
   // samples. Both textures are on the core device; the dmabuf was

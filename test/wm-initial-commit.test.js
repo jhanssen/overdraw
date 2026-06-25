@@ -284,6 +284,45 @@ test('preconfigure: interceptor modification emits window.committed', async () =
   assert.ok(committed[0].changed.includes('exclusive'));
 });
 
+test('preconfigure: synchronous setInsets in interceptor shrinks the first sized configure', async () => {
+  // Verifies the seam the decoration-as-intercept design depends on:
+  // a preconfigure interceptor that synchronously reserves insets must
+  // make the very first SIZED configure (after the 0x0 handshake)
+  // carry the post-insets content size. No wrong-size flash possible.
+  const bus = createDynamicBus();
+  const configures = [];
+  const wm = createWm(mockSink(), [{ id: 0, rect: { x: 0, y: 0, width: 1000, height: 600 }, scale: 1 }], {
+    pluginBus: bus,
+    configure: { configure: (id, _x, _y, w, h) => { configures.push({ id, w, h }); return null; }, configureMove: () => {} },
+    layoutDriverFactory: immediateLayoutDriver,
+  });
+  // Mock decoration plugin: matches firefox, reserves 2px border on
+  // every side via setInsets inside the preconfigure interceptor.
+  bus.subscribe('window.preconfigure', (_n, p) => {
+    if (p.appId === 'firefox') {
+      wm.setInsets(p.surfaceId, { top: 2, right: 2, bottom: 2, left: 2 });
+    }
+  });
+  wm.addWindow(1, res(1), { deferInitialCommit: true });
+  await wm.settled();
+  wm.sendInitialConfigure(1);
+  // The 0x0 handshake configure went out first.
+  assert.deepEqual(configures, [{ id: 1, w: 0, h: 0 }]);
+  // Now the client's initial commit completes; the interceptor's
+  // setInsets must land before the layout pass that sends the sized
+  // configure.
+  await wm.markInitialCommitComplete(1, { appId: 'firefox', title: null });
+  await wm.settled();
+  // First content-driven configure goes out at content rect = outer minus insets.
+  wm.windowHasContent(1);
+  await wm.settled();
+  // Outer was 1000x600 (the only output); content rect after 2px insets is 996x596.
+  const sized = configures.filter((c) => c.w !== 0 || c.h !== 0);
+  assert.ok(sized.length >= 1, 'at least one sized configure');
+  assert.deepEqual(sized[0], { id: 1, w: 996, h: 596 },
+    'first sized configure carries the post-insets content size');
+});
+
 test('preconfigure: configure fires AFTER interceptor settles + state commits', async () => {
   const bus = createDynamicBus();
   const configures = [];

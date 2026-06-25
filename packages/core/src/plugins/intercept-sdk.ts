@@ -140,8 +140,34 @@ export function createWorkerInterceptSdk(deps: WorkerInterceptDeps): InterceptAP
       validateSpec(spec);
       // Run setup LOCALLY with the worker's device.
       const handlers = await Promise.resolve(spec.setup({ device: deps.device }));
+      // Worker transport does not yet support output dimensions
+      // different from input. A non-identity outputDimensions would
+      // need a runtime renegotiation protocol the Worker ring lifecycle
+      // doesn't have (see decoration-as-intercept.md). Reject at
+      // registration so the failure is loud and at predictable time
+      // rather than silently mis-sized at the first render.
+      if (handlers.outputDimensions) {
+        throw new Error(
+          "intercept.register: outputDimensions is not supported on the " +
+          "Worker transport (10a limitation). Run as an in-thread plugin " +
+          "or omit outputDimensions to use identity (output = input).");
+      }
+      // Same reasoning for gates: the gate request has to round-trip to
+      // core to actually engage on the wm. Out of scope for 10a; reject
+      // so a Worker plugin that depends on the gate fails loudly rather
+      // than silently running un-gated.
+      if (spec.gates) {
+        throw new Error(
+          "intercept.register: gates is not supported on the Worker " +
+          "transport (10a limitation). Run as an in-thread plugin or " +
+          "omit gates.");
+      }
+      const payloadObj = {
+        match: serializeMatch(spec.match),
+        ...(spec.priority !== undefined ? { priority: spec.priority } : {}),
+      };
       // eslint-disable-next-line no-restricted-syntax -- match is opaque; broker re-validates
-      const payload = { match: serializeMatch(spec.match) } as unknown as Json;
+      const payload = payloadObj as unknown as Json;
       const r = (await endpoint.request("intercept.register", payload)) as { registrationId: number };
       const reg: WorkerRegistration = {
         id: r.registrationId, spec, handlers,
@@ -470,6 +496,15 @@ class WorkerPerSurfaceState {
             surfaceId: this.cfg.surfaceId,
             frameNumber: this.frameNumber,
             time: performance.now(),
+            // Worker transport: snapshot at match time. The Worker SDK
+            // does not subscribe to live WM rect changes in 10a.
+            surfaceRect: { x: 0, y: 0, w: this.cfg.width, h: this.cfg.height },
+            // No-op: gates are not supported on the Worker transport
+            // in 10a. A Worker plugin that declared `gates` is
+            // rejected at registration (see the Worker register
+            // path's outputDimensions/gates check); this no-op exists
+            // only to keep the ctx shape uniform across transports.
+            releaseGate: () => {},
           },
         });
       } catch (e: unknown) {
@@ -561,6 +596,10 @@ function validateSpec(spec: InterceptSpec): void {
   }
   if (typeof spec.setup !== "function") {
     throw new TypeError("intercept.register: spec.setup must be a function");
+  }
+  if (spec.priority !== undefined &&
+      (typeof spec.priority !== "number" || !Number.isFinite(spec.priority))) {
+    throw new TypeError("intercept.register: spec.priority must be a finite number");
   }
 }
 

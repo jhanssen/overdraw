@@ -28,6 +28,12 @@ export interface RegistrationData {
   // matching against; spec roles are recorded for forward
   // compatibility).
   roles: ReadonlyArray<InterceptableRole> | null;
+  // Lower numbers match first. Same-priority resolves by insertion
+  // order (insertionSeq).
+  priority: number;
+  // Monotonically increasing per-engine counter assigned at
+  // addRegistration time. Tie-breaker for same-priority entries.
+  insertionSeq: number;
 }
 
 // A mapped toplevel's match-relevant fields. Updated by the broker on
@@ -47,28 +53,49 @@ export interface MatchEvent {
 }
 
 export class MatchEngine {
-  // Registrations in insertion order. First-match-wins iterates this
-  // list head-to-tail.
+  // Registrations sorted by (priority asc, insertionSeq asc).
+  // First-match-wins iterates this list head-to-tail; the sort means
+  // lower priority wins, and same-priority falls back to registration
+  // order.
   private registrations: RegistrationData[] = [];
   // Mapped toplevels keyed by surfaceId. Updated by the broker.
   private toplevels = new Map<number, ToplevelData>();
   // Current (toplevel surfaceId -> registration id) match assignments.
   // Sparse: only assigned surfaces appear.
   private assignments = new Map<number, number>();
+  // Monotonic insertion counter; assigned to each new registration so
+  // same-priority registrations resolve in registration order.
+  private nextInsertionSeq = 0;
 
   registerCount(): number { return this.registrations.length; }
 
   // Add a registration. Returns the synthetic registration id. Re-
   // evaluates every existing toplevel and returns the events caused by
-  // the new registration (matched events for any toplevel that newly
-  // matches this registration and isn't already assigned to an earlier
-  // registration).
-  addRegistration(r: RegistrationData): MatchEvent[] {
-    this.registrations.push(r);
+  // the new registration. Critically, a higher-priority (= numerically
+  // lower) new registration can STEAL surfaces from a lower-priority
+  // existing registration: the returned events include both the
+  // unmatched event for the prior owner and the matched event for the
+  // new winner. Same-priority and lower-priority new registrations only
+  // pick up unassigned surfaces (first-match-wins inside a priority
+  // band).
+  addRegistration(rPartial: Omit<RegistrationData, "insertionSeq">): MatchEvent[] {
+    const r: RegistrationData = { ...rPartial, insertionSeq: this.nextInsertionSeq++ };
+    insertSorted(this.registrations, r);
     const events: MatchEvent[] = [];
     for (const [surfaceId, top] of this.toplevels.entries()) {
-      if (this.assignments.has(surfaceId)) continue;  // earlier reg already owns it
-      if (matches(r, top)) {
+      if (!matches(r, top)) continue;
+      const cur = this.assignments.get(surfaceId);
+      if (cur === undefined) {
+        // Unassigned: claim it.
+        this.assignments.set(surfaceId, r.id);
+        events.push({ kind: "matched", registrationId: r.id, surfaceId });
+        continue;
+      }
+      // Already assigned. Steal only if r outranks the current owner.
+      const curReg = this.registrations.find((x) => x.id === cur);
+      if (!curReg) continue;
+      if (compareRank(r, curReg) < 0) {
+        events.push({ kind: "unmatched", registrationId: cur, surfaceId });
         this.assignments.set(surfaceId, r.id);
         events.push({ kind: "matched", registrationId: r.id, surfaceId });
       }
@@ -109,10 +136,36 @@ export class MatchEngine {
     return events;
   }
 
-  // A toplevel mapped (window.map). Add it to the tracking set and
-  // assign to the first matching registration, if any.
+  // A toplevel about to receive its first sized configure
+  // (window.preconfigure). Same shape as onToplevelMapped, but fires
+  // BEFORE the first sized configure goes out so the matched plugin's
+  // synchronous setInsets lands in time. Tracks the toplevel + assigns
+  // to the first matching registration. Idempotent with subsequent
+  // onToplevelMapped (which is a no-op for already-tracked surfaces).
+  onToplevelPreconfigure(top: ToplevelData): MatchEvent[] {
+    return this.trackToplevel(top);
+  }
+
+  // A toplevel mapped (window.map). Add it to the tracking set if not
+  // already (a preconfigure-time match may have done so) and assign to
+  // the first matching registration if not already assigned.
   onToplevelMapped(top: ToplevelData): MatchEvent[] {
-    this.toplevels.set(top.surfaceId, { ...top });
+    return this.trackToplevel(top);
+  }
+
+  // Internal: shared tracking + matching for preconfigure and map.
+  // Idempotent on repeated calls.
+  private trackToplevel(top: ToplevelData): MatchEvent[] {
+    const existing = this.toplevels.get(top.surfaceId);
+    if (existing) {
+      // Already tracked (preconfigure ran first); refresh appId/title
+      // in case the client set them between preconfigure and map.
+      existing.appId = top.appId;
+      existing.title = top.title;
+    } else {
+      this.toplevels.set(top.surfaceId, { ...top });
+    }
+    if (this.assignments.has(top.surfaceId)) return [];   // already matched
     const winner = this.firstMatching(top);
     if (winner === null) return [];
     this.assignments.set(top.surfaceId, winner.id);
@@ -181,6 +234,28 @@ export class MatchEngine {
     }
     return null;
   }
+}
+
+// Ascending order: lower priority first; same-priority by insertionSeq.
+// Compatible with Array.prototype.sort.
+function compareRank(a: RegistrationData, b: RegistrationData): number {
+  if (a.priority !== b.priority) return a.priority - b.priority;
+  return a.insertionSeq - b.insertionSeq;
+}
+
+// Insert r into list keeping (priority, insertionSeq) ascending order.
+// O(N) but N is small (handful of registrations).
+function insertSorted(list: RegistrationData[], r: RegistrationData): void {
+  let idx = list.length;
+  for (let i = 0; i < list.length; i++) {
+    const cur = list[i];
+    if (cur === undefined) continue;   // list is dense; this is unreachable
+    if (compareRank(r, cur) < 0) {
+      idx = i;
+      break;
+    }
+  }
+  list.splice(idx, 0, r);
 }
 
 function matches(r: RegistrationData, top: ToplevelData): boolean {

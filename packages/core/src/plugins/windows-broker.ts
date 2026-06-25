@@ -54,6 +54,11 @@ export interface WindowsBrokerDeps {
   // idempotent so this is also a safe no-op when nothing was
   // engaged).
   openingDriver?: import("../protocols/opening-driver.js").OpeningDriver;
+  // Intercept broker. windows.set-insets authorization checks that
+  // the calling plugin owns the intercept currently assigned to the
+  // target surface. Optional: when absent (a configuration without
+  // intercept support), windows.set-insets always rejects.
+  interceptBroker?: { pluginNameForSurface(surfaceId: number): string | undefined };
 }
 
 // The shape main.ts plugs into its onRequest chain. Returns the result for
@@ -71,8 +76,6 @@ export function createWindowsBroker(deps: WindowsBrokerDeps): WindowsBroker {
   const { wm, compositor, state, pluginBus, closingDriver, openingDriver } = deps;
 
   return (pluginName: string, method: string, params: unknown): unknown | typeof NOT_HANDLED => {
-    void pluginName;   // available for future audit / capability gating
-
     if (method === "windows.propose") return handlePropose(params);
     if (method === "windows.set-state") return handleSetState(params);
     if (method === "windows.delete-state") return handleDeleteState(params);
@@ -85,6 +88,7 @@ export function createWindowsBroker(deps: WindowsBrokerDeps): WindowsBroker {
     if (method === "windows.set-opacity") return handleSetOpacity(params);
     if (method === "windows.set-transform") return handleSetTransform(params);
     if (method === "windows.set-output-margin") return handleSetOutputMargin(params);
+    if (method === "windows.set-insets") return handleSetInsets(pluginName, params);
     if (method === "windows.set-mask") return handleSetMask(params);
     if (method === "windows.set-shape") return handleSetShape(params);
     if (method === "windows.set-tint") return handleSetTint(params);
@@ -231,6 +235,41 @@ export function createWindowsBroker(deps: WindowsBrokerDeps): WindowsBroker {
     }
     compositor.setSurfaceOutputMargin(p.id, p.m);
     return null;
+  }
+
+  function handleSetInsets(pluginName: string, p: unknown):
+    { insets: { top: number; right: number; bottom: number; left: number };
+      outerRect: { x: number; y: number; width: number; height: number };
+      contentRect: { x: number; y: number; width: number; height: number } } | null {
+    if (!isSetInsetsPayload(p)) throw new Error("windows.set-insets: malformed payload");
+    // Authorization: the caller must own the intercept currently
+    // assigned to this surface. Mirrors the assignment-check the
+    // decoration broker has used today (only the assigned provider
+    // can move that window's insets). Without intercept support
+    // configured, reject all set-insets calls.
+    if (!deps.interceptBroker) {
+      throw new Error(
+        "windows.set-insets: rejected (intercept broker not configured; " +
+        "set-insets requires an active intercept matching the target surface)");
+    }
+    const ownerPlugin = deps.interceptBroker.pluginNameForSurface(p.id);
+    if (ownerPlugin === undefined) {
+      throw new Error(
+        `windows.set-insets: rejected (no intercept assigned to surface ${p.id}; ` +
+        `the caller's plugin must own a matching intercept)`);
+    }
+    if (ownerPlugin !== pluginName) {
+      throw new Error(
+        `windows.set-insets: rejected (surface ${p.id} is assigned to ` +
+        `intercept owned by '${ownerPlugin}', not '${pluginName}')`);
+    }
+    const grant = wm.setInsets(p.id, p.insets);
+    if (!grant) return null;
+    return {
+      insets: grant.insets,
+      outerRect: grant.outerRect,
+      contentRect: grant.contentRect,
+    };
   }
 
   // Explicit focus override. Bypasses the focus plugin's decide() and
@@ -470,6 +509,21 @@ function isSetOutputMarginPayload(d: unknown): d is {
     const v = m[k];
     if (v !== undefined
         && (typeof v !== "number" || !Number.isFinite(v) || v < 0)) return false;
+  }
+  return true;
+}
+
+function isSetInsetsPayload(d: unknown): d is {
+  id: number; insets: { top: number; right: number; bottom: number; left: number };
+} {
+  if (typeof d !== "object" || d === null) return false;
+  const o = d as { [k: string]: unknown };
+  if (typeof o.id !== "number") return false;
+  if (typeof o.insets !== "object" || o.insets === null) return false;
+  const i = o.insets as { [k: string]: unknown };
+  for (const k of ["top", "right", "bottom", "left"]) {
+    const v = i[k];
+    if (typeof v !== "number" || !Number.isFinite(v)) return false;
   }
   return true;
 }

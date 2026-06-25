@@ -19,7 +19,10 @@ import {
   MatchEngine, compileAppIdRegex, type RegistrationData, type MatchEvent,
   type ToplevelData,
 } from "./match-engine.js";
-import { InThreadInterceptState, type InThreadTickDeps } from "./inthread-state.js";
+import {
+  InThreadInterceptState,
+  type InThreadTickDeps, type InThreadGateConfig,
+} from "./inthread-state.js";
 import {
   WorkerInterceptState, type RingsAllocPayload, type RingsAllocResult,
 } from "./worker-state.js";
@@ -29,6 +32,16 @@ import type { DawnWire } from "../gpu/compositor.js";
 export interface InterceptBrokerDeps {
   bus: CompositorBus;
   compositor: CompositorSink;
+  // WM content-gate sink. The broker engages/releases per-surface
+  // content gates under owner key `"intercept-${spec.name}"` when a
+  // registration declares `gates: true`. Optional: when absent,
+  // gates-declaring registrations log a warning at register time and
+  // behave as if gates were false (the broker can't ask the WM to
+  // hold draw).
+  gateSink?: {
+    engageContentGate(surfaceId: number, owner: string): void;
+    releaseContentGate(surfaceId: number, owner: string): void;
+  };
   // The core device + texture-usage flags, for in-thread output rings.
   // Optional: when absent, the broker rejects in-thread register
   // requests (no rings to allocate against).
@@ -109,9 +122,21 @@ export class InterceptBroker {
 
   constructor(deps: InterceptBrokerDeps) {
     this.deps = deps;
-    // Subscribe to the core window-event bus. The decoration provider
-    // does the same; window.map / window.change carry app_id + title
-    // for toplevels.
+    // Subscribe to the core window-event bus. window.preconfigure fires
+    // synchronously inside markInitialCommitComplete BEFORE the first
+    // sized configure goes out: matching at this seam lets the plugin's
+    // synchronous setInsets land in time so the client receives the
+    // post-insets size on its FIRST sized configure (no wrong-size
+    // flash). window.map is the catch-up seam for surfaces that were
+    // already mapped when a registration was added, or that didn't have
+    // an appId at preconfigure time.
+    deps.bus.on(WINDOW_EVENT.preconfigure, (ev) => {
+      this.onPreconfigure({
+        surfaceId: ev.surfaceId,
+        appId: ev.appId,
+        title: ev.title,
+      });
+    });
     deps.bus.on(WINDOW_EVENT.map, (ev) => {
       this.onMapped({
         surfaceId: ev.surfaceId,
@@ -141,11 +166,12 @@ export class InterceptBroker {
     const handlers = await Promise.resolve(spec.setup(setupCtx));
 
     const id = this.nextRegistrationId++;
-    const regData: RegistrationData = {
+    const regData = {
       id,
       pluginName,
       appIdRegex,
       roles: spec.match.roles ? [...spec.match.roles] : null,
+      priority: spec.priority ?? 0,
     };
     const active: ActiveRegistrationInThread = {
       transport: "in-thread",
@@ -171,6 +197,7 @@ export class InterceptBroker {
   async registerWorker(args: {
     match: InterceptSpec["match"];
     pluginName: string;
+    priority?: number;
     notifyMatched(n: WorkerMatchedNotification): Promise<void>;
     notifyUnmatched(info: InterceptSurfaceInfo): Promise<void>;
   }): Promise<number> {
@@ -181,11 +208,12 @@ export class InterceptBroker {
     const appIdRegex = compileAppIdRegex(args.match.appId);
 
     const id = this.nextRegistrationId++;
-    const regData: RegistrationData = {
+    const regData = {
       id,
       pluginName: args.pluginName,
       appIdRegex,
       roles: args.match.roles ? [...args.match.roles] : null,
+      priority: args.priority ?? 0,
     };
     const active: ActiveRegistrationWorker = {
       transport: "worker",
@@ -297,6 +325,21 @@ export class InterceptBroker {
     return Array.from(a.surfaces.keys());
   }
 
+  // The plugin name that owns the intercept currently assigned to
+  // `surfaceId`, or undefined when no intercept is assigned. Used by
+  // windows-broker's setInsets authorization (only the assigned
+  // intercept's owner may move that surface's insets).
+  pluginNameForSurface(surfaceId: number): string | undefined {
+    const regId = this.engine.registrationFor(surfaceId);
+    if (regId === undefined) return undefined;
+    return this.registrations.get(regId)?.pluginName;
+  }
+
+  private onPreconfigure(top: ToplevelData): void {
+    const events = this.engine.onToplevelPreconfigure(top);
+    for (const e of events) this.dispatchMatchEvent(e);
+  }
+
   private onMapped(top: ToplevelData): void {
     const events = this.engine.onToplevelMapped(top);
     for (const e of events) this.dispatchMatchEvent(e);
@@ -354,14 +397,16 @@ export class InterceptBroker {
       device: inThread.device,
       clientTexture: (sid) => this.deps.compositor.surfaceClientTexture?.(sid) ?? null,
       isPresentable: (sid) => this.deps.compositor.surfaceIsPresentable?.(sid) ?? false,
+      surfaceWmRect: (sid) => this.deps.compositor.surfaceWmRect?.(sid) ?? null,
       installOutput: (sid, view, placement) =>
         this.deps.compositor.installInterceptOutput?.(sid, view, placement),
       clearOutput: (sid) => this.deps.compositor.clearInterceptOutput?.(sid),
       textureUsage: inThread.textureUsage,
       log: this.deps.log,
     };
+    const gate = this.resolveGateConfig(active);
     const state = new InThreadInterceptState(
-      surfaceId, active.pluginName, active.handlers, tickDeps);
+      surfaceId, active.pluginName, active.handlers, tickDeps, gate);
     active.surfaces.set(surfaceId, state);
 
     try {
@@ -371,6 +416,33 @@ export class InterceptBroker {
       this.deps.log(
         `[intercept ${active.pluginName}] onSurfaceMatched threw: ${msg}`);
     }
+  }
+
+  // Resolve the gate config from spec.gates. Returns null when gates
+  // are not declared, or when declared but the gate sink isn't wired
+  // (in which case we log a warning so the plugin sees their gate
+  // declaration was silently ignored).
+  private resolveGateConfig(active: ActiveRegistrationInThread):
+    InThreadGateConfig | null {
+    const decl = active.spec.gates;
+    if (!decl) return null;
+    if (!this.deps.gateSink) {
+      this.deps.log(
+        `[intercept ${active.pluginName}] declared gates:true but no gate sink ` +
+        `wired in the broker; gate request ignored. The window will draw without ` +
+        `waiting for releaseGate().`);
+      return null;
+    }
+    const timeoutMs = typeof decl === "object" && decl.timeoutMs !== undefined
+      ? decl.timeoutMs
+      : InThreadInterceptState.DEFAULT_GATE_TIMEOUT_MS;
+    const sink = this.deps.gateSink;
+    return {
+      ownerKey: `intercept-${active.spec.name}`,
+      engage: (sid, owner) => sink.engageContentGate(sid, owner),
+      release: (sid, owner) => sink.releaseContentGate(sid, owner),
+      timeoutMs,
+    };
   }
 
   private async dispatchMatchedWorker(

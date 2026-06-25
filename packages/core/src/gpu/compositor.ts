@@ -3166,6 +3166,19 @@ export class JsCompositor implements CompositorSink {
     return !!s && s.present;
   }
 
+  // The surface's WM-assigned placement (the outer rect the layout
+  // wrote via setSurfaceLayout). The intercept broker threads this
+  // into the render context as ctx.surfaceRect so plugins can compute
+  // expected post-inset content dimensions (e.g. compare input.w
+  // against surfaceRect.w - 2*B for a border plugin's gate-release
+  // policy). Returns null if the surface is unknown.
+  surfaceWmRect(surfaceId: number):
+    { x: number; y: number; w: number; h: number } | null {
+    const s = this.surfaces.get(surfaceId);
+    if (!s) return null;
+    return { x: s.x, y: s.y, w: s.layoutW, h: s.layoutH };
+  }
+
   // ----- Cursor slot (Phase 9c) ---------------------------------------------
   //
   // A singleton overlay drawn ABOVE every other layer. The cursor "slot"

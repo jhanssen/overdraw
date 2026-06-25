@@ -45,13 +45,17 @@ export function createInterceptPluginBroker(deps: InterceptPluginBrokerDeps): In
       throw new Error("intercept.register: malformed params");
     }
     // eslint-disable-next-line no-restricted-syntax -- trusted SDK shape
-    const p = params as unknown as { match: InterceptSpec["match"] };
+    const p = params as unknown as { match: InterceptSpec["match"]; priority?: number };
     if (!p.match || typeof p.match !== "object") {
       throw new Error("intercept.register: match required");
+    }
+    if (p.priority !== undefined && (typeof p.priority !== "number" || !Number.isFinite(p.priority))) {
+      throw new Error("intercept.register: priority must be a finite number");
     }
     const id = await deps.interceptBroker.registerWorker({
       match: p.match,
       pluginName,
+      priority: p.priority,
       notifyMatched: async (n) => {
         deps.emitToPlugin(pluginName, "intercept.matched", {
           registrationId: id,

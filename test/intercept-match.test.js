@@ -14,6 +14,7 @@ function reg(id, opts = {}) {
     pluginName: opts.pluginName ?? `plugin-${id}`,
     appIdRegex: opts.appIdRegex ?? null,
     roles: opts.roles ?? null,
+    priority: opts.priority ?? 0,
   };
 }
 
@@ -77,6 +78,85 @@ test('match engine: no app_id -> no match (waits for set_app_id)', () => {
   e.onToplevelMapped(top(1, null));   // app_id not set yet
   const events = e.addRegistration(reg(100, { appIdRegex: /firefox/ }));
   assert.deepEqual(events, []);
+});
+
+// --- priority ordering ----------------------------------------------------
+
+test('match engine: lower priority wins on map', () => {
+  const e = new MatchEngine();
+  // 200 registered first but with a LATER priority (10); 100 registered
+  // second with EARLIER priority (0). Surface 1 should match 100.
+  e.addRegistration(reg(200, { appIdRegex: /.*/, priority: 10 }));
+  e.addRegistration(reg(100, { appIdRegex: /firefox/, priority: 0 }));
+  const events = e.onToplevelMapped(top(1, 'firefox'));
+  assert.deepEqual(events, [{ kind: 'matched', registrationId: 100, surfaceId: 1 }]);
+  assert.equal(e.registrationFor(1), 100);
+});
+
+test('match engine: lower priority new reg steals from higher priority on add', () => {
+  const e = new MatchEngine();
+  // First: a low-priority fallback at priority 10 catches firefox.
+  e.addRegistration(reg(200, { appIdRegex: /.*/, priority: 10 }));
+  e.onToplevelMapped(top(1, 'firefox'));
+  assert.equal(e.registrationFor(1), 200);
+  // Now a higher-priority effect registers at priority 0. It must
+  // STEAL surface 1 from 200 and emit both unmatched (for 200) and
+  // matched (for 100).
+  const events = e.addRegistration(reg(100, { appIdRegex: /firefox/, priority: 0 }));
+  assert.deepEqual(events, [
+    { kind: 'unmatched', registrationId: 200, surfaceId: 1 },
+    { kind: 'matched', registrationId: 100, surfaceId: 1 },
+  ]);
+  assert.equal(e.registrationFor(1), 100);
+});
+
+test('match engine: same-priority later reg does NOT steal (registration order tiebreak)', () => {
+  const e = new MatchEngine();
+  // Both at default priority (0). First-registered wins.
+  e.addRegistration(reg(100, { appIdRegex: /firefox/ }));
+  e.onToplevelMapped(top(1, 'firefox'));
+  // Later same-priority registration must NOT steal.
+  const events = e.addRegistration(reg(200, { appIdRegex: /firefox/ }));
+  assert.deepEqual(events, []);
+  assert.equal(e.registrationFor(1), 100);
+});
+
+test('match engine: higher-priority (later) reg does NOT steal from lower-priority owner', () => {
+  const e = new MatchEngine();
+  // 100 at priority 0 takes firefox.
+  e.addRegistration(reg(100, { appIdRegex: /firefox/, priority: 0 }));
+  e.onToplevelMapped(top(1, 'firefox'));
+  // Later registration at priority 10 (worse) must not steal.
+  const events = e.addRegistration(reg(200, { appIdRegex: /.*/, priority: 10 }));
+  assert.deepEqual(events, []);
+  assert.equal(e.registrationFor(1), 100);
+});
+
+test('match engine: removeRegistration falls back to next-priority owner', () => {
+  const e = new MatchEngine();
+  // Decoration-like fallback at priority 10.
+  e.addRegistration(reg(200, { appIdRegex: /.*/, priority: 10 }));
+  // Higher-priority firefox effect at priority 0.
+  e.addRegistration(reg(100, { appIdRegex: /firefox/, priority: 0 }));
+  e.onToplevelMapped(top(1, 'firefox'));
+  assert.equal(e.registrationFor(1), 100);
+  // Remove the effect; decoration should pick the surface up.
+  const events = e.removeRegistration(100);
+  assert.deepEqual(events, [
+    { kind: 'unmatched', registrationId: 100, surfaceId: 1 },
+    { kind: 'matched', registrationId: 200, surfaceId: 1 },
+  ]);
+  assert.equal(e.registrationFor(1), 200);
+});
+
+test('match engine: priority defaults to 0 (compatibility)', () => {
+  const e = new MatchEngine();
+  // No priority field set on either; both should be treated as priority 0
+  // and resolve by insertion order.
+  e.addRegistration(reg(100, { appIdRegex: /firefox/ }));
+  e.addRegistration(reg(200, { appIdRegex: /firefox/ }));
+  e.onToplevelMapped(top(1, 'firefox'));
+  assert.equal(e.registrationFor(1), 100);
 });
 
 // --- onToplevelMapped -----------------------------------------------------

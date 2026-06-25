@@ -136,6 +136,16 @@ bus.on(WINDOW_EVENT.unmap, (ev) => { pluginBus.emit(WINDOW_EVENT.unmap, ev); });
 bus.on(WINDOW_EVENT.change, (ev) => { pluginBus.emit(WINDOW_EVENT.change, ev); });
 bus.on(WINDOW_EVENT.closing, (ev) => { pluginBus.emit(WINDOW_EVENT.closing, ev); });
 bus.on(WINDOW_EVENT.opening, (ev) => { pluginBus.emit(WINDOW_EVENT.opening, ev); });
+// Reverse bridge: the wm emits window.preconfigure on the plugin bus
+// synchronously inside markInitialCommitComplete. Mirror it onto the
+// typed bus so core-side subscribers (e.g. the intercept broker, which
+// matches at preconfigure to land setInsets before the first sized
+// configure) see it. The wm's emit is awaited; subscribers on the typed
+// bus run via observer fan-out (synchronous) before the wm proceeds to
+// the layout pass, which is the timing this seam exists for.
+pluginBus.subscribe(WINDOW_EVENT.preconfigure, (_name, ev) => {
+  bus.emit(WINDOW_EVENT.preconfigure, ev as import("./events/types.js").WindowPreconfigureEvent);
+});
 
 let ipcServer: IpcServer | null = null;
 
@@ -764,9 +774,19 @@ state.openingDriver = openingDriver;
 // Windows broker: services sdk.windows.set / set-state / get-state / get /
 // list / delete-state / set-output-stack. core-plugin-api.md §1.
 if (!state.wm) throw new Error("internal: state.wm not set by installProtocols");
+// Intercept broker is constructed below; windows.set-insets needs a
+// reference for its authorization check. Use an indirection so the
+// late-binding doesn't reorder broker construction.
+let interceptBrokerLate: InterceptBroker | null = null;
+const interceptBrokerForWindows = {
+  pluginNameForSurface(surfaceId: number): string | undefined {
+    return interceptBrokerLate?.pluginNameForSurface(surfaceId);
+  },
+};
 const windowsBroker = createWindowsBroker({
   wm: state.wm, compositor, state, pluginBus, bus,
   closingDriver, openingDriver,
+  interceptBroker: interceptBrokerForWindows,
 });
 
 // Animation evaluator + broker (core-plugin-api.md §9). The evaluator
@@ -845,9 +865,10 @@ state.installGrabCursor = (shape) => {
 // drives the cross-device dmabuf machinery shared with the gpu-broker.
 // eslint-disable-next-line no-restricted-syntax -- dawn.globals carries arbitrary GPU* entries
 const textureUsageBag = (dawn.globals as unknown as { GPUTextureUsage: typeof GPUTextureUsage }).GPUTextureUsage;
-const interceptBroker = new InterceptBroker({
+interceptBrokerLate = new InterceptBroker({
   bus,
   compositor,
+  gateSink: state.wm,
   inThread: {
     device,
     textureUsage: textureUsageBag,
@@ -865,6 +886,7 @@ const interceptBroker = new InterceptBroker({
   },
   log: (line) => log.info("plugin", line),
 });
+const interceptBroker = interceptBrokerLate;
 const interceptPluginBroker = createInterceptPluginBroker({
   interceptBroker,
   // emitToPlugin forwards events to a specific plugin by name. Used

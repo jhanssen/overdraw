@@ -63,6 +63,28 @@ export interface SurfaceMargin {
   left?: number;
 }
 
+// Insets carved out of a window's outer tile to derive its content rect.
+// Each field is a non-negative finite integer count of logical pixels.
+// `setInsets` clamps negative values to zero; total horizontal/vertical
+// insets exceeding the outer extent are clamped so the content rect
+// remains non-empty.
+export interface Insets {
+  top: number;
+  right: number;
+  bottom: number;
+  left: number;
+}
+
+// The result of setInsets: what the WM actually accepted (after clamping),
+// the current outer rect, and the derived content rect. The plugin can use
+// this to confirm the request landed at the expected dimensions before
+// e.g. releasing a content gate.
+export interface InsetGrant {
+  insets: Insets;
+  outerRect: { x: number; y: number; width: number; height: number };
+  contentRect: { x: number; y: number; width: number; height: number };
+}
+
 // Per-channel tint multiplier on the sampled rgba (Phase 5.5a). Identity is
 // (1,1,1,1); missing fields default to 1 (no change to that channel).
 // Examples: dim to half = { r: 0.5, g: 0.5, b: 0.5 }; suppress red =
@@ -181,6 +203,23 @@ export interface PluginWindows extends PluginWindowObserver {
   setOpacity(id: number, opacity: number): Promise<void>;
   setTransform(id: number, t: SurfaceTransform): Promise<void>;
   setOutputMargin(id: number, m: SurfaceMargin): Promise<void>;
+  // Reserve insets inside the window's outer tile. The WM shrinks the
+  // window's content rect by the insets and re-configures the client at
+  // the smaller size. Returns the actual insets, outer rect, and derived
+  // content rect (the WM may clamp negative values; the grant carries the
+  // post-clamp result). Returns null when the window is unknown.
+  //
+  // Authorization: the caller must own an intercept currently assigned
+  // to `id`. A plugin with no matching intercept on `id` cannot move
+  // its insets (a generic, unauthenticated setInsets would let any
+  // plugin shrink any window). The broker returns an error if the
+  // caller is not the assigned-intercept owner.
+  //
+  // Typical use: a decoration intercept calls setInsets from its
+  // onSurfaceMatched handler to reserve a border band; the WM then
+  // configures the client at the shrunk content size on the first
+  // sized configure.
+  setInsets(id: number, insets: Insets): Promise<InsetGrant | null>;
   // Alpha mask sampled across the (surface + outputMargin) region; the .a
   // channel modulates the surface's premultiplied rgb and alpha. null clears
   // (default-white, no visible effect). The caller OWNS the GPUTexture's
@@ -391,6 +430,22 @@ export function createPluginWindows(
       await endpoint.request("windows.set-output-margin", { id, m: m as unknown as Json });
     },
 
+    async setInsets(id, insets): Promise<InsetGrant | null> {
+      if (typeof id !== "number") {
+        throw new TypeError("setInsets id must be a number");
+      }
+      validateInsets(insets);
+      // Insets is a plain object of numbers -- structurally Json once
+      // it crosses the postMessage boundary.
+      // eslint-disable-next-line no-restricted-syntax
+      const payload = { id, insets: insets as unknown as Json };
+      const result = await endpoint.request("windows.set-insets", payload);
+      if (result === null) return null;
+      // The broker returns the InsetGrant directly. Trust the shape.
+      // eslint-disable-next-line no-restricted-syntax
+      return result as unknown as InsetGrant;
+    },
+
     async setMask(id, mask): Promise<void> {
       if (typeof id !== "number") {
         throw new TypeError("setMask id must be a number");
@@ -542,6 +597,18 @@ function validateMargin(m: SurfaceMargin): void {
     const v = m[k];
     if (v !== undefined && (typeof v !== "number" || !Number.isFinite(v) || v < 0)) {
       throw new TypeError(`setOutputMargin ${k} must be a non-negative finite number`);
+    }
+  }
+}
+
+function validateInsets(i: Insets): void {
+  if (typeof i !== "object" || i === null) {
+    throw new TypeError("setInsets insets must be an object");
+  }
+  for (const k of ["top", "right", "bottom", "left"] as const) {
+    const v = i[k];
+    if (typeof v !== "number" || !Number.isFinite(v)) {
+      throw new TypeError(`setInsets ${k} must be a finite number`);
     }
   }
 }

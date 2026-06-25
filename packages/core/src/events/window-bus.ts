@@ -11,7 +11,7 @@ import { TypedBus } from "./bus.js";
 import { WINDOW_EVENT } from "./types.js";
 import type {
   WindowMapEvent, WindowUnmapEvent, WindowChangeEvent, WindowStateBagChangedEvent,
-  WindowClosingEvent, WindowOpeningEvent,
+  WindowClosingEvent, WindowOpeningEvent, WindowPreconfigureEvent,
 } from "./types.js";
 
 // Keyboard-focus change (active window). surfaceId / clientId identify the
@@ -52,6 +52,7 @@ export interface CompositorEventMap {
   [WINDOW_EVENT.stateBagChanged]: WindowStateBagChangedEvent;
   [WINDOW_EVENT.closing]: WindowClosingEvent;
   [WINDOW_EVENT.opening]: WindowOpeningEvent;
+  [WINDOW_EVENT.preconfigure]: WindowPreconfigureEvent;
   [KEYBOARD_EVENT.focus]: KeyboardFocusEvent;
   [SELECTION_EVENT.changed]: SelectionChangedEvent;
 }
