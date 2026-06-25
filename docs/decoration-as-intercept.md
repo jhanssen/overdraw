@@ -180,53 +180,133 @@ Implementation:
 That's the entire SDK delta. Both extensions are additive (default
 behavior matches 10a today).
 
-## Content gate (decoration first-frame)
+## Match timing + the first-configure problem
 
-Today the decoration broker engages a content gate on
-`onAssigned` and releases on the decoration plugin's first
-present (or backstop). The gate exists because:
+The intercept match engine today fires `onSurfaceMatched` from
+`WINDOW_EVENT.map` (broker.ts:122-126). `window.map` fires AT
+first content commit. By that point the client has:
 
-- Client maps with no insets known; layout assigns it full outer.
-- Decoration plugin matches, calls `createDecoration({ insets })`,
-  which calls `wm.setInsets`, which schedules a relayout shrinking
-  the content rect.
-- The client receives a new configure with the smaller content
-  size and re-commits at that size.
-- Without the gate, between (a) the client's first commit at the
-  full size and (b) the re-commit at the inset size, the window
-  would briefly draw at the wrong size.
+1. Received its initial (throwaway 0x0) configure from
+   `sendInitialConfigure`.
+2. Received its REAL sized configure from the first layout pass
+   (in `markInitialCommitComplete` → `driver.schedule` →
+   `applyLayout` → `configure.configure(...)`).
+3. Committed a buffer at the size from step 2.
 
-With intercept-as-decoration the same race exists. The intercept's
-`onSurfaceMatched` fires synchronously from `window.map` (which
-fires BEFORE `windowHasContent` in `dispatchFrameCallbacks`), so
-the plugin's `sdk.windows.setInsets` call lands before content
-becomes drawable. But the WM has already given the client a
-configure at the full outer size (during `addWindow` / first
-layout pass); the client commits at that size; only after the
-post-setInsets relayout does it get reconfigured to the smaller
-content size.
+If the intercept plugin only learns of the window at step 3 and
+calls `setInsets` then, the client has already committed at the
+WRONG size. A second relayout fires (content rect shrunk by
+insets), the client gets re-configured at the smaller size, and
+re-commits. Between the two commits, if the window is drawing,
+the user sees one wrong-size frame.
 
-The decoration intercept must engage the content gate so the
-window doesn't draw until the inset relayout completes AND the
-client has re-committed at the new size AND the intercept's first
-render with the new dimensions has produced an output texture.
-This is the same lifecycle the existing decoration broker
-implements; the migration moves it into the intercept SDK or the
-plugin itself.
+The existing decoration broker handles this with a content gate:
+gate engaged at `onAssigned`, released on the decoration's first
+present. With intercept-as-decoration, the right fix is **move
+the match check earlier** -- to `window.preconfigure`, the seam
+where the WM fires an interceptable event AFTER the client has
+declared its app_id but BEFORE the real sized configure goes out
+(wm/index.ts:1860 + the `window.preconfigure` event in the
+existing window-rules path).
 
-Recommended: extend the intercept SDK so a registration can
-declare `gates: true` in its spec. When the SDK matches a
-surface with `gates: true`, it engages the content gate under
-owner `"intercept-decoration"` at `onSurfaceMatched` time and
-releases on the first successful `render` whose input dimensions
-match the post-insets content rect (i.e. the client has
-re-committed at the smaller size). This keeps the gating
-mechanism mechanical and reusable: any intercept that needs to
-hold content until its first render can opt in.
+Sequence with preconfigure-time match:
 
-The opening-driver content gate (engaged by a separate
-`window-opening` plugin) is independent; both gates can coexist
-under the multi-owner gate system already implemented.
+1. `get_toplevel` -> `addWindow` with `deferInitialCommit: true`
+   (the production xdg_surface handler already opts in).
+2. Client sets app_id, sends initial commit (no buffer).
+3. `sendInitialConfigure` -> throwaway 0x0 first configure (no
+   size; client picks its own for now).
+4. `markInitialCommitComplete` fires `window.preconfigure`
+   synchronously (interceptable, awaitable).
+5. **The intercept match engine evaluates HERE**: appId is set,
+   role is `xdg_toplevel`, match runs, if a registration matches
+   the SDK fires `onSurfaceMatched(info)`.
+6. Plugin's `onSurfaceMatched` calls `sdk.windows.setInsets`
+   synchronously inside the preconfigure interceptor chain.
+7. `markInitialCommitComplete` returns -> layout pass runs ->
+   REAL configure with the (post-insets) content size goes out.
+8. Client commits at the right content size first time.
+9. `windowHasContent` -> intercept's first `render` fires with
+   the right input dimensions.
+
+This eliminates the wrong-size flash without needing a content
+gate. The gate becomes a backstop only (for cases where match
+happens late, e.g. when an intercept is registered AFTER the
+window mapped; the catch-up pass for already-mapped windows
+runs through `window.map`-time match-and-gate).
+
+### `gates` field on InterceptSpec
+
+The SDK extends `InterceptSpec` with `gates?: boolean`. When
+true, the SDK engages a content gate (under owner
+`"intercept-${spec.name}"`) at `onSurfaceMatched` time. Release
+mechanism:
+
+**The plugin owns release policy.** The SDK injects a
+`releaseGate` callback into the render context:
+
+```ts
+render({ input, output, ctx, releaseGate }) {
+  // ... do work ...
+  releaseGate?.();   // when the plugin is satisfied
+}
+```
+
+The default policy a plugin author would use for "release on
+first render at expected dimensions": the plugin knows the
+content rect it expects (it set the insets, it knows `B`, it
+can compute expected = outer - 2B). The plugin needs the outer
+rect to do that math. Either:
+
+- Plugin receives `ctx.surfaceRect` (the WM outer rect) in the
+  render context; it computes `expected = surfaceRect.w - 2*B`
+  and compares against `input.rect.w`. Release on match.
+- Or plugin just releases on the first render, accepting the
+  one-frame race for the (rare) case where match landed late.
+
+For the migration, the bundled decoration plugin uses
+preconfigure-time match (no race) AND releases on first render
+unconditionally (defensive against late-match catch-up). For
+late-match catch-up, the plugin can detect dimensional mismatch
+and defer release, but practically the catch-up case is rare
+(intercept registers post-startup; usually a window unmaps and
+remaps before this matters).
+
+Backstop: 10 seconds; if neither the plugin nor any first render
+fires within that, force-release so a stuck plugin can't keep
+the window invisible.
+
+### Why not always release after first render unconditionally?
+
+For preconfigure-time matches it's safe (the first render is at
+the correct dimensions). For late-match catch-up of an
+already-mapped window, the first render may be at the
+pre-`setInsets` dimensions. Releasing then shows one wrong-size
+frame. Letting the plugin own release policy gives the plugin a
+choice: accept the frame (simpler) or wait for the right
+dimensions (correct but more complex).
+
+The reference bundled plugin **accepts the one-frame race for
+the late-match case** because:
+- The preconfigure-time match (the common case for new windows)
+  has no race.
+- The late-match case only triggers when a plugin is registered
+  after window maps; rare in practice.
+- Implementing "wait for dim change" in the plugin is more code
+  for marginal benefit.
+
+If a plugin author needs strict no-race behavior they can do
+the dim comparison themselves; the SDK supports it via
+`ctx.surfaceRect`.
+
+### Multi-owner gate composition
+
+The opening-driver's content gate (engaged by a separate
+`window-opening` plugin) is independent. Multiple gate owners
+coexist under the multi-owner gate system already implemented.
+A decorated window with an opening-animation plugin has both
+gates engaged at map time; the window enters the draw stack
+only when both release.
 
 ## Bundled decoration plugin (rewrite)
 
@@ -589,18 +669,35 @@ Total: ~1.5 to 2 days.
 - `setShape` API on `sdk.windows`. The intercept output texture
   can be clipped by an SDF shape via the compositor's existing
   shape system. Decoration plugin sets a per-window shape (e.g.
-  squircle) that clips the output. **But**: today's plugin sets
-  TWO shapes — outer (on the decoration surface) and inner (on
-  the content surface). With one combined texture, only ONE
-  shape applies — the outer. The "inner shape clips client
-  content" effect is gone; the client's content sits in a
-  rectangular inset region inside the rounded outer. Acceptable
-  for most uses; if a user wants the client texture itself
-  rounded, that's a separate setShape call from the intercept
-  plugin against the original surfaceId... but the compositor
-  no longer samples the original surface (it samples the
-  intercept output). So `setShape(windowId, ...)` applies to
-  the OUTPUT, which is what we want.
+  squircle) that clips the OUTER edge of the output.
+
+  Inner clipping (rounding the client content's edge against the
+  border band) is the plugin's job, NOT the compositor's. Today
+  the bundled plugin uses two setShape calls -- outer on the
+  decoration surface (radius R), inner on the content surface
+  (radius max(0, R-B)) -- so the border band is uniformly thick
+  around the curved corners. With one combined output texture,
+  only ONE setShape applies (the outer); the compositor cannot
+  apply a separate inner shape to the client texture region.
+
+  The plugin gets the same uniform-band visual by doing the
+  inner SDF mask itself in its WGSL blit pass. When blitting
+  `args.input.texture` into the inset region of
+  `args.output.texture`, the plugin evaluates an inner SDF
+  (radius max(0, R-B), inset by B on each side) and discards
+  fragments outside the inner shape. This produces:
+    - Rounded outer perimeter via compositor setShape(outer).
+    - Rounded inner boundary between client content and border
+      band via the plugin's own SDF.
+    - Uniformly thick border band around the corner (the
+      distance from inner edge to outer edge is constant).
+
+  The plugin needs the outer shape parameters (radius, kind,
+  per-corner radii, superellipse exponent) to compute the
+  inset inner SDF. The same `DecorationShape` config the
+  bundled plugin already supports, plus the existing `insetShape`
+  helper, gives the plugin everything it needs. No additional
+  SDK surface required.
 - `setOpacity`, `setTint`, `setColorMatrix` group-aware paths:
   with no separate decoration surface, the "group" for a
   windowId is just the content surface (and any subsurfaces).
