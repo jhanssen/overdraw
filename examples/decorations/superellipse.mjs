@@ -10,23 +10,29 @@
 //
 // Then point a client at the printed WAYLAND_DISPLAY.
 //
-// About the superellipse:
-//   |x/a|^n + |y/b|^n = 1
-// exponent=2  -> ellipse
-// exponent=4..6 -> the macOS-style "squircle" (continuous-curvature corner;
-//                  smoother eye-tracking than a circular arc into a flat
-//                  edge). exponent=5 is a common choice; macOS itself uses
-//                  ~5 with some additional smoothing math.
-// large exponent -> approaches a sharp rectangle.
+// About the superellipse shape:
+//   The window is a rectangle whose CORNERS are replaced by a localized
+//   superelliptic curve. Edges stay straight; only the corner box of size
+//   (radius, radius) follows the squircle math. This matches the macOS
+//   style: a normal-shaped window with smoothed corners, NOT a full
+//   ellipse covering the whole window.
 //
-// `radius` is the half-extent on the SHORTER axis -- exposed for symmetry
-// with rounded-rect APIs; the compositor uses the surface's actual extents
-// in both axes regardless.
+// `exponent` controls the corner character:
+//   2     -> circular arc (identical to a rounded-rect with the same radius)
+//   4..6  -> the macOS "squircle" range (continuous-curvature corner;
+//            smoother eye-tracking than a circular arc into the flat edge)
+//   large -> approaches a sharp rectangle (the curve compresses into the
+//            very last pixel of the corner)
+//
+// `radius` is the corner extent in logical pixels, clamped to
+// min(width, height) / 2. Typical values: 8..16 for a normal-sized window
+// matches GTK / GNOME conventions; 12..24 for a more macOS-like
+// pronouncement.
 export default {
   decoration: {
     border: {
       width: 2,
-      shape: { kind: "superellipse", exponent: 5, radius: 24 },
+      shape: { kind: "superellipse", exponent: 5, radius: 12 },
     },
     // A subtle two-stop focused gradient + flat dim unfocused. Skip these
     // fields to keep the bundled plugin's defaults.

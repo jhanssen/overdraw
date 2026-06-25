@@ -78,13 +78,13 @@ struct Uniforms {
   tint        : vec4f,
   colorMatrix : mat4x4f,
   // Per-surface shape. .x = kind (0=rect / 1=rounded-rect uniform /
-  // 2=rounded-rect per-corner / 3=superellipse); .y = surface logical width
-  // (px) the SDF eval works against; .z = surface logical height (px);
-  // .w = uniform corner radius (px) when kind=1, superellipse outer radius
-  // (px) when kind=3, unused when kind=0/2.
+  // 2=rounded-rect per-corner / 3=squircle-cornered rect); .y = surface
+  // logical width (px) the SDF eval works against; .z = surface logical
+  // height (px); .w = corner extent (px) when kind=1 (rounded-rect uniform
+  // radius) or kind=3 (squircle corner extent), unused when kind=0/2.
   shape       : vec4f,
   // kind=2 (per-corner): tl, tr, br, bl radii in px.
-  // kind=3 (superellipse): .x = exponent (>= 2), .yzw unused.
+  // kind=3 (squircle): .x = exponent (>= 2), .yzw unused.
   // kind=0/1: unused.
   shapeExtra  : vec4f,
 };
@@ -142,21 +142,34 @@ fn sdfRoundedRectPerCorner(p : vec2f, he : vec2f,
   return sdfRoundedRect(p, he, r);
 }
 
-// Signed distance to a superellipse |x/a|^n + |y/b|^n = 1, approximated as
-// (R(p) - 1) * min(a, b), where R(p) = (|x/a|^n + |y/b|^n)^(1/n). The factor
-// makes the field roughly unit-scaled near the boundary, so the smoothstep
-// AA width below has the same look as for the other shapes. Negative inside,
-// positive outside. \`he\` are the half-extents (a, b); \`n\` is the exponent
-// (n=2 -> ellipse; n=4..6 -> macOS-like squircle; n -> inf approaches rect).
-// Guards against n < 2 by clamping (n < 2 gives concave shapes that are not
-// the intended use).
-fn sdfSuperellipse(p : vec2f, he : vec2f, n : f32) -> f32 {
+// Signed distance to a rectangle whose CORNERS are replaced by a localized
+// superelliptic curve of size \`r\` (the macOS-style squircle corner). \`he\`
+// are the half-extents of the full rectangle; \`r\` is the corner extent
+// (clamped to <= min(he.x, he.y)); \`n\` is the superellipse exponent.
+// n=2 gives a circular corner identical to the rounded-rect SDF; n=4..6
+// gives the macOS look (continuous-curvature corner; smoother eye-tracking
+// than a circular arc); large n approaches a sharp rectangle.
+//
+// Approach: in the corner quadrant (q.x > 0 AND q.y > 0 where q = |p| - he
+// + r), evaluate the superelliptic SDF in the local (r, r) box; elsewhere
+// (on an edge or in the interior) use the rounded-rect edge formula. This
+// matches the standard rounded-rect SDF's structure -- the corner radius
+// is the same edge inset across both formulas.
+fn sdfSquircleRect(p : vec2f, he : vec2f, r : f32, n : f32) -> f32 {
+  let cr = min(r, min(he.x, he.y));
   let exp = max(n, 2.0);
-  let ax = abs(p.x) / max(he.x, 1e-5);
-  let ay = abs(p.y) / max(he.y, 1e-5);
-  let r = pow(pow(ax, exp) + pow(ay, exp), 1.0 / exp);
-  let scale = min(he.x, he.y);
-  return (r - 1.0) * scale;
+  let q = abs(p) - he + vec2f(cr);
+  let edge = min(max(q.x, q.y), 0.0);  // negative interior + edge bands
+  // In the corner box (q > 0 on both axes) evaluate the squircle SDF
+  // against a local (cr, cr) box; outside, the corner contribution is 0.
+  let qc = max(q, vec2f(0.0));
+  let ax = qc.x / max(cr, 1e-5);
+  let ay = qc.y / max(cr, 1e-5);
+  // (|x|^n + |y|^n)^(1/n) is 1 on the squircle boundary; scale back to px
+  // by multiplying by cr. Subtract cr so the SDF is 0 on the curve.
+  let cornerR = pow(pow(ax, exp) + pow(ay, exp), 1.0 / exp);
+  let corner = cornerR * cr - cr;
+  return edge + corner;
 }
 
 // Convert a signed-distance value into [0,1] coverage with ~1px wide
@@ -183,7 +196,7 @@ fn shapeCoverage(uv : vec2f, kind : u32,
       sdfRoundedRectPerCorner(p, he, extra.x, extra.y, extra.z, extra.w));
   }
   if (kind == 3u) {
-    return sdfCoverage(sdfSuperellipse(p, he, extra.x));
+    return sdfCoverage(sdfSquircleRect(p, he, r, extra.x));
   }
   return 1.0;
 }

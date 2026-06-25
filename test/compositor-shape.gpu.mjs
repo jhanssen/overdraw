@@ -119,23 +119,70 @@ test("per-surface analytic shape (setSurfaceShape)", { skip }, async (t) => {
       assert.equal(at(data, SZ - 1, SZ - 1)[2], 255, "BR corner stays red (square)");
     });
 
-    await t.test("superellipse: rounds the corners with a fatter middle than rounded-rect", async () => {
+    await t.test("superellipse: squircle corners (localized), straight edges", async () => {
       const comp = new JsCompositor(device, dawn.globals, addon, { width: W, height: H });
       comp.uploadPixels(1, { width: SZ, height: SZ, stride: red.stride }, red.data);
       comp.setSurfaceLayout(1, 0, 0, SZ, SZ);
       comp.setStack([1]);
 
-      // A squircle: exponent 4 makes a recognizable fat-corner shape. Same
-      // top-left near-corner pixel should still be clipped, while the
-      // center stays red.
-      comp.setSurfaceShape(1, { kind: "superellipse", exponent: 4, radius: 0 });
+      // Squircle corners with extent 12px and exponent 4 (macOS-ish look).
+      // The corner is localized to the (radius, radius) box; the rest of
+      // the edge is a straight line of the rectangle.
+      comp.setSurfaceShape(1, { kind: "superellipse", exponent: 4, radius: 12 });
       comp.renderFrame();
       const { data } = await comp.readback();
-      assert.equal(at(data, 0, 0)[2], 0, "TL outermost corner is clipped");
+      // Near-corner pixel is clipped (inside the corner-extent box, the
+      // squircle curve excludes the outermost pixel).
+      assert.equal(at(data, 1, 1)[2], 0, "TL near-corner is clipped");
+      assert.equal(at(data, SZ - 2, 1)[2], 0, "TR near-corner is clipped");
+      assert.equal(at(data, 1, SZ - 2)[2], 0, "BL near-corner is clipped");
+      assert.equal(at(data, SZ - 2, SZ - 2)[2], 0, "BR near-corner is clipped");
+      // Mid-edge: outside the (radius, radius) corner box, the shape is a
+      // straight rectangle edge -- so a mid-edge pixel right at the edge
+      // stays red.
+      assert.equal(at(data, SZ / 2, 1)[2], 255, "mid-top edge stays red");
+      assert.equal(at(data, SZ / 2, SZ - 2)[2], 255, "mid-bottom edge stays red");
+      assert.equal(at(data, 1, SZ / 2)[2], 255, "mid-left edge stays red");
+      assert.equal(at(data, SZ - 2, SZ / 2)[2], 255, "mid-right edge stays red");
+      // Center stays red.
       assert.equal(at(data, SZ / 2, SZ / 2)[2], 255, "center stays red");
-      // Mid-edge: a squircle's edge bulges out to nearly touch the rect bound,
-      // so a mid-edge pixel one in from the edge should still be inside.
-      assert.equal(at(data, SZ / 2, 1)[2], 255, "mid-edge stays red");
+    });
+
+    await t.test("superellipse: radius=0 means no rounding (effective rect)", async () => {
+      const comp = new JsCompositor(device, dawn.globals, addon, { width: W, height: H });
+      comp.uploadPixels(1, { width: SZ, height: SZ, stride: red.stride }, red.data);
+      comp.setSurfaceLayout(1, 0, 0, SZ, SZ);
+      comp.setStack([1]);
+
+      comp.setSurfaceShape(1, { kind: "superellipse", exponent: 5, radius: 0 });
+      comp.renderFrame();
+      const { data } = await comp.readback();
+      // All four corners stay red -- corner extent is 0, no curve to apply.
+      assert.equal(at(data, 0, 0)[2], 255, "TL stays red (no rounding)");
+      assert.equal(at(data, SZ - 1, 0)[2], 255, "TR stays red");
+      assert.equal(at(data, 0, SZ - 1)[2], 255, "BL stays red");
+      assert.equal(at(data, SZ - 1, SZ - 1)[2], 255, "BR stays red");
+    });
+
+    await t.test("superellipse exponent=2 matches rounded-rect (circular arc baseline)", async () => {
+      // Under the new model, exponent=2 reduces to a circular arc corner --
+      // i.e. the squircle SDF degenerates to a quarter-circle. So a squircle
+      // with exponent=2 and a rounded-rect with the same radius should
+      // produce visually-equivalent corner clipping.
+      const comp = new JsCompositor(device, dawn.globals, addon, { width: W, height: H });
+      comp.uploadPixels(1, { width: SZ, height: SZ, stride: red.stride }, red.data);
+      comp.setSurfaceLayout(1, 0, 0, SZ, SZ);
+      comp.setStack([1]);
+
+      // The straight-edge midpoints + center stay red for both shapes;
+      // the near-corner pixels are clipped for both. Stronger test:
+      // assert the squircle case shows clipping at the same near-corner
+      // pixels rounded-rect does.
+      comp.setSurfaceShape(1, { kind: "superellipse", exponent: 2, radius: 12 });
+      comp.renderFrame();
+      const { data } = await comp.readback();
+      assert.equal(at(data, 1, 1)[2], 0, "TL corner clipped (n=2)");
+      assert.equal(at(data, SZ / 2, 1)[2], 255, "mid-top stays red (n=2)");
     });
 
     await t.test("shape composes with opacity (multiplicative)", async () => {

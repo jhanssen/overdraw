@@ -89,14 +89,18 @@ export type ColorMatrix = readonly number[] | Float32Array;
 // / extents are in surface LOGICAL pixels.
 //
 // Vocabulary:
-//   rounded-rect:           uniform corner radius
-//   rounded-rect-per-corner: independent (tl, tr, br, bl) radii
-//   superellipse:           |x/a|^n + |y/b|^n = 1 (n=4..6 is a macOS-like
-//                           squircle; n=2 is an ellipse; n -> inf approaches
-//                           a sharp rect). `radius` is the half-extent in the
-//                           SHORTER axis -- exposed for symmetry with the
-//                           rounded-rect variants and the compositor uses the
-//                           surface's actual extents in both axes regardless.
+//   rounded-rect:           uniform corner radius (circular arc)
+//   rounded-rect-per-corner: independent (tl, tr, br, bl) radii (circular arcs)
+//   superellipse:           a rectangle whose corners are replaced by a
+//                           localized superelliptic curve of extent `radius`
+//                           (the macOS-style squircle corner). `exponent`
+//                           controls the curve character: n=2 is identical
+//                           to rounded-rect (circular arc); n=4..6 is the
+//                           macOS-style squircle (continuous-curvature
+//                           corner with smoother eye-tracking than a circular
+//                           arc); larger n approaches a sharp rectangle.
+//                           `radius` is the corner extent in logical px and
+//                           is clamped to <= min(width, height) / 2.
 export type SurfaceShape =
   | null
   | { kind: "rounded-rect"; radius: number }
