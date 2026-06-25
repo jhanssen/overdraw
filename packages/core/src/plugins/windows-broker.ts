@@ -45,6 +45,14 @@ export interface WindowsBrokerDeps {
   // configuration without closing-animation support), destroy-phantom
   // still works -- it just skips the backstop-cancel step.
   closingDriver?: import("../protocols/closing-driver.js").ClosingDriver;
+  // Mirror of closingDriver on the map side. The release-opening-gate
+  // path cancels this driver's backstop in addition to clearing the
+  // WM content gate. Optional: a configuration without opening
+  // animations leaves this undefined and release-opening-gate just
+  // clears the gate (no backstop to cancel; setContentGated is
+  // idempotent so this is also a safe no-op when nothing was
+  // engaged).
+  openingDriver?: import("../protocols/opening-driver.js").OpeningDriver;
 }
 
 // The shape main.ts plugs into its onRequest chain. Returns the result for
@@ -59,7 +67,7 @@ export type WindowsBroker = (
 export const NOT_HANDLED = Symbol("windows-broker:not-handled");
 
 export function createWindowsBroker(deps: WindowsBrokerDeps): WindowsBroker {
-  const { wm, compositor, state, pluginBus, closingDriver } = deps;
+  const { wm, compositor, state, pluginBus, closingDriver, openingDriver } = deps;
 
   return (pluginName: string, method: string, params: unknown): unknown | typeof NOT_HANDLED => {
     void pluginName;   // available for future audit / capability gating
@@ -81,6 +89,7 @@ export function createWindowsBroker(deps: WindowsBrokerDeps): WindowsBroker {
     if (method === "windows.set-tint") return handleSetTint(params);
     if (method === "windows.set-color-matrix") return handleSetColorMatrix(params);
     if (method === "windows.destroy-phantom") return handleDestroyPhantom(params);
+    if (method === "windows.release-opening-gate") return handleReleaseOpeningGate(params);
     return NOT_HANDLED;
   };
 
@@ -98,6 +107,22 @@ export function createWindowsBroker(deps: WindowsBrokerDeps): WindowsBroker {
     // a no-op when the timer was already cancelled.
     closingDriver?.cancelBackstop(p.id);
     compositor.destroyClosingPhantom(p.id);
+    return null;
+  }
+
+  function handleReleaseOpeningGate(p: unknown): null {
+    if (!isReleaseOpeningGatePayload(p)) {
+      throw new Error("windows.release-opening-gate: malformed payload");
+    }
+    // Cancel the backstop FIRST -- if the timer fires between here
+    // and the gate clear, it'd log a spurious warning even though
+    // the plugin did its job.
+    openingDriver?.cancelBackstop(p.id);
+    // Clear the gate. setContentGated is idempotent and a no-op when
+    // the gate isn't engaged, so releasing on a non-gated window is
+    // a safe call (covers the "plugin received window.opening but
+    // the gate was already cleared by the backstop in between" race).
+    wm.setContentGated(p.id, false);
     return null;
   }
 
@@ -480,4 +505,8 @@ function isDestroyPhantomPayload(d: unknown): d is { id: number } {
   if (typeof d !== "object" || d === null) return false;
   const o = d as { [k: string]: unknown };
   return typeof o.id === "number" && Number.isInteger(o.id) && o.id > 0;
+}
+
+function isReleaseOpeningGatePayload(d: unknown): d is { id: number } {
+  return isDestroyPhantomPayload(d);
 }

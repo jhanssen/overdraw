@@ -669,6 +669,15 @@ export interface WmOptions {
   // needed at all. requestFocus(id) applies focus.
   currentFocusedSurfaceId?: () => number | null;
   requestFocus?: (surfaceId: number | null) => void;
+  // Opening-driver hook: called at the first-content edge of a mapped
+  // toplevel, after the window is added to the WM and its rect is
+  // assigned but BEFORE pushStack. Should return true if the
+  // window's appearance was claimed by a plugin (the driver engaged
+  // the content gate via setContentGated; pushStack will skip it
+  // until the gate clears). Return false (or omit the hook) for the
+  // instant-map default. Tests / harnesses that don't wire a runtime
+  // omit it; map is then always instant.
+  beforeMap?: (surfaceId: number) => boolean;
 }
 
 // Convenience: build the WM's per-output map from a list of descriptors,
@@ -727,6 +736,7 @@ export function createWm(
   const outputContent = opts?.outputContent;
   const currentFocusedSurfaceId = opts?.currentFocusedSurfaceId;
   const requestFocus = opts?.requestFocus;
+  const beforeMap = opts?.beforeMap;
   // Shared broker if one was provided; otherwise a private one wired to
   // this compositor sink. The broker absorbs freeze/thaw/timer/frozen-
   // ready plumbing; the WM keeps the resize-specific data (configure
@@ -1388,6 +1398,15 @@ export function createWm(
         // z=0 from addWindow, putting it under everything.
         assignZForMap(win);
         compositor.setSurfaceLayout(win.surfaceId, win.rect.x, win.rect.y, win.rect.width, win.rect.height);
+        // Opening-driver hook: if a 'window-opening' plugin is
+        // present, it engages the content gate via setContentGated
+        // before returning. pushStack then naturally omits this
+        // surface until the plugin calls releaseOpeningGate (or the
+        // backstop fires). The plugin sees the bus event with the
+        // window's outer rect synchronously inside beforeMap, so it
+        // can set initial transform / opacity before the first
+        // composite would have included this surface.
+        beforeMap?.(win.surfaceId);
         pushStack();
         // Modal map: tether keyboard focus to the modal if its parent
         // chain currently holds focus. Runs after pushStack so a focus

@@ -222,6 +222,24 @@ export interface PluginWindows extends PluginWindowObserver {
   // (effectively) a no-op -- the compositor's destroyClosingPhantom
   // refuses non-phantom ids.
   destroyPhantom(id: number): Promise<void>;
+
+  // Release the content gate engaged at window.opening for `id`. The
+  // window then enters the compositor's draw stack and the next
+  // composite includes it -- with whatever per-surface render state
+  // the plugin set before calling this. Typical pattern:
+  //
+  //   sdk.events.on("window.opening", (ev) => {
+  //     sdk.windows.setTransform(ev.surfaceId, { translateX: ev.outerRect.width });
+  //     sdk.windows.releaseOpeningGate(ev.surfaceId);  // visible from this frame
+  //     sdk.animations.run(tween(target.windowTransform(ev.surfaceId),
+  //       { from: { translateX: ev.outerRect.width }, to: { translateX: 0 },
+  //         duration: 200 }));
+  //   });
+  //
+  // The release-gate path cancels the opening-driver's backstop timer.
+  // No-op if no gate is engaged on `id` (idempotent + safe to call on
+  // a non-gated window).
+  releaseOpeningGate(id: number): Promise<void>;
 }
 
 // The id of the primary output (kept in sync with OUTPUT_DEFAULT in
@@ -426,6 +444,13 @@ export function createPluginWindows(
         throw new TypeError("destroyPhantom id must be a positive integer");
       }
       await endpoint.request("windows.destroy-phantom", { id });
+    },
+
+    async releaseOpeningGate(id): Promise<void> {
+      if (typeof id !== "number" || !Number.isInteger(id) || id <= 0) {
+        throw new TypeError("releaseOpeningGate id must be a positive integer");
+      }
+      await endpoint.request("windows.release-opening-gate", { id });
     },
   };
 

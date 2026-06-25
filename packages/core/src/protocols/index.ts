@@ -395,6 +395,22 @@ export async function installProtocols(
       // no-op.
       currentFocusedSurfaceId: () => state.seat?.kbFocus?.surfaceId ?? null,
       requestFocus: (surfaceId) => state.seat?.applyKeyboardFocus(surfaceId),
+      // Opening-driver hook: dispatched from wm.windowHasContent
+      // before pushStack. state.openingDriver is set by main.ts
+      // AFTER the runtime is up; resolve it lazily so the hook is a
+      // no-op in early life. Returns true when the driver engaged
+      // the content gate (a 'window-opening' plugin claimed); the
+      // WM doesn't actually consume the return value (the gate it
+      // engages is observed via the existing contentGated machinery
+      // in pushStack), but returning a boolean keeps the shape
+      // consistent with other plugin-style hooks.
+      beforeMap: (surfaceId) => {
+        const driver = state.openingDriver;
+        if (!driver) return false;
+        const rec = state.surfacesById?.get(surfaceId);
+        if (!rec) return false;
+        return driver.beforeMap(state, rec);
+      },
     },
   );
   // Expose wm.schedule via state.relayout for callers outside the WM that

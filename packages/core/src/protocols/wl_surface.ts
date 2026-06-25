@@ -676,6 +676,12 @@ export function detachSurfaceRole(state: CompositorState, s: SurfaceRecord): voi
   // to capture a phantom. No-op when no plugin claims the
   // 'window-closing' namespace.
   state.closingDriver?.beforeUnmap(state, s);
+  // Cancel any opening-driver backstop -- if the window unmaps while
+  // still gated (client crashed before the plugin called
+  // releaseOpeningGate, or window destroyed mid-animation), the timer
+  // would fire later on a surfaceId that no longer exists. Idempotent
+  // when no backstop is armed.
+  state.openingDriver?.cancelBackstop(s.id);
   // Emit window.unmap for toplevel-shaped surfaces only. Override-redirect
   // xwayland overlays are transient (menus/tooltips/DnD icons); plugins
   // never saw a corresponding window.map for them and shouldn't see an

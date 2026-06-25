@@ -59,6 +59,13 @@ export const WINDOW_EVENT = {
   // layer; its lifetime is plugin-driven (via sdk.windows.destroyPhantom)
   // or the compositor's 10s backstop. core-plugin-api.md §9.
   closing: "window.closing",
+  // First content commit of a mapped toplevel, gated. Fires only if a
+  // 'window-opening' plugin is registered; the window is held out of the
+  // draw stack until the plugin calls sdk.windows.releaseOpeningGate or
+  // the backstop fires. The plugin sets initial per-surface render
+  // state synchronously so the first visible frame is already
+  // mid-animation. See WindowOpeningEvent.
+  opening: "window.opening",
 } as const;
 
 // `type` (not `interface`) so the payloads carry an implicit index signature and
@@ -283,6 +290,31 @@ export type WindowClosingEvent = {
   title: string | null;
 };
 
+// Emitted at first-content commit of a mapped toplevel, BEFORE the window
+// enters the draw stack, IFF a plugin claims the 'window-opening'
+// namespace. While the event is being delivered, the window is held out
+// of the compositor's stack by a content gate (wm.setContentGated). The
+// plugin synchronously sets initial per-surface render state (transform
+// / opacity / etc.) so the very first frame the user sees is already
+// mid-animation, then calls sdk.windows.releaseOpeningGate(surfaceId)
+// to release the gate. A backstop timer (10s default) force-releases
+// if the plugin never does, so a buggy / stuck plugin can't keep a
+// window invisible indefinitely.
+//
+// The plugin then runs its animation asynchronously toward identity
+// via sdk.animations.run -- the gate has already been released so the
+// animation plays over visible frames.
+//
+// `outerRect` is the window's outer rect at the time of first content
+// (= the layout-driver's assignment for this tile). `appId` / `title`
+// may be null (client hasn't set them yet).
+export type WindowOpeningEvent = {
+  surfaceId: number;
+  outerRect: WindowRect;
+  appId: string | null;
+  title: string | null;
+};
+
 // Decoration-provider events (core -> the matched provider plugin).
 export const DECORATION_EVENT = {
   assigned: "decoration.assigned",
@@ -336,6 +368,7 @@ export type _UnmapIsCloneable = AssignableToCloneable<WindowUnmapEvent>;
 export type _ChangeIsCloneable = AssignableToCloneable<WindowChangeEvent>;
 export type _RelayoutIsCloneable = AssignableToCloneable<WindowRelayoutEvent>;
 export type _ClosingIsCloneable = AssignableToCloneable<WindowClosingEvent>;
+export type _OpeningIsCloneable = AssignableToCloneable<WindowOpeningEvent>;
 export type _AssignedIsCloneable = AssignableToCloneable<DecorationAssignedEvent>;
 export type _DeregisteredIsCloneable = AssignableToCloneable<DecorationDeregisteredEvent>;
 export type _ResizedIsCloneable = AssignableToCloneable<DecorationResizedEvent>;

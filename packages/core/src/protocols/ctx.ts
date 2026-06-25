@@ -593,6 +593,13 @@ export interface CompositorState {
   // no closing plugin is registered -- the unmap then proceeds
   // instantly (pre-phase-9a behavior).
   closingDriver?: import("./closing-driver.js").ClosingDriver;
+  // Mirror of closingDriver for the map side. Hooked from
+  // wm.windowHasContent at first-content commit: if a 'window-opening'
+  // plugin is present, the driver engages the WM content gate and
+  // emits window.opening so the plugin can set initial render state
+  // before the first frame composites. Absent or returns false when
+  // no opening plugin is registered -- the map proceeds instantly.
+  openingDriver?: import("./opening-driver.js").OpeningDriver;
   // Phase 9c: cursor kinematic state machine. Pointer motion events in
   // wl_seat feed it; the cursor rule engine reads its snapshot per frame.
   // Absent in GPU-free harnesses that don't bring up cursor support.

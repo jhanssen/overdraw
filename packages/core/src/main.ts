@@ -135,6 +135,7 @@ bus.on(WINDOW_EVENT.map, (ev) => { pluginBus.emit(WINDOW_EVENT.map, ev); });
 bus.on(WINDOW_EVENT.unmap, (ev) => { pluginBus.emit(WINDOW_EVENT.unmap, ev); });
 bus.on(WINDOW_EVENT.change, (ev) => { pluginBus.emit(WINDOW_EVENT.change, ev); });
 bus.on(WINDOW_EVENT.closing, (ev) => { pluginBus.emit(WINDOW_EVENT.closing, ev); });
+bus.on(WINDOW_EVENT.opening, (ev) => { pluginBus.emit(WINDOW_EVENT.opening, ev); });
 
 let ipcServer: IpcServer | null = null;
 
@@ -748,12 +749,24 @@ const closingDriver = createClosingDriver({
 });
 state.closingDriver = closingDriver;
 
+// Opening driver: mirror of the closing driver on the map side. When a
+// 'window-opening' plugin is registered, the driver engages the WM
+// content gate at first-content commit + emits window.opening so the
+// plugin sets initial render state before the first composite would
+// include the surface. No-op otherwise (instant map; the default).
+const { createOpeningDriver } = await import("./protocols/opening-driver.js");
+const openingDriver = createOpeningDriver({
+  hasPluginHandler: () => runtime?.registry().active("window-opening") !== null
+    && runtime?.registry().active("window-opening") !== undefined,
+});
+state.openingDriver = openingDriver;
+
 // Windows broker: services sdk.windows.set / set-state / get-state / get /
 // list / delete-state / set-output-stack. core-plugin-api.md §1.
 if (!state.wm) throw new Error("internal: state.wm not set by installProtocols");
 const windowsBroker = createWindowsBroker({
   wm: state.wm, compositor, state, pluginBus, bus,
-  closingDriver,
+  closingDriver, openingDriver,
 });
 
 // Animation evaluator + broker (core-plugin-api.md §9). The evaluator
