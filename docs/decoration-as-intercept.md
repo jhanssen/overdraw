@@ -142,12 +142,17 @@ Implementation:
   decoration plugin works out of the box.
 
   **For step 1 of the migration (intercept SDK extension), the
-  decoration plugin is in-thread, so we can land `outputDimensions`
-  for the in-thread path only and explicitly leave Worker as a
-  follow-up TODO.** Worker decoration is a non-goal in this
-  migration; Worker effects (blur, etc.) don't change dimensions
-  so the current "fixed at allocate time" behavior is acceptable
-  for them.
+  decoration plugin is in-thread, so we land `outputDimensions`
+  for the in-thread path only.** The Worker SDK throws if a
+  registration declares `outputDimensions` returning non-identity
+  dims (caught at register time, surfaced as a SDK error to the
+  plugin). This keeps the contract honest: a Worker plugin that
+  wants to resize the output is rejected at registration, not
+  silently mis-sized at runtime. A future Worker decoration
+  plugin (or any Worker effect that wants to grow the output —
+  drop-shadow, glow, anything outside the input rect) needs the
+  resize-renegotiation protocol described above; that is a
+  separate piece of work and not blocked by this migration.
 
 ### 2. `priority?: number` on `InterceptSpec`
 
@@ -180,7 +185,7 @@ Implementation:
 That's the entire SDK delta. Both extensions are additive (default
 behavior matches 10a today).
 
-## Match timing + the first-configure problem
+## Match timing + the first-sized-configure problem
 
 The intercept match engine today fires `onSurfaceMatched` from
 `WINDOW_EVENT.map` (broker.ts:122-126). `window.map` fires AT
@@ -206,8 +211,10 @@ present. With intercept-as-decoration, the right fix is **move
 the match check earlier** -- to `window.preconfigure`, the seam
 where the WM fires an interceptable event AFTER the client has
 declared its app_id but BEFORE the real sized configure goes out
-(wm/index.ts:1860 + the `window.preconfigure` event in the
-existing window-rules path).
+(wm/index.ts:1860). The event already exists and is awaited
+through the standard interceptor chain; no consumer subscribes to
+it today, so the intercept broker becomes the first production
+consumer.
 
 Sequence with preconfigure-time match:
 
@@ -258,46 +265,71 @@ content rect it expects (it set the insets, it knows `B`, it
 can compute expected = outer - 2B). The plugin needs the outer
 rect to do that math. Either:
 
-- Plugin receives `ctx.surfaceRect` (the WM outer rect) in the
-  render context; it computes `expected = surfaceRect.w - 2*B`
-  and compares against `input.rect.w`. Release on match.
-- Or plugin just releases on the first render, accepting the
-  one-frame race for the (rare) case where match landed late.
+**Strict release policy is the bundled plugin's default.** The
+plugin receives `ctx.surfaceRect` (the WM outer rect) in the
+render context; it computes `expected = surfaceRect.w - 2*B`
+and compares against `input.rect.w`. If they match, the plugin
+calls `releaseGate()`. If they don't, the plugin renders the
+frame (intercept output replaces the still-out-of-stack client
+texture) but does NOT release the gate. The window stays out of
+the draw stack until the client has re-committed at the
+post-insets size and the intercept renders that frame.
 
-For the migration, the bundled decoration plugin uses
-preconfigure-time match (no race) AND releases on first render
-unconditionally (defensive against late-match catch-up). For
-late-match catch-up, the plugin can detect dimensional mismatch
-and defer release, but practically the catch-up case is rare
-(intercept registers post-startup; usually a window unmaps and
-remaps before this matters).
+This is mandatory, not optional. The late-match catch-up case
+(intercept registers after a window has already mapped and
+committed at the full-outer size) is a first-class supported
+scenario:
+
+- Plugin hot-reload during development (every save triggers
+  unregister + re-register; catch-up enumeration over every
+  mapped window).
+- User toggle of a decoration plugin via slash command or
+  hotkey.
+- `priority`-driven re-evaluation when a higher-priority
+  intercept unregisters and the freed surface re-evaluates
+  against remaining registrations (`broker.removeRegistration`
+  → re-match → `onSurfaceMatched` fires on the catch-up plugin).
+
+Permissive "release on first render" would show a wrong-size
+frame on every window in every one of those scenarios. Races
+that cause rendering artifacts are not acceptable; the strict
+policy is small (five lines of plugin code) and eliminates the
+artifact entirely.
 
 Backstop: 10 seconds; if neither the plugin nor any first render
 fires within that, force-release so a stuck plugin can't keep
-the window invisible.
+the window invisible. Per-spec timeout override is supported via
+`gates: { timeoutMs: N }` (object form of the flag).
 
-### Why not always release after first render unconditionally?
+### Late-match wrong-size sequence (the race)
 
-For preconfigure-time matches it's safe (the first render is at
-the correct dimensions). For late-match catch-up of an
-already-mapped window, the first render may be at the
-pre-`setInsets` dimensions. Releasing then shows one wrong-size
-frame. Letting the plugin own release policy gives the plugin a
-choice: accept the frame (simpler) or wait for the right
-dimensions (correct but more complex).
+Without the strict policy, late-match produces this sequence:
 
-The reference bundled plugin **accepts the one-frame race for
-the late-match case** because:
-- The preconfigure-time match (the common case for new windows)
-  has no race.
-- The late-match case only triggers when a plugin is registered
-  after window maps; rare in practice.
-- Implementing "wait for dim change" in the plugin is more code
-  for marginal benefit.
-
-If a plugin author needs strict no-race behavior they can do
-the dim comparison themselves; the SDK supports it via
-`ctx.surfaceRect`.
+1. Window already mapped; configure was at full outer size;
+   client committed at full outer; window drawing on screen.
+2. Plugin registers. Catch-up enumeration fires
+   `onSurfaceMatched` synchronously.
+3. Plugin calls `setInsets`. WM queues a relayout shrinking
+   the content rect by 2B per side. Gate engages (window out
+   of draw stack from now until release).
+4. Intercept's first `render` fires. The client has not yet
+   acked the new configure or committed at the new size; the
+   committed buffer is still at the OLD (full-outer) size. So
+   `input.rect.w == outer.w`, NOT `outer.w - 2*B`.
+5. With permissive release: gate releases on this render. The
+   output texture is `(outer.w + 2B) × (outer.h + 2B)` (from
+   `outputDimensions(input.w, input.h)`) being placed at the
+   `outer.w × outer.h` WM rect. The client content inside the
+   inset region is sampled from a buffer that's already at the
+   full outer size, blitted into an inset area 2B smaller, then
+   scaled up by the compositor — visible stretched content for
+   1+ frame until the client re-commits.
+6. With strict release: gate stays engaged. Frames continue
+   rendering off-stack. When the client finally re-commits at
+   `(outer.w - 2B) × (outer.h - 2B)`, the next render sees
+   `input.rect.w == surfaceRect.w - 2*B`, plugin calls
+   `releaseGate`, window enters draw stack with the correct
+   first frame. No stretched content ever visible.
 
 ### Multi-owner gate composition
 
@@ -355,7 +387,7 @@ export default async function init(sdk, rawConfig) {
           const enc = device.createCommandEncoder();
 
           // Pass 1: fill the entire output with the border gradient.
-          // (Cheap; we overdraw the center, then pass 2 covers it.)
+          // We overdraw the center; pass 2 covers it.
           const passBorder = enc.beginRenderPass({
             colorAttachments: [{
               view: output.texture.createView(),
@@ -411,12 +443,17 @@ Two open questions on the plugin side:
 
 2. **Focus redraw frequency.** Today the bundled plugin redraws
    once per focus flip. Under intercept, render() runs every
-   visible frame regardless of focus — the work is constant.
-   Acceptable: the border pass is cheap (a fullscreen quad +
-   gradient eval). If profile shows it's a problem, the SDK could
-   add "skip render this frame if the plugin returns
-   `{ noChange: true }` AND the prior output slot is still bindable"
-   as a 10b optimization.
+   visible frame regardless of focus. Expected cost: a fullscreen
+   quad with a gradient eval + a second pass that samples the
+   input texture with an SDF coverage. Plausibly small per
+   window but UNMEASURED. Verification required before declaring
+   step 2 done: measure GPU frame time with 10 and 20 decorated
+   windows at 60Hz on both a discrete GPU and integrated graphics;
+   compare to the same scene with the current plugin. If the
+   delta is >5% of frame budget on integrated graphics, add a
+   per-frame skip mechanism (`{ noChange: true }` return from
+   render + cache the prior output slot) in 10b before deleting
+   the old machinery in step 3.
 
 ## Code to delete
 
@@ -560,9 +597,11 @@ into a phantom. With the changes:
   but with no decoration. For Firefox to have both: 10b chain.
   Stated and accepted.
 - **No per-frame skip.** Decoration renders every visible frame
-  regardless of whether content or focus changed. Cheap but not
-  free. 10b's per-stage caching could skip when both input AND
-  focus are unchanged.
+  regardless of whether content or focus changed. Per-window cost
+  is UNMEASURED (see "Focus redraw frequency" above for the
+  measurement gate before this lands). 10b's per-stage caching
+  could skip when both input AND focus are unchanged; whether
+  that's needed depends on the measurement.
 - **Translucent clients.** The intercept output composes the
   client texture's premultiplied alpha onto a solid decoration
   band, so the result has the right alpha behavior at the band
@@ -609,26 +648,94 @@ into a phantom. With the changes:
 
 Step 1 (additive, no behavior change):
 
-1. Add `outputDimensions` to `InterceptHandlers` (in
-   `@overdraw/intercept-types`).
-2. Wire it through `inthread-state.ts` and `worker-state.ts` /
-   `intercept-sdk.ts` Worker leg. Default = identity (output =
-   input).
-3. Add `priority` to `InterceptSpec`; sort registrations by
+1. Add `priority` to `InterceptSpec`; sort registrations by
    `(priority, registrationOrder)` in `firstMatching`.
-4. Add `surfaceRect` (or equivalent) to the render context so
-   plugins can compute output rect placement without a separate
-   `sdk.windows.get` call.
-5. Tests for both, passing on the existing intercept-invert
-   fixture.
+2. Add `outputDimensions` to `InterceptHandlers` (in
+   `@overdraw/intercept-types`). Wire through `inthread-state.ts`
+   `ensureRing`. Worker path throws on non-identity declaration
+   (documented limitation; decoration is in-thread).
+   **Failure handling**: if `outputDimensions` returns invalid
+   values (zero, negative, exceeding `maxTextureDimension2D`),
+   `createTexture` throws. Wrap the texture allocation in
+   `ensureRing` with a try/catch that increments the per-surface
+   consecutive-failure counter (existing `K=30` threshold path,
+   `inthread-state.ts:58`) and auto-unregisters on threshold.
+   Bad dims is a programming error; auto-unregister surfaces it
+   loudly. This also closes a pre-existing latent crash where a
+   `createTexture` throw inside `ensureRing` escapes `tick()`.
+3. Add `surfaceRect: Rect` to `InterceptRenderCtx`. Required for
+   strict gate-release policy in the bundled decoration plugin
+   (see "Match timing + the first-sized-configure problem"
+   section).
+   Threaded from the compositor's surface record (`s.x/s.y/
+   s.layoutW/s.layoutH`) into the render ctx each tick.
+4. Add `gates?: boolean | { timeoutMs?: number }` to
+   `InterceptSpec`. When truthy, the SDK engages a WM content
+   gate under owner `"intercept-${spec.name}"` at
+   `onSurfaceMatched` time. Inject `releaseGate: () => void`
+   into the render ctx. Backstop timeout (default 10s; per-spec
+   override via object form) force-releases on expiry. On
+   `onSurfaceUnmatched`, release the gate. On render throw,
+   release the gate (intercept falls back to raw client; window
+   shows un-bordered, matches today's "broken provider →
+   undecorated" semantics).
+5. Wire preconfigure-time match in `intercept/broker.ts`. The
+   match engine evaluates registrations on `window.preconfigure`
+   (in addition to `window.map` for catch-up). On the preconfigure
+   path, `onSurfaceMatched` fires synchronously so the plugin's
+   `setInsets` lands BEFORE the first SIZED configure goes out
+   (a throwaway 0x0 configure has already been sent from
+   `sendInitialConfigure`; the SIZED configure is what the
+   client actually maps to a window size).
+   Verify: `markInitialCommitComplete` fires `window.preconfigure`
+   synchronously before the layout pass; `setInsets` in an
+   interceptor must affect that layout pass's configure.
+6. Add `sdk.windows.setInsets(surfaceId, insets)` to the plugin
+   SDK. **Authorization**: the broker rejects the call unless
+   the caller's plugin owns an intercept that is currently
+   assigned to the target surface (consult the intercept match
+   engine's `assignmentOf(surfaceId)` and compare to the
+   caller's `pluginName`). This mirrors today's
+   `decoration.createDecoration` authorization (only the
+   assigned decoration provider can setInsets a given window),
+   transplanted onto the intercept model. A plugin with no
+   intercept matching the surface cannot move its insets.
+7. Tests:
+   - `priority` ordering (lower wins; same priority falls back
+     to registration order); promoted/demoted re-evaluation when
+     a higher-priority intercept unregisters.
+   - `outputDimensions` honored at allocate; reallocate when
+     input dims change.
+   - `ctx.surfaceRect` reflects the current WM rect including
+     post-`setInsets` shrink.
+   - `gates: true` engages content gate at match; `releaseGate`
+     callback releases it; 10s backstop fires on stuck plugin;
+     render throw releases gate; unmatch releases gate.
+   - Preconfigure-time match: client receives first SIZED
+     configure at post-insets size (not pre-insets). Throwaway
+     0x0 ack is unaffected.
+   - Late-match catch-up with strict policy: gate stays engaged
+     until client re-commits at post-insets size; no wrong-size
+     frame visible.
 
 Commit. Existing decoration still works (uses the old surface model).
 
 Step 2 (rewrite bundled plugin):
 
 1. Rewrite `plugin-decoration-default/src/index.ts` as an
-   intercept registration. Keep config compat.
-2. Tests pass against the new plugin.
+   intercept registration. Keep config compat. Implement strict
+   gate-release (compare `ctx.surfaceRect.w - 2*B` against
+   `input.rect.w`, only call `releaseGate` when they match).
+2. Implement the inner-clip SDF in the blit WGSL with
+   antialiased coverage (see "What stays the same" §
+   setShape). Verify visual parity with today's plugin on
+   rounded-corner configs.
+3. Measure GPU frame time with 10 and 20 decorated windows at
+   60Hz (see "Focus redraw frequency" §). If delta exceeds
+   threshold, defer step 3 until per-frame skip lands.
+4. Tests pass against the new plugin (existing config tests,
+   pixel tests for border + inset + rounded corners, late-match
+   catch-up gate test, multi-output decoration test).
 
 At this point, both code paths exist in parallel: the old
 decoration-broker is still loaded (just not used by anything in
@@ -654,13 +761,18 @@ Commit.
 
 ## Effort estimate
 
-- Step 1: ~half day.
-- Step 2: ~half day to a day (mostly plumbing + the WGSL pipeline
-  for the new render path; the border shader exists, the blit
-  pipeline is new).
+- Step 1: ~1.5 days. Seven substeps (priority, outputDimensions
+  in-thread, ctx.surfaceRect, gates + releaseGate + 10s backstop,
+  preconfigure-time match wiring, sdk.windows.setInsets plugin
+  path, tests for each).
+- Step 2: ~1 to 1.5 days. Includes the inner-clip SDF in the
+  blit WGSL with antialiased coverage (NOT hard discard); the
+  border shader exists, the blit pipeline + SDF are new; plus
+  the measurement gate ("Focus redraw frequency" §) before step
+  3 lands.
 - Step 3: ~half day (mechanical deletion + test updates).
 
-Total: ~1.5 to 2 days.
+Total: ~3 to 3.5 days, plus measurement time.
 
 ## What stays the same
 
@@ -684,13 +796,30 @@ Total: ~1.5 to 2 days.
   inner SDF mask itself in its WGSL blit pass. When blitting
   `args.input.texture` into the inset region of
   `args.output.texture`, the plugin evaluates an inner SDF
-  (radius max(0, R-B), inset by B on each side) and discards
-  fragments outside the inner shape. This produces:
+  (radius max(0, R-B), inset by B on each side) and computes
+  ANTIALIASED COVERAGE (not hard discard) so the rounded edge
+  matches today's compositor SDF system:
+
+  ```wgsl
+  let d = sdRoundedBox(inset_uv - innerHalfSize,
+                       innerHalfSize, innerRadii);
+  let coverage = clamp(0.5 - d, 0.0, 1.0);
+  let sample = textureSample(inputTex, sampler, blit_uv);
+  // Premultiplied alpha: scale color by coverage so corner
+  // cutouts show through to the border band underneath.
+  return sample * coverage;
+  ```
+
+  Pass 1 clears to the border band fill; pass 2's blit writes
+  `sample * coverage` with `loadOp: "load"`, so the corner
+  cutouts (coverage near 0) keep the band's color underneath.
+  This produces:
     - Rounded outer perimeter via compositor setShape(outer).
     - Rounded inner boundary between client content and border
       band via the plugin's own SDF.
     - Uniformly thick border band around the corner (the
       distance from inner edge to outer edge is constant).
+    - Antialiased inner curve (no jagged corner pixels).
 
   The plugin needs the outer shape parameters (radius, kind,
   per-corner radii, superellipse exponent) to compute the
@@ -720,10 +849,10 @@ These were open in an earlier draft; resolved here:
    use `outputRect` (per the "Approach" section above), so this
    doesn't affect it. Other intercept users should know.
 
-2. **`ctx.surfaceRect`.** Not needed by the decoration plugin
-   (no outputRect override). Worth adding to the render context
-   for OTHER intercept use cases (e.g. an intercept that wants
-   to position itself relative to the window). Optional; defer.
+2. **`ctx.surfaceRect`.** Required for the bundled decoration
+   plugin's strict gate-release policy (compare `input.rect.w`
+   against `surfaceRect.w - 2*B` to detect post-insets
+   re-commit). Lands in step 1.
 
 3. **First-frame ordering.** Resolved via the content-gate
    section above. The intercept SDK gains a `gates: true`
