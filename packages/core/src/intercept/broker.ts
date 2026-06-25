@@ -414,6 +414,10 @@ export class InterceptBroker {
       clientTexture: (sid) => this.deps.compositor.surfaceClientTexture?.(sid) ?? null,
       isPresentable: (sid) => this.deps.compositor.surfaceIsPresentable?.(sid) ?? false,
       surfaceWmRect: (sid) => this.deps.compositor.surfaceWmRect?.(sid) ?? null,
+      withClientTextureAccess: (sid, fn) =>
+        this.deps.compositor.withClientTextureAccess
+          ? this.deps.compositor.withClientTextureAccess(sid, fn)
+          : (fn(), true),   // no-op if the sink doesn't implement (tests with stub compositors)
       installOutput: (sid, view, placement) =>
         this.deps.compositor.installInterceptOutput?.(sid, view, placement),
       clearOutput: (sid) => this.deps.compositor.clearInterceptOutput?.(sid),

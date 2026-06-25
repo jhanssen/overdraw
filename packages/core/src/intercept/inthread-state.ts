@@ -33,6 +33,15 @@ export interface InThreadTickDeps {
   // surfaces; the tick treats null as a zero rect.
   surfaceWmRect(surfaceId: number):
     { x: number; y: number; w: number; h: number } | null;
+  // Open a BeginAccess bracket on the surface's client dmabuf import
+  // (if any), run fn, close with EndAccess. SHM-backed surfaces pass
+  // through with no bracket. The plugin's render call MUST run
+  // inside this bracket because it samples the client texture (a
+  // SharedTextureMemory-backed resource that requires explicit
+  // access brackets for any GPU use). Returns true if fn ran;
+  // false if the bracket could not be opened (the tick treats it
+  // as a skipped frame).
+  withClientTextureAccess(surfaceId: number, fn: () => void): boolean;
   // The compositor-facing sink for install/clear.
   installOutput(surfaceId: number, view: GPUTextureView,
                 placement: { x: number; y: number; w: number; h: number } | null): void;
@@ -175,27 +184,46 @@ export class InThreadInterceptState {
 
     const wmRect = this.deps.surfaceWmRect(this.surfaceId)
       ?? { x: 0, y: 0, w: 0, h: 0 };
-    let result: InterceptRenderResult | void;
-    try {
-      result = this.handlers.render({
-        input: {
-          texture: input.texture,
-          rect: { x: 0, y: 0, w: input.w, h: input.h },
-        },
-        output: {
-          texture: outTex,
-          rect: { x: 0, y: 0, w: this.ringW, h: this.ringH },
-        },
-        ctx: {
-          surfaceId: this.surfaceId,
-          frameNumber: this.frameNumber,
-          time: timeMs,
-          surfaceRect: wmRect,
-          releaseGate: () => this.releaseGate(),
-        },
-      });
-      this.consecutiveFailures = 0;
-    } catch (e: unknown) {
+    const holder: { result: InterceptRenderResult | void; error: unknown } =
+      { result: undefined, error: null };
+    // Wrap the plugin's render in a BeginAccess/EndAccess bracket
+    // around the surface's client dmabuf import. The plugin samples
+    // input.texture during render; without the bracket the GPU
+    // process rejects the submit with a SharedTextureMemory access
+    // error. SHM-backed surfaces have no import; the bracket is a
+    // no-op for them but fn still runs.
+    const bracketed = this.deps.withClientTextureAccess(this.surfaceId, () => {
+      try {
+        holder.result = this.handlers.render({
+          input: {
+            texture: input.texture,
+            rect: { x: 0, y: 0, w: input.w, h: input.h },
+          },
+          output: {
+            texture: outTex,
+            rect: { x: 0, y: 0, w: this.ringW, h: this.ringH },
+          },
+          ctx: {
+            surfaceId: this.surfaceId,
+            frameNumber: this.frameNumber,
+            time: timeMs,
+            surfaceRect: wmRect,
+            releaseGate: () => this.releaseGate(),
+          },
+        });
+      } catch (e: unknown) {
+        holder.error = e;
+      }
+    });
+    if (!bracketed) {
+      // Bracket open failed (e.g. dmabuf import not yet resolved
+      // async). Not a failure -- the next tick will retry. Don't
+      // touch the failure counter; this is a transient skip akin to
+      // "no client texture yet."
+      return { ok: true, rendered: false };
+    }
+    if (holder.error !== null) {
+      const e = holder.error;
       const msg = e instanceof Error ? e.message : String(e);
       this.consecutiveFailures += 1;
       this.deps.log(
@@ -214,8 +242,9 @@ export class InThreadInterceptState {
       }
       return { ok: true, rendered: false };
     }
+    this.consecutiveFailures = 0;
 
-    const outputRect = result?.outputRect ?? null;
+    const outputRect = holder.result?.outputRect ?? null;
     this.deps.installOutput(this.surfaceId, outView, outputRect);
     return { ok: true, rendered: true };
   }

@@ -460,6 +460,21 @@ export interface CompositorSink {
   // render dispatch to surfaces actually being composited.
   surfaceClientTexture?(surfaceId: number): { texture: GPUTexture; w: number; h: number } | null;
   surfaceIsPresentable?(surfaceId: number): boolean;
+  // Phase 10a in-thread intercept: open a BeginAccess bracket on the
+  // surface's client dmabuf import, run `fn` (the plugin's render
+  // submit which samples the client texture), close with EndAccess.
+  // SHM-backed surfaces have no dmabuf import; the call passes
+  // through with no bracket (fn still runs).
+  //
+  // The bracket is a per-buffer Begin/End pair on the GPU wire,
+  // alternating; multiple Begins without an End violate the
+  // GPU process's accessOpen invariant. The compositor's main
+  // renderFrame opens its own bracket for the SAME buffer LATER in
+  // the same frame; that's fine -- the brackets are sequential, not
+  // nested. Returns true if fn completed without throwing; false if
+  // the bracket open failed (the broker treats that as a skipped
+  // frame).
+  withClientTextureAccess?(surfaceId: number, fn: () => void): boolean;
   // The surface's WM-assigned outer rect (x/y in compositor logical
   // coords, w/h from setSurfaceLayout). Threaded into the intercept
   // render context as ctx.surfaceRect so plugins can compute

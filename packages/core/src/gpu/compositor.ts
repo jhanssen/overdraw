@@ -2448,6 +2448,13 @@ export class JsCompositor implements CompositorSink {
       // A frozen surface samples its snapshot, not the client buffer -- no
       // bracket (and no frameSampled) for its import this frame.
       if (s.frozen) continue;
+      // An intercept output is installed for this surface: the bind
+      // group samples the intercept's output texture, NOT the client
+      // dmabuf. No bracket on the client import for this surface's
+      // on-screen draw. The intercept broker has already opened its
+      // own bracket around the plugin's render submit (which DID
+      // sample the client texture), then closed it.
+      if (s.interceptOutputView !== null) continue;
       if (s.currentBufferId === 0) continue;  // shm or plugin overlay; no lifecycle
       const imp = this.dmabufImports.get(s.currentBufferId);
       if (!imp) continue;  // import not yet resolved (async); will draw next frame
@@ -3177,6 +3184,57 @@ export class JsCompositor implements CompositorSink {
     const s = this.surfaces.get(surfaceId);
     if (!s) return null;
     return { x: s.x, y: s.y, w: s.layoutW, h: s.layoutH };
+  }
+
+  // Phase 10a in-thread intercept: open a Begin/End bracket on the
+  // surface's client dmabuf import around the plugin's render submit.
+  // SHM-backed surfaces have no dmabuf import; the bracket is a no-op
+  // but fn still runs. The bracket is per-import (one Begin per
+  // open); the main renderFrame opens its OWN bracket later in the
+  // same frame and that's fine -- Begin/End pairs are sequential,
+  // not nested, so two pairs within one frame on the same buffer
+  // are allowed.
+  //
+  // Returns true if fn ran (the bracket either wasn't needed -- SHM
+  // -- or opened successfully). Returns false if the bracket open
+  // failed; fn does NOT run in that case (the broker treats it as a
+  // skipped frame so the plugin doesn't sample an unauthorized
+  // texture).
+  withClientTextureAccess(surfaceId: number, fn: () => void): boolean {
+    const s = this.surfaces.get(surfaceId);
+    if (!s) return false;
+    if (s.currentBufferId === 0) {
+      // SHM-backed (or no buffer): no dmabuf bracket needed.
+      fn();
+      return true;
+    }
+    const imp = this.dmabufImports.get(s.currentBufferId);
+    if (!imp) {
+      // Import not yet resolved (async). Skip this frame; next tick
+      // the import will be live.
+      return false;
+    }
+    // Consume any pending acquire fence on this buffer (one-shot per
+    // commit; either this bracket or the main renderFrame's bracket
+    // wins). The compositor's renderFrame de-dupes by importId per
+    // frame; consuming the fence here means renderFrame will fall
+    // through to the non-fence Begin, which is correct (the dmabuf
+    // is already accessible after our Begin succeeded).
+    const fenceFd = this.bufferIdToAcquireFenceFd.get(s.currentBufferId);
+    let beginOk: boolean;
+    if (fenceFd && !fenceFd.closed) {
+      this.bufferIdToAcquireFenceFd.delete(s.currentBufferId);
+      beginOk = this.addon.writeBeginAccessWithFence(imp.importId, fenceFd);
+    } else {
+      beginOk = this.addon.writeBeginAccess(imp.importId);
+    }
+    if (!beginOk) return false;
+    try {
+      fn();
+    } finally {
+      this.addon.writeEndAccess(imp.importId);
+    }
+    return true;
   }
 
   // ----- Cursor slot (Phase 9c) ---------------------------------------------
