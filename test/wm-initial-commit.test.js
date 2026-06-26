@@ -104,6 +104,61 @@ test('markInitialCommitComplete: throwaway 0x0 first configure, then real tile s
   assert.deepEqual(configures.at(-1), { id: 1, w: 1000, h: 600 });
 });
 
+// --- map-ack gating: the open is held until the client acks the tile-size
+// configure, so the open animation plays on a tile-sized buffer (not the
+// client's default from the 0x0 handshake). beforeMap stands in for the
+// opening driver; a serial-returning configure stands in for xdg ack tracking.
+
+function serialConfigure(configures) {
+  let serial = 0;
+  return {
+    configure: (id, _x, _y, w, h) => { serial += 1; configures.push({ id, w, h, serial }); return serial; },
+    configureMove: () => {},
+  };
+}
+
+test('open: held until the client acks the tile-size configure (the mapping commit)', async () => {
+  const configures = [];
+  const mapped = [];
+  const wm = createWm(mockSink(), [{ id: 0, rect: { x: 0, y: 0, width: 1000, height: 600 }, scale: 1 }], {
+    configure: serialConfigure(configures),
+    layoutDriverFactory: immediateLayoutDriver,
+    beforeMap: (id) => { mapped.push(id); return true; },
+  });
+  wm.addWindow(1, res(1), { deferInitialCommit: true });
+  await wm.settled();
+  await wm.markInitialCommitComplete(1, { appId: null, title: null });
+  // First content arrives but the client has not acked the tile-size configure
+  // yet (its buffer is the 0x0-handshake default) -> the open is held.
+  wm.windowHasContent(1);
+  assert.deepEqual(mapped, [], 'open held until the tile-size configure is acked');
+  // Stale ack (the 0x0 serial) does NOT release.
+  wm.notifyToplevelCommit(1, 1);
+  assert.deepEqual(mapped, [], 'a stale serial does not map');
+  // The mapping commit: client acks the latest (tile-size) serial.
+  const last = configures.at(-1).serial;
+  wm.notifyToplevelCommit(1, last);
+  assert.deepEqual(mapped, [1], 'maps once the tile-size ack lands');
+});
+
+test('open: maps immediately when first content already acked the tile-size configure', async () => {
+  const configures = [];
+  const mapped = [];
+  const wm = createWm(mockSink(), [{ id: 0, rect: { x: 0, y: 0, width: 1000, height: 600 }, scale: 1 }], {
+    configure: serialConfigure(configures),
+    layoutDriverFactory: immediateLayoutDriver,
+    beforeMap: (id) => { mapped.push(id); return true; },
+  });
+  wm.addWindow(1, res(1), { deferInitialCommit: true });
+  await wm.settled();
+  await wm.markInitialCommitComplete(1, { appId: null, title: null });
+  // A well-behaved client rendered at the tile size first try: it acks the
+  // latest serial on/with its first content commit -> no hold, no added delay.
+  wm.notifyToplevelCommit(1, configures.at(-1).serial);
+  wm.windowHasContent(1);
+  assert.deepEqual(mapped, [1], 'no hold when first content already acked the tile size');
+});
+
 test('premap: emitted with the spawn output after preconfigure, and awaited before the sized configure goes out', async () => {
   const bus = createDynamicBus();
   const configures = [];

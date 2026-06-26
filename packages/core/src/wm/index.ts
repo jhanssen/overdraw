@@ -99,6 +99,14 @@ export interface Window {
   // content signal). A window is in the layout (and configured) from addWindow,
   // but only drawn once it has content.
   hasContent?: boolean;
+  // Highest xdg_surface.ack_configure serial the client has acked (from
+  // notifyToplevelCommit). Used by the open path to detect the mapping commit.
+  lastAckedSerial?: number;
+  // Set while the open is held waiting for the client to ack the latest
+  // configure serial sent before map (so the first drawn frame is a buffer
+  // rendered at the tile size, not the client's default from the 0x0 handshake).
+  // Released by notifyToplevelCommit when the ack lands, or by a backstop timer.
+  awaitingMapAck?: boolean;
   // The output the window is currently placed on, cached after each
   // applyLayout pass. window.relayout / stack.relayout consumers see this
   // as `oldOutputId` (the prior placement). Updated to the new output at
@@ -752,6 +760,10 @@ export type {
 // Per-handler ceiling for window.relayout + window.proposed interceptors.
 const INTERCEPTOR_TIMEOUT_MS = 100;
 
+// Backstop for the open map-ack hold: map a window even if it never acks the
+// tile-size configure, so a buggy client can't stay invisible indefinitely.
+const MAP_ACK_BACKSTOP_MS = 500;
+
 export function createWm(
   compositor: CompositorSink,
   outputs: ReadonlyArray<WmOutput>,
@@ -761,7 +773,23 @@ export function createWm(
     throw new Error("createWm: outputs must be non-empty");
   }
   const rebuild = opts?.rebuild;
-  const configure = opts?.configure;
+  // The last (size) configure serial sent to each surface, captured by wrapping
+  // the configure sink. The open path uses it to find a window's "mapping
+  // commit": the first client commit that acks the latest serial we sent while
+  // the window was still unmapped is the buffer rendered for our tile size; we
+  // hold the open animation until then so it never plays on a stale-size buffer.
+  const lastConfigureSerial = new Map<number, number>();
+  const rawConfigure = opts?.configure;
+  const configure: ConfigureSink | undefined = rawConfigure
+    ? {
+        configure: (id, x, y, w, h) => {
+          const serial = rawConfigure.configure(id, x, y, w, h);
+          if (serial !== null) lastConfigureSerial.set(id, serial);
+          return serial;
+        },
+        configureMove: rawConfigure.configureMove,
+      }
+    : undefined;
   const decorationResize = opts?.decorationResize;
   const layoutDriverFactory = opts?.layoutDriverFactory;
   const pluginBus = opts?.pluginBus;
@@ -775,6 +803,10 @@ export function createWm(
   // serial, target size, etc.) in pendingResizes.
   const surfaceTx: SurfaceTransactionBroker = opts?.surfaceTx
     ?? createSurfaceTransactionBroker(compositor);
+  // Per-surface backstop timers for the map-ack hold: if a client never acks
+  // the tile-size configure, map it anyway after this so a buggy client can't
+  // stay invisible forever.
+  const mapAckBackstops = new Map<number, ReturnType<typeof setTimeout>>();
   const windows: Window[] = [];
   const wm: WmState = { outputs: outputsMap(outputs), windows };
 
@@ -1164,7 +1196,11 @@ export function createWm(
   // gate invariant: beforeMap engages "opening" before the temp gate is
   // dropped, so the window is never momentarily un-gated.
   function mapOpenedWindow(win: Window): void {
+    win.awaitingMapAck = false;
+    const t = mapAckBackstops.get(win.surfaceId);
+    if (t) { clearTimeout(t); mapAckBackstops.delete(win.surfaceId); }
     beforeMap?.(win.surfaceId);
+    win.contentGateOwners?.delete("opening-ack");
     win.contentGateOwners?.delete("opening-pending-layout");
     pushStack();
     if (win.windowState.modal) tetherFocusOnModal(win);
@@ -1172,7 +1208,12 @@ export function createWm(
 
   // Shared tail of windowHasContent (both the settled-synchronous path and the
   // deferred continuation). Pushes the window's layout, sends the real tile-
-  // size configure if it hasn't gone out yet, then maps the window.
+  // size configure if it hasn't gone out yet, then maps the window -- but holds
+  // the map until the client has acked the latest configure serial we sent
+  // while it was unmapped (the "mapping commit"), so the open animation plays
+  // on a buffer rendered at the tile size, not the client's default from the
+  // 0x0 handshake. A client that already rendered correctly (acked the latest
+  // serial on its first content commit) maps immediately -- no added delay.
   function openWindow(win: Window): void {
     compositor.setSurfaceLayout(win.surfaceId, win.rect.x, win.rect.y, win.rect.width, win.rect.height);
     if (win.pendingSizeConfigure && configure
@@ -1180,6 +1221,31 @@ export function createWm(
       win.pendingSizeConfigure = false;
       const content = contentOf(win);
       configure.configure(win.surfaceId, content.x, content.y, content.width, content.height);
+    }
+    const wantSerial = lastConfigureSerial.get(win.surfaceId);
+    const acked = win.lastAckedSerial ?? -1;
+    // Gate only when there's an unacked size configure AND a beforeMap (the
+    // opening driver). xwayland (no serial) and the no-driver test path map
+    // immediately.
+    if (beforeMap && wantSerial !== undefined && acked < wantSerial) {
+      if (!win.contentGateOwners) win.contentGateOwners = new Set();
+      win.contentGateOwners.add("opening-ack");
+      win.awaitingMapAck = true;
+      if (!mapAckBackstops.has(win.surfaceId)) {
+        const sid = win.surfaceId;
+        const timer = setTimeout(() => {
+          mapAckBackstops.delete(sid);
+          const w = windows.find((x) => x.surfaceId === sid);
+          if (w && w.awaitingMapAck) {
+            coreLog.warn("core",
+              `wm: map-ack backstop fired for surfaceId=${sid}; mapping anyway`);
+            mapOpenedWindow(w);
+          }
+        }, MAP_ACK_BACKSTOP_MS);
+        timer.unref?.();
+        mapAckBackstops.set(sid, timer);
+      }
+      return;
     }
     mapOpenedWindow(win);
   }
@@ -1670,6 +1736,10 @@ export function createWm(
       // Cancel any pending resize-tx hold; the broker thaws and removes
       // the entry from pendingResizes via onCancel.
       if (surfaceTx.has(surfaceId)) surfaceTx.cancel(surfaceId);
+      // Drop map-ack hold bookkeeping (the window never reached map).
+      const mt = mapAckBackstops.get(surfaceId);
+      if (mt) { clearTimeout(mt); mapAckBackstops.delete(surfaceId); }
+      lastConfigureSerial.delete(surfaceId);
       driver.schedule("unmapped");
       pushStack();
       if (wasModal) untetherFocusOnUnmodal(unmapped, surfaceId);
@@ -2268,6 +2338,21 @@ export function createWm(
     },
 
     notifyToplevelCommit(surfaceId, ackedSerial) {
+      const win = windows.find((w) => w.surfaceId === surfaceId);
+      if (win && ackedSerial !== null) {
+        win.lastAckedSerial = Math.max(win.lastAckedSerial ?? -1, ackedSerial);
+        // Map-ack hold: this commit acks our latest pre-map configure serial,
+        // so it carries a buffer rendered at the tile size -- the mapping
+        // commit. Release the open. If a newer configure went out since (e.g. a
+        // re-place), lastConfigureSerial advanced and this ack is still behind,
+        // so we keep waiting for the newer serial.
+        if (win.awaitingMapAck) {
+          const wantSerial = lastConfigureSerial.get(surfaceId);
+          if (wantSerial !== undefined && ackedSerial >= wantSerial) {
+            mapOpenedWindow(win);
+          }
+        }
+      }
       const p = pendingResizes.get(surfaceId);
       if (!p || p.moveOnly || p.acked) return;
       if (p.serial !== null && ackedSerial !== null && ackedSerial >= p.serial) {
