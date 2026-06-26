@@ -16,6 +16,7 @@
 // direct calls because they manage membership and decoration, not state.
 
 import type { Resource } from "../types.js";
+import { log as coreLog } from "../log.js";
 import type { CompositorSink } from "../protocols/ctx.js";
 import type { LayoutResult, LayoutReason } from "@overdraw/layout-types";
 import type { LayoutDriver, LayoutSnapshot, LayoutApplyTarget } from "./layout-driver.js";
@@ -1151,6 +1152,51 @@ export function createWm(
     });
   }
 
+  // Continuation for windowHasContent when the layout-driver pass that
+  // assigns a window's real outer rect hadn't settled by the time
+  // first-content arrived. Awaits driver.settled(), then runs the
+  // setSurfaceLayout + beforeMap + pushStack sequence with the real
+  // outer in place. The "opening-pending-layout" gate owner engaged
+  // by windowHasContent keeps the window invisible until this
+  // continuation releases it.
+  //
+  // Fallback: if the layout never produces a real outer (e.g. a
+  // no-op driver in a minimal test harness), the continuation
+  // releases the temp gate anyway and pushes with whatever
+  // win.outer / win.rect currently hold. This preserves the
+  // pre-fix behavior for that case (window enters the stack at
+  // placeholder dims rather than being held invisible forever).
+  async function runOpeningAfterLayoutSettles(win: Window): Promise<void> {
+    try {
+      await driver.settled();
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      coreLog.err("core",
+        `wm: opening-pending-layout settle threw: ${msg}; releasing gate`);
+    }
+    // The window may have unmapped while we awaited.
+    if (!windows.includes(win)) {
+      win.contentGateOwners?.delete("opening-pending-layout");
+      return;
+    }
+    compositor.setSurfaceLayout(win.surfaceId, win.rect.x, win.rect.y, win.rect.width, win.rect.height);
+    // beforeMap may engage its own gate (opening-driver) before
+    // returning; that gate's release is independent of our temp gate.
+    beforeMap?.(win.surfaceId);
+    // Release the temp gate. If the opening-driver engaged its own
+    // gate inside beforeMap, the window remains held out of the
+    // stack until that plugin releases.
+    win.contentGateOwners?.delete("opening-pending-layout");
+    pushStack();
+    if (win.windowState.modal) tetherFocusOnModal(win);
+    if (win.pendingSizeConfigure && configure
+        && win.outer.width > 0 && win.outer.height > 0) {
+      win.pendingSizeConfigure = false;
+      const content = contentOf(win);
+      configure.configure(win.surfaceId, content.x, content.y, content.width, content.height);
+    }
+  }
+
   // Apply a LayoutResult: emit window.relayout, then update each window's
   // outer rect, push the compositor's setSurfaceLayout, fire configure where
   // size changed, and update bound decorations. For a "reorder" relayout the
@@ -1531,38 +1577,57 @@ export function createWm(
         // this every newly-mapped window would keep the placeholder
         // z=0 from addWindow, putting it under everything.
         assignZForMap(win);
-        compositor.setSurfaceLayout(win.surfaceId, win.rect.x, win.rect.y, win.rect.width, win.rect.height);
-        // Opening-driver hook: if a 'window-opening' plugin is
-        // present, it engages the content gate via setContentGated
-        // before returning. pushStack then naturally omits this
-        // surface until the plugin calls releaseOpeningGate (or the
-        // backstop fires). The plugin sees the bus event with the
-        // window's outer rect synchronously inside beforeMap, so it
-        // can set initial transform / opacity before the first
-        // composite would have included this surface.
-        beforeMap?.(win.surfaceId);
-        pushStack();
-        // Modal map: tether keyboard focus to the modal if its parent
-        // chain currently holds focus. Runs after pushStack so a focus
-        // change here can observe the modal as drawable.
-        if (win.windowState.modal) tetherFocusOnModal(win);
-        // Dialog policy may have promoted this window to floating; the
-        // floatingRect we just seeded won't take effect until a
-        // relayout runs.
+        // The layout pass that gives this window its real outer may
+        // not have settled yet (markInitialCommitComplete kicks one
+        // off but is fire-and-forget; a client whose first buffer
+        // commit lands before that pass completes hits THIS point
+        // with win.outer still at the {0,0,-1,-1} placeholder). If
+        // we beforeMap + pushStack synchronously here, the
+        // opening-driver fires window.opening with a bogus outer and
+        // the compositor briefly draws the surface at placeholder
+        // dimensions before applyLayout corrects it.
+        //
+        // Hold the window out of the draw stack under owner key
+        // "opening-pending-layout" until the layout settles, then
+        // run beforeMap + pushStack with the real outer. This is
+        // independent of the opening-driver's own gate; both can be
+        // engaged at the same time (multi-owner gate composes).
         if (dialogPolicyMutated) {
           driver.schedule("state-changed");
         }
-        // Real tile size as the second configure (a resize) after the throwaway
-        // 0x0 sent at the initial commit. See pendingSizeConfigure. Skip when
-        // the layout-driver hasn't produced a real outer rect yet (still the
-        // -1x-1 placeholder from addWindow); the layout pass itself will send
-        // the sized configure once it runs. Sending now would clamp to 0x0,
-        // which the client reads as "you pick" and overrides our intent.
-        if (win.pendingSizeConfigure && configure
-            && win.outer.width > 0 && win.outer.height > 0) {
-          win.pendingSizeConfigure = false;
-          const content = contentOf(win);
-          configure.configure(win.surfaceId, content.x, content.y, content.width, content.height);
+        const layoutSettled = win.outer.width > 0 && win.outer.height > 0
+                              && !dialogPolicyMutated;
+        if (layoutSettled || !beforeMap) {
+          // Synchronous path: either the layout already gave us a real
+          // outer (the normal case for windows that map after the WM
+          // has been running), OR there's no opening-driver wired (the
+          // unit-test scenario where the test harness skips the
+          // protocol layer; we shouldn't defer the window indefinitely).
+          //
+          // In the no-beforeMap case the surface enters the draw stack
+          // synchronously even at placeholder dims; the test harness
+          // doesn't run a layout pass so the window's rect is whatever
+          // addWindow seeded (compositor sink is also a stub there).
+          compositor.setSurfaceLayout(win.surfaceId, win.rect.x, win.rect.y, win.rect.width, win.rect.height);
+          beforeMap?.(win.surfaceId);
+          pushStack();
+          if (win.windowState.modal) tetherFocusOnModal(win);
+          if (win.pendingSizeConfigure && configure
+              && win.outer.width > 0 && win.outer.height > 0) {
+            win.pendingSizeConfigure = false;
+            const content = contentOf(win);
+            configure.configure(win.surfaceId, content.x, content.y, content.width, content.height);
+          }
+        } else {
+          // Layout not yet settled OR dialog policy will retrigger one,
+          // AND a beforeMap callback is wired (production opening-driver
+          // path). Engage a temp gate; defer beforeMap + pushStack to
+          // the settle-then-run continuation. The window is held out
+          // of the draw stack throughout, so it never composites at
+          // the placeholder rect.
+          if (!win.contentGateOwners) win.contentGateOwners = new Set();
+          win.contentGateOwners.add("opening-pending-layout");
+          void runOpeningAfterLayoutSettles(win);
         }
       }
       return { ...win.rect };
