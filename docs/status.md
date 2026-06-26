@@ -6,7 +6,11 @@ test counts, and historical rationale live in `status-detailed.md`. This
 file is the short read; consult the detailed doc when investigating a
 specific subsystem.
 
-Last updated: 2026-06-23. Most recent landings: Xwayland Phase 4
+Last updated: 2026-06-26. Recent landings: open/retile window animations
+(premap sizing + `window.opening` hook + map-ack hold gated on an active
+animation), open-slide direction, and the decorated-window (intercept)
+flicker fix via render-reports-rendered; see the deferred items in
+"Read first" below. Prior: Xwayland Phase 4
 (CLIPBOARD + PRIMARY selection bridge, both directions, with INCR for
 >64 KiB payloads; xcb-xfixes integration; 6 new selection GPU tests
 including two INCR end-to-end + TIMESTAMP-target reply; one
@@ -265,6 +269,30 @@ nothing, with no error. Worst-first.
   fds, so wire-FIFO can't fix it. Fix (deferred): ack-based shutdown
   handshake. No production impact (the user's runtime compositor
   doesn't tear down `intercept` plugins mid-frame in normal operation).
+
+- **Retile shrink animates the new (smaller) buffer upscaled.** When an
+  existing window shrinks on a layout reshuffle (e.g. 1->2 windows,
+  full->half), its open/retile animation scales the NEW half-width
+  buffer up to look full and tweens down, so the reflowed content reads
+  as "small content upscaled" rather than the old content shrinking. Root
+  cause: the resize transaction (holds the OLD geometry until the client
+  re-renders at the new size) and the `window.relayout` RETILED animation
+  (presnaps a transform ASSUMING the new geometry is already applied)
+  both own the same resize and fight. Not yet fixed; the open path (new
+  window) is correct.
+
+- **Intercept idle CPU not fully ~0%.** The decorated-window flicker is
+  fixed (the intercept output is damaged + recomposited only when the
+  plugin reports it rendered -- `render()` may return `false`, gated on
+  `ctx.contentChanged` + a per-surface content epoch; the decoration
+  returns `false` when content/focus/dims/placement are unchanged). The
+  GPU composite is gated, but the frame loop still WAKES every frame
+  while any intercept is registered (the broker stays active and ticks;
+  the plugin early-returns). GPU idles; CPU does not reach ~0%. Fix
+  (deferred): broker stops waking when all intercepts skip and re-wakes
+  on content/focus. Also outstanding: a dedicated test for the
+  render-returns-`false` / `contentChanged` behavior (covered indirectly
+  by the decoration + intercept-inthread GPU tests, not in isolation).
 
 ## Verification environment
 
