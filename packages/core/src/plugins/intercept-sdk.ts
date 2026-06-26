@@ -505,6 +505,8 @@ class WorkerPerSurfaceState {
             // no regression). A Worker plugin that returns false is honored by
             // the caller below.
             contentChanged: true,
+            // Unused: gates aren't supported on the Worker transport (below).
+            contentReady: false,
             // No-op: gates are not supported on the Worker transport
             // in 10a. A Worker plugin that declared `gates` is
             // rejected at registration (see the Worker register

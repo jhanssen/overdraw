@@ -1407,6 +1407,26 @@ export class JsCompositor implements CompositorSink {
   // passes the target output's scale here when known so it gates apply on
   // a buffer that truly matches the new scale, not just the new logical
   // size.
+  // Whether the committed client buffer matches the WM content rect (layoutW/H)
+  // scaled to device px -- the scale-aware check ctx.contentReady exposes. Reads
+  // s.texture (the same buffer the plugin samples as input), so it holds for
+  // both SHM and dmabuf surfaces; 1px tolerance absorbs fractional rounding.
+  surfaceContentReady(id: number): boolean {
+    const s = this.surfaces.get(id);
+    if (!s || !s.texture || s.layoutW <= 0 || s.layoutH <= 0) return false;
+    const scale = this.surfaceScale(id);
+    return Math.abs(s.width - Math.round(s.layoutW * scale)) <= 1
+        && Math.abs(s.height - Math.round(s.layoutH * scale)) <= 1;
+  }
+
+  private surfaceScale(id: number): number {
+    for (const oid of this.surfaceOutputs(id)) {
+      const o = this.outputsGeom.get(oid);
+      if (o && o.scale > 0) return o.scale;
+    }
+    return this.scale > 0 ? this.scale : 1;
+  }
+
   surfaceReadyAt(id: number, w: number, h: number, scale?: number): boolean {
     const s = this.surfaces.get(id);
     if (!s || !s.present || !s.view || s.currentBufferId === 0) return false;

@@ -31,12 +31,14 @@ export interface InThreadTickDeps {
   // dispatch when false.
   isPresentable(surfaceId: number): boolean;
   // The surface's WM-assigned outer rect. Passed into the render
-  // ctx so plugins can compute placement-relative output sizing
-  // (e.g. border plugin's strict gate-release compares input.w
-  // against surfaceRect.w - 2*B). Returns null for unknown
-  // surfaces; the tick treats null as a zero rect.
+  // ctx as surfaceRect so plugins can compute placement-relative
+  // output sizing. Returns null for unknown surfaces; the tick
+  // treats null as a zero rect.
   surfaceWmRect(surfaceId: number):
     { x: number; y: number; w: number; h: number } | null;
+  // Whether the committed buffer matches the WM content rect at the output
+  // scale. Surfaced as ctx.contentReady for scale-correct gate release.
+  contentReady(surfaceId: number): boolean;
   // Open a BeginAccess bracket on the surface's client dmabuf import
   // (if any), run fn, close with EndAccess. SHM-backed surfaces pass
   // through with no bracket. The plugin's render call MUST run
@@ -218,6 +220,7 @@ export class InThreadInterceptState {
             time: timeMs,
             surfaceRect: wmRect,
             contentChanged,
+            contentReady: this.deps.contentReady(this.surfaceId),
             releaseGate: () => this.releaseGate(),
           },
         });

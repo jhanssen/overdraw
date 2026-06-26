@@ -20,11 +20,9 @@
 //         rounded-corner cutouts show through to the band underneath).
 //   - The outer shape (rounded perimeter) is applied via the
 //     compositor's setShape on the combined output texture.
-//   - gates:true holds the window out of the draw stack until the
-//     plugin calls releaseGate(). Strict release policy: only release
-//     when input.rect.w == ctx.surfaceRect.w - 2*B (so a late-match
-//     catch-up never shows a wrong-size frame; see
-//     decoration-as-intercept.md "late-match wrong-size sequence").
+//   - gates:true holds the window out of the draw stack until the plugin
+//     calls releaseGate() (on ctx.contentReady -- the client committed at
+//     the configured size), so it never appears undecorated or wrong-sized.
 //   - On focus change (window.activated flips), update the cached
 //     focus state so the NEXT render uses the focused vs. unfocused
 //     fill. No explicit redraw call; the next frame picks up the
@@ -181,8 +179,8 @@ export default async function init(sdk: PluginSdk, rawConfig?: unknown): Promise
           // ring dims, or placement (surfaceRect). Returning false keeps the
           // previously-installed output and lets the compositor's dirty gate
           // skip recompositing, so an idle decorated window costs ~0 GPU. Only
-          // skip after the gate is released (before that every tick must render
-          // to drive the strict gate-release below).
+          // skip once released; before that every tick renders to drive the
+          // contentReady gate-release below.
           const rectUnchanged = w.lastSurfaceRect !== null
             && w.lastSurfaceRect.x === sr.x && w.lastSurfaceRect.y === sr.y
             && w.lastSurfaceRect.w === sr.w && w.lastSurfaceRect.h === sr.h;
@@ -209,14 +207,12 @@ export default async function init(sdk: PluginSdk, rawConfig?: unknown): Promise
 
           encodeFrame(pipeline, w.draw, output.texture.createView(), input.texture);
 
-          // Strict gate-release policy: ctx.surfaceRect is the WM's
-          // CONTENT-rect placement for this surface (where the
-          // compositor places the toplevel sans-intercept). The client
-          // commits at that size, so input.rect.w/h matches it once
-          // the post-insets re-commit lands. Comparing both axes: the
-          // WM shrinks BOTH dimensions; a partial match shouldn't
-          // release.
-          if (inputW === ctx.surfaceRect.w && inputH === ctx.surfaceRect.h) {
+          // Release the gate once the client has committed at the configured
+          // size (ctx.contentReady), so the window enters the draw stack with a
+          // correctly-sized decorated frame rather than a stretched late-match
+          // one. Comparing input.rect against surfaceRect directly would mix
+          // buffer px with logical px and never release under fractional scale.
+          if (!w.released && ctx.contentReady) {
             ctx.releaseGate();
             w.released = true;
           }

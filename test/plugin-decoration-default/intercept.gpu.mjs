@@ -166,9 +166,9 @@ test("decoration-default (intercept): rounded corners clip the band with uniform
 
 test("decoration-default (intercept): late-match catch-up does not show a wrong-size frame",
   { skip }, async () => {
-  // Strict gate-release policy: the bundled plugin should release the
-  // gate ONLY when input.rect matches surfaceRect - 2*B. We can't see
-  // the wrong-size frame on screen (that's the whole point of the
+  // The plugin releases the gate on ctx.contentReady -- only once the
+  // client has committed at the configured (post-insets) size. We can't
+  // see the wrong-size frame on screen (that's the whole point of the
   // gate); we verify indirectly that:
   //   - the window IS gated for some non-zero time after match;
   //   - the final composite shows the post-insets content size

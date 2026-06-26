@@ -478,13 +478,14 @@ export interface CompositorSink {
   // the bracket open failed (the broker treats that as a skipped
   // frame).
   withClientTextureAccess?(surfaceId: number, fn: () => void): boolean;
-  // The surface's WM-assigned outer rect (x/y in compositor logical
-  // coords, w/h from setSurfaceLayout). Threaded into the intercept
-  // render context as ctx.surfaceRect so plugins can compute
-  // post-inset content dimensions (e.g. border gate-release policy
-  // compares input.w against surfaceRect.w - 2*B). Returns null
-  // for unknown surfaces.
+  // The surface's WM-assigned outer rect (x/y in compositor logical coords,
+  // w/h from setSurfaceLayout). Threaded into the intercept render context as
+  // ctx.surfaceRect. Null for unknown surfaces.
   surfaceWmRect?(surfaceId: number): { x: number; y: number; w: number; h: number } | null;
+  // Whether the surface's committed buffer matches its WM content rect at the
+  // output scale (the client has caught up to the configured size). Surfaced
+  // to intercept gating plugins as ctx.contentReady.
+  surfaceContentReady?(surfaceId: number): boolean;
   // Phase 10a Worker intercept: copy the surface's currently-
   // committed client texture into a dmabuf the Worker plugin
   // samples. Both textures are on the core device; the dmabuf was

@@ -63,20 +63,17 @@ export interface InterceptRenderCtx {
   // when false and the plugin's own inputs (focus, geometry) are unchanged,
   // return `false` from render to skip. Always true on the first render.
   contentChanged: boolean;
+  // True once the committed buffer matches surfaceRect at the output scale --
+  // the scale-correct signal a gating plugin releases on (comparing input.rect
+  // in buffer px against surfaceRect in logical px only agrees at scale 1.0).
+  // In-thread: live each tick. Worker: always false (gates are in-thread only).
+  contentReady: boolean;
   // Release the WM content gate engaged by gates:true at match time.
-  // Idempotent: subsequent calls are no-ops. The window enters the
-  // draw stack on the next composite; the intercept output produced
-  // by THIS render is what the compositor samples.
-  //
-  // Typical strict-release-policy pattern for a border plugin:
-  //
-  //   render({ input, ctx, releaseGate }) {
-  //     const expectedW = ctx.surfaceRect.w - 2 * B;
-  //     // ... encode the frame ...
-  //     if (input.rect.w === expectedW) releaseGate();
-  //   }
-  //
-  // No-op when the registration did not declare `gates`.
+  // Idempotent; no-op when the registration did not declare `gates`. The
+  // window enters the draw stack on the next composite, sampling the output
+  // from THIS render. Gate on ctx.contentReady, not on dimension comparisons
+  // (input.rect is buffer px, surfaceRect is logical px -- they only agree at
+  // scale 1.0).
   releaseGate: () => void;
 }
 
