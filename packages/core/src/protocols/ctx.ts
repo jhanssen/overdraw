@@ -459,6 +459,9 @@ export interface CompositorSink {
   // plugin will read from). surfaceIsPresentable gates the per-frame
   // render dispatch to surfaces actually being composited.
   surfaceClientTexture?(surfaceId: number): { texture: GPUTexture; w: number; h: number } | null;
+  // Monotonic per-surface client-content version (bumped on each new commit).
+  // The intercept broker compares it across ticks to set ctx.contentChanged.
+  surfaceContentEpoch?(surfaceId: number): number;
   surfaceIsPresentable?(surfaceId: number): boolean;
   // Phase 10a in-thread intercept: open a BeginAccess bracket on the
   // surface's client dmabuf import, run `fn` (the plugin's render

@@ -499,6 +499,12 @@ class WorkerPerSurfaceState {
             // Worker transport: snapshot at match time. The Worker SDK
             // does not subscribe to live WM rect changes in 10a.
             surfaceRect: { x: 0, y: 0, w: this.cfg.width, h: this.cfg.height },
+            // Worker transport: the content-epoch plumbing isn't wired here yet,
+            // so report contentChanged=true every frame -- the Worker keeps its
+            // existing render-every-frame behavior (no skip optimization, but
+            // no regression). A Worker plugin that returns false is honored by
+            // the caller below.
+            contentChanged: true,
             // No-op: gates are not supported on the Worker transport
             // in 10a. A Worker plugin that declared `gates` is
             // rejected at registration (see the Worker register

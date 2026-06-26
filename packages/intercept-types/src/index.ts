@@ -56,6 +56,13 @@ export interface InterceptRenderCtx {
   // (same as surface placement; per-output origin is applied by the
   // compositor downstream).
   surfaceRect: Rect;
+  // True iff the client committed new content (a new buffer) for this
+  // surface since this plugin last rendered it. The plugin can't observe
+  // this itself (the client texture is sampled, not diffed), so the SDK
+  // supplies it. A static effect uses it to decide whether to re-render:
+  // when false and the plugin's own inputs (focus, geometry) are unchanged,
+  // return `false` from render to skip. Always true on the first render.
+  contentChanged: boolean;
   // Release the WM content gate engaged by gates:true at match time.
   // Idempotent: subsequent calls are no-ops. The window enters the
   // draw stack on the next composite; the intercept output produced
@@ -88,6 +95,14 @@ export interface InterceptOutput {
 // Per-frame render result. Returning `outputRect` overrides the
 // surface's WM-assigned placement for this frame (geometry control).
 // Returning `void` (or undefined) leaves the WM rect in place.
+//
+// Returning `false` means "I produced NO new output this frame -- keep
+// the previously-installed output." The SDK then does not install or
+// damage anything for this surface, so the compositor's per-output dirty
+// gate can skip recompositing. A static effect (e.g. a decoration border)
+// returns `false` whenever ctx.contentChanged is false AND none of its
+// own inputs (focus, geometry) changed, which lets an idle desktop drop to
+// ~0% GPU. A per-frame effect simply never returns `false`.
 export interface InterceptRenderResult {
   outputRect?: Rect;
 }
@@ -148,7 +163,7 @@ export interface InterceptHandlers {
     input: InterceptInput;
     output: InterceptOutput;
     ctx: InterceptRenderCtx;
-  }): InterceptRenderResult | void;
+  }): InterceptRenderResult | false | void;
 
   // Fired once on unregister (after every matched surface has
   // received onSurfaceUnmatched).

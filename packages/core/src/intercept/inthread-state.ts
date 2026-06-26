@@ -23,6 +23,10 @@ export interface InThreadTickDeps {
   // the intercept output (the surface draws raw / nothing).
   clientTexture(surfaceId: number):
     { texture: GPUTexture; w: number; h: number } | null;
+  // Monotonic client-content version for the surface. Compared across ticks
+  // to set ctx.contentChanged (did the client commit new content since this
+  // plugin last rendered).
+  contentEpoch(surfaceId: number): number;
   // Whether the surface is in this frame's draw list. Skip render
   // dispatch when false.
   isPresentable(surfaceId: number): boolean;
@@ -84,6 +88,9 @@ export class InThreadInterceptState {
   private ringW = 0;
   private ringH = 0;
   private next = 0;
+  // The client content-epoch at this surface's last successful render. -1 =
+  // never rendered, so the first tick reports contentChanged = true.
+  private lastRenderedEpoch = -1;
 
   // Counter for consecutive render-throw failures. If we hit
   // FAILURE_THRESHOLD, the broker treats the registration as dead.
@@ -184,7 +191,9 @@ export class InThreadInterceptState {
 
     const wmRect = this.deps.surfaceWmRect(this.surfaceId)
       ?? { x: 0, y: 0, w: 0, h: 0 };
-    const holder: { result: InterceptRenderResult | void; error: unknown } =
+    const epoch = this.deps.contentEpoch(this.surfaceId);
+    const contentChanged = epoch !== this.lastRenderedEpoch;
+    const holder: { result: InterceptRenderResult | false | void; error: unknown } =
       { result: undefined, error: null };
     // Wrap the plugin's render in a BeginAccess/EndAccess bracket
     // around the surface's client dmabuf import. The plugin samples
@@ -208,6 +217,7 @@ export class InThreadInterceptState {
             frameNumber: this.frameNumber,
             time: timeMs,
             surfaceRect: wmRect,
+            contentChanged,
             releaseGate: () => this.releaseGate(),
           },
         });
@@ -244,6 +254,18 @@ export class InThreadInterceptState {
     }
     this.consecutiveFailures = 0;
 
+    // The plugin reported it produced no new output this frame (a static
+    // effect whose inputs are unchanged). Keep the previously-installed output;
+    // don't install or damage, so the compositor's dirty gate skips this
+    // surface's region. The ring slot we rotated to is simply reused next time.
+    // Do NOT advance lastRenderedEpoch: if the client content had actually
+    // changed, a well-behaved plugin renders rather than skipping, so this only
+    // happens when contentChanged was false anyway.
+    if (holder.result === false) {
+      return { ok: true, rendered: false };
+    }
+
+    this.lastRenderedEpoch = epoch;
     const outputRect = holder.result?.outputRect ?? null;
     this.deps.installOutput(this.surfaceId, outView, outputRect);
     return { ok: true, rendered: true };

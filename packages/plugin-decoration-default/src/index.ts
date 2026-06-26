@@ -56,6 +56,12 @@ interface PerWindow {
   // the input dims change.
   lastInputW: number;
   lastInputH: number;
+  // The surfaceRect this window was last RENDERED at (placement). Used with
+  // the caches above to skip re-rendering when nothing changed.
+  lastSurfaceRect: { x: number; y: number; w: number; h: number } | null;
+  // True once the content gate has been released. We only skip rendering after
+  // release; before that, every tick must render to drive the release.
+  released: boolean;
 }
 
 export default async function init(sdk: PluginSdk, rawConfig?: unknown): Promise<void> {
@@ -142,6 +148,8 @@ export default async function init(sdk: PluginSdk, rawConfig?: unknown): Promise
             lastOutputH: 0,
             lastInputW: 0,
             lastInputH: 0,
+            lastSurfaceRect: null,
+            released: false,
           };
           perWindow.set(info.surfaceId, w);
         },
@@ -165,9 +173,26 @@ export default async function init(sdk: PluginSdk, rawConfig?: unknown): Promise
           const outputH = output.rect.h;
           const inputW = input.rect.w;
           const inputH = input.rect.h;
+          const fill: ResolvedFill = w.focused ? config.focused : config.unfocused;
+          const sr = ctx.surfaceRect;
+
+          // Static effect: skip re-rendering when nothing this render depends on
+          // has changed -- client content (ctx.contentChanged), focus (fill),
+          // ring dims, or placement (surfaceRect). Returning false keeps the
+          // previously-installed output and lets the compositor's dirty gate
+          // skip recompositing, so an idle decorated window costs ~0 GPU. Only
+          // skip after the gate is released (before that every tick must render
+          // to drive the strict gate-release below).
+          const rectUnchanged = w.lastSurfaceRect !== null
+            && w.lastSurfaceRect.x === sr.x && w.lastSurfaceRect.y === sr.y
+            && w.lastSurfaceRect.w === sr.w && w.lastSurfaceRect.h === sr.h;
+          if (w.released && !ctx.contentChanged && fill === w.lastFill && rectUnchanged
+              && outputW === w.lastOutputW && outputH === w.lastOutputH
+              && inputW === w.lastInputW && inputH === w.lastInputH) {
+            return false;
+          }
 
           // Update border uniforms only when the output size or fill changes.
-          const fill: ResolvedFill = w.focused ? config.focused : config.unfocused;
           if (outputW !== w.lastOutputW || outputH !== w.lastOutputH || fill !== w.lastFill) {
             writeBorderUniforms(pipeline.device, w.draw, outputW, outputH, fill);
             w.lastOutputW = outputW;
@@ -193,7 +218,10 @@ export default async function init(sdk: PluginSdk, rawConfig?: unknown): Promise
           // release.
           if (inputW === ctx.surfaceRect.w && inputH === ctx.surfaceRect.h) {
             ctx.releaseGate();
+            w.released = true;
           }
+          // Record what we rendered at, so the next tick can skip if unchanged.
+          w.lastSurfaceRect = { x: sr.x, y: sr.y, w: sr.w, h: sr.h };
 
           // The output texture is sized to the WM outer rect (=
           // content + 2*B on each side). The compositor's default

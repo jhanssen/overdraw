@@ -540,6 +540,12 @@ interface Surface {
   // with the right buffer id, and to know what to (re)bind into the bind group
   // when an import completes.
   currentBufferId: number;
+  // Monotonic counter bumped every time the client commits NEW content to this
+  // surface (a fresh dmabuf import bound, or an shm upload). The intercept
+  // broker reads it (surfaceContentEpoch) to tell a plugin's render whether the
+  // client content changed since its last render (ctx.contentChanged), so a
+  // static effect can skip re-rendering when nothing changed.
+  contentEpoch: number;
   // Shm fast-path texture handle (wire-allocated by Compositor::reserveShmTexture).
   // When set, this surface's `texture` is sampled but never written by the JS
   // device queue (the GPU process does queue.WriteTexture from its own mmap of
@@ -1628,6 +1634,7 @@ export class JsCompositor implements CompositorSink {
     if (!ab) return false;
     this.uploadPixels(id, { width, height, stride }, ab, damage);
     this.imported.push({ id, width, height });
+    this.bumpContentEpoch(id);
     return true;
   }
 
@@ -1711,6 +1718,7 @@ export class JsCompositor implements CompositorSink {
     const sFinal = this.surfaces.get(id);
     if (sFinal) sFinal.present = true;
     this.imported.push({ id, width, height });
+    this.bumpContentEpoch(id);
     return seq;
   }
 
@@ -1830,6 +1838,7 @@ export class JsCompositor implements CompositorSink {
     // re-render the WM's held resize is waiting for -- poke it to re-check.
     this.rebuildBindGroup(s, imp.view);
     s.present = true;
+    s.contentEpoch++;
     this.imported.push({ id, width: imp.width, height: imp.height });
     this.damageSurface(id);  // new dmabuf content -> repaint this surface's rect
     if (s.frozen) this.frozenReadyCb?.(id);
@@ -3083,6 +3092,27 @@ export class JsCompositor implements CompositorSink {
     // rebuildBindGroup is called on it.
     this.rebuildBindGroup(s, view);
     s.present = true;   // matched + textured -> drawable
+    // The intercept output just changed (the broker re-rendered the plugin's
+    // pixels). This is the ONLY thing that marks the surface's region damaged
+    // for an intercepted window -- the broker only calls install when the
+    // plugin actually produced new output (render didn't return false) -- so
+    // renderFrame's per-output dirty gate recomposites every scanout slot's
+    // copy of this region (the new-then-old flicker was a stale scanout slot).
+    // Damage just the placement rect, not the whole output. A surface with an
+    // active transform (e.g. the open-slide animation) needs a full repaint
+    // because the rect moves under the transform, so fall back to damageFull
+    // there.
+    const fx = s.fx;
+    const transformed = fx.translateX !== 0 || fx.translateY !== 0
+      || fx.scaleX !== 1 || fx.scaleY !== 1
+      || fx.marginTop !== 0 || fx.marginRight !== 0
+      || fx.marginBottom !== 0 || fx.marginLeft !== 0
+      || s.maskView !== null;
+    if (placement && !transformed) {
+      this.addOutputDamage(placement.x, placement.y, placement.w, placement.h);
+    } else {
+      this.damageFull();
+    }
   }
 
   clearInterceptOutput(surfaceId: number): void {
@@ -3118,6 +3148,17 @@ export class JsCompositor implements CompositorSink {
     const s = this.surfaces.get(surfaceId);
     if (!s || !s.texture) return null;
     return { texture: s.texture, w: s.width, h: s.height };
+  }
+
+  private bumpContentEpoch(id: number): void {
+    const s = this.surfaces.get(id);
+    if (s) s.contentEpoch++;
+  }
+
+  // Monotonic per-surface content version (bumped on each new client commit).
+  // The intercept broker compares it across ticks to set ctx.contentChanged.
+  surfaceContentEpoch(surfaceId: number): number {
+    return this.surfaces.get(surfaceId)?.contentEpoch ?? 0;
   }
 
   // Phase 10a: whether the surface is in the on-screen draw list this
@@ -3842,6 +3883,7 @@ function blankSurface(x: number, y: number, w: number, h: number): Surface {
     texture: null, view: null, uniformBuf: null, bindGroup: null,
     width: 0, height: 0, bufferScale: 1, bufferTransform: 0, x, y, layoutW: w, layoutH: h, present: false,
     currentBufferId: 0,
+    contentEpoch: 0,
     fx: defaultFx(),
     maskView: null,
     interceptOutputView: null,
