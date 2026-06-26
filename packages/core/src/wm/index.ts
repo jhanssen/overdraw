@@ -37,6 +37,7 @@ import type {
   WindowProposedEvent,
   WindowCommittedEvent,
   WindowPreconfigureEvent,
+  WindowPremapEvent,
 } from "../events/types.js";
 
 export interface Rect { x: number; y: number; width: number; height: number; }
@@ -282,9 +283,14 @@ export interface Wm {
   // Carries appId + title in the emitted event so window-rules plugins can
   // dispatch off them. The caller (wl_surface.commit when it detects an
   // initial commit) supplies them.
+  //
+  // info.outputId (the spawn output): when present, the WM emits window.premap
+  // after preconfigure so the workspace plugin places the window into a
+  // workspace before first content, letting the sized configure go out in this
+  // handshake. Absent (e.g. xwayland) keeps the legacy first-content placement.
   markInitialCommitComplete(
     surfaceId: number,
-    info: { appId: string | null; title: string | null },
+    info: { appId: string | null; title: string | null; outputId?: number },
   ): Promise<void>;
   // Synchronously send the throwaway 0x0 first configure (with the resolved
   // state array) so the xdg-shell handshake completes within the client's
@@ -1152,6 +1158,32 @@ export function createWm(
     });
   }
 
+  // Final step of the open sequence: drop the opening hold gates, run the
+  // opening-driver hook (which may engage its own "opening" gate that the
+  // animation plugin releases), and stack the window. Ordering matches the
+  // gate invariant: beforeMap engages "opening" before the temp gate is
+  // dropped, so the window is never momentarily un-gated.
+  function mapOpenedWindow(win: Window): void {
+    beforeMap?.(win.surfaceId);
+    win.contentGateOwners?.delete("opening-pending-layout");
+    pushStack();
+    if (win.windowState.modal) tetherFocusOnModal(win);
+  }
+
+  // Shared tail of windowHasContent (both the settled-synchronous path and the
+  // deferred continuation). Pushes the window's layout, sends the real tile-
+  // size configure if it hasn't gone out yet, then maps the window.
+  function openWindow(win: Window): void {
+    compositor.setSurfaceLayout(win.surfaceId, win.rect.x, win.rect.y, win.rect.width, win.rect.height);
+    if (win.pendingSizeConfigure && configure
+        && win.outer.width > 0 && win.outer.height > 0) {
+      win.pendingSizeConfigure = false;
+      const content = contentOf(win);
+      configure.configure(win.surfaceId, content.x, content.y, content.width, content.height);
+    }
+    mapOpenedWindow(win);
+  }
+
   // Continuation for windowHasContent when the layout-driver pass that
   // assigns a window's real outer rect hadn't settled by the time
   // first-content arrived. Awaits driver.settled(), then runs the
@@ -1179,22 +1211,7 @@ export function createWm(
       win.contentGateOwners?.delete("opening-pending-layout");
       return;
     }
-    compositor.setSurfaceLayout(win.surfaceId, win.rect.x, win.rect.y, win.rect.width, win.rect.height);
-    // beforeMap may engage its own gate (opening-driver) before
-    // returning; that gate's release is independent of our temp gate.
-    beforeMap?.(win.surfaceId);
-    // Release the temp gate. If the opening-driver engaged its own
-    // gate inside beforeMap, the window remains held out of the
-    // stack until that plugin releases.
-    win.contentGateOwners?.delete("opening-pending-layout");
-    pushStack();
-    if (win.windowState.modal) tetherFocusOnModal(win);
-    if (win.pendingSizeConfigure && configure
-        && win.outer.width > 0 && win.outer.height > 0) {
-      win.pendingSizeConfigure = false;
-      const content = contentOf(win);
-      configure.configure(win.surfaceId, content.x, content.y, content.width, content.height);
-    }
+    openWindow(win);
   }
 
   // Apply a LayoutResult: emit window.relayout, then update each window's
@@ -1351,6 +1368,11 @@ export function createWm(
         compositor.setSurfaceLayout(win.surfaceId, content.x, content.y, content.width, content.height);
       }
       if (configure && !win.pendingInitialCommit && sizeChanged) {
+        // This is the real tile-size configure. When premap placement gives a
+        // fresh window its first real outer, it goes out here; clearing the
+        // "owed" flag keeps markInitialCommitComplete / windowHasContent from
+        // re-sending it (pendingSizeConfigure is the single source of truth).
+        win.pendingSizeConfigure = false;
         configure.configure(win.surfaceId, content.x, content.y, content.width, content.height);
       } else if (configure && !win.pendingInitialCommit && moved && win.hasContent) {
         // Pure move: configure.configure is for size changes only; route via
@@ -1608,16 +1630,7 @@ export function createWm(
           // synchronously even at placeholder dims; the test harness
           // doesn't run a layout pass so the window's rect is whatever
           // addWindow seeded (compositor sink is also a stub there).
-          compositor.setSurfaceLayout(win.surfaceId, win.rect.x, win.rect.y, win.rect.width, win.rect.height);
-          beforeMap?.(win.surfaceId);
-          pushStack();
-          if (win.windowState.modal) tetherFocusOnModal(win);
-          if (win.pendingSizeConfigure && configure
-              && win.outer.width > 0 && win.outer.height > 0) {
-            win.pendingSizeConfigure = false;
-            const content = contentOf(win);
-            configure.configure(win.surfaceId, content.x, content.y, content.width, content.height);
-          }
+          openWindow(win);
         } else {
           // Layout not yet settled OR dialog policy will retrigger one,
           // AND a beforeMap callback is wired (production opening-driver
@@ -2077,6 +2090,35 @@ export function createWm(
         // in applyLayout doesn't fire for the post-rule pass.
         win.pendingInitialCommit = false;
 
+        // Ensure the throwaway 0x0 handshake configure has gone out. It is
+        // normally sent synchronously by sendInitialConfigure (in the initial-
+        // commit dispatch) so a single-roundtrip client sees it; this covers a
+        // direct caller that skipped that. Sent BEFORE placement so the 0x0
+        // always precedes the real tile size (the handshake invariant), and so
+        // a later applyLayout clearing pendingSizeConfigure can't make this
+        // fire a spurious trailing 0x0.
+        if (configure && !win.pendingSizeConfigure) {
+          configure.configure(win.surfaceId, 0, 0, 0, 0);
+          win.pendingSizeConfigure = true;
+        }
+
+        // Place the window into a workspace before it has any content, so the
+        // layout assigns its real tile rect now and the real tile-size configure
+        // can go out in this handshake (the client's first buffer then renders
+        // at the tile size). The interceptor (workspace plugin) awaits its own
+        // setOutputStack, so by the time this resolves the placement's relayout
+        // has been scheduled; the settle below runs it, and applyLayout sends
+        // the sized configure (clearing pendingSizeConfigure). Skipped when no
+        // spawn output is known (xwayland); those keep first-content placement.
+        if (pluginBus && info.outputId !== undefined) {
+          const premap: WindowPremapEvent = {
+            surfaceId, outputId: info.outputId,
+          };
+          await pluginBus.emit(WINDOW_EVENT.premap, premap,
+            { timeoutMs: INTERCEPTOR_TIMEOUT_MS });
+          if (!windows.includes(win)) return;
+        }
+
         if (changed.some((f) => GEOMETRY_FIELDS.includes(f))) {
           driver.schedule("state-changed");
         }
@@ -2088,16 +2130,18 @@ export function createWm(
         await driver.settled();
         if (!windows.includes(win)) return;
 
-        // The throwaway 0x0 first configure is normally sent synchronously by
-        // sendInitialConfigure (in the initial-commit dispatch) so a
-        // single-roundtrip client sees it. Send it here only as a fallback --
-        // e.g. a direct test caller, or if no configure had gone out yet. The
-        // real tile size follows as a SECOND configure from windowHasContent
-        // once the client has content (a resize). The 0x0 carries the resolved
-        // state array (maximized/tiled) so the client knows it is tiled.
-        if (configure && !win.pendingSizeConfigure) {
-          configure.configure(win.surfaceId, 0, 0, 0, 0);
-          win.pendingSizeConfigure = true;
+        // Real tile size, sent here only if placement did not already cause
+        // applyLayout to send it (e.g. the window's outer was assigned before
+        // this call, so the settle ran no size-changing pass). When placement
+        // produced no real outer at all (no workspace plugin, or no spawn
+        // output) pendingSizeConfigure stays set and windowHasContent sends
+        // this configure at first content.
+        if (configure && win.pendingSizeConfigure
+            && win.outer.width > 0 && win.outer.height > 0) {
+          win.pendingSizeConfigure = false;
+          const content = contentOf(win);
+          configure.configure(win.surfaceId,
+            content.x, content.y, content.width, content.height);
         }
       } finally {
         resolveSelf();

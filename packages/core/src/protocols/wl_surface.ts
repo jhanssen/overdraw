@@ -12,6 +12,7 @@
 import type { WlSurfaceHandler } from "#protocols-gen/wl_surface.js";
 import { WlSurface_Error } from "#protocols-gen/wl_surface.js";
 import type { Ctx, CompositorState, SurfaceRecord, SubsurfaceRecord } from "./ctx.js";
+import { OUTPUT_DEFAULT } from "./ctx.js";
 import type { Resource } from "../types.js";
 import type { RegionRect } from "./region.js";
 import { applySubsurfaces, applySubsurfaceReorder } from "../subsurfaces.js";
@@ -601,7 +602,8 @@ export default function makeSurface(ctx: Ctx): WlSurfaceHandler {
         const t = ctx.state.toplevels?.get(xs.toplevel);
         const appId = t?.appId ?? null;
         const title = t?.title ?? null;
-        void ctx.state.wm?.markInitialCommitComplete(s.id, { appId, title });
+        const outputId = s.spawnOutputId ?? OUTPUT_DEFAULT;
+        void ctx.state.wm?.markInitialCommitComplete(s.id, { appId, title, outputId });
       } else if (xs?.toplevel) {
         // A non-initial commit: the client re-rendered, which may satisfy a
         // held resize (it has acked the size the WM asked for). Pass the

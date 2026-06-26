@@ -39,12 +39,11 @@ const EASING = easings.easeOut;
 
 export default async function init(sdk) {
   // Claiming these namespaces makes the opening / closing drivers
-  // active. opening-driver engages a content gate at first-content
-  // so the window doesn't draw until we've set the presnap
-  // transform (via window.relayout CREATED, which fires before the
-  // opening-driver's window.opening). closing-driver mints a
-  // phantom for the unmapping window's last visible state -- the
-  // surface we animate from DESTROYED.
+  // active. opening-driver engages a content gate at first-content and
+  // emits window.opening so the window doesn't draw until we've set the
+  // presnap transform and released the gate (handled below).
+  // closing-driver mints a phantom for the unmapping window's last
+  // visible state -- the surface we animate from DESTROYED.
   await sdk.registerPlugin("window-opening", () => ({}));
   await sdk.registerPlugin("window-closing", () => ({}));
   sdk.log("window-animations: registered");
@@ -77,50 +76,11 @@ export default async function init(sdk) {
     const id = ev.surfaceId;
     const tiling = ev.tiling;
 
-    // CREATED: set the initial transform/opacity so the window
-    // appears mid-animation when it first composites.
-    if (ev.oldOuter === null && ev.newOuter !== null) {
-      try {
-        if (tiling === "managed") {
-          // Tiled: slide in from one tile-width to the right of the
-          // destination. The slide distance is the window's own
-          // width -- for a master-stack tile this is half the
-          // output; for a single-window-full-output it's the full
-          // output width.
-          const slideX = ev.newOuter.width;
-          await sdk.windows.setTransform(id,
-            { translateX: slideX, translateY: 0, scaleX: 1, scaleY: 1 });
-          await sdk.windows.releaseOpeningGate(id);
-          void sdk.animations.run(tween(target.windowTransform(id), {
-            from: { translateX: slideX, translateY: 0, scaleX: 1, scaleY: 1 },
-            to:   { translateX: 0,      translateY: 0, scaleX: 1, scaleY: 1 },
-            duration: DURATION_MS, easing: EASING,
-          }));
-        } else {
-          // Floating: fade + scale-up from 90% so the window
-          // appears in place rather than sliding from off-screen.
-          // (A dialog at the center of the screen sliding from the
-          // right would feel out of place.)
-          await sdk.windows.setOpacity(id, 0);
-          await sdk.windows.setTransform(id,
-            { translateX: 0, translateY: 0, scaleX: 0.9, scaleY: 0.9 });
-          await sdk.windows.releaseOpeningGate(id);
-          void sdk.animations.run(tween(target.windowOpacity(id), {
-            from: 0, to: 1,
-            duration: DURATION_MS, easing: EASING,
-          }));
-          void sdk.animations.run(tween(target.windowTransform(id), {
-            from: { translateX: 0, translateY: 0, scaleX: 0.9, scaleY: 0.9 },
-            to:   { translateX: 0, translateY: 0, scaleX: 1.0, scaleY: 1.0 },
-            duration: DURATION_MS, easing: EASING,
-          }));
-        }
-      } catch (e) {
-        try { await sdk.windows.releaseOpeningGate(id); } catch (_) { /* */ }
-        sdk.log(`window-animations: CREATED setup failed for ${id}: ${e && e.message ? e.message : e}`);
-      }
-      return undefined;
-    }
+    // Opening (the window first appearing) is driven by window.opening
+    // below, not by relayout CREATED: window.opening fires at first content
+    // with the opening gate already engaged, so releasing it there actually
+    // lands. A relayout CREATED can fire earlier (the window is placed in the
+    // layout before it has content), before the gate exists.
 
     // DESTROYED: animate the phantom (the closing-driver's snapshot
     // of the last visible state) out. The phantom is a separate
@@ -201,6 +161,50 @@ export default async function init(sdk) {
 
     // Anything else: observe-only (no animation we know how to
     // handle).
+    return undefined;
+  });
+
+  // OPEN animation. window.opening fires at first content, with the opening
+  // gate engaged and the window held out of the draw stack. We set the presnap
+  // transform, release the gate (the held window now composites at presnap,
+  // not identity), then tween to identity. ev carries outerRect (the tile) and
+  // tiling so we can pick slide-in (tiled) vs fade/scale (floating) without a
+  // lookup. The gate -- not event-await -- is the synchronization: the window
+  // does not draw until releaseOpeningGate, so the first frame is mid-animation.
+  sdk.events.intercept("window.opening", async (_name, ev) => {
+    const id = ev.surfaceId;
+    try {
+      if (ev.tiling === "managed") {
+        // Slide in from one tile-width to the right of the destination.
+        const slideX = ev.outerRect.width;
+        await sdk.windows.setTransform(id,
+          { translateX: slideX, translateY: 0, scaleX: 1, scaleY: 1 });
+        await sdk.windows.releaseOpeningGate(id);
+        void sdk.animations.run(tween(target.windowTransform(id), {
+          from: { translateX: slideX, translateY: 0, scaleX: 1, scaleY: 1 },
+          to:   { translateX: 0,      translateY: 0, scaleX: 1, scaleY: 1 },
+          duration: DURATION_MS, easing: EASING,
+        }));
+      } else {
+        // Floating: fade + scale-up from 90% so the window appears in place.
+        await sdk.windows.setOpacity(id, 0);
+        await sdk.windows.setTransform(id,
+          { translateX: 0, translateY: 0, scaleX: 0.9, scaleY: 0.9 });
+        await sdk.windows.releaseOpeningGate(id);
+        void sdk.animations.run(tween(target.windowOpacity(id), {
+          from: 0, to: 1,
+          duration: DURATION_MS, easing: EASING,
+        }));
+        void sdk.animations.run(tween(target.windowTransform(id), {
+          from: { translateX: 0, translateY: 0, scaleX: 0.9, scaleY: 0.9 },
+          to:   { translateX: 0, translateY: 0, scaleX: 1.0, scaleY: 1.0 },
+          duration: DURATION_MS, easing: EASING,
+        }));
+      }
+    } catch (e) {
+      try { await sdk.windows.releaseOpeningGate(id); } catch (_) { /* */ }
+      sdk.log(`window-animations: opening setup failed for ${id}: ${e && e.message ? e.message : e}`);
+    }
     return undefined;
   });
 }

@@ -45,6 +45,16 @@ export const WINDOW_EVENT = {
   // observe "the window now exists" without intercepting should use
   // window.map (fires at first content).
   preconfigure: "window.preconfigure",
+  // Await-capable placement event fired AFTER preconfigure commits the final
+  // state but BEFORE the client has any content. Lets the workspace plugin
+  // assign the window to an output/workspace (sdk.windows.setOutputStack) so
+  // the layout produces the window's real tile rect, and the sized configure
+  // can go out in the same handshake instead of waiting for first content. An
+  // interceptor that places the window must AWAIT its setOutputStack so the
+  // WM's emit resolves only once placement has been applied. window.map still
+  // fires later at first content (the drawable signal); placement there is the
+  // idempotent fallback for windows that never went through this event.
+  premap: "window.premap",
   // Pre-action lifecycle event: the WM is about to change a window's outer
   // tile. Fired BEFORE the compositor receives the new rect or xdg_toplevel
   // sees the configure. Await-capable: an interceptor may modify the new
@@ -260,6 +270,13 @@ export type WindowPreconfigureEvent = {
   initialState: WindowState;
 };
 
+// Pre-content placement event (see WINDOW_EVENT.premap). Carries the output the
+// window was spawned on so the workspace plugin can place it without a lookup.
+export type WindowPremapEvent = {
+  surfaceId: number;
+  outputId: number;
+};
+
 // Emitted before the WM mutates a window's outer tile.
 //
 // Covers three lifecycle transitions in addition to the original "rect
@@ -389,6 +406,10 @@ export type WindowOpeningEvent = {
   outerRect: WindowRect;
   outputId: number;
   outputRect: WindowRect;
+  // The window's tiling lane ("managed" tiled vs "floating"), so the opening
+  // animation can pick its entry (slide-in for tiled, fade/scale for floating)
+  // without a separate state lookup.
+  tiling: Tiling;
   appId: string | null;
   title: string | null;
 };
@@ -448,6 +469,7 @@ export type _RelayoutIsCloneable = AssignableToCloneable<WindowRelayoutEvent>;
 export type _StackRelayoutIsCloneable = AssignableToCloneable<StackRelayoutEvent>;
 export type _ClosingIsCloneable = AssignableToCloneable<WindowClosingEvent>;
 export type _OpeningIsCloneable = AssignableToCloneable<WindowOpeningEvent>;
+export type _PremapIsCloneable = AssignableToCloneable<WindowPremapEvent>;
 export type _AssignedIsCloneable = AssignableToCloneable<DecorationAssignedEvent>;
 export type _DeregisteredIsCloneable = AssignableToCloneable<DecorationDeregisteredEvent>;
 export type _ResizedIsCloneable = AssignableToCloneable<DecorationResizedEvent>;

@@ -106,6 +106,7 @@ test('beforeMap: engages gate + emits window.opening when plugin registered', ()
     outerRect: { x: 10, y: 20, width: 500, height: 400 },
     outputId: 0,
     outputRect: { x: 0, y: 0, width: 1920, height: 1080 },
+    tiling: 'managed',
     appId: 'com.example.x',
     title: 'X',
   });

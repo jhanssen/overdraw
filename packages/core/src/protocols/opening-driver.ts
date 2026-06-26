@@ -92,6 +92,7 @@ export function createOpeningDriver(deps: OpeningDriverDeps): OpeningDriver {
         ? { x: wmOutput.rect.x, y: wmOutput.rect.y,
             width: wmOutput.rect.width, height: wmOutput.rect.height }
         : { x: 0, y: 0, width: outer.width, height: outer.height };
+      const tiling = state.wm.getWindowState?.(s.id)?.tiling ?? "managed";
       const payload: WindowOpeningEvent = {
         surfaceId: s.id,
         outerRect: {
@@ -100,6 +101,7 @@ export function createOpeningDriver(deps: OpeningDriverDeps): OpeningDriver {
         },
         outputId,
         outputRect,
+        tiling,
         appId: ta.appId, title: ta.title,
       };
       try {

@@ -14,6 +14,7 @@ import assert from 'node:assert/strict';
 
 import { createWm } from '../packages/core/dist/wm/index.js';
 import { DynamicBus } from '../packages/core/dist/events/dynamic-bus.js';
+import { inlineMasterStackDriverFactory } from './wm-helpers.mjs';
 
 const createDynamicBus = () => new DynamicBus();
 
@@ -83,7 +84,7 @@ test('deferInitialCommit: no configure fires during addWindow + propose phase', 
   assert.equal(configures.length, 0); // still suppressed
 });
 
-test('markInitialCommitComplete: throwaway 0x0 first configure; real size on first content', async () => {
+test('markInitialCommitComplete: throwaway 0x0 first configure, then real tile size once the layout has settled', async () => {
   const configures = [];
   const wm = createWm(mockSink(), [{ id: 0, rect: { x: 0, y: 0, width: 1000, height: 600 }, scale: 1 }], {
     configure: { configure: (id, _x, _y, w, h) => { configures.push({ id, w, h }); return null; }, configureMove: () => {} },
@@ -92,13 +93,96 @@ test('markInitialCommitComplete: throwaway 0x0 first configure; real size on fir
   wm.addWindow(1, res(1), { deferInitialCommit: true });
   await wm.settled();
   await wm.markInitialCommitComplete(1, { appId: null, title: null });
-  // First configure is the throwaway 0x0: the client gets a serial to ack and
-  // may pick its own size; the real tile size lands as the SECOND configure.
-  assert.deepEqual(configures, [{ id: 1, w: 0, h: 0 }]);
-  // First content commit -> the real tile size goes out as a resize.
+  // The 0x0 handshake configure goes out first (the client gets a serial to
+  // ack). With the layout already settled, the real tile size follows
+  // immediately as the SECOND configure -- during the initial-commit handshake,
+  // before any content -- so the client's first buffer renders at the tile size.
+  assert.deepEqual(configures, [{ id: 1, w: 0, h: 0 }, { id: 1, w: 1000, h: 600 }]);
+  // First content does NOT re-send: the sized configure already went out.
   wm.windowHasContent(1);
-  assert.deepEqual(configures.at(-1), { id: 1, w: 1000, h: 600 });
   assert.equal(configures.length, 2);
+  assert.deepEqual(configures.at(-1), { id: 1, w: 1000, h: 600 });
+});
+
+test('premap: emitted with the spawn output after preconfigure, and awaited before the sized configure goes out', async () => {
+  const bus = createDynamicBus();
+  const configures = [];
+  const wm = createWm(mockSink(), [{ id: 0, rect: { x: 0, y: 0, width: 1000, height: 600 }, scale: 1 }], {
+    pluginBus: bus,
+    configure: { configure: (id, _x, _y, w, h) => { configures.push({ id, w, h }); return null; }, configureMove: () => {} },
+    layoutDriverFactory: immediateLayoutDriver,
+  });
+  // The workspace plugin places the window in response to premap; model that as
+  // a slow interceptor so we can observe that the handshake awaits it.
+  const premaps = [];
+  let resolvePremap;
+  bus.intercept('window.premap', (_n, p) => {
+    premaps.push(p);
+    return new Promise((r) => { resolvePremap = r; });
+  });
+  wm.addWindow(1, res(1), { deferInitialCommit: true });
+  await wm.settled();
+  const done = wm.markInitialCommitComplete(1, { appId: 'a', title: 't', outputId: 0 });
+  await new Promise((r) => setImmediate(r));
+  // premap fired carrying the spawn output. The 0x0 handshake has gone out, but
+  // the REAL tile size is gated on placement (the premap interceptor).
+  assert.deepEqual(premaps, [{ surfaceId: 1, outputId: 0 }]);
+  assert.deepEqual(configures, [{ id: 1, w: 0, h: 0 }], '0x0 first; real size waits for placement');
+  resolvePremap(undefined);
+  await done;
+  // Placement done -> the real tile size follows, still pre-content.
+  assert.deepEqual(configures, [{ id: 1, w: 0, h: 0 }, { id: 1, w: 1000, h: 600 }]);
+});
+
+test('premap: placement-driven sized configure goes out exactly once (no double-send with applyLayout)', async () => {
+  // Faithful production model: the window is NOT laid out until the workspace
+  // plugin places it (outputContent gates the layout). The premap interceptor
+  // models that placement -> the resulting relayout takes the window
+  // placeholder->real, so applyLayout sends the sized configure. The
+  // markInitialCommitComplete tail must NOT also send it.
+  const bus = createDynamicBus();
+  const configures = [];
+  const placed = [];
+  // The real layout driver (createLayoutDriver) gates on outputContent, so the
+  // window stays unplaced -- outer placeholder -- until premap places it.
+  const wm = createWm(mockSink(), [{ id: 0, rect: { x: 0, y: 0, width: 1000, height: 600 }, scale: 1 }], {
+    pluginBus: bus,
+    configure: { configure: (id, _x, _y, w, h) => { configures.push({ id, w, h }); return null; }, configureMove: () => {} },
+    layoutDriverFactory: inlineMasterStackDriverFactory,
+    outputContent: () => new Map(placed.length ? [[0, [...placed]]] : []),
+  });
+  bus.intercept('window.premap', async (_n, p) => {
+    placed.push(p.surfaceId);     // place it (workspace plugin's setOutputStack)
+    wm.schedule('reorder');       // ...which triggers a relayout
+    await wm.settled();           // await it, like the plugin awaits setOutputStack
+  });
+  wm.addWindow(1, res(1), { deferInitialCommit: true });
+  await wm.settled();             // not placed yet -> outer stays placeholder
+  assert.equal(wm.outerRectOf(1)?.width <= 0, true, 'outer is placeholder before placement');
+  await wm.markInitialCommitComplete(1, { appId: 'a', title: 't', outputId: 0 });
+  // 0x0 first, then the real tile size exactly once.
+  assert.deepEqual(configures.filter((c) => c.w === 0 && c.h === 0), [{ id: 1, w: 0, h: 0 }],
+    'exactly one 0x0 handshake configure');
+  assert.deepEqual(configures.filter((c) => c.w !== 0 || c.h !== 0), [{ id: 1, w: 1000, h: 600 }],
+    'exactly one sized configure (no double-send)');
+  // First content does not re-send either.
+  wm.windowHasContent(1);
+  assert.deepEqual(configures.filter((c) => c.w !== 0 || c.h !== 0), [{ id: 1, w: 1000, h: 600 }]);
+});
+
+test('premap: not emitted when no spawn output is provided (xwayland path keeps first-content placement)', async () => {
+  const bus = createDynamicBus();
+  const wm = createWm(mockSink(), [{ id: 0, rect: { x: 0, y: 0, width: 1000, height: 600 }, scale: 1 }], {
+    pluginBus: bus,
+    configure: { configure: () => null, configureMove: () => {} },
+    layoutDriverFactory: immediateLayoutDriver,
+  });
+  const premaps = [];
+  bus.subscribe('window.premap', (_n, p) => premaps.push(p));
+  wm.addWindow(1, res(1), { deferInitialCommit: true });
+  await wm.settled();
+  await wm.markInitialCommitComplete(1, { appId: null, title: null });
+  assert.equal(premaps.length, 0);
 });
 
 test('sendInitialConfigure: 0x0 first configure is sent SYNCHRONOUSLY (single-roundtrip handshake)', async () => {
@@ -343,5 +427,7 @@ test('preconfigure: configure fires AFTER interceptor settles + state commits', 
   assert.equal(configures.length, 0); // configure not yet fired
   resolveSlow(undefined);
   await done;
-  assert.equal(configures.length, 1); // configure fires after interceptor resolves
+  // The configures are held until the interceptor resolves; then the 0x0
+  // handshake AND the real tile size (layout already settled) both go out.
+  assert.deepEqual(configures, [{ id: 1, w: 0, h: 0 }, { id: 1, w: 1000, h: 600 }]);
 });
