@@ -8,10 +8,11 @@
 // clipboard layer consumes it); it replaces the old seat.onKbFocusChange hook.
 
 import { TypedBus } from "./bus.js";
-import { WINDOW_EVENT } from "./types.js";
+import { WINDOW_EVENT, STACK_EVENT } from "./types.js";
 import type {
   WindowMapEvent, WindowUnmapEvent, WindowChangeEvent, WindowStateBagChangedEvent,
   WindowClosingEvent, WindowOpeningEvent, WindowPreconfigureEvent,
+  StackRelayoutEvent,
 } from "./types.js";
 
 // Keyboard-focus change (active window). surfaceId / clientId identify the
@@ -53,6 +54,7 @@ export interface CompositorEventMap {
   [WINDOW_EVENT.closing]: WindowClosingEvent;
   [WINDOW_EVENT.opening]: WindowOpeningEvent;
   [WINDOW_EVENT.preconfigure]: WindowPreconfigureEvent;
+  [STACK_EVENT.relayout]: StackRelayoutEvent;
   [KEYBOARD_EVENT.focus]: KeyboardFocusEvent;
   [SELECTION_EVENT.changed]: SelectionChangedEvent;
 }

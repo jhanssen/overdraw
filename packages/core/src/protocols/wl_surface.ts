@@ -675,7 +675,7 @@ export function detachSurfaceRole(state: CompositorState, s: SurfaceRecord): voi
   // BEFORE the WM/compositor teardown, give the closing driver a chance
   // to capture a phantom. No-op when no plugin claims the
   // 'window-closing' namespace.
-  state.closingDriver?.beforeUnmap(state, s);
+  const phantomSurfaceId = state.closingDriver?.beforeUnmap(state, s) ?? null;
   // Cancel any opening-driver backstop -- if the window unmaps while
   // still gated (client crashed before the plugin called
   // releaseOpeningGate, or window destroyed mid-animation), the timer
@@ -695,7 +695,7 @@ export function detachSurfaceRole(state: CompositorState, s: SurfaceRecord): voi
     state.bus?.emit(WINDOW_EVENT.unmap, { surfaceId: s.id });
   }
   state.pendingWindowChanges?.delete(s.id);
-  state.wm?.unmapWindow(s.id);
+  state.wm?.unmapWindow(s.id, phantomSurfaceId !== null ? { phantomSurfaceId } : undefined);
   state.compositor.removeSurface(s.id);
   // The compositor-side Surface entry is gone; the next first-commit
   // recreates it as blank. Force the next applySurfaceState to

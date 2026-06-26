@@ -20,13 +20,14 @@ import type { CompositorSink } from "../protocols/ctx.js";
 import type { LayoutResult, LayoutReason } from "@overdraw/layout-types";
 import type { LayoutDriver, LayoutSnapshot, LayoutApplyTarget } from "./layout-driver.js";
 import type { DynamicBus } from "../events/dynamic-bus.js";
-import { WINDOW_EVENT } from "../events/types.js";
+import { WINDOW_EVENT, STACK_EVENT } from "../events/types.js";
 import {
   createSurfaceTransactionBroker,
   type SurfaceTransactionBroker,
 } from "../surface-transaction.js";
 import type {
   WindowRelayoutEvent,
+  StackRelayoutEvent,
   WindowState,
   Tiling,
   Exclusive,
@@ -96,6 +97,12 @@ export interface Window {
   // content signal). A window is in the layout (and configured) from addWindow,
   // but only drawn once it has content.
   hasContent?: boolean;
+  // The output the window is currently placed on, cached after each
+  // applyLayout pass. window.relayout / stack.relayout consumers see this
+  // as `oldOutputId` (the prior placement). Updated to the new output at
+  // the end of each pass. null = unplaced (e.g. workspace plugin hasn't
+  // claimed it for any output yet).
+  outputId?: number | null;
   // Per-window mutation queue. Async operations on win.windowState
   // (propose, markInitialCommitComplete) chain on this so a second call
   // doesn't read stale state mid-microtask from an in-flight first call.
@@ -285,7 +292,7 @@ export interface Wm {
   // deferred-initial-commit phase or already got its first configure.
   sendInitialConfigure(surfaceId: number): void;
   windowHasContent(surfaceId: number): Rect | undefined;
-  unmapWindow(surfaceId: number): void;
+  unmapWindow(surfaceId: number, opts?: { phantomSurfaceId?: number }): void;
   settled(): Promise<void>;
   // Topmost window containing the point. Walks the stack front-to-back.
   // The optional `accept` predicate is consulted on each candidate; when
@@ -994,6 +1001,18 @@ export function createWm(
   // Shared batchKey: every WM resize-tx hold goes in the same batch, so
   // they apply atomically (two windows trading places never overlap).
   const WM_TX_BATCH = "wm-tx";
+  // Windows removed since the last applyLayout pass. applyLayout iterates
+  // these as DESTROYED entries (newOuter null) so plugins see the full
+  // batch of transitions in stack.relayout: created, retiled, destroyed.
+  // Cleared at the end of each applyLayout pass.
+  type RemovedWindow = {
+    surfaceId: number;
+    lastOuter: Rect;
+    lastOutputId: number | null;
+    tiling: Tiling;
+    phantomSurfaceId: number | null;
+  };
+  const removedThisPass: RemovedWindow[] = [];
   // Resolve the output whose logical rect contains the given point. Used to
   // attribute a pending resize to its destination output so surfaceReadyAt
   // can verify the buffer dims match that output's scale (not just the
@@ -1137,11 +1156,32 @@ export function createWm(
   // size changed, and update bound decorations. For a "reorder" relayout the
   // geometry is routed through the resize transaction (held until the client
   // re-renders) instead of being applied immediately.
+  //
+  // After all per-window window.relayout emits settle, emits a single
+  // stack.relayout carrying the batch of transitions (created / retiled /
+  // destroyed) so plugins coordinating cross-window animations see the
+  // whole pass at once. removedThisPass (populated by unmapWindow) is
+  // drained here as DESTROYED entries.
   async function applyLayout(result: LayoutResult, reason: LayoutReason): Promise<void> {
     const useTx = reason === "reorder" && !!configure;
     const byId = new Map<number, { id: number; outer: Rect }>();
     for (const r of result.rects) byId.set(r.id, r);
     const snapshotWindows = [...windows];
+    // Batch entries built up across the pass for the final stack.relayout
+    // emit. Each entry reflects the POST-OVERRIDE state: per-window
+    // window.relayout interceptors may have modified newOuter; this list
+    // captures the final values the WM committed to.
+    type BatchEntry = {
+      surfaceId: number;
+      oldOuter: Rect | null;
+      oldOutputId: number | null;
+      newOuter: Rect | null;
+      newOutputId: number | null;
+      tiling: Tiling;
+      phantomSurfaceId?: number;
+    };
+    const batch: BatchEntry[] = [];
+
     for (const win of snapshotWindows) {
       const r = byId.get(win.surfaceId);
       if (!r) continue;
@@ -1149,18 +1189,42 @@ export function createWm(
       const prevOuter = win.outer;
       let newOuter: Rect = { ...r.outer };
 
+      // CREATED entries have placeholder oldOuter ({0,0,-1,-1} from
+      // addWindow). The per-window event reports oldOuter / oldOutputId
+      // as null to signal "this is the window's first layout assignment."
+      const isCreated = prevOuter.width <= 0 || prevOuter.height <= 0;
+      const oldOutputId = isCreated ? null : (win.outputId ?? null);
+      const newOutputId = outputOf(win.surfaceId);
+
       if (pluginBus) {
         const initial: WindowRelayoutEvent = {
           surfaceId: win.surfaceId,
-          oldOuter: { ...prevOuter },
+          oldOuter: isCreated ? null : { ...prevOuter },
+          oldOutputId,
           newOuter: { ...newOuter },
+          newOutputId,
+          tiling: win.windowState.tiling,
+          reason,
         };
         const finalPayload = await pluginBus.emit(WINDOW_EVENT.relayout, initial,
           { timeoutMs: INTERCEPTOR_TIMEOUT_MS });
         if (!windows.includes(win)) continue;
         const ev = finalPayload as WindowRelayoutEvent | undefined;
-        if (ev && isRect(ev.newOuter)) newOuter = { ...ev.newOuter };
+        // Honor newOuter override only for non-destroy entries (a
+        // destroyed window can't be redirected). Created and retile
+        // entries pass through normally; the override is the layout
+        // override seam.
+        if (ev && ev.newOuter !== null && isRect(ev.newOuter)) newOuter = { ...ev.newOuter };
       }
+
+      batch.push({
+        surfaceId: win.surfaceId,
+        oldOuter: isCreated ? null : { ...prevOuter },
+        oldOutputId,
+        newOuter: { ...newOuter },
+        newOutputId,
+        tiling: win.windowState.tiling,
+      });
 
       const newContent = win.insets ? shrink(newOuter, win.insets) : { ...newOuter };
       const sizeChanged = newContent.width !== prevContent.width || newContent.height !== prevContent.height;
@@ -1225,8 +1289,16 @@ export function createWm(
 
       // Immediate path (non-reorder reasons, or initial / not-yet-content
       // windows). Suppress configure during the deferred-initial-commit phase.
-      if (!moved && !sizeChanged) continue;
+      if (!moved && !sizeChanged) {
+        // Cache the output id even when geometry didn't change (a workspace
+        // move could change which output a window belongs to without
+        // resizing). The transaction path skips the cache update and
+        // applies it via pushGeometry instead.
+        win.outputId = newOutputId;
+        continue;
+      }
       win.outer = newOuter;
+      win.outputId = newOutputId;
       const content = contentOf(win);
       win.rect = content;
       if (win.hasContent) {
@@ -1249,6 +1321,50 @@ export function createWm(
           decorationResize(win.surfaceId, { ...win.outer }, { ...content }, { ...win.insets });
         }
       }
+    }
+
+    // Drain destroyed-this-pass windows. Each emits a per-window
+    // window.relayout event with newOuter === null (DESTROYED) and a
+    // phantomSurfaceId when the closing-driver minted one. The interceptor
+    // chain runs but newOuter overrides on destroy entries are ignored;
+    // the WM commits no rect change for these (the window is already
+    // unmapped). After per-window emits, the destroyed entries appear in
+    // the stack.relayout batch.
+    const removedSnapshot = removedThisPass.splice(0, removedThisPass.length);
+    for (const removed of removedSnapshot) {
+      if (pluginBus) {
+        const initial: WindowRelayoutEvent = {
+          surfaceId: removed.surfaceId,
+          oldOuter: { ...removed.lastOuter },
+          oldOutputId: removed.lastOutputId,
+          newOuter: null,
+          newOutputId: null,
+          tiling: removed.tiling,
+          reason,
+          ...(removed.phantomSurfaceId !== null
+            ? { phantomSurfaceId: removed.phantomSurfaceId } : {}),
+        };
+        await pluginBus.emit(WINDOW_EVENT.relayout, initial,
+          { timeoutMs: INTERCEPTOR_TIMEOUT_MS });
+        // newOuter override is ignored (destroyed; no rect to install).
+      }
+      batch.push({
+        surfaceId: removed.surfaceId,
+        oldOuter: { ...removed.lastOuter },
+        oldOutputId: removed.lastOutputId,
+        newOuter: null,
+        newOutputId: null,
+        tiling: removed.tiling,
+        ...(removed.phantomSurfaceId !== null
+          ? { phantomSurfaceId: removed.phantomSurfaceId } : {}),
+      });
+    }
+
+    // Emit the batch event once per pass. Observer-only; per-window
+    // interceptors already ran above.
+    if (pluginBus && batch.length > 0) {
+      const stackEvent: StackRelayoutEvent = { reason, windows: batch };
+      pluginBus.emit(STACK_EVENT.relayout, stackEvent);
     }
 
     if (useTx) {
@@ -1452,10 +1568,22 @@ export function createWm(
       return { ...win.rect };
     },
 
-    unmapWindow(surfaceId) {
+    unmapWindow(surfaceId, opts) {
       const i = windows.findIndex((w) => w.surfaceId === surfaceId);
       if (i < 0) return;
       const unmapped = windows[i];
+      // Capture the unmapped window's last placement for the next
+      // applyLayout pass so it shows up as a DESTROYED entry in
+      // window.relayout / stack.relayout. The phantomSurfaceId (when the
+      // closing-driver minted one) flows through here so plugins
+      // animating the disappearance can target it.
+      removedThisPass.push({
+        surfaceId,
+        lastOuter: { ...unmapped.outer },
+        lastOutputId: unmapped.outputId ?? null,
+        tiling: unmapped.windowState.tiling,
+        phantomSurfaceId: opts?.phantomSurfaceId ?? null,
+      });
       // If the unmapped window is modal and currently focused, return
       // focus to the parent (or null if the parent is gone). Read state
       // BEFORE splicing -- untetherFocusOnUnmodal needs the parent ref.

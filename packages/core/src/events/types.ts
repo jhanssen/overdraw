@@ -68,6 +68,17 @@ export const WINDOW_EVENT = {
   opening: "window.opening",
 } as const;
 
+// Stack-level events: one emit per layout pass, scoped to the full WM stack
+// rather than a single window. The per-window `window.relayout` events fire
+// FIRST (one per affected window in the pass, sequentially awaited); then
+// `stack.relayout` fires ONCE with the post-override batch view. Plugins
+// that animate group transitions (e.g. master-stack retile) consume the
+// batch; plugins that override a single window's rect consume the per-window
+// stream.
+export const STACK_EVENT = {
+  relayout: "stack.relayout",
+} as const;
+
 // `type` (not `interface`) so the payloads carry an implicit index signature and
 // stay assignable to Cloneable (interfaces do not). The guards below enforce it.
 export type WindowRect = {
@@ -249,15 +260,77 @@ export type WindowPreconfigureEvent = {
   initialState: WindowState;
 };
 
-// Emitted before the WM mutates a mapped toplevel's outer tile. `oldOuter` is
-// the rect the window has right now; `newOuter` is what the WM is about to
-// install. An interceptor may return the same shape with a different
-// `newOuter` to redirect the relayout, or return undefined (observe-only) and
-// optionally perform side effects (e.g. setTransform) before the WM proceeds.
+// Emitted before the WM mutates a window's outer tile.
+//
+// Covers three lifecycle transitions in addition to the original "rect
+// changed" case:
+//   - CREATED: a window just entered the WM (first-content commit before its
+//     layout pass settles). oldOuter === null && oldOutputId === null.
+//     newOuter / newOutputId are the freshly-assigned values.
+//   - RETILED: rect change while the window stays in the stack. Both old and
+//     new are non-null. Cross-output move is the same event with
+//     oldOutputId !== newOutputId.
+//   - DESTROYED: the window has been removed from the WM (unmap / client
+//     destroy). newOuter === null && newOutputId === null. oldOuter /
+//     oldOutputId are the window's last assigned values. `phantomSurfaceId`
+//     is set when the closing-driver minted a phantom for the disappearing
+//     window's last visible state (the surface id the plugin animates instead
+//     of the gone-already real surface).
+//
+// `tiling` is the window's tiling mode at the moment of the event. For
+// CREATED entries the value reflects the WM's resolved tiling after the
+// preconfigure interceptor chain (a window-rules plugin may have flipped a
+// floating dialog from "floating" to "managed" or vice versa). For DESTROYED
+// entries it's the window's last tiling before unmap.
+//
+// `reason` is the layout pass's reason. Useful for plugins that branch on
+// e.g. "output-resized" (resize without animation) vs. "mapped" (animate from
+// off-screen).
+//
+// An interceptor may return the same shape with a different `newOuter` to
+// redirect the relayout. Overrides on DESTROYED entries (newOuter null) are
+// ignored -- a destroyed window can't be redirected. Returning undefined is
+// observe-only.
 export type WindowRelayoutEvent = {
   surfaceId: number;
-  oldOuter: WindowRect;
-  newOuter: WindowRect;
+  oldOuter: WindowRect | null;
+  oldOutputId: number | null;
+  newOuter: WindowRect | null;
+  newOutputId: number | null;
+  tiling: Tiling;
+  reason: import("@overdraw/layout-types").LayoutReason;
+  // Present only when newOuter is null AND the closing-driver minted a
+  // phantom for the disappearing window's last visible state. The plugin
+  // animates this surface (not the original, which is gone) and calls
+  // sdk.windows.destroyPhantom when the animation completes.
+  phantomSurfaceId?: number;
+};
+
+// Fired ONCE per layout pass after all per-window WindowRelayoutEvent emits
+// settle. Carries every window that participated in the pass (created,
+// retiled, destroyed) as a single batch -- gives plugins a coordinated view
+// for cross-window animations (e.g. all tiled windows shrinking in lockstep
+// when a new window joins the master-stack). Observer-only; per-window
+// overrides happen via the individual WindowRelayoutEvent emits earlier in
+// the pass.
+//
+// Cross-output moves are first-class: an entry with oldOutputId !==
+// newOutputId is the same window transitioning between outputs. The plugin
+// can drive a single animation from oldOuter to newOuter regardless of which
+// outputs each belongs to (rects are in compositor coords).
+export type StackRelayoutEvent = {
+  reason: import("@overdraw/layout-types").LayoutReason;
+  // The post-override values: rect modifications from per-window
+  // WindowRelayoutEvent interceptors are reflected here.
+  windows: Array<{
+    surfaceId: number;
+    oldOuter: WindowRect | null;
+    oldOutputId: number | null;
+    newOuter: WindowRect | null;
+    newOutputId: number | null;
+    tiling: Tiling;
+    phantomSurfaceId?: number;
+  }>;
 };
 
 // Phase 9a: emitted after a mapped toplevel has unmapped (client
@@ -372,6 +445,7 @@ export type _MapIsCloneable = AssignableToCloneable<WindowMapEvent>;
 export type _UnmapIsCloneable = AssignableToCloneable<WindowUnmapEvent>;
 export type _ChangeIsCloneable = AssignableToCloneable<WindowChangeEvent>;
 export type _RelayoutIsCloneable = AssignableToCloneable<WindowRelayoutEvent>;
+export type _StackRelayoutIsCloneable = AssignableToCloneable<StackRelayoutEvent>;
 export type _ClosingIsCloneable = AssignableToCloneable<WindowClosingEvent>;
 export type _OpeningIsCloneable = AssignableToCloneable<WindowOpeningEvent>;
 export type _AssignedIsCloneable = AssignableToCloneable<DecorationAssignedEvent>;

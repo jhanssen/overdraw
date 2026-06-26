@@ -62,11 +62,21 @@ test("relayout intercept: interceptor sees both old and new outer in payload", {
     // least one must have a populated payload.
     const intercepts = logs.filter((l) => l.includes("INTERCEPT "));
     assert.ok(intercepts.length >= 1, `expected >= 1 intercept log, got: ${logs.join("\n")}`);
-    const first = intercepts[0].slice(intercepts[0].indexOf("{"));
-    const parsed = JSON.parse(first);
-    assert.equal(typeof parsed.surfaceId, "number");
-    assert.equal(typeof parsed.oldOuter.x, "number");
-    assert.equal(typeof parsed.newOuter.width, "number");
+    // The FIRST intercept for a newly-mapped window is the CREATED entry
+    // (oldOuter === null). We want a RETILE entry where both rects are
+    // populated; pick the first one that has a non-null oldOuter, OR
+    // fall back to asserting the CREATED shape.
+    const parsed = intercepts.map((l) => JSON.parse(l.slice(l.indexOf("{"))));
+    assert.equal(typeof parsed[0].surfaceId, "number");
+    const retiled = parsed.find((p) => p.oldOuter !== null);
+    if (retiled) {
+      assert.equal(typeof retiled.oldOuter.x, "number");
+      assert.equal(typeof retiled.newOuter.width, "number");
+    } else {
+      // CREATED-only: oldOuter is null; newOuter is populated.
+      assert.equal(parsed[0].oldOuter, null);
+      assert.equal(typeof parsed[0].newOuter.width, "number");
+    }
   } finally {
     await c.teardown();
   }

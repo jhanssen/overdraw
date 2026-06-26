@@ -48,10 +48,13 @@ export interface ClosingDriver {
   // normal unmap teardown -- the surface's render state must still
   // be sampleable.
   //
-  // Returns true if a phantom was captured (so a window.closing
-  // event was emitted + a backstop is armed); false if no plugin
-  // is registered (caller proceeds with instant unmap, no event).
-  beforeUnmap(state: CompositorState, s: SurfaceRecord): boolean;
+  // Returns the freshly-minted phantom surfaceId (so the caller can
+  // thread it into wm.unmapWindow for inclusion in the next
+  // applyLayout pass's window.relayout / stack.relayout events) when
+  // a phantom was captured. Returns null when no plugin is
+  // registered, or when phantom capture failed -- caller proceeds
+  // with instant unmap, no phantom available.
+  beforeUnmap(state: CompositorState, s: SurfaceRecord): number | null;
   // For tests: enumerate the surfaceIds of phantoms whose backstop
   // is still armed.
   activeBackstopIds(): number[];
@@ -70,12 +73,12 @@ export function createClosingDriver(deps: ClosingDriverDeps): ClosingDriver {
   const backstops = new Map<number, ReturnType<typeof setTimeout>>();
 
   return {
-    beforeUnmap(state, s): boolean {
-      if (!deps.hasPluginHandler()) return false;
-      if (s.role !== "xdg_toplevel" || !s.mapped) return false;
-      if (!state.wm || !state.compositor.createClosingPhantom) return false;
+    beforeUnmap(state, s): number | null {
+      if (!deps.hasPluginHandler()) return null;
+      if (s.role !== "xdg_toplevel" || !s.mapped) return null;
+      if (!state.wm || !state.compositor.createClosingPhantom) return null;
       const outer = state.wm.outerRectOf(s.id);
-      if (!outer || outer.width <= 0 || outer.height <= 0) return false;
+      if (!outer || outer.width <= 0 || outer.height <= 0) return null;
 
       // Gather the surface set: decoration (if any) at the bottom of
       // the local z, then the toplevel, then its subsurface subtree.
@@ -99,7 +102,7 @@ export function createClosingDriver(deps: ClosingDriverDeps): ClosingDriver {
         });
       } catch (e) {
         log.err("core", "closing-driver: createClosingPhantom threw: %o", e);
-        return false;
+        return null;
       }
 
       // Pull title + appId via the role-dispatched helper (xdg toplevel or
@@ -144,7 +147,7 @@ export function createClosingDriver(deps: ClosingDriverDeps): ClosingDriver {
       // backstop alone doesn't keep the process alive.
       timer.unref?.();
       backstops.set(phantomSurfaceId, timer);
-      return true;
+      return phantomSurfaceId;
     },
 
     activeBackstopIds(): number[] {

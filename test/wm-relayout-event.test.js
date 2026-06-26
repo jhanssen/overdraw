@@ -42,19 +42,28 @@ test('relayout: emits window.relayout per affected window with correct payload',
 
   wm.addWindow(1, rec(1));
   await wm.settled();
-  // Single window: layout pushed once. Old rect is the -1 sentinel, new is full output.
+  // Single window: layout pushed once. As a newly-created window, oldOuter
+  // and oldOutputId are null; newOuter is the full output rect.
   assert.equal(seen.length, 1);
   assert.equal(seen[0].surfaceId, 1);
-  assert.deepEqual(seen[0].oldOuter, { x: 0, y: 0, width: -1, height: -1 });
+  assert.equal(seen[0].oldOuter, null);
+  assert.equal(seen[0].oldOutputId, null);
   assert.deepEqual(seen[0].newOuter, { x: 0, y: 0, width: 1000, height: 600 });
 
   seen.length = 0;
   wm.addWindow(2, rec(2));
   await wm.settled();
-  // Two windows: both get relayout events (master + stack).
+  // Two windows: both get relayout events (master + stack). The newly-
+  // added window's event is CREATED (oldOuter null); the existing
+  // window's event is a RETILED case (both rects non-null).
   assert.equal(seen.length, 2);
   const ids = seen.map((e) => e.surfaceId).sort();
   assert.deepEqual(ids, [1, 2]);
+  const created = seen.find((e) => e.surfaceId === 2);
+  const retiled = seen.find((e) => e.surfaceId === 1);
+  assert.equal(created.oldOuter, null);
+  assert.ok(retiled.oldOuter !== null);
+  assert.ok(retiled.newOuter !== null);
 });
 
 test('relayout: observer sees the post-modification newOuter', async () => {
