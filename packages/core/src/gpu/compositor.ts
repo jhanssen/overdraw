@@ -404,7 +404,7 @@ import type { CompositorSink, Layer } from "../protocols/ctx.js";
 import { LAYER_ORDER, OUTPUT_DEFAULT } from "../protocols/ctx.js";
 import { OutputDamageMap } from "./output-damage-map.js";
 import type { TransitionKind } from "@overdraw/transition-types";
-import type { WaylandFd } from "../types.js";
+import type { Addon, WaylandFd } from "../types.js";
 import { log } from "../log.js";
 
 // Map a TransitionKind name to its WGSL u32 encoding (must match the
@@ -422,70 +422,27 @@ import {
   type LifecycleIntent,
 } from "./client-buffer-lifecycle.js";
 
-// Minimal slice of the native addon this module needs.
-export interface CompositorAddon {
-  shmView(poolId: number, offset: number, length: number): ArrayBuffer | null;
-  // Async dmabuf import (server-side reserve/inject). Returns a monotonic
-  // importId (0 = could not start); cb(handle|null) fires on completion. `fd` is
-  // a WaylandFd (the native side peeks it without consuming).
-  createTextureFromDmabuf(
-    fd: WaylandFd, w: number, h: number, fourcc: number, modHi: number, modLo: number,
-    offset: number, stride: number, cb: (handle: bigint | null) => void): number;
-  // Release a dmabuf import (drops the server STM + fd). Called once the buffer
-  // is freed (GPU-completion-gated) or the surface is removed.
-  releaseDmabufImport(importId: number): void;
-  // Shm fast-path: reserve a wire-allocated BGRA8 texture for an shm surface
-  // (the GPU process Injects the matching native VkImage on the AllocShmTex
-  // frame the reservation triggers). Returns the WGPUTexture pointer for
-  // dawn.wrapTexture, or null when the wire is down.
-  reserveShmTexture?(surfaceId: number, w: number, h: number): bigint | null;
-  // Shm fast-path: send a per-commit ShmUpload frame. The GPU process does
-  // queue.WriteTexture from its own mmap of the pool; bytes don't cross
-  // the Dawn wire. Returns a non-zero uploadSeq the caller defers
-  // wl_buffer.release on; 0 means the path isn't available.
-  commitShmUpload?(surfaceId: number, poolId: number, offset: number,
-                   w: number, h: number, stride: number,
-                   damage?: ReadonlyArray<{ x: number; y: number; width: number; height: number }>):
-      number;
-  // Drain GPU-process ShmUploaded reply seqs received since the last call.
-  takeShmUploadAcks?(): number[];
-  // In-band per-frame BeginAccess/EndAccess on a cached client dmabuf import
-  // (Layer C of docs/client-buffer-lifecycle.md): write a kind=1/kind=2 control
-  // frame on the core WIRE socket (not ctrl). The frame is FIFO-ordered against
-  // the Dawn sample commands around it -- a Begin written before the sample's
-  // wire batch is processed first (bracket open before HandleCommands reaches
-  // the sample); an End written after the submit's wire batch is processed
-  // after it. No ctrl round-trip (Node thread does not block), no wireSerial,
-  // no WireBarrier. The addon flushes staged Dawn bytes before each frame, so
-  // JS does NOT flush explicitly. writeBeginAccess returns false iff the import
-  // is unknown (JS-gate bug; the GPU process hard-fails on its side too).
-  writeBeginAccess(importId: number): boolean;
-  // Same as writeBeginAccess plus an attached sync_file fd (SCM_RIGHTS) for
-  // wp_linux_drm_syncobj_v1. The GPU process uses the fence as the Dawn
-  // acquire fence INSTEAD of running EXPORT_SYNC_FILE on the dmabuf.
-  // Consumes the WaylandFd. Same false-on-import-miss contract.
-  writeBeginAccessWithFence(importId: number, acquireFenceFd: WaylandFd): boolean;
-  writeEndAccess(importId: number): void;
-  // wp_linux_drm_syncobj_v1: signal a release timeline point. Called from
-  // queue.onSubmittedWorkDone for each pending release point queued via
-  // queueSurfaceReleasePoint on the JsCompositor.
-  syncobjTimelineSignal(handle: number, pointHi: number, pointLo: number): boolean;
-  // Phase 5b: in-band producer Begin/End on the core wire for compose buffers
-  // (AllocComposeBuf). The core IS the producer for compose buffers, so
-  // producer Begin/End ride the core wire (inverted from sdk.gpu overlays
-  // where they ride the plugin wire). Used by composeIntoView when its
-  // target is a wire-wrapped dmabuf with a producerSurfaceBufId.
-  writeProducerBegin(surfaceBufId: number): void;
-  writeProducerEnd(surfaceBufId: number): void;
-  // Acquire the render target handle for the given output (null if none this
-  // frame) and present it after rendering. outputId selects the output (KMS
-  // scanout ring; nested has the single output 0).
-  acquireOutputTexture(outputId: number): bigint | null;
-  presentOutput(outputId: number): void;
-  // Schedule a frame. Drives the wake/render state machine (see addon's
-  // wake()). Idempotent; cheap when called repeatedly with no work pending.
-  wake(): void;
-}
+// The slice of the native addon (`Addon`, ../types.ts) this module needs.
+// JsCompositor only touches these 15 of the addon's methods; narrowing keeps
+// interface segregation with a single source of truth for the signatures.
+export type CompositorAddon = Pick<
+  Addon,
+  | "shmView"
+  | "createTextureFromDmabuf"
+  | "releaseDmabufImport"
+  | "reserveShmTexture"
+  | "commitShmUpload"
+  | "takeShmUploadAcks"
+  | "writeBeginAccess"
+  | "writeBeginAccessWithFence"
+  | "writeEndAccess"
+  | "syncobjTimelineSignal"
+  | "writeProducerBegin"
+  | "writeProducerEnd"
+  | "acquireOutputTexture"
+  | "presentOutput"
+  | "wake"
+>;
 
 // The dawn.node wire binding bits the compositor needs for dmabuf surfaces.
 export interface DawnWire {
