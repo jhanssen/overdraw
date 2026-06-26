@@ -65,27 +65,4 @@ bool WireLink::pumpUntil(const std::function<bool()>& done) {
     return done();
 }
 
-bool WireLink::pumpUntilTimeout(const std::function<bool()>& done, int maxMs) {
-    int iters = (maxMs * 1000) / 200;
-    for (int i = 0; i < iters; ++i) {
-        if (done()) return true;
-        serializer_->pumpOut();
-        drainInbound();
-        ::usleep(200);
-    }
-    return done();
-}
-
-bool WireLink::sendAndWait(const ipc::Message& req, ipc::Tag replyTag, ipc::Message& reply) {
-    ipc::sendMessage(ctrlFd_, req);
-    for (int i = 0; i < 1000000; ++i) {
-        serializer_->pumpOut();
-        drainInbound();
-        ipc::Message m{};
-        if (ipc::recvMessageNB(ctrlFd_, m) && m.tag == replyTag) { reply = m; return true; }
-        ::usleep(200);
-    }
-    return false;
-}
-
 }  // namespace overdraw::core

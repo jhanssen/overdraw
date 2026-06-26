@@ -96,13 +96,6 @@ class WireLink {
     // is hit. One-shot bring-up only. Returns done().
     bool pumpUntil(const std::function<bool()>& done);
 
-    // Like pumpUntil but bounded to ~maxMs milliseconds. Returns done().
-    bool pumpUntilTimeout(const std::function<bool()>& done, int maxMs);
-
-    // Side-channel request -> wait for `replyTag`, pumping the wire meanwhile.
-    // One-shot bring-up only. Returns false on timeout.
-    bool sendAndWait(const ipc::Message& req, ipc::Tag replyTag, ipc::Message& reply);
-
   private:
     int wireFd_;
     int ctrlFd_;

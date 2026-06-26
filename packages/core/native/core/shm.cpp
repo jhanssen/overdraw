@@ -76,11 +76,6 @@ bool ShmRegistry::releaseBufferRef(uint32_t poolId) {
     return false;
 }
 
-size_t ShmRegistry::poolSize(uint32_t poolId) const {
-    auto it = pools_.find(poolId);
-    return it == pools_.end() ? 0 : it->second.size;
-}
-
 const uint8_t* ShmRegistry::view(uint32_t poolId, size_t offset, size_t len) const {
     auto it = pools_.find(poolId);
     if (it == pools_.end()) return nullptr;

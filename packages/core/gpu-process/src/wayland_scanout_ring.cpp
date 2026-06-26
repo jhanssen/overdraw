@@ -129,13 +129,6 @@ bool WaylandScanoutRing::init(gbm_device* gbm, const wgpu::Device& device,
     return true;
 }
 
-int WaylandScanoutRing::acquireFree() const {
-    for (size_t i = 0; i < kSlotCount; ++i) {
-        if (slots_[i].state == SlotState::FREE) return static_cast<int>(i);
-    }
-    return -1;
-}
-
 void WaylandScanoutRing::markPendingFlip(int idx) {
     if (idx < 0 || static_cast<size_t>(idx) >= kSlotCount) return;
     slots_[idx].state = SlotState::PENDING_FLIP;

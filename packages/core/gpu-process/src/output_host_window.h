@@ -67,12 +67,7 @@ class HostWindowOutputBackend : public OutputBackend {
     // the new dimensions (used on host-window resize).
     bool initScanout(gbm_device* gbm, const wgpu::Device& device, uint32_t fourcc);
 
-    // Returns the next FREE slot's wgpu::Texture (and writes its index to
-    // outSlotIdx), or null when no slot is free or the ring is not built.
-    // The texture is borrowed; the slot retains ownership.
-    wgpu::Texture acquireScanout(int& outSlotIdx);
-
-    // Present the slot returned by the matching acquireScanout: attach the
+    // Present a slot: attach the
     // slot's wl_buffer to the host wl_surface, damage_buffer (whole
     // surface for now), commit, and mark the slot PENDING_FLIP. The host's
     // subsequent wl_buffer.release on the slot drives the flip-complete

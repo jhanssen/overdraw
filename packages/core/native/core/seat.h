@@ -98,7 +98,6 @@ class Seat {
     // Name of the seat (e.g. "seat0"). Valid only while open. Empty otherwise.
     std::string name() const;
 
-    bool isOpen() const { return seat_ != nullptr; }
     bool isActive() const { return active_; }
     const std::string& error() const { return error_; }
 

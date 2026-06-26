@@ -57,15 +57,6 @@ bool HostWindowOutputBackend::initScanout(gbm_device* gbm,
     return true;
 }
 
-wgpu::Texture HostWindowOutputBackend::acquireScanout(int& outSlotIdx) {
-    outSlotIdx = -1;
-    if (!scanoutBuilt_) return {};
-    const int idx = ring_.acquireFree();
-    if (idx < 0) return {};
-    outSlotIdx = idx;
-    return ring_.slot(idx).tex;
-}
-
 void HostWindowOutputBackend::presentScanout(int slotIdx) {
     if (!scanoutBuilt_ || slotIdx < 0) return;
     auto* surface = window_.surface();

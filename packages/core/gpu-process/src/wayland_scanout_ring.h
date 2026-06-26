@@ -75,9 +75,6 @@ class WaylandScanoutRing {
               uint32_t width, uint32_t height, uint32_t fourcc,
               const std::vector<uint64_t>& hostModifiers);
 
-    // The next FREE slot, or -1 if none free. Pure query.
-    int acquireFree() const;
-
     // FREE -> PENDING_FLIP (we have attached the slot's wl_buffer and
     // committed the host surface; the slot is unavailable until the host
     // releases its wl_buffer).
@@ -98,7 +95,6 @@ class WaylandScanoutRing {
     uint32_t width()  const { return width_; }
     uint32_t height() const { return height_; }
     uint32_t fourcc() const { return fourcc_; }
-    uint64_t chosenModifier() const { return chosenModifier_; }
 
     // Map a host wl_buffer back to its slot index. Used by the
     // wl_buffer.release listener trampoline to drive onFlipComplete.

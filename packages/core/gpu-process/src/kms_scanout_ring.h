@@ -81,11 +81,6 @@ class KmsScanoutRing {
               uint32_t width, uint32_t height, uint32_t fourcc,
               const std::vector<PlaneFormatModifier>& planeModifiers);
 
-    // Returns the index of the next FREE slot, or -1 if none are free. Pure
-    // query; does not change state. The caller calls markPendingFlip(idx)
-    // after the atomic commit has been queued for this slot.
-    int acquireFree() const;
-
     // Atomic state transitions. `onFlipComplete` returns the (now-FREE) slot
     // index that just exited SCANOUT, or -1 if no prior SCANOUT existed
     // (first flip).
@@ -103,7 +98,6 @@ class KmsScanoutRing {
     uint32_t width()  const { return width_; }
     uint32_t height() const { return height_; }
     uint32_t fourcc() const { return fourcc_; }
-    uint64_t chosenModifier() const { return chosenModifier_; }
 
   private:
     int drmFd_ = -1;

@@ -77,22 +77,8 @@ AllocSlotResult allocateSlot(gbm_device* gbm, const wgpu::Device& device,
 // must drop before the dmabuf fd closes.
 void releaseSlot(DmabufScanoutSlot& s);
 
-// FREE/PENDING_FLIP/SCANOUT state machine for an N-slot ring. The ring
-// always uses kSlotCount = 3 today.
+// The ring always uses kSlotCount = 3 today.
 constexpr size_t kScanoutSlotCount = 3;
-
-// Pick the next FREE slot (or -1 if none free). Pure query.
-int acquireFreeSlot(const DmabufScanoutSlot* slots);
-
-// Atomic transitions. Returns the index of the slot that just exited
-// SCANOUT (and is now FREE), or -1 if no prior SCANOUT existed.
-void markPendingFlipSlot(DmabufScanoutSlot* slots, int idx);
-int  onFlipCompleteSlot(DmabufScanoutSlot* slots, int flippedIdx);
-
-// Forced reset of every slot to FREE. Used by KMS on VT-switch (DRM master
-// revoked; in-flight flip events will never arrive) and is also the right
-// thing to do after a host-window reconfigure that rebuilds the ring.
-void resetSlotsToFree(DmabufScanoutSlot* slots);
 
 }  // namespace overdraw::gpu
 

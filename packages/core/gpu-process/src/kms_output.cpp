@@ -333,8 +333,7 @@ bool KmsOutputBackend::switchMode(uint32_t outputId,
 
     // Allocate the fresh ring at the new dims. Failure here is fatal for
     // this output -- the connector stays in outputs_ but with no ring, so
-    // acquireScanoutAt() returns null and no frames are written for it
-    // until the caller redoes the bring-up.
+    // no frames are written for it until the caller redoes the bring-up.
     if (!initRingFor(*o, device)) {
         std::fprintf(stderr,
             "[kms] switchMode: ring re-init failed for outputId=%u at %ux%u\n",
@@ -425,30 +424,12 @@ void KmsOutputBackend::describeOutputAt(uint32_t outputId, OutputDescriptorInfo&
     describeFrom(*o, out);
 }
 
-uint32_t KmsOutputBackend::crtcIdAt(uint32_t outputId) const {
-    const PerOutput* o = find(outputId);
-    return o ? o->topo.crtcId : 0;
-}
-
 const KmsScanoutRing::Slot& KmsOutputBackend::scanoutSlotAt(uint32_t outputId, int slotIdx) const {
     // Callers must only ask about live outputIds; we do not synthesize an
     // empty slot for absent ids (the legacy API contract is unchanged from
     // the prior outputs_[outputIdx] indexing -- accessing an absent id was
     // a precondition violation then too).
     return find(outputId)->ring.slot(slotIdx);
-}
-
-wgpu::Texture KmsOutputBackend::acquireOutputImpl(PerOutput& o, int& outSlotIdx) {
-    const int idx = o.ring.acquireFree();
-    outSlotIdx = idx;
-    if (idx < 0) return wgpu::Texture();
-    return o.ring.slot(idx).tex;
-}
-
-wgpu::Texture KmsOutputBackend::acquireScanoutAt(uint32_t outputId, int& outSlotIdx) {
-    PerOutput* o = find(outputId);
-    if (!o) { outSlotIdx = -1; return wgpu::Texture(); }
-    return acquireOutputImpl(*o, outSlotIdx);
 }
 
 void KmsOutputBackend::pause() {

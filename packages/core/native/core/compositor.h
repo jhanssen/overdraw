@@ -270,16 +270,6 @@ class Compositor {
     //   signal is FrameComplete (from wl_surface.frame.done) which also
     //   clears the per-output presentedThisCycle gate.
 
-    // True if this compositor is in KMS mode. When false: headless or
-    // nested mode.
-    bool kmsMode() const { return kmsMode_; }
-
-    // Set the fence fd to attach to the next ScanoutPresent. Caller transfers
-    // ownership; the compositor will close it after sending. Pass -1 to send
-    // a present with no fence (test paths). Called by the JS render path
-    // right before presentOutput().
-    void setPendingScanoutFenceFd(int fd) { pendingScanoutFenceFd_ = fd; }
-
     // VT-switch lifecycle (drm-design.md "Seat / VT lifecycle"). The libseat
     // disable_seat / enable_seat callbacks land in the addon; the addon then
     // calls pauseOutput() (immediately, before ackDisable) and resumeOutput()
@@ -300,32 +290,8 @@ class Compositor {
     // it. Idempotent.
     void pauseOutput();
     void resumeOutput();
-    bool kmsPaused() const { return kmsPaused_; }
 
-    // KMS state machine -- exposed for testing / introspection only. Production
-    // paths use acquireOutputTextureHandle / presentOutput.
     enum class ScanoutSlotState : uint8_t { FREE, PENDING_FLIP, SCANOUT };
-    ScanoutSlotState scanoutSlotState(uint32_t outputId, int idx) const {
-        auto it = scanoutOutputs_.find(outputId);
-        if (it == scanoutOutputs_.end() || idx < 0 || idx >= 3)
-            return ScanoutSlotState::SCANOUT;
-        return it->second.slots[idx].state;
-    }
-    // True iff at least one slot is PENDING_FLIP (an atomic commit is queued
-    // with the kernel, awaiting page-flip). The frame trigger uses this to
-    // avoid rendering a second frame while one is already in flight (the
-    // kernel only accepts one queued flip per CRTC). KMS-only; nested mode
-    // always returns false (the nested backend has no equivalent gate
-    // exposed; it relies on inFrame + the host frame callback).
-    bool flipPending() const {
-        if (!kmsMode_) return false;
-        for (const auto& [id, o] : scanoutOutputs_) {
-            (void)id;
-            for (int i = 0; i < 3; ++i)
-                if (o.slots[i].state == ScanoutSlotState::PENDING_FLIP) return true;
-        }
-        return false;
-    }
 
     // Set inside drainCtrl when a frame-complete signal arrives from the GPU
     // process (KMS: ScanoutFlipComplete; nested: FrameComplete from the host

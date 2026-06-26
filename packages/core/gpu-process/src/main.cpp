@@ -1996,8 +1996,8 @@ int run(int wireFd, int ctrlFd, int inputFd, bool headless,
             if (!kms->switchMode(p.outputId, p.width, p.height, p.refreshMhz,
                                   coreDevice)) {
                 // switchMode logs the cause. The output stays in outputs_ but
-                // its ring is torn down; acquireScanoutAt() returns null,
-                // so JS-side renders for it are silently dropped. Do NOT
+                // its ring is torn down, so JS-side renders for it are
+                // silently dropped. Do NOT
                 // emit ScanoutRebuild -- there is no new ring for the core
                 // to reserve into.
                 std::fprintf(stderr,

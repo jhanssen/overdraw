@@ -126,9 +126,6 @@ class HostWindow {
     uint32_t hostOutputTransform()     const { return hostTransform_; }
     uint32_t hostOutputPhysicalWidthMm()  const { return hostPhysWMm_; }
     uint32_t hostOutputPhysicalHeightMm() const { return hostPhysHMm_; }
-    const std::string& hostOutputMake()  const { return hostMake_; }
-    const std::string& hostOutputModel() const { return hostModel_; }
-    const std::string& hostOutputName()  const { return hostName_; }
 
     // Host-side linux-dmabuf-v1 (we are a CLIENT of the host compositor). The
     // host advertises a list of (fourcc, modifier) pairs the host can import;
@@ -137,7 +134,6 @@ class HostWindow {
     // registry; format/modifier advertisements arrive after a roundtrip.
     void bindHostDmabuf(zwp_linux_dmabuf_v1* d);
     void onHostDmabufModifier(uint32_t fourcc, uint32_t modHi, uint32_t modLo);
-    bool hasHostDmabuf() const { return hostDmabuf_ != nullptr; }
 
     // One (fourcc, modifier) host-advertised pair. The version-3 protocol
     // sends only modifier events; older versions' format-only events would
@@ -163,8 +159,6 @@ class HostWindow {
     // Input forwarding (called from pointer/keyboard listener trampolines).
     // No-op when inputFd_ < 0. `surface` identifies the event target; events on
     // surfaces other than the output surface are ignored.
-    int inputFd() const { return inputFd_; }
-    wl_surface* surface_raw() const { return surface_; }
     void sendPointerEnter(uint32_t serial, wl_surface* s, int32_t sx, int32_t sy);
     void sendPointerLeave(uint32_t serial, wl_surface* s);
     void sendPointerMotion(uint32_t time, int32_t sx, int32_t sy);

@@ -37,9 +37,6 @@ bool resolveShape(const std::string& name,
                   uint32_t scale,
                   ResolvedShape& out);
 
-// Drops any in-process caches (file-handle state). Call on theme change.
-void reload();
-
 }  // namespace overdraw::cursor
 
 #endif  // OVERDRAW_CURSOR_XCURSOR_H_

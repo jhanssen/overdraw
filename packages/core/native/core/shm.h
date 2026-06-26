@@ -45,9 +45,6 @@ class ShmRegistry {
     // unknown or [offset, offset+len) is out of range.
     const uint8_t* view(uint32_t poolId, size_t offset, size_t len) const;
 
-    // Mapped size of a pool, or 0 if unknown. (Debug/diagnostics.)
-    size_t poolSize(uint32_t poolId) const;
-
     // Allocate an independent writable mmap (PROT_READ|PROT_WRITE, MAP_SHARED)
     // covering [offset, offset+len) of the pool's fd. The returned pointer is
     // the START of [offset, ...) (the caller does not see the page-alignment

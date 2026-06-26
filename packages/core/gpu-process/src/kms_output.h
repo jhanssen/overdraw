@@ -15,8 +15,6 @@
 //
 // Bring-up sequence (open()): see drm-design.md "DRM/KMS bring-up" §1-13.
 // Steady state (per output):
-//   - acquireScanoutAt() returns the next FREE slot's wgpu::Texture (or null
-//     if all slots are in flight; the JS compositor's frame is skipped).
 //   - presentScanoutAt() issues drmModeAtomicCommit with PAGE_FLIP_EVENT and
 //     (when available) IN_FENCE_FD on the plane.
 //   - pump() drains DRM events; on flip-complete the owning ring's state
@@ -86,16 +84,13 @@ class KmsOutputBackend : public OutputBackend {
     // lowest-free; see multi-output-design.md §3). The dense id is a TRANSIENT
     // runtime routing key, not stable across unplug/replug; durable identity
     // lives on the connector name + EDID.
-    size_t outputCount() const { return outputs_.size(); }
     bool   hasOutput(uint32_t outputId) const { return outputs_.count(outputId) != 0; }
     // Returns every live outputId in ascending order. Snapshot copy; safe to
     // use across mutating calls.
     std::vector<uint32_t> outputIds() const;
     void describeOutputAt(uint32_t outputId, OutputDescriptorInfo& out) const;
-    wgpu::Texture acquireScanoutAt(uint32_t outputId, int& outSlotIdx);
     bool presentScanoutAt(uint32_t outputId, int slotIdx, int inFenceFd);
     const KmsScanoutRing::Slot& scanoutSlotAt(uint32_t outputId, int slotIdx) const;
-    uint32_t crtcIdAt(uint32_t outputId) const;
 
     int eventFd() const override { return drmFd_; }
     // The scanout card fd. Used to match the Dawn adapter to this GPU.
@@ -126,7 +121,6 @@ class KmsOutputBackend : public OutputBackend {
     // idempotent.
     void pause();
     void resume();
-    bool isPaused() const { return paused_; }
 
     // The card's dev_t (for the dmabuf-feedback main_device + sanity-check
     // that Dawn picked an adapter on the same physical GPU). 0 if open()
@@ -210,8 +204,7 @@ class KmsOutputBackend : public OutputBackend {
     // Fill width/height/refresh/scale/transform/identity from one output.
     void describeFrom(const PerOutput& o, OutputDescriptorInfo& out) const;
 
-    // Acquire/present implementations operating on a given output.
-    wgpu::Texture acquireOutputImpl(PerOutput& o, int& outSlotIdx);
+    // Present implementation operating on a given output.
     bool presentOutputImpl(PerOutput& o, int slotIdx, int inFenceFd);
 
     // Allocate the 3-slot scanout ring for one PerOutput against `device`.

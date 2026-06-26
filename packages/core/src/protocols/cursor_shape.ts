@@ -18,7 +18,6 @@
 import type { Ctx } from "./ctx.js";
 import type { WpCursorShapeManagerV1Handler } from "#protocols-gen/wp_cursor_shape_manager_v1.js";
 import type { WpCursorShapeDeviceV1Handler } from "#protocols-gen/wp_cursor_shape_device_v1.js";
-import { signature as devSig } from "#protocols-gen/wp_cursor_shape_device_v1.js";
 import { WpCursorShapeDeviceV1_Error } from "#protocols-gen/wp_cursor_shape_device_v1.js";
 import type { Resource } from "../types.js";
 
@@ -151,7 +150,3 @@ export function makeCursorShapeDevice(ctx: Ctx): WpCursorShapeDeviceV1Handler {
     },
   };
 }
-
-// Convenience: identifies this protocol's child interface name in code
-// that wires registerInterface (mirrors makePointer / makeKeyboard).
-export const DEVICE_INTERFACE_NAME = devSig.name;

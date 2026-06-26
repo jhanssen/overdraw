@@ -90,37 +90,4 @@ void releaseSlot(DmabufScanoutSlot& s) {
     s.state = ScanoutSlotState::FREE;
 }
 
-int acquireFreeSlot(const DmabufScanoutSlot* slots) {
-    for (size_t i = 0; i < kScanoutSlotCount; ++i) {
-        if (slots[i].state == ScanoutSlotState::FREE) return static_cast<int>(i);
-    }
-    return -1;
-}
-
-void markPendingFlipSlot(DmabufScanoutSlot* slots, int idx) {
-    if (idx < 0 || static_cast<size_t>(idx) >= kScanoutSlotCount) return;
-    slots[idx].state = ScanoutSlotState::PENDING_FLIP;
-}
-
-int onFlipCompleteSlot(DmabufScanoutSlot* slots, int flippedIdx) {
-    if (flippedIdx < 0 || static_cast<size_t>(flippedIdx) >= kScanoutSlotCount) return -1;
-    int retiredIdx = -1;
-    for (size_t i = 0; i < kScanoutSlotCount; ++i) {
-        if (static_cast<int>(i) == flippedIdx) continue;
-        if (slots[i].state == ScanoutSlotState::SCANOUT) {
-            slots[i].state = ScanoutSlotState::FREE;
-            retiredIdx = static_cast<int>(i);
-            break;
-        }
-    }
-    slots[flippedIdx].state = ScanoutSlotState::SCANOUT;
-    return retiredIdx;
-}
-
-void resetSlotsToFree(DmabufScanoutSlot* slots) {
-    for (size_t i = 0; i < kScanoutSlotCount; ++i) {
-        slots[i].state = ScanoutSlotState::FREE;
-    }
-}
-
 }  // namespace overdraw::gpu

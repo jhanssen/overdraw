@@ -45,15 +45,6 @@ std::vector<std::string> splitColon(const char* s) {
     return out;
 }
 
-std::string expandHome(const std::string& p) {
-    if (p.size() >= 2 && p[0] == '~' && p[1] == '/') {
-        if (const char* home = std::getenv("HOME"); home && *home) {
-            return std::string(home) + p.substr(1);
-        }
-    }
-    return p;
-}
-
 bool fileExists(const std::string& path) {
     struct stat st;
     return ::stat(path.c_str(), &st) == 0 && S_ISREG(st.st_mode);
@@ -336,13 +327,6 @@ bool resolveShape(const std::string& name,
         return true;
     }
     return false;
-}
-
-void reload() {
-    // No in-process state to flush yet (filesystem walks are stateless;
-    // the JS-side LRU is what holds parsed results). Hook is here so
-    // a future config-driven theme reload has a place to clear native
-    // caches without touching the JS layer.
 }
 
 }  // namespace overdraw::cursor
