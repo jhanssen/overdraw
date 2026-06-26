@@ -411,6 +411,10 @@ export async function installProtocols(
         if (!rec) return false;
         return driver.beforeMap(state, rec);
       },
+      // Side-effect-free: is a 'window-opening' plugin registered? The WM holds
+      // the open until the client acks the tile-size configure ONLY when an
+      // animation will actually run (otherwise the window maps immediately).
+      hasOpeningAnimation: () => state.openingDriver?.hasHandler() ?? false,
     },
   );
   // Expose wm.schedule via state.relayout for callers outside the WM that

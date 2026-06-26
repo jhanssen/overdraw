@@ -124,6 +124,7 @@ test('open: held until the client acks the tile-size configure (the mapping comm
     configure: serialConfigure(configures),
     layoutDriverFactory: immediateLayoutDriver,
     beforeMap: (id) => { mapped.push(id); return true; },
+    hasOpeningAnimation: () => true,
   });
   wm.addWindow(1, res(1), { deferInitialCommit: true });
   await wm.settled();
@@ -148,6 +149,7 @@ test('open: maps immediately when first content already acked the tile-size conf
     configure: serialConfigure(configures),
     layoutDriverFactory: immediateLayoutDriver,
     beforeMap: (id) => { mapped.push(id); return true; },
+    hasOpeningAnimation: () => true,
   });
   wm.addWindow(1, res(1), { deferInitialCommit: true });
   await wm.settled();
@@ -157,6 +159,28 @@ test('open: maps immediately when first content already acked the tile-size conf
   wm.notifyToplevelCommit(1, configures.at(-1).serial);
   wm.windowHasContent(1);
   assert.deepEqual(mapped, [1], 'no hold when first content already acked the tile size');
+});
+
+test('open: maps immediately when NO open animation is active, even with an unacked configure', async () => {
+  // Regression: the map-ack hold must engage only when a window-opening plugin
+  // is registered (an animation will run). With beforeMap wired but no
+  // animation (hasOpeningAnimation false), a window must NOT be held waiting
+  // for an ack -- otherwise every window (and every GPU-test client that
+  // doesn't ack the exact serial) stays invisible.
+  const configures = [];
+  const mapped = [];
+  const wm = createWm(mockSink(), [{ id: 0, rect: { x: 0, y: 0, width: 1000, height: 600 }, scale: 1 }], {
+    configure: serialConfigure(configures),
+    layoutDriverFactory: immediateLayoutDriver,
+    beforeMap: (id) => { mapped.push(id); return false; },
+    hasOpeningAnimation: () => false,
+  });
+  wm.addWindow(1, res(1), { deferInitialCommit: true });
+  await wm.settled();
+  await wm.markInitialCommitComplete(1, { appId: null, title: null });
+  // No ack has arrived, but with no animation the window maps right away.
+  wm.windowHasContent(1);
+  assert.deepEqual(mapped, [1], 'no animation -> immediate map, no ack hold');
 });
 
 test('premap: emitted with the spawn output after preconfigure, and awaited before the sized configure goes out', async () => {

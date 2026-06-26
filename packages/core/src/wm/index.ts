@@ -718,6 +718,11 @@ export interface WmOptions {
   // instant-map default. Tests / harnesses that don't wire a runtime
   // omit it; map is then always instant.
   beforeMap?: (surfaceId: number) => boolean;
+  // Side-effect-free predicate: is an open ANIMATION active (a 'window-opening'
+  // plugin registered)? The map-ack hold (wait for the client to ack the
+  // tile-size configure before mapping) only engages when this is true, so a
+  // window with no open animation maps immediately. Omitted -> never hold.
+  hasOpeningAnimation?: () => boolean;
 }
 
 // Convenience: build the WM's per-output map from a list of descriptors,
@@ -797,6 +802,7 @@ export function createWm(
   const currentFocusedSurfaceId = opts?.currentFocusedSurfaceId;
   const requestFocus = opts?.requestFocus;
   const beforeMap = opts?.beforeMap;
+  const hasOpeningAnimation = opts?.hasOpeningAnimation;
   // Shared broker if one was provided; otherwise a private one wired to
   // this compositor sink. The broker absorbs freeze/thaw/timer/frozen-
   // ready plumbing; the WM keeps the resize-specific data (configure
@@ -1224,10 +1230,12 @@ export function createWm(
     }
     const wantSerial = lastConfigureSerial.get(win.surfaceId);
     const acked = win.lastAckedSerial ?? -1;
-    // Gate only when there's an unacked size configure AND a beforeMap (the
-    // opening driver). xwayland (no serial) and the no-driver test path map
-    // immediately.
-    if (beforeMap && wantSerial !== undefined && acked < wantSerial) {
+    // Hold ONLY when an open animation will actually run (a window-opening
+    // plugin is registered) AND there's an unacked size configure. Without an
+    // animation there's nothing to protect, so the window maps immediately --
+    // gating on beforeMap (the always-wired hook) instead would wrongly hold
+    // every window. xwayland (no serial) also maps immediately.
+    if (beforeMap && hasOpeningAnimation?.() && wantSerial !== undefined && acked < wantSerial) {
       if (!win.contentGateOwners) win.contentGateOwners = new Set();
       win.contentGateOwners.add("opening-ack");
       win.awaitingMapAck = true;

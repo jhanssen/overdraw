@@ -50,6 +50,12 @@ export interface OpeningDriver {
   // was emitted + a backstop is armed); false if no plugin is
   // registered (caller proceeds with instant map, no event).
   beforeMap(state: CompositorState, s: SurfaceRecord): boolean;
+  // Whether a 'window-opening' plugin is currently registered (i.e. beforeMap
+  // would engage the gate and an open animation will run). Side-effect-free,
+  // unlike beforeMap; the WM uses it to decide whether to hold the open until
+  // the client acks the tile-size configure (only worth doing when an
+  // animation will actually play on the buffer).
+  hasHandler(): boolean;
   // For tests: enumerate the surfaceIds whose backstop is still armed.
   activeBackstopIds(): number[];
   // Cancel a window's backstop. Called by the windows broker's
@@ -129,6 +135,10 @@ export function createOpeningDriver(deps: OpeningDriverDeps): OpeningDriver {
       timer.unref?.();
       backstops.set(s.id, timer);
       return true;
+    },
+
+    hasHandler(): boolean {
+      return deps.hasPluginHandler();
     },
 
     activeBackstopIds(): number[] {
