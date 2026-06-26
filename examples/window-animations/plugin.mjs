@@ -175,8 +175,17 @@ export default async function init(sdk) {
     const id = ev.surfaceId;
     try {
       if (ev.tiling === "managed") {
-        // Slide in from one tile-width to the right of the destination.
-        const slideX = ev.outerRect.width;
+        // Slide in from the output edge NEAREST this tile (one tile-width), not
+        // a fixed direction: a window opening into the left half enters from
+        // the left, the right half from the right. This keeps the newcomer
+        // from sliding across a sibling that is retiling to make room -- its
+        // leading edge tracks the sibling's vacating edge instead of crossing
+        // it (both move the same distance over the same duration).
+        const tileCenter = ev.outerRect.x + ev.outerRect.width / 2;
+        const outCenter = ev.outputRect.x + ev.outputRect.width / 2;
+        const slideX = tileCenter < outCenter
+          ? -ev.outerRect.width   // left tile: enter from the left edge
+          : ev.outerRect.width;   // right tile: enter from the right edge
         await sdk.windows.setTransform(id,
           { translateX: slideX, translateY: 0, scaleX: 1, scaleY: 1 });
         await sdk.windows.releaseOpeningGate(id);
