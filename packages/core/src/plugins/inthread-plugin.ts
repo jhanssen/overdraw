@@ -16,6 +16,7 @@ import type { ResolvedPlugin } from "../config/types.js";
 import { runLoader } from "./loader.js";
 import type { InThreadGpuDeps } from "./inthread-gpu.js";
 import type { PluginController, PluginHandle, PluginState } from "./plugin-host.js";
+import { makePluginRequestHandler, dispatchHostRegistryEvent } from "./plugin-host.js";
 import { BusBridge } from "./bus-bridge.js";
 import { log } from "../log.js";
 
@@ -115,25 +116,8 @@ export class InThreadPlugin implements PluginHandle {
     this.endpoint = endpoint;
     endpoint.handleEvents((name, data) => { this.onPluginEvent(name, data); });
 
-    const onReq = this.opts.onRequest;
-    endpoint.handleRequests(async (method, params): Promise<Json> => {
-      if (method === "plugin.invoke") {
-        return await this.ns.onInvoke(this.cfg.name, params);
-      }
-      if (method === "plugin.wait-for-active") {
-        return await this.ns.onWaitForActive(this.cfg.name, params);
-      }
-      if (method === "actions.invoke") {
-        return await this.ns.onActionInvoke(this.cfg.name, params);
-      }
-      if (method === "actions.list") {
-        return await this.ns.onActionList(this.cfg.name, params);
-      }
-      if (onReq) {
-        return (await onReq(this.cfg.name, method, params)) as Json;
-      }
-      throw new Error(`no handler for request '${method}'`);
-    });
+    endpoint.handleRequests(
+      makePluginRequestHandler(this.ns, this.cfg.name, this.opts.onRequest));
   }
 
   private onPluginEvent(name: string, data: unknown): void {
@@ -156,11 +140,7 @@ export class InThreadPlugin implements PluginHandle {
       return;
     }
 
-    if (this.bridge.handle(name, data)) return;
-    if (name === "plugin.register") { this.ns.onRegister(this.cfg.name, data); return; }
-    if (name === "plugin.unregister") { this.ns.onUnregister(this.cfg.name, data); return; }
-    if (name === "actions.register") { this.ns.onActionRegister(this.cfg.name, data); return; }
-    if (name === "actions.unregister") { this.ns.onActionUnregister(this.cfg.name, data); return; }
+    if (dispatchHostRegistryEvent(this.ns, this.cfg.name, this.bridge, name, data)) return;
 
     this.opts.onEvent?.(this.cfg.name, name, data);
   }

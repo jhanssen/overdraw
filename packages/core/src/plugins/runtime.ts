@@ -25,6 +25,7 @@ import { ActionRegistry } from "./action-registry.js";
 import { InThreadPlugin } from "./inthread-plugin.js";
 import type { InThreadGpuDeps } from "./inthread-gpu.js";
 import type { PluginController, PluginHandle, PluginState } from "./plugin-host.js";
+import { makePluginRequestHandler, dispatchHostRegistryEvent } from "./plugin-host.js";
 import { BusBridge } from "./bus-bridge.js";
 import { log } from "../log.js";
 
@@ -182,27 +183,8 @@ class ManagedPlugin implements PluginHandle {
     this.endpoint = endpoint;
     endpoint.handlePongs(() => { this.missed = 0; });
     endpoint.handleEvents((name, data) => { this.onPluginEvent(name, data); });
-    // Plugin->core requests: try namespace + action plumbing first, then
-    // fall back to onRequest (gpu/decoration brokers).
-    const onReq = this.opts.onRequest;
-    endpoint.handleRequests(async (method, params): Promise<Json> => {
-      if (method === "plugin.invoke") {
-        return await this.ns.onInvoke(this.cfg.name, params);
-      }
-      if (method === "plugin.wait-for-active") {
-        return await this.ns.onWaitForActive(this.cfg.name, params);
-      }
-      if (method === "actions.invoke") {
-        return await this.ns.onActionInvoke(this.cfg.name, params);
-      }
-      if (method === "actions.list") {
-        return await this.ns.onActionList(this.cfg.name, params);
-      }
-      if (onReq) {
-        return (await onReq(this.cfg.name, method, params)) as Json;
-      }
-      throw new Error(`no handler for request '${method}'`);
-    });
+    endpoint.handleRequests(
+      makePluginRequestHandler(this.ns, this.cfg.name, this.opts.onRequest));
 
     // The bootstrap posts {kind:'event', name:'init'} with {ok:true} or
     // {ok:false, error}. That is the init-resolve/reject signal.
@@ -230,19 +212,7 @@ class ManagedPlugin implements PluginHandle {
       return;
     }
 
-    // SDK event-bus interactions are reserved one-way events; intercept before
-    // surfacing to onEvent. core-plugin-api.md §3.
-    if (this.bridge.handle(name, data)) return;
-
-    // Namespace registry interactions (sdk.registerPlugin / unregister).
-    // core-plugin-api.md §11.
-    if (name === "plugin.register") { this.ns.onRegister(this.cfg.name, data); return; }
-    if (name === "plugin.unregister") { this.ns.onUnregister(this.cfg.name, data); return; }
-
-    // Action registry interactions (sdk.actions.register / unregister).
-    // core-plugin-api.md §10.
-    if (name === "actions.register") { this.ns.onActionRegister(this.cfg.name, data); return; }
-    if (name === "actions.unregister") { this.ns.onActionUnregister(this.cfg.name, data); return; }
+    if (dispatchHostRegistryEvent(this.ns, this.cfg.name, this.bridge, name, data)) return;
 
     // Surface other plugin->core events (scope B: `log`) to the observer.
     this.opts.onEvent?.(this.cfg.name, name, data);
