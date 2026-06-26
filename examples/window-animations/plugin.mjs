@@ -1,166 +1,206 @@
 // Window animation plugin example.
 //
-// Two animations, run in lockstep so the seam between shrinking
-// existing windows and the sliding-in new window stays continuous:
+// One subscription handles all window-set transitions through the
+// extended window.relayout event:
 //
-// 1. Map: the newly-appearing window slides in from outside the
-//    output's right edge. Specifically translateX_start is chosen so
-//    AT t=0 the window's LEFT edge sits at the output's right edge;
-//    as the animation runs, the window's left edge tracks the
-//    existing tiles' shrinking right edge. Implemented via the
-//    opening-driver content gate: the plugin claims 'window-opening',
-//    receives the window.opening bus event synchronously inside
-//    windowHasContent (BEFORE pushStack would include the surface),
-//    sets the initial transform, releases the gate, and starts the
-//    animation. The first composited frame is already at
-//    translateX=slideX -- no on-tile flash.
+//   CREATED (oldOuter === null, newOuter populated): a window joined
+//     the layout this pass. For tiled windows we slide in from the
+//     output's right edge; for floating windows we fade in.
+//   RETILED (both rects populated): a window's rect changed. The
+//     compensating "presnap" transform makes the surface visually
+//     stay at oldOuter even though the WM has installed newOuter;
+//     the animation moves it from presnap to identity.
+//   DESTROYED (newOuter === null): a window unmapped. The closing-
+//     driver minted a phantom for its last visible state; we animate
+//     the phantom out (slide off for tiled, fade for floating) and
+//     destroy it on completion.
 //
-// 2. Retile: when an existing window's outer rect changes, it
-//    animates from oldOuter to newOuter. Implemented via the existing
-//    window.relayout interceptor: the WM awaits the interceptor
-//    before pushing the new rect, so the plugin's synchronous
-//    setTransform with a compensating (oldOuter - newOuter)
-//    transform lands first; the very first composite at the new
-//    placement shows the window visually still at oldOuter, and the
-//    animation moves it to newOuter.
+// Cross-output moves (oldOutputId !== newOutputId) are first-class:
+// the retile presnap math operates in compositor coords, so a window
+// sliding from output A to output B produces a single coordinated
+// animation from oldOuter to newOuter regardless of which outputs
+// each belongs to.
 //
-// Both use the same DURATION_MS and EASING so the seam is
-// continuous. Both surfaces of a decorated window (content +
-// decoration) move together because the broker's setTransform is
-// group-aware (windows-broker resolves the window group and applies
-// the same transform to every member surface).
+// All animations share DURATION_MS + EASING so the seam between
+// shrinking peers and the sliding-in newcomer stays continuous.
 //
-// No opacity fade -- a window's content + decoration surfaces
-// composite independently, so an alpha tween on each produces
-// incorrect mid-animation math. The slide is sufficient visually and
-// composes correctly.
+// We also claim 'window-opening' + 'window-closing' so the
+// corresponding drivers engage their gates: the window-opening
+// gate holds a new window out of the draw stack until our relayout
+// interceptor has set the presnap transform; the window-closing
+// driver mints the phantom that our DESTROYED branch animates.
+// Without the namespace claims, the drivers no-op and we'd see
+// pop-in / pop-out.
 
 import { tween, target, easings } from "@overdraw/sdk-anim";
 
-// Both animations MUST share duration + easing. The retile animation
-// shrinks an existing window's visible rect from oldOuter -> newOuter
-// while the new window slides in from outside the output. The two
-// animations meet at the seam between tiles; if they run at different
-// speeds, the user briefly sees a gap (or worse, an overlap of one
-// window's content over another's). Same duration + same easing keeps
-// the seam continuous throughout the animation.
 const DURATION_MS = 200;
 const EASING = easings.easeOut;
 
 export default async function init(sdk) {
-  // Claim the 'window-opening' namespace. The runtime exposes this to
-  // the opening-driver's hasPluginHandler() predicate; when true, the
-  // driver engages the content gate at first-content commit and emits
-  // window.opening on the plugin bus.
+  // Claiming these namespaces makes the opening / closing drivers
+  // active. opening-driver engages a content gate at first-content
+  // so the window doesn't draw until we've set the presnap
+  // transform (via window.relayout CREATED, which fires before the
+  // opening-driver's window.opening). closing-driver mints a
+  // phantom for the unmapping window's last visible state -- the
+  // surface we animate from DESTROYED.
   await sdk.registerPlugin("window-opening", () => ({}));
-  sdk.log("window-animations: opening + retile registered");
+  await sdk.registerPlugin("window-closing", () => ({}));
+  sdk.log("window-animations: registered");
 
-  // --- Map animation ----------------------------------------------------
-
-  sdk.events.subscribe("window.opening", async (_name, ev) => {
-    const id = ev.surfaceId;
-    // Slide the new window in so that AT t=0 its LEFT edge sits
-    // exactly at the output's right edge. As the existing windows
-    // shrink (retile path) and free up the new window's tile, the
-    // new window's left edge tracks the existing windows' right
-    // edge -- there's no gap (the seam between tiles stays
-    // continuous) and no overlap (the new window never reaches into
-    // a tile that's still owned by another window).
-    //
-    // translateX_start = outputRect.right - outerRect.x
-    //                  = (outputRect.x + outputRect.width) - outerRect.x
-    const slideX = (ev.outputRect.x + ev.outputRect.width) - ev.outerRect.x;
-    try {
-      // Set initial transform synchronously. The surface is gated, so
-      // this lands BEFORE the first composite would include the
-      // window. No opacity fade -- decoration + content are two
-      // independently-composited surfaces; an alpha tween on each
-      // produces incorrect mid-animation alpha math (see the design
-      // discussion). The slide alone gives a clean appearance and
-      // composes correctly with the decoration surface tracking the
-      // content via the broker's group-aware setTransform.
-      await sdk.windows.setTransform(id,
-        { translateX: slideX, translateY: 0, scaleX: 1, scaleY: 1 });
-
-      // Release the gate. The next composite includes the surface at
-      // the initial transform -- mid-slide from frame 0.
-      await sdk.windows.releaseOpeningGate(id);
-
-      // Animate to identity. Fire-and-forget; the animation runs on
-      // the compositor's frame tick.
-      void sdk.animations.run(tween(target.windowTransform(id), {
-        from: { translateX: slideX, translateY: 0, scaleX: 1, scaleY: 1 },
-        to:   { translateX: 0,      translateY: 0, scaleX: 1, scaleY: 1 },
-        duration: DURATION_MS,
-        easing: EASING,
-      }));
-    } catch (e) {
-      // Plugin must not get stuck mid-gate or the backstop fires +
-      // logs a warning. If our setup throws, release the gate so the
-      // window appears (instantly, no animation).
-      try { await sdk.windows.releaseOpeningGate(id); } catch (_) { /* nothing more we can do */ }
-      sdk.log(`window-animations: map setup failed for ${id}: ${e && e.message ? e.message : e}`);
-    }
-  });
-
-  // --- Retile animation -------------------------------------------------
+  // Cache the output rect for each output so the CREATED slide-in
+  // math can compute "the output's right edge" without an async
+  // sdk.windows.get(id) inside the interceptor. The window.relayout
+  // event carries newOuter (in compositor coords) but not the output
+  // dimensions; we look them up from this cache, keyed by newOutputId.
+  // Populated synchronously on output add (sdk.windows exposes output
+  // metadata via outer rects when the workspace plugin reports them,
+  // but for now we use a simple primary-output assumption -- a
+  // multi-output config should call sdk.windows.get(id) and pull
+  // outer from there, or extend the event to include the output rect).
   //
-  // The window.relayout interceptor fires before the WM mutates a
-  // mapped window's outer tile. oldOuter = current rect; newOuter =
-  // the rect the WM is about to install. We can run side effects
-  // (like setting a transform) inside the interceptor and the WM
-  // awaits before proceeding. So:
-  //
-  //   1. Compute the pre-snap transform that visually keeps the
-  //      window at oldOuter even though its placement is about to be
-  //      newOuter:
-  //         scaleX     = oldOuter.width  / newOuter.width
-  //         scaleY     = oldOuter.height / newOuter.height
-  //         translateX = oldOuter.x - newOuter.x   (px)
-  //         translateY = oldOuter.y - newOuter.y   (px)
-  //   2. setTransform(presnap) synchronously.
-  //   3. Start the animation toward identity (fire-and-forget; the
-  //      interceptor returns immediately).
-  //   4. Return undefined (observe-only: keep newOuter as-is).
+  // For step 1 of this example we use the surface's own outerRect to
+  // derive "off-screen to the right" as outer.x + outer.width * 2:
+  // start the window one-tile-width past its destination. Good
+  // visual for typical master-stack tile sizes and avoids the
+  // output-rect lookup entirely.
 
+  // Strict gate-release pattern: when we receive a CREATED event,
+  // set the presnap transform synchronously inside the interceptor
+  // (so the first composite is at presnap, not identity), then
+  // release the opening gate. The WM awaits the interceptor before
+  // running pushStack; the opening-driver's gate is released as soon
+  // as we call releaseOpeningGate -- by then the transform has
+  // landed.
   sdk.events.intercept("window.relayout", async (_name, ev) => {
     const id = ev.surfaceId;
-    // First-tile case: a window's oldOuter is the addWindow placeholder
-    // (-1x-1) until its first layout. There's nothing to animate FROM
-    // in that case, and the map animation handles first-appearance.
-    // Skip the retile path for it.
-    if (ev.oldOuter.width <= 0 || ev.oldOuter.height <= 0) return undefined;
-    if (ev.newOuter.width <= 0 || ev.newOuter.height <= 0) return undefined;
-    // Degenerate / no-change: skip.
-    if (ev.oldOuter.x === ev.newOuter.x
-        && ev.oldOuter.y === ev.newOuter.y
-        && ev.oldOuter.width === ev.newOuter.width
-        && ev.oldOuter.height === ev.newOuter.height) {
+    const tiling = ev.tiling;
+
+    // CREATED: set the initial transform/opacity so the window
+    // appears mid-animation when it first composites.
+    if (ev.oldOuter === null && ev.newOuter !== null) {
+      try {
+        if (tiling === "managed") {
+          // Tiled: slide in from one tile-width to the right of the
+          // destination. The slide distance is the window's own
+          // width -- for a master-stack tile this is half the
+          // output; for a single-window-full-output it's the full
+          // output width.
+          const slideX = ev.newOuter.width;
+          await sdk.windows.setTransform(id,
+            { translateX: slideX, translateY: 0, scaleX: 1, scaleY: 1 });
+          await sdk.windows.releaseOpeningGate(id);
+          void sdk.animations.run(tween(target.windowTransform(id), {
+            from: { translateX: slideX, translateY: 0, scaleX: 1, scaleY: 1 },
+            to:   { translateX: 0,      translateY: 0, scaleX: 1, scaleY: 1 },
+            duration: DURATION_MS, easing: EASING,
+          }));
+        } else {
+          // Floating: fade + scale-up from 90% so the window
+          // appears in place rather than sliding from off-screen.
+          // (A dialog at the center of the screen sliding from the
+          // right would feel out of place.)
+          await sdk.windows.setOpacity(id, 0);
+          await sdk.windows.setTransform(id,
+            { translateX: 0, translateY: 0, scaleX: 0.9, scaleY: 0.9 });
+          await sdk.windows.releaseOpeningGate(id);
+          void sdk.animations.run(tween(target.windowOpacity(id), {
+            from: 0, to: 1,
+            duration: DURATION_MS, easing: EASING,
+          }));
+          void sdk.animations.run(tween(target.windowTransform(id), {
+            from: { translateX: 0, translateY: 0, scaleX: 0.9, scaleY: 0.9 },
+            to:   { translateX: 0, translateY: 0, scaleX: 1.0, scaleY: 1.0 },
+            duration: DURATION_MS, easing: EASING,
+          }));
+        }
+      } catch (e) {
+        try { await sdk.windows.releaseOpeningGate(id); } catch (_) { /* */ }
+        sdk.log(`window-animations: CREATED setup failed for ${id}: ${e && e.message ? e.message : e}`);
+      }
       return undefined;
     }
 
-    const sx = ev.oldOuter.width / ev.newOuter.width;
-    const sy = ev.oldOuter.height / ev.newOuter.height;
-    const tx = ev.oldOuter.x - ev.newOuter.x;
-    const ty = ev.oldOuter.y - ev.newOuter.y;
-
-    try {
-      await sdk.windows.setTransform(id,
-        { translateX: tx, translateY: ty, scaleX: sx, scaleY: sy });
-      // Fire-and-forget animation toward identity. Same duration +
-      // easing as the map animation so the seam between the
-      // shrinking-existing and sliding-in-new windows stays
-      // continuous throughout the transition. cancel-on-replacement
-      // takes care of overlapping relayouts (a second one preempts).
-      void sdk.animations.run(tween(target.windowTransform(id), {
-        from: { translateX: tx, translateY: ty, scaleX: sx, scaleY: sy },
-        to:   { translateX: 0,  translateY: 0,  scaleX: 1,  scaleY: 1 },
-        duration: DURATION_MS,
-        easing: EASING,
-      }));
-    } catch (e) {
-      sdk.log(`window-animations: retile setup failed for ${id}: ${e && e.message ? e.message : e}`);
+    // DESTROYED: animate the phantom (the closing-driver's snapshot
+    // of the last visible state) out. The phantom is a separate
+    // compositor surface with its own ID, distinct from the
+    // already-gone original. After the animation completes we call
+    // destroyPhantom to free the resources. sdk.animations.run
+    // resolves when the tween settles, so awaiting in a fire-and-
+    // forget chain gives us the completion callback.
+    if (ev.newOuter === null && ev.oldOuter !== null && ev.phantomSurfaceId !== undefined) {
+      const phantomId = ev.phantomSurfaceId;
+      // Fire-and-forget the run-then-destroy chain so the interceptor
+      // doesn't block the layout pass on the animation duration.
+      void (async () => {
+        try {
+          if (tiling === "managed") {
+            const slideX = ev.oldOuter.width;
+            await sdk.animations.run(tween(target.windowTransform(phantomId), {
+              from: { translateX: 0,      translateY: 0, scaleX: 1, scaleY: 1 },
+              to:   { translateX: slideX, translateY: 0, scaleX: 1, scaleY: 1 },
+              duration: DURATION_MS, easing: EASING,
+            }));
+          } else {
+            await Promise.all([
+              sdk.animations.run(tween(target.windowOpacity(phantomId), {
+                from: 1, to: 0,
+                duration: DURATION_MS, easing: EASING,
+              })),
+              sdk.animations.run(tween(target.windowTransform(phantomId), {
+                from: { translateX: 0, translateY: 0, scaleX: 1.0, scaleY: 1.0 },
+                to:   { translateX: 0, translateY: 0, scaleX: 0.9, scaleY: 0.9 },
+                duration: DURATION_MS, easing: EASING,
+              })),
+            ]);
+          }
+        } catch (e) {
+          sdk.log(`window-animations: DESTROYED anim threw for ${phantomId}: ${e && e.message ? e.message : e}`);
+        } finally {
+          // Always destroy the phantom so it doesn't leak. If the
+          // closing-driver's 10s backstop fires before us that's a
+          // no-op via the runtime's already-destroyed guard.
+          try { await sdk.windows.destroyPhantom(phantomId); } catch (_) { /* */ }
+        }
+      })();
+      return undefined;
     }
-    return undefined;  // observe-only; don't redirect newOuter
+
+    // RETILED: rect changed (including cross-output moves -- the
+    // rects are in compositor coords so a window moving from output
+    // A to B animates the same as a window moving within one
+    // output). Compensate visually with a presnap transform that
+    // makes the surface look like it's still at oldOuter even
+    // though its placement is now newOuter, then tween to identity.
+    if (ev.oldOuter !== null && ev.newOuter !== null) {
+      // Degenerate / no-change: skip.
+      if (ev.oldOuter.x === ev.newOuter.x
+          && ev.oldOuter.y === ev.newOuter.y
+          && ev.oldOuter.width === ev.newOuter.width
+          && ev.oldOuter.height === ev.newOuter.height) {
+        return undefined;
+      }
+      const sx = ev.oldOuter.width / ev.newOuter.width;
+      const sy = ev.oldOuter.height / ev.newOuter.height;
+      const tx = ev.oldOuter.x - ev.newOuter.x;
+      const ty = ev.oldOuter.y - ev.newOuter.y;
+      try {
+        await sdk.windows.setTransform(id,
+          { translateX: tx, translateY: ty, scaleX: sx, scaleY: sy });
+        void sdk.animations.run(tween(target.windowTransform(id), {
+          from: { translateX: tx, translateY: ty, scaleX: sx, scaleY: sy },
+          to:   { translateX: 0,  translateY: 0,  scaleX: 1,  scaleY: 1 },
+          duration: DURATION_MS, easing: EASING,
+        }));
+      } catch (e) {
+        sdk.log(`window-animations: RETILED setup failed for ${id}: ${e && e.message ? e.message : e}`);
+      }
+      return undefined;
+    }
+
+    // Anything else: observe-only (no animation we know how to
+    // handle).
+    return undefined;
   });
 }
