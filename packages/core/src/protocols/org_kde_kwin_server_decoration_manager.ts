@@ -15,8 +15,13 @@
 //     `default_mode(Server)`.
 //   - manager: emits `default_mode(Server)` once at bind so clients
 //     that don't even call create() see the SSD signal.
-//   - decoration.request_mode(mode): client preference; we ignore and
-//     re-emit `mode(Server)`.
+//   - decoration.request_mode(mode): client preference; we ignore it and
+//     re-emit `mode(Server)` -- but only for the first few requests per
+//     decoration. A client that wants Client mode (Firefox) re-requests on
+//     every `mode` event it receives, so an unconditional reply ping-pongs
+//     request_mode <-> mode without end (millions/sec, pinning the CPU).
+//     Capping the replies breaks that loop; once we stop answering, the
+//     client settles on the last mode it was told (Server).
 //   - decoration.release: destructor.
 //
 // Silent-drop convention applies (no wl_resource_post_error wired): a
@@ -38,6 +43,13 @@ const MODE = decoSig.enums.mode.entries;
 // Per-surface state, so a second create() on the same wl_surface can be
 // dropped per the protocol's implicit one-per-surface invariant.
 const decoratedSurfaces = new WeakSet<Resource>();
+
+// Per-decoration count of `mode` replies sent in response to request_mode.
+// Capped to break the request_mode<->mode loop with clients that re-request a
+// mode they didn't get (Firefox keeps asking for Client; we only grant
+// Server). After the cap, request_mode is a silent no-op.
+const requestModeReplies = new WeakMap<Resource, number>();
+const MAX_MODE_REPLIES = 4;
 
 type ManagerHandler = OrgKdeKwinServerDecorationManagerHandler & {
   bind(resource: Resource): void;
@@ -65,9 +77,13 @@ export default function makeKdeDecorationManager(ctx: Ctx): ManagerHandler {
 export function makeKdeDecoration(ctx: Ctx): OrgKdeKwinServerDecorationHandler {
   return {
     request_mode(resource, _mode) {
-      // Client preference is ignored; the compositor's policy is SSD.
-      // A well-behaved client suppresses its CSD upon receiving Server
-      // here regardless of what it asked for.
+      // Client preference is ignored; the compositor's policy is SSD. A
+      // well-behaved client suppresses its CSD on Server; a stubborn one
+      // (Firefox) re-requests Client on every reply, so cap the replies to
+      // avoid an unbounded request_mode<->mode loop.
+      const sent = requestModeReplies.get(resource) ?? 0;
+      if (sent >= MAX_MODE_REPLIES) return;
+      requestModeReplies.set(resource, sent + 1);
       ctx.events.org_kde_kwin_server_decoration.send_mode(resource, MODE.Server);
     },
     release(_resource) {
