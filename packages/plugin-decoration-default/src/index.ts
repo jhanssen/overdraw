@@ -174,17 +174,30 @@ export default async function init(sdk: PluginSdk, rawConfig?: unknown): Promise
           const fill: ResolvedFill = w.focused ? config.focused : config.unfocused;
           const sr = ctx.surfaceRect;
 
+          // Release the gate once the client has committed at the configured
+          // size (ctx.contentReady), so the window enters the draw stack with a
+          // correctly-sized decorated frame rather than a stretched late-match
+          // one. Read it here -- before any render decision -- so a static
+          // window doesn't have to keep rendering just to poll this flag.
+          if (!w.released && ctx.contentReady) {
+            ctx.releaseGate();
+            w.released = true;
+          }
+
           // Static effect: skip re-rendering when nothing this render depends on
           // has changed -- client content (ctx.contentChanged), focus (fill),
           // ring dims, or placement (surfaceRect). Returning false keeps the
           // previously-installed output and lets the compositor's dirty gate
-          // skip recompositing, so an idle decorated window costs ~0 GPU. Only
-          // skip once released; before that every tick renders to drive the
-          // contentReady gate-release below.
+          // skip recompositing, so an idle decorated window costs ~0 GPU. This
+          // is independent of the gate: a window whose content never reaches the
+          // configured size (contentReady stays false) but is otherwise idle
+          // must still stop rendering -- re-blitting an identical frame every
+          // vblank achieves nothing. The first tick always renders
+          // (lastSurfaceRect === null), producing the initial decoration.
           const rectUnchanged = w.lastSurfaceRect !== null
             && w.lastSurfaceRect.x === sr.x && w.lastSurfaceRect.y === sr.y
             && w.lastSurfaceRect.w === sr.w && w.lastSurfaceRect.h === sr.h;
-          if (w.released && !ctx.contentChanged && fill === w.lastFill && rectUnchanged
+          if (!ctx.contentChanged && fill === w.lastFill && rectUnchanged
               && outputW === w.lastOutputW && outputH === w.lastOutputH
               && inputW === w.lastInputW && inputH === w.lastInputH) {
             return false;
@@ -207,15 +220,6 @@ export default async function init(sdk: PluginSdk, rawConfig?: unknown): Promise
 
           encodeFrame(pipeline, w.draw, output.texture.createView(), input.texture);
 
-          // Release the gate once the client has committed at the configured
-          // size (ctx.contentReady), so the window enters the draw stack with a
-          // correctly-sized decorated frame rather than a stretched late-match
-          // one. Comparing input.rect against surfaceRect directly would mix
-          // buffer px with logical px and never release under fractional scale.
-          if (!w.released && ctx.contentReady) {
-            ctx.releaseGate();
-            w.released = true;
-          }
           // Record what we rendered at, so the next tick can skip if unchanged.
           w.lastSurfaceRect = { x: sr.x, y: sr.y, w: sr.w, h: sr.h };
 

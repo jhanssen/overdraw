@@ -172,10 +172,11 @@ function uploadBuffer(ctx: Ctx, s: SurfaceRecord, buffer: Resource | null): void
         bufferId, relPt.handle, relPt.pointHi, relPt.pointLo);
       s.committed.syncobjRelease = undefined;
     }
+    const damage = reconcileBufferDamage(s, desc.width, desc.height);
     const ok = ctx.state.compositor.commitSurfaceDmabuf(
       s.id, desc.fd, desc.width, desc.height, desc.format,
       desc.modifierHi ?? 0, desc.modifierLo ?? 0, desc.offset, desc.stride, bufferId,
-      acquireFenceFd ?? undefined);
+      acquireFenceFd ?? undefined, damage ?? undefined);
     if (ok) { ctx.state.lastCommittedSurfaceId = s.id; s.hasContent = true; }
     else if (acquireFenceFd && !acquireFenceFd.closed) {
       // Commit refused (no Dawn wire / no device). Close our sync_file dup so

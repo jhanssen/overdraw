@@ -254,7 +254,8 @@ export interface CompositorSink {
   commitSurfaceDmabuf(id: number, fd: WaylandFd, w: number, h: number,
                       fourcc: number, modHi: number, modLo: number,
                       offset: number, stride: number, bufferId: number,
-                      acquireFenceFd?: WaylandFd): boolean;
+                      acquireFenceFd?: WaylandFd,
+                      damage?: ReadonlyArray<{ x: number; y: number; width: number; height: number }> | null): boolean;
   // wp_linux_drm_syncobj_v1: record the release timeline point bound to
   // `bufferId`. Signaled when the client-buffer-lifecycle emits sendWlRelease
   // for the same bufferId (i.e. the buffer is superseded on its surface AND

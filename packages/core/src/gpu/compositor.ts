@@ -540,6 +540,12 @@ interface Surface {
   // with the right buffer id, and to know what to (re)bind into the bind group
   // when an import completes.
   currentBufferId: number;
+  // Client damage (wl_surface.damage / damage_buffer) for the in-flight dmabuf
+  // commit, in BUFFER pixels, reconciled by the protocol layer. Consumed when
+  // the import binds (bindImportToSurface) to scope the OUTPUT repaint to the
+  // changed region instead of the whole surface. null = no client damage (=>
+  // repaint the full surface); undefined = none pending.
+  pendingContentDamage?: ReadonlyArray<{ x: number; y: number; width: number; height: number }> | null;
   // Monotonic counter bumped every time the client commits NEW content to this
   // surface (a fresh dmabuf import bound, or an shm upload). The intercept
   // broker reads it (surfaceContentEpoch) to tell a plugin's render whether the
@@ -1267,11 +1273,30 @@ export class JsCompositor implements CompositorSink {
   }
 
   // Stack/layer reorders change occlusion at arbitrary places; repaint full.
-  setStack(ids: number[]): void { this.stack = ids.slice(); this.damageFull(); }
+  setStack(ids: number[]): void {
+    // Only repaint when the stack actually changed. applySubsurfaces re-runs
+    // this on every content-surface commit (including a client's no-op frame-
+    // callback-only commit); damaging unconditionally would force a full repaint
+    // per commit, and a client that keeps a frame callback pending (Firefox)
+    // would then loop: empty commit -> repaint -> flip -> wl_callback.done ->
+    // empty commit. Identical stack -> nothing to draw.
+    if (this.stack.length === ids.length && this.stack.every((v, i) => v === ids[i])) return;
+    this.stack = ids.slice();
+    this.damageFull();
+  }
 
   setOutputStack(outputId: number, ids: number[] | null): void {
-    if (ids === null) this.outputStacks.delete(outputId);
-    else this.outputStacks.set(outputId, ids.slice());
+    // Only repaint when this output's stack actually changed. Re-run on every
+    // content-surface commit (applySubsurfaces), so an unconditional damageFull
+    // repaints per commit and loops a frame-callback-driven client (see setStack).
+    const cur = this.outputStacks.get(outputId);
+    if (ids === null) {
+      if (cur === undefined) return;
+      this.outputStacks.delete(outputId);
+    } else {
+      if (cur && cur.length === ids.length && cur.every((v, i) => v === ids[i])) return;
+      this.outputStacks.set(outputId, ids.slice());
+    }
     this.damageFull();
   }
 
@@ -1335,6 +1360,11 @@ export class JsCompositor implements CompositorSink {
   setSurfaceLayout(id: number, x: number, y: number, w: number, h: number): void {
     const s = this.surfaces.get(id);
     if (s) {
+      // Unchanged placement is a no-op: applySubsurfaces re-emits every
+      // subsurface's layout on each commit, so damaging here unconditionally
+      // would repaint the whole rect per commit (and loop a client that keeps
+      // a frame callback pending -- see setStack).
+      if (s.x === x && s.y === y && s.layoutW === w && s.layoutH === h) return;
       // Damage both the vacated and the new rect (move/resize).
       this.addOutputDamage(s.x, s.y, s.layoutW, s.layoutH);
       s.x = x; s.y = y; s.layoutW = w; s.layoutH = h;
@@ -1413,19 +1443,19 @@ export class JsCompositor implements CompositorSink {
   // both SHM and dmabuf surfaces; 1px tolerance absorbs fractional rounding.
   surfaceContentReady(id: number): boolean {
     const s = this.surfaces.get(id);
-    if (!s || !s.texture || s.layoutW <= 0 || s.layoutH <= 0) return false;
-    const scale = this.surfaceScale(id);
-    return Math.abs(s.width - Math.round(s.layoutW * scale)) <= 1
-        && Math.abs(s.height - Math.round(s.layoutH * scale)) <= 1;
+    if (!s || !s.texture || s.layoutW <= 0 || s.layoutH <= 0) {
+      return false;
+    }
+    // The gate releases when the client's content fills the configured layout
+    // rect, compared in LOGICAL pixels. Buffer pixel density is irrelevant: a
+    // fractionally-scaled client renders its buffer at an integer scale (e.g.
+    // 2x for a 1.5x output) and presents at the logical size via buffer_scale
+    // or a viewport, so comparing raw buffer px against layout*outputScale
+    // never matches.
+    const { w: lw, h: lh } = this.surfaceLogicalSize(s);
+    return Math.abs(lw - s.layoutW) <= 1 && Math.abs(lh - s.layoutH) <= 1;
   }
 
-  private surfaceScale(id: number): number {
-    for (const oid of this.surfaceOutputs(id)) {
-      const o = this.outputsGeom.get(oid);
-      if (o && o.scale > 0) return o.scale;
-    }
-    return this.scale > 0 ? this.scale : 1;
-  }
 
   surfaceReadyAt(id: number, w: number, h: number, scale?: number): boolean {
     const s = this.surfaces.get(id);
@@ -1474,15 +1504,23 @@ export class JsCompositor implements CompositorSink {
     else snap.tex.destroy();
   }
 
+  // These three are re-pushed on EVERY wl_surface.commit (applySurfaceState),
+  // so they must damage only on an actual change -- otherwise a client's no-op
+  // commit repaints the surface every frame (a frame-callback-driven client
+  // like Firefox then loops; see setStack).
   setSurfaceBufferScale(id: number, scale: number): void {
     const s = this.surfaces.get(id) ?? this.ensureSurface(id);
-    s.bufferScale = scale > 0 ? scale : 1;
+    const v = scale > 0 ? scale : 1;
+    if (s.bufferScale === v) return;
+    s.bufferScale = v;
     this.damageSurface(id);
   }
 
   setSurfaceBufferTransform(id: number, transform: number): void {
     const s = this.surfaces.get(id) ?? this.ensureSurface(id);
-    s.bufferTransform = (transform >= 0 && transform <= 7) ? transform : 0;
+    const v = (transform >= 0 && transform <= 7) ? transform : 0;
+    if (s.bufferTransform === v) return;
+    s.bufferTransform = v;
     this.damageSurface(id);
   }
 
@@ -1492,6 +1530,12 @@ export class JsCompositor implements CompositorSink {
     src: { x: number; y: number; width: number; height: number } | null,
   ): void {
     const s = this.surfaces.get(id) ?? this.ensureSurface(id);
+    const dstSame = (s.viewportDst == null && dst == null)
+      || (!!s.viewportDst && !!dst && s.viewportDst.width === dst.width && s.viewportDst.height === dst.height);
+    const srcSame = (s.viewportSrc == null && src == null)
+      || (!!s.viewportSrc && !!src && s.viewportSrc.x === src.x && s.viewportSrc.y === src.y
+          && s.viewportSrc.width === src.width && s.viewportSrc.height === src.height);
+    if (dstSame && srcSame) return;
     s.viewportDst = dst;
     s.viewportSrc = src;
     this.damageSurface(id);
@@ -1502,6 +1546,11 @@ export class JsCompositor implements CompositorSink {
     geom: { x: number; y: number; width: number; height: number } | null,
   ): void {
     const s = this.surfaces.get(id) ?? this.ensureSurface(id);
+    const cur = s.geometry;
+    const same = (cur == null && geom == null)
+      || (!!cur && !!geom && cur.x === geom.x && cur.y === geom.y
+          && cur.width === geom.width && cur.height === geom.height);
+    if (same) return;
     s.geometry = geom;
     this.damageSurface(id);
   }
@@ -1755,7 +1804,8 @@ export class JsCompositor implements CompositorSink {
   commitSurfaceDmabuf(id: number, fd: WaylandFd, w: number, h: number, fourcc: number,
                       modHi: number, modLo: number, offset: number, stride: number,
                       bufferId: number,
-                      acquireFenceFd?: WaylandFd): boolean {
+                      acquireFenceFd?: WaylandFd,
+                      damage?: ReadonlyArray<{ x: number; y: number; width: number; height: number }> | null): boolean {
     if (!this.dawn || this.deviceHandle === 0n) {
       if (!this.warnedDmabuf) {
         log.warn("core", "js-compositor: dmabuf needs dawn.wrapTexture + deviceHandle");
@@ -1770,7 +1820,11 @@ export class JsCompositor implements CompositorSink {
     }
 
     // Ensure the surface exists (the layout sweep may not have created it).
-    if (!this.surfaces.has(id)) this.surfaces.set(id, blankSurface(0, 0, 0, 0));
+    let surf = this.surfaces.get(id);
+    if (!surf) { surf = blankSurface(0, 0, 0, 0); this.surfaces.set(id, surf); }
+    // Stash the client damage for this commit; bindImportToSurface consumes it
+    // when the async import binds to scope the output repaint. null = full.
+    surf.pendingContentDamage = damage ?? null;
 
     // wp_linux_drm_syncobj_v1: stash the explicit-sync acquire fence keyed by
     // BUFFER (not surface). openImportBrackets consumes the fence the first
@@ -1860,7 +1914,11 @@ export class JsCompositor implements CompositorSink {
     s.present = true;
     s.contentEpoch++;
     this.imported.push({ id, width: imp.width, height: imp.height });
-    this.damageSurface(id);  // new dmabuf content -> repaint this surface's rect
+    // Repaint only the client's damaged region (set at commit time), or the
+    // whole surface when no damage was provided.
+    const dmg = s.pendingContentDamage;
+    s.pendingContentDamage = undefined;
+    this.damageSurfaceRegion(id, dmg);
     if (s.frozen) this.frozenReadyCb?.(id);
   }
 
@@ -2209,8 +2267,27 @@ export class JsCompositor implements CompositorSink {
       }
     }
     s.present = true;
-    this.damageSurface(id);
+    // A texture recreate (size change) repaints the whole surface; otherwise
+    // scope the output repaint to the client's damaged region.
+    this.damageSurfaceRegion(id, recreated ? null : damage);
     if (s.frozen) this.frozenReadyCb?.(id);
+  }
+
+  // The surface's intrinsic on-screen logical size: the viewport destination
+  // if set, else the committed buffer dims divided by buffer_scale (90/270
+  // transforms swap axes). This is the authoritative "how big is this surface"
+  // answer for surfaces with no WM-assigned layout rect -- a subsurface's
+  // layoutW/H is 0 (the "content-sized" sentinel from setSurfaceLayout), so
+  // readers must resolve the real size through here rather than trusting
+  // layoutW/H. (surface-hit-test.ts has the same computation over the protocol
+  // SurfaceRecord -- a different type, so it can't share this method.)
+  private surfaceLogicalSize(s: Surface): { w: number; h: number } {
+    const vd = s.viewportDst;
+    if (vd && vd.width > 0 && vd.height > 0) return { w: vd.width, h: vd.height };
+    const bs = s.bufferScale || 1;
+    const t = s.bufferTransform ?? 0;
+    const rot = t === 1 || t === 3 || t === 5 || t === 7;
+    return { w: (rot ? s.height : s.width) / bs, h: (rot ? s.width : s.height) / bs };
   }
 
   // --- Composite-scissor damage -------------------------------------------
@@ -2243,7 +2320,39 @@ export class JsCompositor implements CompositorSink {
       this.damageFull();
       return;
     }
-    this.addOutputDamage(s.x, s.y, s.layoutW, s.layoutH);
+    // layoutW/H is 0 for subsurfaces (the "content-sized" sentinel); resolve
+    // the real size so a subsurface content commit damages its actual rect
+    // rather than a zero-area one.
+    let w = s.layoutW, h = s.layoutH;
+    if (w <= 0 || h <= 0) ({ w, h } = this.surfaceLogicalSize(s));
+    this.addOutputDamage(s.x, s.y, w, h);
+  }
+
+  // Damage only the client's changed region for a content commit. `rects` are
+  // in BUFFER pixels (the protocol layer's reconciled damage); null/empty means
+  // "no damage info" -> repaint the whole surface. The protocol layer returns
+  // null whenever a buffer_transform or viewport is active, so here the only
+  // buffer->output mapping is the buffer scale (+ the surface's output
+  // position). An fx that can draw outside the layout rect forces a full
+  // repaint, same as damageSurface.
+  private damageSurfaceRegion(
+    id: number,
+    rects: ReadonlyArray<{ x: number; y: number; width: number; height: number }> | null | undefined,
+  ): void {
+    if (!rects || rects.length === 0) { this.damageSurface(id); return; }
+    const s = this.surfaces.get(id);
+    if (!s) return;
+    const fx = s.fx;
+    if (fx.translateX !== 0 || fx.translateY !== 0 || fx.scaleX !== 1 || fx.scaleY !== 1
+      || fx.marginTop !== 0 || fx.marginRight !== 0 || fx.marginBottom !== 0 || fx.marginLeft !== 0
+      || s.maskView !== null) {
+      this.damageFull();
+      return;
+    }
+    const bs = s.bufferScale || 1;
+    for (const r of rects) {
+      this.addOutputDamage(s.x + r.x / bs, s.y + r.y / bs, r.width / bs, r.height / bs);
+    }
   }
 
   // The 1x1 opaque-black quad used to clear a scissored region to black.

@@ -260,16 +260,23 @@ export class InterceptBroker {
   // this after each render to decide whether to wake again -- intercept
   // wants per-frame render callbacks for every matched surface, so an
   // active registration drives continuous re-render at vsync.
+  // Whether the compositor should keep waking per-frame for intercept work.
+  // True iff the most recent tick() actually PRODUCED a frame for some surface
+  // -- not merely that surfaces are registered. A decoration that has settled
+  // (its render returns the static skip) reports not-rendered, so the frame
+  // loop can idle until a real event (commit, focus, resize) re-drives a tick.
+  // Without this a single registration matching every window (the default
+  // decoration's ".*") would force a render every vblank forever.
   hasActive(): boolean {
-    for (const active of this.registrations.values()) {
-      if (active.surfaces.size > 0) return true;
-    }
-    return false;
+    return this.lastTickRendered;
   }
+
+  private lastTickRendered = false;
 
   // the compositor's renderFrame. Iterates every active state across
   // every registration and dispatches its render.
   tick(timeMs: number): void {
+    let anyRendered = false;
     for (const active of this.registrations.values()) {
       // Snapshot because a render that crosses the failure threshold
       // causes unregister, which mutates the map.
@@ -278,12 +285,14 @@ export class InterceptBroker {
         const states = Array.from(active.surfaces.values());
         for (const state of states) {
           const r = state.tick(timeMs);
+          if (r.rendered) anyRendered = true;
           if (!r.ok) { registrationDead = true; break; }
         }
       } else {
         const states = Array.from(active.surfaces.values());
         for (const state of states) {
           const r = state.tickCore(timeMs);
+          if (r.rendered) anyRendered = true;
           if (!r.ok) { registrationDead = true; break; }
         }
       }
@@ -297,6 +306,7 @@ export class InterceptBroker {
         });
       }
     }
+    this.lastTickRendered = anyRendered;
   }
 
   // Teardown: synchronously destroy every per-surface state across
