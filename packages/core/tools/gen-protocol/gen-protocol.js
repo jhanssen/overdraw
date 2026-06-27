@@ -89,6 +89,10 @@ const DEFAULT_INPUTS = [
   // CSD (visible as a 28x29 GTK shadow band around every window).
   // Vendored copy lifted from wlroots' protocols/.
   join(repoRoot, 'protocols', 'kde-server-decoration.xml'),
+  // Mesa's legacy wl_drm. Not in wayland-protocols upstream; NVIDIA's
+  // libnvidia-egl-wayland binds it to discover the DRM device during EGL
+  // init and null-derefs without it.
+  join(repoRoot, 'protocols', 'wayland-drm.xml'),
 ];
 
 function main(argv) {

@@ -55,7 +55,7 @@ interface HandlerModule { default: HandlerFactory; }
 // via addon.createGlobalForOutput, so a client binding wl_output for output
 // 1 reaches output 1's bind handler and gets output 1's geometry.
 const GLOBALS = [
-  "wl_compositor", "xdg_wm_base", "wl_shm", "zwp_linux_dmabuf_v1", "wl_seat",
+  "wl_compositor", "xdg_wm_base", "wl_shm", "zwp_linux_dmabuf_v1", "wl_drm", "wl_seat",
   "wl_subcompositor", "wl_data_device_manager",
   "zwp_primary_selection_device_manager_v1",
   "wp_cursor_shape_manager_v1",
@@ -743,6 +743,7 @@ export async function installProtocols(
     wl_buffer: await import("./wl_buffer.js"),
     zwp_linux_dmabuf_v1: await import("./zwp_linux_dmabuf_v1.js"),
     zwp_linux_buffer_params_v1: await import("./zwp_linux_buffer_params_v1.js"),
+    wl_drm: await import("./wl_drm.js"),
     // wl_seat is constructed via globalHandlers (it takes the focus driver
     // as a second arg, which the generic HandlerFactory shape doesn't allow).
     wl_subcompositor: await import("./wl_subcompositor.js"),
