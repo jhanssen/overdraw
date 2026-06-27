@@ -21,6 +21,7 @@
 
 #include <cstdio>
 #include <cstring>
+#include <cstdlib>
 #include <memory>
 #include <vector>
 
@@ -285,6 +286,18 @@ void runFrameIfReady() {
     if (!g_addon.compositor || !g_addon.loopRunning) return;
     if (!g_addon.wantNext) return;
     if (g_addon.inFrame) return;                       // re-entrant; post-render loop picks it up
+
+    // vblank-gate. Don't run a frame pass while every output already has a
+    // page-flip in flight -- the flip-complete (onFrameComplete) is the only
+    // thing that drives the next render. wantNext stays set, so the deferred
+    // work runs as soon as a flip frees a slot. Without this, a client that
+    // commits faster than vblank drives unbounded synchronous renders that
+    // monopolize the thread and starve the very poll loop delivering the
+    // flip-completes (and input). Headless has no flips and is paced by its
+    // frame timer, so canPresentAnyOutput is always true there.
+    if (g_addon.compositor && !g_addon.compositor->canPresentAnyOutput()) {
+        return;
+    }
 
     do {
         g_addon.wantNext = false;

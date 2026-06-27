@@ -543,6 +543,14 @@ class Compositor {
     WGPUTexture acquireOutputTextureHandle(uint32_t outputId);
     // Present the previously-acquired target for `outputId`. No-op headless.
     void presentOutput(uint32_t outputId);
+    // True iff at least one enabled output could accept a new frame right now
+    // -- i.e. acquireOutputTextureHandle would return a slot for it (no
+    // page-flip in flight on KMS; not yet presented this host-vblank on
+    // nested). The frame loop gates on this so a client committing faster than
+    // vblank cannot drive renders: when every output already has a flip in
+    // flight, the render waits for the flip-complete instead of spinning.
+    // Headless is timer-paced and always presentable.
+    bool canPresentAnyOutput() const;
     // The scanout-ring slot texture format (the JS pipeline's color-target
     // format must match). Valid after bringUp().
     wgpu::TextureFormat outputFormat() const { return renderFormat_; }

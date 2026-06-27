@@ -1271,6 +1271,26 @@ WGPUTexture Compositor::acquireOutputTextureHandle(uint32_t outputId) {
     return nullptr;  // all slots busy
 }
 
+bool Compositor::canPresentAnyOutput() const {
+    if (headless_) return true;                 // timer-paced; never gate
+    if (kmsMode_ && kmsPaused_) return false;   // VT away: nothing presents
+    if (scanoutOutputs_.empty()) return true;   // not set up yet; don't gate
+    for (const auto& [id, so] : scanoutOutputs_) {
+        (void)id;
+        // Mirror acquireOutputTextureHandle's per-output gate.
+        if (kmsMode_) {
+            bool flipPending = false;
+            for (int i = 0; i < 3; ++i) {
+                if (so.slots[i].state == ScanoutSlotState::PENDING_FLIP) { flipPending = true; break; }
+            }
+            if (!flipPending) return true;
+        } else if (!so.presentedThisCycle) {
+            return true;
+        }
+    }
+    return false;  // every enabled output has a frame in flight
+}
+
 void Compositor::presentOutput(uint32_t outputId) {
     if (headless_) return;
     auto it = scanoutOutputs_.find(outputId);
