@@ -246,11 +246,12 @@ export default function makeSeat(ctx: Ctx, driver: FocusDriver): SeatHandler {
   // descendant; either way, the hit carries the output-space rect of
   // the surface that actually accepted, so motion events can compute
   // surface-local coords against the right surface.
-  function toFocus(hit: SurfaceHit): SeatFocus {
+  function toFocus(hit: SurfaceHit, rootSurfaceId: number): SeatFocus {
     const clientId = ctx.addon.clientId(hit.surfaceRec.resource);
     return {
       surfaceId: hit.surfaceRec.id,
       surfaceRec: hit.surfaceRec,
+      rootSurfaceId,
       clientId,
       rect: hit.rect,
     };
@@ -267,16 +268,18 @@ export default function makeSeat(ctx: Ctx, driver: FocusDriver): SeatHandler {
     // walked: per windowAt's accept callback, the toplevel is a
     // candidate iff its tree hits at all (root OR a subsurface).
     let bestHit: SurfaceHit | null = null;
+    let bestRootId = 0;
     const win = wm.windowAt(x, y, (w) => {
       const root = ctx.state.surfaces.get(w.surfaceRec.resource);
       if (!root) return false;
       const hit = hitTestSurfaceTree(ctx.state, root, w.rect, x, y);
       if (!hit) return false;
       bestHit = hit;
+      bestRootId = root.id;
       return true;
     });
     if (!win || !bestHit) return null;
-    return toFocus(bestHit);
+    return toFocus(bestHit, bestRootId);
   }
 
   // Topmost mapped popup under the point, walking each popup's full
@@ -300,7 +303,7 @@ export default function makeSeat(ctx: Ctx, driver: FocusDriver): SeatHandler {
         height: pr.rect.height,
       };
       const hit = hitTestSurfaceTree(ctx.state, root, rect, x, y);
-      if (hit) return toFocus(hit);
+      if (hit) return toFocus(hit, root.id);
     }
     return null;
   }
@@ -328,7 +331,7 @@ export default function makeSeat(ctx: Ctx, driver: FocusDriver): SeatHandler {
         const root = rec.surface;
         if (root.resource.destroyed) continue;
         const hit = hitTestSurfaceTree(ctx.state, root, r, x, y);
-        if (hit) return toFocus(hit);
+        if (hit) return toFocus(hit, root.id);
       }
     }
     return null;
@@ -371,7 +374,7 @@ export default function makeSeat(ctx: Ctx, driver: FocusDriver): SeatHandler {
     // Layer-shell first: the WM doesn't know about these.
     if (s.layerSurface?.rect) {
       const r = s.layerSurface.rect;
-      return { surfaceId, surfaceRec: s, clientId, rect: { x: r.x, y: r.y, width: r.width, height: r.height } };
+      return { surfaceId, surfaceRec: s, rootSurfaceId: surfaceId, clientId, rect: { x: r.x, y: r.y, width: r.width, height: r.height } };
     }
     // Override-redirect xwayland overlay: rect tracked separately from the
     // WM (the overlay isn't in wm.state.windows). 3.4 will mirror focus to
@@ -380,12 +383,12 @@ export default function makeSeat(ctx: Ctx, driver: FocusDriver): SeatHandler {
     if (s.role === "xwayland") {
       const orRect = ctx.state.overrideRedirects?.get(surfaceId);
       if (orRect) {
-        return { surfaceId, surfaceRec: s, clientId, rect: { ...orRect } };
+        return { surfaceId, surfaceRec: s, rootSurfaceId: surfaceId, clientId, rect: { ...orRect } };
       }
     }
     const snap = ctx.state.wm?.getSnapshot(surfaceId);
     if (!snap) return null;
-    return { surfaceId, surfaceRec: s, clientId, rect: snap.rect };
+    return { surfaceId, surfaceRec: s, rootSurfaceId: surfaceId, clientId, rect: snap.rect };
   }
 
   // Topmost mapped layer surface in protocol layers top|overlay with
@@ -508,7 +511,7 @@ export default function makeSeat(ctx: Ctx, driver: FocusDriver): SeatHandler {
     const cur = seat?.kbFocus?.surfaceId ?? null;
     const sup = surfaceUnderPointer !== undefined
       ? surfaceUnderPointer
-      : (seat?.focus?.surfaceId ?? null);
+      : (seat?.focus?.rootSurfaceId ?? seat?.focus?.surfaceId ?? null);
     driver.dispatch({
       reason,
       pointer: { x: lastX, y: lastY, surfaceUnderPointer: sup },
@@ -632,9 +635,10 @@ export default function makeSeat(ctx: Ctx, driver: FocusDriver): SeatHandler {
           }
         }
         // Focus dispatch only on surface change (coarse event), not per
-        // motion within the same surface.
+        // motion within the same surface. Keyboard focus / activation
+        // target the root toplevel, not the (possibly subsurface) hit.
         if (prevPointerSurface !== hit.surfaceId) {
-          dispatchFocus("pointer-enter", hit.surfaceId, hit.surfaceId);
+          dispatchFocus("pointer-enter", hit.rootSurfaceId, hit.rootSurfaceId);
         }
         break;
       }
@@ -710,14 +714,16 @@ export default function makeSeat(ctx: Ctx, driver: FocusDriver): SeatHandler {
           pointerFrame(p);
         }
         if (ev.pressed) {
-          dispatchFocus("pointer-button", seat.focus.surfaceId, seat.focus.surfaceId);
+          const rootId = seat.focus.rootSurfaceId ?? seat.focus.surfaceId;
+          dispatchFocus("pointer-button", rootId, rootId);
           // Click-to-raise: a press on a toplevel's content surface
           // raises it (and its modal subtree, redirecting up the
           // chain if the press landed on a modal dialog). Focus and
           // raise are decoupled here on purpose; a pointer-follows-
           // focus policy can still walk over windows without
-          // reordering them.
-          ctx.state.wm?.raiseWindow(seat.focus.surfaceId);
+          // reordering them. Raise targets the root toplevel, not a
+          // subsurface the press may have landed on.
+          ctx.state.wm?.raiseWindow(rootId);
         }
         break;
       }

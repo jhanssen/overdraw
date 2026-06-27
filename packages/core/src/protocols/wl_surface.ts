@@ -14,7 +14,7 @@ import { WlSurface_Error } from "#protocols-gen/wl_surface.js";
 import type { Ctx, CompositorState, SurfaceRecord, SubsurfaceRecord } from "./ctx.js";
 import { OUTPUT_DEFAULT } from "./ctx.js";
 import type { Resource } from "../types.js";
-import type { RegionRect } from "./region.js";
+import { Region, type RegionRect } from "./region.js";
 import { applySubsurfaces, applySubsurfaceReorder } from "../subsurfaces.js";
 import { applyPresentationFeedbacks } from "./wp_presentation.js";
 import { WINDOW_EVENT } from "../events/types.js";
@@ -212,19 +212,21 @@ function uploadBuffer(ctx: Ctx, s: SurfaceRecord, buffer: Resource | null): void
   }
 }
 
-// Snapshot a pending region resource into an applied Region (or null for
-// "infinite"). Called on commit for input/opaque region application.
-// Per spec: copy semantics -- the client may destroy the wl_region
-// resource immediately after the commit; the applied region keeps the
-// rect list it had at commit time.
-function snapshotRegion(
+// Snapshot the region named by a set_input_region / set_opaque_region request
+// into a standalone Region (or null for "infinite"), AT REQUEST TIME. Per spec
+// these requests have copy semantics: the client may destroy the wl_region
+// immediately after, and an empty region (created, never add()'d) must read as
+// "accept nothing". A non-null `region` argument therefore always yields a
+// Region -- an empty one when the resource has no rect list yet -- and only a
+// null argument means infinite. (Deferring this to commit by resource lookup
+// loses both the destroyed and the empty case, collapsing them to "infinite".)
+function snapshotRegionArg(
   ctx: Ctx,
-  pending: Resource | null | undefined,
-): import("./region.js").Region | null | undefined {
-  if (pending === undefined) return undefined;   // no set_*_region this cycle
-  if (pending === null) return null;             // explicit null = infinite
-  const r = ctx.state.regions?.get(pending);
-  return r ? r.clone() : null;                   // missing/destroyed -> infinite
+  region: Resource | null,
+): Region | null {
+  if (region === null) return null;              // explicit null = infinite
+  const r = ctx.state.regions?.get(region);
+  return r ? r.clone() : new Region();           // no rects yet => empty region
 }
 
 // Apply a surface's committed state (buffer + frame callbacks + subsurface-
@@ -270,13 +272,14 @@ function applySurfaceState(ctx: Ctx, s: SurfaceRecord): void {
   applyPresentationFeedbacks(ctx, s);
 
   // Apply input/opaque regions. undefined = no set_*_region call this
-  // cycle, leave applied region alone.
+  // cycle, leave applied region alone. The pending value is already a
+  // snapshot (taken at set_*_region time), so promote it verbatim.
   if (s.pending.inputRegion !== undefined) {
-    s.inputRegion = snapshotRegion(ctx, s.pending.inputRegion);
+    s.inputRegion = s.pending.inputRegion;
     s.pending.inputRegion = undefined;
   }
   if (s.pending.opaqueRegion !== undefined) {
-    s.opaqueRegion = snapshotRegion(ctx, s.pending.opaqueRegion);
+    s.opaqueRegion = s.pending.opaqueRegion;
     s.pending.opaqueRegion = undefined;
   }
 
@@ -384,14 +387,15 @@ export default function makeSurface(ctx: Ctx): WlSurfaceHandler {
     set_opaque_region(resource, region) {
       const s = rec(resource);
       if (!s) return;
-      // Double-buffered: store the region resource (or null = infinite);
-      // commit() snapshots its rect list.
-      s.pending.opaqueRegion = region;
+      // Copy semantics: snapshot the region's rects NOW (the client may
+      // destroy the wl_region before the next commit). Double-buffered:
+      // the snapshot is promoted to applied state on commit.
+      s.pending.opaqueRegion = snapshotRegionArg(ctx, region);
     },
     set_input_region(resource, region) {
       const s = rec(resource);
       if (!s) return;
-      s.pending.inputRegion = region;
+      s.pending.inputRegion = snapshotRegionArg(ctx, region);
     },
     set_buffer_transform(resource, transform) {
       const s = rec(resource);

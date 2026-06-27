@@ -58,11 +58,12 @@ export interface SurfaceRecord {
   // either APPLIES it (effective-desync) or CACHES it (effective-sync subsurface)
   // until the parent commits. See wl_surface.commit + applySurfaceState.
   //
-  // `pendingInputRegion` / `pendingOpaqueRegion` hold the wl_region resource
-  // (or null = infinite) the client passed via set_*_region since the last
-  // commit. On commit, the region's CURRENT rect list is snapshotted to
-  // `inputRegion` / `opaqueRegion` (copy semantics; the client can destroy
-  // the region resource immediately).
+  // `inputRegion` / `opaqueRegion` hold a SNAPSHOT of the region's rect list
+  // (a cloned Region, or null = infinite), taken at set_*_region time per the
+  // spec's copy semantics: the client may destroy the wl_region immediately
+  // after the request, and a set-then-destroy of an empty region must read as
+  // "accept nothing", not "infinite". Snapshotting at commit (by resource
+  // lookup) loses both cases. On commit the snapshot is promoted verbatim.
   pending: {
     buffer?: Resource | null;
     frameCallbacks?: Resource[];
@@ -71,8 +72,8 @@ export interface SurfaceRecord {
     // state on commit; the dispatcher consumes them on the next scanout
     // (presented) or supersession (discarded).
     presentationFeedbacks?: Resource[];
-    inputRegion?: Resource | null;
-    opaqueRegion?: Resource | null;
+    inputRegion?: RegionSlot;
+    opaqueRegion?: RegionSlot;
     bufferScale?: number;
     // wl_surface.set_buffer_transform (double-buffered): wl_output.transform
     // enum 0..7. Default 0 (normal).
@@ -110,8 +111,8 @@ export interface SurfaceRecord {
     buffer?: Resource | null;
     frameCallbacks?: Resource[];
     presentationFeedbacks?: Resource[];
-    inputRegion?: Resource | null;
-    opaqueRegion?: Resource | null;
+    inputRegion?: RegionSlot;
+    opaqueRegion?: RegionSlot;
     bufferScale?: number;
     bufferTransform?: number;
     viewportSrc?: ViewportSrc | null;
@@ -1093,8 +1094,16 @@ export interface DmabufParams {
 }
 
 export interface SeatFocus {
+  // The surface that owns the pointer interaction: the exact surface the
+  // pointer is over, which may be a subsurface descendant of a toplevel.
+  // wl_pointer enter/leave/motion and surface-local coords use this.
   surfaceId: number;
   surfaceRec: { resource: Resource };
+  // The root of `surfaceId`'s surface tree -- the xdg_toplevel / layer /
+  // popup surface. Keyboard focus, window activation, and raise target
+  // this, since a subsurface is not a focusable/raisable window. Equals
+  // surfaceId when the hit is itself a root.
+  rootSurfaceId: number;
   clientId: number;
   rect: { x: number; y: number; width: number; height: number };
 }
