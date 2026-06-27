@@ -33,14 +33,20 @@ const MODIFIERS = [DRM_FORMAT_MOD_LINEAR, DRM_FORMAT_MOD_INVALID];
 export default function makeLinuxDmabuf(ctx: Ctx): DmabufHandler {
   return {
     bind(resource) {
-      // v3+ clients use modifier events; older ones use format events. We send
-      // both so either path sees our formats.
+      // format (v1) and modifier (v3) are both deprecated since v4 and must not
+      // be sent to a v4+ binding -- those clients read formats from
+      // get_default_feedback. Sending a modifier event on a v4 binding crashes
+      // NVIDIA's libnvidia-egl-wayland (null deref). Only the legacy path gets
+      // these: format for v1+, modifier (a since-3 event) for v3 only.
+      if (resource.version >= 4) return;
       for (const fmt of ADVERTISED) {
         ctx.events.zwp_linux_dmabuf_v1.send_format(resource, fmt);
-        for (const mod of MODIFIERS) {
-          const hi = Number((mod >> 32n) & 0xffffffffn);
-          const lo = Number(mod & 0xffffffffn);
-          ctx.events.zwp_linux_dmabuf_v1.send_modifier(resource, fmt, hi, lo);
+        if (resource.version >= 3) {
+          for (const mod of MODIFIERS) {
+            const hi = Number((mod >> 32n) & 0xffffffffn);
+            const lo = Number(mod & 0xffffffffn);
+            ctx.events.zwp_linux_dmabuf_v1.send_modifier(resource, fmt, hi, lo);
+          }
         }
       }
     },
