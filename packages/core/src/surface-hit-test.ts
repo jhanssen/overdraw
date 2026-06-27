@@ -142,6 +142,14 @@ export function hitTestSurfaceTree(
   // Then the root itself.
   if (x < rootRect.x || x >= rootRect.x + rootRect.width) return null;
   if (y < rootRect.y || y >= rootRect.y + rootRect.height) return null;
-  if (!inputRegionAccepts(root, x - rootRect.x, y - rootRect.y)) return null;
+  // The input region is in surface-local (buffer) coords. For a CSD root that
+  // declared a window geometry, the buffer origin sits geom.(x,y) above-left of
+  // the on-screen content rect (the shadow margin), so the surface-local point
+  // is (point - rootRect) + geom offset -- the same offset the seat adds when
+  // it delivers wl_pointer coords. Subsurfaces carry no geometry (offset 0).
+  const geom = root.xdgSurface?.geometry;
+  const gx = geom ? geom.x : 0;
+  const gy = geom ? geom.y : 0;
+  if (!inputRegionAccepts(root, (x - rootRect.x) + gx, (y - rootRect.y) + gy)) return null;
   return { surfaceRec: root, rect: rootRect };
 }

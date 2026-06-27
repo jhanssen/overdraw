@@ -201,6 +201,37 @@ test('subsurface input region accepts only inside its declared rects', () => {
   assert.equal(hitOutside.surfaceRec.id, 1);
 });
 
+// A CSD client draws shadow margins into a buffer larger than the window and
+// declares the window sub-rect via xdg_surface.set_window_geometry. Surface-
+// local (== buffer) coords are offset from the on-screen content rect by the
+// geometry origin, so the input region -- which the client sets in buffer
+// coords -- must be hit-tested at (point - rect) + geomOffset. Without the
+// offset, the window's top-left strip (width geom.x, height geom.y) is wrongly
+// click-through. Matches the offset the seat applies when delivering
+// wl_pointer surface-local coords.
+test('root input region is hit-tested with the window-geometry offset', () => {
+  const state = {};
+  const GX = 40, GY = 30, GW = 300, GH = 200;
+  const root = makeSurface(state, 1, { bufW: GX + GW + 40, bufH: GY + GH + 40 });
+  root.xdgSurface = { geometry: { x: GX, y: GY, width: GW, height: GH } };
+  // Input region in BUFFER coords == the geometry (content) rect.
+  root.inputRegion = {
+    contains: (lx, ly) => lx >= GX && lx < GX + GW && ly >= GY && ly < GY + GH,
+  };
+  // The content rect is placed on-screen at (100, 100), sized GW x GH.
+  const rect = { x: 100, y: 100, width: GW, height: GH };
+
+  // 5px inside the content's top-left: surface-local (GX+5, GY+5) IS inside the
+  // input region. Without the offset the check happens at (5, 5) and misses.
+  const tl = hitTestSurfaceTree(state, root, rect, 105, 105);
+  assert.ok(tl, 'top-left content point must hit (geometry offset applied)');
+  assert.equal(tl.surfaceRec.id, 1);
+
+  // Center stays a hit (sanity; this point hits with or without the offset).
+  const mid = hitTestSurfaceTree(state, root, rect, 100 + (GW >> 1), 100 + (GH >> 1));
+  assert.ok(mid, 'center must hit');
+});
+
 // --- size derivation ----------------------------------------------------
 
 test('subsurface with no committed buffer is skipped', () => {
