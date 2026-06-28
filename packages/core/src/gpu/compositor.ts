@@ -508,6 +508,14 @@ interface Surface {
   // group; updated each frame via writeBuffer.
   uniformBuf: GPUBuffer | null;
   bindGroup: GPUBindGroup | null;
+  // Bind groups keyed by the sampled view they bind. A client cycling a fixed
+  // set of buffers re-presents the same view objects (imports are cached per
+  // bufferId), so the bind group can be reused instead of recreated each
+  // commit -- avoiding per-frame WebGPU-object churn (and its N-API finalizer
+  // cost). Baked with the surface's current mask; reset in setSurfaceMask when
+  // the mask changes. WeakMap so a released import's view (and its cached bind
+  // group) collect without manual eviction.
+  bindGroupCache: WeakMap<GPUTextureView, GPUBindGroup>;
   // Buffer pixel dimensions (device pixels).
   width: number;
   height: number;
@@ -1648,6 +1656,9 @@ export class JsCompositor implements CompositorSink {
   setSurfaceMask(id: number, mask: GPUTexture | null): void {
     const s = this.ensureSurface(id);
     s.maskView = mask ? mask.createView() : null;
+    // The cached bind groups bake in the old mask; drop them so the mask change
+    // takes effect on every view they covered.
+    s.bindGroupCache = new WeakMap();
     // Rebuild the bind group if a surface view already exists. If no surface
     // texture is committed yet, the mask installs into the Surface struct;
     // the next rebuildBindGroup (on first content) will pick it up.
@@ -1957,8 +1968,10 @@ export class JsCompositor implements CompositorSink {
     // A frozen surface samples its captured snapshot; an intercept samples the
     // plugin output; otherwise the client view.
     const sampledView = s.frozen?.view ?? s.interceptOutputView ?? view;
+    const cached = s.bindGroupCache.get(sampledView);
+    if (cached) { s.bindGroup = cached; return; }
     const mask = s.maskView ?? this.defaultMaskView;
-    s.bindGroup = this.device.createBindGroup({
+    const bindGroup = this.device.createBindGroup({
       layout: this.layout,
       entries: [
         { binding: 0, resource: this.sampler },
@@ -1968,6 +1981,8 @@ export class JsCompositor implements CompositorSink {
         { binding: 4, resource: mask },
       ],
     });
+    s.bindGroupCache.set(sampledView, bindGroup);
+    s.bindGroup = bindGroup;
   }
 
   // Run the intents the lifecycle just emitted. The executor is intentionally
@@ -4026,6 +4041,7 @@ export class JsCompositor implements CompositorSink {
 function blankSurface(x: number, y: number, w: number, h: number): Surface {
   return {
     texture: null, view: null, uniformBuf: null, bindGroup: null,
+    bindGroupCache: new WeakMap(),
     width: 0, height: 0, bufferScale: 1, bufferTransform: 0, x, y, layoutW: w, layoutH: h, present: false,
     currentBufferId: 0,
     contentEpoch: 0,
