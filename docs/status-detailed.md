@@ -193,15 +193,16 @@ with no error. Worst-first.
   of what Mesa does for Hyprland implicitly, and is not implemented; we
   have no shm-video client measurement today.
 
-- **No `wl_resource_post_error` mechanism.** Requests that the spec defines
-  as protocol errors (e.g. `zwlr_layer_surface_v1.invalid_size` when set_size
-  has a 0 axis with no opposite-edge anchors, `wp_cursor_shape_v1.invalid_shape`
-  for out-of-range shape enums, `wl_subsurface` place_above/place_below on
-  a non-sibling, cross-role surface assignment) are silently dropped rather
-  than disconnected. Compliant clients see no behavior change in the
-  successful path; non-compliant clients don't get the spec'd disconnect.
-  Each silent-drop site is commented with the error it would otherwise
-  post. Adding a generic `post_error` path is its own piece of work.
+- **`wl_resource_post_error` is wired; some sites still silent-drop.** The
+  mechanism exists end-to-end: `ctx.addon.postError(resource, code, message)`
+  (`trampoline.cpp` → `wl_resource_post_error`), and many protocols use it
+  (wl_seat, wp_viewporter, cursor_shape, wp_linux_drm_syncobj_v1, wl_drm,
+  xwayland_shell, zxdg_decoration, zwp_pointer_constraints_v1,
+  zwp_virtual_keyboard_v1, zwlr_virtual_pointer_v1). What remains is that
+  some commit-time / cross-field errors (e.g. `zwlr_layer_surface_v1.invalid_size`,
+  `wl_subsurface` non-sibling place_above/below) still silently drop rather
+  than post. Those sites are commented with the error they would post. So
+  "post an error" is now a per-call decision, not missing infrastructure.
 
 - **Smaller advertised-incomplete items:** `wl_subsurface` `place_above`/
   `place_below` sibling reordering (no-op); DnD drag-icon compositing (implemented,

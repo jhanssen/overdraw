@@ -7,9 +7,10 @@ historical rationale when investigating a specific subsystem). Before
 working on any protocol, read the "Read first: gaps in advertised
 protocols (silent-gap risks)" section at the top of `docs/status.md` — it
 lists what is advertised-but-incomplete (silent-gap risks: `wl_region`
-no-op stub, `wl_surface.damage`/`damage_buffer` residuals, no
-`wl_resource_post_error` mechanism, hotplug-replug logical-position not
-restored, intercept-worker teardown race).
+no-op stub, `wl_surface.damage`/`damage_buffer` residuals,
+`wl_resource_post_error` is wired (`ctx.addon.postError`) and used by many
+protocols, but some commit-time errors still silent-drop, hotplug-replug
+logical-position not restored, intercept-worker teardown race).
 
 ## Comments describe the code, not its history
 
