@@ -14,11 +14,13 @@
 // swap the seat keymap while this device is active) is a later refinement. The
 // supplied fd is closed so it does not leak.
 //
-// Protocol-error post is not wired in this compositor (see the
-// zwlr_layer_shell_v1 header); no_keymap / unauthorized are silent-dropped.
+// no_keymap is posted (via ctx.addon.postError) if key/modifiers arrive before
+// keymap. unauthorized is not enforced -- every client may create a virtual
+// keyboard (no compositor authorization policy).
 
 import type { ZwpVirtualKeyboardManagerV1Handler } from "#protocols-gen/zwp_virtual_keyboard_manager_v1.js";
 import type { ZwpVirtualKeyboardV1Handler } from "#protocols-gen/zwp_virtual_keyboard_v1.js";
+import { ZwpVirtualKeyboardV1_Error } from "#protocols-gen/zwp_virtual_keyboard_v1.js";
 import type { Ctx } from "./ctx.js";
 
 export default function makeVirtualKeyboardManager(_ctx: Ctx): ZwpVirtualKeyboardManagerV1Handler {
@@ -32,15 +34,27 @@ export default function makeVirtualKeyboardManager(_ctx: Ctx): ZwpVirtualKeyboar
 
 export function makeVirtualKeyboard(ctx: Ctx): ZwpVirtualKeyboardV1Handler {
   return {
-    keymap(_resource, _format, fd, _size) {
-      // First cut: ignore the client-supplied keymap; forward raw evdev codes
-      // through the seat's keymap. Close the fd so it does not leak.
+    keymap(resource, _format, fd, _size) {
+      // First cut: ignore the client-supplied keymap contents; forward raw
+      // evdev codes through the seat's keymap. Record that a keymap was set
+      // (the spec requires it before key/modifiers) and close the fd.
+      resource.__hasKeymap = true;
       try { fd.close(); } catch { /* already closed/taken */ }
     },
-    key(_resource, time, key, state) {
+    key(resource, time, key, state) {
+      if (!resource.__hasKeymap) {
+        ctx.addon.postError(resource, ZwpVirtualKeyboardV1_Error.no_keymap,
+          "key sent before keymap");
+        return;
+      }
       ctx.addon.injectInput({ type: "keyboardKey", serial: 0, time, key, pressed: state === 1 });
     },
-    modifiers(_resource, mods_depressed, mods_latched, mods_locked, group) {
+    modifiers(resource, mods_depressed, mods_latched, mods_locked, group) {
+      if (!resource.__hasKeymap) {
+        ctx.addon.postError(resource, ZwpVirtualKeyboardV1_Error.no_keymap,
+          "modifiers sent before keymap");
+        return;
+      }
       ctx.addon.injectInput({
         type: "keyboardModifiers", serial: 0, time: 0,
         modsDepressed: mods_depressed, modsLatched: mods_latched,

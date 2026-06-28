@@ -15,14 +15,18 @@ function mkCtx({ pointer = { x: 0, y: 0 }, outputs = null } = {}) {
       logicalSize: { width: o.w, height: o.h },
     }]),
   );
+  const errors = [];
   const ctx = {
-    addon: { injectInput: (ev) => injected.push(ev) },
+    addon: {
+      injectInput: (ev) => injected.push(ev),
+      postError: (res, code, msg) => errors.push({ res, code, msg }),
+    },
     state: {
       seat: { pointerPosition: () => pointer },
       outputs: outMap,
     },
   };
-  return { ctx, injected };
+  return { ctx, injected, errors };
 }
 
 const RES = {}; // resource arg is unused by the handler
@@ -94,18 +98,38 @@ test("axis: axis 1 is horizontal, 0 vertical; discrete carried through", () => {
   assert.deepEqual(injected[1], { type: "pointerAxis", serial: 0, time: 2, horizontal: true, value: 8, discrete: 1 });
 });
 
+test("axis: an out-of-range axis posts invalid_axis and injects nothing", () => {
+  const { ctx, injected, errors } = mkCtx();
+  makeVirtualPointer(ctx).axis(RES, 1, 5, 1.0);  // axis 5 is invalid
+  assert.equal(injected.length, 0);
+  assert.equal(errors.length, 1);
+  assert.equal(errors[0].code, 0);   // ZwlrVirtualPointerV1_Error.invalid_axis
+});
+
 test("frame: injects a pointerFrame", () => {
   const { ctx, injected } = mkCtx();
   makeVirtualPointer(ctx).frame(RES);
   assert.deepEqual(injected[0], { type: "pointerFrame", serial: 0, time: 0 });
 });
 
-test("axis_source / axis_stop are no-ops (no normalized representation)", () => {
+test("axis_source: forwarded as a pointerAxisSource event", () => {
   const { ctx, injected } = mkCtx();
-  const vp = makeVirtualPointer(ctx);
-  vp.axis_source(RES, 0);
-  vp.axis_stop(RES, 1, 0);
+  makeVirtualPointer(ctx).axis_source(RES, 0);  // wheel
+  assert.deepEqual(injected[0], { type: "pointerAxisSource", serial: 0, time: 0, axisSource: 0 });
+});
+
+test("axis_source: out-of-range posts invalid_axis_source and injects nothing", () => {
+  const { ctx, injected, errors } = mkCtx();
+  makeVirtualPointer(ctx).axis_source(RES, 9);
   assert.equal(injected.length, 0);
+  assert.equal(errors.length, 1);
+  assert.equal(errors[0].code, 1);   // ZwlrVirtualPointerV1_Error.invalid_axis_source
+});
+
+test("axis_stop: forwarded as a pointerAxisStop event for the right axis", () => {
+  const { ctx, injected } = mkCtx();
+  makeVirtualPointer(ctx).axis_stop(RES, 7, 1);  // horizontal
+  assert.deepEqual(injected[0], { type: "pointerAxisStop", serial: 0, time: 7, horizontal: true });
 });
 
 // --- manager is inert (child resource auto-dispatches by interface) ---

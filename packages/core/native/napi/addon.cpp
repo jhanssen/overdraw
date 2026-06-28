@@ -397,6 +397,8 @@ const char* inputTypeName(InputEventType t) {
         case InputEventType::PointerMotion:     return "pointerMotion";
         case InputEventType::PointerButton:     return "pointerButton";
         case InputEventType::PointerAxis:       return "pointerAxis";
+        case InputEventType::PointerAxisSource: return "pointerAxisSource";
+        case InputEventType::PointerAxisStop:   return "pointerAxisStop";
         case InputEventType::PointerFrame:      return "pointerFrame";
         case InputEventType::KeyboardEnter:     return "keyboardEnter";
         case InputEventType::KeyboardLeave:     return "keyboardLeave";
@@ -434,9 +436,16 @@ void JsInputSink::onInputEvent(const InputEvent& ev) {
 
     switch (ev.type) {
         case InputEventType::PointerEnter:
+            setF64(env, obj, "x", ev.x);
+            setF64(env, obj, "y", ev.y);
+            break;
         case InputEventType::PointerMotion:
             setF64(env, obj, "x", ev.x);
             setF64(env, obj, "y", ev.y);
+            setF64(env, obj, "dx", ev.dx);
+            setF64(env, obj, "dy", ev.dy);
+            setF64(env, obj, "dxUnaccel", ev.dxUnaccel);
+            setF64(env, obj, "dyUnaccel", ev.dyUnaccel);
             break;
         case InputEventType::PointerButton:
             setU32(env, obj, "button", ev.button);
@@ -446,6 +455,12 @@ void JsInputSink::onInputEvent(const InputEvent& ev) {
             setBool(env, obj, "horizontal", ev.axis == AxisKind::HorizontalScroll);
             setF64(env, obj, "value", ev.axisValue);
             setU32(env, obj, "discrete", static_cast<uint32_t>(ev.axisDiscrete));
+            break;
+        case InputEventType::PointerAxisSource:
+            setU32(env, obj, "axisSource", ev.axisSource);
+            break;
+        case InputEventType::PointerAxisStop:
+            setBool(env, obj, "horizontal", ev.axis == AxisKind::HorizontalScroll);
             break;
         case InputEventType::KeyboardKey:
             setU32(env, obj, "key", ev.key);  // raw evdev keycode
@@ -2703,6 +2718,8 @@ napi_value InjectInput(napi_env env, napi_callback_info info) {
     else if (type == "pointerMotion")      ev.type = InputEventType::PointerMotion;
     else if (type == "pointerButton")      ev.type = InputEventType::PointerButton;
     else if (type == "pointerAxis")        ev.type = InputEventType::PointerAxis;
+    else if (type == "pointerAxisSource")  ev.type = InputEventType::PointerAxisSource;
+    else if (type == "pointerAxisStop")    ev.type = InputEventType::PointerAxisStop;
     else if (type == "pointerFrame")       ev.type = InputEventType::PointerFrame;
     else if (type == "keyboardEnter")      ev.type = InputEventType::KeyboardEnter;
     else if (type == "keyboardLeave")      ev.type = InputEventType::KeyboardLeave;
@@ -2715,6 +2732,13 @@ napi_value InjectInput(napi_env env, napi_callback_info info) {
         case InputEventType::PointerMotion:
             ev.x = getF64(env, argv[0], "x");
             ev.y = getF64(env, argv[0], "y");
+            break;
+        case InputEventType::PointerAxisSource:
+            ev.axisSource = getU32(env, argv[0], "axisSource");
+            break;
+        case InputEventType::PointerAxisStop:
+            ev.axis = getBoolProp(env, argv[0], "horizontal")
+                          ? AxisKind::HorizontalScroll : AxisKind::VerticalScroll;
             break;
         case InputEventType::PointerButton:
             ev.button = getU32(env, argv[0], "button");
@@ -2743,6 +2767,45 @@ napi_value InjectInput(napi_env env, napi_callback_info info) {
     }
 
     g_inputSink.onInputEvent(ev);
+    napi_value undef; napi_get_undefined(env, &undef);
+    return undef;
+}
+
+// setPointerLocked(locked: boolean) -> undefined
+// Freeze/unfreeze the input backend's cursor accumulator for an active
+// zwp_locked_pointer_v1. While locked the cursor stays put but relative deltas
+// keep flowing (for zwp_relative_pointer_v1).
+napi_value SetPointerLocked(napi_env env, napi_callback_info info) {
+    size_t argc = 1; napi_value argv[1];
+    napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+    bool locked = false;
+    if (argc >= 1) napi_get_value_bool(env, argv[0], &locked);
+    if (g_addon.input) g_addon.input->setPointerLocked(locked);
+    napi_value undef; napi_get_undefined(env, &undef);
+    return undef;
+}
+
+// setPointerConfine(rects: {x,y,w,h}[]) -> undefined
+// Constrain the cursor to the union of `rects` (global logical coords) for an
+// active zwp_confined_pointer_v1. Empty array clears confinement.
+napi_value SetPointerConfine(napi_env env, napi_callback_info info) {
+    size_t argc = 1; napi_value argv[1];
+    napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+    std::vector<overdraw::core::OutputRect> rects;
+    if (argc >= 1) {
+        uint32_t n = 0; napi_get_array_length(env, argv[0], &n);
+        rects.reserve(n);
+        for (uint32_t i = 0; i < n; i++) {
+            napi_value r; napi_get_element(env, argv[0], i, &r);
+            overdraw::core::OutputRect rect{};
+            rect.x = static_cast<int32_t>(getF64(env, r, "x"));
+            rect.y = static_cast<int32_t>(getF64(env, r, "y"));
+            rect.w = static_cast<uint32_t>(getF64(env, r, "w"));
+            rect.h = static_cast<uint32_t>(getF64(env, r, "h"));
+            rects.push_back(rect);
+        }
+    }
+    if (g_addon.input) g_addon.input->setPointerConfine(rects);
     napi_value undef; napi_get_undefined(env, &undef);
     return undef;
 }
@@ -3094,6 +3157,8 @@ napi_value Init(napi_env env, napi_value exports) {
     reg("shmBufferRef", ShmBufferRef);
     reg("shmBufferUnref", ShmBufferUnref);
     reg("injectInput", InjectInput);
+    reg("setPointerLocked", SetPointerLocked);
+    reg("setPointerConfine", SetPointerConfine);
     reg("injectHostInput", InjectHostInput);
     reg("clientId", ClientId);
     reg("destroyResource", DestroyResource);

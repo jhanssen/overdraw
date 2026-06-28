@@ -206,15 +206,24 @@ void LibinputBackend::dispatchEvent(libinput_event* ev) {
             auto* pe = libinput_event_get_pointer_event(ev);
             const double dx = libinput_event_pointer_get_dx(pe);
             const double dy = libinput_event_pointer_get_dy(pe);
+            const double dxu = libinput_event_pointer_get_dx_unaccelerated(pe);
+            const double dyu = libinput_event_pointer_get_dy_unaccelerated(pe);
             // Clamp against the multi-output union by closest-point
             // projection. An empty layout leaves the cursor pinned (no
             // valid landing exists); this normally only happens transiently
-            // during layout changes.
-            if (!outputs_.empty()) {
-                const ClampPoint p =
-                    closestPointInUnion(outputs_, cursorX_ + dx, cursorY_ + dy);
-                cursorX_ = p.x;
-                cursorY_ = p.y;
+            // during layout changes. While the pointer is locked the
+            // accumulator is frozen (the cursor stays put); the deltas below
+            // still flow so zwp_relative_pointer_v1 reports the motion.
+            if (!pointerLocked_) {
+                // Confined pointers clamp to the confine rects; otherwise to the
+                // output union. Both via closest-point projection.
+                const std::vector<OutputRect>& bounds =
+                    confineRects_.empty() ? outputs_ : confineRects_;
+                if (!bounds.empty()) {
+                    const ClampPoint p = closestPointInUnion(bounds, cursorX_ + dx, cursorY_ + dy);
+                    cursorX_ = p.x;
+                    cursorY_ = p.y;
+                }
             }
 
             InputEvent e{};
@@ -222,6 +231,10 @@ void LibinputBackend::dispatchEvent(libinput_event* ev) {
             e.time = libinput_event_pointer_get_time(pe);
             e.x = cursorX_;
             e.y = cursorY_;
+            e.dx = dx;
+            e.dy = dy;
+            e.dxUnaccel = dxu;
+            e.dyUnaccel = dyu;
             sink_->onInputEvent(e);
             break;
         }

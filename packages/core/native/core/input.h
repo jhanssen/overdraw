@@ -49,6 +49,8 @@ enum class InputEventType : uint8_t {
     PointerMotion,
     PointerButton,
     PointerAxis,
+    PointerAxisSource,
+    PointerAxisStop,
     PointerFrame,
     KeyboardEnter,
     KeyboardLeave,
@@ -80,14 +82,27 @@ struct InputEvent {
     double x = 0.0;
     double y = 0.0;
 
+    // Relative pointer motion for PointerMotion, in logical (output-space)
+    // pixels. dx/dy are the accelerated delta the cursor actually moved by;
+    // dxUnaccel/dyUnaccel are libinput's unaccelerated deltas. Both are 0 for a
+    // backend with no relative source (the nested/host backend). Consumed by
+    // zwp_relative_pointer_v1.
+    double dx = 0.0;
+    double dy = 0.0;
+    double dxUnaccel = 0.0;
+    double dyUnaccel = 0.0;
+
     // PointerButton: Linux input-event-codes button (BTN_LEFT=0x110, ...).
     uint32_t    button = 0;
     ButtonState buttonState = ButtonState::Released;
 
-    // PointerAxis (scroll).
+    // PointerAxis (scroll) / PointerAxisStop (which axis stopped uses `axis`).
     AxisKind axis         = AxisKind::VerticalScroll;
     double   axisValue    = 0.0;  // continuous scroll amount, logical units
     int32_t  axisDiscrete = 0;    // discrete step count (wheel clicks), 0 if none
+    // PointerAxisSource: wl_pointer.axis_source enum (wheel/finger/continuous/
+    // wheel_tilt).
+    uint32_t axisSource   = 0;
 
     // KeyboardKey: RAW evdev keycode; state in buttonState.
     uint32_t key = 0;
@@ -141,6 +156,17 @@ class InputBackend {
     // is kept to satisfy the interface. Called whenever state.outputs
     // changes (add/remove/resize).
     virtual void setOutputLayout(const std::vector<OutputRect>& outputs) = 0;
+
+    // Freeze/unfreeze the cursor accumulator for an active pointer lock
+    // (zwp_locked_pointer_v1). While locked, the backend stops moving the
+    // cursor but still reports relative deltas (so zwp_relative_pointer_v1
+    // keeps firing). Default no-op (a backend with no cursor accumulator).
+    virtual void setPointerLocked(bool /*locked*/) {}
+
+    // Constrain the cursor to the union of these rects (global logical coords)
+    // for an active zwp_confined_pointer_v1. Empty = no confinement (clamp to
+    // the output union as usual). Default no-op.
+    virtual void setPointerConfine(const std::vector<OutputRect>& /*rects*/) {}
 };
 
 }  // namespace overdraw::core

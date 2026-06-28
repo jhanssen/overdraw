@@ -22,6 +22,8 @@ import { markWindowChanged } from "./window-changes.js";
 import type { FocusDriver } from "./focus-driver.js";
 import { hitTestSurfaceTree, type SurfaceHit } from "../surface-hit-test.js";
 import { popupOutputOrigin } from "./xdg_popup.js";
+import { dispatchRelativeMotion } from "./zwp_relative_pointer_manager_v1.js";
+import { isPointerLocked, notifyPointerFocus, notifyPointerMotion } from "./zwp_pointer_constraints_v1.js";
 
 // `bind` is a synthetic on-bind hook, not a protocol request.
 type SeatHandler = WlSeatHandler & { bind(resource: Resource): void };
@@ -216,6 +218,44 @@ export default function makeSeat(ctx: Ctx, driver: FocusDriver): SeatHandler {
   // client. Gate every frame on the resource's bound version.
   function pointerFrame(p: Resource): void {
     if (p.version >= 5) ctx.events.wl_pointer.send_frame(p);
+  }
+
+  // Pending wl_pointer axis frame. Axis sub-events (axis value/discrete,
+  // axis_source, axis_stop) accumulate here and flush on pointerFrame, emitted
+  // in spec order (axis_source first, then per-axis discrete -> value -> stop,
+  // then frame). Both the libinput backend and zwlr_virtual_pointer_v1 send an
+  // explicit pointerFrame after a scroll group, so a single flush closes it.
+  // Index 0 = vertical, 1 = horizontal.
+  let axisPending = false;
+  let axisSource: number | null = null;
+  let axisTime = 0;
+  const axisAcc = [
+    { value: 0, hasValue: false, discrete: 0, hasDiscrete: false, stop: false },
+    { value: 0, hasValue: false, discrete: 0, hasDiscrete: false, stop: false },
+  ];
+  function resetAxisAcc(): void {
+    axisPending = false; axisSource = null; axisTime = 0;
+    for (const a of axisAcc) {
+      a.value = 0; a.hasValue = false; a.discrete = 0; a.hasDiscrete = false; a.stop = false;
+    }
+  }
+  function flushAxis(): void {
+    if (!axisPending) return;
+    const target = ctx.state.seat?.focus;
+    if (target) {
+      for (const p of clientPointers(target.clientId)) {
+        if (p.destroyed) continue;
+        if (axisSource !== null && p.version >= 5) ctx.events.wl_pointer.send_axis_source(p, axisSource);
+        for (let a = 0; a < 2; a++) {
+          const d = axisAcc[a];
+          if (d.hasDiscrete && p.version >= 5) ctx.events.wl_pointer.send_axis_discrete(p, a, d.discrete);
+          if (d.hasValue) ctx.events.wl_pointer.send_axis(p, axisTime, a, d.value);
+          if (d.stop && p.version >= 5) ctx.events.wl_pointer.send_axis_stop(p, axisTime, a);
+        }
+        pointerFrame(p);
+      }
+    }
+    resetAxisAcc();
   }
 
   // Find the topmost surface under an output-space point. Searches the
@@ -605,6 +645,7 @@ export default function makeSeat(ctx: Ctx, driver: FocusDriver): SeatHandler {
           seat.focus = null;
         }
         if (!hit) {
+          notifyPointerFocus(ctx, null);
           if (prevPointerSurface !== null) {
             dispatchFocus("pointer-leave", undefined, null);
           }
@@ -627,13 +668,26 @@ export default function makeSeat(ctx: Ctx, driver: FocusDriver): SeatHandler {
         if (!seat.focus) {
           seat.focus = hit;
           sendEnter(hit, sx, sy);
-        } else {
+        } else if (!isPointerLocked(ctx)) {
+          // While the pointer is locked (zwp_locked_pointer_v1) the cursor is
+          // frozen; the client reads motion via zwp_relative_pointer_v1 below
+          // instead of wl_pointer.motion.
           for (const p of clientPointers(hit.clientId)) {
             if (p.destroyed) continue;
             ctx.events.wl_pointer.send_motion(p, ev.time, sx, sy);
             pointerFrame(p);
           }
         }
+        // zwp_relative_pointer_v1: deliver unaccelerated deltas to the focused
+        // client regardless of surface-local position. Real motion only (enter
+        // carries no delta).
+        if (ev.type === "pointerMotion") {
+          dispatchRelativeMotion(ctx, clientPointers(hit.clientId), ev);
+        }
+        // Pointer-constraints: track focus + (for region-gated locks) region
+        // entry so locks/confines activate on the right surface.
+        notifyPointerFocus(ctx, hit.surfaceId);
+        if (ev.type === "pointerMotion") notifyPointerMotion(ctx);
         // Focus dispatch only on surface change (coarse event), not per
         // motion within the same surface. Keyboard focus / activation
         // target the root toplevel, not the (possibly subsurface) hit.
@@ -644,6 +698,7 @@ export default function makeSeat(ctx: Ctx, driver: FocusDriver): SeatHandler {
       }
       case "pointerLeave": {
         const prev = seat.focus?.surfaceId ?? null;
+        notifyPointerFocus(ctx, null);
         if (seat.focus) { sendLeave(seat.focus); seat.focus = null; }
         if (prev !== null) {
           dispatchFocus("pointer-leave", undefined, null);
@@ -728,14 +783,29 @@ export default function makeSeat(ctx: Ctx, driver: FocusDriver): SeatHandler {
         break;
       }
       case "pointerAxis": {
-        if (!seat.focus) return;
-        // wl_pointer.axis: 0 = vertical, 1 = horizontal (matches ev.horizontal).
-        const axis = ev.horizontal ? 1 : 0;
-        for (const p of clientPointers(seat.focus.clientId)) {
-          if (p.destroyed) continue;
-          ctx.events.wl_pointer.send_axis(p, ev.time, axis, ev.value ?? 0);
-          pointerFrame(p);
-        }
+        // Accumulate into the pending frame; flushed on pointerFrame so
+        // axis_source/discrete/value/stop emit in spec order within one frame.
+        const a = ev.horizontal ? 1 : 0;
+        axisPending = true;
+        axisTime = ev.time ?? axisTime;
+        if (ev.value !== undefined) { axisAcc[a].value += ev.value; axisAcc[a].hasValue = true; }
+        if (ev.discrete) { axisAcc[a].discrete += ev.discrete; axisAcc[a].hasDiscrete = true; }
+        break;
+      }
+      case "pointerAxisSource": {
+        axisPending = true;
+        axisSource = ev.axisSource ?? null;
+        break;
+      }
+      case "pointerAxisStop": {
+        const a = ev.horizontal ? 1 : 0;
+        axisPending = true;
+        axisTime = ev.time ?? axisTime;
+        axisAcc[a].stop = true;
+        break;
+      }
+      case "pointerFrame": {
+        flushAxis();
         break;
       }
       case "keyboardKey": {

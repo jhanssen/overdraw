@@ -12,13 +12,23 @@
 // across the output union (single global cursor; the output hint is accepted but
 // not used for a per-output mapping).
 //
-// Protocol-error post is not wired in this compositor (see the
-// zwlr_layer_shell_v1 header); invalid_axis / invalid_axis_source are
-// silent-dropped.
+// invalid_axis / invalid_axis_source are posted (via ctx.addon.postError) when
+// an axis/axis_source enum is out of range.
 
 import type { ZwlrVirtualPointerManagerV1Handler } from "#protocols-gen/zwlr_virtual_pointer_manager_v1.js";
 import type { ZwlrVirtualPointerV1Handler } from "#protocols-gen/zwlr_virtual_pointer_v1.js";
+import { ZwlrVirtualPointerV1_Error } from "#protocols-gen/zwlr_virtual_pointer_v1.js";
 import type { Ctx } from "./ctx.js";
+import type { Resource } from "../types.js";
+import { resolveOutputArg } from "./output-resolve.js";
+
+// wl_pointer.axis: vertical_scroll(0) / horizontal_scroll(1). Anything else is
+// a protocol error.
+function validAxis(ctx: Ctx, resource: Resource, axis: number): boolean {
+  if (axis === 0 || axis === 1) return true;
+  ctx.addon.postError(resource, ZwlrVirtualPointerV1_Error.invalid_axis, "invalid axis");
+  return false;
+}
 
 // Bounding box of all known outputs in logical (output-space) coords, or null
 // when none are known (GPU-free harness) -- in which case motion is left
@@ -47,14 +57,30 @@ function clampToOutputs(ctx: Ctx, x: number, y: number): { x: number; y: number 
   };
 }
 
-export default function makeVirtualPointerManager(_ctx: Ctx): ZwlrVirtualPointerManagerV1Handler {
+// Logical rect of a single output by id, or null if unknown.
+function outputRectById(ctx: Ctx, id: number): { x: number; y: number; w: number; h: number } | null {
+  const o = ctx.state.outputs?.get(id);
+  if (!o) return null;
+  return { x: o.logicalPosition.x, y: o.logicalPosition.y, w: o.logicalSize.width, h: o.logicalSize.height };
+}
+
+// The rect motion_absolute maps into for this virtual pointer: the output it was
+// created with (create_virtual_pointer_with_output), else the whole union.
+function absoluteRect(ctx: Ctx, resource: Resource): { x: number; y: number; w: number; h: number } | null {
+  const outId = resource.__vpOutputId as number | null | undefined;
+  if (outId != null) return outputRectById(ctx, outId);
+  return outputBounds(ctx);
+}
+
+export default function makeVirtualPointerManager(ctx: Ctx): ZwlrVirtualPointerManagerV1Handler {
   return {
-    create_virtual_pointer(_resource, _seat, _id) {
-      // The new zwlr_virtual_pointer_v1 resource dispatches to the child handler
-      // below by interface; no per-object state is needed.
+    create_virtual_pointer(_resource, _seat, id) {
+      id.__vpOutputId = null;  // no output association -> motion_absolute uses the union
     },
-    create_virtual_pointer_with_output(_resource, _seat, _output, _id) {
-      // Output hint accepted but unused (single global cursor).
+    create_virtual_pointer_with_output(_resource, _seat, output, id) {
+      // Associate the pointer with the given output so motion_absolute maps into
+      // that output's rect. A null output means "no association" (union).
+      id.__vpOutputId = output ? resolveOutputArg(ctx.state, output) : null;
     },
     destroy(_resource) {
       // Destroying the manager does not affect created virtual pointers.
@@ -70,9 +96,9 @@ export function makeVirtualPointer(ctx: Ctx): ZwlrVirtualPointerV1Handler {
       const t = clampToOutputs(ctx, p.x + dx, p.y + dy);
       inject({ type: "pointerMotion", serial: 0, time, x: t.x, y: t.y });
     },
-    motion_absolute(_resource, time, x, y, x_extent, y_extent) {
+    motion_absolute(resource, time, x, y, x_extent, y_extent) {
       if (x_extent === 0 || y_extent === 0) return;
-      const b = outputBounds(ctx);
+      const b = absoluteRect(ctx, resource);
       const tx = b ? b.x + (x / x_extent) * b.w : x;
       const ty = b ? b.y + (y / y_extent) * b.h : y;
       inject({ type: "pointerMotion", serial: 0, time, x: tx, y: ty });
@@ -80,20 +106,29 @@ export function makeVirtualPointer(ctx: Ctx): ZwlrVirtualPointerV1Handler {
     button(_resource, time, button, state) {
       inject({ type: "pointerButton", serial: 0, time, button, pressed: state === 1 });
     },
-    axis(_resource, time, axis, value) {
+    axis(resource, time, axis, value) {
+      if (!validAxis(ctx, resource, axis)) return;
       inject({ type: "pointerAxis", serial: 0, time, horizontal: axis === 1, value });
     },
-    axis_discrete(_resource, time, axis, value, discrete) {
+    axis_discrete(resource, time, axis, value, discrete) {
+      if (!validAxis(ctx, resource, axis)) return;
       inject({ type: "pointerAxis", serial: 0, time, horizontal: axis === 1, value, discrete });
     },
     frame(_resource) {
       inject({ type: "pointerFrame", serial: 0, time: 0 });
     },
-    axis_source(_resource, _axisSource) {
-      // The normalized InputEvent has no axis-source field; no-op.
+    axis_source(resource, axis_source) {
+      // wl_pointer.axis_source: wheel(0)/finger(1)/continuous(2)/wheel_tilt(3).
+      if (axis_source > 3) {
+        ctx.addon.postError(resource, ZwlrVirtualPointerV1_Error.invalid_axis_source,
+          "invalid axis_source");
+        return;
+      }
+      inject({ type: "pointerAxisSource", serial: 0, time: 0, axisSource: axis_source });
     },
-    axis_stop(_resource, _time, _axis) {
-      // No axis-stop in the normalized InputEvent model; no-op.
+    axis_stop(resource, time, axis) {
+      if (!validAxis(ctx, resource, axis)) return;
+      inject({ type: "pointerAxisStop", serial: 0, time, horizontal: axis === 1 });
     },
     destroy(_resource) {
       // No per-object state to release.

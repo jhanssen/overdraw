@@ -70,6 +70,8 @@ const GLOBALS = [
   "zwlr_output_manager_v1",
   "zwlr_virtual_pointer_manager_v1",
   "zwp_virtual_keyboard_manager_v1",
+  "zwp_relative_pointer_manager_v1",
+  "zwp_pointer_constraints_v1",
   "ext_workspace_manager_v1",
   "xwayland_shell_v1",
   "ext_data_control_manager_v1",
@@ -108,6 +110,9 @@ const CHILD_INTERFACES = [
   "zwlr_output_configuration_head_v1",
   "zwlr_virtual_pointer_v1",
   "zwp_virtual_keyboard_v1",
+  "zwp_relative_pointer_v1",
+  "zwp_locked_pointer_v1",
+  "zwp_confined_pointer_v1",
   "ext_workspace_group_handle_v1",
   "ext_workspace_handle_v1",
   "xwayland_surface_v1",
@@ -766,6 +771,8 @@ export async function installProtocols(
     zwlr_output_manager_v1: await import("./zwlr_output_manager_v1.js"),
     zwlr_virtual_pointer_manager_v1: await import("./zwlr_virtual_pointer_manager_v1.js"),
     zwp_virtual_keyboard_manager_v1: await import("./zwp_virtual_keyboard_manager_v1.js"),
+    zwp_relative_pointer_manager_v1: await import("./zwp_relative_pointer_manager_v1.js"),
+    zwp_pointer_constraints_v1: await import("./zwp_pointer_constraints_v1.js"),
     ext_workspace_manager_v1: await import("./ext_workspace_v1.js"),
     xwayland_shell_v1: await import("./xwayland_shell_v1.js"),
     ext_data_control_manager_v1: await import("./ext_data_control_v1.js"),
@@ -794,6 +801,8 @@ export async function installProtocols(
   const outputMgmtMod = await import("./zwlr_output_manager_v1.js");
   const virtualPointerMod = await import("./zwlr_virtual_pointer_manager_v1.js");
   const virtualKeyboardMod = await import("./zwp_virtual_keyboard_manager_v1.js");
+  const relativePointerMod = await import("./zwp_relative_pointer_manager_v1.js");
+  const pointerConstraintsMod = await import("./zwp_pointer_constraints_v1.js");
   const extWorkspaceMod = await import("./ext_workspace_v1.js");
   const xwlShellMod = await import("./xwayland_shell_v1.js");
   const extDataControlMod = await import("./ext_data_control_v1.js");
@@ -829,6 +838,9 @@ export async function installProtocols(
     zwlr_output_configuration_head_v1: outputMgmtMod.makeOutputConfigurationHead(ctx),
     zwlr_virtual_pointer_v1: virtualPointerMod.makeVirtualPointer(ctx),
     zwp_virtual_keyboard_v1: virtualKeyboardMod.makeVirtualKeyboard(ctx),
+    zwp_relative_pointer_v1: relativePointerMod.makeRelativePointer(ctx),
+    zwp_locked_pointer_v1: pointerConstraintsMod.makeLockedPointer(ctx),
+    zwp_confined_pointer_v1: pointerConstraintsMod.makeConfinedPointer(ctx),
     ext_workspace_group_handle_v1: extWorkspaceMod.makeExtWorkspaceGroupHandle(ctx),
     ext_workspace_handle_v1: extWorkspaceMod.makeExtWorkspaceHandle(ctx),
     xwayland_surface_v1: xwlShellMod.makeXwaylandSurface(ctx),

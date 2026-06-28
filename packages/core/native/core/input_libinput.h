@@ -72,6 +72,10 @@ class LibinputBackend : public InputBackend {
     // a valid starting invariant.
     void setOutputLayout(const std::vector<OutputRect>& outputs) override;
 
+    void setPointerLocked(bool locked) override { pointerLocked_ = locked; }
+
+    void setPointerConfine(const std::vector<OutputRect>& rects) override { confineRects_ = rects; }
+
     const std::string& error() const { return error_; }
 
   private:
@@ -93,6 +97,14 @@ class LibinputBackend : public InputBackend {
     // Cursor position accumulator (global logical pixels).
     double       cursorX_ = 0.0;
     double       cursorY_ = 0.0;
+
+    // While true (an active zwp_locked_pointer_v1), the accumulator is frozen:
+    // motion events still carry relative deltas but the cursor does not move.
+    bool         pointerLocked_ = false;
+
+    // Non-empty for an active zwp_confined_pointer_v1: the cursor is clamped to
+    // the union of these rects instead of the full output union.
+    std::vector<OutputRect> confineRects_;
 
     struct udev*     udev_ = nullptr;
     struct libinput* li_   = nullptr;

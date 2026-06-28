@@ -342,6 +342,15 @@ export interface Addon {
   // but the GPU-process host-seat listener, which needs a real device).
   injectHostInput(event: InputEvent): boolean;
 
+  // Freeze/unfreeze the input backend's cursor accumulator for an active
+  // zwp_locked_pointer_v1: while locked the cursor stays put but relative
+  // deltas keep flowing. No-op on a backend with no accumulator (nested).
+  setPointerLocked(locked: boolean): void;
+
+  // Constrain the cursor to the union of these rects (global logical coords)
+  // for an active zwp_confined_pointer_v1. Empty clears confinement.
+  setPointerConfine(rects: ReadonlyArray<{ x: number; y: number; w: number; h: number }>): void;
+
   // shm pools. The pool fd is a WaylandFd; native takes the raw fd out of it.
   shmCreatePool(fd: WaylandFd, size: number): number;
   shmResizePool(poolId: number, size: number): void;
@@ -472,17 +481,27 @@ export interface OutputDescriptor {
 export interface InputEvent {
   type:
     | "pointerEnter" | "pointerLeave" | "pointerMotion" | "pointerButton"
-    | "pointerAxis" | "pointerFrame"
+    | "pointerAxis" | "pointerAxisSource" | "pointerAxisStop" | "pointerFrame"
     | "keyboardEnter" | "keyboardLeave" | "keyboardKey" | "keyboardModifiers";
   serial: number;
   time: number;
   x?: number;
   y?: number;
+  // Relative pointer motion (logical pixels), present on pointerMotion from the
+  // libinput backend. dx/dy accelerated; dxUnaccel/dyUnaccel unaccelerated.
+  // Consumed by zwp_relative_pointer_v1. Absent (0) on the nested backend.
+  dx?: number;
+  dy?: number;
+  dxUnaccel?: number;
+  dyUnaccel?: number;
   button?: number;
   pressed?: boolean;
   horizontal?: boolean;
   value?: number;
   discrete?: number;
+  // pointerAxisSource: wl_pointer.axis_source enum (wheel/finger/continuous/
+  // wheel_tilt).
+  axisSource?: number;
   key?: number;
   modsDepressed?: number;
   modsLatched?: number;
