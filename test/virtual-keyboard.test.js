@@ -1,7 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 
-import makeVirtualKeyboardManager, { makeVirtualKeyboard }
+import makeVirtualKeyboardManager, { makeVirtualKeyboard, releaseDeadVirtualKeyboards }
   from "../packages/core/dist/protocols/zwp_virtual_keyboard_manager_v1.js";
 
 function mkCtx() {
@@ -81,5 +81,47 @@ test("keymap: a throwing close does not propagate", () => {
 test("manager: create_virtual_keyboard does not throw or inject", () => {
   const { ctx, injected } = mkCtx();
   makeVirtualKeyboardManager(ctx).create_virtual_keyboard({}, {}, {});
+  assert.equal(injected.length, 0);
+});
+
+// A device registered via the manager (so it tracks held keys), with a keymap.
+function liveKeyboard(ctx) {
+  const vk = {};
+  makeVirtualKeyboardManager(ctx).create_virtual_keyboard({}, {}, vk);
+  makeVirtualKeyboard(ctx).keymap(vk, 1, okFd(), 1);
+  return vk;
+}
+
+test("destroy releases keys the device still holds (no stuck modifier)", () => {
+  const { ctx, injected } = mkCtx();
+  const h = makeVirtualKeyboard(ctx);
+  const vk = liveKeyboard(ctx);
+  h.key(vk, 1, 29, 1);     // KEY_LEFTCTRL down
+  injected.length = 0;
+  h.destroy(vk);
+  assert.deepEqual(injected, [{ type: "keyboardKey", serial: 0, time: 0, key: 29, pressed: false }]);
+});
+
+test("a released key is not released again on destroy", () => {
+  const { ctx, injected } = mkCtx();
+  const h = makeVirtualKeyboard(ctx);
+  const vk = liveKeyboard(ctx);
+  h.key(vk, 1, 29, 1);     // down
+  h.key(vk, 2, 29, 0);     // up (clean)
+  injected.length = 0;
+  h.destroy(vk);
+  assert.equal(injected.length, 0);
+});
+
+test("releaseDeadVirtualKeyboards releases a dead device's held keys, once", () => {
+  const { ctx, injected } = mkCtx();
+  const vk = liveKeyboard(ctx);
+  makeVirtualKeyboard(ctx).key(vk, 1, 29, 1);   // Ctrl down
+  vk.destroyed = true;                          // client died without destroy
+  injected.length = 0;
+  releaseDeadVirtualKeyboards(ctx);
+  assert.deepEqual(injected, [{ type: "keyboardKey", serial: 0, time: 0, key: 29, pressed: false }]);
+  injected.length = 0;
+  releaseDeadVirtualKeyboards(ctx);             // already swept -> no-op
   assert.equal(injected.length, 0);
 });

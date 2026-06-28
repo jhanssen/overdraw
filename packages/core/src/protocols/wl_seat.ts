@@ -24,6 +24,7 @@ import { hitTestSurfaceTree, type SurfaceHit } from "../surface-hit-test.js";
 import { popupOutputOrigin } from "./xdg_popup.js";
 import { dispatchRelativeMotion } from "./zwp_relative_pointer_manager_v1.js";
 import { isPointerLocked, notifyPointerFocus, notifyPointerMotion } from "./zwp_pointer_constraints_v1.js";
+import { releaseDeadVirtualKeyboards } from "./zwp_virtual_keyboard_manager_v1.js";
 
 // `bind` is a synthetic on-bind hook, not a protocol request.
 type SeatHandler = WlSeatHandler & { bind(resource: Resource): void };
@@ -809,6 +810,11 @@ export default function makeSeat(ctx: Ctx, driver: FocusDriver): SeatHandler {
         break;
       }
       case "keyboardKey": {
+        // Before processing a (real) key, release any keys still held by a
+        // virtual keyboard whose client died -- otherwise a stuck modifier
+        // (e.g. Ctrl from a killed lan-mouse) poisons this keystroke. Cheap: a
+        // no-op unless a dead virtual keyboard is registered.
+        releaseDeadVirtualKeyboards(ctx);
         // Always feed xkb state, even when no client is focused: the chain
         // consults modifier state to match bindings, and xkb's mod state
         // must track every keystroke regardless of where it goes.
@@ -951,6 +957,9 @@ export default function makeSeat(ctx: Ctx, driver: FocusDriver): SeatHandler {
     },
     sweepDestroyed() {
       if (!seat0) return;
+      // Release keys held by a virtual keyboard whose client disconnected
+      // without lifting them, so a stuck modifier doesn't poison real input.
+      releaseDeadVirtualKeyboards(ctx);
       sweepDestroyedSeatState(seat0, pointersByClient, keyboardsByClient);
     },
   };

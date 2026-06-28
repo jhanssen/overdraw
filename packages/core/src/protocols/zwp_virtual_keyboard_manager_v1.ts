@@ -22,12 +22,54 @@ import type { ZwpVirtualKeyboardManagerV1Handler } from "#protocols-gen/zwp_virt
 import type { ZwpVirtualKeyboardV1Handler } from "#protocols-gen/zwp_virtual_keyboard_v1.js";
 import { ZwpVirtualKeyboardV1_Error } from "#protocols-gen/zwp_virtual_keyboard_v1.js";
 import type { Ctx } from "./ctx.js";
+import type { Resource } from "../types.js";
 
-export default function makeVirtualKeyboardManager(_ctx: Ctx): ZwpVirtualKeyboardManagerV1Handler {
+// Live virtual keyboards per ctx, so a device's still-held keys can be released
+// if it is destroyed or its client disconnects without lifting them (otherwise a
+// stuck modifier -- e.g. Ctrl -- poisons the shared xkb state and corrupts real
+// keyboard input). Each device tracks its pressed evdev keycodes on
+// `resource.__pressedKeys`.
+const registries = new WeakMap<Ctx, Set<Resource>>();
+function vks(ctx: Ctx): Set<Resource> {
+  let s = registries.get(ctx);
+  if (!s) { s = new Set(); registries.set(ctx, s); }
+  return s;
+}
+
+// Inject a key-up for every key the device still holds, so the seat's xkb state
+// (and any focused client) releases them. Snapshots + clears the held set BEFORE
+// injecting, because injectInput re-enters the seat (and this function) -- doing
+// it first makes the re-entrant pass a no-op instead of recursing.
+function releaseHeldKeys(ctx: Ctx, vk: Resource): void {
+  const held = vk.__pressedKeys as Set<number> | undefined;
+  if (!held || held.size === 0) return;
+  const keys = [...held];
+  held.clear();
+  for (const key of keys) {
+    ctx.addon.injectInput({ type: "keyboardKey", serial: 0, time: 0, key, pressed: false });
+  }
+}
+
+// Release the held keys of any virtual keyboard whose client died without a
+// clean destroy, then drop it. Called both from the seat's per-frame disconnect
+// sweep and at the start of real key handling (so a stuck modifier is cleared
+// before the next physical keystroke even if no frame ran in between). Removes
+// the device from the set BEFORE releasing so the re-entrant injection is a
+// no-op.
+export function releaseDeadVirtualKeyboards(ctx: Ctx): void {
+  const set = vks(ctx);
+  for (const vk of [...set]) {
+    if (!vk.destroyed) continue;
+    set.delete(vk);
+    releaseHeldKeys(ctx, vk);
+  }
+}
+
+export default function makeVirtualKeyboardManager(ctx: Ctx): ZwpVirtualKeyboardManagerV1Handler {
   return {
-    create_virtual_keyboard(_resource, _seat, _id) {
-      // The new zwp_virtual_keyboard_v1 resource dispatches to the child handler
-      // below by interface; no per-object state is needed.
+    create_virtual_keyboard(_resource, _seat, id) {
+      id.__pressedKeys = new Set<number>();
+      vks(ctx).add(id);
     },
   };
 }
@@ -47,6 +89,9 @@ export function makeVirtualKeyboard(ctx: Ctx): ZwpVirtualKeyboardV1Handler {
           "key sent before keymap");
         return;
       }
+      // Track held keys so they can be released if the device dies mid-press.
+      const held = resource.__pressedKeys as Set<number> | undefined;
+      if (held) { if (state === 1) held.add(key); else held.delete(key); }
       ctx.addon.injectInput({ type: "keyboardKey", serial: 0, time, key, pressed: state === 1 });
     },
     modifiers(resource, mods_depressed, mods_latched, mods_locked, group) {
@@ -61,8 +106,10 @@ export function makeVirtualKeyboard(ctx: Ctx): ZwpVirtualKeyboardV1Handler {
         modsLocked: mods_locked, group,
       });
     },
-    destroy(_resource) {
-      // No per-object state to release.
+    destroy(resource) {
+      // Release any keys still held, then drop the device.
+      releaseHeldKeys(ctx, resource);
+      vks(ctx).delete(resource);
     },
   };
 }
