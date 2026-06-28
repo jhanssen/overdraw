@@ -86,13 +86,13 @@ function fallback(state: CompositorState): OutputRecord {
     deviceSize: size,
     scale: 1,
     name: "overdraw-0",
-    description: "overdraw nested output",
+    description: "overdraw output",
     refreshMhz: 60000,
     transform: 0,
     physicalWidthMm: 0,
     physicalHeightMm: 0,
     make: "overdraw",
-    model: "overdraw nested output",
+    model: "overdraw output",
     edidId: "",
   };
 }

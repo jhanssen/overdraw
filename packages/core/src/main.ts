@@ -453,8 +453,11 @@ addon.setOnOutputDescriptor((d) => {
     // would mean the GPU process couldn't parse the EDID at all, not "the
     // identity changed"); otherwise leave the previous durable id intact.
     if (!rec.edidId) rec.edidId = d.edidId;
-    // description stays as set by installProtocols's seed; the descriptor
-    // doesn't carry one (xdg-output's description is overdraw-owned policy).
+    // Description: use the connector's model/name (same source as the
+    // secondary-output path) so xdg-output reports the real monitor on KMS
+    // rather than the generic seed. Keep the seed only when the descriptor
+    // carries neither.
+    if (d.model || d.name) rec.description = d.model || d.name;
     log.info("core",
       `output ${d.outputId}: ${device.width}x${device.height} device, `
       + `${logical.width}x${logical.height} logical @${formatRefreshHz(d.refreshMhz)} scale=${scale} `
