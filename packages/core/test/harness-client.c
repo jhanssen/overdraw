@@ -32,6 +32,11 @@ static struct wl_seat* seat = NULL;
 static struct wl_keyboard* keyboard = NULL;
 static struct wl_output* output = NULL;
 static struct wl_surface* g_surface = NULL;
+// The committed buffer + its size, so the --frames render loop can re-attach
+// and damage real content each frame (a genuine render loop -- an empty commit
+// produces no damage and so, correctly, no repaint/present).
+static struct wl_buffer* g_buffer = NULL;
+static int g_w = 0, g_h = 0;
 static int surface_configured = 0;
 static volatile sig_atomic_t running = 1;
 // --fill-configured: track the latest configured content size so the client can
@@ -123,6 +128,12 @@ static void requestFrame(void) {
     if (!g_surface) return;
     struct wl_callback* cb = wl_surface_frame(g_surface);
     wl_callback_add_listener(cb, &frameListener, NULL);
+    // Attach + damage real content each frame so the commit actually produces a
+    // repaint (a no-op commit correctly yields no present).
+    if (g_buffer) {
+        wl_surface_attach(g_surface, g_buffer, 0, 0);
+        wl_surface_damage(g_surface, 0, 0, g_w, g_h);
+    }
     wl_surface_commit(g_surface);
 }
 
@@ -266,6 +277,7 @@ int main(int argc, char** argv) {
     struct wl_buffer* buffer = make_solid_buffer(W, H, color);
     if (!buffer) return 1;
     int cur_w = W, cur_h = H;
+    g_buffer = buffer; g_w = W; g_h = H;
 
     wl_surface_attach(surface, buffer, 0, 0);
     wl_surface_damage(surface, 0, 0, W, H);
@@ -301,6 +313,7 @@ int main(int argc, char** argv) {
             struct wl_buffer* nb = make_solid_buffer(cfg_w, cfg_h, color);
             if (nb) {
                 cur_w = cfg_w; cur_h = cfg_h;
+                g_buffer = nb; g_w = cur_w; g_h = cur_h;
                 wl_surface_attach(surface, nb, 0, 0);
                 wl_surface_damage(surface, 0, 0, cur_w, cur_h);
                 wl_surface_commit(surface);

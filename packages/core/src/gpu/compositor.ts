@@ -1031,6 +1031,12 @@ export class JsCompositor implements CompositorSink {
   private headless: boolean;
   private format: GPUTextureFormat;
   private outputTex: GPUTexture | null = null;  // wrapped output texture, held during a frame
+  // Output damage for an shm fast-path commit, deferred until its async upload
+  // acks (keyed by uploadSeq). Damaging at commit time would repaint -- and
+  // sample -- the texture before the GPU process has written it. Drained in
+  // takeShmUploadAcks alongside the deferred wl_buffer.release.
+  private shmUploadDamage = new Map<number, { id: number;
+    damage: ReadonlyArray<{ x: number; y: number; width: number; height: number }> | null }>();
 
   // Composite-scissor damage in GLOBAL logical coords, partitioned per
   // output (one OutputDamageRing per output, each keyed by the stable
@@ -1721,7 +1727,13 @@ export class JsCompositor implements CompositorSink {
   // this each tick (in dispatchFrameCallbacks) and fires deferred releases.
   // No-op when the addon predates the fast-path API.
   takeShmUploadAcks(): number[] {
-    return this.addon.takeShmUploadAcks?.() ?? [];
+    const acks = this.addon.takeShmUploadAcks?.() ?? [];
+    // Apply each commit's deferred output damage now that its upload landed.
+    for (const seq of acks) {
+      const d = this.shmUploadDamage.get(seq);
+      if (d) { this.shmUploadDamage.delete(seq); this.damageSurfaceRegion(d.id, d.damage); }
+    }
+    return acks;
   }
 
   // Wire up a wgpu::Texture (already InjectTexture'd at the GPU process by
@@ -1788,6 +1800,10 @@ export class JsCompositor implements CompositorSink {
     if (sFinal) sFinal.present = true;
     this.imported.push({ id, width, height });
     this.bumpContentEpoch(id);
+    // Defer the output repaint to the upload ack (takeShmUploadAcks): the GPU
+    // process writes the texture asynchronously, so damaging now would render +
+    // sample it before it is initialized. Full surface on a texture (re)allocate.
+    this.shmUploadDamage.set(seq, { id, damage: needNewTex ? null : (damage ?? null) });
     return seq;
   }
 
