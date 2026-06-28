@@ -2,8 +2,8 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
     # Custom Dawn wire bundle (jhanssen/dawn): wire client + server, Vulkan
     # backend, built with DAWN_USE_WAYLAND=ON / DAWN_USE_X11=ON on GCC 15.
     # Ships libwebgpu_dawn.a + libwebgpu_dawn_wire.a and the Dawn CMake config.
-    set(DAWN_VERSION "v20260618-linux-wayland-wire-alpha4")
-    set(DAWN_COMMIT "3381166d6a4907cbc14bef685b8e50d1d1144da5")
+    set(DAWN_VERSION "v20260627-linux-wayland-wire-alpha")
+    set(DAWN_COMMIT "9d4cb21cc7b44c336290373bbbbda69349a7916e")
     set(DAWN_REPO "jhanssen/dawn")
     set(DAWN_PLATFORM "linux-x86_64-wayland")
     set(DAWN_LIB_DIR "lib")
