@@ -82,6 +82,8 @@ const DEFAULT_INPUTS = [
   join(repoRoot, 'protocols', 'wlr-layer-shell-unstable-v1.xml'),
   join(repoRoot, 'protocols', 'wlr-foreign-toplevel-management-unstable-v1.xml'),
   join(repoRoot, 'protocols', 'wlr-output-management-unstable-v1.xml'),
+  join(repoRoot, 'protocols', 'wlr-virtual-pointer-unstable-v1.xml'),
+  join(repoRoot, 'protocols', 'virtual-keyboard-unstable-v1.xml'),
   // KDE server-decoration (the older SSD-negotiation protocol that
   // pre-dates zxdg_decoration_manager_v1). GTK4 binds this one in
   // preference to the xdg variant, so a compositor that only
