@@ -262,11 +262,17 @@ export type WindowCommittedEvent = {
 // WM commits and what the first xdg_toplevel.configure reflects.
 //
 // `appId` and `title` may be null (the client may not have set them yet);
-// later changes arrive via window.change.
+// later changes arrive via window.change. For xwayland windows the manage
+// step is held until the WM_CLASS/title property reads land, so `appId`/
+// `title` reflect the real values here (not null) when the client set them.
+//
+// `xwayland` is true for X11 clients (appId is the WM_CLASS class), false for
+// native wayland toplevels. A window-rules plugin uses it to branch.
 export type WindowPreconfigureEvent = {
   surfaceId: number;
   appId: string | null;
   title: string | null;
+  xwayland: boolean;
   initialState: WindowState;
 };
 

@@ -59,6 +59,12 @@ test("xwm: an X11 window associates with its wl_surface and enters the WM",
       assert.ok(managed.length >= 1,
         `an X11 window should associate + enter the WM; saw: ${snapshot.join("; ") || "none"}`);
       assert.ok(managed[0].surfaceId !== null, "window is associated with a wl_surface");
+      // Manage gate: the window's identity reads (WM_CLASS / title) must land
+      // before it enters the WM, so window.preconfigure -- and any window-rules
+      // matching -- sees the real app_id pre-map, not a null placeholder. The
+      // test client always sets WM_CLASS to "x11-test-client".
+      assert.equal(managed[0].appId, "x11-test-client",
+        "WM_CLASS resolved before the X window entered the WM (pre-map identity)");
     } finally {
       if (child) child.kill("SIGKILL");
       if (xwm) xwm.stop();

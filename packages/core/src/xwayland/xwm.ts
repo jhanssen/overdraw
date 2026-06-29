@@ -133,7 +133,23 @@ export interface XWindow {
   // ...] tuples; we keep the parsed list so plugins can pick the size
   // they want. null until the property arrives (or absent).
   icons: NetWmIcon[] | null;
+  // Count of identity-bearing property reads (WM_CLASS + the title atoms)
+  // still outstanding from the associate-time batch. maybeManage holds the
+  // window out of the WM while this is > 0 so the window.preconfigure event
+  // (and thus any window-rules matching) sees the real app_id/title before
+  // the window maps, not a null placeholder. Decremented as each reply lands;
+  // when it hits 0 the deferred manage runs. GetProperty always replies (a
+  // missing property yields type=None), so this is bounded with no timer.
+  criticalReadsPending: number;
 }
+
+// Property atoms that carry a window's identity (app_id / title). maybeManage
+// waits for these before admitting the window so window-rules can match
+// pre-map. The others in the watched batch (size hints, transient-for, state)
+// continue to flow asynchronously and refine the window after it maps.
+const CRITICAL_ATOM_NAMES: ReadonlySet<string> = new Set([
+  "WM_CLASS", "_NET_WM_NAME", "WM_NAME",
+]);
 
 // One decoded _NET_WM_ICON entry. ARGB premultiplied, top-to-bottom,
 // left-to-right; pixels.length === width * height (32 bits each).
@@ -221,6 +237,7 @@ function newXWindow(window: number, x: number, y: number, w: number, h: number,
     netWmStateAtoms: new Set<number>(),
     startupId: null,
     icons: null,
+    criticalReadsPending: 0,
   };
 }
 
@@ -281,6 +298,8 @@ export function startXwm(state: CompositorState, addon: Addon, wmFd: number): Xw
   // windows.
   function maybeManage(w: XWindow): void {
     if (w.addedToWm || w.overrideRedirect || !w.mapped || w.surfaceId === null) return;
+    // Wait for the identity reads so preconfigure sees real app_id/title.
+    if (w.criticalReadsPending > 0) return;
     const surfRec = state.surfacesById?.get(w.surfaceId);
     if (!surfRec || !state.wm) return;
     // Pick a spawn output: under the pointer if known, else the primary.
@@ -343,11 +362,18 @@ export function startXwm(state: CompositorState, addon: Addon, wmFd: number): Xw
       const cookie = addon.xwmGetProperty(w.window, e.atom);
       pendingReads.set(cookie, { window: w.window, name: e.name });
     }
-    // The window may already be mapped; if so, try to manage or place it
-    // now (else wait for the map event). We do this AFTER firing the batch
-    // reads so markInitialCommitComplete sees the still-null title/appId
-    // only if no reply has come back yet -- and the subsequent
-    // property-replies will markWindowChanged to publish the real values.
+    // Hold the manage step until the identity reads (WM_CLASS + title) in this
+    // batch reply, so window.preconfigure carries the real app_id/title and
+    // window-rules can match before the window maps. Override-redirect windows
+    // skip the WM entirely, so they don't wait. The reply path decrements this
+    // and re-invokes maybeManage when it reaches 0.
+    if (!w.overrideRedirect) {
+      w.criticalReadsPending =
+        watched.filter((e) => CRITICAL_ATOM_NAMES.has(e.name)).length;
+    }
+    // The window may already be mapped; if so, try to manage or place it now
+    // (else wait for the map event). maybeManage no-ops while criticalReads-
+    // Pending > 0.
     if (w.overrideRedirect) placeOverlay(w);
     else maybeManage(w);
   }
@@ -357,7 +383,7 @@ export function startXwm(state: CompositorState, addon: Addon, wmFd: number): Xw
   // wl_surface.commit). Idempotent on re-call.
   function publishInitial(w: XWindow, _surfRec: SurfaceRecord): void {
     if (w.surfaceId === null || !state.wm) return;
-    state.wm.markInitialCommitComplete?.(w.surfaceId, { appId: w.appId, title: w.title });
+    state.wm.markInitialCommitComplete?.(w.surfaceId, { appId: w.appId, title: w.title, xwayland: true });
     sendStructuralProposals(w);
   }
 
@@ -609,6 +635,15 @@ export function startXwm(state: CompositorState, addon: Addon, wmFd: number): Xw
           data: ev.data ?? new Uint8Array(0),
         };
         const observableChanged = applyProperty(w, pend.name, reply);
+        // An identity read from the associate-time batch landed: if it clears
+        // the last outstanding one, the deferred manage can run now (with the
+        // real app_id/title visible to window.preconfigure). Guarded on > 0 so
+        // post-manage PropertyNotify re-reads of the same atoms don't underflow
+        // or re-trigger manage.
+        if (w.criticalReadsPending > 0 && CRITICAL_ATOM_NAMES.has(pend.name)) {
+          w.criticalReadsPending--;
+          if (w.criticalReadsPending === 0) maybeManage(w);
+        }
         if (observableChanged && w.addedToWm && w.surfaceId !== null) {
           // window.change ("title" / "appId") goes through the standard flush
           // (window-changes.ts), which calls back into titleAppId -- which

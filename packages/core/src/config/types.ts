@@ -19,6 +19,12 @@
 // Every field is optional; an absent config (or absent field) uses
 // defaults.
 
+// The window-state proposal a windowRules `apply` lambda may mutate. This is
+// the same WindowState the window.preconfigure event exposes to interceptors;
+// re-exported here so config authors can type their lambdas.
+import type { WindowState } from "../events/types.js";
+export type { WindowState } from "../events/types.js";
+
 // Per-output overrides keyed by the output's durable identifier. The key
 // is checked first against EDID (an OutputRecord whose `edidId` is
 // non-empty); if no entry matches, the connector name (e.g. "DP-1") is
@@ -161,6 +167,12 @@ export interface OverdrawConfig {
   // (shell parsing, like Hyprland's exec-once); `{ command, args }` execs
   // directly with no shell.
   autostart?: (string | { command: string; args?: string[] })[];
+  // Window rules: match windows by appId/title (regex) and apply pre-map
+  // policy (float, or an imperative lambda). Consumed by the bundled in-thread
+  // @overdraw/plugin-window-rules, which intercepts window.preconfigure so the
+  // rule applies BEFORE the window is mapped. Function references (predicate
+  // match / `apply`) survive because the plugin is in-thread.
+  windowRules?: WindowRule[];
 }
 
 // Handler signature for OverdrawConfig.actions entries.
@@ -169,6 +181,54 @@ export interface OverdrawConfig {
 // resolved by the action registry).
 export type ActionHandler =
   (sdk: unknown, params?: unknown) => unknown | Promise<unknown>;
+
+// Read-only view of a window at preconfigure (pre-map) time, passed to a
+// windowRules predicate or `apply` lambda. `appId` is the wayland app_id, or
+// the xwayland WM_CLASS class (the two are unified). Both `appId` and `title`
+// may be null when the client never set them.
+export interface WindowRuleQuery {
+  surfaceId: number;
+  appId: string | null;
+  title: string | null;
+  // True for xwayland (X11) clients, false for native wayland toplevels.
+  xwayland: boolean;
+}
+
+// Facade passed to a rule's `apply` lambda. The read fields mirror
+// WindowRuleQuery; `state` is the mutable pre-map proposal. Assign any field
+// of `state` (tiling, exclusive, visible, modal, constraints, parent,
+// layoutMode/layoutData) and it takes effect before the window is mapped (no
+// flicker). The compositor validates the result; an out-of-shape value is
+// ignored (the original state stands).
+//
+//   apply: (win) => {
+//     win.state.tiling = "floating";
+//     if (win.title?.includes("Picture-in-Picture")) win.state.exclusive = "none";
+//   }
+export interface WindowRuleTarget extends WindowRuleQuery {
+  state: WindowState;
+}
+
+// A rule's match clause: regex strings tested against the window's appId /
+// title (when both are present, BOTH must match), OR a predicate over the
+// window for arbitrary logic. Regex strings are passed to `new RegExp(...)`;
+// an invalid pattern fails at config load.
+export type WindowRuleMatch =
+  | { appId?: string; title?: string }
+  | ((win: WindowRuleQuery) => boolean);
+
+// One window rule. `match` selects windows; the remaining fields are applied
+// to each match in array order (later rules win per axis). At least one of the
+// action fields should be set for the rule to do anything.
+export interface WindowRule {
+  match: WindowRuleMatch;
+  // Known declarative action: force the window floating (true) or tiled
+  // (false) on map. Omit to leave the lane to the default policy.
+  float?: boolean;
+  // Imperative escape hatch: arbitrary JS run in-thread at preconfigure with a
+  // mutable window facade. Runs after the declarative fields above.
+  apply?: (win: WindowRuleTarget) => void;
+}
 
 // The config default export: an object, or a (sync/async) function returning one.
 export type ConfigExport =
@@ -240,6 +300,9 @@ export interface ResolvedConfig {
   // exec-once commands, normalized to direct command+args (bare strings become
   // `sh -c <string>`). Spawned detached at startup by main.ts.
   autostart: { command: string; args: string[] }[];
+  // Window rules, verbatim from the user config (function refs preserved for
+  // the in-thread plugin). Empty array when none declared.
+  windowRules: WindowRule[];
   // Absolute path of the config file that was loaded, or null if none was found
   // (built-in defaults in effect).
   sourcePath: string | null;

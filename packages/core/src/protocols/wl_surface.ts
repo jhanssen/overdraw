@@ -661,7 +661,7 @@ export default function makeSurface(ctx: Ctx): WlSurfaceHandler {
         const appId = t?.appId ?? null;
         const title = t?.title ?? null;
         const outputId = s.spawnOutputId ?? OUTPUT_DEFAULT;
-        void ctx.state.wm?.markInitialCommitComplete(s.id, { appId, title, outputId });
+        void ctx.state.wm?.markInitialCommitComplete(s.id, { appId, title, xwayland: false, outputId });
       } else if (xs?.toplevel) {
         // A non-initial commit: the client re-rendered, which may satisfy a
         // held resize (it has acked the size the WM asked for). Pass the

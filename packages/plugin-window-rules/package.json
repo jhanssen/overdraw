@@ -1,0 +1,13 @@
+{
+  "name": "@overdraw/plugin-window-rules",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Bundled plugin: matches windows by appId/title (regex) and applies pre-map policy (float, or a user lambda) by intercepting window.preconfigure. In-thread so predicate/apply function references in the user config survive.",
+  "type": "module",
+  "main": "./dist/index.js",
+  "exports": {
+    ".": {
+      "default": "./dist/index.js"
+    }
+  }
+}

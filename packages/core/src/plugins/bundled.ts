@@ -116,6 +116,16 @@ export const BUNDLED_PLUGINS: ReadonlyArray<BundledPluginSpec> = [
     configFrom: (config) => config.actions,
   },
   {
+    // Window rules. In-thread (so predicate/apply lambdas in the user config
+    // survive) and intercepts window.preconfigure, applying float / imperative
+    // policy by appId/title regex BEFORE the window maps. Load order is
+    // immaterial -- nothing else intercepts preconfigure, and the event fires
+    // at runtime, long after every bundled plugin has registered.
+    name: "window-rules",
+    module: "@overdraw/plugin-window-rules",
+    configFrom: (config) => config.windowRules,
+  },
+  {
     // Loads LAST so any action it might bind (compositor.quit,
     // workspace.show, user.*, etc.) is already registered. The hotkey
     // plugin never needs other plugins' namespaces at init time, but

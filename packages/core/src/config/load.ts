@@ -20,7 +20,7 @@ import { pathToFileURL } from "node:url";
 
 import type {
   ConfigExport, OverdrawConfig, PluginConfig, ResolvedConfig, ResolvedPlugin,
-  RestartPolicy,
+  RestartPolicy, WindowRule,
 } from "./types.js";
 
 const CONFIG_EXTS = ["ts", "cts", "mts", "js", "cjs", "mjs"] as const;
@@ -249,9 +249,21 @@ function normalize(raw: unknown, path: string): ResolvedConfig {
     }
   }
 
+  // windowRules: structural array guarantee here; the bundled in-thread
+  // window-rules plugin owns the per-rule schema (regex compilation, match /
+  // float / apply shape) and validates each entry at init. Verbatim
+  // pass-through preserves the predicate / apply function references (the
+  // plugin is in-thread, so they survive).
+  let windowRules: WindowRule[] = [];
+  if (cfg.windowRules !== undefined) {
+    if (!Array.isArray(cfg.windowRules)) fail("`windowRules` must be an array", path);
+    windowRules = cfg.windowRules as WindowRule[];
+  }
+
   return {
     output, card, scale, outputsByKey,
     focus, hotkeys, decoration, layout, actions, plugins, xwayland, autostart,
+    windowRules,
     sourcePath: path,
   };
 }
@@ -267,6 +279,7 @@ export async function loadConfig(explicit: string | null): Promise<ResolvedConfi
       decoration: undefined, layout: undefined, actions: undefined, plugins: [],
       xwayland: { enabled: false, terminate: false, xwaylandPath: null, displayNumber: 50, scale: 0 },
       autostart: [],
+      windowRules: [],
       sourcePath: null,
     };
   }

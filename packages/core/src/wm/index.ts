@@ -298,7 +298,7 @@ export interface Wm {
   // handshake. Absent (e.g. xwayland) keeps the legacy first-content placement.
   markInitialCommitComplete(
     surfaceId: number,
-    info: { appId: string | null; title: string | null; outputId?: number },
+    info: { appId: string | null; title: string | null; xwayland?: boolean; outputId?: number },
   ): Promise<void>;
   // Synchronously send the throwaway 0x0 first configure (with the resolved
   // state array) so the xdg-shell handshake completes within the client's
@@ -2139,6 +2139,7 @@ export function createWm(
           const initial: WindowPreconfigureEvent = {
             surfaceId,
             appId: info.appId, title: info.title,
+            xwayland: info.xwayland ?? false,
             initialState: cloneState(win.windowState),
           };
           const finalPayload = await pluginBus.emit(WINDOW_EVENT.preconfigure, initial,

@@ -118,6 +118,34 @@ test('autostart: strings -> sh -c, objects -> direct, default empty, validation'
   rmSync(dir, { recursive: true, force: true });
 });
 
+test('windowRules: default empty, verbatim array passthrough (incl. functions), non-array rejected', async () => {
+  const dir = tmp();
+  let n = 0;
+  const write = (body) => {
+    const p = join(dir, `wr-${n++}.mjs`);
+    writeFileSync(p, body);
+    return p;
+  };
+  // absent -> []
+  let c = await loadConfig(write('export default {}'));
+  assert.deepEqual(c.windowRules, []);
+  // verbatim passthrough: object match + float, and a predicate/apply function
+  // survive (the plugin is in-thread, so refs are preserved through load).
+  c = await loadConfig(write(
+    'export default { windowRules: ['
+    + '{ match: { appId: "^Netflix$" }, float: true },'
+    + '{ match: (w) => w.xwayland, apply: (w) => w.float() } ] }'));
+  assert.equal(c.windowRules.length, 2);
+  assert.deepEqual(c.windowRules[0].match, { appId: '^Netflix$' });
+  assert.equal(c.windowRules[0].float, true);
+  assert.equal(typeof c.windowRules[1].match, 'function');
+  assert.equal(typeof c.windowRules[1].apply, 'function');
+  // invalid: not an array
+  await assert.rejects(() => loadConfig(write('export default { windowRules: {} }')),
+    /windowRules/);
+  rmSync(dir, { recursive: true, force: true });
+});
+
 test('output.scale: override, default, and validation', async () => {
   const dir = tmp();
   let n = 0;
