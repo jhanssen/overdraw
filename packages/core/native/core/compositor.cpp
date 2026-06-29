@@ -1312,6 +1312,17 @@ void Compositor::presentOutput(uint32_t outputId) {
     // SCM_RIGHTS path -- the GPU process owns it.
     writeProducerEndAccess(so.slots[slot].surfaceBufId);
 
+    // Drain the wire BEFORE the ScanoutPresent ctrl message. ScanoutPresent
+    // (the flip) rides ctrl; the slot's render commands and the producer
+    // EndAccess (the render-done fence the flip's IN_FENCE_FD depends on) ride
+    // the wire. With deferred wire pumping the wire bytes are only staged, so
+    // sending the ctrl flip first lets it overtake them across the two fds --
+    // the GPU process flips to a slot whose render/fence haven't arrived
+    // (tearing). Flushing here re-establishes "wire render+fence on the socket
+    // before the ctrl flip is sent", the ordering ScanoutPresent relies on (it
+    // is not WireBarrier-gated).
+    link_->flush();
+
     ipc::Message m{};
     m.tag = ipc::Tag::ScanoutPresent;
     m.outputId = outputId;
@@ -1322,7 +1333,6 @@ void Compositor::presentOutput(uint32_t outputId) {
     // FrameComplete arrives. (KMS doesn't need this -- the PENDING_FLIP
     // slot state is the equivalent and the kernel enforces it.)
     if (!kmsMode_) so.presentedThisCycle = true;
-    link_->flush();
 }
 
 void Compositor::renderFrame() {
