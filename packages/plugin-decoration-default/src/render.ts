@@ -12,12 +12,17 @@
 //
 //   Pass 2 (blit): sample the client input texture and write it into the
 //     INSET region of the output, starting at (B, B) and extending
-//     (inputW, inputH). Inside the inset region the fragment evaluates
-//     the INNER shape SDF (= outer shape radii inset by B) with
-//     antialiased coverage; pixels in the rounded-corner cutouts get
-//     coverage < 1 and show through (loadOp=load) to the border band
-//     painted by pass 1. This produces a uniformly thick rounded band
-//     between the outer and inner shapes.
+//     (inputW, inputH). The fragment evaluates the INNER shape SDF (= outer
+//     shape radii inset by B) for antialiased coverage AND the border gradient
+//     at the same output-space pixel, and emits mix(gradient, client, coverage)
+//     with REPLACE blend. Where the client fully covers (coverage 1) the output
+//     is the client sample with its own alpha intact -- so a translucent window
+//     stays translucent and blends against the real backdrop in the final
+//     composite, rather than being baked opaque over the gradient. Across the
+//     rounded inner edge it blends to the opaque border band; corner cutouts
+//     (coverage 0) are discarded, leaving pass 1's gradient. For an opaque
+//     client this is identical to a premultiplied source-over of the client
+//     onto the band.
 //
 // The blit shader contains all four shape kinds (rect, rounded-rect uniform,
 // rounded-rect per-corner, squircle) selected by a uniform `kind` value.
@@ -123,10 +128,52 @@ struct U {
   // For kind=2 (per-corner): (tl, tr, br, bl); for kind=3 (squircle):
   // (exponent, 0, 0, 0); otherwise unused.
   shapeExtra: vec4f,
+  // gradient: .x = cos(angle), .y = sin(angle); .z = stop count [1..8]. Same
+  // angular-gradient parameters the border pass uses, so the blit can evaluate
+  // the border color at each output-space pixel and blend it under the client.
+  gradient  : vec4f,
+  // 8 straight-RGBA color stops (premultiplied before use).
+  colors    : array<vec4f, 8>,
+  // 8 stop positions in [0,1], packed two-per-vec4.
+  ats0      : vec4f,
+  ats1      : vec4f,
 };
 @group(0) @binding(0) var<uniform> u : U;
 @group(0) @binding(1) var samp : sampler;
 @group(0) @binding(2) var tex  : texture_2d<f32>;
+
+fn fetchAt(i : u32) -> f32 {
+  if (i < 4u) { return u.ats0[i]; }
+  return u.ats1[i - 4u];
+}
+
+// Premultiplied border-gradient color at an OUTPUT-space pixel. Identical math
+// to the border pass (BORDER_WGSL.fs), evaluated over the full output extent so
+// the inset blends seamlessly into the band the border pass painted.
+fn gradientAt(fragPx : vec2f) -> vec4f {
+  let w = u.size.x;
+  let h = u.size.y;
+  let p = fragPx - vec2f(w, h) * 0.5;
+  let dir = vec2f(u.gradient.y, u.gradient.x);
+  let proj = dot(p, dir);
+  let halfRange = abs(dir.x) * w * 0.5 + abs(dir.y) * h * 0.5;
+  let t = clamp((proj + halfRange) / max(halfRange * 2.0, 1.0), 0.0, 1.0);
+  let n = u32(u.gradient.z);
+  if (n <= 1u) {
+    let c = u.colors[0];
+    return vec4f(c.rgb * c.a, c.a);
+  }
+  var k : u32 = 0u;
+  for (var i : u32 = 0u; i + 1u < n; i = i + 1u) {
+    if (t >= fetchAt(i)) { k = i; }
+  }
+  let a0 = fetchAt(k);
+  let a1 = fetchAt(k + 1u);
+  let span = max(a1 - a0, 1e-5);
+  let lt = clamp((t - a0) / span, 0.0, 1.0);
+  let col = mix(u.colors[k], u.colors[k + 1u], lt);
+  return vec4f(col.rgb * col.a, col.a);
+}
 
 struct VsOut {
   @builtin(position) pos : vec4f,
@@ -213,16 +260,22 @@ fn innerCoverage(ip : vec2f) -> f32 {
 
 @fragment fn fs(in : VsOut) -> @location(0) vec4f {
   let cov = innerCoverage(in.ip);
-  if (cov <= 0.0) { discard; }   // skip writes in the corner cutouts entirely
-  let sample = textureSample(tex, samp, in.uv);
-  // sample is premultiplied (the client wrote it that way); scale by coverage
-  // so corners blend smoothly into the band underneath.
-  return sample * cov;
+  if (cov <= 0.0) { discard; }   // corner cutouts keep the border pass's gradient
+  let sample = textureSample(tex, samp, in.uv);   // premultiplied client
+  let band = gradientAt(u.size.zw + in.ip);       // premultiplied border at this pixel
+  // Replace blend: emit the final pixel directly. mix preserves the client's
+  // own alpha where it fully covers (cov=1) -- so a translucent window stays
+  // translucent and blends against the real backdrop downstream instead of
+  // being baked opaque over the border -- and blends to the opaque border
+  // across the antialiased inner edge (cov: 1 -> 0). For an opaque client this
+  // is identical to a premultiplied source-over of (sample*cov) onto the band.
+  return mix(band, sample, cov);
 }
 `;
 
-// size (vec4) + inputSize (vec4) + shape (vec4) + shapeExtra (vec4) = 4 vec4s = 16 floats.
-const BLIT_UNIFORM_FLOATS = 4 * 4;
+// size + inputSize + shape + shapeExtra + gradient + colors[8] + ats0 + ats1
+// = 4 + 8 + 2 + 1 = 15 vec4s = 60 floats.
+const BLIT_UNIFORM_FLOATS = 15 * 4;
 const BLIT_UNIFORM_BYTES = BLIT_UNIFORM_FLOATS * 4;
 
 // ----- Pipelines + per-window state -----------------------------------------
@@ -278,18 +331,13 @@ export function createDecorationPipeline(device: GPUDevice): DecorationPipeline 
     vertex: { module: blitModule, entryPoint: "vs" },
     fragment: {
       module: blitModule, entryPoint: "fs",
-      targets: [{
-        format: "bgra8unorm",
-        // The blit is loadOp=load over the border pass output; corner cutouts
-        // already discarded. For pixels we DO write, the input is
-        // premultiplied (the client buffer is premultiplied bgra) so the
-        // standard premultiplied blend overwrites the band underneath
-        // wherever the client opaque sample lands.
-        blend: {
-          color: { srcFactor: "one", dstFactor: "one-minus-src-alpha", operation: "add" },
-          alpha: { srcFactor: "one", dstFactor: "one-minus-src-alpha", operation: "add" },
-        },
-      }],
+      // Replace blend (no blend state): the fragment already composes the
+      // client over the border gradient via mix(), emitting the final
+      // premultiplied pixel. This is what preserves a translucent client's
+      // alpha -- a source-over blend here would force the result opaque against
+      // the gradient. loadOp=load + discard on corner cutouts keeps the border
+      // pass's gradient wherever we don't write.
+      targets: [{ format: "bgra8unorm" }],
     },
     primitive: { topology: "triangle-strip" },
   });
@@ -391,6 +439,7 @@ export function writeBlitUniforms(
   inputW: number, inputH: number,
   borderWidth: number,
   inner: InnerShapeParams,
+  fill: ResolvedFill,
 ): void {
   const data = new Float32Array(BLIT_UNIFORM_FLOATS);
   // size.xy = output dims; size.zw = inset origin (B, B)
@@ -415,6 +464,24 @@ export function writeBlitUniforms(
   } else if (inner.kind === 3) {
     data[12] = inner.exponent ?? 2;
   }
+  // gradient (offset 16) + colors[8] (offset 20) + ats0/ats1 (offset 52): the
+  // border-pass gradient parameters, so the blit can evaluate the band color
+  // under the client. Mirrors writeBorderUniforms' packing.
+  data[16] = Math.cos(fill.angleRad);
+  data[17] = Math.sin(fill.angleRad);
+  data[18] = fill.stops.length;
+  const colorsBase = 20;
+  const N = Math.min(fill.stops.length, MAX_STOPS);
+  for (let i = 0; i < N; i++) {
+    const s = fill.stops[i];
+    const base = colorsBase + i * 4;
+    data[base] = s.color.r;
+    data[base + 1] = s.color.g;
+    data[base + 2] = s.color.b;
+    data[base + 3] = s.color.a;
+  }
+  const atsBase = colorsBase + MAX_STOPS * 4;
+  for (let i = 0; i < N; i++) data[atsBase + i] = fill.stops[i].at;
   device.queue.writeBuffer(d.blitUniform, 0, data);
 }
 

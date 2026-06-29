@@ -203,20 +203,24 @@ export default async function init(sdk: PluginSdk, rawConfig?: unknown): Promise
             return false;
           }
 
-          // Update border uniforms only when the output size or fill changes.
-          if (outputW !== w.lastOutputW || outputH !== w.lastOutputH || fill !== w.lastFill) {
+          // The blit uniforms now carry the border gradient + output size too,
+          // so they must be rewritten whenever the border inputs change, not
+          // only on an input-dim change.
+          const borderChanged = outputW !== w.lastOutputW || outputH !== w.lastOutputH
+            || fill !== w.lastFill;
+          const inputChanged = inputW !== w.lastInputW || inputH !== w.lastInputH;
+          if (borderChanged) {
             writeBorderUniforms(pipeline.device, w.draw, outputW, outputH, fill);
-            w.lastOutputW = outputW;
-            w.lastOutputH = outputH;
-            w.lastFill = fill;
           }
-          // Update blit uniforms only when input dims change.
-          if (inputW !== w.lastInputW || inputH !== w.lastInputH) {
+          if (borderChanged || inputChanged) {
             writeBlitUniforms(pipeline.device, w.draw,
-              outputW, outputH, inputW, inputH, B, innerParams);
-            w.lastInputW = inputW;
-            w.lastInputH = inputH;
+              outputW, outputH, inputW, inputH, B, innerParams, fill);
           }
+          w.lastOutputW = outputW;
+          w.lastOutputH = outputH;
+          w.lastFill = fill;
+          w.lastInputW = inputW;
+          w.lastInputH = inputH;
 
           encodeFrame(pipeline, w.draw, output.texture.createView(), input.texture);
 
