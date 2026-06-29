@@ -495,6 +495,27 @@ export default async function init(
     void applyEffects(r.sideEffects);
   });
 
+  // A client asked to go fullscreen on a specific output (xdg_toplevel
+  // .set_fullscreen with an output arg). Output placement is ours, so move the
+  // window to that output's shown workspace; the WM already flagged it
+  // exclusive=fullscreen and fullscreens it on whichever output it lands on.
+  sdk.events.subscribe("window.fullscreen-output-request", (_name, payload) => {
+    const p = payload as { surfaceId?: unknown; outputId?: unknown };
+    if (typeof p.surfaceId !== "number" || typeof p.outputId !== "number") return;
+    const outputId = p.outputId;
+    const shown = state.shownByOutput.get(outputId);
+    if (shown === undefined) return;
+    const index = (state.positionsByOutput.get(outputId) ?? []).indexOf(shown);
+    if (index < 0) return;
+    // moveWindow throws if the surface isn't tracked yet (request arrived before
+    // the map settled); ignore -- the window stays on its current output.
+    try {
+      const r = reg.moveWindow(state, p.surfaceId, asIndex(index), outputId, outputNameOf(outputId));
+      state = r.state;
+      void applyEffects(r.sideEffects);
+    } catch { /* untracked surface; leave it where it is */ }
+  });
+
   // ---- Actions -----------------------------------------------------------
   // Each handler validates its params (the trust boundary -- the IPC layer
   // doesn't validate against per-action schemas yet).

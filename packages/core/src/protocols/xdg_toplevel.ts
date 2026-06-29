@@ -15,6 +15,7 @@ import type { Ctx, ResizeEdges } from "./ctx.js";
 import type { Resource } from "../types.js";
 import { markWindowChanged } from "./window-changes.js";
 import { detachSurfaceRole } from "./wl_surface.js";
+import { resolveOutputArg } from "./output-resolve.js";
 
 const RESIZE_EDGE = toplevelSig.enums.resize_edge.entries;
 //   none=0 top=1 bottom=2 left=4 top_left=5 bottom_left=6
@@ -173,12 +174,17 @@ export default function makeToplevel(ctx: Ctx): XdgToplevelHandler {
       // doesn't leak into the tiling lane).
       propose(resource, { clientRequests: { wantsMaximized: false } });
     },
-    set_fullscreen(resource, _output) {
-      // `_output` is optional: when present, the client requests fullscreen
-      // on a specific output. Multi-output is not yet supported (wl_output
-      // is fabricated); ignore the hint and fullscreen on the single
-      // output.
+    set_fullscreen(resource, output) {
       propose(resource, { clientRequests: { wantsFullscreen: true } });
+      // Optional target output: ask the workspace plugin (which owns output
+      // placement) to move the window there. It's already exclusive=fullscreen,
+      // so the layout driver fullscreens it on whichever output it lands on.
+      if (output) {
+        const surfaceId = ctx.state.toplevels?.get(resource)?.xdgSurface.surface?.id;
+        const outputId = resolveOutputArg(ctx.state, output);
+        if (surfaceId !== undefined && ctx.state.pluginBus)
+          ctx.state.pluginBus.emit("window.fullscreen-output-request", { surfaceId, outputId });
+      }
     },
     unset_fullscreen(resource) {
       propose(resource, { clientRequests: { wantsFullscreen: false } });
