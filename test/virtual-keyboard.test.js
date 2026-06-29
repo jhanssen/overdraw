@@ -4,46 +4,53 @@ import assert from "node:assert/strict";
 import makeVirtualKeyboardManager, { makeVirtualKeyboard, releaseDeadVirtualKeyboards }
   from "../packages/core/dist/protocols/zwp_virtual_keyboard_manager_v1.js";
 
+// The mock addon hands out keymap ids from registerKeymap (so a device's keys
+// carry that id) and records unregisterKeymap calls.
 function mkCtx() {
   const injected = [];
   const errors = [];
+  const registered = [];      // {fd, size} per registerKeymap call
+  const unregistered = [];     // ids passed to unregisterKeymap
+  let nextId = 7;              // first id handed out (arbitrary, non-zero)
   const ctx = {
     addon: {
       injectInput: (ev) => injected.push(ev),
       postError: (res, code, msg) => errors.push({ res, code, msg }),
+      registerKeymap: (fd, size) => { registered.push({ fd, size }); return nextId++; },
+      unregisterKeymap: (id) => unregistered.push(id),
     },
     state: {},
   };
-  return { ctx, injected, errors };
+  return { ctx, injected, errors, registered, unregistered };
 }
 
 const okFd = () => ({ close() {}, dup() {} });
 
 // A keyboard that has already had its keymap set (the spec precondition for
-// key/modifiers).
+// key/modifiers). Its registered id is 7 (the first mkCtx hands out).
 function keyboardWithKeymap(ctx) {
   const kb = {};
   makeVirtualKeyboard(ctx).keymap(kb, 1, okFd(), 100);
   return kb;
 }
 
-test("key: state 1 -> pressed keyboardKey, 0 -> released (after keymap)", () => {
+test("key: state 1 -> pressed, 0 -> released, tagged with the device keymap id", () => {
   const { ctx, injected } = mkCtx();
   const vk = makeVirtualKeyboard(ctx);
   const kb = keyboardWithKeymap(ctx);
   vk.key(kb, 100, 30, 1);
   vk.key(kb, 101, 30, 0);
-  assert.deepEqual(injected[0], { type: "keyboardKey", serial: 0, time: 100, key: 30, pressed: true });
-  assert.deepEqual(injected[1], { type: "keyboardKey", serial: 0, time: 101, key: 30, pressed: false });
+  assert.deepEqual(injected[0], { type: "keyboardKey", serial: 0, time: 100, key: 30, pressed: true, keymapId: 7 });
+  assert.deepEqual(injected[1], { type: "keyboardKey", serial: 0, time: 101, key: 30, pressed: false, keymapId: 7 });
 });
 
-test("modifiers: forwarded as a keyboardModifiers event (after keymap)", () => {
+test("modifiers: forwarded as a keyboardModifiers event tagged with the keymap id", () => {
   const { ctx, injected } = mkCtx();
-  const kb = keyboardWithKeymap(ctx);
+  const kb = keyboardWithKeymap(ctx);   // keymap id 7
   makeVirtualKeyboard(ctx).modifiers(kb, 1, 2, 4, 0);
   assert.deepEqual(injected[0], {
     type: "keyboardModifiers", serial: 0, time: 0,
-    modsDepressed: 1, modsLatched: 2, modsLocked: 4, group: 0,
+    modsDepressed: 1, modsLatched: 2, modsLocked: 4, group: 0, keymapId: 7,
   });
 });
 
@@ -65,17 +72,27 @@ test("modifiers before keymap posts no_keymap", () => {
   assert.equal(errors[0].code, 0);
 });
 
-test("keymap: the supplied fd is closed", () => {
-  const { ctx } = mkCtx();
-  let closed = false;
-  makeVirtualKeyboard(ctx).keymap({}, 1, { close() { closed = true; }, dup() {} }, 1234);
-  assert.equal(closed, true);
+test("keymap: registers the client keymap and records its id on the device", () => {
+  const { ctx, registered } = mkCtx();
+  const kb = {};
+  const fd = okFd();
+  makeVirtualKeyboard(ctx).keymap(kb, 1, fd, 1234);
+  assert.equal(registered.length, 1);
+  assert.equal(registered[0].fd, fd);
+  assert.equal(registered[0].size, 1234);
+  assert.equal(kb.__keymapId, 7);
+  assert.equal(kb.__hasKeymap, true);
 });
 
-test("keymap: a throwing close does not propagate", () => {
-  const { ctx } = mkCtx();
-  assert.doesNotThrow(() =>
-    makeVirtualKeyboard(ctx).keymap({}, 1, { close() { throw new Error("taken"); }, dup() {} }, 0));
+test("keymap: re-keymap unregisters the previous keymap first", () => {
+  const { ctx, registered, unregistered } = mkCtx();
+  const h = makeVirtualKeyboard(ctx);
+  const kb = {};
+  h.keymap(kb, 1, okFd(), 1);   // id 7
+  h.keymap(kb, 1, okFd(), 1);   // id 8, after dropping 7
+  assert.deepEqual(unregistered, [7]);
+  assert.equal(kb.__keymapId, 8);
+  assert.equal(registered.length, 2);
 });
 
 test("manager: create_virtual_keyboard does not throw or inject", () => {
@@ -92,14 +109,17 @@ function liveKeyboard(ctx) {
   return vk;
 }
 
-test("destroy releases keys the device still holds (no stuck modifier)", () => {
-  const { ctx, injected } = mkCtx();
+test("destroy releases held keys (under the default keymap) and drops the keymap", () => {
+  const { ctx, injected, unregistered } = mkCtx();
   const h = makeVirtualKeyboard(ctx);
-  const vk = liveKeyboard(ctx);
-  h.key(vk, 1, 29, 1);     // KEY_LEFTCTRL down
+  const vk = liveKeyboard(ctx);   // keymap id 7
+  h.key(vk, 1, 29, 1);            // KEY_LEFTCTRL down (tagged keymapId 7)
   injected.length = 0;
   h.destroy(vk);
-  assert.deepEqual(injected, [{ type: "keyboardKey", serial: 0, time: 0, key: 29, pressed: false }]);
+  // The release is tagged keymapId 0: the device keymap is being torn down, so
+  // the lift goes through the default keymap.
+  assert.deepEqual(injected, [{ type: "keyboardKey", serial: 0, time: 0, key: 29, pressed: false, keymapId: 0 }]);
+  assert.deepEqual(unregistered, [7]);
 });
 
 test("a released key is not released again on destroy", () => {
@@ -113,15 +133,18 @@ test("a released key is not released again on destroy", () => {
   assert.equal(injected.length, 0);
 });
 
-test("releaseDeadVirtualKeyboards releases a dead device's held keys, once", () => {
-  const { ctx, injected } = mkCtx();
-  const vk = liveKeyboard(ctx);
-  makeVirtualKeyboard(ctx).key(vk, 1, 29, 1);   // Ctrl down
-  vk.destroyed = true;                          // client died without destroy
+test("releaseDeadVirtualKeyboards releases a dead device's held keys + drops keymap, once", () => {
+  const { ctx, injected, unregistered } = mkCtx();
+  const vk = liveKeyboard(ctx);                  // keymap id 7
+  makeVirtualKeyboard(ctx).key(vk, 1, 29, 1);    // Ctrl down
+  vk.destroyed = true;                           // client died without destroy
   injected.length = 0;
   releaseDeadVirtualKeyboards(ctx);
-  assert.deepEqual(injected, [{ type: "keyboardKey", serial: 0, time: 0, key: 29, pressed: false }]);
+  assert.deepEqual(injected, [{ type: "keyboardKey", serial: 0, time: 0, key: 29, pressed: false, keymapId: 0 }]);
+  assert.deepEqual(unregistered, [7]);
   injected.length = 0;
-  releaseDeadVirtualKeyboards(ctx);             // already swept -> no-op
+  unregistered.length = 0;
+  releaseDeadVirtualKeyboards(ctx);              // already swept -> no-op
   assert.equal(injected.length, 0);
+  assert.equal(unregistered.length, 0);
 });

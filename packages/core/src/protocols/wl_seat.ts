@@ -588,6 +588,28 @@ export default function makeSeat(ctx: Ctx, driver: FocusDriver): SeatHandler {
   }
 
   // Route one normalized input event.
+  // Make the keymap for `keymapId` active (0 = default seat keymap, else a
+  // virtual keyboard's registered keymap) before its keys are fed to xkb. The
+  // seat keymap is global to all wl_keyboards, so on a real change we re-send
+  // the new keymap to every bound keyboard; clients re-mmap and reinterpret
+  // subsequent keycodes under it. Cheap no-op when the keymap is unchanged.
+  function activateKeymap(keymapId: number): void {
+    if (!ctx.addon.setActiveKeymap(keymapId)) return;
+    const km = ctx.addon.keymapInfo();
+    if (!km) return;
+    for (const set of keyboardsByClient.values()) {
+      for (const k of set) {
+        if (k.destroyed) continue;
+        // send_keymap takes the raw fd out of the WaylandFd, so each keyboard
+        // needs its own dup.
+        ctx.events.wl_keyboard.send_keymap(k, km.format, km.fd.dup(), km.size);
+      }
+    }
+    // The WaylandFd from keymapInfo() is unused (every client got a dup); close
+    // it so it doesn't leak.
+    try { km.fd.close(); } catch { /* already taken/closed */ }
+  }
+
   function handleInput(ev: InputEvent): void {
     const seat = ctx.state.seat;
     if (!seat) return;
@@ -815,6 +837,11 @@ export default function makeSeat(ctx: Ctx, driver: FocusDriver): SeatHandler {
         // (e.g. Ctrl from a killed lan-mouse) poisons this keystroke. Cheap: a
         // no-op unless a dead virtual keyboard is registered.
         releaseDeadVirtualKeyboards(ctx);
+        // Make this keyboard's keymap active before feeding xkb. Real input
+        // carries keymapId 0 (default); a virtual keyboard carries its own
+        // registered id. On a change the new keymap is (re-)sent to clients so
+        // they interpret the key under the right layout.
+        activateKeymap(ev.keymapId ?? 0);
         // Always feed xkb state, even when no client is focused: the chain
         // consults modifier state to match bindings, and xkb's mod state
         // must track every keystroke regardless of where it goes.
@@ -893,8 +920,28 @@ export default function makeSeat(ctx: Ctx, driver: FocusDriver): SeatHandler {
         }
         break;
       }
-      // keyboardModifiers from the host is not forwarded separately; we derive
-      // modifiers from key events via xkb. pointerFrame is coalesced above.
+      case "keyboardModifiers": {
+        // Real backends never send standalone modifier events -- modifiers are
+        // derived from key presses in the keyboardKey case above. This path is
+        // for a virtual keyboard's explicit modifiers request: set the device
+        // keymap's xkb state directly from the supplied masks (so a subsequent
+        // key resolves under them) and forward the canonical masks to the
+        // focused client.
+        activateKeymap(ev.keymapId ?? 0);
+        const mods = ctx.addon.setModifiers(
+          ev.modsDepressed ?? 0, ev.modsLatched ?? 0, ev.modsLocked ?? 0, ev.group ?? 0);
+        lastModsDepressed = mods.modsDepressed;
+        const kb = seat.kbFocus;
+        if (!kb) break;
+        for (const k of clientKeyboards(kb.clientId)) {
+          if (k.destroyed) continue;
+          const modSerial = ctx.state.serial();
+          ctx.events.wl_keyboard.send_modifiers(
+            k, modSerial, mods.modsDepressed, mods.modsLatched, mods.modsLocked, mods.group);
+        }
+        break;
+      }
+      // pointerFrame is coalesced above.
       default:
         break;
     }

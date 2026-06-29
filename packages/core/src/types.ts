@@ -171,8 +171,31 @@ export interface Addon {
   destroyResource(resource: Resource): void;
   clientId(resource: Resource): number;
 
-  // Keyboard: keymap memfd (as a WaylandFd) + xkb modifier state.
+  // Keyboard: the ACTIVE keymap's memfd (as a WaylandFd) + format/size. The
+  // active keymap is the default seat keymap unless setActiveKeymap() selected
+  // a virtual keyboard's keymap. Each call dups the memfd (per-client mmap).
   keymapInfo(): { fd: WaylandFd; format: number; size: number } | null;
+
+  // Compile a virtual keyboard's client-supplied keymap (a WaylandFd holding
+  // XKB_KEYMAP_FORMAT_TEXT_V1 text, `size` bytes incl. NUL) and return its id
+  // (>= 1), or 0 on a bad fd / compile failure. Takes ownership of the fd. The
+  // id is passed as InputEvent.keymapId on injected keys, to setActiveKeymap,
+  // and to unregisterKeymap.
+  registerKeymap(fd: WaylandFd, size: number): number;
+  // Drop a virtual keymap (id from registerKeymap). Reverts to the default if
+  // it was active. No-op for 0 / unknown id.
+  unregisterKeymap(id: number): void;
+  // Select which keymap keyUpdate()/keymapInfo() use: 0 = default, else a
+  // registered virtual keymap id. Returns true if the active keymap changed
+  // (the seat then re-sends the keymap to bound wl_keyboards). Unknown id
+  // falls back to the default.
+  setActiveKeymap(id: number): boolean;
+  // Set the active keymap's xkb modifier/layout state directly from serialized
+  // masks (a virtual keyboard's explicit modifiers request, vs. deriving from
+  // keys) and return the canonical masks to forward to clients.
+  setModifiers(depressed: number, latched: number, locked: number, group: number): {
+    modsDepressed: number; modsLatched: number; modsLocked: number; group: number;
+  };
 
   // linux-dmabuf-v1 default-feedback data sourced from the GPU process.
   // formatTableFd is a WaylandFd for the {format,pad,modifier} table memfd;
@@ -507,4 +530,9 @@ export interface InputEvent {
   modsLatched?: number;
   modsLocked?: number;
   group?: number;
+  // keyboardKey: which keymap to interpret this key under. 0/absent = the
+  // default seat keymap (all real input); a non-zero id (from registerKeymap)
+  // selects a virtual keyboard's own keymap. The seat makes it active before
+  // feeding the key; a real key (0) restores the default.
+  keymapId?: number;
 }

@@ -5,14 +5,14 @@
 // the same sink the host seat uses -- so it flows through the seat's xkb state
 // and reaches the keyboard-focused client like real input.
 //
-// Keymap handling (first cut): the protocol lets the client supply its OWN xkb
-// keymap via keymap(format, fd, size). overdraw has a single seat keymap and
-// feeds all key events through it, so we currently IGNORE the client keymap and
-// forward raw evdev keycodes through the seat's keymap (correct when the
-// sender's layout matches; lan-mouse forwards the sender's keymap, usually
-// compatible). Honoring per-device keymaps (translate via the client keymap, or
-// swap the seat keymap while this device is active) is a later refinement. The
-// supplied fd is closed so it does not leak.
+// Keymap handling: the protocol lets the client supply its OWN xkb keymap via
+// keymap(format, fd, size). We compile it (addon.registerKeymap) and tag this
+// device's injected keys with the resulting keymap id. The seat makes that
+// keymap active before feeding the key, so the device's keys resolve under its
+// own layout and its wl_keyboard.modifiers are derived from it -- and the seat
+// re-sends that keymap to focused clients on the switch. A real keystroke
+// (keymapId 0) switches the seat back to the default keymap. If the supplied
+// keymap fails to compile, the device falls back to the default seat keymap.
 //
 // no_keymap is posted (via ctx.addon.postError) if key/modifiers arrive before
 // keymap. unauthorized is not enforced -- every client may create a virtual
@@ -36,18 +36,30 @@ function vks(ctx: Ctx): Set<Resource> {
   return s;
 }
 
-// Inject a key-up for every key the device still holds, so the seat's xkb state
-// (and any focused client) releases them. Snapshots + clears the held set BEFORE
-// injecting, because injectInput re-enters the seat (and this function) -- doing
-// it first makes the re-entrant pass a no-op instead of recursing.
+// Inject a key-up for every key the device still holds, so any focused client
+// is told they lifted. The releases use keymapId 0 (the default keymap): the
+// device's own keymap is about to be unregistered and its xkb state discarded
+// (so real input can never inherit a stuck modifier), and releasing under the
+// default avoids switching focused clients onto a keymap that's vanishing.
+// Modifier keycodes are layout-independent, so the client clears correctly.
+// Snapshots + clears the held set BEFORE injecting, because injectInput
+// re-enters the seat (and this function) -- doing it first makes the re-entrant
+// pass a no-op instead of recursing.
 function releaseHeldKeys(ctx: Ctx, vk: Resource): void {
   const held = vk.__pressedKeys as Set<number> | undefined;
   if (!held || held.size === 0) return;
   const keys = [...held];
   held.clear();
   for (const key of keys) {
-    ctx.addon.injectInput({ type: "keyboardKey", serial: 0, time: 0, key, pressed: false });
+    ctx.addon.injectInput({ type: "keyboardKey", serial: 0, time: 0, key, pressed: false, keymapId: 0 });
   }
+}
+
+// Drop a device's compiled keymap from the native registry, if it has one.
+function unregisterKeymap(ctx: Ctx, vk: Resource): void {
+  const id = vk.__keymapId as number | undefined;
+  if (id) ctx.addon.unregisterKeymap(id);
+  vk.__keymapId = 0;
 }
 
 // Release the held keys of any virtual keyboard whose client died without a
@@ -62,6 +74,7 @@ export function releaseDeadVirtualKeyboards(ctx: Ctx): void {
     if (!vk.destroyed) continue;
     set.delete(vk);
     releaseHeldKeys(ctx, vk);
+    unregisterKeymap(ctx, vk);
   }
 }
 
@@ -69,6 +82,7 @@ export default function makeVirtualKeyboardManager(ctx: Ctx): ZwpVirtualKeyboard
   return {
     create_virtual_keyboard(_resource, _seat, id) {
       id.__pressedKeys = new Set<number>();
+      id.__keymapId = 0;
       vks(ctx).add(id);
     },
   };
@@ -76,12 +90,15 @@ export default function makeVirtualKeyboardManager(ctx: Ctx): ZwpVirtualKeyboard
 
 export function makeVirtualKeyboard(ctx: Ctx): ZwpVirtualKeyboardV1Handler {
   return {
-    keymap(resource, _format, fd, _size) {
-      // First cut: ignore the client-supplied keymap contents; forward raw
-      // evdev codes through the seat's keymap. Record that a keymap was set
-      // (the spec requires it before key/modifiers) and close the fd.
+    keymap(resource, _format, fd, size) {
+      // Compile the client's keymap and remember its id so this device's keys
+      // resolve under it. A re-keymap replaces the previous one. registerKeymap
+      // takes ownership of the fd; on compile failure it returns 0 and the
+      // device falls back to the default seat keymap. Either way a keymap was
+      // supplied, satisfying the no_keymap precondition for key/modifiers.
+      unregisterKeymap(ctx, resource);
+      resource.__keymapId = ctx.addon.registerKeymap(fd, size);
       resource.__hasKeymap = true;
-      try { fd.close(); } catch { /* already closed/taken */ }
     },
     key(resource, time, key, state) {
       if (!resource.__hasKeymap) {
@@ -92,7 +109,10 @@ export function makeVirtualKeyboard(ctx: Ctx): ZwpVirtualKeyboardV1Handler {
       // Track held keys so they can be released if the device dies mid-press.
       const held = resource.__pressedKeys as Set<number> | undefined;
       if (held) { if (state === 1) held.add(key); else held.delete(key); }
-      ctx.addon.injectInput({ type: "keyboardKey", serial: 0, time, key, pressed: state === 1 });
+      ctx.addon.injectInput({
+        type: "keyboardKey", serial: 0, time, key, pressed: state === 1,
+        keymapId: (resource.__keymapId as number | undefined) ?? 0,
+      });
     },
     modifiers(resource, mods_depressed, mods_latched, mods_locked, group) {
       if (!resource.__hasKeymap) {
@@ -104,11 +124,13 @@ export function makeVirtualKeyboard(ctx: Ctx): ZwpVirtualKeyboardV1Handler {
         type: "keyboardModifiers", serial: 0, time: 0,
         modsDepressed: mods_depressed, modsLatched: mods_latched,
         modsLocked: mods_locked, group,
+        keymapId: (resource.__keymapId as number | undefined) ?? 0,
       });
     },
     destroy(resource) {
-      // Release any keys still held, then drop the device.
+      // Release any keys still held, drop its keymap, then drop the device.
       releaseHeldKeys(ctx, resource);
+      unregisterKeymap(ctx, resource);
       vks(ctx).delete(resource);
     },
   };

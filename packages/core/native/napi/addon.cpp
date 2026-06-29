@@ -23,6 +23,7 @@
 #include <cstring>
 #include <cstdlib>
 #include <memory>
+#include <unordered_map>
 #include <vector>
 
 #include "core/compositor.h"
@@ -114,7 +115,16 @@ struct Addon {
     int drmCardFd = -1;        // KMS: our copy of the DRM fd (libseat-owned tracking)
     int drmCardDeviceId = -1;  // KMS: libseat device id for closeDevice on shutdown
 #endif
-    std::unique_ptr<Keymap> keymap;  // xkbcommon keymap + modifier state
+    // The default seat keymap (system layout) plus one per virtual keyboard
+    // that supplied its own layout. `activeKeymapId` selects which keymap
+    // keyUpdate()/keymapInfo() operate on: 0 = default, else a virtualKeymaps
+    // entry. The seat switches it per keystroke to the keyboard that typed, so
+    // each keyboard's keys are interpreted (and its modifiers reported) under
+    // its own layout. See zwp_virtual_keyboard_v1.
+    std::unique_ptr<Keymap> keymap;  // default; xkbcommon keymap + modifier state
+    std::unordered_map<uint32_t, std::unique_ptr<Keymap>> virtualKeymaps;
+    uint32_t nextKeymapId = 1;
+    uint32_t activeKeymapId = 0;
     ShmRegistry shm;  // wl_shm pool mappings (CPU-side, independent of the loop)
     uv_poll_t wirePoll{};
     uv_poll_t ctrlPoll{};
@@ -433,6 +443,7 @@ void JsInputSink::onInputEvent(const InputEvent& ev) {
     napi_set_named_property(env, obj, "type", typeStr);
     setU32(env, obj, "serial", ev.serial);
     setU32(env, obj, "time", ev.time);
+    setU32(env, obj, "keymapId", ev.keymapId);
 
     switch (ev.type) {
         case InputEventType::PointerEnter:
@@ -2010,10 +2021,13 @@ napi_value Stop(napi_env env, napi_callback_info) {
         napi_delete_reference(env, g_addon.onFlipComplete);
         g_addon.onFlipComplete = nullptr;
     }
-    // Release the xkb keymap singleton. Built on demand by ensureKeymap()
+    // Release the keymaps. The default is built on demand by ensureKeymap()
     // from either keymapInfo (client wl_keyboard bind) or keyUpdate (host
     // key-down); a subsequent start()/stop() cycle must see fresh state.
     g_addon.keymap.reset();
+    g_addon.virtualKeymaps.clear();
+    g_addon.nextKeymapId = 1;
+    g_addon.activeKeymapId = 0;
     g_addon.lastNotified = 0;
     napi_value undef; napi_get_undefined(env, &undef);
     return undef;
@@ -2245,6 +2259,19 @@ bool ensureKeymap() {
     return true;
 }
 
+// The keymap keyUpdate()/keymapInfo() currently operate on, per activeKeymapId.
+// Falls back to the default if the active virtual keymap was unregistered out
+// from under us. Returns nullptr only if the default failed to compile.
+Keymap* activeKeymapPtr() {
+    if (!ensureKeymap()) return nullptr;
+    if (g_addon.activeKeymapId != 0) {
+        auto it = g_addon.virtualKeymaps.find(g_addon.activeKeymapId);
+        if (it != g_addon.virtualKeymaps.end()) return it->second.get();
+        g_addon.activeKeymapId = 0;  // stale id; revert to default
+    }
+    return g_addon.keymap.get();
+}
+
 // updateOutputLayout(rects) -> undefined
 // Update the input backend's view of the multi-output layout (used for
 // pointer-space mapping and cursor clamping). `rects` is an Array<{x, y, w, h}>
@@ -2472,14 +2499,15 @@ napi_value ReleaseScanoutForOutput(napi_env env, napi_callback_info info) {
 // Each call returns a fresh dup of the keymap memfd wrapped as a WaylandFd
 // (each client gets its own to mmap).
 napi_value KeymapInfo(napi_env env, napi_callback_info) {
-    if (!ensureKeymap()) { napi_value n; napi_get_null(env, &n); return n; }
-    int fd = g_addon.keymap->dupFd();
+    Keymap* km = activeKeymapPtr();
+    if (!km) { napi_value n; napi_get_null(env, &n); return n; }
+    int fd = km->dupFd();
     if (fd < 0) { napi_value n; napi_get_null(env, &n); return n; }
     napi_value obj; napi_create_object(env, &obj);
     napi_set_named_property(env, obj, "fd", overdraw::wayland::makeWaylandFd(env, fd));
-    napi_value fmt; napi_create_uint32(env, g_addon.keymap->format(), &fmt);
+    napi_value fmt; napi_create_uint32(env, km->format(), &fmt);
     napi_set_named_property(env, obj, "format", fmt);
-    napi_value sz; napi_create_uint32(env, g_addon.keymap->size(), &sz);
+    napi_value sz; napi_create_uint32(env, km->size(), &sz);
     napi_set_named_property(env, obj, "size", sz);
     return obj;
 }
@@ -2497,11 +2525,12 @@ napi_value KeyUpdate(napi_env env, napi_callback_info info) {
     if (argc >= 1) napi_get_value_uint32(env, argv[0], &key);
     if (argc >= 2) napi_get_value_bool(env, argv[1], &pressed);
     uint32_t dep = 0, lat = 0, lock = 0, grp = 0, sym = 0, base = 0;
-    if (ensureKeymap()) {
-        g_addon.keymap->updateKey(key, pressed);
-        g_addon.keymap->modifiers(dep, lat, lock, grp);
-        sym = g_addon.keymap->keysym(key);
-        base = g_addon.keymap->baseKeysym(key);
+    Keymap* km = activeKeymapPtr();
+    if (km) {
+        km->updateKey(key, pressed);
+        km->modifiers(dep, lat, lock, grp);
+        sym = km->keysym(key);
+        base = km->baseKeysym(key);
     }
     napi_value obj; napi_create_object(env, &obj);
     auto setU = [&](const char* k, uint32_t val) {
@@ -2514,6 +2543,87 @@ napi_value KeyUpdate(napi_env env, napi_callback_info info) {
     setU("group", grp);
     setU("keysym", sym);
     setU("baseKeysym", base);
+    return obj;
+}
+
+// registerKeymap(fd, size) -> number
+// Compile a client-supplied keymap (a WaylandFd holding XKB_KEYMAP_FORMAT_TEXT_V1
+// text, `size` bytes incl. NUL) into a new Keymap and return its id (>= 1), or 0
+// on a bad fd / compile failure. Takes ownership of the WaylandFd. The id is
+// later passed as keyboardKey.keymapId / to setActiveKeymap / unregisterKeymap.
+napi_value RegisterKeymap(napi_env env, napi_callback_info info) {
+    size_t argc = 2; napi_value argv[2];
+    napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+    napi_value zero; napi_create_uint32(env, 0, &zero);
+    if (argc < 2) return zero;
+    int fd = overdraw::wayland::takeWaylandFd(env, argv[0]);
+    if (fd < 0) return zero;
+    uint32_t size = 0; napi_get_value_uint32(env, argv[1], &size);
+    auto km = std::make_unique<Keymap>();
+    if (!km->initFromFd(fd, size)) return zero;  // initFromFd closed the fd
+    uint32_t id = g_addon.nextKeymapId++;
+    g_addon.virtualKeymaps[id] = std::move(km);
+    napi_value out; napi_create_uint32(env, id, &out); return out;
+}
+
+// unregisterKeymap(id) -> undefined
+// Drop a virtual keymap (its xkb state + memfd). If it was active, revert to the
+// default. No-op for id 0 or an unknown id.
+napi_value UnregisterKeymap(napi_env env, napi_callback_info info) {
+    size_t argc = 1; napi_value argv[1];
+    napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+    uint32_t id = 0; if (argc >= 1) napi_get_value_uint32(env, argv[0], &id);
+    if (id != 0) {
+        g_addon.virtualKeymaps.erase(id);
+        if (g_addon.activeKeymapId == id) g_addon.activeKeymapId = 0;
+    }
+    napi_value u; napi_get_undefined(env, &u); return u;
+}
+
+// setActiveKeymap(id) -> boolean
+// Select which keymap keyUpdate()/keymapInfo() operate on (0 = default, else a
+// registered virtual keymap). Returns true if the active keymap actually
+// changed (the seat then re-sends the keymap to bound wl_keyboards). An unknown
+// id falls back to the default.
+napi_value SetActiveKeymap(napi_env env, napi_callback_info info) {
+    size_t argc = 1; napi_value argv[1];
+    napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+    uint32_t id = 0; if (argc >= 1) napi_get_value_uint32(env, argv[0], &id);
+    if (id != 0 && g_addon.virtualKeymaps.find(id) == g_addon.virtualKeymaps.end())
+        id = 0;  // unknown id -> default
+    bool changed = (id != g_addon.activeKeymapId);
+    g_addon.activeKeymapId = id;
+    napi_value out; napi_get_boolean(env, changed, &out); return out;
+}
+
+// setModifiers(depressed, latched, locked, group)
+//   -> { modsDepressed, modsLatched, modsLocked, group }
+// Set the active keymap's xkb modifier/layout state directly from serialized
+// masks (a virtual keyboard's explicit modifiers request) and read back the
+// canonical masks to forward to clients. Returns zeros if no keymap is built.
+napi_value SetModifiers(napi_env env, napi_callback_info info) {
+    size_t argc = 4; napi_value argv[4];
+    napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+    uint32_t dep = 0, lat = 0, lock = 0, grp = 0;
+    if (argc >= 1) napi_get_value_uint32(env, argv[0], &dep);
+    if (argc >= 2) napi_get_value_uint32(env, argv[1], &lat);
+    if (argc >= 3) napi_get_value_uint32(env, argv[2], &lock);
+    if (argc >= 4) napi_get_value_uint32(env, argv[3], &grp);
+    uint32_t odep = 0, olat = 0, olock = 0, ogrp = 0;
+    Keymap* km = activeKeymapPtr();
+    if (km) {
+        km->updateMask(dep, lat, lock, grp);
+        km->modifiers(odep, olat, olock, ogrp);
+    }
+    napi_value obj; napi_create_object(env, &obj);
+    auto setU = [&](const char* k, uint32_t val) {
+        napi_value n; napi_create_uint32(env, val, &n);
+        napi_set_named_property(env, obj, k, n);
+    };
+    setU("modsDepressed", odep);
+    setU("modsLatched", olat);
+    setU("modsLocked", olock);
+    setU("group", ogrp);
     return obj;
 }
 
@@ -2753,6 +2863,7 @@ napi_value InjectInput(napi_env env, napi_callback_info info) {
             break;
         case InputEventType::KeyboardKey:
             ev.key = getU32(env, argv[0], "key");
+            ev.keymapId = getU32(env, argv[0], "keymapId");
             ev.buttonState = getBoolProp(env, argv[0], "pressed")
                                  ? ButtonState::Pressed : ButtonState::Released;
             break;
@@ -2761,6 +2872,7 @@ napi_value InjectInput(napi_env env, napi_callback_info info) {
             ev.modsLatched = getU32(env, argv[0], "modsLatched");
             ev.modsLocked = getU32(env, argv[0], "modsLocked");
             ev.group = getU32(env, argv[0], "group");
+            ev.keymapId = getU32(env, argv[0], "keymapId");
             break;
         default:
             break;
@@ -3165,6 +3277,10 @@ napi_value Init(napi_env env, napi_value exports) {
     reg("postError", PostError);
     reg("keymapInfo", KeymapInfo);
     reg("keyUpdate", KeyUpdate);
+    reg("registerKeymap", RegisterKeymap);
+    reg("unregisterKeymap", UnregisterKeymap);
+    reg("setActiveKeymap", SetActiveKeymap);
+    reg("setModifiers", SetModifiers);
     reg("switchVT", SwitchVT);
     reg("wake", Wake);
     reg("resolveCursorShape", ResolveCursorShape);

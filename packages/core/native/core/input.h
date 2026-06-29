@@ -112,6 +112,14 @@ struct InputEvent {
     uint32_t modsLatched   = 0;
     uint32_t modsLocked    = 0;
     uint32_t group         = 0;
+
+    // KeyboardKey: which keymap to interpret this key under. 0 = the default
+    // seat keymap (all real input); a non-zero id selects a virtual keyboard's
+    // own keymap (zwp_virtual_keyboard_v1 with a client-supplied layout). The
+    // seat makes this keymap active before feeding the key, so each keyboard's
+    // keys resolve under its own layout and a real keystroke (id 0) restores
+    // the default.
+    uint32_t keymapId = 0;
 };
 
 // Consumer of normalized events. Implemented by the core's routing/seat layer

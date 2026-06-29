@@ -32,12 +32,41 @@ bool Keymap::init() {
     state_ = xkb_state_new(keymap_);
     if (!state_) return false;
 
+    return serializeToMemfd();
+}
+
+bool Keymap::initFromFd(int fd, uint32_t size) {
+    if (fd < 0 || size == 0) { if (fd >= 0) ::close(fd); return false; }
+
+    ctx_ = xkb_context_new(XKB_CONTEXT_NO_FLAGS);
+    if (!ctx_) { ::close(fd); return false; }
+
+    // The client wrote the keymap text (size bytes, including a trailing NUL)
+    // to its own fd; map it read-only and compile. MAP_PRIVATE so a
+    // non-sealed client fd can't surprise us mid-read.
+    void* map = ::mmap(nullptr, size, PROT_READ, MAP_PRIVATE, fd, 0);
+    ::close(fd);  // ownership taken; the mapping outlives the fd
+    if (map == MAP_FAILED) { std::fprintf(stderr, "[keymap] client fd mmap failed\n"); return false; }
+
+    keymap_ = xkb_keymap_new_from_buffer(ctx_, static_cast<const char*>(map), size,
+                                         XKB_KEYMAP_FORMAT_TEXT_V1,
+                                         XKB_KEYMAP_COMPILE_NO_FLAGS);
+    ::munmap(map, size);
+    if (!keymap_) { std::fprintf(stderr, "[keymap] client keymap compile failed\n"); return false; }
+
+    state_ = xkb_state_new(keymap_);
+    if (!state_) return false;
+
+    return serializeToMemfd();
+}
+
+bool Keymap::serializeToMemfd() {
     char* str = xkb_keymap_get_as_string(keymap_, XKB_KEYMAP_FORMAT_TEXT_V1);
     if (!str) return false;
     size_t len = std::strlen(str) + 1;  // wl keymap size includes the NUL
 
-    // Serialize to a memfd. Clients mmap it read-only; seal it so they can map
-    // shared safely (some clients require F_SEAL_SHRINK).
+    // Clients mmap it read-only; seal it so they can map shared safely (some
+    // clients require F_SEAL_SHRINK).
     int fd = ::memfd_create("overdraw-keymap", MFD_CLOEXEC | MFD_ALLOW_SEALING);
     if (fd < 0) { std::free(str); return false; }
     if (::ftruncate(fd, static_cast<off_t>(len)) != 0) { std::free(str); ::close(fd); return false; }
@@ -63,6 +92,12 @@ void Keymap::updateKey(uint32_t evdevKeycode, bool pressed) {
     // xkb keycodes are evdev + 8 (the X11/XKB offset).
     xkb_state_update_key(state_, evdevKeycode + 8,
                          pressed ? XKB_KEY_DOWN : XKB_KEY_UP);
+}
+
+void Keymap::updateMask(uint32_t depressed, uint32_t latched,
+                        uint32_t locked, uint32_t group) {
+    if (!state_) return;
+    xkb_state_update_mask(state_, depressed, latched, locked, 0, 0, group);
 }
 
 void Keymap::modifiers(uint32_t& depressed, uint32_t& latched,

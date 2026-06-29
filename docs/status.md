@@ -179,6 +179,30 @@ nothing, with no error. Worst-first.
   `zwlr_output_manager_v1` correctly uses its own `cancelled`/`failed` events,
   not `post_error`.
 
+- **Per-keyboard keymaps with active-keyboard arbitration are implemented;
+  residuals are narrow.** Each keyboard owns its own keymap: the default seat
+  keymap (system RMLVO, `native/wayland/keymap.{h,cpp}`) plus one per
+  `zwp_virtual_keyboard_v1` that supplied a layout (`Keymap::initFromFd`
+  compiles the client fd and re-serializes to a sealed memfd). The seat makes
+  the keyboard that last typed active (`addon.setActiveKeymap`, driven off the
+  per-key `keymapId`): `keyUpdate`/`keymapInfo` then read that keymap, so a
+  virtual device's keys resolve and report modifiers under its own layout, and
+  on a switch the new keymap is re-sent to every bound `wl_keyboard`. A real
+  keystroke (keymapId 0) restores the default. This replaces the earlier
+  single-global-keymap simplification (which silently interpreted virtual-
+  keyboard keys under the seat's layout). overdraw needs only this arbitration
+  (real vs. each virtual keyboard), not wlroots's keyboard-group machinery,
+  since libinput already merges the physical keyboards into one stream — so
+  two physical keyboards with different layouts still cannot coexist (one real
+  keyboard, by construction). `zwp_virtual_keyboard_v1.modifiers` is honored:
+  the explicit mask is applied to the device keymap's xkb state
+  (`addon.setModifiers` → `xkb_state_update_mask`) so a subsequent key resolves
+  under it, and the canonical masks are forwarded to the focused client.
+  Verified by `test/keymap-arbitration.test.js` (native register/switch/
+  keyUpdate/setModifiers/unregister round-trip) and
+  `test/virtual-keyboard.test.js` (handler tagging + teardown); not yet
+  hardware-verified end-to-end with a cross-layout remote sender.
+
 - **`ext_workspace_v1`: capability-gated requests are no-ops by design.**
   The compositor advertises only the `activate` and `remove`
   per-workspace capabilities (no `deactivate`, no `assign`) and only the
