@@ -390,6 +390,19 @@ export interface CompositorSink {
     outputId: number; windows: ReadonlyArray<number>;
     outW?: number; outH?: number;
   }): { texture: GPUTexture; outW: number; outH: number };
+  // Snapshot an output's full on-screen content (drawOrder: toplevels +
+  // decorations + subsurfaces + layers, at device resolution, cursor excluded)
+  // for screen capture. Returns null for an unknown output. Caller owns the
+  // texture.
+  composeOutput?(outputId: number): { texture: GPUTexture; outW: number; outH: number } | null;
+  // Compose an explicit flattened draw list (a window's toplevel + decoration
+  // + subsurfaces) covering a global-logical region into a device-resolution
+  // texture, for single-window screen capture. Caller owns the texture.
+  composeRegion?(args: {
+    drawList: ReadonlyArray<number>;
+    region: { x: number; y: number; w: number; h: number };
+    scale: number;
+  }): { texture: GPUTexture; outW: number; outH: number };
   composeWindows?(args: {
     outputId: number;
     windows: ReadonlyArray<{ id: number; rect?: { x: number; y: number; w: number; h: number } }>;

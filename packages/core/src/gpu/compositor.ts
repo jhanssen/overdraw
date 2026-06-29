@@ -1326,7 +1326,7 @@ export class JsCompositor implements CompositorSink {
   // and cursor are global (drawn into every output's viewport; the renderer's
   // per-output viewport + scissor confines them to where they belong in global
   // logical space).
-  private drawOrder(outputId: number): number[] {
+  private drawOrder(outputId: number, includeCursor = true): number[] {
     const out: number[] = [];
     // Per-output content stack via setOutputStack when set. The fallback
     // to the global setStack list is for callers that don't push per-
@@ -1357,7 +1357,7 @@ export class JsCompositor implements CompositorSink {
     // can be the internal cursor surface (CPU-uploaded image) or any
     // existing surface (e.g. a wl_pointer.set_cursor client surface).
     // Visibility flag + target-set + target-has-texture gate inclusion.
-    if (this.cursorVisible && this.cursorTargetSurfaceId !== null) {
+    if (includeCursor && this.cursorVisible && this.cursorTargetSurfaceId !== null) {
       const s = this.surfaces.get(this.cursorTargetSurfaceId);
       if (s && s.texture) {
         // When the target is a regular WM surface that's ALSO in the
@@ -3076,6 +3076,10 @@ export class JsCompositor implements CompositorSink {
     outH: number;
     placements?: Map<number, { x: number; y: number; w: number; h: number }>;
     cropUV?: Map<number, { u0: number; v0: number; u1: number; v1: number }>;
+    // Per-output context: surfaces are placed in GLOBAL logical coords, so the
+    // composite subtracts this output's logical origin and scales by its scale
+    // into the (device-resolution) target. Absent = origin-relative, no scale.
+    output?: OutputCtx;
   }): void {
     // tickleLifecycle=false: a snapshot is not on the on-screen lifecycle
     // frame's submit serial chain; driving frameSampled/endAccessFenceExported
@@ -3093,11 +3097,63 @@ export class JsCompositor implements CompositorSink {
         outW: args.outW, outH: args.outH,
         placements: args.placements,
         cropUV: args.cropUV,
+        output: args.output,
       });
       this.device.queue.submit([enc.finish()]);
     } finally {
       this.closeImportBrackets(bracketed, /*tickleLifecycle*/ false);
     }
+  }
+
+  // Snapshot an output's full on-screen content into a fresh device-resolution
+  // texture -- exactly what renderFrame draws for it: the per-output draw list
+  // (toplevels + their decorations + subsurfaces + shell layers + phantoms),
+  // composed at the output's logical extent and scaled to its device pixels.
+  // The cursor is excluded (screen capture omits it by default). For the
+  // ext_image_copy_capture output source. Caller owns the returned texture.
+  // Returns null if the output is unknown.
+  composeOutput(outputId: number): { texture: GPUTexture; outW: number; outH: number } | null {
+    const geom = this.outputsGeom.get(outputId);
+    if (!geom) return null;
+    const out = this.outputCtx(geom);
+    const texture = this.allocComposeTexture(out.deviceWidth, out.deviceHeight);
+    this.composeSnapshot({
+      targetView: texture.createView(),
+      drawList: this.drawOrder(outputId, /*includeCursor*/ false),
+      outW: out.logicalWidth, outH: out.logicalHeight,
+      output: out,
+    });
+    return { texture, outW: out.deviceWidth, outH: out.deviceHeight };
+  }
+
+  // Compose an explicit, already-flattened draw list (toplevel + decoration +
+  // subsurfaces, as the caller assembled via computeBaseStack) covering a
+  // GLOBAL-logical region into a fresh device-resolution texture. Surfaces draw
+  // at their current global layout, offset by the region origin and scaled --
+  // the same mapping an on-screen output uses, via a region-local synthetic
+  // output context. For single-window screen capture. Caller owns the texture.
+  composeRegion(args: {
+    drawList: ReadonlyArray<number>;
+    region: { x: number; y: number; w: number; h: number };
+    scale: number;
+  }): { texture: GPUTexture; outW: number; outH: number } {
+    const scale = args.scale > 0 ? args.scale : 1;
+    const devW = Math.max(1, Math.round(args.region.w * scale));
+    const devH = Math.max(1, Math.round(args.region.h * scale));
+    const texture = this.allocComposeTexture(devW, devH);
+    const synth: OutputCtx = {
+      id: -1,
+      originX: args.region.x, originY: args.region.y, scale,
+      deviceWidth: devW, deviceHeight: devH,
+      logicalWidth: args.region.w, logicalHeight: args.region.h,
+    };
+    this.composeSnapshot({
+      targetView: texture.createView(),
+      drawList: [...args.drawList],
+      outW: args.region.w, outH: args.region.h,
+      output: synth,
+    });
+    return { texture, outW: devW, outH: devH };
   }
 
   // Render the listed windows into a fresh texture sized to (outW, outH).

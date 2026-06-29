@@ -45,6 +45,8 @@
 import type { Ctx } from "./ctx.js";
 import { surfaceIdForHandle } from "./ext_foreign_toplevel_list_v1.js";
 import { outputIdForWlOutput } from "./wl_output.js";
+import { computeBaseStack } from "../subsurfaces.js";
+import { primaryOutputOfSurface } from "./output-resolve.js";
 import { WINDOW_EVENT } from "../events/types.js";
 import { OUTPUT_FALLBACK } from "./ctx.js";
 import type { Resource } from "../types.js";
@@ -186,15 +188,25 @@ function sourceSize(ctx: Ctx, src: SourceRecord):
     if (!rec || src.id === OUTPUT_FALLBACK) return null;
     return { w: rec.deviceSize.width, h: rec.deviceSize.height };
   }
-  // toplevel: use the WM's current rect; fall back to the surface's buffer
-  // dims if the WM hasn't placed it yet.
+  // toplevel: the WM's OUTER rect (decoration included), at the window's
+  // output scale so the capture is device-resolution like the output path.
   const sRec = ctx.state.surfacesById?.get(src.id);
   if (!sRec || sRec.unmapped) return null;
-  const rect = ctx.state.wm?.rectOf(src.id);
-  if (rect && rect.width > 0 && rect.height > 0) {
-    return { w: rect.width, h: rect.height };
-  }
-  return null;
+  const rect = ctx.state.wm?.outerRectOf(src.id);
+  if (!rect || rect.width <= 0 || rect.height <= 0) return null;
+  const scale = windowOutputScale(ctx, sRec.resource);
+  return {
+    w: Math.max(1, Math.round(rect.width * scale)),
+    h: Math.max(1, Math.round(rect.height * scale)),
+  };
+}
+
+// The integer/fractional scale of the output a window currently resides on
+// (its primary output). Defaults to 1.
+function windowOutputScale(ctx: Ctx, surfaceRes: Resource): number {
+  const outputId = primaryOutputOfSurface(ctx.state, surfaceRes);
+  const s = ctx.state.outputs?.get(outputId)?.scale ?? 1;
+  return s > 0 ? s : 1;
 }
 
 // Stop a session: send stopped + mark it. Any active frame is failed with
@@ -232,8 +244,8 @@ export function dispatchCaptureForOutput(
   tvSec: bigint,
   tvNsec: number,
 ): void {
-  if (!ctx.state.compositor.composeScene
-      || !ctx.state.compositor.composeWindows) {
+  if (!ctx.state.compositor.composeOutput
+      || !ctx.state.compositor.composeRegion) {
     return;  // no JS compositor wired (GPU-free harness)
   }
   const armed = collectArmedFramesForOutput(outputId);
@@ -288,36 +300,51 @@ function captureOneFrame(
   // Compose + readback. Output source = full scene of windows residing on
   // the output. Toplevel source = the single toplevel.
   const compositor = ctx.state.compositor;
-  if (!compositor.composeScene || !compositor.composeWindows) {
+  if (!compositor.composeOutput || !compositor.composeRegion) {
     sendFailed(ctx, f, ExtImageCopyCaptureFrameV1_FailureReason.unknown);
     return false;
   }
   let tex: GPUTexture | null = null;
   try {
     if (session.source.kind === "output") {
-      const windowsOnOutput = collectWindowsOnOutput(ctx, session.source.id);
-      const r = compositor.composeScene({
-        outputId: session.source.id,
-        windows: windowsOnOutput,
-        outW: W, outH: H,
-      });
-      tex = r.texture;
-    } else {
-      const r = compositor.composeWindows({
-        outputId,
-        windows: [{ id: session.source.id }],
-      });
-      if (r.length === 0) {
+      // Snapshot the output's full on-screen content (subsurfaces + decorations
+      // + layers, scaled to device pixels) -- the same draw list renderFrame
+      // uses, so the capture matches the screen.
+      if (!compositor.composeOutput) {
         sendFailed(ctx, f, ExtImageCopyCaptureFrameV1_FailureReason.unknown);
         return false;
       }
-      // composeWindows sizes to the surface's full layout dims. The client's
-      // buffer is session.bufferW x session.bufferH (which we advertised
-      // matching the surface size). If the surface resized between
-      // advertise and capture, those won't match.
-      tex = r[0].texture;
-      const rect = r[0].rect;
-      if (rect.w !== W || rect.h !== H) {
+      const r = compositor.composeOutput(session.source.id);
+      if (!r) {
+        sendFailed(ctx, f, ExtImageCopyCaptureFrameV1_FailureReason.unknown);
+        return false;
+      }
+      // The advertised buffer_size is the output's device size, which is what
+      // composeOutput produces; the earlier W/H == bufferW/bufferH check
+      // guarantees the client's buffer matches.
+      tex = r.texture;
+    } else {
+      // Single window: compose its full on-screen subtree (decoration +
+      // toplevel + subsurfaces, via computeBaseStack) over its outer rect, at
+      // the output scale -- so subsurface content (e.g. a browser's) and the
+      // decoration both appear, at device resolution.
+      const win = ctx.state.wm?.state.windows.find((w) => w.surfaceId === session.source.id);
+      const rect = ctx.state.wm?.outerRectOf(session.source.id);
+      const sRec = ctx.state.surfacesById?.get(session.source.id);
+      if (!win || !rect || !sRec || !compositor.composeRegion) {
+        sendFailed(ctx, f, ExtImageCopyCaptureFrameV1_FailureReason.unknown);
+        return false;
+      }
+      const drawList = computeBaseStack(ctx.state, [win]);
+      const r = compositor.composeRegion({
+        drawList,
+        region: { x: rect.x, y: rect.y, w: rect.width, h: rect.height },
+        scale: windowOutputScale(ctx, sRec.resource),
+      });
+      tex = r.texture;
+      // If the window resized between advertise and capture, the device dims
+      // won't match the client's buffer.
+      if (r.outW !== W || r.outH !== H) {
         tex.destroy();
         sendFailed(ctx, f, ExtImageCopyCaptureFrameV1_FailureReason.buffer_constraints);
         return false;
@@ -336,31 +363,6 @@ function captureOneFrame(
   return true;
 }
 
-// Collect windows that should appear in an output's capture. Mirrors the
-// compositor's per-output content stack -- the surfaces residing on that
-// output, in stacking order. Cursors are explicitly excluded for now
-// (paint_cursors=false implementation; paint_cursors=true would composite
-// the cursor slot too, which is a follow-up).
-function collectWindowsOnOutput(ctx: Ctx, outputId: number): number[] {
-  const stacks = ctx.state.outputToplevelStacks;
-  if (stacks) {
-    const ids = stacks.get(outputId);
-    if (ids && ids.length > 0) return ids.slice();
-  }
-  // Fall back to the WM's window list filtered by spawnOutputId / current
-  // rect intersection.
-  const out: number[] = [];
-  const wm = ctx.state.wm;
-  if (!wm) return out;
-  for (const w of wm.state.windows) {
-    if (!w.hasContent) continue;
-    const s = ctx.state.surfacesById?.get(w.surfaceId);
-    if (!s) continue;
-    if ((s.spawnOutputId ?? 0) !== outputId) continue;
-    out.push(w.surfaceId);
-  }
-  return out;
-}
 
 // Readback the captured texture into BGRA bytes and memcpy into the client's
 // shm buffer (the format is ARGB8888/XRGB8888 in little-endian byte order,
