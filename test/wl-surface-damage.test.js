@@ -11,6 +11,7 @@ import makeSurface from '../packages/core/dist/protocols/wl_surface.js';
 
 function makeCtx() {
   const commits = [];
+  const releases = [];
   const surfaces = new Map();
   const buffers = new Map();
   const ctx = {
@@ -29,9 +30,9 @@ function makeCtx() {
         setSurfaceLayout: () => {},
       },
     },
-    events: { wl_buffer: { send_release: () => {} } },
+    events: { wl_buffer: { send_release: (b) => releases.push(b.id) } },
   };
-  return { ctx, commits, surfaces, buffers };
+  return { ctx, commits, releases, surfaces, buffers };
 }
 
 function addSurface(surfaces, resource, id) {
@@ -167,9 +168,38 @@ test('damage does not persist across commits', () => {
   h.commit(resource);
   assert.deepEqual(commits[0].damage, [{ x: 0, y: 0, width: 10, height: 10 }]);
 
-  // Re-commit (same buffer) with no new damage: full upload.
+  // Re-attach (a real new frame) with no new damage: full upload, and the
+  // previous commit's damage must NOT carry over.
+  h.attach(resource, buffer, 0, 0);
   h.commit(resource);
+  assert.equal(commits.length, 2);
   assert.equal(commits[1].damage, undefined);
+});
+
+test('a bare commit (no fresh attach) does NOT re-upload or re-release the buffer', () => {
+  const { ctx, commits, releases, surfaces } = makeCtx();
+  const h = makeSurface(ctx);
+  const resource = { id: 1 };
+  addSurface(surfaces, resource, 7);
+  const buffer = { id: 100 };
+
+  attachShm(h, ctx, resource, buffer, { width: 64, height: 64, stride: 256 });
+  h.commit(resource);                 // attach + commit -> one upload, one release
+  assert.equal(commits.length, 1);
+  assert.deepEqual(releases, [100]);
+
+  // A commit with no preceding attach (e.g. a frame-callback-only commit)
+  // leaves contents unchanged: no second upload, no second release. A second
+  // release here is a protocol violation that crashes shm clients (GDK/cairo).
+  h.commit(resource);
+  assert.equal(commits.length, 1, 'bare commit must not re-upload');
+  assert.deepEqual(releases, [100], 'bare commit must not re-release');
+
+  // A fresh re-attach of the same buffer IS a new frame: upload + release again.
+  h.attach(resource, buffer, 0, 0);
+  h.commit(resource);
+  assert.equal(commits.length, 2);
+  assert.deepEqual(releases, [100, 100]);
 });
 
 test('too many damage rects -> full upload', () => {

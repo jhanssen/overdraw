@@ -234,8 +234,15 @@ function snapshotRegionArg(
 // managed state of its children), then CASCADE into every effective-sync child:
 // the child's cached state is applied atomically with this (parent) apply. This
 // is the spec's "cached state applied immediately after the parent's state".
-function applySurfaceState(ctx: Ctx, s: SurfaceRecord): void {
-  uploadBuffer(ctx, s, s.committed.buffer);
+function applySurfaceState(ctx: Ctx, s: SurfaceRecord, bufferFresh: boolean): void {
+  // Apply (upload + schedule release of) the committed buffer ONLY when a
+  // fresh wl_buffer.attach accompanied this commit. Per spec a commit with no
+  // preceding attach leaves the surface contents unchanged; re-running the
+  // upload would re-send wl_buffer.release for a buffer the client still owns
+  // -- a double release that crashes well-behaved shm clients (GDK/cairo trips
+  // its staging-surface assertion). The dmabuf lifecycle dedups internally, but
+  // gating here keeps both buffer kinds on the same correct rule.
+  if (bufferFresh) uploadBuffer(ctx, s, s.committed.buffer);
   // Damage is consumed by the upload; the next commit re-accumulates it.
   s.committed.surfaceDamage = undefined;
   s.committed.bufferDamage = undefined;
@@ -318,6 +325,7 @@ function applySurfaceState(ctx: Ctx, s: SurfaceRecord): void {
       // Cascade: apply each effective-sync child's cached commit atomically.
       const childRec = ctx.state.surfaces.get(sub.surface);
       if (childRec && effectiveSync(ctx, childRec) && childRec.cached) {
+        const childBufferFresh = childRec.cached.bufferFresh ?? false;
         childRec.committed.buffer = childRec.cached.buffer ?? childRec.committed.buffer;
         if (childRec.cached.bufferScale !== undefined) {
           childRec.committed.bufferScale = childRec.cached.bufferScale;
@@ -351,7 +359,7 @@ function applySurfaceState(ctx: Ctx, s: SurfaceRecord): void {
           (childRec.committed.bufferDamage ??= []).push(...childRec.cached.bufferDamage);
         }
         childRec.cached = undefined;
-        applySurfaceState(ctx, childRec);
+        applySurfaceState(ctx, childRec, childBufferFresh);
       }
     }
   }
@@ -437,6 +445,11 @@ export default function makeSurface(ctx: Ctx): WlSurfaceHandler {
       const s = rec(resource);
       if (!s) return;
 
+      // Whether this commit carries a fresh wl_buffer.attach (to a buffer or to
+      // null). Drives the apply gate so a bare commit doesn't re-upload /
+      // double-release the unchanged buffer (see applySurfaceState).
+      const attachedThisCommit = s.pending.buffer !== undefined;
+
       // Promote pending buffer into the commit set (undefined = unchanged).
       if (s.pending.buffer !== undefined) {
         s.committed.buffer = s.pending.buffer;
@@ -505,6 +518,9 @@ export default function makeSurface(ctx: Ctx): WlSurfaceHandler {
         // applied when the parent commits (via applySurfaceState's cascade).
         s.cached ??= {};
         s.cached.buffer = s.committed.buffer;
+        // Sticky: the cached buffer is fresh if ANY commit in this cache cycle
+        // attached one, so the parent's cascade applies (and releases) it once.
+        s.cached.bufferFresh = (s.cached.bufferFresh ?? false) || attachedThisCommit;
         if (s.committed.bufferScale !== undefined) s.cached.bufferScale = s.committed.bufferScale;
         if (s.committed.bufferTransform !== undefined) s.cached.bufferTransform = s.committed.bufferTransform;
         if (s.committed.surfaceDamage) {
@@ -547,7 +563,9 @@ export default function makeSurface(ctx: Ctx): WlSurfaceHandler {
       } else {
         // Desynchronized (incl. main surface): apply now. If a cache exists (e.g.
         // it was sync then switched to desync), it is flushed as part of apply.
+        let cachedBufferFresh = false;
         if (s.cached) {
+          cachedBufferFresh = s.cached.bufferFresh ?? false;
           s.committed.buffer = s.cached.buffer ?? s.committed.buffer;
           if (s.cached.bufferScale !== undefined) s.committed.bufferScale = s.cached.bufferScale;
           if (s.cached.bufferTransform !== undefined) s.committed.bufferTransform = s.cached.bufferTransform;
@@ -584,7 +602,7 @@ export default function makeSurface(ctx: Ctx): WlSurfaceHandler {
         if (pendAcq || pendRel) {
           promoteSyncobjForCommit(s, pendAcq, pendRel, ctx);
         }
-        applySurfaceState(ctx, s);
+        applySurfaceState(ctx, s, attachedThisCommit || cachedBufferFresh);
       }
 
       if (s.xdgSurface) s.xdgSurface.lastCommitSerial = ctx.state.nextSerial - 1;

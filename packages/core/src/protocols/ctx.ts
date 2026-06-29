@@ -114,6 +114,10 @@ export interface SurfaceRecord {
   };
   cached?: {
     buffer?: Resource | null;
+    // True if any commit during this cache cycle carried a fresh wl_buffer
+    // attach. The buffer is applied (uploaded + released) only when fresh, so a
+    // bare commit (no attach) doesn't re-upload or double-release the buffer.
+    bufferFresh?: boolean;
     frameCallbacks?: Resource[];
     presentationFeedbacks?: Resource[];
     inputRegion?: RegionSlot;
