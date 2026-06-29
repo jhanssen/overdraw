@@ -1,5 +1,5 @@
-// Phase 5a: scene compose tests. Drives JsCompositor.composeScene /
-// composeWindows / registerLiveScene / registerLiveWindows directly
+// Scene compose tests. Drives JsCompositor.composeRegion / composeOutput /
+// registerLiveScene directly + sdk.compose through the in-thread plugin SDK
 // against the test harness (real Wayland clients, real GPU). One test
 // exercises sdk.compose through the in-thread plugin SDK to prove the
 // SDK plumbing path.
@@ -55,9 +55,11 @@ test("compose.scene snapshot equals the on-screen composite", { skip }, async ()
     await ready;
     const { w } = await waitMappedColored(c, color);
 
-    // Snapshot scene of the same window list.
-    const result = c.jsCompositor.composeScene({
-      outputId: 0, windows: [w.surfaceId],
+    // Snapshot scene of the same window list (flat draw list, full output,
+    // scale 1 -- equivalent to the on-screen composite of this one window).
+    const result = c.jsCompositor.composeRegion({
+      drawList: [w.surfaceId],
+      region: { x: 0, y: 0, w: OUT.width, h: OUT.height }, scale: 1,
     });
     try {
       const composed = await readbackTexture(c.jsCompositor,
@@ -86,8 +88,9 @@ test("compose.scene snapshot is frozen across subsequent state changes",
     await ready;
     const { w } = await waitMappedColored(c, color);
 
-    const result = c.jsCompositor.composeScene({
-      outputId: 0, windows: [w.surfaceId],
+    const result = c.jsCompositor.composeRegion({
+      drawList: [w.surfaceId],
+      region: { x: 0, y: 0, w: OUT.width, h: OUT.height }, scale: 1,
     });
     try {
       // Snapshot taken; now mutate per-surface state and render.
@@ -177,48 +180,9 @@ test("compose.scene live reflects per-surface state changes", { skip }, async ()
   }
 });
 
-// ---------- per-window crop ----------
-
-test("compose.windows crop extracts a sub-region of the window's texture",
-    { skip }, async () => {
-  const c = await setupCompositor({ headless: OUT });
-  try {
-    const color = 0xff2080c0;
-    const { ready } = c.spawnClient([FILL, "--color", color.toString(16)]);
-    await ready;
-    const { w } = await waitMappedColored(c, color);
-    const bgra = argbToBgra(color);
-
-    // Crop a 32x32 region of the surface.
-    const CROP = 32;
-    const result = c.jsCompositor.composeWindows({
-      outputId: 0,
-      windows: [{ id: w.surfaceId, rect: { x: 10, y: 10, w: CROP, h: CROP } }],
-    });
-    assert.equal(result.length, 1);
-    try {
-      const composed = await readbackTexture(c.jsCompositor,
-        result[0].texture, result[0].rect.w, result[0].rect.h);
-      // The whole CROP×CROP texture should be the client color (the
-      // client filled its entire surface with `color`).
-      let bad = 0;
-      for (let y = 0; y < CROP; y++) {
-        for (let x = 0; x < CROP; x++) {
-          if (!pixelMatches(pixelAt(composed, CROP, x, y), bgra, 4)) bad++;
-        }
-      }
-      assert.equal(bad, 0, `every pixel in the crop should be the client color; ${bad} differ`);
-    } finally {
-      for (const r of result) r.texture.destroy();
-    }
-  } finally {
-    await c.teardown();
-  }
-});
-
 // ---------- two windows ----------
 
-test("compose.windows produces one texture per listed window", { skip }, async () => {
+test("composeRegion produces one texture per window over its rect", { skip }, async () => {
   const c = await setupCompositor({ headless: OUT, layout: { masterFraction: 0.5, gap: 0 } });
   try {
     const cA = 0xff3030c0, cB = 0xff30c030;
@@ -245,20 +209,19 @@ test("compose.windows produces one texture per listed window", { skip }, async (
       await new Promise((r) => setTimeout(r, 16));
     }
 
-    const result = c.jsCompositor.composeWindows({
-      outputId: 0,
-      windows: [{ id: wA.surfaceId }, { id: wB.surfaceId }],
+    // Compose each window's subtree over its own rect (device scale 1).
+    const result = [wA, wB].map((win) => {
+      const rect = { x: win.rect.x, y: win.rect.y, w: win.rect.width, h: win.rect.height };
+      const cr = c.jsCompositor.composeRegion({ drawList: [win.surfaceId], region: rect, scale: 1 });
+      return { id: win.surfaceId, texture: cr.texture, w: cr.outW, h: cr.outH };
     });
     assert.equal(result.length, 2);
     try {
       // Each texture should be a solid color of its corresponding client.
-      // Surfaces with no explicit crop are sized to the window's full
-      // layout/buffer dims; for fill-configured clients that's the tile.
-      for (const { id, texture, rect } of result) {
-        const composed = await readbackTexture(c.jsCompositor, texture, rect.w, rect.h);
+      for (const { id, texture, w: tw, h: th } of result) {
+        const composed = await readbackTexture(c.jsCompositor, texture, tw, th);
         const exp = id === wA.surfaceId ? bgraA : bgraB;
-        // Spot-check center.
-        const px = pixelAt(composed, rect.w, rect.w >> 1, rect.h >> 1);
+        const px = pixelAt(composed, tw, tw >> 1, th >> 1);
         assert.ok(pixelMatches(px, exp, 4),
           `window ${id} center should be its client color; got ${px}, expected ${exp}`);
       }

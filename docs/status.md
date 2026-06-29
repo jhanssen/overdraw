@@ -253,15 +253,15 @@ nothing, with no error. Worst-first.
   through `composeRegion`. The state-backed flatteners (`makeComposeFlatteners`)
   are wired in both `main.ts` and the test harness, so the in-thread compose SDK
   uses the subsurface-correct path (it returns null rather than a
-  subsurface-dropping fallback if a host doesn't wire them). Residuals:
-  (1) `sdk.compose.scene` LIVE flattens ONCE at registration — subsurfaces
-  committed afterward aren't picked up and the live pass is still logical-res;
-  the full fix is a per-frame re-flatten (`getDrawList` callback + region/scale)
-  in `registerLiveScene`, which also covers the still-flat `registerLiveWindows`.
-  (2) The compositor's `composeScene`/`composeWindows` remain as low-level FLAT
-  primitives (flagged FOOTGUN in `ctx.ts`) — no production caller uses them now,
-  but `test/compose.gpu.mjs` exercises them directly; retire once that test moves
-  to `composeRegion`.
+  subsurface-dropping fallback if a host doesn't wire them). The
+  subsurface-dropping `composeScene`/`composeWindows` primitives were deleted
+  (compositor + `ctx.ts` + `test/compose.gpu.mjs`, which now drives
+  `composeRegion`/`composeOutput`). Sole residual: `sdk.compose.scene` LIVE
+  flattens ONCE at registration — subsurfaces committed afterward aren't picked
+  up and the live pass is still logical-res; the full fix is a per-frame
+  re-flatten (`getDrawList` callback + region/scale) in `registerLiveScene`,
+  which also covers the still-flat `registerLiveWindows`. Live mode is unused by
+  bundled plugins.
 
 - **`sdk.compose.windows` is in-thread-only.** Worker variant throws "not
   yet implemented for Worker plugins" (loud failure, not silent).

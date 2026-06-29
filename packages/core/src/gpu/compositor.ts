@@ -3156,29 +3156,6 @@ export class JsCompositor implements CompositorSink {
     return { texture, outW: devW, outH: devH };
   }
 
-  // Render the listed windows into a fresh texture sized to (outW, outH).
-  // Snapshot mode: one-shot, the texture is not refreshed after this call.
-  // Windows are drawn in list order (back to front) using their current
-  // per-surface state (placement, transform, mask, opacity); no crop.
-  //
-  // Caller owns the returned texture and must .destroy() it when done.
-  composeScene(args: {
-    outputId: number;
-    windows: ReadonlyArray<number>;
-    outW?: number;
-    outH?: number;
-  }): { texture: GPUTexture; outW: number; outH: number } {
-    const outW = args.outW ?? this.logicalWidth;
-    const outH = args.outH ?? this.logicalHeight;
-    const texture = this.allocComposeTexture(outW, outH);
-    this.composeSnapshot({
-      targetView: texture.createView(),
-      drawList: [...args.windows],
-      outW, outH,
-    });
-    return { texture, outW, outH };
-  }
-
   // Phase 9a: snapshot the closing window's surfaces into a fresh
   // texture and mint a phantom surface entry to display it. The
   // phantom is a regular compositor surface (the plugin can
@@ -3922,62 +3899,6 @@ export class JsCompositor implements CompositorSink {
     pass.setBindGroup(0, bindGroup);
     pass.draw(4);
     pass.end();
-  }
-
-  // Render each listed window into its own texture sized to that window's
-  // crop rect (or the window's full size if no crop). The cropped region of
-  // the surface texture fills the target texture; per-surface state
-  // (transform, mask, opacity, outputMargin) is currently NOT applied to
-  // per-window compose textures -- those are render-state for on-screen
-  // placement, and a per-window crop is a content extraction.
-  // (The placement override sets the surface's draw rect to fill the target.)
-  //
-  // rect (if given) is source crop in surface-local pixels; the target
-  // texture is sized to (rect.w, rect.h). Without rect, target sized to
-  // the window's full layout/buffer dims.
-  //
-  // Caller owns each returned texture and must .destroy() them when done.
-  composeWindows(args: {
-    outputId: number;
-    windows: ReadonlyArray<{ id: number;
-                            rect?: { x: number; y: number; w: number; h: number } }>;
-  }): Array<{ id: number; texture: GPUTexture;
-              rect: { x: number; y: number; w: number; h: number } }> {
-    // Compute per-window output rects and cropUV. The crop's UV range is
-    // the crop pixel coords / surface dims (the surface texture is sampled
-    // in [0,1] UV regardless of its actual pixel size; cropUV picks a
-    // sub-rect of that).
-    const out: Array<{ id: number; texture: GPUTexture;
-                       rect: { x: number; y: number; w: number; h: number } }> = [];
-    for (const w of args.windows) {
-      const s = this.surfaces.get(w.id);
-      if (!s) continue;  // unknown window: skip (caller bug; report empty)
-      const surfW = s.width || s.layoutW || 0;
-      const surfH = s.height || s.layoutH || 0;
-      const rect = w.rect ?? { x: 0, y: 0, w: surfW, h: surfH };
-      // Degenerate (zero-dim) windows produce no texture (would error on
-      // createTexture). Skip and let the caller see a shorter result.
-      if (rect.w <= 0 || rect.h <= 0) continue;
-
-      const texture = this.allocComposeTexture(rect.w, rect.h);
-      // Render this surface filling the target (placement = full target).
-      // Sample only the crop region (cropUV in [0,1] UV).
-      const placements = new Map([[w.id, { x: 0, y: 0, w: rect.w, h: rect.h }]]);
-      const cropUV = surfW > 0 && surfH > 0
-        ? new Map([[w.id, {
-            u0: rect.x / surfW, v0: rect.y / surfH,
-            u1: (rect.x + rect.w) / surfW, v1: (rect.y + rect.h) / surfH,
-          }]])
-        : undefined;
-      this.composeSnapshot({
-        targetView: texture.createView(),
-        drawList: [w.id],
-        outW: rect.w, outH: rect.h,
-        placements, cropUV,
-      });
-      out.push({ id: w.id, texture, rect });
-    }
-    return out;
   }
 
   // Register a live compose-scene target. The texture is re-rendered on

@@ -386,16 +386,6 @@ export interface CompositorSink {
   // refreshed every renderFrame() until released. Optional so non-JsCompositor
   // sinks (none today) need not implement them; the SDK only constructs
   // sdk.compose when they're present.
-  // FOOTGUN: composes the given surfaceIds FLAT -- no subsurface expansion, no
-  // output scale/origin -- so a toplevel id renders without its subsurface
-  // content. Only safe with a PRE-FLATTENED draw list. The compose SDK now
-  // prefers composeRegion (which the caller feeds a computeBaseStack-flattened
-  // list); this remains only as a fallback for hosts that didn't wire
-  // flattening. Prefer composeRegion / composeOutput. To be retired.
-  composeScene?(args: {
-    outputId: number; windows: ReadonlyArray<number>;
-    outW?: number; outH?: number;
-  }): { texture: GPUTexture; outW: number; outH: number };
   // Snapshot an output's full on-screen content (drawOrder: toplevels +
   // decorations + subsurfaces + layers, at device resolution, cursor excluded)
   // for screen capture. Returns null for an unknown output. Caller owns the
@@ -409,19 +399,11 @@ export interface CompositorSink {
     region: { x: number; y: number; w: number; h: number };
     scale: number;
   }): { texture: GPUTexture; outW: number; outH: number };
-  // FOOTGUN (same as composeScene): composes each window FLAT, dropping its
-  // subsurfaces, no scale. The compose SDK's snapshot windows() still uses this;
-  // it should move to per-window composeRegion(computeBaseStack([id]), …).
-  composeWindows?(args: {
-    outputId: number;
-    windows: ReadonlyArray<{ id: number; rect?: { x: number; y: number; w: number; h: number } }>;
-  }): Array<{ id: number; texture: GPUTexture;
-              rect: { x: number; y: number; w: number; h: number } }>;
   // FOOTGUN: the live variants re-render the given window list each frame WITHOUT
-  // subsurfaces or scale. A correct fix needs a per-frame re-flatten (store a
-  // getDrawList callback the compositor calls each frame) + a region/scale.
-  // Unused by bundled plugins (mode:"live" is never requested); kept until that
-  // refactor lands.
+  // per-frame subsurface re-flatten or scale. sdk.compose live flattens once at
+  // registration (subsurfaces included, but not re-expanded as they change). A
+  // full fix stores a getDrawList callback the compositor calls each frame +
+  // region/scale. registerLiveWindows is unused by bundled plugins.
   registerLiveScene?(args: {
     outputId: number; windows: ReadonlyArray<number>;
     outW?: number; outH?: number;
