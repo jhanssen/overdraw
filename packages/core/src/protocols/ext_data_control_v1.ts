@@ -37,8 +37,6 @@ import type { ExtDataControlDeviceV1Handler }
   from "#protocols-gen/ext_data_control_device_v1.js";
 import type { ExtDataControlSourceV1Handler }
   from "#protocols-gen/ext_data_control_source_v1.js";
-import { ExtDataControlSourceV1_Error }
-  from "#protocols-gen/ext_data_control_source_v1.js";
 import type { ExtDataControlOfferV1Handler }
   from "#protocols-gen/ext_data_control_offer_v1.js";
 
@@ -58,15 +56,6 @@ import type { ExtDataControlOfferV1Handler }
 //     route to state.receiveForXSource.
 const offerToWlSource = new WeakMap<Resource, Resource>();
 const offerXBacked = new WeakMap<Resource, "clipboard" | "primary">();
-
-// Sources created via ext_data_control_source_v1.create_data_source that
-// have NOT yet been used in a set_selection or set_primary_selection.
-// Once consumed the slot moves to state.dataSources or primarySources
-// (depending on which set_selection used it) and the entry here is
-// dropped. Re-use raises the used_source error per the spec.
-const unusedSources = new Set<Resource>();
-// A source that's already been used. Re-use is illegal.
-const usedSources = new WeakSet<Resource>();
 
 // Devices we've bound, keyed by client id. We re-push on every
 // selection.changed; closing a device drops it from the set.
@@ -154,7 +143,6 @@ export default function makeExtDataControlManager(ctx: Ctx): ExtDataControlManag
       // The source starts orphaned (no selection slot yet); set_selection
       // or set_primary_selection promotes it.
       (ctx.state.dataSources ??= new Map()).set(id, { mimes: [] });
-      unusedSources.add(id);
     },
     get_data_device(_resource, id, _seat) {
       const clientId = ctx.addon.clientId(id);
@@ -169,15 +157,11 @@ export default function makeExtDataControlManager(ctx: Ctx): ExtDataControlManag
 
 export function makeExtDataControlDevice(ctx: Ctx): ExtDataControlDeviceV1Handler {
   function consume(resource: Resource, source: Resource | null, kind: "clipboard" | "primary"): void {
-    if (source !== null) {
-      if (usedSources.has(source)) {
-        ctx.addon.postError(source, ExtDataControlSourceV1_Error.invalid_offer,
-          `ext_data_control_source_v1: cannot use a source in set_selection or set_primary_selection more than once`);
-        return;
-      }
-      usedSources.add(source);
-      unusedSources.delete(source);
-    }
+    // The spec forbids reusing a source in a second set_selection /
+    // set_primary_selection (and offering more mimes after use), but real
+    // clients (some clipboard managers) do both; killing them over it is worse
+    // than tolerating it, so we accept it rather than post the protocol error.
+    //
     // Hand the source to the standard selection state. From this point
     // every wl_data_device-side path (focus push, X bridge mirror, etc.)
     // sees it as the current source. The wl_data_source / ext source
@@ -278,7 +262,6 @@ export function makeExtDataControlSource(ctx: Ctx): ExtDataControlSourceV1Handle
       if (prim) prim.mimes.push(mimeType);
     },
     destroy(resource) {
-      unusedSources.delete(resource);
       const wasClipboard = ctx.state.selection === resource;
       const wasPrimary = ctx.state.primarySelection === resource;
       ctx.state.dataSources?.delete(resource);

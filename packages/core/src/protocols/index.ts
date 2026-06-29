@@ -31,7 +31,7 @@ import { OUTPUT_DEFAULT, OUTPUT_FALLBACK, FALLBACK_OUTPUT_NAME } from "./ctx.js"
 import type { FocusDriver, FocusApplyTarget } from "./focus-driver.js";
 import { titleAppId } from "../query.js";
 import { WINDOW_EVENT } from "../events/types.js";
-import { markLayerSurfaceMapped } from "./zwlr_layer_shell_v1.js";
+import { markLayerSurfaceMapped, installLayerShellOutputTeardown } from "./zwlr_layer_shell_v1.js";
 import type { CompositorBus } from "../events/window-bus.js";
 import { flushWindowChanges } from "./window-changes.js";
 
@@ -436,6 +436,7 @@ export async function installProtocols(
   // move's "reorder" relayout) shares the broker hold, so the two
   // requirements gate the same atomic apply.
   if (opts.pluginBus) installCrossOutputMove(state, addon, opts.pluginBus);
+  if (opts.pluginBus) installLayerShellOutputTeardown(state, opts.pluginBus);
   // State-query channel (tests / introspection): a GPU-free snapshot of
   // geometry / focus / stacking. See src/query.ts.
   state.query = () => queryState(state);

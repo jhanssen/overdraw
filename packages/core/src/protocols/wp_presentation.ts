@@ -24,7 +24,8 @@
 // approximate as "buffer is non-shm" since shm always goes through an
 // upload.
 //
-// Clock advertised on bind: CLOCK_MONOTONIC (constant 1, the POSIX value).
+// Clock advertised on bind: CLOCK_MONOTONIC (constant 1, the POSIX value),
+// sent from the on-bind hook so it precedes any feedback the client queues.
 
 import type { Ctx, CompositorState, SurfaceRecord } from "./ctx.js";
 import type { Resource } from "../types.js";
@@ -52,32 +53,18 @@ function refreshNsFromMhz(refreshMhz: number): number {
   return Math.round(1e12 / refreshMhz);
 }
 
-export default function makeWpPresentation(ctx: Ctx): WpPresentationHandler {
-  // The clock-id is sent per resource on bind. The generated handler factory
-  // does not see the resource at bind time; emitting on the first request
-  // (or via a separate bind hook) is the clean route. We pick the latter:
-  // patch the events.wp_presentation map to send clock_id once per resource.
-  // Simpler: just send clock_id from `feedback` the FIRST time it's used
-  // per resource. wp_presentation has only one event (clock_id) and one
-  // request (feedback); a client typically queues a feedback right after
-  // bind. The Wayland spec wants clock_id BEFORE feedback; emit it on
-  // bind via the per-resource registry below.
-  //
-  // Actual bind-time send: register an on-bind hook. The protocol layer
-  // doesn't have a generic per-resource on-bind hook today, so we use the
-  // fact that `feedback` is the first thing a client does on the resource
-  // and stamp the clock_id then.
-  const seenClockId = new WeakSet<Resource>();
-  function ensureClockId(presentation: Resource): void {
-    if (seenClockId.has(presentation)) return;
-    seenClockId.add(presentation);
-    ctx.events.wp_presentation.send_clock_id(presentation, CLOCK_MONOTONIC);
-  }
+// `bind` is a synthetic on-bind hook, not a protocol request.
+type WpPresentationHandlerWithBind =
+  WpPresentationHandler & { bind(resource: Resource): void };
 
+export default function makeWpPresentation(ctx: Ctx): WpPresentationHandlerWithBind {
   return {
+    // Synthetic on-bind hook: the spec requires clock_id before any feedback.
+    bind(presentation: Resource) {
+      ctx.events.wp_presentation.send_clock_id(presentation, CLOCK_MONOTONIC);
+    },
     destroy(_resource) { /* destructor */ },
     feedback(presentation, surface, callback) {
-      ensureClockId(presentation);
       const s = ctx.state.surfaces.get(surface);
       if (!s) {
         // Surface destroyed in flight; the callback is dead on arrival.

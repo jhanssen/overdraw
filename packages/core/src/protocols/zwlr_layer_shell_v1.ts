@@ -346,6 +346,28 @@ export function teardownLayerSurface(state: CompositorState, rec: LayerSurfaceRe
   state.seat?.reevaluateExclusiveLayerFocus();
 }
 
+// Close and tear down every layer surface on an output that's being removed.
+// The output's wl_output is still alive at output.pre-remove time, so `closed`
+// reaches the client; teardownLayerSurface then drops the role + reservation.
+// Without this a layer surface on an unplugged monitor would keep its zone and
+// never be told to go away.
+export function installLayerShellOutputTeardown(
+  state: CompositorState, pluginBus: import("../events/dynamic-bus.js").DynamicBus,
+): void {
+  pluginBus.subscribe("output.pre-remove", (_n, raw) => {
+    const p = raw as { outputId?: unknown } | undefined;
+    if (!p || typeof p.outputId !== "number") return;
+    const map = state.layerSurfaces;
+    if (!map) return;
+    for (const rec of [...map.values()]) {
+      if (rec.destroyed || rec.output !== p.outputId) continue;
+      if (!rec.resource.destroyed)
+        state.events?.zwlr_layer_surface_v1.send_closed(rec.resource);
+      teardownLayerSurface(state, rec);
+    }
+  });
+}
+
 // Variant used at teardown when there's no ctx available (called from the
 // generic wl_surface unmap sweep). Replays the apply math against the now-
 // reduced reservation set; doesn't send configures (each surviving surface's

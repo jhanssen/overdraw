@@ -10,6 +10,7 @@
 
 import { signature as fsSig } from "#protocols-gen/wp_fractional_scale_v1.js";
 import type { WpFractionalScaleManagerV1Handler } from "#protocols-gen/wp_fractional_scale_manager_v1.js";
+import { WpFractionalScaleManagerV1_Error } from "#protocols-gen/wp_fractional_scale_manager_v1.js";
 import type { WpFractionalScaleV1Handler } from "#protocols-gen/wp_fractional_scale_v1.js";
 
 import type { Ctx, CompositorState } from "./ctx.js";
@@ -66,8 +67,17 @@ export default function makeFractionalScaleManager(ctx: Ctx): WpFractionalScaleM
     destroy(_resource) {
       // Destructor. Existing wp_fractional_scale_v1 objects survive.
     },
-    get_fractional_scale(_manager, id, surface) {
-      (ctx.state.fractionalScaleResources ??= new Map()).set(id, surface as Resource);
+    get_fractional_scale(manager, id, surface) {
+      // A surface may have only one fractional-scale object.
+      const map = (ctx.state.fractionalScaleResources ??= new Map());
+      for (const owner of map.values()) {
+        if (owner === surface) {
+          ctx.addon.postError(manager, WpFractionalScaleManagerV1_Error.fractional_scale_exists,
+            "a fractional_scale object already exists for this surface");
+          return;
+        }
+      }
+      map.set(id, surface as Resource);
       ctx.events.wp_fractional_scale_v1.send_preferred_scale(
         id, preferredScaleFor(ctx.state, surface as Resource));
     },

@@ -5,6 +5,7 @@
 // window we mark it activated.
 
 import { signature as toplevelSig } from "#protocols-gen/xdg_toplevel.js";
+import { XdgToplevel_WmCapabilities } from "#protocols-gen/xdg_toplevel.js";
 import type { XdgSurfaceHandler } from "#protocols-gen/xdg_surface.js";
 import type { Ctx, PopupRecord, XdgSurfaceRecord } from "./ctx.js";
 import type { Resource } from "../types.js";
@@ -117,6 +118,19 @@ export default function makeXdgSurface(ctx: Ctx): XdgSurfaceHandler {
       ctx.state.toplevels ??= new Map();
       ctx.state.toplevels.set(toplevel, { resource: toplevel, xdgSurface: xs, title: null, appId: null });
       if (xs.surface) xs.surface.role = "xdg_toplevel";
+
+      // wm_capabilities (v5): advertise the window-management actions the
+      // compositor honors, so clients only show affordances that do something.
+      // We support maximize / fullscreen / minimize; show_window_menu is not
+      // implemented, so window_menu is omitted. Sent once, before the first
+      // configure (the set is static).
+      if (toplevel.version >= 5) {
+        ctx.events.xdg_toplevel.send_wm_capabilities(toplevel, packStates([
+          XdgToplevel_WmCapabilities.maximize,
+          XdgToplevel_WmCapabilities.fullscreen,
+          XdgToplevel_WmCapabilities.minimize,
+        ]));
+      }
 
       // Proactive tiling: insert the window into the layout NOW (before it has
       // content) so the WM assigns its tile. The FIRST configure is held
