@@ -71,9 +71,13 @@ test("sdk.compose.scene snapshot for Worker plugins (cross-device dmabuf)",
     const overlayState = { serial: () => ++serial, compositor: c.jsCompositor };
     const overlays = createOverlayBroker(overlayState, OUT);
     const h = c.addon.gpuHandles();
+    const { makeComposeFlatteners } = await import(
+      "../packages/core/dist/subsurfaces.js");
+    const { flattenWindows, outputRegion } = makeComposeFlatteners(c.state);
     gpuBroker = createGpuBroker({
       addon: c.addon, compositor: c.jsCompositor, overlays, dawn,
       coreDeviceHandle: h.device,
+      sceneFlatten: { flattenWindows, outputRegion },
     });
     // The windows broker connects sdk.windows.* (list/get/setOpacity/etc) to
     // the WM + compositor state in c.state.

@@ -13,6 +13,8 @@ import type { OverlayAnchor } from "../overlay-position.js";
 import type { DawnWire } from "../gpu/compositor.js";
 import type { SceneRegistry } from "./scene-registry.js";
 import { createSceneRegistry } from "./scene-registry.js";
+import { sceneDrawParams } from "./compose-sdk.js";
+import type { SceneFlattenDeps } from "./compose-sdk.js";
 import { SlotStates, createSlotStates } from "./surface-slots.js";
 import { SurfaceConsumer, SurfaceProducer } from "./surface-ring.js";
 
@@ -74,6 +76,12 @@ export interface GpuBrokerDeps {
   // compose.live still work but the SceneHandles they hand back lack a
   // valid .id (transitions.run will reject them with a clear error).
   sceneRegistry?: SceneRegistry;
+  // Scene flattening + output-region resolution, shared with the in-thread
+  // compose SDK. When wired, Worker compose (snapshot + live) expands window
+  // subtrees (subsurfaces) and composes at device scale, the same as in-thread;
+  // when absent, it falls back to the raw window list at logical scale (older
+  // test rigs that don't exercise subsurfaces).
+  sceneFlatten?: SceneFlattenDeps;
   // Generic hooks the broker fires WITHOUT understanding what they mean (it stays
   // surface-agnostic). The decoration layer uses these to learn its surface ids
   // and first-present timing; default no-ops.
@@ -301,11 +309,15 @@ export function createGpuBroker(deps: GpuBrokerDeps): GpuBroker {
         composeBufs.set(alloc.surfaceBufId, { texture: tex, width: w, height: h });
 
         if (compositor.composeIntoView) {
+          // Flatten subtrees + resolve the output region so the snapshot draws
+          // subsurfaces at device scale (parity with the in-thread path).
+          const sp = deps.sceneFlatten ? sceneDrawParams(deps.sceneFlatten, 0, windows) : null;
           compositor.composeIntoView({
             outputId: 0,
             targetView: tex.createView(),
-            windows,
+            drawList: sp ? sp.flatten() : windows,
             outW: w, outH: h,
+            region: sp?.region,
             producerSurfaceBufId: alloc.surfaceBufId,
           });
         } else {
@@ -432,6 +444,10 @@ export function createGpuBroker(deps: GpuBrokerDeps): GpuBroker {
           demoteStaleOnPresent: true,
         });
 
+        // Resolve the output region once; re-flatten the window set every
+        // frame so subsurfaces committed mid-life are picked up (parity with
+        // the in-thread registerLiveScene path).
+        const sp = deps.sceneFlatten ? sceneDrawParams(deps.sceneFlatten, 0, windows) : null;
         // Per-frame callback: tryAcquire FREE slot, composeIntoView (without
         // producerSurfaceBufId; the SurfaceProducer's tryAcquire / presentSync
         // already write the producer Begin/End brackets on the core wire),
@@ -442,8 +458,9 @@ export function createGpuBroker(deps: GpuBrokerDeps): GpuBroker {
           compositor.composeIntoView?.({
             outputId: 0,
             targetView: viewFor(got.slot),
-            windows,
+            drawList: sp ? sp.flatten() : windows,
             outW: w, outH: h,
+            region: sp?.region,
             // Intentionally no producerSurfaceBufId -- the SurfaceProducer
             // already wraps the pass in writeProducerBegin/End.
           });

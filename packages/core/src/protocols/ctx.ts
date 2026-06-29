@@ -399,14 +399,15 @@ export interface CompositorSink {
     region: { x: number; y: number; w: number; h: number };
     scale: number;
   }): { texture: GPUTexture; outW: number; outH: number };
-  // FOOTGUN: the live variants re-render the given window list each frame WITHOUT
-  // per-frame subsurface re-flatten or scale. sdk.compose live flattens once at
-  // registration (subsurfaces included, but not re-expanded as they change). A
-  // full fix stores a getDrawList callback the compositor calls each frame +
-  // region/scale. registerLiveWindows is unused by bundled plugins.
+  // Live scene: re-renders every frame at device resolution; getDrawList is
+  // re-evaluated each frame so subsurfaces committed after registration are
+  // picked up. registerLiveWindows still composes a fixed per-window list at
+  // logical scale (unused by bundled plugins).
   registerLiveScene?(args: {
-    outputId: number; windows: ReadonlyArray<number>;
-    outW?: number; outH?: number;
+    outputId: number;
+    getDrawList: () => number[];
+    region?: { x: number; y: number; w: number; h: number };
+    scale?: number;
   }): import("../gpu/compositor.js").LiveSceneHandle;
   registerLiveWindows?(args: {
     outputId: number;
@@ -418,16 +419,19 @@ export interface CompositorSink {
   // JsCompositor sinks (none today) need not implement it.
   readbackTexture?(tex: GPUTexture, w: number, h: number):
     Promise<{ width: number; height: number; data: Uint8Array }>;
-  // Phase 5b: render the listed windows into a pre-allocated target view.
-  // When producerSurfaceBufId is set, the compose pass is wrapped in
-  // producer Begin/End frames on the core wire keyed on that surfaceBufId
-  // (cross-device dmabuf compose target).
+  // Compose an already-flattened draw list into a caller-supplied target view.
+  // With `region` set, surfaces draw at their global layout scaled to the
+  // target's device size (the device-resolution mapping); without it, an
+  // origin-anchored logical pass. When producerSurfaceBufId is set, the pass is
+  // wrapped in producer Begin/End frames on the core wire keyed on that
+  // surfaceBufId (cross-device dmabuf compose target).
   composeIntoView?(args: {
     outputId: number;
     targetView: GPUTextureView;
-    windows: ReadonlyArray<number>;
+    drawList: ReadonlyArray<number>;
     outW: number;
     outH: number;
+    region?: { x: number; y: number; w: number; h: number };
     producerSurfaceBufId?: number;
   }): void;
   // Phase 5b-live: register a per-frame produce callback. Each renderFrame

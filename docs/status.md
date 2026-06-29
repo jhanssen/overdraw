@@ -245,22 +245,26 @@ nothing, with no error. Worst-first.
   dmabuf-stub limitations above); `wl_seat.get_touch` /
   `wp_cursor_shape.get_tablet_tool_v2` with no advertised capability return an
   inert object rather than posting an error (matches Hyprland; sway errors).
-- **`sdk.compose` window-rendering now flattens subsurfaces on every production
-  path; two narrow residuals remain.** Screen capture
+- **`sdk.compose` window-rendering flattens subsurfaces on every production
+  path, at device scale, across both transports.** Screen capture
   (`composeOutput`/`composeRegion`), `sdk.compose.scene` (snapshot + live), and
   `sdk.compose.windows` (snapshot) all expand window subtrees (decoration +
-  toplevel + subsurfaces, via `computeBaseStack`) and compose at device scale
-  through `composeRegion`. The state-backed flatteners (`makeComposeFlatteners`)
-  are wired in both `main.ts` and the test harness, so the in-thread compose SDK
-  uses the subsurface-correct path (it returns null rather than a
-  subsurface-dropping fallback if a host doesn't wire them). The
-  subsurface-dropping `composeScene`/`composeWindows` primitives were deleted
-  (compositor + `ctx.ts` + `test/compose.gpu.mjs`, which now drives
-  `composeRegion`/`composeOutput`). Sole residual: `sdk.compose.scene` LIVE
-  flattens ONCE at registration — subsurfaces committed afterward aren't picked
-  up and the live pass is still logical-res; the full fix is a per-frame
-  re-flatten (`getDrawList` callback + region/scale) in `registerLiveScene`,
-  which also covers the still-flat `registerLiveWindows`. Live mode is unused by
+  toplevel + subsurfaces, via `computeBaseStack`) and compose at device scale.
+  The flatten + output-region resolution is one shared step (`sceneDrawParams`
+  in `compose-sdk.ts`, backed by `makeComposeFlatteners`), used by BOTH the
+  in-thread SDK (`composeRegion`/`registerLiveScene`) and the Worker GPU broker
+  (`composeIntoView`), so subsurface expansion and device-scale mapping have one
+  source of truth regardless of transport. The in-thread SDK returns null rather
+  than a subsurface-dropping fallback if a host doesn't wire the flatteners; the
+  Worker broker takes `sceneFlatten` (wired in `main.ts` + the harness) and falls
+  back to the raw window list only for older test rigs that don't exercise
+  subsurfaces. `sdk.compose.scene` LIVE re-flattens every frame
+  (`registerLiveScene` takes a `getDrawList` callback re-evaluated per frame; the
+  Worker live ring re-flattens in its per-frame `onFrame`), so subsurfaces
+  committed after registration are picked up. The subsurface-dropping
+  `composeScene`/`composeWindows` primitives were deleted. One narrow residual
+  remains: `registerLiveWindows` (the in-thread `sdk.compose.windows` LIVE path)
+  still composes a fixed per-window list at logical scale; it is unused by
   bundled plugins.
 
 - **`sdk.compose.windows` is in-thread-only.** Worker variant throws "not

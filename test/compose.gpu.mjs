@@ -137,7 +137,7 @@ test("compose.scene live reflects per-surface state changes", { skip }, async ()
     const bgra = argbToBgra(color);
 
     const handle = c.jsCompositor.registerLiveScene({
-      outputId: 0, windows: [w.surfaceId],
+      outputId: 0, getDrawList: () => [w.surfaceId],
     });
     try {
       // First read: live texture should match the current state.
@@ -172,6 +172,45 @@ test("compose.scene live reflects per-surface state changes", { skip }, async ()
       }
       assert.equal(mismatches, 0,
         `live should equal on-screen this frame; ${mismatches} differ`);
+    } finally {
+      handle.release();
+    }
+  } finally {
+    await c.teardown();
+  }
+});
+
+test("compose.scene live re-evaluates getDrawList every frame", { skip }, async () => {
+  const c = await setupCompositor({ headless: OUT });
+  try {
+    const color = 0xff2080c0;
+    const { ready } = c.spawnClient([FILL, "--color", color.toString(16)]);
+    await ready;
+    const { w, cx, cy } = await waitMappedColored(c, color);
+    const bgra = argbToBgra(color);
+
+    // The draw list is produced by a closure the compositor must call each
+    // frame -- toggling it between empty and the window proves re-evaluation
+    // (a list captured once at registration could not follow this).
+    let include = false;
+    const handle = c.jsCompositor.registerLiveScene({
+      outputId: 0, getDrawList: () => (include ? [w.surfaceId] : []),
+    });
+    try {
+      // Empty list -> opaque-black background.
+      c.jsCompositor.renderFrame();
+      const empty = await readbackTexture(c.jsCompositor,
+        handle.texture, handle.outW, handle.outH);
+      assert.ok(pixelMatches(pixelAt(empty, handle.outW, cx, cy), [0, 0, 0, 0xff], 4),
+        `empty draw list should be black; got ${pixelAt(empty, handle.outW, cx, cy)}`);
+
+      // Same registration, list now includes the window -> its color appears.
+      include = true;
+      c.jsCompositor.renderFrame();
+      const shown = await readbackTexture(c.jsCompositor,
+        handle.texture, handle.outW, handle.outH);
+      assert.ok(pixelMatches(pixelAt(shown, handle.outW, cx, cy), bgra, 4),
+        `re-evaluated draw list should show the window; got ${pixelAt(shown, handle.outW, cx, cy)}`);
     } finally {
       handle.release();
     }
@@ -251,7 +290,7 @@ test("compose.scene release destroys the texture and removes the live registrati
     const handles = [];
     for (let i = 0; i < 5; i++) {
       handles.push(c.jsCompositor.registerLiveScene({
-        outputId: 0, windows: [w.surfaceId],
+        outputId: 0, getDrawList: () => [w.surfaceId],
       }));
     }
     assert.equal(c.jsCompositor.liveScenes.length, 5);

@@ -81,6 +81,31 @@ export interface PluginCompose {
   }): Promise<WindowComposition>;
 }
 
+// The scene-flattening + region-resolution step, shared by the in-thread SDK
+// (composeRegion / registerLiveScene) and the Worker broker (composeIntoView)
+// so subsurface expansion and device-scale mapping have ONE source of truth
+// across transports. `flatten` re-expands the window set every call -- callers
+// invoke it once for snapshots, or hand it to registerLiveScene/onFrame for a
+// per-frame re-flatten. Returns null when the output has no live region.
+export interface SceneFlattenDeps {
+  flattenWindows: (surfaceIds: ReadonlyArray<number>) => number[];
+  outputRegion: (outputId: number) =>
+    { x: number; y: number; w: number; h: number; scale: number } | null;
+}
+
+export function sceneDrawParams(
+  deps: SceneFlattenDeps, outputId: number, windows: ReadonlyArray<number>,
+): { region: { x: number; y: number; w: number; h: number };
+     scale: number; flatten: () => number[] } | null {
+  const reg = deps.outputRegion(outputId);
+  if (!reg) return null;
+  return {
+    region: { x: reg.x, y: reg.y, w: reg.w, h: reg.h },
+    scale: reg.scale,
+    flatten: () => deps.flattenWindows(windows),
+  };
+}
+
 // Construct sdk.compose backed by an in-thread CompositorSink that
 // implements the compose methods (JsCompositor today). The plugin shares
 // core's GPUDevice, so returned GPUTextures are usable directly -- no
@@ -137,19 +162,16 @@ export function createInThreadCompose(
   return {
     async scene(args): Promise<SceneHandle> {
       checkOutput(args.outputId);
+      const sp = sceneDrawParams({ flattenWindows, outputRegion }, args.outputId, args.windows);
+      if (!sp) throw new Error(`sdk.compose.scene: no region for output ${args.outputId}`);
+      // outW/outH override the logical region size (device dims follow scale).
+      const region = {
+        x: sp.region.x, y: sp.region.y,
+        w: args.outW ?? sp.region.w, h: args.outH ?? sp.region.h,
+      };
       if (args.mode === "snapshot") {
-        // Flatten the window set (subsurfaces included) and compose at the
-        // output's region + scale (device resolution).
-        const region = outputRegion(args.outputId);
-        if (!region) throw new Error(`sdk.compose.scene: no region for output ${args.outputId}`);
-        const r = composeRegion({
-          drawList: flattenWindows(args.windows),
-          region: {
-            x: region.x, y: region.y,
-            w: args.outW ?? region.w, h: args.outH ?? region.h,
-          },
-          scale: region.scale,
-        });
+        // One-shot: flatten now (subsurfaces included), compose at device scale.
+        const r = composeRegion({ drawList: sp.flatten(), region, scale: sp.scale });
         let released = false;
         const tex = r.texture;
         // Register in the scene registry. onTeardown destroys the
@@ -171,14 +193,14 @@ export function createInThreadCompose(
           },
         };
       }
-      // mode === 'live': flatten ONCE so subsurfaces are included; the live
-      // pass re-composites this list each frame. (Subsurfaces committed after
-      // registration aren't picked up, and the live pass is still logical-res
-      // -- the full fix is a per-frame re-flatten in registerLiveScene.)
+      // mode === 'live': the compositor re-evaluates getDrawList each frame
+      // (subsurfaces committed mid-life are picked up) and composes at the
+      // output's region + scale (device resolution).
       const h: LiveSceneHandle = registerLiveScene({
         outputId: args.outputId,
-        windows: flattenWindows(args.windows),
-        outW: args.outW, outH: args.outH,
+        getDrawList: sp.flatten,
+        region,
+        scale: sp.scale,
       });
       const tex = h.texture;
       const sceneId = registry.register(

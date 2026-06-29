@@ -744,10 +744,20 @@ pluginBus.subscribe(WINDOW_EVENT.relayout, (_n, payload) => {
 // the in-thread compose-sdk (via inThreadGpu.sceneRegistry below).
 const sceneRegistry = createSceneRegistry();
 
+// sdk.compose flattening: expand a window set into its full on-screen draw
+// list (decoration + toplevel + subsurfaces) where the subsurface tree lives,
+// so plugin-composed scenes include subsurface content at device scale. Shared
+// by the Worker GPU broker and the in-thread plugin SDK below.
+const composeFlatteners = makeComposeFlatteners(state);
+
 // GPU broker: services plugin Worker GPU/surface requests.
 const gpuBroker = createGpuBroker({
   addon, compositor, overlays, dawn, coreDeviceHandle: h.device,
   sceneRegistry,
+  sceneFlatten: {
+    flattenWindows: composeFlatteners.flattenWindows,
+    outputRegion: composeFlatteners.outputRegion,
+  },
   onSurfaceAllocated: (sid, win) => decorationBroker.onSurfaceAllocated(sid, win),
   onSurfacePresented: (sid) => decorationBroker.onSurfacePresented(sid),
 });
@@ -1246,10 +1256,7 @@ runtime = new PluginRuntime({
     overlays,
     compositor,
     sceneRegistry,
-    // sdk.compose flattening: expand a window set into its full on-screen draw
-    // list (decoration + toplevel + subsurfaces) where the subsurface tree
-    // lives, so plugin-composed scenes include subsurface content at device scale.
-    ...makeComposeFlatteners(state),
+    ...composeFlatteners,
     interceptBroker,
     // Same decoration-broker plumbing the GPU broker uses for Worker plugins:
     // notify on alloc (with the `decorates` window id) and on present, so the

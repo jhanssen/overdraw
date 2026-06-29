@@ -728,13 +728,16 @@ function clamp(v: number, lo: number, hi: number): number {
 
 // A live compose target re-rendered every on-screen renderFrame(). The
 // texture handle is stable across frames; only its contents update.
+// getDrawList is re-evaluated each frame so subsurfaces committed after
+// registration are picked up; ctx carries the region origin/scale so the
+// pass renders at device resolution, the same mapping an on-screen output
+// uses.
 interface LiveScene {
   texture: GPUTexture;
   view: GPUTextureView;
   outputId: number;
-  windows: number[];
-  outW: number;
-  outH: number;
+  getDrawList: () => number[];
+  ctx: OutputCtx;
 }
 
 // A live per-window compose target. Each window in the list has its own
@@ -2886,7 +2889,8 @@ export class JsCompositor implements CompositorSink {
       if (bracketUnion.length > 0) {
         this.openImportBrackets(bracketUnion, bracketed);
       }
-      for (const ls of this.liveScenes) this.openImportBrackets(ls.windows, bracketed);
+      const liveSceneLists = this.liveScenes.map((ls) => ls.getDrawList());
+      for (const list of liveSceneLists) this.openImportBrackets(list, bracketed);
       for (const lw of this.liveWindowComps) {
         this.openImportBrackets(lw.windows.map((w) => w.id), bracketed);
       }
@@ -2926,11 +2930,13 @@ export class JsCompositor implements CompositorSink {
       // target texture and may sample any surface; for the same reason as
       // above, each gets its own submit so its uniform writes are isolated
       // from the previous pass's.
-      for (const ls of this.liveScenes) {
+      for (let i = 0; i < this.liveScenes.length; i++) {
+        const ls = this.liveScenes[i];
         const enc = this.device.createCommandEncoder();
         this.composite({
-          encoder: enc, targetView: ls.view, drawList: ls.windows,
-          outW: ls.outW, outH: ls.outH,
+          encoder: enc, targetView: ls.view, drawList: liveSceneLists[i],
+          outW: ls.ctx.logicalWidth, outH: ls.ctx.logicalHeight,
+          output: ls.ctx,
         });
         this.device.queue.submit([enc.finish()]);
       }
@@ -3633,9 +3639,17 @@ export class JsCompositor implements CompositorSink {
   composeIntoView(args: {
     outputId: number;
     targetView: GPUTextureView;
-    windows: ReadonlyArray<number>;
+    // Already-flattened draw list (decoration + toplevel + subsurfaces); the
+    // caller expands the window set, since the subsurface tree lives outside
+    // the compositor.
+    drawList: ReadonlyArray<number>;
     outW: number;
     outH: number;
+    // Global-logical region the target texture represents. When set, surfaces
+    // draw at their global layout shifted by the region origin and scaled to
+    // the target's device size (outW x outH) -- the same device-resolution
+    // mapping composeRegion uses. Omit for an origin-anchored logical pass.
+    region?: { x: number; y: number; w: number; h: number };
     // When set, the compose pass is wrapped in producer Begin/End frames on
     // the core wire keyed on this surfaceBufId. Required for dmabuf compose
     // targets allocated via AllocComposeBuf (the plugin's consumer Begin
@@ -3646,11 +3660,24 @@ export class JsCompositor implements CompositorSink {
     if (args.producerSurfaceBufId !== undefined) {
       this.addon.writeProducerBegin(args.producerSurfaceBufId);
     }
-    this.composeSnapshot({
-      targetView: args.targetView,
-      drawList: [...args.windows],
-      outW: args.outW, outH: args.outH,
-    });
+    const r = args.region;
+    if (r) {
+      const synth: OutputCtx = {
+        id: -1,
+        originX: r.x, originY: r.y, scale: args.outW / r.w,
+        deviceWidth: args.outW, deviceHeight: args.outH,
+        logicalWidth: r.w, logicalHeight: r.h,
+      };
+      this.composeSnapshot({
+        targetView: args.targetView, drawList: [...args.drawList],
+        outW: r.w, outH: r.h, output: synth,
+      });
+    } else {
+      this.composeSnapshot({
+        targetView: args.targetView, drawList: [...args.drawList],
+        outW: args.outW, outH: args.outH,
+      });
+    }
     if (args.producerSurfaceBufId !== undefined) {
       this.addon.writeProducerEnd(args.producerSurfaceBufId);
     }
@@ -3902,29 +3929,39 @@ export class JsCompositor implements CompositorSink {
   }
 
   // Register a live compose-scene target. The texture is re-rendered on
-  // every on-screen renderFrame() under the same import brackets and
-  // command encoder, so its contents always reflect what the listed
-  // windows would currently look like on-screen. Holder polls the
-  // returned texture between frames. release() removes the registration
-  // and destroys the texture.
+  // every on-screen renderFrame() under the same import brackets, so its
+  // contents always reflect what the windows would currently look like on
+  // screen. getDrawList is re-evaluated each frame -- subsurfaces committed
+  // after registration are picked up. region/scale give the global-logical
+  // rect + scale to compose at device resolution (default: the full primary
+  // output at its scale). Holder polls the returned texture between frames;
+  // release() removes the registration and destroys the texture.
   registerLiveScene(args: {
     outputId: number;
-    windows: ReadonlyArray<number>;
-    outW?: number;
-    outH?: number;
+    getDrawList: () => number[];
+    region?: { x: number; y: number; w: number; h: number };
+    scale?: number;
   }): LiveSceneHandle {
-    const outW = args.outW ?? this.logicalWidth;
-    const outH = args.outH ?? this.logicalHeight;
-    const texture = this.allocComposeTexture(outW, outH);
+    const region = args.region
+      ?? { x: 0, y: 0, w: this.logicalWidth, h: this.logicalHeight };
+    const scale = (args.scale ?? this.scale) > 0 ? (args.scale ?? this.scale) : 1;
+    const devW = Math.max(1, Math.round(region.w * scale));
+    const devH = Math.max(1, Math.round(region.h * scale));
+    const texture = this.allocComposeTexture(devW, devH);
+    const ctx: OutputCtx = {
+      id: -1,
+      originX: region.x, originY: region.y, scale,
+      deviceWidth: devW, deviceHeight: devH,
+      logicalWidth: region.w, logicalHeight: region.h,
+    };
     const entry: LiveScene = {
       texture, view: texture.createView(),
-      outputId: args.outputId, windows: [...args.windows],
-      outW, outH,
+      outputId: args.outputId, getDrawList: args.getDrawList, ctx,
     };
     this.liveScenes.push(entry);
     let released = false;
     return {
-      texture, outW, outH,
+      texture, outW: devW, outH: devH,
       release: () => {
         if (released) return;
         released = true;

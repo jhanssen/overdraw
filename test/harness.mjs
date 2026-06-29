@@ -564,13 +564,14 @@ export async function setupCompositor(opts = {}) {
     const overlays = createOverlayBroker(overlayState, dims);
     const { makeComposeFlatteners } = await import(
       "../packages/core/dist/subsurfaces.js");
+    const composeFlatteners = makeComposeFlatteners(state);
     inThreadGpuDeps = {
       coreDevice,
       globals: dawn.globals,
       overlays,
       compositor: jsCompositor,
       sceneRegistry,
-      ...makeComposeFlatteners(state),
+      ...composeFlatteners,
     };
     if (opts.intercept) {
       const { InterceptBroker } = await import(
@@ -606,6 +607,10 @@ export async function setupCompositor(opts = {}) {
           addon, compositor: jsCompositor, overlays: overlays2, dawn,
           coreDeviceHandle: h2.device,
           sceneRegistry,
+          sceneFlatten: {
+            flattenWindows: composeFlatteners.flattenWindows,
+            outputRegion: composeFlatteners.outputRegion,
+          },
         });
         interceptBrokerOpts.worker = {
           addon, dawn,
