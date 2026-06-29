@@ -25,6 +25,8 @@ import { popupOutputOrigin } from "./xdg_popup.js";
 import { dispatchRelativeMotion } from "./zwp_relative_pointer_manager_v1.js";
 import { isPointerLocked, notifyPointerFocus, notifyPointerMotion } from "./zwp_pointer_constraints_v1.js";
 import { releaseDeadVirtualKeyboards } from "./zwp_virtual_keyboard_manager_v1.js";
+import { keyboardShortcutsInhibited, notifyShortcutsInhibitorFocus }
+  from "./zwp_keyboard_shortcuts_inhibit_manager_v1.js";
 
 // `bind` is a synthetic on-bind hook, not a protocol request.
 type SeatHandler = WlSeatHandler & { bind(resource: Resource): void };
@@ -411,6 +413,8 @@ export default function makeSeat(ctx: Ctx, driver: FocusDriver): SeatHandler {
       markWindowChanged(ctx.state, cur.surfaceId, "activated");
     }
     if (target) markWindowChanged(ctx.state, target.surfaceId, "activated");
+    // Flip keyboard-shortcuts inhibitors active/inactive with focus.
+    notifyShortcutsInhibitorFocus(ctx, cur?.surfaceId, target?.surfaceId);
   }
 
   // Build a SeatFocus for a surface id, handling WM toplevels (rect via
@@ -887,7 +891,11 @@ export default function makeSeat(ctx: Ctx, driver: FocusDriver): SeatHandler {
         // back to the translated keysym if the keymap reported no base symbol.
         const matchSym = mods.baseKeysym || mods.keysym;
         let consumed = false;
-        const chain = ctx.state.bindingChain;
+        // When the focused surface has an active shortcuts inhibitor
+        // (zwp_keyboard_shortcuts_inhibitor_v1), the compositor's bindings are
+        // suppressed so every key reaches the client. VT-switch is handled
+        // above this point and stays effective.
+        const chain = keyboardShortcutsInhibited(ctx) ? null : ctx.state.bindingChain;
         if (chain) {
           if (pressed && matchSym !== 0) {
             const r = chain.dispatchPress({

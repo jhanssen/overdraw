@@ -80,6 +80,7 @@ const DEFAULT_INPUTS = [
   '/usr/share/wayland-protocols/unstable/xdg-foreign/xdg-foreign-unstable-v2.xml',
   '/usr/share/wayland-protocols/unstable/relative-pointer/relative-pointer-unstable-v1.xml',
   '/usr/share/wayland-protocols/unstable/pointer-constraints/pointer-constraints-unstable-v1.xml',
+  '/usr/share/wayland-protocols/unstable/keyboard-shortcuts-inhibit/keyboard-shortcuts-inhibit-unstable-v1.xml',
   // wlr-* protocols are not in wayland-protocols upstream; vendor copies.
   join(repoRoot, 'protocols', 'wlr-layer-shell-unstable-v1.xml'),
   join(repoRoot, 'protocols', 'wlr-foreign-toplevel-management-unstable-v1.xml'),
