@@ -6,7 +6,15 @@ test counts, and historical rationale live in `status-detailed.md`. This
 file is the short read; consult the detailed doc when investigating a
 specific subsystem.
 
-Last updated: 2026-06-26. Recent landings: open/retile window animations
+Last updated: 2026-06-28. Recent landings: per-keyboard keymaps with
+active-keyboard arbitration (virtual keyboards honor their own keymap +
+modifiers); a protocol-wide audit pass that fixed event version-guard
+client-aborts (data-control DnD actions, xdg-output name/description +
+wl_output.done, foreign-toplevel parent) and a batch of completeness fixes
+(wm_capabilities, eager presentation clock_id, fractional_scale_exists,
+lax data-control reuse, layer-surface closed on output-destroy, high-res
+scroll value120/relative_direction, buffer offset for DnD/popups,
+set_fullscreen output targeting). Prior: open/retile window animations
 (premap sizing + `window.opening` hook + map-ack hold gated on an active
 animation), open-slide direction, and the decorated-window (intercept)
 flicker fix via render-reports-rendered; see the deferred items in
@@ -168,7 +176,8 @@ nothing, with no error. Worst-first.
   `invalid_transform`, `wp_viewporter.viewport_exists`, `wp_viewport.bad_value`,
   `wp_cursor_shape_device_v1.invalid_shape`, `wl_pointer.role` (set_cursor on a
   roled surface), `zxdg_toplevel_decoration_v1.already_constructed`,
-  `wp_linux_drm_syncobj_manager_v1.surface_exists`. End-to-end test:
+  `wp_linux_drm_syncobj_manager_v1.surface_exists`,
+  `wp_fractional_scale_manager_v1.fractional_scale_exists`. End-to-end test:
   `test/post-error.test.js` + `wl-error-client`. **Still silent (deliberate,
   each commented why):** commit-time errors that would need ctx threaded into
   state-only apply functions (`zwlr_layer_surface_v1.invalid_size` /
@@ -222,6 +231,20 @@ nothing, with no error. Worst-first.
   `wl_buffer`) not wired (only `create_immed`); single-plane dmabuf only;
   `zwp_linux_dmabuf_feedback_v1` is functional for WSI clients but not
   automatically asserted.
+- **Deliberately deferred (sway/Hyprland skip these too, or they're
+  unreachable here):** `xdg_positioner` reactive popups (`set_reactive` /
+  `set_parent_size` / `set_parent_configure` are no-ops — popups don't
+  auto-reposition when the parent moves; sway only re-unconstrains on
+  commit/reposition, Hyprland skips entirely); `zwp_linux_buffer_params`
+  `flags` (y_invert / interlaced / bottom_first) ignored, and multi-plane
+  (YUV) import unreachable given only ARGB/XRGB are advertised; the
+  `wl_surface` buffer offset is applied to the DnD icon + popups but NOT
+  toplevel/subsurface placement (matches Hyprland); `ext_image_copy_capture`
+  `paint_cursors` is accepted but not honored (cursor compositing into the
+  captured frame is part of the broader capture work, alongside the shm-only /
+  dmabuf-stub limitations above); `wl_seat.get_touch` /
+  `wp_cursor_shape.get_tablet_tool_v2` with no advertised capability return an
+  inert object rather than posting an error (matches Hyprland; sway errors).
 
 - **`sdk.compose.windows` is in-thread-only.** Worker variant throws "not
   yet implemented for Worker plugins" (loud failure, not silent).
