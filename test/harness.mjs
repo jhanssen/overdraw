@@ -562,12 +562,15 @@ export async function setupCompositor(opts = {}) {
     let _serial = 5000;
     const overlayState = { serial: () => ++_serial, compositor: jsCompositor };
     const overlays = createOverlayBroker(overlayState, dims);
+    const { makeComposeFlatteners } = await import(
+      "../packages/core/dist/subsurfaces.js");
     inThreadGpuDeps = {
       coreDevice,
       globals: dawn.globals,
       overlays,
       compositor: jsCompositor,
       sceneRegistry,
+      ...makeComposeFlatteners(state),
     };
     if (opts.intercept) {
       const { InterceptBroker } = await import(

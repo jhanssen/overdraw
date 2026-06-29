@@ -88,6 +88,10 @@ export interface InThreadGpuDeps {
   // The output's GLOBAL-logical rect + scale, for device-resolution compose.
   outputRegion?: (outputId: number) =>
     { x: number; y: number; w: number; h: number; scale: number } | null;
+  // A window's GLOBAL-logical outer rect + its output scale, for per-window
+  // (sdk.compose.windows) device-resolution compose.
+  windowRegion?: (surfaceId: number) =>
+    { x: number; y: number; w: number; h: number; scale: number } | null;
   // Phase 10a intercept: the broker the in-thread sdk.intercept SDK
   // talks to directly. Optional: when absent, sdk.intercept.register
   // will reject (the bundled-plugin path either has it or doesn't,

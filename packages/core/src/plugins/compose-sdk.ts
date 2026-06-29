@@ -103,6 +103,9 @@ export function createInThreadCompose(
   // The output's global-logical rect + scale, for device-resolution compose.
   outputRegion?: (outputId: number) =>
     { x: number; y: number; w: number; h: number; scale: number } | null,
+  // A window's global-logical outer rect + scale, for per-window compose.
+  windowRegion?: (surfaceId: number) =>
+    { x: number; y: number; w: number; h: number; scale: number } | null,
 ): PluginCompose | null {
   if (!compositor.composeScene || !compositor.composeWindows
       || !compositor.registerLiveScene || !compositor.registerLiveWindows) {
@@ -197,6 +200,29 @@ export function createInThreadCompose(
     async windows(args): Promise<WindowComposition> {
       checkOutput(args.outputId);
       if (args.mode === "snapshot") {
+        // Preferred path: compose each window's full subtree (subsurfaces
+        // included) over its outer rect at device scale. The crop rect (unused
+        // by bundled plugins) is not honored on this path.
+        if (composeRegion && flattenWindows && windowRegion) {
+          const results: Array<{ id: number; texture: GPUTexture;
+                                 rect: { x: number; y: number; w: number; h: number } }> = [];
+          for (const w of args.windows) {
+            const reg = windowRegion(w.id);
+            if (!reg) continue;
+            const rect = { x: reg.x, y: reg.y, w: reg.w, h: reg.h };
+            const cr = composeRegion({ drawList: flattenWindows([w.id]), region: rect, scale: reg.scale });
+            results.push({ id: w.id, texture: cr.texture, rect });
+          }
+          let releasedR = false;
+          return {
+            windows: results,
+            async release(): Promise<void> {
+              if (releasedR) return;
+              releasedR = true;
+              for (const w of results) w.texture.destroy();
+            },
+          };
+        }
         const r = composeWindows({
           outputId: args.outputId,
           windows: args.windows,

@@ -85,6 +85,7 @@ export async function runLoader(channel: Channel, input: LoaderInput): Promise<v
       input.inThreadGpu.sceneRegistry,
       input.inThreadGpu.flattenWindows,
       input.inThreadGpu.outputRegion,
+      input.inThreadGpu.windowRegion,
     ) ?? undefined;
     transitions = createTransitions(endpoint);
     // Phase 10a: in-thread intercept SDK. The broker is reached
