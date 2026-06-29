@@ -100,6 +100,10 @@ struct InputEvent {
     AxisKind axis         = AxisKind::VerticalScroll;
     double   axisValue    = 0.0;  // continuous scroll amount, logical units
     int32_t  axisDiscrete = 0;    // discrete step count (wheel clicks), 0 if none
+    // High-resolution wheel step in 1/120ths of a logical detent (wl_pointer
+    // .axis_value120, since v8). Nonzero only for the wheel source; the seat
+    // downgrades it to axisDiscrete (value120/120) for clients below v8.
+    int32_t  axisValue120 = 0;
     // PointerAxisSource: wl_pointer.axis_source enum (wheel/finger/continuous/
     // wheel_tilt).
     uint32_t axisSource   = 0;

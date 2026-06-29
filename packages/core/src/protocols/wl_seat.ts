@@ -231,13 +231,13 @@ export default function makeSeat(ctx: Ctx, driver: FocusDriver): SeatHandler {
   let axisSource: number | null = null;
   let axisTime = 0;
   const axisAcc = [
-    { value: 0, hasValue: false, discrete: 0, hasDiscrete: false, stop: false },
-    { value: 0, hasValue: false, discrete: 0, hasDiscrete: false, stop: false },
+    { value: 0, hasValue: false, value120: 0, hasValue120: false, stop: false },
+    { value: 0, hasValue: false, value120: 0, hasValue120: false, stop: false },
   ];
   function resetAxisAcc(): void {
     axisPending = false; axisSource = null; axisTime = 0;
     for (const a of axisAcc) {
-      a.value = 0; a.hasValue = false; a.discrete = 0; a.hasDiscrete = false; a.stop = false;
+      a.value = 0; a.hasValue = false; a.value120 = 0; a.hasValue120 = false; a.stop = false;
     }
   }
   function flushAxis(): void {
@@ -249,7 +249,16 @@ export default function makeSeat(ctx: Ctx, driver: FocusDriver): SeatHandler {
         if (axisSource !== null && p.version >= 5) ctx.events.wl_pointer.send_axis_source(p, axisSource);
         for (let a = 0; a < 2; a++) {
           const d = axisAcc[a];
-          if (d.hasDiscrete && p.version >= 5) ctx.events.wl_pointer.send_axis_discrete(p, a, d.discrete);
+          // relative_direction (v9): we never invert scroll, so it's always
+          // identical (0); sent before the axis it describes.
+          if ((d.hasValue || d.hasValue120) && p.version >= 9)
+            ctx.events.wl_pointer.send_axis_relative_direction(p, a, 0);
+          // High-resolution step: value120 (v8) for modern clients, downgraded
+          // to the deprecated axis_discrete (v5..7) as whole detents.
+          if (d.hasValue120) {
+            if (p.version >= 8) ctx.events.wl_pointer.send_axis_value120(p, a, d.value120);
+            else if (p.version >= 5) ctx.events.wl_pointer.send_axis_discrete(p, a, Math.round(d.value120 / 120));
+          }
           if (d.hasValue) ctx.events.wl_pointer.send_axis(p, axisTime, a, d.value);
           if (d.stop && p.version >= 5) ctx.events.wl_pointer.send_axis_stop(p, axisTime, a);
         }
@@ -807,12 +816,13 @@ export default function makeSeat(ctx: Ctx, driver: FocusDriver): SeatHandler {
       }
       case "pointerAxis": {
         // Accumulate into the pending frame; flushed on pointerFrame so
-        // axis_source/discrete/value/stop emit in spec order within one frame.
+        // axis_source / relative_direction / value120 / value / stop emit in
+        // spec order within one frame.
         const a = ev.horizontal ? 1 : 0;
         axisPending = true;
         axisTime = ev.time ?? axisTime;
         if (ev.value !== undefined) { axisAcc[a].value += ev.value; axisAcc[a].hasValue = true; }
-        if (ev.discrete) { axisAcc[a].discrete += ev.discrete; axisAcc[a].hasDiscrete = true; }
+        if (ev.value120) { axisAcc[a].value120 += ev.value120; axisAcc[a].hasValue120 = true; }
         break;
       }
       case "pointerAxisSource": {

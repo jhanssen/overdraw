@@ -426,6 +426,10 @@ void setF64(napi_env env, napi_value obj, const char* key, double v) {
     napi_value n; napi_create_double(env, v, &n);
     napi_set_named_property(env, obj, key, n);
 }
+void setI32(napi_env env, napi_value obj, const char* key, int32_t v) {
+    napi_value n; napi_create_int32(env, v, &n);
+    napi_set_named_property(env, obj, key, n);
+}
 void setBool(napi_env env, napi_value obj, const char* key, bool v) {
     napi_value n; napi_get_boolean(env, v, &n);
     napi_set_named_property(env, obj, key, n);
@@ -466,6 +470,7 @@ void JsInputSink::onInputEvent(const InputEvent& ev) {
             setBool(env, obj, "horizontal", ev.axis == AxisKind::HorizontalScroll);
             setF64(env, obj, "value", ev.axisValue);
             setU32(env, obj, "discrete", static_cast<uint32_t>(ev.axisDiscrete));
+            setI32(env, obj, "value120", ev.axisValue120);
             break;
         case InputEventType::PointerAxisSource:
             setU32(env, obj, "axisSource", ev.axisSource);
@@ -2860,6 +2865,7 @@ napi_value InjectInput(napi_env env, napi_callback_info info) {
                           ? AxisKind::HorizontalScroll : AxisKind::VerticalScroll;
             ev.axisValue = getF64(env, argv[0], "value");
             ev.axisDiscrete = static_cast<int32_t>(getU32(env, argv[0], "discrete"));
+            ev.axisValue120 = static_cast<int32_t>(getU32(env, argv[0], "value120"));
             break;
         case InputEventType::KeyboardKey:
             ev.key = getU32(env, argv[0], "key");

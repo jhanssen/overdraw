@@ -522,6 +522,9 @@ export interface InputEvent {
   horizontal?: boolean;
   value?: number;
   discrete?: number;
+  // High-resolution wheel step in 1/120 detent units (wl_pointer.axis_value120,
+  // v8). Nonzero only for the wheel source; downgraded to discrete for < v8.
+  value120?: number;
   // pointerAxisSource: wl_pointer.axis_source enum (wheel/finger/continuous/
   // wheel_tilt).
   axisSource?: number;

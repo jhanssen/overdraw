@@ -89,13 +89,13 @@ test("button: state 1 maps to pressed, 0 to released", () => {
   assert.deepEqual(injected[1], { type: "pointerButton", serial: 0, time: 2, button: 0x110, pressed: false });
 });
 
-test("axis: axis 1 is horizontal, 0 vertical; discrete carried through", () => {
+test("axis: axis 1 is horizontal, 0 vertical; discrete -> value120 (1 detent = 120)", () => {
   const { ctx, injected } = mkCtx();
   const vp = makeVirtualPointer(ctx);
   vp.axis(RES, 1, 0, 12.5);
   vp.axis_discrete(RES, 2, 1, 8, 1);
   assert.deepEqual(injected[0], { type: "pointerAxis", serial: 0, time: 1, horizontal: false, value: 12.5 });
-  assert.deepEqual(injected[1], { type: "pointerAxis", serial: 0, time: 2, horizontal: true, value: 8, discrete: 1 });
+  assert.deepEqual(injected[1], { type: "pointerAxis", serial: 0, time: 2, horizontal: true, value: 8, value120: 120 });
 });
 
 test("axis: an out-of-range axis posts invalid_axis and injects nothing", () => {

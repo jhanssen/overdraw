@@ -255,33 +255,15 @@ void LibinputBackend::dispatchEvent(libinput_event* ev) {
             sink_->onInputEvent(frame);
             break;
         }
-        case LIBINPUT_EVENT_POINTER_AXIS: {
-            // Legacy axis event. v1 uses the continuous value (logical units)
-            // for both wheel and touchpad scroll; the v120 wheel-discrete API
-            // is not used yet.
-            auto* pe = libinput_event_get_pointer_event(ev);
-            for (int axis = 0; axis < 2; ++axis) {
-                const libinput_pointer_axis a =
-                    axis == 0 ? LIBINPUT_POINTER_AXIS_SCROLL_VERTICAL
-                              : LIBINPUT_POINTER_AXIS_SCROLL_HORIZONTAL;
-                if (!libinput_event_pointer_has_axis(pe, a)) continue;
-                const double v = libinput_event_pointer_get_axis_value(pe, a);
-                InputEvent e{};
-                e.type = InputEventType::PointerAxis;
-                e.time = libinput_event_pointer_get_time(pe);
-                e.axis = a == LIBINPUT_POINTER_AXIS_SCROLL_HORIZONTAL
-                             ? AxisKind::HorizontalScroll
-                             : AxisKind::VerticalScroll;
-                e.axisValue = v;
-                e.axisDiscrete = 0;  // v120 path not used in v1
-                sink_->onInputEvent(e);
-            }
-            InputEvent frame{};
-            frame.type = InputEventType::PointerFrame;
-            frame.time = libinput_event_pointer_get_time(pe);
-            sink_->onInputEvent(frame);
+        case LIBINPUT_EVENT_POINTER_SCROLL_WHEEL:
+            emitScroll(ev, 0 /*wl_pointer.axis_source.wheel*/, true /*hasV120*/);
             break;
-        }
+        case LIBINPUT_EVENT_POINTER_SCROLL_FINGER:
+            emitScroll(ev, 1 /*axis_source.finger*/, false);
+            break;
+        case LIBINPUT_EVENT_POINTER_SCROLL_CONTINUOUS:
+            emitScroll(ev, 2 /*axis_source.continuous*/, false);
+            break;
         case LIBINPUT_EVENT_KEYBOARD_KEY: {
             auto* ke = libinput_event_get_keyboard_event(ev);
             InputEvent e{};
@@ -298,6 +280,52 @@ void LibinputBackend::dispatchEvent(libinput_event* ev) {
             // Touch, gestures, switches, tablet — out of scope for v1.
             break;
     }
+}
+
+void LibinputBackend::emitScroll(libinput_event* ev, uint32_t source, bool hasV120) {
+    auto* pe = libinput_event_get_pointer_event(ev);
+    const uint32_t time = libinput_event_pointer_get_time(pe);
+
+    InputEvent src{};
+    src.type = InputEventType::PointerAxisSource;
+    src.time = time;
+    src.axisSource = source;
+    sink_->onInputEvent(src);
+
+    for (int axis = 0; axis < 2; ++axis) {
+        const libinput_pointer_axis a =
+            axis == 0 ? LIBINPUT_POINTER_AXIS_SCROLL_VERTICAL
+                      : LIBINPUT_POINTER_AXIS_SCROLL_HORIZONTAL;
+        if (!libinput_event_pointer_has_axis(pe, a)) continue;
+        const double v = libinput_event_pointer_get_scroll_value(pe, a);
+        const AxisKind kind = a == LIBINPUT_POINTER_AXIS_SCROLL_HORIZONTAL
+                                  ? AxisKind::HorizontalScroll
+                                  : AxisKind::VerticalScroll;
+        // Finger / continuous gestures report a 0 value when the gesture ends;
+        // that's an axis_stop, not a zero-distance scroll. Wheels never do this.
+        if (!hasV120 && v == 0.0) {
+            InputEvent stop{};
+            stop.type = InputEventType::PointerAxisStop;
+            stop.time = time;
+            stop.axis = kind;
+            sink_->onInputEvent(stop);
+            continue;
+        }
+        InputEvent e{};
+        e.type = InputEventType::PointerAxis;
+        e.time = time;
+        e.axis = kind;
+        e.axisValue = v;
+        if (hasV120)
+            e.axisValue120 =
+                static_cast<int32_t>(libinput_event_pointer_get_scroll_value_v120(pe, a));
+        sink_->onInputEvent(e);
+    }
+
+    InputEvent frame{};
+    frame.type = InputEventType::PointerFrame;
+    frame.time = time;
+    sink_->onInputEvent(frame);
 }
 
 void LibinputBackend::setOutputLayout(const std::vector<OutputRect>& outputs) {

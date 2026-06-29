@@ -85,6 +85,11 @@ class LibinputBackend : public InputBackend {
     static void closeRestricted_(int fd, void* userdata);
 
     void dispatchEvent(libinput_event* ev);
+    // Emit a scroll group (axis_source, per-axis value [+ value120 for the
+    // wheel source], axis_stop on a 0-value finger/continuous gesture, frame)
+    // from a modern libinput SCROLL_* event. `source` is the wl_pointer
+    // .axis_source enum; `hasV120` selects the wheel high-resolution path.
+    void emitScroll(libinput_event* ev, uint32_t source, bool hasV120);
 
     Seat&        seat_;
     std::string  seatName_;

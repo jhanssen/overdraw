@@ -112,7 +112,9 @@ export function makeVirtualPointer(ctx: Ctx): ZwlrVirtualPointerV1Handler {
     },
     axis_discrete(resource, time, axis, value, discrete) {
       if (!validAxis(ctx, resource, axis)) return;
-      inject({ type: "pointerAxis", serial: 0, time, horizontal: axis === 1, value, discrete });
+      // The seat carries high-resolution steps as value120 (1 detent = 120);
+      // convert this protocol's whole-step `discrete` to that unit.
+      inject({ type: "pointerAxis", serial: 0, time, horizontal: axis === 1, value, value120: discrete * 120 });
     },
     frame(_resource) {
       inject({ type: "pointerFrame", serial: 0, time: 0 });
