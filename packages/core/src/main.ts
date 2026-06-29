@@ -36,6 +36,7 @@ import {
 } from "./plugins/cursor-broker.js";
 import { createCursorThemeResolver } from "./cursor/theme-resolver.js";
 import { resolveScale, logicalSize } from "./output/scale.js";
+import { computeBaseStack } from "./subsurfaces.js";
 import { Kinematics } from "./cursor/kinematics.js";
 import { CursorRuleEngine } from "./cursor/rule-engine.js";
 import { InterceptBroker } from "./intercept/broker.js";
@@ -1245,6 +1246,26 @@ runtime = new PluginRuntime({
     overlays,
     compositor,
     sceneRegistry,
+    // sdk.compose flattening: expand a window set into its full on-screen draw
+    // list (decoration + toplevel + subsurfaces) here, where the subsurface
+    // tree lives, so plugin-composed scenes include subsurface content.
+    flattenWindows: (surfaceIds) => {
+      const wm = state.wm;
+      if (!wm) return [...surfaceIds];
+      const wins = surfaceIds
+        .map((id) => wm.state.windows.find((w) => w.surfaceId === id))
+        .filter((w): w is NonNullable<typeof w> => !!w);
+      return computeBaseStack(state, wins);
+    },
+    outputRegion: (outputId) => {
+      const o = state.outputs?.get(outputId);
+      if (!o) return null;
+      return {
+        x: o.logicalPosition.x, y: o.logicalPosition.y,
+        w: o.logicalSize.width, h: o.logicalSize.height,
+        scale: o.scale > 0 ? o.scale : 1,
+      };
+    },
     interceptBroker,
     // Same decoration-broker plumbing the GPU broker uses for Worker plugins:
     // notify on alloc (with the `decorates` window id) and on present, so the

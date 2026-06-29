@@ -80,6 +80,14 @@ export interface InThreadGpuDeps {
   // Optional: when absent, in-thread SceneHandles still work for direct
   // sampling but lack a .id, so transitions.run will reject them.
   sceneRegistry?: SceneRegistry;
+  // sdk.compose flattening. The compositor has no subsurface tree, so a window
+  // set must be expanded into its full on-screen draw list (decoration +
+  // toplevel + subsurfaces) here, where the protocol state lives. Without
+  // these, compose falls back to the un-expanded (subsurface-dropping) path.
+  flattenWindows?: (surfaceIds: ReadonlyArray<number>) => number[];
+  // The output's GLOBAL-logical rect + scale, for device-resolution compose.
+  outputRegion?: (outputId: number) =>
+    { x: number; y: number; w: number; h: number; scale: number } | null;
   // Phase 10a intercept: the broker the in-thread sdk.intercept SDK
   // talks to directly. Optional: when absent, sdk.intercept.register
   // will reject (the bundled-plugin path either has it or doesn't,

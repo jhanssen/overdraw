@@ -97,6 +97,12 @@ export function createInThreadCompose(
   compositor: CompositorSink,
   hasOutput: (outputId: number) => boolean,
   sceneRegistry?: SceneRegistry,
+  // Expand a window set into its full on-screen draw list (decoration +
+  // toplevel + subsurfaces). Without it, scene compose drops subsurfaces.
+  flattenWindows?: (surfaceIds: ReadonlyArray<number>) => number[],
+  // The output's global-logical rect + scale, for device-resolution compose.
+  outputRegion?: (outputId: number) =>
+    { x: number; y: number; w: number; h: number; scale: number } | null,
 ): PluginCompose | null {
   if (!compositor.composeScene || !compositor.composeWindows
       || !compositor.registerLiveScene || !compositor.registerLiveWindows) {
@@ -105,6 +111,7 @@ export function createInThreadCompose(
   // Locals to satisfy the type checker that these are defined after the
   // guard above (the methods are optional on the interface).
   const composeScene = compositor.composeScene.bind(compositor);
+  const composeRegion = compositor.composeRegion?.bind(compositor);
   const composeWindows = compositor.composeWindows.bind(compositor);
   const registerLiveScene = compositor.registerLiveScene.bind(compositor);
   const registerLiveWindows = compositor.registerLiveWindows.bind(compositor);
@@ -127,11 +134,25 @@ export function createInThreadCompose(
     async scene(args): Promise<SceneHandle> {
       checkOutput(args.outputId);
       if (args.mode === "snapshot") {
-        const r = composeScene({
-          outputId: args.outputId,
-          windows: args.windows,
-          outW: args.outW, outH: args.outH,
-        });
+        // Preferred path: flatten the window set (so subsurface content is
+        // included) and compose at the output's region + scale (device
+        // resolution). Falls back to the un-expanded composeScene only when the
+        // host didn't wire flattening (older harnesses).
+        const region = outputRegion?.(args.outputId) ?? null;
+        const r = (composeRegion && flattenWindows && region)
+          ? composeRegion({
+              drawList: flattenWindows(args.windows),
+              region: {
+                x: region.x, y: region.y,
+                w: args.outW ?? region.w, h: args.outH ?? region.h,
+              },
+              scale: region.scale,
+            })
+          : composeScene({
+              outputId: args.outputId,
+              windows: args.windows,
+              outW: args.outW, outH: args.outH,
+            });
         let released = false;
         const tex = r.texture;
         // Register in the scene registry. onTeardown destroys the
