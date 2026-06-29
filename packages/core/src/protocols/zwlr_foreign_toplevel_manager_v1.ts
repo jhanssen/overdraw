@@ -171,7 +171,9 @@ function emitCommitted(ctx: Ctx, mgr: ManagerState, surfaceId: number,
     ctx.events.zwlr_foreign_toplevel_handle_v1.send_state(handle, buildStateArray(next, activated));
     any = true;
   }
-  if (prev.parent !== next.parent) {
+  // parent is since 3; a handle bound below v3 (manager bound at v1/v2) has no
+  // listener for it and would be aborted.
+  if (prev.parent !== next.parent && handle.version >= 3) {
     const parentHandle = next.parent != null ? mgr.handles.get(next.parent) ?? null : null;
     ctx.events.zwlr_foreign_toplevel_handle_v1.send_parent(handle, parentHandle);
     any = true;

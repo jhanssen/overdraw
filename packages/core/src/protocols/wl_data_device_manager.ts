@@ -81,11 +81,13 @@ function negotiate(d: DragSession): number {
 }
 
 // (Re)send the negotiated action to both the receiver's offer and the source.
+// action is since 3 on both interfaces; a peer bound below v3 has no listener
+// for the opcode and would be aborted, so gate on each resource's version.
 function sendActions(d: DragSession): void {
   const action = negotiate(d);
-  if (d.offer && !d.offer.destroyed)
+  if (d.offer && !d.offer.destroyed && d.offer.version >= 3)
     d.ctx.events.wl_data_offer.send_action(d.offer, action);
-  if (d.source && !d.source.destroyed)
+  if (d.source && !d.source.destroyed && d.source.version >= 3)
     d.ctx.events.wl_data_source.send_action(d.source, action);
 }
 
@@ -121,8 +123,10 @@ function dragMotion(d: DragSession, x: number, y: number,
     dragOfferSession.set(offer, d);
     offerToSource.set(offer, d.source as Resource);
     for (const mime of mimes) d.ctx.events.wl_data_offer.send_offer(offer, mime);
-    // source_actions tells the receiver what the source supports.
-    if (d.source) d.ctx.events.wl_data_offer.send_source_actions(offer, d.sourceActions);
+    // source_actions tells the receiver what the source supports (since 3;
+    // skip for a receiver bound below v3, which has no listener for it).
+    if (d.source && offer.version >= 3)
+      d.ctx.events.wl_data_offer.send_source_actions(offer, d.sourceActions);
     d.focusDevice = device; d.focusClientId = hit.clientId; d.focusSurfaceId = hit.surfaceId;
     d.offer = offer;
     const serial = d.ctx.state.serial();
@@ -149,7 +153,8 @@ function dragButtonReleased(d: DragSession): void {
   const success = d.focusDevice != null && d.offerAccepted && negotiate(d) !== DND.none;
   if (success && d.focusDevice && !d.focusDevice.destroyed) {
     d.ctx.events.wl_data_device.send_drop(d.focusDevice);
-    if (d.source && !d.source.destroyed)
+    // dnd_drop_performed is since 3.
+    if (d.source && !d.source.destroyed && d.source.version >= 3)
       d.ctx.events.wl_data_source.send_dnd_drop_performed(d.source);
     d.dropped = true;
     // The receiver now receive()s + finish()es; we keep the session alive until
@@ -402,7 +407,9 @@ export function makeDataOffer(ctx: Ctx): WlDataOfferHandler {
       // DnD complete: the receiver finished reading. Tell the source.
       const d = dragOfferSession.get(resource);
       if (d && d.dropped) {
-        if (d.source && !d.source.destroyed) ctx.events.wl_data_source.send_dnd_finished(d.source);
+        // dnd_finished is since 3.
+        if (d.source && !d.source.destroyed && d.source.version >= 3)
+          ctx.events.wl_data_source.send_dnd_finished(d.source);
         endDrag(d);
       }
     },

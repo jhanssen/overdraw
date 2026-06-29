@@ -62,8 +62,12 @@ function emitTo(
     resource, rec.logicalPosition.x * xn, rec.logicalPosition.y * xn);
   events.zxdg_output_v1.send_logical_size(
     resource, rec.logicalSize.width * xn, rec.logicalSize.height * xn);
-  events.zxdg_output_v1.send_name(resource, rec.name);
-  events.zxdg_output_v1.send_description(resource, rec.description);
+  // name/description are since 2; an xdg_output bound at v1 (manager bound at
+  // v1) has no listener for them and would be aborted.
+  if (resource.version >= 2) {
+    events.zxdg_output_v1.send_name(resource, rec.name);
+    events.zxdg_output_v1.send_description(resource, rec.description);
+  }
   // xdg_output.done was deprecated in v3 -- clients bound at v3+ derive
   // atomic-commit boundaries from wl_output.done instead. Sending the
   // event to a v3+ client triggers Qt's "most likely a bug in the
@@ -110,8 +114,9 @@ export default function makeXdgOutputManager(ctx: Ctx): ZxdgOutputManagerV1Handl
       // size (-> a bogus scale_factor, then a scale-0 surface that crashes
       // toolkits). Re-send wl_output.done now, after the logical_size, so the
       // client recomputes with a valid logical size. send_done is the output's
-      // atomic-commit signal and is safe to repeat.
-      ctx.events.wl_output.send_done(output);
+      // atomic-commit signal and is safe to repeat. wl_output.done is since 2;
+      // a client that bound wl_output at v1 has no listener for it.
+      if (output.version >= 2) ctx.events.wl_output.send_done(output);
     },
   };
 }
