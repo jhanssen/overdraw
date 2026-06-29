@@ -90,6 +90,11 @@ test("bundled in-thread plugin runs sdk.transitions.run (crossfade)",
       inThreadGpu: {
         coreDevice: device, globals: dawn.globals,
         overlays, compositor, sceneRegistry,
+        // Minimal rig: no WM/subsurface tree, surfaces are full-output and
+        // scale 1, so flattening is identity and the region is the output.
+        flattenWindows: (ids) => [...ids],
+        outputRegion: () => ({ x: 0, y: 0, w: W, h: H, scale: 1 }),
+        windowRegion: () => ({ x: 0, y: 0, w: W, h: H, scale: 1 }),
       },
       // No state.outputs in this minimal test rig; accept any outputId so
       // sdk.compose validation matches the transitions broker's hasOutput.

@@ -245,19 +245,23 @@ nothing, with no error. Worst-first.
   dmabuf-stub limitations above); `wl_seat.get_touch` /
   `wp_cursor_shape.get_tablet_tool_v2` with no advertised capability return an
   inert object rather than posting an error (matches Hyprland; sway errors).
-- **`sdk.compose` window-rendering still has subsurface-dropping fallbacks.**
-  Screen capture (`composeOutput`/`composeRegion`) and `sdk.compose.scene`
-  (snapshot, the path bundled workspace transitions use) now flatten window
-  subtrees (decoration + toplevel + subsurfaces) and compose at device scale.
-  STILL un-flattened (flagged FOOTGUN in `ctx.ts`): the compositor's
-  `composeScene`/`composeWindows` (kept only as fallbacks for hosts that didn't
-  wire flattening); `sdk.compose.windows` snapshot (should move to per-window
-  `composeRegion(computeBaseStack([id]))`); and the `registerLiveScene`/
-  `registerLiveWindows` LIVE variants — unused by bundled plugins
-  (`mode:"live"` is never requested), and a correct fix needs a per-frame
-  re-flatten (a `getDrawList` callback the compositor calls each frame) plus a
-  region/scale. Retire `composeScene`/`composeWindows` once the harness wires
-  flattening.
+- **`sdk.compose` window-rendering now flattens subsurfaces on every production
+  path; two narrow residuals remain.** Screen capture
+  (`composeOutput`/`composeRegion`), `sdk.compose.scene` (snapshot + live), and
+  `sdk.compose.windows` (snapshot) all expand window subtrees (decoration +
+  toplevel + subsurfaces, via `computeBaseStack`) and compose at device scale
+  through `composeRegion`. The state-backed flatteners (`makeComposeFlatteners`)
+  are wired in both `main.ts` and the test harness, so the in-thread compose SDK
+  uses the subsurface-correct path (it returns null rather than a
+  subsurface-dropping fallback if a host doesn't wire them). Residuals:
+  (1) `sdk.compose.scene` LIVE flattens ONCE at registration — subsurfaces
+  committed afterward aren't picked up and the live pass is still logical-res;
+  the full fix is a per-frame re-flatten (`getDrawList` callback + region/scale)
+  in `registerLiveScene`, which also covers the still-flat `registerLiveWindows`.
+  (2) The compositor's `composeScene`/`composeWindows` remain as low-level FLAT
+  primitives (flagged FOOTGUN in `ctx.ts`) — no production caller uses them now,
+  but `test/compose.gpu.mjs` exercises them directly; retire once that test moves
+  to `composeRegion`.
 
 - **`sdk.compose.windows` is in-thread-only.** Worker variant throws "not
   yet implemented for Worker plugins" (loud failure, not silent).

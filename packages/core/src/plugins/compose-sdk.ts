@@ -107,15 +107,16 @@ export function createInThreadCompose(
   windowRegion?: (surfaceId: number) =>
     { x: number; y: number; w: number; h: number; scale: number } | null,
 ): PluginCompose | null {
-  if (!compositor.composeScene || !compositor.composeWindows
+  // The subsurface-correct path needs composeRegion + the state-backed
+  // flatteners. Without them (a host that didn't wire flattening), in-thread
+  // compose is unavailable rather than silently subsurface-dropping.
+  if (!compositor.composeRegion || !flattenWindows || !outputRegion || !windowRegion
       || !compositor.registerLiveScene || !compositor.registerLiveWindows) {
     return null;
   }
   // Locals to satisfy the type checker that these are defined after the
   // guard above (the methods are optional on the interface).
-  const composeScene = compositor.composeScene.bind(compositor);
-  const composeRegion = compositor.composeRegion?.bind(compositor);
-  const composeWindows = compositor.composeWindows.bind(compositor);
+  const composeRegion = compositor.composeRegion.bind(compositor);
   const registerLiveScene = compositor.registerLiveScene.bind(compositor);
   const registerLiveWindows = compositor.registerLiveWindows.bind(compositor);
   // When the caller hasn't passed a shared registry, fall back to a
@@ -137,25 +138,18 @@ export function createInThreadCompose(
     async scene(args): Promise<SceneHandle> {
       checkOutput(args.outputId);
       if (args.mode === "snapshot") {
-        // Preferred path: flatten the window set (so subsurface content is
-        // included) and compose at the output's region + scale (device
-        // resolution). Falls back to the un-expanded composeScene only when the
-        // host didn't wire flattening (older harnesses).
-        const region = outputRegion?.(args.outputId) ?? null;
-        const r = (composeRegion && flattenWindows && region)
-          ? composeRegion({
-              drawList: flattenWindows(args.windows),
-              region: {
-                x: region.x, y: region.y,
-                w: args.outW ?? region.w, h: args.outH ?? region.h,
-              },
-              scale: region.scale,
-            })
-          : composeScene({
-              outputId: args.outputId,
-              windows: args.windows,
-              outW: args.outW, outH: args.outH,
-            });
+        // Flatten the window set (subsurfaces included) and compose at the
+        // output's region + scale (device resolution).
+        const region = outputRegion(args.outputId);
+        if (!region) throw new Error(`sdk.compose.scene: no region for output ${args.outputId}`);
+        const r = composeRegion({
+          drawList: flattenWindows(args.windows),
+          region: {
+            x: region.x, y: region.y,
+            w: args.outW ?? region.w, h: args.outH ?? region.h,
+          },
+          scale: region.scale,
+        });
         let released = false;
         const tex = r.texture;
         // Register in the scene registry. onTeardown destroys the
@@ -177,10 +171,13 @@ export function createInThreadCompose(
           },
         };
       }
-      // mode === 'live'
+      // mode === 'live': flatten ONCE so subsurfaces are included; the live
+      // pass re-composites this list each frame. (Subsurfaces committed after
+      // registration aren't picked up, and the live pass is still logical-res
+      // -- the full fix is a per-frame re-flatten in registerLiveScene.)
       const h: LiveSceneHandle = registerLiveScene({
         outputId: args.outputId,
-        windows: args.windows,
+        windows: flattenWindows(args.windows),
         outW: args.outW, outH: args.outH,
       });
       const tex = h.texture;
@@ -200,40 +197,25 @@ export function createInThreadCompose(
     async windows(args): Promise<WindowComposition> {
       checkOutput(args.outputId);
       if (args.mode === "snapshot") {
-        // Preferred path: compose each window's full subtree (subsurfaces
-        // included) over its outer rect at device scale. The crop rect (unused
-        // by bundled plugins) is not honored on this path.
-        if (composeRegion && flattenWindows && windowRegion) {
-          const results: Array<{ id: number; texture: GPUTexture;
-                                 rect: { x: number; y: number; w: number; h: number } }> = [];
-          for (const w of args.windows) {
-            const reg = windowRegion(w.id);
-            if (!reg) continue;
-            const rect = { x: reg.x, y: reg.y, w: reg.w, h: reg.h };
-            const cr = composeRegion({ drawList: flattenWindows([w.id]), region: rect, scale: reg.scale });
-            results.push({ id: w.id, texture: cr.texture, rect });
-          }
-          let releasedR = false;
-          return {
-            windows: results,
-            async release(): Promise<void> {
-              if (releasedR) return;
-              releasedR = true;
-              for (const w of results) w.texture.destroy();
-            },
-          };
+        // Compose each window's full subtree (subsurfaces included) over its
+        // outer rect at device scale. The crop rect (unused by bundled plugins)
+        // is not honored on this path.
+        const results: Array<{ id: number; texture: GPUTexture;
+                               rect: { x: number; y: number; w: number; h: number } }> = [];
+        for (const w of args.windows) {
+          const reg = windowRegion(w.id);
+          if (!reg) continue;
+          const rect = { x: reg.x, y: reg.y, w: reg.w, h: reg.h };
+          const cr = composeRegion({ drawList: flattenWindows([w.id]), region: rect, scale: reg.scale });
+          results.push({ id: w.id, texture: cr.texture, rect });
         }
-        const r = composeWindows({
-          outputId: args.outputId,
-          windows: args.windows,
-        });
-        let released = false;
+        let releasedR = false;
         return {
-          windows: r.map((w) => ({ id: w.id, texture: w.texture, rect: w.rect })),
+          windows: results,
           async release(): Promise<void> {
-            if (released) return;
-            released = true;
-            for (const w of r) w.texture.destroy();
+            if (releasedR) return;
+            releasedR = true;
+            for (const w of results) w.texture.destroy();
           },
         };
       }

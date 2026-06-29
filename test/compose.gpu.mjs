@@ -313,13 +313,19 @@ test("createInThreadCompose wraps the compositor compose methods", { skip }, asy
   const { createInThreadCompose } = await import(
     "../packages/core/dist/plugins/compose-sdk.js"
   );
+  const { makeComposeFlatteners } = await import(
+    "../packages/core/dist/subsurfaces.js"
+  );
   try {
     const color = 0xff2080c0;
     const { ready } = c.spawnClient([FILL, "--color", color.toString(16)]);
     await ready;
     const { w } = await waitMappedColored(c, color);
 
-    const sdkCompose = createInThreadCompose(c.jsCompositor, (id) => id === 0);
+    const fl = makeComposeFlatteners(c.state);
+    const sdkCompose = createInThreadCompose(
+      c.jsCompositor, (id) => id === 0, undefined,
+      fl.flattenWindows, fl.outputRegion, fl.windowRegion);
     assert.ok(sdkCompose, "createInThreadCompose returns non-null when compositor exposes the methods");
 
     // snapshot
