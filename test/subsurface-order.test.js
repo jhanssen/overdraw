@@ -172,6 +172,22 @@ test('queue drained after apply', () => {
   assert.deepEqual(idsAfter(state, parent), [120, 110]);
 });
 
+test('returns true only when an op was applied (drives the stack-rebuild skip)', () => {
+  const { state, parent, subsurfaces } = setup(1, [10, 20]);
+  // No pending ops -> false (a plain content commit must NOT rebuild the stack).
+  assert.equal(applySubsurfaceReorder(state, parent), false);
+  // A queued reorder -> true (the draw stack changed, caller rebuilds).
+  state.subsurfacePendingOrder.set(parent, [
+    { op: 'above', subsurface: findBySubId(subsurfaces, 10),
+      sibling: findSurfaceBySubId(subsurfaces, 20) },
+  ]);
+  assert.equal(applySubsurfaceReorder(state, parent), true);
+  // Queue now drained -> false again.
+  assert.equal(applySubsurfaceReorder(state, parent), false);
+  // Unknown parent -> false.
+  assert.equal(applySubsurfaceReorder(state, { id: 999 }), false);
+});
+
 // --- no-op cases ------------------------------------------------------
 
 test('no pending ops: order unchanged', () => {

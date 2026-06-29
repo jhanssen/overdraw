@@ -85,20 +85,23 @@ function childrenOf(state: CompositorState, parent: Resource): SubsurfaceRecord[
 // Multiple ops in arrival order: each runs against the result of the
 // previous. The wl_subsurface spec says successive operations stack
 // without explicit ordering rules; arrival order is the natural choice.
-export function applySubsurfaceReorder(state: CompositorState, parent: Resource): void {
+// Returns true if any reorder op was applied (the draw stack changed), so the
+// caller can rebuild the stack only when something actually moved.
+export function applySubsurfaceReorder(state: CompositorState, parent: Resource): boolean {
   const queue = state.subsurfacePendingOrder?.get(parent);
-  if (!queue || queue.length === 0) return;
+  if (!queue || queue.length === 0) return false;
   const order = state.subsurfaceOrder?.get(parent);
   if (!order) {
     // Defensive: queue refers to a parent with no child list (shouldn't
     // happen -- get_subsurface populates the list). Drop the queue.
     state.subsurfacePendingOrder?.delete(parent);
-    return;
+    return false;
   }
   for (const op of queue) {
     applyOneReorder(state, parent, order, op);
   }
   state.subsurfacePendingOrder?.delete(parent);
+  return true;
 }
 
 function applyOneReorder(

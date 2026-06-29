@@ -234,7 +234,16 @@ function snapshotRegionArg(
 // managed state of its children), then CASCADE into every effective-sync child:
 // the child's cached state is applied atomically with this (parent) apply. This
 // is the spec's "cached state applied immediately after the parent's state".
-function applySurfaceState(ctx: Ctx, s: SurfaceRecord, bufferFresh: boolean): void {
+// Returns true if this commit changed the draw stack and the caller must
+// rebuild it: a (sub)surface gained content for the first time (so it now needs
+// a stack slot), or a subsurface position / sibling-order change was applied.
+// A plain content re-commit (a new video frame, same geometry and order)
+// returns false, so the per-frame fast path skips the global stack rebuild.
+// Accumulates across the effective-sync child cascade, so one commit rebuilds
+// at most once regardless of subtree depth.
+function applySurfaceState(ctx: Ctx, s: SurfaceRecord, bufferFresh: boolean): boolean {
+  const hadContent = !!s.hasContent;
+  let needsStackRebuild = false;
   // Apply (upload + schedule release of) the committed buffer ONLY when a
   // fresh wl_buffer.attach accompanied this commit. Per spec a commit with no
   // preceding attach leaves the surface contents unchanged; re-running the
@@ -315,11 +324,12 @@ function applySurfaceState(ctx: Ctx, s: SurfaceRecord, bufferFresh: boolean): vo
   // Subsurface-managed state (position + sibling reorder) of THIS
   // surface's children is applied on THIS surface's commit, regardless
   // of child mode (spec).
-  applySubsurfaceReorder(ctx.state, s.resource);
+  if (applySubsurfaceReorder(ctx.state, s.resource)) needsStackRebuild = true;
   const subs = ctx.state.subsurfaces;
   if (subs) {
     for (const sub of subs.values()) {
       if (sub.parent !== s.resource) continue;
+      if (sub.x !== sub.pendingX || sub.y !== sub.pendingY) needsStackRebuild = true;
       sub.x = sub.pendingX;
       sub.y = sub.pendingY;
       // Cascade: apply each effective-sync child's cached commit atomically.
@@ -359,12 +369,15 @@ function applySurfaceState(ctx: Ctx, s: SurfaceRecord, bufferFresh: boolean): vo
           (childRec.committed.bufferDamage ??= []).push(...childRec.cached.bufferDamage);
         }
         childRec.cached = undefined;
-        applySurfaceState(ctx, childRec, childBufferFresh);
+        if (applySurfaceState(ctx, childRec, childBufferFresh)) needsStackRebuild = true;
       }
     }
   }
 
-  if (s.hasContent) applySubsurfaces(ctx.state);
+  // A surface entering the draw stack (first content) needs a rebuild; further
+  // content commits on an already-drawn surface do not.
+  if (!hadContent && s.hasContent) needsStackRebuild = true;
+  return needsStackRebuild;
 }
 
 export default function makeSurface(ctx: Ctx): WlSurfaceHandler {
@@ -602,7 +615,13 @@ export default function makeSurface(ctx: Ctx): WlSurfaceHandler {
         if (pendAcq || pendRel) {
           promoteSyncobjForCommit(s, pendAcq, pendRel, ctx);
         }
-        applySurfaceState(ctx, s, attachedThisCommit || cachedBufferFresh);
+        // Rebuild the draw stack only when this commit actually changed it
+        // (a surface gained content, or a subsurface moved/reordered) -- not on
+        // every content commit. Map/unmap, window move/resize, workspace and
+        // subsurface add/remove drive their own rebuilds elsewhere.
+        if (applySurfaceState(ctx, s, attachedThisCommit || cachedBufferFresh)) {
+          applySubsurfaces(ctx.state);
+        }
       }
 
       if (s.xdgSurface) s.xdgSurface.lastCommitSerial = ctx.state.nextSerial - 1;
