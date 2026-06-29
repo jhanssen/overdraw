@@ -156,6 +156,11 @@ export interface OverdrawConfig {
     displayNumber?: number | null;
     scale?: number;
   };
+  // exec-once: commands launched detached at startup with WAYLAND_DISPLAY set
+  // (and DISPLAY when Xwayland is enabled). A bare string runs via `sh -c`
+  // (shell parsing, like Hyprland's exec-once); `{ command, args }` execs
+  // directly with no shell.
+  autostart?: (string | { command: string; args?: string[] })[];
 }
 
 // Handler signature for OverdrawConfig.actions entries.
@@ -232,6 +237,9 @@ export interface ResolvedConfig {
     // 0 = auto (ceil(max output scale) at start, clamped to [1,3]); 1..3 = explicit.
     scale: number;
   };
+  // exec-once commands, normalized to direct command+args (bare strings become
+  // `sh -c <string>`). Spawned detached at startup by main.ts.
+  autostart: { command: string; args: string[] }[];
   // Absolute path of the config file that was loaded, or null if none was found
   // (built-in defaults in effect).
   sourcePath: string | null;

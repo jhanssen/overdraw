@@ -227,9 +227,32 @@ function normalize(raw: unknown, path: string): ResolvedConfig {
     };
   }
 
+  // autostart (exec-once). Bare strings run through `sh -c` (shell parsing);
+  // { command, args } execs directly.
+  const autostart: { command: string; args: string[] }[] = [];
+  if (cfg.autostart !== undefined) {
+    if (!Array.isArray(cfg.autostart)) fail("`autostart` must be an array", path);
+    for (const e of cfg.autostart) {
+      if (typeof e === "string") {
+        if (e.length === 0) fail("`autostart` entries must be non-empty strings", path);
+        autostart.push({ command: "sh", args: ["-c", e] });
+      } else if (e !== null && typeof e === "object"
+          && typeof (e as { command?: unknown }).command === "string"
+          && (e as { command: string }).command.length > 0) {
+        const o = e as { command: string; args?: unknown };
+        const args = Array.isArray(o.args)
+          ? o.args.filter((a): a is string => typeof a === "string") : [];
+        autostart.push({ command: o.command, args });
+      } else {
+        fail("`autostart` entries must be a non-empty string or { command, args }", path);
+      }
+    }
+  }
+
   return {
     output, card, scale, outputsByKey,
-    focus, hotkeys, decoration, layout, actions, plugins, xwayland, sourcePath: path,
+    focus, hotkeys, decoration, layout, actions, plugins, xwayland, autostart,
+    sourcePath: path,
   };
 }
 
@@ -243,6 +266,7 @@ export async function loadConfig(explicit: string | null): Promise<ResolvedConfi
       focus: undefined, hotkeys: undefined,
       decoration: undefined, layout: undefined, actions: undefined, plugins: [],
       xwayland: { enabled: false, terminate: false, xwaylandPath: null, displayNumber: 50, scale: 0 },
+      autostart: [],
       sourcePath: null,
     };
   }

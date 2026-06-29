@@ -85,6 +85,39 @@ test('output.card: override, default, and validation', async () => {
   rmSync(dir, { recursive: true, force: true });
 });
 
+test('autostart: strings -> sh -c, objects -> direct, default empty, validation', async () => {
+  const dir = tmp();
+  let n = 0;
+  const write = (body) => {
+    const p = join(dir, `as-${n++}.mjs`);
+    writeFileSync(p, body);
+    return p;
+  };
+  // absent -> []
+  let c = await loadConfig(write('export default {}'));
+  assert.deepEqual(c.autostart, []);
+  // bare string -> sh -c (shell parsing); object -> direct command+args
+  c = await loadConfig(write(
+    'export default { autostart: ["waybar & swaync", { command: "firefox", args: ["-P"] }] }'));
+  assert.deepEqual(c.autostart, [
+    { command: 'sh', args: ['-c', 'waybar & swaync'] },
+    { command: 'firefox', args: ['-P'] },
+  ]);
+  // object without args -> empty args
+  c = await loadConfig(write('export default { autostart: [{ command: "kitty" }] }'));
+  assert.deepEqual(c.autostart, [{ command: 'kitty', args: [] }]);
+  // invalid: not an array
+  await assert.rejects(() => loadConfig(write('export default { autostart: "waybar" }')),
+    /autostart/);
+  // invalid: empty string entry
+  await assert.rejects(() => loadConfig(write('export default { autostart: [""] }')),
+    /autostart/);
+  // invalid: object without command
+  await assert.rejects(() => loadConfig(write('export default { autostart: [{ args: ["x"] }] }')),
+    /autostart/);
+  rmSync(dir, { recursive: true, force: true });
+});
+
 test('output.scale: override, default, and validation', async () => {
   const dir = tmp();
   let n = 0;
