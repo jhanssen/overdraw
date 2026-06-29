@@ -245,6 +245,19 @@ nothing, with no error. Worst-first.
   dmabuf-stub limitations above); `wl_seat.get_touch` /
   `wp_cursor_shape.get_tablet_tool_v2` with no advertised capability return an
   inert object rather than posting an error (matches Hyprland; sway errors).
+- **`sdk.compose` window-rendering still has subsurface-dropping fallbacks.**
+  Screen capture (`composeOutput`/`composeRegion`) and `sdk.compose.scene`
+  (snapshot, the path bundled workspace transitions use) now flatten window
+  subtrees (decoration + toplevel + subsurfaces) and compose at device scale.
+  STILL un-flattened (flagged FOOTGUN in `ctx.ts`): the compositor's
+  `composeScene`/`composeWindows` (kept only as fallbacks for hosts that didn't
+  wire flattening); `sdk.compose.windows` snapshot (should move to per-window
+  `composeRegion(computeBaseStack([id]))`); and the `registerLiveScene`/
+  `registerLiveWindows` LIVE variants — unused by bundled plugins
+  (`mode:"live"` is never requested), and a correct fix needs a per-frame
+  re-flatten (a `getDrawList` callback the compositor calls each frame) plus a
+  region/scale. Retire `composeScene`/`composeWindows` once the harness wires
+  flattening.
 
 - **`sdk.compose.windows` is in-thread-only.** Worker variant throws "not
   yet implemented for Worker plugins" (loud failure, not silent).
