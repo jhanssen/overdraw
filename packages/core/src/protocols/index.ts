@@ -198,29 +198,29 @@ export async function installProtocols(
   if (!opts.compositor) {
     throw new Error("installProtocols requires opts.compositor (the JS compositor)");
   }
-  // Wrap the compositor sink with a setSurfaceLayout interceptor so any
-  // geometry change triggers a wl_surface.enter/leave diff for the affected
-  // surface. The wrapper delegates to the underlying sink first (so
-  // surfaceOutputs sees the new rect) then runs the residency update.
   const rawCompositor = opts.compositor;
-  const layoutInterceptor: import("./ctx.js").CompositorSink = new Proxy(rawCompositor, {
-    get(target, prop, receiver) {
-      if (prop !== "setSurfaceLayout") return Reflect.get(target, prop, receiver);
-      return function setSurfaceLayoutWrapped(
-        id: number, x: number, y: number, w: number, h: number,
-      ): void {
-        target.setSurfaceLayout(id, x, y, w, h);
-        const rec = state.surfacesById?.get(id);
-        if (rec) updateSurfaceOutputResidency(state, addon, rec);
-      };
-    },
-  });
   const state: CompositorState = {
     surfaces: new Map(),
-    compositor: layoutInterceptor,
+    compositor: rawCompositor,
     nextSerial: 1,
     serial() { return this.nextSerial++; },
   };
+  // Intercept setSurfaceLayout in place so a geometry change triggers a
+  // wl_surface.enter/leave residency diff for the affected surface (delegating
+  // to the underlying sink first, so surfaceOutputs sees the new rect). Done by
+  // replacing the single method rather than wrapping the sink in a Proxy: a
+  // Proxy traps EVERY property access, so the hot per-frame path (renderFrame,
+  // surfaceOutputs, the take*() drains) would pay a get-trap + Reflect.get and
+  // a megamorphic receiver on each `state.compositor.x`. Patching one method
+  // leaves every other access a direct, inline-cacheable property read.
+  const innerSetSurfaceLayout = rawCompositor.setSurfaceLayout?.bind(rawCompositor);
+  if (innerSetSurfaceLayout) {
+    rawCompositor.setSurfaceLayout = (id, x, y, w, h): void => {
+      innerSetSurfaceLayout(id, x, y, w, h);
+      const rec = state.surfacesById?.get(id);
+      if (rec) updateSurfaceOutputResidency(state, addon, rec);
+    };
+  }
   if (opts.bus) state.bus = opts.bus;
   if (opts.pluginBus) state.pluginBus = opts.pluginBus;
   if (opts.reservedZones) state.reservedZones = opts.reservedZones;
