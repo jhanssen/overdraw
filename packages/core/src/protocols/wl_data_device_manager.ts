@@ -200,8 +200,11 @@ function updateDragIcon(d: DragSession, x: number, y: number): void {
   if (!d.icon || d.icon.destroyed) return;
   const rec = d.ctx.state.surfaces.get(d.icon);
   if (!rec) return;
-  // Position the icon at the pointer; it draws on top via the stack rebuild.
-  d.ctx.state.compositor.setSurfaceLayout(rec.id, Math.round(x), Math.round(y), 0, 0);
+  // Position the icon at the pointer, shifted by its accumulated buffer offset
+  // (clients attach with a negative offset to place the grab point under the
+  // cursor). Draws on top via the stack rebuild.
+  d.ctx.state.compositor.setSurfaceLayout(
+    rec.id, Math.round(x + (rec.offsetDx ?? 0)), Math.round(y + (rec.offsetDy ?? 0)), 0, 0);
   pushDragIconStack(d, rec.id);
 }
 function pushDragIconStack(d: DragSession, iconId: number): void {

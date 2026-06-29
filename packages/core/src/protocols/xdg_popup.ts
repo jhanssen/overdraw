@@ -220,8 +220,10 @@ function appendPopups(
     if (!includePopup(pr)) continue;
     const origin = popupOutputOrigin(state, pr);
     if (!origin) continue;
-    const px = origin.x + pr.rect.x, py = origin.y + pr.rect.y;
-    state.compositor.setSurfaceLayout(pr.xdgSurface.surface.id, px, py, 0, 0);
+    const surf = pr.xdgSurface.surface;
+    const px = origin.x + pr.rect.x + (surf.offsetDx ?? 0);
+    const py = origin.y + pr.rect.y + (surf.offsetDy ?? 0);
+    state.compositor.setSurfaceLayout(surf.id, px, py, 0, 0);
     stack.push(pr.xdgSurface.surface.id);
     // A popup is a wl_surface and may itself parent subsurfaces; place its
     // subsurface subtree above it (same walk as for window roots).

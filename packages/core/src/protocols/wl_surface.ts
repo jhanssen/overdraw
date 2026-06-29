@@ -363,9 +363,14 @@ export default function makeSurface(ctx: Ctx): WlSurfaceHandler {
   const rec = (resource: Resource) => ctx.state.surfaces.get(resource);
 
   return {
-    attach(resource, buffer, _x, _y) {
+    attach(resource, buffer, x, y) {
       const s = rec(resource);
-      if (s) s.pending.buffer = buffer; // wl_buffer wrapper or null
+      if (!s) return;
+      s.pending.buffer = buffer; // wl_buffer wrapper or null
+      // Pre-v5 attach carries the buffer offset; v5+ clients pass 0 here and
+      // use the offset request instead (a non-zero offset on a v5 attach is a
+      // protocol error we don't currently post -- it arrives as 0 in practice).
+      if (x !== 0 || y !== 0) { s.pending.offsetX = x; s.pending.offsetY = y; }
     },
     damage(resource, x, y, w, h) {
       const s = rec(resource);
@@ -424,7 +429,10 @@ export default function makeSurface(ctx: Ctx): WlSurfaceHandler {
       }
       s.pending.bufferScale = scale;
     },
-    offset(_resource, _x, _y) {},
+    offset(resource, x, y) {
+      const s = rec(resource);
+      if (s) { s.pending.offsetX = x; s.pending.offsetY = y; }
+    },
     commit(resource) {
       const s = rec(resource);
       if (!s) return;
@@ -442,6 +450,14 @@ export default function makeSurface(ctx: Ctx): WlSurfaceHandler {
       if (s.pending.bufferTransform !== undefined) {
         s.committed.bufferTransform = s.pending.bufferTransform;
         s.pending.bufferTransform = undefined;
+      }
+      // Buffer offset accumulates into the surface's placement delta (consumed
+      // by the DnD drag-icon and popup positioning).
+      if (s.pending.offsetX !== undefined || s.pending.offsetY !== undefined) {
+        s.offsetDx = (s.offsetDx ?? 0) + (s.pending.offsetX ?? 0);
+        s.offsetDy = (s.offsetDy ?? 0) + (s.pending.offsetY ?? 0);
+        s.pending.offsetX = undefined;
+        s.pending.offsetY = undefined;
       }
       // Damage travels with the buffer (double-buffered); accumulate into the
       // commit set (cleared by the upload in applySurfaceState).

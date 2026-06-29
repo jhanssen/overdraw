@@ -78,6 +78,11 @@ export interface SurfaceRecord {
     // wl_surface.set_buffer_transform (double-buffered): wl_output.transform
     // enum 0..7. Default 0 (normal).
     bufferTransform?: number;
+    // wl_surface buffer offset for this commit (attach dx/dy pre-v5, or the v5
+    // offset request), in surface-local pixels. undefined = unchanged this
+    // cycle. Promoted into the accumulated offsetDx/offsetDy on commit.
+    offsetX?: number;
+    offsetY?: number;
     // wp_viewport state (double-buffered): undefined = unchanged this cycle,
     // null = unset/clear, value = set. src crop in surface coords; dst is the
     // surface's logical size override.
@@ -154,6 +159,12 @@ export interface SurfaceRecord {
   // (role === "layer_surface"). Exclusive with xdgSurface (a wl_surface
   // has at most one role).
   layerSurface?: LayerSurfaceRecord | null;
+  // Accumulated wl_surface buffer offset (sum of committed attach/offset
+  // deltas), surface-local pixels. Applied to surface placement where it's
+  // observable: the DnD drag-icon and popups. Toplevel/subsurface placement
+  // ignores it (those are positioned by the WM / subsurface coords).
+  offsetDx?: number;
+  offsetDy?: number;
   mapped?: boolean;
   hasContent?: boolean;  // a buffer has been committed + uploaded at least once
   // Set once the window's unmap teardown has run (explicit wl_surface.destroy OR
