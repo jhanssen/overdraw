@@ -375,6 +375,17 @@ export interface CompositorSink {
   // unmapped / off-screen surface. Used by the per-output frame-callback
   // dispatch (a surface on a 60Hz output gets wl_callback.done at 60Hz).
   surfaceOutputs?(surfaceId: number): number[];
+  // Outputs presented since the last call (drained). A presented output has a
+  // flip in flight whose flip-complete delivers its frame callbacks, so the
+  // idle frame-callback path skips it. See dispatchFrameCallbacks.
+  takePresentedOutputs?(): number[];
+  // True while a committed buffer for this surface is still being applied (shm
+  // upload not yet acked, or dmabuf import not yet bound) -- its damage is
+  // deferred until then. Frame callbacks for such a surface wait for the
+  // upcoming present rather than the idle tick.
+  surfaceHasContentInFlight?(surfaceId: number): boolean;
+  // Whether an output has damage queued (a present is pending for it).
+  isOutputDirty?(outputId: number): boolean;
   // Notify the compositor that a client wl_buffer was destroyed (explicit
   // wl_buffer.destroy or disconnect sweep). Drives cache invalidation in
   // the client-buffer lifecycle (rule A: along with surfaceRemoved, the

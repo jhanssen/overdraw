@@ -1049,6 +1049,12 @@ export class JsCompositor implements CompositorSink {
   private shmUploadDamage = new Map<number, { id: number;
     damage: ReadonlyArray<{ x: number; y: number; width: number; height: number }> | null }>();
 
+  // Outputs presented since the last takePresentedOutputs() drain. A present
+  // means a page-flip is in flight whose flip-complete will deliver that
+  // output's frame callbacks; the dispatch layer consults this so it doesn't
+  // also deliver them off the idle tick (which would race ahead of the flip).
+  private presentedOutputs = new Set<number>();
+
   // Composite-scissor damage in GLOBAL logical coords, partitioned per
   // output (one OutputDamageRing per output, each keyed by the stable
   // acquireOutputTexture handle of its slots). The map clips global damage
@@ -1748,6 +1754,32 @@ export class JsCompositor implements CompositorSink {
       if (d) { this.shmUploadDamage.delete(seq); this.damageSurfaceRegion(d.id, d.damage); }
     }
     return acks;
+  }
+
+  // Drain the set of outputs presented since the last call.
+  takePresentedOutputs(): number[] {
+    if (this.presentedOutputs.size === 0) return [];
+    const out = [...this.presentedOutputs];
+    this.presentedOutputs.clear();
+    return out;
+  }
+
+  // True while a committed buffer for this surface is still being applied: an
+  // shm upload not yet acked, or a dmabuf import not yet bound. Both defer the
+  // surface's output damage until completion, so such a surface has a present
+  // coming -- its frame callbacks wait for that present's flip-complete rather
+  // than being delivered off the idle tick (which would let it free-run).
+  surfaceHasContentInFlight(id: number): boolean {
+    for (const d of this.shmUploadDamage.values()) if (d.id === id) return true;
+    for (const p of this.dmabufPending.values()) {
+      if (p.pendingInstalls.includes(id)) return true;
+    }
+    return false;
+  }
+
+  // Whether an output still has damage queued (a present is pending for it).
+  isOutputDirty(id: number): boolean {
+    return this.outputDamage.isDirty(id);
   }
 
   // Wire up a wgpu::Texture (already InjectTexture'd at the GPU process by
@@ -3020,7 +3052,7 @@ export class JsCompositor implements CompositorSink {
       // markDirty between this clear and the next vblank re-sets the bit
       // and the gate fires again on the next pass.
       for (const t of targets) {
-        if (t.present) this.addon.presentOutput(t.ctx.id);
+        if (t.present) { this.addon.presentOutput(t.ctx.id); this.presentedOutputs.add(t.ctx.id); }
         this.outputDamage.clearDirty(t.ctx.id);
       }
       this.outputTex = null;

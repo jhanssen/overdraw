@@ -381,6 +381,14 @@ class Compositor {
         out.swap(shmUploadAcks_);
         return out;
     }
+    // True while an ShmUploaded ack has arrived but not yet been drained.
+    // Each ack carries a surface's deferred output damage (applied JS-side on
+    // drain, in dispatchFrameCallbacks), so a pending ack is "new renderable
+    // state arrived" -- the addon's poll handlers consult this to wake the
+    // frame loop, the same role a flip-complete plays. Without the wake an idle
+    // compositor would strand the damage until an unrelated event (input,
+    // another output's flip) happens to run a frame.
+    bool hasShmUploadAcks() const { return !shmUploadAcks_.empty(); }
     // Destroy a plugin ring slot's surfaceBuf on the GPU process + reclaim the
     // core-side reservation/status. Caller gates on the consumer GPU read completing.
     void releaseSurfaceBuf(uint32_t surfaceBufId);

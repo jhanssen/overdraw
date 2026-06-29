@@ -663,6 +663,11 @@ void onWireReadable(uv_poll_t*, int status, int events) {
         // drainCtrl may have observed a ScanoutFlipComplete / FrameComplete;
         // route it to the wake state machine.
         if (g_addon.compositor->takeFrameComplete()) onFrameComplete();
+        // An shm upload completed: its ack carries deferred output damage that
+        // JS applies on drain (dispatchFrameCallbacks -> takeShmUploadAcks).
+        // Wake so an idle compositor renders it now instead of stranding it
+        // until the next unrelated wake (input / another output's flip).
+        if (g_addon.compositor->hasShmUploadAcks()) wake();
         napi_close_handle_scope(g_addon.env, scope);
     }
     armWirePoll();  // update WRITABLE arming based on remaining queue
@@ -686,6 +691,7 @@ void onCtrlReadable(uv_poll_t*, int status, int events) {
         fireOutputModes(g_addon.env);
         advanceAllPending(g_addon.env);
         if (g_addon.compositor->takeFrameComplete()) onFrameComplete();
+        if (g_addon.compositor->hasShmUploadAcks()) wake();  // see onWireReadable
         armWirePoll();  // finishing an import flushes wire output (bind group etc.)
     }
     armCtrlPoll();  // re-arm UV_WRITABLE based on remaining queue

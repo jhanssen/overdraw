@@ -23,6 +23,7 @@ import { unmapAndTeardownSurface } from "./wl_surface.js";
 import { rebuildStackWithPopups, maybeDismissGrabbedPopup, flushDeferredOutputStacks } from "./xdg_popup.js";
 import { configureToplevel } from "./xdg_surface.js";
 import { updateSurfaceOutputResidency } from "./surface-residency.js";
+import { shouldDeliverFrameCallbackIdle } from "./frame-callbacks.js";
 import { installCrossOutputMove } from "./cross-output-move.js";
 import { makeOutputForOutput } from "./wl_output.js";
 import type { Addon, EventsByInterface, EventSenders } from "../types.js";
@@ -443,6 +444,13 @@ export async function installProtocols(
   // geometry / focus / stacking. See src/query.ts.
   state.query = () => queryState(state);
 
+  // Outputs with a present in flight: added when renderFrame presents them,
+  // cleared when their flip-complete arrives (dispatchFrameCallbacksForOutput).
+  // While an output is here, its frame callbacks are delivered by that flip-
+  // complete; the idle frame-callback path skips it so it doesn't deliver ahead
+  // of the flip.
+  const awaitingFlip = new Set<number>();
+
   // Fire pending wl_surface.frame callbacks. Clients drive their render loop off
   // these (commit -> request frame -> draw next frame on done), so without this
   // a client renders one frame and waits forever. Called once per compositor
@@ -694,6 +702,32 @@ export async function installProtocols(
     // commits + any newly-mapped windows. The native path renders on its own
     // libuv timer, so its renderFrame is undefined (no-op here).
     state.compositor.renderFrame?.();
+
+    // Outputs renderFrame just presented have a flip in flight; their frame
+    // callbacks are delivered when that flip completes (below). Record them so
+    // the idle path that follows skips them.
+    for (const o of state.compositor.takePresentedOutputs?.() ?? []) awaitingFlip.add(o);
+
+    // Idle frame-callback delivery. A frame callback is normally delivered by
+    // its output's flip-complete, but a surface can arm one via a bare commit
+    // (a frame-callback-only commit with no attached buffer) that produces no
+    // damage, hence no present and no flip-complete -- it would wait forever
+    // while the output is otherwise idle. Deliver those here: a callback whose
+    // surface has no content upload in flight and whose output(s) are neither
+    // presenting nor dirty has no present coming, so this tick is its frame.
+    // Surfaces WITH content pending keep their flip-complete pacing untouched.
+    const comp = state.compositor;
+    for (const s of state.surfaces.values()) {
+      const cbs = s.frameCallbacks;
+      if (!cbs || cbs.length === 0) continue;
+      if (!shouldDeliverFrameCallbackIdle(s.id, comp, awaitingFlip)) continue;
+      s.frameCallbacks = [];
+      for (const cb of cbs) {
+        if (cb.destroyed) continue;
+        events.wl_callback.send_done(cb, timeMs >>> 0);
+        addon.destroyResource(cb);
+      }
+    }
   };
 
   // Per-output frame-callback dispatch. Called by the addon when a KMS
@@ -704,6 +738,8 @@ export async function installProtocols(
   // off-screen) keeps its callbacks queued until it overlaps an output again
   // OR the surface tears down (callbacks released with the SurfaceRecord).
   state.dispatchFrameCallbacksForOutput = (timeMs: number, outputId: number): void => {
+    // The flip this output was awaiting has completed.
+    awaitingFlip.delete(outputId);
     const surfaceOutputs = state.compositor.surfaceOutputs;
     for (const s of state.surfaces.values()) {
       const cbs = s.frameCallbacks;
