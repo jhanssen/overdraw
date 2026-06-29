@@ -35,7 +35,7 @@ import {
   createCursorBroker, CURSOR_NOT_HANDLED,
 } from "./plugins/cursor-broker.js";
 import { createCursorThemeResolver } from "./cursor/theme-resolver.js";
-import { resolveScale, logicalSize } from "./output/scale.js";
+import { resolveScale, logicalSize, edidDpi } from "./output/scale.js";
 import { makeComposeFlatteners } from "./subsurfaces.js";
 import { Kinematics } from "./cursor/kinematics.js";
 import { CursorRuleEngine } from "./cursor/rule-engine.js";
@@ -377,6 +377,14 @@ addon.setOnOutputDescriptor((d) => {
     allowEdidAuto: backendOpts.backend === "kms",
   });
   const logical = logicalSize(device.width, device.height, scale);
+  // Scale derivation, appended to whichever add/update log fires below so the
+  // resolved scale is never logged twice. Source is the config value, a
+  // memorized set_scale, or the EDID-DPI auto fallback (KMS only).
+  const scaleDpi = edidDpi(device.width, device.height, d.physicalWidthMm, d.physicalHeightMm);
+  const scaleSrc = (config.scale ?? memorizedScale) != null ? "config"
+    : (backendOpts.backend === "kms" && scaleDpi > 0 ? "edid-auto" : "default");
+  const scaleInfo = `dpi=${scaleDpi.toFixed(1)} raw=${(scaleDpi / 96).toFixed(3)} `
+    + `scale=${scale}(${scaleSrc})`;
   const memorizedPos = durable !== ""
     ? state.outputPositionMemory?.get(durable) : undefined;
 
@@ -417,7 +425,8 @@ addon.setOnOutputDescriptor((d) => {
     }
     log.info("core",
       `output ${d.outputId} added at (${pos.x},${pos.y}): ${device.width}x${device.height} `
-      + `device, ${logical.width}x${logical.height} logical name=${d.name}`);
+      + `device, ${logical.width}x${logical.height} logical `
+      + `phys=${d.physicalWidthMm}x${d.physicalHeightMm}mm ${scaleInfo} name=${d.name}`);
     // Note: no output.added emit here. Boot enumeration of secondaries
     // happens BEFORE the plugin runtime spawns; any subscriber would miss
     // it anyway. Bundled plugins that need a boot snapshot read it via
@@ -461,7 +470,7 @@ addon.setOnOutputDescriptor((d) => {
     if (d.model || d.name) rec.description = d.model || d.name;
     log.info("core",
       `output ${d.outputId}: ${device.width}x${device.height} device, `
-      + `${logical.width}x${logical.height} logical @${formatRefreshHz(d.refreshMhz)} scale=${scale} `
+      + `${logical.width}x${logical.height} logical @${formatRefreshHz(d.refreshMhz)} ${scaleInfo} `
       + `xform=${d.transform} phys=${d.physicalWidthMm}x${d.physicalHeightMm}mm name=${d.name}`);
   }
 

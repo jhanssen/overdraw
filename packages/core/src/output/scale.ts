@@ -63,21 +63,43 @@ export function snapScale(raw: number, deviceWidth?: number, deviceHeight?: numb
   return 1;
 }
 
-// Derive a scale from physical size + resolution. DPI = px / (mm / 25.4).
-// The reference density is 96 DPI = scale 1; the result is snapped to a
-// value that produces integer logical dimensions for the device size.
-// Returns 1 when the physical size is unknown (0). This is the auto
-// fallback, used only when no explicit scale is configured.
+// Pixel density (DPI) from device resolution + physical size, taking the denser
+// axis. Returns 0 when either input is missing (unknown physical size). DPI =
+// px / (mm / 25.4).
+export function edidDpi(
+  deviceWidth: number, deviceHeight: number,
+  physicalWidthMm: number, physicalHeightMm: number,
+): number {
+  if (physicalWidthMm <= 0 || physicalHeightMm <= 0) return 0;
+  if (deviceWidth <= 0 || deviceHeight <= 0) return 0;
+  const dpiX = deviceWidth / (physicalWidthMm / 25.4);
+  const dpiY = deviceHeight / (physicalHeightMm / 25.4);
+  return Math.max(dpiX, dpiY);
+}
+
+// Derive a scale from physical size + resolution. The reference density is
+// 96 DPI = scale 1; the result is snapped to a value that produces integer
+// logical dimensions for the device size. Returns 1 when the physical size is
+// unknown. This is the auto fallback, used only when no explicit scale is
+// configured.
 export function edidScaleFallback(
   deviceWidth: number, deviceHeight: number,
   physicalWidthMm: number, physicalHeightMm: number,
 ): number {
-  if (physicalWidthMm <= 0 || physicalHeightMm <= 0) return 1;
-  if (deviceWidth <= 0 || deviceHeight <= 0) return 1;
-  const dpiX = deviceWidth / (physicalWidthMm / 25.4);
-  const dpiY = deviceHeight / (physicalHeightMm / 25.4);
-  const dpi = Math.max(dpiX, dpiY);
-  return snapScale(dpi / 96, deviceWidth, deviceHeight);
+  const dpi = edidDpi(deviceWidth, deviceHeight, physicalWidthMm, physicalHeightMm);
+  if (dpi <= 0) return 1;
+  const raw = dpi / 96;
+  // Integer deadzone: a density within SCALE_DEADZONE of a whole-number scale
+  // is treated as that integer. This keeps near-1x panels (e.g. a ~109 DPI
+  // 1440p/ultrawide at raw ~1.14) at 1.0 instead of a pointless fractional
+  // scale, and lands near-2x panels on a clean 2.0. Densities solidly between
+  // integers keep their exact integer-logical scale (1.25, 1.5, 1.667, ...).
+  const SCALE_DEADZONE = 0.2;
+  const nearest = Math.round(raw);
+  if (nearest >= 1 && Math.abs(raw - nearest) <= SCALE_DEADZONE) {
+    return snapScale(nearest, deviceWidth, deviceHeight);
+  }
+  return snapScale(raw, deviceWidth, deviceHeight);
 }
 
 export interface ScaleInputs {

@@ -25,6 +25,22 @@ test("edidScaleFallback derives from DPI (snapped)", () => {
   assert.equal(edidScaleFallback(2560, 1600, 0, 0), 1);
 });
 
+test("edidScaleFallback: integer deadzone collapses near-1x and near-2x panels", () => {
+  // 34" ultrawide 3440x1440 @ 800x335mm ~= 109 DPI -> raw ~1.14, inside the
+  // deadzone of 1.0 -> 1.0 (not a pointless 1.067 fractional scale).
+  assert.equal(edidScaleFallback(3440, 1440, 800, 335), 1);
+  // 24" 4K 3840x2160 @ 530x300mm ~= 184 DPI -> raw ~1.92, inside the deadzone
+  // of 2.0 -> a clean 2.0.
+  assert.equal(edidScaleFallback(3840, 2160, 530, 300), 2);
+  // A density solidly between integers keeps its exact (integer-logical)
+  // fractional scale rather than being pulled to an integer: 27.5" 4K
+  // @ 608x342mm ~= 160 DPI -> raw ~1.67 -> 5/3, logical 2304x1296.
+  const s = edidScaleFallback(3840, 2160, 608, 342);
+  assert.ok(Math.abs(s - 5 / 3) < 1e-9, `expected ~1.667, got ${s}`);
+  assert.equal(3840 / s, 2304);
+  assert.equal(2160 / s, 1296);
+});
+
 // 4K monitor at 1.75x raw scale: a naive quarter-step round would produce
 // 1.75, but 3840/1.75 = 2194.286 (not integer). The integer-logical search
 // retargets to a nearby scale that divides cleanly. 1.6 yields 2400x1350
