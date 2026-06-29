@@ -30,6 +30,25 @@ import type { Ctx } from "./ctx.js";
 import type { Resource, WaylandFd } from "../types.js";
 import { KEYBOARD_EVENT, SELECTION_EVENT } from "../events/window-bus.js";
 
+// Tell a source it lost ownership of a selection slot (the spec's
+// "cancelled" on replacement). The selection state is shared across all three
+// selection protocols, so the displaced source may belong to any of them --
+// dispatch the cancelled event by the resource's interface. No-op if the slot
+// is unchanged or the source is the same one re-asserting.
+export function cancelDisplacedSource(
+  ctx: Ctx, prev: Resource | null, replacement: Resource | null,
+): void {
+  if (!prev || prev === replacement || prev.destroyed) return;
+  switch (prev.interfaceName) {
+    case "wl_data_source":
+      ctx.events.wl_data_source.send_cancelled(prev); break;
+    case "zwp_primary_selection_source_v1":
+      ctx.events.zwp_primary_selection_source_v1.send_cancelled(prev); break;
+    case "ext_data_control_source_v1":
+      ctx.events.ext_data_control_source_v1.send_cancelled(prev); break;
+  }
+}
+
 // Map a wl_data_offer resource back to the source it represents, so receive() can
 // forward to the right source. Lives module-scope (keyed by offer resource).
 const offerToSource = new WeakMap<Resource, Resource>();
@@ -321,6 +340,8 @@ export function makeDataDevice(ctx: Ctx): WlDataDeviceHandler {
       });
     },
     set_selection(resource, source, _serial) {
+      // Tell the displaced owner it lost the selection.
+      cancelDisplacedSource(ctx, ctx.state.selection ?? null, source ?? null);
       ctx.state.selection = source ?? null;
       // Notify the Xwayland selection bridge so it can claim / release the
       // X side. No-op when no bridge is installed.
@@ -440,6 +461,7 @@ export function makePrimaryManager(ctx: Ctx): ZwpPrimarySelectionDeviceManagerV1
 export function makePrimaryDevice(ctx: Ctx): ZwpPrimarySelectionDeviceV1Handler {
   return {
     set_selection(resource, source, _serial) {
+      cancelDisplacedSource(ctx, ctx.state.primarySelection ?? null, source ?? null);
       ctx.state.primarySelection = source ?? null;
       ctx.state.onWlSelectionChanged?.("primary", source ?? null, "primary");
       ctx.state.bus?.emit(SELECTION_EVENT.changed, { kind: "primary" });

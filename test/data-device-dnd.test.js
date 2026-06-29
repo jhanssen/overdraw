@@ -7,7 +7,8 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 
-import { negotiateDndAction } from "../packages/core/dist/protocols/wl_data_device_manager.js";
+import { negotiateDndAction, cancelDisplacedSource }
+  from "../packages/core/dist/protocols/wl_data_device_manager.js";
 
 const NONE = 0, COPY = 1, MOVE = 2, ASK = 4;
 
@@ -32,4 +33,39 @@ test("preferred not in intersection -> fall back copy>move>ask", () => {
 
 test("single matching action with no preference", () => {
   assert.equal(negotiateDndAction(COPY, COPY, 0), COPY);
+});
+
+// cancelDisplacedSource: the displaced selection owner is told it lost the slot
+// via the cancelled event matching ITS interface (the selection state is shared
+// across wl_data, primary, and ext-data-control).
+function spyCtx() {
+  const fired = [];
+  const make = (iface) => ({ send_cancelled: (r) => fired.push([iface, r]) });
+  return {
+    fired,
+    events: {
+      wl_data_source: make("wl_data_source"),
+      zwp_primary_selection_source_v1: make("zwp_primary_selection_source_v1"),
+      ext_data_control_source_v1: make("ext_data_control_source_v1"),
+    },
+  };
+}
+const src = (interfaceName) => ({ interfaceName, destroyed: false });
+
+test("cancelDisplacedSource dispatches cancelled by the source's interface", () => {
+  for (const iface of ["wl_data_source", "zwp_primary_selection_source_v1", "ext_data_control_source_v1"]) {
+    const ctx = spyCtx();
+    const prev = src(iface);
+    cancelDisplacedSource(ctx, prev, src("wl_data_source"));
+    assert.deepEqual(ctx.fired, [[iface, prev]]);
+  }
+});
+
+test("cancelDisplacedSource is a no-op when nothing was displaced", () => {
+  const ctx = spyCtx();
+  const same = src("wl_data_source");
+  cancelDisplacedSource(ctx, null, same);          // no prior owner
+  cancelDisplacedSource(ctx, same, same);          // same source re-asserting
+  cancelDisplacedSource(ctx, { interfaceName: "wl_data_source", destroyed: true }, null); // gone
+  assert.equal(ctx.fired.length, 0);
 });

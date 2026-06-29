@@ -29,6 +29,7 @@
 import type { Resource, WaylandFd } from "../types.js";
 import type { Ctx } from "./ctx.js";
 import { SELECTION_EVENT } from "../events/window-bus.js";
+import { cancelDisplacedSource } from "./wl_data_device_manager.js";
 
 import type { ExtDataControlManagerV1Handler }
   from "#protocols-gen/ext_data_control_manager_v1.js";
@@ -204,6 +205,7 @@ export function makeExtDataControlDevice(ctx: Ctx): ExtDataControlDeviceV1Handle
           }
         }
       }
+      cancelDisplacedSource(ctx, ctx.state.selection ?? null, source);
       ctx.state.selection = source;
       ctx.state.onWlSelectionChanged?.("clipboard", source, "data");
       ctx.state.bus?.emit(SELECTION_EVENT.changed, { kind: "clipboard" });
@@ -228,6 +230,7 @@ export function makeExtDataControlDevice(ctx: Ctx): ExtDataControlDeviceV1Handle
           }
         }
       }
+      cancelDisplacedSource(ctx, ctx.state.primarySelection ?? null, source);
       ctx.state.primarySelection = source;
       ctx.state.onWlSelectionChanged?.("primary", source, "primary");
       ctx.state.bus?.emit(SELECTION_EVENT.changed, { kind: "primary" });
