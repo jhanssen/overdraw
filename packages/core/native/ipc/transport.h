@@ -324,10 +324,26 @@ class FdSerializer : public dawn::wire::CommandSerializer {
     // queue, then try to flush. Never blocks. Returns false only on a fatal
     // socket error (peer closed).
     bool Flush() override {
-        if (pending_) {
-            frame(FrameKind::WireBytes, buf_.data(), pending_);
-            pending_ = 0;
-        }
+        stageBatch();
+        return maybePump();
+    }
+
+    // Defer the per-append socket write: while set, appendFrame()/Flush() only
+    // stage bytes into the outbound queue (preserving FIFO + bytesQueued order)
+    // and let the owner drain them once per event-loop turn via drainNow(). This
+    // coalesces the many small control frames a single frame emits (per-surface
+    // BeginAccess/EndAccess, ScanoutPresent, ...) into one batched write instead
+    // of one write() per frame. Safe because cross-channel ordering is enforced
+    // by the bytesQueued()/WireBarrier serial, not by send timing. Bytes are
+    // still drained immediately once the queue passes kDeferHighWater so a large
+    // upload (a 47 MiB WriteTexture) doesn't balloon out_.
+    void setDeferPump(bool d) { deferPump_ = d; }
+
+    // Force the outbound queue to the socket now (staging any pending Dawn
+    // batch first). The owner calls this on its loop-turn flush hook and at the
+    // explicit per-frame flush points; ignores deferPump_.
+    bool drainNow() {
+        stageBatch();
         return pumpOut();
     }
 
@@ -338,9 +354,10 @@ class FdSerializer : public dawn::wire::CommandSerializer {
     // in here makes the "kind switch is a flush boundary" invariant non-violable
     // from callers. Flush() is a cheap no-op when pending_ is empty.
     bool appendFrame(FrameKind kind, const void* payload, size_t len) {
-        Flush();  // drain staged Dawn bytes as a kind=0 frame (no-op if empty)
+        stageBatch();  // stage staged Dawn bytes as a kind=0 frame BEFORE this
+                       // control frame (the kind switch is a FIFO boundary)
         frame(kind, payload, len);
-        return pumpOut();
+        return maybePump();
     }
 
     // Emit a non-Dawn frame with attached SCM_RIGHTS fds. Same Flush-first
@@ -351,7 +368,7 @@ class FdSerializer : public dawn::wire::CommandSerializer {
     bool appendFrameWithFds(FrameKind kind, const void* payload, size_t len,
                             const int* fds, int nfds) {
         if (nfds <= 0 || nfds > kMaxMsgFds) return false;
-        Flush();
+        stageBatch();
         // Record the byte offset (within the running out_ deque) where this
         // frame starts; pumpOut uses this to know when to switch to sendmsg
         // with SCM_RIGHTS.
@@ -369,7 +386,7 @@ class FdSerializer : public dawn::wire::CommandSerializer {
         }
         fdAttachments_.push_back(std::move(a));
         frame(kind, payload, len);
-        return pumpOut();
+        return maybePump();
     }
 
     // Cumulative count of framed bytes ever enqueued (header + payload, see
@@ -468,6 +485,22 @@ class FdSerializer : public dawn::wire::CommandSerializer {
     static constexpr size_t kMaxAllocation = 1u << 20;     // 1 MiB (one command)
     static constexpr size_t kCapacity = 16u * (1u << 20);  // 16 MiB batch headroom
     static constexpr size_t kChunk = 256u * 1024u;         // write granularity
+    static constexpr size_t kDeferHighWater = 256u * 1024u; // drain even while deferring above this
+
+    // Frame the staged Dawn batch as a kind=0 WireBytes frame (no socket I/O).
+    void stageBatch() {
+        if (pending_) {
+            frame(FrameKind::WireBytes, buf_.data(), pending_);
+            pending_ = 0;
+        }
+    }
+    // Write now, unless deferring AND the queue is still small (the owner drains
+    // it on its loop-turn flush). Past kDeferHighWater we always drain so a large
+    // upload can't balloon out_.
+    bool maybePump() {
+        if (deferPump_ && out_.size() < kDeferHighWater) return true;
+        return pumpOut();
+    }
 
     // Append one [length: u32 LE][kind: u8][payload] frame to the outbound queue
     // and advance the byte-accounting counter. `length` = 1 (kind) + payload len.
@@ -500,6 +533,7 @@ class FdSerializer : public dawn::wire::CommandSerializer {
                                      // also used to compute out_'s front offset:
                                      // bytesQueued_ - out_.size()).
     std::deque<FdAttachment> fdAttachments_;
+    bool deferPump_ = false;         // batch writes per loop turn (see setDeferPump)
 };
 
 // Accumulates bytes from a non-blocking stream socket and yields complete

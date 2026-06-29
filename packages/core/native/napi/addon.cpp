@@ -989,6 +989,10 @@ napi_value Start(napi_env env, napi_callback_info info) {
     // the GPU process.
     uv_prepare_init(loop, &g_addon.flushPrepare);
     uv_prepare_start(&g_addon.flushPrepare, onFlushPrepare);
+    // The loop + its per-turn flush hook are now live, so batch wire writes:
+    // appendFrame/Flush stage until onFlushPrepare drains them once per turn,
+    // collapsing the many small control frames per render into one write.
+    g_addon.compositor->setWireDeferPump(true);
 
     // Input backend follows the output backend: KMS uses libinput (the seat
     // already opened above for the DRM card opens evdev devices on libinput's

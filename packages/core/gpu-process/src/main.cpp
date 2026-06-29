@@ -2917,6 +2917,13 @@ int run(int wireFd, int ctrlFd, int inputFd, bool headless,
         }
     };
 
+    // Batch wire output: the per-iteration appendFrame/Flush calls (Dawn
+    // replies, ShmUploaded, flip/alloc acks, ...) only stage; the single
+    // drainNow() at the end of each loop turn coalesces them into one write
+    // instead of one per reply, so the core wakes far fewer times. Cross-channel
+    // ordering is unaffected (the bytesQueued()/WireBarrier serial, not send
+    // timing). Backpressure leftovers drain on EPOLLOUT via armWire().
+    serializer.setDeferPump(true);
     while (!shutdown && (headless || !output->shouldClose())) {
         loop->runOnce(8);   // 8ms cap: also advances Dawn + output pump below
         pumpWire();          // DeviceTick + drain wire, even with no fd ready
@@ -2925,6 +2932,7 @@ int run(int wireFd, int ctrlFd, int inputFd, bool headless,
         for (auto& pc : pluginConns) pc->pump();  // advance each plugin connection
         drainPluginBarriers();          // fire deferred producer-end / alloc-inject when ready
         if (output) output->pump();    // service output backend events
+        serializer.drainNow();          // flush the turn's batched wire output once
         armWire();
         for (auto& pc : pluginConns) armPluginConn(pc.get());
     }

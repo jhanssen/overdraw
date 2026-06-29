@@ -41,9 +41,15 @@ class WireLink {
     // it (wgpuInstanceProcessEvents).
     void setInstance(WGPUInstance inst) { instance_ = inst; }
 
-    // Queue+try-write any pending wire bytes (non-blocking). Returns false on a
-    // fatal socket error.
-    bool flush() { return serializer_->Flush(); }
+    // Queue+drain any pending wire bytes to the socket now (non-blocking).
+    // Forces the write regardless of deferPump -- this is the owner's loop-turn
+    // / per-frame flush point. Returns false on a fatal socket error.
+    bool flush() { return serializer_->drainNow(); }
+
+    // Batch per-append writes into the owner's loop-turn flush (see
+    // FdSerializer::setDeferPump). Enabled once the libuv loop + its flush hook
+    // are running; appendFrame/Flush then only stage until the next flush().
+    void setDeferPump(bool d) { serializer_->setDeferPump(d); }
 
     // Emit an in-band control frame (kind != 0) on the wire socket. Flushes any
     // staged Dawn (kind=0) bytes first so the kind switch is a clean FIFO

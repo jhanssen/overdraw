@@ -577,6 +577,9 @@ class Compositor {
     // trigger a render -- still reaches the GPU process instead of sitting
     // un-flushed in the serializer.
     void flushWire() { link_->flush(); }
+    // Batch wire writes into the loop-turn flush hook (onFlushPrepare). Enabled
+    // by the addon once the libuv loop + that hook are running.
+    void setWireDeferPump(bool d) { link_->setDeferPump(d); }
     // Per-frame hook from the addon's frame loop: flush queued wire output. The
     // JS compositor records + presents the frame; this just drains the wire.
     void renderFrame();
