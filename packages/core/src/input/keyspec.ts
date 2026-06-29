@@ -58,7 +58,17 @@ export interface ButtonStep {
   button: number;
 }
 
-export type InputStep = KeyStep | ButtonStep;
+// A pointer-scroll step ("Mod+scroll_up"). Fires on each scroll tick in `dir`;
+// scroll has no release, so a scroll binding never carries a releaseAction.
+export interface ScrollStep {
+  kind: "scroll";
+  mods: number;
+  dir: ScrollDir;
+}
+// 0=up, 1=down (vertical axis), 2=left, 3=right (horizontal axis).
+export type ScrollDir = 0 | 1 | 2 | 3;
+
+export type InputStep = KeyStep | ButtonStep | ScrollStep;
 
 // Evdev button codes (from <linux/input-event-codes.h>) for the named
 // "button<N>" tokens in key specs.
@@ -81,6 +91,14 @@ const BUTTON_ALIASES: { [name: string]: number } = {
   button7: BTN_BACK,
   button8: BTN_TASK,
 };
+
+// Scroll-direction tokens. scroll_up/down/left/right are the canonical names;
+// mouse_up/mouse_down are Hyprland-compatible aliases for vertical scroll.
+const SCROLL_ALIASES: { [name: string]: ScrollDir } = {
+  scroll_up: 0, scroll_down: 1, scroll_left: 2, scroll_right: 3,
+  mouse_up: 0, mouse_down: 1,
+};
+const SCROLL_DIR_NAMES = ["scroll_up", "scroll_down", "scroll_left", "scroll_right"];
 
 const MOD_ALIASES: { [name: string]: number } = {
   shift: MOD_SHIFT,
@@ -129,10 +147,15 @@ export function parseSpec(spec: string): InputStep {
     mods |= bit;
   }
 
-  // Try button alias first ("button1" .. "button8"); fall back to keysym.
+  // Try button alias first ("button1" .. "button8"), then scroll
+  // ("scroll_up" ...), then fall back to keysym.
   const button = BUTTON_ALIASES[lastToken.toLowerCase()];
   if (button !== undefined) {
     return { kind: "button", mods, button };
+  }
+  const dir = SCROLL_ALIASES[lastToken.toLowerCase()];
+  if (dir !== undefined) {
+    return { kind: "scroll", mods, dir };
   }
   const keysym = keysymOf(lastToken);
   if (keysym === null) {
@@ -180,19 +203,25 @@ function isInputStep(v: unknown): v is InputStep {
   if ((o.kind === undefined || o.kind === "key") && typeof o.keysym === "number") return true;
   // ButtonStep: kind 'button' + button number.
   if (o.kind === "button" && typeof o.button === "number") return true;
+  // ScrollStep: kind 'scroll' + dir number.
+  if (o.kind === "scroll" && typeof o.dir === "number") return true;
   return false;
 }
 
 function cloneStep(s: InputStep): InputStep {
-  return s.kind === "button"
-    ? { kind: "button", mods: s.mods, button: s.button }
-    : { kind: "key", mods: s.mods, keysym: s.keysym };
+  if (s.kind === "button") return { kind: "button", mods: s.mods, button: s.button };
+  if (s.kind === "scroll") return { kind: "scroll", mods: s.mods, dir: s.dir };
+  return { kind: "key", mods: s.mods, keysym: s.keysym };
 }
 
 // Return true if `step` is a button (vs. a key) step. A KeyStep without
 // an explicit `kind` field defaults to a key step.
 export function isButtonStep(step: InputStep): step is ButtonStep {
   return step.kind === "button";
+}
+
+export function isScrollStep(step: InputStep): step is ScrollStep {
+  return step.kind === "scroll";
 }
 
 // Render an InputStep back to its canonical "Mod+Shift+Key" or
@@ -207,7 +236,10 @@ export function formatStep(step: InputStep): string {
   if (step.mods & MOD_MOD3) parts.push("Mod3");
   if (step.mods & MOD_MOD5) parts.push("Mod5");
   if (step.mods & MOD_LOCK) parts.push("Lock");
-  parts.push(isButtonStep(step) ? buttonName(step.button) : keysymName(step.keysym));
+  parts.push(
+    isButtonStep(step) ? buttonName(step.button)
+      : isScrollStep(step) ? SCROLL_DIR_NAMES[step.dir]
+        : keysymName(step.keysym));
   return parts.join("+");
 }
 
@@ -225,7 +257,8 @@ export function formatChord(steps: readonly InputStep[]): string {
 // Compare two InputSteps for equality.
 export function stepsEqual(a: InputStep, b: InputStep): boolean {
   if (a.mods !== b.mods) return false;
-  if (isButtonStep(a) !== isButtonStep(b)) return false;
-  if (isButtonStep(a)) return a.button === (b as ButtonStep).button;
+  if ((a.kind ?? "key") !== (b.kind ?? "key")) return false;
+  if (a.kind === "button") return a.button === (b as ButtonStep).button;
+  if (a.kind === "scroll") return a.dir === (b as ScrollStep).dir;
   return a.keysym === (b as KeyStep).keysym;
 }

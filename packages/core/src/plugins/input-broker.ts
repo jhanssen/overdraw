@@ -128,6 +128,7 @@ function isStep(v: unknown): v is InputStep {
   const o = v as { [k: string]: unknown };
   if (typeof o.mods !== "number") return false;
   if (o.kind === "button") return typeof o.button === "number";
+  if (o.kind === "scroll") return o.dir === 0 || o.dir === 1 || o.dir === 2 || o.dir === 3;
   // Default ('key' or absent kind): needs a keysym.
   if (o.kind === undefined || o.kind === "key") return typeof o.keysym === "number";
   return false;

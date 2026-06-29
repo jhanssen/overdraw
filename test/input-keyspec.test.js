@@ -189,3 +189,23 @@ test("stepsEqual: different mods", () => {
 test("stepsEqual: different keysym", () => {
   assert.ok(!stepsEqual({ kind: "key", mods: 0x40, keysym: 0x61 }, { kind: "key", mods: 0x40, keysym: 0x62 }));
 });
+
+// ---- scroll steps -----------------------------------------------------------
+
+test("parseSpec: scroll directions + mouse_* aliases", () => {
+  assert.deepEqual(parseSpec("Mod+scroll_up"), { kind: "scroll", mods: MOD_MOD4, dir: 0 });
+  assert.deepEqual(parseSpec("Mod+scroll_down"), { kind: "scroll", mods: MOD_MOD4, dir: 1 });
+  assert.deepEqual(parseSpec("Ctrl+scroll_left"), { kind: "scroll", mods: MOD_CTRL, dir: 2 });
+  assert.deepEqual(parseSpec("scroll_right"), { kind: "scroll", mods: 0, dir: 3 });
+  // Hyprland-style aliases map to vertical scroll.
+  assert.deepEqual(parseSpec("mouse_up"), { kind: "scroll", mods: 0, dir: 0 });
+  assert.deepEqual(parseSpec("mouse_down"), { kind: "scroll", mods: 0, dir: 1 });
+});
+
+test("formatStep + stepsEqual: scroll", () => {
+  assert.equal(formatStep(parseSpec("Mod+scroll_up")), "Mod+scroll_up");
+  assert.ok(stepsEqual(parseSpec("Mod+scroll_up"), { kind: "scroll", mods: MOD_MOD4, dir: 0 }));
+  assert.ok(!stepsEqual(parseSpec("Mod+scroll_up"), parseSpec("Mod+scroll_down")));
+  // a scroll step is never equal to a key/button step with the same mods
+  assert.ok(!stepsEqual(parseSpec("Mod+scroll_up"), parseSpec("Mod+button1")));
+});

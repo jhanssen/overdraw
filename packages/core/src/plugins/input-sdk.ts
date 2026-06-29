@@ -117,6 +117,9 @@ export function createPluginInput(endpoint: Endpoint): InputHandle {
       if (s.kind === "button") {
         return { mods: s.mods, kind: "button", button: s.button };
       }
+      if (s.kind === "scroll") {
+        return { mods: s.mods, kind: "scroll", dir: s.dir };
+      }
       return { mods: s.mods, kind: "key", keysym: s.keysym };
     });
     const payload: Json = {

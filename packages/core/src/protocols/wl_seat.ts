@@ -819,6 +819,20 @@ export default function makeSeat(ctx: Ctx, driver: FocusDriver): SeatHandler {
         break;
       }
       case "pointerAxis": {
+        // Pointer-scroll hotkeys: a discrete wheel detent (value120) can fire a
+        // binding ("Mod+scroll_up"). Vertical: +down/-up; horizontal: +right/
+        // -left. When a binding matches it consumes the scroll (not forwarded to
+        // the client). High-resolution / touchpad scroll (no value120) is never
+        // a binding trigger and forwards normally.
+        if (ev.value120) {
+          const horiz = !!ev.horizontal;
+          const pos = ev.value120 > 0;
+          const dir: 0 | 1 | 2 | 3 = horiz ? (pos ? 3 : 2) : (pos ? 1 : 0);
+          const chain = ctx.state.bindingChain;
+          if (chain && chain.dispatchPress({ kind: "scroll", mods: lastModsDepressed, dir }).consume) {
+            return;
+          }
+        }
         // Accumulate into the pending frame; flushed on pointerFrame so
         // axis_source / relative_direction / value120 / value / stop emit in
         // spec order within one frame.

@@ -28,7 +28,7 @@
 // the active mode doesn't claim; the client gets it.
 
 import type { InputStep, KeyStep, ButtonStep } from "./keyspec.js";
-import { MOD_LOCK, MOD_MOD2, formatStep, formatChord, isButtonStep } from "./keyspec.js";
+import { MOD_LOCK, MOD_MOD2, formatStep, formatChord, isButtonStep, isScrollStep } from "./keyspec.js";
 import { log } from "../log.js";
 
 // A press handler. Returns a boolean to indicate consume (true) or forward
@@ -93,15 +93,15 @@ interface TrieNode {
 function newNode(): TrieNode { return { children: new Map() }; }
 
 function stepKey(step: InputStep): string {
-  return isButtonStep(step)
-    ? `${step.mods}:b:${step.button}`
-    : `${step.mods}:k:${step.keysym}`;
+  if (isButtonStep(step)) return `${step.mods}:b:${step.button}`;
+  if (isScrollStep(step)) return `${step.mods}:s:${step.dir}`;
+  return `${step.mods}:k:${step.keysym}`;
 }
 
 function cloneInputStep(s: InputStep): InputStep {
-  return isButtonStep(s)
-    ? { kind: "button", mods: s.mods, button: s.button }
-    : { kind: "key", mods: s.mods, keysym: s.keysym };
+  if (isButtonStep(s)) return { kind: "button", mods: s.mods, button: s.button };
+  if (isScrollStep(s)) return { kind: "scroll", mods: s.mods, dir: s.dir };
+  return { kind: "key", mods: s.mods, keysym: s.keysym };
 }
 
 // Parse a stepKey back into an InputStep. Inverse of stepKey() above.
@@ -109,9 +109,9 @@ function parseStepKey(key: string): InputStep {
   const [modsStr, kindChar, codeStr] = key.split(":");
   const mods = Number(modsStr);
   const code = Number(codeStr);
-  return kindChar === "b"
-    ? { kind: "button", mods, button: code }
-    : { kind: "key", mods, keysym: code };
+  if (kindChar === "b") return { kind: "button", mods, button: code };
+  if (kindChar === "s") return { kind: "scroll", mods, dir: code as 0 | 1 | 2 | 3 };
+  return { kind: "key", mods, keysym: code };
 }
 
 // Modes the user has access to. The default mode is always present; other
@@ -245,12 +245,12 @@ export class BindingChain {
           "bind: release callback is only valid on single-step bindings (chords cannot be released)");
       }
     }
-    // Button steps may only appear as the SINGLE leaf step. Mid-chord
-    // button presses ("Mod+a then button1") aren't supported in v1.
+    // Button/scroll steps may only appear as the SINGLE leaf step. Mid-chord
+    // pointer steps ("Mod+a then button1") aren't supported in v1.
     for (let i = 0; i < spec.steps.length - 1; i++) {
-      if (isButtonStep(spec.steps[i])) {
+      if (isButtonStep(spec.steps[i]) || isScrollStep(spec.steps[i])) {
         throw new TypeError(
-          "bind: button steps may only appear as the leaf (last) step of a binding");
+          "bind: button/scroll steps may only appear as the leaf (last) step of a binding");
       }
     }
     const modeName = spec.mode ?? "default";
@@ -403,9 +403,8 @@ export class BindingChain {
   dispatchPress(step: InputStep): { consume: boolean; matched: boolean } {
     const top = this.stack[this.stack.length - 1];
     // Match-time mods: strip the bits we don't care about.
-    const compareStep: InputStep = isButtonStep(step)
-      ? { kind: "button", mods: step.mods & ~IGNORED_MODS, button: step.button }
-      : { kind: "key", mods: step.mods & ~IGNORED_MODS, keysym: step.keysym };
+    const compareStep: InputStep = cloneInputStep(step);
+    compareStep.mods = step.mods & ~IGNORED_MODS;
     const key = stepKey(compareStep);
     const next = top.path.children.get(key);
     if (next) {
@@ -460,6 +459,7 @@ export class BindingChain {
       && top.def.exitOnEscape
       && top.path === top.def.root
       && !isButtonStep(compareStep)
+      && !isScrollStep(compareStep)
       && compareStep.keysym === ESCAPE_KEYSYM
       && compareStep.mods === 0
     ) {
