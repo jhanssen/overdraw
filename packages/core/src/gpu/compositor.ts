@@ -1475,7 +1475,21 @@ export class JsCompositor implements CompositorSink {
     // 2x for a 1.5x output) and presents at the logical size via buffer_scale
     // or a viewport, so comparing raw buffer px against layout*outputScale
     // never matches.
-    const { w: lw, h: lh } = this.surfaceLogicalSize(s);
+    //
+    // Prefer the client's window geometry (set_window_geometry) over the raw
+    // buffer: a CSD client draws shadow/margin pixels OUTSIDE the geometry
+    // rect, so its buffer is larger than the window the WM lays out. The
+    // layout rect tracks the geometry (the visible window), so comparing the
+    // raw buffer would never match for any client with a shadow margin and
+    // the content gate would only ever release via its backstop.
+    let lw: number, lh: number;
+    if (s.viewportDst && s.viewportDst.width > 0 && s.viewportDst.height > 0) {
+      lw = s.viewportDst.width; lh = s.viewportDst.height;
+    } else if (s.geometry && s.geometry.width > 0 && s.geometry.height > 0) {
+      lw = s.geometry.width; lh = s.geometry.height;
+    } else {
+      ({ w: lw, h: lh } = this.surfaceLogicalSize(s));
+    }
     return Math.abs(lw - s.layoutW) <= 1 && Math.abs(lh - s.layoutH) <= 1;
   }
 

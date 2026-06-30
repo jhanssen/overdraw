@@ -37,7 +37,6 @@ import type {
   WindowProposedEvent,
   WindowCommittedEvent,
   WindowPreconfigureEvent,
-  WindowPremapEvent,
 } from "../events/types.js";
 
 export interface Rect { x: number; y: number; width: number; height: number; }
@@ -290,15 +289,12 @@ export interface Wm {
   //
   // Carries appId + title in the emitted event so window-rules plugins can
   // dispatch off them. The caller (wl_surface.commit when it detects an
-  // initial commit) supplies them.
-  //
-  // info.outputId (the spawn output): when present, the WM emits window.premap
-  // after preconfigure so the workspace plugin places the window into a
-  // workspace before first content, letting the sized configure go out in this
-  // handshake. Absent (e.g. xwayland) keeps the legacy first-content placement.
+  // initial commit) supplies them. The window is placed into a workspace at
+  // first content (windowHasContent), not here, so its tiling lane is
+  // resolved before it enters the layout.
   markInitialCommitComplete(
     surfaceId: number,
-    info: { appId: string | null; title: string | null; xwayland?: boolean; outputId?: number },
+    info: { appId: string | null; title: string | null; xwayland?: boolean },
   ): Promise<void>;
   // Synchronously send the throwaway 0x0 first configure (with the resolved
   // state array) so the xdg-shell handshake completes within the client's
@@ -306,7 +302,11 @@ export interface Wm {
   // follows as a second configure. No-op if the window isn't in the
   // deferred-initial-commit phase or already got its first configure.
   sendInitialConfigure(surfaceId: number): void;
-  windowHasContent(surfaceId: number): Rect | undefined;
+  // contentSize: the client's natural content size at first content (its
+  // committed window geometry, else its buffer in logical px). A window that
+  // resolves to floating is sized from it (clamped to min/max) so it renders
+  // 1:1 instead of being stretched into a compositor-chosen rect.
+  windowHasContent(surfaceId: number, contentSize?: { width: number; height: number }): Rect | undefined;
   unmapWindow(surfaceId: number, opts?: { phantomSurfaceId?: number }): void;
   settled(): Promise<void>;
   // Topmost window containing the point. Walks the stack front-to-back.
@@ -1458,10 +1458,10 @@ export function createWm(
         compositor.setSurfaceLayout(win.surfaceId, content.x, content.y, content.width, content.height);
       }
       if (configure && !win.pendingInitialCommit && sizeChanged) {
-        // This is the real tile-size configure. When premap placement gives a
-        // fresh window its first real outer, it goes out here; clearing the
-        // "owed" flag keeps markInitialCommitComplete / windowHasContent from
-        // re-sending it (pendingSizeConfigure is the single source of truth).
+        // This is the real tile-size configure. When a fresh window first
+        // gets a real outer from the layout, it goes out here; clearing the
+        // "owed" flag keeps windowHasContent from re-sending it
+        // (pendingSizeConfigure is the single source of truth).
         win.pendingSizeConfigure = false;
         configure.configure(win.surfaceId, content.x, content.y, content.width, content.height);
       } else if (configure && !win.pendingInitialCommit && moved && win.hasContent) {
@@ -1622,7 +1622,7 @@ export function createWm(
       driver.schedule("output-resized");
     },
 
-    windowHasContent(surfaceId) {
+    windowHasContent(surfaceId, contentSize) {
       const win = windows.find((w) => w.surfaceId === surfaceId);
       if (!win) return undefined;
       if (!win.hasContent) {
@@ -1656,28 +1656,47 @@ export function createWm(
             win.windowState = { ...win.windowState, tiling: "floating" };
             dialogPolicyMutated = true;
             if (win.floatingRect === undefined) {
-              // Seed the floating rect at the client's preferred
-              // CONTENT size (locked-axis from set_min_size /
-              // set_max_size when present, else the current
-              // layout-assigned outer). Center on the parent's output
-              // when known, else the primary. The decoration broker's
-              // subsequent setInsets call grows this outer to
-              // (content + insets), preserving the client's content
-              // rect.
-              const fw = (minW !== 0 && minW === maxW) ? minW : (win.outer.width > 0 ? win.outer.width : minW || 800);
-              const fh = (minH !== 0 && minH === maxH) ? minH : (win.outer.height > 0 ? win.outer.height : minH || 600);
+              // Size a newly-floating window from the client's own content
+              // size -- its committed window geometry, else its buffer --
+              // clamped to the client's min/max, so it renders 1:1 at its
+              // natural size instead of being stretched into a compositor-
+              // chosen rect. Fall back to a locked axis / default when no
+              // content size is known yet. Centered on the parent's output
+              // (else primary). The floating rect is the OUTER tile, so when
+              // decoration insets are already reserved (the decoration
+              // intercept's setInsets runs at preconfigure, while the window
+              // is still managed, so its floating grow-path is skipped) the
+              // outer is content + insets here -- leaving the content rect
+              // equal to the client's size, which a fixed-size dialog will
+              // not resize away from.
+              const clampAxis = (v: number, lo: number, hi: number): number => {
+                let r = v;
+                if (lo > 0) r = Math.max(r, lo);
+                if (hi > 0) r = Math.min(r, hi);
+                return r;
+              };
+              const cw = contentSize && contentSize.width > 0 ? contentSize.width : 0;
+              const ch = contentSize && contentSize.height > 0 ? contentSize.height : 0;
+              const fw = cw > 0 ? clampAxis(cw, minW, maxW)
+                : (minW !== 0 && minW === maxW) ? minW : (minW || 800);
+              const fh = ch > 0 ? clampAxis(ch, minH, maxH)
+                : (minH !== 0 && minH === maxH) ? minH : (minH || 600);
+              const insetLR = (win.insets?.left ?? 0) + (win.insets?.right ?? 0);
+              const insetTB = (win.insets?.top ?? 0) + (win.insets?.bottom ?? 0);
+              const outerW = fw + insetLR;
+              const outerH = fh + insetTB;
               const targetOutputId = resolveParentOutputId(
                 win.windowState.parent, outputContent)
                 ?? primaryOutputId();
               const out = wm.outputs.get(targetOutputId);
               const ox = out?.rect.x ?? 0;
               const oy = out?.rect.y ?? 0;
-              const ow = out?.rect.width ?? fw;
-              const oh = out?.rect.height ?? fh;
+              const ow = out?.rect.width ?? outerW;
+              const oh = out?.rect.height ?? outerH;
               win.floatingRect = {
-                x: ox + Math.max(0, Math.round((ow - fw) / 2)),
-                y: oy + Math.max(0, Math.round((oh - fh) / 2)),
-                width: fw, height: fh,
+                x: ox + Math.max(0, Math.round((ow - outerW) / 2)),
+                y: oy + Math.max(0, Math.round((oh - outerH) / 2)),
+                width: outerW, height: outerH,
               };
             }
           }
@@ -2197,22 +2216,14 @@ export function createWm(
           win.pendingSizeConfigure = true;
         }
 
-        // Place the window into a workspace before it has any content, so the
-        // layout assigns its real tile rect now and the real tile-size configure
-        // can go out in this handshake (the client's first buffer then renders
-        // at the tile size). The interceptor (workspace plugin) awaits its own
-        // setOutputStack, so by the time this resolves the placement's relayout
-        // has been scheduled; the settle below runs it, and applyLayout sends
-        // the sized configure (clearing pendingSizeConfigure). Skipped when no
-        // spawn output is known (xwayland); those keep first-content placement.
-        if (pluginBus && info.outputId !== undefined) {
-          const premap: WindowPremapEvent = {
-            surfaceId, outputId: info.outputId,
-          };
-          await pluginBus.emit(WINDOW_EVENT.premap, premap,
-            { timeoutMs: INTERCEPTOR_TIMEOUT_MS });
-          if (!windows.includes(win)) return;
-        }
+        // A window is not placed into a workspace until its first content
+        // commit (windowHasContent), so its tiling lane (tiled vs floating)
+        // is resolved before it ever enters the layout: a window the
+        // client signals as transient/fixed-size floats at that point and
+        // never joins -- or reorders -- the tiled stack. The real tile-size
+        // configure therefore goes out at first content, not in this
+        // handshake; pendingSizeConfigure stays set here and windowHasContent
+        // sends it once the window has a placed rect.
 
         if (changed.some((f) => GEOMETRY_FIELDS.includes(f))) {
           driver.schedule("state-changed");

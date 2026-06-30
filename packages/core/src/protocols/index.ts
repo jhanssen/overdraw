@@ -27,7 +27,7 @@ import { shouldDeliverFrameCallbackIdle } from "./frame-callbacks.js";
 import { installCrossOutputMove } from "./cross-output-move.js";
 import { makeOutputForOutput } from "./wl_output.js";
 import type { Addon, EventsByInterface, EventSenders } from "../types.js";
-import type { Ctx, CompositorState, CompositorSink } from "./ctx.js";
+import type { Ctx, CompositorState, CompositorSink, SurfaceRecord } from "./ctx.js";
 import { OUTPUT_DEFAULT, OUTPUT_FALLBACK, FALLBACK_OUTPUT_NAME } from "./ctx.js";
 import type { FocusDriver, FocusApplyTarget } from "./focus-driver.js";
 import { titleAppId } from "../query.js";
@@ -38,6 +38,24 @@ import { flushWindowChanges } from "./window-changes.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const genDir = join(__dirname, "..", "protocols-gen");
+
+// The client's natural content size at first content: its committed window
+// geometry (set_window_geometry, surface-logical coords) when present, else the
+// committed buffer reduced to logical pixels. The WM sizes a window that
+// resolves to floating from this so it renders 1:1 at its own size.
+function clientContentSize(
+  s: SurfaceRecord, bufW: number, bufH: number,
+): { width: number; height: number } {
+  const geom = s.xdgSurface?.geometry;
+  if (geom && geom.width > 0 && geom.height > 0) {
+    return { width: geom.width, height: geom.height };
+  }
+  const bs = s.committed.bufferScale ?? 1;
+  return {
+    width: Math.max(1, Math.round(bufW / bs)),
+    height: Math.max(1, Math.round(bufH / bs)),
+  };
+}
 
 // A generated signature module: a signature table + an event-sender factory.
 interface SignatureModule {
@@ -477,10 +495,11 @@ export async function installProtocols(
       if (s.role === "xdg_toplevel") {
         s.mapped = true;
         mappedAny = true;
-        // Geometry was assigned proactively at get_toplevel (addWindow); first
-        // content just makes the window drawable + focusable. width/height (the
-        // committed buffer size) are ignored for placement — the tile is owned by
-        // the layout, not the client.
+        // First content places the window (window.map -> workspace plugin)
+        // and makes it drawable + focusable; windowHasContent resolves its
+        // tiling lane before the placement's layout pass runs. width/height
+        // (the committed buffer size) are ignored for placement — the tile is
+        // owned by the layout, not the client.
         //
         // EMIT ORDER: window.map fires BEFORE windowHasContent's pushStack so the
         // decoration registry (a synchronous bus subscriber) gets to call
@@ -503,8 +522,10 @@ export async function installProtocols(
           // Now mark the window drawable + push the stack. If a decoration
           // provider matched in the map emission above, the window is already
           // contentGated and will be skipped by computeBaseStack until the
-          // decoration's first present releases the gate.
-          state.wm?.windowHasContent(id);
+          // decoration's first present releases the gate. The content size (the
+          // client's committed window geometry, else its buffer in logical px)
+          // sizes a window that resolves to floating so it renders 1:1.
+          state.wm?.windowHasContent(id, clientContentSize(s, width, height));
           state.seat?.focusWindow(id, s, rect);
         }
       } else if (s.role === "xwayland") {
@@ -535,7 +556,7 @@ export async function installProtocols(
               rect: { x: rect.x, y: rect.y, width: rect.width, height: rect.height },
               appId: ta.appId, title: ta.title,
             });
-            state.wm?.windowHasContent(id);
+            state.wm?.windowHasContent(id, clientContentSize(s, width, height));
             state.seat?.focusWindow(id, s, rect);
           }
         }

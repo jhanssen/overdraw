@@ -28,8 +28,7 @@ interface PluginEventsLike {
   emit(name: string, payload: unknown): void;
   subscribe(pattern: string, cb: (name: string, payload: unknown) => void): EventSubscription;
   // Await-capable participation: the emitter awaits the handler before
-  // proceeding. Used to place a window at window.premap before the WM sizes
-  // the first configure.
+  // proceeding.
   intercept(
     pattern: string,
     cb: (name: string, payload: unknown) => unknown | Promise<unknown>,
@@ -465,25 +464,10 @@ export default async function init(
     await applyEffects(r.sideEffects);
   }
 
-  // Place windows the moment the WM signals premap (after window-rules, before
-  // first content) so the layout produces their real tile rect and the WM can
-  // size the first configure. AWAIT the placement: the WM awaits this emit, and
-  // resolving only after setOutputStack has been applied is what lets the
-  // sized configure go out in the same handshake. onMap below stays as the
-  // idempotent fallback (applyMap no-ops an already-placed surface) for windows
-  // that never went through premap (e.g. xwayland).
-  sdk.events.intercept("window.premap", async (_name, payload) => {
-    const p = payload as { surfaceId?: unknown; outputId?: unknown } | null;
-    if (!p || typeof p.surfaceId !== "number" || typeof p.outputId !== "number") {
-      return;
-    }
-    const r = reg.applyMap(state, p.surfaceId, p.outputId, outputNameOf(p.outputId));
-    state = r.state;
-    await applyEffects(r.sideEffects);
-  });
-
   // Map/unmap drive workspace membership. The map event carries the WM's
   // assigned outputId; the plugin honors that as the window's home output.
+  // Placement happens here, at first content -- after the WM has resolved the
+  // window's tiling lane -- so a floating window never joins the tiled stack.
   sdk.windows.onMap((ev) => {
     const r = reg.applyMap(state, ev.surfaceId, ev.outputId, outputNameOf(ev.outputId));
     state = r.state;
