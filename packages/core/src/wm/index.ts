@@ -1936,14 +1936,15 @@ export function createWm(
     },
 
     windowAt(x, y, accept) {
-      // Hit-test the visible windows only. The workspace plugin's per-output
-      // ordered list (outputContent) drives visibility; without it, fall back
-      // to every WM window (test harnesses without a workspace plugin). The
-      // master-front order is preserved: index 0 of an output's list is the
-      // master, which in dwm-style tilers is typically the visually on-top
-      // window of its tile region. (For non-overlapping tiled layouts the
-      // master-front order matches hit-test order; floating windows on top
-      // are at index 0 by layout-plugin convention.)
+      // Hit-test top-to-bottom in the SAME z-order the renderer composites
+      // (computeBaseStack draws ascending z, bottom-to-top; we walk
+      // descending), so a click lands on whatever is drawn on top. win.z is
+      // the single source of truth for stacking -- a floating dialog sits
+      // above its parent in z and so wins the hit even though it mapped later
+      // than the parent. The workspace plugin's per-output list (outputContent)
+      // only scopes VISIBILITY here: a window on a hidden workspace is absent
+      // from it. Without a workspace plugin (test harnesses), every WM window
+      // is a candidate.
       //
       // Modal gating: when the hit window has a live modal descendant, the
       // click is redirected to the topmost such descendant. This is the
@@ -1955,27 +1956,26 @@ export function createWm(
         const modal = topmostModalDescendant(win.surfaceId);
         return modal ?? win;
       };
+      let candidates: Window[];
       const content = outputContent ? outputContent() : null;
       if (content) {
+        candidates = [];
+        const seen = new Set<number>();
         for (const ids of content.values()) {
           for (const id of ids) {
+            if (seen.has(id)) continue;
+            seen.add(id);
             const win = windows.find((w) => w.surfaceId === id);
-            if (!win) continue;
-            const r = win.rect;
-            if (x < r.x || x >= r.x + r.width || y < r.y || y >= r.y + r.height) continue;
-            if (accept) {
-              const localX = x - r.x;
-              const localY = y - r.y;
-              if (!accept(win, localX, localY)) continue;
-            }
-            return gate(win);
+            if (win) candidates.push(win);
           }
         }
-        return null;
+      } else {
+        candidates = [...windows];
       }
-      // No workspace plugin: walk every window in declared order.
-      for (let i = 0; i < windows.length; i++) {
-        const win = windows[i];
+      // Stable descending-z sort: ties keep candidate order (the tiled bucket
+      // shares one z but never overlaps, so the tie order is immaterial).
+      candidates.sort((a, b) => (b.z ?? 0) - (a.z ?? 0));
+      for (const win of candidates) {
         const r = win.rect;
         if (x < r.x || x >= r.x + r.width || y < r.y || y >= r.y + r.height) continue;
         if (accept) {

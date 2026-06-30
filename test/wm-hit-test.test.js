@@ -68,6 +68,33 @@ test('windowAt: predicate rejecting front window falls through to back', async (
   assert.equal(r?.surfaceId, 1);
 });
 
+test('windowAt: floating dialog over its parent wins the hit (z, not list order)', async () => {
+  const placed = [];
+  const wm = createWm(mockSink(), [{ id: 0, rect: { x: 0, y: 0, width: 1000, height: 600 }, scale: 1 }], {
+    layoutDriverFactory: inlineMasterStackDriverFactory,
+    outputContent: () => new Map(placed.length ? [[0, [...placed]]] : []),
+  });
+  // Parent fills the output.
+  wm.addWindow(1, res(1));
+  placed.push(1);
+  await wm.settled();
+  wm.windowHasContent(1);
+  await wm.settled();
+  // A transient child floats over the parent. It maps AFTER the parent, so the
+  // plugin's membership list is [1, 2] (parent first); only win.z puts the
+  // dialog on top. Hit-testing by list order would (wrongly) return the parent.
+  wm.addWindow(2, res(2));
+  await wm.propose(2, { parent: 1 }, 'client-request');
+  placed.push(2);
+  wm.windowHasContent(2, { width: 400, height: 300 });
+  await wm.settled();
+  assert.equal(wm.getWindowState(2)?.tiling, 'floating', 'parented window floats');
+  // (500,300) is inside the centered dialog (300..700 x 150..450) AND inside
+  // the parent (fills the output). The dialog wins: its z is above the parent.
+  assert.equal(wm.windowAt(500, 300)?.surfaceId, 2,
+    'dialog over its parent receives the hit, not the parent');
+});
+
 test('windowAt: predicate receives surface-local coords', async () => {
   const wm = createWm(mockSink(), [{ id: 0, rect: { x: 0, y: 0, width: 1000, height: 600 }, scale: 1 }], {
     layoutDriverFactory: inlineMasterStackDriverFactory,
