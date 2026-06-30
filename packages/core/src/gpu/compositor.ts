@@ -3561,13 +3561,16 @@ export class JsCompositor implements CompositorSink {
     const x = this.cursorPointerX - this.cursorHotspotX;
     const y = this.cursorPointerY - this.cursorHotspotY;
     s.x = x; s.y = y;
-    // For the internal surface, layoutW/H match the sampled texture
-    // dims; for a client surface, the client owns layoutW/H via the
-    // normal protocol path and we don't override it.
-    if (this.cursorTargetSurfaceId === this.internalCursorSurfaceId) {
-      s.layoutW = s.width;
-      s.layoutH = s.height;
-    }
+    // A cursor surface is never in the WM layout, so its layoutW/H -- which
+    // size the drawn quad AND the move damage rects -- are not set by the
+    // layout sweep. Derive them from the surface's own buffer: logical size =
+    // buffer pixels / buffer_scale. This covers both the internal cursor image
+    // and a wl_pointer.set_cursor client surface (e.g. Xwayland's pointer
+    // cursor). Without it a client cursor would draw 1px and damage a 0x0 rect,
+    // so it never repaints as the pointer moves.
+    const bs = s.bufferScale || 1;
+    s.layoutW = s.width / bs;
+    s.layoutH = s.height / bs;
     if (this.cursorVisible) this.addOutputDamage(s.x, s.y, s.layoutW, s.layoutH);
   }
 

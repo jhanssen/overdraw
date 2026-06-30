@@ -243,6 +243,33 @@ test("cursor compositing slot (Phase 9c)", { skip }, async (t) => {
       assert.deepEqual(px(data2, 62, 62), [0, 0, 0, 255], "cleared after setCursorFromSurface(null)");
       comp.clearCursor();
     });
+
+    await t.test("moving a client cursor surface damages the output (no choppy freeze)", async () => {
+      // A client cursor surface (Xwayland's pointer cursor) is never in the WM
+      // layout, so its layoutW/H are not set by the layout sweep. A pure cursor
+      // MOVE must still mark the output dirty -- the per-output render gate
+      // skips outputs with no damage, so a zero-size move would never present
+      // and the cursor would freeze until some other commit (choppy motion over
+      // an XWayland window while smooth over a native one). updateCursorLayout
+      // derives the move-damage rect from the cursor surface's own buffer dims.
+      const comp = new JsCompositor(device, dawn.globals, addon, { width: W, height: H });
+      const CURSOR_CLIENT_SURFACE_ID = 9002;
+      const teal = solidPixels([128, 128, 0, 255], 24, 24);
+      comp.uploadPixels(CURSOR_CLIENT_SURFACE_ID,
+        { width: 24, height: 24, stride: 24 * 4 }, teal);
+      comp.setCursorFromSurface(CURSOR_CLIENT_SURFACE_ID, 0, 0);
+      comp.setCursorVisible(true);
+      comp.setCursorPosition(50, 50);
+      // Present to consume the setup damage; the output is clean afterwards.
+      comp.renderFrame();
+      await comp.readback();
+      assert.equal(comp.isOutputDirty(0), false, "clean after present");
+      // Pure move, no new buffer: must re-dirty the output.
+      comp.setCursorPosition(100, 100);
+      assert.equal(comp.isOutputDirty(0), true,
+        "a client-cursor move marks the output dirty -> a present is scheduled");
+      comp.clearCursor();
+    });
   } finally {
     addon.stop();
   }
