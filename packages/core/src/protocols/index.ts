@@ -692,6 +692,25 @@ export async function installProtocols(
     // buffer-release, window-changes, animation tick) still runs at the full
     // wake cadence.
 
+    // Break the idle deadlock. A surface with a pending frame callback whose
+    // output has no present coming (not awaiting a flip, not dirty) would never
+    // get a flip-complete -- so a client waiting on wl_callback.done that
+    // produces no damage of its own stalls forever. Force a present of its
+    // current (unchanged, still-resident) content; the resulting flip-complete
+    // (dispatchFrameCallbacksForOutput, below) delivers the callback at the real
+    // vblank. Done BEFORE renderFrame so the freshly-dirtied output presents
+    // THIS pass. Vblank-gated (canPresentAnyOutput), so it cannot exceed the
+    // refresh rate; when the client stops re-arming, nothing is pending and
+    // nothing presents -> fully idle. Surfaces already presenting/dirty are
+    // skipped (their own present delivers via flip-complete).
+    const comp = state.compositor;
+    for (const s of state.surfaces.values()) {
+      const cbs = s.frameCallbacks;
+      if (!cbs || cbs.length === 0) continue;
+      if (!shouldDeliverFrameCallbackIdle(s.id, comp, awaitingFlip)) continue;
+      comp.requestPresentForCallback?.(s.id);
+    }
+
     // Animation evaluator: advance active animations and write the new
     // per-surface state values for this frame. Runs BEFORE renderFrame so
     // the compositor's submit reads the updated uniforms. main.ts sets
@@ -704,30 +723,13 @@ export async function installProtocols(
     state.compositor.renderFrame?.();
 
     // Outputs renderFrame just presented have a flip in flight; their frame
-    // callbacks are delivered when that flip completes (below). Record them so
-    // the idle path that follows skips them.
+    // callbacks are delivered when that flip completes. Record them so the next
+    // pass's force-present skips a surface that already has a present coming.
     for (const o of state.compositor.takePresentedOutputs?.() ?? []) awaitingFlip.add(o);
 
-    // Idle frame-callback delivery. A frame callback is normally delivered by
-    // its output's flip-complete, but a surface can arm one via a bare commit
-    // (a frame-callback-only commit with no attached buffer) that produces no
-    // damage, hence no present and no flip-complete -- it would wait forever
-    // while the output is otherwise idle. Deliver those here: a callback whose
-    // surface has no content upload in flight and whose output(s) are neither
-    // presenting nor dirty has no present coming, so this tick is its frame.
-    // Surfaces WITH content pending keep their flip-complete pacing untouched.
-    const comp = state.compositor;
-    for (const s of state.surfaces.values()) {
-      const cbs = s.frameCallbacks;
-      if (!cbs || cbs.length === 0) continue;
-      if (!shouldDeliverFrameCallbackIdle(s.id, comp, awaitingFlip)) continue;
-      s.frameCallbacks = [];
-      for (const cb of cbs) {
-        if (cb.destroyed) continue;
-        events.wl_callback.send_done(cb, timeMs >>> 0);
-        addon.destroyResource(cb);
-      }
-    }
+    // Frame callbacks are delivered ONLY by dispatchFrameCallbacksForOutput on
+    // flip-complete (the real vblank). The force-present above guarantees a
+    // flip is coming for any surface with a pending callback, so none strand.
   };
 
   // Per-output frame-callback dispatch. Called by the addon when a KMS

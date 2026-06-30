@@ -2376,6 +2376,16 @@ export class JsCompositor implements CompositorSink {
   // buffer scale/transform changes route here. If the surface's fx can draw
   // outside its nominal rect (transform / margin / mask), repaint the whole
   // output instead -- the rect would undercount the affected region.
+  // Force a present of `id`'s current (unchanged) content so the next
+  // flip-complete delivers its pending frame callback. Its buffer is still
+  // resident (released only on supersede), so re-presenting is safe. Used to
+  // break the idle deadlock: a client waiting on wl_callback.done that produces
+  // no damage of its own would otherwise never get a present -> never a flip ->
+  // never `done`. No-op if the surface isn't drawable.
+  requestPresentForCallback(id: number): void {
+    if (this.surfaces.has(id)) this.damageSurface(id);
+  }
+
   private damageSurface(id: number): void {
     const s = this.surfaces.get(id);
     if (!s) return;

@@ -386,6 +386,11 @@ export interface CompositorSink {
   surfaceHasContentInFlight?(surfaceId: number): boolean;
   // Whether an output has damage queued (a present is pending for it).
   isOutputDirty?(outputId: number): boolean;
+  // Force a present of `surfaceId`'s unchanged content so the next flip-complete
+  // delivers its pending frame callback (breaks the idle deadlock for a client
+  // waiting on wl_callback.done that produces no damage). Vblank-gated. No-op if
+  // the surface isn't drawable.
+  requestPresentForCallback?(surfaceId: number): void;
   // Notify the compositor that a client wl_buffer was destroyed (explicit
   // wl_buffer.destroy or disconnect sweep). Drives cache invalidation in
   // the client-buffer lifecycle (rule A: along with surfaceRemoved, the
