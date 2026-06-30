@@ -370,6 +370,13 @@ export interface CompositorSink {
   setSurfaceShape?(id: number, shape: import("../gpu/compositor.js").SurfaceShape): void;
   removeSurface(id: number): void;
   takeImportedSurfaces(): Array<{ id: number; width: number; height: number }>;
+  // Re-announce an already-imported surface for the next takeImportedSurfaces
+  // pass (XWM uses it to re-run a deferred map once a window is managed).
+  redeliverImported?(id: number): void;
+  // Stamp the latest configure-sent / client-acked serials so the decoration
+  // content-gate (surfaceContentReady) can release on ack rather than size.
+  notifyConfigureSerial?(id: number, serial: number): void;
+  notifyAckSerial?(id: number, serial: number): void;
   takeFreedBuffers(): number[];
   // Which output ids overlap this surface's current rect. Empty for an
   // unmapped / off-screen surface. Used by the per-output frame-callback

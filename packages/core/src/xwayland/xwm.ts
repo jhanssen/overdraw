@@ -315,6 +315,12 @@ export function startXwm(state: CompositorState, addon: Addon, wmFd: number): Xw
     // into the WM now that the window is managed. Order: first markInitial so
     // window.map carries title/appId; then proposals for structural fields.
     publishInitial(w, surfRec);
+    // If the client's first buffer imported BEFORE this manage step (the
+    // property-read race: addWindow waits on the WM_CLASS/title reads), the
+    // first-content map was deferred -- it had no layout rect. Re-deliver the
+    // import now that the window is managed so the map completes. No-op when
+    // no buffer has imported yet (the eventual first import maps it normally).
+    state.compositor.redeliverImported?.(w.surfaceId);
   }
 
   function unmanage(w: XWindow): void {

@@ -537,28 +537,39 @@ export async function installProtocols(
         // don't auto-focus, and rebuild the stack themselves via
         // rebuildStackWithPopups. Managed xwayland windows mirror the
         // xdg_toplevel flow.
-        s.mapped = true;
-        mappedAny = true;
         const isOverrideRedirect = state.xwm?.findBySurfaceId(id)?.overrideRedirect ?? false;
         if (isOverrideRedirect) {
           // OR placement is owned by xwm.ts (state.overrideRedirects +
           // rebuildStackWithPopups); first content just flips s.mapped.
           // The rebuild already ran on MapNotify; trigger another so the
           // stack actually picks up s.mapped flipping true.
+          s.mapped = true;
+          mappedAny = true;
           mappedPopup = true;
         } else {
           const rect = state.wm?.rectOf(id);
-          if (rect) {
-            const ta = titleAppId(state, id);
-            state.bus?.emit(WINDOW_EVENT.map, {
-              surfaceId: id,
-              outputId: s.spawnOutputId ?? OUTPUT_DEFAULT,
-              rect: { x: rect.x, y: rect.y, width: rect.width, height: rect.height },
-              appId: ta.appId, title: ta.title,
-            });
-            state.wm?.windowHasContent(id, clientContentSize(s, width, height));
-            state.seat?.focusWindow(id, s, rect);
+          if (!rect) {
+            // The buffer imported before the XWM finished managing this window
+            // (its addWindow waits on the WM_CLASS/title property reads). The
+            // window has no layout rect yet, so it can't map. Leave it
+            // UNCONSUMED -- do not set s.mapped -- so a re-delivery once the
+            // window is managed runs this branch again with a rect. xwm.ts
+            // maybeManage re-pushes the import via compositor.redeliverImported
+            // right after addWindow. (Setting s.mapped here would make the next
+            // pass skip it forever: the window would stay mapped-but-invisible.)
+            continue;
           }
+          s.mapped = true;
+          mappedAny = true;
+          const ta = titleAppId(state, id);
+          state.bus?.emit(WINDOW_EVENT.map, {
+            surfaceId: id,
+            outputId: s.spawnOutputId ?? OUTPUT_DEFAULT,
+            rect: { x: rect.x, y: rect.y, width: rect.width, height: rect.height },
+            appId: ta.appId, title: ta.title,
+          });
+          state.wm?.windowHasContent(id, clientContentSize(s, width, height));
+          state.seat?.focusWindow(id, s, rect);
         }
       } else if (s.role === "xdg_popup") {
         // A popup maps on first content; it is compositor-positioned above its

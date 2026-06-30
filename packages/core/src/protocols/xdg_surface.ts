@@ -50,6 +50,7 @@ export function configureToplevel(ctx: Ctx, xs: XdgSurfaceRecord, width: number,
   xs.lastConfigureSerial = serial;
   xs.configuredWidth = width;
   xs.configuredHeight = height;
+  if (xs.surface) ctx.state.compositor?.notifyConfigureSerial?.(xs.surface.id, serial);
   ctx.events.xdg_surface.send_configure(xs.resource, serial);
   return serial;
 }
@@ -215,6 +216,7 @@ export default function makeXdgSurface(ctx: Ctx): XdgSurfaceHandler {
       if (xs.lastAckedSerial === undefined || serial > xs.lastAckedSerial) {
         xs.lastAckedSerial = serial;
       }
+      if (xs.surface) ctx.state.compositor?.notifyAckSerial?.(xs.surface.id, serial);
     },
     destroy(resource) {
       const xs = rec(resource);

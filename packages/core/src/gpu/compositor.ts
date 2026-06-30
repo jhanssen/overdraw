@@ -470,6 +470,27 @@ export type SurfaceShape =
       tl: number; tr: number; br: number; bl: number }
   | { kind: "superellipse"; exponent: number; radius: number };
 
+// The content-gate release decision (surfaceContentReady's core), pulled out
+// pure for testing. The gate releases once the client has a drawable buffer
+// AND has acked our latest configure (ackSerial >= cfgSerial). The committed
+// buffer SIZE is intentionally not part of the decision: a client may settle
+// at a slightly different size than configured (CSD shadow margins, terminal
+// cell rounding, fixed-size dialogs) and an exact-size gate would strand it on
+// the backstop. The ack is a serial, so the check is scale-correct with no
+// pixel math. Xwayland has no ack_configure (cfgSerial undefined) -> ready on a
+// drawable buffer alone.
+export function contentGateReleased(s: {
+  hasBuffer: boolean;
+  layoutW: number;
+  layoutH: number;
+  cfgSerial?: number;
+  ackSerial?: number;
+}): boolean {
+  if (!s.hasBuffer || s.layoutW <= 0 || s.layoutH <= 0) return false;
+  if (s.cfgSerial !== undefined && (s.ackSerial ?? -1) < s.cfgSerial) return false;
+  return true;
+}
+
 // Per-surface render state mutated by setSurfaceOpacity/Transform/OutputMargin
 // (core-plugin-api.md §1) and consumed by the WGSL Uniforms struct each frame.
 // Defaults: opacity=1, identity transform, zero margin -- equivalent to the
@@ -542,6 +563,12 @@ interface Surface {
   y: number;
   layoutW: number;
   layoutH: number;
+  // Latest xdg_surface.configure serial sent for this surface, and the latest
+  // serial the client acked. Drive the decoration content-gate release
+  // (surfaceContentReady): the client is ready when ackSerial >= cfgSerial.
+  // Both undefined for xwayland (no ack_configure).
+  cfgSerial?: number;
+  ackSerial?: number;
   present: boolean;
   // For dmabuf surfaces, the buffer the lifecycle machine has assigned as
   // current (0 = shm/none/not-yet-imported). Used to pair frameSampled events
@@ -1448,52 +1475,38 @@ export class JsCompositor implements CompositorSink {
   // becomes drawable, so it can re-check whether a held resize is ready.
   setFrozenReadyHandler(cb: (id: number) => void): void { this.frozenReadyCb = cb; }
 
-  // True if the surface has a drawable buffer at logical size (w, h). The WM
-  // gates a held resize's apply on this so it never thaws onto a not-yet-
-  // imported (or stale-size) buffer.
-  // `scale` (optional): when provided, also require the committed buffer's
-  // device dimensions to match `round(w * scale, h * scale)`. This catches
-  // a fractional-scale-aware client that acked our configure with the new
-  // logical size (viewportDst matches) but rendered its glyphs at the OLD
-  // scale's pixel density (buffer dims still reflect the old scale). The
-  // logical-only check alone returns true on that lie. The WM resize-tx
-  // passes the target output's scale here when known so it gates apply on
-  // a buffer that truly matches the new scale, not just the new logical
-  // size.
-  // Whether the committed client buffer matches the WM content rect (layoutW/H)
-  // scaled to device px -- the scale-aware check ctx.contentReady exposes. Reads
-  // s.texture (the same buffer the plugin samples as input), so it holds for
-  // both SHM and dmabuf surfaces; 1px tolerance absorbs fractional rounding.
+  // Whether the client has produced content in response to our latest
+  // configure -- the signal ctx.contentReady exposes to drive an intercept's
+  // gate release. See contentGateReleased: a drawable buffer plus (for xdg)
+  // an ack of the latest configure serial. Size is deliberately NOT compared.
   surfaceContentReady(id: number): boolean {
     const s = this.surfaces.get(id);
-    if (!s || !s.texture || s.layoutW <= 0 || s.layoutH <= 0) {
-      return false;
-    }
-    // The gate releases when the client's content fills the configured layout
-    // rect, compared in LOGICAL pixels. Buffer pixel density is irrelevant: a
-    // fractionally-scaled client renders its buffer at an integer scale (e.g.
-    // 2x for a 1.5x output) and presents at the logical size via buffer_scale
-    // or a viewport, so comparing raw buffer px against layout*outputScale
-    // never matches.
-    //
-    // Prefer the client's window geometry (set_window_geometry) over the raw
-    // buffer: a CSD client draws shadow/margin pixels OUTSIDE the geometry
-    // rect, so its buffer is larger than the window the WM lays out. The
-    // layout rect tracks the geometry (the visible window), so comparing the
-    // raw buffer would never match for any client with a shadow margin and
-    // the content gate would only ever release via its backstop.
-    let lw: number, lh: number;
-    if (s.viewportDst && s.viewportDst.width > 0 && s.viewportDst.height > 0) {
-      lw = s.viewportDst.width; lh = s.viewportDst.height;
-    } else if (s.geometry && s.geometry.width > 0 && s.geometry.height > 0) {
-      lw = s.geometry.width; lh = s.geometry.height;
-    } else {
-      ({ w: lw, h: lh } = this.surfaceLogicalSize(s));
-    }
-    return Math.abs(lw - s.layoutW) <= 1 && Math.abs(lh - s.layoutH) <= 1;
+    if (!s) return false;
+    return contentGateReleased({
+      hasBuffer: !!s.texture, layoutW: s.layoutW, layoutH: s.layoutH,
+      cfgSerial: s.cfgSerial, ackSerial: s.ackSerial,
+    });
+  }
+
+  // Stamp the latest xdg_surface.configure serial sent for this surface, and
+  // the latest serial the client acked. surfaceContentReady gates the
+  // decoration content-gate on (ackSerial >= cfgSerial).
+  notifyConfigureSerial(id: number, serial: number): void {
+    const s = this.surfaces.get(id) ?? this.ensureSurface(id);
+    s.cfgSerial = serial;
+  }
+  notifyAckSerial(id: number, serial: number): void {
+    const s = this.surfaces.get(id);
+    if (s) s.ackSerial = Math.max(s.ackSerial ?? -1, serial);
   }
 
 
+  // True if the surface has a drawable buffer at logical size (w, h) -- the WM
+  // gates a held resize's apply on this so it never thaws onto a not-yet-
+  // imported (or stale-size) buffer. `scale`, when given, also requires the
+  // buffer's device dims to match round(w*scale, h*scale) -- catches a
+  // fractional-scale client that acked the new logical size but still rendered
+  // at the old pixel density.
   surfaceReadyAt(id: number, w: number, h: number, scale?: number): boolean {
     const s = this.surfaces.get(id);
     if (!s || !s.present || !s.view || s.currentBufferId === 0) return false;
@@ -2210,6 +2223,18 @@ export class JsCompositor implements CompositorSink {
     const out = this.imported;
     this.imported = [];
     return out;
+  }
+
+  // Re-announce an already-imported surface so the next takeImportedSurfaces
+  // pass re-runs the map step. Used by the XWM when a window becomes managed
+  // AFTER its first buffer already imported (the property-read race): the
+  // import was left unconsumed (s.mapped stayed false), so re-delivering it
+  // now -- with the window managed -- lets the map complete. No-op when the
+  // surface has no committed buffer yet (the eventual first import maps it).
+  redeliverImported(id: number): void {
+    const s = this.surfaces.get(id);
+    if (!s || !s.texture) return;
+    this.imported.push({ id, width: s.width, height: s.height });
   }
 
   // Which output ids does the surface currently overlap? Used by the per-output
