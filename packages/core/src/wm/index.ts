@@ -1426,6 +1426,22 @@ export function createWm(
 
       // Immediate path (non-reorder reasons, or initial / not-yet-content
       // windows). Suppress configure during the deferred-initial-commit phase.
+      //
+      // This pass is authoritative for the window's geometry. A resize-tx
+      // hold left by an earlier pass captured a now-stale rect; the broker's
+      // deadline force-apply (or a late client commit) would otherwise run
+      // its onApply and push that stale rect on top of what we set here,
+      // reverting the window to its pre-transition tile. That is what leaves
+      // a hole in the layout when a tiled window is promoted to floating: the
+      // remaining windows' reflow lands, then the stale hold yanks them back.
+      // Retarget the hold to the new geometry so its eventual apply is a
+      // no-op against this placement instead of a regression.
+      const stalePend = pendingResizes.get(win.surfaceId);
+      if (stalePend) {
+        stalePend.outer = { ...newOuter };
+        stalePend.content = { ...newContent };
+        stalePend.moveOnly = false;
+      }
       if (!moved && !sizeChanged) {
         // Cache the output id even when geometry didn't change (a workspace
         // move could change which output a window belongs to without

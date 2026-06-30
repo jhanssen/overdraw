@@ -80,6 +80,41 @@ test('reorder holds geometry: configure sent, but rect not applied until commit'
   assert.deepEqual(rectOf(wm, 3), { x: 500, y: 0, width: 500, height: 300 }, '3 -> stack-top');
 });
 
+test('immediate relayout retargets an in-flight hold (floating peer must not clobber the stack)', async () => {
+  // Regression: a window leaving the tiled set (here: promoted to floating)
+  // reflows the remaining windows via the immediate path. If a resize-tx hold
+  // from an earlier reorder is still in flight for one of those windows, the
+  // broker's deadline force-apply would push the hold's STALE captured rect on
+  // top of the immediate placement -- reverting the window to its pre-reflow
+  // tile and leaving a hole in the layout. The immediate path must retarget
+  // the hold so its eventual apply matches the new geometry.
+  const { wm } = setup();
+  await addMapped(wm, 1);
+  await addMapped(wm, 2);
+  await addMapped(wm, 3);
+  await wm.settled();
+  // Order [3, 2, 1]: 3 master, 2 stack-top, 1 stack-bottom.
+
+  // Reorder to hold 2 and 3 in a resize-tx (no client commits -> stays held).
+  wm.reorder(3, 'swap-next');           // order -> [2, 3, 1]
+  await wm.settled();
+  assert.deepEqual(rectOf(wm, 3), { x: 0, y: 0, width: 500, height: 600 }, '3 held at old master rect');
+
+  // Promote the stack-bottom window to floating BEFORE the hold releases. The
+  // remaining tiled set {2, 3} reflows immediately: 2 master, 3 stack-FULL.
+  await wm.propose(1, { tiling: 'floating' }, 'user-input');
+  await wm.settled();
+
+  // Let the resize-tx deadline (150ms) force-apply with no client commits.
+  await new Promise((r) => setTimeout(r, 220));
+
+  // 3 must end at the new full-height stack rect, NOT the stale half-height
+  // stack-top rect the reorder hold had captured.
+  assert.deepEqual(rectOf(wm, 3), { x: 500, y: 0, width: 500, height: 600 },
+    '3 fills the full stack column (stale hold did not clobber)');
+  assert.deepEqual(rectOf(wm, 2), { x: 0, y: 0, width: 500, height: 600 }, '2 -> master');
+});
+
 test('reorder transaction: stale serial does not release the hold', async () => {
   const { wm, configures } = setup();
   await addMapped(wm, 1);
