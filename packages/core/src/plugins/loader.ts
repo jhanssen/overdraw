@@ -15,6 +15,8 @@
 //                core's GPUDevice; same-device texture rotation).
 // Both produce the same PluginGpu shape, so the plugin source is identical.
 
+import { register } from "node:module";
+
 import { Endpoint } from "./protocol.js";
 import type { Channel, Json } from "./protocol.js";
 import { createSdk } from "./sdk.js";
@@ -61,7 +63,20 @@ export interface LoaderInput {
 
 type InitFn = (sdk: PluginSdk, config?: unknown) => unknown | Promise<unknown>;
 
+// Register the @overdraw/* fallback resolve hook once per realm (main thread
+// for in-thread plugins, worker thread for Worker plugins). Idempotent: the
+// flag is per-module-instance, which is per-realm. Must run before the plugin
+// import() below so a user plugin outside the install can resolve the bundled
+// SDK packages.
+let resolveHooksRegistered = false;
+function registerPluginResolveHooks(): void {
+  if (resolveHooksRegistered) return;
+  resolveHooksRegistered = true;
+  register(new URL("./plugin-resolve-hooks.js", import.meta.url));
+}
+
 export async function runLoader(channel: Channel, input: LoaderInput): Promise<void> {
+  registerPluginResolveHooks();
   const endpoint = new Endpoint(channel);
 
   let gpu: PluginGpu | undefined;
