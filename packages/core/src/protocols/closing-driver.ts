@@ -27,7 +27,7 @@ import { WINDOW_EVENT } from "../events/types.js";
 import type { WindowClosingEvent } from "../events/types.js";
 import { log } from "../log.js";
 import { titleAppId } from "../query.js";
-import { collectSubsurfaceIds } from "./window-group.js";
+import { collectSubsurfaceIds } from "../subsurfaces.js";
 
 // Closing-driver dependencies. Wired by installProtocols when the
 // surrounding harness/launcher provides them; absent means "no closing

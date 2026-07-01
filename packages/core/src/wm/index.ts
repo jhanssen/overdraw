@@ -1138,10 +1138,6 @@ export function createWm(
     win.rect = content;
     if (win.hasContent) {
       compositor.setSurfaceLayout(win.surfaceId, content.x, content.y, content.width, content.height);
-      // The held move landed: re-emit this parent's subsurface subtree from the
-      // new position so children don't lag at the vacated tile until the
-      // client's next commit (mirrors the immediate path's immediateMoved).
-      if (prevContent.x !== content.x || prevContent.y !== content.y) rebuild?.();
     }
     const outerMoved = prevOuter.x !== outer.x || prevOuter.y !== outer.y
                     || prevOuter.width !== outer.width || prevOuter.height !== outer.height;
@@ -1289,13 +1285,6 @@ export function createWm(
   // drained here as DESTROYED entries.
   async function applyLayout(result: LayoutResult, reason: LayoutReason): Promise<void> {
     const useTx = reason === "reorder" && !!configure;
-    // A toplevel moved by this pass (immediate path) drags its subsurface
-    // subtree with it: subsurface layout rects are derived from the parent's
-    // rect, and the client won't re-commit them just because the WM retiled.
-    // Re-emit the whole tree once after the pass so children follow the parent
-    // to its new tile instead of lagging at the vacated position until the
-    // client's next frame. (The tx path re-emits per-window in pushGeometry.)
-    let immediateMoved = false;
     const byId = new Map<number, { id: number; outer: Rect }>();
     for (const r of result.rects) byId.set(r.id, r);
     const snapshotWindows = [...windows];
@@ -1448,11 +1437,9 @@ export function createWm(
       win.outer = newOuter;
       win.outputId = newOutputId;
       const content = contentOf(win);
-      const contentMoved = win.rect.x !== content.x || win.rect.y !== content.y;
       win.rect = content;
       if (win.hasContent) {
         compositor.setSurfaceLayout(win.surfaceId, content.x, content.y, content.width, content.height);
-        if (contentMoved) immediateMoved = true;
       }
       if (configure && !win.pendingInitialCommit && sizeChanged) {
         // This is the real tile-size configure. When a fresh window first
@@ -1477,9 +1464,6 @@ export function createWm(
         }
       }
     }
-    // A parent moved this pass -> re-derive its subsurface layout rects from the
-    // new parent position so children follow immediately (see immediateMoved).
-    if (immediateMoved) rebuild?.();
 
     // Drain destroyed-this-pass windows. Each emits a per-window
     // window.relayout event with newOuter === null (DESTROYED) and a
@@ -1886,6 +1870,10 @@ export function createWm(
       const next = decoSurfaceId === null ? undefined : decoSurfaceId;
       if (win.decorationSurfaceId === next) return;
       win.decorationSurfaceId = next;
+      // Bind the decoration as an fx-follower so a window transform/opacity
+      // reaches it (the compositor cascades over the group). It keeps its own
+      // outer-rect layout, set below.
+      compositor.setDecorationFx?.(windowId, next ?? null);
       if (next !== undefined && win.outer.width > 0 && win.outer.height > 0) {
         compositor.setSurfaceLayout(next, win.outer.x, win.outer.y,
                                     win.outer.width, win.outer.height);

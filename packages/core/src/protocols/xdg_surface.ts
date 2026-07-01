@@ -142,8 +142,8 @@ export default function makeXdgSurface(ctx: Ctx): XdgSurfaceHandler {
       const surfaceId = xs.surface?.id;
       if (surfaceId !== undefined && xs.surface && ctx.state.wm) {
         // The WM's SurfaceHandle must carry the wl_surface record (its .resource is
-        // the wl_surface, used for subsurface child lookup in emitSubtree and for
-        // input/client-id routing), NOT the xdg_toplevel resource.
+        // the wl_surface, used for subsurface child lookup and for input/client-id
+        // routing), NOT the xdg_toplevel resource.
         //
         // Spawn-follows-pointer: place the new window on the output the user
         // is currently looking at. Pointer position is in global logical

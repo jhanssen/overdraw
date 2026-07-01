@@ -63,7 +63,7 @@ import { rebuildStackWithPopups } from "./protocols/xdg_popup.js";
 // The order is maintained by wl_subcompositor.get_subsurface (appends each
 // new child to the top) + applySubsurfaceReorder (drained on parent
 // commit, applying queued place_above / place_below operations).
-function childrenOf(state: CompositorState, parent: Resource): SubsurfaceRecord[] {
+export function childrenOf(state: CompositorState, parent: Resource): SubsurfaceRecord[] {
   const order = state.subsurfaceOrder?.get(parent);
   if (!order) return [];
   const out: SubsurfaceRecord[] = [];
@@ -156,27 +156,64 @@ function applyOneReorder(
   order.splice(insertAt, 0, op.subsurface);
 }
 
-// Recursively append `surfaceRes`'s subsurface subtree to `stack` (each child
-// above its parent), setting each child's layout rect relative to `originX/Y`
-// (the child's parent's output-space top-left). Children themselves may have
-// children. Returns nothing; mutates `stack` and pushes layouts to native.
-export function emitSubtree(
-  state: CompositorState, parentRes: Resource,
-  parentX: number, parentY: number, stack: number[],
+// Append `parentRes`'s subsurface subtree to `stack` in draw order (each child
+// above its parent, nested children above their own parent). Only children with
+// committed content are included -- an id with no texture is skipped at draw,
+// but keeping the stack tight avoids churn. This owns draw-order MEMBERSHIP
+// only: each child's absolute placement is derived by the compositor from its
+// parent's current rect + offset (setSurfaceLayout cascade / reflowSubsurfaces),
+// so no layout is pushed here.
+export function emitSubtreeStack(
+  state: CompositorState, parentRes: Resource, stack: number[],
 ): void {
   for (const sub of childrenOf(state, parentRes)) {
     const childRec = state.surfaces.get(sub.surface) as SurfaceRecord | undefined;
     if (!childRec || childRec.resource.destroyed) continue;
-    // Only draw a subsurface once it has committed content (a texture). The
-    // compositor tolerates an id with no texture (skipped at draw), but keep the
-    // stack tight.
     if (!childRec.hasContent) continue;
-    const cx = parentX + sub.x;
-    const cy = parentY + sub.y;
-    // w/h 0 => the compositor uses the surface's content size.
-    state.compositor.setSurfaceLayout(childRec.id, cx, cy, 0, 0);
     stack.push(childRec.id);
-    emitSubtree(state, sub.surface, cx, cy, stack);  // nested subsurfaces
+    emitSubtreeStack(state, sub.surface, stack);  // nested subsurfaces
+  }
+}
+
+// The subsurface tree, exposed to the compositor as compositor ids. The
+// compositor derives absolute child placement (parent rect + offset) and
+// cascades per-surface fx over the subtree; this is the ONLY channel by which
+// it learns the tree, so no caller enumerates subsurfaces for positioning.
+export interface SubsurfaceAccessor {
+  // Direct subsurface children of `parentId`, in draw order (bottom-to-top),
+  // each with its parent-relative offset. Only children with committed content
+  // are returned (those the compositor positions + draws).
+  children(parentId: number): Array<{ id: number; offX: number; offY: number }>;
+}
+
+export function makeSubsurfaceAccessor(state: CompositorState): SubsurfaceAccessor {
+  return {
+    children(parentId) {
+      const parentRec = state.surfacesById?.get(parentId);
+      if (!parentRec) return [];
+      const out: Array<{ id: number; offX: number; offY: number }> = [];
+      for (const sub of childrenOf(state, parentRec.resource)) {
+        const childRec = state.surfaces.get(sub.surface) as SurfaceRecord | undefined;
+        if (!childRec || childRec.resource.destroyed || !childRec.hasContent) continue;
+        out.push({ id: childRec.id, offX: sub.x, offY: sub.y });
+      }
+      return out;
+    },
+  };
+}
+
+// Flatten `parent`'s subsurface subtree into `out` as compositor ids, in draw
+// order (each child after its parent). Assembles a window's full surface set
+// for an offscreen snapshot (closing-animation phantom); includes children
+// regardless of content -- the caller snapshots whatever is drawable.
+export function collectSubsurfaceIds(
+  state: CompositorState, parent: Resource, out: number[],
+): void {
+  for (const sub of childrenOf(state, parent)) {
+    const childRec = state.surfaces.get(sub.surface) as SurfaceRecord | undefined;
+    if (!childRec) continue;
+    out.push(childRec.id);
+    collectSubsurfaceIds(state, sub.surface, out);
   }
 }
 
@@ -216,7 +253,7 @@ export function computeBaseStack(
     // a lower window's decoration.)
     if (win.decorationSurfaceId !== undefined) stack.push(win.decorationSurfaceId);
     stack.push(win.surfaceId);
-    emitSubtree(state, win.surfaceRec.resource, win.rect.x, win.rect.y, stack);
+    emitSubtreeStack(state, win.surfaceRec.resource, stack);
   }
   return stack;
 }
@@ -236,9 +273,30 @@ export interface WmWindowLike {
   z?: number;
 }
 
-// Recompute subsurface layouts + the full draw stack and push to native. Delegates
-// to the popup module's rebuildStackWithPopups, which is the SINGLE owner of
-// setStack (base = windows+subsurfaces via computeBaseStack, then popups on top).
+// Recompute the full draw stack (via rebuildStackWithPopups, the SINGLE owner of
+// setStack) and re-derive subsurface placement. A tree change (a child gained
+// content, set_position applied on parent commit, a sibling reorder) can move
+// children without the parent's own rect changing, so reflow every root parent's
+// subtree from its current rect -- the compositor recurses into nested children.
 export function applySubsurfaces(state: CompositorState): void {
   rebuildStackWithPopups(state);
+  reflowRootSubsurfaces(state);
+}
+
+// Reflow each root parent's subsurface subtree. Root = a parent surface that is
+// not itself a subsurface's child; the compositor's reflow recurses into nested
+// subsurfaces, so reflowing roots covers the whole forest without positioning a
+// nested parent from a stale rect.
+function reflowRootSubsurfaces(state: CompositorState): void {
+  const order = state.subsurfaceOrder;
+  if (!order || order.size === 0) return;
+  if (!state.compositor.reflowSubsurfaces) return;
+  const childSurfaces = new Set<Resource>();
+  const subs = state.subsurfaces;
+  if (subs) for (const rec of subs.values()) childSurfaces.add(rec.surface);
+  for (const parentRes of order.keys()) {
+    if (childSurfaces.has(parentRes)) continue;   // nested; reached via recursion
+    const parentRec = state.surfaces.get(parentRes);
+    if (parentRec) state.compositor.reflowSubsurfaces(parentRec.id);
+  }
 }

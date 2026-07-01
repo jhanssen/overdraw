@@ -340,6 +340,14 @@ export async function setupCompositor(opts = {}) {
     }),
   });
 
+  // Hand the compositor the subsurface tree so it derives child placement +
+  // cascades fx (matches main.ts). Without this, subsurfaces never get a rect.
+  if (jsCompositor) {
+    const { makeSubsurfaceAccessor } = await import(
+      "../packages/core/dist/subsurfaces.js");
+    jsCompositor.setSubsurfaceAccessor?.(makeSubsurfaceAccessor(state));
+  }
+
   // Spin up the runtime + load the bundled plugins. The user-config-style
   // focus and layoutParams flow through bundledToResolved's third arg, which
   // each plugin spec extracts via its configFrom.

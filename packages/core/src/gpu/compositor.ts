@@ -983,6 +983,16 @@ export class JsCompositor implements CompositorSink {
   // via destroyPhantom; the broker also enforces a backstop timeout.
   // Insertion order = z order within the phantom group.
   private phantoms: number[] = [];
+
+  // Subsurface tree accessor (set by main.ts / the test harness). The only
+  // channel by which the compositor learns the subsurface tree: setSurfaceLayout
+  // derives each child's absolute placement from it, and the fx setters cascade
+  // over it. Null in pure structural tests -> cascade is inert.
+  private subsurfaceAccessor: import("../subsurfaces.js").SubsurfaceAccessor | null = null;
+  // Non-subsurface fx-followers per window: a decorated window's decoration
+  // surface receives the window's transform/opacity/tint/color-matrix but keeps
+  // its own layout rect. Keyed by the window (content) surface id.
+  private fxFollowers = new Map<number, number[]>();
   // Texture handles for each phantom, keyed by phantom surfaceId.
   // Destroyed when destroyPhantom runs. The phantom's compositor
   // surface entry in this.surfaces sees the texture via the regular
@@ -1434,6 +1444,62 @@ export class JsCompositor implements CompositorSink {
       this.surfaces.set(id, blankSurface(x, y, w, h));
       this.addOutputDamage(x, y, w, h);
     }
+    // Cascade: a subsurface's absolute placement is its parent's rect + offset,
+    // so moving/resizing a parent re-lays its whole subtree. The recursion
+    // reuses the per-surface move-damage above, so each child damages its
+    // old+new footprint.
+    this.cascadeSubsurfaceLayout(id, x, y);
+  }
+
+  // Re-place `parentId`'s direct subsurface children from (px, py) = the
+  // parent's absolute top-left; each child recurses through setSurfaceLayout,
+  // so nested subsurfaces follow too. Children are content-sized (w/h 0).
+  private cascadeSubsurfaceLayout(parentId: number, px: number, py: number): void {
+    const acc = this.subsurfaceAccessor;
+    if (!acc) return;
+    for (const c of acc.children(parentId)) {
+      this.setSurfaceLayout(c.id, px + c.offX, py + c.offY, 0, 0);
+    }
+  }
+
+  // Re-derive `parentId`'s subsurface subtree from the parent's CURRENT stored
+  // rect. Used when the tree changed but the parent's own rect did not (a child
+  // gained content, set_position applied on parent commit, a sibling reorder).
+  reflowSubsurfaces(parentId: number): void {
+    const s = this.surfaces.get(parentId);
+    if (!s) return;
+    this.cascadeSubsurfaceLayout(parentId, s.x, s.y);
+  }
+
+  setSubsurfaceAccessor(accessor: import("../subsurfaces.js").SubsurfaceAccessor): void {
+    this.subsurfaceAccessor = accessor;
+  }
+
+  // Bind (or clear) a window's decoration as an fx-follower. The decoration
+  // then receives the window's transform/opacity/tint/color-matrix via the fx
+  // cascade, keeping a decorated window visually unified during animations,
+  // while retaining its own layout rect (set separately by the WM).
+  setDecorationFx(windowId: number, decorationId: number | null): void {
+    if (decorationId === null) this.fxFollowers.delete(windowId);
+    else this.fxFollowers.set(windowId, [decorationId]);
+  }
+
+  // Every surface id the fx cascade should touch for `id`: the surface itself,
+  // its subsurface subtree (position-children also follow fx), and any
+  // non-subsurface fx-followers (the decoration). Depth-first; deduped by the
+  // tree structure (a surface has one parent).
+  private fxCascadeTargets(id: number): number[] {
+    const out: number[] = [id];
+    const acc = this.subsurfaceAccessor;
+    if (acc) {
+      const walk = (pid: number): void => {
+        for (const c of acc.children(pid)) { out.push(c.id); walk(c.id); }
+      };
+      walk(id);
+    }
+    const followers = this.fxFollowers.get(id);
+    if (followers) out.push(...followers);
+    return out;
   }
 
   // Resize transaction: snapshot this surface's CURRENT appearance right now,
@@ -1603,17 +1669,25 @@ export class JsCompositor implements CompositorSink {
   // mutate the per-surface SurfaceFx; the values flow into the WGSL Uniforms
   // each frame via updateUniforms. Auto-create the Surface so callers don't
   // race the protocol layer's setSurfaceLayout.
+  // The fx setters cascade over the surface's fx group (itself + subsurface
+  // subtree + decoration follower), so a caller moves/fades a whole window with
+  // one call. Each member gets the SAME value (scale is anchored per-surface --
+  // exact for translate, approximate for scale at animation timescales).
   setSurfaceOpacity(id: number, opacity: number): void {
-    this.ensureSurface(id).fx.opacity = clamp(opacity, 0, 1);
-    this.damageSurface(id);  // alpha change stays within the surface rect
+    const v = clamp(opacity, 0, 1);
+    for (const t of this.fxCascadeTargets(id)) {
+      this.ensureSurface(t).fx.opacity = v;
+      this.damageSurface(t);  // alpha change stays within the surface rect
+    }
   }
 
   setSurfaceTransform(id: number, t: SurfaceTransform): void {
-    const fx = this.ensureSurface(id).fx;
-    fx.translateX = t.translateX ?? 0;
-    fx.translateY = t.translateY ?? 0;
-    fx.scaleX = t.scaleX ?? 1;
-    fx.scaleY = t.scaleY ?? 1;
+    const tx = t.translateX ?? 0, ty = t.translateY ?? 0;
+    const sx = t.scaleX ?? 1, sy = t.scaleY ?? 1;
+    for (const tid of this.fxCascadeTargets(id)) {
+      const fx = this.ensureSurface(tid).fx;
+      fx.translateX = tx; fx.translateY = ty; fx.scaleX = sx; fx.scaleY = sy;
+    }
     this.damageFull();  // translate/scale can draw outside the layout rect
   }
 
@@ -1627,33 +1701,37 @@ export class JsCompositor implements CompositorSink {
   }
 
   setSurfaceTint(id: number, t: SurfaceTint): void {
-    const fx = this.ensureSurface(id).fx;
-    fx.tintR = t.r ?? 1;
-    fx.tintG = t.g ?? 1;
-    fx.tintB = t.b ?? 1;
-    fx.tintA = t.a ?? 1;
-    this.damageSurface(id);
+    const r = t.r ?? 1, g = t.g ?? 1, b = t.b ?? 1, a = t.a ?? 1;
+    for (const tid of this.fxCascadeTargets(id)) {
+      const fx = this.ensureSurface(tid).fx;
+      fx.tintR = r; fx.tintG = g; fx.tintB = b; fx.tintA = a;
+      this.damageSurface(tid);
+    }
   }
 
   // Install a 4x4 color matrix applied to the sampled rgba each frame. The
   // caller passes 16 numbers in column-major order (WGSL mat4x4f layout).
   // null restores the identity matrix.
   setSurfaceColorMatrix(id: number, m: ColorMatrix | null): void {
-    const fx = this.ensureSurface(id).fx;
+    const targets = this.fxCascadeTargets(id);
     if (m === null) {
-      fx.colorMatrix = identityColorMatrix();
-      this.damageSurface(id);
+      for (const tid of targets) {
+        this.ensureSurface(tid).fx.colorMatrix = identityColorMatrix();
+        this.damageSurface(tid);
+      }
       return;
     }
     if (m.length !== 16) {
       throw new Error(`setSurfaceColorMatrix: expected 16 numbers, got ${m.length}`);
     }
-    // Defensive copy: the caller's array is theirs to mutate without
-    // affecting subsequent frames.
-    const dst = new Float32Array(16);
-    for (let i = 0; i < 16; i++) dst[i] = m[i] ?? 0;
-    fx.colorMatrix = dst;
-    this.damageSurface(id);
+    for (const tid of targets) {
+      // Fresh array per surface: the caller's array is theirs to mutate, and
+      // members must not share a mutable buffer.
+      const dst = new Float32Array(16);
+      for (let i = 0; i < 16; i++) dst[i] = m[i] ?? 0;
+      this.ensureSurface(tid).fx.colorMatrix = dst;
+      this.damageSurface(tid);
+    }
   }
 
   // Install an analytic shape on a surface: a rounded rect (uniform radius or
@@ -1711,6 +1789,7 @@ export class JsCompositor implements CompositorSink {
     // rule A; the disconnect sweep in src/protocols/index.ts is what
     // guarantees no client-disconnect leak.
     this.dispatch(this.lifecycle.step({ kind: "surfaceRemoved", surfaceId: id }));
+    this.fxFollowers.delete(id);
 
     const s = this.surfaces.get(id);
     if (s) {

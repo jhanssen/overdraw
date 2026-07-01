@@ -9,7 +9,7 @@ import type { XdgPopupHandler } from "#protocols-gen/xdg_popup.js";
 import type { Ctx, XdgSurfaceRecord, PopupRecord, CompositorState } from "./ctx.js";
 import type { Resource } from "../types.js";
 import { solvePopupPosition } from "../popup-position.js";
-import { computeBaseStack, emitSubtree } from "../subsurfaces.js";
+import { computeBaseStack, emitSubtreeStack } from "../subsurfaces.js";
 import { primaryOutputOfSurface, primaryOutputId } from "./output-resolve.js";
 import { detachSurfaceRole } from "./wl_surface.js";
 
@@ -223,11 +223,13 @@ function appendPopups(
     const surf = pr.xdgSurface.surface;
     const px = origin.x + pr.rect.x + (surf.offsetDx ?? 0);
     const py = origin.y + pr.rect.y + (surf.offsetDy ?? 0);
+    // Positioning a popup cascades to its subsurface subtree (the compositor
+    // derives each child's absolute placement from this parent rect + offset).
     state.compositor.setSurfaceLayout(surf.id, px, py, 0, 0);
     stack.push(pr.xdgSurface.surface.id);
-    // A popup is a wl_surface and may itself parent subsurfaces; place its
-    // subsurface subtree above it (same walk as for window roots).
-    emitSubtree(state, pr.xdgSurface.surface.resource, px, py, stack);
+    // A popup is a wl_surface and may itself parent subsurfaces; add its
+    // subsurface subtree to the draw stack above it (membership only).
+    emitSubtreeStack(state, pr.xdgSurface.surface.resource, stack);
   }
 }
 

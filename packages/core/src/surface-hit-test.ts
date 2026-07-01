@@ -23,7 +23,8 @@
 // buffer has size 0 and is silently skipped.
 
 import type { Resource } from "./types.js";
-import type { CompositorState, SubsurfaceRecord, SurfaceRecord } from "./protocols/ctx.js";
+import type { CompositorState, SurfaceRecord } from "./protocols/ctx.js";
+import { childrenOf } from "./subsurfaces.js";
 
 export interface SurfaceHit {
   // The surface that accepted the hit (root or any descendant).
@@ -31,21 +32,6 @@ export interface SurfaceHit {
   // Output-space rect of the accepting surface (so the caller can
   // compute surface-local coords for wl_pointer.enter/motion).
   rect: { x: number; y: number; width: number; height: number };
-}
-
-// Bottom-to-top z-order of `parent`'s direct subsurface children, as
-// maintained by wl_subcompositor.get_subsurface + applySubsurfaceReorder.
-// An unknown parent yields no children. Mirrors subsurfaces.ts's
-// childrenOf (kept private there to avoid widening that module's API).
-function childSubsurfaces(state: CompositorState, parent: Resource): SubsurfaceRecord[] {
-  const order = state.subsurfaceOrder?.get(parent);
-  if (!order) return [];
-  const out: SubsurfaceRecord[] = [];
-  for (const subRes of order) {
-    const sub = state.subsurfaces?.get(subRes);
-    if (sub) out.push(sub);
-  }
-  return out;
 }
 
 // Logical (post-bufferScale / buffer_transform / viewport-dst)
@@ -100,7 +86,7 @@ function hitTestSubsurfaces(
   x: number,
   y: number,
 ): SurfaceHit | null {
-  const children = childSubsurfaces(state, parentRes);
+  const children = childrenOf(state, parentRes);
   // Top-of-stack first.
   for (let i = children.length - 1; i >= 0; i--) {
     const sub = children[i];

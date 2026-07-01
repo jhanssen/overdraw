@@ -363,6 +363,17 @@ export interface CompositorSink {
   // optional alpha mask. null = rectangle (default; shader early-out).
   // Radii are in surface LOGICAL pixels.
   setSurfaceShape?(id: number, shape: import("../gpu/compositor.js").SurfaceShape): void;
+  // Subsurface positioning + fx cascade. The compositor derives each subsurface's
+  // absolute placement (parent rect + offset) and cascades per-surface fx over
+  // the subtree, so no caller enumerates subsurfaces. The accessor is the only
+  // channel by which it learns the tree; reflowSubsurfaces re-derives a parent's
+  // subtree when the tree changed without the parent's own rect moving (child
+  // gained content, set_position applied, sibling reorder). setDecorationFx binds
+  // a window's decoration as an fx-follower (same transform/opacity as the
+  // window; its own layout) -- decoration is not a subsurface.
+  setSubsurfaceAccessor?(accessor: import("../subsurfaces.js").SubsurfaceAccessor): void;
+  reflowSubsurfaces?(parentId: number): void;
+  setDecorationFx?(windowId: number, decorationId: number | null): void;
   removeSurface(id: number): void;
   takeImportedSurfaces(): Array<{ id: number; width: number; height: number }>;
   // Re-announce an already-imported surface for the next takeImportedSurfaces

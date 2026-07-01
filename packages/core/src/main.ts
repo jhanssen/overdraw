@@ -36,7 +36,7 @@ import {
 } from "./plugins/cursor-broker.js";
 import { createCursorThemeResolver } from "./cursor/theme-resolver.js";
 import { resolveScale, logicalSize, edidDpi } from "./output/scale.js";
-import { makeComposeFlatteners } from "./subsurfaces.js";
+import { makeComposeFlatteners, makeSubsurfaceAccessor } from "./subsurfaces.js";
 import { Kinematics } from "./cursor/kinematics.js";
 import { CursorRuleEngine } from "./cursor/rule-engine.js";
 import { InterceptBroker } from "./intercept/broker.js";
@@ -53,7 +53,6 @@ import type { DawnWire, DawnGlobals } from "./gpu/compositor.js";
 import type { Addon, InputEvent } from "./types.js";
 import type { CompositorSink, CompositorState } from "./protocols/ctx.js";
 import { OUTPUT_DEFAULT } from "./protocols/ctx.js";
-import { resolveWindowGroup } from "./protocols/window-group.js";
 import { nextOutputPosition, durableKeyOf, formatRefreshHz } from "./output/arrangement.js";
 import { reemitWlOutput } from "./protocols/wl_output.js";
 import { reemitXdgOutput } from "./protocols/zxdg_output_manager_v1.js";
@@ -767,6 +766,10 @@ const sceneRegistry = createSceneRegistry();
 // so plugin-composed scenes include subsurface content at device scale. Shared
 // by the Worker GPU broker and the in-thread plugin SDK below.
 const composeFlatteners = makeComposeFlatteners(state);
+// Hand the compositor the subsurface tree: it derives each child's absolute
+// placement and cascades per-surface fx over the subtree, so the WM, evaluator,
+// and windows-broker never enumerate subsurfaces.
+compositor.setSubsurfaceAccessor?.(makeSubsurfaceAccessor(state));
 
 // GPU broker: services plugin Worker GPU/surface requests.
 const gpuBroker = createGpuBroker({
@@ -825,24 +828,13 @@ const windowsBroker = createWindowsBroker({
 // ticks once per compositor frame from state.beforeRender (wired below);
 // the broker routes plugin animations.run / cancel requests to it.
 //
-// A "window" is a group of surfaces (toplevel + decoration + subsurface
-// subtree); a transform/opacity animation must reach every member, since a
-// subsurface has no independent position -- it moves only with its parent.
-// The plugin-facing broker already expands the group (resolveWindowGroup); the
-// evaluator ticks the SAME targets every frame, so it must expand them too.
-// Without this, a content-subsurface client (e.g. Firefox) gets the animation's
-// start transform on its content surface but none of the decay ticks, leaving
-// the content pinned at the pre-animation position.
+// A transform/opacity animation on a window reaches its whole surface group
+// (toplevel + decoration + subsurface subtree) because the compositor's fx
+// setters cascade over the group -- the evaluator targets only the window's
+// content surface. A subsurface has no independent position; it moves only with
+// its parent, which the cascade guarantees on every decay tick.
 if (!state) throw new Error("animation evaluator: compositor state not initialized");
-const stateForAnim = state;
-const evaluatorSink: CompositorSink = Object.create(compositor) as CompositorSink;
-evaluatorSink.setSurfaceTransform = (id, t) => {
-  for (const sid of resolveWindowGroup(stateForAnim, id)) compositor.setSurfaceTransform?.(sid, t);
-};
-evaluatorSink.setSurfaceOpacity = (id, o) => {
-  for (const sid of resolveWindowGroup(stateForAnim, id)) compositor.setSurfaceOpacity?.(sid, o);
-};
-const evaluator = createEvaluator(evaluatorSink);
+const evaluator = createEvaluator(compositor);
 const animationsBroker = createAnimationsBroker(evaluator);
 
 // Transitions broker (core-plugin-api.md §8). Owns one TransitionEvaluator

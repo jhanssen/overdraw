@@ -1,19 +1,21 @@
 // A subsurface is positioned relative to its parent: its absolute rect is the
-// parent's rect + the subsurface offset, re-derived by the compositor's
-// emitSubtree (driven through the WM's `rebuild` hook). When the WM MOVES a
-// parent toplevel -- a tiling reflow when a peer maps, or a master/stack swap --
-// the children must be re-emitted at the new absolute position immediately,
-// not lag until the client's next commit. A client that renders its content
-// into a child surface (the GTK content-subsurface pattern, e.g. Firefox) would
-// otherwise leave that content parked over whatever now occupies the vacated
-// tile (renders on top of the new master) while its own tile shows only the
-// empty decoration frame (black).
+// parent's rect + the subsurface offset. The WM never derives child placement --
+// it only moves the parent via compositor.setSurfaceLayout, and the compositor
+// cascades that move to the parent's subsurface subtree. When the WM MOVES a
+// parent toplevel (a tiling reflow when a peer maps, or a master/stack swap) the
+// children must follow to the new absolute position immediately, not lag until
+// the client's next commit. A client that renders its content into a child
+// surface (the GTK content-subsurface pattern, e.g. Firefox) would otherwise
+// leave that content parked over whatever now occupies the vacated tile (renders
+// on top of the new master) while its own tile shows only the empty decoration
+// frame (black).
 //
-// These tests model the child re-emit with a `rebuild` spy that mimics
-// emitSubtree (child rect = parent rect + offset). They assert the child's
-// recorded placement tracks the parent across both move paths: the immediate
-// relayout (a peer mapping) and the resize-transaction apply (a reorder that
-// holds geometry until the client commits).
+// The fake compositor here implements the same cascade JsCompositor does: a
+// setSurfaceLayout on a parent re-lays every registered subsurface child from
+// the new parent rect + offset. The tests assert the child's recorded placement
+// tracks the parent across both move paths: the immediate relayout (a peer
+// mapping) and the resize-transaction apply (a reorder that holds geometry until
+// the client commits).
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
@@ -24,18 +26,35 @@ import { inlineMasterStackDriverFactory } from './wm-helpers.mjs';
 const rec = (id) => ({ resource: { __id: id } });
 const OUT = [{ id: 0, rect: { x: 0, y: 0, width: 1000, height: 600 }, scale: 1 }];
 
-// A child surface tracked under a parent toplevel at a fixed offset. `rebuild`
-// (the WM's subsurface-refresh hook) re-emits every tracked child from its
-// parent's CURRENT rect -- exactly what the real emitSubtree does.
 function setup({ withSerials } = {}) {
   const layouts = [];
+  // childId -> { parent, dx, dy }: the subsurface tree the compositor would
+  // learn through its accessor.
+  const children = new Map();
+  const lastRect = new Map();   // id -> { x, y }: last placement seen per surface
   const comp = {
-    setSurfaceLayout(id, x, y, w, h) { layouts.push({ id, x, y, w, h }); },
+    setSurfaceLayout(id, x, y, w, h) {
+      layouts.push({ id, x, y, w, h });
+      lastRect.set(id, { x, y });
+      // Cascade to subsurface children (content-sized), recursing like the
+      // real compositor's cascadeSubsurfaceLayout.
+      for (const [childId, c] of children) {
+        if (c.parent === id) this.setSurfaceLayout(childId, x + c.dx, y + c.dy, 0, 0);
+      }
+    },
+    // Re-derive a parent's subtree from its current rect (tree change with no
+    // parent move). Exercised by the protocol layer's applySubsurfaces; the
+    // WM-only tests here reach children through setSurfaceLayout cascades.
+    reflowSubsurfaces(parentId) {
+      const p = lastRect.get(parentId);
+      if (!p) return;
+      for (const [childId, c] of children) {
+        if (c.parent === parentId) this.setSurfaceLayout(childId, p.x + c.dx, p.y + c.dy, 0, 0);
+      }
+    },
     setStack() {},
     _layouts: layouts,
   };
-  // childId -> { parent, dx, dy }
-  const children = new Map();
   let serial = 0;
   const configures = [];
   const configure = {
@@ -45,17 +64,9 @@ function setup({ withSerials } = {}) {
     },
     configureMove: () => {},
   };
-  let wm;
-  const rebuild = () => {
-    for (const [childId, { parent, dx, dy }] of children) {
-      const p = wm.rectOf(parent);
-      if (p) comp.setSurfaceLayout(childId, p.x + dx, p.y + dy, 0, 0);
-    }
-  };
-  wm = createWm(comp, OUT, {
+  const wm = createWm(comp, OUT, {
     configure,
     layoutDriverFactory: inlineMasterStackDriverFactory,
-    rebuild,
   });
   return { wm, comp, children, configures };
 }
@@ -81,9 +92,9 @@ test('immediate reflow: a child follows its parent to the new tile', async () =>
 
   assert.deepEqual(wm.rectOf(1), { x: 500, y: 0, width: 500, height: 600 },
     'parent moved to the stack column');
-  // The child must have been re-emitted at the parent's NEW origin + offset.
+  // The parent move cascaded to the child at the parent's NEW origin + offset.
   assert.deepEqual(lastLayoutOf(comp, 9001), { id: 9001, x: 505, y: 7, w: 0, h: 0 },
-    'child followed the parent move (would lag at 5,7 before the fix)');
+    'child followed the parent move (would lag at 5,7 without the cascade)');
 });
 
 test('resize-transaction apply: a child follows when the held geometry lands', async () => {
@@ -102,12 +113,12 @@ test('resize-transaction apply: a child follows when the held geometry lands', a
   assert.equal(wm.reorder(3, 'swap-next'), true);
   await wm.settled();
 
-  // Held: 3 has not moved yet, so the child has not been re-emitted to a new
-  // place. Assert the parent is still at its old rect.
+  // Held: 3 has not moved yet, so the child has not been re-laid to a new place.
+  // Assert the parent is still at its old rect.
   assert.deepEqual(wm.rectOf(3), { x: 0, y: 0, width: 500, height: 600 }, '3 still held at master');
 
   // Both resizing windows commit; the held batch applies and 3 moves to the
-  // stack-top tile (500,0). pushGeometry re-emits the subtree.
+  // stack-top tile (500,0). pushGeometry's setSurfaceLayout cascades the subtree.
   wm.notifyToplevelCommit(2, lastSerial(configures, 2));
   wm.notifyToplevelCommit(3, lastSerial(configures, 3));
 
