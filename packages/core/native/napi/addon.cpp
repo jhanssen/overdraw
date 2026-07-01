@@ -28,6 +28,7 @@
 
 #include "core/compositor.h"
 #include "core/gpu_process.h"
+#include "core/spawn_child.h"
 #include "core/input.h"
 #include "core/input_wayland.h"
 #include "xwayland/napi_xwayland.h"
@@ -3341,6 +3342,7 @@ napi_value Init(napi_env env, napi_value exports) {
     napi_set_named_property(env, exports, "postEvent", fnPostEvent);
 
     overdraw::xwayland::RegisterXwayland(env, exports);
+    overdraw::core::RegisterSpawn(env, exports);
     return exports;
 }
 

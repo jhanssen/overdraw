@@ -10,7 +10,6 @@
 //   WAYLAND_DISPLAY=<printed name> your-client
 
 import { createRequire } from "node:module";
-import { spawn as spawnProcess } from "node:child_process";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { dirname, join, isAbsolute, resolve as resolvePath } from "node:path";
 import { globSync } from "node:fs";
@@ -639,21 +638,17 @@ if (config.xwayland.enabled) {
   }
 }
 
-// The `spawn` action (plugin-core-actions) emits this; the launcher runs the
-// actual process detached, with WAYLAND_DISPLAY pointed at our socket so the
-// child connects to us. stdio is discarded; the child outlives a compositor
-// restart only if it reparents (detached), which is the intent for a launcher.
-function spawnDetached(command: string, argv: string[]): void {
+// The `spawn` action (plugin-core-actions) emits this; exec-once/autostart use
+// it too. The child connects back to us via WAYLAND_DISPLAY and dies with the
+// compositor (addon.spawnChild sets PR_SET_PDEATHSIG on it), so a spawned GUI
+// client is never orphaned holding GPU memory across a compositor kill+relaunch.
+function spawnChild(command: string, argv: string[]): void {
+  const env = [`WAYLAND_DISPLAY=${sock}`];
+  if (xwaylandHandle !== null) env.push(`DISPLAY=${xwaylandHandle.display}`);
   try {
-    spawnProcess(command, argv, {
-      detached: true,
-      stdio: "ignore",
-      env: {
-        ...process.env,
-        WAYLAND_DISPLAY: sock,
-        ...(xwaylandHandle !== null ? { DISPLAY: xwaylandHandle.display } : {}),
-      },
-    }).unref();
+    if (addon.spawnChild(command, argv, env) < 0) {
+      log.warn("core", `spawn failed: ${command} (fork failed)`);
+    }
   } catch (e) {
     log.warn("core", `spawn failed: ${command}: ${(e as Error).message}`);
   }
@@ -662,13 +657,13 @@ pluginBus.subscribe("process.spawn-requested", (_name, payload) => {
   const { command, args } = payload as { command?: unknown; args?: unknown };
   if (typeof command !== "string" || command.length === 0) return;
   const argv = Array.isArray(args) ? args.filter((a): a is string => typeof a === "string") : [];
-  spawnDetached(command, argv);
+  spawnChild(command, argv);
 });
 
 // exec-once: launch the configured autostart commands now that the wayland
-// socket is up. Detached, with WAYLAND_DISPLAY (and DISPLAY once Xwayland is
-// running). Failures are logged, never fatal.
-for (const entry of config.autostart) spawnDetached(entry.command, entry.args);
+// socket is up, with WAYLAND_DISPLAY (and DISPLAY once Xwayland is running).
+// Failures are logged, never fatal.
+for (const entry of config.autostart) spawnChild(entry.command, entry.args);
 
 // Build the runtime context bundled plugins may need. The workspace plugin
 // reads bootOutputDurableKey to seed preferredOutputs with the real durable

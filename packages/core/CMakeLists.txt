@@ -185,6 +185,7 @@ set_target_properties(overdraw_xwayland PROPERTIES POSITION_INDEPENDENT_CODE ON)
 # ---- Core N-API addon (Node-hosted core) ----
 add_library(overdraw_native MODULE
     native/napi/addon.cpp
+    native/core/spawn_child.cpp
     native/wayland/trampoline.cpp
     native/wayland/wayland_fd.cpp
     native/wayland/keymap.cpp

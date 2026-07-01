@@ -41,6 +41,14 @@ export interface Addon {
   startServer(): string;
   stopServer(): void;
 
+  // Spawn a client that dies with the compositor (PR_SET_PDEATHSIG): argv
+  // excludes argv0, env is a list of "KEY=VALUE" overrides on the inherited
+  // environment. Returns the child pid, or -1 on fork failure. Exited children
+  // are reaped from a SIGCHLD watcher on the event loop; reapChildren forces a
+  // sweep if ever needed.
+  spawnChild(command: string, argv: string[], env: string[]): number;
+  reapChildren(): void;
+
   registerProtocols(signatures: unknown[]): void;
   registerInterface(name: string, handler: unknown): void;
   createGlobal(name: string, handler: unknown): void;
