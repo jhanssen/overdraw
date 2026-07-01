@@ -1415,10 +1415,21 @@ export class JsCompositor implements CompositorSink {
       // would repaint the whole rect per commit (and loop a client that keeps
       // a frame callback pending -- see setStack).
       if (s.x === x && s.y === y && s.layoutW === w && s.layoutH === h) return;
-      // Damage both the vacated and the new rect (move/resize).
-      this.addOutputDamage(s.x, s.y, s.layoutW, s.layoutH);
+      // Damage both the vacated and the new rect (move/resize). A subsurface is
+      // placed size-from-intrinsic (layoutW/H = 0); its on-screen footprint is
+      // the buffer's logical size (or the viewport destination). Damage that
+      // effective size, not the 0x0 layout -- a zero-area rect is dropped by the
+      // damage ring (and never sets the dirty bit), so a moved subsurface would
+      // otherwise leave stale pixels at its old position and never paint the new
+      // one until some other damage forces a full recomposite.
+      const bs = s.bufferScale || 1;
+      const effW = (lw: number): number =>
+        lw > 0 ? lw : (s.viewportDst?.width ?? s.viewportSrc?.width ?? s.width / bs);
+      const effH = (lh: number): number =>
+        lh > 0 ? lh : (s.viewportDst?.height ?? s.viewportSrc?.height ?? s.height / bs);
+      this.addOutputDamage(s.x, s.y, effW(s.layoutW), effH(s.layoutH));
       s.x = x; s.y = y; s.layoutW = w; s.layoutH = h;
-      this.addOutputDamage(x, y, w, h);
+      this.addOutputDamage(x, y, effW(w), effH(h));
     } else {
       this.surfaces.set(id, blankSurface(x, y, w, h));
       this.addOutputDamage(x, y, w, h);
@@ -1501,38 +1512,21 @@ export class JsCompositor implements CompositorSink {
   }
 
 
-  // True if the surface has a drawable buffer at logical size (w, h) -- the WM
-  // gates a held resize's apply on this so it never thaws onto a not-yet-
-  // imported (or stale-size) buffer. `scale`, when given, also requires the
-  // buffer's device dims to match round(w*scale, h*scale) -- catches a
-  // fractional-scale client that acked the new logical size but still rendered
-  // at the old pixel density.
-  surfaceReadyAt(id: number, w: number, h: number, scale?: number): boolean {
+  // True if the surface has a drawable buffer presenting at logical size (w, h)
+  // -- the WM gates a held resize's apply on this so it never thaws onto a
+  // not-yet-imported (or stale-size) buffer. Readiness is judged in LOGICAL
+  // space only: a wp_viewport destination (or source crop) defines the logical
+  // size directly, and a buffer's pixel dims are the client's own business -- a
+  // fractional-scale or viewporter client (e.g. Firefox) picks a buffer
+  // resolution unrelated to logical*scale, so any buffer-pixel equality gate
+  // here would never pass and would stall the held transaction indefinitely.
+  surfaceReadyAt(id: number, w: number, h: number): boolean {
     const s = this.surfaces.get(id);
     if (!s || !s.present || !s.view || s.currentBufferId === 0) return false;
     const bs = s.bufferScale || 1;
     const lw = s.viewportDst?.width ?? s.viewportSrc?.width ?? (s.width / bs);
     const lh = s.viewportDst?.height ?? s.viewportSrc?.height ?? (s.height / bs);
-    if (Math.round(lw) !== w || Math.round(lh) !== h) return false;
-    if (scale && scale > 0) {
-      // Allow a 1px tolerance: round-trip rounding can drift by one.
-      const expectedW = Math.round(w * scale);
-      const expectedH = Math.round(h * scale);
-      if (Math.abs(s.width - expectedW) > 1) return false;
-      if (Math.abs(s.height - expectedH) > 1) return false;
-    }
-    return true;
-  }
-
-  // Current committed buffer's device-pixel dimensions for surface `id`, or
-  // null if the surface has no drawable buffer yet. Used by the cross-
-  // output move hold to detect that a fractional-scale-aware client has
-  // reallocated at the new output's scale (= buffer dims changed to match
-  // round(logical * newScale)).
-  surfaceBufferDims(id: number): { width: number; height: number } | null {
-    const s = this.surfaces.get(id);
-    if (!s || !s.present || s.currentBufferId === 0) return null;
-    return { width: s.width, height: s.height };
+    return Math.round(lw) === w && Math.round(lh) === h;
   }
 
   private acquireSnapTex(w: number, h: number): FrozenSnapshot {

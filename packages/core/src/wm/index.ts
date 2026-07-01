@@ -1058,33 +1058,17 @@ export function createWm(
     phantomSurfaceId: number | null;
   };
   const removedThisPass: RemovedWindow[] = [];
-  // Resolve the output whose logical rect contains the given point. Used to
-  // attribute a pending resize to its destination output so surfaceReadyAt
-  // can verify the buffer dims match that output's scale (not just the
-  // logical size, which doesn't catch a client that committed at the new
-  // logical size but rasterized at the old scale).
-  function outputScaleForPoint(x: number, y: number): number | undefined {
-    for (const o of wm.outputs.values()) {
-      const r = o.rect;
-      if (x >= r.x && x < r.x + r.width && y >= r.y && y < r.y + r.height) {
-        return o.scale;
-      }
-    }
-    return undefined;
-  }
-
   function pendingReady(id: number): boolean {
     const p = pendingResizes.get(id);
     if (!p) return true;
     if (p.moveOnly) return true;
     if (p.requireAck && !p.acked) return false;
     if (!compositor.surfaceReadyAt) return true;
-    // Determine the destination output's scale from p.outer's center; gate
-    // the apply on the buffer matching both logical size AND that scale.
-    const cx = p.outer.x + p.outer.width / 2;
-    const cy = p.outer.y + p.outer.height / 2;
-    const scale = outputScaleForPoint(cx, cy);
-    return compositor.surfaceReadyAt(id, p.content.width, p.content.height, scale);
+    // Gate the apply on the surface presenting at the new LOGICAL size. A
+    // viewport/fractional-scale client controls its own buffer resolution, so
+    // logical size is the only sound readiness signal (a buffer-pixel scale
+    // gate would never pass for such a client and would hold the tx forever).
+    return compositor.surfaceReadyAt(id, p.content.width, p.content.height);
   }
 
   function pushStack(): void {
@@ -1154,6 +1138,10 @@ export function createWm(
     win.rect = content;
     if (win.hasContent) {
       compositor.setSurfaceLayout(win.surfaceId, content.x, content.y, content.width, content.height);
+      // The held move landed: re-emit this parent's subsurface subtree from the
+      // new position so children don't lag at the vacated tile until the
+      // client's next commit (mirrors the immediate path's immediateMoved).
+      if (prevContent.x !== content.x || prevContent.y !== content.y) rebuild?.();
     }
     const outerMoved = prevOuter.x !== outer.x || prevOuter.y !== outer.y
                     || prevOuter.width !== outer.width || prevOuter.height !== outer.height;
@@ -1301,6 +1289,13 @@ export function createWm(
   // drained here as DESTROYED entries.
   async function applyLayout(result: LayoutResult, reason: LayoutReason): Promise<void> {
     const useTx = reason === "reorder" && !!configure;
+    // A toplevel moved by this pass (immediate path) drags its subsurface
+    // subtree with it: subsurface layout rects are derived from the parent's
+    // rect, and the client won't re-commit them just because the WM retiled.
+    // Re-emit the whole tree once after the pass so children follow the parent
+    // to its new tile instead of lagging at the vacated position until the
+    // client's next frame. (The tx path re-emits per-window in pushGeometry.)
+    let immediateMoved = false;
     const byId = new Map<number, { id: number; outer: Rect }>();
     for (const r of result.rects) byId.set(r.id, r);
     const snapshotWindows = [...windows];
@@ -1453,9 +1448,11 @@ export function createWm(
       win.outer = newOuter;
       win.outputId = newOutputId;
       const content = contentOf(win);
+      const contentMoved = win.rect.x !== content.x || win.rect.y !== content.y;
       win.rect = content;
       if (win.hasContent) {
         compositor.setSurfaceLayout(win.surfaceId, content.x, content.y, content.width, content.height);
+        if (contentMoved) immediateMoved = true;
       }
       if (configure && !win.pendingInitialCommit && sizeChanged) {
         // This is the real tile-size configure. When a fresh window first
@@ -1480,6 +1477,9 @@ export function createWm(
         }
       }
     }
+    // A parent moved this pass -> re-derive its subsurface layout rects from the
+    // new parent position so children follow immediately (see immediateMoved).
+    if (immediateMoved) rebuild?.();
 
     // Drain destroyed-this-pass windows. Each emits a per-window
     // window.relayout event with newOuter === null (DESTROYED) and a

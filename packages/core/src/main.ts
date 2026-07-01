@@ -53,6 +53,7 @@ import type { DawnWire, DawnGlobals } from "./gpu/compositor.js";
 import type { Addon, InputEvent } from "./types.js";
 import type { CompositorSink, CompositorState } from "./protocols/ctx.js";
 import { OUTPUT_DEFAULT } from "./protocols/ctx.js";
+import { resolveWindowGroup } from "./protocols/window-group.js";
 import { nextOutputPosition, durableKeyOf, formatRefreshHz } from "./output/arrangement.js";
 import { reemitWlOutput } from "./protocols/wl_output.js";
 import { reemitXdgOutput } from "./protocols/zxdg_output_manager_v1.js";
@@ -823,7 +824,25 @@ const windowsBroker = createWindowsBroker({
 // Animation evaluator + broker (core-plugin-api.md §9). The evaluator
 // ticks once per compositor frame from state.beforeRender (wired below);
 // the broker routes plugin animations.run / cancel requests to it.
-const evaluator = createEvaluator(compositor);
+//
+// A "window" is a group of surfaces (toplevel + decoration + subsurface
+// subtree); a transform/opacity animation must reach every member, since a
+// subsurface has no independent position -- it moves only with its parent.
+// The plugin-facing broker already expands the group (resolveWindowGroup); the
+// evaluator ticks the SAME targets every frame, so it must expand them too.
+// Without this, a content-subsurface client (e.g. Firefox) gets the animation's
+// start transform on its content surface but none of the decay ticks, leaving
+// the content pinned at the pre-animation position.
+if (!state) throw new Error("animation evaluator: compositor state not initialized");
+const stateForAnim = state;
+const evaluatorSink: CompositorSink = Object.create(compositor) as CompositorSink;
+evaluatorSink.setSurfaceTransform = (id, t) => {
+  for (const sid of resolveWindowGroup(stateForAnim, id)) compositor.setSurfaceTransform?.(sid, t);
+};
+evaluatorSink.setSurfaceOpacity = (id, o) => {
+  for (const sid of resolveWindowGroup(stateForAnim, id)) compositor.setSurfaceOpacity?.(sid, o);
+};
+const evaluator = createEvaluator(evaluatorSink);
 const animationsBroker = createAnimationsBroker(evaluator);
 
 // Transitions broker (core-plugin-api.md §8). Owns one TransitionEvaluator

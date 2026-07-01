@@ -292,12 +292,7 @@ export interface CompositorSink {
   // (GPU-free test sinks omit them; the WM degrades to the ack-serial gate).
   freezeSurface?(id: number): void;
   thawSurface?(id: number): void;
-  surfaceReadyAt?(id: number, w: number, h: number, scale?: number): boolean;
-  // Current committed buffer's device-pixel dimensions, or null when the
-  // surface has no drawable buffer yet. Used by the cross-output move
-  // hold to detect that a fractional-scale client has reallocated at the
-  // new output's scale (= buffer dims changed to match new scale).
-  surfaceBufferDims?(id: number): { width: number; height: number } | null;
+  surfaceReadyAt?(id: number, w: number, h: number): boolean;
   setFrozenReadyHandler?(cb: (id: number) => void): void;
   // Buffer scale (wl_surface.set_buffer_scale): device pixels per logical
   // pixel in the surface's buffer. The surface's intrinsic logical size is

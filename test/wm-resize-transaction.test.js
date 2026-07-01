@@ -197,7 +197,7 @@ function setupBufferDimsOnly() {
     setSurfaceLayout() {},
     setStack() {},
     setFrozenReadyHandler(cb) { comp._frozenReady = cb; },
-    surfaceReadyAt(id, w, h, _scale) {
+    surfaceReadyAt(id, w, h) {
       const r = readyAt.get(id);
       return !!r && r.w === w && r.h === h;
     },

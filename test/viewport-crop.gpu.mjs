@@ -89,6 +89,22 @@ test("wp_viewport source crop: conversion, orientation, size-from-source",
     assert.deepEqual(px(8, 72), RED, "S3: inside 32x32 = cropped red");
     assert.deepEqual(px(40, 72), BLACK, "S3: x>32 outside surface = black");
     assert.deepEqual(px(8, 104), BLACK, "S3: y>32 outside surface = black");
+
+    // surfaceReadyAt (the WM resize-transaction "is this buffer drawable at the
+    // new size yet?" gate) judges readiness in LOGICAL space, NOT buffer pixels.
+    // A viewport/fractional-scale client picks its own buffer resolution, so a
+    // buffer-pixel equality gate would never pass and would stall the held
+    // transaction forever (the Firefox-on-top-of-Chrome bug). S1's 64x64 buffer
+    // has a 32x32 source crop, so its logical size is 32x32 (size-from-source).
+    // uploadPixels is an shm-style helper that leaves currentBufferId at 0 (the
+    // real wl_buffer attach path sets it); surfaceReadyAt requires a live buffer.
+    comp.surfaces.get(1).currentBufferId = 1;
+    assert.equal(comp.surfaceReadyAt(1, 32, 32), true, "ready at viewport logical size");
+    assert.equal(comp.surfaceReadyAt(1, 64, 64), false, "NOT ready at raw buffer pixels");
+    // A viewport DESTINATION decouples logical size from the buffer outright.
+    comp.setSurfaceViewport(1, { width: 50, height: 40 }, null);
+    assert.equal(comp.surfaceReadyAt(1, 50, 40), true, "ready at viewport dst (logical)");
+    assert.equal(comp.surfaceReadyAt(1, 64, 64), false, "still NOT ready at buffer pixels");
   } finally {
     addon.stop();
   }
