@@ -2477,6 +2477,19 @@ export class JsCompositor implements CompositorSink {
     this.outputDamage.full();
   }
 
+  // Fire the per-output render gate without geometry so the next frame
+  // presents (and emits a flip-complete). See CompositorHooks.requestOutputPresent
+  // for why screen capture needs this. markDirty leaves each slot's own damage
+  // ring untouched, so the presented scanout slot still composites the correct
+  // pixels; this only flips the "render this output at all this vblank" bit.
+  requestOutputPresent(outputId: number | null): void {
+    if (outputId === null) {
+      for (const o of this.outputsGeom.values()) this.outputDamage.markDirty(o.id);
+    } else {
+      this.outputDamage.markDirty(outputId);
+    }
+  }
+
   // Accumulate a GLOBAL-logical-space rect into the damage rings of every
   // output it overlaps (the map clips into each output's local space).
   // Rects entirely outside the union are silent no-ops.

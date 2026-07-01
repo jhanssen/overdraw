@@ -725,9 +725,16 @@ export function makeImageCopyCaptureFrame(ctx: Ctx):
         return;
       }
       // Arm and wait for the next flip-complete on the relevant output.
-      // Wake so an idle compositor (no clients with pending content) still
-      // renders the next frame and fires our dispatch.
+      // Arming changes no pixels, so nothing has marked the output dirty;
+      // force it to present so a flip-complete actually fires and drains this
+      // frame (otherwise an idle desktop never flips and the capture hangs
+      // until an unrelated repaint). Output source: that output; toplevel
+      // source: any output's flip drains it, so nudge them all. Then wake so
+      // the frame loop runs the forced present now.
       f.armed = true;
+      const src = f.session.source;
+      ctx.state.compositor?.requestOutputPresent?.(
+        src.kind === "output" ? src.id : null);
       ctx.addon.wake();
     },
   };

@@ -410,6 +410,14 @@ export interface CompositorSink {
   // only path that releases a cached GPU import).
   notifyBufferDestroyed?(bufferId: number): void;
   renderFrame?(): void;
+  // Force the per-output render gate to fire so the next frame presents and a
+  // flip-complete is emitted, without supplying damage geometry. Screen
+  // capture (ext_image_copy_capture_v1) drives its readback off the flip-
+  // complete edge, but arming a capture frame changes no pixels -- so on an
+  // idle desktop nothing marks the output dirty, no flip occurs, and the
+  // capture hangs until an unrelated event repaints. `outputId` null nudges
+  // every output (a toplevel-source capture drains on any output's flip).
+  requestOutputPresent?(outputId: number | null): void;
   // Run a callback once the compositing submit in flight at call time completes on
   // the GPU. The plugin/overlay ring uses this to recycle a consumer slot only
   // after the frame that last sampled it is done (avoids EndAccess racing the read).
