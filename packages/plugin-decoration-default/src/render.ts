@@ -121,8 +121,13 @@ const BLIT_WGSL = /* wgsl */ `
 struct U {
   // size.xy = output texture size (px); .zw = inset origin (B, B).
   size      : vec4f,
-  // inputSize.xy = client input size (px); .zw unused.
+  // inputSize.xy = content (window) size in px = the inset extent; .zw unused.
   inputSize : vec4f,
+  // uvRect.xy = uv bias (contentOrigin / bufferSize); uvRect.zw = uv scale
+  // (contentSize / bufferSize). Maps the inset-local position to the content
+  // sub-region of the buffer texture, so a CSD client's shadow margin (buffer
+  // beyond the window geometry) is never sampled.
+  uvRect    : vec4f,
   // shape.x = kind (0/1/2/3); shape.yz = inner extent (px); shape.w = radius.
   shape     : vec4f,
   // For kind=2 (per-corner): (tl, tr, br, bl); for kind=3 (squircle):
@@ -202,7 +207,10 @@ struct VsOut {
   var out : VsOut;
   out.pos = vec4f(nx, ny, 0.0, 1.0);
   out.ip  = vec2f(dx, dy);
-  out.uv  = vec2f(dx / max(iw, 1e-5), dy / max(ih, 1e-5));
+  // Normalized position inside the inset [0,1], mapped to the content
+  // sub-region of the buffer via uvRect (bias + scale).
+  let nl  = vec2f(dx / max(iw, 1e-5), dy / max(ih, 1e-5));
+  out.uv  = u.uvRect.xy + nl * u.uvRect.zw;
   return out;
 }
 
@@ -273,9 +281,9 @@ fn innerCoverage(ip : vec2f) -> f32 {
 }
 `;
 
-// size + inputSize + shape + shapeExtra + gradient + colors[8] + ats0 + ats1
-// = 4 + 8 + 2 + 1 = 15 vec4s = 60 floats.
-const BLIT_UNIFORM_FLOATS = 15 * 4;
+// size + inputSize + uvRect + shape + shapeExtra + gradient + colors[8] + ats0
+// + ats1 = 16 vec4s = 64 floats.
+const BLIT_UNIFORM_FLOATS = 16 * 4;
 const BLIT_UNIFORM_BYTES = BLIT_UNIFORM_FLOATS * 4;
 
 // ----- Pipelines + per-window state -----------------------------------------
@@ -437,6 +445,8 @@ export function writeBlitUniforms(
   device: GPUDevice, d: DecorationDraw,
   outputW: number, outputH: number,
   inputW: number, inputH: number,
+  bufferW: number, bufferH: number,
+  contentX: number, contentY: number,
   borderWidth: number,
   inner: InnerShapeParams,
   fill: ResolvedFill,
@@ -447,30 +457,38 @@ export function writeBlitUniforms(
   data[1] = outputH;
   data[2] = borderWidth;
   data[3] = borderWidth;
-  // inputSize.xy = client input dims
+  // inputSize.xy = content (window) dims = the inset extent
   data[4] = inputW;
   data[5] = inputH;
-  // shape.x = kind; shape.yz = inner extent (= input dims); shape.w = radius
-  data[8] = inner.kind;
-  data[9] = inputW;
-  data[10] = inputH;
-  data[11] = inner.radius;
-  // shapeExtra
+  // uvRect = (bias.xy, scale.xy): sample the [contentX,contentY]+(inputW x
+  // inputH) sub-region of the bufferW x bufferH texture.
+  const bw = Math.max(bufferW, 1);
+  const bh = Math.max(bufferH, 1);
+  data[8] = contentX / bw;
+  data[9] = contentY / bh;
+  data[10] = inputW / bw;
+  data[11] = inputH / bh;
+  // shape.x = kind; shape.yz = inner extent (= content dims); shape.w = radius
+  data[12] = inner.kind;
+  data[13] = inputW;
+  data[14] = inputH;
+  data[15] = inner.radius;
+  // shapeExtra (offset 16)
   if (inner.kind === 2) {
-    data[12] = inner.tl ?? 0;
-    data[13] = inner.tr ?? 0;
-    data[14] = inner.br ?? 0;
-    data[15] = inner.bl ?? 0;
+    data[16] = inner.tl ?? 0;
+    data[17] = inner.tr ?? 0;
+    data[18] = inner.br ?? 0;
+    data[19] = inner.bl ?? 0;
   } else if (inner.kind === 3) {
-    data[12] = inner.exponent ?? 2;
+    data[16] = inner.exponent ?? 2;
   }
-  // gradient (offset 16) + colors[8] (offset 20) + ats0/ats1 (offset 52): the
+  // gradient (offset 20) + colors[8] (offset 24) + ats0/ats1 (offset 56): the
   // border-pass gradient parameters, so the blit can evaluate the band color
   // under the client. Mirrors writeBorderUniforms' packing.
-  data[16] = Math.cos(fill.angleRad);
-  data[17] = Math.sin(fill.angleRad);
-  data[18] = fill.stops.length;
-  const colorsBase = 20;
+  data[20] = Math.cos(fill.angleRad);
+  data[21] = Math.sin(fill.angleRad);
+  data[22] = fill.stops.length;
+  const colorsBase = 24;
   const N = Math.min(fill.stops.length, MAX_STOPS);
   for (let i = 0; i < N; i++) {
     const s = fill.stops[i];

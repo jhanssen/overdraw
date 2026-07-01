@@ -2669,7 +2669,13 @@ export class JsCompositor implements CompositorSink {
         v1: ((s.viewportSrc.y + s.viewportSrc.height) * bs) / H,
       };
     }
-    if (!frozenDraw && !cu && geom && intrinsicW > 0 && intrinsicH > 0) {
+    // Skip the geometry crop when an explicit placement override is in play
+    // (intercept output / compose placement): the override's texture is the
+    // final content, already geometry-correct -- a decoration intercept sizes
+    // its output to the window geometry and samples only that sub-region of the
+    // client buffer, so cropping it AGAIN by geometry would double-crop (drop
+    // the decoration band and keep only the window interior).
+    if (!frozenDraw && !cu && !overrideP && geom && intrinsicW > 0 && intrinsicH > 0) {
       cu = {
         u0: geom.x / intrinsicW,
         v0: geom.y / intrinsicH,

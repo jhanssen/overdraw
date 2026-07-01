@@ -1,0 +1,36 @@
+strace: Process 54168 attached with 12 threads
+strace: Process 54168 detached
+strace: Process 54195 detached
+strace: Process 54196 detached
+strace: Process 54177 detached
+strace: Process 54197 detached
+strace: Process 54198 detached
+strace: Process 54175 detached
+strace: Process 54174 detached
+strace: Process 54173 detached
+strace: Process 54172 detached
+strace: Process 54171 detached
+strace: Process 54170 detached
+% time     seconds  usecs/call     calls    errors syscall
+------ ----------- ----------- --------- --------- ----------------
+ 89.85   16.795620        3338      5031       627 futex
+  2.41    0.450586           6     70410     35727 recvmsg
+  1.57    0.292814           8     33152           write
+  1.34    0.251064           7     35190           sendmsg
+  1.29    0.241043           6     38025           epoll_pwait
+  1.21    0.225884           6     32737           io_uring_enter
+  1.11    0.207186           5     35150      1368 epoll_ctl
+  0.92    0.171351           5     33702           epoll_wait
+  0.18    0.034302           6      5315           ioctl
+  0.05    0.009420           4      2108           close
+  0.03    0.005460           5      1044           fcntl
+  0.03    0.005146         233        22           madvise
+  0.01    0.001155           4       244        80 read
+  0.00    0.000551         551         1           mprotect
+  0.00    0.000387          64         6           munmap
+  0.00    0.000297           5        50           getpid
+  0.00    0.000276          69         4           mmap
+  0.00    0.000135          33         4           brk
+  0.00    0.000029           2        12           timerfd_settime
+------ ----------- ----------- --------- --------- ----------------
+100.00   18.692706          63    292207     37802 total

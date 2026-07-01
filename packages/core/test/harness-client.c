@@ -205,6 +205,32 @@ static struct wl_buffer* make_solid_buffer(int w, int h, uint32_t color) {
     return buf;
 }
 
+// Like make_solid_buffer, but the outer `margin` px are transparent (0) and the
+// inner (w-2*margin) x (h-2*margin) rect is the opaque color -- the shape a GTK
+// CSD client draws (opaque window + transparent drop-shadow margin). The caller
+// pairs this with xdg_surface_set_window_geometry(margin, margin, w-2m, h-2m).
+static struct wl_buffer* make_shadow_buffer(int w, int h, int margin, uint32_t color) {
+    if (w <= 0 || h <= 0 || margin < 0 || w - 2*margin <= 0 || h - 2*margin <= 0) return NULL;
+    const int stride = w * 4;
+    const size_t poolSize = (size_t)stride * h;
+    int fd = memfd_create("overdraw-harness", 0);
+    if (fd < 0 || ftruncate(fd, poolSize) != 0) { perror("memfd"); return NULL; }
+    uint32_t* px = mmap(NULL, poolSize, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    if (px == MAP_FAILED) { perror("mmap"); close(fd); return NULL; }
+    for (int y = 0; y < h; ++y) {
+        for (int x = 0; x < w; ++x) {
+            int inside = (x >= margin && x < w - margin && y >= margin && y < h - margin);
+            px[y * w + x] = inside ? color : 0x00000000u;
+        }
+    }
+    munmap(px, poolSize);
+    struct wl_shm_pool* pool = wl_shm_create_pool(shm, fd, poolSize);
+    struct wl_buffer* buf = wl_shm_pool_create_buffer(pool, 0, w, h, stride, WL_SHM_FORMAT_ARGB8888);
+    wl_shm_pool_destroy(pool);
+    close(fd);
+    return buf;
+}
+
 int main(int argc, char** argv) {
     const char* socket = NULL;
     const char* title = "harness";
@@ -212,6 +238,7 @@ int main(int argc, char** argv) {
     int W = 200, H = 150;
     uint32_t color = 0xFF0000FFu;  // opaque blue (ARGB)
     int report_frames = 0;  // --frames: drive a frame-callback loop + print done
+    int shadow_margin = 0;  // --shadow-margin N: transparent CSD drop-shadow band
 
     for (int i = 1; i < argc; ++i) {
         if (strcmp(argv[i], "--socket") == 0 && i + 1 < argc) socket = argv[++i];
@@ -221,6 +248,7 @@ int main(int argc, char** argv) {
         else if (strcmp(argv[i], "--app-id") == 0 && i + 1 < argc) app_id = argv[++i];
         else if (strcmp(argv[i], "--frames") == 0) report_frames = 1;
         else if (strcmp(argv[i], "--fill-configured") == 0) fill_configured = 1;
+        else if (strcmp(argv[i], "--shadow-margin") == 0 && i + 1 < argc) shadow_margin = atoi(argv[++i]);
         else if (strcmp(argv[i], "--initial-state") == 0 && i + 1 < argc) {
             const char* v = argv[++i];
             if (strcmp(v, "maximized") == 0) initial_state = 1;
@@ -274,13 +302,23 @@ int main(int argc, char** argv) {
     // client fills its tile (tiling WM path). Otherwise use the requested --size.
     if (fill_configured && cfg_w > 0 && cfg_h > 0) { W = cfg_w; H = cfg_h; }
 
-    struct wl_buffer* buffer = make_solid_buffer(W, H, color);
+    // --shadow-margin: draw a transparent drop-shadow margin AROUND the window,
+    // mirroring GTK CSD -- the opaque window is W x H, the buffer is bigger by
+    // `margin` on every side, and window geometry declares the opaque rect. So
+    // buffer (bufW x bufH) > geometry (W x H @ margin,margin).
+    const int m = shadow_margin;
+    const int bufW = m > 0 ? W + 2 * m : W;
+    const int bufH = m > 0 ? H + 2 * m : H;
+    struct wl_buffer* buffer = m > 0
+        ? make_shadow_buffer(bufW, bufH, m, color)
+        : make_solid_buffer(W, H, color);
     if (!buffer) return 1;
+    if (m > 0) xdg_surface_set_window_geometry(xs, m, m, W, H);
     int cur_w = W, cur_h = H;
-    g_buffer = buffer; g_w = W; g_h = H;
+    g_buffer = buffer; g_w = bufW; g_h = bufH;
 
     wl_surface_attach(surface, buffer, 0, 0);
-    wl_surface_damage(surface, 0, 0, W, H);
+    wl_surface_damage(surface, 0, 0, bufW, bufH);
     wl_surface_commit(surface);        // upload happens server-side here
     wl_display_roundtrip(display);
     wl_display_roundtrip(display);
@@ -310,12 +348,17 @@ int main(int argc, char** argv) {
         // --fill-configured: if the compositor reconfigured us to a new tile size,
         // reallocate a buffer at that size, ack, and recommit so we fill the tile.
         if (fill_configured && cfg_w > 0 && cfg_h > 0 && (cfg_w != cur_w || cfg_h != cur_h)) {
-            struct wl_buffer* nb = make_solid_buffer(cfg_w, cfg_h, color);
+            const int nbw = m > 0 ? cfg_w + 2 * m : cfg_w;
+            const int nbh = m > 0 ? cfg_h + 2 * m : cfg_h;
+            struct wl_buffer* nb = m > 0
+                ? make_shadow_buffer(nbw, nbh, m, color)
+                : make_solid_buffer(cfg_w, cfg_h, color);
             if (nb) {
                 cur_w = cfg_w; cur_h = cfg_h;
-                g_buffer = nb; g_w = cur_w; g_h = cur_h;
+                g_buffer = nb; g_w = nbw; g_h = nbh;
+                if (m > 0) xdg_surface_set_window_geometry(xs, m, m, cfg_w, cfg_h);
                 wl_surface_attach(surface, nb, 0, 0);
-                wl_surface_damage(surface, 0, 0, cur_w, cur_h);
+                wl_surface_damage(surface, 0, 0, nbw, nbh);
                 wl_surface_commit(surface);
             }
         }

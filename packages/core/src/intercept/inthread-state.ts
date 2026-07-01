@@ -39,6 +39,13 @@ export interface InThreadTickDeps {
   // Whether the committed buffer matches the WM content rect at the output
   // scale. Surfaced as ctx.contentReady for scale-correct gate release.
   contentReady(surfaceId: number): boolean;
+  // Whether the surface currently holds keyboard focus. Surfaced as
+  // ctx.activated so a plugin styles focus level-triggered from live seat
+  // state instead of an async window.change edge.
+  isActivated(surfaceId: number): boolean;
+  // The client's declared window geometry (buffer px), or null if unset.
+  surfaceGeometry(surfaceId: number):
+    { x: number; y: number; width: number; height: number } | null;
   // Open a BeginAccess bracket on the surface's client dmabuf import
   // (if any), run fn, close with EndAccess. SHM-backed surfaces pass
   // through with no bracket. The plugin's render call MUST run
@@ -160,8 +167,19 @@ export class InThreadInterceptState {
       this.deps.clearOutput(this.surfaceId);
       return { ok: true, rendered: false };
     }
+    // Content rect = the client's window geometry (set_window_geometry) clamped
+    // to the buffer, or the whole buffer when unset. This is the region the
+    // plugin sees as input.rect; a CSD client's transparent drop-shadow margin
+    // (buffer beyond the geometry) is excluded, so a decoration bands the real
+    // window, not the shadow. The plugin reads the full buffer size off
+    // input.texture when it needs to map input.rect into texture UVs.
+    const geom = this.deps.surfaceGeometry(this.surfaceId);
+    const cx = geom ? Math.max(0, Math.min(geom.x, input.w - 1)) : 0;
+    const cy = geom ? Math.max(0, Math.min(geom.y, input.h - 1)) : 0;
+    const cw = geom ? Math.max(1, Math.min(geom.width, input.w - cx)) : input.w;
+    const ch = geom ? Math.max(1, Math.min(geom.height, input.h - cy)) : input.h;
     try {
-      this.ensureRing(input.w, input.h);
+      this.ensureRing(cw, ch);
     } catch (e: unknown) {
       // outputDimensions returned bad values, or createTexture threw
       // (e.g. exceeds maxTextureDimension2D). Treat as a programming
@@ -208,7 +226,7 @@ export class InThreadInterceptState {
         holder.result = this.handlers.render({
           input: {
             texture: input.texture,
-            rect: { x: 0, y: 0, w: input.w, h: input.h },
+            rect: { x: cx, y: cy, w: cw, h: ch },
           },
           output: {
             texture: outTex,
@@ -221,6 +239,7 @@ export class InThreadInterceptState {
             surfaceRect: wmRect,
             contentChanged,
             contentReady: this.deps.contentReady(this.surfaceId),
+            activated: this.deps.isActivated(this.surfaceId),
             releaseGate: () => this.releaseGate(),
           },
         });

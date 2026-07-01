@@ -905,6 +905,8 @@ const textureUsageBag = (dawn.globals as unknown as { GPUTextureUsage: typeof GP
 interceptBrokerLate = new InterceptBroker({
   bus,
   compositor,
+  isActivated: (sid) => state?.seat?.kbFocus?.surfaceId === sid,
+  surfaceGeometry: (sid) => state?.surfacesById?.get(sid)?.xdgSurface?.geometry ?? null,
   gateSink: state.wm,
   inThread: {
     device,

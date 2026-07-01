@@ -32,6 +32,17 @@ import type { DawnWire } from "../gpu/compositor.js";
 export interface InterceptBrokerDeps {
   bus: CompositorBus;
   compositor: CompositorSink;
+  // Whether a surface currently holds keyboard focus (the active window).
+  // Read live at tick time and surfaced as ctx.activated so decoration-style
+  // plugins style focus from current seat state, not an async window.change
+  // edge. Optional: absent in test harnesses with no seat (defaults unfocused).
+  isActivated?(surfaceId: number): boolean;
+  // The client's declared window geometry (set_window_geometry): the opaque
+  // window sub-rect within the buffer, in buffer px. CSD clients (GTK) draw
+  // transparent shadow margins outside this. Null when the client never set
+  // it (the whole buffer is the window).
+  surfaceGeometry?(surfaceId: number):
+    { x: number; y: number; width: number; height: number } | null;
   // WM content-gate sink. The broker engages/releases per-surface
   // content gates under owner key `"intercept-${spec.name}"` when a
   // registration declares `gates: true`. Optional: when absent,
@@ -391,7 +402,6 @@ export class InterceptBroker {
       appId: top?.appId ?? undefined,
       title: top?.title ?? undefined,
     };
-
     if (active.transport === "in-thread") {
       this.dispatchMatchedInThread(active, surfaceId, info);
     } else {
@@ -426,6 +436,8 @@ export class InterceptBroker {
       isPresentable: (sid) => this.deps.compositor.surfaceIsPresentable?.(sid) ?? false,
       surfaceWmRect: (sid) => this.deps.compositor.surfaceWmRect?.(sid) ?? null,
       contentReady: (sid) => this.deps.compositor.surfaceContentReady?.(sid) ?? false,
+      isActivated: (sid) => this.deps.isActivated?.(sid) ?? false,
+      surfaceGeometry: (sid) => this.deps.surfaceGeometry?.(sid) ?? null,
       withClientTextureAccess: (sid, fn) =>
         this.deps.compositor.withClientTextureAccess
           ? this.deps.compositor.withClientTextureAccess(sid, fn)

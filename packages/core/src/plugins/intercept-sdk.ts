@@ -507,6 +507,9 @@ class WorkerPerSurfaceState {
             contentChanged: true,
             // Unused: gates aren't supported on the Worker transport (below).
             contentReady: false,
+            // Seat focus is not threaded across the Worker boundary; Worker
+            // plugins observe focus via window.change instead.
+            activated: false,
             // No-op: gates are not supported on the Worker transport
             // in 10a. A Worker plugin that declared `gates` is
             // rejected at registration (see the Worker register

@@ -68,6 +68,15 @@ export interface InterceptRenderCtx {
   // in buffer px against surfaceRect in logical px only agrees at scale 1.0).
   // In-thread: live each tick. Worker: always false (gates are in-thread only).
   contentReady: boolean;
+  // True iff this surface currently holds keyboard focus (the active window).
+  // Level-triggered: re-read from the seat each tick, so a plugin drives its
+  // focused vs. unfocused styling from this rather than caching an edge from
+  // window.change. Reading current state (not an edge) is what lets a static
+  // window -- one that never commits again -- reflect a focus change on the
+  // frame the focus-causing input wakes.
+  // In-thread: live each tick. Worker: always false (seat focus is not threaded
+  // across the Worker boundary).
+  activated: boolean;
   // Release the WM content gate engaged by gates:true at match time.
   // Idempotent; no-op when the registration did not declare `gates`. The
   // window enters the draw stack on the next composite, sampling the output
@@ -81,6 +90,13 @@ export interface InterceptRenderCtx {
 // these past the return of `render`; the SDK recycles them.
 export interface InterceptInput {
   texture: GPUTexture;
+  // The CONTENT sub-rect within `texture`, in buffer px: the client's window
+  // geometry (set_window_geometry) clamped to the buffer, or the whole buffer
+  // when the client never set geometry. For a CSD client this excludes the
+  // transparent drop-shadow margin, so a decoration bands the real window. A
+  // plugin that samples the texture must map `rect` into UVs itself
+  // (rect.x/y and rect.w/h against texture.width/height); it is NOT always
+  // the full texture.
   rect: Rect;
 }
 

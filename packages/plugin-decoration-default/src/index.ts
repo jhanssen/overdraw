@@ -23,10 +23,12 @@
 //   - gates:true holds the window out of the draw stack until the plugin
 //     calls releaseGate() (on ctx.contentReady -- the client committed at
 //     the configured size), so it never appears undecorated or wrong-sized.
-//   - On focus change (window.activated flips), update the cached
-//     focus state so the NEXT render uses the focused vs. unfocused
-//     fill. No explicit redraw call; the next frame picks up the
-//     change automatically.
+//   - Focus styling reads ctx.activated live each render (level-
+//     triggered), so the focused vs. unfocused fill always reflects
+//     current keyboard focus. The focus-causing input wakes the frame
+//     the change lands on; reading current state (not a cached edge)
+//     is what lets a static window -- one that never commits again --
+//     reflect the change on that frame.
 
 import type { PluginSdk } from "../../core/dist/plugins/sdk.js";
 
@@ -42,11 +44,10 @@ import {
 
 interface PerWindow {
   draw: DecorationDraw;
-  // Cached focus state. Updated by window.change; consumed by the next
-  // render's writeBorderUniforms call.
-  focused: boolean;
   // Cached fill so writeBorderUniforms only runs when the surface size
-  // or focus state changes (not on every frame).
+  // or focus state changes (not on every frame). Focus is read live from
+  // ctx.activated each render; a change flips fill, which diverges from
+  // lastFill and drives the re-render.
   lastFill: ResolvedFill | null;
   lastOutputW: number;
   lastOutputH: number;
@@ -54,6 +55,13 @@ interface PerWindow {
   // the input dims change.
   lastInputW: number;
   lastInputH: number;
+  // Cached buffer dims + content offset (the blit's uv sub-rect inputs), so
+  // writeBlitUniforms reruns when the client's buffer size or window-geometry
+  // offset changes even if the content extent stayed the same.
+  lastBufferW: number;
+  lastBufferH: number;
+  lastContentX: number;
+  lastContentY: number;
   // The surfaceRect this window was last RENDERED at (placement). Used with
   // the caches above to skip re-rendering when nothing changed.
   lastSurfaceRect: { x: number; y: number; w: number; h: number } | null;
@@ -140,12 +148,15 @@ export default async function init(sdk: PluginSdk, rawConfig?: unknown): Promise
           // render call after the client commits).
           const w: PerWindow = {
             draw: createDecorationDraw(pipeline),
-            focused: false,
             lastFill: null,
             lastOutputW: 0,
             lastOutputH: 0,
             lastInputW: 0,
             lastInputH: 0,
+            lastBufferW: 0,
+            lastBufferH: 0,
+            lastContentX: 0,
+            lastContentY: 0,
             lastSurfaceRect: null,
             released: false,
           };
@@ -169,9 +180,17 @@ export default async function init(sdk: PluginSdk, rawConfig?: unknown): Promise
           if (!w) return;   // defensive: matched dispatched before our handler installed
           const outputW = output.rect.w;
           const outputH = output.rect.h;
+          // input.rect is the CONTENT sub-rect (window geometry) within the
+          // buffer texture; the band wraps that, and the blit samples only that
+          // sub-region -- so a CSD client's transparent shadow margin (buffer
+          // beyond the window) is excluded.
           const inputW = input.rect.w;
           const inputH = input.rect.h;
-          const fill: ResolvedFill = w.focused ? config.focused : config.unfocused;
+          const bufferW = input.texture.width;
+          const bufferH = input.texture.height;
+          const contentX = input.rect.x;
+          const contentY = input.rect.y;
+          const fill: ResolvedFill = ctx.activated ? config.focused : config.unfocused;
           const sr = ctx.surfaceRect;
 
           // Release the gate once the client has committed at the configured
@@ -197,9 +216,10 @@ export default async function init(sdk: PluginSdk, rawConfig?: unknown): Promise
           const rectUnchanged = w.lastSurfaceRect !== null
             && w.lastSurfaceRect.x === sr.x && w.lastSurfaceRect.y === sr.y
             && w.lastSurfaceRect.w === sr.w && w.lastSurfaceRect.h === sr.h;
-          if (!ctx.contentChanged && fill === w.lastFill && rectUnchanged
+          const willSkip = !ctx.contentChanged && fill === w.lastFill && rectUnchanged
               && outputW === w.lastOutputW && outputH === w.lastOutputH
-              && inputW === w.lastInputW && inputH === w.lastInputH) {
+              && inputW === w.lastInputW && inputH === w.lastInputH;
+          if (willSkip) {
             return false;
           }
 
@@ -208,19 +228,26 @@ export default async function init(sdk: PluginSdk, rawConfig?: unknown): Promise
           // only on an input-dim change.
           const borderChanged = outputW !== w.lastOutputW || outputH !== w.lastOutputH
             || fill !== w.lastFill;
-          const inputChanged = inputW !== w.lastInputW || inputH !== w.lastInputH;
+          const inputChanged = inputW !== w.lastInputW || inputH !== w.lastInputH
+            || bufferW !== w.lastBufferW || bufferH !== w.lastBufferH
+            || contentX !== w.lastContentX || contentY !== w.lastContentY;
           if (borderChanged) {
             writeBorderUniforms(pipeline.device, w.draw, outputW, outputH, fill);
           }
           if (borderChanged || inputChanged) {
             writeBlitUniforms(pipeline.device, w.draw,
-              outputW, outputH, inputW, inputH, B, innerParams, fill);
+              outputW, outputH, inputW, inputH, bufferW, bufferH,
+              contentX, contentY, B, innerParams, fill);
           }
           w.lastOutputW = outputW;
           w.lastOutputH = outputH;
           w.lastFill = fill;
           w.lastInputW = inputW;
           w.lastInputH = inputH;
+          w.lastBufferW = bufferW;
+          w.lastBufferH = bufferH;
+          w.lastContentX = contentX;
+          w.lastContentY = contentY;
 
           encodeFrame(pipeline, w.draw, output.texture.createView(), input.texture);
 
@@ -255,15 +282,4 @@ export default async function init(sdk: PluginSdk, rawConfig?: unknown): Promise
   });
   sdk.log(`decoration-default: intercept registered (pattern=${JSON.stringify(config.appIdPattern)}`
     + `, border=${B}, shape=${JSON.stringify(config.outerShape)})`);
-
-  // Focus-driven restyle: a window.change with a flipped `activated` flag
-  // updates the cached focus state so the NEXT intercept render uses the
-  // focused vs. unfocused fill. The intercept runs every visible frame so
-  // the change becomes visible without an explicit redraw call.
-  windowsSdk.onChange((ev: { surfaceId: number; activated: boolean }) => {
-    const w = perWindow.get(ev.surfaceId);
-    if (!w || w.focused === ev.activated) return;
-    w.focused = ev.activated;
-  });
-
 }

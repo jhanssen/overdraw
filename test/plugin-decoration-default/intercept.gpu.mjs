@@ -47,6 +47,7 @@ const HEX_TO_BGRA = (h) => {
   return [b, g, r, a];
 };
 const UNFOCUSED_BGRA = HEX_TO_BGRA("#3a3a3aff");
+const FOCUSED_BGRA = HEX_TO_BGRA("#0000ffff");       // blue -> BGRA [255,0,0,255]
 
 test("decoration-default (intercept): border band fills the perimeter; client fills the inset",
   { skip }, async () => {
@@ -100,6 +101,134 @@ test("decoration-default (intercept): border band fills the perimeter; client fi
     // Inside the inset region, just past the band.
     assert.ok(pixelMatches(pixelAt(px, OUT.width, OUT.width >> 1, B + 2), CLIENT_BGRA, 8),
       `just past the top band -> client; got ${pixelAt(px, OUT.width, OUT.width >> 1, B + 2)}`);
+  } finally {
+    await c.teardown();
+  }
+});
+
+test("decoration-default (intercept): band reflects keyboard focus on an idle window",
+  { skip }, async () => {
+  // Regression: a static window (one that never commits again after its
+  // first frame) must repaint its decoration band when keyboard focus
+  // changes. Focus is a level-triggered render input (ctx.activated); the
+  // plugin reads it live each tick instead of caching a window.change edge,
+  // which is what a client with no ongoing content (a dialog) depends on.
+  const B = 8;
+  const c = await setupCompositor({
+    headless: OUT,
+    intercept: true,
+    config: {
+      decoration: {
+        appIdPattern: ".*",
+        border: { width: B, radius: 0 },
+        unfocused: { kind: "solid", color: "#3a3a3aff" },
+        focused: { kind: "solid", color: "#0000ffff" },
+      },
+    },
+  });
+  try {
+    const client = c.spawnClient(
+      ["--app-id", "deco-test", "--color", CLIENT_COLOR_ARGB,
+       "--size", CLIENT_REQUESTED_SIZE, "--title", "t",
+       "--fill-configured"],
+      { bin: HARNESS_BIN, readyMarker: "[harness-client] mapped" });
+    await client.ready;
+    const band = { x: 2, y: 2 };
+    const win = c.query().windows.find((w) => w.appId === "deco-test");
+    assert.ok(win, "decorated window present in query");
+    // The client never commits again after mapping; each transition below only
+    // changes keyboard focus, so a repaint proves the band tracks ctx.activated
+    // live rather than a cached window.change edge.
+
+    // Focus -> focused fill.
+    c.state.seat.applyKeyboardFocus(win.surfaceId);
+    assert.equal(c.state.seat.kbFocus?.surfaceId, win.surfaceId,
+      "keyboard focus landed on the decorated window");
+    let px = await settled(() => c.frameReadback(),
+      (p) => p && pixelMatches(pixelAt(p, OUT.width, band.x, band.y), FOCUSED_BGRA, 8),
+      { what: "band focused after focus", timeoutMs: 6000 });
+    // The client content is untouched by the focus change.
+    assert.ok(pixelMatches(pixelAt(px, OUT.width, OUT.width >> 1, OUT.height >> 1), CLIENT_BGRA, 8),
+      `center still shows client; got ${pixelAt(px, OUT.width, OUT.width >> 1, OUT.height >> 1)}`);
+
+    // Blur -> unfocused fill (no client commit).
+    c.state.seat.applyKeyboardFocus(null);
+    await settled(() => c.frameReadback(),
+      (p) => p && pixelMatches(pixelAt(p, OUT.width, band.x, band.y), UNFOCUSED_BGRA, 8),
+      { what: "band unfocused after blur", timeoutMs: 6000 });
+
+    // Re-focus -> focused fill again (no client commit).
+    c.state.seat.applyKeyboardFocus(win.surfaceId);
+    px = await settled(() => c.frameReadback(),
+      (p) => p && pixelMatches(pixelAt(p, OUT.width, band.x, band.y), FOCUSED_BGRA, 8),
+      { what: "band focused after re-focus", timeoutMs: 6000 });
+    assert.ok(pixelMatches(pixelAt(px, OUT.width, band.x, band.y), FOCUSED_BGRA, 8),
+      `band must be the focused fill after re-focus; got ${pixelAt(px, OUT.width, band.x, band.y)}`);
+  } finally {
+    await c.teardown();
+  }
+});
+
+test("decoration-default (intercept): band hugs the window geometry, not the CSD shadow buffer",
+  { skip }, async () => {
+  // A GTK-style CSD client draws a transparent drop-shadow margin AROUND its
+  // window: the buffer is bigger than the real window on every side, and
+  // set_window_geometry declares the opaque inner rect. The decoration must
+  // band the WINDOW (geometry), sampling only that sub-region -- not the whole
+  // buffer -- so the band hugs the window with no transparent gap where the
+  // shadow was. Regression for the double-crop (compositor re-cropping the
+  // intercept output by geometry) + buffer-vs-geometry banding bugs.
+  const B = 8;
+  const c = await setupCompositor({
+    headless: OUT,
+    intercept: true,
+    config: {
+      decoration: {
+        appIdPattern: ".*",
+        border: { width: B, radius: 0 },
+        unfocused: { kind: "solid", color: "#00ff00ff" },   // green band
+        focused: { kind: "solid", color: "#00ff00ff" },
+      },
+    },
+  });
+  const BAND_BGRA = [0, 255, 0, 255];   // green
+  try {
+    // --shadow-margin 30: buffer = window + 60, geometry = window @ (30,30).
+    const client = c.spawnClient(
+      ["--app-id", "csd", "--color", CLIENT_COLOR_ARGB, "--size", "140x140",
+       "--shadow-margin", "30", "--fill-configured", "--title", "s"],
+      { bin: HARNESS_BIN, readyMarker: "[harness-client] mapped" });
+    await client.ready;
+    const win = () => c.query().windows.find((w) => w.appId === "csd");
+    // Settle: the window content (red) fills the inset, hugged by the band.
+    const px = await settled(() => c.frameReadback(),
+      (p) => {
+        if (!p) return false;
+        const w = win();
+        if (!w) return false;
+        const cx = w.rect.x + (w.rect.width >> 1);
+        const cy = w.rect.y + (w.rect.height >> 1);
+        return pixelMatches(pixelAt(p, OUT.width, cx, cy), CLIENT_BGRA, 8)
+          && pixelMatches(pixelAt(p, OUT.width, 2, cy), BAND_BGRA, 8);
+      },
+      { what: "csd window content + band settled", timeoutMs: 6000 });
+    const w = win();
+    const cy = w.rect.y + (w.rect.height >> 1);
+    // The band hugs the window: NO transparent pixel anywhere along a scanline
+    // through the window center. Before the fix, the client's transparent
+    // shadow margin sat between the window and the band as a see-through gap.
+    for (let x = 0; x < OUT.width; x++) {
+      const p = pixelAt(px, OUT.width, x, cy);
+      assert.ok(p[3] > 200,
+        `scanline pixel (${x},${cy}) must be opaque (band or window), not a `
+        + `transparent shadow gap; got [B,G,R,A]=${Array.from(p)}`);
+    }
+    // Left band is green; window interior is the client's red; the boundary is
+    // direct (band -> window, no gap).
+    assert.ok(pixelMatches(pixelAt(px, OUT.width, 2, cy), BAND_BGRA, 8),
+      `left band should be green; got ${pixelAt(px, OUT.width, 2, cy)}`);
+    assert.ok(pixelMatches(pixelAt(px, OUT.width, w.rect.x + (w.rect.width >> 1), cy), CLIENT_BGRA, 8),
+      `window center should be the client red; got ${pixelAt(px, OUT.width, w.rect.x + (w.rect.width >> 1), cy)}`);
   } finally {
     await c.teardown();
   }

@@ -591,6 +591,9 @@ export async function setupCompositor(opts = {}) {
       const interceptBrokerOpts = {
         bus: coreBus,
         compositor: jsCompositor,
+        // Surface live keyboard focus as ctx.activated (mirrors main.ts).
+        isActivated: (sid) => state?.seat?.kbFocus?.surfaceId === sid,
+        surfaceGeometry: (sid) => state?.surfacesById?.get(sid)?.xdgSurface?.geometry ?? null,
         // Wire the WM as the gate sink so intercepts that declare
         // `gates: true` (e.g. the bundled decoration plugin) can engage
         // the WM content gate. Mirrors main.ts wiring.
