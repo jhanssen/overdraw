@@ -50,7 +50,9 @@ async function renderDeco(device, jsCompositor, render, inputBgra) {
   const pipeline = render.createDecorationPipeline(device);
   const draw = render.createDecorationDraw(pipeline);
   render.writeBorderUniforms(device, draw, OUTW, OUTH, FILL);
-  render.writeBlitUniforms(device, draw, OUTW, OUTH, INW, INH, B,
+  // No CSD shadow here: the content sub-rect is the whole buffer (bufferW/H =
+  // INW/INH, offset 0,0), so the blit samples the full input.
+  render.writeBlitUniforms(device, draw, OUTW, OUTH, INW, INH, INW, INH, 0, 0, B,
     { kind: 0, radius: 0 }, FILL);
   const input = bgraTexture(device, INW, INH, inputBgra);
   const output = device.createTexture({
