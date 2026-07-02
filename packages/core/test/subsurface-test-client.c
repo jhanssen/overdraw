@@ -62,7 +62,7 @@ static void regRemove(void* data, struct wl_registry* reg, uint32_t name) { (voi
 static const struct wl_registry_listener regListener = { regGlobal, regRemove };
 
 // Allocate a wl_buffer of WxH filled with a solid ARGB color.
-static struct wl_buffer* solidBuffer(int W, int H, uint32_t color) {
+static struct wl_buffer* solidBuffer(int W, int H, uint32_t color, uint32_t fmt) {
     int stride = W * 4;
     size_t sz = (size_t)stride * H;
     int fd = memfd_create("overdraw-subsurf", 0);
@@ -72,7 +72,7 @@ static struct wl_buffer* solidBuffer(int W, int H, uint32_t color) {
     for (int i = 0; i < W * H; ++i) px[i] = color;
     munmap(px, sz);
     struct wl_shm_pool* pool = wl_shm_create_pool(shm, fd, sz);
-    struct wl_buffer* b = wl_shm_pool_create_buffer(pool, 0, W, H, stride, WL_SHM_FORMAT_ARGB8888);
+    struct wl_buffer* b = wl_shm_pool_create_buffer(pool, 0, W, H, stride, fmt);
     wl_shm_pool_destroy(pool);
     close(fd);
     return b;
@@ -85,6 +85,8 @@ int main(int argc, char** argv) {
     uint32_t cColor = 0xFF00FF00u;  // child: opaque green
     int sync = 0;   // --sync: subsurface stays in synchronized mode (default desync here)
     int step = 0;   // --step: gate the parent commit on a stdin line (timing test)
+    int child_xrgb = 0;  // --child-xrgb: commit the CHILD as XRGB8888 (opaque format,
+                         // don't-care alpha byte) instead of ARGB8888
 
     for (int i = 1; i < argc; ++i) {
         if (strcmp(argv[i], "--socket") == 0 && i + 1 < argc) socket = argv[++i];
@@ -95,6 +97,7 @@ int main(int argc, char** argv) {
         else if (strcmp(argv[i], "--child-color") == 0 && i + 1 < argc) cColor = (uint32_t)strtoul(argv[++i], NULL, 16);
         else if (strcmp(argv[i], "--sync") == 0) sync = 1;
         else if (strcmp(argv[i], "--step") == 0) step = 1;
+        else if (strcmp(argv[i], "--child-xrgb") == 0) child_xrgb = 1;
     }
     if (!socket) { fprintf(stderr, "usage: %s --socket NAME [--sync] [--step] [...]\n", argv[0]); return 2; }
 
@@ -115,7 +118,7 @@ int main(int argc, char** argv) {
     }
 
     // Parent toplevel.
-    struct wl_buffer* pbuf = solidBuffer(PW, PH, pColor);
+    struct wl_buffer* pbuf = solidBuffer(PW, PH, pColor, WL_SHM_FORMAT_ARGB8888);
     struct wl_surface* parent = wl_compositor_create_surface(compositor);
     struct xdg_surface* xs = xdg_wm_base_get_xdg_surface(wm_base, parent);
     xdg_surface_add_listener(xs, &xsListener, NULL);
@@ -139,7 +142,7 @@ int main(int argc, char** argv) {
 
         // Set up the child subsurface and commit ITS buffer. In sync mode this is
         // cached and must NOT appear until the parent commits next.
-        struct wl_buffer* cbuf = solidBuffer(CW, CH, cColor);
+        struct wl_buffer* cbuf = solidBuffer(CW, CH, cColor, child_xrgb ? WL_SHM_FORMAT_XRGB8888 : WL_SHM_FORMAT_ARGB8888);
         struct wl_surface* child = wl_compositor_create_surface(compositor);
         struct wl_subsurface* sub = wl_subcompositor_get_subsurface(subcompositor, child, parent);
         wl_subsurface_set_position(sub, OX, OY);
@@ -161,7 +164,7 @@ int main(int argc, char** argv) {
         fflush(stdout);
     } else {
         // One-shot path (desync default): child + parent committed together.
-        struct wl_buffer* cbuf = solidBuffer(CW, CH, cColor);
+        struct wl_buffer* cbuf = solidBuffer(CW, CH, cColor, child_xrgb ? WL_SHM_FORMAT_XRGB8888 : WL_SHM_FORMAT_ARGB8888);
         struct wl_surface* child = wl_compositor_create_surface(compositor);
         struct wl_subsurface* sub = wl_subcompositor_get_subsurface(subcompositor, child, parent);
         wl_subsurface_set_position(sub, OX, OY);

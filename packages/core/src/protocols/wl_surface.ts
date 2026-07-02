@@ -143,6 +143,18 @@ function promoteSyncobjForCommit(
 function uploadBuffer(ctx: Ctx, s: SurfaceRecord, buffer: Resource | null): void {
   if (!buffer || buffer.destroyed) return;
   const desc = ctx.state.buffers?.get(buffer);
+  if (desc) {
+    // Opaque (X-alpha) formats have a don't-care 4th byte the compositor must
+    // not sample as alpha: shm XRGB8888 (format 1), and dmabuf XR24/XB24/XR30
+    // (fourcc first char 'X' = low byte 0x58). Alpha formats (ARGB8888 / AR24,
+    // low byte 'A' = 0x41) keep their real alpha. An Xwayland client leaves
+    // that byte non-0xFF on partial repaints, so without this the surface
+    // blends spuriously translucent.
+    const opaque = desc.dmabuf
+      ? (desc.format & 0xff) === 0x58
+      : desc.format === 1;
+    ctx.state.compositor.setSurfaceOpaque?.(s.id, opaque);
+  }
   if (desc && desc.dmabuf && desc.fd) {
     const bufferId = bufferIdOf(ctx, buffer);
     // Explicit-sync (wp_linux_drm_syncobj_v1): when commit() promoted an

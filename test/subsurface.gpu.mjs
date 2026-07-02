@@ -133,3 +133,40 @@ test("desync subsurface: child content appears on its own commit (no parent comm
     await c.teardown();
   }
 });
+
+// Opaque (X-alpha) format: a child committed as XRGB8888 with a zeroed
+// don't-care alpha byte must composite FULLY OPAQUE over its parent, never
+// blending. Regression for the Xwayland-menu flicker where the compositor
+// sampled the XR24/XRGB X byte as alpha, so a partial repaint that left that
+// byte non-0xFF turned the surface translucent. Child RGB=red over an opaque
+// green parent: opaque => pure red; the bug => red blended over green = yellow.
+test("XRGB (opaque-format) child composites opaque over its parent, ignoring the X byte", { skip }, async () => {
+  const c = await setupCompositor({ headless: OUT });
+  try {
+    const pColor = 0xff00ff00;   // parent: opaque green
+    const cColor = 0x00ff0000;   // child: RGB red, alpha BYTE 0x00 (don't-care X)
+    const PW = 300, PH = 200, CW = 80, CH = 60, OX = 40, OY = 30;
+    const cl = c.spawnClient(
+      ["--child-xrgb", "--parent", `${PW}x${PH}`, "--child", `${CW}x${CH}`,
+       "--offset", `${OX}x${OY}`, "--parent-color", pColor.toString(16),
+       "--child-color", cColor.toString(16)],
+      { bin: SUB_BIN, readyMarker: "[subsurface-client] mapped" });
+    await cl.ready;
+
+    const snap = await c.waitFor(c.query, (s) => s.windows.length >= 1, { what: "parent window" });
+    const p = snap.windows[0].rect;
+    const childCx = p.x + OX + (CW >> 1), childCy = p.y + OY + (CH >> 1);
+
+    const RED = [0, 0, 255, 255]; // BGRA
+    const frame = await readWhen(c, { x: childCx, y: childCy, bgra: RED });
+    const got = pixelAt(frame, OUT.width, childCx, childCy);
+    assert.ok(pixelMatches(got, RED, 6),
+      `XRGB child must be opaque red (X byte ignored), not blended with the `
+      + `green parent; got ${got}`);
+    // The parent's green must not bleed through: alpha=0 blending would give
+    // green≈255 (yellow). Opaque keeps it ≈0.
+    assert.ok(got[1] <= 8, `green channel must be ~0 (no parent bleed-through); got ${got}`);
+  } finally {
+    await c.teardown();
+  }
+});

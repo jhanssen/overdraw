@@ -239,6 +239,10 @@ fn applyBufferTransform(uv : vec2f, t : f32) -> vec2f {
   let tuv = applyBufferTransform(in.surfUV, u.fx.y);
   let sampleUV = mix(u.cropUV.xy, u.cropUV.zw, tuv);
   var surf = textureSampleLevel(tex, samp, sampleUV, 0.0);
+  // Opaque-format (XRGB/XBGR, XR24, ...): the buffer has no alpha channel; its
+  // sampled 4th byte is a don't-care value. Force alpha to 1 so it cannot blend
+  // as translucency. u.fx.z = 1 for opaque formats, 0 otherwise.
+  surf.a = mix(surf.a, 1.0, u.fx.z);
   let inside = step(0.0, in.surfUV.x) * step(in.surfUV.x, 1.0)
              * step(0.0, in.surfUV.y) * step(in.surfUV.y, 1.0);
 
@@ -547,6 +551,12 @@ interface Surface {
   // undoes this when sampling; 90/270 (and flipped variants) swap the surface's
   // logical width/height. Default 0 (normal).
   bufferTransform: number;
+  // The committed buffer's format has no alpha channel (XRGB8888 / XBGR8888 /
+  // XR24 etc.): its 4th byte is a don't-care value, so the shader must treat
+  // the surface as fully opaque rather than sample that byte as alpha (which
+  // an X11/Xwayland client may leave non-0xFF on a partial repaint, producing
+  // spurious translucency). Default false (ARGB carries real alpha).
+  opaque: boolean;
   // wp_viewport: dst overrides the surface's logical size; src crops the
   // sampled buffer region (surface coords). null/undefined = unset.
   viewportDst?: { width: number; height: number } | null;
@@ -1774,6 +1784,14 @@ export class JsCompositor implements CompositorSink {
     this.damageFull();  // mask spans the expanded (surface + margin) region
   }
 
+  // Mark whether the surface's committed buffer format carries a real alpha
+  // channel. Called from the protocol commit path with the buffer format; an
+  // opaque (X-alpha) format makes the shader force alpha=1 (see the fragment
+  // shader). Cheap flag flip; the draw-time uniform picks it up.
+  setSurfaceOpaque(id: number, opaque: boolean): void {
+    this.ensureSurface(id).opaque = opaque;
+  }
+
   private ensureSurface(id: number): Surface {
     let s = this.surfaces.get(id);
     if (!s) { s = blankSurface(0, 0, 0, 0); this.surfaces.set(id, s); }
@@ -2663,9 +2681,14 @@ export class JsCompositor implements CompositorSink {
     // transform + crop, so it samples full with no transform. Otherwise the
     // client buffer's transform applies.
     const frozenDraw = !!s.frozen && !overrides;
-    // fx: opacity in x; buffer-transform code (0..7) in y; rest reserved
+    // fx: opacity in x; buffer-transform code (0..7) in y; opaque-format flag
+    // in z (1 => buffer has no alpha channel, shader forces alpha=1); w reserved.
+    // The opaque force applies ONLY when drawing the raw client texture: an
+    // intercept output (plugin RGBA, e.g. a decoration ring's transparent
+    // corners) or a frozen snapshot carry their own alpha and must keep it.
     data[12] = fx.opacity;
     data[13] = frozenDraw ? 0 : (s.bufferTransform || 0);
+    data[14] = (s.opaque && !s.interceptOutputView && !frozenDraw) ? 1 : 0;
     // cropUV: u0, v0, u1, v1 (defaults identity = full surface texture). A
     // wp_viewport source rect (surface coords) crops the sampled buffer;
     // computed from current buffer dims so it survives a buffer resize.
@@ -4232,7 +4255,7 @@ function blankSurface(x: number, y: number, w: number, h: number): Surface {
   return {
     texture: null, view: null, uniformBuf: null, bindGroup: null,
     bindGroupCache: new WeakMap(),
-    width: 0, height: 0, bufferScale: 1, bufferTransform: 0, x, y, layoutW: w, layoutH: h, present: false,
+    width: 0, height: 0, bufferScale: 1, bufferTransform: 0, opaque: false, x, y, layoutW: w, layoutH: h, present: false,
     currentBufferId: 0,
     contentEpoch: 0,
     fx: defaultFx(),

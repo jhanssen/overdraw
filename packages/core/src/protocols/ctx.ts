@@ -281,6 +281,11 @@ export interface CompositorSink {
   // no-op).
   setBufferReleasePoint?(bufferId: number, handle: number,
                          pointHi: number, pointLo: number): void;
+  // Mark whether the committed buffer format carries a real alpha channel.
+  // Opaque (X-alpha) formats — XRGB8888/XBGR8888, dmabuf XR24/XB24 — have a
+  // don't-care 4th byte the compositor must not sample as alpha; this forces
+  // the surface fully opaque in the blend. Optional (test sinks may omit it).
+  setSurfaceOpaque?(id: number, opaque: boolean): void;
   setSurfaceLayout(id: number, x: number, y: number, w: number, h: number): void;
   // Resize transaction: freezeSurface synchronously snapshots the surface's
   // current appearance so it keeps showing its pre-resize frame while the WM
