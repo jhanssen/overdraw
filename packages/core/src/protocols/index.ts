@@ -615,7 +615,7 @@ export async function installProtocols(
     let unmappedAny = false;
     for (const s of [...state.surfaces.values()]) {
       if (!s.resource.destroyed || s.unmapped) continue;
-      unmapAndTeardownSurface(state, s);
+      unmapAndTeardownSurface(state, addon, s);
       state.surfaces.delete(s.resource);
       unmappedAny = true;
     }

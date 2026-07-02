@@ -12,9 +12,10 @@
 import type { WlSurfaceHandler } from "#protocols-gen/wl_surface.js";
 import { WlSurface_Error } from "#protocols-gen/wl_surface.js";
 import type { Ctx, CompositorState, SurfaceRecord, SubsurfaceRecord } from "./ctx.js";
-import type { Resource } from "../types.js";
+import type { Resource, Addon } from "../types.js";
 import { Region, type RegionRect } from "./region.js";
 import { applySubsurfaces, applySubsurfaceReorder } from "../subsurfaces.js";
+import { updateSurfaceOutputResidency } from "./surface-residency.js";
 import { applyPresentationFeedbacks } from "./wp_presentation.js";
 import { WINDOW_EVENT } from "../events/types.js";
 import {
@@ -635,7 +636,7 @@ export default function makeSurface(ctx: Ctx): WlSurfaceHandler {
       if (s.mapped && s.committed.buffer === null
           && (s.role === "xdg_popup" || s.role === "xdg_toplevel"
               || s.role === "layer_surface")) {
-        detachSurfaceRole(ctx.state, s);
+        detachSurfaceRole(ctx.state, ctx.addon, s);
         s.hasContent = false;
       }
 
@@ -692,7 +693,7 @@ export default function makeSurface(ctx: Ctx): WlSurfaceHandler {
     },
     destroy(resource) {
       const s = rec(resource);
-      if (s) unmapAndTeardownSurface(ctx.state, s);
+      if (s) unmapAndTeardownSurface(ctx.state, ctx.addon, s);
       ctx.state.surfaces.delete(resource);
     },
   };
@@ -720,7 +721,7 @@ export default function makeSurface(ctx: Ctx): WlSurfaceHandler {
 // still clear its zone). The mapped-state reset (events + WM unmap +
 // compositor stack drop + flag reset) runs only when the surface
 // actually mapped.
-export function detachSurfaceRole(state: CompositorState, s: SurfaceRecord): void {
+export function detachSurfaceRole(state: CompositorState, addon: Addon, s: SurfaceRecord): void {
   // Role-state cleanup -- runs even when never-mapped. Layer-shell
   // reservations register on apply, not on map; the zone must be
   // released regardless of whether the surface ever showed content.
@@ -786,9 +787,18 @@ export function detachSurfaceRole(state: CompositorState, s: SurfaceRecord): voi
   }
   s.presentationFeedbacks = undefined;
   s.pending.presentationFeedbacks = undefined;
-  // Output residency must rebuild from scratch: a re-roled surface may
-  // land on a different output, and the residency differ would
-  // otherwise miss the implicit "left every output" transition.
+  // The surface has left the draw stack (unmapped or re-roled). Emit
+  // wl_surface.leave for every output it was on before dropping the tracked
+  // set -- clearing without the leave desyncs a REUSED surface: a client that
+  // keeps one wl_surface across successive roles (Qt reuses one surface for
+  // successive menu popups) still believes it's on the output, so the next
+  // role's residency pass re-emits enter -> a duplicate enter with no
+  // intervening leave (QtWayland's "unexpected wl_surface.enter"). Passing an
+  // empty override drives leave-all and resets enteredOutputs, so a re-role
+  // still rebuilds residency from scratch.
+  if (s.enteredOutputs && s.enteredOutputs.size > 0) {
+    updateSurfaceOutputResidency(state, addon, s, []);
+  }
   s.enteredOutputs?.clear();
   // hasContent stays as a "the surface has presentable bytes" flag;
   // next commit refreshes it. A null-buffer-commit unmap clears it
@@ -806,9 +816,9 @@ export function detachSurfaceRole(state: CompositorState, s: SurfaceRecord): voi
 // that disconnects without explicitly destroying its wl_surface would
 // never emit window.unmap, leaking any decoration ring bound to that
 // window (the provider frees it on sdk.windows.onUnmap).
-export function unmapAndTeardownSurface(state: CompositorState, s: SurfaceRecord): void {
+export function unmapAndTeardownSurface(state: CompositorState, addon: Addon, s: SurfaceRecord): void {
   if (s.unmapped) return;
   s.unmapped = true;
-  detachSurfaceRole(state, s);
+  detachSurfaceRole(state, addon, s);
   state.surfacesById?.delete(s.id);
 }

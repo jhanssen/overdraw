@@ -148,6 +148,42 @@ test('updateAllSurfaceResidency: skips unmapped surfaces', () => {
   assert.equal(calls[0][1].surface, mappedRes);
 });
 
+test('role detach (empty override) emits leave-all so a reused surface does not double-enter', () => {
+  // A client that keeps one wl_surface across successive roles (Qt reuses one
+  // surface for successive menu popups) must get a leave when the role is
+  // detached, else the next role's enter is a duplicate with no intervening
+  // leave -- QtWayland's "Ignoring unexpected wl_surface.enter". detachSurfaceRole
+  // drives this by calling updateSurfaceOutputResidency with an empty override.
+  const surfaceRes = mockResource("wl_surface", 7);
+  const out0Res = mockResource("wl_output-0", 7);
+  const wlOR = new Map([[0, new Set([out0Res])]]);
+  let overlapping = [0];
+  const { state, calls } = mockState({
+    surfaceOutputs: () => overlapping,
+    wlOutputResources: wlOR,
+  });
+  const rec = { id: 42, resource: surfaceRes };
+  state.surfaces.set(surfaceRes, rec);
+  state.surfacesById.set(42, rec);
+
+  // 1) Popup maps on output 0 -> enter.
+  updateSurfaceOutputResidency(state, mockAddon(), rec);
+  // 2) Popup role detached (unmap): leave-all via empty override.
+  updateSurfaceOutputResidency(state, mockAddon(), rec, []);
+  // 3) Same surface re-roled onto output 0 again -> a fresh enter.
+  overlapping = [0];
+  updateSurfaceOutputResidency(state, mockAddon(), rec);
+
+  // The client sees enter, leave, enter -- never enter, enter.
+  assert.deepEqual(calls.map((c) => [c[0], c[1].output]), [
+    ["enter", out0Res],
+    ["leave", out0Res],
+    ["enter", out0Res],
+  ]);
+  // The empty override reset the tracked set between roles.
+  assert.deepEqual([...rec.enteredOutputs], [0]);
+});
+
 test('destroyed wl_output resource is skipped during enter emission', () => {
   const surfaceRes = mockResource("wl_surface", 7);
   const stale = mockResource("wl_output-stale", 7);

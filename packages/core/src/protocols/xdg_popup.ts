@@ -132,7 +132,7 @@ export default function makeXdgPopup(ctx: Ctx): XdgPopupHandler {
         // s.mapped === true from this binding and silently skips the
         // re-map.
         const surf = pr.xdgSurface.surface;
-        if (surf) detachSurfaceRole(ctx.state, surf);
+        if (surf) detachSurfaceRole(ctx.state, ctx.addon, surf);
         if (ctx.state.grabbedPopup === resource) ctx.state.grabbedPopup = undefined;
         ctx.state.popups?.delete(resource);
         rebuildStackWithPopups(ctx.state);

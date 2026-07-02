@@ -202,7 +202,7 @@ export default function makeToplevel(ctx: Ctx): XdgToplevelHandler {
       // role binding works.
       const t = ctx.state.toplevels?.get(resource);
       const surface = t?.xdgSurface.surface;
-      if (surface) detachSurfaceRole(ctx.state, surface);
+      if (surface) detachSurfaceRole(ctx.state, ctx.addon, surface);
       ctx.state.toplevels?.delete(resource);
     },
   };

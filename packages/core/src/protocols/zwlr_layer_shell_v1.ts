@@ -547,7 +547,7 @@ export function makeLayerSurface(ctx: Ctx): ZwlrLayerSurfaceV1Handler {
       // detachSurfaceRole drives teardownLayerSurface internally
       // (and emits window.unmap, drops WM tracking, resets mapped),
       // so the wl_surface can be re-bound under a fresh role.
-      detachSurfaceRole(ctx.state, r.surface);
+      detachSurfaceRole(ctx.state, ctx.addon, r.surface);
     },
     set_layer(resource, layer) {
       const r = rec(resource);
