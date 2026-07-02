@@ -98,6 +98,10 @@ export interface Window {
   // content signal). A window is in the layout (and configured) from addWindow,
   // but only drawn once it has content.
   hasContent?: boolean;
+  // The client's window-type prefers floating (X11 _NET_WM_WINDOW_TYPE
+  // splash/dialog/utility). Stamped from propose(); consumed by the
+  // default-floating policy at first content, alongside parent/fixed-size.
+  floatByType?: boolean;
   // Highest xdg_surface.ack_configure serial the client has acked (from
   // notifyToplevelCommit). Used by the open path to detect the mapping commit.
   lastAckedSerial?: number;
@@ -239,6 +243,9 @@ export interface WindowStateProposal {
     maxSize?: { width: number; height: number } | null;
   };
   parent?: number | null;
+  // A structural hint (like `parent`/`constraints`), not a decision axis: the
+  // client's window-type prefers floating. See Window.floatByType.
+  floatByType?: boolean;
 }
 
 export interface Wm {
@@ -1621,7 +1628,9 @@ export function createWm(
         // Conditions:
         //   - parent set (xdg_toplevel.set_parent != null), OR
         //   - min and max are both non-zero AND either axis is locked
-        //     (min == max on width OR height).
+        //     (min == max on width OR height), OR
+        //   - the client's window-type prefers floating (X11
+        //     _NET_WM_WINDOW_TYPE splash/dialog/utility; win.floatByType).
         // A plugin's preconfigure interceptor would have already
         // overridden if it wanted to; this is a default that fires
         // only when the WM is still in the post-preconfigure
@@ -1636,7 +1645,7 @@ export function createWm(
           const maxH = c.maxSize?.height ?? 0;
           const fixedSize = minW !== 0 && minH !== 0
             && (minW === maxW || minH === maxH);
-          if (win.windowState.parent !== null || fixedSize) {
+          if (win.windowState.parent !== null || fixedSize || win.floatByType) {
             win.windowState = { ...win.windowState, tiling: "floating" };
             dialogPolicyMutated = true;
             if (win.floatingRect === undefined) {
@@ -2033,6 +2042,14 @@ export function createWm(
             ...proposal.constraints,
           },
         };
+      }
+      // Window-type float hint rides the same synchronous race as constraints:
+      // the X11 _NET_WM_WINDOW_TYPE reply can arrive interleaved with the first
+      // content commit, and windowHasContent (called synchronously from the map
+      // handler) must see it. Stamp it eagerly onto the window record; it is a
+      // hint, not a decision axis, so it never enters windowState.
+      if (proposal.floatByType !== undefined) {
+        win.floatByType = proposal.floatByType;
       }
       // Serialize against any in-flight mutation on this window so a
       // second caller doesn't read stale state mid-microtask. Two

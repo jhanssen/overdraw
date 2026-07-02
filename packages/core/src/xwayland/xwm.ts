@@ -32,6 +32,7 @@ import {
   netWmStateToPresentation,
   netWmStateIsModal,
   classifyWindowType,
+  windowKindPrefersFloating,
   type PropertyAtoms,
   type PropertyReply,
 } from "./properties.js";
@@ -264,6 +265,7 @@ function asPropertyAtoms(raw: Record<string, number>): PropertyAtoms {
     _NET_WM_WINDOW_TYPE_POPUP_MENU: a("_NET_WM_WINDOW_TYPE_POPUP_MENU"),
     _NET_WM_WINDOW_TYPE_TOOLTIP: a("_NET_WM_WINDOW_TYPE_TOOLTIP"),
     _NET_WM_WINDOW_TYPE_COMBO: a("_NET_WM_WINDOW_TYPE_COMBO"),
+    _NET_WM_WINDOW_TYPE_SPLASH: a("_NET_WM_WINDOW_TYPE_SPLASH"),
   };
 }
 
@@ -409,6 +411,9 @@ export function startXwm(state: CompositorState, addon: Addon, wmFd: number): Xw
       const parent = windows.get(w.transientFor);
       if (parent && parent.surfaceId !== null) proposal.parent = parent.surfaceId;
     }
+    // _NET_WM_WINDOW_TYPE -> default-floating hint. Splash/dialog/utility
+    // windows are never tiled masters; the WM honors this at first content.
+    if (windowKindPrefersFloating(w.windowKind)) proposal.floatByType = true;
     // _NET_WM_STATE -> clientRequests. EWMH sends "this window WANTS
     // to be fullscreen/maximized/modal"; that's a wish, not a decision.
     // The policy seam in wm.propose maps it onto the decision axes the
@@ -481,6 +486,9 @@ export function startXwm(state: CompositorState, addon: Addon, wmFd: number): Xw
       case "_NET_WM_WINDOW_TYPE": {
         const types = parseNetWmWindowType(p);
         w.windowKind = classifyWindowType(types, pa);
+        // The type can arrive after the initial publish; re-propose so the
+        // default-floating hint reaches the WM before first content.
+        sendStructuralProposals(w);
         break;
       }
       case "_NET_WM_PID": {

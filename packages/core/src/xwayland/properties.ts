@@ -48,6 +48,7 @@ export interface PropertyAtoms {
   _NET_WM_WINDOW_TYPE_POPUP_MENU: number;
   _NET_WM_WINDOW_TYPE_TOOLTIP: number;
   _NET_WM_WINDOW_TYPE_COMBO: number;
+  _NET_WM_WINDOW_TYPE_SPLASH: number;
 }
 
 const utf8Decoder = new TextDecoder("utf-8", { fatal: false });
@@ -242,10 +243,10 @@ export function netWmStateIsModal(
   return states.has(atoms._NET_WM_STATE_MODAL);
 }
 
-// _NET_WM_WINDOW_TYPE: classify the highest-priority recognized type. Used by
-// the WM to promote dialogs/utility/menus to floating (Phase 3 reuses the
-// existing xdg dialog/transient-for floating policy via wm.propose).
-export type WindowKind = "normal" | "dialog" | "utility" | "menu" | "tooltip" | "combo" | null;
+// _NET_WM_WINDOW_TYPE: classify the highest-priority recognized type. The WM
+// uses it (via windowKindPrefersFloating) to default splash/dialog/utility
+// windows to floating.
+export type WindowKind = "normal" | "dialog" | "utility" | "menu" | "tooltip" | "combo" | "splash" | null;
 
 export function classifyWindowType(
   types: readonly number[],
@@ -257,7 +258,8 @@ export function classifyWindowType(
     "_NET_WM_WINDOW_TYPE_DROPDOWN_MENU" |
     "_NET_WM_WINDOW_TYPE_POPUP_MENU" |
     "_NET_WM_WINDOW_TYPE_TOOLTIP" |
-    "_NET_WM_WINDOW_TYPE_COMBO">,
+    "_NET_WM_WINDOW_TYPE_COMBO" |
+    "_NET_WM_WINDOW_TYPE_SPLASH">,
 ): WindowKind {
   // Walk the client-supplied list in order (EWMH says the client orders by
   // preference). Stop at the first one we recognize.
@@ -270,8 +272,16 @@ export function classifyWindowType(
     if (a === atoms._NET_WM_WINDOW_TYPE_POPUP_MENU) return "menu";
     if (a === atoms._NET_WM_WINDOW_TYPE_TOOLTIP) return "tooltip";
     if (a === atoms._NET_WM_WINDOW_TYPE_COMBO) return "combo";
+    if (a === atoms._NET_WM_WINDOW_TYPE_SPLASH) return "splash";
   }
   return null;
+}
+
+// Window kinds that default to floating: a splash, dialog, or utility/toolbox
+// is never a tiled master. Menu/dropdown/popup/tooltip/combo are excluded
+// because they arrive override-redirect and bypass the WM's tiling decision.
+export function windowKindPrefersFloating(kind: WindowKind): boolean {
+  return kind === "splash" || kind === "dialog" || kind === "utility";
 }
 
 // _NET_STARTUP_ID: an opaque ASCII id the launcher set on the window

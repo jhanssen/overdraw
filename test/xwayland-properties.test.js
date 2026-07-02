@@ -18,6 +18,7 @@ import {
   parseNetWmIcon,
   netWmStateToPresentation,
   classifyWindowType,
+  windowKindPrefersFloating,
 } from "../packages/core/dist/xwayland/properties.js";
 
 // Synthetic atom values (the real values come from the X server's intern; this
@@ -39,6 +40,7 @@ const ATOMS = {
   _NET_WM_WINDOW_TYPE_POPUP_MENU: 305,
   _NET_WM_WINDOW_TYPE_TOOLTIP: 306,
   _NET_WM_WINDOW_TYPE_COMBO: 307,
+  _NET_WM_WINDOW_TYPE_SPLASH: 308,
 };
 
 // Helpers to build u32-array properties (X wire is little-endian on x86_64).
@@ -168,6 +170,19 @@ test("classifyWindowType: all menu variants collapse to 'menu'", () => {
 
 test("classifyWindowType: no recognized type -> null", () => {
   assert.equal(classifyWindowType([42, 43], ATOMS), null);
+});
+
+test("classifyWindowType: splash", () => {
+  assert.equal(classifyWindowType([ATOMS._NET_WM_WINDOW_TYPE_SPLASH], ATOMS), "splash");
+});
+
+test("windowKindPrefersFloating: splash/dialog/utility float; others do not", () => {
+  for (const k of ["splash", "dialog", "utility"]) {
+    assert.equal(windowKindPrefersFloating(k), true, `${k} should float`);
+  }
+  for (const k of ["normal", "menu", "tooltip", "combo", null]) {
+    assert.equal(windowKindPrefersFloating(k), false, `${k} should not float`);
+  }
 });
 
 // ---- parseTransientFor ---------------------------------------------------
