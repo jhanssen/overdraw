@@ -77,16 +77,24 @@ struct Uniforms {
   cropUV      : vec4f,
   tint        : vec4f,
   colorMatrix : mat4x4f,
-  // Per-surface shape. .x = kind (0=rect / 1=rounded-rect uniform /
-  // 2=rounded-rect per-corner / 3=squircle-cornered rect); .y = surface
-  // logical width (px) the SDF eval works against; .z = surface logical
-  // height (px); .w = corner extent (px) when kind=1 (rounded-rect uniform
-  // radius) or kind=3 (squircle corner extent), unused when kind=0/2.
+  // Shape clipping the surface to its WINDOW's rounded footprint. .x = kind
+  // (0=rect / 1=rounded-rect uniform / 2=rounded-rect per-corner /
+  // 3=squircle-cornered rect); .y = window logical width (px) the SDF eval
+  // works against; .z = window logical height (px); .w = corner extent (px)
+  // when kind=1 (rounded-rect uniform radius) or kind=3 (squircle corner
+  // extent), unused when kind=0/2. For a plain rounded window .y/.z are the
+  // surface's own size; for a subsurface they are the enclosing window's size.
   shape       : vec4f,
   // kind=2 (per-corner): tl, tr, br, bl radii in px.
   // kind=3 (squircle): .x = exponent (>= 2), .yzw unused.
   // kind=0/1: unused.
   shapeExtra  : vec4f,
+  // Maps this surface's [0,1] surfUV into the window's [0,1] shape space:
+  // windowUV = shapeMap.xy + surfUV * shapeMap.zw. Identity (0,0,1,1) when the
+  // surface IS the shaped window; for a subsurface it locates the surface's
+  // rect within the enclosing window footprint, so the window's rounded corners
+  // clip the subsurface at the correct place.
+  shapeMap    : vec4f,
 };
 @group(0) @binding(2) var<uniform> u : Uniforms;
 @vertex fn vs(@builtin(vertex_index) i : u32) -> VsOut {
@@ -184,9 +192,13 @@ fn sdfCoverage(d : f32) -> f32 {
 // margin band gets coverage from the existing \`inside\` step). Kind 0 returns
 // 1.0 (rect; the early-out keeps the common case cheap).
 fn shapeCoverage(uv : vec2f, kind : u32,
-                 sizePx : vec2f, r : f32, extra : vec4f) -> f32 {
+                 sizePx : vec2f, r : f32, extra : vec4f, map : vec4f) -> f32 {
   if (kind == 0u) { return 1.0; }
-  let p  = (uv - vec2f(0.5)) * sizePx;
+  // Map the surface-local uv into the enclosing window's [0,1] shape space, so
+  // the SDF is evaluated over the WINDOW rect (sizePx) even for a subsurface
+  // that only covers part of it.
+  let wuv = map.xy + uv * map.zw;
+  let p  = (wuv - vec2f(0.5)) * sizePx;
   let he = sizePx * 0.5;
   if (kind == 1u) {
     return sdfCoverage(sdfRoundedRect(p, he, r));
@@ -261,7 +273,7 @@ fn applyBufferTransform(uv : vec2f, t : f32) -> vec2f {
   // shapes, shape for rounded corners; the intersection is rendered).
   let shapeCov = shapeCoverage(
     clamp(in.surfUV, vec2f(0.0), vec2f(1.0)),
-    u32(u.shape.x), u.shape.yz, u.shape.w, u.shapeExtra);
+    u32(u.shape.x), u.shape.yz, u.shape.w, u.shapeExtra, u.shapeMap);
 
   // Premultiplied: rgb and alpha both multiplied by inside * shapeCov *
   // mAlpha * opacity. Matches the pipeline's premultiplied blend.
@@ -635,9 +647,9 @@ interface Surface {
 interface FrozenSnapshot { tex: GPUTexture; view: GPUTextureView; w: number; h: number; }
 
 // 6 vec4s (placement, transform, margin, fx, cropUV, tint) + 1 mat4x4f
-// (colorMatrix, packed as 4 vec4 columns) + 2 vec4s (shape, shapeExtra) =
-// 12 vec4s = 48 floats = 192 bytes.
-const UNIFORM_BYTES = 192;
+// (colorMatrix, packed as 4 vec4 columns) + 3 vec4s (shape, shapeExtra,
+// shapeMap) = 13 vec4s = 52 floats = 208 bytes.
+const UNIFORM_BYTES = 208;
 const UNIFORM_FLOATS = UNIFORM_BYTES / 4;
 
 function identityColorMatrix(): Float32Array {
@@ -659,18 +671,22 @@ function defaultFx(): SurfaceFx {
 }
 
 // Pack a SurfaceShape into the per-surface uniform buffer at the shape /
-// shapeExtra vec4 slots (float indices 40..47). `sizeXPx`/`sizeYPx` are the
-// surface's logical pixel size used by the SDF eval; radii / per-corner /
-// superellipse params are clamped to non-negative finite numbers (a bad
-// value would propagate as NaN through the smoothstep and zero coverage --
-// "weird invisible window" failure mode, easier to reason about with a
-// clamp than with NaN propagation).
+// shapeExtra / shapeMap vec4 slots (float indices 40..51). `winXPx`/`winYPx`
+// are the WINDOW's logical pixel size the SDF eval works against, and `map`
+// = (offsetU, offsetV, spanU, spanV) locates this surface's [0,1] within that
+// window (identity 0,0,1,1 when the surface IS the window). Radii / per-corner /
+// superellipse params are clamped to non-negative finite numbers (a bad value
+// would propagate as NaN through the smoothstep and zero coverage -- "weird
+// invisible window" failure mode, easier to reason about than NaN propagation).
 function packShape(data: Float32Array, shape: SurfaceShape,
-                   sizeXPx: number, sizeYPx: number): void {
-  // shape (vec4 #10, floats 40..43): kind, sizeXpx, sizeYpx, radius
+                   winXPx: number, winYPx: number,
+                   map: { ox: number; oy: number; sx: number; sy: number }): void {
+  // shape (vec4 #10, floats 40..43): kind, winXpx, winYpx, radius
   // shapeExtra (vec4 #11, floats 44..47): kind-specific
-  data[41] = sizeXPx;
-  data[42] = sizeYPx;
+  // shapeMap (vec4 #12, floats 48..51): offsetU, offsetV, spanU, spanV
+  data[41] = winXPx;
+  data[42] = winYPx;
+  data[48] = map.ox; data[49] = map.oy; data[50] = map.sx; data[51] = map.sy;
   if (shape === null) { data[40] = 0; return; }
   switch (shape.kind) {
     case "rounded-rect":
@@ -696,6 +712,14 @@ function packShape(data: Float32Array, shape: SurfaceShape,
 function sanitizeNonNeg(v: number): number {
   return Number.isFinite(v) && v >= 0 ? v : 0;
 }
+
+// surfUV->windowUV map for a surface that IS its own shape window (the shape's
+// rect equals the surface's rect): no offset, full span.
+const IDENTITY_SHAPE_MAP = { ox: 0, oy: 0, sx: 1, sy: 1 } as const;
+
+// A window's rounded footprint (absolute logical coords) + the shape to clip
+// its subtree with. Rebuilt each frame in shapeClipMap.
+interface ShapeClip { x: number; y: number; w: number; h: number; shape: SurfaceShape; }
 
 // The executor's per-bufferId record. Holds the GPU side of a cached client
 // dmabuf import (wrapped texture + view + the native importId for release).
@@ -1519,6 +1543,55 @@ export class JsCompositor implements CompositorSink {
     const followers = this.fxFollowers.get(id);
     if (followers) out.push(...followers);
     return out;
+  }
+
+  // Per-surface shape-clip footprint, rebuilt each frame by refreshShapeClips.
+  // A surface present here is clipped to the mapped window's rounded shape (the
+  // surface itself for a shaped window; the enclosing window for its
+  // subsurfaces). Absent -> the surface's own fx.shape (or none) applies.
+  private shapeClipMap = new Map<number, ShapeClip>();
+
+  // Rebuild shapeClipMap: for every surface carrying a shape, stamp a clip
+  // footprint onto itself and cascade one down its subsurface subtree, so a
+  // window's rounded corners clip its content subsurfaces (Firefox renders its
+  // content as one full-window subsurface; without this its square corners
+  // escape the decoration's rounded shape). A subsurface carrying its OWN shape
+  // starts a fresh footprint for its subtree.
+  //
+  // The shaped surface itself clips to the rect its shape is drawn over -- the
+  // intercept output's outer (border) rect when decorated, else its layout
+  // rect -- rounding the window's OUTER boundary. Its subsurfaces clip to the
+  // CONTENT rect (the layout rect, inside the border) so the content rounds
+  // within the border ring rather than over it. When the shaped surface is a
+  // 0x0 container (a client whose content lives entirely in a subsurface), the
+  // content footprint is degenerate and updateUniforms falls back to the
+  // subsurface's own rect -- which IS the content, so it clips correctly.
+  private refreshShapeClips(): void {
+    this.shapeClipMap.clear();
+    const acc = this.subsurfaceAccessor;
+    for (const [id, s] of this.surfaces) {
+      if (s.fx.shape === null) continue;
+      const p = s.interceptPlacement;
+      const own: ShapeClip = p
+        ? { x: p.x, y: p.y, w: p.w, h: p.h, shape: s.fx.shape }
+        : { x: s.x, y: s.y, w: s.layoutW, h: s.layoutH, shape: s.fx.shape };
+      this.shapeClipMap.set(id, own);
+      if (!acc) continue;
+      const content: ShapeClip = {
+        x: s.x, y: s.y, w: s.layoutW, h: s.layoutH, shape: s.fx.shape,
+      };
+      const walk = (pid: number): void => {
+        for (const c of acc.children(pid)) {
+          const cs = this.surfaces.get(c.id);
+          // A nested shaped surface owns its subtree's clip; the outer loop
+          // stamps it from its own footprint, so skip it and its descendants.
+          if (cs && cs.fx.shape !== null) continue;
+          this.shapeClipMap.set(c.id, content);
+          walk(c.id);
+        }
+      };
+      walk(id);
+    }
   }
 
   // Resize transaction: snapshot this surface's CURRENT appearance right now,
@@ -2633,7 +2706,7 @@ export class JsCompositor implements CompositorSink {
   // texture; cropUV = normalized source-crop pixel coords. compose.scene
   // passes neither, falling through to the on-screen behavior.
   private updateUniforms(
-    s: Surface, ow: number, oh: number,
+    s: Surface, surfaceId: number, ow: number, oh: number,
     overrides?: {
       placement?: { x: number; y: number; w: number; h: number };
       cropUV?: { u0: number; v0: number; u1: number; v1: number };
@@ -2749,12 +2822,29 @@ export class JsCompositor implements CompositorSink {
     data[22] = fx.tintB; data[23] = fx.tintA;
     // colorMatrix: 4 column vectors of 4 components each (mat4x4f, column-major)
     data.set(fx.colorMatrix, 24);
-    // shape: (kind, sizeXpx, sizeYpx, radius) + shapeExtra (4 params per kind).
-    // The SDF evaluates in surface-LOGICAL pixel space; pw/ph are already in
-    // logical pixels (the placement is in logical output coords, not device).
-    // Frozen surfaces sample the snapshot at the same on-screen rect; the
-    // shape applies the same way.
-    packShape(data, fx.shape, pw, ph);
+    // shape: clip the surface to its WINDOW's rounded footprint. A shaped
+    // window (or any surface carrying its own shape) clips against its own rect
+    // -- identity map, reproducing a plain rounded window. A subsurface of a
+    // shaped window inherits that window's shape (via shapeClipMap) and clips
+    // against the window footprint, positioned by the surfUV->windowUV map, so
+    // the window's rounded corners cut the subsurface at the right place. The
+    // SDF evaluates in logical pixels (placement is logical output coords); px/
+    // py are already output-local (output origin subtracted), and the window
+    // footprint is converted the same way so the two share a frame.
+    const clip = this.shapeClipMap.get(surfaceId);
+    const clipShape = clip ? clip.shape : fx.shape;
+    if (clipShape === null) {
+      packShape(data, null, pw, ph, IDENTITY_SHAPE_MAP);
+    } else {
+      const wx = clip ? clip.x - ox : px;
+      const wy = clip ? clip.y - oy : py;
+      const ww = clip && clip.w > 0 ? clip.w : pw;
+      const wh = clip && clip.h > 0 ? clip.h : ph;
+      const map = (ww > 0 && wh > 0)
+        ? { ox: (px - wx) / ww, oy: (py - wy) / wh, sx: pw / ww, sy: ph / wh }
+        : IDENTITY_SHAPE_MAP;
+      packShape(data, clipShape, ww, wh, map);
+    }
     this.device.queue.writeBuffer(s.uniformBuf, 0, data);
   }
 
@@ -2926,7 +3016,9 @@ export class JsCompositor implements CompositorSink {
       // Clear the scissored box to black (loadOp:load preserved old pixels).
       const black = this.ensureBlackFill();
       if (black.bindGroup) {
-        this.updateUniforms(black, args.outW, args.outH,
+        // The black scissor-fill is not a tracked surface (id -1 never matches
+        // shapeClipMap); it clears a rect, unshaped.
+        this.updateUniforms(black, -1, args.outW, args.outH,
           { placement: args.scissor }, out);
         pass.setPipeline(this.pipeline);
         pass.setBindGroup(0, black.bindGroup);
@@ -2964,7 +3056,7 @@ export class JsCompositor implements CompositorSink {
           if (sx1 <= ox0 || sx0 >= ox1 || sy1 <= oy0 || sy0 >= oy1) continue;
         }
       }
-      this.updateUniforms(s, args.outW, args.outH,
+      this.updateUniforms(s, id, args.outW, args.outH,
         placement || cropUV ? { placement, cropUV } : undefined, out);
       pass.setBindGroup(0, s.bindGroup);
       pass.draw(4);
@@ -2985,6 +3077,10 @@ export class JsCompositor implements CompositorSink {
   // access bracket.
   renderFrame(): void {
     let frameOpen = false;
+
+    // Derive each surface's shape-clip footprint from the current surface tree
+    // + placements before any uniforms are written this frame.
+    this.refreshShapeClips();
 
     // One render target per output. Nested/KMS: acquire each output's scanout
     // texture (skip the ones whose ring has no free slot this frame). Headless:

@@ -185,6 +185,77 @@ test("per-surface analytic shape (setSurfaceShape)", { skip }, async (t) => {
       assert.equal(at(data, SZ / 2, 1)[2], 255, "mid-top stays red (n=2)");
     });
 
+    await t.test("subsurface inherits + is clipped by the parent window's rounded shape", async () => {
+      // Firefox renders its whole content as ONE full-window subsurface. The
+      // parent (shaped) window's rounded corners must clip that subsurface, or
+      // its square corners escape the decoration.
+      const comp = new JsCompositor(device, dawn.globals, addon, { width: W, height: H });
+      const green = solid([0, 255, 0, 255], SZ, SZ);
+      comp.uploadPixels(1, { width: SZ, height: SZ, stride: red.stride }, red.data);
+      comp.uploadPixels(2, { width: SZ, height: SZ, stride: green.stride }, green.data);
+      comp.setSurfaceLayout(1, 0, 0, SZ, SZ);
+      comp.setSurfaceLayout(2, 0, 0, SZ, SZ);           // covers the window
+      comp.setSubsurfaceAccessor({ children: (p) => (p === 1 ? [{ id: 2, offX: 0, offY: 0 }] : []) });
+      comp.setStack([1, 2]);                             // child (2) above parent (1)
+      comp.setSurfaceShape(1, { kind: "rounded-rect", radius: 12 });
+      comp.renderFrame();
+      const { data } = await comp.readback();
+      // The child (green) is on top and covers the window; at a corner BOTH the
+      // child and the parent are clipped by the window shape -> black.
+      const tl = at(data, 1, 1);
+      assert.equal(tl[1], 0, `child TL corner clipped (green==0); got ${tl}`);
+      assert.equal(tl[2], 0, `parent clipped there too (red==0); got ${tl}`);
+      assert.equal(at(data, SZ - 2, 1)[1], 0, "child TR corner clipped");
+      assert.equal(at(data, 1, SZ - 2)[1], 0, "child BL corner clipped");
+      assert.equal(at(data, SZ - 2, SZ - 2)[1], 0, "child BR corner clipped");
+      // Interior + mid-edge of the child stay green (unclipped).
+      assert.equal(at(data, SZ / 2, SZ / 2)[1], 255, "child center stays green");
+      assert.equal(at(data, SZ / 2, 1)[1], 255, "child mid-top edge stays green");
+    });
+
+    await t.test("partial subsurface clipped only where it overlaps a window corner", async () => {
+      // A subsurface covering just the bottom-right quadrant: its OUTER corner
+      // (the window's BR corner) is clipped; its INNER corner (window interior)
+      // is not -- proves the surfUV->windowUV offset map.
+      const comp = new JsCompositor(device, dawn.globals, addon, { width: W, height: H });
+      const q = SZ / 2;                                  // 32
+      const green = solid([0, 255, 0, 255], q, q);
+      comp.uploadPixels(1, { width: SZ, height: SZ, stride: red.stride }, red.data);
+      comp.uploadPixels(2, { width: q, height: q, stride: q * 4 }, green.data);
+      comp.setSurfaceLayout(1, 0, 0, SZ, SZ);
+      comp.setSurfaceLayout(2, q, q, q, q);              // BR quadrant of the window
+      comp.setSubsurfaceAccessor({ children: (p) => (p === 1 ? [{ id: 2, offX: q, offY: q }] : []) });
+      comp.setStack([1, 2]);
+      comp.setSurfaceShape(1, { kind: "rounded-rect", radius: 12 });
+      comp.renderFrame();
+      const { data } = await comp.readback();
+      // Window BR corner (framebuffer (SZ-1,SZ-1)) overlaps the child -> clipped.
+      assert.equal(at(data, SZ - 2, SZ - 2)[1], 0, "child outer (window-BR) corner clipped");
+      // Child's inner corner sits at the window center -> interior -> green.
+      assert.equal(at(data, q + 1, q + 1)[1], 255, "child inner corner (window interior) stays green");
+    });
+
+    await t.test("shaped 0x0 container clips its full-window content subsurface (Firefox structure)", async () => {
+      // Firefox's shaped surface is an empty 0x0 container; its content is a
+      // full-window subsurface. The container footprint is degenerate, so the
+      // content must clip to its OWN rect with the container's shape.
+      const comp = new JsCompositor(device, dawn.globals, addon, { width: W, height: H });
+      const green = solid([0, 255, 0, 255], SZ, SZ);
+      comp.uploadPixels(2, { width: SZ, height: SZ, stride: green.stride }, green.data);
+      comp.setSurfaceLayout(1, 0, 0, 0, 0);   // 0x0 container (draws nothing itself)
+      comp.setSurfaceLayout(2, 0, 0, SZ, SZ);
+      comp.setSubsurfaceAccessor({ children: (p) => (p === 1 ? [{ id: 2, offX: 0, offY: 0 }] : []) });
+      comp.setStack([2]);                       // only the content surface draws
+      comp.setSurfaceShape(1, { kind: "rounded-rect", radius: 12 });
+      comp.renderFrame();
+      const { data } = await comp.readback();
+      assert.equal(at(data, 1, 1)[1], 0, "content TL corner clipped by container shape");
+      assert.equal(at(data, SZ - 2, 1)[1], 0, "content TR corner clipped");
+      assert.equal(at(data, SZ - 2, SZ - 2)[1], 0, "content BR corner clipped");
+      assert.equal(at(data, SZ / 2, SZ / 2)[1], 255, "content center stays green");
+      assert.equal(at(data, SZ / 2, 1)[1], 255, "content mid-top edge stays green");
+    });
+
     await t.test("shape composes with opacity (multiplicative)", async () => {
       const comp = new JsCompositor(device, dawn.globals, addon, { width: W, height: H });
       comp.uploadPixels(1, { width: SZ, height: SZ, stride: red.stride }, red.data);
