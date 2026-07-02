@@ -1447,9 +1447,18 @@ export class JsCompositor implements CompositorSink {
         lw > 0 ? lw : (s.viewportDst?.width ?? s.viewportSrc?.width ?? s.width / bs);
       const effH = (lh: number): number =>
         lh > 0 ? lh : (s.viewportDst?.height ?? s.viewportSrc?.height ?? s.height / bs);
-      this.addOutputDamage(s.x, s.y, effW(s.layoutW), effH(s.layoutH));
-      s.x = x; s.y = y; s.layoutW = w; s.layoutH = h;
-      this.addOutputDamage(x, y, effW(w), effH(h));
+      if (this.fxDrawsOutsideLayout(s)) {
+        // An active fx transform/mask draws beyond the layout rect at BOTH the
+        // old and new placement; a plain old+new rect damage would miss the
+        // transformed footprint and leave residue in some scanout slot. Force a
+        // whole-output repaint across every ring slot.
+        s.x = x; s.y = y; s.layoutW = w; s.layoutH = h;
+        this.damageFull();
+      } else {
+        this.addOutputDamage(s.x, s.y, effW(s.layoutW), effH(s.layoutH));
+        s.x = x; s.y = y; s.layoutW = w; s.layoutH = h;
+        this.addOutputDamage(x, y, effW(w), effH(h));
+      }
     } else {
       this.surfaces.set(id, blankSurface(x, y, w, h));
       this.addOutputDamage(x, y, w, h);
@@ -1820,8 +1829,17 @@ export class JsCompositor implements CompositorSink {
       s.uniformBuf?.destroy();
       // Return any frozen snapshot to the pool.
       if (s.frozen) { this.releaseSnapTex(s.frozen); s.frozen = null; }
-      // Repaint the rect the surface vacated.
-      this.addOutputDamage(s.x, s.y, s.layoutW, s.layoutH);
+      // Repaint the region the surface vacated. A surface with an active fx
+      // transform/mask (notably a closing-window phantom mid-animation) drew
+      // OUTSIDE its layout rect, and its last-presented footprint may sit in a
+      // scanout slot that only accumulates small unrelated damage afterward --
+      // so a plain layout-rect damage would leave that transformed residue in
+      // the slot. Force a full-output repaint so every ring slot is cleared.
+      if (this.fxDrawsOutsideLayout(s)) {
+        this.damageFull();
+      } else {
+        this.addOutputDamage(s.x, s.y, s.layoutW, s.layoutH);
+      }
     }
     this.surfaces.delete(id);
   }
@@ -2529,13 +2547,21 @@ export class JsCompositor implements CompositorSink {
     if (this.surfaces.has(id)) this.damageSurface(id);
   }
 
+  // True when the surface's fx transform/margin or mask can draw pixels OUTSIDE
+  // its plain layout rect. Damaging only that rect would then leave stale pixels
+  // (in some scanout slot) where the surface drew beyond it, so such a surface
+  // must force a whole-output repaint across every ring slot instead.
+  private fxDrawsOutsideLayout(s: Surface): boolean {
+    const fx = s.fx;
+    return fx.translateX !== 0 || fx.translateY !== 0 || fx.scaleX !== 1 || fx.scaleY !== 1
+      || fx.marginTop !== 0 || fx.marginRight !== 0 || fx.marginBottom !== 0 || fx.marginLeft !== 0
+      || s.maskView !== null;
+  }
+
   private damageSurface(id: number): void {
     const s = this.surfaces.get(id);
     if (!s) return;
-    const fx = s.fx;
-    if (fx.translateX !== 0 || fx.translateY !== 0 || fx.scaleX !== 1 || fx.scaleY !== 1
-      || fx.marginTop !== 0 || fx.marginRight !== 0 || fx.marginBottom !== 0 || fx.marginLeft !== 0
-      || s.maskView !== null) {
+    if (this.fxDrawsOutsideLayout(s)) {
       this.damageFull();
       return;
     }
@@ -2561,10 +2587,7 @@ export class JsCompositor implements CompositorSink {
     if (!rects || rects.length === 0) { this.damageSurface(id); return; }
     const s = this.surfaces.get(id);
     if (!s) return;
-    const fx = s.fx;
-    if (fx.translateX !== 0 || fx.translateY !== 0 || fx.scaleX !== 1 || fx.scaleY !== 1
-      || fx.marginTop !== 0 || fx.marginRight !== 0 || fx.marginBottom !== 0 || fx.marginLeft !== 0
-      || s.maskView !== null) {
+    if (this.fxDrawsOutsideLayout(s)) {
       this.damageFull();
       return;
     }
