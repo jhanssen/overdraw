@@ -201,6 +201,24 @@ export function encodeShape(shape: DecorationShape): {
   }
 }
 
+// Scale every radius / extent of a shape by `s` (exponent is a curve
+// parameter, not a length; it is preserved). Used to express a shape
+// declared in logical pixels in the output ring's buffer pixels.
+export function scaleShape(shape: DecorationShape, s: number): DecorationShape {
+  if (shape === null || s === 1) return shape;
+  switch (shape.kind) {
+    case "rounded-rect":
+      return { kind: "rounded-rect", radius: shape.radius * s };
+    case "rounded-rect-per-corner":
+      return {
+        kind: "rounded-rect-per-corner",
+        tl: shape.tl * s, tr: shape.tr * s, br: shape.br * s, bl: shape.bl * s,
+      };
+    case "superellipse":
+      return { kind: "superellipse", exponent: shape.exponent, radius: shape.radius * s };
+  }
+}
+
 // Inset every radius / extent of a shape by `borderWidth`. The result
 // is the shape applied to the CLIENT CONTENT region inside the border
 // band. Negative values are floored at 0 -- a content shape with all

@@ -324,10 +324,18 @@ test('broker: input rect maps window geometry into buffer pixels (fractional sca
     log: () => {},
   });
   const rects = [];
+  const ctxScales = [];
+  const dimScales = [];
   await broker.registerInThread({
     name: 'test',
     match: { appId: appIdMatch('.*') },
-    setup: () => ({ render: ({ input }) => { rects.push(input.rect); } }),
+    setup: () => ({
+      outputDimensions: (w, h, s) => { dimScales.push(s); return { w, h }; },
+      render: ({ input, ctx }) => {
+        rects.push(input.rect);
+        ctxScales.push(ctx.inputScale);
+      },
+    }),
   }, 'test-plugin');
   bus.emit(WINDOW_EVENT.map, mapEvent(1, 'kitty'));
   // A 1.5x fractional-scale client: 200x100-logical window geometry backed
@@ -339,6 +347,8 @@ test('broker: input rect maps window geometry into buffer pixels (fractional sca
   broker.tick(16);
   assert.deepEqual(rects[0], { x: 0, y: 0, w: 300, h: 150 },
     'geometry scaled to buffer pixels covers the whole buffer');
+  assert.equal(ctxScales[0], 1.5, 'render ctx reports the buffer/logical factor');
+  assert.equal(dimScales[0], 1.5, 'outputDimensions receives the same factor');
 
   // Non-zero origin (CSD shadow margins) scales on both axes.
   geometries.set(1, { x: 10, y: 20, width: 180, height: 60 });

@@ -33,7 +33,7 @@
 import type { PluginSdk } from "../../core/dist/plugins/sdk.js";
 
 import {
-  validateConfig, encodeShape, insetShape,
+  validateConfig, encodeShape, insetShape, scaleShape,
   type ResolvedFill,
 } from "./config.js";
 import {
@@ -65,6 +65,11 @@ interface PerWindow {
   // The surfaceRect this window was last RENDERED at (placement). Used with
   // the caches above to skip re-rendering when nothing changed.
   lastSurfaceRect: { x: number; y: number; w: number; h: number } | null;
+  // The client's buffer-px-per-logical-px factor this window last rendered
+  // at, plus the shape parameters computed for it (band thickness and radii
+  // live in ring pixels, so they scale with the client's buffer density).
+  lastScale: number;
+  innerParams: ReturnType<typeof encodeShape>;
   // True once the content gate has been released. We only skip rendering after
   // release; before that, every tick must render to drive the release.
   released: boolean;
@@ -87,11 +92,16 @@ export default async function init(sdk: PluginSdk, rawConfig?: unknown): Promise
   const perWindow = new Map<number, PerWindow>();
 
   const B = config.borderWidth;
-  // Compute inner shape parameters once. The inner shape is the OUTER
-  // shape shrunk by B on every axis -- exactly what insetShape returns.
-  // We encode for the blit shader.
-  const innerShapeConfig = insetShape(config.outerShape, B);
-  const innerParams = encodeShape(innerShapeConfig);
+  // The band is declared in LOGICAL pixels but drawn in ring (buffer)
+  // pixels; a fractional-scale client's ring is denser than logical, so
+  // the drawn thickness scales by the client's buffer-px-per-logical-px
+  // factor (ctx.inputScale) to display at the intended logical size.
+  const ringBorder = (s: number): number =>
+    B === 0 ? 0 : Math.max(1, Math.round(B * s));
+  // Inner shape parameters for one scale factor: the OUTER shape (logical)
+  // expressed in ring pixels, shrunk by the ring-pixel band.
+  const innerParamsFor = (s: number): ReturnType<typeof encodeShape> =>
+    encodeShape(insetShape(scaleShape(config.outerShape, s), ringBorder(s)));
 
   await interceptSdk.register({
     name: "decoration-default",
@@ -110,13 +120,13 @@ export default async function init(sdk: PluginSdk, rawConfig?: unknown): Promise
     // priority re-evaluation).
     gates: true,
     setup: () => {
-      // Each matched window gets +2*B on each axis: the output ring's
-      // texture is sized to the WM outer rect, large enough to hold the
-      // B-pixel band around the client content.
+      // Each matched window's output ring extends the client content by the
+      // ring-pixel band on every axis, so the ring holds the band plus the
+      // content at the client's buffer density.
       return {
-        outputDimensions: (inputW, inputH) => ({
-          w: inputW + 2 * B,
-          h: inputH + 2 * B,
+        outputDimensions: (inputW, inputH, inputScale) => ({
+          w: inputW + 2 * ringBorder(inputScale),
+          h: inputH + 2 * ringBorder(inputScale),
         }),
         onSurfaceMatched: (info) => {
           // Reserve insets BEFORE the WM's first sized configure goes
@@ -158,6 +168,8 @@ export default async function init(sdk: PluginSdk, rawConfig?: unknown): Promise
             lastContentX: 0,
             lastContentY: 0,
             lastSurfaceRect: null,
+            lastScale: 0,   // 0 never matches a real scale; first render computes
+            innerParams: encodeShape(null),
             released: false,
           };
           perWindow.set(info.surfaceId, w);
@@ -190,6 +202,7 @@ export default async function init(sdk: PluginSdk, rawConfig?: unknown): Promise
           const bufferH = input.texture.height;
           const contentX = input.rect.x;
           const contentY = input.rect.y;
+          const scale = ctx.inputScale;
           const fill: ResolvedFill = ctx.activated ? config.focused : config.unfocused;
           const sr = ctx.surfaceRect;
 
@@ -218,7 +231,8 @@ export default async function init(sdk: PluginSdk, rawConfig?: unknown): Promise
             && w.lastSurfaceRect.w === sr.w && w.lastSurfaceRect.h === sr.h;
           const willSkip = !ctx.contentChanged && fill === w.lastFill && rectUnchanged
               && outputW === w.lastOutputW && outputH === w.lastOutputH
-              && inputW === w.lastInputW && inputH === w.lastInputH;
+              && inputW === w.lastInputW && inputH === w.lastInputH
+              && scale === w.lastScale;
           if (willSkip) {
             return false;
           }
@@ -230,14 +244,18 @@ export default async function init(sdk: PluginSdk, rawConfig?: unknown): Promise
             || fill !== w.lastFill;
           const inputChanged = inputW !== w.lastInputW || inputH !== w.lastInputH
             || bufferW !== w.lastBufferW || bufferH !== w.lastBufferH
-            || contentX !== w.lastContentX || contentY !== w.lastContentY;
+            || contentX !== w.lastContentX || contentY !== w.lastContentY
+            || scale !== w.lastScale;
+          if (scale !== w.lastScale) {
+            w.innerParams = innerParamsFor(scale);
+          }
           if (borderChanged) {
             writeBorderUniforms(pipeline.device, w.draw, outputW, outputH, fill);
           }
           if (borderChanged || inputChanged) {
             writeBlitUniforms(pipeline.device, w.draw,
               outputW, outputH, inputW, inputH, bufferW, bufferH,
-              contentX, contentY, B, innerParams, fill);
+              contentX, contentY, ringBorder(scale), w.innerParams, fill);
           }
           w.lastOutputW = outputW;
           w.lastOutputH = outputH;
@@ -248,6 +266,7 @@ export default async function init(sdk: PluginSdk, rawConfig?: unknown): Promise
           w.lastBufferH = bufferH;
           w.lastContentX = contentX;
           w.lastContentY = contentY;
+          w.lastScale = scale;
 
           encodeFrame(pipeline, w.draw, output.texture.createView(), input.texture);
 

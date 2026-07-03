@@ -1159,7 +1159,12 @@ export class JsCompositor implements CompositorSink {
     this.headless = opts.headless ?? true;
     this.format = opts.format ?? DEFAULT_FORMAT;
 
-    this.sampler = device.createSampler({ magFilter: "nearest", minFilter: "nearest" });
+    // Linear, not nearest: at a fractional output scale (or an integer-scale
+    // client on any output) surface content is resampled at composite, and
+    // nearest turns that into dropped/duplicated pixel rows -- visibly
+    // pixelated text. At true 1:1 (texel-aligned quads) linear sampling at
+    // texel centers is exact, so the crisp paths lose nothing.
+    this.sampler = device.createSampler({ magFilter: "linear", minFilter: "linear" });
     this.maskSampler = device.createSampler({ magFilter: "linear", minFilter: "linear" });
 
     // Allocate the shared default mask. 1x1 opaque white; uploaded once at

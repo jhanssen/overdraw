@@ -197,7 +197,7 @@ export class InThreadInterceptState {
     const cw = geom ? Math.max(1, Math.min(Math.round(geom.width * sx), input.w - cx)) : input.w;
     const ch = geom ? Math.max(1, Math.min(Math.round(geom.height * sy), input.h - cy)) : input.h;
     try {
-      this.ensureRing(cw, ch);
+      this.ensureRing(cw, ch, sx);
     } catch (e: unknown) {
       // outputDimensions returned bad values, or createTexture threw
       // (e.g. exceeds maxTextureDimension2D). Treat as a programming
@@ -258,6 +258,7 @@ export class InThreadInterceptState {
             contentChanged,
             contentReady: this.deps.contentReady(this.surfaceId),
             activated: this.deps.isActivated(this.surfaceId),
+            inputScale: sx,
             releaseGate: () => this.releaseGate(),
           },
         });
@@ -322,14 +323,17 @@ export class InThreadInterceptState {
   }
 
   // Allocate or reallocate the output ring. (inputW, inputH) are the
-  // client texture dimensions. If the plugin declared outputDimensions,
-  // the callback maps input to output dims (border plugins add 2B on
-  // each side); otherwise identity. Throws if the callback returns
-  // invalid dimensions or createTexture rejects; the caller catches and
-  // counts toward the failure threshold.
-  private ensureRing(inputW: number, inputH: number): void {
+  // content dims in buffer pixels; inputScale is the buffer-px-per-
+  // logical-px factor (forwarded so a border plugin sizes its band in
+  // ring pixels that display at the intended logical thickness). If the
+  // plugin declared outputDimensions, the callback maps input to output
+  // dims (border plugins add 2*round(B*scale) on each side); otherwise
+  // identity. Throws if the callback returns invalid dimensions or
+  // createTexture rejects; the caller catches and counts toward the
+  // failure threshold.
+  private ensureRing(inputW: number, inputH: number, inputScale: number): void {
     const out = this.handlers.outputDimensions
-      ? this.handlers.outputDimensions(inputW, inputH)
+      ? this.handlers.outputDimensions(inputW, inputH, inputScale)
       : { w: inputW, h: inputH };
     if (!Number.isFinite(out.w) || !Number.isFinite(out.h) ||
         out.w <= 0 || out.h <= 0 ||

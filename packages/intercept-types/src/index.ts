@@ -84,6 +84,14 @@ export interface InterceptRenderCtx {
   // (input.rect is buffer px, surfaceRect is logical px -- they only agree at
   // scale 1.0).
   releaseGate: () => void;
+  // Buffer pixels per logical pixel of the client content: the factor the
+  // SDK used to map the surface-local window geometry into input.rect. 1 for
+  // scale-1 clients; a fractional-scale or buffer_scale>1 client reports its
+  // effective scale (e.g. 1.5, 2). A plugin drawing pixel-thickness features
+  // (borders, corner radii) into the output ring multiplies logical
+  // thicknesses by this so they display at the intended logical size.
+  // Worker transport: always 1 (the geometry/scale mapping is not wired).
+  inputScale: number;
 }
 
 // Per-frame input/output texture handles. The plugin must NOT retain
@@ -145,12 +153,15 @@ export interface InterceptHandlers {
   // failure counter; sustained failure auto-unregisters the plugin.
   //
   // Border-style intercepts return { w: inputW + 2*B, h: inputH + 2*B }
-  // to extend the output by B on every side (the band).
+  // to extend the output by B on every side (the band). `inputScale` is
+  // the same buffer-px-per-logical-px factor the render ctx reports (see
+  // InterceptRenderCtx.inputScale); a band that should display B LOGICAL
+  // pixels thick extends by round(B * inputScale) ring pixels.
   //
   // 10a: in-thread transport only. Worker plugins that declare a
   // non-identity outputDimensions are rejected at registration; the
   // Worker ring lifecycle does not yet renegotiate dimensions.
-  outputDimensions?(inputW: number, inputH: number): { w: number; h: number };
+  outputDimensions?(inputW: number, inputH: number, inputScale: number): { w: number; h: number };
 
   // Fired once per matched surface, immediately after the registration
   // is set up (for already-matched surfaces) or when a new surface

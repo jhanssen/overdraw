@@ -517,6 +517,9 @@ class WorkerPerSurfaceState {
             // Seat focus is not threaded across the Worker boundary; Worker
             // plugins observe focus via window.change instead.
             activated: false,
+            // The Worker transport does not map geometry/scale; the ring is
+            // client-buffer sized and input.rect covers the whole buffer.
+            inputScale: 1,
             // No-op: gates are not supported on the Worker transport
             // in 10a. A Worker plugin that declared `gates` is
             // rejected at registration (see the Worker register
