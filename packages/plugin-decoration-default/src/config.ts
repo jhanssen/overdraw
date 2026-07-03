@@ -4,7 +4,7 @@
 // errors, which is what we want for bad config.
 
 import type {
-  DecorationPluginConfig, DecorationFill, DecorationShape,
+  DecorationFill, DecorationShape,
 } from "@overdraw/decoration-types";
 
 // RGBA in [0,1]. Used downstream by the shader uniform packer.

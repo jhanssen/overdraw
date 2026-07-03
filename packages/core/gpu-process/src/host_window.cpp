@@ -361,12 +361,10 @@ wl_buffer* HostWindow::createWlBufferFromDmabuf(int fd, uint32_t width, uint32_t
 }
 
 void HostWindow::onOutputGeometry(int32_t physWMm, int32_t physHMm, int32_t transform,
-                                  const char* make, const char* model) {
+                                  const char* /*make*/, const char* /*model*/) {
     hostPhysWMm_ = static_cast<uint32_t>(physWMm < 0 ? 0 : physWMm);
     hostPhysHMm_ = static_cast<uint32_t>(physHMm < 0 ? 0 : physHMm);
     hostTransform_ = static_cast<uint32_t>(transform);
-    if (make)  hostMake_  = make;
-    if (model) hostModel_ = model;
 }
 
 void HostWindow::onOutputMode(uint32_t flags, int32_t /*w*/, int32_t /*h*/, int32_t refresh) {
@@ -381,8 +379,9 @@ void HostWindow::onOutputScale(int32_t factor) {
     hostScale_ = static_cast<uint32_t>(factor < 1 ? 1 : factor);
 }
 
-void HostWindow::onOutputName(const char* name) {
-    if (name) hostName_ = name;
+void HostWindow::onOutputName(const char* /*name*/) {
+    // Host output name is host-only metadata; our wl_output describes the
+    // nested window, not the host's monitor.
 }
 
 void HostWindow::onOutputDescription(const char* /*desc*/) {

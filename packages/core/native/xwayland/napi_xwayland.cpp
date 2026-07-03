@@ -794,15 +794,6 @@ napi_value XwmGetAtomName(napi_env env, napi_callback_info info) {
     return out;
 }
 
-// xwmFlush() -> undefined
-napi_value XwmFlush(napi_env env, napi_callback_info /*info*/) {
-    if (!g_xwm.active) return throwErr(env, "xwmFlush: no XWM running");
-    xwmFlush(g_xwm.conn);
-    napi_value u;
-    napi_get_undefined(env, &u);
-    return u;
-}
-
 // wrapFd(rawFd) -> WaylandFd
 //
 // Wrap a raw int fd (e.g. one from makePipe) into the WaylandFd object the
@@ -898,7 +889,6 @@ void RegisterXwayland(napi_env env, napi_value exports) {
     reg("xwmXfixesSelectSelectionInput", XwmXfixesSelectSelectionInput);
     reg("xwmInternAtom", XwmInternAtom);
     reg("xwmGetAtomName", XwmGetAtomName);
-    reg("xwmFlush", XwmFlush);
     reg("xwmSelectWindowEvents", XwmSelectWindowEvents);
     reg("makePipe", MakePipe);
     reg("wrapFd", WrapFd);

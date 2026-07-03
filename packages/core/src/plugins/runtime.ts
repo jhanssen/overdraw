@@ -20,7 +20,6 @@ import { Endpoint, channelFor } from "./protocol.js";
 import type { Json } from "./protocol.js";
 import type { DynamicBus } from "../events/dynamic-bus.js";
 import { NamespaceRegistry } from "./namespace-registry.js";
-import type { Registration } from "./namespace-registry.js";
 import { ActionRegistry } from "./action-registry.js";
 import { InThreadPlugin } from "./inthread-plugin.js";
 import type { InThreadGpuDeps } from "./inthread-gpu.js";

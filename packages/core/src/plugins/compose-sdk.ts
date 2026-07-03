@@ -299,7 +299,7 @@ export interface WorkerComposeDeps {
 // Construct sdk.compose for a Worker plugin. Snapshot mode (phase 5b);
 // live mode raises if requested (phase 5b-live adds it).
 export function createWorkerCompose(deps: WorkerComposeDeps): PluginCompose {
-  const { clientId, plugin, dawn, pluginDeviceHandle, endpoint, allocSurfaceBufId, hasOutput } = deps;
+  const { hasOutput } = deps;
 
   function checkOutput(outputId: number): void {
     if (!hasOutput(outputId)) {
@@ -433,7 +433,6 @@ async function makeWorkerLive(
   // Build the consumer half of the ring. The plugin's GPU device tracks
   // afterReadDone via onSubmittedWorkDone -- consumer End must wait until
   // the plugin's most recent sample submit completed.
-  const dev = deps.plugin === undefined ? null : null; void dev;
   // (sdk.gpu.device is on the worker side -- consumers run cb() that
   // encodes + submits. The DRAINING -> FREE / writeEnd must come AFTER
   // that submit's GPU work completes. We rely on the cb itself awaiting

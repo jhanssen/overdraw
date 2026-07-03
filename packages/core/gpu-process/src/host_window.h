@@ -194,9 +194,6 @@ class HostWindow {
     uint32_t hostTransform_  = 0;
     uint32_t hostPhysWMm_    = 0;
     uint32_t hostPhysHMm_    = 0;
-    std::string hostMake_;
-    std::string hostModel_;
-    std::string hostName_;
 
     bool configured_ = false;
     bool shouldClose_ = false;

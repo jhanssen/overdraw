@@ -73,9 +73,7 @@ export class Kinematics {
   private velocitySamples: number;
   // Shake window (in samples).
   private shakeSamples: number;
-  private shakeStarted = false;
 
-  private lastMotionMs = 0;
   private lastTickMs = 0;
   private firstTick = true;       // distinguishes "never ticked" from "ticked at t=0"
   private idleMsAccum = 0;
@@ -114,8 +112,6 @@ export class Kinematics {
     this.dist.fill(0);
     this.writeIdx = 0;
     this.samplesSeen = 0;
-    this.shakeStarted = false;
-    this.lastMotionMs = 0;
     this.lastTickMs = 0;
     this.firstTick = true;
     this.idleMsAccum = 0;
@@ -125,9 +121,10 @@ export class Kinematics {
     };
   }
 
-  // Feed a pointer motion event. (x, y) in output-space pixels;
-  // timeMs is the event timestamp. No-op when disabled.
-  update(x: number, y: number, timeMs: number): void {
+  // Feed a pointer motion event. (x, y) in output-space pixels. The event
+  // timestamp is accepted for signature stability but unused: idle time is
+  // tracked by tick(), and velocity assumes sampleHz spacing.
+  update(x: number, y: number, _timeMs: number): void {
     if (this.enableRefCount === 0) return;
     // Distance from the previous sample (for the shake trail).
     const prevIdx = (this.writeIdx + this.ringSize - 1) % this.ringSize;
@@ -140,7 +137,6 @@ export class Kinematics {
     this.writeIdx = (this.writeIdx + 1) % this.ringSize;
     if (this.samplesSeen < this.ringSize) this.samplesSeen += 1;
 
-    this.lastMotionMs = timeMs;
     this.idleMsAccum = 0;
     this.snap.idleMs = 0;
 
@@ -196,7 +192,6 @@ export class Kinematics {
     if (n < 2) {
       this.snap.shake = false;
       this.snap.shakeIntensity = 0;
-      this.shakeStarted = false;
       return;
     }
     const cur = (this.writeIdx + this.ringSize - 1) % this.ringSize;
@@ -223,6 +218,5 @@ export class Kinematics {
     }
     this.snap.shake = shake;
     this.snap.shakeIntensity = intensity;
-    this.shakeStarted = shake;
   }
 }

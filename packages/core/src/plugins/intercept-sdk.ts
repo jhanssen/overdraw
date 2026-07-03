@@ -66,10 +66,8 @@ export function createInThreadInterceptSdk(deps: InThreadInterceptDeps): Interce
 // overlay + compose-live paths use.
 
 import type { Endpoint, Json } from "./protocol.js";
-import {
-  SlotStates, SLOT_FREE, SLOT_PRESENTED,
-} from "./surface-slots.js";
-import { SurfaceConsumer, SurfaceProducer, awaitPresentedSlot } from "./surface-ring.js";
+import { SlotStates } from "./surface-slots.js";
+import { SurfaceConsumer, SurfaceProducer } from "./surface-ring.js";
 import { log } from "../log.js";
 
 export interface WorkerInterceptDeps {
@@ -471,7 +469,7 @@ class WorkerPerSurfaceState {
   }
 
   private async runLoop(): Promise<void> {
-    const { handlers, deps } = this.cfg;
+    const { handlers } = this.cfg;
     while (!this.stopped) {
       // Wait until the input ring has a PRESENTED slot (core has
       // copied a fresh client texture into it).

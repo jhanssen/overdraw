@@ -68,7 +68,7 @@ export function configurePopup(ctx: Ctx, pr: PopupRecord): void {
   // output 0's right edge, so every candidate position is "outside" and
   // slide_x clamps left, landing the popup far to the left of the
   // parent on the wrong monitor).
-  const parentSurfaceRes = parentSurfaceResourceOf(ctx.state, pr);
+  const parentSurfaceRes = parentSurfaceResourceOf(pr);
   const parentOutputId = parentSurfaceRes
     ? primaryOutputOfSurface(ctx.state, parentSurfaceRes)
     : primaryOutputId(ctx.state);
@@ -94,9 +94,7 @@ export function configurePopup(ctx: Ctx, pr: PopupRecord): void {
 // The wl_surface this popup is parented to: the root toplevel's wl_surface,
 // the immediate parent popup's wl_surface, or the layer parent's wl_surface.
 // Returns null only for malformed records (no resolvable parent).
-function parentSurfaceResourceOf(
-  state: CompositorState, pr: PopupRecord,
-): Resource | null {
+function parentSurfaceResourceOf(pr: PopupRecord): Resource | null {
   if (pr.layerParent) return pr.layerParent.surface.resource;
   if (pr.parent && pr.parent.surface) return pr.parent.surface.resource;
   return null;

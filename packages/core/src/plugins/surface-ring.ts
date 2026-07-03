@@ -26,7 +26,7 @@
 // the abstractions don't bake in which addon (core's overdraw_native vs the
 // plugin's overdraw_plugin_native) or which device (core's vs the worker's).
 
-import { SlotStates, SLOT_FREE, SLOT_PRESENTED } from "./surface-slots.js";
+import { SlotStates } from "./surface-slots.js";
 import { log } from "../log.js";
 
 // --- shared types ------------------------------------------------------------

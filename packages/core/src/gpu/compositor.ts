@@ -1112,7 +1112,6 @@ export class JsCompositor implements CompositorSink {
   // and dev both run !headless.
   private headless: boolean;
   private format: GPUTextureFormat;
-  private outputTex: GPUTexture | null = null;  // wrapped output texture, held during a frame
   // Output damage for an shm fast-path commit, deferred until its async upload
   // acks (keyed by uploadSeq). Damaging at commit time would repaint -- and
   // sample -- the texture before the GPU process has written it. Drained in
@@ -3338,7 +3337,6 @@ export class JsCompositor implements CompositorSink {
         if (t.present) { this.addon.presentOutput(t.ctx.id); this.presentedOutputs.add(t.ctx.id); }
         this.outputDamage.clearDirty(t.ctx.id);
       }
-      this.outputTex = null;
     } catch (e) {
       // If anything threw between frameStart and submitted, close any begin
       // brackets that DID open (the GPU process's wire-side Begin/End

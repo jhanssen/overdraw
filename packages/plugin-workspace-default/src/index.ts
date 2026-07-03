@@ -962,7 +962,3 @@ function parseSetNameParams(
   return { index: base.index, name, outputId: base.outputId };
 }
 
-// Silence unused-warning for the WorkspaceHandle import (it's part of the
-// runtime contract via state-bag entries but the type isn't referenced in
-// signatures here).
-type _UnusedHandle = WorkspaceHandle;

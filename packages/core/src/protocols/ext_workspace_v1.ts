@@ -68,7 +68,7 @@ const WS_STATE = wsSig.enums.state.entries;
 const WS_CAPS = wsSig.enums.workspace_capabilities.entries;
 //   { activate: 1, deactivate: 2, remove: 4, assign: 8 }
 
-import type { Ctx, CompositorState } from "./ctx.js";
+import type { Ctx } from "./ctx.js";
 import type { Resource } from "../types.js";
 import { log } from "../log.js";
 
@@ -670,7 +670,7 @@ export default function makeExtWorkspaceManager(ctx: Ctx): ManagerHandlerExt {
   };
 }
 
-export function makeExtWorkspaceGroupHandle(ctx: Ctx): ExtWorkspaceGroupHandleV1Handler {
+export function makeExtWorkspaceGroupHandle(_ctx: Ctx): ExtWorkspaceGroupHandleV1Handler {
   return {
     create_workspace(resource: ExtWorkspaceGroupHandleV1Resource, workspace: string): void {
       const owner = handleOwners.get(resource);
@@ -691,7 +691,7 @@ export function makeExtWorkspaceGroupHandle(ctx: Ctx): ExtWorkspaceGroupHandleV1
   };
 }
 
-export function makeExtWorkspaceHandle(ctx: Ctx): ExtWorkspaceHandleV1Handler {
+export function makeExtWorkspaceHandle(_ctx: Ctx): ExtWorkspaceHandleV1Handler {
   return {
     activate(resource: ExtWorkspaceHandleV1Resource): void {
       const owner = handleOwners.get(resource);

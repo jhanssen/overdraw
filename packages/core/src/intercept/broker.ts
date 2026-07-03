@@ -16,7 +16,7 @@ import type { CompositorBus } from "../events/window-bus.js";
 import type { CompositorSink } from "../protocols/ctx.js";
 import { WINDOW_EVENT } from "../events/types.js";
 import {
-  MatchEngine, compileAppIdRegex, type RegistrationData, type MatchEvent,
+  MatchEngine, compileAppIdRegex, type MatchEvent,
   type ToplevelData,
 } from "./match-engine.js";
 import {

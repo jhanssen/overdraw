@@ -95,7 +95,6 @@ export class WorkerInterceptState {
   // Input ring (core produces, plugin consumes).
   private inputSlotBufIds: number[] = [];
   private inputSlotTextures: (GPUTexture | null)[] = [];
-  private inputSlotViews: (GPUTextureView | null)[] = [];
   private inputSlotStates: SlotStates | null = null;
   private inputSab: SharedArrayBuffer | null = null;
   private inputProducer: SurfaceProducer | null = null;
@@ -157,7 +156,6 @@ export class WorkerInterceptState {
       this.inputSlotBufIds.push(r.surfaceBufId);
     }
     this.inputSlotTextures = new Array(SLOTS).fill(null);
-    this.inputSlotViews = new Array(SLOTS).fill(null);
     const inputSlots = createSlotStates(SLOTS);
     this.inputSab = inputSlots.sab;
     this.inputSlotStates = new SlotStates(this.inputSab);

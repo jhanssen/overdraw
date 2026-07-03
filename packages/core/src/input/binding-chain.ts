@@ -140,8 +140,6 @@ const ESCAPE_KEYSYM = 0xff1b;
 // no binding would ever match. Strip them for comparison.
 const IGNORED_MODS = MOD_LOCK | MOD_MOD2;
 
-export type ModeStackName = string;
-
 // Emitted by the chain to a caller-supplied callback. The seat plumbs these
 // to the plugin bus so a status bar can observe.
 export type ChainEvent =

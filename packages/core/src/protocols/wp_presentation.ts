@@ -64,7 +64,7 @@ export default function makeWpPresentation(ctx: Ctx): WpPresentationHandlerWithB
       ctx.events.wp_presentation.send_clock_id(presentation, CLOCK_MONOTONIC);
     },
     destroy(_resource) { /* destructor */ },
-    feedback(presentation, surface, callback) {
+    feedback(_presentation, surface, callback) {
       const s = ctx.state.surfaces.get(surface);
       if (!s) {
         // Surface destroyed in flight; the callback is dead on arrival.
@@ -161,28 +161,5 @@ export function dispatchPresentationFeedbackForOutput(
         cb, tvSecHi, tvSecLo, tvNsec, refresh, seqHi, seqLo, flags);
       addon.destroyResource(cb);
     }
-  }
-}
-
-// Fire `discarded` on every queued feedback for a surface that's tearing
-// down. Called from the unmap / surface-destroy path so a destroyed surface
-// doesn't leak feedback resources.
-export function discardPresentationFeedbacks(ctx: Ctx, s: SurfaceRecord): void {
-  const fbs = s.presentationFeedbacks;
-  if (!fbs) return;
-  for (const cb of fbs) {
-    if (cb.destroyed) continue;
-    ctx.events.wp_presentation_feedback.send_discarded(cb);
-    ctx.addon.destroyResource(cb);
-  }
-  s.presentationFeedbacks = undefined;
-  const pend = s.pending.presentationFeedbacks;
-  if (pend) {
-    for (const cb of pend) {
-      if (cb.destroyed) continue;
-      ctx.events.wp_presentation_feedback.send_discarded(cb);
-      ctx.addon.destroyResource(cb);
-    }
-    s.pending.presentationFeedbacks = undefined;
   }
 }

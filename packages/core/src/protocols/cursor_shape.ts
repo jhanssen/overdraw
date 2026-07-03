@@ -133,7 +133,6 @@ export function makeCursorShapeDevice(ctx: Ctx): WpCursorShapeDeviceV1Handler {
       // each time; setClientCursor's surface-pointer path is for client-
       // owned wl_surfaces. We still update setClientCursor so the seat
       // can re-apply it on focus changes.
-      const clientId = ctx.addon.clientId(resource);
       ctx.state.compositor.setCursorPixels?.(
         r.rgba, r.width, r.height, r.hotspotX, r.hotspotY);
       ctx.state.compositor.setCursorVisible?.(true);

@@ -266,11 +266,6 @@ uint32_t xwmInternAtom(XwmConn* x, const char* name);
 // client). Returns a cookieId; the reply arrives as AtomNameReply.
 uint32_t xwmGetAtomName(XwmConn* x, uint32_t atom);
 
-// Flush pending xcb writes. Most request wrappers flush themselves; this
-// is for callers that issue several writes back-to-back and want one
-// explicit flush.
-void xwmFlush(XwmConn* x);
-
 // Replace the event mask on an arbitrary X window. The selection bridge uses
 // this to subscribe to PROPERTY_CHANGE on client-owned requestor windows so
 // it can observe PropertyNotify(Delete) -- the INCR-continuation signal.

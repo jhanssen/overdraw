@@ -11,7 +11,7 @@
 
 import type { CompositorBus } from "./events/window-bus.js";
 import {
-  WINDOW_EVENT, DECORATION_EVENT,
+  WINDOW_EVENT,
 } from "./events/types.js";
 import type {
   WindowMapEvent, WindowChangeEvent, WindowUnmapEvent,

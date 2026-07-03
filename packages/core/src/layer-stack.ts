@@ -29,15 +29,10 @@ export function protocolLayerToCompositorLayer(layer: LayerShellLayer): Exclude<
 const NON_CONTENT_LAYERS: ReadonlyArray<Exclude<Layer, "content">> =
   ["background", "below", "above", "overlay"];
 
-// Accessor a producer publishes on `state` so the rebuild can read its
-// per-layer ordered list. The overlay broker installs `overlayLayerIds`;
-// the layer-shell handler reads its surfaces directly from
-// `state.layerSurfaces` so it doesn't need a separate accessor.
-export interface LayerStackProducers {
-  overlayLayerIds?: (layer: Exclude<Layer, "content">) => number[];
-}
-
-// Compute the merged ordered id list for one compositor layer.
+// Compute the merged ordered id list for one compositor layer. The overlay
+// broker publishes its per-layer ordered list via `state.overlayLayerIds`;
+// the layer-shell handler's surfaces are read directly from
+// `state.layerSurfaces`.
 function computeLayerIds(state: CompositorState, layer: Exclude<Layer, "content">): number[] {
   const ids: number[] = [];
   const overlayIds = state.overlayLayerIds?.(layer);

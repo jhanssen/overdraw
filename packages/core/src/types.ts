@@ -44,10 +44,8 @@ export interface Addon {
   // Spawn a client that dies with the compositor (PR_SET_PDEATHSIG): argv
   // excludes argv0, env is a list of "KEY=VALUE" overrides on the inherited
   // environment. Returns the child pid, or -1 on fork failure. Exited children
-  // are reaped from a SIGCHLD watcher on the event loop; reapChildren forces a
-  // sweep if ever needed.
+  // are reaped from a SIGCHLD watcher on the event loop.
   spawnChild(command: string, argv: string[], env: string[]): number;
-  reapChildren(): void;
 
   registerProtocols(signatures: unknown[]): void;
   registerInterface(name: string, handler: unknown): void;
@@ -157,7 +155,6 @@ export interface Addon {
   // Async atom-name lookup. Returns a cookieId; reply arrives as an
   // "atom-name-reply" event with the same cookieId carrying `name`.
   xwmGetAtomName(atom: number): number;
-  xwmFlush(): void;
   // Replace the event mask on a non-bridge-owned X window (typically a
   // client-owned requestor). Selecting our own mask is independent of any
   // mask the owning client has selected. The bridge uses this for

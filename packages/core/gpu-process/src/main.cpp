@@ -467,17 +467,14 @@ int run(int wireFd, int ctrlFd, int inputFd, bool headless,
     // Nested bring-up.
     // SurfaceReady: tell the core the surface is "ready" with the window's
     // logical size. The surface handle is zero (no wgpu::Surface created;
-    // see above), the format / presentMode / alphaMode fields are ignored
-    // by the core's bringUp once it sees a zero handle. (The
-    // wp_linux_drm_syncobj_v1 dance Mesa would have set up if we'd created
-    // the WSI surface is also skipped, which is the point.)
+    // see above); the core's bringUp skips WSI configuration once it sees
+    // a zero handle. (The wp_linux_drm_syncobj_v1 dance Mesa would have
+    // set up if we'd created the WSI surface is also skipped, which is
+    // the point.)
     {
         ipc::Message m{};
         m.tag = ipc::Tag::SurfaceReady;
         m.surface = {0, 0};  // no WSI surface
-        m.format = 0;
-        m.presentMode = 0;
-        m.alphaMode = 0;
         m.width = outW();
         m.height = outH();
         ipc::sendMessage(ctrlFd, m);

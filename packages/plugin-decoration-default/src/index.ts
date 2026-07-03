@@ -39,7 +39,7 @@ import {
 import {
   createDecorationPipeline, createDecorationDraw, destroyDecorationDraw,
   writeBorderUniforms, writeBlitUniforms, encodeFrame,
-  type DecorationPipeline, type DecorationDraw,
+  type DecorationDraw,
 } from "./render.js";
 
 interface PerWindow {

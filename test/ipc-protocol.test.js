@@ -5,7 +5,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 
 import {
-  parseMessage, isRequest, isNotification, ok, err, notify, encode, JSONRPC_ERRORS,
+  parseMessage, isRequest, ok, err, notify, encode, JSONRPC_ERRORS,
 } from '../packages/core/dist/ipc/protocol.js';
 
 // --- parseMessage ---------------------------------------------------------
@@ -54,25 +54,6 @@ test('isRequest: null / array / non-object -> false', () => {
   assert.equal(isRequest(null), false);
   assert.equal(isRequest([]), false);
   assert.equal(isRequest('string'), false);
-});
-
-// --- isNotification -------------------------------------------------------
-
-test('isNotification: valid notification returns true', () => {
-  assert.equal(isNotification({ jsonrpc: '2.0', method: 'x' }), true);
-  assert.equal(isNotification({ jsonrpc: '2.0', method: 'x', params: { y: 1 } }), true);
-});
-
-test('isNotification: id present -> false (it is a request)', () => {
-  assert.equal(isNotification({ jsonrpc: '2.0', id: 1, method: 'x' }), false);
-});
-
-test('isNotification: missing method -> false', () => {
-  assert.equal(isNotification({ jsonrpc: '2.0' }), false);
-});
-
-test('isNotification: missing jsonrpc -> false', () => {
-  assert.equal(isNotification({ method: 'x' }), false);
 });
 
 // --- ok / err / notify ----------------------------------------------------

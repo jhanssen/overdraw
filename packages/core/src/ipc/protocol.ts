@@ -89,13 +89,6 @@ export function isRequest(m: unknown): m is Request {
   return true;
 }
 
-export function isNotification(m: unknown): m is Notification {
-  if (!isJsonRpcShape(m)) return false;
-  const o = m as { [k: string]: unknown };
-  if (typeof o.method !== "string" || o.method.length === 0) return false;
-  return !("id" in o);
-}
-
 function isJsonRpcShape(m: unknown): m is { [k: string]: unknown } {
   return typeof m === "object" && m !== null && !Array.isArray(m)
     && (m as { jsonrpc?: unknown }).jsonrpc === "2.0";

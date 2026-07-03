@@ -11,7 +11,6 @@
 
 import type {
   LayoutAPI, LayoutInputs, LayoutResult, LayoutParamUpdate, LayoutParamSnapshot,
-  LayoutPluginConfig,
 } from "@overdraw/layout-types";
 import { masterStackLayout, DEFAULT_LAYOUT, type LayoutParams } from "./master-stack.js";
 

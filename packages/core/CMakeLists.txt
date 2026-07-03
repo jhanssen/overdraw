@@ -45,6 +45,11 @@ endif()
 # Dawn is built -fno-rtti; match it to avoid typeinfo mismatches.
 add_compile_options($<$<COMPILE_LANGUAGE:CXX>:-fno-rtti>)
 
+# Clang-only: flags write-only private members (GCC has no equivalent).
+if (CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+    add_compile_options($<$<COMPILE_LANGUAGE:CXX>:-Wunused-private-field>)
+endif()
+
 # Shared IPC headers (side-channel protocol + transport).
 set(IPC_INCLUDE ${CMAKE_SOURCE_DIR}/native/ipc)
 set(NATIVE_INCLUDE ${CMAKE_SOURCE_DIR}/native)

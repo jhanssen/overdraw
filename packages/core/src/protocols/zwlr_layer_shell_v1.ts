@@ -51,7 +51,6 @@ import {
   resolveExclusiveEdge,
   computeReservedThickness,
   isValidAnchor,
-  ANCHOR_TOP, ANCHOR_BOTTOM, ANCHOR_LEFT, ANCHOR_RIGHT,
 } from "./layer-shell-position.js";
 
 import { rebuildLayerStack, protocolLayerToCompositorLayer } from "../layer-stack.js";

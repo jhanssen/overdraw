@@ -252,7 +252,7 @@ export function dispatchCaptureForOutput(
   for (const f of armed) {
     f.armed = false;
     if (f.resource.destroyed || !f.buffer || f.buffer.destroyed) continue;
-    const ok = captureOneFrame(ctx, f, outputId, tvSec, tvNsec);
+    const ok = captureOneFrame(ctx, f, tvSec, tvNsec);
     if (!ok) {
       // captureOneFrame already sent failed; just clear the active frame.
       if (f.session.activeFrame === f.resource) f.session.activeFrame = null;
@@ -263,7 +263,7 @@ export function dispatchCaptureForOutput(
 // Drive a single capture. Returns true on success (ready sent), false on
 // failure (failed already sent).
 function captureOneFrame(
-  ctx: Ctx, f: FrameRecord, outputId: number, tvSec: bigint, tvNsec: number,
+  ctx: Ctx, f: FrameRecord, tvSec: bigint, tvNsec: number,
 ): boolean {
   const session = f.session;
   const buf = f.buffer;

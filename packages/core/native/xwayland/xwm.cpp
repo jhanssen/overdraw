@@ -690,10 +690,6 @@ uint32_t xwmGetAtomName(XwmConn* x, uint32_t atom) {
     return p.cookieId;
 }
 
-void xwmFlush(XwmConn* x) {
-    if (x->conn) xcb_flush(x->conn);
-}
-
 void xwmSelectWindowEvents(XwmConn* x, uint32_t window, uint32_t mask) {
     if (!x->conn || window == 0) return;
     const uint32_t values[1] = { mask };

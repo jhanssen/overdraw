@@ -140,13 +140,6 @@ napi_value SpawnChild(napi_env env, napi_callback_info info) {
     return out;
 }
 
-napi_value ReapChildren(napi_env env, napi_callback_info) {
-    reapTracked();
-    napi_value undef;
-    napi_get_undefined(env, &undef);
-    return undef;
-}
-
 void onSigchld(uv_signal_t*, int /*signum*/) {
     reapTracked();
 }
@@ -160,7 +153,6 @@ void RegisterSpawn(napi_env env, napi_value exports) {
         napi_set_named_property(env, exports, name, f);
     };
     reg("spawnChild", SpawnChild);
-    reg("reapChildren", ReapChildren);
 
     // Reap spawn children on SIGCHLD via the node event loop. uv_signal_t
     // multiplexes with libuv's own SIGCHLD use, so this does not disturb node's

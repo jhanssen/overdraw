@@ -40,7 +40,6 @@ void KmsOutputBackend::close() {
         gbm_device_destroy(gbm_);
         gbm_ = nullptr;
     }
-    deviceId_ = 0;
 }
 
 bool KmsOutputBackend::open(const char* /*title*/) {
@@ -52,10 +51,6 @@ bool KmsOutputBackend::open(const char* /*title*/) {
     // 1: drmFd already received from the core.
     // 2-3: enable atomic + universal-planes caps.
     if (!enableDrmAtomicCaps(drmFd_)) return false;
-
-    // Record the card's dev_t for dmabuf-feedback / adapter sanity check.
-    struct stat st{};
-    if (::fstat(drmFd_, &st) == 0) deviceId_ = static_cast<uint64_t>(st.st_rdev);
 
     // 4: pick the primary connector (env var OVERDRAW_CONNECTOR may pin a name).
     DrmTopology primaryTopo{};

@@ -9,7 +9,7 @@
 // plugin in the same namespace.
 
 import type {
-  KeyboardConfig, BindingSpec, ModeSpec,
+  BindingSpec, ModeSpec,
 } from "@overdraw/hotkey-types";
 
 interface SdkLike {

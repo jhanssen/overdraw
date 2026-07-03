@@ -97,7 +97,9 @@ class KmsOutputBackend : public OutputBackend {
     int drmFd() const { return drmFd_; }
     void pump() override;
     bool shouldClose() const override { return shouldClose_; }
-    void setResizeListener(ResizeListener cb) override { resizeListener_ = std::move(cb); }
+    // KMS output resizes (mode switches) propagate to the core via the
+    // ScanoutRebuild wire frame, not this listener; accept and discard.
+    void setResizeListener(ResizeListener) override {}
 
     // Callback invoked when a page-flip retires a slot on some output. Carries
     // the dense outputId that flipped and the slot index that just exited
@@ -121,11 +123,6 @@ class KmsOutputBackend : public OutputBackend {
     // idempotent.
     void pause();
     void resume();
-
-    // The card's dev_t (for the dmabuf-feedback main_device + sanity-check
-    // that Dawn picked an adapter on the same physical GPU). 0 if open()
-    // didn't succeed.
-    uint64_t deviceId() const { return deviceId_; }
 
     // Rescan result: which outputIds vanished and which were freshly
     // created. The caller (GPU process main loop) uses these to send the
@@ -240,7 +237,6 @@ class KmsOutputBackend : public OutputBackend {
 
     int drmFd_ = -1;   // borrowed; not closed
     gbm_device* gbm_ = nullptr;
-    uint64_t deviceId_ = 0;
     bool shouldClose_ = false;
     bool paused_ = false;
     std::unordered_map<uint32_t, std::unique_ptr<PerOutput>> outputs_;
@@ -248,7 +244,6 @@ class KmsOutputBackend : public OutputBackend {
     // (insert) / disconnectOutput (erase). connectOutput passes a transient
     // vector view of this set into the existing pickCrtc helper.
     std::unordered_set<uint32_t> usedCrtcs_;
-    ResizeListener resizeListener_;
     FlipCompleteCb flipCompleteListener_;
 };
 

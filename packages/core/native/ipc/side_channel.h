@@ -28,9 +28,13 @@ enum class Tag : uint8_t {
     FeedbackData = 'F',  // gpu  -> core: dmabuf-feedback data (main_device dev_t +
                          //              format_table entry count); the format_table
                          //              memfd rides as SCM_RIGHTS on the same msg
-    ImportClientTex = 'M',  // core -> gpu : import a CLIENT dmabuf fd (SCM_RIGHTS) into
-                            //              a texture at the reserved handle
-    ClientTexImported = 'm',  // gpu -> core: client dmabuf imported + injected (or failed)
+    ImportClientTex = 'M',  // Bridge tag only: the import request rides the WIRE
+                            //   (FrameKind::ImportClientTex); the GPU process
+                            //   synthesizes a Message with this tag to reuse the
+                            //   shared import path. Never sent on the ctrl socket.
+                            //   The reply rides the wire too
+                            //   (FrameKind::ClientTexImported); its retired ctrl
+                            //   letter 'm' must not be reused.
     // The per-frame CLIENT-dmabuf BeginAccess/EndAccess bracket is multiplexed
     // in-band on the WIRE socket as a kind=1/kind=2 frame (see transport.h
     // FrameKind + ClientTexAccessPayload below), FIFO-ordered against the Dawn
@@ -88,15 +92,11 @@ enum class Tag : uint8_t {
                          //   BEFORE Hello when --output=kms; the GPU process refuses
                          //   to start the output backend until it arrives.
                          //   See drm-design.md "Seat / VT lifecycle".
-    ScanoutReserve  = 'Z',  // core -> gpu: the core has ReserveTexture'd three wire
-                            //   handles (sent as `scanoutHandles[3]` on this msg).
-                            //   The GPU process completes its DRM/GBM/STM bring-up
-                            //   and InjectTexture's the three scanout-ring textures
-                            //   at the matching handles. width/height carry the
-                            //   scanout dims (chosen by the connector's mode).
-    ScanoutReady    = 'y',  // gpu -> core: the scanout ring is built and injected
-                            //   at the three reserved handles. ok=1 success, 0 failure.
-                            //   Sent once during bring-up.
+    // ScanoutReserve / ScanoutReady (the scanout-ring reservation handshake)
+    // ride the WIRE socket as FrameKind::ScanoutReserve / ScanoutReady
+    // (transport.h) so followup ProducerBegin frames are FIFO-ordered after
+    // the InjectTexture work. Retired ctrl letters (do not reuse): 'Z'
+    // ScanoutReserve, 'y' ScanoutReady.
     // ScanoutPresent (the per-frame flip request) rides the WIRE socket as
     // FrameKind::ScanoutPresent (transport.h). The wire-FIFO ordering is
     // load-bearing: the flip must land AFTER the slot's render submit and
@@ -173,9 +173,6 @@ struct Message {
     WireHandle surface;    // DeviceReady, SurfaceReady
     WireHandle texture;    // ImportClientTex, ClientTexImported, ReleaseClientTex
 
-    uint32_t format = 0;       // SurfaceReady: WGPUTextureFormat
-    uint32_t presentMode = 0;  // SurfaceReady: WGPUPresentMode
-    uint32_t alphaMode = 0;    // SurfaceReady: WGPUCompositeAlphaMode
     uint32_t width = 0;        // HelloReply, SurfaceReady
     uint32_t height = 0;       // HelloReply, SurfaceReady
 
@@ -189,7 +186,6 @@ struct Message {
     uint32_t planeOffset = 0;  // plane 0 byte offset within the dmabuf
     uint32_t planeStride = 0;  // plane 0 row stride
     uint32_t planeCount = 0;   // number of planes (1 supported today)
-    uint32_t importOk = 0;     // ClientTexImported: 1 = injected, 0 = import failed
 
     // FeedbackData: dmabuf-feedback default-feedback data. mainDevice is the DRM
     // device dev_t; entryCount is the number of 16-byte format_table records in
@@ -203,38 +199,9 @@ struct Message {
     uint32_t connId = 0;
     uint32_t ok = 0;
 
-    // AllocSurfaceBuf: the plugin (producer) device + reserved texture handle, on
-    // the plugin wire connection (`connId`). The core (consumer) device + reserved
-    // texture handle use the `device`/`texture` fields above. `width`/`height`/
-    // `format` describe the buffer.
-    WireHandle pluginDevice;
-    WireHandle pluginTexture;
-    // SurfaceBufAllocated: an id naming this server-allocated surface buffer, for
-    // the core's later Begin/EndAccess (which side, plugin vs core, is implied by
-    // the access message). Assigned by the core in the request; echoed back.
+    // ScanoutFlipComplete: the ring slot index that just exited SCANOUT
+    // (now FREE); the core advances its slot state machine off it.
     uint32_t surfaceBufId = 0;
-
-    // ImportClientTex: cross-channel ordering serial. The GPU process must not
-    // act on this request until its wire reader has consumed at least this many
-    // framed wire bytes (so all wire commands the inject depends on -- the prior
-    // texture's UnregisterObjectCmd that recycled this handle id, object creates,
-    // etc. -- have been handed to the wire server). Sampled by the core from
-    // FdSerializer::bytesQueued() right after flushing the reserve.
-    //
-    // For AllocSurfaceBuf this names the CORE wire reader (the core reserved the
-    // consumer texture); for ProducerEnd, the PLUGIN wire reader (plugin render
-    // commands ride that wire). See `reservePointSerial` for the PLUGIN-wire side
-    // of AllocSurfaceBuf (the producer texture).
-    uint64_t wireSerial = 0;
-
-    // AllocSurfaceBuf: cross-channel ordering serial on the PLUGIN wire connection.
-    // The plugin worker sampled its own FdSerializer::bytesQueued() right after
-    // flushing the producer-texture reserve; the GPU process must not InjectTexture
-    // at the producer handle until its plugin-conn wire reader has consumed at
-    // least this many framed bytes (so the prior UnregisterObjectCmd that recycled
-    // this id has been applied and the new ReserveTexture is in). Independent of
-    // `wireSerial` above, which is the CORE-wire serial for the consumer texture.
-    uint64_t reservePointSerial = 0;
 
     // OutputDescriptor: the output's identity + geometry. Width/height (above,
     // shared with HelloReply/SurfaceReady) carry the logical pixel size of the
@@ -272,17 +239,6 @@ struct Message {
     // to reserve before the first descriptor's reply path proceeds. 0 means
     // unset (the core falls back to a single output).
     uint32_t outputCount = 0;
-
-    // ScanoutReserve: the three texture wire handles (id+generation) the core
-    // ReserveTexture'd for the KMS scanout ring slots, plus the three
-    // surfaceBufId values the core assigned for in-band access brackets on
-    // them. The GPU process InjectTexture's each ring slot's wgpu::Texture
-    // at the matching handle AND registers each surfaceBufId as a SurfaceBuf
-    // (producerOnCore=true, consumer side null) so the existing in-band
-    // BeginAccess/EndAccess machinery covers scanout brackets too. Width/
-    // height (above) carry the scanout dims.
-    WireHandle scanoutHandles[3] = {};
-    uint32_t   scanoutBufIds[3]  = {};
 
     // ScanoutFlipComplete / FrameComplete: presentation-time data for the
     // just-retired frame, used to drive wp_presentation. tv_sec is the
