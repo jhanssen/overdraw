@@ -52,6 +52,8 @@ const pAllocCompose = (
 // struct is the CONSUMER half on the core side.
 interface OverlaySurface {
   surfaceId: number;      // compositor surface id (== overlay broker id)
+  owner: string;          // plugin name (frame-tick delivery target)
+  outputId: number | null; // anchored overlay's output; null = caller-owned rect
   width: number;
   height: number;
   slots: number[];        // surfaceBufIds, indexed by ring-slot index
@@ -90,6 +92,18 @@ export interface GpuBrokerDeps {
   //  - onSurfacePresented: a surface received a frame (called every present).
   onSurfaceAllocated?: (surfaceId: number, decoratesWindowId: number) => void;
   onSurfacePresented?: (surfaceId: number) => void;
+  // Live output enumeration for gpu.listOutputs (id + global logical rect +
+  // scale + name). Injected by main.ts from state.outputs; harnesses that
+  // don't wire it report no outputs.
+  listOutputs?: () => Array<{
+    id: number; x: number; y: number; width: number; height: number;
+    scale: number; name: string;
+  }>;
+  // Frame-tick service + the plugin push channel (surface.onFrame). Both
+  // injected by main.ts; harnesses that don't exercise onFrame leave them
+  // unset and surface.requestFrame becomes a no-op.
+  frameTicks?: import("./frame-ticks.js").OverlayFrameTicks;
+  emitToPlugin?: (pluginName: string, name: string, data: import("./protocol.js").Json) => void;
 }
 
 export interface GpuBroker {
@@ -160,6 +174,8 @@ export function createGpuBroker(deps: GpuBrokerDeps): GpuBroker {
       case "gpu.setTickDevice":
         addon.pluginSetTickDevice(p.connId as number, p.id as number, p.generation as number);
         return null;
+      case "gpu.listOutputs":
+        return deps.listOutputs?.() ?? [];
       case "surface.alloc": {
         // Core decides the rect + layer (overlay broker) and assigns the surface
         // id. Two geometry sources: an EXPLICIT rect (decorations -- the core
@@ -180,6 +196,7 @@ export function createGpuBroker(deps: GpuBrokerDeps): GpuBroker {
             : overlays.create(pluginName, {
                 layer: (p.layer as OverlayLayer) ?? "overlay",
                 anchor: (p.anchor as OverlayAnchor) ?? "center", width, height, margin: p.margin as number,
+                output: p.output as number | undefined,
               });
         // Shared slot-ownership state (SAB) for this surface's ring. Shared to the
         // Worker in the response; both sides agree on FREE/ACQUIRED/PRESENTED/
@@ -215,7 +232,8 @@ export function createGpuBroker(deps: GpuBrokerDeps): GpuBroker {
           },
         });
         const surf: OverlaySurface = {
-          surfaceId: handle.surfaceId, width, height,
+          surfaceId: handle.surfaceId, owner: pluginName, outputId: handle.outputId,
+          width, height,
           slots: slotBufIds, slotTextures, slotStates, consumer,
           alive: true,
         };
@@ -224,7 +242,7 @@ export function createGpuBroker(deps: GpuBrokerDeps): GpuBroker {
         // If this surface decorates a window, tell the decoration layer the link
         // (generic tag; the broker does not interpret it).
         if (typeof decorates === "number") onSurfaceAllocated(handle.surfaceId, decorates);
-        return { overlayId: handle.surfaceId, rect: handle.rect, slotsSab: sab };
+        return { overlayId: handle.surfaceId, rect: handle.rect, outputId: handle.outputId, slotsSab: sab };
       }
       case "surface.bindProducer": {
         const overlayId = p.overlayId as number;
@@ -553,10 +571,23 @@ export function createGpuBroker(deps: GpuBrokerDeps): GpuBroker {
         }
         return null;
       }
+      case "surface.requestFrame": {
+        // Arm a one-shot vblank tick (surface.onFrame). Delivery is a
+        // postMessage event to the owning plugin; the idle force-present in
+        // frame-ticks guarantees a flip is coming even on an idle output.
+        const surf = surfaces.get(p.overlayId as number);
+        if (!surf || !surf.alive) return null;   // destroyed: silently drop
+        const { surfaceId, owner } = surf;
+        deps.frameTicks?.arm(surfaceId, surf.outputId, (timeMs) => {
+          deps.emitToPlugin?.(owner, "gpu.surface.frame", { surfaceId, timeMs });
+        });
+        return null;
+      }
       case "surface.destroy": {
         const surfaceId = p.overlayId as number;
         const surf = surfaces.get(surfaceId);
         if (!surf) return null;   // already destroyed / unknown
+        deps.frameTicks?.drop(surfaceId);
         // Mark dead NOW (synchronously) so any pending deferred recycle bails before
         // touching slots the teardown is about to free.
         surf.alive = false;

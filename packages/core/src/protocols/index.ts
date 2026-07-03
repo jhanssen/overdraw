@@ -468,6 +468,11 @@ export async function installProtocols(
   // complete; the idle frame-callback path skips it so it doesn't deliver ahead
   // of the flip.
   const awaitingFlip = new Set<number>();
+  // Published read-only so peer subsystems pacing off the same flips (plugin
+  // overlay frame ticks) share this set instead of double-tracking it (the
+  // compositor's takePresentedOutputs drain is destructive; only one consumer
+  // can own it).
+  state.awaitingFlipOutputs = awaitingFlip;
 
   // Fire pending wl_surface.frame callbacks. Clients drive their render loop off
   // these (commit -> request frame -> draw next frame on done), so without this

@@ -584,9 +584,14 @@ with input routed per the plugin's declaration.** Decorations follow by adding
 Three things the plugin tells the core (declarations / requests):
 
 - **Overlay placement** (free-floating use): `createOverlay({ layer, anchor,
-  size })` -> core returns the actual rect + the allocated surface. `layer` is
-  the stack-layer (below); `anchor`/`size` are a request the core may clamp to
-  the output.
+  size, output? })` -> core returns the actual rect (global logical
+  coordinates) + the allocated surface. `layer` is the stack-layer (below);
+  `anchor`/`size` are a request the core may clamp to the target output.
+  `output` picks the output (default primary; enumerate via
+  `gpu.listOutputs()`); the overlay is anchored within that output's global
+  rect. When the output is removed the core drops the overlay from
+  compositing; the plugin observes `output.pre-remove`/`output.removed` on
+  the bus and destroys its surface (idempotent against the core-side drop).
 - **Decoration insets** (window-bound use): `requestInsets(windowId,
   {top,right,bottom,left})` -> core reserves that edge space, recomputes the
   window's inner (content) rect, and returns the actual insets + the decoration

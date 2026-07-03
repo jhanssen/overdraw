@@ -184,18 +184,6 @@ function safeStringify(v, maxLen = Infinity) {
 
 // Count live GPU processes by EXACT comm (truncated to "overdraw-gpu-pr"), per
 // the project's process-management rules -- never pgrep by name.
-function countGpuProcs() {
-  let n = 0;
-  for (const ent of readdirSync("/proc")) {
-    if (!/^\d+$/.test(ent)) continue;
-    try {
-      const comm = readFileSync(`/proc/${ent}/comm`, "utf8").trim();
-      if (comm === "overdraw-gpu-pr") n++;
-    } catch { /* pid vanished */ }
-  }
-  return n;
-}
-
 // PIDs of live GPU processes (exact comm "overdraw-gpu-pr"). Normally one.
 export function gpuPids() {
   const pids = [];
@@ -233,10 +221,21 @@ export function fdCount(pid) {
 //             for nested-host-window mode.
 export async function setupCompositor(opts = {}) {
   const addon = require(addonPath);
+  // GPU processes alive BEFORE this compositor starts (e.g. a live overdraw
+  // session on the host). The teardown leak check only counts processes NOT
+  // in this set, so tests are runnable inside a running session.
+  const preexistingGpu = new Set(gpuPids());
 
   let state = null;
   const onInput = (ev) => { state?.seat?.handleInput(ev); };
-  const onFrame = () => { state?.dispatchFrameCallbacks?.(Math.round(performance.now())); };
+  // Plugin overlay frame ticks (surface.onFrame); constructed with the gpu
+  // deps below when a rig needs them. Mirrors main.ts ordering: idleTick
+  // BEFORE dispatchFrameCallbacks so a forced present lands this pass.
+  let frameTicks = null;
+  const onFrame = () => {
+    frameTicks?.idleTick();
+    state?.dispatchFrameCallbacks?.(Math.round(performance.now()));
+  };
   // Per-output wl_callback.done dispatch (paces clients at their resident
   // output's vblank, not the union of all outputs'). Headless synthesizes
   // this from the ~60Hz frame timer; nested gets one per host FrameComplete.
@@ -244,6 +243,7 @@ export async function setupCompositor(opts = {}) {
     state?.dispatchFrameCallbacksForOutput?.(Math.round(performance.now()), outputId);
     state?.dispatchPresentationFeedbackForOutput?.(outputId, tvSec, tvNsec, seq);
     state?.dispatchCaptureForOutput?.(outputId, tvSec, tvNsec);
+    frameTicks?.dispatchForOutput(outputId, Math.round(performance.now()));
   };
 
   // Headless by default: the JS compositor renders into an offscreen target
@@ -578,6 +578,13 @@ export async function setupCompositor(opts = {}) {
     const { makeComposeFlatteners } = await import(
       "../packages/core/dist/subsurfaces.js");
     const composeFlatteners = makeComposeFlatteners(state);
+    const { createOverlayFrameTicks } = await import(
+      "../packages/core/dist/plugins/frame-ticks.js");
+    frameTicks = createOverlayFrameTicks({
+      compositor: jsCompositor,
+      awaitingFlip: () => state?.awaitingFlipOutputs ?? new Set(),
+      outputIds: () => state?.outputs ? [...state.outputs.keys()] : [0],
+    });
     inThreadGpuDeps = {
       coreDevice,
       globals: dawn.globals,
@@ -585,6 +592,7 @@ export async function setupCompositor(opts = {}) {
       compositor: jsCompositor,
       sceneRegistry,
       ...composeFlatteners,
+      frameTicks,
     };
     if (opts.intercept) {
       const { InterceptBroker } = await import(
@@ -627,6 +635,8 @@ export async function setupCompositor(opts = {}) {
             flattenWindows: composeFlatteners.flattenWindows,
             outputRegion: composeFlatteners.outputRegion,
           },
+          frameTicks,
+          emitToPlugin: (pluginName, name, data) => { runtime?.emit(pluginName, name, data); },
         });
         interceptBrokerOpts.worker = {
           addon, dawn,
@@ -781,7 +791,7 @@ export async function setupCompositor(opts = {}) {
     let leaked;
     do {
       await sleep(20);
-      leaked = countGpuProcs();
+      leaked = gpuPids().filter((p) => !preexistingGpu.has(p)).length;
     } while (leaked > 0 && Date.now() < reapDeadline);
     if (leaked > 0) throw new Error(`leaked ${leaked} GPU process(es) after teardown`);
   }

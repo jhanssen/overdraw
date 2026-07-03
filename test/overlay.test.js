@@ -1,15 +1,22 @@
 // Pure-unit tests for overlay geometry (placeOverlay) and the overlay broker
 // (createOverlayBroker). No GPU/Wayland: a mock sink records setSurfaceLayout /
 // setLayerSurfaces / removeSurface. Covers anchor placement + output clamping,
-// and the broker's layer registration / destroy / reflow.
+// global-coordinate placement on a target output, the broker's layer
+// registration / destroy / reflow, and the output hotplug hooks.
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 
 import { placeOverlay } from '../packages/core/dist/overlay-position.js';
-import { createOverlayBroker } from '../packages/core/dist/overlay.js';
+import { createOverlayBroker, installOverlayOutputHooks } from '../packages/core/dist/overlay.js';
+import { DynamicBus } from '../packages/core/dist/events/dynamic-bus.js';
 
 const OUT = { width: 1000, height: 800 };
+
+// Minimal OutputRecord: just the fields the broker's geometry lookup reads.
+function outRec(id, x, y, width, height) {
+  return { id, logicalPosition: { x, y }, logicalSize: { width, height } };
+}
 
 test('placeOverlay: corner/edge/center anchors', () => {
   const sz = { width: 100, height: 50 };
@@ -96,11 +103,59 @@ test('broker.destroyForPlugin: removes all of one plugin, re-pushes affected lay
   assert.ok(state.compositor._calls.removed.includes(a.surfaceId));
 });
 
-test('broker.reflow: recomputes rects against a new output size', () => {
+test('placeOverlay: output origin offsets the rect into global space', () => {
+  assert.deepEqual(
+    placeOverlay({ anchor: 'top-left', width: 100, height: 50 }, { x: 1920, y: 100, width: 1000, height: 800 }),
+    { x: 1920, y: 100, width: 100, height: 50 });
+});
+
+test('broker.reflow: recomputes rects against the output\'s current geometry', () => {
   const state = mockState();
   const broker = createOverlayBroker(state, OUT);
   const h = broker.create('p', { layer: 'overlay', anchor: 'bottom-right', width: 100, height: 50 });
   assert.deepEqual(h.rect, { x: 900, y: 750, width: 100, height: 50 });
-  broker.reflow({ width: 500, height: 400 });
+  state.outputs = new Map([[0, outRec(0, 0, 0, 500, 400)]]);
+  broker.reflow();
   assert.deepEqual(broker.list()[0].rect, { x: 400, y: 350, width: 100, height: 50 });
+});
+
+test('broker.create: output option places in that output\'s global rect', () => {
+  const state = mockState();
+  state.outputs = new Map([
+    [0, outRec(0, 0, 0, 1000, 800)],
+    [1, outRec(1, 1000, 0, 600, 400)],
+  ]);
+  const broker = createOverlayBroker(state, OUT);
+  const a = broker.create('p', { layer: 'background', anchor: 'top-left', width: 600, height: 400, output: 1 });
+  assert.equal(a.outputId, 1);
+  assert.deepEqual(a.rect, { x: 1000, y: 0, width: 600, height: 400 });
+  // Default output = primary (lowest id).
+  const b = broker.create('p', { layer: 'background', anchor: 'top-left', width: 10, height: 10 });
+  assert.equal(b.outputId, 0);
+  assert.deepEqual(b.rect, { x: 0, y: 0, width: 10, height: 10 });
+});
+
+test('output hooks: pre-remove destroys that output\'s overlays; changed reflows survivors', () => {
+  const state = mockState();
+  state.outputs = new Map([
+    [0, outRec(0, 0, 0, 1000, 800)],
+    [1, outRec(1, 1000, 0, 600, 400)],
+  ]);
+  const broker = createOverlayBroker(state, OUT);
+  const bus = new DynamicBus();
+  installOverlayOutputHooks(bus, broker);
+
+  const a = broker.create('p', { layer: 'background', anchor: 'top-left', width: 600, height: 400, output: 1 });
+  const b = broker.create('p', { layer: 'background', anchor: 'top-right', width: 100, height: 50, output: 0 });
+
+  bus.emit('output.pre-remove', { outputId: 1 });
+  assert.deepEqual(broker.list().map((o) => o.surfaceId), [b.surfaceId]);
+  assert.ok(state.compositor._calls.removed.includes(a.surfaceId));
+  assert.deepEqual(state.compositor._calls.layers.background, [b.surfaceId]);
+
+  // Output 0 grows; the survivor re-anchors on output.changed.
+  state.outputs.set(0, outRec(0, 0, 0, 1920, 1080));
+  state.outputs.delete(1);
+  bus.emit('output.changed', { outputId: 0 });
+  assert.deepEqual(broker.list()[0].rect, { x: 1820, y: 0, width: 100, height: 50 });
 });

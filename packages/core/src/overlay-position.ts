@@ -22,12 +22,15 @@ export interface OverlayRequest {
 }
 
 export interface Rect { x: number; y: number; width: number; height: number; }
-export interface Output { width: number; height: number; }
+// The target output's rect. `x`/`y` are the output's origin in global logical
+// space (multi-output arrangements place outputs side by side); omitted = 0.
+export interface Output { x?: number; y?: number; width: number; height: number; }
 
-// Compute the authoritative output-space rect for an overlay request. The size is
-// clamped to the output; the anchor positions the (possibly clamped) box against
-// the output edges/center, honoring `margin` on the anchored edges; the final
-// origin is clamped so the box stays fully on the output.
+// Compute the authoritative rect for an overlay request, in GLOBAL logical
+// coordinates. The size is clamped to the output; the anchor positions the
+// (possibly clamped) box against the output edges/center, honoring `margin` on
+// the anchored edges; the origin is clamped so the box stays fully on the
+// output, then offset by the output's global origin.
 export function placeOverlay(req: OverlayRequest, output: Output): Rect {
   const m = Math.max(0, req.margin ?? 0);
   // Clamp size to the output (leave room for margins on anchored axes).
@@ -53,7 +56,7 @@ export function placeOverlay(req: OverlayRequest, output: Output): Rect {
   // Keep the box fully on the output even if margins/size would push it off.
   x = clamp(x, 0, Math.max(0, output.width - w));
   y = clamp(y, 0, Math.max(0, output.height - h));
-  return { x, y, width: w, height: h };
+  return { x: x + (output.x ?? 0), y: y + (output.y ?? 0), width: w, height: h };
 }
 
 function clamp(v: number, lo: number, hi: number): number {

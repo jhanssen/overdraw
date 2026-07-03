@@ -23,7 +23,7 @@ import { createReservedZoneRegistry } from "./wm/reserved-zones.js";
 import { createFocusDriver } from "./protocols/focus-driver.js";
 import { parseConfigArg, loadConfig } from "./config/load.js";
 import { PluginRuntime } from "./plugins/index.js";
-import { createOverlayBroker } from "./overlay.js";
+import { createOverlayBroker, installOverlayOutputHooks } from "./overlay.js";
 import { createGpuBroker } from "./plugins/gpu-broker.js";
 import { createDecorationBroker } from "./plugins/decoration-broker.js";
 import { createWindowsBroker, NOT_HANDLED as WINDOWS_NOT_HANDLED } from "./plugins/windows-broker.js";
@@ -118,7 +118,13 @@ const onInput = (ev: InputEvent): void => { state?.seat?.handleInput(ev); };
 // (the closure captures lexically, but the assignment happens at boot time
 // before any frame fires; an extra `?.` guards the early-call window).
 let wakeIfActive: (() => void) | null = null;
+// Plugin overlay frame ticks (surface.onFrame). Constructed after the
+// compositor exists; the idle check runs BEFORE dispatchFrameCallbacks so a
+// forced present lands in this pass's renderFrame (same ordering the
+// wl_surface idle force-present relies on).
+let overlayFrameTicks: import("./plugins/frame-ticks.js").OverlayFrameTicks | null = null;
 const onFrame = (): void => {
+  overlayFrameTicks?.idleTick();
   state?.dispatchFrameCallbacks?.(Math.round(performance.now()));
   wakeIfActive?.();
 };
@@ -715,6 +721,7 @@ const userResolved = config.plugins.map((p) => {
 const resolved = [...bundledResolved, ...userResolved];
 
 const overlays = createOverlayBroker(state, config.output ?? { width: dims.width, height: dims.height });
+installOverlayOutputHooks(pluginBus, overlays);
 const [dawnNodePath] = globSync(join(__dirname, "..", "build", "3rdparty", "dawn", "Dawn-*", "dawn.node"));
 const pluginAddonPath = join(__dirname, "..", "build", "overdraw_plugin_native.node");
 
@@ -766,6 +773,26 @@ const composeFlatteners = makeComposeFlatteners(state);
 // and windows-broker never enumerate subsurfaces.
 compositor.setSubsurfaceAccessor?.(makeSubsurfaceAccessor(state));
 
+// Frame-tick service (surface.onFrame): pending-tick state shared by the
+// Worker GPU broker and the in-thread GPU SDK. Paced by setOnFlipComplete;
+// idle outputs are force-presented from onFrame's idleTick above.
+overlayFrameTicks = (await import("./plugins/frame-ticks.js")).createOverlayFrameTicks({
+  compositor,
+  awaitingFlip: () => state.awaitingFlipOutputs ?? new Set(),
+  outputIds: () => [...(state.outputs?.keys() ?? [])],
+});
+const frameTicks = overlayFrameTicks;
+
+// Live output enumeration for sdk.gpu.listOutputs (Worker and in-thread).
+const listOutputsForPlugins = (): Array<{
+  id: number; x: number; y: number; width: number; height: number;
+  scale: number; name: string;
+}> => [...(state.outputs?.values() ?? [])].map((r) => ({
+  id: r.id, x: r.logicalPosition.x, y: r.logicalPosition.y,
+  width: r.logicalSize.width, height: r.logicalSize.height,
+  scale: r.scale, name: r.name,
+}));
+
 // GPU broker: services plugin Worker GPU/surface requests.
 const gpuBroker = createGpuBroker({
   addon, compositor, overlays, dawn, coreDeviceHandle: h.device,
@@ -776,6 +803,9 @@ const gpuBroker = createGpuBroker({
   },
   onSurfaceAllocated: (sid, win) => decorationBroker.onSurfaceAllocated(sid, win),
   onSurfacePresented: (sid) => decorationBroker.onSurfacePresented(sid),
+  listOutputs: listOutputsForPlugins,
+  frameTicks,
+  emitToPlugin: (plugin, name, data) => { runtime?.emit(plugin, name, data); },
 });
 
 // Phase 9a closing driver: snapshots a phantom of a closing toplevel
@@ -1288,6 +1318,8 @@ runtime = new PluginRuntime({
     // broker's first-frame gate releases for in-thread decoration plugins too.
     onSurfaceAllocated: (sid, win) => decorationBroker.onSurfaceAllocated(sid, win),
     onSurfacePresented: (sid) => decorationBroker.onSurfacePresented(sid),
+    listOutputs: listOutputsForPlugins,
+    frameTicks,
   },
   bus: pluginBus,
   resolveDeferredRefs: deferredRefResolver,
@@ -1405,6 +1437,8 @@ log.info("core", `ctrl-c to quit.`);
 // no longer dispatches frame callbacks.
 addon.setOnFlipComplete?.((outputId, tvSec, tvNsec, seq) => {
   state?.dispatchFrameCallbacksForOutput?.(Math.round(performance.now()), outputId);
+  // Plugin overlay frame ticks pace off the same flip (surface.onFrame).
+  overlayFrameTicks?.dispatchForOutput(outputId, Math.round(performance.now()));
   // wp_presentation feedback dispatch -- surfaces that intersect this
   // output get their pending feedback fired with the same scanout
   // timestamp. Optional-chained so a state without the dispatcher (mid-

@@ -93,6 +93,7 @@ let nextResKey = 1;
 interface AllocResult {
   overlayId: number;
   rect: { x: number; y: number; width: number; height: number };
+  outputId: number | null;
   slotsSab: SharedArrayBuffer;
 }
 function parseAllocResult(res: unknown): AllocResult {
@@ -108,6 +109,7 @@ function parseAllocResult(res: unknown): AllocResult {
   return {
     overlayId: r.overlayId,
     rect: { x: rect.x, y: rect.y, width: rect.width, height: rect.height },
+    outputId: typeof r.outputId === "number" ? r.outputId : null,
     slotsSab: r.slotsSab,
   };
 }
@@ -123,6 +125,20 @@ export interface CreateOverlayOpts {
   width: number;
   height: number;
   margin?: number;
+  // Target output id (from listOutputs() or the output.* bus events);
+  // default: the primary output. Placement is anchored within -- and
+  // clamped to -- this output.
+  output?: number;
+}
+
+// One live output, as reported by listOutputs(). x/y are the output's origin
+// in global logical space; width/height its logical size.
+export interface OutputInfo {
+  id: number;
+  x: number; y: number;
+  width: number; height: number;
+  scale: number;
+  name: string;
 }
 
 export interface Surface {
@@ -135,6 +151,12 @@ export interface Surface {
   // setMask / setTint / etc.). Hidden by the core for non-decorator overlays
   // would be a separate capability gate; not enforced today.
   readonly surfaceId: number;
+  // The output an anchored overlay was placed on (null for decoration/
+  // explicit-rect surfaces, whose geometry is caller-owned). Fixed at
+  // creation; when this output is removed the core drops the overlay from
+  // compositing and the plugin (watching output.* events) should destroy()
+  // the surface.
+  readonly outputId: number | null;
   // Acquire the GPUTexture to render into this frame (dmabuf-backed, BGRA8). ASYNC:
   // a swapchain-style acquire -- it claims a FREE ring slot, awaiting one if every
   // slot is in use (producer rendering / consumer reading / draining). The returned
@@ -143,6 +165,13 @@ export interface Surface {
   getCurrentTexture(): Promise<GPUTexture>;
   // Hand the acquired texture to the core to composite (drives the fence dance).
   present(): Promise<void>;
+  // Request ONE frame tick, delivered on the next flip-complete of this
+  // surface's output (rAF-shaped; re-arm inside the callback for a render
+  // loop). The compositor force-presents an idle output so the tick always
+  // comes, at most at the output's refresh rate. `timeMs` is the compositor's
+  // monotonic ms clock. Ticks arrive one postMessage hop after the flip:
+  // pacing is exact, delivery may slip within the frame.
+  onFrame(cb: (timeMs: number) => void): void;
   // Tear down the surface: the core stops compositing it and frees the ring's GPU
   // resources (dmabuf/STM/textures on both devices); the worker drops its wrapped
   // textures + producer reservations. After destroy() the surface is unusable.
@@ -152,6 +181,10 @@ export interface Surface {
 export interface PluginGpu {
   device: GPUDevice;
   createOverlay(opts: CreateOverlayOpts): Promise<Surface>;
+  // Live outputs (id + global logical rect + scale + name). One call at
+  // startup covers the boot topology (the output.added burst precedes the
+  // plugin runtime); output.* bus events cover changes from then on.
+  listOutputs(): Promise<OutputInfo[]>;
 }
 
 // Internal producer/consumer ring allocator (NOT plugin-facing). `allocExtra`
@@ -178,7 +211,8 @@ export interface WorkerGpuInternals {
 export async function createPluginGpu(
   endpoint: Endpoint, pluginAddonPath: string, dawnPath: string,
 ): Promise<{ gpu: PluginGpu; pump: () => void; makeRingSurface: RingMaker;
-            stop: () => void; internals: WorkerGpuInternals }> {
+            stop: () => void; internals: WorkerGpuInternals;
+            dispatchGpuEvent: (name: string, data: unknown) => boolean }> {
   const require = createRequire(import.meta.url);
   const plugin = require(pluginAddonPath) as PluginAddon;
   const dawn = require(dawnPath) as DawnModule;
@@ -224,6 +258,10 @@ export async function createPluginGpu(
   // fatally (ThrowAsJavaScriptException with no JS frame) when worker.terminate()
   // killed the thread mid-submit/mid-wire-callback.
   let stopped = false;
+
+  // surface.onFrame callbacks, keyed by surfaceId. One core-side arm covers
+  // any number of queued callbacks; the whole list flushes on the tick event.
+  const surfaceFrameCbs = new Map<number, Array<(timeMs: number) => void>>();
 
   // Shared producer/consumer ring setup. `allocExtra` carries the geometry source
   // (anchor params for overlays, an explicit rect for decorations); the core's
@@ -289,16 +327,31 @@ export async function createPluginGpu(
       isStopped: () => stopped,
     });
     return {
-      width, height, rect: r.rect, surfaceId: r.overlayId,
+      width, height, rect: r.rect, surfaceId: r.overlayId, outputId: r.outputId,
       async getCurrentTexture(): Promise<GPUTexture> {
         if (destroyed) throw new Error("surface used after destroy()");
         const r = await producer.acquire();
         return r.texture;
       },
       async present(): Promise<void> { await producer.present(); },
+      onFrame(cb: (timeMs: number) => void): void {
+        if (destroyed) throw new Error("surface used after destroy()");
+        let cbs = surfaceFrameCbs.get(r.overlayId);
+        const arm = !cbs || cbs.length === 0;
+        if (!cbs) { cbs = []; surfaceFrameCbs.set(r.overlayId, cbs); }
+        cbs.push(cb);
+        // One core-side arm per delivery cycle; queuing more callbacks before
+        // the tick rides the same arm. Fire-and-forget: a failure (teardown
+        // race) drops the tick, which is what a dying surface wants.
+        if (arm) {
+          void endpoint.request("surface.requestFrame",
+            { connId: conn.connId, overlayId: r.overlayId }).catch(() => {});
+        }
+      },
       async destroy(): Promise<void> {
         if (destroyed) return;
         destroyed = true;
+        surfaceFrameCbs.delete(r.overlayId);
         // Ask the core to stop compositing + free the ring's GPU resources (it gates
         // the GPU-process free on its own read completing).
         await endpoint.request("surface.destroy", { connId: conn.connId, overlayId: r.overlayId });
@@ -327,7 +380,25 @@ export async function createPluginGpu(
       return makeRingSurface(opts.width, opts.height, {
         layer: opts.layer ?? "overlay", anchor: opts.anchor ?? "center",
         margin: opts.margin ?? 0,
+        ...(opts.output !== undefined ? { output: opts.output } : {}),
       });
+    },
+    async listOutputs(): Promise<OutputInfo[]> {
+      const r = await endpoint.request("gpu.listOutputs", {});
+      if (!Array.isArray(r)) return [];
+      const outs: OutputInfo[] = [];
+      for (const e of r) {
+        if (typeof e !== "object" || e === null) continue;
+        const o = e as Record<string, unknown>;
+        if (typeof o.id !== "number" || typeof o.x !== "number" || typeof o.y !== "number"
+            || typeof o.width !== "number" || typeof o.height !== "number") continue;
+        outs.push({
+          id: o.id, x: o.x, y: o.y, width: o.width, height: o.height,
+          scale: typeof o.scale === "number" ? o.scale : 1,
+          name: typeof o.name === "string" ? o.name : "",
+        });
+      }
+      return outs;
     },
   };
 
@@ -342,5 +413,19 @@ export async function createPluginGpu(
     allocSurfaceBufId: () => nextResKey++,
   };
 
-  return { gpu, pump, makeRingSurface, stop, internals };
+  // Core-pushed gpu events (loader routes endpoint events here). Only
+  // gpu.surface.frame today: flush the surface's queued onFrame callbacks.
+  const dispatchGpuEvent = (name: string, data: unknown): boolean => {
+    if (name !== "gpu.surface.frame") return false;
+    const d = (data ?? {}) as { surfaceId?: unknown; timeMs?: unknown };
+    if (typeof d.surfaceId !== "number") return true;
+    const cbs = surfaceFrameCbs.get(d.surfaceId);
+    if (!cbs || cbs.length === 0) return true;
+    surfaceFrameCbs.set(d.surfaceId, []);
+    const t = typeof d.timeMs === "number" ? d.timeMs : 0;
+    for (const cb of cbs) cb(t);
+    return true;
+  };
+
+  return { gpu, pump, makeRingSurface, stop, internals, dispatchGpuEvent };
 }

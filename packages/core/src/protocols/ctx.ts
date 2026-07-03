@@ -921,6 +921,11 @@ export interface CompositorState {
   // pushing to setLayerSurfaces. Excludes the "content" layer (which the
   // WM stack owns).
   overlayLayerIds?: (layer: Exclude<Layer, "content">) => number[];
+  // Outputs with a present in flight (flip-complete pending). Owned + mutated
+  // by the protocol layer's frame-callback machinery; published here read-only
+  // so the plugin overlay frame-tick service gates its idle force-present on
+  // the same set.
+  awaitingFlipOutputs?: ReadonlySet<number>;
   // Schedule a WM layout pass with the given reason. Set by installProtocols
   // after the WM is constructed; reachable from layer-shell apply paths so a
   // reserved-zone change reflows tiled / maximized windows. Absent in

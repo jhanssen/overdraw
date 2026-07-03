@@ -27,7 +27,7 @@
 
 import type { CompositorSink } from "../protocols/ctx.js";
 import type {
-  CreateOverlayOpts, PluginGpu, RingMaker, Surface,
+  CreateOverlayOpts, OutputInfo, PluginGpu, RingMaker, Surface,
 } from "./gpu.js";
 import type { OverlayBroker, OverlayLayer } from "../overlay.js";
 import type { OverlayAnchor } from "../overlay-position.js";
@@ -107,6 +107,13 @@ export interface InThreadGpuDeps {
   // on every present (the broker filters its own).
   onSurfaceAllocated?: (surfaceId: number, decoratesWindowId: number) => void;
   onSurfacePresented?: (surfaceId: number) => void;
+  // Live output enumeration for gpu.listOutputs; mirrors the Worker GPU
+  // broker's dep. Absent in harnesses -> no outputs reported.
+  listOutputs?: () => OutputInfo[];
+  // Frame-tick service for surface.onFrame. In-thread delivery invokes the
+  // plugin's callback directly on the core thread (no postMessage hop).
+  // Absent in harnesses -> onFrame ticks never fire.
+  frameTicks?: import("./frame-ticks.js").OverlayFrameTicks;
 }
 
 // Per-plugin GPU SDK construction. The plugin's name flows in so the overlay
@@ -159,6 +166,7 @@ export function createInThreadGpu(
             anchor: (allocExtra.anchor as OverlayAnchor) ?? "center",
             width, height,
             margin: allocExtra.margin as number | undefined,
+            output: allocExtra.output as number | undefined,
           });
     // Fire the decoration-broker alloc hook for decoration surfaces. The
     // Worker GPU broker does the equivalent for surface.alloc; we mirror it
@@ -178,6 +186,8 @@ export function createInThreadGpu(
     let presented = -1;
     let nextFreeIdx = 0;
     let destroyed = false;
+    // Queued surface.onFrame callbacks; flushed together on the tick.
+    const frameCbs: Array<(timeMs: number) => void> = [];
 
     // FREE / ACQUIRED / PRESENTED / DRAINING tracked as a small array. No
     // atomics; the producer + consumer are the same thread.
@@ -194,6 +204,7 @@ export function createInThreadGpu(
 
     const surface: Surface = {
       width, height, rect: handle.rect, surfaceId: handle.surfaceId,
+      outputId: handle.outputId,
 
       async getCurrentTexture(): Promise<GPUTexture> {
         if (destroyed) throw new Error("surface used after destroy()");
@@ -248,9 +259,25 @@ export function createInThreadGpu(
         }
       },
 
+      onFrame(cb: (timeMs: number) => void): void {
+        if (destroyed) throw new Error("surface used after destroy()");
+        const arm = frameCbs.length === 0;
+        frameCbs.push(cb);
+        // One arm per delivery cycle; the tick flushes the whole queue.
+        // Delivery runs on the core thread (in-thread plugins always do).
+        if (arm) {
+          deps.frameTicks?.arm(handle.surfaceId, handle.outputId, (timeMs) => {
+            if (destroyed) return;
+            for (const fn of frameCbs.splice(0)) fn(timeMs);
+          });
+        }
+      },
+
       async destroy(): Promise<void> {
         if (destroyed) return;
         destroyed = true;
+        deps.frameTicks?.drop(handle.surfaceId);
+        frameCbs.length = 0;
         // Stop compositing it immediately. The compositor removes the
         // surface from its draw list; subsequent setSurfaceTexture for
         // this id is a no-op.
@@ -278,7 +305,11 @@ export function createInThreadGpu(
         layer: opts.layer ?? "overlay",
         anchor: opts.anchor ?? "center",
         margin: opts.margin ?? 0,
+        ...(opts.output !== undefined ? { output: opts.output } : {}),
       });
+    },
+    listOutputs(): Promise<OutputInfo[]> {
+      return Promise.resolve(deps.listOutputs?.() ?? []);
     },
   };
 

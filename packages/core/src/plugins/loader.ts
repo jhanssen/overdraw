@@ -82,6 +82,9 @@ export async function runLoader(channel: Channel, input: LoaderInput): Promise<v
   let gpu: PluginGpu | undefined;
   let makeRingSurface: RingMaker | undefined;
   let stopGpu: () => void = () => {};
+  // Worker path only: core-pushed gpu events (surface.onFrame ticks) route
+  // here. The in-thread path delivers ticks by direct callback instead.
+  let dispatchGpuEvent: ((name: string, data: unknown) => boolean) | undefined;
   // sdk.compose: in-thread bundled plugins share core's device, so they get
   // GPUTexture handles by reference (createInThreadCompose). Worker plugins
   // get cross-device dmabuf compose via createWorkerCompose (phase 5b
@@ -118,6 +121,7 @@ export async function runLoader(channel: Channel, input: LoaderInput): Promise<v
     const g = await createPluginGpu(endpoint, input.pluginAddonPath, input.dawnPath);
     gpu = g.gpu;
     makeRingSurface = g.makeRingSurface;
+    dispatchGpuEvent = g.dispatchGpuEvent;
     const t = setInterval(g.pump, 4);
     t.unref?.();
     stopGpu = () => { clearInterval(t); g.stop(); };
@@ -186,6 +190,7 @@ export async function runLoader(channel: Channel, input: LoaderInput): Promise<v
   });
 
   endpoint.handleEvents((eventName, data) => {
+    if (dispatchGpuEvent?.(eventName, data)) return;
     if (eventsHandle.dispatcher.dispatch(eventName, data)) return;
     if (inputHandle.dispatcher.dispatch(eventName, data)) return;
     if (dispatchInterceptEvent(eventName, data)) return;

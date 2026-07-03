@@ -347,13 +347,21 @@ returning `true` consumes the event; the client doesn't see it.
 ### 5. Frame ticks
 
 ```ts
-sdk.frame.onTick(outputId | null, cb: (frame: FrameInfo) => void): { off }
+surface.onFrame(cb: (timeMs: number) => void): void
 ```
 
-`outputId: null` ticks per global frame. Used by animation plugins, plugins
-needing per-frame compute outside the takeover path.
+Surface-scoped, rAF-shaped: one tick per call, delivered on the next
+flip-complete of the surface's output (an overlay on a 60Hz output ticks at
+60Hz even when a 240Hz output is also flipping; a surface with no output
+binding ticks on any output's flip). Re-arm inside the callback for a render
+loop. The core force-presents an idle output so a tick always comes, gated so
+nothing free-runs past the refresh rate. Delivery to a Worker plugin is one
+postMessage hop after the flip: pacing is exact, delivery may slip within the
+frame — latency-critical animation belongs in core, not a plugin.
 
-`FrameInfo`: `{ time, frameNumber, deltaMs }`.
+A future `sdk.frame.onTick(outputId | null, cb)` namespace variant (ticks
+without a surface, `FrameInfo { time, frameNumber, deltaMs }`) is sketched
+but not built; `surface.onFrame` is the implemented API.
 
 ### 6. Scene compose
 

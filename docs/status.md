@@ -748,7 +748,14 @@ active; failure demotes).
 
 **SDK surface (built):**
 - `sdk.gpu.createOverlay` (cross-process wire + dmabuf rings for
-  Worker; core-device textures for in-thread).
+  Worker; core-device textures for in-thread). Output-targetable
+  (`output` opt, default primary; global-coordinate placement;
+  anchored overlays reflow on output add/remove/change and are
+  dropped when their output is removed) + `sdk.gpu.listOutputs`.
+- `surface.onFrame` (rAF-shaped vblank tick per overlay surface,
+  paced by the surface's output's flip-complete; idle outputs are
+  force-presented via the wl_surface frame-callback gate so ticks
+  never strand and never free-run).
 - `sdk.window` observer (onMap/onUnmap/onChange).
 - `sdk.windows.propose` + state bag + snapshots +
   `setOutputStack` + `focus(id)` + `requestFocusDecision` +
