@@ -279,11 +279,19 @@ export function createWorkerInterceptSdk(deps: WorkerInterceptDeps): InterceptAP
 
   async function handleUnmatched(ev: UnmatchedEvent): Promise<void> {
     const reg = registrations.get(ev.registrationId);
-    if (!reg) return;
-    const state = reg.surfaces.get(ev.surfaceId);
-    if (!state) return;
-    reg.surfaces.delete(ev.surfaceId);
-    state.stop();
+    const state = reg?.surfaces.get(ev.surfaceId);
+    if (reg && state) {
+      reg.surfaces.delete(ev.surfaceId);
+      state.stop();
+    }
+    // Ack unconditionally: the broker parks the surface's rings until
+    // this arrives (releasing them earlier would race brackets this
+    // loop already wrote to the plugin wire). Missing state means the
+    // loop is already stopped (unregister path) -- still ack so the
+    // broker releases without waiting out its timeout.
+    await endpoint.request("intercept.unmatch-ack", {
+      registrationId: ev.registrationId, surfaceId: ev.surfaceId,
+    });
   }
 
   // The endpoint exposes handleEvents at the loader level (loader wires

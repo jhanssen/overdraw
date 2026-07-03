@@ -330,13 +330,15 @@ nothing, with no error. Worst-first.
   zero formats + done so clients gracefully read "cursor capture not
   available."
 
-- **Known race: intercept-worker teardown** (`test/intercept-worker.gpu.
-  mjs` flake ~24%). Missing Worker→core teardown handshake -- the
-  Worker keeps calling `outputProducer.acquire()` after core has
-  released the corresponding surface bufs. Two writes ride independent
-  fds, so wire-FIFO can't fix it. Fix (deferred): ack-based shutdown
-  handshake. No production impact (the user's runtime compositor
-  doesn't tear down `intercept` plugins mid-frame in normal operation).
+- **Intercept-worker teardown is handshake-gated** (was a ~24% flake in
+  `test/intercept-worker.gpu.mjs` with a GPU-process abort). Two guards:
+  the broker parks an unmatched Worker surface's rings until the worker
+  acks its loop stopped (`intercept.unmatch-ack`, 1s timeout for a dead
+  worker), and the GPU process drops -- rather than aborts on --
+  plugin-wire brackets naming a released surfaceBuf (frames already in
+  flight when the release lands; the two sockets have no cross-fd
+  ordering). Residual: a worker wedged past the timeout can still race
+  its own straggler frames, which the drop path absorbs.
 
 - **Retile shrink animates the new (smaller) buffer upscaled.** When an
   existing window shrinks on a layout reshuffle (e.g. 1->2 windows,

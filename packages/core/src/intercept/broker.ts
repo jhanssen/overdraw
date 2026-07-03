@@ -32,6 +32,10 @@ import type { DawnWire } from "../gpu/compositor.js";
 export interface InterceptBrokerDeps {
   bus: CompositorBus;
   compositor: CompositorSink;
+  // How long an unmatched Worker surface's rings stay parked waiting
+  // for the worker's intercept.unmatch-ack before being released
+  // anyway (worker dead or wedged). Tests shrink this.
+  unmatchAckTimeoutMs?: number;
   // Whether a surface currently holds keyboard focus (the active window).
   // Read live at tick time and surfaced as ctx.activated so decoration-style
   // plugins style focus from current seat state, not an async window.change
@@ -125,11 +129,19 @@ interface ActiveRegistrationWorker {
 
 type ActiveRegistration = ActiveRegistrationInThread | ActiveRegistrationWorker;
 
+const DEFAULT_UNMATCH_ACK_TIMEOUT_MS = 1000;
+
 export class InterceptBroker {
   private readonly engine = new MatchEngine();
   private readonly registrations = new Map<number, ActiveRegistration>();
   private nextRegistrationId = 1;
   private readonly deps: InterceptBrokerDeps;
+  // Worker surfaces whose rings are parked between the unmatch notify
+  // and the worker's intercept.unmatch-ack (or the timeout). Keyed
+  // `${registrationId}:${surfaceId}`; survives unregister (the ack can
+  // land after the registration itself is gone).
+  private readonly pendingUnmatchAcks = new Map<
+    string, { state: { destroy(): void }; timer: ReturnType<typeof setTimeout> }>();
 
   constructor(deps: InterceptBrokerDeps) {
     this.deps = deps;
@@ -612,16 +624,56 @@ export class InterceptBroker {
         this.deps.log(
           `[intercept ${active.pluginName}] onSurfaceUnmatched threw: ${msg}`);
       }
-    } else {
-      // Fire-and-forget; worker's notifyUnmatched can throw but the
-      // broker tears down regardless.
-      active.notifyUnmatched(info).catch((e: unknown) => {
-        const msg = e instanceof Error ? e.message : String(e);
-        this.deps.log(
-          `[intercept ${active.pluginName}] notifyUnmatched threw: ${msg}`);
-      });
+      state.destroy();
+      return;
     }
-    state.destroy();
+
+    // Worker transport: the worker's tick loop may be mid-frame with
+    // producer/consumer brackets already written to its wire. Releasing
+    // the surface bufs now would race those in-flight frames on the GPU
+    // process, so park the state until the worker acks that its loop
+    // has stopped (intercept.unmatch-ack). The timeout covers a dead or
+    // wedged worker -- rings must not leak forever.
+    const key = `${active.id}:${surfaceId}`;
+    const stale = this.pendingUnmatchAcks.get(key);
+    if (stale) {
+      // A previous unmatch for this surface never resolved (re-match +
+      // re-unmatch inside the ack window). Release the old rings now.
+      this.pendingUnmatchAcks.delete(key);
+      clearTimeout(stale.timer);
+      stale.state.destroy();
+    }
+    const timeoutMs = this.deps.unmatchAckTimeoutMs ?? DEFAULT_UNMATCH_ACK_TIMEOUT_MS;
+    const timer = setTimeout(() => {
+      this.pendingUnmatchAcks.delete(key);
+      this.deps.log(
+        `[intercept ${active.pluginName}] no unmatch-ack for surface ` +
+        `${surfaceId} after ${timeoutMs}ms; releasing rings`);
+      state.destroy();
+    }, timeoutMs);
+    timer.unref?.();
+    this.pendingUnmatchAcks.set(key, { state, timer });
+    active.notifyUnmatched(info).catch((e: unknown) => {
+      const msg = e instanceof Error ? e.message : String(e);
+      this.deps.log(
+        `[intercept ${active.pluginName}] notifyUnmatched threw: ${msg}`);
+      // The notify never reached the worker, so no ack will come.
+      this.ackUnmatched(active.id, surfaceId);
+    });
+  }
+
+  // Worker SDK -> broker: the worker observed the unmatch and stopped
+  // the surface's tick loop -- its wire carries no further brackets for
+  // these rings, so releasing them can't race in-flight frames. No-op
+  // when nothing is parked (timeout already fired, or the ack is a
+  // duplicate).
+  ackUnmatched(registrationId: number, surfaceId: number): void {
+    const key = `${registrationId}:${surfaceId}`;
+    const pending = this.pendingUnmatchAcks.get(key);
+    if (!pending) return;
+    this.pendingUnmatchAcks.delete(key);
+    clearTimeout(pending.timer);
+    pending.state.destroy();
   }
 
   // Worker SDK -> broker: complete ring allocation for a matched

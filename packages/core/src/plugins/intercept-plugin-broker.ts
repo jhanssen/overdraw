@@ -37,8 +37,24 @@ export function createInterceptPluginBroker(deps: InterceptPluginBrokerDeps): In
     if (method === "intercept.alloc-rings") {
       return await handleAllocRings(params);
     }
+    if (method === "intercept.unmatch-ack") {
+      return handleUnmatchAck(params);
+    }
     return INTERCEPT_NOT_HANDLED;
   };
+
+  function handleUnmatchAck(params: unknown): null {
+    if (!params || typeof params !== "object") {
+      throw new Error("intercept.unmatch-ack: malformed params");
+    }
+    // eslint-disable-next-line no-restricted-syntax -- trusted SDK shape
+    const p = params as unknown as { registrationId: number; surfaceId: number };
+    if (typeof p.registrationId !== "number" || typeof p.surfaceId !== "number") {
+      throw new Error("intercept.unmatch-ack: registrationId + surfaceId required");
+    }
+    deps.interceptBroker.ackUnmatched(p.registrationId, p.surfaceId);
+    return null;
+  }
 
   async function handleRegister(pluginName: string, params: unknown): Promise<{ registrationId: number }> {
     if (!params || typeof params !== "object") {

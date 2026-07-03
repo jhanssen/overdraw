@@ -2617,24 +2617,37 @@ int run(int wireFd, int ctrlFd, int inputFd, bool headless,
                         }
                         uint32_t surfaceBufId = ipc::getU32LE(frame.data() + 1);
                         bool producer = frame[5] != 0;
+                        auto it = surfaceBufs.find(surfaceBufId);
+                        // Missing surface = teardown race: the core released
+                        // this buf (plugin unmatch / worker shutdown) on ITS
+                        // wire while this bracket was in flight on the plugin
+                        // wire -- two FIFOs with no cross ordering. The
+                        // worker's straggler brackets are harmless: drop them.
+                        // (Its render commands against the injected texture
+                        // fail Dawn validation on the plugin device; the
+                        // release already closed any open bracket.)
+                        if (it == surfaceBufs.end()) {
+                            std::fprintf(stderr,
+                                "[gpu] plugin conn %u: %s %s on released buf=%u "
+                                "(teardown race), dropped\n",
+                                connId, producer ? "producer" : "consumer",
+                                kind == ipc::FrameKind::BeginAccess ? "Begin" : "End",
+                                surfaceBufId);
+                            return;
+                        }
                         // Plugin wire's role expectation is inverted from the
                         // core wire: producerOnCore=false -> plugin produces ->
                         // plugin wire carries PRODUCER frames; producerOnCore=
                         // true (compose buf) -> plugin consumes -> plugin wire
-                        // carries CONSUMER frames. Missing surface = release
-                        // race -- silently skip on End, abort on Begin
-                        // (matches pre-refactor behavior).
-                        auto it = surfaceBufs.find(surfaceBufId);
-                        if (it != surfaceBufs.end()) {
-                            const bool expectProducer = !it->second.producerOnCore;
-                            if (producer != expectProducer) {
-                                std::fprintf(stderr,
-                                    "[gpu] plugin conn %u: %s frame on plugin wire "
-                                    "(buf=%u producerOnCore=%d) -- wrong socket\n",
-                                    connId, producer ? "producer" : "consumer",
-                                    surfaceBufId, static_cast<int>(it->second.producerOnCore));
-                                std::abort();
-                            }
+                        // carries CONSUMER frames.
+                        const bool expectProducer = !it->second.producerOnCore;
+                        if (producer != expectProducer) {
+                            std::fprintf(stderr,
+                                "[gpu] plugin conn %u: %s frame on plugin wire "
+                                "(buf=%u producerOnCore=%d) -- wrong socket\n",
+                                connId, producer ? "producer" : "consumer",
+                                surfaceBufId, static_cast<int>(it->second.producerOnCore));
+                            std::abort();
                         }
                         if (kind == ipc::FrameKind::BeginAccess) {
                             if (!runSurfaceBegin(surfaceBufId, producer)) {

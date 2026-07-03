@@ -352,14 +352,14 @@ The historical workaround `wireSerial` field on `ReleaseClientTex` is
 gone — `ReleaseClientTex` now rides the wire too (`kind=14`), so the
 prior brackets are FIFO-ahead by construction.
 
-### Known race: intercept-worker teardown (Worker keeps writing after
-core releases)
+### Intercept-worker teardown race (handshake + drop guards)
 
-`test/intercept-worker.gpu.mjs` is flaky (~24% failure rate) with a
-characteristic abort: `[gpu] ProducerBegin: unknown surfaceBufId=N`
-followed by GPU-process crash. Root cause is **NOT** a cross-fd race
-in the IPC migration — it is a missing teardown handshake between the
-core and the plugin Worker:
+The Worker's tick loop and the core's surface release run in separate
+execution contexts, so without a gate the Worker can keep writing
+brackets for surface bufs the core has already released (historically a
+~24% `test/intercept-worker.gpu.mjs` flake aborting the GPU process
+with `ProducerBegin: unknown surfaceBufId`). This is **NOT** a cross-fd
+race of the IPC-migration class — it is a teardown-ordering race:
 
 1. Test winds down. Core's `WorkerSurfaceState.destroy()` runs.
 2. Core writes `ReleaseSurfaceBuf` for all 6 surface bufs to the
@@ -383,18 +383,26 @@ addressing (`ProducerBegin overtaking AllocSurfaceBuf` and friends) is
 a different race; this one is a teardown-ordering race that requires
 a handshake.
 
-**Fix (deferred, not silent):** Worker→core teardown handshake. The
-Worker receives `intercept.unmatched`, sets `stopped=true`, drains the
-runLoop, then sends a `unmatched-acked` event back to core. Core's
-`WorkerSurfaceState.destroy()` waits for the ack before issuing the
-ReleaseSurfaceBuf frames. ~50 lines including the bus event roundtrip
-and timeout fallback (default to releasing after some bounded wait so
-a dead Worker can't leak buffers indefinitely).
+**Guards (two, independent):**
 
-Until that lands the test is rerun-flaky; CI accepts the
-non-deterministic pass-rate. No production impact (the user's runtime
-compositor doesn't tear down `intercept` plugins mid-frame in normal
-operation).
+1. **Ack-gated release.** On unmatch, the broker parks the surface's
+   `WorkerInterceptState` in a pending map instead of destroying it
+   (`InterceptBroker.dispatchUnmatched`). The Worker's SDK stops the
+   tick loop on `intercept.unmatched`, then sends
+   `intercept.unmatch-ack`; `InterceptBroker.ackUnmatched` runs the
+   deferred `destroy()` (which issues the ReleaseSurfaceBuf frames). A
+   bounded timeout (`unmatchAckTimeoutMs`, default 1s) releases anyway
+   when the worker is dead or wedged, and a notify failure (worker
+   endpoint gone) releases immediately -- rings can't leak
+   indefinitely. Unit-tested in `test/intercept-unmatch-ack.test.js`.
+2. **GPU-side drop instead of abort.** A plugin-wire Begin/End naming a
+   surfaceBufId that is no longer in `surfaceBufs` is logged and
+   dropped (the plugin-conn `dispatchControl` in
+   `gpu-process/src/main.cpp`). This absorbs the residual window the
+   handshake can't close: frames already written to the plugin wire
+   before the worker observed the unmatch, decoded after the release
+   landed on the core wire (the two sockets have no cross-fd
+   ordering), plus any future lifecycle bug of the same class.
 
 ### GPU process threading
 
@@ -3210,6 +3218,12 @@ sets/clears these per frame via the sink.
   breaking the steady-state correctness invariants the aborts
   protect. Recorded here as architectural debt to address before the
   intercept-Worker code path takes production traffic.
+
+  Of Mode B's abort sites, the plugin-wire `dispatchControl` one is
+  now a logged drop (a Begin/End naming a released surfaceBuf is a
+  teardown race, not a state-machine bug -- see "Intercept-worker
+  teardown race" above); the core-wire sites (`allocSurfaceBufImpl`
+  finalize and friends) still hard-abort.
 
 ### wlr-layer-shell (`zwlr_layer_shell_v1` / `zwlr_layer_surface_v1`)
 

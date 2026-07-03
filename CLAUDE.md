@@ -10,7 +10,7 @@ lists what is advertised-but-incomplete (silent-gap risks: `wl_region`
 no-op stub, `wl_surface.damage`/`damage_buffer` residuals,
 `wl_resource_post_error` is wired (`ctx.addon.postError`) and used by many
 protocols, but some commit-time errors still silent-drop, hotplug-replug
-logical-position not restored, intercept-worker teardown race).
+logical-position not restored).
 
 ## Comments describe the code, not its history
 
