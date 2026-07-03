@@ -119,6 +119,7 @@ message(STATUS "Node addon headers: ${NODE_INCLUDE_DIR}")
 # consumes log records (host addon, plugin addon, GPU process).
 add_library(overdraw_log STATIC
     native/log/log.cpp
+    native/log/crash_handler.cpp
     native/log/ipc_sink.cpp
     native/log/ipc_source.cpp)
 target_include_directories(overdraw_log PUBLIC

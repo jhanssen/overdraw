@@ -49,40 +49,32 @@
 #include "wire_barrier.h"
 
 #include "log/log.h"
+#include "log/crash_handler.h"
 #include "log/ipc_sink.h"
 
 using namespace overdraw;
 
 namespace {
 
-// Crash handler: dump a native backtrace to a file (async-signal-safe-ish:
-// backtrace/backtrace_symbols_fd are commonly used here) then re-raise.
-void crashHandler(int sig) {
-    const char* path = "/tmp/overdraw-gpu-crash.txt";
-    int fd = ::open(path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
-    if (fd >= 0) {
-        char hdr[64];
-        int n = std::snprintf(hdr, sizeof(hdr), "GPU process caught signal %d\n", sig);
-        ssize_t w = ::write(fd, hdr, static_cast<size_t>(n));
-        (void)w;
-        void* frames[64];
-        int got = ::backtrace(frames, 64);
-        ::backtrace_symbols_fd(frames, got, fd);
-        ::close(fd);
-    }
-    ::signal(sig, SIG_DFL);
-    ::raise(sig);
-}
-
-void installCrashHandler() {
-    ::signal(SIGSEGV, crashHandler);
-    ::signal(SIGABRT, crashHandler);
-    ::signal(SIGBUS, crashHandler);
-    ::signal(SIGILL, crashHandler);
-    ::signal(SIGFPE, crashHandler);
-}
-
 void usleepShort() { ::usleep(200); }
+
+// Copy one output's identity into the descriptor-bearing fields of an
+// ipc::Message (the ctrl-borne OutputDescriptor send).
+void fillOutputMsgFromInfo(uint32_t outputId, const gpu::OutputDescriptorInfo& info,
+                           ipc::Message& m) {
+    m.outputId         = outputId;
+    m.width            = info.width;
+    m.height           = info.height;
+    m.refreshMhz       = info.refreshMhz;
+    m.outScale         = info.scale;
+    m.outTransform     = info.transform;
+    m.physicalWidthMm  = info.physicalWidthMm;
+    m.physicalHeightMm = info.physicalHeightMm;
+    std::memcpy(m.outputName,   info.name,   sizeof(m.outputName));
+    std::memcpy(m.outputMake,   info.make,   sizeof(m.outputMake));
+    std::memcpy(m.outputModel,  info.model,  sizeof(m.outputModel));
+    std::memcpy(m.outputEdidId, info.edidId, sizeof(m.outputEdidId));
+}
 
 // Export a dmabuf's implicit-sync acquire fence (the producer's outstanding
 // WRITE work) as a sync_file fd. A consumer that wants to wait on the
@@ -491,18 +483,8 @@ int run(int wireFd, int ctrlFd, int inputFd, bool headless,
         output->describeOutput(info);
         ipc::Message m{};
         m.tag = ipc::Tag::OutputDescriptor;
-        m.outputId         = 0;  // the one output today; per-output when enumeration lands
-        m.width            = info.width;
-        m.height           = info.height;
-        m.refreshMhz       = info.refreshMhz;
-        m.outScale         = info.scale;
-        m.outTransform     = info.transform;
-        m.physicalWidthMm  = info.physicalWidthMm;
-        m.physicalHeightMm = info.physicalHeightMm;
-        std::memcpy(m.outputName,   info.name,   sizeof(m.outputName));
-        std::memcpy(m.outputMake,   info.make,   sizeof(m.outputMake));
-        std::memcpy(m.outputModel,  info.model,  sizeof(m.outputModel));
-        std::memcpy(m.outputEdidId, info.edidId, sizeof(m.outputEdidId));
+        // outputId 0: the one output today; per-output when enumeration lands.
+        fillOutputMsgFromInfo(0, info, m);
         ipc::sendMessage(ctrlFd, m);
         std::printf(
             "[gpu] sent OutputDescriptor: %ux%u @%u.%03uHz scale=%u xform=%u "
@@ -661,18 +643,7 @@ int run(int wireFd, int ctrlFd, int inputFd, bool headless,
         if (!kms) return;
         gpu::OutputDescriptorInfo info{};
         kms->describeOutputAt(outputId, info);
-        m.outputId         = outputId;
-        m.width            = info.width;
-        m.height           = info.height;
-        m.refreshMhz       = info.refreshMhz;
-        m.outScale         = info.scale;
-        m.outTransform     = info.transform;
-        m.physicalWidthMm  = info.physicalWidthMm;
-        m.physicalHeightMm = info.physicalHeightMm;
-        std::memcpy(m.outputName,   info.name,   sizeof(m.outputName));
-        std::memcpy(m.outputMake,   info.make,   sizeof(m.outputMake));
-        std::memcpy(m.outputModel,  info.model,  sizeof(m.outputModel));
-        std::memcpy(m.outputEdidId, info.edidId, sizeof(m.outputEdidId));
+        fillOutputMsgFromInfo(outputId, info, m);
     };
 
     // Emit OutputModes for an output. Walks the connector's mode list,
@@ -1039,19 +1010,9 @@ int run(int wireFd, int ctrlFd, int inputFd, bool headless,
                 gpu::OutputDescriptorInfo info{};
                 output->describeOutput(info);
                 ipc::Message m{};
-                m.tag              = ipc::Tag::OutputDescriptor;
-                m.outputId         = 0;  // the one output today; per-output when enumeration lands
-                m.width            = info.width;
-                m.height           = info.height;
-                m.refreshMhz       = info.refreshMhz;
-                m.outScale         = info.scale;
-                m.outTransform     = info.transform;
-                m.physicalWidthMm  = info.physicalWidthMm;
-                m.physicalHeightMm = info.physicalHeightMm;
-                std::memcpy(m.outputName,   info.name,   sizeof(m.outputName));
-                std::memcpy(m.outputMake,   info.make,   sizeof(m.outputMake));
-                std::memcpy(m.outputModel,  info.model,  sizeof(m.outputModel));
-                std::memcpy(m.outputEdidId, info.edidId, sizeof(m.outputEdidId));
+                m.tag = ipc::Tag::OutputDescriptor;
+                // outputId 0: the nested backend drives one output.
+                fillOutputMsgFromInfo(0, info, m);
                 ipc::sendMessage(ctrlFd, m);
                 std::printf("[gpu] resize -> %ux%u; rebuilt scanout ring; sent ScanoutRebuild + OutputDescriptor\n",
                             newW, newH);
@@ -3322,7 +3283,8 @@ int main(int argc, char** argv) {
         FILE* f = ::freopen(lp, "w", stderr);
         if (f) { ::dup2(::fileno(stderr), ::fileno(stdout)); setvbuf(stderr, nullptr, _IOLBF, 0); }
     }
-    installCrashHandler();
+    overdraw::log::installCrashHandler("/tmp/overdraw-gpu-crash.txt",
+                                       "GPU process");
     // C-M1 verification mode: two-device cross-device dmabuf STM + fence
     // round-trip. Self-contained (no fds, no core); prints XDEV: PASS/FAIL.
     if (argc >= 2 && std::strcmp(argv[1], "--selftest-xdev") == 0) {

@@ -45,6 +45,7 @@
 #include "wayland/keymap.h"
 #include "cursor/xcursor.h"
 #include "log/log.h"
+#include "log/crash_handler.h"
 #include "log/ipc_source.h"
 
 using overdraw::core::Compositor;
@@ -64,36 +65,6 @@ using overdraw::wayland::Trampoline;
 using overdraw::wayland::Keymap;
 
 namespace {
-
-// Crash handler: dump a native backtrace to a file then re-raise. Mirrors the
-// GPU-process handler in `gpu-process/src/main.cpp`. Without this, a SIGSEGV
-// inside the addon (or inside any code reachable from a libuv handle the
-// addon installed) leaves no trace -- Node prints nothing to stderr because
-// the fatal signal short-circuits the runtime. The file is the only artifact.
-void coreCrashHandler(int sig) {
-    const char* path = "/tmp/overdraw-core-crash.txt";
-    int fd = ::open(path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
-    if (fd >= 0) {
-        char hdr[64];
-        int n = std::snprintf(hdr, sizeof(hdr), "core (node addon) caught signal %d\n", sig);
-        ssize_t w = ::write(fd, hdr, static_cast<size_t>(n));
-        (void)w;
-        void* frames[64];
-        int got = ::backtrace(frames, 64);
-        ::backtrace_symbols_fd(frames, got, fd);
-        ::close(fd);
-    }
-    ::signal(sig, SIG_DFL);
-    ::raise(sig);
-}
-
-void installCoreCrashHandler() {
-    ::signal(SIGSEGV, coreCrashHandler);
-    ::signal(SIGABRT, coreCrashHandler);
-    ::signal(SIGBUS,  coreCrashHandler);
-    ::signal(SIGILL,  coreCrashHandler);
-    ::signal(SIGFPE,  coreCrashHandler);
-}
 
 struct Addon {
     std::unique_ptr<Compositor> compositor;
@@ -2334,22 +2305,29 @@ napi_value UpdateOutputLayout(napi_env env, napi_callback_info info) {
     napi_value u; napi_get_undefined(env, &u); return u;
 }
 
+// Swap a stored JS-callback reference for a setOnX(cb) binding: drop the old
+// reference, then hold the new one iff the first argument is a function
+// (null / omitted clears).
+void replaceCallbackRef(napi_env env, napi_callback_info info, napi_ref& ref) {
+    size_t argc = 1; napi_value argv[1];
+    napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+    if (ref) {
+        napi_delete_reference(env, ref);
+        ref = nullptr;
+    }
+    if (argc >= 1) {
+        napi_valuetype t; napi_typeof(env, argv[0], &t);
+        if (t == napi_function) napi_create_reference(env, argv[0], 1, &ref);
+    }
+}
+
 // setOnFlipComplete(cb) -> undefined
 // Register a JS callback fired once per drained KMS flip-complete. The callback
 // receives one outputId per call. JS dispatches wl_callback.done for surfaces
 // resident on that output here -- so a surface on a 60Hz output sees `done` at
 // 60Hz even when a 240Hz output is also flipping. Pass null/omit to clear.
 napi_value SetOnFlipComplete(napi_env env, napi_callback_info info) {
-    size_t argc = 1; napi_value argv[1];
-    napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
-    if (g_addon.onFlipComplete) {
-        napi_delete_reference(env, g_addon.onFlipComplete);
-        g_addon.onFlipComplete = nullptr;
-    }
-    if (argc >= 1) {
-        napi_valuetype t; napi_typeof(env, argv[0], &t);
-        if (t == napi_function) napi_create_reference(env, argv[0], 1, &g_addon.onFlipComplete);
-    }
+    replaceCallbackRef(env, info, g_addon.onFlipComplete);
     napi_value u; napi_get_undefined(env, &u); return u;
 }
 
@@ -2360,16 +2338,7 @@ napi_value SetOnFlipComplete(napi_env env, napi_callback_info info) {
 //  physicalHeightMm, name, make, model}. Called on the Node thread from the
 // ctrl/wire poll. Passing null (or omitting the arg) clears the callback.
 napi_value SetOnOutputDescriptor(napi_env env, napi_callback_info info) {
-    size_t argc = 1; napi_value argv[1];
-    napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
-    if (g_addon.onOutput) {
-        napi_delete_reference(env, g_addon.onOutput);
-        g_addon.onOutput = nullptr;
-    }
-    if (argc >= 1) {
-        napi_valuetype t; napi_typeof(env, argv[0], &t);
-        if (t == napi_function) napi_create_reference(env, argv[0], 1, &g_addon.onOutput);
-    }
+    replaceCallbackRef(env, info, g_addon.onOutput);
     // The GPU process sends the first OutputDescriptor right after SurfaceReady
     // (during bringUp). bringUp doesn't drain past SurfaceReady, so the
     // descriptor may still be in the ctrl-fd kernel buffer when JS registers
@@ -2389,16 +2358,7 @@ napi_value SetOnOutputDescriptor(napi_env env, napi_callback_info info) {
 // reserveScanoutForOutput to complete the runtime ring handshake, and emits
 // output.added on the plugin bus. Pass null/omit to clear.
 napi_value SetOnOutputAdded(napi_env env, napi_callback_info info) {
-    size_t argc = 1; napi_value argv[1];
-    napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
-    if (g_addon.onOutputAdded) {
-        napi_delete_reference(env, g_addon.onOutputAdded);
-        g_addon.onOutputAdded = nullptr;
-    }
-    if (argc >= 1) {
-        napi_valuetype t; napi_typeof(env, argv[0], &t);
-        if (t == napi_function) napi_create_reference(env, argv[0], 1, &g_addon.onOutputAdded);
-    }
+    replaceCallbackRef(env, info, g_addon.onOutputAdded);
     napi_value u; napi_get_undefined(env, &u); return u;
 }
 
@@ -2409,16 +2369,7 @@ napi_value SetOnOutputAdded(napi_env env, napi_callback_info info) {
 // state.outputs[outputId], destroys that output's wl_output global, and
 // fires output.removed. Pass null/omit to clear.
 napi_value SetOnOutputRemoved(napi_env env, napi_callback_info info) {
-    size_t argc = 1; napi_value argv[1];
-    napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
-    if (g_addon.onOutputRemoved) {
-        napi_delete_reference(env, g_addon.onOutputRemoved);
-        g_addon.onOutputRemoved = nullptr;
-    }
-    if (argc >= 1) {
-        napi_valuetype t; napi_typeof(env, argv[0], &t);
-        if (t == napi_function) napi_create_reference(env, argv[0], 1, &g_addon.onOutputRemoved);
-    }
+    replaceCallbackRef(env, info, g_addon.onOutputRemoved);
     napi_value u; napi_get_undefined(env, &u); return u;
 }
 
@@ -2430,16 +2381,7 @@ napi_value SetOnOutputRemoved(napi_env env, napi_callback_info info) {
 // Callback receives { outputId: number, modes: [{ width, height,
 // refreshMhz, preferred }] }. Pass null/omit to clear.
 napi_value SetOnOutputModes(napi_env env, napi_callback_info info) {
-    size_t argc = 1; napi_value argv[1];
-    napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
-    if (g_addon.onOutputModes) {
-        napi_delete_reference(env, g_addon.onOutputModes);
-        g_addon.onOutputModes = nullptr;
-    }
-    if (argc >= 1) {
-        napi_valuetype t; napi_typeof(env, argv[0], &t);
-        if (t == napi_function) napi_create_reference(env, argv[0], 1, &g_addon.onOutputModes);
-    }
+    replaceCallbackRef(env, info, g_addon.onOutputModes);
     // Same bring-up consideration as setOnOutputDescriptor: drain ctrl
     // / wire and fire any already-queued modes so the freshly-registered
     // callback sees them.
@@ -3210,7 +3152,8 @@ napi_value DmabufFeedbackInfo(napi_env env, napi_callback_info) {
 }
 
 napi_value Init(napi_env env, napi_value exports) {
-    installCoreCrashHandler();
+    overdraw::log::installCrashHandler("/tmp/overdraw-core-crash.txt",
+                                       "core (node addon)");
     napi_value fnStart, fnStop, fnPresented, fnStartServer, fnStopServer;
     napi_create_function(env, "start", NAPI_AUTO_LENGTH, Start, nullptr, &fnStart);
     napi_create_function(env, "stop", NAPI_AUTO_LENGTH, Stop, nullptr, &fnStop);
