@@ -130,14 +130,14 @@ export class DynamicBus {
     if (pattern === "*") {
       const entry: PatternEntry = { pattern, prefix: null, exact: null, catchAll: true, cb };
       this.patternSubs.push(entry);
-      return { off: () => { this.removePatternEntry(entry); } };
+      return { off: () => { this.removeEntry(this.patternSubs, entry); } };
     }
 
     if (pattern.endsWith(".*")) {
       const prefix = pattern.slice(0, -1);
       const entry: PatternEntry = { pattern, prefix, exact: null, catchAll: false, cb };
       this.patternSubs.push(entry);
-      return { off: () => { this.removePatternEntry(entry); } };
+      return { off: () => { this.removeEntry(this.patternSubs, entry); } };
     }
 
     // Reject other forms (e.g. 'workspace.*.shown', '*.shown'); cleaner to
@@ -177,7 +177,7 @@ export class DynamicBus {
     // handler's return value will be ignored when emitSync delivers that
     // name. Fire once per (pattern, name) pair.
     for (const n of this.syncOnlyNames) {
-      if (!this.interceptMatches(entry, n)) continue;
+      if (!this.matches(entry, n)) continue;
       const key = `${pattern}\0${n}`;
       if (this.syncWarned.has(key)) continue;
       this.syncWarned.add(key);
@@ -188,7 +188,7 @@ export class DynamicBus {
       );
     }
 
-    return { off: () => { this.removeInterceptEntry(entry); } };
+    return { off: () => { this.removeEntry(this.interceptors, entry); } };
   }
 
   // Declare a name as sync-only. emitSync() is the only legal dispatch for
@@ -357,7 +357,7 @@ export class DynamicBus {
   private matchingInterceptors(name: string): InterceptEntry[] {
     const out: InterceptEntry[] = [];
     for (const e of this.interceptors) {
-      if (this.interceptMatches(e, name)) out.push(e);
+      if (this.matches(e, name)) out.push(e);
     }
     if (out.length > 1) {
       out.sort((a, b) => (a.priority - b.priority) || (a.seq - b.seq));
@@ -402,27 +402,20 @@ export class DynamicBus {
     return { pattern, prefix: null, exact: pattern, catchAll: false, priority, seq: ++this.interceptSeq, cb };
   }
 
-  private matches(entry: PatternEntry, name: string): boolean {
+  // Pattern match shared by subscriptions and interceptors (their entry
+  // types share the compiled prefix/exact/catchAll shape).
+  private matches(
+    entry: { prefix: string | null; exact: string | null; catchAll: boolean },
+    name: string,
+  ): boolean {
     if (entry.catchAll) return true;
     if (entry.prefix !== null) return name.startsWith(entry.prefix);
     if (entry.exact !== null) return name === entry.exact;
     return false;
   }
 
-  private interceptMatches(entry: InterceptEntry, name: string): boolean {
-    if (entry.catchAll) return true;
-    if (entry.prefix !== null) return name.startsWith(entry.prefix);
-    if (entry.exact !== null) return name === entry.exact;
-    return false;
-  }
-
-  private removePatternEntry(target: PatternEntry): void {
-    const i = this.patternSubs.indexOf(target);
-    if (i >= 0) this.patternSubs.splice(i, 1);
-  }
-
-  private removeInterceptEntry(target: InterceptEntry): void {
-    const i = this.interceptors.indexOf(target);
-    if (i >= 0) this.interceptors.splice(i, 1);
+  private removeEntry<T>(arr: T[], target: T): void {
+    const i = arr.indexOf(target);
+    if (i >= 0) arr.splice(i, 1);
   }
 }

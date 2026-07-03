@@ -106,6 +106,17 @@ export function sceneDrawParams(
   };
 }
 
+// outputId validation shared by the in-thread and Worker builders: reject
+// ids that don't resolve to a live output (state.outputs is the source of
+// truth; the virtual fallback is never a legal SDK target).
+function makeCheckOutput(hasOutput: (outputId: number) => boolean): (outputId: number) => void {
+  return (outputId) => {
+    if (!hasOutput(outputId)) {
+      throw new Error(`sdk.compose: outputId=${outputId} is not a live output`);
+    }
+  };
+}
+
 // Construct sdk.compose backed by an in-thread CompositorSink that
 // implements the compose methods (JsCompositor today). The plugin shares
 // core's GPUDevice, so returned GPUTextures are usable directly -- no
@@ -150,14 +161,7 @@ export function createInThreadCompose(
   // (the broker's registry is separate). For tests that don't exercise
   // transitions this is invisible.
   const registry = sceneRegistry ?? createSceneRegistry();
-  // outputId validation: reject ids that don't resolve to a live output
-  // (state.outputs is the source of truth; the virtual fallback is never a
-  // legal SDK target).
-  function checkOutput(outputId: number): void {
-    if (!hasOutput(outputId)) {
-      throw new Error(`sdk.compose: outputId=${outputId} is not a live output`);
-    }
-  }
+  const checkOutput = makeCheckOutput(hasOutput);
 
   return {
     async scene(args): Promise<SceneHandle> {
@@ -300,12 +304,7 @@ export interface WorkerComposeDeps {
 // live mode raises if requested (phase 5b-live adds it).
 export function createWorkerCompose(deps: WorkerComposeDeps): PluginCompose {
   const { hasOutput } = deps;
-
-  function checkOutput(outputId: number): void {
-    if (!hasOutput(outputId)) {
-      throw new Error(`sdk.compose: outputId=${outputId} is not a live output`);
-    }
-  }
+  const checkOutput = makeCheckOutput(hasOutput);
 
   return {
     async scene(args): Promise<SceneHandle> {

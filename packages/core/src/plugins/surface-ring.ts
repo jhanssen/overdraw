@@ -347,9 +347,14 @@ export class SurfaceConsumer {
 
 // Used by both the producer and the consumer halves to wait until at least
 // one slot is PRESENTED (i.e. there's something for the consumer to read).
-// Polls; intended for compose-live's sample() flow.
-export async function awaitPresentedSlot(states: SlotStates): Promise<number> {
+// Polls. The optional `isStopped` predicate lets a tick loop bail during
+// teardown: when it turns true the wait resolves -1 instead of parking on a
+// ring nothing will present into again.
+export async function awaitPresentedSlot(
+  states: SlotStates, isStopped?: () => boolean,
+): Promise<number> {
   for (;;) {
+    if (isStopped?.()) return -1;
     const s = states.presentedSlot();
     if (s >= 0) return s;
     const w = Atomics.waitAsync(states.states, 0, states.state(0));

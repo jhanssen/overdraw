@@ -11,33 +11,14 @@
 import type {
   BindingSpec, ModeSpec,
 } from "@overdraw/hotkey-types";
-
-interface SdkLike {
-  readonly name: string;
-  log(...args: unknown[]): void;
-  registerPlugin<A>(name: string, init: () => Promise<A> | A,
-                   opts?: { priority?: number }): Promise<{ unregister(): void }>;
-  actions: {
-    invoke(name: string, params?: unknown): Promise<unknown>;
-  };
-  input: {
-    bind(opts: { keys: string | readonly string[]; mode?: string;
-                 handler: (event: unknown) => void | Promise<void>;
-                 release?: (event: unknown) => void | Promise<void>;
-                 priority?: number; }): Promise<{ unregister(): void }>;
-    defineMode(name: string, opts?: { exitOnEscape?: boolean }):
-      Promise<{ undefine(): void }>;
-    pushMode(name: string): Promise<void>;
-    popMode(): Promise<void>;
-  };
-}
+import type { PluginSdkShape } from "@overdraw/plugin-sdk-types";
 
 // Minimal namespace API the plugin exposes. There's nothing for other
 // plugins to call into today; the namespace exists so a third-party
 // hotkey plugin can replace this one via the priority chain.
 const api = {} as const;
 
-export default async function init(sdk: SdkLike, rawConfig?: unknown): Promise<void> {
+export default async function init(sdk: PluginSdkShape, rawConfig?: unknown): Promise<void> {
   const config = validateConfig(rawConfig);
 
   // The config validator returns an empty config when rawConfig is null /
@@ -72,66 +53,62 @@ export default async function init(sdk: SdkLike, rawConfig?: unknown): Promise<v
     }
   }
 
-  async function dispatchPress(binding: BindingSpec): Promise<void> {
-    if (binding.action) {
+  // Shared outcome dispatcher: press and release differ only in which
+  // BindingSpec fields carry the outcome (action/pushMode/popMode vs the
+  // release* counterparts). `fieldPrefix` keys the log messages to the
+  // field the user actually wrote.
+  async function dispatchOutcome(
+    outcome: { action?: string; params?: unknown; pushMode?: string; popMode?: true },
+    fieldPrefix: "" | "release",
+    noOutcomeMsg: string,
+  ): Promise<void> {
+    const field = (name: string) =>
+      fieldPrefix === "" ? name : fieldPrefix + name[0].toUpperCase() + name.slice(1);
+    const fail = (what: string, err: unknown) => {
+      const msg = err instanceof Error ? err.message : String(err);
+      sdk.log(`${what} failed: ${msg}`);
+    };
+    if (outcome.action) {
       try {
-        await sdk.actions.invoke(binding.action, binding.params);
+        await sdk.actions.invoke(outcome.action, outcome.params);
       } catch (err: unknown) {
-        const msg = err instanceof Error ? err.message : String(err);
-        sdk.log(`action '${binding.action}' failed: ${msg}`);
+        fail(`${field("action")} '${outcome.action}'`, err);
       }
       return;
     }
-    if (binding.pushMode) {
+    if (outcome.pushMode) {
       try {
-        await sdk.input.pushMode(binding.pushMode);
+        await sdk.input.pushMode(outcome.pushMode);
       } catch (err: unknown) {
-        const msg = err instanceof Error ? err.message : String(err);
-        sdk.log(`pushMode '${binding.pushMode}' failed: ${msg}`);
+        fail(`${field("pushMode")} '${outcome.pushMode}'`, err);
       }
       return;
     }
-    if (binding.popMode) {
+    if (outcome.popMode) {
       try {
         await sdk.input.popMode();
       } catch (err: unknown) {
-        const msg = err instanceof Error ? err.message : String(err);
-        sdk.log(`popMode failed: ${msg}`);
+        fail(field("popMode"), err);
       }
       return;
     }
-    sdk.log(`binding has no outcome: ${JSON.stringify(binding)}`);
+    sdk.log(noOutcomeMsg);
   }
 
-  async function dispatchRelease(binding: BindingSpec): Promise<void> {
-    if (binding.releaseAction) {
-      try {
-        await sdk.actions.invoke(binding.releaseAction, binding.releaseParams);
-      } catch (err: unknown) {
-        const msg = err instanceof Error ? err.message : String(err);
-        sdk.log(`releaseAction '${binding.releaseAction}' failed: ${msg}`);
-      }
-      return;
-    }
-    if (binding.releasePushMode) {
-      try {
-        await sdk.input.pushMode(binding.releasePushMode);
-      } catch (err: unknown) {
-        const msg = err instanceof Error ? err.message : String(err);
-        sdk.log(`releasePushMode '${binding.releasePushMode}' failed: ${msg}`);
-      }
-      return;
-    }
-    if (binding.releasePopMode) {
-      try {
-        await sdk.input.popMode();
-      } catch (err: unknown) {
-        const msg = err instanceof Error ? err.message : String(err);
-        sdk.log(`releasePopMode failed: ${msg}`);
-      }
-      return;
-    }
-    sdk.log(`binding has releaseAction but no outcome: ${JSON.stringify(binding)}`);
+  function dispatchPress(binding: BindingSpec): Promise<void> {
+    return dispatchOutcome(
+      { action: binding.action, params: binding.params,
+        pushMode: binding.pushMode, popMode: binding.popMode },
+      "",
+      `binding has no outcome: ${JSON.stringify(binding)}`);
+  }
+
+  function dispatchRelease(binding: BindingSpec): Promise<void> {
+    return dispatchOutcome(
+      { action: binding.releaseAction, params: binding.releaseParams,
+        pushMode: binding.releasePushMode, popMode: binding.releasePopMode },
+      "release",
+      `binding has releaseAction but no outcome: ${JSON.stringify(binding)}`);
   }
 
   await sdk.registerPlugin("hotkey", () => api);

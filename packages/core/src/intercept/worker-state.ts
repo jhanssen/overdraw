@@ -27,6 +27,7 @@ import {
   SlotStates, createSlotStates,
 } from "../plugins/surface-slots.js";
 import { SurfaceConsumer, SurfaceProducer } from "../plugins/surface-ring.js";
+import type { TickResult } from "./inthread-state.js";
 import type { Addon } from "../types.js";
 import type { CompositorSink } from "../protocols/ctx.js";
 import type { DawnWire } from "../gpu/compositor.js";
@@ -375,9 +376,4 @@ export class WorkerInterceptState {
     this.outputSlotViews[slot] = v;
     return v;
   }
-}
-
-export interface TickResult {
-  ok: boolean;
-  rendered: boolean;
 }

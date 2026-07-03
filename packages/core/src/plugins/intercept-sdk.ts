@@ -67,7 +67,7 @@ export function createInThreadInterceptSdk(deps: InThreadInterceptDeps): Interce
 
 import type { Endpoint, Json } from "./protocol.js";
 import { SlotStates } from "./surface-slots.js";
-import { SurfaceConsumer, SurfaceProducer } from "./surface-ring.js";
+import { SurfaceConsumer, SurfaceProducer, awaitPresentedSlot } from "./surface-ring.js";
 import { log } from "../log.js";
 
 export interface WorkerInterceptDeps {
@@ -473,7 +473,8 @@ class WorkerPerSurfaceState {
     while (!this.stopped) {
       // Wait until the input ring has a PRESENTED slot (core has
       // copied a fresh client texture into it).
-      const inputSlot = await this.waitForPresentedInput();
+      const inputSlot = await awaitPresentedSlot(
+        this.inputSlotStates, () => this.stopped);
       if (this.stopped) return;
       if (inputSlot < 0) continue;
 
@@ -545,19 +546,6 @@ class WorkerPerSurfaceState {
       // Release the input bracket (consumer End fires after the
       // render submit, which the FIFO order guarantees).
       this.inputConsumer.endConsume();
-    }
-  }
-
-  private async waitForPresentedInput(): Promise<number> {
-    // Loop until a PRESENTED slot appears or we're stopped.
-    for (;;) {
-      if (this.stopped) return -1;
-      const s = this.inputSlotStates.presentedSlot();
-      if (s >= 0) return s;
-      const w = Atomics.waitAsync(
-        this.inputSlotStates.states, 0,
-        this.inputSlotStates.state(0));
-      if (w.async) await w.value; else await Promise.resolve();
     }
   }
 
