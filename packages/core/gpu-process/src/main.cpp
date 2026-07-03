@@ -551,7 +551,7 @@ int run(int wireFd, int ctrlFd, int inputFd, bool headless,
     // scanoutBufIdToSlot: each scanout surfaceBufId -> {outputId, slot index
     // 0..2}. The outputId is a dense routing key (KMS: assigned by
     // KmsOutputBackend's allocator; nested host-window: always 0). Same id
-    // carried on ScanoutPresent / ScanoutFlipComplete tags.
+    // carried on ScanoutPresent wire frames and ScanoutFlipComplete tags.
     //
     // scanoutFenceFdByBufId: surfaceBufId -> last exported sync_file fd from
     // the producer EndAccess. Owned here until consumed by the next
@@ -2033,6 +2033,58 @@ int run(int wireFd, int ctrlFd, int inputFd, bool headless,
                         info.refreshMhz / 1000, info.refreshMhz % 1000);
             return;
         }
+        if (kind == ipc::FrameKind::ScanoutPresent) {
+            // Per-frame flip. Wire-FIFO with the slot's render submit and
+            // producer EndAccess: by here runSurfaceEnd has captured the
+            // render-done sync_file into scanoutFenceFdByBufId, so the KMS
+            // commit always carries its IN_FENCE_FD. The payload names the
+            // slot by surfaceBufId, NOT slot index -- map it back to
+            // {output, slot} and dispatch by which backend owns the output.
+            if (nfds != 0) {
+                std::fprintf(stderr,
+                    "[gpu] core wire: ScanoutPresent with nfds=%d (must be 0)\n", nfds);
+                std::abort();
+            }
+            if (frame.size() != ipc::ScanoutPresentPayload::kSize) {
+                std::fprintf(stderr,
+                    "[gpu] core wire: bad ScanoutPresent payload size %zu\n", frame.size());
+                std::abort();
+            }
+            auto p = ipc::ScanoutPresentPayload::decode(frame.data());
+            auto sit = scanoutBufIdToSlot.find(p.surfaceBufId);
+            if (sit == scanoutBufIdToSlot.end()) {
+                // A flip queued before this output's ring was torn down
+                // (hotplug remove, SwitchMode): drop it.
+                std::fprintf(stderr,
+                    "[gpu] ScanoutPresent: unknown surfaceBufId=%u\n",
+                    p.surfaceBufId);
+                return;
+            }
+            const uint32_t outputId = sit->second.first;
+            const int slot = sit->second.second;
+#if OVERDRAW_KMS
+            if (kms) {
+                int fenceFd = -1;
+                auto fit = scanoutFenceFdByBufId.find(p.surfaceBufId);
+                if (fit != scanoutFenceFdByBufId.end()) {
+                    fenceFd = fit->second;
+                    scanoutFenceFdByBufId.erase(fit);
+                }
+                if (!kms->presentScanoutAt(outputId, slot, fenceFd)) {
+                    std::fprintf(stderr,
+                        "[gpu] presentScanoutAt(output=%u, slot=%d) rejected by kernel\n",
+                        outputId, slot);
+                }
+                if (fenceFd >= 0) ::close(fenceFd);
+                return;
+            }
+#endif
+            if (!headless && !outputKms) {
+                auto* hb = static_cast<gpu::HostWindowOutputBackend*>(output.get());
+                hb->presentScanout(slot);
+            }
+            return;
+        }
         if (kind == ipc::FrameKind::ImportClientTex) {
             // In-band dmabuf import: FIFO-ordered with surrounding wire commands
             // so the just-Reserved texture slot at handle.id (which grew the wire
@@ -2514,44 +2566,6 @@ int run(int wireFd, int ctrlFd, int inputFd, bool headless,
         {
             if (m.tag == ipc::Tag::Shutdown) {
                 shutdown = true;
-            } else if (m.tag == ipc::Tag::ScanoutPresent) {
-                // m.surfaceBufId is the scanout slot's surfaceBufId, NOT
-                // the slot index. Map it back to {output, slot}. Backend
-                // dispatch by which one owns this output: KMS routes to
-                // presentScanoutAt with the producer-EndAccess sync_file
-                // fd captured earlier; the nested host-window backend
-                // routes to its scanout ring (no fence -- implicit sync
-                // via the dmabuf reservation).
-                auto sit = scanoutBufIdToSlot.find(m.surfaceBufId);
-                if (sit == scanoutBufIdToSlot.end()) {
-                    std::fprintf(stderr,
-                        "[gpu] ScanoutPresent: unknown surfaceBufId=%u\n",
-                        m.surfaceBufId);
-                } else {
-                    const uint32_t outputId = sit->second.first;
-                    const int slot = sit->second.second;
-#if OVERDRAW_KMS
-                    if (kms) {
-                        int fenceFd = -1;
-                        auto fit = scanoutFenceFdByBufId.find(m.surfaceBufId);
-                        if (fit != scanoutFenceFdByBufId.end()) {
-                            fenceFd = fit->second;
-                            scanoutFenceFdByBufId.erase(fit);
-                        }
-                        if (!kms->presentScanoutAt(outputId, slot, fenceFd)) {
-                            std::fprintf(stderr,
-                                "[gpu] presentScanoutAt(output=%u, slot=%d) rejected by kernel\n",
-                                outputId, slot);
-                        }
-                        if (fenceFd >= 0) ::close(fenceFd);
-                    } else
-#endif
-                    if (!headless && !outputKms) {
-                        auto* hb = static_cast<gpu::HostWindowOutputBackend*>(output.get());
-                        hb->presentScanout(slot);
-                    }
-                }
-                for (int i = 0; i < nRecvFds; ++i) ::close(recvFds[i]);
 #if OVERDRAW_KMS
             } else if (m.tag == ipc::Tag::OutputPause) {
                 if (kms) kms->pause();

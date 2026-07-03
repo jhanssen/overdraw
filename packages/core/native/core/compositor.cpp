@@ -1312,22 +1312,18 @@ void Compositor::presentOutput(uint32_t outputId) {
     // SCM_RIGHTS path -- the GPU process owns it.
     writeProducerEndAccess(so.slots[slot].surfaceBufId);
 
-    // Drain the wire BEFORE the ScanoutPresent ctrl message. ScanoutPresent
-    // (the flip) rides ctrl; the slot's render commands and the producer
-    // EndAccess (the render-done fence the flip's IN_FENCE_FD depends on) ride
-    // the wire. With deferred wire pumping the wire bytes are only staged, so
-    // sending the ctrl flip first lets it overtake them across the two fds --
-    // the GPU process flips to a slot whose render/fence haven't arrived
-    // (tearing). Flushing here re-establishes "wire render+fence on the socket
-    // before the ctrl flip is sent", the ordering ScanoutPresent relies on (it
-    // is not WireBarrier-gated).
+    // The flip rides the wire, in-band after the slot's render submit and the
+    // EndAccess above -- FIFO by construction, so the GPU process has already
+    // captured the render-done fence when it dispatches the flip. flush() is
+    // non-blocking; under backpressure the frame drains with the rest of the
+    // wire queue, still in order.
+    ipc::ScanoutPresentPayload pl{};
+    pl.outputId     = outputId;
+    pl.surfaceBufId = so.slots[slot].surfaceBufId;
+    uint8_t buf[ipc::ScanoutPresentPayload::kSize];
+    pl.encode(buf);
+    link_->appendFrame(ipc::FrameKind::ScanoutPresent, buf, sizeof(buf));
     link_->flush();
-
-    ipc::Message m{};
-    m.tag = ipc::Tag::ScanoutPresent;
-    m.outputId = outputId;
-    m.surfaceBufId = so.slots[slot].surfaceBufId;
-    ipc::sendMessage(ctrlFd_, m);
     presented_++;
     // Nested per-vblank gate: arm. drainCtrl clears this when the next
     // FrameComplete arrives. (KMS doesn't need this -- the PENDING_FLIP

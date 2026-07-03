@@ -37,9 +37,9 @@ class Compositor {
     // the GPU process must also be spawned with matching --headless WxH.
     //
     // `kms` selects the bare-metal output path: scanout textures dual-imported
-    // from GBM dmabufs and driven by atomic-commit / page-flip-event traffic
-    // on the side channel (ScanoutPresent / ScanoutFlipComplete). Mutually
-    // exclusive with `headless`.
+    // from GBM dmabufs, flips requested in-band on the wire
+    // (FrameKind::ScanoutPresent) and retired via ScanoutFlipComplete on the
+    // side channel. Mutually exclusive with `headless`.
     //
     // Default (`kms`=false, `headless`=false): nested mode. The GPU process
     // is a Wayland client of the host compositor; the on-screen target is
@@ -261,8 +261,9 @@ class Compositor {
     // during bring-up. The core tracks per-slot state locally and dispatches:
     //   acquireOutputTextureHandle() -> returns the next FREE slot's texture
     //     handle, or nullptr if no slot is currently free.
-    //   presentOutput() -> writes the producer EndAccess on the wire, sends
-    //     ScanoutPresent on the side channel, and marks the slot PENDING_FLIP.
+    //   presentOutput() -> writes the producer EndAccess and the
+    //     ScanoutPresent flip on the wire (FIFO-ordered), and marks the
+    //     slot PENDING_FLIP.
     // KMS: the GPU process's page-flip handler sends ScanoutFlipComplete on
     //   flip; drainCtrl advances the slot state machine.
     // Nested: the GPU process's wl_buffer.release listener sends

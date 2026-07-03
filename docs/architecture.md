@@ -1314,8 +1314,9 @@ No discovery, no drop-in directories. Single source of truth.
   per output via GBM, imports each slot into Dawn as
   `SharedTextureMemory`, and wraps each as a host `wl_buffer` via the
   host's `zwp_linux_dmabuf_v1`. The core composites into the next FREE
-  slot's `wgpu::Texture` over the wire; presentOutput sends
-  `ScanoutPresent` on the side channel; the GPU process runs
+  slot's `wgpu::Texture` over the wire; presentOutput appends a
+  `ScanoutPresent` wire frame (FIFO after the render + EndAccess); the
+  GPU process runs
   `wl_surface.attach(slot.wl_buffer)` + `damage_buffer` + `commit`. The
   host's `wl_buffer.release` retires the prior slot.
 - Core is also a Wayland *server* for its own clients. Imports their

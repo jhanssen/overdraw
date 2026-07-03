@@ -97,26 +97,32 @@ enum class Tag : uint8_t {
     ScanoutReady    = 'y',  // gpu -> core: the scanout ring is built and injected
                             //   at the three reserved handles. ok=1 success, 0 failure.
                             //   Sent once during bring-up.
-    ScanoutPresent  = 'z',  // core -> gpu: the JS compositor finished rendering
-                            //   into slot `surfaceBufId` (the slot index, 0..2).
-                            //   The GPU process runs drmModeAtomicCommit with
-                            //   IN_FENCE_FD set to the attached sync_file fd (via
-                            //   SCM_RIGHTS) so the kernel waits for GPU work to
-                            //   complete. fence fd may be absent (no SCM_RIGHTS
-                            //   payload) -- then no IN_FENCE_FD is added.
+    // ScanoutPresent (the per-frame flip request) rides the WIRE socket as
+    // FrameKind::ScanoutPresent (transport.h). The wire-FIFO ordering is
+    // load-bearing: the flip must land AFTER the slot's render submit and
+    // producer EndAccess (whose exported sync_file becomes the KMS commit's
+    // IN_FENCE_FD). Retired ctrl letter (do not reuse): 'z'.
+    // See architecture.md "Why wire, not ctrl".
     ScanoutFlipComplete = 'Y',  // gpu -> core: a page-flip retired a slot. The
                                 //   `surfaceBufId` field carries the slot index
                                 //   that just exited SCANOUT (now FREE). The core
                                 //   advances its slot state machine off this.
                                 //   Also doubles as the KMS frame-complete signal
                                 //   for the wake/render state machine.
+                                //   Safe on ctrl (no wire dependency): it only
+                                //   touches the core's own slot bookkeeping and
+                                //   names a slot the core itself created; the
+                                //   render it triggers writes NEW wire frames,
+                                //   ordered after everything already queued.
     FrameComplete = 'f',  // gpu -> core: nested mode's host wl_surface.frame
                           //   callback fired (the host compositor is ready for
                           //   the next frame). The KMS path uses
                           //   ScanoutFlipComplete for the same purpose; the two
                           //   exist as separate tags because KMS carries the
                           //   retired slot idx in its payload and nested has
-                          //   no equivalent.
+                          //   no equivalent. Safe on ctrl for the same reason:
+                          //   a pure wakeup, referencing no wire-introduced
+                          //   resource.
     OutputPause  = 'q',  // core -> gpu: VT-switch-away (libseat disable_seat).
                          //   GPU process stops atomic commits, clears any pending
                          //   flip wait, resets the scanout ring's per-slot state
@@ -257,10 +263,8 @@ struct Message {
     char outputEdidId[64] = {};
 
     // Routing id of the output this message concerns, for every output-scoped
-    // tag: OutputDescriptor, ScanoutReserve, ScanoutReady, ScanoutPresent,
-    // ScanoutFlipComplete. The core keys state.outputs by it and the GPU process
-    // routes per-output scanout state by it. 0 is the first output; one output
-    // exists today, so it is always 0 until multi-output enumeration lands.
+    // tag (OutputDescriptor, ScanoutFlipComplete). The core keys state.outputs
+    // by it and the GPU process routes per-output scanout state by it.
     uint32_t outputId = 0;
 
     // OutputDescriptor: total number of outputs the GPU process is driving. Set
@@ -530,6 +534,30 @@ struct SwitchModePayload {
 };
 static_assert(SwitchModePayload::kSize == 16,
               "SwitchModePayload size mismatch with hand-counted layout");
+
+// ScanoutPresent payload (core -> gpu, FrameKind::ScanoutPresent): flip
+// the scanout slot holding `surfaceBufId` on `outputId`. No fence rides
+// with it: the GPU process captured the render-done sync_file from the
+// slot's producer EndAccess (FIFO-earlier on the same wire) and attaches
+// it as the KMS atomic commit's IN_FENCE_FD; the nested backend relies
+// on the dmabuf's implicit-sync reservation instead.
+struct ScanoutPresentPayload {
+    uint32_t outputId;
+    uint32_t surfaceBufId;
+    static constexpr size_t kSize = 2 * 4;  // 8
+    void encode(uint8_t* out) const {
+        putU32LE(out + 0, outputId);
+        putU32LE(out + 4, surfaceBufId);
+    }
+    static ScanoutPresentPayload decode(const uint8_t* p) {
+        ScanoutPresentPayload r{};
+        r.outputId     = getU32LE(p + 0);
+        r.surfaceBufId = getU32LE(p + 4);
+        return r;
+    }
+};
+static_assert(ScanoutPresentPayload::kSize == 8,
+              "ScanoutPresentPayload size mismatch with hand-counted layout");
 
 // ScanoutRebuild payload (gpu -> core, FrameKind::ScanoutRebuild): the
 // GPU has torn down the named output's ring and the new dims are

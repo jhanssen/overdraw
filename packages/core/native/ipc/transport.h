@@ -242,6 +242,19 @@ enum class FrameKind : uint8_t {
                               // observable on the GPU device. Payload:
                               // ShmUploadedPayload (uploadSeq). The core
                               // releases the wl_buffer keyed by uploadSeq.
+    ScanoutPresent = 23,      // core -> gpu: flip the scanout slot named by
+                              // surfaceBufId to the display (KMS atomic
+                              // commit with the captured producer-EndAccess
+                              // sync_file as IN_FENCE_FD; nested host-window
+                              // attach+commit, implicit sync). Rides the
+                              // wire so it is FIFO-ordered AFTER the slot's
+                              // render submit and producer EndAccess (kind=2)
+                              // -- the EndAccess captures the render-done
+                              // fence the flip depends on. On ctrl the flip
+                              // could overtake those wire bytes across the
+                              // two fds and commit with no fence (a torn
+                              // frame). Payload: ScanoutPresentPayload
+                              // (outputId, surfaceBufId).
 };
 
 // Max fds attachable in one message (control msg OR in-band wire frame).

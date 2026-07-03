@@ -308,8 +308,12 @@ node-addon-api, to avoid exception/RTTI dependence under `-fno-rtti`).
     `PluginInstanceInjected`, `SetPluginTickDevice`.
   - Steady-state without a wire dependency: `OutputDescriptor` (the
     re-emit notifies JS that state.outputs needs refresh; nothing
-    keys subsequent wire frames off it), `ScanoutPresent`,
-    `ScanoutFlipComplete`, `FrameComplete`.
+    keys subsequent wire frames off it), `ScanoutFlipComplete`,
+    `FrameComplete` (both pure gpu→core wakeups referencing no
+    wire-introduced resource). `ScanoutPresent` rides the WIRE
+    (`FrameKind::ScanoutPresent`): the flip depends on the slot's
+    render submit + producer EndAccess fence, so it must be
+    FIFO-ordered behind them.
 - **Input** over a dedicated `SOCK_SEQPACKET` socket (separate from
   control so unsolicited input never interleaves with request/reply
   traffic).
@@ -909,14 +913,15 @@ explicitly via `setupCompositor({ headless: false, backend: "kms" })`.
 3. JS records render commands + calls `queue.submit`. The in-band Begin
    already opened the STM bracket so the submit is validated.
 4. JS calls `addon.presentOutput()`. Core writes an in-band EndAccess
-   frame on the wire, then sends `ipc::Tag::ScanoutPresent { surfaceBufId }`
-   on ctrl, then flushes the wire.
+   frame followed by a `FrameKind::ScanoutPresent { outputId,
+   surfaceBufId }` frame on the wire, then flushes. Wire FIFO orders
+   the flip behind the render submit and the EndAccess.
 5. GPU process's wire reader hits the EndAccess frame, calls
    `runSurfaceEnd(surfaceBufId, producer=true)` which calls `mem.EndAccess`.
    The exported sync_file fd is captured into
    `scanoutSlotFenceFd[slot]` (instead of the usual cross-device fence
    import path — there's no wgpu consumer device for scanout).
-6. GPU process's ctrl handler dispatches `ScanoutPresent`: looks up
+6. GPU process's wire control dispatch hits `ScanoutPresent`: looks up
    `scanoutBufIdToSlot[surfaceBufId]` → slot index, picks up the
    captured fence fd, builds an atomic commit with the slot's `fb_id`
    on the primary plane + the fence fd on the plane's `IN_FENCE_FD`
@@ -1012,8 +1017,9 @@ connector→CRTC link, CRTC mode blob, and CRTC active.
 
 - `packages/core/native/core/seat.{h,cpp}` — libseat wrapper (slice 1).
 - `packages/core/native/ipc/side_channel.h` — `SetDrmFd`,
-  `ScanoutReserve`, `ScanoutReady`, `ScanoutPresent`,
-  `ScanoutFlipComplete`, `OutputPause`, `OutputResume` messages.
+  `ScanoutFlipComplete`, `OutputPause`, `OutputResume` ctrl messages;
+  `ScanoutPresentPayload` for the wire-borne flip
+  (`FrameKind::ScanoutPresent`, transport.h).
 - `packages/core/native/core/compositor.{h,cpp}` — KMS-aware
   `acquireOutputTextureHandle` / `presentOutput`, scanout slot state
   machine, in-band Begin/End writes.
