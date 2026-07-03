@@ -14,15 +14,19 @@
 //     INSET region of the output, starting at (B, B) and extending
 //     (inputW, inputH). The fragment evaluates the INNER shape SDF (= outer
 //     shape radii inset by B) for antialiased coverage AND the border gradient
-//     at the same output-space pixel, and emits mix(gradient, client, coverage)
-//     with REPLACE blend. Where the client fully covers (coverage 1) the output
-//     is the client sample with its own alpha intact -- so a translucent window
+//     at the same output-space pixel, then emits, with REPLACE blend,
+//     mix(gradient, client-over-rim-underlay, coverage). The rim underlay
+//     composites the client source-over the gradient within one corner radius
+//     of the inner edge, so a client that rounds its own corners (a CSD buffer
+//     with transparent corner pixels) blends into the band instead of showing
+//     the backdrop through the corner. Deeper than the rim the output is the
+//     client sample with its own alpha intact -- a translucent window body
 //     stays translucent and blends against the real backdrop in the final
 //     composite, rather than being baked opaque over the gradient. Across the
 //     rounded inner edge it blends to the opaque border band; corner cutouts
 //     (coverage 0) are discarded, leaving pass 1's gradient. For an opaque
-//     client this is identical to a premultiplied source-over of the client
-//     onto the band.
+//     client all of this is identical to a premultiplied source-over of the
+//     client onto the band.
 //
 // The blit shader contains all four shape kinds (rect, rounded-rect uniform,
 // rounded-rect per-corner, squircle) selected by a uniform `kind` value.
@@ -221,14 +225,6 @@ fn sdfRoundedRect(p : vec2f, he : vec2f, r : f32) -> f32 {
   return min(max(q.x, q.y), 0.0) + length(max(q, vec2f(0.0))) - r;
 }
 
-fn sdfRoundedRectPerCorner(p : vec2f, he : vec2f,
-                           tl : f32, tr : f32, br : f32, bl : f32) -> f32 {
-  var r : f32 = 0.0;
-  if (p.x < 0.0) { if (p.y < 0.0) { r = tl; } else { r = bl; } }
-  else           { if (p.y < 0.0) { r = tr; } else { r = br; } }
-  return sdfRoundedRect(p, he, r);
-}
-
 fn sdfSquircleRect(p : vec2f, he : vec2f, r : f32, n : f32) -> f32 {
   let cr = min(r, min(he.x, he.y));
   let exp = max(n, 2.0);
@@ -246,38 +242,51 @@ fn sdfCoverage(d : f32) -> f32 {
   return 1.0 - smoothstep(-0.5, 0.5, d);
 }
 
-fn innerCoverage(ip : vec2f) -> f32 {
+// Signed inner-shape distance (px, negative inside) in .x and the corner
+// radius governing this pixel's nearest corner in .y (0 = square / no inner
+// clip; the sentinel -1e6 distance means "deep inside, unclipped").
+fn innerShape(ip : vec2f) -> vec2f {
   let kind = u32(u.shape.x);
-  if (kind == 0u) { return 1.0; }   // rect: no inner clip
+  if (kind == 0u) { return vec2f(-1e6, 0.0); }   // rect: no inner clip
   let iw = u.shape.y;
   let ih = u.shape.z;
   let he = vec2f(iw, ih) * 0.5;
   let p  = ip - he;   // recenter on the inset region's midpoint
   if (kind == 1u) {
-    return sdfCoverage(sdfRoundedRect(p, he, u.shape.w));
+    return vec2f(sdfRoundedRect(p, he, u.shape.w), u.shape.w);
   }
   if (kind == 2u) {
-    return sdfCoverage(sdfRoundedRectPerCorner(
-      p, he, u.shapeExtra.x, u.shapeExtra.y, u.shapeExtra.z, u.shapeExtra.w));
+    var r : f32 = 0.0;
+    if (p.x < 0.0) { if (p.y < 0.0) { r = u.shapeExtra.x; } else { r = u.shapeExtra.w; } }
+    else           { if (p.y < 0.0) { r = u.shapeExtra.y; } else { r = u.shapeExtra.z; } }
+    return vec2f(sdfRoundedRect(p, he, r), r);
   }
   if (kind == 3u) {
-    return sdfCoverage(sdfSquircleRect(p, he, u.shape.w, u.shapeExtra.x));
+    return vec2f(sdfSquircleRect(p, he, u.shape.w, u.shapeExtra.x), u.shape.w);
   }
-  return 1.0;
+  return vec2f(-1e6, 0.0);
 }
 
 @fragment fn fs(in : VsOut) -> @location(0) vec4f {
-  let cov = innerCoverage(in.ip);
+  let s = innerShape(in.ip);
+  let cov = sdfCoverage(s.x);
   if (cov <= 0.0) { discard; }   // corner cutouts keep the border pass's gradient
   let sample = textureSample(tex, samp, in.uv);   // premultiplied client
   let band = gradientAt(u.size.zw + in.ip);       // premultiplied border at this pixel
-  // Replace blend: emit the final pixel directly. mix preserves the client's
-  // own alpha where it fully covers (cov=1) -- so a translucent window stays
-  // translucent and blends against the real backdrop downstream instead of
-  // being baked opaque over the border -- and blends to the opaque border
-  // across the antialiased inner edge (cov: 1 -> 0). For an opaque client this
-  // is identical to a premultiplied source-over of (sample*cov) onto the band.
-  return mix(band, sample, cov);
+  // Band underlay: within one corner radius of the inner edge the client is
+  // composited source-over the band, so a client that rounds its own corners
+  // (a CSD buffer with transparent corner pixels) blends into the band rather
+  // than punching a see-through hole to the backdrop. The underlay fades out
+  // with depth; past it the client's own alpha is preserved, so a translucent
+  // window body still blends against the real backdrop downstream instead of
+  // being baked opaque over the gradient.
+  let rim = smoothstep(-max(s.y, 1e-4), 0.0, s.x);
+  let over = sample + band * ((1.0 - sample.a) * rim);
+  // Replace blend: emit the final pixel directly, blending to the opaque
+  // border across the antialiased inner edge (cov: 1 -> 0). For an opaque
+  // client this is identical to a premultiplied source-over of (sample*cov)
+  // onto the band.
+  return mix(band, over, cov);
 }
 `;
 

@@ -1,9 +1,12 @@
 // The decoration blit composes the client over the border gradient with
-// mix(gradient, client, coverage) + replace blend, so a TRANSLUCENT client
-// keeps its own alpha in the inset (it blends against the real backdrop
-// downstream) instead of being baked opaque toward the gradient. This drives
-// render.ts directly: a known gradient + a translucent input texture, reading
-// back the decoration output. Opaque inputs are unchanged (control case).
+// mix(gradient, client-over-rim-underlay, coverage) + replace blend: a
+// TRANSLUCENT client keeps its own alpha in the window body (it blends
+// against the real backdrop downstream) instead of being baked opaque toward
+// the gradient, while within one corner radius of the inner edge the band is
+// underlaid so a client's own rounded-corner transparency blends into the
+// band rather than showing the backdrop. This drives render.ts directly: a
+// known gradient + known input textures, reading back the decoration output.
+// Opaque inputs are unchanged (control case).
 
 import test from "node:test";
 import assert from "node:assert/strict";
@@ -46,14 +49,15 @@ function bgraTexture(device, w, h, bgra) {
   return tex;
 }
 
-async function renderDeco(device, jsCompositor, render, inputBgra) {
+async function renderDeco(device, jsCompositor, render, inputBgra,
+    shape = { kind: 0, radius: 0 }) {
   const pipeline = render.createDecorationPipeline(device);
   const draw = render.createDecorationDraw(pipeline);
   render.writeBorderUniforms(device, draw, OUTW, OUTH, FILL);
   // No CSD shadow here: the content sub-rect is the whole buffer (bufferW/H =
   // INW/INH, offset 0,0), so the blit samples the full input.
   render.writeBlitUniforms(device, draw, OUTW, OUTH, INW, INH, INW, INH, 0, 0, B,
-    { kind: 0, radius: 0 }, FILL);
+    shape, FILL);
   const input = bgraTexture(device, INW, INH, inputBgra);
   const output = device.createTexture({
     size: { width: OUTW, height: OUTH },
@@ -112,6 +116,35 @@ test("decoration blit preserves a translucent client's alpha; opaque unchanged",
     const o = px(opaqueData, OUTW >> 1, OUTH >> 1);
     assert.ok(o[2] >= 250 && o[3] >= 250 && o[0] <= 6 && o[1] <= 6,
       `opaque center should be solid red, unchanged, got ${o}`);
+
+    // --- Rim underlay (rounded inner shape, radius 12). A fully transparent
+    // input stands in for a client's own rounded-corner transparency: just
+    // inside the inner edge the band must show through the client's alpha
+    // (underlay ~1), while the window body keeps the client's alpha
+    // (underlay 0) so real translucency still reaches the backdrop.
+    const ROUND = { kind: 1, radius: 12 };
+    const clearData = await renderDeco(device, jsCompositor, render, [0, 0, 0, 0], ROUND);
+    // Top-edge midpoint, 1.5px inside the inner edge: rim ~0.96 of the gray band.
+    const rimPx = px(clearData, OUTW >> 1, B + 1);
+    assert.ok(rimPx[3] >= 230, `near-edge alpha should be ~band-opaque, got ${rimPx}`);
+    assert.ok(rimPx.slice(0, 3).every((v) => v >= 45 && v <= 64),
+      `near-edge color should be the gray band, got ${rimPx}`);
+    // Window body: transparent client stays transparent (no band bake-in).
+    const bodyPx = px(clearData, OUTW >> 1, OUTH >> 1);
+    assert.ok(bodyPx.every((v) => v <= 6),
+      `body should keep the client's transparency, got ${bodyPx}`);
+    // Corner cutout (outside the inner shape): pass 1's opaque gray band.
+    const cut = px(clearData, B + 1, B + 1);
+    assert.ok(Math.abs(cut[0] - GRAY_BYTE) <= 4 && Math.abs(cut[1] - GRAY_BYTE) <= 4
+      && Math.abs(cut[2] - GRAY_BYTE) <= 4 && cut[3] >= 250,
+      `corner cutout should be the opaque band, got ${cut}`);
+
+    // Opaque client with the same rounding: the underlay is a no-op, the
+    // near-edge pixel is pure client.
+    const opaqueRound = await renderDeco(device, jsCompositor, render, [0, 0, 255, 255], ROUND);
+    const or = px(opaqueRound, OUTW >> 1, B + 1);
+    assert.ok(or[2] >= 250 && or[3] >= 250 && or[0] <= 6 && or[1] <= 6,
+      `opaque near-edge should be solid red (no band bleed), got ${or}`);
   } finally {
     addon.stop();
   }
