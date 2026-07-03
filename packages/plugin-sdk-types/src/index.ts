@@ -15,6 +15,7 @@
 
 import type { FocusReason } from "@overdraw/focus-types";
 import type { CursorAPI } from "@overdraw/cursor-types";
+import type { InterceptAPI } from "@overdraw/intercept-types";
 
 // ---- actions ---------------------------------------------------------------
 
@@ -59,6 +60,26 @@ export interface WindowSnapshotLike {
   state: { [key: string]: unknown };
 }
 
+export interface InsetsLike {
+  top: number; right: number; bottom: number; left: number;
+}
+
+// What the WM accepted for a setInsets request (after clamping), plus the
+// current outer rect and the derived content rect.
+export interface InsetGrantLike {
+  insets: InsetsLike;
+  outerRect: { x: number; y: number; width: number; height: number };
+  contentRect: { x: number; y: number; width: number; height: number };
+}
+
+// Perimeter clip applied at composite. null = sharp rectangle.
+export type SurfaceShapeLike =
+  | null
+  | { kind: "rounded-rect"; radius: number }
+  | { kind: "rounded-rect-per-corner";
+      tl: number; tr: number; br: number; bl: number }
+  | { kind: "superellipse"; exponent: number; radius: number };
+
 export interface PluginWindowsLike {
   setState(id: number, key: string, value: unknown): Promise<void>;
   deleteState(id: number, key: string): Promise<void>;
@@ -67,6 +88,15 @@ export interface PluginWindowsLike {
   list(): Promise<WindowSnapshotLike[]>;
   onMap(cb: (ev: { surfaceId: number; outputId: number }) => void): void;
   onUnmap(cb: (ev: { surfaceId: number }) => void): void;
+  // Reserve a band around the window's content (decoration providers).
+  setInsets(id: number, insets: InsetsLike): Promise<InsetGrantLike | null>;
+  setShape(id: number, shape: SurfaceShapeLike): Promise<void>;
+}
+
+// ---- gpu ---------------------------------------------------------------------
+
+export interface PluginGpuLike {
+  device: GPUDevice;
 }
 
 // ---- input (keyboard binding chain) ----------------------------------------
@@ -140,4 +170,6 @@ export interface PluginSdkShape {
   cursor?: CursorAPI;
   compose?: PluginComposeLike;
   transitions?: PluginTransitionsLike;
+  gpu?: PluginGpuLike;
+  intercept?: InterceptAPI;
 }

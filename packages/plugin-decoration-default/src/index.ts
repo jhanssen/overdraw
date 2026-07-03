@@ -30,7 +30,7 @@
 //     is what lets a static window -- one that never commits again --
 //     reflect the change on that frame.
 
-import type { PluginSdk } from "../../core/dist/plugins/sdk.js";
+import type { PluginSdkShape } from "@overdraw/plugin-sdk-types";
 
 import {
   validateConfig, encodeShape, insetShape, scaleShape,
@@ -75,7 +75,7 @@ interface PerWindow {
   released: boolean;
 }
 
-export default async function init(sdk: PluginSdk, rawConfig?: unknown): Promise<void> {
+export default async function init(sdk: PluginSdkShape, rawConfig?: unknown): Promise<void> {
   const config = validateConfig(rawConfig);
   if (!sdk.gpu || !sdk.intercept) {
     throw new Error(

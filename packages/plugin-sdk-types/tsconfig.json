@@ -4,10 +4,22 @@
     "rootDir": "src",
     "outDir": "dist"
   },
-  "include": ["src/**/*.ts"],
-  "exclude": ["dist", "node_modules"],
+  "include": [
+    "src/**/*.ts"
+  ],
+  "exclude": [
+    "dist",
+    "node_modules"
+  ],
   "references": [
-    { "path": "../cursor-types" },
-    { "path": "../focus-types" }
+    {
+      "path": "../cursor-types"
+    },
+    {
+      "path": "../focus-types"
+    },
+    {
+      "path": "../intercept-types"
+    }
   ]
 }

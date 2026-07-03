@@ -24,7 +24,7 @@ import type { CursorAPI } from "@overdraw/cursor-types";
 import type { InterceptAPI } from "@overdraw/intercept-types";
 import type {
   PluginActionsLike, PluginEventsLike, PluginWindowsLike, PluginInputLike,
-  PluginComposeLike, PluginTransitionsLike,
+  PluginComposeLike, PluginTransitionsLike, PluginGpuLike,
 } from "@overdraw/plugin-sdk-types";
 
 // Compile-time drift guard: each real SDK slice must satisfy the published
@@ -38,6 +38,7 @@ export type _WindowsSatisfyPublished = SatisfiesPublished<PluginWindowsLike, Plu
 export type _InputSatisfiesPublished = SatisfiesPublished<PluginInputLike, PluginInput>;
 export type _ComposeSatisfiesPublished = SatisfiesPublished<PluginComposeLike, PluginCompose>;
 export type _TransitionsSatisfyPublished = SatisfiesPublished<PluginTransitionsLike, PluginTransitions>;
+export type _GpuSatisfiesPublished = SatisfiesPublished<PluginGpuLike, PluginGpu>;
 
 export interface PluginSdk {
   // The plugin's stable name (config `name`, defaulting to its module).

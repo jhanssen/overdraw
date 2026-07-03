@@ -14,6 +14,7 @@
   },
   "dependencies": {
     "@overdraw/cursor-types": "*",
-    "@overdraw/focus-types": "*"
+    "@overdraw/focus-types": "*",
+    "@overdraw/intercept-types": "*"
   }
 }

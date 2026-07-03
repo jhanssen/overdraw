@@ -4,9 +4,19 @@
     "rootDir": "src",
     "outDir": "dist"
   },
-  "include": ["src/**/*.ts"],
-  "exclude": ["dist", "node_modules"],
+  "include": [
+    "src/**/*.ts"
+  ],
+  "exclude": [
+    "dist",
+    "node_modules"
+  ],
   "references": [
-    { "path": "../decoration-types" }
+    {
+      "path": "../decoration-types"
+    },
+    {
+      "path": "../plugin-sdk-types"
+    }
   ]
 }

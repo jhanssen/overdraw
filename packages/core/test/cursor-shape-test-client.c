@@ -144,7 +144,7 @@ int main(int argc, char** argv) {
 
     // Toplevel red buffer.
     int fdTl = memfd_create("cs-test-tl", 0);
-    ftruncate(fdTl, POOL_SIZE_TL);
+    if (fdTl < 0 || ftruncate(fdTl, POOL_SIZE_TL) != 0) { perror("memfd"); return 1; }
     uint32_t* pxTl = mmap(NULL, POOL_SIZE_TL, PROT_READ | PROT_WRITE, MAP_SHARED, fdTl, 0);
     for (int i = 0; i < W * H; ++i) pxTl[i] = 0xFFFF0000u;  // ARGB red
     munmap(pxTl, POOL_SIZE_TL);
