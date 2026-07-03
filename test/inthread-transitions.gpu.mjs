@@ -11,21 +11,13 @@
 
 import test from "node:test";
 import assert from "node:assert/strict";
-import { createRequire } from "node:module";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { dirname, join } from "node:path";
-import { globSync } from "node:fs";
+import { loadAddon, loadDawn, gpuBin, coreRoot } from "./harness.mjs";
 
-const require = createRequire(import.meta.url);
 const __dirname = dirname(fileURLToPath(import.meta.url));
-const OD = join(__dirname, "..", "packages", "core");
-const addon = require(join(OD, "build", "overdraw_native.node"));
-let dawn = null;
-try {
-  const [p] = globSync(join(OD, "build", "3rdparty", "dawn", "Dawn-*", "dawn.node"));
-  if (p) dawn = require(p);
-} catch { dawn = null; }
-const gpuBin = join(OD, "build", "overdraw-gpu-process");
+const addon = loadAddon();
+const dawn = loadDawn();
 
 const W = 128, H = 128;
 const RED_ID = 100, BLUE_ID = 200;
@@ -42,13 +34,13 @@ function solid(bgra, w, h) {
 
 test("bundled in-thread plugin runs sdk.transitions.run (crossfade)",
     { skip: !dawn ? "dawn.node not built" : false }, async () => {
-  const { JsCompositor } = await import(join(OD, "dist", "gpu", "compositor.js"));
-  const { PluginRuntime } = await import(join(OD, "dist", "plugins", "index.js"));
-  const { createOverlayBroker } = await import(join(OD, "dist", "overlay.js"));
-  const { createSceneRegistry } = await import(join(OD, "dist", "plugins", "scene-registry.js"));
+  const { JsCompositor } = await import(join(coreRoot, "dist", "gpu", "compositor.js"));
+  const { PluginRuntime } = await import(join(coreRoot, "dist", "plugins", "index.js"));
+  const { createOverlayBroker } = await import(join(coreRoot, "dist", "overlay.js"));
+  const { createSceneRegistry } = await import(join(coreRoot, "dist", "plugins", "scene-registry.js"));
   const {
     createTransitionsBroker, NOT_HANDLED: TX_NOT_HANDLED,
-  } = await import(join(OD, "dist", "plugins", "transitions-broker.js"));
+  } = await import(join(coreRoot, "dist", "plugins", "transitions-broker.js"));
 
   addon.start(gpuBin, () => {}, null, { width: W, height: H });
   let runtime = null;

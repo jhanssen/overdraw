@@ -7,17 +7,12 @@
 
 import test from "node:test";
 import assert from "node:assert/strict";
-import { createRequire } from "node:module";
-import { fileURLToPath } from "node:url";
-import { dirname, join } from "node:path";
+import { join } from "node:path";
 import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
+import { loadAddon, gpuBin } from "./harness.mjs";
 
-const require = createRequire(import.meta.url);
-const __dirname = dirname(fileURLToPath(import.meta.url));
-const OD = join(__dirname, "..", "packages", "core");
-const addon = require(join(OD, "build", "overdraw_native.node"));
-const gpuBin = join(OD, "build", "overdraw-gpu-process");
+const addon = loadAddon();
 
 async function waitForLog(path, predicate, timeoutMs = 3000) {
   const start = Date.now();

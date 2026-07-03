@@ -12,14 +12,9 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { existsSync } from "node:fs";
-import { createRequire } from "node:module";
-import { fileURLToPath } from "node:url";
-import { dirname, join } from "node:path";
+import { loadAddon, buildBin } from "./harness.mjs";
 
-const require = createRequire(import.meta.url);
-const __dirname = dirname(fileURLToPath(import.meta.url));
-const addonPath = join(__dirname, "..", "packages", "core", "build", "overdraw_native.node");
-const skip = existsSync(addonPath) ? false : "overdraw_native.node not built";
+const skip = existsSync(buildBin("overdraw_native.node")) ? false : "overdraw_native.node not built";
 
 // Evdev keycodes (linux/input-event-codes.h).
 const KEY_1 = 2;
@@ -33,7 +28,7 @@ const XKB_KEY_J = 0x4a;
 const MOD_SHIFT = 0x01;
 
 test("keyUpdate.baseKeysym is shift-independent; keysym is shift-translated", { skip }, () => {
-  const addon = require(addonPath);
+  const addon = loadAddon();
 
   // No Shift: base == translated.
   const plain = addon.keyUpdate(KEY_J, true);

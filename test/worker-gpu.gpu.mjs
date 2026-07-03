@@ -8,18 +8,13 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { Worker } from "node:worker_threads";
-import { createRequire } from "node:module";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
-import { globSync } from "node:fs";
+import { loadAddon, loadDawn, gpuBin, coreRoot } from "./harness.mjs";
 
-const require = createRequire(import.meta.url);
 const __dirname = dirname(fileURLToPath(import.meta.url));
-const OD = join(__dirname, "..", "packages", "core");
-const addon = require(join(OD, "build", "overdraw_native.node"));
-let dawn = null;
-try { const [p] = globSync(join(OD, "build", "3rdparty", "dawn", "Dawn-*", "dawn.node")); if (p) dawn = require(p); } catch { dawn = null; }
-const gpuBin = join(OD, "build", "overdraw-gpu-process");
+const addon = loadAddon();
+const dawn = loadDawn();
 
 // Core broker helpers (Promise-wrapped async addon calls).
 const createConn = () => new Promise((res, rej) => addon.pluginCreateConnection((r) => r ? res(r) : rej(new Error("createConnection"))));
@@ -28,7 +23,7 @@ const injectInstance = (connId, id, gen) => new Promise((res, rej) => addon.plug
 test("plugin Worker brings up its own device over its own wire client", { skip: !dawn ? "dawn.node not built" : false }, async () => {
   addon.start(gpuBin, () => {}, null, { width: 64, height: 64 });
   const worker = new Worker(join(__dirname, "fixtures", "worker-gpu-bringup.mjs"),
-    { workerData: { repoRoot: OD } });
+    { workerData: { repoRoot: coreRoot } });
   try {
     // Broker the connection first so connId is known to the message handler.
     const { connId, fd } = await createConn();

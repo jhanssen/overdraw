@@ -13,14 +13,9 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { createRequire } from "node:module";
-import { resolve } from "node:path";
-import { canRunGpu } from "./harness.mjs";
+import { canRunGpu, loadAddon, gpuBin } from "./harness.mjs";
 
-const require = createRequire(import.meta.url);
 const skip = canRunGpu() ? false : "needs GPU (no render node / dawn.node)";
-const addonPath = resolve("packages/core/build/overdraw_native.node");
-const gpuBin = resolve("packages/core/build/overdraw-gpu-process");
 
 // Evdev keycode for 'a' (linux/input-event-codes.h KEY_A).
 const KEY_A = 30;
@@ -28,7 +23,7 @@ const KEY_A = 30;
 const XKB_KEY_a = 0x61;
 
 test("addon.keyUpdate resolves a keysym on first call (no client connected)", { skip }, () => {
-  const addon = require(addonPath);
+  const addon = loadAddon();
   // start() brings up the GPU process + device but binds NOTHING from a
   // Wayland-client perspective; no wl_keyboard get_keyboard has run, so
   // KeymapInfo's lazy path has not constructed the keymap. The chord

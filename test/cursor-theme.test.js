@@ -10,14 +10,9 @@
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { createRequire } from 'node:module';
-import { fileURLToPath } from 'node:url';
-import path from 'node:path';
 
 import { createCursorThemeResolver } from '../packages/core/dist/cursor/theme-resolver.js';
-
-const here = path.dirname(fileURLToPath(import.meta.url));
-const require = createRequire(import.meta.url);
+import { loadAddon } from './harness.mjs';
 
 // --- tier 0: LRU cache semantics --------------------------------------------
 
@@ -114,7 +109,7 @@ test('resolver: reload() clears the cache', () => {
 
 function tryLoadAddon() {
   try {
-    return require(path.join(here, '..', 'packages', 'core', 'build', 'overdraw_native.node'));
+    return loadAddon();
   } catch {
     return null;
   }

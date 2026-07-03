@@ -35,15 +35,20 @@ import { buildResolver } from "../packages/core/dist/plugins/deferred-refs.js";
 
 const require = createRequire(import.meta.url);
 const __dirname = dirname(fileURLToPath(import.meta.url));
-// Native build outputs live under packages/core/build/ post-monorepo restructure.
-const coreRoot = join(__dirname, "..", "packages", "core");
+// Native build outputs live under packages/core/build/.
+export const coreRoot = join(__dirname, "..", "packages", "core");
 
 const addonPath = join(coreRoot, "build", "overdraw_native.node");
-const gpuBin = process.env.OVERDRAW_GPU_PROCESS ?? join(coreRoot, "build", "overdraw-gpu-process");
+export const gpuBin = process.env.OVERDRAW_GPU_PROCESS ?? join(coreRoot, "build", "overdraw-gpu-process");
 const clientBin = join(coreRoot, "build", "harness-client");
 
 // Absolute path to a built binary in build/ (for spawnClient({ bin })).
 export const buildBin = (name) => join(coreRoot, "build", name);
+
+// The native addon. require() caches, so every caller in one process shares
+// the same instance (the addon is not context-aware; a second load would be
+// an error anyway).
+export function loadAddon() { return require(addonPath); }
 
 // True if at least one DRM render node is present and accessible. The headless
 // GPU backend (Dawn/Vulkan) renders through a render node; this is the hardware

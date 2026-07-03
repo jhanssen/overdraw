@@ -20,23 +20,11 @@
 
 import test from "node:test";
 import assert from "node:assert/strict";
-import { createRequire } from "node:module";
-import { fileURLToPath } from "node:url";
-import { dirname, join } from "node:path";
-import { globSync } from "node:fs";
-import { canRunKms } from "./harness.mjs";
+import { join } from "node:path";
+import { canRunKms, loadAddon, loadDawn, gpuBin, coreRoot } from "./harness.mjs";
 
-const require = createRequire(import.meta.url);
-const __dirname = dirname(fileURLToPath(import.meta.url));
-const OD = join(__dirname, "..", "packages", "core");
-
-const addon = require(join(OD, "build", "overdraw_native.node"));
-let dawn = null;
-try {
-  const [p] = globSync(join(OD, "build", "3rdparty", "dawn", "Dawn-*", "dawn.node"));
-  if (p) dawn = require(p);
-} catch { dawn = null; }
-const gpuBin = join(OD, "build", "overdraw-gpu-process");
+const addon = loadAddon();
+const dawn = loadDawn();
 
 const skip = canRunKms()
   ? false
@@ -57,7 +45,7 @@ function solid(bgra, w, h) {
 }
 
 test("KMS scanout: composite-scissor drives real page-flips across the slot ring", { skip }, async () => {
-  const { JsCompositor } = await import(join(OD, "dist", "gpu", "compositor.js"));
+  const { JsCompositor } = await import(join(coreRoot, "dist", "gpu", "compositor.js"));
 
   // backend:"kms" -> the core opens the card via libseat, takes DRM-master,
   // and sends the fd to the GPU process, which modesets the connector and

@@ -9,16 +9,11 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { createRequire } from "node:module";
-import { fileURLToPath } from "node:url";
-import { dirname, join } from "node:path";
-
-const require = createRequire(import.meta.url);
-const __dirname = dirname(fileURLToPath(import.meta.url));
+import { loadAddon } from "./harness.mjs";
 
 let addon = null;
 try {
-  addon = require(join(__dirname, "..", "packages", "core", "build", "overdraw_native.node"));
+  addon = loadAddon();
 } catch {
   addon = null;  // not built; skip
 }

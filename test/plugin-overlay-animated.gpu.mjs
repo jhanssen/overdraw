@@ -10,18 +10,14 @@
 
 import test from "node:test";
 import assert from "node:assert/strict";
-import { createRequire } from "node:module";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { dirname, join } from "node:path";
 import { globSync } from "node:fs";
+import { loadAddon, loadDawn, gpuBin, coreRoot, buildBin } from "./harness.mjs";
 
-const require = createRequire(import.meta.url);
 const __dirname = dirname(fileURLToPath(import.meta.url));
-const OD = join(__dirname, "..", "packages", "core");
-const addon = require(join(OD, "build", "overdraw_native.node"));
-let dawn = null;
-try { const [p] = globSync(join(OD, "build", "3rdparty", "dawn", "Dawn-*", "dawn.node")); if (p) dawn = require(p); } catch { dawn = null; }
-const gpuBin = join(OD, "build", "overdraw-gpu-process");
+const addon = loadAddon();
+const dawn = loadDawn();
 
 const W = 128, H = 128;
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -35,10 +31,10 @@ function classify(b, g, r) {
 }
 
 test("animated plugin overlay: composited output changes across frames", { skip: !dawn ? "dawn.node not built" : false }, async () => {
-  const { JsCompositor } = await import(join(OD, "dist", "gpu", "compositor.js"));
-  const { PluginRuntime } = await import(join(OD, "dist", "plugins", "index.js"));
-  const { createOverlayBroker } = await import(join(OD, "dist", "overlay.js"));
-  const { createGpuBroker } = await import(join(OD, "dist", "plugins", "gpu-broker.js"));
+  const { JsCompositor } = await import(join(coreRoot, "dist", "gpu", "compositor.js"));
+  const { PluginRuntime } = await import(join(coreRoot, "dist", "plugins", "index.js"));
+  const { createOverlayBroker } = await import(join(coreRoot, "dist", "overlay.js"));
+  const { createGpuBroker } = await import(join(coreRoot, "dist", "plugins", "gpu-broker.js"));
 
   addon.start(gpuBin, () => {}, null, { width: W, height: H });
   let runtime = null;
@@ -52,8 +48,8 @@ test("animated plugin overlay: composited output changes across frames", { skip:
     const gpuBroker = createGpuBroker({ addon, compositor, overlays, dawn, coreDeviceHandle: h.device });
 
     runtime = new PluginRuntime({
-      pluginAddonPath: join(OD, "build", "overdraw_plugin_native.node"),
-      dawnPath: globSync(join(OD, "build", "3rdparty", "dawn", "Dawn-*", "dawn.node"))[0],
+      pluginAddonPath: buildBin("overdraw_plugin_native.node"),
+      dawnPath: globSync(join(coreRoot, "build", "3rdparty", "dawn", "Dawn-*", "dawn.node"))[0],
       onEvent: () => {},
       onRequest: (p, m, params) => gpuBroker.onRequest(p, m, params),
     });

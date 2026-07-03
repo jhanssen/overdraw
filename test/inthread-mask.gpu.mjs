@@ -8,21 +8,13 @@
 
 import test from "node:test";
 import assert from "node:assert/strict";
-import { createRequire } from "node:module";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { dirname, join } from "node:path";
-import { globSync } from "node:fs";
+import { loadAddon, loadDawn, gpuBin, coreRoot } from "./harness.mjs";
 
-const require = createRequire(import.meta.url);
 const __dirname = dirname(fileURLToPath(import.meta.url));
-const OD = join(__dirname, "..", "packages", "core");
-const addon = require(join(OD, "build", "overdraw_native.node"));
-let dawn = null;
-try {
-  const [p] = globSync(join(OD, "build", "3rdparty", "dawn", "Dawn-*", "dawn.node"));
-  if (p) dawn = require(p);
-} catch { dawn = null; }
-const gpuBin = join(OD, "build", "overdraw-gpu-process");
+const addon = loadAddon();
+const dawn = loadDawn();
 
 const W = 128, H = 128, SZ = 64, SURFACE_ID = 42;
 
@@ -37,13 +29,13 @@ function solidRed(w, h) {
 
 test("bundled in-thread plugin installs a mask via sdk.windows.setMask",
   { skip: !dawn ? "dawn.node not built" : false }, async () => {
-  const { JsCompositor } = await import(join(OD, "dist", "gpu", "compositor.js"));
-  const { PluginRuntime } = await import(join(OD, "dist", "plugins", "index.js"));
-  const { createOverlayBroker } = await import(join(OD, "dist", "overlay.js"));
-  const { createWindowsBroker, NOT_HANDLED } = await import(join(OD, "dist", "plugins", "windows-broker.js"));
-  const { createWm } = await import(join(OD, "dist", "wm", "index.js"));
-  const { createCompositorBus } = await import(join(OD, "dist", "events", "window-bus.js"));
-  const { DynamicBus } = await import(join(OD, "dist", "events", "dynamic-bus.js"));
+  const { JsCompositor } = await import(join(coreRoot, "dist", "gpu", "compositor.js"));
+  const { PluginRuntime } = await import(join(coreRoot, "dist", "plugins", "index.js"));
+  const { createOverlayBroker } = await import(join(coreRoot, "dist", "overlay.js"));
+  const { createWindowsBroker, NOT_HANDLED } = await import(join(coreRoot, "dist", "plugins", "windows-broker.js"));
+  const { createWm } = await import(join(coreRoot, "dist", "wm", "index.js"));
+  const { createCompositorBus } = await import(join(coreRoot, "dist", "events", "window-bus.js"));
+  const { DynamicBus } = await import(join(coreRoot, "dist", "events", "dynamic-bus.js"));
 
   addon.start(gpuBin, () => {}, null, { width: W, height: H });
   let runtime = null;

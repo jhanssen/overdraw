@@ -5,22 +5,11 @@
 
 import test from "node:test";
 import assert from "node:assert/strict";
-import { createRequire } from "node:module";
-import { fileURLToPath } from "node:url";
-import { dirname, join } from "node:path";
-import { globSync } from "node:fs";
+import { join } from "node:path";
+import { loadAddon, loadDawn, gpuBin, coreRoot } from "./harness.mjs";
 
-const require = createRequire(import.meta.url);
-const __dirname = dirname(fileURLToPath(import.meta.url));
-const OD = join(__dirname, "..", "packages", "core");
-
-const addon = require(join(OD, "build", "overdraw_native.node"));
-let dawn = null;
-try {
-  const [p] = globSync(join(OD, "build", "3rdparty", "dawn", "Dawn-*", "dawn.node"));
-  if (p) dawn = require(p);
-} catch { dawn = null; }
-const gpuBin = join(OD, "build", "overdraw-gpu-process");
+const addon = loadAddon();
+const dawn = loadDawn();
 
 const W = 128, H = 128, SZ = 64;
 const skip = !dawn ? "dawn.node not built" : false;
@@ -50,7 +39,7 @@ test("per-surface analytic shape (setSurfaceShape)", { skip }, async (t) => {
   try {
     const h = addon.gpuHandles();
     const device = dawn.wrapDevice(h.instance, h.device);
-    const { JsCompositor } = await import(join(OD, "dist", "gpu", "compositor.js"));
+    const { JsCompositor } = await import(join(coreRoot, "dist", "gpu", "compositor.js"));
 
     const red = solid([0, 0, 255, 255], SZ, SZ);  // opaque red BGRA
 
