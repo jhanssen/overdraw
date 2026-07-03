@@ -4,9 +4,19 @@
     "rootDir": "src",
     "outDir": "dist"
   },
-  "include": ["src/**/*.ts"],
-  "exclude": ["dist", "node_modules"],
+  "include": [
+    "src/**/*.ts"
+  ],
+  "exclude": [
+    "dist",
+    "node_modules"
+  ],
   "references": [
-    { "path": "../hotkey-types" }
+    {
+      "path": "../hotkey-types"
+    },
+    {
+      "path": "../plugin-sdk-types"
+    }
   ]
 }

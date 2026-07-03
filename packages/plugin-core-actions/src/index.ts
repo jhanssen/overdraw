@@ -9,25 +9,9 @@
 // the right order. Other launchers (tests, embedded uses) can subscribe to
 // the same event and run their own teardown.
 
-interface ActionRegisterSpec {
-  name: string;
-  description?: string;
-  handler: (params: unknown) => unknown | Promise<unknown>;
-}
-interface PluginActionsLike {
-  register(spec: ActionRegisterSpec): { unregister(): void };
-}
-interface PluginEventsLike {
-  emit(name: string, payload: unknown): void;
-}
-interface SdkLike {
-  readonly name: string;
-  log(...args: unknown[]): void;
-  actions: PluginActionsLike;
-  events: PluginEventsLike;
-}
+import type { PluginSdkShape } from "@overdraw/plugin-sdk-types";
 
-export default async function init(sdk: SdkLike): Promise<void> {
+export default async function init(sdk: PluginSdkShape): Promise<void> {
   sdk.actions.register({
     name: "compositor.quit",
     description: "Initiate graceful compositor shutdown. " +

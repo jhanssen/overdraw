@@ -3,16 +3,10 @@
 // the 'focus' namespace.
 
 import type { FocusAPI, FocusInputs, FocusResult } from "@overdraw/focus-types";
+import type { PluginSdkShape } from "@overdraw/plugin-sdk-types";
 import { decideFocus, validateConfig, type FocusPluginConfig } from "./policy.js";
 
-interface SdkLike {
-  readonly name: string;
-  log(...args: unknown[]): void;
-  registerPlugin<A>(name: string, init: () => Promise<A> | A,
-                   opts?: { priority?: number }): Promise<{ unregister(): void }>;
-}
-
-export default async function init(sdk: SdkLike, rawConfig?: unknown): Promise<void> {
+export default async function init(sdk: PluginSdkShape, rawConfig?: unknown): Promise<void> {
   const config: FocusPluginConfig = validateConfig(rawConfig);
   sdk.log(`focus plugin: policy=${config.policy}, focusOnMap=${config.focusOnMap}`);
 

@@ -134,6 +134,9 @@ export type SurfaceShape =
 // by hand because wm/ is core-side; this is what arrives over the wire).
 export interface WindowSnapshot {
   surfaceId: number;
+  // The window's current output placement; null = unplaced (no layout pass
+  // has assigned it yet).
+  outputId: number | null;
   rect: { x: number; y: number; width: number; height: number };
   outer: { x: number; y: number; width: number; height: number };
   insets?: { top: number; right: number; bottom: number; left: number };

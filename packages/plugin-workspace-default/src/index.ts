@@ -7,90 +7,11 @@
 import type {
   WorkspaceAPI, WorkspaceHandle, WorkspaceIndex, WorkspaceSnapshot,
 } from "@overdraw/workspace-types";
-import type { FocusReason } from "@overdraw/focus-types";
+import type {
+  PluginSdkShape, SceneHandleLike, PluginTransitionsLike,
+} from "@overdraw/plugin-sdk-types";
 import * as reg from "./registry.js";
 import type { SideEffect, WorkspaceState } from "./registry.js";
-
-// Minimal plugin SDK shape we depend on. Same pattern as the bundled focus +
-// layout plugins -- the plugin's runtime SDK comes from the bootstrap; we
-// declare only what we use.
-interface ActionRegisterSpec {
-  name: string;
-  description?: string;
-  handler: (params: unknown) => unknown | Promise<unknown>;
-}
-interface ActionRegistration { unregister(): void }
-interface PluginActionsLike {
-  register(spec: ActionRegisterSpec): ActionRegistration;
-}
-interface EventSubscription { off(): void }
-interface PluginEventsLike {
-  emit(name: string, payload: unknown): void;
-  subscribe(pattern: string, cb: (name: string, payload: unknown) => void): EventSubscription;
-  // Await-capable participation: the emitter awaits the handler before
-  // proceeding.
-  intercept(
-    pattern: string,
-    cb: (name: string, payload: unknown) => unknown | Promise<unknown>,
-  ): EventSubscription;
-}
-interface WindowSnapshotLike {
-  surfaceId: number;
-  outputId: number;
-  state: { [key: string]: unknown };
-}
-interface PluginWindowsLike {
-  setState(id: number, key: string, value: unknown): Promise<void>;
-  deleteState(id: number, key: string): Promise<void>;
-  setOutputStack(outputId: number, ids: number[] | null): Promise<void>;
-  requestFocusDecision(reason: FocusReason, trigger?: number): Promise<void>;
-  list(): Promise<WindowSnapshotLike[]>;
-  onMap(cb: (ev: { surfaceId: number; outputId: number }) => void): void;
-  onUnmap(cb: (ev: { surfaceId: number }) => void): void;
-}
-// Compose + transitions surfaces the plugin uses for animated
-// workspace.show. Optional: when the runtime didn't bring them up
-// (older harnesses, builds without GPU), the plugin falls back to
-// the instant-swap path -- transitions are opt-in by the caller
-// AND require runtime support.
-interface SceneHandleLike {
-  texture: unknown;
-  outW: number;
-  outH: number;
-  id: number;
-  release(): Promise<void>;
-}
-interface PluginComposeLike {
-  scene(args: {
-    outputId: number;
-    windows: readonly number[];
-    mode: "snapshot" | "live";
-    outW?: number;
-    outH?: number;
-  }): Promise<SceneHandleLike>;
-}
-interface PluginTransitionsLike {
-  run(opts: {
-    outputId: number;
-    kind: string;
-    duration: number;
-    easing?: unknown;
-    from: SceneHandleLike;
-    to: SceneHandleLike;
-    commit?: { setOutputStack?: ReadonlyArray<{ outputId: number; ids: readonly number[] | null }> };
-  }): Promise<void>;
-}
-interface SdkLike {
-  readonly name: string;
-  log(...args: unknown[]): void;
-  registerPlugin<A>(name: string, init: () => Promise<A> | A,
-                   opts?: { priority?: number }): Promise<{ unregister(): void }>;
-  actions: PluginActionsLike;
-  events: PluginEventsLike;
-  windows: PluginWindowsLike;
-  compose?: PluginComposeLike;
-  transitions?: PluginTransitionsLike;
-}
 
 // The state-bag key under which each window's owning WorkspaceHandle is
 // stored. Other plugins can read it (typed as WorkspaceHandle via the
@@ -136,7 +57,7 @@ interface WorkspacePluginConfig {
 }
 
 export default async function init(
-  sdk: SdkLike, config?: WorkspacePluginConfig,
+  sdk: PluginSdkShape, config?: WorkspacePluginConfig,
 ): Promise<void> {
   // Resolve fallback config. Empty defaults make this safe to run in
   // non-core harnesses (the recompute will throw if a workspace ever has
@@ -459,7 +380,10 @@ export default async function init(
   // this is usually empty, but the runtime makes no such guarantee).
   const existing = await sdk.windows.list();
   for (const w of existing) {
-    const r = reg.applyMap(state, w.surfaceId, w.outputId, outputNameOf(w.outputId));
+    // Unplaced windows (no layout pass yet) seed onto the fallback output;
+    // the workspace recompute re-homes them once a real output claims them.
+    const outId = w.outputId ?? fallbackOutputId;
+    const r = reg.applyMap(state, w.surfaceId, outId, outputNameOf(outId));
     state = r.state;
     await applyEffects(r.sideEffects);
   }

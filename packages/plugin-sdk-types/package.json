@@ -1,0 +1,19 @@
+{
+  "name": "@overdraw/plugin-sdk-types",
+  "version": "0.0.0",
+  "private": true,
+  "description": "The canonical plugin-facing SDK shape: the structural (duck-typed) slices of the sdk object handed to a plugin's init(sdk). Plugins depend on this instead of re-declaring the shape or importing core; core asserts at compile time that its real SDK satisfies these slices. Type-only: no runtime code.",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
+  },
+  "dependencies": {
+    "@overdraw/cursor-types": "*",
+    "@overdraw/focus-types": "*"
+  }
+}

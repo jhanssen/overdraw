@@ -3,29 +3,9 @@
 // plugin install. Mirrors @overdraw/plugin-core-actions: tiny init, just
 // wraps sdk.cursor.* in named actions.
 
-interface ActionRegisterSpec {
-  name: string;
-  description?: string;
-  handler: (params: unknown) => unknown | Promise<unknown>;
-}
-interface PluginActionsLike {
-  register(spec: ActionRegisterSpec): { unregister(): void };
-}
-interface CursorLike {
-  setShape(name: string): Promise<void>;
-  hide(): Promise<void>;
-  show(): Promise<void>;
-  clearOverride(): Promise<void>;
-  setDefault(shape: string | null): Promise<void>;
-}
-interface SdkLike {
-  readonly name: string;
-  log(...args: unknown[]): void;
-  actions: PluginActionsLike;
-  cursor?: CursorLike;
-}
+import type { PluginSdkShape } from "@overdraw/plugin-sdk-types";
 
-export default async function init(sdk: SdkLike): Promise<void> {
+export default async function init(sdk: PluginSdkShape): Promise<void> {
   if (!sdk.cursor) {
     sdk.log("cursor SDK absent; cursor-actions not registered");
     return;

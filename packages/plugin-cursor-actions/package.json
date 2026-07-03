@@ -9,5 +9,8 @@
     ".": {
       "default": "./dist/index.js"
     }
+  },
+  "dependencies": {
+    "@overdraw/plugin-sdk-types": "*"
   }
 }

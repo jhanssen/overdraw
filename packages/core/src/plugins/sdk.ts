@@ -22,6 +22,22 @@ import type { PluginInput } from "./input-sdk.js";
 import type { PluginTransitions } from "./transitions-sdk.js";
 import type { CursorAPI } from "@overdraw/cursor-types";
 import type { InterceptAPI } from "@overdraw/intercept-types";
+import type {
+  PluginActionsLike, PluginEventsLike, PluginWindowsLike, PluginInputLike,
+  PluginComposeLike, PluginTransitionsLike,
+} from "@overdraw/plugin-sdk-types";
+
+// Compile-time drift guard: each real SDK slice must satisfy the published
+// plugin-facing shape in @overdraw/plugin-sdk-types (what plugins program
+// against instead of importing core). A mismatch is a build error here, not
+// a runtime surprise in a plugin.
+type SatisfiesPublished<Shape, T extends Shape> = T;
+export type _ActionsSatisfyPublished = SatisfiesPublished<PluginActionsLike, PluginActions>;
+export type _EventsSatisfyPublished = SatisfiesPublished<PluginEventsLike, PluginEvents>;
+export type _WindowsSatisfyPublished = SatisfiesPublished<PluginWindowsLike, PluginWindows>;
+export type _InputSatisfiesPublished = SatisfiesPublished<PluginInputLike, PluginInput>;
+export type _ComposeSatisfiesPublished = SatisfiesPublished<PluginComposeLike, PluginCompose>;
+export type _TransitionsSatisfyPublished = SatisfiesPublished<PluginTransitionsLike, PluginTransitions>;
 
 export interface PluginSdk {
   // The plugin's stable name (config `name`, defaulting to its module).

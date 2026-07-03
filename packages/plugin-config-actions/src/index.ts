@@ -11,23 +11,11 @@
 // resolution, so ref.surfaceUnderPointer in the hotkey config is
 // already resolved to a number by the time the handler runs).
 
+import type { PluginSdkShape } from "@overdraw/plugin-sdk-types";
+
 type UserHandler = (sdk: unknown, params?: unknown) => unknown | Promise<unknown>;
 
-interface ActionRegisterSpec {
-  name: string;
-  description?: string;
-  handler: (params: unknown) => unknown | Promise<unknown>;
-}
-interface PluginActionsLike {
-  register(spec: ActionRegisterSpec): { unregister(): void };
-}
-interface SdkLike {
-  readonly name: string;
-  log(...args: unknown[]): void;
-  actions: PluginActionsLike;
-}
-
-export default async function init(sdk: SdkLike, rawConfig?: unknown): Promise<void> {
+export default async function init(sdk: PluginSdkShape, rawConfig?: unknown): Promise<void> {
   if (rawConfig === undefined || rawConfig === null) {
     // No actions in config; nothing to do.
     return;

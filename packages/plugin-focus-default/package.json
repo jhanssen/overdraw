@@ -11,6 +11,7 @@
     }
   },
   "dependencies": {
-    "@overdraw/focus-types": "*"
+    "@overdraw/focus-types": "*",
+    "@overdraw/plugin-sdk-types": "*"
   }
 }

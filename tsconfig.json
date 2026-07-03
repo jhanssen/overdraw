@@ -1,6 +1,7 @@
 {
   "files": [],
   "references": [
+    { "path": "./packages/plugin-sdk-types" },
     { "path": "./packages/layout-types" },
     { "path": "./packages/plugin-layout-default" },
     { "path": "./packages/focus-types" },

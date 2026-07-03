@@ -21,6 +21,8 @@
 // override `newOuter`. Size/position policy belongs on that seam, not in this
 // state-only hook.
 
+import type { PluginSdkShape } from "@overdraw/plugin-sdk-types";
+
 // Window-state shape we touch. The full WindowState has more fields; the
 // interceptor preserves them by shallow-cloning and only writing `tiling`.
 type Tiling = "managed" | "floating";
@@ -66,18 +68,6 @@ interface CompiledRule {
   test: (q: WindowQuery) => boolean;
   float?: boolean;
   apply?: (win: WindowTarget) => void;
-}
-
-interface EventsLike {
-  intercept(
-    pattern: string,
-    cb: (name: string, payload: unknown) => unknown,
-  ): { unregister(): void };
-}
-interface SdkLike {
-  readonly name: string;
-  log(...args: unknown[]): void;
-  events: EventsLike;
 }
 
 // Compile one rule's match clause into a predicate over the window query.
@@ -144,7 +134,7 @@ function compileRule(raw: unknown, index: number): CompiledRule {
   return compiled;
 }
 
-export default async function init(sdk: SdkLike, rawConfig?: unknown): Promise<void> {
+export default async function init(sdk: PluginSdkShape, rawConfig?: unknown): Promise<void> {
   if (rawConfig === undefined || rawConfig === null) return;
   if (!Array.isArray(rawConfig)) {
     throw new TypeError("config.windowRules must be an array");

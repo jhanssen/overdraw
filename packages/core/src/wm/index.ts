@@ -418,6 +418,9 @@ export interface Wm {
 // event payloads. surfaceRec / Resource are NOT included (not cloneable).
 export interface WindowSnapshot {
   surfaceId: number;
+  // The output the window is currently placed on (cached after each layout
+  // pass). null = unplaced (no layout pass has assigned it yet).
+  outputId: number | null;
   rect: Rect;
   outer: Rect;
   insets?: Insets;
@@ -2409,6 +2412,7 @@ function snapshotOf(win: Window): WindowSnapshot {
   for (const [k, v] of win.state.entries()) state[k] = v;
   const snap: WindowSnapshot = {
     surfaceId: win.surfaceId,
+    outputId: win.outputId ?? null,
     rect: { ...win.rect },
     outer: { ...win.outer },
     hasContent: !!win.hasContent,

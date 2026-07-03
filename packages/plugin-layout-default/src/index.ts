@@ -12,6 +12,7 @@
 import type {
   LayoutAPI, LayoutInputs, LayoutResult, LayoutParamUpdate, LayoutParamSnapshot,
 } from "@overdraw/layout-types";
+import type { PluginSdkShape } from "@overdraw/plugin-sdk-types";
 import { masterStackLayout, DEFAULT_LAYOUT, type LayoutParams } from "./master-stack.js";
 
 // Master-fraction bounds; matches the clamp masterStackLayout applies.
@@ -45,22 +46,7 @@ function validateConfig(raw: unknown): LayoutParams {
   return out;
 }
 
-// The plugin SDK shape we need. Importing PluginSdk from the core types
-// would couple this plugin to core's internal type packaging; instead we
-// declare the minimum shape we depend on.
-//
-// (Future: an @overdraw/plugin-sdk-types package could publish the canonical
-// SDK shape for plugin authors; today the SDK lives in core. The bundled
-// plugin imports the runtime-provided sdk through this minimal interface so
-// the dependency direction stays one-way: plugin -> layout-types only.)
-interface SdkLike {
-  readonly name: string;
-  log(...args: unknown[]): void;
-  registerPlugin<A>(name: string, init: () => Promise<A> | A,
-                   opts?: { priority?: number }): Promise<{ unregister(): void }>;
-}
-
-export default async function init(sdk: SdkLike, rawConfig?: unknown): Promise<void> {
+export default async function init(sdk: PluginSdkShape, rawConfig?: unknown): Promise<void> {
   const params: LayoutParams = validateConfig(rawConfig);
 
   const api: LayoutAPI = {
