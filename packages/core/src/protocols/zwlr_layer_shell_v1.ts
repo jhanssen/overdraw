@@ -117,10 +117,11 @@ function effectiveRectExcluding(state: CompositorState, exclude: LayerSurfaceRec
   // Temporarily drop this surface's reservation, compute, restore. Avoid
   // allocating a fresh registry: snapshot the surface's zone, clear it,
   // compute, restore.
-  const zones = state.reservedZones.list(exclude.output).filter((z) => z.owner === exclude.surface.id);
-  for (const z of zones) state.reservedZones.clear(`${myId}`);
+  const mine = state.reservedZones.list(exclude.output).find((z) => z.owner === exclude.surface.id);
+  if (!mine) return state.reservedZones.effectiveRect(exclude.output, raw);
+  state.reservedZones.clear(myId);
   const r = state.reservedZones.effectiveRect(exclude.output, raw);
-  for (const z of zones) state.reservedZones.set(myId, z);
+  state.reservedZones.set(myId, mine);
   return r;
 }
 

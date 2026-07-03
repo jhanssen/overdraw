@@ -603,6 +603,10 @@ export default function makeSurface(ctx: Ctx): WlSurfaceHandler {
           if (s.cached.frameCallbacks?.length) {
             (s.pending.frameCallbacks ??= []).push(...s.cached.frameCallbacks);
           }
+          if (s.cached.presentationFeedbacks?.length) {
+            (s.pending.presentationFeedbacks ??= [])
+              .push(...s.cached.presentationFeedbacks);
+          }
           if (s.cached.inputRegion !== undefined) {
             s.pending.inputRegion = s.cached.inputRegion;
           }

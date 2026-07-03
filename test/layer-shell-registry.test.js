@@ -386,6 +386,41 @@ test("two surfaces: zone>0 reserves; zone==0 sibling re-places against effective
   assert.equal(notif.rect.y, 30, "notification placed below the panel's reservation");
 });
 
+test("re-applying a reserving surface excludes only its own reservation", () => {
+  const ctx = mockCtx({ withReservedZones: true });
+  const ls = makeLayerSurface(ctx);
+
+  // A 30px top panel reserving its zone.
+  const { layerSurface: panel, resource: panelRes } = createLayerSurface(ctx, 100);
+  ls.set_size(panelRes, 0, 30);
+  ls.set_anchor(panelRes, A.top | A.left | A.right);
+  ls.set_exclusive_zone(panelRes, 30);
+  applyLayerSurfaceInitial(ctx, panel);
+  assert.equal(panel.rect.y, 0);
+
+  // A 20px bottom dock reserving its own zone.
+  const { layerSurface: dock, resource: dockRes } = createLayerSurface(ctx, 200);
+  ls.set_size(dockRes, 0, 20);
+  ls.set_anchor(dockRes, A.bottom | A.left | A.right);
+  ls.set_exclusive_zone(dockRes, 20);
+  applyLayerSurfaceInitial(ctx, dock);
+
+  // Re-apply the panel while its own zone is registered: it must not be
+  // displaced by its own 30px reservation, but the dock's still applies
+  // to the height available to a stretch-anchored surface.
+  ls.set_size(panelRes, 0, 32);
+  ls.set_exclusive_zone(panelRes, 32);
+  applyLayerSurfacePending(ctx, panel);
+  assert.equal(panel.rect.y, 0, "panel not pushed down by its own zone");
+  assert.equal(panel.rect.width, 1000, "panel spans the full output width");
+
+  // The temporary drop-compute-restore left the panel's zone registered:
+  // the effective rect still reflects both reservations.
+  const eff = ctx.state.reservedZones.effectiveRect(
+    0, { x: 0, y: 0, width: 1000, height: 600 });
+  assert.deepEqual(eff, { x: 0, y: 32, width: 1000, height: 548 });
+});
+
 test("destroying the panel reflows the notification back up", () => {
   const ctx = mockCtx({ withReservedZones: true });
   const ls = makeLayerSurface(ctx);
