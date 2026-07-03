@@ -2567,13 +2567,22 @@ export class JsCompositor implements CompositorSink {
   // readers must resolve the real size through here rather than trusting
   // layoutW/H. (surface-hit-test.ts has the same computation over the protocol
   // SurfaceRecord -- a different type, so it can't share this method.)
-  private surfaceLogicalSize(s: Surface): { w: number; h: number } {
+  private logicalSizeOf(s: Surface): { w: number; h: number } {
     const vd = s.viewportDst;
     if (vd && vd.width > 0 && vd.height > 0) return { w: vd.width, h: vd.height };
     const bs = s.bufferScale || 1;
     const t = s.bufferTransform ?? 0;
     const rot = t === 1 || t === 3 || t === 5 || t === 7;
     return { w: (rot ? s.height : s.width) / bs, h: (rot ? s.width : s.height) / bs };
+  }
+
+  // Public by-id variant for the intercept broker: the plugin tick maps the
+  // xdg window geometry (surface-local coordinates) into buffer pixels via
+  // clientTextureSize / logicalSize, which needs this as the denominator.
+  // Null when the surface is unknown.
+  surfaceLogicalSize(surfaceId: number): { w: number; h: number } | null {
+    const s = this.surfaces.get(surfaceId);
+    return s ? this.logicalSizeOf(s) : null;
   }
 
   // --- Composite-scissor damage -------------------------------------------
@@ -2641,7 +2650,7 @@ export class JsCompositor implements CompositorSink {
     // the real size so a subsurface content commit damages its actual rect
     // rather than a zero-area one.
     let w = s.layoutW, h = s.layoutH;
-    if (w <= 0 || h <= 0) ({ w, h } = this.surfaceLogicalSize(s));
+    if (w <= 0 || h <= 0) ({ w, h } = this.logicalSizeOf(s));
     this.addOutputDamage(s.x, s.y, w, h);
   }
 

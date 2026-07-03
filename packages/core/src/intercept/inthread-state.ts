@@ -23,6 +23,12 @@ export interface InThreadTickDeps {
   // the intercept output (the surface draws raw / nothing).
   clientTexture(surfaceId: number):
     { texture: GPUTexture; w: number; h: number } | null;
+  // The surface's intrinsic logical size (viewport destination, else buffer
+  // dims / buffer_scale). Divides the client texture's buffer-pixel dims to
+  // give the surface-local -> buffer-pixel scale factor; a fractional-scale
+  // or buffer_scale>1 client commits a buffer larger than its logical size.
+  // Null (unknown surface / no sink support) means assume scale 1.
+  surfaceLogicalSize(surfaceId: number): { w: number; h: number } | null;
   // Monotonic client-content version for the surface. Compared across ticks
   // to set ctx.contentChanged (did the client commit new content since this
   // plugin last rendered).
@@ -43,7 +49,9 @@ export interface InThreadTickDeps {
   // ctx.activated so a plugin styles focus level-triggered from live seat
   // state instead of an async window.change edge.
   isActivated(surfaceId: number): boolean;
-  // The client's declared window geometry (buffer px), or null if unset.
+  // The client's declared window geometry in surface-local (logical)
+  // coordinates, or null if unset. The tick maps it into buffer pixels via
+  // surfaceLogicalSize before clamping against the client texture.
   surfaceGeometry(surfaceId: number):
     { x: number; y: number; width: number; height: number } | null;
   // Open a BeginAccess bracket on the surface's client dmabuf import
@@ -173,11 +181,21 @@ export class InThreadInterceptState {
     // (buffer beyond the geometry) is excluded, so a decoration bands the real
     // window, not the shadow. The plugin reads the full buffer size off
     // input.texture when it needs to map input.rect into texture UVs.
+    //
+    // The geometry is in surface-local (logical) coordinates while input.w/h
+    // are buffer pixels; a fractional-scale or buffer_scale>1 client commits
+    // a buffer larger than its logical size, so scale the geometry into
+    // buffer pixels first (identity for scale-1 clients). Without this, the
+    // input rect covers only the top-left logicalW x logicalH buffer pixels
+    // -- the window renders cropped and upscaled.
     const geom = this.deps.surfaceGeometry(this.surfaceId);
-    const cx = geom ? Math.max(0, Math.min(geom.x, input.w - 1)) : 0;
-    const cy = geom ? Math.max(0, Math.min(geom.y, input.h - 1)) : 0;
-    const cw = geom ? Math.max(1, Math.min(geom.width, input.w - cx)) : input.w;
-    const ch = geom ? Math.max(1, Math.min(geom.height, input.h - cy)) : input.h;
+    const logical = this.deps.surfaceLogicalSize(this.surfaceId);
+    const sx = logical && logical.w > 0 ? input.w / logical.w : 1;
+    const sy = logical && logical.h > 0 ? input.h / logical.h : 1;
+    const cx = geom ? Math.max(0, Math.min(Math.round(geom.x * sx), input.w - 1)) : 0;
+    const cy = geom ? Math.max(0, Math.min(Math.round(geom.y * sy), input.h - 1)) : 0;
+    const cw = geom ? Math.max(1, Math.min(Math.round(geom.width * sx), input.w - cx)) : input.w;
+    const ch = geom ? Math.max(1, Math.min(Math.round(geom.height * sy), input.h - cy)) : input.h;
     try {
       this.ensureRing(cw, ch);
     } catch (e: unknown) {

@@ -53,6 +53,7 @@ function stubCompositor(initial = {}) {
   const clientTextures = new Map(Object.entries(initial.clientTextures ?? {}).map(([k, v]) => [Number(k), v]));
   const presentable = new Set(Object.entries(initial.presentable ?? {}).filter(([, v]) => v).map(([k]) => Number(k)));
   const wmRects = new Map(Object.entries(initial.wmRects ?? {}).map(([k, v]) => [Number(k), v]));
+  const logicalSizes = new Map();
   return {
     log,
     setClientTexture(sid, tex) {
@@ -63,6 +64,10 @@ function stubCompositor(initial = {}) {
     setWmRect(sid, rect) {
       if (rect === null) wmRects.delete(sid);
       else wmRects.set(sid, rect);
+    },
+    setLogicalSize(sid, size) {
+      if (size === null) logicalSizes.delete(sid);
+      else logicalSizes.set(sid, size);
     },
     sink: {
       installInterceptOutput(surfaceId, view, placement) {
@@ -79,6 +84,9 @@ function stubCompositor(initial = {}) {
       },
       surfaceWmRect(surfaceId) {
         return wmRects.get(surfaceId) ?? null;
+      },
+      surfaceLogicalSize(surfaceId) {
+        return logicalSizes.get(surfaceId) ?? null;
       },
     },
   };
@@ -303,6 +311,46 @@ test('broker: K consecutive failures -> auto-unregister', async () => {
   await new Promise((r) => queueMicrotask(r));
   assert.equal(destroyed, true, 'destroy fired after threshold');
   assert.equal(broker.registrationCount(), 0);
+});
+
+test('broker: input rect maps window geometry into buffer pixels (fractional scale)', async () => {
+  const bus = new TypedBus();
+  const comp = stubCompositor();
+  const geometries = new Map();
+  const broker = new InterceptBroker({
+    bus, compositor: comp.sink,
+    inThread: { device: fakeDevice(), textureUsage: fakeTextureUsage() },
+    surfaceGeometry: (sid) => geometries.get(sid) ?? null,
+    log: () => {},
+  });
+  const rects = [];
+  await broker.registerInThread({
+    name: 'test',
+    match: { appId: appIdMatch('.*') },
+    setup: () => ({ render: ({ input }) => { rects.push(input.rect); } }),
+  }, 'test-plugin');
+  bus.emit(WINDOW_EVENT.map, mapEvent(1, 'kitty'));
+  // A 1.5x fractional-scale client: 200x100-logical window geometry backed
+  // by a 300x150-buffer-pixel texture.
+  comp.setClientTexture(1, { texture: fakeTexture(300, 150), w: 300, h: 150 });
+  comp.setLogicalSize(1, { w: 200, h: 100 });
+  geometries.set(1, { x: 0, y: 0, width: 200, height: 100 });
+  comp.setPresentable(1, true);
+  broker.tick(16);
+  assert.deepEqual(rects[0], { x: 0, y: 0, w: 300, h: 150 },
+    'geometry scaled to buffer pixels covers the whole buffer');
+
+  // Non-zero origin (CSD shadow margins) scales on both axes.
+  geometries.set(1, { x: 10, y: 20, width: 180, height: 60 });
+  broker.tick(32);
+  assert.deepEqual(rects[1], { x: 15, y: 30, w: 270, h: 90 });
+
+  // Without a logical size (sink without support), geometry passes through
+  // unscaled -- the scale-1 behavior.
+  comp.setLogicalSize(1, null);
+  geometries.set(1, { x: 0, y: 0, width: 200, height: 100 });
+  broker.tick(48);
+  assert.deepEqual(rects[2], { x: 0, y: 0, w: 200, h: 100 });
 });
 
 test('broker: in-thread transport required for registerInThread', async () => {

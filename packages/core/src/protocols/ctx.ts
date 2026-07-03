@@ -531,6 +531,11 @@ export interface CompositorSink {
   // plugin will read from). surfaceIsPresentable gates the per-frame
   // render dispatch to surfaces actually being composited.
   surfaceClientTexture?(surfaceId: number): { texture: GPUTexture; w: number; h: number } | null;
+  // The surface's intrinsic logical size (viewport destination, else buffer
+  // dims / buffer_scale). The intercept tick divides the client texture's
+  // buffer-pixel dims by this to map surface-local coordinates (e.g. the xdg
+  // window geometry) into buffer pixels.
+  surfaceLogicalSize?(surfaceId: number): { w: number; h: number } | null;
   // Monotonic per-surface client-content version (bumped on each new commit).
   // The intercept broker compares it across ticks to set ctx.contentChanged.
   surfaceContentEpoch?(surfaceId: number): number;

@@ -444,6 +444,7 @@ export class InterceptBroker {
     const tickDeps: InThreadTickDeps = {
       device: inThread.device,
       clientTexture: (sid) => this.deps.compositor.surfaceClientTexture?.(sid) ?? null,
+      surfaceLogicalSize: (sid) => this.deps.compositor.surfaceLogicalSize?.(sid) ?? null,
       contentEpoch: (sid) => this.deps.compositor.surfaceContentEpoch?.(sid) ?? 0,
       isPresentable: (sid) => this.deps.compositor.surfaceIsPresentable?.(sid) ?? false,
       surfaceWmRect: (sid) => this.deps.compositor.surfaceWmRect?.(sid) ?? null,
