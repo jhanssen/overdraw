@@ -482,6 +482,40 @@ std::vector<DrmMode> enumerateModesForConnector(int drmFd, uint32_t connectorId)
     return out;
 }
 
+int addForeignPlaneDisables(drmModeAtomicReq* req, int drmFd, uint32_t crtcId,
+                            const std::vector<uint32_t>& ownedPlaneIds) {
+    drmModePlaneRes* pr = drmModeGetPlaneResources(drmFd);
+    if (!pr) return 0;
+    int disabled = 0;
+    for (uint32_t i = 0; i < pr->count_planes; ++i) {
+        const uint32_t planeId = pr->planes[i];
+        if (std::find(ownedPlaneIds.begin(), ownedPlaneIds.end(), planeId)
+            != ownedPlaneIds.end()) {
+            continue;
+        }
+        drmModePlane* p = drmModeGetPlane(drmFd, planeId);
+        if (!p) continue;
+        const bool boundHere = p->crtc_id == crtcId;
+        drmModeFreePlane(p);
+        if (!boundHere) continue;
+        uint32_t fbProp = 0, crtcProp = 0;
+        walkProperties(drmFd, planeId, DRM_MODE_OBJECT_PLANE,
+                       [&](const char* name, uint64_t, const drmModePropertyRes* prop) {
+            if (std::strcmp(name, "FB_ID") == 0) fbProp = prop->prop_id;
+            else if (std::strcmp(name, "CRTC_ID") == 0) crtcProp = prop->prop_id;
+        });
+        if (!fbProp || !crtcProp) continue;
+        drmModeAtomicAddProperty(req, planeId, fbProp, 0);
+        drmModeAtomicAddProperty(req, planeId, crtcProp, 0);
+        std::printf("[kms] disabling foreign plane %u on crtc %u "
+                    "(left latched by a previous DRM master)\n",
+                    planeId, crtcId);
+        ++disabled;
+    }
+    drmModeFreePlaneResources(pr);
+    return disabled;
+}
+
 bool findMode(int drmFd, uint32_t connectorId,
               uint32_t width, uint32_t height, uint32_t refreshMhz,
               DrmMode& outMode) {

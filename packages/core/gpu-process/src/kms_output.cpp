@@ -505,6 +505,15 @@ bool KmsOutputBackend::presentOutputImpl(PerOutput& o, int slotIdx, int inFenceF
     if (!o.didInitialCommit) {
         // First commit also sets up CRTC + connector + mode.
         add(topo.connectorId, topo.connectorProps.crtc_id, topo.crtcId);
+        // Takeover: a previous DRM master (another compositor on another VT)
+        // may have left cursor/overlay planes latched on this CRTC with its
+        // final image -- a hardware cursor frozen at its last position,
+        // displayed on top of everything we scan out. Disable every plane on
+        // this CRTC that isn't one of ours.
+        std::vector<uint32_t> owned;
+        owned.reserve(outputs_.size());
+        for (const auto& [id, other] : outputs_) owned.push_back(other->topo.planeId);
+        addForeignPlaneDisables(req, drmFd_, topo.crtcId, owned);
         if (o.modeBlobId == 0) {
             o.modeBlobId = createModeBlob(drmFd_, topo.mode.raw);
             if (o.modeBlobId == 0) { drmModeAtomicFree(req); return false; }

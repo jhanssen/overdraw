@@ -522,6 +522,14 @@ Modifier selection: plane's `IN_FORMATS` candidates, tiled-first,
 with LINEAR as last fallback. Multi-plane modifiers (CCS/AFBC) fall
 through because Dawn requires single-FD.
 
+Takeover modeset (boot and VT-switch resume) disables every plane
+bound to our CRTC that isn't ours (`addForeignPlaneDisables`): a
+previous DRM master's cursor/overlay plane otherwise stays latched
+with its final image -- a hardware cursor frozen at its last
+position, displayed on top of everything we scan out. overdraw's own
+cursor is software-composited, so any latched plane on our CRTC is
+foreign by construction.
+
 Production defaults to `kms`; `--backend=nested` or `OVERDRAW_BACKEND=
 nested` for dev under a host session.
 

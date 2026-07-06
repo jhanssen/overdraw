@@ -153,6 +153,16 @@ readPlaneFormats(int drmFd, uint32_t planeId, uint32_t inFormatsPropId);
 // drmModeDestroyPropertyBlob. Returns 0 on failure.
 uint32_t createModeBlob(int drmFd, const drmModeModeInfo& mode);
 
+// Add FB_ID=0 / CRTC_ID=0 disables to `req` for every plane currently bound
+// to `crtcId` that is not in `ownedPlaneIds`. A previous DRM master (another
+// compositor on a different VT) can leave cursor/overlay planes latched with
+// its final image -- classically a hardware cursor frozen at its last
+// position, composited by the display engine on top of everything we scan
+// out. Call during a takeover modeset (ALLOW_MODESET commit). Returns the
+// number of planes disabled.
+int addForeignPlaneDisables(drmModeAtomicReq* req, int drmFd, uint32_t crtcId,
+                            const std::vector<uint32_t>& ownedPlaneIds);
+
 // Find a mode on `connectorId` whose active dims and refresh match the
 // request. Width/height match exactly; refresh tolerates a small delta
 // (the modeline rate computed from clock/htotal/vtotal can be off by a
