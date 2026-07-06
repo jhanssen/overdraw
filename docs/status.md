@@ -399,6 +399,37 @@ Workarounds (pick one):
 
 No overdraw-side fix; documented here so the diagnosis is in one place.
 
+Related but fixed in-tree: `XDG_SESSION_TYPE`. A bare-TTY login session
+carries `XDG_SESSION_TYPE=tty`, and clients that pick their windowing
+backend off the session identity (Chrome selects Ozone/Wayland only under
+`XDG_SESSION_TYPE=wayland`; otherwise it silently runs through Xwayland,
+where e.g. WebGPU is much slower) would go X11 even with `WAYLAND_DISPLAY`
+set. `main.ts` exports `XDG_SESSION_TYPE=wayland` (and
+`XDG_CURRENT_DESKTOP=overdraw` when unset) at startup so all spawned
+children inherit the wayland identity.
+
+Also fixed in-tree: user-bus services. xdg-desktop-portal (and its
+backends, notification daemons, etc.) are per-USER, not per-session:
+they bind whichever `WAYLAND_DISPLAY`/`DISPLAY` the systemd/D-Bus user
+environment held when they were activated. A portal activated by another
+session opens its dialogs on that session's display (symptom: Chrome's
+portal file picker "never shows" -- it showed on the other compositor).
+On the kms backend, `main.ts` publishes `WAYLAND_DISPLAY`, `DISPLAY`,
+`XDG_CURRENT_DESKTOP`, `XDG_SESSION_TYPE` via
+`dbus-update-activation-environment --systemd` (fallback `systemctl
+--user set-environment`) at startup and unsets them on shutdown
+(`session-env.ts`; same scheme as Hyprland's startCompositor).
+Nested mode never publishes (it would steal the host session's
+services); `OVERDRAW_NO_SD_VARS=1` opts out entirely. Two caveats:
+(a) portal processes already running keep their old binding -- restart
+them (`systemctl --user restart xdg-desktop-portal
+xdg-desktop-portal-gtk`) after the first overdraw session, or log out;
+(b) no installed portal backend matches the `overdraw` desktop name, so
+FileChooser needs `~/.config/xdg-desktop-portal/overdraw-portals.conf`
+with `[preferred]` / `default=gtk`. Running a second compositor session
+concurrently under the same user inherently fights over these
+singletons; that is an ecosystem limitation, not overdraw's.
+
 ## Architecture as built
 
 Two processes: a core (Node + N-API addon, Dawn wire client, JS

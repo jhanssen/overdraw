@@ -65,6 +65,7 @@ import { bindAddon, installConsoleShim, parseLogArgs, log } from "./log.js";
 import { startXwayland, stopXwayland, type XwaylandHandle } from "./xwayland/index.js";
 import { startXwm, type Xwm } from "./xwayland/xwm.js";
 import { closeSurface } from "./protocols/close-surface.js";
+import { publishSessionEnv, clearSessionEnv } from "./session-env.js";
 
 const require = createRequire(import.meta.url);
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -89,6 +90,16 @@ bindAddon(addon);
   }
   installConsoleShim();
 }
+
+// Clients pick their windowing backend off the session identity, not
+// WAYLAND_DISPLAY (e.g. Chrome selects Ozone/Wayland only under
+// XDG_SESSION_TYPE=wayland and otherwise runs through Xwayland). A login
+// session started from a bare TTY says "tty", so export the wayland
+// identity here; every spawned child inherits it. XDG_CURRENT_DESKTOP is
+// left alone if the environment already provides one (it steers
+// xdg-desktop-portal backend selection).
+process.env.XDG_SESSION_TYPE = "wayland";
+if (!process.env.XDG_CURRENT_DESKTOP) process.env.XDG_CURRENT_DESKTOP = "overdraw";
 
 // The compositing pass runs in core JS over the Dawn wire (dawn.node).
 interface DawnModule extends DawnWire {
@@ -159,6 +170,7 @@ let ipcServer: IpcServer | null = null;
 let xwaylandHandle: XwaylandHandle | null = null;
 let xwm: Xwm | null = null;
 let xwaylandSelection: import("./xwayland/selection.js").SelectionBridge | null = null;
+let sessionEnvPublished = false;
 
 let stopped = false;
 function shutdown(signal: string): void {
@@ -181,6 +193,7 @@ function shutdown(signal: string): void {
     }
     try { addon.stopServer(); } catch { /* ignore */ }
     try { addon.stop(); } catch { /* ignore */ }
+    if (sessionEnvPublished) clearSessionEnv((m) => log.warn("core", m));
     process.exit(0);
   };
   // Stop IPC first (synchronous-ish; awaits socket close + unlink). The IPC
@@ -642,6 +655,16 @@ if (config.xwayland.enabled) {
       }
     }
   }
+}
+
+// Publish the session identity to the systemd/D-Bus user environment so
+// user-bus services (xdg-desktop-portal + backends, notification daemons)
+// bind to this session's displays. kms-only: a nested overdraw would steal
+// the host session's services. OVERDRAW_NO_SD_VARS opts out entirely.
+if (backendOpts.backend === "kms" && !process.env.OVERDRAW_NO_SD_VARS) {
+  publishSessionEnv(sock, xwaylandHandle?.display ?? null,
+    (m) => log.warn("core", m));
+  sessionEnvPublished = true;
 }
 
 // The `spawn` action (plugin-core-actions) emits this; exec-once/autostart use
