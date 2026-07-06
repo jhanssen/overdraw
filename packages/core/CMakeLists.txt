@@ -364,6 +364,15 @@ target_include_directories(cursor-test-client PRIVATE
     ${CMAKE_SOURCE_DIR}/native/wayland/generated)
 target_link_libraries(cursor-test-client PRIVATE ${WAYLAND_CLIENT_LIBRARIES})
 
+# ---- cursor shm-resize test client (grown theme pool, offset buffer) ----
+add_executable(cursor-shm-resize-client
+    test/cursor-shm-resize-client.c
+    native/wayland/generated/xdg-shell-protocol.c)
+target_include_directories(cursor-shm-resize-client PRIVATE
+    ${WAYLAND_CLIENT_INCLUDE_DIRS}
+    ${CMAKE_SOURCE_DIR}/native/wayland/generated)
+target_link_libraries(cursor-shm-resize-client PRIVATE ${WAYLAND_CLIENT_LIBRARIES})
+
 # ---- cursor-shape test client (wp_cursor_shape_v1.set_shape) ----
 add_executable(cursor-shape-test-client
     test/cursor-shape-test-client.c

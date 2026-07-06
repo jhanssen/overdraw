@@ -5,6 +5,10 @@
 // presents through. No JS. Spawned by the core with two inherited socket fds:
 //   argv[1] = wire socket fd, argv[2] = side-channel socket fd.
 
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE  // MREMAP_MAYMOVE
+#endif
+
 #include <cerrno>
 #include <cstdio>
 #include <cstdlib>
@@ -2177,6 +2181,40 @@ int run(int wireFd, int ctrlFd, int inputFd, bool headless,
             }
             if (it->second.fd >= 0) ::close(it->second.fd);
             shmPools.erase(it);
+            return;
+        }
+        if (kind == ipc::FrameKind::ResizeShmPool) {
+            // Core mirrored a wl_shm_pool.resize (pools only grow). Remap so
+            // ShmUpload regions past the old size stay in bounds; wire FIFO
+            // guarantees this lands before any upload that needs the growth.
+            if (nfds != 0) {
+                std::fprintf(stderr,
+                    "[gpu] core wire: ResizeShmPool with nfds=%d (must be 0)\n", nfds);
+                std::abort();
+            }
+            if (frame.size() != ipc::ResizeShmPoolPayload::kSize) {
+                std::fprintf(stderr,
+                    "[gpu] core wire: bad ResizeShmPool payload size %zu\n",
+                    frame.size());
+                std::abort();
+            }
+            auto p = ipc::ResizeShmPoolPayload::decode(frame.data());
+            auto it = shmPools.find(p.poolId);
+            if (it == shmPools.end()) return;  // registration failed earlier; uploads
+                                               // for this pool already no-op
+            if (p.size <= it->second.size) return;
+            void* nb = ::mremap(const_cast<uint8_t*>(it->second.base),
+                                it->second.size, static_cast<size_t>(p.size),
+                                MREMAP_MAYMOVE);
+            if (nb == MAP_FAILED) {
+                std::fprintf(stderr,
+                    "[gpu] ResizeShmPool: mremap failed (poolId=%u, %zu -> %zu): %s\n",
+                    p.poolId, it->second.size, static_cast<size_t>(p.size),
+                    std::strerror(errno));
+                return;
+            }
+            it->second.base = static_cast<const uint8_t*>(nb);
+            it->second.size = static_cast<size_t>(p.size);
             return;
         }
         if (kind == ipc::FrameKind::AllocShmTex) {

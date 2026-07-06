@@ -904,6 +904,29 @@ struct UnregisterShmPoolPayload {
 static_assert(UnregisterShmPoolPayload::kSize == 4,
               "UnregisterShmPoolPayload size mismatch with hand-counted layout");
 
+// ResizeShmPoolPayload (core -> gpu; FrameKind::ResizeShmPool): the client
+// grew the pool via wl_shm_pool.resize (pools only grow). The GPU process
+// mremap's its cached mapping to the new size.
+struct ResizeShmPoolPayload {
+    uint32_t poolId;
+    uint32_t _pad;   // explicit align: size is u64, layout is u32/u32/u64
+    uint64_t size;
+    static constexpr size_t kSize = 16;
+    void encode(uint8_t* out) const {
+        putU32LE(out + 0, poolId);
+        putU32LE(out + 4, 0);
+        putU64LE(out + 8, size);
+    }
+    static ResizeShmPoolPayload decode(const uint8_t* p) {
+        ResizeShmPoolPayload r{};
+        r.poolId = getU32LE(p + 0);
+        r.size   = getU64LE(p + 8);
+        return r;
+    }
+};
+static_assert(ResizeShmPoolPayload::kSize == 16,
+              "ResizeShmPoolPayload size mismatch with hand-counted layout");
+
 // AllocShmTexPayload (core -> gpu; FrameKind::AllocShmTex):
 // the core wire-client has ReserveTexture'd a wire handle for a
 // sampleable BGRA8 texture sized to the current shm buffer. The GPU

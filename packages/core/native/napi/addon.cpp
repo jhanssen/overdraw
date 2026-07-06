@@ -2711,7 +2711,14 @@ napi_value ShmResizePool(napi_env env, napi_callback_info info) {
     if (argc < 2) return throwError(env, "shmResizePool(poolId, newSize) requires two args");
     uint32_t poolId = 0; napi_get_value_uint32(env, argv[0], &poolId);
     uint32_t newSize = 0; napi_get_value_uint32(env, argv[1], &newSize);
-    napi_value out; napi_get_boolean(env, g_addon.shm.resizePool(poolId, newSize), &out);
+    const bool ok = g_addon.shm.resizePool(poolId, newSize);
+    // Mirror the grow to the GPU process's mapping; without this, ShmUpload
+    // regions past the pool's creation size fail its bounds check (the
+    // grown-cursor-theme-pool case) and the content silently never lands.
+    if (ok && g_addon.compositor) {
+        g_addon.compositor->resizeShmPool(poolId, newSize);
+    }
+    napi_value out; napi_get_boolean(env, ok, &out);
     return out;
 }
 

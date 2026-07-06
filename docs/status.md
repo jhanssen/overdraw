@@ -572,6 +572,17 @@ ARGB8888/XRGB8888 advertised; `wl_shm_pool` maps the fd;
 uploads via `queue.writeTexture`. ARGB8888/XRGB8888 -> BGRA8Unorm
 byte-for-byte on LE. `wl_buffer.release` after upload (bytes copied).
 
+`wl_shm_pool.resize` is mirrored to the GPU process
+(`FrameKind::ResizeShmPool` -> mremap), keeping the shm fast-path
+mapping in sync with the core's. Without the mirror, an upload whose
+region sits past the pool's CREATION size fails the GPU process's
+bounds check and is silently dropped (ack still sent, so the buffer
+releases and nothing retries). The canonical victim is a
+libwayland-cursor theme pool -- created one-image-sized and grown per
+loaded cursor -- which made GTK/emacs client-surface cursors render
+as fully transparent (invisible pointer). End-to-end coverage:
+`test/cursor-shm-resize.gpu.mjs` + `cursor-shm-resize-client`.
+
 ### dmabuf (verified)
 
 ARGB8888/XRGB8888 + LINEAR/INVALID advertised. `create_immed` builds

@@ -344,6 +344,10 @@ class Compositor {
     // the core's shmRegistry uses, so subsequent ShmUpload frames key on
     // a matching identifier on both sides.
     void registerShmPool(uint32_t poolId, int fd, uint64_t size);
+    // Mirror a wl_shm_pool.resize to the GPU process (pools only grow).
+    // Rides the wire so the remap lands before any ShmUpload that reads
+    // past the old size.
+    void resizeShmPool(uint32_t poolId, uint64_t size);
     void unregisterShmPool(uint32_t poolId);
 
     // Allocate a sampleable BGRA8 wire texture for shm content on the

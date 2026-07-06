@@ -673,6 +673,16 @@ void Compositor::registerShmPool(uint32_t poolId, int fd, uint64_t size) {
     }
 }
 
+void Compositor::resizeShmPool(uint32_t poolId, uint64_t size) {
+    if (!link_) return;
+    ipc::ResizeShmPoolPayload p{};
+    p.poolId = poolId;
+    p.size   = size;
+    uint8_t buf[ipc::ResizeShmPoolPayload::kSize];
+    p.encode(buf);
+    link_->appendFrame(ipc::FrameKind::ResizeShmPool, buf, sizeof(buf));
+}
+
 void Compositor::unregisterShmPool(uint32_t poolId) {
     if (!link_) return;
     ipc::UnregisterShmPoolPayload p{poolId};

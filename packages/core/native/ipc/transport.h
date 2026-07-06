@@ -255,6 +255,15 @@ enum class FrameKind : uint8_t {
                               // two fds and commit with no fence (a torn
                               // frame). Payload: ScanoutPresentPayload
                               // (outputId, surfaceBufId).
+    ResizeShmPool = 24,       // core -> gpu: client grew a wl_shm pool
+                              // (wl_shm_pool.resize; pools only grow). GPU
+                              // process mremap's its mapping to the new
+                              // size. Payload: ResizeShmPoolPayload (poolId
+                              // + size). Rides wire so the remap is FIFO-
+                              // ordered before any ShmUpload that references
+                              // bytes past the old size -- a cursor theme
+                              // pool grows image-by-image, and the next
+                              // upload reads from the newly grown region.
 };
 
 // Max fds attachable in one message (control msg OR in-band wire frame).
