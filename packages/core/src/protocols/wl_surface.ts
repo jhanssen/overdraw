@@ -24,6 +24,7 @@ import {
   applyLayerSurfacePending,
   teardownLayerSurface,
 } from "./zwlr_layer_shell_v1.js";
+import { dropSerialsForSurface } from "../xwayland/surface.js";
 
 // Assign a stable per-wl_buffer id used to track the dmabuf release lifecycle
 // across the JS<->native boundary. Native reports freed bufferIds (once its GPU
@@ -836,5 +837,6 @@ export function unmapAndTeardownSurface(state: CompositorState, addon: Addon, s:
   if (s.unmapped) return;
   s.unmapped = true;
   detachSurfaceRole(state, addon, s);
+  dropSerialsForSurface(state, s.id);
   state.surfacesById?.delete(s.id);
 }

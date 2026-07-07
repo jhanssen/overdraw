@@ -67,3 +67,14 @@ export function lookupBySerial(state: CompositorState, serial: bigint): number |
 export function unbindSurface(state: CompositorState, resource: Resource): void {
   state.xwayland?.byResource.delete(resource);
 }
+
+// Evict a torn-down wl_surface's serial registrations. The serial join is
+// only meaningful while the surface exists; without this the registry
+// grows by one permanent entry per X window ever mapped.
+export function dropSerialsForSurface(state: CompositorState, surfaceId: number): void {
+  const st = state.xwayland;
+  if (!st) return;
+  for (const [serial, sid] of st.bySerial) {
+    if (sid === surfaceId) st.bySerial.delete(serial);
+  }
+}

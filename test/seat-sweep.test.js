@@ -127,6 +127,37 @@ test("idempotent: a second call with no destroyed entries leaves state untouched
   assert.deepEqual([...kbByClient.get(100)], [liveKb]);
 });
 
+test("enter serials of destroyed pointers are dropped; live ones survive", () => {
+  const liveP = res("p-live");
+  const deadP = res("p-dead", { destroyed: true });
+  const serials = new Map([[liveP, 41], [deadP, 42]]);
+  const seat = { kbFocus: null, focus: null };
+  sweepDestroyedSeatState(seat, new Map([[100, new Set([liveP, deadP])]]), new Map(), serials);
+  assert.deepEqual([...serials.entries()], [[liveP, 41]]);
+});
+
+test("recycled-clientId hazard: dead client's cursor preference is dropped with its pointers", () => {
+  // Client A hid the cursor, then disconnected (its pointer is destroyed).
+  // Client B lands at the recycled clientId: it must NOT inherit
+  // hidden:true.
+  const deadP = res("pA", { destroyed: true });
+  const ptrByClient = new Map([[100, new Set([deadP])]]);
+  const cursors = new Map([[100, { surfaceResource: null, hotspotX: 0, hotspotY: 0, hidden: true }]]);
+  const seat = { kbFocus: null, focus: null };
+  sweepDestroyedSeatState(seat, ptrByClient, new Map(), new Map(), cursors);
+  assert.equal(cursors.has(100), false);
+});
+
+test("cursor preference of a client with a surviving pointer is preserved", () => {
+  const liveP = res("p-live");
+  const ptrByClient = new Map([[100, new Set([liveP])]]);
+  const pref = { surfaceResource: res("cursor-surf"), hotspotX: 3, hotspotY: 4, hidden: false };
+  const cursors = new Map([[100, pref]]);
+  const seat = { kbFocus: null, focus: null };
+  sweepDestroyedSeatState(seat, ptrByClient, new Map(), new Map(), cursors);
+  assert.equal(cursors.get(100), pref);
+});
+
 test("no-op on empty inputs", () => {
   const seat = { kbFocus: null, focus: null };
   const kb = new Map();

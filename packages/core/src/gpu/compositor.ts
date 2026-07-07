@@ -950,9 +950,15 @@ export class JsCompositor implements CompositorSink {
   private warnedDmabuf = false;
 
   // Pool of compositor-owned textures reused for frozen-surface snapshots,
-  // keyed by "WxH" device size. Bounded per size so a one-off large resize
-  // doesn't pin memory.
+  // keyed by "WxH" device size. Bounded per size AND globally: each release
+  // bumps its bucket to the map's tail (insertion order = recency), and
+  // exceeding the global cap evicts from the least-recently-released size,
+  // so a resize session that visits many distinct sizes doesn't pin one
+  // pool of textures per size for the process lifetime.
   private snapPool = new Map<string, GPUTexture[]>();
+  private snapPoolCount = 0;
+  private static readonly SNAP_POOL_PER_SIZE = 4;
+  private static readonly SNAP_POOL_MAX = 16;
   // Fired when a frozen surface's new buffer becomes drawable (the WM gates the
   // thaw on this + the new size). Set by setFrozenReadyHandler.
   private frozenReadyCb: ((id: number) => void) | null = null;
@@ -1692,8 +1698,14 @@ export class JsCompositor implements CompositorSink {
   }
 
   private acquireSnapTex(w: number, h: number): FrozenSnapshot {
-    const free = this.snapPool.get(`${w}x${h}`);
-    const pooled = free && free.length > 0 ? free.pop() : undefined;
+    const key = `${w}x${h}`;
+    const free = this.snapPool.get(key);
+    let pooled: GPUTexture | undefined;
+    if (free && free.length > 0) {
+      pooled = free.pop();
+      this.snapPoolCount--;
+      if (free.length === 0) this.snapPool.delete(key);
+    }
     const tex = pooled ?? this.device.createTexture({
       size: { width: w, height: h },
       format: this.format,
@@ -1704,10 +1716,28 @@ export class JsCompositor implements CompositorSink {
 
   private releaseSnapTex(snap: FrozenSnapshot): void {
     const key = `${snap.w}x${snap.h}`;
-    let free = this.snapPool.get(key);
-    if (!free) { free = []; this.snapPool.set(key, free); }
-    if (free.length < 4) free.push(snap.tex);
-    else snap.tex.destroy();
+    // Delete + re-set so the bucket moves to the map's tail (most recent).
+    const existing = this.snapPool.get(key);
+    const free = existing ?? [];
+    if (existing) this.snapPool.delete(key);
+    this.snapPool.set(key, free);
+    if (free.length < JsCompositor.SNAP_POOL_PER_SIZE) {
+      free.push(snap.tex);
+      this.snapPoolCount++;
+    } else {
+      snap.tex.destroy();
+    }
+    // Global bound: evict from the least-recently-released size bucket.
+    // The current bucket was just bumped to the tail, so the head is
+    // always a different (older) size once the cap is exceeded.
+    while (this.snapPoolCount > JsCompositor.SNAP_POOL_MAX) {
+      const oldest = this.snapPool.entries().next().value;
+      if (!oldest) break;
+      const [oldKey, texes] = oldest;
+      const tex = texes.shift();
+      if (tex) { tex.destroy(); this.snapPoolCount--; }
+      if (texes.length === 0) this.snapPool.delete(oldKey);
+    }
   }
 
   // These three are re-pushed on EVERY wl_surface.commit (applySurfaceState),

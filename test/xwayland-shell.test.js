@@ -7,7 +7,8 @@ import assert from "node:assert/strict";
 
 import makeXwaylandShell, { makeXwaylandSurface }
   from "../packages/core/dist/protocols/xwayland_shell_v1.js";
-import { lookupBySerial } from "../packages/core/dist/xwayland/surface.js";
+import { lookupBySerial, dropSerialsForSurface }
+  from "../packages/core/dist/xwayland/surface.js";
 
 function makeCtx() {
   const errorCalls = [];
@@ -88,4 +89,24 @@ test("set_serial twice posts already_associated (0)", () => {
   errorCalls.length = 0;
   surf.set_serial(xs, 2, 0);
   assert.deepEqual(errorCalls.map((c) => c[0]), [0]);  // already_associated == 0
+});
+
+test("dropSerialsForSurface evicts a torn-down surface's serials; others survive", () => {
+  const { ctx, surfaces } = makeCtx();
+  const shell = makeXwaylandShell(ctx);
+  const surf = makeXwaylandSurface(ctx);
+  const wlA = { id: 1 }, wlB = { id: 2 };
+  addSurface(surfaces, wlA, 42);
+  addSurface(surfaces, wlB, 43);
+  const xsA = { id: 3 }, xsB = { id: 4 };
+  shell.get_xwayland_surface({ id: 9 }, xsA, wlA);
+  shell.get_xwayland_surface({ id: 9 }, xsB, wlB);
+  surf.set_serial(xsA, 100, 0);
+  surf.set_serial(xsB, 200, 0);
+  assert.equal(lookupBySerial(ctx.state, 100n), 42);
+
+  dropSerialsForSurface(ctx.state, 42);
+  assert.equal(lookupBySerial(ctx.state, 100n), null, "torn-down surface's serial evicted");
+  assert.equal(lookupBySerial(ctx.state, 200n), 43, "other surface's serial survives");
+  assert.equal(ctx.state.xwayland.bySerial.size, 1);
 });

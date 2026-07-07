@@ -53,6 +53,8 @@ export function sweepDestroyedSeatState(
   seat: SweepableSeatState,
   pointersByClient: Map<number, Set<Resource>>,
   keyboardsByClient: Map<number, Set<Resource>>,
+  lastEnterSerial?: Map<Resource, number>,
+  clientCursors?: Map<number, unknown>,
 ): void {
   if (seat.kbFocus && seat.kbFocus.surfaceRec.resource.destroyed) {
     seat.kbFocus = null;
@@ -67,6 +69,22 @@ export function sweepDestroyedSeatState(
   for (const [cid, set] of pointersByClient) {
     for (const p of [...set]) if (p.destroyed) set.delete(p);
     if (set.size === 0) pointersByClient.delete(cid);
+  }
+  // Per-pointer enter serials: drop entries for destroyed pointers.
+  if (lastEnterSerial) {
+    for (const p of [...lastEnterSerial.keys()]) {
+      if (p.destroyed) lastEnterSerial.delete(p);
+    }
+  }
+  // Per-client cursor preferences are keyed by clientId, which libwayland
+  // recycles -- a new client at a recycled address must not inherit a dead
+  // client's cursor (including hidden:true). A cursor preference can only
+  // be set through a wl_pointer request, so a clientId with no surviving
+  // pointers (pruned above) has no owner for its preference: drop it.
+  if (clientCursors) {
+    for (const cid of [...clientCursors.keys()]) {
+      if (!pointersByClient.has(cid)) clientCursors.delete(cid);
+    }
   }
 }
 
@@ -1039,7 +1057,8 @@ export default function makeSeat(ctx: Ctx, driver: FocusDriver): SeatHandler {
       // Release keys held by a virtual keyboard whose client disconnected
       // without lifting them, so a stuck modifier doesn't poison real input.
       releaseDeadVirtualKeyboards(ctx);
-      sweepDestroyedSeatState(seat0, pointersByClient, keyboardsByClient);
+      sweepDestroyedSeatState(seat0, pointersByClient, keyboardsByClient,
+        lastEnterSerial, clientCursors);
     },
   };
   const seat0 = ctx.state.seat;
