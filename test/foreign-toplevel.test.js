@@ -11,6 +11,7 @@ import assert from "node:assert/strict";
 import makeManager, {
   makeForeignToplevelHandle,
   installForeignToplevelBusHooks,
+  sweepDisconnected,
   _resetForTests,
 } from "../packages/core/dist/protocols/zwlr_foreign_toplevel_manager_v1.js";
 
@@ -62,6 +63,9 @@ function mockCtx() {
   const events = {
     zwlr_foreign_toplevel_manager_v1: {
       send_toplevel(resource, _placeholder) {
+        // Mirror the trampoline: posting to a destroyed resource is a
+        // no-op that mints no server-side new_id.
+        if (resource.destroyed) return undefined;
         const handle = mockResource("zwlr_foreign_toplevel_handle_v1");
         minted.push(handle);
         sent.push(["toplevel", { resource, handle }]);
@@ -506,6 +510,61 @@ test("handle destroy drops the per-manager mapping", () => {
   ctx.state._propose.length = 0;
   handle.set_maximized(h);
   assert.equal(ctx.state._propose.length, 0);
+});
+
+// ---- client disconnect (no stop, no destroy handlers) --------------------
+
+test("manager client disconnect: window.map neither throws nor emits, and prunes the manager", () => {
+  const ctx = mockCtx();
+  recordToplevel(ctx, 200);
+  const mgr = makeManager(ctx);
+  const mgrResource = mockResource("m");
+  mgr.bind(mgrResource);
+  installForeignToplevelBusHooks(ctx);
+  ctx.state._sent.length = 0;
+
+  // Simulate the client vanishing: libwayland marks the wrapper destroyed
+  // without running any request handler.
+  mgrResource.destroyed = true;
+
+  ctx.state.bus.emit("window.map", {
+    surfaceId: 200, rect: { x: 0, y: 0, width: 100, height: 50 },
+    appId: null, title: null,
+  });
+  assert.equal(ctx.state._sent.length, 0);
+
+  // The dead manager was pruned during fan-out: a second manager binding
+  // and mapping still works, and only that manager receives events.
+  const mgr2 = makeManager(ctx);
+  mgr2.bind(mockResource("m2"));
+  recordToplevel(ctx, 201);
+  ctx.state.bus.emit("window.map", {
+    surfaceId: 201, rect: { x: 0, y: 0, width: 100, height: 50 },
+    appId: null, title: null,
+  });
+  const toplevels = ctx.state._sent.filter(([k]) => k === "toplevel");
+  assert.equal(toplevels.length, 1);
+});
+
+test("manager disconnect mid-lifetime: sweepDisconnected drops it with no events", () => {
+  const ctx = mockCtx();
+  recordToplevel(ctx, 200);
+  const mgr = makeManager(ctx);
+  const mgrResource = mockResource("m");
+  mgr.bind(mgrResource);
+  installForeignToplevelBusHooks(ctx);
+  ctx.state.bus.emit("window.map", {
+    surfaceId: 200, rect: { x: 0, y: 0, width: 100, height: 50 },
+    appId: null, title: null,
+  });
+  ctx.state._sent.length = 0;
+
+  mgrResource.destroyed = true;
+  sweepDisconnected();
+
+  // Unmap after the sweep: nothing addresses the dead manager's handle.
+  ctx.state.bus.emit("window.unmap", { surfaceId: 200 });
+  assert.equal(ctx.state._sent.length, 0);
 });
 
 test("manager.stop: emits finished, no further events", () => {

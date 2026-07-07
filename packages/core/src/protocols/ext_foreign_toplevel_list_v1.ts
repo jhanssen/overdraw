@@ -38,21 +38,13 @@ import type { ExtForeignToplevelListV1Handler }
 import type { ExtForeignToplevelHandleV1Handler }
   from "#protocols-gen/ext_foreign_toplevel_handle_v1.js";
 
-// Per-bound-list state.
-interface ListState {
-  resource: Resource;
-  // surfaceId -> ext_foreign_toplevel_handle_v1 resource. The handle is
-  // valid until the client destroys it (or the list is `stop`ed and
-  // `finished`); after closed it's "inert" but still alive.
-  handles: Map<number, Resource>;
-  active: boolean;
-}
+import { BindingRegistry, emitTitleAppIdChange } from "./foreign-toplevel-registry.js";
+import type { Binding } from "./foreign-toplevel-registry.js";
 
-// Module-local registry. Same pattern as the wlr impl: a Set of bound
-// lists, plus a reverse map so a destroyed handle can find its owner
-// for bookkeeping cleanup.
-const lists = new Set<ListState>();
-const handleOwners = new WeakMap<Resource, { list: ListState; surfaceId: number }>();
+// Module-local registry of bound lists + reverse handle->owner lookup;
+// shared machinery with the wlr foreign-toplevel implementation, including
+// disconnect pruning for clients that exit without stop().
+const registry = new BindingRegistry();
 
 // Identifier generator. Monotonic across the compositor's lifetime.
 let identifierSeq = 0;
@@ -70,13 +62,12 @@ function identifierFor(surfaceId: number): string {
 
 // Send the full initial burst for a toplevel on a single bound list.
 // Order per spec: identifier -> app_id -> title -> done.
-function emitInitial(ctx: Ctx, list: ListState, surfaceId: number): void {
+function emitInitial(ctx: Ctx, list: Binding, surfaceId: number): void {
   const events = ctx.events;
-  const handle = events.ext_foreign_toplevel_list_v1
-    .send_toplevel(list.resource, null) as Resource;
+  const handle = registry.mint(list, surfaceId, () =>
+    events.ext_foreign_toplevel_list_v1
+      .send_toplevel(list.resource, null) as Resource | undefined);
   if (!handle) return;
-  list.handles.set(surfaceId, handle);
-  handleOwners.set(handle, { list, surfaceId });
 
   events.ext_foreign_toplevel_handle_v1.send_identifier(handle, identifierFor(surfaceId));
   const ta = titleAppId(ctx.state, surfaceId);
@@ -88,40 +79,26 @@ function emitInitial(ctx: Ctx, list: ListState, surfaceId: number): void {
 }
 
 // Re-emit title / app_id when window.change reports they moved.
-function emitChange(ctx: Ctx, list: ListState, surfaceId: number,
+function emitChange(ctx: Ctx, list: Binding, surfaceId: number,
                     fields: ReadonlySet<string>): void {
-  const handle = list.handles.get(surfaceId);
+  const handle = registry.handleFor(list, surfaceId);
   if (!handle) return;
   const events = ctx.events;
-  let any = false;
-  if (fields.has("title")) {
-    const t = titleAppId(ctx.state, surfaceId).title;
-    if (t !== null) {
-      events.ext_foreign_toplevel_handle_v1.send_title(handle, t);
-      any = true;
-    }
-  }
-  if (fields.has("appId")) {
-    const a = titleAppId(ctx.state, surfaceId).appId;
-    if (a !== null) {
-      events.ext_foreign_toplevel_handle_v1.send_app_id(handle, a);
-      any = true;
-    }
-  }
+  const any = emitTitleAppIdChange(ctx.state, events.ext_foreign_toplevel_handle_v1,
+    handle, surfaceId, fields);
   if (any) events.ext_foreign_toplevel_handle_v1.send_done(handle);
 }
 
 // Send closed to every bound list's handle for this surfaceId. The
 // identifier is invalidated (spec: must not be reused on remap).
 function emitUnmap(ctx: Ctx, surfaceId: number): void {
-  for (const list of lists) {
-    if (!list.active) continue;
-    const handle = list.handles.get(surfaceId);
+  for (const list of registry.live()) {
+    const handle = registry.handleFor(list, surfaceId);
     if (!handle) continue;
     ctx.events.ext_foreign_toplevel_handle_v1.send_closed(handle);
     list.handles.delete(surfaceId);
-    // Keep handleOwners around so destroy() finds the list; the handle
-    // is now inert per spec.
+    // The registry's reverse lookup keeps the entry so destroy() finds the
+    // list; the handle is now inert per spec.
   }
   identifiers.delete(surfaceId);
 }
@@ -134,8 +111,7 @@ export function installExtForeignToplevelBusHooks(ctx: Ctx): void {
     // Layer-shell maps also ride window.map; this protocol covers
     // toplevels only, mirroring the wlr equivalent.
     if (ev.role !== undefined && ev.role !== "toplevel") return;
-    for (const list of lists) {
-      if (!list.active) continue;
+    for (const list of registry.live()) {
       emitInitial(ctx, list, ev.surfaceId);
     }
   });
@@ -144,8 +120,7 @@ export function installExtForeignToplevelBusHooks(ctx: Ctx): void {
   });
   bus.on(WINDOW_EVENT.change, (ev) => {
     const fields = new Set<string>(ev.changed);
-    for (const list of lists) {
-      if (!list.active) continue;
+    for (const list of registry.live()) {
       emitChange(ctx, list, ev.surfaceId, fields);
     }
   });
@@ -156,8 +131,7 @@ export default function makeExtForeignToplevelList(ctx: Ctx):
 {
   return {
     bind(resource) {
-      const list: ListState = { resource, handles: new Map(), active: true };
-      lists.add(list);
+      const list = registry.bind(resource);
       // Catch-up: every currently-mapped toplevel.
       const wm = ctx.state.wm;
       if (!wm) return;
@@ -168,15 +142,10 @@ export default function makeExtForeignToplevelList(ctx: Ctx):
     },
     stop(resource) {
       // The client no longer wants new-toplevel events. Send finished
-      // and mark the list inactive; the client is expected to destroy
-      // the list resource (and its remaining handles) afterwards.
-      for (const list of lists) {
-        if (list.resource !== resource) continue;
-        if (!list.active) return;
-        list.active = false;
+      // and drop the list; the client is expected to destroy the list
+      // resource (and its remaining handles) afterwards.
+      if (registry.stop(resource)) {
         ctx.events.ext_foreign_toplevel_list_v1.send_finished(resource);
-        lists.delete(list);
-        return;
       }
     },
     destroy(_resource) { /* destructor */ },
@@ -186,26 +155,28 @@ export default function makeExtForeignToplevelList(ctx: Ctx):
 export function makeExtForeignToplevelHandle(_ctx: Ctx): ExtForeignToplevelHandleV1Handler {
   return {
     destroy(resource) {
-      const owner = handleOwners.get(resource);
-      if (!owner) return;
-      owner.list.handles.delete(owner.surfaceId);
-      handleOwners.delete(resource);
+      registry.releaseHandle(resource);
     },
   };
+}
+
+// Frame-tick disconnect sweep: drop lists whose client vanished without
+// stop() (their resources are marked destroyed; no request handler ran).
+export function sweepDisconnected(): void {
+  registry.sweep();
 }
 
 // Test-only hook: clear all per-list state so a fresh installProtocols
 // sees an empty registry.
 export function _resetForTests(): void {
-  lists.clear();
+  registry.clear();
   identifiers.clear();
   identifierSeq = 0;
 }
 
-// Look up the surfaceId for a given handle resource. Used by the
-// (forthcoming) ext_foreign_toplevel_image_capture_source_manager_v1
-// to map a client-supplied handle back to the toplevel.
+// Look up the surfaceId for a given handle resource. Used by
+// ext_foreign_toplevel_image_capture_source_manager_v1 to map a
+// client-supplied handle back to the toplevel.
 export function surfaceIdForHandle(resource: Resource): number | null {
-  const o = handleOwners.get(resource);
-  return o ? o.surfaceId : null;
+  return registry.surfaceIdOf(resource);
 }

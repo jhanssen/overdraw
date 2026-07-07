@@ -124,32 +124,53 @@ export default function makeExporter(ctx: Ctx): ZxdgExporterV2Handler {
   };
 }
 
+// Invalidate an export: notify every dependent import, clear parent edges,
+// and drop the registry entry. Runs on explicit zxdg_exported_v2.destroy
+// and on the disconnect sweep when the exporter's client vanished.
+function invalidateExport(ctx: Ctx, entry: ExportEntry): void {
+  // Notify every dependent import that the handle is now invalid.
+  // We don't tear down the imported resources here -- the client
+  // owns their lifetime via xdg_imported.destroy. Just signal.
+  for (const imported of entry.imports) {
+    // Spec: "any relationship set up has been invalidated. This may
+    // happen ... if the exported surface or the exported surface
+    // handle has been destroyed."
+    ctx.events.zxdg_imported_v2.send_destroyed(imported);
+    // Clear the parent edge on the child (if any) so the WM's
+    // stacking semantics don't keep a dangling parent reference.
+    const importEntry = imports.get(imported);
+    if (importEntry && importEntry.childSurfaceId !== null) {
+      void ctx.state.wm?.propose(importEntry.childSurfaceId,
+        { parent: null }, "client-request");
+      importEntry.childSurfaceId = null;
+    }
+  }
+  exportsByHandle.delete(entry.handle);
+  exportByResource.delete(entry.exported);
+}
+
 export function makeExported(_ctx: Ctx): ZxdgExportedV2Handler {
   return {
     destroy(resource) {
       const entry = exportByResource.get(resource);
       if (!entry) return;
-      // Notify every dependent import that the handle is now invalid.
-      // We don't tear down the imported resources here -- the client
-      // owns their lifetime via xdg_imported.destroy. Just signal.
-      for (const imported of entry.imports) {
-        // Spec: "any relationship set up has been invalidated. This may
-        // happen ... if the exported surface or the exported surface
-        // handle has been destroyed."
-        _ctx.events.zxdg_imported_v2.send_destroyed(imported);
-        // Clear the parent edge on the child (if any) so the WM's
-        // stacking semantics don't keep a dangling parent reference.
-        const importEntry = imports.get(imported);
-        if (importEntry && importEntry.childSurfaceId !== null) {
-          void _ctx.state.wm?.propose(importEntry.childSurfaceId,
-            { parent: null }, "client-request");
-          importEntry.childSurfaceId = null;
-        }
-      }
-      exportsByHandle.delete(entry.handle);
-      exportByResource.delete(resource);
+      invalidateExport(_ctx, entry);
     },
   };
+}
+
+// Frame-tick disconnect sweep. A client that vanished runs no destroy
+// handlers, so: prune imported resources whose importer is gone (their
+// entries in an export's dependent set would otherwise persist for the
+// export's lifetime), then invalidate exports whose exporter is gone
+// (otherwise the handle registry entry persists forever).
+export function sweepDisconnected(ctx: Ctx): void {
+  for (const entry of [...exportsByHandle.values()]) {
+    for (const imported of entry.imports) {
+      if (imported.destroyed) entry.imports.delete(imported);
+    }
+    if (entry.exported.destroyed) invalidateExport(ctx, entry);
+  }
 }
 
 export function makeImporter(ctx: Ctx): ZxdgImporterV2Handler {

@@ -640,6 +640,17 @@ export async function installProtocols(
     // this so the kbFocus.surfaceRec.resource.destroyed flag is current.
     state.seat?.sweepDestroyed();
 
+    // Same disconnect case for module-local protocol registries: these
+    // track per-client bound resources outside the wrapper maps, and a
+    // client that vanished ran none of the protocol's stop/destroy
+    // handlers. Each sweep drops state keyed to a destroyed resource.
+    // (The module consts are declared later in this function; this
+    // closure only runs after installProtocols completes.)
+    foreignTopMod.sweepDisconnected();
+    extForeignTopMod.sweepDisconnected();
+    xdgForeignMod.sweepDisconnected(ctx);
+    shortcutsInhibitMod.sweepDisconnected(ctx);
+
     // Same disconnect case for wl_buffers: a client that drops without
     // wl_buffer.destroy leaves its descriptor in state.buffers. A dmabuf
     // descriptor holds an open WaylandFd; an shm descriptor holds a ref on its

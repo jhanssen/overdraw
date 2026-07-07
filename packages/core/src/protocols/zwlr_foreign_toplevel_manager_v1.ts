@@ -45,24 +45,18 @@ import { closeSurface } from "./close-surface.js";
 import { WINDOW_EVENT } from "../events/types.js";
 import type { Resource } from "../types.js";
 import type { WindowState } from "../events/types.js";
+import { BindingRegistry, emitTitleAppIdChange } from "./foreign-toplevel-registry.js";
+import type { Binding } from "./foreign-toplevel-registry.js";
 
 const STATE = handleSig.enums.state.entries;
 //   { maximized: 0, minimized: 1, activated: 2, fullscreen: 3 }
 
-// Per-manager state: which handle this client received for each surfaceId,
-// plus an `active` flag flipped on stop() so further events suppress.
-interface ManagerState {
-  resource: Resource;
-  handles: Map<number, Resource>; // surfaceId -> zwlr_foreign_toplevel_handle_v1
-  active: boolean;
-}
-
-// Module-local registry of all bound managers + reverse lookup from a
-// handle resource back to its (manager, surfaceId). Living outside the
+// Module-local registry of bound managers + reverse lookup from a handle
+// resource back to its (manager, surfaceId). Living outside the
 // CompositorState avoids leaking foreign-toplevel internals to every other
-// handler.
-const managers = new Set<ManagerState>();
-const handleOwners = new WeakMap<Resource, { manager: ManagerState; surfaceId: number }>();
+// handler. Disconnect pruning (a manager client that exits without stop())
+// is owned by the registry.
+const registry = new BindingRegistry();
 
 // Pack the foreign-toplevel state array. Same wire shape as
 // xdg_toplevel.configure states: a contiguous run of host-endian uint32.
@@ -107,15 +101,16 @@ function buildStateArray(ws: WindowState | null, activated: boolean): Uint8Array
 // (output_enter is omitted today; see status.md "Read first" --
 // per-client wl_output resource resolution isn't wired and single-output
 // means there's only one valid value anyway).
-function emitInitial(ctx: Ctx, mgr: ManagerState, surfaceId: number): void {
+function emitInitial(ctx: Ctx, mgr: Binding, surfaceId: number): void {
   const state = ctx.state;
   // Mint a server-side new_id for the handle. The trampoline returns the
   // freshly created resource when the new_id arg is null. Same idiom the
-  // wl_data_device.send_data_offer path uses.
-  const handle = ctx.events.zwlr_foreign_toplevel_manager_v1
-    .send_toplevel(mgr.resource, null) as Resource;
-  mgr.handles.set(surfaceId, handle);
-  handleOwners.set(handle, { manager: mgr, surfaceId });
+  // wl_data_device.send_data_offer path uses. Minting fails (returns
+  // null) when the manager's client is already gone; skip the burst.
+  const handle = registry.mint(mgr, surfaceId, () =>
+    ctx.events.zwlr_foreign_toplevel_manager_v1
+      .send_toplevel(mgr.resource, null) as Resource | undefined);
+  if (!handle) return;
 
   const ta = titleAppId(state, surfaceId);
   if (ta.appId !== null) ctx.events.zwlr_foreign_toplevel_handle_v1.send_app_id(handle, ta.appId);
@@ -127,26 +122,13 @@ function emitInitial(ctx: Ctx, mgr: ManagerState, surfaceId: number): void {
 }
 
 // Translate a window.change field set into per-handle re-emissions.
-function emitChange(ctx: Ctx, mgr: ManagerState, surfaceId: number,
+function emitChange(ctx: Ctx, mgr: Binding, surfaceId: number,
                     fields: ReadonlySet<string>): void {
-  const handle = mgr.handles.get(surfaceId);
+  const handle = registry.handleFor(mgr, surfaceId);
   if (!handle) return;
   const state = ctx.state;
-  let any = false;
-  if (fields.has("title")) {
-    const t = titleAppId(state, surfaceId).title;
-    if (t !== null) {
-      ctx.events.zwlr_foreign_toplevel_handle_v1.send_title(handle, t);
-      any = true;
-    }
-  }
-  if (fields.has("appId")) {
-    const a = titleAppId(state, surfaceId).appId;
-    if (a !== null) {
-      ctx.events.zwlr_foreign_toplevel_handle_v1.send_app_id(handle, a);
-      any = true;
-    }
-  }
+  let any = emitTitleAppIdChange(state, ctx.events.zwlr_foreign_toplevel_handle_v1,
+    handle, surfaceId, fields);
   if (fields.has("activated")) {
     const ws = state.wm?.getWindowState(surfaceId) ?? null;
     const activated = state.seat?.kbFocus?.surfaceId === surfaceId;
@@ -158,9 +140,9 @@ function emitChange(ctx: Ctx, mgr: ManagerState, surfaceId: number,
 
 // Re-emit the state array (presentation change) and parent event when the
 // committed window state changed.
-function emitCommitted(ctx: Ctx, mgr: ManagerState, surfaceId: number,
+function emitCommitted(ctx: Ctx, mgr: Binding, surfaceId: number,
                        prev: WindowState, next: WindowState): void {
-  const handle = mgr.handles.get(surfaceId);
+  const handle = registry.handleFor(mgr, surfaceId);
   if (!handle) return;
   let any = false;
   const stateChanged = prev.tiling !== next.tiling
@@ -174,7 +156,8 @@ function emitCommitted(ctx: Ctx, mgr: ManagerState, surfaceId: number,
   // parent is since 3; a handle bound below v3 (manager bound at v1/v2) has no
   // listener for it and would be aborted.
   if (prev.parent !== next.parent && handle.version >= 3) {
-    const parentHandle = next.parent != null ? mgr.handles.get(next.parent) ?? null : null;
+    const parentHandle = next.parent != null
+      ? registry.handleFor(mgr, next.parent) ?? null : null;
     ctx.events.zwlr_foreign_toplevel_handle_v1.send_parent(handle, parentHandle);
     any = true;
   }
@@ -186,14 +169,13 @@ function emitCommitted(ctx: Ctx, mgr: ManagerState, surfaceId: number,
 // requires the client to destroy it); we just stop addressing it as
 // "tracking this toplevel".
 function emitUnmap(ctx: Ctx, surfaceId: number): void {
-  for (const mgr of managers) {
-    if (!mgr.active) continue;
-    const handle = mgr.handles.get(surfaceId);
+  for (const mgr of registry.live()) {
+    const handle = registry.handleFor(mgr, surfaceId);
     if (!handle) continue;
     ctx.events.zwlr_foreign_toplevel_handle_v1.send_closed(handle);
     mgr.handles.delete(surfaceId);
-    // Keep handleOwners so destroy() finds the manager; the handle is now
-    // inert per spec.
+    // The registry's reverse lookup keeps the entry so destroy() finds the
+    // manager; the handle is now inert per spec.
   }
 }
 
@@ -206,8 +188,7 @@ export function installForeignToplevelBusHooks(ctx: Ctx): void {
       // Layer-shell maps also fire window.map; only toplevels go through
       // the foreign-toplevel manager.
       if (ev.role !== undefined && ev.role !== "toplevel") return;
-      for (const mgr of managers) {
-        if (!mgr.active) continue;
+      for (const mgr of registry.live()) {
         emitInitial(ctx, mgr, ev.surfaceId);
       }
     });
@@ -216,8 +197,7 @@ export function installForeignToplevelBusHooks(ctx: Ctx): void {
     });
     state.bus.on(WINDOW_EVENT.change, (ev) => {
       const fields = new Set<string>(ev.changed);
-      for (const mgr of managers) {
-        if (!mgr.active) continue;
+      for (const mgr of registry.live()) {
         emitChange(ctx, mgr, ev.surfaceId, fields);
       }
     });
@@ -228,8 +208,7 @@ export function installForeignToplevelBusHooks(ctx: Ctx): void {
   if (state.pluginBus) {
     state.pluginBus.subscribe(WINDOW_EVENT.committed, (_name, payload) => {
       if (!isCommittedPayload(payload)) return;
-      for (const mgr of managers) {
-        if (!mgr.active) continue;
+      for (const mgr of registry.live()) {
         emitCommitted(ctx, mgr, payload.surfaceId, payload.previous, payload.current);
       }
     });
@@ -241,8 +220,7 @@ export function installForeignToplevelBusHooks(ctx: Ctx): void {
 export default function makeForeignToplevelManager(ctx: Ctx): ZwlrForeignToplevelManagerV1Handler & { bind(resource: Resource): void } {
   return {
     bind(resource) {
-      const mgr: ManagerState = { resource, handles: new Map(), active: true };
-      managers.add(mgr);
+      const mgr = registry.bind(resource);
       // Catch-up: emit toplevel + initial burst for every currently-mapped
       // window. The WM is the authority on which toplevels exist.
       const wm = ctx.state.wm;
@@ -256,27 +234,20 @@ export default function makeForeignToplevelManager(ctx: Ctx): ZwlrForeignTopleve
       }
     },
     stop(resource) {
-      // The client no longer wants events. Send finished + mark the manager
-      // inactive. Per spec: "The server will destroy the object immediately
-      // after sending this request" -- the trampoline's destructor handler
-      // wires that up; we just send the event + flag.
-      for (const mgr of managers) {
-        if (mgr.resource !== resource) continue;
-        if (!mgr.active) return;
-        mgr.active = false;
+      // The client no longer wants events. Send finished + drop the manager.
+      // Per spec: "The server will destroy the object immediately after
+      // sending this request" -- the trampoline's destructor handler wires
+      // that up; we just send the event + drop our bookkeeping.
+      if (registry.stop(resource)) {
         ctx.events.zwlr_foreign_toplevel_manager_v1.send_finished(resource);
-        managers.delete(mgr);
-        return;
       }
     },
   };
 }
 
 export function makeForeignToplevelHandle(ctx: Ctx): ZwlrForeignToplevelHandleV1Handler {
-  const surfaceIdOf = (resource: Resource): number | null => {
-    const o = handleOwners.get(resource);
-    return o ? o.surfaceId : null;
-  };
+  const surfaceIdOf = (resource: Resource): number | null =>
+    registry.surfaceIdOf(resource);
 
   return {
     set_maximized(resource) {
@@ -333,17 +304,20 @@ export function makeForeignToplevelHandle(ctx: Ctx): ZwlrForeignToplevelHandleV1
     destroy(resource) {
       // The client is done with this handle. Drop the per-manager mapping;
       // the resource itself is torn down by the trampoline.
-      const owner = handleOwners.get(resource);
-      if (!owner) return;
-      owner.manager.handles.delete(owner.surfaceId);
-      handleOwners.delete(resource);
+      registry.releaseHandle(resource);
     },
   };
+}
+
+// Frame-tick disconnect sweep: drop managers whose client vanished without
+// stop() (their resources are marked destroyed; no request handler ran).
+export function sweepDisconnected(): void {
+  registry.sweep();
 }
 
 // Test-only hook: clear all manager + handle state. Module-local state
 // persists across installProtocols calls in the same process; tests that
 // stand up multiple compositors in one process call this between them.
 export function _resetForTests(): void {
-  managers.clear();
+  registry.clear();
 }

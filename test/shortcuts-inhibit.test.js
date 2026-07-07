@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 
 import makeShortcutsInhibitManager, {
   makeShortcutsInhibitor, keyboardShortcutsInhibited, notifyShortcutsInhibitorFocus,
+  sweepDisconnected,
 } from "../packages/core/dist/protocols/zwp_keyboard_shortcuts_inhibit_manager_v1.js";
 
 // focusedSurfaceId: the surface that currently holds keyboard focus (undefined
@@ -76,4 +77,26 @@ test("destroy removes the inhibitor", () => {
   assert.equal(keyboardShortcutsInhibited(ctx), true);
   makeShortcutsInhibitor(ctx).destroy(inh);
   assert.equal(keyboardShortcutsInhibited(ctx), false);
+});
+
+test("client disconnect: sweep reclaims the inert entry so a new inhibit succeeds", () => {
+  const { ctx, errors, surfaces } = mkCtx(5);
+  const surf = surfaceRes(5, surfaces);
+  const inh = {};
+  const mgr = makeShortcutsInhibitManager(ctx);
+  mgr.inhibit_shortcuts({}, inh, surf, {});
+  assert.equal(keyboardShortcutsInhibited(ctx), true);
+
+  // The client vanishes: no destroy handler runs, the resource is just
+  // marked destroyed. Reads already skip it; the sweep drops the entry.
+  inh.destroyed = true;
+  assert.equal(keyboardShortcutsInhibited(ctx), false);
+  sweepDisconnected(ctx);
+
+  // A fresh inhibitor for the same surface is accepted (no
+  // already_inhibited from the stale entry).
+  const inh2 = {};
+  mgr.inhibit_shortcuts({}, inh2, surf, {});
+  assert.equal(errors.length, 0);
+  assert.equal(keyboardShortcutsInhibited(ctx), true);
 });

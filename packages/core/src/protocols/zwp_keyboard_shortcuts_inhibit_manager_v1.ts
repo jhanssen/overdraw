@@ -95,6 +95,21 @@ export default function makeShortcutsInhibitManager(ctx: Ctx): ZwpKeyboardShortc
   };
 }
 
+// Frame-tick disconnect sweep: a client that vanished runs no destroy
+// handler, so its inhibitor resources stay in the per-surface sets as
+// inert (destroyed) entries. Reads already skip destroyed resources; this
+// reclaims the entries themselves.
+export function sweepDisconnected(ctx: Ctx): void {
+  const map = registries.get(ctx);
+  if (!map) return;
+  for (const [sid, set] of map) {
+    for (const r of set) {
+      if (r.destroyed) set.delete(r);
+    }
+    if (set.size === 0) map.delete(sid);
+  }
+}
+
 export function makeShortcutsInhibitor(ctx: Ctx): ZwpKeyboardShortcutsInhibitorV1Handler {
   return {
     destroy(resource) {

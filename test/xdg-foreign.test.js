@@ -15,6 +15,7 @@ import makeExporter, {
   makeExported,
   makeImporter,
   makeImported,
+  sweepDisconnected,
   _resetForTests,
 } from '../packages/core/dist/protocols/xdg_foreign_v2.js';
 
@@ -152,6 +153,64 @@ test('destroying the exporter sends destroyed to dependent imports + clears pare
   assert.ok(destroyedEv, 'destroyed event sent to imported');
   // Child's parent edge cleared.
   assert.equal(s.wm.getWindowState(2).parent, null);
+});
+
+test('exporter client disconnect: sweep invalidates the export like an explicit destroy', async () => {
+  const s = setup();
+  const parentSurface = makeToplevelSurface(s, 1);
+  const childSurface = makeToplevelSurface(s, 2);
+  const exporterRes = { id: 'e', version: 1, destroyed: false };
+  const exportedRes = { id: 'ex1', version: 1, destroyed: false };
+  s.exporter.export_toplevel(exporterRes, exportedRes, parentSurface);
+  const handle = s.sentEvents.find(([k]) => k === 'handle')[1].handle;
+  const importerRes = { id: 'i', version: 1, destroyed: false };
+  const importedRes = { id: 'im1', version: 1, destroyed: false };
+  s.importer.import_toplevel(importerRes, importedRes, handle);
+  s.imported.set_parent_of(importedRes, childSurface);
+  await new Promise((r) => setImmediate(r));
+  assert.equal(s.wm.getWindowState(2).parent, 1);
+
+  // The exporter's client vanishes: no destroy handler runs; libwayland
+  // just marks the resource destroyed.
+  s.sentEvents.length = 0;
+  exportedRes.destroyed = true;
+  sweepDisconnected(s.ctx);
+  await new Promise((r) => setImmediate(r));
+
+  const destroyedEv = s.sentEvents.find(([k]) => k === 'destroyed');
+  assert.ok(destroyedEv, 'destroyed event sent to the live imported');
+  assert.equal(s.wm.getWindowState(2).parent, null);
+
+  // The handle registry entry is gone: a re-import gets destroyed
+  // immediately (unknown handle path).
+  s.sentEvents.length = 0;
+  const importedRes2 = { id: 'im2', version: 1, destroyed: false };
+  s.importer.import_toplevel(importerRes, importedRes2, handle);
+  const destroyedEv2 = s.sentEvents.find(([k]) => k === 'destroyed');
+  assert.ok(destroyedEv2, 'reused handle is invalid after sweep');
+});
+
+test('importer client disconnect: sweep prunes its imported from the export', () => {
+  const s = setup();
+  const parentSurface = makeToplevelSurface(s, 1);
+  const exporterRes = { id: 'e', version: 1, destroyed: false };
+  const exportedRes = { id: 'ex1', version: 1, destroyed: false };
+  s.exporter.export_toplevel(exporterRes, exportedRes, parentSurface);
+  const handle = s.sentEvents.find(([k]) => k === 'handle')[1].handle;
+  const importerRes = { id: 'i', version: 1, destroyed: false };
+  const importedRes = { id: 'im1', version: 1, destroyed: false };
+  s.importer.import_toplevel(importerRes, importedRes, handle);
+
+  // The importer's client vanishes; its imported resource is marked
+  // destroyed without running the destroy handler.
+  importedRes.destroyed = true;
+  sweepDisconnected(s.ctx);
+
+  // An explicit exported destroy afterwards no longer signals the dead
+  // imported resource.
+  s.sentEvents.length = 0;
+  s.exported.destroy(exportedRes);
+  assert.equal(s.sentEvents.filter(([k]) => k === 'destroyed').length, 0);
 });
 
 test('destroying the imported clears the parent edge', async () => {
