@@ -717,8 +717,19 @@ export async function setupCompositor(opts = {}) {
         handle.stdout += d.toString();
         if (handle.stdout.includes(readyMarker)) { clearTimeout(to); resolve(child); }
       });
-      child.on("exit", (code) => { clearTimeout(to); if (code) reject(new Error(`client exited ${code}`)); });
+      // Any exit before the marker rejects -- including code 0. (A no-op
+      // when the marker already resolved; without the code-0 case, `ready`
+      // would stay pending forever and an awaiting test would hang.)
+      child.on("exit", (code, signal) => {
+        clearTimeout(to);
+        reject(new Error(`client exited (code ${code}, signal ${signal}) before ready marker; stdout:\n${handle.stdout}`));
+      });
     });
+    // Mark the rejection handled so a test that never awaits `.ready` (or a
+    // client that crashes after the test finished with it) doesn't take the
+    // whole run down as an unhandled rejection. Awaiting `.ready` later
+    // still observes the rejection.
+    handle.ready.catch(() => {});
     // Wait until the client's stdout matches `re` (RegExp) or substring. Yields
     // to libuv so the server keeps processing while we wait.
     handle.waitForLine = async (re, { timeoutMs = 4000, what = "client line" } = {}) => {
