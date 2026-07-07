@@ -113,3 +113,23 @@ test('event sender factory wires opcodes', { skip: !haveInputs }, async () => {
   assert.equal(calls[0].opcode, enterIdx);
   assert.deepEqual(calls[0].args, ['OUTPUT']);
 });
+
+test('tokenizer: comments and CDATA containing ">" do not derail parsing', async () => {
+  const { parseProtocol } = await import('../packages/core/tools/gen-protocol/parse.js');
+  const xml = `<?xml version="1.0"?>
+<!-- a comment with > and <fake_tag attr="x"> inside -->
+<protocol name="p">
+  <interface name="i" version="1">
+    <description><![CDATA[ cdata with > and <another_fake> inside ]]></description>
+    <!-- if x > y then <request name="ghost"/> never exists -->
+    <request name="real"><arg name="a" type="int"/></request>
+  </interface>
+</protocol>`;
+  const model = parseProtocol(xml);
+  assert.equal(model.name, 'p');
+  assert.equal(model.interfaces.length, 1);
+  const iface = model.interfaces[0];
+  assert.equal(iface.name, 'i');
+  assert.deepEqual(iface.requests.map((r) => r.name), ['real'],
+    'only the real request survives; nothing from comment/CDATA bodies');
+});

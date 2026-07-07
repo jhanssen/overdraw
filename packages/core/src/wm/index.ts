@@ -257,9 +257,11 @@ export interface Wm {
   schedule(reason: import("@overdraw/layout-types").LayoutReason): void;
   // Replace the WM's output set. The new set must be non-empty (the WM
   // requires ≥1 output at all times -- the virtual fallback is what the host
-  // installs when no real output exists). Windows whose outputId is not in
-  // the new set are reassigned to the primary (lowest id) of the new set so
-  // no window is orphaned. Schedules an output-resized relayout.
+  // installs when no real output exists). Schedules an output-resized
+  // relayout. Rehoming windows stranded on a removed output is NOT done
+  // here: window->output placement is the workspace plugin's domain (see
+  // addWindow below); its output.removed handling migrates the orphaned
+  // workspaces before/alongside this call.
   setOutputs(outputs: ReadonlyArray<WmOutput>): void;
   // The id of the primary output -- the lowest id in state.outputs, used as
   // the default home for newly-mapped windows. Throws if the WM has no

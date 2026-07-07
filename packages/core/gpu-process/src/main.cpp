@@ -1529,6 +1529,7 @@ int run(int wireFd, int ctrlFd, int inputFd, bool headless,
                 textureId, textureGen,
                 it == clientTextures.end() ? -1 : (int)it->second.generation,
                 wireReader.bytesConsumed());
+            if (explicitAcquireFd >= 0) ::close(explicitAcquireFd);
             return false;
         }
         ClientTex& ct = it->second;
@@ -2326,16 +2327,18 @@ int run(int wireFd, int ctrlFd, int inputFd, bool headless,
                     } else {
                         for (const auto& r : p.damage) {
                             // Clamp the damage rect against the buffer extent.
+                            // 64-bit: x/y and w/h are client-controlled, so
+                            // x + w can exceed INT32_MAX (signed overflow).
                             if (r.w == 0 || r.h == 0) continue;
-                            int32_t x0 = r.x, y0 = r.y;
+                            int64_t x0 = r.x, y0 = r.y;
                             if (x0 < 0) x0 = 0;
                             if (y0 < 0) y0 = 0;
-                            int32_t x1 = r.x + static_cast<int32_t>(r.w);
-                            int32_t y1 = r.y + static_cast<int32_t>(r.h);
-                            if (x1 > static_cast<int32_t>(p.width))
-                                x1 = static_cast<int32_t>(p.width);
-                            if (y1 > static_cast<int32_t>(p.height))
-                                y1 = static_cast<int32_t>(p.height);
+                            int64_t x1 = static_cast<int64_t>(r.x) + r.w;
+                            int64_t y1 = static_cast<int64_t>(r.y) + r.h;
+                            if (x1 > static_cast<int64_t>(p.width))
+                                x1 = static_cast<int64_t>(p.width);
+                            if (y1 > static_cast<int64_t>(p.height))
+                                y1 = static_cast<int64_t>(p.height);
                             if (x1 <= x0 || y1 <= y0) continue;
                             const uint32_t cw = static_cast<uint32_t>(x1 - x0);
                             const uint32_t ch = static_cast<uint32_t>(y1 - y0);
@@ -2488,10 +2491,15 @@ int run(int wireFd, int ctrlFd, int inputFd, bool headless,
                 ok = true;
             }
             if (!ok) {
+                // A Begin can fail on a client-influenced path: a rejected
+                // dmabuf import leaves no cache entry, and Dawn can refuse
+                // BeginAccess on a hostile buffer. Dropping the bracket costs
+                // at most a bad frame for that one surface (a render pass
+                // referencing the texture fails Dawn validation, which is
+                // recoverable); aborting would kill every client's session.
                 std::fprintf(stderr,
-                    "[gpu] in-band client-texture Begin failed {%u,%u} -- "
-                    "JS import gate or state-machine bug\n", texId, texGen);
-                std::abort();
+                    "[gpu] in-band client-texture Begin failed {%u,%u}; "
+                    "dropping bracket\n", texId, texGen);
             }
         } else if (variant == ipc::AccessVariant::Surface) {
             if (frame.size() != ipc::SurfaceAccessPayload::kSize) {
@@ -2583,6 +2591,9 @@ int run(int wireFd, int ctrlFd, int inputFd, bool headless,
                     ctrlSender.send(reply);
                 } else {
                     int connFd = recvFds[0];
+                    // Exactly one fd is expected; close any extras rather
+                    // than leak them.
+                    for (int i = 1; i < nRecvFds; ++i) ::close(recvFds[i]);
                     ipc::setNonBlocking(connFd);
                     const int wb = 8 * 1024 * 1024;
                     ::setsockopt(connFd, SOL_SOCKET, SO_SNDBUF, &wb, sizeof(wb));

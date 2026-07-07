@@ -20,16 +20,21 @@ WireLink::WireLink(int wireFd, int ctrlFd) : wireFd_(wireFd), ctrlFd_(ctrlFd) {
 }
 
 WireLink::~WireLink() {
-    if (client_) client_->Disconnect();
-    // If a JS WebGPU binding (dawn.node) holds wgpu objects routed through this
-    // client, their finalizers run at process exit and call into the client.
-    // Deleting it here would be a use-after-free, so leak it after Disconnect
-    // (the process is terminating). The serializer must also outlive it (the
-    // client may flush on teardown), so leak that too in the shared case.
+    // If a JS WebGPU binding (dawn.node) holds wgpu objects routed through
+    // this client, two hazards apply at teardown:
+    //   - Disconnect() completes every in-flight tracked event, firing the
+    //     binding's callbacks into a JS env that is mid-teardown (observed
+    //     abort: Client::Disconnect -> TrackedEvent::Complete ->
+    //     Napi::CallbackScope -> node fatal error). Skip it.
+    //   - The binding's finalizers run at process exit and call into the
+    //     client; deleting it here would be a use-after-free. Leak the
+    //     client, and the serializer it may still flush through (the
+    //     process is terminating).
     if (sharedWithExternal_) {
         delete reader_;
         return;
     }
+    if (client_) client_->Disconnect();
     delete client_;
     delete reader_;
     delete serializer_;

@@ -18,11 +18,21 @@ function tokenize(xml) {
     const lt = xml.indexOf('<', i);
     if (lt < 0) break;
     i = lt + 1;
-    // Skip XML decl, comments, doctype, CDATA.
+    // Skip XML decl, comments, doctype, CDATA. Comments and CDATA may
+    // legitimately contain '>', so they scan to their own terminator --
+    // stopping at the first '>' would resume tokenizing inside the
+    // comment body and emit garbage tokens (or swallow real elements).
     if (xml[i] === '?' || xml[i] === '!') {
-      const gt = xml.indexOf('>', i);
-      if (gt < 0) break;
-      i = gt + 1;
+      if (xml.startsWith('!--', i)) {
+        const end = xml.indexOf('-->', i + 3);
+        i = end < 0 ? n : end + 3;
+      } else if (xml.startsWith('![CDATA[', i)) {
+        const end = xml.indexOf(']]>', i + 8);
+        i = end < 0 ? n : end + 3;
+      } else {
+        const gt = xml.indexOf('>', i);
+        i = gt < 0 ? n : gt + 1;
+      }
       continue;
     }
     const close = xml[i] === '/';

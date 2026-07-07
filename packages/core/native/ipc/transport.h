@@ -863,12 +863,20 @@ inline bool recvMessageNBFds(int fd, Message& msg, int* fds, int* nfdsOut) {
     ssize_t r = ::recvmsg(fd, &mh, MSG_DONTWAIT);
     if (r != static_cast<ssize_t>(sizeof(Message))) return false;
 
+    // Accumulate across SCM_RIGHTS blocks (a conforming sender attaches one,
+    // but a second block must not overwrite -- and thereby leak -- the first
+    // batch). Delivered fds past the caller's capacity are closed, not
+    // dropped: the kernel already installed them in this process, so
+    // forgetting the number is a leak.
     for (cmsghdr* cm = CMSG_FIRSTHDR(&mh); cm; cm = CMSG_NXTHDR(&mh, cm)) {
         if (cm->cmsg_level == SOL_SOCKET && cm->cmsg_type == SCM_RIGHTS) {
-            int n = static_cast<int>((cm->cmsg_len - CMSG_LEN(0)) / sizeof(int));
-            if (n > kMaxMsgFds) n = kMaxMsgFds;
-            std::memcpy(fds, CMSG_DATA(cm), sizeof(int) * n);
-            *nfdsOut = n;
+            const int n = static_cast<int>((cm->cmsg_len - CMSG_LEN(0)) / sizeof(int));
+            for (int i = 0; i < n; ++i) {
+                int f;
+                std::memcpy(&f, CMSG_DATA(cm) + sizeof(int) * i, sizeof(int));
+                if (*nfdsOut < kMaxMsgFds) fds[(*nfdsOut)++] = f;
+                else if (f >= 0) ::close(f);
+            }
         }
     }
     return true;

@@ -31,10 +31,12 @@ class WireLink {
 
     // Mark the wire client as shared with an external JS WebGPU binding
     // (dawn.node) that holds wgpu objects routed through this client. Those
-    // objects' finalizers run at process exit and call into the client; if the
-    // client were freed first that is a use-after-free. When shared, the
-    // destructor disconnects but intentionally leaks the client so late
-    // finalizers are safe (process is ending anyway).
+    // objects' finalizers run at process exit and call into the client; if
+    // the client were freed first that is a use-after-free. When shared, the
+    // destructor neither disconnects (Disconnect would fire the binding's
+    // event callbacks into a tearing-down JS env) nor deletes -- it leaks
+    // the client and serializer so late finalizers are safe (the process is
+    // ending anyway).
     void markSharedWithExternal() { sharedWithExternal_ = true; }
 
     // The wire instance must be set once reserved so event processing can pump

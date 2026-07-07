@@ -2684,7 +2684,11 @@ napi_value ShmCreatePool(napi_env env, napi_callback_info info) {
     size_t argc = 2; napi_value argv[2];
     napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
     if (argc < 2) return throwError(env, "shmCreatePool(fd, size) requires two args");
-    uint32_t size = 0; napi_get_value_uint32(env, argv[1], &size);
+    // 64-bit: the whole downstream chain (shm registry, wire payload, GPU
+    // mapping) carries u64; a u32 read here would silently truncate a
+    // >4GiB size.
+    int64_t size64 = 0; napi_get_value_int64(env, argv[1], &size64);
+    uint64_t size = size64 > 0 ? static_cast<uint64_t>(size64) : 0;
     int fd = overdraw::wayland::takeWaylandFd(env, argv[0]);
     // Dup BEFORE handing fd to the shm registry; the registry takes ownership
     // (closes on destroy / failure), and the GPU process needs its own
@@ -2710,7 +2714,8 @@ napi_value ShmResizePool(napi_env env, napi_callback_info info) {
     napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
     if (argc < 2) return throwError(env, "shmResizePool(poolId, newSize) requires two args");
     uint32_t poolId = 0; napi_get_value_uint32(env, argv[0], &poolId);
-    uint32_t newSize = 0; napi_get_value_uint32(env, argv[1], &newSize);
+    int64_t newSize64 = 0; napi_get_value_int64(env, argv[1], &newSize64);
+    uint64_t newSize = newSize64 > 0 ? static_cast<uint64_t>(newSize64) : 0;
     const bool ok = g_addon.shm.resizePool(poolId, newSize);
     // Mirror the grow to the GPU process's mapping; without this, ShmUpload
     // regions past the pool's creation size fail its bounds check (the
