@@ -1284,9 +1284,13 @@ export function createWm(
 
   // Apply a LayoutResult: emit window.relayout, then update each window's
   // outer rect, push the compositor's setSurfaceLayout, fire configure where
-  // size changed, and update bound decorations. For a "reorder" relayout the
-  // geometry is routed through the resize transaction (held until the client
-  // re-renders) instead of being applied immediately.
+  // size changed, and update bound decorations. For "reorder" and
+  // "param-changed" relayouts the geometry is routed through the resize
+  // transaction (held until the client re-renders) instead of being applied
+  // immediately: both retile existing windows to new sizes, and applying
+  // geometry before content leaves stretched buffers and misaligned
+  // decoration cut-outs on screen (background showing through) until the
+  // clients catch up -- continuously so under a held resize key.
   //
   // After all per-window window.relayout emits settle, emits a single
   // stack.relayout carrying the batch of transitions (created / retiled /
@@ -1294,7 +1298,7 @@ export function createWm(
   // whole pass at once. removedThisPass (populated by unmapWindow) is
   // drained here as DESTROYED entries.
   async function applyLayout(result: LayoutResult, reason: LayoutReason): Promise<void> {
-    const useTx = reason === "reorder" && !!configure;
+    const useTx = (reason === "reorder" || reason === "param-changed") && !!configure;
     const byId = new Map<number, { id: number; outer: Rect }>();
     for (const r of result.rects) byId.set(r.id, r);
     const snapshotWindows = [...windows];
