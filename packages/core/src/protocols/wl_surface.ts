@@ -839,4 +839,8 @@ export function unmapAndTeardownSurface(state: CompositorState, addon: Addon, s:
   detachSurfaceRole(state, addon, s);
   dropSerialsForSurface(state, s.id);
   state.surfacesById?.delete(s.id);
+  // Invalidate seat focus NOW, not at the next per-frame sweep: a focus
+  // change landing in that window would send wl_keyboard/wl_pointer.leave
+  // referencing the destroyed surface.
+  state.seat?.clearFocusForSurface(s.id);
 }

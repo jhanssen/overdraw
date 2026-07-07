@@ -228,6 +228,11 @@ export default function makeSeat(ctx: Ctx, driver: FocusDriver): SeatHandler {
     }
   }
   function sendKbLeave(target: SeatFocus): void {
+    // A destroyed surface must never ride the wire as an event argument:
+    // its id may already be deleted client-side, and a leave referencing
+    // it is a fatal protocol error for the recipient. The client that
+    // destroyed the surface needs no leave for it.
+    if (target.surfaceRec.resource.destroyed) return;
     const serial = ctx.state.serial();
     for (const k of clientKeyboards(target.clientId)) {
       if (k.destroyed) continue;
@@ -553,14 +558,20 @@ export default function makeSeat(ctx: Ctx, driver: FocusDriver): SeatHandler {
   }
 
   function sendLeave(target: SeatFocus): void {
+    // Same rule as sendKbLeave: never reference a destroyed surface in a
+    // leave event. The cursor/serial cleanup still runs -- the pointer
+    // focus is gone either way.
+    const gone = target.surfaceRec.resource.destroyed;
     const serial = ctx.state.serial();
     for (const p of clientPointers(target.clientId)) {
       if (p.destroyed) continue;
-      ctx.events.wl_pointer.send_leave(p, serial, target.surfaceRec.resource);
+      if (!gone) {
+        ctx.events.wl_pointer.send_leave(p, serial, target.surfaceRec.resource);
+        pointerFrame(p);
+      }
       // Clear the recorded enter serial so a late set_cursor for the
       // prior focus is rejected.
       lastEnterSerial.delete(p);
-      pointerFrame(p);
     }
     // Pointer left the client's surface: revert to compositor default.
     installCompositorDefaultCursor();
@@ -1059,6 +1070,22 @@ export default function makeSeat(ctx: Ctx, driver: FocusDriver): SeatHandler {
       releaseDeadVirtualKeyboards(ctx);
       sweepDestroyedSeatState(seat0, pointersByClient, keyboardsByClient,
         lastEnterSerial, clientCursors);
+    },
+    // Synchronous focus invalidation for a surface being torn down. Drops
+    // kb/pointer focus records pointing at it WITHOUT sending leave (the
+    // surface is gone; the sweep-based path would leave a stale record
+    // live until the next frame, and any focus change in that window
+    // would send leave referencing the destroyed resource).
+    clearFocusForSurface(surfaceId) {
+      if (!seat0) return;
+      const kf = seat0.kbFocus;
+      if (kf && (kf.surfaceId === surfaceId || kf.rootSurfaceId === surfaceId)) {
+        seat0.kbFocus = null;
+      }
+      const pf = seat0.focus;
+      if (pf && (pf.surfaceId === surfaceId || pf.rootSurfaceId === surfaceId)) {
+        seat0.focus = null;
+      }
     },
   };
   const seat0 = ctx.state.seat;

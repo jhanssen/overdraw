@@ -233,6 +233,9 @@ function buildModeList(rec: OutputRecord):
 // Returns null when no match (no current_mode event emitted).
 function findCurrentMode(rec: OutputRecord, modes: ModeEntry[]): ModeEntry | null {
   for (const m of modes) {
+    // A mode the client released must never be re-selected: sending it as
+    // a current_mode argument would reference a destroyed resource.
+    if (m.resource.destroyed) continue;
     if (m.width !== rec.deviceSize.width || m.height !== rec.deviceSize.height) continue;
     const delta = Math.abs(m.refreshMhz - rec.refreshMhz);
     if (delta > 100 && rec.refreshMhz > 0) continue;
@@ -513,6 +516,17 @@ export function makeOutputHead(_ctx: Ctx): ZwlrOutputHeadV1Handler {
 export function makeOutputMode(_ctx: Ctx): ZwlrOutputModeV1Handler {
   return {
     release(resource) {
+      // Prune the released mode from its head's advertised list so a later
+      // head update cannot re-select it as current_mode (the resource is
+      // destroyed; referencing it in an event would kill the client).
+      const owner = modeOwners.get(resource);
+      if (owner) {
+        const entry = owner.manager.heads.get(owner.outputId);
+        if (entry) {
+          entry.modes = entry.modes.filter((m) => m.resource !== resource);
+          if (entry.currentModeRes === resource) entry.currentModeRes = null;
+        }
+      }
       modeOwners.delete(resource);
     },
   };

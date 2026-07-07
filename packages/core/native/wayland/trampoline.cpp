@@ -313,6 +313,18 @@ bool Trampoline::postEvent(napi_value resourceHandle, uint32_t opcode, napi_valu
                     if (napi_get_named_property(env, v, "__resource", &e2) == napi_ok)
                         napi_get_value_external(env, e2, &p2);
                 }
+                // Same liveness rule as the send target (above): the external
+                // keeps pointing at freed memory after the resource dies, and
+                // serializing it would put a stale (possibly already-deleted)
+                // id on the wire -- a fatal protocol error for the recipient.
+                // A dead object arg invalidates the whole event: drop it.
+                if (p2 && wrappers_.find(static_cast<wl_resource*>(p2)) == wrappers_.end()) {
+                    for (int fd : fdKeep) if (fd >= 0) ::close(fd);
+                    fprintf(stderr, "[wl] dropped %s event (opcode %u): destroyed %s argument\n",
+                            className ? className : "?", opcode,
+                            ev->types && ev->types[ai] ? ev->types[ai]->name : "object");
+                    return true;
+                }
                 wargs[ai].o = reinterpret_cast<wl_object*>(p2);
                 break;
             }

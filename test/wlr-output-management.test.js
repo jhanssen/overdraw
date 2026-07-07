@@ -714,3 +714,40 @@ test("head.release drops the entry but leaves mode resource alive for separate d
   // Smoke: subsequent emissions to those resources are unhooked from the
   // owner maps and downstream finishHead is a no-op (no double-finished).
 });
+
+test("mode.release prunes the head's mode list; a later update never re-selects it", () => {
+  const ctx = mockCtx([makeOutput(0)]);
+  const mgr = makeManager(ctx);
+  mgr.bind(mockResource("mgr"));
+  installOutputManagerBusHooks(ctx);
+  const mode = makeOutputMode(ctx);
+  const modeRes = ctx.state._sent.find(([k]) => k === "head.mode")[1].mode;
+
+  // Client releases the current mode (destructor request: the resource is
+  // destroyed under it). current_mode must not reference it afterwards.
+  mode.release(modeRes);
+  modeRes.destroyed = true;
+
+  ctx.state._sent.length = 0;
+  ctx.state.pluginBus.emit("output.changed", { outputId: 0 });
+
+  assert.equal(ctx.state._sent.filter(([k]) => k === "head.current_mode").length, 0);
+  // The rest of the mutable burst still fires.
+  assert.equal(ctx.state._sent.filter(([k]) => k === "head.position").length, 1);
+});
+
+test("a destroyed mode resource is never selected as current_mode (disconnect case)", () => {
+  const ctx = mockCtx([makeOutput(0)]);
+  const mgr = makeManager(ctx);
+  mgr.bind(mockResource("mgr"));
+  installOutputManagerBusHooks(ctx);
+  const modeRes = ctx.state._sent.find(([k]) => k === "head.mode")[1].mode;
+
+  // No release request ran (client died); only the destroyed flag flips.
+  modeRes.destroyed = true;
+
+  ctx.state._sent.length = 0;
+  ctx.state.pluginBus.emit("output.changed", { outputId: 0 });
+
+  assert.equal(ctx.state._sent.filter(([k]) => k === "head.current_mode").length, 0);
+});

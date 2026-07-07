@@ -1259,6 +1259,12 @@ export interface SeatState {
   // the per-frame sweep in dispatchFrameCallbacks alongside surface/buffer
   // disconnect cleanup.
   sweepDestroyed(): void;
+  // Drop kb/pointer focus records pointing at `surfaceId` without sending
+  // leave. Called synchronously from wl_surface teardown so no focus change
+  // between the destroy and the next per-frame sweep can send a leave event
+  // referencing the destroyed surface resource (a fatal protocol error for
+  // the receiving client).
+  clearFocusForSurface(surfaceId: number): void;
 }
 
 export interface ClientCursor {
