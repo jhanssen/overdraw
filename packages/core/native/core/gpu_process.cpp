@@ -70,6 +70,16 @@ GpuProcess spawnGpuProcess(const char* binPath, uint32_t headlessW, uint32_t hea
         // driver opens reuses fd 1/2, silently swallowing all GPU-side output.
         ::fcntl(STDOUT_FILENO, F_SETFD, 0);
         ::fcntl(STDERR_FILENO, F_SETFD, 0);
+        // stdin gets the same close-on-exec mark, but the GPU process never
+        // reads it -- point fd 0 at /dev/null instead of letting it close at
+        // exec. An unoccupied fd 0 is where the first driver open() and every
+        // lowest-free-fd F_DUPFD in the wire pump would land, churning hot
+        // small fd numbers and handing "stdin" reads a device fd.
+        const int devnull = ::open("/dev/null", O_RDONLY);
+        if (devnull >= 0) {
+            ::dup2(devnull, STDIN_FILENO);
+            if (devnull > STDERR_FILENO) ::close(devnull);
+        }
         char a1[16], a2[16], a3[16], a4[32], asize[32];
         std::snprintf(a1, sizeof(a1), "%d", wireFds[1]);
         std::snprintf(a2, sizeof(a2), "%d", ctrlFds[1]);
