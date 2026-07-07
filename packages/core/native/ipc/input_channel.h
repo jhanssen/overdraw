@@ -1,6 +1,6 @@
 // Input side-channel protocol: GPU process -> core, one-way.
 //
-// Phase 1 nested: host pointer/keyboard events arrive on the GPU process's host
+// Nested mode: host pointer/keyboard events arrive on the GPU process's host
 // Wayland connection (the output wl_surface lives there) and are forwarded to
 // the core over a dedicated SEQPACKET socket, separate from the control side
 // channel so unsolicited input never collides with control request/reply

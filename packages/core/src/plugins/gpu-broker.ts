@@ -1,4 +1,4 @@
-// Core-side GPU broker for plugin Workers (C-M4 step 4c). Runs on the CORE main
+// Core-side GPU broker for plugin Workers. Runs on the CORE main
 // thread. The plugin Worker owns its wire client + device + rendering; the core
 // owns the side channel and the compositor. This object services the Worker's
 // SDK requests (routed via the plugin runtime's onRequest hook): broker the wire
@@ -32,7 +32,7 @@ const pAlloc = (
       pluginReservePointSerial,
       (r: { surfaceBufId: number } | null) => r ? res(r) : rej(new Error("allocSurfaceBuffer"))));
 
-// Phase 5b: AllocComposeBuf. Reverse direction (core produces, plugin consumes).
+// AllocComposeBuf. Reverse direction (core produces, plugin consumes).
 // The plugin reserved its consumer texture; the core reserves its producer
 // texture and ships AllocComposeBuf with all handles + the plugin's wireSerial.
 const pAllocCompose = (
@@ -141,19 +141,17 @@ export function createGpuBroker(deps: GpuBrokerDeps): GpuBroker {
   const surfaceByBuf = new Map<number, OverlaySurface>();
   // overlay surfaceId -> OverlaySurface.
   const surfaces = new Map<number, OverlaySurface>();
-  // Phase 5b compose buffers (snapshot, one-shot): surfaceBufId -> the
+  // Compose buffers (snapshot, one-shot): surfaceBufId -> the
   // wrapped core-device producer texture. Held alive until release.
-  // (Could later track per-plugin so destroy-on-plugin-stop teardowns
-  // these along with overlays.)
   const composeBufs = new Map<number, { texture: GPUTexture; width: number; height: number }>();
-  // Phase 5b-live compose rings: any slot's surfaceBufId -> the live ring it
+  // Live compose rings: any slot's surfaceBufId -> the live ring it
   // belongs to. compose.release deregisters the whole ring on any slot id.
   interface LiveComposeRing {
     surfaceBufIds: number[];
     teardown: () => void;
   }
   const liveComposeRings = new Map<number, LiveComposeRing>();
-  // Phase 8: surfaceBufId -> sceneId minted by the scene registry on
+  // surfaceBufId -> sceneId minted by the scene registry on
   // compose.snapshot / compose.live. Lets compose.release route through
   // the registry (so a transition pinning the scene defers teardown).
   // For live, only the FIRST slot's surfaceBufId maps to the sceneId
@@ -290,7 +288,7 @@ export function createGpuBroker(deps: GpuBrokerDeps): GpuBroker {
         return null;
       }
       case "compose.snapshot": {
-        // Phase 5b: Worker plugin asked for a snapshot compose. The plugin
+        // Worker plugin asked for a snapshot compose. The plugin
         // has already reserved its consumer-side texture on its own wire
         // and is sending us the reserved handle. We:
         //   1. Allocate a compose dmabuf (core = producer, plugin = consumer)
@@ -372,7 +370,7 @@ export function createGpuBroker(deps: GpuBrokerDeps): GpuBroker {
         return { surfaceBufId: bufId, width: w, height: h, sceneId };
       }
       case "compose.live": {
-        // Phase 5b-live: Worker plugin asked for a live compose. The plugin
+        // Worker plugin asked for a live compose. The plugin
         // has reserved SLOTS consumer textures on its own wire (one per ring
         // slot) and sent their handles. We:
         //   1. Allocate SLOTS dmabufs (one per slot via coreAllocComposeBufferW).

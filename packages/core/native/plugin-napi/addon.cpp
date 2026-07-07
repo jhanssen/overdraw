@@ -206,10 +206,10 @@ napi_value WireBytesQueued(napi_env env, napi_callback_info info) {
 }
 
 // writeBeginAccess(clientId, surfaceBufId) / writeEndAccess(clientId, surfaceBufId):
-// in-band producer Begin/End on the plugin wire. Synchronous frame writes (the
-// FIFO wire ordering replaces the prior ctrl ProducerBegin round-trip / the
-// ProducerEnd WireBarrier deferral). The Worker writes Begin as it claims a
-// slot and End after its render submit.
+// in-band producer Begin/End on the plugin wire. Synchronous frame writes;
+// FIFO wire ordering supplies the ordering guarantee (no ctrl round-trip, no
+// WireBarrier deferral). The Worker writes Begin as it claims a slot and End
+// after its render submit.
 napi_value WriteBeginAccess(napi_env env, napi_callback_info info) {
     size_t argc = 2; napi_value argv[2];
     napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
@@ -227,7 +227,7 @@ napi_value WriteEndAccess(napi_env env, napi_callback_info info) {
     return nullptr;
 }
 
-// Phase 5b: reserveConsumerTexture(clientId, surfaceBufId, w, h) -> same shape
+// reserveConsumerTexture(clientId, surfaceBufId, w, h) -> same shape
 // as ReserveProducerTexture. The plugin is the CONSUMER for a compose buffer.
 napi_value ReserveConsumerTexture(napi_env env, napi_callback_info info) {
     size_t argc = 4; napi_value argv[4];
@@ -265,7 +265,7 @@ napi_value ForgetConsumerReservation(napi_env env, napi_callback_info info) {
     return nullptr;
 }
 
-// Phase 5b: in-band consumer Begin/End on the plugin wire (compose buffers
+// In-band consumer Begin/End on the plugin wire (compose buffers
 // where the plugin is the consumer). Inverted from sdk.gpu overlay surfaces
 // where the plugin is the producer.
 napi_value WriteConsumerBegin(napi_env env, napi_callback_info info) {

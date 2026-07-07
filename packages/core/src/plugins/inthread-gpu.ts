@@ -92,7 +92,7 @@ export interface InThreadGpuDeps {
   // (sdk.compose.windows) device-resolution compose.
   windowRegion?: (surfaceId: number) =>
     { x: number; y: number; w: number; h: number; scale: number } | null;
-  // Phase 10a intercept: the broker the in-thread sdk.intercept SDK
+  // Intercept: the broker the in-thread sdk.intercept SDK
   // talks to directly. Optional: when absent, sdk.intercept.register
   // will reject (the bundled-plugin path either has it or doesn't,
   // mirroring how sdk.transitions only works when sceneRegistry is

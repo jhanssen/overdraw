@@ -1,4 +1,4 @@
-// wl_surface.enter / wl_surface.leave emission (M6).
+// wl_surface.enter / wl_surface.leave emission.
 //
 // Each surface tracks the set of outputs it currently overlaps in
 // SurfaceRecord.enteredOutputs. After any geometry change (WM layout,

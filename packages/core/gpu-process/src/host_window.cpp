@@ -390,7 +390,8 @@ void HostWindow::onOutputDescription(const char* /*desc*/) {
 }
 
 void HostWindow::onOutputDone() {
-    // No-op for now. A future re-emit path uses this as the trigger.
+    // Nothing to propagate: our wl_output describes the nested window, not
+    // the host monitor, so the host's output-done carries no state we mirror.
 }
 
 void HostWindow::onSeatCapabilities(uint32_t caps) {

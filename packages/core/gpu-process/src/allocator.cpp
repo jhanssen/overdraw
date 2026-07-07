@@ -21,8 +21,8 @@ namespace {
 // (e.g. ARGB8888 + XRGB8888), with identical modifiers. This matters: a Vulkan
 // WSI configuring a BGRA8Unorm swapchain selects the OPAQUE fourcc (XRGB8888)
 // for an opaque surface and the alpha one for alpha, and rejects the surface if
-// its chosen fourcc is absent. Advertising only the alpha variant is why a
-// swapchain Configure() previously failed.
+// its chosen fourcc is absent. Advertising only the alpha variant makes a
+// swapchain Configure() for an opaque surface fail.
 struct FourccPair { uint32_t alpha; uint32_t opaque; };  // opaque==0 if none
 bool fourccsFor(wgpu::TextureFormat fmt, FourccPair& out) {
     switch (fmt) {

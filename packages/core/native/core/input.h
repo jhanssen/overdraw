@@ -1,14 +1,14 @@
 // Core input abstraction (backend-agnostic).
 //
 // The compositor consumes a single stream of normalized input events regardless
-// of where they originate. The thing that varies between phases is the *source*:
+// of where they originate. The thing that varies is the *source*:
 //
-//   - Phase 1 (nested): host pointer/keyboard events arrive on the GPU process's
+//   - Nested: host pointer/keyboard events arrive on the GPU process's
 //     host Wayland connection and are forwarded to the core over the dedicated
 //     input socket (ipc::InputMessage). The WaylandInputBackend reads that
 //     socket, maps host-surface coordinates into output space, and emits
 //     InputEvents.
-//   - Phase 2 (bare metal): a LibinputBackend reads /dev/input/* (device fds via
+//   - Bare metal: a LibinputBackend reads /dev/input/* (device fds via
 //     libseat) and emits the SAME InputEvents.
 //
 // Everything above this seam -- cursor accumulation, surface hit-testing, focus
@@ -134,7 +134,7 @@ class InputSink {
     virtual void onInputEvent(const InputEvent& ev) = 0;
 };
 
-// A source of normalized input events. One implementation per phase. The
+// A source of normalized input events. One implementation per source. The
 // backend does not own the sink; the sink must outlive start()..stop().
 //
 // Lifecycle: construct -> start(sink) -> (events flow via sink) -> stop().

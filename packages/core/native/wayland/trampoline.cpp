@@ -85,7 +85,7 @@ bool Trampoline::createGlobalForOutput(const std::string& interfaceName,
     InterfaceState* raw = st.get();
     std::string key = interfaceName + ":" + std::to_string(outputId);
     // Remember the wl_global so destroyGlobalForOutput can tear it down on
-    // hotplug remove (M7). createGlobal (non-per-output) doesn't keep the
+    // hotplug remove. createGlobal (non-per-output) doesn't keep the
     // pointer; those globals live for the process.
     raw->global = wl_global_create(display_, raw->iface, raw->iface->version,
                                    raw, &Trampoline::onBind);

@@ -15,12 +15,12 @@
 //   - SurfaceProducer wraps "FREE -> ACQUIRED -> PRESENTED" + writing producer
 //     BeginAccess/EndAccess on the PRODUCER's wire. Used by:
 //       * the plugin overlay path (plugin = producer, plugin wire).
-//       * the compose-live core (core = producer, core wire) -- phase 5b-live.
+//       * the compose-live core (core = producer, core wire).
 //
 //   - SurfaceConsumer wraps "PRESENTED -> DRAINING -> FREE" + writing consumer
 //     BeginAccess/EndAccess on the CONSUMER's wire. Used by:
 //       * the overlay broker core-side (core = consumer, core wire).
-//       * the compose-live worker (plugin = consumer, plugin wire) -- phase 5b-live.
+//       * the compose-live worker (plugin = consumer, plugin wire).
 //
 // Both sides receive "wire writers" + "texture wrappers" as constructor deps;
 // the abstractions don't bake in which addon (core's overdraw_native vs the

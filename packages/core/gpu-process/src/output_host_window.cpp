@@ -65,9 +65,8 @@ void HostWindowOutputBackend::presentScanout(int slotIdx) {
     if (!s.hostBuffer) return;
 
     wl_surface_attach(surface, s.hostBuffer, 0, 0);
-    // For now: full-surface damage. A follow-on can forward the per-frame
-    // damage region from the JS compositor for the host-side optimization
-    // wlroots/Hyprland's wayland backends pass on.
+    // Full-surface damage: the per-frame damage region from the JS compositor
+    // isn't plumbed here, so the host can't optimize partial updates.
     wl_surface_damage_buffer(surface, 0, 0,
                              static_cast<int32_t>(window_.width()),
                              static_cast<int32_t>(window_.height()));

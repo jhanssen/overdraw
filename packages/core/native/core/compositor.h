@@ -82,7 +82,7 @@ class Compositor {
     // is held by a move-only RAII-ish holder with TWO explicit terminal actions:
     //
     //   - commit(): the reservation has been (or will be) published to a peer
-    //     via a ctrl message that the peer will act on (e.g. ImportClientTex,
+    //     via a message the peer will act on (e.g. ImportClientTex,
     //     AllocSurfaceBuf). The wire-id is now considered "in use" by the
     //     server's WireServer object table -- per the deferred-reclaim policy
     //     for the recycled-handle hazard, it MUST NOT be reclaimed even after
@@ -187,7 +187,7 @@ class Compositor {
     };
     void takePendingOutputDescriptors(std::vector<OutputDescriptorMsg>& out);
 
-    // OutputAdded / OutputRemoved delivery (multi-output hotplug, M7). The GPU
+    // OutputAdded / OutputRemoved delivery (multi-output hotplug). The GPU
     // process sends OutputAdded with the same descriptor fields as
     // OutputDescriptor when a connector transitions to connected with a usable
     // CRTC; OutputRemoved carries only the dense outputId of the vanished
@@ -379,8 +379,8 @@ class Compositor {
 
     // Drain ShmUploaded acks received since the last call. Returns the list
     // of uploadSeq values the GPU process has now committed; the JS layer
-    // uses each to release the deferred wl_buffer (mirrors Hyprland's
-    // copy-then-release timing). FIFO with the surrounding wire frames.
+    // uses each to release the deferred wl_buffer (copy-then-release
+    // timing). FIFO with the surrounding wire frames.
     std::vector<uint32_t> takeShmUploadAcks() {
         std::vector<uint32_t> out;
         out.swap(shmUploadAcks_);
@@ -417,7 +417,7 @@ class Compositor {
     int wireFd() const { return link_->wireFd(); }
     int ctrlFd() const { return ctrlFd_; }
 
-    // --- Plugin wire connections (C-M2) ---------------------------------------
+    // --- Plugin wire connections ----------------------------------------------
     // Create a new plugin wire connection: socketpair, send the GPU-end fd to the
     // GPU process over the side channel (AddWireConn, SCM_RIGHTS), and return the
     // CLIENT-end fd (owned by the caller -> handed to the plugin's Worker) plus
@@ -436,7 +436,7 @@ class Compositor {
     int wireConnAdded(uint32_t connId) const;
     int pluginInstanceInjected(uint32_t connId) const;
 
-    // --- Plugin producer/consumer surface buffer (C-M4 step 2) ----------------
+    // --- Plugin producer/consumer surface buffer ------------------------------
     // Reserve a CORE-device texture (the consumer side: TextureBinding|CopySrc)
     // for a plugin surface buffer, returning its wire handle + the surfaceBufId
     // to use. Holds the reservation alive (keyed by surfaceBufId). The plugin
@@ -454,7 +454,7 @@ class Compositor {
         uint64_t coreWireSerial;
     };
     CoreSurfaceReservation reserveCoreSurfaceTexture(uint32_t width, uint32_t height);
-    // Reserve a CORE-device texture for a COMPOSE buffer (phase 5b). Same as
+    // Reserve a CORE-device texture for a COMPOSE buffer. Same as
     // reserveCoreSurfaceTexture but with RENDER_ATTACHMENT | TEXTURE_BINDING |
     // COPY_SRC usage -- the core is the producer (it renders into the dmabuf)
     // and may also re-sample / read back. The plugin (consumer) reserves a
@@ -476,7 +476,7 @@ class Compositor {
                              ReservedHandle coreDevice, ReservedHandle coreTexture,
                              uint64_t pluginReservePointSerial,
                              uint64_t coreReservePointSerial);
-    // Send AllocComposeBuf (phase 5b): SAME machinery as AllocSurfaceBuf but
+    // Send AllocComposeBuf: SAME machinery as AllocSurfaceBuf but
     // the GPU process imports the dmabuf with the core device as PRODUCER and
     // the plugin device as CONSUMER. Wire field shape is identical -- the
     // pluginDevice/pluginTexture name the plugin-side handle (consumer) and
@@ -526,13 +526,13 @@ class Compositor {
     // kind=2 Surface frame (producer=false) on the CORE wire socket. The
     // consumer device is the core's, so these ride the core wire; the GPU
     // process dispatches them to runSurfaceBegin/runSurfaceEnd(_, false).
-    // Replaces the ConsumerBegin/ConsumerEnd ctrl round-trips. Begin's FIFO
-    // position before the compositor's next sample batch keeps the bracket open
+    // Begin's FIFO position before the compositor's next sample batch keeps
+    // the bracket open
     // before HandleCommands reaches the sample; End's caller still gates the
     // write on GPU-read completion (afterCurrentFrame) for execution ordering.
     void writeConsumerBeginAccess(uint32_t surfaceBufId);
     void writeConsumerEndAccess(uint32_t surfaceBufId);
-    // In-band producer Begin/End on a compose buffer (phase 5b): write a
+    // In-band producer Begin/End on a compose buffer: write a
     // kind=1/kind=2 Surface frame (producer=true) on the CORE wire socket.
     // For compose buffers the core IS the producer, so producer Begin/End
     // ride the core wire (inverted from sdk.gpu overlay buffers where the
@@ -693,7 +693,7 @@ class Compositor {
     std::vector<PendingJsImport> pendingJsImports_;
     std::vector<JsImportDone> completedJsImports_;
     std::vector<OutputDescriptorMsg> pendingOutputDescriptors_;
-    // Hotplug deliveries drained alongside OutputDescriptor (M7). Added carries
+    // Hotplug deliveries drained alongside OutputDescriptor. Added carries
     // the full descriptor body (same struct reused); removed carries only the
     // dense outputId.
     std::vector<OutputDescriptorMsg> pendingOutputsAdded_;

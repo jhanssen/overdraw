@@ -87,8 +87,7 @@ export async function runLoader(channel: Channel, input: LoaderInput): Promise<v
   let dispatchGpuEvent: ((name: string, data: unknown) => boolean) | undefined;
   // sdk.compose: in-thread bundled plugins share core's device, so they get
   // GPUTexture handles by reference (createInThreadCompose). Worker plugins
-  // get cross-device dmabuf compose via createWorkerCompose (phase 5b
-  // snapshot today; live mode lands in phase 5b-live).
+  // get cross-device dmabuf compose via createWorkerCompose (snapshot).
   let compose: PluginCompose | undefined;
   let transitions: PluginTransitions | undefined;
   let intercept: InterceptAPI | undefined;
@@ -106,7 +105,7 @@ export async function runLoader(channel: Channel, input: LoaderInput): Promise<v
       input.inThreadGpu.windowRegion,
     ) ?? undefined;
     transitions = createTransitions(endpoint);
-    // Phase 10a: in-thread intercept SDK. The broker is reached
+    // In-thread intercept SDK. The broker is reached
     // directly (no IPC) when wired; absent when the harness/launcher
     // didn't construct it.
     if (input.inThreadGpu.interceptBroker) {
@@ -125,7 +124,7 @@ export async function runLoader(channel: Channel, input: LoaderInput): Promise<v
     const t = setInterval(g.pump, 4);
     t.unref?.();
     stopGpu = () => { clearInterval(t); g.stop(); };
-    // Phase 5b: Worker plugins get sdk.compose backed by AllocComposeBuf.
+    // Worker plugins get sdk.compose backed by AllocComposeBuf.
     compose = createWorkerCompose({
       clientId: g.internals.clientId,
       plugin: g.internals.plugin,
@@ -136,7 +135,7 @@ export async function runLoader(channel: Channel, input: LoaderInput): Promise<v
       hasOutput: input.hasOutput,
     });
     transitions = createTransitions(endpoint);
-    // Phase 10a Worker intercept: full cross-device dmabuf wiring.
+    // Worker intercept: full cross-device dmabuf wiring.
     // The SDK reuses the existing plugin GPU machinery (the plugin's
     // wire client, device, addon) which createPluginGpu just brought up.
     intercept = createWorkerInterceptSdk({

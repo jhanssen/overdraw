@@ -7,9 +7,9 @@
 // floating exclusion zones are not supported (would require constraint-
 // solving rather than simple subtraction).
 //
-// No consumer exists today. The registry is in place so `maximized` and
-// the layout plugin's tile region both use `effectiveRect()` from day one;
-// layer-shell drops in by calling `set` / `clear`.
+// The layout driver reads `effectiveRect()` for both the tile region and
+// `maximized` windows; the layer-shell handler maintains zones via `set` /
+// `clear` for anchored surfaces that declare an exclusive zone.
 
 import type { Rect } from "@overdraw/layout-types";
 

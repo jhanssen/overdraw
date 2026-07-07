@@ -79,7 +79,7 @@ export interface RuntimeOptions {
   // emit events via sdk.events.emit (routed to bus.emit). When unset (scope-B
   // tests with no bus), the SDK still exists but subscribe/emit are no-ops.
   bus?: DynamicBus;
-  // Deferred-reference resolver for action params (Phase 7b). When set,
+  // Deferred-reference resolver for action params. When set,
   // sdk.actions.invoke walks the params payload at invoke time and
   // substitutes every { $ref: name } sentinel with the resolver's
   // current value for `name`. main.ts populates the resolver map from
@@ -665,7 +665,7 @@ export class PluginRuntime implements PluginController {
         `actions.invoke: owner '${owner.pluginName}' of '${payload.name}' is not live`);
     }
     void callerName;
-    // Deferred-reference resolution (Phase 7b): if the launcher
+    // Deferred-reference resolution: if the launcher
     // provided a resolver, walk params and substitute every
     // { $ref: name } sentinel with its current value. When unset,
     // params pass through unchanged. The resolved value is cast back

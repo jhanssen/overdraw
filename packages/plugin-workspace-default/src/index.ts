@@ -179,7 +179,7 @@ export default async function init(
   // emits during that window, but the closure references `state` so a hotplug
   // landing too early would dereference undefined.
   let stateReady = false;
-  // M7 hotplug: workspace migration on add / remove.
+  // Workspace migration on hotplug add / remove.
   sdk.events.subscribe("output.added", (_name, payload) => {
     if (!stateReady) return;
     if (!payload || typeof payload !== "object") return;

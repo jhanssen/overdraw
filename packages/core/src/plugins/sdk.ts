@@ -88,7 +88,7 @@ export interface PluginSdk {
   // Scene compose primitive (core-plugin-api.md §6): render a window subset
   // into a fresh texture. Present iff the plugin runs in-thread (it returns
   // GPUTexture handles that only cross the boundary for in-thread plugins
-  // sharing core's device). Phase 5b adds the Worker variant.
+  // sharing core's device).
   compose?: PluginCompose;
   // Built-in transitions (core-plugin-api.md §8): blend two SceneHandles
   // on screen via a kind-specific shader. Present iff the runtime brought
@@ -102,7 +102,7 @@ export interface PluginSdk {
   // cursor broker + rule engine (always, when the JS compositor's
   // cursor slot is wired).
   cursor?: CursorAPI;
-  // Buffer intercept (intercept-design.md, Phase 10a): per-pixel
+  // Buffer intercept (intercept-design.md): per-pixel
   // intercept of matched client surfaces. Plugin registers with a
   // match predicate + setup callback; the SDK runs setup once,
   // dispatches render every visible frame on matched surfaces, and

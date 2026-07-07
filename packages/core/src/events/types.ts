@@ -52,7 +52,7 @@ export const WINDOW_EVENT = {
   // for an entry animation) and the WM awaits before pushing. Bounded by a
   // 100ms per-handler timeout. core-plugin-api.md §3.1.
   relayout: "window.relayout",
-  // Phase 9a: a mapped toplevel has unmapped (client destroyed it or
+  // A mapped toplevel has unmapped (client destroyed it or
   // disconnected) and the compositor has minted a phantom surface
   // holding a snapshot of its last visible state. The phantom sits
   // at the closing window's prior screen rect, above the content
@@ -339,7 +339,7 @@ export type StackRelayoutEvent = {
   }>;
 };
 
-// Phase 9a: emitted after a mapped toplevel has unmapped (client
+// Emitted after a mapped toplevel has unmapped (client
 // destroyed it or disconnected). `phantomSurfaceId` is a fresh
 // compositor surface entry the core minted to display a snapshot
 // of the closing window's last visible state at its prior screen
@@ -412,8 +412,8 @@ export const DECORATION_EVENT = {
 
 // Emitted to a decoration-provider plugin when a mapped window matches its
 // registered app_id pattern (match-once; first-registered match wins). The
-// plugin now "owns" decorating this window: piece 2/3 will let it requestInsets
-// + draw. rect is the window's current outer rect (output px).
+// plugin now "owns" decorating this window (requestInsets + draw). rect is
+// the window's current outer rect (output px).
 export type DecorationAssignedEvent = {
   surfaceId: number;
   appId: string | null;

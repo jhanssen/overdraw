@@ -1,4 +1,4 @@
-// wl_output: one global per output (M6). Each global has its own bind
+// wl_output: one global per output. Each global has its own bind
 // handler tagged with its outputId; on bind, the handler emits that
 // output's geometry/mode/scale/name/done burst and registers the resource
 // against state.wlOutputResources[outputId].

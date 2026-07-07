@@ -29,10 +29,8 @@ bool WaylandInputBackend::convert(const ipc::InputMessage& m, InputEvent& ev) co
             break;
         case ipc::InputTag::PointerMotion:
             ev.type = InputEventType::PointerMotion;
-            // Phase 1: output logical size == host surface size (scale 1), so
-            // surface-local position maps directly to output space. When
-            // scale/resize lands, divide by scale / clamp to [0,width|height)
-            // here using width_/height_.
+            // Output logical size == host surface size (scale 1), so
+            // surface-local position maps directly to output space.
             ev.x = fixedToDouble(m.surfaceX);
             ev.y = fixedToDouble(m.surfaceY);
             break;

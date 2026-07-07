@@ -24,7 +24,7 @@
 // If the reader is already past `serial`, after() runs the action SYNCHRONOUSLY
 // (the common case: no deferral). Otherwise it FIFO-queues it. cancel(pred)
 // drops matching deferred entries (e.g. a surface destroyed before its deferred
-// op fires; the spec for the old pendingProducerEnds did this by surfaceBufId).
+// op fires, cancelled by surfaceBufId).
 // drainAll() runs every still-pending action (used at shutdown after the action
 // owns its fd, so the action can close it as part of running -- not for the
 // case where the wire never caught up; that case calls takePending()).

@@ -208,7 +208,7 @@ export class DynamicBus {
   // input payload when no interceptors match; otherwise the chain's output).
   //
   // Hot path: when no interceptor matches, observers fan out synchronously
-  // (same cost as before interception existed) and the returned Promise is
+  // (same cost as a plain fan-out) and the returned Promise is
   // already-resolved. Callers that don't await get fire-and-forget.
   //
   // Slow path: when at least one interceptor matches, the chain runs in

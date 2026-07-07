@@ -1,4 +1,4 @@
-// Host Wayland output window owned by the GPU process (phase 1 nested mode).
+// Host Wayland output window owned by the GPU process (nested mode).
 //
 // A wl_surface is a client-side proxy bound to one wl_display connection and
 // is not shareable across processes; since the wgpu::Surface and compositing

@@ -34,8 +34,8 @@ function preferredScaleFor(state: CompositorState, surfaceRes: Resource): number
 }
 
 // Re-emit preferred_scale for every bound wp_fractional_scale_v1 resource.
-// Called on output.changed (main.ts) and surface-residency changes (M6
-// surface-residency module). Destroyed resources are pruned in-line.
+// Called on output.changed (main.ts) and surface-residency changes
+// (surface-residency module). Destroyed resources are pruned in-line.
 export function reemitFractionalScale(state: CompositorState): void {
   const map = state.fractionalScaleResources;
   if (!map || map.size === 0 || !state.events) return;

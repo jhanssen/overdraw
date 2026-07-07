@@ -79,7 +79,7 @@ enum class FrameKind : uint8_t {
                               // BeginAccess (kind=1) MUST stay fd-less, otherwise
                               // a stale fd would leak into the next ImportClientTex.
     ScanoutReserve = 6,       // core -> gpu: reserve N scanout slots for an output
-                              // (M7 hotplug add + startup ring bring-up). Rides
+                              // (hotplug add + startup ring bring-up). Rides
                               // the wire (not ctrl) so the followup ProducerBegin
                               // frames the core writes for the new ring are FIFO-
                               // ordered AFTER the InjectTexture work the GPU
@@ -235,9 +235,8 @@ enum class FrameKind : uint8_t {
                               // copyBufferToTexture, submits, and replies
                               // with ShmUploaded(uploadSeq). The core
                               // defers wl_buffer.release until that reply,
-                              // mirroring Hyprland's "copy then release"
-                              // behavior without paying the writeTexture
-                              // marshaling cost on the JS thread.
+                              // a copy-then-release model that avoids the
+                              // writeTexture marshaling cost on the JS thread.
     ShmUploaded = 22,         // gpu -> core: ShmUpload(uploadSeq) is now
                               // observable on the GPU device. Payload:
                               // ShmUploadedPayload (uploadSeq). The core

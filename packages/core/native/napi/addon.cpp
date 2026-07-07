@@ -1060,7 +1060,7 @@ napi_value Start(napi_env env, napi_callback_info info) {
 #endif
     } else if (g_addon.inputFd >= 0) {
         // Nested input backend: maps host-forwarded events to normalized
-        // events. Output logical size == host window size in phase 1 (scale 1).
+        // events. Output logical size == host window size (scale 1).
         auto wlBackend = std::make_unique<WaylandInputBackend>(
             g_addon.inputFd, g_addon.compositor->windowWidth(),
             g_addon.compositor->windowHeight());
@@ -1298,7 +1298,7 @@ napi_value PluginAllocSurfaceBufferW(napi_env env, napi_callback_info info) {
 }
 
 // coreAllocComposeBufferW(connId, w, h, conTexId, conTexGen, conDevId, conDevGen,
-// pluginSerial, cb): the reverse-direction alloc (phase 5b). The core is the
+// pluginSerial, cb): the reverse-direction alloc. The core is the
 // PRODUCER (renders into the dmabuf), the plugin is the CONSUMER (samples it).
 // The WORKER reserved its consumer-side texture on its wire client and passes
 // those handles; the core reserves its producer-side texture and sends
@@ -1340,10 +1340,9 @@ static uint32_t arg0u32(napi_env env, napi_callback_info info, napi_value* argv,
 }
 
 // writeConsumerBegin(surfaceBufId) / writeConsumerEnd(surfaceBufId): in-band
-// consumer Begin/End on the core wire (replaces the pluginSurfaceConsumerBegin/
-// End ctrl round-trips). Synchronous frame writes -- no pendingBegins callback;
-// the FIFO wire ordering replaces the begin-done acknowledgement. The caller
-// still gates End on afterCurrentFrame (GPU-read completion).
+// consumer Begin/End on the core wire. Synchronous frame writes -- no
+// pendingBegins callback; FIFO wire ordering supplies the begin-done ordering.
+// The caller still gates End on afterCurrentFrame (GPU-read completion).
 napi_value WriteConsumerBegin(napi_env env, napi_callback_info info) {
     if (!g_addon.compositor) return nullptr;
     napi_value argv[1]; uint32_t id = arg0u32(env, info, argv, 1);
@@ -1358,7 +1357,7 @@ napi_value WriteConsumerEnd(napi_env env, napi_callback_info info) {
 }
 
 // writeProducerBegin / writeProducerEnd: in-band producer Begin/End on the
-// core wire (phase 5b). The core IS the producer for compose buffers, so
+// core wire. The core IS the producer for compose buffers, so
 // producer Begin/End ride the core wire (inverted from plugin-overlay
 // surfaces where producer Begin/End ride the plugin wire).
 napi_value WriteProducerBegin(napi_env env, napi_callback_info info) {
@@ -2128,7 +2127,7 @@ napi_value CreateGlobalForOutput(napi_env env, napi_callback_info info) {
 //
 // Tear down a previously-advertised per-output global (the inverse of
 // createGlobalForOutput). Clients see wl_registry.global_remove and any
-// existing resources become destroyable. Used by the M7 hotplug handler on
+// existing resources become destroyable. Used by the hotplug handler on
 // output removal AFTER protocol-level "leave" events have fired.
 napi_value DestroyGlobalForOutput(napi_env env, napi_callback_info info) {
     size_t argc = 2; napi_value argv[2];
@@ -2352,7 +2351,7 @@ napi_value SetOnOutputDescriptor(napi_env env, napi_callback_info info) {
 
 // setOnOutputAdded(cb) -> undefined
 // Register a JS callback fired for each OutputAdded message arriving from
-// the GPU process (M7 hotplug). Same payload shape as OutputDescriptor
+// the GPU process (hotplug). Same payload shape as OutputDescriptor
 // (outputId + width/height/refreshMhz/scale/transform/physical/name/make/
 // model). The handler creates state.outputs[outputId], calls
 // reserveScanoutForOutput to complete the runtime ring handshake, and emits
@@ -2364,7 +2363,7 @@ napi_value SetOnOutputAdded(napi_env env, napi_callback_info info) {
 
 // setOnOutputRemoved(cb) -> undefined
 // Register a JS callback fired for each OutputRemoved message arriving from
-// the GPU process (M7 hotplug). Payload is { outputId }. The handler fires
+// the GPU process (hotplug). Payload is { outputId }. The handler fires
 // output.pre-remove (workspace migration + wl_surface.leave), tears down
 // state.outputs[outputId], destroys that output's wl_output global, and
 // fires output.removed. Pass null/omit to clear.
@@ -2391,7 +2390,7 @@ napi_value SetOnOutputModes(napi_env env, napi_callback_info info) {
 }
 
 // reserveScanoutForOutput(outputId, width, height) -> undefined
-// Send ScanoutReserve for a runtime-added output (M7). Called by the
+// Send ScanoutReserve for a runtime-added output. Called by the
 // output.added JS handler after OutputAdded arrives so the GPU process can
 // complete its bring-up handshake (it InjectTextures at the reserved handles
 // and replies ScanoutReady, consumed by drainCtrl). KMS only; nested/headless
@@ -2437,7 +2436,7 @@ napi_value SwitchOutputMode(napi_env env, napi_callback_info info) {
 }
 
 // releaseScanoutForOutput(outputId) -> undefined
-// Drop the core-side per-output scanout state on output removal (M7). The GPU
+// Drop the core-side per-output scanout state on output removal. The GPU
 // process has already torn down its ring; this clears the core's slot
 // bookkeeping so a future OutputAdded at the same outputId can build a fresh
 // ring. KMS only; nested/headless are silent no-ops.

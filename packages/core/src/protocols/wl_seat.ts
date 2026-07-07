@@ -129,7 +129,7 @@ export default function makeSeat(ctx: Ctx, driver: FocusDriver): SeatHandler {
   // for the binding chain's release callback path.
   let lastModsDepressed = 0;
 
-  // Phase 9c cursor state. Shared with makePointer via ctx.state.seat
+  // Cursor state. Shared with makePointer via ctx.state.seat
   // (which we publish below). Per-pointer-resource latest enter serial
   // for set_cursor serial validation; per-client cursor preference
   // (the surface + hotspot, or "hidden"). Encapsulated as helpers so
@@ -540,7 +540,7 @@ export default function makeSeat(ctx: Ctx, driver: FocusDriver): SeatHandler {
     for (const p of clientPointers(target.clientId)) {
       if (p.destroyed) continue;
       ctx.events.wl_pointer.send_enter(p, serial, target.surfaceRec.resource, sx, sy);
-      // Phase 9c: stash the enter serial per pointer resource so a
+      // Stash the enter serial per pointer resource so a
       // subsequent set_cursor request from the client can be validated
       // against it.
       lastEnterSerial.set(p, serial);
@@ -681,7 +681,7 @@ export default function makeSeat(ctx: Ctx, driver: FocusDriver): SeatHandler {
         const x = ev.x ?? 0;
         const y = ev.y ?? 0;
         lastX = x; lastY = y;
-        // Move the software cursor with the pointer (Phase 9c). The
+        // Move the software cursor with the pointer. The
         // compositor's cursor slot draws above every layer; visibility
         // and texture-installed gate inclusion -- so this is cheap when
         // no cursor is set up yet. pointerEnter restores visibility
@@ -1015,7 +1015,7 @@ export default function makeSeat(ctx: Ctx, driver: FocusDriver): SeatHandler {
     pointerPosition() { return { x: lastX, y: lastY }; },
     reevaluateExclusiveLayerFocus,
     drag: null,
-    // Phase 9c: cursor handling shared with makePointer (set_cursor) and
+    // Cursor handling shared with makePointer (set_cursor) and
     // wl_surface.commit (cursor-role surface texture refresh).
     cursor: cursorOps,
     // Begin a DnD pointer grab. While set, handleInput routes pointer motion/
@@ -1100,7 +1100,7 @@ export function makePointer(ctx: Ctx): WlPointerHandler {
     set_cursor(resource, serial, surface, hx, hy) {
       const seat = ctx.state.seat;
       if (!seat) return;
-      // Phase 9c: validate against the most-recent enter serial for this
+      // Validate against the most-recent enter serial for this
       // pointer resource. Stale requests (serial < latest enter) are
       // silently dropped per protocol convention. A missing entry means
       // no current enter for this resource (client never had focus, or

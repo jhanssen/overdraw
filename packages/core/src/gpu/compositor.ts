@@ -50,7 +50,7 @@
 //   - Per-channel scale (dim red channel, etc.) -> tint.
 //   - Workspace inactive dim: tint = (0.5, 0.5, 0.5, 1).
 // Effects that need to read neighbor pixels (blur, distortion) are not
-// expressible here -- they're for the buffer-intercept path (Phase 10).
+// expressible here -- they're for the buffer-intercept path.
 //
 // outputMargin reserves canvas around the surface's nominal rect. The mask
 // is sampled across the FULL expanded region (margin included) and its alpha
@@ -622,7 +622,7 @@ interface Surface {
   // visible effect). The bind group references the chosen mask's view;
   // setSurfaceMask rebuilds the bind group.
   maskView: GPUTextureView | null;
-  // Phase 10a buffer intercept: when set, the compositor's per-surface
+  // Buffer intercept: when set, the compositor's per-surface
   // render pass samples from this view instead of `view`. The intercept
   // broker drives this via installInterceptOutput / clearInterceptOutput:
   // each frame the broker invokes the plugin's render callback, then
@@ -813,9 +813,9 @@ interface LiveWindowComp {
     texture: GPUTexture;
     view: GPUTextureView;
     // surface dims at registration time (used to compute cropUV); on
-    // resize, the registration is invalidated. Phase 5a does not handle
-    // mid-life surface resize for live window-comps; the holder releases
-    // and re-registers if it needs to track resizes.
+    // resize, the registration is invalidated. Mid-life surface resize for
+    // live window-comps is not handled here; the holder releases and
+    // re-registers if it needs to track resizes.
     surfW: number;
     surfH: number;
   }>;
@@ -1007,14 +1007,14 @@ export class JsCompositor implements CompositorSink {
   // with the cropped region filling the target.
   private liveScenes: LiveScene[] = [];
   private liveWindowComps: LiveWindowComp[] = [];
-  // Phase 5b-live: per-frame callbacks the broker registers for cross-device
+  // Per-frame callbacks the broker registers for cross-device
   // dmabuf compose-live. Each callback owns its own ring + producer; the
   // compositor doesn't know the target. Invoked after the on-screen frame
   // composite (and the existing liveScenes/liveWindowComps passes), so the
   // producer's compose pass shares the frame's encoder + submit.
   private liveProducers: Array<() => void> = [];
 
-  // Phase 9a: closing-animation phantoms. When a mapped toplevel
+  // Closing-animation phantoms. When a mapped toplevel
   // unmaps, the compositor composites its surface set (toplevel +
   // decoration + subsurfaces) into a fresh core-owned texture, mints
   // a new surfaceId for the phantom, and tracks it here. Phantoms
@@ -1210,7 +1210,7 @@ export class JsCompositor implements CompositorSink {
     });
     this.layout = this.pipeline.getBindGroupLayout(0);
 
-    // Phase 8: transition pipeline. A separate pipeline because the
+    // Transition pipeline. A separate pipeline because the
     // bind-group shape and the shader (full-screen quad, two input
     // textures) differ from the per-surface composite pass. Built
     // eagerly so the per-frame fast path in renderFrame can encode
@@ -1432,18 +1432,14 @@ export class JsCompositor implements CompositorSink {
     for (const layer of LAYER_ORDER) {
       if (layer === "content") {
         out.push(...content);
-        // Phase 9a: phantoms (closing-animation snapshots) draw on top
-        // of the content layer but below the 'above' layer. Insertion
-        // order = z order; the most recently closed window's phantom
-        // is on top of older phantoms. This is the v1 z model;
-        // future phases may splice phantoms into the exact z position
-        // their original surface had if the simple "on top of content"
-        // placement turns out wrong for some real use case.
+        // Phantoms (closing-animation snapshots) draw on top of the content
+        // layer but below the 'above' layer. Insertion order = z order; the
+        // most recently closed window's phantom is on top of older phantoms.
         if (this.phantoms.length > 0) out.push(...this.phantoms);
       }
       else { const ids = this.layers.get(layer); if (ids) out.push(...ids); }
     }
-    // Phase 9c: the cursor is always on top -- above every layer,
+    // The cursor is always on top -- above every layer,
     // above phantoms, above any plugin overlay. The target surfaceId
     // can be the internal cursor surface (CPU-uploaded image) or any
     // existing surface (e.g. a wl_pointer.set_cursor client surface).
@@ -2104,9 +2100,8 @@ export class JsCompositor implements CompositorSink {
   //
   // Returns false only when this compositor was constructed without a Dawn
   // wire (the headless protocol-only mode used by some tests); true otherwise.
-  // (It used to return the addon's importId-truthy value, but the
-  // intent-driven path makes the import strictly async, so we return true and
-  // let the lifecycle drive the rest.)
+  // The import is strictly async (the lifecycle drives it), so a true return
+  // signals "accepted", not "import complete".
   commitSurfaceDmabuf(id: number, fd: WaylandFd, w: number, h: number, fourcc: number,
                       modHi: number, modLo: number, offset: number, stride: number,
                       bufferId: number,
@@ -2238,7 +2233,7 @@ export class JsCompositor implements CompositorSink {
         usage: this.g.GPUBufferUsage.UNIFORM | this.g.GPUBufferUsage.COPY_DST,
       });
     }
-    // Phase 10a: when an intercept is active for this surface, sample
+    // When an intercept is active for this surface, sample
     // the plugin's output instead of the client texture. Callers that
     // update the client view still call rebuildBindGroup with that
     // view; this chokepoint substitutes the intercept view when
@@ -2546,7 +2541,7 @@ export class JsCompositor implements CompositorSink {
       tex = this.device.createTexture({
         size: { width: c.width, height: c.height },
         format: "bgra8unorm",
-        // COPY_SRC is required by the Phase 10a Worker intercept's
+        // COPY_SRC is required by the Worker intercept's
         // input-leg copy (core copies the client texture into a dmabuf
         // the plugin samples). Keeping it always-on is cheap; the
         // alternative (re-create texture with COPY_SRC when an
@@ -3354,7 +3349,7 @@ export class JsCompositor implements CompositorSink {
         if (this.freed.length > freedBefore) this.addon.wake();
       });
 
-      // Phase 5b-live: invoke each registered live-producer callback. They
+      // Invoke each registered live-producer callback. They
       // own their own SurfaceProducer + ring slot; each runs its own
       // writeProducerBegin / composeIntoView / writeProducerEnd as a
       // separate submit (since the per-buf brackets are FIFO-ordered with
@@ -3515,7 +3510,7 @@ export class JsCompositor implements CompositorSink {
     return { texture, outW: devW, outH: devH };
   }
 
-  // Phase 9a: snapshot the closing window's surfaces into a fresh
+  // Snapshot the closing window's surfaces into a fresh
   // texture and mint a phantom surface entry to display it. The
   // phantom is a regular compositor surface (the plugin can
   // manipulate it via the standard windows broker -- setOpacity,
@@ -3588,7 +3583,7 @@ export class JsCompositor implements CompositorSink {
     return phantomSurfaceId;
   }
 
-  // Phase 9a: tear down a phantom. Removes it from the draw order,
+  // Tear down a phantom. Removes it from the draw order,
   // drops the surface entry, destroys the snapshot texture. Idempotent
   // (no-op if the id isn't a known phantom).
   destroyClosingPhantom(phantomSurfaceId: number): void {
@@ -3611,7 +3606,7 @@ export class JsCompositor implements CompositorSink {
   // For tests: enumerate active phantom surfaceIds in draw order.
   activePhantomIds(): number[] { return this.phantoms.slice(); }
 
-  // ----- Buffer intercept (Phase 10a) ---------------------------------------
+  // ----- Buffer intercept -----------------------------------------------------
   //
   // Displaces a surface's sampled texture with a plugin-supplied one.
   // The intercept broker runs in the beforeRender hook: for each
@@ -3684,7 +3679,7 @@ export class JsCompositor implements CompositorSink {
     return out;
   }
 
-  // Phase 10a: hand the intercept broker the current client texture
+  // Hand the intercept broker the current client texture
   // for a surface. The broker passes this as `input.texture` to the
   // plugin's render callback in the in-thread path. Returns null when
   // the surface is unknown or has no committed buffer yet (the broker
@@ -3707,7 +3702,7 @@ export class JsCompositor implements CompositorSink {
     return this.surfaces.get(surfaceId)?.contentEpoch ?? 0;
   }
 
-  // Phase 10a: whether the surface is in the on-screen draw list this
+  // Whether the surface is in the on-screen draw list this
   // frame. The broker uses this to skip render dispatch for surfaces
   // that aren't being composited (off-screen / hidden by a workspace).
   // Returns the surface's presentable flag; the broker treats "not
@@ -3730,7 +3725,7 @@ export class JsCompositor implements CompositorSink {
     return { x: s.x, y: s.y, w: s.layoutW, h: s.layoutH };
   }
 
-  // Phase 10a in-thread intercept: open a Begin/End bracket on the
+  // In-thread intercept: open a Begin/End bracket on the
   // surface's client dmabuf import around the plugin's render submit.
   // SHM-backed surfaces have no dmabuf import; the bracket is a no-op
   // but fn still runs. The bracket is per-import (one Begin per
@@ -3781,7 +3776,7 @@ export class JsCompositor implements CompositorSink {
     return true;
   }
 
-  // ----- Cursor slot (Phase 9c) ---------------------------------------------
+  // ----- Cursor slot ----------------------------------------------------------
   //
   // A singleton overlay drawn ABOVE every other layer. The cursor "slot"
   // is a reference to a surfaceId + hotspot + visibility; drawOrder()
@@ -3906,9 +3901,11 @@ export class JsCompositor implements CompositorSink {
     this.updateCursorLayout();
   }
 
-  // Deprecated direct-texture install (kept for tests that hand-craft a
-  // GPUTexture). New callers should use setCursorPixels (CPU bytes) or
-  // setCursorFromSurface (existing surface).
+  // Install an already-on-device GPUTexture as the cursor image. The live
+  // path for cursor.set-image and plugin-supplied cursor textures: the
+  // cursor-broker's installTexture / handleSetImage route an in-thread
+  // plugin's GPUTexture here. setCursorPixels (CPU bytes) and
+  // setCursorFromSurface (existing surface) are the other two install paths.
   setCursorTexture(tex: GPUTexture, width: number, height: number,
                    hotspotX: number, hotspotY: number): void {
     if (this.cursorOwnedTexture) {
@@ -3981,8 +3978,8 @@ export class JsCompositor implements CompositorSink {
   }
 
   // Render the listed windows into a PRE-ALLOCATED target view, with optional
-  // producer Begin/End wrapping for cross-device dmabuf targets (phase 5b
-  // Worker compose). Used when the target texture is a wire-wrapped dmabuf
+  // producer Begin/End wrapping for cross-device dmabuf targets (Worker
+  // compose). Used when the target texture is a wire-wrapped dmabuf
   // that the core produces and a Worker plugin consumes; the producer bracket
   // is required for the GPU process to chain the cross-device fence to the
   // plugin's subsequent consumer Begin.
@@ -4033,7 +4030,7 @@ export class JsCompositor implements CompositorSink {
     }
   }
 
-  // Phase 10a Worker intercept: copy a client surface's currently-
+  // Worker intercept: copy a client surface's currently-
   // committed texture into a dmabuf the Worker plugin samples. Both
   // textures live on the core device (the dmabuf was allocated via
   // AllocComposeBuf; the core has the producer-side wgpu::Texture).
@@ -4076,7 +4073,7 @@ export class JsCompositor implements CompositorSink {
     return true;
   }
 
-  // Phase 5b-live: register a per-frame produce callback. The compositor
+  // Register a per-frame produce callback. The compositor
   // invokes it after the on-screen frame submits. The caller owns its
   // SurfaceProducer + ring; each callback typically calls producer.
   // tryAcquire() -> composeIntoView -> producer.presentSync(). Returns an

@@ -1,5 +1,5 @@
 // Core-side decoration broker. Owns the decoration registry + the content-gating
-// state machine (decoration milestone piece 3). main.ts routes decoration.*
+// state machine. main.ts routes decoration.*
 // requests here and gpu.*/surface.* to the GPU broker; it also forwards the GPU
 // broker's generic surface hooks (alloc-with-`decorates` tag, first-present) here
 // so the broker can link a decoration surface to its window and release the gate.

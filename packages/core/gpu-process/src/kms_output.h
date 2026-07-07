@@ -232,7 +232,7 @@ class KmsOutputBackend : public OutputBackend {
 
     // Smallest non-negative uint32 not currently in use by outputs_. Today
     // outputs_ stays small (<10), so the linear scan is fine; revisit if
-    // outputs ever go into the hundreds (multi-card territory, M9+).
+    // outputs ever go into the hundreds (multi-card territory).
     uint32_t allocateOutputId() const;
 
     int drmFd_ = -1;   // borrowed; not closed

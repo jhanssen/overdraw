@@ -1,4 +1,4 @@
-// Phase-2 bare-metal input backend.
+// Bare-metal input backend.
 //
 // Reads events from /dev/input/event* via libinput, with device fds opened
 // through libseat. Emits the same normalized core::InputEvent stream the

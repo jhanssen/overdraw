@@ -85,7 +85,7 @@ export interface InsetGrant {
   contentRect: { x: number; y: number; width: number; height: number };
 }
 
-// Per-channel tint multiplier on the sampled rgba (Phase 5.5a). Identity is
+// Per-channel tint multiplier on the sampled rgba. Identity is
 // (1,1,1,1); missing fields default to 1 (no change to that channel).
 // Examples: dim to half = { r: 0.5, g: 0.5, b: 0.5 }; suppress red =
 // { r: 0 }; fade alpha = { a: 0.5 }.
@@ -96,12 +96,12 @@ export interface SurfaceTint {
   a?: number;
 }
 
-// 4x4 color matrix applied to the sampled rgba before the per-channel tint
-// (Phase 5.5a). Caller passes 16 numbers in COLUMN-MAJOR order, matching
+// 4x4 color matrix applied to the sampled rgba before the per-channel tint.
+// Caller passes 16 numbers in COLUMN-MAJOR order, matching
 // WGSL mat4x4f. Identity = [1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1]. Covers
 // saturation, hue rotation, contrast, brightness, channel swap. Anything
 // needing neighbor pixels (blur, distortion) is for the buffer-intercept
-// path (Phase 10), not core primitives.
+// path, not core primitives.
 export type ColorMatrix = readonly number[] | Float32Array;
 
 // Analytic per-surface shape evaluated by the compositor's fragment shader.
@@ -243,17 +243,16 @@ export interface PluginWindows extends PluginWindowObserver {
   // GPUTexture). Radii are in surface LOGICAL pixels.
   setShape(id: number, shape: SurfaceShape): Promise<void>;
 
-  // Per-channel tint multiplier on the sampled rgba (Phase 5.5a). Identity
+  // Per-channel tint multiplier on the sampled rgba. Identity
   // = (1,1,1,1); missing fields default to 1. Cheap (uniform write next
   // frame).
   setTint(id: number, t: SurfaceTint): Promise<void>;
 
-  // 4x4 color matrix applied to the sampled rgba BEFORE the tint (Phase
-  // 5.5a). Pass 16 numbers in column-major order (WGSL mat4x4f). null
-  // restores identity.
+  // 4x4 color matrix applied to the sampled rgba BEFORE the tint. Pass 16
+  // numbers in column-major order (WGSL mat4x4f). null restores identity.
   setColorMatrix(id: number, m: ColorMatrix | null): Promise<void>;
 
-  // Phase 9a: destroy a phantom surface (created by core in response to
+  // Destroy a phantom surface (created by core in response to
   // a closing window and passed to the plugin via the window.closing
   // event). The plugin calls this when its closing animation completes;
   // the compositor removes the phantom from the draw order, destroys

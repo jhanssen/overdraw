@@ -3,7 +3,7 @@
 // registry the XWM consults to pair an X11 window's WL_SURFACE_SERIAL
 // client-message with the wl_surface Xwayland created for it.
 //
-// No xcb here -- pure association bookkeeping. The native XWM (Phase 2 part B)
+// No xcb here -- pure association bookkeeping. The native XWM
 // reports "X window announced serial S"; lookupBySerial resolves S to the
 // wl_surface id so the window can enter the WM. The two halves may arrive in
 // either order; the registry simply holds whichever side is known.
@@ -44,7 +44,6 @@ export type SetSerialResult = "ok" | "already" | "unknown";
 // Note: the protocol specifies set_serial as double-buffered (applied on the
 // wl_surface's next commit). We register on set_serial directly; the serial is
 // globally unique either way, so the XWM join is unaffected by the timing.
-// Commit-gated application is a future refinement.
 export function setSerial(state: CompositorState, resource: Resource, serial: bigint): SetSerialResult {
   const st = ensureXwaylandState(state);
   const b = st.byResource.get(resource);

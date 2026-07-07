@@ -1,11 +1,11 @@
 // The core-internal window/compositor event bus: the concrete TypedBus instance +
 // its event map. Producers (the protocol layer, the seat) emit; subscribers (the
-// plugin-forwarding layer in main.ts, the clipboard layer, the future decoration
+// plugin-forwarding layer in main.ts, the clipboard layer, the decoration
 // registry) call bus.on(...).
 //
 // The map's keys are the WINDOW_EVENT name strings so producers reference the
 // same constants as the plugin wire. keyboard.focus is in-core only today (the
-// clipboard layer consumes it); it replaces the old seat.onKbFocusChange hook.
+// clipboard layer consumes it).
 
 import { TypedBus } from "./bus.js";
 import { WINDOW_EVENT, STACK_EVENT } from "./types.js";

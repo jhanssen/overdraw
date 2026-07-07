@@ -1,13 +1,12 @@
 // Cursor kinematic state: smoothed velocity + shake detection + idle
-// timer. Feeds the cursor rule engine (Phase 9c) so plugin rules like
+// timer. Feeds the cursor rule engine so plugin rules like
 // `when: {speedRange: [500, Infinity]}` or `{shake: true}` can match
 // against derived pointer state without subscribing to every motion
 // event.
 //
-// Algorithms are direct ports of hypr-dynamic-cursors (rotate / tilt /
-// stretch / shake). The shake detector uses the "trail / diagonal of
-// bounding box" ratio (the KWin algorithm hypr copied). Velocity uses
-// a windowed finite-difference over a ring buffer.
+// The shake detector uses the "trail length / diagonal of bounding box"
+// ratio over a sliding window. Velocity uses a windowed
+// finite-difference over a ring buffer.
 //
 // Lazy enablement: the state machine does nothing until at least one
 // consumer is registered. enable() bumps a refcount; disable() drops.

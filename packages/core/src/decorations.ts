@@ -1,13 +1,12 @@
-// Decoration-provider registry (core, GPU-free). Piece 1 of the decoration
-// milestone (architecture.md "First decoration milestone"): a plugin registers an
+// Decoration-provider registry (core, GPU-free): a plugin registers an
 // app_id pattern; when a mapped window's app_id matches, the first-registered
-// matching provider is ASSIGNED that window and notified. No insets, no surface,
-// no drawing yet -- that is pieces 2/3. This is pure bookkeeping + one event.
+// matching provider is ASSIGNED that window and notified. Pure bookkeeping +
+// one event -- no insets, surface, or drawing here.
 //
 // Matching happens at window.map AND on window.change (the app_id may arrive after
 // first content -- see the window-state stream). Match-once: once a window is
-// assigned, it stays with that provider for its lifetime (reassignment on later
-// app_id change is deferred -- flagged).
+// assigned, it stays with that provider for its lifetime (no reassignment on a
+// later app_id change).
 
 import type { CompositorBus } from "./events/window-bus.js";
 import {

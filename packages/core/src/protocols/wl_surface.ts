@@ -686,7 +686,7 @@ export default function makeSurface(ctx: Ctx): WlSurfaceHandler {
         ctx.state.wm?.notifyToplevelCommit(s.id, xs.lastAckedSerial ?? null);
       }
 
-      // Phase 9c: if this surface has the "cursor" role and is the
+      // If this surface has the "cursor" role and is the
       // current pointer focus's active cursor surface, re-apply the
       // cursor slot so the just-uploaded texture is picked up by the
       // compositor. The seat re-checks ownership before mutating.

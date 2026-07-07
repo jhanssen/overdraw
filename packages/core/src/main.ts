@@ -260,7 +260,7 @@ const compositor: CompositorSink = new JsCompositor(device, dawn.globals, addon,
   { headless: false, format: addon.outputFormat() });
 log.info("core", "compositor: JS (over the Dawn wire)");
 
-// Phase 9c: install the built-in default cursor. The XCursor theme
+// Install the built-in default cursor. The XCursor theme
 // resolver picks up XCURSOR_THEME / XCURSOR_SIZE from env; for
 // 'default' the resolver always succeeds (built-in 16x16 fallback
 // if no theme on disk). The cursor draws above every other layer
@@ -779,9 +779,9 @@ pluginBus.subscribe(WINDOW_EVENT.relayout, (_n, payload) => {
     { x: r.x, y: r.y, width: r.width, height: r.height });
 });
 
-// Scene registry (phase 8): every SceneHandle minted by in-thread or
-// Worker compose registers here so transitions (and any future
-// cross-SDK consumer) can resolve a sceneId back to a core-side
+// Scene registry: every SceneHandle minted by in-thread or Worker compose
+// registers here so transitions (and any other cross-SDK consumer) can
+// resolve a sceneId back to a core-side
 // GPUTexture. Shared by the gpu-broker (Worker compose paths) and
 // the in-thread compose-sdk (via inThreadGpu.sceneRegistry below).
 const sceneRegistry = createSceneRegistry();
@@ -831,7 +831,7 @@ const gpuBroker = createGpuBroker({
   emitToPlugin: (plugin, name, data) => { runtime?.emit(plugin, name, data); },
 });
 
-// Phase 9a closing driver: snapshots a phantom of a closing toplevel
+// Closing driver: snapshots a phantom of a closing toplevel
 // for the registered 'window-closing' plugin (if any). hasPluginHandler
 // reads the runtime's namespace registry; runtime is created below.
 // state.closingDriver is the hook unmapAndTeardownSurface calls.
@@ -911,7 +911,7 @@ const transitionsBroker = createTransitionsBroker({
   },
 });
 
-// Cursor (Phase 9c). Theme resolver + kinematic state + rule engine
+// Cursor. Theme resolver + kinematic state + rule engine
 // + broker. The resolver caches XCursor file parses; the kinematic
 // state machine is lazily enabled by rule registration; the broker
 // is the plugin-facing route for cursor.* requests.
@@ -949,7 +949,7 @@ state.installGrabCursor = (shape) => {
   }
 };
 
-// Intercept (Phase 10a). Match engine + per-surface state + broker.
+// Intercept. Match engine + per-surface state + broker.
 // In-thread bundled plugins register through the broker directly;
 // Worker plugins register via the intercept-plugin-broker route which
 // drives the cross-device dmabuf machinery shared with the gpu-broker.
@@ -1030,7 +1030,7 @@ const inputBroker = createInputBroker({
   },
 });
 
-// Deferred-reference resolver map (phase 7b). Used by the action
+// Deferred-reference resolver map. Used by the action
 // registry to substitute `ref.X` sentinels in invoke params at
 // dispatch time. The map is LIVE -- each function reads core state on
 // every action invocation, so resolvers see the current pointer / focus
@@ -1457,7 +1457,7 @@ log.info("core", `ctrl-c to quit.`);
 // headless synthesizes one per tick of the addon's frame timer. This is the
 // ONLY path that fires wl_callback.done -- the per-tick dispatchFrameCallbacks
 // runs housekeeping (imports/maps/unmaps, buffer-release, animation tick) but
-// no longer dispatches frame callbacks.
+// does not dispatch frame callbacks.
 addon.setOnFlipComplete?.((outputId, tvSec, tvNsec, seq) => {
   state?.dispatchFrameCallbacksForOutput?.(Math.round(performance.now()), outputId);
   // Plugin overlay frame ticks pace off the same flip (surface.onFrame).

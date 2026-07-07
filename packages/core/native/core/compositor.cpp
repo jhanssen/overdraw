@@ -319,8 +319,8 @@ bool Compositor::bringUp() {
     //              the scanout-ring bring-up.
     //   headless-> wait for FeedbackData only (no surface).
     // DeviceReady's surface handle is always zero: no wgpu::Surface lives
-    // on either side any more (KMS never had one; nested no longer creates
-    // one -- see the bringUp comment in the wantSurface branch below).
+    // on either side (KMS has none; nested does not create one -- see the
+    // bringUp comment in the wantSurface branch below).
     const bool wantSurface = !headless_ && !kmsMode_;
     {
         ipc::Message m{};
@@ -420,8 +420,9 @@ bool Compositor::bringUp() {
     // Scanout-ring set-up: ReserveTexture three wire handles per output, then
     // write a ScanoutReserve frame on the WIRE socket. The GPU process's wire
     // reader sees the Reserve bytes before any subsequent ProducerBegin frame
-    // referencing the same handles -- the cross-fd race that previously broke
-    // ctrl delivery is eliminated by construction. ScanoutReady comes back on
+    // referencing the same handles -- eliminating the cross-fd race a
+    // ctrl-delivered Reserve would expose (wire drained ahead of ctrl, a
+    // ProducerBegin hitting an unreserved handle). ScanoutReady comes back on
     // the wire too; the inbound handler installed here consumes it.
     //
     // KMS uses the kmsOutputs list collected above; nested uses a single
@@ -493,10 +494,10 @@ bool Compositor::bringUp() {
     };
 
     if (wantSurface) {
-        // Nested: the GPU process no longer creates a Dawn WSI swapchain
-        // surface (its Mesa side-effect of auto-binding
-        // wp_linux_drm_syncobj_surface_v1 on the host wl_surface would
-        // conflict with our direct dmabuf attach + commit). SurfaceReady
+        // Nested: the GPU process does not create a Dawn WSI swapchain
+        // surface (that would auto-bind wp_linux_drm_syncobj_surface_v1 on
+        // the host wl_surface via Mesa, conflicting with our direct dmabuf
+        // attach + commit). SurfaceReady
         // carries width/height and a zero surface handle. The on-screen
         // present path runs through a scanout ring just like KMS:
         // reserve 3 texture handles, send ScanoutReserve, wait for
@@ -608,8 +609,9 @@ uint32_t Compositor::importDmabufForJs(int fd, uint32_t width, uint32_t height,
     // mKnown.size(), which grows monotonically as wire commands (including
     // this InjectTexture) are processed. A later Surface::APIGetCurrentTexture
     // allocates the NEXT sequential id; if its wire command arrived before
-    // ImportClientTex (as happened when ImportClientTex rode the ctrl socket),
-    // the gap would silently zero the slot and the surface would render black.
+    // ImportClientTex -- as it could if this import rode the ctrl socket
+    // instead of the wire -- the gap would silently zero the slot and the
+    // surface would render black.
     ipc::ImportClientTexPayload p{};
     p.textureId         = rt.handle.id;
     p.textureGeneration = rt.handle.generation;
@@ -844,8 +846,8 @@ void Compositor::reserveScanoutForOutput(uint32_t outputId, uint32_t width, uint
     // ProducerBegin frames referencing the new handles. Wire FIFO + the
     // GPU process's single-threaded wire dispatch guarantee the
     // ScanoutReserve handler (InjectTexture + surfaceBufs register) runs
-    // BEFORE any frame referencing the new bufIds -- this is the fix for
-    // the ctrl/wire cross-fd race that broke M7 step 4.
+    // BEFORE any frame referencing the new bufIds, closing the ctrl/wire
+    // cross-fd race by construction.
     uint8_t buf[ipc::ScanoutReservePayload::kSize];
     pl.encode(buf);
     link_->appendFrame(ipc::FrameKind::ScanoutReserve, buf, sizeof(buf));
@@ -958,7 +960,7 @@ void Compositor::drainCtrl() {
         // Note: ScanoutReady arrives on the WIRE (not ctrl) -- see the
         // inboundHandler in Compositor::Compositor and the bringUp's
         // transient handler. Keeping ctrl free of this avoids the cross-fd
-        // race that broke M7 step 4.
+        // race.
         if (r.tag == ipc::Tag::WireConnAdded) {
             wireConnAdded_[r.connId] = r.ok ? 1 : 2;
             continue;

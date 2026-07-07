@@ -103,13 +103,12 @@ class WorkerWireClient {
     // reclaim policy (above) encodes that.
     //
     // The flush + bytesQueued sample happens inside this function so the serial
-    // cannot be captured too early; this is the single chokepoint replacing
-    // the previous "reserveProducerTexture() + caller flushes + caller reads
-    // wireBytesQueued()" pattern across separate calls.
+    // cannot be captured too early: folding the reserve, flush, and sample into
+    // one call keeps them from being split across separate calls.
     struct SurfaceReservation { Handle texture; Handle device; uint64_t wireSerial; bool ok; };
     SurfaceReservation reserveProducerTexture(uint32_t surfaceBufId, uint32_t w, uint32_t h);
     WGPUTexture producerTexture(uint32_t surfaceBufId) const;
-    // Phase 5b: reserve a consumer-side texture on this plugin wire. The
+    // Reserve a consumer-side texture on this plugin wire. The
     // plugin is the CONSUMER for a compose buffer (the core produces, the
     // plugin samples). Same reserve-and-flush-and-sample-serial pattern as
     // reserveProducerTexture; usage is TextureBinding|CopySrc (sample +
@@ -130,8 +129,7 @@ class WorkerWireClient {
     // Surface frame (producer=true) for `surfaceBufId`. Begin's FIFO position
     // before the Worker's render commands opens the producer bracket in time;
     // End's position after the render submit closes it after the GPU process
-    // decodes those commands. Replaces the core-mediated ProducerBegin/
-    // ProducerEnd ctrl path and its plugin-wire WireBarrier deferral.
+    // decodes those commands.
     // appendFrame flushes staged Dawn bytes first, so the caller does NOT flush.
     void writeBeginAccess(uint32_t surfaceBufId) {
         ipc::SurfaceAccessPayload p{surfaceBufId, /*producer=*/true};
@@ -145,7 +143,7 @@ class WorkerWireClient {
         p.encode(buf);
         link_->appendFrame(ipc::FrameKind::EndAccess, buf, sizeof(buf));
     }
-    // Phase 5b: in-band consumer Begin/End on THIS plugin wire. The plugin
+    // In-band consumer Begin/End on THIS plugin wire. The plugin
     // is the consumer for compose buffers, so consumer Begin/End ride the
     // plugin wire (inverted from sdk.gpu where consumer = core).
     void writeConsumerBeginAccess(uint32_t surfaceBufId) {

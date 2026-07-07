@@ -1,12 +1,12 @@
-// Phase-1 nested input backend.
+// Nested-mode input backend.
 //
 // Reads ipc::InputMessage events forwarded by the GPU process over the input
 // socket and emits normalized core::InputEvents. Host pointer positions are
 // surface-local wl_fixed_t (24.8); this backend converts them to OUTPUT-space
-// logical pixels. In phase 1 the output's logical size equals the host window
-// size (scale 1, no resize handling yet), so the mapping is currently identity
-// on the integer part. setOutputSize() exists so resize handling can update it
-// without touching the seam.
+// logical pixels. The output's logical size equals the host window size
+// (scale 1), so the mapping is currently identity on the integer part.
+// setOutputSize() exists so resize handling can update it without touching
+// the seam.
 //
 // Keyboard codes and modifier masks are forwarded unchanged (raw evdev / host
 // masks); keysym/modifier resolution belongs to the seat layer above.

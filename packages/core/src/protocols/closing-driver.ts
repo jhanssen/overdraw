@@ -1,4 +1,4 @@
-// Phase 9a closing driver: captures a phantom of an unmapping toplevel
+// Closing driver: captures a phantom of an unmapping toplevel
 // and arms its lifetime. Called from wl_surface's
 // unmapAndTeardownSurface BEFORE the WM/compositor teardown of the
 // original surface, so the surface's render state is still sampleable
@@ -6,7 +6,7 @@
 //
 // When no plugin claims the 'window-closing' namespace, beforeUnmap()
 // returns false and the caller proceeds with the normal instant-unmap
-// path (no phantom; same behavior as before phase 9a). When a plugin
+// path (no phantom; instant unmap). When a plugin
 // IS registered, the driver:
 //
 //   - Allocates a fresh surfaceId for the phantom.
@@ -20,7 +20,7 @@
 //
 // The plugin manipulates the phantom via the regular per-surface SDK
 // (setOpacity / setTransform / animations.run / etc.) and releases
-// it by calling sdk.windows.destroyPhantom (added in this phase).
+// it by calling sdk.windows.destroyPhantom.
 
 import type { CompositorState, SurfaceRecord } from "./ctx.js";
 import { WINDOW_EVENT } from "../events/types.js";

@@ -53,11 +53,12 @@ export interface Addon {
   // Like createGlobal, but advertises another global for `name` tagged with
   // `outputId`. Each global gets its own bind handler so multiple wl_outputs
   // (etc.) can be advertised, one per dense outputId. The interface must
-  // already be registered (registerProtocols). M6+ uses this for wl_output.
+  // already be registered (registerProtocols). Used for per-output globals
+  // such as wl_output.
   createGlobalForOutput(name: string, outputId: number, handler: unknown): void;
   // Inverse of createGlobalForOutput: tear down the per-output global so
   // clients see wl_registry.global_remove. Idempotent (a missing entry is a
-  // silent no-op). Used on output removal in M7. Callers must emit any
+  // silent no-op). Used on output removal. Callers must emit any
   // protocol-level "leave" events (wl_surface.leave, fractional-scale
   // re-emit) BEFORE this -- once the global is gone clients cannot identify
   // the wl_output the leave referenced.
@@ -69,8 +70,8 @@ export interface Addon {
   // generated `<Iface>_Error` consts); `message` is a human-readable diagnostic.
   postError(resource: Resource, code: number, message: string): void;
 
-  // Xwayland lifecycle (Phase 1: spawn a rootless Xwayland that connects to our
-  // Wayland server as a client and report when it is ready). Returns the pid
+  // Xwayland lifecycle: spawn a rootless Xwayland that connects to our
+  // Wayland server as a client and report when it is ready. Returns the pid
   // synchronously; readiness is delivered asynchronously via `onReady` once
   // Xwayland writes its display number to the -displayfd pipe (the pipe is
   // polled on the libuv loop -- a blocking wait would deadlock the Wayland
@@ -331,7 +332,7 @@ export interface Addon {
                             pdId: number, pdGen: number,
                             pluginReservePointSerial: bigint,
                             cb: (r: { surfaceBufId: number } | null) => void): void;
-  // Reverse-direction alloc (phase 5b): the core is the PRODUCER for a compose
+  // Reverse-direction alloc: the core is the PRODUCER for a compose
   // buffer, the plugin is the CONSUMER. The worker reserves its consumer-side
   // texture on the plugin wire and passes the handles; the core reserves its
   // producer-side texture (RENDER_ATTACHMENT|TEXTURE_BINDING|COPY_SRC) and
@@ -349,8 +350,8 @@ export interface Addon {
   // core does not mediate them -- see src/plugins/gpu.ts.)
   writeConsumerBegin(surfaceBufId: number): void;
   writeConsumerEnd(surfaceBufId: number): void;
-  // In-band producer Begin/End on the core wire (phase 5b, for compose
-  // buffers where the core is the producer). Inverted from plugin-overlay
+  // In-band producer Begin/End on the core wire (for compose buffers where
+  // the core is the producer). Inverted from plugin-overlay
   // surfaces where producer Begin/End ride the plugin wire.
   writeProducerBegin(surfaceBufId: number): void;
   writeProducerEnd(surfaceBufId: number): void;
@@ -366,8 +367,7 @@ export interface Addon {
   // Like injectInput, but routes through the REAL WaylandInputBackend
   // normalization (fixed-point -> output space, evdev codes) -- the layer
   // injectInput skips. Pointer x/y are logical output-space coords. Returns false
-  // if no input backend is active. Supersedes the manual input-smoke path (all
-  // but the GPU-process host-seat listener, which needs a real device).
+  // if no input backend is active.
   injectHostInput(event: InputEvent): boolean;
 
   // Freeze/unfreeze the input backend's cursor accumulator for an active
@@ -402,7 +402,7 @@ export interface Addon {
   // Passing null clears the callback. Descriptors that arrived before the
   // callback was registered (during bring-up) are drained synchronously.
   setOnOutputDescriptor(cb: ((d: OutputDescriptor) => void) | null): void;
-  // Register callbacks fired on hotplug add / remove (M7). OutputAdded
+  // Register callbacks fired on hotplug add / remove. OutputAdded
   // carries the same fields as OutputDescriptor; OutputRemoved carries only
   // outputId. Called on the Node thread; pass null to clear.
   //
@@ -431,11 +431,11 @@ export interface Addon {
       preferred: boolean;
     }>;
   }) => void) | null): void;
-  // Send a ScanoutReserve to the GPU process for a runtime-added output
-  // (M7). Called by the onOutputAdded handler. KMS only; nested/headless are
+  // Send a ScanoutReserve to the GPU process for a runtime-added output.
+  // Called by the onOutputAdded handler. KMS only; nested/headless are
   // silent no-ops.
   reserveScanoutForOutput(outputId: number, width: number, height: number): void;
-  // Drop the core-side scanout state for an outputId on removal (M7). The
+  // Drop the core-side scanout state for an outputId on removal. The
   // GPU process has already torn down its ring. KMS only; nested/headless
   // are silent no-ops.
   releaseScanoutForOutput(outputId: number): void;

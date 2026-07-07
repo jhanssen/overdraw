@@ -210,9 +210,9 @@ export function createLayoutDriver(deps: LayoutDriverDeps): LayoutDriver {
         for (const r of resolvedRects) mergedRects.push(r);
       }
 
-      // Match the pre-multi-output behavior: if EVERY managed pass failed and
-      // nothing was resolved either, suppress apply() rather than push an
-      // empty result. Otherwise apply -- partial-success is preferable to
+      // If EVERY managed pass failed and nothing was resolved either,
+      // suppress apply() rather than push an empty result. Otherwise apply
+      // -- partial-success is preferable to
       // letting one output's plugin failure freeze every other output.
       if (anyComputeFailed && mergedRects.length === 0) {
         return;

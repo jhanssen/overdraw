@@ -39,7 +39,7 @@ export interface WindowsBrokerDeps {
   // The core typed bus -- markWindowChanged consults state.bus, but the broker
   // does not emit directly through it. Kept here for symmetry/extension.
   bus: CompositorBus;
-  // Phase 9a closing driver. The destroy-phantom path needs to cancel
+  // Closing driver. The destroy-phantom path needs to cancel
   // the driver's backstop timer in addition to calling
   // compositor.destroyClosingPhantom. Optional: when absent (a
   // configuration without closing-animation support), destroy-phantom

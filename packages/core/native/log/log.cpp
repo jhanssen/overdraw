@@ -197,7 +197,7 @@ void logInit(const Config& cfg) {
         spdlog::register_logger(lg);
         r.loggers[i] = std::move(lg);
     }
-    // Preinit fallback is no longer needed.
+    // Real loggers are installed; release the preinit fallback.
     r.fallback.reset();
 }
 

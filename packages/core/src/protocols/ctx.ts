@@ -201,7 +201,7 @@ export interface SurfaceRecord {
   // Updated by updateSurfaceOutputResidency: diff the compositor's
   // surfaceOutputs(id) against this set, emit enter for each newly-overlapped
   // outputId, leave for each newly-disjoint one. The diff is the only signal
-  // a client gets about which monitor its window is on (M6).
+  // a client gets about which monitor its window is on.
   enteredOutputs?: Set<number>;
 }
 
@@ -214,9 +214,8 @@ export interface SurfaceRecord {
 // milestone": background < below < content < above < overlay). Client/plugin
 // windows live in `content` (set via setStack, which keeps owning the
 // window+subsurface+popup ordering); decorations bind to `below`/`above` of a
-// window; free overlays pick a layer. This is the smallest generalization of the
-// old single flat stack that lets "above/below content" be expressed without a
-// full layout engine.
+// window; free overlays pick a layer. Layers express "above/below content"
+// without a full layout engine.
 export type Layer = "background" | "below" | "content" | "above" | "overlay";
 export const LAYER_ORDER: readonly Layer[] =
   ["background", "below", "content", "above", "overlay"];
@@ -348,7 +347,7 @@ export interface CompositorSink {
   setSurfaceOpacity?(id: number, opacity: number): void;
   setSurfaceTransform?(id: number, t: import("../gpu/compositor.js").SurfaceTransform): void;
   setSurfaceOutputMargin?(id: number, m: import("../gpu/compositor.js").SurfaceMargin): void;
-  // Per-channel multiplier + 4x4 matrix on the sampled rgba (Phase 5.5a).
+  // Per-channel multiplier + 4x4 matrix on the sampled rgba.
   // The matrix is column-major (matching WGSL mat4x4f); null restores identity.
   setSurfaceTint?(id: number, t: import("../gpu/compositor.js").SurfaceTint): void;
   setSurfaceColorMatrix?(
@@ -480,7 +479,7 @@ export interface CompositorSink {
     region?: { x: number; y: number; w: number; h: number };
     producerSurfaceBufId?: number;
   }): void;
-  // Phase 5b-live: register a per-frame produce callback. Each renderFrame
+  // Register a per-frame produce callback. Each renderFrame
   // invokes onFrame after the on-screen composite; the callback owns its
   // own SurfaceProducer + composes a fresh frame into the next FREE ring
   // slot (skipping if all slots are busy). Returns a token used to
@@ -501,7 +500,7 @@ export interface CompositorSink {
     resolveTextures?: () => { fromTex: GPUTexture; toTex: GPUTexture } | null;
   }): void;
   clearActiveTransition?(outputId: number): void;
-  // Phase 9a: snapshot the surfaces of a closing window into a fresh
+  // Snapshot the surfaces of a closing window into a fresh
   // phantom surface entry. The phantom is a regular surface (the
   // standard per-surface setters work on it) but its texture is
   // core-owned; the lifecycle is plugin-driven (or compositor's
@@ -516,7 +515,7 @@ export interface CompositorSink {
   // from the draw order; destroys the snapshot texture. Idempotent.
   destroyClosingPhantom?(phantomSurfaceId: number): void;
 
-  // Phase 10a buffer intercept: route a surface's sampled texture
+  // Buffer intercept: route a surface's sampled texture
   // through a plugin-supplied view. The intercept broker drives this
   // each frame after invoking the plugin's render callback. Optional
   // `placement` overrides the surface's WM-assigned rect for the
@@ -525,7 +524,7 @@ export interface CompositorSink {
   installInterceptOutput?(surfaceId: number, view: GPUTextureView,
                           placement: { x: number; y: number; w: number; h: number } | null): void;
   clearInterceptOutput?(surfaceId: number): void;
-  // Phase 10a: the broker queries these per frame to drive the
+  // The broker queries these per frame to drive the
   // intercept's render callback. surfaceClientTexture returns the
   // current sampled client texture for the surface (the input the
   // plugin will read from). surfaceIsPresentable gates the per-frame
@@ -540,7 +539,7 @@ export interface CompositorSink {
   // The intercept broker compares it across ticks to set ctx.contentChanged.
   surfaceContentEpoch?(surfaceId: number): number;
   surfaceIsPresentable?(surfaceId: number): boolean;
-  // Phase 10a in-thread intercept: open a BeginAccess bracket on the
+  // In-thread intercept: open a BeginAccess bracket on the
   // surface's client dmabuf import, run `fn` (the plugin's render
   // submit which samples the client texture), close with EndAccess.
   // SHM-backed surfaces have no dmabuf import; the call passes
@@ -563,7 +562,7 @@ export interface CompositorSink {
   // output scale (the client has caught up to the configured size). Surfaced
   // to intercept gating plugins as ctx.contentReady.
   surfaceContentReady?(surfaceId: number): boolean;
-  // Phase 10a Worker intercept: copy the surface's currently-
+  // Worker intercept: copy the surface's currently-
   // committed client texture into a dmabuf the Worker plugin
   // samples. Both textures are on the core device; the dmabuf was
   // allocated via AllocComposeBuf. The copy is wrapped in producer
@@ -577,7 +576,7 @@ export interface CompositorSink {
     dstTex: GPUTexture;
   }): boolean;
 
-  // Phase 9c: software cursor slot. The cursor draws above every other
+  // Software cursor slot. The cursor draws above every other
   // layer; visibility + texture-installed gate inclusion. Install paths:
   //   setCursorPixels  -- CPU BGRA8 bytes (theme resolver output,
   //                       plugin setImage in-thread).
@@ -688,13 +687,13 @@ export interface CompositorState {
   // the focused client) or forwarded as usual. Plugins register bindings
   // via the windows broker (windows.input.* methods).
   bindingChain?: import("../input/binding-chain.js").BindingChain;
-  // Phase 9a closing driver. When wired (a 'window-closing' plugin
+  // Closing driver. When wired (a 'window-closing' plugin
   // is registered), the wl_surface unmap path consults this before
   // tearing down a mapped toplevel: if a plugin handler is present,
   // the driver snapshots the window into a phantom + emits
   // window.closing + arms a backstop timer. Absent or no-op when
   // no closing plugin is registered -- the unmap then proceeds
-  // instantly (pre-phase-9a behavior).
+  // instantly.
   closingDriver?: import("./closing-driver.js").ClosingDriver;
   // Mirror of closingDriver for the map side. Hooked from
   // wm.windowHasContent at first-content commit: if a 'window-opening'
@@ -703,7 +702,7 @@ export interface CompositorState {
   // before the first frame composites. Absent or returns false when
   // no opening plugin is registered -- the map proceeds instantly.
   openingDriver?: import("./opening-driver.js").OpeningDriver;
-  // Phase 9c: cursor kinematic state machine. Pointer motion events in
+  // Cursor kinematic state machine. Pointer motion events in
   // wl_seat feed it; the cursor rule engine reads its snapshot per frame.
   // Absent in GPU-free harnesses that don't bring up cursor support.
   cursorKinematics?: import("../cursor/kinematics.js").Kinematics;
@@ -1065,7 +1064,7 @@ export interface OutputRecord {
   make: string;
   model: string;
   // Durable identifier from EDID (mfr-product-serial). Empty when the
-  // connector has no usable EDID. The workspace plugin (M7 step 5) keys
+  // connector has no usable EDID. The workspace plugin keys
   // `preferredOutputs` on this when non-empty and falls back to `name`
   // otherwise -- see multi-output-design §3.
   edidId: string;
@@ -1238,7 +1237,7 @@ export interface SeatState {
   beginGrab(grab: PointerGrab): void;
   // End any active grab. Idempotent.
   endGrab(): void;
-  // Phase 9c: cursor state (per-pointer-resource enter serials, per-client
+  // Cursor state (per-pointer-resource enter serials, per-client
   // cursor preference). Owned by wl_seat, accessed by wl_pointer (set_cursor
   // serial validation + client preference recording) and by wl_surface
   // (cursor-role surface commit triggers a slot re-apply).

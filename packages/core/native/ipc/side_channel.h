@@ -75,10 +75,9 @@ enum class Tag : uint8_t {
     // the render/sample commands on the same wire. Retired ctrl letters
     // (do not reuse): 'A' AllocSurfaceBuf, 'a' SurfaceBufAllocated,
     // 'c' AllocComposeBuf, 'D' ReleaseSurfaceBuf, plus 'G'/'q'/'g'
-    // (Producer*) and 'V'/'k'/'v' (Consumer*) from the prior per-frame
-    // ctrl brackets. The cross-device fence dance itself is unchanged
-    // (runSurfaceBegin/runSurfaceEnd in the GPU process); only the
-    // trigger moved from ctrl to the wire.
+    // (Producer*) and 'V'/'k'/'v' (Consumer*) for the per-frame
+    // brackets. The cross-device fence dance (runSurfaceBegin/
+    // runSurfaceEnd in the GPU process) is driven by the wire frames.
     OutputDescriptor = 'O',  // gpu -> core: the output's identity + geometry. Sent
                              //   once after surface bring-up and again whenever the
                              //   GPU process detects a change (host-window resize in
@@ -147,13 +146,13 @@ enum class Tag : uint8_t {
     // ScanoutReserve rides wire created a cross-fd window. Retired
     // ctrl letters (do not reuse): 'N' OutputAdded, 'n' OutputRemoved.
     // See architecture.md "Why wire, not ctrl".
-    // ScanoutRebuild and SwitchMode now ride the WIRE socket as FrameKind
+    // ScanoutRebuild and SwitchMode ride the WIRE socket as FrameKind
     // variants (transport.h), not Tag-on-ctrl. The wire-FIFO ordering is
     // load-bearing: a SwitchMode arriving on ctrl while ProducerBegin
     // frames for the same output are still queued on wire would tear down
     // the surfaceBufs the GPU is still in the middle of accessing. See
-    // multi-output-design §10.5 and the M7 step 4 cross-fd race fix
-    // (commit 447a905). The 'B' tag letter is intentionally not reused.
+    // multi-output-design §10.5 and architecture.md "Why wire, not ctrl".
+    // The 'B' tag letter is intentionally not reused.
 };
 
 // Wire object handle {id, generation}, matching dawn::wire::Handle layout.
@@ -223,10 +222,10 @@ struct Message {
     char outputModel[64] = {};
     // Stable durable identifier derived from EDID (manufacturer + product
     // code + serial). Empty when the connector has no usable EDID. The
-    // workspace plugin (M7 step 5) keys its `preferredOutputs` list on this
+    // workspace plugin keys its `preferredOutputs` list on this
     // when present, falling back to `outputName` -- see multi-output-design
     // §3 ("Output identity model"). Fixed 64-byte NUL-terminated buffer;
-    // 64 covers `mfr3+u16+u32` plus headroom for a future format change.
+    // 64 covers `mfr3+u16+u32` with headroom to spare.
     char outputEdidId[64] = {};
 
     // Routing id of the output this message concerns, for every output-scoped
@@ -413,12 +412,11 @@ static_assert(ClientTexImportedPayload::kSize == 9,
 //
 // These ride the WIRE socket so they are FIFO-ordered with the
 // per-frame Begin/End access frames that reference the same
-// surfaceBufIds. Putting them on ctrl (as M7 step 4 originally did) is
-// unsafe: wire and ctrl are independent fds, and on a hotplug add the
-// core writes ProducerBegin on wire moments after ScanoutReserve on
-// ctrl -- the GPU process can drain wire first and abort on an
-// unregistered surfaceBufId. See multi-output-design §4 / the M7
-// step 5 follow-up.
+// surfaceBufIds. Putting them on ctrl is unsafe: wire and ctrl are
+// independent fds, and on a hotplug add the core writes ProducerBegin
+// on wire moments after ScanoutReserve on ctrl -- the GPU process can
+// drain wire first and abort on an unregistered surfaceBufId. See
+// multi-output-design §4.
 
 // ScanoutReserve payload: outputId, scanout dims, plus 3 (handleId,
 // handleGeneration, surfaceBufId) tuples. The core has already
@@ -977,7 +975,7 @@ static_assert(AllocShmTexPayload::kSize == 32,
 // memcpys the damaged bytes from the mmap'd pool into a staging
 // VkBuffer, runs copyBufferToTexture, submits, and replies with
 // ShmUploaded(uploadSeq). The core defers wl_buffer.release until
-// that reply (mirrors Hyprland's "copy then release").
+// that reply (a copy-then-release model).
 struct ShmUploadPayload {
     uint32_t surfaceId;
     uint32_t uploadSeq;

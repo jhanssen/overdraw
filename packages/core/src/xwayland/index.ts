@@ -1,8 +1,8 @@
-// Xwayland orchestrator. Phase 1 is lifecycle only: spawn a rootless Xwayland
-// that connects to our Wayland server as a client and reports the X display it
-// chose. The X11 window-manager side (xwm, surface association, selection) and
-// the `xwayland_shell_v1` global land in later phases; this module owns
-// start/stop and the resulting DISPLAY.
+// Xwayland orchestrator: spawn a rootless Xwayland that connects to our
+// Wayland server as a client and reports the X display it chose. This module
+// owns start/stop and the resulting DISPLAY; the X11 window-manager side
+// (xwm, surface association, selection) lives in the sibling modules under
+// this directory.
 //
 // All X11/xcb work is native and lives under native/xwayland/; this file only
 // drives the lifecycle through the addon binding -- no Wayland-protocol code.

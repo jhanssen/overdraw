@@ -137,8 +137,8 @@ void KmsOutputBackend::disconnectOutput(uint32_t outputId) {
     // the kernel disabled it on our behalf via udev). The next time this
     // CRTC is reused for a different connector, that connect's initial
     // ALLOW_MODESET commit fully reprograms it. If we ever support
-    // electively disabling an output while it's still physically connected
-    // (M8 \"disabled output\"), we'd want an atomic-disable commit here.
+    // electively disabling an output while it's still physically connected,
+    // we'd want an atomic-disable commit here.
     usedCrtcs_.erase(o.topo.crtcId);
     o.ring.clear();
     if (o.modeBlobId != 0 && drmFd_ >= 0) {

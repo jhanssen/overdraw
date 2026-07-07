@@ -837,7 +837,7 @@ export interface MigrationChange {
 
 // Recompute every workspace's derived live output against the current set
 // of live outputs (real connectors only -- the fallback is passed
-// separately). Implements the full M7 §10 migration policy:
+// separately). Implements the full multi-output-design §10 migration policy:
 //
 //   1. Each workspace's new home is the highest-ranked entry in its
 //      preferredOutputs that resolves to a live output (currentLiveOutput).

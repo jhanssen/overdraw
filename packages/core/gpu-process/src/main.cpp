@@ -125,10 +125,10 @@ int run(int wireFd, int ctrlFd, int inputFd, bool headless,
     LOG_INFO(Gpu, "overdraw-gpu-process up: pid={} headless={} output={}",
              ::getpid(), headless ? "yes" : "no",
              headless ? "none" : (outputKms ? "kms" : "nested"));
-    // 1) Output: in nested mode, an OutputBackend brings up the display target
-    //    (HostWindowOutputBackend in phase 1 = a host Wayland output window the
+    // 1) Output: an OutputBackend brings up the display target.
+    //    HostWindowOutputBackend (nested) = a host Wayland output window the
     //    GPU process is a client of, forwarding host pointer/keyboard over
-    //    inputFd; KmsOutputBackend in phase 2 = DRM/KMS scanout, no host).
+    //    inputFd; KmsOutputBackend = DRM/KMS scanout, no host.
     //    HEADLESS mode has no output target at all -- the core renders into an
     //    offscreen texture and reads it back (tests). The size is fixed from
     //    argv. `output` is null in headless mode.
@@ -1135,15 +1135,15 @@ int run(int wireFd, int ctrlFd, int inputFd, bool headless,
     // (ctrl, with a wire-byte serial sampled at release time): the erase must
     // wait until the wire reader has consumed past every in-band BeginAccess /
     // EndAccess frame already queued ahead of the release, otherwise a pending
-    // Begin would find the texture gone. ImportClientTex no longer rides ctrl
-    // (it's in-band kind=3 on the wire now, so naturally FIFO-ordered).
+    // Begin would find the texture gone. ImportClientTex rides in-band as
+    // kind=3 on the wire, so it is naturally FIFO-ordered and needs no barrier.
     ipc::WireBarrier coreWireBarrier;
 
     // 9) Service Dawn + the host window until the core requests shutdown or the
     //    host window is closed. The core drives the swapchain over the wire.
     bool shutdown = false;
 
-    // --- Plugin wire connections (C-M2) ---------------------------------------
+    // --- Plugin wire connections ----------------------------------------------
     // Each plugin gets its OWN wire connection (architecture.md "IPC": one
     // dawn::wire::Server per connected client). The connection's GPU-end fd is
     // delivered by the core over the side channel (AddWireConn, SCM_RIGHTS); there
@@ -1152,7 +1152,7 @@ int run(int wireFd, int ctrlFd, int inputFd, bool headless,
     // instance; the plugin's wire client (in its Worker) drives ReserveInstance/
     // RequestAdapter/RequestDevice over it, exactly as the core does on its own
     // connection. The native device is resolved lazily (server.GetDevice) when the
-    // plugin first needs server-side work (STM import, C-M4).
+    // plugin first needs server-side work (STM import).
     struct PluginConn {
         uint32_t connId = 0;
         int fd = -1;
@@ -1200,7 +1200,7 @@ int run(int wireFd, int ctrlFd, int inputFd, bool headless,
 
     // --- Producer/consumer surface buffers ------------------------------------
     // One GBM dmabuf shared between two devices: one writes (the "producer"),
-    // one reads (the "consumer"). The cross-device fence (C-M1) is applied per
+    // one reads (the "consumer"). The cross-device fence is applied per
     // frame: producer EndAccess exports a sync-fd, which the consumer BeginAccess
     // waits on (and vice versa, for the next producer cycle).
     //
@@ -1365,13 +1365,12 @@ int run(int wireFd, int ctrlFd, int inputFd, bool headless,
     };
 
     // Open a producer (write) or consumer (read) access bracket on the surface
-    // buffer, WAITING the other side's last fence (C-M1 cross-device fence,
+    // buffer, WAITING the other side's last fence (cross-device fence,
     // in-process here). The dmabuf's Vulkan layout continues from the last
     // EndAccess. Returns true iff the bracket opened (the ctrl-dispatch caller
     // turns this into a *BeginDone reply; in-band dispatch ignores the bool and
     // hard-fails on false). Mirrors runSurfaceEnd's (surfaceBufId, producer)
-    // shape so both the ctrl branch and the future kind=1 wire dispatch can call
-    // it.
+    // shape so both the ctrl branch and the kind=1 wire dispatch can call it.
     auto runSurfaceBegin = [&](uint32_t surfaceBufId, bool producer) -> bool {
         auto it = surfaceBufs.find(surfaceBufId);
         if (it == surfaceBufs.end()) {
@@ -1453,8 +1452,8 @@ int run(int wireFd, int ctrlFd, int inputFd, bool headless,
     // drains them after each plugin-wire pump. Tag scheme:
     //   - AllocSurfaceBuf / AllocComposeBuf:  tag = allocSurfaceBufTag(surfaceBufId)
     // (The tag is only used by ReleaseSurfaceBuf to cancel a pending inject whose
-    // serial may never arrive. Producer/consumer Begin/End no longer use the
-    // barrier -- they ride the wire in-band, ordered by FIFO.)
+    // serial may never arrive. Producer/consumer Begin/End ride the wire in-band,
+    // ordered by FIFO, and do not use the barrier.)
     auto allocSurfaceBufTag = [](uint32_t bufId) -> ipc::WireBarrier::Tag {
         return (static_cast<ipc::WireBarrier::Tag>(2) << 32) |
                static_cast<ipc::WireBarrier::Tag>(bufId);
@@ -1871,8 +1870,8 @@ int run(int wireFd, int ctrlFd, int inputFd, bool headless,
     //
     // Failure paths HARD-FAIL (abort): per the in-band design, "unknown texture"
     // / "bracket already open" / Dawn rejection are state-machine or JS-gate bugs,
-    // not transient races. The old ctrl path soft-failed (reply ok=0, skip the
-    // surface), which masked the bug as a silent glitch. A loud abort surfaces it.
+    // not transient races. A soft-fail (reply ok=0, skip the surface) would mask
+    // the bug as a silent glitch; a loud abort surfaces it.
     dispatchCoreControlFrame = [&](ipc::FrameKind kind, const std::vector<uint8_t>& frame,
                                    const int* fds, int nfds) {
         if (frame.empty()) {
@@ -2236,9 +2235,9 @@ int run(int wireFd, int ctrlFd, int inputFd, bool headless,
             wgpu::TextureDescriptor td{};
             td.size = {p.width, p.height, 1};
             td.format = wgpu::TextureFormat::BGRA8Unorm;
-            // Same usage shape as the JS-side `device.createTexture` used to
-            // pick: sampled + copy dst (queue.WriteTexture target) + copy src
-            // (intercepts copy the client texture into a dmabuf consumer).
+            // Usage shape for an shm-backed surface texture: sampled + copy dst
+            // (queue.WriteTexture target) + copy src (intercepts copy the client
+            // texture into a dmabuf consumer).
             td.usage = wgpu::TextureUsage::TextureBinding
                      | wgpu::TextureUsage::CopyDst
                      | wgpu::TextureUsage::CopySrc;
@@ -2262,7 +2261,7 @@ int run(int wireFd, int ctrlFd, int inputFd, bool headless,
             // Upload an shm region into a previously-AllocShmTex'd texture.
             // queue.WriteTexture runs natively in-process; no wire bulk
             // transfer. Sends ShmUploaded back so the core can release the
-            // wl_buffer to the client (Hyprland-style copy-then-release).
+            // wl_buffer to the client (copy-then-release).
             if (nfds != 0) {
                 std::fprintf(stderr,
                     "[gpu] core wire: ShmUpload with nfds=%d (must be 0)\n", nfds);
@@ -2558,8 +2557,7 @@ int run(int wireFd, int ctrlFd, int inputFd, bool headless,
     };
 
     // Drain the core wire barrier: any deferred ctrl op whose serial the wire
-    // reader has now passed runs in FIFO order. Replaces the old hand-rolled
-    // pendingImports vector + walk.
+    // reader has now passed runs in FIFO order.
     auto drainCoreBarrier = [&]() {
         coreWireBarrier.drain(wireReader.bytesConsumed());
     };
@@ -2810,7 +2808,7 @@ int run(int wireFd, int ctrlFd, int inputFd, bool headless,
     // kms->rescan() and emits per-output IPC:
     //   OutputRemoved   for every dense outputId whose connector vanished
     //   OutputAdded     for every newly-connected connector with a CRTC
-    // Card-level add/remove is logged for awareness; acting on it is M9.
+    // Card-level add/remove is logged for awareness only.
     gpu::UdevHotplugMonitor udevMon;
     if (outputKms && kms) {
         if (!udevMon.open()) {
@@ -3020,7 +3018,7 @@ int run(int wireFd, int ctrlFd, int inputFd, bool headless,
     return 0;
 }
 
-// C-M1 verification: the two-device cross-device dmabuf-STM + sync-fd-fence
+// Cross-device verification: the two-device cross-device dmabuf-STM + sync-fd-fence
 // round-trip the plugin producer/consumer primitive depends on. status.md flags
 // this exact composition ("two-device cross-device sharing ... the sync-fd is
 // produced but not waited on across a device boundary ... assumed to work,
@@ -3334,7 +3332,7 @@ int main(int argc, char** argv) {
     }
     overdraw::log::installCrashHandler("/tmp/overdraw-gpu-crash.txt",
                                        "GPU process");
-    // C-M1 verification mode: two-device cross-device dmabuf STM + fence
+    // Cross-device verification mode: two-device cross-device dmabuf STM + fence
     // round-trip. Self-contained (no fds, no core); prints XDEV: PASS/FAIL.
     if (argc >= 2 && std::strcmp(argv[1], "--selftest-xdev") == 0) {
         return selftestXDev();

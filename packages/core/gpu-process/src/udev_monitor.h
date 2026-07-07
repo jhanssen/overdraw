@@ -5,10 +5,9 @@
 // classified into one of:
 //
 //   kConnectorChange  -- a monitor was plugged/unplugged on the current card
-//                        (action=change, HOTPLUG=1). M7 acts on this.
-//   kCardAdded        -- a whole DRM card appeared (action=add). M7 logs
-//                        only; M9 (dynamic GPU) will act on it.
-//   kCardRemoved      -- a whole DRM card disappeared (action=remove). Same.
+//                        (action=change, HOTPLUG=1). Triggers a connector rescan.
+//   kCardAdded        -- a whole DRM card appeared (action=add). Logged only.
+//   kCardRemoved      -- a whole DRM card disappeared (action=remove). Logged only.
 //   kIgnore           -- anything else (LEASE events, etc.).
 //
 // The classifier is split out into a pure helper (classifyAction) so it can
@@ -36,9 +35,9 @@ namespace overdraw::gpu {
 struct UdevHotplugEvent {
     enum class Kind {
         kIgnore,
-        kConnectorChange,  // action=change + HOTPLUG=1: act on this in M7
-        kCardAdded,        // action=add: log only in M7 (M9 will pick up)
-        kCardRemoved,      // action=remove: log only in M7 (M9 will pick up)
+        kConnectorChange,  // action=change + HOTPLUG=1: triggers a rescan
+        kCardAdded,        // action=add: logged only
+        kCardRemoved,      // action=remove: logged only
     };
 
     Kind        kind             = Kind::kIgnore;

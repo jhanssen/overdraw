@@ -1,4 +1,4 @@
-// Plugin Worker-side GPU + surface SDK (C-M4 step 4c). Runs INSIDE the Worker.
+// Plugin Worker-side GPU + surface SDK. Runs INSIDE the Worker.
 // Brings up the plugin's own Dawn device over its own wire client (the core
 // brokers the side channel) and exposes:
 //   sdk.gpu                     -> the wrapped GPUDevice (dawn.node)
@@ -38,7 +38,7 @@ interface PluginAddon {
   // for the life of the worker; future use cases (e.g. surface migration)
   // that need to explicitly forget a slot would call this.
   forgetProducerReservation(clientId: number, resKey: number): void;
-  // Phase 5b: consumer-side reserve for compose buffers (the plugin is the
+  // Consumer-side reserve for compose buffers (the plugin is the
   // consumer; the core produces). Same shape as reserveProducerTexture;
   // wireSerial is forwarded to coreAllocComposeBufferW.
   reserveConsumerTexture(clientId: number, surfaceBufId: number, w: number, h: number):
@@ -46,14 +46,13 @@ interface PluginAddon {
   consumerTexture(clientId: number, surfaceBufId: number): bigint;
   forgetConsumerReservation(clientId: number, resKey: number): void;
   flush(clientId: number): void;
-  // In-band producer Begin/End on the plugin wire (replaces the core-mediated
-  // ProducerBegin ctrl round-trip / ProducerEnd WireBarrier deferral). The
+  // In-band producer Begin/End on the plugin wire. The
   // Worker writes Begin as it claims a slot (kind=1, FIFO-ordered before its
   // render commands) and End after its render submit (kind=2, after them).
   // Synchronous; appendFrame flushes staged wire bytes first.
   writeBeginAccess(clientId: number, surfaceBufId: number): void;
   writeEndAccess(clientId: number, surfaceBufId: number): void;
-  // Phase 5b: in-band consumer Begin/End on the plugin wire (compose buffers
+  // In-band consumer Begin/End on the plugin wire (compose buffers
   // where the plugin is the consumer).
   writeConsumerBegin(clientId: number, surfaceBufId: number): void;
   writeConsumerEnd(clientId: number, surfaceBufId: number): void;
@@ -199,8 +198,8 @@ export type RingMaker = (width: number, height: number, allocExtra: Record<strin
 // /`dawnPath` are absolute paths to the two native modules.
 //
 // The returned `composeDeps` is the internal handle createWorkerCompose
-// (compose-sdk.ts) needs to participate in cross-device dmabuf compose
-// (phase 5b). Not plugin-facing; consumed by the loader.
+// (compose-sdk.ts) needs to participate in cross-device dmabuf compose.
+// Not plugin-facing; consumed by the loader.
 export interface WorkerGpuInternals {
   clientId: number;
   plugin: PluginAddon;
@@ -406,7 +405,7 @@ export async function createPluginGpu(
   // no new wire/device work is issued while the Worker is torn down.
   const stop = (): void => { stopped = true; };
 
-  // Internals exposed to the loader so it can build sdk.compose (phase 5b)
+  // Internals exposed to the loader so it can build sdk.compose
   // without re-doing the device bring-up. Not plugin-facing.
   const internals: WorkerGpuInternals = {
     clientId, plugin, dawn, devHandle,

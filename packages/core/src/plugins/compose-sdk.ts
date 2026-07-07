@@ -6,11 +6,9 @@
 // compositor would draw for that window list, re-rendered on every
 // on-screen frame).
 //
-// In-thread bundled plugins only (Phase 5a): GPUTexture handles cross the
-// boundary by reference because the plugin shares core's device. Worker
-// plugins lack this path; sdk.compose is absent on their SDK by shape.
-// Phase 5b adds the Worker transport (dmabuf import onto the plugin's
-// device).
+// In-thread bundled plugins pass GPUTexture handles across the boundary
+// by reference because the plugin shares core's device. Worker plugins
+// use a dmabuf-import transport onto the plugin's own device.
 
 import type {
   LiveSceneHandle, LiveWindowCompHandle,
@@ -260,7 +258,7 @@ export function createInThreadCompose(
   };
 }
 
-// Phase 5b: Worker plugin compose deps. The Worker has its own wgpu::Device
+// Worker plugin compose deps. The Worker has its own wgpu::Device
 // (over its own wire client); the core produces a dmabuf, the plugin samples
 // it. createWorkerCompose returns a PluginCompose backed by AllocComposeBuf
 // + cross-device fence brackets (mediated through the core's gpu-broker via
@@ -300,8 +298,8 @@ export interface WorkerComposeDeps {
   hasOutput: (outputId: number) => boolean;
 }
 
-// Construct sdk.compose for a Worker plugin. Snapshot mode (phase 5b);
-// live mode raises if requested (phase 5b-live adds it).
+// Construct sdk.compose for a Worker plugin. Snapshot mode only;
+// live mode raises if requested.
 export function createWorkerCompose(deps: WorkerComposeDeps): PluginCompose {
   const { hasOutput } = deps;
   const checkOutput = makeCheckOutput(hasOutput);
@@ -321,7 +319,7 @@ export function createWorkerCompose(deps: WorkerComposeDeps): PluginCompose {
     },
 
     async windows(_args): Promise<WindowComposition> {
-      throw new Error("sdk.compose.windows: not yet implemented for Worker plugins (phase 5b)");
+      throw new Error("sdk.compose.windows: not implemented for Worker plugins");
     },
   };
 }

@@ -10,9 +10,8 @@
 //   running (progress advances) -> [tick where progress >= 1] ->
 //   commit() (sync, before resolve) -> resolve() -> idle.
 //
-// Cancel is reserved for v2 (per build-order.md and the design's "no
-// cancellation in v1" decision). install() throws synchronously if
-// another transition is already active.
+// There is no cancellation: install() throws synchronously if another
+// transition is already active.
 
 import type { EasingSpec } from "@overdraw/animation-types";
 import { resolveEasing, type EasingFn } from "../animations/easing.js";

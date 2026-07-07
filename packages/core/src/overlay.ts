@@ -3,8 +3,8 @@
 // the authoritative rect (placeOverlay, output-clamped), assigns a surface id,
 // places it in the requested stack layer, and returns the granted geometry. The
 // plugin then populates the surface's buffer ring (the producer/consumer
-// primitive) -- that allocation/render half lands in C-M4; this module owns the
-// geometry + layer registration, which is GPU-free and unit-testable.
+// primitive). This module owns the geometry + layer registration, which is
+// GPU-free and unit-testable.
 //
 // Surface ids share the compositor's monotonic id space (state.serial()) so the
 // sink's per-surface maps don't collide with wl_surface ids.
@@ -110,7 +110,7 @@ export function createOverlayBroker(state: CompositorState, output: Output): Ove
         surfaceId, layer: params.layer, rect, pluginId, outputId, req: params,
       };
       overlays.set(surfaceId, handle);
-      // Geometry to the sink now; the producer fills pixels later (C-M4).
+      // Geometry to the sink now; the producer fills pixels later.
       state.compositor.setSurfaceLayout(surfaceId, rect.x, rect.y, rect.width, rect.height);
       pushLayer(params.layer);
       return { surfaceId, layer: params.layer, rect, pluginId, outputId };

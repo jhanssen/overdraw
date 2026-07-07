@@ -212,7 +212,7 @@ napi_value Stop(napi_env env, napi_callback_info info) {
 
 // ---- XWM (X11 window manager over the -wm socket) ----
 //
-// One XWM at a time (Phase 2). The xcb fd is polled on the libuv loop; decoded
+// One XWM at a time. The xcb fd is polled on the libuv loop; decoded
 // events marshal to the JS onEvent callback. Request wrappers operate on the
 // live connection.
 

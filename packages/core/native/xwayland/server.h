@@ -31,7 +31,7 @@ struct XwaylandOptions {
     // default so a freshly-spawned server (no clients yet) stays up.
     bool terminate = false;
     // -wm: pass an X11 window-manager socket so the XWM (xcb) can manage
-    // windows. Off by default (the Phase 1 lifecycle path needs no WM).
+    // windows. Off by default (the lifecycle-only path needs no WM).
     bool enableWm = false;
     // Explicit display number to request. When >= 0, Xwayland is asked to
     // bind ":N" -- it FAILS HARD if :N is already in use (no fallback). When
