@@ -83,6 +83,18 @@ test('in-thread: init throw -> plugin enters failed state, no respawn', async ()
   });
 });
 
+test('in-thread: init that never settles -> spawn watchdog marks failed', async () => {
+  await withRuntime({ initTimeoutMs: 300 }, async (rt) => {
+    const t0 = Date.now();
+    // Without the spawn-phase watchdog this load() never resolves (the
+    // hung init can't be terminated -- it shares the main thread).
+    await rt.load([bundledEntry('init-hang.mjs')]);
+    const dt = Date.now() - t0;
+    assert.equal(rt.states()[0].state, 'failed');
+    assert.ok(dt >= 250, `settled too early (${dt}ms)`);
+  });
+});
+
 test('in-thread: graceful stop releases everything', async () => {
   await withRuntime({}, async (rt) => {
     await rt.load([bundledEntry('inthread-config.mjs', { x: 1 })]);

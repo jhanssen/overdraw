@@ -62,6 +62,26 @@ test('init reject -> failed (restart="never")', async () => {
   await rt.stop();
 });
 
+test('init that never settles -> spawn watchdog terminates -> failed (restart="never")', async () => {
+  const rt = quietRuntime({ initTimeoutMs: 300 });
+  const t0 = Date.now();
+  // Without the spawn-phase watchdog this load() never resolves.
+  await rt.load([entry('init-hang.mjs', { restart: 'never' })]);
+  const dt = Date.now() - t0;
+  assert.equal(rt.states()[0].state, 'failed');
+  assert.ok(dt >= 250, `settled too early (${dt}ms)`);
+  await rt.stop();
+});
+
+test('init that never settles + on-failure restart -> budget exhausts -> failed', async () => {
+  const rt = quietRuntime({ initTimeoutMs: 200 });
+  await rt.load([entry('init-hang.mjs', { restart: 'on-failure', maxRestarts: 1, windowSeconds: 60 })]);
+  const s = await waitFor(rt, (st) => st[0].state === 'failed', 8000);
+  assert.equal(s[0].state, 'failed');
+  assert.equal(s[0].restarts, 1);
+  await rt.stop();
+});
+
 test('module without a default init export -> failed', async () => {
   const rt = quietRuntime();
   await rt.load([entry('no-default.mjs', { restart: 'never' })]);

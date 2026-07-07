@@ -46,6 +46,11 @@ export interface RuntimeOptions {
   maxMissedPongs: number;
   // Graceful-shutdown onShutdown timeout, ms (architecture.md: 2s).
   shutdownTimeoutMs: number;
+  // Spawn-phase watchdog: how long a plugin's init may run before the
+  // runtime gives up on it, ms. The ping watchdog only arms once a plugin
+  // is live; without this bound, an init that never settles would block
+  // load() -- and compositor startup -- forever with no diagnostic.
+  initTimeoutMs: number;
   // Override the bootstrap entry (tests point at a fixture-aware bootstrap if needed).
   bootstrapPath?: string;
   // Absolute paths to the plugin Worker addon + dawn.node. When set (and the
@@ -94,6 +99,8 @@ export const DEFAULT_OPTIONS: RuntimeOptions = {
   pingIntervalMs: 1000,
   maxMissedPongs: 3,
   shutdownTimeoutMs: 2000,
+  // Generous: init may bring up a plugin GPU device over the wire.
+  initTimeoutMs: 10_000,
 };
 
 // A managed plugin: its config, current Worker generation, and lifecycle state.
@@ -111,6 +118,9 @@ class ManagedPlugin implements PluginHandle {
   private pingTimer: NodeJS.Timeout | null = null;
   private pingSeq = 0;
   private missed = 0;
+  // Spawn-phase watchdog: armed per Worker generation; fires if init has
+  // not settled (ok or fail) within opts.initTimeoutMs.
+  private initTimer: NodeJS.Timeout | null = null;
 
   // Restart bookkeeping: timestamps (ms) of restarts within the rolling window.
   private restartTimes: number[] = [];
@@ -189,10 +199,29 @@ class ManagedPlugin implements PluginHandle {
     // {ok:false, error}. That is the init-resolve/reject signal.
     worker.on("error", (err) => { this.onWorkerError(err); });
     worker.on("exit", (code) => { this.onExit(code); });
+
+    // Spawn-phase watchdog: a plugin whose init never settles would
+    // otherwise leave `ready` pending forever (load() awaits it). Treat a
+    // timed-out init like an init failure: terminate; onExit applies the
+    // restart policy and settles `ready` when the state is terminal.
+    this.clearInitTimer();
+    this.initTimer = setTimeout(() => {
+      this.initTimer = null;
+      if (this.state !== "spawning") return;
+      this.log(`[plugin ${this.cfg.name}] init did not settle within ${this.opts.initTimeoutMs}ms; terminating`);
+      this.terminating = true;
+      void this.worker?.terminate();
+    }, this.opts.initTimeoutMs);
+    this.initTimer.unref?.();
+  }
+
+  private clearInitTimer(): void {
+    if (this.initTimer) { clearTimeout(this.initTimer); this.initTimer = null; }
   }
 
   private onPluginEvent(name: string, data: unknown): void {
     if (name === "init") {
+      this.clearInitTimer();
       const d = data as { ok: boolean; error?: string };
       if (d.ok) {
         this.state = "live";
@@ -257,6 +286,7 @@ class ManagedPlugin implements PluginHandle {
   }
 
   private onExit(code: number): void {
+    this.clearInitTimer();
     this.stopWatchdog();
     this.releaseBusSubs();
     this.ns.registry().unregisterAllFor(this.cfg.name);
@@ -301,6 +331,7 @@ class ManagedPlugin implements PluginHandle {
   // then terminate. Forced shutdown (watchdog/crash) never reaches here.
   async stop(): Promise<void> {
     this.stopping = true;
+    this.clearInitTimer();
     this.stopWatchdog();
     if (!this.worker || !this.endpoint) {
       this.releaseBusSubs();
@@ -377,6 +408,7 @@ export class PluginRuntime implements PluginController {
           onRequest: this.opts.onRequest,
           bus: this.opts.bus,
           shutdownTimeoutMs: this.opts.shutdownTimeoutMs,
+          initTimeoutMs: this.opts.initTimeoutMs,
           inThreadGpu: this.opts.inThreadGpu,
           liveOutputIds: this.opts.liveOutputIds,
         }, this);

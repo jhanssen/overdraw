@@ -26,6 +26,11 @@ export interface InThreadOptions {
   onRequest?: (pluginName: string, method: string, params: unknown) => Promise<unknown> | unknown;
   bus?: DynamicBus;
   shutdownTimeoutMs: number;
+  // Spawn-phase watchdog: how long init may run before the plugin is
+  // declared failed, ms. An in-thread plugin can't be terminated (it runs
+  // on the main thread), but settling `ready` keeps a hung init from
+  // blocking compositor startup forever.
+  initTimeoutMs: number;
   // Core-device GPU bundle. When set, the in-thread plugin gets a working
   // sdk.gpu whose .device IS core's GPUDevice and whose .createOverlay
   // allocates same-device GPUTextures. Omitting it (GPU-free unit tests,
@@ -50,6 +55,7 @@ export class InThreadPlugin implements PluginHandle {
   private endpoint: Endpoint | null = null;
   private firstSettle: { resolve: () => void } | null = null;
   readonly ready: Promise<void>;
+  private initTimer: NodeJS.Timeout | null = null;
 
   // events.* surface is delegated to a BusBridge so the Worker-backed host
   // (runtime.ts) and the in-thread host stay in lockstep. The bridge reads
@@ -106,9 +112,33 @@ export class InThreadPlugin implements PluginHandle {
       // construction). Treat as a fatal startup error.
       const msg = err instanceof Error ? err.message : String(err);
       this.log(`[plugin ${this.cfg.name}] loader fatal: ${msg}`);
+      this.clearInitTimer();
       this.state = "failed";
       this.settleFirst();
     });
+
+    // Spawn-phase watchdog. An in-thread plugin's hung init can't be
+    // killed (same thread), but it must not leave `ready` pending forever:
+    // declare the plugin failed, drop its registrations, and let startup
+    // proceed. A late init event finds the endpoint closed and never
+    // arrives.
+    this.initTimer = setTimeout(() => {
+      this.initTimer = null;
+      if (this.state !== "spawning") return;
+      this.log(`[plugin ${this.cfg.name}] init did not settle within ${this.opts.initTimeoutMs}ms; marking failed`);
+      this.state = "failed";
+      this.ns.registry().unregisterAllFor(this.cfg.name);
+      this.ns.actions().unregisterAllFor(this.cfg.name);
+      this.releaseBusSubs();
+      this.endpoint?.close(`plugin ${this.cfg.name} init timed out`);
+      this.endpoint = null;
+      this.settleFirst();
+    }, this.opts.initTimeoutMs);
+    this.initTimer.unref?.();
+  }
+
+  private clearInitTimer(): void {
+    if (this.initTimer) { clearTimeout(this.initTimer); this.initTimer = null; }
   }
 
   private wireCoreEndpoint(channel: Channel): void {
@@ -122,6 +152,7 @@ export class InThreadPlugin implements PluginHandle {
 
   private onPluginEvent(name: string, data: unknown): void {
     if (name === "init") {
+      this.clearInitTimer();
       const d = data as { ok: boolean; error?: string };
       if (d.ok) {
         this.state = "live";
@@ -148,6 +179,7 @@ export class InThreadPlugin implements PluginHandle {
   private releaseBusSubs(): void { this.bridge.release(); }
 
   async stop(): Promise<void> {
+    this.clearInitTimer();
     if (!this.endpoint || this.state === "failed") {
       this.releaseBusSubs();
       this.ns.registry().unregisterAllFor(this.cfg.name);
