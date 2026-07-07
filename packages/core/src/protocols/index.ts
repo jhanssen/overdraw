@@ -652,6 +652,11 @@ export async function installProtocols(
     shortcutsInhibitMod.sweepDisconnected(ctx);
     extWorkspaceMod.sweepDisconnected();
     outputMgmtMod.sweepDisconnected();
+    pointerConstraintsMod.sweepDisconnected(ctx);
+    captureMod.sweepDisconnected();
+    // Timelines hold kernel drm_syncobj handles; sweeping also releases
+    // those, not just the map entries.
+    syncobjMod.sweepDisconnected(ctx);
     // Selection ownership: a disconnected owner's selection must be
     // relinquished (offers re-pushed as null / X claim rescinded), not
     // just leak -- see sweepDataDeviceState.

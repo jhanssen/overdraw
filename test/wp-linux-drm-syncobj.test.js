@@ -16,7 +16,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 
 import makeSyncobjManager, {
-  makeSyncobjTimeline, makeSyncobjSurface,
+  makeSyncobjTimeline, makeSyncobjSurface, sweepDisconnected,
 } from '../packages/core/dist/protocols/wp_linux_drm_syncobj_v1.js';
 
 // Build a minimal Ctx with a stub addon recording syncobj calls.
@@ -158,4 +158,49 @@ test('timeline.destroy calls addon.syncobjDestroy with the handle', () => {
   mgr.import_timeline(null, tlRes, { fd: 42 });
   tlH.destroy(tlRes);
   assert.deepEqual(calls.destroy, [100]);
+});
+
+// --- disconnect sweep ---
+
+test('sweepDisconnected releases kernel handles of destroyed timelines', () => {
+  const { ctx, state, calls } = makeCtx();
+  const mgr = makeSyncobjManager(ctx);
+  const dead = { id: 1 };
+  const live = { id: 2 };
+  mgr.import_timeline(null, dead, { fd: 40 });   // handle 100
+  mgr.import_timeline(null, live, { fd: 41 });   // handle 101
+
+  dead.destroyed = true;
+  sweepDisconnected(ctx);
+
+  assert.deepEqual(calls.destroy, [100]);
+  assert.equal(state.syncobjTimelines.has(dead), false);
+  assert.equal(state.syncobjTimelines.get(live), 101);
+});
+
+test('sweepDisconnected does not double-free a handle-0 (failed import) timeline', () => {
+  const { ctx, state, calls, addon } = makeCtx();
+  addon.syncobjImportTimeline = () => 0;
+  const mgr = makeSyncobjManager(ctx);
+  const tl = { id: 1 };
+  mgr.import_timeline(null, tl, { fd: 40 });
+  tl.destroyed = true;
+  sweepDisconnected(ctx);
+  assert.deepEqual(calls.destroy, []);
+  assert.equal(state.syncobjTimelines.has(tl), false);
+});
+
+test('sweepDisconnected drops surface associations of destroyed resources', () => {
+  const { ctx, state } = makeCtx();
+  const mgr = makeSyncobjManager(ctx);
+  const surfRes = { id: 1 };
+  addSurface(state, surfRes, 10);
+  const sync = { id: 2 };
+  mgr.get_surface(null, sync, surfRes);
+
+  sync.destroyed = true;
+  sweepDisconnected(ctx);
+
+  assert.equal(state.syncobjSurfaces.has(sync), false);
+  assert.equal(state.syncobjSurfaceBySurface.has(surfRes), false);
 });

@@ -155,6 +155,19 @@ function teardown(ctx: Ctx, resource: Resource): void {
   pc(ctx).live.delete(lock);
 }
 
+// Per-frame disconnect sweep (wired in installProtocols alongside the
+// other protocol sweeps): a client that vanished never sent the
+// destructor request, so its LockRec (and cloned Region) would live
+// forever. Deactivate + drop any record whose resource is destroyed.
+export function sweepDisconnected(ctx: Ctx): void {
+  const s = pc(ctx);
+  for (const rec of [...s.live]) {
+    if (!rec.resource.destroyed) continue;
+    deactivate(ctx, rec);
+    s.live.delete(rec);
+  }
+}
+
 // Read by wl_seat to suppress wl_pointer.motion while the pointer is locked.
 // Self-heals: a lock whose client died (resource destroyed) is deactivated so
 // the cursor unfreezes on the next motion.

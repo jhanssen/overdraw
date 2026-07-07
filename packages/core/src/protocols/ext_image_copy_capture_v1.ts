@@ -501,6 +501,19 @@ export function installImageCopyCaptureBusHooks(ctx: Ctx): void {
   }
 }
 
+// Per-frame disconnect sweep (wired in installProtocols alongside the
+// other protocol sweeps): a client that vanished never sent the destroy
+// requests, so its session/frame records would live forever in the
+// module maps.
+export function sweepDisconnected(): void {
+  for (const [r, f] of [...frames.entries()]) {
+    if (r.destroyed || f.session.resource.destroyed) frames.delete(r);
+  }
+  for (const [r] of [...sessions.entries()]) {
+    if (r.destroyed) sessions.delete(r);
+  }
+}
+
 // Test-only reset.
 export function _resetForTests(): void {
   sessions.clear();

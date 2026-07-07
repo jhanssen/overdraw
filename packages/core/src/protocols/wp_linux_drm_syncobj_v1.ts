@@ -79,6 +79,29 @@ export default function makeSyncobjManager(ctx: Ctx): WpLinuxDrmSyncobjManagerV1
   };
 }
 
+// Per-frame disconnect sweep (wired in installProtocols alongside the
+// other protocol sweeps): a client that vanished never sent the destructor
+// requests, which would leak one kernel drm_syncobj handle per imported
+// timeline plus the surface-association map entries.
+export function sweepDisconnected(ctx: Ctx): void {
+  const timelines = ctx.state.syncobjTimelines;
+  if (timelines) {
+    for (const [r, handle] of [...timelines.entries()]) {
+      if (!r.destroyed) continue;
+      if (handle !== 0) ctx.addon.syncobjDestroy(handle);
+      timelines.delete(r);
+    }
+  }
+  const surfaces = ctx.state.syncobjSurfaces;
+  if (surfaces) {
+    for (const [r, surface] of [...surfaces.entries()]) {
+      if (!r.destroyed && !surface.destroyed) continue;
+      surfaces.delete(r);
+      ctx.state.syncobjSurfaceBySurface?.delete(surface);
+    }
+  }
+}
+
 export function makeSyncobjTimeline(ctx: Ctx): WpLinuxDrmSyncobjTimelineV1Handler {
   return {
     destroy(resource) {

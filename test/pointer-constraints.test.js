@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 
 import makePointerConstraints, {
   makeLockedPointer, makeConfinedPointer, isPointerLocked,
-  notifyPointerFocus, notifyPointerMotion,
+  notifyPointerFocus, notifyPointerMotion, sweepDisconnected,
 } from "../packages/core/dist/protocols/zwp_pointer_constraints_v1.js";
 import { Region } from "../packages/core/dist/protocols/region.js";
 
@@ -177,4 +177,35 @@ test("lock_pointer on an unknown surface is a no-op", () => {
   makePointerConstraints(ctx).lock_pointer(NORES, {}, {}, NORES, null, 2);
   assert.deepEqual(calls.setPointerLocked, []);
   assert.equal(isPointerLocked(ctx), false);
+});
+
+// --- disconnect sweep ---
+
+test("sweepDisconnected deactivates + drops a lock whose client vanished", () => {
+  const { ctx, calls, surfaces } = mkCtx({ focusSurfaceId: 5 });
+  const surface = surfaceWithId(surfaces, 5);
+  const locked = {};
+  makePointerConstraints(ctx).lock_pointer(NORES, locked, surface, NORES, null, 2);
+  assert.equal(isPointerLocked(ctx), true);
+
+  // Client disconnected: no destructor request ran, only the flag flips.
+  locked.destroyed = true;
+  sweepDisconnected(ctx);
+
+  assert.equal(isPointerLocked(ctx), false);
+  assert.deepEqual(calls.setPointerLocked, [true, false]);
+  // The dropped record no longer blocks a new constraint on the same
+  // surface + pointer (already_constrained must not fire).
+  const locked2 = {};
+  makePointerConstraints(ctx).lock_pointer(NORES, locked2, surface, NORES, null, 2);
+  assert.equal(calls.errors.length, 0);
+  assert.equal(isPointerLocked(ctx), true);
+});
+
+test("sweepDisconnected leaves live constraints alone", () => {
+  const { ctx, surfaces } = mkCtx({ focusSurfaceId: 5 });
+  const surface = surfaceWithId(surfaces, 5);
+  makePointerConstraints(ctx).lock_pointer(NORES, {}, surface, NORES, null, 2);
+  sweepDisconnected(ctx);
+  assert.equal(isPointerLocked(ctx), true);
 });
