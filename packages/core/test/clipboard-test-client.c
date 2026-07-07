@@ -68,7 +68,10 @@ static void srcSend(void* d, struct wl_data_source* s, const char* mime, int32_t
     (void)d;(void)s;(void)mime;
     if (g_text) {
         ssize_t n = write(fd, g_text, strlen(g_text));
-        (void)n;
+        if (n < 0) fprintf(stderr, "[clipboard-client] send write failed: %s (fd=%d)\n",
+                           strerror(errno), fd);
+        else if ((size_t)n != strlen(g_text))
+            fprintf(stderr, "[clipboard-client] short send write: %zd\n", n);
     } else if (g_bytes > 0) {
         // Write the deterministic pattern in chunks. The receive side (or
         // bridge incoming-INCR pump) handles arbitrary chunking.
@@ -213,6 +216,18 @@ static void mapWindow(struct wl_display* display) {
     wl_display_roundtrip(display);
 }
 
+// Non-blocking display pump: read whatever arrived and dispatch it.
+// wl_display_dispatch() BLOCKS when the queue drains, which deadlocks a
+// client whose next wakeup is a pipe (not a display event).
+static int pump_display(struct wl_display* d) {
+    while (wl_display_prepare_read(d) != 0)
+        if (wl_display_dispatch_pending(d) < 0) return -1;
+    wl_display_flush(d);
+    if (wl_display_read_events(d) < 0) return -1;
+    if (wl_display_dispatch_pending(d) < 0) return -1;
+    return 0;
+}
+
 int main(int argc, char** argv) {
     const char* socket = NULL;
     int source_mode = 0, receive_mode = 0, primary = 0;
@@ -298,7 +313,7 @@ int main(int argc, char** argv) {
             wl_display_flush(display);
             struct pollfd pfd = { wlfd, POLLIN, 0 };
             if (poll(&pfd, 1, 10) > 0 && (pfd.revents & POLLIN))
-                if (wl_display_dispatch(display) < 0) break;
+                if (pump_display(display) < 0) break;
         }
         wl_display_disconnect(display);
         return 0;
@@ -313,7 +328,7 @@ int main(int argc, char** argv) {
         wl_display_flush(display);
         struct pollfd pfd = { wlfd, POLLIN, 0 };
         if (poll(&pfd, 1, 10) > 0 && (pfd.revents & POLLIN))
-            if (wl_display_dispatch(display) < 0) break;
+            if (pump_display(display) < 0) break;
     }
     if (!HAVE_OFFER()) {
         fprintf(stderr, "[clipboard-client] no matching selection offer (selection=%d mime=%d)\n",
@@ -338,8 +353,8 @@ int main(int argc, char** argv) {
             struct pollfd pfd[2] = { { pipefd[0], POLLIN, 0 }, { wlfd, POLLIN, 0 } };
             int r = poll(pfd, 2, 2000);
             if (r <= 0) { break; }
-            if (pfd[1].revents & POLLIN) wl_display_dispatch(display);
-            if (pfd[0].revents & POLLIN) {
+            if (pfd[1].revents & (POLLIN | POLLERR | POLLHUP)) { if (pump_display(display) < 0) break; }
+            if (pfd[0].revents & (POLLIN | POLLHUP | POLLERR)) {
                 ssize_t n = read(pipefd[0], buf, sizeof(buf));
                 if (n < 0) { if (errno == EINTR) continue; break; }
                 if (n == 0) { received_done = 1; break; }
@@ -360,8 +375,8 @@ int main(int argc, char** argv) {
         struct pollfd pfd[2] = { { pipefd[0], POLLIN, 0 }, { wlfd, POLLIN, 0 } };
         int r = poll(pfd, 2, 1000);
         if (r <= 0) break;
-        if (pfd[1].revents & POLLIN) wl_display_dispatch(display);
-        if (pfd[0].revents & POLLIN) {
+        if (pfd[1].revents & (POLLIN | POLLERR | POLLHUP)) { if (pump_display(display) < 0) break; }
+        if (pfd[0].revents & (POLLIN | POLLHUP | POLLERR)) {
             ssize_t n = read(pipefd[0], received + off, sizeof(received) - 1 - off);
             if (n < 0) { if (errno == EINTR) continue; break; }
             if (n == 0) { received_done = 1; break; } // EOF: source closed

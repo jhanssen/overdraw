@@ -95,6 +95,7 @@ const GLOBALS = [
   "ext_workspace_manager_v1",
   "xwayland_shell_v1",
   "ext_data_control_manager_v1",
+  "zwlr_data_control_manager_v1",
   "wp_presentation",
   "ext_foreign_toplevel_list_v1",
   "ext_output_image_capture_source_manager_v1",
@@ -140,6 +141,9 @@ const CHILD_INTERFACES = [
   "ext_data_control_device_v1",
   "ext_data_control_source_v1",
   "ext_data_control_offer_v1",
+  "zwlr_data_control_device_v1",
+  "zwlr_data_control_source_v1",
+  "zwlr_data_control_offer_v1",
   "wp_presentation_feedback",
   "ext_foreign_toplevel_handle_v1",
   "ext_image_capture_source_v1",
@@ -855,6 +859,7 @@ export async function installProtocols(
     ext_workspace_manager_v1: await import("./ext_workspace_v1.js"),
     xwayland_shell_v1: await import("./xwayland_shell_v1.js"),
     ext_data_control_manager_v1: await import("./ext_data_control_v1.js"),
+    zwlr_data_control_manager_v1: await import("./zwlr_data_control_v1.js"),
     wp_presentation: await import("./wp_presentation.js"),
     ext_foreign_toplevel_list_v1: await import("./ext_foreign_toplevel_list_v1.js"),
     ext_output_image_capture_source_manager_v1: await import("./ext_image_copy_capture_v1.js"),
@@ -928,6 +933,11 @@ export async function installProtocols(
     ext_data_control_device_v1: extDataControlMod.makeExtDataControlDevice(ctx),
     ext_data_control_source_v1: extDataControlMod.makeExtDataControlSource(ctx),
     ext_data_control_offer_v1: extDataControlMod.makeExtDataControlOffer(ctx),
+    // zwlr data-control children share the ext handlers (family dispatch
+    // by interface name inside the shared module).
+    zwlr_data_control_device_v1: extDataControlMod.makeExtDataControlDevice(ctx),
+    zwlr_data_control_source_v1: extDataControlMod.makeExtDataControlSource(ctx),
+    zwlr_data_control_offer_v1: extDataControlMod.makeExtDataControlOffer(ctx),
     // wp_presentation_feedback has no requests (event-only); the protocol layer
     // still needs a handler-shaped object to register.
     wp_presentation_feedback: {},

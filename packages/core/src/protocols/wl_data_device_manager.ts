@@ -400,28 +400,25 @@ export function makeDataOffer(ctx: Ctx): WlDataOfferHandler {
       }
     },
     receive(resource, mimeType, fd: WaylandFd) {
-      // X-backed offers (an X client owns the clipboard): hand a duped fd
-      // to the selection bridge so it survives libwayland closing the
-      // demarshalled request fd after this dispatch returns. The bridge
-      // owns the int fd; release the original wrapper.
+      // X-backed offers (an X client owns the clipboard): the dispatcher
+      // owns the request fd; transfer it to the selection bridge, which
+      // closes it after the X transfer completes.
       const xKind = xBackedOffer.get(resource);
       if (xKind && ctx.state.receiveForXSource) {
-        const owned = fd.dup().takeRawFd();
-        fd.takeRawFd();
-        ctx.state.receiveForXSource(xKind, mimeType, owned);
+        ctx.state.receiveForXSource(xKind, mimeType, fd.takeRawFd());
         return;
       }
-      // Wl-client source path. send_send queues a WIRE EVENT that transfers
-      // the fd when the connection next flushes -- AFTER this dispatch
-      // returns, by which point libwayland has closed the demarshalled
-      // request fd. So forward an independent dup (the wire owns + closes
-      // it) and release the original from its wrapper so its finalizer
-      // doesn't double-close the fd libwayland already owns.
+      // Wl-client source path. send_send takes a dup (libwayland owns it
+      // once the event is queued); our request fd must be CLOSED here --
+      // the dispatcher owns it and nothing else will close it. A
+      // merely-taken fd would hold the receiver's pipe write-end open
+      // forever, so the reading client never sees EOF after the source
+      // finishes writing.
       const source = offerToSource.get(resource);
       if (source && !source.destroyed) {
         ctx.events.wl_data_source.send_send(source, mimeType, fd.dup());
       }
-      fd.takeRawFd();
+      fd.close();
     },
     destroy(resource) {
       offerToSource.delete(resource);
@@ -497,18 +494,16 @@ export function makePrimaryOffer(ctx: Ctx): ZwpPrimarySelectionOfferV1Handler {
     receive(resource, mimeType, fd: WaylandFd) {
       const xKind = xBackedOffer.get(resource);
       if (xKind && ctx.state.receiveForXSource) {
-        const owned = fd.dup().takeRawFd();
-        fd.takeRawFd();
-        ctx.state.receiveForXSource(xKind, mimeType, owned);
+        ctx.state.receiveForXSource(xKind, mimeType, fd.takeRawFd());
         return;
       }
-      // See the wl_data_offer.receive forward above: dup for the async wire
-      // transfer, release the original (libwayland closes the request fd).
+      // See the wl_data_offer.receive forward above: dup for send_send,
+      // then CLOSE our request fd so the receiver sees EOF.
       const source = primaryOfferToSource.get(resource);
       if (source && !source.destroyed) {
         ctx.events.zwp_primary_selection_source_v1.send_send(source, mimeType, fd.dup());
       }
-      fd.takeRawFd();
+      fd.close();
     },
     destroy(resource) { primaryOfferToSource.delete(resource); },
   };

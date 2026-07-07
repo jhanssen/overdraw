@@ -52,8 +52,12 @@ export interface WaylandFd {
   takeRawFd(): number;
   close(): void;
   // An independent dup of this fd in a fresh WaylandFd; this wrapper is left
-  // intact. For forwarding a request fd onto an async wire event (the original
-  // is closed by libwayland when the dispatch returns).
+  // intact. For forwarding a request fd onto an async wire event while the
+  // handler keeps (and eventually close()s) the original. The dispatcher owns
+  // request fds: libwayland does NOT close them after dispatch, so a handler
+  // must close() or transfer every fd it receives -- a merely-taken fd stays
+  // open in the compositor forever (e.g. a pipe write-end whose reader then
+  // never sees EOF).
   dup(): WaylandFd;
 }
 `;
@@ -83,6 +87,12 @@ const DEFAULT_INPUTS = [
   '/usr/share/wayland-protocols/unstable/keyboard-shortcuts-inhibit/keyboard-shortcuts-inhibit-unstable-v1.xml',
   // wlr-* protocols are not in wayland-protocols upstream; vendor copies.
   join(repoRoot, 'protocols', 'wlr-layer-shell-unstable-v1.xml'),
+  // Legacy data-control: wl-clipboard <= 2.2.1 and older clipboard
+  // managers bind only this variant, not ext-data-control. Without it
+  // wl-copy falls back to mapping an invisible toplevel to grab focus,
+  // which a tiler reflows around. Served by the shared data-control
+  // handler alongside the ext family.
+  join(repoRoot, 'protocols', 'wlr-data-control-unstable-v1.xml'),
   join(repoRoot, 'protocols', 'wlr-foreign-toplevel-management-unstable-v1.xml'),
   join(repoRoot, 'protocols', 'wlr-output-management-unstable-v1.xml'),
   join(repoRoot, 'protocols', 'wlr-virtual-pointer-unstable-v1.xml'),

@@ -72,9 +72,10 @@ napi_value jsClose(napi_env env, napi_callback_info info) {
 }
 
 // dup(): return a NEW WaylandFd owning an independent F_DUPFD_CLOEXEC copy of
-// this fd, leaving this wrapper untouched. For forwarding a request fd onto an
-// async wire event: libwayland closes the demarshalled request fd when the
-// dispatch returns, so the copy that outlives dispatch must be one we own.
+// this fd, leaving this wrapper untouched. For forwarding a request fd onto
+// an async wire event while the handler keeps (and eventually close()s) the
+// original. Request fds are handler-owned: libwayland does NOT close them
+// after dispatch (see trampoline.cpp 'h' demarshal).
 napi_value jsDup(napi_env env, napi_callback_info info) {
     napi_value self;
     napi_get_cb_info(env, info, nullptr, nullptr, &self, nullptr);

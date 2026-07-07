@@ -307,6 +307,15 @@ target_include_directories(ext-data-control-client PRIVATE
     ${CMAKE_SOURCE_DIR}/native/wayland/generated)
 target_link_libraries(ext-data-control-client PRIVATE ${WAYLAND_CLIENT_LIBRARIES})
 
+# ---- zwlr-data-control test client (legacy data-control family) ----
+add_executable(zwlr-data-control-client
+    test/zwlr-data-control-client.c
+    native/wayland/generated/wlr-data-control-unstable-v1-protocol.c)
+target_include_directories(zwlr-data-control-client PRIVATE
+    ${WAYLAND_CLIENT_INCLUDE_DIRS}
+    ${CMAKE_SOURCE_DIR}/native/wayland/generated)
+target_link_libraries(zwlr-data-control-client PRIVATE ${WAYLAND_CLIENT_LIBRARIES})
+
 # ---- wp_presentation test client ----
 add_executable(wp-presentation-client
     test/wp-presentation-client.c

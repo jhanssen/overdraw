@@ -1,7 +1,16 @@
-// ext_data_control_v1: clipboard + primary-selection control for clients
-// that bypass keyboard focus. Used by wl-clipboard (wl-copy / wl-paste),
+// Data-control: clipboard + primary-selection control for clients that
+// bypass keyboard focus. Used by wl-clipboard (wl-copy / wl-paste),
 // clipboard managers, and scripted automation -- anything that needs to
 // read or set the current selection without holding wl_keyboard focus.
+//
+// This module serves BOTH wire families: ext_data_control_v1 and the
+// legacy zwlr_data_control_v1 (wl-clipboard <= 2.2.1 and older clipboard
+// managers bind only the latter; without it wl-copy maps an invisible
+// toplevel to grab focus, which a tiler reflows around). The two
+// protocols are request/event-identical for everything here; senders are
+// picked per resource by interface name. One divergence: zwlr's
+// primary_selection is since-version 2, so primary pushes to a v1 zwlr
+// device are skipped.
 //
 // Differences vs. wl_data_device_manager:
 //   - Per-client device receives BOTH selections (clipboard + primary).
@@ -57,6 +66,23 @@ import type { ExtDataControlOfferV1Handler }
 const offerToWlSource = new WeakMap<Resource, Resource>();
 const offerXBacked = new WeakMap<Resource, "clipboard" | "primary">();
 
+// Family dispatch: the ext and zwlr sender objects have the same call
+// shapes for everything this handler emits, so call sites work against
+// the inferred union.
+function isZwlr(resource: Resource): boolean {
+  return resource.interfaceName.startsWith("zwlr_");
+}
+function deviceEvents(ctx: Ctx, device: Resource) {
+  return isZwlr(device)
+    ? ctx.events.zwlr_data_control_device_v1
+    : ctx.events.ext_data_control_device_v1;
+}
+function offerEventsFor(ctx: Ctx, device: Resource) {
+  return isZwlr(device)
+    ? ctx.events.zwlr_data_control_offer_v1
+    : ctx.events.ext_data_control_offer_v1;
+}
+
 // Devices we've bound, keyed by client id. We re-push on every
 // selection.changed; closing a device drops it from the set.
 function devicesFor(ctx: Ctx, clientId: number): Set<Resource> {
@@ -68,46 +94,49 @@ function devicesFor(ctx: Ctx, clientId: number): Set<Resource> {
 
 function pushClipboardTo(ctx: Ctx, device: Resource): void {
   if (device.destroyed) return;
+  const dev = deviceEvents(ctx, device);
   const wlSource = ctx.state.selection ?? null;
   const xSource = ctx.state.xClipboardSource ?? null;
   if (!wlSource && !xSource) {
-    ctx.events.ext_data_control_device_v1.send_selection(device, null);
+    dev.send_selection(device, null);
     return;
   }
   const mimes = wlSource
     ? (ctx.state.dataSources?.get(wlSource)?.mimes ?? [])
     : (xSource ? xSource.mimes : []);
-  const offer = ctx.events.ext_data_control_device_v1
-    .send_data_offer(device, null) as Resource;
+  const offer = dev.send_data_offer(device, null) as Resource;
   if (!offer) return;
   if (wlSource) offerToWlSource.set(offer, wlSource);
   else offerXBacked.set(offer, "clipboard");
   for (const mime of mimes) {
-    ctx.events.ext_data_control_offer_v1.send_offer(offer, mime);
+    offerEventsFor(ctx, device).send_offer(offer, mime);
   }
-  ctx.events.ext_data_control_device_v1.send_selection(device, offer);
+  dev.send_selection(device, offer);
 }
 
 function pushPrimaryTo(ctx: Ctx, device: Resource): void {
   if (device.destroyed) return;
+  // zwlr: primary_selection is since-version 2; a v1 binding must not
+  // receive it (event-version client-abort).
+  if (isZwlr(device) && device.version < 2) return;
+  const dev = deviceEvents(ctx, device);
   const wlSource = ctx.state.primarySelection ?? null;
   const xSource = ctx.state.xPrimarySource ?? null;
   if (!wlSource && !xSource) {
-    ctx.events.ext_data_control_device_v1.send_primary_selection(device, null);
+    dev.send_primary_selection(device, null);
     return;
   }
   const mimes = wlSource
     ? (ctx.state.primarySources?.get(wlSource)?.mimes ?? [])
     : (xSource ? xSource.mimes : []);
-  const offer = ctx.events.ext_data_control_device_v1
-    .send_data_offer(device, null) as Resource;
+  const offer = dev.send_data_offer(device, null) as Resource;
   if (!offer) return;
   if (wlSource) offerToWlSource.set(offer, wlSource);
   else offerXBacked.set(offer, "primary");
   for (const mime of mimes) {
-    ctx.events.ext_data_control_offer_v1.send_offer(offer, mime);
+    offerEventsFor(ctx, device).send_offer(offer, mime);
   }
-  ctx.events.ext_data_control_device_v1.send_primary_selection(device, offer);
+  dev.send_primary_selection(device, offer);
 }
 
 function pushBothTo(ctx: Ctx, device: Resource): void {
@@ -282,25 +311,28 @@ export function makeExtDataControlOffer(ctx: Ctx): ExtDataControlOfferV1Handler 
   return {
     receive(resource, mimeType, fd: WaylandFd) {
       // X-backed offer: route to the selection bridge (same path the
-      // wl_data_offer.receive forward uses).
+      // wl_data_offer.receive forward uses). The dispatcher owns the
+      // request fd; transfer it to the bridge, which closes it.
       const xKind = offerXBacked.get(resource);
       if (xKind && ctx.state.receiveForXSource) {
-        const owned = fd.dup().takeRawFd();
-        fd.takeRawFd();
-        ctx.state.receiveForXSource(xKind, mimeType, owned);
+        ctx.state.receiveForXSource(xKind, mimeType, fd.takeRawFd());
         return;
       }
-      // Wl-source path. send_send transfers the fd on the next flush
-      // (after this dispatch returns), so dup for the async wire send
-      // and release the request fd that libwayland already owns.
+      // Wl-source path. send_send takes a dup (libwayland owns it once the
+      // event is queued); our request fd must be CLOSED here -- the
+      // dispatcher owns it and nothing else will close it. A merely-taken
+      // fd would hold the receiver's pipe write-end open forever, so the
+      // reading client never sees EOF.
       const source = offerToWlSource.get(resource);
-      if (!source || source.destroyed) { fd.takeRawFd(); return; }
-      // The source is either a wl_data_source or an ext_data_control_source_v1.
-      // Both have a `send` event carrying (mime, fd) at opcode 0; we
-      // dispatch to whichever the source resource is registered against.
-      const isExt = isExtSource(ctx, source);
-      if (isExt) {
+      if (!source || source.destroyed) { fd.close(); return; }
+      // The source is a wl_data_source, an ext_data_control_source_v1, or
+      // a zwlr_data_control_source_v1. All have a `send` event carrying
+      // (mime, fd); dispatch to whichever family the source resource is
+      // registered against.
+      if (source.interfaceName === "ext_data_control_source_v1") {
         ctx.events.ext_data_control_source_v1.send_send(source, mimeType, fd.dup());
+      } else if (source.interfaceName === "zwlr_data_control_source_v1") {
+        ctx.events.zwlr_data_control_source_v1.send_send(source, mimeType, fd.dup());
       } else {
         // wl_data_source.send_send for clipboard sources and
         // zwp_primary_selection_source_v1.send_send for primary sources;
@@ -311,19 +343,11 @@ export function makeExtDataControlOffer(ctx: Ctx): ExtDataControlOfferV1Handler 
           ctx.events.zwp_primary_selection_source_v1.send_send(source, mimeType, fd.dup());
         }
       }
-      fd.takeRawFd();
+      fd.close();
     },
     destroy(resource) {
       offerToWlSource.delete(resource);
       offerXBacked.delete(resource);
     },
   };
-}
-
-// True iff `source` is an ext_data_control_source_v1 (rather than a
-// wl_data_source or zwp_primary_selection_source_v1). We check the
-// resource's interface name to decide which `send_send` event family
-// to dispatch.
-function isExtSource(_ctx: Ctx, source: Resource): boolean {
-  return source.interfaceName === "ext_data_control_source_v1";
 }

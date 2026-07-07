@@ -573,6 +573,12 @@ hotplug device add/remove.
 
 ## Client buffers
 
+Selection receive fds are handler-owned and closed after the send
+forward (libwayland does not close request fds after dispatch). The
+receiver's pipe therefore sees EOF once the source finishes -- an
+EOF-dependent paste reader (real wl-paste) completes instead of
+hanging on a leaked write-end.
+
 ### shm (verified)
 
 ARGB8888/XRGB8888 advertised; `wl_shm_pool` maps the fd;
@@ -731,9 +737,13 @@ type-check under `tsc --strict`.
   `wp_linux_drm_syncobj_v1` (NVIDIA proprietary clients),
   `wp_viewporter`/`wp_viewport`, `wp_fractional_scale_manager_v1`/
   `wp_fractional_scale_v1`, `wp_cursor_shape_v1`,
-  `ext_data_control_manager_v1` (clipboard + primary selection control
-  for unfocused clients; tested end-to-end via the
-  `ext-data-control-client` test client),
+  `ext_data_control_manager_v1` + legacy `zwlr_data_control_manager_v1`
+  (clipboard + primary selection control for unfocused clients; both
+  families served by one handler with per-resource dispatch -- the zwlr
+  name is what wl-clipboard <= 2.2.1 binds, and without it wl-copy maps
+  an invisible toplevel for focus that a tiler reflows around; tested
+  end-to-end via the `ext-data-control-client` and
+  `zwlr-data-control-client` test clients),
   `wp_presentation` / `wp_presentation_feedback` (per-commit scanout
   timestamps for video apps; CLOCK_MONOTONIC; supersession on the
   next commit per spec; tested end-to-end),
