@@ -22,7 +22,7 @@ import { detachSurfaceRole } from "./wl_surface.js";
 // PopupRecord-aware variant `popupOutputOrigin` is preferred for callers that
 // have the popup record; this raw-XdgSurfaceRecord variant exists for the
 // xdg-popup recursion and stays narrow to that case.
-export function parentOutputOrigin(state: CompositorState, parent: XdgSurfaceRecord | null): { x: number; y: number } | null {
+function parentOutputOrigin(state: CompositorState, parent: XdgSurfaceRecord | null): { x: number; y: number } | null {
   if (!parent) return null;
   if (parent.role === "toplevel" && parent.surface) {
     const surface = parent.surface;

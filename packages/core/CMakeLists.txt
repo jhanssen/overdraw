@@ -261,15 +261,6 @@ add_executable(shm-disconnect-client test/shm-disconnect-client.c)
 target_include_directories(shm-disconnect-client PRIVATE ${WAYLAND_CLIENT_INCLUDE_DIRS})
 target_link_libraries(shm-disconnect-client PRIVATE ${WAYLAND_CLIENT_LIBRARIES})
 
-# ---- shm test client (shm buffer upload + composite) ----
-add_executable(shm-test-client
-    test/shm-test-client.c
-    native/wayland/generated/xdg-shell-protocol.c)
-target_include_directories(shm-test-client PRIVATE
-    ${WAYLAND_CLIENT_INCLUDE_DIRS}
-    ${CMAKE_SOURCE_DIR}/native/wayland/generated)
-target_link_libraries(shm-test-client PRIVATE ${WAYLAND_CLIENT_LIBRARIES})
-
 # ---- harness client (controllable shm window for integration tests) ----
 add_executable(harness-client
     test/harness-client.c

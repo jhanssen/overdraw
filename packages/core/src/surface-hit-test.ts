@@ -25,6 +25,7 @@
 import type { Resource } from "./types.js";
 import type { CompositorState, SurfaceRecord } from "./protocols/ctx.js";
 import { childrenOf } from "./subsurfaces.js";
+import { logicalContentSize } from "./surface-geometry.js";
 
 export interface SurfaceHit {
   // The surface that accepted the hit (root or any descendant).
@@ -50,13 +51,8 @@ function surfaceLogicalSize(
   if (!buf) return null;
   const desc = state.buffers?.get(buf);
   if (!desc || desc.width <= 0 || desc.height <= 0) return null;
-  const scale = s.committed.bufferScale ?? 1;
-  // buffer_transform values 1, 3, 5, 7 are 90/270 rotations and swap dims.
-  const t = s.committed.bufferTransform ?? 0;
-  const rotated = t === 1 || t === 3 || t === 5 || t === 7;
-  const bw = rotated ? desc.height : desc.width;
-  const bh = rotated ? desc.width : desc.height;
-  return { w: bw / scale, h: bh / scale };
+  return logicalContentSize(desc.width, desc.height,
+    s.committed.bufferScale ?? 1, s.committed.bufferTransform ?? 0, null);
 }
 
 // True iff `region` accepts the surface-local point (lx, ly). The

@@ -419,6 +419,7 @@ fn sampleClamped(t : texture_2d<f32>, uv : vec2f) -> vec4f {
 import type { CompositorSink, Layer } from "../protocols/ctx.js";
 import { LAYER_ORDER, OUTPUT_DEFAULT } from "../protocols/ctx.js";
 import { OutputDamageMap } from "./output-damage-map.js";
+import { logicalContentSize } from "../surface-geometry.js";
 import type { TransitionKind } from "@overdraw/transition-types";
 import type { Addon, WaylandFd } from "../types.js";
 import { log } from "../log.js";
@@ -2600,15 +2601,10 @@ export class JsCompositor implements CompositorSink {
   // answer for surfaces with no WM-assigned layout rect -- a subsurface's
   // layoutW/H is 0 (the "content-sized" sentinel from setSurfaceLayout), so
   // readers must resolve the real size through here rather than trusting
-  // layoutW/H. (surface-hit-test.ts has the same computation over the protocol
-  // SurfaceRecord -- a different type, so it can't share this method.)
+  // layoutW/H.
   private logicalSizeOf(s: Surface): { w: number; h: number } {
-    const vd = s.viewportDst;
-    if (vd && vd.width > 0 && vd.height > 0) return { w: vd.width, h: vd.height };
-    const bs = s.bufferScale || 1;
-    const t = s.bufferTransform ?? 0;
-    const rot = t === 1 || t === 3 || t === 5 || t === 7;
-    return { w: (rot ? s.height : s.width) / bs, h: (rot ? s.width : s.height) / bs };
+    return logicalContentSize(s.width, s.height, s.bufferScale || 1,
+      s.bufferTransform ?? 0, s.viewportDst);
   }
 
   // Public by-id variant for the intercept broker: the plugin tick maps the
@@ -3658,13 +3654,7 @@ export class JsCompositor implements CompositorSink {
     // active transform (e.g. the open-slide animation) needs a full repaint
     // because the rect moves under the transform, so fall back to damageFull
     // there.
-    const fx = s.fx;
-    const transformed = fx.translateX !== 0 || fx.translateY !== 0
-      || fx.scaleX !== 1 || fx.scaleY !== 1
-      || fx.marginTop !== 0 || fx.marginRight !== 0
-      || fx.marginBottom !== 0 || fx.marginLeft !== 0
-      || s.maskView !== null;
-    if (placement && !transformed) {
+    if (placement && !this.fxDrawsOutsideLayout(s)) {
       this.addOutputDamage(placement.x, placement.y, placement.w, placement.h);
     } else {
       this.damageFull();
