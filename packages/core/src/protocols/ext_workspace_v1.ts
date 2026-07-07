@@ -128,6 +128,26 @@ interface ManagerState {
 // Module-local registry. Mirrors the zwlr_foreign_toplevel_manager pattern:
 // living outside CompositorState avoids polluting every other handler.
 const managers = new Set<ManagerState>();
+
+// A manager whose client disconnected without stop() never ran the stop
+// handler: its resource is destroyed but the ManagerState lingers. Minting
+// an event on the dead resource returns undefined (which would poison
+// handleOwners.set), so treat destroyed as stopped and drop the state on
+// sight.
+function managerLive(mgr: ManagerState): boolean {
+  if (mgr.resource.destroyed) { managers.delete(mgr); return false; }
+  return mgr.active;
+}
+
+// Per-frame disconnect sweep (wired in installProtocols alongside the
+// other protocol sweeps): frees manager state whose client vanished
+// without stop(), even when no workspace/output event fires.
+export function sweepDisconnected(): void {
+  for (const mgr of managers) {
+    if (mgr.resource.destroyed) managers.delete(mgr);
+  }
+}
+
 const handleOwners = new WeakMap<Resource, {
   manager: ManagerState;
   kind: "group" | "workspace";
@@ -198,6 +218,9 @@ function emitGroupCreate(ctx: Ctx, mgr: ManagerState, outputId: number): void {
   if (mgr.groups.has(outputId)) return;
   const groupRes = ctx.events.ext_workspace_manager_v1
     .send_workspace_group(mgr.resource, null) as ExtWorkspaceGroupHandleV1Resource;
+  // Minting on a dead manager resource yields undefined; never let that
+  // poison the handle maps.
+  if (!groupRes) return;
   mgr.groups.set(outputId, groupRes);
   handleOwners.set(groupRes, { manager: mgr, kind: "group", outputId });
   ctx.events.ext_workspace_group_handle_v1.send_capabilities(
@@ -231,6 +254,7 @@ function emitWorkspaceCreate(ctx: Ctx, mgr: ManagerState, ws: WorkspaceInfo): vo
   if (mgr.handles.has(ws.workspaceId)) return;
   const wsRes = ctx.events.ext_workspace_manager_v1
     .send_workspace(mgr.resource, null) as ExtWorkspaceHandleV1Resource;
+  if (!wsRes) return;
   mgr.handles.set(ws.workspaceId, wsRes);
   handleOwners.set(wsRes, { manager: mgr, kind: "workspace", workspaceId: ws.workspaceId });
 
@@ -312,7 +336,7 @@ function emitWorkspaceName(ctx: Ctx, mgr: ManagerState, ws: WorkspaceInfo): void
 // model.
 function broadcastDone(ctx: Ctx): void {
   for (const mgr of managers) {
-    if (!mgr.active) continue;
+    if (!managerLive(mgr)) continue;
     if (mgr.batching) continue;
     ctx.events.ext_workspace_manager_v1.send_done(mgr.resource);
   }
@@ -403,7 +427,7 @@ export function installExtWorkspaceBusHooks(ctx: Ctx): void {
     if (liveOutputs.has(p.outputId)) return;
     liveOutputs.add(p.outputId);
     for (const mgr of managers) {
-      if (!mgr.active) continue;
+      if (!managerLive(mgr)) continue;
       emitGroupCreate(ctx, mgr, p.outputId);
     }
     broadcastDone(ctx);
@@ -420,7 +444,7 @@ export function installExtWorkspaceBusHooks(ctx: Ctx): void {
     liveOutputs.delete(p.outputId);
     shownByOutput.delete(p.outputId);
     for (const mgr of managers) {
-      if (!mgr.active) continue;
+      if (!managerLive(mgr)) continue;
       emitGroupRemove(ctx, mgr, p.outputId);
     }
     broadcastDone(ctx);
@@ -442,12 +466,12 @@ export function installExtWorkspaceBusHooks(ctx: Ctx): void {
     if (!liveOutputs.has(p.outputId)) {
       liveOutputs.add(p.outputId);
       for (const mgr of managers) {
-        if (!mgr.active) continue;
+        if (!managerLive(mgr)) continue;
         emitGroupCreate(ctx, mgr, p.outputId);
       }
     }
     for (const mgr of managers) {
-      if (!mgr.active) continue;
+      if (!managerLive(mgr)) continue;
       emitWorkspaceCreate(ctx, mgr, info);
     }
     broadcastDone(ctx);
@@ -458,7 +482,7 @@ export function installExtWorkspaceBusHooks(ctx: Ctx): void {
     if (!p) return;
     workspacesCache.delete(p.handle);
     for (const mgr of managers) {
-      if (!mgr.active) continue;
+      if (!managerLive(mgr)) continue;
       emitWorkspaceRemove(ctx, mgr, p.handle, p.outputId);
     }
     broadcastDone(ctx);
@@ -473,7 +497,7 @@ export function installExtWorkspaceBusHooks(ctx: Ctx): void {
     const info = workspacesCache.get(p.handle);
     if (info) info.index = p.index;
     for (const mgr of managers) {
-      if (!mgr.active) continue;
+      if (!managerLive(mgr)) continue;
       if (prev !== undefined && prev !== p.handle) {
         const prevInfo = workspacesCache.get(prev);
         if (prevInfo) emitWorkspaceState(ctx, mgr, prevInfo);
@@ -504,7 +528,7 @@ export function installExtWorkspaceBusHooks(ctx: Ctx): void {
     if (p.name !== undefined) info.name = p.name;
     else delete info.name;
     for (const mgr of managers) {
-      if (!mgr.active) continue;
+      if (!managerLive(mgr)) continue;
       emitWorkspaceName(ctx, mgr, info);
     }
     broadcastDone(ctx);
@@ -518,7 +542,7 @@ export function installExtWorkspaceBusHooks(ctx: Ctx): void {
       if (info) info.index = c.newIndex;
     }
     for (const mgr of managers) {
-      if (!mgr.active) continue;
+      if (!managerLive(mgr)) continue;
       for (const c of p.changes) {
         const info = workspacesCache.get(c.handle);
         if (info) emitWorkspaceCoordinates(ctx, mgr, info);
@@ -534,7 +558,7 @@ export function installExtWorkspaceBusHooks(ctx: Ctx): void {
     if (!info) return;
     info.urgent = p.urgent;
     for (const mgr of managers) {
-      if (!mgr.active) continue;
+      if (!managerLive(mgr)) continue;
       emitWorkspaceState(ctx, mgr, info);
     }
     broadcastDone(ctx);

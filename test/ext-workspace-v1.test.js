@@ -11,6 +11,7 @@ import makeManager, {
   makeExtWorkspaceGroupHandle,
   makeExtWorkspaceHandle,
   installExtWorkspaceBusHooks,
+  sweepDisconnected,
   _resetForTests,
 } from "../packages/core/dist/protocols/ext_workspace_v1.js";
 
@@ -703,4 +704,45 @@ test("no workspaceDriver: activate/remove/create enqueue but commit drains to no
   // Driver is absent; the batch drain bails before dispatching. No done
   // is emitted (no state changed because no apply happened).
   assert.equal(ctx.sent.filter(([k]) => k === "manager_done").length, 0);
+});
+
+// ---- disconnect without stop() -------------------------------------------
+
+test("a manager destroyed without stop() is skipped and pruned on the next bus event", () => {
+  const ctx = mockCtx();
+  ctx.addWlOutput(0);
+  installExtWorkspaceBusHooks(ctx);
+  const mgrRes = mockResource("ext_workspace_manager_v1");
+  makeManager(ctx).bind(mgrRes);
+
+  // Client disconnected: no stop request ran, only the destroyed flag flips.
+  mgrRes.destroyed = true;
+  ctx.sent.length = 0;
+
+  // Must not throw (a mint on the dead resource would return undefined and
+  // WeakMap.set(undefined) would TypeError inside the bus subscriber).
+  ctx.state.pluginBus.emit("workspace.created",
+    { handle: 7, outputId: 0, index: 1, name: "one" });
+  assert.equal(ctx.sent.length, 0);
+
+  // A manager bound afterwards still works.
+  const mgr2 = mockResource("ext_workspace_manager_v1");
+  makeManager(ctx).bind(mgr2);
+  ctx.sent.length = 0;
+  ctx.state.pluginBus.emit("workspace.created",
+    { handle: 8, outputId: 0, index: 2, name: "two" });
+  assert.ok(ctx.sent.find(([k]) => k === "workspace"));
+});
+
+test("sweepDisconnected drops destroyed managers with no bus event needed", () => {
+  const ctx = mockCtx();
+  installExtWorkspaceBusHooks(ctx);
+  const mgrRes = mockResource("ext_workspace_manager_v1");
+  makeManager(ctx).bind(mgrRes);
+  mgrRes.destroyed = true;
+  sweepDisconnected();
+  // After the sweep, a bus event emits nothing for the dead manager.
+  ctx.sent.length = 0;
+  ctx.state.pluginBus.emit("output.added", { outputId: 3 });
+  assert.equal(ctx.sent.filter(([k]) => k === "workspace_group").length, 0);
 });

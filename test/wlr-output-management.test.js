@@ -20,6 +20,7 @@ import makeManager, {
   makeOutputConfiguration,
   makeOutputConfigurationHead,
   installOutputManagerBusHooks,
+  sweepDisconnected,
   _resetForTests,
 } from "../packages/core/dist/protocols/zwlr_output_manager_v1.js";
 
@@ -750,4 +751,42 @@ test("a destroyed mode resource is never selected as current_mode (disconnect ca
   ctx.state.pluginBus.emit("output.changed", { outputId: 0 });
 
   assert.equal(ctx.state._sent.filter(([k]) => k === "head.current_mode").length, 0);
+});
+
+test("a manager destroyed without stop() is skipped and pruned on hotplug events", () => {
+  const ctx = mockCtx([makeOutput(0)]);
+  const mgr = makeManager(ctx);
+  const mgrRes = mockResource("zwlr_output_manager_v1");
+  mgr.bind(mgrRes);
+  installOutputManagerBusHooks(ctx);
+
+  // Client disconnected: no stop request ran, only the destroyed flag flips.
+  mgrRes.destroyed = true;
+  ctx.state._sent.length = 0;
+
+  // Must not throw (a head mint on the dead resource returns undefined and
+  // WeakMap.set(undefined) would TypeError inside the bus subscriber).
+  ctx.state.outputs.set(1, makeOutput(1));
+  ctx.state.pluginBus.emit("output.added", { outputId: 1 });
+  assert.equal(ctx.state._sent.length, 0);
+
+  // A manager bound afterwards still works.
+  const mgr2Res = mockResource("zwlr_output_manager_v1");
+  mgr.bind(mgr2Res);
+  ctx.state._sent.length = 0;
+  ctx.state.pluginBus.emit("output.changed", { outputId: 0 });
+  assert.ok(ctx.state._sent.find(([k]) => k === "head.position"));
+});
+
+test("sweepDisconnected drops destroyed managers with no bus event needed", () => {
+  const ctx = mockCtx([makeOutput(0)]);
+  const mgr = makeManager(ctx);
+  const mgrRes = mockResource("zwlr_output_manager_v1");
+  mgr.bind(mgrRes);
+  installOutputManagerBusHooks(ctx);
+  mgrRes.destroyed = true;
+  sweepDisconnected();
+  ctx.state._sent.length = 0;
+  ctx.state.pluginBus.emit("output.changed", { outputId: 0 });
+  assert.equal(ctx.state._sent.length, 0);
 });

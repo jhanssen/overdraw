@@ -650,6 +650,12 @@ export async function installProtocols(
     extForeignTopMod.sweepDisconnected();
     xdgForeignMod.sweepDisconnected(ctx);
     shortcutsInhibitMod.sweepDisconnected(ctx);
+    extWorkspaceMod.sweepDisconnected();
+    outputMgmtMod.sweepDisconnected();
+    // Selection ownership: a disconnected owner's selection must be
+    // relinquished (offers re-pushed as null / X claim rescinded), not
+    // just leak -- see sweepDataDeviceState.
+    ddmMod.sweepDataDeviceState(ctx);
 
     // Same disconnect case for wl_buffers: a client that drops without
     // wl_buffer.destroy leaves its descriptor in state.buffers. A dmabuf

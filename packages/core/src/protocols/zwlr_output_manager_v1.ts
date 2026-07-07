@@ -196,8 +196,11 @@ function fixedToDouble(v: number): number {
 function emitOneMode(
   ctx: Ctx, mgr: ManagerState, outputId: number, headRes: Resource,
   width: number, height: number, refreshMhz: number, preferred: boolean,
-): ModeEntry {
+): ModeEntry | null {
   const modeRes = ctx.events.zwlr_output_head_v1.send_mode(headRes, null) as Resource;
+  // Minting on a dead head resource yields undefined; never let that
+  // poison the owner maps.
+  if (!modeRes) return null;
   modeOwners.set(modeRes, { manager: mgr, outputId });
   ctx.events.zwlr_output_mode_v1.send_size(modeRes, width, height);
   if (refreshMhz > 0) {
@@ -244,8 +247,9 @@ function findCurrentMode(rec: OutputRecord, modes: ModeEntry[]): ModeEntry | nul
   return null;
 }
 
-function emitHeadInitial(ctx: Ctx, mgr: ManagerState, rec: OutputRecord): HeadEntry {
+function emitHeadInitial(ctx: Ctx, mgr: ManagerState, rec: OutputRecord): HeadEntry | null {
   const headRes = ctx.events.zwlr_output_manager_v1.send_head(mgr.resource, null) as Resource;
+  if (!headRes) return null;
 
   const entry: HeadEntry = {
     head: headRes,
@@ -275,8 +279,9 @@ function emitHeadInitial(ctx: Ctx, mgr: ManagerState, rec: OutputRecord): HeadEn
   // zwlr_output_mode_v1 object; static events (size/refresh/preferred)
   // fire once per object.
   for (const m of buildModeList(rec)) {
-    entry.modes.push(emitOneMode(ctx, mgr, rec.id, headRes,
-      m.width, m.height, m.refreshMhz, m.preferred));
+    const me = emitOneMode(ctx, mgr, rec.id, headRes,
+      m.width, m.height, m.refreshMhz, m.preferred);
+    if (me) entry.modes.push(me);
   }
   entry.currentModeRes = findCurrentMode(rec, entry.modes)?.resource ?? null;
 
@@ -339,10 +344,29 @@ function finishHead(ctx: Ctx, mgr: ManagerState, outputId: number): void {
   mgr.heads.delete(outputId);
 }
 
+// A manager whose client disconnected without stop() never ran the stop
+// handler: its resource is destroyed but the ManagerState lingers. Minting
+// a head/mode on the dead resource returns undefined (which would poison
+// headOwners/modeOwners), so treat destroyed as stopped and drop the
+// state on sight.
+function managerLive(mgr: ManagerState): boolean {
+  if (mgr.resource.destroyed) { managers.delete(mgr); return false; }
+  return mgr.active;
+}
+
+// Per-frame disconnect sweep (wired in installProtocols alongside the
+// other protocol sweeps): frees manager state whose client vanished
+// without stop(), even when no output event fires.
+export function sweepDisconnected(): void {
+  for (const mgr of managers) {
+    if (mgr.resource.destroyed) managers.delete(mgr);
+  }
+}
+
 function bumpSerialAndAnnounce(ctx: Ctx): void {
   currentSerial = (currentSerial + 1) >>> 0;
   for (const mgr of managers) {
-    if (!mgr.active) continue;
+    if (!managerLive(mgr)) continue;
     ctx.events.zwlr_output_manager_v1.send_done(mgr.resource, currentSerial);
   }
 }
@@ -361,7 +385,7 @@ export function installOutputManagerBusHooks(ctx: Ctx): void {
     const rec = ctx.state.outputs?.get(p.outputId);
     if (!rec) return;
     for (const mgr of managers) {
-      if (!mgr.active) continue;
+      if (!managerLive(mgr)) continue;
       emitHeadInitial(ctx, mgr, rec);
     }
     bumpSerialAndAnnounce(ctx);
@@ -371,7 +395,7 @@ export function installOutputManagerBusHooks(ctx: Ctx): void {
     const p = payload as { outputId?: number } | undefined;
     if (!p || typeof p.outputId !== "number") return;
     for (const mgr of managers) {
-      if (!mgr.active) continue;
+      if (!managerLive(mgr)) continue;
       finishHead(ctx, mgr, p.outputId);
     }
     bumpSerialAndAnnounce(ctx);
@@ -389,7 +413,7 @@ export function installOutputManagerBusHooks(ctx: Ctx): void {
     const rec = ctx.state.outputs?.get(p.outputId);
     if (!rec) return;
     for (const mgr of managers) {
-      if (!mgr.active) continue;
+      if (!managerLive(mgr)) continue;
       const entry = mgr.heads.get(p.outputId);
       if (!entry) continue;
       // Finish the old mode objects.
@@ -400,8 +424,9 @@ export function installOutputManagerBusHooks(ctx: Ctx): void {
       entry.modes = [];
       // Re-advertise from the new list.
       for (const m of buildModeList(rec)) {
-        entry.modes.push(emitOneMode(ctx, mgr, rec.id, entry.head,
-          m.width, m.height, m.refreshMhz, m.preferred));
+        const me = emitOneMode(ctx, mgr, rec.id, entry.head,
+          m.width, m.height, m.refreshMhz, m.preferred);
+        if (me) entry.modes.push(me);
       }
       entry.currentModeRes = findCurrentMode(rec, entry.modes)?.resource ?? null;
       if (entry.currentModeRes !== null) {
@@ -418,7 +443,7 @@ export function installOutputManagerBusHooks(ctx: Ctx): void {
     const p = payload as { outputId?: number } | undefined;
     let any = false;
     for (const mgr of managers) {
-      if (!mgr.active) continue;
+      if (!managerLive(mgr)) continue;
       if (p && typeof p.outputId === "number") {
         const entry = mgr.heads.get(p.outputId);
         const rec = ctx.state.outputs?.get(p.outputId);

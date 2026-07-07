@@ -281,6 +281,50 @@ function sendPrimaryTo(ctx: Ctx, clientId: number): void {
   }
 }
 
+// The owner of a selection slot is gone (its source was destroyed
+// explicitly, or its client disconnected and the per-frame sweep noticed).
+// Clear the slot, rescind the X-side claim via the Xwayland selection
+// bridge, broadcast to data-control observers, and re-push to the
+// keyboard-focused client so it drops the now-dangling offer (falling back
+// to an X-backed source when one exists).
+export function selectionOwnerGone(ctx: Ctx, kind: "clipboard" | "primary"): void {
+  const focusClient = ctx.state.seat?.kbFocus?.clientId;
+  if (kind === "clipboard") {
+    ctx.state.selection = null;
+    ctx.state.onWlSelectionChanged?.("clipboard", null, "data");
+    ctx.state.bus?.emit(SELECTION_EVENT.changed, { kind: "clipboard" });
+    if (focusClient != null) sendSelectionTo(ctx, focusClient);
+  } else {
+    ctx.state.primarySelection = null;
+    ctx.state.onWlSelectionChanged?.("primary", null, "primary");
+    ctx.state.bus?.emit(SELECTION_EVENT.changed, { kind: "primary" });
+    if (focusClient != null) sendPrimaryTo(ctx, focusClient);
+  }
+}
+
+// Per-frame disconnect sweep (wired in installProtocols alongside the
+// other protocol sweeps). A client that vanished ran none of the destroy
+// handlers, so a selection it owned would stay claimed forever: every
+// paste would EOF instantly and the X bridge would keep a phantom owner.
+// Run the same owner-gone path as an explicit source destroy, and drop
+// source records / device registrations keyed to destroyed resources.
+export function sweepDataDeviceState(ctx: Ctx): void {
+  if (ctx.state.selection?.destroyed) selectionOwnerGone(ctx, "clipboard");
+  if (ctx.state.primarySelection?.destroyed) selectionOwnerGone(ctx, "primary");
+  for (const m of [ctx.state.dataSources, ctx.state.primarySources]) {
+    if (!m) continue;
+    for (const r of [...m.keys()]) if (r.destroyed) m.delete(r);
+  }
+  for (const m of [ctx.state.dataDevices, ctx.state.primaryDevices,
+                   ctx.state.dataControlDevices]) {
+    if (!m) continue;
+    for (const [cid, set] of [...m.entries()]) {
+      for (const r of [...set]) if (r.destroyed) set.delete(r);
+      if (set.size === 0) m.delete(cid);
+    }
+  }
+}
+
 export default function makeDataDeviceManager(ctx: Ctx): WlDataDeviceManagerHandler {
   // Expose the per-client push helpers so sibling protocol modules
   // (ext_data_control) can re-fan a selection change to the keyboard-
@@ -362,7 +406,14 @@ export function makeDataDevice(ctx: Ctx): WlDataDeviceHandler {
         sendSelectionTo(ctx, own);
       }
     },
-    release(_resource) {},
+    release(resource) {
+      const clientId = ctx.addon.clientId(resource);
+      const set = ctx.state.dataDevices?.get(clientId);
+      if (set) {
+        set.delete(resource);
+        if (set.size === 0) ctx.state.dataDevices?.delete(clientId);
+      }
+    },
   };
 }
 
@@ -374,10 +425,7 @@ export function makeDataSource(ctx: Ctx): WlDataSourceHandler {
     },
     destroy(resource) {
       ctx.state.dataSources?.delete(resource);
-      if (ctx.state.selection === resource) {
-        ctx.state.selection = null;
-        ctx.state.bus?.emit(SELECTION_EVENT.changed, { kind: "clipboard" });
-      }
+      if (ctx.state.selection === resource) selectionOwnerGone(ctx, "clipboard");
     },
     set_actions(resource, dndActions) {
       // Source declares the DnD actions it supports (copy/move/ask).
@@ -469,7 +517,14 @@ export function makePrimaryDevice(ctx: Ctx): ZwpPrimarySelectionDeviceV1Handler 
       if (focusClient != null) sendPrimaryTo(ctx, focusClient);
       else sendPrimaryTo(ctx, ctx.addon.clientId(resource));
     },
-    destroy(_resource) {},
+    destroy(resource) {
+      const clientId = ctx.addon.clientId(resource);
+      const set = ctx.state.primaryDevices?.get(clientId);
+      if (set) {
+        set.delete(resource);
+        if (set.size === 0) ctx.state.primaryDevices?.delete(clientId);
+      }
+    },
   };
 }
 
@@ -481,10 +536,7 @@ export function makePrimarySource(ctx: Ctx): ZwpPrimarySelectionSourceV1Handler 
     },
     destroy(resource) {
       ctx.state.primarySources?.delete(resource);
-      if (ctx.state.primarySelection === resource) {
-        ctx.state.primarySelection = null;
-        ctx.state.bus?.emit(SELECTION_EVENT.changed, { kind: "primary" });
-      }
+      if (ctx.state.primarySelection === resource) selectionOwnerGone(ctx, "primary");
     },
   };
 }

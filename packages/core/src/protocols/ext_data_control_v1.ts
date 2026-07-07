@@ -38,7 +38,7 @@
 import type { Resource, WaylandFd } from "../types.js";
 import type { Ctx } from "./ctx.js";
 import { SELECTION_EVENT } from "../events/window-bus.js";
-import { cancelDisplacedSource } from "./wl_data_device_manager.js";
+import { cancelDisplacedSource, selectionOwnerGone } from "./wl_data_device_manager.js";
 
 import type { ExtDataControlManagerV1Handler }
   from "#protocols-gen/ext_data_control_manager_v1.js";
@@ -295,14 +295,8 @@ export function makeExtDataControlSource(ctx: Ctx): ExtDataControlSourceV1Handle
       const wasPrimary = ctx.state.primarySelection === resource;
       ctx.state.dataSources?.delete(resource);
       ctx.state.primarySources?.delete(resource);
-      if (wasClipboard) {
-        ctx.state.selection = null;
-        ctx.state.bus?.emit(SELECTION_EVENT.changed, { kind: "clipboard" });
-      }
-      if (wasPrimary) {
-        ctx.state.primarySelection = null;
-        ctx.state.bus?.emit(SELECTION_EVENT.changed, { kind: "primary" });
-      }
+      if (wasClipboard) selectionOwnerGone(ctx, "clipboard");
+      if (wasPrimary) selectionOwnerGone(ctx, "primary");
     },
   };
 }

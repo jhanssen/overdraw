@@ -37,6 +37,7 @@ import type { CompositorState } from "../protocols/ctx.js";
 import type { Addon, Resource } from "../types.js";
 import type { Xwm, XwmEventMsg } from "./xwm.js";
 import { SELECTION_EVENT } from "../events/window-bus.js";
+import { log } from "../log.js";
 
 // 64 KiB. Above this, outgoing transfers switch to INCR.
 const INCR_CHUNK_SIZE = 64 * 1024;
@@ -515,15 +516,25 @@ export function startSelectionBridge(
     protocol: "data" | "primary",
   ): void {
     const sel = sels[kind];
+    // The XWM connection can die out from under us (Xwayland crash)
+    // before anything uninstalls this hook; the wayland-side selection
+    // must keep working, so a failed X-side claim/rescind is logged and
+    // swallowed rather than thrown into the selection handlers.
+    const setOwner = (owner: number, ts: number): void => {
+      try { addon.xwmSetSelectionOwner(sel.selectionAtom, owner, ts); }
+      catch (e) {
+        log.warn("core", `x selection owner update failed: ${(e as Error).message}`);
+      }
+    };
     if (source !== null) {
       sel.wlSource = source;
       sel.wlSourceProtocol = protocol;
-      addon.xwmSetSelectionOwner(sel.selectionAtom, sel.ownerWindow, 0);
+      setOwner(sel.ownerWindow, 0);
       return;
     }
     // Release.
     if (sel.wlSource !== null) {
-      addon.xwmSetSelectionOwner(sel.selectionAtom, 0, sel.ownerTimestamp);
+      setOwner(0, sel.ownerTimestamp);
       sel.wlSource = null;
       sel.wlSourceProtocol = null;
     }
@@ -547,7 +558,12 @@ export function startSelectionBridge(
       addon.xwmSendSelectionNotify(requestor, sel.selectionAtom, target, property, timestamp);
       return;
     }
-    if (sel.wlSource === null || sel.xOwner !== sel.ownerWindow) {
+    // wlSource.destroyed covers the window between the source resource
+    // dying (client disconnect) and the per-frame sweep's owner-gone
+    // notification landing here: a send_send to it would be dropped and
+    // the requestor's transfer would hang instead of being refused.
+    if (sel.wlSource === null || sel.wlSource.destroyed
+        || sel.xOwner !== sel.ownerWindow) {
       refuse(requestor, sel.selectionAtom, target, timestamp);
       return;
     }
@@ -946,18 +962,32 @@ export function startSelectionBridge(
       xwm.setSelectionHook(null, null);
       state.xClipboardSource = null;
       state.xPrimarySource = null;
+      // Uninstall the wl-side hooks: after the XWM is gone, a selection
+      // change (including the disconnect sweep relinquishing a dead
+      // owner's selection) must not call into addon.xwm* -- those throw
+      // once the XWM connection is down.
+      if (state.onWlSelectionChanged === onWlSelectionChangedImpl) {
+        state.onWlSelectionChanged = undefined;
+      }
+      if (state.receiveForXSource === receiveForXSourceImpl) {
+        state.receiveForXSource = undefined;
+      }
     },
     onWlSelectionChanged: onWlSelectionChangedImpl,
-    receiveForXSource(kind, mime, fd) {
-      const sel = sels[kind];
-      if (!sel.xSource) return false;
-      // The X-side source might have advertised a MIME not in our cache.
-      // mimes is the canonical list; trust the wl-side to only call us for
-      // a MIME we advertised.
-      sel.xSource.receive(mime, fd);
-      return true;
-    },
+    receiveForXSource: receiveForXSourceImpl,
   };
+
+  function receiveForXSourceImpl(
+    kind: SelectionKind, mime: string, fd: number,
+  ): boolean {
+    const sel = sels[kind];
+    if (!sel.xSource) return false;
+    // The X-side source might have advertised a MIME not in our cache.
+    // mimes is the canonical list; trust the wl-side to only call us for
+    // a MIME we advertised.
+    sel.xSource.receive(mime, fd);
+    return true;
+  }
 }
 
 function fsCloseSafe(fd: number): void {
