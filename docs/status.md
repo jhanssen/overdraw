@@ -800,7 +800,10 @@ active; failure demotes).
   `window.change.activated`).
 - `@overdraw/plugin-hotkey-default` (namespace `'hotkey'`):
   binding chain (chord + mode) driven by `config.hotkeys`.
-- `@overdraw/plugin-core-actions`: `compositor.quit`.
+- `@overdraw/plugin-core-actions`: `compositor.quit`,
+  `xwayland.restart` (respawn the Xwayland stack without restarting
+  the compositor; `overdrawctl restart-xwayland`), plus `spawn`,
+  `window.*`, `focus.*`, `layout.*`, `output.switch-mode`.
 - `@overdraw/plugin-config-actions`: user-defined action handlers
   from `config.actions`.
 - `@overdraw/plugin-cursor-actions`: `cursor.set-shape`,

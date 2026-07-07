@@ -23,7 +23,8 @@ import {
 } from "../ipc/protocol.js";
 
 type Args = {
-  command: "invoke" | "list-actions" | "subscribe" | "switch-mode" | "help";
+  command: "invoke" | "list-actions" | "subscribe" | "switch-mode"
+    | "restart-xwayland" | "help";
   socket?: string;
   action?: string;
   pattern?: string;
@@ -58,6 +59,10 @@ Commands:
                                   invoke output.switch-mode
                                     '{"output":NAME,"width":W,"height":H,
                                       "refreshMhz":RATE*1000}'
+  restart-xwayland              Restart the Xwayland stack (process + WM +
+                                selection bridge) without restarting the
+                                compositor. Kills running X11 clients.
+                                Equivalent to: invoke xwayland.restart
   -h, --help                    Show this help.
 
 Socket discovery (highest priority first):
@@ -107,6 +112,9 @@ async function main(): Promise<void> {
         ...(args.modeRefreshMhz !== undefined && args.modeRefreshMhz > 0
             ? { refreshMhz: args.modeRefreshMhz } : {}),
       });
+      return;
+    case "restart-xwayland":
+      await runInvoke(sock, "xwayland.restart", null);
       return;
   }
 }
@@ -167,6 +175,7 @@ function parseArgs(argv: string[]): Args {
     return { command: "invoke", socket, action, actionArgs };
   }
   if (cmd === "list-actions") return { command: "list-actions", socket };
+  if (cmd === "restart-xwayland") return { command: "restart-xwayland", socket };
   if (cmd === "subscribe") {
     if (positional.length < 2) die("subscribe requires a pattern");
     return { command: "subscribe", socket, pattern: positional[1] };

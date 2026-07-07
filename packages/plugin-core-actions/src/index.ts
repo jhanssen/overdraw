@@ -286,6 +286,19 @@ export default async function init(sdk: PluginSdkShape): Promise<void> {
     },
   });
 
+  sdk.actions.register({
+    name: "xwayland.restart",
+    description: "Restart the Xwayland stack (Xwayland process + X window " +
+      "manager + selection bridge) without restarting the compositor. Any " +
+      "running X11 clients are killed. No-op when Xwayland is disabled in " +
+      "config. Emits 'xwayland.restart-requested'; the launcher tears down " +
+      "and respawns.",
+    handler: async (): Promise<null> => {
+      sdk.events.emit("xwayland.restart-requested", {});
+      return null;
+    },
+  });
+
   sdk.log("core-actions registered");
 }
 

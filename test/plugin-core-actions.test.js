@@ -132,3 +132,13 @@ test('output.switch-mode rejects missing / invalid params', async () => {
   await assert.rejects(() => switchMode({ output: 'DP-1', width: 1920, height: 1080, refreshMhz: 1.5 }),
     /refreshMhz/);
 });
+
+test('xwayland.restart emits xwayland.restart-requested', async () => {
+  const { sdk, handlers, emitted } = makeSdk();
+  await init(sdk);
+  const restart = handlers.get('xwayland.restart');
+  assert.ok(restart, 'xwayland.restart action registered');
+  const result = await restart();
+  assert.equal(result, null);
+  assert.deepEqual(emitted.at(-1), ['xwayland.restart-requested', {}]);
+});

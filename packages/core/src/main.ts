@@ -609,60 +609,128 @@ pluginBus.subscribe("output.changed", (_name, payload) => {
 log.info("core", `Wayland server listening.`);
 log.info("core", `run a client with:  WAYLAND_DISPLAY=${sock} <your-client>`);
 
-// Rootless XWayland. Spawned only when config.xwayland.enabled is true.
-// startXwayland resolves once Xwayland reports its X display via -displayfd
-// (gated on an explicit displayNumber -- autopick is rejected upstream); the
-// XWM then connects xcb to the -wm socketpair and pumps X events on the
-// libuv loop. The shutdown path reaps both.
-if (config.xwayland.enabled) {
+// Rootless XWayland lifecycle. The stack is three coupled pieces: the
+// Xwayland process (startXwayland resolves once it reports its X display
+// via -displayfd -- gated on an explicit displayNumber, autopick is
+// rejected upstream), the X window manager pumping xcb on the -wm
+// socketpair, and the CLIPBOARD/PRIMARY selection bridge. Brought up once
+// at boot when enabled, and restartable at runtime (the xwayland.restart
+// action / `overdrawctl restart-xwayland`) so a crashed or wedged Xwayland
+// can be recovered without restarting the whole compositor. The shutdown
+// path reaps whatever is up.
+
+// Tear down the current Xwayland stack. Teardown order mirrors shutdown():
+// drop the selection bridge (it watches the wmFd the reap will close), stop
+// the XWM poll, then reap Xwayland. Idempotent -- a no-op when nothing is up.
+function stopXwaylandStack(): void {
+  if (xwaylandSelection) {
+    try { xwaylandSelection.stop(); } catch { /* ignore */ }
+    xwaylandSelection = null;
+  }
+  if (xwm) { try { xwm.stop(); } catch { /* ignore */ } xwm = null; }
+  if (xwaylandHandle) {
+    try { stopXwayland(addon, xwaylandHandle); } catch { /* ignore */ }
+    xwaylandHandle = null;
+  }
+  // Per-session X state keyed outside the wl_resource lifecycle. The dead
+  // Xwayland's wl_client disconnect sweeps its wl_surfaces, but these
+  // module-level maps must be cleared so a fresh Xwayland starts clean
+  // (stale serials / override-redirect rects must not survive a restart).
+  if (state) {
+    state.xwayland = undefined;
+    state.overrideRedirects = undefined;
+    state.xwaylandClientIds = undefined;
+  }
+}
+
+// Bring up the Xwayland stack. No-op when disabled or already running.
+async function startXwaylandStack(): Promise<void> {
+  if (!config.xwayland.enabled) return;
   if (config.xwayland.displayNumber === null) {
     log.err("core",
       "Xwayland: `xwayland.displayNumber` is null in config; autopick is not "
       + "supported (it can steal :0 from the host). Set a number (default 50).");
-  } else {
-    try {
-      xwaylandHandle = await startXwayland(addon, {
-        waylandDisplay: sock,
-        enableWm: true,
-        terminate: config.xwayland.terminate,
-        displayNumber: config.xwayland.displayNumber,
-        ...(config.xwayland.xwaylandPath !== null
-          ? { xwaylandPath: config.xwayland.xwaylandPath }
-          : {}),
-      });
-      // Freeze the global Xwayland scale for the session. See
-      // docs/xwayland-design.md "HiDPI".
-      const { resolveXwaylandScale } = await import("./xwayland/scale.js");
-      state.xwaylandScale = resolveXwaylandScale(state, config.xwayland.scale);
-      if (state.xwaylandScale !== 1) {
-        log.info("core", `Xwayland scale = ${state.xwaylandScale} `
-          + `(${config.xwayland.scale === 0 ? "auto" : "config"})`);
-      }
-      xwm = startXwm(state, addon, xwaylandHandle.wmFd);
-      // Selection bridge: mediates CLIPBOARD / PRIMARY between X clients
-      // and wayland clients via wl_data_device / wp_primary_selection_v1.
-      const { startSelectionBridge } = await import("./xwayland/selection.js");
-      xwaylandSelection = startSelectionBridge(state, addon, xwm);
-      state.onWlSelectionChanged = xwaylandSelection.onWlSelectionChanged;
-      state.receiveForXSource = xwaylandSelection.receiveForXSource;
-      log.info("core", `Xwayland up; DISPLAY=${xwaylandHandle.display} (pid ${xwaylandHandle.pid})`);
-      log.info("core", `run an X client with:  DISPLAY=${xwaylandHandle.display} <x-client>`);
-    } catch (e) {
-      log.warn("core", `Xwayland start failed: ${(e as Error).message}`);
-      if (xwaylandHandle) {
-        try { stopXwayland(addon, xwaylandHandle); } catch { /* ignore */ }
-        xwaylandHandle = null;
-      }
+    return;
+  }
+  if (xwaylandHandle) return;
+  const st = state;
+  if (!st) return;
+  try {
+    const handle = await startXwayland(addon, {
+      waylandDisplay: sock,
+      enableWm: true,
+      terminate: config.xwayland.terminate,
+      displayNumber: config.xwayland.displayNumber,
+      ...(config.xwayland.xwaylandPath !== null
+        ? { xwaylandPath: config.xwayland.xwaylandPath }
+        : {}),
+    });
+    xwaylandHandle = handle;
+    // Freeze the global Xwayland scale for the session. See
+    // docs/xwayland-design.md "HiDPI".
+    const { resolveXwaylandScale } = await import("./xwayland/scale.js");
+    st.xwaylandScale = resolveXwaylandScale(st, config.xwayland.scale);
+    if (st.xwaylandScale !== 1) {
+      log.info("core", `Xwayland scale = ${st.xwaylandScale} `
+        + `(${config.xwayland.scale === 0 ? "auto" : "config"})`);
     }
+    xwm = startXwm(st, addon, handle.wmFd);
+    // Selection bridge: mediates CLIPBOARD / PRIMARY between X clients
+    // and wayland clients via wl_data_device / wp_primary_selection_v1.
+    const { startSelectionBridge } = await import("./xwayland/selection.js");
+    xwaylandSelection = startSelectionBridge(st, addon, xwm);
+    st.onWlSelectionChanged = xwaylandSelection.onWlSelectionChanged;
+    st.receiveForXSource = xwaylandSelection.receiveForXSource;
+    log.info("core", `Xwayland up; DISPLAY=${handle.display} (pid ${handle.pid})`);
+    log.info("core", `run an X client with:  DISPLAY=${handle.display} <x-client>`);
+  } catch (e) {
+    log.warn("core", `Xwayland start failed: ${(e as Error).message}`);
+    stopXwaylandStack();
   }
 }
+
+// Restart in-flight guard: a second request while a restart is running is
+// dropped (the running restart already produces a fresh stack).
+let xwaylandRestarting = false;
+async function restartXwayland(): Promise<void> {
+  if (!config.xwayland.enabled) {
+    log.warn("core", "xwayland.restart ignored: Xwayland is disabled in config");
+    return;
+  }
+  if (xwaylandRestarting) {
+    log.warn("core", "xwayland.restart ignored: a restart is already in progress");
+    return;
+  }
+  xwaylandRestarting = true;
+  log.info("core", "Xwayland restart requested; tearing down and respawning");
+  try {
+    stopXwaylandStack();
+    await startXwaylandStack();
+  } finally {
+    xwaylandRestarting = false;
+  }
+}
+
+// The core-actions plugin's xwayland.restart action emits this; any caller
+// (a hotkey binding, another plugin, overdrawctl) can trigger the same
+// restart by emitting it directly.
+pluginBus.subscribe("xwayland.restart-requested", () => { void restartXwayland(); });
+
+// Current X display string, or null when Xwayland isn't up. A function so
+// reads see live state (the module-level handle is only mutated inside the
+// start/stop helpers above).
+function currentXDisplay(): string | null {
+  return xwaylandHandle ? xwaylandHandle.display : null;
+}
+
+await startXwaylandStack();
 
 // Publish the session identity to the systemd/D-Bus user environment so
 // user-bus services (xdg-desktop-portal + backends, notification daemons)
 // bind to this session's displays. kms-only: a nested overdraw would steal
 // the host session's services. OVERDRAW_NO_SD_VARS opts out entirely.
 if (backendOpts.backend === "kms" && !process.env.OVERDRAW_NO_SD_VARS) {
-  publishSessionEnv(sock, xwaylandHandle?.display ?? null,
+  publishSessionEnv(sock, currentXDisplay(),
     (m) => log.warn("core", m));
   sessionEnvPublished = true;
 }
