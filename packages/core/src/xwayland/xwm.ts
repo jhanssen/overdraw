@@ -309,7 +309,10 @@ export function startXwm(state: CompositorState, addon: Addon, wmFd: number): Xw
     if (surfRec.spawnOutputId === undefined) {
       surfRec.spawnOutputId = state.wm.primaryOutputId?.();
     }
-    state.wm.addWindow(w.surfaceId, surfRec);
+    // deferInitialCommit arms the handshake so publishInitial's
+    // markInitialCommitComplete emits window.preconfigure, where window
+    // rules match on appId/title.
+    state.wm.addWindow(w.surfaceId, surfRec, { deferInitialCommit: true });
     w.addedToWm = true;
     // ICCCM §4.1.3.1: a managed top-level holds WM_STATE = NormalState.
     setWmStateNormal(w.window);

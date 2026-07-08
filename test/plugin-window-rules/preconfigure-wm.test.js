@@ -49,6 +49,20 @@ test('matching float rule: window maps floating (pre-map)', async () => {
   assert.equal(wm.getWindowState(1).tiling, 'floating');
 });
 
+test('float rule: the window is sized (floatingRect) at first content so it is visible', async () => {
+  const wm = await setup([{ match: { appId: '^Netflix$' }, float: true }]);
+  await premap(wm, 1, { appId: 'Netflix', title: null, xwayland: true });
+  assert.equal(wm.getWindowState(1).tiling, 'floating');
+  // No rect until the client commits its first content.
+  assert.equal(wm.getFloatingRect(1), null);
+  // First content: the WM sizes the floating window from its natural size and
+  // centers it on the 1000x600 output. Without this a rule-floated window has
+  // no rect and the layout driver falls back to the addWindow placeholder --
+  // the window renders invisible.
+  wm.windowHasContent(1, { width: 400, height: 300 });
+  assert.deepEqual(wm.getFloatingRect(1), { x: 300, y: 150, width: 400, height: 300 });
+});
+
 test('non-matching window stays managed', async () => {
   const wm = await setup([{ match: { appId: '^Netflix$' }, float: true }]);
   await premap(wm, 2, { appId: 'firefox', title: null, xwayland: false });

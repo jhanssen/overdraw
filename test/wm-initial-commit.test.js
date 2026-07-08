@@ -106,6 +106,23 @@ test('markInitialCommitComplete: throwaway 0x0 first configure, then real tile s
   assert.deepEqual(configures.at(-1), { id: 1, w: 1000, h: 600 });
 });
 
+test('markInitialCommitComplete: xwayland suppresses the xdg 0x0 handshake configure', async () => {
+  const configures = [];
+  const wm = createWm(mockSink(), [{ id: 0, rect: { x: 0, y: 0, width: 1000, height: 600 }, scale: 1 }], {
+    configure: { configure: (id, _x, _y, w, h) => { configures.push({ id, w, h }); return null; }, configureMove: () => {} },
+    layoutDriverFactory: immediateLayoutDriver,
+  });
+  wm.addWindow(1, res(1), { deferInitialCommit: true });
+  await wm.settled();
+  await wm.markInitialCommitComplete(1, { appId: null, title: null, xwayland: true });
+  // X11 has no xdg two-phase commit: the 0x0 throwaway handshake would reach
+  // the X client as a bogus 0x0 ConfigureNotify. Xwayland sizing is owned by
+  // applyLayout, so no handshake configure fires from this path. (A wayland
+  // window DOES get the 0x0 -- see the test above.)
+  assert.ok(!configures.some((c) => c.w === 0 && c.h === 0),
+    'no 0x0 handshake configure for an xwayland window');
+});
+
 // --- map-ack gating: the open is held until the client acks the tile-size
 // configure, so the open animation plays on a tile-sized buffer (not the
 // client's default from the 0x0 handshake). beforeMap stands in for the

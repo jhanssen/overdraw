@@ -1644,64 +1644,67 @@ export function createWm(
         // overridden if it wanted to; this is a default that fires
         // only when the WM is still in the post-preconfigure
         // 'managed' state.
+        const c = win.windowState.constraints;
+        const minW = c.minSize?.width ?? 0;
+        const minH = c.minSize?.height ?? 0;
+        const maxW = c.maxSize?.width ?? 0;
+        const maxH = c.maxSize?.height ?? 0;
+        const fixedSize = minW !== 0 && minH !== 0
+          && (minW === maxW || minH === maxH);
         let dialogPolicyMutated = false;
         if (win.windowState.tiling === "managed"
-            && win.windowState.exclusive === "none") {
-          const c = win.windowState.constraints;
-          const minW = c.minSize?.width ?? 0;
-          const minH = c.minSize?.height ?? 0;
-          const maxW = c.maxSize?.width ?? 0;
-          const maxH = c.maxSize?.height ?? 0;
-          const fixedSize = minW !== 0 && minH !== 0
-            && (minW === maxW || minH === maxH);
-          if (win.windowState.parent !== null || fixedSize || win.floatByType) {
-            win.windowState = { ...win.windowState, tiling: "floating" };
-            dialogPolicyMutated = true;
-            if (win.floatingRect === undefined) {
-              // Size a newly-floating window from the client's own content
-              // size -- its committed window geometry, else its buffer --
-              // clamped to the client's min/max, so it renders 1:1 at its
-              // natural size instead of being stretched into a compositor-
-              // chosen rect. Fall back to a locked axis / default when no
-              // content size is known yet. Centered on the parent's output
-              // (else primary). The floating rect is the OUTER tile, so when
-              // decoration insets are already reserved (the decoration
-              // intercept's setInsets runs at preconfigure, while the window
-              // is still managed, so its floating grow-path is skipped) the
-              // outer is content + insets here -- leaving the content rect
-              // equal to the client's size, which a fixed-size dialog will
-              // not resize away from.
-              const clampAxis = (v: number, lo: number, hi: number): number => {
-                let r = v;
-                if (lo > 0) r = Math.max(r, lo);
-                if (hi > 0) r = Math.min(r, hi);
-                return r;
-              };
-              const cw = contentSize && contentSize.width > 0 ? contentSize.width : 0;
-              const ch = contentSize && contentSize.height > 0 ? contentSize.height : 0;
-              const fw = cw > 0 ? clampAxis(cw, minW, maxW)
-                : (minW !== 0 && minW === maxW) ? minW : (minW || 800);
-              const fh = ch > 0 ? clampAxis(ch, minH, maxH)
-                : (minH !== 0 && minH === maxH) ? minH : (minH || 600);
-              const insetLR = (win.insets?.left ?? 0) + (win.insets?.right ?? 0);
-              const insetTB = (win.insets?.top ?? 0) + (win.insets?.bottom ?? 0);
-              const outerW = fw + insetLR;
-              const outerH = fh + insetTB;
-              const targetOutputId = resolveParentOutputId(
-                win.windowState.parent, outputContent)
-                ?? primaryOutputId();
-              const out = wm.outputs.get(targetOutputId);
-              const ox = out?.rect.x ?? 0;
-              const oy = out?.rect.y ?? 0;
-              const ow = out?.rect.width ?? outerW;
-              const oh = out?.rect.height ?? outerH;
-              win.floatingRect = {
-                x: ox + Math.max(0, Math.round((ow - outerW) / 2)),
-                y: oy + Math.max(0, Math.round((oh - outerH) / 2)),
-                width: outerW, height: outerH,
-              };
-            }
-          }
+            && win.windowState.exclusive === "none"
+            && (win.windowState.parent !== null || fixedSize || win.floatByType)) {
+          win.windowState = { ...win.windowState, tiling: "floating" };
+          dialogPolicyMutated = true;
+        }
+        // Size a floating window that has no rect yet: promoted just above by
+        // the transient/fixed-size default, OR floated by a window rule at
+        // preconfigure. A floating window with no floatingRect falls back to
+        // the addWindow placeholder in the layout driver, so it renders
+        // invisible. Size it from the client's own content size -- its
+        // committed window geometry, else its buffer -- clamped to the
+        // client's min/max, so it renders 1:1 at its natural size instead of
+        // being stretched. Fall back to a locked axis / default when no
+        // content size is known yet. Centered on the parent's output (else
+        // primary). The floating rect is the OUTER tile, so when decoration
+        // insets are already reserved (the decoration intercept's setInsets
+        // runs at preconfigure) the outer is content + insets here, leaving
+        // the content rect equal to the client's size.
+        let floatingSized = false;
+        if (win.windowState.tiling === "floating"
+            && win.windowState.exclusive === "none"
+            && win.floatingRect === undefined) {
+          const clampAxis = (v: number, lo: number, hi: number): number => {
+            let r = v;
+            if (lo > 0) r = Math.max(r, lo);
+            if (hi > 0) r = Math.min(r, hi);
+            return r;
+          };
+          const cw = contentSize && contentSize.width > 0 ? contentSize.width : 0;
+          const ch = contentSize && contentSize.height > 0 ? contentSize.height : 0;
+          const fw = cw > 0 ? clampAxis(cw, minW, maxW)
+            : (minW !== 0 && minW === maxW) ? minW : (minW || 800);
+          const fh = ch > 0 ? clampAxis(ch, minH, maxH)
+            : (minH !== 0 && minH === maxH) ? minH : (minH || 600);
+          const insetLR = (win.insets?.left ?? 0) + (win.insets?.right ?? 0);
+          const insetTB = (win.insets?.top ?? 0) + (win.insets?.bottom ?? 0);
+          const outerW = fw + insetLR;
+          const outerH = fh + insetTB;
+          const targetOutputId = resolveParentOutputId(
+            win.windowState.parent, outputContent)
+            ?? primaryOutputId();
+          const out = wm.outputs.get(targetOutputId);
+          const ox = out?.rect.x ?? 0;
+          const oy = out?.rect.y ?? 0;
+          const ow = out?.rect.width ?? outerW;
+          const oh = out?.rect.height ?? outerH;
+          win.floatingRect = {
+            x: ox + Math.max(0, Math.round((ow - outerW) / 2)),
+            y: oy + Math.max(0, Math.round((oh - outerH) / 2)),
+            width: outerW, height: outerH,
+          };
+          floatingSized = true;
         }
         // Assign z per the map-time rules (tiled joins the shared
         // tiledZ; floating sits above the floating peak; modal sits
@@ -1725,11 +1728,11 @@ export function createWm(
         // run beforeMap + pushStack with the real outer. This is
         // independent of the opening-driver's own gate; both can be
         // engaged at the same time (multi-owner gate composes).
-        if (dialogPolicyMutated) {
+        if (dialogPolicyMutated || floatingSized) {
           driver.schedule("state-changed");
         }
         const layoutSettled = win.outer.width > 0 && win.outer.height > 0
-                              && !dialogPolicyMutated;
+                              && !dialogPolicyMutated && !floatingSized;
         if (layoutSettled || !beforeMap) {
           // Synchronous path: either the layout already gave us a real
           // outer (the normal case for windows that map after the WM
@@ -2183,6 +2186,10 @@ export function createWm(
         if (prior) await prior;
         if (!windows.includes(win) || !win.pendingInitialCommit) return;
 
+        // X11 has no xdg two-phase commit: sizing is owned by applyLayout,
+        // so the handshake configures below are suppressed (a 0x0 configure
+        // would reach the X client as a bogus 0x0 ConfigureNotify).
+        const isXwayland = info.xwayland === true;
         let finalState: WindowState = cloneState(win.windowState);
         if (pluginBus) {
           const initial: WindowPreconfigureEvent = {
@@ -2225,7 +2232,7 @@ export function createWm(
         // always precedes the real tile size (the handshake invariant), and so
         // a later applyLayout clearing pendingSizeConfigure can't make this
         // fire a spurious trailing 0x0.
-        if (configure && !win.pendingSizeConfigure) {
+        if (configure && !isXwayland && !win.pendingSizeConfigure) {
           configure.configure(win.surfaceId, 0, 0, 0, 0);
           win.pendingSizeConfigure = true;
         }
@@ -2256,7 +2263,7 @@ export function createWm(
         // produced no real outer at all (no workspace plugin, or no spawn
         // output) pendingSizeConfigure stays set and windowHasContent sends
         // this configure at first content.
-        if (configure && win.pendingSizeConfigure
+        if (configure && !isXwayland && win.pendingSizeConfigure
             && win.outer.width > 0 && win.outer.height > 0) {
           win.pendingSizeConfigure = false;
           const content = contentOf(win);
