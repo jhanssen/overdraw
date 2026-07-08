@@ -353,6 +353,13 @@ export interface Wm {
   // No-op when the window doesn't exist.
   raiseWindow(surfaceId: number): void;
 
+  // Raise every floating window above the tiled stack, preserving the
+  // floating windows' relative order. Tiled windows share one z, so
+  // raising a tiled window lifts the whole tile stack over the floating
+  // layer; this reverses that, bringing all floating windows back on top.
+  // No-op when there are no floating windows.
+  raiseAllFloating(): void;
+
   // Propose a behavioral-state change. Builds a candidate by merging the
   // proposal onto the current state, runs the candidate through the
   // 'window.proposed' interceptor chain, commits the final candidate to
@@ -1940,6 +1947,23 @@ export function createWm(
           root.z = highestFloating + 1;
         }
         raiseStackedDescendants(root);
+      }
+      pushStack();
+    },
+
+    raiseAllFloating() {
+      // Independent floating stacks (a floating window that is the root of
+      // its own raise-with chain), in current z order, restacked just above
+      // the shared tiled z. Ascending assignment preserves their relative
+      // order; each chain's descendants renormalize to stay above their root.
+      const roots = windows
+        .filter((w) => w.windowState.tiling === "floating" && rootOfChain(w) === w)
+        .sort((a, b) => a.z - b.z);
+      if (roots.length === 0) return;
+      let z = tiledZ;
+      for (const w of roots) {
+        w.z = ++z;
+        raiseStackedDescendants(w);
       }
       pushStack();
     },

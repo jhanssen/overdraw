@@ -10,6 +10,7 @@ import assert from 'node:assert/strict';
 
 import { createWm } from '../packages/core/dist/wm/index.js';
 import { createLayoutDriver } from '../packages/core/dist/wm/layout-driver.js';
+import { computeBaseStack } from '../packages/core/dist/subsurfaces.js';
 import { inlineMasterStackDriverFactory } from './wm-helpers.mjs';
 
 function mockSink() {
@@ -282,4 +283,54 @@ test('floating window with reserved insets: outer grows so content == client siz
   // Content rect = the client's own size, so it renders 1:1 and never resizes.
   assert.deepEqual(wm.rectOf(2), { x: (1000 - 644) / 2 + 2, y: (600 - 484) / 2 + 2, width: 640, height: 480 },
     'content rect equals the client content size, inset within the outer tile');
+});
+
+// --- raiseAllFloating: bring the floating layer back over the tiled stack ---
+// The composited order is z-sorted by computeBaseStack (the renderer's path);
+// a higher index is drawn on top.
+
+function stackOf(wm) {
+  return computeBaseStack({ wm, surfaces: new Map() });
+}
+
+test('raiseAllFloating: floating windows restacked above the tiled stack', async () => {
+  const wm = createWm(mockSink(), [{ id: 0, rect: { x: 0, y: 0, width: 1000, height: 600 }, scale: 1 }], {
+    layoutDriverFactory: inlineMasterStackDriverFactory,
+  });
+  // Two tiled windows (sharing tiledZ) and one floating window (above them).
+  await addMapped(wm, 1);
+  await addMapped(wm, 2);
+  await addMapped(wm, 3);
+  await wm.propose(3, { tiling: 'floating' }, 'user-input');
+
+  // Raising a tiled window lifts the whole tile stack over the floating one.
+  wm.raiseWindow(1);
+  let stack = stackOf(wm);
+  assert.ok(stack.indexOf(3) < Math.min(stack.indexOf(1), stack.indexOf(2)),
+    'tiled stack raised above the floating window');
+
+  // raiseAllFloating brings the floating window back on top of both tiles.
+  wm.raiseAllFloating();
+  stack = stackOf(wm);
+  assert.ok(stack.indexOf(3) > Math.max(stack.indexOf(1), stack.indexOf(2)),
+    'floating window raised above the tiled stack');
+});
+
+test('raiseAllFloating: preserves relative order of multiple floating windows', async () => {
+  const wm = createWm(mockSink(), [{ id: 0, rect: { x: 0, y: 0, width: 1000, height: 600 }, scale: 1 }], {
+    layoutDriverFactory: inlineMasterStackDriverFactory,
+  });
+  await addMapped(wm, 1); // tiled
+  await addMapped(wm, 2); // floating
+  await addMapped(wm, 3); // floating
+  await wm.propose(2, { tiling: 'floating' }, 'user-input');
+  await wm.propose(3, { tiling: 'floating' }, 'user-input');
+  wm.raiseWindow(3); // 3 above 2 in the floating layer
+  wm.raiseWindow(1); // tile stack over both floating
+
+  wm.raiseAllFloating();
+  const stack = stackOf(wm);
+  // Both floating above the tile, and 3 still above 2.
+  assert.ok(stack.indexOf(2) > stack.indexOf(1), 'floating 2 above tiled');
+  assert.ok(stack.indexOf(3) > stack.indexOf(2), 'floating 3 stays above floating 2');
 });

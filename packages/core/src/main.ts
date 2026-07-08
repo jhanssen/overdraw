@@ -1203,6 +1203,11 @@ pluginBus.subscribe("window.close-requested", () => {
   closeSurface(state, focusedId);
 });
 
+// window.raise-floating: lift every floating window above the tiled stack.
+pluginBus.subscribe("window.raise-floating-requested", () => {
+  state?.wm?.raiseAllFloating();
+});
+
 // window.move-to-output (explicit outputId): move the focused window to the
 // shown workspace on the target output. Resolves via the workspace
 // namespace's moveWindow (which knows the shown workspace per output) so

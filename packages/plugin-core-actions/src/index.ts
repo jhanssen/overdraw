@@ -140,6 +140,19 @@ export default async function init(sdk: PluginSdkShape): Promise<void> {
     },
   });
 
+  // Raise all floating windows above the tiled stack. Tiled windows share a
+  // single z, so raising one lifts the whole tile stack over the floating
+  // layer; this brings the floating windows back on top.
+  sdk.actions.register({
+    name: "window.raise-floating",
+    description: "Raise every floating window above the tiled stack, preserving " +
+      "their relative order. No params.",
+    handler: async (): Promise<null> => {
+      sdk.events.emit("window.raise-floating-requested", {});
+      return null;
+    },
+  });
+
   // Keyboard focus navigation. Cycles the keyboard focus through the WM's
   // toplevel stack (wrapping at the ends). The launcher resolves the current
   // focus + the stack order and applies the new focus; plugin context has
