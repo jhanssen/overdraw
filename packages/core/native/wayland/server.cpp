@@ -26,6 +26,12 @@ bool Server::start(uv_loop_t* loop) {
     }
     socketName_ = sock;
 
+    // Per-client outgoing buffers grow on demand up to this cap (default is a
+    // fixed 4 KiB). At the default, a client that stalls for a few hundred ms
+    // while events stream at it (e.g. high-rate pointer motion) overflows and
+    // gets disconnected; 1 MiB absorbs transient stalls.
+    wl_display_set_default_max_buffer_size(display_, 1024 * 1024);
+
     eventLoop_ = wl_display_get_event_loop(display_);
     int fd = wl_event_loop_get_fd(eventLoop_);
 
