@@ -14,6 +14,8 @@ import { setupCompositor, canRunGpu, buildBin } from "./harness.mjs";
 
 const skip = canRunGpu() ? false : "needs GPU (no render node / dawn.node)";
 const CLIP = buildBin("clipboard-test-client");
+const EXT_DC = buildBin("ext-data-control-client");
+const ZWLR_DC = buildBin("zwlr-data-control-client");
 const MIME = "text/plain;charset=utf-8";
 const PAYLOAD = "overdraw-clipboard-roundtrip-42";
 
@@ -61,3 +63,67 @@ test("primary selection: middle-click selection round-trips to the focused clien
     await c.teardown();
   }
 });
+
+// Cross-protocol paste: a data-control client (clipboard manager,
+// lan-mouse-style sync tool) owns the selection; a regular focused client
+// pastes it through wl_data_device / zwp_primary_selection. Exercises the
+// receive() forward from a wl-side offer to a data-control source -- a
+// different source family than the same-protocol tests above, where the
+// send event lives at a different opcode.
+async function crossPaste(c, dcBin, dcMarker, payload, primary) {
+  // Receiver first: maps a window -> focus-on-map -> eligible for selection.
+  const recvArgs = primary ? ["--primary", "--receive", MIME] : ["--receive", MIME];
+  const receiver = c.spawnClient(recvArgs,
+    { bin: CLIP, readyMarker: "[clipboard-client] receiver mapped" });
+  await receiver.ready;
+  await c.waitFor(c.query, (s) => s.keyboardFocus != null, { what: "receiver focused" });
+
+  const srcArgs = primary
+    ? ["--primary", "--source", MIME, payload]
+    : ["--source", MIME, payload];
+  const src = c.spawnClient(srcArgs, { bin: dcBin, readyMarker: dcMarker });
+  await src.ready;
+
+  const out = await receiver.waitForLine(/\[clipboard-client\] received: /,
+    { what: "received line", timeoutMs: 5000 });
+  return out.match(/\[clipboard-client\] received: (.*)/)[1].trim();
+}
+
+test("clipboard: selection set via ext_data_control pastes into the focused client",
+  { skip }, async () => {
+    const c = await setupCompositor({ headless: { width: 800, height: 600 } });
+    try {
+      const payload = "ext-dc-to-wl-paste-13";
+      const got = await crossPaste(c, EXT_DC, "[ext-dc-client] selection set", payload, false);
+      assert.equal(got, payload,
+        `ext_data_control-owned clipboard pastes via wl_data_device; got "${got}"`);
+    } finally {
+      await c.teardown();
+    }
+  });
+
+test("clipboard: selection set via zwlr_data_control pastes into the focused client",
+  { skip }, async () => {
+    const c = await setupCompositor({ headless: { width: 800, height: 600 } });
+    try {
+      const payload = "zwlr-dc-to-wl-paste-29";
+      const got = await crossPaste(c, ZWLR_DC, "[zwlr-dc-client] selection set", payload, false);
+      assert.equal(got, payload,
+        `zwlr_data_control-owned clipboard pastes via wl_data_device; got "${got}"`);
+    } finally {
+      await c.teardown();
+    }
+  });
+
+test("primary selection: set via ext_data_control pastes into the focused client",
+  { skip }, async () => {
+    const c = await setupCompositor({ headless: { width: 800, height: 600 } });
+    try {
+      const payload = "ext-dc-to-wl-primary-5";
+      const got = await crossPaste(c, EXT_DC, "[ext-dc-client] selection set", payload, true);
+      assert.equal(got, payload,
+        `ext_data_control-owned primary selection pastes via zwp_primary_selection; got "${got}"`);
+    } finally {
+      await c.teardown();
+    }
+  });

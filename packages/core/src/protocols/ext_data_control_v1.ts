@@ -38,7 +38,8 @@
 import type { Resource, WaylandFd } from "../types.js";
 import type { Ctx } from "./ctx.js";
 import { SELECTION_EVENT } from "../events/window-bus.js";
-import { cancelDisplacedSource, selectionOwnerGone } from "./wl_data_device_manager.js";
+import { cancelDisplacedSource, forwardReceiveToSource, selectionOwnerGone }
+  from "./wl_data_device_manager.js";
 
 import type { ExtDataControlManagerV1Handler }
   from "#protocols-gen/ext_data_control_manager_v1.js";
@@ -312,32 +313,9 @@ export function makeExtDataControlOffer(ctx: Ctx): ExtDataControlOfferV1Handler 
         ctx.state.receiveForXSource(xKind, mimeType, fd.takeRawFd());
         return;
       }
-      // Wl-source path. send_send takes a dup (libwayland owns it once the
-      // event is queued); our request fd must be CLOSED here -- the
-      // dispatcher owns it and nothing else will close it. A merely-taken
-      // fd would hold the receiver's pipe write-end open forever, so the
-      // reading client never sees EOF.
-      const source = offerToWlSource.get(resource);
-      if (!source || source.destroyed) { fd.close(); return; }
-      // The source is a wl_data_source, an ext_data_control_source_v1, or
-      // a zwlr_data_control_source_v1. All have a `send` event carrying
-      // (mime, fd); dispatch to whichever family the source resource is
-      // registered against.
-      if (source.interfaceName === "ext_data_control_source_v1") {
-        ctx.events.ext_data_control_source_v1.send_send(source, mimeType, fd.dup());
-      } else if (source.interfaceName === "zwlr_data_control_source_v1") {
-        ctx.events.zwlr_data_control_source_v1.send_send(source, mimeType, fd.dup());
-      } else {
-        // wl_data_source.send_send for clipboard sources and
-        // zwp_primary_selection_source_v1.send_send for primary sources;
-        // disambiguate by which selection map the source lives in.
-        if (ctx.state.dataSources?.has(source)) {
-          ctx.events.wl_data_source.send_send(source, mimeType, fd.dup());
-        } else if (ctx.state.primarySources?.has(source)) {
-          ctx.events.zwp_primary_selection_source_v1.send_send(source, mimeType, fd.dup());
-        }
-      }
-      fd.close();
+      // Wl-source path: dispatch by source family (helper closes the
+      // request fd).
+      forwardReceiveToSource(ctx, offerToWlSource.get(resource) ?? null, mimeType, fd);
     },
     destroy(resource) {
       offerToWlSource.delete(resource);

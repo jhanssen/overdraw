@@ -46,7 +46,40 @@ export function cancelDisplacedSource(
       ctx.events.zwp_primary_selection_source_v1.send_cancelled(prev); break;
     case "ext_data_control_source_v1":
       ctx.events.ext_data_control_source_v1.send_cancelled(prev); break;
+    case "zwlr_data_control_source_v1":
+      ctx.events.zwlr_data_control_source_v1.send_cancelled(prev); break;
   }
+}
+
+// Forward a receive() request to the source backing an offer. Like
+// cancelDisplacedSource, the source may belong to any of the selection
+// protocols (a data-control client's source can own the clipboard that a
+// wl_data_device client pastes from), so the send event must be dispatched
+// by the resource's interface -- each family's `send` has a different
+// opcode, and posting through the wrong sender emits a different event
+// entirely on the recipient's interface.
+//
+// Fd ownership: send_send takes a dup (libwayland owns it once the event is
+// queued); the request fd itself is CLOSED here -- the dispatcher owns it
+// and nothing else will close it. A merely-taken fd would hold the
+// receiver's pipe write-end open forever, so the reading client never sees
+// EOF after the source finishes writing.
+export function forwardReceiveToSource(
+  ctx: Ctx, source: Resource | null, mimeType: string, fd: WaylandFd,
+): void {
+  if (source && !source.destroyed) {
+    switch (source.interfaceName) {
+      case "wl_data_source":
+        ctx.events.wl_data_source.send_send(source, mimeType, fd.dup()); break;
+      case "zwp_primary_selection_source_v1":
+        ctx.events.zwp_primary_selection_source_v1.send_send(source, mimeType, fd.dup()); break;
+      case "ext_data_control_source_v1":
+        ctx.events.ext_data_control_source_v1.send_send(source, mimeType, fd.dup()); break;
+      case "zwlr_data_control_source_v1":
+        ctx.events.zwlr_data_control_source_v1.send_send(source, mimeType, fd.dup()); break;
+    }
+  }
+  fd.close();
 }
 
 // Map a wl_data_offer resource back to the source it represents, so receive() can
@@ -456,17 +489,7 @@ export function makeDataOffer(ctx: Ctx): WlDataOfferHandler {
         ctx.state.receiveForXSource(xKind, mimeType, fd.takeRawFd());
         return;
       }
-      // Wl-client source path. send_send takes a dup (libwayland owns it
-      // once the event is queued); our request fd must be CLOSED here --
-      // the dispatcher owns it and nothing else will close it. A
-      // merely-taken fd would hold the receiver's pipe write-end open
-      // forever, so the reading client never sees EOF after the source
-      // finishes writing.
-      const source = offerToSource.get(resource);
-      if (source && !source.destroyed) {
-        ctx.events.wl_data_source.send_send(source, mimeType, fd.dup());
-      }
-      fd.close();
+      forwardReceiveToSource(ctx, offerToSource.get(resource) ?? null, mimeType, fd);
     },
     destroy(resource) {
       offerToSource.delete(resource);
@@ -549,13 +572,7 @@ export function makePrimaryOffer(ctx: Ctx): ZwpPrimarySelectionOfferV1Handler {
         ctx.state.receiveForXSource(xKind, mimeType, fd.takeRawFd());
         return;
       }
-      // See the wl_data_offer.receive forward above: dup for send_send,
-      // then CLOSE our request fd so the receiver sees EOF.
-      const source = primaryOfferToSource.get(resource);
-      if (source && !source.destroyed) {
-        ctx.events.zwp_primary_selection_source_v1.send_send(source, mimeType, fd.dup());
-      }
-      fd.close();
+      forwardReceiveToSource(ctx, primaryOfferToSource.get(resource) ?? null, mimeType, fd);
     },
     destroy(resource) { primaryOfferToSource.delete(resource); },
   };
