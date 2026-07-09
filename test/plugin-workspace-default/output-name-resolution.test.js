@@ -50,6 +50,7 @@ async function withTwoOutputs(outputsDecl, fn) {
   const seat = {
     applyKeyboardFocus() {},
     dispatchFocusEvent() {},
+    repickPointer() {},
   };
   const state = {
     bus, wm, surfaces: new Map(), compositor: sink, seat,

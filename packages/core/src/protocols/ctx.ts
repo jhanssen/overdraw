@@ -1214,6 +1214,12 @@ export interface SeatState {
                      trigger?: number): void;
   // Topmost surface under an output-space point (for DnD hit-testing).
   pick(x: number, y: number): SeatFocus | null;
+  // Re-derive pointer focus at the last-known pointer position, sending
+  // leave/enter/motion and a focus-policy dispatch as if the pointer had
+  // moved zero pixels. Called when the scene changes under a stationary
+  // pointer (resize-tx batch apply, workspace switch). No-op during
+  // grabs/drags or while the host pointer is outside the compositor.
+  repickPointer(): void;
   // The last observed pointer position (output-space). Used by the
   // action-registry's deferred-ref resolver (ref.pointerX/Y). When no
   // pointer event has ever been seen, returns {x: 0, y: 0} -- matches

@@ -45,6 +45,7 @@ function harness(initialOutputs, bootKey = 'DP-1') {
     seat: {
       applyKeyboardFocus() {},
       dispatchFocusEvent() {},
+      repickPointer() {},
     },
     pendingWindowChanges: undefined, decorationResize: null,
   };

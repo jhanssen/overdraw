@@ -302,6 +302,7 @@ test('requestFocusDecision: forwards reason to seat.dispatchFocusEvent', async (
   const seat = {
     applyKeyboardFocus() {},
     dispatchFocusEvent(reason, trigger) { dispatchCalls.push({ reason, trigger }); },
+    repickPointer() {},
   };
   await withWindowsSetup(7, async ({ events, pluginBus }) => {
     trigger(pluginBus, 16);

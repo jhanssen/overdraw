@@ -267,6 +267,11 @@ export function createWindowsBroker(deps: WindowsBrokerDeps): WindowsBroker {
     if (!isRequestFocusDecisionPayload(p)) {
       throw new Error("windows.request-focus-decision: malformed payload");
     }
+    // A workspace switch replaces the stack under a stationary pointer.
+    // Refresh pointer focus first so the decision below (and clients'
+    // wl_pointer enter/leave state) sees the surface actually under the
+    // cursor rather than the pre-switch cached hit.
+    if (p.reason === "workspace-changed") state.seat?.repickPointer();
     state.seat?.dispatchFocusEvent(p.reason, p.trigger);
     return null;
   }

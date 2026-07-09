@@ -125,6 +125,15 @@ export default function makeSeat(ctx: Ctx, driver: FocusDriver): SeatHandler {
   // Last pointer position (output space), tracked on motion; used for popup
   // click-away dismissal at button-press time (button events carry no position).
   let lastX = 0, lastY = 0;
+  // Timestamp of the last pointer motion/enter, reused for the synthesized
+  // motion repickPointer sends. Clients only read deltas from wl_pointer
+  // timestamps; reusing the last real device time keeps the stream monotonic
+  // without guessing at the input backend's clock domain.
+  let lastTime = 0;
+  // Whether the host pointer is currently over the compositor at all
+  // (nested backend sends pointerLeave when it isn't). Gates repickPointer:
+  // while outside, lastX/lastY are stale and nothing should gain focus.
+  let pointerInside = false;
   // Last-known modsDepressed mask, used to diff modifier-release events
   // for the binding chain's release callback path.
   let lastModsDepressed = 0;
@@ -329,6 +338,27 @@ export default function makeSeat(ctx: Ctx, driver: FocusDriver): SeatHandler {
       rootSurfaceId,
       clientId,
       rect: hit.rect,
+    };
+  }
+
+  // Surface-local coords for an output-space point on a hit surface.
+  // Surface-local coords are relative to the wl_surface's origin, which
+  // (for CSD clients with set_window_geometry) is NOT the same as the
+  // WM-assigned content rect's origin: the geometry rect declares a
+  // sub-region of the buffer, so the visible top-left of the window
+  // corresponds to surface-local (geom.x, geom.y), not (0, 0). Add the
+  // offset back. For X clients the surface buffer is oversized by the
+  // global X scale (see docs/xwayland-design.md "HiDPI"); the X client's
+  // surface-local frame is in those oversized pixels, so multiply.
+  function surfaceLocalCoords(
+    hit: SeatFocus, x: number, y: number,
+  ): { sx: number; sy: number } {
+    const goff = surfaceGeometryOffset(ctx, hit.surfaceRec.resource);
+    const hitRole = ctx.state.surfacesById?.get(hit.surfaceId)?.role;
+    const xn = hitRole === "xwayland" ? (ctx.state.xwaylandScale ?? 1) : 1;
+    return {
+      sx: ((x - hit.rect.x) + goff.x) * xn,
+      sy: ((y - hit.rect.y) + goff.y) * xn,
     };
   }
 
@@ -681,6 +711,8 @@ export default function makeSeat(ctx: Ctx, driver: FocusDriver): SeatHandler {
     if (seat.grab && (ev.type === "pointerMotion" || ev.type === "pointerEnter")) {
       lastX = ev.x ?? 0;
       lastY = ev.y ?? 0;
+      lastTime = ev.time ?? lastTime;
+      pointerInside = true;
       ctx.state.compositor.setCursorPosition?.(lastX, lastY);
       applyGrabMotion(seat.grab, lastX, lastY);
       return;
@@ -692,6 +724,8 @@ export default function makeSeat(ctx: Ctx, driver: FocusDriver): SeatHandler {
         const x = ev.x ?? 0;
         const y = ev.y ?? 0;
         lastX = x; lastY = y;
+        lastTime = ev.time ?? lastTime;
+        pointerInside = true;
         // Move the software cursor with the pointer. The
         // compositor's cursor slot draws above every layer; visibility
         // and texture-installed gate inclusion -- so this is cheap when
@@ -716,20 +750,7 @@ export default function makeSeat(ctx: Ctx, driver: FocusDriver): SeatHandler {
           }
           return;
         }
-        // Surface-local coords are relative to the wl_surface's
-        // origin, which (for CSD clients with set_window_geometry) is
-        // NOT the same as the WM-assigned content rect's origin: the
-        // geometry rect declares a sub-region of the buffer, so the
-        // visible top-left of the window corresponds to surface-local
-        // (geom.x, geom.y), not (0, 0). Add the offset back.
-        // For X clients the surface buffer is oversized by the global X
-        // scale (see docs/xwayland-design.md "HiDPI"); the X client's
-        // surface-local frame is in those oversized pixels, so multiply.
-        const goff = surfaceGeometryOffset(ctx, hit.surfaceRec.resource);
-        const hitRole = ctx.state.surfacesById?.get(hit.surfaceId)?.role;
-        const xn = hitRole === "xwayland" ? (ctx.state.xwaylandScale ?? 1) : 1;
-        const sx = ((x - hit.rect.x) + goff.x) * xn;
-        const sy = ((y - hit.rect.y) + goff.y) * xn;
+        const { sx, sy } = surfaceLocalCoords(hit, x, y);
         if (!seat.focus) {
           seat.focus = hit;
           sendEnter(hit, sx, sy);
@@ -762,6 +783,7 @@ export default function makeSeat(ctx: Ctx, driver: FocusDriver): SeatHandler {
         break;
       }
       case "pointerLeave": {
+        pointerInside = false;
         const prev = seat.focus?.surfaceId ?? null;
         notifyPointerFocus(ctx, null);
         if (seat.focus) { sendLeave(seat.focus); seat.focus = null; }
@@ -1017,12 +1039,62 @@ export default function makeSeat(ctx: Ctx, driver: FocusDriver): SeatHandler {
     dispatchFocus("window-mapped", surfaceId, undefined);
   }
 
+  // Re-derive the surface under the (stationary) pointer after the scene
+  // changed beneath it -- a relayout swapped tiles, a workspace switch
+  // replaced the stack. Produces the same leave/enter/motion sequence and
+  // focus-policy dispatch a zero-length pointer motion would, so
+  // follow-pointer keyboard focus and client hover state track scene
+  // changes, not just device input. No-op while a move/resize grab or a
+  // DnD drag owns the pointer, or while the host pointer is outside the
+  // compositor.
+  function repickPointer(): void {
+    const seat = ctx.state.seat;
+    if (!seat || seat.grab || seat.drag || !pointerInside) return;
+    const hit = pick(lastX, lastY);
+    const prevPointerSurface = seat.focus?.surfaceId ?? null;
+    if (seat.focus && (!hit || hit.surfaceId !== seat.focus.surfaceId)) {
+      sendLeave(seat.focus);
+      seat.focus = null;
+    }
+    if (!hit) {
+      notifyPointerFocus(ctx, null);
+      if (prevPointerSurface !== null) {
+        dispatchFocus("pointer-leave", undefined, null);
+      }
+      return;
+    }
+    const { sx, sy } = surfaceLocalCoords(hit, lastX, lastY);
+    if (!seat.focus) {
+      seat.focus = hit;
+      sendEnter(hit, sx, sy);
+    } else {
+      // Same surface, but its rect may have moved under the pointer:
+      // refresh the cached hit and the client's surface-local position.
+      const pr = seat.focus.rect, nr = hit.rect;
+      const moved = pr.x !== nr.x || pr.y !== nr.y
+        || pr.width !== nr.width || pr.height !== nr.height;
+      seat.focus = hit;
+      if (moved && !isPointerLocked(ctx)) {
+        for (const p of clientPointers(hit.clientId)) {
+          if (p.destroyed) continue;
+          ctx.events.wl_pointer.send_motion(p, lastTime, sx, sy);
+          pointerFrame(p);
+        }
+      }
+    }
+    notifyPointerFocus(ctx, hit.surfaceId);
+    if (prevPointerSurface !== hit.surfaceId) {
+      dispatchFocus("pointer-enter", hit.rootSurfaceId, hit.rootSurfaceId);
+    }
+  }
+
   ctx.state.seat = {
     pointersByClient, keyboardsByClient,
     focus: null, kbFocus: null, handleInput, focusWindow,
     applyKeyboardFocus,
     dispatchFocusEvent(reason, trigger) { dispatchFocus(reason, trigger); },
     pick,
+    repickPointer,
     pointerPosition() { return { x: lastX, y: lastY }; },
     reevaluateExclusiveLayerFocus,
     drag: null,

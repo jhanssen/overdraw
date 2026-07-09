@@ -52,6 +52,7 @@ async function withWorkspacePlugin(fn) {
     dispatchFocusEvent(reason, trigger) {
       seatCalls.focus.push({ kind: 'dispatch', reason, trigger });
     },
+    repickPointer() {},
   };
   const state = {
     bus, wm, surfaces: new Map(), compositor: sink, seat,

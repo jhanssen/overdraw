@@ -21,8 +21,8 @@ function mockSink() {
   };
 }
 
-// Records dispatchFocusEvent calls. applyKeyboardFocus stub satisfies the
-// SeatState shape; the broker only invokes dispatchFocusEvent here.
+// Records dispatchFocusEvent + repickPointer calls in one ordered list.
+// applyKeyboardFocus stub satisfies the SeatState shape.
 function makeSeat() {
   const calls = [];
   return {
@@ -30,6 +30,7 @@ function makeSeat() {
     seat: {
       applyKeyboardFocus() {},
       dispatchFocusEvent(reason, trigger) { calls.push({ reason, trigger }); },
+      repickPointer() { calls.push({ repick: true }); },
     },
   };
 }
@@ -44,13 +45,23 @@ function brokerWithSeat(seat) {
   return broker;
 }
 
-test('request-focus-decision: forwards reason to seat.dispatchFocusEvent', () => {
+test('request-focus-decision: workspace-changed repicks pointer, then dispatches', () => {
   const { seat, calls } = makeSeat();
   const broker = brokerWithSeat(seat);
   broker('p', 'windows.request-focus-decision', { reason: 'workspace-changed' });
-  assert.equal(calls.length, 1);
-  assert.equal(calls[0].reason, 'workspace-changed');
-  assert.equal(calls[0].trigger, undefined);
+  // The stack under the (stationary) pointer changed; the broker must
+  // refresh pointer focus BEFORE the decision so it sees the new hit.
+  assert.deepEqual(calls, [
+    { repick: true },
+    { reason: 'workspace-changed', trigger: undefined },
+  ]);
+});
+
+test('request-focus-decision: non-workspace reasons do not repick', () => {
+  const { seat, calls } = makeSeat();
+  const broker = brokerWithSeat(seat);
+  broker('p', 'windows.request-focus-decision', { reason: 'window-mapped', trigger: 3 });
+  assert.deepEqual(calls, [{ reason: 'window-mapped', trigger: 3 }]);
 });
 
 test('request-focus-decision: forwards trigger when present', () => {
@@ -69,7 +80,7 @@ test('request-focus-decision: accepts every FocusReason in the canonical set', (
     'workspace-changed', 'explicit',
   ];
   for (const r of reasons) broker('p', 'windows.request-focus-decision', { reason: r });
-  assert.deepEqual(calls.map((c) => c.reason), reasons);
+  assert.deepEqual(calls.filter((c) => !c.repick).map((c) => c.reason), reasons);
 });
 
 test('request-focus-decision: unknown reason throws malformed payload', () => {

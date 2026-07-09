@@ -398,7 +398,14 @@ export async function installProtocols(
   // deferred during the hold (rebuildStackWithPopups stashed them in
   // state.deferredOutputStacks). This makes the outputStack flip
   // atomic with the surface's new geometry.
-  surfaceTx.onAfterApply(() => { flushDeferredOutputStacks(state); });
+  surfaceTx.onAfterApply(() => {
+    flushDeferredOutputStacks(state);
+    // Window geometry just changed under a possibly-stationary pointer
+    // (tiles swapped, windows retiled). Re-derive pointer focus so
+    // follow-pointer keyboard focus and client hover state land on the
+    // window actually under the cursor, after the stack flush above.
+    state.seat?.repickPointer();
+  });
   state.wm = createWm(
     state.compositor,
     [{
