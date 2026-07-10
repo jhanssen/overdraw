@@ -17,6 +17,14 @@
 //                    "[x11] wm-state state=<N> icon=0x<W>" once.
 //   --probe-net-supported After mapping, read _NET_SUPPORTED on the root
 //                    and print "[x11] net-supported count=<N>".
+//   --fill <rrggbb>  Paint the whole window with this color on map and on
+//                    every Expose (so the window has deterministic pixels
+//                    for compositor readback tests).
+//   --stdin-fills    Read commands from stdin: "fill X Y W H RRGGBB" paints
+//                    a sub-rectangle and prints "[x11] filled X Y W H" after
+//                    the flush. Drives partial-damage tests: each fill is an
+//                    in-place update of part of the window, the pattern a
+//                    real app's incremental repaint produces.
 //
 // Prints "[x11] mapped 0x<window>" on map and "[x11] deleted" on
 // WM_DELETE_WINDOW receipt.
@@ -48,6 +56,8 @@ int main(int argc, char** argv) {
     int timeoutMs = 5000;
     int overrideRedirect = 0;
     int x = 0, y = 0, w = 200, h = 150;
+    const char* fillColor = NULL;
+    int stdinFills = 0;
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--title") && i + 1 < argc) { title = argv[++i]; }
         else if (!strcmp(argv[i], "--app-id") && i + 1 < argc) { appId = argv[++i]; }
@@ -63,6 +73,8 @@ int main(int argc, char** argv) {
         else if (!strcmp(argv[i], "--y") && i + 1 < argc) { y = atoi(argv[++i]); }
         else if (!strcmp(argv[i], "--w") && i + 1 < argc) { w = atoi(argv[++i]); }
         else if (!strcmp(argv[i], "--h") && i + 1 < argc) { h = atoi(argv[++i]); }
+        else if (!strcmp(argv[i], "--fill") && i + 1 < argc) { fillColor = argv[++i]; }
+        else if (!strcmp(argv[i], "--stdin-fills")) { stdinFills = 1; }
     }
 
     xcb_connection_t* c = xcb_connect(NULL, NULL);
@@ -141,6 +153,17 @@ int main(int argc, char** argv) {
                             (uint32_t)strlen(startupId), startupId);
     }
 
+    // GC for --fill / --stdin-fills. Foreground is set per fill; the hex
+    // color is used directly as the pixel value (TrueColor RGB masks, which
+    // is what Xwayland's root visual always is).
+    xcb_gcontext_t gc = xcb_generate_id(c);
+    {
+        uint32_t gcMask = XCB_GC_FOREGROUND;
+        uint32_t gcVal = fillColor ? (uint32_t)strtoul(fillColor, NULL, 16)
+                                   : screen->black_pixel;
+        xcb_create_gc(c, gc, win, gcMask, &gcVal);
+    }
+
     xcb_map_window(c, win);
     xcb_flush(c);
     printf("[x11] mapped 0x%x\n", win);
@@ -217,6 +240,12 @@ int main(int argc, char** argv) {
     xcb_atom_t WM_STATE = 0;
     int wmStateReported = 0;
     if (probeWmState) WM_STATE = intern(c, "WM_STATE");
+    // Current window size; ConfigureNotify updates it so --fill repaints the
+    // WM-chosen size, not the creation size.
+    uint16_t curW = (uint16_t)w, curH = (uint16_t)h;
+    // Line accumulator for --stdin-fills.
+    char lineBuf[256];
+    size_t lineLen = 0;
     for (;;) {
         // --probe-wm-state: poll WM_STATE on this window every tick until
         // it appears (the WM sets NormalState after taking us over).
@@ -233,9 +262,39 @@ int main(int argc, char** argv) {
             free(r);
         }
         if (elapsedMs >= deadlineMs) break;
-        struct pollfd p = { .fd = fd, .events = POLLIN };
-        poll(&p, 1, stepMs);
+        struct pollfd p[2] = {
+            { .fd = fd, .events = POLLIN },
+            { .fd = 0, .events = stdinFills ? POLLIN : 0 },
+        };
+        poll(p, stdinFills ? 2 : 1, stepMs);
         elapsedMs += stepMs;
+        // --stdin-fills: consume complete "fill X Y W H RRGGBB" lines and
+        // paint the requested sub-rectangle in place -- the incremental-
+        // repaint pattern whose damage propagation the harness asserts on.
+        if (stdinFills && (p[1].revents & (POLLIN | POLLHUP))) {
+            ssize_t rd = read(0, lineBuf + lineLen, sizeof(lineBuf) - 1 - lineLen);
+            if (rd > 0) {
+                lineLen += (size_t)rd;
+                lineBuf[lineLen] = 0;
+                char* nl;
+                while ((nl = strchr(lineBuf, '\n'))) {
+                    *nl = 0;
+                    int fx, fy; unsigned fw, fh; char hex[16];
+                    if (sscanf(lineBuf, "fill %d %d %u %u %15s", &fx, &fy, &fw, &fh, hex) == 5) {
+                        uint32_t pix = (uint32_t)strtoul(hex, NULL, 16);
+                        xcb_change_gc(c, gc, XCB_GC_FOREGROUND, &pix);
+                        xcb_rectangle_t r = { (int16_t)fx, (int16_t)fy, (uint16_t)fw, (uint16_t)fh };
+                        xcb_poly_fill_rectangle(c, win, gc, 1, &r);
+                        xcb_flush(c);
+                        printf("[x11] filled %d %d %u %u\n", fx, fy, fw, fh);
+                        fflush(stdout);
+                    }
+                    const size_t rest = lineLen - (size_t)(nl + 1 - lineBuf);
+                    memmove(lineBuf, nl + 1, rest + 1);
+                    lineLen = rest;
+                }
+            }
+        }
         xcb_generic_event_t* ev;
         while ((ev = xcb_poll_for_event(c))) {
             const uint8_t type = ev->response_type & 0x7f;
@@ -243,10 +302,24 @@ int main(int argc, char** argv) {
             const int synthetic = (ev->response_type & 0x80) != 0;
             if (type == XCB_CONFIGURE_NOTIFY) {
                 xcb_configure_notify_event_t* cn = (xcb_configure_notify_event_t*)ev;
+                curW = cn->width; curH = cn->height;
                 printf("[x11] configure %s x=%d y=%d w=%u h=%u\n",
                        synthetic ? "synthetic" : "real",
                        cn->x, cn->y, cn->width, cn->height);
                 fflush(stdout);
+            } else if (type == XCB_EXPOSE) {
+                // --fill: (re)paint the whole window so tests get
+                // deterministic pixels. Repainting per Expose (not once at
+                // map) survives WM resizes and X server-side reallocation.
+                if (fillColor) {
+                    uint32_t pix = (uint32_t)strtoul(fillColor, NULL, 16);
+                    xcb_change_gc(c, gc, XCB_GC_FOREGROUND, &pix);
+                    xcb_rectangle_t r = { 0, 0, curW, curH };
+                    xcb_poly_fill_rectangle(c, win, gc, 1, &r);
+                    xcb_flush(c);
+                    printf("[x11] filled full %ux%u\n", curW, curH);
+                    fflush(stdout);
+                }
             } else if (type == XCB_FOCUS_IN) {
                 printf("[x11] focused\n");
                 fflush(stdout);

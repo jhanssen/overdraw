@@ -2125,7 +2125,18 @@ export class JsCompositor implements CompositorSink {
     if (!surf) { surf = blankSurface(0, 0, 0, 0); this.surfaces.set(id, surf); }
     // Stash the client damage for this commit; bindImportToSurface consumes it
     // when the async import binds to scope the output repaint. null = full.
-    surf.pendingContentDamage = damage ?? null;
+    // A prior commit's damage may still be unconsumed (its import hasn't
+    // bound yet -- pipelined commits during import latency): UNION with it,
+    // don't replace. The bind that eventually consumes this shows the newest
+    // buffer, whose delta against what's on screen is the union of every
+    // interim commit's region. null (= full) absorbs everything.
+    if (surf.pendingContentDamage === undefined) {
+      surf.pendingContentDamage = damage ?? null;
+    } else if (surf.pendingContentDamage !== null && damage) {
+      surf.pendingContentDamage = [...surf.pendingContentDamage, ...damage];
+    } else {
+      surf.pendingContentDamage = null;
+    }
 
     // wp_linux_drm_syncobj_v1: stash the explicit-sync acquire fence keyed by
     // BUFFER (not surface). openImportBrackets consumes the fence the first
