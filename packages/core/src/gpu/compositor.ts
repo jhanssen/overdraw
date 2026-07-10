@@ -1618,7 +1618,10 @@ export class JsCompositor implements CompositorSink {
     // Standalone bracketed submit: open the client import's access bracket,
     // render the surface filling the snapshot (its crop/transform apply), close
     // the bracket. FIFO-ordered on the wire like any other sample.
-    if (!this.addon.writeBeginAccess(imp.importId)) { this.releaseSnapTex(snap); return; }
+    if (!this.beginClientAccess(s.currentBufferId, imp.importId)) {
+      this.releaseSnapTex(snap);
+      return;
+    }
     const enc = this.device.createCommandEncoder();
     this.composite({
       encoder: enc, targetView: snap.view, drawList: [id],
@@ -2893,6 +2896,31 @@ export class JsCompositor implements CompositorSink {
     this.device.queue.writeBuffer(s.uniformBuf, 0, data);
   }
 
+  // Open the import's access bracket, consuming the buffer's pending
+  // explicit-sync acquire fence if one is stashed.
+  //
+  // wp_linux_drm_syncobj_v1: when the most recent commit carried an acquire
+  // fence, hand it to the GPU process via writeBeginAccessWithFence -- it
+  // waits on THAT sync_file instead of running EXPORT_SYNC_FILE on the
+  // dmabuf (the implicit-sync path). Clients on drivers that don't attach
+  // implicit fences (NVIDIA proprietary, incl. Xwayland/glamor) are
+  // unsynchronized without this wait: sampling races the client's GPU
+  // writes and reads stale or never-written (transparent) content.
+  //
+  // The fence is one-shot per commit: once one Begin waits on it, later
+  // samples of the same buffer chain on the GPU process's access-fence
+  // sequence; nothing writes the dmabuf again until the client re-commits.
+  // EVERY path that samples a client dmabuf must Begin through here so the
+  // wait happens on whichever sample runs first after the commit.
+  private beginClientAccess(bufferId: number, importId: number): boolean {
+    const fenceFd = this.bufferIdToAcquireFenceFd.get(bufferId);
+    if (fenceFd && !fenceFd.closed) {
+      this.bufferIdToAcquireFenceFd.delete(bufferId);
+      return this.addon.writeBeginAccessWithFence(importId, fenceFd);
+    }
+    return this.addon.writeBeginAccess(importId);
+  }
+
   // Open per-frame dmabuf import brackets for every surface in `drawList`
   // that has a live dmabuf import. Appends to `bracketed`; de-dupes on
   // importId so an import shared across multiple draw lists (on-screen +
@@ -2950,27 +2978,7 @@ export class JsCompositor implements CompositorSink {
       // writeBeginAccess therefore must succeed; a false return means the
       // JS-side import gate and the core's jsImportHandles_ map have desynced
       // -- a contract violation, not a recoverable per-frame condition.
-      //
-      // wp_linux_drm_syncobj_v1: if the surface has an explicit-sync acquire
-      // fence stashed from the most recent commit, hand it to the GPU process
-      // via writeBeginAccessWithFence. The GPU process then waits on THAT
-      // sync_file as the acquire fence instead of running EXPORT_SYNC_FILE on
-      // the dmabuf (the implicit-sync path) -- this is the fix for clients
-      // like the NVIDIA proprietary driver that don't attach implicit fences.
-      // Consumed one-shot per commit; an explicit fence covers one Begin.
-      let beginOk: boolean;
-      // Consume a per-buffer acquire fence if one is pending for THIS bufferId.
-      // The fence is one-shot per commit: kitty signals the acquire timeline
-      // point when its GPU writes complete; once Dawn waits on it for our
-      // first sample of the buffer, no later sample of the same buffer needs
-      // a fence (the dmabuf isn't being written until the client re-commits).
-      const fenceFd = this.bufferIdToAcquireFenceFd.get(s.currentBufferId);
-      if (fenceFd && !fenceFd.closed) {
-        this.bufferIdToAcquireFenceFd.delete(s.currentBufferId);
-        beginOk = this.addon.writeBeginAccessWithFence(imp.importId, fenceFd);
-      } else {
-        beginOk = this.addon.writeBeginAccess(imp.importId);
-      }
+      const beginOk = this.beginClientAccess(s.currentBufferId, imp.importId);
       if (!beginOk) {
         throw new Error(
           `writeBeginAccess returned false for live import ` +
@@ -3764,21 +3772,7 @@ export class JsCompositor implements CompositorSink {
       // the import will be live.
       return false;
     }
-    // Consume any pending acquire fence on this buffer (one-shot per
-    // commit; either this bracket or the main renderFrame's bracket
-    // wins). The compositor's renderFrame de-dupes by importId per
-    // frame; consuming the fence here means renderFrame will fall
-    // through to the non-fence Begin, which is correct (the dmabuf
-    // is already accessible after our Begin succeeded).
-    const fenceFd = this.bufferIdToAcquireFenceFd.get(s.currentBufferId);
-    let beginOk: boolean;
-    if (fenceFd && !fenceFd.closed) {
-      this.bufferIdToAcquireFenceFd.delete(s.currentBufferId);
-      beginOk = this.addon.writeBeginAccessWithFence(imp.importId, fenceFd);
-    } else {
-      beginOk = this.addon.writeBeginAccess(imp.importId);
-    }
-    if (!beginOk) return false;
+    if (!this.beginClientAccess(s.currentBufferId, imp.importId)) return false;
     try {
       fn();
     } finally {
@@ -4058,30 +4052,26 @@ export class JsCompositor implements CompositorSink {
   }): boolean {
     const s = this.surfaces.get(args.surfaceId);
     if (!s || !s.texture) return false;
-    // The client texture's import bracket must be open during the
-    // copy (its dmabuf has a SharedTextureMemory access bracket the
-    // GPU process needs to know about). Use the same import-bracket
-    // mechanism the on-screen frame uses: openImportBrackets ->
-    // copy -> closeImportBrackets.
-    // tickleLifecycle=false: this copy runs as a post-on-screen-submit
-    // callback, outside the on-screen lifecycle frame; the wire-level
-    // bracket still has to fire (the GPU process needs the per-texture
-    // BeginAccess) but the JS-side frameSampled would throw without an
-    // open frameStart.
-    const bracketed: Array<{ importId: number; bufferId: number }> = [];
-    this.openImportBrackets([args.surfaceId], bracketed, /*tickleLifecycle*/ false);
-    try {
+    const clientTex = s.texture;
+    // The client texture's import bracket must be open during the copy (its
+    // dmabuf has a SharedTextureMemory access bracket the GPU process needs
+    // to know about), and the bracket must consume any pending explicit-sync
+    // acquire fence -- this copy is the FIRST sample of the client's commit
+    // for an intercepted surface (the on-screen draw samples the intercept
+    // output, never the client dmabuf, so no other path waits on the fence).
+    // withClientTextureAccess does both. openImportBrackets would do
+    // neither: its intercept-output gate skips this surface entirely,
+    // leaving the copy unbracketed and unsynchronized against the client's
+    // GPU writes.
+    return this.withClientTextureAccess(args.surfaceId, () => {
       const enc = this.device.createCommandEncoder();
       enc.copyTextureToTexture(
-        { texture: s.texture, mipLevel: 0, origin: { x: 0, y: 0, z: 0 } },
+        { texture: clientTex, mipLevel: 0, origin: { x: 0, y: 0, z: 0 } },
         { texture: args.dstTex, mipLevel: 0, origin: { x: 0, y: 0, z: 0 } },
         { width: s.width, height: s.height, depthOrArrayLayers: 1 },
       );
       this.device.queue.submit([enc.finish()]);
-    } finally {
-      this.closeImportBrackets(bracketed, /*tickleLifecycle*/ false);
-    }
-    return true;
+    });
   }
 
   // Register a per-frame produce callback. The compositor
