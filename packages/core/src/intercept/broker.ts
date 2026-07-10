@@ -109,6 +109,9 @@ export interface WorkerMatchedNotification {
   info: InterceptSurfaceInfo;
   width: number;
   height: number;
+  // Opaque (X-alpha) buffer format at match time: the worker's render must
+  // force alpha=1 when sampling the input (see InterceptInput.opaque).
+  opaque: boolean;
 }
 
 interface ActiveRegistrationWorker {
@@ -444,6 +447,7 @@ export class InterceptBroker {
     const tickDeps: InThreadTickDeps = {
       device: inThread.device,
       clientTexture: (sid) => this.deps.compositor.surfaceClientTexture?.(sid) ?? null,
+      surfaceOpaque: (sid) => this.deps.compositor.surfaceIsOpaque?.(sid) ?? false,
       surfaceLogicalSize: (sid) => this.deps.compositor.surfaceLogicalSize?.(sid) ?? null,
       contentEpoch: (sid) => this.deps.compositor.surfaceContentEpoch?.(sid) ?? 0,
       isPresentable: (sid) => this.deps.compositor.surfaceIsPresentable?.(sid) ?? false,
@@ -596,6 +600,7 @@ export class InterceptBroker {
         info,
         width: client.w,
         height: client.h,
+        opaque: this.deps.compositor.surfaceIsOpaque?.(surfaceId) ?? false,
       });
     } catch (e: unknown) {
       const msg = e instanceof Error ? e.message : String(e);

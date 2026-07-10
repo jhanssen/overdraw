@@ -54,8 +54,10 @@ function stubCompositor(initial = {}) {
   const presentable = new Set(Object.entries(initial.presentable ?? {}).filter(([, v]) => v).map(([k]) => Number(k)));
   const wmRects = new Map(Object.entries(initial.wmRects ?? {}).map(([k, v]) => [Number(k), v]));
   const logicalSizes = new Map();
+  const opaqueSurfaces = new Set();
   return {
     log,
+    setOpaque(sid, o) { o ? opaqueSurfaces.add(sid) : opaqueSurfaces.delete(sid); },
     setClientTexture(sid, tex) {
       if (tex === null) clientTextures.delete(sid);
       else clientTextures.set(sid, tex);
@@ -87,6 +89,9 @@ function stubCompositor(initial = {}) {
       },
       surfaceLogicalSize(surfaceId) {
         return logicalSizes.get(surfaceId) ?? null;
+      },
+      surfaceIsOpaque(surfaceId) {
+        return opaqueSurfaces.has(surfaceId);
       },
     },
   };
@@ -246,6 +251,28 @@ test('broker: tick calls render only for presentable + textured surfaces', async
   const installs = comp.log.filter((e) => e.kind === 'install');
   assert.equal(installs.length, 1);
   assert.equal(installs[0].surfaceId, 1);
+});
+
+test('broker: opaque buffer format flows into render input.opaque', async () => {
+  const { broker, bus, comp } = setup();
+  const seen = [];
+  await broker.registerInThread({
+    name: 'test',
+    match: { appId: appIdMatch('.*') },
+    setup: () => ({
+      render: ({ input }) => { seen.push(input.opaque); },
+    }),
+  }, 'test-plugin');
+  bus.emit(WINDOW_EVENT.map, mapEvent(1, 'firefox'));
+  comp.setClientTexture(1, { texture: fakeTexture(64, 64), w: 64, h: 64 });
+  comp.setPresentable(1, true);
+  // ARGB-style buffer: alpha is meaningful.
+  broker.tick(0);
+  assert.deepEqual(seen, [false]);
+  // XRGB-style buffer: the alpha byte is undefined; the plugin must be told.
+  comp.setOpaque(1, true);
+  broker.tick(16);
+  assert.deepEqual(seen, [false, true]);
 });
 
 test('broker: render outputRect propagates as install placement', async () => {

@@ -3715,6 +3715,15 @@ export class JsCompositor implements CompositorSink {
     if (s) s.contentEpoch++;
   }
 
+  // Whether the surface's current buffer is an opaque (X-alpha) format whose
+  // alpha byte must be ignored. The intercept broker forwards this to plugin
+  // renders so they can force alpha=1 when sampling the client texture --
+  // the shader-level force in the compositor's own draw applies only to the
+  // raw (non-intercepted) path.
+  surfaceIsOpaque(surfaceId: number): boolean {
+    return this.surfaces.get(surfaceId)?.opaque ?? false;
+  }
+
   // Monotonic per-surface content version (bumped on each new client commit).
   // The intercept broker compares it across ticks to set ctx.contentChanged.
   surfaceContentEpoch(surfaceId: number): number {

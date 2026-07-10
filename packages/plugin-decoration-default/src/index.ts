@@ -62,6 +62,7 @@ interface PerWindow {
   lastBufferH: number;
   lastContentX: number;
   lastContentY: number;
+  lastOpaque: boolean;
   // The surfaceRect this window was last RENDERED at (placement). Used with
   // the caches above to skip re-rendering when nothing changed.
   lastSurfaceRect: { x: number; y: number; w: number; h: number } | null;
@@ -167,6 +168,7 @@ export default async function init(sdk: PluginSdkShape, rawConfig?: unknown): Pr
             lastBufferH: 0,
             lastContentX: 0,
             lastContentY: 0,
+            lastOpaque: false,
             lastSurfaceRect: null,
             lastScale: 0,   // 0 never matches a real scale; first render computes
             innerParams: encodeShape(null),
@@ -202,6 +204,7 @@ export default async function init(sdk: PluginSdkShape, rawConfig?: unknown): Pr
           const bufferH = input.texture.height;
           const contentX = input.rect.x;
           const contentY = input.rect.y;
+          const opaque = input.opaque;
           const scale = ctx.inputScale;
           const fill: ResolvedFill = ctx.activated ? config.focused : config.unfocused;
           const sr = ctx.surfaceRect;
@@ -232,7 +235,7 @@ export default async function init(sdk: PluginSdkShape, rawConfig?: unknown): Pr
           const willSkip = !ctx.contentChanged && fill === w.lastFill && rectUnchanged
               && outputW === w.lastOutputW && outputH === w.lastOutputH
               && inputW === w.lastInputW && inputH === w.lastInputH
-              && scale === w.lastScale;
+              && scale === w.lastScale && opaque === w.lastOpaque;
           if (willSkip) {
             return false;
           }
@@ -245,7 +248,7 @@ export default async function init(sdk: PluginSdkShape, rawConfig?: unknown): Pr
           const inputChanged = inputW !== w.lastInputW || inputH !== w.lastInputH
             || bufferW !== w.lastBufferW || bufferH !== w.lastBufferH
             || contentX !== w.lastContentX || contentY !== w.lastContentY
-            || scale !== w.lastScale;
+            || scale !== w.lastScale || opaque !== w.lastOpaque;
           if (scale !== w.lastScale) {
             w.innerParams = innerParamsFor(scale);
           }
@@ -255,7 +258,7 @@ export default async function init(sdk: PluginSdkShape, rawConfig?: unknown): Pr
           if (borderChanged || inputChanged) {
             writeBlitUniforms(pipeline.device, w.draw,
               outputW, outputH, inputW, inputH, bufferW, bufferH,
-              contentX, contentY, ringBorder(scale), w.innerParams, fill);
+              contentX, contentY, ringBorder(scale), w.innerParams, fill, opaque);
           }
           w.lastOutputW = outputW;
           w.lastOutputH = outputH;
@@ -266,6 +269,7 @@ export default async function init(sdk: PluginSdkShape, rawConfig?: unknown): Pr
           w.lastBufferH = bufferH;
           w.lastContentX = contentX;
           w.lastContentY = contentY;
+          w.lastOpaque = opaque;
           w.lastScale = scale;
 
           encodeFrame(pipeline, w.draw, output.texture.createView(), input.texture);

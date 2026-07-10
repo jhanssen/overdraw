@@ -42,6 +42,11 @@ static volatile sig_atomic_t running = 1;
 // --fill-configured: track the latest configured content size so the client can
 // resize its buffer to fill the compositor-assigned tile (tiling WM path).
 static int fill_configured = 0;
+// --xrgb: commit XRGB8888 instead of ARGB8888. The color's top byte is written
+// verbatim into the buffer's X byte, which XRGB semantics say the compositor
+// must ignore -- pass 00RRGGBB to exercise the garbage-X-byte case an X11
+// 24-bit visual produces.
+static uint32_t shm_format = WL_SHM_FORMAT_ARGB8888;
 static int cfg_w = 0, cfg_h = 0;   // latest xdg_toplevel.configure size (0 = unset)
 // Initial state requests (sent BEFORE the initial commit so the server's first
 // configure carries the resolved size + states): 0=none, 1=maximized,
@@ -199,7 +204,7 @@ static struct wl_buffer* make_solid_buffer(int w, int h, uint32_t color) {
     for (int i = 0; i < w * h; ++i) px[i] = color;
     munmap(px, poolSize);
     struct wl_shm_pool* pool = wl_shm_create_pool(shm, fd, poolSize);
-    struct wl_buffer* buf = wl_shm_pool_create_buffer(pool, 0, w, h, stride, WL_SHM_FORMAT_ARGB8888);
+    struct wl_buffer* buf = wl_shm_pool_create_buffer(pool, 0, w, h, stride, shm_format);
     wl_shm_pool_destroy(pool);  // the buffer holds its own ref to the mapping
     close(fd);
     return buf;
@@ -248,6 +253,7 @@ int main(int argc, char** argv) {
         else if (strcmp(argv[i], "--app-id") == 0 && i + 1 < argc) app_id = argv[++i];
         else if (strcmp(argv[i], "--frames") == 0) report_frames = 1;
         else if (strcmp(argv[i], "--fill-configured") == 0) fill_configured = 1;
+        else if (strcmp(argv[i], "--xrgb") == 0) shm_format = WL_SHM_FORMAT_XRGB8888;
         else if (strcmp(argv[i], "--shadow-margin") == 0 && i + 1 < argc) shadow_margin = atoi(argv[++i]);
         else if (strcmp(argv[i], "--initial-state") == 0 && i + 1 < argc) {
             const char* v = argv[++i];

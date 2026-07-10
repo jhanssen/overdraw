@@ -125,7 +125,9 @@ const BLIT_WGSL = /* wgsl */ `
 struct U {
   // size.xy = output texture size (px); .zw = inset origin (B, B).
   size      : vec4f,
-  // inputSize.xy = content (window) size in px = the inset extent; .zw unused.
+  // inputSize.xy = content (window) size in px = the inset extent; .z = 1
+  // when the client buffer is an opaque (X-alpha) format whose alpha byte
+  // is undefined garbage -- the sample's alpha is forced to 1; .w unused.
   inputSize : vec4f,
   // uvRect.xy = uv bias (contentOrigin / bufferSize); uvRect.zw = uv scale
   // (contentSize / bufferSize). Maps the inset-local position to the content
@@ -271,7 +273,10 @@ fn innerShape(ip : vec2f) -> vec2f {
   let s = innerShape(in.ip);
   let cov = sdfCoverage(s.x);
   if (cov <= 0.0) { discard; }   // corner cutouts keep the border pass's gradient
-  let sample = textureSample(tex, samp, in.uv);   // premultiplied client
+  var sample = textureSample(tex, samp, in.uv);   // premultiplied client
+  // Opaque (X-alpha) formats: the alpha channel is the buffer's undefined X
+  // byte, not coverage -- treat the pixel as fully opaque.
+  if (u.inputSize.z > 0.5) { sample = vec4f(sample.rgb, 1.0); }
   let band = gradientAt(u.size.zw + in.ip);       // premultiplied border at this pixel
   // Band underlay: within one corner radius of the inner edge the client is
   // composited source-over the band, so a client that rounds its own corners
@@ -459,6 +464,7 @@ export function writeBlitUniforms(
   borderWidth: number,
   inner: InnerShapeParams,
   fill: ResolvedFill,
+  opaqueInput: boolean,
 ): void {
   const data = new Float32Array(BLIT_UNIFORM_FLOATS);
   // size.xy = output dims; size.zw = inset origin (B, B)
@@ -466,9 +472,11 @@ export function writeBlitUniforms(
   data[1] = outputH;
   data[2] = borderWidth;
   data[3] = borderWidth;
-  // inputSize.xy = content (window) dims = the inset extent
+  // inputSize.xy = content (window) dims = the inset extent; .z = force
+  // alpha=1 (opaque X-alpha buffer format)
   data[4] = inputW;
   data[5] = inputH;
+  data[6] = opaqueInput ? 1 : 0;
   // uvRect = (bias.xy, scale.xy): sample the [contentX,contentY]+(inputW x
   // inputH) sub-region of the bufferW x bufferH texture.
   const bw = Math.max(bufferW, 1);

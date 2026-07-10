@@ -23,6 +23,9 @@ export interface InThreadTickDeps {
   // the intercept output (the surface draws raw / nothing).
   clientTexture(surfaceId: number):
     { texture: GPUTexture; w: number; h: number } | null;
+  // Whether the surface's current buffer is an opaque (X-alpha) format --
+  // forwarded to the plugin as input.opaque so its sampling forces alpha=1.
+  surfaceOpaque(surfaceId: number): boolean;
   // The surface's intrinsic logical size (viewport destination, else buffer
   // dims / buffer_scale). Divides the client texture's buffer-pixel dims to
   // give the surface-local -> buffer-pixel scale factor; a fractional-scale
@@ -245,6 +248,7 @@ export class InThreadInterceptState {
           input: {
             texture: input.texture,
             rect: { x: cx, y: cy, w: cw, h: ch },
+            opaque: this.deps.surfaceOpaque(this.surfaceId),
           },
           output: {
             texture: outTex,

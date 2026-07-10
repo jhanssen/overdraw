@@ -106,6 +106,12 @@ export interface InterceptInput {
   // (rect.x/y and rect.w/h against texture.width/height); it is NOT always
   // the full texture.
   rect: Rect;
+  // True when the client committed an opaque-format buffer (XRGB8888 shm,
+  // XR24/XB24/XR30 dmabuf, ...): the texture's alpha channel is the format's
+  // undefined X byte, NOT coverage. A plugin that samples the texture and
+  // blends MUST force alpha to 1 when this is set (X11 clients through
+  // Xwayland routinely leave garbage in the X byte).
+  opaque: boolean;
 }
 
 export interface InterceptOutput {

@@ -50,14 +50,14 @@ function bgraTexture(device, w, h, bgra) {
 }
 
 async function renderDeco(device, jsCompositor, render, inputBgra,
-    shape = { kind: 0, radius: 0 }) {
+    shape = { kind: 0, radius: 0 }, opaqueInput = false) {
   const pipeline = render.createDecorationPipeline(device);
   const draw = render.createDecorationDraw(pipeline);
   render.writeBorderUniforms(device, draw, OUTW, OUTH, FILL);
   // No CSD shadow here: the content sub-rect is the whole buffer (bufferW/H =
   // INW/INH, offset 0,0), so the blit samples the full input.
   render.writeBlitUniforms(device, draw, OUTW, OUTH, INW, INH, INW, INH, 0, 0, B,
-    shape, FILL);
+    shape, FILL, opaqueInput);
   const input = bgraTexture(device, INW, INH, inputBgra);
   const output = device.createTexture({
     size: { width: OUTW, height: OUTH },
@@ -145,6 +145,20 @@ test("decoration blit preserves a translucent client's alpha; opaque unchanged",
     const or = px(opaqueRound, OUTW >> 1, B + 1);
     assert.ok(or[2] >= 250 && or[3] >= 250 && or[0] <= 6 && or[1] <= 6,
       `opaque near-edge should be solid red (no band bleed), got ${or}`);
+
+    // --- Opaque (X-alpha) input format: red pixels whose alpha byte is 0
+    // (an X11 24-bit visual's undefined X byte through Xwayland/glamor).
+    // With opaqueInput the blit must force alpha=1 -- the body reads solid
+    // red and the rim shows no band bleed-through. Without the flag the
+    // same input blends away (that's the bug this pins).
+    const xData = await renderDeco(device, jsCompositor, render, [0, 0, 255, 0],
+      ROUND, /*opaqueInput*/ true);
+    const xBody = px(xData, OUTW >> 1, OUTH >> 1);
+    assert.ok(xBody[2] >= 250 && xBody[3] >= 250 && xBody[0] <= 6 && xBody[1] <= 6,
+      `X-alpha body should be forced opaque red, got ${xBody}`);
+    const xRim = px(xData, OUTW >> 1, B + 1);
+    assert.ok(xRim[2] >= 250 && xRim[3] >= 250 && xRim[0] <= 6 && xRim[1] <= 6,
+      `X-alpha near-edge should be solid red (no band bleed), got ${xRim}`);
   } finally {
     addon.stop();
   }

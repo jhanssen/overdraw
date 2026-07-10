@@ -262,6 +262,7 @@ export function createWorkerInterceptSdk(deps: WorkerInterceptDeps): InterceptAP
       surfaceId: ev.surfaceId,
       pluginName,
       width: w, height: h,
+      opaque: ev.opaque ?? false,
       handlers: reg.handlers,
       info: { surfaceId: ev.surfaceId, role: ev.role, appId: ev.appId ?? undefined, title: ev.title ?? undefined },
       inputResKeys, outputResKeys,
@@ -336,6 +337,8 @@ interface MatchedEvent {
   surfaceId: number;
   width: number;
   height: number;
+  // Opaque (X-alpha) buffer format at match time (see InterceptInput.opaque).
+  opaque?: boolean;
   role: "toplevel" | "popup" | "subsurface";
   appId: string | null;
   title: string | null;
@@ -352,6 +355,7 @@ interface PerSurfaceConfig {
   pluginName: string;
   width: number;
   height: number;
+  opaque: boolean;
   handlers: InterceptHandlers;
   info: { surfaceId: number; role: "toplevel" | "popup" | "subsurface"; appId?: string; title?: string };
   inputResKeys: number[];
@@ -494,6 +498,7 @@ class WorkerPerSurfaceState {
           input: {
             texture: inputTex,
             rect: { x: 0, y: 0, w: this.cfg.width, h: this.cfg.height },
+            opaque: this.cfg.opaque,
           },
           output: {
             texture: outputTex,

@@ -22,10 +22,13 @@
 #include "xdg-shell-client-protocol.h"
 #include "linux-dmabuf-v1-client-protocol.h"
 
-#define W 64
-#define H 64
 #define DRM_FORMAT_ARGB8888 0x34325241  /* 'AR24' */
+#define DRM_FORMAT_XRGB8888 0x34325258  /* 'XR24' */
 #define DRM_FORMAT_MOD_LINEAR 0ULL
+
+static int W = 64;
+static int H = 64;
+static int cfg_w = 0, cfg_h = 0;  /* latest xdg_toplevel.configure size */
 
 static struct wl_compositor* compositor = NULL;
 static struct xdg_wm_base* wm_base = NULL;
@@ -36,7 +39,7 @@ static struct wl_buffer* the_buffer = NULL;
 static void wmPing(void* d, struct xdg_wm_base* b, uint32_t serial) { (void)d; xdg_wm_base_pong(b, serial); }
 static const struct xdg_wm_base_listener wmListener = { wmPing };
 
-static void tlConfigure(void* d, struct xdg_toplevel* t, int32_t w, int32_t h, struct wl_array* s) { (void)d;(void)t;(void)w;(void)h;(void)s; }
+static void tlConfigure(void* d, struct xdg_toplevel* t, int32_t w, int32_t h, struct wl_array* s) { (void)d;(void)t;(void)s; if (w > 0) cfg_w = w; if (h > 0) cfg_h = h; }
 static void tlClose(void* d, struct xdg_toplevel* t) { (void)d;(void)t; }
 static void tlConfigureBounds(void* d, struct xdg_toplevel* t, int32_t w, int32_t h) { (void)d;(void)t;(void)w;(void)h; }
 static void tlWmCaps(void* d, struct xdg_toplevel* t, struct wl_array* c) { (void)d;(void)t;(void)c; }
@@ -65,7 +68,26 @@ static void regRemove(void* data, struct wl_registry* reg, uint32_t name) { (voi
 static const struct wl_registry_listener regListener = { regGlobal, regRemove };
 
 int main(int argc, char** argv) {
-    if (argc < 2) { fprintf(stderr, "usage: %s <socket>\n", argv[0]); return 2; }
+    if (argc < 2) { fprintf(stderr, "usage: %s <socket> [--format xrgb] [--pixel AARRGGBB] [--hold-ms N] [--app-id ID]\n", argv[0]); return 2; }
+    uint32_t fourcc = DRM_FORMAT_ARGB8888;
+    uint32_t pixel = 0xFFFF0000u;   /* ARGB red */
+    int hold_ms = 400;
+    int fit_configure = 0;
+    const char* app_id = NULL;
+    for (int i = 2; i < argc; ++i) {
+        if (strcmp(argv[i], "--format") == 0 && i + 1 < argc) {
+            if (strcmp(argv[++i], "xrgb") == 0) fourcc = DRM_FORMAT_XRGB8888;
+        }
+        /* Written verbatim: with --format xrgb the top byte lands in the X
+           byte, which the compositor must ignore (pass 00RRGGBB to model an
+           X11 24-bit visual's undefined X byte). */
+        else if (strcmp(argv[i], "--pixel") == 0 && i + 1 < argc) pixel = (uint32_t)strtoul(argv[++i], NULL, 16);
+        else if (strcmp(argv[i], "--hold-ms") == 0 && i + 1 < argc) hold_ms = atoi(argv[++i]);
+        else if (strcmp(argv[i], "--app-id") == 0 && i + 1 < argc) app_id = argv[++i];
+        /* Size the buffer from the first xdg configure (the WM's tile), so a
+           gated consumer (decoration contentReady) sees a size-correct commit. */
+        else if (strcmp(argv[i], "--fit-configure") == 0) fit_configure = 1;
+    }
 
     struct wl_display* display = wl_display_connect(argv[1]);
     if (!display) { fprintf(stderr, "[client] connect failed\n"); return 1; }
@@ -81,24 +103,36 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    // Allocate a LINEAR ARGB8888 dmabuf via GBM on the primary render node.
+    struct wl_surface* surface = wl_compositor_create_surface(compositor);
+    struct xdg_surface* xs = xdg_wm_base_get_xdg_surface(wm_base, surface);
+    xdg_surface_add_listener(xs, &xsListener, NULL);
+    struct xdg_toplevel* toplevel = xdg_surface_get_toplevel(xs);
+    xdg_toplevel_add_listener(toplevel, &tlListener, NULL);
+    xdg_toplevel_set_title(toplevel, "overdraw-dmabuf-test");
+    if (app_id) xdg_toplevel_set_app_id(toplevel, app_id);
+
+    wl_surface_commit(surface);     // map -> configure
+    wl_display_roundtrip(display);
+    if (fit_configure && cfg_w > 0 && cfg_h > 0) { W = cfg_w; H = cfg_h; }
+
+    // Allocate a LINEAR dmabuf via GBM on the primary render node.
     const char* rnode = getenv("OVERDRAW_RENDER_NODE"); if (!rnode || !*rnode) { fprintf(stderr, "[client] OVERDRAW_RENDER_NODE not set\n"); return 1; }
     int drm = open(rnode, O_RDWR | O_CLOEXEC);
     if (drm < 0) { perror("open render node"); return 1; }
     struct gbm_device* gbm = gbm_create_device(drm);
     if (!gbm) { fprintf(stderr, "[client] gbm_create_device failed\n"); return 1; }
     uint64_t mod = DRM_FORMAT_MOD_LINEAR;
-    struct gbm_bo* bo = gbm_bo_create_with_modifiers(gbm, W, H, DRM_FORMAT_ARGB8888, &mod, 1);
-    if (!bo) bo = gbm_bo_create(gbm, W, H, DRM_FORMAT_ARGB8888, GBM_BO_USE_LINEAR | GBM_BO_USE_RENDERING);
+    struct gbm_bo* bo = gbm_bo_create_with_modifiers(gbm, W, H, fourcc, &mod, 1);
+    if (!bo) bo = gbm_bo_create(gbm, W, H, fourcc, GBM_BO_USE_LINEAR | GBM_BO_USE_RENDERING);
     if (!bo) { fprintf(stderr, "[client] gbm_bo_create failed\n"); return 1; }
 
     uint32_t stride = 0;
     void* map_data = NULL;
     void* ptr = gbm_bo_map(bo, 0, 0, W, H, GBM_BO_TRANSFER_WRITE, &stride, &map_data);
     if (!ptr || ptr == MAP_FAILED) { fprintf(stderr, "[client] gbm_bo_map failed\n"); return 1; }
-    for (uint32_t y = 0; y < H; ++y) {
+    for (int y = 0; y < H; ++y) {
         uint32_t* row = (uint32_t*)((uint8_t*)ptr + (size_t)y * stride);
-        for (uint32_t x = 0; x < W; ++x) row[x] = 0xFFFF0000u;  /* ARGB red */
+        for (int x = 0; x < W; ++x) row[x] = pixel;
     }
     gbm_bo_unmap(bo, map_data);
 
@@ -112,18 +146,8 @@ int main(int argc, char** argv) {
     struct zwp_linux_buffer_params_v1* params = zwp_linux_dmabuf_v1_create_params(dmabuf);
     zwp_linux_buffer_params_v1_add(params, fd, 0, offset, stride,
                                    (uint32_t)(modifier >> 32), (uint32_t)(modifier & 0xffffffff));
-    the_buffer = zwp_linux_buffer_params_v1_create_immed(params, W, H, DRM_FORMAT_ARGB8888, 0);
+    the_buffer = zwp_linux_buffer_params_v1_create_immed(params, W, H, fourcc, 0);
     zwp_linux_buffer_params_v1_destroy(params);
-
-    struct wl_surface* surface = wl_compositor_create_surface(compositor);
-    struct xdg_surface* xs = xdg_wm_base_get_xdg_surface(wm_base, surface);
-    xdg_surface_add_listener(xs, &xsListener, NULL);
-    struct xdg_toplevel* toplevel = xdg_surface_get_toplevel(xs);
-    xdg_toplevel_add_listener(toplevel, &tlListener, NULL);
-    xdg_toplevel_set_title(toplevel, "overdraw-dmabuf-test");
-
-    wl_surface_commit(surface);     // map -> configure
-    wl_display_roundtrip(display);
 
     wl_surface_attach(surface, the_buffer, 0, 0);
     wl_surface_damage(surface, 0, 0, W, H);
@@ -134,7 +158,7 @@ int main(int argc, char** argv) {
     printf("[client] committed dmabuf buffer (configured=%d)\n", surface_configured);
 
     close(fd);
-    usleep(400 * 1000);  // hold for the harness readback
+    usleep((useconds_t)hold_ms * 1000);  // hold for the harness readback
 
     xdg_toplevel_destroy(toplevel);
     xdg_surface_destroy(xs);

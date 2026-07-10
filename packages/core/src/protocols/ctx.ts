@@ -530,6 +530,10 @@ export interface CompositorSink {
   // plugin will read from). surfaceIsPresentable gates the per-frame
   // render dispatch to surfaces actually being composited.
   surfaceClientTexture?(surfaceId: number): { texture: GPUTexture; w: number; h: number } | null;
+  // Whether the surface's current buffer is an opaque (X-alpha) format: the
+  // texture's alpha channel is undefined and must be forced to 1 by whoever
+  // samples it (the intercept broker forwards this into plugin renders).
+  surfaceIsOpaque?(surfaceId: number): boolean;
   // The surface's intrinsic logical size (viewport destination, else buffer
   // dims / buffer_scale). The intercept tick divides the client texture's
   // buffer-pixel dims by this to map surface-local coordinates (e.g. the xdg

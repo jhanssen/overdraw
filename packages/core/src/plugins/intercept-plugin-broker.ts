@@ -81,6 +81,7 @@ export function createInterceptPluginBroker(deps: InterceptPluginBrokerDeps): In
           role: n.info.role,
           width: n.width,
           height: n.height,
+          opaque: n.opaque,
         });
       },
       notifyUnmatched: async (info) => {
