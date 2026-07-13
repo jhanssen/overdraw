@@ -77,6 +77,7 @@ const DEFAULT_INPUTS = [
   '/usr/share/wayland-protocols/staging/xwayland-shell/xwayland-shell-v1.xml',
   '/usr/share/wayland-protocols/staging/ext-data-control/ext-data-control-v1.xml',
   '/usr/share/wayland-protocols/stable/presentation-time/presentation-time.xml',
+  '/usr/share/wayland-protocols/staging/commit-timing/commit-timing-v1.xml',
   '/usr/share/wayland-protocols/staging/ext-foreign-toplevel-list/ext-foreign-toplevel-list-v1.xml',
   '/usr/share/wayland-protocols/staging/ext-image-capture-source/ext-image-capture-source-v1.xml',
   '/usr/share/wayland-protocols/staging/ext-image-copy-capture/ext-image-copy-capture-v1.xml',

@@ -317,6 +317,17 @@ target_include_directories(wp-presentation-client PRIVATE
     ${CMAKE_SOURCE_DIR}/native/wayland/generated)
 target_link_libraries(wp-presentation-client PRIVATE ${WAYLAND_CLIENT_LIBRARIES})
 
+# ---- commit-timing test client (timed commits + presentation feedback) ----
+add_executable(commit-timing-client
+    test/commit-timing-client.c
+    native/wayland/generated/xdg-shell-protocol.c
+    native/wayland/generated/presentation-time-protocol.c
+    native/wayland/generated/commit-timing-v1-protocol.c)
+target_include_directories(commit-timing-client PRIVATE
+    ${WAYLAND_CLIENT_INCLUDE_DIRS}
+    ${CMAKE_SOURCE_DIR}/native/wayland/generated)
+target_link_libraries(commit-timing-client PRIVATE ${WAYLAND_CLIENT_LIBRARIES})
+
 # ---- ext_foreign_toplevel_list test client ----
 add_executable(ext-foreign-toplevel-client
     test/ext-foreign-toplevel-client.c

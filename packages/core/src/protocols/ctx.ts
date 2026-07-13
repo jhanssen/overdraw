@@ -98,6 +98,11 @@ export interface SurfaceRecord {
     // points apply to exactly one commit and are not carried over.
     syncobjAcquire?: SyncobjPoint;
     syncobjRelease?: SyncobjPoint;
+    // wp_commit_timer_v1.set_timestamp: target presentation time for the
+    // next commit, in CLOCK_MONOTONIC nanoseconds (the wp_presentation
+    // clock domain). Consumed by wl_surface.commit: the commit's content
+    // update is not latched before this time.
+    commitTimestamp?: bigint;
   };
   committed: {
     buffer: Resource | null; bufferScale?: number; bufferTransform?: number;
@@ -131,6 +136,18 @@ export interface SurfaceRecord {
     syncobjAcquire?: SyncobjPoint;
     syncobjRelease?: SyncobjPoint;
   };
+  // wp_commit_timing_v1 timed-commit queue. A commit carrying a timestamp
+  // (or arriving while earlier queued commits are still waiting -- content
+  // updates apply in the order received) is diverted here: its accumulated
+  // `pending` set is captured whole and latched by the pump when the
+  // presentation clock reaches targetNs (undefined = no constraint, latches
+  // as soon as it reaches the head). See wl_surface.ts pumpTimedCommits.
+  timedCommits?: { set: SurfaceRecord["pending"]; targetNs?: bigint }[];
+  // Armed setTimeout for the queue head's target time; cleared on pump/teardown.
+  timedCommitTimer?: ReturnType<typeof setTimeout>;
+  // Set while a wp_commit_timer_v1 exists for this surface (one per surface;
+  // a second get_timer posts commit_timer_exists).
+  hasCommitTimer?: boolean;
   // Set once the client has called wp_linux_drm_syncobj_manager_v1.get_surface
   // for this wl_surface. While set, the surface is in explicit-sync mode: an
   // acquire+release point MUST accompany every buffer-attaching commit (per
@@ -651,6 +668,11 @@ export interface CompositorState {
   xdgOutputResources?: Map<number, Set<Resource>>;
   // wp_viewport resource -> its wl_surface resource (one viewport per surface).
   viewports?: Map<Resource, Resource>;
+  // wp_commit_timer_v1 resource -> its wl_surface resource (one timer per
+  // surface). The entry survives surface destruction (mapping to the dead
+  // resource) so set_timestamp can distinguish "surface destroyed" (the
+  // spec's surface_destroyed error) from an untracked timer.
+  commitTimers?: Map<Resource, Resource>;
   // wp_linux_drm_syncobj_timeline_v1 resource -> the DRM syncobj handle the
   // addon imported from the client's fd (drmSyncobjFDToHandle). Destroying the
   // timeline resource releases the handle (drmSyncobjDestroy).

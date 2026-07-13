@@ -6,7 +6,9 @@ test counts, and historical rationale live in `status-detailed.md`. This
 file is the short read; consult the detailed doc when investigating a
 specific subsystem.
 
-Last updated: 2026-06-28. Recent landings: per-keyboard keymaps with
+Last updated: 2026-07-12. Recent landings: commit-timing-v1 (per-surface
+timed commits latched at their target presentation-clock time; see the
+protocol list below). Prior: per-keyboard keymaps with
 active-keyboard arbitration (virtual keyboards honor their own keymap +
 modifiers); a protocol-wide audit pass that fixed event version-guard
 client-aborts (data-control DnD actions, xdg-output name/description +
@@ -747,6 +749,15 @@ type-check under `tsc --strict`.
   `wp_presentation` / `wp_presentation_feedback` (per-commit scanout
   timestamps for video apps; CLOCK_MONOTONIC; supersession on the
   next commit per spec; tested end-to-end),
+  `wp_commit_timing_manager_v1` / `wp_commit_timer_v1` (per-surface
+  timed commits: a commit carrying a set_timestamp target is held --
+  the whole pending set, captured in a per-surface FIFO that later
+  commits queue behind, preserving latch order -- and latched when the
+  presentation clock reaches the target, so it presents at the next
+  flip at-or-after it; no vblank prediction, so presentation lands
+  within one refresh after the target rather than at the nearest
+  vblank; unit-tested state machine + tested end-to-end via the
+  `commit-timing-client` timed-presentation assertions),
   `ext_foreign_toplevel_list_v1` / `ext_foreign_toplevel_handle_v1`
   (read-only toplevel enumeration with identifier + app_id + title
   for status panels, window switchers, screen-share window pickers;

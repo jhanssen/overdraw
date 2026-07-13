@@ -97,6 +97,7 @@ const GLOBALS = [
   "ext_data_control_manager_v1",
   "zwlr_data_control_manager_v1",
   "wp_presentation",
+  "wp_commit_timing_manager_v1",
   "ext_foreign_toplevel_list_v1",
   "ext_output_image_capture_source_manager_v1",
   "ext_foreign_toplevel_image_capture_source_manager_v1",
@@ -145,6 +146,7 @@ const CHILD_INTERFACES = [
   "zwlr_data_control_source_v1",
   "zwlr_data_control_offer_v1",
   "wp_presentation_feedback",
+  "wp_commit_timer_v1",
   "ext_foreign_toplevel_handle_v1",
   "ext_image_capture_source_v1",
   "ext_image_copy_capture_session_v1",
@@ -890,6 +892,7 @@ export async function installProtocols(
     ext_data_control_manager_v1: await import("./ext_data_control_v1.js"),
     zwlr_data_control_manager_v1: await import("./zwlr_data_control_v1.js"),
     wp_presentation: await import("./wp_presentation.js"),
+    wp_commit_timing_manager_v1: await import("./wp_commit_timing_v1.js"),
     ext_foreign_toplevel_list_v1: await import("./ext_foreign_toplevel_list_v1.js"),
     ext_output_image_capture_source_manager_v1: await import("./ext_image_copy_capture_v1.js"),
     xdg_wm_dialog_v1: await import("./xdg_dialog_v1.js"),
@@ -924,6 +927,7 @@ export async function installProtocols(
   const captureMod = await import("./ext_image_copy_capture_v1.js");
   const xdgDialogMod = await import("./xdg_dialog_v1.js");
   const xdgForeignMod = await import("./xdg_foreign_v2.js");
+  const commitTimingMod = await import("./wp_commit_timing_v1.js");
   const childHandlers: Record<string, object> = {
     wl_pointer: seatMod.makePointer(ctx),
     wl_keyboard: seatMod.makeKeyboard(ctx),
@@ -970,6 +974,7 @@ export async function installProtocols(
     // wp_presentation_feedback has no requests (event-only); the protocol layer
     // still needs a handler-shaped object to register.
     wp_presentation_feedback: {},
+    wp_commit_timer_v1: commitTimingMod.makeCommitTimer(ctx),
     ext_foreign_toplevel_handle_v1: extForeignTopMod.makeExtForeignToplevelHandle(ctx),
     ext_image_capture_source_v1: captureMod.makeImageCaptureSource(ctx),
     ext_image_copy_capture_session_v1: captureMod.makeImageCopyCaptureSession(ctx),

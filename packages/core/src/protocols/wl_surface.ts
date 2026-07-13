@@ -8,6 +8,11 @@
 // a sync-behaving parent is effectively sync; the main surface is always desync).
 // Applying a surface cascades into its effective-sync children's caches, so a
 // parent commit atomically applies the parent + all its synchronized descendants.
+//
+// A third path sits in front of both: commit timing (wp_commit_timer_v1). A
+// commit carrying a target timestamp -- or following one that does -- is
+// captured whole into a per-surface FIFO and replayed through the same
+// apply/cache logic once the presentation clock reaches its target time.
 
 import type { WlSurfaceHandler } from "#protocols-gen/wl_surface.js";
 import { WlSurface_Error } from "#protocols-gen/wl_surface.js";
@@ -393,6 +398,323 @@ function applySurfaceState(ctx: Ctx, s: SurfaceRecord, bufferFresh: boolean): bo
   return needsStackRebuild;
 }
 
+
+// wp_commit_timing_v1 deferred-latch queue -------------------------------
+
+// The presentation clock (wp_presentation advertises CLOCK_MONOTONIC);
+// process.hrtime.bigint() reads the same clock, in nanoseconds.
+function monotonicNowNs(): bigint {
+  return process.hrtime.bigint();
+}
+
+// Latch queued commits whose target time has passed, in order. Stops at the
+// first entry still in the future and arms a timer for it. The live
+// `pending` (requests accumulated toward the client's NEXT commit) is
+// parked during each latch so the replayed commit consumes exactly its own
+// captured set.
+function pumpTimedCommits(ctx: Ctx, s: SurfaceRecord): void {
+  if (s.timedCommitTimer !== undefined) {
+    clearTimeout(s.timedCommitTimer);
+    s.timedCommitTimer = undefined;
+  }
+  const q = s.timedCommits;
+  if (!q) return;
+  // A latch can tear the surface down (null-buffer unmap) and discard the
+  // queue reentrantly; the `s.timedCommits === q` check detects that.
+  while (s.timedCommits === q && q.length > 0) {
+    if (s.unmapped || s.resource.destroyed) {
+      discardTimedCommits(ctx.state, ctx.addon, s);
+      return;
+    }
+    const head = q[0];
+    if (head.targetNs !== undefined) {
+      const now = monotonicNowNs();
+      if (head.targetNs > now) {
+        const delayMs = Number((head.targetNs - now) / 1_000_000n) + 1;
+        s.timedCommitTimer = setTimeout(() => {
+          s.timedCommitTimer = undefined;
+          pumpTimedCommits(ctx, s);
+        }, delayMs);
+        return;
+      }
+    }
+    q.shift();
+    const live = s.pending;
+    s.pending = head.set;
+    commitNow(ctx, s);
+    s.pending = live;
+  }
+  if (s.timedCommits === q && q.length === 0) s.timedCommits = undefined;
+}
+
+// Drop a surface's timed-commit queue: cancel the armed timer and fire
+// `discarded` on any wp_presentation feedback captured in queued sets (the
+// updates will never present). Captured frame callbacks are dropped without
+// dispatch, matching the unmap path's handling of armed callbacks.
+function discardTimedCommits(state: CompositorState, addon: Addon, s: SurfaceRecord): void {
+  if (s.timedCommitTimer !== undefined) {
+    clearTimeout(s.timedCommitTimer);
+    s.timedCommitTimer = undefined;
+  }
+  const q = s.timedCommits;
+  if (!q) return;
+  s.timedCommits = undefined;
+  const fbEvents = state.events?.wp_presentation_feedback;
+  if (!fbEvents) return;
+  for (const entry of q) {
+    for (const cb of entry.set.presentationFeedbacks ?? []) {
+      if (cb.destroyed) continue;
+      fbEvents.send_discarded(cb);
+      addon.destroyResource(cb);
+    }
+  }
+}
+
+// Latch one commit: promote the surface's accumulated `pending` set into
+// committed/cached state and run every commit side effect (role
+// handshakes, unmap-on-null, layer-shell apply). Runs synchronously from
+// the commit request unless commit timing diverts the commit into the
+// timed queue, in which case the pump replays it here at its target time
+// with `s.pending` temporarily swapped to the captured set.
+function commitNow(ctx: Ctx, s: SurfaceRecord): void {
+  // Whether this commit carries a fresh wl_buffer.attach (to a buffer or to
+  // null). Drives the apply gate so a bare commit doesn't re-upload /
+  // double-release the unchanged buffer (see applySurfaceState).
+  const attachedThisCommit = s.pending.buffer !== undefined;
+
+  // Promote pending buffer into the commit set (undefined = unchanged).
+  if (s.pending.buffer !== undefined) {
+    s.committed.buffer = s.pending.buffer;
+    s.pending.buffer = undefined;
+  }
+  // buffer_scale travels with the buffer (double-buffered).
+  if (s.pending.bufferScale !== undefined) {
+    s.committed.bufferScale = s.pending.bufferScale;
+    s.pending.bufferScale = undefined;
+  }
+  if (s.pending.bufferTransform !== undefined) {
+    s.committed.bufferTransform = s.pending.bufferTransform;
+    s.pending.bufferTransform = undefined;
+  }
+  // Buffer offset accumulates into the surface's placement delta (consumed
+  // by the DnD drag-icon and popup positioning).
+  if (s.pending.offsetX !== undefined || s.pending.offsetY !== undefined) {
+    s.offsetDx = (s.offsetDx ?? 0) + (s.pending.offsetX ?? 0);
+    s.offsetDy = (s.offsetDy ?? 0) + (s.pending.offsetY ?? 0);
+    s.pending.offsetX = undefined;
+    s.pending.offsetY = undefined;
+  }
+  // Damage travels with the buffer (double-buffered); accumulate into the
+  // commit set (cleared by the upload in applySurfaceState).
+  if (s.pending.surfaceDamage) {
+    (s.committed.surfaceDamage ??= []).push(...s.pending.surfaceDamage);
+    s.pending.surfaceDamage = undefined;
+  }
+  if (s.pending.bufferDamage) {
+    (s.committed.bufferDamage ??= []).push(...s.pending.bufferDamage);
+    s.pending.bufferDamage = undefined;
+  }
+
+  // wp_linux_drm_syncobj_v1: acquire/release timeline points are
+  // double-buffered, applied to exactly one commit. The spec error checks
+  // (no_buffer / no_acquire_point / no_release_point / conflicting_points)
+  // would fire here in a compositor with wl_resource_post_error; today
+  // we silently drop the point on violation (status.md "no post_error").
+  // What we DO enforce locally: only honor points when a dmabuf buffer
+  // accompanies them -- otherwise the points are dropped (the shm path
+  // has no fence to wait on and no submit-completion to signal).
+  // promotePoints lives below the layer-shell discard so a discarded
+  // initial commit doesn't carry phantom points forward.
+
+  // Layer-shell: a buffer attached before the first configure-ack is
+  // invalid_surface_state per spec. Silent-drop convention (no
+  // post_error path in this compositor today; see top of
+  // zwlr_layer_shell_v1.ts); discard the buffer so it never reaches
+  // the GPU.
+  if (s.layerSurface && isLayerSurfaceInitialCommit(s.layerSurface) && s.committed.buffer) {
+    s.committed.buffer = null;
+  }
+
+  // Promote the pending syncobj points. Only honored when a dmabuf is
+  // attached this commit (a buffer-less commit drops the points outright;
+  // an shm commit logs and drops, since explicit-sync is undefined there
+  // -- spec's unsupported_buffer error). Cleared from pending whatever the
+  // outcome so they don't leak forward.
+  const pendAcq = s.pending.syncobjAcquire;
+  const pendRel = s.pending.syncobjRelease;
+  s.pending.syncobjAcquire = undefined;
+  s.pending.syncobjRelease = undefined;
+
+  if (effectiveSync(ctx, s)) {
+    // Synchronized subsurface: CACHE this commit; do not apply. The cache is
+    // applied when the parent commits (via applySurfaceState's cascade).
+    s.cached ??= {};
+    s.cached.buffer = s.committed.buffer;
+    // Sticky: the cached buffer is fresh if ANY commit in this cache cycle
+    // attached one, so the parent's cascade applies (and releases) it once.
+    s.cached.bufferFresh = (s.cached.bufferFresh ?? false) || attachedThisCommit;
+    if (s.committed.bufferScale !== undefined) s.cached.bufferScale = s.committed.bufferScale;
+    if (s.committed.bufferTransform !== undefined) s.cached.bufferTransform = s.committed.bufferTransform;
+    if (s.committed.surfaceDamage) {
+      (s.cached.surfaceDamage ??= []).push(...s.committed.surfaceDamage);
+      s.committed.surfaceDamage = undefined;
+    }
+    if (s.committed.bufferDamage) {
+      (s.cached.bufferDamage ??= []).push(...s.committed.bufferDamage);
+      s.committed.bufferDamage = undefined;
+    }
+    if (s.pending.frameCallbacks?.length) {
+      (s.cached.frameCallbacks ??= []).push(...s.pending.frameCallbacks);
+      s.pending.frameCallbacks = undefined;
+    }
+    if (s.pending.presentationFeedbacks?.length) {
+      (s.cached.presentationFeedbacks ??= [])
+        .push(...s.pending.presentationFeedbacks);
+      s.pending.presentationFeedbacks = undefined;
+    }
+    if (s.pending.inputRegion !== undefined) {
+      s.cached.inputRegion = s.pending.inputRegion;
+      s.pending.inputRegion = undefined;
+    }
+    if (s.pending.opaqueRegion !== undefined) {
+      s.cached.opaqueRegion = s.pending.opaqueRegion;
+      s.pending.opaqueRegion = undefined;
+    }
+    if (s.pending.viewportSrc !== undefined) {
+      s.cached.viewportSrc = s.pending.viewportSrc;
+      s.pending.viewportSrc = undefined;
+    }
+    if (s.pending.viewportDst !== undefined) {
+      s.cached.viewportDst = s.pending.viewportDst;
+      s.pending.viewportDst = undefined;
+    }
+    // Cache the syncobj points to be promoted alongside the buffer when
+    // the parent commits.
+    if (pendAcq) s.cached.syncobjAcquire = pendAcq;
+    if (pendRel) s.cached.syncobjRelease = pendRel;
+  } else {
+    // Desynchronized (incl. main surface): apply now. If a cache exists (e.g.
+    // it was sync then switched to desync), it is flushed as part of apply.
+    let cachedBufferFresh = false;
+    if (s.cached) {
+      cachedBufferFresh = s.cached.bufferFresh ?? false;
+      s.committed.buffer = s.cached.buffer ?? s.committed.buffer;
+      if (s.cached.bufferScale !== undefined) s.committed.bufferScale = s.cached.bufferScale;
+      if (s.cached.bufferTransform !== undefined) s.committed.bufferTransform = s.cached.bufferTransform;
+      if (s.cached.surfaceDamage) {
+        (s.committed.surfaceDamage ??= []).push(...s.cached.surfaceDamage);
+      }
+      if (s.cached.bufferDamage) {
+        (s.committed.bufferDamage ??= []).push(...s.cached.bufferDamage);
+      }
+      if (s.cached.frameCallbacks?.length) {
+        (s.pending.frameCallbacks ??= []).push(...s.cached.frameCallbacks);
+      }
+      if (s.cached.presentationFeedbacks?.length) {
+        (s.pending.presentationFeedbacks ??= [])
+          .push(...s.cached.presentationFeedbacks);
+      }
+      if (s.cached.inputRegion !== undefined) {
+        s.pending.inputRegion = s.cached.inputRegion;
+      }
+      if (s.cached.opaqueRegion !== undefined) {
+        s.pending.opaqueRegion = s.cached.opaqueRegion;
+      }
+      if (s.cached.viewportSrc !== undefined) {
+        s.pending.viewportSrc = s.cached.viewportSrc;
+      }
+      if (s.cached.viewportDst !== undefined) {
+        s.pending.viewportDst = s.cached.viewportDst;
+      }
+      // Flushed cached syncobj points alongside the buffer.
+      const cachedAcq = s.cached.syncobjAcquire;
+      const cachedRel = s.cached.syncobjRelease;
+      s.cached = undefined;
+      if (cachedAcq || cachedRel) {
+        promoteSyncobjForCommit(s, cachedAcq, cachedRel, ctx);
+      }
+    }
+    // Desync promotion of THIS commit's own pending points (if any).
+    if (pendAcq || pendRel) {
+      promoteSyncobjForCommit(s, pendAcq, pendRel, ctx);
+    }
+    // Rebuild the draw stack only when this commit actually changed it
+    // (a surface gained content, or a subsurface moved/reordered) -- not on
+    // every content commit. Map/unmap, window move/resize, workspace and
+    // subsurface add/remove drive their own rebuilds elsewhere.
+    if (applySurfaceState(ctx, s, attachedThisCommit || cachedBufferFresh)) {
+      applySubsurfaces(ctx.state);
+    }
+  }
+
+  if (s.xdgSurface) s.xdgSurface.lastCommitSerial = ctx.state.nextSerial - 1;
+
+  // Null-buffer-commit unmap: per xdg-shell, attaching null and
+  // committing on a mapped surface unmaps it (without destroying
+  // the role). The client may then commit a new buffer to re-map
+  // under the same role. detachSurfaceRole resets the wl_surface
+  // to the same state a role-destroy would (window.unmap fired,
+  // WM/compositor entries dropped, mapped flag cleared) so the
+  // next non-null commit re-runs the map sweep cleanly.
+  if (s.mapped && s.committed.buffer === null
+      && (s.role === "xdg_popup" || s.role === "xdg_toplevel"
+          || s.role === "layer_surface")) {
+    detachSurfaceRole(ctx.state, ctx.addon, s);
+    s.hasContent = false;
+  }
+
+  // Initial-commit detection (xdg-shell): the first commit on a
+  // toplevel-roled surface whose xdg_surface has not yet sent any
+  // configure. Per spec the client commits the xdg_surface with no
+  // buffer to signal "ready for configure".
+  //
+  // Complete the handshake IN THIS DISPATCH: send the throwaway 0x0 first
+  // configure synchronously (carrying the resolved state array) so a client
+  // that does a single wl_display_roundtrip after its initial commit sees
+  // the configure within that roundtrip -- the common idiom. The real tile
+  // size follows as a SECOND configure once layout/plugins resolve.
+  //
+  // markInitialCommitComplete then runs async: it emits window.preconfigure
+  // (window-rules plugins may change presentation), commits the final state,
+  // and schedules the layout pass that drives the sized second configure.
+  const xs = s.xdgSurface;
+  if (xs?.toplevel && xs.lastConfigureSerial === null) {
+    ctx.state.wm?.sendInitialConfigure(s.id);
+    const t = ctx.state.toplevels?.get(xs.toplevel);
+    const appId = t?.appId ?? null;
+    const title = t?.title ?? null;
+    void ctx.state.wm?.markInitialCommitComplete(s.id, { appId, title, xwayland: false });
+  } else if (xs?.toplevel) {
+    // A non-initial commit: the client re-rendered, which may satisfy a
+    // held resize (it has acked the size the WM asked for). Pass the
+    // highest acked serial; the WM releases that window's hold and applies
+    // the batch once every held window is ready.
+    ctx.state.wm?.notifyToplevelCommit(s.id, xs.lastAckedSerial ?? null);
+  }
+
+  // If this surface has the "cursor" role and is the
+  // current pointer focus's active cursor surface, re-apply the
+  // cursor slot so the just-uploaded texture is picked up by the
+  // compositor. The seat re-checks ownership before mutating.
+  if (s.role === "cursor") {
+    ctx.state.seat?.cursor.onCursorSurfaceCommit(s.resource);
+  }
+
+  // Layer-shell: drive the configure handshake + apply pipeline. The
+  // initial commit (no configure sent yet) sends the first configure
+  // with the resolved size; subsequent commits apply any pending
+  // double-buffered state (set_size / set_anchor / ...) and may send
+  // a new configure when the rect changed.
+  const ls = s.layerSurface;
+  if (ls && !ls.destroyed) {
+    if (isLayerSurfaceInitialCommit(ls)) {
+      applyLayerSurfaceInitial(ctx, ls);
+    } else {
+      applyLayerSurfacePending(ctx, ls);
+    }
+  }
+}
+
 export default function makeSurface(ctx: Ctx): WlSurfaceHandler {
   const rec = (resource: Resource) => ctx.state.surfaces.get(resource);
 
@@ -470,243 +792,21 @@ export default function makeSurface(ctx: Ctx): WlSurfaceHandler {
     commit(resource) {
       const s = rec(resource);
       if (!s) return;
-
-      // Whether this commit carries a fresh wl_buffer.attach (to a buffer or to
-      // null). Drives the apply gate so a bare commit doesn't re-upload /
-      // double-release the unchanged buffer (see applySurfaceState).
-      const attachedThisCommit = s.pending.buffer !== undefined;
-
-      // Promote pending buffer into the commit set (undefined = unchanged).
-      if (s.pending.buffer !== undefined) {
-        s.committed.buffer = s.pending.buffer;
-        s.pending.buffer = undefined;
+      // Commit timing: a commit carrying a target timestamp -- or arriving
+      // while earlier queued commits still wait (content updates latch in
+      // the order received, timed or not) -- is captured whole and latched
+      // by the pump at its target time. A timestamp already in the past
+      // latches immediately.
+      const targetNs = s.pending.commitTimestamp;
+      if (targetNs !== undefined) s.pending.commitTimestamp = undefined;
+      if ((s.timedCommits !== undefined && s.timedCommits.length > 0)
+          || (targetNs !== undefined && targetNs > monotonicNowNs())) {
+        (s.timedCommits ??= []).push({ set: s.pending, targetNs });
+        s.pending = {};
+        pumpTimedCommits(ctx, s);
+        return;
       }
-      // buffer_scale travels with the buffer (double-buffered).
-      if (s.pending.bufferScale !== undefined) {
-        s.committed.bufferScale = s.pending.bufferScale;
-        s.pending.bufferScale = undefined;
-      }
-      if (s.pending.bufferTransform !== undefined) {
-        s.committed.bufferTransform = s.pending.bufferTransform;
-        s.pending.bufferTransform = undefined;
-      }
-      // Buffer offset accumulates into the surface's placement delta (consumed
-      // by the DnD drag-icon and popup positioning).
-      if (s.pending.offsetX !== undefined || s.pending.offsetY !== undefined) {
-        s.offsetDx = (s.offsetDx ?? 0) + (s.pending.offsetX ?? 0);
-        s.offsetDy = (s.offsetDy ?? 0) + (s.pending.offsetY ?? 0);
-        s.pending.offsetX = undefined;
-        s.pending.offsetY = undefined;
-      }
-      // Damage travels with the buffer (double-buffered); accumulate into the
-      // commit set (cleared by the upload in applySurfaceState).
-      if (s.pending.surfaceDamage) {
-        (s.committed.surfaceDamage ??= []).push(...s.pending.surfaceDamage);
-        s.pending.surfaceDamage = undefined;
-      }
-      if (s.pending.bufferDamage) {
-        (s.committed.bufferDamage ??= []).push(...s.pending.bufferDamage);
-        s.pending.bufferDamage = undefined;
-      }
-
-      // wp_linux_drm_syncobj_v1: acquire/release timeline points are
-      // double-buffered, applied to exactly one commit. The spec error checks
-      // (no_buffer / no_acquire_point / no_release_point / conflicting_points)
-      // would fire here in a compositor with wl_resource_post_error; today
-      // we silently drop the point on violation (status.md "no post_error").
-      // What we DO enforce locally: only honor points when a dmabuf buffer
-      // accompanies them -- otherwise the points are dropped (the shm path
-      // has no fence to wait on and no submit-completion to signal).
-      // promotePoints lives below the layer-shell discard so a discarded
-      // initial commit doesn't carry phantom points forward.
-
-      // Layer-shell: a buffer attached before the first configure-ack is
-      // invalid_surface_state per spec. Silent-drop convention (no
-      // post_error path in this compositor today; see top of
-      // zwlr_layer_shell_v1.ts); discard the buffer so it never reaches
-      // the GPU.
-      if (s.layerSurface && isLayerSurfaceInitialCommit(s.layerSurface) && s.committed.buffer) {
-        s.committed.buffer = null;
-      }
-
-      // Promote the pending syncobj points. Only honored when a dmabuf is
-      // attached this commit (a buffer-less commit drops the points outright;
-      // an shm commit logs and drops, since explicit-sync is undefined there
-      // -- spec's unsupported_buffer error). Cleared from pending whatever the
-      // outcome so they don't leak forward.
-      const pendAcq = s.pending.syncobjAcquire;
-      const pendRel = s.pending.syncobjRelease;
-      s.pending.syncobjAcquire = undefined;
-      s.pending.syncobjRelease = undefined;
-
-      if (effectiveSync(ctx, s)) {
-        // Synchronized subsurface: CACHE this commit; do not apply. The cache is
-        // applied when the parent commits (via applySurfaceState's cascade).
-        s.cached ??= {};
-        s.cached.buffer = s.committed.buffer;
-        // Sticky: the cached buffer is fresh if ANY commit in this cache cycle
-        // attached one, so the parent's cascade applies (and releases) it once.
-        s.cached.bufferFresh = (s.cached.bufferFresh ?? false) || attachedThisCommit;
-        if (s.committed.bufferScale !== undefined) s.cached.bufferScale = s.committed.bufferScale;
-        if (s.committed.bufferTransform !== undefined) s.cached.bufferTransform = s.committed.bufferTransform;
-        if (s.committed.surfaceDamage) {
-          (s.cached.surfaceDamage ??= []).push(...s.committed.surfaceDamage);
-          s.committed.surfaceDamage = undefined;
-        }
-        if (s.committed.bufferDamage) {
-          (s.cached.bufferDamage ??= []).push(...s.committed.bufferDamage);
-          s.committed.bufferDamage = undefined;
-        }
-        if (s.pending.frameCallbacks?.length) {
-          (s.cached.frameCallbacks ??= []).push(...s.pending.frameCallbacks);
-          s.pending.frameCallbacks = undefined;
-        }
-        if (s.pending.presentationFeedbacks?.length) {
-          (s.cached.presentationFeedbacks ??= [])
-            .push(...s.pending.presentationFeedbacks);
-          s.pending.presentationFeedbacks = undefined;
-        }
-        if (s.pending.inputRegion !== undefined) {
-          s.cached.inputRegion = s.pending.inputRegion;
-          s.pending.inputRegion = undefined;
-        }
-        if (s.pending.opaqueRegion !== undefined) {
-          s.cached.opaqueRegion = s.pending.opaqueRegion;
-          s.pending.opaqueRegion = undefined;
-        }
-        if (s.pending.viewportSrc !== undefined) {
-          s.cached.viewportSrc = s.pending.viewportSrc;
-          s.pending.viewportSrc = undefined;
-        }
-        if (s.pending.viewportDst !== undefined) {
-          s.cached.viewportDst = s.pending.viewportDst;
-          s.pending.viewportDst = undefined;
-        }
-        // Cache the syncobj points to be promoted alongside the buffer when
-        // the parent commits.
-        if (pendAcq) s.cached.syncobjAcquire = pendAcq;
-        if (pendRel) s.cached.syncobjRelease = pendRel;
-      } else {
-        // Desynchronized (incl. main surface): apply now. If a cache exists (e.g.
-        // it was sync then switched to desync), it is flushed as part of apply.
-        let cachedBufferFresh = false;
-        if (s.cached) {
-          cachedBufferFresh = s.cached.bufferFresh ?? false;
-          s.committed.buffer = s.cached.buffer ?? s.committed.buffer;
-          if (s.cached.bufferScale !== undefined) s.committed.bufferScale = s.cached.bufferScale;
-          if (s.cached.bufferTransform !== undefined) s.committed.bufferTransform = s.cached.bufferTransform;
-          if (s.cached.surfaceDamage) {
-            (s.committed.surfaceDamage ??= []).push(...s.cached.surfaceDamage);
-          }
-          if (s.cached.bufferDamage) {
-            (s.committed.bufferDamage ??= []).push(...s.cached.bufferDamage);
-          }
-          if (s.cached.frameCallbacks?.length) {
-            (s.pending.frameCallbacks ??= []).push(...s.cached.frameCallbacks);
-          }
-          if (s.cached.presentationFeedbacks?.length) {
-            (s.pending.presentationFeedbacks ??= [])
-              .push(...s.cached.presentationFeedbacks);
-          }
-          if (s.cached.inputRegion !== undefined) {
-            s.pending.inputRegion = s.cached.inputRegion;
-          }
-          if (s.cached.opaqueRegion !== undefined) {
-            s.pending.opaqueRegion = s.cached.opaqueRegion;
-          }
-          if (s.cached.viewportSrc !== undefined) {
-            s.pending.viewportSrc = s.cached.viewportSrc;
-          }
-          if (s.cached.viewportDst !== undefined) {
-            s.pending.viewportDst = s.cached.viewportDst;
-          }
-          // Flushed cached syncobj points alongside the buffer.
-          const cachedAcq = s.cached.syncobjAcquire;
-          const cachedRel = s.cached.syncobjRelease;
-          s.cached = undefined;
-          if (cachedAcq || cachedRel) {
-            promoteSyncobjForCommit(s, cachedAcq, cachedRel, ctx);
-          }
-        }
-        // Desync promotion of THIS commit's own pending points (if any).
-        if (pendAcq || pendRel) {
-          promoteSyncobjForCommit(s, pendAcq, pendRel, ctx);
-        }
-        // Rebuild the draw stack only when this commit actually changed it
-        // (a surface gained content, or a subsurface moved/reordered) -- not on
-        // every content commit. Map/unmap, window move/resize, workspace and
-        // subsurface add/remove drive their own rebuilds elsewhere.
-        if (applySurfaceState(ctx, s, attachedThisCommit || cachedBufferFresh)) {
-          applySubsurfaces(ctx.state);
-        }
-      }
-
-      if (s.xdgSurface) s.xdgSurface.lastCommitSerial = ctx.state.nextSerial - 1;
-
-      // Null-buffer-commit unmap: per xdg-shell, attaching null and
-      // committing on a mapped surface unmaps it (without destroying
-      // the role). The client may then commit a new buffer to re-map
-      // under the same role. detachSurfaceRole resets the wl_surface
-      // to the same state a role-destroy would (window.unmap fired,
-      // WM/compositor entries dropped, mapped flag cleared) so the
-      // next non-null commit re-runs the map sweep cleanly.
-      if (s.mapped && s.committed.buffer === null
-          && (s.role === "xdg_popup" || s.role === "xdg_toplevel"
-              || s.role === "layer_surface")) {
-        detachSurfaceRole(ctx.state, ctx.addon, s);
-        s.hasContent = false;
-      }
-
-      // Initial-commit detection (xdg-shell): the first commit on a
-      // toplevel-roled surface whose xdg_surface has not yet sent any
-      // configure. Per spec the client commits the xdg_surface with no
-      // buffer to signal "ready for configure".
-      //
-      // Complete the handshake IN THIS DISPATCH: send the throwaway 0x0 first
-      // configure synchronously (carrying the resolved state array) so a client
-      // that does a single wl_display_roundtrip after its initial commit sees
-      // the configure within that roundtrip -- the common idiom. The real tile
-      // size follows as a SECOND configure once layout/plugins resolve.
-      //
-      // markInitialCommitComplete then runs async: it emits window.preconfigure
-      // (window-rules plugins may change presentation), commits the final state,
-      // and schedules the layout pass that drives the sized second configure.
-      const xs = s.xdgSurface;
-      if (xs?.toplevel && xs.lastConfigureSerial === null) {
-        ctx.state.wm?.sendInitialConfigure(s.id);
-        const t = ctx.state.toplevels?.get(xs.toplevel);
-        const appId = t?.appId ?? null;
-        const title = t?.title ?? null;
-        void ctx.state.wm?.markInitialCommitComplete(s.id, { appId, title, xwayland: false });
-      } else if (xs?.toplevel) {
-        // A non-initial commit: the client re-rendered, which may satisfy a
-        // held resize (it has acked the size the WM asked for). Pass the
-        // highest acked serial; the WM releases that window's hold and applies
-        // the batch once every held window is ready.
-        ctx.state.wm?.notifyToplevelCommit(s.id, xs.lastAckedSerial ?? null);
-      }
-
-      // If this surface has the "cursor" role and is the
-      // current pointer focus's active cursor surface, re-apply the
-      // cursor slot so the just-uploaded texture is picked up by the
-      // compositor. The seat re-checks ownership before mutating.
-      if (s.role === "cursor") {
-        ctx.state.seat?.cursor.onCursorSurfaceCommit(resource);
-      }
-
-      // Layer-shell: drive the configure handshake + apply pipeline. The
-      // initial commit (no configure sent yet) sends the first configure
-      // with the resolved size; subsequent commits apply any pending
-      // double-buffered state (set_size / set_anchor / ...) and may send
-      // a new configure when the rect changed.
-      const ls = s.layerSurface;
-      if (ls && !ls.destroyed) {
-        if (isLayerSurfaceInitialCommit(ls)) {
-          applyLayerSurfaceInitial(ctx, ls);
-        } else {
-          applyLayerSurfacePending(ctx, ls);
-        }
-      }
+      commitNow(ctx, s);
     },
     destroy(resource) {
       const s = rec(resource);
@@ -746,6 +846,11 @@ export function detachSurfaceRole(state: CompositorState, addon: Addon, s: Surfa
     teardownLayerSurface(state, s.layerSurface);
     s.layerSurface = null;
   }
+  // Timed commits still queued for this role will never latch into it;
+  // drop them (discarding their captured presentation feedbacks) so the
+  // pump doesn't replay stale content into a re-roled surface. Also runs
+  // for never-mapped surfaces -- a queue can exist before first content.
+  discardTimedCommits(state, addon, s);
   if (!s.mapped) return;
   // Mapped-only path: emit unmap event + clear runtime state.
   // BEFORE the WM/compositor teardown, give the closing driver a chance
