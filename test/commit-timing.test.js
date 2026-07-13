@@ -16,6 +16,7 @@ function makeCtx() {
   const errors = [];
   const latched = [];   // offsets passed to commitSurfaceBuffer, in latch order
   const discarded = [];
+  const wakes = { count: 0 };
   const events = {
     wl_buffer: { send_release: () => {} },
     wp_presentation_feedback: {
@@ -39,8 +40,9 @@ function makeCtx() {
     postError: (resource, code, message) => errors.push({ resource, code, message }),
     destroyResource: (r) => { r.destroyed = true; },
     clientId: () => 1,
+    wake: () => { wakes.count++; },
   };
-  return { ctx: { state, events, addon }, errors, latched, discarded };
+  return { ctx: { state, events, addon }, errors, latched, discarded, wakes };
 }
 
 function addSurface(state, resource, id) {
@@ -220,8 +222,40 @@ test('an untimed commit behind a queued timed commit latches after it, in order'
   assert.deepEqual(latched, [16, 32], 'latched in commit order once the time passed');
 });
 
+test('a deferred latch wakes the frame loop; queueing/re-arming alone does not', async () => {
+  const { ctx, latched, wakes } = makeCtx();
+  const mgr = makeCommitTimingManager(ctx);
+  const timer = makeCommitTimer(ctx);
+  const surface = makeSurface(ctx);
+  const surfRes = { id: 1 };
+  addSurface(ctx.state, surfRes, 10);
+  const timerRes = { id: 3 };
+  mgr.get_timer({ id: 2 }, timerRes, surfRes);
+
+  const buf = addBuffer(ctx.state, 0);
+  const t = timestampIn(40);
+  timer.set_timestamp(timerRes, t.hi, t.lo, t.nsec);
+  surface.attach(surfRes, buf, 0, 0);
+  surface.commit(surfRes);
+
+  // Queued, timer armed, nothing latched: the frame loop must NOT be woken
+  // (a static surface with a far-future commit stays idle until then).
+  assert.equal(latched.length, 0);
+  assert.equal(wakes.count, 0, 'no wake while the commit is only queued');
+
+  // The latch fires from a timer callback, outside any native-event wake --
+  // it must request a frame itself or the applied commit never renders and
+  // the client never gets its frame callback (the "animates only on input"
+  // stall). One wake per pump, not periodic.
+  await sleep(80);
+  assert.deepEqual(latched, [0]);
+  assert.equal(wakes.count, 1, 'exactly one wake for the deferred latch');
+  await sleep(40);
+  assert.equal(wakes.count, 1, 'no further wakes once the queue is drained');
+});
+
 test('teardown discards queued commits and fires discarded on captured feedbacks', () => {
-  const { ctx, latched, discarded } = makeCtx();
+  const { ctx, latched, discarded, wakes } = makeCtx();
   const mgr = makeCommitTimingManager(ctx);
   const timer = makeCommitTimer(ctx);
   const surface = makeSurface(ctx);
@@ -243,4 +277,5 @@ test('teardown discards queued commits and fires discarded on captured feedbacks
   assert.equal(s.timedCommits, undefined, 'queue dropped');
   assert.deepEqual(discarded, [fb], 'captured feedback got discarded');
   assert.equal(latched.length, 0, 'held content never latched');
+  assert.equal(wakes.count, 0, 'a discard latches nothing and must not wake');
 });

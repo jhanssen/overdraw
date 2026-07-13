@@ -12,6 +12,13 @@
 //   --frames N         number of timed commits (default 3)
 //   --delay-ms N       per-commit target delay from "now" (default 120)
 //   --timeout-ms N     give up + exit 1 (default 8000)
+//   --idle-latch       instead of the timed-frames loop: quiesce, post ONE
+//                      timed commit carrying a wl_surface.frame callback,
+//                      then only dispatch (no further requests) until the
+//                      callback arrives. Proves the deferred latch renders
+//                      by itself -- with nothing else waking the
+//                      compositor, a latch that doesn't request a frame
+//                      never flips and the callback never comes.
 
 #define _GNU_SOURCE
 #include <stdio.h>
@@ -41,6 +48,7 @@ static void onTerm(int sig) { (void)sig; running = 0; }
 static int g_frames = 3;
 static int g_delayMs = 120;
 static int g_timeoutMs = 8000;
+static int g_idleLatch = 0;
 
 static struct wl_surface* surface = NULL;
 static struct xdg_surface* xs = NULL;
@@ -110,6 +118,16 @@ static const struct wp_presentation_feedback_listener fbListener = {
     fbSyncOutput, fbPresented, fbDiscarded,
 };
 
+static int frame_done = 0;
+static uint64_t frame_done_ns = 0;
+static void frameDone(void* d, struct wl_callback* cb, uint32_t t) {
+    (void)d; (void)t;
+    frame_done = 1;
+    frame_done_ns = nowMonotonicNs();
+    wl_callback_destroy(cb);
+}
+static const struct wl_callback_listener frameListener = { frameDone };
+
 static void regGlobal(void* data, struct wl_registry* reg, uint32_t name,
                       const char* iface, uint32_t version) {
     (void)data;
@@ -139,6 +157,7 @@ int main(int argc, char** argv) {
         else if (strcmp(argv[i], "--frames") == 0 && i + 1 < argc) g_frames = atoi(argv[++i]);
         else if (strcmp(argv[i], "--delay-ms") == 0 && i + 1 < argc) g_delayMs = atoi(argv[++i]);
         else if (strcmp(argv[i], "--timeout-ms") == 0 && i + 1 < argc) g_timeoutMs = atoi(argv[++i]);
+        else if (strcmp(argv[i], "--idle-latch") == 0) g_idleLatch = 1;
     }
     if (!socket) {
         fprintf(stderr, "usage: %s --socket NAME [--frames N] [--delay-ms N] [--timeout-ms N]\n", argv[0]);
@@ -185,6 +204,50 @@ int main(int argc, char** argv) {
     wl_display_roundtrip(display);
     printf("[commit-timing-client] mapped\n");
     fflush(stdout);
+
+    int wlfd_early = wl_display_get_fd(display);
+    if (g_idleLatch) {
+        // Quiesce: dispatch-only for a while so the compositor's frame loop
+        // goes fully idle (no damage from us, nothing pending).
+        for (long q = 0; running && q < 400; q += 16) {
+            wl_display_dispatch_pending(display);
+            wl_display_flush(display);
+            struct pollfd p = { wlfd_early, POLLIN, 0 };
+            if (poll(&p, 1, 16) > 0 && (p.revents & POLLIN))
+                if (wl_display_dispatch(display) < 0) break;
+        }
+        // One timed commit carrying a frame callback...
+        target_ns = nowMonotonicNs() + (uint64_t)g_delayMs * 1000000ull;
+        uint64_t sec = target_ns / 1000000000ull;
+        wp_commit_timer_v1_set_timestamp(timer,
+            (uint32_t)(sec >> 32), (uint32_t)(sec & 0xffffffffu),
+            (uint32_t)(target_ns % 1000000000ull));
+        wl_surface_attach(surface, buffer, 0, 0);
+        wl_surface_damage(surface, 0, 0, W, H);
+        struct wl_callback* cb = wl_surface_frame(surface);
+        wl_callback_add_listener(cb, &frameListener, NULL);
+        wl_surface_commit(surface);
+        wl_display_flush(display);
+        printf("[commit-timing-client] idle-latch posted\n");
+        fflush(stdout);
+        // ...then ONLY dispatch. No further requests reach the compositor,
+        // so the deferred latch must drive the render (and thus the flip
+        // that delivers wl_callback.done) entirely by itself.
+        for (long w2 = 0; running && !frame_done && w2 < g_timeoutMs; w2 += 16) {
+            struct pollfd p = { wlfd_early, POLLIN, 0 };
+            if (poll(&p, 1, 16) > 0 && (p.revents & POLLIN))
+                if (wl_display_dispatch(display) < 0) break;
+        }
+        long long after_ms = frame_done
+            ? (long long)(frame_done_ns - target_ns) / 1000000ll : -1;
+        int ok = frame_done && frame_done_ns + 2000000ull >= target_ns;
+        printf("[commit-timing-client] idle-latch done=%d ms_after_target=%lld ok=%d\n",
+               frame_done, after_ms, ok);
+        fflush(stdout);
+        wp_commit_timer_v1_destroy(timer);
+        wl_display_disconnect(display);
+        return ok ? 0 : 1;
+    }
 
     // Drive N timed commits, strictly paced: post the next only after the
     // previous one's feedback arrived (so no feedback is superseded).

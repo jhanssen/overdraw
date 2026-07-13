@@ -419,12 +419,13 @@ function pumpTimedCommits(ctx: Ctx, s: SurfaceRecord): void {
   }
   const q = s.timedCommits;
   if (!q) return;
+  let latched = false;
   // A latch can tear the surface down (null-buffer unmap) and discard the
   // queue reentrantly; the `s.timedCommits === q` check detects that.
   while (s.timedCommits === q && q.length > 0) {
     if (s.unmapped || s.resource.destroyed) {
       discardTimedCommits(ctx.state, ctx.addon, s);
-      return;
+      break;
     }
     const head = q[0];
     if (head.targetNs !== undefined) {
@@ -435,7 +436,7 @@ function pumpTimedCommits(ctx: Ctx, s: SurfaceRecord): void {
           s.timedCommitTimer = undefined;
           pumpTimedCommits(ctx, s);
         }, delayMs);
-        return;
+        break;
       }
     }
     q.shift();
@@ -443,8 +444,16 @@ function pumpTimedCommits(ctx: Ctx, s: SurfaceRecord): void {
     s.pending = head.set;
     commitNow(ctx, s);
     s.pending = live;
+    latched = true;
   }
   if (s.timedCommits === q && q.length === 0) s.timedCommits = undefined;
+  // A latch from the timer callback lands while the addon's frame loop is
+  // idle (no native event accompanies it), so nothing would render the
+  // applied commit -- and without a render there is no flip, no
+  // wl_callback.done, and a timestamp-pacing client stalls until unrelated
+  // input wakes the loop. Request the frame explicitly. One-shot: only
+  // when something actually latched, so an idle surface stays idle.
+  if (latched) ctx.addon.wake();
 }
 
 // Drop a surface's timed-commit queue: cancel the armed timer and fire
