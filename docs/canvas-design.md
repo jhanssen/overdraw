@@ -303,15 +303,35 @@ The `ext_workspace_v1` adapter is a pure wire adapter over `workspace.*`
 bus events plus the inbound `state.workspaceDriver` verbs — it doesn't
 care what produces the events. Islands map:
 
-- One workspace object per island (or per bookmark — see open questions);
-  urgency and names pass straight through; click-to-activate = fly/dock a
-  camera.
+- Urgency and names pass straight through; click-to-activate = fly/dock a
+  camera. `activate` semantics are explicitly compositor-defined in the
+  spec ("may or may not deactivate all other workspaces in the same
+  group"), so docking a camera is a conforming interpretation.
 - **Activate needs a "which camera" answer** (groups are per-output;
-  islands are global). Preferred: advertise every island into every
-  output's group, so activating from monitor 2's bar docks monitor 2's
-  camera. Needs an empirical waybar test (one workspace in multiple
-  groups, or per-group duplicates keyed to one island). Fallback: one
-  global group, activate resolves to the focused output's camera.
+  islands are global), and the protocol constrains the options: a
+  workspace may belong to **at most one group at a time** (re-assignable;
+  `ext-workspace-v1.xml` `workspace_enter`), and waybar's `ext/workspaces`
+  module (defaults: `all-outputs=false`) shows only workspaces whose
+  group has entered the bar's output and **hides group-less workspaces
+  entirely**. So: sharing one workspace object across groups is
+  spec-illegal, and dynamic re-assignment would make un-viewed islands
+  vanish from every bar. The conforming mapping is **per-group duplicate
+  workspace objects** — one handle per (island × output group). Each bar
+  shows its own group's set once; clicking sends `activate` on that
+  group's duplicate, which identifies the output whose camera should
+  dock. Waybar does not deduplicate across groups, which is exactly right
+  here; the only cosmetic caveat is `all-outputs=true` would render one
+  button per (island × group), which is honest if unusual.
+- The workspace `id` event is defined as stable across sessions — a
+  natural carrier for durable island identity (suffixed per group so
+  duplicate handles keep unique ids; waybar sorts within one group, so
+  a uniform per-group suffix doesn't perturb order).
+- The `coordinates` event organizes workspaces as an N-dimensional grid
+  per group (unique coords per group, uint32) — the adapter can advertise
+  normalized island world positions, and spatially-aware clients can
+  sort/render by them (`sort-by-coordinates` in waybar).
+- The `hidden` state bit lets scratch/unnamed islands be advertised but
+  not displayed, if hygiene policy wants them enumerable.
 - Per-group **active** state = the island that output's camera is docked
   on (multi-monitor shows multiple actives, as today). A free-roaming
   camera honestly shows no active island.
@@ -385,9 +405,6 @@ first-class object.
 
 ## 12. Open questions
 
-- **Waybar vs. multi-group workspaces** (§9): does waybar tolerate one
-  workspace in several groups? Decides the activate story. One-evening
-  empirical test.
 - **Islands vs. bookmarks in ext-workspace**: advertise every island, or
   only named/bookmarked ones? Lean: every named island; scratch islands
   stay off the bar.
