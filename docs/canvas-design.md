@@ -285,28 +285,30 @@ gaining island semantics.
 ## 7b. X11 and the 16-bit world
 
 X11 coordinates are int16 (±32767); a world that sprawls past that breaks
-X clients if their X-visible positions are world positions. Two-stage
-answer:
+X clients if their X-visible positions are world positions. Answer:
+**X space is a maintained fiction, not world space** -- built BEFORE
+world positions ship (a step-4 prerequisite), not retrofitted. (A
+"confine X-containing islands to an origin district" interim was
+considered and rejected: it is throwaway policy code in the arrangement
+solver -- constraint tracking, shove exclusions, move-rejection UX --
+that costs more than the fiction it defers. Its residue is a safety
+clamp: if a told coordinate would ever exceed int16, clamp and log
+loudly rather than let X wrap silently.)
 
-- **v1 (with world positions, step 4): an X district.** X-containing
-  islands are constrained to a ±30k region around the origin; an island
-  acquires the constraint when an X window joins, and the shove solver
-  respects it. Moving an X window to an out-of-district island is
-  rejected with a clear error. The default world-arrangement policy packs
-  islands in 2D with gutters, so most worlds fit inside the district
-  entirely and the constraint rarely binds.
-- **End state: X space is a maintained fiction, not world space.** The
-  XWM tells X clients GLASS positions (world minus the owning output's
-  camera): bounded by the physical arrangement, always int16-safe, and
-  consistent for everything X uses root coords for (override-redirect
-  menus relative to the parent's believed position, sibling placement --
-  relative offsets in glass equal what the user sees, and pointer root
-  coords are synthesized from the told positions). OR-window world
-  positions derive by the inverse mapping. Re-tell positions on camera
-  settle (not per pan frame). Precedent: the HiDPI `xwaylandScale`
-  fiction already translates X coordinates specially
-  (xwayland-design.md). Once this lands, the district constraint is
-  deleted, not worked around.
+The XWM tells X clients GLASS positions (world minus the owning output's
+camera): bounded by the physical arrangement, always int16-safe, and
+consistent for everything X uses root coords for (override-redirect
+menus relative to the parent's believed position, sibling placement --
+relative offsets in glass equal what the user sees, and pointer root
+coords are synthesized from the told positions). OR-window world
+positions derive by the inverse mapping. Re-tell positions on camera
+settle (not per pan frame). The X coordinate boundary is small and
+concentrated (`xwayland/xwm.ts` ConfigureRequest/OR handling +
+`protocols/index.ts` geometry mirror, ~11 call sites); the mapping is
+the identity under identity cameras, so it lands as another
+zero-behavior-change increment exercised by non-identity-camera tests.
+Precedent: the HiDPI `xwaylandScale` fiction already translates X
+coordinates specially (xwayland-design.md).
 
   **Unviewed windows** (island shown on no camera) have no glass
   position, and don't need a true one: a hidden window's told position
