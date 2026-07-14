@@ -323,9 +323,25 @@ answer:
   workspace -- so the attic tidies an accepted fiction rather than
   fixing a new fragility.)
 
-Windows spanning outputs with disagreeing cameras would have two glass
-positions, but independent cameras already preclude straddling (§8), so
-the case does not arise.
+**Doubly-viewed windows** (two cameras on the same island -- overlapping
+cameras are legal, §8) have two glass positions but can be told only
+one. Resolution: each island has a designated **chart** camera (e.g. the
+lowest-id viewer, re-designated + re-told when it goes away), used for
+BOTH directions -- outbound ConfigureNotify positions and inbound
+ConfigureRequest / override-redirect coordinates. This is sufficient
+because X clients can never observe physical glass from inside the X
+connection; everything they do with root coordinates is relative
+arithmetic against other told coordinates (menus at parent+offset,
+sibling placement, pointer root coords synthesized from told+local). A
+click on the non-chart copy delivers identical per-surface events; a
+menu placed via the chart's inverse mapping lands at the correct world
+position and renders on both viewers. Windows on the same island always
+share a chart, so intra-island relative geometry stays valid;
+cross-island X geometry is already fictional (see the attic).
+
+(The straddling variant -- one window half on each of two disagreeing
+cameras -- still does not arise: independent cameras clip at their
+edges, §8.)
 
 ## 8. Hotplug — the model's strongest case
 
