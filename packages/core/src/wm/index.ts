@@ -1571,22 +1571,28 @@ export function createWm(
     for (const o of wm.outputs.values()) {
       outputDescs.push({ id: o.id, rect: { ...o.rect }, scale: o.scale });
     }
-    // Workspace plugin's view, or a fallback when no plugin is wired:
-    // every known window on the primary output, in master-front insertion
-    // order. The fallback keeps GPU-free tests (no workspace plugin) and
-    // pre-workspace bring-up paths producing a layout. Pre-content windows
-    // are included so their rect is ready by the time their first commit
+    // Implicit per-output islands (docs/canvas-design.md §5): one island
+    // per output with content, id = outputId, rect = null (the driver
+    // derives the tile region from the output minus reserved zones),
+    // members = the workspace plugin's per-output visible order. Fallback
+    // when no plugin is wired: every known window on the primary output,
+    // in master-front insertion order -- keeps GPU-free tests and
+    // pre-workspace bring-up producing a layout. Pre-content windows are
+    // included so their rect is ready by the time their first commit
     // lands (windowHasContent just flips the gate; no relayout needed).
-    let content: ReadonlyMap<number, ReadonlyArray<number>>;
+    const islands: Array<import("./layout-driver.js").LayoutIsland> = [];
     if (outputContent) {
-      content = outputContent();
+      for (const [outputId, ids] of outputContent()) {
+        islands.push({ id: outputId, outputId, rect: null, members: [...ids] });
+      }
     } else {
       const ids = windows.map((w) => w.surfaceId);
-      const m = new Map<number, ReadonlyArray<number>>();
-      if (ids.length > 0) m.set(primaryOutputId(), ids);
-      content = m;
+      if (ids.length > 0) {
+        const outputId = primaryOutputId();
+        islands.push({ id: outputId, outputId, rect: null, members: ids });
+      }
     }
-    return { outputs: outputDescs, windows: windowMap, outputContent: content };
+    return { outputs: outputDescs, windows: windowMap, islands };
   }
 
   const target: LayoutApplyTarget = { apply: applyLayout };

@@ -22,8 +22,9 @@ function captureTarget() {
 function snap(windows) {
   // Default every window to outputId 0 unless explicitly set; lets test
   // inline objects stay terse. The driver consumes a windows Map keyed by
-  // surfaceId + an outputContent map of ordered ids per output; both are
-  // built from the flat array here.
+  // surfaceId + an islands array; one implicit island on output 0 (id =
+  // outputId, rect = null) is built from the flat array here, mirroring
+  // the WM's implicit derivation.
   const wins = windows.map((win) => ({
     outputId: 0,
     tiling: 'managed',
@@ -32,15 +33,15 @@ function snap(windows) {
     ...win,
   }));
   const windowMap = new Map();
-  const outputContent = new Map([[0, []]]);
+  const members = [];
   for (const w of wins) {
     windowMap.set(w.id, w);
-    outputContent.get(0).push(w.id);
+    members.push(w.id);
   }
   return {
     outputs: [{ id: 0, rect: { x: 0, y: 0, width: 1000, height: 600 }, scale: 1 }],
     windows: windowMap,
-    outputContent,
+    islands: [{ id: 0, outputId: 0, rect: null, members }],
   };
 }
 

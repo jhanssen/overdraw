@@ -6,13 +6,14 @@
 //   - Coalesce relayout requests (at most one compute() in flight; subsequent
 //     invalidations queue and replace).
 //   - Resolve non-managed lanes in core: a window with exclusive !== "none"
-//     covers the workspace (tileRegion for maximized, full output for
-//     fullscreen) and suppresses peers; an invisible (visible === false)
-//     window is omitted from the result; a floating (tiling === "floating")
-//     window uses its stored floatingRect.
-//   - Build LayoutInputs from the WM's `managed`, non-exclusive, visible
-//     windows + the tile region (output minus reserved zones), invoke
-//     compute() on the active layout plugin.
+//     covers its island (tile region for maximized, full output for
+//     fullscreen) and suppresses island peers; an invisible
+//     (visible === false) window is omitted from the result; a floating
+//     (tiling === "floating") window uses its stored floatingRect.
+//   - Build LayoutInputs per island from its `managed`, non-exclusive,
+//     visible members + the island's tile region (implicit islands derive
+//     it from the output minus reserved zones), invoke compute() on the
+//     island's layout plugin.
 //   - Merge the plugin's result with the driver-resolved rects and hand
 //     the unified LayoutResult to the WM for apply.
 //
@@ -37,24 +38,41 @@ import { log as coreLog } from "../log.js";
 
 export type { LayoutInputs, LayoutResult, LayoutReason } from "@overdraw/layout-types";
 
+// One tiling region + its member windows (docs/canvas-design.md §5). The
+// driver runs the layout plugin once per island. The WM derives one
+// implicit island per output (id = outputId, rect = null) from the
+// workspace plugin's per-output content; explicit islands carry their own
+// world rect and share their output's scale/fullscreen context.
+export interface LayoutIsland {
+  // Stable island id. Implicit per-output islands use the outputId.
+  id: number;
+  // The output that gives the island its context: the plugin sees this
+  // output's rect + scale, and a fullscreen member covers this output.
+  outputId: number;
+  // The island's tile region in global logical coordinates, or null to
+  // derive it from the output (output rect minus reserved zones) -- the
+  // implicit per-output island.
+  rect: Rect | null;
+  // Ordered member windows, master-front. The driver lays out EXACTLY
+  // these windows in this order.
+  members: ReadonlyArray<number>;
+}
+
 // Snapshot the driver needs from the WM to build LayoutInputs + run the
 // mode resolver. The WM produces this on demand; the driver consumes it
 // and never holds onto references.
 export interface LayoutSnapshot {
   // The WM's outputs, each carrying its global-logical-space rect + HiDPI
-  // scale. The driver runs the layout plugin once per output.
+  // scale. Islands reference these by outputId.
   outputs: ReadonlyArray<{ id: number; rect: Rect; scale: number }>;
   // Every known window (every mapped toplevel), keyed by surfaceId for
-  // lookup. The driver does NOT iterate this map -- it iterates
-  // outputContent per output and looks up each id here.
+  // lookup. The driver does NOT iterate this map -- it iterates each
+  // island's members and looks up each id here.
   windows: ReadonlyMap<number, LayoutSnapshotWindow>;
-  // Ordered per-output visible-window lists, master-front. When set for an
-  // output, the layout-driver lays out EXACTLY these windows in this order.
-  // Absent or empty for an output -> the driver lays out nothing on that
-  // output. Provided by the workspace plugin via state.outputToplevelStacks
-  // (which it keeps in sync as workspaces switch and windows move); the WM
-  // copies that map into the snapshot at snapshot() time.
-  outputContent: ReadonlyMap<number, ReadonlyArray<number>>;
+  // The islands to lay out. The WM builds one implicit island per output
+  // from the workspace plugin's per-output content (an output with no
+  // content contributes no island and nothing is laid out there).
+  islands: ReadonlyArray<LayoutIsland>;
 }
 
 // The driver's view of a window. Carries everything needed to either pass
@@ -115,34 +133,43 @@ export function createLayoutDriver(deps: LayoutDriverDeps): LayoutDriver {
     running = true;
     try {
       const snap = deps.snapshot();
+      const outputById = new Map(snap.outputs.map((o) => [o.id, o]));
 
-      // Accumulate the merged result across every output's pass; one final
+      // Accumulate the merged result across every island's pass; one final
       // apply() at the end so the WM sees a single transactional update.
       const mergedRects: Array<{ id: number; outer: Rect }> = [];
       let anyComputeFailed = false;
 
-      for (const o of snap.outputs) {
+      for (const island of snap.islands) {
+        const o = outputById.get(island.outputId);
+        if (!o) {
+          // An island referencing a departed output has nothing to resolve
+          // fullscreen/scale against; its members keep their rects until
+          // the island source repairs itself.
+          log(`island ${island.id}: unknown output ${island.outputId}; skipped`);
+          continue;
+        }
         const outputRect: Rect = { ...o.rect };
-        const tileRegion = deps.reservedZones
-          ? deps.reservedZones.effectiveRect(o.id, outputRect)
-          : outputRect;
+        // The island's tile region: its own world rect, or (implicit
+        // island) the output rect minus reserved zones.
+        const tileRegion = island.rect
+          ? { ...island.rect }
+          : deps.reservedZones
+            ? deps.reservedZones.effectiveRect(o.id, outputRect)
+            : outputRect;
 
         const resolvedRects: Array<{ id: number; outer: Rect }> = [];
         const managed: LayoutWindow[] = [];
-        // The visible window order on this output comes from the workspace
-        // plugin's outputContent map. An absent entry means "no workspace
-        // is shown on this output," and nothing should be laid out there.
-        const ids = snap.outputContent.get(o.id) ?? [];
         const bucket: LayoutSnapshotWindow[] = [];
-        for (const id of ids) {
+        for (const id of island.members) {
           const w = snap.windows.get(id);
           if (w) bucket.push(w);
         }
 
         // First pass: find an exclusive (maximized or fullscreen) window.
-        // If one exists and is visible, it owns the workspace and every
-        // peer (except a fullscreen-on-top floating, which is also owned
-        // out of the way) is suppressed from this frame.
+        // If one exists and is visible, it owns the island and every peer
+        // (except a fullscreen-on-top floating, which is also owned out of
+        // the way) is suppressed from this frame.
         let exclusiveWin: LayoutSnapshotWindow | null = null;
         for (const w of bucket) {
           if (!w.visible) continue;
@@ -192,6 +219,7 @@ export function createLayoutDriver(deps: LayoutDriverDeps): LayoutDriver {
           const inputs: LayoutInputs = {
             output: { id: o.id, rect: outputRect, scale: o.scale },
             tileRegion,
+            island: { id: island.id },
             windows: managed,
             reason,
           };
@@ -200,8 +228,8 @@ export function createLayoutDriver(deps: LayoutDriverDeps): LayoutDriver {
           } catch (e: unknown) {
             anyComputeFailed = true;
             const msg = e instanceof Error ? e.message : String(e);
-            log(`compute(${reason}, output=${o.id}) failed: ${msg}`);
-            // Skip this output's contribution; other outputs still apply.
+            log(`compute(${reason}, island=${island.id}) failed: ${msg}`);
+            // Skip this island's contribution; other islands still apply.
             continue;
           }
         }

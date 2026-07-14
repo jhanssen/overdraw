@@ -86,13 +86,19 @@ export interface LayoutWindow {
 
 export interface LayoutInputs {
   output: Output;
-  // The region the plugin may place windows in. This is the output rect
-  // minus reserved zones (layer-shell anchored surfaces, etc.) minus any
-  // exclusion zones from non-managed windows on the same output. The
-  // plugin treats this as its working area; it should not place windows
-  // outside it (decoration layers handle anything that needs to draw
-  // beyond).
+  // The region the plugin may place windows in: the island's rect
+  // (docs/canvas-design.md §5). For the implicit per-output island this is
+  // the output rect minus reserved zones (layer-shell anchored surfaces,
+  // etc.); an explicit island supplies its own world rect. The plugin
+  // treats this as its working area; it should not place windows outside
+  // it (decoration layers handle anything that needs to draw beyond).
   tileRegion: Rect;
+  // The island whose members are being laid out. One compute() call per
+  // island; an output showing several islands produces several calls.
+  // Implicit per-output islands use the outputId as their island id.
+  // Layouts that key persistent parameters (master fraction, column
+  // widths) should key them per island id, not per output id.
+  island: { id: number };
   windows: ReadonlyArray<LayoutWindow>;
   reason: LayoutReason;
 }

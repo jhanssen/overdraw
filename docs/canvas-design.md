@@ -395,20 +395,26 @@ defaults), which is the point: establish that every mapping site honors
 the mechanism while nothing exercises it, with non-identity covered by
 tests only.
 
-1. **Camera term in core, identity default.** Add view origin (+zoom
-   placeholder) per output; apply at all five mapping sites (§4) gated to
-   content surfaces; SDK setter + spring-driven moves + full-output
-   damage while unsettled. Nothing sets it, so behavior is pixel-identical.
-   GPU test: set a non-identity camera, readback shifted pixel positions,
-   verify input hits the shifted window, verify layer-shell/cursor did
-   not move. This also unlocks replacing snapshot-based workspace slide
-   transitions with real camera moves later — optional, not part of this
-   step.
-2. **Island object in core.** Generalize the layout-driver to iterate
-   islands; instantiate one implicit island per output (rect = tileRegion,
-   members = that output's stack, layoutRef = the sole layout plugin).
-   Behavior-identical refactor; existing layout plugins untouched. Unit
-   tests move from per-output to per-island vocabulary.
+1. **Camera term in core, identity default.** LANDED. View origin per
+   output applied at all five mapping sites (§4) gated to content
+   surfaces, plus pointer-constraint regions; SDK setter
+   (`sdk.windows.setOutputCamera`); full-output damage on camera change;
+   `query()` exposes per-output camera. GPU test
+   (`output-camera.gpu.mjs`): non-identity camera pans content and
+   transforms hit-testing while a layer panel stays anchored; identity
+   restore repaints. Spring-driven camera moves ride the SDK setter for
+   now (in-core evaluator target is future, §4). Replacing snapshot-based
+   workspace slide transitions with real camera moves remains optional
+   future work.
+2. **Island object in core.** LANDED. The layout-driver iterates
+   `LayoutIsland`s ({id, outputId, rect | null, members}); the WM derives
+   one implicit island per output (rect = null -> output minus reserved
+   zones) from the workspace plugin's per-output content; explicit
+   islands pass their rect verbatim and scope exclusive-window ownership
+   to the island. `LayoutInputs.island` identifies the pass; existing
+   layout plugins work unchanged. Unit tests:
+   `layout-driver-islands.test.js`. No explicit-island producer exists
+   yet -- that arrives with the canvas plugin (step 3).
 3. **`plugin-canvas` in workspace-parity mode.** New plugin claiming the
    `'workspace'` namespace: N fixed islands 1:1 with today's workspaces,
    cameras permanently docked, `show` = dock camera, the §10 façade, the

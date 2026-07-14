@@ -53,7 +53,8 @@ export default async function init(sdk: PluginSdkShape, rawConfig?: unknown): Pr
     async compute(inputs: LayoutInputs): Promise<LayoutResult> {
       // Master-stack only consumes window count + the working rect.
       // layoutMode, layoutData, currentRect are ignored. Tiles are
-      // placed within `tileRegion` (output minus reserved zones); the
+      // placed within `tileRegion` (the island's rect; for the implicit
+      // per-output island that is the output minus reserved zones); the
       // core resolver dispatched non-managed presentations before we
       // were called.
       const region = inputs.tileRegion;
