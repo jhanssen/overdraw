@@ -38,7 +38,7 @@ test('explicit islands replace the implicit derivation; null reverts', () => {
   assert.equal(implicit[0].rect, null);
 
   const explicit = [{
-    id: 42, outputId: 0,
+    id: 42, contextOutputId: 0,
     rect: { x: 10, y: 10, width: 300, height: 300 }, members: [1],
   }];
   assert.equal(wm.setIslands(explicit), true);
@@ -55,15 +55,15 @@ test('explicit islands replace the implicit derivation; null reverts', () => {
 test('unchanged islands are a no-op (no relayout scheduled)', () => {
   const cap = captureDriver();
   const wm = createWm(mockSink(), OUTPUT, { layoutDriverFactory: cap.factory });
-  const islands = [{ id: 7, outputId: 0, rect: null, members: [3, 4] }];
+  const islands = [{ id: 7, contextOutputId: 0, rect: null, members: [3, 4] }];
   assert.equal(wm.setIslands(islands), true);
   const count = cap.snapshots.length;
   // Same content, fresh arrays/objects: must not schedule again.
   assert.equal(wm.setIslands(
-    [{ id: 7, outputId: 0, rect: null, members: [3, 4] }]), false);
+    [{ id: 7, contextOutputId: 0, rect: null, members: [3, 4] }]), false);
   assert.equal(cap.snapshots.length, count);
   // Member-order change IS a change.
   assert.equal(wm.setIslands(
-    [{ id: 7, outputId: 0, rect: null, members: [4, 3] }]), true);
+    [{ id: 7, contextOutputId: 0, rect: null, members: [4, 3] }]), true);
   assert.equal(cap.snapshots.length, count + 1);
 });

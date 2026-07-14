@@ -203,7 +203,7 @@ test('canvas: shown workspace is published as an explicit island (id = handle)',
     const isl = islands();
     assert.equal(isl.length, 1);
     assert.equal(isl[0].id, shownHandle);
-    assert.equal(isl[0].outputId, 0);
+    assert.equal(isl[0].contextOutputId, 0);
     assert.equal(isl[0].rect, null);
     assert.deepEqual(isl[0].members, [101]);
   });

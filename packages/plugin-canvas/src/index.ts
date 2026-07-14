@@ -273,7 +273,7 @@ export default async function init(
   // output minus reserved zones, exactly like the implicit island -- the
   // only observable delta is the island id layouts can key state on.
   const islandByOutput = new Map<
-    number, { id: number; outputId: number; rect: null; members: number[] }>();
+    number, { id: number; contextOutputId: number; rect: null; members: number[] }>();
   async function updateIsland(outputId: number, ids: readonly number[] | null): Promise<void> {
     if (ids === null) {
       if (!islandByOutput.delete(outputId)) return;
@@ -281,10 +281,10 @@ export default async function init(
       const shown = state.shownByOutput.get(outputId);
       if (shown === undefined) return;
       islandByOutput.set(outputId,
-        { id: shown, outputId, rect: null, members: [...ids] });
+        { id: shown, contextOutputId: outputId, rect: null, members: [...ids] });
     }
     const list = [...islandByOutput.values()]
-      .sort((a, b) => a.outputId - b.outputId);
+      .sort((a, b) => a.contextOutputId - b.contextOutputId);
     await sdk.windows.setIslands(list);
   }
 

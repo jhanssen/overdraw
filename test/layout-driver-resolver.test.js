@@ -41,7 +41,7 @@ function snap(windows) {
   return {
     outputs: [{ id: 0, rect: { x: 0, y: 0, width: 1000, height: 600 }, scale: 1 }],
     windows: windowMap,
-    islands: [{ id: 0, outputId: 0, rect: null, members }],
+    islands: [{ id: 0, contextOutputId: 0, rect: null, members }],
   };
 }
 

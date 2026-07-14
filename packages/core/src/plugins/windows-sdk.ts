@@ -187,13 +187,13 @@ export interface PluginWindows extends PluginWindowObserver {
 
   // Replace the explicit island set the layout-driver iterates
   // (docs/canvas-design.md §5): each entry is a tiling region ({id,
-  // outputId, rect | null, members}); rect null derives the region from
+  // contextOutputId, rect | null, members}); rect null derives the region from
   // the output minus reserved zones. null reverts to the implicit
   // one-island-per-output derivation. The workspace-namespace plugin is
   // the intended single writer.
   setIslands(islands: ReadonlyArray<{
     id: number;
-    outputId: number;
+    contextOutputId: number;
     rect: { x: number; y: number; width: number; height: number } | null;
     members: ReadonlyArray<number>;
   }> | null): Promise<void>;
@@ -409,8 +409,8 @@ export function createPluginWindows(
           if (!isl || typeof isl !== "object") {
             throw new TypeError("setIslands entries must be objects");
           }
-          if (typeof isl.id !== "number" || typeof isl.outputId !== "number") {
-            throw new TypeError("setIslands entries need numeric id/outputId");
+          if (typeof isl.id !== "number" || typeof isl.contextOutputId !== "number") {
+            throw new TypeError("setIslands entries need numeric id/contextOutputId");
           }
           if (!Array.isArray(isl.members)
             || !isl.members.every((m: unknown): m is number => typeof m === "number")) {

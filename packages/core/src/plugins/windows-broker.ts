@@ -355,10 +355,10 @@ export function createWindowsBroker(deps: WindowsBrokerDeps): WindowsBroker {
         throw new Error(`windows.set-islands: islands[${i}] must be an object`);
       }
       const isl = raw as {
-        id?: unknown; outputId?: unknown; rect?: unknown; members?: unknown;
+        id?: unknown; contextOutputId?: unknown; rect?: unknown; members?: unknown;
       };
-      if (typeof isl.id !== "number" || typeof isl.outputId !== "number") {
-        throw new Error(`windows.set-islands: islands[${i}] id/outputId must be numbers`);
+      if (typeof isl.id !== "number" || typeof isl.contextOutputId !== "number") {
+        throw new Error(`windows.set-islands: islands[${i}] id/contextOutputId must be numbers`);
       }
       let rect: { x: number; y: number; width: number; height: number } | null = null;
       if (isl.rect !== null && isl.rect !== undefined) {
@@ -373,7 +373,7 @@ export function createWindowsBroker(deps: WindowsBrokerDeps): WindowsBroker {
         || !isl.members.every((m): m is number => typeof m === "number")) {
         throw new Error(`windows.set-islands: islands[${i}].members must be number[]`);
       }
-      return { id: isl.id, outputId: isl.outputId, rect, members: isl.members.slice() };
+      return { id: isl.id, contextOutputId: isl.contextOutputId, rect, members: isl.members.slice() };
     });
     wm.setIslands(parsed);
     return null;

@@ -46,9 +46,12 @@ export type { LayoutInputs, LayoutResult, LayoutReason } from "@overdraw/layout-
 export interface LayoutIsland {
   // Stable island id. Implicit per-output islands use the outputId.
   id: number;
-  // The output that gives the island its context: the plugin sees this
-  // output's rect + scale, and a fullscreen member covers this output.
-  outputId: number;
+  // The output whose VIEW resolves this island's layout context: the
+  // plugin sees this output's rect + scale, and a fullscreen member
+  // covers it. Derived, not ownership -- the island source recomputes it
+  // as cameras move (the output currently viewing the island); islands
+  // do not belong to outputs (docs/canvas-design.md §3).
+  contextOutputId: number;
   // The island's tile region in global logical coordinates, or null to
   // derive it from the output (output rect minus reserved zones) -- the
   // implicit per-output island.
@@ -141,12 +144,12 @@ export function createLayoutDriver(deps: LayoutDriverDeps): LayoutDriver {
       let anyComputeFailed = false;
 
       for (const island of snap.islands) {
-        const o = outputById.get(island.outputId);
+        const o = outputById.get(island.contextOutputId);
         if (!o) {
           // An island referencing a departed output has nothing to resolve
           // fullscreen/scale against; its members keep their rects until
           // the island source repairs itself.
-          log(`island ${island.id}: unknown output ${island.outputId}; skipped`);
+          log(`island ${island.id}: unknown output ${island.contextOutputId}; skipped`);
           continue;
         }
         const outputRect: Rect = { ...o.rect };

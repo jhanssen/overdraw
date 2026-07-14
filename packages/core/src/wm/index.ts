@@ -1568,7 +1568,7 @@ export function createWm(
     if (a.length !== b.length) return false;
     for (let i = 0; i < a.length; i++) {
       const x = a[i], y = b[i];
-      if (x.id !== y.id || x.outputId !== y.outputId) return false;
+      if (x.id !== y.id || x.contextOutputId !== y.contextOutputId) return false;
       if ((x.rect === null) !== (y.rect === null)) return false;
       if (x.rect && y.rect
         && (x.rect.x !== y.rect.x || x.rect.y !== y.rect.y
@@ -1620,20 +1620,20 @@ export function createWm(
     if (explicitIslands) {
       for (const isl of explicitIslands) {
         islands.push({
-          id: isl.id, outputId: isl.outputId,
+          id: isl.id, contextOutputId: isl.contextOutputId,
           rect: isl.rect ? { ...isl.rect } : null,
           members: [...isl.members],
         });
       }
     } else if (outputContent) {
       for (const [outputId, ids] of outputContent()) {
-        islands.push({ id: outputId, outputId, rect: null, members: [...ids] });
+        islands.push({ id: outputId, contextOutputId: outputId, rect: null, members: [...ids] });
       }
     } else {
       const ids = windows.map((w) => w.surfaceId);
       if (ids.length > 0) {
         const outputId = primaryOutputId();
-        islands.push({ id: outputId, outputId, rect: null, members: ids });
+        islands.push({ id: outputId, contextOutputId: outputId, rect: null, members: ids });
       }
     }
     return { outputs: outputDescs, windows: windowMap, islands };
@@ -1681,7 +1681,7 @@ export function createWm(
 
     setIslands(islands) {
       const next = islands === null ? null : islands.map((i) => ({
-        id: i.id, outputId: i.outputId,
+        id: i.id, contextOutputId: i.contextOutputId,
         rect: i.rect ? { ...i.rect } : null,
         members: [...i.members],
       }));

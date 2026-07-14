@@ -35,8 +35,8 @@ function snapWith(islands, windows, outputs = [OUTPUT]) {
 test('two islands on one output: one compute() each, tileRegion = island rect', async () => {
   const computeCalls = [];
   const target = captureTarget();
-  const islandA = { id: 10, outputId: 0, rect: { x: 0, y: 0, width: 500, height: 600 }, members: [1, 2] };
-  const islandB = { id: 11, outputId: 0, rect: { x: 500, y: 0, width: 500, height: 600 }, members: [3] };
+  const islandA = { id: 10, contextOutputId: 0, rect: { x: 0, y: 0, width: 500, height: 600 }, members: [1, 2] };
+  const islandB = { id: 11, contextOutputId: 0, rect: { x: 500, y: 0, width: 500, height: 600 }, members: [3] };
   const driver = createLayoutDriver({
     snapshot: () => snapWith([islandA, islandB],
       [managedWin(1), managedWin(2), managedWin(3)]),
@@ -73,8 +73,8 @@ test('explicit island rect is used verbatim; reserved zones do not shrink it', a
 
   const computeCalls = [];
   const target = captureTarget();
-  const explicit = { id: 10, outputId: 0, rect: { x: 100, y: 0, width: 300, height: 600 }, members: [1] };
-  const implicit = { id: 0, outputId: 0, rect: null, members: [2] };
+  const explicit = { id: 10, contextOutputId: 0, rect: { x: 100, y: 0, width: 300, height: 600 }, members: [1] };
+  const implicit = { id: 0, contextOutputId: 0, rect: null, members: [2] };
   const driver = createLayoutDriver({
     snapshot: () => snapWith([explicit, implicit], [managedWin(1), managedWin(2)]),
     target,
@@ -97,8 +97,8 @@ test('explicit island rect is used verbatim; reserved zones do not shrink it', a
 test('exclusive window owns only its island; the sibling island still tiles', async () => {
   const target = captureTarget();
   const computeCalls = [];
-  const islandA = { id: 10, outputId: 0, rect: { x: 0, y: 0, width: 500, height: 600 }, members: [1, 2] };
-  const islandB = { id: 11, outputId: 0, rect: { x: 500, y: 0, width: 500, height: 600 }, members: [3] };
+  const islandA = { id: 10, contextOutputId: 0, rect: { x: 0, y: 0, width: 500, height: 600 }, members: [1, 2] };
+  const islandB = { id: 11, contextOutputId: 0, rect: { x: 500, y: 0, width: 500, height: 600 }, members: [3] };
   const driver = createLayoutDriver({
     snapshot: () => snapWith([islandA, islandB], [
       { ...managedWin(1), exclusive: 'maximized' },
@@ -129,8 +129,8 @@ test('island referencing an unknown output is skipped; others apply', async () =
   const computeCalls = [];
   const driver = createLayoutDriver({
     snapshot: () => snapWith([
-      { id: 10, outputId: 7, rect: { x: 0, y: 0, width: 100, height: 100 }, members: [1] },
-      { id: 11, outputId: 0, rect: null, members: [2] },
+      { id: 10, contextOutputId: 7, rect: { x: 0, y: 0, width: 100, height: 100 }, members: [1] },
+      { id: 11, contextOutputId: 0, rect: null, members: [2] },
     ], [managedWin(1), managedWin(2)]),
     target,
     log: () => {},

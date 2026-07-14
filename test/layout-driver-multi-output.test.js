@@ -37,7 +37,7 @@ function snap(windows, outputs = TWO_OUTPUTS) {
     byOutput.get(w.outputId).push(w.id);
   }
   const islands = [...byOutput].map(([outputId, members]) =>
-    ({ id: outputId, outputId, rect: null, members }));
+    ({ id: outputId, contextOutputId: outputId, rect: null, members }));
   return { outputs, windows: windowMap, islands };
 }
 

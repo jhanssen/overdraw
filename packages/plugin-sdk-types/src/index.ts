@@ -87,7 +87,7 @@ export interface PluginWindowsLike {
   setOutputCamera(outputId: number, x: number, y: number): Promise<void>;
   setIslands(islands: ReadonlyArray<{
     id: number;
-    outputId: number;
+    contextOutputId: number;
     rect: { x: number; y: number; width: number; height: number } | null;
     members: ReadonlyArray<number>;
   }> | null): Promise<void>;
