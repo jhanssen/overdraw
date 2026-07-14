@@ -282,6 +282,37 @@ assigns workspaces today) becomes the placement resolver;
 `plugin-window-rules` stays the matching side, with the rule *target*
 gaining island semantics.
 
+## 7b. X11 and the 16-bit world
+
+X11 coordinates are int16 (±32767); a world that sprawls past that breaks
+X clients if their X-visible positions are world positions. Two-stage
+answer:
+
+- **v1 (with world positions, step 4): an X district.** X-containing
+  islands are constrained to a ±30k region around the origin; an island
+  acquires the constraint when an X window joins, and the shove solver
+  respects it. Moving an X window to an out-of-district island is
+  rejected with a clear error. The default world-arrangement policy packs
+  islands in 2D with gutters, so most worlds fit inside the district
+  entirely and the constraint rarely binds.
+- **End state: X space is a maintained fiction, not world space.** The
+  XWM tells X clients GLASS positions (world minus the owning output's
+  camera): bounded by the physical arrangement, always int16-safe, and
+  consistent for everything X uses root coords for (override-redirect
+  menus relative to the parent's believed position, sibling placement --
+  relative offsets in glass equal what the user sees, and pointer root
+  coords are synthesized from the told positions). OR-window world
+  positions derive by the inverse mapping. Re-tell positions on camera
+  settle (not per pan frame); hidden-island X windows keep their last
+  told coords (inert while hidden). Precedent: the HiDPI
+  `xwaylandScale` fiction already translates X coordinates specially
+  (xwayland-design.md). Once this lands, the district constraint is
+  deleted, not worked around.
+
+Windows spanning outputs with disagreeing cameras would have two glass
+positions, but independent cameras already preclude straddling (§8), so
+the case does not arise.
+
 ## 8. Hotplug — the model's strongest case
 
 Today windows belong to monitors, so disconnect is a migration problem
