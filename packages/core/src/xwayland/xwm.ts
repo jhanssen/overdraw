@@ -37,6 +37,7 @@ import {
   type PropertyReply,
 } from "./properties.js";
 import { xwaylandScaleOf } from "./scale.js";
+import { xChartCameraOf, xGlassToWorld, tellXRect } from "./glass-map.js";
 
 export interface XwmEventMsg {
   type:
@@ -168,6 +169,9 @@ export interface XwmStateView {
   // Initiate close. Returns true iff a matching X window was found; the
   // close-surface helper uses that to skip the xdg branch.
   closeBySurfaceId(surfaceId: number): boolean;
+  // Re-narrate managed windows' glass positions after a camera or
+  // stack-visibility change (glass-map.ts). Cheap when nothing moved.
+  retellPositions(): void;
   // _NET_STARTUP_ID set on the X window (or null when the client never set
   // one). Resolved by surfaceId so callers don't need an X window handle.
   startupIdOf(surfaceId: number): string | null;
@@ -346,9 +350,16 @@ export function startXwm(state: CompositorState, addon: Addon, wmFd: number): Xw
     if (!w.overrideRedirect || !w.mapped || w.surfaceId === null) return;
     const ors = (state.overrideRedirects ??= new Map());
     const n = xwaylandScaleOf(state);
+    // The client placed the overlay in X coords = GLASS space (the same
+    // fiction managed windows are told, glass-map.ts); reduce to logical
+    // and invert through the containing output's camera so the overlay
+    // lands at the WORLD position beside its (world-space) opener. The
+    // overlay then pans with content, staying attached to it.
+    const world = xGlassToWorld(state,
+      Math.round(w.x / n), Math.round(w.y / n));
     ors.set(w.surfaceId, {
-      x: Math.round(w.x / n),
-      y: Math.round(w.y / n),
+      x: world.x,
+      y: world.y,
       width: Math.round(w.width / n),
       height: Math.round(w.height / n),
     });
@@ -568,8 +579,9 @@ export function startXwm(state: CompositorState, addon: Addon, wmFd: number): Xw
         // Managed windows: the compositor is authoritative -- reply with
         // the WM's current rect (and a synthetic ConfigureNotify per ICCCM
         // §4.2.3) instead of honoring the client's request. The WM rect
-        // is in compositor logical coords; multiply by the global X scale
-        // to land in X-device coords for the wire.
+        // is world coords; X sees GLASS positions (world minus the chart
+        // camera, glass-map.ts), multiplied by the global X scale to land
+        // in X-device coords for the wire.
         // Override-redirect: the X client positions menus/tooltips itself;
         // honor the request (X coords passed through), update our tracked
         // rect (also X coords), and re-place the overlay so the compositor
@@ -579,10 +591,10 @@ export function startXwm(state: CompositorState, addon: Addon, wmFd: number): Xw
         if (w && w.addedToWm && w.surfaceId !== null) {
           const r = state.wm?.rectOf(w.surfaceId);
           if (r) {
-            const xx = r.x * n, xy = r.y * n;
-            const xw = r.width * n, xh = r.height * n;
-            addon.xwmConfigureWindow(ev.window, xx, xy, xw, xh);
-            addon.xwmSendConfigureNotify(ev.window, xx, xy, xw, xh);
+            const cam = xChartCameraOf(state, w.surfaceId);
+            tellXRect(addon, ev.window,
+              (r.x - cam.x) * n, (r.y - cam.y) * n,
+              r.width * n, r.height * n);
             break;
           }
         }
@@ -939,6 +951,28 @@ export function startXwm(state: CompositorState, addon: Addon, wmFd: number): Xw
     }
   }
 
+  // Re-narrate every managed window's GLASS position (world rect mapped
+  // through its chart camera, glass-map.ts). Called when the mapping's
+  // inputs move without the world rect changing: a camera change, or a
+  // stack-visibility change that re-charts a window. Windows whose told
+  // rect is unchanged are skipped (w.x/w.y track the X-side rect via
+  // configure-notify echoes; a stale echo costs one redundant, idempotent
+  // tell). Override-redirect overlays are excluded: their X position is
+  // client-owned and their world position was fixed at placement.
+  function retellPositions(): void {
+    const n = xwaylandScaleOf(state);
+    for (const w of windows.values()) {
+      if (w.overrideRedirect || !w.addedToWm || w.surfaceId === null) continue;
+      const r = state.wm?.rectOf(w.surfaceId);
+      if (!r) continue;
+      const cam = xChartCameraOf(state, w.surfaceId);
+      const xx = Math.round((r.x - cam.x) * n);
+      const xy = Math.round((r.y - cam.y) * n);
+      if (xx === w.x && xy === w.y) continue;
+      tellXRect(addon, w.window, xx, xy, r.width * n, r.height * n);
+    }
+  }
+
   // Stash a view on CompositorState so titleAppId / closeSurface can reach
   // x-backed windows without taking a dep on the full Xwm.
   state.xwm = {
@@ -946,6 +980,7 @@ export function startXwm(state: CompositorState, addon: Addon, wmFd: number): Xw
     closeBySurfaceId,
     startupIdOf(surfaceId) { return bySurface.get(surfaceId)?.startupId ?? null; },
     iconsOf(surfaceId) { return bySurface.get(surfaceId)?.icons ?? null; },
+    retellPositions,
   };
 
   return {

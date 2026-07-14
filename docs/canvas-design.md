@@ -314,13 +314,23 @@ menus relative to the parent's believed position, sibling placement --
 relative offsets in glass equal what the user sees, and pointer root
 coords are synthesized from the told positions). OR-window world
 positions derive by the inverse mapping. Re-tell positions on camera
-settle (not per pan frame). The X coordinate boundary is small and
-concentrated (`xwayland/xwm.ts` ConfigureRequest/OR handling +
-`protocols/index.ts` geometry mirror, ~11 call sites); the mapping is
-the identity under identity cameras, so it lands as another
-zero-behavior-change increment exercised by non-identity-camera tests.
-Precedent: the HiDPI `xwaylandScale` fiction already translates X
-coordinates specially (xwayland-design.md).
+settle (not per pan frame). Precedent: the HiDPI `xwaylandScale`
+fiction already translates X coordinates specially (xwayland-design.md).
+
+LANDED (`xwayland/glass-map.ts`): the chart is the camera of the
+lowest-id output that SHOWS the window (stack-gated residency), falling
+back to geometric overlap -- so a hidden window keeps being told
+coordinates in its last home's frame (retained fiction; the structured
+per-island attic arrives with world positions). Outbound: the configure
+sink + the XWM's ConfigureRequest reply map world -> glass -> X-device,
+int16 clamp-and-log. Inbound: override-redirect placements invert
+through the containing output's camera, so overlays land at WORLD
+positions and pan with their openers. Re-tell triggers:
+`state.xwm.retellPositions()` on camera change and on stack-visibility
+change (idempotent; skips unmoved windows). Chart cameras are pan-only
+(zoom treated as 1) per the rule above. GPU test
+(`xwayland-camera.gpu.mjs`): camera pan re-narrates the told position
+via synthetic ConfigureNotify; identity restores.
 
   **Unviewed windows** (island shown on no camera) have no glass
   position, and don't need a true one: a hidden window's told position

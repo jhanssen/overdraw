@@ -23,6 +23,7 @@ import { unmapAndTeardownSurface } from "./wl_surface.js";
 import { rebuildStackWithPopups, maybeDismissGrabbedPopup, flushDeferredOutputStacks } from "./xdg_popup.js";
 import { configureToplevel } from "./xdg_surface.js";
 import { updateSurfaceOutputResidency, updateAllSurfaceResidency } from "./surface-residency.js";
+import { xChartCameraOf, tellXRect } from "../xwayland/glass-map.js";
 import { shouldDeliverFrameCallbackIdle } from "./frame-callbacks.js";
 import { installCrossOutputMove } from "./cross-output-move.js";
 import { makeOutputForOutput } from "./wl_output.js";
@@ -270,7 +271,11 @@ export async function installProtocols(
       lastGlobal = ids.slice();
       // The very first push is boot bring-up; per-surface layout residency
       // covers it and a sweep before outputs settle is noise.
-      if (!first) updateAllSurfaceResidency(state, addon);
+      if (!first) {
+        updateAllSurfaceResidency(state, addon);
+        // Visibility changes can re-chart X windows (glass-map.ts).
+        state.xwm?.retellPositions();
+      }
     };
   }
   const innerSetOutputStack = rawCompositor.setOutputStack?.bind(rawCompositor);
@@ -282,6 +287,8 @@ export async function installProtocols(
       if (lastByOutput.has(outputId) && !stacksChanged(prev, ids)) return;
       lastByOutput.set(outputId, ids === null ? null : ids.slice());
       updateAllSurfaceResidency(state, addon);
+      // Visibility changes can re-chart X windows (glass-map.ts).
+      state.xwm?.retellPositions();
     };
   }
   if (opts.bus) state.bus = opts.bus;
@@ -387,13 +394,14 @@ export async function installProtocols(
       if (rec?.role === "xwayland") {
         const xw = state.xwm?.findBySurfaceId(surfaceId);
         if (xw) {
-          // The WM rect (x,y,w,h) is in compositor logical coords;
-          // multiply by the frozen global X scale to land in X-device
-          // coords. See docs/xwayland-design.md "HiDPI".
+          // The WM rect (x,y,w,h) is world coords; X sees GLASS positions
+          // (world minus the chart camera, glass-map.ts), then multiplied
+          // by the frozen global X scale to land in X-device coords. See
+          // docs/xwayland-design.md "HiDPI" + canvas-design.md §7b.
+          const cam = xChartCameraOf(state, surfaceId);
           const n = state.xwaylandScale ?? 1;
-          const xx = x * n, xy = y * n, xw2 = w * n, xh2 = h * n;
-          addon.xwmConfigureWindow(xw.window, xx, xy, xw2, xh2);
-          addon.xwmSendConfigureNotify(xw.window, xx, xy, xw2, xh2);
+          tellXRect(addon, xw.window,
+            (x - cam.x) * n, (y - cam.y) * n, w * n, h * n);
         }
         return null;
       }
@@ -403,18 +411,17 @@ export async function installProtocols(
     },
     // Pure move (no resize): xdg has no client-visible position concept, so
     // a no-op. xwayland needs the synthetic ConfigureNotify so the client
-    // reads its new root coords. xwmConfigureWindow + xwmSendConfigureNotify
-    // is the same pair as the resize path; with same w/h, the real
-    // ConfigureNotify the X server generates is also fine.
+    // reads its new root coords -- same world->glass->X-device mapping as
+    // the resize path.
     configureMove(surfaceId, x, y, w, h) {
       const rec = state.surfacesById?.get(surfaceId);
       if (rec?.role !== "xwayland") return;
       const xw = state.xwm?.findBySurfaceId(surfaceId);
       if (!xw) return;
+      const cam = xChartCameraOf(state, surfaceId);
       const n = state.xwaylandScale ?? 1;
-      const xx = x * n, xy = y * n, xw2 = w * n, xh2 = h * n;
-      addon.xwmConfigureWindow(xw.window, xx, xy, xw2, xh2);
-      addon.xwmSendConfigureNotify(xw.window, xx, xy, xw2, xh2);
+      tellXRect(addon, xw.window,
+        (x - cam.x) * n, (y - cam.y) * n, w * n, h * n);
     },
   };
   // The WM delegates its stack push to the full rebuild (windows interleaved with

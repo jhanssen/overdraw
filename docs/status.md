@@ -955,9 +955,14 @@ validated + resolved + consumed by the runtime + hotkey plugin.
   on hidden workspaces now get `wl_surface.leave` and reside nowhere;
   frame pacing stays geometric so hidden clients keep receiving
   `wl_callback.done` (GPU test `residency-visibility.gpu.mjs`).
+  The X11 glass-space fiction is LANDED (`xwayland/glass-map.ts`,
+  canvas-design.md §7b): X clients are told glass positions through
+  pan-only chart cameras with int16 clamp-and-log; override-redirect
+  placements invert to world; re-narration on camera/visibility change
+  (GPU test `xwayland-camera.gpu.mjs`).
   NOT built: world positions + camera policy (roaming, docking,
-  bookmarks, gutters/shove, hotplug camera persistence), the X11
-  glass-space fiction, ext-workspace per-group duplicate projection,
+  bookmarks, gutters/shove, hotplug camera persistence, the per-island
+  X attic), ext-workspace per-group duplicate projection,
   camera-following compose/live scenes, camera animation as an in-core
   evaluator target.
 - **Logging.** TS surface migrated (spdlog 1.17.0; fixed area set;

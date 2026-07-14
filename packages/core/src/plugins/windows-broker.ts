@@ -342,6 +342,9 @@ export function createWindowsBroker(deps: WindowsBrokerDeps): WindowsBroker {
     // enter/leave and hover state track the surface actually under the
     // cursor (same rationale as the workspace-changed repick above).
     state.seat?.repickPointer();
+    // X windows on this output changed glass position (X sees glass, not
+    // world -- xwayland/glass-map.ts): re-narrate their told coordinates.
+    state.xwm?.retellPositions();
     return null;
   }
 
