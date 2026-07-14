@@ -27,6 +27,7 @@ import type { ZwpPrimarySelectionDeviceV1Handler } from "#protocols-gen/zwp_prim
 import type { ZwpPrimarySelectionSourceV1Handler } from "#protocols-gen/zwp_primary_selection_source_v1.js";
 import type { ZwpPrimarySelectionOfferV1Handler } from "#protocols-gen/zwp_primary_selection_offer_v1.js";
 import type { Ctx } from "./ctx.js";
+import { seatViewToWorldX, seatViewToWorldY } from "./ctx.js";
 import type { Resource, WaylandFd } from "../types.js";
 import { KEYBOARD_EVENT, SELECTION_EVENT } from "../events/window-bus.js";
 
@@ -157,7 +158,7 @@ function dragLeave(d: DragSession): void {
 function dragMotion(d: DragSession, x: number, y: number,
                     hit: { surfaceId: number; clientId: number;
                            rect: { x: number; y: number };
-                           camX: number; camY: number } | null): void {
+                           view: import("./ctx.js").SeatViewTransform } | null): void {
   // Move the drag icon (if any) to follow the pointer.
   updateDragIcon(d, x, y);
 
@@ -189,15 +190,17 @@ function dragMotion(d: DragSession, x: number, y: number,
     // pixels. Other roles pass through 1:1.
     const xn = surfaceRec?.role === "xwayland" ? (d.ctx.state.xwaylandScale ?? 1) : 1;
     // hit.rect is in the hit's own space (world for content, glass for layer
-    // trees); re-apply the camera offset the hit was made with.
-    const sx = (x + hit.camX - hit.rect.x) * xn, sy = (y + hit.camY - hit.rect.y) * xn;
+    // trees); re-apply the view transform the hit was made with.
+    const sx = (seatViewToWorldX(hit.view, x) - hit.rect.x) * xn;
+    const sy = (seatViewToWorldY(hit.view, y) - hit.rect.y) * xn;
     if (surfaceRec)
       d.ctx.events.wl_data_device.send_enter(device, serial, surfaceRec.resource, sx, sy, offer);
   } else if (d.focusDevice && !d.focusDevice.destroyed) {
     const surfaceRec = d.focusSurfaceId !== null
       ? d.ctx.state.surfacesById?.get(d.focusSurfaceId) : null;
     const xn = surfaceRec?.role === "xwayland" ? (d.ctx.state.xwaylandScale ?? 1) : 1;
-    const sx = (x + hit.camX - hit.rect.x) * xn, sy = (y + hit.camY - hit.rect.y) * xn;
+    const sx = (seatViewToWorldX(hit.view, x) - hit.rect.x) * xn;
+    const sy = (seatViewToWorldY(hit.view, y) - hit.rect.y) * xn;
     d.ctx.events.wl_data_device.send_motion(d.focusDevice, 0, sx, sy);
   }
 }

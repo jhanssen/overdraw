@@ -223,6 +223,18 @@ omitted from the stack entirely. `pushStack` gating (exclusive-window
 suppression etc.) keys on islands-in-view rather than the per-window
 output cache.
 
+**Hidden means hidden** (LANDED): visibility is explicit stack state, not
+a geometric accident -- a camera roaming over a hidden island's world
+position shows void, and residency agrees: `surfaceVisibleOutputs`
+(stack membership ∩ camera-view geometry) drives `wl_surface.enter/
+leave` + preferred scale, so hidden-workspace windows get leave and
+truthfully reside nowhere. Frame pacing keeps the ungated geometric
+`surfaceOutputs` so a hidden client still receives `wl_callback.done`
+(clients that block on `done` before committing must not deadlock).
+Distinct from hidden is merely UNVIEWED (no camera there, world-visible
+when one roams past -- e.g. an orphaned island); the plugin decides
+which state an island is in via what it stacks.
+
 ## 6. World arrangement (no overlap, shove)
 
 Islands may not overlap. Placement policy (plugin):
@@ -458,17 +470,21 @@ defaults), which is the point: establish that every mapping site honors
 the mechanism while nothing exercises it, with non-identity covered by
 tests only.
 
-1. **Camera term in core, identity default.** LANDED. View origin per
-   output applied at all five mapping sites (§4) gated to content
-   surfaces, plus pointer-constraint regions; SDK setter
-   (`sdk.windows.setOutputCamera`); full-output damage on camera change;
-   `query()` exposes per-output camera. GPU test
-   (`output-camera.gpu.mjs`): non-identity camera pans content and
-   transforms hit-testing while a layer panel stays anchored; identity
-   restore repaints. Spring-driven camera moves ride the SDK setter for
-   now (in-core evaluator target is future, §4). Replacing snapshot-based
-   workspace slide transitions with real camera moves remains optional
-   future work.
+1. **Camera term in core, identity default.** LANDED, including the
+   zoom term: the camera is (x, y, zoom), applied at all five mapping
+   sites (§4) gated to content surfaces, plus pointer-constraint regions
+   and popup constraint boxes; input generalizes through
+   `SeatViewTransform` (glass<->world with zoom); SDK setter
+   (`sdk.windows.setOutputCamera(outputId, x, y, zoom?)`); full-output
+   damage on camera change; `query()` exposes per-output camera. GPU
+   tests (`output-camera.gpu.mjs`): pan and zoom each shift/scale
+   content + hit-testing while a layer panel stays anchored; identity
+   restores repaint. Zoom is compositor-side optics (clients render at
+   real size; fx translate/margins stay glass-space); X told-coordinates
+   use pan-only charts (§7b). Spring-driven camera moves ride the SDK
+   setter for now (in-core evaluator target is future, §4). Replacing
+   snapshot-based workspace slide transitions with real camera moves
+   remains optional future work.
 2. **Island object in core.** LANDED. The layout-driver iterates
    `LayoutIsland`s ({id, outputId, rect | null, members}); the WM derives
    one implicit island per output (rect = null -> output minus reserved

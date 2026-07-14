@@ -314,12 +314,19 @@ export function createWindowsBroker(deps: WindowsBrokerDeps): WindowsBroker {
     if (!p || typeof p !== "object") {
       throw new Error("windows.set-output-camera: malformed payload");
     }
-    const { outputId, x, y } = p as { outputId?: unknown; x?: unknown; y?: unknown };
+    const { outputId, x, y, zoom } = p as {
+      outputId?: unknown; x?: unknown; y?: unknown; zoom?: unknown;
+    };
     if (typeof outputId !== "number"
       || typeof x !== "number" || !Number.isFinite(x)
       || typeof y !== "number" || !Number.isFinite(y)) {
       throw new Error("windows.set-output-camera: malformed payload");
     }
+    if (zoom !== undefined
+      && (typeof zoom !== "number" || !Number.isFinite(zoom) || zoom <= 0)) {
+      throw new Error("windows.set-output-camera: zoom must be a positive number");
+    }
+    const z = zoom ?? 1;
     if (!compositor.setOutputCamera) {
       throw new Error("windows.set-output-camera: not supported by this compositor");
     }
@@ -328,9 +335,9 @@ export function createWindowsBroker(deps: WindowsBrokerDeps): WindowsBroker {
     // the same value to render/damage/residency. One writer keeps them
     // agreeing.
     state.outputCameras ??= new Map();
-    if (x === 0 && y === 0) state.outputCameras.delete(outputId);
-    else state.outputCameras.set(outputId, { x, y });
-    compositor.setOutputCamera(outputId, x, y);
+    if (x === 0 && y === 0 && z === 1) state.outputCameras.delete(outputId);
+    else state.outputCameras.set(outputId, { x, y, zoom: z });
+    compositor.setOutputCamera(outputId, x, y, z);
     // The world moved under a stationary pointer: refresh pointer focus so
     // enter/leave and hover state track the surface actually under the
     // cursor (same rationale as the workspace-changed repick above).

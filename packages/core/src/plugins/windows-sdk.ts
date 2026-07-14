@@ -199,11 +199,13 @@ export interface PluginWindows extends PluginWindowObserver {
   }> | null): Promise<void>;
 
   // Set the output's content camera (docs/canvas-design.md §4): the output
-  // renders world-space content starting at (arrangement origin + (x, y)).
-  // (0, 0) restores identity (the default). Purely optical -- no relayout;
-  // layer-shell, the cursor, and layer-rooted popups stay glass-anchored.
-  // Applies to render, hit-testing, damage, and output residency together.
-  setOutputCamera(outputId: number, x: number, y: number): Promise<void>;
+  // renders world-space content starting at (arrangement origin + (x, y)),
+  // scaled by zoom (zoom < 1 shows more world, compositor-side optics
+  // only -- clients keep rendering at their real size). (0, 0, 1) restores
+  // identity (the default). Purely optical -- no relayout; layer-shell,
+  // the cursor, and layer-rooted popups stay glass-anchored. Applies to
+  // render, hit-testing, damage, and output residency together.
+  setOutputCamera(outputId: number, x: number, y: number, zoom?: number): Promise<void>;
 
   // Explicit focus override; bypasses the focus plugin's decide()
   // (core-plugin-api.md §1). null clears. For policy-mediated focus
@@ -421,7 +423,7 @@ export function createPluginWindows(
       await endpoint.request("windows.set-islands", { islands });
     },
 
-    async setOutputCamera(outputId, x, y): Promise<void> {
+    async setOutputCamera(outputId, x, y, zoom = 1): Promise<void> {
       if (typeof outputId !== "number") {
         throw new TypeError("setOutputCamera outputId must be a number");
       }
@@ -429,7 +431,10 @@ export function createPluginWindows(
         || typeof y !== "number" || !Number.isFinite(y)) {
         throw new TypeError("setOutputCamera x/y must be finite numbers");
       }
-      await endpoint.request("windows.set-output-camera", { outputId, x, y });
+      if (typeof zoom !== "number" || !Number.isFinite(zoom) || zoom <= 0) {
+        throw new TypeError("setOutputCamera zoom must be a positive number");
+      }
+      await endpoint.request("windows.set-output-camera", { outputId, x, y, zoom });
     },
 
     async focus(id): Promise<void> {

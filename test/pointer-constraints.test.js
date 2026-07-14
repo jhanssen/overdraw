@@ -33,7 +33,8 @@ function mkCtx({ focusSurfaceId = null, rect = { x: 0, y: 0, width: 100, height:
       surfaces, regions,
       seat: {
         focus: focusSurfaceId === null ? null
-          : { surfaceId: focusSurfaceId, rect, camX: 0, camY: 0 },
+          : { surfaceId: focusSurfaceId, rect,
+              view: { originX: 0, originY: 0, camX: 0, camY: 0, zoom: 1 } },
         pointerPosition: () => ptr,
       },
     },

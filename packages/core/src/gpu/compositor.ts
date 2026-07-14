@@ -927,14 +927,17 @@ interface OutputCtx {
   id: number;
   originX: number;
   originY: number;
-  // Content-camera offset for this output: the output views the world
-  // starting at (originX + cameraX, originY + cameraY). Applies only to
-  // world-space surfaces (see Surface.outputAnchored); layer-shell, the
-  // cursor, and output-anchored surfaces subtract the plain origin.
-  // (0, 0) = identity (the output shows the slice at its arrangement
-  // position, the pre-camera behavior).
+  // Content-camera for this output: the output views the world starting
+  // at (originX + cameraX, originY + cameraY), scaled by cameraZoom (a
+  // world unit covers zoom logical output units; zoom < 1 shows more
+  // world). Applies only to world-space surfaces (see
+  // Surface.outputAnchored); layer-shell, the cursor, and output-anchored
+  // surfaces use the plain origin unscaled. (0, 0, 1) = identity (the
+  // output shows the slice at its arrangement position, the pre-camera
+  // behavior).
   cameraX: number;
   cameraY: number;
+  cameraZoom: number;
   scale: number;
   deviceWidth: number;
   deviceHeight: number;
@@ -963,10 +966,13 @@ export class JsCompositor implements CompositorSink {
   // single entry {id:0, x:0, y:0} so nested/headless/single-KMS are unchanged.
   private outputsGeom = new Map<number, OutputGeom>();
   // Per-output content camera (docs/canvas-design.md §4). Keyed by outputId;
-  // absent = identity. Shifts where world-space surfaces land on the output
-  // (render + geometric cull + damage partitioning); output-anchored
-  // surfaces, non-content layers, and the cursor ignore it.
-  private cameras = new Map<number, { x: number; y: number }>();
+  // absent = identity (0, 0, zoom 1). (x, y) shifts and zoom scales where
+  // world-space surfaces land on the output (render + geometric cull +
+  // damage partitioning): world w maps to output-local logical
+  // (w - origin - camera) * zoom, so the view covers logical/zoom world
+  // units. Output-anchored surfaces, non-content layers, and the cursor
+  // ignore it.
+  private cameras = new Map<number, { x: number; y: number; zoom: number }>();
   // Surfaces that gained presentable content since the last takeImportedSurfaces.
   private imported: Array<{ id: number; width: number; height: number }> = [];
   private warnedDmabuf = false;
@@ -1340,7 +1346,7 @@ export class JsCompositor implements CompositorSink {
     for (const id of [...this.cameras.keys()]) {
       if (!this.outputsGeom.has(id)) {
         this.cameras.delete(id);
-        this.outputDamage.setCamera(id, 0, 0);
+        this.outputDamage.setCamera(id, 0, 0, 1);
       }
     }
     // Mirror output 0's device dims/scale into the primary fields so paths that
@@ -1392,6 +1398,7 @@ export class JsCompositor implements CompositorSink {
       id: o.id,
       originX: o.logicalX, originY: o.logicalY,
       cameraX: cam ? cam.x : 0, cameraY: cam ? cam.y : 0,
+      cameraZoom: cam ? cam.zoom : 1,
       scale,
       deviceWidth: o.deviceWidth, deviceHeight: o.deviceHeight,
       logicalWidth: Math.max(1, Math.round(o.deviceWidth / scale)),
@@ -1399,18 +1406,21 @@ export class JsCompositor implements CompositorSink {
     };
   }
 
-  // Set (or clear, with (0, 0)) the content camera for one output. A camera
-  // change moves every world-space surface on that output at once, so the
-  // whole output repaints. Unknown outputIds are stored anyway -- the camera
-  // applies when the output appears (setOutputs prunes stale entries).
-  setOutputCamera(outputId: number, x: number, y: number): void {
+  // Set (or clear, with (0, 0, 1)) the content camera for one output. A
+  // camera change moves every world-space surface on that output at once,
+  // so the whole output repaints. Unknown outputIds are stored anyway --
+  // the camera applies when the output appears (setOutputs prunes stale
+  // entries). Non-finite or non-positive zoom is coerced to 1.
+  setOutputCamera(outputId: number, x: number, y: number, zoom = 1): void {
+    const z = Number.isFinite(zoom) && zoom > 0 ? zoom : 1;
     const cur = this.cameras.get(outputId);
     const cx = cur ? cur.x : 0;
     const cy = cur ? cur.y : 0;
-    if (cx === x && cy === y) return;
-    if (x === 0 && y === 0) this.cameras.delete(outputId);
-    else this.cameras.set(outputId, { x, y });
-    this.outputDamage.setCamera(outputId, x, y);
+    const cz = cur ? cur.zoom : 1;
+    if (cx === x && cy === y && cz === z) return;
+    if (x === 0 && y === 0 && z === 1) this.cameras.delete(outputId);
+    else this.cameras.set(outputId, { x, y, zoom: z });
+    this.outputDamage.setCamera(outputId, x, y, z);
     this.outputDamage.fullOutput(outputId);
   }
 
@@ -2585,10 +2595,11 @@ export class JsCompositor implements CompositorSink {
     for (const o of this.outputsGeom.values()) {
       const scale = o.scale > 0 ? o.scale : 1;
       const cam = exempt ? undefined : this.cameras.get(o.id);
+      const camZ = cam ? cam.zoom : 1;
       const ox0 = o.logicalX + (cam ? cam.x : 0);
       const oy0 = o.logicalY + (cam ? cam.y : 0);
-      const ox1 = ox0 + o.deviceWidth / scale;
-      const oy1 = oy0 + o.deviceHeight / scale;
+      const ox1 = ox0 + o.deviceWidth / (scale * camZ);
+      const oy1 = oy0 + o.deviceHeight / (scale * camZ);
       if (sx0 < ox1 && sx1 > ox0 && sy0 < oy1 && sy1 > oy0) out.push(o.id);
     }
     // Mapped but placed off-screen / outside every output's region: fall back
@@ -2596,6 +2607,53 @@ export class JsCompositor implements CompositorSink {
     // rare; correctness > optimal pacing for the degenerate case.
     if (out.length === 0) return [...this.outputsGeom.keys()];
     return out;
+  }
+
+  // Which outputs SHOW the surface: geometric overlap (as surfaceOutputs)
+  // additionally gated by draw-stack membership per output. Visibility is
+  // explicit state (canvas-design.md: hidden means hidden regardless of
+  // camera position): a surface absent from an output's content stack is
+  // shown nowhere on it even if its world rect falls inside the camera
+  // view. Glass-anchored chrome (layer shell, cursor) is in every output's
+  // draw order, so it stays purely geometric. No all-outputs fallbacks:
+  // this drives wl_surface.enter/leave + preferred scale, where "shown
+  // nowhere" is a truthful answer; frame pacing keeps surfaceOutputs so
+  // hidden clients still receive wl_callback.done.
+  surfaceVisibleOutputs(surfaceId: number): number[] {
+    const s = this.surfaces.get(surfaceId);
+    if (!s) return [];
+    const chrome = this.layerIdSet.has(surfaceId)
+      || surfaceId === this.cursorTargetSurfaceId;
+    const w = s.layoutW > 0 ? s.layoutW : s.width;
+    const h = s.layoutH > 0 ? s.layoutH : s.height;
+    if (w <= 0 || h <= 0) return [];
+    const sx0 = s.x;
+    const sy0 = s.y;
+    const sx1 = sx0 + w;
+    const sy1 = sy0 + h;
+    const exempt = this.cameraExempt(surfaceId, s);
+    const out: number[] = [];
+    for (const o of this.outputsGeom.values()) {
+      if (!chrome && !this.stackMemberOn(o.id, surfaceId)) continue;
+      const scale = o.scale > 0 ? o.scale : 1;
+      const cam = exempt ? undefined : this.cameras.get(o.id);
+      const camZ = cam ? cam.zoom : 1;
+      const ox0 = o.logicalX + (cam ? cam.x : 0);
+      const oy0 = o.logicalY + (cam ? cam.y : 0);
+      const ox1 = ox0 + o.deviceWidth / (scale * camZ);
+      const oy1 = oy0 + o.deviceHeight / (scale * camZ);
+      if (sx0 < ox1 && sx1 > ox0 && sy0 < oy1 && sy1 > oy0) out.push(o.id);
+    }
+    return out;
+  }
+
+  // True when `id` is in the content draw order for `outputId` (the
+  // per-output override, or the global stack while no output has one).
+  private stackMemberOn(outputId: number, id: number): boolean {
+    const useGlobal = this.outputStacks.size === 0;
+    const content = this.outputStacks.get(outputId)
+      ?? (useGlobal ? this.stack : EMPTY_STACK);
+    return content.includes(id);
   }
 
   // dmabuf buffers freed since the last call (their last sampling frame completed
@@ -2884,10 +2942,12 @@ export class JsCompositor implements CompositorSink {
     const bh = swapAxes ? s.width : s.height;
     const intrinsicW = s.viewportDst?.width ?? s.viewportSrc?.width ?? bw / bs;
     const intrinsicH = s.viewportDst?.height ?? s.viewportSrc?.height ?? bh / bs;
-    // World-space surfaces subtract the camera-shifted view origin; glass-
-    // anchored surfaces (layer-shell, cursor, outputAnchored) subtract the
-    // plain arrangement origin. Identity cameras make the two identical.
+    // World-space surfaces subtract the camera-shifted view origin and
+    // scale by the camera zoom; glass-anchored surfaces (layer-shell,
+    // cursor, outputAnchored) subtract the plain arrangement origin
+    // unscaled. Identity cameras make the two identical.
     const cam = output && !this.cameraExempt(surfaceId, s);
+    const camZ = cam ? output.cameraZoom : 1;
     const ox = output ? output.originX + (cam ? output.cameraX : 0) : 0;
     const oy = output ? output.originY + (cam ? output.cameraY : 0) : 0;
     // xdg_surface.set_window_geometry: when set (CSD clients like GTK
@@ -2902,18 +2962,21 @@ export class JsCompositor implements CompositorSink {
     // geometry entirely (the override IS the placement).
     const overrideP = overrides?.placement;
     const geom = s.geometry ?? null;
-    const px = (overrideP?.x ?? s.x) - ox;
-    const py = (overrideP?.y ?? s.y) - oy;
+    const px = ((overrideP?.x ?? s.x) - ox) * camZ;
+    const py = ((overrideP?.y ?? s.y) - oy) * camZ;
     // When the WM has assigned a layout rect (any decorated window),
     // use it: it's the rect we configured the client to render into
     // AND the rect we hit-test against, so visual extent and input
     // extent stay aligned. When no layout (subsurface, popup) and
     // window-geometry is set (CSD client), fall back to the geometry
     // size. Otherwise the surface's intrinsic logical size.
-    const pw = overrideP?.w
-      ?? (s.layoutW || (geom ? geom.width : intrinsicW));
-    const ph = overrideP?.h
-      ?? (s.layoutH || (geom ? geom.height : intrinsicH));
+    // Camera zoom scales the drawn extent along with the position (fx
+    // translate/margins stay glass-space: they are output-anchored effects
+    // and zoom is a transient optical state).
+    const pw = (overrideP?.w
+      ?? (s.layoutW || (geom ? geom.width : intrinsicW))) * camZ;
+    const ph = (overrideP?.h
+      ?? (s.layoutH || (geom ? geom.height : intrinsicH))) * camZ;
     const fx = s.fx;
     const data = new Float32Array(UNIFORM_FLOATS);
     // placement
@@ -3210,12 +3273,14 @@ export class JsCompositor implements CompositorSink {
           const sx1 = sx0 + sw, sy1 = sy0 + sh;
           const oscale = out.scale > 0 ? out.scale : 1;
           // World-space surfaces are visible where the CAMERA view rect is,
-          // not the arrangement rect (matches updateUniforms' origin).
+          // not the arrangement rect (matches updateUniforms' mapping); a
+          // zoomed-out view covers logical/zoom world units.
           const cam = !this.cameraExempt(id, s);
+          const camZ = cam ? out.cameraZoom : 1;
           const ox0 = out.originX + (cam ? out.cameraX : 0);
           const oy0 = out.originY + (cam ? out.cameraY : 0);
-          const ox1 = ox0 + out.deviceWidth / oscale;
-          const oy1 = oy0 + out.deviceHeight / oscale;
+          const ox1 = ox0 + out.deviceWidth / (oscale * camZ);
+          const oy1 = oy0 + out.deviceHeight / (oscale * camZ);
           if (sx1 <= ox0 || sx0 >= ox1 || sy1 <= oy0 || sy0 >= oy1) continue;
         }
       }
@@ -3626,7 +3691,7 @@ export class JsCompositor implements CompositorSink {
     const texture = this.allocComposeTexture(devW, devH);
     const synth: OutputCtx = {
       id: -1,
-      originX: args.region.x, originY: args.region.y, cameraX: 0, cameraY: 0, scale,
+      originX: args.region.x, originY: args.region.y, cameraX: 0, cameraY: 0, cameraZoom: 1, scale,
       deviceWidth: devW, deviceHeight: devH,
       logicalWidth: args.region.w, logicalHeight: args.region.h,
     };
@@ -4136,7 +4201,7 @@ export class JsCompositor implements CompositorSink {
     if (r) {
       const synth: OutputCtx = {
         id: -1,
-        originX: r.x, originY: r.y, cameraX: 0, cameraY: 0, scale: args.outW / r.w,
+        originX: r.x, originY: r.y, cameraX: 0, cameraY: 0, cameraZoom: 1, scale: args.outW / r.w,
         deviceWidth: args.outW, deviceHeight: args.outH,
         logicalWidth: r.w, logicalHeight: r.h,
       };
@@ -4418,7 +4483,7 @@ export class JsCompositor implements CompositorSink {
     const texture = this.allocComposeTexture(devW, devH);
     const ctx: OutputCtx = {
       id: -1,
-      originX: region.x, originY: region.y, cameraX: 0, cameraY: 0, scale,
+      originX: region.x, originY: region.y, cameraX: 0, cameraY: 0, cameraZoom: 1, scale,
       deviceWidth: devW, deviceHeight: devH,
       logicalWidth: region.w, logicalHeight: region.h,
     };

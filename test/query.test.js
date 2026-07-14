@@ -63,7 +63,7 @@ test('queryState: empty compositor', () => {
   const snap = queryState(state);
   assert.equal(snap.outputs.length, 1);
   assert.deepEqual(snap.outputs[0],
-    { id: 0, x: 0, y: 0, width: 1920, height: 1080, scale: 1, cameraX: 0, cameraY: 0 });
+    { id: 0, x: 0, y: 0, width: 1920, height: 1080, scale: 1, cameraX: 0, cameraY: 0, cameraZoom: 1 });
   assert.deepEqual(snap.windows, []);
   assert.deepEqual(snap.stack, []);
   assert.equal(snap.pointerFocus, null);

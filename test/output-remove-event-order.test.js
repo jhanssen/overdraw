@@ -83,6 +83,9 @@ function makeFixture() {
     if (surfaceId !== 42) return [];
     return [...state.outputs.keys()].filter((id) => id === 1);
   };
+  // The residency differ prefers the stack-gated variant; this harness
+  // models no stacks, so visibility == geometry.
+  compositor.surfaceVisibleOutputs = compositor.surfaceOutputs;
 
   const events = {
     wl_surface: {
@@ -243,6 +246,7 @@ test('OutputRemoved: no leave when surface does not overlap the dying output', (
   const rec = [...state.surfaces.values()][0];
   rec.enteredOutputs = new Set([0]);
   state.compositor.surfaceOutputs = (sid) => sid === 42 ? [0] : [];
+  state.compositor.surfaceVisibleOutputs = state.compositor.surfaceOutputs;
 
   const onRemoved = makeOnOutputRemoved(deps);
   onRemoved({ outputId: 1 });

@@ -939,20 +939,27 @@ validated + resolved + consumed by the runtime + hotkey plugin.
 - **Canvas (shared world, monitors as cameras).** Design in
   `canvas-design.md`. Core mechanisms LANDED with identity defaults
   (zero behavior change until a plugin drives them): per-output content
-  camera (`setOutputCamera` sink method + `sdk.windows.setOutputCamera`;
-  applied consistently at render, hit-test, damage partitioning,
+  camera with pan + zoom (`setOutputCamera(outputId, x, y, zoom?)` +
+  `sdk.windows.setOutputCamera`; applied consistently at render,
+  hit-test (`SeatViewTransform`), damage partitioning,
   residency/enter-leave, popup constraints, pointer-constraint regions;
-  GPU test `output-camera.gpu.mjs`), per-island layout invocation
-  (`LayoutIsland` in the layout-driver; the WM derives one implicit
-  island per output; `LayoutInputs.island`), explicit islands
-  (`sdk.windows.setIslands` -> `wm.setIslands`), and
-  `@overdraw/plugin-canvas` in workspace-parity mode (shares the
-  workspace registry; publishes shown workspaces as explicit islands;
-  opt-in via a `canvas: {}` config slice, `selectBundledPlugins`).
+  GPU tests `output-camera.gpu.mjs`), per-island layout invocation
+  (`LayoutIsland` with `contextOutputId` = derived view context, not
+  ownership; the WM derives one implicit island per output;
+  `LayoutInputs.island`), explicit islands (`sdk.windows.setIslands` ->
+  `wm.setIslands`), and `@overdraw/plugin-canvas` in workspace-parity
+  mode (shares the workspace registry; publishes shown workspaces as
+  explicit islands; opt-in via a `canvas: {}` config slice,
+  `selectBundledPlugins`). ONE landed behavior change: residency is
+  stack-gated (`surfaceVisibleOutputs`; "hidden means hidden") -- windows
+  on hidden workspaces now get `wl_surface.leave` and reside nowhere;
+  frame pacing stays geometric so hidden clients keep receiving
+  `wl_callback.done` (GPU test `residency-visibility.gpu.mjs`).
   NOT built: world positions + camera policy (roaming, docking,
-  bookmarks, gutters/shove, hotplug camera persistence), ext-workspace
-  per-group duplicate projection, camera-following compose/live scenes,
-  camera animation as an in-core evaluator target.
+  bookmarks, gutters/shove, hotplug camera persistence), the X11
+  glass-space fiction, ext-workspace per-group duplicate projection,
+  camera-following compose/live scenes, camera animation as an in-core
+  evaluator target.
 - **Logging.** TS surface migrated (spdlog 1.17.0; fixed area set;
   severity-based stdout/stderr split; `--log-file=PATH`; per-area
   `--log-level=SPEC`; `installConsoleShim` routes `console.*`

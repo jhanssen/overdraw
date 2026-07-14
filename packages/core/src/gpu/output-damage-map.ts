@@ -33,11 +33,12 @@ interface Entry {
 
 export class OutputDamageMap {
   private entries = new Map<number, Entry>();
-  // Per-output content-camera offset, mirrored from the compositor. World-
-  // space damage rects partition against each output's camera view rect
-  // (bounds shifted by this); output-anchored rects use the plain bounds.
+  // Per-output content camera, mirrored from the compositor. World-space
+  // damage rects partition against each output's camera view rect (bounds
+  // shifted by x/y, covering logical/zoom world units) and land in the
+  // ring scaled by zoom; output-anchored rects use the plain bounds.
   // Absent = identity.
-  private cameras = new Map<number, { x: number; y: number }>();
+  private cameras = new Map<number, { x: number; y: number; zoom: number }>();
   // Per-output dirty bit. Set by every damageRect/full call for an output
   // the dirty signal touches; cleared by clearDirty(outputId) on successful
   // present. Independent of the per-slot damage rings: the rings answer
@@ -107,28 +108,30 @@ export class OutputDamageMap {
     for (const e of this.entries.values()) {
       const b = e.bounds;
       const cam = anchored ? undefined : this.cameras.get(b.outputId);
+      const z = cam ? cam.zoom : 1;
       const bx = b.logicalX + (cam ? cam.x : 0);
       const by = b.logicalY + (cam ? cam.y : 0);
       const lx0 = Math.max(gx,  bx);
       const ly0 = Math.max(gy,  by);
-      const lx1 = Math.min(gx1, bx + b.logicalWidth);
-      const ly1 = Math.min(gy1, by + b.logicalHeight);
+      const lx1 = Math.min(gx1, bx + b.logicalWidth / z);
+      const ly1 = Math.min(gy1, by + b.logicalHeight / z);
       if (lx1 <= lx0 || ly1 <= ly0) continue;
       // Translate to this output's local space (origin = the view rect's
-      // top-left). OutputDamageRing.damageRect itself clips to setBounds,
-      // so a slight overflow is fine; we just hand it the already-clipped
-      // local rect.
-      e.ring.damageRect(lx0 - bx, ly0 - by, lx1 - lx0, ly1 - ly0);
+      // top-left; a world unit covers zoom local units). OutputDamageRing
+      // .damageRect itself clips to setBounds, so a slight overflow is
+      // fine; we just hand it the already-clipped local rect.
+      e.ring.damageRect((lx0 - bx) * z, (ly0 - by) * z,
+                        (lx1 - lx0) * z, (ly1 - ly0) * z);
       this.dirty.add(b.outputId);
     }
   }
 
-  // Mirror one output's content camera (identity = (0, 0)). A camera change
-  // repositions every world rect relative to the output; callers follow up
-  // with fullOutput so the whole view repaints.
-  setCamera(outputId: number, x: number, y: number): void {
-    if (x === 0 && y === 0) this.cameras.delete(outputId);
-    else this.cameras.set(outputId, { x, y });
+  // Mirror one output's content camera (identity = (0, 0, 1)). A camera
+  // change repositions every world rect relative to the output; callers
+  // follow up with fullOutput so the whole view repaints.
+  setCamera(outputId: number, x: number, y: number, zoom = 1): void {
+    if (x === 0 && y === 0 && zoom === 1) this.cameras.delete(outputId);
+    else this.cameras.set(outputId, { x, y, zoom });
   }
 
   // Clear damage state on a single output (its ring's next take() returns

@@ -50,11 +50,11 @@ async function waitForMappedLayerSurface(c, timeoutMs = 2000) {
 
 // Apply a camera the way the windows broker does: compositor (render/damage/
 // residency) + the state mirror the seat's pointer transform reads.
-function setCamera(c, outputId, x, y) {
+function setCamera(c, outputId, x, y, zoom = 1) {
   c.state.outputCameras ??= new Map();
-  if (x === 0 && y === 0) c.state.outputCameras.delete(outputId);
-  else c.state.outputCameras.set(outputId, { x, y });
-  c.state.compositor.setOutputCamera(outputId, x, y);
+  if (x === 0 && y === 0 && zoom === 1) c.state.outputCameras.delete(outputId);
+  else c.state.outputCameras.set(outputId, { x, y, zoom });
+  c.state.compositor.setOutputCamera(outputId, x, y, zoom);
   c.state.seat?.repickPointer();
 }
 
@@ -138,8 +138,8 @@ test("camera transforms pointer hit-testing; layer hits stay glass-space",
       { what: "panned pointer focus on toplevel" });
     // Local coords must account for the camera: glass 150 = world 50 on a
     // window whose world rect starts at 0.
-    assert.equal(c.state.seat.focus.camX, -100,
-      "hit records the camera offset it was made with");
+    assert.equal(c.state.seat.focus.view.camX, -100,
+      "hit records the view transform it was made with");
     pointerMotion(c.addon, 50, 128);
     await c.waitFor(c.query, (s) => s.pointerFocus === null,
       { what: "void under camera clears pointer focus" });
@@ -150,6 +150,63 @@ test("camera transforms pointer hit-testing; layer hits stay glass-space",
       { what: "panel hit stays glass-space" });
 
     setCamera(c, 0, 0, 0);
+  } finally {
+    await c.teardown();
+  }
+});
+
+test("camera zoom scales world content + hit-testing; panel unscaled", { skip }, async () => {
+  const c = await setupCompositor({ headless: OUT });
+  try {
+    const blue = 0xff2040c0;
+    const blueBgra = argbToBgra(blue);
+    const greenBgra = [0, 255, 0, 255];
+
+    c.spawnClient(
+      ["--layer", "top", "--anchor", String(A_TOP | A_LEFT | A_RIGHT),
+       "--size", "0x30", "--zone", "0", "--kbd", "none", "--color", "00FF00"],
+      { bin: LS_BIN, readyMarker: "[client] mapped" });
+    await waitForMappedLayerSurface(c);
+
+    const t = c.spawnClient(["--fill-configured", "--color", blue.toString(16)]);
+    await t.ready;
+    const snap = await c.waitFor(c.query, (s) => s.windows.length === 1, { what: "toplevel" });
+    const toplevelId = snap.windows[0].surfaceId;
+
+    // Full-frame baseline (row 128 is below the 30px panel).
+    let px = await readUntil(c,
+      (p) => pixelMatches(pixelAt(p, OUT.width, 200, 128), blueBgra, 4));
+    assert.ok(pixelMatches(pixelAt(px, OUT.width, 200, 128), blueBgra, 4));
+
+    // Zoom 0.5 about the view origin: the 256-wide window covers glass
+    // 0..128; glass 200 looks past its scaled extent into the void.
+    setCamera(c, 0, 0, 0, 0.5);
+    px = await readUntil(c,
+      (p) => pixelMatches(pixelAt(p, OUT.width, 200, 128), BLACK, 4));
+    assert.ok(pixelMatches(pixelAt(px, OUT.width, 60, 60), blueBgra, 4),
+      `zoomed content at glass (60,60); got ${pixelAt(px, OUT.width, 60, 60)}`);
+    assert.ok(pixelMatches(pixelAt(px, OUT.width, 200, 128), BLACK, 4),
+      `void past the scaled window; got ${pixelAt(px, OUT.width, 200, 128)}`);
+    // The panel does not zoom.
+    assert.ok(pixelMatches(pixelAt(px, OUT.width, 128, 15), greenBgra, 4),
+      `panel unscaled under zoom; got ${pixelAt(px, OUT.width, 128, 15)}`);
+
+    // Hit-testing maps glass through the zoom: glass (100, 100) is world
+    // (200, 200) -> inside the window; glass (200, 128) is world (400, 256)
+    // -> void.
+    pointerMotion(c.addon, 100, 100);
+    await c.waitFor(c.query, (s) => s.pointerFocus === toplevelId,
+      { what: "zoomed pointer focus on toplevel" });
+    pointerMotion(c.addon, 200, 128);
+    await c.waitFor(c.query, (s) => s.pointerFocus === null,
+      { what: "void under zoom clears pointer focus" });
+
+    // Identity restore.
+    setCamera(c, 0, 0, 0, 1);
+    px = await readUntil(c,
+      (p) => pixelMatches(pixelAt(p, OUT.width, 200, 128), blueBgra, 4));
+    assert.ok(pixelMatches(pixelAt(px, OUT.width, 200, 128), blueBgra, 4),
+      `identity restored; got ${pixelAt(px, OUT.width, 200, 128)}`);
   } finally {
     await c.teardown();
   }

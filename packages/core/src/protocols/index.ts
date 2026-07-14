@@ -22,7 +22,7 @@ import { applySubsurfaces } from "../subsurfaces.js";
 import { unmapAndTeardownSurface } from "./wl_surface.js";
 import { rebuildStackWithPopups, maybeDismissGrabbedPopup, flushDeferredOutputStacks } from "./xdg_popup.js";
 import { configureToplevel } from "./xdg_surface.js";
-import { updateSurfaceOutputResidency } from "./surface-residency.js";
+import { updateSurfaceOutputResidency, updateAllSurfaceResidency } from "./surface-residency.js";
 import { shouldDeliverFrameCallbackIdle } from "./frame-callbacks.js";
 import { installCrossOutputMove } from "./cross-output-move.js";
 import { makeOutputForOutput } from "./wl_output.js";
@@ -243,6 +243,45 @@ export async function installProtocols(
       innerSetSurfaceLayout(id, x, y, w, h);
       const rec = state.surfacesById?.get(id);
       if (rec) updateSurfaceOutputResidency(state, addon, rec);
+    };
+  }
+  // Same single-method patch on the stack setters: residency is gated on
+  // draw-stack membership (surfaceVisibleOutputs), so a stack change (a
+  // window joining/leaving what an output shows) moves enter/leave state
+  // with no geometry change. rebuildStackWithPopups re-pushes on every
+  // content commit, so each patch keeps the last-pushed ids and sweeps
+  // only on an actual change.
+  const stacksChanged = (
+    a: ReadonlyArray<number> | null | undefined,
+    b: ReadonlyArray<number> | null,
+  ): boolean => {
+    if (!a || !b) return a !== b || a === undefined;
+    if (a.length !== b.length) return true;
+    for (let i = 0; i < a.length; i++) if (a[i] !== b[i]) return true;
+    return false;
+  };
+  const innerSetStack = rawCompositor.setStack?.bind(rawCompositor);
+  if (innerSetStack && rawCompositor.surfaceVisibleOutputs) {
+    let lastGlobal: number[] | undefined;
+    rawCompositor.setStack = (ids): void => {
+      innerSetStack(ids);
+      if (lastGlobal !== undefined && !stacksChanged(lastGlobal, ids)) return;
+      const first = lastGlobal === undefined;
+      lastGlobal = ids.slice();
+      // The very first push is boot bring-up; per-surface layout residency
+      // covers it and a sweep before outputs settle is noise.
+      if (!first) updateAllSurfaceResidency(state, addon);
+    };
+  }
+  const innerSetOutputStack = rawCompositor.setOutputStack?.bind(rawCompositor);
+  if (innerSetOutputStack && rawCompositor.surfaceVisibleOutputs) {
+    const lastByOutput = new Map<number, number[] | null>();
+    rawCompositor.setOutputStack = (outputId, ids): void => {
+      innerSetOutputStack(outputId, ids);
+      const prev = lastByOutput.get(outputId);
+      if (lastByOutput.has(outputId) && !stacksChanged(prev, ids)) return;
+      lastByOutput.set(outputId, ids === null ? null : ids.slice());
+      updateAllSurfaceResidency(state, addon);
     };
   }
   if (opts.bus) state.bus = opts.bus;

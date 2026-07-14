@@ -84,16 +84,19 @@ export function configurePopup(ctx: Ctx, pr: PopupRecord): void {
   const outEntry = ctx.state.outputs?.get(parentOutputId);
   // outputs[*].logicalPosition + logicalSize are the GLOBAL rect of
   // that output. A toplevel-rooted popup solves against the output's
-  // camera VIEW rect (the region of the world the output shows -- the
-  // parent's coordinates are world coordinates); a layer-rooted popup is
+  // camera VIEW rect (the region of the world the output shows: origin +
+  // camera offset, spanning logical/zoom world units -- the parent's
+  // coordinates are world coordinates); a layer-rooted popup is
   // glass-anchored and uses the plain rect. Fall back to a safe
   // single-output area at origin when outputs is absent (test stubs).
   const cam = (!popupChainLayerRooted(ctx.state, pr)
-    ? ctx.state.outputCameras?.get(parentOutputId) : undefined) ?? { x: 0, y: 0 };
+    ? ctx.state.outputCameras?.get(parentOutputId) : undefined)
+    ?? { x: 0, y: 0, zoom: 1 };
   const outRect = outEntry
     ? {
         x: outEntry.logicalPosition.x + cam.x, y: outEntry.logicalPosition.y + cam.y,
-        width: outEntry.logicalSize.width, height: outEntry.logicalSize.height,
+        width: outEntry.logicalSize.width / cam.zoom,
+        height: outEntry.logicalSize.height / cam.zoom,
       }
     : { x: 0, y: 0, width: 1920, height: 1080 };
   pr.rect = solvePopupPosition(

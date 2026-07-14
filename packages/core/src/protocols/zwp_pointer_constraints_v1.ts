@@ -29,6 +29,7 @@ import { ZwpPointerConstraintsV1_Error } from "#protocols-gen/zwp_pointer_constr
 import type { ZwpLockedPointerV1Handler } from "#protocols-gen/zwp_locked_pointer_v1.js";
 import type { ZwpConfinedPointerV1Handler } from "#protocols-gen/zwp_confined_pointer_v1.js";
 import type { Ctx } from "./ctx.js";
+import { seatViewToGlassX, seatViewToGlassY } from "./ctx.js";
 import type { Resource } from "../types.js";
 import type { Region } from "./region.js";
 
@@ -66,34 +67,45 @@ function surfaceIdOf(ctx: Ctx, surface: Resource): number | null {
 // The focused surface's rect in GLASS space (valid only while the
 // constraint's surface is focused, which is the activation precondition).
 // A content surface's stored rect is in world coordinates; the focus
-// carries the camera offset its hit was made with, so glass = world - cam.
+// carries the view transform its hit was made with, so glass positions
+// come from the inverse mapping and world extents scale by the zoom.
 // The pointer position and the addon's confine clamp are both glass-space,
 // so all the math below happens there.
-function focusRect(ctx: Ctx): { x: number; y: number; width: number; height: number } | null {
+function focusRect(ctx: Ctx): { x: number; y: number; width: number; height: number; zoom: number } | null {
   const f = ctx.state.seat?.focus;
   if (!f) return null;
   return {
-    x: f.rect.x - f.camX, y: f.rect.y - f.camY,
-    width: f.rect.width, height: f.rect.height,
+    x: seatViewToGlassX(f.view, f.rect.x),
+    y: seatViewToGlassY(f.view, f.rect.y),
+    width: f.rect.width * f.view.zoom,
+    height: f.rect.height * f.view.zoom,
+    zoom: f.view.zoom,
   };
 }
 
 // Is the cursor within the lock's region? True when there is no region.
+// The region is surface-local LOGICAL coords, so glass offsets divide by
+// the view zoom before the containment test.
 function pointerInRegion(ctx: Ctx, lock: LockRec): boolean {
   if (!lock.region) return true;
   const rect = focusRect(ctx);
   const p = ctx.state.seat?.pointerPosition();
   if (!rect || !p) return false;
-  return lock.region.contains(p.x - rect.x, p.y - rect.y);
+  return lock.region.contains(
+    (p.x - rect.x) / rect.zoom, (p.y - rect.y) / rect.zoom);
 }
 
-// Glass-space confine rects: the region translated to the surface origin, or
-// the whole surface when there is no region.
+// Glass-space confine rects: the region translated to the surface origin
+// (region coords are surface-local logical, scaled by the view zoom into
+// glass), or the whole surface when there is no region.
 function confineRects(ctx: Ctx, lock: LockRec): Array<{ x: number; y: number; w: number; h: number }> {
   const rect = focusRect(ctx);
   if (!rect) return [];
   if (!lock.region) return [{ x: rect.x, y: rect.y, w: rect.width, h: rect.height }];
-  return lock.region.snapshot().map((r) => ({ x: rect.x + r.x, y: rect.y + r.y, w: r.width, h: r.height }));
+  return lock.region.snapshot().map((r) => ({
+    x: rect.x + r.x * rect.zoom, y: rect.y + r.y * rect.zoom,
+    w: r.width * rect.zoom, h: r.height * rect.zoom,
+  }));
 }
 
 function activate(ctx: Ctx, lock: LockRec): void {

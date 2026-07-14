@@ -49,7 +49,10 @@ export function updateSurfaceOutputResidency(
   state: CompositorState, addon: Addon, rec: SurfaceRecord,
   overrideOutputs?: ReadonlyArray<number>,
 ): void {
-  const surfaceOutputs = state.compositor.surfaceOutputs;
+  // Prefer the stack-gated variant (hidden surfaces are shown nowhere);
+  // the geometric surfaceOutputs is the fallback for test sinks.
+  const surfaceOutputs = state.compositor.surfaceVisibleOutputs
+    ?? state.compositor.surfaceOutputs;
   if (!surfaceOutputs) return;
   if (!state.events) return;
   const current = overrideOutputs
@@ -80,7 +83,7 @@ export function updateSurfaceOutputResidency(
 // Recompute residency for every mapped surface. Called on output add/remove
 // /resize/arrangement-change so clients see the new overlap state.
 export function updateAllSurfaceResidency(state: CompositorState, addon: Addon): void {
-  if (!state.compositor.surfaceOutputs) return;
+  if (!state.compositor.surfaceVisibleOutputs && !state.compositor.surfaceOutputs) return;
   for (const rec of state.surfaces.values()) {
     if (!rec.mapped) continue;
     updateSurfaceOutputResidency(state, addon, rec);

@@ -356,15 +356,23 @@ export interface CompositorSink {
   // (if ever used) need not implement it.
   setLayerSurfaces?(layer: Layer, ids: number[]): void;
   // Per-output content camera (docs/canvas-design.md §4): the output renders
-  // the world starting at (arrangement origin + camera). (0, 0) = identity.
-  // Applies to world-space surfaces only; layer-shell, the cursor, and
-  // output-anchored surfaces stay glass-positioned. Optional (GPU-free test
-  // sinks omit it).
-  setOutputCamera?(outputId: number, x: number, y: number): void;
+  // the world starting at (arrangement origin + camera), scaled by zoom
+  // (zoom < 1 shows more world). (0, 0, 1) = identity. Applies to
+  // world-space surfaces only; layer-shell, the cursor, and
+  // output-anchored surfaces stay glass-positioned. Optional (GPU-free
+  // test sinks omit it).
+  setOutputCamera?(outputId: number, x: number, y: number, zoom?: number): void;
   // Mark a surface as glass-positioned (ignores the content camera) even
   // though it rides the content stack: popups parented to layer-shell
   // surfaces. Optional (GPU-free test sinks omit it).
   setSurfaceOutputAnchored?(id: number, anchored: boolean): void;
+  // Which outputs SHOW the surface: geometric overlap gated by draw-stack
+  // membership (hidden surfaces are shown nowhere regardless of camera
+  // position -- canvas-design.md). Drives wl_surface.enter/leave +
+  // preferred scale; frame pacing uses the ungated surfaceOutputs.
+  // Optional (GPU-free test sinks omit it; residency falls back to
+  // surfaceOutputs).
+  surfaceVisibleOutputs?(surfaceId: number): number[];
   // Install a pre-wrapped wire texture as surface `id`'s sampled texture (plugin
   // overlay consumer texture). Optional (JS compositor only).
   setSurfaceTexture?(id: number, tex: GPUTexture, w: number, h: number): void;
@@ -923,10 +931,11 @@ export interface CompositorState {
   // `fallbackOutput`).
   outputs?: Map<number, OutputRecord>;
   // Per-output content camera (docs/canvas-design.md §4), keyed by outputId.
-  // Absent entry = identity. Single writer: the camera SDK broker, which
-  // also mirrors each change into the compositor (setOutputCamera). Readers:
-  // the seat's pointer->world transform and output-membership derivation.
-  outputCameras?: Map<number, { x: number; y: number }>;
+  // Absent entry = identity (0, 0, zoom 1). Single writer: the camera SDK
+  // broker, which also mirrors each change into the compositor
+  // (setOutputCamera). Readers: the seat's pointer->world transform,
+  // popup constraint boxes, and output-membership derivation.
+  outputCameras?: Map<number, { x: number; y: number; zoom: number }>;
   // The virtual fallback output. Always present once installProtocols runs;
   // never scanned out; deliberately NOT a member of `outputs` so every
   // iteration over the live output map (render passes, wl_output globals,
@@ -1214,6 +1223,34 @@ export interface DmabufParams {
   used: boolean;
 }
 
+// A glass->world view transform (one output's content camera at hit time):
+// worldX = originX + camX + (glassX - originX) / zoom (likewise y). The
+// inverse maps world to glass: glassX = originX + (worldX - originX - camX)
+// * zoom. Identity ({0,0,0,0,1}) makes world === glass.
+export interface SeatViewTransform {
+  originX: number;
+  originY: number;
+  camX: number;
+  camY: number;
+  zoom: number;
+}
+
+export const SEAT_VIEW_IDENTITY: Readonly<SeatViewTransform> =
+  Object.freeze({ originX: 0, originY: 0, camX: 0, camY: 0, zoom: 1 });
+
+export function seatViewToWorldX(v: SeatViewTransform, glassX: number): number {
+  return v.originX + v.camX + (glassX - v.originX) / v.zoom;
+}
+export function seatViewToWorldY(v: SeatViewTransform, glassY: number): number {
+  return v.originY + v.camY + (glassY - v.originY) / v.zoom;
+}
+export function seatViewToGlassX(v: SeatViewTransform, worldX: number): number {
+  return v.originX + (worldX - v.originX - v.camX) * v.zoom;
+}
+export function seatViewToGlassY(v: SeatViewTransform, worldY: number): number {
+  return v.originY + (worldY - v.originY - v.camY) * v.zoom;
+}
+
 export interface SeatFocus {
   // The surface that owns the pointer interaction: the exact surface the
   // pointer is over, which may be a subsurface descendant of a toplevel.
@@ -1227,13 +1264,13 @@ export interface SeatFocus {
   rootSurfaceId: number;
   clientId: number;
   rect: { x: number; y: number; width: number; height: number };
-  // The content-camera offset that was added to the pointer's glass position
-  // when this hit was made: `rect` for a world-space surface (toplevel tree)
-  // is in world coords, so surface-local math is (glassX + camX - rect.x).
-  // 0 for glass-anchored hits (layer shell, layer-rooted popups) and under
-  // identity cameras.
-  camX: number;
-  camY: number;
+  // The glass->world view transform the hit was made through: `rect` for a
+  // world-space surface (toplevel tree) is in world coords, so
+  // surface-local math maps the pointer's glass position through
+  // worldX = originX + camX + (glassX - originX) / zoom
+  // before subtracting rect.x. Identity ({0,0,0,0,1}) for glass-anchored
+  // hits (layer shell, layer-rooted popups) and under identity cameras.
+  view: SeatViewTransform;
 }
 
 export interface SeatState {
