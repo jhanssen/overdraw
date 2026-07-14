@@ -23,7 +23,7 @@ import { installProtocols } from "../packages/core/dist/protocols/index.js";
 import { createLayoutDriver } from "../packages/core/dist/wm/layout-driver.js";
 import { createFocusDriver } from "../packages/core/dist/protocols/focus-driver.js";
 import { PluginRuntime } from "../packages/core/dist/plugins/index.js";
-import { BUNDLED_PLUGINS, bundledToResolved } from "../packages/core/dist/plugins/bundled.js";
+import { selectBundledPlugins, bundledToResolved } from "../packages/core/dist/plugins/bundled.js";
 import { DynamicBus } from "../packages/core/dist/events/dynamic-bus.js";
 import { createCompositorBus } from "../packages/core/dist/events/window-bus.js";
 import { WINDOW_EVENT } from "../packages/core/dist/events/types.js";
@@ -688,7 +688,10 @@ export async function setupCompositor(opts = {}) {
     inThreadGpu: inThreadGpuDeps,
     liveOutputIds: () => state.outputs ? [...state.outputs.keys()] : [],
   });
-  const resolved = BUNDLED_PLUGINS.map((spec) => bundledToResolved(spec, spec.module, resolvedConfig));
+  // Config-driven bundled selection (a `canvas` slice in opts.config swaps
+  // the workspace provider for @overdraw/plugin-canvas, as in production).
+  const resolved = selectBundledPlugins(resolvedConfig)
+    .map((spec) => bundledToResolved(spec, spec.module, resolvedConfig));
   // Optional extra plugins (ResolvedPlugin shape) from the test. Loaded
   // alongside the bundled set so interception tests can drop in a fixture.
   const extra = opts.plugins ?? [];

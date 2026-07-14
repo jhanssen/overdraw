@@ -263,6 +263,14 @@ export interface Wm {
   // addWindow below); its output.removed handling migrates the orphaned
   // workspaces before/alongside this call.
   setOutputs(outputs: ReadonlyArray<WmOutput>): void;
+  // Replace the explicit island set the layout-driver iterates
+  // (docs/canvas-design.md §5). null reverts to the implicit one-island-
+  // per-output derivation from outputContent. Schedules a relayout when
+  // the set actually changed; returns whether it did. The workspace-
+  // namespace plugin is the single writer (via windows.set-islands).
+  setIslands(
+    islands: ReadonlyArray<import("./layout-driver.js").LayoutIsland> | null,
+  ): boolean;
   // The id of the primary output -- the lowest id in state.outputs, used as
   // the default home for newly-mapped windows. Throws if the WM has no
   // outputs (the construction invariant forbids this).
@@ -1547,6 +1555,34 @@ export function createWm(
   // carries every mapped window keyed by surfaceId; outputContent (from the
   // workspace plugin via the WmOptions callback) drives which subset is
   // laid out on each output and in what order.
+  // Explicit islands (docs/canvas-design.md §5), pushed by the workspace-
+  // namespace plugin via windows.set-islands. null = derive one implicit
+  // island per output from outputContent (the snapshot fallback below).
+  let explicitIslands: ReadonlyArray<import("./layout-driver.js").LayoutIsland> | null = null;
+
+  function islandsEqual(
+    a: ReadonlyArray<import("./layout-driver.js").LayoutIsland> | null,
+    b: ReadonlyArray<import("./layout-driver.js").LayoutIsland> | null,
+  ): boolean {
+    if (a === null || b === null) return a === b;
+    if (a.length !== b.length) return false;
+    for (let i = 0; i < a.length; i++) {
+      const x = a[i], y = b[i];
+      if (x.id !== y.id || x.outputId !== y.outputId) return false;
+      if ((x.rect === null) !== (y.rect === null)) return false;
+      if (x.rect && y.rect
+        && (x.rect.x !== y.rect.x || x.rect.y !== y.rect.y
+          || x.rect.width !== y.rect.width || x.rect.height !== y.rect.height)) {
+        return false;
+      }
+      if (x.members.length !== y.members.length) return false;
+      for (let j = 0; j < x.members.length; j++) {
+        if (x.members[j] !== y.members[j]) return false;
+      }
+    }
+    return true;
+  }
+
   function snapshot(): LayoutSnapshot {
     const windowMap = new Map<number, import("./layout-driver.js").LayoutSnapshotWindow>();
     for (const w of windows) {
@@ -1581,7 +1617,15 @@ export function createWm(
     // included so their rect is ready by the time their first commit
     // lands (windowHasContent just flips the gate; no relayout needed).
     const islands: Array<import("./layout-driver.js").LayoutIsland> = [];
-    if (outputContent) {
+    if (explicitIslands) {
+      for (const isl of explicitIslands) {
+        islands.push({
+          id: isl.id, outputId: isl.outputId,
+          rect: isl.rect ? { ...isl.rect } : null,
+          members: [...isl.members],
+        });
+      }
+    } else if (outputContent) {
       for (const [outputId, ids] of outputContent()) {
         islands.push({ id: outputId, outputId, rect: null, members: [...ids] });
       }
@@ -1633,6 +1677,18 @@ export function createWm(
       }
       wm.outputs = outputsMap(newOutputs);
       driver.schedule("output-resized");
+    },
+
+    setIslands(islands) {
+      const next = islands === null ? null : islands.map((i) => ({
+        id: i.id, outputId: i.outputId,
+        rect: i.rect ? { ...i.rect } : null,
+        members: [...i.members],
+      }));
+      if (islandsEqual(explicitIslands, next)) return false;
+      explicitIslands = next;
+      driver.schedule("reorder");
+      return true;
     },
 
     windowHasContent(surfaceId, contentSize) {

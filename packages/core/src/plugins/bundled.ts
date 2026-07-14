@@ -58,6 +58,31 @@ export interface BundledPluginSpec {
   configFrom?: (config: ResolvedConfig, runtime: BundledRuntimeContext) => unknown;
 }
 
+// The canvas workspace provider (docs/canvas-design.md). Selected in place
+// of workspace-default when the user config carries a `canvas` slice; same
+// namespace, same runtime context, plus the user's canvas config.
+const CANVAS_PLUGIN: BundledPluginSpec = {
+  name: "canvas",
+  module: "@overdraw/plugin-canvas",
+  configFrom: (config, runtime) => ({
+    fallbackOutputId: OUTPUT_FALLBACK,
+    fallbackOutputName: FALLBACK_OUTPUT_NAME,
+    bootOutputDurableKey: runtime.bootOutputDurableKey,
+    initialOutputs: runtime.initialOutputs,
+    canvas: config.canvas,
+  }),
+};
+
+// The bundled set for a given config: the static list, with the workspace
+// provider swapped for the canvas plugin when the config opts in.
+export function selectBundledPlugins(
+  config: Pick<ResolvedConfig, "canvas">,
+): ReadonlyArray<BundledPluginSpec> {
+  if (config.canvas === undefined) return BUNDLED_PLUGINS;
+  return BUNDLED_PLUGINS.map((spec) =>
+    spec.name === "workspace-default" ? CANVAS_PLUGIN : spec);
+}
+
 export const BUNDLED_PLUGINS: ReadonlyArray<BundledPluginSpec> = [
   {
     // Loads first so its actions (compositor.quit, ...) are available for

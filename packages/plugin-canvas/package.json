@@ -1,0 +1,18 @@
+{
+  "name": "@overdraw/plugin-canvas",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Canvas workspace provider (docs/canvas-design.md): registers in the 'workspace' namespace with the same verb/event/action surface as plugin-workspace-default (whose registry it shares), and additionally publishes each output's shown workspace as an explicit layout island. Selected in place of the default workspace plugin by a `canvas` config slice. Workspace-parity today; world positions, camera policy, and bookmarks build on this.",
+  "type": "module",
+  "main": "./dist/index.js",
+  "exports": {
+    ".": {
+      "default": "./dist/index.js"
+    }
+  },
+  "dependencies": {
+    "@overdraw/plugin-sdk-types": "*",
+    "@overdraw/plugin-workspace-default": "*",
+    "@overdraw/workspace-types": "*"
+  }
+}

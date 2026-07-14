@@ -185,6 +185,19 @@ export interface PluginWindows extends PluginWindowObserver {
   // plugin uses it to multiplex per-output workspace stacks.
   setOutputStack(outputId: number, ids: number[] | null): Promise<void>;
 
+  // Replace the explicit island set the layout-driver iterates
+  // (docs/canvas-design.md §5): each entry is a tiling region ({id,
+  // outputId, rect | null, members}); rect null derives the region from
+  // the output minus reserved zones. null reverts to the implicit
+  // one-island-per-output derivation. The workspace-namespace plugin is
+  // the intended single writer.
+  setIslands(islands: ReadonlyArray<{
+    id: number;
+    outputId: number;
+    rect: { x: number; y: number; width: number; height: number } | null;
+    members: ReadonlyArray<number>;
+  }> | null): Promise<void>;
+
   // Set the output's content camera (docs/canvas-design.md §4): the output
   // renders world-space content starting at (arrangement origin + (x, y)).
   // (0, 0) restores identity (the default). Purely optical -- no relayout;
@@ -385,6 +398,27 @@ export function createPluginWindows(
         }
       }
       await endpoint.request("windows.set-output-stack", { outputId, ids });
+    },
+
+    async setIslands(islands): Promise<void> {
+      if (islands !== null) {
+        if (!Array.isArray(islands)) {
+          throw new TypeError("setIslands islands must be an array or null");
+        }
+        for (const isl of islands) {
+          if (!isl || typeof isl !== "object") {
+            throw new TypeError("setIslands entries must be objects");
+          }
+          if (typeof isl.id !== "number" || typeof isl.outputId !== "number") {
+            throw new TypeError("setIslands entries need numeric id/outputId");
+          }
+          if (!Array.isArray(isl.members)
+            || !isl.members.every((m: unknown): m is number => typeof m === "number")) {
+            throw new TypeError("setIslands members must be number[]");
+          }
+        }
+      }
+      await endpoint.request("windows.set-islands", { islands });
     },
 
     async setOutputCamera(outputId, x, y): Promise<void> {

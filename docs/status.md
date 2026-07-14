@@ -942,12 +942,17 @@ validated + resolved + consumed by the runtime + hotkey plugin.
   camera (`setOutputCamera` sink method + `sdk.windows.setOutputCamera`;
   applied consistently at render, hit-test, damage partitioning,
   residency/enter-leave, popup constraints, pointer-constraint regions;
-  GPU test `output-camera.gpu.mjs`), and per-island layout invocation
+  GPU test `output-camera.gpu.mjs`), per-island layout invocation
   (`LayoutIsland` in the layout-driver; the WM derives one implicit
-  island per output; `LayoutInputs.island`). NOT built: the canvas
-  plugin itself (explicit islands, camera policy, bookmarks,
-  ext-workspace per-group projection), camera-following compose/live
-  scenes, camera animation as an in-core evaluator target.
+  island per output; `LayoutInputs.island`), explicit islands
+  (`sdk.windows.setIslands` -> `wm.setIslands`), and
+  `@overdraw/plugin-canvas` in workspace-parity mode (shares the
+  workspace registry; publishes shown workspaces as explicit islands;
+  opt-in via a `canvas: {}` config slice, `selectBundledPlugins`).
+  NOT built: world positions + camera policy (roaming, docking,
+  bookmarks, gutters/shove, hotplug camera persistence), ext-workspace
+  per-group duplicate projection, camera-following compose/live scenes,
+  camera animation as an in-core evaluator target.
 - **Logging.** TS surface migrated (spdlog 1.17.0; fixed area set;
   severity-based stdout/stderr split; `--log-file=PATH`; per-area
   `--log-level=SPEC`; `installConsoleShim` routes `console.*`

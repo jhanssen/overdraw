@@ -8,6 +8,9 @@
   "exports": {
     ".": {
       "default": "./dist/index.js"
+    },
+    "./registry": {
+      "default": "./dist/registry.js"
     }
   },
   "dependencies": {

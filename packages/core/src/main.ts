@@ -46,7 +46,7 @@ import {
   createTransitionsBroker, NOT_HANDLED as TRANSITIONS_NOT_HANDLED,
 } from "./plugins/transitions-broker.js";
 import { createSceneRegistry } from "./plugins/scene-registry.js";
-import { BUNDLED_PLUGINS, bundledToResolved } from "./plugins/bundled.js";
+import { selectBundledPlugins, bundledToResolved } from "./plugins/bundled.js";
 import { JsCompositor } from "./gpu/compositor.js";
 import type { DawnWire, DawnGlobals } from "./gpu/compositor.js";
 import type { Addon, InputEvent } from "./types.js";
@@ -794,7 +794,7 @@ const bundledRuntime = { bootOutputDurableKey, initialOutputs };
 // (default priority 100). A `module` that looks like a path (absolute or
 // ./ ../) resolves to a file:// URL; bare specifiers pass through to
 // Node's resolver.
-const bundledResolved = BUNDLED_PLUGINS.map((spec) => {
+const bundledResolved = selectBundledPlugins(config).map((spec) => {
   const isPath = isAbsolute(spec.module)
     || spec.module.startsWith("./") || spec.module.startsWith("../");
   const module = isPath

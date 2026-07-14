@@ -415,13 +415,20 @@ tests only.
    layout plugins work unchanged. Unit tests:
    `layout-driver-islands.test.js`. No explicit-island producer exists
    yet -- that arrives with the canvas plugin (step 3).
-3. **`plugin-canvas` in workspace-parity mode.** New plugin claiming the
-   `'workspace'` namespace: N fixed islands 1:1 with today's workspaces,
-   cameras permanently docked, `show` = dock camera, the §10 façade, the
-   same `workspace.*` bus events. Behaviorally indistinguishable from
-   `plugin-workspace-default` (including waybar) — validated by running
-   the existing workspace test suite against it. Opt-in via config while
-   both plugins exist.
+3. **`plugin-canvas` in workspace-parity mode.** LANDED.
+   `@overdraw/plugin-canvas` claims the `'workspace'` namespace with the
+   identical verb/event/action surface (it shares
+   plugin-workspace-default's registry via the `./registry` subpath
+   export; index wiring is a fork), and publishes each output's shown
+   workspace as an explicit island (id = the workspace's durable handle,
+   rect = null, members = the pushed stack) through the new
+   `sdk.windows.setIslands` -> `wm.setIslands` seam. Cameras stay
+   identity (nothing to dock while every island's region equals its
+   output). Opt-in: a `canvas: {}` slice in config.mjs swaps it in for
+   workspace-default (`selectBundledPlugins`). Validated by the
+   workspace GPU flow re-run against it
+   (`test/plugin-canvas/canvas-parity.gpu.mjs`) + an integration suite
+   asserting verb/event parity and island publication.
 4. **Canvas features** (all policy, all incremental from parity): free
    roaming + fly-to bookmarks; elastic islands; placement rules targeting
    islands; gutters + shove; hotplug persistence/rescue; overview

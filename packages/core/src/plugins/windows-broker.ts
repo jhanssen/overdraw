@@ -83,6 +83,7 @@ export function createWindowsBroker(deps: WindowsBrokerDeps): WindowsBroker {
     if (method === "windows.list") return wm.listSnapshots();
     if (method === "windows.set-output-stack") return handleSetOutputStack(params);
     if (method === "windows.set-output-camera") return handleSetOutputCamera(params);
+    if (method === "windows.set-islands") return handleSetIslands(params);
     if (method === "windows.focus") return handleFocus(params);
     if (method === "windows.request-focus-decision") return handleRequestFocusDecision(params);
     if (method === "windows.set-opacity") return handleSetOpacity(params);
@@ -334,6 +335,47 @@ export function createWindowsBroker(deps: WindowsBrokerDeps): WindowsBroker {
     // enter/leave and hover state track the surface actually under the
     // cursor (same rationale as the workspace-changed repick above).
     state.seat?.repickPointer();
+    return null;
+  }
+
+  function handleSetIslands(p: unknown): null {
+    if (!p || typeof p !== "object") {
+      throw new Error("windows.set-islands: malformed payload");
+    }
+    const { islands } = p as { islands?: unknown };
+    if (islands === null) {
+      wm.setIslands(null);
+      return null;
+    }
+    if (!Array.isArray(islands)) {
+      throw new Error("windows.set-islands: islands must be an array or null");
+    }
+    const parsed = islands.map((raw, i) => {
+      if (!raw || typeof raw !== "object") {
+        throw new Error(`windows.set-islands: islands[${i}] must be an object`);
+      }
+      const isl = raw as {
+        id?: unknown; outputId?: unknown; rect?: unknown; members?: unknown;
+      };
+      if (typeof isl.id !== "number" || typeof isl.outputId !== "number") {
+        throw new Error(`windows.set-islands: islands[${i}] id/outputId must be numbers`);
+      }
+      let rect: { x: number; y: number; width: number; height: number } | null = null;
+      if (isl.rect !== null && isl.rect !== undefined) {
+        const r = isl.rect as { x?: unknown; y?: unknown; width?: unknown; height?: unknown };
+        if (typeof r.x !== "number" || typeof r.y !== "number"
+          || typeof r.width !== "number" || typeof r.height !== "number") {
+          throw new Error(`windows.set-islands: islands[${i}].rect must be a rect or null`);
+        }
+        rect = { x: r.x, y: r.y, width: r.width, height: r.height };
+      }
+      if (!Array.isArray(isl.members)
+        || !isl.members.every((m): m is number => typeof m === "number")) {
+        throw new Error(`windows.set-islands: islands[${i}].members must be number[]`);
+      }
+      return { id: isl.id, outputId: isl.outputId, rect, members: isl.members.slice() };
+    });
+    wm.setIslands(parsed);
     return null;
   }
 

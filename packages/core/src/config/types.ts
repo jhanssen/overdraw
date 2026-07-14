@@ -123,6 +123,12 @@ export interface OverdrawConfig {
   // `import type { LayoutPluginConfig } from "@overdraw/layout-types"`
   // and write `layout: cfg satisfies LayoutPluginConfig`.
   layout?: unknown;
+  // Opt into the canvas workspace provider (docs/canvas-design.md): when
+  // set (any object, {} for defaults), @overdraw/plugin-canvas loads in
+  // place of @overdraw/plugin-workspace-default as the 'workspace'
+  // namespace owner. The canvas plugin owns the slice's schema; verbatim
+  // pass-through. Absent = the default workspace plugin.
+  canvas?: unknown;
   // User-defined actions. Each entry is a name -> handler function
   // registered into the core action registry by the bundled
   // @overdraw/plugin-config-actions. Handlers run in the main thread
@@ -279,6 +285,9 @@ export interface ResolvedConfig {
   decoration: unknown;
   // Same verbatim pass-through to the bundled layout plugin.
   layout: unknown;
+  // Canvas opt-in slice (undefined = default workspace plugin; any object
+  // = @overdraw/plugin-canvas replaces it and owns this schema).
+  canvas: unknown;
   // User-defined action handlers. The bundled @overdraw/plugin-config-
   // actions registers each entry into the action registry. Function
   // references survive only because the plugin is in-thread (bundled);

@@ -149,6 +149,12 @@ function normalize(raw: unknown, path: string): ResolvedConfig {
   const decoration: unknown = cfg.decoration;
   // Verbatim pass-through; the bundled layout plugin owns the schema.
   const layout: unknown = cfg.layout;
+  // Canvas opt-in: when set (any object), plugin-canvas replaces the
+  // default workspace plugin and owns this slice's schema.
+  const canvas: unknown = cfg.canvas;
+  if (canvas !== undefined && (canvas === null || typeof canvas !== "object")) {
+    fail("`canvas` must be an object", path);
+  }
   // Verbatim pass-through to the bundled config-actions plugin. The
   // plugin validates the shape ({ [name: string]: function }) and
   // registers each entry into the action registry.
@@ -262,7 +268,7 @@ function normalize(raw: unknown, path: string): ResolvedConfig {
 
   return {
     output, card, scale, outputsByKey,
-    focus, hotkeys, decoration, layout, actions, plugins, xwayland, autostart,
+    focus, hotkeys, decoration, layout, canvas, actions, plugins, xwayland, autostart,
     windowRules,
     sourcePath: path,
   };
@@ -276,7 +282,8 @@ export async function loadConfig(explicit: string | null): Promise<ResolvedConfi
     return {
       output: null, card: null, scale: null, outputsByKey: {},
       focus: undefined, hotkeys: undefined,
-      decoration: undefined, layout: undefined, actions: undefined, plugins: [],
+      decoration: undefined, layout: undefined, canvas: undefined,
+      actions: undefined, plugins: [],
       xwayland: { enabled: false, terminate: false, xwaylandPath: null, displayNumber: 50, scale: 0 },
       autostart: [],
       windowRules: [],

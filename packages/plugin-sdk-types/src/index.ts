@@ -85,6 +85,12 @@ export interface PluginWindowsLike {
   deleteState(id: number, key: string): Promise<void>;
   setOutputStack(outputId: number, ids: number[] | null): Promise<void>;
   setOutputCamera(outputId: number, x: number, y: number): Promise<void>;
+  setIslands(islands: ReadonlyArray<{
+    id: number;
+    outputId: number;
+    rect: { x: number; y: number; width: number; height: number } | null;
+    members: ReadonlyArray<number>;
+  }> | null): Promise<void>;
   requestFocusDecision(reason: FocusReason, trigger?: number): Promise<void>;
   list(): Promise<WindowSnapshotLike[]>;
   onMap(cb: (ev: { surfaceId: number; outputId: number }) => void): void;
