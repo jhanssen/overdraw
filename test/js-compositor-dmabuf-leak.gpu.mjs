@@ -16,11 +16,16 @@ const skip = !canRunGpu() ? "needs GPU (no render node / dawn.node)"
 const FRAMES = 40;
 
 test("JS compositor: cycling dmabufs do not leak GPU-process fds", { skip }, async () => {
+  // GPU processes alive before this compositor starts (e.g. a live overdraw
+  // session on the host) are not ours to count; only the one this
+  // setupCompositor spawns is fd-audited. Same exclusion the harness
+  // teardown leak check uses.
+  const preexisting = new Set(gpuPids());
   const c = await setupCompositor({ headless: { width: 1280, height: 720 }, jsCompositor: true });
   let client = null;
   try {
-    const pids = gpuPids();
-    assert.equal(pids.length, 1, `expected 1 GPU process, got ${pids.length}`);
+    const pids = gpuPids().filter((p) => !preexisting.has(p));
+    assert.equal(pids.length, 1, `expected 1 new GPU process, got ${pids.length}`);
     const pid = pids[0];
 
     client = spawn(buildBin("dmabuf-cycle-client"), [c.sock, String(FRAMES)],
