@@ -2,13 +2,13 @@
 // types, enum values, and since-versions for sampled interfaces, so a generator
 // change that corrupts the signature tables fails here.
 //
-// Regenerates into a temp dir from the system XML, then imports the modules.
+// Regenerates into a temp dir from the vendored XML, then imports the modules.
 // Run: node --test test/gen-protocol.test.js
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
-import { mkdtempSync, existsSync } from 'node:fs';
+import { mkdtempSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
@@ -16,10 +16,9 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const repoRoot = join(__dirname, '..');
 const coreRoot = join(repoRoot, 'packages', 'core');
-const WL = '/usr/share/wayland/wayland.xml';
-const XDG = '/usr/share/wayland-protocols/stable/xdg-shell/xdg-shell.xml';
-
-const haveInputs = existsSync(WL) && existsSync(XDG);
+const protoDir = join(coreRoot, 'protocols');
+const WL = join(protoDir, 'wayland.xml');
+const XDG = join(protoDir, 'xdg-shell.xml');
 
 let outDir;
 function ensureGenerated() {
@@ -41,7 +40,7 @@ async function load(iface) {
 function req(sig, name) { return sig.requests.find((r) => r.name === name); }
 function ev(sig, name) { return sig.events.find((e) => e.name === name); }
 
-test('wl_compositor: requests and opcodes', { skip: !haveInputs }, async () => {
+test('wl_compositor: requests and opcodes', async () => {
   const s = await load('wl_compositor');
   assert.equal(s.name, 'wl_compositor');
   const cs = req(s, 'create_surface');
@@ -51,7 +50,7 @@ test('wl_compositor: requests and opcodes', { skip: !haveInputs }, async () => {
   assert.equal(cs.args[0].interface, 'wl_surface');
 });
 
-test('wl_surface.attach: opcode, nullable object, ints', { skip: !haveInputs }, async () => {
+test('wl_surface.attach: opcode, nullable object, ints', async () => {
   const s = await load('wl_surface');
   const attach = req(s, 'attach');
   assert.equal(attach.opcode, 1);
@@ -63,13 +62,13 @@ test('wl_surface.attach: opcode, nullable object, ints', { skip: !haveInputs }, 
   assert.equal(req(s, 'destroy').type, 'destructor');
 });
 
-test('wl_pointer.motion: fixed args', { skip: !haveInputs }, async () => {
+test('wl_pointer.motion: fixed args', async () => {
   const s = await load('wl_pointer');
   const motion = ev(s, 'motion');
   assert.deepEqual(motion.args.map((a) => a.type), ['uint', 'fixed', 'fixed']);
 });
 
-test('wl_registry.bind: new_id without interface', { skip: !haveInputs }, async () => {
+test('wl_registry.bind: new_id without interface', async () => {
   const s = await load('wl_registry');
   const bind = req(s, 'bind');
   const newId = bind.args.find((a) => a.type === 'new_id');
@@ -77,7 +76,7 @@ test('wl_registry.bind: new_id without interface', { skip: !haveInputs }, async 
   assert.equal(newId.interface, null, 'bind new_id has no fixed interface');
 });
 
-test('wl_shm enums: values incl. hex fourcc', { skip: !haveInputs }, async () => {
+test('wl_shm enums: values incl. hex fourcc', async () => {
   const s = await load('wl_shm');
   assert.equal(s.enums.format.entries.argb8888, 0);
   assert.equal(s.enums.format.entries.xrgb8888, 1);
@@ -85,13 +84,13 @@ test('wl_shm enums: values incl. hex fourcc', { skip: !haveInputs }, async () =>
   assert.equal(s.enums.error.entries.invalid_fd, 2);
 });
 
-test('wl_data_source.send: fd arg (event)', { skip: !haveInputs }, async () => {
+test('wl_data_source.send: fd arg (event)', async () => {
   const s = await load('wl_data_source');
   const send = ev(s, 'send');  // 'send' is an event the source emits, not a request
   assert.deepEqual(send.args.map((a) => a.type), ['string', 'fd']);
 });
 
-test('xdg_toplevel.set_title: since-versioned interface present', { skip: !haveInputs }, async () => {
+test('xdg_toplevel.set_title: since-versioned interface present', async () => {
   const s = await load('xdg_toplevel');
   assert.equal(s.name, 'xdg_toplevel');
   assert.ok(req(s, 'set_title'), 'has set_title');
@@ -100,7 +99,7 @@ test('xdg_toplevel.set_title: since-versioned interface present', { skip: !haveI
   assert.ok(cfg.args.some((a) => a.type === 'array'), 'configure has an array arg');
 });
 
-test('event sender factory wires opcodes', { skip: !haveInputs }, async () => {
+test('event sender factory wires opcodes', async () => {
   const dir = ensureGenerated();
   const mod = await import(pathToFileURL(join(dir, 'wl_surface.js')).href);
   const calls = [];

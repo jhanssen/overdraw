@@ -3,8 +3,8 @@
 //
 //   node tools/gen-protocol/gen-protocol.js [--out DIR] FILE.xml [FILE.xml ...]
 //
-// Default inputs (if none given) are the system wayland-protocols files the
-// server needs. Each interface foo_bar -> protocols-gen/foo_bar.{js,d.ts}.
+// Default inputs (if none given) are the vendored protocol XMLs under
+// protocols/. Each interface foo_bar -> protocols-gen/foo_bar.{js,d.ts}.
 
 import { readFileSync, writeFileSync, mkdirSync } from 'node:fs';
 import { join, dirname } from 'node:path';
@@ -13,6 +13,7 @@ import { fileURLToPath } from 'node:url';
 import { parseProtocol } from './parse.js';
 import { emitJs } from './emit-js.js';
 import { emitDts } from './emit-dts.js';
+import { applyVersionPin } from './pin.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const repoRoot = join(__dirname, '..', '..');
@@ -62,53 +63,59 @@ export interface WaylandFd {
 }
 `;
 
+// Every XML is vendored under protocols/ rather than read from
+// /usr/share: generation must not depend on the host's wayland /
+// wayland-protocols package. A distro bump that appends a request to an
+// interface would otherwise add a member to the generated handler type and
+// break the build on that machine only; an older package would drop one and
+// break it the other way. See protocols/README.md for provenance and how to
+// refresh.
+const vendored = (f) => join(repoRoot, 'protocols', f);
+
 const DEFAULT_INPUTS = [
-  '/usr/share/wayland/wayland.xml',
-  '/usr/share/wayland-protocols/stable/xdg-shell/xdg-shell.xml',
-  '/usr/share/wayland-protocols/stable/linux-dmabuf/linux-dmabuf-v1.xml',
-  '/usr/share/wayland-protocols/unstable/primary-selection/primary-selection-unstable-v1.xml',
-  '/usr/share/wayland-protocols/unstable/xdg-decoration/xdg-decoration-unstable-v1.xml',
-  '/usr/share/wayland-protocols/unstable/xdg-output/xdg-output-unstable-v1.xml',
-  '/usr/share/wayland-protocols/staging/cursor-shape/cursor-shape-v1.xml',
-  '/usr/share/wayland-protocols/stable/viewporter/viewporter.xml',
-  '/usr/share/wayland-protocols/staging/fractional-scale/fractional-scale-v1.xml',
-  '/usr/share/wayland-protocols/staging/linux-drm-syncobj/linux-drm-syncobj-v1.xml',
-  '/usr/share/wayland-protocols/staging/ext-workspace/ext-workspace-v1.xml',
-  '/usr/share/wayland-protocols/staging/xwayland-shell/xwayland-shell-v1.xml',
-  '/usr/share/wayland-protocols/staging/ext-data-control/ext-data-control-v1.xml',
-  '/usr/share/wayland-protocols/stable/presentation-time/presentation-time.xml',
-  '/usr/share/wayland-protocols/staging/commit-timing/commit-timing-v1.xml',
-  '/usr/share/wayland-protocols/staging/ext-foreign-toplevel-list/ext-foreign-toplevel-list-v1.xml',
-  '/usr/share/wayland-protocols/staging/ext-image-capture-source/ext-image-capture-source-v1.xml',
-  '/usr/share/wayland-protocols/staging/ext-image-copy-capture/ext-image-copy-capture-v1.xml',
-  '/usr/share/wayland-protocols/staging/xdg-dialog/xdg-dialog-v1.xml',
-  '/usr/share/wayland-protocols/unstable/xdg-foreign/xdg-foreign-unstable-v2.xml',
-  '/usr/share/wayland-protocols/unstable/relative-pointer/relative-pointer-unstable-v1.xml',
-  '/usr/share/wayland-protocols/unstable/pointer-constraints/pointer-constraints-unstable-v1.xml',
-  '/usr/share/wayland-protocols/unstable/keyboard-shortcuts-inhibit/keyboard-shortcuts-inhibit-unstable-v1.xml',
-  // wlr-* protocols are not in wayland-protocols upstream; vendor copies.
-  join(repoRoot, 'protocols', 'wlr-layer-shell-unstable-v1.xml'),
+  vendored('wayland.xml'),
+  vendored('xdg-shell.xml'),
+  vendored('linux-dmabuf-v1.xml'),
+  vendored('primary-selection-unstable-v1.xml'),
+  vendored('xdg-decoration-unstable-v1.xml'),
+  vendored('xdg-output-unstable-v1.xml'),
+  vendored('cursor-shape-v1.xml'),
+  vendored('viewporter.xml'),
+  vendored('fractional-scale-v1.xml'),
+  vendored('linux-drm-syncobj-v1.xml'),
+  vendored('ext-workspace-v1.xml'),
+  vendored('xwayland-shell-v1.xml'),
+  vendored('ext-data-control-v1.xml'),
+  vendored('presentation-time.xml'),
+  vendored('commit-timing-v1.xml'),
+  vendored('ext-foreign-toplevel-list-v1.xml'),
+  vendored('ext-image-capture-source-v1.xml'),
+  vendored('ext-image-copy-capture-v1.xml'),
+  vendored('xdg-dialog-v1.xml'),
+  vendored('xdg-foreign-unstable-v2.xml'),
+  vendored('relative-pointer-unstable-v1.xml'),
+  vendored('pointer-constraints-unstable-v1.xml'),
+  vendored('keyboard-shortcuts-inhibit-unstable-v1.xml'),
+  vendored('wlr-layer-shell-unstable-v1.xml'),
   // Legacy data-control: wl-clipboard <= 2.2.1 and older clipboard
   // managers bind only this variant, not ext-data-control. Without it
   // wl-copy falls back to mapping an invisible toplevel to grab focus,
   // which a tiler reflows around. Served by the shared data-control
   // handler alongside the ext family.
-  join(repoRoot, 'protocols', 'wlr-data-control-unstable-v1.xml'),
-  join(repoRoot, 'protocols', 'wlr-foreign-toplevel-management-unstable-v1.xml'),
-  join(repoRoot, 'protocols', 'wlr-output-management-unstable-v1.xml'),
-  join(repoRoot, 'protocols', 'wlr-virtual-pointer-unstable-v1.xml'),
-  join(repoRoot, 'protocols', 'virtual-keyboard-unstable-v1.xml'),
+  vendored('wlr-data-control-unstable-v1.xml'),
+  vendored('wlr-foreign-toplevel-management-unstable-v1.xml'),
+  vendored('wlr-output-management-unstable-v1.xml'),
+  vendored('wlr-virtual-pointer-unstable-v1.xml'),
+  vendored('virtual-keyboard-unstable-v1.xml'),
   // KDE server-decoration (the older SSD-negotiation protocol that
   // pre-dates zxdg_decoration_manager_v1). GTK4 binds this one in
   // preference to the xdg variant, so a compositor that only
   // advertises zxdg gets ignored by GTK and the client keeps drawing
   // CSD (visible as a 28x29 GTK shadow band around every window).
-  // Vendored copy lifted from wlroots' protocols/.
-  join(repoRoot, 'protocols', 'kde-server-decoration.xml'),
-  // Mesa's legacy wl_drm. Not in wayland-protocols upstream; NVIDIA's
-  // libnvidia-egl-wayland binds it to discover the DRM device during EGL
-  // init and null-derefs without it.
-  join(repoRoot, 'protocols', 'wayland-drm.xml'),
+  vendored('kde-server-decoration.xml'),
+  // Mesa's legacy wl_drm. NVIDIA's libnvidia-egl-wayland binds it to
+  // discover the DRM device during EGL init and null-derefs without it.
+  vendored('wayland-drm.xml'),
 ];
 
 function main(argv) {
@@ -133,6 +140,7 @@ function main(argv) {
     const proto = parseProtocol(xml);
     protoCount++;
     for (const iface of proto.interfaces) {
+      applyVersionPin(iface);
       writeFileSync(join(out, `${iface.name}.js`), emitJs(iface));
       writeFileSync(join(out, `${iface.name}.d.ts`), emitDts(iface));
       ifaceCount++;

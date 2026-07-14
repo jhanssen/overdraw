@@ -233,6 +233,23 @@ nothing, with no error. Worst-first.
   `wl_buffer`) not wired (only `create_immed`); single-plane dmabuf only;
   `zwp_linux_dmabuf_feedback_v1` is functional for WSI clients but not
   automatically asserted.
+- **Interfaces pinned below the version their XML declares.** Protocol XML is
+  vendored under `packages/core/protocols/` (wayland 1.25.0, wayland-protocols
+  1.49) and `VERSION_PINS` in `tools/gen-protocol/pin.js` caps these interfaces,
+  dropping the newer messages from the generated interface. The cap is what the
+  global advertises, so a client cannot bind or reach the feature — no silent
+  no-op — but the feature is unimplemented:
+  - `wl_surface` at 6 (`wl_compositor` at 6 with it): v7 adds `get_release`, a
+    per-commit buffer-release callback. The buffer-release lifecycle releases
+    per buffer, not per commit, so a client re-using one buffer across several
+    surfaces/commits gets no per-commit signal. Implementing it means tracking
+    release callbacks as double-buffered commit state.
+  - `zwp_linux_dmabuf_v1`, `zwp_linux_buffer_params_v1`,
+    `zwp_linux_dmabuf_feedback_v1` at 5: v6 adds
+    `set_sampling_device` (client picks the import device for the next `create`/
+    `create_immed`) and the feedback tranche flag advertising it. Multi-GPU
+    clients cannot steer imports.
+  - `wl_data_device_manager` at 3: v4 adds a `release` destructor.
 - **Deliberately deferred (sway/Hyprland skip these too, or they're
   unreachable here):** `xdg_positioner` reactive popups (`set_reactive` /
   `set_parent_size` / `set_parent_configure` are no-ops — popups don't

@@ -1,6 +1,6 @@
 // Structural well-formedness check across ALL generated interfaces (not just the
 // spot-checked ones in gen-protocol.test.js). Regenerates the full default set
-// from the system XML, then asserts invariants every signature must satisfy:
+// from the vendored XML, then asserts invariants every signature must satisfy:
 // sequential unique opcodes, known arg types, interface references that resolve,
 // and a makeEvents sender per event wired to the right opcode. Catches broad
 // generator regressions.
@@ -8,7 +8,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { mkdtempSync, existsSync, readdirSync } from "node:fs";
+import { mkdtempSync, readdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, dirname } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
@@ -16,13 +16,13 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const repoRoot = join(__dirname, "..");
 const coreRoot = join(repoRoot, "packages", "core");
+const protoDir = join(coreRoot, "protocols");
 const INPUTS = [
-  "/usr/share/wayland/wayland.xml",
-  "/usr/share/wayland-protocols/stable/xdg-shell/xdg-shell.xml",
-  "/usr/share/wayland-protocols/stable/linux-dmabuf/linux-dmabuf-v1.xml",
-  "/usr/share/wayland-protocols/unstable/primary-selection/primary-selection-unstable-v1.xml",
-];
-const haveInputs = INPUTS.every((p) => existsSync(p));
+  "wayland.xml",
+  "xdg-shell.xml",
+  "linux-dmabuf-v1.xml",
+  "primary-selection-unstable-v1.xml",
+].map((f) => join(protoDir, f));
 
 const ARG_TYPES = new Set(["int", "uint", "fixed", "string", "object", "new_id", "array", "fd"]);
 
@@ -48,7 +48,7 @@ async function loadAll() {
   return mods;
 }
 
-test("generator: a non-trivial set of interfaces is produced", { skip: !haveInputs }, async () => {
+test("generator: a non-trivial set of interfaces is produced", async () => {
   const mods = await loadAll();
   assert.ok(mods.size >= 25, `expected >=25 interfaces, got ${mods.size}`);
   // The interfaces the compositor actually uses must all be present.
@@ -62,7 +62,7 @@ test("generator: a non-trivial set of interfaces is produced", { skip: !haveInpu
   }
 });
 
-test("generator: every signature is structurally well-formed", { skip: !haveInputs }, async () => {
+test("generator: every signature is structurally well-formed", async () => {
   const mods = await loadAll();
   const known = new Set(mods.keys());
 
@@ -91,7 +91,7 @@ test("generator: every signature is structurally well-formed", { skip: !haveInpu
   }
 });
 
-test("generator: makeEvents wires one sender per event at the right opcode", { skip: !haveInputs }, async () => {
+test("generator: makeEvents wires one sender per event at the right opcode", async () => {
   const mods = await loadAll();
   for (const [name, m] of mods) {
     const s = m.signature;
