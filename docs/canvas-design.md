@@ -303,11 +303,25 @@ answer:
   relative offsets in glass equal what the user sees, and pointer root
   coords are synthesized from the told positions). OR-window world
   positions derive by the inverse mapping. Re-tell positions on camera
-  settle (not per pan frame); hidden-island X windows keep their last
-  told coords (inert while hidden). Precedent: the HiDPI
-  `xwaylandScale` fiction already translates X coordinates specially
+  settle (not per pan frame). Precedent: the HiDPI `xwaylandScale`
+  fiction already translates X coordinates specially
   (xwayland-design.md). Once this lands, the district constraint is
   deleted, not worked around.
+
+  **Unviewed windows** (island shown on no camera) have no glass
+  position, and don't need a true one: a hidden window's told position
+  is dormant -- interaction requires visibility, and the show path
+  re-tells real coords first. Park hidden ISLANDS (not windows) in a
+  reserved attic band outside any plausible arrangement (e.g.
+  y >= 20000): each hidden island gets a deterministic slot, each member
+  is told slot origin + its island-relative offset. That keeps
+  intra-island relative geometry valid for multi-window X apps, is
+  deterministic for windows spawned directly onto hidden islands, and
+  never overlaps live glass or contains the pointer. (Today's model
+  already tolerates the degenerate version -- hidden-workspace X
+  windows keep stale in-arrangement coords overlapping the shown
+  workspace -- so the attic tidies an accepted fiction rather than
+  fixing a new fragility.)
 
 Windows spanning outputs with disagreeing cameras would have two glass
 positions, but independent cameras already preclude straddling (§8), so
