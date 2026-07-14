@@ -184,6 +184,10 @@ export interface SubsurfaceAccessor {
   // each with its parent-relative offset. Only children with committed content
   // are returned (those the compositor positions + draws).
   children(parentId: number): Array<{ id: number; offX: number; offY: number }>;
+  // The subsurface parent of `id`, or null when `id` is not a subsurface.
+  // Lets the compositor resolve a surface's tree root (a subsurface inherits
+  // the root's camera anchoring). Optional: test accessors may omit it.
+  parent?(id: number): number | null;
 }
 
 export function makeSubsurfaceAccessor(state: CompositorState): SubsurfaceAccessor {
@@ -198,6 +202,16 @@ export function makeSubsurfaceAccessor(state: CompositorState): SubsurfaceAccess
         out.push({ id: childRec.id, offX: sub.x, offY: sub.y });
       }
       return out;
+    },
+    parent(id) {
+      const rec = state.surfacesById?.get(id);
+      if (!rec || !state.subsurfaces) return null;
+      for (const sub of state.subsurfaces.values()) {
+        if (sub.surface !== rec.resource) continue;
+        const parentRec = state.surfaces.get(sub.parent) as SurfaceRecord | undefined;
+        return parentRec ? parentRec.id : null;
+      }
+      return null;
     },
   };
 }

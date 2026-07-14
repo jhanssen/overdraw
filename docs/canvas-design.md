@@ -149,7 +149,32 @@ output's vblank tick, forcing full-output damage while unsettled
 pan — `LayoutReason` has no "pan" on purpose. Panning is purely
 render+input; layout runs on structural events only. Do not implement the
 camera as per-surface `fx.translate`: that channel is owned by per-window
-open/move animations and would collide.
+open/move animations and would collide (as a separate uniform term the
+camera composes with fx cleanly). The SDK setter suffices for docked
+jumps and coarse animation; smooth per-vblank springs from a Worker
+plugin would pay one IPC round-trip per frame, so the follow-up is an
+`output-camera` target kind in the animation evaluator (`animations/
+value.ts` TargetRef) letting plugins hand core a spring spec and get
+in-core per-tick evaluation, like window fx animations do.
+
+Interactive grabs (`computeGrabRect`): anchor and deltas are glass-space,
+the grabbed rect is world-space — correct while the camera is constant,
+so camera policy must not animate an output's camera during an active
+grab on it (or must re-anchor the grab). Same rule covers a grab whose
+pointer crosses onto an output with a different camera: the grab keeps
+its starting camera frame until release.
+
+Capture/compose interplay: output screen-capture (`composeOutput`) renders
+through the same per-output context as scanout, so it is camera-correct by
+construction; single-window capture (`composeRegion`) is world-space and
+correctly camera-independent. The plugin compose APIs (`compose.scene`,
+live scenes) capture **world regions** at identity camera — right for
+world-rect semantics, but a live view built from `outputRegion(outputId)`
+shows the output's arrangement slot, not its camera view. When mirror
+semantics are needed under non-identity cameras, add an opt-in
+"follow output N's camera" mode that refreshes the synthetic context per
+frame. Same caveat for transition FROM/TO snapshots (moot in the canvas
+end-state, where camera moves replace snapshot transitions).
 
 Zoom is two features:
 

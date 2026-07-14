@@ -586,6 +586,14 @@ interface Surface {
   y: number;
   layoutW: number;
   layoutH: number;
+  // Output-anchored surfaces (layer-shell popups, the scissor black-fill)
+  // are positioned relative to the output's glass, not the world: the
+  // per-output content camera does not shift them. Content surfaces
+  // (toplevels, decorations, their subsurfaces/popups, phantoms) live in
+  // world coordinates and pan with the camera. Non-content layer surfaces
+  // and the cursor are exempted structurally (layer membership / cursor
+  // target id) without needing this flag.
+  outputAnchored: boolean;
   // Latest xdg_surface.configure serial sent for this surface, and the latest
   // serial the client acked. Drive the decoration content-gate release
   // (surfaceContentReady): the client is ready when ackSerial >= cfgSerial.
@@ -919,6 +927,14 @@ interface OutputCtx {
   id: number;
   originX: number;
   originY: number;
+  // Content-camera offset for this output: the output views the world
+  // starting at (originX + cameraX, originY + cameraY). Applies only to
+  // world-space surfaces (see Surface.outputAnchored); layer-shell, the
+  // cursor, and output-anchored surfaces subtract the plain origin.
+  // (0, 0) = identity (the output shows the slice at its arrangement
+  // position, the pre-camera behavior).
+  cameraX: number;
+  cameraY: number;
   scale: number;
   deviceWidth: number;
   deviceHeight: number;
@@ -946,6 +962,11 @@ export class JsCompositor implements CompositorSink {
   // into its own scanout target. Before setOutputs is ever called this holds a
   // single entry {id:0, x:0, y:0} so nested/headless/single-KMS are unchanged.
   private outputsGeom = new Map<number, OutputGeom>();
+  // Per-output content camera (docs/canvas-design.md §4). Keyed by outputId;
+  // absent = identity. Shifts where world-space surfaces land on the output
+  // (render + geometric cull + damage partitioning); output-anchored
+  // surfaces, non-content layers, and the cursor ignore it.
+  private cameras = new Map<number, { x: number; y: number }>();
   // Surfaces that gained presentable content since the last takeImportedSurfaces.
   private imported: Array<{ id: number; width: number; height: number }> = [];
   private warnedDmabuf = false;
@@ -991,6 +1012,10 @@ export class JsCompositor implements CompositorSink {
   // Non-content layers (background/below/above/overlay). Composited around the
   // content stack per LAYER_ORDER. Plugin overlays/decorations populate these.
   private layers = new Map<Layer, number[]>();
+  // Union of every non-content layer list, rebuilt on setLayerSurfaces.
+  // Membership = the surface is glass-anchored for camera purposes
+  // (cameraExempt) without any per-surface tagging.
+  private layerIdSet = new Set<number>();
 
   // Live compose targets. Each entry is re-rendered inside every renderFrame()
   // alongside the on-screen composite, sharing the frame's open import
@@ -1310,6 +1335,14 @@ export class JsCompositor implements CompositorSink {
         logicalX: o.logicalX, logicalY: o.logicalY, scale,
       });
     }
+    // Cameras for outputs that no longer exist are dropped (a returning
+    // output starts at identity; core re-applies its persisted camera).
+    for (const id of [...this.cameras.keys()]) {
+      if (!this.outputsGeom.has(id)) {
+        this.cameras.delete(id);
+        this.outputDamage.setCamera(id, 0, 0);
+      }
+    }
     // Mirror output 0's device dims/scale into the primary fields so paths that
     // still read this.width/height/scale (readback, freeze snapshots) match it.
     const primary = this.outputsGeom.get(OUTPUT_DEFAULT);
@@ -1354,13 +1387,31 @@ export class JsCompositor implements CompositorSink {
   // surface's global-logical position before the ×scale placement.
   private outputCtx(o: OutputGeom): OutputCtx {
     const scale = o.scale > 0 ? o.scale : 1;
+    const cam = this.cameras.get(o.id);
     return {
       id: o.id,
-      originX: o.logicalX, originY: o.logicalY, scale,
+      originX: o.logicalX, originY: o.logicalY,
+      cameraX: cam ? cam.x : 0, cameraY: cam ? cam.y : 0,
+      scale,
       deviceWidth: o.deviceWidth, deviceHeight: o.deviceHeight,
       logicalWidth: Math.max(1, Math.round(o.deviceWidth / scale)),
       logicalHeight: Math.max(1, Math.round(o.deviceHeight / scale)),
     };
+  }
+
+  // Set (or clear, with (0, 0)) the content camera for one output. A camera
+  // change moves every world-space surface on that output at once, so the
+  // whole output repaints. Unknown outputIds are stored anyway -- the camera
+  // applies when the output appears (setOutputs prunes stale entries).
+  setOutputCamera(outputId: number, x: number, y: number): void {
+    const cur = this.cameras.get(outputId);
+    const cx = cur ? cur.x : 0;
+    const cy = cur ? cur.y : 0;
+    if (cx === x && cy === y) return;
+    if (x === 0 && y === 0) this.cameras.delete(outputId);
+    else this.cameras.set(outputId, { x, y });
+    this.outputDamage.setCamera(outputId, x, y);
+    this.outputDamage.fullOutput(outputId);
   }
 
   // Consume this output's accumulated damage for the frame, keyed by the
@@ -1408,7 +1459,41 @@ export class JsCompositor implements CompositorSink {
   setLayerSurfaces(layer: Layer, ids: number[]): void {
     if (layer === "content") { this.stack = ids.slice(); this.damageFull(); return; }
     this.layers.set(layer, ids.slice());
+    this.layerIdSet.clear();
+    for (const list of this.layers.values()) {
+      for (const id of list) this.layerIdSet.add(id);
+    }
     this.damageFull();
+  }
+
+  // Mark a surface as positioned relative to its output's glass rather than
+  // the world (see Surface.outputAnchored). Used for surfaces that ride the
+  // content stack but must not pan with the camera: popups whose parent is a
+  // layer-shell surface.
+  setSurfaceOutputAnchored(id: number, anchored: boolean): void {
+    const s = this.ensureSurface(id);
+    if (s.outputAnchored === anchored) return;
+    s.outputAnchored = anchored;
+    // The flag changes where the surface renders only under a non-identity
+    // camera; repaint everything for that rare transition.
+    if (this.cameras.size > 0) this.damageFull();
+  }
+
+  // True when the per-output content camera does NOT move this surface:
+  // output-anchored surfaces, non-content layer surfaces (bars, wallpaper),
+  // and the cursor sprite are glass-positioned. A subsurface inherits its
+  // ancestors' anchoring (a bar's subsurface must not pan away from the bar),
+  // so walk the parent chain when the surface itself isn't exempt.
+  private cameraExempt(id: number, s: Surface): boolean {
+    if (s.outputAnchored || this.layerIdSet.has(id)
+      || id === this.cursorTargetSurfaceId) return true;
+    const parentOf = this.subsurfaceAccessor?.parent;
+    if (!parentOf) return false;
+    for (let p = parentOf(id); p !== null; p = parentOf(p)) {
+      const ps = this.surfaces.get(p);
+      if ((ps && ps.outputAnchored) || this.layerIdSet.has(p)) return true;
+    }
+    return false;
   }
 
   // The full back-to-front draw order for one output: each layer in
@@ -1486,9 +1571,10 @@ export class JsCompositor implements CompositorSink {
         s.x = x; s.y = y; s.layoutW = w; s.layoutH = h;
         this.damageFull();
       } else {
-        this.addOutputDamage(s.x, s.y, effW(s.layoutW), effH(s.layoutH));
+        const anchored = this.cameraExempt(id, s);
+        this.addOutputDamage(s.x, s.y, effW(s.layoutW), effH(s.layoutH), anchored);
         s.x = x; s.y = y; s.layoutW = w; s.layoutH = h;
-        this.addOutputDamage(x, y, effW(w), effH(h));
+        this.addOutputDamage(x, y, effW(w), effH(h), anchored);
       }
     } else {
       this.surfaces.set(id, blankSurface(x, y, w, h));
@@ -1945,7 +2031,8 @@ export class JsCompositor implements CompositorSink {
       if (this.fxDrawsOutsideLayout(s)) {
         this.damageFull();
       } else {
-        this.addOutputDamage(s.x, s.y, s.layoutW, s.layoutH);
+        this.addOutputDamage(s.x, s.y, s.layoutW, s.layoutH,
+          this.cameraExempt(id, s));
       }
     }
     this.surfaces.delete(id);
@@ -2490,13 +2577,18 @@ export class JsCompositor implements CompositorSink {
     const sy0 = s.y;
     const sx1 = sx0 + w;
     const sy1 = sy0 + h;
+    // World-space surfaces are resident where a CAMERA view overlaps them;
+    // glass-anchored surfaces use the plain arrangement rect (same gating
+    // as the render pass, so residency matches what actually draws).
+    const exempt = this.cameraExempt(surfaceId, s);
     const out: number[] = [];
     for (const o of this.outputsGeom.values()) {
       const scale = o.scale > 0 ? o.scale : 1;
-      const ox0 = o.logicalX;
-      const oy0 = o.logicalY;
-      const ox1 = o.logicalX + o.deviceWidth / scale;
-      const oy1 = o.logicalY + o.deviceHeight / scale;
+      const cam = exempt ? undefined : this.cameras.get(o.id);
+      const ox0 = o.logicalX + (cam ? cam.x : 0);
+      const oy0 = o.logicalY + (cam ? cam.y : 0);
+      const ox1 = ox0 + o.deviceWidth / scale;
+      const oy1 = oy0 + o.deviceHeight / scale;
       if (sx0 < ox1 && sx1 > ox0 && sy0 < oy1 && sy1 > oy0) out.push(o.id);
     }
     // Mapped but placed off-screen / outside every output's region: fall back
@@ -2649,9 +2741,14 @@ export class JsCompositor implements CompositorSink {
 
   // Accumulate a GLOBAL-logical-space rect into the damage rings of every
   // output it overlaps (the map clips into each output's local space).
-  // Rects entirely outside the union are silent no-ops.
-  private addOutputDamage(x: number, y: number, w: number, h: number): void {
-    this.outputDamage.damageRect(x, y, w, h);
+  // Rects entirely outside the union are silent no-ops. `anchored` mirrors
+  // cameraExempt for the damaged surface: world rects are partitioned
+  // against each output's camera view rect, anchored rects against the
+  // plain arrangement rect.
+  private addOutputDamage(
+    x: number, y: number, w: number, h: number, anchored = false,
+  ): void {
+    this.outputDamage.damageRect(x, y, w, h, anchored);
   }
 
   // Damage a surface's current on-screen rect (placement). Content commits and
@@ -2691,7 +2788,7 @@ export class JsCompositor implements CompositorSink {
     // rather than a zero-area one.
     let w = s.layoutW, h = s.layoutH;
     if (w <= 0 || h <= 0) ({ w, h } = this.logicalSizeOf(s));
-    this.addOutputDamage(s.x, s.y, w, h);
+    this.addOutputDamage(s.x, s.y, w, h, this.cameraExempt(id, s));
   }
 
   // Damage only the client's changed region for a content commit. `rects` are
@@ -2713,8 +2810,10 @@ export class JsCompositor implements CompositorSink {
       return;
     }
     const bs = s.bufferScale || 1;
+    const anchored = this.cameraExempt(id, s);
     for (const r of rects) {
-      this.addOutputDamage(s.x + r.x / bs, s.y + r.y / bs, r.width / bs, r.height / bs);
+      this.addOutputDamage(s.x + r.x / bs, s.y + r.y / bs,
+        r.width / bs, r.height / bs, anchored);
     }
   }
 
@@ -2734,6 +2833,9 @@ export class JsCompositor implements CompositorSink {
     s.texture = tex;
     s.view = tex.createView();
     s.width = 1; s.height = 1; s.present = true;
+    // The fill's placement override is a scissor box in output-rect
+    // coordinates; the content camera must not shift it.
+    s.outputAnchored = true;
     this.rebuildBindGroup(s, s.view);
     this.blackFill = s;
     return s;
@@ -2782,8 +2884,12 @@ export class JsCompositor implements CompositorSink {
     const bh = swapAxes ? s.width : s.height;
     const intrinsicW = s.viewportDst?.width ?? s.viewportSrc?.width ?? bw / bs;
     const intrinsicH = s.viewportDst?.height ?? s.viewportSrc?.height ?? bh / bs;
-    const ox = output ? output.originX : 0;
-    const oy = output ? output.originY : 0;
+    // World-space surfaces subtract the camera-shifted view origin; glass-
+    // anchored surfaces (layer-shell, cursor, outputAnchored) subtract the
+    // plain arrangement origin. Identity cameras make the two identical.
+    const cam = output && !this.cameraExempt(surfaceId, s);
+    const ox = output ? output.originX + (cam ? output.cameraX : 0) : 0;
+    const oy = output ? output.originY + (cam ? output.cameraY : 0) : 0;
     // xdg_surface.set_window_geometry: when set (CSD clients like GTK
     // draw shadow / overflow chrome around their content; the
     // geometry rect declares the sub-region of the surface that is
@@ -3103,7 +3209,11 @@ export class JsCompositor implements CompositorSink {
           const sx0 = s.x, sy0 = s.y;
           const sx1 = sx0 + sw, sy1 = sy0 + sh;
           const oscale = out.scale > 0 ? out.scale : 1;
-          const ox0 = out.originX, oy0 = out.originY;
+          // World-space surfaces are visible where the CAMERA view rect is,
+          // not the arrangement rect (matches updateUniforms' origin).
+          const cam = !this.cameraExempt(id, s);
+          const ox0 = out.originX + (cam ? out.cameraX : 0);
+          const oy0 = out.originY + (cam ? out.cameraY : 0);
           const ox1 = ox0 + out.deviceWidth / oscale;
           const oy1 = oy0 + out.deviceHeight / oscale;
           if (sx1 <= ox0 || sx0 >= ox1 || sy1 <= oy0 || sy0 >= oy1) continue;
@@ -3516,7 +3626,7 @@ export class JsCompositor implements CompositorSink {
     const texture = this.allocComposeTexture(devW, devH);
     const synth: OutputCtx = {
       id: -1,
-      originX: args.region.x, originY: args.region.y, scale,
+      originX: args.region.x, originY: args.region.y, cameraX: 0, cameraY: 0, scale,
       deviceWidth: devW, deviceHeight: devH,
       logicalWidth: args.region.w, logicalHeight: args.region.h,
     };
@@ -3669,7 +3779,8 @@ export class JsCompositor implements CompositorSink {
     // because the rect moves under the transform, so fall back to damageFull
     // there.
     if (placement && !this.fxDrawsOutsideLayout(s)) {
-      this.addOutputDamage(placement.x, placement.y, placement.w, placement.h);
+      this.addOutputDamage(placement.x, placement.y, placement.w, placement.h,
+        this.cameraExempt(surfaceId, s));
     } else {
       this.damageFull();
     }
@@ -3832,7 +3943,7 @@ export class JsCompositor implements CompositorSink {
     if (!s) return;
     // Damage the cursor's old rect, move it, damage the new rect: a cursor
     // move repaints just the two small regions, not the whole output.
-    if (this.cursorVisible) this.addOutputDamage(s.x, s.y, s.layoutW, s.layoutH);
+    if (this.cursorVisible) this.addOutputDamage(s.x, s.y, s.layoutW, s.layoutH, /*anchored*/ true);
     const x = this.cursorPointerX - this.cursorHotspotX;
     const y = this.cursorPointerY - this.cursorHotspotY;
     s.x = x; s.y = y;
@@ -3846,7 +3957,7 @@ export class JsCompositor implements CompositorSink {
     const bs = s.bufferScale || 1;
     s.layoutW = s.width / bs;
     s.layoutH = s.height / bs;
-    if (this.cursorVisible) this.addOutputDamage(s.x, s.y, s.layoutW, s.layoutH);
+    if (this.cursorVisible) this.addOutputDamage(s.x, s.y, s.layoutW, s.layoutH, /*anchored*/ true);
   }
 
   // Install a CPU-side BGRA8 cursor image into the internal cursor surface
@@ -3950,7 +4061,7 @@ export class JsCompositor implements CompositorSink {
     // Repaint the cursor's rect so it appears / is erased.
     if (this.cursorTargetSurfaceId !== null) {
       const s = this.surfaces.get(this.cursorTargetSurfaceId);
-      if (s) this.addOutputDamage(s.x, s.y, s.layoutW, s.layoutH);
+      if (s) this.addOutputDamage(s.x, s.y, s.layoutW, s.layoutH, /*anchored*/ true);
     }
   }
 
@@ -4025,7 +4136,7 @@ export class JsCompositor implements CompositorSink {
     if (r) {
       const synth: OutputCtx = {
         id: -1,
-        originX: r.x, originY: r.y, scale: args.outW / r.w,
+        originX: r.x, originY: r.y, cameraX: 0, cameraY: 0, scale: args.outW / r.w,
         deviceWidth: args.outW, deviceHeight: args.outH,
         logicalWidth: r.w, logicalHeight: r.h,
       };
@@ -4307,7 +4418,7 @@ export class JsCompositor implements CompositorSink {
     const texture = this.allocComposeTexture(devW, devH);
     const ctx: OutputCtx = {
       id: -1,
-      originX: region.x, originY: region.y, scale,
+      originX: region.x, originY: region.y, cameraX: 0, cameraY: 0, scale,
       deviceWidth: devW, deviceHeight: devH,
       logicalWidth: region.w, logicalHeight: region.h,
     };
@@ -4414,6 +4525,7 @@ function blankSurface(x: number, y: number, w: number, h: number): Surface {
     texture: null, view: null, uniformBuf: null, bindGroup: null,
     bindGroupCache: new WeakMap(),
     width: 0, height: 0, bufferScale: 1, bufferTransform: 0, opaque: false, x, y, layoutW: w, layoutH: h, present: false,
+    outputAnchored: false,
     currentBufferId: 0,
     contentEpoch: 0,
     fx: defaultFx(),

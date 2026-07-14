@@ -63,10 +63,19 @@ function surfaceIdOf(ctx: Ctx, surface: Resource): number | null {
   return ctx.state.surfaces?.get(surface)?.id ?? null;
 }
 
-// The focused surface's output-space rect (valid only while the constraint's
-// surface is focused, which is the activation precondition).
+// The focused surface's rect in GLASS space (valid only while the
+// constraint's surface is focused, which is the activation precondition).
+// A content surface's stored rect is in world coordinates; the focus
+// carries the camera offset its hit was made with, so glass = world - cam.
+// The pointer position and the addon's confine clamp are both glass-space,
+// so all the math below happens there.
 function focusRect(ctx: Ctx): { x: number; y: number; width: number; height: number } | null {
-  return ctx.state.seat?.focus?.rect ?? null;
+  const f = ctx.state.seat?.focus;
+  if (!f) return null;
+  return {
+    x: f.rect.x - f.camX, y: f.rect.y - f.camY,
+    width: f.rect.width, height: f.rect.height,
+  };
 }
 
 // Is the cursor within the lock's region? True when there is no region.
@@ -78,7 +87,7 @@ function pointerInRegion(ctx: Ctx, lock: LockRec): boolean {
   return lock.region.contains(p.x - rect.x, p.y - rect.y);
 }
 
-// Output-space confine rects: the region translated to the surface origin, or
+// Glass-space confine rects: the region translated to the surface origin, or
 // the whole surface when there is no region.
 function confineRects(ctx: Ctx, lock: LockRec): Array<{ x: number; y: number; w: number; h: number }> {
   const rect = focusRect(ctx);

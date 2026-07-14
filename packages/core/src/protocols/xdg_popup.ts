@@ -60,6 +60,15 @@ export function popupOutputOrigin(state: CompositorState, pr: PopupRecord): { x:
 export function configurePopup(ctx: Ctx, pr: PopupRecord): void {
   const origin = popupOutputOrigin(ctx.state, pr);
   if (!origin) return; // unparented; defer the configure
+  // A popup chain rooted at a layer-shell surface (a bar's menu, its
+  // submenus) is positioned relative to glass-anchored chrome: exempt it
+  // from the content camera. Toplevel-rooted popups pan with their window.
+  // Subsurfaces of either inherit via the compositor's parent walk.
+  const popupSurfaceRec = pr.xdgSurface.surface;
+  if (popupSurfaceRec) {
+    ctx.state.compositor.setSurfaceOutputAnchored?.(
+      popupSurfaceRec.id, popupChainLayerRooted(ctx.state, pr));
+  }
   // Position-constrain the popup against its parent surface's CURRENT
   // output. A popup parented to a toplevel that has been moved to a
   // second monitor must be solved against that monitor's GLOBAL rect,
@@ -74,11 +83,16 @@ export function configurePopup(ctx: Ctx, pr: PopupRecord): void {
     : primaryOutputId(ctx.state);
   const outEntry = ctx.state.outputs?.get(parentOutputId);
   // outputs[*].logicalPosition + logicalSize are the GLOBAL rect of
-  // that output. Fall back to a safe single-output area at origin when
-  // outputs is absent (test stubs).
+  // that output. A toplevel-rooted popup solves against the output's
+  // camera VIEW rect (the region of the world the output shows -- the
+  // parent's coordinates are world coordinates); a layer-rooted popup is
+  // glass-anchored and uses the plain rect. Fall back to a safe
+  // single-output area at origin when outputs is absent (test stubs).
+  const cam = (!popupChainLayerRooted(ctx.state, pr)
+    ? ctx.state.outputCameras?.get(parentOutputId) : undefined) ?? { x: 0, y: 0 };
   const outRect = outEntry
     ? {
-        x: outEntry.logicalPosition.x, y: outEntry.logicalPosition.y,
+        x: outEntry.logicalPosition.x + cam.x, y: outEntry.logicalPosition.y + cam.y,
         width: outEntry.logicalSize.width, height: outEntry.logicalSize.height,
       }
     : { x: 0, y: 0, width: 1920, height: 1080 };
@@ -89,6 +103,21 @@ export function configurePopup(ctx: Ctx, pr: PopupRecord): void {
   const serial = ctx.state.serial();
   pr.xdgSurface.lastConfigureSerial = serial;
   ctx.events.xdg_surface.send_configure(pr.xdgSurface.resource, serial);
+}
+
+// True when the popup's parent chain terminates at a layer-shell surface,
+// directly (layerParent) or through nested popups. Bounded walk, same
+// rationale as popupRootToplevelId. Such popups are glass-anchored: exempt
+// from the content camera on both the render and hit-test sides.
+export function popupChainLayerRooted(state: CompositorState, pr: PopupRecord): boolean {
+  let cur: PopupRecord | undefined = pr;
+  for (let i = 0; i < 64 && cur; i++) {
+    if (cur.layerParent) return true;
+    const parent: XdgSurfaceRecord | null = cur.parent;
+    if (!parent || parent.role !== "popup" || !parent.popup) return false;
+    cur = state.popups?.get(parent.popup);
+  }
+  return false;
 }
 
 // The wl_surface this popup is parented to: the root toplevel's wl_surface,

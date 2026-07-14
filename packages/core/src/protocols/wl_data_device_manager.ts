@@ -156,7 +156,8 @@ function dragLeave(d: DragSession): void {
 // surface under the pointer, minting a fresh data_offer on each new enter.
 function dragMotion(d: DragSession, x: number, y: number,
                     hit: { surfaceId: number; clientId: number;
-                           rect: { x: number; y: number } } | null): void {
+                           rect: { x: number; y: number };
+                           camX: number; camY: number } | null): void {
   // Move the drag icon (if any) to follow the pointer.
   updateDragIcon(d, x, y);
 
@@ -187,14 +188,16 @@ function dragMotion(d: DragSession, x: number, y: number,
     // "HiDPI"); X clients expect surface-local coords in those oversized
     // pixels. Other roles pass through 1:1.
     const xn = surfaceRec?.role === "xwayland" ? (d.ctx.state.xwaylandScale ?? 1) : 1;
-    const sx = (x - hit.rect.x) * xn, sy = (y - hit.rect.y) * xn;
+    // hit.rect is in the hit's own space (world for content, glass for layer
+    // trees); re-apply the camera offset the hit was made with.
+    const sx = (x + hit.camX - hit.rect.x) * xn, sy = (y + hit.camY - hit.rect.y) * xn;
     if (surfaceRec)
       d.ctx.events.wl_data_device.send_enter(device, serial, surfaceRec.resource, sx, sy, offer);
   } else if (d.focusDevice && !d.focusDevice.destroyed) {
     const surfaceRec = d.focusSurfaceId !== null
       ? d.ctx.state.surfacesById?.get(d.focusSurfaceId) : null;
     const xn = surfaceRec?.role === "xwayland" ? (d.ctx.state.xwaylandScale ?? 1) : 1;
-    const sx = (x - hit.rect.x) * xn, sy = (y - hit.rect.y) * xn;
+    const sx = (x + hit.camX - hit.rect.x) * xn, sy = (y + hit.camY - hit.rect.y) * xn;
     d.ctx.events.wl_data_device.send_motion(d.focusDevice, 0, sx, sy);
   }
 }

@@ -185,6 +185,13 @@ export interface PluginWindows extends PluginWindowObserver {
   // plugin uses it to multiplex per-output workspace stacks.
   setOutputStack(outputId: number, ids: number[] | null): Promise<void>;
 
+  // Set the output's content camera (docs/canvas-design.md §4): the output
+  // renders world-space content starting at (arrangement origin + (x, y)).
+  // (0, 0) restores identity (the default). Purely optical -- no relayout;
+  // layer-shell, the cursor, and layer-rooted popups stay glass-anchored.
+  // Applies to render, hit-testing, damage, and output residency together.
+  setOutputCamera(outputId: number, x: number, y: number): Promise<void>;
+
   // Explicit focus override; bypasses the focus plugin's decide()
   // (core-plugin-api.md §1). null clears. For policy-mediated focus
   // changes, emit an event the focus plugin observes instead.
@@ -378,6 +385,17 @@ export function createPluginWindows(
         }
       }
       await endpoint.request("windows.set-output-stack", { outputId, ids });
+    },
+
+    async setOutputCamera(outputId, x, y): Promise<void> {
+      if (typeof outputId !== "number") {
+        throw new TypeError("setOutputCamera outputId must be a number");
+      }
+      if (typeof x !== "number" || !Number.isFinite(x)
+        || typeof y !== "number" || !Number.isFinite(y)) {
+        throw new TypeError("setOutputCamera x/y must be finite numbers");
+      }
+      await endpoint.request("windows.set-output-camera", { outputId, x, y });
     },
 
     async focus(id): Promise<void> {

@@ -33,6 +33,11 @@ interface Entry {
 
 export class OutputDamageMap {
   private entries = new Map<number, Entry>();
+  // Per-output content-camera offset, mirrored from the compositor. World-
+  // space damage rects partition against each output's camera view rect
+  // (bounds shifted by this); output-anchored rects use the plain bounds.
+  // Absent = identity.
+  private cameras = new Map<number, { x: number; y: number }>();
   // Per-output dirty bit. Set by every damageRect/full call for an output
   // the dirty signal touches; cleared by clearDirty(outputId) on successful
   // present. Independent of the per-slot damage rings: the rings answer
@@ -91,26 +96,48 @@ export class OutputDamageMap {
 
   // Union a global-logical-space rect into the rings of every output it
   // overlaps, clipping the rect into each output's local space first.
-  // Outside-the-union rects (no overlap) are silent no-ops.
-  damageRect(gx: number, gy: number, w: number, h: number): void {
+  // Outside-the-union rects (no overlap) are silent no-ops. `anchored`
+  // rects are positioned relative to the output's glass (cursor, layer
+  // shell) and clip against the plain bounds; world rects clip against
+  // the camera view rect (bounds shifted by the output's camera).
+  damageRect(gx: number, gy: number, w: number, h: number, anchored = false): void {
     if (w <= 0 || h <= 0) return;
     const gx1 = gx + w;
     const gy1 = gy + h;
     for (const e of this.entries.values()) {
       const b = e.bounds;
-      const lx0 = Math.max(gx,  b.logicalX);
-      const ly0 = Math.max(gy,  b.logicalY);
-      const lx1 = Math.min(gx1, b.logicalX + b.logicalWidth);
-      const ly1 = Math.min(gy1, b.logicalY + b.logicalHeight);
+      const cam = anchored ? undefined : this.cameras.get(b.outputId);
+      const bx = b.logicalX + (cam ? cam.x : 0);
+      const by = b.logicalY + (cam ? cam.y : 0);
+      const lx0 = Math.max(gx,  bx);
+      const ly0 = Math.max(gy,  by);
+      const lx1 = Math.min(gx1, bx + b.logicalWidth);
+      const ly1 = Math.min(gy1, by + b.logicalHeight);
       if (lx1 <= lx0 || ly1 <= ly0) continue;
-      // Translate from global to this output's local space (origin = its
-      // logical top-left). OutputDamageRing.damageRect itself clips to
-      // setBounds, so a slight overflow is fine; we just hand it the
-      // already-clipped local rect.
-      e.ring.damageRect(lx0 - b.logicalX, ly0 - b.logicalY,
-                        lx1 - lx0, ly1 - ly0);
+      // Translate to this output's local space (origin = the view rect's
+      // top-left). OutputDamageRing.damageRect itself clips to setBounds,
+      // so a slight overflow is fine; we just hand it the already-clipped
+      // local rect.
+      e.ring.damageRect(lx0 - bx, ly0 - by, lx1 - lx0, ly1 - ly0);
       this.dirty.add(b.outputId);
     }
+  }
+
+  // Mirror one output's content camera (identity = (0, 0)). A camera change
+  // repositions every world rect relative to the output; callers follow up
+  // with fullOutput so the whole view repaints.
+  setCamera(outputId: number, x: number, y: number): void {
+    if (x === 0 && y === 0) this.cameras.delete(outputId);
+    else this.cameras.set(outputId, { x, y });
+  }
+
+  // Clear damage state on a single output (its ring's next take() returns
+  // full) and mark it dirty. Unknown outputIds are no-ops.
+  fullOutput(outputId: number): void {
+    const e = this.entries.get(outputId);
+    if (!e) return;
+    e.ring.full();
+    this.dirty.add(outputId);
   }
 
   // True iff `outputId` has work to draw this vblank: a damageRect/full

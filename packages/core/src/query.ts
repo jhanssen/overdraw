@@ -22,6 +22,10 @@ export interface OutputSummary {
   width: number;
   height: number;
   scale: number;
+  // Content-camera offset (docs/canvas-design.md §4). (0, 0) = identity:
+  // the output shows the world at its arrangement position.
+  cameraX: number;
+  cameraY: number;
 }
 
 export interface StateSnapshot {
@@ -73,6 +77,8 @@ export function queryState(state: CompositorState): StateSnapshot {
           x: o.rect.x, y: o.rect.y,
           width: o.rect.width, height: o.rect.height,
           scale: o.scale,
+          cameraX: state.outputCameras?.get(o.id)?.x ?? 0,
+          cameraY: state.outputCameras?.get(o.id)?.y ?? 0,
         }))
     : [];
 

@@ -82,6 +82,7 @@ export function createWindowsBroker(deps: WindowsBrokerDeps): WindowsBroker {
     if (method === "windows.get") return handleGet(params);
     if (method === "windows.list") return wm.listSnapshots();
     if (method === "windows.set-output-stack") return handleSetOutputStack(params);
+    if (method === "windows.set-output-camera") return handleSetOutputCamera(params);
     if (method === "windows.focus") return handleFocus(params);
     if (method === "windows.request-focus-decision") return handleRequestFocusDecision(params);
     if (method === "windows.set-opacity") return handleSetOpacity(params);
@@ -305,6 +306,34 @@ export function createWindowsBroker(deps: WindowsBrokerDeps): WindowsBroker {
     // clients re-render at the new size), avoiding a frame or two where
     // a moved window shows scaled at its old size on the new tile.
     state.relayout?.("reorder");
+    return null;
+  }
+
+  function handleSetOutputCamera(p: unknown): null {
+    if (!p || typeof p !== "object") {
+      throw new Error("windows.set-output-camera: malformed payload");
+    }
+    const { outputId, x, y } = p as { outputId?: unknown; x?: unknown; y?: unknown };
+    if (typeof outputId !== "number"
+      || typeof x !== "number" || !Number.isFinite(x)
+      || typeof y !== "number" || !Number.isFinite(y)) {
+      throw new Error("windows.set-output-camera: malformed payload");
+    }
+    if (!compositor.setOutputCamera) {
+      throw new Error("windows.set-output-camera: not supported by this compositor");
+    }
+    // state.outputCameras is the core-side mirror the seat's pointer->world
+    // transform and the popup constraint solver read; the compositor applies
+    // the same value to render/damage/residency. One writer keeps them
+    // agreeing.
+    state.outputCameras ??= new Map();
+    if (x === 0 && y === 0) state.outputCameras.delete(outputId);
+    else state.outputCameras.set(outputId, { x, y });
+    compositor.setOutputCamera(outputId, x, y);
+    // The world moved under a stationary pointer: refresh pointer focus so
+    // enter/leave and hover state track the surface actually under the
+    // cursor (same rationale as the workspace-changed repick above).
+    state.seat?.repickPointer();
     return null;
   }
 

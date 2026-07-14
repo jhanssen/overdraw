@@ -21,7 +21,7 @@ import { KEYBOARD_EVENT } from "../events/window-bus.js";
 import { markWindowChanged } from "./window-changes.js";
 import type { FocusDriver } from "./focus-driver.js";
 import { hitTestSurfaceTree, type SurfaceHit } from "../surface-hit-test.js";
-import { popupOutputOrigin } from "./xdg_popup.js";
+import { popupOutputOrigin, popupChainLayerRooted } from "./xdg_popup.js";
 import { dispatchRelativeMotion } from "./zwp_relative_pointer_manager_v1.js";
 import { isPointerLocked, notifyPointerFocus, notifyPointerMotion } from "./zwp_pointer_constraints_v1.js";
 import { releaseDeadVirtualKeyboards } from "./zwp_virtual_keyboard_manager_v1.js";
@@ -89,6 +89,10 @@ export function sweepDestroyedSeatState(
 }
 
 const CAP = seatSig.enums.capability.entries; // { pointer:1, keyboard:2, touch:4 }
+
+// Shared identity camera offset for glass-anchored hits (and outputs with
+// no camera set).
+const CAM_IDENTITY = Object.freeze({ x: 0, y: 0 });
 
 // Geometry offset of a wl_surface's xdg_surface.set_window_geometry,
 // or (0, 0) when none is set. CSD clients (GTK4 etc.) declare a
@@ -318,19 +322,45 @@ export default function makeSeat(ctx: Ctx, driver: FocusDriver): SeatHandler {
   function pick(x: number, y: number): SeatFocus | null {
     const above = pickLayer(x, y, ["overlay", "top"]);
     if (above) return above;
-    const popup = pickPopup(x, y);
+    // Content surfaces live in world coordinates: the pointer's glass
+    // position maps into the world through the content camera of the
+    // output it is on (identity camera = same point). Layer-shell trees
+    // (and popups rooted at them) stay in glass coordinates. This mirrors
+    // the render side's cameraExempt gating -- the two must agree or
+    // clicks land beside pixels.
+    const cam = contentCameraAt(x, y);
+    const popup = pickPopup(x, y, cam);
     if (popup) return popup;
-    const win = pickToplevel(x, y);
+    const win = pickToplevel(x + cam.x, y + cam.y, cam);
     if (win) return win;
     return pickLayer(x, y, ["bottom", "background"]);
+  }
+
+  // The content camera of the output under a glass-space point. Identity
+  // when the point is on no output or no camera is set.
+  function contentCameraAt(x: number, y: number): { x: number; y: number } {
+    const cams = ctx.state.outputCameras;
+    if (!cams || cams.size === 0 || !ctx.state.outputs) return CAM_IDENTITY;
+    for (const o of ctx.state.outputs.values()) {
+      const p = o.logicalPosition;
+      const s = o.logicalSize;
+      if (x >= p.x && x < p.x + s.width && y >= p.y && y < p.y + s.height) {
+        return cams.get(o.id) ?? CAM_IDENTITY;
+      }
+    }
+    return CAM_IDENTITY;
   }
 
   // Build a SeatFocus from a SurfaceHit produced by hitTestSurfaceTree.
   // The accepting surface may be the candidate root or any subsurface
   // descendant; either way, the hit carries the output-space rect of
   // the surface that actually accepted, so motion events can compute
-  // surface-local coords against the right surface.
-  function toFocus(hit: SurfaceHit, rootSurfaceId: number): SeatFocus {
+  // surface-local coords against the right surface. `cam` is the camera
+  // offset the pointer was shifted by for this hit (identity for glass-
+  // anchored candidates); stored so local-coord math can re-apply it.
+  function toFocus(
+    hit: SurfaceHit, rootSurfaceId: number, cam: { x: number; y: number },
+  ): SeatFocus {
     const clientId = ctx.addon.clientId(hit.surfaceRec.resource);
     return {
       surfaceId: hit.surfaceRec.id,
@@ -338,6 +368,8 @@ export default function makeSeat(ctx: Ctx, driver: FocusDriver): SeatHandler {
       rootSurfaceId,
       clientId,
       rect: hit.rect,
+      camX: cam.x,
+      camY: cam.y,
     };
   }
 
@@ -356,9 +388,11 @@ export default function makeSeat(ctx: Ctx, driver: FocusDriver): SeatHandler {
     const goff = surfaceGeometryOffset(ctx, hit.surfaceRec.resource);
     const hitRole = ctx.state.surfacesById?.get(hit.surfaceId)?.role;
     const xn = hitRole === "xwayland" ? (ctx.state.xwaylandScale ?? 1) : 1;
+    // hit.rect is in the hit's own space (world for content, glass for
+    // layer trees); re-apply the camera offset the hit was made with.
     return {
-      sx: ((x - hit.rect.x) + goff.x) * xn,
-      sy: ((y - hit.rect.y) + goff.y) * xn,
+      sx: ((x + hit.camX - hit.rect.x) + goff.x) * xn,
+      sy: ((y + hit.camY - hit.rect.y) + goff.y) * xn,
     };
   }
 
@@ -367,7 +401,10 @@ export default function makeSeat(ctx: Ctx, driver: FocusDriver): SeatHandler {
   // turn. The acceptor on windowAt rejects toplevels whose ROOT input
   // region drops the point so windowAt keeps walking; the subsurface-
   // aware tree hit happens once windowAt returns a candidate.
-  function pickToplevel(x: number, y: number): SeatFocus | null {
+  // `x`/`y` are already world coordinates (the caller applied `cam`).
+  function pickToplevel(
+    x: number, y: number, cam: { x: number; y: number },
+  ): SeatFocus | null {
     const wm = ctx.state.wm;
     if (!wm) return null;
     // walked: per windowAt's accept callback, the toplevel is a
@@ -384,14 +421,16 @@ export default function makeSeat(ctx: Ctx, driver: FocusDriver): SeatHandler {
       return true;
     });
     if (!win || !bestHit) return null;
-    return toFocus(bestHit, bestRootId);
+    return toFocus(bestHit, bestRootId, cam);
   }
 
   // Topmost mapped popup under the point, walking each popup's full
   // tree. Popups are above their parent toplevel; within the popup map
   // insertion order approximates parent-before-child, so iterate in
   // REVERSE so a child popup (a submenu) wins over its parent popup.
-  function pickPopup(x: number, y: number): SeatFocus | null {
+  function pickPopup(
+    x: number, y: number, cam: { x: number; y: number },
+  ): SeatFocus | null {
     const popups = ctx.state.popups;
     if (!popups || popups.size === 0) return null;
     const ordered = [...popups.values()].reverse();
@@ -407,8 +446,12 @@ export default function makeSeat(ctx: Ctx, driver: FocusDriver): SeatHandler {
         width: pr.rect.width,
         height: pr.rect.height,
       };
-      const hit = hitTestSurfaceTree(ctx.state, root, rect, x, y);
-      if (hit) return toFocus(hit, root.id);
+      // A toplevel-rooted popup's rect is in world coordinates (its parent
+      // pans with the camera); a layer-rooted chain is glass-anchored.
+      // Test each popup with the point in its own space.
+      const pcam = popupChainLayerRooted(ctx.state, pr) ? CAM_IDENTITY : cam;
+      const hit = hitTestSurfaceTree(ctx.state, root, rect, x + pcam.x, y + pcam.y);
+      if (hit) return toFocus(hit, root.id, pcam);
     }
     return null;
   }
@@ -436,7 +479,7 @@ export default function makeSeat(ctx: Ctx, driver: FocusDriver): SeatHandler {
         const root = rec.surface;
         if (root.resource.destroyed) continue;
         const hit = hitTestSurfaceTree(ctx.state, root, r, x, y);
-        if (hit) return toFocus(hit, root.id);
+        if (hit) return toFocus(hit, root.id, CAM_IDENTITY);
       }
     }
     return null;
@@ -473,7 +516,8 @@ export default function makeSeat(ctx: Ctx, driver: FocusDriver): SeatHandler {
   // Build a SeatFocus for a surface id, handling WM toplevels (rect via
   // wm.getSnapshot), layer-shell surfaces (rect via state.layerSurfaces),
   // and xwayland override-redirect overlays (rect via state.overrideRedirects).
-  // Returns null when the surface is unknown or unmapped.
+  // Returns null when the surface is unknown or unmapped. These targets
+  // carry keyboard focus (no pointer-local math), so camX/camY stay 0.
   function focusTargetFor(surfaceId: number): SeatFocus | null {
     const s = ctx.state.surfacesById?.get(surfaceId);
     if (!s || s.resource.destroyed) return null;
@@ -481,7 +525,7 @@ export default function makeSeat(ctx: Ctx, driver: FocusDriver): SeatHandler {
     // Layer-shell first: the WM doesn't know about these.
     if (s.layerSurface?.rect) {
       const r = s.layerSurface.rect;
-      return { surfaceId, surfaceRec: s, rootSurfaceId: surfaceId, clientId, rect: { x: r.x, y: r.y, width: r.width, height: r.height } };
+      return { surfaceId, surfaceRec: s, rootSurfaceId: surfaceId, clientId, rect: { x: r.x, y: r.y, width: r.width, height: r.height }, camX: 0, camY: 0 };
     }
     // Override-redirect xwayland overlay: rect tracked separately from the
     // WM (the overlay isn't in wm.state.windows). 3.4 will mirror focus to
@@ -490,12 +534,12 @@ export default function makeSeat(ctx: Ctx, driver: FocusDriver): SeatHandler {
     if (s.role === "xwayland") {
       const orRect = ctx.state.overrideRedirects?.get(surfaceId);
       if (orRect) {
-        return { surfaceId, surfaceRec: s, rootSurfaceId: surfaceId, clientId, rect: { ...orRect } };
+        return { surfaceId, surfaceRec: s, rootSurfaceId: surfaceId, clientId, rect: { ...orRect }, camX: 0, camY: 0 };
       }
     }
     const snap = ctx.state.wm?.getSnapshot(surfaceId);
     if (!snap) return null;
-    return { surfaceId, surfaceRec: s, rootSurfaceId: surfaceId, clientId, rect: snap.rect };
+    return { surfaceId, surfaceRec: s, rootSurfaceId: surfaceId, clientId, rect: snap.rect, camX: 0, camY: 0 };
   }
 
   // Topmost mapped layer surface in protocol layers top|overlay with

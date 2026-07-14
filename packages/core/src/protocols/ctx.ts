@@ -355,6 +355,16 @@ export interface CompositorSink {
   // overlay). Plugin overlays/decorations use this. Optional so the native sink
   // (if ever used) need not implement it.
   setLayerSurfaces?(layer: Layer, ids: number[]): void;
+  // Per-output content camera (docs/canvas-design.md §4): the output renders
+  // the world starting at (arrangement origin + camera). (0, 0) = identity.
+  // Applies to world-space surfaces only; layer-shell, the cursor, and
+  // output-anchored surfaces stay glass-positioned. Optional (GPU-free test
+  // sinks omit it).
+  setOutputCamera?(outputId: number, x: number, y: number): void;
+  // Mark a surface as glass-positioned (ignores the content camera) even
+  // though it rides the content stack: popups parented to layer-shell
+  // surfaces. Optional (GPU-free test sinks omit it).
+  setSurfaceOutputAnchored?(id: number, anchored: boolean): void;
   // Install a pre-wrapped wire texture as surface `id`'s sampled texture (plugin
   // overlay consumer texture). Optional (JS compositor only).
   setSurfaceTexture?(id: number, tex: GPUTexture, w: number, h: number): void;
@@ -912,6 +922,11 @@ export interface CompositorState {
   // process; never includes the virtual fallback (that lives in
   // `fallbackOutput`).
   outputs?: Map<number, OutputRecord>;
+  // Per-output content camera (docs/canvas-design.md §4), keyed by outputId.
+  // Absent entry = identity. Single writer: the camera SDK broker, which
+  // also mirrors each change into the compositor (setOutputCamera). Readers:
+  // the seat's pointer->world transform and output-membership derivation.
+  outputCameras?: Map<number, { x: number; y: number }>;
   // The virtual fallback output. Always present once installProtocols runs;
   // never scanned out; deliberately NOT a member of `outputs` so every
   // iteration over the live output map (render passes, wl_output globals,
@@ -1212,6 +1227,13 @@ export interface SeatFocus {
   rootSurfaceId: number;
   clientId: number;
   rect: { x: number; y: number; width: number; height: number };
+  // The content-camera offset that was added to the pointer's glass position
+  // when this hit was made: `rect` for a world-space surface (toplevel tree)
+  // is in world coords, so surface-local math is (glassX + camX - rect.x).
+  // 0 for glass-anchored hits (layer shell, layer-rooted popups) and under
+  // identity cameras.
+  camX: number;
+  camY: number;
 }
 
 export interface SeatState {

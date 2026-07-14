@@ -32,7 +32,8 @@ function mkCtx({ focusSurfaceId = null, rect = { x: 0, y: 0, width: 100, height:
     state: {
       surfaces, regions,
       seat: {
-        focus: focusSurfaceId === null ? null : { surfaceId: focusSurfaceId, rect },
+        focus: focusSurfaceId === null ? null
+          : { surfaceId: focusSurfaceId, rect, camX: 0, camY: 0 },
         pointerPosition: () => ptr,
       },
     },
