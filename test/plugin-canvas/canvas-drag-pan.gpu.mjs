@@ -8,7 +8,8 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 
 import {
-  setupCompositor, canRunGpu, pixelAt, pixelMatches, settled, pointerMotion,
+  setupCompositor, canRunGpu, pixelAt, pixelMatches, settled,
+  pointerMotion, pointerButton,
 } from "../harness.mjs";
 
 const skip = canRunGpu() ? false : "needs GPU (no render node / dawn.node)";
@@ -74,8 +75,14 @@ test("drag-pan: motion pans the camera; release settles + repicks", { skip }, as
     // B composites through the live camera (the union stack rides).
     await readUntil(c, (p) => pixelMatches(pixelAt(p, OUT.width, 640, 360), argbToBgra(cB), 4));
 
-    // Release: the settled write sweeps residency; roaming continues at
-    // the dragged position; the shown workspace never changed.
+    // The BUTTON release ends the drag (endOnButtonUp) -- releasing the
+    // button while the binding's modifier is still held must stop the
+    // pan. The settled write sweeps residency; roaming continues at the
+    // dragged position; the shown workspace never changed.
+    pointerButton(c.addon, 0x112 /* BTN_MIDDLE */, false);
+    await settled(() => c.state.seat.grab, (g) => g === null, { what: "grab ended on button-up" });
+    // The binding's releaseAction still fires at chord release; it must
+    // be an idempotent no-op against the already-ended grab.
     await c.runtime.invokeAction("workspace.pan-grab-end", {});
     assert.equal(c.state.seat.grab, null, "grab released");
     await settled(() => enteredOf(c, bId),
@@ -92,6 +99,38 @@ test("drag-pan: motion pans the camera; release settles + repicks", { skip }, as
       (x) => x === 0, { what: "unfit re-docks at slot 0" });
     await readUntil(c, (p) => pixelMatches(pixelAt(p, OUT.width, 640, 360), argbToBgra(cA), 4));
   } finally {
+    await c.teardown();
+  }
+});
+
+test("drag-pan: a chain-consumed button release still ends the grab", { skip }, async () => {
+  const c = await setupCompositor({ headless: OUT, config: { canvas: { world: true } } });
+  try {
+    const a = c.spawnClient([FILL, "--color", "ff3030c0"]);
+    await a.ready;
+    await c.waitFor(c.query, (s) => s.windows.length === 1, { what: "A mapped" });
+
+    // A held binding chord consumes the button-up (the release
+    // participates in the held instance: button lifts, modifier still
+    // down). Stub that exact behavior; the seat's endOnButtonUp must
+    // fire regardless -- this is the "keeps panning with Mod held" bug.
+    c.state.bindingChain = {
+      dispatchPress: () => ({ consume: false }),
+      dispatchRelease: () => ({ consume: true }),
+    };
+    pointerMotion(c.addon, 800, 360);
+    await c.runtime.invokeAction("workspace.pan-grab", {});
+    assert.equal(c.state.seat.grab?.kind, "camera-pan");
+    pointerMotion(c.addon, 400, 360);
+    await settled(() => c.query().outputs[0].cameraX,
+      (x) => x === 400, { what: "camera panned" });
+
+    pointerButton(c.addon, 0x112 /* BTN_MIDDLE */, false);
+    await settled(() => c.state.seat.grab, (g) => g === null,
+      { what: "grab ended despite the consumed release" });
+    assert.equal(c.query().outputs[0].cameraX, 400, "camera parked where dragged");
+  } finally {
+    c.state.bindingChain = null;
     await c.teardown();
   }
 });

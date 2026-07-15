@@ -894,24 +894,24 @@ export default function makeSeat(ctx: Ctx, driver: FocusDriver): SeatHandler {
             consumed = r.consume;
           }
         }
+        // Protocol/gesture grabs set endOnButtonUp: the seat auto-ends
+        // the grab on the next button release. This must run BEFORE the
+        // consumed early-return -- the binding chain consumes a release
+        // that participates in a held chord instance (button up, modifier
+        // still down), and a drag gesture must end on the button lift
+        // regardless. Hotkey move/resize grabs leave it false (the
+        // binding chain's release callback ends them via the
+        // window.end-grab action at chord release).
+        if (seat.grab && !ev.pressed && seat.grab.endOnButtonUp) {
+          seat.endGrab();
+        }
         if (consumed) return;
 
         // While a grab is active, button events are not forwarded to the
         // client (the user is manipulating compositor geometry, not the
         // client). The binding chain still saw the event above, so the
         // grab's release callback gets to fire normally.
-        //
-        // Protocol-initiated grabs (xdg_toplevel.move/.resize) set
-        // endOnButtonUp: the seat auto-ends the grab on the next
-        // button release. Hotkey-initiated grabs leave it false (the
-        // binding chain's release callback ends them via the
-        // window.end-grab action).
-        if (seat.grab) {
-          if (!ev.pressed && seat.grab.endOnButtonUp) {
-            seat.endGrab();
-          }
-          return;
-        }
+        if (seat.grab) return;
 
         if (!seat.focus) return;
         const serial = ctx.state.serial();

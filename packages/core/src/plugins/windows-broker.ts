@@ -416,6 +416,13 @@ export function createWindowsBroker(deps: WindowsBrokerDeps): WindowsBroker {
       kind: "camera-pan",
       outputId: (p as { outputId: number }).outputId,
       lastX: pos.x, lastY: pos.y,
+      // A drag gesture ends when the button lifts, not when the whole
+      // binding chord releases -- releasing the button while the
+      // modifier is still held must stop the pan (and lets a held
+      // modifier chain repeated grab-slide-release strokes). The
+      // binding's releaseAction (pan-grab-end) still fires at chord
+      // release as an idempotent backstop.
+      endOnButtonUp: true,
     });
     return !!seat.grab;
   }
