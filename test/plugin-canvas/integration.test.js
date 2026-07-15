@@ -55,6 +55,9 @@ async function withCanvasPlugin(fn, opts = {}) {
   const wm = createWm(sink,
     [{ id: 0, rect: { x: 0, y: 0, width: 800, height: 600 }, scale: 1 }],
     {
+      // The plugin bus makes the WM's window.committed/relayout emits
+      // visible to the plugin under test, as in production.
+      pluginBus,
       layoutDriverFactory: (target, snapshot) => ({
         schedule() { layoutSnapshots.push(snapshot()); },
         settled() { return Promise.resolve(); },
@@ -934,6 +937,26 @@ test('elastic: islands grow with members and shove the row; layout hint set', as
     sink.cameraCalls.length = 0;
     await call(rt, 'show', [2, 0]);
     assert.deepEqual(sink.cameraCalls.at(-1), { outputId: 0, x: 1328, y: 0, zoom: 1 });
+  }, { canvas: { world: true, elastic: true } });
+});
+
+test('elastic: only tiled members take columns (floating never grows the strip)', async () => {
+  await withCanvasPlugin(async (h) => {
+    const { rt, islands, wm, addWindow } = h;
+    addWindow(101);
+    await settle();
+    addWindow(102);
+    await settle();
+    addWindow(103);
+    await settle();   // 3 managed -> strip 1200
+    const list = await call(rt, 'list', [0]);
+    assert.equal(islands().find((i) => i.id === list[0].handle).rect.width, 1200);
+
+    // Floating one member shrinks the strip to 2 columns.
+    await wm.propose(103, { tiling: 'floating' }, 'user-input');
+    await settle();
+    assert.equal(islands().find((i) => i.id === list[0].handle).rect.width, 800,
+      '2 columns of 400 -> viewport-width island');
   }, { canvas: { world: true, elastic: true } });
 });
 

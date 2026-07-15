@@ -356,6 +356,22 @@ export default async function init(
       // pointer/keyboard is still anchored on that output.
     }
   });
+  // Lane changes re-solve the world: a member floating/unfloating gains
+  // or loses its elastic column, and an exclusive (maximize/fullscreen)
+  // member collapses its strip to the viewport. window.committed is the
+  // observe-only signal for behavioral-state commits; only the fields
+  // that feed elasticWidth trigger a republish.
+  sdk.events.subscribe("window.committed", (_name, payload) => {
+    if (!worldMode || !payload || typeof payload !== "object") return;
+    const p = payload as { surfaceId?: unknown; changed?: unknown };
+    if (typeof p.surfaceId !== "number" || !Array.isArray(p.changed)) return;
+    if (!p.changed.some((f) => f === "tiling" || f === "exclusive" || f === "visible")) {
+      return;
+    }
+    if (!state.surfaceToHandle.has(p.surfaceId)) return;
+    void publishWorld();
+  });
+
   // Elastic strips: after each layout pass, if the focused window's rect
   // moved (retile, new column at the strip's head), keep it inside the
   // docked view. stack.relayout carries the fresh post-layout rects, so
@@ -812,7 +828,11 @@ export default async function init(
     let cols = 0;
     for (const id of members) {
       const ws = snapById.get(id)?.windowState;
-      if (!ws) { cols++; continue; }   // unknown lane (pre-map): assume a column
+      // Only demonstrably TILED windows take a column: floating members
+      // never grow the strip, and a member without a WM snapshot counts
+      // for nothing -- undersizing (viewport-width island) is always
+      // recoverable, oversizing stretches windows past the output.
+      if (!ws) continue;
       if (!ws.visible) continue;
       if (ws.exclusive !== "none") return g.width;
       if (ws.tiling === "managed") cols++;
@@ -834,8 +854,13 @@ export default async function init(
       if (!state.byHandle.has(h)) growthByHandle.delete(h);
     }
     // Elastic growth reads each member's lane from a windows snapshot.
+    // Any source of elasticity counts: the config default, runtime
+    // set-elastic overrides, AND per-name declarations (canvas.workspaces
+    // entries) -- forgetting the last starved declared-elastic strips of
+    // their snapshots and every member counted as nothing.
     const anyElastic = elasticDefault
-      || [...growthByHandle.values()].some((v) => v);
+      || [...growthByHandle.values()].some((v) => v)
+      || [...elasticByName.values()].some((v) => v);
     const snapById = new Map<number, WindowSnapshotLike>();
     if (anyElastic) {
       for (const s of await sdk.windows.list()) snapById.set(s.surfaceId, s);
