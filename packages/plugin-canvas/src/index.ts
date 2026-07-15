@@ -29,7 +29,7 @@ import type {
   WorkspaceAPI, WorkspaceHandle, WorkspaceIndex, WorkspaceSnapshot,
 } from "@overdraw/workspace-types";
 import type {
-  PluginSdkShape, SceneHandleLike, PluginTransitionsLike,
+  PluginSdkShape, SceneHandleLike, PluginTransitionsLike, WindowSnapshotLike,
 } from "@overdraw/plugin-sdk-types";
 import type { EasingSpec, TweenSpec } from "@overdraw/animation-types";
 import * as reg from "@overdraw/plugin-workspace-default/registry";
@@ -124,6 +124,25 @@ export default async function init(
   // the camera. Off = workspace parity.
   const worldMode = !!config?.canvas && typeof config.canvas === "object"
     && (config.canvas as { world?: unknown }).world === true;
+
+  // Elastic strips (canvas-design.md §5): every workspace island grows
+  // along its row as managed members exceed the viewport -- one column of
+  // `column` × viewport width per managed member, tiled by the layout
+  // provider's columns mode -- and the docked camera scrolls within the
+  // strip to follow focus. Off = fixed islands (classic compression).
+  const elasticRaw = worldMode
+    ? (config?.canvas as { elastic?: unknown }).elastic : undefined;
+  const elasticMode = elasticRaw === true
+    || (typeof elasticRaw === "object" && elasticRaw !== null);
+  let colFraction = 0.5;
+  if (typeof elasticRaw === "object" && elasticRaw !== null) {
+    const c = (elasticRaw as { column?: unknown }).column;
+    if (typeof c === "number" && Number.isFinite(c)) {
+      colFraction = Math.min(1, Math.max(0.1, c));
+    }
+  }
+  // Camera scroll animation within a strip (ms).
+  const SCROLL_MS = 150;
 
   // Snapshot-based show transitions capture arrangement-anchored scenes
   // and cannot represent a world-docked view; in world mode a `transition`
@@ -262,6 +281,23 @@ export default async function init(
             void applyEffects(r.sideEffects, new Set(["requestFocusDecision"]));
           }
         }
+        // Elastic strips: keep the newly focused window inside the
+        // docked view -- scroll the camera minimally within its island.
+        if (rec && elasticMode && !override.has(rec.outputId)
+            && state.shownByOutput.get(rec.outputId) === handle) {
+          const sid = p.surfaceId;
+          void (async () => {
+            const snap = await sdk.windows.get(sid);
+            // A window no layout pass has placed yet carries a
+            // degenerate placeholder rect; its retile will land through
+            // the stack.relayout trigger instead.
+            if (!snap?.outer || snap.outer.width <= 0) return;
+            if (focusedSurfaceId !== sid) return;
+            if (ensureVisibleScroll(rec.outputId, handle, snap.outer) !== null) {
+              await applyScroll(rec.outputId);
+            }
+          })();
+        }
       }
     } else if (focusedSurfaceId === p.surfaceId) {
       focusedSurfaceId = null;
@@ -269,6 +305,30 @@ export default async function init(
       // pointer/keyboard is still anchored on that output.
     }
   });
+  // Elastic strips: after each layout pass, if the focused window's rect
+  // moved (retile, new column at the strip's head), keep it inside the
+  // docked view. stack.relayout carries the fresh post-layout rects, so
+  // this needs no extra windows.get round trip.
+  sdk.events.subscribe("stack.relayout", (_name, payload) => {
+    if (!worldMode || !elasticMode || focusedSurfaceId === null) return;
+    if (!payload || typeof payload !== "object") return;
+    const wins = (payload as { windows?: unknown }).windows;
+    if (!Array.isArray(wins)) return;
+    const entry = wins.find((w): w is { newOuter: { x: number; width: number } } =>
+      isObj(w) && w.surfaceId === focusedSurfaceId && isObj(w.newOuter)
+      && typeof (w.newOuter as { width?: unknown }).width === "number"
+      && (w.newOuter as { width: number }).width > 0);
+    if (!entry) return;
+    const handle = state.surfaceToHandle.get(focusedSurfaceId);
+    if (handle === undefined) return;
+    const rec = state.byHandle.get(handle);
+    if (!rec || override.has(rec.outputId)) return;
+    if (state.shownByOutput.get(rec.outputId) !== handle) return;
+    if (ensureVisibleScroll(rec.outputId, handle, entry.newOuter) !== null) {
+      void applyScroll(rec.outputId);
+    }
+  });
+
   // Guard against hotplug events that arrive between subscribe() and reg.init
   // returning. reg.init runs synchronously right below; in practice nothing
   // emits during that window, but the closure references `state` so a hotplug
@@ -391,6 +451,16 @@ export default async function init(
   // their slots and arrive pre-sized on show); the draw stack still gates
   // visibility. `show` docks the camera on the shown island's rect.
   const slotByHandle = new Map<WorkspaceHandle, number>();
+  // Per-workspace scroll offset within an elastic island wider than the
+  // viewport (world px from the island's left edge; clamped on use, so a
+  // shrinking island self-corrects).
+  const scrollByHandle = new Map<WorkspaceHandle, number>();
+  // Row arrangement computed by publishWorld: each workspace's island
+  // rect, keyed per output. camXFor / fitCameraFor read this cache
+  // synchronously; publishWorld refreshes it on every structural change.
+  const rowRectsByOutput = new Map<
+    number,
+    Map<WorkspaceHandle, { x: number; y: number; width: number; height: number }>>();
   const lastCamByOutput = new Map<number, number>();
   // Outputs with a camera flight in progress, keyed to the flight's token.
   // While an output flies, publishWorld skips docking its camera (the
@@ -477,9 +547,7 @@ export default async function init(
     let minX = Infinity;
     let maxX = -Infinity;
     for (const h of handles) {
-      const slot = slotByHandle.get(h);
-      if (slot === undefined) continue;
-      const r = slotRect(outputId, slot);
+      const r = islandRectFor(outputId, h);
       if (!r) continue;
       minX = Math.min(minX, r.x);
       maxX = Math.max(maxX, r.x + r.width);
@@ -491,6 +559,72 @@ export default async function init(
       y: (g.height - g.height / zoom) / 2,
       zoom,
     };
+  }
+
+  // Minimal scroll bringing `rect` fully into the docked viewport of
+  // `handle`'s island (left edge wins for windows wider than the view).
+  // Updates scrollByHandle; returns the new scroll, or null when the
+  // current view already contains the rect.
+  function ensureVisibleScroll(
+    outputId: number, handle: WorkspaceHandle,
+    rect: { x: number; width: number },
+  ): number | null {
+    const g = outputGeom.get(outputId);
+    const isl = islandRectFor(outputId, handle);
+    if (!g || !isl) return null;
+    const maxScroll = Math.max(0, isl.width - g.width);
+    const prev = scrollByHandle.get(handle) ?? 0;
+    let s = Math.min(maxScroll, Math.max(0, prev));
+    if (rect.x + rect.width > isl.x + s + g.width) {
+      s = rect.x + rect.width - g.width - isl.x;
+    }
+    if (rect.x < isl.x + s) s = rect.x - isl.x;
+    s = Math.min(maxScroll, Math.max(0, s));
+    scrollByHandle.set(handle, s);
+    return s !== prev ? s : null;
+  }
+
+  // Move a docked camera to its (re-clamped) scroll position within the
+  // shown island: a short tween (denied tweens -- grabs -- fall back to
+  // the instant write), then one settled write. Overridden / flying
+  // outputs are left alone; their owner re-docks through camXFor, which
+  // reads the same scroll state.
+  async function applyScroll(outputId: number): Promise<void> {
+    if (override.has(outputId) || flying.has(outputId)) return;
+    const shown = state.shownByOutput.get(outputId);
+    if (shown === undefined) return;
+    const target = camXFor(outputId, shown);
+    if (lastCamByOutput.get(outputId) === target) return;
+    if (sdk.animations) {
+      const token = ++flightSeq;
+      flying.set(outputId, token);
+      try {
+        const cur = await sdk.windows.getOutputCamera(outputId);
+        if (cur.x !== target || cur.y !== 0 || cur.zoom !== 1) {
+          const spec: TweenSpec = {
+            type: "tween",
+            target: { kind: "output-camera", outputId },
+            from: cur,
+            to: { x: target, y: 0, zoom: 1 },
+            duration: SCROLL_MS,
+            easing: "ease-in-out" as EasingSpec,
+          };
+          try {
+            await sdk.animations.run(spec);
+          } catch { /* denied (grab active); settle instantly below */ }
+        }
+        if (flying.get(outputId) !== token) return;  // preempted; the winner settles
+        flying.delete(outputId);
+      } finally {
+        if (flying.get(outputId) === token) flying.delete(outputId);
+      }
+    }
+    // Settle against LIVE scroll state: another trigger may have moved
+    // the scroll while the tween flew (it bailed on our flying token and
+    // relies on this settle to land its value).
+    const settleX = camXFor(outputId, shown);
+    lastCamByOutput.set(outputId, settleX);
+    await sdk.windows.setOutputCamera(outputId, settleX, 0);
   }
 
   // Keep each overridden output's union stack (and, for fits, the
@@ -528,10 +662,22 @@ export default async function init(
     }
   }
 
+  function islandRectFor(
+    outputId: number, handle: WorkspaceHandle,
+  ): { x: number; y: number; width: number; height: number } | null {
+    return rowRectsByOutput.get(outputId)?.get(handle) ?? null;
+  }
+
+  // Dock target for a workspace: its island's row origin plus the
+  // clamped scroll offset (elastic islands wider than the viewport
+  // scroll to follow focus; fixed islands always clamp to 0).
   function camXFor(outputId: number, handle: WorkspaceHandle): number {
-    const slot = slotByHandle.get(handle);
     const g = outputGeom.get(outputId);
-    return (slot !== undefined && g) ? slot * (g.width + SLOT_GUTTER) : 0;
+    const r = islandRectFor(outputId, handle);
+    if (!g || !r) return 0;
+    const maxScroll = Math.max(0, r.width - g.width);
+    const s = Math.min(maxScroll, Math.max(0, scrollByHandle.get(handle) ?? 0));
+    return (r.x - g.x) + s;
   }
 
   async function pushStack(outputId: number, ids: number[]): Promise<void> {
@@ -573,40 +719,81 @@ export default async function init(
     return out;
   }
 
-  function slotRect(
-    outputId: number, slot: number,
-  ): { x: number; y: number; width: number; height: number } | null {
-    const g = outputGeom.get(outputId);
-    if (!g) return null;
-    return {
-      x: g.x + slot * (g.width + SLOT_GUTTER),
-      y: g.y,
-      width: g.width,
-      height: g.height,
-    };
+  // Elastic growth policy: each visible managed member takes one column
+  // of colFraction × viewport width; floating members take none. An
+  // exclusive (maximized / fullscreen) member collapses the strip to the
+  // viewport -- the layout hands it the whole tile region, and a
+  // maximize should cover the screen, not a multi-screen strip.
+  function elasticWidth(
+    g: { width: number }, members: ReadonlyArray<number>,
+    snapById: Map<number, WindowSnapshotLike>,
+  ): number {
+    let cols = 0;
+    for (const id of members) {
+      const ws = snapById.get(id)?.windowState;
+      if (!ws) { cols++; continue; }   // unknown lane (pre-map): assume a column
+      if (!ws.visible) continue;
+      if (ws.exclusive !== "none") return g.width;
+      if (ws.tiling === "managed") cols++;
+    }
+    const colW = Math.max(1, Math.round(g.width * colFraction));
+    return Math.max(g.width, cols * colW);
   }
 
   async function publishWorld(): Promise<void> {
     if (!worldMode) return;
-    // Drop slots for destroyed workspaces.
+    // Drop slots + scroll for destroyed workspaces.
     for (const h of [...slotByHandle.keys()]) {
       if (!state.byHandle.has(h)) slotByHandle.delete(h);
+    }
+    for (const h of [...scrollByHandle.keys()]) {
+      if (!state.byHandle.has(h)) scrollByHandle.delete(h);
+    }
+    // Elastic growth reads each member's lane from a windows snapshot.
+    const snapById = new Map<number, WindowSnapshotLike>();
+    if (elasticMode) {
+      for (const s of await sdk.windows.list()) snapById.set(s.surfaceId, s);
     }
     const islands: Array<{
       id: number; contextOutputId: number;
       rect: { x: number; y: number; width: number; height: number } | null;
       members: number[];
+      layout?: { [k: string]: unknown };
     }> = [];
+    rowRectsByOutput.clear();
     for (const [outputId, handles] of state.positionsByOutput) {
       const slots = resolveSlots(handles);
+      const g = outputGeom.get(outputId);
+      // Row arrangement: sticky slot ORDER, per-island widths (viewport
+      // for fixed, column-grown for elastic), cumulative origins with
+      // SLOT_GUTTER between islands. A growing island shoves its
+      // right-hand neighbors along the row -- order-preserving and
+      // monotone (canvas-design.md §6's shove, scoped to one row).
+      const row = new Map<
+        WorkspaceHandle, { x: number; y: number; width: number; height: number }>();
+      if (g) {
+        const ordered = [...handles].sort(
+          (a, b) => (slots.get(a) ?? 0) - (slots.get(b) ?? 0));
+        let x = g.x;
+        for (const h of ordered) {
+          const rec = state.byHandle.get(h);
+          const width = elasticMode && rec
+            ? elasticWidth(g, rec.members, snapById)
+            : g.width;
+          row.set(h, { x, y: g.y, width, height: g.height });
+          x += width + SLOT_GUTTER;
+        }
+      }
+      rowRectsByOutput.set(outputId, row);
       for (const h of handles) {
         const rec = state.byHandle.get(h);
         if (!rec) continue;
         islands.push({
           id: h,
           contextOutputId: outputId,
-          rect: slotRect(outputId, slots.get(h) ?? 0),
+          rect: row.get(h) ?? null,
           members: [...rec.members],
+          ...(elasticMode ? { layout: { mode: "columns" } } : {}),
         });
       }
     }

@@ -1000,13 +1000,29 @@ validated + resolved + consumed by the runtime + hotkey plugin.
   `workspace.bookmark-set/go/delete/list` name camera framings (dock
   -> island, fit -> range, roam -> rect+zoom) and `canvas.bookmarks`
   config entries re-seed each start with workspace-name references
-  resolved at go time. GPU tests `plugin-canvas/canvas-fit.gpu.mjs`;
-  unit coverage in `plugin-canvas/integration.test.js`.
+  resolved at go time. Elastic islands are LANDED behind
+  `canvas: { elastic: true | { column } }` (canvas-design.md §5):
+  each workspace becomes a niri-style strip -- one column per visible
+  managed member, tiled as equal columns via the per-island layout
+  hint (`LayoutIsland.layout` -> `LayoutInputs.island.layout`; the
+  bundled provider recognizes `{ mode: "columns" }`); the row
+  arrangement uses cumulative origins so a growing island shoves its
+  right-hand neighbors; the docked camera scrolls within the strip to
+  follow focus (focus changes + the focused window's retiles via
+  stack.relayout). Off-view frame pacing is FIXED with it: surfaces
+  outside every camera view now get wl_callback.done from any
+  output's flip-complete (idle compositors force one flip), so
+  off-view clients that block on done before committing (e.g. a
+  strip-tail resize) no longer deadlock. GPU tests
+  `plugin-canvas/canvas-fit.gpu.mjs`,
+  `plugin-canvas/canvas-elastic.gpu.mjs`; unit coverage in
+  `plugin-canvas/integration.test.js`.
   NOT built: pointer drag-pan gesture, bookmark advertising via
-  ext-workspace, elastic islands, gutters/shove, hotplug camera
-  persistence, ext-workspace per-group duplicate projection,
-  camera-following compose/live scenes, the de-workspacing
-  renames/retirements (canvas-design.md §10b).
+  ext-workspace, per-workspace elastic opt-in (the flag is
+  config-global), gutters/shove beyond the single-row arrangement,
+  hotplug camera persistence, ext-workspace per-group duplicate
+  projection, camera-following compose/live scenes, the
+  de-workspacing renames/retirements (canvas-design.md §10b).
 - **Logging.** TS surface migrated (spdlog 1.17.0; fixed area set;
   severity-based stdout/stderr split; `--log-file=PATH`; per-area
   `--log-level=SPEC`; `installConsoleShim` routes `console.*`

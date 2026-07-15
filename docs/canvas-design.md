@@ -645,9 +645,34 @@ tests only.
    runtime bookmarks are session-scoped. Unit coverage in
    `plugin-canvas/integration.test.js`; GPU roam test in
    `canvas-fit.gpu.mjs`.
+   ALSO LANDED -- **elastic islands** (`canvas: { elastic: true |
+   { column } }`): every workspace island grows along its row -- one
+   column of `column` × viewport width (default 0.5) per visible
+   managed member; floating members take none, and an exclusive member
+   collapses the strip to the viewport (maximize covers the screen,
+   not the strip). Members tile as equal full-height columns via a
+   per-island layout HINT (`LayoutIsland.layout`, passed through
+   verbatim to `LayoutInputs.island.layout`; the bundled provider
+   recognizes `{ mode: "columns" }`) -- a deliberate small step toward
+   §5's per-island providers. The row arrangement generalizes from
+   fixed slot pitch to cumulative origins in sticky slot order, so a
+   growing island SHOVES its right-hand neighbors (monotone,
+   order-preserving -- §6's shove, scoped to one row; docked cameras
+   follow automatically). The docked camera scrolls within the strip
+   to keep the focused window visible (per-workspace scroll offset,
+   clamped on use; triggered by focus changes and by the focused
+   window's retiles via stack.relayout). Landing this exposed and
+   fixed a frame-pacing gap: surfaces outside EVERY camera view got no
+   wl_callback.done at all ("wait until it re-enters an output"),
+   deadlocking off-view clients that block on done before committing a
+   resize -- §5's pacing promise now holds: off-view callbacks ride
+   any output's flip-complete, and a fully idle compositor forces one
+   flip. GPU test: `plugin-canvas/canvas-elastic.gpu.mjs`.
    NOT yet: pointer drag-pan gesture; bookmark advertising on the bar
-   (§12's islands-vs-bookmarks question); elastic islands; placement
-   rules targeting islands; gutters + shove; hotplug camera
+   (§12's islands-vs-bookmarks question); per-workspace elastic
+   opt-in (the flag is currently config-global); placement
+   rules targeting islands; gutters + shove beyond the single-row
+   arrangement; hotplug camera
    persistence/rescue; overview UX (an interactive picker/gesture on
    top of the landed fit-zoom optics); island hygiene;
    camera-following compose/live scenes (§4: a live view built from

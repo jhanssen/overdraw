@@ -809,6 +809,100 @@ test('world: bookmarks capture dock / fit / free framings and replay them', asyn
   }, { world: true });
 });
 
+// ---- world mode: elastic islands ------------------------------------------
+// canvas: { elastic: true } grows each workspace island along its row (one
+// 0.5-viewport column per managed member), tiles it via the layout
+// provider's columns hint, shoves right-hand neighbors, and scrolls the
+// docked camera within the strip to follow focus.
+
+test('elastic: islands grow with members and shove the row; layout hint set', async () => {
+  await withCanvasPlugin(async (h) => {
+    const { rt, sink, islands, addWindow } = h;
+    addWindow(101);
+    await settle();
+    await call(rt, 'create', [{}]);
+    await call(rt, 'show', [2, 0]);
+    addWindow(102);
+    await settle();
+    await call(rt, 'show', [1, 0]);
+    await settle();
+
+    // One managed member: viewport-sized island, columns hint.
+    const list = await call(rt, 'list', [0]);
+    let isl = islands();
+    const ws1 = isl.find((i) => i.id === list[0].handle);
+    const ws2 = isl.find((i) => i.id === list[1].handle);
+    assert.deepEqual(ws1.rect, { x: 0, y: 0, width: 800, height: 600 });
+    assert.deepEqual(ws1.layout, { mode: 'columns' });
+    assert.deepEqual(ws2.rect, { x: 800 + 128, y: 0, width: 800, height: 600 });
+
+    // Three managed members on ws1 -> 3 columns of 400 -> strip 1200;
+    // ws2 is shoved right by the growth.
+    addWindow(103);
+    await settle();
+    addWindow(104);
+    await settle();
+    isl = islands();
+    assert.deepEqual(isl.find((i) => i.id === list[0].handle).rect,
+      { x: 0, y: 0, width: 1200, height: 600 });
+    assert.deepEqual(isl.find((i) => i.id === list[1].handle).rect,
+      { x: 1200 + 128, y: 0, width: 800, height: 600 });
+
+    // Showing ws2 docks at its shoved origin.
+    sink.cameraCalls.length = 0;
+    await call(rt, 'show', [2, 0]);
+    assert.deepEqual(sink.cameraCalls.at(-1), { outputId: 0, x: 1328, y: 0, zoom: 1 });
+  }, { canvas: { world: true, elastic: true } });
+});
+
+test('elastic: the docked camera scrolls to keep the focused window visible', async () => {
+  await withCanvasPlugin(async (h) => {
+    const { rt, sink, pluginBus, addWindow } = h;
+    addWindow(101);
+    await settle();
+    addWindow(102);
+    await settle();
+    addWindow(103);
+    await settle();   // strip 1200, viewport 800
+    sink.cameraCalls.length = 0;
+
+    // Focus 101 and deliver its post-layout rect at the strip's right
+    // end (the retile stream): the camera scrolls minimally to reveal it.
+    pluginBus.emit('window.change',
+      { surfaceId: 101, activated: true, changed: ['activated'] });
+    pluginBus.emit('stack.relayout', {
+      reason: 'mapped',
+      windows: [{
+        surfaceId: 101, oldOuter: null, oldOutputId: 0,
+        newOuter: { x: 800, y: 0, width: 400, height: 600 },
+        newOutputId: 0, tiling: 'managed',
+      }],
+    });
+    await settle();
+    assert.deepEqual(sink.cameraCalls.at(-1), { outputId: 0, x: 400, y: 0, zoom: 1 });
+
+    // Focus moves to the window at the strip's head: the camera
+    // scrolls back to reveal it.
+    pluginBus.emit('window.change',
+      { surfaceId: 103, activated: true, changed: ['activated'] });
+    pluginBus.emit('stack.relayout', {
+      reason: 'reorder',
+      windows: [{
+        surfaceId: 103, oldOuter: null, oldOutputId: 0,
+        newOuter: { x: 0, y: 0, width: 400, height: 600 },
+        newOutputId: 0, tiling: 'managed',
+      }],
+    });
+    await settle();
+    assert.deepEqual(sink.cameraCalls.at(-1), { outputId: 0, x: 0, y: 0, zoom: 1 });
+
+    // fit frames the whole strip (bounds from the grown rect).
+    sink.cameraCalls.length = 0;
+    await rt.invokeAction('workspace.fit', {});
+    assert.equal(sink.cameraCalls.at(-1).zoom, 800 / 1200);
+  }, { canvas: { world: true, elastic: true } });
+});
+
 test('world: config-seeded bookmarks resolve at go time', async () => {
   await withCanvasPlugin(async (h) => {
     const { rt, sink, wsEvents } = h;
