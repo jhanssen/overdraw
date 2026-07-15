@@ -11,7 +11,7 @@
 //
 //   world (`world: true`): EVERY workspace publishes as an island at a
 //   world rect along its output's row (slot pitch = output width +
-//   SLOT_GUTTER); hidden members lay out at their slots (pre-sized on
+//   canvas.gutter); hidden members lay out at their slots (pre-sized on
 //   show) while the draw stack still gates visibility; `show` docks the
 //   output's camera on the shown island instantly, or FLIES it there when
 //   the caller passes a `transition` (duration + easing drive a camera
@@ -93,8 +93,9 @@ interface CanvasPluginConfig {
   canvas?: unknown;
 }
 
-// Horizontal spacing between neighboring slot rects in a row. Visible as
-// the void between islands while a camera flight crosses it.
+// Default spacing between neighboring island rects (both axes in grid
+// arrangement). Visible as the void between islands while a camera
+// flight crosses it or while fitted. `canvas.gutter` overrides.
 const SLOT_GUTTER = 128;
 
 export default async function init(
@@ -159,6 +160,13 @@ export default async function init(
   }
   // Camera scroll animation within a strip (ms).
   const SCROLL_MS = 150;
+
+  // Island spacing (canvas.gutter, world px; default SLOT_GUTTER).
+  const gutterRaw = worldMode
+    ? (config?.canvas as { gutter?: unknown }).gutter : undefined;
+  const gutter = (typeof gutterRaw === "number"
+    && Number.isFinite(gutterRaw) && gutterRaw >= 0)
+    ? Math.round(gutterRaw) : SLOT_GUTTER;
 
   // Empty-island backdrops: a translucent world-space quad marks each
   // island with no members, so empty (typically persistent) workspaces
@@ -486,7 +494,7 @@ export default async function init(
 
   // ---- World mode ---------------------------------------------------------
   // Every workspace is an island at a world rect along its output's row:
-  // slot s of output O sits at O.arrangement + s * (O.width + SLOT_GUTTER)
+  // slot s of output O sits at O.arrangement + s * (O.width + gutter)
   // horizontally. Slots are per-workspace-handle, assigned on first
   // placement and kept for the workspace's lifetime; collisions after a
   // hotplug migration resolve to the lowest free slot on the new row. ALL
@@ -844,7 +852,7 @@ export default async function init(
       const g = outputGeom.get(outputId);
       // Arrangement: sticky slot ORDER, per-island widths (viewport for
       // fixed, column-grown for elastic), cumulative x origins with
-      // SLOT_GUTTER between islands. "rows" is one filmstrip; "grid"
+      // canvas.gutter between islands. "rows" is one filmstrip; "grid"
       // wraps row-major after ~sqrt(N) islands (the near-square block
       // maximizes the fit zoom), stepping y by viewport height + gutter.
       // A growing island shoves its right-hand neighbors along its own
@@ -867,10 +875,10 @@ export default async function init(
             ? elasticWidth(g, rec.members, snapById, columnFor(h))
             : g.width;
           row.set(h, {
-            x, y: g.y + gridRow * (g.height + SLOT_GUTTER),
+            x, y: g.y + gridRow * (g.height + gutter),
             width, height: g.height,
           });
-          x += width + SLOT_GUTTER;
+          x += width + gutter;
           col++;
         }
       }

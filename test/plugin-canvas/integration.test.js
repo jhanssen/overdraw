@@ -1357,6 +1357,19 @@ test('world: empty islands publish backdrops; occupied ones do not', async () =>
   });
 });
 
+test('world: canvas.gutter overrides the island spacing', async () => {
+  await withCanvasPlugin(async (h) => {
+    const { rt, islands, addWindow } = h;
+    addWindow(101);
+    await settle();
+    await call(rt, 'create', [{}]);
+    await settle();
+    const list = await call(rt, 'list', [0]);
+    const ws2 = islands().find((i) => i.id === list[1].handle);
+    assert.equal(ws2.rect.x, 800 + 48, 'second slot one gutter past the viewport');
+  }, { canvas: { world: true, gutter: 48 } });
+});
+
 test('world: config-seeded bookmarks resolve at go time', async () => {
   await withCanvasPlugin(async (h) => {
     const { rt, sink, wsEvents } = h;
