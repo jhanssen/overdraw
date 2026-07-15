@@ -219,6 +219,8 @@ napi_value Stop(napi_env env, napi_callback_info info) {
 struct XwmJsState {
     XwmConn* conn = nullptr;
     uv_poll_t poll;
+    // One-shot drain scheduled after request wrappers (see scheduleXwmDrain).
+    uv_timer_t drainTimer;
     napi_env env = nullptr;
     napi_ref cb = nullptr;
     bool active = false;
@@ -351,6 +353,8 @@ void xwmTeardown() {
     g_xwm.active = false;
     uv_poll_stop(&g_xwm.poll);
     uv_close(reinterpret_cast<uv_handle_t*>(&g_xwm.poll), nullptr);
+    uv_timer_stop(&g_xwm.drainTimer);
+    uv_close(reinterpret_cast<uv_handle_t*>(&g_xwm.drainTimer), nullptr);
     if (g_xwm.conn) {
         xwmDisconnect(g_xwm.conn);  // closes the wm fd
         g_xwm.conn = nullptr;
@@ -359,6 +363,24 @@ void xwmTeardown() {
         napi_delete_reference(g_xwm.env, g_xwm.cb);
         g_xwm.cb = nullptr;
     }
+}
+
+// xcb reads whatever is on the socket whenever it touches the connection,
+// so a reply/event can land in xcb's internal queue during a request
+// wrapper's flush -- consumed off the fd, so uv_poll never fires and the
+// event sits queued until unrelated traffic arrives (symptom: a
+// ConfigureNotify echo lost after two back-to-back configures). Every
+// request wrapper schedules this one-shot drain; the next loop iteration
+// empties the queue. Deferred (not drained inline) so JS event callbacks
+// never re-enter mid-wrapper.
+void onXwmDrainTimer(uv_timer_t* /*t*/) {
+    if (!g_xwm.active || !g_xwm.conn) return;
+    if (!xwmProcess(g_xwm.conn, deliverXwmEvent)) xwmTeardown();
+}
+
+void scheduleXwmDrain() {
+    if (!g_xwm.active) return;
+    uv_timer_start(&g_xwm.drainTimer, onXwmDrainTimer, 0, 0);
 }
 
 void onXcbReadable(uv_poll_t* /*h*/, int status, int /*events*/) {
@@ -399,6 +421,7 @@ napi_value XwmStart(napi_env env, napi_callback_info info) {
     napi_get_uv_event_loop(env, &loop);
     uv_poll_init(loop, &g_xwm.poll, xwmFd(conn));
     uv_poll_start(&g_xwm.poll, UV_READABLE, onXcbReadable);
+    uv_timer_init(loop, &g_xwm.drainTimer);
     g_xwm.active = true;
 
     // Drain anything already queued before the poll was armed.
@@ -442,6 +465,7 @@ napi_value XwmMapWindow(napi_env env, napi_callback_info info) {
     uint32_t window = 0;
     if (argc >= 1) napi_get_value_uint32(env, argv[0], &window);
     xwmMapWindow(g_xwm.conn, window);
+    scheduleXwmDrain();
     napi_value u;
     napi_get_undefined(env, &u);
     return u;
@@ -461,6 +485,7 @@ napi_value XwmConfigureWindow(napi_env env, napi_callback_info info) {
     napi_get_value_int32(env, argv[3], &w);
     napi_get_value_int32(env, argv[4], &h);
     xwmConfigureWindow(g_xwm.conn, window, x, y, w, h);
+    scheduleXwmDrain();
     napi_value u;
     napi_get_undefined(env, &u);
     return u;
@@ -487,6 +512,7 @@ napi_value XwmSendConfigureNotify(napi_env env, napi_callback_info info) {
     napi_get_value_int32(env, argv[3], &w);
     napi_get_value_int32(env, argv[4], &h);
     xwmSendConfigureNotify(g_xwm.conn, window, x, y, w, h);
+    scheduleXwmDrain();
     napi_value u;
     napi_get_undefined(env, &u);
     return u;
@@ -508,6 +534,7 @@ napi_value XwmGetProperty(napi_env env, napi_callback_info info) {
     napi_get_value_uint32(env, argv[1], &atom);
     if (argc >= 3) napi_get_value_uint32(env, argv[2], &maxWords);
     const uint32_t cookieId = xwmGetProperty(g_xwm.conn, window, atom, maxWords);
+    scheduleXwmDrain();
     napi_value out;
     napi_create_uint32(env, cookieId, &out);
     return out;
@@ -530,6 +557,7 @@ napi_value XwmSendWmProtocol(napi_env env, napi_callback_info info) {
     napi_get_value_uint32(env, argv[1], &proto);
     if (argc >= 3) napi_get_value_uint32(env, argv[2], &timestamp);
     xwmSendWmProtocol(g_xwm.conn, window, proto, timestamp);
+    scheduleXwmDrain();
     napi_value u;
     napi_get_undefined(env, &u);
     return u;
@@ -547,6 +575,7 @@ napi_value XwmKillClient(napi_env env, napi_callback_info info) {
     uint32_t window = 0;
     if (argc >= 1) napi_get_value_uint32(env, argv[0], &window);
     xwmKillClient(g_xwm.conn, window);
+    scheduleXwmDrain();
     napi_value u;
     napi_get_undefined(env, &u);
     return u;
@@ -568,6 +597,7 @@ napi_value XwmSetInputFocus(napi_env env, napi_callback_info info) {
     napi_get_value_uint32(env, argv[0], &window);
     if (argc >= 2) napi_get_value_uint32(env, argv[1], &timestamp);
     const uint32_t seq = xwmSetInputFocus(g_xwm.conn, window, timestamp);
+    scheduleXwmDrain();
     napi_value out;
     napi_create_uint32(env, seq, &out);
     return out;
@@ -614,6 +644,7 @@ napi_value XwmChangeProperty(napi_env env, napi_callback_info info) {
     (void)byteLen;  // trusted: caller passes nelements explicitly
     xwmChangeProperty(g_xwm.conn, window, atom, type,
                       static_cast<uint8_t>(format32), data, nelements);
+    scheduleXwmDrain();
     napi_value u;
     napi_get_undefined(env, &u);
     return u;
@@ -630,6 +661,7 @@ napi_value XwmDeleteProperty(napi_env env, napi_callback_info info) {
     napi_get_value_uint32(env, argv[0], &window);
     napi_get_value_uint32(env, argv[1], &atom);
     xwmDeleteProperty(g_xwm.conn, window, atom);
+    scheduleXwmDrain();
     napi_value u;
     napi_get_undefined(env, &u);
     return u;
@@ -652,6 +684,7 @@ napi_value XwmCreateSelectionWindow(napi_env env, napi_callback_info info) {
     if (argc >= 2) napi_get_value_bool(env, argv[1], &inputOnly);
     napi_value out;
     napi_create_uint32(env, xwmCreateSelectionWindow(g_xwm.conn, mask, inputOnly), &out);
+    scheduleXwmDrain();
     return out;
 }
 
@@ -664,6 +697,7 @@ napi_value XwmDestroyWindow(napi_env env, napi_callback_info info) {
     uint32_t window = 0;
     if (argc >= 1) napi_get_value_uint32(env, argv[0], &window);
     xwmDestroyWindow(g_xwm.conn, window);
+    scheduleXwmDrain();
     napi_value u;
     napi_get_undefined(env, &u);
     return u;
@@ -683,6 +717,7 @@ napi_value XwmSetSelectionOwner(napi_env env, napi_callback_info info) {
     napi_get_value_uint32(env, argv[1], &window);
     if (argc >= 3) napi_get_value_uint32(env, argv[2], &timestamp);
     xwmSetSelectionOwner(g_xwm.conn, selectionAtom, window, timestamp);
+    scheduleXwmDrain();
     napi_value u;
     napi_get_undefined(env, &u);
     return u;
@@ -707,6 +742,7 @@ napi_value XwmConvertSelection(napi_env env, napi_callback_info info) {
     napi_get_value_uint32(env, argv[3], &property);
     if (argc >= 5) napi_get_value_uint32(env, argv[4], &timestamp);
     xwmConvertSelection(g_xwm.conn, requestor, selection, target, property, timestamp);
+    scheduleXwmDrain();
     napi_value u;
     napi_get_undefined(env, &u);
     return u;
@@ -730,6 +766,7 @@ napi_value XwmSendSelectionNotify(napi_env env, napi_callback_info info) {
     napi_get_value_uint32(env, argv[3], &property);
     if (argc >= 5) napi_get_value_uint32(env, argv[4], &timestamp);
     xwmSendSelectionNotify(g_xwm.conn, requestor, selection, target, property, timestamp);
+    scheduleXwmDrain();
     napi_value u;
     napi_get_undefined(env, &u);
     return u;
@@ -753,6 +790,7 @@ napi_value XwmXfixesSelectSelectionInput(napi_env env, napi_callback_info info) 
     napi_get_value_uint32(env, argv[1], &sel);
     napi_get_value_uint32(env, argv[2], &mask);
     xwmXfixesSelectSelectionInput(g_xwm.conn, window, sel, mask);
+    scheduleXwmDrain();
     napi_value u;
     napi_get_undefined(env, &u);
     return u;
@@ -775,6 +813,7 @@ napi_value XwmInternAtom(napi_env env, napi_callback_info info) {
     napi_get_value_string_utf8(env, argv[0], name.data(), len + 1, &len);
     napi_value out;
     napi_create_uint32(env, xwmInternAtom(g_xwm.conn, name.c_str()), &out);
+    scheduleXwmDrain();
     return out;
 }
 
@@ -791,6 +830,7 @@ napi_value XwmGetAtomName(napi_env env, napi_callback_info info) {
     napi_get_value_uint32(env, argv[0], &atom);
     napi_value out;
     napi_create_uint32(env, xwmGetAtomName(g_xwm.conn, atom), &out);
+    scheduleXwmDrain();
     return out;
 }
 
@@ -855,6 +895,7 @@ napi_value XwmSelectWindowEvents(napi_env env, napi_callback_info info) {
     napi_get_value_uint32(env, argv[0], &window);
     napi_get_value_uint32(env, argv[1], &mask);
     xwmSelectWindowEvents(g_xwm.conn, window, mask);
+    scheduleXwmDrain();
     napi_value u;
     napi_get_undefined(env, &u);
     return u;
