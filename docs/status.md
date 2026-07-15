@@ -985,11 +985,14 @@ validated + resolved + consumed by the runtime + hotkey plugin.
   (same GPU test). Fit zoom is LANDED: `workspace.fit {start?, end?,
   output?, transition?}` optically zooms the camera out to frame a
   consecutive workspace range (defaults first..last) -- union of the
-  framed workspaces' members rides the draw stack, registry truth
-  (shown workspace / bar / focus) stays put, structural changes
-  re-frame while fitted, any show exits the fit; `workspace.unfit
-  {index?, output?, transition?}` zooms back in (default: the shown
-  workspace, optics-only; a different index behaves like show). GPU
+  framed workspaces' members rides the draw stack, the camera holds
+  the framing while structural changes re-frame, and any show exits
+  the fit. While fitted the SHOWN workspace follows focus (every
+  framed window is focusable; the bar highlight names what the user
+  selected) without moving the camera or stack; `workspace.unfit
+  {index?, output?, transition?}` zooms back in (default: the focused
+  window's workspace, else the shown one -- optics-only when it is
+  already shown, a show otherwise). GPU
   test `plugin-canvas/canvas-fit.gpu.mjs`; unit coverage in
   `plugin-canvas/integration.test.js`.
   NOT built: bookmarks + free roaming (bookmarks deferred until the

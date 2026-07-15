@@ -613,16 +613,18 @@ tests only.
    ALSO LANDED -- **fit zoom** (`workspace.fit` / `workspace.unfit`):
    fit optically zooms the camera out to frame a consecutive workspace
    range (start/end per-output positions, defaults first..last;
-   centered + letterboxed on the slots' bounding box). Registry truth
-   never moves -- the shown workspace, bar highlight, and focus stay
-   put; the union of the framed workspaces' members rides the draw
-   stack (so they composite and gain residency) and is maintained
-   across structural changes while fitted; the framing re-solves on
-   membership/geometry change. Any show on the output exits the fit;
-   unfit zooms back in (default target the shown workspace --
-   optics-only; an explicit different index is a show). Both accept a
-   `transition {duration, easing?}` camera tween with the flight
-   machinery's preemption/instant-fallback semantics. GPU test:
+   centered + letterboxed on the slots' bounding box). The camera and
+   stack hold the framing: the union of the framed workspaces' members
+   rides the draw stack (so they composite and gain residency) and is
+   maintained across structural changes; the framing re-solves on
+   membership/geometry change. While fitted every framed window is
+   focusable and the SHOWN workspace follows focus (bar highlight =
+   what the user selected) without moving the optics. Any show on the
+   output exits the fit; unfit zooms back in (default target the
+   focused window's workspace, else the shown one -- optics-only when
+   already shown, a show otherwise). Both accept a `transition
+   {duration, easing?}` camera tween with the flight machinery's
+   preemption/instant-fallback semantics. GPU test:
    `plugin-canvas/canvas-fit.gpu.mjs`.
    NOT yet: bookmarks + free roaming (bookmarks wait until the camera
    can leave slot framings -- without pan gestures or roaming they

@@ -240,6 +240,23 @@ export default async function init(
       if (handle !== undefined) {
         const rec = state.byHandle.get(handle);
         if (rec) focusedOutputIdCache = rec.outputId;
+        // While an output is fitted every framed window is focusable
+        // (click, or hover under follow-pointer focus), so the shown
+        // workspace FOLLOWS focus: the bar highlight and the default
+        // unfit target always name the workspace the user selected.
+        // The registry show flips truth only -- the fit's union stack
+        // and camera stay in place (the setOutputStack override and
+        // publishWorld's fitted gates keep them), and the focus
+        // decision is skipped: focus is the cause here, not an effect.
+        if (rec && worldMode && fitted.has(rec.outputId)
+            && state.shownByOutput.get(rec.outputId) !== handle) {
+          const idx = reg.findIndex(state, handle, rec.outputId);
+          if (idx !== null) {
+            const r = reg.show(state, idx, rec.outputId, outputNameOf(rec.outputId));
+            state = r.state;
+            void applyEffects(r.sideEffects, new Set(["requestFocusDecision"]));
+          }
+        }
       }
     } else if (focusedSurfaceId === p.surfaceId) {
       focusedSurfaceId = null;

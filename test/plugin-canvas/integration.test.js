@@ -609,23 +609,35 @@ test('world: unfit returns to the shown workspace without touching the registry'
   }, { world: true });
 });
 
-test('world: unfit targets the focused window\'s workspace by default', async () => {
+test('world: focus while fitted flips the shown workspace; unfit zooms into it', async () => {
   await withCanvasPlugin(async (h) => {
     const { rt, sink, pluginBus, wsEvents } = h;
     await setupTwoIslands(h);
     await rt.invokeAction('workspace.fit', {});
-    // Focus lands on 102 (framed, hidden ws2) while fitted -- click or
-    // follow-pointer hover; the plugin tracks it via window.change.
-    pluginBus.emit('window.change',
-      { surfaceId: 102, activated: true, changed: ['activated'] });
     sink.cameraCalls.length = 0;
     wsEvents.length = 0;
 
+    // Focus lands on 102 (framed, hidden ws2) while fitted -- click or
+    // follow-pointer hover. The shown workspace follows focus (bar
+    // highlight), but the fit's camera and union stack stay.
+    pluginBus.emit('window.change',
+      { surfaceId: 102, activated: true, changed: ['activated'] });
+    await settle();
+    assert.ok(wsEvents.some((e) => e.name === 'workspace.shown' && e.payload.index === 2),
+      'shown follows focus while fitted');
+    assert.equal(sink.cameraCalls.length, 0, 'camera stays fitted');
+    assert.deepEqual(sink.outputStackCalls.at(-1), { outputId: 0, ids: [101, 102] },
+      'union stack stays while fitted');
+    const cur = await call(rt, 'current', [0]);
+    assert.equal(cur.index, 2);
+
+    // Unfit: ws2 is already shown, so this is the optics-only zoom-in
+    // onto its slot.
+    wsEvents.length = 0;
     await rt.invokeAction('workspace.unfit', {});
     assert.deepEqual(sink.cameraCalls.at(-1), { outputId: 0, x: PITCH, y: 0, zoom: 1 });
     assert.deepEqual(sink.outputStackCalls.at(-1), { outputId: 0, ids: [102] });
-    assert.ok(wsEvents.some((e) => e.name === 'workspace.shown' && e.payload.index === 2),
-      'unfit onto the focused workspace is a show');
+    assert.equal(wsEvents.length, 0, 'no extra show on unfit; truth already flipped');
   }, { world: true });
 });
 
