@@ -1020,7 +1020,10 @@ validated + resolved + consumed by the runtime + hotkey plugin.
   `plugin-canvas/canvas-fit.gpu.mjs`,
   `plugin-canvas/canvas-elastic.gpu.mjs`; unit coverage in
   `plugin-canvas/integration.test.js`.
-  Declarative workspaces are LANDED: `canvas.workspaces` entries
+  Grid arrangement is LANDED (`canvas.arrangement: "grid"`, default
+  "rows"): slots wrap row-major after ~sqrt(N) columns, fit frames
+  the 2D bounds, docks move both camera axes, elastic shove stays
+  per grid row. Declarative workspaces are LANDED: `canvas.workspaces` entries
   `{ name, output?, persistent?, elastic? }` seed named workspaces at
   boot (persistent by default; `elastic` boolean or `{ column }`
   declares growth by name), backed by registry name idempotence --

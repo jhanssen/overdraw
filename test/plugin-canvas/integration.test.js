@@ -1063,6 +1063,89 @@ test('placement: malformed or empty hints fall back to the spawn output', async 
   }, { world: true });
 });
 
+// ---- world mode: grid arrangement -----------------------------------------
+// canvas: { arrangement: "grid" } wraps the slot order row-major after
+// ~sqrt(N) columns; vertical pitch = viewport height + gutter.
+
+const VPITCH = 600 + 128;
+
+test('grid: islands wrap row-major; show docks at x AND y', async () => {
+  await withCanvasPlugin(async (h) => {
+    const { rt, sink, islands, addWindow } = h;
+    addWindow(101);
+    await settle();
+    await call(rt, 'create', [{}]);
+    await call(rt, 'create', [{}]);   // 3 workspaces -> cols = 2
+    await settle();
+
+    const list = await call(rt, 'list', [0]);
+    const rectOf = (i) => islands().find((x) => x.id === list[i].handle).rect;
+    assert.deepEqual(rectOf(0), { x: 0, y: 0, width: 800, height: 600 });
+    assert.deepEqual(rectOf(1), { x: PITCH, y: 0, width: 800, height: 600 });
+    assert.deepEqual(rectOf(2), { x: 0, y: VPITCH, width: 800, height: 600 },
+      'third island wraps to the second grid row');
+
+    // Docking on the wrapped island moves the camera on both axes.
+    sink.cameraCalls.length = 0;
+    await call(rt, 'show', [3, 0]);
+    assert.deepEqual(sink.cameraCalls.at(-1), { outputId: 0, x: 0, y: VPITCH, zoom: 1 });
+    // And back: y returns to the first row.
+    await call(rt, 'show', [1, 0]);
+    assert.deepEqual(sink.cameraCalls.at(-1), { outputId: 0, x: 0, y: 0, zoom: 1 });
+  }, { canvas: { world: true, arrangement: 'grid' } });
+});
+
+test('grid: fit frames the 2D bounds (near-square zoom, both axes centered)', async () => {
+  await withCanvasPlugin(async (h) => {
+    const { rt, sink, addWindow } = h;
+    addWindow(101);
+    await settle();
+    await call(rt, 'create', [{}]);
+    await call(rt, 'create', [{}]);
+    await call(rt, 'create', [{}]);   // 4 workspaces -> 2x2 grid
+    await settle();
+    sink.cameraCalls.length = 0;
+
+    await rt.invokeAction('workspace.fit', {});
+    const boundsW = PITCH + 800;      // two columns
+    const boundsH = VPITCH + 600;     // two grid rows
+    const zoom = Math.min(800 / boundsW, 600 / boundsH);
+    assert.deepEqual(sink.cameraCalls.at(-1), {
+      outputId: 0,
+      x: boundsW / 2 - (800 / zoom) / 2,
+      y: boundsH / 2 - (600 / zoom) / 2,
+      zoom,
+    });
+    // 2x2 on a 4:3-ish viewport: zoom ~0.45 vs the ~0.29 a 4-wide row
+    // would give -- the grid is why fit wastes less glass.
+    assert.ok(zoom > 800 / (4 * PITCH));
+  }, { canvas: { world: true, arrangement: 'grid' } });
+});
+
+test('grid: elastic growth shoves within its own grid row only', async () => {
+  await withCanvasPlugin(async (h) => {
+    const { rt, islands, addWindow } = h;
+    addWindow(101);
+    await settle();
+    await call(rt, 'create', [{}]);
+    await call(rt, 'create', [{}]);
+    await settle();
+    // Grow ws1 (slot 0, grid row 0) to 3 columns of 400 = 1200.
+    addWindow(102);
+    await settle();
+    addWindow(103);
+    await settle();
+
+    const list = await call(rt, 'list', [0]);
+    const rectOf = (i) => islands().find((x) => x.id === list[i].handle).rect;
+    assert.equal(rectOf(0).width, 1200, 'ws1 grew');
+    assert.deepEqual(rectOf(1), { x: 1200 + 128, y: 0, width: 800, height: 600 },
+      'same-row neighbor shoved right');
+    assert.deepEqual(rectOf(2), { x: 0, y: VPITCH, width: 800, height: 600 },
+      'next grid row unmoved');
+  }, { canvas: { world: true, arrangement: 'grid', elastic: true } });
+});
+
 // ---- declarative workspaces (canvas.workspaces) ---------------------------
 
 test('canvas.workspaces: seeds named persistent workspaces with elastic by name', async () => {

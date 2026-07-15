@@ -673,6 +673,16 @@ tests only.
    resize -- §5's pacing promise now holds: off-view callbacks ride
    any output's flip-complete, and a fully idle compositor forces one
    flip. GPU test: `plugin-canvas/canvas-elastic.gpu.mjs`.
+   ALSO LANDED -- **grid arrangement** (`canvas.arrangement:
+   "grid"`; default "rows"): the world-arrangement policy's first
+   alternative (§6's rows/grid/freeform). Slots wrap row-major after
+   ceil(sqrt(N)) columns, vertical pitch = viewport height + gutter;
+   fit frames the 2D bounds (near-square block, so the overview zoom
+   wastes far less glass on wide monitors than the filmstrip), docks
+   move the camera on both axes, and elastic shove stays scoped to an
+   island's own grid row. Not yet pluggable -- a config switch between
+   two built-in policies; the §6 recursion (arrangement as a
+   layout-shaped compute) remains future work.
    ALSO LANDED -- **declarative workspaces** (`canvas.workspaces`):
    config entries `{ name, output?, persistent?, elastic? }` declare
    named workspaces that exist from boot -- persistent by default (a

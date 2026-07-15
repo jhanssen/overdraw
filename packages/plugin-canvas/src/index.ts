@@ -137,6 +137,14 @@ export default async function init(
   // (true / { column } = all elastic; { default: false, column } =
   // fixed unless opted in), and workspace.set-elastic overrides one
   // workspace either way at runtime.
+  // World arrangement (canvas-design.md §6): how workspace islands are
+  // placed in the world. "rows" (default) = one horizontal filmstrip per
+  // output; "grid" = row-major grid of ~sqrt(N) columns per output --
+  // workspace.fit then frames a near-square block instead of a long
+  // strip, wasting far less glass on wide monitors.
+  const arrangement = worldMode
+    && (config?.canvas as { arrangement?: unknown }).arrangement === "grid"
+    ? "grid" : "rows";
   const elasticRaw = worldMode
     ? (config?.canvas as { elastic?: unknown }).elastic : undefined;
   const elasticDefault = elasticRaw === true
@@ -461,7 +469,8 @@ export default async function init(
   const slotByHandle = new Map<WorkspaceHandle, number>();
   // Per-workspace scroll offset within an elastic island wider than the
   // viewport (world px from the island's left edge; clamped on use, so a
-  // shrinking island self-corrects).
+  // shrinking island self-corrects). Scroll is x-only: strips grow along
+  // their (grid) row.
   const scrollByHandle = new Map<WorkspaceHandle, number>();
   // Per-workspace growth. Precedence: runtime override
   // (workspace.set-elastic, session-scoped, pruned with the workspace) >
@@ -484,12 +493,12 @@ export default async function init(
     return (name !== undefined ? columnByName.get(name) : undefined) ?? colFraction;
   }
   // Row arrangement computed by publishWorld: each workspace's island
-  // rect, keyed per output. camXFor / fitCameraFor read this cache
+  // rect, keyed per output. camPosFor / fitCameraFor read this cache
   // synchronously; publishWorld refreshes it on every structural change.
   const rowRectsByOutput = new Map<
     number,
     Map<WorkspaceHandle, { x: number; y: number; width: number; height: number }>>();
-  const lastCamByOutput = new Map<number, number>();
+  const lastCamByOutput = new Map<number, { x: number; y: number }>();
   // Outputs with a camera flight in progress, keyed to the flight's token.
   // While an output flies, publishWorld skips docking its camera (the
   // flight owns it); the settle step (or a preempting flight / an instant
@@ -563,10 +572,10 @@ export default async function init(
   }
 
   // Camera framing the union of the given workspaces' slot rects: zoomed
-  // out just enough to fit (never past 1), centered both ways. The camera
-  // views the world from (originX + x, originY + y) over logical/zoom
-  // world units, so x/y are offsets from the output's arrangement
-  // position; y goes negative to letterbox the slot band vertically.
+  // out just enough to fit the 2D bounds (never past 1), centered both
+  // ways. The camera views the world from (originX + x, originY + y)
+  // over logical/zoom world units, so x/y are offsets from the output's
+  // arrangement position; the non-binding axis letterboxes.
   function fitCameraFor(
     outputId: number, handles: ReadonlyArray<WorkspaceHandle>,
   ): { x: number; y: number; zoom: number } | null {
@@ -574,17 +583,22 @@ export default async function init(
     if (!g) return null;
     let minX = Infinity;
     let maxX = -Infinity;
+    let minY = Infinity;
+    let maxY = -Infinity;
     for (const h of handles) {
       const r = islandRectFor(outputId, h);
       if (!r) continue;
       minX = Math.min(minX, r.x);
       maxX = Math.max(maxX, r.x + r.width);
+      minY = Math.min(minY, r.y);
+      maxY = Math.max(maxY, r.y + r.height);
     }
     if (minX === Infinity) return null;
-    const zoom = Math.min(g.width / (maxX - minX), 1);
+    const zoom = Math.min(
+      g.width / (maxX - minX), g.height / (maxY - minY), 1);
     return {
       x: (minX + maxX) / 2 - (g.width / zoom) / 2 - g.x,
-      y: (g.height - g.height / zoom) / 2,
+      y: (minY + maxY) / 2 - (g.height / zoom) / 2 - g.y,
       zoom,
     };
   }
@@ -615,25 +629,26 @@ export default async function init(
   // Move a docked camera to its (re-clamped) scroll position within the
   // shown island: a short tween (denied tweens -- grabs -- fall back to
   // the instant write), then one settled write. Overridden / flying
-  // outputs are left alone; their owner re-docks through camXFor, which
+  // outputs are left alone; their owner re-docks through camPosFor, which
   // reads the same scroll state.
   async function applyScroll(outputId: number): Promise<void> {
     if (override.has(outputId) || flying.has(outputId)) return;
     const shown = state.shownByOutput.get(outputId);
     if (shown === undefined) return;
-    const target = camXFor(outputId, shown);
-    if (lastCamByOutput.get(outputId) === target) return;
+    const target = camPosFor(outputId, shown);
+    const last = lastCamByOutput.get(outputId);
+    if (last && last.x === target.x && last.y === target.y) return;
     if (sdk.animations) {
       const token = ++flightSeq;
       flying.set(outputId, token);
       try {
         const cur = await sdk.windows.getOutputCamera(outputId);
-        if (cur.x !== target || cur.y !== 0 || cur.zoom !== 1) {
+        if (cur.x !== target.x || cur.y !== target.y || cur.zoom !== 1) {
           const spec: TweenSpec = {
             type: "tween",
             target: { kind: "output-camera", outputId },
             from: cur,
-            to: { x: target, y: 0, zoom: 1 },
+            to: { x: target.x, y: target.y, zoom: 1 },
             duration: SCROLL_MS,
             easing: "ease-in-out" as EasingSpec,
           };
@@ -650,9 +665,9 @@ export default async function init(
     // Settle against LIVE scroll state: another trigger may have moved
     // the scroll while the tween flew (it bailed on our flying token and
     // relies on this settle to land its value).
-    const settleX = camXFor(outputId, shown);
-    lastCamByOutput.set(outputId, settleX);
-    await sdk.windows.setOutputCamera(outputId, settleX, 0);
+    const settle = camPosFor(outputId, shown);
+    lastCamByOutput.set(outputId, settle);
+    await sdk.windows.setOutputCamera(outputId, settle.x, settle.y);
   }
 
   // Keep each overridden output's union stack (and, for fits, the
@@ -696,16 +711,19 @@ export default async function init(
     return rowRectsByOutput.get(outputId)?.get(handle) ?? null;
   }
 
-  // Dock target for a workspace: its island's row origin plus the
-  // clamped scroll offset (elastic islands wider than the viewport
+  // Dock target for a workspace: its island's origin (output-relative,
+  // both axes -- grid arrangement places islands at non-zero y) plus the
+  // clamped x scroll offset (elastic islands wider than the viewport
   // scroll to follow focus; fixed islands always clamp to 0).
-  function camXFor(outputId: number, handle: WorkspaceHandle): number {
+  function camPosFor(
+    outputId: number, handle: WorkspaceHandle,
+  ): { x: number; y: number } {
     const g = outputGeom.get(outputId);
     const r = islandRectFor(outputId, handle);
-    if (!g || !r) return 0;
+    if (!g || !r) return { x: 0, y: 0 };
     const maxScroll = Math.max(0, r.width - g.width);
     const s = Math.min(maxScroll, Math.max(0, scrollByHandle.get(handle) ?? 0));
-    return (r.x - g.x) + s;
+    return { x: (r.x - g.x) + s, y: r.y - g.y };
   }
 
   async function pushStack(outputId: number, ids: number[]): Promise<void> {
@@ -797,24 +815,36 @@ export default async function init(
     for (const [outputId, handles] of state.positionsByOutput) {
       const slots = resolveSlots(handles);
       const g = outputGeom.get(outputId);
-      // Row arrangement: sticky slot ORDER, per-island widths (viewport
-      // for fixed, column-grown for elastic), cumulative origins with
-      // SLOT_GUTTER between islands. A growing island shoves its
-      // right-hand neighbors along the row -- order-preserving and
-      // monotone (canvas-design.md §6's shove, scoped to one row).
+      // Arrangement: sticky slot ORDER, per-island widths (viewport for
+      // fixed, column-grown for elastic), cumulative x origins with
+      // SLOT_GUTTER between islands. "rows" is one filmstrip; "grid"
+      // wraps row-major after ~sqrt(N) islands (the near-square block
+      // maximizes the fit zoom), stepping y by viewport height + gutter.
+      // A growing island shoves its right-hand neighbors along its own
+      // (grid) row -- order-preserving and monotone (canvas-design.md
+      // §6's shove, scoped to one row; grid rows are independent).
       const row = new Map<
         WorkspaceHandle, { x: number; y: number; width: number; height: number }>();
       if (g) {
         const ordered = [...handles].sort(
           (a, b) => (slots.get(a) ?? 0) - (slots.get(b) ?? 0));
+        const cols = arrangement === "grid"
+          ? Math.max(1, Math.ceil(Math.sqrt(ordered.length))) : Infinity;
         let x = g.x;
+        let gridRow = 0;
+        let col = 0;
         for (const h of ordered) {
+          if (col >= cols) { col = 0; gridRow++; x = g.x; }
           const rec = state.byHandle.get(h);
           const width = rec && isElastic(h)
             ? elasticWidth(g, rec.members, snapById, columnFor(h))
             : g.width;
-          row.set(h, { x, y: g.y, width, height: g.height });
+          row.set(h, {
+            x, y: g.y + gridRow * (g.height + SLOT_GUTTER),
+            width, height: g.height,
+          });
           x += width + SLOT_GUTTER;
+          col++;
         }
       }
       rowRectsByOutput.set(outputId, row);
@@ -840,10 +870,11 @@ export default async function init(
     // docks it. An overridden output's camera belongs to its override.
     for (const [outputId, shown] of state.shownByOutput) {
       if (flying.has(outputId) || override.has(outputId)) continue;
-      const camX = camXFor(outputId, shown);
-      if (lastCamByOutput.get(outputId) === camX) continue;
-      lastCamByOutput.set(outputId, camX);
-      await sdk.windows.setOutputCamera(outputId, camX, 0);
+      const cam = camPosFor(outputId, shown);
+      const last = lastCamByOutput.get(outputId);
+      if (last && last.x === cam.x && last.y === cam.y) continue;
+      lastCamByOutput.set(outputId, cam);
+      await sdk.windows.setOutputCamera(outputId, cam.x, cam.y);
     }
   }
 
@@ -1069,15 +1100,16 @@ export default async function init(
         await sdk.animations?.cancel({ kind: "output-camera", outputId });
       }
       const shown = state.shownByOutput.get(outputId);
-      const target = shown !== undefined ? camXFor(outputId, shown) : 0;
+      const target = shown !== undefined
+        ? camPosFor(outputId, shown) : { x: 0, y: 0 };
       const cur = await sdk.windows.getOutputCamera(outputId);
       if (sdk.animations
-          && (cur.x !== target || cur.y !== 0 || cur.zoom !== 1)) {
+          && (cur.x !== target.x || cur.y !== target.y || cur.zoom !== 1)) {
         const spec: TweenSpec = {
           type: "tween",
           target: { kind: "output-camera", outputId },
           from: cur,
-          to: { x: target, y: 0, zoom: 1 },
+          to: { x: target.x, y: target.y, zoom: 1 },
           duration: t.duration,
           easing: (t.easing ?? "ease-in-out") as EasingSpec,
         };
@@ -1093,9 +1125,10 @@ export default async function init(
       // may have changed the shown workspace under us.
       const settleShown = state.shownByOutput.get(outputId);
       await pushStack(outputId, reg.stackFor(state, outputId));
-      const settleX = settleShown !== undefined ? camXFor(outputId, settleShown) : 0;
-      lastCamByOutput.set(outputId, settleX);
-      await sdk.windows.setOutputCamera(outputId, settleX, 0);
+      const settle = settleShown !== undefined
+        ? camPosFor(outputId, settleShown) : { x: 0, y: 0 };
+      lastCamByOutput.set(outputId, settle);
+      await sdk.windows.setOutputCamera(outputId, settle.x, settle.y);
       const focusEffect = r.sideEffects.find(
         (e): e is Extract<SideEffect, { kind: "requestFocusDecision" }> =>
           e.kind === "requestFocusDecision");
@@ -1409,18 +1442,19 @@ export default async function init(
     // Zoom back onto the shown workspace: optics only. The fit union
     // keeps riding the stack for the journey; settle collapses it.
     await cancelFlight(outputId);
-    const camX = shown !== undefined ? camXFor(outputId, shown) : 0;
+    const cam = shown !== undefined
+      ? camPosFor(outputId, shown) : { x: 0, y: 0 };
     if (t && sdk.animations) {
       const token = ++flightSeq;
       flying.set(outputId, token);
       try {
         const cur = await sdk.windows.getOutputCamera(outputId);
-        if (cur.x !== camX || cur.y !== 0 || cur.zoom !== 1) {
+        if (cur.x !== cam.x || cur.y !== cam.y || cur.zoom !== 1) {
           const spec: TweenSpec = {
             type: "tween",
             target: { kind: "output-camera", outputId },
             from: cur,
-            to: { x: camX, y: 0, zoom: 1 },
+            to: { x: cam.x, y: cam.y, zoom: 1 },
             duration: t.duration,
             easing: (t.easing ?? "ease-in-out") as EasingSpec,
           };
@@ -1437,8 +1471,8 @@ export default async function init(
       }
     }
     await pushStack(outputId, reg.stackFor(state, outputId));
-    lastCamByOutput.set(outputId, camX);
-    await sdk.windows.setOutputCamera(outputId, camX, 0);
+    lastCamByOutput.set(outputId, cam);
+    await sdk.windows.setOutputCamera(outputId, cam.x, cam.y);
   }
 
   // Emit the boot-time workspace.created for workspace 1, plus any side
