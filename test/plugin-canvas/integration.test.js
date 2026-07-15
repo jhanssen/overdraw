@@ -147,6 +147,7 @@ async function withCanvasPlugin(fn, opts = {}) {
     await rt.waitForNamespace('workspace');
     await fn({
       rt, sink, wm, wsEvents, seatCalls, layoutSnapshots, animCalls, animPending,
+      pluginBus,
       islands() { return layoutSnapshots.at(-1)?.islands ?? []; },
       addWindow(id) {
         wm.addWindow(id, res(id));
@@ -605,6 +606,26 @@ test('world: unfit returns to the shown workspace without touching the registry'
     assert.equal(wsEvents.length, 0, 'no workspace events for an optics-only unfit');
     const cur = await call(rt, 'current', [0]);
     assert.equal(cur.index, 1);
+  }, { world: true });
+});
+
+test('world: unfit targets the focused window\'s workspace by default', async () => {
+  await withCanvasPlugin(async (h) => {
+    const { rt, sink, pluginBus, wsEvents } = h;
+    await setupTwoIslands(h);
+    await rt.invokeAction('workspace.fit', {});
+    // Focus lands on 102 (framed, hidden ws2) while fitted -- click or
+    // follow-pointer hover; the plugin tracks it via window.change.
+    pluginBus.emit('window.change',
+      { surfaceId: 102, activated: true, changed: ['activated'] });
+    sink.cameraCalls.length = 0;
+    wsEvents.length = 0;
+
+    await rt.invokeAction('workspace.unfit', {});
+    assert.deepEqual(sink.cameraCalls.at(-1), { outputId: 0, x: PITCH, y: 0, zoom: 1 });
+    assert.deepEqual(sink.outputStackCalls.at(-1), { outputId: 0, ids: [102] });
+    assert.ok(wsEvents.some((e) => e.name === 'workspace.shown' && e.payload.index === 2),
+      'unfit onto the focused workspace is a show');
   }, { world: true });
 });
 

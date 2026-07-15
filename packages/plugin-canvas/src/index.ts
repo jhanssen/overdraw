@@ -908,10 +908,16 @@ export default async function init(
   }
 
   // workspace.unfit: zoom back in to a single workspace. Exits the fit;
-  // an explicit index different from the shown workspace is a normal
-  // show (flown when a transition is given), while the default -- the
-  // shown workspace itself -- restores camera + stack without touching
-  // registry truth (the fit never moved it).
+  // a target different from the shown workspace is a normal show (flown
+  // when a transition is given), while unfitting onto the shown
+  // workspace itself restores camera + stack without touching registry
+  // truth (the fit never moved it).
+  //
+  // Default target: the workspace of the focused window when it lives on
+  // this output -- while fitted every framed window is focusable
+  // (click, or hover under follow-pointer focus), so "zoom back in"
+  // lands on what the user selected. Falls back to the shown workspace
+  // when nothing framed holds focus.
   async function unfitTo(
     outputId: number, index: number | undefined, t: CameraTransitionSpec | null,
   ): Promise<void> {
@@ -919,7 +925,16 @@ export default async function init(
     const positions = state.positionsByOutput.get(outputId) ?? [];
     const shown = state.shownByOutput.get(outputId);
     const shownIdx = shown !== undefined ? positions.indexOf(shown) + 1 : 0;
-    const target = index ?? shownIdx;
+    let defaultIdx = shownIdx;
+    if (focusedSurfaceId !== null) {
+      const h = state.surfaceToHandle.get(focusedSurfaceId);
+      const focusRec = h !== undefined ? state.byHandle.get(h) : undefined;
+      if (focusRec && focusRec.outputId === outputId && h !== undefined) {
+        const i = positions.indexOf(h);
+        if (i >= 0) defaultIdx = i + 1;
+      }
+    }
+    const target = index ?? defaultIdx;
     if (target < 1 || target > positions.length) {
       throw new Error(
         `workspace.unfit: index ${target} out of bounds (1..${positions.length})`);
@@ -1126,7 +1141,7 @@ export default async function init(
   sdk.actions.register({
     name: "workspace.unfit",
     description:
-      "World mode: zoom the camera back in to one workspace (per-output `index`, default the shown one), exiting a workspace.fit. An index other than the shown workspace's behaves like show. Optional transition {duration, easing?} animates the zoom.",
+      "World mode: zoom the camera back in to one workspace, exiting a workspace.fit. Target = per-output `index` when given, else the focused window's workspace, else the shown one. A target other than the shown workspace behaves like show. Optional transition {duration, easing?} animates the zoom.",
     handler: async (params: unknown): Promise<null> => {
       if (!worldMode) {
         throw new Error(
