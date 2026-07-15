@@ -903,6 +903,76 @@ test('elastic: the docked camera scrolls to keep the focused window visible', as
   }, { canvas: { world: true, elastic: true } });
 });
 
+test('elastic: per-workspace opt-in via workspace.set-elastic (fixed default)', async () => {
+  await withCanvasPlugin(async (h) => {
+    const { rt, islands, addWindow } = h;
+    addWindow(101);
+    await settle();
+    await call(rt, 'create', [{}]);
+    await call(rt, 'show', [2, 0]);
+    addWindow(102);
+    await settle();
+    await call(rt, 'show', [1, 0]);
+    await settle();
+    addWindow(103);
+    await settle();
+    addWindow(104);
+    await settle();
+
+    // default: false -> ws1 stays a fixed viewport-sized island with
+    // master-stack (no layout hint), 3 managed members notwithstanding.
+    const list = await call(rt, 'list', [0]);
+    let ws1 = islands().find((i) => i.id === list[0].handle);
+    assert.deepEqual(ws1.rect, { x: 0, y: 0, width: 800, height: 600 });
+    assert.equal(ws1.layout, undefined);
+
+    // Toggle the shown workspace elastic: 3 columns -> strip 1200; the
+    // neighbor shoves right; ws2 itself stays fixed.
+    let r = await rt.invokeAction('workspace.set-elastic', {});
+    assert.equal(r.elastic, true);
+    ws1 = islands().find((i) => i.id === list[0].handle);
+    assert.deepEqual(ws1.rect, { x: 0, y: 0, width: 1200, height: 600 });
+    assert.deepEqual(ws1.layout, { mode: 'columns' });
+    const ws2 = islands().find((i) => i.id === list[1].handle);
+    assert.equal(ws2.rect.x, 1200 + 128);
+    assert.equal(ws2.layout, undefined);
+
+    // Toggle back: fixed again.
+    r = await rt.invokeAction('workspace.set-elastic', {});
+    assert.equal(r.elastic, false);
+    ws1 = islands().find((i) => i.id === list[0].handle);
+    assert.deepEqual(ws1.rect, { x: 0, y: 0, width: 800, height: 600 });
+
+    // Explicit index + elastic flag.
+    r = await rt.invokeAction('workspace.set-elastic', { index: 2, elastic: true });
+    assert.equal(r.elastic, true);
+    assert.deepEqual(islands().find((i) => i.id === list[1].handle).layout,
+      { mode: 'columns' });
+    await assert.rejects(
+      rt.invokeAction('workspace.set-elastic', { index: 9 }), /out of bounds/);
+  }, { canvas: { world: true, elastic: { default: false } } });
+});
+
+test('elastic: default-on config can opt one workspace back to fixed', async () => {
+  await withCanvasPlugin(async (h) => {
+    const { rt, islands, addWindow } = h;
+    addWindow(101);
+    await settle();
+    addWindow(102);
+    await settle();
+    addWindow(103);
+    await settle();   // strip 1200 by default
+    const list = await call(rt, 'list', [0]);
+    assert.equal(islands().find((i) => i.id === list[0].handle).rect.width, 1200);
+
+    const r = await rt.invokeAction('workspace.set-elastic', { elastic: false });
+    assert.equal(r.elastic, false);
+    const ws1 = islands().find((i) => i.id === list[0].handle);
+    assert.equal(ws1.rect.width, 800, 'compresses back to the viewport');
+    assert.equal(ws1.layout, undefined, 'master-stack again');
+  }, { canvas: { world: true, elastic: true } });
+});
+
 test('world: config-seeded bookmarks resolve at go time', async () => {
   await withCanvasPlugin(async (h) => {
     const { rt, sink, wsEvents } = h;

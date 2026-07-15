@@ -645,8 +645,13 @@ tests only.
    runtime bookmarks are session-scoped. Unit coverage in
    `plugin-canvas/integration.test.js`; GPU roam test in
    `canvas-fit.gpu.mjs`.
-   ALSO LANDED -- **elastic islands** (`canvas: { elastic: true |
-   { column } }`): every workspace island grows along its row -- one
+   ALSO LANDED -- **elastic islands**, per workspace (§2's one flag
+   per island): config `canvas.elastic` sets the DEFAULT (`true` /
+   `{ column }` = all elastic; `{ default: false, column }` = fixed
+   unless opted in) and `workspace.set-elastic {index?, output?,
+   elastic?}` overrides one workspace at runtime (omit `elastic` to
+   toggle; index defaults to the shown workspace; overrides are
+   session-scoped). An elastic island grows along its row -- one
    column of `column` × viewport width (default 0.5) per visible
    managed member; floating members take none, and an exclusive member
    collapses the strip to the viewport (maximize covers the screen,
@@ -669,8 +674,8 @@ tests only.
    any output's flip-complete, and a fully idle compositor forces one
    flip. GPU test: `plugin-canvas/canvas-elastic.gpu.mjs`.
    NOT yet: pointer drag-pan gesture; bookmark advertising on the bar
-   (§12's islands-vs-bookmarks question); per-workspace elastic
-   opt-in (the flag is currently config-global); placement
+   (§12's islands-vs-bookmarks question); persistent growth overrides
+   (set-elastic is session-scoped); placement
    rules targeting islands; gutters + shove beyond the single-row
    arrangement; hotplug camera
    persistence/rescue; overview UX (an interactive picker/gesture on

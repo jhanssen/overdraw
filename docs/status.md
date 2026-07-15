@@ -1000,9 +1000,12 @@ validated + resolved + consumed by the runtime + hotkey plugin.
   `workspace.bookmark-set/go/delete/list` name camera framings (dock
   -> island, fit -> range, roam -> rect+zoom) and `canvas.bookmarks`
   config entries re-seed each start with workspace-name references
-  resolved at go time. Elastic islands are LANDED behind
-  `canvas: { elastic: true | { column } }` (canvas-design.md §5):
-  each workspace becomes a niri-style strip -- one column per visible
+  resolved at go time. Elastic islands are LANDED, per workspace
+  (canvas-design.md §5): config `canvas.elastic` sets the default
+  (`true | { column }` = all elastic; `{ default: false, column }` =
+  opt-in) and `workspace.set-elastic` overrides one workspace at
+  runtime (session-scoped; omitted `elastic` toggles). An elastic
+  workspace becomes a niri-style strip -- one column per visible
   managed member, tiled as equal columns via the per-island layout
   hint (`LayoutIsland.layout` -> `LayoutInputs.island.layout`; the
   bundled provider recognizes `{ mode: "columns" }`); the row
@@ -1018,8 +1021,8 @@ validated + resolved + consumed by the runtime + hotkey plugin.
   `plugin-canvas/canvas-elastic.gpu.mjs`; unit coverage in
   `plugin-canvas/integration.test.js`.
   NOT built: pointer drag-pan gesture, bookmark advertising via
-  ext-workspace, per-workspace elastic opt-in (the flag is
-  config-global), gutters/shove beyond the single-row arrangement,
+  ext-workspace, persistent growth overrides (set-elastic is
+  session-scoped), gutters/shove beyond the single-row arrangement,
   hotplug camera persistence, ext-workspace per-group duplicate
   projection, camera-following compose/live scenes, the
   de-workspacing renames/retirements (canvas-design.md §10b).

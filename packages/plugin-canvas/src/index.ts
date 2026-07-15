@@ -125,15 +125,20 @@ export default async function init(
   const worldMode = !!config?.canvas && typeof config.canvas === "object"
     && (config.canvas as { world?: unknown }).world === true;
 
-  // Elastic strips (canvas-design.md §5): every workspace island grows
-  // along its row as managed members exceed the viewport -- one column of
-  // `column` × viewport width per managed member, tiled by the layout
-  // provider's columns mode -- and the docked camera scrolls within the
-  // strip to follow focus. Off = fixed islands (classic compression).
+  // Elastic strips (canvas-design.md §5): an elastic workspace island
+  // grows along its row as managed members exceed the viewport -- one
+  // column of `column` × viewport width per managed member, tiled by the
+  // layout provider's columns mode -- and the docked camera scrolls
+  // within the strip to follow focus. Fixed = classic compression.
+  // Growth is per workspace: config `elastic` sets the DEFAULT
+  // (true / { column } = all elastic; { default: false, column } =
+  // fixed unless opted in), and workspace.set-elastic overrides one
+  // workspace either way at runtime.
   const elasticRaw = worldMode
     ? (config?.canvas as { elastic?: unknown }).elastic : undefined;
-  const elasticMode = elasticRaw === true
-    || (typeof elasticRaw === "object" && elasticRaw !== null);
+  const elasticDefault = elasticRaw === true
+    || (typeof elasticRaw === "object" && elasticRaw !== null
+        && (elasticRaw as { default?: unknown }).default !== false);
   let colFraction = 0.5;
   if (typeof elasticRaw === "object" && elasticRaw !== null) {
     const c = (elasticRaw as { column?: unknown }).column;
@@ -283,7 +288,7 @@ export default async function init(
         }
         // Elastic strips: keep the newly focused window inside the
         // docked view -- scroll the camera minimally within its island.
-        if (rec && elasticMode && !override.has(rec.outputId)
+        if (rec && worldMode && isElastic(handle) && !override.has(rec.outputId)
             && state.shownByOutput.get(rec.outputId) === handle) {
           const sid = p.surfaceId;
           void (async () => {
@@ -310,7 +315,7 @@ export default async function init(
   // docked view. stack.relayout carries the fresh post-layout rects, so
   // this needs no extra windows.get round trip.
   sdk.events.subscribe("stack.relayout", (_name, payload) => {
-    if (!worldMode || !elasticMode || focusedSurfaceId === null) return;
+    if (!worldMode || focusedSurfaceId === null) return;
     if (!payload || typeof payload !== "object") return;
     const wins = (payload as { windows?: unknown }).windows;
     if (!Array.isArray(wins)) return;
@@ -320,7 +325,7 @@ export default async function init(
       && (w.newOuter as { width: number }).width > 0);
     if (!entry) return;
     const handle = state.surfaceToHandle.get(focusedSurfaceId);
-    if (handle === undefined) return;
+    if (handle === undefined || !isElastic(handle)) return;
     const rec = state.byHandle.get(handle);
     if (!rec || override.has(rec.outputId)) return;
     if (state.shownByOutput.get(rec.outputId) !== handle) return;
@@ -455,6 +460,12 @@ export default async function init(
   // viewport (world px from the island's left edge; clamped on use, so a
   // shrinking island self-corrects).
   const scrollByHandle = new Map<WorkspaceHandle, number>();
+  // Per-workspace growth override (workspace.set-elastic); absent = the
+  // config default. Session-scoped; pruned with the workspace.
+  const growthByHandle = new Map<WorkspaceHandle, boolean>();
+  function isElastic(handle: WorkspaceHandle): boolean {
+    return growthByHandle.get(handle) ?? elasticDefault;
+  }
   // Row arrangement computed by publishWorld: each workspace's island
   // rect, keyed per output. camXFor / fitCameraFor read this cache
   // synchronously; publishWorld refreshes it on every structural change.
@@ -742,16 +753,21 @@ export default async function init(
 
   async function publishWorld(): Promise<void> {
     if (!worldMode) return;
-    // Drop slots + scroll for destroyed workspaces.
+    // Drop slots + scroll + growth overrides for destroyed workspaces.
     for (const h of [...slotByHandle.keys()]) {
       if (!state.byHandle.has(h)) slotByHandle.delete(h);
     }
     for (const h of [...scrollByHandle.keys()]) {
       if (!state.byHandle.has(h)) scrollByHandle.delete(h);
     }
+    for (const h of [...growthByHandle.keys()]) {
+      if (!state.byHandle.has(h)) growthByHandle.delete(h);
+    }
     // Elastic growth reads each member's lane from a windows snapshot.
+    const anyElastic = elasticDefault
+      || [...growthByHandle.values()].some((v) => v);
     const snapById = new Map<number, WindowSnapshotLike>();
-    if (elasticMode) {
+    if (anyElastic) {
       for (const s of await sdk.windows.list()) snapById.set(s.surfaceId, s);
     }
     const islands: Array<{
@@ -777,7 +793,7 @@ export default async function init(
         let x = g.x;
         for (const h of ordered) {
           const rec = state.byHandle.get(h);
-          const width = elasticMode && rec
+          const width = rec && isElastic(h)
             ? elasticWidth(g, rec.members, snapById)
             : g.width;
           row.set(h, { x, y: g.y, width, height: g.height });
@@ -793,7 +809,7 @@ export default async function init(
           contextOutputId: outputId,
           rect: row.get(h) ?? null,
           members: [...rec.members],
-          ...(elasticMode ? { layout: { mode: "columns" } } : {}),
+          ...(isElastic(h) ? { layout: { mode: "columns" } } : {}),
         });
       }
     }
@@ -1626,6 +1642,37 @@ export default async function init(
   });
 
   sdk.actions.register({
+    name: "workspace.set-elastic",
+    description:
+      "World mode: set a workspace's growth -- elastic strip (true) or fixed island (false); omit `elastic` to toggle. Positional {index?, output?}; index defaults to the shown workspace on the focused output.",
+    handler: async (params: unknown): Promise<{ elastic: boolean }> => {
+      if (!worldMode) {
+        throw new Error(
+          "workspace.set-elastic: requires canvas world mode (canvas: { world: true })");
+      }
+      const p = parseSetElasticParams(params, resolveOutputName, focusedOutputId());
+      const positions = state.positionsByOutput.get(p.outputId) ?? [];
+      let handle: WorkspaceHandle | undefined;
+      if (p.index !== undefined) {
+        handle = positions[p.index - 1];
+        if (handle === undefined) {
+          throw new Error(
+            `workspace.set-elastic: index ${p.index} out of bounds (1..${positions.length})`);
+        }
+      } else {
+        handle = state.shownByOutput.get(p.outputId);
+        if (handle === undefined) {
+          throw new Error("workspace.set-elastic: no shown workspace on the target output");
+        }
+      }
+      const next = p.elastic ?? !isElastic(handle);
+      growthByHandle.set(handle, next);
+      await publishWorld();
+      return { elastic: next };
+    },
+  });
+
+  sdk.actions.register({
     name: "workspace.bookmark-set",
     description:
       "World mode: save the output's current camera framing under `name` -- a dock captures the shown workspace, a fit captures the framed range, a roam captures the raw rect + zoom.",
@@ -2141,6 +2188,38 @@ function parseZoomParams(
   const outputId = parseOptionalOutput(
     params, resolveOutput, defaultOutputId, "workspace.zoom");
   return { factor: params.factor, outputId };
+}
+
+// workspace.set-elastic: optional per-output index (default: the shown
+// workspace) + optional elastic flag (absent = toggle) + optional output.
+function parseSetElasticParams(
+  params: unknown,
+  resolveOutput: (input: string) => number | null,
+  defaultOutputId: number,
+): { index?: number; elastic?: boolean; outputId: number } {
+  if (params === undefined || params === null) {
+    return { outputId: defaultOutputId };
+  }
+  if (!isObj(params)) {
+    throw new TypeError("workspace.set-elastic: expected an object");
+  }
+  const outputId = parseOptionalOutput(
+    params, resolveOutput, defaultOutputId, "workspace.set-elastic");
+  const out: { index?: number; elastic?: boolean; outputId: number } = { outputId };
+  if (params.index !== undefined) {
+    if (typeof params.index !== "number" || !Number.isInteger(params.index)
+        || params.index < 1) {
+      throw new TypeError("workspace.set-elastic: index must be a positive integer");
+    }
+    out.index = params.index;
+  }
+  if (params.elastic !== undefined) {
+    if (typeof params.elastic !== "boolean") {
+      throw new TypeError("workspace.set-elastic: elastic must be a boolean");
+    }
+    out.elastic = params.elastic;
+  }
+  return out;
 }
 
 // Bookmark verbs: { name, output? }.
