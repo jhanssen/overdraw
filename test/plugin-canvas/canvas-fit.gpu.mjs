@@ -3,6 +3,13 @@
 // range: the framed workspaces' members all composite (scaled) and become
 // resident, while registry truth (shown workspace) stays put. unfit zooms
 // back in to the shown slot and re-hides the rest.
+//
+// Both windows carry a rounded shape (what a decoration provider's border
+// radius stamps): the shape-clip footprint must map through the camera
+// zoom like the window quad does -- a zoom-blind clip truncates every
+// shaped window to the part its unscaled world rect happens to cover on
+// glass, and fully clips windows whose world rect lies past the output's
+// extent.
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
@@ -71,6 +78,11 @@ test("world mode: fit frames both workspaces; unfit zooms back", { skip }, async
       (x) => x === 0, { what: "camera docked at slot 0" });
     await settled(() => enteredOf(c, bId),
       (e) => e.length === 0, { what: "B hidden before fit" });
+
+    // Rounded shapes on both windows (what a decoration border radius
+    // stamps): their clip footprints must follow the camera zoom.
+    c.state.compositor.setSurfaceShape(aId, { kind: "rounded-rect", radius: 10 });
+    c.state.compositor.setSurfaceShape(bId, { kind: "rounded-rect", radius: 10 });
 
     // Fit the whole row: camera zooms out + letterboxes, both windows
     // composite at their scaled slot positions with void between them,

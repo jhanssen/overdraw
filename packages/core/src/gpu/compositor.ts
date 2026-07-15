@@ -689,10 +689,15 @@ function defaultFx(): SurfaceFx {
 // invisible window" failure mode, easier to reason about than NaN propagation).
 function packShape(data: Float32Array, shape: SurfaceShape,
                    winXPx: number, winYPx: number,
-                   map: { ox: number; oy: number; sx: number; sy: number }): void {
+                   map: { ox: number; oy: number; sx: number; sy: number },
+                   radiusScale = 1): void {
   // shape (vec4 #10, floats 40..43): kind, winXpx, winYpx, radius
   // shapeExtra (vec4 #11, floats 44..47): kind-specific
   // shapeMap (vec4 #12, floats 48..51): offsetU, offsetV, spanU, spanV
+  //
+  // `radiusScale` converts radii from the shape's logical units into the
+  // frame winXPx/winYPx are expressed in (the camera zoom when the window
+  // frame is glass-space); exponents are dimensionless and pass through.
   data[41] = winXPx;
   data[42] = winYPx;
   data[48] = map.ox; data[49] = map.oy; data[50] = map.sx; data[51] = map.sy;
@@ -700,18 +705,18 @@ function packShape(data: Float32Array, shape: SurfaceShape,
   switch (shape.kind) {
     case "rounded-rect":
       data[40] = 1;
-      data[43] = sanitizeNonNeg(shape.radius);
+      data[43] = sanitizeNonNeg(shape.radius * radiusScale);
       return;
     case "rounded-rect-per-corner":
       data[40] = 2;
-      data[44] = sanitizeNonNeg(shape.tl);
-      data[45] = sanitizeNonNeg(shape.tr);
-      data[46] = sanitizeNonNeg(shape.br);
-      data[47] = sanitizeNonNeg(shape.bl);
+      data[44] = sanitizeNonNeg(shape.tl * radiusScale);
+      data[45] = sanitizeNonNeg(shape.tr * radiusScale);
+      data[46] = sanitizeNonNeg(shape.br * radiusScale);
+      data[47] = sanitizeNonNeg(shape.bl * radiusScale);
       return;
     case "superellipse":
       data[40] = 3;
-      data[43] = sanitizeNonNeg(shape.radius);
+      data[43] = sanitizeNonNeg(shape.radius * radiusScale);
       // The shader clamps n>=2 inline; pass through here.
       data[44] = Number.isFinite(shape.exponent) ? shape.exponent : 2;
       return;
@@ -3053,14 +3058,19 @@ export class JsCompositor implements CompositorSink {
     if (clipShape === null) {
       packShape(data, null, pw, ph, IDENTITY_SHAPE_MAP);
     } else {
-      const wx = clip ? clip.x - ox : px;
-      const wy = clip ? clip.y - oy : py;
-      const ww = clip && clip.w > 0 ? clip.w : pw;
-      const wh = clip && clip.h > 0 ? clip.h : ph;
+      // The clip footprint is world coords while px/py/pw/ph are glass
+      // (camera view origin subtracted, zoom-scaled), so the footprint
+      // maps through the same camera -- and the radii scale to glass
+      // units with it. Without the zoom term a zoomed-out view clips
+      // every shaped window against its unscaled world rect.
+      const wx = clip ? (clip.x - ox) * camZ : px;
+      const wy = clip ? (clip.y - oy) * camZ : py;
+      const ww = clip && clip.w > 0 ? clip.w * camZ : pw;
+      const wh = clip && clip.h > 0 ? clip.h * camZ : ph;
       const map = (ww > 0 && wh > 0)
         ? { ox: (px - wx) / ww, oy: (py - wy) / wh, sx: pw / ww, sy: ph / wh }
         : IDENTITY_SHAPE_MAP;
-      packShape(data, clipShape, ww, wh, map);
+      packShape(data, clipShape, ww, wh, map, camZ);
     }
     this.device.queue.writeBuffer(s.uniformBuf, 0, data);
   }
