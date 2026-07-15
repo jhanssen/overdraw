@@ -1517,6 +1517,80 @@ export class JsCompositor implements CompositorSink {
   // and cursor are global (drawn into every output's viewport; the renderer's
   // per-output viewport + scissor confines them to where they belong in global
   // logical space).
+  // Island backdrops: world-space translucent quads drawn at the bottom of
+  // the content segment (above wallpaper / bottom layers, below every
+  // window). Each is a compositor-private Surface with a 1x1 colored
+  // texture stretched to its rect; world-space (not outputAnchored), so
+  // the camera pans/zooms them with the islands they mark. Ids come from
+  // a private negative range -- they never collide with protocol surface
+  // ids and are invisible to residency/hit-testing (not in the WM).
+  private static readonly BACKDROP_ID_BASE = -0x40000000;
+  private backdropIds: number[] = [];
+  // Packed rgba currently uploaded to each backdrop's texel.
+  private backdropColors: number[] = [];
+
+  setIslandBackdrops(list: ReadonlyArray<{
+    x: number; y: number; width: number; height: number;
+    // 0-255 straight-alpha color.
+    color: { r: number; g: number; b: number; a: number };
+  }>): void {
+    // Shrink: drop surplus backdrop surfaces.
+    while (this.backdropIds.length > list.length) {
+      const id = this.backdropIds.pop();
+      this.backdropColors.pop();
+      if (id === undefined) break;
+      const s = this.surfaces.get(id);
+      s?.texture?.destroy();
+      s?.uniformBuf?.destroy();
+      this.surfaces.delete(id);
+    }
+    let changed = this.backdropIds.length !== list.length;
+    for (let i = 0; i < list.length; i++) {
+      const b = list[i];
+      let id = this.backdropIds[i];
+      if (id === undefined) {
+        id = JsCompositor.BACKDROP_ID_BASE - i;
+        this.backdropIds[i] = id;
+        const s = blankSurface(b.x, b.y, b.width, b.height);
+        const tex = this.device.createTexture({
+          size: { width: 1, height: 1 },
+          format: "bgra8unorm",
+          usage: this.g.GPUTextureUsage.TEXTURE_BINDING | this.g.GPUTextureUsage.COPY_DST,
+        });
+        s.texture = tex;
+        s.view = tex.createView();
+        s.width = 1; s.height = 1; s.present = true;
+        this.rebuildBindGroup(s, s.view);
+        this.surfaces.set(id, s);
+        changed = true;
+      }
+      const s = this.surfaces.get(id);
+      if (!s) continue;
+      if (s.x !== b.x || s.y !== b.y || s.layoutW !== b.width || s.layoutH !== b.height) {
+        s.x = b.x; s.y = b.y; s.layoutW = b.width; s.layoutH = b.height;
+        changed = true;
+      }
+      // The 1x1 texel carries the color; straight alpha, and the draw
+      // path blends (opaque=false). Premultiply for the blend the
+      // pipeline uses on sampled textures (client buffers arrive
+      // premultiplied; ours must match or translucency over-brightens).
+      const key = (b.color.r << 24 | b.color.g << 16 | b.color.b << 8 | b.color.a) >>> 0;
+      if (this.backdropColors[i] !== key) {
+        this.backdropColors[i] = key;
+        const a = Math.max(0, Math.min(255, b.color.a));
+        const pm = (v: number): number =>
+          Math.round(Math.max(0, Math.min(255, v)) * a / 255);
+        this.device.queue.writeTexture(
+          { texture: s.texture as GPUTexture },
+          new Uint8Array([pm(b.color.b), pm(b.color.g), pm(b.color.r), a]),
+          { offset: 0, bytesPerRow: 4, rowsPerImage: 1 }, { width: 1, height: 1 },
+        );
+        changed = true;
+      }
+    }
+    if (changed) this.damageFull();
+  }
+
   private drawOrder(outputId: number, includeCursor = true): number[] {
     const out: number[] = [];
     // Per-output content stack via setOutputStack when set. The fallback
@@ -1531,6 +1605,9 @@ export class JsCompositor implements CompositorSink {
                  ?? (useGlobal ? this.stack : EMPTY_STACK);
     for (const layer of LAYER_ORDER) {
       if (layer === "content") {
+        // Island backdrops sit at the bottom of the content segment:
+        // above wallpaper/bottom layers, below every window.
+        if (this.backdropIds.length > 0) out.push(...this.backdropIds);
         out.push(...content);
         // Phantoms (closing-animation snapshots) draw on top of the content
         // layer but below the 'above' layer. Insertion order = z order; the

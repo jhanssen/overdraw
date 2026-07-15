@@ -160,6 +160,33 @@ export default async function init(
   // Camera scroll animation within a strip (ms).
   const SCROLL_MS = 150;
 
+  // Empty-island backdrops: a translucent world-space quad marks each
+  // island with no members, so empty (typically persistent) workspaces
+  // are visible while fitted or roaming instead of reading as void.
+  // `canvas.islandBackdrop` overrides the color ("#rrggbb" or
+  // "#rrggbbaa"); false disables.
+  function parseBackdropColor(
+    v: unknown,
+  ): { r: number; g: number; b: number; a: number } | null {
+    if (v === false) return null;
+    const def = { r: 128, g: 128, b: 128, a: 56 };
+    if (typeof v !== "string") return def;
+    const m = /^#([0-9a-fA-F]{6})([0-9a-fA-F]{2})?$/.exec(v);
+    if (!m) {
+      sdk.log(`canvas: islandBackdrop must be #rrggbb[aa]; using the default`);
+      return def;
+    }
+    const n = parseInt(m[1], 16);
+    return {
+      r: (n >> 16) & 0xff, g: (n >> 8) & 0xff, b: n & 0xff,
+      a: m[2] !== undefined ? parseInt(m[2], 16) : 56,
+    };
+  }
+  const backdropColor = worldMode
+    ? parseBackdropColor((config?.canvas as { islandBackdrop?: unknown }).islandBackdrop)
+    : null;
+  let lastBackdropsJson = "";
+
   // Snapshot-based show transitions capture arrangement-anchored scenes
   // and cannot represent a world-docked view; in world mode a `transition`
   // instead requests a camera FLIGHT to the destination island (the kind
@@ -862,6 +889,21 @@ export default async function init(
     }
     islands.sort((a, b) => a.id - b.id);
     await sdk.windows.setIslands(islands);
+    // Mark empty islands with a translucent backdrop so they're visible
+    // while fitted / roaming. Dedupe on content -- publishWorld runs on
+    // every structural change and the sink repaints on each set.
+    if (backdropColor) {
+      const backdrops = islands
+        .filter((i) => i.members.length === 0 && i.rect !== null)
+        .map((i) => ({ ...(i.rect as { x: number; y: number; width: number; height: number }), color: backdropColor }));
+      const json = JSON.stringify(backdrops);
+      if (json !== lastBackdropsJson) {
+        lastBackdropsJson = json;
+        try {
+          await sdk.windows.setIslandBackdrops(backdrops);
+        } catch { /* sink without backdrop support (harness) */ }
+      }
+    }
     // Overridden outputs maintain their own union stack + camera.
     await refreshOverrides();
     // Dock each output's camera on its shown island (instant). Identity

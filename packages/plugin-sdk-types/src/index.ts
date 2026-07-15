@@ -99,6 +99,10 @@ export interface PluginWindowsLike {
   getOutputCamera(outputId: number): Promise<{ x: number; y: number; zoom: number }>;
   beginCameraPan(outputId: number): Promise<boolean>;
   endCameraPan(outputId: number): Promise<{ x: number; y: number; zoom: number }>;
+  setIslandBackdrops(list: ReadonlyArray<{
+    x: number; y: number; width: number; height: number;
+    color: { r: number; g: number; b: number; a: number };
+  }>): Promise<void>;
   setIslands(islands: ReadonlyArray<{
     id: number;
     contextOutputId: number;

@@ -22,7 +22,9 @@ function argbToBgra(argb) {
   const a = (argb >>> 24) & 0xff;
   return [b, g, r, a];
 }
-const BLACK = [0, 0, 0, 255];
+// An empty workspace draws the default island backdrop (gray 128 at
+// alpha 56, premultiplied over the black void -> ~28).
+const EMPTY_BACKDROP = [28, 28, 28, 255];
 
 async function readUntil(c, pred, { timeoutMs = 3000 } = {}) {
   return await settled(() => c.frameReadback(),
@@ -57,7 +59,7 @@ test("world mode: workspaces at slots, camera docks on show", { skip }, async ()
     await c.runtime.invokeAction("workspace.show-at-index", { index: 2 });
     await settled(() => c.query().outputs[0].cameraX,
       (x) => x === PITCH, { what: "camera docked at slot 1" });
-    await readUntil(c, (p) => pixelMatches(pixelAt(p, OUT.width, 640, 360), BLACK, 4));
+    await readUntil(c, (p) => pixelMatches(pixelAt(p, OUT.width, 640, 360), EMPTY_BACKDROP, 4));
     await settled(() => enteredOf(c, aId),
       (e) => e.length === 0, { what: "A left all outputs while hidden" });
     assert.equal(c.query().windows.find((w) => w.surfaceId === aId).rect.x, 0,

@@ -121,6 +121,39 @@ test("world mode: fit frames both workspaces; unfit zooms back", { skip }, async
   }
 });
 
+test("world mode: empty persistent islands draw a backdrop, visible when fitted", { skip }, async () => {
+  const c = await setupCompositor({
+    headless: OUT,
+    config: {
+      canvas: {
+        world: true,
+        islandBackdrop: "#4080c080",   // translucent blue, alpha 0x80
+        workspaces: [{ name: "spare" }],
+      },
+    },
+  });
+  try {
+    const cA = 0xff3030c0;
+    const a = c.spawnClient([FILL, "--color", cA.toString(16)]);
+    await a.ready;
+    await c.waitFor(c.query, (s) => s.windows.length === 1, { what: "A mapped" });
+    await readUntil(c, (p) => pixelMatches(pixelAt(p, OUT.width, 640, 360), argbToBgra(cA), 4));
+
+    // Fit both islands: ws1 shows A; the empty persistent "spare" island
+    // shows its backdrop (premultiplied 0x80 alpha over black ≈ half the
+    // color) instead of reading as void.
+    await c.runtime.invokeAction("workspace.fit", {});
+    await settled(() => c.query().outputs[0].cameraZoom, (z) => z < 1, { what: "fitted" });
+    const zoom = OUT.width / BOUNDS_W;
+    const gx = Math.round((PITCH + OUT.width / 2 - CAM_X) * zoom);
+    const gy = Math.round((OUT.height / 2 - (OUT.height - OUT.height / zoom) / 2) * zoom);
+    await readUntil(c, (p) =>
+      pixelMatches(pixelAt(p, OUT.width, gx, gy), [0x60, 0x40, 0x20, 255], 12));
+  } finally {
+    await c.teardown();
+  }
+});
+
 test("world mode: pan roams the camera; hidden workspaces become visible", { skip }, async () => {
   const c = await setupCompositor({ headless: OUT, config: { canvas: { world: true } } });
   try {

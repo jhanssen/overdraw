@@ -34,7 +34,11 @@ function mockSink() {
     setOutputCamera(outputId, x, y, zoom = 1) {
       sink.cameraCalls.push({ outputId, x, y, zoom });
     },
+    setIslandBackdrops(list) {
+      sink.backdropCalls.push(list.map((b) => ({ ...b })));
+    },
   };
+  sink.backdropCalls = [];
   return sink;
 }
 
@@ -1314,6 +1318,41 @@ test('canvas.workspaces: seeds named persistent workspaces with elastic by name'
         { name: 'comms' },
         { name: 'media', elastic: { column: 0.75 }, persistent: false },
       ],
+    },
+  });
+});
+
+test('world: empty islands publish backdrops; occupied ones do not', async () => {
+  await withCanvasPlugin(async (h) => {
+    const { rt, sink, addWindow } = h;
+    await settle();
+    // Boot: ws1 (empty, shown) + declared "spare" (empty) -> 2 backdrops.
+    let last = sink.backdropCalls.at(-1);
+    assert.equal(last.length, 2);
+    assert.deepEqual(last[0], {
+      x: 0, y: 0, width: 800, height: 600,
+      color: { r: 0x40, g: 0x80, b: 0xc0, a: 0x80 },
+    });
+    assert.equal(last[1].x, PITCH);
+
+    // A window on ws1 removes its backdrop; "spare" keeps its own.
+    addWindow(101);
+    await settle();
+    last = sink.backdropCalls.at(-1);
+    assert.equal(last.length, 1);
+    assert.equal(last[0].x, PITCH);
+
+    // Moving the window to "spare" flips which island is marked.
+    await rt.invokeAction('workspace.move-window', { surfaceId: 101, name: 'spare' });
+    await settle();
+    last = sink.backdropCalls.at(-1);
+    assert.equal(last.length, 1);
+    assert.equal(last[0].x, 0);
+  }, {
+    canvas: {
+      world: true,
+      islandBackdrop: '#4080c080',
+      workspaces: [{ name: 'spare' }],
     },
   });
 });

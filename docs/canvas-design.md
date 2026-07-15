@@ -716,6 +716,16 @@ tests only.
    stack) at the current camera and hands the pointer to the grab,
    backing out cleanly when another grab owns the pointer. GPU test:
    `plugin-canvas/canvas-drag-pan.gpu.mjs`.
+   ALSO LANDED -- **empty-island backdrops**: islands with no members
+   draw a translucent world-space quad (a compositor-private 1x1
+   colored surface stretched to the island rect, inserted at the
+   bottom of the content segment -- above wallpaper, below windows --
+   and camera-mapped, so it pans/zooms with the island). Empty
+   (typically persistent) workspaces read as places instead of void
+   while fitted or roaming. `canvas.islandBackdrop` sets the color
+   (`#rrggbb[aa]`, default a faint gray; `false` disables). Sink
+   surface via `setIslandBackdrops` (windows.set-island-backdrops);
+   backdrops are render-only -- not hit-testable, no residency.
    ALSO LANDED -- **membership on drag** (§3's third membership
    trigger): a move grab's release emits `window.drag-dropped` with
    the pointer's WORLD position (through the content camera, so drops

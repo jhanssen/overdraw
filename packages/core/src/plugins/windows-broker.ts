@@ -86,6 +86,7 @@ export function createWindowsBroker(deps: WindowsBrokerDeps): WindowsBroker {
     if (method === "windows.get-output-camera") return handleGetOutputCamera(params);
     if (method === "windows.set-islands") return handleSetIslands(params);
     if (method === "windows.begin-camera-pan") return handleBeginCameraPan(params);
+    if (method === "windows.set-island-backdrops") return handleSetIslandBackdrops(params);
     if (method === "windows.end-camera-pan") return handleEndCameraPan(params);
     if (method === "windows.focus") return handleFocus(params);
     if (method === "windows.request-focus-decision") return handleRequestFocusDecision(params);
@@ -364,6 +365,37 @@ export function createWindowsBroker(deps: WindowsBrokerDeps): WindowsBroker {
     // evaluator's transient per-frame ones, so a flight preempted
     // mid-motion reads its true starting point here.
     return state.outputCameras?.get(outputId) ?? { x: 0, y: 0, zoom: 1 };
+  }
+
+  function handleSetIslandBackdrops(p: unknown): null {
+    if (!p || typeof p !== "object"
+      || !Array.isArray((p as { list?: unknown }).list)) {
+      throw new Error("windows.set-island-backdrops: malformed payload");
+    }
+    const list = (p as { list: unknown[] }).list.map((raw, i) => {
+      if (!raw || typeof raw !== "object") {
+        throw new Error(`windows.set-island-backdrops: list[${i}] must be an object`);
+      }
+      const b = raw as {
+        x?: unknown; y?: unknown; width?: unknown; height?: unknown; color?: unknown;
+      };
+      const c = b.color as { r?: unknown; g?: unknown; b?: unknown; a?: unknown } | null;
+      if (typeof b.x !== "number" || typeof b.y !== "number"
+        || typeof b.width !== "number" || typeof b.height !== "number"
+        || !c || typeof c.r !== "number" || typeof c.g !== "number"
+        || typeof c.b !== "number" || typeof c.a !== "number") {
+        throw new Error(`windows.set-island-backdrops: list[${i}] malformed`);
+      }
+      return {
+        x: b.x, y: b.y, width: b.width, height: b.height,
+        color: { r: c.r, g: c.g, b: c.b, a: c.a },
+      };
+    });
+    if (!compositor.setIslandBackdrops) {
+      throw new Error("windows.set-island-backdrops: not supported by this compositor");
+    }
+    compositor.setIslandBackdrops(list);
+    return null;
   }
 
   // Drag-pan (canvas-design.md §4): install a camera-pan pointer grab on

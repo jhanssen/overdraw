@@ -222,6 +222,13 @@ export interface PluginWindows extends PluginWindowObserver {
   beginCameraPan(outputId: number): Promise<boolean>;
   endCameraPan(outputId: number): Promise<{ x: number; y: number; zoom: number }>;
 
+  // World-space translucent quads at the bottom of the content segment
+  // (empty-island markers). Replaces the previous set; [] clears.
+  setIslandBackdrops(list: ReadonlyArray<{
+    x: number; y: number; width: number; height: number;
+    color: { r: number; g: number; b: number; a: number };
+  }>): Promise<void>;
+
   // Explicit focus override; bypasses the focus plugin's decide()
   // (core-plugin-api.md §1). null clears. For policy-mediated focus
   // changes, emit an event the focus plugin observes instead.
@@ -463,6 +470,19 @@ export function createPluginWindows(
         throw new TypeError("getOutputCamera: malformed broker reply");
       }
       return { x: cam.x, y: cam.y, zoom: cam.zoom };
+    },
+
+    async setIslandBackdrops(list): Promise<void> {
+      if (!Array.isArray(list)) {
+        throw new TypeError("setIslandBackdrops list must be an array");
+      }
+      const payload: Json = {
+        list: list.map((b) => ({
+          x: b.x, y: b.y, width: b.width, height: b.height,
+          color: { r: b.color.r, g: b.color.g, b: b.color.b, a: b.color.a },
+        })),
+      };
+      await endpoint.request("windows.set-island-backdrops", payload);
     },
 
     async beginCameraPan(outputId): Promise<boolean> {

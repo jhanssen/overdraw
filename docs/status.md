@@ -1020,6 +1020,10 @@ validated + resolved + consumed by the runtime + hotkey plugin.
   `plugin-canvas/canvas-fit.gpu.mjs`,
   `plugin-canvas/canvas-elastic.gpu.mjs`; unit coverage in
   `plugin-canvas/integration.test.js`.
+  Empty-island backdrops are LANDED: memberless islands draw a
+  translucent camera-mapped quad (`canvas.islandBackdrop` color,
+  `setIslandBackdrops` sink surface) so empty persistent workspaces
+  are visible while fitted/roaming.
   Membership-on-drag is LANDED: a move grab's drop (window.drag-dropped,
   pointer world position + pre-grab lane) re-parents the window to the
   island under the cursor -- previously-tiled windows re-tile there,

@@ -370,6 +370,12 @@ export interface CompositorSink {
   setOutputCamera?(
     outputId: number, x: number, y: number, zoom?: number,
     transient?: boolean): void;
+  // World-space translucent quads at the bottom of the content segment
+  // (island markers for empty islands; the camera pans/zooms them).
+  setIslandBackdrops?(list: ReadonlyArray<{
+    x: number; y: number; width: number; height: number;
+    color: { r: number; g: number; b: number; a: number };
+  }>): void;
   // Mark a surface as glass-positioned (ignores the content camera) even
   // though it rides the content stack: popups parented to layer-shell
   // surfaces. Optional (GPU-free test sinks omit it).
