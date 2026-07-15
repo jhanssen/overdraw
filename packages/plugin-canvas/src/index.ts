@@ -16,7 +16,10 @@
 //   output's camera on the shown island instantly, or FLIES it there when
 //   the caller passes a `transition` (duration + easing drive a camera
 //   tween; the union of departure + destination stacks rides the output
-//   for the journey so the world visibly slides by).
+//   for the journey so the world visibly slides by). `workspace.fit`
+//   zooms the camera out (optically) to frame a consecutive run of
+//   workspaces without moving registry truth; `workspace.unfit` zooms
+//   back in to one.
 
 import type {
   WorkspaceAPI, WorkspaceHandle, WorkspaceIndex, WorkspaceSnapshot,
@@ -294,6 +297,7 @@ export default async function init(
     liveOutputs.delete(p.outputId);
     outputAliasesById.delete(p.outputId);
     outputGeom.delete(p.outputId);
+    fitted.delete(p.outputId);
     // Focus may have been on this output; reset to OUTPUT_DEFAULT so the
     // next action targets a live output rather than the vanished one.
     if (focusedOutputIdCache === p.outputId) {
@@ -377,6 +381,102 @@ export default async function init(
   // stackFor cannot know about -- a preempting flight unions against it
   // so nothing pops off screen mid-journey.
   const lastPushedStack = new Map<number, number[]>();
+  // Fitted overview per output (workspace.fit): the camera frames a
+  // consecutive run of workspaces while registry truth (shown workspace,
+  // bar highlight, focus) stays put. The draw stack carries the union of
+  // the framed workspaces' members; refreshFits keeps stack + camera in
+  // step with structural changes. Any show on the output exits the fit.
+  interface FitRecord {
+    handles: WorkspaceHandle[];
+    // Last settled fit camera; null while the entry tween is in flight.
+    cam: { x: number; y: number; zoom: number } | null;
+  }
+  const fitted = new Map<number, FitRecord>();
+
+  function exitFit(outputId: number): void {
+    // The dock cache tracks camera x at zoom 1; a fit camera invalidates
+    // it, so the next dock re-sends even a previously-sent value.
+    if (fitted.delete(outputId)) lastCamByOutput.delete(outputId);
+  }
+
+  // The draw stack for a fitted output: the union of the framed
+  // workspaces' members (position order), plus the shown workspace's
+  // members when it lies outside the framed range -- registry truth stays
+  // on the shown workspace, so its windows must not vanish from the
+  // output while the camera frames the range.
+  function fitStackFor(
+    outputId: number, handles: ReadonlyArray<WorkspaceHandle>,
+  ): number[] {
+    const ids: number[] = [];
+    const add = (h: WorkspaceHandle | undefined): void => {
+      if (h === undefined) return;
+      const rec = state.byHandle.get(h);
+      if (!rec) return;
+      for (const id of rec.members) if (!ids.includes(id)) ids.push(id);
+    };
+    for (const h of handles) add(h);
+    add(state.shownByOutput.get(outputId));
+    return ids;
+  }
+
+  // Camera framing the union of the given workspaces' slot rects: zoomed
+  // out just enough to fit (never past 1), centered both ways. The camera
+  // views the world from (originX + x, originY + y) over logical/zoom
+  // world units, so x/y are offsets from the output's arrangement
+  // position; y goes negative to letterbox the slot band vertically.
+  function fitCameraFor(
+    outputId: number, handles: ReadonlyArray<WorkspaceHandle>,
+  ): { x: number; y: number; zoom: number } | null {
+    const g = outputGeom.get(outputId);
+    if (!g) return null;
+    let minX = Infinity;
+    let maxX = -Infinity;
+    for (const h of handles) {
+      const slot = slotByHandle.get(h);
+      if (slot === undefined) continue;
+      const r = slotRect(outputId, slot);
+      if (!r) continue;
+      minX = Math.min(minX, r.x);
+      maxX = Math.max(maxX, r.x + r.width);
+    }
+    if (minX === Infinity) return null;
+    const zoom = Math.min(g.width / (maxX - minX), 1);
+    return {
+      x: (minX + maxX) / 2 - (g.width / zoom) / 2 - g.x,
+      y: (g.height - g.height / zoom) / 2,
+      zoom,
+    };
+  }
+
+  // Keep each fitted output's union stack + camera in step with
+  // structural changes (membership, workspace create/destroy, geometry).
+  // A fit whose workspaces all vanished dissolves; publishWorld's dock
+  // loop then re-docks the camera on the shown slot.
+  async function refreshFits(): Promise<void> {
+    for (const [outputId, rec] of [...fitted]) {
+      const positions = state.positionsByOutput.get(outputId) ?? [];
+      const live = positions.filter((h) => rec.handles.includes(h));
+      if (live.length === 0 || !outputGeom.has(outputId)) {
+        exitFit(outputId);
+        continue;
+      }
+      rec.handles = live;
+      const union = fitStackFor(outputId, live);
+      const last = lastPushedStack.get(outputId);
+      if (!last || last.length !== union.length
+          || union.some((v, i) => v !== last[i])) {
+        await pushStack(outputId, union);
+      }
+      // A fit entry tween owns the camera until it settles.
+      if (flying.has(outputId)) continue;
+      const cam = fitCameraFor(outputId, live);
+      if (!cam) continue;
+      if (rec.cam && rec.cam.x === cam.x && rec.cam.y === cam.y
+          && rec.cam.zoom === cam.zoom) continue;
+      rec.cam = cam;
+      await sdk.windows.setOutputCamera(outputId, cam.x, cam.y, cam.zoom);
+    }
+  }
 
   function camXFor(outputId: number, handle: WorkspaceHandle): number {
     const slot = slotByHandle.get(handle);
@@ -462,12 +562,14 @@ export default async function init(
     }
     islands.sort((a, b) => a.id - b.id);
     await sdk.windows.setIslands(islands);
+    // Fitted outputs maintain their own union stack + fit camera.
+    await refreshFits();
     // Dock each output's camera on its shown island (instant). Identity
     // when geometry is unknown (rect null islands tile in place). A
     // flying output's camera belongs to its flight; the settle step
-    // docks it.
+    // docks it. A fitted output's camera belongs to its fit.
     for (const [outputId, shown] of state.shownByOutput) {
-      if (flying.has(outputId)) continue;
+      if (flying.has(outputId) || fitted.has(outputId)) continue;
       const camX = camXFor(outputId, shown);
       if (lastCamByOutput.get(outputId) === camX) continue;
       lastCamByOutput.set(outputId, camX);
@@ -489,11 +591,20 @@ export default async function init(
     for (const e of effects) {
       if (skipKinds.has(e.kind)) continue;
       switch (e.kind) {
-        case "setOutputStack":
-          lastPushedStack.set(e.outputId, e.ids ? [...e.ids] : []);
-          await sdk.windows.setOutputStack(e.outputId, e.ids);
+        case "setOutputStack": {
+          // A fitted output's stack stays the fit union: replaying the
+          // shown workspace's stack verbatim would hide the other framed
+          // workspaces' windows for a frame until refreshFits re-unions.
+          const fit = worldMode ? fitted.get(e.outputId) : undefined;
+          if (fit) {
+            await pushStack(e.outputId, fitStackFor(e.outputId, fit.handles));
+          } else {
+            lastPushedStack.set(e.outputId, e.ids ? [...e.ids] : []);
+            await sdk.windows.setOutputStack(e.outputId, e.ids);
+          }
           await updateIsland(e.outputId, e.ids);
           break;
+        }
         case "setStateBag":
           await sdk.windows.setState(e.surfaceId, STATE_KEY, e.handle);
           break;
@@ -663,6 +774,7 @@ export default async function init(
     index: WorkspaceIndex, outputId: number, t: ShowTransitionSpec,
   ): Promise<void> {
     noteFlight(t.kind);
+    exitFit(outputId);
     const fromIds = lastPushedStack.get(outputId) ?? reg.stackFor(state, outputId);
     const r = reg.show(state, index, outputId, outputNameOf(outputId));
     state = r.state;
@@ -721,6 +833,142 @@ export default async function init(
     } finally {
       if (flying.get(outputId) === token) flying.delete(outputId);
     }
+  }
+
+  // workspace.fit: zoom the output's camera out to frame workspaces
+  // [start..end] (per-output positions; defaults first..last). Registry
+  // truth is untouched -- only the optics widen, with the fit union
+  // riding the draw stack so every framed workspace composites. The
+  // framed set is resolved once, here; workspaces created later don't
+  // join it. With a transition the camera tweens out (denied tweens --
+  // grabs -- fall back to the instant write); either way one settled
+  // camera write sweeps residency + X narration.
+  async function fitRange(
+    outputId: number, start: number | undefined, end: number | undefined,
+    t: CameraTransitionSpec | null,
+  ): Promise<void> {
+    const positions = state.positionsByOutput.get(outputId) ?? [];
+    if (positions.length === 0) {
+      throw new Error("workspace.fit: no workspaces on the target output");
+    }
+    const s = start ?? 1;
+    const e = end ?? positions.length;
+    if (s < 1 || e > positions.length || s > e) {
+      throw new Error(
+        `workspace.fit: range ${s}..${e} out of bounds (1..${positions.length})`);
+    }
+    if (!outputGeom.has(outputId)) {
+      throw new Error(`workspace.fit: output ${outputId} has unknown geometry`);
+    }
+    resolveSlots(positions);
+    const handles = positions.slice(s - 1, e);
+    const cam = fitCameraFor(outputId, handles);
+    if (!cam) {
+      throw new Error("workspace.fit: no slot geometry for the range");
+    }
+    await cancelFlight(outputId);
+    const rec: FitRecord = { handles: [...handles], cam: null };
+    fitted.set(outputId, rec);
+    lastCamByOutput.delete(outputId);
+    await pushStack(outputId, fitStackFor(outputId, handles));
+    if (t && sdk.animations) {
+      const token = ++flightSeq;
+      flying.set(outputId, token);
+      try {
+        const cur = await sdk.windows.getOutputCamera(outputId);
+        if (cur.x !== cam.x || cur.y !== cam.y || cur.zoom !== cam.zoom) {
+          const spec: TweenSpec = {
+            type: "tween",
+            target: { kind: "output-camera", outputId },
+            from: cur,
+            to: cam,
+            duration: t.duration,
+            easing: (t.easing ?? "ease-in-out") as EasingSpec,
+          };
+          try {
+            await sdk.animations.run(spec);
+          } catch (err) {
+            sdk.log(`canvas: fit camera fell back to instant (${String(err)})`);
+          }
+        }
+        if (flying.get(outputId) !== token) return;  // preempted; the winner settles
+        flying.delete(outputId);
+      } finally {
+        if (flying.get(outputId) === token) flying.delete(outputId);
+      }
+    }
+    if (fitted.get(outputId) !== rec) return;  // a show exited the fit mid-tween
+    // Settle against live geometry: a mid-tween structural change may
+    // have moved the framing (refreshFits skipped the camera while the
+    // tween owned it).
+    const settleCam = fitCameraFor(outputId, rec.handles) ?? cam;
+    rec.cam = settleCam;
+    await sdk.windows.setOutputCamera(
+      outputId, settleCam.x, settleCam.y, settleCam.zoom);
+  }
+
+  // workspace.unfit: zoom back in to a single workspace. Exits the fit;
+  // an explicit index different from the shown workspace is a normal
+  // show (flown when a transition is given), while the default -- the
+  // shown workspace itself -- restores camera + stack without touching
+  // registry truth (the fit never moved it).
+  async function unfitTo(
+    outputId: number, index: number | undefined, t: CameraTransitionSpec | null,
+  ): Promise<void> {
+    exitFit(outputId);
+    const positions = state.positionsByOutput.get(outputId) ?? [];
+    const shown = state.shownByOutput.get(outputId);
+    const shownIdx = shown !== undefined ? positions.indexOf(shown) + 1 : 0;
+    const target = index ?? shownIdx;
+    if (target < 1 || target > positions.length) {
+      throw new Error(
+        `workspace.unfit: index ${target} out of bounds (1..${positions.length})`);
+    }
+    if (target !== shownIdx) {
+      if (t) {
+        await showWithFlight(asIndex(target), outputId,
+          { kind: "camera", duration: t.duration, easing: t.easing });
+        return;
+      }
+      await cancelFlight(outputId);
+      const r = reg.show(state, asIndex(target), outputId, outputNameOf(outputId));
+      state = r.state;
+      await applyEffects(r.sideEffects);
+      return;
+    }
+    // Zoom back onto the shown workspace: optics only. The fit union
+    // keeps riding the stack for the journey; settle collapses it.
+    await cancelFlight(outputId);
+    const camX = shown !== undefined ? camXFor(outputId, shown) : 0;
+    if (t && sdk.animations) {
+      const token = ++flightSeq;
+      flying.set(outputId, token);
+      try {
+        const cur = await sdk.windows.getOutputCamera(outputId);
+        if (cur.x !== camX || cur.y !== 0 || cur.zoom !== 1) {
+          const spec: TweenSpec = {
+            type: "tween",
+            target: { kind: "output-camera", outputId },
+            from: cur,
+            to: { x: camX, y: 0, zoom: 1 },
+            duration: t.duration,
+            easing: (t.easing ?? "ease-in-out") as EasingSpec,
+          };
+          try {
+            await sdk.animations.run(spec);
+          } catch (err) {
+            sdk.log(`canvas: unfit camera fell back to instant (${String(err)})`);
+          }
+        }
+        if (flying.get(outputId) !== token) return;  // preempted; the winner settles
+        flying.delete(outputId);
+      } finally {
+        if (flying.get(outputId) === token) flying.delete(outputId);
+      }
+    }
+    await pushStack(outputId, reg.stackFor(state, outputId));
+    lastCamByOutput.set(outputId, camX);
+    await sdk.windows.setOutputCamera(outputId, camX, 0);
   }
 
   // Emit the boot-time workspace.created for workspace 1, plus any side
@@ -825,6 +1073,7 @@ export default async function init(
         await showWithTransition(p.index, p.outputId, t);
         return null;
       }
+      exitFit(p.outputId);
       await cancelFlight(p.outputId);
       const r = reg.show(state, p.index, p.outputId, outputNameOf(p.outputId));
       state = r.state;
@@ -849,10 +1098,43 @@ export default async function init(
         await showWithTransition(p.index, p.outputId, t);
         return null;
       }
+      exitFit(p.outputId);
       await cancelFlight(p.outputId);
       const r = reg.show(state, p.index, p.outputId, outputNameOf(p.outputId));
       state = r.state;
       await applyEffects(r.sideEffects);
+      return null;
+    },
+  });
+
+  sdk.actions.register({
+    name: "workspace.fit",
+    description:
+      "World mode: zoom the output's camera out to frame the consecutive workspace range [start..end] (per-output positions; defaults first..last). The shown workspace, bar state, and focus stay put. Optional transition {duration, easing?} animates the zoom.",
+    handler: async (params: unknown): Promise<null> => {
+      if (!worldMode) {
+        throw new Error(
+          "workspace.fit: requires canvas world mode (canvas: { world: true })");
+      }
+      const p = parseFitParams(params, resolveOutputName, focusedOutputId());
+      const t = parseCameraTransition(params, "workspace.fit");
+      await fitRange(p.outputId, p.start, p.end, t);
+      return null;
+    },
+  });
+
+  sdk.actions.register({
+    name: "workspace.unfit",
+    description:
+      "World mode: zoom the camera back in to one workspace (per-output `index`, default the shown one), exiting a workspace.fit. An index other than the shown workspace's behaves like show. Optional transition {duration, easing?} animates the zoom.",
+    handler: async (params: unknown): Promise<null> => {
+      if (!worldMode) {
+        throw new Error(
+          "workspace.unfit: requires canvas world mode (canvas: { world: true })");
+      }
+      const p = parseUnfitParams(params, resolveOutputName, focusedOutputId());
+      const t = parseCameraTransition(params, "workspace.unfit");
+      await unfitTo(p.outputId, p.index, t);
       return null;
     },
   });
@@ -966,6 +1248,7 @@ export default async function init(
         return;
       }
       const outId = outputId ?? reg.OUTPUT_DEFAULT;
+      exitFit(outId);
       await cancelFlight(outId);
       const r = reg.show(state, index, outId, outputNameOf(outId));
       state = r.state;
@@ -1205,6 +1488,78 @@ function parseShowTransition(params: unknown, label: string): ShowTransitionSpec
     duration: t.duration,
     easing: (t as { easing?: unknown }).easing,
   };
+}
+
+// Optional camera transition for workspace.fit / workspace.unfit: a
+// camera move has no snapshot kind, so only duration (+ optional easing)
+// matter; a `kind` field is tolerated and ignored so keybinds can share
+// one transition object with workspace.show.
+interface CameraTransitionSpec {
+  duration: number;
+  easing?: unknown;
+}
+function parseCameraTransition(
+  params: unknown, label: string,
+): CameraTransitionSpec | null {
+  if (!isObj(params)) return null;
+  const t = (params as { transition?: unknown }).transition;
+  if (t === undefined || t === null) return null;
+  if (!isObj(t)) {
+    throw new TypeError(`${label}: transition must be an object`);
+  }
+  if (typeof t.duration !== "number" || !(t.duration > 0)) {
+    throw new TypeError(
+      `${label}: transition.duration must be > 0 (got ${String(t.duration)})`);
+  }
+  return { duration: t.duration, easing: (t as { easing?: unknown }).easing };
+}
+
+// workspace.fit: optional start/end per-output positions + optional output.
+function parseFitParams(
+  params: unknown,
+  resolveOutput: (input: string) => number | null,
+  defaultOutputId: number,
+): { start?: number; end?: number; outputId: number } {
+  if (params === undefined || params === null) {
+    return { outputId: defaultOutputId };
+  }
+  if (!isObj(params)) throw new TypeError("workspace.fit: expected an object");
+  const outputId = parseOptionalOutput(
+    params, resolveOutput, defaultOutputId, "workspace.fit");
+  const out: { start?: number; end?: number; outputId: number } = { outputId };
+  for (const key of ["start", "end"] as const) {
+    const v = params[key];
+    if (v === undefined) continue;
+    if (typeof v !== "number" || !Number.isInteger(v) || v < 1) {
+      throw new TypeError(`workspace.fit: ${key} must be a positive integer`);
+    }
+    out[key] = v;
+  }
+  return out;
+}
+
+// workspace.unfit: optional per-output index (default: the shown
+// workspace) + optional output.
+function parseUnfitParams(
+  params: unknown,
+  resolveOutput: (input: string) => number | null,
+  defaultOutputId: number,
+): { index?: number; outputId: number } {
+  if (params === undefined || params === null) {
+    return { outputId: defaultOutputId };
+  }
+  if (!isObj(params)) throw new TypeError("workspace.unfit: expected an object");
+  const outputId = parseOptionalOutput(
+    params, resolveOutput, defaultOutputId, "workspace.unfit");
+  const out: { index?: number; outputId: number } = { outputId };
+  if (params.index !== undefined) {
+    if (typeof params.index !== "number" || !Number.isInteger(params.index)
+        || params.index < 1) {
+      throw new TypeError("workspace.unfit: index must be a positive integer");
+    }
+    out.index = params.index;
+  }
+  return out;
 }
 
 function parseSetUrgentParams(

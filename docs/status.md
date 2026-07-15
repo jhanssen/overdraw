@@ -982,7 +982,16 @@ validated + resolved + consumed by the runtime + hotkey plugin.
   destination stacks rides the output for the journey; the animations
   broker's `cameraGate` denies flights during interactive grabs/drags
   (instant-dock fallback); preempting shows cancel the losing flight
-  (same GPU test).
+  (same GPU test). Fit zoom is LANDED: `workspace.fit {start?, end?,
+  output?, transition?}` optically zooms the camera out to frame a
+  consecutive workspace range (defaults first..last) -- union of the
+  framed workspaces' members rides the draw stack, registry truth
+  (shown workspace / bar / focus) stays put, structural changes
+  re-frame while fitted, any show exits the fit; `workspace.unfit
+  {index?, output?, transition?}` zooms back in (default: the shown
+  workspace, optics-only; a different index behaves like show). GPU
+  test `plugin-canvas/canvas-fit.gpu.mjs`; unit coverage in
+  `plugin-canvas/integration.test.js`.
   NOT built: bookmarks + free roaming (bookmarks deferred until the
   camera can leave slot framings -- without pan gestures or roaming a
   bookmark could only record the dock it started from), elastic

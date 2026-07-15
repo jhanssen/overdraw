@@ -492,3 +492,172 @@ test('world: a denied flight (grab active) falls back to an instant dock', async
     assert.deepEqual(sink.outputStackCalls.at(-1), { outputId: 0, ids: [102] });
   }, { world: true, animations: 'deny' });
 });
+
+// ---- world mode: fit (zoom-out overview) ---------------------------------
+// workspace.fit frames a consecutive workspace range: union stack, camera
+// zoomed out + centered on the slots' bounding box, registry truth
+// untouched. workspace.unfit zooms back in.
+
+// Expected fit camera for slots [0..n-1] on the 800x600 mock output.
+function fitCam(nSlots) {
+  const boundsW = (nSlots - 1) * PITCH + 800;
+  const zoom = Math.min(800 / boundsW, 1);
+  return {
+    outputId: 0,
+    x: boundsW / 2 - (800 / zoom) / 2,
+    y: (600 - 600 / zoom) / 2,
+    zoom,
+  };
+}
+
+test('world: fit frames the whole row (union stack + zoomed camera); registry untouched', async () => {
+  await withCanvasPlugin(async (h) => {
+    const { rt, sink } = h;
+    await setupTwoIslands(h);   // 101 on ws1 (shown), 102 on ws2
+    sink.outputStackCalls.length = 0;
+    sink.cameraCalls.length = 0;
+
+    await rt.invokeAction('workspace.fit', {});
+    assert.deepEqual(sink.outputStackCalls[0], { outputId: 0, ids: [101, 102] });
+    assert.deepEqual(sink.cameraCalls.at(-1), fitCam(2));
+    const cur = await call(rt, 'current', [0]);
+    assert.equal(cur.index, 1, 'shown workspace unchanged by fit');
+  }, { world: true });
+});
+
+test('world: fit range validation', async () => {
+  await withCanvasPlugin(async (h) => {
+    const { rt } = h;
+    await setupTwoIslands(h);
+    await assert.rejects(rt.invokeAction('workspace.fit', { start: 2, end: 1 }),
+      /out of bounds/);
+    await assert.rejects(rt.invokeAction('workspace.fit', { end: 3 }),
+      /out of bounds/);
+    await assert.rejects(rt.invokeAction('workspace.fit', { start: 0 }),
+      /positive integer/);
+  }, { world: true });
+});
+
+test('fit requires world mode', async () => {
+  await withCanvasPlugin(async ({ rt }) => {
+    await assert.rejects(rt.invokeAction('workspace.fit', {}), /world mode/);
+    await assert.rejects(rt.invokeAction('workspace.unfit', {}), /world mode/);
+  });
+});
+
+test('world: fitted stack tracks membership changes; camera refits on destroy', async () => {
+  await withCanvasPlugin(async (h) => {
+    const { rt, sink, addWindow } = h;
+    await setupTwoIslands(h);
+    // Third workspace so destroy leaves a 2-workspace fit.
+    await call(rt, 'create', [{}]);
+    await call(rt, 'show', [3, 0]);
+    addWindow(103);
+    await settle();
+    await call(rt, 'show', [1, 0]);
+    await settle();
+
+    await rt.invokeAction('workspace.fit', {});
+    assert.deepEqual(sink.outputStackCalls.at(-1),
+      { outputId: 0, ids: [101, 102, 103] });
+    assert.deepEqual(sink.cameraCalls.at(-1), fitCam(3));
+
+    // A window mapping onto the shown workspace joins the union (new
+    // members lead their workspace's stack).
+    sink.outputStackCalls.length = 0;
+    addWindow(104);
+    await settle();
+    assert.deepEqual(sink.outputStackCalls.at(-1),
+      { outputId: 0, ids: [104, 101, 102, 103] });
+
+    // Destroying the last framed workspace shrinks the framing.
+    sink.cameraCalls.length = 0;
+    await call(rt, 'destroy', [3, 0]);
+    await settle();
+    assert.deepEqual(sink.cameraCalls.at(-1), fitCam(2));
+  }, { world: true });
+});
+
+test('world: show exits the fit (stack collapses, camera docks at zoom 1)', async () => {
+  await withCanvasPlugin(async (h) => {
+    const { rt, sink } = h;
+    await setupTwoIslands(h);
+    await rt.invokeAction('workspace.fit', {});
+    sink.cameraCalls.length = 0;
+
+    await call(rt, 'show', [2, 0]);
+    assert.deepEqual(sink.cameraCalls.at(-1), { outputId: 0, x: PITCH, y: 0, zoom: 1 });
+    assert.deepEqual(sink.outputStackCalls.at(-1), { outputId: 0, ids: [102] });
+  }, { world: true });
+});
+
+test('world: unfit returns to the shown workspace without touching the registry', async () => {
+  await withCanvasPlugin(async (h) => {
+    const { rt, sink, wsEvents } = h;
+    await setupTwoIslands(h);
+    await rt.invokeAction('workspace.fit', {});
+    sink.cameraCalls.length = 0;
+    wsEvents.length = 0;
+
+    await rt.invokeAction('workspace.unfit', {});
+    assert.deepEqual(sink.cameraCalls.at(-1), { outputId: 0, x: 0, y: 0, zoom: 1 });
+    assert.deepEqual(sink.outputStackCalls.at(-1), { outputId: 0, ids: [101] });
+    assert.equal(wsEvents.length, 0, 'no workspace events for an optics-only unfit');
+    const cur = await call(rt, 'current', [0]);
+    assert.equal(cur.index, 1);
+  }, { world: true });
+});
+
+test('world: unfit with a different index behaves like show', async () => {
+  await withCanvasPlugin(async (h) => {
+    const { rt, sink, wsEvents } = h;
+    await setupTwoIslands(h);
+    await rt.invokeAction('workspace.fit', {});
+    sink.cameraCalls.length = 0;
+    wsEvents.length = 0;
+
+    await rt.invokeAction('workspace.unfit', { index: 2 });
+    assert.deepEqual(sink.cameraCalls.at(-1), { outputId: 0, x: PITCH, y: 0, zoom: 1 });
+    assert.deepEqual(sink.outputStackCalls.at(-1), { outputId: 0, ids: [102] });
+    assert.ok(wsEvents.some((e) => e.name === 'workspace.shown' && e.payload.index === 2));
+  }, { world: true });
+});
+
+test('world: fit with a transition tweens the camera; one settled write at arrival', async () => {
+  await withCanvasPlugin(async (h) => {
+    const { rt, sink, animCalls, animPending } = h;
+    await setupTwoIslands(h);
+    sink.outputStackCalls.length = 0;
+    sink.cameraCalls.length = 0;
+
+    const p = rt.invokeAction('workspace.fit', { transition: { duration: 200 } });
+    await settle();
+    const cam = fitCam(2);
+    // Union rides at takeoff; the tween targets the fit camera; nothing
+    // settled yet.
+    assert.deepEqual(sink.outputStackCalls[0], { outputId: 0, ids: [101, 102] });
+    assert.equal(animCalls.length, 1);
+    assert.deepEqual(animCalls[0].target, { kind: 'output-camera', outputId: 0 });
+    assert.deepEqual(animCalls[0].to, { x: cam.x, y: cam.y, zoom: cam.zoom });
+    assert.equal(sink.cameraCalls.length, 0);
+
+    animPending.shift().resolve();
+    await p;
+    assert.deepEqual(sink.cameraCalls.at(-1), cam);
+  }, { world: true, animations: 'manual' });
+});
+
+test('world: an instant show cancels an in-progress fit tween', async () => {
+  await withCanvasPlugin(async (h) => {
+    const { rt, sink } = h;
+    await setupTwoIslands(h);
+    sink.cameraCalls.length = 0;
+
+    const p = rt.invokeAction('workspace.fit', { transition: { duration: 500 } });
+    await settle();
+    await call(rt, 'show', [2, 0]);   // instant: exits the fit, cancels the tween
+    await p;                          // fit resolves without settling
+    assert.deepEqual(sink.cameraCalls.at(-1), { outputId: 0, x: PITCH, y: 0, zoom: 1 });
+    assert.deepEqual(sink.outputStackCalls.at(-1), { outputId: 0, ids: [102] });
+  }, { world: true, animations: 'manual' });
+});

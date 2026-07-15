@@ -610,11 +610,26 @@ tests only.
    live mid-flight camera via `windows.get-output-camera`); an instant
    show cancels it. Flights denied during grabs/drags (the broker's
    cameraGate) fall back to an instant dock.
+   ALSO LANDED -- **fit zoom** (`workspace.fit` / `workspace.unfit`):
+   fit optically zooms the camera out to frame a consecutive workspace
+   range (start/end per-output positions, defaults first..last;
+   centered + letterboxed on the slots' bounding box). Registry truth
+   never moves -- the shown workspace, bar highlight, and focus stay
+   put; the union of the framed workspaces' members rides the draw
+   stack (so they composite and gain residency) and is maintained
+   across structural changes while fitted; the framing re-solves on
+   membership/geometry change. Any show on the output exits the fit;
+   unfit zooms back in (default target the shown workspace --
+   optics-only; an explicit different index is a show). Both accept a
+   `transition {duration, easing?}` camera tween with the flight
+   machinery's preemption/instant-fallback semantics. GPU test:
+   `plugin-canvas/canvas-fit.gpu.mjs`.
    NOT yet: bookmarks + free roaming (bookmarks wait until the camera
    can leave slot framings -- without pan gestures or roaming they
    could only record docks); elastic islands; placement rules
    targeting islands; gutters + shove; hotplug camera
-   persistence/rescue; overview (optical zoom UX); island hygiene;
+   persistence/rescue; overview UX (an interactive picker/gesture on
+   top of the landed fit-zoom optics); island hygiene;
    camera-following compose/live scenes (§4: a live view built from
    `outputRegion(outputId)` needs a "follow output N's camera" mode);
    ext-workspace per-group duplicate-handle projection (§9, needed once
