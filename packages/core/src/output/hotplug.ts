@@ -167,6 +167,8 @@ export function makeOnOutputAdded(deps: HotplugDeps): (d: OutputDescriptor) => v
       outputId: d.outputId,
       name: d.name,
       edidId: d.edidId,
+      x: pos.x,
+      y: pos.y,
       width: logical.width,
       height: logical.height,
       scale,

@@ -959,12 +959,16 @@ validated + resolved + consumed by the runtime + hotkey plugin.
   canvas-design.md §7b): X clients are told glass positions through
   pan-only chart cameras with int16 clamp-and-log; override-redirect
   placements invert to world; re-narration on camera/visibility change
-  (GPU test `xwayland-camera.gpu.mjs`).
-  NOT built: world positions + camera policy (roaming, docking,
-  bookmarks, gutters/shove, hotplug camera persistence, the per-island
-  X attic), ext-workspace per-group duplicate projection,
-  camera-following compose/live scenes, camera animation as an in-core
-  evaluator target.
+  (GPU test `xwayland-camera.gpu.mjs`); unviewed windows narrate in
+  their island frame. World slots are LANDED behind
+  `canvas: { world: true }` (canvas-design.md §11 step 4): workspaces
+  live at world rects along per-output rows, `show` docks the camera
+  instantly, hidden members stay laid out at their slots (GPU test
+  `plugin-canvas/canvas-world.gpu.mjs`).
+  NOT built: camera flights + bookmarks + free roaming (step 4d),
+  elastic islands, gutters/shove, hotplug camera persistence,
+  ext-workspace per-group duplicate projection, camera-following
+  compose/live scenes, camera animation as an in-core evaluator target.
 - **Logging.** TS surface migrated (spdlog 1.17.0; fixed area set;
   severity-based stdout/stderr split; `--log-file=PATH`; per-area
   `--log-level=SPEC`; `installConsoleShim` routes `console.*`

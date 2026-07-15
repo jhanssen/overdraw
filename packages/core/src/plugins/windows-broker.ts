@@ -337,14 +337,13 @@ export function createWindowsBroker(deps: WindowsBrokerDeps): WindowsBroker {
     state.outputCameras ??= new Map();
     if (x === 0 && y === 0 && z === 1) state.outputCameras.delete(outputId);
     else state.outputCameras.set(outputId, { x, y, zoom: z });
+    // The camera patch installed by installProtocols sweeps residency and
+    // re-narrates X positions on actual change; this call routes through it.
     compositor.setOutputCamera(outputId, x, y, z);
     // The world moved under a stationary pointer: refresh pointer focus so
     // enter/leave and hover state track the surface actually under the
     // cursor (same rationale as the workspace-changed repick above).
     state.seat?.repickPointer();
-    // X windows on this output changed glass position (X sees glass, not
-    // world -- xwayland/glass-map.ts): re-narrate their told coordinates.
-    state.xwm?.retellPositions();
     return null;
   }
 

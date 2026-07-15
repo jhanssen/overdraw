@@ -23,12 +23,16 @@ const canvasSpec = { name: 'canvas', module: '@overdraw/plugin-canvas' };
 function mockSink() {
   const sink = {
     outputStackCalls: [],
+    cameraCalls: [],
     setSurfaceLayout() {}, setStack() {}, setLayerSurfaces() {},
     setSurfaceTexture() {}, commitSurfaceBuffer() {}, commitSurfaceDmabuf() {},
     removeSurface() {}, takeImportedSurfaces() { return []; },
     takeFreedBuffers() { return []; }, afterCurrentFrame() {}, renderFrame() {},
     setOutputStack(outputId, ids) {
       sink.outputStackCalls.push({ outputId, ids: ids === null ? null : [...ids] });
+    },
+    setOutputCamera(outputId, x, y, zoom = 1) {
+      sink.cameraCalls.push({ outputId, x, y, zoom });
     },
   };
   return sink;
@@ -39,7 +43,7 @@ function res(id) { return { resource: { id, version: 1, destroyed: false } }; }
 // Build a runtime + windows broker + bus harness around the canvas plugin.
 // The WM runs a capture layout driver so pushed islands are observable via
 // the layout snapshots the driver receives.
-async function withCanvasPlugin(fn) {
+async function withCanvasPlugin(fn, opts = {}) {
   const pluginBus = new DynamicBus();
   const bus = createCompositorBus();
   const sink = mockSink();
@@ -84,10 +88,29 @@ async function withCanvasPlugin(fn) {
       throw new Error(`no handler for '${method}'`);
     },
   }, async (rt) => {
-    await rt.load([bundledToResolved(canvasSpec, canvasSpec.module,
+    // Mirror the production bundled spec: configFrom merges the runtime
+    // context (output geometry seed) with the user's canvas slice.
+    const spec = {
+      ...canvasSpec,
+      configFrom: (cfg, runtime) => ({
+        fallbackOutputId: -1, fallbackOutputName: '',
+        bootOutputDurableKey: runtime.bootOutputDurableKey,
+        initialOutputs: runtime.initialOutputs,
+        canvas: cfg.canvas,
+      }),
+    };
+    await rt.load([bundledToResolved(spec, spec.module,
       {
         output: null, focus: null, hotkeys: undefined, actions: undefined,
-        plugins: [], sourcePath: null, canvas: {},
+        plugins: [], sourcePath: null,
+        canvas: opts.world ? { world: true } : {},
+      },
+      {
+        bootOutputDurableKey: 'mock-0',
+        initialOutputs: [{
+          outputId: 0, name: 'mock-0', edidId: '',
+          x: 0, y: 0, width: 800, height: 600, scale: 1,
+        }],
       })]);
     await rt.waitForNamespace('workspace');
     await fn({
@@ -245,4 +268,70 @@ test('canvas: island members mirror unmap', async () => {
     await settle();
     assert.deepEqual(islands()[0].members, [101]);
   });
+});
+
+// ---- world mode ---------------------------------------------------------
+// Slot pitch for the 800-wide mock output (SLOT_GUTTER = 128).
+const PITCH = 800 + 128;
+
+test('world: every workspace publishes an island at its slot rect', async () => {
+  await withCanvasPlugin(async ({ rt, islands, addWindow }) => {
+    addWindow(101);
+    await settle();
+    await call(rt, 'create', [{}]);
+    await settle();
+
+    const isl = islands();
+    assert.equal(isl.length, 2);
+    const list = await call(rt, 'list', [0]);
+    const byId = new Map(isl.map((i) => [i.id, i]));
+    const ws1 = byId.get(list[0].handle);
+    const ws2 = byId.get(list[1].handle);
+    // Workspace 1 at slot 0 (the arrangement rect), workspace 2 one pitch over.
+    assert.deepEqual(ws1.rect, { x: 0, y: 0, width: 800, height: 600 });
+    assert.deepEqual(ws2.rect, { x: PITCH, y: 0, width: 800, height: 600 });
+    // Hidden workspaces publish too; members carry through.
+    assert.deepEqual(ws1.members, [101]);
+    assert.deepEqual(ws2.members, []);
+  }, { world: true });
+});
+
+test('world: show docks the camera on the shown slot; hidden members stay published', async () => {
+  await withCanvasPlugin(async ({ rt, sink, islands, addWindow }) => {
+    addWindow(101);
+    await settle();
+    await call(rt, 'create', [{}]);
+    await call(rt, 'moveWindow', [101, 2, 0]);
+    await settle();
+
+    // 101 now lives on hidden workspace 2: island at slot 1 keeps it as a
+    // member (laid out at its slot) while the stack excludes it.
+    const list = await call(rt, 'list', [0]);
+    const isl = islands();
+    const ws2Island = isl.find((i) => i.id === list[1].handle);
+    assert.deepEqual(ws2Island.members, [101]);
+    assert.equal(ws2Island.rect.x, PITCH);
+    assert.deepEqual(sink.outputStackCalls.at(-1), { outputId: 0, ids: [] });
+
+    // Show workspace 2: camera docks at its slot.
+    sink.cameraCalls.length = 0;
+    await call(rt, 'show', [2, 0]);
+    assert.deepEqual(sink.cameraCalls.at(-1), { outputId: 0, x: PITCH, y: 0, zoom: 1 });
+
+    // Back to workspace 1: camera returns to the row origin.
+    await call(rt, 'show', [1, 0]);
+    assert.deepEqual(sink.cameraCalls.at(-1), { outputId: 0, x: 0, y: 0, zoom: 1 });
+  }, { world: true });
+});
+
+test('world: destroying a workspace frees its slot for the next one', async () => {
+  await withCanvasPlugin(async ({ rt, islands }) => {
+    await call(rt, 'create', [{}]);   // ws2 -> slot 1
+    await call(rt, 'destroy', [2, 0]);
+    await call(rt, 'create', [{}]);   // new ws2 -> reuses slot 1
+    await settle();
+    const isl = islands();
+    const xs = isl.map((i) => i.rect.x).sort((a, b) => a - b);
+    assert.deepEqual(xs, [0, PITCH]);
+  }, { world: true });
 });

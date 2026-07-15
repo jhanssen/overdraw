@@ -67,13 +67,13 @@ test('two islands on one output: one compute() each, tileRegion = island rect', 
   assert.equal(target.calls[0].result.rects.length, 3);
 });
 
-test('explicit island rect is used verbatim; reserved zones do not shrink it', async () => {
+test('reserved zones carve explicit island rects edge-relative (docked bar band)', async () => {
   const zones = createReservedZoneRegistry();
   zones.set('bar', { outputId: 0, edge: 'top', thickness: 30, owner: 99 });
 
   const computeCalls = [];
   const target = captureTarget();
-  const explicit = { id: 10, contextOutputId: 0, rect: { x: 100, y: 0, width: 300, height: 600 }, members: [1] };
+  const explicit = { id: 10, contextOutputId: 0, rect: { x: 5000, y: 0, width: 1000, height: 600 }, members: [1] };
   const implicit = { id: 0, contextOutputId: 0, rect: null, members: [2] };
   const driver = createLayoutDriver({
     snapshot: () => snapWith([explicit, implicit], [managedWin(1), managedWin(2)]),
@@ -88,8 +88,10 @@ test('explicit island rect is used verbatim; reserved zones do not shrink it', a
   await driver.settled();
 
   const byIsland = new Map(computeCalls.map((c) => [c.islandId, c]));
-  // Explicit island rect passes through untouched by the zone.
-  assert.deepEqual(byIsland.get(10).tileRegion, explicit.rect);
+  // The context output's zone carves the island's edge wherever its world
+  // slot sits (a docked island keeps the bar band clear).
+  assert.deepEqual(byIsland.get(10).tileRegion,
+    { x: 5000, y: 30, width: 1000, height: 570 });
   // The implicit island still derives output-minus-zones.
   assert.deepEqual(byIsland.get(0).tileRegion, { x: 0, y: 30, width: 1000, height: 570 });
 });

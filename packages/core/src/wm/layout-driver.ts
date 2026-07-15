@@ -154,12 +154,14 @@ export function createLayoutDriver(deps: LayoutDriverDeps): LayoutDriver {
         }
         const outputRect: Rect = { ...o.rect };
         // The island's tile region: its own world rect, or (implicit
-        // island) the output rect minus reserved zones.
-        const tileRegion = island.rect
-          ? { ...island.rect }
-          : deps.reservedZones
-            ? deps.reservedZones.effectiveRect(o.id, outputRect)
-            : outputRect;
+        // island) the output rect. Either way the context output's
+        // reserved zones carve the region's edges -- zones are
+        // edge-relative, so a docked island keeps its bar band clear no
+        // matter where its world slot sits.
+        const baseRegion = island.rect ? { ...island.rect } : outputRect;
+        const tileRegion = deps.reservedZones
+          ? deps.reservedZones.effectiveRect(island.contextOutputId, baseRegion)
+          : baseRegion;
 
         const resolvedRects: Array<{ id: number; outer: Rect }> = [];
         const managed: LayoutWindow[] = [];

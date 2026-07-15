@@ -271,6 +271,13 @@ export interface Wm {
   setIslands(
     islands: ReadonlyArray<import("./layout-driver.js").LayoutIsland> | null,
   ): boolean;
+  // The explicit island a window is a member of, or null (no explicit
+  // islands, or the window is in none). Consumers: the X glass-space
+  // narration derives a hidden window's telling frame from its island
+  // (xwayland/glass-map.ts).
+  islandOf(
+    surfaceId: number,
+  ): { rect: Rect | null; contextOutputId: number } | null;
   // The id of the primary output -- the lowest id in state.outputs, used as
   // the default home for newly-mapped windows. Throws if the WM has no
   // outputs (the construction invariant forbids this).
@@ -1689,6 +1696,19 @@ export function createWm(
       explicitIslands = next;
       driver.schedule("reorder");
       return true;
+    },
+
+    islandOf(surfaceId) {
+      if (!explicitIslands) return null;
+      for (const isl of explicitIslands) {
+        if (isl.members.includes(surfaceId)) {
+          return {
+            rect: isl.rect ? { ...isl.rect } : null,
+            contextOutputId: isl.contextOutputId,
+          };
+        }
+      }
+      return null;
     },
 
     windowHasContent(surfaceId, contentSize) {

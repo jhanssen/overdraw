@@ -550,6 +550,8 @@ addon.setOnOutputDescriptor((d) => {
     outputId: d.outputId,
     name: d.name,
     edidId: d.edidId,
+    x: rec.logicalPosition.x,
+    y: rec.logicalPosition.y,
     width: logical.width,
     height: logical.height,
     scale,
@@ -786,6 +788,11 @@ const initialOutputs = state?.outputs
       outputId: rec.id,
       name: rec.name,
       edidId: rec.edidId,
+      x: rec.logicalPosition.x,
+      y: rec.logicalPosition.y,
+      width: rec.logicalSize.width,
+      height: rec.logicalSize.height,
+      scale: rec.scale,
     }))
   : [];
 const bundledRuntime = { bootOutputDurableKey, initialOutputs };

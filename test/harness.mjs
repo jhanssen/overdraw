@@ -690,8 +690,17 @@ export async function setupCompositor(opts = {}) {
   });
   // Config-driven bundled selection (a `canvas` slice in opts.config swaps
   // the workspace provider for @overdraw/plugin-canvas, as in production).
+  // The runtime context mirrors main.ts: geometry-aware plugins (canvas
+  // world slots) seed output geometry from initialOutputs.
+  const bundledRuntime = {
+    bootOutputDurableKey: "headless-0",
+    initialOutputs: [{
+      outputId: 0, name: "headless-0", edidId: "",
+      x: 0, y: 0, width: dims.width, height: dims.height, scale: 1,
+    }],
+  };
   const resolved = selectBundledPlugins(resolvedConfig)
-    .map((spec) => bundledToResolved(spec, spec.module, resolvedConfig));
+    .map((spec) => bundledToResolved(spec, spec.module, resolvedConfig, bundledRuntime));
   // Optional extra plugins (ResolvedPlugin shape) from the test. Loaded
   // alongside the bundled set so interception tests can drop in a fixture.
   const extra = opts.plugins ?? [];

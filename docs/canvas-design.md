@@ -518,10 +518,26 @@ tests only.
    workspace GPU flow re-run against it
    (`test/plugin-canvas/canvas-parity.gpu.mjs`) + an integration suite
    asserting verb/event parity and island publication.
-4. **Canvas features** (all policy, all incremental from parity): free
-   roaming + fly-to bookmarks; elastic islands; placement rules targeting
-   islands; gutters + shove; hotplug persistence/rescue; overview
-   (optical zoom); island hygiene.
+4. **Canvas features** (all policy, all incremental from parity).
+   LANDED so far -- **world slots (rows model)**, opt-in via
+   `canvas: { world: true }`: every workspace publishes as an island at
+   a world rect along its output's row (slot pitch = output width +
+   SLOT_GUTTER; slots per-handle, freed on destroy, collision-resolved
+   after hotplug migration); hidden members lay out at their slots
+   (pre-sized on show) while the draw stack gates visibility; `show`
+   docks the camera instantly; snapshot show transitions are ignored in
+   world mode (camera flights replace them); reserved zones carve
+   explicit island rects edge-relative via the context output, so docked
+   islands keep their bar band clear; hidden X windows are narrated in
+   their ISLAND FRAME (glass-map.ts: the camera that would show them),
+   staying int16-safe at any slot distance. Camera changes sweep
+   residency + X narration via a core-side single-method patch (the
+   stack sweep alone ran before the dock landed). GPU test:
+   `plugin-canvas/canvas-world.gpu.mjs`.
+   NOT yet: free roaming + fly-to bookmarks (flights, 4d); elastic
+   islands; placement rules targeting islands; gutters + shove; hotplug
+   camera persistence/rescue; overview (optical zoom UX); island
+   hygiene.
 5. **Later**: true zoom via fractional-scale; snap clusters /
    bezel-spanning; per-island layout providers (layout registry);
    world-arrangement pluggability.

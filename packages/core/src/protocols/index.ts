@@ -278,6 +278,23 @@ export async function installProtocols(
       }
     };
   }
+  // Camera changes move every world-space surface relative to the output:
+  // residency (enter/leave, preferred scale) and X glass narration both
+  // depend on the camera, so sweep on actual change -- the stack sweep
+  // alone runs too early when a stack push and a camera dock land in the
+  // same batch (the sweep would see the old camera).
+  const innerSetOutputCamera = rawCompositor.setOutputCamera?.bind(rawCompositor);
+  if (innerSetOutputCamera && rawCompositor.surfaceVisibleOutputs) {
+    const lastCam = new Map<number, { x: number; y: number; zoom: number }>();
+    rawCompositor.setOutputCamera = (outputId, x, y, zoom = 1): void => {
+      innerSetOutputCamera(outputId, x, y, zoom);
+      const prev = lastCam.get(outputId);
+      if (prev && prev.x === x && prev.y === y && prev.zoom === zoom) return;
+      lastCam.set(outputId, { x, y, zoom });
+      updateAllSurfaceResidency(state, addon);
+      state.xwm?.retellPositions();
+    };
+  }
   const innerSetOutputStack = rawCompositor.setOutputStack?.bind(rawCompositor);
   if (innerSetOutputStack && rawCompositor.surfaceVisibleOutputs) {
     const lastByOutput = new Map<number, number[] | null>();

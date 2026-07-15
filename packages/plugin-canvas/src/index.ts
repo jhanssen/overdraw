@@ -1,13 +1,20 @@
 // Canvas workspace provider (docs/canvas-design.md). Registers in the
 // 'workspace' namespace at priority 0 with the same verb/event/action
 // surface as @overdraw/plugin-workspace-default, whose registry (the pure
-// workspace state machine) it shares. On top of that surface it publishes
-// each output's shown workspace as an explicit layout island (id = the
-// workspace's durable handle, rect = null so the tile region derives from
-// the output minus reserved zones, members = the pushed stack) -- so
-// layouts see per-workspace island identity while on-screen behavior
-// matches the default plugin exactly. World positions, camera policy, and
-// bookmarks build on this island seam.
+// workspace state machine) it shares. Two modes, selected by the user's
+// `canvas` config slice:
+//
+//   parity (default): each output's SHOWN workspace publishes as an
+//   explicit island (id = durable handle, rect = null so the tile region
+//   derives from the output minus reserved zones, members = the pushed
+//   stack). On-screen behavior matches the default plugin exactly.
+//
+//   world (`world: true`): EVERY workspace publishes as an island at a
+//   world rect along its output's row (slot pitch = output width +
+//   SLOT_GUTTER); hidden members lay out at their slots (pre-sized on
+//   show) while the draw stack still gates visibility; `show` docks the
+//   output's camera on the shown island instantly. Snapshot show
+//   transitions are ignored (camera flights are the world-mode animation).
 
 import type {
   WorkspaceAPI, WorkspaceHandle, WorkspaceIndex, WorkspaceSnapshot,
@@ -57,12 +64,24 @@ interface CanvasPluginConfig {
   // subscribe). After seeding the plugin recomputes once so secondary
   // outputs immediately satisfy the ≥1-workspace-per-output invariant.
   // When omitted (test harness), the plugin starts with empty maps and
-  // learns outputs lazily from bus events.
-  initialOutputs?: ReadonlyArray<{ outputId: number; name: string; edidId: string }>;
-  // The user's `canvas` config slice (verbatim). No options yet: parity
-  // mode has no knobs; the slice's presence is what selects this plugin.
+  // learns outputs lazily from bus events. The geometry fields (global
+  // logical position + size) feed world slots; entries without them
+  // behave as unknown-geometry outputs.
+  initialOutputs?: ReadonlyArray<{
+    outputId: number; name: string; edidId: string;
+    x?: number; y?: number; width?: number; height?: number;
+  }>;
+  // The user's `canvas` config slice (verbatim). `world: true` enables
+  // world slots: each workspace gets a world-rect island along its
+  // output's row and `show` docks the output's camera on it instantly.
+  // Absent/false = workspace parity (islands colocated with outputs,
+  // identity cameras).
   canvas?: unknown;
 }
+
+// Horizontal spacing between neighboring slot rects in a row. Cosmetic
+// until camera flights exist (instant docks never show the gap).
+const SLOT_GUTTER = 128;
 
 export default async function init(
   sdk: PluginSdkShape, config?: CanvasPluginConfig,
@@ -89,6 +108,25 @@ export default async function init(
     // Never overwritten (the design forbids rewrites of durable identifiers).
     : "boot";
 
+  // World slots (docs/canvas-design.md sequencing step 4c): each workspace
+  // becomes an island at a world rect along its output's row; `show` docks
+  // the camera. Off = workspace parity.
+  const worldMode = !!config?.canvas && typeof config.canvas === "object"
+    && (config.canvas as { world?: unknown }).world === true;
+
+  // Snapshot-based show transitions capture arrangement-anchored scenes
+  // and cannot represent a world-docked view: world mode shows instantly
+  // (camera flights are the world-mode animation). Logged once.
+  let transitionDropWarned = false;
+  function gateTransition<T>(t: T | null): T | null {
+    if (t === null || !worldMode) return t;
+    if (!transitionDropWarned) {
+      transitionDropWarned = true;
+      sdk.log("canvas: show transitions are ignored in world mode (instant dock)");
+    }
+    return null;
+  }
+
   // Live output identifiers, kept in sync via output.added / output.removed /
   // output.changed. Maps outputId -> durable key (edidId when non-empty,
   // else name). Used by recomputeOutputs to resolve preferredOutputs entries
@@ -99,6 +137,24 @@ export default async function init(
   // can match against either identifier -- a user typing "DP-1" in a
   // config keybind should not have to know the EDID string.
   const outputAliasesById = new Map<number, { name: string; edidId: string }>();
+  // Arrangement geometry per output (global logical position + size), fed
+  // by output.added/changed payloads + the initialOutputs seed. World
+  // slots derive their rects from this; an output with unknown geometry
+  // publishes rect-null islands (parity behavior) until it reports.
+  const outputGeom = new Map<
+    number, { x: number; y: number; width: number; height: number }>();
+  function recordGeom(payload: unknown): void {
+    if (!payload || typeof payload !== "object") return;
+    const p = payload as {
+      outputId?: unknown; x?: unknown; y?: unknown;
+      width?: unknown; height?: unknown;
+    };
+    if (typeof p.outputId !== "number") return;
+    if (typeof p.x !== "number" || typeof p.y !== "number"
+      || typeof p.width !== "number" || typeof p.height !== "number") return;
+    outputGeom.set(p.outputId,
+      { x: p.x, y: p.y, width: p.width, height: p.height });
+  }
   function outputNameOf(outputId: number): string {
     return liveOutputs.get(outputId) ?? BOOT_OUTPUT_NAME;
   }
@@ -150,6 +206,9 @@ export default async function init(
     const key = durableKeyOf(payload as { edidId?: unknown; name?: unknown });
     if (key !== null) liveOutputs.set(p.outputId, key);
     outputAliasesById.set(p.outputId, aliasesOf(payload as { name?: unknown; edidId?: unknown }));
+    recordGeom(payload);
+    // Geometry may have moved/resized the row: republish slot rects.
+    if (stateReady) void publishWorld();
   });
   // Keyboard focus tracking. Each window.change carries activated: bool; a
   // surface becoming activated is our signal that its output is the
@@ -197,6 +256,7 @@ export default async function init(
     if (key === null) return;
     liveOutputs.set(p.outputId, key);
     outputAliasesById.set(p.outputId, aliasesOf(payload as { name?: unknown; edidId?: unknown }));
+    recordGeom(payload);
     const r = reg.recomputeOutputs(
       state, liveOutputs, fallbackOutputId, fallbackOutputName);
     state = r.state;
@@ -230,6 +290,7 @@ export default async function init(
     if (typeof p.outputId !== "number") return;
     liveOutputs.delete(p.outputId);
     outputAliasesById.delete(p.outputId);
+    outputGeom.delete(p.outputId);
     // Focus may have been on this output; reset to OUTPUT_DEFAULT so the
     // next action targets a live output rather than the vanished one.
     if (focusedOutputIdCache === p.outputId) {
@@ -258,6 +319,7 @@ export default async function init(
       const durable = durableKeyOf(o);
       if (durable !== null) liveOutputs.set(o.outputId, durable);
       outputAliasesById.set(o.outputId, { name: o.name, edidId: o.edidId });
+      recordGeom(o);
     }
     const r = reg.recomputeOutputs(
       state, liveOutputs, fallbackOutputId, fallbackOutputName);
@@ -265,16 +327,18 @@ export default async function init(
     bootRecomputeEffects = r.sideEffects;
   }
 
-  // One explicit island per output: the shown workspace's durable handle +
-  // the exact stack pushed for it. Updated wherever a stack lands (the
-  // setOutputStack side effect, or a transition's commit) and mirrored to
-  // the WM, which schedules a relayout only when the set actually changed.
-  // rect stays null in parity mode: the tile region derives from the
-  // output minus reserved zones, exactly like the implicit island -- the
-  // only observable delta is the island id layouts can key state on.
+  // Parity mode: one explicit island per output -- the shown workspace's
+  // durable handle + the exact stack pushed for it. Updated wherever a
+  // stack lands (the setOutputStack side effect, or a transition's
+  // commit) and mirrored to the WM, which schedules a relayout only when
+  // the set actually changed. rect stays null: the tile region derives
+  // from the output minus reserved zones, exactly like the implicit
+  // island -- the only observable delta is the island id layouts can key
+  // state on. World mode replaces this with publishWorld below.
   const islandByOutput = new Map<
     number, { id: number; contextOutputId: number; rect: null; members: number[] }>();
   async function updateIsland(outputId: number, ids: readonly number[] | null): Promise<void> {
+    if (worldMode) return;
     if (ids === null) {
       if (!islandByOutput.delete(outputId)) return;
     } else {
@@ -286,6 +350,92 @@ export default async function init(
     const list = [...islandByOutput.values()]
       .sort((a, b) => a.contextOutputId - b.contextOutputId);
     await sdk.windows.setIslands(list);
+  }
+
+  // ---- World mode ---------------------------------------------------------
+  // Every workspace is an island at a world rect along its output's row:
+  // slot s of output O sits at O.arrangement + s * (O.width + SLOT_GUTTER)
+  // horizontally. Slots are per-workspace-handle, assigned on first
+  // placement and kept for the workspace's lifetime; collisions after a
+  // hotplug migration resolve to the lowest free slot on the new row. ALL
+  // workspaces publish (hidden ones too, so their members are laid out at
+  // their slots and arrive pre-sized on show); the draw stack still gates
+  // visibility. `show` docks the camera on the shown island's rect.
+  const slotByHandle = new Map<WorkspaceHandle, number>();
+  const lastCamByOutput = new Map<number, number>();
+
+  function resolveSlots(
+    handles: ReadonlyArray<WorkspaceHandle>,
+  ): Map<WorkspaceHandle, number> {
+    const used = new Set<number>();
+    const out = new Map<WorkspaceHandle, number>();
+    // First pass: keep existing non-colliding slots (position order wins
+    // a collision; the later claimant moves).
+    for (const h of handles) {
+      const s = slotByHandle.get(h);
+      if (s !== undefined && !used.has(s)) { used.add(s); out.set(h, s); }
+    }
+    for (const h of handles) {
+      if (out.has(h)) continue;
+      let s = 0;
+      while (used.has(s)) s++;
+      used.add(s);
+      out.set(h, s);
+      slotByHandle.set(h, s);
+    }
+    return out;
+  }
+
+  function slotRect(
+    outputId: number, slot: number,
+  ): { x: number; y: number; width: number; height: number } | null {
+    const g = outputGeom.get(outputId);
+    if (!g) return null;
+    return {
+      x: g.x + slot * (g.width + SLOT_GUTTER),
+      y: g.y,
+      width: g.width,
+      height: g.height,
+    };
+  }
+
+  async function publishWorld(): Promise<void> {
+    if (!worldMode) return;
+    // Drop slots for destroyed workspaces.
+    for (const h of [...slotByHandle.keys()]) {
+      if (!state.byHandle.has(h)) slotByHandle.delete(h);
+    }
+    const islands: Array<{
+      id: number; contextOutputId: number;
+      rect: { x: number; y: number; width: number; height: number } | null;
+      members: number[];
+    }> = [];
+    for (const [outputId, handles] of state.positionsByOutput) {
+      const slots = resolveSlots(handles);
+      for (const h of handles) {
+        const rec = state.byHandle.get(h);
+        if (!rec) continue;
+        islands.push({
+          id: h,
+          contextOutputId: outputId,
+          rect: slotRect(outputId, slots.get(h) ?? 0),
+          members: [...rec.members],
+        });
+      }
+    }
+    islands.sort((a, b) => a.id - b.id);
+    await sdk.windows.setIslands(islands);
+    // Dock each output's camera on its shown island (instant). Identity
+    // when geometry is unknown (rect null islands tile in place).
+    for (const [outputId, shown] of state.shownByOutput) {
+      const slot = slotByHandle.get(shown);
+      const g = outputGeom.get(outputId);
+      const camX = (slot !== undefined && g)
+        ? slot * (g.width + SLOT_GUTTER) : 0;
+      if (lastCamByOutput.get(outputId) === camX) continue;
+      lastCamByOutput.set(outputId, camX);
+      await sdk.windows.setOutputCamera(outputId, camX, 0);
+    }
   }
 
   // Apply each side effect against the SDK. Errors from SDK calls bubble up;
@@ -320,6 +470,11 @@ export default async function init(
           break;
       }
     }
+    // World mode: any effect batch may have changed workspace structure
+    // (create/destroy touch no stacks but do add/remove islands) --
+    // republish islands + re-dock cameras. Dedupe-safe: wm.setIslands
+    // compares; camera pushes are cached per output.
+    if (worldMode && effects.length > 0) await publishWorld();
   }
 
   // Animated workspace.show: capture FROM + TO scene snapshots, run
@@ -383,6 +538,7 @@ export default async function init(
       // The commit applied the TO stack inside the completion tick,
       // bypassing applyEffects; publish the matching island now.
       await updateIsland(outputId, toIds ?? []);
+      if (worldMode) await publishWorld();
     } finally {
       // Release scenes regardless of throw / success. The transitions
       // broker unpins on completion (or on its install-time throw);
@@ -495,7 +651,7 @@ export default async function init(
       "Show the workspace matching `name`. Matches user-set names first across all outputs; falls back to the durable handle when `name` is a digit string. Use `output` to restrict the search.",
     handler: async (params: unknown): Promise<null> => {
       const p = parseShowParams(state, params, resolveOutputName);
-      const t = parseShowTransition(params, "workspace.show");
+      const t = gateTransition(parseShowTransition(params, "workspace.show"));
       if (t) {
         await showWithTransition(p.index, p.outputId, t);
         return null;
@@ -514,7 +670,7 @@ export default async function init(
     handler: async (params: unknown): Promise<null> => {
       const p = parseIndexParams(
         params, resolveOutputName, focusedOutputId(), "workspace.show-at-index");
-      const t = parseShowTransition(params, "workspace.show-at-index");
+      const t = gateTransition(parseShowTransition(params, "workspace.show-at-index"));
       if (t) {
         await showWithTransition(p.index, p.outputId, t);
         return null;
@@ -619,10 +775,11 @@ export default async function init(
       await applyEffects(r.sideEffects);
     },
     async show(index, outputId, transition): Promise<void> {
-      if (transition) {
+      const t = gateTransition(transition ?? null);
+      if (t) {
         await showWithTransition(
           index, outputId ?? 0,
-          { kind: transition.kind, duration: transition.duration, easing: transition.easing },
+          { kind: t.kind, duration: t.duration, easing: t.easing },
         );
         return;
       }

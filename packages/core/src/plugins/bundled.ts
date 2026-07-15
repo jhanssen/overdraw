@@ -19,15 +19,20 @@ export interface BundledRuntimeContext {
   bootOutputDurableKey: string;
   // Snapshot of every live output known at plugin-resolution time. Each
   // entry carries the connector name (e.g. "DP-1") AND the EDID-derived
-  // durable id, both as raw strings (empty when not present). The
-  // workspace plugin computes its durable key as edidId-when-non-empty-
-  // else-name AND keeps the pair around so a user-supplied output
-  // string (typically the connector name) can be resolved back to an
-  // outputId.  The boot OutputDescriptor burst that fires output.added
-  // happens BEFORE the plugin runtime spawns, so the plugin can't
-  // observe those events via subscribe -- this snapshot is the
-  // catch-up mechanism.
-  initialOutputs: ReadonlyArray<{ outputId: number; name: string; edidId: string }>;
+  // durable id, both as raw strings (empty when not present), plus the
+  // output's arrangement geometry (global logical position + size +
+  // scale) so geometry-aware plugins (canvas world slots) can seed
+  // without waiting for an output.changed. The workspace plugin computes
+  // its durable key as edidId-when-non-empty-else-name AND keeps the
+  // pair around so a user-supplied output string (typically the
+  // connector name) can be resolved back to an outputId. The boot
+  // OutputDescriptor burst that fires output.added happens BEFORE the
+  // plugin runtime spawns, so the plugin can't observe those events via
+  // subscribe -- this snapshot is the catch-up mechanism.
+  initialOutputs: ReadonlyArray<{
+    outputId: number; name: string; edidId: string;
+    x?: number; y?: number; width?: number; height?: number; scale?: number;
+  }>;
 }
 
 // Default keybindings when the user supplies no `hotkeys` config. Deliberately

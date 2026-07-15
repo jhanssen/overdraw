@@ -17,21 +17,44 @@ import type { Addon } from "../types.js";
 import { log } from "../log.js";
 
 // Pan-only chart camera for an X-backed window: the camera of the
-// lowest-id output that SHOWS the window (stack-gated residency), falling
-// back to the lowest geometric overlap, then to identity. glass = world -
-// chart.
+// lowest-id output that SHOWS the window (stack-gated residency).
+// glass = world - chart.
+//
+// A window shown nowhere is narrated in its ISLAND FRAME: the camera that
+// WOULD show it -- the one docking its island's origin at its context
+// output's arrangement origin. Told coordinates stay in-arrangement
+// (int16-safe) no matter how far the island's world slot roams, are
+// deterministic for never-shown windows, and preserve intra-island
+// relative geometry; they coincide with the shown narration the moment a
+// camera actually docks there. Without an island (implicit islands /
+// non-world mode), fall back to the lowest geometric overlap, then
+// identity -- the retained-fiction rule.
 export function xChartCameraOf(
   state: CompositorState, surfaceId: number,
 ): { x: number; y: number } {
   const comp = state.compositor;
-  let outs = comp.surfaceVisibleOutputs
+  const outs = comp.surfaceVisibleOutputs
     ? comp.surfaceVisibleOutputs(surfaceId) : undefined;
-  if (!outs || outs.length === 0) {
-    outs = comp.surfaceOutputs ? comp.surfaceOutputs(surfaceId) : undefined;
+  if (outs && outs.length > 0) {
+    let lo = Infinity;
+    for (const id of outs) if (id < lo) lo = id;
+    const cam = state.outputCameras?.get(lo);
+    return cam ? { x: cam.x, y: cam.y } : { x: 0, y: 0 };
   }
-  if (!outs || outs.length === 0) return { x: 0, y: 0 };
+  const island = state.wm?.islandOf(surfaceId);
+  if (island && island.rect) {
+    const out = state.outputs?.get(island.contextOutputId);
+    if (out) {
+      return {
+        x: island.rect.x - out.logicalPosition.x,
+        y: island.rect.y - out.logicalPosition.y,
+      };
+    }
+  }
+  const geo = comp.surfaceOutputs ? comp.surfaceOutputs(surfaceId) : undefined;
+  if (!geo || geo.length === 0) return { x: 0, y: 0 };
   let lo = Infinity;
-  for (const id of outs) if (id < lo) lo = id;
+  for (const id of geo) if (id < lo) lo = id;
   const cam = state.outputCameras?.get(lo);
   return cam ? { x: cam.x, y: cam.y } : { x: 0, y: 0 };
 }
