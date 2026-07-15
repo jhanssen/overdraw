@@ -964,11 +964,23 @@ validated + resolved + consumed by the runtime + hotkey plugin.
   `canvas: { world: true }` (canvas-design.md §11 step 4): workspaces
   live at world rects along per-output rows, `show` docks the camera
   instantly, hidden members stay laid out at their slots (GPU test
-  `plugin-canvas/canvas-world.gpu.mjs`).
-  NOT built: camera flights + bookmarks + free roaming (step 4d),
-  elastic islands, gutters/shove, hotplug camera persistence,
-  ext-workspace per-group duplicate projection, camera-following
-  compose/live scenes, camera animation as an in-core evaluator target.
+  `plugin-canvas/canvas-world.gpu.mjs`). Camera flights are LANDED:
+  `workspace.show` with a `transition` in world mode tweens the camera
+  to the destination slot via the in-core animation evaluator's
+  `output-camera` target (transient per-frame sink writes keep the
+  `state.outputCameras` mirror -- input/popups/query -- live while
+  deferring the residency sweep + X re-narration + pointer repick to
+  the one settled write at arrival); the union of departure +
+  destination stacks rides the output for the journey; the animations
+  broker's `cameraGate` denies flights during interactive grabs/drags
+  (instant-dock fallback); preempting shows cancel the losing flight
+  (same GPU test).
+  NOT built: bookmarks + free roaming (bookmarks deferred until the
+  camera can leave slot framings -- without pan gestures or roaming a
+  bookmark could only record the dock it started from), elastic
+  islands, gutters/shove, hotplug camera persistence, ext-workspace
+  per-group duplicate projection, camera-following compose/live
+  scenes.
 - **Logging.** TS surface migrated (spdlog 1.17.0; fixed area set;
   severity-based stdout/stderr split; `--log-file=PATH`; per-area
   `--log-level=SPEC`; `installConsoleShim` routes `console.*`

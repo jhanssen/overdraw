@@ -1,8 +1,8 @@
-// Value coercion + interpolation + writing for the three target kinds.
-// Each kind has an identity (default value) and a per-field set of
-// numeric components. Tween and spring operate on numeric components;
-// the writers package the components back into the CompositorSink
-// setters' shapes.
+// Value coercion + interpolation + writing for the target kinds. Each
+// kind has an identity (default value) and a per-field set of numeric
+// components. Tween and spring operate on numeric components; the
+// writers package the components back into the CompositorSink setters'
+// shapes.
 
 import type { CompositorSink } from "../protocols/ctx.js";
 import type { TargetRef } from "@overdraw/animation-types";
@@ -11,6 +11,7 @@ import type { TargetRef } from "@overdraw/animation-types";
 // stores per-animation arrays of field values aligned with this order.
 const TRANSFORM_FIELDS = ["translateX", "translateY", "scaleX", "scaleY"] as const;
 const MARGIN_FIELDS = ["top", "right", "bottom", "left"] as const;
+const CAMERA_FIELDS = ["x", "y", "zoom"] as const;
 
 // Identity component values: what missing fields default to.
 const TRANSFORM_IDENTITY: Record<typeof TRANSFORM_FIELDS[number], number> = {
@@ -18,6 +19,9 @@ const TRANSFORM_IDENTITY: Record<typeof TRANSFORM_FIELDS[number], number> = {
 };
 const MARGIN_IDENTITY: Record<typeof MARGIN_FIELDS[number], number> = {
   top: 0, right: 0, bottom: 0, left: 0,
+};
+const CAMERA_IDENTITY: Record<typeof CAMERA_FIELDS[number], number> = {
+  x: 0, y: 0, zoom: 1,
 };
 
 // Coerce a from/to value into an ordered numeric array per target kind.
@@ -59,6 +63,23 @@ export function coerceValue(target: TargetRef, value: unknown): number[] {
       return f;
     });
   }
+  if (target.kind === "output-camera") {
+    if (typeof value !== "object" || value === null) {
+      throw new TypeError("camera value must be an object");
+    }
+    const v = value as Record<string, unknown>;
+    return CAMERA_FIELDS.map((k) => {
+      const f = v[k];
+      if (f === undefined) return CAMERA_IDENTITY[k];
+      if (typeof f !== "number" || !Number.isFinite(f)) {
+        throw new TypeError(`camera.${k} must be a finite number`);
+      }
+      if (k === "zoom" && f <= 0) {
+        throw new TypeError("camera.zoom must be a positive number");
+      }
+      return f;
+    });
+  }
   throw new TypeError(`unknown target kind '${(target as { kind: string }).kind}'`);
 }
 
@@ -83,6 +104,17 @@ export function applyValue(
         top: components[0], right: components[1],
         bottom: components[2], left: components[3],
       });
+      return;
+    case "output-camera":
+      // Per-frame writes are transient: the sink applies the camera to
+      // render/damage/input but defers the residency sweep + X
+      // re-narration to a settled write (the flight's owner sends one
+      // when the animation completes). Sweeping every frame would spam
+      // X clients with ConfigureNotify and run a full residency diff
+      // per tick.
+      sink.setOutputCamera?.(
+        target.outputId, components[0] ?? 0, components[1] ?? 0,
+        components[2] ?? 1, true);
       return;
   }
 }

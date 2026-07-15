@@ -83,6 +83,7 @@ export function createWindowsBroker(deps: WindowsBrokerDeps): WindowsBroker {
     if (method === "windows.list") return wm.listSnapshots();
     if (method === "windows.set-output-stack") return handleSetOutputStack(params);
     if (method === "windows.set-output-camera") return handleSetOutputCamera(params);
+    if (method === "windows.get-output-camera") return handleGetOutputCamera(params);
     if (method === "windows.set-islands") return handleSetIslands(params);
     if (method === "windows.focus") return handleFocus(params);
     if (method === "windows.request-focus-decision") return handleRequestFocusDecision(params);
@@ -332,8 +333,10 @@ export function createWindowsBroker(deps: WindowsBrokerDeps): WindowsBroker {
     }
     // state.outputCameras is the core-side mirror the seat's pointer->world
     // transform and the popup constraint solver read; the compositor applies
-    // the same value to render/damage/residency. One writer keeps them
-    // agreeing.
+    // the same value to render/damage/residency. The camera patch installed
+    // by installProtocols also mirrors (it sees every sink write, including
+    // the animation evaluator's per-frame ones); this write covers harnesses
+    // where that patch isn't installed.
     state.outputCameras ??= new Map();
     if (x === 0 && y === 0 && z === 1) state.outputCameras.delete(outputId);
     else state.outputCameras.set(outputId, { x, y, zoom: z });
@@ -345,6 +348,20 @@ export function createWindowsBroker(deps: WindowsBrokerDeps): WindowsBroker {
     // cursor (same rationale as the workspace-changed repick above).
     state.seat?.repickPointer();
     return null;
+  }
+
+  function handleGetOutputCamera(p: unknown): { x: number; y: number; zoom: number } {
+    if (!p || typeof p !== "object") {
+      throw new Error("windows.get-output-camera: malformed payload");
+    }
+    const { outputId } = p as { outputId?: unknown };
+    if (typeof outputId !== "number") {
+      throw new Error("windows.get-output-camera: malformed payload");
+    }
+    // The mirror tracks every sink write, including the animation
+    // evaluator's transient per-frame ones, so a flight preempted
+    // mid-motion reads its true starting point here.
+    return state.outputCameras?.get(outputId) ?? { x: 0, y: 0, zoom: 1 };
   }
 
   function handleSetIslands(p: unknown): null {

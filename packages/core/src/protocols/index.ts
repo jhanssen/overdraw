@@ -282,12 +282,21 @@ export async function installProtocols(
   // residency (enter/leave, preferred scale) and X glass narration both
   // depend on the camera, so sweep on actual change -- the stack sweep
   // alone runs too early when a stack push and a camera dock land in the
-  // same batch (the sweep would see the old camera).
+  // same batch (the sweep would see the old camera). Transient writes
+  // (per-frame camera-flight steps from the animation evaluator) skip
+  // the sweep/retell -- the flight's settled write catches up -- but
+  // still refresh the state.outputCameras mirror so pointer->world
+  // mapping, popup constraints, and query() track the camera live
+  // mid-flight.
   const innerSetOutputCamera = rawCompositor.setOutputCamera?.bind(rawCompositor);
   if (innerSetOutputCamera && rawCompositor.surfaceVisibleOutputs) {
     const lastCam = new Map<number, { x: number; y: number; zoom: number }>();
-    rawCompositor.setOutputCamera = (outputId, x, y, zoom = 1): void => {
+    rawCompositor.setOutputCamera = (outputId, x, y, zoom = 1, transient = false): void => {
       innerSetOutputCamera(outputId, x, y, zoom);
+      state.outputCameras ??= new Map();
+      if (x === 0 && y === 0 && zoom === 1) state.outputCameras.delete(outputId);
+      else state.outputCameras.set(outputId, { x, y, zoom });
+      if (transient) return;
       const prev = lastCam.get(outputId);
       if (prev && prev.x === x && prev.y === y && prev.zoom === zoom) return;
       lastCam.set(outputId, { x, y, zoom });

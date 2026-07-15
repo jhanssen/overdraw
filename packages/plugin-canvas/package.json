@@ -11,6 +11,7 @@
     }
   },
   "dependencies": {
+    "@overdraw/animation-types": "*",
     "@overdraw/plugin-sdk-types": "*",
     "@overdraw/plugin-workspace-default": "*",
     "@overdraw/workspace-types": "*"

@@ -45,10 +45,17 @@ function validateTarget(t: TargetRef): void {
     throw new TypeError("target must be an object");
   }
   const kind = (t as { kind?: unknown }).kind;
+  if (kind === "output-camera") {
+    const oid = (t as { outputId?: unknown }).outputId;
+    if (typeof oid !== "number") {
+      throw new TypeError("target.outputId must be a number");
+    }
+    return;
+  }
   if (kind !== "window-opacity"
       && kind !== "window-transform"
       && kind !== "window-output-margin") {
-    throw new TypeError(`target.kind must be one of window-opacity / window-transform / window-output-margin (got '${String(kind)}')`);
+    throw new TypeError(`target.kind must be one of window-opacity / window-transform / window-output-margin / output-camera (got '${String(kind)}')`);
   }
   const wid = (t as { windowId?: unknown }).windowId;
   if (typeof wid !== "number") {

@@ -361,7 +361,15 @@ export interface CompositorSink {
   // world-space surfaces only; layer-shell, the cursor, and
   // output-anchored surfaces stay glass-positioned. Optional (GPU-free
   // test sinks omit it).
-  setOutputCamera?(outputId: number, x: number, y: number, zoom?: number): void;
+  //
+  // `transient` marks a mid-animation write (one frame of a camera
+  // flight): the camera applies to render/damage/input immediately, but
+  // the per-change residency sweep + X re-narration are deferred until a
+  // settled (non-transient) write arrives. Whoever animates the camera
+  // owns sending that settled write when the motion ends.
+  setOutputCamera?(
+    outputId: number, x: number, y: number, zoom?: number,
+    transient?: boolean): void;
   // Mark a surface as glass-positioned (ignores the content camera) even
   // though it rides the content stack: popups parented to layer-shell
   // surfaces. Optional (GPU-free test sinks omit it).

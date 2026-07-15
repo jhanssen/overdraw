@@ -207,6 +207,12 @@ export interface PluginWindows extends PluginWindowObserver {
   // render, hit-testing, damage, and output residency together.
   setOutputCamera(outputId: number, x: number, y: number, zoom?: number): Promise<void>;
 
+  // The output's current content camera. Tracks live values even while a
+  // camera animation (output-camera target) is mid-flight, so a caller
+  // starting a new motion reads its true starting framing. Identity
+  // ({0, 0, 1}) when the camera has never been set.
+  getOutputCamera(outputId: number): Promise<{ x: number; y: number; zoom: number }>;
+
   // Explicit focus override; bypasses the focus plugin's decide()
   // (core-plugin-api.md §1). null clears. For policy-mediated focus
   // changes, emit an event the focus plugin observes instead.
@@ -435,6 +441,19 @@ export function createPluginWindows(
         throw new TypeError("setOutputCamera zoom must be a positive number");
       }
       await endpoint.request("windows.set-output-camera", { outputId, x, y, zoom });
+    },
+
+    async getOutputCamera(outputId): Promise<{ x: number; y: number; zoom: number }> {
+      if (typeof outputId !== "number") {
+        throw new TypeError("getOutputCamera outputId must be a number");
+      }
+      const r = await endpoint.request("windows.get-output-camera", { outputId });
+      const cam = r as { x?: unknown; y?: unknown; zoom?: unknown };
+      if (typeof cam?.x !== "number" || typeof cam.y !== "number"
+        || typeof cam.zoom !== "number") {
+        throw new TypeError("getOutputCamera: malformed broker reply");
+      }
+      return { x: cam.x, y: cam.y, zoom: cam.zoom };
     },
 
     async focus(id): Promise<void> {

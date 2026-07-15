@@ -77,3 +77,72 @@ test('non-animations method returns NOT_HANDLED', () => {
   assert.equal(broker('p', 'windows.set-opacity', { id: 1, opacity: 0.5 }),
     NOT_HANDLED);
 });
+
+// ---- output-camera targets -------------------------------------------------
+
+test('animations.cancel: output-camera target forwards to the evaluator', async () => {
+  const ev = mockEvaluator();
+  const broker = createAnimationsBroker(ev);
+  await broker('p', 'animations.cancel',
+    { target: { kind: 'output-camera', outputId: 2 } });
+  assert.deepEqual(ev.calls[0],
+    { method: 'cancel', target: { kind: 'output-camera', outputId: 2 } });
+});
+
+test('animations.cancel: output-camera without outputId throws', () => {
+  const broker = createAnimationsBroker(mockEvaluator());
+  assert.throws(() => broker('p', 'animations.cancel',
+    { target: { kind: 'output-camera', windowId: 2 } }),
+    /malformed payload/);
+});
+
+test('cameraGate: denial rejects the run before it reaches the evaluator', () => {
+  const ev = mockEvaluator();
+  const broker = createAnimationsBroker(ev, {
+    cameraGate: () => 'interactive grab active',
+  });
+  assert.throws(() => broker('p', 'animations.run', {
+    spec: { type: 'tween', target: { kind: 'output-camera', outputId: 0 },
+            from: { x: 0 }, to: { x: 100 }, duration: 100 },
+  }), /camera animation denied: interactive grab active/);
+  assert.equal(ev.calls.length, 0);
+});
+
+test('cameraGate: walks composite specs to find camera leaves', () => {
+  const ev = mockEvaluator();
+  const gated = [];
+  const broker = createAnimationsBroker(ev, {
+    cameraGate: (outputId) => { gated.push(outputId); return 'denied'; },
+  });
+  assert.throws(() => broker('p', 'animations.run', {
+    spec: { type: 'sequence', items: [
+      { type: 'tween', target: { kind: 'window-opacity', windowId: 1 },
+        from: 0, to: 1, duration: 50 },
+      { type: 'parallel', items: [
+        { type: 'tween', target: { kind: 'output-camera', outputId: 4 },
+          from: { x: 0 }, to: { x: 10 }, duration: 50 },
+      ] },
+    ] },
+  }), /camera animation denied/);
+  assert.deepEqual(gated, [4]);
+});
+
+test('cameraGate: window-only specs pass an always-deny gate', async () => {
+  const ev = mockEvaluator();
+  const broker = createAnimationsBroker(ev, { cameraGate: () => 'denied' });
+  await broker('p', 'animations.run', {
+    spec: { type: 'tween', target: { kind: 'window-opacity', windowId: 1 },
+            from: 0, to: 1, duration: 50 },
+  });
+  assert.equal(ev.calls.length, 1);
+});
+
+test('cameraGate: allow (null) lets a camera run through', async () => {
+  const ev = mockEvaluator();
+  const broker = createAnimationsBroker(ev, { cameraGate: () => null });
+  await broker('p', 'animations.run', {
+    spec: { type: 'tween', target: { kind: 'output-camera', outputId: 1 },
+            from: { x: 0 }, to: { x: 10 }, duration: 50 },
+  });
+  assert.equal(ev.calls.length, 1);
+});

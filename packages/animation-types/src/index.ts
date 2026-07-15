@@ -18,8 +18,9 @@
 // "Decided"). decay / keyframes / stagger are deferred until concrete
 // use cases demand them.
 
-// Per-surface render-state target. The kind picks which CompositorSink
-// setter the evaluator writes each frame; windowId picks which surface.
+// Render-state target. The kind picks which CompositorSink setter the
+// evaluator writes each frame; windowId (or outputId for the camera)
+// picks which surface / output.
 //
 // Per the design, a window's transform / margin are single composite
 // values. An animation on window-transform owns ALL transform fields
@@ -30,7 +31,8 @@
 export type TargetRef =
   | { readonly kind: "window-opacity"; readonly windowId: number }
   | { readonly kind: "window-transform"; readonly windowId: number }
-  | { readonly kind: "window-output-margin"; readonly windowId: number };
+  | { readonly kind: "window-output-margin"; readonly windowId: number }
+  | { readonly kind: "output-camera"; readonly outputId: number };
 
 // The set of values an animation can interpolate. The shape matches the
 // CompositorSink setters' payloads. For window-transform / -output-margin,
@@ -48,11 +50,20 @@ export interface MarginValue {
   bottom?: number;
   left?: number;
 }
+// World-space camera framing for an output (docs/canvas-design.md §4):
+// world x/y offset + zoom factor. Missing fields default to the identity
+// camera (0, 0, zoom 1).
+export interface CameraValue {
+  x?: number;
+  y?: number;
+  zoom?: number;
+}
 // ValueOf<TargetRef>: scalar for opacity, struct for the others.
 export type ValueOf<T extends TargetRef> =
   T extends { kind: "window-opacity" } ? number
   : T extends { kind: "window-transform" } ? TransformValue
   : T extends { kind: "window-output-margin" } ? MarginValue
+  : T extends { kind: "output-camera" } ? CameraValue
   : never;
 
 // Cubic-bezier control points (matches CSS cubic-bezier(x1,y1,x2,y2)).

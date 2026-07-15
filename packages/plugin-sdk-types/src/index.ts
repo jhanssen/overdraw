@@ -85,6 +85,7 @@ export interface PluginWindowsLike {
   deleteState(id: number, key: string): Promise<void>;
   setOutputStack(outputId: number, ids: number[] | null): Promise<void>;
   setOutputCamera(outputId: number, x: number, y: number, zoom?: number): Promise<void>;
+  getOutputCamera(outputId: number): Promise<{ x: number; y: number; zoom: number }>;
   setIslands(islands: ReadonlyArray<{
     id: number;
     contextOutputId: number;
@@ -155,6 +156,16 @@ export interface PluginTransitionsLike {
   }): Promise<void>;
 }
 
+// ---- animations ---------------------------------------------------------------
+
+// Structural view of sdk.animations (core-plugin-api.md §9). Specs and
+// targets are typed loosely here; @overdraw/animation-types carries the
+// canonical AnimationSpec / TargetRef shapes for plugins that want them.
+export interface PluginAnimationsLike {
+  run(spec: unknown): Promise<void>;
+  cancel(target: unknown): Promise<void>;
+}
+
 // ---- the composed SDK shape --------------------------------------------------
 
 // What init(sdk) can rely on. Required fields are always provided by the
@@ -177,6 +188,7 @@ export interface PluginSdkShape {
   cursor?: CursorAPI;
   compose?: PluginComposeLike;
   transitions?: PluginTransitionsLike;
+  animations?: PluginAnimationsLike;
   gpu?: PluginGpuLike;
   intercept?: InterceptAPI;
 }

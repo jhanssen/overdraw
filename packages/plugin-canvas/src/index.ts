@@ -13,8 +13,10 @@
 //   world rect along its output's row (slot pitch = output width +
 //   SLOT_GUTTER); hidden members lay out at their slots (pre-sized on
 //   show) while the draw stack still gates visibility; `show` docks the
-//   output's camera on the shown island instantly. Snapshot show
-//   transitions are ignored (camera flights are the world-mode animation).
+//   output's camera on the shown island instantly, or FLIES it there when
+//   the caller passes a `transition` (duration + easing drive a camera
+//   tween; the union of departure + destination stacks rides the output
+//   for the journey so the world visibly slides by).
 
 import type {
   WorkspaceAPI, WorkspaceHandle, WorkspaceIndex, WorkspaceSnapshot,
@@ -22,6 +24,7 @@ import type {
 import type {
   PluginSdkShape, SceneHandleLike, PluginTransitionsLike,
 } from "@overdraw/plugin-sdk-types";
+import type { EasingSpec, TweenSpec } from "@overdraw/animation-types";
 import * as reg from "@overdraw/plugin-workspace-default/registry";
 import type { SideEffect, WorkspaceState } from "@overdraw/plugin-workspace-default/registry";
 
@@ -73,14 +76,15 @@ interface CanvasPluginConfig {
   }>;
   // The user's `canvas` config slice (verbatim). `world: true` enables
   // world slots: each workspace gets a world-rect island along its
-  // output's row and `show` docks the output's camera on it instantly.
+  // output's row and `show` docks the output's camera on it (instantly,
+  // or via a camera flight when the caller passes a transition).
   // Absent/false = workspace parity (islands colocated with outputs,
   // identity cameras).
   canvas?: unknown;
 }
 
-// Horizontal spacing between neighboring slot rects in a row. Cosmetic
-// until camera flights exist (instant docks never show the gap).
+// Horizontal spacing between neighboring slot rects in a row. Visible as
+// the void between islands while a camera flight crosses it.
 const SLOT_GUTTER = 128;
 
 export default async function init(
@@ -115,16 +119,15 @@ export default async function init(
     && (config.canvas as { world?: unknown }).world === true;
 
   // Snapshot-based show transitions capture arrangement-anchored scenes
-  // and cannot represent a world-docked view: world mode shows instantly
-  // (camera flights are the world-mode animation). Logged once.
-  let transitionDropWarned = false;
-  function gateTransition<T>(t: T | null): T | null {
-    if (t === null || !worldMode) return t;
-    if (!transitionDropWarned) {
-      transitionDropWarned = true;
-      sdk.log("canvas: show transitions are ignored in world mode (instant dock)");
-    }
-    return null;
+  // and cannot represent a world-docked view; in world mode a `transition`
+  // instead requests a camera FLIGHT to the destination island (the kind
+  // is irrelevant to a real camera move -- only duration and easing carry
+  // over). Logged once.
+  let flightNoteShown = false;
+  function noteFlight(kind: string): void {
+    if (flightNoteShown) return;
+    flightNoteShown = true;
+    sdk.log(`canvas: world mode show transitions fly the camera (kind '${kind}' ignored; duration/easing honored)`);
   }
 
   // Live output identifiers, kept in sync via output.added / output.removed /
@@ -363,6 +366,40 @@ export default async function init(
   // visibility. `show` docks the camera on the shown island's rect.
   const slotByHandle = new Map<WorkspaceHandle, number>();
   const lastCamByOutput = new Map<number, number>();
+  // Outputs with a camera flight in progress, keyed to the flight's token.
+  // While an output flies, publishWorld skips docking its camera (the
+  // flight owns it); the settle step (or a preempting flight / an instant
+  // show's cancelFlight) reclaims it.
+  const flying = new Map<number, number>();
+  let flightSeq = 0;
+  // The ids most recently pushed to each output's draw stack. During a
+  // flight this is the departure+destination union, which the registry's
+  // stackFor cannot know about -- a preempting flight unions against it
+  // so nothing pops off screen mid-journey.
+  const lastPushedStack = new Map<number, number[]>();
+
+  function camXFor(outputId: number, handle: WorkspaceHandle): number {
+    const slot = slotByHandle.get(handle);
+    const g = outputGeom.get(outputId);
+    return (slot !== undefined && g) ? slot * (g.width + SLOT_GUTTER) : 0;
+  }
+
+  async function pushStack(outputId: number, ids: number[]): Promise<void> {
+    lastPushedStack.set(outputId, ids);
+    await sdk.windows.setOutputStack(outputId, ids);
+  }
+
+  // Abort an in-progress flight so an instant camera dock can land: the
+  // token bump makes the flight's settle step a no-op, and cancelling the
+  // evaluator leaf stops the per-frame camera writes (the flight's
+  // pending run() promise resolves cleanly). The camera cache is
+  // invalidated too -- the flight left the camera somewhere between
+  // slots, so the next dock must re-send even a value we sent before.
+  async function cancelFlight(outputId: number): Promise<void> {
+    if (!flying.delete(outputId)) return;
+    lastCamByOutput.delete(outputId);
+    await sdk.animations?.cancel({ kind: "output-camera", outputId });
+  }
 
   function resolveSlots(
     handles: ReadonlyArray<WorkspaceHandle>,
@@ -426,12 +463,12 @@ export default async function init(
     islands.sort((a, b) => a.id - b.id);
     await sdk.windows.setIslands(islands);
     // Dock each output's camera on its shown island (instant). Identity
-    // when geometry is unknown (rect null islands tile in place).
+    // when geometry is unknown (rect null islands tile in place). A
+    // flying output's camera belongs to its flight; the settle step
+    // docks it.
     for (const [outputId, shown] of state.shownByOutput) {
-      const slot = slotByHandle.get(shown);
-      const g = outputGeom.get(outputId);
-      const camX = (slot !== undefined && g)
-        ? slot * (g.width + SLOT_GUTTER) : 0;
+      if (flying.has(outputId)) continue;
+      const camX = camXFor(outputId, shown);
       if (lastCamByOutput.get(outputId) === camX) continue;
       lastCamByOutput.set(outputId, camX);
       await sdk.windows.setOutputCamera(outputId, camX, 0);
@@ -453,6 +490,7 @@ export default async function init(
       if (skipKinds.has(e.kind)) continue;
       switch (e.kind) {
         case "setOutputStack":
+          lastPushedStack.set(e.outputId, e.ids ? [...e.ids] : []);
           await sdk.windows.setOutputStack(e.outputId, e.ids);
           await updateIsland(e.outputId, e.ids);
           break;
@@ -537,6 +575,7 @@ export default async function init(
       await sdk.transitions.run(runOpts);
       // The commit applied the TO stack inside the completion tick,
       // bypassing applyEffects; publish the matching island now.
+      lastPushedStack.set(outputId, toIds ? [...toIds] : []);
       await updateIsland(outputId, toIds ?? []);
       if (worldMode) await publishWorld();
     } finally {
@@ -555,6 +594,85 @@ export default async function init(
         e.kind === "requestFocusDecision");
     if (focusEffect) {
       await sdk.windows.requestFocusDecision(focusEffect.reason);
+    }
+  }
+
+  // World-mode workspace.show with a transition: fly the camera to the
+  // destination island instead of teleporting. The registry state flips
+  // to the destination immediately (workspace.shown/hidden events, bar
+  // highlight, focus policy all see the new truth at takeoff); only the
+  // optics travel. For the journey the output's draw stack carries the
+  // UNION of what was visible and what will be, so the world slides by
+  // instead of a void. Settle = final stack + one settled camera write
+  // (residency sweep, X re-narration, pointer repick) + the deferred
+  // focus decision.
+  //
+  // Falls back to an instant dock when the runtime has no sdk.animations
+  // or when the evaluator refuses (camera animations are denied during
+  // interactive grabs/drags). A flight preempted by a newer show abandons
+  // its settle -- the winner (whose tween starts from the live mid-flight
+  // camera) owns the output from that point.
+  async function showWithFlight(
+    index: WorkspaceIndex, outputId: number, t: ShowTransitionSpec,
+  ): Promise<void> {
+    noteFlight(t.kind);
+    const fromIds = lastPushedStack.get(outputId) ?? reg.stackFor(state, outputId);
+    const r = reg.show(state, index, outputId, outputNameOf(outputId));
+    state = r.state;
+    const setStackEffect = r.sideEffects.find(
+      (e): e is Extract<SideEffect, { kind: "setOutputStack" }> =>
+        e.kind === "setOutputStack" && e.outputId === outputId);
+    const toIds = setStackEffect ? [...setStackEffect.ids ?? []] : [];
+    const prevFlight = flying.get(outputId);
+    const token = ++flightSeq;
+    flying.set(outputId, token);
+    try {
+      await applyEffects(r.sideEffects, new Set(["setOutputStack", "requestFocusDecision"]));
+      const union = [...fromIds.filter((id) => !toIds.includes(id)), ...toIds];
+      await pushStack(outputId, union);
+      // Stop a preempted flight's leaf before reading the camera: run()
+      // below would replace it anyway, but the no-animation branch (the
+      // camera is already at the target) would otherwise leave the old
+      // leaf flying the camera away from where we settle.
+      if (prevFlight !== undefined) {
+        await sdk.animations?.cancel({ kind: "output-camera", outputId });
+      }
+      const shown = state.shownByOutput.get(outputId);
+      const target = shown !== undefined ? camXFor(outputId, shown) : 0;
+      const cur = await sdk.windows.getOutputCamera(outputId);
+      if (sdk.animations
+          && (cur.x !== target || cur.y !== 0 || cur.zoom !== 1)) {
+        const spec: TweenSpec = {
+          type: "tween",
+          target: { kind: "output-camera", outputId },
+          from: cur,
+          to: { x: target, y: 0, zoom: 1 },
+          duration: t.duration,
+          easing: (t.easing ?? "ease-in-out") as EasingSpec,
+        };
+        try {
+          await sdk.animations.run(spec);
+        } catch (err) {
+          sdk.log(`canvas: camera flight fell back to instant dock (${String(err)})`);
+        }
+      }
+      if (flying.get(outputId) !== token) return;  // preempted; the winner settles
+      flying.delete(outputId);
+      // Settle against LIVE state: a destroy/move that landed mid-flight
+      // may have changed the shown workspace under us.
+      const settleShown = state.shownByOutput.get(outputId);
+      await pushStack(outputId, reg.stackFor(state, outputId));
+      const settleX = settleShown !== undefined ? camXFor(outputId, settleShown) : 0;
+      lastCamByOutput.set(outputId, settleX);
+      await sdk.windows.setOutputCamera(outputId, settleX, 0);
+      const focusEffect = r.sideEffects.find(
+        (e): e is Extract<SideEffect, { kind: "requestFocusDecision" }> =>
+          e.kind === "requestFocusDecision");
+      if (focusEffect) {
+        await sdk.windows.requestFocusDecision(focusEffect.reason);
+      }
+    } finally {
+      if (flying.get(outputId) === token) flying.delete(outputId);
     }
   }
 
@@ -651,11 +769,16 @@ export default async function init(
       "Show the workspace matching `name`. Matches user-set names first across all outputs; falls back to the durable handle when `name` is a digit string. Use `output` to restrict the search.",
     handler: async (params: unknown): Promise<null> => {
       const p = parseShowParams(state, params, resolveOutputName);
-      const t = gateTransition(parseShowTransition(params, "workspace.show"));
+      const t = parseShowTransition(params, "workspace.show");
+      if (t && worldMode) {
+        await showWithFlight(p.index, p.outputId, t);
+        return null;
+      }
       if (t) {
         await showWithTransition(p.index, p.outputId, t);
         return null;
       }
+      await cancelFlight(p.outputId);
       const r = reg.show(state, p.index, p.outputId, outputNameOf(p.outputId));
       state = r.state;
       await applyEffects(r.sideEffects);
@@ -670,11 +793,16 @@ export default async function init(
     handler: async (params: unknown): Promise<null> => {
       const p = parseIndexParams(
         params, resolveOutputName, focusedOutputId(), "workspace.show-at-index");
-      const t = gateTransition(parseShowTransition(params, "workspace.show-at-index"));
+      const t = parseShowTransition(params, "workspace.show-at-index");
+      if (t && worldMode) {
+        await showWithFlight(p.index, p.outputId, t);
+        return null;
+      }
       if (t) {
         await showWithTransition(p.index, p.outputId, t);
         return null;
       }
+      await cancelFlight(p.outputId);
       const r = reg.show(state, p.index, p.outputId, outputNameOf(p.outputId));
       state = r.state;
       await applyEffects(r.sideEffects);
@@ -775,7 +903,14 @@ export default async function init(
       await applyEffects(r.sideEffects);
     },
     async show(index, outputId, transition): Promise<void> {
-      const t = gateTransition(transition ?? null);
+      const t = transition ?? null;
+      if (t && worldMode) {
+        await showWithFlight(
+          index, outputId ?? reg.OUTPUT_DEFAULT,
+          { kind: t.kind, duration: t.duration, easing: t.easing },
+        );
+        return;
+      }
       if (t) {
         await showWithTransition(
           index, outputId ?? 0,
@@ -784,6 +919,7 @@ export default async function init(
         return;
       }
       const outId = outputId ?? reg.OUTPUT_DEFAULT;
+      await cancelFlight(outId);
       const r = reg.show(state, index, outId, outputNameOf(outId));
       state = r.state;
       await applyEffects(r.sideEffects);
@@ -833,7 +969,7 @@ export default async function init(
   };
 
   await sdk.registerPlugin("workspace", () => api);
-  sdk.log("canvas plugin registered (workspace parity)");
+  sdk.log(`canvas plugin registered (${worldMode ? "world" : "workspace parity"} mode)`);
 }
 
 // ---- Param parsers -------------------------------------------------------

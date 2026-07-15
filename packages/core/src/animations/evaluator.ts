@@ -5,11 +5,12 @@
 // composite specs sequence + parallel unfold into leaves whose Promises
 // the composite awaits.
 //
-// Cancel-on-replacement keys on (target.kind, target.windowId): only
-// one leaf-level animation is active per target at a time. A new leaf
-// targeting (kind, windowId) cancels the prior one (its Promise
-// resolves cleanly, then the new one starts on the next tick). A
-// sdk.animations.cancel(target) call resolves the same way.
+// Cancel-on-replacement keys on (target.kind, target.windowId) -- or
+// (kind, outputId) for output-camera targets: only one leaf-level
+// animation is active per target at a time. A new leaf on the same
+// target cancels the prior one (its Promise resolves cleanly, then the
+// new one starts on the next tick). A sdk.animations.cancel(target)
+// call resolves the same way.
 
 import type { CompositorSink } from "../protocols/ctx.js";
 import type {
@@ -78,7 +79,7 @@ export function createEvaluator(
   const maxDtSec = opts.maxDtSec ?? 0.1;
 
   function targetKey(t: TargetRef): string {
-    return `${t.kind}:${t.windowId}`;
+    return `${t.kind}:${t.kind === "output-camera" ? t.outputId : t.windowId}`;
   }
 
   // Cancel-on-replacement: if a leaf is already active on this target,

@@ -1,8 +1,9 @@
 // GPU integration: canvas world mode (canvas: { world: true }). Workspaces
 // live at world slots along the output's row; `show` docks the camera
-// instantly; windows tile at their slot's world rect and composite through
-// the camera; hidden-workspace members reside nowhere (stack-gated
-// residency) while keeping their world rects.
+// instantly (or flies it there when the caller passes a transition);
+// windows tile at their slot's world rect and composite through the
+// camera; hidden-workspace members reside nowhere (stack-gated residency)
+// while keeping their world rects.
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
@@ -86,6 +87,61 @@ test("world mode: workspaces at slots, camera docks on show", { skip }, async ()
       (e) => e.length === 1 && e[0] === 0, { what: "A re-entered on show" });
     await settled(() => enteredOf(c, bId),
       (e) => e.length === 0, { what: "B left while hidden" });
+  } finally {
+    await c.teardown();
+  }
+});
+
+test("world mode: show with a transition flies the camera", { skip }, async () => {
+  const c = await setupCompositor({
+    headless: OUT, animations: true, config: { canvas: { world: true } },
+  });
+  try {
+    const cA = 0xff3030c0;
+    const cB = 0xff30c030;
+
+    // A on workspace 1 (slot 0); B on workspace 2 (slot 1); back on 1.
+    const a = c.spawnClient([FILL, "--color", cA.toString(16)]);
+    await a.ready;
+    const s1 = await c.waitFor(c.query, (s) => s.windows.length === 1, { what: "A mapped" });
+    const aId = s1.windows[0].surfaceId;
+    await c.runtime.invokeAction("workspace.create", {});
+    await c.runtime.invokeAction("workspace.show-at-index", { index: 2 });
+    const b = c.spawnClient([FILL, "--color", cB.toString(16)]);
+    await b.ready;
+    const s2 = await c.waitFor(c.query, (s) => s.windows.length === 2, { what: "B mapped" });
+    const bId = s2.windows.find((w) => w.surfaceId !== aId).surfaceId;
+    await c.runtime.invokeAction("workspace.show-at-index", { index: 1 });
+    await settled(() => c.query().outputs[0].cameraX,
+      (x) => x === 0, { what: "camera back at slot 0" });
+    await settled(() => enteredOf(c, aId),
+      (e) => e.length === 1, { what: "A resident before takeoff" });
+
+    // Fly to workspace 2. The action resolves at settle; poll mid-flight
+    // state while it runs.
+    const flight = c.runtime.invokeAction("workspace.show-at-index",
+      { index: 2, transition: { kind: "slide", duration: 800 } });
+    // Mid-flight: the camera mirror tracks the tween between the slots...
+    await settled(() => c.query().outputs[0].cameraX,
+      (x) => x > 0 && x < PITCH, { what: "camera between slots mid-flight" });
+    // ...the union of both workspaces rides the draw stack...
+    const stack = c.state.outputToplevelStacks?.get(0) ?? [];
+    assert.deepEqual([...stack].sort(), [aId, bId].sort(),
+      "union stack mid-flight");
+    // ...and residency is takeoff-state (the sweep defers to settle): B
+    // is stack-visible but not yet entered anywhere.
+    assert.deepEqual(enteredOf(c, bId), [], "B not resident mid-flight");
+
+    await flight;
+    await settled(() => c.query().outputs[0].cameraX,
+      (x) => x === PITCH, { what: "camera settled at slot 1" });
+    await readUntil(c, (p) => pixelMatches(pixelAt(p, OUT.width, 640, 360), argbToBgra(cB), 4));
+    await settled(() => enteredOf(c, bId),
+      (e) => e.length === 1 && e[0] === 0, { what: "B resident after settle" });
+    await settled(() => enteredOf(c, aId),
+      (e) => e.length === 0, { what: "A left after settle" });
+    const settledStack = c.state.outputToplevelStacks?.get(0) ?? [];
+    assert.deepEqual([...settledStack], [bId], "destination stack after settle");
   } finally {
     await c.teardown();
   }

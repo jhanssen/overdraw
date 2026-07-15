@@ -77,6 +77,37 @@ async function withCanvasPlugin(fn, opts = {}) {
     wsEvents.push({ name, payload });
   });
 
+  // Mock animations broker for camera flights. Modes (opts.animations):
+  //   undefined      -- run resolves immediately (flights settle instantly);
+  //   'manual'       -- run parks until the test resolves it via animPending
+  //                     (a second run on the same target resolves the first,
+  //                     mirroring the evaluator's cancel-on-replacement);
+  //   'deny'         -- run rejects (the broker's cameraGate during a grab).
+  const animCalls = [];
+  const animPending = [];
+  function handleAnimations(method, params) {
+    if (opts.animations === 'deny') {
+      throw new Error('animations.run: camera animation denied: interactive grab active');
+    }
+    if (method === 'animations.run') {
+      animCalls.push(params.spec);
+      if (opts.animations === 'manual') {
+        const key = JSON.stringify(params.spec.target);
+        const prior = animPending.findIndex((p) => p.key === key);
+        if (prior >= 0) animPending.splice(prior, 1)[0].resolve();
+        return new Promise((resolve) => animPending.push({ key, resolve }));
+      }
+      return null;
+    }
+    if (method === 'animations.cancel') {
+      const key = JSON.stringify(params.target);
+      const prior = animPending.findIndex((p) => p.key === key);
+      if (prior >= 0) animPending.splice(prior, 1)[0].resolve();
+      return null;
+    }
+    throw new Error(`no handler for '${method}'`);
+  }
+
   await withRuntime({
     bus: pluginBus,
     onRequest: (plugin, method, params) => {
@@ -85,6 +116,7 @@ async function withCanvasPlugin(fn, opts = {}) {
         if (r === WINDOWS_NOT_HANDLED) throw new Error(`unhandled ${method}`);
         return r;
       }
+      if (method.startsWith('animations.')) return handleAnimations(method, params);
       throw new Error(`no handler for '${method}'`);
     },
   }, async (rt) => {
@@ -114,7 +146,7 @@ async function withCanvasPlugin(fn, opts = {}) {
       })]);
     await rt.waitForNamespace('workspace');
     await fn({
-      rt, sink, wm, wsEvents, seatCalls, layoutSnapshots,
+      rt, sink, wm, wsEvents, seatCalls, layoutSnapshots, animCalls, animPending,
       islands() { return layoutSnapshots.at(-1)?.islands ?? []; },
       addWindow(id) {
         wm.addWindow(id, res(id));
@@ -334,4 +366,114 @@ test('world: destroying a workspace frees its slot for the next one', async () =
     const xs = isl.map((i) => i.rect.x).sort((a, b) => a - b);
     assert.deepEqual(xs, [0, PITCH]);
   }, { world: true });
+});
+
+// ---- world mode: camera flights ------------------------------------------
+// A show with a `transition` flies the camera instead of teleporting:
+// union stack for the journey, tween on the output-camera target, settle
+// = destination stack + one settled camera write + deferred focus.
+
+// Two workspaces, one window each (101 on ws1, 102 on ws2), ws1 shown.
+async function setupTwoIslands({ rt, addWindow }) {
+  addWindow(101);
+  await settle();
+  await call(rt, 'create', [{}]);
+  await call(rt, 'show', [2, 0]);
+  addWindow(102);
+  await settle();
+  await call(rt, 'show', [1, 0]);
+  await settle();
+}
+
+test('world: show with a transition flies (union stack, tween, settle at slot)', async () => {
+  await withCanvasPlugin(async (h) => {
+    const { rt, sink, wsEvents, animCalls, animPending } = h;
+    await setupTwoIslands(h);
+    sink.outputStackCalls.length = 0;
+    sink.cameraCalls.length = 0;
+    wsEvents.length = 0;
+
+    const p = call(rt, 'show', [2, 0, { kind: 'slide', duration: 200 }]);
+    await settle();
+    // Takeoff: the union of departure + destination stacks rides the
+    // output, the tween targets the destination slot, and the registry
+    // truth (bar highlight) flipped immediately -- no settled camera yet.
+    assert.deepEqual(sink.outputStackCalls[0], { outputId: 0, ids: [101, 102] });
+    assert.equal(animCalls.length, 1);
+    assert.equal(animCalls[0].type, 'tween');
+    assert.deepEqual(animCalls[0].target, { kind: 'output-camera', outputId: 0 });
+    assert.deepEqual(animCalls[0].to, { x: PITCH, y: 0, zoom: 1 });
+    assert.equal(animCalls[0].duration, 200);
+    assert.ok(wsEvents.some((e) => e.name === 'workspace.shown' && e.payload.index === 2));
+    assert.equal(sink.cameraCalls.length, 0);
+
+    animPending.shift().resolve();
+    await p;
+    assert.deepEqual(sink.outputStackCalls.at(-1), { outputId: 0, ids: [102] });
+    assert.deepEqual(sink.cameraCalls.at(-1), { outputId: 0, x: PITCH, y: 0, zoom: 1 });
+  }, { world: true, animations: 'manual' });
+});
+
+test('world: a newer flight preempts; the loser never settles', async () => {
+  await withCanvasPlugin(async (h) => {
+    const { rt, sink, animCalls, animPending } = h;
+    await setupTwoIslands(h);
+    // Third island (window 103 on ws3) so the second flight has a
+    // destination distinct from both the first's and the live camera.
+    await call(rt, 'create', [{}]);
+    await call(rt, 'show', [3, 0]);
+    h.addWindow(103);
+    await settle();
+    await call(rt, 'show', [1, 0]);
+    await settle();
+    sink.outputStackCalls.length = 0;
+    sink.cameraCalls.length = 0;
+
+    const p1 = call(rt, 'show', [2, 0, { kind: 'slide', duration: 500 }]);
+    await settle();
+    const p2 = call(rt, 'show', [3, 0, { kind: 'slide', duration: 500 }]);
+    await settle();
+    // Flight 2 cancelled flight 1's leaf; flight 1 must abandon its
+    // settle (no stack push to [102], no settled camera write).
+    await p1;
+    assert.equal(sink.cameraCalls.length, 0);
+    // Flight 2's union keeps everything from the aborted journey visible.
+    assert.deepEqual(sink.outputStackCalls.at(-1),
+      { outputId: 0, ids: [101, 102, 103] });
+    assert.equal(animCalls.at(-1).to.x, 2 * PITCH);
+
+    animPending.shift().resolve();
+    await p2;
+    assert.deepEqual(sink.outputStackCalls.at(-1), { outputId: 0, ids: [103] });
+    assert.deepEqual(sink.cameraCalls.at(-1), { outputId: 0, x: 2 * PITCH, y: 0, zoom: 1 });
+  }, { world: true, animations: 'manual' });
+});
+
+test('world: an instant show cancels an in-progress flight and docks', async () => {
+  await withCanvasPlugin(async (h) => {
+    const { rt, sink } = h;
+    await setupTwoIslands(h);
+    sink.cameraCalls.length = 0;
+
+    const p = call(rt, 'show', [2, 0, { kind: 'slide', duration: 500 }]);
+    await settle();
+    await call(rt, 'show', [1, 0]);   // instant: cancels the flight
+    await p;                          // flight resolves without settling
+    assert.deepEqual(sink.cameraCalls.at(-1), { outputId: 0, x: 0, y: 0, zoom: 1 });
+    assert.deepEqual(sink.outputStackCalls.at(-1), { outputId: 0, ids: [101] });
+  }, { world: true, animations: 'manual' });
+});
+
+test('world: a denied flight (grab active) falls back to an instant dock', async () => {
+  await withCanvasPlugin(async (h) => {
+    const { rt, sink, animCalls } = h;
+    await setupTwoIslands(h);
+    sink.outputStackCalls.length = 0;
+    sink.cameraCalls.length = 0;
+
+    await call(rt, 'show', [2, 0, { kind: 'slide', duration: 200 }]);
+    assert.equal(animCalls.length, 0);
+    assert.deepEqual(sink.cameraCalls.at(-1), { outputId: 0, x: PITCH, y: 0, zoom: 1 });
+    assert.deepEqual(sink.outputStackCalls.at(-1), { outputId: 0, ids: [102] });
+  }, { world: true, animations: 'deny' });
 });

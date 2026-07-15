@@ -21,6 +21,9 @@ function mockSink() {
     setSurfaceOutputMargin(id, m) {
       calls.push({ method: 'margin', id, m: { ...m } });
     },
+    setOutputCamera(outputId, x, y, zoom, transient) {
+      calls.push({ method: 'camera', outputId, x, y, zoom, transient });
+    },
     // Stubs required by CompositorSink shape; unused here.
     setSurfaceLayout() {}, setStack() {}, setLayerSurfaces() {},
     setSurfaceTexture() {}, commitSurfaceBuffer() {}, commitSurfaceDmabuf() {},
@@ -339,4 +342,96 @@ test('coerceValue: rejects negative margin', () => {
     target: { kind: 'window-output-margin', windowId: 1 },
     from: { top: 0 }, to: { top: -5 }, duration: 100,
   }), /non-negative/);
+});
+
+// ---- output-camera target ------------------------------------------------
+
+test('tween output-camera: writes transient per-frame camera values', async () => {
+  const sink = mockSink();
+  const e = createEvaluator(sink);
+
+  const done = e.run({
+    type: 'tween',
+    target: { kind: 'output-camera', outputId: 2 },
+    from: { x: 0 }, to: { x: 928 }, duration: 400,
+  });
+  drive(e, 0, 200);
+  const mid = sink.calls.at(-1);
+  assert.equal(mid.method, 'camera');
+  assert.equal(mid.outputId, 2);
+  assert.equal(mid.transient, true);
+  // Linear midpoint; missing fields ride the identity camera.
+  assert.ok(Math.abs(mid.x - 464) < 40, `mid.x ${mid.x} ~ 464`);
+  assert.equal(mid.y, 0);
+  assert.equal(mid.zoom, 1);
+
+  drive(e, 200, 300);
+  await done;
+  const last = sink.calls.at(-1);
+  assert.equal(last.x, 928);
+  assert.equal(last.transient, true);
+});
+
+test('output-camera and window targets with the same numeric id do not preempt', async () => {
+  const sink = mockSink();
+  const e = createEvaluator(sink);
+  const cam = e.run({
+    type: 'tween',
+    target: { kind: 'output-camera', outputId: 3 },
+    from: { x: 0 }, to: { x: 100 }, duration: 100,
+  });
+  const fade = e.run({
+    type: 'tween',
+    target: { kind: 'window-opacity', windowId: 3 },
+    from: 0, to: 1, duration: 100,
+  });
+  assert.equal(e.activeCount(), 2);
+  drive(e, 0, 150);
+  await Promise.all([cam, fade]);
+  assert.ok(sink.calls.some((c) => c.method === 'camera' && c.x === 100));
+  assert.ok(sink.calls.some((c) => c.method === 'opacity' && c.opacity === 1));
+});
+
+test('cancel-on-replacement: a new flight on the same output preempts the old one', async () => {
+  const sink = mockSink();
+  const e = createEvaluator(sink);
+  const first = e.run({
+    type: 'tween',
+    target: { kind: 'output-camera', outputId: 1 },
+    from: { x: 0 }, to: { x: 1000 }, duration: 1000,
+  });
+  drive(e, 0, 100);
+  const second = e.run({
+    type: 'tween',
+    target: { kind: 'output-camera', outputId: 1 },
+    from: { x: 100 }, to: { x: 2000 }, duration: 100,
+  });
+  await first;  // resolves cleanly on preemption
+  assert.equal(e.activeCount(), 1);
+  drive(e, 100, 150);
+  await second;
+  assert.equal(sink.calls.at(-1).x, 2000);
+});
+
+test('cancel(output-camera target): resolves the run Promise', async () => {
+  const sink = mockSink();
+  const e = createEvaluator(sink);
+  const run = e.run({
+    type: 'tween',
+    target: { kind: 'output-camera', outputId: 5 },
+    from: { x: 0 }, to: { x: 500 }, duration: 1000,
+  });
+  await e.cancel({ kind: 'output-camera', outputId: 5 });
+  await run;
+  assert.equal(e.activeCount(), 0);
+});
+
+test('coerceValue: rejects non-positive camera zoom', () => {
+  const sink = mockSink();
+  const e = createEvaluator(sink);
+  assert.throws(() => e.run({
+    type: 'tween',
+    target: { kind: 'output-camera', outputId: 1 },
+    from: { zoom: 1 }, to: { zoom: 0 }, duration: 100,
+  }), /positive/);
 });

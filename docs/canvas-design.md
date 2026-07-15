@@ -491,10 +491,13 @@ tests only.
    content + hit-testing while a layer panel stays anchored; identity
    restores repaint. Zoom is compositor-side optics (clients render at
    real size; fx translate/margins stay glass-space); X told-coordinates
-   use pan-only charts (§7b). Spring-driven camera moves ride the SDK
-   setter for now (in-core evaluator target is future, §4). Replacing
-   snapshot-based workspace slide transitions with real camera moves
-   remains optional future work.
+   use pan-only charts (§7b). Camera motion is an in-core animation
+   evaluator target (`{kind: "output-camera", outputId}`, tween or
+   spring on x/y/zoom): per-frame writes are TRANSIENT (they update
+   render/damage/input and the `state.outputCameras` mirror but defer
+   the residency sweep + X re-narration to the mover's one settled
+   write at arrival), and the animations broker's `cameraGate` denies
+   camera runs during interactive grabs/drags.
 2. **Island object in core.** LANDED. The layout-driver iterates
    `LayoutIsland`s ({id, outputId, rect | null, members}); the WM derives
    one implicit island per output (rect = null -> output minus reserved
@@ -525,8 +528,7 @@ tests only.
    SLOT_GUTTER; slots per-handle, freed on destroy, collision-resolved
    after hotplug migration); hidden members lay out at their slots
    (pre-sized on show) while the draw stack gates visibility; `show`
-   docks the camera instantly; snapshot show transitions are ignored in
-   world mode (camera flights replace them); reserved zones carve
+   docks the camera instantly; reserved zones carve
    explicit island rects edge-relative via the context output, so docked
    islands keep their bar band clear; hidden X windows are narrated in
    their ISLAND FRAME (glass-map.ts: the camera that would show them),
@@ -534,10 +536,26 @@ tests only.
    residency + X narration via a core-side single-method patch (the
    stack sweep alone ran before the dock landed). GPU test:
    `plugin-canvas/canvas-world.gpu.mjs`.
-   NOT yet: free roaming + fly-to bookmarks (flights, 4d); elastic
-   islands; placement rules targeting islands; gutters + shove; hotplug
-   camera persistence/rescue; overview (optical zoom UX); island
-   hygiene.
+   ALSO LANDED -- **camera flights**: `workspace.show` with a
+   `transition` in world mode flies the camera to the destination slot
+   (a tween on the evaluator's `output-camera` target; the transition's
+   duration + easing carry over; the snapshot `kind` vocabulary is
+   irrelevant to a real camera move and is ignored). The registry truth
+   flips at takeoff (bar highlight, workspace.shown/hidden, focus
+   policy see the destination immediately); the union of departure +
+   destination stacks rides the output for the journey so the world
+   slides by instead of a void; settle = destination stack + one
+   settled camera write (residency sweep, X re-narration, pointer
+   repick) + the deferred focus decision. A newer show preempts the
+   flight (the loser abandons its settle; the winner tweens from the
+   live mid-flight camera via `windows.get-output-camera`); an instant
+   show cancels it. Flights denied during grabs/drags (the broker's
+   cameraGate) fall back to an instant dock.
+   NOT yet: bookmarks + free roaming (bookmarks wait until the camera
+   can leave slot framings -- without pan gestures or roaming they
+   could only record docks); elastic islands; placement rules
+   targeting islands; gutters + shove; hotplug camera
+   persistence/rescue; overview (optical zoom UX); island hygiene.
 5. **Later**: true zoom via fractional-scale; snap clusters /
    bezel-spanning; per-island layout providers (layout registry);
    world-arrangement pluggability.

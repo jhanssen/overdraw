@@ -460,7 +460,14 @@ export async function setupCompositor(opts = {}) {
     const ab = await import(
       "../packages/core/dist/plugins/animations-broker.js");
     const animEvaluator = createEvaluator(jsCompositor);
-    animationsBroker = ab.createAnimationsBroker(animEvaluator);
+    animationsBroker = ab.createAnimationsBroker(animEvaluator, {
+      // Mirrors main.ts: camera flights are denied during grabs/drags.
+      cameraGate: () => {
+        if (state.seat?.grab) return "interactive grab active";
+        if (state.seat?.drag) return "drag in progress";
+        return null;
+      },
+    });
     ANIM_NOT_HANDLED = ab.NOT_HANDLED;
     const priorBefore = state.beforeRender;
     state.beforeRender = (timeMs) => {

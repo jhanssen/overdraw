@@ -958,7 +958,19 @@ const windowsBroker = createWindowsBroker({
 // its parent, which the cascade guarantees on every decay tick.
 if (!state) throw new Error("animation evaluator: compositor state not initialized");
 const evaluator = createEvaluator(compositor);
-const animationsBroker = createAnimationsBroker(evaluator);
+const protocolState = state;
+const animationsBroker = createAnimationsBroker(evaluator, {
+  // Camera flights are denied while an interactive move/resize grab or a
+  // DnD drag is in progress: the grab maps pointer glass->world every
+  // motion event, and a camera moving underneath would drag the grabbed
+  // window across the world with it. Callers fall back to an instant dock.
+  cameraGate: () => {
+    const seat = protocolState.seat;
+    if (seat?.grab) return "interactive grab active";
+    if (seat?.drag) return "drag in progress";
+    return null;
+  },
+});
 
 // Transitions broker (core-plugin-api.md §8). Owns one TransitionEvaluator
 // per output with an in-flight transition (allocated lazily); the broker
