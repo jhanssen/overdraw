@@ -140,6 +140,7 @@ async function withCanvasPlugin(fn, opts = {}) {
         bootOutputDurableKey: runtime.bootOutputDurableKey,
         initialOutputs: runtime.initialOutputs,
         canvas: cfg.canvas,
+        layoutGap: cfg.layout?.gap,
       }),
     };
     await rt.load([bundledToResolved(spec, spec.module,
@@ -147,6 +148,7 @@ async function withCanvasPlugin(fn, opts = {}) {
         output: null, focus: null, hotkeys: undefined, actions: undefined,
         plugins: [], sourcePath: null,
         canvas: opts.canvas ?? (opts.world ? { world: true } : {}),
+        layout: opts.layout,
       },
       {
         bootOutputDurableKey: 'mock-0',
@@ -958,6 +960,51 @@ test('elastic: only tiled members take columns (floating never grows the strip)'
     assert.equal(islands().find((i) => i.id === list[0].handle).rect.width, 800,
       '2 columns of 400 -> viewport-width island');
   }, { canvas: { world: true, elastic: true } });
+});
+
+test('elastic: scroll reveals keep the layout gap visible (margin = gap)', async () => {
+  await withCanvasPlugin(async (h) => {
+    const { rt, sink, pluginBus, addWindow } = h;
+    addWindow(101);
+    await settle();
+    addWindow(102);
+    await settle();
+    addWindow(103);
+    await settle();   // strip 1200, viewport 800, maxScroll 400
+    sink.cameraCalls.length = 0;
+
+    // Reveal the RIGHTMOST column (columns layout, gap 10: last column
+    // right edge at island x + 1190). With the gap margin the scroll
+    // clamps to maxScroll -- the island-edge gap band stays visible --
+    // instead of stopping 10px short.
+    pluginBus.emit('window.change',
+      { surfaceId: 101, activated: true, changed: ['activated'] });
+    pluginBus.emit('stack.relayout', {
+      reason: 'mapped',
+      windows: [{
+        surfaceId: 101, oldOuter: null, oldOutputId: 0,
+        newOuter: { x: 802, y: 10, width: 388, height: 580 },
+        newOutputId: 0, tiling: 'managed',
+      }],
+    });
+    await settle();
+    assert.deepEqual(sink.cameraCalls.at(-1), { outputId: 0, x: 400, y: 0, zoom: 1 });
+
+    // Reveal the LEFTMOST column (x = island + 10): scroll returns to 0,
+    // not 10 -- the left gap is never eaten.
+    pluginBus.emit('window.change',
+      { surfaceId: 103, activated: true, changed: ['activated'] });
+    pluginBus.emit('stack.relayout', {
+      reason: 'reorder',
+      windows: [{
+        surfaceId: 103, oldOuter: null, oldOutputId: 0,
+        newOuter: { x: 10, y: 10, width: 386, height: 580 },
+        newOutputId: 0, tiling: 'managed',
+      }],
+    });
+    await settle();
+    assert.deepEqual(sink.cameraCalls.at(-1), { outputId: 0, x: 0, y: 0, zoom: 1 });
+  }, { canvas: { world: true, elastic: true }, layout: { gap: 10 } });
 });
 
 test('elastic: the docked camera scrolls to keep the focused window visible', async () => {

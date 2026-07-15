@@ -75,6 +75,9 @@ const CANVAS_PLUGIN: BundledPluginSpec = {
     bootOutputDurableKey: runtime.bootOutputDurableKey,
     initialOutputs: runtime.initialOutputs,
     canvas: config.canvas,
+    // The layout gap doubles as the strip scroll-reveal margin, so a
+    // revealed column keeps its gap band visible at the viewport edge.
+    layoutGap: (config.layout as { gap?: unknown } | undefined)?.gap,
   }),
 };
 

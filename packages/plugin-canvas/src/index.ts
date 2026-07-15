@@ -91,6 +91,11 @@ interface CanvasPluginConfig {
   // that exist from boot (persistent by default, optional per-entry
   // output / elastic).
   canvas?: unknown;
+  // The layout provider's configured gap (config.layout.gap). Used as
+  // the strip scroll-reveal margin: revealing a column keeps its gap
+  // band visible instead of sitting flush at the viewport edge. Static
+  // (a runtime layout.grow-gap drifts the margin slightly; cosmetic).
+  layoutGap?: unknown;
 }
 
 // Default spacing between neighboring island rects (both axes in grid
@@ -160,6 +165,12 @@ export default async function init(
   }
   // Camera scroll animation within a strip (ms).
   const SCROLL_MS = 150;
+  // Scroll-reveal margin (the layout gap): a revealed column sits this
+  // many world px from the viewport edge, keeping the inter-column gap
+  // visible -- the neighbor ends exactly at the edge.
+  const scrollMargin = (typeof config?.layoutGap === "number"
+    && Number.isFinite(config.layoutGap) && config.layoutGap >= 0)
+    ? config.layoutGap : 0;
 
   // Island spacing (canvas.gutter, world px; default SLOT_GUTTER).
   const gutterRaw = worldMode
@@ -667,11 +678,16 @@ export default async function init(
     if (!g || !isl) return null;
     const maxScroll = Math.max(0, isl.width - g.width);
     const prev = scrollByHandle.get(handle) ?? 0;
+    // Reveal with the gap band: the margin keeps the layout's
+    // inter-column gap visible at the viewport edge (the neighbor ends
+    // exactly at the edge; the leftmost/rightmost columns keep their
+    // island-edge gap since clamping lands on 0 / maxScroll).
+    const m = Math.min(scrollMargin, g.width / 4);
     let s = Math.min(maxScroll, Math.max(0, prev));
-    if (rect.x + rect.width > isl.x + s + g.width) {
-      s = rect.x + rect.width - g.width - isl.x;
+    if (rect.x + rect.width + m > isl.x + s + g.width) {
+      s = rect.x + rect.width + m - g.width - isl.x;
     }
-    if (rect.x < isl.x + s) s = rect.x - isl.x;
+    if (rect.x - m < isl.x + s) s = rect.x - m - isl.x;
     s = Math.min(maxScroll, Math.max(0, s));
     scrollByHandle.set(handle, s);
     return s !== prev ? s : null;
