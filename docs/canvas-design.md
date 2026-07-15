@@ -473,6 +473,65 @@ island this output's camera is on, creating one if none"). Keybinds,
 core actions, config refs, and ext-workspace keep working without core
 changes for workspace reasons — there is essentially nothing to unpick.
 
+## 10b. De-workspacing core (the model-level retirement pass)
+
+Standing rule: **the word "workspace" must not appear in core.** It is
+purely a plugin concept; any core occurrence is a bug. The façade in
+§10 keeps behavior stable, but the names and shapes it hangs off are
+still workspace-flavored. This pass renames the seams and retires the
+APIs whose semantics the canvas model supersedes. It was deferred until
+the questions it depended on (hidden semantics, zoom-as-z,
+pointer/camera separation) were settled; all three now are.
+
+Renames (behavior-preserving):
+
+- The `"workspace"` **namespace role** in core dispatch
+  (`invokeNamespace("workspace", ...)`, `state.workspaceDriver`) gets a
+  model-neutral name (candidate: `organizer`; the role is "the plugin
+  that decides what each output shows"). The plugin keeps registering
+  the old name as an alias while configs migrate.
+- The `currentWorkspace` **config ref** gets a neutral name with the
+  old one as a deprecated alias; its backing `workspace.shown` bus
+  subscription follows whatever event vocabulary the organizer role
+  standardizes.
+- **Comment scrub**: core comments that explain themselves in workspace
+  terms get rewritten in stack/island/camera terms.
+- Exception, by design: `protocols/ext_workspace_v1.ts` keeps its name
+  and vocabulary — it implements a wire protocol literally called
+  ext-workspace; that is the protocol's name, not a core concept.
+
+Retirements (semantics superseded by the model):
+
+- **`WorkspaceIndex` as a public identifier.** Per-output positional
+  indices are a projection for bars and keybinds, not identity. Island
+  ids / names become the durable references; index-shaped verbs survive
+  only inside the façade.
+- **`ensureOutput`.** "Make sure this output has a workspace" becomes
+  "the island this output's camera frames, creating one if none" — a
+  camera question, not an output-provisioning verb.
+- **`preferredOutputs` migration records.** Hotplug re-homing keyed on
+  durable output identity is superseded by camera persistence (§8):
+  hotplug records store island refs + camera framings; windows never
+  move, cameras do.
+- **Spawn-output assignment as ownership.** The map-event `outputId`
+  becomes a placement HINT (which island's region the window lands in);
+  placement rules target islands/bookmarks (§7), not outputs.
+- **Per-output state shapes**: `outputContent` / `outputOf` and the
+  exclusive-window suppression keys scoped per-output move to
+  island-scoped equivalents (`LayoutIsland` already scopes exclusive
+  ownership; the per-output forms remain as the implicit-island
+  degenerate case).
+- **`focusedOutputIdCache`** in the organizer plugin: derivable from
+  focus + camera framing; retire the cache once island refs make the
+  derivation cheap.
+- **ext-workspace groups**: the per-output group projection is replaced
+  by the per-group duplicate-handle scheme (§9) once islands roam.
+
+Sequencing: renames can land any time (pure churn, zero behavior);
+retirements land with the features that supersede them (camera
+persistence retires `preferredOutputs`; roaming retires the per-output
+shapes; placement rules retire spawn-ownership).
+
 ## 11. Sequencing — behavior-intact first, policy later
 
 The first two steps land in core with **zero behavior change** (identity
@@ -555,7 +614,12 @@ tests only.
    can leave slot framings -- without pan gestures or roaming they
    could only record docks); elastic islands; placement rules
    targeting islands; gutters + shove; hotplug camera
-   persistence/rescue; overview (optical zoom UX); island hygiene.
+   persistence/rescue; overview (optical zoom UX); island hygiene;
+   camera-following compose/live scenes (§4: a live view built from
+   `outputRegion(outputId)` needs a "follow output N's camera" mode);
+   ext-workspace per-group duplicate-handle projection (§9, needed once
+   islands roam across outputs); the de-workspacing renames/retirements
+   (§10b, each landing with the feature that supersedes it).
 5. **Later**: true zoom via fractional-scale; snap clusters /
    bezel-spanning; per-island layout providers (layout registry);
    world-arrangement pluggability.

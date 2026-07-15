@@ -980,7 +980,8 @@ validated + resolved + consumed by the runtime + hotkey plugin.
   bookmark could only record the dock it started from), elastic
   islands, gutters/shove, hotplug camera persistence, ext-workspace
   per-group duplicate projection, camera-following compose/live
-  scenes.
+  scenes, the de-workspacing renames/retirements
+  (canvas-design.md §10b).
 - **Logging.** TS surface migrated (spdlog 1.17.0; fixed area set;
   severity-based stdout/stderr split; `--log-file=PATH`; per-area
   `--log-level=SPEC`; `installConsoleShim` routes `console.*`
