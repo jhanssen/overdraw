@@ -450,3 +450,43 @@ test('snapshotsForOutput: workspaces sorted by index', () => {
   const snaps = snapshotsForOutput(state, OUTPUT_DEFAULT);
   assert.deepEqual(snaps.map((s) => s.index), [1, 2, 3]);
 });
+
+// ---- applyMapAt (placement rules) -------------------------------------------
+
+test('applyMapAt: assigns to the target handle; hidden target pushes no stack', async () => {
+  const { applyMapAt } = await import('../../packages/plugin-workspace-default/dist/registry.js');
+  let state = init('test').state;
+  state = applyMap(state, 100, OUTPUT_DEFAULT, 'test').state;   // anchor ws1
+  const c = create(state, {}, 'test');                          // ws2, hidden
+  state = c.state;
+  const target = c.snapshot.handle;
+
+  const r = applyMapAt(state, 200, target);
+  state = r.state;
+  assert.deepEqual(snapshotOf(state, target).members, [200]);
+  // Membership bag points at the target; no stack effect (target hidden).
+  assert.deepEqual(ofKind(r.sideEffects, 'setStateBag'),
+    [{ kind: 'setStateBag', surfaceId: 200, handle: target }]);
+  assert.equal(ofKind(r.sideEffects, 'setOutputStack').length, 0);
+
+  // A second window takes the master slot (unshift, like applyMap).
+  state = applyMapAt(state, 201, target).state;
+  assert.deepEqual(snapshotOf(state, target).members, [201, 200]);
+});
+
+test('applyMapAt: shown target pushes its stack; idempotent; unknown handle throws', async () => {
+  const { applyMapAt } = await import('../../packages/plugin-workspace-default/dist/registry.js');
+  let state = init('test').state;
+  const shown = current(state).handle;
+
+  const r = applyMapAt(state, 300, shown);
+  state = r.state;
+  assert.deepEqual(ofKind(r.sideEffects, 'setOutputStack'),
+    [{ kind: 'setOutputStack', outputId: OUTPUT_DEFAULT, ids: [300] }]);
+
+  // Already tracked -> no-op.
+  const again = applyMapAt(state, 300, shown);
+  assert.deepEqual(again.sideEffects, []);
+
+  assert.throws(() => applyMapAt(state, 301, 999), /no workspace with handle/);
+});

@@ -1449,11 +1449,98 @@ export default async function init(
   // assigned outputId; the plugin honors that as the window's home output.
   // Placement happens here, at first content -- after the WM has resolved the
   // window's tiling lane -- so a floating window never joins the tiled stack.
-  sdk.windows.onMap((ev) => {
-    const r = reg.applyMap(state, ev.surfaceId, ev.outputId, outputNameOf(ev.outputId));
+  //
+  // This handler is the PLACEMENT RESOLVER (canvas-design.md §7): a
+  // `workspace.place` state-bag hint (stamped by plugin-window-rules
+  // during preconfigure) overrides the camera-relative default. The hint
+  // carries { name?, output?, show? }: a workspace NAME resolves across
+  // all outputs (created on reference when absent -- any name; a rule is
+  // explicit config, not a typo'd bind); an OUTPUT alone targets that
+  // monitor's shown workspace ("appear on the TV, whatever it shows") and
+  // scopes where a created workspace homes; `show` makes the placement
+  // grab attention (the target workspace is shown), default quiet.
+  interface PlacementHint { name?: string; output?: string; show?: boolean }
+  function parsePlacementHint(v: unknown): PlacementHint | null {
+    if (!isObj(v)) return null;
+    const out: PlacementHint = {};
+    if (typeof v.name === "string" && v.name !== "") out.name = v.name;
+    if (typeof v.output === "string" && v.output !== "") out.output = v.output;
+    if (typeof v.show === "boolean") out.show = v.show;
+    return out.name !== undefined || out.output !== undefined ? out : null;
+  }
+  // Resolve a workspace name to its handle: user-set names first across
+  // all outputs (position order within an output), then the digit-string
+  // durable-handle fallback -- the same order workspace.show uses.
+  function findHandleByName(name: string): WorkspaceHandle | null {
+    for (const outputId of state.positionsByOutput.keys()) {
+      const idx = reg.findIndexByName(state, name, outputId);
+      if (idx !== null) return reg.findHandle(state, idx, outputId);
+    }
+    if (/^[1-9][0-9]*$/.test(name)) {
+      const h = Number(name) as WorkspaceHandle;
+      if (state.byHandle.has(h)) return h;
+    }
+    return null;
+  }
+  async function placeOnMap(ev: { surfaceId: number; outputId: number }): Promise<void> {
+    let hint: PlacementHint | null = null;
+    try {
+      hint = parsePlacementHint(
+        await sdk.windows.getState(ev.surfaceId, "workspace.place"));
+    } catch { /* no bag / broker without get-state: default placement */ }
+    if (!hint) {
+      const r = reg.applyMap(state, ev.surfaceId, ev.outputId, outputNameOf(ev.outputId));
+      state = r.state;
+      await applyEffects(r.sideEffects);
+      return;
+    }
+    // The hint is one-shot; consume it before any await can re-enter.
+    void sdk.windows.deleteState(ev.surfaceId, "workspace.place").catch(() => { /* */ });
+    // An unresolvable output (unplugged monitor) falls back per intent:
+    // a named workspace still resolves/creates elsewhere (home-region
+    // keeps working while the monitor is away); an output-only hint has
+    // no target left and places camera-relative.
+    const ruleOutputId = hint.output !== undefined
+      ? resolveOutputName(hint.output) : null;
+    let handle: WorkspaceHandle | null = null;
+    if (hint.name !== undefined) {
+      handle = findHandleByName(hint.name);
+      if (handle === null) {
+        const homeOutput = ruleOutputId ?? focusedOutputId();
+        const c = reg.create(state,
+          { name: hint.name, outputId: homeOutput }, outputNameOf(homeOutput));
+        state = c.state;
+        await applyEffects(c.sideEffects);
+        handle = c.snapshot.handle;
+      }
+    } else if (ruleOutputId !== null) {
+      const r = reg.applyMap(state, ev.surfaceId, ruleOutputId, outputNameOf(ruleOutputId));
+      state = r.state;
+      await applyEffects(r.sideEffects);
+      return;
+    }
+    if (handle === null) {
+      const r = reg.applyMap(state, ev.surfaceId, ev.outputId, outputNameOf(ev.outputId));
+      state = r.state;
+      await applyEffects(r.sideEffects);
+      return;
+    }
+    const r = reg.applyMapAt(state, ev.surfaceId, handle);
     state = r.state;
-    void applyEffects(r.sideEffects);
-  });
+    await applyEffects(r.sideEffects);
+    if (hint.show === true) {
+      const rec = state.byHandle.get(handle);
+      const idx = rec ? reg.findIndex(state, handle, rec.outputId) : null;
+      if (rec && idx !== null && state.shownByOutput.get(rec.outputId) !== handle) {
+        exitOverride(rec.outputId);
+        await cancelFlight(rec.outputId);
+        const s = reg.show(state, idx, rec.outputId, outputNameOf(rec.outputId));
+        state = s.state;
+        await applyEffects(s.sideEffects);
+      }
+    }
+  }
+  sdk.windows.onMap((ev) => { void placeOnMap(ev); });
   sdk.windows.onUnmap((ev) => {
     const r = reg.applyUnmap(state, ev.surfaceId);
     state = r.state;

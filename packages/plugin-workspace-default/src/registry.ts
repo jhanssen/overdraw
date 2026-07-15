@@ -831,6 +831,36 @@ export function applyMap(state: WorkspaceState,
   return { state, sideEffects };
 }
 
+// A new window mapped with an explicit target workspace (placement rules):
+// assign it to `handle` directly instead of the spawn output's shown
+// workspace. Idempotent if the surface is already tracked; throws on an
+// unknown handle. Same master-slot insertion as applyMap; pushes the
+// target output's stack only when the target is shown there (a quiet
+// placement onto a hidden workspace touches no stack).
+export function applyMapAt(state: WorkspaceState,
+                           surfaceId: number,
+                           handle: WorkspaceHandle,
+                           ): { state: WorkspaceState; sideEffects: SideEffect[] } {
+  if (state.surfaceToHandle.has(surfaceId)) {
+    return { state, sideEffects: [] };
+  }
+  const rec = state.byHandle.get(handle);
+  if (!rec) throw new Error(`applyMapAt: no workspace with handle ${handle as number}`);
+  if (!rec.members.includes(surfaceId)) rec.members.unshift(surfaceId);
+  state.surfaceToHandle.set(surfaceId, handle);
+
+  const sideEffects: SideEffect[] = [
+    { kind: "setStateBag", surfaceId, handle },
+  ];
+  if (state.shownByOutput.get(rec.outputId) === handle) {
+    sideEffects.push({
+      kind: "setOutputStack", outputId: rec.outputId,
+      ids: stackFor(state, rec.outputId),
+    });
+  }
+  return { state, sideEffects };
+}
+
 // A tracked window unmapped. Remove from membership + reverse index. The
 // state-bag entry is dropped (the surface is gone). If the unmapped window
 // was on the shown workspace, push setOutputStack.

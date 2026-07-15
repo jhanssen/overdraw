@@ -1020,9 +1020,18 @@ validated + resolved + consumed by the runtime + hotkey plugin.
   `plugin-canvas/canvas-fit.gpu.mjs`,
   `plugin-canvas/canvas-elastic.gpu.mjs`; unit coverage in
   `plugin-canvas/integration.test.js`.
+  Placement rules are LANDED (canvas-design.md §7): windowRules gain
+  `workspace: "name"` (create-on-reference), `output` (glass-relative
+  alone; home-region with a name), and `show: true` (attention;
+  default quiet). plugin-window-rules stamps the `workspace.place`
+  state-bag hint at preconfigure; the canvas plugin's map handler
+  resolves it (registry `applyMapAt` assigns direct-to-handle).
+  Unruled spawns stay camera-relative; with workspace-default the
+  hint is inert. GPU test `plugin-canvas/canvas-placement.gpu.mjs`.
   NOT built: pointer drag-pan gesture, bookmark advertising via
   ext-workspace, persistent growth overrides (set-elastic is
-  session-scoped), gutters/shove beyond the single-row arrangement,
+  session-scoped), rule targets for bookmarks / fly-to attention,
+  gutters/shove beyond the single-row arrangement,
   hotplug camera persistence, ext-workspace per-group duplicate
   projection, camera-following compose/live scenes, the
   de-workspacing renames/retirements (canvas-design.md §10b).

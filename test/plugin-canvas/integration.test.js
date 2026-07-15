@@ -149,9 +149,12 @@ async function withCanvasPlugin(fn, opts = {}) {
       rt, sink, wm, wsEvents, seatCalls, layoutSnapshots, animCalls, animPending,
       pluginBus,
       islands() { return layoutSnapshots.at(-1)?.islands ?? []; },
-      addWindow(id) {
+      addWindow(id, { place } = {}) {
         wm.addWindow(id, res(id));
         wm.windowHasContent(id);
+        // Placement rules stamp this bag key during preconfigure (before
+        // the map); tests set it directly on the WM.
+        if (place) wm.setState(id, 'workspace.place', place);
         bus.emit(WINDOW_EVENT.map, {
           surfaceId: id, outputId: 0,
           rect: { x: 0, y: 0, width: 1, height: 1 },
@@ -971,6 +974,93 @@ test('elastic: default-on config can opt one workspace back to fixed', async () 
     assert.equal(ws1.rect.width, 800, 'compresses back to the viewport');
     assert.equal(ws1.layout, undefined, 'master-stack again');
   }, { canvas: { world: true, elastic: true } });
+});
+
+// ---- placement rules (workspace.place state-bag hint) ---------------------
+// plugin-window-rules stamps { name?, output?, show? } during preconfigure;
+// the canvas map handler is the placement resolver.
+
+test('placement: a named hint creates the workspace and places quietly', async () => {
+  await withCanvasPlugin(async (h) => {
+    const { rt, sink, wm, addWindow } = h;
+    addWindow(101);   // anchors ws1 (shown)
+    await settle();
+    sink.cameraCalls.length = 0;
+    sink.outputStackCalls.length = 0;
+
+    // Hinted map: workspace "comms" doesn't exist -> created (hidden),
+    // window lands there, shown workspace and camera untouched.
+    addWindow(102, { place: { name: 'comms' } });
+    await settle();
+    const list = await call(rt, 'list', [0]);
+    assert.equal(list.length, 2);
+    const comms = list.find((w) => w.name === 'comms');
+    assert.ok(comms, 'created on reference');
+    assert.deepEqual(comms.members, [102]);
+    const cur = await call(rt, 'current', [0]);
+    assert.equal(cur.index, 1, 'placement is quiet');
+    assert.equal(sink.cameraCalls.length, 0, 'camera never moved');
+    assert.ok(!sink.outputStackCalls.some((c) => c.ids?.includes(102)),
+      'quiet placement never stacks the window');
+    assert.equal(wm.getState(102, 'workspace.place'), undefined,
+      'hint consumed');
+    assert.equal(wm.getState(102, 'workspace.id'), comms.handle,
+      'membership bag points at the target');
+
+    // A second window with the same hint joins the existing workspace.
+    addWindow(103, { place: { name: 'comms' } });
+    await settle();
+    const after = await call(rt, 'list', [0]);
+    assert.deepEqual(after.find((w) => w.name === 'comms').members, [103, 102]);
+  }, { world: true });
+});
+
+test('placement: show: true also shows the target workspace', async () => {
+  await withCanvasPlugin(async (h) => {
+    const { rt, sink, wsEvents, addWindow } = h;
+    addWindow(101);
+    await settle();
+    wsEvents.length = 0;
+    sink.cameraCalls.length = 0;
+
+    addWindow(102, { place: { name: 'media', show: true } });
+    await settle();
+    const cur = await call(rt, 'current', [0]);
+    assert.equal(cur.name, 'media', 'attention placement shows the target');
+    assert.ok(wsEvents.some((e) => e.name === 'workspace.shown'));
+    assert.deepEqual(sink.outputStackCalls.at(-1), { outputId: 0, ids: [102] });
+    // World mode: the camera docked on the new workspace's slot.
+    assert.equal(sink.cameraCalls.at(-1).x, PITCH);
+  }, { world: true });
+});
+
+test('placement: digit-name hint resolves to the durable handle like show', async () => {
+  await withCanvasPlugin(async (h) => {
+    const { rt, addWindow } = h;
+    addWindow(101);
+    await settle();
+    await call(rt, 'create', [{}]);   // handle 2, hidden
+    addWindow(102, { place: { name: '2' } });
+    await settle();
+    const list = await call(rt, 'list', [0]);
+    assert.deepEqual(list[1].members, [102]);
+    const cur = await call(rt, 'current', [0]);
+    assert.equal(cur.index, 1, 'quiet');
+  }, { world: true });
+});
+
+test('placement: malformed or empty hints fall back to the spawn output', async () => {
+  await withCanvasPlugin(async (h) => {
+    const { rt, addWindow } = h;
+    addWindow(101);
+    await settle();
+    addWindow(102, { place: { bogus: true } });
+    addWindow(103, { place: 'comms' });   // non-object
+    await settle();
+    const list = await call(rt, 'list', [0]);
+    assert.equal(list.length, 1);
+    assert.deepEqual(list[0].members, [103, 102, 101]);
+  }, { world: true });
 });
 
 test('world: config-seeded bookmarks resolve at go time', async () => {

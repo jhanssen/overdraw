@@ -673,10 +673,30 @@ tests only.
    resize -- §5's pacing promise now holds: off-view callbacks ride
    any output's flip-complete, and a fully idle compositor forces one
    flip. GPU test: `plugin-canvas/canvas-elastic.gpu.mjs`.
+   ALSO LANDED -- **placement rules targeting workspaces** (§7):
+   window rules gain `workspace: "name"` (resolved across all outputs
+   by user-set name, digit-handle fallback; created on reference when
+   absent -- any name, since a rule is explicit config), `output:
+   "DP-1"` (alone = "appear on that monitor, whatever it shows" --
+   glass-relative; with a name = where a created workspace homes --
+   the §7 home-region intent, and the name keeps resolving while the
+   monitor is unplugged), and `show: true` (placement + attention;
+   default is quiet -- the shown workspace, camera, and stack never
+   move). Mechanically per §7: plugin-window-rules stays the matching
+   side and stamps `{name?, output?, show?}` into the window's
+   `workspace.place` state-bag key during preconfigure (awaited before
+   the map); the canvas plugin's map handler is the placement resolver
+   that consumes the one-shot hint, assigning membership via the
+   registry's `applyMapAt` (direct-to-handle; no transient stack on
+   the spawn workspace). Unruled spawns stay camera-relative ("open
+   where I'm looking"). With plugin-workspace-default the hint is
+   inert. GPU test: `plugin-canvas/canvas-placement.gpu.mjs`.
    NOT yet: pointer drag-pan gesture; bookmark advertising on the bar
    (§12's islands-vs-bookmarks question); persistent growth overrides
-   (set-elastic is session-scoped); placement
-   rules targeting islands; gutters + shove beyond the single-row
+   (set-elastic is session-scoped); rules targeting BOOKMARKS (rules
+   name workspaces today; a bookmark target adds camera framings);
+   fly-to attention (rule `show` docks instantly; no transition
+   plumbing in rules yet); gutters + shove beyond the single-row
    arrangement; hotplug camera
    persistence/rescue; overview UX (an interactive picker/gesture on
    top of the landed fit-zoom optics); island hygiene;

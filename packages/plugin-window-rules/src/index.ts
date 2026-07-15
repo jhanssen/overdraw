@@ -6,6 +6,18 @@
 // references from the user's config survive (same reason config.actions is
 // in-thread).
 //
+// Placement (docs/canvas-design.md §7): a rule may also target WHERE the
+// window goes -- `workspace: "name"` (created on reference if absent)
+// and/or `output: "DP-1"` (the home of a created workspace, or the
+// placement target by itself: "appear on that monitor, whatever it shows").
+// `show: true` additionally makes the placement grab attention (the target
+// workspace is shown); default is quiet. This plugin stays the MATCHING
+// side: it stamps the resolved placement into the window's state bag
+// (`workspace.place`) during preconfigure, and the workspace-namespace
+// plugin's map handler is the placement resolver that consumes it. The
+// bundled canvas plugin implements it; with plugin-workspace-default the
+// hint is inert (windows place on the spawn output's shown workspace).
+//
 // The single seam is `window.preconfigure`: an interceptable event fired at
 // the initial commit, BEFORE the window enters the draw stack, carrying the
 // window's resolved appId/title (for xwayland the manage step is held until
@@ -60,6 +72,9 @@ type MatchClause =
 interface RawRule {
   match: MatchClause;
   float?: boolean;
+  workspace?: string;
+  output?: string;
+  show?: boolean;
   apply?: (win: WindowTarget) => void;
 }
 
@@ -67,6 +82,9 @@ interface RawRule {
 interface CompiledRule {
   test: (q: WindowQuery) => boolean;
   float?: boolean;
+  workspace?: string;
+  output?: string;
+  show?: boolean;
   apply?: (win: WindowTarget) => void;
 }
 
@@ -125,11 +143,31 @@ function compileRule(raw: unknown, index: number): CompiledRule {
   if (r.float !== undefined && typeof r.float !== "boolean") {
     throw new TypeError(`windowRules[${index}].float must be a boolean`);
   }
+  if (r.workspace !== undefined
+      && (typeof r.workspace !== "string" || r.workspace === "")) {
+    throw new TypeError(`windowRules[${index}].workspace must be a non-empty string`);
+  }
+  if (r.output !== undefined
+      && (typeof r.output !== "string" || r.output === "")) {
+    throw new TypeError(`windowRules[${index}].output must be a non-empty string`);
+  }
+  if (r.show !== undefined) {
+    if (typeof r.show !== "boolean") {
+      throw new TypeError(`windowRules[${index}].show must be a boolean`);
+    }
+    if (r.workspace === undefined && r.output === undefined) {
+      throw new TypeError(
+        `windowRules[${index}].show requires a workspace or output target`);
+    }
+  }
   if (r.apply !== undefined && typeof r.apply !== "function") {
     throw new TypeError(`windowRules[${index}].apply must be a function`);
   }
   const compiled: CompiledRule = { test: compileMatch(r.match, index) };
   if (r.float !== undefined) compiled.float = r.float;
+  if (r.workspace !== undefined) compiled.workspace = r.workspace;
+  if (r.output !== undefined) compiled.output = r.output;
+  if (r.show !== undefined) compiled.show = r.show;
   if (r.apply !== undefined) compiled.apply = r.apply;
   return compiled;
 }
@@ -142,7 +180,7 @@ export default async function init(sdk: PluginSdkShape, rawConfig?: unknown): Pr
   const rules: CompiledRule[] = rawConfig.map((r, i) => compileRule(r, i));
   if (rules.length === 0) return;
 
-  sdk.events.intercept("window.preconfigure", (_name, payload): unknown => {
+  sdk.events.intercept("window.preconfigure", async (_name, payload): Promise<unknown> => {
     const p = payload as PreconfigurePayload | null;
     if (!p || typeof p.surfaceId !== "number"
         || typeof p.initialState !== "object" || p.initialState === null) {
@@ -167,16 +205,36 @@ export default async function init(sdk: PluginSdkShape, rawConfig?: unknown): Pr
       get state(): WindowStateLike { return proposal(); },
     };
 
+    // Placement accumulates across matches (later rules win per field).
+    let place: { name?: string; output?: string; show?: boolean } | null = null;
     for (const rule of rules) {
       if (!rule.test(query)) continue;
       if (rule.float === true) proposal().tiling = "floating";
       else if (rule.float === false) proposal().tiling = "managed";
+      if (rule.workspace !== undefined || rule.output !== undefined) {
+        place = {
+          ...(rule.workspace !== undefined ? { name: rule.workspace } : {}),
+          ...(rule.output !== undefined ? { output: rule.output } : {}),
+          ...(rule.show !== undefined ? { show: rule.show } : {}),
+        };
+      }
       if (rule.apply) {
         try {
           rule.apply(target);
         } catch (e) {
           sdk.log(`[window-rules] apply for surface ${p.surfaceId} threw: ${(e as Error).message}`);
         }
+      }
+    }
+
+    // Stamp the placement into the window's state bag BEFORE the map: the
+    // preconfigure intercept is awaited ahead of window.map, so the
+    // workspace plugin's map handler reads a settled hint.
+    if (place) {
+      try {
+        await sdk.windows.setState(p.surfaceId, "workspace.place", place);
+      } catch (e) {
+        sdk.log(`[window-rules] placement stamp for surface ${p.surfaceId} failed: ${(e as Error).message}`);
       }
     }
 
