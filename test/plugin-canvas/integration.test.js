@@ -1225,6 +1225,33 @@ test('grid: elastic growth shoves within its own grid row only', async () => {
   }, { canvas: { world: true, arrangement: 'grid', elastic: true } });
 });
 
+// ---- layer-shell maps never join workspace membership ----------------------
+
+test('elastic: a layer-shell map (waybar) neither joins members nor grows the strip', async () => {
+  await withCanvasPlugin(async (h) => {
+    const { rt, islands, addWindow, wm } = h;
+    addWindow(101);
+    await settle();
+    const before = islands().find((i) => i.id === 1);
+    assert.deepEqual(before.rect, { x: 0, y: 0, width: 800, height: 600 });
+
+    // A bar maps: window.map with role "layer-shell" (no wm.addWindow --
+    // layer surfaces are not WM windows).
+    h.pluginBus.emit('window.map', {
+      surfaceId: 900, outputId: 0,
+      rect: { x: 0, y: 0, width: 800, height: 30 },
+      appId: null, title: null, role: 'layer-shell',
+    });
+    await settle();
+    const list = await call(rt, 'list', [0]);
+    assert.deepEqual(list[0].members, [101], 'bar never joined the workspace');
+    const after = islands().find((i) => i.id === 1);
+    assert.deepEqual(after.rect, { x: 0, y: 0, width: 800, height: 600 },
+      'strip width unchanged by the bar');
+    void wm;
+  }, { canvas: { world: true, elastic: true } });
+});
+
 // ---- digit-name resolution vs handle drift --------------------------------
 
 test('world: digit names never resolve to a differently-named workspace', async () => {

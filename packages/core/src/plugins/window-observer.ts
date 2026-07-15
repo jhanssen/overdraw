@@ -104,6 +104,13 @@ function isNullableString(v: unknown): v is string | null {
 function asMapEvent(data: unknown): WindowMapEvent | null {
   if (!isRecord(data)) return null;
   if (typeof data.surfaceId !== "number") return null;
+  // onMap's contract is TOPLEVEL maps. Layer-shell surfaces (bars,
+  // wallpapers) also emit window.map (role: "layer-shell") for raw
+  // subscribers; letting them through here made workspace plugins adopt
+  // them as members -- a bar's surfaces counted as elastic columns and
+  // grew the island past the output. Plugins that want layer maps
+  // subscribe to 'window.map' directly and read `role`.
+  if (data.role === "layer-shell") return null;
   if (!isRect(data.rect)) return null;
   if (!isNullableString(data.appId) || !isNullableString(data.title)) return null;
   // outputId defaults to the primary (0) when absent so legacy test fixtures
