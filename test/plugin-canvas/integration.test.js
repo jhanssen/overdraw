@@ -753,6 +753,31 @@ test('world: zoom multiplies about the view center; pan scales by zoom', async (
   }, { world: true });
 });
 
+test('world: zoom clamps to min/max; a capped no-change zoom is a no-op', async () => {
+  await withCanvasPlugin(async (h) => {
+    const { rt, sink } = h;
+    await setupTwoIslands(h);
+    sink.cameraCalls.length = 0;
+    sink.outputStackCalls.length = 0;
+
+    // Docked at zoom 1, a zoom-in capped at 1 changes nothing -- no
+    // camera write, and crucially no roaming override (stack untouched).
+    await rt.invokeAction('workspace.zoom', { factor: 1.25, max: 1 });
+    assert.equal(sink.cameraCalls.length, 0);
+    assert.equal(sink.outputStackCalls.length, 0);
+
+    // Zoom out, then a large zoom-in clamps to the max.
+    await rt.invokeAction('workspace.zoom', { factor: 0.5 });
+    assert.equal(sink.cameraCalls.at(-1).zoom, 0.5);
+    await rt.invokeAction('workspace.zoom', { factor: 10, max: 1 });
+    assert.deepEqual(sink.cameraCalls.at(-1), { outputId: 0, x: 0, y: 0, zoom: 1 });
+
+    // min clamps the other direction.
+    await rt.invokeAction('workspace.zoom', { factor: 0.1, min: 0.4 });
+    assert.equal(sink.cameraCalls.at(-1).zoom, 0.4);
+  }, { world: true });
+});
+
 test('world: show and unfit exit free roaming', async () => {
   await withCanvasPlugin(async (h) => {
     const { rt, sink } = h;

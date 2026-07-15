@@ -1930,7 +1930,7 @@ export default async function init(
   sdk.actions.register({
     name: "workspace.zoom",
     description:
-      "World mode: multiply the output's camera zoom by `factor` (anchored at the view center; clamped to [0.05, 8]), entering free roaming. Optional transition {duration, easing?} animates it.",
+      "World mode: multiply the output's camera zoom by `factor` (anchored at the view center), entering free roaming. `min`/`max` clamp the result within [0.05, 8] -- e.g. max: 1 for a wheel bind that zooms back in no further than native. A clamped no-change zoom is a no-op. Optional transition {duration, easing?} animates it.",
     handler: async (params: unknown): Promise<null> => {
       if (!worldMode) {
         throw new Error(
@@ -1943,7 +1943,13 @@ export default async function init(
         throw new Error(`workspace.zoom: output ${p.outputId} has unknown geometry`);
       }
       const cur = await sdk.windows.getOutputCamera(p.outputId);
-      const z = Math.min(8, Math.max(0.05, cur.zoom * p.factor));
+      const lo = Math.max(0.05, p.min ?? 0.05);
+      const hi = Math.min(8, p.max ?? 8);
+      const z = Math.min(hi, Math.max(lo, cur.zoom * p.factor));
+      // Already at the clamp (a wheel detent past the cap): change
+      // nothing -- entering the roaming override for a no-op zoom would
+      // needlessly union the stack.
+      if (z === cur.zoom) return null;
       // Keep the world point at the viewport center fixed across the
       // zoom change.
       await freeCamera(p.outputId, {
@@ -2535,14 +2541,14 @@ function parsePanParams(
   return { dx, dy, outputId };
 }
 
-// workspace.zoom: multiplicative factor (> 0).
+// workspace.zoom: multiplicative factor (> 0) + optional min/max clamps.
 function parseZoomParams(
   params: unknown,
   resolveOutput: (input: string) => number | null,
   defaultOutputId: number,
-): { factor: number; outputId: number } {
+): { factor: number; min?: number; max?: number; outputId: number } {
   if (!isObj(params)) {
-    throw new TypeError("workspace.zoom: expected an object with { factor, output? }");
+    throw new TypeError("workspace.zoom: expected an object with { factor, min?, max?, output? }");
   }
   if (typeof params.factor !== "number" || !Number.isFinite(params.factor)
       || params.factor <= 0) {
@@ -2550,7 +2556,17 @@ function parseZoomParams(
   }
   const outputId = parseOptionalOutput(
     params, resolveOutput, defaultOutputId, "workspace.zoom");
-  return { factor: params.factor, outputId };
+  const out: { factor: number; min?: number; max?: number; outputId: number } =
+    { factor: params.factor, outputId };
+  for (const key of ["min", "max"] as const) {
+    const v = params[key];
+    if (v === undefined) continue;
+    if (typeof v !== "number" || !Number.isFinite(v) || v <= 0) {
+      throw new TypeError(`workspace.zoom: ${key} must be a positive finite number`);
+    }
+    out[key] = v;
+  }
+  return out;
 }
 
 // workspace.set-elastic: optional per-output index (default: the shown
