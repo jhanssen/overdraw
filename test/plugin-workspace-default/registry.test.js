@@ -256,7 +256,9 @@ test('moveWindow: from shown to hidden updates source stack only', () => {
 test('moveWindow: from hidden to shown updates target stack', () => {
   let state = init('test').state;
   let r = create(state, {}, 'test'); state = r.state;
-  let m = applyMap(state, 101, 0, 'test'); state = m.state;
+  // 100 anchors ws1 (an empty hidden workspace would evaporate).
+  let m = applyMap(state, 100, 0, 'test'); state = m.state;
+  m = applyMap(state, 101, 0, 'test'); state = m.state;
   // Move 101 to ws2 (hidden).
   let mw = moveWindow(state, 101, 2, 0, 'test'); state = mw.state;
   // Now show ws2.

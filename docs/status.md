@@ -825,7 +825,15 @@ active; failure demotes).
   `WorkspaceHandle` (stable identity for `Mod+N` keybinds);
   positional access lives behind `workspace.show-at-index`. Default
   output for omitted-`output` is the focused output (tracked via
-  `window.change.activated`).
+  `window.change.activated`). Hyprland-style dynamic lifetime: an
+  all-digits `name` in show/move-window that matches nothing CREATES
+  a workspace with that user-set name (non-digit names still throw),
+  and a non-persistent workspace EVAPORATES (auto-destroys, normal
+  destroyed/renumbered events) once it is empty and not shown --
+  checked on unmap, move-away, and navigate-away; the shown guard
+  also preserves the ≥1-per-output invariant. `create({persistent:
+  true})` opts a workspace out of evaporation. The canvas plugin
+  shares all of this (same registry + parsers).
 - `@overdraw/plugin-hotkey-default` (namespace `'hotkey'`):
   binding chain (chord + mode) driven by `config.hotkeys`.
 - `@overdraw/plugin-core-actions`: `compositor.quit`,

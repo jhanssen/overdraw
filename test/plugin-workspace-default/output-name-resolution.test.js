@@ -229,11 +229,13 @@ test('workspace.show by handle-string: resolves to the workspace whose durable h
   await withTwoOutputs(
     [{ outputId: 0, name: 'DP-1', edidId: '' },
      { outputId: 1, name: 'HDMI-A-1', edidId: '' }],
-    async ({ rt, wsEvents }) => {
+    async ({ rt, wsEvents, addWindow }) => {
       // Boot creates handle 1 on output 0 + handle 2 on output 1 (donor
-      // replenishment). Create handle 3 on output 1 and show it, so a
-      // subsequent show-by-handle-string for "2" produces an observable
-      // transition (handle 2 was already shown by boot).
+      // replenishment). Anchor handle 2 with a window (an empty hidden
+      // workspace evaporates), then create handle 3 on output 1 and show
+      // it, so a subsequent show-by-handle-string for "2" produces an
+      // observable transition (handle 2 was already shown by boot).
+      addWindow(101, 1);
       await rt.invokeAction('workspace.create', { output: 'HDMI-A-1' });
       await rt.invokeAction('workspace.show-at-index',
         { index: 2, output: 'HDMI-A-1' });  // now handle 3 is shown

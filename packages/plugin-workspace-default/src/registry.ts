@@ -55,6 +55,13 @@ export interface WorkspaceRecord {
   // snapshotOf(). External consumers (status bars, the ext-workspace-v1
   // protocol) read it via 'workspace.urgency-changed' bus events.
   urgent: boolean;
+  // Dynamic-workspace lifetime. A non-persistent workspace EVAPORATES
+  // (auto-destroys) once it is empty AND not the shown workspace on its
+  // output -- checked when a member leaves (unmap / move-away) and when
+  // the user navigates away from it. Persistent workspaces only die via
+  // an explicit destroy(). Default false; opt in via
+  // create({persistent: true}).
+  persistent: boolean;
 }
 
 export interface WorkspaceState {
@@ -115,6 +122,7 @@ export function snapshotOf(state: WorkspaceState,
     outputId: rec.outputId,
     members: [...rec.members],
     urgent: rec.urgent,
+    persistent: rec.persistent,
   };
 }
 
@@ -214,7 +222,7 @@ export function ensureOutput(state: WorkspaceState, outputId: number, seedName: 
   }
   const handle = asHandle(state.nextHandle);
   const rec: WorkspaceRecord = {
-    handle, outputId, members: [], urgent: false,
+    handle, outputId, members: [], urgent: false, persistent: false,
     // Empty seedName leaves preferredOutputs empty (no durable identity);
     // the registry's resolver returns null in that case and the next
     // recomputeOutputs / config-seeded create populates it. Matches the
@@ -308,6 +316,7 @@ export function promotePreferredOutput(
 export function create(state: WorkspaceState,
                        spec: { name?: string; outputId?: number;
                                preferredOutputs?: ReadonlyArray<string>;
+                               persistent?: boolean;
                              } = {},
                        outputName: string,
                        ): { state: WorkspaceState; snapshot: WorkspaceSnapshot;
@@ -331,6 +340,7 @@ export function create(state: WorkspaceState,
 
   const rec: WorkspaceRecord = {
     handle, outputId, members: [], urgent: false,
+    persistent: spec.persistent ?? false,
     preferredOutputs: preferred,
     ...(spec.name !== undefined ? { name: spec.name } : {}),
   };
@@ -404,7 +414,7 @@ export function destroy(state: WorkspaceState,
     const fresh = asHandle(state.nextHandle);
     state.nextHandle += 1;
     state.byHandle.set(fresh, {
-      handle: fresh, outputId, members: [], urgent: false,
+      handle: fresh, outputId, members: [], urgent: false, persistent: false,
       preferredOutputs: outputName !== "" ? [outputName] : [],
     });
     positions.push(fresh);
@@ -494,6 +504,28 @@ export function destroy(state: WorkspaceState,
   return { state, sideEffects, renumbered };
 }
 
+// Dynamic-workspace evaporation: destroy `handle` if it is empty,
+// non-persistent, and not the shown workspace on its output. Called
+// whenever one of those conditions may have just become true (a member
+// unmapped or moved away; the user navigated away from it). Returns
+// null when the workspace is not eligible (or no longer exists).
+//
+// The shown-workspace guard also preserves the at-least-one-per-output
+// invariant: an output's only workspace is by construction its shown
+// one, so evaporation never triggers destroy()'s fresh-replacement path.
+function reapIfEmpty(state: WorkspaceState,
+                     handle: WorkspaceHandle,
+                     ): { state: WorkspaceState; sideEffects: SideEffect[] } | null {
+  const rec = state.byHandle.get(handle);
+  if (!rec) return null;
+  if (rec.persistent || rec.members.length > 0) return null;
+  if (state.shownByOutput.get(rec.outputId) === handle) return null;
+  const idx = findIndex(state, handle, rec.outputId);
+  if (idx === null) return null;
+  const d = destroy(state, idx, rec.outputId);
+  return { state: d.state, sideEffects: d.sideEffects };
+}
+
 // Make the workspace at `index` the shown one on outputId. Pushes the new
 // stack and triggers a focus re-decide. No-op if already shown.
 //
@@ -556,6 +588,15 @@ export function show(state: WorkspaceState,
     kind: "setOutputStack", outputId, ids: stackFor(state, outputId),
   });
   sideEffects.push({ kind: "requestFocusDecision", reason: "workspace-changed" });
+  // The workspace we just navigated away from may now be eligible to
+  // evaporate (empty + non-persistent + no longer shown).
+  if (prev !== undefined) {
+    const reaped = reapIfEmpty(state, prev);
+    if (reaped) {
+      state = reaped.state;
+      sideEffects.push(...reaped.sideEffects);
+    }
+  }
   return { state, sideEffects };
 }
 
@@ -662,6 +703,14 @@ export function moveWindow(state: WorkspaceState,
         kind: "setOutputStack", outputId, ids: stackFor(state, outputId),
       });
     }
+  }
+
+  // The source workspace may have just lost its last member; if it is
+  // hidden it evaporates now (a shown one waits for the user to leave).
+  const reaped = reapIfEmpty(state, fromHandle);
+  if (reaped) {
+    state = reaped.state;
+    sideEffects.push(...reaped.sideEffects);
   }
 
   return { state, sideEffects };
@@ -810,6 +859,15 @@ export function applyUnmap(state: WorkspaceState,
       kind: "setOutputStack", outputId: rec.outputId,
       ids: stackFor(state, rec.outputId),
     });
+  } else {
+    // The last window of a hidden workspace may just have left it; a
+    // shown workspace is left alone until the user navigates away
+    // (show() reaps it then).
+    const reaped = reapIfEmpty(state, handle);
+    if (reaped) {
+      state = reaped.state;
+      sideEffects.push(...reaped.sideEffects);
+    }
   }
   return { state, sideEffects };
 }
@@ -975,6 +1033,7 @@ export function recomputeOutputs(
     state.nextHandle += 1;
     state.byHandle.set(freshHandle, {
       handle: freshHandle, outputId: liveId, members: [], urgent: false,
+      persistent: false,
       // Seed preferredOutputs with the live name so the replenishment
       // workspace stays anchored to this output across future churn.
       preferredOutputs: [name],

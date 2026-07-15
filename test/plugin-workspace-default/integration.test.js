@@ -357,9 +357,12 @@ test('workspace.show by name: unknown name rejects', async () => {
 // handle 1 and no user-set name; `{ name: "1" }` resolves to it via the
 // handle-cast pass.
 test('workspace.show by handle-string: falls back to durable handle when no name matches', async () => {
-  await withWorkspacePlugin(async ({ rt, sink, wsEvents }) => {
+  await withWorkspacePlugin(async ({ rt, sink, wsEvents, addWindow }) => {
     // Move off the boot workspace (handle 1) so showing it later actually
-    // transitions and emits the side effects we're asserting on.
+    // transitions and emits the side effects we're asserting on. 100
+    // anchors it (an empty hidden workspace evaporates).
+    addWindow(100);
+    await new Promise((r) => setTimeout(r, 50));
     await rt.invokeAction('workspace.create', { name: 'work' });
     await rt.invokeAction('workspace.show', { name: 'work' });
     sink.outputStackCalls.length = 0;
@@ -384,6 +387,70 @@ test('workspace.show by handle-string: user-set name shadows the handle-string f
     // The named workspace (index 2) wins, not handle 1 (index 1).
     const shown = wsEvents.find((e) => e.name === 'workspace.shown');
     assert.equal(shown?.payload?.handle, snap.handle);
+  });
+});
+
+// ---- create-on-reference + dynamic lifetime --------------------------------
+
+test('workspace.show create-on-reference: unmatched digits create a dynamic workspace', async () => {
+  await withWorkspacePlugin(async ({ rt, wsEvents, addWindow }) => {
+    addWindow(100);   // anchors ws1
+    await new Promise((r) => setTimeout(r, 50));
+    wsEvents.length = 0;
+
+    // Nothing is named "2" and no handle 2 exists: created + shown.
+    await rt.invokeAction('workspace.show', { name: '2' });
+    const created = wsEvents.find((e) => e.name === 'workspace.created');
+    assert.equal(created?.payload?.name, '2');
+    const shown = wsEvents.find((e) => e.name === 'workspace.shown');
+    assert.equal(shown?.payload?.handle, created.payload.handle);
+    let list = await rt.invokeAction('workspace.list', {});
+    assert.equal(list.length, 2);
+    assert.equal(list[1].name, '2');
+    assert.equal(list[1].persistent, false);
+
+    // Navigating away from the still-empty "2" evaporates it.
+    wsEvents.length = 0;
+    await rt.invokeAction('workspace.show', { name: '1' });
+    assert.ok(wsEvents.some((e) => e.name === 'workspace.destroyed'
+      && e.payload.handle === created.payload.handle));
+    list = await rt.invokeAction('workspace.list', {});
+    assert.equal(list.length, 1);
+  });
+});
+
+test('workspace.show create-on-reference: non-digit names still reject', async () => {
+  await withWorkspacePlugin(async ({ rt }) => {
+    await assert.rejects(
+      () => rt.invokeAction('workspace.show', { name: 'webb' }),
+      /no workspace named 'webb'/);
+  });
+});
+
+test('workspace.move-window create-on-reference: moves into a fresh workspace', async () => {
+  await withWorkspacePlugin(async ({ rt, addWindow }) => {
+    addWindow(100);
+    addWindow(101);
+    await new Promise((r) => setTimeout(r, 50));
+    await rt.invokeAction('workspace.move-window', { surfaceId: 101, name: '3' });
+    const list = await rt.invokeAction('workspace.list', {});
+    assert.equal(list.length, 2);
+    assert.equal(list[1].name, '3');
+    assert.deepEqual(list[1].members, [101]);
+  });
+});
+
+test('workspace.create persistent: survives becoming empty and hidden', async () => {
+  await withWorkspacePlugin(async ({ rt, addWindow }) => {
+    addWindow(100);   // anchors ws1
+    await new Promise((r) => setTimeout(r, 50));
+    await rt.invokeAction('workspace.create', { name: 'keep', persistent: true });
+    await rt.invokeAction('workspace.show', { name: 'keep' });
+    await rt.invokeAction('workspace.show', { name: '1' });
+    const list = await rt.invokeAction('workspace.list', {});
+    assert.equal(list.length, 2);
+    assert.equal(list[1].name, 'keep');
+    assert.equal(list[1].persistent, true);
   });
 });
 
@@ -419,7 +486,9 @@ test('setUrgent: idempotent — second identical call emits nothing', async () =
 });
 
 test('show auto-clears urgent: urgency-changed fires before workspace.shown', async () => {
-  await withWorkspacePlugin(async ({ rt, wsEvents }) => {
+  await withWorkspacePlugin(async ({ rt, wsEvents, addWindow }) => {
+    addWindow(100);   // anchors ws1 (empty hidden workspaces evaporate)
+    await new Promise((r) => setTimeout(r, 50));
     await call(rt, 'create', [{}]);
     await call(rt, 'setUrgent', [2, true, 0]);
     wsEvents.length = 0;

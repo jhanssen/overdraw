@@ -35,6 +35,11 @@ export interface WorkspaceSnapshot {
   // shown workspace). Cleared automatically when the workspace becomes the
   // shown one on its output.
   urgent: boolean;
+  // Dynamic-workspace lifetime. A non-persistent workspace evaporates
+  // (auto-destroys, with the usual workspace.destroyed / renumbered
+  // events) once it is empty AND not the shown workspace on its output.
+  // Persistent workspaces only die via an explicit destroy().
+  persistent: boolean;
 }
 
 export interface WorkspaceCreateSpec {
@@ -48,6 +53,9 @@ export interface WorkspaceCreateSpec {
   // -> the live boot output's name becomes the sole entry, so a workspace
   // still tracks where it was born.
   preferredOutputs?: ReadonlyArray<string>;
+  // Opt out of dynamic-workspace evaporation: a persistent workspace
+  // survives becoming empty and hidden. Default false (dynamic).
+  persistent?: boolean;
 }
 
 // Transition spec accepted by show() / moveWindow() to animate the swap.

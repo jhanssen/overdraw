@@ -6,7 +6,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 
 import {
-  init, create, show, setUrgent, snapshotsForOutput,
+  init, create, show, setUrgent, applyMap, snapshotsForOutput,
   OUTPUT_DEFAULT,
 } from '../../packages/plugin-workspace-default/dist/registry.js';
 
@@ -61,6 +61,8 @@ test('setUrgent: idempotent — re-setting the same value emits nothing', () => 
 
 test('show: auto-clears urgent on the newly-shown workspace; emit ordered before workspace.shown', () => {
   let state = init('out0').state;
+  // 100 anchors ws1 so it survives being hidden while empty.
+  state = applyMap(state, 100, 0, 'out0').state;
   let r = create(state, {}, 'out0'); state = r.state;
   const handle2 = r.snapshot.handle;
 

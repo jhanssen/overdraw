@@ -515,6 +515,53 @@ export default async function init(
     if (worldMode && effects.length > 0) await publishWorld();
   }
 
+  // Hyprland-style create-on-reference: a well-formed show/move `name`
+  // that matches nothing and is all digits creates a DYNAMIC workspace
+  // with that user-set name (it evaporates once empty and hidden; see
+  // the registry's reapIfEmpty) on the explicit `output` when given,
+  // else the focused output. Non-digit names still throw -- an
+  // unmatched word is more likely a typo'd bind than an intent.
+  async function resolveOrCreateByName(
+    params: unknown, label: string,
+  ): Promise<{ index: WorkspaceIndex; outputId: number }> {
+    const r = tryResolveShowName(state, params, resolveOutputName);
+    if (r !== null) return r;
+    const name = (params as { name: string }).name;
+    if (!/^[1-9][0-9]*$/.test(name)) {
+      throw new Error(`${label}: no workspace named '${name}'`);
+    }
+    const outputId = parseOptionalOutput(
+      params, resolveOutputName, focusedOutputId(), label);
+    const c = reg.create(state, { name, outputId }, outputNameOf(outputId));
+    state = c.state;
+    await applyEffects(c.sideEffects);
+    return { index: c.snapshot.index, outputId };
+  }
+
+  // workspace.move-window target: `name` (create-on-reference, like
+  // show) or positional `{index, output}`.
+  async function parseMoveTarget(
+    params: unknown,
+  ): Promise<{ surfaceId: number; index: WorkspaceIndex; outputId: number }> {
+    if (!isObj(params)) {
+      throw new TypeError(
+        "workspace.move-window: expected an object with { surfaceId, name|index, output? }");
+    }
+    if (typeof params.surfaceId !== "number") {
+      throw new TypeError("workspace.move-window: surfaceId must be a number");
+    }
+    const hasName = params.name !== undefined;
+    const hasIndex = params.index !== undefined;
+    if (hasName === hasIndex) {
+      throw new TypeError(
+        "workspace.move-window: pass exactly one of name or index");
+    }
+    const r = hasName
+      ? await resolveOrCreateByName(params, "workspace.move-window")
+      : parseIndexParams(params, resolveOutputName, focusedOutputId(), "workspace.move-window");
+    return { surfaceId: params.surfaceId, index: r.index, outputId: r.outputId };
+  }
+
   // Animated workspace.show: capture FROM + TO scene snapshots, run
   // the transition with a setOutputStack commit that fires atomically
   // with completion, then defer focus-decide until after.
@@ -766,9 +813,9 @@ export default async function init(
   sdk.actions.register({
     name: "workspace.show",
     description:
-      "Show the workspace matching `name`. Matches user-set names first across all outputs; falls back to the durable handle when `name` is a digit string. Use `output` to restrict the search.",
+      "Show the workspace matching `name` (user-set names first across all outputs, then durable-handle fallback for digit strings; `output` restricts the search). An all-digits name that matches nothing creates a dynamic workspace with that name.",
     handler: async (params: unknown): Promise<null> => {
-      const p = parseShowParams(state, params, resolveOutputName);
+      const p = await resolveOrCreateByName(params, "workspace.show");
       const t = parseShowTransition(params, "workspace.show");
       if (t && worldMode) {
         await showWithFlight(p.index, p.outputId, t);
@@ -815,7 +862,7 @@ export default async function init(
     description:
       "Move a window (by surfaceId) to a workspace identified by `name` (with handle-string fallback) or by `{index, output}`.",
     handler: async (params: unknown): Promise<null> => {
-      const p = parseMoveParams(state, params, resolveOutputName, focusedOutputId());
+      const p = await parseMoveTarget(params);
       const r = reg.moveWindow(state, p.surfaceId, p.index, p.outputId, outputNameOf(p.outputId));
       state = r.state;
       await applyEffects(r.sideEffects);
@@ -1014,13 +1061,15 @@ function parseCreateParams(
   params: unknown,
   resolveOutput: (input: string) => number | null,
   defaultOutputId: number,
-): { name?: string; outputId: number; preferredOutputs?: string[] } {
+): { name?: string; outputId: number; preferredOutputs?: string[];
+     persistent?: boolean } {
   if (params === undefined || params === null) {
     return { outputId: defaultOutputId };
   }
   if (!isObj(params)) throw new TypeError("workspace.create: expected an object");
   const outputId = parseOptionalOutput(params, resolveOutput, defaultOutputId, "workspace.create");
-  const out: { name?: string; outputId: number; preferredOutputs?: string[] } = { outputId };
+  const out: { name?: string; outputId: number; preferredOutputs?: string[];
+               persistent?: boolean } = { outputId };
   if (params.name !== undefined) {
     if (typeof params.name !== "string") {
       throw new TypeError("workspace.create: name must be a string");
@@ -1034,6 +1083,12 @@ function parseCreateParams(
         "workspace.create: preferredOutputs must be an array of strings");
     }
     out.preferredOutputs = params.preferredOutputs;
+  }
+  if (params.persistent !== undefined) {
+    if (typeof params.persistent !== "boolean") {
+      throw new TypeError("workspace.create: persistent must be a boolean");
+    }
+    out.persistent = params.persistent;
   }
   return out;
 }
@@ -1057,7 +1112,7 @@ function parseIndexParams(
   return { index: asIndex(params.index), outputId };
 }
 
-// workspace.show parameter parser. The action takes EITHER:
+// Resolve a show/move `name` parameter. The caller passes EITHER:
 //   - a workspace name (user-set label OR a digit-string that resolves
 //     to a durable WorkspaceHandle as a fallback), with optional
 //     `output` to scope the lookup; or
@@ -1071,14 +1126,17 @@ function parseIndexParams(
 //   2. If no user-set name matched AND `name` is an all-digits string
 //      parseable as a positive integer, treat it as a durable handle;
 //      return that workspace's (index, outputId).
-//   3. Otherwise throw.
+//   3. Otherwise return null -- the caller decides between throwing and
+//      create-on-reference (resolveOrCreateByName).
 //
-// When `output` is set, restrict the lookup to that output.
-function parseShowParams(
+// When `output` is set, restrict the lookup to that output. Malformed
+// params still throw TypeErrors; null strictly means "well-formed name,
+// no such workspace".
+function tryResolveShowName(
   state: WorkspaceState,
   params: unknown,
   resolveOutput: (input: string) => number | null,
-): { index: WorkspaceIndex; outputId: number } {
+): { index: WorkspaceIndex; outputId: number } | null {
   if (!isObj(params)) {
     throw new TypeError("workspace.show: expected an object with { name, output? }");
   }
@@ -1115,10 +1173,7 @@ function parseShowParams(
     }
   }
 
-  throw new Error(
-    restrictTo !== null
-      ? `workspace.show: no workspace named '${params.name}' on the requested output`
-      : `workspace.show: no workspace named '${params.name}'`);
+  return null;
 }
 
 // Optional transition spec for workspace.show (and friends). When the
@@ -1150,37 +1205,6 @@ function parseShowTransition(params: unknown, label: string): ShowTransitionSpec
     duration: t.duration,
     easing: (t as { easing?: unknown }).easing,
   };
-}
-
-// workspace.move-window: explicit surfaceId + workspace identifier
-// (name or positional index) + optional output. Mirrors the show
-// shape: a `name` field that resolves through the same two-pass
-// rules; or a positional `index` with `output`.
-function parseMoveParams(
-  state: WorkspaceState,
-  params: unknown,
-  resolveOutput: (input: string) => number | null,
-  defaultOutputId: number,
-): { surfaceId: number; index: WorkspaceIndex; outputId: number } {
-  if (!isObj(params)) {
-    throw new TypeError(
-      "workspace.move-window: expected an object with { surfaceId, name|index, output? }");
-  }
-  if (typeof params.surfaceId !== "number") {
-    throw new TypeError("workspace.move-window: surfaceId must be a number");
-  }
-  const hasName = params.name !== undefined;
-  const hasIndex = params.index !== undefined;
-  if (hasName === hasIndex) {
-    throw new TypeError(
-      "workspace.move-window: pass exactly one of name or index");
-  }
-  if (hasName) {
-    const r = parseShowParams(state, params, resolveOutput);
-    return { surfaceId: params.surfaceId, index: r.index, outputId: r.outputId };
-  }
-  const r = parseIndexParams(params, resolveOutput, defaultOutputId, "workspace.move-window");
-  return { surfaceId: params.surfaceId, index: r.index, outputId: r.outputId };
 }
 
 function parseSetUrgentParams(

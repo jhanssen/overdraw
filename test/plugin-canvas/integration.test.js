@@ -266,6 +266,7 @@ test('canvas: shown workspace is published as an explicit island (id = handle)',
 
 test('canvas: show swaps the island to the new workspace handle + members', async () => {
   await withCanvasPlugin(async ({ rt, islands, addWindow }) => {
+    addWindow(100);   // anchors ws1 (empty hidden workspaces evaporate)
     addWindow(101);
     await settle();
     const created = await call(rt, 'create', [{}]);
@@ -286,7 +287,7 @@ test('canvas: show swaps the island to the new workspace handle + members', asyn
     const list = await call(rt, 'list', [0]);
     isl = islands();
     assert.equal(isl[0].id, list[0].handle);
-    assert.deepEqual(isl[0].members, []);
+    assert.deepEqual(isl[0].members, [100]);
   });
 });
 
@@ -330,6 +331,7 @@ test('world: every workspace publishes an island at its slot rect', async () => 
 
 test('world: show docks the camera on the shown slot; hidden members stay published', async () => {
   await withCanvasPlugin(async ({ rt, sink, islands, addWindow }) => {
+    addWindow(100);   // anchors ws1 (empty hidden workspaces evaporate)
     addWindow(101);
     await settle();
     await call(rt, 'create', [{}]);
@@ -343,7 +345,7 @@ test('world: show docks the camera on the shown slot; hidden members stay publis
     const ws2Island = isl.find((i) => i.id === list[1].handle);
     assert.deepEqual(ws2Island.members, [101]);
     assert.equal(ws2Island.rect.x, PITCH);
-    assert.deepEqual(sink.outputStackCalls.at(-1), { outputId: 0, ids: [] });
+    assert.deepEqual(sink.outputStackCalls.at(-1), { outputId: 0, ids: [100] });
 
     // Show workspace 2: camera docks at its slot.
     sink.cameraCalls.length = 0;
@@ -365,6 +367,19 @@ test('world: destroying a workspace frees its slot for the next one', async () =
     const isl = islands();
     const xs = isl.map((i) => i.rect.x).sort((a, b) => a - b);
     assert.deepEqual(xs, [0, PITCH]);
+  }, { world: true });
+});
+
+test('world: create-on-reference show docks the camera on the fresh slot', async () => {
+  await withCanvasPlugin(async ({ rt, sink, addWindow }) => {
+    addWindow(101);   // anchors ws1
+    await settle();
+    sink.cameraCalls.length = 0;
+    await rt.invokeAction('workspace.show', { name: '2' });
+    const list = await call(rt, 'list', [0]);
+    assert.equal(list.length, 2);
+    assert.equal(list[1].name, '2');
+    assert.deepEqual(sink.cameraCalls.at(-1), { outputId: 0, x: PITCH, y: 0, zoom: 1 });
   }, { world: true });
 });
 
