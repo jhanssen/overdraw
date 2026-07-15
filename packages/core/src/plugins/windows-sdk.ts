@@ -213,6 +213,15 @@ export interface PluginWindows extends PluginWindowObserver {
   // ({0, 0, 1}) when the camera has never been set.
   getOutputCamera(outputId: number): Promise<{ x: number; y: number; zoom: number }>;
 
+  // Drag-pan: install a camera-pan pointer grab on the seat. While it
+  // holds, pointer motion pans the output's camera (transient writes; no
+  // client delivery, no focus repick) instead of reaching windows.
+  // Returns false when no grab could be installed (another grab active,
+  // or no seat). endCameraPan ends it (settle + repick; no-op for other
+  // grab kinds) and returns the settled camera.
+  beginCameraPan(outputId: number): Promise<boolean>;
+  endCameraPan(outputId: number): Promise<{ x: number; y: number; zoom: number }>;
+
   // Explicit focus override; bypasses the focus plugin's decide()
   // (core-plugin-api.md §1). null clears. For policy-mediated focus
   // changes, emit an event the focus plugin observes instead.
@@ -452,6 +461,27 @@ export function createPluginWindows(
       if (typeof cam?.x !== "number" || typeof cam.y !== "number"
         || typeof cam.zoom !== "number") {
         throw new TypeError("getOutputCamera: malformed broker reply");
+      }
+      return { x: cam.x, y: cam.y, zoom: cam.zoom };
+    },
+
+    async beginCameraPan(outputId): Promise<boolean> {
+      if (typeof outputId !== "number") {
+        throw new TypeError("beginCameraPan outputId must be a number");
+      }
+      const r = await endpoint.request("windows.begin-camera-pan", { outputId });
+      return r === true;
+    },
+
+    async endCameraPan(outputId): Promise<{ x: number; y: number; zoom: number }> {
+      if (typeof outputId !== "number") {
+        throw new TypeError("endCameraPan outputId must be a number");
+      }
+      const r = await endpoint.request("windows.end-camera-pan", { outputId });
+      const cam = r as { x?: unknown; y?: unknown; zoom?: unknown };
+      if (typeof cam?.x !== "number" || typeof cam.y !== "number"
+        || typeof cam.zoom !== "number") {
+        throw new TypeError("endCameraPan: malformed broker reply");
       }
       return { x: cam.x, y: cam.y, zoom: cam.zoom };
     },

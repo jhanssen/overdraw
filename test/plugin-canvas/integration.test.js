@@ -63,6 +63,10 @@ async function withCanvasPlugin(fn, opts = {}) {
       seatCalls.focus.push({ kind: 'dispatch', reason, trigger });
     },
     repickPointer() {},
+    grab: null,
+    pointerPosition() { return { x: 100, y: 100 }; },
+    beginGrab(g) { if (!seat.grab) seat.grab = g; },
+    endGrab() { seat.grab = null; },
   };
   const state = {
     bus, wm, surfaces: new Map(), compositor: sink, seat,
@@ -147,7 +151,7 @@ async function withCanvasPlugin(fn, opts = {}) {
     await rt.waitForNamespace('workspace');
     await fn({
       rt, sink, wm, wsEvents, seatCalls, layoutSnapshots, animCalls, animPending,
-      pluginBus,
+      pluginBus, seat,
       islands() { return layoutSnapshots.at(-1)?.islands ?? []; },
       addWindow(id, { place } = {}) {
         wm.addWindow(id, res(id));
@@ -763,6 +767,52 @@ test('world: show and unfit exit free roaming', async () => {
     await rt.invokeAction('workspace.unfit', {});
     assert.deepEqual(sink.cameraCalls.at(-1), { outputId: 0, x: PITCH, y: 0, zoom: 1 });
     assert.deepEqual(sink.outputStackCalls.at(-1), { outputId: 0, ids: [102] });
+  }, { world: true });
+});
+
+test('world: pan-grab enters free roaming and installs the seat grab; end settles', async () => {
+  await withCanvasPlugin(async (h) => {
+    const { rt, sink, seat, wsEvents } = h;
+    await setupTwoIslands(h);
+    sink.outputStackCalls.length = 0;
+    sink.cameraCalls.length = 0;
+    wsEvents.length = 0;
+
+    await rt.invokeAction('workspace.pan-grab', {});
+    // Free roaming at the current camera: union stack, settled write of
+    // the unchanged framing, seat grab installed.
+    assert.deepEqual(sink.outputStackCalls[0], { outputId: 0, ids: [101, 102] });
+    assert.deepEqual(sink.cameraCalls.at(-1), { outputId: 0, x: 0, y: 0, zoom: 1 });
+    assert.equal(seat.grab?.kind, 'camera-pan');
+    assert.equal(seat.grab.outputId, 0);
+    assert.deepEqual([seat.grab.lastX, seat.grab.lastY], [100, 100]);
+    assert.equal(wsEvents.length, 0, 'registry truth untouched');
+
+    // The seat pans transiently (mirror updated by core in production);
+    // end releases the grab and adopts the settled camera.
+    await rt.invokeAction('workspace.pan-grab-end', {});
+    assert.equal(seat.grab, null);
+    // Roaming continues: a show exits it and docks normally.
+    await call(rt, 'show', [2, 0]);
+    assert.deepEqual(sink.cameraCalls.at(-1), { outputId: 0, x: PITCH, y: 0, zoom: 1 });
+    assert.deepEqual(sink.outputStackCalls.at(-1), { outputId: 0, ids: [102] });
+  }, { world: true });
+});
+
+test('world: pan-grab backs out cleanly when another grab owns the pointer', async () => {
+  await withCanvasPlugin(async (h) => {
+    const { rt, sink, seat } = h;
+    await setupTwoIslands(h);
+    seat.grab = { kind: 'move', surfaceId: 101 };   // a move grab is active
+    sink.outputStackCalls.length = 0;
+    sink.cameraCalls.length = 0;
+
+    await rt.invokeAction('workspace.pan-grab', {});
+    assert.equal(seat.grab.kind, 'move', 'existing grab untouched');
+    // Backed out: stack collapsed to the shown workspace, camera re-docked.
+    assert.deepEqual(sink.outputStackCalls.at(-1), { outputId: 0, ids: [101] });
+    assert.deepEqual(sink.cameraCalls.at(-1), { outputId: 0, x: 0, y: 0, zoom: 1 });
+    seat.grab = null;
   }, { world: true });
 });
 

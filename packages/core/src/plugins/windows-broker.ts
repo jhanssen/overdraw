@@ -85,6 +85,8 @@ export function createWindowsBroker(deps: WindowsBrokerDeps): WindowsBroker {
     if (method === "windows.set-output-camera") return handleSetOutputCamera(params);
     if (method === "windows.get-output-camera") return handleGetOutputCamera(params);
     if (method === "windows.set-islands") return handleSetIslands(params);
+    if (method === "windows.begin-camera-pan") return handleBeginCameraPan(params);
+    if (method === "windows.end-camera-pan") return handleEndCameraPan(params);
     if (method === "windows.focus") return handleFocus(params);
     if (method === "windows.request-focus-decision") return handleRequestFocusDecision(params);
     if (method === "windows.set-opacity") return handleSetOpacity(params);
@@ -361,6 +363,44 @@ export function createWindowsBroker(deps: WindowsBrokerDeps): WindowsBroker {
     // The mirror tracks every sink write, including the animation
     // evaluator's transient per-frame ones, so a flight preempted
     // mid-motion reads its true starting point here.
+    return state.outputCameras?.get(outputId) ?? { x: 0, y: 0, zoom: 1 };
+  }
+
+  // Drag-pan (canvas-design.md §4): install a camera-pan pointer grab on
+  // the seat. While it holds, pointer motion pans the output's camera
+  // transiently instead of reaching clients; endGrab settles + repicks.
+  // Returns whether the grab was installed (false: no seat, or another
+  // grab already active -- the seat's beginGrab is first-wins).
+  function handleBeginCameraPan(p: unknown): boolean {
+    if (!p || typeof p !== "object"
+      || typeof (p as { outputId?: unknown }).outputId !== "number") {
+      throw new Error("windows.begin-camera-pan: malformed payload");
+    }
+    const seat = state.seat;
+    if (!seat?.beginGrab || !seat.pointerPosition) return false;
+    if (seat.grab) return false;
+    const pos = seat.pointerPosition();
+    seat.beginGrab({
+      kind: "camera-pan",
+      outputId: (p as { outputId: number }).outputId,
+      lastX: pos.x, lastY: pos.y,
+    });
+    return !!seat.grab;
+  }
+
+  // End an active camera-pan grab (no-op for other grab kinds -- a pan
+  // release must never tear down a move/resize grab that superseded it)
+  // and return the settled camera.
+  function handleEndCameraPan(p: unknown): { x: number; y: number; zoom: number } {
+    if (!p || typeof p !== "object"
+      || typeof (p as { outputId?: unknown }).outputId !== "number") {
+      throw new Error("windows.end-camera-pan: malformed payload");
+    }
+    const outputId = (p as { outputId: number }).outputId;
+    const seat = state.seat;
+    if (seat?.grab?.kind === "camera-pan" && seat.grab.outputId === outputId) {
+      seat.endGrab();
+    }
     return state.outputCameras?.get(outputId) ?? { x: 0, y: 0, zoom: 1 };
   }
 

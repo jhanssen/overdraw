@@ -1878,6 +1878,49 @@ export default async function init(
   });
 
   sdk.actions.register({
+    name: "workspace.pan-grab",
+    description:
+      "World mode: start a drag-pan -- while the triggering button is held, pointer motion pans the camera 1:1 (free roaming; every workspace on the output stays visible). Bind with releaseAction: 'workspace.pan-grab-end'.",
+    handler: async (params: unknown): Promise<null> => {
+      if (!worldMode) {
+        throw new Error(
+          "workspace.pan-grab: requires canvas world mode (canvas: { world: true })");
+      }
+      const outputId = parseOptionalOutput(
+        params, resolveOutputName, focusedOutputId(), "workspace.pan-grab");
+      // Enter free roaming AT the current camera (union stack rides so
+      // the world is visible as it slides by), then hand the pointer to
+      // the seat's camera-pan grab.
+      const cur = await sdk.windows.getOutputCamera(outputId);
+      await freeCamera(outputId, cur, null, "workspace.pan-grab");
+      const ok = await sdk.windows.beginCameraPan(outputId);
+      if (!ok) {
+        // Another grab owns the pointer (or no seat): back out of the
+        // override so the stack and camera return to the shown dock.
+        exitOverride(outputId);
+        await pushStack(outputId, reg.stackFor(state, outputId));
+        await publishWorld();
+      }
+      return null;
+    },
+  });
+
+  sdk.actions.register({
+    name: "workspace.pan-grab-end",
+    description:
+      "End a drag-pan (the bind's releaseAction): settles the camera where it was dragged and keeps free roaming there.",
+    handler: async (params: unknown): Promise<null> => {
+      if (!worldMode) return null;
+      const outputId = parseOptionalOutput(
+        params, resolveOutputName, focusedOutputId(), "workspace.pan-grab-end");
+      const cam = await sdk.windows.endCameraPan(outputId);
+      const o = override.get(outputId);
+      if (o?.kind === "free") o.cam = cam;
+      return null;
+    },
+  });
+
+  sdk.actions.register({
     name: "workspace.bookmark-set",
     description:
       "World mode: save the output's current camera framing under `name` -- a dock captures the shown workspace, a fit captures the framed range, a roam captures the raw rect + zoom.",

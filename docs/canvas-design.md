@@ -700,6 +700,22 @@ tests only.
    resize -- §5's pacing promise now holds: off-view callbacks ride
    any output's flip-complete, and a fully idle compositor forces one
    flip. GPU test: `plugin-canvas/canvas-elastic.gpu.mjs`.
+   ALSO LANDED -- **drag-pan** (the pointer gesture for free roaming):
+   a third seat grab kind, `camera-pan` -- while it holds, pointer
+   motion pans the output's camera 1:1 (content follows the hand;
+   glass deltas / zoom -> world) as TRANSIENT writes with no client
+   delivery and no per-frame repick; endGrab sends the one settled
+   write and repicks, since the world moved under a stationary
+   pointer. This is the one grab that IS camera motion, inverting §4's
+   "no camera animation during a grab" -- which still holds for
+   animations (the broker's cameraGate denies flights while any grab,
+   including this one, is active; two camera writers would fight).
+   Exposed as `sdk.windows.beginCameraPan/endCameraPan`; the canvas
+   plugin's `workspace.pan-grab` (bind with releaseAction:
+   `workspace.pan-grab-end`) enters the free-roaming override (union
+   stack) at the current camera and hands the pointer to the grab,
+   backing out cleanly when another grab owns the pointer. GPU test:
+   `plugin-canvas/canvas-drag-pan.gpu.mjs`.
    ALSO LANDED -- **grid arrangement** (`canvas.arrangement:
    "grid"`; default "rows"): the world-arrangement policy's first
    alternative (§6's rows/grid/freeform). Slots wrap row-major after
@@ -744,13 +760,12 @@ tests only.
    the spawn workspace). Unruled spawns stay camera-relative ("open
    where I'm looking"). With plugin-workspace-default the hint is
    inert. GPU test: `plugin-canvas/canvas-placement.gpu.mjs`.
-   NOT yet: pointer drag-pan gesture; bookmark advertising on the bar
-   (§12's islands-vs-bookmarks question); persistent growth overrides
-   (set-elastic is session-scoped); rules targeting BOOKMARKS (rules
-   name workspaces today; a bookmark target adds camera framings);
-   fly-to attention (rule `show` docks instantly; no transition
-   plumbing in rules yet); gutters + shove beyond the single-row
-   arrangement; hotplug camera
+   NOT yet: bookmark advertising on the bar
+   (§12's islands-vs-bookmarks question); rules targeting BOOKMARKS
+   (rules name workspaces today; a bookmark target adds camera
+   framings); fly-to attention (rule `show` docks instantly; no
+   transition plumbing in rules yet); gutters + shove beyond the
+   per-row arrangement; hotplug camera
    persistence/rescue; overview UX (an interactive picker/gesture on
    top of the landed fit-zoom optics); island hygiene;
    camera-following compose/live scenes (§4: a live view built from

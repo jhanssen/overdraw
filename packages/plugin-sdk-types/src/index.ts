@@ -97,6 +97,8 @@ export interface PluginWindowsLike {
   setOutputStack(outputId: number, ids: number[] | null): Promise<void>;
   setOutputCamera(outputId: number, x: number, y: number, zoom?: number): Promise<void>;
   getOutputCamera(outputId: number): Promise<{ x: number; y: number; zoom: number }>;
+  beginCameraPan(outputId: number): Promise<boolean>;
+  endCameraPan(outputId: number): Promise<{ x: number; y: number; zoom: number }>;
   setIslands(islands: ReadonlyArray<{
     id: number;
     contextOutputId: number;

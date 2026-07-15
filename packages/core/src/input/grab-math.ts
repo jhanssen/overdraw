@@ -2,7 +2,7 @@
 // the current pointer position, and the window's size constraints, return
 // the new floating rect. No I/O; trivially unit-testable.
 
-import type { PointerGrab } from "../protocols/ctx.js";
+import type { PointerGrabMove, PointerGrabResize } from "../protocols/ctx.js";
 
 export interface SizeConstraints {
   minSize: { width: number; height: number } | null;
@@ -16,11 +16,13 @@ export interface Rect {
   height: number;
 }
 
-// Compute the new outer rect for the grab given the pointer's current
-// (x, y). `constraints` may be null (no clamps) or a partial spec
-// (missing min/max defaults to 1 / Infinity respectively).
+// Compute the new outer rect for a move/resize grab given the pointer's
+// current (x, y). `constraints` may be null (no clamps) or a partial spec
+// (missing min/max defaults to 1 / Infinity respectively). Camera-pan
+// grabs never reach here (they move the camera, not a rect; see
+// wl_seat's applyGrabMotion).
 export function computeGrabRect(
-  g: PointerGrab,
+  g: PointerGrabMove | PointerGrabResize,
   x: number,
   y: number,
   constraints: SizeConstraints | null,

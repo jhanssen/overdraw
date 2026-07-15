@@ -1428,7 +1428,25 @@ export interface PointerGrabResize {
   endOnButtonUp?: boolean;
 }
 
-export type PointerGrab = PointerGrabMove | PointerGrabResize;
+// Drag-pan: pointer motion pans the output's content camera instead of
+// moving a window -- the grab IS the camera motion, so the usual
+// "camera must hold still during a grab" rule doesn't apply (the
+// animations broker's cameraGate still denies concurrent camera
+// ANIMATIONS, which is exactly right: two writers would fight).
+// Deltas accumulate from the last applied pointer position (glass px,
+// converted to world by the live zoom), each written as a TRANSIENT
+// camera value; endGrab sends the one settled write.
+export interface PointerGrabCameraPan {
+  kind: "camera-pan";
+  outputId: number;
+  // Pointer position (global logical) at the last applied motion.
+  lastX: number;
+  lastY: number;
+  endOnButtonUp?: boolean;
+}
+
+export type PointerGrab =
+  | PointerGrabMove | PointerGrabResize | PointerGrabCameraPan;
 
 export interface Ctx {
   events: EventsByInterface; // per-interface event senders (built from makeEvents)

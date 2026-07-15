@@ -1020,6 +1020,12 @@ validated + resolved + consumed by the runtime + hotkey plugin.
   `plugin-canvas/canvas-fit.gpu.mjs`,
   `plugin-canvas/canvas-elastic.gpu.mjs`; unit coverage in
   `plugin-canvas/integration.test.js`.
+  Drag-pan is LANDED: a `camera-pan` seat grab kind pans the camera
+  1:1 from pointer motion (transient writes, no client delivery;
+  settle + repick on release), exposed via
+  `sdk.windows.beginCameraPan/endCameraPan` and the canvas plugin's
+  `workspace.pan-grab` / `pan-grab-end` actions (GPU test
+  `plugin-canvas/canvas-drag-pan.gpu.mjs`).
   Grid arrangement is LANDED (`canvas.arrangement: "grid"`, default
   "rows"): slots wrap row-major after ~sqrt(N) columns, fit frames
   the 2D bounds, docks move both camera axes, elastic shove stays
@@ -1038,10 +1044,9 @@ validated + resolved + consumed by the runtime + hotkey plugin.
   resolves it (registry `applyMapAt` assigns direct-to-handle).
   Unruled spawns stay camera-relative; with workspace-default the
   hint is inert. GPU test `plugin-canvas/canvas-placement.gpu.mjs`.
-  NOT built: pointer drag-pan gesture, bookmark advertising via
-  ext-workspace, persistent growth overrides (set-elastic is
-  session-scoped), rule targets for bookmarks / fly-to attention,
-  gutters/shove beyond the single-row arrangement,
+  NOT built: bookmark advertising via
+  ext-workspace, rule targets for bookmarks / fly-to attention,
+  gutters/shove beyond the per-row arrangement,
   hotplug camera persistence, ext-workspace per-group duplicate
   projection, camera-following compose/live scenes, the
   de-workspacing renames/retirements (canvas-design.md §10b).

@@ -688,6 +688,7 @@ export default function makeSeat(ctx: Ctx, driver: FocusDriver): SeatHandler {
   // that ship in every XCursor theme.
   function grabCursorShape(g: import("./ctx.js").PointerGrab): string {
     if (g.kind === "move") return "move";
+    if (g.kind === "camera-pan") return "grabbing";
     switch (g.edges) {
       case "top": return "top_side";
       case "bottom": return "bottom_side";
@@ -700,10 +701,25 @@ export default function makeSeat(ctx: Ctx, driver: FocusDriver): SeatHandler {
     }
   }
 
-  // Apply a pointer-motion event to an active grab: compute the new
-  // floating rect from the grab's anchor + startRect + current pointer
-  // position, then push it to the WM.
+  // Apply a pointer-motion event to an active grab. Move/resize: compute
+  // the new floating rect from the grab's anchor + startRect + current
+  // pointer position, then push it to the WM. Camera-pan: the content
+  // under the hand follows it -- a glass delta pans the camera by
+  // -delta/zoom in world units, written transiently (render/damage/input
+  // update per frame; the residency sweep + X re-narration wait for
+  // endGrab's settled write).
   function applyGrabMotion(g: import("./ctx.js").PointerGrab, x: number, y: number): void {
+    if (g.kind === "camera-pan") {
+      const dx = x - g.lastX;
+      const dy = y - g.lastY;
+      if (dx === 0 && dy === 0) return;
+      g.lastX = x;
+      g.lastY = y;
+      const cam = ctx.state.outputCameras?.get(g.outputId) ?? { x: 0, y: 0, zoom: 1 };
+      ctx.state.compositor.setOutputCamera?.(
+        g.outputId, cam.x - dx / cam.zoom, cam.y - dy / cam.zoom, cam.zoom, true);
+      return;
+    }
     const ws = ctx.state.wm?.getWindowState(g.surfaceId) ?? null;
     const rect = computeGrabRect(g, x, y, ws?.constraints ?? null);
     ctx.state.wm?.setFloatingRect(g.surfaceId, rect);
@@ -1177,11 +1193,24 @@ export default function makeSeat(ctx: Ctx, driver: FocusDriver): SeatHandler {
     },
     endGrab() {
       if (!seat0) return;
+      const ended = seat0.grab;
       seat0.grab = null;
       // Restore the default cursor. The hook is responsible for
       // routing this through the cursor broker's priority chain
       // (plugin override > client cursor > setDefault > theme default).
       ctx.state.installGrabCursor?.(null);
+      // A camera-pan streamed transient camera writes; settle now with
+      // one non-transient write of the final value (residency sweep +
+      // X re-narration), then repick -- the world moved under a
+      // stationary pointer, so enter/leave must track what's actually
+      // under it rather than waiting for the next device motion.
+      if (ended?.kind === "camera-pan") {
+        const cam = ctx.state.outputCameras?.get(ended.outputId)
+          ?? { x: 0, y: 0, zoom: 1 };
+        ctx.state.compositor.setOutputCamera?.(
+          ended.outputId, cam.x, cam.y, cam.zoom);
+        repickPointer();
+      }
       // After ending the grab, the next pointer motion will land an
       // enter on whichever surface is now under the pointer.
     },
