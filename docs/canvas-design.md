@@ -783,9 +783,18 @@ first-class object.
 
 ## 12. Open questions
 
-- **Islands vs. bookmarks in ext-workspace**: advertise every island, or
-  only named/bookmarked ones? Lean: every named island; scratch islands
-  stay off the bar.
+- **Islands vs. bookmarks in ext-workspace**: RESOLVED -- advertise
+  every island, each in its affinity-appropriate group(s) (§10b: homed
+  islands in their home output's group only while it is connected --
+  one bar; `affinity: none` islands in every group via duplicate
+  handles). No island is ever group-less/invisible-everywhere.
+  "Scratch" has no members in the current model: every
+  user-created workspace is named (create-on-reference stores digit
+  names), the unnamed ones (boot, hotplug donor) are either shown or
+  holding windows and must display, and unnamed+hidden+empty
+  evaporates before it could clutter a bar. The `hidden` state bit
+  stays shelved until some feature mints unnamed islands that
+  deliberately linger.
 - **Grid-bookmark active state**: camera framing two islands — both
   active or primary only? Cosmetic.
 - **Namespace verb shape**: keep the index/output-shaped `workspace`
