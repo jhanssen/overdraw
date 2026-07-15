@@ -28,12 +28,15 @@ export function shouldDeliverFrameCallbackIdle(
   // present's flip-complete.
   if (deps.surfaceHasContentInFlight?.(surfaceId)) return false;
   // null = compositor reports no residency (stub/harness): deliver. An empty
-  // array = mapped but off-screen, so there is no idle output to pace against;
-  // leave it for a flip-complete when it re-enters an output. Otherwise every
-  // resident output must be idle (no flip in flight, no queued damage).
+  // array = off every camera view (a hidden island's member, an elastic
+  // strip's off-view tail): its callbacks ride ANY flip-complete, so force a
+  // present only when NO flip is coming at all -- otherwise a client blocking
+  // on `done` before its next commit deadlocks (canvas-design.md §5).
+  // Otherwise every resident output must be idle (no flip in flight, no
+  // queued damage).
   const outs = deps.surfaceOutputs ? deps.surfaceOutputs(surfaceId) : null;
   if (outs !== null) {
-    if (outs.length === 0) return false;
+    if (outs.length === 0) return awaitingFlip.size === 0;
     if (outs.some((o) => awaitingFlip.has(o) || deps.isOutputDirty?.(o))) return false;
   }
   return true;

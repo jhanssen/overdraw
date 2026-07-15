@@ -60,13 +60,20 @@ test("delivered only when EVERY resident output is idle", () => {
   assert.equal(shouldDeliverFrameCallbackIdle(7, deps, NONE), false);
 });
 
-test("mapped-but-off-screen ([] residency) waits for a flip-complete", () => {
+test("off-every-view ([] residency): rides a coming flip, else forces one", () => {
+  // An off-view world surface (hidden island member, elastic strip tail)
+  // has no output of its own; its callbacks ride ANY flip-complete. With
+  // a flip already coming, don't force a present...
   const deps = {
     surfaceHasContentInFlight: () => false,
     surfaceOutputs: () => [],
     isOutputDirty: () => false,
   };
-  assert.equal(shouldDeliverFrameCallbackIdle(7, deps, NONE), false);
+  assert.equal(shouldDeliverFrameCallbackIdle(7, deps, new Set([1])), false);
+  // ...but on a fully idle compositor, force one -- a client blocking on
+  // wl_callback.done before its next commit must not deadlock
+  // (canvas-design.md §5).
+  assert.equal(shouldDeliverFrameCallbackIdle(7, deps, NONE), true);
 });
 
 test("a stub compositor with no residency info delivers", () => {

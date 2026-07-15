@@ -2825,7 +2825,17 @@ export class JsCompositor implements CompositorSink {
   // no damage of its own would otherwise never get a present -> never a flip ->
   // never `done`. No-op if the surface isn't drawable.
   requestPresentForCallback(id: number): void {
-    if (this.surfaces.has(id)) this.damageSurface(id);
+    if (!this.surfaces.has(id)) return;
+    this.damageSurface(id);
+    // A world surface outside every camera view damages nothing above --
+    // but its pending callback rides any flip-complete, so force one
+    // output to present (dirty bit only; its ring repaints its usual
+    // region). Without this, an off-view client blocking on `done` before
+    // its next commit stalls forever on an otherwise idle compositor.
+    if (this.surfaceOutputs(id).length === 0) {
+      const first = this.outputsGeom.keys().next();
+      if (!first.done) this.outputDamage.markDirty(first.value);
+    }
   }
 
   // True when the surface's fx transform/margin or mask can draw pixels OUTSIDE

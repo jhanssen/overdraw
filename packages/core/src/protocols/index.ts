@@ -880,9 +880,12 @@ export async function installProtocols(
   // ScanoutFlipComplete is drained for `outputId`. Sends wl_callback.done to
   // each pending callback whose surface overlaps that output -- so a surface
   // resident only on a 60Hz output is paced by its flips, not by a faster
-  // peer output's. A surface with no current output overlap (unmapped /
-  // off-screen) keeps its callbacks queued until it overlaps an output again
-  // OR the surface tears down (callbacks released with the SurfaceRecord).
+  // peer output's. A surface overlapping NO camera view (a hidden island's
+  // member, an elastic strip's off-view tail) has no output of its own to
+  // pace against, so its callbacks ride ANY output's flip-complete instead:
+  // clients that block on `done` before committing must not deadlock
+  // (canvas-design.md §5) -- a stalled off-view client can never redraw its
+  // way back into view, and a held resize transaction never releases.
   state.dispatchFrameCallbacksForOutput = (timeMs: number, outputId: number): void => {
     // The flip this output was awaiting has completed.
     awaitingFlip.delete(outputId);
@@ -894,7 +897,7 @@ export async function installProtocols(
       // (back-compat for harnesses with a stub compositor).
       if (surfaceOutputs) {
         const outs = surfaceOutputs.call(state.compositor, s.id);
-        if (!outs.includes(outputId)) continue;
+        if (outs.length > 0 && !outs.includes(outputId)) continue;
       }
       s.frameCallbacks = [];
       for (const cb of cbs) {
