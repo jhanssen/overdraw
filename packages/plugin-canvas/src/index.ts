@@ -2383,11 +2383,17 @@ function tryResolveShowName(
     if (idx !== null) return { index: idx, outputId };
   }
 
-  // Pass 2: digit-string -> durable handle.
+  // Pass 2: digit-string -> durable handle, UNNAMED workspaces only
+  // (boot / hotplug-donor workspaces, which have no user-set name to
+  // match in pass 1). A workspace explicitly named something else must
+  // never be addressable by its internal handle: durable handles drift
+  // from user-visible numbering as workspaces evaporate and re-create
+  // (a re-created "2" may hold handle 3, and `name: "3"` landing on it
+  // sends windows to the wrong workspace).
   if (/^[1-9][0-9]*$/.test(params.name)) {
     const handle = Number(params.name) as WorkspaceHandle;
     const rec = state.byHandle.get(handle);
-    if (rec) {
+    if (rec && rec.name === undefined) {
       if (restrictTo !== null && rec.outputId !== restrictTo) {
         throw new Error(
           `workspace.show: workspace handle ${params.name} is on a different output`);

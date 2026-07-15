@@ -1200,6 +1200,49 @@ test('grid: elastic growth shoves within its own grid row only', async () => {
   }, { canvas: { world: true, arrangement: 'grid', elastic: true } });
 });
 
+// ---- digit-name resolution vs handle drift --------------------------------
+
+test('world: digit names never resolve to a differently-named workspace', async () => {
+  await withCanvasPlugin(async (h) => {
+    const { rt, addWindow } = h;
+    addWindow(101);   // anchors ws1 (handle 1, unnamed)
+    await settle();
+    addWindow(102);
+    await settle();
+
+    // Drift the handle: "2" created (handle 2), evaporates, re-created
+    // by a move (handle 3, still named "2").
+    await rt.invokeAction('workspace.show', { name: '2' });
+    await call(rt, 'show', [1, 0]);   // empty + hidden -> evaporates
+    await settle();
+    await rt.invokeAction('workspace.move-window', { surfaceId: 102, name: '2' });
+    await settle();
+    let list = await call(rt, 'list', [0]);
+    assert.equal(list.length, 2);
+    assert.equal(list[1].name, '2');
+    assert.ok(list[1].handle > 2, 'durable handle drifted past the digit');
+
+    // The bug: name "3" fell back to durable handle 3 -- the workspace
+    // NAMED "2" -- and windows moved there. It must create "3" instead.
+    addWindow(103);
+    await settle();
+    await rt.invokeAction('workspace.move-window', { surfaceId: 103, name: '3' });
+    await settle();
+    list = await call(rt, 'list', [0]);
+    assert.deepEqual(list.map((w) => w.name), [undefined, '2', '3']);
+    assert.deepEqual(list.find((w) => w.name === '2').members, [102]);
+    assert.deepEqual(list.find((w) => w.name === '3').members, [103]);
+
+    // The UNNAMED boot workspace stays addressable as "1" (the handle
+    // fallback's remaining legitimate case).
+    await rt.invokeAction('workspace.show', { name: '1' });
+    const cur = await call(rt, 'current', [0]);
+    assert.equal(cur.index, 1);
+    assert.equal((await call(rt, 'list', [0])).length, 3,
+      'no spurious create-on-reference for "1"');
+  }, { world: true });
+});
+
 // ---- membership on drag (window.drag-dropped) -----------------------------
 
 test('world: dropping a previously-tiled window on another island re-parents and re-tiles', async () => {
