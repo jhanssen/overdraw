@@ -111,6 +111,12 @@ export interface PluginWindowsLike {
   requestFocusDecision(reason: FocusReason, trigger?: number): Promise<void>;
   list(): Promise<WindowSnapshotLike[]>;
   get(id: number): Promise<WindowSnapshotLike | null>;
+  // Behavioral-state proposal (tiling, exclusive, visible, ...); runs the
+  // window.proposed interceptor chain and returns the committed state.
+  // Reason defaults to 'plugin'; pass 'user-input' when acting on a
+  // user gesture.
+  propose(id: number, proposal: { [k: string]: unknown },
+          reason?: string): Promise<unknown>;
   onMap(cb: (ev: { surfaceId: number; outputId: number }) => void): void;
   onUnmap(cb: (ev: { surfaceId: number }) => void): void;
   // Reserve a band around the window's content (decoration providers).

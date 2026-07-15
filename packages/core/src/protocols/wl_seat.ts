@@ -1199,6 +1199,21 @@ export default function makeSeat(ctx: Ctx, driver: FocusDriver): SeatHandler {
       // routing this through the cursor broker's priority chain
       // (plugin override > client cursor > setDefault > theme default).
       ctx.state.installGrabCursor?.(null);
+      // A move grab that ends is a DROP: report where (the pointer's
+      // world position through the content camera -- drops land where
+      // the cursor is, correct while fitted/roaming) and whether the
+      // window was tiled before the grab floated it. The workspace
+      // plugin's membership-on-drag policy consumes this (re-parent to
+      // the island under the cursor; re-tile if it was managed).
+      if (ended?.kind === "move") {
+        const view = contentViewAt(lastX, lastY);
+        ctx.state.pluginBus?.emit("window.drag-dropped", {
+          surfaceId: ended.surfaceId,
+          wasManaged: ended.wasManaged === true,
+          x: seatViewToWorldX(view, lastX),
+          y: seatViewToWorldY(view, lastY),
+        });
+      }
       // A camera-pan streamed transient camera writes; settle now with
       // one non-transient write of the final value (residency sweep +
       // X re-narration), then repick -- the world moved under a

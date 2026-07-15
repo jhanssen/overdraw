@@ -1020,6 +1020,11 @@ validated + resolved + consumed by the runtime + hotkey plugin.
   `plugin-canvas/canvas-fit.gpu.mjs`,
   `plugin-canvas/canvas-elastic.gpu.mjs`; unit coverage in
   `plugin-canvas/integration.test.js`.
+  Membership-on-drag is LANDED: a move grab's drop (window.drag-dropped,
+  pointer world position + pre-grab lane) re-parents the window to the
+  island under the cursor -- previously-tiled windows re-tile there,
+  user-floated ones stay floating. Island bookmarks survive
+  evaporation via their captured name (create-on-reference fallback).
   Drag-pan is LANDED: a `camera-pan` seat grab kind pans the camera
   1:1 from pointer motion (transient writes, no client delivery;
   settle + repick on release), exposed via

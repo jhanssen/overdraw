@@ -99,6 +99,7 @@ export default function makeToplevel(ctx: Ctx): XdgToplevelHandler {
         kind: "move", surfaceId: id,
         anchorX: pos.x, anchorY: pos.y,
         startRect,
+        wasManaged: ws?.tiling === "managed",
         endOnButtonUp: true,
       });
     } else {

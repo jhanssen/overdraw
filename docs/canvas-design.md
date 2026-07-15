@@ -716,6 +716,18 @@ tests only.
    stack) at the current camera and hands the pointer to the grab,
    backing out cleanly when another grab owns the pointer. GPU test:
    `plugin-canvas/canvas-drag-pan.gpu.mjs`.
+   ALSO LANDED -- **membership on drag** (§3's third membership
+   trigger): a move grab's release emits `window.drag-dropped` with
+   the pointer's WORLD position (through the content camera, so drops
+   land where the cursor points while fitted/roaming) and whether the
+   window was tiled before the grab floated it. The canvas plugin
+   re-parents the window to the island under the cursor; a
+   previously-tiled window re-tiles into the new island, a
+   user-floated one stays floating, and drops on the window's own
+   island or on void change nothing (the plain drag-to-float
+   gesture). Island bookmarks also survive evaporation now: they
+   capture the workspace's name and degrade to create-on-reference
+   when the handle is dead -- closing the last island-hygiene gap.
    ALSO LANDED -- **grid arrangement** (`canvas.arrangement:
    "grid"`; default "rows"): the world-arrangement policy's first
    alternative (§6's rows/grid/freeform). Slots wrap row-major after
@@ -767,7 +779,7 @@ tests only.
    transition plumbing in rules yet); gutters + shove beyond the
    per-row arrangement; hotplug camera
    persistence/rescue; overview UX (an interactive picker/gesture on
-   top of the landed fit-zoom optics); island hygiene;
+   top of the landed fit-zoom optics);
    camera-following compose/live scenes (§4: a live view built from
    `outputRegion(outputId)` needs a "follow output N's camera" mode);
    ext-workspace per-group duplicate-handle projection (§9, needed once

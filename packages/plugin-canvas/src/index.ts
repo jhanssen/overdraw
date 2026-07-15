@@ -1269,7 +1269,7 @@ export default async function init(
   // workspaces by NAME, resolved at go time (create-on-reference, like
   // show).
   type BookmarkFraming =
-    | { kind: "island"; handle: WorkspaceHandle }
+    | { kind: "island"; handle: WorkspaceHandle; name?: string }
     | { kind: "island-name"; workspace: string }
     | { kind: "range"; handles: WorkspaceHandle[] }
     | { kind: "range-index"; start?: number; end?: number }
@@ -1328,7 +1328,13 @@ export default async function init(
       if (shown === undefined) {
         throw new Error("workspace.bookmark-set: no shown workspace to capture");
       }
-      framing = { kind: "island", handle: shown };
+      // Carry the workspace's name so the bookmark survives evaporation:
+      // names are the durable identity, handles die with the workspace.
+      const wsName = state.byHandle.get(shown)?.name;
+      framing = {
+        kind: "island", handle: shown,
+        ...(wsName !== undefined ? { name: wsName } : {}),
+      };
     }
     bookmarks.set(name, framing);
     return framing;
@@ -1358,6 +1364,15 @@ export default async function init(
       case "island": {
         const rec = state.byHandle.get(f.handle);
         if (!rec) {
+          // The workspace evaporated. Degrade to its captured name
+          // (create-on-reference, like config bookmarks); a nameless
+          // one is genuinely gone.
+          if (f.name !== undefined) {
+            const p = await resolveOrCreateByName(
+              { name: f.name }, "workspace.bookmark-go");
+            await showAt(p.index, p.outputId);
+            return;
+          }
           throw new Error(
             `workspace.bookmark-go: bookmark '${name}' points at a destroyed workspace`);
         }
@@ -1659,6 +1674,50 @@ export default async function init(
     }
   }
   sdk.windows.onMap((ev) => { void placeOnMap(ev); });
+
+  // Membership on drag (canvas-design.md §3): a move grab's drop
+  // re-parents the window to the island under the CURSOR (the seat
+  // reports the pointer's world position through the content camera, so
+  // drops land where you're pointing while fitted/roaming too). A window
+  // that was tiled before the grab floated it re-tiles into the new
+  // island; one the user floated stays floating. Dropping on the
+  // window's own island (or on void between islands) changes nothing --
+  // that's the plain drag-to-float gesture.
+  sdk.events.subscribe("window.drag-dropped", (_name, payload) => {
+    if (!worldMode || !payload || typeof payload !== "object") return;
+    const p = payload as {
+      surfaceId?: unknown; wasManaged?: unknown; x?: unknown; y?: unknown;
+    };
+    if (typeof p.surfaceId !== "number"
+      || typeof p.x !== "number" || typeof p.y !== "number") return;
+    const surfaceId = p.surfaceId;
+    const from = state.surfaceToHandle.get(surfaceId);
+    if (from === undefined) return;
+    // The island under the drop point, across every output's arrangement.
+    let target: { handle: WorkspaceHandle; outputId: number } | null = null;
+    for (const [outputId, row] of rowRectsByOutput) {
+      for (const [h, r] of row) {
+        if (p.x >= r.x && p.x < r.x + r.width
+          && p.y >= r.y && p.y < r.y + r.height) {
+          target = { handle: h, outputId };
+          break;
+        }
+      }
+      if (target) break;
+    }
+    if (!target || target.handle === from) return;
+    const idx = reg.findIndex(state, target.handle, target.outputId);
+    if (idx === null) return;
+    void (async () => {
+      const r = reg.moveWindow(
+        state, surfaceId, idx, target.outputId, outputNameOf(target.outputId));
+      state = r.state;
+      await applyEffects(r.sideEffects);
+      if (p.wasManaged === true) {
+        await sdk.windows.propose(surfaceId, { tiling: "managed" }, "user-input");
+      }
+    })();
+  });
   sdk.windows.onUnmap((ev) => {
     const r = reg.applyUnmap(state, ev.surfaceId);
     state = r.state;

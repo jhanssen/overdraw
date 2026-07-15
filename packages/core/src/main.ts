@@ -1190,6 +1190,7 @@ pluginBus.subscribe("window.grab-requested", async (_n, payload) => {
       kind: "move", surfaceId,
       anchorX: pos.x, anchorY: pos.y,
       startRect: startOuter,
+      wasManaged: ws?.tiling === "managed",
     });
   } else {
     const valid: ReadonlyArray<import("./protocols/ctx.js").ResizeEdges> = [

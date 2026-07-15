@@ -1196,6 +1196,72 @@ test('grid: elastic growth shoves within its own grid row only', async () => {
   }, { canvas: { world: true, arrangement: 'grid', elastic: true } });
 });
 
+// ---- membership on drag (window.drag-dropped) -----------------------------
+
+test('world: dropping a previously-tiled window on another island re-parents and re-tiles', async () => {
+  await withCanvasPlugin(async (h) => {
+    const { rt, wm, pluginBus, addWindow } = h;
+    await setupTwoIslands(h);   // 101 on ws1 (slot 0), 102 on ws2 (slot 1)
+    addWindow(103);             // second member on ws1
+    await settle();
+
+    // Drop 103 at a world point inside ws2's slot (x = PITCH + 100).
+    pluginBus.emit('window.drag-dropped',
+      { surfaceId: 103, wasManaged: true, x: PITCH + 100, y: 300 });
+    await settle();
+    const list = await call(rt, 'list', [0]);
+    assert.deepEqual(list[0].members, [101], 'left the source island');
+    assert.deepEqual(list[1].members, [102, 103], 'joined the target island');
+    assert.equal(wm.getWindowState(103)?.tiling, 'managed',
+      'previously-tiled window re-tiles in the new island');
+
+    // A floating window keeps floating: in production the grab floats
+    // the window before the drop, so mirror that here, then drop 101
+    // with wasManaged: false (it was already floating pre-grab).
+    await wm.propose(101, { tiling: 'floating' }, 'user-input');
+    pluginBus.emit('window.drag-dropped',
+      { surfaceId: 101, wasManaged: false, x: PITCH + 200, y: 300 });
+    await settle();
+    assert.deepEqual((await call(rt, 'list', [0]))[1].members, [102, 103, 101]);
+    assert.notEqual(wm.getWindowState(101)?.tiling, 'managed',
+      'user-floated window stays floating');
+
+    // Drops on the window's own island or on void change nothing.
+    pluginBus.emit('window.drag-dropped',
+      { surfaceId: 103, wasManaged: true, x: PITCH + 300, y: 300 });
+    pluginBus.emit('window.drag-dropped',
+      { surfaceId: 103, wasManaged: true, x: -5000, y: 300 });
+    await settle();
+    assert.deepEqual((await call(rt, 'list', [0]))[1].members, [102, 103, 101]);
+  }, { world: true });
+});
+
+// ---- bookmark evaporation fallback ----------------------------------------
+
+test('world: an island bookmark survives evaporation via its captured name', async () => {
+  await withCanvasPlugin(async (h) => {
+    const { rt, wsEvents, addWindow } = h;
+    addWindow(101);   // anchors ws1
+    await settle();
+    // Dynamic named workspace via create-on-reference; bookmark its dock.
+    await rt.invokeAction('workspace.show', { name: '2' });
+    const r = await rt.invokeAction('workspace.bookmark-set', { name: 'two' });
+    assert.equal(r.kind, 'island');
+    // Leave it empty + hidden -> it evaporates.
+    await call(rt, 'show', [1, 0]);
+    await settle();
+    assert.equal((await call(rt, 'list', [0])).length, 1, 'workspace evaporated');
+
+    // bookmark-go re-creates it by the captured name instead of throwing.
+    wsEvents.length = 0;
+    await rt.invokeAction('workspace.bookmark-go', { name: 'two' });
+    const list = await call(rt, 'list', [0]);
+    assert.equal(list.length, 2);
+    assert.equal(list[1].name, '2');
+    assert.ok(wsEvents.some((e) => e.name === 'workspace.shown' && e.payload.index === 2));
+  }, { world: true });
+});
+
 // ---- declarative workspaces (canvas.workspaces) ---------------------------
 
 test('canvas.workspaces: seeds named persistent workspaces with elastic by name', async () => {
