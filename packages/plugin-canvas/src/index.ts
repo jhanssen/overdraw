@@ -86,7 +86,10 @@ interface CanvasPluginConfig {
   // output's row and `show` docks the output's camera on it (instantly,
   // or via a camera flight when the caller passes a transition).
   // Absent/false = workspace parity (islands colocated with outputs,
-  // identity cameras).
+  // identity cameras). `elastic` sets the growth default; `bookmarks`
+  // seeds named camera framings; `workspaces` declares named workspaces
+  // that exist from boot (persistent by default, optional per-entry
+  // output / elastic).
   canvas?: unknown;
 }
 
@@ -460,11 +463,25 @@ export default async function init(
   // viewport (world px from the island's left edge; clamped on use, so a
   // shrinking island self-corrects).
   const scrollByHandle = new Map<WorkspaceHandle, number>();
-  // Per-workspace growth override (workspace.set-elastic); absent = the
-  // config default. Session-scoped; pruned with the workspace.
+  // Per-workspace growth. Precedence: runtime override
+  // (workspace.set-elastic, session-scoped, pruned with the workspace) >
+  // config declaration by NAME (canvas.workspaces entries -- survives
+  // destroy/recreate cycles since it keys on the name) > config default.
   const growthByHandle = new Map<WorkspaceHandle, boolean>();
+  const elasticByName = new Map<string, boolean>();
+  // Per-name column fraction (canvas.workspaces `elastic: { column }`);
+  // absent = the global colFraction.
+  const columnByName = new Map<string, number>();
   function isElastic(handle: WorkspaceHandle): boolean {
-    return growthByHandle.get(handle) ?? elasticDefault;
+    const override = growthByHandle.get(handle);
+    if (override !== undefined) return override;
+    const name = state.byHandle.get(handle)?.name;
+    const declared = name !== undefined ? elasticByName.get(name) : undefined;
+    return declared ?? elasticDefault;
+  }
+  function columnFor(handle: WorkspaceHandle): number {
+    const name = state.byHandle.get(handle)?.name;
+    return (name !== undefined ? columnByName.get(name) : undefined) ?? colFraction;
   }
   // Row arrangement computed by publishWorld: each workspace's island
   // rect, keyed per output. camXFor / fitCameraFor read this cache
@@ -737,7 +754,7 @@ export default async function init(
   // maximize should cover the screen, not a multi-screen strip.
   function elasticWidth(
     g: { width: number }, members: ReadonlyArray<number>,
-    snapById: Map<number, WindowSnapshotLike>,
+    snapById: Map<number, WindowSnapshotLike>, fraction: number,
   ): number {
     let cols = 0;
     for (const id of members) {
@@ -747,7 +764,7 @@ export default async function init(
       if (ws.exclusive !== "none") return g.width;
       if (ws.tiling === "managed") cols++;
     }
-    const colW = Math.max(1, Math.round(g.width * colFraction));
+    const colW = Math.max(1, Math.round(g.width * fraction));
     return Math.max(g.width, cols * colW);
   }
 
@@ -794,7 +811,7 @@ export default async function init(
         for (const h of ordered) {
           const rec = state.byHandle.get(h);
           const width = rec && isElastic(h)
-            ? elasticWidth(g, rec.members, snapById)
+            ? elasticWidth(g, rec.members, snapById, columnFor(h))
             : g.width;
           row.set(h, { x, y: g.y, width, height: g.height });
           x += width + SLOT_GUTTER;
@@ -1432,6 +1449,73 @@ export default async function init(
   await applyEffects(r0.sideEffects);
   await applyEffects(bootRecomputeEffects);
 
+  // Declarative workspaces (canvas.workspaces): each entry names a
+  // workspace that exists from boot. Created persistent by default (a
+  // declared workspace shouldn't evaporate mid-session; it would only be
+  // re-declared next boot); `persistent: false` opts back into dynamic
+  // lifetime. `output` picks the home output (and seeds preferredOutputs
+  // so a replug reclaims it); an unresolvable output falls back to the
+  // default output. `elastic` declares growth by NAME (see isElastic).
+  // Registry create is idempotent on name, so re-seeding is safe.
+  async function seedWorkspaces(canvasSlice: unknown): Promise<void> {
+    if (!canvasSlice || typeof canvasSlice !== "object") return;
+    const list = (canvasSlice as { workspaces?: unknown }).workspaces;
+    if (list === undefined) return;
+    if (!Array.isArray(list)) {
+      sdk.log("canvas: config workspaces must be an array; ignored");
+      return;
+    }
+    for (const entry of list) {
+      if (!isObj(entry) || typeof entry.name !== "string" || entry.name === "") {
+        sdk.log(`canvas: config workspace without a name skipped (${JSON.stringify(entry)})`);
+        continue;
+      }
+      if (entry.elastic !== undefined) {
+        // Same shape as the top-level default: boolean, or { column }
+        // (an object means elastic with a per-workspace column fraction).
+        if (typeof entry.elastic === "boolean") {
+          elasticByName.set(entry.name, entry.elastic);
+        } else if (isObj(entry.elastic)) {
+          elasticByName.set(entry.name, true);
+          const col = entry.elastic.column;
+          if (col !== undefined) {
+            if (typeof col !== "number" || !Number.isFinite(col)) {
+              sdk.log(`canvas: config workspace '${entry.name}' elastic.column must be a number; ignored`);
+            } else {
+              columnByName.set(entry.name, Math.min(1, Math.max(0.1, col)));
+            }
+          }
+        } else {
+          sdk.log(`canvas: config workspace '${entry.name}' elastic must be a boolean or { column }; skipped`);
+          continue;
+        }
+      }
+      if (entry.persistent !== undefined && typeof entry.persistent !== "boolean") {
+        sdk.log(`canvas: config workspace '${entry.name}' persistent must be a boolean; skipped`);
+        continue;
+      }
+      let outputId = reg.OUTPUT_DEFAULT;
+      const preferredOutputs: string[] = [];
+      if (entry.output !== undefined) {
+        if (typeof entry.output !== "string" || entry.output === "") {
+          sdk.log(`canvas: config workspace '${entry.name}' output must be a non-empty string; skipped`);
+          continue;
+        }
+        preferredOutputs.push(entry.output);
+        outputId = resolveOutputName(entry.output) ?? reg.OUTPUT_DEFAULT;
+      }
+      const c = reg.create(state, {
+        name: entry.name,
+        outputId,
+        persistent: entry.persistent ?? true,
+        ...(preferredOutputs.length > 0 ? { preferredOutputs } : {}),
+      }, outputNameOf(outputId));
+      state = c.state;
+      await applyEffects(c.sideEffects);
+    }
+  }
+  await seedWorkspaces(config?.canvas);
+
   // Seed membership from windows that are already mapped at plugin init
   // (defensive: bundled plugins load before any client maps in practice, so
   // this is usually empty, but the runtime makes no such guarantee).
@@ -1575,7 +1659,7 @@ export default async function init(
   sdk.actions.register({
     name: "workspace.create",
     description:
-      "Append a new workspace on the given output (defaults to the focused output); returns its snapshot.",
+      "Append a new workspace on the given output (defaults to the focused output); returns its snapshot. A `name` matching an existing workspace is a no-op returning that workspace.",
     handler: async (params: unknown): Promise<WorkspaceSnapshot> => {
       const p = parseCreateParams(params, resolveOutputName, focusedOutputId());
       const r = reg.create(state, p, outputNameOf(p.outputId));

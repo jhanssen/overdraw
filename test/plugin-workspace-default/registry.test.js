@@ -490,3 +490,23 @@ test('applyMapAt: shown target pushes its stack; idempotent; unknown handle thro
 
   assert.throws(() => applyMapAt(state, 301, 999), /no workspace with handle/);
 });
+
+// ---- create: name idempotence ----------------------------------------------
+
+test('create: an existing name is a no-op returning the existing workspace', () => {
+  let state = init('test').state;
+  const first = create(state, { name: 'comms' }, 'test');
+  state = first.state;
+  assert.equal(emitsOf(first.sideEffects, 'workspace.created').length, 1);
+
+  // Same name again: same handle back, no state change, no effects.
+  const again = create(state, { name: 'comms', persistent: true }, 'test');
+  assert.equal(again.snapshot.handle, first.snapshot.handle);
+  assert.deepEqual(again.sideEffects, []);
+  assert.equal(snapshotsForOutput(again.state, OUTPUT_DEFAULT).length, 2);
+
+  // Unnamed creates always append.
+  const unnamed1 = create(state, {}, 'test');
+  const unnamed2 = create(unnamed1.state, {}, 'test');
+  assert.notEqual(unnamed1.snapshot.handle, unnamed2.snapshot.handle);
+});

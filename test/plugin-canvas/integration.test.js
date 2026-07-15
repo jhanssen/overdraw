@@ -1063,6 +1063,62 @@ test('placement: malformed or empty hints fall back to the spawn output', async 
   }, { world: true });
 });
 
+// ---- declarative workspaces (canvas.workspaces) ---------------------------
+
+test('canvas.workspaces: seeds named persistent workspaces with elastic by name', async () => {
+  await withCanvasPlugin(async (h) => {
+    const { rt, islands, addWindow } = h;
+    await settle();
+    const list = await call(rt, 'list', [0]);
+    // Boot workspace 1 + the two declared ones.
+    assert.deepEqual(list.map((w) => w.name), [undefined, 'comms', 'media']);
+    const comms = list.find((w) => w.name === 'comms');
+    assert.equal(comms.persistent, true, 'declared workspaces default persistent');
+    const media = list.find((w) => w.name === 'media');
+    assert.equal(media.persistent, false, 'explicit persistent: false honored');
+
+    // Redundant create by name is a no-op (registry idempotence).
+    const snap = await rt.invokeAction('workspace.create', { name: 'comms' });
+    assert.equal(snap.handle, comms.handle);
+    assert.equal((await call(rt, 'list', [0])).length, 3);
+
+    // 'media' is declared elastic with a 0.75 column: three members grow
+    // it to 3 × 600 while its neighbors stay fixed.
+    await call(rt, 'show', [3, 0]);
+    addWindow(101);
+    await settle();
+    addWindow(102);
+    await settle();
+    addWindow(103);
+    await settle();
+    const mediaIsland = islands().find((i) => i.id === media.handle);
+    assert.equal(mediaIsland.rect.width, 1800,
+      'declared-elastic workspace grew at its own column fraction');
+    assert.deepEqual(mediaIsland.layout, { mode: 'columns' });
+    assert.equal(islands().find((i) => i.id === comms.handle).layout, undefined,
+      'undeclared workspaces keep the fixed default');
+
+    // A window quietly placed on 'comms' keeps it around even when it
+    // empties again: persistent means no evaporation.
+    await call(rt, 'show', [1, 0]);
+    await settle();
+    h.unmapWindow(101); h.unmapWindow(102); h.unmapWindow(103);
+    await settle();
+    const after = await call(rt, 'list', [0]);
+    assert.ok(after.some((w) => w.name === 'comms'), 'persistent survives empty+hidden');
+    assert.ok(!after.some((w) => w.name === 'media'),
+      'persistent: false evaporates when empty and hidden');
+  }, {
+    canvas: {
+      world: true,
+      workspaces: [
+        { name: 'comms' },
+        { name: 'media', elastic: { column: 0.75 }, persistent: false },
+      ],
+    },
+  });
+});
+
 test('world: config-seeded bookmarks resolve at go time', async () => {
   await withCanvasPlugin(async (h) => {
     const { rt, sink, wsEvents } = h;

@@ -478,7 +478,7 @@ export default async function init(
   sdk.actions.register({
     name: "workspace.create",
     description:
-      "Append a new workspace on the given output (defaults to the focused output); returns its snapshot.",
+      "Append a new workspace on the given output (defaults to the focused output); returns its snapshot. A `name` matching an existing workspace is a no-op returning that workspace.",
     handler: async (params: unknown): Promise<WorkspaceSnapshot> => {
       const p = parseCreateParams(params, resolveOutputName, focusedOutputId());
       const r = reg.create(state, p, outputNameOf(p.outputId));

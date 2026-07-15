@@ -321,6 +321,18 @@ export function create(state: WorkspaceState,
                        outputName: string,
                        ): { state: WorkspaceState; snapshot: WorkspaceSnapshot;
                             sideEffects: SideEffect[] } {
+  // Named workspaces are stable identities: everything that references
+  // one does so by name (show, placement rules, bookmarks), so a create
+  // whose name already exists anywhere is a no-op returning the existing
+  // workspace -- which also makes declarative seeding idempotent. Only
+  // unnamed creates always append.
+  if (spec.name !== undefined) {
+    for (const [handle, rec] of state.byHandle) {
+      if (rec.name === spec.name) {
+        return { state, snapshot: snapshotOf(state, handle), sideEffects: [] };
+      }
+    }
+  }
   const outputId = spec.outputId ?? OUTPUT_DEFAULT;
   // ensureOutput first so the very-first workspace on a brand-new output is
   // still appended at the end (it'll just be the only one).

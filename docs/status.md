@@ -1020,6 +1020,13 @@ validated + resolved + consumed by the runtime + hotkey plugin.
   `plugin-canvas/canvas-fit.gpu.mjs`,
   `plugin-canvas/canvas-elastic.gpu.mjs`; unit coverage in
   `plugin-canvas/integration.test.js`.
+  Declarative workspaces are LANDED: `canvas.workspaces` entries
+  `{ name, output?, persistent?, elastic? }` seed named workspaces at
+  boot (persistent by default; `elastic` boolean or `{ column }`
+  declares growth by name), backed by registry name idempotence --
+  `workspace.create` with an existing name is a no-op returning that
+  workspace. Config declaration IS the persistence story: restart
+  resets the world, so durable setup is declared, not saved.
   Placement rules are LANDED (canvas-design.md §7): windowRules gain
   `workspace: "name"` (create-on-reference), `output` (glass-relative
   alone; home-region with a name), and `show: true` (attention;

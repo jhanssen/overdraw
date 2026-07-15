@@ -673,6 +673,22 @@ tests only.
    resize -- §5's pacing promise now holds: off-view callbacks ride
    any output's flip-complete, and a fully idle compositor forces one
    flip. GPU test: `plugin-canvas/canvas-elastic.gpu.mjs`.
+   ALSO LANDED -- **declarative workspaces** (`canvas.workspaces`):
+   config entries `{ name, output?, persistent?, elastic? }` declare
+   named workspaces that exist from boot -- persistent by default (a
+   declared workspace shouldn't evaporate mid-session), homed on
+   `output` when given (also seeded into preferredOutputs for replug),
+   with `elastic` declaring growth BY NAME (survives destroy/recreate;
+   boolean or `{ column }` for a per-workspace column fraction;
+   precedence: runtime set-elastic > declared name > config default).
+   Backed by registry-level name idempotence: `workspace.create` with
+   a name that already exists anywhere is a no-op returning the
+   existing workspace -- named workspaces are stable identities
+   (show / rules / bookmarks all resolve by name), and seeding is
+   idempotent by construction. This is the config-declaration answer
+   to persistence: restart resets the world (clients die with the
+   compositor), so durable setup is DECLARED, not saved/restored;
+   runtime bookmark-set / set-elastic stay deliberately ephemeral.
    ALSO LANDED -- **placement rules targeting workspaces** (§7):
    window rules gain `workspace: "name"` (resolved across all outputs
    by user-set name, digit-handle fallback; created on reference when
