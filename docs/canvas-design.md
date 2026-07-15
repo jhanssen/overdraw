@@ -431,7 +431,12 @@ care what produces the events. Islands map:
   group's duplicate, which identifies the output whose camera should
   dock. Waybar does not deduplicate across groups, which is exactly right
   here; the only cosmetic caveat is `all-outputs=true` would render one
-  button per (island × group), which is honest if unusual.
+  button per (island × group), which is honest if unusual. Duplication
+  is gated on the island's output affinity (§10b): only `affinity:
+  none` islands duplicate into every group; homed islands (`preferred`
+  / `pinned`) advertise only in their home group while it is connected,
+  so per-monitor bars keep their disjoint traditional lists and a
+  disconnect migrates the orphans to a surviving group.
 - The workspace `id` event is defined as stable across sessions — a
   natural carrier for durable island identity (suffixed per group so
   duplicate handles keep unique ids; waybar sorts within one group, so
@@ -512,7 +517,29 @@ Retirements (semantics superseded by the model):
 - **`preferredOutputs` migration records.** Hotplug re-homing keyed on
   durable output identity is superseded by camera persistence (§8):
   hotplug records store island refs + camera framings; windows never
-  move, cameras do.
+  move, cameras do. RE-EXPRESSED, not deleted: output affinity is a
+  feature users of the traditional model actively want, so the
+  MECHANISM (migration records) retires while the POLICY survives as
+  a per-island affinity constraint on camera docking -- `none` (free
+  canvas island, any camera), `preferred` (today's default: soft
+  homing; other cameras may view it, and it falls back to live
+  outputs while its home is unplugged, reclaiming on replug), or
+  `pinned` (dockable only by its home output's camera while that
+  output is connected; unplugging relaxes it to the fallback
+  behavior). Declared per workspace (a `canvas.workspaces` field,
+  next to `output`); `none` is always EXPLICIT -- an entry that omits
+  `output` still homes where it is created with `preferred` affinity,
+  so traditional configs never fall into all-bars projection by
+  omission. The ext-workspace projection follows it: an
+  island with a home (`preferred` or `pinned`) advertises ONLY in its
+  home output's group while that output is connected -- per-output
+  bars keep showing disjoint per-monitor lists, and a disconnect
+  migrates the orphans into a surviving output's group (today's
+  behavior, preserved) -- while §9's per-group duplicate handles
+  apply only to `affinity: none` islands. The naive "duplicate every
+  island into every group" projection would erase the per-monitor
+  bar separation traditional users rely on; duplicates are the
+  opt-in, not the default.
 - **Spawn-output assignment as ownership.** The map-event `outputId`
   becomes a placement HINT (which island's region the window lands in);
   placement rules target islands/bookmarks (§7), not outputs.
