@@ -626,10 +626,28 @@ tests only.
    {duration, easing?}` camera tween with the flight machinery's
    preemption/instant-fallback semantics. GPU test:
    `plugin-canvas/canvas-fit.gpu.mjs`.
-   NOT yet: bookmarks + free roaming (bookmarks wait until the camera
-   can leave slot framings -- without pan gestures or roaming they
-   could only record docks); elastic islands; placement rules
-   targeting islands; gutters + shove; hotplug camera
+   ALSO LANDED -- **free roaming + bookmarks**: `workspace.pan {dx,
+   dy}` / `workspace.zoom {factor}` (keyboard verbs; a pointer
+   drag-pan gesture is future work) park the camera at arbitrary world
+   framings through the same per-output camera-override state as fit.
+   While overridden, every workspace on the output rides the draw
+   stack -- the plugin's roaming answer to §5's hidden-vs-unviewed
+   choice: everything is viewable while traveling -- the shown
+   workspace follows focus, and structural changes never move a parked
+   free camera (fit framings re-solve). Bookmarks name camera framings
+   (§2): `bookmark-set` captures what the camera is doing (dock ->
+   island ref, fit -> handle range, roam -> raw rect+zoom, the
+   sanctioned raw-coordinate holder), `bookmark-go` replays through
+   show / fit / free-park respectively (flown with a `transition`);
+   `bookmark-delete` / `bookmark-list` manage them. Config
+   `canvas.bookmarks` entries re-seed each start and reference
+   workspaces by NAME, resolved at go time (create-on-reference);
+   runtime bookmarks are session-scoped. Unit coverage in
+   `plugin-canvas/integration.test.js`; GPU roam test in
+   `canvas-fit.gpu.mjs`.
+   NOT yet: pointer drag-pan gesture; bookmark advertising on the bar
+   (§12's islands-vs-bookmarks question); elastic islands; placement
+   rules targeting islands; gutters + shove; hotplug camera
    persistence/rescue; overview UX (an interactive picker/gesture on
    top of the landed fit-zoom optics); island hygiene;
    camera-following compose/live scenes (§4: a live view built from

@@ -18,8 +18,12 @@
 //   tween; the union of departure + destination stacks rides the output
 //   for the journey so the world visibly slides by). `workspace.fit`
 //   zooms the camera out (optically) to frame a consecutive run of
-//   workspaces without moving registry truth; `workspace.unfit` zooms
-//   back in to one.
+//   workspaces; `workspace.pan` / `workspace.zoom` roam the camera
+//   freely (every workspace on the output stays visible while the
+//   camera is off its dock, and the shown workspace follows focus);
+//   `workspace.unfit` zooms back in to one; `workspace.bookmark-*`
+//   name camera framings (dock / fit range / free rect+zoom) and fly
+//   back to them. Config `canvas.bookmarks` seeds bookmarks each start.
 
 import type {
   WorkspaceAPI, WorkspaceHandle, WorkspaceIndex, WorkspaceSnapshot,
@@ -240,15 +244,16 @@ export default async function init(
       if (handle !== undefined) {
         const rec = state.byHandle.get(handle);
         if (rec) focusedOutputIdCache = rec.outputId;
-        // While an output is fitted every framed window is focusable
-        // (click, or hover under follow-pointer focus), so the shown
-        // workspace FOLLOWS focus: the bar highlight and the default
-        // unfit target always name the workspace the user selected.
-        // The registry show flips truth only -- the fit's union stack
-        // and camera stay in place (the setOutputStack override and
-        // publishWorld's fitted gates keep them), and the focus
-        // decision is skipped: focus is the cause here, not an effect.
-        if (rec && worldMode && fitted.has(rec.outputId)
+        // While an output's camera is overridden (fit or free roam)
+        // every visible window is focusable (click, or hover under
+        // follow-pointer focus), so the shown workspace FOLLOWS focus:
+        // the bar highlight and the default unfit target always name
+        // the workspace the user selected. The registry show flips
+        // truth only -- the override's union stack and camera stay in
+        // place (the setOutputStack override and publishWorld's gates
+        // keep them), and the focus decision is skipped: focus is the
+        // cause here, not an effect.
+        if (rec && worldMode && override.has(rec.outputId)
             && state.shownByOutput.get(rec.outputId) !== handle) {
           const idx = reg.findIndex(state, handle, rec.outputId);
           if (idx !== null) {
@@ -314,7 +319,7 @@ export default async function init(
     liveOutputs.delete(p.outputId);
     outputAliasesById.delete(p.outputId);
     outputGeom.delete(p.outputId);
-    fitted.delete(p.outputId);
+    override.delete(p.outputId);
     // Focus may have been on this output; reset to OUTPUT_DEFAULT so the
     // next action targets a live output rather than the vanished one.
     if (focusedOutputIdCache === p.outputId) {
@@ -398,22 +403,45 @@ export default async function init(
   // stackFor cannot know about -- a preempting flight unions against it
   // so nothing pops off screen mid-journey.
   const lastPushedStack = new Map<number, number[]>();
-  // Fitted overview per output (workspace.fit): the camera frames a
-  // consecutive run of workspaces while registry truth (shown workspace,
-  // bar highlight, focus) stays put. The draw stack carries the union of
-  // the framed workspaces' members; refreshFits keeps stack + camera in
-  // step with structural changes. Any show on the output exits the fit.
-  interface FitRecord {
+  // Camera override per output: the camera has left its docked slot
+  // framing. Two kinds:
+  //   fit  -- workspace.fit frames a consecutive workspace set; the
+  //           framing re-solves when members / geometry change.
+  //   free -- workspace.pan / workspace.zoom / a free bookmark parked
+  //           the camera at an arbitrary world framing; structural
+  //           changes never move it.
+  // While overridden the output's draw stack carries a union (the
+  // framed workspaces for fit, every workspace on the output for free)
+  // so the world is visible, and the SHOWN workspace follows focus.
+  // Registry truth is otherwise untouched; any show exits the override.
+  interface FitOverride {
+    kind: "fit";
     handles: WorkspaceHandle[];
     // Last settled fit camera; null while the entry tween is in flight.
     cam: { x: number; y: number; zoom: number } | null;
   }
-  const fitted = new Map<number, FitRecord>();
+  interface FreeOverride {
+    kind: "free";
+    // The parked (or in-flight target) camera.
+    cam: { x: number; y: number; zoom: number };
+  }
+  const override = new Map<number, FitOverride | FreeOverride>();
 
-  function exitFit(outputId: number): void {
-    // The dock cache tracks camera x at zoom 1; a fit camera invalidates
-    // it, so the next dock re-sends even a previously-sent value.
-    if (fitted.delete(outputId)) lastCamByOutput.delete(outputId);
+  function exitOverride(outputId: number): void {
+    // The dock cache tracks camera x at zoom 1; an override camera
+    // invalidates it, so the next dock re-sends even a previously-sent
+    // value.
+    if (override.delete(outputId)) lastCamByOutput.delete(outputId);
+  }
+
+  // The workspaces an override unions onto the draw stack: the framed
+  // set for fit, everything on the output for free roaming.
+  function overrideHandles(
+    outputId: number, o: FitOverride | FreeOverride,
+  ): WorkspaceHandle[] {
+    return o.kind === "fit"
+      ? o.handles
+      : [...(state.positionsByOutput.get(outputId) ?? [])];
   }
 
   // The draw stack for a fitted output: the union of the framed
@@ -465,32 +493,37 @@ export default async function init(
     };
   }
 
-  // Keep each fitted output's union stack + camera in step with
-  // structural changes (membership, workspace create/destroy, geometry).
-  // A fit whose workspaces all vanished dissolves; publishWorld's dock
-  // loop then re-docks the camera on the shown slot.
-  async function refreshFits(): Promise<void> {
-    for (const [outputId, rec] of [...fitted]) {
+  // Keep each overridden output's union stack (and, for fits, the
+  // framing camera) in step with structural changes (membership,
+  // workspace create/destroy, geometry). An override whose workspaces
+  // all vanished dissolves; publishWorld's dock loop then re-docks the
+  // camera on the shown slot. Free cameras stay parked -- the user put
+  // them there.
+  async function refreshOverrides(): Promise<void> {
+    for (const [outputId, o] of [...override]) {
       const positions = state.positionsByOutput.get(outputId) ?? [];
-      const live = positions.filter((h) => rec.handles.includes(h));
+      const live = o.kind === "fit"
+        ? positions.filter((h) => o.handles.includes(h))
+        : [...positions];
       if (live.length === 0 || !outputGeom.has(outputId)) {
-        exitFit(outputId);
+        exitOverride(outputId);
         continue;
       }
-      rec.handles = live;
+      if (o.kind === "fit") o.handles = live;
       const union = fitStackFor(outputId, live);
       const last = lastPushedStack.get(outputId);
       if (!last || last.length !== union.length
           || union.some((v, i) => v !== last[i])) {
         await pushStack(outputId, union);
       }
-      // A fit entry tween owns the camera until it settles.
-      if (flying.has(outputId)) continue;
+      // Only fit framings re-solve; an entry tween owns the camera
+      // until it settles.
+      if (o.kind !== "fit" || flying.has(outputId)) continue;
       const cam = fitCameraFor(outputId, live);
       if (!cam) continue;
-      if (rec.cam && rec.cam.x === cam.x && rec.cam.y === cam.y
-          && rec.cam.zoom === cam.zoom) continue;
-      rec.cam = cam;
+      if (o.cam && o.cam.x === cam.x && o.cam.y === cam.y
+          && o.cam.zoom === cam.zoom) continue;
+      o.cam = cam;
       await sdk.windows.setOutputCamera(outputId, cam.x, cam.y, cam.zoom);
     }
   }
@@ -579,14 +612,14 @@ export default async function init(
     }
     islands.sort((a, b) => a.id - b.id);
     await sdk.windows.setIslands(islands);
-    // Fitted outputs maintain their own union stack + fit camera.
-    await refreshFits();
+    // Overridden outputs maintain their own union stack + camera.
+    await refreshOverrides();
     // Dock each output's camera on its shown island (instant). Identity
     // when geometry is unknown (rect null islands tile in place). A
     // flying output's camera belongs to its flight; the settle step
-    // docks it. A fitted output's camera belongs to its fit.
+    // docks it. An overridden output's camera belongs to its override.
     for (const [outputId, shown] of state.shownByOutput) {
-      if (flying.has(outputId) || fitted.has(outputId)) continue;
+      if (flying.has(outputId) || override.has(outputId)) continue;
       const camX = camXFor(outputId, shown);
       if (lastCamByOutput.get(outputId) === camX) continue;
       lastCamByOutput.set(outputId, camX);
@@ -609,12 +642,14 @@ export default async function init(
       if (skipKinds.has(e.kind)) continue;
       switch (e.kind) {
         case "setOutputStack": {
-          // A fitted output's stack stays the fit union: replaying the
-          // shown workspace's stack verbatim would hide the other framed
-          // workspaces' windows for a frame until refreshFits re-unions.
-          const fit = worldMode ? fitted.get(e.outputId) : undefined;
-          if (fit) {
-            await pushStack(e.outputId, fitStackFor(e.outputId, fit.handles));
+          // An overridden output's stack stays the override union:
+          // replaying the shown workspace's stack verbatim would hide
+          // the other visible workspaces' windows for a frame until
+          // refreshOverrides re-unions.
+          const o = worldMode ? override.get(e.outputId) : undefined;
+          if (o) {
+            await pushStack(e.outputId,
+              fitStackFor(e.outputId, overrideHandles(e.outputId, o)));
           } else {
             lastPushedStack.set(e.outputId, e.ids ? [...e.ids] : []);
             await sdk.windows.setOutputStack(e.outputId, e.ids);
@@ -791,7 +826,7 @@ export default async function init(
     index: WorkspaceIndex, outputId: number, t: ShowTransitionSpec,
   ): Promise<void> {
     noteFlight(t.kind);
-    exitFit(outputId);
+    exitOverride(outputId);
     const fromIds = lastPushedStack.get(outputId) ?? reg.stackFor(state, outputId);
     const r = reg.show(state, index, outputId, outputNameOf(outputId));
     state = r.state;
@@ -852,42 +887,21 @@ export default async function init(
     }
   }
 
-  // workspace.fit: zoom the output's camera out to frame workspaces
-  // [start..end] (per-output positions; defaults first..last). Registry
-  // truth is untouched -- only the optics widen, with the fit union
-  // riding the draw stack so every framed workspace composites. The
-  // framed set is resolved once, here; workspaces created later don't
-  // join it. With a transition the camera tweens out (denied tweens --
-  // grabs -- fall back to the instant write); either way one settled
-  // camera write sweeps residency + X narration.
-  async function fitRange(
-    outputId: number, start: number | undefined, end: number | undefined,
-    t: CameraTransitionSpec | null,
+  // Shared enter-override flow: install the override record, push its
+  // union stack, then move the camera to `cam` (tweened when a
+  // transition is given, with the flight preemption contract; denied
+  // tweens -- grabs -- fall back to the instant write). Either way one
+  // settled camera write sweeps residency + X narration at the end.
+  async function engageOverride(
+    outputId: number, rec: FitOverride | FreeOverride,
+    cam: { x: number; y: number; zoom: number },
+    t: CameraTransitionSpec | null, label: string,
   ): Promise<void> {
-    const positions = state.positionsByOutput.get(outputId) ?? [];
-    if (positions.length === 0) {
-      throw new Error("workspace.fit: no workspaces on the target output");
-    }
-    const s = start ?? 1;
-    const e = end ?? positions.length;
-    if (s < 1 || e > positions.length || s > e) {
-      throw new Error(
-        `workspace.fit: range ${s}..${e} out of bounds (1..${positions.length})`);
-    }
-    if (!outputGeom.has(outputId)) {
-      throw new Error(`workspace.fit: output ${outputId} has unknown geometry`);
-    }
-    resolveSlots(positions);
-    const handles = positions.slice(s - 1, e);
-    const cam = fitCameraFor(outputId, handles);
-    if (!cam) {
-      throw new Error("workspace.fit: no slot geometry for the range");
-    }
     await cancelFlight(outputId);
-    const rec: FitRecord = { handles: [...handles], cam: null };
-    fitted.set(outputId, rec);
+    override.set(outputId, rec);
     lastCamByOutput.delete(outputId);
-    await pushStack(outputId, fitStackFor(outputId, handles));
+    await pushStack(outputId,
+      fitStackFor(outputId, overrideHandles(outputId, rec)));
     if (t && sdk.animations) {
       const token = ++flightSeq;
       flying.set(outputId, token);
@@ -905,7 +919,7 @@ export default async function init(
           try {
             await sdk.animations.run(spec);
           } catch (err) {
-            sdk.log(`canvas: fit camera fell back to instant (${String(err)})`);
+            sdk.log(`canvas: ${label} camera fell back to instant (${String(err)})`);
           }
         }
         if (flying.get(outputId) !== token) return;  // preempted; the winner settles
@@ -914,17 +928,221 @@ export default async function init(
         if (flying.get(outputId) === token) flying.delete(outputId);
       }
     }
-    if (fitted.get(outputId) !== rec) return;  // a show exited the fit mid-tween
+    if (override.get(outputId) !== rec) return;  // a show exited the override mid-tween
     // Settle against live geometry: a mid-tween structural change may
-    // have moved the framing (refreshFits skipped the camera while the
-    // tween owned it).
-    const settleCam = fitCameraFor(outputId, rec.handles) ?? cam;
-    rec.cam = settleCam;
+    // have re-solved a fit framing (refreshOverrides skipped the camera
+    // while the tween owned it). Free cameras settle where they aimed.
+    const settleCam = rec.kind === "fit"
+      ? (fitCameraFor(outputId, rec.handles) ?? cam)
+      : rec.cam;
+    if (rec.kind === "fit") rec.cam = settleCam;
     await sdk.windows.setOutputCamera(
       outputId, settleCam.x, settleCam.y, settleCam.zoom);
   }
 
-  // workspace.unfit: zoom back in to a single workspace. Exits the fit;
+  // Frame a specific set of workspaces (all on outputId). Registry truth
+  // is untouched -- only the optics widen, with the fit union riding the
+  // draw stack so every framed workspace composites. The framed set is
+  // resolved once, here; workspaces created later don't join it.
+  async function fitHandles(
+    outputId: number, handles: ReadonlyArray<WorkspaceHandle>,
+    t: CameraTransitionSpec | null, label: string,
+  ): Promise<void> {
+    const positions = state.positionsByOutput.get(outputId) ?? [];
+    const live = handles.filter((h) => {
+      const rec = state.byHandle.get(h);
+      return rec !== undefined && rec.outputId === outputId;
+    });
+    if (live.length === 0) {
+      throw new Error(`${label}: no live workspaces to frame`);
+    }
+    if (!outputGeom.has(outputId)) {
+      throw new Error(`${label}: output ${outputId} has unknown geometry`);
+    }
+    resolveSlots(positions);
+    const cam = fitCameraFor(outputId, live);
+    if (!cam) {
+      throw new Error(`${label}: no slot geometry for the range`);
+    }
+    await engageOverride(
+      outputId, { kind: "fit", handles: [...live], cam: null }, cam, t, label);
+  }
+
+  // workspace.fit: frame workspaces [start..end] (per-output positions;
+  // defaults first..last).
+  async function fitRange(
+    outputId: number, start: number | undefined, end: number | undefined,
+    t: CameraTransitionSpec | null,
+  ): Promise<void> {
+    const positions = state.positionsByOutput.get(outputId) ?? [];
+    if (positions.length === 0) {
+      throw new Error("workspace.fit: no workspaces on the target output");
+    }
+    const s = start ?? 1;
+    const e = end ?? positions.length;
+    if (s < 1 || e > positions.length || s > e) {
+      throw new Error(
+        `workspace.fit: range ${s}..${e} out of bounds (1..${positions.length})`);
+    }
+    await fitHandles(outputId, positions.slice(s - 1, e), t, "workspace.fit");
+  }
+
+  // Free roaming (workspace.pan / workspace.zoom / free bookmarks): park
+  // the camera at an arbitrary framing. Every workspace on the output
+  // rides the stack so the world is visible as it goes by; the camera
+  // stays where the user put it until a show / unfit / new movement.
+  async function freeCamera(
+    outputId: number, cam: { x: number; y: number; zoom: number },
+    t: CameraTransitionSpec | null, label: string,
+  ): Promise<void> {
+    const positions = state.positionsByOutput.get(outputId) ?? [];
+    if (positions.length === 0) {
+      throw new Error(`${label}: no workspaces on the target output`);
+    }
+    if (!outputGeom.has(outputId)) {
+      throw new Error(`${label}: output ${outputId} has unknown geometry`);
+    }
+    resolveSlots(positions);
+    await engageOverride(outputId, { kind: "free", cam }, cam, t, label);
+  }
+
+  // ---- Bookmarks -----------------------------------------------------------
+  // Named camera framings (docs/canvas-design.md §2): what the camera is
+  // doing when the bookmark is set decides its shape. A dock captures the
+  // shown workspace (island), a fit captures the framed set (range), a
+  // roam captures the raw camera (free; offsets are output-relative).
+  // Runtime bookmarks live for the session; config-declared ones
+  // (canvas.bookmarks) are re-seeded every start and reference
+  // workspaces by NAME, resolved at go time (create-on-reference, like
+  // show).
+  type BookmarkFraming =
+    | { kind: "island"; handle: WorkspaceHandle }
+    | { kind: "island-name"; workspace: string }
+    | { kind: "range"; handles: WorkspaceHandle[] }
+    | { kind: "range-index"; start?: number; end?: number }
+    | { kind: "free"; x: number; y: number; zoom: number };
+  const bookmarks = new Map<string, BookmarkFraming>();
+
+  function seedBookmarks(canvasSlice: unknown): void {
+    if (!canvasSlice || typeof canvasSlice !== "object") return;
+    const list = (canvasSlice as { bookmarks?: unknown }).bookmarks;
+    if (list === undefined) return;
+    if (!Array.isArray(list)) {
+      sdk.log("canvas: config bookmarks must be an array; ignored");
+      return;
+    }
+    for (const entry of list) {
+      if (!isObj(entry) || typeof entry.name !== "string" || entry.name === "") {
+        sdk.log(`canvas: config bookmark without a name skipped (${JSON.stringify(entry)})`);
+        continue;
+      }
+      if (typeof entry.workspace === "string" && entry.workspace !== "") {
+        bookmarks.set(entry.name, { kind: "island-name", workspace: entry.workspace });
+      } else if (typeof entry.x === "number" && typeof entry.y === "number") {
+        const zoom = entry.zoom === undefined ? 1 : entry.zoom;
+        if (typeof zoom !== "number" || !(zoom > 0)) {
+          sdk.log(`canvas: config bookmark '${entry.name}' has invalid zoom; skipped`);
+          continue;
+        }
+        bookmarks.set(entry.name, { kind: "free", x: entry.x, y: entry.y, zoom });
+      } else if (entry.start !== undefined || entry.end !== undefined) {
+        const ok = (v: unknown): v is number | undefined =>
+          v === undefined || (typeof v === "number" && Number.isInteger(v) && v >= 1);
+        if (!ok(entry.start) || !ok(entry.end)) {
+          sdk.log(`canvas: config bookmark '${entry.name}' has invalid start/end; skipped`);
+          continue;
+        }
+        bookmarks.set(entry.name,
+          { kind: "range-index", start: entry.start, end: entry.end });
+      } else {
+        sdk.log(`canvas: config bookmark '${entry.name}' matches no framing shape ` +
+          "(need workspace, x/y[/zoom], or start/end); skipped");
+      }
+    }
+  }
+  seedBookmarks(config?.canvas);
+
+  // Capture the invoking output's current framing under `name`.
+  function setBookmark(name: string, outputId: number): BookmarkFraming {
+    const o = override.get(outputId);
+    let framing: BookmarkFraming;
+    if (o?.kind === "free") {
+      framing = { kind: "free", x: o.cam.x, y: o.cam.y, zoom: o.cam.zoom };
+    } else if (o?.kind === "fit") {
+      framing = { kind: "range", handles: [...o.handles] };
+    } else {
+      const shown = state.shownByOutput.get(outputId);
+      if (shown === undefined) {
+        throw new Error("workspace.bookmark-set: no shown workspace to capture");
+      }
+      framing = { kind: "island", handle: shown };
+    }
+    bookmarks.set(name, framing);
+    return framing;
+  }
+
+  // Fly/dock a camera to the bookmark's framing. Island framings are a
+  // show on the workspace's home output; range framings re-fit; free
+  // framings park the invoking output's camera.
+  async function gotoBookmark(
+    name: string, outputId: number, t: CameraTransitionSpec | null,
+  ): Promise<void> {
+    const f = bookmarks.get(name);
+    if (!f) throw new Error(`workspace.bookmark-go: no bookmark '${name}'`);
+    const showAt = async (index: WorkspaceIndex, outId: number): Promise<void> => {
+      if (t) {
+        await showWithFlight(index, outId,
+          { kind: "camera", duration: t.duration, easing: t.easing });
+        return;
+      }
+      exitOverride(outId);
+      await cancelFlight(outId);
+      const r = reg.show(state, index, outId, outputNameOf(outId));
+      state = r.state;
+      await applyEffects(r.sideEffects);
+    };
+    switch (f.kind) {
+      case "island": {
+        const rec = state.byHandle.get(f.handle);
+        if (!rec) {
+          throw new Error(
+            `workspace.bookmark-go: bookmark '${name}' points at a destroyed workspace`);
+        }
+        const idx = reg.findIndex(state, f.handle, rec.outputId);
+        if (idx === null) {
+          throw new Error(`workspace.bookmark-go: bookmark '${name}' is unresolvable`);
+        }
+        await showAt(idx, rec.outputId);
+        return;
+      }
+      case "island-name": {
+        const p = await resolveOrCreateByName(
+          { name: f.workspace }, "workspace.bookmark-go");
+        await showAt(p.index, p.outputId);
+        return;
+      }
+      case "range": {
+        const live = f.handles.filter((h) => state.byHandle.has(h));
+        const home = live.length > 0 ? state.byHandle.get(live[0]) : undefined;
+        if (!home) {
+          throw new Error(
+            `workspace.bookmark-go: bookmark '${name}' frames only destroyed workspaces`);
+        }
+        await fitHandles(home.outputId, live, t, "workspace.bookmark-go");
+        return;
+      }
+      case "range-index":
+        await fitRange(outputId, f.start, f.end, t);
+        return;
+      case "free":
+        await freeCamera(outputId,
+          { x: f.x, y: f.y, zoom: f.zoom }, t, "workspace.bookmark-go");
+        return;
+    }
+  }
+
+  // workspace.unfit: zoom back in to a single workspace. Exits any
+  // camera override (fit or free roam);
   // a target different from the shown workspace is a normal show (flown
   // when a transition is given), while unfitting onto the shown
   // workspace itself restores camera + stack without touching registry
@@ -938,7 +1156,7 @@ export default async function init(
   async function unfitTo(
     outputId: number, index: number | undefined, t: CameraTransitionSpec | null,
   ): Promise<void> {
-    exitFit(outputId);
+    exitOverride(outputId);
     const positions = state.positionsByOutput.get(outputId) ?? [];
     const shown = state.shownByOutput.get(outputId);
     const shownIdx = shown !== undefined ? positions.indexOf(shown) + 1 : 0;
@@ -1105,7 +1323,7 @@ export default async function init(
         await showWithTransition(p.index, p.outputId, t);
         return null;
       }
-      exitFit(p.outputId);
+      exitOverride(p.outputId);
       await cancelFlight(p.outputId);
       const r = reg.show(state, p.index, p.outputId, outputNameOf(p.outputId));
       state = r.state;
@@ -1130,7 +1348,7 @@ export default async function init(
         await showWithTransition(p.index, p.outputId, t);
         return null;
       }
-      exitFit(p.outputId);
+      exitOverride(p.outputId);
       await cancelFlight(p.outputId);
       const r = reg.show(state, p.index, p.outputId, outputNameOf(p.outputId));
       state = r.state;
@@ -1168,6 +1386,106 @@ export default async function init(
       const t = parseCameraTransition(params, "workspace.unfit");
       await unfitTo(p.outputId, p.index, t);
       return null;
+    },
+  });
+
+  sdk.actions.register({
+    name: "workspace.pan",
+    description:
+      "World mode: pan the output's camera by {dx, dy} glass logical px (scaled by the current zoom into world units), entering free roaming -- every workspace on the output stays visible as the world goes by. Optional transition {duration, easing?} animates the step.",
+    handler: async (params: unknown): Promise<null> => {
+      if (!worldMode) {
+        throw new Error(
+          "workspace.pan: requires canvas world mode (canvas: { world: true })");
+      }
+      const p = parsePanParams(params, resolveOutputName, focusedOutputId());
+      const t = parseCameraTransition(params, "workspace.pan");
+      const cur = await sdk.windows.getOutputCamera(p.outputId);
+      await freeCamera(p.outputId, {
+        x: cur.x + p.dx / cur.zoom,
+        y: cur.y + p.dy / cur.zoom,
+        zoom: cur.zoom,
+      }, t, "workspace.pan");
+      return null;
+    },
+  });
+
+  sdk.actions.register({
+    name: "workspace.zoom",
+    description:
+      "World mode: multiply the output's camera zoom by `factor` (anchored at the view center; clamped to [0.05, 8]), entering free roaming. Optional transition {duration, easing?} animates it.",
+    handler: async (params: unknown): Promise<null> => {
+      if (!worldMode) {
+        throw new Error(
+          "workspace.zoom: requires canvas world mode (canvas: { world: true })");
+      }
+      const p = parseZoomParams(params, resolveOutputName, focusedOutputId());
+      const t = parseCameraTransition(params, "workspace.zoom");
+      const g = outputGeom.get(p.outputId);
+      if (!g) {
+        throw new Error(`workspace.zoom: output ${p.outputId} has unknown geometry`);
+      }
+      const cur = await sdk.windows.getOutputCamera(p.outputId);
+      const z = Math.min(8, Math.max(0.05, cur.zoom * p.factor));
+      // Keep the world point at the viewport center fixed across the
+      // zoom change.
+      await freeCamera(p.outputId, {
+        x: cur.x + (g.width / 2) * (1 / cur.zoom - 1 / z),
+        y: cur.y + (g.height / 2) * (1 / cur.zoom - 1 / z),
+        zoom: z,
+      }, t, "workspace.zoom");
+      return null;
+    },
+  });
+
+  sdk.actions.register({
+    name: "workspace.bookmark-set",
+    description:
+      "World mode: save the output's current camera framing under `name` -- a dock captures the shown workspace, a fit captures the framed range, a roam captures the raw rect + zoom.",
+    handler: async (params: unknown): Promise<{ name: string; kind: string }> => {
+      if (!worldMode) {
+        throw new Error(
+          "workspace.bookmark-set: requires canvas world mode (canvas: { world: true })");
+      }
+      const p = parseBookmarkParams(params, resolveOutputName, focusedOutputId(),
+        "workspace.bookmark-set");
+      const framing = setBookmark(p.name, p.outputId);
+      return { name: p.name, kind: framing.kind };
+    },
+  });
+
+  sdk.actions.register({
+    name: "workspace.bookmark-go",
+    description:
+      "World mode: fly/dock the camera to the bookmark `name`. Island bookmarks show that workspace; range bookmarks re-fit; free bookmarks park the camera. Optional transition {duration, easing?}.",
+    handler: async (params: unknown): Promise<null> => {
+      if (!worldMode) {
+        throw new Error(
+          "workspace.bookmark-go: requires canvas world mode (canvas: { world: true })");
+      }
+      const p = parseBookmarkParams(params, resolveOutputName, focusedOutputId(),
+        "workspace.bookmark-go");
+      const t = parseCameraTransition(params, "workspace.bookmark-go");
+      await gotoBookmark(p.name, p.outputId, t);
+      return null;
+    },
+  });
+
+  sdk.actions.register({
+    name: "workspace.bookmark-delete",
+    description: "World mode: delete the bookmark `name`. Returns whether it existed.",
+    handler: async (params: unknown): Promise<{ deleted: boolean }> => {
+      const p = parseBookmarkParams(params, resolveOutputName, focusedOutputId(),
+        "workspace.bookmark-delete");
+      return { deleted: bookmarks.delete(p.name) };
+    },
+  });
+
+  sdk.actions.register({
+    name: "workspace.bookmark-list",
+    description: "World mode: list saved bookmarks (name + framing).",
+    handler: async (): Promise<Array<{ name: string } & BookmarkFraming>> => {
+      return [...bookmarks].map(([name, f]) => ({ name, ...f }));
     },
   });
 
@@ -1280,7 +1598,7 @@ export default async function init(
         return;
       }
       const outId = outputId ?? reg.OUTPUT_DEFAULT;
-      exitFit(outId);
+      exitOverride(outId);
       await cancelFlight(outId);
       const r = reg.show(state, index, outId, outputNameOf(outId));
       state = r.state;
@@ -1592,6 +1910,67 @@ function parseUnfitParams(
     out.index = params.index;
   }
   return out;
+}
+
+// workspace.pan: dx/dy in glass logical px (either may be omitted = 0).
+function parsePanParams(
+  params: unknown,
+  resolveOutput: (input: string) => number | null,
+  defaultOutputId: number,
+): { dx: number; dy: number; outputId: number } {
+  if (!isObj(params)) {
+    throw new TypeError("workspace.pan: expected an object with { dx?, dy?, output? }");
+  }
+  const outputId = parseOptionalOutput(
+    params, resolveOutput, defaultOutputId, "workspace.pan");
+  const num = (v: unknown, label: string): number => {
+    if (v === undefined) return 0;
+    if (typeof v !== "number" || !Number.isFinite(v)) {
+      throw new TypeError(`workspace.pan: ${label} must be a finite number`);
+    }
+    return v;
+  };
+  const dx = num(params.dx, "dx");
+  const dy = num(params.dy, "dy");
+  if (dx === 0 && dy === 0) {
+    throw new TypeError("workspace.pan: pass a non-zero dx and/or dy");
+  }
+  return { dx, dy, outputId };
+}
+
+// workspace.zoom: multiplicative factor (> 0).
+function parseZoomParams(
+  params: unknown,
+  resolveOutput: (input: string) => number | null,
+  defaultOutputId: number,
+): { factor: number; outputId: number } {
+  if (!isObj(params)) {
+    throw new TypeError("workspace.zoom: expected an object with { factor, output? }");
+  }
+  if (typeof params.factor !== "number" || !Number.isFinite(params.factor)
+      || params.factor <= 0) {
+    throw new TypeError("workspace.zoom: factor must be a positive finite number");
+  }
+  const outputId = parseOptionalOutput(
+    params, resolveOutput, defaultOutputId, "workspace.zoom");
+  return { factor: params.factor, outputId };
+}
+
+// Bookmark verbs: { name, output? }.
+function parseBookmarkParams(
+  params: unknown,
+  resolveOutput: (input: string) => number | null,
+  defaultOutputId: number,
+  label: string,
+): { name: string; outputId: number } {
+  if (!isObj(params)) {
+    throw new TypeError(`${label}: expected an object with { name, output? }`);
+  }
+  if (typeof params.name !== "string" || params.name === "") {
+    throw new TypeError(`${label}: name must be a non-empty string`);
+  }
+  const outputId = parseOptionalOutput(params, resolveOutput, defaultOutputId, label);
+  return { name: params.name, outputId };
 }
 
 function parseSetUrgentParams(

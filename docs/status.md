@@ -992,16 +992,21 @@ validated + resolved + consumed by the runtime + hotkey plugin.
   selected) without moving the camera or stack; `workspace.unfit
   {index?, output?, transition?}` zooms back in (default: the focused
   window's workspace, else the shown one -- optics-only when it is
-  already shown, a show otherwise). GPU
-  test `plugin-canvas/canvas-fit.gpu.mjs`; unit coverage in
-  `plugin-canvas/integration.test.js`.
-  NOT built: bookmarks + free roaming (bookmarks deferred until the
-  camera can leave slot framings -- without pan gestures or roaming a
-  bookmark could only record the dock it started from), elastic
-  islands, gutters/shove, hotplug camera persistence, ext-workspace
-  per-group duplicate projection, camera-following compose/live
-  scenes, the de-workspacing renames/retirements
-  (canvas-design.md §10b).
+  already shown, a show otherwise). Free roaming + bookmarks are
+  LANDED: `workspace.pan {dx, dy}` / `workspace.zoom {factor}` park
+  the camera at arbitrary framings (keyboard verbs; every workspace
+  on the output rides the stack while roaming, shown follows focus,
+  structural changes never move a parked camera);
+  `workspace.bookmark-set/go/delete/list` name camera framings (dock
+  -> island, fit -> range, roam -> rect+zoom) and `canvas.bookmarks`
+  config entries re-seed each start with workspace-name references
+  resolved at go time. GPU tests `plugin-canvas/canvas-fit.gpu.mjs`;
+  unit coverage in `plugin-canvas/integration.test.js`.
+  NOT built: pointer drag-pan gesture, bookmark advertising via
+  ext-workspace, elastic islands, gutters/shove, hotplug camera
+  persistence, ext-workspace per-group duplicate projection,
+  camera-following compose/live scenes, the de-workspacing
+  renames/retirements (canvas-design.md §10b).
 - **Logging.** TS surface migrated (spdlog 1.17.0; fixed area set;
   severity-based stdout/stderr split; `--log-file=PATH`; per-area
   `--log-level=SPEC`; `installConsoleShim` routes `console.*`

@@ -120,3 +120,54 @@ test("world mode: fit frames both workspaces; unfit zooms back", { skip }, async
     await c.teardown();
   }
 });
+
+test("world mode: pan roams the camera; hidden workspaces become visible", { skip }, async () => {
+  const c = await setupCompositor({ headless: OUT, config: { canvas: { world: true } } });
+  try {
+    const cA = 0xff3030c0;
+    const cB = 0xff30c030;
+
+    // A on workspace 1 (slot 0); B on workspace 2 (slot 1); back on 1.
+    const a = c.spawnClient([FILL, "--color", cA.toString(16)]);
+    await a.ready;
+    const s1 = await c.waitFor(c.query, (s) => s.windows.length === 1, { what: "A mapped" });
+    const aId = s1.windows[0].surfaceId;
+    await c.runtime.invokeAction("workspace.create", {});
+    await c.runtime.invokeAction("workspace.show-at-index", { index: 2 });
+    const b = c.spawnClient([FILL, "--color", cB.toString(16)]);
+    await b.ready;
+    const s2 = await c.waitFor(c.query, (s) => s.windows.length === 2, { what: "B mapped" });
+    const bId = s2.windows.find((w) => w.surfaceId !== aId).surfaceId;
+    await c.runtime.invokeAction("workspace.show-at-index", { index: 1 });
+    await settled(() => c.query().outputs[0].cameraX,
+      (x) => x === 0, { what: "camera docked at slot 0" });
+    await settled(() => enteredOf(c, bId),
+      (e) => e.length === 0, { what: "B hidden before roaming" });
+
+    // Pan one pitch right: the camera now frames slot 1 exactly, so B
+    // composites at full size and becomes resident; A slides off-view
+    // and leaves. Registry truth is untouched (workspace 1 still shown).
+    await c.runtime.invokeAction("workspace.pan", { dx: PITCH });
+    await settled(() => c.query().outputs[0],
+      (o) => o.cameraX === PITCH && o.cameraY === 0 && o.cameraZoom === 1,
+      { what: "camera parked at slot 1" });
+    await readUntil(c, (p) => pixelMatches(pixelAt(p, OUT.width, 640, 360), argbToBgra(cB), 4));
+    await settled(() => enteredOf(c, bId),
+      (e) => e.length === 1 && e[0] === 0, { what: "B resident while roamed over" });
+    await settled(() => enteredOf(c, aId),
+      (e) => e.length === 0, { what: "A left while off-view" });
+    const cur = await c.runtime.invokeAction("workspace.current", {});
+    assert.equal(cur.index, 1, "roaming leaves the shown workspace alone");
+
+    // Unfit docks back onto the shown workspace's slot.
+    await c.runtime.invokeAction("workspace.unfit", {});
+    await settled(() => c.query().outputs[0],
+      (o) => o.cameraX === 0 && o.cameraY === 0 && o.cameraZoom === 1,
+      { what: "camera re-docked at slot 0" });
+    await readUntil(c, (p) => pixelMatches(pixelAt(p, OUT.width, 640, 360), argbToBgra(cA), 4));
+    await settled(() => enteredOf(c, bId),
+      (e) => e.length === 0, { what: "B re-hidden after unfit" });
+  } finally {
+    await c.teardown();
+  }
+});

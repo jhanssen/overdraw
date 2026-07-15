@@ -135,7 +135,7 @@ async function withCanvasPlugin(fn, opts = {}) {
       {
         output: null, focus: null, hotkeys: undefined, actions: undefined,
         plugins: [], sourcePath: null,
-        canvas: opts.world ? { world: true } : {},
+        canvas: opts.canvas ?? (opts.world ? { world: true } : {}),
       },
       {
         bootOutputDurableKey: 'mock-0',
@@ -693,4 +693,147 @@ test('world: an instant show cancels an in-progress fit tween', async () => {
     assert.deepEqual(sink.cameraCalls.at(-1), { outputId: 0, x: PITCH, y: 0, zoom: 1 });
     assert.deepEqual(sink.outputStackCalls.at(-1), { outputId: 0, ids: [102] });
   }, { world: true, animations: 'manual' });
+});
+
+// ---- world mode: free roaming + bookmarks ---------------------------------
+
+test('world: pan enters free roaming (union stack, accumulating camera)', async () => {
+  await withCanvasPlugin(async (h) => {
+    const { rt, sink, wsEvents } = h;
+    await setupTwoIslands(h);
+    sink.outputStackCalls.length = 0;
+    sink.cameraCalls.length = 0;
+    wsEvents.length = 0;
+
+    await rt.invokeAction('workspace.pan', { dx: 200, dy: 50 });
+    assert.deepEqual(sink.outputStackCalls[0], { outputId: 0, ids: [101, 102] },
+      'every workspace rides the stack while roaming');
+    assert.deepEqual(sink.cameraCalls.at(-1), { outputId: 0, x: 200, y: 50, zoom: 1 });
+    assert.equal(wsEvents.length, 0, 'roaming does not touch registry truth');
+
+    // A second pan accumulates from the live camera.
+    await rt.invokeAction('workspace.pan', { dx: -50 });
+    assert.deepEqual(sink.cameraCalls.at(-1), { outputId: 0, x: 150, y: 50, zoom: 1 });
+
+    // A structural change keeps the parked camera (free cameras never
+    // re-solve) and keeps the union stack.
+    sink.cameraCalls.length = 0;
+    h.addWindow(103);
+    await settle();
+    assert.equal(sink.cameraCalls.length, 0, 'free camera stays parked');
+    assert.deepEqual(sink.outputStackCalls.at(-1), { outputId: 0, ids: [103, 101, 102] });
+  }, { world: true });
+});
+
+test('world: zoom multiplies about the view center; pan scales by zoom', async () => {
+  await withCanvasPlugin(async (h) => {
+    const { rt, sink } = h;
+    await setupTwoIslands(h);
+    sink.cameraCalls.length = 0;
+
+    // From identity, halving the zoom keeps the view center: the origin
+    // shifts back by half the extra world the viewport now covers.
+    await rt.invokeAction('workspace.zoom', { factor: 0.5 });
+    assert.deepEqual(sink.cameraCalls.at(-1), { outputId: 0, x: -400, y: -300, zoom: 0.5 });
+
+    // A glass-px pan at zoom 0.5 moves twice the world distance.
+    await rt.invokeAction('workspace.pan', { dx: 100 });
+    assert.deepEqual(sink.cameraCalls.at(-1), { outputId: 0, x: -200, y: -300, zoom: 0.5 });
+  }, { world: true });
+});
+
+test('world: show and unfit exit free roaming', async () => {
+  await withCanvasPlugin(async (h) => {
+    const { rt, sink } = h;
+    await setupTwoIslands(h);
+    await rt.invokeAction('workspace.pan', { dx: 300, dy: 100 });
+    sink.cameraCalls.length = 0;
+
+    // show docks at the slot, stack collapses.
+    await call(rt, 'show', [2, 0]);
+    assert.deepEqual(sink.cameraCalls.at(-1), { outputId: 0, x: PITCH, y: 0, zoom: 1 });
+    assert.deepEqual(sink.outputStackCalls.at(-1), { outputId: 0, ids: [102] });
+
+    // Roam again, unfit docks back onto the shown workspace.
+    await rt.invokeAction('workspace.pan', { dx: -500 });
+    sink.cameraCalls.length = 0;
+    await rt.invokeAction('workspace.unfit', {});
+    assert.deepEqual(sink.cameraCalls.at(-1), { outputId: 0, x: PITCH, y: 0, zoom: 1 });
+    assert.deepEqual(sink.outputStackCalls.at(-1), { outputId: 0, ids: [102] });
+  }, { world: true });
+});
+
+test('world: bookmarks capture dock / fit / free framings and replay them', async () => {
+  await withCanvasPlugin(async (h) => {
+    const { rt, sink, wsEvents } = h;
+    await setupTwoIslands(h);
+
+    // Docked on ws1: an island bookmark. From ws2, going back is a show.
+    let r = await rt.invokeAction('workspace.bookmark-set', { name: 'home' });
+    assert.equal(r.kind, 'island');
+    await call(rt, 'show', [2, 0]);
+    wsEvents.length = 0;
+    await rt.invokeAction('workspace.bookmark-go', { name: 'home' });
+    assert.ok(wsEvents.some((e) => e.name === 'workspace.shown' && e.payload.index === 1));
+    assert.deepEqual(sink.cameraCalls.at(-1), { outputId: 0, x: 0, y: 0, zoom: 1 });
+
+    // Fitted: a range bookmark; going back re-fits.
+    await rt.invokeAction('workspace.fit', {});
+    r = await rt.invokeAction('workspace.bookmark-set', { name: 'both' });
+    assert.equal(r.kind, 'range');
+    await call(rt, 'show', [1, 0]);   // exit the fit
+    sink.cameraCalls.length = 0;
+    await rt.invokeAction('workspace.bookmark-go', { name: 'both' });
+    assert.deepEqual(sink.cameraCalls.at(-1), fitCam(2));
+    assert.deepEqual(sink.outputStackCalls.at(-1), { outputId: 0, ids: [101, 102] });
+
+    // Roaming: a free bookmark; going back restores the exact camera.
+    await rt.invokeAction('workspace.pan', { dx: 700, dy: -80 });
+    r = await rt.invokeAction('workspace.bookmark-set', { name: 'spot' });
+    assert.equal(r.kind, 'free');
+    await rt.invokeAction('workspace.unfit', {});
+    sink.cameraCalls.length = 0;
+    await rt.invokeAction('workspace.bookmark-go', { name: 'spot' });
+    const cam = sink.cameraCalls.at(-1);
+    assert.equal(cam.zoom, fitCam(2).zoom);
+    assert.equal(cam.x, 700 / fitCam(2).zoom);
+    assert.equal(cam.y, fitCam(2).y - 80 / fitCam(2).zoom);
+
+    // list + delete.
+    const list = await rt.invokeAction('workspace.bookmark-list', {});
+    assert.deepEqual(list.map((b) => b.name).sort(), ['both', 'home', 'spot']);
+    const del = await rt.invokeAction('workspace.bookmark-delete', { name: 'spot' });
+    assert.equal(del.deleted, true);
+    await assert.rejects(rt.invokeAction('workspace.bookmark-go', { name: 'spot' }),
+      /no bookmark/);
+  }, { world: true });
+});
+
+test('world: config-seeded bookmarks resolve at go time', async () => {
+  await withCanvasPlugin(async (h) => {
+    const { rt, sink, wsEvents } = h;
+    await setupTwoIslands(h);
+    wsEvents.length = 0;
+
+    await rt.invokeAction('workspace.bookmark-go', { name: 'two' });
+    assert.ok(wsEvents.some((e) => e.name === 'workspace.shown' && e.payload.index === 2),
+      'workspace-name bookmark is a show');
+
+    sink.cameraCalls.length = 0;
+    await rt.invokeAction('workspace.bookmark-go', { name: 'spot' });
+    assert.deepEqual(sink.cameraCalls.at(-1), { outputId: 0, x: 500, y: 0, zoom: 0.5 });
+
+    sink.cameraCalls.length = 0;
+    await rt.invokeAction('workspace.bookmark-go', { name: 'all' });
+    assert.deepEqual(sink.cameraCalls.at(-1), fitCam(2), 'range bookmark fits');
+  }, {
+    canvas: {
+      world: true,
+      bookmarks: [
+        { name: 'two', workspace: '2' },
+        { name: 'spot', x: 500, y: 0, zoom: 0.5 },
+        { name: 'all', start: 1 },
+      ],
+    },
+  });
 });
