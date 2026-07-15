@@ -160,7 +160,7 @@ async function withCanvasPlugin(fn, opts = {}) {
     await rt.waitForNamespace('workspace');
     await fn({
       rt, sink, wm, wsEvents, seatCalls, layoutSnapshots, animCalls, animPending,
-      pluginBus, seat,
+      pluginBus, seat, state,
       islands() { return layoutSnapshots.at(-1)?.islands ?? []; },
       addWindow(id, { place } = {}) {
         wm.addWindow(id, res(id));
@@ -539,6 +539,39 @@ test('world: fit frames the whole row (union stack + zoomed camera); registry un
     assert.deepEqual(sink.cameraCalls.at(-1), fitCam(2));
     const cur = await call(rt, 'current', [0]);
     assert.equal(cur.index, 1, 'shown workspace unchanged by fit');
+  }, { world: true });
+});
+
+test('world: fit centers within the workarea (reserved zones respected)', async () => {
+  await withCanvasPlugin(async (h) => {
+    const { rt, sink, state, addWindow } = h;
+    // A bar reserves the top 100px of the 800x600 output.
+    state.outputs = new Map([[0, {
+      logicalPosition: { x: 0, y: 0 },
+      logicalSize: { width: 800, height: 600 },
+    }]]);
+    state.reservedZones = {
+      effectiveRect: (_id, r) => ({
+        x: r.x, y: r.y + 100, width: r.width, height: r.height - 100,
+      }),
+    };
+    await setupTwoIslands(h);
+    sink.cameraCalls.length = 0;
+    void addWindow;
+
+    await rt.invokeAction('workspace.fit', {});
+    // Bounds 0..1728 x 0..600 framed into the 800x500 workarea at
+    // y=100: zoom fits the narrower axis; the bounds center maps to the
+    // workarea center (x 400, y 350) -- not the viewport center -- so
+    // the fitted world sits below the bar.
+    const boundsW = PITCH + 800;
+    const zoom = Math.min(800 / boundsW, 500 / 600);
+    assert.deepEqual(sink.cameraCalls.at(-1), {
+      outputId: 0,
+      x: boundsW / 2 - (0 + 400) / zoom,
+      y: 300 - (100 + 250) / zoom,
+      zoom,
+    });
   }, { world: true });
 });
 

@@ -87,6 +87,7 @@ export function createWindowsBroker(deps: WindowsBrokerDeps): WindowsBroker {
     if (method === "windows.set-islands") return handleSetIslands(params);
     if (method === "windows.begin-camera-pan") return handleBeginCameraPan(params);
     if (method === "windows.set-island-backdrops") return handleSetIslandBackdrops(params);
+    if (method === "windows.get-output-workarea") return handleGetOutputWorkarea(params);
     if (method === "windows.end-camera-pan") return handleEndCameraPan(params);
     if (method === "windows.focus") return handleFocus(params);
     if (method === "windows.request-focus-decision") return handleRequestFocusDecision(params);
@@ -365,6 +366,29 @@ export function createWindowsBroker(deps: WindowsBrokerDeps): WindowsBroker {
     // evaluator's transient per-frame ones, so a flight preempted
     // mid-motion reads its true starting point here.
     return state.outputCameras?.get(outputId) ?? { x: 0, y: 0, zoom: 1 };
+  }
+
+  // The output's usable area in global logical coords: its rect minus
+  // reserved zones (layer-shell exclusive bands). Camera policy centers
+  // overview framings in this rather than the full viewport, so a fitted
+  // world never hides under the bar.
+  function handleGetOutputWorkarea(
+    p: unknown,
+  ): { x: number; y: number; width: number; height: number } | null {
+    if (!p || typeof p !== "object"
+      || typeof (p as { outputId?: unknown }).outputId !== "number") {
+      throw new Error("windows.get-output-workarea: malformed payload");
+    }
+    const outputId = (p as { outputId: number }).outputId;
+    const o = state.outputs?.get(outputId);
+    if (!o) return null;
+    const rect = {
+      x: o.logicalPosition.x, y: o.logicalPosition.y,
+      width: o.logicalSize.width, height: o.logicalSize.height,
+    };
+    return state.reservedZones
+      ? state.reservedZones.effectiveRect(outputId, rect)
+      : rect;
   }
 
   function handleSetIslandBackdrops(p: unknown): null {

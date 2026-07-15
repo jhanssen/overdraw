@@ -561,6 +561,23 @@ export default async function init(
     number,
     Map<WorkspaceHandle, { x: number; y: number; width: number; height: number }>>();
   const lastCamByOutput = new Map<number, { x: number; y: number }>();
+  // Usable glass per output (viewport minus reserved zones, e.g. the
+  // bar's band), OUTPUT-LOCAL coords. Fit framings center in this so the
+  // overview never hides under the bar. Refreshed on publish and before
+  // each fit (zones change when bars map/unmap).
+  const workareaByOutput = new Map<
+    number, { x: number; y: number; width: number; height: number }>();
+  async function refreshWorkarea(outputId: number): Promise<void> {
+    const g = outputGeom.get(outputId);
+    if (!g) return;
+    try {
+      const wa = await sdk.windows.getOutputWorkarea(outputId);
+      if (wa) {
+        workareaByOutput.set(outputId,
+          { x: wa.x - g.x, y: wa.y - g.y, width: wa.width, height: wa.height });
+      }
+    } catch { /* broker without workarea support (harness): full viewport */ }
+  }
   // Outputs with a camera flight in progress, keyed to the flight's token.
   // While an output flies, publishWorld skips docking its camera (the
   // flight owns it); the settle step (or a preempting flight / an instant
@@ -656,11 +673,17 @@ export default async function init(
       maxY = Math.max(maxY, r.y + r.height);
     }
     if (minX === Infinity) return null;
+    // Frame within the WORKAREA (viewport minus reserved zones): the
+    // zoom fits the bounds into the usable glass, and the bounds center
+    // maps to the workarea's center -- not the viewport's -- so the
+    // fitted world sits below the bar instead of under it.
+    const wa = workareaByOutput.get(outputId)
+      ?? { x: 0, y: 0, width: g.width, height: g.height };
     const zoom = Math.min(
-      g.width / (maxX - minX), g.height / (maxY - minY), 1);
+      wa.width / (maxX - minX), wa.height / (maxY - minY), 1);
     return {
-      x: (minX + maxX) / 2 - (g.width / zoom) / 2 - g.x,
-      y: (minY + maxY) / 2 - (g.height / zoom) / 2 - g.y,
+      x: (minX + maxX) / 2 - g.x - (wa.x + wa.width / 2) / zoom,
+      y: (minY + maxY) / 2 - g.y - (wa.y + wa.height / 2) / zoom,
       zoom,
     };
   }
@@ -887,6 +910,12 @@ export default async function init(
       members: number[];
       layout?: { [k: string]: unknown };
     }> = [];
+    // Workareas first: the arrangement rebuild below must stay
+    // synchronous -- rowRectsByOutput is read by event handlers (drops,
+    // scroll), so it must never be observable half-built.
+    for (const outputId of state.positionsByOutput.keys()) {
+      await refreshWorkarea(outputId);
+    }
     rowRectsByOutput.clear();
     for (const [outputId, handles] of state.positionsByOutput) {
       const slots = resolveSlots(handles);
@@ -1304,6 +1333,9 @@ export default async function init(
       throw new Error(`${label}: output ${outputId} has unknown geometry`);
     }
     resolveSlots(positions);
+    // Zones move when bars map/unmap without a structural republish;
+    // re-read the workarea so the framing centers below a fresh bar.
+    await refreshWorkarea(outputId);
     const cam = fitCameraFor(outputId, live);
     if (!cam) {
       throw new Error(`${label}: no slot geometry for the range`);

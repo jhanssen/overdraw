@@ -222,6 +222,11 @@ export interface PluginWindows extends PluginWindowObserver {
   beginCameraPan(outputId: number): Promise<boolean>;
   endCameraPan(outputId: number): Promise<{ x: number; y: number; zoom: number }>;
 
+  // The output's usable area (rect minus reserved zones), global logical
+  // coords. Null for unknown outputs.
+  getOutputWorkarea(outputId: number):
+    Promise<{ x: number; y: number; width: number; height: number } | null>;
+
   // World-space translucent quads at the bottom of the content segment
   // (empty-island markers). Replaces the previous set; [] clears.
   setIslandBackdrops(list: ReadonlyArray<{
@@ -483,6 +488,20 @@ export function createPluginWindows(
         })),
       };
       await endpoint.request("windows.set-island-backdrops", payload);
+    },
+
+    async getOutputWorkarea(outputId): Promise<{ x: number; y: number; width: number; height: number } | null> {
+      if (typeof outputId !== "number") {
+        throw new TypeError("getOutputWorkarea outputId must be a number");
+      }
+      const r = await endpoint.request("windows.get-output-workarea", { outputId });
+      if (r === null) return null;
+      const w = r as { x?: unknown; y?: unknown; width?: unknown; height?: unknown };
+      if (typeof w?.x !== "number" || typeof w.y !== "number"
+        || typeof w.width !== "number" || typeof w.height !== "number") {
+        throw new TypeError("getOutputWorkarea: malformed broker reply");
+      }
+      return { x: w.x, y: w.y, width: w.width, height: w.height };
     },
 
     async beginCameraPan(outputId): Promise<boolean> {

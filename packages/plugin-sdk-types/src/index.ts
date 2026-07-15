@@ -103,6 +103,8 @@ export interface PluginWindowsLike {
     x: number; y: number; width: number; height: number;
     color: { r: number; g: number; b: number; a: number };
   }>): Promise<void>;
+  getOutputWorkarea(outputId: number):
+    Promise<{ x: number; y: number; width: number; height: number } | null>;
   setIslands(islands: ReadonlyArray<{
     id: number;
     contextOutputId: number;
