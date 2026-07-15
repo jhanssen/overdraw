@@ -225,3 +225,34 @@ test('setParams: combined gap + master deltas in a single call', async () => {
     assert.equal(snap.gap, 12);
   });
 });
+
+test('island layout hint { mode: "columns" } selects equal columns', async () => {
+  await withRuntime({}, async (rt) => {
+    await rt.load([bundledToResolved(layoutPluginSpec, layoutPluginSpec.module)]);
+    await rt.waitForNamespace('layout');
+
+    const inputs = {
+      output: { id: 0, rect: { x: 0, y: 0, width: 1000, height: 600 }, scale: 1 },
+      tileRegion: { x: 100, y: 0, width: 1200, height: 600 },
+      island: { id: 7, layout: { mode: 'columns' } },
+      windows: [
+        { id: 1, role: 'toplevel' },
+        { id: 2, role: 'toplevel' },
+        { id: 3, role: 'toplevel' },
+      ],
+      reason: 'mapped',
+    };
+    const r = await rt.invokeNamespace('layout', 'compute', [inputs]);
+    // Three equal full-height columns across the region, region-translated.
+    assert.deepEqual(r.rects.map((x) => x.outer), [
+      { x: 100, y: 0, width: 400, height: 600 },
+      { x: 500, y: 0, width: 400, height: 600 },
+      { x: 900, y: 0, width: 400, height: 600 },
+    ]);
+
+    // An unknown hint falls back to master-stack.
+    const fallback = await rt.invokeNamespace('layout', 'compute',
+      [{ ...inputs, island: { id: 7, layout: { mode: 'mystery' } } }]);
+    assert.equal(fallback.rects[0].outer.width, Math.round((1200) * 0.5));
+  });
+});

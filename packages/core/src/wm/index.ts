@@ -1586,6 +1586,9 @@ export function createWm(
       for (let j = 0; j < x.members.length; j++) {
         if (x.members[j] !== y.members[j]) return false;
       }
+      // Layout hints are small JSON-shaped values; structural compare via
+      // stringify (undefined on both sides compares equal).
+      if (JSON.stringify(x.layout) !== JSON.stringify(y.layout)) return false;
     }
     return true;
   }
@@ -1630,6 +1633,7 @@ export function createWm(
           id: isl.id, contextOutputId: isl.contextOutputId,
           rect: isl.rect ? { ...isl.rect } : null,
           members: [...isl.members],
+          ...(isl.layout !== undefined ? { layout: isl.layout } : {}),
         });
       }
     } else if (outputContent) {
@@ -1691,6 +1695,7 @@ export function createWm(
         id: i.id, contextOutputId: i.contextOutputId,
         rect: i.rect ? { ...i.rect } : null,
         members: [...i.members],
+        ...(i.layout !== undefined ? { layout: i.layout } : {}),
       }));
       if (islandsEqual(explicitIslands, next)) return false;
       explicitIslands = next;

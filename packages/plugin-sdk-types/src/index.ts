@@ -57,6 +57,16 @@ export interface WindowSnapshotLike {
   surfaceId: number;
   // null = unplaced (no layout pass has assigned an output yet).
   outputId: number | null;
+  // The window's outer rect in global logical (world) coordinates.
+  outer?: { x: number; y: number; width: number; height: number };
+  // Structural state the WM tracks per window. Optional so minimal test
+  // harnesses can fake snapshots; the core always provides it.
+  windowState?: {
+    tiling: string;
+    exclusive: string;
+    visible: boolean;
+    [k: string]: unknown;
+  };
   state: { [key: string]: unknown };
 }
 
@@ -91,9 +101,13 @@ export interface PluginWindowsLike {
     contextOutputId: number;
     rect: { x: number; y: number; width: number; height: number } | null;
     members: ReadonlyArray<number>;
+    // Per-island layout hint, passed through to the layout provider
+    // (layout-types documents the recognized shapes).
+    layout?: { [k: string]: unknown };
   }> | null): Promise<void>;
   requestFocusDecision(reason: FocusReason, trigger?: number): Promise<void>;
   list(): Promise<WindowSnapshotLike[]>;
+  get(id: number): Promise<WindowSnapshotLike | null>;
   onMap(cb: (ev: { surfaceId: number; outputId: number }) => void): void;
   onUnmap(cb: (ev: { surfaceId: number }) => void): void;
   // Reserve a band around the window's content (decoration providers).

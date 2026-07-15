@@ -98,7 +98,14 @@ export interface LayoutInputs {
   // Implicit per-output islands use the outputId as their island id.
   // Layouts that key persistent parameters (master fraction, column
   // widths) should key them per island id, not per output id.
-  island: { id: number };
+  //
+  // `layout` is an optional per-island hint set by the island source
+  // (the workspace-namespace plugin) and passed through verbatim.
+  // Providers that understand a hint honor it; others ignore it. The
+  // bundled plugin recognizes `{ mode: "columns" }` (equal full-height
+  // columns -- the shape an elastic strip wants) and defaults to
+  // master-stack otherwise.
+  island: { id: number; layout?: unknown };
   windows: ReadonlyArray<LayoutWindow>;
   reason: LayoutReason;
 }

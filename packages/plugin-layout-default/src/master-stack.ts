@@ -33,6 +33,34 @@ function clampRect(r: Rect): Rect {
   };
 }
 
+// Equal full-height columns, left to right in member order, separated by
+// gaps. The shape an elastic strip wants: the island source sizes the
+// region to N columns and this divides it evenly.
+export function columnsLayout(
+  windowCount: number,
+  output: { width: number; height: number },
+  gap = 0,
+): Rect[] {
+  if (windowCount <= 0) return [];
+
+  const g = Math.max(0, gap | 0);
+  const ax = g;
+  const ay = g;
+  const aw = Math.max(0, Math.max(0, output.width) - 2 * g);
+  const ah = Math.max(0, Math.max(0, output.height) - 2 * g);
+
+  const totalGap = (windowCount - 1) * g;
+  const colW = Math.floor((aw - totalGap) / windowCount);
+  const rects: Rect[] = [];
+  for (let i = 0; i < windowCount; i++) {
+    const x = ax + i * (colW + g);
+    // Last column absorbs the rounding remainder so the row fills exactly.
+    const w = i === windowCount - 1 ? ax + aw - x : colW;
+    rects.push(clampRect({ x, y: ay, width: w, height: ah }));
+  }
+  return rects;
+}
+
 // Compute the outer rect for each window in the given count, in master-front
 // order (index 0 = master; 1..n-1 fill the stack top-to-bottom).
 export function masterStackLayout(

@@ -103,3 +103,42 @@ test('DEFAULT_LAYOUT is 0.5 fraction, 0 gap', () => {
   assert.equal(DEFAULT_LAYOUT.masterFraction, 0.5);
   assert.equal(DEFAULT_LAYOUT.gap, 0);
 });
+
+// ---- columns (elastic strips) ---------------------------------------------
+
+test('columns: empty -> no rects', async () => {
+  const { columnsLayout } = await import('../../packages/plugin-layout-default/dist/master-stack.js');
+  assert.deepEqual(columnsLayout(0, OUT), []);
+});
+
+test('columns: N equal full-height columns, no gap', async () => {
+  const { columnsLayout } = await import('../../packages/plugin-layout-default/dist/master-stack.js');
+  const r = columnsLayout(4, OUT);
+  assert.equal(r.length, 4);
+  for (let i = 0; i < 4; i++) {
+    assert.deepEqual(r[i], { x: i * 250, y: 0, width: 250, height: 600 });
+  }
+});
+
+test('columns: gaps between and around; last column absorbs rounding', async () => {
+  const { columnsLayout } = await import('../../packages/plugin-layout-default/dist/master-stack.js');
+  const r = columnsLayout(3, OUT, 10);
+  assert.equal(r.length, 3);
+  // usable 980 wide; 2 inner gaps -> floor(960/3)=320 per column.
+  assert.deepEqual(r[0], { x: 10, y: 10, width: 320, height: 580 });
+  assert.deepEqual(r[1], { x: 340, y: 10, width: 320, height: 580 });
+  // last absorbs remainder: 10+980 - 670 = 320
+  assert.deepEqual(r[2], { x: 670, y: 10, width: 320, height: 580 });
+  // columns tile the row exactly
+  assert.equal(r[2].x + r[2].width, 10 + 980);
+});
+
+test('columns: degenerate tiny output stays finite and non-negative', async () => {
+  const { columnsLayout } = await import('../../packages/plugin-layout-default/dist/master-stack.js');
+  for (const n of [1, 3]) {
+    for (const r of columnsLayout(n, { width: 1, height: 1 }, 5)) {
+      assert.ok(Number.isFinite(r.x) && Number.isFinite(r.y));
+      assert.ok(r.width >= 0 && r.height >= 0);
+    }
+  }
+});

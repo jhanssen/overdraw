@@ -382,6 +382,7 @@ export function createWindowsBroker(deps: WindowsBrokerDeps): WindowsBroker {
       }
       const isl = raw as {
         id?: unknown; contextOutputId?: unknown; rect?: unknown; members?: unknown;
+        layout?: unknown;
       };
       if (typeof isl.id !== "number" || typeof isl.contextOutputId !== "number") {
         throw new Error(`windows.set-islands: islands[${i}] id/contextOutputId must be numbers`);
@@ -399,7 +400,15 @@ export function createWindowsBroker(deps: WindowsBrokerDeps): WindowsBroker {
         || !isl.members.every((m): m is number => typeof m === "number")) {
         throw new Error(`windows.set-islands: islands[${i}].members must be number[]`);
       }
-      return { id: isl.id, contextOutputId: isl.contextOutputId, rect, members: isl.members.slice() };
+      if (isl.layout !== undefined
+        && (typeof isl.layout !== "object" || isl.layout === null || Array.isArray(isl.layout))) {
+        throw new Error(`windows.set-islands: islands[${i}].layout must be an object`);
+      }
+      return {
+        id: isl.id, contextOutputId: isl.contextOutputId, rect,
+        members: isl.members.slice(),
+        ...(isl.layout !== undefined ? { layout: isl.layout } : {}),
+      };
     });
     wm.setIslands(parsed);
     return null;

@@ -59,6 +59,10 @@ export interface LayoutIsland {
   // Ordered member windows, master-front. The driver lays out EXACTLY
   // these windows in this order.
   members: ReadonlyArray<number>;
+  // Optional per-island layout hint, passed through verbatim to the
+  // layout plugin as LayoutInputs.island.layout (layout-types documents
+  // the recognized shapes). Absent = the provider's default algorithm.
+  layout?: unknown;
 }
 
 // Snapshot the driver needs from the WM to build LayoutInputs + run the
@@ -224,7 +228,10 @@ export function createLayoutDriver(deps: LayoutDriverDeps): LayoutDriver {
           const inputs: LayoutInputs = {
             output: { id: o.id, rect: outputRect, scale: o.scale },
             tileRegion,
-            island: { id: island.id },
+            island: {
+              id: island.id,
+              ...(island.layout !== undefined ? { layout: island.layout } : {}),
+            },
             windows: managed,
             reason,
           };

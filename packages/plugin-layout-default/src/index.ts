@@ -13,7 +13,9 @@ import type {
   LayoutAPI, LayoutInputs, LayoutResult, LayoutParamUpdate, LayoutParamSnapshot,
 } from "@overdraw/layout-types";
 import type { PluginSdkShape } from "@overdraw/plugin-sdk-types";
-import { masterStackLayout, DEFAULT_LAYOUT, type LayoutParams } from "./master-stack.js";
+import {
+  masterStackLayout, columnsLayout, DEFAULT_LAYOUT, type LayoutParams,
+} from "./master-stack.js";
 
 // Master-fraction bounds; matches the clamp masterStackLayout applies.
 const MASTER_MIN = 0.05;
@@ -51,18 +53,22 @@ export default async function init(sdk: PluginSdkShape, rawConfig?: unknown): Pr
 
   const api: LayoutAPI = {
     async compute(inputs: LayoutInputs): Promise<LayoutResult> {
-      // Master-stack only consumes window count + the working rect.
-      // layoutMode, layoutData, currentRect are ignored. Tiles are
-      // placed within `tileRegion` (the island's rect; for the implicit
-      // per-output island that is the output minus reserved zones); the
-      // core resolver dispatched non-managed presentations before we
-      // were called.
+      // Consumes window count + the working rect; layoutMode, layoutData,
+      // currentRect are ignored. Tiles are placed within `tileRegion`
+      // (the island's rect; for the implicit per-output island that is
+      // the output minus reserved zones); the core resolver dispatched
+      // non-managed presentations before we were called. The island's
+      // layout hint selects the algorithm: `{ mode: "columns" }` divides
+      // the region into equal full-height columns (elastic strips);
+      // default is master-stack.
       const region = inputs.tileRegion;
-      const rects = masterStackLayout(
-        inputs.windows.length,
-        { width: region.width, height: region.height },
-        params,
-      );
+      const hint = inputs.island?.layout;
+      const mode = (hint && typeof hint === "object")
+        ? (hint as { mode?: unknown }).mode : undefined;
+      const dims = { width: region.width, height: region.height };
+      const rects = mode === "columns"
+        ? columnsLayout(inputs.windows.length, dims, params.gap)
+        : masterStackLayout(inputs.windows.length, dims, params);
       return {
         rects: inputs.windows.map((w, i) => ({
           id: w.id,
