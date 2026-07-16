@@ -198,6 +198,20 @@ export interface PluginWindows extends PluginWindowObserver {
     members: ReadonlyArray<number>;
   }> | null): Promise<void>;
 
+  // The active layout provider's natural size for an island
+  // (LayoutAPI.measure; canvas-design.md §5 "Layout mode is declared;
+  // growth only sizes the region"). `windows` is the ordered id list of
+  // the members the layout would tile (the caller filters lanes: managed,
+  // non-exclusive, visible); `layout` is the island's declared layout
+  // hint, passed verbatim. Resolves null when the provider has no
+  // measure() -- the caller treats that as workarea-sized (inert growth).
+  measureIsland(inputs: {
+    islandId: number;
+    windows: ReadonlyArray<number>;
+    workarea: { width: number; height: number };
+    layout?: { [k: string]: unknown };
+  }): Promise<{ width: number; height: number } | null>;
+
   // Set the output's content camera (docs/canvas-design.md §4): the output
   // renders world-space content starting at (arrangement origin + (x, y)),
   // scaled by zoom (zoom < 1 shows more world, compositor-side optics
@@ -448,6 +462,33 @@ export function createPluginWindows(
         }
       }
       await endpoint.request("windows.set-islands", { islands });
+    },
+
+    async measureIsland(inputs): Promise<{ width: number; height: number } | null> {
+      if (!inputs || typeof inputs !== "object") {
+        throw new TypeError("measureIsland expects an inputs object");
+      }
+      if (typeof inputs.islandId !== "number") {
+        throw new TypeError("measureIsland islandId must be a number");
+      }
+      if (!Array.isArray(inputs.windows)
+        || !inputs.windows.every((w: unknown): w is number => typeof w === "number")) {
+        throw new TypeError("measureIsland windows must be number[]");
+      }
+      const wa = inputs.workarea;
+      if (!wa || typeof wa.width !== "number" || typeof wa.height !== "number") {
+        throw new TypeError("measureIsland workarea must be { width, height }");
+      }
+      const payload: { [k: string]: Json } = {
+        islandId: inputs.islandId,
+        windows: [...inputs.windows],
+        workarea: { width: wa.width, height: wa.height },
+      };
+      if (inputs.layout !== undefined) payload.layout = inputs.layout as Json;
+      const r = await endpoint.request("windows.measure-island", payload) as
+        { width?: unknown; height?: unknown } | null;
+      if (!r || typeof r.width !== "number" || typeof r.height !== "number") return null;
+      return { width: r.width, height: r.height };
     },
 
     async setOutputCamera(outputId, x, y, zoom = 1): Promise<void> {

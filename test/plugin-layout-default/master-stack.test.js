@@ -99,30 +99,42 @@ test('degenerate tiny output: no NaN/Infinity, non-negative sizes', () => {
   }
 });
 
-test('DEFAULT_LAYOUT is 0.5 fraction, 0 gap', () => {
+test('DEFAULT_LAYOUT is master-stack mode, 0.5 fractions, 0 gap', () => {
+  assert.equal(DEFAULT_LAYOUT.mode, 'master-stack');
   assert.equal(DEFAULT_LAYOUT.masterFraction, 0.5);
+  assert.equal(DEFAULT_LAYOUT.column, 0.5);
   assert.equal(DEFAULT_LAYOUT.gap, 0);
 });
 
-// ---- columns (elastic strips) ---------------------------------------------
+// ---- columns ---------------------------------------------------------------
 
 test('columns: empty -> no rects', async () => {
   const { columnsLayout } = await import('../../packages/plugin-layout-default/dist/master-stack.js');
-  assert.deepEqual(columnsLayout(0, OUT), []);
+  assert.deepEqual(columnsLayout([], OUT), []);
 });
 
-test('columns: N equal full-height columns, no gap', async () => {
+test('columns: equal weights -> N equal full-height columns, no gap', async () => {
   const { columnsLayout } = await import('../../packages/plugin-layout-default/dist/master-stack.js');
-  const r = columnsLayout(4, OUT);
+  const r = columnsLayout([1, 1, 1, 1], OUT);
   assert.equal(r.length, 4);
   for (let i = 0; i < 4; i++) {
     assert.deepEqual(r[i], { x: i * 250, y: 0, width: 250, height: 600 });
   }
 });
 
+test('columns: unequal weights split the region proportionally', async () => {
+  const { columnsLayout } = await import('../../packages/plugin-layout-default/dist/master-stack.js');
+  const r = columnsLayout([2, 1, 1], OUT);
+  assert.equal(r.length, 3);
+  assert.deepEqual(r[0], { x: 0, y: 0, width: 500, height: 600 });
+  assert.deepEqual(r[1], { x: 500, y: 0, width: 250, height: 600 });
+  // last absorbs the remainder; the row tiles exactly
+  assert.deepEqual(r[2], { x: 750, y: 0, width: 250, height: 600 });
+});
+
 test('columns: gaps between and around; last column absorbs rounding', async () => {
   const { columnsLayout } = await import('../../packages/plugin-layout-default/dist/master-stack.js');
-  const r = columnsLayout(3, OUT, 10);
+  const r = columnsLayout([1, 1, 1], OUT, 10);
   assert.equal(r.length, 3);
   // usable 980 wide; 2 inner gaps -> floor(960/3)=320 per column.
   assert.deepEqual(r[0], { x: 10, y: 10, width: 320, height: 580 });
@@ -136,9 +148,30 @@ test('columns: gaps between and around; last column absorbs rounding', async () 
 test('columns: degenerate tiny output stays finite and non-negative', async () => {
   const { columnsLayout } = await import('../../packages/plugin-layout-default/dist/master-stack.js');
   for (const n of [1, 3]) {
-    for (const r of columnsLayout(n, { width: 1, height: 1 }, 5)) {
+    for (const r of columnsLayout(Array(n).fill(1), { width: 1, height: 1 }, 5)) {
       assert.ok(Number.isFinite(r.x) && Number.isFinite(r.y));
       assert.ok(r.width >= 0 && r.height >= 0);
     }
   }
+});
+
+test('columns: a region pre-sized by columnsMeasure places columns at their natural px widths', async () => {
+  const { columnsLayout, columnsMeasure } =
+    await import('../../packages/plugin-layout-default/dist/master-stack.js');
+  const wa = { width: 1000, height: 600 };
+  const widthsPx = [500, 500, 750]; // fractions 0.5, 0.5, 0.75 of the workarea
+  const m = columnsMeasure(widthsPx, wa, 10);
+  // 2*10 outer + 2*10 inner + 1750 natural = 1790
+  assert.deepEqual(m, { width: 1790, height: 600 });
+  const r = columnsLayout(widthsPx, { width: m.width, height: m.height }, 10);
+  assert.deepEqual(r.map((c) => c.width), [500, 500, 750]);
+  assert.equal(r[2].x + r[2].width, 10 + (1790 - 20));
+});
+
+test('columnsMeasure: empty -> the workarea; few windows floor at the workarea', async () => {
+  const { columnsMeasure } = await import('../../packages/plugin-layout-default/dist/master-stack.js');
+  const wa = { width: 1000, height: 600 };
+  assert.deepEqual(columnsMeasure([], wa, 10), { width: 1000, height: 600 });
+  // one half-width column: natural 500 + 20 outer < workarea -> floor
+  assert.deepEqual(columnsMeasure([500], wa, 10), { width: 1000, height: 600 });
 });

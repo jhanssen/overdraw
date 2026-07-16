@@ -1,8 +1,15 @@
-// Bundled master-stack layout plugin. Registers in the 'layout' namespace
-// at priority 0 (the floor; bundled default). A user-installed third-party
-// layout plugin claiming the same namespace at a higher priority displaces
-// this one at runtime; if that plugin fails, the priority-chain promotes
-// this one back.
+// Bundled layout plugin: master-stack and columns modes. Registers in the
+// 'layout' namespace at priority 0 (the floor; bundled default). A
+// user-installed third-party layout plugin claiming the same namespace at a
+// higher priority displaces this one at runtime; if that plugin fails, the
+// priority-chain promotes this one back.
+//
+// Which mode tiles an island is declared (canvas-design.md §5 "Layout mode
+// is declared; growth only sizes the region"): `config.layout.mode` sets the
+// default, the island's layout hint overrides per island. Growth never
+// selects the algorithm -- it only changes the region compute() receives,
+// and measure() tells the island source what region an elastic island
+// wants.
 //
 // The SDK passed to init() comes from the plugin Worker's bootstrap. The
 // plugin's only responsibility is to call sdk.registerPlugin('layout', ...);
@@ -11,15 +18,22 @@
 
 import type {
   LayoutAPI, LayoutInputs, LayoutResult, LayoutParamUpdate, LayoutParamSnapshot,
+  MeasureInputs, MeasureResult,
 } from "@overdraw/layout-types";
 import type { PluginSdkShape } from "@overdraw/plugin-sdk-types";
 import {
-  masterStackLayout, columnsLayout, DEFAULT_LAYOUT, type LayoutParams,
+  masterStackLayout, columnsLayout, columnsMeasure, DEFAULT_LAYOUT,
+  type LayoutParams,
 } from "./master-stack.js";
 
 // Master-fraction bounds; matches the clamp masterStackLayout applies.
 const MASTER_MIN = 0.05;
 const MASTER_MAX = 0.95;
+
+// Column-width fraction bounds (of the workarea width). A column may span
+// the full workarea; narrower than a tenth stops being a usable tile.
+const COLUMN_MIN = 0.1;
+const COLUMN_MAX = 1;
 
 // Validate the raw config. Returns a populated LayoutParams; throws on
 // schema deviation. Missing fields take the DEFAULT_LAYOUT values.
@@ -30,6 +44,13 @@ function validateConfig(raw: unknown): LayoutParams {
   }
   const o = raw as { [k: string]: unknown };
   const out: LayoutParams = { ...DEFAULT_LAYOUT };
+  if (o.mode !== undefined) {
+    if (o.mode !== "master-stack" && o.mode !== "columns") {
+      throw new TypeError(
+        `layout.mode must be "master-stack" or "columns" (got ${JSON.stringify(o.mode)})`);
+    }
+    out.mode = o.mode;
+  }
   if (o.masterFraction !== undefined) {
     if (typeof o.masterFraction !== "number"
         || !Number.isFinite(o.masterFraction)
@@ -38,6 +59,15 @@ function validateConfig(raw: unknown): LayoutParams {
         `layout.masterFraction must be a finite number in [${MASTER_MIN}, ${MASTER_MAX}]`);
     }
     out.masterFraction = o.masterFraction;
+  }
+  if (o.column !== undefined) {
+    if (typeof o.column !== "number"
+        || !Number.isFinite(o.column)
+        || o.column < COLUMN_MIN || o.column > COLUMN_MAX) {
+      throw new TypeError(
+        `layout.column must be a finite number in [${COLUMN_MIN}, ${COLUMN_MAX}]`);
+    }
+    out.column = o.column;
   }
   if (o.gap !== undefined) {
     if (typeof o.gap !== "number" || !Number.isFinite(o.gap) || o.gap < 0) {
@@ -51,23 +81,60 @@ function validateConfig(raw: unknown): LayoutParams {
 export default async function init(sdk: PluginSdkShape, rawConfig?: unknown): Promise<void> {
   const params: LayoutParams = validateConfig(rawConfig);
 
+  // Per-window column-width fractions (of the workarea width), columns
+  // mode. Keyed by surface id so a width follows its window through
+  // reorders and across islands. ONLY user-resized windows appear here
+  // (grow-column / shrink-column): a window with no entry follows its
+  // island's effective column fraction, so re-declaring an island's
+  // layout re-sizes everything the user hasn't pinned by hand.
+  const colWidths = new Map<number, number>();
+  // The island column fraction each window was last laid out at -- the
+  // base a resize starts from, since setParams carries no island
+  // context. Written by compute/measure, never a user value.
+  const lastSeed = new Map<number, number>();
+  sdk.windows.onUnmap((ev) => {
+    colWidths.delete(ev.surfaceId);
+    lastSeed.delete(ev.surfaceId);
+  });
+
+  // The effective mode + default column fraction for one island: the
+  // declared hint wins over the configured default. Unknown hint shapes
+  // fall back to the config (a provider ignores hints it doesn't
+  // understand).
+  function islandParams(hint: unknown): { mode: LayoutParams["mode"]; column: number } {
+    let mode = params.mode;
+    let column = params.column;
+    if (hint !== null && typeof hint === "object") {
+      const h = hint as { mode?: unknown; column?: unknown };
+      if (h.mode === "master-stack" || h.mode === "columns") mode = h.mode;
+      if (typeof h.column === "number" && Number.isFinite(h.column)) {
+        column = Math.min(COLUMN_MAX, Math.max(COLUMN_MIN, h.column));
+      }
+    }
+    return { mode, column };
+  }
+
+  function widthOf(id: number, islandColumn: number): number {
+    lastSeed.set(id, islandColumn);
+    return colWidths.get(id) ?? islandColumn;
+  }
+
   const api: LayoutAPI = {
     async compute(inputs: LayoutInputs): Promise<LayoutResult> {
-      // Consumes window count + the working rect; layoutMode, layoutData,
-      // currentRect are ignored. Tiles are placed within `tileRegion`
-      // (the island's rect; for the implicit per-output island that is
-      // the output minus reserved zones); the core resolver dispatched
-      // non-managed presentations before we were called. The island's
-      // layout hint selects the algorithm: `{ mode: "columns" }` divides
-      // the region into equal full-height columns (elastic strips);
-      // default is master-stack.
+      // Consumes the window ids + the working rect; layoutMode,
+      // layoutData, currentRect are ignored. Tiles are placed within
+      // `tileRegion` (the island's rect; for the implicit per-output
+      // island that is the output minus reserved zones); the core
+      // resolver dispatched non-managed presentations before we were
+      // called. Columns scale to fill the region, so a region sized by
+      // measure() gives each its natural width and a workarea-sized one
+      // compresses them proportionally.
       const region = inputs.tileRegion;
-      const hint = inputs.island?.layout;
-      const mode = (hint && typeof hint === "object")
-        ? (hint as { mode?: unknown }).mode : undefined;
+      const { mode, column } = islandParams(inputs.island?.layout);
       const dims = { width: region.width, height: region.height };
       const rects = mode === "columns"
-        ? columnsLayout(inputs.windows.length, dims, params.gap)
+        ? columnsLayout(
+            inputs.windows.map((w) => widthOf(w.id, column)), dims, params.gap)
         : masterStackLayout(inputs.windows.length, dims, params);
       return {
         rects: inputs.windows.map((w, i) => ({
@@ -94,7 +161,35 @@ export default async function init(sdk: PluginSdkShape, rawConfig?: unknown): Pr
           && Number.isFinite(update.gapDelta)) {
         params.gap = Math.max(0, params.gap + update.gapDelta);
       }
-      return { masterFraction: params.masterFraction, gap: params.gap };
+      if (typeof update?.widthDelta === "number"
+          && Number.isFinite(update.widthDelta)
+          && typeof update?.surfaceId === "number") {
+        // Resize from what the window currently shows: its own pinned
+        // width, else the island fraction it was last laid out at.
+        const cur = colWidths.get(update.surfaceId)
+          ?? lastSeed.get(update.surfaceId)
+          ?? params.column;
+        colWidths.set(update.surfaceId, Math.min(COLUMN_MAX,
+          Math.max(COLUMN_MIN, cur + update.widthDelta)));
+      }
+      return {
+        masterFraction: params.masterFraction,
+        gap: params.gap,
+        column: params.column,
+      };
+    },
+
+    async measure(inputs: MeasureInputs): Promise<MeasureResult> {
+      const wa = inputs.workarea;
+      const { mode, column } = islandParams(inputs.island?.layout);
+      if (mode !== "columns") {
+        // Master-stack always fits its region; its natural size IS the
+        // workarea (growth is inert -- canvas-design.md §5).
+        return { width: wa.width, height: wa.height };
+      }
+      const widthsPx = inputs.windows.map(
+        (w) => widthOf(w.id, column) * wa.width);
+      return columnsMeasure(widthsPx, wa, params.gap);
     },
   };
 
@@ -102,7 +197,7 @@ export default async function init(sdk: PluginSdkShape, rawConfig?: unknown): Pr
   // ResolvedPlugin.bundled is true). Pass undefined here so the runtime's
   // default applies; an explicit value would shadow the bundled marker.
   await sdk.registerPlugin("layout", () => api);
-  sdk.log(`master-stack layout registered (masterFraction=${params.masterFraction}, gap=${params.gap})`);
+  sdk.log(`layout registered (mode=${params.mode}, masterFraction=${params.masterFraction}, column=${params.column}, gap=${params.gap})`);
 }
 
 // Re-export the user-facing config type so plugin authors can

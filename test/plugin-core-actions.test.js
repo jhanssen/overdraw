@@ -97,6 +97,26 @@ test('layout.grow-master / shrink-master emit signed master-fraction deltas', as
   assert.equal(shrink[1].delta, -grow[1].delta, 'shrink delta is the negated grow delta');
 });
 
+test('layout.grow-column / shrink-column emit signed per-window width deltas', async () => {
+  const { sdk, handlers, emitted } = makeSdk();
+  await init(sdk);
+  // No surfaceId: the launcher resolves the focused window.
+  await handlers.get('layout.grow-column')();
+  const grow = emitted.at(-1);
+  assert.equal(grow[0], 'layout.column-width-requested');
+  assert.ok(grow[1].delta > 0, 'grow delta is positive');
+  assert.equal(grow[1].surfaceId, undefined, 'omitted target stays unresolved here');
+
+  await handlers.get('layout.shrink-column')({ surfaceId: 42 });
+  const shrink = emitted.at(-1);
+  assert.equal(shrink[0], 'layout.column-width-requested');
+  assert.equal(shrink[1].delta, -grow[1].delta, 'shrink delta is the negated grow delta');
+  assert.equal(shrink[1].surfaceId, 42, 'explicit target rides the request');
+
+  await assert.rejects(
+    handlers.get('layout.grow-column')({ surfaceId: 'nope' }), /surfaceId/);
+});
+
 test('output.switch-mode emits a request with output + dims + refresh', async () => {
   const { sdk, handlers, emitted } = makeSdk();
   await init(sdk);

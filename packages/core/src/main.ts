@@ -951,6 +951,13 @@ const windowsBroker = createWindowsBroker({
   wm: state.wm, compositor, state, pluginBus, bus,
   closingDriver, openingDriver,
   interceptBroker: interceptBrokerForWindows,
+  // Late-bound: `runtime` is created after the broker. Reads the live
+  // binding at call time (measure-island arrives well after startup).
+  invokeLayout: (method, args) => {
+    if (!runtime) return Promise.reject(new Error("plugin runtime not up"));
+    return runtime.invokeNamespace("layout", method,
+      args as import("./plugins/protocol.js").Json[]);
+  },
 });
 
 // Animation evaluator + broker (core-plugin-api.md §9). The evaluator
@@ -1379,29 +1386,50 @@ pluginBus.subscribe("layout.reorder-requested", (_n, payload) => {
     });
 });
 
+// Apply one LayoutParamUpdate to the active layout plugin, then relayout
+// and announce the change ('layout.params-changed') so an island source
+// that sizes islands from layout measure() (elastic strips) re-measures
+// and republishes.
+function applyLayoutParams(update: { [k: string]: number }): void {
+  if (!runtime) return;
+  void runtime.invokeNamespace("layout", "setParams", [update])
+    .then(() => {
+      state?.relayout?.("param-changed");
+      pluginBus.emit("layout.params-changed", {});
+    })
+    .catch((e: unknown) => {
+      log.warn("core", `layout.setParams failed: ${(e as Error).message}`);
+    });
+}
+
 // The layout.grow-master / shrink-master actions emit this; route the
 // relative delta to the active layout plugin's setParams and relayout.
 // No-op (logged) if the active layout plugin doesn't implement setParams.
 pluginBus.subscribe("layout.master-fraction-requested", (_n, payload) => {
   const delta = (payload as { delta?: unknown }).delta;
-  if (typeof delta !== "number" || !runtime) return;
-  void runtime.invokeNamespace("layout", "setParams", [{ masterFractionDelta: delta }])
-    .then(() => { state?.relayout?.("param-changed"); })
-    .catch((e: unknown) => {
-      log.warn("core", `layout.setParams failed: ${(e as Error).message}`);
-    });
+  if (typeof delta !== "number") return;
+  applyLayoutParams({ masterFractionDelta: delta });
 });
 
 // The layout.grow-gap / shrink-gap actions emit this; route to the
 // active layout plugin's setParams.
 pluginBus.subscribe("layout.gap-requested", (_n, payload) => {
   const delta = (payload as { delta?: unknown }).delta;
-  if (typeof delta !== "number" || !runtime) return;
-  void runtime.invokeNamespace("layout", "setParams", [{ gapDelta: delta }])
-    .then(() => { state?.relayout?.("param-changed"); })
-    .catch((e: unknown) => {
-      log.warn("core", `layout.setParams failed: ${(e as Error).message}`);
-    });
+  if (typeof delta !== "number") return;
+  applyLayoutParams({ gapDelta: delta });
+});
+
+// The layout.grow-column / shrink-column actions emit this; resolve the
+// target window (explicit surfaceId, else the keyboard focus) and route
+// the per-window width delta to the active layout plugin's setParams.
+pluginBus.subscribe("layout.column-width-requested", (_n, payload) => {
+  const p = payload as { delta?: unknown; surfaceId?: unknown };
+  if (typeof p.delta !== "number") return;
+  const surfaceId = typeof p.surfaceId === "number"
+    ? p.surfaceId
+    : state?.seat?.kbFocus?.surfaceId;
+  if (typeof surfaceId !== "number") return;
+  applyLayoutParams({ surfaceId, widthDelta: p.delta });
 });
 
 // KMS mode switch. Resolves the durable identifier (EDID id or connector

@@ -236,8 +236,9 @@ only decides what region the algorithm receives. The two compose:
 Config: `layout: { mode: "master-stack" | "columns", gap }` plus
 mode-specific params — `masterFraction` (master-stack) or `column`, the
 default column-width fraction (columns). `canvas.workspaces[].layout`
-overrides per name; `workspace.set-layout {index?, output?, mode}`
-switches one island at runtime. `workspace.set-elastic` stays pure
+(`{ mode, column? }`) overrides per name; `workspace.set-layout
+{index?, output?, mode?, column?}` overrides one island at runtime
+(omit `mode` to clear the override). `workspace.set-elastic` stays pure
 growth (boolean only — the `{ column }` form retires into the layout
 config, with no compatibility sugar; `canvas.elastic` sets the growth
 default and nothing else).

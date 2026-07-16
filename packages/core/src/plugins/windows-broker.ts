@@ -15,6 +15,7 @@ import type {
 import type { CompositorState, CompositorSink } from "../protocols/ctx.js";
 import { rebuildStackWithPopups } from "../protocols/xdg_popup.js";
 import { FOCUS_REASONS } from "@overdraw/focus-types";
+import { log } from "../log.js";
 
 const TILINGS: ReadonlyArray<Tiling> = ["managed", "floating"];
 const EXCLUSIVES: ReadonlyArray<Exclusive> = ["none", "maximized", "fullscreen"];
@@ -58,6 +59,12 @@ export interface WindowsBrokerDeps {
   // target surface. Optional: when absent (a configuration without
   // intercept support), windows.set-insets always rejects.
   interceptBroker?: { pluginNameForSurface(surfaceId: number): string | undefined };
+  // Invoke a method on the active layout-namespace plugin.
+  // windows.measure-island routes through this so an island source can
+  // size elastic islands from the layout's natural size
+  // (canvas-design.md §5). Optional: when absent, measure-island
+  // resolves null (islands stay workarea-sized).
+  invokeLayout?: (method: string, args: unknown[]) => Promise<unknown>;
 }
 
 // The shape main.ts plugs into its onRequest chain. Returns the result for
@@ -85,6 +92,7 @@ export function createWindowsBroker(deps: WindowsBrokerDeps): WindowsBroker {
     if (method === "windows.set-output-camera") return handleSetOutputCamera(params);
     if (method === "windows.get-output-camera") return handleGetOutputCamera(params);
     if (method === "windows.set-islands") return handleSetIslands(params);
+    if (method === "windows.measure-island") return handleMeasureIsland(params);
     if (method === "windows.begin-camera-pan") return handleBeginCameraPan(params);
     if (method === "windows.set-island-backdrops") return handleSetIslandBackdrops(params);
     if (method === "windows.get-output-workarea") return handleGetOutputWorkarea(params);
@@ -515,6 +523,58 @@ export function createWindowsBroker(deps: WindowsBrokerDeps): WindowsBroker {
     });
     wm.setIslands(parsed);
     return null;
+  }
+
+  // The active layout plugin's natural size for an island's would-be
+  // members (LayoutAPI.measure). Resolves null when no layout invoker is
+  // wired, the provider has no measure(), or measure throws -- the caller
+  // treats null as "workarea-sized" so a missing measure degrades to
+  // inert growth, never an error.
+  async function handleMeasureIsland(p: unknown): Promise<{ width: number; height: number } | null> {
+    if (!p || typeof p !== "object") {
+      throw new Error("windows.measure-island: malformed payload");
+    }
+    const q = p as {
+      islandId?: unknown; windows?: unknown; workarea?: unknown; layout?: unknown;
+    };
+    if (typeof q.islandId !== "number") {
+      throw new Error("windows.measure-island: islandId must be a number");
+    }
+    if (!Array.isArray(q.windows)
+      || !q.windows.every((w): w is number => typeof w === "number")) {
+      throw new Error("windows.measure-island: windows must be number[]");
+    }
+    const wa = q.workarea as { width?: unknown; height?: unknown } | null | undefined;
+    if (!wa || typeof wa.width !== "number" || typeof wa.height !== "number") {
+      throw new Error("windows.measure-island: workarea must be { width, height }");
+    }
+    if (q.layout !== undefined
+      && (typeof q.layout !== "object" || q.layout === null || Array.isArray(q.layout))) {
+      throw new Error("windows.measure-island: layout must be an object");
+    }
+    if (!deps.invokeLayout) return null;
+    const inputs = {
+      windows: q.windows.map((id) => ({ id })),
+      workarea: { width: wa.width, height: wa.height },
+      island: {
+        id: q.islandId,
+        ...(q.layout !== undefined ? { layout: q.layout } : {}),
+      },
+    };
+    try {
+      const r = await deps.invokeLayout("measure", [inputs]) as
+        { width?: unknown; height?: unknown } | null | undefined;
+      if (!r || typeof r.width !== "number" || typeof r.height !== "number") return null;
+      return { width: r.width, height: r.height };
+    } catch (e: unknown) {
+      // A provider without measure() is a supported configuration (growth
+      // goes inert), but it is indistinguishable here from a provider whose
+      // measure() is broken -- log so the latter isn't a silent
+      // never-grows.
+      log.debug("core",
+        `windows.measure-island: layout measure failed: ${(e as Error).message}`);
+      return null;
+    }
   }
 
   async function handlePropose(p: unknown): Promise<unknown> {

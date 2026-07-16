@@ -114,6 +114,16 @@ export interface PluginWindowsLike {
     // (layout-types documents the recognized shapes).
     layout?: { [k: string]: unknown };
   }> | null): Promise<void>;
+  // The active layout provider's natural size for an island
+  // (LayoutAPI.measure). `windows` lists the member ids the layout would
+  // tile (caller filters lanes). Null when the provider has no measure()
+  // -- treat as workarea-sized (inert growth).
+  measureIsland(inputs: {
+    islandId: number;
+    windows: ReadonlyArray<number>;
+    workarea: { width: number; height: number };
+    layout?: { [k: string]: unknown };
+  }): Promise<{ width: number; height: number } | null>;
   requestFocusDecision(reason: FocusReason, trigger?: number): Promise<void>;
   list(): Promise<WindowSnapshotLike[]>;
   get(id: number): Promise<WindowSnapshotLike | null>;

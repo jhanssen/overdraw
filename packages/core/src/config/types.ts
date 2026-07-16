@@ -116,9 +116,10 @@ export interface OverdrawConfig {
   // and write `decoration: cfg satisfies DecorationPluginConfig`.
   decoration?: unknown;
   // Bundled-plugin config slice for the 'layout' namespace. Same verbatim
-  // pass-through pattern: the bundled master-stack layout plugin owns the
-  // schema (`LayoutPluginConfig` from `@overdraw/layout-types`: optional
-  // `masterFraction` in [0.05, 0.95] and `gap` in px). For typed editing
+  // pass-through pattern: the bundled layout plugin owns the schema
+  // (`LayoutPluginConfig` from `@overdraw/layout-types`: optional `mode`
+  // ("master-stack" | "columns"), `masterFraction` in [0.05, 0.95],
+  // `column` in [0.1, 1], and `gap` in px). For typed editing
   // users may
   // `import type { LayoutPluginConfig } from "@overdraw/layout-types"`
   // and write `layout: cfg satisfies LayoutPluginConfig`.

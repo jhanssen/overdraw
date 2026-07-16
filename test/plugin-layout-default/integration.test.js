@@ -191,6 +191,176 @@ test('init config: invalid masterFraction puts the plugin in failed state', asyn
   });
 });
 
+// ---- declared mode + columns (canvas-design.md §5) -----------------------
+
+const COLS_INPUTS = {
+  output: { id: 0, rect: { x: 0, y: 0, width: 1000, height: 600 }, scale: 1 },
+  tileRegion: { x: 0, y: 0, width: 1000, height: 600 },
+  island: { id: 7 },
+  windows: [{ id: 1, role: 'toplevel' }, { id: 2, role: 'toplevel' }],
+  reason: 'mapped',
+};
+
+test('init config: mode "columns" tiles equal full-height columns', async () => {
+  await withRuntime({}, async (rt) => {
+    await rt.load([
+      bundledToResolved(layoutPluginSpec, layoutPluginSpec.module,
+        { layout: { mode: 'columns' } }),
+    ]);
+    await rt.waitForNamespace('layout');
+    const r = await rt.invokeNamespace('layout', 'compute', [COLS_INPUTS]);
+    // Two 0.5 columns proportionally fill the 1000px region: no master.
+    assert.deepEqual(r.rects.find((x) => x.id === 1).outer,
+      { x: 0, y: 0, width: 500, height: 600 });
+    assert.deepEqual(r.rects.find((x) => x.id === 2).outer,
+      { x: 500, y: 0, width: 500, height: 600 });
+  });
+});
+
+test('init config: invalid mode puts the plugin in failed state', async () => {
+  const logs = [];
+  await withRuntime({ log: (m) => logs.push(m) }, async (rt) => {
+    await rt.load([
+      bundledToResolved(layoutPluginSpec, layoutPluginSpec.module,
+        { layout: { mode: 'dwindle' } }),
+    ]);
+    assert.equal(rt.states()[0].state, 'failed');
+    assert.ok(logs.some((l) => l.includes('init failed') && l.includes('layout.mode')),
+      `expected layout.mode error in logs; got: ${logs.join('\n')}`);
+  });
+});
+
+test('island hint overrides the configured default mode, per island', async () => {
+  await withRuntime({}, async (rt) => {
+    // Config default master-stack; the island declares columns.
+    await rt.load([bundledToResolved(layoutPluginSpec, layoutPluginSpec.module)]);
+    await rt.waitForNamespace('layout');
+
+    const declared = { ...COLS_INPUTS, island: { id: 7, layout: { mode: 'columns' } } };
+    const cols = await rt.invokeNamespace('layout', 'compute', [declared]);
+    assert.deepEqual(cols.rects.find((x) => x.id === 1).outer,
+      { x: 0, y: 0, width: 500, height: 600 });
+
+    // A different island with no hint still gets the configured default.
+    const ms = await rt.invokeNamespace('layout', 'compute',
+      [{ ...COLS_INPUTS, island: { id: 8 } }]);
+    // master-stack(2) at fraction 0.5 is also 500/500 -- distinguish by
+    // growing the master, which columns mode ignores.
+    await rt.invokeNamespace('layout', 'setParams', [{ masterFractionDelta: 0.2 }]);
+    const ms2 = await rt.invokeNamespace('layout', 'compute',
+      [{ ...COLS_INPUTS, island: { id: 8 } }]);
+    assert.equal(ms.rects.find((x) => x.id === 1).outer.width, 500);
+    assert.equal(ms2.rects.find((x) => x.id === 1).outer.width, 700,
+      'master-stack island honors masterFraction');
+    const cols2 = await rt.invokeNamespace('layout', 'compute', [declared]);
+    assert.equal(cols2.rects.find((x) => x.id === 1).outer.width, 500,
+      'columns island is unaffected by masterFraction');
+  });
+});
+
+test('measure: columns natural size grows with members; master-stack is inert', async () => {
+  await withRuntime({}, async (rt) => {
+    await rt.load([
+      bundledToResolved(layoutPluginSpec, layoutPluginSpec.module,
+        { layout: { mode: 'columns' } }),
+    ]);
+    await rt.waitForNamespace('layout');
+    const wa = { width: 1000, height: 600 };
+    const measure = (windows, layout) => rt.invokeNamespace('layout', 'measure',
+      [{ windows, workarea: wa, island: { id: 7, ...(layout ? { layout } : {}) } }]);
+
+    // 2 x 500 = 1000 -> exactly the workarea.
+    assert.deepEqual(await measure([{ id: 1 }, { id: 2 }]), { width: 1000, height: 600 });
+    // 3 x 500 = 1500 -> grown.
+    assert.deepEqual(await measure([{ id: 1 }, { id: 2 }, { id: 3 }]),
+      { width: 1500, height: 600 });
+    // Empty measures to the workarea, never smaller.
+    assert.deepEqual(await measure([]), { width: 1000, height: 600 });
+    // A master-stack island always fits: growth is inert.
+    assert.deepEqual(
+      await measure([{ id: 1 }, { id: 2 }, { id: 3 }], { mode: 'master-stack' }),
+      { width: 1000, height: 600 });
+  });
+});
+
+test('setParams: widthDelta resizes ONE window\'s column; others keep the default', async () => {
+  await withRuntime({}, async (rt) => {
+    await rt.load([
+      bundledToResolved(layoutPluginSpec, layoutPluginSpec.module,
+        { layout: { mode: 'columns' } }),
+    ]);
+    await rt.waitForNamespace('layout');
+
+    const snap = await rt.invokeNamespace('layout', 'setParams',
+      [{ surfaceId: 1, widthDelta: 0.25 }]);
+    assert.equal(snap.column, 0.5, 'the default seed is untouched by a per-window resize');
+
+    // Window 1 is now 0.75 wide, window 2 stays 0.5: the region splits 0.6/0.4.
+    const r = await rt.invokeNamespace('layout', 'compute', [COLS_INPUTS]);
+    assert.equal(r.rects.find((x) => x.id === 1).outer.width, 600);
+    assert.equal(r.rects.find((x) => x.id === 2).outer.width, 400);
+
+    // And the natural size reflects the wider column: 750 + 500 = 1250.
+    const m = await rt.invokeNamespace('layout', 'measure',
+      [{ windows: [{ id: 1 }, { id: 2 }], workarea: { width: 1000, height: 600 },
+         island: { id: 7 } }]);
+    assert.deepEqual(m, { width: 1250, height: 600 });
+  });
+});
+
+test('setParams: column width clamps to [0.1, 1] and accumulates', async () => {
+  await withRuntime({}, async (rt) => {
+    await rt.load([
+      bundledToResolved(layoutPluginSpec, layoutPluginSpec.module,
+        { layout: { mode: 'columns' } }),
+    ]);
+    await rt.waitForNamespace('layout');
+    const measure1 = async () => (await rt.invokeNamespace('layout', 'measure',
+      [{ windows: [{ id: 1 }], workarea: { width: 1000, height: 600 },
+         island: { id: 7 } }])).width;
+
+    await rt.invokeNamespace('layout', 'setParams', [{ surfaceId: 1, widthDelta: 10 }]);
+    assert.equal(await measure1(), 1000, 'clamped to a full-workarea column');
+    await rt.invokeNamespace('layout', 'setParams', [{ surfaceId: 1, widthDelta: -10 }]);
+    // 0.1 x 1000 = 100 natural, floored at the workarea by measure.
+    assert.equal(await measure1(), 1000);
+    // Two accumulating steps from the 0.1 floor: 0.1 + 0.05 + 0.05 = 0.2.
+    await rt.invokeNamespace('layout', 'setParams', [{ surfaceId: 1, widthDelta: 0.05 }]);
+    await rt.invokeNamespace('layout', 'setParams', [{ surfaceId: 1, widthDelta: 0.05 }]);
+    const r = await rt.invokeNamespace('layout', 'compute',
+      [{ ...COLS_INPUTS, windows: [{ id: 1, role: 'toplevel' }, { id: 2, role: 'toplevel' }] }]);
+    // Weights 0.2 / 0.5 -> 2/7 and 5/7 of 1000.
+    assert.equal(r.rects.find((x) => x.id === 1).outer.width, 285);
+  });
+});
+
+test('an unresized window follows its island declaration; a resized one pins', async () => {
+  await withRuntime({}, async (rt) => {
+    await rt.load([
+      bundledToResolved(layoutPluginSpec, layoutPluginSpec.module,
+        { layout: { mode: 'columns' } }),
+    ]);
+    await rt.waitForNamespace('layout');
+    const wa = { width: 1000, height: 600 };
+    const measure = (layout) => rt.invokeNamespace('layout', 'measure',
+      [{ windows: [{ id: 1 }, { id: 2 }], workarea: wa,
+         island: { id: 7, ...(layout ? { layout } : {}) } }]);
+
+    // Both windows follow the island's declared column fraction: a
+    // re-declaration re-sizes them (0.75 each -> 1500 natural).
+    assert.deepEqual(await measure({ mode: 'columns', column: 0.75 }),
+      { width: 1500, height: 600 });
+
+    // Pin window 1 by hand: the resize starts from what it last showed
+    // (0.75), not the provider default -- 0.75 + 0.25 = 1.0.
+    await rt.invokeNamespace('layout', 'setParams', [{ surfaceId: 1, widthDelta: 0.25 }]);
+    // Re-declaring the island to 0.5 moves window 2 only; window 1 holds
+    // its pinned full-width column: 1000 + 500 = 1500.
+    assert.deepEqual(await measure({ mode: 'columns', column: 0.5 }),
+      { width: 1500, height: 600 });
+  });
+});
+
 // ---- setParams: gap delta -----------------------------------------------
 
 test('setParams: gapDelta grows the gap', async () => {

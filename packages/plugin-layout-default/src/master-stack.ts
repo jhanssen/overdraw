@@ -12,14 +12,20 @@
 import type { Rect } from "@overdraw/layout-types";
 
 export interface LayoutParams {
+  // Which algorithm tiles an island when its hint doesn't override it.
+  mode: "master-stack" | "columns";
   // Fraction of output width given to the master column when 2+ windows exist.
   masterFraction: number;
+  // Default column-width fraction of the workarea width (columns mode).
+  column: number;
   // Gap (output px) between tiles and around the outer edge.
   gap: number;
 }
 
 export const DEFAULT_LAYOUT: LayoutParams = {
+  mode: "master-stack",
   masterFraction: 0.5,
+  column: 0.5,
   gap: 0,
 };
 
@@ -33,32 +39,61 @@ function clampRect(r: Rect): Rect {
   };
 }
 
-// Equal full-height columns, left to right in member order, separated by
-// gaps. The shape an elastic strip wants: the island source sizes the
-// region to N columns and this divides it evenly.
+// One full-height column per window, left to right in member order,
+// separated by gaps. `weights` carries each window's relative column
+// width; columns are scaled proportionally so they exactly fill the
+// region. A region pre-sized by columnsMeasure from the same weights
+// scales by ~1 (columns land at their natural widths); a fixed
+// workarea-sized region compresses or stretches them proportionally.
 export function columnsLayout(
-  windowCount: number,
-  output: { width: number; height: number },
+  weights: ReadonlyArray<number>,
+  region: { width: number; height: number },
   gap = 0,
 ): Rect[] {
-  if (windowCount <= 0) return [];
+  const n = weights.length;
+  if (n <= 0) return [];
 
   const g = Math.max(0, gap | 0);
   const ax = g;
   const ay = g;
-  const aw = Math.max(0, Math.max(0, output.width) - 2 * g);
-  const ah = Math.max(0, Math.max(0, output.height) - 2 * g);
+  const aw = Math.max(0, Math.max(0, region.width) - 2 * g);
+  const ah = Math.max(0, Math.max(0, region.height) - 2 * g);
 
-  const totalGap = (windowCount - 1) * g;
-  const colW = Math.floor((aw - totalGap) / windowCount);
+  const avail = Math.max(0, aw - (n - 1) * g);
+  let total = 0;
+  for (const w of weights) total += Math.max(1e-6, w);
+  const scale = total > 0 ? avail / total : 0;
   const rects: Rect[] = [];
-  for (let i = 0; i < windowCount; i++) {
-    const x = ax + i * (colW + g);
+  let x = ax;
+  for (let i = 0; i < n; i++) {
     // Last column absorbs the rounding remainder so the row fills exactly.
-    const w = i === windowCount - 1 ? ax + aw - x : colW;
+    const w = i === n - 1
+      ? ax + aw - x
+      : Math.floor(Math.max(1e-6, weights[i]) * scale);
     rects.push(clampRect({ x, y: ay, width: w, height: ah }));
+    x += w + g;
   }
   return rects;
+}
+
+// The columns' natural region size: every column at its stated pixel
+// width, plus inter-column gaps and the outer gap band, floored at the
+// workarea (islands grow; they never shrink below the glass). Zero
+// windows measure to the workarea itself.
+export function columnsMeasure(
+  widthsPx: ReadonlyArray<number>,
+  workarea: { width: number; height: number },
+  gap = 0,
+): { width: number; height: number } {
+  const n = widthsPx.length;
+  if (n === 0) return { width: workarea.width, height: workarea.height };
+  const g = Math.max(0, gap | 0);
+  let natural = 0;
+  for (const w of widthsPx) natural += Math.max(1, Math.round(w));
+  return {
+    width: Math.max(workarea.width, natural + (n - 1) * g + 2 * g),
+    height: workarea.height,
+  };
 }
 
 // Compute the outer rect for each window in the given count, in master-front

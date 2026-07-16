@@ -1,8 +1,9 @@
-// GPU integration: elastic islands (canvas: { world: true, elastic: true }).
-// A workspace's island grows one half-viewport column per managed member
-// and tiles as equal columns (the layout provider's columns hint); the
-// docked camera scrolls within the strip to keep the focused window
-// visible (reorders retile the focused window and the camera follows).
+// GPU integration: an elastic island under the columns layout -- a niri
+// strip (canvas-design.md §5: `layout.mode` declares the algorithm,
+// `canvas.elastic` only sizes the island to the layout's measure). The
+// island grows one half-viewport column per managed member; the docked
+// camera scrolls within the strip to keep the focused window visible
+// (reorders retile the focused window and the camera follows).
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
@@ -32,7 +33,10 @@ test("elastic: strip grows per member; camera scrolls to follow focus", { skip }
   const c = await setupCompositor({
     headless: OUT,
     focus: { policy: "follow-pointer", focusOnMap: true },
-    config: { canvas: { world: true, elastic: true } },
+    config: {
+      canvas: { world: true, elastic: true },
+      layout: { mode: "columns" },
+    },
   });
   try {
     const cA = 0xff3030c0;   // blue-ish

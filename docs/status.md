@@ -1001,38 +1001,47 @@ validated + resolved + consumed by the runtime + hotkey plugin.
   -> island, fit -> range, roam -> rect+zoom) and `canvas.bookmarks`
   config entries re-seed each start with workspace-name references
   resolved at go time. Elastic islands are LANDED, per workspace
-  (canvas-design.md §5): config `canvas.elastic` sets the default
-  (`true | { column }` = all elastic; `{ default: false, column }` =
-  opt-in) and `workspace.set-elastic` overrides one workspace at
-  runtime (session-scoped; omitted `elastic` toggles). An elastic
-  workspace becomes a niri-style strip -- one column per visible
-  managed member, tiled as equal columns via the per-island layout
-  hint (`LayoutIsland.layout` -> `LayoutInputs.island.layout`; the
-  bundled provider recognizes `{ mode: "columns" }`); the row
-  arrangement uses cumulative origins so a growing island shoves its
-  right-hand neighbors; the docked camera scrolls within the strip to
-  follow focus (focus changes + the focused window's retiles via
-  stack.relayout). Off-view frame pacing is FIXED with it: surfaces
-  outside every camera view now get wl_callback.done from any
-  output's flip-complete (idle compositors force one flip), so
-  off-view clients that block on done before committing (e.g. a
+  (canvas-design.md §5): config `canvas.elastic` (boolean) sets the
+  growth default and `workspace.set-elastic` overrides one workspace
+  at runtime (session-scoped; omitted `elastic` toggles). Growth is
+  ONLY a sizing flag -- it never selects the algorithm: an elastic
+  island takes the layout provider's natural size for its members
+  (`LayoutAPI.measure` via the `windows.measure-island` broker seam;
+  the canvas plugin computes no strip geometry of its own), a fixed
+  island keeps the workarea and the same layout compresses into it.
+  The row arrangement uses cumulative origins so a growing island
+  shoves its right-hand neighbors; the docked camera scrolls within
+  the strip to follow focus (focus changes + the focused window's
+  retiles via stack.relayout). Off-view frame pacing is FIXED with
+  it: surfaces outside every camera view now get wl_callback.done
+  from any output's flip-complete (idle compositors force one flip),
+  so off-view clients that block on done before committing (e.g. a
   strip-tail resize) no longer deadlock. GPU tests
   `plugin-canvas/canvas-fit.gpu.mjs`,
   `plugin-canvas/canvas-elastic.gpu.mjs`; unit coverage in
   `plugin-canvas/integration.test.js`.
-  KNOWN GAP (design settled in canvas-design.md §5 "Layout mode is
-  declared; growth only sizes the region", not yet implemented): the
-  growth flag currently SELECTS the algorithm -- an elastic workspace
-  silently swaps master-stack for uniform columns, so
-  `layout.masterFraction` and the `layout.grow/shrink-master` actions
-  no-op on strips, and columns have no runtime width knob (the column
-  fraction is config-only). The settled design: explicit `layout.mode`
-  (`"master-stack" | "columns"`, per-workspace overridable +
-  `workspace.set-layout`), a provider `measure()` that sizes elastic
-  islands (growth never picks the algorithm; even-split = columns +
-  fixed), and per-window column widths with
-  `layout.grow/shrink-column`. `canvas.elastic` reduces to the growth
-  default (boolean; `{ column }` moves into layout config, no sugar).
+  Declared layout modes are LANDED (canvas-design.md §5 "Layout mode
+  is declared; growth only sizes the region"): `layout.mode`
+  (`"master-stack" | "columns"`, default master-stack) picks the
+  algorithm, `canvas.workspaces[].layout` declares it per workspace
+  by name, and `workspace.set-layout {index?, output?, mode?,
+  column?}` overrides one island at runtime (omit `mode` to clear).
+  The declared hint publishes on the island (`LayoutIsland.layout` ->
+  `LayoutInputs.island.layout`), never derived from growth, so the
+  four combinations compose: columns+elastic = niri strip,
+  columns+fixed = even-split, master-stack+elastic = inert growth
+  (master-stack measures to the workarea), master-stack+fixed =
+  classic. Columns mode holds ONE window per column with per-window
+  widths (seeded from `layout.column` / the island hint's `column`,
+  keyed by surface id so they follow reorders, pruned on unmap);
+  `layout.grow-column` / `shrink-column {surfaceId?}` (default: the
+  focused window) resize one column through `setParams({surfaceId,
+  widthDelta})` and re-measure the strip. Only user-resized windows
+  pin a width -- everything else follows its island's declaration, so
+  re-declaring a workspace re-sizes it. Unit coverage:
+  `plugin-layout-default/{master-stack,integration}.test.js`,
+  `windows-broker-measure-island.test.js`,
+  `plugin-canvas/integration.test.js`.
   Empty-island backdrops are LANDED: memberless islands draw a
   translucent camera-mapped quad (`canvas.islandBackdrop` color,
   `setIslandBackdrops` sink surface) so empty persistent workspaces

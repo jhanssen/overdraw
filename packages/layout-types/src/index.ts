@@ -100,11 +100,14 @@ export interface LayoutInputs {
   // widths) should key them per island id, not per output id.
   //
   // `layout` is an optional per-island hint set by the island source
-  // (the workspace-namespace plugin) and passed through verbatim.
-  // Providers that understand a hint honor it; others ignore it. The
-  // bundled plugin recognizes `{ mode: "columns" }` (equal full-height
-  // columns -- the shape an elastic strip wants) and defaults to
-  // master-stack otherwise.
+  // (the workspace-namespace plugin) and passed through verbatim: the
+  // island's DECLARED layout, from user config / a runtime
+  // workspace.set-layout -- never derived from the island's growth
+  // (canvas-design.md §5 "Layout mode is declared"). Providers that
+  // understand a hint honor it; others ignore it. The bundled plugin
+  // recognizes `{ mode: "master-stack" | "columns", column?: number }`
+  // (column = the default column-width fraction for this island) and
+  // falls back to its configured default mode when absent.
   island: { id: number; layout?: unknown };
   windows: ReadonlyArray<LayoutWindow>;
   reason: LayoutReason;
@@ -136,21 +139,61 @@ export interface LayoutParamUpdate {
   // Positive grows the gap, negative shrinks it. The layout clamps to a
   // non-negative result.
   gapDelta?: number;
+  // Change to ONE window's column-width fraction (columns mode). Both
+  // fields together: `surfaceId` names the window, `widthDelta` is the
+  // fraction delta (of the workarea width). The layout seeds an unseen
+  // window at its default column fraction before applying the delta and
+  // clamps the result to its own bounds.
+  surfaceId?: number;
+  widthDelta?: number;
 }
 
 // The resolved parameter values after a setParams() call.
 export interface LayoutParamSnapshot {
   masterFraction: number;
   gap: number;
+  // Default column-width fraction (columns mode seed value).
+  column: number;
+}
+
+// What measure() sees: the would-be members (ids only -- the island
+// source has already filtered lanes exactly as the driver does for
+// compute(): managed, non-exclusive, visible) and the island's sizing
+// authority, its home workarea (canvas-design.md §10b).
+export interface MeasureInputs {
+  windows: ReadonlyArray<{ id: number }>;
+  workarea: { width: number; height: number };
+  island: { id: number; layout?: unknown };
+}
+
+// A layout's natural size for the given members (canvas-design.md §5
+// "Layout mode is declared; growth only sizes the region"). An elastic
+// island's rect is this result; a fixed island keeps the workarea and
+// the same algorithm compresses into it. Never smaller than the
+// workarea (islands grow; they don't shrink below the glass).
+export interface MeasureResult {
+  width: number;
+  height: number;
 }
 
 // Startup config for the bundled master-stack layout plugin. Read from
 // the user's `config.layout` slice. Every field is optional; missing
 // fields take the documented defaults.
 export interface LayoutPluginConfig {
+  // Which algorithm tiles an island when its hint doesn't say otherwise
+  // (canvas-design.md §5 "Layout mode is declared"). "master-stack"
+  // (default): master column + vertical stack. "columns": one
+  // full-height column per window, per-window widths.
+  mode?: "master-stack" | "columns";
   // Initial master-column fraction in [0.05, 0.95]. Default 0.5. The
   // layout.grow-master / shrink-master actions adjust this at runtime.
+  // Consumed by master-stack mode.
   masterFraction?: number;
+  // Default column-width fraction (of the workarea width) in [0.1, 1].
+  // Default 0.5. Seeds each window's column width in columns mode; the
+  // layout.grow-column / shrink-column actions adjust one window's
+  // width at runtime.
+  column?: number;
   // Initial gap (logical px) between tiles AND around the outer edge of
   // the work area. Default 0 (no gap; tiles touch). The runtime gap
   // delta actions (layout.grow-gap / shrink-gap) adjust this on the
@@ -165,7 +208,13 @@ export interface LayoutPluginConfig {
 // synchronously (Promise.resolve(...)).
 export interface LayoutAPI {
   compute(inputs: LayoutInputs): Promise<LayoutResult>;
-  // Adjust runtime parameters (master fraction, gap) and return the resolved
-  // values. Bound via the layout.grow-master / layout.shrink-master actions.
+  // Adjust runtime parameters (master fraction, gap, per-window column
+  // width) and return the resolved values. Bound via the layout.grow-* /
+  // shrink-* actions.
   setParams?(update: LayoutParamUpdate): Promise<LayoutParamSnapshot>;
+  // The layout's natural size for these members in this workarea. The
+  // island source calls this to size an elastic island's rect before
+  // publishing; providers without it leave elastic islands at the
+  // workarea (growth is inert).
+  measure?(inputs: MeasureInputs): Promise<MeasureResult>;
 }

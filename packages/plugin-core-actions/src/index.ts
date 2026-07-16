@@ -244,6 +244,40 @@ export default async function init(sdk: PluginSdkShape): Promise<void> {
     },
   });
 
+  // Per-window column-width tuning (columns mode). Params:
+  //   { surfaceId?: number }  -- the window whose column to resize;
+  // omitted (or a deferred ref resolving to null) targets the
+  // keyboard-focused window. The launcher routes the delta to the active
+  // layout plugin's setParams; no-op if the layout doesn't track
+  // per-window widths.
+  const columnResizeHandler = (delta: number) =>
+    async (rawParams: unknown): Promise<null> => {
+      const p = (rawParams ?? {}) as { surfaceId?: unknown };
+      if (p.surfaceId !== undefined && p.surfaceId !== null
+          && typeof p.surfaceId !== "number") {
+        throw new TypeError("layout column resize: params.surfaceId must be a number");
+      }
+      sdk.events.emit("layout.column-width-requested", {
+        delta,
+        ...(typeof p.surfaceId === "number" ? { surfaceId: p.surfaceId } : {}),
+      });
+      return null;
+    };
+
+  sdk.actions.register({
+    name: "layout.grow-column",
+    description: "Grow one window's column by one step (columns mode). " +
+      "Params: { surfaceId?: number } (default: the focused window).",
+    handler: columnResizeHandler(COLUMN_STEP),
+  });
+
+  sdk.actions.register({
+    name: "layout.shrink-column",
+    description: "Shrink one window's column by one step (columns mode). " +
+      "Params: { surfaceId?: number } (default: the focused window).",
+    handler: columnResizeHandler(-COLUMN_STEP),
+  });
+
   // Gap tuning. Same shape as the master-fraction actions: the launcher
   // forwards the delta to the active layout plugin's setParams. No-op if
   // the active layout doesn't implement setParams or doesn't recognize
@@ -330,6 +364,10 @@ export default async function init(sdk: PluginSdkShape): Promise<void> {
 
 // Per-command master-fraction increment for layout.grow-master / shrink-master.
 const MASTER_STEP = 0.05;
+
+// Per-command column-width increment (fraction of the workarea width) for
+// layout.grow-column / shrink-column.
+const COLUMN_STEP = 0.05;
 
 // Per-command gap increment for layout.grow-gap / shrink-gap (logical px).
 const GAP_STEP = 4;

@@ -19,6 +19,13 @@ import { bundledToResolved } from '../../packages/core/dist/plugins/bundled.js';
 import { withRuntime } from '../plugin-helpers.mjs';
 
 const canvasSpec = { name: 'canvas', module: '@overdraw/plugin-canvas' };
+// The real layout provider loads alongside: elastic island widths come from
+// its measure() (canvas-design.md §5), so a mock would pin geometry the
+// production provider never produces.
+const layoutSpec = {
+  name: 'layout-default', module: '@overdraw/plugin-layout-default',
+  configFrom: (cfg) => cfg.layout,
+};
 
 function mockSink() {
   const sink = {
@@ -79,7 +86,13 @@ async function withCanvasPlugin(fn, opts = {}) {
     bus, wm, surfaces: new Map(), compositor: sink, seat,
     pendingWindowChanges: undefined, decorationResize: null,
   };
-  const broker = createWindowsBroker({ wm, compositor: sink, state, pluginBus, bus });
+  // Late-bound like main.ts: the runtime is created below the broker, and
+  // measure-island only fires once both plugins are live.
+  let runtime = null;
+  const broker = createWindowsBroker({
+    wm, compositor: sink, state, pluginBus, bus,
+    invokeLayout: (method, args) => runtime.invokeNamespace('layout', method, args),
+  });
   bus.on(WINDOW_EVENT.map, (ev) => pluginBus.emit(WINDOW_EVENT.map, ev));
   bus.on(WINDOW_EVENT.unmap, (ev) => pluginBus.emit(WINDOW_EVENT.unmap, ev));
 
@@ -131,32 +144,37 @@ async function withCanvasPlugin(fn, opts = {}) {
       throw new Error(`no handler for '${method}'`);
     },
   }, async (rt) => {
+    runtime = rt;
     // Mirror the production bundled spec: configFrom merges the runtime
     // context (output geometry seed) with the user's canvas slice.
     const spec = {
       ...canvasSpec,
-      configFrom: (cfg, runtime) => ({
+      configFrom: (cfg, rtCtx) => ({
         fallbackOutputId: -1, fallbackOutputName: '',
-        bootOutputDurableKey: runtime.bootOutputDurableKey,
-        initialOutputs: runtime.initialOutputs,
+        bootOutputDurableKey: rtCtx.bootOutputDurableKey,
+        initialOutputs: rtCtx.initialOutputs,
         canvas: cfg.canvas,
         layoutGap: cfg.layout?.gap,
       }),
     };
-    await rt.load([bundledToResolved(spec, spec.module,
-      {
-        output: null, focus: null, hotkeys: undefined, actions: undefined,
-        plugins: [], sourcePath: null,
-        canvas: opts.canvas ?? (opts.world ? { world: true } : {}),
-        layout: opts.layout,
-      },
-      {
-        bootOutputDurableKey: 'mock-0',
-        initialOutputs: [{
-          outputId: 0, name: 'mock-0', edidId: '',
-          x: 0, y: 0, width: 800, height: 600, scale: 1,
-        }],
-      })]);
+    const cfg = {
+      output: null, focus: null, hotkeys: undefined, actions: undefined,
+      plugins: [], sourcePath: null,
+      canvas: opts.canvas ?? (opts.world ? { world: true } : {}),
+      layout: opts.layout,
+    };
+    const rtCtx = {
+      bootOutputDurableKey: 'mock-0',
+      initialOutputs: [{
+        outputId: 0, name: 'mock-0', edidId: '',
+        x: 0, y: 0, width: 800, height: 600, scale: 1,
+      }],
+    };
+    await rt.load([
+      bundledToResolved(layoutSpec, layoutSpec.module, cfg, rtCtx),
+      bundledToResolved(spec, spec.module, cfg, rtCtx),
+    ]);
+    await rt.waitForNamespace('layout');
     await rt.waitForNamespace('workspace');
     await fn({
       rt, sink, wm, wsEvents, seatCalls, layoutSnapshots, animCalls, animPending,
@@ -978,12 +996,13 @@ test('world: bookmarks capture dock / fit / free framings and replay them', asyn
 });
 
 // ---- world mode: elastic islands ------------------------------------------
-// canvas: { elastic: true } grows each workspace island along its row (one
-// 0.5-viewport column per managed member), tiles it via the layout
-// provider's columns hint, shoves right-hand neighbors, and scrolls the
-// docked camera within the strip to follow focus.
+// Growth and layout are orthogonal (canvas-design.md §5 "Layout mode is
+// declared; growth only sizes the region"): `layout.mode` declares the
+// algorithm, `canvas.elastic` only decides whether the island takes the
+// layout's measured natural size (grow + camera-scroll within it) or
+// stays workarea-sized (the same layout compresses into it).
 
-test('elastic: islands grow with members and shove the row; layout hint set', async () => {
+test('elastic: islands grow to the layout measure and shove the row', async () => {
   await withCanvasPlugin(async (h) => {
     const { rt, sink, islands, addWindow } = h;
     addWindow(101);
@@ -995,13 +1014,15 @@ test('elastic: islands grow with members and shove the row; layout hint set', as
     await call(rt, 'show', [1, 0]);
     await settle();
 
-    // One managed member: viewport-sized island, columns hint.
+    // One managed member: a 400px column measures under the workarea, so
+    // the island floors at it. The mode comes from the layout config, so
+    // no per-island hint is published.
     const list = await call(rt, 'list', [0]);
     let isl = islands();
     const ws1 = isl.find((i) => i.id === list[0].handle);
     const ws2 = isl.find((i) => i.id === list[1].handle);
     assert.deepEqual(ws1.rect, { x: 0, y: 0, width: 800, height: 600 });
-    assert.deepEqual(ws1.layout, { mode: 'columns' });
+    assert.equal(ws1.layout, undefined);
     assert.deepEqual(ws2.rect, { x: 800 + 128, y: 0, width: 800, height: 600 });
 
     // Three managed members on ws1 -> 3 columns of 400 -> strip 1200;
@@ -1020,7 +1041,44 @@ test('elastic: islands grow with members and shove the row; layout hint set', as
     sink.cameraCalls.length = 0;
     await call(rt, 'show', [2, 0]);
     assert.deepEqual(sink.cameraCalls.at(-1), { outputId: 0, x: 1328, y: 0, zoom: 1 });
-  }, { canvas: { world: true, elastic: true } });
+  }, { canvas: { world: true, elastic: true }, layout: { mode: 'columns' } });
+});
+
+test('elastic + master-stack: growth is inert (master-stack always fits)', async () => {
+  await withCanvasPlugin(async (h) => {
+    const { rt, islands, addWindow } = h;
+    addWindow(101);
+    await settle();
+    addWindow(102);
+    await settle();
+    addWindow(103);
+    await settle();
+    // Elastic, but master-stack measures to the workarea: the island
+    // never grows. A valid combination, not an error.
+    const list = await call(rt, 'list', [0]);
+    assert.deepEqual(islands().find((i) => i.id === list[0].handle).rect,
+      { x: 0, y: 0, width: 800, height: 600 });
+  }, { canvas: { world: true, elastic: true }, layout: { mode: 'master-stack' } });
+});
+
+test('columns + fixed: even-split -- the same layout compressed into the workarea', async () => {
+  await withCanvasPlugin(async (h) => {
+    const { rt, islands, layoutSnapshots, addWindow } = h;
+    addWindow(101);
+    await settle();
+    addWindow(102);
+    await settle();
+    addWindow(103);
+    await settle();
+    const list = await call(rt, 'list', [0]);
+    // Fixed growth: the island stays workarea-sized however many
+    // columns it holds...
+    assert.deepEqual(islands().find((i) => i.id === list[0].handle).rect,
+      { x: 0, y: 0, width: 800, height: 600 });
+    // ...and the columns provider still tiles it (the driver would
+    // compress the three equal columns into the 800px region).
+    assert.equal(layoutSnapshots.at(-1).islands[0].members.length, 3);
+  }, { canvas: { world: true, elastic: false }, layout: { mode: 'columns' } });
 });
 
 test('elastic: only tiled members take columns (floating never grows the strip)', async () => {
@@ -1040,7 +1098,7 @@ test('elastic: only tiled members take columns (floating never grows the strip)'
     await settle();
     assert.equal(islands().find((i) => i.id === list[0].handle).rect.width, 800,
       '2 columns of 400 -> viewport-width island');
-  }, { canvas: { world: true, elastic: true } });
+  }, { canvas: { world: true, elastic: true }, layout: { mode: 'columns' } });
 });
 
 test('elastic: scroll reveals keep the layout gap visible (margin = gap)', async () => {
@@ -1051,25 +1109,28 @@ test('elastic: scroll reveals keep the layout gap visible (margin = gap)', async
     addWindow(102);
     await settle();
     addWindow(103);
-    await settle();   // strip 1200, viewport 800, maxScroll 400
+    await settle();
+    // 3 columns of 400 + 2 inner gaps + 2 outer gap bands = 1240 wide;
+    // viewport 800 -> maxScroll 440. The measured region gives every
+    // column its full natural width (the gaps are measured in, not
+    // carved out of the columns).
     sink.cameraCalls.length = 0;
 
-    // Reveal the RIGHTMOST column (columns layout, gap 10: last column
-    // right edge at island x + 1190). With the gap margin the scroll
-    // clamps to maxScroll -- the island-edge gap band stays visible --
-    // instead of stopping 10px short.
+    // Reveal the RIGHTMOST column (x = island + 830, right edge 1230).
+    // With the gap margin the scroll clamps to maxScroll -- the
+    // island-edge gap band stays visible -- instead of stopping short.
     pluginBus.emit('window.change',
       { surfaceId: 101, activated: true, changed: ['activated'] });
     pluginBus.emit('stack.relayout', {
       reason: 'mapped',
       windows: [{
         surfaceId: 101, oldOuter: null, oldOutputId: 0,
-        newOuter: { x: 802, y: 10, width: 388, height: 580 },
+        newOuter: { x: 830, y: 10, width: 400, height: 580 },
         newOutputId: 0, tiling: 'managed',
       }],
     });
     await settle();
-    assert.deepEqual(sink.cameraCalls.at(-1), { outputId: 0, x: 400, y: 0, zoom: 1 });
+    assert.deepEqual(sink.cameraCalls.at(-1), { outputId: 0, x: 440, y: 0, zoom: 1 });
 
     // Reveal the LEFTMOST column (x = island + 10): scroll returns to 0,
     // not 10 -- the left gap is never eaten.
@@ -1079,13 +1140,13 @@ test('elastic: scroll reveals keep the layout gap visible (margin = gap)', async
       reason: 'reorder',
       windows: [{
         surfaceId: 103, oldOuter: null, oldOutputId: 0,
-        newOuter: { x: 10, y: 10, width: 386, height: 580 },
+        newOuter: { x: 10, y: 10, width: 400, height: 580 },
         newOutputId: 0, tiling: 'managed',
       }],
     });
     await settle();
     assert.deepEqual(sink.cameraCalls.at(-1), { outputId: 0, x: 0, y: 0, zoom: 1 });
-  }, { canvas: { world: true, elastic: true }, layout: { gap: 10 } });
+  }, { canvas: { world: true, elastic: true }, layout: { mode: 'columns', gap: 10 } });
 });
 
 test('elastic: the docked camera scrolls to keep the focused window visible', async () => {
@@ -1133,7 +1194,7 @@ test('elastic: the docked camera scrolls to keep the focused window visible', as
     sink.cameraCalls.length = 0;
     await rt.invokeAction('workspace.fit', {});
     assert.equal(sink.cameraCalls.at(-1).zoom, 800 / 1200);
-  }, { canvas: { world: true, elastic: true } });
+  }, { canvas: { world: true, elastic: true }, layout: { mode: 'columns' } });
 });
 
 test('elastic: per-workspace opt-in via workspace.set-elastic (fixed default)', async () => {
@@ -1152,12 +1213,11 @@ test('elastic: per-workspace opt-in via workspace.set-elastic (fixed default)', 
     addWindow(104);
     await settle();
 
-    // default: false -> ws1 stays a fixed viewport-sized island with
-    // master-stack (no layout hint), 3 managed members notwithstanding.
+    // elastic: false -> ws1 stays a fixed viewport-sized island, its 3
+    // managed members notwithstanding (they compress into it).
     const list = await call(rt, 'list', [0]);
     let ws1 = islands().find((i) => i.id === list[0].handle);
     assert.deepEqual(ws1.rect, { x: 0, y: 0, width: 800, height: 600 });
-    assert.equal(ws1.layout, undefined);
 
     // Toggle the shown workspace elastic: 3 columns -> strip 1200; the
     // neighbor shoves right; ws2 itself stays fixed.
@@ -1165,10 +1225,9 @@ test('elastic: per-workspace opt-in via workspace.set-elastic (fixed default)', 
     assert.equal(r.elastic, true);
     ws1 = islands().find((i) => i.id === list[0].handle);
     assert.deepEqual(ws1.rect, { x: 0, y: 0, width: 1200, height: 600 });
-    assert.deepEqual(ws1.layout, { mode: 'columns' });
     const ws2 = islands().find((i) => i.id === list[1].handle);
     assert.equal(ws2.rect.x, 1200 + 128);
-    assert.equal(ws2.layout, undefined);
+    assert.equal(ws2.rect.width, 800);
 
     // Toggle back: fixed again.
     r = await rt.invokeAction('workspace.set-elastic', {});
@@ -1179,11 +1238,9 @@ test('elastic: per-workspace opt-in via workspace.set-elastic (fixed default)', 
     // Explicit index + elastic flag.
     r = await rt.invokeAction('workspace.set-elastic', { index: 2, elastic: true });
     assert.equal(r.elastic, true);
-    assert.deepEqual(islands().find((i) => i.id === list[1].handle).layout,
-      { mode: 'columns' });
     await assert.rejects(
       rt.invokeAction('workspace.set-elastic', { index: 9 }), /out of bounds/);
-  }, { canvas: { world: true, elastic: { default: false } } });
+  }, { canvas: { world: true, elastic: false }, layout: { mode: 'columns' } });
 });
 
 test('elastic: default-on config can opt one workspace back to fixed', async () => {
@@ -1202,8 +1259,94 @@ test('elastic: default-on config can opt one workspace back to fixed', async () 
     assert.equal(r.elastic, false);
     const ws1 = islands().find((i) => i.id === list[0].handle);
     assert.equal(ws1.rect.width, 800, 'compresses back to the viewport');
-    assert.equal(ws1.layout, undefined, 'master-stack again');
-  }, { canvas: { world: true, elastic: true } });
+  }, { canvas: { world: true, elastic: true }, layout: { mode: 'columns' } });
+});
+
+// ---- declared layout mode (workspace.set-layout) ---------------------------
+
+test('set-layout: declares one workspace\'s mode; growth follows the new measure', async () => {
+  await withCanvasPlugin(async (h) => {
+    const { rt, islands, addWindow } = h;
+    addWindow(101);
+    await settle();
+    addWindow(102);
+    await settle();
+    addWindow(103);
+    await settle();
+
+    // Global config is master-stack: elastic growth is inert.
+    const list = await call(rt, 'list', [0]);
+    assert.equal(islands().find((i) => i.id === list[0].handle).rect.width, 800);
+
+    // Declare THIS workspace columns: the hint publishes, and the island
+    // grows to the columns measure (3 x 400).
+    let r = await rt.invokeAction('workspace.set-layout', { mode: 'columns' });
+    assert.equal(r.mode, 'columns');
+    let ws1 = islands().find((i) => i.id === list[0].handle);
+    assert.deepEqual(ws1.layout, { mode: 'columns' });
+    assert.equal(ws1.rect.width, 1200);
+
+    // A per-island column fraction rides the hint and re-measures.
+    r = await rt.invokeAction('workspace.set-layout', { mode: 'columns', column: 0.25 });
+    ws1 = islands().find((i) => i.id === list[0].handle);
+    assert.deepEqual(ws1.layout, { mode: 'columns', column: 0.25 });
+    assert.equal(ws1.rect.width, 800, '3 x 200 measures under the workarea -> floors');
+
+    // Clearing the override falls back to the configured default mode.
+    r = await rt.invokeAction('workspace.set-layout', {});
+    assert.equal(r.mode, null);
+    ws1 = islands().find((i) => i.id === list[0].handle);
+    assert.equal(ws1.layout, undefined);
+    assert.equal(ws1.rect.width, 800);
+
+    await assert.rejects(
+      rt.invokeAction('workspace.set-layout', { mode: 'bogus' }), /master-stack/);
+    await assert.rejects(
+      rt.invokeAction('workspace.set-layout', { index: 9, mode: 'columns' }),
+      /out of bounds/);
+  }, { canvas: { world: true, elastic: true }, layout: { mode: 'master-stack' } });
+});
+
+test('set-layout: per-workspace declaration beats the config default both ways', async () => {
+  await withCanvasPlugin(async (h) => {
+    const { rt, islands, addWindow } = h;
+    addWindow(101);
+    await settle();
+    addWindow(102);
+    await settle();
+    addWindow(103);
+    await settle();
+    const list = await call(rt, 'list', [0]);
+    // Config default is columns -> grown.
+    assert.equal(islands().find((i) => i.id === list[0].handle).rect.width, 1200);
+    // Declaring master-stack on it collapses the growth (inert measure).
+    await rt.invokeAction('workspace.set-layout', { mode: 'master-stack' });
+    const ws1 = islands().find((i) => i.id === list[0].handle);
+    assert.deepEqual(ws1.layout, { mode: 'master-stack' });
+    assert.equal(ws1.rect.width, 800);
+  }, { canvas: { world: true, elastic: true }, layout: { mode: 'columns' } });
+});
+
+test('column resize: grow-column widens the focused window and re-measures the strip', async () => {
+  await withCanvasPlugin(async (h) => {
+    const { rt, islands, addWindow, pluginBus } = h;
+    addWindow(101);
+    await settle();
+    addWindow(102);
+    await settle();
+    const list = await call(rt, 'list', [0]);
+    // 2 columns of 400 -> measures 800, floors at the workarea.
+    assert.equal(islands().find((i) => i.id === list[0].handle).rect.width, 800);
+
+    // The launcher routes layout.column-width-requested -> setParams;
+    // this harness has no launcher, so drive the namespace directly and
+    // emit the params-changed the launcher would.
+    await rt.invokeNamespace('layout', 'setParams', [{ surfaceId: 101, widthDelta: 0.5 }]);
+    pluginBus.emit('layout.params-changed', {});
+    await settle();
+    // 101 is now a full-workarea column: 800 + 400 = 1200.
+    assert.equal(islands().find((i) => i.id === list[0].handle).rect.width, 1200);
+  }, { canvas: { world: true, elastic: true }, layout: { mode: 'columns' } });
 });
 
 // ---- placement rules (workspace.place state-bag hint) ---------------------
@@ -1373,7 +1516,10 @@ test('grid: elastic growth shoves within its own grid row only', async () => {
       'same-row neighbor shoved right');
     assert.deepEqual(rectOf(2), { x: 0, y: VPITCH, width: 800, height: 600 },
       'next grid row unmoved');
-  }, { canvas: { world: true, arrangement: 'grid', elastic: true } });
+  }, {
+    canvas: { world: true, arrangement: 'grid', elastic: true },
+    layout: { mode: 'columns' },
+  });
 });
 
 // ---- layer-shell maps never join workspace membership ----------------------
@@ -1400,7 +1546,7 @@ test('elastic: a layer-shell map (waybar) neither joins members nor grows the st
     assert.deepEqual(after.rect, { x: 0, y: 0, width: 800, height: 600 },
       'strip width unchanged by the bar');
     void wm;
-  }, { canvas: { world: true, elastic: true } });
+  }, { canvas: { world: true, elastic: true }, layout: { mode: 'columns' } });
 });
 
 // ---- digit-name resolution vs handle drift --------------------------------
@@ -1551,7 +1697,7 @@ test('world: an island bookmark survives evaporation via its captured name', asy
 
 // ---- declarative workspaces (canvas.workspaces) ---------------------------
 
-test('canvas.workspaces: seeds named persistent workspaces with elastic by name', async () => {
+test('canvas.workspaces: seeds named persistent workspaces with growth + layout by name', async () => {
   await withCanvasPlugin(async (h) => {
     const { rt, islands, addWindow } = h;
     await settle();
@@ -1568,8 +1714,8 @@ test('canvas.workspaces: seeds named persistent workspaces with elastic by name'
     assert.equal(snap.handle, comms.handle);
     assert.equal((await call(rt, 'list', [0])).length, 3);
 
-    // 'media' is declared elastic with a 0.75 column: three members grow
-    // it to 3 × 600 while its neighbors stay fixed.
+    // 'media' is declared elastic AND columns-with-a-0.75-column: three
+    // members grow it to 3 × 600 while its neighbors stay fixed.
     await call(rt, 'show', [3, 0]);
     addWindow(101);
     await settle();
@@ -1579,10 +1725,10 @@ test('canvas.workspaces: seeds named persistent workspaces with elastic by name'
     await settle();
     const mediaIsland = islands().find((i) => i.id === media.handle);
     assert.equal(mediaIsland.rect.width, 1800,
-      'declared-elastic workspace grew at its own column fraction');
-    assert.deepEqual(mediaIsland.layout, { mode: 'columns' });
+      'declared-elastic workspace grew at its declared column fraction');
+    assert.deepEqual(mediaIsland.layout, { mode: 'columns', column: 0.75 });
     assert.equal(islands().find((i) => i.id === comms.handle).layout, undefined,
-      'undeclared workspaces keep the fixed default');
+      'undeclared workspaces take the provider default mode');
 
     // A window quietly placed on 'comms' keeps it around even when it
     // empties again: persistent means no evaporation.
@@ -1599,7 +1745,10 @@ test('canvas.workspaces: seeds named persistent workspaces with elastic by name'
       world: true,
       workspaces: [
         { name: 'comms' },
-        { name: 'media', elastic: { column: 0.75 }, persistent: false },
+        {
+          name: 'media', elastic: true,
+          layout: { mode: 'columns', column: 0.75 }, persistent: false,
+        },
       ],
     },
   });

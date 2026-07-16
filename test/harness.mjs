@@ -406,6 +406,13 @@ export async function setupCompositor(opts = {}) {
           return interceptBroker?.pluginNameForSurface(surfaceId);
         },
       },
+      // windows.measure-island -> the active layout provider, so an
+      // island source can size elastic islands. Late-bound: `runtime` is
+      // assigned below (same pattern as main.ts).
+      invokeLayout: (method, args) => {
+        if (!runtime) return Promise.reject(new Error("plugin runtime not up"));
+        return runtime.invokeNamespace("layout", method, args);
+      },
     });
   }
   // The input broker emits 'input.binding-fired' to the originating plugin

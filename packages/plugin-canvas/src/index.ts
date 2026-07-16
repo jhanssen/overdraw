@@ -134,15 +134,16 @@ export default async function init(
   const worldMode = !!config?.canvas && typeof config.canvas === "object"
     && (config.canvas as { world?: unknown }).world === true;
 
-  // Elastic strips (canvas-design.md §5): an elastic workspace island
-  // grows along its row as managed members exceed the viewport -- one
-  // column of `column` × viewport width per managed member, tiled by the
-  // layout provider's columns mode -- and the docked camera scrolls
-  // within the strip to follow focus. Fixed = classic compression.
-  // Growth is per workspace: config `elastic` sets the DEFAULT
-  // (true / { column } = all elastic; { default: false, column } =
-  // fixed unless opted in), and workspace.set-elastic overrides one
-  // workspace either way at runtime.
+  // Elastic growth (canvas-design.md §5 "Layout mode is declared;
+  // growth only sizes the region"): an elastic workspace island grows
+  // along its row to the layout provider's natural size for its members
+  // (measure()) and the docked camera scrolls within it to follow
+  // focus. Fixed = the workarea rect; the same layout compresses into
+  // it. Growth is strictly a sizing flag -- it never selects the
+  // algorithm; which layout tiles the island is declared via
+  // `config.layout.mode` and per-workspace `layout` entries. Config
+  // `canvas.elastic` (boolean) sets the growth DEFAULT and
+  // workspace.set-elastic overrides one workspace either way at runtime.
   // World arrangement (canvas-design.md §6): how workspace islands are
   // placed in the world. "rows" (default) = one horizontal filmstrip per
   // output; "grid" = row-major grid of ~sqrt(N) columns per output --
@@ -153,16 +154,11 @@ export default async function init(
     ? "grid" : "rows";
   const elasticRaw = worldMode
     ? (config?.canvas as { elastic?: unknown }).elastic : undefined;
-  const elasticDefault = elasticRaw === true
-    || (typeof elasticRaw === "object" && elasticRaw !== null
-        && (elasticRaw as { default?: unknown }).default !== false);
-  let colFraction = 0.5;
-  if (typeof elasticRaw === "object" && elasticRaw !== null) {
-    const c = (elasticRaw as { column?: unknown }).column;
-    if (typeof c === "number" && Number.isFinite(c)) {
-      colFraction = Math.min(1, Math.max(0.1, c));
-    }
+  if (elasticRaw !== undefined && typeof elasticRaw !== "boolean") {
+    sdk.log("canvas: config elastic must be a boolean (layout mode and "
+      + "column width are declared in the layout config); ignored");
   }
+  const elasticDefault = elasticRaw === true;
   // Camera scroll animation within a strip (ms).
   const SCROLL_MS = 150;
   // Scroll-reveal margin (the layout gap): a revealed column sits this
@@ -377,11 +373,11 @@ export default async function init(
       // pointer/keyboard is still anchored on that output.
     }
   });
-  // Lane changes re-solve the world: a member floating/unfloating gains
-  // or loses its elastic column, and an exclusive (maximize/fullscreen)
-  // member collapses its strip to the viewport. window.committed is the
-  // observe-only signal for behavioral-state commits; only the fields
-  // that feed elasticWidth trigger a republish.
+  // Lane changes re-solve the world: a member floating/unfloating joins
+  // or leaves the tiled set an elastic island is measured for, and an
+  // exclusive (maximize/fullscreen) member collapses its strip to the
+  // viewport. window.committed is the observe-only signal for
+  // behavioral-state commits; only the lane fields trigger a republish.
   sdk.events.subscribe("window.committed", (_name, payload) => {
     if (!worldMode || !payload || typeof payload !== "object") return;
     const p = payload as { surfaceId?: unknown; changed?: unknown };
@@ -390,6 +386,14 @@ export default async function init(
       return;
     }
     if (!state.surfaceToHandle.has(p.surfaceId)) return;
+    void publishWorld();
+  });
+
+  // Layout parameter changes (gap, per-window column widths) change
+  // what measure() returns, so elastic island rects re-solve. The
+  // launcher emits this after routing any layout.setParams.
+  sdk.events.subscribe("layout.params-changed", () => {
+    if (!worldMode) return;
     void publishWorld();
   });
 
@@ -550,9 +554,14 @@ export default async function init(
   // destroy/recreate cycles since it keys on the name) > config default.
   const growthByHandle = new Map<WorkspaceHandle, boolean>();
   const elasticByName = new Map<string, boolean>();
-  // Per-name column fraction (canvas.workspaces `elastic: { column }`);
-  // absent = the global colFraction.
-  const columnByName = new Map<string, number>();
+  // Per-workspace declared layout, published verbatim as the island's
+  // layout hint (`{ mode, column? }`; layout-types documents the
+  // shapes). Same precedence as growth: runtime override
+  // (workspace.set-layout, keyed by handle, session-scoped) > config
+  // declaration by NAME (canvas.workspaces `layout` entries) > absent
+  // (the layout provider's configured default mode).
+  const layoutByName = new Map<string, { [k: string]: unknown }>();
+  const layoutByHandle = new Map<WorkspaceHandle, { [k: string]: unknown }>();
   function isElastic(handle: WorkspaceHandle): boolean {
     const override = growthByHandle.get(handle);
     if (override !== undefined) return override;
@@ -560,9 +569,11 @@ export default async function init(
     const declared = name !== undefined ? elasticByName.get(name) : undefined;
     return declared ?? elasticDefault;
   }
-  function columnFor(handle: WorkspaceHandle): number {
+  function layoutHintFor(handle: WorkspaceHandle): { [k: string]: unknown } | undefined {
+    const override = layoutByHandle.get(handle);
+    if (override !== undefined) return override;
     const name = state.byHandle.get(handle)?.name;
-    return (name !== undefined ? columnByName.get(name) : undefined) ?? colFraction;
+    return name !== undefined ? layoutByName.get(name) : undefined;
   }
   // Row arrangement computed by publishWorld: each workspace's island
   // rect, keyed per output. camPosFor / fitCameraFor read this cache
@@ -876,29 +887,52 @@ export default async function init(
     return out;
   }
 
-  // Elastic growth policy: each visible managed member takes one column
-  // of colFraction × workarea width; floating members take none. An
-  // exclusive (maximized / fullscreen) member collapses the strip to the
-  // workarea -- the layout hands it the whole tile region, and a
-  // maximize should cover the usable glass, not a multi-screen strip.
-  function elasticWidth(
-    wa: { width: number }, members: ReadonlyArray<number>,
-    snapById: Map<number, WindowSnapshotLike>, fraction: number,
-  ): number {
-    let cols = 0;
+  // The members the layout will tile, mirroring the driver's compute()
+  // lane filter: managed, non-exclusive, visible. Returns null when an
+  // exclusive (maximized / fullscreen) member collapses the island to
+  // the workarea -- a maximize covers the usable glass, not a
+  // multi-screen strip. A member without a WM snapshot counts for
+  // nothing: undersizing (workarea-width island) is always recoverable,
+  // oversizing stretches windows past the output.
+  function tiledMembers(
+    members: ReadonlyArray<number>,
+    snapById: Map<number, WindowSnapshotLike>,
+  ): number[] | null {
+    const tiled: number[] = [];
     for (const id of members) {
       const ws = snapById.get(id)?.windowState;
-      // Only demonstrably TILED windows take a column: floating members
-      // never grow the strip, and a member without a WM snapshot counts
-      // for nothing -- undersizing (workarea-width island) is always
-      // recoverable, oversizing stretches windows past the output.
       if (!ws) continue;
       if (!ws.visible) continue;
-      if (ws.exclusive !== "none") return wa.width;
-      if (ws.tiling === "managed") cols++;
+      if (ws.exclusive !== "none") return null;
+      if (ws.tiling === "managed") tiled.push(id);
     }
-    const colW = Math.max(1, Math.round(wa.width * fraction));
-    return Math.max(wa.width, cols * colW);
+    return tiled;
+  }
+
+  // Elastic island widths come from the layout provider's natural size
+  // (measure(); canvas-design.md §5 "growth only sizes the region"),
+  // never computed here -- two owners of one geometry drift apart.
+  // Floored at the workarea: islands grow, they never shrink below the
+  // glass. A provider without measure() leaves growth inert.
+  async function measuredWidth(
+    handle: WorkspaceHandle,
+    members: ReadonlyArray<number>,
+    wa: { width: number; height: number },
+    snapById: Map<number, WindowSnapshotLike>,
+  ): Promise<number> {
+    const tiled = tiledMembers(members, snapById);
+    // No tiled members -> the workarea, without asking: every provider
+    // floors its measure there, and publishWorld runs on each structural
+    // change across every island.
+    if (tiled === null || tiled.length === 0) return wa.width;
+    const hint = layoutHintFor(handle);
+    const m = await sdk.windows.measureIsland({
+      islandId: handle,
+      windows: tiled,
+      workarea: { width: wa.width, height: wa.height },
+      ...(hint !== undefined ? { layout: hint } : {}),
+    });
+    return Math.max(wa.width, m?.width ?? wa.width);
   }
 
   async function publishWorld(): Promise<void> {
@@ -912,6 +946,9 @@ export default async function init(
     }
     for (const h of [...growthByHandle.keys()]) {
       if (!state.byHandle.has(h)) growthByHandle.delete(h);
+    }
+    for (const h of [...layoutByHandle.keys()]) {
+      if (!state.byHandle.has(h)) layoutByHandle.delete(h);
     }
     // Elastic growth reads each member's lane from a windows snapshot.
     // Any source of elasticity counts: the config default, runtime
@@ -937,12 +974,28 @@ export default async function init(
     for (const outputId of state.positionsByOutput.keys()) {
       await refreshWorkarea(outputId);
     }
+    // Elastic widths second, for the same reason: measure() is an async
+    // round trip to the layout provider, so every grown width is
+    // resolved before the rebuild starts.
+    const widthByHandle = new Map<WorkspaceHandle, number>();
+    for (const [outputId, handles] of state.positionsByOutput) {
+      const g = outputGeom.get(outputId);
+      if (!g) continue;
+      const wa = workareaOf(outputId, g);
+      for (const h of handles) {
+        if (!isElastic(h)) continue;
+        const rec = state.byHandle.get(h);
+        if (!rec) continue;
+        widthByHandle.set(h,
+          await measuredWidth(h, rec.members, wa, snapById));
+      }
+    }
     rowRectsByOutput.clear();
     for (const [outputId, handles] of state.positionsByOutput) {
       const slots = resolveSlots(handles);
       const g = outputGeom.get(outputId);
       // Arrangement: sticky slot ORDER, per-island widths (workarea for
-      // fixed, column-grown for elastic), cumulative x origins with
+      // fixed, layout-measured for elastic), cumulative x origins with
       // canvas.gutter between islands. Islands are WORKAREA-sized (the
       // usable glass): bars are lens furniture, so the world packs pure
       // content edge-to-edge and the docked camera offsets each island
@@ -965,10 +1018,7 @@ export default async function init(
         let col = 0;
         for (const h of ordered) {
           if (col >= cols) { col = 0; gridRow++; x = g.x; }
-          const rec = state.byHandle.get(h);
-          const width = rec && isElastic(h)
-            ? elasticWidth(wa, rec.members, snapById, columnFor(h))
-            : wa.width;
+          const width = widthByHandle.get(h) ?? wa.width;
           row.set(h, {
             x, y: g.y + gridRow * (wa.height + gutter),
             width, height: wa.height,
@@ -981,12 +1031,13 @@ export default async function init(
       for (const h of handles) {
         const rec = state.byHandle.get(h);
         if (!rec) continue;
+        const hint = layoutHintFor(h);
         islands.push({
           id: h,
           contextOutputId: outputId,
           rect: row.get(h) ?? null,
           members: [...rec.members],
-          ...(isElastic(h) ? { layout: { mode: "columns" } } : {}),
+          ...(hint !== undefined ? { layout: hint } : {}),
         });
       }
     }
@@ -1652,8 +1703,10 @@ export default async function init(
   // re-declared next boot); `persistent: false` opts back into dynamic
   // lifetime. `output` picks the home output (and seeds preferredOutputs
   // so a replug reclaims it); an unresolvable output falls back to the
-  // default output. `elastic` declares growth by NAME (see isElastic).
-  // Registry create is idempotent on name, so re-seeding is safe.
+  // default output. `elastic` declares growth by NAME (see isElastic);
+  // `layout` declares the workspace's layout mode by NAME (see
+  // layoutHintFor). Registry create is idempotent on name, so
+  // re-seeding is safe.
   async function seedWorkspaces(canvasSlice: unknown): Promise<void> {
     if (!canvasSlice || typeof canvasSlice !== "object") return;
     const list = (canvasSlice as { workspaces?: unknown }).workspaces;
@@ -1668,24 +1721,35 @@ export default async function init(
         continue;
       }
       if (entry.elastic !== undefined) {
-        // Same shape as the top-level default: boolean, or { column }
-        // (an object means elastic with a per-workspace column fraction).
+        // Growth only; the workspace's layout (mode, column width) is
+        // declared via the `layout` entry below.
         if (typeof entry.elastic === "boolean") {
           elasticByName.set(entry.name, entry.elastic);
-        } else if (isObj(entry.elastic)) {
-          elasticByName.set(entry.name, true);
-          const col = entry.elastic.column;
-          if (col !== undefined) {
-            if (typeof col !== "number" || !Number.isFinite(col)) {
-              sdk.log(`canvas: config workspace '${entry.name}' elastic.column must be a number; ignored`);
-            } else {
-              columnByName.set(entry.name, Math.min(1, Math.max(0.1, col)));
-            }
-          }
         } else {
-          sdk.log(`canvas: config workspace '${entry.name}' elastic must be a boolean or { column }; skipped`);
+          sdk.log(`canvas: config workspace '${entry.name}' elastic must be a boolean; skipped`);
           continue;
         }
+      }
+      if (entry.layout !== undefined) {
+        // Declared per-workspace layout: { mode: "master-stack" |
+        // "columns", column? }. Published verbatim as the island's
+        // layout hint; the provider validates/clamps what it consumes.
+        if (!isObj(entry.layout)
+            || (entry.layout.mode !== "master-stack" && entry.layout.mode !== "columns")) {
+          sdk.log(`canvas: config workspace '${entry.name}' layout must be `
+            + `{ mode: "master-stack" | "columns", column? }; skipped`);
+          continue;
+        }
+        const hint: { [k: string]: unknown } = { mode: entry.layout.mode };
+        if (entry.layout.column !== undefined) {
+          if (typeof entry.layout.column !== "number"
+              || !Number.isFinite(entry.layout.column)) {
+            sdk.log(`canvas: config workspace '${entry.name}' layout.column must be a number; ignored`);
+          } else {
+            hint.column = entry.layout.column;
+          }
+        }
+        layoutByName.set(entry.name, hint);
       }
       if (entry.persistent !== undefined && typeof entry.persistent !== "boolean") {
         sdk.log(`canvas: config workspace '${entry.name}' persistent must be a boolean; skipped`);
@@ -2145,6 +2209,42 @@ export default async function init(
       growthByHandle.set(handle, next);
       await publishWorld();
       return { elastic: next };
+    },
+  });
+
+  sdk.actions.register({
+    name: "workspace.set-layout",
+    description:
+      "World mode: declare a workspace's layout -- { mode: \"master-stack\" | \"columns\", column? } (column = default column-width fraction). Positional {index?, output?}; index defaults to the shown workspace on the focused output. Session-scoped override; omit `mode` to clear it (back to config/default).",
+    handler: async (params: unknown): Promise<{ mode: string | null }> => {
+      if (!worldMode) {
+        throw new Error(
+          "workspace.set-layout: requires canvas world mode (canvas: { world: true })");
+      }
+      const p = parseSetLayoutParams(params, resolveOutputName, focusedOutputId());
+      const positions = state.positionsByOutput.get(p.outputId) ?? [];
+      let handle: WorkspaceHandle | undefined;
+      if (p.index !== undefined) {
+        handle = positions[p.index - 1];
+        if (handle === undefined) {
+          throw new Error(
+            `workspace.set-layout: index ${p.index} out of bounds (1..${positions.length})`);
+        }
+      } else {
+        handle = state.shownByOutput.get(p.outputId);
+        if (handle === undefined) {
+          throw new Error("workspace.set-layout: no shown workspace on the target output");
+        }
+      }
+      if (p.mode === undefined) {
+        layoutByHandle.delete(handle);
+      } else {
+        const hint: { [k: string]: unknown } = { mode: p.mode };
+        if (p.column !== undefined) hint.column = p.column;
+        layoutByHandle.set(handle, hint);
+      }
+      await publishWorld();
+      return { mode: p.mode ?? null };
     },
   });
 
@@ -2721,6 +2821,48 @@ function parseZoomParams(
       throw new TypeError(`workspace.zoom: ${key} must be a positive finite number`);
     }
     out[key] = v;
+  }
+  return out;
+}
+
+// workspace.set-layout: optional per-output index (default: the shown
+// workspace) + optional mode (absent = clear the override) + optional
+// column fraction + optional output.
+function parseSetLayoutParams(
+  params: unknown,
+  resolveOutput: (input: string) => number | null,
+  defaultOutputId: number,
+): { index?: number; mode?: "master-stack" | "columns"; column?: number; outputId: number } {
+  if (params === undefined || params === null) {
+    return { outputId: defaultOutputId };
+  }
+  if (!isObj(params)) {
+    throw new TypeError("workspace.set-layout: expected an object");
+  }
+  const outputId = parseOptionalOutput(
+    params, resolveOutput, defaultOutputId, "workspace.set-layout");
+  const out: {
+    index?: number; mode?: "master-stack" | "columns"; column?: number; outputId: number;
+  } = { outputId };
+  if (params.index !== undefined) {
+    if (typeof params.index !== "number" || !Number.isInteger(params.index)
+        || params.index < 1) {
+      throw new TypeError("workspace.set-layout: index must be a positive integer");
+    }
+    out.index = params.index;
+  }
+  if (params.mode !== undefined) {
+    if (params.mode !== "master-stack" && params.mode !== "columns") {
+      throw new TypeError(
+        "workspace.set-layout: mode must be \"master-stack\" or \"columns\"");
+    }
+    out.mode = params.mode;
+  }
+  if (params.column !== undefined) {
+    if (typeof params.column !== "number" || !Number.isFinite(params.column)) {
+      throw new TypeError("workspace.set-layout: column must be a finite number");
+    }
+    out.column = params.column;
   }
   return out;
 }
