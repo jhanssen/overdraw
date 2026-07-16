@@ -157,6 +157,16 @@ plugin would pay one IPC round-trip per frame, so the follow-up is an
 value.ts` TargetRef) letting plugins hand core a spring spec and get
 in-core per-tick evaluation, like window fx animations do.
 
+**Glass or world is a property of the surface, and pointer-borne chrome is
+glass.** The camera moves every content surface that is not camera-exempt
+(`outputAnchored`, a layer surface, or the cursor sprite). A surface
+positioned from raw pointer coordinates must therefore be anchored, or the
+camera pans it away from the very pointer it tracks: the DnD icon
+(`wl_data_device_manager.ts`) rides `lastX/lastY` and is anchored for
+exactly this reason, alongside the cursor. The rule generalizes — anything
+placed in glass coordinates must say so, because "glass" is the exception
+and world content is the default.
+
 Interactive grabs (`computeGrabRect`): anchor and deltas are glass-space,
 the grabbed rect is world-space — correct while the camera is constant,
 so camera policy must not animate an output's camera during an active

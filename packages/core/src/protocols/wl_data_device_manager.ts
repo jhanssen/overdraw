@@ -239,6 +239,14 @@ function updateDragIcon(d: DragSession, x: number, y: number): void {
   if (!d.icon || d.icon.destroyed) return;
   const rec = d.ctx.state.surfaces.get(d.icon);
   if (!rec) return;
+  // The icon rides the pointer, and the pointer is glass: anchor it to the
+  // output so the content camera leaves it alone. It is cursor furniture,
+  // not world content -- panning it with the camera would place it camX
+  // away from the cursor it is meant to sit under, and zooming it would
+  // scale it while the cursor beneath it stayed put. The flag is per
+  // Surface record and removeSurface drops the record, so a client that
+  // later reuses this wl_surface as ordinary content starts unanchored.
+  d.ctx.state.compositor.setSurfaceOutputAnchored?.(rec.id, true);
   // Position the icon at the pointer, shifted by its accumulated buffer offset
   // (clients attach with a negative offset to place the grab point under the
   // cursor). Draws on top via the stack rebuild.
