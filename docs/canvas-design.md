@@ -818,9 +818,12 @@ tests only.
    preemption/instant-fallback semantics. GPU test:
    `plugin-canvas/canvas-fit.gpu.mjs`.
    ALSO LANDED -- **free roaming + bookmarks**: `workspace.pan {dx,
-   dy}` / `workspace.zoom {factor}` (keyboard verbs; a pointer
-   drag-pan gesture is future work) park the camera at arbitrary world
-   framings through the same per-output camera-override state as fit.
+   dy}` / `workspace.zoom {factor}` (keyboard verbs) and the
+   `workspace.pan-grab` / `pan-grab-end` drag gesture (a held button
+   pans the camera 1:1 through `sdk.windows.beginCameraPan` /
+   `endCameraPan`; GPU test `plugin-canvas/canvas-drag-pan.gpu.mjs`)
+   park the camera at arbitrary world framings through the same
+   per-output camera-override state as fit.
    While overridden, every workspace on the output rides the draw
    stack -- the plugin's roaming answer to §5's hidden-vs-unviewed
    choice: everything is viewable while traveling -- the shown
