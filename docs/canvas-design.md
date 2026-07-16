@@ -526,7 +526,19 @@ Retirements (semantics superseded by the model):
   outputs while its home is unplugged, reclaiming on replug), or
   `pinned` (dockable only by its home output's camera while that
   output is connected; unplugging relaxes it to the fallback
-  behavior). Declared per workspace (a `canvas.workspaces` field,
+  behavior). One piece of "home" is IRREDUCIBLE and survives even
+  full dissolution: every island needs exactly one SIZING AUTHORITY
+  -- the workarea that shapes its rect, layout, and elastic column
+  width (`contextOutputId` in the driver; content has concrete pixel
+  geometry, and you cannot lay out for two workareas at once). A
+  camera from a differently-sized output can only VISIT (fit-zoom the
+  whole island at < 1.0, or dock at 1.0 and crop/scroll -- the
+  elastic-strip scroll generalized to both axes); making the content
+  actually fit that glass means ADOPTING the island, i.e. moving its
+  home so it re-lays-out to the new workarea. Affinity is therefore
+  "how mobile the home is" (`pinned` = never adopted away, protecting
+  e.g. an ultrawide layout from a smaller adopter), never "whether a
+  home exists". Declared per workspace (a `canvas.workspaces` field,
   next to `output`); `none` is always EXPLICIT -- an entry that omits
   `output` still homes where it is created with `preferred` affinity,
   so traditional configs never fall into all-bars projection by
