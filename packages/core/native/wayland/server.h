@@ -50,6 +50,14 @@ class Server {
     using PumpHook = std::function<void()>;
     void setOnPump(PumpHook cb) { onPump_ = std::move(cb); }
 
+    // Wraps the dispatch section of the async handler. libwayland dispatch
+    // trampolines client requests into JS; the embedder installs a wrapper
+    // that brackets it with a microtask-draining callback scope so promise
+    // continuations queued by those handlers run when dispatch unwinds
+    // instead of waiting for an unrelated loop wakeup.
+    using DispatchScope = std::function<void(const std::function<void()>&)>;
+    void setDispatchScope(DispatchScope f) { dispatchScope_ = std::move(f); }
+
     // Drain pending wayland-server events synchronously (without blocking
     // libuv). Used by the frame-trigger path right before deciding what to
     // render: if a client commit arrived between the last server-pump and
@@ -72,6 +80,7 @@ class Server {
     std::string socketName_;
 
     PumpHook onPump_;
+    DispatchScope dispatchScope_;
 
     int wlFd_ = -1;    // libwayland's event-loop epoll fd (owned by libwayland)
     int stopFd_ = -1;  // eventfd; written by stop() to end the watcher thread

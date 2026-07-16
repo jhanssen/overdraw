@@ -11,6 +11,7 @@
 #include "xwayland/server.h"
 #include "xwayland/xwm.h"
 #include "wayland/wayland_fd.h"
+#include "napi/uv_js_scope.h"
 
 namespace overdraw::xwayland {
 namespace {
@@ -55,6 +56,7 @@ struct ReadyWatch {
     std::string digits;
     bool done = false;
     napi_env env = nullptr;
+    napi_async_context jsCtx = nullptr;  // microtask-draining scope for the cb
     napi_ref cb = nullptr;
 };
 
@@ -108,6 +110,7 @@ void finish(ReadyWatch* w, const char* err, int displayNumber) {
 
 void onReadable(uv_poll_t* h, int status, int /*events*/) {
     auto* w = static_cast<ReadyWatch*>(h->data);
+    UvJsScope jsScope(w->env, w->jsCtx);
     if (status < 0) {
         finish(w, "poll error on displayfd", -1);
         return;
@@ -178,6 +181,7 @@ napi_value Start(napi_env env, napi_callback_info info) {
     auto* w = new ReadyWatch();
     w->fd = sp.displayReadFd;
     w->env = env;
+    w->jsCtx = overdraw::makeUvJsAsyncContext(env, "overdraw-xwayland");
     napi_create_reference(env, argv[1], 1, &w->cb);
 
     uv_loop_t* loop = nullptr;
@@ -222,6 +226,7 @@ struct XwmJsState {
     // One-shot drain scheduled after request wrappers (see scheduleXwmDrain).
     uv_timer_t drainTimer;
     napi_env env = nullptr;
+    napi_async_context jsCtx = nullptr;  // microtask-draining scope for event delivery
     napi_ref cb = nullptr;
     bool active = false;
 };
@@ -375,6 +380,7 @@ void xwmTeardown() {
 // never re-enter mid-wrapper.
 void onXwmDrainTimer(uv_timer_t* /*t*/) {
     if (!g_xwm.active || !g_xwm.conn) return;
+    UvJsScope jsScope(g_xwm.env, g_xwm.jsCtx);
     if (!xwmProcess(g_xwm.conn, deliverXwmEvent)) xwmTeardown();
 }
 
@@ -388,6 +394,7 @@ void onXcbReadable(uv_poll_t* /*h*/, int status, int /*events*/) {
         xwmTeardown();
         return;
     }
+    UvJsScope jsScope(g_xwm.env, g_xwm.jsCtx);
     if (!xwmProcess(g_xwm.conn, deliverXwmEvent)) xwmTeardown();  // xcb errored
 }
 
@@ -416,6 +423,7 @@ napi_value XwmStart(napi_env env, napi_callback_info info) {
 
     g_xwm.conn = conn;
     g_xwm.env = env;
+    if (!g_xwm.jsCtx) g_xwm.jsCtx = overdraw::makeUvJsAsyncContext(env, "overdraw-xwm");
     napi_create_reference(env, argv[1], 1, &g_xwm.cb);
     uv_loop_t* loop = nullptr;
     napi_get_uv_event_loop(env, &loop);

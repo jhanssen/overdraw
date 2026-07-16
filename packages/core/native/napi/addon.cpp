@@ -38,6 +38,7 @@
 #endif
 #include "input_channel.h"
 #include "core/shm.h"
+#include "uv_js_scope.h"
 #include "wayland/server.h"
 #include "wayland/interface_registry.h"
 #include "wayland/trampoline.h"
@@ -56,6 +57,7 @@ using overdraw::core::ButtonState;
 using overdraw::core::AxisKind;
 using overdraw::core::WaylandInputBackend;
 using overdraw::core::ShmRegistry;
+using overdraw::UvJsScope;
 using overdraw::wayland::Server;
 using overdraw::wayland::InterfaceRegistry;
 using overdraw::wayland::InterfaceDesc;
@@ -131,6 +133,10 @@ struct Addon {
     // is needed). Cross-thread events (e.g. Dawn callbacks on Dawn-internal
     // threads) will need napi_threadsafe_function -- not exercised yet.
     napi_env env = nullptr;
+    // Async context for UvJsScope: every uv-driven entry into JS opens a
+    // callback scope against this so promise continuations queued by the JS
+    // drain when the callback unwinds (see uv_js_scope.h).
+    napi_async_context uvJsCtx = nullptr;
     napi_ref onFrame = nullptr;
     napi_ref onInput = nullptr;  // optional JS callback(event) for input events
     napi_ref onOutput = nullptr; // optional JS callback(descriptor) for OutputDescriptor msgs
@@ -157,6 +163,16 @@ struct Addon {
     bool syncobjFdOwned = false;
 };
 Addon g_addon;
+
+// Record env and build the shared async context on first use. Called by
+// every JS-facing entry point that arms uv handles (Start, StartServer),
+// whichever runs first.
+void ensureUvJsCtx(napi_env env) {
+    if (!g_addon.env) g_addon.env = env;
+    if (!g_addon.uvJsCtx) {
+        g_addon.uvJsCtx = overdraw::makeUvJsAsyncContext(env, "overdraw");
+    }
+}
 
 // The plugin GPU model: the plugin WORKER owns its wire client + device
 // (overdraw_plugin_native.node); the CORE only brokers the side channel. The
@@ -315,6 +331,7 @@ void runFrameIfReady() {
 // the pre-flip-driven 60Hz frame timer); headless is a test-only mode where
 // continuous frames are the expectation.
 void onHeadlessFrameTimer(uv_timer_t*) {
+    UvJsScope jsScope(g_addon.env, g_addon.uvJsCtx);
     // Headless has no flip-complete events; synthesize one for the primary
     // output so dispatchFrameCallbacksForOutput still fires per tick. Tests
     // (which are the headless use case) depend on wl_callback.done arriving
@@ -605,6 +622,7 @@ void advanceAllPending(napi_env env) {
 
 void onWireReadable(uv_poll_t*, int status, int events) {
     if (status < 0 || !g_addon.compositor) return;
+    UvJsScope jsScope(g_addon.env, g_addon.uvJsCtx);
     if (events & UV_WRITABLE) g_addon.compositor->wirePumpOut();
     if (events & UV_READABLE) {
         // drainWire() advances the wire client's event manager, which may resolve
@@ -652,6 +670,7 @@ void onWireReadable(uv_poll_t*, int status, int events) {
 // pumps what the socket can now accept so the queue eventually empties.
 void onCtrlReadable(uv_poll_t*, int status, int events) {
     if (status < 0 || !g_addon.compositor) return;
+    UvJsScope jsScope(g_addon.env, g_addon.uvJsCtx);
     if (events & UV_WRITABLE) g_addon.compositor->ctrlPumpOut();
     if (events & UV_READABLE) {
         g_addon.compositor->drainCtrl();
@@ -693,6 +712,7 @@ void onFlushPrepare(uv_prepare_t*) {
 
 void onInputReadable(uv_poll_t*, int status, int) {
     if (status < 0 || !g_addon.input) return;
+    UvJsScope jsScope(g_addon.env, g_addon.uvJsCtx);
     g_addon.input->drain();
     // Pointer motion changes the cursor, key presses may change focus +
     // alter what should be rendered; clients react via wl events and want
@@ -703,6 +723,7 @@ void onInputReadable(uv_poll_t*, int status, int) {
 #if OVERDRAW_KMS
 void onSeatReadable(uv_poll_t*, int status, int) {
     if (status < 0 || !g_addon.seat) return;
+    UvJsScope jsScope(g_addon.env, g_addon.uvJsCtx);
     g_addon.seat->dispatch();
 }
 #endif
@@ -795,7 +816,7 @@ napi_value Start(napi_env env, napi_callback_info info) {
         return throwError(env, "gpuBinPath must be a string");
 
     // Optional frame-event + input-event callbacks.
-    g_addon.env = env;
+    ensureUvJsCtx(env);
     if (argc >= 2) {
         napi_valuetype t;
         napi_typeof(env, argv[1], &t);
@@ -2022,6 +2043,7 @@ napi_value Stop(napi_env env, napi_callback_info) {
 // startServer() -> string (socket name) : stand up the Wayland server on the
 // libuv loop. Independent of the present loop for now.
 napi_value StartServer(napi_env env, napi_callback_info) {
+    ensureUvJsCtx(env);
     if (!g_addon.server) g_addon.server = std::make_unique<Server>();
     uv_loop_t* loop = nullptr;
     napi_get_uv_event_loop(env, &loop);
@@ -2032,6 +2054,12 @@ napi_value StartServer(napi_env env, napi_callback_info) {
     // Wake the frame loop after every Wayland-server pump tick: a client
     // commit/attach/etc arrived and the frame callbacks + render need to run.
     g_addon.server->setOnPump([]() { wake(); });
+    // Client request dispatch trampolines into JS protocol handlers; run it
+    // inside a microtask-draining scope (see uv_js_scope.h).
+    g_addon.server->setDispatchScope([](const std::function<void()>& body) {
+        UvJsScope jsScope(g_addon.env, g_addon.uvJsCtx);
+        body();
+    });
     napi_value name;
     napi_create_string_utf8(env, g_addon.server->socketName().c_str(), NAPI_AUTO_LENGTH, &name);
     return name;

@@ -108,9 +108,13 @@ void Server::watchLoop() {
 
 void Server::onAsync(uv_async_t* handle) {
     auto* self = static_cast<Server*>(handle->data);
-    wl_event_loop_dispatch(self->eventLoop_, 0);
-    wl_display_flush_clients(self->display_);
-    if (self->onPump_) self->onPump_();
+    const auto body = [self] {
+        wl_event_loop_dispatch(self->eventLoop_, 0);
+        wl_display_flush_clients(self->display_);
+        if (self->onPump_) self->onPump_();
+    };
+    if (self->dispatchScope_) self->dispatchScope_(body);
+    else body();
     uv_sem_post(&self->dispatchedSem_);
 }
 
