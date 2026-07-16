@@ -1087,9 +1087,20 @@ validated + resolved + consumed by the runtime + hotkey plugin.
   `workspace.pan-grab` / `pan-grab-end` actions (GPU test
   `plugin-canvas/canvas-drag-pan.gpu.mjs`).
   Grid arrangement is LANDED (`canvas.arrangement: "grid"`, default
-  "rows"): slots wrap row-major after ~sqrt(N) columns, fit frames
-  the 2D bounds, docks move both camera axes, elastic shove stays
-  per grid row. Declarative workspaces are LANDED: `canvas.workspaces` entries
+  "rows"): slots wrap row-major, fit frames the 2D bounds, docks move
+  both camera axes, elastic shove stays per grid row. The wrap is
+  WIDTH-aware, not count-based (canvas-design.md §6 "The grid's wrap is
+  width-aware"): the row count whose bounds-aspect best matches the
+  output wins, so wide elastic strips wrap after fewer columns than
+  workarea-wide islands (a ~sqrt(N) wrap assumes every island is one
+  screen wide and frames a ribbon). Growth repacks too -- a workspace is
+  narrow when created and only becomes a strip as it fills -- but only
+  when the better packing beats the current by a margin (0.85), so the
+  grid rewraps on a strip doubling and ignores one more window in a wide
+  island. This is the one sanctioned exception to §6's "never repack":
+  slot order is preserved, but an island can change ROW. Coverage in
+  `plugin-canvas/integration.test.js` (width-aware wrap, growth rewrap,
+  in-row shove when the packing holds). Declarative workspaces are LANDED: `canvas.workspaces` entries
   `{ name, output?, persistent?, elastic? }` seed named workspaces at
   boot (persistent by default; `elastic` boolean or `{ column }`
   declares growth by name), backed by registry name idempotence --

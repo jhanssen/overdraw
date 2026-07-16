@@ -1549,30 +1549,96 @@ test('grid: fit frames the 2D bounds (near-square zoom, both axes centered)', as
   }, { canvas: { world: true, arrangement: 'grid' } });
 });
 
-test('grid: elastic growth shoves within its own grid row only', async () => {
+// Growth that leaves the packing alone still shoves in-row (canvas-design
+// §6): a 2x2 of workarea-wide islands is already screen-shaped, so ws1
+// growing by half pushes its own row's neighbor right and the row below
+// never hears about it.
+test('grid: growth the repack ignores shoves within its own row only', async () => {
   await withCanvasPlugin(async (h) => {
     const { rt, islands, addWindow } = h;
     addWindow(101);
     await settle();
-    await call(rt, 'create', [{}]);
-    await call(rt, 'create', [{}]);
+    for (let i = 0; i < 3; i++) await call(rt, 'create', [{}]);
     await settle();
-    // Grow ws1 (slot 0, grid row 0) to 3 columns of 400 = 1200.
+    const list = await call(rt, 'list', [0]);
+    const rectOf = (i) => islands().find((x) => x.id === list[i].handle).rect;
+    const belowBefore = [2, 3].map((i) => ({ ...rectOf(i) }));
+    assert.equal(belowBefore[0].y, VPITCH, 'ws3/ws4 start on the second row');
+
+    // Grow ws1 (the current workspace) to 3 columns of 400 = 1200.
     addWindow(102);
     await settle();
     addWindow(103);
     await settle();
 
-    const list = await call(rt, 'list', [0]);
-    const rectOf = (i) => islands().find((x) => x.id === list[i].handle).rect;
     assert.equal(rectOf(0).width, 1200, 'ws1 grew');
     assert.deepEqual(rectOf(1), { x: 1200 + 128, y: 0, width: 800, height: 600 },
       'same-row neighbor shoved right');
-    assert.deepEqual(rectOf(2), { x: 0, y: VPITCH, width: 800, height: 600 },
-      'next grid row unmoved');
+    assert.deepEqual([2, 3].map((i) => ({ ...rectOf(i) })), belowBefore,
+      'the row below never moved');
   }, {
     canvas: { world: true, arrangement: 'grid', elastic: true },
     layout: { mode: 'columns' },
+  });
+});
+
+// Wide islands wrap sooner: three 2400px strips stack one-per-row (bounds
+// 2400x2056, aspect 1.17) rather than the 2-then-1 a count-based ~sqrt(N)
+// wrap gives (bounds 4928x1328, aspect 3.7) -- 1.17 is the nearer miss of
+// the 800x600 viewport's 1.33, so fit frames a screen-shaped block.
+test('grid: wide elastic islands wrap after fewer columns than narrow ones', async () => {
+  await withCanvasPlugin(async (h) => {
+    const { rt, islands, addWindow } = h;
+    let id = 100;
+    for (let ws = 0; ws < 3; ws++) {
+      if (ws > 0) {
+        await call(rt, 'create', [{}]);
+        await call(rt, 'show', [ws + 1, 0]);
+        await settle();
+      }
+      for (let i = 0; i < 3; i++) addWindow(++id);
+      await settle();
+    }
+
+    const list = await call(rt, 'list', [0]);
+    const rectOf = (i) => islands().find((x) => x.id === list[i].handle).rect;
+    for (let i = 0; i < 3; i++) {
+      assert.equal(rectOf(i).width, 2400, `ws${i + 1} is a three-column strip`);
+      assert.deepEqual(
+        { x: rectOf(i).x, y: rectOf(i).y }, { x: 0, y: i * VPITCH },
+        `ws${i + 1} takes its own grid row`);
+    }
+  }, {
+    canvas: { world: true, arrangement: 'grid', elastic: true },
+    layout: { mode: 'columns', column: 1.0 },
+  });
+});
+
+// A workspace is workarea-wide when created and only becomes a strip as it
+// fills, so growth -- not just the island set -- must be able to rewrap the
+// grid, or every strip stays packed as if it were one screen wide. Here ws1
+// grows to 3x its neighbor and their row can no longer hold both at the
+// screen's shape.
+test('grid: growth rewraps the grid when the better packing clearly wins', async () => {
+  await withCanvasPlugin(async (h) => {
+    const { rt, islands, addWindow } = h;
+    addWindow(101);
+    await settle();
+    await call(rt, 'create', [{}]);
+    await settle();
+    const list = await call(rt, 'list', [0]);
+    const rectOf = (i) => islands().find((x) => x.id === list[i].handle).rect;
+    assert.deepEqual({ x: rectOf(1).x, y: rectOf(1).y }, { x: PITCH, y: 0 },
+      'two workarea-wide islands start side by side');
+
+    for (const wid of [102, 103]) { addWindow(wid); await settle(); }
+
+    assert.equal(rectOf(0).width, 2400, 'ws1 grew to a three-column strip');
+    assert.deepEqual({ x: rectOf(1).x, y: rectOf(1).y }, { x: 0, y: VPITCH },
+      'ws2 rewrapped onto its own row rather than sitting 2400px out');
+  }, {
+    canvas: { world: true, arrangement: 'grid', elastic: true },
+    layout: { mode: 'columns', column: 1.0 },
   });
 });
 

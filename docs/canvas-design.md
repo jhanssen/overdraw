@@ -339,6 +339,30 @@ Islands may not overlap. Placement policy (plugin):
   automatically; names don't move; only free cameras and floating windows
   observe the (animated) shift.
 
+**The grid's wrap is width-aware, and it is the one thing that repacks.**
+Under `arrangement: "grid"` the wrap column is chosen so the world's
+overall bounds land as close to the output's aspect as they can — try
+every row count, fill greedily in slot order, keep the packing whose
+bounds-aspect misses the screen's by the least (compared in log space, so
+too-wide and too-tall are judged alike). Wrapping on COUNT instead
+(~sqrt(N)) silently assumes every island is one screen wide; elastic
+strips break that, and a 3×-wide island counts as one cell while eating
+three, so `workspace.fit` frames a ribbon and wastes the glass the grid
+exists to save.
+
+This has to react to GROWTH, not just to the island set, and that is the
+concession to §6's "never repack": a workspace is workarea-wide the
+moment it is created and only becomes a long strip as it fills, so a wrap
+frozen at creation would pack every strip as though it were narrow — the
+exact waste the grid is for. A repack can therefore move a bystander
+island to another row, which a monotone shove never does. Two things keep
+it from thrashing: rows are STICKY (the packing is re-adopted only when it
+beats the current one by a margin, so one more window in an already-wide
+island changes nothing while a strip doubling in length rewraps), and slot
+order is untouched — a repack re-flows the same sequence, so "comms is
+before code" survives even when "left of" becomes "above". Within a row,
+growth still shoves, and rows stay independent.
+
 Shoving is itself a layout problem one level up — islands are the
 "windows", the world the "screen", and the policy is a compute-rects
 function in the same shape as the layout contract. Not worth forcing

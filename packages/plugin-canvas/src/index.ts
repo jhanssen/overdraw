@@ -146,8 +146,9 @@ export default async function init(
   // workspace.set-elastic overrides one workspace either way at runtime.
   // World arrangement (canvas-design.md §6): how workspace islands are
   // placed in the world. "rows" (default) = one horizontal filmstrip per
-  // output; "grid" = row-major grid of ~sqrt(N) columns per output --
-  // workspace.fit then frames a near-square block instead of a long
+  // output; "grid" = row-major grid per output, wrapping at whatever
+  // width shapes the world's bounds most like the screen (packRows) --
+  // workspace.fit then frames a screen-shaped block instead of a long
   // strip, wasting far less glass on wide monitors.
   const arrangement = worldMode
     && (config?.canvas as { arrangement?: unknown }).arrangement === "grid"
@@ -576,6 +577,18 @@ export default async function init(
     const name = state.byHandle.get(handle)?.name;
     return name !== undefined ? layoutByName.get(name) : undefined;
   }
+  // Which grid row each workspace occupies ("grid" arrangement). Sticky
+  // against churn: a changed island set or slot order repacks outright,
+  // but a width change only repacks when the better packing wins by
+  // REPACK_MARGIN. Growth must be able to rewrap -- a workspace is empty
+  // when it is created and only becomes a long strip later, so a wrap
+  // frozen at creation would pack every strip as if it were one screen
+  // wide. The margin is what keeps that from twitching: one more window
+  // in an already-wide island leaves the grid alone; a strip doubling in
+  // length rewraps it.
+  const rowByHandle = new Map<WorkspaceHandle, number>();
+  const packedSetByOutput = new Map<number, string>();
+  const REPACK_MARGIN = 0.85;
   // Row arrangement computed by publishWorld: each workspace's island
   // rect, keyed per output. camPosFor / fitCameraFor read this cache
   // synchronously; publishWorld refreshes it on every structural change.
@@ -888,6 +901,68 @@ export default async function init(
     return out;
   }
 
+  // How far a row assignment's bounds miss the output's shape. Compared in
+  // log space so 2x too wide and 2x too tall count as the same sin, where
+  // a linear difference would call the wide one worse. 0 = bounds exactly
+  // the screen's shape; lower is better.
+  function rowsScore(
+    ordered: ReadonlyArray<WorkspaceHandle>,
+    rows: ReadonlyMap<WorkspaceHandle, number>,
+    widthOf: (h: WorkspaceHandle) => number,
+    rowHeight: number,
+    aspect: number,
+  ): number {
+    const widthByRow = new Map<number, number>();
+    let lastRow = 0;
+    for (const h of ordered) {
+      const r = rows.get(h) ?? 0;
+      widthByRow.set(r, (widthByRow.get(r) ?? 0) + widthOf(h) + gutter);
+      lastRow = Math.max(lastRow, r);
+    }
+    let widest = 0;
+    for (const w of widthByRow.values()) widest = Math.max(widest, w - gutter);
+    if (widest <= 0) return Infinity;
+    const used = lastRow + 1;
+    const height = used * rowHeight + (used - 1) * gutter;
+    return Math.abs(Math.log((widest / height) / aspect));
+  }
+
+  // Wrap islands into grid rows whose overall bounds sit closest to the
+  // output's aspect, so workspace.fit frames a block shaped like the
+  // screen instead of a long ribbon. Rows are uniform-height, so only the
+  // wrap width is in question: try every row count, greedily fill in slot
+  // order against the width that count's bounds could afford, and keep the
+  // packing that scores best. Wide (elastic) islands therefore wrap after
+  // fewer columns than narrow ones -- a count-based wrap can only assume
+  // every island is workarea-wide.
+  function packRows(
+    ordered: ReadonlyArray<WorkspaceHandle>,
+    widthOf: (h: WorkspaceHandle) => number,
+    rowHeight: number,
+    aspect: number,
+  ): { rows: Map<WorkspaceHandle, number>; score: number } | null {
+    if (ordered.length === 0 || rowHeight <= 0 || aspect <= 0) return null;
+    let best: { rows: Map<WorkspaceHandle, number>; score: number } | null = null;
+    for (let r = 1; r <= ordered.length; r++) {
+      const budget = aspect * (r * rowHeight + (r - 1) * gutter);
+      const rows = new Map<WorkspaceHandle, number>();
+      let row = 0;
+      let x = 0;
+      for (const h of ordered) {
+        const w = widthOf(h);
+        // An island wider than the budget still takes its own row rather
+        // than leaving an empty one above it.
+        if (x > 0 && x + w > budget) { row++; x = 0; }
+        rows.set(h, row);
+        x += w + gutter;
+      }
+      const score = rowsScore(ordered, rows, widthOf, rowHeight, aspect);
+      // Strict: ties keep the earlier (flatter) packing.
+      if (!best || score < best.score) best = { rows, score };
+    }
+    return best;
+  }
+
   // The members the layout will tile, mirroring the driver's compute()
   // lane filter: managed, non-exclusive, visible. Returns null when an
   // exclusive (maximized / fullscreen) member collapses the island to
@@ -951,6 +1026,9 @@ export default async function init(
     for (const h of [...layoutByHandle.keys()]) {
       if (!state.byHandle.has(h)) layoutByHandle.delete(h);
     }
+    for (const h of [...rowByHandle.keys()]) {
+      if (!state.byHandle.has(h)) rowByHandle.delete(h);
+    }
     // Elastic growth reads each member's lane from a windows snapshot.
     // Any source of elasticity counts: the config default, runtime
     // set-elastic overrides, AND per-name declarations (canvas.workspaces
@@ -1001,8 +1079,8 @@ export default async function init(
       // usable glass): bars are lens furniture, so the world packs pure
       // content edge-to-edge and the docked camera offsets each island
       // into the workarea. "rows" is one filmstrip; "grid" wraps
-      // row-major after ~sqrt(N) islands (the near-square block
-      // maximizes the fit zoom), stepping y by island height + gutter.
+      // row-major at the width that shapes the fit bounds like the
+      // screen (packRows), stepping y by island height + gutter.
       // A growing island shoves its right-hand neighbors along its own
       // (grid) row -- order-preserving and monotone (canvas-design.md
       // §6's shove, scoped to one row; grid rows are independent).
@@ -1012,20 +1090,34 @@ export default async function init(
         const wa = workareaOf(outputId, g);
         const ordered = [...handles].sort(
           (a, b) => (slots.get(a) ?? 0) - (slots.get(b) ?? 0));
-        const cols = arrangement === "grid"
-          ? Math.max(1, Math.ceil(Math.sqrt(ordered.length))) : Infinity;
-        let x = g.x;
-        let gridRow = 0;
-        let col = 0;
+        if (arrangement === "grid" && g.height > 0) {
+          const aspect = g.width / g.height;
+          const widthOf = (h: WorkspaceHandle) => widthByHandle.get(h) ?? wa.width;
+          const key = ordered.join(",");
+          const reshaped = packedSetByOutput.get(outputId) !== key
+            || ordered.some((h) => !rowByHandle.has(h));
+          packedSetByOutput.set(outputId, key);
+          const best = packRows(ordered, widthOf, wa.height, aspect);
+          if (best) {
+            const current = reshaped
+              ? Infinity
+              : rowsScore(ordered, rowByHandle, widthOf, wa.height, aspect);
+            if (best.score < current * REPACK_MARGIN) {
+              for (const [h, r] of best.rows) rowByHandle.set(h, r);
+            }
+          }
+        }
+        // x advances per row: rows are independent strips.
+        const xByRow = new Map<number, number>();
         for (const h of ordered) {
-          if (col >= cols) { col = 0; gridRow++; x = g.x; }
+          const gridRow = arrangement === "grid" ? (rowByHandle.get(h) ?? 0) : 0;
+          const x = xByRow.get(gridRow) ?? g.x;
           const width = widthByHandle.get(h) ?? wa.width;
           row.set(h, {
             x, y: g.y + gridRow * (wa.height + gutter),
             width, height: wa.height,
           });
-          x += width + gutter;
-          col++;
+          xByRow.set(gridRow, x + width + gutter);
         }
       }
       rowRectsByOutput.set(outputId, row);
