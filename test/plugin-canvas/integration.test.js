@@ -1044,6 +1044,35 @@ test('elastic: islands grow to the layout measure and shove the row', async () =
   }, { canvas: { world: true, elastic: true }, layout: { mode: 'columns' } });
 });
 
+// Two apps side by side with a gap configured: the island must equal the
+// workarea, so focusing between them never scrolls the camera. Measuring
+// the gap bands into the strip instead leaves it 3 x gap too wide and the
+// pair visibly drifts on and off the glass.
+test('elastic: two 0.5 columns with a gap leave nothing offscreen', async () => {
+  await withCanvasPlugin(async (h) => {
+    const { rt, sink, islands, addWindow } = h;
+    addWindow(101);
+    await settle();
+    addWindow(102);
+    await settle();
+    const list = await call(rt, 'list', [0]);
+    assert.deepEqual(islands().find((i) => i.id === list[0].handle).rect,
+      { x: 0, y: 0, width: 800, height: 600 },
+      'the island fits the glass exactly');
+
+    // Focusing back and forth holds the camera still: with maxScroll 0
+    // there is nothing to reveal.
+    sink.cameraCalls.length = 0;
+    for (const id of [101, 102, 101]) {
+      h.pluginBus.emit('window.change',
+        { surfaceId: id, activated: true, changed: ['activated'] });
+      await settle();
+    }
+    const scrolled = sink.cameraCalls.filter((c) => c.x !== 0);
+    assert.deepEqual(scrolled, [], 'no camera scroll between two fitting windows');
+  }, { canvas: { world: true, elastic: true }, layout: { mode: 'columns', gap: 10 } });
+});
+
 test('elastic + master-stack: growth is inert (master-stack always fits)', async () => {
   await withCanvasPlugin(async (h) => {
     const { rt, islands, addWindow } = h;
@@ -1110,27 +1139,27 @@ test('elastic: scroll reveals keep the layout gap visible (margin = gap)', async
     await settle();
     addWindow(103);
     await settle();
-    // 3 columns of 400 + 2 inner gaps + 2 outer gap bands = 1240 wide;
-    // viewport 800 -> maxScroll 440. The measured region gives every
-    // column its full natural width (the gaps are measured in, not
-    // carved out of the columns).
+    // 3 columns of 0.5 measure to 1200 -- the gaps are carved out of the
+    // columns (386/386/388 at x=10/406/802), never added around them, so
+    // the strip is exactly 3 half-glass pitches. Viewport 800 ->
+    // maxScroll 400.
     sink.cameraCalls.length = 0;
 
-    // Reveal the RIGHTMOST column (x = island + 830, right edge 1230).
-    // With the gap margin the scroll clamps to maxScroll -- the
-    // island-edge gap band stays visible -- instead of stopping short.
+    // Reveal the RIGHTMOST column (right edge at island x + 1190). With
+    // the gap margin the scroll clamps to maxScroll -- the island-edge
+    // gap band stays visible -- instead of stopping 10px short.
     pluginBus.emit('window.change',
       { surfaceId: 101, activated: true, changed: ['activated'] });
     pluginBus.emit('stack.relayout', {
       reason: 'mapped',
       windows: [{
         surfaceId: 101, oldOuter: null, oldOutputId: 0,
-        newOuter: { x: 830, y: 10, width: 400, height: 580 },
+        newOuter: { x: 802, y: 10, width: 388, height: 580 },
         newOutputId: 0, tiling: 'managed',
       }],
     });
     await settle();
-    assert.deepEqual(sink.cameraCalls.at(-1), { outputId: 0, x: 440, y: 0, zoom: 1 });
+    assert.deepEqual(sink.cameraCalls.at(-1), { outputId: 0, x: 400, y: 0, zoom: 1 });
 
     // Reveal the LEFTMOST column (x = island + 10): scroll returns to 0,
     // not 10 -- the left gap is never eaten.
@@ -1140,7 +1169,7 @@ test('elastic: scroll reveals keep the layout gap visible (margin = gap)', async
       reason: 'reorder',
       windows: [{
         surfaceId: 103, oldOuter: null, oldOutputId: 0,
-        newOuter: { x: 10, y: 10, width: 400, height: 580 },
+        newOuter: { x: 10, y: 10, width: 386, height: 580 },
         newOutputId: 0, tiling: 'managed',
       }],
     });

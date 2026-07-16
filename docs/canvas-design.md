@@ -258,14 +258,25 @@ widths follow reorders, pruned when the window leaves the island.
 `layout.grow-column` / `layout.shrink-column { surfaceId? }` (default:
 the focused window) adjust one width through `setParams({ surfaceId,
 widthDelta })`, the same plumbing shape as the master-fraction actions.
-Under elastic growth a width change changes the measure (Σ widths +
-gaps) and shoves neighbors (§6); under fixed growth it changes the
-ratios within the workarea. The invariant this restores: every
-mode × growth combination keeps a live, user-visible size knob — an
-elastic island is never more restrictive than a fixed one. (Params
-other than per-window widths — `masterFraction`, `gap` — remain
-provider-global until the registry lands: a fraction tweak still
-applies to every master-stack island at once.)
+Under elastic growth a width change changes the measure and shoves
+neighbors (§6); under fixed growth it changes the ratios within the
+workarea. The invariant this restores: every mode × growth combination
+keeps a live, user-visible size knob — an elastic island is never more
+restrictive than a fixed one. (Params other than per-window widths —
+`masterFraction`, `gap` — remain provider-global until the registry
+lands: a fraction tweak still applies to every master-stack island at
+once.)
+
+A column's fraction is its share of the workarea PITCH — the glass it
+occupies *including* its gap allotment — so the measure is Σ widths,
+with the gaps carved out of the columns rather than added around them.
+That is what makes N columns of 1/N tile the glass exactly: the
+everyday two-windows-side-by-side case must leave nothing offscreen.
+Measuring Σ widths + gaps instead puts every such pair 3 × gap past the
+viewport edge, and the camera scrolls a strip that plainly fits. The
+trade is that a column is fractionally narrower than `column ×
+workarea` once gap > 0 — the same one master-stack makes, where the gap
+eats the tiles, not the screen.
 
 Visibility: `setOutputStack` semantics invert from "the shown workspace's
 members" to "everything near the camera's view rect" (with margin for

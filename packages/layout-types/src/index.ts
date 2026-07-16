@@ -189,10 +189,15 @@ export interface LayoutPluginConfig {
   // layout.grow-master / shrink-master actions adjust this at runtime.
   // Consumed by master-stack mode.
   masterFraction?: number;
-  // Default column-width fraction (of the workarea width) in [0.1, 1].
-  // Default 0.5. Seeds each window's column width in columns mode; the
-  // layout.grow-column / shrink-column actions adjust one window's
-  // width at runtime.
+  // Default column-width fraction in [0.1, 1]. Default 0.5. Seeds each
+  // window's column width in columns mode; the layout.grow-column /
+  // shrink-column actions adjust one window's width at runtime.
+  //
+  // The fraction is of the workarea PITCH -- a column's share of the
+  // glass INCLUDING its gap allotment -- so N columns at 1/N tile the
+  // screen exactly with nothing offscreen (two 0.5 columns fit side by
+  // side). With gap > 0 a column is therefore fractionally narrower
+  // than `column x workarea`.
   column?: number;
   // Initial gap (logical px) between tiles AND around the outer edge of
   // the work area. Default 0 (no gap; tiles touch). The runtime gap

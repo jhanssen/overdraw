@@ -76,22 +76,32 @@ export function columnsLayout(
   return rects;
 }
 
-// The columns' natural region size: every column at its stated pixel
-// width, plus inter-column gaps and the outer gap band, floored at the
-// workarea (islands grow; they never shrink below the glass). Zero
-// windows measure to the workarea itself.
+// The columns' natural region size: the sum of the column widths,
+// floored at the workarea (islands grow; they never shrink below the
+// glass). Zero windows measure to the workarea itself.
+//
+// A column width is its share of the WORKAREA PITCH -- the gaps come out
+// of the columns, they are not added around them. This is what makes N
+// columns at fraction 1/N tile the glass exactly with nothing offscreen
+// (the common case: two 0.5 columns side by side). Adding the gap bands
+// here instead would push every such pair (2g + 1g) past the viewport
+// edge and force the camera to scroll a strip that visibly ought to fit.
+// The cost is that a column is fractionally narrower than
+// `column x workarea` once gap > 0 -- the same trade master-stack makes,
+// where the gap eats into the tiles rather than the screen.
 export function columnsMeasure(
   widthsPx: ReadonlyArray<number>,
   workarea: { width: number; height: number },
-  gap = 0,
 ): { width: number; height: number } {
   const n = widthsPx.length;
   if (n === 0) return { width: workarea.width, height: workarea.height };
-  const g = Math.max(0, gap | 0);
+  // Sum first, round once. Rounding each column instead lets the error
+  // accumulate: three 1/3 columns of a 3440px glass round to 1147 apiece
+  // and measure 3441 -- one pixel of scroll on a strip that fits.
   let natural = 0;
-  for (const w of widthsPx) natural += Math.max(1, Math.round(w));
+  for (const w of widthsPx) natural += Math.max(0, w);
   return {
-    width: Math.max(workarea.width, natural + (n - 1) * g + 2 * g),
+    width: Math.max(workarea.width, Math.round(natural)),
     height: workarea.height,
   };
 }

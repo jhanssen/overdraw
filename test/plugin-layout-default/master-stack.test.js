@@ -155,23 +155,47 @@ test('columns: degenerate tiny output stays finite and non-negative', async () =
   }
 });
 
-test('columns: a region pre-sized by columnsMeasure places columns at their natural px widths', async () => {
+test('columns: a region pre-sized by columnsMeasure fits every column, gaps carved out', async () => {
   const { columnsLayout, columnsMeasure } =
     await import('../../packages/plugin-layout-default/dist/master-stack.js');
   const wa = { width: 1000, height: 600 };
   const widthsPx = [500, 500, 750]; // fractions 0.5, 0.5, 0.75 of the workarea
-  const m = columnsMeasure(widthsPx, wa, 10);
-  // 2*10 outer + 2*10 inner + 1750 natural = 1790
-  assert.deepEqual(m, { width: 1790, height: 600 });
+  const m = columnsMeasure(widthsPx, wa);
+  // The natural sum; gaps are NOT added around the columns.
+  assert.deepEqual(m, { width: 1750, height: 600 });
   const r = columnsLayout(widthsPx, { width: m.width, height: m.height }, 10);
-  assert.deepEqual(r.map((c) => c.width), [500, 500, 750]);
-  assert.equal(r[2].x + r[2].width, 10 + (1790 - 20));
+  // Columns keep their 1:1:1.5 proportions, each shaved by its gap share.
+  assert.deepEqual(r.map((c) => c.width), [488, 488, 734]);
+  // The row tiles the region exactly: no column falls outside it.
+  assert.equal(r[2].x + r[2].width, 10 + (1750 - 20));
 });
 
-test('columnsMeasure: empty -> the workarea; few windows floor at the workarea', async () => {
+// The invariant that keeps a normal two-window screen fully on-glass.
+// Adding the gap bands to the measure instead pushes N columns of 1/N
+// (2 x 0.5 being the everyday case) 3 x gap past the viewport, so the
+// camera scrolls a strip that plainly ought to fit.
+test('columns: N columns at 1/N measure to exactly the workarea -- nothing offscreen', async () => {
+  const { columnsLayout, columnsMeasure } =
+    await import('../../packages/plugin-layout-default/dist/master-stack.js');
+  for (const W of [3440, 2560, 1920, 800]) {
+    const wa = { width: W, height: 1440 };
+    for (const [n, frac] of [[2, 0.5], [3, 1 / 3], [4, 0.25]]) {
+      const widths = Array(n).fill(frac * W);
+      const m = columnsMeasure(widths, wa);
+      assert.equal(m.width, W,
+        `${n} columns of ${frac} on a ${W}px workarea must not exceed the glass`);
+      // ...and the tiles land inside it with the gaps taken out of them.
+      const r = columnsLayout(widths, { width: m.width, height: m.height }, 10);
+      assert.ok(r[n - 1].x + r[n - 1].width <= W, 'last column ends on-screen');
+      assert.ok(r[0].x >= 0, 'first column starts on-screen');
+    }
+  }
+});
+
+test('columnsMeasure: empty -> the workarea; narrow columns floor at the workarea', async () => {
   const { columnsMeasure } = await import('../../packages/plugin-layout-default/dist/master-stack.js');
   const wa = { width: 1000, height: 600 };
-  assert.deepEqual(columnsMeasure([], wa, 10), { width: 1000, height: 600 });
-  // one half-width column: natural 500 + 20 outer < workarea -> floor
-  assert.deepEqual(columnsMeasure([500], wa, 10), { width: 1000, height: 600 });
+  assert.deepEqual(columnsMeasure([], wa), { width: 1000, height: 600 });
+  // one half-width column: natural 500 < workarea -> floor
+  assert.deepEqual(columnsMeasure([500], wa), { width: 1000, height: 600 });
 });

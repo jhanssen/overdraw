@@ -189,7 +189,7 @@ export default async function init(sdk: PluginSdkShape, rawConfig?: unknown): Pr
       }
       const widthsPx = inputs.windows.map(
         (w) => widthOf(w.id, column) * wa.width);
-      return columnsMeasure(widthsPx, wa, params.gap);
+      return columnsMeasure(widthsPx, wa);
     },
   };
 
