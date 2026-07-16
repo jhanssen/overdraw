@@ -1019,7 +1019,13 @@ validated + resolved + consumed by the runtime + hotkey plugin.
   The row arrangement uses cumulative origins so a growing island
   shoves its right-hand neighbors; the docked camera scrolls within
   the strip to follow focus (focus changes + the focused window's
-  retiles via stack.relayout). Off-view frame pacing is FIXED with
+  retiles via stack.relayout). The reveal is POSITIONAL, not minimal
+  (canvas-design.md §5 "The focused column's position in the strip
+  picks its alignment"): a column with neighbors on both sides centers
+  so each peeks in, head/tail columns sit flush to the side that has
+  strip in it, and a column wider than the view keeps left-edge-wins.
+  Minimal scroll hid the far neighbor entirely with no hint it existed
+  -- under follow-pointer that left it pointer-unreachable. Off-view frame pacing is FIXED with
   it: surfaces outside every camera view now get wl_callback.done
   from any output's flip-complete (idle compositors force one flip),
   so off-view clients that block on done before committing (e.g. a

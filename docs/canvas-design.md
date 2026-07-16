@@ -301,6 +301,20 @@ overflowed its workarea would overlap its neighbors in the world. A
 `max` never forces either: the slack is absorbed by neighboring columns
 rather than left as dead glass.
 
+**The focused column's position in the strip picks its alignment.** A
+strip wider than the glass means the docked camera chooses what sits
+beside the focus, and the choice is the user's only evidence of what
+exists off-view. A column with strip on BOTH sides is therefore
+CENTERED, splitting the slack so each neighbor peeks in; a head or tail
+column sits flush to the side that has strip in it, spending the slack
+where there is something to show rather than on void. Revealing a column
+flush against the edge it came from instead — the minimal scroll — hides
+whatever is past that edge and gives no hint it is there at all, which
+under follow-pointer focus makes it unreachable: there is nothing on
+screen to aim at, so the neighbor can only be reached by fit, pan, or a
+keyboard cycle. A column wider than the view can satisfy neither rule;
+its left edge wins.
+
 Visibility: `setOutputStack` semantics invert from "the shown workspace's
 members" to "everything near the camera's view rect" (with margin for
 pan). The camera + per-output scissor culls; windows far off-view are

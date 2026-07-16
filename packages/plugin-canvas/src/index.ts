@@ -362,7 +362,7 @@ export default async function init(
             // the stack.relayout trigger instead.
             if (!snap?.outer || snap.outer.width <= 0) return;
             if (focusedSurfaceId !== sid) return;
-            if (ensureVisibleScroll(rec.outputId, handle, snap.outer) !== null) {
+            if (revealScroll(rec.outputId, handle, snap.outer) !== null) {
               await applyScroll(rec.outputId);
             }
           })();
@@ -418,7 +418,7 @@ export default async function init(
     const rec = state.byHandle.get(handle);
     if (!rec || override.has(rec.outputId)) return;
     if (state.shownByOutput.get(rec.outputId) !== handle) return;
-    if (ensureVisibleScroll(rec.outputId, handle, entry.newOuter) !== null) {
+    if (revealScroll(rec.outputId, handle, entry.newOuter) !== null) {
       void applyScroll(rec.outputId);
     }
   });
@@ -730,12 +730,21 @@ export default async function init(
     };
   }
 
-  // Minimal scroll bringing `rect` fully into the docked view of
-  // `handle`'s island -- the WORKAREA-wide window onto the strip (left
-  // edge wins for windows wider than the view). Updates scrollByHandle;
-  // returns the new scroll, or null when the current view already
-  // contains the rect.
-  function ensureVisibleScroll(
+  // Where the focused column `rect` sits in the docked view of `handle`'s
+  // island -- the WORKAREA-wide window onto the strip. The column's place
+  // in the strip picks the alignment, so the view always says what lies
+  // on either side of the focus:
+  //   neighbors both sides -> CENTERED, so both peek in and either can be
+  //     hovered or clicked. A column revealed flush against the edge it
+  //     came from hides whatever is past that edge with no hint it is
+  //     there -- unreachable by pointer, since there is nothing to aim at.
+  //   only one neighbor -> flush to ITS side (head sits left, tail sits
+  //     right), spending the slack on the one direction that has strip in
+  //     it rather than on void.
+  // A column wider than the view can't do either; its left edge wins.
+  // Updates scrollByHandle; returns the new scroll, or null when the view
+  // already sits there.
+  function revealScroll(
     outputId: number, handle: WorkspaceHandle,
     rect: { x: number; width: number },
   ): number | null {
@@ -745,16 +754,23 @@ export default async function init(
     const wa = workareaOf(outputId, g);
     const maxScroll = Math.max(0, isl.width - wa.width);
     const prev = scrollByHandle.get(handle) ?? 0;
-    // Reveal with the gap band: the margin keeps the layout's
-    // inter-column gap visible at the view edge (the neighbor ends
-    // exactly at the edge; the leftmost/rightmost columns keep their
-    // island-edge gap since clamping lands on 0 / maxScroll).
+    // The margin keeps the layout's inter-column gap visible at the view
+    // edge: the neighbor ends exactly at the edge. The head/tail columns
+    // keep their island-edge gap since clamping lands on 0 / maxScroll.
     const m = Math.min(scrollMargin, wa.width / 4);
-    let s = Math.min(maxScroll, Math.max(0, prev));
-    if (rect.x + rect.width + m > isl.x + s + wa.width) {
+    // Columns tile the island edge to edge, so anything but the head has
+    // strip to its left and anything but the tail has strip to its right.
+    const hasLeft = rect.x - isl.x > m;
+    const hasRight = (isl.x + isl.width) - (rect.x + rect.width) > m;
+    const slack = wa.width - rect.width;
+    let s: number;
+    if (slack <= 0 || (!hasLeft && hasRight)) {
+      s = rect.x - m - isl.x;
+    } else if (hasLeft && hasRight) {
+      s = Math.round(rect.x - isl.x - slack / 2);
+    } else {
       s = rect.x + rect.width + m - wa.width - isl.x;
     }
-    if (rect.x - m < isl.x + s) s = rect.x - m - isl.x;
     s = Math.min(maxScroll, Math.max(0, s));
     scrollByHandle.set(handle, s);
     return s !== prev ? s : null;

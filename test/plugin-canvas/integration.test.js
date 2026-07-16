@@ -1203,6 +1203,43 @@ test('elastic: scroll reveals keep the layout gap visible (margin = gap)', async
   }, { canvas: { world: true, elastic: true }, layout: { mode: 'columns', gap: 10 } });
 });
 
+// The focused column's place in the strip picks its alignment: a column
+// with strip on both sides is centered so both neighbors peek in (each is
+// then hoverable, and their existence is visible at all); head and tail
+// columns sit flush to the side that has strip in it.
+test('elastic: a column with neighbors both sides is centered; head/tail sit flush', async () => {
+  await withCanvasPlugin(async (h) => {
+    const { sink, pluginBus, addWindow } = h;
+    for (const id of [101, 102, 103]) { addWindow(id); await settle(); }
+    // Strip 1200 (3 x 400), viewport 800 -> 400px of scroll to spend.
+    const focus = async (surfaceId, x) => {
+      pluginBus.emit('window.change',
+        { surfaceId, activated: true, changed: ['activated'] });
+      pluginBus.emit('stack.relayout', {
+        reason: 'reorder',
+        windows: [{
+          surfaceId, oldOuter: null, oldOutputId: 0,
+          newOuter: { x, y: 0, width: 400, height: 600 },
+          newOutputId: 0, tiling: 'managed',
+        }],
+      });
+      await settle();
+      return sink.cameraCalls.at(-1);
+    };
+
+    // Middle column (400..800): centered, so 200px of each neighbor shows.
+    assert.deepEqual(await focus(102, 400), { outputId: 0, x: 200, y: 0, zoom: 1 },
+      'the middle column centers, leaving both neighbors visible');
+    // Head column (0..400): nothing to its left, so it sits flush left
+    // rather than spending the slack on void.
+    assert.deepEqual(await focus(101, 0), { outputId: 0, x: 0, y: 0, zoom: 1 },
+      'the head column sits flush left');
+    // Tail column (800..1200): flush right, same reason mirrored.
+    assert.deepEqual(await focus(103, 800), { outputId: 0, x: 400, y: 0, zoom: 1 },
+      'the tail column sits flush right');
+  }, { canvas: { world: true, elastic: true }, layout: { mode: 'columns' } });
+});
+
 test('elastic: the docked camera scrolls to keep the focused window visible', async () => {
   await withCanvasPlugin(async (h) => {
     const { rt, sink, pluginBus, addWindow } = h;
