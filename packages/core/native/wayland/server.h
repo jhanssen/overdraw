@@ -14,6 +14,7 @@
 #include <functional>
 #include <memory>
 #include <string>
+#include <thread>
 
 #include <uv.h>
 
@@ -57,8 +58,14 @@ class Server {
     void drainEvents();
 
   private:
-    static void onLoopReadable(uv_poll_t* handle, int status, int events);
+    static void onAsync(uv_async_t* handle);
     static void onPrepare(uv_prepare_t* handle);
+
+    // Watcher-thread body: poll(2) on the wayland event-loop fd + the stop
+    // eventfd; hand readiness to the main thread via async_ and wait for the
+    // dispatch handshake. See the comment in start() for why uv_poll cannot
+    // be used here (the fd is an epoll fd).
+    void watchLoop();
 
     wl_display* display_ = nullptr;
     wl_event_loop* eventLoop_ = nullptr;
@@ -66,7 +73,11 @@ class Server {
 
     PumpHook onPump_;
 
-    uv_poll_t poll_{};
+    int wlFd_ = -1;    // libwayland's event-loop epoll fd (owned by libwayland)
+    int stopFd_ = -1;  // eventfd; written by stop() to end the watcher thread
+    std::thread watcher_;
+    uv_sem_t dispatchedSem_{};
+    uv_async_t async_{};
     uv_prepare_t prepare_{};
     bool started_ = false;
 };
