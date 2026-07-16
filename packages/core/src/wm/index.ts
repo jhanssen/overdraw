@@ -2157,7 +2157,18 @@ export function createWm(
       // default to floating. Constraints are append-only data with no
       // downstream invariants beyond the floating classification;
       // stamping them eagerly is safe.
+      // The stamp jumps ahead of the diff below, so keep what the
+      // constraints were before it: that is the baseline the commit
+      // diffs against, or a constraints-only proposal reads as
+      // unchanged and never reaches subscribers.
+      let preStamp: WindowState["constraints"] | null = null;
       if (proposal.constraints !== undefined) {
+        preStamp = {
+          minSize: win.windowState.constraints.minSize
+            ? { ...win.windowState.constraints.minSize } : null,
+          maxSize: win.windowState.constraints.maxSize
+            ? { ...win.windowState.constraints.maxSize } : null,
+        };
         win.windowState = {
           ...win.windowState,
           constraints: {
@@ -2186,6 +2197,7 @@ export function createWm(
         if (!windows.includes(win)) return null;
 
         const current = cloneState(win.windowState);
+        if (preStamp) current.constraints = preStamp;
         let candidate = mergeProposal(current, proposal);
 
         if (pluginBus) {

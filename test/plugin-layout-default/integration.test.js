@@ -334,6 +334,56 @@ test('setParams: column width clamps to [0.1, 1] and accumulates', async () => {
   });
 });
 
+test('measure + compute honor a window\'s min width; the strip grows to hold it', async () => {
+  await withRuntime({}, async (rt) => {
+    await rt.load([
+      bundledToResolved(layoutPluginSpec, layoutPluginSpec.module,
+        { layout: { mode: 'columns', gap: 10 } }),
+    ]);
+    await rt.waitForNamespace('layout');
+    const wa = { width: 1000, height: 600 };
+    const constraints = { minSize: { width: 700, height: 0 }, maxSize: null };
+
+    // Two 0.5 columns would be 500 each; window 1 needs 700.
+    const m = await rt.invokeNamespace('layout', 'measure', [{
+      windows: [{ id: 1, constraints }, { id: 2 }],
+      workarea: wa, island: { id: 7 },
+    }]);
+    assert.equal(m.width, 1215, 'the strip grows past the glass to hold the floor');
+
+    const r = await rt.invokeNamespace('layout', 'compute', [{
+      output: { id: 0, rect: { x: 0, y: 0, width: 1000, height: 600 }, scale: 1 },
+      tileRegion: { x: 0, y: 0, width: m.width, height: m.height },
+      island: { id: 7 },
+      windows: [
+        { id: 1, role: 'toplevel', constraints },
+        { id: 2, role: 'toplevel' },
+      ],
+      reason: 'mapped',
+    }]);
+    assert.equal(r.rects.find((x) => x.id === 1).outer.width, 700, 'min honored exactly');
+    assert.equal(r.rects.find((x) => x.id === 2).outer.width, 485);
+  });
+});
+
+test('measure ignores min HEIGHT: columns are full-height, strips grow along x', async () => {
+  await withRuntime({}, async (rt) => {
+    await rt.load([
+      bundledToResolved(layoutPluginSpec, layoutPluginSpec.module,
+        { layout: { mode: 'columns' } }),
+    ]);
+    await rt.waitForNamespace('layout');
+    // A window demanding more height than the glass changes nothing: the
+    // island's height is its workarea's, and there is no vertical growth
+    // for this mode to ask for.
+    const m = await rt.invokeNamespace('layout', 'measure', [{
+      windows: [{ id: 1, constraints: { minSize: { width: 0, height: 5000 }, maxSize: null } }],
+      workarea: { width: 1000, height: 600 }, island: { id: 7 },
+    }]);
+    assert.deepEqual(m, { width: 1000, height: 600 });
+  });
+});
+
 test('an unresized window follows its island declaration; a resized one pins', async () => {
   await withRuntime({}, async (rt) => {
     await rt.load([

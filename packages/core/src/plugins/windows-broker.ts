@@ -553,8 +553,19 @@ export function createWindowsBroker(deps: WindowsBrokerDeps): WindowsBroker {
       throw new Error("windows.measure-island: layout must be an object");
     }
     if (!deps.invokeLayout) return null;
+    // The caller supplies ids; core supplies each window's constraints,
+    // from the same state the layout driver hands compute(). A provider
+    // that honors a min width has to see it here too, or it measures a
+    // strip that its own compute() then overflows.
     const inputs = {
-      windows: q.windows.map((id) => ({ id })),
+      windows: q.windows.map((id) => {
+        const c = wm.getWindowState(id)?.constraints;
+        const minSize = c?.minSize ? { ...c.minSize } : null;
+        const maxSize = c?.maxSize ? { ...c.maxSize } : null;
+        return (minSize || maxSize)
+          ? { id, constraints: { minSize, maxSize } }
+          : { id };
+      }),
       workarea: { width: wa.width, height: wa.height },
       island: {
         id: q.islandId,

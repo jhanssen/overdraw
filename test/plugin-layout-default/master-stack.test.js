@@ -192,6 +192,87 @@ test('columns: N columns at 1/N measure to exactly the workarea -- nothing offsc
   }
 });
 
+// ---- columns: width constraints -------------------------------------------
+// A column is full-height, so only the width half of a window's min/max is
+// expressible: min widens the column past its fraction, max narrows it, and
+// the strip's measure follows.
+
+test('columns: a min width widens the column exactly and grows the strip', async () => {
+  const { columnsLayout, columnsMeasure } =
+    await import('../../packages/plugin-layout-default/dist/master-stack.js');
+  const wa = { width: 3440, height: 1440 };
+  const weights = [0.5, 0.5];
+  const px = weights.map((w) => w * wa.width);
+  const bounds = [{ min: 2000 }, undefined];
+
+  const m = columnsMeasure(px, wa, 10, bounds);
+  assert.equal(m.width, 3735, 'strip grows to hold the floored column');
+  const r = columnsLayout(weights, { width: m.width, height: m.height }, 10, bounds);
+  assert.equal(r[0].width, 2000, 'the floor is honored exactly, not approximately');
+  assert.equal(r[1].width, 1705, 'the unconstrained neighbor keeps its fair share');
+});
+
+test('columns: every column min-pinned still gets its full minimum', async () => {
+  // The case that forces the measure to reserve each bound's gap
+  // allotment: without it the water-fill shaves every column by a gap and
+  // no window gets its minimum.
+  const { columnsLayout, columnsMeasure } =
+    await import('../../packages/plugin-layout-default/dist/master-stack.js');
+  const wa = { width: 3440, height: 1440 };
+  const bounds = [{ min: 2000 }, { min: 2000 }];
+  const m = columnsMeasure([1720, 1720], wa, 10, bounds);
+  const r = columnsLayout([0.5, 0.5], { width: m.width, height: m.height }, 10, bounds);
+  assert.deepEqual(r.map((c) => c.width), [2000, 2000]);
+});
+
+test('columns: a max width narrows the column and the neighbor takes the slack', async () => {
+  const { columnsLayout, columnsMeasure } =
+    await import('../../packages/plugin-layout-default/dist/master-stack.js');
+  const wa = { width: 3440, height: 1440 };
+  const bounds = [{ max: 1000 }, undefined];
+  const m = columnsMeasure([1720, 1720], wa, 10, bounds);
+  assert.equal(m.width, 3440, 'a narrower column shortens the strip, floored at the glass');
+  const r = columnsLayout([0.5, 0.5], { width: m.width, height: m.height }, 10, bounds);
+  assert.equal(r[0].width, 1000, 'max honored');
+  assert.equal(r[1].width, 2410, 'the slack goes to the neighbor -- no dead space');
+  assert.equal(r[1].x + r[1].width, 3430, 'the row still fills the glass');
+});
+
+test('columns: a min above a max wins (a client may state both nonsensically)', async () => {
+  const { columnsLayout } =
+    await import('../../packages/plugin-layout-default/dist/master-stack.js');
+  const r = columnsLayout([0.5, 0.5], { width: 3735, height: 1440 }, 10,
+    [{ min: 2000, max: 1200 }, undefined]);
+  assert.equal(r[0].width, 2000);
+});
+
+test('columns: a fixed region honors what it can and squeezes what it cannot', async () => {
+  const { columnsLayout } =
+    await import('../../packages/plugin-layout-default/dist/master-stack.js');
+  const region = { width: 1000, height: 600 };
+  // Satisfiable: 400 fits inside the compressed region, so it is honored.
+  const ok = columnsLayout([0.5, 0.5], region, 10, [{ min: 400 }, undefined]);
+  assert.ok(ok[0].width >= 400, 'a reachable floor is honored under compression');
+
+  // Impossible: two 800px floors cannot share a 1000px island. The columns
+  // squeeze rather than overflow -- an island may not run over its
+  // neighbor, so the glass wins and the clients are told the truth.
+  const tight = columnsLayout([0.5, 0.5], region, 10, [{ min: 800 }, { min: 800 }]);
+  const rightEdge = tight[1].x + tight[1].width;
+  assert.ok(rightEdge <= region.width - 10,
+    `columns stay inside the island (right edge ${rightEdge})`);
+  assert.ok(tight[0].width < 800, 'the unsatisfiable floor is squeezed, not overflowed');
+});
+
+test('columns: unconstrained windows are unaffected by a constrained peer', async () => {
+  const { columnsLayout } =
+    await import('../../packages/plugin-layout-default/dist/master-stack.js');
+  const region = { width: 1200, height: 600 };
+  const before = columnsLayout([0.5, 0.5, 0.5], region, 10);
+  const after = columnsLayout([0.5, 0.5, 0.5], region, 10, [undefined, undefined, undefined]);
+  assert.deepEqual(after, before, 'empty bounds change nothing');
+});
+
 test('columnsMeasure: empty -> the workarea; narrow columns floor at the workarea', async () => {
   const { columnsMeasure } = await import('../../packages/plugin-layout-default/dist/master-stack.js');
   const wa = { width: 1000, height: 600 };

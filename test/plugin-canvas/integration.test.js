@@ -1073,6 +1073,31 @@ test('elastic: two 0.5 columns with a gap leave nothing offscreen', async () => 
   }, { canvas: { world: true, elastic: true }, layout: { mode: 'columns', gap: 10 } });
 });
 
+// A client that states a minimum wider than its share: the strip grows to
+// hold it rather than handing it a column it cannot function in. The whole
+// path runs -- window state -> measure-island -> the provider's measure()
+// -> the published island rect.
+test('elastic: a min-width window grows the strip instead of being squeezed', async () => {
+  await withCanvasPlugin(async (h) => {
+    const { rt, islands, wm, addWindow } = h;
+    addWindow(101);
+    await settle();
+    addWindow(102);
+    await settle();
+    const list = await call(rt, 'list', [0]);
+    // Two 0.5 columns of an 800px glass fit exactly.
+    assert.equal(islands().find((i) => i.id === list[0].handle).rect.width, 800);
+
+    // 101 now needs 600px; its 400px column cannot hold it.
+    await wm.propose(101, {
+      constraints: { minSize: { width: 600, height: 0 }, maxSize: null },
+    }, 'client-request');
+    await settle();
+    assert.equal(islands().find((i) => i.id === list[0].handle).rect.width, 1015,
+      'the strip grew to seat the 600px floor (plus its gap allotment)');
+  }, { canvas: { world: true, elastic: true }, layout: { mode: 'columns', gap: 10 } });
+});
+
 test('elastic + master-stack: growth is inert (master-stack always fits)', async () => {
   await withCanvasPlugin(async (h) => {
     const { rt, islands, addWindow } = h;

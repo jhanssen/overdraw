@@ -37,7 +37,7 @@ function makeBroker(invokeLayout) {
     wm, compositor: sink, state, pluginBus, bus,
     ...(invokeLayout ? { invokeLayout } : {}),
   });
-  return { broker };
+  return { broker, wm };
 }
 
 const PAYLOAD = {
@@ -58,10 +58,33 @@ test('measure-island: forwards MeasureInputs to the layout provider', async () =
   assert.equal(calls.length, 1);
   assert.equal(calls[0].method, 'measure');
   assert.deepEqual(calls[0].args, [{
+    // Unknown / unconstrained windows carry no constraints field.
     windows: [{ id: 101 }, { id: 102 }],
     workarea: { width: 800, height: 600 },
     island: { id: 7, layout: { mode: 'columns', column: 0.75 } },
   }]);
+});
+
+// The caller passes ids only; core attaches each window's constraints from
+// the same state the layout driver hands compute(). A provider that honors
+// a min width must see it at measure time too, or it sizes a strip its own
+// compute() then overflows.
+test('measure-island: core attaches each window\'s constraints from window state', async () => {
+  const calls = [];
+  const { broker, wm } = makeBroker((method, args) => {
+    calls.push(args[0]);
+    return Promise.resolve({ width: 1800, height: 600 });
+  });
+  wm.addWindow(101, { resource: { __id: 101 } });
+  await wm.propose(101, {
+    constraints: { minSize: { width: 700, height: 300 }, maxSize: null },
+  }, 'client-request');
+
+  await broker('canvas', 'windows.measure-island', PAYLOAD);
+  assert.deepEqual(calls[0].windows, [
+    { id: 101, constraints: { minSize: { width: 700, height: 300 }, maxSize: null } },
+    { id: 102 },
+  ]);
 });
 
 test('measure-island: an absent layout hint is omitted, not sent as undefined', async () => {

@@ -278,6 +278,29 @@ trade is that a column is fractionally narrower than `column ×
 workarea` once gap > 0 — the same one master-stack makes, where the gap
 eats the tiles, not the screen.
 
+**Client size constraints bound the column, not the fraction.** A window
+below its declared minimum is often not merely ugly but unusable, so in
+columns mode `min/max width` is a hard bound and `column` is the
+preference that fills what the bounds leave. Allocation is a water-fill:
+bounded columns pin to their bound, the remainder re-divides among the
+rest by weight, and a `min` that exceeds a `max` resolves to `min` (a
+window that cannot shrink further wins over one that would rather be
+smaller). Constraints reach the provider through `MeasureInputs.windows[]`
+as well as `compute()` — measuring without them sizes a strip the
+provider's own `compute()` then overflows.
+
+Only WIDTH is expressible here, and that is the mode's shape rather than
+an omission: one window per column means every column is full-height, so
+a height floor has nowhere to go. Growth decides what happens when the
+floors do not fit: elastic seats them exactly and the strip grows past
+the glass (the camera scrolls — this is the *only* case where two windows
+legitimately leave the viewport, and it is the client's own floor asking
+for it, not the compositor wasting space), while fixed has no such room
+and squeezes proportionally *inside* the island, since an island that
+overflowed its workarea would overlap its neighbors in the world. A
+`max` never forces either: the slack is absorbed by neighboring columns
+rather than left as dead glass.
+
 Visibility: `setOutputStack` semantics invert from "the shown workspace's
 members" to "everything near the camera's view rect" (with margin for
 pan). The camera + per-output scissor culls; windows far off-view are

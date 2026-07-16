@@ -18,12 +18,12 @@
 
 import type {
   LayoutAPI, LayoutInputs, LayoutResult, LayoutParamUpdate, LayoutParamSnapshot,
-  MeasureInputs, MeasureResult,
+  MeasureInputs, MeasureResult, SizeConstraints,
 } from "@overdraw/layout-types";
 import type { PluginSdkShape } from "@overdraw/plugin-sdk-types";
 import {
   masterStackLayout, columnsLayout, columnsMeasure, DEFAULT_LAYOUT,
-  type LayoutParams,
+  type LayoutParams, type ColumnBounds,
 } from "./master-stack.js";
 
 // Master-fraction bounds; matches the clamp masterStackLayout applies.
@@ -119,22 +119,37 @@ export default async function init(sdk: PluginSdkShape, rawConfig?: unknown): Pr
     return colWidths.get(id) ?? islandColumn;
   }
 
+  // The width half of a window's size constraints, as column bounds.
+  // Columns are full-height by construction, so the height half is not
+  // expressible here: an island's height is its workarea's, and strips
+  // grow along x only. A window needing more height than the glass is
+  // beyond what this mode can express.
+  function widthBounds(c: SizeConstraints | undefined): ColumnBounds | undefined {
+    const min = c?.minSize?.width;
+    const max = c?.maxSize?.width;
+    const out: ColumnBounds = {};
+    if (typeof min === "number" && Number.isFinite(min) && min > 0) out.min = min;
+    if (typeof max === "number" && Number.isFinite(max) && max > 0) out.max = max;
+    return out.min === undefined && out.max === undefined ? undefined : out;
+  }
+
   const api: LayoutAPI = {
     async compute(inputs: LayoutInputs): Promise<LayoutResult> {
-      // Consumes the window ids + the working rect; layoutMode,
-      // layoutData, currentRect are ignored. Tiles are placed within
-      // `tileRegion` (the island's rect; for the implicit per-output
-      // island that is the output minus reserved zones); the core
-      // resolver dispatched non-managed presentations before we were
-      // called. Columns scale to fill the region, so a region sized by
-      // measure() gives each its natural width and a workarea-sized one
-      // compresses them proportionally.
+      // Consumes the window ids, their width constraints, and the working
+      // rect; layoutMode, layoutData, currentRect are ignored. Tiles are
+      // placed within `tileRegion` (the island's rect; for the implicit
+      // per-output island that is the output minus reserved zones); the
+      // core resolver dispatched non-managed presentations before we were
+      // called. Columns divide the region by weight, so a region sized by
+      // measure() lands each on its target and a workarea-sized one
+      // compresses them instead.
       const region = inputs.tileRegion;
       const { mode, column } = islandParams(inputs.island?.layout);
       const dims = { width: region.width, height: region.height };
       const rects = mode === "columns"
         ? columnsLayout(
-            inputs.windows.map((w) => widthOf(w.id, column)), dims, params.gap)
+            inputs.windows.map((w) => widthOf(w.id, column)), dims, params.gap,
+            inputs.windows.map((w) => widthBounds(w.constraints)))
         : masterStackLayout(inputs.windows.length, dims, params);
       return {
         rects: inputs.windows.map((w, i) => ({
@@ -189,7 +204,8 @@ export default async function init(sdk: PluginSdkShape, rawConfig?: unknown): Pr
       }
       const widthsPx = inputs.windows.map(
         (w) => widthOf(w.id, column) * wa.width);
-      return columnsMeasure(widthsPx, wa);
+      return columnsMeasure(widthsPx, wa, params.gap,
+        inputs.windows.map((w) => widthBounds(w.constraints)));
     },
   };
 

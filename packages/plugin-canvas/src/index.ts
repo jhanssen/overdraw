@@ -373,18 +373,19 @@ export default async function init(
       // pointer/keyboard is still anchored on that output.
     }
   });
-  // Lane changes re-solve the world: a member floating/unfloating joins
-  // or leaves the tiled set an elastic island is measured for, and an
+  // State changes that re-solve the world: a member floating/unfloating
+  // joins or leaves the tiled set an elastic island is measured for, an
   // exclusive (maximize/fullscreen) member collapses its strip to the
-  // viewport. window.committed is the observe-only signal for
-  // behavioral-state commits; only the lane fields trigger a republish.
+  // viewport, and a size constraint changes what the layout measures for
+  // that member (a client may state its minimum at any point in its
+  // life, not only before it maps). window.committed is the observe-only
+  // signal for behavioral-state commits.
+  const MEASURED_FIELDS = ["tiling", "exclusive", "visible", "constraints"];
   sdk.events.subscribe("window.committed", (_name, payload) => {
     if (!worldMode || !payload || typeof payload !== "object") return;
     const p = payload as { surfaceId?: unknown; changed?: unknown };
     if (typeof p.surfaceId !== "number" || !Array.isArray(p.changed)) return;
-    if (!p.changed.some((f) => f === "tiling" || f === "exclusive" || f === "visible")) {
-      return;
-    }
+    if (!p.changed.some((f) => MEASURED_FIELDS.includes(f as string))) return;
     if (!state.surfaceToHandle.has(p.surfaceId)) return;
     void publishWorld();
   });

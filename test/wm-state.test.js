@@ -103,6 +103,29 @@ test('propose: identical proposal is a no-op (no committed event)', async () => 
   assert.equal(events.length, 0);
 });
 
+// Constraints are stamped onto windowState synchronously (windowHasContent
+// needs them for the fixed-size classification), which puts them in place
+// before the commit diff runs. The diff must still see the change: a layout
+// that sizes columns to a min width only hears about it via this event.
+test('propose: a constraints-only change commits and reports the previous value', async () => {
+  const bus = createDynamicBus();
+  const wm = createWm(mockSink(), [{ id: 0, rect: { x: 0, y: 0, width: 800, height: 600 }, scale: 1 }], { pluginBus: bus });
+  addMapped(wm, 1);
+  const events = [];
+  bus.subscribe('window.committed', (_n, p) => { events.push(p); });
+
+  await wm.propose(1, { constraints: { minSize: { width: 600, height: 0 } } }, 'client-request');
+  assert.equal(events.length, 1);
+  assert.deepEqual(events[0].changed, ['constraints']);
+  assert.equal(events[0].previous.constraints.minSize, null,
+    'previous carries the pre-stamp constraints, not the stamped ones');
+  assert.deepEqual(events[0].current.constraints.minSize, { width: 600, height: 0 });
+
+  // A re-send of the same floor is still a no-op.
+  await wm.propose(1, { constraints: { minSize: { width: 600, height: 0 } } }, 'client-request');
+  assert.equal(events.length, 1);
+});
+
 test('propose: partial proposal merges with current state', async () => {
   const wm = createWm(mockSink(), [{ id: 0, rect: { x: 0, y: 0, width: 800, height: 600 }, scale: 1 }]);
   addMapped(wm, 1);

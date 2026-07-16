@@ -1049,6 +1049,22 @@ validated + resolved + consumed by the runtime + hotkey plugin.
   `plugin-layout-default/{master-stack,integration}.test.js`,
   `windows-broker-measure-island.test.js`,
   `plugin-canvas/integration.test.js`.
+  Client size constraints in columns mode are LANDED for WIDTH
+  (canvas-design.md §5 "Client size constraints bound the column"):
+  `min/max width` is a hard bound, `column` fills what the bounds
+  leave, allocation water-fills the remainder by weight, and min beats
+  max on conflict. Core attaches each member's constraints to
+  `MeasureInputs.windows[]`, so the measure and the compute agree.
+  Elastic seats impossible floors exactly and lets the strip scroll
+  past the glass; fixed squeezes proportionally inside the island
+  rather than overlapping its world neighbors. HEIGHT constraints are
+  inexpressible in columns mode (one window per column = full-height
+  columns) and are ignored; master-stack honors NEITHER axis --
+  min/max there is still a gap. Coverage:
+  `plugin-layout-default/master-stack.test.js` (allocation,
+  measure/compute agreement), `plugin-canvas/integration.test.js`
+  (a min-width window grows the strip), `wm-state.test.js` (a
+  constraints-only propose reaches subscribers).
   Empty-island backdrops are LANDED: memberless islands draw a
   translucent camera-mapped quad (`canvas.islandBackdrop` color,
   `setIslandBackdrops` sink surface) so empty persistent workspaces

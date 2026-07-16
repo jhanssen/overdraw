@@ -161,7 +161,10 @@ export interface LayoutParamSnapshot {
 // compute(): managed, non-exclusive, visible) and the island's sizing
 // authority, its home workarea (canvas-design.md §10b).
 export interface MeasureInputs {
-  windows: ReadonlyArray<{ id: number }>;
+  // The would-be members, each with the size constraints compute() will
+  // see for it. Core fills these in from window state; the island source
+  // supplies only the ids.
+  windows: ReadonlyArray<{ id: number; constraints?: SizeConstraints }>;
   workarea: { width: number; height: number };
   island: { id: number; layout?: unknown };
 }
