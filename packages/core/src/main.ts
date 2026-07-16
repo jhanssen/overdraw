@@ -283,6 +283,12 @@ const sock = addon.startServer();
 // layout driver and the protocol layer share this instance via
 // installProtocols(opts.reservedZones).
 const reservedZones = createReservedZoneRegistry();
+// Zone changes move the usable glass (workarea). Camera-policy plugins
+// (canvas world mode) resize their islands off this; the WM's own relayout
+// rides the layer-shell handlers' triggerWmRelayout separately.
+reservedZones.onChange((outputId) => {
+  pluginBus.emit("output.workarea-changed", { outputId });
+});
 
 // The WM needs a layout driver before installProtocols creates it; the driver
 // invokes the layout plugin via the runtime; the runtime is created later.

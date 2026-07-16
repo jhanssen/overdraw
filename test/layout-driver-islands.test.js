@@ -67,13 +67,13 @@ test('two islands on one output: one compute() each, tileRegion = island rect', 
   assert.equal(target.calls[0].result.rects.length, 3);
 });
 
-test('reserved zones carve explicit island rects edge-relative (docked bar band)', async () => {
+test('reserved zones never carve explicit island rects; implicit still derives output-minus-zones', async () => {
   const zones = createReservedZoneRegistry();
   zones.set('bar', { outputId: 0, edge: 'top', thickness: 30, owner: 99 });
 
   const computeCalls = [];
   const target = captureTarget();
-  const explicit = { id: 10, contextOutputId: 0, rect: { x: 5000, y: 0, width: 1000, height: 600 }, members: [1] };
+  const explicit = { id: 10, contextOutputId: 0, rect: { x: 5000, y: 0, width: 1000, height: 570 }, members: [1] };
   const implicit = { id: 0, contextOutputId: 0, rect: null, members: [2] };
   const driver = createLayoutDriver({
     snapshot: () => snapWith([explicit, implicit], [managedWin(1), managedWin(2)]),
@@ -88,12 +88,40 @@ test('reserved zones carve explicit island rects edge-relative (docked bar band)
   await driver.settled();
 
   const byIsland = new Map(computeCalls.map((c) => [c.islandId, c]));
-  // The context output's zone carves the island's edge wherever its world
-  // slot sits (a docked island keeps the bar band clear).
+  // An explicit world rect is pure content space: the island source
+  // sized it to the workarea and the camera keeps it clear of the bar
+  // band, so the driver uses it verbatim.
   assert.deepEqual(byIsland.get(10).tileRegion,
-    { x: 5000, y: 30, width: 1000, height: 570 });
+    { x: 5000, y: 0, width: 1000, height: 570 });
   // The implicit island still derives output-minus-zones.
   assert.deepEqual(byIsland.get(0).tileRegion, { x: 0, y: 30, width: 1000, height: 570 });
+});
+
+test('fullscreen on an explicit island covers the glass: island origin shifted back by the workarea offset, output-sized', async () => {
+  const zones = createReservedZoneRegistry();
+  zones.set('bar', { outputId: 0, edge: 'top', thickness: 30, owner: 99 });
+
+  const target = captureTarget();
+  const island = {
+    id: 10, contextOutputId: 0,
+    rect: { x: 5000, y: 0, width: 1000, height: 570 }, members: [1],
+  };
+  const driver = createLayoutDriver({
+    snapshot: () => snapWith([island],
+      [{ ...managedWin(1), exclusive: 'fullscreen' }]),
+    target,
+    reservedZones: zones,
+    compute: async () => { throw new Error('exclusive islands never reach the plugin'); },
+  });
+  driver.schedule('mapped');
+  await driver.settled();
+
+  // The docked camera puts the island origin at the workarea origin
+  // (0, 30 on the glass); a glass-covering rect therefore starts 30px
+  // above the island in world space and spans the full output size.
+  assert.deepEqual(target.calls[0].result.rects, [
+    { id: 1, outer: { x: 5000, y: -30, width: 1000, height: 600 } },
+  ]);
 });
 
 test('exclusive window owns only its island; the sibling island still tiles', async () => {

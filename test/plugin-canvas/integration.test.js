@@ -560,18 +560,66 @@ test('world: fit centers within the workarea (reserved zones respected)', async 
     void addWindow;
 
     await rt.invokeAction('workspace.fit', {});
-    // Bounds 0..1728 x 0..600 framed into the 800x500 workarea at
-    // y=100: zoom fits the narrower axis; the bounds center maps to the
-    // workarea center (x 400, y 350) -- not the viewport center -- so
-    // the fitted world sits below the bar.
+    // Islands are workarea-sized (800x500), so the bounds are
+    // 0..1728 x 0..500. The zoom fits them into the 800x500 workarea
+    // and the bounds center maps to the workarea center (x 400, y 350
+    // in viewport coords) -- not the viewport center -- so the fitted
+    // world sits below the bar.
     const boundsW = PITCH + 800;
-    const zoom = Math.min(800 / boundsW, 500 / 600);
+    const zoom = Math.min(800 / boundsW, 500 / 500, 1);
     assert.deepEqual(sink.cameraCalls.at(-1), {
       outputId: 0,
       x: boundsW / 2 - (0 + 400) / zoom,
-      y: 300 - (100 + 250) / zoom,
+      y: 250 - (100 + 250) / zoom,
       zoom,
     });
+  }, { world: true });
+});
+
+test('world: islands size to the workarea; the dock offsets them below the bar', async () => {
+  await withCanvasPlugin(async (h) => {
+    const { rt, sink, state, islands, pluginBus } = h;
+    // A bar reserves the top 100px of the 800x600 output.
+    state.outputs = new Map([[0, {
+      logicalPosition: { x: 0, y: 0 },
+      logicalSize: { width: 800, height: 600 },
+    }]]);
+    state.reservedZones = {
+      effectiveRect: (_id, r) => ({
+        x: r.x, y: r.y + 100, width: r.width, height: r.height - 100,
+      }),
+    };
+    await setupTwoIslands(h);
+
+    // World rects carry no bar band: pure content, workarea-sized,
+    // packed with only the gutter between them.
+    const isl = islands();
+    const list = await call(rt, 'list', [0]);
+    const byId = new Map(isl.map((i) => [i.id, i]));
+    assert.deepEqual(byId.get(list[0].handle).rect,
+      { x: 0, y: 0, width: 800, height: 500 });
+    assert.deepEqual(byId.get(list[1].handle).rect,
+      { x: 800 + 128, y: 0, width: 800, height: 500 });
+
+    // The dock aligns the island origin with the WORKAREA origin: the
+    // camera sits 100px up so the island renders below the bar.
+    sink.cameraCalls.length = 0;
+    await call(rt, 'show', [2, 0]);
+    assert.deepEqual(sink.cameraCalls.at(-1),
+      { outputId: 0, x: 800 + 128, y: -100, zoom: 1 });
+
+    // The bar unmaps: the zone clears, main.ts's registry hook emits
+    // output.workarea-changed, and the world re-solves to full-viewport
+    // islands with the camera re-docked at the slot itself.
+    state.reservedZones = { effectiveRect: (_id, r) => ({ ...r }) };
+    pluginBus.emit('output.workarea-changed', { outputId: 0 });
+    await settle();
+    const isl2 = islands();
+    const byId2 = new Map(isl2.map((i) => [i.id, i]));
+    assert.deepEqual(byId2.get(list[1].handle).rect,
+      { x: 800 + 128, y: 0, width: 800, height: 600 });
+    assert.deepEqual(sink.cameraCalls.at(-1),
+      { outputId: 0, x: 800 + 128, y: 0, zoom: 1 });
   }, { world: true });
 });
 

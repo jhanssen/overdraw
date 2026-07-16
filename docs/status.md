@@ -1053,6 +1053,18 @@ validated + resolved + consumed by the runtime + hotkey plugin.
   resolves it (registry `applyMapAt` assigns direct-to-handle).
   Unruled spawns stay camera-relative; with workspace-default the
   hint is inert. GPU test `plugin-canvas/canvas-placement.gpu.mjs`.
+  Bar-in-the-camera is LANDED: reserved zones (bar bands) are lens
+  furniture, not world geometry -- the layout driver uses explicit
+  island rects VERBATIM (only implicit rect-null islands derive
+  output-minus-zones), world islands are workarea-sized and packed
+  edge-to-edge with just the gutter (symmetric on both axes; no dead
+  band per island), the docked camera aligns the island origin with
+  the workarea origin, and elastic columns/scroll span the workarea
+  width. Zone changes notify via the reserved-zone registry's
+  onChange -> `output.workarea-changed` on the plugin bus, resizing
+  islands + re-docking cameras when a bar maps/unmaps. A fullscreen
+  member of an explicit island covers the full glass (island origin
+  shifted back by the workarea offset, output-sized).
   NOT built: bookmark advertising via
   ext-workspace, rule targets for bookmarks / fly-to attention,
   gutters/shove beyond the per-row arrangement,

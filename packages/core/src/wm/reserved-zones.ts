@@ -36,22 +36,40 @@ export interface ReservedZoneRegistry {
   effectiveRect(outputId: number, outputRect: Rect): Rect;
   // Diagnostic: enumerate zones for an output. Returned in insertion order.
   list(outputId: number): ReadonlyArray<ReservedZone>;
+  // Notify when an output's zone picture actually changes (a set that
+  // stores identical values, or a clear of an absent zone, is silent).
+  // A zone migrating between outputs notifies both.
+  onChange(cb: (outputId: number) => void): void;
 }
 
 export function createReservedZoneRegistry(): ReservedZoneRegistry {
   const zones = new Map<string, ReservedZone>();
+  const changeCbs: Array<(outputId: number) => void> = [];
+  function notify(outputId: number): void {
+    for (const cb of changeCbs) cb(outputId);
+  }
 
   return {
     set(zoneId, zone) {
-      zones.set(zoneId, {
+      const next: ReservedZone = {
         outputId: zone.outputId,
         edge: zone.edge,
         thickness: Math.max(0, zone.thickness | 0),
         owner: zone.owner,
-      });
+      };
+      const prev = zones.get(zoneId);
+      zones.set(zoneId, next);
+      if (prev && prev.outputId === next.outputId && prev.edge === next.edge
+          && prev.thickness === next.thickness && prev.owner === next.owner) {
+        return;
+      }
+      if (prev && prev.outputId !== next.outputId) notify(prev.outputId);
+      notify(next.outputId);
     },
     clear(zoneId) {
-      zones.delete(zoneId);
+      const prev = zones.get(zoneId);
+      if (!zones.delete(zoneId)) return;
+      if (prev) notify(prev.outputId);
     },
     effectiveRect(outputId, outputRect) {
       let top = 0, right = 0, bottom = 0, left = 0;
@@ -76,6 +94,9 @@ export function createReservedZoneRegistry(): ReservedZoneRegistry {
         if (z.outputId === outputId) out.push(z);
       }
       return out;
+    },
+    onChange(cb) {
+      changeCbs.push(cb);
     },
   };
 }

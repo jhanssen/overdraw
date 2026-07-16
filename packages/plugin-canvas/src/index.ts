@@ -301,6 +301,16 @@ export default async function init(
     // Geometry may have moved/resized the row: republish slot rects.
     if (stateReady) void publishWorld();
   });
+  // A reserved zone changed (a bar mapped, resized, or unmapped): the
+  // workarea moved, so islands resize to it and docked cameras re-offset.
+  // publishWorld re-reads the workarea itself; downstream dedupe (island
+  // compare, camera cache) absorbs the no-op case.
+  sdk.events.subscribe("output.workarea-changed", (_name, payload) => {
+    if (!worldMode || !stateReady) return;
+    const p = payload as { outputId?: unknown };
+    if (!payload || typeof payload !== "object" || typeof p.outputId !== "number") return;
+    void publishWorld();
+  });
   // Keyboard focus tracking. Each window.change carries activated: bool; a
   // surface becoming activated is our signal that its output is the
   // user-facing focused output. When the focused surface unmaps (no
@@ -562,11 +572,19 @@ export default async function init(
     Map<WorkspaceHandle, { x: number; y: number; width: number; height: number }>>();
   const lastCamByOutput = new Map<number, { x: number; y: number }>();
   // Usable glass per output (viewport minus reserved zones, e.g. the
-  // bar's band), OUTPUT-LOCAL coords. Fit framings center in this so the
-  // overview never hides under the bar. Refreshed on publish and before
-  // each fit (zones change when bars map/unmap).
+  // bar's band), OUTPUT-LOCAL coords. The bar lives on the LENS, not in
+  // the world: islands are sized to this and the docked camera offsets
+  // them into it, so the world never carries dead bands. Fit framings
+  // center in it too. Refreshed on publish, before each fit, and on
+  // output.workarea-changed (zones move when bars map/unmap).
   const workareaByOutput = new Map<
     number, { x: number; y: number; width: number; height: number }>();
+  function workareaOf(
+    outputId: number, g: { width: number; height: number },
+  ): { x: number; y: number; width: number; height: number } {
+    return workareaByOutput.get(outputId)
+      ?? { x: 0, y: 0, width: g.width, height: g.height };
+  }
   async function refreshWorkarea(outputId: number): Promise<void> {
     const g = outputGeom.get(outputId);
     if (!g) return;
@@ -677,8 +695,7 @@ export default async function init(
     // zoom fits the bounds into the usable glass, and the bounds center
     // maps to the workarea's center -- not the viewport's -- so the
     // fitted world sits below the bar instead of under it.
-    const wa = workareaByOutput.get(outputId)
-      ?? { x: 0, y: 0, width: g.width, height: g.height };
+    const wa = workareaOf(outputId, g);
     const zoom = Math.min(
       wa.width / (maxX - minX), wa.height / (maxY - minY), 1);
     return {
@@ -688,10 +705,11 @@ export default async function init(
     };
   }
 
-  // Minimal scroll bringing `rect` fully into the docked viewport of
-  // `handle`'s island (left edge wins for windows wider than the view).
-  // Updates scrollByHandle; returns the new scroll, or null when the
-  // current view already contains the rect.
+  // Minimal scroll bringing `rect` fully into the docked view of
+  // `handle`'s island -- the WORKAREA-wide window onto the strip (left
+  // edge wins for windows wider than the view). Updates scrollByHandle;
+  // returns the new scroll, or null when the current view already
+  // contains the rect.
   function ensureVisibleScroll(
     outputId: number, handle: WorkspaceHandle,
     rect: { x: number; width: number },
@@ -699,16 +717,17 @@ export default async function init(
     const g = outputGeom.get(outputId);
     const isl = islandRectFor(outputId, handle);
     if (!g || !isl) return null;
-    const maxScroll = Math.max(0, isl.width - g.width);
+    const wa = workareaOf(outputId, g);
+    const maxScroll = Math.max(0, isl.width - wa.width);
     const prev = scrollByHandle.get(handle) ?? 0;
     // Reveal with the gap band: the margin keeps the layout's
-    // inter-column gap visible at the viewport edge (the neighbor ends
+    // inter-column gap visible at the view edge (the neighbor ends
     // exactly at the edge; the leftmost/rightmost columns keep their
     // island-edge gap since clamping lands on 0 / maxScroll).
-    const m = Math.min(scrollMargin, g.width / 4);
+    const m = Math.min(scrollMargin, wa.width / 4);
     let s = Math.min(maxScroll, Math.max(0, prev));
-    if (rect.x + rect.width + m > isl.x + s + g.width) {
-      s = rect.x + rect.width + m - g.width - isl.x;
+    if (rect.x + rect.width + m > isl.x + s + wa.width) {
+      s = rect.x + rect.width + m - wa.width - isl.x;
     }
     if (rect.x - m < isl.x + s) s = rect.x - m - isl.x;
     s = Math.min(maxScroll, Math.max(0, s));
@@ -801,9 +820,10 @@ export default async function init(
     return rowRectsByOutput.get(outputId)?.get(handle) ?? null;
   }
 
-  // Dock target for a workspace: its island's origin (output-relative,
-  // both axes -- grid arrangement places islands at non-zero y) plus the
-  // clamped x scroll offset (elastic islands wider than the viewport
+  // Dock target for a workspace: the camera that places the island's
+  // origin at the output's WORKAREA origin (below/beside any bar band --
+  // the reservation lives in the camera, not the world), plus the
+  // clamped x scroll offset (elastic islands wider than the workarea
   // scroll to follow focus; fixed islands always clamp to 0).
   function camPosFor(
     outputId: number, handle: WorkspaceHandle,
@@ -811,9 +831,10 @@ export default async function init(
     const g = outputGeom.get(outputId);
     const r = islandRectFor(outputId, handle);
     if (!g || !r) return { x: 0, y: 0 };
-    const maxScroll = Math.max(0, r.width - g.width);
+    const wa = workareaOf(outputId, g);
+    const maxScroll = Math.max(0, r.width - wa.width);
     const s = Math.min(maxScroll, Math.max(0, scrollByHandle.get(handle) ?? 0));
-    return { x: (r.x - g.x) + s, y: r.y - g.y };
+    return { x: (r.x - g.x - wa.x) + s, y: r.y - g.y - wa.y };
   }
 
   async function pushStack(outputId: number, ids: number[]): Promise<void> {
@@ -856,12 +877,12 @@ export default async function init(
   }
 
   // Elastic growth policy: each visible managed member takes one column
-  // of colFraction × viewport width; floating members take none. An
+  // of colFraction × workarea width; floating members take none. An
   // exclusive (maximized / fullscreen) member collapses the strip to the
-  // viewport -- the layout hands it the whole tile region, and a
-  // maximize should cover the screen, not a multi-screen strip.
+  // workarea -- the layout hands it the whole tile region, and a
+  // maximize should cover the usable glass, not a multi-screen strip.
   function elasticWidth(
-    g: { width: number }, members: ReadonlyArray<number>,
+    wa: { width: number }, members: ReadonlyArray<number>,
     snapById: Map<number, WindowSnapshotLike>, fraction: number,
   ): number {
     let cols = 0;
@@ -869,15 +890,15 @@ export default async function init(
       const ws = snapById.get(id)?.windowState;
       // Only demonstrably TILED windows take a column: floating members
       // never grow the strip, and a member without a WM snapshot counts
-      // for nothing -- undersizing (viewport-width island) is always
+      // for nothing -- undersizing (workarea-width island) is always
       // recoverable, oversizing stretches windows past the output.
       if (!ws) continue;
       if (!ws.visible) continue;
-      if (ws.exclusive !== "none") return g.width;
+      if (ws.exclusive !== "none") return wa.width;
       if (ws.tiling === "managed") cols++;
     }
-    const colW = Math.max(1, Math.round(g.width * fraction));
-    return Math.max(g.width, cols * colW);
+    const colW = Math.max(1, Math.round(wa.width * fraction));
+    return Math.max(wa.width, cols * colW);
   }
 
   async function publishWorld(): Promise<void> {
@@ -920,17 +941,21 @@ export default async function init(
     for (const [outputId, handles] of state.positionsByOutput) {
       const slots = resolveSlots(handles);
       const g = outputGeom.get(outputId);
-      // Arrangement: sticky slot ORDER, per-island widths (viewport for
+      // Arrangement: sticky slot ORDER, per-island widths (workarea for
       // fixed, column-grown for elastic), cumulative x origins with
-      // canvas.gutter between islands. "rows" is one filmstrip; "grid"
-      // wraps row-major after ~sqrt(N) islands (the near-square block
-      // maximizes the fit zoom), stepping y by viewport height + gutter.
+      // canvas.gutter between islands. Islands are WORKAREA-sized (the
+      // usable glass): bars are lens furniture, so the world packs pure
+      // content edge-to-edge and the docked camera offsets each island
+      // into the workarea. "rows" is one filmstrip; "grid" wraps
+      // row-major after ~sqrt(N) islands (the near-square block
+      // maximizes the fit zoom), stepping y by island height + gutter.
       // A growing island shoves its right-hand neighbors along its own
       // (grid) row -- order-preserving and monotone (canvas-design.md
       // §6's shove, scoped to one row; grid rows are independent).
       const row = new Map<
         WorkspaceHandle, { x: number; y: number; width: number; height: number }>();
       if (g) {
+        const wa = workareaOf(outputId, g);
         const ordered = [...handles].sort(
           (a, b) => (slots.get(a) ?? 0) - (slots.get(b) ?? 0));
         const cols = arrangement === "grid"
@@ -942,11 +967,11 @@ export default async function init(
           if (col >= cols) { col = 0; gridRow++; x = g.x; }
           const rec = state.byHandle.get(h);
           const width = rec && isElastic(h)
-            ? elasticWidth(g, rec.members, snapById, columnFor(h))
-            : g.width;
+            ? elasticWidth(wa, rec.members, snapById, columnFor(h))
+            : wa.width;
           row.set(h, {
-            x, y: g.y + gridRow * (g.height + gutter),
-            width, height: g.height,
+            x, y: g.y + gridRow * (wa.height + gutter),
+            width, height: wa.height,
           });
           x += width + gutter;
           col++;

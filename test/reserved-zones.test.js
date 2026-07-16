@@ -99,3 +99,28 @@ test('preserves outputRect origin (non-zero x/y)', () => {
   assert.deepEqual(r.effectiveRect(0, rect),
     { x: 100, y: 220, width: 800, height: 580 });
 });
+
+test('onChange fires per real change: identical set and absent clear are silent', () => {
+  const r = createReservedZoneRegistry();
+  const changes = [];
+  r.onChange((outputId) => changes.push(outputId));
+
+  r.set('bar', { outputId: 0, edge: 'top', thickness: 30, owner: 1 });
+  assert.deepEqual(changes, [0]);
+  // Identical replace: silent.
+  r.set('bar', { outputId: 0, edge: 'top', thickness: 30, owner: 1 });
+  assert.deepEqual(changes, [0]);
+  // Thickness change: notifies.
+  r.set('bar', { outputId: 0, edge: 'top', thickness: 40, owner: 1 });
+  assert.deepEqual(changes, [0, 0]);
+  // Migrating outputs notifies both.
+  r.set('bar', { outputId: 1, edge: 'top', thickness: 40, owner: 1 });
+  assert.deepEqual(changes, [0, 0, 0, 1]);
+  // Clear notifies the zone's output; a second clear is silent.
+  r.clear('bar');
+  r.clear('bar');
+  assert.deepEqual(changes, [0, 0, 0, 1, 1]);
+  // Clearing a never-set id is silent.
+  r.clear('ghost');
+  assert.deepEqual(changes, [0, 0, 0, 1, 1]);
+});

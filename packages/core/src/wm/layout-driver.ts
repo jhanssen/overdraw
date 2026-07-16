@@ -52,9 +52,11 @@ export interface LayoutIsland {
   // as cameras move (the output currently viewing the island); islands
   // do not belong to outputs (docs/canvas-design.md §3).
   contextOutputId: number;
-  // The island's tile region in global logical coordinates, or null to
-  // derive it from the output (output rect minus reserved zones) -- the
-  // implicit per-output island.
+  // The island's tile region in global logical coordinates (used
+  // verbatim -- reserved zones never carve an explicit rect; the island
+  // source sizes it to the workarea and the camera keeps it clear of
+  // the bands), or null to derive it from the output (output rect minus
+  // reserved zones) -- the implicit per-output island.
   rect: Rect | null;
   // Ordered member windows, master-front. The driver lays out EXACTLY
   // these windows in this order.
@@ -157,15 +159,17 @@ export function createLayoutDriver(deps: LayoutDriverDeps): LayoutDriver {
           continue;
         }
         const outputRect: Rect = { ...o.rect };
-        // The island's tile region: its own world rect, or (implicit
-        // island) the output rect. Either way the context output's
-        // reserved zones carve the region's edges -- zones are
-        // edge-relative, so a docked island keeps its bar band clear no
-        // matter where its world slot sits.
-        const baseRegion = island.rect ? { ...island.rect } : outputRect;
-        const tileRegion = deps.reservedZones
-          ? deps.reservedZones.effectiveRect(island.contextOutputId, baseRegion)
-          : baseRegion;
+        // The island's tile region. An explicit world rect is pure
+        // content space, used verbatim: reserved zones are glass
+        // furniture (a bar lives on the lens, not in the world), so the
+        // island source sizes its rects to the workarea and the camera
+        // policy keeps them clear of the bands. Only the implicit
+        // rect-null island, which derives from the output itself,
+        // carves the context output's zones from its edges.
+        const workarea = deps.reservedZones
+          ? deps.reservedZones.effectiveRect(island.contextOutputId, outputRect)
+          : outputRect;
+        const tileRegion = island.rect ? { ...island.rect } : workarea;
 
         const resolvedRects: Array<{ id: number; outer: Rect }> = [];
         const managed: LayoutWindow[] = [];
@@ -186,7 +190,22 @@ export function createLayoutDriver(deps: LayoutDriverDeps): LayoutDriver {
         }
 
         if (exclusiveWin !== null) {
-          const outer = exclusiveWin.exclusive === "fullscreen" ? outputRect : tileRegion;
+          // Fullscreen covers the whole glass. For an explicit island
+          // the docked camera aligns the island's origin with the
+          // output's workarea origin, so the glass's world footprint is
+          // the island origin shifted back by the workarea offset, at
+          // the output's full size. Implicit islands sit at the output
+          // rect itself.
+          const outer = exclusiveWin.exclusive !== "fullscreen"
+            ? tileRegion
+            : island.rect
+              ? {
+                  x: island.rect.x - (workarea.x - outputRect.x),
+                  y: island.rect.y - (workarea.y - outputRect.y),
+                  width: outputRect.width,
+                  height: outputRect.height,
+                }
+              : outputRect;
           resolvedRects.push({ id: exclusiveWin.id, outer });
           for (const r of resolvedRects) mergedRects.push(r);
           continue;

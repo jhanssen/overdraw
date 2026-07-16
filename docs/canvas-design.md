@@ -610,13 +610,21 @@ tests only.
 4. **Canvas features** (all policy, all incremental from parity).
    LANDED so far -- **world slots (rows model)**, opt-in via
    `canvas: { world: true }`: every workspace publishes as an island at
-   a world rect along its output's row (slot pitch = output width +
-   SLOT_GUTTER; slots per-handle, freed on destroy, collision-resolved
-   after hotplug migration); hidden members lay out at their slots
-   (pre-sized on show) while the draw stack gates visibility; `show`
-   docks the camera instantly; reserved zones carve
-   explicit island rects edge-relative via the context output, so docked
-   islands keep their bar band clear; hidden X windows are narrated in
+   a world rect along its output's row (islands are WORKAREA-sized --
+   the viewport minus reserved zones -- and packed with only
+   `canvas.gutter` between them; slots per-handle, freed on destroy,
+   collision-resolved after hotplug migration); hidden members lay out
+   at their slots (pre-sized on show) while the draw stack gates
+   visibility; `show` docks the camera so the island origin lands at
+   the WORKAREA origin -- the bar lives on the lens, not in the world:
+   reserved zones never carve explicit island rects (the layout driver
+   uses them verbatim; only implicit rect-null islands derive
+   output-minus-zones), the world carries no dead bands, and zone
+   changes (`output.workarea-changed`, emitted by the reserved-zone
+   registry's onChange hook) resize islands + re-dock cameras. A
+   fullscreen member of an explicit island covers the full glass (the
+   driver shifts the island origin back by the workarea offset at
+   output size); hidden X windows are narrated in
    their ISLAND FRAME (glass-map.ts: the camera that would show them),
    staying int16-safe at any slot distance. Camera changes sweep
    residency + X narration via a core-side single-method patch (the
@@ -679,10 +687,10 @@ tests only.
    elastic?}` overrides one workspace at runtime (omit `elastic` to
    toggle; index defaults to the shown workspace; overrides are
    session-scoped). An elastic island grows along its row -- one
-   column of `column` × viewport width (default 0.5) per visible
+   column of `column` × workarea width (default 0.5) per visible
    managed member; floating members take none, and an exclusive member
-   collapses the strip to the viewport (maximize covers the screen,
-   not the strip). Members tile as equal full-height columns via a
+   collapses the strip to the workarea (maximize covers the usable
+   glass, not the strip). Members tile as equal full-height columns via a
    per-island layout HINT (`LayoutIsland.layout`, passed through
    verbatim to `LayoutInputs.island.layout`; the bundled provider
    recognizes `{ mode: "columns" }`) -- a deliberate small step toward
@@ -741,7 +749,8 @@ tests only.
    ALSO LANDED -- **grid arrangement** (`canvas.arrangement:
    "grid"`; default "rows"): the world-arrangement policy's first
    alternative (§6's rows/grid/freeform). Slots wrap row-major after
-   ceil(sqrt(N)) columns, vertical pitch = viewport height + gutter;
+   ceil(sqrt(N)) columns, vertical pitch = island (workarea) height +
+   gutter, so the gutter reads the same on both axes;
    fit frames the 2D bounds (near-square block, so the overview zoom
    wastes far less glass on wide monitors than the filmstrip), docks
    move the camera on both axes, and elastic shove stays scoped to an

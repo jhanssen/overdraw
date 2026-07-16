@@ -319,6 +319,11 @@ export async function setupCompositor(opts = {}) {
   const { createReservedZoneRegistry } = await import(
     "../packages/core/dist/wm/reserved-zones.js");
   const reservedZones = createReservedZoneRegistry();
+  // Mirror main.ts: zone changes announce the moved workarea so
+  // camera-policy plugins (canvas world mode) resize their islands.
+  reservedZones.onChange((outputId) => {
+    pluginBus.emit("output.workarea-changed", { outputId });
+  });
 
   state = await installProtocols(addon, {
     output: { width: dims.width, height: dims.height },
