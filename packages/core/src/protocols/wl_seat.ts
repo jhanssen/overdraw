@@ -1020,10 +1020,14 @@ export default function makeSeat(ctx: Ctx, driver: FocusDriver): SeatHandler {
         }
 
         // Consult the binding chain.
-        //   - press: dispatchPress; consume on match.
+        //   - press: dispatchPress; consume on match, and on ANY key
+        //     while a pushed mode is active (a mode isolates the
+        //     keyboard -- see BindingChain.dispatchPress).
         //   - release: dispatchRelease for (a) the released keysym AND
         //     (b) every modifier bit that just became unset. Consume if
-        //     any held instance participated.
+        //     any held instance participated. Releases are never
+        //     isolated: a key held from before a mode was pushed was
+        //     forwarded, and the client needs its key-up.
         // Key-up events bypass the press path (bindings fire on press
         // only); xkb still sees them so subsequent presses have the
         // right modifier state.

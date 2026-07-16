@@ -187,7 +187,7 @@ test("defineMode + pushMode shifts the active trie", () => {
   assert.equal(resizeFired, 1);
 });
 
-test("modes are isolated: unbound key in top mode is NOT consumed (no fall-through)", () => {
+test("modes are isolated: an unbound key in the top mode never reaches the mode below", () => {
   const { chain } = newChain();
   chain.defineMode("resize");
   let defaultFired = 0;
@@ -195,8 +195,68 @@ test("modes are isolated: unbound key in top mode is NOT consumed (no fall-throu
   // No binding for Mod+1 in resize.
   chain.pushMode("resize");
   const r = chain.dispatchPress(step("Mod+1"));
-  assert.equal(r.consume, false);
   assert.equal(defaultFired, 0);  // default's Mod+1 is NOT consulted
+  // ...and it doesn't reach the client either: a pushed mode swallows
+  // unbound keys, so its key space is exactly its own bindings.
+  assert.equal(r.consume, true);
+  assert.equal(r.matched, false);
+});
+
+test("modes are isolated: a still-held modifier doesn't leak the key to the client", () => {
+  // The Mod+z -> resize case: Super is still down when the user hits an
+  // arrow, so the step carries Mod and matches no bare-arrow binding.
+  const { chain } = newChain();
+  chain.defineMode("resize");
+  let fired = 0;
+  chain.bind({ steps: [step("Left")], mode: "resize", handler: () => { fired++; } });
+  chain.pushMode("resize");
+
+  const held = chain.dispatchPress(step("Mod+Left"));
+  assert.equal(held.consume, true, "swallowed, not forwarded to the app");
+  assert.equal(fired, 0, "Mod+Left is not the bare-Left binding");
+
+  const released = chain.dispatchPress(step("Left"));
+  assert.equal(released.consume, true);
+  assert.equal(fired, 1, "bare Left fires once Super is released");
+});
+
+test("modes isolate the KEYBOARD only: unbound buttons/scroll still reach the client", () => {
+  const { chain } = newChain();
+  chain.defineMode("resize");
+  chain.pushMode("resize");
+  // A mode captures the keyboard, not the mouse: clicking a window while
+  // a mode is up must still work.
+  assert.equal(chain.dispatchPress(step("button1")).consume, false);
+  assert.equal(chain.dispatchPress(step("Mod+button3")).consume, false);
+  assert.equal(chain.dispatchPress(step("scroll_up")).consume, false);
+});
+
+test("the default mode never isolates: unbound keys forward as normal typing", () => {
+  const { chain } = newChain();
+  chain.defineMode("resize");
+  chain.bind({ steps: [step("Left")], mode: "resize", handler: () => {} });
+  // Root frame: 'a' is just typing.
+  assert.equal(chain.dispatchPress(step("a")).consume, false);
+  // Isolated while the mode is up...
+  chain.pushMode("resize");
+  assert.equal(chain.dispatchPress(step("a")).consume, true);
+  // ...and typing resumes the moment it pops.
+  chain.popMode();
+  assert.equal(chain.dispatchPress(step("a")).consume, false);
+});
+
+test("a cancelled chord inside a mode is swallowed, not forwarded", () => {
+  const { chain, events } = newChain();
+  chain.defineMode("resize");
+  chain.bind({
+    steps: [step("Mod+a"), step("Mod+b")], mode: "resize", handler: () => {},
+  });
+  chain.pushMode("resize");
+  assert.equal(chain.dispatchPress(step("Mod+a")).consume, true);  // enters the chord
+  // 'x' doesn't continue the chord: it cancels -- and stays swallowed.
+  const r = chain.dispatchPress(step("x"));
+  assert.equal(r.consume, true);
+  assert.ok(events.some((e) => e.kind === "chord-cancelled"));
 });
 
 test("Escape pops a mode by default", () => {
@@ -215,7 +275,10 @@ test("Escape does NOT pop when exitOnEscape: false", () => {
   chain.defineMode("modal", { exitOnEscape: false });
   chain.pushMode("modal");
   const r = chain.dispatchPress(step("Escape"));
-  assert.equal(r.consume, false);  // unbound key, forward
+  // The mode holds: Escape neither pops it nor reaches the client (an
+  // unbound key in a pushed mode is swallowed). Exiting is up to the
+  // mode's own bindings or a programmatic popMode.
+  assert.equal(r.consume, true);
   assert.deepEqual(chain.stackNames(), ["default", "modal"]);
 });
 

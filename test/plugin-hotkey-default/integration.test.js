@@ -258,6 +258,50 @@ test('pushMode + popMode shift the active mode', async () => {
   );
 });
 
+// The Mod+Z resize-submap shape, end to end through the config: while the
+// mode is up, no keystroke reaches the focused app -- not the arrows the
+// mode binds, and not the still-held-Super arrows that match nothing.
+test('a pushed mode swallows every key; the mod-held variant never leaks', async () => {
+  const invoked = [];
+  await withHotkeyPlugin(
+    {
+      modes: {
+        default: [{ keys: 'Mod+z', pushMode: 'resize' }],
+        resize: [
+          { keys: 'Escape', popMode: true },
+          { keys: 'Left', action: 'test.shrink' },
+        ],
+      },
+    },
+    async ({ chain, runtime }) => {
+      dispatch(chain, 'Mod+z');
+      await runtime.flush();
+      assert.deepEqual(chain.stackNames(), ['default', 'resize']);
+
+      // Super still held from the chord: matches nothing, but is
+      // swallowed rather than reaching the app as a cursor key.
+      const held = dispatch(chain, 'Mod+Left');
+      await runtime.flush();
+      assert.equal(held.consume, true);
+      assert.deepEqual(invoked, [], 'no action fired');
+
+      // Super released: the bound arrow fires.
+      const bare = dispatch(chain, 'Left');
+      await runtime.flush();
+      assert.equal(bare.consume, true);
+      assert.deepEqual(invoked, ['test.shrink']);
+
+      // An unrelated key is swallowed too -- and typing resumes on exit.
+      assert.equal(dispatch(chain, 'q').consume, true);
+      dispatch(chain, 'Escape');
+      await runtime.flush();
+      assert.deepEqual(chain.stackNames(), ['default']);
+      assert.equal(dispatch(chain, 'q').consume, false);
+    },
+    { actions: { 'test.shrink': () => { invoked.push('test.shrink'); } } },
+  );
+});
+
 test('Escape exits a sub-mode by default (binding-chain feature, no binding needed)', async () => {
   await withHotkeyPlugin(
     {
@@ -291,7 +335,9 @@ test('exitOnEscape: false prevents Escape from popping', async () => {
       await runtime.flush();
       assert.deepEqual(chain.stackNames(), ['default', 'modal']);
       const r = dispatch(chain, 'Escape');
-      assert.equal(r.consume, false);    // unbound + no exit -> forward
+      // Unbound + no exit -> swallowed: a pushed mode isolates the
+      // keyboard, so the modal holds and the app sees nothing.
+      assert.equal(r.consume, true);
       assert.deepEqual(chain.stackNames(), ['default', 'modal']);
     },
   );

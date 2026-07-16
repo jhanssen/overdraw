@@ -875,7 +875,14 @@ active; failure demotes).
   left/right/up/down, scale; snapshot + live scene inputs;
   declarative atomic commit; in-thread + Worker).
 - `sdk.input.bind` + `defineMode` + `pushMode`/`popMode` (chord +
-  mode trie; modes isolated).
+  mode trie). A pushed mode ISOLATES the keyboard: an unbound key
+  reaches neither the mode below nor the focused client, so the
+  mode's key space is exactly its bindings (plus Escape, unless
+  `exitOnEscape: false`). Presses only -- releases stay lane-agnostic
+  so a key/modifier held from before the push (Super, still down
+  from the `Mod+z` that pushed) can't strand as a stuck key.
+  Pointer input is unaffected: a mode captures the keyboard, not the
+  mouse.
 - `sdk.cursor.setShape`/`setImage`/`hide`/`show`/`setDefault`/
   `clearOverride`/`defineRule` (XCursor theme resolver +
   kinematic state machine + rule engine; `setImage` is in-thread

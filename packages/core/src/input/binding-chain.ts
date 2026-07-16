@@ -464,13 +464,29 @@ export class BindingChain {
       this.popMode();
       return { consume: true, matched: false };
     }
-    // In-progress chord that didn't match: cancel and forward THIS event.
+    // In-progress chord that didn't match: cancel it. The event itself is
+    // still dispatched per the rule below.
     if (top.path !== top.def.root) {
       this.emit({
         kind: "chord-cancelled", mode: top.def.name,
         path: formatStep(compareStep),
       });
       top.path = top.def.root;
+    }
+    // A pushed mode ISOLATES the keyboard: an unbound key is swallowed
+    // rather than forwarded to the focused client, so a mode's key space
+    // is exactly its bindings (plus Escape) and stray keys can't leak
+    // into the app underneath. Pointer input is a separate device and
+    // keeps flowing -- a mode captures the keyboard, not the mouse, so
+    // clicking a window while a mode is up still works.
+    //
+    // Presses only: a key or modifier pressed BEFORE the mode was pushed
+    // was forwarded, and the client needs its release to avoid a stuck
+    // key (entering a mode via Mod+z with Super still held is the
+    // ordinary case). dispatchRelease therefore stays lane-agnostic.
+    if (this.stack.length > 1
+        && !isButtonStep(compareStep) && !isScrollStep(compareStep)) {
+      return { consume: true, matched: false };
     }
     return { consume: false, matched: false };
   }
