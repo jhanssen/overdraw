@@ -153,6 +153,19 @@ export default async function init(sdk: PluginSdkShape): Promise<void> {
     },
   });
 
+  // Toggle the keyboard-focused window between the tiled and floating
+  // lanes. Floating is an explicit verb: interactive drags never change
+  // a window's lane (a tiled window dropped anywhere re-tiles there).
+  sdk.actions.register({
+    name: "window.toggle-floating",
+    description: "Toggle the keyboard-focused window between tiled (managed) " +
+      "and floating. No params.",
+    handler: async (): Promise<null> => {
+      sdk.events.emit("window.toggle-floating-requested", {});
+      return null;
+    },
+  });
+
   // Keyboard focus navigation. Cycles the keyboard focus through the WM's
   // toplevel stack (wrapping at the ends). The launcher resolves the current
   // focus + the stack order and applies the new focus; plugin context has

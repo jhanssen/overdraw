@@ -142,12 +142,15 @@ export interface WorkspaceAPI {
    * Reorder a window within its current workspace's member list. The
    * workspace's members IS the per-workspace master-stack order the
    * layout-driver consumes; reordering it directly changes which window
-   * is master / where each window sits in the stack. Returns true when the
-   * order changed (and a layout pass is scheduled), false when the
+   * is master / where each window sits in the stack. `{ moveToIndex }`
+   * places the window at that final index (clamped). Returns true when
+   * the order changed (and a layout pass is scheduled), false when the
    * requested op was a no-op (e.g. promote on a window already at master,
    * swap-next on the tail).
    */
-  reorder(surfaceId: number, op: "promote" | "swap-next" | "swap-prev"): Promise<boolean>;
+  reorder(surfaceId: number,
+          op: "promote" | "swap-next" | "swap-prev"
+            | { moveToIndex: number }): Promise<boolean>;
 
   /**
    * Idempotently ensure `outputId` has at least one workspace. If a workspace

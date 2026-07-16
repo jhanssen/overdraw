@@ -738,7 +738,8 @@ export function moveWindow(state: WorkspaceState,
 // the surface is unknown.
 export function reorder(state: WorkspaceState,
                         surfaceId: number,
-                        op: "promote" | "swap-next" | "swap-prev",
+                        op: "promote" | "swap-next" | "swap-prev"
+                          | { moveToIndex: number },
                         ): { state: WorkspaceState; changed: boolean;
                              sideEffects: SideEffect[] } {
   const handle = state.surfaceToHandle.get(surfaceId);
@@ -752,7 +753,17 @@ export function reorder(state: WorkspaceState,
   if (i < 0) return { state, changed: false, sideEffects: [] };
 
   let mutated = false;
-  if (op === "promote") {
+  if (typeof op === "object") {
+    // moveToIndex: the window's final position in the members array
+    // (clamped). Position-based rearrangement -- e.g. a drop landing a
+    // window at a specific slot of its island's tiling.
+    const n = Math.max(0, Math.min(rec.members.length - 1,
+      Math.trunc(op.moveToIndex)));
+    if (n === i) return { state, changed: false, sideEffects: [] };
+    rec.members.splice(i, 1);
+    rec.members.splice(n, 0, surfaceId);
+    mutated = true;
+  } else if (op === "promote") {
     if (i === 0) return { state, changed: false, sideEffects: [] };
     rec.members.splice(i, 1);
     rec.members.unshift(surfaceId);

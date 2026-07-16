@@ -1826,11 +1826,51 @@ export default async function init(
   // Membership on drag (canvas-design.md §3): a move grab's drop
   // re-parents the window to the island under the CURSOR (the seat
   // reports the pointer's world position through the content camera, so
-  // drops land where you're pointing while fitted/roaming too). A window
-  // that was tiled before the grab floated it re-tiles into the new
-  // island; one the user floated stays floating. Dropping on the
-  // window's own island (or on void between islands) changes nothing --
-  // that's the plain drag-to-float gesture.
+  // drops land where you're pointing while fitted/roaming too). Tiled
+  // stays tiled: a window that was managed before the grab floated it
+  // re-tiles wherever it drops -- into another island (cross-island
+  // move), at the drop position within its own island's order
+  // (rearrange), or back into its old slot (void drop; nothing to point
+  // at). Floating is an explicit verb (window.toggle-floating), never a
+  // drag side effect. A window the user floated stays floating wherever
+  // it's dropped; only its membership follows the cursor.
+  //
+  // The drop-position -> member-index mapping is a heuristic: land at
+  // the hit window's slot (its left half -- the dragged window shoves it
+  // over) or just past it (right half). Horizontal-flow-oriented, which
+  // matches the bundled layouts (master-stack, elastic columns); a
+  // layout-owned drop-index query is future work.
+  function dropIndexFor(
+    members: ReadonlyArray<number>, surfaceId: number,
+    snaps: ReadonlyArray<WindowSnapshotLike>, x: number, y: number,
+  ): number | null {
+    const tiled = snaps.filter((s) =>
+      s.surfaceId !== surfaceId && members.includes(s.surfaceId)
+      && s.windowState?.tiling === "managed" && s.windowState.visible
+      && s.windowState.exclusive === "none"
+      && s.outer && s.outer.width > 0);
+    if (tiled.length === 0) return null;
+    const contains = (s: WindowSnapshotLike): boolean => {
+      const o = s.outer as { x: number; y: number; width: number; height: number };
+      return x >= o.x && x < o.x + o.width && y >= o.y && y < o.y + o.height;
+    };
+    const dist = (s: WindowSnapshotLike): number => {
+      const o = s.outer as { x: number; y: number; width: number; height: number };
+      const dx = x - (o.x + o.width / 2);
+      const dy = y - (o.y + o.height / 2);
+      return dx * dx + dy * dy;
+    };
+    const hit = tiled.find(contains)
+      ?? tiled.reduce((a, b) => (dist(a) <= dist(b) ? a : b));
+    const o = hit.outer as { x: number; y: number; width: number };
+    const before = x < o.x + o.width / 2;
+    const hitIdx = members.indexOf(hit.surfaceId);
+    const dragIdx = members.indexOf(surfaceId);
+    // moveToIndex is the FINAL index (post-removal splice): the hit's
+    // post-removal index to land before it, +1 to land after.
+    const h = hitIdx - (dragIdx >= 0 && dragIdx < hitIdx ? 1 : 0);
+    return before ? h : h + 1;
+  }
   sdk.events.subscribe("window.drag-dropped", (_name, payload) => {
     if (!worldMode || !payload || typeof payload !== "object") return;
     const p = payload as {
@@ -1839,31 +1879,49 @@ export default async function init(
     if (typeof p.surfaceId !== "number"
       || typeof p.x !== "number" || typeof p.y !== "number") return;
     const surfaceId = p.surfaceId;
+    const dropX = p.x;
+    const dropY = p.y;
     const from = state.surfaceToHandle.get(surfaceId);
     if (from === undefined) return;
     // The island under the drop point, across every output's arrangement.
     let target: { handle: WorkspaceHandle; outputId: number } | null = null;
     for (const [outputId, row] of rowRectsByOutput) {
       for (const [h, r] of row) {
-        if (p.x >= r.x && p.x < r.x + r.width
-          && p.y >= r.y && p.y < r.y + r.height) {
+        if (dropX >= r.x && dropX < r.x + r.width
+          && dropY >= r.y && dropY < r.y + r.height) {
           target = { handle: h, outputId };
           break;
         }
       }
       if (target) break;
     }
-    if (!target || target.handle === from) return;
-    const idx = reg.findIndex(state, target.handle, target.outputId);
-    if (idx === null) return;
+    // Floating windows only follow the cursor's island; dropping on the
+    // own island or on void leaves everything as the drag put it.
+    if (p.wasManaged !== true && (!target || target.handle === from)) return;
     void (async () => {
-      const r = reg.moveWindow(
-        state, surfaceId, idx, target.outputId, outputNameOf(target.outputId));
-      state = r.state;
-      await applyEffects(r.sideEffects);
-      if (p.wasManaged === true) {
-        await sdk.windows.propose(surfaceId, { tiling: "managed" }, "user-input");
+      if (target && target.handle !== from) {
+        const idx = reg.findIndex(state, target.handle, target.outputId);
+        if (idx === null) return;
+        const r = reg.moveWindow(
+          state, surfaceId, idx, target.outputId, outputNameOf(target.outputId));
+        state = r.state;
+        await applyEffects(r.sideEffects);
       }
+      if (p.wasManaged !== true) return;
+      // Rearrange by drop position within the (possibly new) island's
+      // order, then snap back into the tiling.
+      const handle = state.surfaceToHandle.get(surfaceId);
+      const rec = handle !== undefined ? state.byHandle.get(handle) : undefined;
+      if (rec) {
+        const idx = dropIndexFor(
+          rec.members, surfaceId, await sdk.windows.list(), dropX, dropY);
+        if (idx !== null) {
+          const r = reg.reorder(state, surfaceId, { moveToIndex: idx });
+          state = r.state;
+          await applyEffects(r.sideEffects);
+        }
+      }
+      await sdk.windows.propose(surfaceId, { tiling: "managed" }, "user-input");
     })();
   });
   sdk.windows.onUnmap((ev) => {

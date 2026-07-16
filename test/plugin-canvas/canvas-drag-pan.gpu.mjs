@@ -217,3 +217,61 @@ test("move-drag while fitted: 1:1 tracking, chain-consumed release drops onto th
     await c.teardown();
   }
 });
+
+// Tiled stays tiled: dragging a tiled window past its neighbor rearranges
+// the tiling (drop-position reorder + re-tile) instead of leaving the
+// window floating.
+test("move-drag within an island: drop past the neighbor rearranges the tiling", { skip }, async () => {
+  const c = await setupCompositor({ headless: OUT, config: { canvas: { world: true } } });
+  try {
+    const a = c.spawnClient([FILL, "--color", "ff3030c0"]);
+    await a.ready;
+    const s1 = await c.waitFor(c.query, (s) => s.windows.length === 1, { what: "A mapped" });
+    const aId = s1.windows[0].surfaceId;
+    const b = c.spawnClient([FILL, "--color", "ff30c030"]);
+    await b.ready;
+    const s2 = await c.waitFor(c.query, (s) => s.windows.length === 2, { what: "B mapped" });
+    const bId = s2.windows.find((w) => w.surfaceId !== aId).surfaceId;
+    await c.state.wm.settled();
+
+    // Newest is master: members [B, A] -- B tiles left, A right. The
+    // rects land through resize transactions (client ack + commit), so
+    // poll for the side-by-side state rather than reading right away.
+    const { b: bRect, a: aRect } = await settled(
+      () => ({ a: c.state.wm.outerRectOf(aId), b: c.state.wm.outerRectOf(bId) }),
+      (r) => r.a && r.b && r.b.x < r.a.x
+        && r.a.width < OUT.width && r.b.width < OUT.width,
+      { what: "B (master) tiles left of A" });
+
+    // Grab B at its center and drop it on the RIGHT half of A: B lands
+    // after A in the member order and re-tiles -- A becomes master.
+    const g0 = { x: Math.round(bRect.x + bRect.width / 2),
+                 y: Math.round(bRect.y + bRect.height / 2) };
+    pointerMotion(c.addon, g0.x, g0.y);
+    await c.state.wm.propose(bId, { tiling: "floating" }, "user-input");
+    c.state.seat.beginGrab({
+      kind: "move", surfaceId: bId,
+      anchorX: g0.x, anchorY: g0.y,
+      startRect: bRect,
+      wasManaged: true,
+      endOnButtonUp: true,
+    });
+    pointerMotion(c.addon,
+      Math.round(aRect.x + aRect.width * 0.9),
+      Math.round(aRect.y + aRect.height / 2));
+    pointerButton(c.addon, 0x110 /* BTN_LEFT */, false);
+
+    await settled(() => c.state.seat.grab, (g) => g === null,
+      { what: "grab ended on button-up" });
+    await settled(() => c.state.wm.getWindowState(bId),
+      (ws) => ws?.tiling === "managed", { what: "B re-tiled on drop" });
+    await settled(() => c.runtime.invokeAction("workspace.list", {}),
+      (list) => JSON.stringify(list[0]?.members) === JSON.stringify([aId, bId]),
+      { what: "member order rearranged to [A, B]" });
+    await settled(() => ({ a: c.state.wm.outerRectOf(aId), b: c.state.wm.outerRectOf(bId) }),
+      (r) => r.a && r.b && r.a.x < r.b.x,
+      { what: "A tiles left of B after the rearrange" });
+  } finally {
+    await c.teardown();
+  }
+});

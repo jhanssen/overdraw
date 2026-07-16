@@ -94,3 +94,38 @@ test('reorder on a shown workspace emits a setOutputStack side effect with the n
   assert.equal(stacks[0].outputId, 0);
   assert.deepEqual(stacks[0].ids, [102, 103, 101]);
 });
+
+test('reorder moveToIndex: places the surface at the final index', () => {
+  let state = setup();
+  // members = [103, 102, 101]; move 103 to index 2 -> [102, 101, 103].
+  const r = reorder(state, 103, { moveToIndex: 2 });
+  state = r.state;
+  assert.equal(r.changed, true);
+  assert.deepEqual(members(state), [102, 101, 103]);
+});
+
+test('reorder moveToIndex: moving master-ward shifts the others tail-ward', () => {
+  let state = setup();
+  // members = [103, 102, 101]; move 101 to index 0 -> [101, 103, 102].
+  const r = reorder(state, 101, { moveToIndex: 0 });
+  state = r.state;
+  assert.equal(r.changed, true);
+  assert.deepEqual(members(state), [101, 103, 102]);
+});
+
+test('reorder moveToIndex: clamps out-of-range and no-ops on same index', () => {
+  let state = setup();
+  // Out of range clamps to the tail.
+  const r1 = reorder(state, 103, { moveToIndex: 99 });
+  state = r1.state;
+  assert.equal(r1.changed, true);
+  assert.deepEqual(members(state), [102, 101, 103]);
+  // Already there: no-op, no side effects.
+  const r2 = reorder(state, 103, { moveToIndex: 99 });
+  assert.equal(r2.changed, false);
+  assert.deepEqual(r2.sideEffects, []);
+  // Negative clamps to master.
+  const r3 = reorder(state, 103, { moveToIndex: -3 });
+  assert.equal(r3.changed, true);
+  assert.deepEqual(members(r3.state), [103, 102, 101]);
+});

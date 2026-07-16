@@ -1476,13 +1476,50 @@ test('world: dropping a previously-tiled window on another island re-parents and
     assert.notEqual(wm.getWindowState(101)?.tiling, 'managed',
       'user-floated window stays floating');
 
-    // Drops on the window's own island or on void change nothing.
+    // Drops on the window's own island or on void keep membership.
     pluginBus.emit('window.drag-dropped',
       { surfaceId: 103, wasManaged: true, x: PITCH + 300, y: 300 });
     pluginBus.emit('window.drag-dropped',
       { surfaceId: 103, wasManaged: true, x: -5000, y: 300 });
     await settle();
     assert.deepEqual((await call(rt, 'list', [0]))[1].members, [102, 103, 101]);
+  }, { world: true });
+});
+
+test('world: tiled stays tiled -- a drag-floated window snaps back into the tiling on any drop', async () => {
+  await withCanvasPlugin(async (h) => {
+    const { rt, wm, pluginBus, addWindow } = h;
+    await setupTwoIslands(h);   // 101 on ws1, 102 on ws2
+    addWindow(103);
+    await settle();
+
+    // The grab floats the window; a drop on its OWN island re-tiles it
+    // (floating is an explicit verb, never a drag side effect).
+    await wm.propose(103, { tiling: 'floating' }, 'user-input');
+    pluginBus.emit('window.drag-dropped',
+      { surfaceId: 103, wasManaged: true, x: 100, y: 300 });
+    await settle();
+    assert.equal(wm.getWindowState(103)?.tiling, 'managed',
+      'own-island drop re-tiles a previously-tiled window');
+    assert.deepEqual([...(await call(rt, 'list', [0]))[0].members].sort(), [101, 103],
+      'membership unchanged by an own-island drop');
+
+    // Same for a drop on void (no island under the cursor): snap back.
+    await wm.propose(103, { tiling: 'floating' }, 'user-input');
+    pluginBus.emit('window.drag-dropped',
+      { surfaceId: 103, wasManaged: true, x: -5000, y: 300 });
+    await settle();
+    assert.equal(wm.getWindowState(103)?.tiling, 'managed',
+      'void drop re-tiles a previously-tiled window');
+
+    // A window the user floated (wasManaged: false) stays floating on
+    // an own-island / void drop.
+    await wm.propose(103, { tiling: 'floating' }, 'user-input');
+    pluginBus.emit('window.drag-dropped',
+      { surfaceId: 103, wasManaged: false, x: 100, y: 300 });
+    await settle();
+    assert.equal(wm.getWindowState(103)?.tiling, 'floating',
+      'user-floated window stays floating');
   }, { world: true });
 });
 

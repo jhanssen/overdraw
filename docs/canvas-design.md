@@ -750,12 +750,17 @@ tests only.
    trigger): a move grab's release emits `window.drag-dropped` with
    the pointer's WORLD position (through the content camera, so drops
    land where the cursor points while fitted/roaming) and whether the
-   window was tiled before the grab floated it. The canvas plugin
-   re-parents the window to the island under the cursor; a
-   previously-tiled window re-tiles into the new island, a
-   user-floated one stays floating, and drops on the window's own
-   island or on void change nothing (the plain drag-to-float
-   gesture). Island bookmarks also survive evaporation now: they
+   window was tiled before the grab floated it. TILED STAYS TILED: a
+   previously-tiled window re-tiles wherever it drops -- into another
+   island (re-parent), at the drop position within its own island's
+   member order (rearrange past a neighbor; `reorder`'s
+   `{ moveToIndex }` op, index from a horizontal-flow half-plane
+   heuristic against the hit window's rect -- a layout-owned
+   drop-index query is future work), or back into its old slot (void
+   drop). Floating is an explicit verb (`window.toggle-floating`,
+   core-actions), never a drag side effect; a window the user floated
+   stays floating wherever it's dropped, only its membership follows
+   the cursor. Island bookmarks also survive evaporation now: they
    capture the workspace's name and degrade to create-on-reference
    when the handle is dead -- closing the last island-hygiene gap.
    ALSO LANDED -- **grid arrangement** (`canvas.arrangement:

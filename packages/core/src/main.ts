@@ -1249,6 +1249,20 @@ pluginBus.subscribe("window.raise-floating-requested", () => {
   state?.wm?.raiseAllFloating();
 });
 
+// The window.toggle-floating action: flip the focused window's lane.
+// Floating -> managed re-enters the tiling at its member slot; managed ->
+// floating keeps the current rect (the WM captures it as the floating
+// rect).
+pluginBus.subscribe("window.toggle-floating-requested", () => {
+  if (!state?.seat || !state.wm) return;
+  const focused = state.seat.kbFocus?.surfaceId;
+  if (typeof focused !== "number") return;
+  const ws = state.wm.getWindowState(focused);
+  if (!ws) return;
+  const next = ws.tiling === "floating" ? "managed" : "floating";
+  void state.wm.propose(focused, { tiling: next }, "user-input");
+});
+
 // window.move-to-output (explicit outputId): move the focused window to the
 // shown workspace on the target output. Resolves via the workspace
 // namespace's moveWindow (which knows the shown workspace per output) so
