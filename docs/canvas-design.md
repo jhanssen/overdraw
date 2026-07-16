@@ -208,13 +208,63 @@ Consequences:
   moves into island arrangement, which is user-manipulable at runtime. A
   grid screen is two even-split islands stacked with a camera framing
   both — not a new layout plugin.
-- **Fixed islands** compress on overflow (master-stack rows get thinner —
-  today's behavior). **Elastic islands** grow along their anchored axis
-  and the docked camera scrolls within them (niri strip). One flag, per
-  island.
+- **Fixed islands** compress on overflow (the layout divides a
+  workarea-sized rect — master-stack rows get thinner). **Elastic
+  islands** grow along their anchored axis and the docked camera scrolls
+  within them (niri strip). One flag, per island — and strictly a sizing
+  flag: growth never selects the algorithm (see "Layout mode is
+  declared" below).
 - Cameras **dock** to islands (pin to origin/framing exactly) rather than
   free-pan near them; free panning is for traveling and floating-window
   territory. Docked-on-a-fixed-island is pixel-identical to a workspace.
+
+**Layout mode is declared; growth only sizes the region.** The full
+provider registry is future work, but its first consequence binds now:
+WHICH algorithm tiles an island is declared configuration
+(`layout.mode`), and the island's growth flag never selects it — growth
+only decides what region the algorithm receives. The two compose:
+
+- `columns` + elastic = the niri strip: fixed-width columns, island rect
+  = the layout's natural size, docked camera scrolls within it.
+- `columns` + fixed = even-split: the same column widths compressed
+  proportionally into the workarea. The "even-split" primitive above is
+  columns under fixed growth, not a second algorithm.
+- `master-stack` + elastic = inert growth: master-stack's natural size
+  IS the workarea (it always fits), so the island simply never grows.
+  Valid, not an error.
+
+Config: `layout: { mode: "master-stack" | "columns", gap }` plus
+mode-specific params — `masterFraction` (master-stack) or `column`, the
+default column-width fraction (columns). `canvas.workspaces[].layout`
+overrides per name; `workspace.set-layout {index?, output?, mode}`
+switches one island at runtime. `workspace.set-elastic` stays pure
+growth (boolean only — the `{ column }` form retires into the layout
+config, with no compatibility sugar; `canvas.elastic` sets the growth
+default and nothing else).
+
+Sizing contract: the provider gains `measure(inputs) -> { width,
+height }` — its natural size for these members in this workarea. An
+elastic island's rect is the measure result (anchored per §6); a fixed
+island's rect is the workarea. The canvas plugin neither computes strip
+geometry itself nor injects a layout hint: a canvas-side count × column
+computation would duplicate the layout's own arithmetic, and two owners
+of one geometry is exactly how the modes drift apart.
+
+Columns mode: one window per column is an invariant (vertical division
+belongs to master-stack or a future stack primitive). Column widths are
+per-window provider state — seeded from `column`, keyed by window id so
+widths follow reorders, pruned when the window leaves the island.
+`layout.grow-column` / `layout.shrink-column { surfaceId? }` (default:
+the focused window) adjust one width through `setParams({ surfaceId,
+widthDelta })`, the same plumbing shape as the master-fraction actions.
+Under elastic growth a width change changes the measure (Σ widths +
+gaps) and shoves neighbors (§6); under fixed growth it changes the
+ratios within the workarea. The invariant this restores: every
+mode × growth combination keeps a live, user-visible size knob — an
+elastic island is never more restrictive than a fixed one. (Params
+other than per-window widths — `masterFraction`, `gap` — remain
+provider-global until the registry lands: a fraction tweak still
+applies to every master-stack island at once.)
 
 Visibility: `setOutputStack` semantics invert from "the shown workspace's
 members" to "everything near the camera's view rect" (with margin for
@@ -720,6 +770,17 @@ tests only.
    resize -- §5's pacing promise now holds: off-view callbacks ride
    any output's flip-complete, and a fully idle compositor forces one
    flip. GPU test: `plugin-canvas/canvas-elastic.gpu.mjs`.
+   GAP (superseded by §5 "Layout mode is declared; growth only sizes
+   the region"): the landed strip keys the ALGORITHM off the growth
+   flag -- elastic injects the columns hint, so the `layout` config
+   block silently stops meaning master-stack, `masterFraction` and the
+   grow/shrink-master actions no-op on strips, and columns are uniform
+   with no runtime width knob at all (the column fraction is
+   config-only; `set-elastic` takes a boolean). `elasticWidth` also
+   duplicates the layout's geometry canvas-side. The §5 contract
+   (explicit `layout.mode`, `measure`, per-column widths +
+   grow/shrink-column, `workspace.set-layout`) replaces this; the
+   `canvas.elastic: { column }` config form goes away with it.
    ALSO LANDED -- **drag-pan** (the pointer gesture for free roaming):
    a third seat grab kind, `camera-pan` -- while it holds, pointer
    motion pans the output's camera 1:1 (content follows the hand;

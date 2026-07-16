@@ -1020,6 +1020,19 @@ validated + resolved + consumed by the runtime + hotkey plugin.
   `plugin-canvas/canvas-fit.gpu.mjs`,
   `plugin-canvas/canvas-elastic.gpu.mjs`; unit coverage in
   `plugin-canvas/integration.test.js`.
+  KNOWN GAP (design settled in canvas-design.md §5 "Layout mode is
+  declared; growth only sizes the region", not yet implemented): the
+  growth flag currently SELECTS the algorithm -- an elastic workspace
+  silently swaps master-stack for uniform columns, so
+  `layout.masterFraction` and the `layout.grow/shrink-master` actions
+  no-op on strips, and columns have no runtime width knob (the column
+  fraction is config-only). The settled design: explicit `layout.mode`
+  (`"master-stack" | "columns"`, per-workspace overridable +
+  `workspace.set-layout`), a provider `measure()` that sizes elastic
+  islands (growth never picks the algorithm; even-split = columns +
+  fixed), and per-window column widths with
+  `layout.grow/shrink-column`. `canvas.elastic` reduces to the growth
+  default (boolean; `{ column }` moves into layout config, no sugar).
   Empty-island backdrops are LANDED: memberless islands draw a
   translucent camera-mapped quad (`canvas.islandBackdrop` color,
   `setIslandBackdrops` sink surface) so empty persistent workspaces
