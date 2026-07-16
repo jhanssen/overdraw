@@ -816,9 +816,24 @@ tests only.
    ext-workspace per-group duplicate-handle projection (§9, needed once
    islands roam across outputs); the de-workspacing renames/retirements
    (§10b, each landing with the feature that supersedes it).
-5. **Later**: true zoom via fractional-scale; snap clusters /
-   bezel-spanning; per-island layout providers (layout registry);
-   world-arrangement pluggability.
+5. **Later**: true zoom via fractional-scale -- with a structural
+   constraint: fractional scale is a SURFACE property (one buffer, one
+   scale), so simultaneous viewers at different zooms cannot all be
+   native-crisp. The workable shape: negotiate each surface to the MAX
+   effective scale across its viewing cameras (zoom × output scale) --
+   the most-zoomed-in viewer is crisp, everyone else minifies a
+   higher-res buffer (supersampling; the bad direction, upscaling,
+   never occurs under max) -- and renegotiate only on SETTLED camera
+   writes (transient writes during pans/tweens stay optical; a
+   per-frame scale change would be a client re-render storm). The
+   dominant case (a docked island's single camera) gets full true
+   zoom. Lifting the constraint outright would take a NEW protocol
+   (per-view rendering: a client submits distinct buffers per
+   compositor-declared view/scale) -- technically possible, but it
+   only pays off once toolkits adopt it, so it is an ecosystem bet,
+   not a design dependency; max-over-viewers is the plan of record.
+   Also later: snap clusters / bezel-spanning; per-island layout
+   providers (layout registry); world-arrangement pluggability.
 
 Steps 1–2 are useful even if the canvas never ships: the camera subsumes
 slide transitions, and islands give reserved-zone/region handling a
