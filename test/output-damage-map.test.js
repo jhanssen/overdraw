@@ -182,3 +182,59 @@ test("moving an output (logical position) preserves accumulated damage", () => {
   assert.deepEqual(m.take(0, SLOT_0),
     { mode: "partial", box: { x: 510, y: 510, w: 5, h: 5 } });
 });
+
+// --- damageRect under a camera ---
+//
+// World damage has to land where the camera actually shows it: the view rect
+// is the output's bounds shifted by the camera and widened by 1/zoom, and a
+// world unit covers `zoom` local units. The compositor forces a full repaint
+// on a camera CHANGE, so what matters here is an ordinary content commit
+// arriving while the camera is already parked somewhere -- the everyday case
+// in world mode, and the one a full-repaint-on-move test never reaches.
+
+test("camera pan: world damage lands at its offset in output-local space", () => {
+  const m = new OutputDamageMap();
+  m.setOutputs([out(0, 0, 0, 100, 100)]);
+  m.setCamera(0, 50, 0, 1);          // view covers world x 50..150
+  m.full(); m.take(0, SLOT_0);       // clear the first-sight full
+  m.damageRect(60, 20, 10, 10);
+  assert.deepEqual(m.take(0, SLOT_0),
+    { mode: "partial", box: { x: 10, y: 20, w: 10, h: 10 } });
+});
+
+test("camera pan: damage outside the view rect is a no-op", () => {
+  const m = new OutputDamageMap();
+  m.setOutputs([out(0, 0, 0, 100, 100)]);
+  m.setCamera(0, 50, 0, 1);
+  m.full(); m.take(0, SLOT_0);
+  // World x 0..10 is inside the output's BOUNDS but behind the camera --
+  // clipping against the plain bounds instead of the view rect would
+  // wrongly dirty the output here.
+  m.damageRect(0, 0, 10, 10);
+  m.damageRect(60, 20, 10, 10);
+  assert.deepEqual(m.take(0, SLOT_0),
+    { mode: "partial", box: { x: 10, y: 20, w: 10, h: 10 } },
+    "only the in-view rect contributes");
+});
+
+test("camera zoom: the view covers more world and damage scales down", () => {
+  const m = new OutputDamageMap();
+  m.setOutputs([out(0, 0, 0, 100, 100)]);
+  m.setCamera(0, 0, 0, 0.5);         // view covers world 0..200 in each axis
+  m.full(); m.take(0, SLOT_0);
+  // A 20x20 world rect at world 100 renders 10x10 at local 50.
+  m.damageRect(100, 0, 20, 20);
+  assert.deepEqual(m.take(0, SLOT_0),
+    { mode: "partial", box: { x: 50, y: 0, w: 10, h: 10 } });
+});
+
+test("anchored damage ignores the camera (cursor / layer shell)", () => {
+  const m = new OutputDamageMap();
+  m.setOutputs([out(0, 0, 0, 100, 100)]);
+  m.setCamera(0, 50, 0, 1);
+  m.full(); m.take(0, SLOT_0);
+  // Glass-positioned: clips against the plain bounds, no camera term.
+  m.damageRect(10, 10, 5, 5, true);
+  assert.deepEqual(m.take(0, SLOT_0),
+    { mode: "partial", box: { x: 10, y: 10, w: 5, h: 5 } });
+});
