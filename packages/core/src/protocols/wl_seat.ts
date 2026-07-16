@@ -721,7 +721,17 @@ export default function makeSeat(ctx: Ctx, driver: FocusDriver): SeatHandler {
       return;
     }
     const ws = ctx.state.wm?.getWindowState(g.surfaceId) ?? null;
-    const rect = computeGrabRect(g, x, y, ws?.constraints ?? null);
+    // The floating rect lives in world coordinates; pointer travel is
+    // glass. Convert the deltas through the viewing camera (translation
+    // cancels, leaving /zoom) so the window tracks the hand 1:1 on
+    // glass even while zoomed out (fit/roam). The camera is static for
+    // the grab's duration -- the animations broker's cameraGate denies
+    // camera moves during grabs -- so the transform is stable.
+    const view = contentViewAt(x, y);
+    const rect = computeGrabRect(g,
+      (x - g.anchorX) / view.zoom,
+      (y - g.anchorY) / view.zoom,
+      ws?.constraints ?? null);
     ctx.state.wm?.setFloatingRect(g.surfaceId, rect);
   }
 
@@ -894,14 +904,14 @@ export default function makeSeat(ctx: Ctx, driver: FocusDriver): SeatHandler {
             consumed = r.consume;
           }
         }
-        // Protocol/gesture grabs set endOnButtonUp: the seat auto-ends
-        // the grab on the next button release. This must run BEFORE the
+        // Pointer-drag grabs (move/resize/camera-pan, hotkey- or
+        // client-initiated) set endOnButtonUp: the seat auto-ends the
+        // grab on the next button release. This must run BEFORE the
         // consumed early-return -- the binding chain consumes a release
-        // that participates in a held chord instance (button up, modifier
-        // still down), and a drag gesture must end on the button lift
-        // regardless. Hotkey move/resize grabs leave it false (the
-        // binding chain's release callback ends them via the
-        // window.end-grab action at chord release).
+        // that participates in a held chord instance (button up,
+        // modifier still down) and fires the binding's releaseAction
+        // only at instance end, so a drag gesture must end on the
+        // button lift here regardless.
         if (seat.grab && !ev.pressed && seat.grab.endOnButtonUp) {
           seat.endGrab();
         }

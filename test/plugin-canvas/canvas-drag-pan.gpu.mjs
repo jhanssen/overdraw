@@ -134,3 +134,86 @@ test("drag-pan: a chain-consumed button release still ends the grab", { skip }, 
     await c.teardown();
   }
 });
+
+// The hotkey move grab, exercised the way a Mod+LMB drag reaches it while
+// fitted: deltas convert glass->world through the fit camera (the window
+// tracks the hand 1:1 on glass, not slower), the chain-consumed button
+// release still ends the grab (endOnButtonUp -- the chord's modifier is
+// still held), and the drop at THAT moment's pointer re-parents the
+// window to the island under the cursor and re-tiles it.
+test("move-drag while fitted: 1:1 tracking, chain-consumed release drops onto the target island", { skip }, async () => {
+  const c = await setupCompositor({ headless: OUT, config: { canvas: { world: true } } });
+  try {
+    const a = c.spawnClient([FILL, "--color", "ff3030c0"]);
+    await a.ready;
+    const s1 = await c.waitFor(c.query, (s) => s.windows.length === 1, { what: "A mapped" });
+    const aId = s1.windows[0].surfaceId;
+    await c.runtime.invokeAction("workspace.create", { persistent: true });
+    await c.state.wm.settled();
+
+    await c.runtime.invokeAction("workspace.fit", {});
+    const cam = await settled(() => c.query().outputs[0],
+      (o) => o.cameraZoom < 1, { what: "fit camera engaged" });
+    const world = (gx, gy) => ({
+      x: cam.cameraX + gx / cam.cameraZoom,
+      y: cam.cameraY + gy / cam.cameraZoom,
+    });
+
+    // Grab A at its center: pointer to A's glass position, then install
+    // the grab exactly as main.ts's window.grab-requested handler does.
+    const start = c.state.wm.outerRectOf(aId);
+    const g0 = {
+      x: Math.round((start.x + start.width / 2 - cam.cameraX) * cam.cameraZoom),
+      y: Math.round((start.y + start.height / 2 - cam.cameraY) * cam.cameraZoom),
+    };
+    pointerMotion(c.addon, g0.x, g0.y);
+    await c.state.wm.propose(aId, { tiling: "floating" }, "user-input");
+    c.state.seat.beginGrab({
+      kind: "move", surfaceId: aId,
+      anchorX: g0.x, anchorY: g0.y,
+      startRect: start,
+      wasManaged: true,
+      endOnButtonUp: true,
+    });
+
+    // Drag toward ws2's island (slot 1). The window must track the hand
+    // 1:1 on glass: world delta = glass delta / zoom.
+    const g1 = { x: g0.x + 300, y: g0.y };
+    pointerMotion(c.addon, g1.x, g1.y);
+    const expectX = start.x + 300 / cam.cameraZoom;
+    await settled(() => c.state.wm.outerRectOf(aId),
+      (r) => r && Math.abs(r.x - expectX) < 1.5,
+      { what: `window follows the hand through the zoom (expect x ${expectX})` });
+
+    // Land the pointer over ws2's island center and release the button
+    // with the chord's modifier still held (the chain consumes the
+    // release). The grab must end NOW, dropping at this position.
+    const w1 = world(g1.x, g1.y);
+    const target = { x: PITCH + 640, y: w1.y };
+    const g2 = {
+      x: Math.round((target.x - cam.cameraX) * cam.cameraZoom),
+      y: Math.round((target.y - cam.cameraY) * cam.cameraZoom),
+    };
+    pointerMotion(c.addon, g2.x, g2.y);
+    c.state.bindingChain = {
+      dispatchPress: () => ({ consume: false }),
+      dispatchRelease: () => ({ consume: true }),
+    };
+    pointerButton(c.addon, 0x110 /* BTN_LEFT */, false);
+    await settled(() => c.state.seat.grab, (g) => g === null,
+      { what: "move grab ended despite the consumed release" });
+
+    // The drop re-parented A to workspace 2 and re-tiled it (it was
+    // managed before the grab floated it).
+    await settled(() => c.runtime.invokeAction("workspace.list", {}),
+      (list) => {
+        const ws2 = list.find((w) => w.index === 2);
+        return !!ws2 && ws2.members.includes(aId);
+      }, { what: "A re-parented to workspace 2" });
+    await settled(() => c.state.wm.getWindowState(aId),
+      (ws) => ws?.tiling === "managed", { what: "A re-tiled on drop" });
+  } finally {
+    c.state.bindingChain = null;
+    await c.teardown();
+  }
+});

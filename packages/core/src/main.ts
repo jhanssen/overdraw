@@ -1191,12 +1191,21 @@ pluginBus.subscribe("window.grab-requested", async (_n, payload) => {
   }
 
   const pos = state.seat.pointerPosition();
+  // A drag gesture ends when the button lifts, not when the whole
+  // binding chord releases: the chain fires releaseAction only at
+  // instance end (all keys up), so a button release with the modifier
+  // still held would otherwise leave the grab live -- the window keeps
+  // following the pointer, and a move grab's drop event fires late at
+  // whatever position the cursor drifted to. The binding's
+  // releaseAction (window.end-grab) still fires at chord release as an
+  // idempotent backstop.
   if (p.kind === "move") {
     state.seat.beginGrab({
       kind: "move", surfaceId,
       anchorX: pos.x, anchorY: pos.y,
       startRect: startOuter,
       wasManaged: ws?.tiling === "managed",
+      endOnButtonUp: true,
     });
   } else {
     const valid: ReadonlyArray<import("./protocols/ctx.js").ResizeEdges> = [
@@ -1212,12 +1221,18 @@ pluginBus.subscribe("window.grab-requested", async (_n, payload) => {
       anchorX: pos.x, anchorY: pos.y,
       startRect: startOuter,
       edges,
+      endOnButtonUp: true,
     });
   }
 });
 
 pluginBus.subscribe("window.grab-end-requested", () => {
-  state?.seat?.endGrab();
+  // Ends only move/resize grabs: this fires at chord release as the
+  // backstop for a grab that already ended on button-up, and the user
+  // may have started a DIFFERENT grab (e.g. a camera pan) on another
+  // button of the still-held chord in between -- that one must survive.
+  const kind = state?.seat?.grab?.kind;
+  if (kind === "move" || kind === "resize") state?.seat?.endGrab();
 });
 
 // The `window.close` action (plugin-core-actions) emits this; close the
