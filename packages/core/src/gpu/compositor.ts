@@ -1440,6 +1440,10 @@ export class JsCompositor implements CompositorSink {
   ): { x: number; y: number; w: number; h: number } | undefined {
     if (this.activeTransitions.has(o.id)) return undefined;
     const repaint = this.outputDamage.take(o.id, key);
+    // Debug/mitigation knob: force full repaints (disable the composite
+    // scissor). Rules out -- or works around -- damage-accounting bugs at the
+    // cost of full-frame composites.
+    if (process.env.OVERDRAW_FULL_REPAINT === "1") return undefined;
     return repaint.mode === "partial" ? repaint.box : undefined;
   }
 
