@@ -1025,7 +1025,17 @@ validated + resolved + consumed by the runtime + hotkey plugin.
   so each peeks in, head/tail columns sit flush to the side that has
   strip in it, and a column wider than the view keeps left-edge-wins.
   Minimal scroll hid the far neighbor entirely with no hint it existed
-  -- under follow-pointer that left it pointer-unreachable. Off-view frame pacing is FIXED with
+  -- under follow-pointer that left it pointer-unreachable.
+  `wm.viewportOf(outputId)` is the seam for "what is this output looking
+  at" (canvas-design.md §4 "Where is the output?"): core wires it to
+  `outputCameras` (origin + camera, sized by 1/zoom), and it falls back
+  to the output's rect when no camera exists, so non-canvas sessions are
+  unchanged. Map-time float placement and `window.opening`'s outputRect
+  both read it; an output's own rect is the monitor's arrangement slot
+  and was placing map-time floats (dialogs, fixed-size clients,
+  rule-floated windows) on whichever island sat at that slot rather than
+  in front of the user. Coverage: `wm-floating.test.js`,
+  `opening-driver.test.js`. Off-view frame pacing is FIXED with
   it: surfaces outside every camera view now get wl_callback.done
   from any output's flip-complete (idle compositors force one flip),
   so off-view clients that block on done before committing (e.g. a

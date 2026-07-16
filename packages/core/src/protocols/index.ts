@@ -502,6 +502,24 @@ export async function installProtocols(
       // from state.outputToplevelStacks (populated via the workspace
       // plugin's setOutputStack side effects).
       outputContent: () => state.outputToplevelStacks ?? new Map(),
+      // viewportOf: the world region an output currently shows. The
+      // camera translates by (cam.x, cam.y) from the output's own origin
+      // and scales by cam.zoom, so a zoomed-out camera sees MORE world
+      // than the output is wide -- the inverse of the render transform
+      // in gpu/compositor.ts updateUniforms. No camera (the common case,
+      // and every non-canvas session) leaves the output's rect as the
+      // answer, which is then exactly true.
+      viewportOf: (outputId) => {
+        const o = state.wm?.state.outputs.get(outputId);
+        if (!o) return null;
+        const cam = state.outputCameras?.get(outputId);
+        if (!cam) return { ...o.rect };
+        const z = cam.zoom > 0 ? cam.zoom : 1;
+        return {
+          x: o.rect.x + cam.x, y: o.rect.y + cam.y,
+          width: o.rect.width / z, height: o.rect.height / z,
+        };
+      },
       // Modal focus tethering: the WM observes when a modal becomes
       // active (or loses modality) and tells the seat to move focus.
       // The seat is constructed AFTER createWm (see GLOBALS loop

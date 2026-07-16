@@ -334,3 +334,53 @@ test('raiseAllFloating: preserves relative order of multiple floating windows', 
   assert.ok(stack.indexOf(2) > stack.indexOf(1), 'floating 2 above tiled');
   assert.ok(stack.indexOf(3) > stack.indexOf(2), 'floating 3 stays above floating 2');
 });
+
+// --- map-time float placement -------------------------------------------
+
+// A window that maps already floating (fixed-size here; also dialogs and
+// rule-floated windows) has no rect to inherit, so the WM picks one. It must
+// land in front of the user: an output's own rect is where the monitor sits
+// in the arrangement, which stops being the visible region the moment a
+// camera looks somewhere else.
+async function addFixedSize(wm, id, w, h) {
+  wm.addWindow(id, res(id));
+  await wm.propose(id, {
+    constraints: { minSize: { width: w, height: h }, maxSize: { width: w, height: h } },
+  }, 'client-request');
+  wm.windowHasContent(id);
+  await wm.settled();
+}
+
+test('float placement: centers on what the output is looking at', async () => {
+  const wm = createWm(mockSink(), [{ id: 0, rect: { x: 0, y: 0, width: 1000, height: 600 }, scale: 1 }], {
+    layoutDriverFactory: inlineMasterStackDriverFactory,
+    // The camera is parked on an island far from the output's own slot.
+    viewportOf: () => ({ x: 5000, y: 300, width: 1000, height: 600 }),
+  });
+  await addFixedSize(wm, 1, 400, 200);
+  assert.equal(wm.getWindowState(1).tiling, 'floating', 'fixed-size maps floating');
+  assert.deepEqual(wm.getFloatingRect(1),
+    { x: 5300, y: 500, width: 400, height: 200 },
+    'centered in the viewport, not at the output rect');
+});
+
+test('float placement: a zoomed-out camera sees more world, and the float centers in it', async () => {
+  const wm = createWm(mockSink(), [{ id: 0, rect: { x: 0, y: 0, width: 1000, height: 600 }, scale: 1 }], {
+    layoutDriverFactory: inlineMasterStackDriverFactory,
+    // zoom 0.5 -> the viewport covers twice the world in each axis.
+    viewportOf: () => ({ x: 0, y: 0, width: 2000, height: 1200 }),
+  });
+  await addFixedSize(wm, 1, 400, 200);
+  assert.deepEqual(wm.getFloatingRect(1),
+    { x: 800, y: 500, width: 400, height: 200 });
+});
+
+test('float placement: no viewport reported -> the output rect is the answer', async () => {
+  const wm = createWm(mockSink(), [{ id: 0, rect: { x: 0, y: 0, width: 1000, height: 600 }, scale: 1 }], {
+    layoutDriverFactory: inlineMasterStackDriverFactory,
+  });
+  await addFixedSize(wm, 1, 400, 200);
+  assert.deepEqual(wm.getFloatingRect(1),
+    { x: 300, y: 200, width: 400, height: 200 },
+    'no camera: the output shows its own rect');
+});

@@ -282,6 +282,12 @@ export interface Wm {
   // the default home for newly-mapped windows. Throws if the WM has no
   // outputs (the construction invariant forbids this).
   primaryOutputId(): number;
+  // The world region `outputId` currently shows. Its own rect is only the
+  // monitor's slot in the arrangement; a camera parts the two the moment it
+  // leaves that slot's origin. Anything meaning "the visible region" -- or
+  // handing a plugin a rect to measure a world distance against -- asks
+  // this. Null for an unknown output.
+  viewportOf(outputId: number): Rect | null;
   // Proactive: called at get_toplevel (role assignment), BEFORE the client has
   // content. Inserts the window into the layout (as the new master) and
   // schedules a layout pass. Idempotent for an already-added surface. The
@@ -725,6 +731,14 @@ export interface WmOptions {
   // omit it -- the WM then defaults to "every mapped window on the
   // primary output" so non-workspace harnesses still produce a layout.
   outputContent?: () => ReadonlyMap<number, ReadonlyArray<number>>;
+  // Where an output is currently looking, in world coordinates. An
+  // output's own rect is its slot in the monitor arrangement, which is
+  // only what the user sees when nothing moves the view; with a camera
+  // the two part company the moment it leaves that slot's origin. Sites
+  // that mean "the visible region" ask this instead. Returning null (or
+  // omitting the callback) means the output shows its own rect, which is
+  // the truth whenever no camera is in play.
+  viewportOf?: (outputId: number) => Rect | null;
   // Optional shared surface-transaction broker. When provided, the WM
   // routes its resize-tx through it (and the cross-output handler shares
   // the same broker so holds on a single surface from both sources
@@ -1039,6 +1053,12 @@ export function createWm(
     for (const id of wm.outputs.keys()) if (id < lo) lo = id;
     if (lo === Infinity) throw new Error("internal: WM has no outputs");
     return lo;
+  }
+  function viewportOf(outputId: number): Rect | null {
+    const reported = opts?.viewportOf?.(outputId);
+    if (reported) return reported;
+    const out = wm.outputs.get(outputId);
+    return out ? { ...out.rect } : null;
   }
   // Resize transaction (reorder relayouts only). A window that changes size must
   // not jump to its new tile before it has re-rendered at the new size, or it
@@ -1681,6 +1701,7 @@ export function createWm(
     },
 
     primaryOutputId,
+    viewportOf,
 
     setOutputs(newOutputs) {
       if (newOutputs.length === 0) {
@@ -1788,11 +1809,15 @@ export function createWm(
           const targetOutputId = resolveParentOutputId(
             win.windowState.parent, outputContent)
             ?? primaryOutputId();
-          const out = wm.outputs.get(targetOutputId);
-          const ox = out?.rect.x ?? 0;
-          const oy = out?.rect.y ?? 0;
-          const ow = out?.rect.width ?? outerW;
-          const oh = out?.rect.height ?? outerH;
+          // Center on what the output is LOOKING at, not on where the
+          // monitor sits in the arrangement: a float belongs in front of
+          // the user, and under a camera the two are the same place only
+          // while it sits at its slot's origin.
+          const view = viewportOf(targetOutputId);
+          const ox = view?.x ?? 0;
+          const oy = view?.y ?? 0;
+          const ow = view?.width ?? outerW;
+          const oh = view?.height ?? outerH;
           win.floatingRect = {
             x: ox + Math.max(0, Math.round((ow - outerW) / 2)),
             y: oy + Math.max(0, Math.round((oh - outerH) / 2)),

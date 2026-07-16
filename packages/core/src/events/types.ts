@@ -385,11 +385,13 @@ export type WindowClosingEvent = {
 // animation plays over visible frames.
 //
 // `outerRect` is the window's outer rect at the time of first content
-// (= the layout-driver's assignment for this tile). `outputRect` is
-// the rect of the output the window is mapped on, in compositor
-// coordinates, so a plugin computing "slide in from the output edge"
-// can do the math without a separate outputs lookup. `appId` / `title`
-// may be null (client hasn't set them yet).
+// (= the layout-driver's assignment for this tile). `outputRect` is the
+// region its output is SHOWING -- the same space as `outerRect`, so a
+// plugin computing "slide in from the output edge" can subtract the two
+// without a separate outputs lookup. Under a camera that is not the
+// output's own rect, which is only the monitor's slot in the
+// arrangement. `appId` / `title` may be null (client hasn't set them
+// yet).
 export type WindowOpeningEvent = {
   surfaceId: number;
   outerRect: WindowRect;

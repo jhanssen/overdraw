@@ -89,15 +89,16 @@ export function createOpeningDriver(deps: OpeningDriverDeps): OpeningDriver {
       // Resolve the output the window mapped on. Falls back to the
       // primary output if the surface never had a spawnOutputId set
       // (defensive; shouldn't happen for a real toplevel that reached
-      // first content). The output's rect is in compositor coords --
-      // plugins use it to compute slide distances ("from the output
-      // edge to the tile") without a separate outputs lookup.
+      // first content). outputRect is the world region that output is
+      // SHOWING, so it shares a space with outerRect and a plugin can
+      // subtract the two for a slide distance ("from the output edge to
+      // the tile"). The output's own rect is its slot in the monitor
+      // arrangement -- a different space from outerRect the moment a
+      // camera looks anywhere but that slot's origin, which would leave
+      // the arithmetic mixing world and layout coordinates.
       const outputId = s.spawnOutputId ?? state.wm.primaryOutputId();
-      const wmOutput = state.wm.state.outputs.get(outputId);
-      const outputRect = wmOutput
-        ? { x: wmOutput.rect.x, y: wmOutput.rect.y,
-            width: wmOutput.rect.width, height: wmOutput.rect.height }
-        : { x: 0, y: 0, width: outer.width, height: outer.height };
+      const outputRect = state.wm.viewportOf(outputId)
+        ?? { x: 0, y: 0, width: outer.width, height: outer.height };
       const tiling = state.wm.getWindowState?.(s.id)?.tiling ?? "managed";
       const payload: WindowOpeningEvent = {
         surfaceId: s.id,

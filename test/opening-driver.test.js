@@ -24,7 +24,8 @@ import { createOpeningDriver } from '../packages/core/dist/protocols/opening-dri
 // contentGateOwners machinery so tests can assert who's currently
 // holding the gate.
 function mockState({ outer, role = 'xdg_toplevel', gated = false,
-                     title = null, appId = null } = {}) {
+                     title = null, appId = null,
+                     viewport = { x: 0, y: 0, width: 1920, height: 1080 } } = {}) {
   const gates = new Map();
   if (gated) gates.set(1, new Set(['decoration']));  // a pre-existing owner
   const events = [];
@@ -58,6 +59,9 @@ function mockState({ outer, role = 'xdg_toplevel', gated = false,
           if (s.size === 0) gates.delete(id);
         },
         primaryOutputId: () => 0,
+        // The world region the output shows -- what the event reports as
+        // outputRect, so it shares a space with outerRect.
+        viewportOf: (id) => id === 0 ? viewport : null,
         // wm.state.outputs is a Map<id, WmOutput>.
         state: {
           outputs: new Map([[0, {
@@ -216,4 +220,22 @@ test('hasPluginHandler is consulted lazily on every beforeMap', () => {
   m.gates.clear();
   assert.equal(driver.beforeMap(m.state, m.surface), true);
   assert.deepEqual([...m.gates.get(1)], ['opening']);
+});
+
+// outerRect is a world rect; outputRect must be the region the output is
+// SHOWING, or a plugin subtracting them to get a slide distance mixes world
+// and monitor-arrangement coordinates. Under a camera parked on a far
+// island the difference is the whole point.
+test('window.opening: outputRect is the output viewport, not its layout slot', () => {
+  const m = mockState({
+    outer: { x: 8000, y: 0, width: 800, height: 600 },
+    viewport: { x: 7800, y: 0, width: 1920, height: 1080 },
+  });
+  const driver = createOpeningDriver({ hasPluginHandler: () => true });
+  driver.beforeMap(m.state, m.surface);
+  const ev = m.events.find((e) => e.name === 'window.opening');
+  assert.deepEqual(ev.payload.outputRect, { x: 7800, y: 0, width: 1920, height: 1080 });
+  // The plugin's "distance from the output's left edge to the tile" is now
+  // a subtraction within one space.
+  assert.equal(ev.payload.outerRect.x - ev.payload.outputRect.x, 200);
 });

@@ -157,6 +157,22 @@ plugin would pay one IPC round-trip per frame, so the follow-up is an
 value.ts` TargetRef) letting plugins hand core a spring spec and get
 in-core per-tick evaluation, like window fx animations do.
 
+**"Where is the output?" and "what is the output looking at?" are
+different questions** — an output's rect answers only the first. It is the
+monitor's slot in the arrangement; the visible region is that slot's
+origin plus the camera, sized by the zoom, and the two agree only while
+the camera sits at the origin at 1:1. Sites that mean the visible region
+ask `wm.viewportOf(outputId)` (backed by a core callback reading
+`outputCameras`; it returns the output's rect when no camera is in play,
+which is then exactly true). Map-time float placement centers on it — a
+float belongs in front of the user, and the output rect would drop it on
+whatever island happens to sit at the monitor's slot. `window.opening`
+reports it as `outputRect` so it shares a space with the event's
+world-space `outerRect` and a plugin can subtract the two for a slide
+distance. Keep the conversion in one place: a second site deriving the
+viewport from cameras itself is two owners of one geometry, and they
+drift.
+
 **Glass or world is a property of the surface, and pointer-borne chrome is
 glass.** The camera moves every content surface that is not camera-exempt
 (`outputAnchored`, a layer surface, or the cursor sprite). A surface
