@@ -78,6 +78,9 @@ const CANVAS_PLUGIN: BundledPluginSpec = {
     // The layout gap doubles as the strip scroll-reveal margin, so a
     // revealed column keeps its gap band visible at the viewport edge.
     layoutGap: (config.layout as { gap?: unknown } | undefined)?.gap,
+    // The provider's default mode, for islands that declare none. The
+    // mode picks which end of the member list a new window joins.
+    layoutMode: (config.layout as { mode?: unknown } | undefined)?.mode,
   }),
 };
 

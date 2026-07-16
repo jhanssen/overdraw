@@ -43,8 +43,8 @@ test("elastic: strip grows per member; camera scrolls to follow focus", { skip }
     const cB = 0xff30c030;   // green-ish
     const cC = 0xffc03030;   // red-ish
 
-    // Three windows on workspace 1. Members are master-front (newest
-    // first), so columns land C | B | A across a 3-column strip.
+    // Three windows on workspace 1. Columns mode appends, so the strip
+    // reads A | B | C left to right in the order they opened.
     const a = c.spawnClient([FILL, "--color", cA.toString(16)]);
     await a.ready;
     const s1 = await c.waitFor(c.query, (s) => s.windows.length === 1, { what: "A mapped" });
@@ -65,36 +65,39 @@ test("elastic: strip grows per member; camera scrolls to follow focus", { skip }
       { what: "three equal columns across the strip" });
     const cId = s3.windows.find((w) => w.surfaceId !== aId && w.surfaceId !== bId).surfaceId;
     const rectOf = (id) => c.query().windows.find((w) => w.surfaceId === id).rect;
-    assert.equal(rectOf(cId).x, 0, "newest member leads the strip");
-    assert.equal(rectOf(aId).x, 2 * COL, "oldest member at the tail");
+    assert.equal(rectOf(cId).x, 2 * COL, "newest member joins the tail");
+    assert.equal(rectOf(aId).x, 0, "oldest member leads the strip");
 
-    // C is focused (focusOnMap) at the strip's head: no scroll. C and B
-    // composite in the viewport; A is off-view right.
+    // C is focused (focusOnMap) and is the tail column: nothing lies to
+    // its right, so it sits flush right and B fills the rest of the view.
     await settled(() => c.query().outputs[0].cameraX,
-      (x) => x === 0, { what: "camera at strip head" });
+      (x) => x === 2 * COL + COL - OUT.width, { what: "camera at the strip end" });
     await readUntil(c, (p) =>
-      pixelMatches(pixelAt(p, OUT.width, 320, 360), argbToBgra(cC), 4)
-      && pixelMatches(pixelAt(p, OUT.width, 960, 360), argbToBgra(cB), 4));
-
-    // Swap the focused window C toward the tail twice: C retiles to the
-    // third column and the camera scrolls to keep it visible.
-    await c.runtime.invokeNamespace("workspace", "reorder", [cId, "swap-next"]);
-    await c.runtime.invokeNamespace("workspace", "reorder", [cId, "swap-next"]);
-    await settled(() => rectOf(cId).x, (x) => x === 2 * COL, { what: "C at the tail" });
-    await settled(() => c.query().outputs[0].cameraX,
-      (x) => x === 2 * COL + COL - OUT.width,   // strip end minus viewport
-      { what: "camera scrolled to the strip end" });
-    // Members are now B | A | C; the view covers columns 2 and 3 (A | C).
-    await readUntil(c, (p) =>
-      pixelMatches(pixelAt(p, OUT.width, 320, 360), argbToBgra(cA), 4)
+      pixelMatches(pixelAt(p, OUT.width, 320, 360), argbToBgra(cB), 4)
       && pixelMatches(pixelAt(p, OUT.width, 960, 360), argbToBgra(cC), 4));
 
-    // Promote C back to the strip's head: the camera scrolls home.
-    await c.runtime.invokeNamespace("workspace", "reorder", [cId, "promote"]);
+    // Swap the focused C toward the head twice (C | A | B): C becomes the
+    // head column, so it sits flush left and the camera scrolls home.
+    await c.runtime.invokeNamespace("workspace", "reorder", [cId, "swap-prev"]);
+    await c.runtime.invokeNamespace("workspace", "reorder", [cId, "swap-prev"]);
+    await settled(() => rectOf(cId).x, (x) => x === 0, { what: "C at the head" });
     await settled(() => c.query().outputs[0].cameraX,
       (x) => x === 0, { what: "camera back at the strip head" });
     await readUntil(c, (p) =>
-      pixelMatches(pixelAt(p, OUT.width, 320, 360), argbToBgra(cC), 4));
+      pixelMatches(pixelAt(p, OUT.width, 320, 360), argbToBgra(cC), 4)
+      && pixelMatches(pixelAt(p, OUT.width, 960, 360), argbToBgra(cA), 4));
+
+    // Swap C back one (A | C | B): now it has strip on BOTH sides, so it
+    // centers and both neighbors peek into the view -- A on the left, B on
+    // the right, each hoverable rather than hidden past an edge.
+    await c.runtime.invokeNamespace("workspace", "reorder", [cId, "swap-next"]);
+    await settled(() => rectOf(cId).x, (x) => x === COL, { what: "C in the middle" });
+    await settled(() => c.query().outputs[0].cameraX,
+      (x) => x === COL - (OUT.width - COL) / 2, { what: "camera centered on C" });
+    await readUntil(c, (p) =>
+      pixelMatches(pixelAt(p, OUT.width, 160, 360), argbToBgra(cA), 4)
+      && pixelMatches(pixelAt(p, OUT.width, 640, 360), argbToBgra(cC), 4)
+      && pixelMatches(pixelAt(p, OUT.width, 1120, 360), argbToBgra(cB), 4));
   } finally {
     await c.teardown();
   }

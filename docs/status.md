@@ -1044,7 +1044,12 @@ validated + resolved + consumed by the runtime + hotkey plugin.
   four combinations compose: columns+elastic = niri strip,
   columns+fixed = even-split, master-stack+elastic = inert growth
   (master-stack measures to the workarea), master-stack+fixed =
-  classic. Columns mode holds ONE window per column with per-window
+  classic. The declared mode also picks the INSERTION END for a newly
+  mapped window (`InsertEnd` on the registry's `applyMap`/`applyMapAt`,
+  resolved by the island source from the island's hint; registry default
+  stays "head"): columns appends at the tail so the strip reads
+  left-to-right in open order, master-stack unshifts into its master
+  slot. Columns mode holds ONE window per column with per-window
   widths (seeded from `layout.column` / the island hint's `column`,
   keyed by surface id so they follow reorders, pruned on unmap);
   `layout.grow-column` / `shrink-column {surfaceId?}` (default: the

@@ -251,6 +251,17 @@ geometry itself nor injects a layout hint: a canvas-side count × column
 computation would duplicate the layout's own arithmetic, and two owners
 of one geometry is exactly how the modes drift apart.
 
+The declared mode also picks WHICH END a newly mapped window joins,
+because the member list is the layout's order and the two modes read it
+oppositely: master-stack's head is its master slot, where a new window
+belongs, while in columns the head is the leftmost column — the oldest
+window — so a new window belongs at the TAIL and the strip reads left to
+right in the order things opened. The island source resolves the end
+from the island's declared mode and hands it to the registry, which owns
+member order but knows nothing of layout; a registry that always
+unshifts is a master-stack assumption baked into a layout-agnostic
+component, and it put every new column on the far left of the strip.
+
 Columns mode: one window per column is an invariant (vertical division
 belongs to master-stack or a future stack primitive). Column widths are
 per-window provider state — seeded from `column`, keyed by window id so

@@ -155,6 +155,7 @@ async function withCanvasPlugin(fn, opts = {}) {
         initialOutputs: rtCtx.initialOutputs,
         canvas: cfg.canvas,
         layoutGap: cfg.layout?.gap,
+        layoutMode: cfg.layout?.mode,
       }),
     };
     const cfg = {
@@ -258,6 +259,52 @@ test('canvas: moveWindow relocates membership and restacks', async () => {
     assert.deepEqual(snaps[0].members, [102]);
     assert.deepEqual(snaps[1].members, [101]);
   });
+});
+
+// The member order IS the column order in columns mode, so a new window
+// belongs on the right -- the strip reads left to right in the order things
+// opened. Master-stack's head is its master slot, where a new window is
+// meant to land, so the end follows the DECLARED MODE rather than growth.
+test('columns: a newly mapped window joins at the tail, not the master slot', async () => {
+  await withCanvasPlugin(async ({ rt, addWindow }) => {
+    for (const id of [101, 102, 103]) { addWindow(id); await settle(); }
+    const list = await call(rt, 'list', [0]);
+    assert.deepEqual(list[0].members, [101, 102, 103],
+      'each new window appends to the right of the strip');
+  }, { canvas: { world: true, elastic: true }, layout: { mode: 'columns' } });
+});
+
+test('master-stack: a newly mapped window still takes the master slot', async () => {
+  await withCanvasPlugin(async ({ rt, addWindow }) => {
+    for (const id of [101, 102, 103]) { addWindow(id); await settle(); }
+    const list = await call(rt, 'list', [0]);
+    assert.deepEqual(list[0].members, [103, 102, 101],
+      'the newest window heads the list');
+  }, { canvas: { world: true }, layout: { mode: 'master-stack' } });
+});
+
+// The mode is declared per island, so an island that declares columns
+// appends while its master-stack neighbor on the same output still unshifts.
+test('columns: the insertion end follows the island that declares it', async () => {
+  await withCanvasPlugin(async ({ rt, addWindow }) => {
+    addWindow(101);
+    await settle();
+    await call(rt, 'create', [{}]);
+    await call(rt, 'show', [2, 0]);
+    await rt.invokeAction('workspace.set-layout',
+      { index: 2, mode: 'master-stack' });
+    await settle();
+    for (const id of [102, 103]) { addWindow(id); await settle(); }
+    await call(rt, 'show', [1, 0]);
+    await settle();
+    for (const id of [104, 105]) { addWindow(id); await settle(); }
+
+    const list = await call(rt, 'list', [0]);
+    assert.deepEqual(list[0].members, [101, 104, 105],
+      'the columns island appends');
+    assert.deepEqual(list[1].members, [103, 102],
+      'the master-stack island unshifts');
+  }, { canvas: { world: true, elastic: true }, layout: { mode: 'columns' } });
 });
 
 test('canvas: reorder promote reorders the member list', async () => {

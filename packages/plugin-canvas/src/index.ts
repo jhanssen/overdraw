@@ -96,6 +96,9 @@ interface CanvasPluginConfig {
   // band visible instead of sitting flush at the viewport edge. Static
   // (a runtime layout.grow-gap drifts the margin slightly; cosmetic).
   layoutGap?: unknown;
+  // The layout provider's default mode (config.layout.mode), for islands
+  // that declare no mode of their own.
+  layoutMode?: unknown;
 }
 
 // Default spacing between neighboring island rects (both axes in grid
@@ -168,6 +171,8 @@ export default async function init(
   const scrollMargin = (typeof config?.layoutGap === "number"
     && Number.isFinite(config.layoutGap) && config.layoutGap >= 0)
     ? config.layoutGap : 0;
+  const defaultLayoutMode = typeof config?.layoutMode === "string"
+    ? config.layoutMode : "master-stack";
 
   // Island spacing (canvas.gutter, world px; default SLOT_GUTTER).
   const gutterRaw = worldMode
@@ -576,6 +581,17 @@ export default async function init(
     if (override !== undefined) return override;
     const name = state.byHandle.get(handle)?.name;
     return name !== undefined ? layoutByName.get(name) : undefined;
+  }
+  // Which end of the member list a newly mapped window joins. The member
+  // order IS the column order in columns mode, so a new window belongs at
+  // the tail -- the strip reads left to right in the order things opened,
+  // and the head is where the oldest window lives. Master-stack's head is
+  // its master slot, where a new window is meant to land.
+  function insertEndFor(handle: WorkspaceHandle | undefined): "head" | "tail" {
+    if (handle === undefined) return "head";
+    const mode = (layoutHintFor(handle)?.mode as string | undefined)
+      ?? defaultLayoutMode;
+    return mode === "columns" ? "tail" : "head";
   }
   // Which grid row each workspace occupies ("grid" arrangement). Sticky
   // against churn: a changed island set or slot order repacks outright,
@@ -1894,7 +1910,8 @@ export default async function init(
     // Unplaced windows (no layout pass yet) seed onto the fallback output;
     // the workspace recompute re-homes them once a real output claims them.
     const outId = w.outputId ?? fallbackOutputId;
-    const r = reg.applyMap(state, w.surfaceId, outId, outputNameOf(outId));
+    const r = reg.applyMap(state, w.surfaceId, outId, outputNameOf(outId),
+      insertEndFor(state.shownByOutput.get(outId)));
     state = r.state;
     await applyEffects(r.sideEffects);
   }
@@ -1943,7 +1960,8 @@ export default async function init(
         await sdk.windows.getState(ev.surfaceId, "workspace.place"));
     } catch { /* no bag / broker without get-state: default placement */ }
     if (!hint) {
-      const r = reg.applyMap(state, ev.surfaceId, ev.outputId, outputNameOf(ev.outputId));
+      const r = reg.applyMap(state, ev.surfaceId, ev.outputId, outputNameOf(ev.outputId),
+        insertEndFor(state.shownByOutput.get(ev.outputId)));
       state = r.state;
       await applyEffects(r.sideEffects);
       return;
@@ -1968,18 +1986,20 @@ export default async function init(
         handle = c.snapshot.handle;
       }
     } else if (ruleOutputId !== null) {
-      const r = reg.applyMap(state, ev.surfaceId, ruleOutputId, outputNameOf(ruleOutputId));
+      const r = reg.applyMap(state, ev.surfaceId, ruleOutputId, outputNameOf(ruleOutputId),
+        insertEndFor(state.shownByOutput.get(ruleOutputId)));
       state = r.state;
       await applyEffects(r.sideEffects);
       return;
     }
     if (handle === null) {
-      const r = reg.applyMap(state, ev.surfaceId, ev.outputId, outputNameOf(ev.outputId));
+      const r = reg.applyMap(state, ev.surfaceId, ev.outputId, outputNameOf(ev.outputId),
+        insertEndFor(state.shownByOutput.get(ev.outputId)));
       state = r.state;
       await applyEffects(r.sideEffects);
       return;
     }
-    const r = reg.applyMapAt(state, ev.surfaceId, handle);
+    const r = reg.applyMapAt(state, ev.surfaceId, handle, insertEndFor(handle));
     state = r.state;
     await applyEffects(r.sideEffects);
     if (hint.show === true) {

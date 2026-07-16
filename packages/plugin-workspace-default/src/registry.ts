@@ -818,6 +818,19 @@ export function setName(state: WorkspaceState,
   };
 }
 
+// Which end of the member list a new window joins. The member order is
+// the layout's order, so the caller -- who knows the island's declared
+// mode -- picks: "head" is master-stack's master slot, "tail" appends
+// where a columns strip reads it as the newest column on the right.
+export type InsertEnd = "head" | "tail";
+
+function insertMember(rec: { members: number[] },
+                      surfaceId: number, insertAt: InsertEnd): void {
+  if (rec.members.includes(surfaceId)) return;
+  if (insertAt === "tail") rec.members.push(surfaceId);
+  else rec.members.unshift(surfaceId);
+}
+
 // A new window mapped on `outputId`. Assigns to that output's currently-
 // shown workspace. Idempotent: if the surface is already tracked, no-op.
 // `outputName` is the durable identifier of the output -- used to seed
@@ -826,6 +839,7 @@ export function applyMap(state: WorkspaceState,
                          surfaceId: number,
                          outputId: number,
                          outputName: string,
+                         insertAt: InsertEnd = "head",
                          ): { state: WorkspaceState; sideEffects: SideEffect[] } {
   if (state.surfaceToHandle.has(surfaceId)) {
     return { state, sideEffects: [] };
@@ -840,10 +854,7 @@ export function applyMap(state: WorkspaceState,
   }
   const rec = state.byHandle.get(shown);
   if (!rec) throw new Error("internal: shown handle has no record");
-  // New windows take the master slot (index 0); the previous master shifts
-  // down one. Matches dwm semantics + the WM's previous addWindow(unshift)
-  // behavior. The `promote` action lets the user rearrange explicitly.
-  if (!rec.members.includes(surfaceId)) rec.members.unshift(surfaceId);
+  insertMember(rec, surfaceId, insertAt);
   state.surfaceToHandle.set(surfaceId, shown);
 
   sideEffects.push({ kind: "setStateBag", surfaceId, handle: shown });
@@ -863,13 +874,14 @@ export function applyMap(state: WorkspaceState,
 export function applyMapAt(state: WorkspaceState,
                            surfaceId: number,
                            handle: WorkspaceHandle,
+                           insertAt: InsertEnd = "head",
                            ): { state: WorkspaceState; sideEffects: SideEffect[] } {
   if (state.surfaceToHandle.has(surfaceId)) {
     return { state, sideEffects: [] };
   }
   const rec = state.byHandle.get(handle);
   if (!rec) throw new Error(`applyMapAt: no workspace with handle ${handle as number}`);
-  if (!rec.members.includes(surfaceId)) rec.members.unshift(surfaceId);
+  insertMember(rec, surfaceId, insertAt);
   state.surfaceToHandle.set(surfaceId, handle);
 
   const sideEffects: SideEffect[] = [
