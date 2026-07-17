@@ -101,12 +101,16 @@ export class OutputDamageMap {
   // rects are positioned relative to the output's glass (cursor, layer
   // shell) and clip against the plain bounds; world rects clip against
   // the camera view rect (bounds shifted by the output's camera).
-  damageRect(gx: number, gy: number, w: number, h: number, anchored = false): void {
+  // `exclude` skips the named outputs entirely (hardware-cursor outputs:
+  // a cursor move repositions their KMS plane instead of repainting).
+  damageRect(gx: number, gy: number, w: number, h: number, anchored = false,
+             exclude?: ReadonlySet<number>): void {
     if (w <= 0 || h <= 0) return;
     const gx1 = gx + w;
     const gy1 = gy + h;
     for (const e of this.entries.values()) {
       const b = e.bounds;
+      if (exclude?.has(b.outputId)) continue;
       const cam = anchored ? undefined : this.cameras.get(b.outputId);
       const z = cam ? cam.zoom : 1;
       const bx = b.logicalX + (cam ? cam.x : 0);

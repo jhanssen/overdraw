@@ -615,6 +615,23 @@ int run(int wireFd, int ctrlFd, int inputFd, bool headless,
     // ScanoutReserve arrives: at startup, kms->initScanout() builds all rings
     // before the core sends its Reserves; at runtime, the udev rescan callback
     // calls kms->initScanoutForOutput() before sending OutputAdded.
+    // Tell the core whether this output has a usable hardware cursor plane
+    // (and the device's cursor FB dims). ok=0 means the core software-
+    // composites the cursor for this output. Sent after each ring bring-up
+    // (startup, hotplug, mode-switch rebuild) and on runtime demotion.
+    auto emitCursorPlaneStatus = [&](uint32_t outputId) {
+        if (!kms) return;
+        ipc::CursorPlaneStatusPayload p{};
+        p.outputId = outputId;
+        uint32_t w = 0, h = 0;
+        p.ok = kms->cursorPlaneInfoAt(outputId, w, h) ? 1 : 0;
+        p.maxWidth  = w;
+        p.maxHeight = h;
+        uint8_t buf[ipc::CursorPlaneStatusPayload::kSize];
+        p.encode(buf);
+        serializer.appendFrame(ipc::FrameKind::CursorPlaneStatus, buf, sizeof(buf));
+    };
+
     auto handleScanoutReserve = [&](const ipc::ScanoutReservePayload& p) -> bool {
         if (!kms) {
             std::fprintf(stderr,
@@ -641,6 +658,7 @@ int run(int wireFd, int ctrlFd, int inputFd, bool headless,
         if (injectOk) {
             std::printf("[gpu] kms scanout ready for output %u (3 slots injected)\n",
                         outputId);
+            emitCursorPlaneStatus(outputId);
         }
         return injectOk;
     };
@@ -2071,6 +2089,97 @@ int run(int wireFd, int ctrlFd, int inputFd, bool headless,
             }
             return;
         }
+        if (kind == ipc::FrameKind::CursorImage
+            || kind == ipc::FrameKind::CursorImageShm
+            || kind == ipc::FrameKind::CursorState) {
+            if (nfds != 0) {
+                std::fprintf(stderr,
+                    "[gpu] core wire: cursor frame kind=%u with nfds=%d (must be 0)\n",
+                    static_cast<unsigned>(kind), nfds);
+                std::abort();
+            }
+#if OVERDRAW_KMS
+            if (kms) {
+                if (kind == ipc::FrameKind::CursorState) {
+                    if (frame.size() != ipc::CursorStatePayload::kSize) {
+                        std::fprintf(stderr,
+                            "[gpu] core wire: bad CursorState payload size %zu\n",
+                            frame.size());
+                        std::abort();
+                    }
+                    auto p = ipc::CursorStatePayload::decode(frame.data());
+                    kms->setCursorState(p.outputId, p.x, p.y,
+                                        p.visible != 0, p.commitNow != 0);
+                    return;
+                }
+                if (kind == ipc::FrameKind::CursorImage) {
+                    if (frame.size() < ipc::CursorImagePayload::kSize) {
+                        std::fprintf(stderr,
+                            "[gpu] core wire: bad CursorImage payload size %zu\n",
+                            frame.size());
+                        std::abort();
+                    }
+                    auto p = ipc::CursorImagePayload::decode(frame.data());
+                    const size_t need = ipc::CursorImagePayload::kSize
+                        + static_cast<size_t>(p.srcWidth) * p.srcHeight * 4u;
+                    if (frame.size() != need) {
+                        std::fprintf(stderr,
+                            "[gpu] core wire: CursorImage %ux%u expects %zu bytes, got %zu\n",
+                            p.srcWidth, p.srcHeight, need, frame.size());
+                        std::abort();
+                    }
+                    if (!kms->setCursorImage(p.outputId,
+                                             frame.data() + ipc::CursorImagePayload::kSize,
+                                             p.srcWidth, p.srcHeight, p.srcWidth * 4u,
+                                             p.dstWidth, p.dstHeight)) {
+                        emitCursorPlaneStatus(p.outputId);
+                    }
+                    return;
+                }
+                // CursorImageShm: pixels live in a registered shm pool. Copy
+                // out immediately -- wire FIFO puts this after the commit's
+                // ShmUpload and before any wl_buffer release the core sends.
+                if (frame.size() != ipc::CursorImageShmPayload::kSize) {
+                    std::fprintf(stderr,
+                        "[gpu] core wire: bad CursorImageShm payload size %zu\n",
+                        frame.size());
+                    std::abort();
+                }
+                auto p = ipc::CursorImageShmPayload::decode(frame.data());
+                auto it = shmPools.find(p.poolId);
+                if (it == shmPools.end()) {
+                    std::fprintf(stderr,
+                        "[gpu] CursorImageShm: unknown poolId=%u\n", p.poolId);
+                    return;
+                }
+                const ShmPool& pool = it->second;
+                if (p.srcWidth == 0 || p.srcHeight == 0
+                    || p.stride < p.srcWidth * 4u
+                    || static_cast<uint64_t>(p.offset)
+                           + static_cast<uint64_t>(p.srcHeight - 1) * p.stride
+                           + static_cast<uint64_t>(p.srcWidth) * 4u
+                       > pool.size) {
+                    std::fprintf(stderr,
+                        "[gpu] CursorImageShm: rect %ux%u stride=%u offset=%u "
+                        "exceeds pool %zu\n",
+                        p.srcWidth, p.srcHeight, p.stride, p.offset, pool.size);
+                    return;
+                }
+                if (!kms->setCursorImage(p.outputId, pool.base + p.offset,
+                                         p.srcWidth, p.srcHeight, p.stride,
+                                         p.dstWidth, p.dstHeight)) {
+                    emitCursorPlaneStatus(p.outputId);
+                }
+                return;
+            }
+#endif
+            // Nested/headless: the core never receives an ok=1
+            // CursorPlaneStatus here, so cursor frames are unexpected.
+            std::fprintf(stderr,
+                "[gpu] core wire: cursor frame kind=%u with no kms backend\n",
+                static_cast<unsigned>(kind));
+            return;
+        }
         if (kind == ipc::FrameKind::ImportClientTex) {
             // In-band dmabuf import: FIFO-ordered with surrounding wire commands
             // so the just-Reserved texture slot at handle.id (which grew the wire
@@ -2822,6 +2931,12 @@ int run(int wireFd, int ctrlFd, int inputFd, bool headless,
                 }
             }
             ctrlSender.send(m);
+        });
+        // Runtime hardware-cursor demotion (the kernel rejected a commit
+        // because of the cursor plane): tell the core to software-composite
+        // the cursor on this output from now on.
+        kms->setCursorFallbackListener([&](uint32_t outputId) {
+            emitCursorPlaneStatus(outputId);
         });
     }
 

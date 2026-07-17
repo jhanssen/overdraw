@@ -144,6 +144,8 @@ struct Addon {
     napi_ref onOutputRemoved = nullptr; // optional JS callback({outputId}) for hotplug remove
     napi_ref onOutputModes = nullptr;   // optional JS callback({outputId, modes}) for full mode list
     napi_ref onFlipComplete = nullptr;  // optional JS callback(outputId) for KMS flip-completes
+    napi_ref onCursorPlaneStatus = nullptr;  // optional JS callback({outputId, ok, maxWidth,
+                                             // maxHeight}) for hw-cursor availability
     uint64_t lastNotified = 0;
 
     // Host-side reader for the GPU process's log socket. Started after
@@ -583,6 +585,7 @@ void fireOutputDescriptors(napi_env env);
 void fireOutputsAdded(napi_env env);
 void fireOutputsRemoved(napi_env env);
 void fireOutputModes(napi_env env);
+void fireCursorPlaneStatuses(napi_env env);
 
 // Arm the wire poll for READABLE always, plus WRITABLE iff outbound wire bytes
 // are queued (so we get told when the socket can take more). Call after anything
@@ -647,6 +650,7 @@ void onWireReadable(uv_poll_t*, int status, int events) {
         // OutputModes after Added: the mode list applies to an
         // already-created state.outputs entry.
         fireOutputModes(g_addon.env);
+        fireCursorPlaneStatuses(g_addon.env);
         // drainCtrl above may have consumed plugin-broker replies (alloc/begin/...);
         // advance them here too, else they are stranded (see advanceAllPending).
         advanceAllPending(g_addon.env);
@@ -680,6 +684,7 @@ void onCtrlReadable(uv_poll_t*, int status, int events) {
         fireOutputDescriptors(g_addon.env);
         fireOutputsAdded(g_addon.env);
         fireOutputModes(g_addon.env);
+        fireCursorPlaneStatuses(g_addon.env);
         advanceAllPending(g_addon.env);
         if (g_addon.compositor->takeFrameComplete()) onFrameComplete();
         if (g_addon.compositor->hasShmUploadAcks()) wake();  // see onWireReadable
@@ -1540,6 +1545,34 @@ void fireOutputsRemoved(napi_env env) {
     napi_close_handle_scope(env, scope);
 }
 
+// Drain queued CursorPlaneStatus messages and invoke the JS
+// onCursorPlaneStatus callback per message. Each call carries
+// { outputId, ok, maxWidth, maxHeight }.
+void fireCursorPlaneStatuses(napi_env env) {
+    if (!g_addon.compositor || !g_addon.onCursorPlaneStatus) return;
+    auto msgs = g_addon.compositor->takeCursorPlaneStatuses();
+    if (msgs.empty()) return;
+    napi_handle_scope scope;
+    napi_open_handle_scope(env, &scope);
+    napi_value cb, undefined;
+    napi_get_reference_value(env, g_addon.onCursorPlaneStatus, &cb);
+    napi_get_undefined(env, &undefined);
+    for (const auto& m : msgs) {
+        napi_value obj, v;
+        napi_create_object(env, &obj);
+        napi_create_uint32(env, m.outputId, &v);
+        napi_set_named_property(env, obj, "outputId", v);
+        napi_get_boolean(env, m.ok, &v);
+        napi_set_named_property(env, obj, "ok", v);
+        napi_create_uint32(env, m.maxWidth, &v);
+        napi_set_named_property(env, obj, "maxWidth", v);
+        napi_create_uint32(env, m.maxHeight, &v);
+        napi_set_named_property(env, obj, "maxHeight", v);
+        napi_call_function(env, undefined, cb, 1, &obj, nullptr);
+    }
+    napi_close_handle_scope(env, scope);
+}
+
 // Drain queued OutputModes messages and invoke the JS onOutputModes
 // callback per output. Each call carries { outputId, modes: [{ width,
 // height, refreshMhz, preferred }] }. Same Node thread; same pattern
@@ -1649,6 +1682,71 @@ napi_value PresentOutput(napi_env env, napi_callback_info info) {
     uint32_t outputId = 0;
     if (argc >= 1) napi_get_value_uint32(env, argv[0], &outputId);
     g_addon.compositor->presentOutput(outputId);
+    return nullptr;
+}
+
+// sendCursorImage(outputId, pixels: Uint8Array, srcW, srcH, dstW, dstH) ->
+// undefined. Install a hardware-cursor image for one output; pixels are
+// tightly-packed premultiplied BGRA.
+napi_value SendCursorImage(napi_env env, napi_callback_info info) {
+    if (!g_addon.compositor) return nullptr;
+    size_t argc = 6; napi_value argv[6];
+    napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+    if (argc < 6) return nullptr;
+    uint32_t outputId = 0, srcW = 0, srcH = 0, dstW = 0, dstH = 0;
+    napi_get_value_uint32(env, argv[0], &outputId);
+    napi_get_value_uint32(env, argv[2], &srcW);
+    napi_get_value_uint32(env, argv[3], &srcH);
+    napi_get_value_uint32(env, argv[4], &dstW);
+    napi_get_value_uint32(env, argv[5], &dstH);
+    napi_typedarray_type type;
+    size_t length = 0;
+    void* data = nullptr;
+    if (napi_get_typedarray_info(env, argv[1], &type, &length, &data,
+                                 nullptr, nullptr) != napi_ok
+        || type != napi_uint8_array || !data) {
+        return nullptr;
+    }
+    if (length < static_cast<size_t>(srcW) * srcH * 4u) return nullptr;
+    g_addon.compositor->sendCursorImage(outputId,
+                                        static_cast<const uint8_t*>(data),
+                                        srcW, srcH, dstW, dstH);
+    return nullptr;
+}
+
+// sendCursorImageShm(outputId, poolId, offset, stride, srcW, srcH, dstW,
+// dstH) -> undefined. Install a hardware-cursor image whose pixels live in
+// a registered wl_shm pool the GPU process has mapped.
+napi_value SendCursorImageShm(napi_env env, napi_callback_info info) {
+    if (!g_addon.compositor) return nullptr;
+    size_t argc = 8; napi_value argv[8];
+    napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+    if (argc < 8) return nullptr;
+    uint32_t v[8] = {};
+    for (int i = 0; i < 8; ++i) napi_get_value_uint32(env, argv[i], &v[i]);
+    g_addon.compositor->sendCursorImageShm(v[0], v[1], v[2], v[3],
+                                           v[4], v[5], v[6], v[7]);
+    return nullptr;
+}
+
+// sendCursorState(outputId, x, y, visible, commitNow) -> undefined. Cursor
+// plane position (device px, hotspot-adjusted, may be negative) +
+// visibility; commitNow=true when no frame render is coming so the GPU
+// process issues the cursor-only commit itself.
+napi_value SendCursorState(napi_env env, napi_callback_info info) {
+    if (!g_addon.compositor) return nullptr;
+    size_t argc = 5; napi_value argv[5];
+    napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+    if (argc < 5) return nullptr;
+    uint32_t outputId = 0;
+    int32_t x = 0, y = 0;
+    bool visible = false, commitNow = false;
+    napi_get_value_uint32(env, argv[0], &outputId);
+    napi_get_value_int32(env, argv[1], &x);
+    napi_get_value_int32(env, argv[2], &y);
+    napi_get_value_bool(env, argv[3], &visible);
+    napi_get_value_bool(env, argv[4], &commitNow);
+    g_addon.compositor->sendCursorState(outputId, x, y, visible, commitNow);
     return nullptr;
 }
 
@@ -2027,6 +2125,10 @@ napi_value Stop(napi_env env, napi_callback_info) {
     if (g_addon.onFlipComplete) {
         napi_delete_reference(env, g_addon.onFlipComplete);
         g_addon.onFlipComplete = nullptr;
+    }
+    if (g_addon.onCursorPlaneStatus) {
+        napi_delete_reference(env, g_addon.onCursorPlaneStatus);
+        g_addon.onCursorPlaneStatus = nullptr;
     }
     // Release the keymaps. The default is built on demand by ensureKeymap()
     // from either keymapInfo (client wl_keyboard bind) or keyUpdate (host
@@ -2426,6 +2528,22 @@ napi_value SetOnOutputModes(napi_env env, napi_callback_info info) {
     // callback sees them.
     if (g_addon.compositor) g_addon.compositor->drainCtrl();
     fireOutputModes(env);
+    napi_value u; napi_get_undefined(env, &u); return u;
+}
+
+// setOnCursorPlaneStatus(cb) -> undefined
+// Register a JS callback fired for each CursorPlaneStatus message arriving
+// from the GPU process: { outputId, ok, maxWidth, maxHeight }. ok=true
+// means the output scans the cursor out of a hardware plane sized
+// maxWidth x maxHeight; ok=false means the JS compositor must software-
+// composite the cursor for that output (either it has no plane, or a
+// runtime commit rejection demoted it). Pass null/omit to clear.
+napi_value SetOnCursorPlaneStatus(napi_env env, napi_callback_info info) {
+    replaceCallbackRef(env, info, g_addon.onCursorPlaneStatus);
+    // Statuses for the startup outputs may already be queued (they ride
+    // the wire right after each ScanoutReady); fire them into the
+    // freshly-registered callback.
+    fireCursorPlaneStatuses(env);
     napi_value u; napi_get_undefined(env, &u); return u;
 }
 
@@ -3324,6 +3442,10 @@ napi_value Init(napi_env env, napi_value exports) {
     reg("setOnOutputRemoved", SetOnOutputRemoved);
     reg("setOnOutputModes", SetOnOutputModes);
     reg("setOnFlipComplete", SetOnFlipComplete);
+    reg("setOnCursorPlaneStatus", SetOnCursorPlaneStatus);
+    reg("sendCursorImage", SendCursorImage);
+    reg("sendCursorImageShm", SendCursorImageShm);
+    reg("sendCursorState", SendCursorState);
     reg("reserveScanoutForOutput", ReserveScanoutForOutput);
     reg("releaseScanoutForOutput", ReleaseScanoutForOutput);
     reg("switchOutputMode", SwitchOutputMode);

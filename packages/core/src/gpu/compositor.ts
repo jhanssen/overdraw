@@ -440,8 +440,8 @@ import {
 } from "./client-buffer-lifecycle.js";
 
 // The slice of the native addon (`Addon`, ../types.ts) this module needs.
-// JsCompositor only touches these 15 of the addon's methods; narrowing keeps
-// interface segregation with a single source of truth for the signatures.
+// JsCompositor only touches these addon methods; narrowing keeps interface
+// segregation with a single source of truth for the signatures.
 export type CompositorAddon = Pick<
   Addon,
   | "shmView"
@@ -459,6 +459,9 @@ export type CompositorAddon = Pick<
   | "acquireOutputTexture"
   | "presentOutput"
   | "wake"
+  | "sendCursorImage"
+  | "sendCursorImageShm"
+  | "sendCursorState"
 >;
 
 // The dawn.node wire binding bits the compositor needs for dmabuf surfaces.
@@ -1354,6 +1357,19 @@ export class JsCompositor implements CompositorSink {
         this.outputDamage.setCamera(id, 0, 0, 1);
       }
     }
+    // Hardware-cursor state for vanished outputs goes with them (the GPU
+    // process tore the plane down with the connector). A surviving output
+    // whose scale changed needs its cursor image re-shipped at the new
+    // device size.
+    for (const id of [...this.hwCursorCaps.keys()]) {
+      if (!this.outputsGeom.has(id)) {
+        this.hwCursorCaps.delete(id);
+        this.hwCursorActive.delete(id);
+        this.hwCursorLastSent.delete(id);
+        this.hwCursorHotspotDev.delete(id);
+      }
+    }
+    this.refreshHwCursorImage();
     // Mirror output 0's device dims/scale into the primary fields so paths that
     // still read this.width/height/scale (readback, freeze snapshots) match it.
     const primary = this.outputsGeom.get(OUTPUT_DEFAULT);
@@ -1628,7 +1644,9 @@ export class JsCompositor implements CompositorSink {
     // can be the internal cursor surface (CPU-uploaded image) or any
     // existing surface (e.g. a wl_pointer.set_cursor client surface).
     // Visibility flag + target-set + target-has-texture gate inclusion.
-    if (includeCursor && this.cursorVisible && this.cursorTargetSurfaceId !== null) {
+    // Outputs whose KMS cursor plane carries the cursor skip it here.
+    if (includeCursor && !this.hwCursorActive.has(outputId)
+        && this.cursorVisible && this.cursorTargetSurfaceId !== null) {
       const s = this.surfaces.get(this.cursorTargetSurfaceId);
       if (s && s.texture) {
         // When the target is a regular WM surface that's ALSO in the
@@ -2109,6 +2127,7 @@ export class JsCompositor implements CompositorSink {
     // guarantees no client-disconnect leak.
     this.dispatch(this.lifecycle.step({ kind: "surfaceRemoved", surfaceId: id }));
     this.fxFollowers.delete(id);
+    this.lastShmSource.delete(id);
 
     const s = this.surfaces.get(id);
     if (s) {
@@ -2271,6 +2290,10 @@ export class JsCompositor implements CompositorSink {
     // the pool; the bytes never cross the Dawn wire.
     const seq = upload(id, poolId, offset, width, height, stride, sendDamage);
     if (seq === 0) return 0;
+    // Remember where this surface's pixels live so a cursor-role surface
+    // can be shipped to a KMS cursor plane by pool reference (the GPU
+    // process copies out of its own mmap on receipt).
+    this.lastShmSource.set(id, { poolId, offset, stride, width, height });
     const sFinal = this.surfaces.get(id);
     if (sFinal) sFinal.present = true;
     this.imported.push({ id, width, height });
@@ -2308,6 +2331,8 @@ export class JsCompositor implements CompositorSink {
       }
       return false;
     }
+    // The surface's pixels no longer live in an shm pool.
+    this.lastShmSource.delete(id);
 
     // Ensure the surface exists (the layout sweep may not have created it).
     let surf = this.surfaces.get(id);
@@ -3458,6 +3483,7 @@ export class JsCompositor implements CompositorSink {
         present: false,
         scissor: this.takeScissor(o, JsCompositor.HEADLESS_DAMAGE_KEY),
       });
+      this.flushHwCursorStates(new Set([OUTPUT_DEFAULT]));
     } else {
       if (!this.dawn) return;
       // Any live composer is "every-frame" by contract: its caller produces
@@ -3499,6 +3525,12 @@ export class JsCompositor implements CompositorSink {
           scissor: this.takeScissor(o, handle),
         });
       }
+      // Cursor plane positions flush here, after the render set is known:
+      // an output about to present carries the state in that commit; a
+      // clean output gets a GPU-process cursor-only commit instead. Must
+      // run before the empty-target early-return -- a cursor-only wake IS
+      // the empty-target case.
+      this.flushHwCursorStates(new Set(targets.map((t) => t.ctx.id)));
       // No output needs rendering this pass (every output's ring was busy,
       // or no output is dirty). The lifecycle/bracket machinery would
       // otherwise open a frame with no draw.
@@ -4118,15 +4150,209 @@ export class JsCompositor implements CompositorSink {
   private cursorPointerX = 0;
   private cursorPointerY = 0;
 
+  // ----- Hardware cursor (KMS cursor plane) -----
+  //
+  // Outputs the GPU process reports a usable cursor plane for
+  // (CursorPlaneStatus) scan the cursor out of that plane instead of the
+  // composite pass: the image is shipped once per change
+  // (sendCursorImage / sendCursorImageShm), and pointer motion sends a
+  // tiny plane-position update (sendCursorState) with NO output damage --
+  // an otherwise-idle output repositions the cursor without a single
+  // drawcall. Per-output fallback to the software slot covers every case
+  // the plane can't: no plane, image too large for the plane FB, a
+  // GPU-texture cursor (no CPU bytes to ship), or a runtime commit
+  // rejection (the GPU process demotes and reports ok=false).
+  private hwCursorEnabled = true;                    // config gate (cursor.hardware)
+  private hwCursorCaps = new Map<number, { maxW: number; maxH: number }>();
+  private hwCursorActive = new Set<number>();        // plane carries the cursor now
+  private hwCursorHotspotDev = new Map<number, { x: number; y: number }>();
+  private hwCursorLastSent = new Map<number, { x: number; y: number; visible: boolean }>();
+  private hwCursorStateStale = false;                // position/visibility to flush
+  // CPU bytes behind the internal cursor surface (theme cursors); null when
+  // the internal surface holds a GPU texture we have no bytes for.
+  private cursorPixelBytes: { bytes: Uint8Array; width: number; height: number } | null = null;
+  // Latest shm buffer source per surface, recorded on every shm commit so a
+  // client cursor surface's pixels can be referenced by pool without a
+  // readback (the GPU process has the pool mapped). Dmabuf commits clear
+  // the entry.
+  private lastShmSource = new Map<number, {
+    poolId: number; offset: number; stride: number; width: number; height: number;
+  }>();
+
+  setHwCursorEnabled(on: boolean): void {
+    this.hwCursorEnabled = on;
+    if (!on) {
+      for (const id of [...this.hwCursorActive]) {
+        this.deactivateHwCursor(id, { dropCaps: true, sendDisable: true });
+      }
+      this.hwCursorCaps.clear();
+    }
+  }
+
+  // CursorPlaneStatus from the GPU process (via main.ts).
+  setCursorPlaneStatus(outputId: number, ok: boolean,
+                       maxW: number, maxH: number): void {
+    if (!this.hwCursorEnabled) return;
+    if (ok) {
+      this.hwCursorCaps.set(outputId, { maxW, maxH });
+      this.refreshHwCursorImage(outputId);
+    } else {
+      // Plane gone (or demoted GPU-side, which already turned it off).
+      this.deactivateHwCursor(outputId, { dropCaps: true, sendDisable: false });
+    }
+  }
+
+  // Stop using the plane on one output and repaint the software cursor
+  // there. `sendDisable` turns the plane off (skip when the GPU process
+  // already did); `dropCaps` forgets the plane entirely (status ok=false)
+  // vs. keeping it for a retry when the next image install fits.
+  private deactivateHwCursor(outputId: number,
+                             opts: { dropCaps: boolean; sendDisable: boolean }): void {
+    if (this.hwCursorActive.delete(outputId)) {
+      if (opts.sendDisable) this.addon.sendCursorState?.(outputId, 0, 0, false, true);
+      this.hwCursorLastSent.delete(outputId);
+      this.hwCursorHotspotDev.delete(outputId);
+      // The composite pass owns the cursor again on this output; repaint
+      // its rect (the exclude set no longer contains this output).
+      this.damageCursorNow();
+    }
+    if (opts.dropCaps) this.hwCursorCaps.delete(outputId);
+  }
+
+  // Damage the cursor's current rect on software-cursor outputs.
+  private damageCursorNow(): void {
+    const sid = this.cursorTargetSurfaceId;
+    const s = sid !== null ? this.surfaces.get(sid) : undefined;
+    if (s) this.damageCursorRect(s.x, s.y, s.layoutW, s.layoutH);
+  }
+
+  // Cursor-rect damage that skips hardware-cursor outputs (their plane is
+  // repositioned instead of repainted).
+  private damageCursorRect(x: number, y: number, w: number, h: number): void {
+    this.outputDamage.damageRect(x, y, w, h, /*anchored*/ true, this.hwCursorActive);
+  }
+
+  // Ship the current cursor image to `only` (or every) cursor-plane output,
+  // activating the plane there; outputs the image can't serve fall back to
+  // the software slot. Called on every image install and on plane arrival.
+  private refreshHwCursorImage(only?: number): void {
+    if (!this.hwCursorEnabled || this.hwCursorCaps.size === 0) return;
+    const sendPixels = this.addon.sendCursorImage;
+    const sendShm = this.addon.sendCursorImageShm;
+    const sid = this.cursorTargetSurfaceId;
+    const s = sid !== null ? this.surfaces.get(sid) : undefined;
+    for (const [outputId, caps] of this.hwCursorCaps) {
+      if (only !== undefined && outputId !== only) continue;
+      const o = this.outputsGeom.get(outputId);
+      if (!o || !s || sid === null) {
+        this.deactivateHwCursor(outputId, { dropCaps: false, sendDisable: true });
+        continue;
+      }
+      let sent = false;
+      if (sid === this.internalCursorSurfaceId && this.cursorPixelBytes && sendPixels) {
+        // Theme / CPU-byte cursor: logical dims scale up to device dims.
+        const p = this.cursorPixelBytes;
+        const dstW = Math.round(p.width * o.scale);
+        const dstH = Math.round(p.height * o.scale);
+        if (dstW >= 1 && dstH >= 1 && dstW <= caps.maxW && dstH <= caps.maxH) {
+          sendPixels(outputId, p.bytes, p.width, p.height, dstW, dstH);
+          sent = true;
+        }
+      } else if (sid !== this.internalCursorSurfaceId && sendShm) {
+        // Client cursor surface: reference its shm bytes by pool. A dmabuf
+        // or texture-backed cursor has no entry -> software fallback.
+        const shm = this.lastShmSource.get(sid);
+        if (shm) {
+          const bs = s.bufferScale || 1;
+          const dstW = Math.round((shm.width / bs) * o.scale);
+          const dstH = Math.round((shm.height / bs) * o.scale);
+          if (dstW >= 1 && dstH >= 1 && dstW <= caps.maxW && dstH <= caps.maxH) {
+            sendShm(outputId, shm.poolId, shm.offset, shm.stride,
+                    shm.width, shm.height, dstW, dstH);
+            sent = true;
+          }
+        }
+      }
+      if (!sent) {
+        this.deactivateHwCursor(outputId, { dropCaps: false, sendDisable: true });
+        continue;
+      }
+      // Hotspot in device pixels (the state sends plane positions already
+      // hotspot-adjusted; hotspots are surface-logical units).
+      this.hwCursorHotspotDev.set(outputId, {
+        x: Math.round(this.cursorHotspotX * o.scale),
+        y: Math.round(this.cursorHotspotY * o.scale),
+      });
+      if (!this.hwCursorActive.has(outputId)) {
+        // Erase the software-drawn cursor from this output's next frame
+        // BEFORE marking it hardware (the damage helper skips hw outputs).
+        this.damageCursorNow();
+        this.hwCursorActive.add(outputId);
+      }
+      this.hwCursorLastSent.delete(outputId);  // force a position (re)send
+      this.hwCursorStateStale = true;
+    }
+  }
+
+  // Send pending plane positions. Runs once per renderFrame, after the
+  // per-output render set is known: an output about to present folds the
+  // cursor state into that commit (commitNow=false); an output with no
+  // render coming needs the GPU process to issue a cursor-only commit
+  // (commitNow=true). Wire FIFO puts these before the frame's presents.
+  private flushHwCursorStates(rendering: ReadonlySet<number>): void {
+    if (!this.hwCursorStateStale || this.hwCursorActive.size === 0) {
+      this.hwCursorStateStale = false;
+      return;
+    }
+    const send = this.addon.sendCursorState;
+    if (!send) return;
+    const sid = this.cursorTargetSurfaceId;
+    const s = sid !== null ? this.surfaces.get(sid) : undefined;
+    for (const outputId of this.hwCursorActive) {
+      const o = this.outputsGeom.get(outputId);
+      if (!o) continue;
+      const hot = this.hwCursorHotspotDev.get(outputId) ?? { x: 0, y: 0 };
+      const lw = Math.round(o.deviceWidth / o.scale);
+      const lh = Math.round(o.deviceHeight / o.scale);
+      // Visible on this output iff the cursor rect (logical) overlaps it.
+      // Fully-offscreen plane positions are avoided rather than trusted to
+      // driver clipping.
+      const cx = this.cursorPointerX - this.cursorHotspotX;
+      const cy = this.cursorPointerY - this.cursorHotspotY;
+      const overlaps = !!s && this.cursorVisible
+        && cx < o.logicalX + lw && cx + s.layoutW > o.logicalX
+        && cy < o.logicalY + lh && cy + s.layoutH > o.logicalY;
+      const x = Math.round((this.cursorPointerX - o.logicalX) * o.scale) - hot.x;
+      const y = Math.round((this.cursorPointerY - o.logicalY) * o.scale) - hot.y;
+      const last = this.hwCursorLastSent.get(outputId);
+      if (last && last.x === x && last.y === y && last.visible === overlaps) continue;
+      send(outputId, x, y, overlaps, !rendering.has(outputId));
+      this.hwCursorLastSent.set(outputId, { x, y, visible: overlaps });
+    }
+    this.hwCursorStateStale = false;
+  }
+
+  // Test/introspection accessor for the hardware-cursor state.
+  hwCursorState(): { enabled: boolean; capOutputs: number[]; activeOutputs: number[] } {
+    return {
+      enabled: this.hwCursorEnabled,
+      capOutputs: [...this.hwCursorCaps.keys()].sort((a, b) => a - b),
+      activeOutputs: [...this.hwCursorActive].sort((a, b) => a - b),
+    };
+  }
+
   // Place the cursor target surface at (pointer - hotspot). Called on
   // every position update, and after install.
   private updateCursorLayout(): void {
     if (this.cursorTargetSurfaceId === null) return;
     const s = this.surfaces.get(this.cursorTargetSurfaceId);
     if (!s) return;
+    // Hardware-cursor outputs reposition their plane instead of repainting;
+    // the flush happens in renderFrame once the render set is known.
+    if (this.hwCursorActive.size > 0) this.hwCursorStateStale = true;
     // Damage the cursor's old rect, move it, damage the new rect: a cursor
     // move repaints just the two small regions, not the whole output.
-    if (this.cursorVisible) this.addOutputDamage(s.x, s.y, s.layoutW, s.layoutH, /*anchored*/ true);
+    if (this.cursorVisible) this.damageCursorRect(s.x, s.y, s.layoutW, s.layoutH);
     const x = this.cursorPointerX - this.cursorHotspotX;
     const y = this.cursorPointerY - this.cursorHotspotY;
     s.x = x; s.y = y;
@@ -4140,7 +4366,7 @@ export class JsCompositor implements CompositorSink {
     const bs = s.bufferScale || 1;
     s.layoutW = s.width / bs;
     s.layoutH = s.height / bs;
-    if (this.cursorVisible) this.addOutputDamage(s.x, s.y, s.layoutW, s.layoutH, /*anchored*/ true);
+    if (this.cursorVisible) this.damageCursorRect(s.x, s.y, s.layoutW, s.layoutH);
   }
 
   // Install a CPU-side BGRA8 cursor image into the internal cursor surface
@@ -4183,7 +4409,9 @@ export class JsCompositor implements CompositorSink {
     this.cursorTargetSurfaceId = this.internalCursorSurfaceId;
     this.cursorHotspotX = hotspotX;
     this.cursorHotspotY = hotspotY;
+    this.cursorPixelBytes = { bytes, width, height };
     this.updateCursorLayout();
+    this.refreshHwCursorImage();
   }
 
   // Point the cursor slot at an existing surface (e.g. a client cursor
@@ -4207,6 +4435,7 @@ export class JsCompositor implements CompositorSink {
     this.cursorHotspotX = hotspotX;
     this.cursorHotspotY = hotspotY;
     this.updateCursorLayout();
+    this.refreshHwCursorImage();
   }
 
   // Install an already-on-device GPUTexture as the cursor image. The live
@@ -4227,7 +4456,10 @@ export class JsCompositor implements CompositorSink {
     this.cursorTargetSurfaceId = this.internalCursorSurfaceId;
     this.cursorHotspotX = hotspotX;
     this.cursorHotspotY = hotspotY;
+    // A device-texture cursor has no CPU bytes to ship to a cursor plane.
+    this.cursorPixelBytes = null;
     this.updateCursorLayout();
+    this.refreshHwCursorImage();
   }
 
   // Update pointer position. Called on every host pointer motion event.
@@ -4241,16 +4473,21 @@ export class JsCompositor implements CompositorSink {
   setCursorVisible(visible: boolean): void {
     if (visible === this.cursorVisible) return;
     this.cursorVisible = visible;
+    if (this.hwCursorActive.size > 0) this.hwCursorStateStale = true;
     // Repaint the cursor's rect so it appears / is erased.
     if (this.cursorTargetSurfaceId !== null) {
       const s = this.surfaces.get(this.cursorTargetSurfaceId);
-      if (s) this.addOutputDamage(s.x, s.y, s.layoutW, s.layoutH, /*anchored*/ true);
+      if (s) this.damageCursorRect(s.x, s.y, s.layoutW, s.layoutH);
     }
   }
 
   // Tear down the cursor entirely. Called on compositor shutdown; tests use
   // this between cases.
   clearCursor(): void {
+    for (const id of [...this.hwCursorActive]) {
+      this.deactivateHwCursor(id, { dropCaps: false, sendDisable: true });
+    }
+    this.cursorPixelBytes = null;
     this.cursorVisible = false;
     this.cursorTargetSurfaceId = null;
     const intern = this.surfaces.get(this.internalCursorSurfaceId);

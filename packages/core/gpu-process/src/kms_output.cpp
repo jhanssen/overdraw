@@ -5,7 +5,10 @@
 #include <cstdio>
 #include <cstring>
 
+#include <fcntl.h>
+#include <sys/mman.h>
 #include <sys/stat.h>
+#include <unistd.h>
 
 extern "C" {
 #include <gbm.h>
@@ -15,6 +18,41 @@ extern "C" {
 }
 
 namespace overdraw::gpu {
+
+namespace {
+
+// Bilinear-scale premultiplied BGRA pixels into a destination with its own
+// stride. Premultiplied alpha makes channel-wise interpolation correct
+// without unmultiply/remultiply.
+void scaleBgraInto(uint8_t* dst, uint32_t dstStride, uint32_t dstW, uint32_t dstH,
+                   const uint8_t* src, uint32_t srcW, uint32_t srcH, uint32_t srcStride) {
+    for (uint32_t y = 0; y < dstH; ++y) {
+        float fy = (y + 0.5f) * static_cast<float>(srcH) / static_cast<float>(dstH) - 0.5f;
+        if (fy < 0) fy = 0;
+        uint32_t y0 = static_cast<uint32_t>(fy);
+        if (y0 > srcH - 1) y0 = srcH - 1;
+        uint32_t y1 = y0 + 1 < srcH ? y0 + 1 : srcH - 1;
+        const float wy = fy - static_cast<float>(y0);
+        const uint8_t* row0 = src + y0 * srcStride;
+        const uint8_t* row1 = src + y1 * srcStride;
+        uint8_t* out = dst + y * dstStride;
+        for (uint32_t x = 0; x < dstW; ++x) {
+            float fx = (x + 0.5f) * static_cast<float>(srcW) / static_cast<float>(dstW) - 0.5f;
+            if (fx < 0) fx = 0;
+            uint32_t x0 = static_cast<uint32_t>(fx);
+            if (x0 > srcW - 1) x0 = srcW - 1;
+            uint32_t x1 = x0 + 1 < srcW ? x0 + 1 : srcW - 1;
+            const float wx = fx - static_cast<float>(x0);
+            for (int c = 0; c < 4; ++c) {
+                const float top = row0[x0 * 4 + c] * (1.0f - wx) + row0[x1 * 4 + c] * wx;
+                const float bot = row1[x0 * 4 + c] * (1.0f - wx) + row1[x1 * 4 + c] * wx;
+                out[x * 4 + c] = static_cast<uint8_t>(top * (1.0f - wy) + bot * wy + 0.5f);
+            }
+        }
+    }
+}
+
+}  // namespace
 
 KmsOutputBackend::~KmsOutputBackend() {
     close();
@@ -29,6 +67,8 @@ void KmsOutputBackend::close() {
     // The DRM fd itself is owned by the core's libseat; we don't close it.
     for (auto& [id, o] : outputs_) {
         o->ring.clear();
+        resetCursorFlipState(*o);
+        destroyCursorBos(*o);
         if (o->modeBlobId != 0 && drmFd_ >= 0) {
             drmModeDestroyPropertyBlob(drmFd_, o->modeBlobId);
             o->modeBlobId = 0;
@@ -51,6 +91,7 @@ bool KmsOutputBackend::open(const char* /*title*/) {
     // 1: drmFd already received from the core.
     // 2-3: enable atomic + universal-planes caps.
     if (!enableDrmAtomicCaps(drmFd_)) return false;
+    queryCursorSizeCaps(drmFd_, cursorCapW_, cursorCapH_);
 
     // 4: pick the primary connector (env var OVERDRAW_CONNECTOR may pin a name).
     DrmTopology primaryTopo{};
@@ -115,12 +156,21 @@ bool KmsOutputBackend::connectOutput(DrmTopology topo, uint32_t outputId) {
                      topo.connectorName.c_str(), topo.connectorId);
         return false;
     }
+    // Cursor plane is best-effort: without one this output just uses the
+    // software cursor. Exclude cursor planes other outputs already claimed.
+    std::vector<uint32_t> claimedCursorPlanes;
+    for (const auto& [id, other] : outputs_) {
+        if (other->topo.cursorPlaneId) claimedCursorPlanes.push_back(other->topo.cursorPlaneId);
+    }
+    if (pickCursorPlane(drmFd_, topo.crtcId, topo.cursorPlaneId, claimedCursorPlanes)) {
+        resolveCursorPlaneProperties(drmFd_, topo);  // zeroes cursorPlaneId on failure
+    }
     usedCrtcs_.insert(topo.crtcId);
-    std::printf("[kms] output %u connector %s id=%u mode=%ux%u @%u.%03uHz crtc=%u plane=%u\n",
+    std::printf("[kms] output %u connector %s id=%u mode=%ux%u @%u.%03uHz crtc=%u plane=%u cursor-plane=%u\n",
                 outputId, topo.connectorName.c_str(), topo.connectorId,
                 topo.mode.hdisplay, topo.mode.vdisplay,
                 topo.mode.vrefreshMhz / 1000, topo.mode.vrefreshMhz % 1000,
-                topo.crtcId, topo.planeId);
+                topo.crtcId, topo.planeId, topo.cursorPlaneId);
     auto out = std::make_unique<PerOutput>();
     out->outputId = outputId;
     out->topo = std::move(topo);
@@ -141,6 +191,8 @@ void KmsOutputBackend::disconnectOutput(uint32_t outputId) {
     // we'd want an atomic-disable commit here.
     usedCrtcs_.erase(o.topo.crtcId);
     o.ring.clear();
+    resetCursorFlipState(o);
+    destroyCursorBos(o);
     if (o.modeBlobId != 0 && drmFd_ >= 0) {
         drmModeDestroyPropertyBlob(drmFd_, o.modeBlobId);
         o.modeBlobId = 0;
@@ -148,6 +200,216 @@ void KmsOutputBackend::disconnectOutput(uint32_t outputId) {
     std::printf("[kms] output %u connector %s disconnected (crtc %u released)\n",
                 outputId, o.topo.connectorName.c_str(), o.topo.crtcId);
     outputs_.erase(it);
+}
+
+bool KmsOutputBackend::ensureCursorBos(PerOutput& o) {
+    if (o.cursorBos[0].fbId) return true;
+    for (int i = 0; i < 2; ++i) {
+        CursorBo& b = o.cursorBos[i];
+        drm_mode_create_dumb create{};
+        create.width  = cursorCapW_;
+        create.height = cursorCapH_;
+        create.bpp    = 32;
+        if (drmIoctl(drmFd_, DRM_IOCTL_MODE_CREATE_DUMB, &create) != 0) {
+            std::fprintf(stderr, "[kms] cursor dumb-buffer create failed: %s\n",
+                         std::strerror(errno));
+            destroyCursorBos(o);
+            return false;
+        }
+        b.handle = create.handle;
+        b.pitch  = create.pitch;
+        b.size   = create.size;
+        drm_mode_map_dumb mapReq{};
+        mapReq.handle = b.handle;
+        if (drmIoctl(drmFd_, DRM_IOCTL_MODE_MAP_DUMB, &mapReq) != 0) {
+            std::fprintf(stderr, "[kms] cursor dumb-buffer map failed: %s\n",
+                         std::strerror(errno));
+            destroyCursorBos(o);
+            return false;
+        }
+        b.map = ::mmap(nullptr, b.size, PROT_READ | PROT_WRITE, MAP_SHARED,
+                       drmFd_, mapReq.offset);
+        if (b.map == MAP_FAILED) {
+            b.map = nullptr;
+            std::fprintf(stderr, "[kms] cursor dumb-buffer mmap failed: %s\n",
+                         std::strerror(errno));
+            destroyCursorBos(o);
+            return false;
+        }
+        std::memset(b.map, 0, b.size);
+        uint32_t handles[4] = { b.handle, 0, 0, 0 };
+        uint32_t pitches[4] = { b.pitch, 0, 0, 0 };
+        uint32_t offsets[4] = { 0, 0, 0, 0 };
+        if (drmModeAddFB2(drmFd_, cursorCapW_, cursorCapH_, DRM_FORMAT_ARGB8888,
+                          handles, pitches, offsets, &b.fbId, 0) != 0) {
+            std::fprintf(stderr, "[kms] cursor AddFB2 failed: %s\n", std::strerror(errno));
+            destroyCursorBos(o);
+            return false;
+        }
+    }
+    return true;
+}
+
+void KmsOutputBackend::destroyCursorBos(PerOutput& o) {
+    for (CursorBo& b : o.cursorBos) {
+        if (b.map) { ::munmap(b.map, b.size); b.map = nullptr; }
+        if (b.fbId && drmFd_ >= 0) { drmModeRmFB(drmFd_, b.fbId); }
+        b.fbId = 0;
+        if (b.handle && drmFd_ >= 0) {
+            drm_mode_destroy_dumb destroy{};
+            destroy.handle = b.handle;
+            drmIoctl(drmFd_, DRM_IOCTL_MODE_DESTROY_DUMB, &destroy);
+        }
+        b.handle = 0;
+        b.pitch = 0;
+        b.size = 0;
+    }
+    o.cursorImageValid = false;
+}
+
+void KmsOutputBackend::resetCursorFlipState(PerOutput& o) {
+    o.cursorFlipPending = false;
+    o.stashedPresentSlot = -1;
+    if (o.stashedPresentFence >= 0) {
+        ::close(o.stashedPresentFence);
+        o.stashedPresentFence = -1;
+    }
+}
+
+bool KmsOutputBackend::cursorPlaneInfoAt(uint32_t outputId,
+                                         uint32_t& outW, uint32_t& outH) const {
+    const PerOutput* o = find(outputId);
+    if (!o || !o->topo.cursorPlaneId || o->cursorDemoted) return false;
+    outW = cursorCapW_;
+    outH = cursorCapH_;
+    return true;
+}
+
+bool KmsOutputBackend::setCursorImage(uint32_t outputId, const uint8_t* pixels,
+                                      uint32_t srcW, uint32_t srcH, uint32_t srcStride,
+                                      uint32_t dstW, uint32_t dstH) {
+    PerOutput* o = find(outputId);
+    if (!o || !o->topo.cursorPlaneId || o->cursorDemoted) return false;
+    if (!pixels || srcW == 0 || srcH == 0 || dstW == 0 || dstH == 0) return false;
+    if (srcStride < srcW * 4) return false;
+    // The core pre-checks dims against the caps it received; this is the
+    // defensive backstop.
+    if (dstW > cursorCapW_ || dstH > cursorCapH_) return false;
+    if (!ensureCursorBos(*o)) {
+        // Allocation failure is not going to heal; stop trying.
+        o->cursorDemoted = true;
+        return false;
+    }
+    CursorBo& back = o->cursorBos[1 - o->cursorFrontBo];
+    std::memset(back.map, 0, back.size);
+    uint8_t* dst = static_cast<uint8_t*>(back.map);
+    if (srcW == dstW && srcH == dstH) {
+        for (uint32_t y = 0; y < srcH; ++y) {
+            std::memcpy(dst + y * back.pitch, pixels + y * srcStride, srcW * 4u);
+        }
+    } else {
+        scaleBgraInto(dst, back.pitch, dstW, dstH, pixels, srcW, srcH, srcStride);
+    }
+    o->cursorFrontBo = 1 - o->cursorFrontBo;
+    o->cursorImageValid = true;
+    o->cursorDirty = true;
+    maybeCursorCommit(*o);
+    return true;
+}
+
+void KmsOutputBackend::setCursorState(uint32_t outputId, int32_t x, int32_t y,
+                                      bool visible, bool commitNow) {
+    PerOutput* o = find(outputId);
+    if (!o || !o->topo.cursorPlaneId || o->cursorDemoted) return;
+    o->cursorX = x;
+    o->cursorY = y;
+    o->cursorVisible = visible;
+    o->cursorDirty = true;
+    if (commitNow) o->cursorCommitRequested = true;
+    maybeCursorCommit(*o);
+}
+
+void KmsOutputBackend::addCursorPlaneState(drmModeAtomicReq* req, PerOutput& o) const {
+    const uint32_t plane = o.topo.cursorPlaneId;
+    if (!plane) return;
+    const auto& cp = o.topo.cursorPlaneProps;
+    auto add = [&](uint32_t prop, uint64_t v) {
+        if (prop) drmModeAtomicAddProperty(req, plane, prop, v);
+    };
+    if (o.cursorVisible && o.cursorImageValid && !o.cursorDemoted) {
+        const CursorBo& b = o.cursorBos[o.cursorFrontBo];
+        add(cp.fb_id,   b.fbId);
+        add(cp.crtc_id, o.topo.crtcId);
+        add(cp.src_x,   0);
+        add(cp.src_y,   0);
+        add(cp.src_w,   static_cast<uint64_t>(cursorCapW_) << 16);
+        add(cp.src_h,   static_cast<uint64_t>(cursorCapH_) << 16);
+        // CRTC_X/Y are signed: a cursor straddling the output's top/left
+        // edge goes negative, carried as two's complement in the u64.
+        add(cp.crtc_x,  static_cast<uint64_t>(static_cast<int64_t>(o.cursorX)));
+        add(cp.crtc_y,  static_cast<uint64_t>(static_cast<int64_t>(o.cursorY)));
+        add(cp.crtc_w,  cursorCapW_);
+        add(cp.crtc_h,  cursorCapH_);
+    } else {
+        add(cp.fb_id,   0);
+        add(cp.crtc_id, 0);
+    }
+}
+
+void KmsOutputBackend::maybeCursorCommit(PerOutput& o) {
+    if (paused_ || drmFd_ < 0) return;
+    if (!o.cursorDirty || !o.cursorCommitRequested) return;
+    if (!o.didInitialCommit) return;  // the initial modeset carries it
+    // Commits are serialized per CRTC: while any flip is in flight, the
+    // desired state is picked up either by the arriving present (frame
+    // path) or re-checked from that flip's completion event.
+    if (o.pendingFlipSlot != -1 || o.cursorFlipPending) return;
+    if (!o.topo.cursorPlaneId || o.cursorDemoted) return;
+    drmModeAtomicReq* req = drmModeAtomicAlloc();
+    if (!req) return;
+    addCursorPlaneState(req, o);
+    int rc = drmModeAtomicCommit(drmFd_, req, DRM_MODE_ATOMIC_TEST_ONLY, this);
+    if (rc == 0) {
+        rc = drmModeAtomicCommit(drmFd_, req,
+                                 DRM_MODE_PAGE_FLIP_EVENT | DRM_MODE_ATOMIC_NONBLOCK,
+                                 this);
+    }
+    drmModeAtomicFree(req);
+    if (rc != 0) {
+        std::fprintf(stderr,
+            "[kms] cursor-only commit failed (%s); software cursor for output %u\n",
+            std::strerror(errno), o.outputId);
+        demoteCursor(o);
+        return;
+    }
+    o.cursorFlipPending = true;
+    o.cursorDirty = false;
+    o.cursorCommitRequested = false;
+}
+
+void KmsOutputBackend::demoteCursor(PerOutput& o, bool issueDisableCommit) {
+    if (o.cursorDemoted) return;
+    o.cursorDemoted = true;
+    o.cursorVisible = false;
+    o.cursorDirty = false;
+    o.cursorCommitRequested = false;
+    // Best-effort: turn the plane off now if nothing is in flight. If a
+    // flip IS in flight, the next commit (frame or stashed present) emits
+    // the disable via addCursorPlaneState.
+    if (issueDisableCommit && !paused_ && o.didInitialCommit && o.pendingFlipSlot == -1
+        && !o.cursorFlipPending && o.topo.cursorPlaneId) {
+        drmModeAtomicReq* req = drmModeAtomicAlloc();
+        if (req) {
+            addCursorPlaneState(req, o);  // demoted -> plane-off props
+            if (drmModeAtomicCommit(drmFd_, req,
+                                    DRM_MODE_PAGE_FLIP_EVENT | DRM_MODE_ATOMIC_NONBLOCK,
+                                    this) == 0) {
+                o.cursorFlipPending = true;
+            }
+            drmModeAtomicFree(req);
+        }
+    }
+    if (cursorFallbackListener_) cursorFallbackListener_(o.outputId);
 }
 
 uint32_t KmsOutputBackend::allocateOutputId() const {
@@ -322,6 +584,11 @@ bool KmsOutputBackend::switchMode(uint32_t outputId,
     // try to advance a slot that no longer exists.
     o->pendingFlipSlot = -1;
     o->didInitialCommit = false;
+    // The stashed present (if any) references the old ring; drop it. Cursor
+    // image + desired state survive the mode switch (the cursor FB is
+    // cap-sized, mode-independent); the post-switch modeset re-programs it.
+    resetCursorFlipState(*o);
+    o->cursorDirty = true;
 
     // Adopt the new mode.
     o->topo.mode = newMode;
@@ -434,6 +701,11 @@ void KmsOutputBackend::pause() {
         o->pendingFlipSlot = -1;
         o->ring.resetAllSlotsToFree();
         o->didInitialCommit = false;
+        // No flip event will arrive for a commit the revoked master had in
+        // flight; the post-resume modeset re-programs the cursor plane from
+        // the (kept) desired state.
+        resetCursorFlipState(*o);
+        o->cursorDirty = true;
     }
     std::printf("[kms] paused (VT switched away or seat disabled)\n");
 }
@@ -453,38 +725,29 @@ bool KmsOutputBackend::presentOutputImpl(PerOutput& o, int slotIdx, int inFenceF
         return true;
     }
     if (slotIdx < 0 || drmFd_ < 0) return false;
+    // A cursor-only flip is in flight on this CRTC; a second nonblocking
+    // commit would EBUSY. Stash the present and issue it from the cursor
+    // flip's completion event (sub-vblank delay, and rare: only an
+    // idle->active transition races a cursor commit against a render).
+    if (o.cursorFlipPending) {
+        if (o.stashedPresentSlot >= 0) {
+            // Can't happen while flip-completes gate the core's renders,
+            // but never leak a fence if it does.
+            std::fprintf(stderr,
+                "[kms] present stashed twice on output %u; dropping older slot %d\n",
+                o.outputId, o.stashedPresentSlot);
+            if (o.stashedPresentFence >= 0) ::close(o.stashedPresentFence);
+        }
+        o.stashedPresentSlot = slotIdx;
+        o.stashedPresentFence =
+            inFenceFd >= 0 ? ::fcntl(inFenceFd, F_DUPFD_CLOEXEC, 0) : -1;
+        return true;
+    }
     const auto& s = o.ring.slot(slotIdx);
     const DrmTopology& topo = o.topo;
-    drmModeAtomicReq* req = drmModeAtomicAlloc();
-    if (!req) {
-        std::fprintf(stderr, "[kms] drmModeAtomicAlloc failed\n");
-        return false;
-    }
 
     const uint32_t modeW = topo.mode.hdisplay;
     const uint32_t modeH = topo.mode.vdisplay;
-    auto add = [&](uint32_t obj, uint32_t prop, uint64_t v) {
-        if (prop) drmModeAtomicAddProperty(req, obj, prop, v);
-    };
-
-    // Plane: which CRTC, which FB, src + crtc rects. src_* are 16.16 fixed-
-    // point in buffer space; crtc_* are integers in mode space.
-    add(topo.planeId, topo.planeProps.fb_id,   s.fbId);
-    add(topo.planeId, topo.planeProps.crtc_id, topo.crtcId);
-    add(topo.planeId, topo.planeProps.src_x,   0);
-    add(topo.planeId, topo.planeProps.src_y,   0);
-    add(topo.planeId, topo.planeProps.src_w,   static_cast<uint64_t>(o.ring.width())  << 16);
-    add(topo.planeId, topo.planeProps.src_h,   static_cast<uint64_t>(o.ring.height()) << 16);
-    add(topo.planeId, topo.planeProps.crtc_x,  0);
-    add(topo.planeId, topo.planeProps.crtc_y,  0);
-    add(topo.planeId, topo.planeProps.crtc_w,  modeW);
-    add(topo.planeId, topo.planeProps.crtc_h,  modeH);
-
-    // Explicit sync: tell the kernel to wait for this fence before latching.
-    // The fd is dup'd by the kernel; caller still owns the original.
-    if (inFenceFd >= 0 && topo.planeProps.in_fence_fd) {
-        add(topo.planeId, topo.planeProps.in_fence_fd, static_cast<uint64_t>(inFenceFd));
-    }
 
     // Atomic commit flags differ between the initial modeset and steady-state
     // page flips.
@@ -503,27 +766,72 @@ bool KmsOutputBackend::presentOutputImpl(PerOutput& o, int slotIdx, int inFenceF
     //   DRM fd in pump().
     uint32_t flags = 0;
     if (!o.didInitialCommit) {
-        // First commit also sets up CRTC + connector + mode.
-        add(topo.connectorId, topo.connectorProps.crtc_id, topo.crtcId);
-        // Takeover: a previous DRM master (another compositor on another VT)
-        // may have left cursor/overlay planes latched on this CRTC with its
-        // final image -- a hardware cursor frozen at its last position,
-        // displayed on top of everything we scan out. Disable every plane on
-        // this CRTC that isn't one of ours.
-        std::vector<uint32_t> owned;
-        owned.reserve(outputs_.size());
-        for (const auto& [id, other] : outputs_) owned.push_back(other->topo.planeId);
-        addForeignPlaneDisables(req, drmFd_, topo.crtcId, owned);
         if (o.modeBlobId == 0) {
             o.modeBlobId = createModeBlob(drmFd_, topo.mode.raw);
-            if (o.modeBlobId == 0) { drmModeAtomicFree(req); return false; }
+            if (o.modeBlobId == 0) return false;
         }
-        add(topo.crtcId, topo.crtcProps.mode_id, o.modeBlobId);
-        add(topo.crtcId, topo.crtcProps.active,  1);
         flags = DRM_MODE_ATOMIC_ALLOW_MODESET;
     } else {
         flags = DRM_MODE_PAGE_FLIP_EVENT | DRM_MODE_ATOMIC_NONBLOCK;
     }
+
+    // Built as a lambda so the cursor-demotion path below can rebuild the
+    // request (identical but for the cursor plane now emitting its
+    // plane-off props) without duplicating this block.
+    auto buildReq = [&]() -> drmModeAtomicReq* {
+        drmModeAtomicReq* req = drmModeAtomicAlloc();
+        if (!req) {
+            std::fprintf(stderr, "[kms] drmModeAtomicAlloc failed\n");
+            return nullptr;
+        }
+        auto add = [&](uint32_t obj, uint32_t prop, uint64_t v) {
+            if (prop) drmModeAtomicAddProperty(req, obj, prop, v);
+        };
+
+        // Plane: which CRTC, which FB, src + crtc rects. src_* are 16.16
+        // fixed-point in buffer space; crtc_* are integers in mode space.
+        add(topo.planeId, topo.planeProps.fb_id,   s.fbId);
+        add(topo.planeId, topo.planeProps.crtc_id, topo.crtcId);
+        add(topo.planeId, topo.planeProps.src_x,   0);
+        add(topo.planeId, topo.planeProps.src_y,   0);
+        add(topo.planeId, topo.planeProps.src_w,   static_cast<uint64_t>(o.ring.width())  << 16);
+        add(topo.planeId, topo.planeProps.src_h,   static_cast<uint64_t>(o.ring.height()) << 16);
+        add(topo.planeId, topo.planeProps.crtc_x,  0);
+        add(topo.planeId, topo.planeProps.crtc_y,  0);
+        add(topo.planeId, topo.planeProps.crtc_w,  modeW);
+        add(topo.planeId, topo.planeProps.crtc_h,  modeH);
+
+        // Explicit sync: tell the kernel to wait for this fence before
+        // latching. The fd is dup'd by the kernel; caller still owns the
+        // original.
+        if (inFenceFd >= 0 && topo.planeProps.in_fence_fd) {
+            add(topo.planeId, topo.planeProps.in_fence_fd, static_cast<uint64_t>(inFenceFd));
+        }
+
+        // Cursor plane rides every commit: position/visibility changes are
+        // free on a commit that was happening anyway.
+        addCursorPlaneState(req, o);
+
+        if (!o.didInitialCommit) {
+            // First commit also sets up CRTC + connector + mode.
+            add(topo.connectorId, topo.connectorProps.crtc_id, topo.crtcId);
+            // Takeover: a previous DRM master (another compositor on another
+            // VT) may have left cursor/overlay planes latched on this CRTC
+            // with its final image -- a hardware cursor frozen at its last
+            // position, displayed on top of everything we scan out. Disable
+            // every plane on this CRTC that isn't one of ours.
+            std::vector<uint32_t> owned;
+            owned.reserve(outputs_.size() * 2);
+            for (const auto& [id, other] : outputs_) {
+                owned.push_back(other->topo.planeId);
+                if (other->topo.cursorPlaneId) owned.push_back(other->topo.cursorPlaneId);
+            }
+            addForeignPlaneDisables(req, drmFd_, topo.crtcId, owned);
+            add(topo.crtcId, topo.crtcProps.mode_id, o.modeBlobId);
+            add(topo.crtcId, topo.crtcProps.active,  1);
+        }
+        return req;
+    };
 
     // Atomic TEST first so the kernel rejects without leaving us half-state.
     // TEST_ONLY must NOT include PAGE_FLIP_EVENT (the kernel rejects the
@@ -531,7 +839,24 @@ bool KmsOutputBackend::presentOutputImpl(PerOutput& o, int slotIdx, int inFenceF
     // signal). NONBLOCK is also irrelevant for TEST_ONLY.
     const uint32_t testFlags = (flags & ~DRM_MODE_PAGE_FLIP_EVENT & ~DRM_MODE_ATOMIC_NONBLOCK)
                               | DRM_MODE_ATOMIC_TEST_ONLY;
+    drmModeAtomicReq* req = buildReq();
+    if (!req) return false;
     int testRc = drmModeAtomicCommit(drmFd_, req, testFlags, this);
+    if (testRc != 0 && o.topo.cursorPlaneId && !o.cursorDemoted
+        && o.cursorVisible && o.cursorImageValid) {
+        // The cursor plane props may be what the kernel rejects (driver
+        // quirk, size/format constraint the caps didn't surface). Demote
+        // to software cursor and retry the frame without it -- the frame
+        // must not be lost to a cursor problem.
+        std::fprintf(stderr,
+            "[kms] atomic TEST failed with cursor plane (%s); retrying without "
+            "hw cursor on output %u\n", std::strerror(errno), o.outputId);
+        demoteCursor(o, /*issueDisableCommit=*/false);
+        drmModeAtomicFree(req);
+        req = buildReq();  // now emits the cursor plane-off props
+        if (!req) return false;
+        testRc = drmModeAtomicCommit(drmFd_, req, testFlags, this);
+    }
     if (testRc != 0) {
         std::fprintf(stderr, "[kms] atomic TEST failed: %s (flags=0x%x)\n",
                      std::strerror(errno), testFlags);
@@ -545,6 +870,9 @@ bool KmsOutputBackend::presentOutputImpl(PerOutput& o, int slotIdx, int inFenceF
                      std::strerror(errno), flags);
         return false;
     }
+    // This commit carried the current desired cursor state.
+    o.cursorDirty = false;
+    o.cursorCommitRequested = false;
 
     const bool wasInitial = !o.didInitialCommit;
     o.didInitialCommit = true;
@@ -590,7 +918,27 @@ void KmsOutputBackend::pageFlipTrampoline(int /*fd*/, unsigned int sequence,
         if (o->topo.crtcId != crtc_id) continue;
         const int flipped = o->pendingFlipSlot;
         o->pendingFlipSlot = -1;
-        if (flipped < 0) return;
+        if (flipped < 0) {
+            // Not a frame flip. A cursor-only commit's event completes here:
+            // it must NOT feed the frame clock (no slot retired, nothing for
+            // the core to pace on) -- it only unblocks the next commit.
+            if (o->cursorFlipPending) {
+                o->cursorFlipPending = false;
+                if (o->stashedPresentSlot >= 0) {
+                    // A present arrived while the cursor flip was in flight;
+                    // issue it now (it folds the latest cursor state).
+                    const int slot = o->stashedPresentSlot;
+                    const int fence = o->stashedPresentFence;
+                    o->stashedPresentSlot = -1;
+                    o->stashedPresentFence = -1;
+                    self->presentOutputImpl(*o, slot, fence);
+                    if (fence >= 0) ::close(fence);
+                } else {
+                    self->maybeCursorCommit(*o);
+                }
+            }
+            return;
+        }
         const int retired = o->ring.onFlipComplete(flipped);
         if (self->flipCompleteListener_) {
             // Promote kernel-supplied (tv_sec, tv_usec) to (tv_sec, tv_nsec)
@@ -600,6 +948,9 @@ void KmsOutputBackend::pageFlipTrampoline(int /*fd*/, unsigned int sequence,
             const uint32_t nsec = static_cast<uint32_t>(tv_usec) * 1000u;
             self->flipCompleteListener_(o->outputId, retired, sec, nsec, sequence);
         }
+        // Cursor motion that arrived while this frame flip was in flight
+        // and asked for a commit of its own.
+        self->maybeCursorCommit(*o);
         return;
     }
 }

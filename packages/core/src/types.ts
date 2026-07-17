@@ -465,6 +465,27 @@ export interface Addon {
   // survive the u64 monotonic-clock range. Passing null clears.
   setOnFlipComplete(cb: ((outputId: number, tvSec: bigint, tvNsec: number,
                           seq: number) => void) | null): void;
+  // Hardware-cursor plane bridge (KMS). setOnCursorPlaneStatus registers the
+  // per-output availability callback (ok=true: the output scans the cursor
+  // out of a maxWidth x maxHeight KMS plane; ok=false: software cursor --
+  // no plane, or a runtime commit rejection demoted it). sendCursorImage
+  // installs tightly-packed premultiplied BGRA pixels (scaled GPU-process-
+  // side to dstW x dstH); sendCursorImageShm references pixels inside an
+  // already-registered wl_shm pool instead. sendCursorState positions the
+  // plane in device pixels relative to the output, hotspot pre-applied;
+  // commitNow=true when no frame render is coming for that output so the
+  // GPU process issues the cursor-only commit itself. All optional: absent
+  // on test sinks and non-KMS builds.
+  setOnCursorPlaneStatus?(cb: ((msg: {
+    outputId: number; ok: boolean; maxWidth: number; maxHeight: number;
+  }) => void) | null): void;
+  sendCursorImage?(outputId: number, pixels: Uint8Array,
+                   srcW: number, srcH: number, dstW: number, dstH: number): void;
+  sendCursorImageShm?(outputId: number, poolId: number, offset: number,
+                      stride: number, srcW: number, srcH: number,
+                      dstW: number, dstH: number): void;
+  sendCursorState?(outputId: number, x: number, y: number,
+                   visible: boolean, commitNow: boolean): void;
   // Update the input backend's view of the multi-output layout (used for
   // pointer-space mapping and cursor clamping). Rects are in global logical
   // pixels. Called whenever state.outputs changes. Silent no-op if no input

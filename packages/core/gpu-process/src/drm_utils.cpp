@@ -274,6 +274,84 @@ bool pickPrimaryPlane(int drmFd, uint32_t crtcId, uint32_t& outPlaneId) {
     return ok;
 }
 
+bool pickCursorPlane(int drmFd, uint32_t crtcId, uint32_t& outPlaneId,
+                     const std::vector<uint32_t>& excludePlanes) {
+    drmModeRes* res = drmModeGetResources(drmFd);
+    if (!res) return false;
+
+    int crtcIdx = -1;
+    for (int i = 0; i < res->count_crtcs; ++i) {
+        if (res->crtcs[i] == crtcId) { crtcIdx = i; break; }
+    }
+    drmModeFreeResources(res);
+    if (crtcIdx < 0) return false;
+
+    drmModePlaneRes* planes = drmModeGetPlaneResources(drmFd);
+    if (!planes) return false;
+    bool ok = false;
+    for (uint32_t i = 0; i < planes->count_planes && !ok; ++i) {
+        if (std::find(excludePlanes.begin(), excludePlanes.end(),
+                      planes->planes[i]) != excludePlanes.end()) continue;
+        drmModePlane* p = drmModeGetPlane(drmFd, planes->planes[i]);
+        if (!p) continue;
+        const bool reachable = (p->possible_crtcs & (1u << crtcIdx)) != 0;
+        drmModeFreePlane(p);
+        if (!reachable) continue;
+        bool isCursor = false;
+        walkProperties(drmFd, planes->planes[i], DRM_MODE_OBJECT_PLANE,
+            [&](const char* name, uint64_t value, const drmModePropertyRes*) {
+                if (std::strcmp(name, "type") == 0 && value == DRM_PLANE_TYPE_CURSOR) {
+                    isCursor = true;
+                }
+            });
+        if (isCursor) {
+            outPlaneId = planes->planes[i];
+            ok = true;
+        }
+    }
+    drmModeFreePlaneResources(planes);
+    // No log on miss: absence of a cursor plane is a normal configuration
+    // (the output just uses the software cursor).
+    return ok;
+}
+
+void queryCursorSizeCaps(int drmFd, uint32_t& outWidth, uint32_t& outHeight) {
+    uint64_t w = 0, h = 0;
+    if (drmGetCap(drmFd, DRM_CAP_CURSOR_WIDTH, &w) != 0 || w == 0) w = 64;
+    if (drmGetCap(drmFd, DRM_CAP_CURSOR_HEIGHT, &h) != 0 || h == 0) h = 64;
+    outWidth  = static_cast<uint32_t>(w);
+    outHeight = static_cast<uint32_t>(h);
+}
+
+bool resolveCursorPlaneProperties(int drmFd, DrmTopology& topo) {
+    if (!topo.cursorPlaneId) return false;
+    walkProperties(drmFd, topo.cursorPlaneId, DRM_MODE_OBJECT_PLANE,
+        [&](const char* name, uint64_t, const drmModePropertyRes* p) {
+            auto& cp = topo.cursorPlaneProps;
+            if (std::strcmp(name, "FB_ID")        == 0) cp.fb_id   = p->prop_id;
+            else if (std::strcmp(name, "CRTC_ID") == 0) cp.crtc_id = p->prop_id;
+            else if (std::strcmp(name, "SRC_X")   == 0) cp.src_x   = p->prop_id;
+            else if (std::strcmp(name, "SRC_Y")   == 0) cp.src_y   = p->prop_id;
+            else if (std::strcmp(name, "SRC_W")   == 0) cp.src_w   = p->prop_id;
+            else if (std::strcmp(name, "SRC_H")   == 0) cp.src_h   = p->prop_id;
+            else if (std::strcmp(name, "CRTC_X")  == 0) cp.crtc_x  = p->prop_id;
+            else if (std::strcmp(name, "CRTC_Y")  == 0) cp.crtc_y  = p->prop_id;
+            else if (std::strcmp(name, "CRTC_W")  == 0) cp.crtc_w  = p->prop_id;
+            else if (std::strcmp(name, "CRTC_H")  == 0) cp.crtc_h  = p->prop_id;
+        });
+    const auto& cp = topo.cursorPlaneProps;
+    const bool ok = cp.fb_id && cp.crtc_id && cp.src_x && cp.src_y && cp.src_w
+                    && cp.src_h && cp.crtc_x && cp.crtc_y && cp.crtc_w && cp.crtc_h;
+    if (!ok) {
+        std::fprintf(stderr,
+            "[drm] cursor plane %u missing required properties; using software cursor\n",
+            topo.cursorPlaneId);
+        topo.cursorPlaneId = 0;
+        topo.cursorPlaneProps = {};
+    }
+    return ok;
+}
+
 bool resolveProperties(int drmFd, DrmTopology& topo) {
     bool okConn = false, okCrtc = false, okPlane = false;
 

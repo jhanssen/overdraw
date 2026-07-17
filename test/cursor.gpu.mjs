@@ -259,6 +259,65 @@ test("cursor compositing slot (Phase 9c)", { skip }, async (t) => {
         "a client-cursor move marks the output dirty -> a present is scheduled");
       comp.clearCursor();
     });
+
+    await t.test("hardware cursor plane routing", async () => {
+      // Wrap the addon so the plane-bound sends are observable; every
+      // other method falls through to the real addon.
+      const sent = { images: [], states: [] };
+      const rec = Object.create(addon);
+      rec.sendCursorImage = (outputId, pixels, srcW, srcH, dstW, dstH) =>
+        sent.images.push({ outputId, len: pixels.length, srcW, srcH, dstW, dstH });
+      rec.sendCursorImageShm = () => {};
+      rec.sendCursorState = (outputId, x, y, visible, commitNow) =>
+        sent.states.push({ outputId, x, y, visible, commitNow });
+      const comp = new JsCompositor(device, dawn.globals, rec, { width: W, height: H });
+
+      const mag = solidPixels([255, 0, 255, 255], 16, 16);
+      comp.setCursorPixels(mag, 16, 16, 2, 3);
+      comp.setCursorPosition(40, 40);
+      comp.setCursorVisible(true);
+
+      // Plane arrives: the image ships, the plane activates, and the
+      // software slot drops out of the composite on that output.
+      comp.setCursorPlaneStatus(0, true, 64, 64);
+      assert.equal(sent.images.length, 1, "image shipped to the plane");
+      assert.deepEqual(
+        { srcW: sent.images[0].srcW, dstW: sent.images[0].dstW },
+        { srcW: 16, dstW: 16 }, "scale-1 output: dst == src");
+      assert.deepEqual(comp.hwCursorState().activeOutputs, [0]);
+      comp.renderFrame();
+      const { data } = await comp.readback();
+      assert.deepEqual(px(data, 44, 42), [0, 0, 0, 255],
+        "software cursor NOT composited while the plane owns it");
+      assert.ok(sent.states.length >= 1, "plane position flushed");
+      const st = sent.states.at(-1);
+      assert.deepEqual(
+        [st.x, st.y, st.visible, st.commitNow],
+        [38, 37, true, false],
+        "hotspot-adjusted device position; rendered output folds into its present");
+
+      // A move re-flushes the plane position without any output damage.
+      comp.setCursorPosition(60, 20);
+      assert.equal(comp.isOutputDirty(0), false,
+        "cursor move adds no damage on a hw-cursor output");
+      comp.renderFrame();
+      const st2 = sent.states.at(-1);
+      assert.deepEqual([st2.x, st2.y], [58, 17]);
+
+      // Demotion (status ok=false): the software slot takes over again.
+      comp.setCursorPlaneStatus(0, false, 0, 0);
+      assert.deepEqual(comp.hwCursorState().activeOutputs, []);
+      assert.equal(comp.isOutputDirty(0), true, "fallback repaints the cursor rect");
+      comp.renderFrame();
+      const { data: d2 } = await comp.readback();
+      assert.deepEqual(px(d2, 62, 20), [255, 0, 255, 255], "software cursor is back");
+
+      // An image too large for the plane FB never activates the plane.
+      comp.setCursorPlaneStatus(0, true, 8, 8);
+      assert.deepEqual(comp.hwCursorState().activeOutputs, [],
+        "16x16 image exceeds an 8x8 plane; output stays software");
+      comp.clearCursor();
+    });
   } finally {
     addon.stop();
   }

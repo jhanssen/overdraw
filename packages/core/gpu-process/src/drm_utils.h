@@ -41,6 +41,11 @@ struct DrmTopology {
     // Primary plane for that CRTC
     uint32_t planeId       = 0;
 
+    // Cursor plane for that CRTC. 0 = the CRTC has no reachable cursor
+    // plane (or another output claimed it); the compositor then software-
+    // composites the cursor for this output.
+    uint32_t cursorPlaneId = 0;
+
     // Property ids cached for atomic commits. 0 = property absent on object.
     struct {
         uint32_t crtc_id = 0;       // on connector: which CRTC drives it
@@ -63,6 +68,20 @@ struct DrmTopology {
         uint32_t in_fence_fd  = 0;   // optional; 0 means absent (commit without IN_FENCE_FD)
         uint32_t in_formats   = 0;   // optional; reading the per-plane modifier set
     } planeProps;
+
+    // Property ids for the cursor plane. All-zero when cursorPlaneId == 0.
+    struct {
+        uint32_t fb_id   = 0;
+        uint32_t crtc_id = 0;
+        uint32_t src_x   = 0;
+        uint32_t src_y   = 0;
+        uint32_t src_w   = 0;
+        uint32_t src_h   = 0;
+        uint32_t crtc_x  = 0;
+        uint32_t crtc_y  = 0;
+        uint32_t crtc_w  = 0;
+        uint32_t crtc_h  = 0;
+    } cursorPlaneProps;
 };
 
 // EDID-derived display identity. Fields are best-effort: any can be empty
@@ -133,6 +152,25 @@ bool pickCrtc(int drmFd, uint32_t connectorId, uint32_t& outCrtcId,
 // Pick the primary plane attached to (or attachable to) `crtcId`. Returns
 // false if no primary plane is found.
 bool pickPrimaryPlane(int drmFd, uint32_t crtcId, uint32_t& outPlaneId);
+
+// Pick a cursor plane reachable from `crtcId` that is not in
+// `excludePlanes` (cursor planes already claimed for other outputs this
+// session). Returns false if none is available -- the caller falls back
+// to software cursor compositing for this output.
+bool pickCursorPlane(int drmFd, uint32_t crtcId, uint32_t& outPlaneId,
+                     const std::vector<uint32_t>& excludePlanes = {});
+
+// The device's cursor buffer dimensions (DRM_CAP_CURSOR_WIDTH/HEIGHT).
+// Kernel default is 64x64 when the caps are absent. The cursor plane FB
+// must be exactly this size on most drivers; smaller images are placed
+// top-left with transparent padding.
+void queryCursorSizeCaps(int drmFd, uint32_t& outWidth, uint32_t& outHeight);
+
+// Resolve the cursor plane's property ids into topo.cursorPlaneProps.
+// Returns false (and zeroes cursorPlaneId) if any required property is
+// missing -- cursor support is optional, so the caller keeps going with
+// the software path rather than failing the output.
+bool resolveCursorPlaneProperties(int drmFd, DrmTopology& topo);
 
 // Resolve and cache the property ids we need for atomic commits, for the
 // connector / CRTC / plane in `topo`. Returns false if any required property

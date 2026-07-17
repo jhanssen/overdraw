@@ -650,6 +650,14 @@ export interface CompositorSink {
   setCursorPosition?(x: number, y: number): void;
   setCursorVisible?(visible: boolean): void;
   clearCursor?(): void;
+  // Hardware-cursor plane control (KMS). setCursorPlaneStatus feeds the
+  // GPU process's per-output availability reports; setHwCursorEnabled is
+  // the config gate (cursor.hardware). Outputs with an available plane
+  // and a plane-compatible image scan the cursor out in hardware instead
+  // of the software slot; everything else falls back per output.
+  setCursorPlaneStatus?(outputId: number, ok: boolean,
+                        maxW: number, maxH: number): void;
+  setHwCursorEnabled?(on: boolean): void;
 }
 
 export interface CompositorState {

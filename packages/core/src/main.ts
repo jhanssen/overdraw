@@ -260,6 +260,17 @@ const compositor: CompositorSink = new JsCompositor(device, dawn.globals, addon,
   { headless: false, format: addon.outputFormat() });
 log.info("core", "compositor: JS (over the Dawn wire)");
 
+// Hardware cursor: apply the config gate, then subscribe to per-output
+// cursor-plane availability from the GPU process (KMS only; nested never
+// reports a plane). Registering the callback also drains statuses already
+// queued from bring-up.
+compositor.setHwCursorEnabled?.(config.cursor.hardware);
+addon.setOnCursorPlaneStatus?.((m) => {
+  if (m.ok) log.info("core", `hw cursor: output ${m.outputId} plane ${m.maxWidth}x${m.maxHeight}`);
+  else log.info("core", `hw cursor: output ${m.outputId} software fallback`);
+  compositor.setCursorPlaneStatus?.(m.outputId, m.ok, m.maxWidth, m.maxHeight);
+});
+
 // Install the built-in default cursor. The XCursor theme
 // resolver picks up XCURSOR_THEME / XCURSOR_SIZE from env; for
 // 'default' the resolver always succeeds (built-in 16x16 fallback

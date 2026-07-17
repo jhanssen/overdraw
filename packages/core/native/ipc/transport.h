@@ -263,6 +263,43 @@ enum class FrameKind : uint8_t {
                               // bytes past the old size -- a cursor theme
                               // pool grows image-by-image, and the next
                               // upload reads from the newly grown region.
+    CursorImage = 25,         // core -> gpu: install a cursor image for one
+                              // output's hardware cursor plane. Payload:
+                              // CursorImagePayload header + srcW*srcH*4
+                              // BGRA (premultiplied) bytes inline. The GPU
+                              // process scales (when dst != src dims) and
+                              // writes the image into the output's linear
+                              // cursor bo. Cursor images are tiny (<=256px
+                              // square) so inline bytes are cheap.
+    CursorImageShm = 26,      // core -> gpu: same install, but the pixels
+                              // live in an already-registered wl_shm pool
+                              // (client cursor surface). Payload:
+                              // CursorImageShmPayload (poolId + offset +
+                              // stride + dims). Rides wire so it is FIFO-
+                              // ordered after the RegisterShmPool /
+                              // ResizeShmPool that mapped the pool and
+                              // after the commit's ShmUpload -- the GPU
+                              // process copies out of the pool immediately
+                              // on receipt, before the core can release
+                              // the client buffer.
+    CursorState = 27,         // core -> gpu: hardware-cursor plane position
+                              // + visibility for one output. x/y are device
+                              // pixels relative to the output, already
+                              // hotspot-adjusted by the core (may be
+                              // negative when the cursor straddles the
+                              // output's top/left edge). commitNow=1 asks
+                              // the GPU process to issue a cursor-only
+                              // atomic commit because the core will NOT
+                              // render a frame for this output (no damage);
+                              // commitNow=0 means a ScanoutPresent is
+                              // imminent on this same wire and will carry
+                              // the new state.
+    CursorPlaneStatus = 28,   // gpu -> core: whether outputId has a usable
+                              // hardware cursor plane (ok=1, with the
+                              // device's cursor buffer dims) or the core
+                              // must software-composite the cursor for it
+                              // (ok=0; also sent on runtime fallback, e.g.
+                              // a cursor commit the kernel rejected).
 };
 
 // Max fds attachable in one message (control msg OR in-band wire frame).

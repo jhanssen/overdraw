@@ -24,6 +24,7 @@
 #define OVERDRAW_GPU_KMS_OUTPUT_H_
 
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <unordered_map>
 #include <unordered_set>
@@ -112,6 +113,46 @@ class KmsOutputBackend : public OutputBackend {
                                               uint64_t tvSec, uint32_t tvNsec, uint32_t seq)>;
     void setFlipCompleteListener(FlipCompleteCb cb) { flipCompleteListener_ = std::move(cb); }
 
+    // -------------------------------------------------------------------
+    // Hardware cursor plane.
+    //
+    // Each output that resolved a cursor plane scans the cursor out of a
+    // small linear ARGB8888 dumb buffer on that plane; position changes
+    // ride the next atomic commit (every frame commit re-programs the
+    // cursor plane) or, when the core says no frame is coming, a cursor-
+    // only commit issued here. Cursor-only commits and frame commits are
+    // serialized: while a cursor-only flip is in flight an arriving
+    // present is stashed and issued from the cursor flip's event.
+    // -------------------------------------------------------------------
+
+    // Whether outputId has a usable cursor plane; fills the device's
+    // cursor buffer dims (the FB is always exactly this size).
+    bool cursorPlaneInfoAt(uint32_t outputId, uint32_t& outW, uint32_t& outH) const;
+
+    // Install a cursor image: `pixels` is srcW x srcH premultiplied BGRA
+    // rows at `srcStride` bytes. The image is scaled to dstW x dstH (when
+    // different) and placed top-left in the cursor FB, remainder
+    // transparent. Returns false when the image can't be used (dst dims
+    // exceed the cursor FB, buffer alloc/map failure) -- the caller should
+    // demote this output to the software cursor.
+    bool setCursorImage(uint32_t outputId, const uint8_t* pixels,
+                        uint32_t srcW, uint32_t srcH, uint32_t srcStride,
+                        uint32_t dstW, uint32_t dstH);
+
+    // Desired cursor plane state. x/y are device pixels relative to the
+    // output (hotspot already applied; may be negative). commitNow means
+    // no present is coming for this output, so apply via a cursor-only
+    // commit as soon as the plane is free.
+    void setCursorState(uint32_t outputId, int32_t x, int32_t y,
+                        bool visible, bool commitNow);
+
+    // Invoked when the kernel rejects a commit because of the cursor
+    // plane: the output has been demoted to software cursor (its cursor
+    // plane released). The listener should tell the core so it resumes
+    // compositing the cursor for this output.
+    using CursorFallbackCb = std::function<void(uint32_t outputId)>;
+    void setCursorFallbackListener(CursorFallbackCb cb) { cursorFallbackListener_ = std::move(cb); }
+
     // VT-switch lifecycle. On pause(): drop any pending flip wait, reset every
     // ring slot to FREE on every output, clear each didInitialCommit so the
     // next post-resume present runs the ALLOW_MODESET path (the kernel has
@@ -177,6 +218,16 @@ class KmsOutputBackend : public OutputBackend {
     // state. Held by unique_ptr because KmsScanoutRing is non-movable (deleted
     // copy + a user dtor), so PerOutput cannot live by value in containers
     // that reallocate / rehash.
+    // One CPU-writable cursor framebuffer: a linear ARGB8888 dumb buffer
+    // kept mmap'd for its lifetime, wrapped as a KMS FB.
+    struct CursorBo {
+        uint32_t handle = 0;   // dumb-buffer GEM handle
+        uint32_t pitch  = 0;
+        uint64_t size   = 0;
+        void*    map    = nullptr;
+        uint32_t fbId   = 0;
+    };
+
     struct PerOutput {
         uint32_t outputId = 0;
         DrmTopology topo{};
@@ -184,6 +235,23 @@ class KmsOutputBackend : public OutputBackend {
         uint32_t modeBlobId = 0;
         bool didInitialCommit = false;
         int pendingFlipSlot = -1;    // -1 = no flip in flight
+
+        // Cursor plane state. Image writes go to the back bo (1 - front)
+        // and swap, so the latched FB is never scribbled on mid-scanout.
+        CursorBo cursorBos[2];
+        int  cursorFrontBo = 0;
+        bool cursorImageValid = false;   // an image has been installed
+        int32_t cursorX = 0;             // device px, hotspot-adjusted
+        int32_t cursorY = 0;
+        bool cursorVisible = false;
+        bool cursorDirty = false;            // desired state not yet committed
+        bool cursorCommitRequested = false;  // core asked for a cursor-only commit
+        bool cursorFlipPending = false;      // cursor-only commit awaiting its event
+        bool cursorDemoted = false;          // kernel rejected the plane; software now
+        // Present stashed because a cursor-only flip was in flight when it
+        // arrived; issued from that flip's event. Fence fd is owned here.
+        int stashedPresentSlot  = -1;
+        int stashedPresentFence = -1;
     };
 
     // Page-flip C trampoline (libdrm calls back into this). The 5th argument is
@@ -203,6 +271,33 @@ class KmsOutputBackend : public OutputBackend {
 
     // Present implementation operating on a given output.
     bool presentOutputImpl(PerOutput& o, int slotIdx, int inFenceFd);
+
+    // Add the cursor plane's desired state to `req`: full props when
+    // visible with a valid image, else FB_ID=0 + CRTC_ID=0 (plane off).
+    // No-op when the output has no cursor plane.
+    void addCursorPlaneState(drmModeAtomicReq* req, PerOutput& o) const;
+
+    // Issue a cursor-only atomic commit (PAGE_FLIP_EVENT | NONBLOCK)
+    // carrying the desired cursor state. Preconditions checked inside:
+    // initial modeset done, no flip of either kind in flight.
+    void maybeCursorCommit(PerOutput& o);
+
+    // Demote this output to software cursor: mark the plane unusable (all
+    // later commits emit the plane-off props), and tell the core via the
+    // fallback listener so it resumes compositing the cursor. The cursor
+    // bos stay allocated until output teardown -- the plane may still be
+    // latched on one until the next commit turns it off.
+    // issueDisableCommit=false when the caller is about to commit anyway
+    // (the caller's commit carries the plane-off props; a self-issued one
+    // would collide with it).
+    void demoteCursor(PerOutput& o, bool issueDisableCommit = true);
+
+    // Allocate (lazily) / destroy the two cursor dumb-buffer FBs.
+    bool ensureCursorBos(PerOutput& o);
+    void destroyCursorBos(PerOutput& o);
+    // Drop any in-flight cursor-only flip + stashed present (VT pause,
+    // mode switch, teardown).
+    void resetCursorFlipState(PerOutput& o);
 
     // Allocate the 3-slot scanout ring for one PerOutput against `device`.
     // Shared by initScanout (startup, every output) and initScanoutForOutput
@@ -239,12 +334,16 @@ class KmsOutputBackend : public OutputBackend {
     gbm_device* gbm_ = nullptr;
     bool shouldClose_ = false;
     bool paused_ = false;
+    // Device-wide cursor FB dims (DRM_CAP_CURSOR_WIDTH/HEIGHT).
+    uint32_t cursorCapW_ = 0;
+    uint32_t cursorCapH_ = 0;
     std::unordered_map<uint32_t, std::unique_ptr<PerOutput>> outputs_;
     // CRTC ids currently bound to a live output. Mutated by connectOutput
     // (insert) / disconnectOutput (erase). connectOutput passes a transient
     // vector view of this set into the existing pickCrtc helper.
     std::unordered_set<uint32_t> usedCrtcs_;
     FlipCompleteCb flipCompleteListener_;
+    CursorFallbackCb cursorFallbackListener_;
 };
 
 }  // namespace overdraw::gpu

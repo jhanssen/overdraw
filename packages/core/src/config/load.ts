@@ -255,6 +255,18 @@ function normalize(raw: unknown, path: string): ResolvedConfig {
     }
   }
 
+  // cursor. `hardware` defaults to true (use each KMS output's cursor
+  // plane when present); false is the software-compositing escape hatch.
+  let cursor: ResolvedConfig["cursor"] = { hardware: true };
+  if (cfg.cursor !== undefined) {
+    const c = cfg.cursor;
+    if (c === null || typeof c !== "object") fail("`cursor` must be an object", path);
+    if (c.hardware !== undefined && typeof c.hardware !== "boolean") {
+      fail("`cursor.hardware` must be a boolean", path);
+    }
+    cursor = { hardware: c.hardware ?? true };
+  }
+
   // windowRules: structural array guarantee here; the bundled in-thread
   // window-rules plugin owns the per-rule schema (regex compilation, match /
   // float / apply shape) and validates each entry at init. Verbatim
@@ -269,7 +281,7 @@ function normalize(raw: unknown, path: string): ResolvedConfig {
   return {
     output, card, scale, outputsByKey,
     focus, hotkeys, decoration, layout, canvas, actions, plugins, xwayland, autostart,
-    windowRules,
+    windowRules, cursor,
     sourcePath: path,
   };
 }
@@ -287,6 +299,7 @@ export async function loadConfig(explicit: string | null): Promise<ResolvedConfi
       xwayland: { enabled: false, terminate: false, xwaylandPath: null, displayNumber: 50, scale: 0 },
       autostart: [],
       windowRules: [],
+      cursor: { hardware: true },
       sourcePath: null,
     };
   }

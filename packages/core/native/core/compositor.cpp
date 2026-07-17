@@ -204,6 +204,21 @@ Compositor::Compositor(int wireFd, int ctrlFd, pid_t gpuPid,
                         p.outputId, p.width, p.height);
             return;
         }
+        if (kind == ipc::FrameKind::CursorPlaneStatus) {
+            // Hardware-cursor availability for one output (bring-up probe
+            // or runtime demotion). Buffered for the JS layer, which flips
+            // the output between hardware and software cursor.
+            if (frame.size() != ipc::CursorPlaneStatusPayload::kSize) {
+                std::fprintf(stderr,
+                    "[core] CursorPlaneStatus: bad payload size %zu\n", frame.size());
+                return;
+            }
+            auto p = ipc::CursorPlaneStatusPayload::decode(frame.data());
+            pendingCursorPlaneStatus_.push_back({
+                p.outputId, p.maxWidth, p.maxHeight, p.ok != 0,
+            });
+            return;
+        }
         std::fprintf(stderr,
             "[core] WireLink inbound: unexpected kind=%u\n",
             static_cast<unsigned>(kind));
@@ -1347,6 +1362,60 @@ void Compositor::renderFrame() {
     // The JS compositor records + presents the frame (over the wire, via
     // acquireOutputTextureHandle/presentOutput). This per-frame hook just flushes
     // queued wire output.
+    link_->flush();
+}
+
+void Compositor::sendCursorImage(uint32_t outputId, const uint8_t* pixels,
+                                 uint32_t srcW, uint32_t srcH,
+                                 uint32_t dstW, uint32_t dstH) {
+    if (headless_ || !link_ || !pixels || srcW == 0 || srcH == 0) return;
+    ipc::CursorImagePayload pl{};
+    pl.outputId  = outputId;
+    pl.srcWidth  = srcW;
+    pl.srcHeight = srcH;
+    pl.dstWidth  = dstW;
+    pl.dstHeight = dstH;
+    std::vector<uint8_t> buf(ipc::CursorImagePayload::kSize
+                             + static_cast<size_t>(srcW) * srcH * 4u);
+    pl.encode(buf.data());
+    std::memcpy(buf.data() + ipc::CursorImagePayload::kSize, pixels,
+                static_cast<size_t>(srcW) * srcH * 4u);
+    link_->appendFrame(ipc::FrameKind::CursorImage, buf.data(), buf.size());
+    link_->flush();
+}
+
+void Compositor::sendCursorImageShm(uint32_t outputId, uint32_t poolId,
+                                    uint32_t offset, uint32_t stride,
+                                    uint32_t srcW, uint32_t srcH,
+                                    uint32_t dstW, uint32_t dstH) {
+    if (headless_ || !link_) return;
+    ipc::CursorImageShmPayload pl{};
+    pl.outputId  = outputId;
+    pl.poolId    = poolId;
+    pl.offset    = offset;
+    pl.stride    = stride;
+    pl.srcWidth  = srcW;
+    pl.srcHeight = srcH;
+    pl.dstWidth  = dstW;
+    pl.dstHeight = dstH;
+    uint8_t buf[ipc::CursorImageShmPayload::kSize];
+    pl.encode(buf);
+    link_->appendFrame(ipc::FrameKind::CursorImageShm, buf, sizeof(buf));
+    link_->flush();
+}
+
+void Compositor::sendCursorState(uint32_t outputId, int32_t x, int32_t y,
+                                 bool visible, bool commitNow) {
+    if (headless_ || !link_) return;
+    ipc::CursorStatePayload pl{};
+    pl.outputId  = outputId;
+    pl.x         = x;
+    pl.y         = y;
+    pl.visible   = visible ? 1 : 0;
+    pl.commitNow = commitNow ? 1 : 0;
+    uint8_t buf[ipc::CursorStatePayload::kSize];
+    pl.encode(buf);
+    link_->appendFrame(ipc::FrameKind::CursorState, buf, sizeof(buf));
     link_->flush();
 }
 

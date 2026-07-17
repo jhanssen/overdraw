@@ -592,6 +592,33 @@ Cursor compositing end-to-end: `wl_pointer.set_cursor` +
 `wp_cursor_shape_v1` route through the compositor's software cursor
 slot above all layers; see "Cursor system" via `status-detailed.md`.
 
+**Hardware cursor (KMS cursor plane):** on KMS, each output with a
+reachable `DRM_PLANE_TYPE_CURSOR` plane scans the cursor out of that
+plane instead of the composite pass (`cursor.hardware` config knob,
+default true). The image ships to the GPU process once per change
+(inline BGRA for theme cursors, pool-reference for client shm cursor
+surfaces — `FrameKind::CursorImage`/`CursorImageShm`); pointer motion
+sends a plane-position update (`CursorState`) with no output damage,
+so moving the mouse over an idle desktop issues zero drawcalls — the
+GPU process folds the position into the next frame commit or, when no
+render is coming, issues a cursor-only atomic commit itself
+(serialized against frame flips; a present arriving mid-cursor-flip is
+stashed and issued from that flip's event). Per-output software
+fallback (`CursorPlaneStatus` ok=0) covers: no plane, image larger
+than the cursor FB (`DRM_CAP_CURSOR_WIDTH/HEIGHT`), dmabuf/GPU-texture
+cursor images (no CPU bytes to ship), nested mode, and runtime commit
+rejection (the frame retries without the plane and demotes). Cursor
+FBs are linear ARGB8888 dumb buffers, ping-ponged per image change;
+hotspot is baked into the plane position core-side. Theme cursors are
+resolved at scale 1 and scaled to device size GPU-process-side
+(bilinear), so scale>1 sharpness matches the software path; client
+cursors with bufferScale == output scale ship 1:1. Verified on
+bare-metal KMS (Intel, 3440x1440@60, 256x256 cursor FB): smooth
+plane-driven motion, theme shape changes, and client `set_cursor`
+surfaces (Chrome arrow/I-beam). Nested tests cover the fallback and
+the core routing: `test/cursor.gpu.mjs` "hardware cursor plane
+routing".
+
 **Limitations:** touch not forwarded; no key-repeat generation
 (repeat_info sent, client repeats); libinput backend ignores
 hotplug device add/remove.
@@ -710,10 +737,12 @@ transform with a `wp_viewport` source crop is not spec-exact (crop
 composed after transform rather than in pre-transform surface
 coords); transform-alone and crop-alone are correct.
 
-**Known gaps:** software cursor correct-size but soft at scale>1
-(internal cursor only passes scale 1); scale-aware-subsurface render
-path covered at the protocol layer but not by a GPU test; nested
-mode does not auto-derive scale (config only).
+**Known gaps:** the cursor is correct-size but soft at scale>1 on
+both paths (theme images resolve at scale 1; the software slot
+upscales at composite, the hardware plane upscales at image-install —
+resolving per-output-scale theme images would fix both); scale-aware-
+subsurface render path covered at the protocol layer but not by a GPU
+test; nested mode does not auto-derive scale (config only).
 
 ## Protocols
 

@@ -394,6 +394,39 @@ class Compositor {
     // compositor would strand the damage until an unrelated event (input,
     // another output's flip) happens to run a frame.
     bool hasShmUploadAcks() const { return !shmUploadAcks_.empty(); }
+
+    // Hardware-cursor plane IPC (KMS outputs). The JS compositor calls the
+    // send methods only for outputs the GPU process reported a usable
+    // cursor plane on (CursorPlaneStatus ok=1). Image pixels are
+    // premultiplied BGRA; the shm variant references a pool the GPU
+    // process already has mapped (RegisterShmPool), so no bulk copy
+    // crosses this boundary. x/y in sendCursorState are device pixels
+    // relative to the output, hotspot pre-applied.
+    void sendCursorImage(uint32_t outputId, const uint8_t* pixels,
+                         uint32_t srcW, uint32_t srcH,
+                         uint32_t dstW, uint32_t dstH);
+    void sendCursorImageShm(uint32_t outputId, uint32_t poolId,
+                            uint32_t offset, uint32_t stride,
+                            uint32_t srcW, uint32_t srcH,
+                            uint32_t dstW, uint32_t dstH);
+    void sendCursorState(uint32_t outputId, int32_t x, int32_t y,
+                         bool visible, bool commitNow);
+
+    // Per-output hardware-cursor availability messages from the GPU
+    // process, drained by the addon's poll handlers into the JS
+    // onCursorPlaneStatus callback.
+    struct CursorPlaneStatusMsg {
+        uint32_t outputId = 0;
+        uint32_t maxWidth = 0;
+        uint32_t maxHeight = 0;
+        bool ok = false;
+    };
+    std::vector<CursorPlaneStatusMsg> takeCursorPlaneStatuses() {
+        std::vector<CursorPlaneStatusMsg> out;
+        out.swap(pendingCursorPlaneStatus_);
+        return out;
+    }
+    bool hasCursorPlaneStatuses() const { return !pendingCursorPlaneStatus_.empty(); }
     // Destroy a plugin ring slot's surfaceBuf on the GPU process + reclaim the
     // core-side reservation/status. Caller gates on the consumer GPU read completing.
     void releaseSurfaceBuf(uint32_t surfaceBufId);
@@ -750,6 +783,9 @@ class Compositor {
     // drains via takeShmUploadAcks() inside dispatchFrameCallbacks.
     uint32_t nextShmUploadSeq_ = 1;
     std::vector<uint32_t> shmUploadAcks_;
+    // CursorPlaneStatus frames buffered between wire pumps; drained by the
+    // addon into the JS onCursorPlaneStatus callback.
+    std::vector<CursorPlaneStatusMsg> pendingCursorPlaneStatus_;
 
     uint32_t windowWidth_ = 0;
     uint32_t windowHeight_ = 0;

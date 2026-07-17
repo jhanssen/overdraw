@@ -925,6 +925,142 @@ struct ResizeShmPoolPayload {
 static_assert(ResizeShmPoolPayload::kSize == 16,
               "ResizeShmPoolPayload size mismatch with hand-counted layout");
 
+// CursorImagePayload (core -> gpu; FrameKind::CursorImage): fixed header,
+// followed inline by srcWidth*srcHeight*4 bytes of premultiplied BGRA
+// pixels (tightly packed, stride == srcWidth*4). dstWidth/dstHeight are
+// the device-pixel dims the image should occupy on the cursor plane; when
+// they differ from the src dims the GPU process scales during the copy
+// into the cursor bo. The frame's total payload length is
+// kSize + srcWidth*srcHeight*4.
+struct CursorImagePayload {
+    uint32_t outputId;
+    uint32_t srcWidth;
+    uint32_t srcHeight;
+    uint32_t dstWidth;
+    uint32_t dstHeight;
+    static constexpr size_t kSize = 5 * 4;  // 20 (header only; pixels follow)
+    void encode(uint8_t* out) const {
+        putU32LE(out + 0,  outputId);
+        putU32LE(out + 4,  srcWidth);
+        putU32LE(out + 8,  srcHeight);
+        putU32LE(out + 12, dstWidth);
+        putU32LE(out + 16, dstHeight);
+    }
+    static CursorImagePayload decode(const uint8_t* p) {
+        CursorImagePayload r{};
+        r.outputId  = getU32LE(p + 0);
+        r.srcWidth  = getU32LE(p + 4);
+        r.srcHeight = getU32LE(p + 8);
+        r.dstWidth  = getU32LE(p + 12);
+        r.dstHeight = getU32LE(p + 16);
+        return r;
+    }
+};
+static_assert(CursorImagePayload::kSize == 20,
+              "CursorImagePayload size mismatch with hand-counted layout");
+
+// CursorImageShmPayload (core -> gpu; FrameKind::CursorImageShm): the
+// cursor pixels live at poolId/offset in an shm pool the GPU process has
+// mapped (RegisterShmPool). stride is in bytes; the pixel format is the
+// client buffer's BGRA/XRGB-as-sampled (premultiplied where the client
+// says so -- cursor images are conventionally ARGB8888 premultiplied).
+struct CursorImageShmPayload {
+    uint32_t outputId;
+    uint32_t poolId;
+    uint32_t offset;
+    uint32_t stride;
+    uint32_t srcWidth;
+    uint32_t srcHeight;
+    uint32_t dstWidth;
+    uint32_t dstHeight;
+    static constexpr size_t kSize = 8 * 4;  // 32
+    void encode(uint8_t* out) const {
+        putU32LE(out + 0,  outputId);
+        putU32LE(out + 4,  poolId);
+        putU32LE(out + 8,  offset);
+        putU32LE(out + 12, stride);
+        putU32LE(out + 16, srcWidth);
+        putU32LE(out + 20, srcHeight);
+        putU32LE(out + 24, dstWidth);
+        putU32LE(out + 28, dstHeight);
+    }
+    static CursorImageShmPayload decode(const uint8_t* p) {
+        CursorImageShmPayload r{};
+        r.outputId  = getU32LE(p + 0);
+        r.poolId    = getU32LE(p + 4);
+        r.offset    = getU32LE(p + 8);
+        r.stride    = getU32LE(p + 12);
+        r.srcWidth  = getU32LE(p + 16);
+        r.srcHeight = getU32LE(p + 20);
+        r.dstWidth  = getU32LE(p + 24);
+        r.dstHeight = getU32LE(p + 28);
+        return r;
+    }
+};
+static_assert(CursorImageShmPayload::kSize == 32,
+              "CursorImageShmPayload size mismatch with hand-counted layout");
+
+// CursorStatePayload (core -> gpu; FrameKind::CursorState): cursor plane
+// position + visibility for one output. x/y are device pixels relative to
+// the output's top-left, already hotspot-adjusted (negative = cursor
+// straddles the top/left edge). commitNow=1: no ScanoutPresent is coming
+// for this output, so the GPU process should issue a cursor-only atomic
+// commit itself.
+struct CursorStatePayload {
+    uint32_t outputId;
+    int32_t  x;
+    int32_t  y;
+    uint8_t  visible;
+    uint8_t  commitNow;
+    static constexpr size_t kSize = 3 * 4 + 2;  // 14
+    void encode(uint8_t* out) const {
+        putU32LE(out + 0, outputId);
+        putI32LE(out + 4, x);
+        putI32LE(out + 8, y);
+        out[12] = visible;
+        out[13] = commitNow;
+    }
+    static CursorStatePayload decode(const uint8_t* p) {
+        CursorStatePayload r{};
+        r.outputId  = getU32LE(p + 0);
+        r.x         = getI32LE(p + 4);
+        r.y         = getI32LE(p + 8);
+        r.visible   = p[12];
+        r.commitNow = p[13];
+        return r;
+    }
+};
+static_assert(CursorStatePayload::kSize == 14,
+              "CursorStatePayload size mismatch with hand-counted layout");
+
+// CursorPlaneStatusPayload (gpu -> core; FrameKind::CursorPlaneStatus):
+// ok=1 with the device's cursor buffer dims when outputId has a usable
+// hardware cursor plane; ok=0 when it doesn't (no plane, or a runtime
+// commit rejection demoted the output back to software cursor).
+struct CursorPlaneStatusPayload {
+    uint32_t outputId;
+    uint32_t maxWidth;
+    uint32_t maxHeight;
+    uint8_t  ok;
+    static constexpr size_t kSize = 3 * 4 + 1;  // 13
+    void encode(uint8_t* out) const {
+        putU32LE(out + 0, outputId);
+        putU32LE(out + 4, maxWidth);
+        putU32LE(out + 8, maxHeight);
+        out[12] = ok;
+    }
+    static CursorPlaneStatusPayload decode(const uint8_t* p) {
+        CursorPlaneStatusPayload r{};
+        r.outputId  = getU32LE(p + 0);
+        r.maxWidth  = getU32LE(p + 4);
+        r.maxHeight = getU32LE(p + 8);
+        r.ok        = p[12];
+        return r;
+    }
+};
+static_assert(CursorPlaneStatusPayload::kSize == 13,
+              "CursorPlaneStatusPayload size mismatch with hand-counted layout");
+
 // AllocShmTexPayload (core -> gpu; FrameKind::AllocShmTex):
 // the core wire-client has ReserveTexture'd a wire handle for a
 // sampleable BGRA8 texture sized to the current shm buffer. The GPU

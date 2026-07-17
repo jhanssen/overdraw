@@ -207,6 +207,57 @@ When the host pointer leaves the overdraw window (host wayland seat sends
 leave to the GPU process), the cursor hides via `setCursorVisible(false)`.
 On re-enter, restored to current state.
 
+## Hardware cursor (KMS cursor plane)
+
+On KMS, the software slot above is the *fallback*; the default path
+scans the cursor out of each output's DRM cursor plane, so pointer
+motion costs a plane-position update instead of a recomposite. Config
+gate: `cursor.hardware` (default true).
+
+Division of labor:
+
+- **GPU process** (`kms_output.*`): picks a `DRM_PLANE_TYPE_CURSOR`
+  plane per CRTC at connect (best-effort; exclusion-shared across
+  outputs), allocates two cap-sized (`DRM_CAP_CURSOR_WIDTH/HEIGHT`)
+  linear ARGB8888 dumb-buffer FBs per output (ping-ponged per image
+  change so the latched FB is never written), and folds the desired
+  cursor state into **every** frame commit. When the core flags a
+  state update `commitNow` (no render coming), it issues a cursor-only
+  atomic commit (`PAGE_FLIP_EVENT | NONBLOCK`), serialized against
+  frame flips: while any flip is in flight the state just sits dirty
+  (picked up by the next commit or that flip's completion event), and
+  a present arriving while a cursor-only flip is pending is stashed
+  and issued from that flip's event. Cursor-only flip events never
+  feed the frame clock. On a commit TEST rejection attributable to the
+  cursor plane, the frame retries without it and the output demotes to
+  software (`CursorPlaneStatus` ok=0).
+- **Core** (`compositor.ts`): receives per-output plane availability
+  (`CursorPlaneStatus`), ships the image on every install
+  (`CursorImage` with inline BGRA bytes for theme/CPU cursors;
+  `CursorImageShm` referencing the already-GPU-mapped wl_shm pool for
+  client cursor surfaces — the GPU process copies out on receipt, and
+  wire FIFO orders the copy before any buffer release), and on cursor
+  movement marks state stale instead of damaging hw-cursor outputs
+  (the damage-map `exclude` set). `renderFrame` flushes plane
+  positions once per pass after the render set is known: outputs about
+  to present get `commitNow=false` (the present carries the state);
+  clean outputs get `commitNow=true`. Positions are device pixels
+  relative to the output with the hotspot pre-applied (aquamarine-
+  style: no HOTSPOT props); dst dims are scaled GPU-process-side
+  (bilinear) when image scale != output scale.
+
+Per-output fallback to the software slot whenever the plane can't
+serve: no cursor plane on the CRTC, image larger than the cursor FB,
+dmabuf or device-texture cursor images (no CPU/pool bytes to ship),
+nested mode (no planes at all), or runtime demotion. Fallback flips
+the output back into `drawOrder` and repaints the cursor rect; the
+GPU process turns the plane off via the same commit machinery.
+
+Takeover interaction: our cursor planes are excluded from the
+foreign-plane disable sweep on the initial modeset, and the initial
+commit programs (or disables) the plane explicitly, so a previous DRM
+master's latched cursor image can never survive.
+
 ## `wl_pointer.set_cursor`
 
 End-to-end: the existing pointer enter flow already mints serials

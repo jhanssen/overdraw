@@ -180,6 +180,14 @@ export interface OverdrawConfig {
   // rule applies BEFORE the window is mapped. Function references (predicate
   // match / `apply`) survive because the plugin is in-thread.
   windowRules?: WindowRule[];
+  // Cursor. `hardware` (default true) scans the cursor out of each KMS
+  // output's cursor plane when the device has one, so pointer motion costs
+  // a plane-position update instead of a recomposite. Set false to force
+  // software cursor compositing everywhere (escape hatch for driver
+  // cursor-plane quirks). Ignored in nested mode (always software).
+  cursor?: {
+    hardware?: boolean;
+  };
 }
 
 // Handler signature for OverdrawConfig.actions entries.
@@ -313,6 +321,11 @@ export interface ResolvedConfig {
   // Window rules, verbatim from the user config (function refs preserved for
   // the in-thread plugin). Empty array when none declared.
   windowRules: WindowRule[];
+  // Cursor settings. `hardware` gates the KMS cursor-plane path (default
+  // true; false forces software cursor compositing on every output).
+  cursor: {
+    hardware: boolean;
+  };
   // Absolute path of the config file that was loaded, or null if none was found
   // (built-in defaults in effect).
   sourcePath: string | null;
