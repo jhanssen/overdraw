@@ -226,6 +226,21 @@ uint64_t Trampoline::clientIdOf(napi_value resourceHandle) {
     return reinterpret_cast<uint64_t>(wl_resource_get_client(resource));
 }
 
+int32_t Trampoline::clientPidOf(napi_value resourceHandle) {
+    napi_env env = env_;
+    napi_value ext;
+    if (napi_get_named_property(env, resourceHandle, "__resource", &ext) != napi_ok) return 0;
+    void* ptr = nullptr;
+    if (napi_get_value_external(env, ext, &ptr) != napi_ok || !ptr) return 0;
+    auto* resource = static_cast<wl_resource*>(ptr);
+    if (wrappers_.find(resource) == wrappers_.end()) return 0;
+    wl_client* client = wl_resource_get_client(resource);
+    if (!client) return 0;
+    pid_t pid = 0;
+    wl_client_get_credentials(client, &pid, nullptr, nullptr);
+    return static_cast<int32_t>(pid);
+}
+
 bool Trampoline::postError(napi_value resourceHandle, uint32_t code, const std::string& message) {
     napi_env env = env_;
     napi_value ext;

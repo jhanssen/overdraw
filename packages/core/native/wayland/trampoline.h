@@ -91,6 +91,9 @@ class Trampoline {
     // the same client (e.g. route input to the wl_pointer of the client owning
     // the focused wl_surface) without exposing wl_client to JS.
     uint64_t clientIdOf(napi_value resourceHandle);
+    // Peer process id of the client owning `resourceHandle`'s connection
+    // (SO_PEERCRED via wl_client_get_credentials). 0 on error.
+    int32_t clientPidOf(napi_value resourceHandle);
 
     // Drop a cached wrapper + mark the JS handle destroyed. Called from the
     // per-resource destroy listener.

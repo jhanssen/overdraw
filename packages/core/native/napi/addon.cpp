@@ -2260,6 +2260,18 @@ napi_value ClientId(napi_env env, napi_callback_info info) {
     return out;
 }
 
+// clientPid(resource) -> number : the peer PROCESS id of the client owning the
+// resource's connection (SO_PEERCRED). 0 on error. Used to recognize the
+// Xwayland connection (the compositor spawned it and knows its pid).
+napi_value ClientPid(napi_env env, napi_callback_info info) {
+    size_t argc = 1; napi_value argv[1];
+    napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+    if (argc < 1 || !g_addon.trampoline) { napi_value z; napi_create_double(env, 0, &z); return z; }
+    int32_t pid = g_addon.trampoline->clientPidOf(argv[0]);
+    napi_value out; napi_create_double(env, static_cast<double>(pid), &out);
+    return out;
+}
+
 // Build the singleton keymap if it doesn't exist yet. Both keymapInfo()
 // (a client binds wl_keyboard) and keyUpdate() (every host key-down) can
 // be the first caller -- the binding chain consults keysyms whether or
@@ -3272,6 +3284,7 @@ napi_value Init(napi_env env, napi_value exports) {
     reg("setPointerConfine", SetPointerConfine);
     reg("injectHostInput", InjectHostInput);
     reg("clientId", ClientId);
+    reg("clientPid", ClientPid);
     reg("destroyResource", DestroyResource);
     reg("postError", PostError);
     reg("keymapInfo", KeymapInfo);

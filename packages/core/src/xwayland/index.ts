@@ -28,6 +28,11 @@ export interface XwaylandConfig {
   // scan from :0 upward via -displayfd alone; the latter can collide with
   // an existing X session and is only appropriate for tests.
   displayNumber?: number;
+  // Invoked synchronously as soon as the fork returns, before Xwayland can
+  // have connected to the wayland socket. Lets the caller record the pid
+  // (state.xwaylandPid) so protocol paths can recognize the Xwayland
+  // connection from its very first bind.
+  onSpawn?: (pid: number) => void;
 }
 
 // Start Xwayland and resolve once it reports its X display. Rejects if the
@@ -65,6 +70,7 @@ export function startXwayland(addon: Addon, config: XwaylandConfig): Promise<Xwa
           resolve({ pid, wmFd, display: infoArg.display, displayNumber: infoArg.displayNumber });
         },
       );
+      config.onSpawn?.(pid);
     } catch (e) {
       reject(e instanceof Error ? e : new Error(String(e)));
     }

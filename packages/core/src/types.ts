@@ -176,6 +176,11 @@ export interface Addon {
   // events that destroy their target (wl_callback.done).
   destroyResource(resource: Resource): void;
   clientId(resource: Resource): number;
+  // Peer PROCESS id of the client owning the resource's connection
+  // (SO_PEERCRED). 0 on error. Identifies the Xwayland connection (the
+  // compositor spawned it and knows its pid) at bind time, before any
+  // X window exists.
+  clientPid(resource: Resource): number;
 
   // Keyboard: the ACTIVE keymap's memfd (as a WaylandFd) + format/size. The
   // active keymap is the default seat keymap unless setActiveKeymap() selected

@@ -211,3 +211,31 @@ test("reemitXdgOutput is a no-op when state.events is missing", () => {
   reemitXdgOutput(ctx.state, ctx.addon, 0);
   assert.deepEqual(ctx._calls, []);
 });
+
+// X-backed clients see an oversized world (logical * xwaylandScale). The
+// Xwayland server connection must be recognized by peer PID from its very
+// first bind: Xwayland builds its X screen / RandR view from the logical
+// size it sees at startup, before any X window has associated via
+// xwayland_shell_v1 (a fullscreen X client sizes itself to that RandR view;
+// an unscaled one renders at 1/N of the output).
+test("get_xdg_output scales logical dims for the Xwayland connection (pid match, pre-association)", () => {
+  const ctx = mockCtx(defaultRecord());
+  ctx.state.xwaylandScale = 2;
+  ctx.state.xwaylandPid = 4242;
+  ctx.addon.clientPid = () => 4242;   // the binding client IS Xwayland
+  // xwaylandClientIds deliberately absent: no X window has associated yet.
+  const mgr = makeXdgOutputManager(ctx);
+  mgr.get_xdg_output(mockResource("mgr", 3), mockResource("xdg", 3), mockResource("wl_output", 3));
+  assert.deepEqual(ctx._calls[0][1].x, 0);
+  assert.deepEqual(ctx._calls[1][1], { resource: ctx._calls[1][1].resource, w: 3840, h: 2160 });
+});
+
+test("get_xdg_output does not scale for non-Xwayland clients (pid mismatch)", () => {
+  const ctx = mockCtx(defaultRecord());
+  ctx.state.xwaylandScale = 2;
+  ctx.state.xwaylandPid = 4242;
+  ctx.addon.clientPid = () => 7;      // some other client
+  const mgr = makeXdgOutputManager(ctx);
+  mgr.get_xdg_output(mockResource("mgr", 3), mockResource("xdg", 3), mockResource("wl_output", 3));
+  assert.deepEqual(ctx._calls[1][1], { resource: ctx._calls[1][1].resource, w: 1920, h: 1080 });
+});

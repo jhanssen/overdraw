@@ -672,6 +672,13 @@ export interface CompositorState {
   // by xwaylandScale for those clients (they think in X device-pixel
   // coords). Populated by the xwayland_shell_v1 bind path.
   xwaylandClientIds?: Set<number>;
+  // Process id of the spawned Xwayland server. Set synchronously at fork,
+  // BEFORE Xwayland can connect -- xdg_output matches a binding client's
+  // peer pid against this to recognize the Xwayland connection at bind
+  // time. The xwayland_shell_v1 path above only fires when the first X
+  // window associates, which is too late: Xwayland builds its RandR view
+  // from the xdg_output logical size it sees at startup.
+  xwaylandPid?: number;
   // Narrow read-only view of the active XWM (when startXwm has run). Used by
   // query.titleAppId and the close path to look up X-backed windows by
   // surfaceId without taking a dep on the full Xwm shape. Cleared on

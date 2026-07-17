@@ -648,6 +648,7 @@ function stopXwaylandStack(): void {
     state.xwayland = undefined;
     state.overrideRedirects = undefined;
     state.xwaylandClientIds = undefined;
+    state.xwaylandPid = undefined;
   }
 }
 
@@ -664,24 +665,32 @@ async function startXwaylandStack(): Promise<void> {
   const st = state;
   if (!st) return;
   try {
-    const handle = await startXwayland(addon, {
-      waylandDisplay: sock,
-      enableWm: true,
-      terminate: config.xwayland.terminate,
-      displayNumber: config.xwayland.displayNumber,
-      ...(config.xwayland.xwaylandPath !== null
-        ? { xwaylandPath: config.xwayland.xwaylandPath }
-        : {}),
-    });
-    xwaylandHandle = handle;
-    // Freeze the global Xwayland scale for the session. See
-    // docs/xwayland-design.md "HiDPI".
+    // Freeze the global Xwayland scale BEFORE the spawn, and record the
+    // child pid synchronously at fork (onSpawn): Xwayland binds
+    // wl_output/xdg_output during its own startup -- before the ready
+    // callback resolves -- and xdg_output must already know both the
+    // scale and which connection is Xwayland's to advertise the
+    // oversized (scale-multiplied) logical size it builds its RandR
+    // screen from. A fullscreen X client sizes itself to that RandR
+    // view; an unscaled one makes it render at 1/N of the output.
+    // See docs/xwayland-design.md "HiDPI".
     const { resolveXwaylandScale } = await import("./xwayland/scale.js");
     st.xwaylandScale = resolveXwaylandScale(st, config.xwayland.scale);
     if (st.xwaylandScale !== 1) {
       log.info("core", `Xwayland scale = ${st.xwaylandScale} `
         + `(${config.xwayland.scale === 0 ? "auto" : "config"})`);
     }
+    const handle = await startXwayland(addon, {
+      waylandDisplay: sock,
+      enableWm: true,
+      terminate: config.xwayland.terminate,
+      displayNumber: config.xwayland.displayNumber,
+      onSpawn: (pid) => { st.xwaylandPid = pid; },
+      ...(config.xwayland.xwaylandPath !== null
+        ? { xwaylandPath: config.xwayland.xwaylandPath }
+        : {}),
+    });
+    xwaylandHandle = handle;
     xwm = startXwm(st, addon, handle.wmFd);
     // Selection bridge: mediates CLIPBOARD / PRIMARY between X clients
     // and wayland clients via wl_data_device / wp_primary_selection_v1.
