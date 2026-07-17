@@ -188,6 +188,12 @@ export interface OverdrawConfig {
   cursor?: {
     hardware?: boolean;
   };
+  // Direct scanout (default true): a solitary mode-sized opaque fullscreen
+  // client dmabuf is put on the KMS primary plane directly, skipping the
+  // composite pass (games, fullscreen video). Set false to always
+  // composite (escape hatch for driver plane quirks). Ignored in nested
+  // mode.
+  directScanout?: boolean;
 }
 
 // Handler signature for OverdrawConfig.actions entries.
@@ -326,6 +332,8 @@ export interface ResolvedConfig {
   cursor: {
     hardware: boolean;
   };
+  // Direct-scanout gate (default true; false always composites).
+  directScanout: boolean;
   // Absolute path of the config file that was loaded, or null if none was found
   // (built-in defaults in effect).
   sourcePath: string | null;

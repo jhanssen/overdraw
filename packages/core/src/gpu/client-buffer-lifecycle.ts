@@ -63,7 +63,15 @@ export type LifecycleEvent =
   // any owed releaseImport (a bufferDestroyed or surfaceRemoved-drain that
   // arrived while Importing) fires now via maybeFlush.
   | { kind: "importCompleted"; bufferId: number }
-  | { kind: "accessFailed"; bufferId: number; reason: string };
+  | { kind: "accessFailed"; bufferId: number; reason: string }
+  // Direct scanout: the buffer was handed to the display engine
+  // (scanoutPresented -> hold release) and later displaced by a
+  // subsequent flip (scanoutRetired -> the hold drops and any owed
+  // release drains). A scanned-out buffer is never GPU-sampled, so
+  // without the hold a supersede would release it while the display
+  // engine still reads it.
+  | { kind: "scanoutPresented"; bufferId: number }
+  | { kind: "scanoutRetired"; bufferId: number };
 
 export type LifecycleIntent =
   | { kind: "importBuffer"; bufferId: number; surfaceId: number; dims: { w: number; h: number } }
@@ -127,6 +135,10 @@ interface BufferRec {
   // (between frameSampled and the frame's submitted/aborted). Used to enforce
   // begin/end alternation (invariant 2).
   accessOpen: boolean;
+  // Held by the display engine (direct scanout): the buffer is latched on
+  // (or in a pending flip toward) a KMS plane. Blocks maybeFlush exactly
+  // like an inflight sampling serial; cleared by scanoutRetired.
+  scanoutHeld: boolean;
   // Memoized dims (for the importBuffer intent on the first sight of the
   // buffer; tests / executor don't need them after that).
   dims: { w: number; h: number };
@@ -172,6 +184,8 @@ export class ClientBufferLifecycle {
       case "surfaceRemoved": this.onSurfaceRemoved(event.surfaceId); break;
       case "importCompleted": this.onImportCompleted(event.bufferId); break;
       case "accessFailed": this.onAccessFailed(event.bufferId, event.reason); break;
+      case "scanoutPresented": this.onScanoutPresented(event.bufferId); break;
+      case "scanoutRetired": this.onScanoutRetired(event.bufferId); break;
     }
     return this.out;
   }
@@ -192,7 +206,7 @@ export class ClientBufferLifecycle {
         state: "Importing", currentSurfaceId: surfaceId, destroyed: false,
         releaseOwed: false, importOwed: false,
         chainFence: { kind: "none" }, pendingAcquireFence: { kind: "none" },
-        inflightSerials: new Set(), accessOpen: false, dims,
+        inflightSerials: new Set(), accessOpen: false, scanoutHeld: false, dims,
       };
       this.buffers.set(bufferId, b);
       this.out.push({ kind: "importBuffer", bufferId, surfaceId, dims });
@@ -443,6 +457,9 @@ export class ClientBufferLifecycle {
     if (!b) return;
     if (b.inflightSerials.size > 0) return;
     if (b.accessOpen) return;
+    if (b.scanoutHeld) return;            // the display engine reads the
+                                          // buffer (direct scanout); wait
+                                          // for scanoutRetired
     if (b.state === "Importing") return;  // wait for importCompleted: the
                                           // executor has no live import to
                                           // releaseImport against, and
@@ -458,6 +475,19 @@ export class ClientBufferLifecycle {
       this.out.push({ kind: "releaseImport", bufferId });
       this.buffers.delete(bufferId);
     }
+  }
+
+  private onScanoutPresented(bufferId: number): void {
+    const b = this.buffers.get(bufferId);
+    if (!b) return;
+    b.scanoutHeld = true;
+  }
+
+  private onScanoutRetired(bufferId: number): void {
+    const b = this.buffers.get(bufferId);
+    if (!b || !b.scanoutHeld) return;
+    b.scanoutHeld = false;
+    this.maybeFlush(bufferId);
   }
 
   // --- introspection (for tests) ---

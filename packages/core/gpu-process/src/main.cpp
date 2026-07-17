@@ -36,6 +36,10 @@
 
 #include <linux/dma-buf.h>
 
+extern "C" {
+#include <drm_fourcc.h>
+}
+
 #include "dawn/native/DawnNative.h"
 #include "dawn/wire/WireServer.h"
 #include "dawn/webgpu_cpp.h"
@@ -632,6 +636,39 @@ int run(int wireFd, int ctrlFd, int inputFd, bool headless,
         serializer.appendFrame(ipc::FrameKind::CursorPlaneStatus, buf, sizeof(buf));
     };
 
+    // Ship the dmabuf-feedback format-table indices whose (fourcc, modifier)
+    // this output's primary plane accepts -- the scanout tranche a
+    // fullscreen surface's per-surface feedback advertises. Also includes
+    // each scannable fourcc's DRM_FORMAT_MOD_INVALID sentinel entry so
+    // implicit-modifier allocators participate.
+    auto emitScanoutFormats = [&](uint32_t outputId) {
+        if (!kms) return;
+        const auto plane = kms->primaryPlaneFormatsAt(outputId);
+        const auto& table = alloc.formatTable();
+        std::unordered_set<uint32_t> planeFourccs;
+        auto planeHas = [&](uint32_t fmt, uint64_t mod) {
+            for (const auto& pf : plane) {
+                if (pf.fourcc == fmt && pf.modifier == mod) return true;
+            }
+            return false;
+        };
+        for (const auto& pf : plane) planeFourccs.insert(pf.fourcc);
+        ipc::ScanoutFormatsPayload p{};
+        p.outputId = outputId;
+        for (size_t i = 0; i < table.size(); ++i) {
+            const auto& e = table[i];
+            const bool match = e.modifier == DRM_FORMAT_MOD_INVALID
+                ? planeFourccs.count(e.format) != 0
+                : planeHas(e.format, e.modifier);
+            if (match) p.indices.push_back(static_cast<uint16_t>(i));
+        }
+        std::vector<uint8_t> buf(p.encodedSize());
+        p.encode(buf.data());
+        serializer.appendFrame(ipc::FrameKind::ScanoutFormats, buf.data(), buf.size());
+        std::printf("[gpu] sent ScanoutFormats outputId=%u count=%zu (of %zu table entries)\n",
+                    outputId, p.indices.size(), table.size());
+    };
+
     auto handleScanoutReserve = [&](const ipc::ScanoutReservePayload& p) -> bool {
         if (!kms) {
             std::fprintf(stderr,
@@ -659,6 +696,7 @@ int run(int wireFd, int ctrlFd, int inputFd, bool headless,
             std::printf("[gpu] kms scanout ready for output %u (3 slots injected)\n",
                         outputId);
             emitCursorPlaneStatus(outputId);
+            emitScanoutFormats(outputId);
         }
         return injectOk;
     };
@@ -1127,6 +1165,16 @@ int run(int wireFd, int ctrlFd, int inputFd, bool headless,
         bool accessOpen = false;
         bool everSampled = false; // initialized=false on first Begin, =true after
         wgpu::SharedFence lastEndFence;
+        // Retained import geometry so the buffer can be wrapped as a KMS FB
+        // for direct scanout (lazily, on the first ScanoutClientPresent).
+        uint32_t width = 0;
+        uint32_t height = 0;
+        uint32_t fourcc = 0;
+        uint64_t modifier = 0;
+        uint32_t planeOffset = 0;
+        uint32_t planeStride = 0;
+        uint32_t kmsFbId = 0;        // 0 = not (yet) wrapped
+        bool kmsFbRejected = false;  // AddFB2 refused; don't retry
     };
     std::unordered_map<uint32_t, ClientTex> clientTextures;
 
@@ -1535,6 +1583,12 @@ int run(int wireFd, int ctrlFd, int inputFd, bool headless,
             serializer.Flush();
             ct.fd = cb.fd;
             ct.generation = m.texture.generation;
+            ct.width = m.width;
+            ct.height = m.height;
+            ct.fourcc = m.drmFourcc;
+            ct.modifier = m.modifier;
+            ct.planeOffset = m.planeOffset;
+            ct.planeStride = m.planeStride;
             clientTextures[m.texture.id] = std::move(ct);
         } else {
             ::close(cb.fd);
@@ -2180,6 +2234,75 @@ int run(int wireFd, int ctrlFd, int inputFd, bool headless,
                 static_cast<unsigned>(kind));
             return;
         }
+        if (kind == ipc::FrameKind::ScanoutClientPresent
+            || kind == ipc::FrameKind::ScanoutClientPresentFence) {
+            const bool withFence = kind == ipc::FrameKind::ScanoutClientPresentFence;
+            int fenceFd = -1;
+            if (withFence) {
+                if (nfds != 1 || !fds) {
+                    std::fprintf(stderr,
+                        "[gpu] core wire: ScanoutClientPresentFence with nfds=%d\n", nfds);
+                    std::abort();
+                }
+                fenceFd = fds[0];
+            } else if (nfds != 0) {
+                std::fprintf(stderr,
+                    "[gpu] core wire: ScanoutClientPresent with nfds=%d (must be 0)\n", nfds);
+                std::abort();
+            }
+            if (frame.size() != ipc::ScanoutClientPresentPayload::kSize) {
+                std::fprintf(stderr,
+                    "[gpu] core wire: bad ScanoutClientPresent payload size %zu\n",
+                    frame.size());
+                std::abort();
+            }
+            auto p = ipc::ScanoutClientPresentPayload::decode(frame.data());
+            auto reject = [&]() {
+                ipc::ScanoutClientRejectPayload rj{};
+                rj.outputId = p.outputId;
+                rj.bufferId = p.bufferId;
+                uint8_t rb[ipc::ScanoutClientRejectPayload::kSize];
+                rj.encode(rb);
+                serializer.appendFrame(ipc::FrameKind::ScanoutClientReject,
+                                       rb, sizeof(rb));
+            };
+#if OVERDRAW_KMS
+            if (kms) {
+                auto it = clientTextures.find(p.textureId);
+                if (it == clientTextures.end()
+                    || it->second.generation != p.textureGeneration) {
+                    std::fprintf(stderr,
+                        "[gpu] ScanoutClientPresent: unknown texture {%u,%u}\n",
+                        p.textureId, p.textureGeneration);
+                    reject();
+                    if (fenceFd >= 0) ::close(fenceFd);
+                    return;
+                }
+                ClientTex& ct = it->second;
+                if (!ct.kmsFbRejected && ct.kmsFbId == 0) {
+                    ct.kmsFbId = kms->importClientFb(
+                        ct.fd, ct.width, ct.height, ct.fourcc, ct.modifier,
+                        ct.planeOffset, ct.planeStride);
+                    if (ct.kmsFbId == 0) ct.kmsFbRejected = true;
+                }
+                if (ct.kmsFbRejected
+                    || !kms->presentClientFbAt(p.outputId, ct.kmsFbId,
+                                               ct.width, ct.height,
+                                               p.bufferId, fenceFd)) {
+                    reject();
+                }
+                if (fenceFd >= 0) ::close(fenceFd);
+                return;
+            }
+#endif
+            // Nested/headless never advertises scanout; a present here is a
+            // protocol bug, but reject-and-continue keeps the core rendering.
+            std::fprintf(stderr,
+                "[gpu] core wire: ScanoutClientPresent with no kms backend\n");
+            reject();
+            if (fenceFd >= 0) ::close(fenceFd);
+            return;
+        }
         if (kind == ipc::FrameKind::ImportClientTex) {
             // In-band dmabuf import: FIFO-ordered with surrounding wire commands
             // so the just-Reserved texture slot at handle.id (which grew the wire
@@ -2244,6 +2367,11 @@ int run(int wireFd, int ctrlFd, int inputFd, bool headless,
                 (void)ct.mem.EndAccess(ct.tex, &endState);
                 ct.accessOpen = false;
             }
+#if OVERDRAW_KMS
+            // The buffer may still be latched on a plane (direct scanout);
+            // the FB is condemned and RmFB'd once a successor latches.
+            if (kms && ct.kmsFbId) kms->condemnClientFb(ct.kmsFbId);
+#endif
             if (ct.fd >= 0) ::close(ct.fd);
             clientTextures.erase(it);
             return;
@@ -2937,6 +3065,20 @@ int run(int wireFd, int ctrlFd, int inputFd, bool headless,
         // the cursor on this output from now on.
         kms->setCursorFallbackListener([&](uint32_t outputId) {
             emitCursorPlaneStatus(outputId);
+        });
+        // Client-scanout flips: pacing (frame callbacks / wp_presentation)
+        // + the retired buffer's release ride the wire to the core.
+        kms->setClientFlipListener([&](const gpu::KmsOutputBackend::ClientFlipInfo& f) {
+            ipc::ScanoutClientFlipPayload p{};
+            p.outputId        = f.outputId;
+            p.latchedBufferId = f.latchedBufferId;
+            p.retiredBufferId = f.retiredBufferId;
+            p.tvSec           = f.tvSec;
+            p.tvNsec          = f.tvNsec;
+            p.seq             = f.seq;
+            uint8_t buf[ipc::ScanoutClientFlipPayload::kSize];
+            p.encode(buf);
+            serializer.appendFrame(ipc::FrameKind::ScanoutClientFlip, buf, sizeof(buf));
         });
     }
 

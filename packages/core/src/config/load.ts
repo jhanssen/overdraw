@@ -267,6 +267,15 @@ function normalize(raw: unknown, path: string): ResolvedConfig {
     cursor = { hardware: c.hardware ?? true };
   }
 
+  // directScanout: boolean gate, default true.
+  let directScanout = true;
+  if (cfg.directScanout !== undefined) {
+    if (typeof cfg.directScanout !== "boolean") {
+      fail("`directScanout` must be a boolean", path);
+    }
+    directScanout = cfg.directScanout;
+  }
+
   // windowRules: structural array guarantee here; the bundled in-thread
   // window-rules plugin owns the per-rule schema (regex compilation, match /
   // float / apply shape) and validates each entry at init. Verbatim
@@ -281,7 +290,7 @@ function normalize(raw: unknown, path: string): ResolvedConfig {
   return {
     output, card, scale, outputsByKey,
     focus, hotkeys, decoration, layout, canvas, actions, plugins, xwayland, autostart,
-    windowRules, cursor,
+    windowRules, cursor, directScanout,
     sourcePath: path,
   };
 }
@@ -300,6 +309,7 @@ export async function loadConfig(explicit: string | null): Promise<ResolvedConfi
       autostart: [],
       windowRules: [],
       cursor: { hardware: true },
+      directScanout: true,
       sourcePath: null,
     };
   }

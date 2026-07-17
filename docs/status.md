@@ -653,6 +653,35 @@ loaded cursor -- which made GTK/emacs client-surface cursors render
 as fully transparent (invisible pointer). End-to-end coverage:
 `test/cursor-shm-resize.gpu.mjs` + `cursor-shm-resize-client`.
 
+### Direct scanout (KMS; landed, pending bare-metal verification)
+
+A solitary fullscreen client dmabuf goes straight onto the primary
+plane, skipping the composite pass (`docs/scanout-design.md`;
+`directScanout` config knob, default true, KMS only). Eligibility is
+re-evaluated per output per frame in `renderFrame` (draw list is
+exactly one surface; buffer dims == mode; alpha-less fourcc; no
+transform/viewport-crop/fx/shape/camera; hw-cursor or hidden cursor);
+the present rides `ScanoutClientPresent` naming the buffer by its wire
+texture handle — the GPU process already retains the dmabuf fd from
+import and lazily wraps it as a KMS FB (`AddFB2WithModifiers`,
+deferred `RmFB` until unlatched). Kernel refusals (`AddFB2` / atomic
+TEST) reject back to the core, which vetoes the (output, buffer) pair
+and composites. Flips report latched/retired bufferIds
+(`ScanoutClientFlip`): pacing (frame callbacks, wp_presentation) rides
+the ordinary flip-complete path; the retired buffer's release is gated
+on it — a scanned-out buffer holds `scanoutHeld` in the buffer
+lifecycle (it is never GPU-sampled, so `onSubmittedWorkDone` cannot
+gate it; this resolves drm-design.md "Open points" §1's deferral).
+Explicit-sync acquire points ride the present as `IN_FENCE_FD`
+(implicit-sync clients rely on the kernel's resv fences). Per-surface
+dmabuf feedback re-sends with a leading SCANOUT tranche (primary-plane
+formats ∩ the render table, shipped per output via `ScanoutFormats`)
+while a surface is fullscreen, steering clients toward scannable
+allocations. Enter/leave is per-frame: any overlay makes the output
+composite again (ring slots stay warm; the leave frame full-repaints).
+Lifecycle-hold coverage: `test/client-buffer-lifecycle.test.js`
+"scanout:" cases. The plane path itself needs bare-metal verification.
+
 ### dmabuf (verified)
 
 ARGB8888/XRGB8888 + LINEAR/INVALID advertised. `create_immed` builds

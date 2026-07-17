@@ -427,6 +427,48 @@ class Compositor {
         return out;
     }
     bool hasCursorPlaneStatuses() const { return !pendingCursorPlaneStatus_.empty(); }
+
+    // Direct scanout of client dmabufs (scanout-design.md). The present
+    // names the buffer by its importId (resolved to the wire texture
+    // handle the GPU process keys its retained fd by); acquireFenceFd >= 0
+    // is the explicit-sync acquire sync_file (ownership taken -- closed
+    // after the dup into the wire queue). Returns false when the import
+    // is unknown (caller falls back to compositing).
+    bool sendScanoutClientPresent(uint32_t outputId, uint32_t importId,
+                                  uint32_t bufferId, int acquireFenceFd);
+
+    // Client-scanout flips: pacing rides the ordinary flip-complete queue
+    // (the inbound handler pushes there too); these entries carry the
+    // latch/retire bookkeeping the JS buffer lifecycle needs.
+    struct ScanoutClientFlipMsg {
+        uint32_t outputId = 0;
+        uint32_t latchedBufferId = 0;
+        uint32_t retiredBufferId = 0;
+    };
+    std::vector<ScanoutClientFlipMsg> takeScanoutClientFlips() {
+        std::vector<ScanoutClientFlipMsg> out;
+        out.swap(pendingScanoutFlips_);
+        return out;
+    }
+    struct ScanoutClientRejectMsg {
+        uint32_t outputId = 0;
+        uint32_t bufferId = 0;
+    };
+    std::vector<ScanoutClientRejectMsg> takeScanoutClientRejects() {
+        std::vector<ScanoutClientRejectMsg> out;
+        out.swap(pendingScanoutRejects_);
+        return out;
+    }
+    bool hasScanoutClientEvents() const {
+        return !pendingScanoutFlips_.empty() || !pendingScanoutRejects_.empty();
+    }
+
+    // Format-table indices the named output's primary plane can scan out
+    // (the dmabuf-feedback scanout tranche). Empty when unknown.
+    std::vector<uint16_t> scanoutFormatIndicesFor(uint32_t outputId) const {
+        auto it = scanoutFormatIndices_.find(outputId);
+        return it == scanoutFormatIndices_.end() ? std::vector<uint16_t>{} : it->second;
+    }
     // Destroy a plugin ring slot's surfaceBuf on the GPU process + reclaim the
     // core-side reservation/status. Caller gates on the consumer GPU read completing.
     void releaseSurfaceBuf(uint32_t surfaceBufId);
@@ -786,6 +828,11 @@ class Compositor {
     // CursorPlaneStatus frames buffered between wire pumps; drained by the
     // addon into the JS onCursorPlaneStatus callback.
     std::vector<CursorPlaneStatusMsg> pendingCursorPlaneStatus_;
+    // Client-scanout events buffered between wire pumps.
+    std::vector<ScanoutClientFlipMsg> pendingScanoutFlips_;
+    std::vector<ScanoutClientRejectMsg> pendingScanoutRejects_;
+    // Per-output scanout-capable format-table indices (ScanoutFormats).
+    std::unordered_map<uint32_t, std::vector<uint16_t>> scanoutFormatIndices_;
 
     uint32_t windowWidth_ = 0;
     uint32_t windowHeight_ = 0;

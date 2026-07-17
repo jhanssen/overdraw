@@ -56,6 +56,7 @@ import { nextOutputPosition, durableKeyOf, formatRefreshHz } from "./output/arra
 import { reemitWlOutput } from "./protocols/wl_output.js";
 import { reemitXdgOutput } from "./protocols/zxdg_output_manager_v1.js";
 import { reemitFractionalScale } from "./protocols/wp_fractional_scale_manager_v1.js";
+import { reemitScanoutFeedback } from "./protocols/zwp_linux_dmabuf_v1.js";
 import { makeOnOutputAdded, makeOnOutputRemoved } from "./output/hotplug.js";
 import { WINDOW_EVENT } from "./events/types.js";
 import { createCompositorBus } from "./events/window-bus.js";
@@ -269,6 +270,19 @@ addon.setOnCursorPlaneStatus?.((m) => {
   if (m.ok) log.info("core", `hw cursor: output ${m.outputId} plane ${m.maxWidth}x${m.maxHeight}`);
   else log.info("core", `hw cursor: output ${m.outputId} software fallback`);
   compositor.setCursorPlaneStatus?.(m.outputId, m.ok, m.maxWidth, m.maxHeight);
+});
+
+// Direct scanout (KMS): config gate + the GPU process's flip/reject
+// routing. Frame pacing for scanout flips rides the ordinary
+// setOnFlipComplete path (the native side queues them there too).
+compositor.setDirectScanoutEnabled?.(config.directScanout
+  && backendOpts.backend === "kms");
+addon.setOnScanoutClientFlip?.((m) => {
+  compositor.handleScanoutClientFlip?.(m.outputId, m.latchedBufferId, m.retiredBufferId);
+});
+addon.setOnScanoutClientReject?.((m) => {
+  log.info("core", `scanout: output ${m.outputId} rejected buffer ${m.bufferId}; compositing`);
+  compositor.handleScanoutClientReject?.(m.outputId, m.bufferId);
 });
 
 // Install the built-in default cursor. The XCursor theme
@@ -586,6 +600,17 @@ pluginBus.subscribe("output.changed", (_name, payload) => {
   reemitWlOutput(state, outputId);
   reemitXdgOutput(state, addon, outputId);
   reemitFractionalScale(state);
+  reemitScanoutFeedback(state, addon);
+});
+
+// Fullscreen transitions retarget per-surface dmabuf feedback (the scanout
+// tranche leads while the surface is fullscreen on a scanout-capable
+// output). Keyed re-send: a committed event with no exclusive change is a
+// cheap no-op.
+pluginBus.subscribe(WINDOW_EVENT.committed, (_name, payload) => {
+  const changed = (payload as { changed?: string[] }).changed;
+  if (changed && !changed.includes("exclusive")) return;
+  reemitScanoutFeedback(state, addon);
 });
 
 // M7 hotplug handlers. Logic factored out into output/hotplug.ts so tests

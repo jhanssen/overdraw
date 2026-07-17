@@ -153,6 +153,56 @@ class KmsOutputBackend : public OutputBackend {
     using CursorFallbackCb = std::function<void(uint32_t outputId)>;
     void setCursorFallbackListener(CursorFallbackCb cb) { cursorFallbackListener_ = std::move(cb); }
 
+    // -------------------------------------------------------------------
+    // Direct scanout of client dmabufs (see scanout-design.md).
+    //
+    // A client buffer is imported once as a KMS FB (importClientFb) and
+    // then presented on an output's primary plane instead of a ring slot.
+    // Commits share the per-CRTC serialization with ring presents and
+    // cursor-only commits; a present arriving while another flip is in
+    // flight is stashed and issued from that flip's event.
+    // -------------------------------------------------------------------
+
+    // Wrap a client dmabuf as a KMS FB (drmModeAddFB2WithModifiers).
+    // Returns the fbId, or 0 when the kernel refuses the buffer (the
+    // caller reports not-scannable and the core composites it).
+    uint32_t importClientFb(int dmabufFd, uint32_t width, uint32_t height,
+                            uint32_t fourcc, uint64_t modifier,
+                            uint32_t offset, uint32_t stride);
+
+    // Put a client FB on outputId's primary plane. Returns false when the
+    // atomic TEST rejects it (caller emits ScanoutClientReject and the
+    // core composites; nothing was committed). bufferId is the core-side
+    // buffer key echoed through the flip listener.
+    bool presentClientFbAt(uint32_t outputId, uint32_t fbId,
+                           uint32_t width, uint32_t height,
+                           uint32_t bufferId, int inFenceFd);
+
+    // Mark a client FB for destruction. RmFB on a latched FB force-
+    // disables the plane, so condemned FBs are destroyed only once no
+    // output has them latched or pending (swept at flip events and
+    // teardown).
+    void condemnClientFb(uint32_t fbId);
+
+    // A page flip involving client scanout completed: latchedBufferId is
+    // the client buffer now on the plane (0 when a ring frame latched);
+    // retiredBufferId is the client buffer the flip displaced (0 = none).
+    struct ClientFlipInfo {
+        uint32_t outputId = 0;
+        uint32_t latchedBufferId = 0;
+        uint32_t retiredBufferId = 0;
+        uint64_t tvSec = 0;
+        uint32_t tvNsec = 0;
+        uint32_t seq = 0;
+    };
+    using ClientFlipCb = std::function<void(const ClientFlipInfo&)>;
+    void setClientFlipListener(ClientFlipCb cb) { clientFlipListener_ = std::move(cb); }
+
+    // The (format, modifier) set the output's PRIMARY plane advertises
+    // (IN_FORMATS). Used to build the dmabuf-feedback scanout tranche.
+    // Empty when the output is unknown or the property is absent.
+    std::vector<PlaneFormatModifier> primaryPlaneFormatsAt(uint32_t outputId) const;
+
     // VT-switch lifecycle. On pause(): drop any pending flip wait, reset every
     // ring slot to FREE on every output, clear each didInitialCommit so the
     // next post-resume present runs the ALLOW_MODESET path (the kernel has
@@ -248,10 +298,29 @@ class KmsOutputBackend : public OutputBackend {
         bool cursorCommitRequested = false;  // core asked for a cursor-only commit
         bool cursorFlipPending = false;      // cursor-only commit awaiting its event
         bool cursorDemoted = false;          // kernel rejected the plane; software now
-        // Present stashed because a cursor-only flip was in flight when it
-        // arrived; issued from that flip's event. Fence fd is owned here.
-        int stashedPresentSlot  = -1;
-        int stashedPresentFence = -1;
+
+        // Client direct scanout: which client FB/buffer is latched on the
+        // primary plane (0 = a ring frame is latched) and which is in a
+        // pending flip.
+        uint32_t latchedClientFbId  = 0;
+        uint32_t latchedClientBufId = 0;
+        uint32_t pendingClientFbId  = 0;
+        uint32_t pendingClientBufId = 0;
+        bool clientFlipPending = false;
+
+        // Present stashed because another flip was in flight when it
+        // arrived; issued from that flip's event. Either a ring slot
+        // (slotIdx >= 0) or a client FB (clientFbId != 0). Fence fd is
+        // owned here.
+        struct StashedPresent {
+            int slotIdx = -1;
+            uint32_t clientFbId = 0;
+            uint32_t clientBufId = 0;
+            uint32_t clientW = 0;
+            uint32_t clientH = 0;
+            int fence = -1;
+            bool valid = false;
+        } stashed;
     };
 
     // Page-flip C trampoline (libdrm calls back into this). The 5th argument is
@@ -269,8 +338,28 @@ class KmsOutputBackend : public OutputBackend {
     // Fill width/height/refresh/scale/transform/identity from one output.
     void describeFrom(const PerOutput& o, OutputDescriptorInfo& out) const;
 
-    // Present implementation operating on a given output.
-    bool presentOutputImpl(PerOutput& o, int slotIdx, int inFenceFd);
+    // Present implementation operating on a given output. Exactly one of
+    // slotIdx >= 0 (ring present) or clientFbId != 0 (client scanout
+    // present) is set; the client variant carries the buffer dims (for
+    // SRC_W/H) and the core-side bufferId for flip reporting.
+    bool presentOutputImpl(PerOutput& o, int slotIdx, int inFenceFd,
+                           uint32_t clientFbId = 0, uint32_t clientBufId = 0,
+                           uint32_t clientW = 0, uint32_t clientH = 0);
+
+    // Stash a present that cannot commit now (another flip in flight);
+    // replayed from that flip's completion event.
+    void stashPresent(PerOutput& o, int slotIdx, uint32_t clientFbId,
+                      uint32_t clientBufId, uint32_t clientW, uint32_t clientH,
+                      int inFenceFd);
+    // Issue the stashed present (if any). Called from flip events.
+    void replayStashedPresent(PerOutput& o);
+    // Emit the client-flip listener event + advance latched bookkeeping
+    // for a flip that latched `latchedFb`/`latchedBuf` (0/0 = ring frame),
+    // then sweep condemned FBs.
+    void noteLatch(PerOutput& o, uint32_t latchedFb, uint32_t latchedBuf,
+                   uint64_t tvSec, uint32_t tvNsec, uint32_t seq);
+    // RmFB every condemned FB no output has latched or pending.
+    void sweepCondemnedFbs();
 
     // Add the cursor plane's desired state to `req`: full props when
     // visible with a valid image, else FB_ID=0 + CRTC_ID=0 (plane off).
@@ -297,7 +386,7 @@ class KmsOutputBackend : public OutputBackend {
     void destroyCursorBos(PerOutput& o);
     // Drop any in-flight cursor-only flip + stashed present (VT pause,
     // mode switch, teardown).
-    void resetCursorFlipState(PerOutput& o);
+    void resetTransientFlipState(PerOutput& o);
 
     // Allocate the 3-slot scanout ring for one PerOutput against `device`.
     // Shared by initScanout (startup, every output) and initScanoutForOutput
@@ -344,6 +433,9 @@ class KmsOutputBackend : public OutputBackend {
     std::unordered_set<uint32_t> usedCrtcs_;
     FlipCompleteCb flipCompleteListener_;
     CursorFallbackCb cursorFallbackListener_;
+    ClientFlipCb clientFlipListener_;
+    // Client FBs waiting for a safe RmFB (not latched/pending anywhere).
+    std::vector<uint32_t> condemnedClientFbs_;
 };
 
 }  // namespace overdraw::gpu

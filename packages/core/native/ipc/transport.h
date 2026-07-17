@@ -300,6 +300,54 @@ enum class FrameKind : uint8_t {
                               // must software-composite the cursor for it
                               // (ok=0; also sent on runtime fallback, e.g.
                               // a cursor commit the kernel rejected).
+    ScanoutClientPresent = 29, // core -> gpu: put a CLIENT dmabuf directly
+                              // on outputId's primary plane (direct
+                              // scanout). The buffer is named by its wire
+                              // texture handle -- the GPU process retains
+                              // the dmabuf fd + dims/fourcc/modifier from
+                              // the ImportClientTex that introduced it, and
+                              // lazily builds/caches a KMS FB from them.
+                              // Wire-FIFO after that import by construction.
+                              // No fds; the explicit-sync variant is
+                              // ScanoutClientPresentFence (the FrameReader
+                              // learns fd counts from the kind, mirroring
+                              // BeginAccess / BeginAccessWithFence).
+                              // Payload: ScanoutClientPresentPayload.
+    ScanoutClientFlip = 30,   // gpu -> core: a page flip involving client
+                              // scanout completed. latchedBufferId is the
+                              // client buffer now on the plane (0 when a
+                              // composite/ring frame latched); retired-
+                              // BufferId is the client buffer the flip
+                              // displaced (0 = none) -- the core releases
+                              // it (the display engine no longer reads
+                              // it). Carries the kernel flip timestamp +
+                              // vsync seq for frame-callback pacing and
+                              // wp_presentation. Ring-slot flips continue
+                              // to ride ScanoutFlipComplete on ctrl; a
+                              // composite flip that retires a client
+                              // buffer emits BOTH.
+    ScanoutClientReject = 31, // gpu -> core: AddFB2 or the atomic TEST
+                              // refused this buffer for this output. The
+                              // core repaints via the composite path and
+                              // vetoes further scanout attempts for the
+                              // (outputId, bufferId) pair. Payload:
+                              // outputId + bufferId.
+    ScanoutFormats = 32,      // gpu -> core: indices into the dmabuf-
+                              // feedback format table whose (fourcc,
+                              // modifier) the named output's PRIMARY plane
+                              // accepts (the scanout tranche subset).
+                              // Emitted after ring init, alongside
+                              // CursorPlaneStatus. Payload:
+                              // ScanoutFormatsPayload (outputId + u16
+                              // index list).
+    ScanoutClientPresentFence = 33, // core -> gpu: ScanoutClientPresent
+                              // with exactly ONE SCM_RIGHTS fd -- the
+                              // explicit-sync acquire sync_file, attached
+                              // to the commit as IN_FENCE_FD. Distinct
+                              // kind so the FrameReader claims the fd
+                              // (same reason BeginAccessWithFence is
+                              // distinct from BeginAccess). Same payload
+                              // as ScanoutClientPresent.
 };
 
 // Max fds attachable in one message (control msg OR in-band wire frame).
@@ -688,6 +736,7 @@ class FrameReader {
         if (kind == FrameKind::ImportClientTex) expect = 1;
         if (kind == FrameKind::BeginAccessWithFence) expect = 1;
         if (kind == FrameKind::RegisterShmPool) expect = 1;
+        if (kind == FrameKind::ScanoutClientPresentFence) expect = 1;
         if (expect > 0) {
             if (static_cast<int>(recvFds_.size()) < expect) {
                 std::fprintf(stderr,

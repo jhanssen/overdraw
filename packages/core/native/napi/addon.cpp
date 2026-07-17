@@ -146,6 +146,9 @@ struct Addon {
     napi_ref onFlipComplete = nullptr;  // optional JS callback(outputId) for KMS flip-completes
     napi_ref onCursorPlaneStatus = nullptr;  // optional JS callback({outputId, ok, maxWidth,
                                              // maxHeight}) for hw-cursor availability
+    napi_ref onScanoutClientFlip = nullptr;   // optional JS callback({outputId,
+                                              // latchedBufferId, retiredBufferId})
+    napi_ref onScanoutClientReject = nullptr; // optional JS callback({outputId, bufferId})
     uint64_t lastNotified = 0;
 
     // Host-side reader for the GPU process's log socket. Started after
@@ -586,6 +589,7 @@ void fireOutputsAdded(napi_env env);
 void fireOutputsRemoved(napi_env env);
 void fireOutputModes(napi_env env);
 void fireCursorPlaneStatuses(napi_env env);
+void fireScanoutClientEvents(napi_env env);
 
 // Arm the wire poll for READABLE always, plus WRITABLE iff outbound wire bytes
 // are queued (so we get told when the socket can take more). Call after anything
@@ -651,6 +655,7 @@ void onWireReadable(uv_poll_t*, int status, int events) {
         // already-created state.outputs entry.
         fireOutputModes(g_addon.env);
         fireCursorPlaneStatuses(g_addon.env);
+        fireScanoutClientEvents(g_addon.env);
         // drainCtrl above may have consumed plugin-broker replies (alloc/begin/...);
         // advance them here too, else they are stranded (see advanceAllPending).
         advanceAllPending(g_addon.env);
@@ -685,6 +690,7 @@ void onCtrlReadable(uv_poll_t*, int status, int events) {
         fireOutputsAdded(g_addon.env);
         fireOutputModes(g_addon.env);
         fireCursorPlaneStatuses(g_addon.env);
+        fireScanoutClientEvents(g_addon.env);
         advanceAllPending(g_addon.env);
         if (g_addon.compositor->takeFrameComplete()) onFrameComplete();
         if (g_addon.compositor->hasShmUploadAcks()) wake();  // see onWireReadable
@@ -1573,6 +1579,52 @@ void fireCursorPlaneStatuses(napi_env env) {
     napi_close_handle_scope(env, scope);
 }
 
+// Drain queued client-scanout events (flips with latch/retire pairs and
+// rejections) into their JS callbacks.
+void fireScanoutClientEvents(napi_env env) {
+    if (!g_addon.compositor) return;
+    if (!g_addon.compositor->hasScanoutClientEvents()) return;
+    napi_handle_scope scope;
+    napi_open_handle_scope(env, &scope);
+    napi_value undefined;
+    napi_get_undefined(env, &undefined);
+    if (g_addon.onScanoutClientFlip) {
+        auto flips = g_addon.compositor->takeScanoutClientFlips();
+        if (!flips.empty()) {
+            napi_value cb;
+            napi_get_reference_value(env, g_addon.onScanoutClientFlip, &cb);
+            for (const auto& f : flips) {
+                napi_value obj, v;
+                napi_create_object(env, &obj);
+                napi_create_uint32(env, f.outputId, &v);
+                napi_set_named_property(env, obj, "outputId", v);
+                napi_create_uint32(env, f.latchedBufferId, &v);
+                napi_set_named_property(env, obj, "latchedBufferId", v);
+                napi_create_uint32(env, f.retiredBufferId, &v);
+                napi_set_named_property(env, obj, "retiredBufferId", v);
+                napi_call_function(env, undefined, cb, 1, &obj, nullptr);
+            }
+        }
+    }
+    if (g_addon.onScanoutClientReject) {
+        auto rejects = g_addon.compositor->takeScanoutClientRejects();
+        if (!rejects.empty()) {
+            napi_value cb;
+            napi_get_reference_value(env, g_addon.onScanoutClientReject, &cb);
+            for (const auto& r : rejects) {
+                napi_value obj, v;
+                napi_create_object(env, &obj);
+                napi_create_uint32(env, r.outputId, &v);
+                napi_set_named_property(env, obj, "outputId", v);
+                napi_create_uint32(env, r.bufferId, &v);
+                napi_set_named_property(env, obj, "bufferId", v);
+                napi_call_function(env, undefined, cb, 1, &obj, nullptr);
+            }
+        }
+    }
+    napi_close_handle_scope(env, scope);
+}
+
 // Drain queued OutputModes messages and invoke the JS onOutputModes
 // callback per output. Each call carries { outputId, modes: [{ width,
 // height, refreshMhz, preferred }] }. Same Node thread; same pattern
@@ -1748,6 +1800,56 @@ napi_value SendCursorState(napi_env env, napi_callback_info info) {
     napi_get_value_bool(env, argv[4], &commitNow);
     g_addon.compositor->sendCursorState(outputId, x, y, visible, commitNow);
     return nullptr;
+}
+
+// sendScanoutClientPresent(outputId, importId, bufferId, fence?: WaylandFd|null)
+// -> boolean. Put the imported client dmabuf on the output's primary plane
+// (direct scanout). The optional fence is the explicit-sync acquire
+// sync_file (consumed). false = the frame was not queued (unknown import);
+// the caller composites instead.
+napi_value SendScanoutClientPresent(napi_env env, napi_callback_info info) {
+    size_t argc = 4; napi_value argv[4];
+    napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+    napi_value fals;
+    napi_get_boolean(env, false, &fals);
+    if (!g_addon.compositor || argc < 3) return fals;
+    uint32_t outputId = 0, importId = 0, bufferId = 0;
+    napi_get_value_uint32(env, argv[0], &outputId);
+    napi_get_value_uint32(env, argv[1], &importId);
+    napi_get_value_uint32(env, argv[2], &bufferId);
+    int fenceFd = -1;
+    if (argc >= 4) {
+        napi_valuetype t;
+        napi_typeof(env, argv[3], &t);
+        if (t != napi_null && t != napi_undefined) {
+            fenceFd = overdraw::wayland::takeWaylandFd(env, argv[3]);
+        }
+    }
+    const bool ok = g_addon.compositor->sendScanoutClientPresent(
+        outputId, importId, bufferId, fenceFd);
+    napi_value out;
+    napi_get_boolean(env, ok, &out);
+    return out;
+}
+
+// scanoutFormatIndices(outputId) -> number[]. The dmabuf-feedback format-
+// table indices the output's primary plane can scan out (the scanout
+// tranche). Empty array when unknown / nested.
+napi_value ScanoutFormatIndices(napi_env env, napi_callback_info info) {
+    size_t argc = 1; napi_value argv[1];
+    napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+    napi_value arr;
+    napi_create_array(env, &arr);
+    if (!g_addon.compositor || argc < 1) return arr;
+    uint32_t outputId = 0;
+    napi_get_value_uint32(env, argv[0], &outputId);
+    const auto idx = g_addon.compositor->scanoutFormatIndicesFor(outputId);
+    for (size_t i = 0; i < idx.size(); ++i) {
+        napi_value v;
+        napi_create_uint32(env, idx[i], &v);
+        napi_set_element(env, arr, static_cast<uint32_t>(i), v);
+    }
+    return arr;
 }
 
 // gpuRenderNode() -> string. The /dev/dri/renderD* node the GPU process opened
@@ -2129,6 +2231,14 @@ napi_value Stop(napi_env env, napi_callback_info) {
     if (g_addon.onCursorPlaneStatus) {
         napi_delete_reference(env, g_addon.onCursorPlaneStatus);
         g_addon.onCursorPlaneStatus = nullptr;
+    }
+    if (g_addon.onScanoutClientFlip) {
+        napi_delete_reference(env, g_addon.onScanoutClientFlip);
+        g_addon.onScanoutClientFlip = nullptr;
+    }
+    if (g_addon.onScanoutClientReject) {
+        napi_delete_reference(env, g_addon.onScanoutClientReject);
+        g_addon.onScanoutClientReject = nullptr;
     }
     // Release the keymaps. The default is built on demand by ensureKeymap()
     // from either keymapInfo (client wl_keyboard bind) or keyUpdate (host
@@ -2544,6 +2654,26 @@ napi_value SetOnCursorPlaneStatus(napi_env env, napi_callback_info info) {
     // the wire right after each ScanoutReady); fire them into the
     // freshly-registered callback.
     fireCursorPlaneStatuses(env);
+    napi_value u; napi_get_undefined(env, &u); return u;
+}
+
+// setOnScanoutClientFlip(cb) -> undefined
+// Register a JS callback fired per direct-scanout page flip:
+// { outputId, latchedBufferId, retiredBufferId }. The retired buffer is
+// no longer read by the display engine -- the JS buffer lifecycle
+// releases it. Pacing (frame callbacks / wp_presentation) rides the
+// ordinary onFlipComplete callback. Pass null/omit to clear.
+napi_value SetOnScanoutClientFlip(napi_env env, napi_callback_info info) {
+    replaceCallbackRef(env, info, g_addon.onScanoutClientFlip);
+    napi_value u; napi_get_undefined(env, &u); return u;
+}
+
+// setOnScanoutClientReject(cb) -> undefined
+// Register a JS callback fired when the GPU process refuses to scan out a
+// buffer ({ outputId, bufferId }): the core repaints through the composite
+// path and vetoes the pair. Pass null/omit to clear.
+napi_value SetOnScanoutClientReject(napi_env env, napi_callback_info info) {
+    replaceCallbackRef(env, info, g_addon.onScanoutClientReject);
     napi_value u; napi_get_undefined(env, &u); return u;
 }
 
@@ -3446,6 +3576,10 @@ napi_value Init(napi_env env, napi_value exports) {
     reg("sendCursorImage", SendCursorImage);
     reg("sendCursorImageShm", SendCursorImageShm);
     reg("sendCursorState", SendCursorState);
+    reg("setOnScanoutClientFlip", SetOnScanoutClientFlip);
+    reg("setOnScanoutClientReject", SetOnScanoutClientReject);
+    reg("sendScanoutClientPresent", SendScanoutClientPresent);
+    reg("scanoutFormatIndices", ScanoutFormatIndices);
     reg("reserveScanoutForOutput", ReserveScanoutForOutput);
     reg("releaseScanoutForOutput", ReleaseScanoutForOutput);
     reg("switchOutputMode", SwitchOutputMode);

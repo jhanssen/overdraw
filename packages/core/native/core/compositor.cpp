@@ -204,6 +204,50 @@ Compositor::Compositor(int wireFd, int ctrlFd, pid_t gpuPid,
                         p.outputId, p.width, p.height);
             return;
         }
+        if (kind == ipc::FrameKind::ScanoutClientFlip) {
+            // A direct-scanout page flip completed. Pacing rides the same
+            // queue as ring flips (the JS onFlipComplete callback fires
+            // wl_callback.done / wp_presentation for this output); the
+            // latch/retire pair is queued separately for the buffer
+            // lifecycle (release the retired buffer).
+            if (frame.size() != ipc::ScanoutClientFlipPayload::kSize) {
+                std::fprintf(stderr,
+                    "[core] ScanoutClientFlip: bad payload size %zu\n", frame.size());
+                return;
+            }
+            auto p = ipc::ScanoutClientFlipPayload::decode(frame.data());
+            if (p.latchedBufferId != 0) {
+                // Only real latches pace the output; a pure-retire event
+                // (composite frame displaced a client buffer) already has
+                // its ring flip driving the clock.
+                flipCompletes_.push_back({ p.outputId, p.tvSec, p.tvNsec, p.seq });
+                frameCompleteSeen_ = true;
+            }
+            pendingScanoutFlips_.push_back({
+                p.outputId, p.latchedBufferId, p.retiredBufferId,
+            });
+            return;
+        }
+        if (kind == ipc::FrameKind::ScanoutClientReject) {
+            if (frame.size() != ipc::ScanoutClientRejectPayload::kSize) {
+                std::fprintf(stderr,
+                    "[core] ScanoutClientReject: bad payload size %zu\n", frame.size());
+                return;
+            }
+            auto p = ipc::ScanoutClientRejectPayload::decode(frame.data());
+            pendingScanoutRejects_.push_back({ p.outputId, p.bufferId });
+            return;
+        }
+        if (kind == ipc::FrameKind::ScanoutFormats) {
+            ipc::ScanoutFormatsPayload p;
+            if (!ipc::ScanoutFormatsPayload::decode(frame.data(), frame.size(), p)) {
+                std::fprintf(stderr,
+                    "[core] ScanoutFormats: bad payload (size %zu)\n", frame.size());
+                return;
+            }
+            scanoutFormatIndices_[p.outputId] = std::move(p.indices);
+            return;
+        }
         if (kind == ipc::FrameKind::CursorPlaneStatus) {
             // Hardware-cursor availability for one output (bring-up probe
             // or runtime demotion). Buffered for the JS layer, which flips
@@ -1363,6 +1407,40 @@ void Compositor::renderFrame() {
     // acquireOutputTextureHandle/presentOutput). This per-frame hook just flushes
     // queued wire output.
     link_->flush();
+}
+
+bool Compositor::sendScanoutClientPresent(uint32_t outputId, uint32_t importId,
+                                          uint32_t bufferId, int acquireFenceFd) {
+    if (headless_ || !link_) {
+        if (acquireFenceFd >= 0) ::close(acquireFenceFd);
+        return false;
+    }
+    auto wh = jsImportHandles_.find(importId);
+    if (wh == jsImportHandles_.end()) {
+        std::fprintf(stderr,
+            "[core] sendScanoutClientPresent: no handle for importId=%u\n", importId);
+        if (acquireFenceFd >= 0) ::close(acquireFenceFd);
+        return false;
+    }
+    ipc::ScanoutClientPresentPayload pl{};
+    pl.outputId          = outputId;
+    pl.textureId         = wh->second.id;
+    pl.textureGeneration = wh->second.generation;
+    pl.bufferId          = bufferId;
+    uint8_t buf[ipc::ScanoutClientPresentPayload::kSize];
+    pl.encode(buf);
+    bool ok;
+    if (acquireFenceFd >= 0) {
+        const int fds[1] = { acquireFenceFd };
+        ok = link_->appendFrameWithFds(ipc::FrameKind::ScanoutClientPresentFence,
+                                       buf, sizeof(buf), fds, 1);
+        ::close(acquireFenceFd);  // dup'd into the wire queue
+    } else {
+        ok = link_->appendFrame(ipc::FrameKind::ScanoutClientPresent,
+                                buf, sizeof(buf));
+    }
+    link_->flush();
+    return ok;
 }
 
 void Compositor::sendCursorImage(uint32_t outputId, const uint8_t* pixels,

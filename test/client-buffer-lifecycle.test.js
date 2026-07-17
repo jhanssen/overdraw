@@ -924,3 +924,73 @@ test("fuzz: 200 seeds x ~500 steps each, all invariants hold", () => {
     fuzzRun(seed * 9973);
   }
 });
+
+// --- Direct scanout hold ------------------------------------------------
+// A scanned-out buffer is never GPU-sampled, so its release gate is the
+// scanout hold: scanoutPresented sets it, scanoutRetired drops it and
+// drains any owed release. (scanout-design.md "Buffer release".)
+
+test("scanout: superseded held buffer releases only on scanoutRetired", () => {
+  const m = new ClientBufferLifecycle();
+  commitImported(m, 1, 10, dims(64, 64));
+  assert.equal(m.step({ kind: "scanoutPresented", bufferId: 10 }).length, 0);
+  // Supersede while the display engine reads buffer 10: NO release yet.
+  const sup = commitImported(m, 1, 11, dims(64, 64));
+  assert.equal(pick(sup, "sendWlRelease").length, 0,
+    "no release while scanout-held");
+  // The successor latched; 10 retired -> release fires now.
+  const ret = m.step({ kind: "scanoutRetired", bufferId: 10 });
+  assert.equal(pick(ret, "sendWlRelease", (i) => i.bufferId === 10).length, 1);
+});
+
+test("scanout: retire without supersede releases nothing", () => {
+  const m = new ClientBufferLifecycle();
+  commitImported(m, 1, 10, dims(64, 64));
+  m.step({ kind: "scanoutPresented", bufferId: 10 });
+  // Composite frame took over (scanout leave); 10 is still the surface's
+  // current buffer -- retiring must not release it.
+  const ret = m.step({ kind: "scanoutRetired", bufferId: 10 });
+  assert.equal(pick(ret, "sendWlRelease").length, 0);
+  // A later supersede releases immediately (no hold, no inflight).
+  const sup = commitImported(m, 1, 11, dims(64, 64));
+  assert.equal(pick(sup, "sendWlRelease", (i) => i.bufferId === 10).length, 1);
+});
+
+test("scanout: destroyed while held never sends wl release, frees import on retire", () => {
+  const m = new ClientBufferLifecycle();
+  commitImported(m, 1, 10, dims(64, 64));
+  m.step({ kind: "scanoutPresented", bufferId: 10 });
+  const d = m.step({ kind: "bufferDestroyed", bufferId: 10 });
+  assert.equal(pick(d, "sendWlRelease").length, 0, "invariant 8");
+  assert.equal(pick(d, "releaseImport").length, 0, "import held while latched");
+  const ret = m.step({ kind: "scanoutRetired", bufferId: 10 });
+  assert.equal(pick(ret, "sendWlRelease").length, 0, "invariant 8 still");
+  assert.equal(pick(ret, "releaseImport", (i) => i.bufferId === 10).length, 1);
+});
+
+test("scanout: hold composes with inflight sampling serials", () => {
+  // Enter transition: the frame that composited buffer 10 is still in
+  // flight when the buffer also gets scanned out. Release requires BOTH
+  // gates to clear, in either order.
+  const m = new ClientBufferLifecycle();
+  commitImported(m, 1, 10, dims(64, 64));
+  runFrame(m, [1], 1);
+  m.step({ kind: "scanoutPresented", bufferId: 10 });
+  const sup = commitImported(m, 1, 11, dims(64, 64));
+  assert.equal(pick(sup, "sendWlRelease").length, 0);
+  const g = m.step({ kind: "gpuCompleted", serial: 1 });
+  assert.equal(pick(g, "sendWlRelease").length, 0, "still scanout-held");
+  const ret = m.step({ kind: "scanoutRetired", bufferId: 10 });
+  assert.equal(pick(ret, "sendWlRelease", (i) => i.bufferId === 10).length, 1);
+});
+
+test("scanout: re-adopt of a held buffer cancels the owed release", () => {
+  const m = new ClientBufferLifecycle();
+  commitImported(m, 1, 10, dims(64, 64));
+  m.step({ kind: "scanoutPresented", bufferId: 10 });
+  commitImported(m, 1, 11, dims(64, 64));   // supersede (owed, held)
+  commitImported(m, 1, 10, dims(64, 64));   // client re-attaches 10
+  const ret = m.step({ kind: "scanoutRetired", bufferId: 10 });
+  assert.equal(pick(ret, "sendWlRelease").length, 0,
+    "re-adopt cleared releaseOwed; retire alone must not release");
+});

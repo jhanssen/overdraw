@@ -486,6 +486,25 @@ export interface Addon {
                       dstW: number, dstH: number): void;
   sendCursorState?(outputId: number, x: number, y: number,
                    visible: boolean, commitNow: boolean): void;
+  // Direct scanout of client dmabufs (KMS; scanout-design.md).
+  // sendScanoutClientPresent puts the imported buffer on the output's
+  // primary plane; `fence` is the explicit-sync acquire sync_file
+  // (consumed). Returns false when the frame was not queued (unknown
+  // import) -- composite instead. setOnScanoutClientFlip reports each
+  // scanout flip's latch/retire pair (release the retired buffer);
+  // setOnScanoutClientReject reports a kernel refusal (veto + repaint).
+  // scanoutFormatIndices returns the dmabuf-feedback format-table indices
+  // the output's primary plane accepts (the scanout tranche; empty when
+  // unknown/nested). All optional: absent on test sinks and non-KMS.
+  sendScanoutClientPresent?(outputId: number, importId: number,
+                            bufferId: number, fence: WaylandFd | null): boolean;
+  setOnScanoutClientFlip?(cb: ((msg: {
+    outputId: number; latchedBufferId: number; retiredBufferId: number;
+  }) => void) | null): void;
+  setOnScanoutClientReject?(cb: ((msg: {
+    outputId: number; bufferId: number;
+  }) => void) | null): void;
+  scanoutFormatIndices?(outputId: number): number[];
   // Update the input backend's view of the multi-output layout (used for
   // pointer-space mapping and cursor clamping). Rects are in global logical
   // pixels. Called whenever state.outputs changes. Silent no-op if no input

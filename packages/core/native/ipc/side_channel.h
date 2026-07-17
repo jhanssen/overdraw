@@ -1061,6 +1061,123 @@ struct CursorPlaneStatusPayload {
 static_assert(CursorPlaneStatusPayload::kSize == 13,
               "CursorPlaneStatusPayload size mismatch with hand-counted layout");
 
+// ScanoutClientPresentPayload (core -> gpu; FrameKind::ScanoutClientPresent
+// or ScanoutClientPresentFence): put the client dmabuf behind the wire
+// texture handle {textureId, textureGeneration} onto outputId's primary
+// plane. bufferId is the core-side stable wl_buffer id, echoed back in
+// ScanoutClientFlip / ScanoutClientReject so the core's buffer lifecycle
+// can hold/release/veto by its own key.
+struct ScanoutClientPresentPayload {
+    uint32_t outputId;
+    uint32_t textureId;
+    uint32_t textureGeneration;
+    uint32_t bufferId;
+    static constexpr size_t kSize = 4 * 4;  // 16
+    void encode(uint8_t* out) const {
+        putU32LE(out + 0,  outputId);
+        putU32LE(out + 4,  textureId);
+        putU32LE(out + 8,  textureGeneration);
+        putU32LE(out + 12, bufferId);
+    }
+    static ScanoutClientPresentPayload decode(const uint8_t* p) {
+        ScanoutClientPresentPayload r{};
+        r.outputId          = getU32LE(p + 0);
+        r.textureId         = getU32LE(p + 4);
+        r.textureGeneration = getU32LE(p + 8);
+        r.bufferId          = getU32LE(p + 12);
+        return r;
+    }
+};
+static_assert(ScanoutClientPresentPayload::kSize == 16,
+              "ScanoutClientPresentPayload size mismatch with hand-counted layout");
+
+// ScanoutClientFlipPayload (gpu -> core; FrameKind::ScanoutClientFlip):
+// a page flip involving client scanout completed. latchedBufferId = the
+// client buffer now on the plane (0 when a composite frame latched);
+// retiredBufferId = the client buffer the flip displaced (0 = none; the
+// core releases it). tvSec/tvNsec/seq are the kernel page-flip timestamp
+// (CLOCK_MONOTONIC) + vsync sequence for pacing/wp_presentation.
+struct ScanoutClientFlipPayload {
+    uint32_t outputId;
+    uint32_t latchedBufferId;
+    uint32_t retiredBufferId;
+    uint32_t seq;
+    uint64_t tvSec;
+    uint32_t tvNsec;
+    static constexpr size_t kSize = 4 * 4 + 8 + 4;  // 28
+    void encode(uint8_t* out) const {
+        putU32LE(out + 0,  outputId);
+        putU32LE(out + 4,  latchedBufferId);
+        putU32LE(out + 8,  retiredBufferId);
+        putU32LE(out + 12, seq);
+        putU64LE(out + 16, tvSec);
+        putU32LE(out + 24, tvNsec);
+    }
+    static ScanoutClientFlipPayload decode(const uint8_t* p) {
+        ScanoutClientFlipPayload r{};
+        r.outputId        = getU32LE(p + 0);
+        r.latchedBufferId = getU32LE(p + 4);
+        r.retiredBufferId = getU32LE(p + 8);
+        r.seq             = getU32LE(p + 12);
+        r.tvSec           = getU64LE(p + 16);
+        r.tvNsec          = getU32LE(p + 24);
+        return r;
+    }
+};
+static_assert(ScanoutClientFlipPayload::kSize == 28,
+              "ScanoutClientFlipPayload size mismatch with hand-counted layout");
+
+// ScanoutClientRejectPayload (gpu -> core; FrameKind::ScanoutClientReject):
+// AddFB2 / atomic TEST refused this buffer on this output; the core
+// composites instead and vetoes the pair.
+struct ScanoutClientRejectPayload {
+    uint32_t outputId;
+    uint32_t bufferId;
+    static constexpr size_t kSize = 2 * 4;  // 8
+    void encode(uint8_t* out) const {
+        putU32LE(out + 0, outputId);
+        putU32LE(out + 4, bufferId);
+    }
+    static ScanoutClientRejectPayload decode(const uint8_t* p) {
+        ScanoutClientRejectPayload r{};
+        r.outputId = getU32LE(p + 0);
+        r.bufferId = getU32LE(p + 4);
+        return r;
+    }
+};
+static_assert(ScanoutClientRejectPayload::kSize == 8,
+              "ScanoutClientRejectPayload size mismatch with hand-counted layout");
+
+// ScanoutFormatsPayload (gpu -> core; FrameKind::ScanoutFormats): the
+// dmabuf-feedback format-table indices whose (fourcc, modifier) the named
+// output's primary plane accepts. Variable length:
+// [outputId:u32][count:u32][count x u16 indices].
+struct ScanoutFormatsPayload {
+    uint32_t outputId = 0;
+    std::vector<uint16_t> indices;
+    size_t encodedSize() const { return 8 + indices.size() * 2; }
+    void encode(uint8_t* out) const {
+        putU32LE(out + 0, outputId);
+        putU32LE(out + 4, static_cast<uint32_t>(indices.size()));
+        for (size_t i = 0; i < indices.size(); ++i) {
+            out[8 + i * 2]     = static_cast<uint8_t>(indices[i] & 0xff);
+            out[8 + i * 2 + 1] = static_cast<uint8_t>(indices[i] >> 8);
+        }
+    }
+    static bool decode(const uint8_t* p, size_t len, ScanoutFormatsPayload& out) {
+        if (len < 8) return false;
+        out.outputId = getU32LE(p + 0);
+        const uint32_t count = getU32LE(p + 4);
+        if (len != 8 + static_cast<size_t>(count) * 2) return false;
+        out.indices.resize(count);
+        for (uint32_t i = 0; i < count; ++i) {
+            out.indices[i] = static_cast<uint16_t>(
+                p[8 + i * 2] | (p[8 + i * 2 + 1] << 8));
+        }
+        return true;
+    }
+};
+
 // AllocShmTexPayload (core -> gpu; FrameKind::AllocShmTex):
 // the core wire-client has ReserveTexture'd a wire handle for a
 // sampleable BGRA8 texture sized to the current shm buffer. The GPU

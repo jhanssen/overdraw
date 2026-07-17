@@ -462,6 +462,7 @@ export type CompositorAddon = Pick<
   | "sendCursorImage"
   | "sendCursorImageShm"
   | "sendCursorState"
+  | "sendScanoutClientPresent"
 >;
 
 // The dawn.node wire binding bits the compositor needs for dmabuf surfaces.
@@ -748,7 +749,23 @@ interface DmabufImport {
   width: number;
   height: number;
   importId: number;
+  // DRM fourcc, kept for the direct-scanout opacity check (alpha-less
+  // formats only; a translucent buffer cannot skip compositing).
+  fourcc: number;
 }
+
+// Alpha-less DRM fourccs eligible for direct scanout: nothing shows
+// through them, so putting the buffer on the plane is visually identical
+// to compositing it. Alpha-carrying variants (AR24 etc.) would need an
+// opaque-region check to qualify.
+const SCANOUT_OPAQUE_FOURCCS = new Set<number>([
+  0x34325258, // XRGB8888 'XR24'
+  0x34324258, // XBGR8888 'XB24'
+  0x34325852, // RGBX8888 'RX24'
+  0x34325842, // BGRX8888 'BX24'
+  0x30335258, // XRGB2101010 'XR30'
+  0x30334258, // XBGR2101010 'XB30'
+]);
 
 // Pending importBuffer intent: the descriptor we need to call the addon. Kept
 // here (not in the state machine) so the lifecycle stays Dawn-free.
@@ -2568,6 +2585,7 @@ export class JsCompositor implements CompositorSink {
         const view = tex.createView();
         const imp: DmabufImport = {
           tex, view, width: pending.width, height: pending.height, importId,
+          fourcc: pending.fourcc,
         };
         this.dmabufImports.set(bufferId, imp);
         // Tell the lifecycle the buffer transitioned Importing -> Imported.
@@ -2635,6 +2653,8 @@ export class JsCompositor implements CompositorSink {
     }
     // Native release: drops the server-side STM + texture + dmabuf fd.
     if (imp.importId !== 0) this.addon.releaseDmabufImport(imp.importId);
+    // A destroyed buffer's scanout veto entries are moot; drop them.
+    for (const set of this.scanoutVeto.values()) set.delete(bufferId);
   }
 
   // The wire layer (src/protocols/wl_buffer.ts) calls this from the wl_buffer
@@ -3515,6 +3535,32 @@ export class JsCompositor implements CompositorSink {
           || this.outputDamage.isDirty(o.id)
           || this.activeTransitions.has(o.id);
         if (!dirty) continue;
+        // Direct scanout: a solitary mode-sized opaque client dmabuf goes
+        // straight onto the primary plane -- no acquire, no render, no
+        // composite. Damage is consumed (the plane shows the new buffer);
+        // frame pacing rides the client flip's completion.
+        const wasScanout = this.scanoutActive.has(o.id);
+        const cand = this.activeTransitions.has(o.id)
+          ? null : this.scanoutCandidate(o, this.drawOrder(o.id));
+        if (cand) {
+          const fence = this.takeScanoutAcquireFence(cand.bufferId);
+          if (this.addon.sendScanoutClientPresent?.(o.id, cand.importId,
+                                                    cand.bufferId, fence)) {
+            this.dispatch(this.lifecycle.step({
+              kind: "scanoutPresented", bufferId: cand.bufferId,
+            }));
+            this.scanoutActive.set(o.id, cand.bufferId);
+            this.outputDamage.clearDirty(o.id);
+            continue;
+          }
+          // The sink refused the present (unknown import); composite.
+        }
+        if (wasScanout) {
+          // Leaving scanout: the ring slots hold stale pre-scanout
+          // content, so the returning composite frame repaints fully.
+          this.scanoutActive.delete(o.id);
+          this.outputDamage.fullOutput(o.id);
+        }
         const handle = this.addon.acquireOutputTexture(o.id);
         // The native addon returns nullptr from N-API on "no slot available"
         // (no FREE scanout in KMS mode; no swapchain texture in nested-host
@@ -4388,6 +4434,117 @@ export class JsCompositor implements CompositorSink {
       enabled: this.hwCursorEnabled,
       capOutputs: [...this.hwCursorCaps.keys()].sort((a, b) => a - b),
       activeOutputs: [...this.hwCursorActive].sort((a, b) => a - b),
+    };
+  }
+
+  // ----- Direct scanout (KMS primary plane; scanout-design.md) -----
+  //
+  // Per frame, per output: when the entire visible scene is one solitary
+  // mode-sized opaque client dmabuf, the composite pass is skipped and the
+  // buffer is presented directly on the primary plane. Eligibility is
+  // re-evaluated every renderFrame; any overlay/cursor/transition simply
+  // makes the output composite again that frame. OFF until main.ts
+  // enables it for the KMS backend -- nested/test compositors must never
+  // attempt plane presents.
+  private directScanoutEnabled = false;
+  private scanoutActive = new Map<number, number>();     // outputId -> bufferId
+  private scanoutVeto = new Map<number, Set<number>>();  // GPU-process-refused pairs
+
+  setDirectScanoutEnabled(on: boolean): void {
+    this.directScanoutEnabled = on;
+    if (!on && this.scanoutActive.size > 0) {
+      for (const id of this.scanoutActive.keys()) this.outputDamage.fullOutput(id);
+      this.addon.wake();
+    }
+  }
+
+  // The solitary-fullscreen-dmabuf test. `draw` is the output's draw list
+  // for this frame; every overlay (software cursor, popup, subsurface,
+  // phantom, layer shell, decoration) is its own entry, so length !== 1
+  // covers the whole "something else is visible" family.
+  private scanoutCandidate(o: OutputGeom, draw: readonly number[]):
+      { bufferId: number; importId: number } | null {
+    if (!this.directScanoutEnabled || this.headless) return null;
+    if (!this.addon.sendScanoutClientPresent) return null;
+    if (draw.length !== 1) return null;
+    const id = draw[0];
+    if (id === this.internalCursorSurfaceId) return null;
+    const s = this.surfaces.get(id);
+    if (!s || !s.present || s.frozen) return null;
+    const bufferId = s.currentBufferId ?? 0;
+    if (!bufferId) return null;
+    const imp = this.dmabufImports.get(bufferId);
+    if (!imp) return null;  // shm / plugin-texture surface: no dmabuf to scan out
+    // Buffer must exactly match the mode; the plane does not scale or
+    // blend. Alpha-carrying fourccs would need an opaque-region check.
+    if (imp.width !== o.deviceWidth || imp.height !== o.deviceHeight) return null;
+    if (!SCANOUT_OPAQUE_FOURCCS.has(imp.fourcc)) return null;
+    if (s.bufferTransform !== 0) return null;
+    if (s.viewportSrc) return null;
+    // Placement must exactly cover the output's logical rect, unwarped:
+    // identity camera, no fx transform/margin/mask/shape, full opacity.
+    const lw = Math.round(o.deviceWidth / o.scale);
+    const lh = Math.round(o.deviceHeight / o.scale);
+    if (s.x !== o.logicalX || s.y !== o.logicalY) return null;
+    if (Math.round(s.layoutW) !== lw || Math.round(s.layoutH) !== lh) return null;
+    if (s.fx.opacity !== 1 || this.fxDrawsOutsideLayout(s)) return null;
+    if (s.fx.shape !== null) return null;
+    if (this.cameras.has(o.id)) return null;
+    if (this.scanoutVeto.get(o.id)?.has(bufferId)) return null;
+    return { bufferId, importId: imp.importId };
+  }
+
+  // Consume the buffer's stashed explicit-sync acquire fence for a scanout
+  // present (the role wire-BeginAccess plays on the composite path).
+  private takeScanoutAcquireFence(bufferId: number): WaylandFd | null {
+    const f = this.bufferIdToAcquireFenceFd.get(bufferId);
+    if (!f) return null;
+    this.bufferIdToAcquireFenceFd.delete(bufferId);
+    return f.closed ? null : f;
+  }
+
+  // ScanoutClientFlip from the GPU process: latch bookkeeping + the
+  // retired buffer's release (the display engine no longer reads it).
+  handleScanoutClientFlip(outputId: number, latchedBufferId: number,
+                          retiredBufferId: number): void {
+    if (latchedBufferId !== 0) {
+      this.scanoutActive.set(outputId, latchedBufferId);
+    } else if (this.scanoutActive.get(outputId) === retiredBufferId) {
+      // Only a retire of the LATCHED buffer ends the session; a dropped
+      // never-latched present (mailbox supersede) retires its buffer
+      // while the plane still shows the previous one.
+      this.scanoutActive.delete(outputId);
+    }
+    if (retiredBufferId !== 0) {
+      this.dispatch(this.lifecycle.step({
+        kind: "scanoutRetired", bufferId: retiredBufferId,
+      }));
+    }
+  }
+
+  // ScanoutClientReject: the kernel refused the buffer (AddFB2 or atomic
+  // TEST). Veto the pair, drop the never-latched hold, and repaint through
+  // the composite path.
+  handleScanoutClientReject(outputId: number, bufferId: number): void {
+    let set = this.scanoutVeto.get(outputId);
+    if (!set) { set = new Set(); this.scanoutVeto.set(outputId, set); }
+    set.add(bufferId);
+    while (set.size > 32) {
+      const oldest = set.values().next().value;
+      if (oldest === undefined) break;
+      set.delete(oldest);
+    }
+    this.scanoutActive.delete(outputId);
+    this.dispatch(this.lifecycle.step({ kind: "scanoutRetired", bufferId }));
+    this.outputDamage.fullOutput(outputId);
+    this.addon.wake();
+  }
+
+  // Test/introspection accessor.
+  scanoutState(): { enabled: boolean; activeOutputs: number[] } {
+    return {
+      enabled: this.directScanoutEnabled,
+      activeOutputs: [...this.scanoutActive.keys()].sort((a, b) => a - b),
     };
   }
 

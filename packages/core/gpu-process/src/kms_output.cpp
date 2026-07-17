@@ -67,7 +67,7 @@ void KmsOutputBackend::close() {
     // The DRM fd itself is owned by the core's libseat; we don't close it.
     for (auto& [id, o] : outputs_) {
         o->ring.clear();
-        resetCursorFlipState(*o);
+        resetTransientFlipState(*o);
         destroyCursorBos(*o);
         if (o->modeBlobId != 0 && drmFd_ >= 0) {
             drmModeDestroyPropertyBlob(drmFd_, o->modeBlobId);
@@ -191,7 +191,7 @@ void KmsOutputBackend::disconnectOutput(uint32_t outputId) {
     // we'd want an atomic-disable commit here.
     usedCrtcs_.erase(o.topo.crtcId);
     o.ring.clear();
-    resetCursorFlipState(o);
+    resetTransientFlipState(o);
     destroyCursorBos(o);
     if (o.modeBlobId != 0 && drmFd_ >= 0) {
         drmModeDestroyPropertyBlob(drmFd_, o.modeBlobId);
@@ -267,13 +267,154 @@ void KmsOutputBackend::destroyCursorBos(PerOutput& o) {
     o.cursorImageValid = false;
 }
 
-void KmsOutputBackend::resetCursorFlipState(PerOutput& o) {
+void KmsOutputBackend::resetTransientFlipState(PerOutput& o) {
     o.cursorFlipPending = false;
-    o.stashedPresentSlot = -1;
-    if (o.stashedPresentFence >= 0) {
-        ::close(o.stashedPresentFence);
-        o.stashedPresentFence = -1;
+    // Retire every client buffer this output still references (latched,
+    // in a pending flip, or stashed) -- no flip event will arrive for
+    // them, and the core must release them. Dedupe: the same buffer can
+    // appear in more than one slot across a fast transition.
+    uint32_t retire[3] = { o.latchedClientBufId, o.pendingClientBufId,
+                           o.stashed.clientBufId };
+    for (int i = 0; i < 3; ++i) {
+        if (retire[i] == 0) continue;
+        bool dup = false;
+        for (int j = 0; j < i; ++j) if (retire[j] == retire[i]) dup = true;
+        if (!dup && clientFlipListener_) {
+            clientFlipListener_({ o.outputId, 0, retire[i], 0, 0, 0 });
+        }
     }
+    o.latchedClientFbId = 0;
+    o.latchedClientBufId = 0;
+    o.pendingClientFbId = 0;
+    o.pendingClientBufId = 0;
+    o.clientFlipPending = false;
+    if (o.stashed.fence >= 0) ::close(o.stashed.fence);
+    o.stashed = {};
+    sweepCondemnedFbs();
+}
+
+void KmsOutputBackend::stashPresent(PerOutput& o, int slotIdx, uint32_t clientFbId,
+                                    uint32_t clientBufId, uint32_t clientW,
+                                    uint32_t clientH, int inFenceFd) {
+    if (o.stashed.valid) {
+        // Mailbox: the newer present supersedes the stashed one. A dropped
+        // CLIENT present's buffer will never latch -- report it retired so
+        // the core releases it.
+        std::fprintf(stderr,
+            "[kms] present stashed twice on output %u; dropping older (slot %d fb %u)\n",
+            o.outputId, o.stashed.slotIdx, o.stashed.clientFbId);
+        if (o.stashed.clientBufId != 0 && clientFlipListener_) {
+            clientFlipListener_({ o.outputId, 0, o.stashed.clientBufId, 0, 0, 0 });
+        }
+        if (o.stashed.fence >= 0) ::close(o.stashed.fence);
+    }
+    o.stashed = {};
+    o.stashed.slotIdx = slotIdx;
+    o.stashed.clientFbId = clientFbId;
+    o.stashed.clientBufId = clientBufId;
+    o.stashed.clientW = clientW;
+    o.stashed.clientH = clientH;
+    o.stashed.fence = inFenceFd >= 0 ? ::fcntl(inFenceFd, F_DUPFD_CLOEXEC, 0) : -1;
+    o.stashed.valid = true;
+}
+
+void KmsOutputBackend::replayStashedPresent(PerOutput& o) {
+    if (!o.stashed.valid) return;
+    const auto st = o.stashed;
+    o.stashed = {};
+    presentOutputImpl(o, st.slotIdx, st.fence, st.clientFbId, st.clientBufId,
+                      st.clientW, st.clientH);
+    if (st.fence >= 0) ::close(st.fence);
+}
+
+void KmsOutputBackend::noteLatch(PerOutput& o, uint32_t latchedFb, uint32_t latchedBuf,
+                                 uint64_t tvSec, uint32_t tvNsec, uint32_t seq) {
+    const uint32_t retired =
+        (o.latchedClientBufId != 0 && o.latchedClientBufId != latchedBuf)
+            ? o.latchedClientBufId : 0;
+    o.latchedClientFbId = latchedFb;
+    o.latchedClientBufId = latchedBuf;
+    if ((latchedBuf != 0 || retired != 0) && clientFlipListener_) {
+        clientFlipListener_({ o.outputId, latchedBuf, retired, tvSec, tvNsec, seq });
+    }
+    sweepCondemnedFbs();
+}
+
+void KmsOutputBackend::sweepCondemnedFbs() {
+    if (condemnedClientFbs_.empty() || drmFd_ < 0) return;
+    auto inUse = [&](uint32_t fb) {
+        for (const auto& [id, o] : outputs_) {
+            if (o->latchedClientFbId == fb || o->pendingClientFbId == fb
+                || (o->stashed.valid && o->stashed.clientFbId == fb)) {
+                return true;
+            }
+        }
+        return false;
+    };
+    for (auto it = condemnedClientFbs_.begin(); it != condemnedClientFbs_.end();) {
+        if (inUse(*it)) { ++it; continue; }
+        drmModeRmFB(drmFd_, *it);
+        it = condemnedClientFbs_.erase(it);
+    }
+}
+
+uint32_t KmsOutputBackend::importClientFb(int dmabufFd, uint32_t width, uint32_t height,
+                                          uint32_t fourcc, uint64_t modifier,
+                                          uint32_t offset, uint32_t stride) {
+    if (drmFd_ < 0 || dmabufFd < 0) return 0;
+    uint32_t handle = 0;
+    if (drmPrimeFDToHandle(drmFd_, dmabufFd, &handle) != 0) {
+        std::fprintf(stderr, "[kms] scanout: PrimeFDToHandle failed: %s\n",
+                     std::strerror(errno));
+        return 0;
+    }
+    uint32_t handles[4] = { handle, 0, 0, 0 };
+    uint32_t pitches[4] = { stride, 0, 0, 0 };
+    uint32_t offsets[4] = { offset, 0, 0, 0 };
+    uint64_t modifiers[4] = { modifier, 0, 0, 0 };
+    uint32_t fbId = 0;
+    int rc;
+    if (modifier != DRM_FORMAT_MOD_INVALID) {
+        rc = drmModeAddFB2WithModifiers(drmFd_, width, height, fourcc,
+                                        handles, pitches, offsets, modifiers,
+                                        &fbId, DRM_MODE_FB_MODIFIERS);
+    } else {
+        rc = drmModeAddFB2(drmFd_, width, height, fourcc,
+                           handles, pitches, offsets, &fbId, 0);
+    }
+    // The FB holds its own reference to the BO; drop ours. Client dmabufs
+    // are not otherwise imported on this card fd (rendering imports go
+    // through the render node), so no handle aliasing to worry about.
+    drmCloseBufferHandle(drmFd_, handle);
+    if (rc != 0) {
+        std::fprintf(stderr,
+            "[kms] scanout: AddFB2 %ux%u fourcc=0x%08x mod=0x%016llx failed: %s\n",
+            width, height, fourcc,
+            static_cast<unsigned long long>(modifier), std::strerror(errno));
+        return 0;
+    }
+    return fbId;
+}
+
+bool KmsOutputBackend::presentClientFbAt(uint32_t outputId, uint32_t fbId,
+                                         uint32_t width, uint32_t height,
+                                         uint32_t bufferId, int inFenceFd) {
+    PerOutput* o = find(outputId);
+    if (!o || fbId == 0) return false;
+    return presentOutputImpl(*o, -1, inFenceFd, fbId, bufferId, width, height);
+}
+
+void KmsOutputBackend::condemnClientFb(uint32_t fbId) {
+    if (fbId == 0) return;
+    condemnedClientFbs_.push_back(fbId);
+    sweepCondemnedFbs();
+}
+
+std::vector<PlaneFormatModifier>
+KmsOutputBackend::primaryPlaneFormatsAt(uint32_t outputId) const {
+    const PerOutput* o = find(outputId);
+    if (!o) return {};
+    return readPlaneFormats(drmFd_, o->topo.planeId, o->topo.planeProps.in_formats);
 }
 
 bool KmsOutputBackend::cursorPlaneInfoAt(uint32_t outputId,
@@ -363,7 +504,7 @@ void KmsOutputBackend::maybeCursorCommit(PerOutput& o) {
     // Commits are serialized per CRTC: while any flip is in flight, the
     // desired state is picked up either by the arriving present (frame
     // path) or re-checked from that flip's completion event.
-    if (o.pendingFlipSlot != -1 || o.cursorFlipPending) return;
+    if (o.pendingFlipSlot != -1 || o.cursorFlipPending || o.clientFlipPending) return;
     if (!o.topo.cursorPlaneId || o.cursorDemoted) return;
     drmModeAtomicReq* req = drmModeAtomicAlloc();
     if (!req) return;
@@ -397,7 +538,7 @@ void KmsOutputBackend::demoteCursor(PerOutput& o, bool issueDisableCommit) {
     // flip IS in flight, the next commit (frame or stashed present) emits
     // the disable via addCursorPlaneState.
     if (issueDisableCommit && !paused_ && o.didInitialCommit && o.pendingFlipSlot == -1
-        && !o.cursorFlipPending && o.topo.cursorPlaneId) {
+        && !o.cursorFlipPending && !o.clientFlipPending && o.topo.cursorPlaneId) {
         drmModeAtomicReq* req = drmModeAtomicAlloc();
         if (req) {
             addCursorPlaneState(req, o);  // demoted -> plane-off props
@@ -587,7 +728,7 @@ bool KmsOutputBackend::switchMode(uint32_t outputId,
     // The stashed present (if any) references the old ring; drop it. Cursor
     // image + desired state survive the mode switch (the cursor FB is
     // cap-sized, mode-independent); the post-switch modeset re-programs it.
-    resetCursorFlipState(*o);
+    resetTransientFlipState(*o);
     o->cursorDirty = true;
 
     // Adopt the new mode.
@@ -704,7 +845,7 @@ void KmsOutputBackend::pause() {
         // No flip event will arrive for a commit the revoked master had in
         // flight; the post-resume modeset re-programs the cursor plane from
         // the (kept) desired state.
-        resetCursorFlipState(*o);
+        resetTransientFlipState(*o);
         o->cursorDirty = true;
     }
     std::printf("[kms] paused (VT switched away or seat disabled)\n");
@@ -716,7 +857,9 @@ void KmsOutputBackend::resume() {
     std::printf("[kms] resumed (next present will re-run modeset)\n");
 }
 
-bool KmsOutputBackend::presentOutputImpl(PerOutput& o, int slotIdx, int inFenceFd) {
+bool KmsOutputBackend::presentOutputImpl(PerOutput& o, int slotIdx, int inFenceFd,
+                                         uint32_t clientFbId, uint32_t clientBufId,
+                                         uint32_t clientW, uint32_t clientH) {
     if (paused_) {
         // The seat is disabled; the kernel has revoked DRM master and any
         // commit would EACCES. Swallow the present and discard the fence
@@ -724,26 +867,21 @@ bool KmsOutputBackend::presentOutputImpl(PerOutput& o, int slotIdx, int inFenceF
         (void)inFenceFd;
         return true;
     }
-    if (slotIdx < 0 || drmFd_ < 0) return false;
-    // A cursor-only flip is in flight on this CRTC; a second nonblocking
-    // commit would EBUSY. Stash the present and issue it from the cursor
-    // flip's completion event (sub-vblank delay, and rare: only an
-    // idle->active transition races a cursor commit against a render).
-    if (o.cursorFlipPending) {
-        if (o.stashedPresentSlot >= 0) {
-            // Can't happen while flip-completes gate the core's renders,
-            // but never leak a fence if it does.
-            std::fprintf(stderr,
-                "[kms] present stashed twice on output %u; dropping older slot %d\n",
-                o.outputId, o.stashedPresentSlot);
-            if (o.stashedPresentFence >= 0) ::close(o.stashedPresentFence);
-        }
-        o.stashedPresentSlot = slotIdx;
-        o.stashedPresentFence =
-            inFenceFd >= 0 ? ::fcntl(inFenceFd, F_DUPFD_CLOEXEC, 0) : -1;
+    const bool isClient = clientFbId != 0;
+    if ((!isClient && slotIdx < 0) || drmFd_ < 0) return false;
+    // One commit in flight per CRTC, across all three commit kinds (ring
+    // present, client-scanout present, cursor-only). A present arriving
+    // while another flip is pending is stashed and issued from that
+    // flip's completion event (sub-vblank delay, and rare: transition
+    // frames only -- the frame clock otherwise serializes presents).
+    if (o.cursorFlipPending || o.clientFlipPending
+        || (isClient && o.pendingFlipSlot != -1)) {
+        stashPresent(o, slotIdx, clientFbId, clientBufId, clientW, clientH, inFenceFd);
         return true;
     }
-    const auto& s = o.ring.slot(slotIdx);
+    const uint32_t fbId = isClient ? clientFbId : o.ring.slot(slotIdx).fbId;
+    const uint32_t srcW = isClient ? clientW : o.ring.width();
+    const uint32_t srcH = isClient ? clientH : o.ring.height();
     const DrmTopology& topo = o.topo;
 
     const uint32_t modeW = topo.mode.hdisplay;
@@ -790,12 +928,14 @@ bool KmsOutputBackend::presentOutputImpl(PerOutput& o, int slotIdx, int inFenceF
 
         // Plane: which CRTC, which FB, src + crtc rects. src_* are 16.16
         // fixed-point in buffer space; crtc_* are integers in mode space.
-        add(topo.planeId, topo.planeProps.fb_id,   s.fbId);
+        // The FB is either this frame's ring slot or a client dmabuf
+        // being scanned out directly.
+        add(topo.planeId, topo.planeProps.fb_id,   fbId);
         add(topo.planeId, topo.planeProps.crtc_id, topo.crtcId);
         add(topo.planeId, topo.planeProps.src_x,   0);
         add(topo.planeId, topo.planeProps.src_y,   0);
-        add(topo.planeId, topo.planeProps.src_w,   static_cast<uint64_t>(o.ring.width())  << 16);
-        add(topo.planeId, topo.planeProps.src_h,   static_cast<uint64_t>(o.ring.height()) << 16);
+        add(topo.planeId, topo.planeProps.src_w,   static_cast<uint64_t>(srcW) << 16);
+        add(topo.planeId, topo.planeProps.src_h,   static_cast<uint64_t>(srcH) << 16);
         add(topo.planeId, topo.planeProps.crtc_x,  0);
         add(topo.planeId, topo.planeProps.crtc_y,  0);
         add(topo.planeId, topo.planeProps.crtc_w,  modeW);
@@ -876,6 +1016,25 @@ bool KmsOutputBackend::presentOutputImpl(PerOutput& o, int slotIdx, int inFenceF
 
     const bool wasInitial = !o.didInitialCommit;
     o.didInitialCommit = true;
+    if (isClient) {
+        o.pendingClientFbId  = clientFbId;
+        o.pendingClientBufId = clientBufId;
+        o.clientFlipPending  = true;
+        if (wasInitial) {
+            // ALLOW_MODESET commits are synchronous and deliver no flip
+            // event; account the latch now (same reasoning as the ring
+            // fake-flip below).
+            o.clientFlipPending = false;
+            o.pendingClientFbId = 0;
+            o.pendingClientBufId = 0;
+            struct timespec ts{};
+            clock_gettime(CLOCK_MONOTONIC, &ts);
+            noteLatch(o, clientFbId, clientBufId,
+                      static_cast<uint64_t>(ts.tv_sec),
+                      static_cast<uint32_t>(ts.tv_nsec), 0);
+        }
+        return true;
+    }
     o.ring.markPendingFlip(slotIdx);
     o.pendingFlipSlot = slotIdx;
     // Initial commit ran ALLOW_MODESET without PAGE_FLIP_EVENT (the kernel-
@@ -898,6 +1057,10 @@ bool KmsOutputBackend::presentOutputImpl(PerOutput& o, int slotIdx, int inFenceF
                                   static_cast<uint64_t>(ts.tv_sec),
                                   static_cast<uint32_t>(ts.tv_nsec), 0);
         }
+        struct timespec ts{};
+        clock_gettime(CLOCK_MONOTONIC, &ts);
+        noteLatch(o, 0, 0, static_cast<uint64_t>(ts.tv_sec),
+                  static_cast<uint32_t>(ts.tv_nsec), 0);
     }
     return true;
 }
@@ -916,23 +1079,34 @@ void KmsOutputBackend::pageFlipTrampoline(int /*fd*/, unsigned int sequence,
     // Route the flip to the output whose CRTC the kernel reported.
     for (auto& [id, o] : self->outputs_) {
         if (o->topo.crtcId != crtc_id) continue;
+        const uint64_t sec = static_cast<uint64_t>(tv_sec);
+        const uint32_t nsec = static_cast<uint32_t>(tv_usec) * 1000u;
         const int flipped = o->pendingFlipSlot;
         o->pendingFlipSlot = -1;
         if (flipped < 0) {
-            // Not a frame flip. A cursor-only commit's event completes here:
-            // it must NOT feed the frame clock (no slot retired, nothing for
-            // the core to pace on) -- it only unblocks the next commit.
+            // Not a ring flip. Either a client-scanout present's flip (a
+            // client dmabuf latched -- report it for pacing + release and
+            // advance the latch bookkeeping) or a cursor-only commit's
+            // (which must NOT feed any pacing -- it only unblocks the next
+            // commit).
+            if (o->clientFlipPending) {
+                o->clientFlipPending = false;
+                const uint32_t fb = o->pendingClientFbId;
+                const uint32_t buf = o->pendingClientBufId;
+                o->pendingClientFbId = 0;
+                o->pendingClientBufId = 0;
+                self->noteLatch(*o, fb, buf, sec, nsec, sequence);
+                self->replayStashedPresent(*o);
+                self->maybeCursorCommit(*o);
+                return;
+            }
             if (o->cursorFlipPending) {
                 o->cursorFlipPending = false;
-                if (o->stashedPresentSlot >= 0) {
-                    // A present arrived while the cursor flip was in flight;
-                    // issue it now (it folds the latest cursor state).
-                    const int slot = o->stashedPresentSlot;
-                    const int fence = o->stashedPresentFence;
-                    o->stashedPresentSlot = -1;
-                    o->stashedPresentFence = -1;
-                    self->presentOutputImpl(*o, slot, fence);
-                    if (fence >= 0) ::close(fence);
+                if (o->stashed.valid) {
+                    // A present arrived while the cursor flip was in
+                    // flight; issue it now (it folds the latest cursor
+                    // state).
+                    self->replayStashedPresent(*o);
                 } else {
                     self->maybeCursorCommit(*o);
                 }
@@ -941,13 +1115,15 @@ void KmsOutputBackend::pageFlipTrampoline(int /*fd*/, unsigned int sequence,
         }
         const int retired = o->ring.onFlipComplete(flipped);
         if (self->flipCompleteListener_) {
-            // Promote kernel-supplied (tv_sec, tv_usec) to (tv_sec, tv_nsec)
-            // and pass the vsync sequence number. The kernel clock is
-            // CLOCK_MONOTONIC by default for DRM page-flip events.
-            const uint64_t sec = static_cast<uint64_t>(tv_sec);
-            const uint32_t nsec = static_cast<uint32_t>(tv_usec) * 1000u;
+            // Kernel-supplied (tv_sec, tv_usec) promoted to nsec + the
+            // vsync sequence number; CLOCK_MONOTONIC by default for DRM
+            // page-flip events.
             self->flipCompleteListener_(o->outputId, retired, sec, nsec, sequence);
         }
+        // A ring frame latched: any client buffer that was on the plane is
+        // now retired (the scanout-leave transition).
+        self->noteLatch(*o, 0, 0, sec, nsec, sequence);
+        self->replayStashedPresent(*o);
         // Cursor motion that arrived while this frame flip was in flight
         // and asked for a commit of its own.
         self->maybeCursorCommit(*o);

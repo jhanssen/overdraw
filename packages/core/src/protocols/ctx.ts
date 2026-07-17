@@ -670,6 +670,12 @@ export interface CompositorSink {
   setCursorPlaneStatus?(outputId: number, ok: boolean,
                         maxW: number, maxH: number): void;
   setHwCursorEnabled?(on: boolean): void;
+  // Direct scanout (KMS): flip latch/retire + rejection routing from the
+  // GPU process, and the config gate. See scanout-design.md.
+  handleScanoutClientFlip?(outputId: number, latchedBufferId: number,
+                           retiredBufferId: number): void;
+  handleScanoutClientReject?(outputId: number, bufferId: number): void;
+  setDirectScanoutEnabled?(on: boolean): void;
 }
 
 export interface CompositorState {
@@ -750,6 +756,11 @@ export interface CompositorState {
   // drives per-surface scale selection: re-emit picks the scale of the
   // surface's primary output (the one with the largest overlap area).
   fractionalScaleResources?: Map<Resource, Resource>;
+  // Per-surface zwp_linux_dmabuf_feedback_v1 resources, tracked so the
+  // feedback re-sends with a scanout tranche when the surface's
+  // fullscreen state changes (direct scanout; scanout-design.md).
+  // lastKey dedups re-sends ("render" | "scanout:<outputId>").
+  dmabufSurfaceFeedback?: Map<Resource, { surfaceId: number; lastKey: string }>;
   // surfaceId -> record, for native->JS lookups keyed by the integer id (e.g. the
   // imported-surface map-on-first-content sweep).
   surfacesById?: Map<number, SurfaceRecord>;
