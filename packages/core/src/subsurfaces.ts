@@ -240,19 +240,33 @@ export function collectSubsurfaceIds(
 // `windows` is the toplevel order to emit. Default = wm.state.windows (the
 // global stack). Pass a filtered/reordered list for per-output expansion.
 // Without a WM AND no explicit list, returns [].
+// Effective stacking z for draw order and hit-testing. An exclusive
+// (fullscreen / maximized) window owns its island and OVERLAPS its
+// suppressed peers at the full output/tile size, so it must stack above
+// every non-exclusive window -- including floating windows, whose
+// raiseWindow z would otherwise put them on top. Both computeBaseStack
+// (draw, ascending) and the WM's windowAt (input, descending) sort by
+// this value; using the same key is what keeps clicks landing on the
+// pixels the user sees.
+export function effectiveStackZ(w: WmWindowLike): number {
+  const boost = (w.windowState?.exclusive ?? "none") !== "none" ? 0x40000000 : 0;
+  return (w.z ?? 0) + boost;
+}
+
 export function computeBaseStack(
   state: CompositorState,
   windows?: ReadonlyArray<WmWindowLike>,
 ): number[] {
   const list = windows ?? state.wm?.state.windows;
   if (!list) return [];
-  // Sort by ascending z (bottom-to-top). Ties keep input list order
-  // (stable sort) -- callers passing wm.state.windows get the
+  // Sort by ascending effective z (bottom-to-top). Ties keep input list
+  // order (stable sort) -- callers passing wm.state.windows get the
   // master-front order preserved within a z-bucket, which matters
   // only when a bucket has multiple windows AND the layout puts them
   // overlapping (the tiled bucket never overlaps; the floating
-  // bucket gets one z per window from raiseWindow).
-  const sorted = [...list].sort((a, b) => (a.z ?? 0) - (b.z ?? 0));
+  // bucket gets one z per window from raiseWindow; exclusive windows
+  // overlap everything and stack above via effectiveStackZ).
+  const sorted = [...list].sort((a, b) => effectiveStackZ(a) - effectiveStackZ(b));
   const stack: number[] = [];
   for (const win of sorted) {
     // Content-gated windows (waiting for their decoration's first frame,
@@ -285,6 +299,9 @@ export interface WmWindowLike {
   contentGateOwners?: ReadonlySet<string>;
   decorationSurfaceId?: number;
   z?: number;
+  // Behavioral state; effectiveStackZ boosts exclusive windows above
+  // every non-exclusive z tier.
+  windowState?: { exclusive?: "none" | "maximized" | "fullscreen" };
 }
 
 // Recompute the full draw stack (via rebuildStackWithPopups, the SINGLE owner of

@@ -20,6 +20,8 @@
 //   --fill <rrggbb>  Paint the whole window with this color on map and on
 //                    every Expose (so the window has deterministic pixels
 //                    for compositor readback tests).
+//   --fullscreen     Set _NET_WM_STATE=_NET_WM_STATE_FULLSCREEN before
+//                    mapping (how fullscreen games declare themselves).
 //   --stdin-fills    Read commands from stdin: "fill X Y W H RRGGBB" paints
 //                    a sub-rectangle and prints "[x11] filled X Y W H" after
 //                    the flush. Drives partial-damage tests: each fill is an
@@ -55,6 +57,7 @@ int main(int argc, char** argv) {
     int probeNetSupported = 0;
     int timeoutMs = 5000;
     int overrideRedirect = 0;
+    int fullscreen = 0;
     int x = 0, y = 0, w = 200, h = 150;
     const char* fillColor = NULL;
     int stdinFills = 0;
@@ -75,6 +78,7 @@ int main(int argc, char** argv) {
         else if (!strcmp(argv[i], "--h") && i + 1 < argc) { h = atoi(argv[++i]); }
         else if (!strcmp(argv[i], "--fill") && i + 1 < argc) { fillColor = argv[++i]; }
         else if (!strcmp(argv[i], "--stdin-fills")) { stdinFills = 1; }
+        else if (!strcmp(argv[i], "--fullscreen")) { fullscreen = 1; }
     }
 
     xcb_connection_t* c = xcb_connect(NULL, NULL);
@@ -162,6 +166,15 @@ int main(int argc, char** argv) {
         uint32_t gcVal = fillColor ? (uint32_t)strtoul(fillColor, NULL, 16)
                                    : screen->black_pixel;
         xcb_create_gc(c, gc, win, gcMask, &gcVal);
+    }
+
+    // --fullscreen: declare EWMH fullscreen BEFORE mapping, the way games
+    // do (the WM reads _NET_WM_STATE during the manage step).
+    if (fullscreen) {
+        const xcb_atom_t NET_WM_STATE = intern(c, "_NET_WM_STATE");
+        const xcb_atom_t NET_WM_STATE_FULLSCREEN = intern(c, "_NET_WM_STATE_FULLSCREEN");
+        xcb_change_property(c, XCB_PROP_MODE_REPLACE, win, NET_WM_STATE, 4 /*ATOM*/, 32,
+                            1, &NET_WM_STATE_FULLSCREEN);
     }
 
     xcb_map_window(c, win);

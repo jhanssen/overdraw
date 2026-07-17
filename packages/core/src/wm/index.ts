@@ -16,6 +16,7 @@
 // direct calls because they manage membership and decoration, not state.
 
 import type { Resource } from "../types.js";
+import { effectiveStackZ } from "../subsurfaces.js";
 import { log as coreLog } from "../log.js";
 import type { CompositorSink } from "../protocols/ctx.js";
 import type { LayoutResult, LayoutReason } from "@overdraw/layout-types";
@@ -2117,9 +2118,13 @@ export function createWm(
       } else {
         candidates = [...windows];
       }
-      // Stable descending-z sort: ties keep candidate order (the tiled bucket
-      // shares one z but never overlaps, so the tie order is immaterial).
-      candidates.sort((a, b) => (b.z ?? 0) - (a.z ?? 0));
+      // Stable descending-effective-z sort: ties keep candidate order (the
+      // tiled bucket shares one z and never overlaps, so tie order is
+      // immaterial). effectiveStackZ lifts exclusive (fullscreen/maximized)
+      // windows above every other tier -- they DO overlap their suppressed
+      // island peers, and the renderer stacks them with the same key, so
+      // input and pixels agree.
+      candidates.sort((a, b) => effectiveStackZ(b) - effectiveStackZ(a));
       for (const win of candidates) {
         const r = win.rect;
         if (x < r.x || x >= r.x + r.width || y < r.y || y >= r.y + r.height) continue;
@@ -2296,6 +2301,12 @@ export function createWm(
         // from windowHasContent for that case).
         if (win.hasContent && changed.some((f) => STACKING_FIELDS.includes(f))) {
           assignZForMap(win);
+          pushStack();
+        } else if (win.hasContent && changed.includes("exclusive")) {
+          // Exclusive transitions change the window's EFFECTIVE stacking
+          // tier (effectiveStackZ lifts an exclusive window above every
+          // peer it now overlaps) without touching win.z, so the draw
+          // stack must be re-pushed even though no z was reassigned.
           pushStack();
         }
         // Modal transitions: tether or untether focus.
