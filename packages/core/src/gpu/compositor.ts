@@ -1538,6 +1538,10 @@ export class JsCompositor implements CompositorSink {
     // 0-255 straight-alpha color.
     color: { r: number; g: number; b: number; a: number };
   }>): void {
+    // Any count change repaints -- computed BEFORE the shrink loop below
+    // equalizes the lengths, so a removal-only update still damages the
+    // vacated regions.
+    let changed = this.backdropIds.length !== list.length;
     // Shrink: drop surplus backdrop surfaces.
     while (this.backdropIds.length > list.length) {
       const id = this.backdropIds.pop();
@@ -1548,7 +1552,6 @@ export class JsCompositor implements CompositorSink {
       s?.uniformBuf?.destroy();
       this.surfaces.delete(id);
     }
-    let changed = this.backdropIds.length !== list.length;
     for (let i = 0; i < list.length; i++) {
       const b = list[i];
       let id = this.backdropIds[i];

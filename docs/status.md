@@ -158,6 +158,12 @@ nothing, with no error. Worst-first.
   (transform/margin/mask, animated opacity) conservatively damage the
   whole output; (c) a content commit damages the surface's full output
   rect, not Layer-1 buffer damage mapped to an output sub-region.
+  One KNOWN correctness gap (code-level trace, no repro yet):
+  `removeSurface` damages `layoutW x layoutH`, which is zero-area for
+  content-sized surfaces (subsurfaces) -- their vacated region is not
+  repainted, leaving stale pixels until unrelated damage covers it.
+  `setSurfaceLayout` resolves the effective size for exactly this case;
+  the removal path does not.
 
 - **Large shm clients (e.g. fullscreen software-decoded video) may
   serialize against vsync.** Each `wl_surface.commit` with new shm content
