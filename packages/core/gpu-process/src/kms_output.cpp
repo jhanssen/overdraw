@@ -92,6 +92,9 @@ bool KmsOutputBackend::open(const char* /*title*/) {
     // 2-3: enable atomic + universal-planes caps.
     if (!enableDrmAtomicCaps(drmFd_)) return false;
     queryCursorSizeCaps(drmFd_, cursorCapW_, cursorCapH_);
+    asyncFlipCap_ = queryAsyncPageFlipCap(drmFd_);
+    std::printf("[kms] atomic async page flips (tearing): %s\n",
+                asyncFlipCap_ ? "supported" : "unsupported");
 
     // 4: pick the primary connector (env var OVERDRAW_CONNECTOR may pin a name).
     DrmTopology primaryTopo{};
@@ -295,7 +298,7 @@ void KmsOutputBackend::resetTransientFlipState(PerOutput& o) {
 
 void KmsOutputBackend::stashPresent(PerOutput& o, int slotIdx, uint32_t clientFbId,
                                     uint32_t clientBufId, uint32_t clientW,
-                                    uint32_t clientH, int inFenceFd) {
+                                    uint32_t clientH, int inFenceFd, bool tearing) {
     if (o.stashed.valid) {
         // Mailbox: the newer present supersedes the stashed one. A dropped
         // CLIENT present's buffer will never latch -- report it retired so
@@ -315,6 +318,7 @@ void KmsOutputBackend::stashPresent(PerOutput& o, int slotIdx, uint32_t clientFb
     o.stashed.clientW = clientW;
     o.stashed.clientH = clientH;
     o.stashed.fence = inFenceFd >= 0 ? ::fcntl(inFenceFd, F_DUPFD_CLOEXEC, 0) : -1;
+    o.stashed.tearing = tearing;
     o.stashed.valid = true;
 }
 
@@ -323,7 +327,7 @@ void KmsOutputBackend::replayStashedPresent(PerOutput& o) {
     const auto st = o.stashed;
     o.stashed = {};
     presentOutputImpl(o, st.slotIdx, st.fence, st.clientFbId, st.clientBufId,
-                      st.clientW, st.clientH);
+                      st.clientW, st.clientH, st.tearing);
     if (st.fence >= 0) ::close(st.fence);
 }
 
@@ -398,10 +402,11 @@ uint32_t KmsOutputBackend::importClientFb(int dmabufFd, uint32_t width, uint32_t
 
 bool KmsOutputBackend::presentClientFbAt(uint32_t outputId, uint32_t fbId,
                                          uint32_t width, uint32_t height,
-                                         uint32_t bufferId, int inFenceFd) {
+                                         uint32_t bufferId, int inFenceFd,
+                                         bool tearing) {
     PerOutput* o = find(outputId);
     if (!o || fbId == 0) return false;
-    return presentOutputImpl(*o, -1, inFenceFd, fbId, bufferId, width, height);
+    return presentOutputImpl(*o, -1, inFenceFd, fbId, bufferId, width, height, tearing);
 }
 
 void KmsOutputBackend::condemnClientFb(uint32_t fbId) {
@@ -859,7 +864,8 @@ void KmsOutputBackend::resume() {
 
 bool KmsOutputBackend::presentOutputImpl(PerOutput& o, int slotIdx, int inFenceFd,
                                          uint32_t clientFbId, uint32_t clientBufId,
-                                         uint32_t clientW, uint32_t clientH) {
+                                         uint32_t clientW, uint32_t clientH,
+                                         bool tearing) {
     if (paused_) {
         // The seat is disabled; the kernel has revoked DRM master and any
         // commit would EACCES. Swallow the present and discard the fence
@@ -876,7 +882,8 @@ bool KmsOutputBackend::presentOutputImpl(PerOutput& o, int slotIdx, int inFenceF
     // frames only -- the frame clock otherwise serializes presents).
     if (o.cursorFlipPending || o.clientFlipPending
         || (isClient && o.pendingFlipSlot != -1)) {
-        stashPresent(o, slotIdx, clientFbId, clientBufId, clientW, clientH, inFenceFd);
+        stashPresent(o, slotIdx, clientFbId, clientBufId, clientW, clientH,
+                     inFenceFd, tearing);
         return true;
     }
     const uint32_t fbId = isClient ? clientFbId : o.ring.slot(slotIdx).fbId;
@@ -902,6 +909,14 @@ bool KmsOutputBackend::presentOutputImpl(PerOutput& o, int slotIdx, int inFenceF
     //   PAGE_FLIP_EVENT | NONBLOCK. The kernel queues the flip for the next
     //   vblank and the page-flip event arrives via drmHandleEvent on the
     //   DRM fd in pump().
+    // wp_tearing_control: an async-requested client present flips
+    // immediately (mid-scanout, visible tear) instead of waiting for
+    // vblank. Only meaningful on a steady-state flip; the modeset commit
+    // can't tear. Kept best-effort: the TEST below drops the flag when
+    // the kernel refuses (a commit that changes more than the primary
+    // FB_ID -- e.g. the cursor moved this frame -- or a driver limit).
+    const bool wantAsync = tearing && isClient && asyncFlipCap_ && o.didInitialCommit;
+
     uint32_t flags = 0;
     if (!o.didInitialCommit) {
         if (o.modeBlobId == 0) {
@@ -911,6 +926,7 @@ bool KmsOutputBackend::presentOutputImpl(PerOutput& o, int slotIdx, int inFenceF
         flags = DRM_MODE_ATOMIC_ALLOW_MODESET;
     } else {
         flags = DRM_MODE_PAGE_FLIP_EVENT | DRM_MODE_ATOMIC_NONBLOCK;
+        if (wantAsync) flags |= DRM_MODE_PAGE_FLIP_ASYNC;
     }
 
     // Built as a lambda so the cursor-demotion path below can rebuild the
@@ -977,11 +993,18 @@ bool KmsOutputBackend::presentOutputImpl(PerOutput& o, int slotIdx, int inFenceF
     // TEST_ONLY must NOT include PAGE_FLIP_EVENT (the kernel rejects the
     // combination -- the test isn't a real commit so there's no flip to
     // signal). NONBLOCK is also irrelevant for TEST_ONLY.
-    const uint32_t testFlags = (flags & ~DRM_MODE_PAGE_FLIP_EVENT & ~DRM_MODE_ATOMIC_NONBLOCK)
-                              | DRM_MODE_ATOMIC_TEST_ONLY;
+    uint32_t testFlags = (flags & ~DRM_MODE_PAGE_FLIP_EVENT & ~DRM_MODE_ATOMIC_NONBLOCK)
+                        | DRM_MODE_ATOMIC_TEST_ONLY;
     drmModeAtomicReq* req = buildReq();
     if (!req) return false;
     int testRc = drmModeAtomicCommit(drmFd_, req, testFlags, this);
+    if (testRc != 0 && (flags & DRM_MODE_PAGE_FLIP_ASYNC)) {
+        // The async refusal must not cascade into cursor demotion below --
+        // retry vsynced first; the request itself is unchanged.
+        flags     &= ~DRM_MODE_PAGE_FLIP_ASYNC;
+        testFlags &= ~DRM_MODE_PAGE_FLIP_ASYNC;
+        testRc = drmModeAtomicCommit(drmFd_, req, testFlags, this);
+    }
     if (testRc != 0 && o.topo.cursorPlaneId && !o.cursorDemoted
         && o.cursorVisible && o.cursorImageValid) {
         // The cursor plane props may be what the kernel rejects (driver
@@ -1004,11 +1027,30 @@ bool KmsOutputBackend::presentOutputImpl(PerOutput& o, int slotIdx, int inFenceF
         return false;
     }
     int rc = drmModeAtomicCommit(drmFd_, req, flags, this);
+    if (rc != 0 && (flags & DRM_MODE_PAGE_FLIP_ASYNC)) {
+        // TEST passed but the real commit refused the async flip (state
+        // moved between the two); land the frame vsynced.
+        flags &= ~DRM_MODE_PAGE_FLIP_ASYNC;
+        rc = drmModeAtomicCommit(drmFd_, req, flags, this);
+    }
     drmModeAtomicFree(req);
     if (rc != 0) {
         std::fprintf(stderr, "[kms] atomic commit failed: %s (flags=0x%x)\n",
                      std::strerror(errno), flags);
         return false;
+    }
+    if (wantAsync) {
+        // One-shot per-output logs so a bare-metal run can tell whether
+        // tearing actually engaged for an async-requesting client.
+        if ((flags & DRM_MODE_PAGE_FLIP_ASYNC) && !o.tearingEngagedLogged) {
+            o.tearingEngagedLogged = true;
+            std::printf("[kms] output %u: tearing engaged (async page flip)\n",
+                        o.outputId);
+        } else if (!(flags & DRM_MODE_PAGE_FLIP_ASYNC) && !o.tearingFallbackLogged) {
+            o.tearingFallbackLogged = true;
+            std::printf("[kms] output %u: async flip refused; vsynced instead "
+                        "(may engage on later frames)\n", o.outputId);
+        }
     }
     // This commit carried the current desired cursor state.
     o.cursorDirty = false;

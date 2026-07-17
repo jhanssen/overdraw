@@ -1410,7 +1410,8 @@ void Compositor::renderFrame() {
 }
 
 bool Compositor::sendScanoutClientPresent(uint32_t outputId, uint32_t importId,
-                                          uint32_t bufferId, int acquireFenceFd) {
+                                          uint32_t bufferId, int acquireFenceFd,
+                                          bool tearing) {
     if (headless_ || !link_) {
         if (acquireFenceFd >= 0) ::close(acquireFenceFd);
         return false;
@@ -1427,6 +1428,7 @@ bool Compositor::sendScanoutClientPresent(uint32_t outputId, uint32_t importId,
     pl.textureId         = wh->second.id;
     pl.textureGeneration = wh->second.generation;
     pl.bufferId          = bufferId;
+    pl.flags             = tearing ? ipc::ScanoutClientPresentPayload::kFlagTearing : 0;
     uint8_t buf[ipc::ScanoutClientPresentPayload::kSize];
     pl.encode(buf);
     bool ok;

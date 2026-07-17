@@ -318,6 +318,18 @@ function applySurfaceState(ctx: Ctx, s: SurfaceRecord, bufferFresh: boolean): bo
     s.pending.opaqueRegion = undefined;
   }
 
+  // Apply the wp_tearing_control hint. undefined = unchanged; pushed on
+  // change or on compositor resync (same rule as viewport below).
+  let tearingChanged = !!s.needsCompositorResync;
+  if (s.pending.tearingHint !== undefined) {
+    s.tearingHint = s.pending.tearingHint;
+    s.pending.tearingHint = undefined;
+    tearingChanged = true;
+  }
+  if (tearingChanged) {
+    ctx.state.compositor.setSurfaceTearing?.(s.id, (s.tearingHint ?? 0) === 1);
+  }
+
   // Apply wp_viewport state. undefined = unchanged; push to the compositor
   // only when src or dst changed this cycle (OR the compositor surface
   // was torn down since the last apply -- after a role-detach the
@@ -379,6 +391,9 @@ function applySurfaceState(ctx: Ctx, s: SurfaceRecord, bufferFresh: boolean): bo
         }
         if (childRec.cached.viewportDst !== undefined) {
           childRec.pending.viewportDst = childRec.cached.viewportDst;
+        }
+        if (childRec.cached.tearingHint !== undefined) {
+          childRec.pending.tearingHint = childRec.cached.tearingHint;
         }
         if (childRec.cached.surfaceDamage) {
           (childRec.committed.surfaceDamage ??= []).push(...childRec.cached.surfaceDamage);
@@ -596,6 +611,10 @@ function commitNow(ctx: Ctx, s: SurfaceRecord): void {
     if (s.pending.viewportDst !== undefined) {
       s.cached.viewportDst = s.pending.viewportDst;
       s.pending.viewportDst = undefined;
+    }
+    if (s.pending.tearingHint !== undefined) {
+      s.cached.tearingHint = s.pending.tearingHint;
+      s.pending.tearingHint = undefined;
     }
     // Cache the syncobj points to be promoted alongside the buffer when
     // the parent commits.

@@ -88,6 +88,7 @@ const DEFAULT_INPUTS = [
   vendored('ext-data-control-v1.xml'),
   vendored('presentation-time.xml'),
   vendored('commit-timing-v1.xml'),
+  vendored('tearing-control-v1.xml'),
   vendored('ext-foreign-toplevel-list-v1.xml'),
   vendored('ext-image-capture-source-v1.xml'),
   vendored('ext-image-copy-capture-v1.xml'),

@@ -173,10 +173,11 @@ class KmsOutputBackend : public OutputBackend {
     // Put a client FB on outputId's primary plane. Returns false when the
     // atomic TEST rejects it (caller emits ScanoutClientReject and the
     // core composites; nothing was committed). bufferId is the core-side
-    // buffer key echoed through the flip listener.
+    // buffer key echoed through the flip listener. `tearing` requests an
+    // immediate (async) page flip, best-effort.
     bool presentClientFbAt(uint32_t outputId, uint32_t fbId,
                            uint32_t width, uint32_t height,
-                           uint32_t bufferId, int inFenceFd);
+                           uint32_t bufferId, int inFenceFd, bool tearing);
 
     // Mark a client FB for destruction. RmFB on a latched FB force-
     // disables the plane, so condemned FBs are destroyed only once no
@@ -308,6 +309,11 @@ class KmsOutputBackend : public OutputBackend {
         uint32_t pendingClientBufId = 0;
         bool clientFlipPending = false;
 
+        // One-shot log guards for wp_tearing_control presents (whether the
+        // first async-requested flip actually went async or fell back).
+        bool tearingEngagedLogged  = false;
+        bool tearingFallbackLogged = false;
+
         // Present stashed because another flip was in flight when it
         // arrived; issued from that flip's event. Either a ring slot
         // (slotIdx >= 0) or a client FB (clientFbId != 0). Fence fd is
@@ -319,6 +325,7 @@ class KmsOutputBackend : public OutputBackend {
             uint32_t clientW = 0;
             uint32_t clientH = 0;
             int fence = -1;
+            bool tearing = false;
             bool valid = false;
         } stashed;
     };
@@ -341,16 +348,19 @@ class KmsOutputBackend : public OutputBackend {
     // Present implementation operating on a given output. Exactly one of
     // slotIdx >= 0 (ring present) or clientFbId != 0 (client scanout
     // present) is set; the client variant carries the buffer dims (for
-    // SRC_W/H) and the core-side bufferId for flip reporting.
+    // SRC_W/H) and the core-side bufferId for flip reporting. `tearing`
+    // (client presents only) asks for an immediate (async) flip; the
+    // commit falls back to vsync when the kernel refuses.
     bool presentOutputImpl(PerOutput& o, int slotIdx, int inFenceFd,
                            uint32_t clientFbId = 0, uint32_t clientBufId = 0,
-                           uint32_t clientW = 0, uint32_t clientH = 0);
+                           uint32_t clientW = 0, uint32_t clientH = 0,
+                           bool tearing = false);
 
     // Stash a present that cannot commit now (another flip in flight);
     // replayed from that flip's completion event.
     void stashPresent(PerOutput& o, int slotIdx, uint32_t clientFbId,
                       uint32_t clientBufId, uint32_t clientW, uint32_t clientH,
-                      int inFenceFd);
+                      int inFenceFd, bool tearing);
     // Issue the stashed present (if any). Called from flip events.
     void replayStashedPresent(PerOutput& o);
     // Emit the client-flip listener event + advance latched bookkeeping
@@ -423,6 +433,10 @@ class KmsOutputBackend : public OutputBackend {
     gbm_device* gbm_ = nullptr;
     bool shouldClose_ = false;
     bool paused_ = false;
+    // Kernel accepts DRM_MODE_PAGE_FLIP_ASYNC on atomic commits
+    // (DRM_CAP_ATOMIC_ASYNC_PAGE_FLIP). Tearing presents are only
+    // attempted async when set; individual commits still TEST-fall-back.
+    bool asyncFlipCap_ = false;
     // Device-wide cursor FB dims (DRM_CAP_CURSOR_WIDTH/HEIGHT).
     uint32_t cursorCapW_ = 0;
     uint32_t cursorCapH_ = 0;

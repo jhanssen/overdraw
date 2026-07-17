@@ -1066,18 +1066,23 @@ static_assert(CursorPlaneStatusPayload::kSize == 13,
 // texture handle {textureId, textureGeneration} onto outputId's primary
 // plane. bufferId is the core-side stable wl_buffer id, echoed back in
 // ScanoutClientFlip / ScanoutClientReject so the core's buffer lifecycle
-// can hold/release/veto by its own key.
+// can hold/release/veto by its own key. flags bit 0 = the client prefers
+// an immediate (tearing) page flip (wp_tearing_control_v1); best-effort,
+// the GPU process falls back to a vsynced flip when the driver refuses.
 struct ScanoutClientPresentPayload {
+    static constexpr uint32_t kFlagTearing = 1u << 0;
     uint32_t outputId;
     uint32_t textureId;
     uint32_t textureGeneration;
     uint32_t bufferId;
-    static constexpr size_t kSize = 4 * 4;  // 16
+    uint32_t flags;
+    static constexpr size_t kSize = 5 * 4;  // 20
     void encode(uint8_t* out) const {
         putU32LE(out + 0,  outputId);
         putU32LE(out + 4,  textureId);
         putU32LE(out + 8,  textureGeneration);
         putU32LE(out + 12, bufferId);
+        putU32LE(out + 16, flags);
     }
     static ScanoutClientPresentPayload decode(const uint8_t* p) {
         ScanoutClientPresentPayload r{};
@@ -1085,10 +1090,11 @@ struct ScanoutClientPresentPayload {
         r.textureId         = getU32LE(p + 4);
         r.textureGeneration = getU32LE(p + 8);
         r.bufferId          = getU32LE(p + 12);
+        r.flags             = getU32LE(p + 16);
         return r;
     }
 };
-static_assert(ScanoutClientPresentPayload::kSize == 16,
+static_assert(ScanoutClientPresentPayload::kSize == 20,
               "ScanoutClientPresentPayload size mismatch with hand-counted layout");
 
 // ScanoutClientFlipPayload (gpu -> core; FrameKind::ScanoutClientFlip):

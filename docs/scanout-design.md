@@ -172,6 +172,31 @@ composite frames; only the present leg differs. wp_presentation
 reports zero-copy flags... (deferred: the feedback `kind` bits; v1
 reports the same as composite frames).
 
+## Tearing (wp_tearing_control_v1)
+
+An async-hinted surface (the hint is double-buffered wl_surface state;
+see the protocol handler) sets bit 0 of
+`ScanoutClientPresentPayload.flags`, and the GPU process adds
+`DRM_MODE_PAGE_FLIP_ASYNC` to the steady-state commit: the plane's FB
+swaps immediately, mid-scanout, instead of waiting for vblank. Strictly
+best-effort, in layers:
+
+- `DRM_CAP_ATOMIC_ASYNC_PAGE_FLIP` gates whether async is attempted at
+  all (queried once at backend open).
+- The atomic TEST runs with the async flag; on refusal the commit
+  retries vsynced *before* the cursor-demotion retry, so an async
+  refusal can never demote the hardware cursor. The kernel refuses any
+  async commit that changes more than the primary plane's FB_ID — a
+  frame that also moves the cursor plane simply lands vsynced.
+- A refusal of the real commit after a passing TEST retries vsynced too.
+
+Only client-scanout presents can tear; composited frames and the
+initial modeset never carry the flag. Pacing is unchanged: async flips
+still deliver page-flip events, so `ScanoutClientFlip`, buffer retire,
+and frame callbacks all ride the same path — just sooner. One-shot
+per-output logs (`tearing engaged` / `async flip refused`) record which
+way the first async-requested flip went.
+
 ## Explicitly out of scope (v1)
 
 - Plane-scaled scanout (buffer != mode via SRC/CRTC scaling) — needs
@@ -179,7 +204,5 @@ reports the same as composite frames).
 - Alpha-fourcc fullscreen surfaces (would need an opaque-region
   check or an undercoat guarantee).
 - Overlay planes for non-fullscreen surfaces.
-- Tearing (`wp_tearing_control_v1`) — next feature; slots into the
-  client-present commit flags.
 - Multi-GPU blit path (cross-card buffers fail AddFB2 and fall back
   to compositing, which is correct, just not zero-copy).

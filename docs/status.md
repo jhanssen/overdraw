@@ -851,7 +851,16 @@ type-check under `tsc --strict`.
   `ext_foreign_toplevel_image_capture_source_manager_v1`
   (output and per-toplevel screenshot/screen-share capture into
   client shm buffers; tested end-to-end via the
-  `ext-image-copy-capture-client` test client).
+  `ext-image-copy-capture-client` test client),
+  `wp_tearing_control_manager_v1` / `wp_tearing_control_v1` (per-surface
+  presentation hint, double-buffered on commit; only consulted while the
+  surface is scanned out directly on KMS -- the hint rides the scanout
+  present and the GPU process attempts `DRM_MODE_PAGE_FLIP_ASYNC`,
+  TEST-falling back to a vsynced flip when the kernel refuses, e.g. the
+  cursor moved that frame or no `DRM_CAP_ATOMIC_ASYNC_PAGE_FLIP`;
+  composited output always presents vsynced; protocol state machine
+  unit-tested in `test/wp-tearing-control.test.js`; the async-flip leg
+  itself needs bare-metal verification).
 - **Implemented, input-region path exercised via hit-testing:** `wl_region`
   (opaque region stored but unconsumed -- see "Read first");
   `zwp_linux_dmabuf_feedback_v1` (exercised by real WSI clients).

@@ -578,6 +578,10 @@ interface Surface {
   // sampled buffer region (surface coords). null/undefined = unset.
   viewportDst?: { width: number; height: number } | null;
   viewportSrc?: { x: number; y: number; width: number; height: number } | null;
+  // wp_tearing_control_v1: the client prefers async (tearing) page flips.
+  // Pure presentation hint consulted by the direct-scanout present; it never
+  // affects composited pixels, so changing it damages nothing.
+  tearingAsync?: boolean;
   // xdg_surface.set_window_geometry: surface-local sub-rect the
   // client considers its "window" (excluding shadow / pop-out
   // chrome). When set, the buffer renders anchored so this rect's
@@ -2003,6 +2007,11 @@ export class JsCompositor implements CompositorSink {
     s.viewportDst = dst;
     s.viewportSrc = src;
     this.damageSurface(id);
+  }
+
+  setSurfaceTearing(id: number, async: boolean): void {
+    const s = this.surfaces.get(id) ?? this.ensureSurface(id);
+    s.tearingAsync = async;
   }
 
   setSurfaceGeometry(
@@ -3545,7 +3554,8 @@ export class JsCompositor implements CompositorSink {
         if (cand) {
           const fence = this.takeScanoutAcquireFence(cand.bufferId);
           if (this.addon.sendScanoutClientPresent?.(o.id, cand.importId,
-                                                    cand.bufferId, fence)) {
+                                                    cand.bufferId, fence,
+                                                    cand.tearing)) {
             this.dispatch(this.lifecycle.step({
               kind: "scanoutPresented", bufferId: cand.bufferId,
             }));
@@ -4463,7 +4473,7 @@ export class JsCompositor implements CompositorSink {
   // phantom, layer shell, decoration) is its own entry, so length !== 1
   // covers the whole "something else is visible" family.
   private scanoutCandidate(o: OutputGeom, draw: readonly number[]):
-      { bufferId: number; importId: number } | null {
+      { bufferId: number; importId: number; tearing: boolean } | null {
     if (!this.directScanoutEnabled || this.headless) return null;
     if (!this.addon.sendScanoutClientPresent) return null;
     if (draw.length !== 1) return null;
@@ -4491,7 +4501,7 @@ export class JsCompositor implements CompositorSink {
     if (s.fx.shape !== null) return null;
     if (this.cameras.has(o.id)) return null;
     if (this.scanoutVeto.get(o.id)?.has(bufferId)) return null;
-    return { bufferId, importId: imp.importId };
+    return { bufferId, importId: imp.importId, tearing: s.tearingAsync === true };
   }
 
   // Consume the buffer's stashed explicit-sync acquire fence for a scanout

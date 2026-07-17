@@ -166,6 +166,12 @@ bool pickCursorPlane(int drmFd, uint32_t crtcId, uint32_t& outPlaneId,
 // top-left with transparent padding.
 void queryCursorSizeCaps(int drmFd, uint32_t& outWidth, uint32_t& outHeight);
 
+// True when the kernel accepts DRM_MODE_PAGE_FLIP_ASYNC on atomic commits
+// (DRM_CAP_ATOMIC_ASYNC_PAGE_FLIP, kernel 6.8+). Gates whether immediate
+// (tearing) flips are attempted at all; individual commits are still
+// TEST-validated and fall back to vsync when refused.
+bool queryAsyncPageFlipCap(int drmFd);
+
 // Resolve the cursor plane's property ids into topo.cursorPlaneProps.
 // Returns false (and zeroes cursorPlaneId) if any required property is
 // missing -- cursor support is optional, so the caller keeps going with

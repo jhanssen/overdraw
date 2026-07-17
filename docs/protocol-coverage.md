@@ -31,6 +31,7 @@ Overdraw advertises **27** registry-visible globals (one of which,
   `wp_presentation` v2.
 - Staging: `wp_cursor_shape_manager_v1` v2,
   `wp_fractional_scale_manager_v1` v1,
+  `wp_tearing_control_manager_v1` v1,
   `wp_linux_drm_syncobj_manager_v1` v1, `ext_workspace_manager_v1` v1,
   `ext_data_control_manager_v1` v1,
   `ext_foreign_toplevel_list_v1` v1,
@@ -157,11 +158,6 @@ the rest.
   all clients; the latter two are Wayland-side counterparts of X-side
   grabs. Effort: ~3 days for the cluster. See the discussion in
   `docs/xwayland-design.md` for the Xwayland-specific framing.
-
-- **`wp_tearing_control_manager_v1`** — a client can hint "tearing is
-  OK here" so the compositor can skip vblank pacing for that surface.
-  Used by competitive gamers. Effort: ~0.5 day; the protocol is a
-  hint, no scheduling change required to land the global.
 
 - **`zwp_pointer_gestures_v1`** — touchpad gesture events (swipe,
   pinch, hold) reach the focused client. Without it, browser pinch-

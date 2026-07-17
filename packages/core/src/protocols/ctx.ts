@@ -103,6 +103,9 @@ export interface SurfaceRecord {
     // clock domain). Consumed by wl_surface.commit: the commit's content
     // update is not latched before this time.
     commitTimestamp?: bigint;
+    // wp_tearing_control_v1 presentation hint (double-buffered): 0 = vsync,
+    // 1 = async (tearing OK). undefined = unchanged this cycle.
+    tearingHint?: number;
   };
   committed: {
     buffer: Resource | null; bufferScale?: number; bufferTransform?: number;
@@ -135,6 +138,7 @@ export interface SurfaceRecord {
     bufferDamage?: DamageRect[];
     syncobjAcquire?: SyncobjPoint;
     syncobjRelease?: SyncobjPoint;
+    tearingHint?: number;
   };
   // wp_commit_timing_v1 timed-commit queue. A commit carrying a timestamp
   // (or arriving while earlier queued commits are still waiting -- content
@@ -166,6 +170,12 @@ export interface SurfaceRecord {
   viewportDst?: ViewportDst | null;
   // True once a wp_viewport has been created for this surface (one per surface).
   hasViewport?: boolean;
+  // Applied wp_tearing_control_v1 hint: 1 = the client prefers async
+  // (tearing) page flips. Default/absent = vsync.
+  tearingHint?: number;
+  // Set while a wp_tearing_control_v1 exists for this surface (one per
+  // surface; a second get_tearing_control posts tearing_control_exists).
+  hasTearingControl?: boolean;
   // Applied input region. Used for hit-testing in surface-local coords.
   // null = "infinite" (whole surface accepts input -- the spec's initial
   // state). A non-null empty Region (no rects) = "no input anywhere" --
@@ -326,6 +336,10 @@ export interface CompositorSink {
   // wp_viewport: dst overrides the surface's logical size; src crops the
   // sampled buffer region (surface coords). null clears either.
   setSurfaceViewport?(id: number, dst: ViewportDst | null, src: ViewportSrc | null): void;
+  // wp_tearing_control_v1: the client prefers immediate (tearing) page flips
+  // for this surface. Only consulted while the surface is scanned out
+  // directly; composited output always presents vsynced.
+  setSurfaceTearing?(id: number, async: boolean): void;
   // xdg_surface.set_window_geometry: the sub-rect of the surface (in
   // surface-local logical coords) that the client considers its
   // "window" -- the rest is shadow / pop-out that should render
@@ -733,6 +747,8 @@ export interface CompositorState {
   xdgOutputResources?: Map<number, Set<Resource>>;
   // wp_viewport resource -> its wl_surface resource (one viewport per surface).
   viewports?: Map<Resource, Resource>;
+  // wp_tearing_control_v1 resource -> its wl_surface resource (one per surface).
+  tearingControls?: Map<Resource, Resource>;
   // wp_commit_timer_v1 resource -> its wl_surface resource (one timer per
   // surface). The entry survives surface destruction (mapping to the dead
   // resource) so set_timestamp can distinguish "surface destroyed" (the

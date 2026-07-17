@@ -2285,10 +2285,12 @@ int run(int wireFd, int ctrlFd, int inputFd, bool headless,
                         ct.planeOffset, ct.planeStride);
                     if (ct.kmsFbId == 0) ct.kmsFbRejected = true;
                 }
+                const bool tearing =
+                    (p.flags & ipc::ScanoutClientPresentPayload::kFlagTearing) != 0;
                 if (ct.kmsFbRejected
                     || !kms->presentClientFbAt(p.outputId, ct.kmsFbId,
                                                ct.width, ct.height,
-                                               p.bufferId, fenceFd)) {
+                                               p.bufferId, fenceFd, tearing)) {
                     reject();
                 }
                 if (fenceFd >= 0) ::close(fenceFd);

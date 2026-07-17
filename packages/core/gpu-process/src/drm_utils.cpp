@@ -323,6 +323,16 @@ void queryCursorSizeCaps(int drmFd, uint32_t& outWidth, uint32_t& outHeight) {
     outHeight = static_cast<uint32_t>(h);
 }
 
+// Older libdrm headers predate the cap; the kernel ABI value is stable.
+#ifndef DRM_CAP_ATOMIC_ASYNC_PAGE_FLIP
+#define DRM_CAP_ATOMIC_ASYNC_PAGE_FLIP 0x15
+#endif
+
+bool queryAsyncPageFlipCap(int drmFd) {
+    uint64_t v = 0;
+    return drmGetCap(drmFd, DRM_CAP_ATOMIC_ASYNC_PAGE_FLIP, &v) == 0 && v != 0;
+}
+
 bool resolveCursorPlaneProperties(int drmFd, DrmTopology& topo) {
     if (!topo.cursorPlaneId) return false;
     walkProperties(drmFd, topo.cursorPlaneId, DRM_MODE_OBJECT_PLANE,

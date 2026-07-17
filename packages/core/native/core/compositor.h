@@ -432,10 +432,12 @@ class Compositor {
     // names the buffer by its importId (resolved to the wire texture
     // handle the GPU process keys its retained fd by); acquireFenceFd >= 0
     // is the explicit-sync acquire sync_file (ownership taken -- closed
-    // after the dup into the wire queue). Returns false when the import
-    // is unknown (caller falls back to compositing).
+    // after the dup into the wire queue); tearing asks for an immediate
+    // (async) page flip when the driver allows it (best-effort). Returns
+    // false when the import is unknown (caller falls back to compositing).
     bool sendScanoutClientPresent(uint32_t outputId, uint32_t importId,
-                                  uint32_t bufferId, int acquireFenceFd);
+                                  uint32_t bufferId, int acquireFenceFd,
+                                  bool tearing);
 
     // Client-scanout flips: pacing rides the ordinary flip-complete queue
     // (the inbound handler pushes there too); these entries carry the

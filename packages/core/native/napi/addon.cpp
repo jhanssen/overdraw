@@ -1802,13 +1802,14 @@ napi_value SendCursorState(napi_env env, napi_callback_info info) {
     return nullptr;
 }
 
-// sendScanoutClientPresent(outputId, importId, bufferId, fence?: WaylandFd|null)
-// -> boolean. Put the imported client dmabuf on the output's primary plane
-// (direct scanout). The optional fence is the explicit-sync acquire
-// sync_file (consumed). false = the frame was not queued (unknown import);
-// the caller composites instead.
+// sendScanoutClientPresent(outputId, importId, bufferId, fence?: WaylandFd|null,
+// tearing?: boolean) -> boolean. Put the imported client dmabuf on the
+// output's primary plane (direct scanout). The optional fence is the
+// explicit-sync acquire sync_file (consumed); tearing requests an immediate
+// (async) page flip, best-effort. false = the frame was not queued (unknown
+// import); the caller composites instead.
 napi_value SendScanoutClientPresent(napi_env env, napi_callback_info info) {
-    size_t argc = 4; napi_value argv[4];
+    size_t argc = 5; napi_value argv[5];
     napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
     napi_value fals;
     napi_get_boolean(env, false, &fals);
@@ -1825,8 +1826,10 @@ napi_value SendScanoutClientPresent(napi_env env, napi_callback_info info) {
             fenceFd = overdraw::wayland::takeWaylandFd(env, argv[3]);
         }
     }
+    bool tearing = false;
+    if (argc >= 5) napi_get_value_bool(env, argv[4], &tearing);
     const bool ok = g_addon.compositor->sendScanoutClientPresent(
-        outputId, importId, bufferId, fenceFd);
+        outputId, importId, bufferId, fenceFd, tearing);
     napi_value out;
     napi_get_boolean(env, ok, &out);
     return out;

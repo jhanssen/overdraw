@@ -16,7 +16,8 @@ one release behind drops it and fails the build for the opposite reason.
 | Source | Version | Files |
 | --- | --- | --- |
 | wayland | 1.25.0 | `wayland.xml` |
-| wayland-protocols | 1.49 | everything else, except the four below |
+| wayland-protocols | 1.49 | everything else, except the rows below |
+| wayland-protocols | 1.47 | `tearing-control-v1.xml` (interface version 1, identical in 1.49) |
 | wlroots | — | `wlr-*.xml`, `kde-server-decoration.xml` |
 | Mesa | — | `wayland-drm.xml` |
 

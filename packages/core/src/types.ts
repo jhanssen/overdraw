@@ -489,15 +489,18 @@ export interface Addon {
   // Direct scanout of client dmabufs (KMS; scanout-design.md).
   // sendScanoutClientPresent puts the imported buffer on the output's
   // primary plane; `fence` is the explicit-sync acquire sync_file
-  // (consumed). Returns false when the frame was not queued (unknown
-  // import) -- composite instead. setOnScanoutClientFlip reports each
+  // (consumed); `tearing` asks for an immediate (async) page flip when
+  // the driver allows it (wp_tearing_control_v1; best-effort, falls back
+  // to a vsynced flip). Returns false when the frame was not queued
+  // (unknown import) -- composite instead. setOnScanoutClientFlip reports each
   // scanout flip's latch/retire pair (release the retired buffer);
   // setOnScanoutClientReject reports a kernel refusal (veto + repaint).
   // scanoutFormatIndices returns the dmabuf-feedback format-table indices
   // the output's primary plane accepts (the scanout tranche; empty when
   // unknown/nested). All optional: absent on test sinks and non-KMS.
   sendScanoutClientPresent?(outputId: number, importId: number,
-                            bufferId: number, fence: WaylandFd | null): boolean;
+                            bufferId: number, fence: WaylandFd | null,
+                            tearing?: boolean): boolean;
   setOnScanoutClientFlip?(cb: ((msg: {
     outputId: number; latchedBufferId: number; retiredBufferId: number;
   }) => void) | null): void;
