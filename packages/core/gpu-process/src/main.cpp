@@ -242,7 +242,11 @@ int run(int wireFd, int ctrlFd, int inputFd, bool headless,
     std::function<void(ipc::FrameKind, const std::vector<uint8_t>&,
                        const int*, int)> dispatchCoreControlFrame;
 
+    // True while pumpWire is on the stack: runSurfaceBegin's cross-wire drain
+    // must not re-enter the core wire reader mid-iteration.
+    bool corePumpActive = false;
     auto pumpWire = [&]() -> bool {
+        corePumpActive = true;
         bool alive = wireReader.readAvailable();
         ipc::FrameKind kind;
         std::vector<uint8_t> frame;
@@ -269,6 +273,7 @@ int run(int wireFd, int ctrlFd, int inputFd, bool headless,
             dawn::native::DeviceTick(tickDev);
             serializer.Flush();
         }
+        corePumpActive = false;
         return alive;
     };
 
@@ -1381,36 +1386,55 @@ int run(int wireFd, int ctrlFd, int inputFd, bool headless,
         SurfaceBuf& sb = it->second;
         // CROSS-WIRE FENCE ORDERING (consumer Begin only).
         //
-        // The consumer Begin rides the CORE wire while the matching producer
-        // End rides the PLUGIN wire -- two independent FIFOs. The event loop
-        // pumps the core wire before each plugin connection, so when both
-        // frames are buffered at the start of one iteration, the consumer
-        // Begin is decoded first. That opens the bracket with no fence wait
-        // AND a UNDEFINED -> GENERAL image-layout transition, which Vulkan is
-        // allowed to discard the image contents on. Result: a corrupt or
-        // empty consumer sample on that slot until the next cycle heals it.
-        //
-        // SAFE BY CONSTRUCTION: the worker writes producer End to its socket
-        // BEFORE sending the surface.present IPC that triggers the consumer
-        // Begin. So whenever we see a consumer Begin with the producer's
-        // bracket still open on this buf, the producer End is already in the
-        // kernel recv buffer for the owning plugin connection. A single
-        // non-blocking drain of that connection picks it up before we open
-        // the consumer bracket. No poll, no event-loop stall.
+        // The consumer Begin and the matching producer End travel on
+        // DIFFERENT fds; which fd carries the End depends on the direction:
+        //   producerOnCore=false (AllocSurfaceBuf): producer End on the
+        //     owning PLUGIN wire, consumer Begin on the core wire.
+        //   producerOnCore=true (AllocComposeBuf): producer End on the CORE
+        //     wire, consumer Begin on the plugin wire.
+        // The notification that triggers the consumer's Begin (present /
+        // input-ready IPC) rides yet another channel and can beat the End
+        // bytes -- under load the producing side's serializer may not even
+        // have flushed them yet. Opening the consumer bracket early does an
+        // UNDEFINED -> GENERAL layout transition (Vulkan may discard the
+        // contents) and corrupts the bracket state the producer's next Begin
+        // depends on: the producer's renders then fail access validation and
+        // the effect goes permanently dark. Enforce the ordering: drain the
+        // PRODUCING side's fd, waiting (bounded) for the End to decode.
         if (!producer && (sb.producerOpen || !sb.everProduced)) {
+            const auto ended = [&] { return !sb.producerOpen && sb.everProduced; };
             PluginConn* owner = nullptr;
-            for (auto& c : pluginConns) if (c->connId == sb.connId) { owner = c.get(); break; }
-            if (owner) {
-                owner->pump();
-                owner->barrier.drain(owner->reader->bytesConsumed());
-                if (sb.producerOpen || !sb.everProduced) {
-                    std::fprintf(stderr,
-                        "[gpu] ConsumerBegin buf=%u: producer End not yet decoded after pump "
-                        "(producerOpen=%d everProduced=%d). Proceeding with no fence wait; "
-                        "this slot may sample stale/zeroed contents.\n",
-                        surfaceBufId,
-                        sb.producerOpen ? 1 : 0, sb.everProduced ? 1 : 0);
+            if (!sb.producerOnCore) {
+                for (auto& c : pluginConns) if (c->connId == sb.connId) { owner = c.get(); break; }
+            }
+            const int stepMs = 5;
+            for (int waited = 0; !ended() && waited <= 200; waited += stepMs) {
+                int drainFd = -1;
+                if (sb.producerOnCore) {
+                    // Nested inside core-wire dispatch: the reader is mid-
+                    // iteration and must not be re-entered; fall through to
+                    // the warning below.
+                    if (corePumpActive) break;
+                    pumpWire();
+                    drainFd = wireFd;
+                } else if (owner) {
+                    owner->pump();
+                    owner->barrier.drain(owner->reader->bytesConsumed());
+                    drainFd = owner->fd;
+                } else {
+                    break;
                 }
+                if (ended()) break;
+                pollfd pw{drainFd, POLLIN, 0};
+                ::poll(&pw, 1, stepMs);
+            }
+            if (!ended()) {
+                std::fprintf(stderr,
+                    "[gpu] ConsumerBegin buf=%u: producer End not decoded after bounded "
+                    "wait (producerOnCore=%d producerOpen=%d everProduced=%d). Proceeding "
+                    "with no fence wait; this slot may sample stale/zeroed contents.\n",
+                    surfaceBufId, sb.producerOnCore ? 1 : 0,
+                    sb.producerOpen ? 1 : 0, sb.everProduced ? 1 : 0);
             }
         }
         wgpu::SharedTextureMemory& mem = producer ? sb.producerMem : sb.consumerMem;
