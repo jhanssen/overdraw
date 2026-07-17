@@ -204,6 +204,12 @@ interface OutgoingTransfer {
   // (EOF signal). The next PROPERTY_DELETE on the requestor's destination
   // property destroys the transfer.
   eofPropertyWritten: boolean;
+  // Set by destroyOutgoingTransfer. The ReadStream's data/end/error
+  // callbacks fire ASYNCHRONOUSLY and can land after the transfer was
+  // purged (superseded by a newer SelectionRequest from the same
+  // requestor, or torn down); acting on them then would write an empty
+  // property + SelectionNotify over the requestor's CURRENT transfer.
+  destroyed: boolean;
 }
 
 interface SelectionInstance {
@@ -679,6 +685,7 @@ export function startSelectionBridge(
       buffer: [], bufferTotal: 0,
       incr: false, eof: false, selectionNotifySent: false,
       awaitingRequestorAck: false, eofPropertyWritten: false,
+      destroyed: false,
     };
     sel.outgoingTransfers.set(requestor, transfer);
 
@@ -697,17 +704,30 @@ export function startSelectionBridge(
       }
     };
     readStream.on("data", (chunk: string | Buffer) => {
+      if (transfer.destroyed) return;
       const buf = typeof chunk === "string" ? Buffer.from(chunk) : chunk;
       transfer.buffer.push(buf);
       transfer.bufferTotal += buf.byteLength;
       onDataOrEof();
     });
     readStream.on("end", () => {
+      if (transfer.destroyed) return;
       transfer.eof = true;
+      if (transfer.bufferTotal === 0 && transfer.buffer.length === 0) {
+        // A zero-byte outgoing transfer means the wl source closed the pipe
+        // without writing -- always suspicious (mime mismatch, source died
+        // mid-transfer, fd lost in transit). The requestor will see an
+        // empty paste; leave a trace for diagnosis.
+        console.error(`[xwayland] selection: outgoing transfer EOF with 0 bytes `
+          + `(mime=${transfer.mime} requestor=0x${requestor.toString(16)})`);
+      }
       onDataOrEof();
     });
-    readStream.on("error", () => {
+    readStream.on("error", (err: Error) => {
+      if (transfer.destroyed) return;   // late error from the purge's close
       transfer.eof = true;
+      console.error(`[xwayland] selection: outgoing transfer read error `
+        + `(mime=${transfer.mime} buffered=${transfer.bufferTotal}): ${err.message}`);
       onDataOrEof();
     });
 
@@ -835,6 +855,7 @@ export function startSelectionBridge(
   }
 
   function destroyOutgoingTransfer(sel: SelectionInstance, t: OutgoingTransfer): void {
+    t.destroyed = true;   // detach the stream callbacks (they fire async)
     sel.outgoingTransfers.delete(t.requestor);
     try { t.readStream.destroy(); } catch { /* ignore */ }
     fsCloseSafe(t.pipeReadFd);
