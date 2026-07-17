@@ -643,6 +643,18 @@ export interface CompositorSink {
   setCursorPixels?(bytes: Uint8Array,
                    width: number, height: number,
                    hotspotX: number, hotspotY: number): void;
+  // Theme-shape install by resolver: `resolve` produces the shape at any
+  // requested device-pixel size so the compositor can pick a native-
+  // resolution image per output (software slot at the highest output
+  // scale; each cursor plane at its exact scale). Returns false -- current
+  // cursor untouched -- when the shape doesn't resolve. Preferred over
+  // setCursorPixels for anything the XCursor resolver produces.
+  setCursorShape?(resolve: (deviceSizePx: number) => {
+                    width: number; height: number;
+                    hotspotX: number; hotspotY: number;
+                    rgba: Uint8Array;
+                  } | null,
+                  logicalSizePx: number): boolean;
   setCursorFromSurface?(surfaceId: number | null,
                         hotspotX: number, hotspotY: number): void;
   setCursorTexture?(tex: GPUTexture, width: number, height: number,

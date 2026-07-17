@@ -243,8 +243,14 @@ Division of labor:
   to present get `commitNow=false` (the present carries the state);
   clean outputs get `commitNow=true`. Positions are device pixels
   relative to the output with the hotspot pre-applied (aquamarine-
-  style: no HOTSPOT props); dst dims are scaled GPU-process-side
-  (bilinear) when image scale != output scale.
+  style: no HOTSPOT props). Theme shapes install by resolver
+  (`setCursorShape(resolve, logicalSizePx)`): each plane output gets
+  its own resolve at `logicalSizePx * scale` device pixels and the
+  software slot resolves at the highest output scale (the internal
+  surface's bufferScale keeps the logical size constant), so theme
+  cursors are native-sharp at every scale. Only fixed-bitmap installs
+  (plugin `set-image` bytes) fall back to a GPU-process-side bilinear
+  upscale when image scale != output scale.
 
 Per-output fallback to the software slot whenever the plane can't
 serve: no cursor plane on the CRTC, image larger than the cursor FB,

@@ -1369,7 +1369,15 @@ export class JsCompositor implements CompositorSink {
         this.hwCursorHotspotDev.delete(id);
       }
     }
-    this.refreshHwCursorImage();
+    // A theme-shape cursor re-resolves against the (possibly changed)
+    // output scales -- both the software image (highest scale) and each
+    // plane's exact-scale copy. Fixed-bitmap / client cursors just re-ship.
+    const shp = this.cursorShapeResolver;
+    if (shp && this.cursorTargetSurfaceId === this.internalCursorSurfaceId) {
+      this.setCursorShape(shp.resolve, shp.logicalSizePx);
+    } else {
+      this.refreshHwCursorImage();
+    }
     // Mirror output 0's device dims/scale into the primary fields so paths that
     // still read this.width/height/scale (readback, freeze snapshots) match it.
     const primary = this.outputsGeom.get(OUTPUT_DEFAULT);
@@ -4171,6 +4179,17 @@ export class JsCompositor implements CompositorSink {
   // CPU bytes behind the internal cursor surface (theme cursors); null when
   // the internal surface holds a GPU texture we have no bytes for.
   private cursorPixelBytes: { bytes: Uint8Array; width: number; height: number } | null = null;
+  // Theme-shape source able to re-resolve the current shape at any device
+  // pixel size, so each output gets a native-resolution image (software
+  // slot: highest output scale; cursor planes: exact per-output scale).
+  // Null when the cursor is a fixed bitmap / texture / client surface.
+  private cursorShapeResolver: {
+    resolve: (deviceSizePx: number) => {
+      width: number; height: number; hotspotX: number; hotspotY: number;
+      rgba: Uint8Array;
+    } | null;
+    logicalSizePx: number;
+  } | null = null;
   // Latest shm buffer source per surface, recorded on every shm commit so a
   // client cursor surface's pixels can be referenced by pool without a
   // readback (the GPU process has the pool mapped). Dmabuf commits clear
@@ -4249,13 +4268,43 @@ export class JsCompositor implements CompositorSink {
         continue;
       }
       let sent = false;
-      if (sid === this.internalCursorSurfaceId && this.cursorPixelBytes && sendPixels) {
-        // Theme / CPU-byte cursor: logical dims scale up to device dims.
+      let hotDev: { x: number; y: number } | null = null;
+      const shp = this.cursorShapeResolver;
+      if (sid === this.internalCursorSurfaceId && shp && sendPixels) {
+        // Theme shape: re-resolve at THIS output's exact device size so
+        // the plane shows a native-resolution image (no upscale). The
+        // theme may return a different stored size; the GPU-side copy
+        // scales it to the requested dst, and the hotspot rides the same
+        // ratio so it stays anchored to the same image feature.
+        const D = Math.max(1, Math.round(shp.logicalSizePx * o.scale));
+        if (D <= caps.maxW) {
+          const r = shp.resolve(D);
+          if (r) {
+            const dstW = D;
+            const dstH = Math.max(1, Math.round((D * r.height) / r.width));
+            if (dstH <= caps.maxH) {
+              sendPixels(outputId, r.rgba, r.width, r.height, dstW, dstH);
+              hotDev = {
+                x: Math.round((r.hotspotX * dstW) / r.width),
+                y: Math.round((r.hotspotY * dstH) / r.height),
+              };
+              sent = true;
+            }
+          }
+        }
+      } else if (sid === this.internalCursorSurfaceId && !shp
+                 && this.cursorPixelBytes && sendPixels) {
+        // Fixed 1x bitmap (plugin set-image bytes): logical dims scale up
+        // to device dims.
         const p = this.cursorPixelBytes;
         const dstW = Math.round(p.width * o.scale);
         const dstH = Math.round(p.height * o.scale);
         if (dstW >= 1 && dstH >= 1 && dstW <= caps.maxW && dstH <= caps.maxH) {
           sendPixels(outputId, p.bytes, p.width, p.height, dstW, dstH);
+          hotDev = {
+            x: Math.round(this.cursorHotspotX * o.scale),
+            y: Math.round(this.cursorHotspotY * o.scale),
+          };
           sent = true;
         }
       } else if (sid !== this.internalCursorSurfaceId && sendShm) {
@@ -4269,20 +4318,21 @@ export class JsCompositor implements CompositorSink {
           if (dstW >= 1 && dstH >= 1 && dstW <= caps.maxW && dstH <= caps.maxH) {
             sendShm(outputId, shm.poolId, shm.offset, shm.stride,
                     shm.width, shm.height, dstW, dstH);
+            hotDev = {
+              x: Math.round(this.cursorHotspotX * o.scale),
+              y: Math.round(this.cursorHotspotY * o.scale),
+            };
             sent = true;
           }
         }
       }
-      if (!sent) {
+      if (!sent || !hotDev) {
         this.deactivateHwCursor(outputId, { dropCaps: false, sendDisable: true });
         continue;
       }
-      // Hotspot in device pixels (the state sends plane positions already
-      // hotspot-adjusted; hotspots are surface-logical units).
-      this.hwCursorHotspotDev.set(outputId, {
-        x: Math.round(this.cursorHotspotX * o.scale),
-        y: Math.round(this.cursorHotspotY * o.scale),
-      });
+      // Plane positions are sent already hotspot-adjusted; this is the
+      // per-output device-pixel hotspot that adjustment uses.
+      this.hwCursorHotspotDev.set(outputId, hotDev);
       if (!this.hwCursorActive.has(outputId)) {
         // Erase the software-drawn cursor from this output's next frame
         // BEFORE marking it hardware (the damage helper skips hw outputs).
@@ -4369,14 +4419,16 @@ export class JsCompositor implements CompositorSink {
     if (this.cursorVisible) this.damageCursorRect(s.x, s.y, s.layoutW, s.layoutH);
   }
 
-  // Install a CPU-side BGRA8 cursor image into the internal cursor surface
-  // and point the cursor slot at it. Allocates / reuses a core-device
-  // texture; uploads via queue.writeTexture.
-  setCursorPixels(bytes: Uint8Array,
-                  width: number, height: number,
-                  hotspotX: number, hotspotY: number): void {
+  // Shared install: upload BGRA8 bytes to the compositor-owned texture,
+  // point the slot at the internal cursor surface, and stamp its
+  // bufferScale (image px per logical unit -- fractional is fine, the
+  // layout just divides) and the LOGICAL hotspot.
+  private installCursorPixels(bytes: Uint8Array,
+                              width: number, height: number,
+                              hotspotX: number, hotspotY: number,
+                              bufferScale: number): void {
     if (width <= 0 || height <= 0 || bytes.length !== width * height * 4) {
-      throw new Error(`setCursorPixels: invalid dims/bytes (${width}x${height}, ${bytes.length} bytes)`);
+      throw new Error(`installCursorPixels: invalid dims/bytes (${width}x${height}, ${bytes.length} bytes)`);
     }
     const owned = this.cursorOwnedTexture;
     let tex = owned;
@@ -4406,12 +4458,55 @@ export class JsCompositor implements CompositorSink {
       this.surfaces.set(this.internalCursorSurfaceId, blankSurface(0, 0, width, height));
     }
     this.setSurfaceTexture(this.internalCursorSurfaceId, tex, width, height);
+    const s = this.surfaces.get(this.internalCursorSurfaceId);
+    if (s) s.bufferScale = bufferScale;
     this.cursorTargetSurfaceId = this.internalCursorSurfaceId;
     this.cursorHotspotX = hotspotX;
     this.cursorHotspotY = hotspotY;
     this.cursorPixelBytes = { bytes, width, height };
     this.updateCursorLayout();
+  }
+
+  // Install a CPU-side BGRA8 cursor image into the internal cursor surface
+  // and point the cursor slot at it. Allocates / reuses a core-device
+  // texture; uploads via queue.writeTexture. Dims and hotspot are logical
+  // (a 1x image).
+  setCursorPixels(bytes: Uint8Array,
+                  width: number, height: number,
+                  hotspotX: number, hotspotY: number): void {
+    this.cursorShapeResolver = null;
+    this.installCursorPixels(bytes, width, height, hotspotX, hotspotY, 1);
     this.refreshHwCursorImage();
+  }
+
+  // Install a theme shape by RESOLVER rather than fixed bitmap: `resolve`
+  // produces the shape at any requested device-pixel size (themes store
+  // discrete sizes, so the returned image may differ from the request --
+  // consumers scale to fit). The software slot uploads the image resolved
+  // for the highest output scale (bufferScale keeps its logical size at
+  // logicalSizePx); each cursor-plane output ships its own exact-scale
+  // resolve, so the cursor is native-sharp everywhere. Returns false --
+  // leaving the current cursor untouched -- when the shape doesn't resolve.
+  setCursorShape(resolve: (deviceSizePx: number) => {
+                   width: number; height: number;
+                   hotspotX: number; hotspotY: number;
+                   rgba: Uint8Array;
+                 } | null,
+                 logicalSizePx: number): boolean {
+    const L = Math.max(1, Math.round(logicalSizePx));
+    let maxScale = 1;
+    for (const o of this.outputsGeom.values()) if (o.scale > maxScale) maxScale = o.scale;
+    const r = resolve(Math.max(1, Math.round(L * maxScale)));
+    if (!r) return false;
+    // One bufferScale for both axes (width-derived; theme images are
+    // square in practice) -- the hotspot converts to logical by the same
+    // divisor so it stays anchored to the same pixel of the image.
+    const bs = r.width / L;
+    this.installCursorPixels(r.rgba, r.width, r.height,
+      r.hotspotX / bs, r.hotspotY / bs, bs);
+    this.cursorShapeResolver = { resolve, logicalSizePx: L };
+    this.refreshHwCursorImage();
+    return true;
   }
 
   // Point the cursor slot at an existing surface (e.g. a client cursor
@@ -4453,11 +4548,14 @@ export class JsCompositor implements CompositorSink {
       this.surfaces.set(this.internalCursorSurfaceId, blankSurface(0, 0, width, height));
     }
     this.setSurfaceTexture(this.internalCursorSurfaceId, tex, width, height);
+    const s = this.surfaces.get(this.internalCursorSurfaceId);
+    if (s) s.bufferScale = 1;
     this.cursorTargetSurfaceId = this.internalCursorSurfaceId;
     this.cursorHotspotX = hotspotX;
     this.cursorHotspotY = hotspotY;
     // A device-texture cursor has no CPU bytes to ship to a cursor plane.
     this.cursorPixelBytes = null;
+    this.cursorShapeResolver = null;
     this.updateCursorLayout();
     this.refreshHwCursorImage();
   }
@@ -4488,6 +4586,7 @@ export class JsCompositor implements CompositorSink {
       this.deactivateHwCursor(id, { dropCaps: false, sendDisable: true });
     }
     this.cursorPixelBytes = null;
+    this.cursorShapeResolver = null;
     this.cursorVisible = false;
     this.cursorTargetSurfaceId = null;
     const intern = this.surfaces.get(this.internalCursorSurfaceId);

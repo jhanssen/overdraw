@@ -278,11 +278,11 @@ addon.setOnCursorPlaneStatus?.((m) => {
 // (drawOrder appends it last when visible + textured).
 {
   const cursorSize = Number(process.env.XCURSOR_SIZE) || 24;
-  const r = addon.resolveCursorShape("default", cursorSize, 1);
-  if (r) {
-    compositor.setCursorPixels?.(r.rgba, r.width, r.height, r.hotspotX, r.hotspotY);
+  const ok = compositor.setCursorShape?.(
+    (sizeDev) => addon.resolveCursorShape("default", sizeDev, 1), cursorSize) ?? false;
+  if (ok) {
     compositor.setCursorVisible?.(true);
-    log.info("core", `cursor: default ${r.width}x${r.height} hotspot=(${r.hotspotX},${r.hotspotY})`);
+    log.info("core", `cursor: default ${cursorSize}px (per-output-scale resolve)`);
   } else {
     log.warn("core", "cursor: default shape not resolved; no cursor shown");
   }
@@ -1058,15 +1058,13 @@ state.installGrabCursor = (shape) => {
     // Restore the default: re-resolve the boot default. (A future
     // refinement could replay the priority chain to honor a
     // setDefault override; v1 just goes back to 'default'.)
-    const r = cursorResolver.resolveShape("default", sizePx, 1);
-    if (r) compositor.setCursorPixels?.(r.rgba, r.width, r.height, r.hotspotX, r.hotspotY);
+    compositor.setCursorShape?.(
+      (sizeDev) => cursorResolver.resolveShape("default", sizeDev, 1), sizePx);
     return;
   }
-  const r = cursorResolver.resolveShape(shape, sizePx, 1);
-  if (r) {
-    compositor.setCursorPixels?.(r.rgba, r.width, r.height, r.hotspotX, r.hotspotY);
-    compositor.setCursorVisible?.(true);
-  }
+  const ok = compositor.setCursorShape?.(
+    (sizeDev) => cursorResolver.resolveShape(shape, sizeDev, 1), sizePx) ?? false;
+  if (ok) compositor.setCursorVisible?.(true);
 };
 
 // Intercept. Match engine + per-surface state + broker.

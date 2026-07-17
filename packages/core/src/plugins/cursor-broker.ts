@@ -66,10 +66,9 @@ export function createCursorBroker(deps: CursorBrokerDeps): CursorBroker & {
       // scaled-cursor would be the cleanest fix when continuous transforms
       // land). Static enlarge could be done by uploading a larger
       // pre-scaled image -- punt.
-      const r = resolver.resolveShape(name, cursorSizePx, 1);
-      if (!r) return false;
-      compositor.setCursorPixels?.(
-        r.rgba, r.width, r.height, r.hotspotX, r.hotspotY);
+      const ok = compositor.setCursorShape?.(
+        (sizeDev) => resolver.resolveShape(name, sizeDev, 1), cursorSizePx) ?? true;
+      if (!ok) return false;
       compositor.setCursorVisible?.(true);
       return true;
     },
@@ -86,11 +85,8 @@ export function createCursorBroker(deps: CursorBrokerDeps): CursorBroker & {
       // Re-resolve and install the current default shape (set via
       // sdk.cursor.setDefault, or 'default' at boot).
       const name = defaultShape ?? "default";
-      const r = resolver.resolveShape(name, cursorSizePx, 1);
-      if (r) {
-        compositor.setCursorPixels?.(
-          r.rgba, r.width, r.height, r.hotspotX, r.hotspotY);
-      }
+      compositor.setCursorShape?.(
+        (sizeDev) => resolver.resolveShape(name, sizeDev, 1), cursorSizePx);
       compositor.setCursorVisible?.(true);
     },
   };
@@ -137,14 +133,14 @@ export function createCursorBroker(deps: CursorBrokerDeps): CursorBroker & {
 
   function handleSetShape(p: unknown): null {
     if (!isShapePayload(p)) throw new Error("cursor.set-shape: malformed payload");
-    const r = resolver.resolveShape(p.name, cursorSizePx, 1);
-    if (!r) {
-      throw new Error(`cursor.set-shape: shape '${p.name}' not in active theme`);
+    const name = p.name;
+    const ok = compositor.setCursorShape?.(
+      (sizeDev) => resolver.resolveShape(name, sizeDev, 1), cursorSizePx) ?? true;
+    if (!ok) {
+      throw new Error(`cursor.set-shape: shape '${name}' not in active theme`);
     }
     explicitOverrideActive = true;
     ruleEngine.setExplicitOverride(true);
-    compositor.setCursorPixels?.(
-      r.rgba, r.width, r.height, r.hotspotX, r.hotspotY);
     compositor.setCursorVisible?.(true);
     return null;
   }

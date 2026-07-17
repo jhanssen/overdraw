@@ -609,10 +609,14 @@ than the cursor FB (`DRM_CAP_CURSOR_WIDTH/HEIGHT`), dmabuf/GPU-texture
 cursor images (no CPU bytes to ship), nested mode, and runtime commit
 rejection (the frame retries without the plane and demotes). Cursor
 FBs are linear ARGB8888 dumb buffers, ping-ponged per image change;
-hotspot is baked into the plane position core-side. Theme cursors are
-resolved at scale 1 and scaled to device size GPU-process-side
-(bilinear), so scale>1 sharpness matches the software path; client
-cursors with bufferScale == output scale ship 1:1. Verified on
+hotspot is baked into the plane position core-side. Theme cursors
+install by RESOLVER (`setCursorShape`): the software slot uploads the
+image resolved at the highest output scale (internal-surface
+bufferScale keeps its logical size), and each cursor plane ships its
+own exact-per-output-scale resolve — native-sharp at any scale, both
+paths. Fixed-bitmap plugin cursors upscale GPU-process-side
+(bilinear); client cursors with bufferScale == output scale ship
+1:1. Verified on
 bare-metal KMS (Intel, 3440x1440@60, 256x256 cursor FB): smooth
 plane-driven motion, theme shape changes, and client `set_cursor`
 surfaces (Chrome arrow/I-beam). Nested tests cover the fallback and
@@ -737,12 +741,9 @@ transform with a `wp_viewport` source crop is not spec-exact (crop
 composed after transform rather than in pre-transform surface
 coords); transform-alone and crop-alone are correct.
 
-**Known gaps:** the cursor is correct-size but soft at scale>1 on
-both paths (theme images resolve at scale 1; the software slot
-upscales at composite, the hardware plane upscales at image-install —
-resolving per-output-scale theme images would fix both); scale-aware-
-subsurface render path covered at the protocol layer but not by a GPU
-test; nested mode does not auto-derive scale (config only).
+**Known gaps:** scale-aware-subsurface render path covered at the
+protocol layer but not by a GPU test; nested mode does not auto-derive
+scale (config only).
 
 ## Protocols
 

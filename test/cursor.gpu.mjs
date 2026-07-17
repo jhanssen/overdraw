@@ -318,6 +318,47 @@ test("cursor compositing slot (Phase 9c)", { skip }, async (t) => {
         "16x16 image exceeds an 8x8 plane; output stays software");
       comp.clearCursor();
     });
+
+    await t.test("theme shapes resolve at per-output scale (no upscale)", async () => {
+      const sent = { images: [] };
+      const rec = Object.create(addon);
+      rec.sendCursorImage = (outputId, pixels, srcW, srcH, dstW, dstH) =>
+        sent.images.push({ outputId, srcW, srcH, dstW, dstH });
+      rec.sendCursorImageShm = () => {};
+      rec.sendCursorState = () => {};
+      const comp = new JsCompositor(device, dawn.globals, rec, { width: W, height: H });
+
+      // A scale-2 output: 64x64 logical glass over the 128x128 device target.
+      comp.setOutputs([{ id: 0, deviceWidth: W, deviceHeight: H,
+                         logicalX: 0, logicalY: 0, scale: 2 }]);
+      comp.setCursorPlaneStatus(0, true, 256, 256);
+
+      const asked = [];
+      const provider = (sizeDev) => {
+        asked.push(sizeDev);
+        return {
+          width: sizeDev, height: sizeDev,
+          hotspotX: sizeDev / 2, hotspotY: sizeDev / 2,
+          rgba: solidPixels([0, 255, 255, 255], sizeDev, sizeDev),
+        };
+      };
+      assert.equal(comp.setCursorShape(provider, 16), true);
+      comp.setCursorVisible(true);
+
+      // Software image resolved at the highest output scale (16 * 2 = 32)...
+      assert.ok(asked.includes(32), `expected a resolve at 32, got [${asked}]`);
+      // ...and the plane shipped a native-resolution image (src == dst,
+      // nothing upscaled).
+      const img = sent.images.at(-1);
+      assert.deepEqual({ srcW: img.srcW, dstW: img.dstW, dstH: img.dstH },
+        { srcW: 32, dstW: 32, dstH: 32 });
+      // The internal surface holds the 32px image at bufferScale 2, so the
+      // logical cursor size stays 16 and the hotspot converts to logical.
+      const cs = comp.cursorState();
+      assert.equal(cs.width, 32, "surface holds the scale-2 image");
+      assert.equal(cs.hotspotX, 8, "16px image hotspot -> logical 8 at bs=2");
+      comp.clearCursor();
+    });
   } finally {
     addon.stop();
   }

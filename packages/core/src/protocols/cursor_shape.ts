@@ -112,29 +112,21 @@ export function makeCursorShapeDevice(ctx: Ctx): WpCursorShapeDeviceV1Handler {
         return;
       }
 
-      // Look up the XCursor texture for this shape in the active theme.
-      const sizePx = Number(process.env.XCURSOR_SIZE) || 24;
-      const r = ctx.addon.resolveCursorShape(name, sizePx, 1);
-      if (!r) {
-        // Shape not in the active theme + no fallback (only 'default'
-        // has one). Drop silently; the previous cursor stays.
-        return;
-      }
-
-      // Install into the internal cursor surface and point the slot at it.
-      // setCursorPixels uploads the bytes and points the slot at the
-      // compositor-internal cursor surface; the client's "cursor"
-      // selection is just (resolver pixels, hotspot). We record that as
-      // the client's cursor preference so focus changes restore the
-      // right shape.
+      // Install the shape by resolver so the compositor can pick a
+      // native-resolution image per output (software slot at the highest
+      // output scale, cursor planes at their exact scale). A shape not in
+      // the active theme (only 'default' has a fallback) drops silently;
+      // the previous cursor stays.
       //
       // The compositor mutation here is direct (not via setClientCursor)
       // because the bytes need a fresh CPU upload to the internal surface
       // each time; setClientCursor's surface-pointer path is for client-
       // owned wl_surfaces. We still update setClientCursor so the seat
       // can re-apply it on focus changes.
-      ctx.state.compositor.setCursorPixels?.(
-        r.rgba, r.width, r.height, r.hotspotX, r.hotspotY);
+      const sizePx = Number(process.env.XCURSOR_SIZE) || 24;
+      const ok = ctx.state.compositor.setCursorShape?.(
+        (sizeDev) => ctx.addon.resolveCursorShape(name, sizeDev, 1), sizePx) ?? false;
+      if (!ok) return;
       ctx.state.compositor.setCursorVisible?.(true);
 
       // Note: we don't cache this shape against the clientId in the
