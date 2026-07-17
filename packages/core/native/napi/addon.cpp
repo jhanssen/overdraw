@@ -2851,6 +2851,13 @@ napi_value InjectInput(napi_env env, napi_callback_info info) {
         case InputEventType::PointerMotion:
             ev.x = getF64(env, argv[0], "x");
             ev.y = getF64(env, argv[0], "y");
+            // Optional relative deltas (zwp_relative_pointer_v1 tests). A
+            // real libinput backend always carries them; synthetic events
+            // default to 0.
+            ev.dx = getF64(env, argv[0], "dx");
+            ev.dy = getF64(env, argv[0], "dy");
+            ev.dxUnaccel = getF64(env, argv[0], "dxUnaccel");
+            ev.dyUnaccel = getF64(env, argv[0], "dyUnaccel");
             break;
         case InputEventType::PointerAxisSource:
             ev.axisSource = getU32(env, argv[0], "axisSource");

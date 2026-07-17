@@ -1,7 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 
-import makeRelativePointerManager, { makeRelativePointer, dispatchRelativeMotion }
+import makeRelativePointerManager, { makeRelativePointer, sendRelativeMotionTo }
   from "../packages/core/dist/protocols/zwp_relative_pointer_manager_v1.js";
 
 function mkCtx() {
@@ -29,51 +29,52 @@ test("get_relative_pointer: stashes the relative pointer on its wl_pointer", () 
   assert.equal(rp.__clientId, 7);
 });
 
-test("dispatchRelativeMotion: forwards deltas + microsecond timestamp", () => {
+test("sendRelativeMotionTo: forwards deltas + microsecond timestamp, returns true", () => {
   const { ctx, sent } = mkCtx();
   const pointer = {};
   const rp = {};
   makeRelativePointerManager(ctx).get_relative_pointer(NORES, rp, pointer);
-  dispatchRelativeMotion(ctx, [pointer], {
+  const r = sendRelativeMotionTo(ctx, pointer, {
     type: "pointerMotion", time: 5, dx: 2.5, dy: -1.5, dxUnaccel: 3, dyUnaccel: -2,
   });
+  assert.equal(r, true);
   assert.equal(sent.length, 1);
   assert.deepEqual(sent[0], { rp, hi: 0, lo: 5000, dx: 2.5, dy: -1.5, dxu: 3, dyu: -2 });
 });
 
-test("dispatchRelativeMotion: utime splits across 32 bits", () => {
+test("sendRelativeMotionTo: utime splits across 32 bits", () => {
   const { ctx, sent } = mkCtx();
   const pointer = {};
   const rp = {};
   makeRelativePointerManager(ctx).get_relative_pointer(NORES, rp, pointer);
-  dispatchRelativeMotion(ctx, [pointer], { type: "pointerMotion", time: 5_000_000, dx: 0, dy: 0 });
+  sendRelativeMotionTo(ctx, pointer, { type: "pointerMotion", time: 5_000_000, dx: 0, dy: 0 });
   // us = 5e9; hi = floor(5e9 / 2^32) = 1; lo = 5e9 - 2^32 = 705032704
   assert.equal(sent[0].hi, 1);
   assert.equal(sent[0].lo, 705032704);
 });
 
-test("dispatchRelativeMotion: unaccel falls back to accel when absent", () => {
+test("sendRelativeMotionTo: unaccel falls back to accel when absent", () => {
   const { ctx, sent } = mkCtx();
   const pointer = {};
   const rp = {};
   makeRelativePointerManager(ctx).get_relative_pointer(NORES, rp, pointer);
-  dispatchRelativeMotion(ctx, [pointer], { type: "pointerMotion", time: 1, dx: 4, dy: 6 });
+  sendRelativeMotionTo(ctx, pointer, { type: "pointerMotion", time: 1, dx: 4, dy: 6 });
   assert.equal(sent[0].dxu, 4);
   assert.equal(sent[0].dyu, 6);
 });
 
-test("dispatchRelativeMotion: a pointer with no relative pointer is skipped", () => {
+test("sendRelativeMotionTo: a pointer with no relative pointer returns false", () => {
   const { ctx, sent } = mkCtx();
-  dispatchRelativeMotion(ctx, [{}], { type: "pointerMotion", time: 1, dx: 1, dy: 1 });
+  assert.equal(sendRelativeMotionTo(ctx, {}, { type: "pointerMotion", time: 1, dx: 1, dy: 1 }), false);
   assert.equal(sent.length, 0);
 });
 
-test("dispatchRelativeMotion: a destroyed relative pointer is skipped", () => {
+test("sendRelativeMotionTo: a destroyed relative pointer returns false", () => {
   const { ctx, sent } = mkCtx();
   const pointer = {};
   const rp = { destroyed: true };
   makeRelativePointerManager(ctx).get_relative_pointer(NORES, rp, pointer);
-  dispatchRelativeMotion(ctx, [pointer], { type: "pointerMotion", time: 1, dx: 1, dy: 1 });
+  assert.equal(sendRelativeMotionTo(ctx, pointer, { type: "pointerMotion", time: 1, dx: 1, dy: 1 }), false);
   assert.equal(sent.length, 0);
 });
 

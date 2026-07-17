@@ -40,13 +40,20 @@ export function makeRelativePointer(_ctx: Ctx): ZwpRelativePointerV1Handler {
 
 const U32 = 0x100000000;
 
-// Deliver relative_motion to the relative pointers of the given wl_pointers.
-// Called from wl_seat's pointer-motion dispatch with the focused client's
-// pointer set. The event's deltas (logical pixels) are sent as fixed by the
-// wire layer; utime is microseconds split into hi/lo.
-export function dispatchRelativeMotion(
-  ctx: Ctx, pointers: Iterable<Resource>, ev: InputEvent,
-): void {
+// Deliver relative_motion to `pointer`'s relative pointer, if it has a live
+// one. Called from wl_seat's pointer-motion dispatch per wl_pointer, BEFORE
+// that pointer's wl_pointer.frame: the spec couples relative_motion into the
+// same frame group as the corresponding motion, and frame-batching clients
+// (notably Xwayland) sit on the event until a frame arrives -- so a locked
+// pointer (absolute motion suppressed) still needs relative_motion + frame,
+// or X clients never see any of it. Returns true when an event was sent so
+// the caller knows the frame is warranted. The deltas (logical pixels) are
+// sent as fixed by the wire layer; utime is microseconds split into hi/lo.
+export function sendRelativeMotionTo(
+  ctx: Ctx, pointer: Resource, ev: InputEvent,
+): boolean {
+  const rp = pointer.__relativePointer as Resource | undefined;
+  if (!rp || rp.destroyed) return false;
   const us = (ev.time ?? 0) * 1000;
   const hi = Math.floor(us / U32);
   const lo = us - hi * U32;
@@ -54,9 +61,6 @@ export function dispatchRelativeMotion(
   const dy = ev.dy ?? 0;
   const dxu = ev.dxUnaccel ?? dx;
   const dyu = ev.dyUnaccel ?? dy;
-  for (const p of pointers) {
-    const rp = p.__relativePointer as Resource | undefined;
-    if (!rp || rp.destroyed) continue;
-    ctx.events.zwp_relative_pointer_v1.send_relative_motion(rp, hi, lo, dx, dy, dxu, dyu);
-  }
+  ctx.events.zwp_relative_pointer_v1.send_relative_motion(rp, hi, lo, dx, dy, dxu, dyu);
+  return true;
 }

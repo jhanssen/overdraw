@@ -60,6 +60,13 @@ function pc(ctx: Ctx): PCState {
   return s;
 }
 
+// OVERDRAW_INPUT_DEBUG=1: trace constraint lifecycle (create / activate /
+// deactivate / focus tracking). Low-rate by nature (no per-motion logs).
+const DBG = process.env.OVERDRAW_INPUT_DEBUG === "1";
+function dbg(msg: string): void {
+  if (DBG) console.log(`[input-debug] constraints: ${msg}`);
+}
+
 function surfaceIdOf(ctx: Ctx, surface: Resource): number | null {
   return ctx.state.surfaces?.get(surface)?.id ?? null;
 }
@@ -122,6 +129,7 @@ function activate(ctx: Ctx, lock: LockRec): void {
     ctx.addon.setPointerConfine(confineRects(ctx, lock));
     ctx.events.zwp_confined_pointer_v1.send_confined(lock.resource);
   }
+  dbg(`activated ${lock.kind} on surface ${lock.surfaceId}`);
 }
 
 function deactivate(ctx: Ctx, lock: LockRec): void {
@@ -137,6 +145,7 @@ function deactivate(ctx: Ctx, lock: LockRec): void {
     if (!lock.resource.destroyed) ctx.events.zwp_confined_pointer_v1.send_unconfined(lock.resource);
   }
   if (lock.oneshot) lock.defunct = true;
+  dbg(`deactivated ${lock.kind} on surface ${lock.surfaceId}${lock.oneshot ? " (oneshot -> defunct)" : ""}`);
 }
 
 function create(ctx: Ctx, manager: Resource, id: Resource, surface: Resource,
@@ -160,6 +169,8 @@ function create(ctx: Ctx, manager: Resource, id: Resource, surface: Resource,
   };
   id.__lockRec = lock;
   s.live.add(lock);
+  dbg(`create ${kind} surface=${sid} region=${lock.region ? "yes" : "no"} oneshot=${lock.oneshot} `
+    + `focus=${ctx.state.seat?.focus?.surfaceId ?? "none"}`);
   // Activate now if the surface is already focused (lan-mouse locks right after
   // the pointer enters its barrier). seat.focus is authoritative here;
   // currentFocus tracks changes for notifyPointerFocus.
@@ -203,6 +214,8 @@ export function isPointerLocked(ctx: Ctx): boolean {
 export function notifyPointerFocus(ctx: Ctx, surfaceId: number | null): void {
   const s = pc(ctx);
   if (s.currentFocus === surfaceId) return;
+  dbg(`pointer focus ${s.currentFocus ?? "none"} -> ${surfaceId ?? "none"}`
+    + ` (live constraints: ${[...s.live].map((l) => l.surfaceId).join(",") || "none"})`);
   s.currentFocus = surfaceId;
   if (s.active && s.active.surfaceId !== surfaceId) deactivate(ctx, s.active);
   if (surfaceId === null) return;

@@ -348,6 +348,17 @@ target_include_directories(ext-image-copy-capture-client PRIVATE
     ${CMAKE_SOURCE_DIR}/native/wayland/generated)
 target_link_libraries(ext-image-copy-capture-client PRIVATE ${WAYLAND_CLIENT_LIBRARIES})
 
+# ---- pointer-lock test client (constraints + relative motion + frames) ----
+add_executable(pointer-lock-client
+    test/pointer-lock-client.c
+    native/wayland/generated/xdg-shell-protocol.c
+    native/wayland/generated/pointer-constraints-unstable-v1-protocol.c
+    native/wayland/generated/relative-pointer-unstable-v1-protocol.c)
+target_include_directories(pointer-lock-client PRIVATE
+    ${WAYLAND_CLIENT_INCLUDE_DIRS}
+    ${CMAKE_SOURCE_DIR}/native/wayland/generated)
+target_link_libraries(pointer-lock-client PRIVATE ${WAYLAND_CLIENT_LIBRARIES})
+
 # ---- DnD test client (drag-and-drop) ----
 add_executable(dnd-test-client
     test/dnd-test-client.c

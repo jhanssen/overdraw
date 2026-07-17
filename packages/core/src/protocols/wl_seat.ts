@@ -25,8 +25,12 @@ import { markWindowChanged } from "./window-changes.js";
 import type { FocusDriver } from "./focus-driver.js";
 import { hitTestSurfaceTree, type SurfaceHit } from "../surface-hit-test.js";
 import { popupOutputOrigin, popupChainLayerRooted } from "./xdg_popup.js";
-import { dispatchRelativeMotion } from "./zwp_relative_pointer_manager_v1.js";
+import { sendRelativeMotionTo } from "./zwp_relative_pointer_manager_v1.js";
 import { isPointerLocked, notifyPointerFocus, notifyPointerMotion } from "./zwp_pointer_constraints_v1.js";
+
+// OVERDRAW_INPUT_DEBUG=1: pointer-path counters for the 1 Hz seat summary.
+const INPUT_DBG = process.env.OVERDRAW_INPUT_DEBUG === "1";
+const dbgCounters = { motionIn: 0, absOut: 0, lastRelTargets: 0, lastLog: 0 };
 import { releaseDeadVirtualKeyboards } from "./zwp_virtual_keyboard_manager_v1.js";
 import { keyboardShortcutsInhibited, notifyShortcutsInhibitorFocus }
   from "./zwp_keyboard_shortcuts_inhibit_manager_v1.js";
@@ -319,6 +323,25 @@ export default function makeSeat(ctx: Ctx, driver: FocusDriver): SeatHandler {
   // matches the whole surface rect; an empty input region (Region with
   // no rects) makes that surface entirely click-through and the search
   // falls through to whatever is behind it.
+  // OVERDRAW_INPUT_DEBUG=1: once-per-second pointer-path summary (events in,
+  // wl_pointer.motion out, relative_motion recipients, lock + focus state).
+  function dbgSummary(dctx: Ctx, hit: SeatFocus, ev: InputEvent): void {
+    const now = Date.now();
+    let rel = 0;
+    for (const p of clientPointers(hit.clientId)) {
+      const rp = p.__relativePointer as Resource | undefined;
+      if (rp && !rp.destroyed) rel += 1;
+    }
+    dbgCounters.lastRelTargets = rel;
+    if (now - dbgCounters.lastLog < 1000) return;
+    dbgCounters.lastLog = now;
+    console.log(`[input-debug] seat: motionIn=${dbgCounters.motionIn}/s absOut=${dbgCounters.absOut}/s `
+      + `relTargets=${rel} locked=${isPointerLocked(dctx)} focus=${hit.surfaceId} `
+      + `dx=${(ev.dx ?? 0).toFixed(2)} pos=(${(ev.x ?? 0).toFixed(1)},${(ev.y ?? 0).toFixed(1)})`);
+    dbgCounters.motionIn = 0;
+    dbgCounters.absOut = 0;
+  }
+
   function pick(x: number, y: number): SeatFocus | null {
     const above = pickLayer(x, y, ["overlay", "top"]);
     if (above) return above;
@@ -799,6 +822,7 @@ export default function makeSeat(ctx: Ctx, driver: FocusDriver): SeatHandler {
       case "pointerEnter": {
         const x = ev.x ?? 0;
         const y = ev.y ?? 0;
+        if (INPUT_DBG && ev.type === "pointerMotion") dbgCounters.motionIn += 1;
         lastX = x; lastY = y;
         lastTime = ev.time ?? lastTime;
         pointerInside = true;
@@ -830,22 +854,32 @@ export default function makeSeat(ctx: Ctx, driver: FocusDriver): SeatHandler {
         if (!seat.focus) {
           seat.focus = hit;
           sendEnter(hit, sx, sy);
-        } else if (!isPointerLocked(ctx)) {
-          // While the pointer is locked (zwp_locked_pointer_v1) the cursor is
-          // frozen; the client reads motion via zwp_relative_pointer_v1 below
-          // instead of wl_pointer.motion.
+        } else {
+          // Per-pointer frame group, in spec order: wl_pointer.motion
+          // (suppressed while a zwp_locked_pointer_v1 lock is active -- the
+          // cursor is frozen and the client reads deltas instead), then
+          // zwp_relative_pointer_v1.relative_motion for pointers that have
+          // one, then ONE wl_pointer.frame closing the group. The frame must
+          // go out even when only relative_motion was sent: frame-batching
+          // clients (Xwayland) hold events until the frame, so a locked
+          // pointer without frames starves X clients of all motion.
+          const locked = isPointerLocked(ctx);
           for (const p of clientPointers(hit.clientId)) {
             if (p.destroyed) continue;
-            ctx.events.wl_pointer.send_motion(p, ev.time, sx, sy);
-            pointerFrame(p);
+            let sentAny = false;
+            if (!locked) {
+              ctx.events.wl_pointer.send_motion(p, ev.time, sx, sy);
+              sentAny = true;
+              if (INPUT_DBG) dbgCounters.absOut += 1;
+            }
+            // Relative deltas ride real motion only (enter carries none).
+            if (ev.type === "pointerMotion" && sendRelativeMotionTo(ctx, p, ev)) {
+              sentAny = true;
+            }
+            if (sentAny) pointerFrame(p);
           }
         }
-        // zwp_relative_pointer_v1: deliver unaccelerated deltas to the focused
-        // client regardless of surface-local position. Real motion only (enter
-        // carries no delta).
-        if (ev.type === "pointerMotion") {
-          dispatchRelativeMotion(ctx, clientPointers(hit.clientId), ev);
-        }
+        if (INPUT_DBG && ev.type === "pointerMotion") dbgSummary(ctx, hit, ev);
         // Pointer-constraints: track focus + (for region-gated locks) region
         // entry so locks/confines activate on the right surface.
         notifyPointerFocus(ctx, hit.surfaceId);
