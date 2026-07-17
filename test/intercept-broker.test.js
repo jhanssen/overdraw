@@ -868,3 +868,72 @@ test('broker: outputDimensions sustained failure -> auto-unregister', async () =
   assert.equal(destroyed, true);
   assert.equal(broker.registrationCount(), 0);
 });
+
+test('broker: fullscreen transitions on the plugin bus unmatch/rematch excludeFullscreen registrations', async () => {
+  const bus = new TypedBus();
+  const comp = stubCompositor();
+  const subs = new Map();
+  const pluginBus = {
+    subscribe(name, handler) { subs.set(name, handler); return {}; },
+  };
+  const broker = new InterceptBroker({
+    bus,
+    pluginBus,
+    compositor: comp.sink,
+    inThread: { device: fakeDevice(), textureUsage: fakeTextureUsage() },
+    log: () => {},
+  });
+  let matched = 0, unmatched = 0;
+  const id = await broker.registerInThread({
+    name: 'deco',
+    match: { excludeFullscreen: true },
+    setup: () => ({
+      onSurfaceMatched: () => { matched += 1; },
+      onSurfaceUnmatched: () => { unmatched += 1; },
+      render: () => {},
+    }),
+  }, 'deco-plugin');
+  bus.emit(WINDOW_EVENT.map, mapEvent(1, 'game'));
+  assert.equal(matched, 1);
+  assert.deepEqual(broker.activeSurfacesFor(id), [1]);
+
+  const committed = subs.get(WINDOW_EVENT.committed);
+  assert.ok(committed, 'broker subscribed to window.committed on the plugin bus');
+  committed(WINDOW_EVENT.committed,
+    { surfaceId: 1, changed: ['exclusive'], current: { exclusive: 'fullscreen' } });
+  assert.equal(unmatched, 1);
+  assert.deepEqual(broker.activeSurfacesFor(id), []);
+
+  committed(WINDOW_EVENT.committed,
+    { surfaceId: 1, changed: ['exclusive'], current: { exclusive: 'none' } });
+  assert.equal(matched, 2);
+  assert.deepEqual(broker.activeSurfacesFor(id), [1]);
+});
+
+test('broker: preconfigure seeds fullscreen so an excludeFullscreen registration never matches', async () => {
+  const bus = new TypedBus();
+  const comp = stubCompositor();
+  const broker = new InterceptBroker({
+    bus,
+    compositor: comp.sink,
+    inThread: { device: fakeDevice(), textureUsage: fakeTextureUsage() },
+    log: () => {},
+  });
+  let matched = 0;
+  const id = await broker.registerInThread({
+    name: 'deco',
+    match: { excludeFullscreen: true },
+    setup: () => ({
+      onSurfaceMatched: () => { matched += 1; },
+      render: () => {},
+    }),
+  }, 'deco-plugin');
+  // A game declaring fullscreen pre-map: preconfigure carries the state.
+  bus.emit(WINDOW_EVENT.preconfigure, {
+    surfaceId: 1, appId: 'game', title: null, xwayland: false,
+    initialState: { exclusive: 'fullscreen' },
+  });
+  bus.emit(WINDOW_EVENT.map, mapEvent(1, 'game'));
+  assert.equal(matched, 0);
+  assert.deepEqual(broker.activeSurfacesFor(id), []);
+});

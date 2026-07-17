@@ -586,6 +586,8 @@ function serializeMatch(m: InterceptSpec["match"]): unknown {
   return {
     ...(m.appId ? { appId: { source: m.appId.source, flags: m.appId.flags } } : {}),
     ...(m.roles ? { roles: [...m.roles] } : {}),
+    ...(m.excludeFullscreen !== undefined
+      ? { excludeFullscreen: m.excludeFullscreen } : {}),
   };
 }
 

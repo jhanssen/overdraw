@@ -346,3 +346,49 @@ test("decoration-default (intercept): late-match catch-up does not show a wrong-
     await c.teardown();
   }
 });
+
+test("decoration-default (intercept): a fullscreen window draws bare (no band, no insets)",
+  { skip }, async () => {
+  // The window declares fullscreen before mapping (--initial-state), the
+  // way games do. excludeFullscreen keeps the decoration registration
+  // from ever matching it: no border band, no insets -- the client's
+  // pixels reach every edge of the output.
+  const B = 8;
+  const c = await setupCompositor({
+    headless: OUT,
+    intercept: true,
+    config: {
+      decoration: {
+        appIdPattern: ".*",
+        border: { width: B, radius: 0 },
+        unfocused: { kind: "solid", color: "#3a3a3aff" },
+        focused: { kind: "solid", color: "#3a3a3aff" },
+      },
+    },
+  });
+  try {
+    const client = c.spawnClient(
+      ["--app-id", "fs-test", "--color", CLIENT_COLOR_ARGB,
+       "--size", CLIENT_REQUESTED_SIZE, "--title", "t",
+       "--fill-configured", "--initial-state", "fullscreen"],
+      { bin: HARNESS_BIN, readyMarker: "[harness-client] mapped" });
+    await client.ready;
+    // Fullscreen rect = the whole output; without decoration the client
+    // fills all of it, including where the band would have been.
+    const center = { x: OUT.width >> 1, y: OUT.height >> 1 };
+    const bandArea = { x: 2, y: 2 };
+    const px = await settled(() => c.frameReadback(),
+      (p) => p
+        && pixelMatches(pixelAt(p, OUT.width, center.x, center.y), CLIENT_BGRA, 8)
+        && pixelMatches(pixelAt(p, OUT.width, bandArea.x, bandArea.y), CLIENT_BGRA, 8),
+      { what: "fullscreen: client red at center AND at the would-be band", timeoutMs: 6000 });
+    for (const [x, y] of [[2, 2], [OUT.width - 3, 2], [2, OUT.height - 3],
+                          [OUT.width - 3, OUT.height - 3],
+                          [OUT.width >> 1, 2], [center.x, center.y]]) {
+      assert.ok(pixelMatches(pixelAt(px, OUT.width, x, y), CLIENT_BGRA, 8),
+        `(${x},${y}) should be the client's red (no decoration on fullscreen); got ${pixelAt(px, OUT.width, x, y)}`);
+    }
+  } finally {
+    await c.teardown();
+  }
+});

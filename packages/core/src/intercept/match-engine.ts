@@ -31,17 +31,25 @@ export interface RegistrationData {
   // Lower numbers match first. Same-priority resolves by insertion
   // order (insertionSeq).
   priority: number;
+  // A fullscreen toplevel never satisfies this registration (see
+  // InterceptMatch.excludeFullscreen).
+  excludeFullscreen: boolean;
   // Monotonically increasing per-engine counter assigned at
   // addRegistration time. Tie-breaker for same-priority entries.
   insertionSeq: number;
 }
 
 // A mapped toplevel's match-relevant fields. Updated by the broker on
-// window.map / window.change / window.unmap.
+// window.map / window.change / window.unmap / window.committed
+// (exclusive transitions).
 export interface ToplevelData {
   surfaceId: number;
   appId: string | null;
   title: string | null;
+  // Current exclusive=fullscreen state. Optional: an update that omits
+  // it (e.g. the map event, which doesn't carry window state) leaves
+  // the tracked value unchanged.
+  fullscreen?: boolean;
 }
 
 // Events the engine emits abstractly. The broker translates to plugin
@@ -156,17 +164,23 @@ export class MatchEngine {
   // Internal: shared tracking + matching for preconfigure and map.
   // Idempotent on repeated calls.
   private trackToplevel(top: ToplevelData): MatchEvent[] {
-    const existing = this.toplevels.get(top.surfaceId);
-    if (existing) {
+    let rec = this.toplevels.get(top.surfaceId);
+    if (rec) {
       // Already tracked (preconfigure ran first); refresh appId/title
-      // in case the client set them between preconfigure and map.
-      existing.appId = top.appId;
-      existing.title = top.title;
+      // in case the client set them between preconfigure and map. The
+      // fullscreen flag only updates when the caller supplied it (the
+      // map event doesn't carry window state).
+      rec.appId = top.appId;
+      rec.title = top.title;
+      if (top.fullscreen !== undefined) rec.fullscreen = top.fullscreen;
     } else {
-      this.toplevels.set(top.surfaceId, { ...top });
+      rec = { ...top };
+      this.toplevels.set(top.surfaceId, rec);
     }
     if (this.assignments.has(top.surfaceId)) return [];   // already matched
-    const winner = this.firstMatching(top);
+    // Match against the TRACKED record: it carries state (fullscreen)
+    // that this call's argument may not.
+    const winner = this.firstMatching(rec);
     if (winner === null) return [];
     this.assignments.set(top.surfaceId, winner.id);
     return [{ kind: "matched", registrationId: winner.id, surfaceId: top.surfaceId }];
@@ -192,6 +206,22 @@ export class MatchEngine {
     if (!cur) return [];   // not mapped (or not a toplevel we tracked)
     cur.appId = appId;
     cur.title = title;
+    return this.reevaluate(surfaceId, cur);
+  }
+
+  // Toplevel entered / left fullscreen. Re-evaluates so registrations
+  // with excludeFullscreen release the surface on entry and can reclaim
+  // it on exit.
+  onToplevelFullscreenChanged(surfaceId: number, fullscreen: boolean): MatchEvent[] {
+    const cur = this.toplevels.get(surfaceId);
+    if (!cur) return [];
+    if (cur.fullscreen === fullscreen) return [];
+    cur.fullscreen = fullscreen;
+    return this.reevaluate(surfaceId, cur);
+  }
+
+  // Shared winner re-evaluation after a tracked field changed.
+  private reevaluate(surfaceId: number, cur: ToplevelData): MatchEvent[] {
     const events: MatchEvent[] = [];
     const oldRegId = this.assignments.get(surfaceId);
     const winner = this.firstMatching(cur);
@@ -262,6 +292,7 @@ function matches(r: RegistrationData, top: ToplevelData): boolean {
   // In 10a we only support matching toplevels. The 'roles' filter is
   // recorded but the match here is implicitly toplevel-scoped because
   // this engine only sees toplevels.
+  if (r.excludeFullscreen && top.fullscreen === true) return false;
   if (r.appIdRegex !== null) {
     if (top.appId === null) return false;       // no app_id yet -> no match
     if (!r.appIdRegex.test(top.appId)) return false;

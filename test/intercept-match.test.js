@@ -324,3 +324,53 @@ test('match engine: registerCount tracks active registrations', () => {
   e.removeRegistration(100);
   assert.equal(e.registerCount(), 1);
 });
+
+// --- excludeFullscreen ------------------------------------------------------
+
+function fsReg(id, opts = {}) {
+  return { ...reg(id, opts), excludeFullscreen: true };
+}
+
+test('match engine: excludeFullscreen never matches a fullscreen toplevel', () => {
+  const e = new MatchEngine();
+  e.addRegistration(fsReg(100));
+  // Seeded fullscreen at preconfigure (a game declaring fullscreen pre-map).
+  const events = e.onToplevelPreconfigure({ surfaceId: 1, appId: 'game', title: null, fullscreen: true });
+  assert.deepEqual(events, []);
+  assert.equal(e.registrationFor(1), undefined);
+});
+
+test('match engine: fullscreen entry unmatches, exit re-matches', () => {
+  const e = new MatchEngine();
+  e.addRegistration(fsReg(100));
+  e.onToplevelMapped(top(1, 'term'));
+  assert.equal(e.registrationFor(1), 100);
+  const enter = e.onToplevelFullscreenChanged(1, true);
+  assert.deepEqual(enter, [{ kind: 'unmatched', registrationId: 100, surfaceId: 1 }]);
+  assert.equal(e.registrationFor(1), undefined);
+  const exit = e.onToplevelFullscreenChanged(1, false);
+  assert.deepEqual(exit, [{ kind: 'matched', registrationId: 100, surfaceId: 1 }]);
+  // Idempotent: repeating the same state is a no-op.
+  assert.deepEqual(e.onToplevelFullscreenChanged(1, false), []);
+});
+
+test('match engine: fullscreen falls through to a non-excluding registration', () => {
+  const e = new MatchEngine();
+  e.addRegistration(fsReg(100, { priority: 0 }));
+  e.addRegistration(reg(200, { priority: 10 }));
+  e.onToplevelMapped(top(1, 'app'));
+  assert.equal(e.registrationFor(1), 100);
+  const events = e.onToplevelFullscreenChanged(1, true);
+  assert.deepEqual(events, [
+    { kind: 'unmatched', registrationId: 100, surfaceId: 1 },
+    { kind: 'matched', registrationId: 200, surfaceId: 1 },
+  ]);
+});
+
+test('match engine: plain registrations keep fullscreen toplevels', () => {
+  const e = new MatchEngine();
+  e.addRegistration(reg(100));
+  e.onToplevelMapped(top(1, 'app'));
+  assert.deepEqual(e.onToplevelFullscreenChanged(1, true), []);
+  assert.equal(e.registrationFor(1), 100);
+});

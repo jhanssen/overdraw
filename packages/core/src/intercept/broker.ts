@@ -31,6 +31,12 @@ import type { DawnWire } from "../gpu/compositor.js";
 
 export interface InterceptBrokerDeps {
   bus: CompositorBus;
+  // The plugin-visible dynamic bus. window.committed (exclusive
+  // transitions -> excludeFullscreen re-evaluation) is only emitted
+  // there. Optional for harnesses.
+  pluginBus?: {
+    subscribe(name: string, handler: (name: string, payload: unknown) => void): unknown;
+  };
   compositor: CompositorSink;
   // How long an unmatched Worker surface's rings stay parked waiting
   // for the worker's intercept.unmatch-ack before being released
@@ -161,6 +167,10 @@ export class InterceptBroker {
         surfaceId: ev.surfaceId,
         appId: ev.appId,
         title: ev.title,
+        // Seed the fullscreen flag from the initial state so a window
+        // that declares fullscreen before mapping (games) is never
+        // matched-then-unmatched by an excludeFullscreen registration.
+        fullscreen: ev.initialState.exclusive === "fullscreen",
       });
     });
     deps.bus.on(WINDOW_EVENT.map, (ev) => {
@@ -173,6 +183,23 @@ export class InterceptBroker {
     deps.bus.on(WINDOW_EVENT.change, (ev) => {
       if (!ev.changed.includes("appId")) return;
       this.engine.onToplevelChanged(ev.surfaceId, ev.appId, ev.title)
+        .forEach((e) => this.dispatchMatchEvent(e));
+    });
+    // window.committed (behavioral-state transitions) rides the PLUGIN
+    // bus, not the core compositor bus. Fullscreen entry/exit re-runs
+    // the match so excludeFullscreen registrations release / reclaim
+    // the surface. Optional: a harness without a plugin bus simply
+    // never re-evaluates on state changes.
+    deps.pluginBus?.subscribe(WINDOW_EVENT.committed, (_name, payload) => {
+      const ev = payload as {
+        surfaceId?: number;
+        changed?: ReadonlyArray<string>;
+        current?: { exclusive?: string };
+      } | null;
+      if (!ev || typeof ev.surfaceId !== "number") return;
+      if (!Array.isArray(ev.changed) || !ev.changed.includes("exclusive")) return;
+      this.engine.onToplevelFullscreenChanged(
+        ev.surfaceId, ev.current?.exclusive === "fullscreen")
         .forEach((e) => this.dispatchMatchEvent(e));
     });
     deps.bus.on(WINDOW_EVENT.unmap, (ev) => {
@@ -198,6 +225,7 @@ export class InterceptBroker {
       appIdRegex,
       roles: spec.match.roles ? [...spec.match.roles] : null,
       priority: spec.priority ?? 0,
+      excludeFullscreen: spec.match.excludeFullscreen ?? false,
     };
     const active: ActiveRegistrationInThread = {
       transport: "in-thread",
@@ -240,6 +268,7 @@ export class InterceptBroker {
       appIdRegex,
       roles: args.match.roles ? [...args.match.roles] : null,
       priority: args.priority ?? 0,
+      excludeFullscreen: args.match.excludeFullscreen ?? false,
     };
     const active: ActiveRegistrationWorker = {
       transport: "worker",

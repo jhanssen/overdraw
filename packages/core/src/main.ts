@@ -1066,6 +1066,7 @@ state.installGrabCursor = (shape) => {
 const textureUsageBag = (dawn.globals as unknown as { GPUTextureUsage: typeof GPUTextureUsage }).GPUTextureUsage;
 interceptBrokerLate = new InterceptBroker({
   bus,
+  pluginBus: state.pluginBus,
   compositor,
   isActivated: (sid) => state?.seat?.kbFocus?.surfaceId === sid,
   surfaceGeometry: (sid) => state?.surfacesById?.get(sid)?.xdgSurface?.geometry ?? null,

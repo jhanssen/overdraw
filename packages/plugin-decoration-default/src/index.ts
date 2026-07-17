@@ -109,6 +109,10 @@ export default async function init(sdk: PluginSdkShape, rawConfig?: unknown): Pr
     match: {
       appId: { source: config.appIdPattern, flags: config.appIdFlags ?? "" },
       roles: ["toplevel"],
+      // Fullscreen windows draw bare: entering fullscreen unmatches this
+      // registration (band + insets drop; the window gets the full
+      // output), leaving re-matches. Maximized windows keep decorations.
+      excludeFullscreen: true,
     },
     // Lower priority than user effects (default 0). The bundled plugin
     // is a fallback: a Firefox-specific blur (priority 0, narrow pattern)
@@ -181,6 +185,13 @@ export default async function init(sdk: PluginSdkShape, rawConfig?: unknown): Pr
           if (!w) return;
           destroyDecorationDraw(w.draw);
           perWindow.delete(info.surfaceId);
+          // Release the inset band: the window may still be mapped (an
+          // unmatch from entering fullscreen, a priority steal, a config
+          // toggle), and without this its content would stay inset by a
+          // band nobody draws anymore. A no-op for an unmapped window.
+          void windowsSdk.setInsets(info.surfaceId, {
+            top: 0, right: 0, bottom: 0, left: 0,
+          }).catch(() => { /* window gone; ignore */ });
           // Reset the window's outer shape so a future intercept can
           // start from a known state. The setShape call may race a
           // teardown-in-progress; swallow the error.

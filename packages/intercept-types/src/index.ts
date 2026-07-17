@@ -25,6 +25,12 @@ export interface InterceptMatch {
   // Default: ["toplevel", "popup", "subsurface"] (all content roles).
   // Pass a subset to restrict.
   roles?: ReadonlyArray<InterceptableRole>;
+  // When true, a fullscreen window never satisfies this registration:
+  // entering fullscreen unmatches it (the effect tears down and the
+  // window draws bare), leaving fullscreen re-matches. Decorations use
+  // this -- a fullscreen window shows no border band. Maximized windows
+  // are unaffected (they keep decorations).
+  excludeFullscreen?: boolean;
 }
 
 // Forward-compatibility field. Recorded but not used for ordering in
