@@ -1,5 +1,6 @@
 #include "trampoline.h"
 
+#include <algorithm>
 #include <cstdio>
 #include <cstring>
 #include <vector>
@@ -31,6 +32,21 @@ void onResourceDestroyNotify(wl_listener* l, void* /*data*/) {
 
 }  // namespace
 
+// Per-bound-resource destroy listener keeping the InterfaceState's
+// boundResources count accurate (the dispatcher holds a raw pointer to the
+// state, so the state must outlive every resource bound through it).
+struct Trampoline::BindDestroyListener {
+    wl_listener listener;
+    InterfaceState* st;
+};
+
+void Trampoline::onBoundResourceDestroyNotify(wl_listener* l, void* /*data*/) {
+    BindDestroyListener* bl;
+    bl = wl_container_of(l, bl, listener);
+    bl->st->owner->onBoundResourceDestroyed(bl->st);
+    delete bl;
+}
+
 Trampoline::Trampoline(napi_env env, wl_display* display, InterfaceRegistry* registry)
     : env_(env), display_(display), registry_(registry) {}
 
@@ -47,6 +63,17 @@ Trampoline::InterfaceState* Trampoline::ensureInterface(
     const std::string& interfaceName, napi_value handler) {
     const wl_interface* iface = registry_->get(interfaceName);
     if (!iface) return nullptr;
+
+    // Re-registration swaps the handler on the existing state in place:
+    // globals and bound resources hold the raw state pointer, so the state
+    // itself must never be replaced.
+    auto existing = interfaces_.find(interfaceName);
+    if (existing != interfaces_.end()) {
+        InterfaceState* st = existing->second.get();
+        if (st->handler) napi_delete_reference(env_, st->handler);
+        napi_create_reference(env_, handler, 1, &st->handler);
+        return st;
+    }
 
     auto st = std::make_unique<InterfaceState>();
     st->name = interfaceName;
@@ -74,6 +101,10 @@ bool Trampoline::createGlobalForOutput(const std::string& interfaceName,
                                        uint32_t outputId, napi_value handler) {
     const wl_interface* iface = registry_->get(interfaceName);
     if (!iface) return false;
+    // If a global is already advertised at this (interface, outputId), tear
+    // it down first: bound resources hold the old state's raw pointer, so it
+    // must be parked via the removal path, never overwritten in the map.
+    destroyGlobalForOutput(interfaceName, outputId);
     // Allocate a fresh InterfaceState whose handler is the per-output JS
     // object. Stored in outputGlobals_ keyed by "<name>:<outputId>" so it
     // survives the call and the destructor can drop the napi_ref.
@@ -110,8 +141,22 @@ bool Trampoline::destroyGlobalForOutput(const std::string& interfaceName,
         napi_delete_reference(env_, it->second->handler);
         it->second->handler = nullptr;
     }
+    // Resources bound through this global may still be alive; their
+    // dispatchers hold the raw InterfaceState pointer. Park the state until
+    // the last one is destroyed (onDispatch drops requests for it meanwhile).
+    it->second->removed = true;
+    if (it->second->boundResources > 0)
+        removedOutputGlobals_.push_back(std::move(it->second));
     outputGlobals_.erase(it);
     return true;
+}
+
+void Trampoline::onBoundResourceDestroyed(InterfaceState* st) {
+    st->boundResources--;
+    if (st->boundResources > 0 || !st->removed) return;
+    auto it = std::find_if(removedOutputGlobals_.begin(), removedOutputGlobals_.end(),
+                           [st](const std::unique_ptr<InterfaceState>& p) { return p.get() == st; });
+    if (it != removedOutputGlobals_.end()) removedOutputGlobals_.erase(it);
 }
 
 void Trampoline::onBind(wl_client* client, void* data, uint32_t version, uint32_t id) {
@@ -120,6 +165,11 @@ void Trampoline::onBind(wl_client* client, void* data, uint32_t version, uint32_
     if (!res) { wl_client_post_no_memory(client); return; }
     // Generic dispatcher; implementation pointer carries the InterfaceState.
     wl_resource_set_dispatcher(res, &Trampoline::onDispatch, st, st, nullptr);
+    st->boundResources++;
+    auto* bl = new BindDestroyListener{};
+    bl->listener.notify = &Trampoline::onBoundResourceDestroyNotify;
+    bl->st = st;
+    wl_resource_add_destroy_listener(res, &bl->listener);
     std::printf("[wl] bind %s v%u id=%u\n", st->name.c_str(), version, id);
 
     // Optional on-bind hook: if the handler has a `bind` method, call it with
@@ -427,6 +477,24 @@ int Trampoline::onDispatch(const void* implData, void* target, uint32_t opcode,
     napi_env env = self->env_;
     auto* resource = static_cast<wl_resource*>(target);
     wl_client* client = wl_resource_get_client(resource);
+
+    // The global this resource was bound through is gone (per-output removal);
+    // the handler ref is deleted and the state is parked. Destructor requests
+    // (e.g. wl_output.release) must still release the server-side resource so
+    // the client's id bookkeeping stays coherent; everything else is dropped.
+    // Dispatch owns any fd args libwayland demarshalled -- close them.
+    if (st->removed) {
+        int argIndex = 0;
+        for (const char* p = msg->signature; *p; ++p) {
+            if (*p >= '0' && *p <= '9') continue;
+            if (*p == '?') continue;
+            if (*p == 'h' && args[argIndex].h >= 0) ::close(args[argIndex].h);
+            ++argIndex;
+        }
+        if (self->registry_->isRequestDestructor(st->name, opcode))
+            wl_resource_destroy(resource);
+        return 0;
+    }
 
     napi_handle_scope scope;
     napi_open_handle_scope(env, &scope);

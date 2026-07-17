@@ -223,6 +223,12 @@ add_executable(wl-destructor-client test/wl-destructor-client.c)
 target_include_directories(wl-destructor-client PRIVATE ${WAYLAND_CLIENT_INCLUDE_DIRS})
 target_link_libraries(wl-destructor-client PRIVATE ${WAYLAND_CLIENT_LIBRARIES})
 
+# Per-output global removal client: binds wl_output, waits for global_remove,
+# sends wl_output.release on the now-globalless resource.
+add_executable(output-remove-client test/output-remove-client.c)
+target_include_directories(output-remove-client PRIVATE ${WAYLAND_CLIENT_INCLUDE_DIRS})
+target_link_libraries(output-remove-client PRIVATE ${WAYLAND_CLIENT_LIBRARIES})
+
 # Protocol-error test client: validates wl_resource_post_error reaches the
 # client with the right error code + interface and disconnects it.
 add_executable(wl-error-client test/wl-error-client.c)

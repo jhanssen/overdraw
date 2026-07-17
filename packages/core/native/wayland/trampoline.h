@@ -18,6 +18,7 @@
 #include <memory>
 #include <string>
 #include <unordered_map>
+#include <vector>
 
 #include "interface_registry.h"
 
@@ -26,6 +27,7 @@ struct wl_client;
 struct wl_resource;
 struct wl_message;
 struct wl_global;
+struct wl_listener;
 union wl_argument;
 
 namespace overdraw::wayland {
@@ -59,13 +61,16 @@ class Trampoline {
     // Destroy a previously-advertised per-output global. Clients see
     // wl_registry.global_remove for the global's name, then existing
     // resources continue to exist until the client destroys them (libwayland
-    // delivers the destroy on the next display flush). Callers must emit
-    // any protocol-level "leave" events (e.g. wl_surface.leave) BEFORE
-    // calling this -- once the global is gone, clients cannot identify the
-    // wl_output the leave referenced. Returns false if no global is
-    // registered at (interfaceName, outputId); idempotent re-call is a no-op
-    // (returns true on the second call because the map miss is treated as
-    // already-removed).
+    // delivers the destroy on the next display flush). Those resources keep
+    // dispatching into the (handler-less) InterfaceState, which is parked
+    // until the last of them is destroyed: destructor requests (e.g.
+    // wl_output.release) still release the server-side resource, all other
+    // requests are dropped. Callers must emit any protocol-level "leave"
+    // events (e.g. wl_surface.leave) BEFORE calling this -- once the global
+    // is gone, clients cannot identify the wl_output the leave referenced.
+    // Returns false if no global is registered at (interfaceName, outputId);
+    // idempotent re-call is a no-op (returns true on the second call because
+    // the map miss is treated as already-removed).
     bool destroyGlobalForOutput(const std::string& interfaceName,
                                 uint32_t outputId);
 
@@ -120,6 +125,15 @@ class Trampoline {
         // global creation or no global at all). Used to wl_global_destroy on
         // per-output removal.
         wl_global* global = nullptr;
+        // Live wl_resources whose dispatcher points at this state (each bind
+        // adds one; a per-resource destroy listener decrements). The state
+        // must outlive them all: dispatchers hold this raw pointer.
+        int boundResources = 0;
+        // The global was torn down (destroyGlobalForOutput) but bound
+        // resources remain; the state is parked in removedOutputGlobals_ and
+        // freed when boundResources reaches zero. onDispatch drops requests
+        // for parked states (the handler ref is gone).
+        bool removed = false;
     };
 
     // Build + store an InterfaceState for `interfaceName`, taking a strong ref
@@ -130,6 +144,13 @@ class Trampoline {
     static void onBind(wl_client* client, void* data, uint32_t version, uint32_t id);
     static int onDispatch(const void* implData, void* target, uint32_t opcode,
                           const wl_message* msg, wl_argument* args);
+
+    // Called from each bound resource's destroy listener: decrements
+    // st->boundResources and frees the state if it is parked (removed) and
+    // this was its last resource.
+    void onBoundResourceDestroyed(InterfaceState* st);
+    struct BindDestroyListener;
+    static void onBoundResourceDestroyNotify(wl_listener* l, void* data);
 
     // Return the JS resource handle for `resource`, creating and caching it on
     // first use so JS sees a stable object per resource. `ifaceName` is used
@@ -144,6 +165,10 @@ class Trampoline {
     // owns its own InterfaceState (separate JS bind handler ref) so the bind
     // routes to the right output's handler. Keyed by "<interfaceName>:<outputId>".
     std::unordered_map<std::string, std::unique_ptr<InterfaceState>> outputGlobals_;
+    // Parked states from destroyGlobalForOutput whose bound resources are
+    // still alive; each is freed by onBoundResourceDestroyed when its last
+    // resource goes away.
+    std::vector<std::unique_ptr<InterfaceState>> removedOutputGlobals_;
     // Stable JS wrapper per wl_resource (napi_ref keeps it alive while the
     // resource lives). Cleared on resource destroy.
     std::unordered_map<wl_resource*, napi_ref> wrappers_;
