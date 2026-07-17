@@ -10,7 +10,7 @@ import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 import { globSync } from "node:fs";
 
-import { setupCompositor, canRunGpu, buildBin } from "./harness.mjs";
+import { setupCompositor, canRunGpu, buildBin, settled } from "./harness.mjs";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const OD = join(here, "..", "packages", "core");
@@ -92,11 +92,12 @@ test("intercept (Worker): invert plugin displaces a red client buffer with its c
     }
     assert.ok(c.jsCompositor.activeInterceptIds().length > 0,
       `expected compositor to install the worker's output; logs:\n${logs.join("\n")}`);
-    // One more frame so the install propagates to the next composite.
-    await new Promise((r) => setTimeout(r, 100));
-
-    const data = await c.frameReadback();
-    assert.ok(data, "got a frame");
+    // Poll until the installed output has actually reached a composited
+    // frame: the install lands between composites, so a single readback
+    // right after it can still catch the pre-install frame.
+    const data = await settled(() => c.frameReadback(),
+      (p) => p && px(p, 256, 50, 50).every((v, i) => v === CYAN_BGRA[i]),
+      { what: "worker invert output composited", timeoutMs: 6000 });
     // Sample inside the surface (full-output single-window layout).
     const center = px(data, 256, 50, 50);
     assert.deepEqual(center, CYAN_BGRA,

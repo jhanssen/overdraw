@@ -32,7 +32,7 @@ async function exchangeOnce(c, mime, payload, primary) {
   });
   await src.ready;
 
-  const line = await recv.waitForLine(/\[zwlr-dc-client\] received: /,
+  const line = await recv.waitForLine(/\[zwlr-dc-client\] received: [^\n]*\n/,
     { what: "received line", timeoutMs: 5000 });
   return line.match(/\[zwlr-dc-client\] received: (.*)/)[1].trim();
 }

@@ -140,7 +140,7 @@ test("X -> wl INCR: a large X selection chunks through the bridge to a wl receiv
       wlReceiver.stdout.on("data", (d) => { wlOut += d.toString(); });
       wlReceiver.stderr.on("data", (d) => { wlOut += d.toString(); });
       const deadline = Date.now() + 30000;
-      while (Date.now() < deadline && !/received-summary /.test(wlOut)) {
+      while (Date.now() < deadline && !/received-summary [^\n]*\n/.test(wlOut)) {
         await sleep(50);
       }
       const m = wlOut.match(/received-summary len=(\d+) sum32=0x([0-9a-f]+)/);
@@ -187,7 +187,7 @@ test("wl -> X INCR: a large wl selection chunks through the bridge to an X paste
       xPaste = spawnX11(X11_SEL,
         ["--paste", "CLIPBOARD", MIME, "--summary", "--timeout-ms", "30000"],
         c.display);
-      await xPaste.waitForLine(/received-summary /, { what: "x paste summary", timeoutMs: 30000 });
+      await xPaste.waitForLine(/received-summary [^\n]*\n/, { what: "x paste summary", timeoutMs: 30000 });
       const m = xPaste.stdout.match(/received-summary len=(\d+) sum32=0x([0-9a-f]+)/);
       assert.ok(m, `x paste did not print summary; stdout was:\n${xPaste.stdout}`);
       const gotLen = Number(m[1]);

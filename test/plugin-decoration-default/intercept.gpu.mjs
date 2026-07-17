@@ -85,11 +85,18 @@ test("decoration-default (intercept): border band fills the perimeter; client fi
     // 240x240, re-commits, the gate releases.
     const center = { x: OUT.width >> 1, y: OUT.height >> 1 };   // inset region
     const bandSample = { x: 2, y: 2 };                          // band region (top-left)
+    // The settle predicate covers EVERY probe point asserted below: a
+    // transitional catch-up frame (client still committed at the pre-inset
+    // size, decoration output stretched) can satisfy center+corner while
+    // the band edge is still off by a few px, so settling on a subset
+    // flakes the later asserts.
     const px = await settled(() => c.frameReadback(),
       (p) => p
         && pixelMatches(pixelAt(p, OUT.width, center.x, center.y), CLIENT_BGRA, 8)
-        && pixelMatches(pixelAt(p, OUT.width, bandSample.x, bandSample.y), UNFOCUSED_BGRA, 8),
-      { what: "decoration: client at center + band at corner", timeoutMs: 6000 });
+        && pixelMatches(pixelAt(p, OUT.width, bandSample.x, bandSample.y), UNFOCUSED_BGRA, 8)
+        && pixelMatches(pixelAt(p, OUT.width, OUT.width >> 1, 2), UNFOCUSED_BGRA, 8)
+        && pixelMatches(pixelAt(p, OUT.width, OUT.width >> 1, B + 2), CLIENT_BGRA, 8),
+      { what: "decoration: client inset + band settled at all probe points", timeoutMs: 6000 });
     // Sanity checks once settled:
     assert.ok(pixelMatches(pixelAt(px, OUT.width, center.x, center.y), CLIENT_BGRA, 8),
       `center should be the client's red (inset region); got ${pixelAt(px, OUT.width, center.x, center.y)}`);

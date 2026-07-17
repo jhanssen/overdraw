@@ -139,7 +139,7 @@ test("X -> wl: an X client claims CLIPBOARD; a focused wl client receives the by
       wlReceiver.stderr.on("data", (d) => { wlOut += d.toString(); });
       // Wait for the receiver to print its result line.
       const deadline = Date.now() + 8000;
-      while (Date.now() < deadline && !/received: /.test(wlOut)) {
+      while (Date.now() < deadline && !/received: [^\n]*\n/.test(wlOut)) {
         await sleep(50);
       }
       const m = wlOut.match(/received: (.*)/);
@@ -187,7 +187,7 @@ test("wl -> X: a wl client claims CLIPBOARD; an X client paste reads the bytes",
       // X paste.
       xPaste = spawnX11(X11_SEL,
         ["--paste", "CLIPBOARD", MIME, "--timeout-ms", "10000"], c.display);
-      await xPaste.waitForLine(/received: /, { what: "x paste received", timeoutMs: 10000 });
+      await xPaste.waitForLine(/received: [^\n]*\n/, { what: "x paste received", timeoutMs: 10000 });
       const m = xPaste.stdout.match(/received: (.*)/);
       assert.ok(m, `x paste did not print; stdout was:\n${xPaste.stdout}`);
       assert.equal(m[1].trim(), PAYLOAD,
@@ -287,7 +287,7 @@ test("wl -> X: PRIMARY selection round-trips",
 
       xPaste = spawnX11(X11_SEL,
         ["--paste", "PRIMARY", MIME, "--timeout-ms", "10000"], c.display);
-      await xPaste.waitForLine(/received: /, { what: "x paste received", timeoutMs: 10000 });
+      await xPaste.waitForLine(/received: [^\n]*\n/, { what: "x paste received", timeoutMs: 10000 });
       const m = xPaste.stdout.match(/received: (.*)/);
       assert.equal(m[1].trim(), PAYLOAD,
         `wl -> X primary payload mismatch; got "${m[1]}"`);

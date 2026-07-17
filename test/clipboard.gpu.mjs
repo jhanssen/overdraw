@@ -35,7 +35,7 @@ test("clipboard: selection set by source is received by the focused client", { s
     await source.ready;
 
     // The receiver exits 0 after printing what it read.
-    const out = await receiver.waitForLine(/\[clipboard-client\] received: /, { what: "received line", timeoutMs: 5000 });
+    const out = await receiver.waitForLine(/\[clipboard-client\] received: [^\n]*\n/, { what: "received line", timeoutMs: 5000 });
     const got = out.match(/\[clipboard-client\] received: (.*)/)[1].trim();
     assert.equal(got, PAYLOAD, `clipboard payload round-trips; got "${got}"`);
   } finally {
@@ -56,7 +56,7 @@ test("primary selection: middle-click selection round-trips to the focused clien
       { bin: CLIP, readyMarker: "[clipboard-client] selection set" });
     await source.ready;
 
-    const out = await receiver.waitForLine(/\[clipboard-client\] received: /, { what: "received line", timeoutMs: 5000 });
+    const out = await receiver.waitForLine(/\[clipboard-client\] received: [^\n]*\n/, { what: "received line", timeoutMs: 5000 });
     const got = out.match(/\[clipboard-client\] received: (.*)/)[1].trim();
     assert.equal(got, PRIMARY, `primary selection payload round-trips; got "${got}"`);
   } finally {
@@ -84,7 +84,7 @@ async function crossPaste(c, dcBin, dcMarker, payload, primary) {
   const src = c.spawnClient(srcArgs, { bin: dcBin, readyMarker: dcMarker });
   await src.ready;
 
-  const out = await receiver.waitForLine(/\[clipboard-client\] received: /,
+  const out = await receiver.waitForLine(/\[clipboard-client\] received: [^\n]*\n/,
     { what: "received line", timeoutMs: 5000 });
   return out.match(/\[clipboard-client\] received: (.*)/)[1].trim();
 }

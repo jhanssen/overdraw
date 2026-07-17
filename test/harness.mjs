@@ -827,9 +827,11 @@ export async function setupCompositor(opts = {}) {
     // process otherwise races the pending closes and libuv aborts on a half-
     // closed handle. The do/while guarantees that first yield. Past it, keep
     // polling: the GPU reap is asynchronous and can exceed 50ms on some drivers
-    // (NVIDIA teardown is slow), so wait until the child is gone rather than
-    // guessing a fixed delay.
-    const reapDeadline = Date.now() + 3000;
+    // (NVIDIA teardown is slow -- multi-second under parallel GPU load), so
+    // wait until the child is gone rather than guessing a fixed delay. The
+    // deadline only bounds the pathological case; the loop exits as soon as
+    // the child is reaped.
+    const reapDeadline = Date.now() + 10000;
     let leaked;
     do {
       await sleep(20);
