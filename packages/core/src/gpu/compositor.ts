@@ -3334,18 +3334,32 @@ export class JsCompositor implements CompositorSink {
       // output-local logical origin, then to device px (the attachment's space).
       const lx = args.scissor.x - (out ? out.originX : 0);
       const ly = args.scissor.y - (out ? out.originY : 0);
-      const sx = Math.max(0, Math.floor(lx * scale));
-      const sy = Math.max(0, Math.floor(ly * scale));
-      const sw = Math.min(devW - sx, Math.ceil(args.scissor.w * scale));
-      const sh = Math.min(devH - sy, Math.ceil(args.scissor.h * scale));
-      pass.setScissorRect(sx, sy, Math.max(0, sw), Math.max(0, sh));
+      // Device box: floor the origin, ceil the END coordinates. Ceiling the
+      // WIDTH instead (floor(x*s) + ceil(w*s)) ends up to a pixel short of
+      // ceil((x+w)*s) when the origin's device coordinate is fractional,
+      // which leaves a stale 1px column/row at the box's right/bottom edge
+      // at fractional scales.
+      const sx = Math.min(devW, Math.max(0, Math.floor(lx * scale)));
+      const sy = Math.min(devH, Math.max(0, Math.floor(ly * scale)));
+      const sx1 = Math.min(devW, Math.max(sx, Math.ceil((lx + args.scissor.w) * scale)));
+      const sy1 = Math.min(devH, Math.max(sy, Math.ceil((ly + args.scissor.h) * scale)));
+      pass.setScissorRect(sx, sy, sx1 - sx, sy1 - sy);
       // Clear the scissored box to black (loadOp:load preserved old pixels).
       const black = this.ensureBlackFill();
       if (black.bindGroup) {
-        // The black scissor-fill is not a tracked surface (id -1 never matches
-        // shapeClipMap); it clears a rect, unshaped.
+        // The fill's placement is the device box mapped back to logical, NOT
+        // the logical damage box: a quad at the damage box's fractional
+        // device edges rasterizes short of the scissor's last column/row,
+        // and translucent content then blends over stale pixels there
+        // instead of over black. Snapping to the device box makes the fill's
+        // coverage exactly the scissor rect.
+        // (The black scissor-fill is not a tracked surface -- id -1 never
+        // matches shapeClipMap; it clears a rect, unshaped.)
+        const originX = out ? out.originX : 0;
+        const originY = out ? out.originY : 0;
         this.updateUniforms(black, -1, args.outW, args.outH,
-          { placement: args.scissor }, out);
+          { placement: { x: sx / scale + originX, y: sy / scale + originY,
+                         w: (sx1 - sx) / scale, h: (sy1 - sy) / scale } }, out);
         pass.setPipeline(this.pipeline);
         pass.setBindGroup(0, black.bindGroup);
         pass.draw(4);
