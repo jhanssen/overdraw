@@ -147,19 +147,16 @@ test("ext_image_copy_capture: toplevel unmap stops the session", { skip },
         s.windows.length >= 1 && s.windows[0].mapped,
         { what: "producer mapped" });
 
-      // Start the capture client but don't let it run its capture quickly:
-      // use --timeout-ms 6000 so it sits waiting for ready. After it starts
-      // its session + frame.capture, kill the producer; we expect the
-      // session.stopped event to come through and the frame to fail with
-      // reason=stopped.
-      //
-      // The client's flow is: wait for done -> alloc buffer -> create_frame
-      // -> attach -> damage -> capture -> wait for ready/failed. Once we see
-      // "ready" line (printed only after session.done with constraints), we
-      // kill the producer.
+      // The capture client gates its frame.capture on stdin
+      // (--capture-on-stdin): it sets up the session, prints constraints,
+      // then waits. That lets us kill the producer and confirm the
+      // compositor processed the unmap BEFORE the capture is issued --
+      // otherwise the capture can legitimately complete against the
+      // still-mapped scene and the test races.
       const cli = c.spawnClient(
-        ["--mode", "toplevel", "--pick", "0", "--timeout-ms", "6000"],
-        { bin: CLI, readyMarker: "[ext-icc-client] ready" });
+        ["--mode", "toplevel", "--pick", "0", "--timeout-ms", "6000",
+         "--capture-on-stdin"],
+        { bin: CLI, readyMarker: "[ext-icc-client] ready", stdin: true });
       await cli.ready;
       // Wait for constraints (the "constraints" line is printed AFTER
       // session.done so we know we're past the registry-bind phase).
@@ -167,11 +164,18 @@ test("ext_image_copy_capture: toplevel unmap stops the session", { skip },
         { what: "constraints", timeoutMs: 5000 });
 
       // Kill the producer; its surface unmaps, the bus emits window.unmap,
-      // the capture session moves to stopped.
+      // the capture session moves to stopped. Wait until the compositor's
+      // own state reflects the unmap so the ordering is deterministic.
       producer.child.kill("SIGTERM");
+      await c.waitFor(c.query, (s) =>
+        s.windows.length === 0 || s.windows.every((w) => !w.mapped),
+        { what: "producer unmapped" });
 
-      // The client should observe session.stopped OR a failed event with
-      // reason=stopped. Both surface as a non-ok summary.
+      // Release the capture. The session is already stopped, so the client
+      // observes session.stopped (if it arrived during the gate) or an
+      // immediate failed reason=stopped on the fresh frame. Both surface as
+      // a non-ok summary.
+      cli.send("go");
       const summary = await cli.waitForLine(/\[ext-icc-client\] done /,
         { what: "summary line", timeoutMs: 8000 });
       assert.match(summary, /ok=0/,

@@ -11,6 +11,10 @@
 //                           (0 = first; default 0)
 //   --timeout-ms N          give up + return 1 if no ready/failed (default 5000)
 //   --dump-prefix PREFIX    optional: write captured BGRA pixels to PREFIX.raw
+//   --capture-on-stdin      after printing constraints, wait for a byte on
+//                           stdin (or EOF) before issuing the capture; lets
+//                           the harness change compositor state at a known
+//                           point between session setup and frame capture
 
 #define _GNU_SOURCE
 #include <stdio.h>
@@ -42,6 +46,7 @@ static int g_timeoutMs = 5000;
 static const char* g_dumpPrefix = NULL;
 static const char* g_mode = "output";
 static int g_pick = 0;
+static int g_captureOnStdin = 0;
 
 // Toplevel handles collected via ext_foreign_toplevel_list_v1.
 struct ToplevelEntry {
@@ -228,6 +233,7 @@ int main(int argc, char** argv) {
         else if (strcmp(argv[i], "--pick") == 0 && i + 1 < argc) g_pick = atoi(argv[++i]);
         else if (strcmp(argv[i], "--timeout-ms") == 0 && i + 1 < argc) g_timeoutMs = atoi(argv[++i]);
         else if (strcmp(argv[i], "--dump-prefix") == 0 && i + 1 < argc) g_dumpPrefix = argv[++i];
+        else if (strcmp(argv[i], "--capture-on-stdin") == 0) g_captureOnStdin = 1;
     }
     if (!socket) {
         fprintf(stderr, "usage: %s --socket NAME [--mode output|toplevel] [--pick N] [--timeout-ms N] [--dump-prefix P]\n",
@@ -313,6 +319,30 @@ int main(int argc, char** argv) {
     if (allocBuffer(g_bufW, g_bufH) != 0) {
         fprintf(stderr, "[ext-icc-client] buffer alloc failed\n");
         return 1;
+    }
+
+    if (g_captureOnStdin) {
+        // Hold the capture until the harness writes a byte (or closes our
+        // stdin), dispatching wayland events meanwhile so a session.stopped
+        // arriving during the wait is observed before we capture.
+        int gated = 1;
+        while (running && gated) {
+            wl_display_dispatch_pending(display);
+            wl_display_flush(display);
+            struct pollfd ps[2] = { { wlfd, POLLIN, 0 }, { 0, POLLIN, 0 } };
+            if (poll(ps, 2, 16) > 0) {
+                if (ps[0].revents & POLLIN) {
+                    if (wl_display_dispatch(display) < 0) break;
+                }
+                if (ps[1].revents & (POLLIN | POLLHUP)) gated = 0;
+            }
+        }
+        if (!running) {
+            // Session stopped before the capture was released.
+            printf("[ext-icc-client] done ok=0 wrote=0 w=%u h=%u\n", g_bufW, g_bufH);
+            fflush(stdout);
+            return 1;
+        }
     }
 
     // Create a frame, attach the buffer, capture.

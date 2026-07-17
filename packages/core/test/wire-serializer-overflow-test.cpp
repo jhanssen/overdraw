@@ -162,10 +162,25 @@ int main() {
         std::fprintf(stderr, "final Flush failed\n");
         allAllocsOk = false;
     }
-    // Push any remaining buffered bytes into the socket.
-    for (int i = 0; i < 100 && ser.hasPendingOut(); ++i) {
-        (void)ser.pumpOut();
-        ::usleep(1000);
+    // Push the remaining buffered bytes into the socket. The reader thread
+    // may lag far behind under load (e.g. a full parallel test-suite run), so
+    // gate each pump on POLLOUT and bound only the time spent with NO socket
+    // headroom -- a fixed pump count gives up mid-stream and strands the
+    // reader, which then reports a bogus byte shortfall.
+    int stalledMs = 0;
+    while (ser.hasPendingOut() && stalledMs < 20000) {
+        pollfd wp{sv[0], POLLOUT, 0};
+        int pr = ::poll(&wp, 1, 100);
+        if (pr < 0) {
+            std::perror("poll(POLLOUT)");
+            break;
+        }
+        if (pr == 0) { stalledMs += 100; continue; }
+        stalledMs = 0;
+        if (!ser.pumpOut()) {
+            std::fprintf(stderr, "pumpOut failed while draining\n");
+            break;
+        }
     }
 
     reader.join();
