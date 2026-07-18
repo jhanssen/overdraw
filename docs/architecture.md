@@ -1675,6 +1675,15 @@ The `log` module is a thin wrapper over `nativeLog`. Format-string handling
 matches `util.format` (lazy: only invoked if the level passes the runtime
 filter).
 
+**Plugin Workers.** A `worker_threads` Worker has its own `console`, so the
+host shim does not reach plugin code. The Worker bootstrap installs its own
+shim over the same six methods that formats via `util.format` and ships the
+line to the host as the `"log"` plugin event (the one `sdk.log` uses) with
+payload `{ level, text }`; the host routes it into the `plugin` area at that
+level, prefixed with the plugin name. Installed before the plugin module is
+imported, so module-load-time console calls are captured. `sdk.log` keeps
+its plain-string payload and logs at `info`.
+
 ### GPU process forwarding
 
 The GPU process is a separate binary. It links spdlog the same way the

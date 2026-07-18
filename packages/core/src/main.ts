@@ -62,7 +62,7 @@ import { WINDOW_EVENT } from "./events/types.js";
 import { createCompositorBus } from "./events/window-bus.js";
 import { DynamicBus } from "./events/dynamic-bus.js";
 import { IpcServer } from "./ipc/server.js";
-import { bindAddon, installConsoleShim, parseLogArgs, log } from "./log.js";
+import { bindAddon, installConsoleShim, parseLogArgs, log, LEVEL } from "./log.js";
 import { startXwayland, stopXwayland, type XwaylandHandle } from "./xwayland/index.js";
 import { startXwm, type Xwm } from "./xwayland/xwm.js";
 import { closeSurface } from "./protocols/close-surface.js";
@@ -1551,7 +1551,24 @@ runtime = new PluginRuntime({
   // is immediately visible.
   liveOutputIds: () => state.outputs ? [...state.outputs.keys()] : [],
   onEvent: (plugin, name, data) => {
-    if (name === "log") log.info("plugin", `${plugin}: ${String(data)}`);
+    if (name === "log") {
+      // Two payload shapes: a plain string (sdk.log) at info, or
+      // { level, text } (the Worker console shim) carrying the level of the
+      // console method that produced it.
+      const rec = data as { level?: unknown; text?: unknown } | null;
+      if (rec && typeof rec === "object"
+          && typeof rec.level === "number" && typeof rec.text === "string") {
+        const fn = rec.level <= LEVEL.trace ? log.trace
+                 : rec.level === LEVEL.debug ? log.debug
+                 : rec.level === LEVEL.warn ? log.warn
+                 : rec.level === LEVEL.err ? log.err
+                 : rec.level >= LEVEL.critical ? log.critical
+                 : log.info;
+        fn("plugin", `${plugin}: ${rec.text}`);
+      } else {
+        log.info("plugin", `${plugin}: ${String(data)}`);
+      }
+    }
   },
   onRequest: (plugin, method, params) => {
     if (method.startsWith("decoration.")) {

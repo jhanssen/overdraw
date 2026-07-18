@@ -140,3 +140,26 @@ test('multiple plugins are independent (one fails, one stays live)', async () =>
   assert.equal(states['bad'], 'failed');
   await rt.stop();
 });
+
+test('Worker console.* routes to the host as leveled "log" events', async () => {
+  const events = [];
+  const rt = quietRuntime({}, events);
+  await rt.load([entry('console-log.mjs')]);
+  await rt.stop();
+
+  const logs = events.filter((e) => e.n === 'log' && e.p === 'console-log');
+  const structured = logs.map((e) => e.d).filter((d) => d && typeof d === 'object');
+  const byText = (t) => structured.find((d) => String(d.text).startsWith(t));
+
+  // Module-load-time console.log is captured (shim installs before import),
+  // with util.format applied and info level.
+  assert.deepEqual(byText('module-load'), { level: 2, text: 'module-load line 1' });
+  assert.equal(byText('info line').level, 2);
+  assert.equal(byText('warn line').level, 3);
+  // Non-string args survive formatting; console.error maps to err.
+  const err = byText('error line');
+  assert.equal(err.level, 4);
+  assert.match(err.text, /code.*7/);
+  // sdk.log keeps its plain-string shape.
+  assert.ok(logs.some((e) => e.d === 'sdk-log line'));
+});
