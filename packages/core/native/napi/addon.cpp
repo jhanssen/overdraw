@@ -48,6 +48,7 @@
 #include "log/log.h"
 #include "log/crash_handler.h"
 #include "log/ipc_source.h"
+#include "log/paths.h"
 
 using overdraw::core::Compositor;
 using overdraw::core::InputEvent;
@@ -929,7 +930,7 @@ napi_value Start(napi_env env, napi_callback_info info) {
             if (g_addon.inputFd >= 0) { ::close(g_addon.inputFd); g_addon.inputFd = -1; }
             return throwError(env, err.c_str());
         }
-        std::fprintf(stderr, "[overdraw] KMS card: %s\n", chosenCard.c_str());
+        LOG_INFO(Core, "KMS card: {}", chosenCard);
         // Track for later closeDevice on Stop().
         g_addon.drmCardFd = drmFd;
         g_addon.drmCardDeviceId = drmDeviceId;
@@ -1061,7 +1062,7 @@ napi_value Start(napi_env env, napi_callback_info info) {
         g_addon.seat->setCallbacks(
             /*onEnable=*/ []() {
                 if (!g_addon.compositor) return;
-                std::printf("[seat] enable_seat (VT switched back)\n");
+                LOG_INFO(Seat, "enable_seat (VT switched back)");
                 if (g_addon.libinputBackend) g_addon.libinputBackend->resume();
                 if (g_addon.loopRunning && g_addon.libinputBackend) {
                     // The input poll was stopped on disable; restart it on the
@@ -1073,7 +1074,7 @@ napi_value Start(napi_env env, napi_callback_info info) {
             },
             /*onDisable=*/ []() {
                 if (!g_addon.compositor) return;
-                std::printf("[seat] disable_seat (VT switched away)\n");
+                LOG_INFO(Seat, "disable_seat (VT switched away)");
                 g_addon.compositor->pauseOutput();
                 if (g_addon.loopRunning && g_addon.libinputBackend) {
                     uv_poll_stop(&g_addon.inputPoll);
@@ -1136,10 +1137,12 @@ napi_value PresentedCount(napi_env env, napi_callback_info) {
     return v;
 }
 
-// logInit({ levelSpec?: string, logFile?: string })
-// Configures the global spdlog registry: builds stdout/stderr/(optional file)
-// sinks and per-area level table from the spec. Idempotent. Call before start()
-// so the GPU-process log reader dispatches into a configured registry.
+// logInit({ levelSpec?: string, logFile?: string, noLogFile?: boolean })
+// Configures the global spdlog registry: builds stdout/stderr/file sinks and
+// the per-area level table from the spec. The file sink is on by default
+// (rotating, in the state dir); logFile overrides its path, noLogFile
+// suppresses it. Idempotent. Call before start() so the GPU-process log
+// reader dispatches into a configured registry.
 napi_value LogInit(napi_env env, napi_callback_info info) {
     size_t argc = 1;
     napi_value argv[1];
@@ -1171,6 +1174,14 @@ napi_value LogInit(napi_env env, napi_callback_info info) {
                 if (vt == napi_string) {
                     napi_get_value_string_utf8(env, v, fbuf, sizeof(fbuf), &n);
                     cfg.filePath = std::string(fbuf, n);
+                }
+            }
+            if (napi_get_named_property(env, argv[0], "noLogFile", &v) == napi_ok) {
+                napi_valuetype vt; napi_typeof(env, v, &vt);
+                if (vt == napi_boolean) {
+                    bool b = false;
+                    napi_get_value_bool(env, v, &b);
+                    cfg.disableFile = b;
                 }
             }
         }
@@ -3305,8 +3316,7 @@ int syncobjFd() {
     }
     int fd = ::open(node.c_str(), O_RDWR | O_CLOEXEC);
     if (fd < 0) {
-        std::fprintf(stderr, "[overdraw] syncobjFd: open %s failed errno=%d\n",
-                     node.c_str(), errno);
+        LOG_ERR(Core, "syncobjFd: open {} failed errno={}", node, errno);
         return -1;
     }
     g_addon.syncobjFdValue = fd;
@@ -3328,7 +3338,7 @@ napi_value SyncobjImportTimeline(napi_env env, napi_callback_info info) {
     int r = drmSyncobjFDToHandle(drmFd, fd, &handle);
     ::close(fd);  // the kernel duped the underlying syncobj reference
     if (r != 0) {
-        std::fprintf(stderr, "[overdraw] drmSyncobjFDToHandle failed errno=%d\n", errno);
+        LOG_ERR(Core, "drmSyncobjFDToHandle failed errno={}", errno);
         napi_value z; napi_create_uint32(env, 0, &z); return z;
     }
     napi_value out; napi_create_uint32(env, handle, &out); return out;
@@ -3368,17 +3378,17 @@ napi_value SyncobjExportSyncFile(napi_env env, napi_callback_info info) {
 
     uint32_t bin = 0;
     if (drmSyncobjCreate(drmFd, 0, &bin) != 0) {
-        std::fprintf(stderr, "[overdraw] drmSyncobjCreate failed errno=%d\n", errno);
+        LOG_ERR(Core, "drmSyncobjCreate failed errno={}", errno);
         napi_value n; napi_get_null(env, &n); return n;
     }
     int syncFileFd = -1;
     if (drmSyncobjTransfer(drmFd, bin, 0, handle, point, 0) != 0) {
-        std::fprintf(stderr, "[overdraw] drmSyncobjTransfer (export) failed errno=%d\n", errno);
+        LOG_ERR(Core, "drmSyncobjTransfer (export) failed errno={}", errno);
         drmSyncobjDestroy(drmFd, bin);
         napi_value n; napi_get_null(env, &n); return n;
     }
     if (drmSyncobjExportSyncFile(drmFd, bin, &syncFileFd) != 0) {
-        std::fprintf(stderr, "[overdraw] drmSyncobjExportSyncFile failed errno=%d\n", errno);
+        LOG_ERR(Core, "drmSyncobjExportSyncFile failed errno={}", errno);
         drmSyncobjDestroy(drmFd, bin);
         napi_value n; napi_get_null(env, &n); return n;
     }
@@ -3404,7 +3414,7 @@ napi_value SyncobjTimelineSignal(napi_env env, napi_callback_info info) {
     uint64_t point = (static_cast<uint64_t>(hi) << 32) | lo;
     const bool ok = drmSyncobjTimelineSignal(drmFd, &handle, &point, 1) == 0;
     if (!ok) {
-        std::fprintf(stderr, "[overdraw] drmSyncobjTimelineSignal failed errno=%d\n", errno);
+        LOG_ERR(Core, "drmSyncobjTimelineSignal failed errno={}", errno);
     }
     napi_value out; napi_get_boolean(env, ok, &out); return out;
 }
@@ -3461,8 +3471,7 @@ napi_value DmabufFeedbackInfo(napi_env env, napi_callback_info) {
 }
 
 napi_value Init(napi_env env, napi_value exports) {
-    overdraw::log::installCrashHandler("/tmp/overdraw-core-crash.txt",
-                                       "core (node addon)");
+    overdraw::log::installCrashHandler(overdraw::log::crashesDir(), "core");
     napi_value fnStart, fnStop, fnPresented, fnStartServer, fnStopServer;
     napi_create_function(env, "start", NAPI_AUTO_LENGTH, Start, nullptr, &fnStart);
     napi_create_function(env, "stop", NAPI_AUTO_LENGTH, Stop, nullptr, &fnStop);

@@ -1,7 +1,6 @@
 #include "dmabuf_scanout_slot.h"
 
 #include <cerrno>
-#include <cstdio>
 #include <cstring>
 
 #include <unistd.h>
@@ -12,6 +11,7 @@ extern "C" {
 }
 
 #include "allocator.h"
+#include "log/log.h"
 
 namespace overdraw::gpu {
 
@@ -46,8 +46,8 @@ AllocSlotResult allocateSlot(gbm_device* gbm, const wgpu::Device& device,
     s.offset   = gbm_bo_get_offset(s.bo, 0);
     s.dmabufFd = gbm_bo_get_fd_for_plane(s.bo, 0);
     if (s.dmabufFd < 0) {
-        std::fprintf(stderr, "[gpu] gbm_bo_get_fd_for_plane failed: %s\n",
-                     std::strerror(errno));
+        LOG_ERR(Gpu, "gbm_bo_get_fd_for_plane failed: {}",
+                std::strerror(errno));
         gbm_bo_destroy(s.bo); s.bo = nullptr;
         return AllocSlotResult::Failed;
     }

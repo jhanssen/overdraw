@@ -1,7 +1,6 @@
 #include "wayland_scanout_ring.h"
 
 #include <algorithm>
-#include <cstdio>
 
 #include <wayland-client.h>
 
@@ -10,6 +9,7 @@ extern "C" {
 }
 
 #include "host_window.h"
+#include "log/log.h"
 
 namespace overdraw::gpu {
 
@@ -73,8 +73,8 @@ bool WaylandScanoutRing::init(gbm_device* gbm, const wgpu::Device& device,
         AllocSlotResult r = allocateSlot(gbm_, device, width_, height_, fourcc_,
                                          candidates, slots_[0], &rejected);
         if (r == AllocSlotResult::Failed) {
-            std::fprintf(stderr,
-                "[gpu] wayland scanout: no usable modifier (%zu host-advertised + LINEAR fallback)\n",
+            LOG_ERR(Gpu,
+                "wayland scanout: no usable modifier ({} host-advertised + LINEAR fallback)",
                 hostModifiers.size());
             return false;
         }
@@ -83,17 +83,16 @@ bool WaylandScanoutRing::init(gbm_device* gbm, const wgpu::Device& device,
                 slots_[0].dmabufFd, width_, height_, fourcc_, slots_[0].modifier,
                 slots_[0].offset, slots_[0].stride);
             if (slots_[0].hostBuffer) break;
-            std::fprintf(stderr,
-                "[gpu] wayland scanout: host wl_buffer wrap failed for modifier 0x%lx\n",
-                static_cast<unsigned long>(slots_[0].modifier));
+            LOG_WARN(Gpu,
+                "wayland scanout: host wl_buffer wrap failed for modifier 0x{:x}",
+                slots_[0].modifier);
             rejected = slots_[0].modifier;
             releaseSlot(slots_[0]);
         }
         candidates.erase(std::remove(candidates.begin(), candidates.end(), rejected),
                          candidates.end());
         if (candidates.empty()) {
-            std::fprintf(stderr,
-                "[gpu] wayland scanout: no single-plane host-acceptable modifier\n");
+            LOG_ERR(Gpu, "wayland scanout: no single-plane host-acceptable modifier");
             return false;
         }
     }
@@ -108,8 +107,7 @@ bool WaylandScanoutRing::init(gbm_device* gbm, const wgpu::Device& device,
         AllocSlotResult r = allocateSlot(gbm_, device, width_, height_, fourcc_,
                                          chosenList, slots_[i], &rejected);
         if (r != AllocSlotResult::Ok) {
-            std::fprintf(stderr,
-                "[gpu] wayland scanout: failed to allocate slot %zu\n", i);
+            LOG_ERR(Gpu, "wayland scanout: failed to allocate slot {}", i);
             for (size_t j = 0; j <= i; ++j) releaseHostSlot(slots_[j]);
             return false;
         }
@@ -117,15 +115,13 @@ bool WaylandScanoutRing::init(gbm_device* gbm, const wgpu::Device& device,
             slots_[i].dmabufFd, width_, height_, fourcc_, slots_[i].modifier,
             slots_[i].offset, slots_[i].stride);
         if (!slots_[i].hostBuffer) {
-            std::fprintf(stderr,
-                "[gpu] wayland scanout: host wl_buffer wrap failed for slot %zu\n", i);
+            LOG_ERR(Gpu, "wayland scanout: host wl_buffer wrap failed for slot {}", i);
             for (size_t j = 0; j <= i; ++j) releaseHostSlot(slots_[j]);
             return false;
         }
     }
-    std::printf("[gpu] wayland scanout: %zu slots, %ux%u fourcc=0x%08x modifier=0x%lx\n",
-                kSlotCount, width_, height_, fourcc_,
-                static_cast<unsigned long>(chosenModifier_));
+    LOG_INFO(Gpu, "wayland scanout: {} slots, {}x{} fourcc=0x{:08x} modifier=0x{:x}",
+             kSlotCount, width_, height_, fourcc_, chosenModifier_);
     return true;
 }
 

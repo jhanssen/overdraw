@@ -13,6 +13,8 @@ extern "C" {
 #include <drm_fourcc.h>
 }
 
+#include "log/log.h"
+
 namespace overdraw::gpu {
 namespace {
 
@@ -65,12 +67,12 @@ int walkProperties(int drmFd, uint32_t objectId, uint32_t objectType,
 
 bool enableDrmAtomicCaps(int drmFd) {
     if (drmSetClientCap(drmFd, DRM_CLIENT_CAP_ATOMIC, 1) != 0) {
-        std::fprintf(stderr, "[drm] DRM_CLIENT_CAP_ATOMIC rejected: %s\n", std::strerror(errno));
+        LOG_ERR(Gpu, "[drm] DRM_CLIENT_CAP_ATOMIC rejected: {}", std::strerror(errno));
         return false;
     }
     if (drmSetClientCap(drmFd, DRM_CLIENT_CAP_UNIVERSAL_PLANES, 1) != 0) {
-        std::fprintf(stderr, "[drm] DRM_CLIENT_CAP_UNIVERSAL_PLANES rejected: %s\n",
-                     std::strerror(errno));
+        LOG_ERR(Gpu, "[drm] DRM_CLIENT_CAP_UNIVERSAL_PLANES rejected: {}",
+                std::strerror(errno));
         return false;
     }
     return true;
@@ -81,7 +83,7 @@ bool pickConnector(int drmFd, const std::string& preferConnectorName,
                    DrmMode& outMode) {
     drmModeRes* res = drmModeGetResources(drmFd);
     if (!res) {
-        std::fprintf(stderr, "[drm] drmModeGetResources failed: %s\n", std::strerror(errno));
+        LOG_ERR(Gpu, "[drm] drmModeGetResources failed: {}", std::strerror(errno));
         return false;
     }
 
@@ -142,7 +144,7 @@ bool pickConnector(int drmFd, const std::string& preferConnectorName,
     }
 
     drmModeFreeResources(res);
-    std::fprintf(stderr, "[drm] no connected connector with modes\n");
+    LOG_ERR(Gpu, "[drm] no connected connector with modes");
     return false;
 }
 
@@ -230,7 +232,7 @@ bool pickCrtc(int drmFd, uint32_t connectorId, uint32_t& outCrtcId,
 
     drmModeFreeConnector(conn);
     drmModeFreeResources(res);
-    if (!ok) std::fprintf(stderr, "[drm] no free CRTC for connector %u\n", connectorId);
+    if (!ok) LOG_ERR(Gpu, "[drm] no free CRTC for connector {}", connectorId);
     return ok;
 }
 
@@ -270,7 +272,7 @@ bool pickPrimaryPlane(int drmFd, uint32_t crtcId, uint32_t& outPlaneId) {
         }
     }
     drmModeFreePlaneResources(planes);
-    if (!ok) std::fprintf(stderr, "[drm] no primary plane for CRTC %u\n", crtcId);
+    if (!ok) LOG_ERR(Gpu, "[drm] no primary plane for CRTC {}", crtcId);
     return ok;
 }
 
@@ -353,8 +355,8 @@ bool resolveCursorPlaneProperties(int drmFd, DrmTopology& topo) {
     const bool ok = cp.fb_id && cp.crtc_id && cp.src_x && cp.src_y && cp.src_w
                     && cp.src_h && cp.crtc_x && cp.crtc_y && cp.crtc_w && cp.crtc_h;
     if (!ok) {
-        std::fprintf(stderr,
-            "[drm] cursor plane %u missing required properties; using software cursor\n",
+        LOG_WARN(Gpu,
+            "[drm] cursor plane {} missing required properties; using software cursor",
             topo.cursorPlaneId);
         topo.cursorPlaneId = 0;
         topo.cursorPlaneProps = {};
@@ -396,8 +398,8 @@ bool resolveProperties(int drmFd, DrmTopology& topo) {
               && pp.crtc_x && pp.crtc_y && pp.crtc_w && pp.crtc_h;
 
     if (!(okConn && okCrtc && okPlane)) {
-        std::fprintf(stderr,
-            "[drm] missing required properties: connector=%d crtc=%d plane=%d\n",
+        LOG_ERR(Gpu,
+            "[drm] missing required properties: connector={:d} crtc={:d} plane={:d}",
             okConn, okCrtc, okPlane);
         return false;
     }
@@ -545,7 +547,7 @@ readPlaneFormats(int drmFd, uint32_t planeId, uint32_t inFormatsPropId) {
 uint32_t createModeBlob(int drmFd, const drmModeModeInfo& mode) {
     uint32_t id = 0;
     if (drmModeCreatePropertyBlob(drmFd, &mode, sizeof(mode), &id) != 0) {
-        std::fprintf(stderr, "[drm] createModeBlob failed: %s\n", std::strerror(errno));
+        LOG_ERR(Gpu, "[drm] createModeBlob failed: {}", std::strerror(errno));
         return 0;
     }
     return id;
@@ -595,9 +597,9 @@ int addForeignPlaneDisables(drmModeAtomicReq* req, int drmFd, uint32_t crtcId,
         if (!fbProp || !crtcProp) continue;
         drmModeAtomicAddProperty(req, planeId, fbProp, 0);
         drmModeAtomicAddProperty(req, planeId, crtcProp, 0);
-        std::printf("[kms] disabling foreign plane %u on crtc %u "
-                    "(left latched by a previous DRM master)\n",
-                    planeId, crtcId);
+        LOG_INFO(Gpu, "[kms] disabling foreign plane {} on crtc {} "
+                 "(left latched by a previous DRM master)",
+                 planeId, crtcId);
         ++disabled;
     }
     drmModeFreePlaneResources(pr);

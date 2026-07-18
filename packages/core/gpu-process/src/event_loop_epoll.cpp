@@ -4,12 +4,14 @@
 #include "event_loop.h"
 
 #include <cerrno>
-#include <cstdio>
+#include <cstring>
 #include <unordered_map>
 #include <vector>
 
 #include <unistd.h>
 #include <sys/epoll.h>
+
+#include "log/log.h"
 
 namespace overdraw::gpu {
 namespace {
@@ -41,7 +43,7 @@ class EpollLoop final : public EventLoop {
         ee.events = toEpoll(events);
         ee.data.fd = fd;
         if (::epoll_ctl(epfd_, EPOLL_CTL_ADD, fd, &ee) != 0) {
-            std::perror("[gpu] epoll_ctl add");
+            LOG_ERR(Gpu, "epoll_ctl add: {}", std::strerror(errno));
             return false;
         }
         cbs_[fd] = std::move(cb);
@@ -65,7 +67,7 @@ class EpollLoop final : public EventLoop {
         int n = ::epoll_wait(epfd_, evs, 16, timeoutMs);
         if (n < 0) {
             if (errno == EINTR) return true;
-            std::perror("[gpu] epoll_wait");
+            LOG_ERR(Gpu, "epoll_wait: {}", std::strerror(errno));
             return false;
         }
         for (int i = 0; i < n; ++i) {

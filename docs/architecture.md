@@ -1592,13 +1592,38 @@ This means `console.log` → stdout, `console.warn`/`console.error` → stderr,
 and the same severity-based split applies uniformly to C++ `LOG_*` calls
 regardless of which process they originated in.
 
-A third **file sink** is attached only if `--log-file=PATH` is passed.
-The file sink accepts all levels (subject to per-area runtime filtering)
-and writes truncate-on-start (no rotation in v1; rotation is a future
-addition if logs get big). Without `--log-file`, no file is written.
+A third **file sink** is on by default: a rotating file
+(8 MB × 3 files) at `$XDG_STATE_HOME/overdraw/logs/overdraw.log`
+(`~/.local/state/overdraw/logs/` when `XDG_STATE_HOME` is unset;
+`OVERDRAW_STATE_DIR` overrides the state root, mainly for tests). The
+state dir is persistent storage — unlike `/tmp` (tmpfs), it survives
+reboots, so the log of a session that ended in a black screen or crash
+is still there the next morning. `--log-file=PATH` overrides the path;
+`--no-log-file` disables the sink. The file sink accepts all levels
+(subject to per-area runtime filtering).
 
-All sinks live in the host process. The GPU process forwards records
-over IPC; it has no sinks of its own.
+A fourth **ring sink** keeps the last 256 formatted records in a fixed
+in-memory ring (`native/log/ring_sink.{h,cpp}`). It exists for crash
+reports: the crash handler appends the ring's contents to the report so
+every crash carries the log context that led up to it. The ring is
+attached in every mode — including the GPU process's sender mode, so
+GPU-process crash reports have local context even though its normal
+records ship over IPC.
+
+All other sinks live in the host process. The GPU process forwards
+records over IPC; besides the ring it has no sinks of its own.
+
+### Crash reports
+
+Both processes install a fatal-signal handler
+(`native/log/crash_handler.{h,cpp}`) for SIGSEGV/SIGABRT/SIGBUS/SIGILL/
+SIGFPE. A crash writes
+`$XDG_STATE_HOME/overdraw/crashes/crash-<label>-<epoch>-<pid>.txt`
+(label `core` or `gpu`) containing the signal + fault address, a native
+backtrace, and the ring sink's recent records. Reports are per-crash
+files (never overwritten; `O_EXCL`); install-time pruning keeps the
+newest 20. The handler runs on a dedicated `sigaltstack` so
+stack-overflow SIGSEGVs are reported too.
 
 ### CLI
 
@@ -1614,8 +1639,9 @@ process inherits the filter table over IPC, not the CLI):
   - `--log-level=warn,gpu=debug` — default warn, gpu at debug.
   Unknown areas are an error at startup.
 
-- `--log-file=PATH` — enable the file sink at `PATH` (truncated on start).
-  Omitted = no file written.
+- `--log-file=PATH` — override the file sink's path (default:
+  `$XDG_STATE_HOME/overdraw/logs/overdraw.log`, rotating).
+- `--no-log-file` — disable the file sink.
 
 ### JS integration
 
@@ -1657,10 +1683,9 @@ once the IPC sink comes up. If the ring overflows before flush, oldest
 records are dropped and a single `warn`-level "log buffer overflow:
 N records dropped" record is enqueued in their place. The GPU process
 makes **no** direct writes to its inherited stderr — the existing
-`FD_CLOEXEC`-cleared inheritance from `gpu_process.cpp:62` is no longer
-relied upon for logging (it remains for the crash handler, which writes
-`/tmp/overdraw-gpu-crash.txt` per CLAUDE.md and is not part of normal
-logging).
+`FD_CLOEXEC`-cleared inheritance from `gpu_process.cpp:62` is not
+relied upon for logging (the crash handler writes its report file
+directly and is not part of normal logging; see "Crash reports").
 
 **Filter table.** When the host applies `--log-level`, the per-area
 filter is sent to the GPU process over the same side channel so the
@@ -1684,6 +1709,14 @@ table is replaced by this.
 - **`packages/core/native/log/ipc_sink.{h,cpp}`** — spdlog sink subclass
   that writes records to the side channel; symmetric `ipc_source` on
   the host side that reads frames and replays.
+- **`packages/core/native/log/paths.{h,cpp}`** — state-dir resolution
+  (`OVERDRAW_STATE_DIR` / `$XDG_STATE_HOME/overdraw` /
+  `~/.local/state/overdraw`) + `logs/` and `crashes/` creation.
+- **`packages/core/native/log/ring_sink.{h,cpp}`** — crash-context ring
+  of recent formatted records + the signal-safe dump used by the crash
+  handler.
+- **`packages/core/native/log/crash_handler.{h,cpp}`** — fatal-signal
+  handler writing per-crash report files.
 - **`packages/core/native/log/console_shim.{h,cpp}`** + napi binding
   `nativeLog(level, area, msg)`.
 - **`packages/core/src/log.ts`** — `log` module + `console.*` install
@@ -1698,8 +1731,6 @@ table is replaced by this.
 
 - Async logging sink. spdlog supports it; v1 stays synchronous for
   determinism in tests.
-- File rotation. Single truncate-on-start file is enough; rotation
-  added if/when needed.
 - Structured/JSON output. Plain text only. A JSON sink is a future
   addition.
 - Runtime level changes from JS. Mechanism exists (IPC broadcasts the

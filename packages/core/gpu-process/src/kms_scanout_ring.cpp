@@ -2,7 +2,6 @@
 
 #include <algorithm>
 #include <cerrno>
-#include <cstdio>
 #include <cstring>
 #include <vector>
 
@@ -17,6 +16,7 @@ extern "C" {
 
 #include "allocator.h"
 #include "drm_utils.h"
+#include "log/log.h"
 
 namespace overdraw::gpu {
 
@@ -59,8 +59,8 @@ bool addFB2(int drmFd, uint32_t width, uint32_t height, uint32_t fourcc,
     if (drmModeAddFB2WithModifiers(drmFd, width, height, fourcc,
                                    handles, pitches, offsets, fbModifiers,
                                    &fbIdOut, flags) != 0) {
-        std::fprintf(stderr, "[kms] drmModeAddFB2WithModifiers failed: %s\n",
-                     std::strerror(errno));
+        LOG_ERR(Gpu, "[kms] drmModeAddFB2WithModifiers failed: {}",
+                std::strerror(errno));
         return false;
     }
     return true;
@@ -101,9 +101,9 @@ bool KmsScanoutRing::init(int drmFd, gbm_device* gbm,
         AllocSlotResult r = allocateSlot(gbm_, device, width_, height_, fourcc_,
                                          candidates, slots_[0], &rejected);
         if (r == AllocSlotResult::Failed) {
-            std::fprintf(stderr,
-                "[kms] no usable modifier for scanout (%u advertised + LINEAR fallback)\n",
-                static_cast<uint32_t>(planeModifiers.size()));
+            LOG_ERR(Gpu,
+                "[kms] no usable modifier for scanout ({} advertised + LINEAR fallback)",
+                planeModifiers.size());
             return false;
         }
         if (r == AllocSlotResult::Ok) {
@@ -116,8 +116,8 @@ bool KmsScanoutRing::init(int drmFd, gbm_device* gbm,
         candidates.erase(std::remove(candidates.begin(), candidates.end(), rejected),
                          candidates.end());
         if (candidates.empty()) {
-            std::fprintf(stderr, "[kms] no single-plane scanout modifier (last rejected 0x%lx)\n",
-                         static_cast<unsigned long>(rejected));
+            LOG_ERR(Gpu, "[kms] no single-plane scanout modifier (last rejected 0x{:x})",
+                    rejected);
             return false;
         }
     }
@@ -131,15 +131,14 @@ bool KmsScanoutRing::init(int drmFd, gbm_device* gbm,
                                          chosenList, slots_[i], &rejected);
         if (r != AllocSlotResult::Ok ||
             !addFB2(drmFd_, width_, height_, fourcc_, slots_[i], slots_[i].fbId)) {
-            std::fprintf(stderr, "[kms] failed to allocate scanout slot %zu\n", i);
+            LOG_ERR(Gpu, "[kms] failed to allocate scanout slot {}", i);
             if (r == AllocSlotResult::Ok) releaseSlot(slots_[i]);
             for (size_t j = 0; j <= i; ++j) releaseKmsSlot(slots_[j]);
             return false;
         }
     }
-    std::printf("[kms] scanout ring: %zu slots, %ux%u fourcc=0x%08x modifier=0x%lx\n",
-                kSlotCount, width_, height_, fourcc_,
-                static_cast<unsigned long>(chosenModifier_));
+    LOG_INFO(Gpu, "[kms] scanout ring: {} slots, {}x{} fourcc=0x{:08x} modifier=0x{:x}",
+             kSlotCount, width_, height_, fourcc_, chosenModifier_);
     return true;
 }
 

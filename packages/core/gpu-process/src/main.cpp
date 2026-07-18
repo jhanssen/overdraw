@@ -59,6 +59,7 @@ extern "C" {
 #include "log/log.h"
 #include "log/crash_handler.h"
 #include "log/ipc_sink.h"
+#include "log/paths.h"
 
 using namespace overdraw;
 
@@ -99,7 +100,7 @@ int exportDmabufAcquireFence(int dmabufFd) {
     req.flags = DMA_BUF_SYNC_WRITE;
     req.fd = -1;
     if (::ioctl(dmabufFd, DMA_BUF_IOCTL_EXPORT_SYNC_FILE, &req) != 0) {
-        std::fprintf(stderr, "[gpu] EXPORT_SYNC_FILE failed errno=%d\n", errno);
+        LOG_ERR(Gpu, "EXPORT_SYNC_FILE failed errno={}", errno);
         return -1;
     }
     return req.fd;
@@ -112,7 +113,7 @@ int buildFormatTableMemfd(const std::vector<gpu::FormatTableEntry>& entries) {
     const size_t bytes = entries.size() * sizeof(gpu::FormatTableEntry);
     int fd = ::memfd_create("overdraw-dmabuf-format-table",
                             MFD_CLOEXEC | MFD_ALLOW_SEALING);
-    if (fd < 0) { std::perror("[gpu] memfd_create format_table"); return -1; }
+    if (fd < 0) { LOG_ERR(Gpu, "memfd_create format_table: {}", std::strerror(errno)); return -1; }
     if (bytes > 0) {
         if (::ftruncate(fd, static_cast<off_t>(bytes)) != 0) { ::close(fd); return -1; }
         void* map = ::mmap(nullptr, bytes, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
@@ -162,7 +163,7 @@ int run(int wireFd, int ctrlFd, int inputFd, bool headless,
                             drmFd = fds[0];
                             for (int j = 1; j < nfds; ++j) ::close(fds[j]);
                         } else {
-                            std::fprintf(stderr, "[gpu] SetDrmFd had no fd\n");
+                            LOG_ERR(Ipc, "SetDrmFd had no fd");
                             return 1;
                         }
                         break;
@@ -170,34 +171,34 @@ int run(int wireFd, int ctrlFd, int inputFd, bool headless,
                     usleepShort();
                 }
                 if (drmFd < 0) {
-                    std::fprintf(stderr, "[gpu] no SetDrmFd (kms requested)\n");
+                    LOG_ERR(Ipc, "no SetDrmFd (kms requested)");
                     return 1;
                 }
             }
             auto kmsUp = std::make_unique<gpu::KmsOutputBackend>(drmFd);
             if (!kmsUp->open("overdraw")) {
-                std::fprintf(stderr, "[gpu] KmsOutputBackend::open failed\n");
+                LOG_ERR(Gpu, "KmsOutputBackend::open failed");
                 return 1;
             }
             const gpu::OutputSize sz = kmsUp->size();
-            std::printf("[gpu] kms output %ux%u\n", sz.width, sz.height);
+            LOG_INFO(Gpu, "kms output {}x{}", sz.width, sz.height);
             kms = kmsUp.get();  // borrowed view
             output = std::move(kmsUp);  // OutputBackend takes ownership
 #else
-            std::fprintf(stderr, "[gpu] --output=kms requested but OVERDRAW_KMS=OFF at build\n");
+            LOG_ERR(Gpu, "--output=kms requested but OVERDRAW_KMS=OFF at build");
             return 1;
 #endif
         } else {
             output = std::make_unique<gpu::HostWindowOutputBackend>(inputFd);
             if (!output->open("overdraw")) {
-                std::fprintf(stderr, "[gpu] failed to open host window (no WAYLAND_DISPLAY?)\n");
+                LOG_ERR(Gpu, "failed to open host window (no WAYLAND_DISPLAY?)");
                 return 1;
             }
             const gpu::OutputSize sz = output->size();
-            std::printf("[gpu] host window %ux%u\n", sz.width, sz.height);
+            LOG_INFO(Gpu, "host window {}x{}", sz.width, sz.height);
         }
     } else {
-        std::printf("[gpu] HEADLESS %ux%u (no host window/surface)\n", headlessW, headlessH);
+        LOG_INFO(Gpu, "HEADLESS {}x{} (no host window/surface)", headlessW, headlessH);
     }
     auto outW = [&] { return headless ? headlessW : output->size().width; };
     auto outH = [&] { return headless ? headlessH : output->size().height; };
@@ -263,9 +264,8 @@ int run(int wireFd, int ctrlFd, int inputFd, bool headless,
             } else if (dispatchCoreControlFrame) {
                 dispatchCoreControlFrame(kind, frame, nRecvFds ? recvFds : nullptr, nRecvFds);
             } else {
-                std::fprintf(stderr,
-                    "[gpu] core wire: control frame kind=%u before dispatch ready\n",
-                    static_cast<unsigned>(kind));
+                LOG_ERR(Ipc, "core wire: control frame kind={} before dispatch ready",
+                        static_cast<unsigned>(kind));
                 std::abort();
             }
         }
@@ -289,7 +289,7 @@ int run(int wireFd, int ctrlFd, int inputFd, bool headless,
             if (ipc::recvMessageNB(ctrlFd, m) && m.tag == ipc::Tag::Hello) gotHello = true;
             else usleepShort();
         }
-        if (!gotHello) { std::fprintf(stderr, "[gpu] no Hello\n"); return 1; }
+        if (!gotHello) { LOG_ERR(Ipc, "no Hello"); return 1; }
         ipc::Message reply{};
         reply.tag = ipc::Tag::HelloReply;
         reply.protocolVersion = ipc::kProtocolVersion;
@@ -306,12 +306,12 @@ int run(int wireFd, int ctrlFd, int inputFd, bool headless,
             if (ipc::recvMessageNB(ctrlFd, m) && m.tag == ipc::Tag::InstanceReserved) got = true;
             else usleepShort();
         }
-        if (!got) { std::fprintf(stderr, "[gpu] no InstanceReserved\n"); return 1; }
+        if (!got) { LOG_ERR(Ipc, "no InstanceReserved"); return 1; }
         if (!server.InjectInstance(instance.Get(), {m.instance.id, m.instance.generation})) {
-            std::fprintf(stderr, "[gpu] InjectInstance failed\n");
+            LOG_ERR(Dawn, "InjectInstance failed");
             return 1;
         }
-        std::printf("[gpu] injected instance {%u,%u}\n", m.instance.id, m.instance.generation);
+        LOG_INFO(Dawn, "injected instance {{{},{}}}", m.instance.id, m.instance.generation);
     }
 
     // 5) Pump until the client has its device + reserved surface (DeviceReady).
@@ -327,14 +327,14 @@ int run(int wireFd, int ctrlFd, int inputFd, bool headless,
             }
             usleepShort();
         }
-        if (!got) { std::fprintf(stderr, "[gpu] no DeviceReady\n"); return 1; }
+        if (!got) { LOG_ERR(Ipc, "no DeviceReady"); return 1; }
     }
     WGPUDevice nativeDev = server.GetDevice(ready.device.id, ready.device.generation);
-    if (!nativeDev) { std::fprintf(stderr, "[gpu] GetDevice null\n"); return 1; }
+    if (!nativeDev) { LOG_ERR(Dawn, "GetDevice null"); return 1; }
     tickDev = nativeDev;  // pump now ticks the device queue (map/work-done)
-    std::printf("[gpu] client device {%u,%u} resolved; surface {%u,%u}\n",
-                ready.device.id, ready.device.generation,
-                ready.surface.id, ready.surface.generation);
+    LOG_INFO(Dawn, "client device {{{},{}}} resolved; surface {{{},{}}}",
+             ready.device.id, ready.device.generation,
+             ready.surface.id, ready.surface.generation);
 
     // 6) Native adapter (needed for the dmabuf modifier probe AND, in nested
     //    mode, for surface caps). In headless mode there is no surface.
@@ -344,7 +344,7 @@ int run(int wireFd, int ctrlFd, int inputFd, bool headless,
     ao.featureLevel = wgpu::FeatureLevel::Core;
     auto adapters = instance.EnumerateAdapters(
         reinterpret_cast<const WGPURequestAdapterOptions*>(&ao));
-    if (adapters.empty()) { std::fprintf(stderr, "[gpu] no adapter\n"); return 1; }
+    if (adapters.empty()) { LOG_ERR(Dawn, "no adapter"); return 1; }
 
     // Read an adapter's DRM node numbers (WGPUAdapterPropertiesDrm chained on
     // GetInfo). has* is false when the backend exposes no DRM node (e.g. a CPU
@@ -367,7 +367,7 @@ int run(int wireFd, int ctrlFd, int inputFd, bool headless,
     if (kms) {
         struct stat cst{};
         if (::fstat(kms->drmFd(), &cst) != 0) {
-            std::perror("[gpu] fstat drm card fd");
+            LOG_ERR(Gpu, "fstat drm card fd: {}", std::strerror(errno));
             return 1;
         }
         const uint64_t wantMajor = major(cst.st_rdev);
@@ -379,10 +379,10 @@ int run(int wireFd, int ctrlFd, int inputFd, bool headless,
                 && drm.primaryMinor == wantMinor) { found = (int)i; break; }
         }
         if (found < 0) {
-            std::fprintf(stderr,
-                "[gpu] no Vulkan adapter matches scanout card %llu:%llu "
-                "(cross-GPU scanout is unsupported)\n",
-                (unsigned long long)wantMajor, (unsigned long long)wantMinor);
+            LOG_ERR(Dawn,
+                "no Vulkan adapter matches scanout card {}:{} "
+                "(cross-GPU scanout is unsupported)",
+                wantMajor, wantMinor);
             return 1;
         }
         chosenIdx = static_cast<size_t>(found);
@@ -410,13 +410,12 @@ int run(int wireFd, int ctrlFd, int inputFd, bool headless,
             renderNode = "/dev/dri/renderD" + std::to_string(drm.renderMinor);
         } else {
             renderNode = "/dev/dri/renderD128";
-            std::fprintf(stderr, "[gpu] WARNING: adapter[%zu] advertises no DRM "
-                         "render node; guessing %s (correct only on single-GPU)\n",
-                         chosenIdx, renderNode.c_str());
+            LOG_WARN(Dawn, "WARNING: adapter[{}] advertises no DRM "
+                     "render node; guessing {} (correct only on single-GPU)",
+                     chosenIdx, renderNode);
         }
     }
-    std::printf("[gpu] selected adapter[%zu], render node %s\n",
-                chosenIdx, renderNode.c_str());
+    LOG_INFO(Dawn, "selected adapter[{}], render node {}", chosenIdx, renderNode);
     wgpu::Adapter adapter(adapters[chosenIdx].Get());
 
     // Headless / KMS / nested: no Dawn WSI surface. The nested on-screen
@@ -429,16 +428,16 @@ int run(int wireFd, int ctrlFd, int inputFd, bool headless,
 
     // B1: GBM allocator + Dawn DRM modifier probe (persistent: the allocator
     // owns the gbm device and any allocated bo for the rest of the run).
-    std::printf("[gpu] adapter DawnDrmFormatCapabilities feature: %d  SharedTextureMemoryDmaBuf: %d\n",
-                adapter.HasFeature(wgpu::FeatureName::DawnDrmFormatCapabilities) ? 1 : 0,
-                adapter.HasFeature(wgpu::FeatureName::SharedTextureMemoryDmaBuf) ? 1 : 0);
+    LOG_INFO(Dawn, "adapter DawnDrmFormatCapabilities feature: {}  SharedTextureMemoryDmaBuf: {}",
+             adapter.HasFeature(wgpu::FeatureName::DawnDrmFormatCapabilities) ? 1 : 0,
+             adapter.HasFeature(wgpu::FeatureName::SharedTextureMemoryDmaBuf) ? 1 : 0);
     gpu::Allocator alloc;
-    if (!alloc.open(renderNode.c_str())) { std::fprintf(stderr, "[gpu] allocator open failed\n"); return 1; }
+    if (!alloc.open(renderNode.c_str())) { LOG_ERR(Gpu, "allocator open failed"); return 1; }
     if (!alloc.probe(adapter)) {
-        std::fprintf(stderr, "[gpu] modifier probe found nothing importable\n");
+        LOG_ERR(Gpu, "modifier probe found nothing importable");
         return 1;
     }
-    std::printf("[gpu] B1 probe OK (%zu usable modifiers)\n", alloc.usableModifiers().size());
+    LOG_INFO(Gpu, "B1 probe OK ({} usable modifiers)", alloc.usableModifiers().size());
 
     // Send dmabuf-feedback data to the core: the format_table (one entry per
     // usable modifier) as a sealed memfd via SCM_RIGHTS, plus main_device dev_t
@@ -458,11 +457,10 @@ int run(int wireFd, int ctrlFd, int inputFd, bool headless,
             int fds[1] = {tableFd};
             ipc::sendMessageFds(ctrlFd, m, fds, 1);
             ::close(tableFd);  // receiver dup'd it
-            std::printf("[gpu] sent FeedbackData: main_device=0x%llx entries=%u size=%u\n",
-                        static_cast<unsigned long long>(m.mainDevice),
-                        m.entryCount, m.formatTableSize);
+            LOG_INFO(Gpu, "sent FeedbackData: main_device=0x{:x} entries={} size={}",
+                     m.mainDevice, m.entryCount, m.formatTableSize);
         } else {
-            std::fprintf(stderr, "[gpu] format_table memfd build failed; feedback skipped\n");
+            LOG_WARN(Gpu, "format_table memfd build failed; feedback skipped");
         }
     }
 
@@ -499,9 +497,9 @@ int run(int wireFd, int ctrlFd, int inputFd, bool headless,
         // outputId 0: the one output today; per-output when enumeration lands.
         fillOutputMsgFromInfo(0, info, m);
         ipc::sendMessage(ctrlFd, m);
-        std::printf(
-            "[gpu] sent OutputDescriptor: %ux%u @%u.%03uHz scale=%u xform=%u "
-            "phys=%ux%umm name=%s make=%s model=%s edid=%s\n",
+        LOG_INFO(Gpu,
+            "sent OutputDescriptor: {}x{} @{}.{:03}Hz scale={} xform={} "
+            "phys={}x{}mm name={} make={} model={} edid={}",
             info.width, info.height,
             info.refreshMhz / 1000, info.refreshMhz % 1000,
             info.scale, info.transform,
@@ -584,9 +582,8 @@ int run(int wireFd, int ctrlFd, int inputFd, bool headless,
             if (!server.InjectTexture(texs[i].Get(),
                                       {p.slots[i].handleId, p.slots[i].handleGeneration},
                                       {ready.device.id, ready.device.generation})) {
-                std::fprintf(stderr,
-                    "[gpu] InjectTexture failed for output %u scanout slot %d\n",
-                    outputId, i);
+                LOG_ERR(Gpu, "InjectTexture failed for output {} scanout slot {}",
+                        outputId, i);
                 return false;
             }
             SurfaceBuf sb{};
@@ -665,21 +662,19 @@ int run(int wireFd, int ctrlFd, int inputFd, bool headless,
         std::vector<uint8_t> buf(p.encodedSize());
         p.encode(buf.data());
         serializer.appendFrame(ipc::FrameKind::ScanoutFormats, buf.data(), buf.size());
-        std::printf("[gpu] sent ScanoutFormats outputId=%u count=%zu (of %zu table entries)\n",
-                    outputId, p.indices.size(), table.size());
+        LOG_INFO(Gpu, "sent ScanoutFormats outputId={} count={} (of {} table entries)",
+                 outputId, p.indices.size(), table.size());
     };
 
     auto handleScanoutReserve = [&](const ipc::ScanoutReservePayload& p) -> bool {
         if (!kms) {
-            std::fprintf(stderr,
-                "[gpu] handleScanoutReserve: no kms (nested mode?) outputId=%u\n",
-                p.outputId);
+            LOG_ERR(Gpu, "handleScanoutReserve: no kms (nested mode?) outputId={}",
+                    p.outputId);
             return false;
         }
         const uint32_t outputId = p.outputId;
         if (!kms->hasOutput(outputId)) {
-            std::fprintf(stderr,
-                "[gpu] ScanoutReserve for unknown output %u\n", outputId);
+            LOG_ERR(Gpu, "ScanoutReserve for unknown output {}", outputId);
             sendScanoutReady(outputId, false);
             return false;
         }
@@ -693,8 +688,8 @@ int run(int wireFd, int ctrlFd, int inputFd, bool headless,
         const bool injectOk = injectScanoutRingSlots(outputId, p, mems, texs);
         sendScanoutReady(outputId, injectOk);
         if (injectOk) {
-            std::printf("[gpu] kms scanout ready for output %u (3 slots injected)\n",
-                        outputId);
+            LOG_INFO(Gpu, "kms scanout ready for output {} (3 slots injected)",
+                     outputId);
             emitCursorPlaneStatus(outputId);
             emitScanoutFormats(outputId);
         }
@@ -725,9 +720,9 @@ int run(int wireFd, int ctrlFd, int inputFd, bool headless,
         p.outputId = outputId;
         const size_t cap = ipc::kMaxModesPerOutput;
         if (modes.size() > cap) {
-            std::fprintf(stderr,
-                "[gpu] OutputModes: connector for outputId=%u has %zu modes, "
-                "truncating to %zu\n", outputId, modes.size(), cap);
+            LOG_WARN(Gpu,
+                "OutputModes: connector for outputId={} has {} modes, "
+                "truncating to {}", outputId, modes.size(), cap);
             modes.resize(cap);
         }
         p.modes.reserve(modes.size());
@@ -742,8 +737,8 @@ int run(int wireFd, int ctrlFd, int inputFd, bool headless,
         std::vector<uint8_t> buf(p.encodedSize());
         p.encode(buf.data());
         serializer.appendFrame(ipc::FrameKind::OutputModes, buf.data(), buf.size());
-        std::printf("[gpu] sent OutputModes outputId=%u count=%zu\n",
-                    outputId, p.modes.size());
+        LOG_INFO(Gpu, "sent OutputModes outputId={} count={}",
+                 outputId, p.modes.size());
     };
 
     // Pack one output's identity into an OutputDescriptorPayload. Used by
@@ -797,9 +792,9 @@ int run(int wireFd, int ctrlFd, int inputFd, bool headless,
             m.outputCount = nOutputs;
             fillOutputMsg(outputId, m);
             ipc::sendMessage(ctrlFd, m);
-            std::printf("[gpu] sent OutputDescriptor (kms output %u/%u): %ux%u @%u.%03uHz name=%s\n",
-                        outputId, nOutputs, m.width, m.height,
-                        m.refreshMhz / 1000, m.refreshMhz % 1000, m.outputName);
+            LOG_INFO(Gpu, "sent OutputDescriptor (kms output {}/{}): {}x{} @{}.{:03}Hz name={}",
+                     outputId, nOutputs, m.width, m.height,
+                     m.refreshMhz / 1000, m.refreshMhz % 1000, m.outputName);
             // OutputModes rides wire (FrameKind), the descriptor above
             // rides ctrl. Different fds, but the core's startup pump
             // drains both before handing control to the JS layer, so
@@ -813,7 +808,7 @@ int run(int wireFd, int ctrlFd, int inputFd, bool headless,
         // any ScanoutReserve handling so handleScanoutReserve below can
         // assume the ring is already there.
         if (!kms->initScanout(coreDevice)) {
-            std::fprintf(stderr, "[gpu] KmsOutputBackend::initScanout failed\n");
+            LOG_ERR(Gpu, "KmsOutputBackend::initScanout failed");
             return 1;
         }
 
@@ -829,26 +824,23 @@ int run(int wireFd, int ctrlFd, int inputFd, bool headless,
                                        const std::vector<uint8_t>& frame,
                                        const int* /*fds*/, int nfds) {
             if (kind != ipc::FrameKind::ScanoutReserve) {
-                std::fprintf(stderr,
-                    "[gpu] startup: unexpected wire frame kind=%u (expected ScanoutReserve)\n",
+                LOG_ERR(Ipc,
+                    "startup: unexpected wire frame kind={} (expected ScanoutReserve)",
                     static_cast<unsigned>(kind));
                 std::abort();
             }
             if (nfds != 0) {
-                std::fprintf(stderr,
-                    "[gpu] startup: ScanoutReserve with nfds=%d (must be 0)\n", nfds);
+                LOG_ERR(Ipc, "startup: ScanoutReserve with nfds={} (must be 0)", nfds);
                 std::abort();
             }
             if (frame.size() != ipc::ScanoutReservePayload::kSize) {
-                std::fprintf(stderr,
-                    "[gpu] startup: ScanoutReserve bad payload size %zu\n", frame.size());
+                LOG_ERR(Ipc, "startup: ScanoutReserve bad payload size {}", frame.size());
                 std::abort();
             }
             auto p = ipc::ScanoutReservePayload::decode(frame.data());
             if (!handleScanoutReserve(p)) {
-                std::fprintf(stderr,
-                    "[gpu] startup ScanoutReserve handling failed for output %u\n",
-                    p.outputId);
+                LOG_ERR(Gpu, "startup ScanoutReserve handling failed for output {}",
+                        p.outputId);
                 std::abort();
             }
             ++reservesHandled;
@@ -859,8 +851,8 @@ int run(int wireFd, int ctrlFd, int inputFd, bool headless,
             usleepShort();
         }
         if (reservesHandled < nOutputs) {
-            std::fprintf(stderr, "[gpu] no ScanoutReserve (received %u/%u)\n",
-                         reservesHandled, nOutputs);
+            LOG_ERR(Ipc, "no ScanoutReserve (received {}/{})",
+                    reservesHandled, nOutputs);
             return 1;
         }
         // Reset the startup dispatcher; the full one is bound below.
@@ -878,13 +870,12 @@ int run(int wireFd, int ctrlFd, int inputFd, bool headless,
     auto handleNestedScanoutReserve =
         [&](const ipc::ScanoutReservePayload& p) -> bool {
         if (headless || outputKms) {
-            std::fprintf(stderr,
-                "[gpu] handleNestedScanoutReserve called without nested backend\n");
+            LOG_ERR(Gpu, "handleNestedScanoutReserve called without nested backend");
             return false;
         }
         if (p.outputId != 0) {
-            std::fprintf(stderr,
-                "[gpu] nested ScanoutReserve for unexpected output %u (only 0 supported)\n",
+            LOG_ERR(Gpu,
+                "nested ScanoutReserve for unexpected output {} (only 0 supported)",
                 p.outputId);
             sendScanoutReady(p.outputId, false);
             return false;
@@ -892,8 +883,7 @@ int run(int wireFd, int ctrlFd, int inputFd, bool headless,
         auto* hb = static_cast<gpu::HostWindowOutputBackend*>(output.get());
         auto* ring = hb->scanoutRing();
         if (!ring) {
-            std::fprintf(stderr,
-                "[gpu] nested ScanoutReserve: scanout ring is not built\n");
+            LOG_ERR(Gpu, "nested ScanoutReserve: scanout ring is not built");
             sendScanoutReady(0, false);
             return false;
         }
@@ -930,7 +920,7 @@ int run(int wireFd, int ctrlFd, int inputFd, bool headless,
         const bool injectOk = injectScanoutRingSlots(0, p, mems, texs);
         sendScanoutReady(0, injectOk);
         if (injectOk) {
-            std::printf("[gpu] nested scanout ready for output 0 (3 slots injected)\n");
+            LOG_INFO(Gpu, "nested scanout ready for output 0 (3 slots injected)");
         }
         return injectOk;
     };
@@ -950,7 +940,7 @@ int run(int wireFd, int ctrlFd, int inputFd, bool headless,
         // ring (see bringUp's wantSurface branch).
         constexpr uint32_t kScanoutFourcc = 0x34325241u;  // DRM_FORMAT_ARGB8888
         if (!hb->initScanout(alloc.gbm(), coreDevice, kScanoutFourcc)) {
-            std::fprintf(stderr, "[gpu] HostWindowOutputBackend::initScanout failed\n");
+            LOG_ERR(Gpu, "HostWindowOutputBackend::initScanout failed");
             return 1;
         }
 
@@ -960,25 +950,22 @@ int run(int wireFd, int ctrlFd, int inputFd, bool headless,
                                        const std::vector<uint8_t>& frame,
                                        const int* /*fds*/, int nfds) {
             if (kind != ipc::FrameKind::ScanoutReserve) {
-                std::fprintf(stderr,
-                    "[gpu] nested startup: unexpected wire frame kind=%u (expected ScanoutReserve)\n",
+                LOG_ERR(Ipc,
+                    "nested startup: unexpected wire frame kind={} (expected ScanoutReserve)",
                     static_cast<unsigned>(kind));
                 std::abort();
             }
             if (nfds != 0) {
-                std::fprintf(stderr,
-                    "[gpu] nested startup: ScanoutReserve with nfds=%d (must be 0)\n", nfds);
+                LOG_ERR(Ipc, "nested startup: ScanoutReserve with nfds={} (must be 0)", nfds);
                 std::abort();
             }
             if (frame.size() != ipc::ScanoutReservePayload::kSize) {
-                std::fprintf(stderr,
-                    "[gpu] nested startup: ScanoutReserve bad payload size %zu\n", frame.size());
+                LOG_ERR(Ipc, "nested startup: ScanoutReserve bad payload size {}", frame.size());
                 std::abort();
             }
             auto p = ipc::ScanoutReservePayload::decode(frame.data());
             if (!handleNestedScanoutReserve(p)) {
-                std::fprintf(stderr,
-                    "[gpu] nested startup: ScanoutReserve handling failed\n");
+                LOG_ERR(Gpu, "nested startup: ScanoutReserve handling failed");
                 std::abort();
             }
             ++reservesHandled;
@@ -988,7 +975,7 @@ int run(int wireFd, int ctrlFd, int inputFd, bool headless,
             usleepShort();
         }
         if (reservesHandled < 1) {
-            std::fprintf(stderr, "[gpu] no ScanoutReserve received (nested)\n");
+            LOG_ERR(Ipc, "no ScanoutReserve received (nested)");
             return 1;
         }
         dispatchCoreControlFrame = nullptr;
@@ -1048,8 +1035,8 @@ int run(int wireFd, int ctrlFd, int inputFd, bool headless,
                 // after any in-flight wire frames for the old ring have
                 // been processed by FIFO ordering.
                 if (!hb->initScanout(alloc.gbm(), coreDevice, kScanoutFourcc)) {
-                    std::fprintf(stderr,
-                        "[gpu] resize: HostWindowOutputBackend::initScanout(%ux%u) failed\n",
+                    LOG_ERR(Gpu,
+                        "resize: HostWindowOutputBackend::initScanout({}x{}) failed",
                         newW, newH);
                     return;
                 }
@@ -1079,8 +1066,8 @@ int run(int wireFd, int ctrlFd, int inputFd, bool headless,
                 // outputId 0: the nested backend drives one output.
                 fillOutputMsgFromInfo(0, info, m);
                 ipc::sendMessage(ctrlFd, m);
-                std::printf("[gpu] resize -> %ux%u; rebuilt scanout ring; sent ScanoutRebuild + OutputDescriptor\n",
-                            newW, newH);
+                LOG_INFO(Gpu, "resize -> {}x{}; rebuilt scanout ring; sent ScanoutRebuild + OutputDescriptor",
+                         newW, newH);
                 // Resize-deadlock break: after a rebuild the host won't
                 // fire wl_surface.frame.done until we commit something
                 // (its frame callback signals frame-actually-displayed,
@@ -1256,8 +1243,8 @@ int run(int wireFd, int ctrlFd, int inputFd, bool headless,
                 } else if (dispatchControl) {
                     dispatchControl(kind, frame);
                 } else {
-                    std::fprintf(stderr,
-                        "[gpu] plugin conn %u: control frame kind=%u before dispatch ready\n",
+                    LOG_ERR(Ipc,
+                        "plugin conn {}: control frame kind={} before dispatch ready",
                         connId, static_cast<unsigned>(kind));
                     std::abort();
                 }
@@ -1333,8 +1320,8 @@ int run(int wireFd, int ctrlFd, int inputFd, bool headless,
         wgpu::SharedTextureMemoryEndAccessState endState{};
         endState.nextInChain = &endLayout;
         if (mem.EndAccess(tex, &endState) != wgpu::Status::Success) {
-            std::fprintf(stderr, "[gpu] %sEnd: EndAccess failed (buf=%u)\n",
-                         producer ? "Producer" : "Consumer", surfaceBufId);
+            LOG_ERR(Gpu, "{}End: EndAccess failed (buf={})",
+                    producer ? "Producer" : "Consumer", surfaceBufId);
             // A failed End leaves nothing for the peer to wait on. Clear any
             // stale fence from the previous successful End so the peer's next
             // Begin doesn't wait on an obsolete fence.
@@ -1395,8 +1382,8 @@ int run(int wireFd, int ctrlFd, int inputFd, bool headless,
                             if (dupFd >= 0) {
                                 scanoutFenceFdByBufId[surfaceBufId] = dupFd;
                             } else {
-                                std::fprintf(stderr,
-                                    "[gpu] scanout EndAccess: dup(syncfd=%d) failed: %s\n",
+                                LOG_ERR(Gpu,
+                                    "scanout EndAccess: dup(syncfd={}) failed: {}",
                                     syncExp.handle, std::strerror(errno));
                             }
                         }
@@ -1445,8 +1432,8 @@ int run(int wireFd, int ctrlFd, int inputFd, bool headless,
     auto runSurfaceBegin = [&](uint32_t surfaceBufId, bool producer) -> bool {
         auto it = surfaceBufs.find(surfaceBufId);
         if (it == surfaceBufs.end()) {
-            std::fprintf(stderr, "[gpu] %sBegin: unknown surfaceBufId=%u\n",
-                         producer ? "Producer" : "Consumer", surfaceBufId);
+            LOG_ERR(Gpu, "{}Begin: unknown surfaceBufId={}",
+                    producer ? "Producer" : "Consumer", surfaceBufId);
             return false;
         }
         SurfaceBuf& sb = it->second;
@@ -1495,10 +1482,10 @@ int run(int wireFd, int ctrlFd, int inputFd, bool headless,
                 ::poll(&pw, 1, stepMs);
             }
             if (!ended()) {
-                std::fprintf(stderr,
-                    "[gpu] ConsumerBegin buf=%u: producer End not decoded after bounded "
-                    "wait (producerOnCore=%d producerOpen=%d everProduced=%d). Proceeding "
-                    "with no fence wait; this slot may sample stale/zeroed contents.\n",
+                LOG_WARN(Gpu,
+                    "ConsumerBegin buf={}: producer End not decoded after bounded "
+                    "wait (producerOnCore={} producerOpen={} everProduced={}). Proceeding "
+                    "with no fence wait; this slot may sample stale/zeroed contents.",
                     surfaceBufId, sb.producerOnCore ? 1 : 0,
                     sb.producerOpen ? 1 : 0, sb.everProduced ? 1 : 0);
             }
@@ -1528,8 +1515,8 @@ int run(int wireFd, int ctrlFd, int inputFd, bool headless,
         }
         wgpu::Status ba = mem.BeginAccess(tex, &bad);
         if (ba != wgpu::Status::Success) {
-            std::fprintf(stderr, "[gpu] %sBegin: BeginAccess failed (buf=%u)\n",
-                         producer ? "Producer" : "Consumer", surfaceBufId);
+            LOG_ERR(Gpu, "{}Begin: BeginAccess failed (buf={})",
+                    producer ? "Producer" : "Consumer", surfaceBufId);
             return false;
         }
         if (producer) { sb.everProduced = true; sb.producerOpen = true; }
@@ -1576,7 +1563,7 @@ int run(int wireFd, int ctrlFd, int inputFd, bool headless,
         if (ok && !server.InjectTexture(ct.tex.Get(),
                                         {m.texture.id, m.texture.generation},
                                         {m.device.id, m.device.generation})) {
-            std::fprintf(stderr, "[gpu] ImportClientTex: InjectTexture failed\n");
+            LOG_ERR(Gpu, "ImportClientTex: InjectTexture failed");
             ok = false;
         }
         if (ok) {
@@ -1619,8 +1606,8 @@ int run(int wireFd, int ctrlFd, int inputFd, bool headless,
                                     int explicitAcquireFd) -> bool {
         auto it = clientTextures.find(textureId);
         if (it == clientTextures.end() || it->second.generation != textureGen) {
-            std::fprintf(stderr,
-                "[gpu] BeginClientAccess: unknown texture {%u,%u} (have gen %d) @wire=%zu\n",
+            LOG_ERR(Gpu,
+                "BeginClientAccess: unknown texture {{{},{}}} (have gen {}) @wire={}",
                 textureId, textureGen,
                 it == clientTextures.end() ? -1 : (int)it->second.generation,
                 wireReader.bytesConsumed());
@@ -1634,8 +1621,8 @@ int run(int wireFd, int ctrlFd, int inputFd, bool headless,
             // (src/gpu/client-buffer-lifecycle.ts) enforces this too, but
             // defending here gives a typed error attribution to the bufferId
             // rather than letting Dawn fault the device.
-            std::fprintf(stderr,
-                "[gpu] BeginClientAccess: bracket already open on {%u,%u}\n",
+            LOG_ERR(Gpu,
+                "BeginClientAccess: bracket already open on {{{},{}}}",
                 textureId, textureGen);
             if (explicitAcquireFd >= 0) ::close(explicitAcquireFd);
             return false;
@@ -1687,8 +1674,8 @@ int run(int wireFd, int ctrlFd, int inputFd, bool headless,
         bad.signaledValueCount = fenceCount;
         bad.signaledValues = fenceCount ? signaledValues : nullptr;
         if (ct.mem.BeginAccess(ct.tex, &bad) != wgpu::Status::Success) {
-            std::fprintf(stderr,
-                "[gpu] BeginClientAccess: Dawn BeginAccess failed {%u,%u}\n",
+            LOG_ERR(Gpu,
+                "BeginClientAccess: Dawn BeginAccess failed {{{},{}}}",
                 textureId, textureGen);
             return false;
         }
@@ -1712,8 +1699,8 @@ int run(int wireFd, int ctrlFd, int inputFd, bool headless,
         }
         ClientTex& ct = it->second;
         if (!ct.accessOpen) {
-            std::fprintf(stderr,
-                "[gpu] EndClientAccess: no open bracket on {%u,%u}\n",
+            LOG_ERR(Gpu,
+                "EndClientAccess: no open bracket on {{{},{}}}",
                 textureId, textureGen);
             return;
         }
@@ -1732,8 +1719,8 @@ int run(int wireFd, int ctrlFd, int inputFd, bool headless,
         wgpu::SharedTextureMemoryEndAccessState endState{};
         endState.nextInChain = &endLayout;
         if (ct.mem.EndAccess(ct.tex, &endState) != wgpu::Status::Success) {
-            std::fprintf(stderr,
-                "[gpu] EndClientAccess: Dawn EndAccess failed {%u,%u}\n",
+            LOG_ERR(Gpu,
+                "EndClientAccess: Dawn EndAccess failed {{{},{}}}",
                 textureId, textureGen);
             ct.accessOpen = false;  // cleared even on failure -- Dawn rejects future begins anyway
             return;
@@ -1827,10 +1814,9 @@ int run(int wireFd, int ctrlFd, int inputFd, bool headless,
         }
         const char* tagName = producerOnCore ? "AllocComposeBuf" : "AllocSurfaceBuf";
         if (!pc || !producerNative || !consumerNative) {
-            std::fprintf(stderr, "[gpu] %s: device resolve failed "
-                         "(pc=%d producer=%p consumer=%p)\n", tagName, pc ? 1 : 0,
-                         static_cast<void*>(producerNative),
-                         static_cast<void*>(consumerNative));
+            LOG_ERR(Gpu, "{}: device resolve failed "
+                    "(pc={} producer={} consumer={})", tagName, pc ? 1 : 0,
+                    fmt::ptr(producerNative), fmt::ptr(consumerNative));
             sendSurfaceBufAllocated(m.surfaceBufId, m.connId, false);
             return;
         }
@@ -1851,8 +1837,8 @@ int run(int wireFd, int ctrlFd, int inputFd, bool headless,
         if (ok) ok = gpu::Allocator::importTexture(
             consumerDev, alloc.fourcc(), sb.buf, sb.consumerMem, sb.consumerTex);
         if (!ok) {
-            std::fprintf(stderr, "[gpu] %s id=%u: alloc/import failed\n",
-                         tagName, m.surfaceBufId);
+            LOG_ERR(Gpu, "{} id={}: alloc/import failed",
+                    tagName, m.surfaceBufId);
             alloc.release(sb.buf);
             sendSurfaceBufAllocated(m.surfaceBufId, m.connId, false);
             return;
@@ -1881,16 +1867,16 @@ int run(int wireFd, int ctrlFd, int inputFd, bool headless,
                          state, tagName]() {
             const bool ok = state->producerOk && state->consumerOk;
             if (ok) {
-                std::printf("[gpu] %s id=%u %ux%u: imported on producer+consumer, injected\n",
-                            tagName, state->msg.surfaceBufId,
-                            state->msg.width, state->msg.height);
+                LOG_INFO(Gpu, "{} id={} {}x{}: imported on producer+consumer, injected",
+                         tagName, state->msg.surfaceBufId,
+                         state->msg.width, state->msg.height);
                 surfaceBufs[state->msg.surfaceBufId] = std::move(state->sb);
                 serializer.Flush();
             } else {
-                std::fprintf(stderr, "[gpu] %s id=%u: inject failed (p=%d c=%d)\n",
-                             tagName, state->msg.surfaceBufId,
-                             static_cast<int>(state->producerOk),
-                             static_cast<int>(state->consumerOk));
+                LOG_ERR(Gpu, "{} id={}: inject failed (p={} c={})",
+                        tagName, state->msg.surfaceBufId,
+                        static_cast<int>(state->producerOk),
+                        static_cast<int>(state->consumerOk));
                 state->sb.producerTex = nullptr;
                 state->sb.producerMem = nullptr;
                 state->sb.consumerTex = nullptr;
@@ -1971,7 +1957,7 @@ int run(int wireFd, int ctrlFd, int inputFd, bool headless,
     dispatchCoreControlFrame = [&](ipc::FrameKind kind, const std::vector<uint8_t>& frame,
                                    const int* fds, int nfds) {
         if (frame.empty()) {
-            std::fprintf(stderr, "[gpu] core wire: empty control frame\n");
+            LOG_ERR(Ipc, "core wire: empty control frame");
             std::abort();
         }
         if (kind == ipc::FrameKind::ScanoutReserve) {
@@ -1984,13 +1970,11 @@ int run(int wireFd, int ctrlFd, int inputFd, bool headless,
             // referencing the new bufIds is FIFO-after this frame and
             // will find the bufIds registered in surfaceBufs.
             if (nfds != 0) {
-                std::fprintf(stderr,
-                    "[gpu] core wire: ScanoutReserve with nfds=%d (must be 0)\n", nfds);
+                LOG_ERR(Ipc, "core wire: ScanoutReserve with nfds={} (must be 0)", nfds);
                 std::abort();
             }
             if (frame.size() != ipc::ScanoutReservePayload::kSize) {
-                std::fprintf(stderr,
-                    "[gpu] core wire: bad ScanoutReserve payload size %zu\n", frame.size());
+                LOG_ERR(Ipc, "core wire: bad ScanoutReserve payload size {}", frame.size());
                 std::abort();
             }
             auto p = ipc::ScanoutReservePayload::decode(frame.data());
@@ -2004,8 +1988,8 @@ int run(int wireFd, int ctrlFd, int inputFd, bool headless,
                 (void)handleNestedScanoutReserve(p);
                 return;
             }
-            std::fprintf(stderr,
-                "[gpu] core wire: ScanoutReserve with no backend to handle it (outputId=%u)\n",
+            LOG_ERR(Gpu,
+                "core wire: ScanoutReserve with no backend to handle it (outputId={})",
                 p.outputId);
             std::abort();
         }
@@ -2017,20 +2001,17 @@ int run(int wireFd, int ctrlFd, int inputFd, bool headless,
             // ScanoutRebuild on the wire. The core's reply (ScanoutReserve
             // for the new dims) lands back in this same handler later.
             if (nfds != 0) {
-                std::fprintf(stderr,
-                    "[gpu] core wire: SwitchMode with nfds=%d (must be 0)\n", nfds);
+                LOG_ERR(Ipc, "core wire: SwitchMode with nfds={} (must be 0)", nfds);
                 std::abort();
             }
             if (frame.size() != ipc::SwitchModePayload::kSize) {
-                std::fprintf(stderr,
-                    "[gpu] core wire: bad SwitchMode payload size %zu\n", frame.size());
+                LOG_ERR(Ipc, "core wire: bad SwitchMode payload size {}", frame.size());
                 std::abort();
             }
             auto p = ipc::SwitchModePayload::decode(frame.data());
             if (!kms) {
-                std::fprintf(stderr,
-                    "[gpu] SwitchMode: no kms backend (nested mode?) outputId=%u\n",
-                    p.outputId);
+                LOG_ERR(Gpu, "SwitchMode: no kms backend (nested mode?) outputId={}",
+                        p.outputId);
                 return;
             }
             // Erase the old ring's surfaceBufs / fence-fd / slot-routing
@@ -2058,10 +2039,10 @@ int run(int wireFd, int ctrlFd, int inputFd, bool headless,
                 // silently dropped. Do NOT
                 // emit ScanoutRebuild -- there is no new ring for the core
                 // to reserve into.
-                std::fprintf(stderr,
-                    "[gpu] SwitchMode failed for outputId=%u (mode missing or "
+                LOG_ERR(Gpu,
+                    "SwitchMode failed for outputId={} (mode missing or "
                     "ring re-init failed); output is dark until a successful "
-                    "switch or hotplug cycle\n", p.outputId);
+                    "switch or hotplug cycle", p.outputId);
                 return;
             }
             // Emit ScanoutRebuild so the core releases its prior
@@ -2085,10 +2066,10 @@ int run(int wireFd, int ctrlFd, int inputFd, bool headless,
             m.tag = ipc::Tag::OutputDescriptor;
             fillOutputMsg(p.outputId, m);
             ctrlSender.send(m);
-            std::printf("[gpu] SwitchMode applied + ScanoutRebuild sent for "
-                        "outputId=%u %ux%u @%u.%03uHz\n",
-                        p.outputId, info.width, info.height,
-                        info.refreshMhz / 1000, info.refreshMhz % 1000);
+            LOG_INFO(Gpu, "SwitchMode applied + ScanoutRebuild sent for "
+                     "outputId={} {}x{} @{}.{:03}Hz",
+                     p.outputId, info.width, info.height,
+                     info.refreshMhz / 1000, info.refreshMhz % 1000);
             return;
         }
         if (kind == ipc::FrameKind::ScanoutPresent) {
@@ -2099,13 +2080,11 @@ int run(int wireFd, int ctrlFd, int inputFd, bool headless,
             // slot by surfaceBufId, NOT slot index -- map it back to
             // {output, slot} and dispatch by which backend owns the output.
             if (nfds != 0) {
-                std::fprintf(stderr,
-                    "[gpu] core wire: ScanoutPresent with nfds=%d (must be 0)\n", nfds);
+                LOG_ERR(Ipc, "core wire: ScanoutPresent with nfds={} (must be 0)", nfds);
                 std::abort();
             }
             if (frame.size() != ipc::ScanoutPresentPayload::kSize) {
-                std::fprintf(stderr,
-                    "[gpu] core wire: bad ScanoutPresent payload size %zu\n", frame.size());
+                LOG_ERR(Ipc, "core wire: bad ScanoutPresent payload size {}", frame.size());
                 std::abort();
             }
             auto p = ipc::ScanoutPresentPayload::decode(frame.data());
@@ -2113,9 +2092,8 @@ int run(int wireFd, int ctrlFd, int inputFd, bool headless,
             if (sit == scanoutBufIdToSlot.end()) {
                 // A flip queued before this output's ring was torn down
                 // (hotplug remove, SwitchMode): drop it.
-                std::fprintf(stderr,
-                    "[gpu] ScanoutPresent: unknown surfaceBufId=%u\n",
-                    p.surfaceBufId);
+                LOG_WARN(Gpu, "ScanoutPresent: unknown surfaceBufId={}",
+                         p.surfaceBufId);
                 return;
             }
             const uint32_t outputId = sit->second.first;
@@ -2129,9 +2107,8 @@ int run(int wireFd, int ctrlFd, int inputFd, bool headless,
                     scanoutFenceFdByBufId.erase(fit);
                 }
                 if (!kms->presentScanoutAt(outputId, slot, fenceFd)) {
-                    std::fprintf(stderr,
-                        "[gpu] presentScanoutAt(output=%u, slot=%d) rejected by kernel\n",
-                        outputId, slot);
+                    LOG_ERR(Gpu, "presentScanoutAt(output={}, slot={}) rejected by kernel",
+                            outputId, slot);
                 }
                 if (fenceFd >= 0) ::close(fenceFd);
                 return;
@@ -2147,18 +2124,16 @@ int run(int wireFd, int ctrlFd, int inputFd, bool headless,
             || kind == ipc::FrameKind::CursorImageShm
             || kind == ipc::FrameKind::CursorState) {
             if (nfds != 0) {
-                std::fprintf(stderr,
-                    "[gpu] core wire: cursor frame kind=%u with nfds=%d (must be 0)\n",
-                    static_cast<unsigned>(kind), nfds);
+                LOG_ERR(Ipc, "core wire: cursor frame kind={} with nfds={} (must be 0)",
+                        static_cast<unsigned>(kind), nfds);
                 std::abort();
             }
 #if OVERDRAW_KMS
             if (kms) {
                 if (kind == ipc::FrameKind::CursorState) {
                     if (frame.size() != ipc::CursorStatePayload::kSize) {
-                        std::fprintf(stderr,
-                            "[gpu] core wire: bad CursorState payload size %zu\n",
-                            frame.size());
+                        LOG_ERR(Ipc, "core wire: bad CursorState payload size {}",
+                                frame.size());
                         std::abort();
                     }
                     auto p = ipc::CursorStatePayload::decode(frame.data());
@@ -2168,18 +2143,16 @@ int run(int wireFd, int ctrlFd, int inputFd, bool headless,
                 }
                 if (kind == ipc::FrameKind::CursorImage) {
                     if (frame.size() < ipc::CursorImagePayload::kSize) {
-                        std::fprintf(stderr,
-                            "[gpu] core wire: bad CursorImage payload size %zu\n",
-                            frame.size());
+                        LOG_ERR(Ipc, "core wire: bad CursorImage payload size {}",
+                                frame.size());
                         std::abort();
                     }
                     auto p = ipc::CursorImagePayload::decode(frame.data());
                     const size_t need = ipc::CursorImagePayload::kSize
                         + static_cast<size_t>(p.srcWidth) * p.srcHeight * 4u;
                     if (frame.size() != need) {
-                        std::fprintf(stderr,
-                            "[gpu] core wire: CursorImage %ux%u expects %zu bytes, got %zu\n",
-                            p.srcWidth, p.srcHeight, need, frame.size());
+                        LOG_ERR(Ipc, "core wire: CursorImage {}x{} expects {} bytes, got {}",
+                                p.srcWidth, p.srcHeight, need, frame.size());
                         std::abort();
                     }
                     if (!kms->setCursorImage(p.outputId,
@@ -2194,16 +2167,14 @@ int run(int wireFd, int ctrlFd, int inputFd, bool headless,
                 // out immediately -- wire FIFO puts this after the commit's
                 // ShmUpload and before any wl_buffer release the core sends.
                 if (frame.size() != ipc::CursorImageShmPayload::kSize) {
-                    std::fprintf(stderr,
-                        "[gpu] core wire: bad CursorImageShm payload size %zu\n",
-                        frame.size());
+                    LOG_ERR(Ipc, "core wire: bad CursorImageShm payload size {}",
+                            frame.size());
                     std::abort();
                 }
                 auto p = ipc::CursorImageShmPayload::decode(frame.data());
                 auto it = shmPools.find(p.poolId);
                 if (it == shmPools.end()) {
-                    std::fprintf(stderr,
-                        "[gpu] CursorImageShm: unknown poolId=%u\n", p.poolId);
+                    LOG_ERR(Gpu, "CursorImageShm: unknown poolId={}", p.poolId);
                     return;
                 }
                 const ShmPool& pool = it->second;
@@ -2213,9 +2184,9 @@ int run(int wireFd, int ctrlFd, int inputFd, bool headless,
                            + static_cast<uint64_t>(p.srcHeight - 1) * p.stride
                            + static_cast<uint64_t>(p.srcWidth) * 4u
                        > pool.size) {
-                    std::fprintf(stderr,
-                        "[gpu] CursorImageShm: rect %ux%u stride=%u offset=%u "
-                        "exceeds pool %zu\n",
+                    LOG_ERR(Gpu,
+                        "CursorImageShm: rect {}x{} stride={} offset={} "
+                        "exceeds pool {}",
                         p.srcWidth, p.srcHeight, p.stride, p.offset, pool.size);
                     return;
                 }
@@ -2229,9 +2200,8 @@ int run(int wireFd, int ctrlFd, int inputFd, bool headless,
 #endif
             // Nested/headless: the core never receives an ok=1
             // CursorPlaneStatus here, so cursor frames are unexpected.
-            std::fprintf(stderr,
-                "[gpu] core wire: cursor frame kind=%u with no kms backend\n",
-                static_cast<unsigned>(kind));
+            LOG_ERR(Gpu, "core wire: cursor frame kind={} with no kms backend",
+                    static_cast<unsigned>(kind));
             return;
         }
         if (kind == ipc::FrameKind::ScanoutClientPresent
@@ -2240,20 +2210,17 @@ int run(int wireFd, int ctrlFd, int inputFd, bool headless,
             int fenceFd = -1;
             if (withFence) {
                 if (nfds != 1 || !fds) {
-                    std::fprintf(stderr,
-                        "[gpu] core wire: ScanoutClientPresentFence with nfds=%d\n", nfds);
+                    LOG_ERR(Ipc, "core wire: ScanoutClientPresentFence with nfds={}", nfds);
                     std::abort();
                 }
                 fenceFd = fds[0];
             } else if (nfds != 0) {
-                std::fprintf(stderr,
-                    "[gpu] core wire: ScanoutClientPresent with nfds=%d (must be 0)\n", nfds);
+                LOG_ERR(Ipc, "core wire: ScanoutClientPresent with nfds={} (must be 0)", nfds);
                 std::abort();
             }
             if (frame.size() != ipc::ScanoutClientPresentPayload::kSize) {
-                std::fprintf(stderr,
-                    "[gpu] core wire: bad ScanoutClientPresent payload size %zu\n",
-                    frame.size());
+                LOG_ERR(Ipc, "core wire: bad ScanoutClientPresent payload size {}",
+                        frame.size());
                 std::abort();
             }
             auto p = ipc::ScanoutClientPresentPayload::decode(frame.data());
@@ -2271,9 +2238,8 @@ int run(int wireFd, int ctrlFd, int inputFd, bool headless,
                 auto it = clientTextures.find(p.textureId);
                 if (it == clientTextures.end()
                     || it->second.generation != p.textureGeneration) {
-                    std::fprintf(stderr,
-                        "[gpu] ScanoutClientPresent: unknown texture {%u,%u}\n",
-                        p.textureId, p.textureGeneration);
+                    LOG_ERR(Gpu, "ScanoutClientPresent: unknown texture {{{},{}}}",
+                            p.textureId, p.textureGeneration);
                     reject();
                     if (fenceFd >= 0) ::close(fenceFd);
                     return;
@@ -2299,8 +2265,7 @@ int run(int wireFd, int ctrlFd, int inputFd, bool headless,
 #endif
             // Nested/headless never advertises scanout; a present here is a
             // protocol bug, but reject-and-continue keeps the core rendering.
-            std::fprintf(stderr,
-                "[gpu] core wire: ScanoutClientPresent with no kms backend\n");
+            LOG_ERR(Gpu, "core wire: ScanoutClientPresent with no kms backend");
             reject();
             if (fenceFd >= 0) ::close(fenceFd);
             return;
@@ -2311,12 +2276,12 @@ int run(int wireFd, int ctrlFd, int inputFd, bool headless,
             // client's id allocator one past anything prior) is server-allocated
             // BEFORE any subsequent wire command tries to allocate id+1.
             if (frame.size() != ipc::ImportClientTexPayload::kSize) {
-                std::fprintf(stderr, "[gpu] core wire: bad ImportClientTex payload size %zu\n",
-                             frame.size());
+                LOG_ERR(Ipc, "core wire: bad ImportClientTex payload size {}",
+                        frame.size());
                 std::abort();
             }
             if (nfds != 1 || !fds) {
-                std::fprintf(stderr, "[gpu] core wire: ImportClientTex with nfds=%d\n", nfds);
+                LOG_ERR(Ipc, "core wire: ImportClientTex with nfds={}", nfds);
                 std::abort();
             }
             auto p = ipc::ImportClientTexPayload::decode(frame.data());
@@ -2343,14 +2308,12 @@ int run(int wireFd, int ctrlFd, int inputFd, bool headless,
             // bracket the core wrote before this release has already been
             // decoded by here -- no wireSerial workaround needed.
             if (nfds != 0) {
-                std::fprintf(stderr,
-                    "[gpu] core wire: ReleaseClientTex with nfds=%d (must be 0)\n", nfds);
+                LOG_ERR(Ipc, "core wire: ReleaseClientTex with nfds={} (must be 0)", nfds);
                 std::abort();
             }
             if (frame.size() != ipc::ReleaseClientTexPayload::kSize) {
-                std::fprintf(stderr,
-                    "[gpu] core wire: bad ReleaseClientTex payload size %zu\n",
-                    frame.size());
+                LOG_ERR(Ipc, "core wire: bad ReleaseClientTex payload size {}",
+                        frame.size());
                 std::abort();
             }
             auto p = ipc::ReleaseClientTexPayload::decode(frame.data());
@@ -2382,31 +2345,27 @@ int run(int wireFd, int ctrlFd, int inputFd, bool headless,
             // Core registered a wl_shm pool. The memfd rides as exactly one
             // SCM_RIGHTS fd. mmap it read-only so ShmUpload can stage from it.
             if (nfds != 1) {
-                std::fprintf(stderr,
-                    "[gpu] core wire: RegisterShmPool expects nfds=1, got %d\n", nfds);
+                LOG_ERR(Ipc, "core wire: RegisterShmPool expects nfds=1, got {}", nfds);
                 std::abort();
             }
             if (frame.size() != ipc::RegisterShmPoolPayload::kSize) {
-                std::fprintf(stderr,
-                    "[gpu] core wire: bad RegisterShmPool payload size %zu\n",
-                    frame.size());
+                LOG_ERR(Ipc, "core wire: bad RegisterShmPool payload size {}",
+                        frame.size());
                 std::abort();
             }
             auto p = ipc::RegisterShmPoolPayload::decode(frame.data());
             const int fd = fds[0];
             if (p.size == 0 || p.size > static_cast<uint64_t>(SIZE_MAX)) {
-                std::fprintf(stderr,
-                    "[gpu] RegisterShmPool: bad size %llu (poolId=%u)\n",
-                    static_cast<unsigned long long>(p.size), p.poolId);
+                LOG_ERR(Gpu, "RegisterShmPool: bad size {} (poolId={})",
+                        p.size, p.poolId);
                 ::close(fd);
                 return;
             }
             void* base = ::mmap(nullptr, static_cast<size_t>(p.size),
                                 PROT_READ, MAP_SHARED, fd, 0);
             if (base == MAP_FAILED) {
-                std::fprintf(stderr,
-                    "[gpu] RegisterShmPool: mmap failed (poolId=%u, size=%zu): %s\n",
-                    p.poolId, static_cast<size_t>(p.size), std::strerror(errno));
+                LOG_ERR(Gpu, "RegisterShmPool: mmap failed (poolId={}, size={}): {}",
+                        p.poolId, static_cast<size_t>(p.size), std::strerror(errno));
                 ::close(fd);
                 return;
             }
@@ -2426,14 +2385,12 @@ int run(int wireFd, int ctrlFd, int inputFd, bool headless,
         }
         if (kind == ipc::FrameKind::UnregisterShmPool) {
             if (nfds != 0) {
-                std::fprintf(stderr,
-                    "[gpu] core wire: UnregisterShmPool with nfds=%d (must be 0)\n", nfds);
+                LOG_ERR(Ipc, "core wire: UnregisterShmPool with nfds={} (must be 0)", nfds);
                 std::abort();
             }
             if (frame.size() != ipc::UnregisterShmPoolPayload::kSize) {
-                std::fprintf(stderr,
-                    "[gpu] core wire: bad UnregisterShmPool payload size %zu\n",
-                    frame.size());
+                LOG_ERR(Ipc, "core wire: bad UnregisterShmPool payload size {}",
+                        frame.size());
                 std::abort();
             }
             auto p = ipc::UnregisterShmPoolPayload::decode(frame.data());
@@ -2451,14 +2408,12 @@ int run(int wireFd, int ctrlFd, int inputFd, bool headless,
             // ShmUpload regions past the old size stay in bounds; wire FIFO
             // guarantees this lands before any upload that needs the growth.
             if (nfds != 0) {
-                std::fprintf(stderr,
-                    "[gpu] core wire: ResizeShmPool with nfds=%d (must be 0)\n", nfds);
+                LOG_ERR(Ipc, "core wire: ResizeShmPool with nfds={} (must be 0)", nfds);
                 std::abort();
             }
             if (frame.size() != ipc::ResizeShmPoolPayload::kSize) {
-                std::fprintf(stderr,
-                    "[gpu] core wire: bad ResizeShmPool payload size %zu\n",
-                    frame.size());
+                LOG_ERR(Ipc, "core wire: bad ResizeShmPool payload size {}",
+                        frame.size());
                 std::abort();
             }
             auto p = ipc::ResizeShmPoolPayload::decode(frame.data());
@@ -2470,10 +2425,9 @@ int run(int wireFd, int ctrlFd, int inputFd, bool headless,
                                 it->second.size, static_cast<size_t>(p.size),
                                 MREMAP_MAYMOVE);
             if (nb == MAP_FAILED) {
-                std::fprintf(stderr,
-                    "[gpu] ResizeShmPool: mremap failed (poolId=%u, %zu -> %zu): %s\n",
-                    p.poolId, it->second.size, static_cast<size_t>(p.size),
-                    std::strerror(errno));
+                LOG_ERR(Gpu, "ResizeShmPool: mremap failed (poolId={}, {} -> {}): {}",
+                        p.poolId, it->second.size, static_cast<size_t>(p.size),
+                        std::strerror(errno));
                 return;
             }
             it->second.base = static_cast<const uint8_t*>(nb);
@@ -2484,14 +2438,12 @@ int run(int wireFd, int ctrlFd, int inputFd, bool headless,
             // Core reserved a wire texture handle for an shm surface. Create
             // a native BGRA8 texture and Inject at the reserved handle.
             if (nfds != 0) {
-                std::fprintf(stderr,
-                    "[gpu] core wire: AllocShmTex with nfds=%d (must be 0)\n", nfds);
+                LOG_ERR(Ipc, "core wire: AllocShmTex with nfds={} (must be 0)", nfds);
                 std::abort();
             }
             if (frame.size() != ipc::AllocShmTexPayload::kSize) {
-                std::fprintf(stderr,
-                    "[gpu] core wire: bad AllocShmTex payload size %zu\n",
-                    frame.size());
+                LOG_ERR(Ipc, "core wire: bad AllocShmTex payload size {}",
+                        frame.size());
                 std::abort();
             }
             auto p = ipc::AllocShmTexPayload::decode(frame.data());
@@ -2508,9 +2460,8 @@ int run(int wireFd, int ctrlFd, int inputFd, bool headless,
             if (!server.InjectTexture(tex.Get(),
                                       {p.texture.id, p.texture.generation},
                                       {p.device.id, p.device.generation})) {
-                std::fprintf(stderr,
-                    "[gpu] AllocShmTex: InjectTexture failed (surfaceId=%u, "
-                    "handle=%u/%u)\n",
+                LOG_ERR(Gpu,
+                    "AllocShmTex: InjectTexture failed (surfaceId={}, handle={}/{})",
                     p.surfaceId, p.texture.id, p.texture.generation);
                 return;
             }
@@ -2526,15 +2477,13 @@ int run(int wireFd, int ctrlFd, int inputFd, bool headless,
             // transfer. Sends ShmUploaded back so the core can release the
             // wl_buffer to the client (copy-then-release).
             if (nfds != 0) {
-                std::fprintf(stderr,
-                    "[gpu] core wire: ShmUpload with nfds=%d (must be 0)\n", nfds);
+                LOG_ERR(Ipc, "core wire: ShmUpload with nfds={} (must be 0)", nfds);
                 std::abort();
             }
             ipc::ShmUploadPayload p{};
             if (!ipc::ShmUploadPayload::decode(frame.data(), frame.size(), p)) {
-                std::fprintf(stderr,
-                    "[gpu] core wire: bad ShmUpload payload (size %zu)\n",
-                    frame.size());
+                LOG_ERR(Ipc, "core wire: bad ShmUpload payload (size {})",
+                        frame.size());
                 std::abort();
             }
             // Look up the destination texture + pool.
@@ -2543,9 +2492,8 @@ int run(int wireFd, int ctrlFd, int inputFd, bool headless,
             const bool haveTex = tit != shmTextures.end();
             const bool havePool = pit != shmPools.end();
             if (!haveTex || !havePool) {
-                std::fprintf(stderr,
-                    "[gpu] ShmUpload: missing %s%s (surfaceId=%u poolId=%u "
-                    "uploadSeq=%u)\n",
+                LOG_WARN(Gpu,
+                    "ShmUpload: missing {}{} (surfaceId={} poolId={} uploadSeq={})",
                     !haveTex ? "texture" : "",
                     !havePool ? (!haveTex ? "+pool" : "pool") : "",
                     p.surfaceId, p.poolId, p.uploadSeq);
@@ -2562,12 +2510,10 @@ int run(int wireFd, int ctrlFd, int inputFd, bool headless,
                 const uint64_t needFull = static_cast<uint64_t>(p.stride) *
                                           static_cast<uint64_t>(p.height);
                 if (off > poolSize || needFull > poolSize - off) {
-                    std::fprintf(stderr,
-                        "[gpu] ShmUpload: region out of pool bounds "
-                        "(off=%llu need=%llu pool=%zu)\n",
-                        static_cast<unsigned long long>(off),
-                        static_cast<unsigned long long>(needFull),
-                        poolSize);
+                    LOG_ERR(Gpu,
+                        "ShmUpload: region out of pool bounds "
+                        "(off={} need={} pool={})",
+                        off, needFull, poolSize);
                 } else {
                     wgpu::Queue queue = coreDevice.GetQueue();
                     wgpu::TexelCopyTextureInfo dst{};
@@ -2617,13 +2563,10 @@ int run(int wireFd, int ctrlFd, int inputFd, bool headless,
                                 static_cast<uint64_t>(ch - 1) * p.stride
                                 + static_cast<uint64_t>(cw) * 4;
                             if (rectOff > poolSize || spanBytes > poolSize - rectOff) {
-                                std::fprintf(stderr,
-                                    "[gpu] ShmUpload: rect out of pool bounds "
-                                    "(rect %d,%d,%u,%u rectOff=%llu span=%llu pool=%zu)\n",
-                                    r.x, r.y, r.w, r.h,
-                                    static_cast<unsigned long long>(rectOff),
-                                    static_cast<unsigned long long>(spanBytes),
-                                    poolSize);
+                                LOG_ERR(Gpu,
+                                    "ShmUpload: rect out of pool bounds "
+                                    "(rect {},{},{},{} rectOff={} span={} pool={})",
+                                    r.x, r.y, r.w, r.h, rectOff, spanBytes, poolSize);
                                 continue;
                             }
                             dst.origin = {static_cast<uint32_t>(x0),
@@ -2649,14 +2592,12 @@ int run(int wireFd, int ctrlFd, int inputFd, bool headless,
         if (kind == ipc::FrameKind::AllocSurfaceBuf
             || kind == ipc::FrameKind::AllocComposeBuf) {
             if (nfds != 0) {
-                std::fprintf(stderr,
-                    "[gpu] core wire: Alloc*Buf with nfds=%d (must be 0)\n", nfds);
+                LOG_ERR(Ipc, "core wire: Alloc*Buf with nfds={} (must be 0)", nfds);
                 std::abort();
             }
             if (frame.size() != ipc::AllocSurfaceBufPayload::kSize) {
-                std::fprintf(stderr,
-                    "[gpu] core wire: bad AllocSurfaceBuf payload size %zu\n",
-                    frame.size());
+                LOG_ERR(Ipc, "core wire: bad AllocSurfaceBuf payload size {}",
+                        frame.size());
                 std::abort();
             }
             auto p = ipc::AllocSurfaceBufPayload::decode(frame.data());
@@ -2671,14 +2612,12 @@ int run(int wireFd, int ctrlFd, int inputFd, bool headless,
             // brackets for this buf (also wire frames), so any in-flight
             // bracket is already decoded by here.
             if (nfds != 0) {
-                std::fprintf(stderr,
-                    "[gpu] core wire: ReleaseSurfaceBuf with nfds=%d (must be 0)\n", nfds);
+                LOG_ERR(Ipc, "core wire: ReleaseSurfaceBuf with nfds={} (must be 0)", nfds);
                 std::abort();
             }
             if (frame.size() != ipc::ReleaseSurfaceBufPayload::kSize) {
-                std::fprintf(stderr,
-                    "[gpu] core wire: bad ReleaseSurfaceBuf payload size %zu\n",
-                    frame.size());
+                LOG_ERR(Ipc, "core wire: bad ReleaseSurfaceBuf payload size {}",
+                        frame.size());
                 std::abort();
             }
             auto p = ipc::ReleaseSurfaceBufPayload::decode(frame.data());
@@ -2715,8 +2654,8 @@ int run(int wireFd, int ctrlFd, int inputFd, bool headless,
         auto variant = static_cast<ipc::AccessVariant>(frame[0]);
         if (variant == ipc::AccessVariant::ClientTex) {
             if (frame.size() != ipc::ClientTexAccessPayload::kSize) {
-                std::fprintf(stderr, "[gpu] core wire: bad ClientTex payload size %zu\n",
-                             frame.size());
+                LOG_ERR(Ipc, "core wire: bad ClientTex payload size {}",
+                        frame.size());
                 std::abort();
             }
             uint32_t texId = ipc::getU32LE(frame.data() + 1);
@@ -2726,9 +2665,9 @@ int run(int wireFd, int ctrlFd, int inputFd, bool headless,
                 // Implicit-sync BeginAccess: zero fds (BeginAccessWithFence
                 // carries the explicit-sync fd as kind=5 instead).
                 if (nfds != 0) {
-                    std::fprintf(stderr,
-                        "[gpu] core wire: BeginAccess with nfds=%d (must be 0; "
-                        "explicit sync uses BeginAccessWithFence)\n", nfds);
+                    LOG_ERR(Ipc,
+                        "core wire: BeginAccess with nfds={} (must be 0; "
+                        "explicit sync uses BeginAccessWithFence)", nfds);
                     std::abort();
                 }
                 ok = runBeginClientAccess(texId, texGen, -1);
@@ -2737,16 +2676,15 @@ int run(int wireFd, int ctrlFd, int inputFd, bool headless,
                 // one SCM_RIGHTS fd, a sync_file the GPU process passes to
                 // Dawn as the acquire fence instead of EXPORT_SYNC_FILE.
                 if (nfds != 1 || !fds) {
-                    std::fprintf(stderr,
-                        "[gpu] core wire: BeginAccessWithFence with nfds=%d (must be 1)\n",
+                    LOG_ERR(Ipc,
+                        "core wire: BeginAccessWithFence with nfds={} (must be 1)",
                         nfds);
                     std::abort();
                 }
                 ok = runBeginClientAccess(texId, texGen, fds[0]);
             } else {
                 if (nfds != 0) {
-                    std::fprintf(stderr,
-                        "[gpu] core wire: ClientTex End with nfds=%d (must be 0)\n", nfds);
+                    LOG_ERR(Ipc, "core wire: ClientTex End with nfds={} (must be 0)", nfds);
                     std::abort();
                 }
                 runEndClientAccess(texId, texGen);
@@ -2759,14 +2697,14 @@ int run(int wireFd, int ctrlFd, int inputFd, bool headless,
                 // at most a bad frame for that one surface (a render pass
                 // referencing the texture fails Dawn validation, which is
                 // recoverable); aborting would kill every client's session.
-                std::fprintf(stderr,
-                    "[gpu] in-band client-texture Begin failed {%u,%u}; "
-                    "dropping bracket\n", texId, texGen);
+                LOG_WARN(Gpu,
+                    "in-band client-texture Begin failed {{{},{}}}; "
+                    "dropping bracket", texId, texGen);
             }
         } else if (variant == ipc::AccessVariant::Surface) {
             if (frame.size() != ipc::SurfaceAccessPayload::kSize) {
-                std::fprintf(stderr, "[gpu] core wire: bad Surface payload size %zu\n",
-                             frame.size());
+                LOG_ERR(Ipc, "core wire: bad Surface payload size {}",
+                        frame.size());
                 std::abort();
             }
             uint32_t surfaceBufId = ipc::getU32LE(frame.data() + 1);
@@ -2786,18 +2724,18 @@ int run(int wireFd, int ctrlFd, int inputFd, bool headless,
             if (it != surfaceBufs.end()) {
                 const bool expectProducer = it->second.producerOnCore;
                 if (producer != expectProducer) {
-                    std::fprintf(stderr, "[gpu] core wire: %s frame on core wire "
-                                 "(buf=%u producerOnCore=%d) -- wrong socket\n",
-                                 producer ? "producer" : "consumer",
-                                 surfaceBufId, static_cast<int>(expectProducer));
+                    LOG_ERR(Ipc, "core wire: {} frame on core wire "
+                            "(buf={} producerOnCore={}) -- wrong socket",
+                            producer ? "producer" : "consumer",
+                            surfaceBufId, static_cast<int>(expectProducer));
                     std::abort();
                 }
             }
             if (kind == ipc::FrameKind::BeginAccess) {
                 if (!runSurfaceBegin(surfaceBufId, producer)) {
-                    std::fprintf(stderr,
-                        "[gpu] in-band %s Begin failed (buf=%u) -- "
-                        "JS gate or state-machine bug\n",
+                    LOG_ERR(Gpu,
+                        "in-band {} Begin failed (buf={}) -- "
+                        "JS gate or state-machine bug",
                         producer ? "producer" : "consumer", surfaceBufId);
                     std::abort();
                 }
@@ -2806,15 +2744,15 @@ int run(int wireFd, int ctrlFd, int inputFd, bool headless,
             } else {
                 // BeginAccessWithFence on a Surface frame is a wire bug:
                 // explicit-sync only applies to client textures.
-                std::fprintf(stderr,
-                    "[gpu] core wire: kind=%u on Surface variant (only client "
-                    "textures support explicit-sync)\n",
+                LOG_ERR(Ipc,
+                    "core wire: kind={} on Surface variant (only client "
+                    "textures support explicit-sync)",
                     static_cast<unsigned>(kind));
                 std::abort();
             }
         } else {
-            std::fprintf(stderr, "[gpu] core wire: unknown access variant %u\n",
-                         static_cast<unsigned>(frame[0]));
+            LOG_ERR(Ipc, "core wire: unknown access variant {}",
+                    static_cast<unsigned>(frame[0]));
             std::abort();
         }
     };
@@ -2848,7 +2786,7 @@ int run(int wireFd, int ctrlFd, int inputFd, bool headless,
                 reply.connId = m.connId;
                 reply.ok = 0;
                 if (nRecvFds < 1) {
-                    std::fprintf(stderr, "[gpu] AddWireConn: no fd received\n");
+                    LOG_ERR(Ipc, "AddWireConn: no fd received");
                     ctrlSender.send(reply);
                 } else {
                     int connFd = recvFds[0];
@@ -2879,8 +2817,7 @@ int run(int wireFd, int ctrlFd, int inputFd, bool headless,
                             ipc::FrameKind kind, const std::vector<uint8_t>& frame) {
                         if (frame.size() != ipc::SurfaceAccessPayload::kSize ||
                             static_cast<ipc::AccessVariant>(frame[0]) != ipc::AccessVariant::Surface) {
-                            std::fprintf(stderr,
-                                "[gpu] plugin conn %u: non-Surface control frame\n", connId);
+                            LOG_ERR(Ipc, "plugin conn {}: non-Surface control frame", connId);
                             std::abort();
                         }
                         uint32_t surfaceBufId = ipc::getU32LE(frame.data() + 1);
@@ -2895,9 +2832,9 @@ int run(int wireFd, int ctrlFd, int inputFd, bool headless,
                         // fail Dawn validation on the plugin device; the
                         // release already closed any open bracket.)
                         if (it == surfaceBufs.end()) {
-                            std::fprintf(stderr,
-                                "[gpu] plugin conn %u: %s %s on released buf=%u "
-                                "(teardown race), dropped\n",
+                            LOG_WARN(Gpu,
+                                "plugin conn {}: {} {} on released buf={} "
+                                "(teardown race), dropped",
                                 connId, producer ? "producer" : "consumer",
                                 kind == ipc::FrameKind::BeginAccess ? "Begin" : "End",
                                 surfaceBufId);
@@ -2910,18 +2847,18 @@ int run(int wireFd, int ctrlFd, int inputFd, bool headless,
                         // carries CONSUMER frames.
                         const bool expectProducer = !it->second.producerOnCore;
                         if (producer != expectProducer) {
-                            std::fprintf(stderr,
-                                "[gpu] plugin conn %u: %s frame on plugin wire "
-                                "(buf=%u producerOnCore=%d) -- wrong socket\n",
+                            LOG_ERR(Ipc,
+                                "plugin conn {}: {} frame on plugin wire "
+                                "(buf={} producerOnCore={}) -- wrong socket",
                                 connId, producer ? "producer" : "consumer",
                                 surfaceBufId, static_cast<int>(it->second.producerOnCore));
                             std::abort();
                         }
                         if (kind == ipc::FrameKind::BeginAccess) {
                             if (!runSurfaceBegin(surfaceBufId, producer)) {
-                                std::fprintf(stderr,
-                                    "[gpu] in-band %s Begin failed (buf=%u) -- "
-                                    "JS gate or state-machine bug\n",
+                                LOG_ERR(Gpu,
+                                    "in-band {} Begin failed (buf={}) -- "
+                                    "JS gate or state-machine bug",
                                     producer ? "producer" : "consumer", surfaceBufId);
                                 std::abort();
                             }
@@ -2929,8 +2866,8 @@ int run(int wireFd, int ctrlFd, int inputFd, bool headless,
                             runSurfaceEnd(surfaceBufId, producer);
                         }
                     };
-                    std::printf("[gpu] AddWireConn: connId=%u fd=%d registered\n",
-                                m.connId, connFd);
+                    LOG_INFO(Ipc, "AddWireConn: connId={} fd={} registered",
+                             m.connId, connFd);
                     pluginConns.push_back(std::move(pc));
                     reply.ok = 1;
                     ctrlSender.send(reply);
@@ -2946,14 +2883,14 @@ int run(int wireFd, int ctrlFd, int inputFd, bool headless,
                 PluginConn* pc = nullptr;
                 for (auto& c : pluginConns) if (c->connId == m.connId) { pc = c.get(); break; }
                 if (!pc) {
-                    std::fprintf(stderr, "[gpu] InjectPluginInstance: unknown connId=%u\n", m.connId);
+                    LOG_ERR(Ipc, "InjectPluginInstance: unknown connId={}", m.connId);
                 } else if (!pc->server->InjectInstance(pc->instance->Get(),
                                                        {m.instance.id, m.instance.generation})) {
-                    std::fprintf(stderr, "[gpu] InjectPluginInstance: InjectInstance failed\n");
+                    LOG_ERR(Dawn, "InjectPluginInstance: InjectInstance failed");
                 } else {
                     pc->serializer->Flush();
-                    std::printf("[gpu] InjectPluginInstance: connId=%u instance {%u,%u}\n",
-                                m.connId, m.instance.id, m.instance.generation);
+                    LOG_INFO(Dawn, "InjectPluginInstance: connId={} instance {{{},{}}}",
+                             m.connId, m.instance.id, m.instance.generation);
                     reply.ok = 1;
                 }
                 ctrlSender.send(reply);
@@ -2967,10 +2904,10 @@ int run(int wireFd, int ctrlFd, int inputFd, bool headless,
                     WGPUDevice dev = pc->server->GetDevice(m.device.id, m.device.generation);
                     if (dev) {
                         pc->tickDev = dev;
-                        std::fprintf(stderr, "[gpu] SetPluginTickDevice: connId=%u dev{%u,%u} ok\n",
-                                     m.connId, m.device.id, m.device.generation);
+                        LOG_INFO(Dawn, "SetPluginTickDevice: connId={} dev{{{},{}}} ok",
+                                 m.connId, m.device.id, m.device.generation);
                     } else {
-                        std::fprintf(stderr, "[gpu] SetPluginTickDevice: GetDevice null connId=%u\n", m.connId);
+                        LOG_ERR(Dawn, "SetPluginTickDevice: GetDevice null connId={}", m.connId);
                     }
                 }
             }
@@ -2988,7 +2925,7 @@ int run(int wireFd, int ctrlFd, int inputFd, bool headless,
     //    the loop drains on EPOLLOUT -- this is what breaks the prior deadlock
     //    (single-threaded peer parked in write() while the other waited to read).
     auto loop = gpu::EventLoop::create();
-    if (!loop) { std::fprintf(stderr, "[gpu] EventLoop create failed\n"); return 1; }
+    if (!loop) { LOG_ERR(Gpu, "EventLoop create failed"); return 1; }
 
     auto armWire = [&] {
         uint32_t ev = gpu::EventLoop::kRead;
@@ -3097,8 +3034,8 @@ int run(int wireFd, int ctrlFd, int inputFd, bool headless,
         if (!udevMon.open()) {
             // Not fatal: hotplug is added incrementally; the rest of the GPU
             // process still works (just no live plug/unplug). Log once.
-            std::fprintf(stderr, "[gpu] udev monitor open failed: %s (hotplug disabled)\n",
-                         udevMon.error().c_str());
+            LOG_WARN(Gpu, "udev monitor open failed: {} (hotplug disabled)",
+                     udevMon.error());
         } else {
             const int udevFd = udevMon.fd();
             loop->add(udevFd, gpu::EventLoop::kRead, [&](uint32_t) {
@@ -3106,10 +3043,10 @@ int run(int wireFd, int ctrlFd, int inputFd, bool headless,
                     using Kind = gpu::UdevHotplugEvent::Kind;
                     switch (ev.kind) {
                         case Kind::kConnectorChange: {
-                            std::printf("[gpu] udev: connector change on %s devnum=%lu hint=%u\n",
-                                        ev.sysname.c_str(),
-                                        static_cast<unsigned long>(ev.devnum),
-                                        ev.connectorIdHint);
+                            LOG_INFO(Gpu, "udev: connector change on {} devnum={} hint={}",
+                                     ev.sysname,
+                                     static_cast<unsigned long>(ev.devnum),
+                                     ev.connectorIdHint);
                             if (!kms) break;
                             auto result = kms->rescan();
 
@@ -3150,7 +3087,7 @@ int run(int wireFd, int ctrlFd, int inputFd, bool headless,
                                 p.encode(buf);
                                 serializer.appendFrame(
                                     ipc::FrameKind::OutputRemoved, buf, sizeof(buf));
-                                std::printf("[gpu] sent OutputRemoved outputId=%u\n", id);
+                                LOG_INFO(Gpu, "sent OutputRemoved outputId={}", id);
                             }
 
                             // Build the ring NOW for each newly-connected
@@ -3164,8 +3101,8 @@ int run(int wireFd, int ctrlFd, int inputFd, bool headless,
                             // OutputAdded for that id.
                             for (uint32_t id : result.added) {
                                 if (!kms->initScanoutForOutput(id, coreDevice)) {
-                                    std::fprintf(stderr,
-                                        "[gpu] OutputAdded skipped for outputId=%u (ring init failed)\n",
+                                    LOG_WARN(Gpu,
+                                        "OutputAdded skipped for outputId={} (ring init failed)",
                                         id);
                                     continue;
                                 }
@@ -3175,10 +3112,10 @@ int run(int wireFd, int ctrlFd, int inputFd, bool headless,
                                 p.encode(buf.data());
                                 serializer.appendFrame(
                                     ipc::FrameKind::OutputAdded, buf.data(), buf.size());
-                                std::printf("[gpu] sent OutputAdded outputId=%u %ux%u @%u.%03uHz name=%s\n",
-                                            id, p.width, p.height,
-                                            p.refreshMhz / 1000, p.refreshMhz % 1000,
-                                            p.name.c_str());
+                                LOG_INFO(Gpu, "sent OutputAdded outputId={} {}x{} @{}.{:03}Hz name={}",
+                                         id, p.width, p.height,
+                                         p.refreshMhz / 1000, p.refreshMhz % 1000,
+                                         p.name);
                                 // Wire-FIFO: this OutputModes lands after
                                 // the OutputAdded above, so the JS handler
                                 // sees the existing OutputRecord before
@@ -3188,12 +3125,12 @@ int run(int wireFd, int ctrlFd, int inputFd, bool headless,
                             break;
                         }
                         case Kind::kCardAdded:
-                            std::printf("[gpu] udev: DRM card added (%s); M9 territory, ignored\n",
-                                        ev.sysname.c_str());
+                            LOG_INFO(Gpu, "udev: DRM card added ({}); M9 territory, ignored",
+                                     ev.sysname);
                             break;
                         case Kind::kCardRemoved:
-                            std::printf("[gpu] udev: DRM card removed (%s); M9 territory, ignored\n",
-                                        ev.sysname.c_str());
+                            LOG_INFO(Gpu, "udev: DRM card removed ({}); M9 territory, ignored",
+                                     ev.sysname);
                             break;
                         case Kind::kIgnore:
                             break;
@@ -3203,7 +3140,7 @@ int run(int wireFd, int ctrlFd, int inputFd, bool headless,
                 // ctrlSender. Re-arm so the loop drains them on EPOLLOUT.
                 armCtrl();
             });
-            std::printf("[gpu] udev hotplug monitor up (fd=%d)\n", udevFd);
+            LOG_INFO(Gpu, "udev hotplug monitor up (fd={})", udevFd);
         }
     }
 #endif
@@ -3287,9 +3224,9 @@ int run(int wireFd, int ctrlFd, int inputFd, bool headless,
     dmaTex = nullptr;
     dmaMem = nullptr;
     alloc.release(dmaBuf);
-    std::printf("[gpu] shutting down (shutdown=%d outputClosed=%d)\n",
-                static_cast<int>(shutdown),
-                static_cast<int>(output ? output->shouldClose() : 0));
+    LOG_INFO(Gpu, "shutting down (shutdown={} outputClosed={})",
+             static_cast<int>(shutdown),
+             static_cast<int>(output ? output->shouldClose() : 0));
 
     // Drain the wire until the core closes it, then exit.
     for (int i = 0; i < 4000; ++i) {
@@ -3613,8 +3550,7 @@ int main(int argc, char** argv) {
         FILE* f = ::freopen(lp, "w", stderr);
         if (f) { ::dup2(::fileno(stderr), ::fileno(stdout)); setvbuf(stderr, nullptr, _IOLBF, 0); }
     }
-    overdraw::log::installCrashHandler("/tmp/overdraw-gpu-crash.txt",
-                                       "GPU process");
+    overdraw::log::installCrashHandler(overdraw::log::crashesDir(), "gpu");
     // Cross-device verification mode: two-device cross-device dmabuf STM + fence
     // round-trip. Self-contained (no fds, no core); prints XDEV: PASS/FAIL.
     if (argc >= 2 && std::strcmp(argv[1], "--selftest-xdev") == 0) {

@@ -1,6 +1,5 @@
 #include "keymap.h"
 
-#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 
@@ -9,6 +8,8 @@
 #include <unistd.h>
 
 #include <xkbcommon/xkbcommon.h>
+
+#include "log/log.h"
 
 namespace overdraw::wayland {
 
@@ -27,7 +28,7 @@ bool Keymap::init() {
     // defaults, typically us/pc105). xkbcommon reads the env (XKB_DEFAULT_*).
     xkb_rule_names names{};
     keymap_ = xkb_keymap_new_from_names(ctx_, &names, XKB_KEYMAP_COMPILE_NO_FLAGS);
-    if (!keymap_) { std::fprintf(stderr, "[keymap] compile failed\n"); return false; }
+    if (!keymap_) { LOG_ERR(Wayland, "[keymap] compile failed"); return false; }
 
     state_ = xkb_state_new(keymap_);
     if (!state_) return false;
@@ -46,13 +47,13 @@ bool Keymap::initFromFd(int fd, uint32_t size) {
     // non-sealed client fd can't surprise us mid-read.
     void* map = ::mmap(nullptr, size, PROT_READ, MAP_PRIVATE, fd, 0);
     ::close(fd);  // ownership taken; the mapping outlives the fd
-    if (map == MAP_FAILED) { std::fprintf(stderr, "[keymap] client fd mmap failed\n"); return false; }
+    if (map == MAP_FAILED) { LOG_ERR(Wayland, "[keymap] client fd mmap failed"); return false; }
 
     keymap_ = xkb_keymap_new_from_buffer(ctx_, static_cast<const char*>(map), size,
                                          XKB_KEYMAP_FORMAT_TEXT_V1,
                                          XKB_KEYMAP_COMPILE_NO_FLAGS);
     ::munmap(map, size);
-    if (!keymap_) { std::fprintf(stderr, "[keymap] client keymap compile failed\n"); return false; }
+    if (!keymap_) { LOG_ERR(Wayland, "[keymap] client keymap compile failed"); return false; }
 
     state_ = xkb_state_new(keymap_);
     if (!state_) return false;

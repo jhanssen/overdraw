@@ -1,7 +1,6 @@
 #include "trampoline.h"
 
 #include <algorithm>
-#include <cstdio>
 #include <cstring>
 #include <vector>
 
@@ -10,6 +9,7 @@
 #include <wayland-server-core.h>
 #include <wayland-util.h>
 
+#include "log/log.h"
 #include "wayland_fd.h"
 
 namespace overdraw::wayland {
@@ -170,7 +170,7 @@ void Trampoline::onBind(wl_client* client, void* data, uint32_t version, uint32_
     bl->listener.notify = &Trampoline::onBoundResourceDestroyNotify;
     bl->st = st;
     wl_resource_add_destroy_listener(res, &bl->listener);
-    std::printf("[wl] bind %s v%u id=%u\n", st->name.c_str(), version, id);
+    LOG_DEBUG(Wayland, "bind {} v{} id={}", st->name, version, id);
 
     // Optional on-bind hook: if the handler has a `bind` method, call it with
     // the freshly-bound resource so it can send initial events (e.g.
@@ -385,9 +385,9 @@ bool Trampoline::postEvent(napi_value resourceHandle, uint32_t opcode, napi_valu
                 // A dead object arg invalidates the whole event: drop it.
                 if (p2 && wrappers_.find(static_cast<wl_resource*>(p2)) == wrappers_.end()) {
                     for (int fd : fdKeep) if (fd >= 0) ::close(fd);
-                    fprintf(stderr, "[wl] dropped %s event (opcode %u): destroyed %s argument\n",
-                            className ? className : "?", opcode,
-                            ev->types && ev->types[ai] ? ev->types[ai]->name : "object");
+                    LOG_WARN(Wayland, "dropped {} event (opcode {}): destroyed {} argument",
+                             className ? className : "?", opcode,
+                             ev->types && ev->types[ai] ? ev->types[ai]->name : "object");
                     return true;
                 }
                 wargs[ai].o = reinterpret_cast<wl_object*>(p2);
@@ -508,7 +508,7 @@ int Trampoline::onDispatch(const void* implData, void* target, uint32_t opcode,
     napi_valuetype mt;
     napi_typeof(env, method, &mt);
     if (mt != napi_function) {
-        std::fprintf(stderr, "[wl] no handler for %s.%s\n", st->name.c_str(), msg->name);
+        LOG_WARN(Wayland, "no handler for {}.{}", st->name, msg->name);
         napi_close_handle_scope(env, scope);
         return 0;
     }
@@ -627,8 +627,7 @@ int Trampoline::onDispatch(const void* implData, void* target, uint32_t opcode,
                 if (t == napi_string) detail = toStr(stack);
             }
             if (detail.empty()) detail = toStr(ex);
-            std::fprintf(stderr, "[wl] handler %s.%s threw: %s\n",
-                         st->name.c_str(), msg->name, detail.c_str());
+            LOG_ERR(Wayland, "handler {}.{} threw: {}", st->name, msg->name, detail);
         }
     }
     napi_close_handle_scope(env, scope);

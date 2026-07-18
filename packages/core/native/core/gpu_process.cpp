@@ -1,5 +1,6 @@
 #include "gpu_process.h"
 
+#include <cerrno>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -10,6 +11,8 @@
 #include <sys/socket.h>
 #include <sys/wait.h>
 #include <unistd.h>
+
+#include "log/log.h"
 
 namespace overdraw::core {
 
@@ -29,7 +32,7 @@ GpuProcess spawnGpuProcess(const char* binPath, uint32_t headlessW, uint32_t hea
         ::socketpair(AF_UNIX, SOCK_SEQPACKET, 0, ctrlFds) ||
         ::socketpair(AF_UNIX, SOCK_SEQPACKET, 0, inputFds) ||
         ::socketpair(AF_UNIX, SOCK_SEQPACKET, 0, logFds)) {
-        std::perror("socketpair");
+        LOG_ERR(Ipc, "socketpair: {}", std::strerror(errno));
         return out;
     }
 
@@ -48,7 +51,7 @@ GpuProcess spawnGpuProcess(const char* binPath, uint32_t headlessW, uint32_t hea
     const pid_t parentPid = ::getpid();  // for the child's fork-race death check
     pid_t pid = ::fork();
     if (pid < 0) {
-        std::perror("fork");
+        LOG_ERR(Ipc, "fork: {}", std::strerror(errno));
         return out;
     }
     if (pid == 0) {

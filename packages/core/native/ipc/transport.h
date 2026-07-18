@@ -31,6 +31,7 @@
 
 #include "dawn/wire/Wire.h"
 
+#include "log/log.h"
 #include "side_channel.h"
 
 namespace overdraw::ipc {
@@ -739,9 +740,8 @@ class FrameReader {
         if (kind == FrameKind::ScanoutClientPresentFence) expect = 1;
         if (expect > 0) {
             if (static_cast<int>(recvFds_.size()) < expect) {
-                std::fprintf(stderr,
-                    "[ipc] FrameReader: frame kind=%u expects %d fd(s), have %zu\n",
-                    static_cast<unsigned>(kind), expect, recvFds_.size());
+                LOG_CRIT(Ipc, "FrameReader: frame kind={} expects {} fd(s), have {}",
+                         static_cast<unsigned>(kind), expect, recvFds_.size());
                 std::abort();
             }
             for (int i = 0; i < expect; ++i) {
@@ -764,9 +764,8 @@ class FrameReader {
         FrameKind kind;
         if (!nextFrame(kind, out)) return false;
         if (kind != FrameKind::WireBytes) {
-            std::fprintf(stderr,
-                "[ipc] FrameReader: unexpected non-Dawn frame kind=%u on a "
-                "wire-bytes-only direction\n", static_cast<unsigned>(kind));
+            LOG_CRIT(Ipc, "FrameReader: unexpected non-Dawn frame kind={} on a "
+                     "wire-bytes-only direction", static_cast<unsigned>(kind));
             std::abort();
         }
         return true;

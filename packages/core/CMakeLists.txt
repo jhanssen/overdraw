@@ -119,6 +119,8 @@ message(STATUS "Node addon headers: ${NODE_INCLUDE_DIR}")
 # consumes log records (host addon, plugin addon, GPU process).
 add_library(overdraw_log STATIC
     native/log/log.cpp
+    native/log/paths.cpp
+    native/log/ring_sink.cpp
     native/log/crash_handler.cpp
     native/log/ipc_sink.cpp
     native/log/ipc_source.cpp)
@@ -185,7 +187,7 @@ target_include_directories(overdraw_xwayland PUBLIC
     ${NATIVE_INCLUDE} ${XCB_INCLUDE_DIRS} ${XCB_COMPOSITE_INCLUDE_DIRS}
     ${XCB_XFIXES_INCLUDE_DIRS})
 target_link_libraries(overdraw_xwayland PUBLIC
-    ${XCB_LIBRARIES} ${XCB_COMPOSITE_LIBRARIES} ${XCB_XFIXES_LIBRARIES})
+    overdraw_log ${XCB_LIBRARIES} ${XCB_COMPOSITE_LIBRARIES} ${XCB_XFIXES_LIBRARIES})
 set_target_properties(overdraw_xwayland PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
 # ---- Core N-API addon (Node-hosted core) ----
@@ -425,12 +427,12 @@ target_link_libraries(layer-shell-test-client PRIVATE ${WAYLAND_CLIENT_LIBRARIES
 # ---- SCM_RIGHTS transport unit test (fd passing over the side channel) ----
 add_executable(scm-rights-test test/scm-rights-test.cpp)
 target_include_directories(scm-rights-test PRIVATE ${IPC_INCLUDE})
-target_link_libraries(scm-rights-test PRIVATE dawn::webgpu_dawn_wire)
+target_link_libraries(scm-rights-test PRIVATE overdraw_log dawn::webgpu_dawn_wire)
 
 # ---- CtrlSender wedge-resistance test (steady-state ctrl is non-blocking) ----
 add_executable(ctrl-sender-test test/ctrl-sender-test.cpp)
 target_include_directories(ctrl-sender-test PRIVATE ${IPC_INCLUDE})
-target_link_libraries(ctrl-sender-test PRIVATE dawn::webgpu_dawn_wire)
+target_link_libraries(ctrl-sender-test PRIVATE overdraw_log dawn::webgpu_dawn_wire)
 
 # ---- WireBarrier native unit test (cross-channel ordering primitive) ----
 # Header-only class; the test exercises the deferred-action FIFO + cancel +
@@ -445,7 +447,7 @@ target_include_directories(wire-barrier-test PRIVATE ${IPC_INCLUDE})
 # instead of flushing-and-retrying (Dawn's contract treats nullptr as fatal).
 add_executable(wire-serializer-overflow-test test/wire-serializer-overflow-test.cpp)
 target_include_directories(wire-serializer-overflow-test PRIVATE ${IPC_INCLUDE})
-target_link_libraries(wire-serializer-overflow-test PRIVATE dawn::webgpu_dawn_wire Threads::Threads)
+target_link_libraries(wire-serializer-overflow-test PRIVATE overdraw_log dawn::webgpu_dawn_wire Threads::Threads)
 
 # ---- Logging native unit test (areas, --log-level parser, ipc sink/source) ----
 add_executable(log-test test/log-test.cpp)

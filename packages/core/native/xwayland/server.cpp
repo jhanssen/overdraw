@@ -1,6 +1,8 @@
 #include "server.h"
 
+#include <cerrno>
 #include <cstdio>
+#include <cstring>
 #include <string>
 #include <vector>
 
@@ -11,18 +13,20 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
+#include "log/log.h"
+
 namespace overdraw::xwayland {
 
 XwaylandSpawn spawnXwayland(const XwaylandOptions& opts) {
     XwaylandSpawn out;
     if (opts.waylandDisplay.empty()) {
-        std::fprintf(stderr, "[xwayland] no WAYLAND_DISPLAY to connect to\n");
+        LOG_ERR(Wayland, "[xwayland] no WAYLAND_DISPLAY to connect to");
         return out;
     }
 
     int dpyFds[2];  // [0] parent read, [1] child write (Xwayland -displayfd)
     if (::pipe(dpyFds) != 0) {
-        std::perror("pipe");
+        LOG_ERR(Wayland, "[xwayland] pipe: {}", std::strerror(errno));
         return out;
     }
 
@@ -30,7 +34,7 @@ XwaylandSpawn spawnXwayland(const XwaylandOptions& opts) {
     // on our end (wmFds[0]); Xwayland gets the other via -wm.
     int wmFds[2] = {-1, -1};
     if (opts.enableWm && ::socketpair(AF_UNIX, SOCK_STREAM, 0, wmFds) != 0) {
-        std::perror("socketpair (wm)");
+        LOG_ERR(Wayland, "[xwayland] socketpair (wm): {}", std::strerror(errno));
         ::close(dpyFds[0]);
         ::close(dpyFds[1]);
         return out;
@@ -39,7 +43,7 @@ XwaylandSpawn spawnXwayland(const XwaylandOptions& opts) {
     const pid_t parentPid = ::getpid();  // for the child's fork-race death check
     const pid_t pid = ::fork();
     if (pid < 0) {
-        std::perror("fork");
+        LOG_ERR(Wayland, "[xwayland] fork: {}", std::strerror(errno));
         ::close(dpyFds[0]);
         ::close(dpyFds[1]);
         if (opts.enableWm) { ::close(wmFds[0]); ::close(wmFds[1]); }

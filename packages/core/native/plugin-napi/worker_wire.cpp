@@ -1,9 +1,11 @@
 #include "worker_wire.h"
 
-#include <cstdio>
+#include <string_view>
+
 #include <fcntl.h>
 #include <unistd.h>
 
+#include "log/log.h"
 #include "transport.h"
 
 namespace overdraw::plugin {
@@ -59,8 +61,8 @@ void WorkerWireClient::pump() {
         dd.requiredFeatures = feats;
         dd.SetUncapturedErrorCallback(
             [](const wgpu::Device&, wgpu::ErrorType t, wgpu::StringView m) {
-                std::fprintf(stderr, "[worker-wire][dawn err %d] %.*s\n",
-                             static_cast<int>(t), static_cast<int>(m.length), m.data);
+                LOG_ERR(Plugin, "[dawn err {}] {}", static_cast<int>(t),
+                        std::string_view(m.data, m.length));
             });
         adapter_.RequestDevice(&dd, wgpu::CallbackMode::AllowProcessEvents,
             [this](wgpu::RequestDeviceStatus s, wgpu::Device d, wgpu::StringView) {

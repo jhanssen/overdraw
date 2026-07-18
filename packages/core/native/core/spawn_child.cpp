@@ -1,5 +1,6 @@
 #include "spawn_child.h"
 
+#include <cerrno>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -14,6 +15,8 @@
 #include <unistd.h>
 
 #include <uv.h>
+
+#include "log/log.h"
 
 namespace overdraw::core {
 namespace {
@@ -92,7 +95,7 @@ napi_value SpawnChild(napi_env env, napi_callback_info info) {
     const pid_t parentPid = ::getpid();  // for the child's fork-race death check
     const pid_t pid = ::fork();
     if (pid < 0) {
-        std::perror("fork (spawnChild)");
+        LOG_ERR(Core, "fork (spawnChild): {}", std::strerror(errno));
         napi_value out;
         napi_create_int32(env, -1, &out);
         return out;

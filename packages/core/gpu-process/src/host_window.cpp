@@ -10,6 +10,7 @@
 #include "linux-dmabuf-v1-client-protocol.h"
 
 #include "input_channel.h"
+#include "log/log.h"
 #include "transport.h"
 
 namespace overdraw::gpu {
@@ -281,8 +282,7 @@ void HostWindow::pump() {
     // diagnostic.
     int err = wl_display_get_error(display_);
     if (err != 0 && !shouldClose_) {
-        std::fprintf(stderr,
-            "[gpu] host wl_display fatal protocol error: errno=%d\n", err);
+        LOG_ERR(Gpu, "host wl_display fatal protocol error: errno={}", err);
         shouldClose_ = true;
     }
 }

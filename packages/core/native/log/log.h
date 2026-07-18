@@ -57,10 +57,14 @@ struct Config {
     // Default level for areas not in `overrides`.
     spdlog::level::level_enum defaultLevel = spdlog::level::info;
     std::vector<LevelOverride> overrides;
-    // Optional file sink. Empty = no file. Ignored when senderSink is set.
+    // File sink path override. Empty = default (logsDir()/overdraw.log,
+    // rotating). Ignored when senderSink is set or disableFile is true.
     std::string filePath;
-    // If set, areas use ONLY this sink (no stdout/stderr/file). Used by the
-    // GPU process to route every LOG_* through the IPC sink.
+    // Suppress the file sink entirely (--no-log-file).
+    bool disableFile = false;
+    // If set, areas use this sink instead of stdout/stderr/file (the crash
+    // ring is still attached). Used by the GPU process to route every LOG_*
+    // through the IPC sink.
     std::shared_ptr<spdlog::sinks::sink> senderSink;
 };
 

@@ -1,12 +1,12 @@
 #include "wire_link.h"
 
-#include <cstdio>
 #include <cstdlib>
 #include <vector>
 
 #include <unistd.h>
 
 #include "dawn/dawn_proc.h"
+#include "log/log.h"
 
 namespace overdraw::core {
 
@@ -50,9 +50,8 @@ bool WireLink::drainInbound() {
         } else if (inboundHandler_) {
             inboundHandler_(kind, f);
         } else {
-            std::fprintf(stderr,
-                "[ipc] WireLink::drainInbound: non-Dawn frame kind=%u with no handler\n",
-                static_cast<unsigned>(kind));
+            LOG_CRIT(Ipc, "WireLink::drainInbound: non-Dawn frame kind={} with no handler",
+                     static_cast<unsigned>(kind));
             std::abort();
         }
     }

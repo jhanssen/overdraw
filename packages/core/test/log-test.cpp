@@ -19,6 +19,16 @@
 #include "log/ipc_sink.h"
 #include "log/ipc_source.h"
 #include "log/log_wire.h"
+#include "log/paths.h"
+#include "log/ring_sink.h"
+#include "log/crash_handler.h"
+
+#include <filesystem>
+#include <fstream>
+#include <sstream>
+
+#include <fcntl.h>
+#include <sys/wait.h>
 
 using overdraw::log::Area;
 using overdraw::log::Config;
@@ -328,6 +338,140 @@ void caseIpcSourceReceives() {
     ::close(sv[0]);
 }
 
+std::string makeTempDir() {
+    char tmpl[] = "/tmp/overdraw-log-test-XXXXXX";
+    const char* d = ::mkdtemp(tmpl);
+    CHECK(d != nullptr);
+    return d ? d : "";
+}
+
+std::string readWholeFile(const std::string& path) {
+    std::ifstream f(path);
+    std::ostringstream ss;
+    ss << f.rdbuf();
+    return ss.str();
+}
+
+void casePathsResolution() {
+    g_currentCase = "pathsResolution";
+    const std::string tmp = makeTempDir();
+
+    ::setenv("OVERDRAW_STATE_DIR", tmp.c_str(), 1);
+    CHECK(overdraw::log::stateDir() == tmp);
+    const std::string logs = overdraw::log::logsDir();
+    const std::string crashes = overdraw::log::crashesDir();
+    CHECK(logs == tmp + "/logs");
+    CHECK(crashes == tmp + "/crashes");
+    CHECK(std::filesystem::is_directory(logs));
+    CHECK(std::filesystem::is_directory(crashes));
+
+    // XDG fallback (override unset): <XDG_STATE_HOME>/overdraw, dirs created
+    // through multiple missing levels.
+    ::unsetenv("OVERDRAW_STATE_DIR");
+    const std::string xdg = tmp + "/deep/xdg-state";
+    ::setenv("XDG_STATE_HOME", xdg.c_str(), 1);
+    CHECK(overdraw::log::stateDir() == xdg + "/overdraw");
+    CHECK(overdraw::log::logsDir() == xdg + "/overdraw/logs");
+    CHECK(std::filesystem::is_directory(xdg + "/overdraw/logs"));
+    ::unsetenv("XDG_STATE_HOME");
+
+    std::filesystem::remove_all(tmp);
+}
+
+void caseRingCaptureAndDump() {
+    g_currentCase = "ringCaptureAndDump";
+    using overdraw::log::kCrashRingSlots;
+    overdraw::log::crashRingReset();
+
+    auto sink = std::make_shared<overdraw::log::RingSink>();
+    auto lg = std::make_shared<spdlog::logger>("core", sink);
+    lg->set_level(spdlog::level::trace);
+
+    // Overflow the ring so only the newest kCrashRingSlots survive.
+    const size_t total = kCrashRingSlots + 10;
+    for (size_t i = 0; i < total; ++i) lg->info("ring-msg-{:04}", i);
+
+    const std::string tmp = makeTempDir();
+    const std::string out = tmp + "/dump.txt";
+    int fd = ::open(out.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    CHECK(fd >= 0);
+    overdraw::log::crashRingDump(fd);
+    ::close(fd);
+
+    const std::string text = readWholeFile(out);
+    CHECK(text.find("ring-msg-0009") == std::string::npos);  // overwritten
+    CHECK(text.find("ring-msg-0010") != std::string::npos);  // oldest kept
+    CHECK(text.find("ring-msg-0265") != std::string::npos);  // newest
+    // Oldest-first ordering.
+    CHECK(text.find("ring-msg-0010") < text.find("ring-msg-0265"));
+
+    overdraw::log::crashRingReset();
+    std::filesystem::remove_all(tmp);
+}
+
+void caseCrashReportPrune() {
+    g_currentCase = "crashReportPrune";
+    const std::string tmp = makeTempDir();
+    for (int i = 0; i < 25; ++i) {
+        char name[64];
+        std::snprintf(name, sizeof(name), "%s/crash-test-%010d-1.txt", tmp.c_str(), i);
+        std::ofstream(name) << "x";
+    }
+    overdraw::log::installCrashHandler(tmp, "prune-test");
+    size_t remaining = 0;
+    bool newestKept = false;
+    for (const auto& e : std::filesystem::directory_iterator(tmp)) {
+        const auto n = e.path().filename().string();
+        if (n.rfind("crash-", 0) == 0) {
+            ++remaining;
+            if (n == "crash-test-0000000024-1.txt") newestKept = true;
+        }
+    }
+    CHECK(remaining == 20);
+    CHECK(newestKept);
+    std::filesystem::remove_all(tmp);
+}
+
+void caseCrashReportOnSegv() {
+    g_currentCase = "crashReportOnSegv";
+    const std::string tmp = makeTempDir();
+
+    const pid_t pid = ::fork();
+    CHECK(pid >= 0);
+    if (pid == 0) {
+        // Child: install to the temp dir, seed the ring, fault.
+        overdraw::log::crashRingReset();
+        overdraw::log::installCrashHandler(tmp, "child");
+        auto sink = std::make_shared<overdraw::log::RingSink>();
+        auto lg = std::make_shared<spdlog::logger>("core", sink);
+        lg->info("last-words-before-crash");
+        volatile int* p = nullptr;
+        *p = 1;
+        _exit(0);  // not reached
+    }
+
+    int status = 0;
+    CHECK(::waitpid(pid, &status, 0) == pid);
+    CHECK(WIFSIGNALED(status));
+    CHECK(WTERMSIG(status) == SIGSEGV);
+
+    std::string report;
+    for (const auto& e : std::filesystem::directory_iterator(tmp)) {
+        const auto n = e.path().filename().string();
+        if (n.rfind("crash-child-", 0) == 0) report = e.path().string();
+    }
+    CHECK(!report.empty());
+    if (!report.empty()) {
+        const std::string text = readWholeFile(report);
+        CHECK(text.find("child caught SIGSEGV (11) addr=0x0") != std::string::npos);
+        CHECK(text.find("--- recent log records (oldest first) ---") != std::string::npos);
+        CHECK(text.find("last-words-before-crash") != std::string::npos);
+        // A backtrace with at least one resolvable frame.
+        CHECK(text.find("log-test") != std::string::npos);
+    }
+    std::filesystem::remove_all(tmp);
+}
+
 }  // namespace
 
 int main() {
@@ -339,6 +483,10 @@ int main() {
     caseSinkPreFdBuffering();
     caseSinkRingOverflow();
     caseIpcSourceReceives();
+    casePathsResolution();
+    caseRingCaptureAndDump();
+    caseCrashReportPrune();
+    caseCrashReportOnSegv();
 
     overdraw::log::logShutdown();
 

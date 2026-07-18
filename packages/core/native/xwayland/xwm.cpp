@@ -1,6 +1,5 @@
 #include "xwayland/xwm.h"
 
-#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <unordered_map>
@@ -10,6 +9,8 @@
 #include <xcb/xcb.h>
 #include <xcb/xcbext.h>  // xcb_poll_for_reply
 #include <xcb/xfixes.h>
+
+#include "log/log.h"
 
 namespace overdraw::xwayland {
 
@@ -140,14 +141,14 @@ XwmConn* xwmConnect(int wmFd) {
     auto* x = new XwmConn();
     x->conn = xcb_connect_to_fd(wmFd, nullptr);
     if (xcb_connection_has_error(x->conn)) {
-        std::fprintf(stderr, "[xwm] xcb_connect_to_fd failed\n");
+        LOG_ERR(Wayland, "[xwm] xcb_connect_to_fd failed");
         xcb_disconnect(x->conn);  // also closes wmFd
         delete x;
         return nullptr;
     }
     x->screen = xcb_setup_roots_iterator(xcb_get_setup(x->conn)).data;
     if (!x->screen) {
-        std::fprintf(stderr, "[xwm] no screen\n");
+        LOG_ERR(Wayland, "[xwm] no screen");
         xcb_disconnect(x->conn);
         delete x;
         return nullptr;
@@ -197,9 +198,9 @@ XwmConn* xwmConnect(int wmFd) {
         }
     }
     if (!x->xfixesAvailable) {
-        std::fprintf(stderr,
+        LOG_WARN(Wayland,
             "[xwm] xfixes unavailable; clipboard / primary-selection bridge "
-            "will not function\n");
+            "will not function");
     }
 
     // Intern atoms (pipelined: issue all, then collect).

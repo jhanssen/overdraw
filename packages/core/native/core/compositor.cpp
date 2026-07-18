@@ -2,8 +2,9 @@
 
 #include <algorithm>
 #include <iterator>
-#include <cstdio>
+#include <cerrno>
 #include <cstring>
+#include <string_view>
 #include <vector>
 
 #include <fcntl.h>
@@ -11,6 +12,7 @@
 #include <sys/socket.h>
 
 #include "gpu_process.h"
+#include "log/log.h"
 #include "side_channel.h"
 #include "transport.h"
 
@@ -42,8 +44,7 @@ Compositor::Compositor(int wireFd, int ctrlFd, pid_t gpuPid,
                                          const std::vector<uint8_t>& frame) {
         if (kind == ipc::FrameKind::ClientTexImported) {
             if (frame.size() != ipc::ClientTexImportedPayload::kSize) {
-                std::fprintf(stderr,
-                    "[core] ClientTexImported: bad payload size %zu\n", frame.size());
+                LOG_ERR(Core, "ClientTexImported: bad payload size {}", frame.size());
                 return;
             }
             auto p = ipc::ClientTexImportedPayload::decode(frame.data());
@@ -55,8 +56,7 @@ Compositor::Compositor(int wireFd, int ctrlFd, pid_t gpuPid,
             // takeShmUploadAcks() in dispatchFrameCallbacks and call
             // wl_buffer.send_release on the deferred bufferId.
             if (frame.size() != ipc::ShmUploadedPayload::kSize) {
-                std::fprintf(stderr,
-                    "[core] ShmUploaded: bad payload size %zu\n", frame.size());
+                LOG_ERR(Core, "ShmUploaded: bad payload size {}", frame.size());
                 return;
             }
             auto p = ipc::ShmUploadedPayload::decode(frame.data());
@@ -72,16 +72,14 @@ Compositor::Compositor(int wireFd, int ctrlFd, pid_t gpuPid,
             // acquireOutputTextureHandle returns null and no frames are
             // written for the dead output.
             if (frame.size() != ipc::ScanoutReadyPayload::kSize) {
-                std::fprintf(stderr,
-                    "[core] ScanoutReady: bad payload size %zu\n", frame.size());
+                LOG_ERR(Core, "ScanoutReady: bad payload size {}", frame.size());
                 return;
             }
             auto p = ipc::ScanoutReadyPayload::decode(frame.data());
             if (p.ok == 0) {
                 scanoutOutputs_.erase(p.outputId);
-                std::fprintf(stderr,
-                    "[core] ScanoutReady ok=0 for outputId=%u; ring discarded\n",
-                    p.outputId);
+                LOG_ERR(Core, "ScanoutReady ok=0 for outputId={}; ring discarded",
+                        p.outputId);
             }
             return;
         }
@@ -92,8 +90,7 @@ Compositor::Compositor(int wireFd, int ctrlFd, pid_t gpuPid,
             // ConsumerBegin we write is FIFO-after the insert and finds
             // the buf populated.
             if (frame.size() != ipc::SurfaceBufAllocatedPayload::kSize) {
-                std::fprintf(stderr,
-                    "[core] SurfaceBufAllocated: bad payload size %zu\n", frame.size());
+                LOG_ERR(Core, "SurfaceBufAllocated: bad payload size {}", frame.size());
                 return;
             }
             auto p = ipc::SurfaceBufAllocatedPayload::decode(frame.data());
@@ -125,8 +122,7 @@ Compositor::Compositor(int wireFd, int ctrlFd, pid_t gpuPid,
             // frames before handling ScanoutReserve.
             ipc::OutputDescriptorPayload p;
             if (!ipc::OutputDescriptorPayload::decode(frame.data(), frame.size(), p)) {
-                std::fprintf(stderr,
-                    "[core] OutputAdded: bad payload (size %zu)\n", frame.size());
+                LOG_ERR(Core, "OutputAdded: bad payload (size {})", frame.size());
                 return;
             }
             OutputDescriptorMsg msg{};
@@ -152,8 +148,7 @@ Compositor::Compositor(int wireFd, int ctrlFd, pid_t gpuPid,
             // state.outputs[outputId] already exists.
             ipc::OutputModesPayload p;
             if (!ipc::OutputModesPayload::decode(frame.data(), frame.size(), p)) {
-                std::fprintf(stderr,
-                    "[core] OutputModes: bad payload (size %zu)\n", frame.size());
+                LOG_ERR(Core, "OutputModes: bad payload (size {})", frame.size());
                 return;
             }
             OutputModesMsg msg{};
@@ -174,8 +169,7 @@ Compositor::Compositor(int wireFd, int ctrlFd, pid_t gpuPid,
             // fires output.pre-remove / removed and calls
             // releaseScanoutForOutput.
             if (frame.size() != ipc::OutputRemovedPayload::kSize) {
-                std::fprintf(stderr,
-                    "[core] OutputRemoved: bad payload size %zu\n", frame.size());
+                LOG_ERR(Core, "OutputRemoved: bad payload size {}", frame.size());
                 return;
             }
             auto p = ipc::OutputRemovedPayload::decode(frame.data());
@@ -192,16 +186,15 @@ Compositor::Compositor(int wireFd, int ctrlFd, pid_t gpuPid,
             // for this output BEFORE this frame arrived, so any in-flight
             // ProducerBegin for the OLD ring is also already drained.
             if (frame.size() != ipc::ScanoutRebuildPayload::kSize) {
-                std::fprintf(stderr,
-                    "[core] ScanoutRebuild: bad payload size %zu\n", frame.size());
+                LOG_ERR(Core, "ScanoutRebuild: bad payload size {}", frame.size());
                 return;
             }
             auto p = ipc::ScanoutRebuildPayload::decode(frame.data());
             scanoutOutputs_.erase(p.outputId);
             reserveScanoutForOutput(p.outputId, p.width, p.height);
-            std::printf("[core] ScanoutRebuild handled for outputId=%u %ux%u "
-                        "(fresh ScanoutReserve dispatched)\n",
-                        p.outputId, p.width, p.height);
+            LOG_INFO(Core, "ScanoutRebuild handled for outputId={} {}x{} "
+                           "(fresh ScanoutReserve dispatched)",
+                     p.outputId, p.width, p.height);
             return;
         }
         if (kind == ipc::FrameKind::ScanoutClientFlip) {
@@ -211,8 +204,7 @@ Compositor::Compositor(int wireFd, int ctrlFd, pid_t gpuPid,
             // latch/retire pair is queued separately for the buffer
             // lifecycle (release the retired buffer).
             if (frame.size() != ipc::ScanoutClientFlipPayload::kSize) {
-                std::fprintf(stderr,
-                    "[core] ScanoutClientFlip: bad payload size %zu\n", frame.size());
+                LOG_ERR(Core, "ScanoutClientFlip: bad payload size {}", frame.size());
                 return;
             }
             auto p = ipc::ScanoutClientFlipPayload::decode(frame.data());
@@ -230,8 +222,7 @@ Compositor::Compositor(int wireFd, int ctrlFd, pid_t gpuPid,
         }
         if (kind == ipc::FrameKind::ScanoutClientReject) {
             if (frame.size() != ipc::ScanoutClientRejectPayload::kSize) {
-                std::fprintf(stderr,
-                    "[core] ScanoutClientReject: bad payload size %zu\n", frame.size());
+                LOG_ERR(Core, "ScanoutClientReject: bad payload size {}", frame.size());
                 return;
             }
             auto p = ipc::ScanoutClientRejectPayload::decode(frame.data());
@@ -241,8 +232,7 @@ Compositor::Compositor(int wireFd, int ctrlFd, pid_t gpuPid,
         if (kind == ipc::FrameKind::ScanoutFormats) {
             ipc::ScanoutFormatsPayload p;
             if (!ipc::ScanoutFormatsPayload::decode(frame.data(), frame.size(), p)) {
-                std::fprintf(stderr,
-                    "[core] ScanoutFormats: bad payload (size %zu)\n", frame.size());
+                LOG_ERR(Core, "ScanoutFormats: bad payload (size {})", frame.size());
                 return;
             }
             scanoutFormatIndices_[p.outputId] = std::move(p.indices);
@@ -253,8 +243,7 @@ Compositor::Compositor(int wireFd, int ctrlFd, pid_t gpuPid,
             // or runtime demotion). Buffered for the JS layer, which flips
             // the output between hardware and software cursor.
             if (frame.size() != ipc::CursorPlaneStatusPayload::kSize) {
-                std::fprintf(stderr,
-                    "[core] CursorPlaneStatus: bad payload size %zu\n", frame.size());
+                LOG_ERR(Core, "CursorPlaneStatus: bad payload size {}", frame.size());
                 return;
             }
             auto p = ipc::CursorPlaneStatusPayload::decode(frame.data());
@@ -263,9 +252,8 @@ Compositor::Compositor(int wireFd, int ctrlFd, pid_t gpuPid,
             });
             return;
         }
-        std::fprintf(stderr,
-            "[core] WireLink inbound: unexpected kind=%u\n",
-            static_cast<unsigned>(kind));
+        LOG_ERR(Core, "WireLink inbound: unexpected kind={}",
+                static_cast<unsigned>(kind));
     });
 }
 
@@ -343,7 +331,8 @@ bool Compositor::bringUp() {
         dd.requiredFeatures = feats;
         dd.SetUncapturedErrorCallback(
             [](const wgpu::Device&, wgpu::ErrorType t, wgpu::StringView m) {
-                std::fprintf(stderr, "[core][dawn err %d] %.*s\n", (int)t, (int)m.length, m.data);
+                LOG_ERR(Core, "[dawn err {}] {}", (int)t,
+                        std::string_view(m.data, m.length));
             });
         bool ready = false;
         adapter.RequestDevice(&dd, wgpu::CallbackMode::AllowProcessEvents,
@@ -366,9 +355,8 @@ bool Compositor::bringUp() {
         dmabufFeedback_.entryCount = m.entryCount;
         dmabufFeedback_.formatTableSize = m.formatTableSize;
         for (int i = 1; i < nfds; ++i) ::close(fds[i]);
-        std::printf("[core] dmabuf feedback: main_device=0x%llx entries=%u size=%u\n",
-                    static_cast<unsigned long long>(m.mainDevice),
-                    m.entryCount, m.formatTableSize);
+        LOG_INFO(Core, "dmabuf feedback: main_device=0x{:x} entries={} size={}",
+                 m.mainDevice, m.entryCount, m.formatTableSize);
     };
 
     // DeviceReady; then dispatch on output mode:
@@ -728,9 +716,8 @@ void Compositor::registerShmPool(uint32_t poolId, int fd, uint64_t size) {
                                         buf, sizeof(buf), fds, 1);
     if (fd >= 0) ::close(fd);
     if (!ok) {
-        std::fprintf(stderr,
-            "[core] registerShmPool: appendFrameWithFds failed (poolId=%u)\n",
-            poolId);
+        LOG_ERR(Core, "registerShmPool: appendFrameWithFds failed (poolId={})",
+                poolId);
     }
 }
 
@@ -1059,8 +1046,8 @@ void Compositor::onClientTexImported(uint32_t textureId, bool importOk) {
             {jit->importId, jit->width, jit->height,
              wgpu::Texture::Acquire(taken.texture), true});
     } else {
-        std::fprintf(stderr, "[core] dmabuf JS import FAILED id=%u %ux%u\n",
-                     jit->importId, jit->width, jit->height);
+        LOG_ERR(Core, "dmabuf JS import FAILED id={} {}x{}",
+                jit->importId, jit->width, jit->height);
         jit->reservation.commit();
         completedJsImports_.push_back({jit->importId, 0, 0, wgpu::Texture(), false});
     }
@@ -1179,8 +1166,8 @@ void Compositor::writeAccessFrame(ipc::FrameKind kind, const Payload& payload) {
 bool Compositor::writeClientTexBeginAccess(uint32_t importId) {
     auto wh = jsImportHandles_.find(importId);
     if (wh == jsImportHandles_.end()) {
-        std::fprintf(stderr, "[core] writeClientTexBeginAccess: no handle for importId=%u\n",
-                     importId);
+        LOG_ERR(Core, "writeClientTexBeginAccess: no handle for importId={}",
+                importId);
         return false;
     }
     writeAccessFrame(ipc::FrameKind::BeginAccess,
@@ -1191,9 +1178,8 @@ bool Compositor::writeClientTexBeginAccess(uint32_t importId) {
 bool Compositor::writeClientTexBeginAccessWithFence(uint32_t importId, int acquireFenceFd) {
     auto wh = jsImportHandles_.find(importId);
     if (wh == jsImportHandles_.end()) {
-        std::fprintf(stderr,
-            "[core] writeClientTexBeginAccessWithFence: no handle for importId=%u\n",
-            importId);
+        LOG_ERR(Core, "writeClientTexBeginAccessWithFence: no handle for importId={}",
+                importId);
         if (acquireFenceFd >= 0) ::close(acquireFenceFd);
         return false;
     }
@@ -1211,8 +1197,8 @@ bool Compositor::writeClientTexBeginAccessWithFence(uint32_t importId, int acqui
 void Compositor::writeClientTexEndAccess(uint32_t importId) {
     auto wh = jsImportHandles_.find(importId);
     if (wh == jsImportHandles_.end()) {
-        std::fprintf(stderr, "[core] writeClientTexEndAccess: no handle for importId=%u\n",
-                     importId);
+        LOG_ERR(Core, "writeClientTexEndAccess: no handle for importId={}",
+                importId);
         return;
     }
     writeAccessFrame(ipc::FrameKind::EndAccess,
@@ -1244,7 +1230,7 @@ Compositor::PluginConnHandle Compositor::addWireConnection() {
     int fds[2];
     // STREAM, like the core's own wire socket (length-prefixed framing).
     if (::socketpair(AF_UNIX, SOCK_STREAM, 0, fds) != 0) {
-        std::perror("[core] addWireConnection socketpair");
+        LOG_ERR(Core, "addWireConnection socketpair: {}", std::strerror(errno));
         return h;
     }
     const int wb = 8 * 1024 * 1024;  // match the core wire socket buffers
@@ -1259,7 +1245,7 @@ Compositor::PluginConnHandle Compositor::addWireConnection() {
     m.connId = connId;
     int sendFds[1] = {fds[1]};
     if (!ctrlSender_->send(m, sendFds, 1)) {
-        std::fprintf(stderr, "[core] addWireConnection: ctrlSender send failed\n");
+        LOG_ERR(Core, "addWireConnection: ctrlSender send failed");
         ::close(fds[0]); ::close(fds[1]);
         return h;
     }
@@ -1418,8 +1404,7 @@ bool Compositor::sendScanoutClientPresent(uint32_t outputId, uint32_t importId,
     }
     auto wh = jsImportHandles_.find(importId);
     if (wh == jsImportHandles_.end()) {
-        std::fprintf(stderr,
-            "[core] sendScanoutClientPresent: no handle for importId=%u\n", importId);
+        LOG_ERR(Core, "sendScanoutClientPresent: no handle for importId={}", importId);
         if (acquireFenceFd >= 0) ::close(acquireFenceFd);
         return false;
     }

@@ -514,13 +514,15 @@ export interface Addon {
   // backend is active.
   updateOutputLayout(rects: ReadonlyArray<{ x: number; y: number; w: number; h: number }>): void;
 
-  // Initialize the global spdlog registry (stdout + stderr sinks, optional
-  // file sink) and the per-area level table. Idempotent. Call before start()
-  // so cross-process records dispatched by the GPU log reader thread land in
-  // a configured registry. `levelSpec` is the --log-level argument value
-  // (`area=level` pairs, comma-separated; a bare level becomes the default).
-  // Throws on a malformed levelSpec.
-  logInit(opts?: { levelSpec?: string; logFile?: string }): void;
+  // Initialize the global spdlog registry (stdout + stderr sinks, rotating
+  // file sink) and the per-area level table. The file sink is on by default,
+  // writing to the state dir ($XDG_STATE_HOME/overdraw/logs); `logFile`
+  // overrides its path and `noLogFile` suppresses it. Idempotent. Call before
+  // start() so cross-process records dispatched by the GPU log reader thread
+  // land in a configured registry. `levelSpec` is the --log-level argument
+  // value (`area=level` pairs, comma-separated; a bare level becomes the
+  // default). Throws on a malformed levelSpec.
+  logInit(opts?: { levelSpec?: string; logFile?: string; noLogFile?: boolean }): void;
 
   // Emit a log record on the named area. The level matches
   // spdlog::level::level_enum (trace=0, debug=1, info=2, warn=3, err=4,

@@ -2,7 +2,6 @@
 
 #include <algorithm>
 #include <cerrno>
-#include <cstdio>
 #include <cstring>
 
 #include <fcntl.h>
@@ -16,6 +15,8 @@ extern "C" {
 #include <xf86drmMode.h>
 #include <drm_fourcc.h>
 }
+
+#include "log/log.h"
 
 namespace overdraw::gpu {
 
@@ -84,7 +85,7 @@ void KmsOutputBackend::close() {
 
 bool KmsOutputBackend::open(const char* /*title*/) {
     if (drmFd_ < 0) {
-        std::fprintf(stderr, "[kms] open: no DRM fd (SetDrmFd not received)\n");
+        LOG_ERR(Gpu, "[kms] open: no DRM fd (SetDrmFd not received)");
         return false;
     }
 
@@ -93,8 +94,8 @@ bool KmsOutputBackend::open(const char* /*title*/) {
     if (!enableDrmAtomicCaps(drmFd_)) return false;
     queryCursorSizeCaps(drmFd_, cursorCapW_, cursorCapH_);
     asyncFlipCap_ = queryAsyncPageFlipCap(drmFd_);
-    std::printf("[kms] atomic async page flips (tearing): %s\n",
-                asyncFlipCap_ ? "supported" : "unsupported");
+    LOG_INFO(Gpu, "[kms] atomic async page flips (tearing): {}",
+             asyncFlipCap_ ? "supported" : "unsupported");
 
     // 4: pick the primary connector (env var OVERDRAW_CONNECTOR may pin a name).
     DrmTopology primaryTopo{};
@@ -108,7 +109,7 @@ bool KmsOutputBackend::open(const char* /*title*/) {
     // 8: GBM device on the DRM fd, shared by every output's scanout ring.
     gbm_ = gbm_create_device(drmFd_);
     if (!gbm_) {
-        std::fprintf(stderr, "[kms] gbm_create_device failed: %s\n", std::strerror(errno));
+        LOG_ERR(Gpu, "[kms] gbm_create_device failed: {}", std::strerror(errno));
         return false;
     }
 
@@ -121,7 +122,7 @@ bool KmsOutputBackend::open(const char* /*title*/) {
     // rescan() (e.g. after an existing output disconnects, freeing its CRTC)
     // does retry.
     if (!connectOutput(std::move(primaryTopo), 0)) {
-        std::fprintf(stderr, "[kms] primary output bring-up failed\n");
+        LOG_ERR(Gpu, "[kms] primary output bring-up failed");
         return false;
     }
     const uint32_t primaryConnectorId = outputs_[0]->topo.connectorId;
@@ -145,18 +146,18 @@ bool KmsOutputBackend::connectOutput(DrmTopology topo, uint32_t outputId) {
     // call. usedCrtcs_ is the source of truth.
     std::vector<uint32_t> usedView(usedCrtcs_.begin(), usedCrtcs_.end());
     if (!pickCrtc(drmFd_, topo.connectorId, topo.crtcId, usedView)) {
-        std::fprintf(stderr, "[kms] connector %s id=%u: no distinct CRTC; skipping\n",
-                     topo.connectorName.c_str(), topo.connectorId);
+        LOG_WARN(Gpu, "[kms] connector {} id={}: no distinct CRTC; skipping",
+                 topo.connectorName, topo.connectorId);
         return false;
     }
     if (!pickPrimaryPlane(drmFd_, topo.crtcId, topo.planeId)) {
-        std::fprintf(stderr, "[kms] connector %s id=%u crtc=%u: no primary plane; skipping\n",
-                     topo.connectorName.c_str(), topo.connectorId, topo.crtcId);
+        LOG_WARN(Gpu, "[kms] connector {} id={} crtc={}: no primary plane; skipping",
+                 topo.connectorName, topo.connectorId, topo.crtcId);
         return false;
     }
     if (!resolveProperties(drmFd_, topo)) {
-        std::fprintf(stderr, "[kms] connector %s id=%u: property resolve failed; skipping\n",
-                     topo.connectorName.c_str(), topo.connectorId);
+        LOG_WARN(Gpu, "[kms] connector {} id={}: property resolve failed; skipping",
+                 topo.connectorName, topo.connectorId);
         return false;
     }
     // Cursor plane is best-effort: without one this output just uses the
@@ -169,11 +170,11 @@ bool KmsOutputBackend::connectOutput(DrmTopology topo, uint32_t outputId) {
         resolveCursorPlaneProperties(drmFd_, topo);  // zeroes cursorPlaneId on failure
     }
     usedCrtcs_.insert(topo.crtcId);
-    std::printf("[kms] output %u connector %s id=%u mode=%ux%u @%u.%03uHz crtc=%u plane=%u cursor-plane=%u\n",
-                outputId, topo.connectorName.c_str(), topo.connectorId,
-                topo.mode.hdisplay, topo.mode.vdisplay,
-                topo.mode.vrefreshMhz / 1000, topo.mode.vrefreshMhz % 1000,
-                topo.crtcId, topo.planeId, topo.cursorPlaneId);
+    LOG_INFO(Gpu, "[kms] output {} connector {} id={} mode={}x{} @{}.{:03}Hz crtc={} plane={} cursor-plane={}",
+             outputId, topo.connectorName, topo.connectorId,
+             topo.mode.hdisplay, topo.mode.vdisplay,
+             topo.mode.vrefreshMhz / 1000, topo.mode.vrefreshMhz % 1000,
+             topo.crtcId, topo.planeId, topo.cursorPlaneId);
     auto out = std::make_unique<PerOutput>();
     out->outputId = outputId;
     out->topo = std::move(topo);
@@ -200,8 +201,8 @@ void KmsOutputBackend::disconnectOutput(uint32_t outputId) {
         drmModeDestroyPropertyBlob(drmFd_, o.modeBlobId);
         o.modeBlobId = 0;
     }
-    std::printf("[kms] output %u connector %s disconnected (crtc %u released)\n",
-                outputId, o.topo.connectorName.c_str(), o.topo.crtcId);
+    LOG_INFO(Gpu, "[kms] output {} connector {} disconnected (crtc {} released)",
+             outputId, o.topo.connectorName, o.topo.crtcId);
     outputs_.erase(it);
 }
 
@@ -214,8 +215,8 @@ bool KmsOutputBackend::ensureCursorBos(PerOutput& o) {
         create.height = cursorCapH_;
         create.bpp    = 32;
         if (drmIoctl(drmFd_, DRM_IOCTL_MODE_CREATE_DUMB, &create) != 0) {
-            std::fprintf(stderr, "[kms] cursor dumb-buffer create failed: %s\n",
-                         std::strerror(errno));
+            LOG_ERR(Gpu, "[kms] cursor dumb-buffer create failed: {}",
+                    std::strerror(errno));
             destroyCursorBos(o);
             return false;
         }
@@ -225,8 +226,8 @@ bool KmsOutputBackend::ensureCursorBos(PerOutput& o) {
         drm_mode_map_dumb mapReq{};
         mapReq.handle = b.handle;
         if (drmIoctl(drmFd_, DRM_IOCTL_MODE_MAP_DUMB, &mapReq) != 0) {
-            std::fprintf(stderr, "[kms] cursor dumb-buffer map failed: %s\n",
-                         std::strerror(errno));
+            LOG_ERR(Gpu, "[kms] cursor dumb-buffer map failed: {}",
+                    std::strerror(errno));
             destroyCursorBos(o);
             return false;
         }
@@ -234,8 +235,8 @@ bool KmsOutputBackend::ensureCursorBos(PerOutput& o) {
                        drmFd_, mapReq.offset);
         if (b.map == MAP_FAILED) {
             b.map = nullptr;
-            std::fprintf(stderr, "[kms] cursor dumb-buffer mmap failed: %s\n",
-                         std::strerror(errno));
+            LOG_ERR(Gpu, "[kms] cursor dumb-buffer mmap failed: {}",
+                    std::strerror(errno));
             destroyCursorBos(o);
             return false;
         }
@@ -245,7 +246,7 @@ bool KmsOutputBackend::ensureCursorBos(PerOutput& o) {
         uint32_t offsets[4] = { 0, 0, 0, 0 };
         if (drmModeAddFB2(drmFd_, cursorCapW_, cursorCapH_, DRM_FORMAT_ARGB8888,
                           handles, pitches, offsets, &b.fbId, 0) != 0) {
-            std::fprintf(stderr, "[kms] cursor AddFB2 failed: %s\n", std::strerror(errno));
+            LOG_ERR(Gpu, "[kms] cursor AddFB2 failed: {}", std::strerror(errno));
             destroyCursorBos(o);
             return false;
         }
@@ -303,8 +304,8 @@ void KmsOutputBackend::stashPresent(PerOutput& o, int slotIdx, uint32_t clientFb
         // Mailbox: the newer present supersedes the stashed one. A dropped
         // CLIENT present's buffer will never latch -- report it retired so
         // the core releases it.
-        std::fprintf(stderr,
-            "[kms] present stashed twice on output %u; dropping older (slot %d fb %u)\n",
+        LOG_WARN(Gpu,
+            "[kms] present stashed twice on output {}; dropping older (slot {} fb {})",
             o.outputId, o.stashed.slotIdx, o.stashed.clientFbId);
         if (o.stashed.clientBufId != 0 && clientFlipListener_) {
             clientFlipListener_({ o.outputId, 0, o.stashed.clientBufId, 0, 0, 0 });
@@ -368,8 +369,8 @@ uint32_t KmsOutputBackend::importClientFb(int dmabufFd, uint32_t width, uint32_t
     if (drmFd_ < 0 || dmabufFd < 0) return 0;
     uint32_t handle = 0;
     if (drmPrimeFDToHandle(drmFd_, dmabufFd, &handle) != 0) {
-        std::fprintf(stderr, "[kms] scanout: PrimeFDToHandle failed: %s\n",
-                     std::strerror(errno));
+        LOG_ERR(Gpu, "[kms] scanout: PrimeFDToHandle failed: {}",
+                std::strerror(errno));
         return 0;
     }
     uint32_t handles[4] = { handle, 0, 0, 0 };
@@ -391,10 +392,9 @@ uint32_t KmsOutputBackend::importClientFb(int dmabufFd, uint32_t width, uint32_t
     // through the render node), so no handle aliasing to worry about.
     drmCloseBufferHandle(drmFd_, handle);
     if (rc != 0) {
-        std::fprintf(stderr,
-            "[kms] scanout: AddFB2 %ux%u fourcc=0x%08x mod=0x%016llx failed: %s\n",
-            width, height, fourcc,
-            static_cast<unsigned long long>(modifier), std::strerror(errno));
+        LOG_ERR(Gpu,
+            "[kms] scanout: AddFB2 {}x{} fourcc=0x{:08x} mod=0x{:016x} failed: {}",
+            width, height, fourcc, modifier, std::strerror(errno));
         return 0;
     }
     return fbId;
@@ -522,8 +522,8 @@ void KmsOutputBackend::maybeCursorCommit(PerOutput& o) {
     }
     drmModeAtomicFree(req);
     if (rc != 0) {
-        std::fprintf(stderr,
-            "[kms] cursor-only commit failed (%s); software cursor for output %u\n",
+        LOG_WARN(Gpu,
+            "[kms] cursor-only commit failed ({}); software cursor for output {}",
             std::strerror(errno), o.outputId);
         demoteCursor(o);
         return;
@@ -639,7 +639,7 @@ bool KmsOutputBackend::initRingFor(PerOutput& o, const wgpu::Device& device) {
 
 bool KmsOutputBackend::initScanout(const wgpu::Device& device) {
     if (drmFd_ < 0 || !gbm_ || outputs_.empty()) {
-        std::fprintf(stderr, "[kms] initScanout: open() not completed\n");
+        LOG_ERR(Gpu, "[kms] initScanout: open() not completed");
         return false;
     }
 
@@ -648,13 +648,13 @@ bool KmsOutputBackend::initScanout(const wgpu::Device& device) {
     // keeps this correct under churn.
     std::vector<uint32_t> ids = outputIds();
     if (!initRingFor(*outputs_[ids[0]], device)) {
-        std::fprintf(stderr, "[kms] primary scanout ring init failed\n");
+        LOG_ERR(Gpu, "[kms] primary scanout ring init failed");
         return false;
     }
     for (size_t i = 1; i < ids.size(); ++i) {
         const uint32_t id = ids[i];
         if (!initRingFor(*outputs_[id], device)) {
-            std::fprintf(stderr, "[kms] output %u scanout ring init failed; dropping\n", id);
+            LOG_WARN(Gpu, "[kms] output {} scanout ring init failed; dropping", id);
             outputs_[id]->ring.clear();
             outputs_.erase(id);
         }
@@ -665,17 +665,17 @@ bool KmsOutputBackend::initScanout(const wgpu::Device& device) {
 bool KmsOutputBackend::initScanoutForOutput(uint32_t outputId,
                                             const wgpu::Device& device) {
     if (drmFd_ < 0 || !gbm_) {
-        std::fprintf(stderr, "[kms] initScanoutForOutput: backend not open\n");
+        LOG_ERR(Gpu, "[kms] initScanoutForOutput: backend not open");
         return false;
     }
     PerOutput* o = find(outputId);
     if (!o) {
-        std::fprintf(stderr, "[kms] initScanoutForOutput: unknown outputId=%u\n", outputId);
+        LOG_ERR(Gpu, "[kms] initScanoutForOutput: unknown outputId={}", outputId);
         return false;
     }
     if (!initRingFor(*o, device)) {
-        std::fprintf(stderr, "[kms] output %u scanout ring init failed; dropping\n",
-                     outputId);
+        LOG_WARN(Gpu, "[kms] output {} scanout ring init failed; dropping",
+                 outputId);
         // Caller treats this as a hard-drop: the connector came up but the
         // ring wouldn't allocate (modifier mismatch, GBM exhaustion, ...).
         // Remove from outputs_ so the next rescan can retry it from scratch
@@ -698,13 +698,13 @@ bool KmsOutputBackend::switchMode(uint32_t outputId,
                                   const wgpu::Device& device) {
     PerOutput* o = find(outputId);
     if (!o) {
-        std::fprintf(stderr, "[kms] switchMode: unknown outputId=%u\n", outputId);
+        LOG_ERR(Gpu, "[kms] switchMode: unknown outputId={}", outputId);
         return false;
     }
     DrmMode newMode{};
     if (!findMode(drmFd_, o->topo.connectorId, width, height, refreshMhz, newMode)) {
-        std::fprintf(stderr,
-            "[kms] switchMode: connector %u has no mode matching %ux%u@%u.%03uHz; ignoring\n",
+        LOG_WARN(Gpu,
+            "[kms] switchMode: connector {} has no mode matching {}x{}@{}.{:03}Hz; ignoring",
             o->topo.connectorId, width, height,
             refreshMhz / 1000, refreshMhz % 1000);
         return false;
@@ -743,14 +743,14 @@ bool KmsOutputBackend::switchMode(uint32_t outputId,
     // this output -- the connector stays in outputs_ but with no ring, so
     // no frames are written for it until the caller redoes the bring-up.
     if (!initRingFor(*o, device)) {
-        std::fprintf(stderr,
-            "[kms] switchMode: ring re-init failed for outputId=%u at %ux%u\n",
+        LOG_ERR(Gpu,
+            "[kms] switchMode: ring re-init failed for outputId={} at {}x{}",
             outputId, newMode.hdisplay, newMode.vdisplay);
         return false;
     }
-    std::printf("[kms] output %u switched to %ux%u@%u.%03uHz\n",
-                outputId, newMode.hdisplay, newMode.vdisplay,
-                newMode.vrefreshMhz / 1000, newMode.vrefreshMhz % 1000);
+    LOG_INFO(Gpu, "[kms] output {} switched to {}x{}@{}.{:03}Hz",
+             outputId, newMode.hdisplay, newMode.vdisplay,
+             newMode.vrefreshMhz / 1000, newMode.vrefreshMhz % 1000);
     return true;
 }
 
@@ -853,13 +853,13 @@ void KmsOutputBackend::pause() {
         resetTransientFlipState(*o);
         o->cursorDirty = true;
     }
-    std::printf("[kms] paused (VT switched away or seat disabled)\n");
+    LOG_INFO(Gpu, "[kms] paused (VT switched away or seat disabled)");
 }
 
 void KmsOutputBackend::resume() {
     if (!paused_) return;
     paused_ = false;
-    std::printf("[kms] resumed (next present will re-run modeset)\n");
+    LOG_INFO(Gpu, "[kms] resumed (next present will re-run modeset)");
 }
 
 bool KmsOutputBackend::presentOutputImpl(PerOutput& o, int slotIdx, int inFenceFd,
@@ -935,7 +935,7 @@ bool KmsOutputBackend::presentOutputImpl(PerOutput& o, int slotIdx, int inFenceF
     auto buildReq = [&]() -> drmModeAtomicReq* {
         drmModeAtomicReq* req = drmModeAtomicAlloc();
         if (!req) {
-            std::fprintf(stderr, "[kms] drmModeAtomicAlloc failed\n");
+            LOG_ERR(Gpu, "[kms] drmModeAtomicAlloc failed");
             return nullptr;
         }
         auto add = [&](uint32_t obj, uint32_t prop, uint64_t v) {
@@ -1011,9 +1011,9 @@ bool KmsOutputBackend::presentOutputImpl(PerOutput& o, int slotIdx, int inFenceF
         // quirk, size/format constraint the caps didn't surface). Demote
         // to software cursor and retry the frame without it -- the frame
         // must not be lost to a cursor problem.
-        std::fprintf(stderr,
-            "[kms] atomic TEST failed with cursor plane (%s); retrying without "
-            "hw cursor on output %u\n", std::strerror(errno), o.outputId);
+        LOG_WARN(Gpu,
+            "[kms] atomic TEST failed with cursor plane ({}); retrying without "
+            "hw cursor on output {}", std::strerror(errno), o.outputId);
         demoteCursor(o, /*issueDisableCommit=*/false);
         drmModeAtomicFree(req);
         req = buildReq();  // now emits the cursor plane-off props
@@ -1021,8 +1021,8 @@ bool KmsOutputBackend::presentOutputImpl(PerOutput& o, int slotIdx, int inFenceF
         testRc = drmModeAtomicCommit(drmFd_, req, testFlags, this);
     }
     if (testRc != 0) {
-        std::fprintf(stderr, "[kms] atomic TEST failed: %s (flags=0x%x)\n",
-                     std::strerror(errno), testFlags);
+        LOG_ERR(Gpu, "[kms] atomic TEST failed: {} (flags=0x{:x})",
+                std::strerror(errno), testFlags);
         drmModeAtomicFree(req);
         return false;
     }
@@ -1035,8 +1035,8 @@ bool KmsOutputBackend::presentOutputImpl(PerOutput& o, int slotIdx, int inFenceF
     }
     drmModeAtomicFree(req);
     if (rc != 0) {
-        std::fprintf(stderr, "[kms] atomic commit failed: %s (flags=0x%x)\n",
-                     std::strerror(errno), flags);
+        LOG_ERR(Gpu, "[kms] atomic commit failed: {} (flags=0x{:x})",
+                std::strerror(errno), flags);
         return false;
     }
     if (wantAsync) {
@@ -1044,12 +1044,12 @@ bool KmsOutputBackend::presentOutputImpl(PerOutput& o, int slotIdx, int inFenceF
         // tearing actually engaged for an async-requesting client.
         if ((flags & DRM_MODE_PAGE_FLIP_ASYNC) && !o.tearingEngagedLogged) {
             o.tearingEngagedLogged = true;
-            std::printf("[kms] output %u: tearing engaged (async page flip)\n",
-                        o.outputId);
+            LOG_INFO(Gpu, "[kms] output {}: tearing engaged (async page flip)",
+                     o.outputId);
         } else if (!(flags & DRM_MODE_PAGE_FLIP_ASYNC) && !o.tearingFallbackLogged) {
             o.tearingFallbackLogged = true;
-            std::printf("[kms] output %u: async flip refused; vsynced instead "
-                        "(may engage on later frames)\n", o.outputId);
+            LOG_INFO(Gpu, "[kms] output {}: async flip refused; vsynced instead "
+                     "(may engage on later frames)", o.outputId);
         }
     }
     // This commit carried the current desired cursor state.

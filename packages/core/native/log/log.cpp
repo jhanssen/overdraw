@@ -1,6 +1,7 @@
 #include "log/log.h"
 
 #include <array>
+#include <cstdio>
 #include <cstring>
 #include <mutex>
 #include <sstream>
@@ -8,7 +9,10 @@
 
 #include <spdlog/sinks/dist_sink.h>
 #include <spdlog/sinks/stdout_sinks.h>
-#include <spdlog/sinks/basic_file_sink.h>
+#include <spdlog/sinks/rotating_file_sink.h>
+
+#include "log/paths.h"
+#include "log/ring_sink.h"
 
 namespace overdraw::log {
 
@@ -55,30 +59,47 @@ private:
 std::shared_ptr<spdlog::sinks::dist_sink_mt> buildSinks(const Config& cfg) {
     auto dist = std::make_shared<spdlog::sinks::dist_sink_mt>();
 
+    // Crash-context ring rides along in every mode (including the GPU
+    // process's sender mode) so a crash report always has recent records.
+    dist->add_sink(std::make_shared<RingSink>());
+
     if (cfg.senderSink) {
-        // Sender mode (GPU process): only the IPC sink. No stdout/stderr/file.
+        // Sender mode (GPU process): the IPC sink instead of stdout/stderr/
+        // file. The IpcSink uses the record's raw payload bytes; the pattern
+        // set below only affects the ring.
         dist->add_sink(cfg.senderSink);
-        // No pattern: the IpcSink ignores formatted output and uses the
-        // record's raw payload bytes.
-        return dist;
-    }
+    } else {
+        // stdout: trace/debug/info. Capped at info.
+        auto stdoutInner = std::make_shared<spdlog::sinks::stdout_sink_mt>();
+        auto stdoutCapped = std::make_shared<CeilingSink<spdlog::sinks::stdout_sink_mt>>(
+            stdoutInner, spdlog::level::info);
+        dist->add_sink(stdoutCapped);
 
-    // stdout: trace/debug/info. Capped at info.
-    auto stdoutInner = std::make_shared<spdlog::sinks::stdout_sink_mt>();
-    auto stdoutCapped = std::make_shared<CeilingSink<spdlog::sinks::stdout_sink_mt>>(
-        stdoutInner, spdlog::level::info);
-    dist->add_sink(stdoutCapped);
+        // stderr: warn/err/critical. Floor at warn (sink-level filter, not record).
+        auto stderrSink = std::make_shared<spdlog::sinks::stderr_sink_mt>();
+        stderrSink->set_level(spdlog::level::warn);
+        dist->add_sink(stderrSink);
 
-    // stderr: warn/err/critical. Floor at warn (sink-level filter, not record).
-    auto stderrSink = std::make_shared<spdlog::sinks::stderr_sink_mt>();
-    stderrSink->set_level(spdlog::level::warn);
-    dist->add_sink(stderrSink);
-
-    if (!cfg.filePath.empty()) {
-        // truncate-on-start, no rotation.
-        auto fileSink = std::make_shared<spdlog::sinks::basic_file_sink_mt>(
-            cfg.filePath, /*truncate=*/true);
-        dist->add_sink(fileSink);
+        // Persistent file sink, on by default: cfg.filePath when given, else
+        // the state dir (survives reboots; /tmp does not). Rotation bounds
+        // disk use for long sessions.
+        if (!cfg.disableFile) {
+            std::string path = cfg.filePath;
+            if (path.empty()) {
+                const std::string dir = logsDir();
+                if (!dir.empty()) path = dir + "/overdraw.log";
+            }
+            if (!path.empty()) {
+                try {
+                    auto fileSink = std::make_shared<spdlog::sinks::rotating_file_sink_mt>(
+                        path, /*max_size=*/8u * 1024 * 1024, /*max_files=*/3);
+                    dist->add_sink(fileSink);
+                } catch (const spdlog::spdlog_ex& e) {
+                    std::fprintf(stderr, "overdraw: log file sink at %s unavailable: %s\n",
+                                 path.c_str(), e.what());
+                }
+            }
+        }
     }
 
     // Compact pattern: time, level, area (via logger name), message.

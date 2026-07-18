@@ -1228,17 +1228,22 @@ validated + resolved + consumed by the runtime + hotkey plugin.
   hotplug camera persistence, ext-workspace per-group duplicate
   projection, camera-following compose/live scenes, the
   de-workspacing renames/retirements (canvas-design.md §10b).
-- **Logging.** TS surface migrated (spdlog 1.17.0; fixed area set;
-  severity-based stdout/stderr split; `--log-file=PATH`; per-area
+- **Logging.** Fully migrated: TS surface (spdlog 1.17.0; fixed
+  area set; severity-based stdout/stderr split; per-area
   `--log-level=SPEC`; `installConsoleShim` routes `console.*`
   through `addon.nativeLog` on area `"js"`; cross-process flow
-  via a fourth socket with fragmented `LogPacket`s). **Not yet
-  migrated:** ~140 native `fprintf(stderr, …)` / `printf` sites
-  across `packages/core/native/**` and `gpu-process/src/**` --
-  they still write directly to inherited stderr, bypassing the
-  log-file sink and runtime level filter. Known soundness gap
-  (low impact): `overdraw::log::logger(Area)` returns a reference
-  to a `shared_ptr`-held logger with the lock dropped on return;
+  via a fourth socket with fragmented `LogPacket`s) AND the
+  native `printf`/`fprintf` sites in `packages/core/native/**`
+  and `gpu-process/src/**` (now `LOG_*`; per-frame chatter is
+  `debug`, compiled out in Release via `SPDLOG_ACTIVE_LEVEL`).
+  Persistent by default: rotating file sink at
+  `~/.local/state/overdraw/logs/overdraw.log` (`--log-file=PATH`
+  overrides, `--no-log-file` disables); crash reports with
+  backtrace + recent-log ring at
+  `~/.local/state/overdraw/crashes/` (architecture.md "Crash
+  reports"). Known soundness gap (low impact):
+  `overdraw::log::logger(Area)` returns a reference to a
+  `shared_ptr`-held logger with the lock dropped on return;
   `IpcSource` works around via `spdlog::get(name)`.
 - **WM behavioral residuals:** `show_window_menu`, `set_parent`
   driving stacking/modality, per-output fullscreen target,

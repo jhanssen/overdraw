@@ -138,11 +138,15 @@ and cleaned up carefully.
 
 ## Crash vs. hang
 
-- The GPU process installs a crash handler that writes a backtrace to
-  `/tmp/overdraw-gpu-crash.txt` on SIGSEGV/SIGABRT/SIGBUS/SIGILL/SIGFPE
-  (`gpu-process/src/main.cpp`). **Before assuming a crash, check that file.**
-  Absent file + live process in a kernel wait (`/proc/<pid>/wchan`) = a hang/
-  deadlock, not a crash.
+- Both processes install a crash handler that writes a per-crash report
+  (signal + fault address, backtrace, recent log records) to
+  `~/.local/state/overdraw/crashes/crash-<core|gpu>-<epoch>-<pid>.txt`
+  (`$OVERDRAW_STATE_DIR/crashes/` when that env override is set) on
+  SIGSEGV/SIGABRT/SIGBUS/SIGILL/SIGFPE (`native/log/crash_handler.cpp`).
+  **Before assuming a crash, check that directory.** No new report + live
+  process in a kernel wait (`/proc/<pid>/wchan`) = a hang/deadlock, not a
+  crash. The rotating session log lives next door in
+  `~/.local/state/overdraw/logs/overdraw.log`.
 - A GPU main thread in `drm_syncobj_array_wait_timeout` is blocked on a
   DRM/Vulkan fence (e.g. inside `DeviceTick` waiting on submitted work). Often a
   synchronization/present-pacing entanglement, not a dead process.

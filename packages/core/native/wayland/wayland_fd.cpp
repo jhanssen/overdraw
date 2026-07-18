@@ -1,9 +1,9 @@
 #include "wayland_fd.h"
 
-#include <cstdio>
-
 #include <fcntl.h>
 #include <unistd.h>
+
+#include "log/log.h"
 
 namespace overdraw::wayland {
 namespace {
@@ -32,9 +32,9 @@ WaylandFdState* stateOf(napi_env env, napi_value self) {
 void finalizeState(napi_env, void* data, void*) {
     auto* st = static_cast<WaylandFdState*>(data);
     if (st->fd >= 0 && !st->taken && !st->closed) {
-        std::fprintf(stderr,
-            "[wlfd] WARNING: WaylandFd garbage-collected while still open (fd=%d); "
-            "closing. Well-behaved code should takeRawFd() or close() it.\n", st->fd);
+        LOG_WARN(Wayland,
+            "[wlfd] WaylandFd garbage-collected while still open (fd={}); "
+            "closing. Well-behaved code should takeRawFd() or close() it.", st->fd);
         ::close(st->fd);
     }
     delete st;

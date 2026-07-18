@@ -1,7 +1,6 @@
 #include "allocator.h"
 
 #include <cerrno>
-#include <cstdio>
 #include <cstring>
 #include <fcntl.h>
 #include <sys/stat.h>
@@ -9,6 +8,8 @@
 
 #include <gbm.h>
 #include <drm_fourcc.h>
+
+#include "log/log.h"
 
 namespace overdraw::gpu {
 namespace {
@@ -55,19 +56,19 @@ Allocator::~Allocator() {
 bool Allocator::open(const char* renderNode) {
     drmFd_ = ::open(renderNode, O_RDWR | O_CLOEXEC);
     if (drmFd_ < 0) {
-        std::fprintf(stderr, "[gpu] open %s: %s\n", renderNode, std::strerror(errno));
+        LOG_ERR(Gpu, "open {}: {}", renderNode, std::strerror(errno));
         return false;
     }
     gbm_ = gbm_create_device(drmFd_);
     if (!gbm_) {
-        std::fprintf(stderr, "[gpu] gbm_create_device failed\n");
+        LOG_ERR(Gpu, "gbm_create_device failed");
         return false;
     }
     // Capture the device's dev_t for dmabuf-feedback main_device. Non-fatal if
     // it fails; feedback main_device would then be 0 (clients tolerate it).
     struct stat st{};
     if (::fstat(drmFd_, &st) == 0) deviceId_ = st.st_rdev;
-    else std::perror("[gpu] fstat render node");
+    else LOG_ERR(Gpu, "fstat render node: {}", std::strerror(errno));
     return true;
 }
 
@@ -90,7 +91,7 @@ bool Allocator::probe(const wgpu::Adapter& adapter) {
         wgpu::DawnFormatCapabilities caps{};
         caps.nextInChain = &drmCaps;
         if (adapter.GetFormatCapabilities(fmt, &caps) != wgpu::Status::Success) {
-            std::fprintf(stderr, "[gpu] GetFormatCapabilities failed for fourcc=0x%08x\n", fcc.alpha);
+            LOG_ERR(Gpu, "GetFormatCapabilities failed for fourcc=0x{:08x}", fcc.alpha);
             continue;
         }
 
@@ -137,13 +138,13 @@ bool Allocator::probe(const wgpu::Adapter& adapter) {
                 }
             }
             table_.push_back(FormatTableEntry{fourcc, 0, DRM_FORMAT_MOD_INVALID});
-            std::printf("[gpu] probe fourcc=0x%08x modifiers=%zu (+INVALID)\n",
-                        fourcc, table_.size() - before);
+            LOG_INFO(Gpu, "probe fourcc=0x{:08x} modifiers={} (+INVALID)",
+                     fourcc, table_.size() - before);
         }
     }
 
-    std::printf("[gpu] probe: %zu total format-table entries; primary gbm-usable=%zu\n",
-                table_.size(), modifiers_.size());
+    LOG_INFO(Gpu, "probe: {} total format-table entries; primary gbm-usable={}",
+             table_.size(), modifiers_.size());
 
     return !modifiers_.empty();
 }
@@ -156,19 +157,18 @@ bool Allocator::allocate(uint32_t width, uint32_t height, DmabufBuffer& out) {
         gbm_, width, height, fourcc_, modifiers_.data(), modifiers_.size(),
         GBM_BO_USE_RENDERING);
     if (!bo) {
-        std::fprintf(stderr, "[gpu] gbm_bo_create_with_modifiers2 %ux%u failed\n",
-                     width, height);
+        LOG_ERR(Gpu, "gbm_bo_create_with_modifiers2 {}x{} failed", width, height);
         return false;
     }
     if (gbm_bo_get_plane_count(bo) != 1) {
-        std::fprintf(stderr, "[gpu] multi-plane bo not supported in slice\n");
+        LOG_ERR(Gpu, "multi-plane bo not supported in slice");
         gbm_bo_destroy(bo);
         return false;
     }
 
     int fd = gbm_bo_get_fd_for_plane(bo, 0);
     if (fd < 0) {
-        std::fprintf(stderr, "[gpu] gbm_bo_get_fd_for_plane failed\n");
+        LOG_ERR(Gpu, "gbm_bo_get_fd_for_plane failed");
         gbm_bo_destroy(bo);
         return false;
     }
@@ -181,10 +181,8 @@ bool Allocator::allocate(uint32_t width, uint32_t height, DmabufBuffer& out) {
     out.width = width;
     out.height = height;
 
-    std::printf("[gpu] allocated dmabuf %ux%u fd=%d modifier=0x%016llx stride=%u offset=%u\n",
-                width, height, fd,
-                static_cast<unsigned long long>(out.modifier),
-                out.stride, out.offset);
+    LOG_INFO(Gpu, "allocated dmabuf {}x{} fd={} modifier=0x{:016x} stride={} offset={}",
+             width, height, fd, out.modifier, out.stride, out.offset);
     return true;
 }
 
@@ -208,20 +206,20 @@ bool Allocator::importTexture(const wgpu::Device& device, uint32_t fourcc,
     stmDesc.nextInChain = &dmaDesc;
     outMem = device.ImportSharedTextureMemory(&stmDesc);
     if (!outMem) {
-        std::fprintf(stderr, "[gpu] ImportSharedTextureMemory failed\n");
+        LOG_ERR(Gpu, "ImportSharedTextureMemory failed");
         return false;
     }
 
     wgpu::SharedTextureMemoryProperties props{};
     outMem.GetProperties(&props);
-    std::printf("[gpu] STM props: %ux%u format=%u usage=0x%x\n",
-                props.size.width, props.size.height,
-                static_cast<uint32_t>(props.format),
-                static_cast<uint32_t>(props.usage));
+    LOG_DEBUG(Gpu, "STM props: {}x{} format={} usage=0x{:x}",
+              props.size.width, props.size.height,
+              static_cast<uint32_t>(props.format),
+              static_cast<uint32_t>(props.usage));
 
     outTex = outMem.CreateTexture();
     if (!outTex) {
-        std::fprintf(stderr, "[gpu] SharedTextureMemory.CreateTexture failed\n");
+        LOG_ERR(Gpu, "SharedTextureMemory.CreateTexture failed");
         return false;
     }
     return true;

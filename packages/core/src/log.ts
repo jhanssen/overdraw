@@ -87,20 +87,27 @@ export function installConsoleShim(): void {
     globalThis.console.error = toJsLog(LEVEL.err)   as typeof console.error;
 }
 
-// Parse a `--log-level`/`--log-file` from process.argv (or any argv slice).
-// Returns the values to pass straight into addon.logInit({...}). Unknown
+// Parse `--log-level`/`--log-file`/`--no-log-file` from process.argv (or any
+// argv slice). Returns the values to pass straight into addon.logInit({...}).
+// The file sink is on by default (rotating file in the state dir);
+// `--log-file` overrides its path, `--no-log-file` suppresses it. Unknown
 // flags are ignored; this function does no validation beyond looking for
 // `=`-style flag values. spdlog itself rejects malformed level specs when
 // addon.logInit runs.
-export function parseLogArgs(argv: string[]): { levelSpec?: string; logFile?: string } {
+export function parseLogArgs(argv: string[]): {
+    levelSpec?: string; logFile?: string; noLogFile?: boolean;
+} {
     let levelSpec: string | undefined;
     let logFile: string | undefined;
+    let noLogFile = false;
     for (const a of argv) {
         if (a.startsWith("--log-level=")) levelSpec = a.slice("--log-level=".length);
         else if (a.startsWith("--log-file=")) logFile = a.slice("--log-file=".length);
+        else if (a === "--no-log-file") noLogFile = true;
     }
-    const out: { levelSpec?: string; logFile?: string } = {};
+    const out: { levelSpec?: string; logFile?: string; noLogFile?: boolean } = {};
     if (levelSpec !== undefined) out.levelSpec = levelSpec;
     if (logFile !== undefined) out.logFile = logFile;
+    if (noLogFile) out.noLogFile = true;
     return out;
 }

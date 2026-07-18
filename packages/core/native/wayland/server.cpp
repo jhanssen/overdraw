@@ -1,8 +1,8 @@
 #include "server.h"
 
-#include <cstdio>
-
 #include <wayland-server-core.h>
+
+#include "log/log.h"
 
 namespace overdraw::wayland {
 
@@ -13,13 +13,13 @@ bool Server::start(uv_loop_t* loop) {
 
     display_ = wl_display_create();
     if (!display_) {
-        std::fprintf(stderr, "[wl] wl_display_create failed\n");
+        LOG_ERR(Wayland, "wl_display_create failed");
         return false;
     }
 
     const char* sock = wl_display_add_socket_auto(display_);
     if (!sock) {
-        std::fprintf(stderr, "[wl] add_socket_auto failed\n");
+        LOG_ERR(Wayland, "add_socket_auto failed");
         wl_display_destroy(display_);
         display_ = nullptr;
         return false;
@@ -41,7 +41,7 @@ bool Server::start(uv_loop_t* loop) {
     //    pre-poll flush is the canonical cause of stalled Wayland clients.
     poll_.data = this;
     if (uv_poll_init(loop, &poll_, fd) != 0) {
-        std::fprintf(stderr, "[wl] uv_poll_init failed\n");
+        LOG_ERR(Wayland, "uv_poll_init failed");
         wl_display_destroy(display_);
         display_ = nullptr;
         eventLoop_ = nullptr;
@@ -54,7 +54,7 @@ bool Server::start(uv_loop_t* loop) {
     uv_prepare_start(&prepare_, onPrepare);
 
     started_ = true;
-    std::printf("[wl] server up on %s\n", socketName_.c_str());
+    LOG_INFO(Wayland, "server up on {}", socketName_);
     return true;
 }
 
@@ -63,8 +63,7 @@ void Server::onLoopReadable(uv_poll_t* handle, int status, int) {
     // UV_EBADF); swallowing it turns a reported failure into a silent
     // permanent stall of all client dispatch. Shout instead.
     if (status < 0) {
-        std::fprintf(stderr, "[wl] uv_poll on wayland loop fd died: %s\n",
-                     uv_strerror(status));
+        LOG_ERR(Wayland, "uv_poll on wayland loop fd died: {}", uv_strerror(status));
         return;
     }
     auto* self = static_cast<Server*>(handle->data);
