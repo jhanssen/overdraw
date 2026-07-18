@@ -485,6 +485,11 @@ export interface CompositorSink {
   // capture hangs until an unrelated event repaints. `outputId` null nudges
   // every output (a toplevel-source capture drains on any output's flip).
   requestOutputPresent?(outputId: number | null): void;
+  // Mark every output fully damaged and dirty so the next frame pass
+  // recomposites and presents each one from scratch. Seat re-enable (VT
+  // switch back) uses this: the display no longer shows our content and
+  // per-slot damage accounting is stale, so partial repaints are wrong.
+  repaintAll?(): void;
   // Run a callback once the compositing submit in flight at call time completes on
   // the GPU. The plugin/overlay ring uses this to recycle a consumer slot only
   // after the frame that last sampled it is done (avoids EndAccess racing the read).

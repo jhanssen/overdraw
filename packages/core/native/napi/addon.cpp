@@ -150,6 +150,7 @@ struct Addon {
     napi_ref onScanoutClientFlip = nullptr;   // optional JS callback({outputId,
                                               // latchedBufferId, retiredBufferId})
     napi_ref onScanoutClientReject = nullptr; // optional JS callback({outputId, bufferId})
+    napi_ref onSeatEnabled = nullptr;  // optional JS callback() on libseat enable_seat
     uint64_t lastNotified = 0;
 
     // Host-side reader for the GPU process's log socket. Started after
@@ -255,6 +256,22 @@ void notifyFlipComplete(uint32_t outputId, uint64_t tvSec, uint32_t tvNsec, uint
     napi_create_uint32(env, tvNsec, &args[2]);
     napi_create_uint32(env, seq, &args[3]);
     napi_call_function(env, undefined, cb, 4, args, nullptr);
+    napi_close_handle_scope(env, scope);
+}
+
+// Call the JS onSeatEnabled() callback if registered. Fired on libseat
+// enable_seat (VT switch back). JS marks every output fully damaged so the
+// wake() that follows repaints and re-presents (the post-resume present runs
+// the ALLOW_MODESET commit that reclaims the display). Same-thread.
+void notifySeatEnabled() {
+    if (!g_addon.onSeatEnabled) return;
+    napi_env env = g_addon.env;
+    napi_handle_scope scope;
+    napi_open_handle_scope(env, &scope);
+    napi_value cb, undefined;
+    napi_get_reference_value(env, g_addon.onSeatEnabled, &cb);
+    napi_get_undefined(env, &undefined);
+    napi_call_function(env, undefined, cb, 0, nullptr, nullptr);
     napi_close_handle_scope(env, scope);
 }
 
@@ -1057,8 +1074,12 @@ napi_value Start(napi_env env, napi_callback_info info) {
         //
         // enable_seat (VT switch back): resume libinput (libseat hands us
         // fresh fds via open_restricted), restart the input poll, and tell
-        // the GPU process to resume. The next render's ScanoutPresent will
-        // re-run the ALLOW_MODESET commit.
+        // the GPU process to resume. Nothing else repaints on its own: the
+        // frame loop is event-driven and the last flip-complete was dropped
+        // on pause, and the JS per-output dirty gate would skip every output
+        // (no damage accumulated while away). So notify JS to mark all
+        // outputs fully damaged, then wake() -- the resulting present runs
+        // the ALLOW_MODESET commit that takes the display back.
         g_addon.seat->setCallbacks(
             /*onEnable=*/ []() {
                 if (!g_addon.compositor) return;
@@ -1071,6 +1092,8 @@ napi_value Start(napi_env env, napi_callback_info info) {
                     uv_poll_start(&g_addon.inputPoll, UV_READABLE, onInputReadable);
                 }
                 g_addon.compositor->resumeOutput();
+                notifySeatEnabled();
+                wake();
             },
             /*onDisable=*/ []() {
                 if (!g_addon.compositor) return;
@@ -2254,6 +2277,10 @@ napi_value Stop(napi_env env, napi_callback_info) {
         napi_delete_reference(env, g_addon.onScanoutClientReject);
         g_addon.onScanoutClientReject = nullptr;
     }
+    if (g_addon.onSeatEnabled) {
+        napi_delete_reference(env, g_addon.onSeatEnabled);
+        g_addon.onSeatEnabled = nullptr;
+    }
     // Release the keymaps. The default is built on demand by ensureKeymap()
     // from either keymapInfo (client wl_keyboard bind) or keyUpdate (host
     // key-down); a subsequent start()/stop() cycle must see fresh state.
@@ -2593,6 +2620,16 @@ void replaceCallbackRef(napi_env env, napi_callback_info info, napi_ref& ref) {
 // 60Hz even when a 240Hz output is also flipping. Pass null/omit to clear.
 napi_value SetOnFlipComplete(napi_env env, napi_callback_info info) {
     replaceCallbackRef(env, info, g_addon.onFlipComplete);
+    napi_value u; napi_get_undefined(env, &u); return u;
+}
+
+// setOnSeatEnabled(cb) -> undefined
+// Register a JS callback fired when libseat re-enables the seat (VT switch
+// back). No payload. The handler marks every output fully damaged so the
+// native wake() that follows the callback repaints and re-presents. Never
+// fires in nested/headless mode (no seat). Pass null/omit to clear.
+napi_value SetOnSeatEnabled(napi_env env, napi_callback_info info) {
+    replaceCallbackRef(env, info, g_addon.onSeatEnabled);
     napi_value u; napi_get_undefined(env, &u); return u;
 }
 
@@ -3579,6 +3616,7 @@ napi_value Init(napi_env env, napi_value exports) {
     reg("writeProducerBegin", WriteProducerBegin);
     reg("writeProducerEnd", WriteProducerEnd);
     reg("pluginReleaseSurfaceBuffer", PluginReleaseSurfaceBuffer);
+    reg("setOnSeatEnabled", SetOnSeatEnabled);
     reg("setOnOutputDescriptor", SetOnOutputDescriptor);
     reg("setOnOutputAdded", SetOnOutputAdded);
     reg("setOnOutputRemoved", SetOnOutputRemoved);

@@ -2935,6 +2935,16 @@ export class JsCompositor implements CompositorSink {
     this.outputDamage.full();
   }
 
+  // Mark every output fully damaged AND dirty so the next frame pass
+  // recomposites and presents each one from scratch. Used on seat re-enable
+  // (VT switch back): the display shows whatever the console left, the ring
+  // slots restart rotation from slot 0, and per-slot damage accounting no
+  // longer matches what each slot last showed -- only a full repaint of
+  // every slot is correct.
+  repaintAll(): void {
+    this.damageFull();
+  }
+
   // Fire the per-output render gate without geometry so the next frame
   // presents (and emits a flip-complete). See CompositorHooks.requestOutputPresent
   // for why screen capture needs this. markDirty leaves each slot's own damage

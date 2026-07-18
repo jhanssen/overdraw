@@ -238,3 +238,34 @@ test("anchored damage ignores the camera (cursor / layer shell)", () => {
   assert.deepEqual(m.take(0, SLOT_0),
     { mode: "partial", box: { x: 10, y: 10, w: 5, h: 5 } });
 });
+
+// --- dirty bit (the per-output render gate's predicate) ---
+
+test("full() from a clean idle state marks every output dirty and stale", () => {
+  // Seat re-enable (VT switch back) relies on exactly this: after a
+  // clearDirty on every output (idle desktop), full() must both set the
+  // dirty bit (so the render gate fires at all) and reset every ring (so
+  // the repaint is whole-output, not the stale partial accounting).
+  const m = new OutputDamageMap();
+  m.setOutputs([out(0, 0, 0, 100, 100), out(1, 100, 0, 100, 100)]);
+  m.full();
+  m.take(0, SLOT_0); m.take(1, SLOT_0);
+  m.clearDirty(0); m.clearDirty(1);
+  assert.equal(m.isDirty(0), false);
+  assert.equal(m.isDirty(1), false);
+
+  m.full();
+  assert.equal(m.isDirty(0), true);
+  assert.equal(m.isDirty(1), true);
+  assert.deepEqual(m.take(0, SLOT_0), { mode: "full" });
+  assert.deepEqual(m.take(1, SLOT_0), { mode: "full" });
+});
+
+test("clearDirty drops only the named output's dirty bit", () => {
+  const m = new OutputDamageMap();
+  m.setOutputs([out(0, 0, 0, 100, 100), out(1, 100, 0, 100, 100)]);
+  m.full();
+  m.clearDirty(0);
+  assert.equal(m.isDirty(0), false);
+  assert.equal(m.isDirty(1), true);
+});

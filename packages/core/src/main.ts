@@ -285,6 +285,16 @@ addon.setOnScanoutClientReject?.((m) => {
   compositor.handleScanoutClientReject?.(m.outputId, m.bufferId);
 });
 
+// Seat re-enable (VT switch back, KMS only): the display shows console
+// content and no damage accumulated while away, so the per-output dirty
+// gate would skip every output forever. Full-damage everything; the native
+// side wake()s right after this callback, and that present re-runs the
+// ALLOW_MODESET commit that takes the display back.
+addon.setOnSeatEnabled?.(() => {
+  log.info("core", "seat re-enabled; full repaint of all outputs");
+  compositor.repaintAll?.();
+});
+
 // Install the built-in default cursor. The XCursor theme
 // resolver picks up XCURSOR_THEME / XCURSOR_SIZE from env; for
 // 'default' the resolver always succeeds (built-in 16x16 fallback

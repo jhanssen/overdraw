@@ -508,6 +508,13 @@ export interface Addon {
     outputId: number; bufferId: number;
   }) => void) | null): void;
   scanoutFormatIndices?(outputId: number): number[];
+  // Register a callback fired when libseat re-enables the seat (VT switch
+  // back). No payload. The handler marks every output fully damaged; the
+  // native side wake()s right after the callback so the repaint presents
+  // (and that present re-runs the ALLOW_MODESET commit reclaiming the
+  // display). Never fires in nested/headless (no seat). Optional: absent
+  // on test sinks and non-KMS builds. Pass null to clear.
+  setOnSeatEnabled?(cb: (() => void) | null): void;
   // Update the input backend's view of the multi-output layout (used for
   // pointer-space mapping and cursor clamping). Rects are in global logical
   // pixels. Called whenever state.outputs changes. Silent no-op if no input
