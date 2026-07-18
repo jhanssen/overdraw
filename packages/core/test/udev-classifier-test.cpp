@@ -1,19 +1,22 @@
-// Native unit test for the udev action classifier. GPU-free / no daemon
-// dependency: feeds raw (action, HOTPLUG, CONNECTOR) property strings into
-// the pure classifyUdevAction + parseConnectorIdHint helpers and asserts the
-// kind / hint. Wired into `npm test` via test/udev-classifier.test.js, which
-// spawns this binary and asserts PASS on stdout. Exit code: 0 = PASS,
-// non-zero = FAIL.
+// Native unit test for the udev action classifier and the hotplug-adjacent
+// link-status guards. GPU-free / no daemon dependency: feeds raw (action,
+// HOTPLUG, CONNECTOR) property strings into the pure classifyUdevAction +
+// parseConnectorIdHint helpers and asserts the kind / hint, and drives
+// connectorLinkStatusBad through its no-DRM guard paths. Wired into
+// `npm test` via test/udev-classifier.test.js, which spawns this binary and
+// asserts PASS on stdout. Exit code: 0 = PASS, non-zero = FAIL.
 //
 // Mirrors wire-barrier-test.cpp / wire-barrier.test.js.
 
 #include <cstdio>
 #include <cstdlib>
 
+#include "drm_utils.h"
 #include "udev_monitor.h"
 
 using overdraw::gpu::UdevHotplugEvent;
 using overdraw::gpu::classifyUdevAction;
+using overdraw::gpu::connectorLinkStatusBad;
 using overdraw::gpu::parseConnectorIdHint;
 
 namespace {
@@ -81,6 +84,20 @@ void caseConnectorIdHint() {
     CHECK(parseConnectorIdHint("  7") == 7u);
 }
 
+// link-status guards. A connector with no link-status property (propId 0 --
+// nested outputs, non-DP sinks, older drivers) must never read as bad, or
+// rescan() would recycle healthy outputs on every hotplug event. Same for an
+// unreadable device: failure to read is not evidence of a bad link. The
+// BAD-detection path itself needs a kernel that flags a real link failure and
+// is verified manually (see docs/status.md).
+void caseLinkStatusGuards() {
+    g_currentCase = "linkStatusGuards";
+    // propId 0: early-out before any DRM call (fd deliberately invalid).
+    CHECK(connectorLinkStatusBad(-1, 1, 0) == false);
+    // Unreadable fd with a nonzero propId: read fails -> not bad.
+    CHECK(connectorLinkStatusBad(-1, 1, 7) == false);
+}
+
 }  // namespace
 
 int main() {
@@ -89,6 +106,7 @@ int main() {
     caseCardLifecycle();
     caseUnknownAction();
     caseConnectorIdHint();
+    caseLinkStatusGuards();
 
     if (g_failures == 0) {
         std::printf("PASS udev-classifier-test\n");

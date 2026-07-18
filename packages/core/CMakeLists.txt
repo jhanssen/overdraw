@@ -459,10 +459,12 @@ target_link_libraries(log-test PRIVATE overdraw_log)
 if(OVERDRAW_KMS)
     add_executable(udev-classifier-test
         test/udev-classifier-test.cpp
-        gpu-process/src/udev_monitor.cpp)
+        gpu-process/src/udev_monitor.cpp
+        gpu-process/src/drm_utils.cpp)
     target_include_directories(udev-classifier-test PRIVATE
-        gpu-process/src ${LIBUDEV_INCLUDE_DIRS})
-    target_link_libraries(udev-classifier-test PRIVATE ${LIBUDEV_LIBRARIES})
+        gpu-process/src ${LIBUDEV_INCLUDE_DIRS} ${LIBDRM_INCLUDE_DIRS})
+    target_link_libraries(udev-classifier-test PRIVATE
+        overdraw_log ${LIBUDEV_LIBRARIES} ${LIBDRM_LIBRARIES})
 endif()
 
 # ---- dmabuf test client (linux-dmabuf-v1 import + composite) ----

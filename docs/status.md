@@ -529,6 +529,15 @@ dmabuf-interop service.
   migration recompute, cross-fd race fix). Steps 6-7 remain (verify
   wl_surface.leave / global_remove ordering with a real client;
   `ScanoutRebuild` plumbing for mode change). M8 (multi-GPU) remains.
+- **Bad-link recovery (monitor power-cycle without HPD drop):**
+  `rescan()` reads each still-connected connector's `link-status`
+  property; BAD forces a disconnect/reconnect in the same rescan
+  (OutputRemoved + OutputAdded), whose initial `ALLOW_MODESET` commit
+  also writes link-status GOOD so the kernel retrains. Guard paths
+  (absent property / unreadable device never report bad) are unit
+  tested; the BAD path itself cannot be induced from userspace and is
+  **verified manually only** -- power-cycle a DP monitor overnight and
+  check the state-dir log for "link-status BAD; recycling output".
 - **Workspace plugin authoritative for per-output ordered visible
   windows** -- layout-driver, `windowAt`, `focusOrder` all read from
   `state.outputToplevelStacks`.

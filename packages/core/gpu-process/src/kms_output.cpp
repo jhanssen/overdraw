@@ -572,29 +572,44 @@ KmsOutputBackend::RescanResult KmsOutputBackend::rescan() {
     // currently reports connection==CONNECTED with a usable mode.
     auto live = enumerateConnectors(drmFd_);
 
-    // Index live connectors by id for fast lookup, and build the
-    // already-claimed connector set for phase 4 dedup.
+    // Index live connectors by id for fast lookup.
     std::unordered_map<uint32_t, const ConnectorInfo*> liveById;
     liveById.reserve(live.size());
     for (const auto& c : live) liveById.emplace(c.connectorId, &c);
 
-    std::unordered_set<uint32_t> claimedConnectors;
-    claimedConnectors.reserve(outputs_.size());
-    for (const auto& [id, o] : outputs_) claimedConnectors.insert(o->topo.connectorId);
-
-    // Phase 2: disconnect-vanished. An output's connector that is no longer
-    // in the live set goes away. Iterate over a snapshot of ids so we can
-    // erase from outputs_ during the walk.
+    // Phase 2: disconnect-vanished + recycle-bad-link. An output's connector
+    // that is no longer in the live set goes away. A connector that is still
+    // connected but whose link-status property reads BAD needs the link
+    // re-trained: the kernel signals this (hotplug uevent, connector still
+    // CONNECTED) after e.g. a DP monitor power-cycles without dropping HPD,
+    // and the only recovery is a fresh ALLOW_MODESET commit. Force the full
+    // disconnect/reconnect cycle -- phase 4 re-adds the connector, and the
+    // re-added output's initial commit re-modesets and writes link-status
+    // GOOD. Iterate over a snapshot of ids so we can erase from outputs_
+    // during the walk.
     std::vector<uint32_t> ids = outputIds();
     for (uint32_t id : ids) {
         const auto it = outputs_.find(id);
         if (it == outputs_.end()) continue;
-        const uint32_t connId = it->second->topo.connectorId;
-        if (liveById.find(connId) == liveById.end()) {
-            result.removed.push_back(id);
-            disconnectOutput(id);
+        const auto& topo = it->second->topo;
+        const bool vanished = liveById.find(topo.connectorId) == liveById.end();
+        if (!vanished && !connectorLinkStatusBad(drmFd_, topo.connectorId,
+                                                 topo.connectorProps.link_status)) {
+            continue;
         }
+        if (!vanished) {
+            LOG_WARN(Gpu, "[kms] connector {} link-status BAD; recycling output {} to force a modeset",
+                     topo.connectorName, id);
+        }
+        result.removed.push_back(id);
+        disconnectOutput(id);
     }
+
+    // Built after phase 2 so a just-recycled connector is not counted as
+    // claimed -- phase 4 must pick it back up in this same rescan.
+    std::unordered_set<uint32_t> claimedConnectors;
+    claimedConnectors.reserve(outputs_.size());
+    for (const auto& [id, o] : outputs_) claimedConnectors.insert(o->topo.connectorId);
 
     // Phase 3: recheck-CRTCs is currently a no-op for already-assigned
     // outputs (see RescanResult docstring for the limitation). Phase 4
@@ -971,6 +986,11 @@ bool KmsOutputBackend::presentOutputImpl(PerOutput& o, int slotIdx, int inFenceF
         if (!o.didInitialCommit) {
             // First commit also sets up CRTC + connector + mode.
             add(topo.connectorId, topo.connectorProps.crtc_id, topo.crtcId);
+            // Writing GOOD on a modeset tells the kernel to retrain the link
+            // if it had flagged it BAD (add() no-ops when the connector has
+            // no link-status property).
+            add(topo.connectorId, topo.connectorProps.link_status,
+                DRM_MODE_LINK_STATUS_GOOD);
             // Takeover: a previous DRM master (another compositor on another
             // VT) may have left cursor/overlay planes latched on this CRTC
             // with its final image -- a hardware cursor frozen at its last

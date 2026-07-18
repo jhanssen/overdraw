@@ -370,6 +370,7 @@ bool resolveProperties(int drmFd, DrmTopology& topo) {
     walkProperties(drmFd, topo.connectorId, DRM_MODE_OBJECT_CONNECTOR,
         [&](const char* name, uint64_t, const drmModePropertyRes* p) {
             if (std::strcmp(name, "CRTC_ID") == 0) { topo.connectorProps.crtc_id = p->prop_id; okConn = true; }
+            else if (std::strcmp(name, "link-status") == 0) topo.connectorProps.link_status = p->prop_id;
         });
     walkProperties(drmFd, topo.crtcId, DRM_MODE_OBJECT_CRTC,
         [&](const char* name, uint64_t, const drmModePropertyRes* p) {
@@ -496,6 +497,23 @@ bool readEdid(int drmFd, uint32_t connectorId, EdidInfo& out) {
 
     drmModeFreePropertyBlob(blob);
     return true;
+}
+
+bool connectorLinkStatusBad(int drmFd, uint32_t connectorId,
+                            uint32_t linkStatusPropId) {
+    if (linkStatusPropId == 0) return false;
+    drmModeObjectProperties* props = drmModeObjectGetProperties(
+        drmFd, connectorId, DRM_MODE_OBJECT_CONNECTOR);
+    if (!props) return false;
+    bool bad = false;
+    for (uint32_t i = 0; i < props->count_props; ++i) {
+        if (props->props[i] == linkStatusPropId) {
+            bad = props->prop_values[i] == DRM_MODE_LINK_STATUS_BAD;
+            break;
+        }
+    }
+    drmModeFreeObjectProperties(props);
+    return bad;
 }
 
 std::vector<PlaneFormatModifier>

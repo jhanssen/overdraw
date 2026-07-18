@@ -48,7 +48,8 @@ struct DrmTopology {
 
     // Property ids cached for atomic commits. 0 = property absent on object.
     struct {
-        uint32_t crtc_id = 0;       // on connector: which CRTC drives it
+        uint32_t crtc_id     = 0;   // on connector: which CRTC drives it
+        uint32_t link_status = 0;   // on connector: DP link health (optional)
     } connectorProps;
     struct {
         uint32_t mode_id = 0;       // on CRTC: the mode blob id
@@ -186,6 +187,15 @@ bool resolveProperties(int drmFd, DrmTopology& topo);
 // Read the connector's EDID blob and extract physical dims + product name.
 // Returns true if the EDID was readable; missing fields stay zero/empty.
 bool readEdid(int drmFd, uint32_t connectorId, EdidInfo& out);
+
+// True when the connector's link-status property currently reads BAD. The
+// kernel flags this (with a hotplug uevent) when the sink needs the link
+// re-trained -- typically a DP monitor power-cycled without dropping HPD.
+// Recovery is a fresh ALLOW_MODESET commit that also writes link-status
+// GOOD. False when the property is absent (linkStatusPropId == 0) or the
+// read fails.
+bool connectorLinkStatusBad(int drmFd, uint32_t connectorId,
+                            uint32_t linkStatusPropId);
 
 // Read the plane's IN_FORMATS property and return the (format, modifier)
 // list it advertises. Returns an empty vector if the property is absent
