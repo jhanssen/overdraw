@@ -2319,8 +2319,14 @@ napi_value StartServer(napi_env env, napi_callback_info) {
 }
 
 napi_value StopServer(napi_env env, napi_callback_info) {
-    if (g_addon.trampoline) g_addon.trampoline.reset();
+    // Order matters: live wl_resources hold raw pointers into the trampoline
+    // (dispatcher InterfaceState, per-resource destroy listeners), and the
+    // display is what invokes them. Destroy the server (and with it the
+    // display) first so nothing can dispatch into -- or fire a destroy
+    // listener on -- a freed trampoline; only then drop the trampoline and
+    // the registry its dispatch path reads.
     if (g_addon.server) { g_addon.server->stop(); g_addon.server.reset(); }
+    if (g_addon.trampoline) g_addon.trampoline.reset();
     g_addon.registry.reset();
     napi_value undef; napi_get_undefined(env, &undef);
     return undef;

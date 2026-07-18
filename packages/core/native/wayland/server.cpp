@@ -77,7 +77,11 @@ void Server::onLoopReadable(uv_poll_t* handle, int status, int) {
 }
 
 void Server::drainEvents() {
-    if (!eventLoop_) return;
+    // started_ drops at the top of stop(), whose close-drain uv_run spin can
+    // re-enter here through unrelated uv callbacks (e.g. the ctrl poll's
+    // frame-complete path). Dispatching client requests mid-teardown would
+    // reach handler state that is being destroyed.
+    if (!started_ || !eventLoop_) return;
     wl_event_loop_dispatch(eventLoop_, 0);  // 0 = non-blocking
     wl_display_flush_clients(display_);
 }
@@ -109,8 +113,14 @@ void Server::stop() {
     uv_loop_t* loop = poll_.loop;
     while (pending > 0) uv_run(loop, UV_RUN_NOWAIT);
     if (display_) {
+        // Destroy remaining clients before the display, as libwayland
+        // requires. Their resources' destroy listeners fire here (trampoline
+        // wrapper invalidation, bound-resource bookkeeping), so the caller
+        // must keep the trampoline alive until stop() returns.
+        wl_display_destroy_clients(display_);
         wl_display_destroy(display_);
         display_ = nullptr;
+        eventLoop_ = nullptr;
     }
 }
 
