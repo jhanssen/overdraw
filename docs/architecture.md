@@ -1602,6 +1602,14 @@ is still there the next morning. `--log-file=PATH` overrides the path;
 `--no-log-file` disables the sink. The file sink accepts all levels
 (subject to per-area runtime filtering).
 
+The file appends across runs (rotation is size-triggered only), so
+each `logInit` that attaches a file sink emits a session-start banner
+(`==== overdraw session start pid=N ====`) as the boundary between
+runs; the banner bypasses per-area level filters so it survives e.g.
+`--log-level=err`. The file and ring patterns carry the date
+(`%Y-%m-%d`) in addition to time-of-day — both outlive a single day,
+unlike stdout/stderr, which keep the compact time-only pattern.
+
 A fourth **ring sink** keeps the last 256 formatted records in a fixed
 in-memory ring (`native/log/ring_sink.{h,cpp}`). It exists for crash
 reports: the crash handler appends the ring's contents to the report so

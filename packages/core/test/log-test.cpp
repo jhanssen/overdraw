@@ -319,9 +319,11 @@ void caseIpcSourceReceives() {
 
     // Initialize global registry with stdout sinks suppressed (level=off) so
     // dispatched records do NOT print to stdout during the test (which would
-    // disrupt the final PASS line).
+    // disrupt the final PASS line). disableFile keeps the default file sink
+    // from writing into the developer's real state dir.
     Config cfg{};
     cfg.defaultLevel = spdlog::level::off;
+    cfg.disableFile = true;
     overdraw::log::logInit(cfg);
 
     overdraw::log::IpcSource src;
@@ -374,6 +376,28 @@ void casePathsResolution() {
     CHECK(overdraw::log::logsDir() == xdg + "/overdraw/logs");
     CHECK(std::filesystem::is_directory(xdg + "/overdraw/logs"));
     ::unsetenv("XDG_STATE_HOME");
+
+    std::filesystem::remove_all(tmp);
+}
+
+void caseSessionBanner() {
+    g_currentCase = "sessionBanner";
+    const std::string tmp = makeTempDir();
+    const std::string path = tmp + "/session.log";
+
+    Config cfg{};
+    cfg.defaultLevel = spdlog::level::off;  // banner must bypass area filters
+    cfg.filePath = path;
+    overdraw::log::logInit(cfg);
+    overdraw::log::logInit(cfg);  // second "run": file reopens in append mode
+
+    const std::string text = readWholeFile(path);
+    const size_t first = text.find("==== overdraw session start pid=");
+    CHECK(first != std::string::npos);
+    // One banner per logInit -- the boundary marker between appended runs.
+    CHECK(text.find("==== overdraw session start pid=", first + 1) != std::string::npos);
+    // File-sink pattern carries the date (YYYY-MM-DD ...).
+    CHECK(text.size() > 10 && text[4] == '-' && text[7] == '-');
 
     std::filesystem::remove_all(tmp);
 }
@@ -484,6 +508,7 @@ int main() {
     caseSinkRingOverflow();
     caseIpcSourceReceives();
     casePathsResolution();
+    caseSessionBanner();
     caseRingCaptureAndDump();
     caseCrashReportPrune();
     caseCrashReportOnSegv();

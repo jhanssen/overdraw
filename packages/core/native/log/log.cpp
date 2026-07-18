@@ -3,6 +3,8 @@
 #include <array>
 #include <cstdio>
 #include <cstring>
+
+#include <unistd.h>
 #include <mutex>
 #include <sstream>
 #include <string>
@@ -56,12 +58,20 @@ private:
     spdlog::level::level_enum ceiling_;
 };
 
-std::shared_ptr<spdlog::sinks::dist_sink_mt> buildSinks(const Config& cfg) {
+struct BuiltSinks {
+    std::shared_ptr<spdlog::sinks::dist_sink_mt> dist;
+    std::shared_ptr<spdlog::sinks::sink> file;  // null when no file sink attached
+    std::shared_ptr<RingSink> ring;
+};
+
+BuiltSinks buildSinks(const Config& cfg) {
     auto dist = std::make_shared<spdlog::sinks::dist_sink_mt>();
+    BuiltSinks out{dist, nullptr, nullptr};
 
     // Crash-context ring rides along in every mode (including the GPU
     // process's sender mode) so a crash report always has recent records.
-    dist->add_sink(std::make_shared<RingSink>());
+    out.ring = std::make_shared<RingSink>();
+    dist->add_sink(out.ring);
 
     if (cfg.senderSink) {
         // Sender mode (GPU process): the IPC sink instead of stdout/stderr/
@@ -94,6 +104,7 @@ std::shared_ptr<spdlog::sinks::dist_sink_mt> buildSinks(const Config& cfg) {
                     auto fileSink = std::make_shared<spdlog::sinks::rotating_file_sink_mt>(
                         path, /*max_size=*/8u * 1024 * 1024, /*max_files=*/3);
                     dist->add_sink(fileSink);
+                    out.file = fileSink;
                 } catch (const spdlog::spdlog_ex& e) {
                     std::fprintf(stderr, "overdraw: log file sink at %s unavailable: %s\n",
                                  path.c_str(), e.what());
@@ -104,7 +115,12 @@ std::shared_ptr<spdlog::sinks::dist_sink_mt> buildSinks(const Config& cfg) {
 
     // Compact pattern: time, level, area (via logger name), message.
     dist->set_pattern("%H:%M:%S.%e %^%-5l%$ [%n] %v");
-    return dist;
+    // The file outlives the session and the ring lands in crash reports, so
+    // both carry the date; a time-of-day-only line is ambiguous across days.
+    // Set AFTER the dist-wide pattern (set_pattern propagates to every sink).
+    if (out.file) out.file->set_pattern("%Y-%m-%d %H:%M:%S.%e %-5l [%n] %v");
+    out.ring->set_pattern("%Y-%m-%d %H:%M:%S.%e %-5l [%n] %v");
+    return out;
 }
 
 }  // namespace
@@ -195,7 +211,8 @@ bool parseLevelSpec(std::string_view spec, Config* out, std::string* err) {
 }
 
 void logInit(const Config& cfg) {
-    auto sinks = buildSinks(cfg);
+    auto built = buildSinks(cfg);
+    const auto& sinks = built.dist;
 
     auto& r = registry();
     std::lock_guard<std::mutex> lk(r.mu);
@@ -220,6 +237,19 @@ void logInit(const Config& cfg) {
     }
     // Real loggers are installed; release the preinit fallback.
     r.fallback.reset();
+
+    // Session-start banner, emitted only when a file sink is attached: the
+    // file spans multiple runs, so a reader needs an explicit boundary to
+    // tell where one session ends and the next begins (stdout/stderr have
+    // natural process boundaries; the GPU process's sender mode has no
+    // file). Bypasses the per-area level filters via a transient logger so
+    // the banner survives e.g. --log-level=err.
+    if (built.file) {
+        auto banner = std::make_shared<spdlog::logger>("core", sinks);
+        banner->set_level(spdlog::level::trace);
+        banner->info("==== overdraw session start pid={} ====", ::getpid());
+        banner->flush();
+    }
 }
 
 void logShutdown() {
