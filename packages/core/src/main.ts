@@ -15,6 +15,7 @@ import { dirname, join, isAbsolute, resolve as resolvePath } from "node:path";
 import { globSync } from "node:fs";
 
 import { installProtocols } from "./protocols/index.js";
+import { titleAppId } from "./query.js";
 import { makeOutputForOutput as makeWlOutputForOutput } from "./protocols/wl_output.js";
 import { updateAllSurfaceResidency } from "./protocols/surface-residency.js";
 import { rebuildStackWithPopups } from "./protocols/xdg_popup.js";
@@ -1667,6 +1668,74 @@ log.info("core", `plugins: ${summary.length > 0 ? summary : "(none)"}`);
     show: (index, outputId) =>
       rt.invokeNamespace("workspace", "show", [index, outputId]),
   };
+}
+
+// Host query actions: read-only introspection served over IPC (overdrawctl
+// invoke query.* / overdrawctl query <topic>). These run on the main thread
+// with direct access to protocol state, the WM, and the compositor -- data
+// no plugin SDK surface reaches.
+{
+  const rt = runtime;
+  const surfaceRole = (surfaceId: number): string | null => {
+    for (const s of state.surfaces.values()) {
+      if (s.id === surfaceId) return s.role;
+    }
+    return null;
+  };
+  rt.registerHostAction({
+    name: "query.state",
+    description: "Snapshot of outputs (geometry, mode, scale, camera), " +
+      "windows (rects, insets, window state, title/app id), the WM stack " +
+      "order, and keyboard/pointer focus. Read-only; no params.",
+    handler: () => {
+      const outputs = [...(state.outputs?.values() ?? [])]
+        .sort((a, b) => a.id - b.id)
+        .map((o) => ({
+          id: o.id, name: o.name, edidId: o.edidId,
+          make: o.make, model: o.model,
+          x: o.logicalPosition.x, y: o.logicalPosition.y,
+          width: o.logicalSize.width, height: o.logicalSize.height,
+          deviceWidth: o.deviceSize.width, deviceHeight: o.deviceSize.height,
+          scale: o.scale, refreshMhz: o.refreshMhz, transform: o.transform,
+          camera: {
+            x: state.outputCameras?.get(o.id)?.x ?? 0,
+            y: state.outputCameras?.get(o.id)?.y ?? 0,
+            zoom: state.outputCameras?.get(o.id)?.zoom ?? 1,
+          },
+        }));
+      const windows = (state.wm?.listSnapshots() ?? []).map((snap) => ({
+        ...snap,
+        ...titleAppId(state, snap.surfaceId),
+        role: surfaceRole(snap.surfaceId),
+      }));
+      const result = {
+        outputs, windows,
+        stack: windows.map((w) => w.surfaceId),
+        focus: {
+          keyboard: state.seat?.kbFocus?.surfaceId ?? null,
+          pointer: state.seat?.focus?.surfaceId ?? null,
+        },
+        xwaylandScale: state.xwaylandScale ?? null,
+      };
+      // The snapshot is JSON-safe by construction (WindowSnapshot's plugin
+      // KV `state` arrives structured-clone-safe over postMessage).
+      // eslint-disable-next-line no-restricted-syntax
+      return result as unknown as import("./plugins/protocol.js").Json;
+    },
+  });
+  rt.registerHostAction({
+    name: "query.render",
+    description: "Per-output render diagnostics: the draw list (bottom to " +
+      "top, each entry labeled backdrop/content/phantom/layer/cursor with " +
+      "its rect) and direct-scanout status (latched buffer, in-flight " +
+      "present, vetoed buffers, hardware cursor). Read-only; no params.",
+    handler: () => {
+      const snap = compositor.introspect?.();
+      if (!snap) throw new Error("query.render: compositor sink has no introspection");
+      // eslint-disable-next-line no-restricted-syntax
+      return snap as unknown as import("./plugins/protocol.js").Json;
+    },
+  });
 }
 
 // IPC server: JSON-RPC 2.0 over a Unix socket. Plugins register actions and

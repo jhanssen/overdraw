@@ -608,6 +608,17 @@ Backed by the action registry and event bus directly — no IPC plugin
 required. `overdrawctl` is a thin client tool that ships with overdraw and
 maps CLI invocations to JSON-RPC.
 
+Besides plugin actions, the launcher registers **host actions**
+(`PluginRuntime.registerHostAction`): same registry, same naming rules and
+`list-actions` visibility, but the handler runs on the main thread — for
+read-only queries over state no plugin SDK surface reaches (protocol state,
+the WM, the compositor sink). Built on it: `query.state` (outputs, windows
+with rects/insets/window state/title, stack, focus) and `query.render`
+(per-output draw order labeled by stack segment + direct-scanout status).
+`overdrawctl query <topic>` is shorthand for `invoke query.<topic>`.
+Mutating actions stay in plugins + bus events; host actions are the
+introspection escape hatch.
+
 Authentication: filesystem permissions on the socket. No token / further
 auth in v1.
 

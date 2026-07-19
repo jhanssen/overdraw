@@ -985,6 +985,13 @@ active; failure demotes).
 `$XDG_RUNTIME_DIR/overdraw-<display>.sock` (mode 0700) with methods
 `invoke`/`list-actions`/`subscribe`/`unsubscribe`. CLI:
 `overdrawctl`. Authentication is filesystem permissions only.
+Host actions (`PluginRuntime.registerHostAction`): main-thread action
+handlers sharing the plugin action registry, for state only the
+launcher reaches. Built on it: `query.state` (outputs + windows with
+rects/insets/window-state/title/appId + stack + focus) and
+`query.render` (per-output labeled draw order + direct-scanout
+status: latched buffer, in-flight present, vetoes, hw cursor);
+`overdrawctl query state|render` is the CLI shorthand.
 
 **Deferred refs:** `{ $ref: "focusedWindow" }` etc. in action
 params resolve at invoke time from core state (

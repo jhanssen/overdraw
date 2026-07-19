@@ -416,7 +416,7 @@ fn sampleClamped(t : texture_2d<f32>, uv : vec2f) -> vec4f {
 }
 `;
 
-import type { CompositorSink, Layer } from "../protocols/ctx.js";
+import type { CompositorSink, CompositorIntrospection, Layer } from "../protocols/ctx.js";
 import { LAYER_ORDER, OUTPUT_DEFAULT } from "../protocols/ctx.js";
 import { OutputDamageMap } from "./output-damage-map.js";
 import { logicalContentSize } from "../surface-geometry.js";
@@ -1687,6 +1687,52 @@ export class JsCompositor implements CompositorSink {
       }
     }
     return out;
+  }
+
+  introspect(): CompositorIntrospection {
+    const backdrops = new Set(this.backdropIds);
+    const phantoms = new Set(this.phantoms);
+    const layerOf = new Map<number, Layer>();
+    for (const [layer, ids] of this.layers) {
+      for (const id of ids) layerOf.set(id, layer);
+    }
+    const outputs: CompositorIntrospection["outputs"] = [];
+    for (const o of this.outputsGeom.values()) {
+      const drawList: CompositorIntrospection["outputs"][number]["drawList"] = [];
+      for (const id of this.drawOrder(o.id)) {
+        const s = this.surfaces.get(id);
+        // Effective on-screen size: the WM layout size, or the intrinsic
+        // buffer/viewport size for size-from-intrinsic entries (subsurfaces).
+        const bs = s ? (s.bufferScale || 1) : 1;
+        const w = s ? (s.layoutW > 0 ? s.layoutW
+          : (s.viewportDst?.width ?? s.viewportSrc?.width ?? s.width / bs)) : 0;
+        const h = s ? (s.layoutH > 0 ? s.layoutH
+          : (s.viewportDst?.height ?? s.viewportSrc?.height ?? s.height / bs)) : 0;
+        const kind = backdrops.has(id) ? "backdrop"
+          : phantoms.has(id) ? "phantom"
+          : layerOf.has(id) ? "layer"
+          : id === this.cursorTargetSurfaceId ? "cursor"
+          : "content";
+        const layer = layerOf.get(id);
+        drawList.push({
+          id, kind,
+          ...(layer !== undefined ? { layer } : {}),
+          x: s?.x ?? 0, y: s?.y ?? 0, width: w, height: h,
+          hasBuffer: !!s?.texture,
+        });
+      }
+      outputs.push({
+        outputId: o.id,
+        drawList,
+        scanout: {
+          latchedBufferId: this.scanoutActive.get(o.id) ?? null,
+          flipPending: this.scanoutFlipPending.has(o.id),
+          vetoedBufferIds: [...(this.scanoutVeto.get(o.id) ?? [])],
+        },
+        hwCursor: this.hwCursorActive.has(o.id),
+      });
+    }
+    return { directScanout: this.directScanoutEnabled, outputs };
   }
 
   setSurfaceLayout(id: number, x: number, y: number, w: number, h: number): void {

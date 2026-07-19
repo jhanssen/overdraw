@@ -49,6 +49,11 @@ Commands:
                                 line as JSON). Pattern grammar matches the bus:
                                 exact ('window.map'), prefix-glob ('workspace.*'),
                                 or catch-all ('*').
+  query <topic>                 Shorthand for: invoke query.<topic>. Topics:
+                                  state   outputs, windows (rects, insets,
+                                          window state, titles), stack, focus
+                                  render  per-output draw order + direct-scanout
+                                          status
   switch-mode --output NAME --mode WxH[@RATE]
                                 Switch a KMS output to a new mode. NAME is the
                                 connector name (e.g. 'DP-1') OR the durable EDID
@@ -175,6 +180,10 @@ function parseArgs(argv: string[]): Args {
     return { command: "invoke", socket, action, actionArgs };
   }
   if (cmd === "list-actions") return { command: "list-actions", socket };
+  if (cmd === "query") {
+    if (positional.length < 2) die("query requires a topic (try --help)");
+    return { command: "invoke", socket, action: `query.${positional[1]}`, actionArgs: null };
+  }
   if (cmd === "restart-xwayland") return { command: "restart-xwayland", socket };
   if (cmd === "subscribe") {
     if (positional.length < 2) die("subscribe requires a pattern");

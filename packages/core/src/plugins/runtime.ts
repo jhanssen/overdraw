@@ -36,6 +36,15 @@ const BOOTSTRAP = join(__dirname, "bootstrap.js");
 // See plugin-host.ts.
 export type { PluginState } from "./plugin-host.js";
 
+// A main-thread action handler (registerHostAction). Receives the invoke
+// params (deferred refs already resolved) and returns a JSON-safe result.
+export type HostActionHandler = (params: Json) => Json | Promise<Json>;
+
+// Reserved owner name for host actions in the shared ActionRegistry. Angle
+// brackets keep it out of the plugin-name space (config plugin names are
+// bare identifiers).
+const HOST_ACTION_OWNER = "<core>";
+
 // Tunables (injectable for fast tests). Defaults match architecture.md intent.
 export interface RuntimeOptions {
   // Per-Worker heap cap, MiB (Worker resourceLimits.maxOldGenerationSizeMb).
@@ -375,6 +384,10 @@ export class PluginRuntime implements PluginController {
   private nsRegistry = new NamespaceRegistry();
   // Action registry (sdk.actions.register / invoke / list). Also shared.
   private actionRegistry = new ActionRegistry();
+  // Handlers for actions registered via registerHostAction: they run on the
+  // main thread instead of routing to a plugin endpoint. Registered in the
+  // shared actionRegistry under the reserved owner name HOST_ACTION_OWNER.
+  private hostActions = new Map<string, HostActionHandler>();
   // Pending `plugin.wait-for-active` waiters, keyed by namespace. Each
   // waiter's promise resolves when the registry's active winner appears (or
   // rejects on timeout / when the waiting plugin dies).
@@ -625,6 +638,32 @@ export class PluginRuntime implements PluginController {
 
   actions(): ActionRegistry { return this.actionRegistry; }
 
+  // Register an action whose handler runs on the MAIN thread (launcher/core
+  // code) instead of in a plugin Worker. Same registry, naming rules, and
+  // list-actions visibility as plugin actions (name collisions throw). Used
+  // for queries over state only the launcher can reach (WM, compositor,
+  // protocol state); mutating actions should stay in plugins + bus events.
+  registerHostAction(reg: {
+    name: string; description?: string; schema?: unknown;
+    handler: HostActionHandler;
+  }): { unregister(): void } {
+    if (typeof reg.handler !== "function") {
+      throw new TypeError("registerHostAction: handler must be a function");
+    }
+    this.actionRegistry.register({
+      pluginName: HOST_ACTION_OWNER, name: reg.name,
+      ...(reg.description !== undefined ? { description: reg.description } : {}),
+      ...(reg.schema !== undefined ? { schema: reg.schema } : {}),
+    });
+    this.hostActions.set(reg.name, reg.handler);
+    return {
+      unregister: (): void => {
+        this.actionRegistry.unregister(HOST_ACTION_OWNER, reg.name);
+        this.hostActions.delete(reg.name);
+      },
+    };
+  }
+
   onActionRegister(pluginName: string, payload: unknown): void {
     if (!isActionRegisterPayload(payload)) {
       this.opts.log?.(`[plugin ${pluginName}] actions.register: malformed payload; ignored`);
@@ -657,6 +696,17 @@ export class PluginRuntime implements PluginController {
     const owner = this.actionRegistry.lookup(payload.name);
     if (!owner) {
       throw new Error(`actions.invoke: no such action '${payload.name}'`);
+    }
+    if (owner.pluginName === HOST_ACTION_OWNER) {
+      const handler = this.hostActions.get(payload.name);
+      if (!handler) {
+        throw new Error(`actions.invoke: host action '${payload.name}' has no handler`);
+      }
+      let params: Json = payload.params;
+      if (this.opts.resolveDeferredRefs) {
+        params = this.opts.resolveDeferredRefs(payload.params) as Json;
+      }
+      return await handler(params);
     }
     const target = this.plugins.find((p) => p.cfg.name === owner.pluginName);
     const ep = target?.endpointHandle();

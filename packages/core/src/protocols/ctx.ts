@@ -695,6 +695,41 @@ export interface CompositorSink {
                            retiredBufferId: number): void;
   handleScanoutClientReject?(outputId: number, bufferId: number): void;
   setDirectScanoutEnabled?(on: boolean): void;
+  // Read-only diagnostic snapshot of the render state: per-output draw
+  // order (bottom to top, each entry labeled with its stack segment) and
+  // direct-scanout status. Serves the IPC query actions; never mutates.
+  introspect?(): CompositorIntrospection;
+}
+
+// Snapshot returned by CompositorSink.introspect. JSON-safe by construction
+// (numbers/strings/booleans only) so it can cross the IPC boundary verbatim.
+export interface CompositorIntrospection {
+  directScanout: boolean;
+  outputs: Array<{
+    outputId: number;
+    // The draw list renderFrame would composite this frame, bottom to top.
+    // `kind` labels the stack segment the entry came from; `layer` is set
+    // for kind "layer". Rect fields are world/output logical coords with
+    // the effective size (layout size, or intrinsic buffer size for
+    // size-from-intrinsic entries like subsurfaces).
+    drawList: Array<{
+      id: number;
+      kind: "backdrop" | "content" | "phantom" | "layer" | "cursor";
+      layer?: Layer;
+      x: number; y: number; width: number; height: number;
+      hasBuffer: boolean;
+    }>;
+    scanout: {
+      // Non-null while a client buffer is latched on the primary plane.
+      latchedBufferId: number | null;
+      // A client present is in flight (sent, flip not yet reported).
+      flipPending: boolean;
+      // Buffer ids the GPU process refused (AddFB2 / atomic TEST).
+      vetoedBufferIds: number[];
+    };
+    // The KMS cursor plane carries the cursor on this output.
+    hwCursor: boolean;
+  }>;
 }
 
 export interface CompositorState {
@@ -704,7 +739,8 @@ export interface CompositorState {
   // can pair X11 windows to the surfaces Xwayland created. Created lazily by
   // the shell handler; logic lives in src/xwayland/surface.ts.
   xwayland?: import("../xwayland/surface.js").XwaylandSurfaceState;
-  // Global integer scale for the Xwayland session (1..3). The X client sees an
+  // Global scale for the Xwayland session ([1,3], fractional allowed). The
+  // X client sees an
   // oversized world: compositor logical coords/sizes are multiplied by this
   // before reaching X and X coords/sizes are divided by it on the way back.
   // The X surface's wl_buffer is treated as bufferScale=N so the composite
