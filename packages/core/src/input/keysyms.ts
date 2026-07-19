@@ -80,6 +80,16 @@ for (let c = 0x30; c <= 0x39; c++) SYMS[String.fromCharCode(c)] = c;
 const CI: { [lower: string]: number } = {};
 for (const [k, v] of Object.entries(SYMS)) CI[k.toLowerCase()] = v;
 
+// True for keysyms produced by modifier keys (Shift, Ctrl, Alt, Super,
+// AltGr, locks). The binding chain treats an unbound press of these as
+// neutral: it may be arming modifiers for a later chord step, so it never
+// cancels a chord in progress.
+export function isModifierKeysym(sym: number): boolean {
+  return (sym >= 0xffe1 && sym <= 0xffee)   // Shift_L .. Hyper_R
+    || sym === 0xfe03 || sym === 0xfe11     // ISO_Level3/5_Shift (AltGr)
+    || sym === 0xff7e || sym === 0xff7f;    // Mode_switch, Num_Lock
+}
+
 // Resolve a keysym name to its numeric value, or null if unknown. Names are
 // matched case-insensitively. Both XKB-style ("Return") and lowercase
 // ("return") names work.

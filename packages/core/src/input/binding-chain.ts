@@ -20,7 +20,10 @@
 //   2. If the top frame's path has a child for this step:
 //        - leaf: fire handler; reset path; consume.
 //        - branch: advance path; consume.
-//   3. Else: check the frame's exitOnEscape for an Escape match -> pop;
+//   3. Else if the key is itself a modifier (Shift, Super, ...): neutral --
+//      it may be arming modifiers for a later chord step ("Insert,
+//      Shift+c"), so it neither advances nor cancels the path.
+//   4. Else: check the frame's exitOnEscape for an Escape match -> pop;
 //      otherwise reset the path; forward to client.
 //
 // Behaviorally isolated: when a key isn't bound in the top mode, it does
@@ -29,6 +32,7 @@
 
 import type { InputStep, KeyStep, ButtonStep } from "./keyspec.js";
 import { MOD_LOCK, MOD_MOD2, formatStep, formatChord, isButtonStep, isScrollStep } from "./keyspec.js";
+import { isModifierKeysym } from "./keysyms.js";
 import { log } from "../log.js";
 
 // A press handler. Returns a boolean to indicate consume (true) or forward
@@ -448,6 +452,14 @@ export class BindingChain {
         path: formatChord(this.pathToSteps(top.def, top.path)),
       });
       return { consume: true, matched: false };
+    }
+    // An unbound modifier press is neutral: it may be arming modifiers for
+    // a later chord step, so it must not cancel an in-progress chord. Mode
+    // isolation still applies (swallowed in a pushed mode, forwarded in
+    // default). A modifier sym that IS bound as a step matched above.
+    if (!isButtonStep(compareStep) && !isScrollStep(compareStep)
+        && isModifierKeysym(compareStep.keysym)) {
+      return { consume: this.stack.length > 1, matched: false };
     }
     // No match in the trie. Check exit-on-Escape (only meaningful for
     // a non-default top frame with exitOnEscape, when the chord pointer

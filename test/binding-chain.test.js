@@ -100,6 +100,49 @@ test("chord prefix followed by non-matching key cancels + forwards the non-match
   assert.equal(r2.consume, true);
 });
 
+test("modifier press mid-chord is neutral: 'Insert, Shift+c' fires", () => {
+  const { chain, events } = newChain();
+  let fired = 0;
+  chain.bind({ steps: parseChord(["Insert", "Shift+c"]), handler: () => { fired++; } });
+
+  assert.equal(chain.dispatchPress(step("Insert")).consume, true);
+  // The physical Shift press: keysym Shift_L, Shift bit now depressed.
+  const r = chain.dispatchPress({ mods: MOD_SHIFT, keysym: 0xffe1 });
+  assert.equal(r.consume, false);                // forwarded in default mode
+  assert.ok(!events.some((e) => e.kind === "chord-cancelled"));
+  assert.equal(chain.currentPath().length, 1);   // prefix still armed
+
+  const r2 = chain.dispatchPress(step("Shift+c"));
+  assert.equal(r2.matched, true);
+  assert.equal(fired, 1);
+});
+
+test("modifier press in a pushed mode is swallowed and keeps chord progress", () => {
+  const { chain, events } = newChain();
+  let fired = 0;
+  chain.defineMode("m");
+  chain.bind({ steps: parseChord(["a", "Shift+b"]), mode: "m", handler: () => { fired++; } });
+  chain.pushMode("m");
+
+  chain.dispatchPress(step("a"));
+  const r = chain.dispatchPress({ mods: MOD_SHIFT, keysym: 0xffe1 });
+  assert.equal(r.consume, true);                 // mode isolates the keyboard
+  assert.ok(!events.some((e) => e.kind === "chord-cancelled"));
+  assert.equal(chain.dispatchPress(step("Shift+b")).matched, true);
+  assert.equal(fired, 1);
+});
+
+test("a bound lock-key step still matches (neutrality only applies unbound)", () => {
+  const { chain } = newChain();
+  let fired = 0;
+  chain.bind({ steps: parseChord(["Insert", "Caps_Lock"]), handler: () => { fired++; } });
+  chain.dispatchPress(step("Insert"));
+  // Caps_Lock (0xffe5) is in the modifier-sym range but bound as the leaf.
+  const r = chain.dispatchPress(step("Caps_Lock"));
+  assert.equal(r.matched, true);
+  assert.equal(fired, 1);
+});
+
 test("currentPath reflects in-progress chord", () => {
   const { chain } = newChain();
   chain.bind({ steps: parseChord(["Mod+a", "Mod+b"]), handler: () => {} });
