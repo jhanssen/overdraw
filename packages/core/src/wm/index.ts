@@ -117,6 +117,13 @@ export interface Window {
   // the end of each pass. null = unplaced (e.g. workspace plugin hasn't
   // claimed it for any output yet).
   outputId?: number | null;
+  // True while this window is keyboard-focused AND a different window on
+  // its output holds exclusive !== "none". effectiveStackZ lifts it above
+  // the exclusive tier so focus-cycling away from a fullscreen window
+  // reveals the newly focused one instead of leaving it covered.
+  // Maintained by updateFocusReveal (recomputed on every stack push and
+  // on setKeyboardFocus).
+  focusReveal?: boolean;
   // Per-window mutation queue. Async operations on win.windowState
   // (propose, markInitialCommitComplete) chain on this so a second call
   // doesn't read stale state mid-microtask from an in-flight first call.
@@ -427,6 +434,15 @@ export interface Wm {
   // cycling and the reorder ops.
   focusOrder(): number[];
 
+  // Report the current keyboard-focused surface (any surface id or null;
+  // non-window ids simply match no window). When focus lands on a window
+  // that shares an output with a DIFFERENT window holding exclusive
+  // (fullscreen/maximized), the focused window is lifted above the
+  // exclusive tier (focusReveal) and the stack re-pushes -- focus-cycling
+  // away from a fullscreen window reveals the newly focused one. The
+  // seat's keyboard.focus bus event is the single caller.
+  setKeyboardFocus(surfaceId: number | null): void;
+
   // Reorder the window list relative to one surface:
   //   'promote'    move it to the master slot (front of the list);
   //   'swap-next'  exchange it with the next toplevel toward the stack tail;
@@ -475,6 +491,14 @@ function shrink(outer: Rect, i: Insets): Rect {
 }
 
 function contentOf(win: Window): Rect {
+  // Fullscreen windows draw bare: decoration plugins release their inset
+  // band on fullscreen entry, but that release is an async plugin
+  // round-trip. The content rect must equal the outer rect IMMEDIATELY on
+  // entry -- an inset-shrunk fullscreen configure tells the client its
+  // window is smaller than the output, and geometry-derived clients
+  // (Wine's EWMH state sync) respond by dropping fullscreen, which
+  // oscillates.
+  if (win.windowState.exclusive === "fullscreen") return { ...win.outer };
   return win.insets ? shrink(win.outer, win.insets) : { ...win.outer };
 }
 
@@ -864,6 +888,9 @@ export function createWm(
   const mapAckBackstops = new Map<number, ReturnType<typeof setTimeout>>();
   const windows: Window[] = [];
   const wm: WmState = { outputs: outputsMap(outputs), windows };
+  // The keyboard-focused surface as reported via setKeyboardFocus (any
+  // surface id, not necessarily a WM window). Drives focusReveal.
+  let focusedWindowId: number | null = null;
 
   // Z-order state. tiledZ is the single z value shared by every
   // tiled (master-stack) window: tiled windows don't overlap each
@@ -1127,26 +1154,61 @@ export function createWm(
   }
 
   function pushStack(): void {
+    updateFocusReveal();
     if (rebuild) { rebuild(); return; }
     const ids: number[] = [];
     // When some window on a workspace has exclusive !== "none", it owns
     // the workspace and every peer is omitted from the draw stack
     // (matches the layout-driver's resolver, which only emits a rect
-    // for the exclusive window on that output). Invisible windows
-    // (visible === false) are also omitted regardless.
+    // for the exclusive window on that output) -- except a focusReveal
+    // peer, which draws above it. Invisible windows (visible === false)
+    // are also omitted regardless.
     const exclusiveByOutput = exclusiveWindowsByOutput();
+    const revealed: number[] = [];
     for (const w of windows) {
       if (isGated(w) || !w.hasContent) continue;
       if (!w.windowState.visible) continue;
       const ownerOutput = outputOf(w.surfaceId);
       if (ownerOutput !== null) {
         const exclusiveId = exclusiveByOutput.get(ownerOutput);
-        if (exclusiveId !== undefined && exclusiveId !== w.surfaceId) continue;
+        if (exclusiveId !== undefined && exclusiveId !== w.surfaceId) {
+          if (!w.focusReveal) continue;
+          // Above the exclusive window: append after the main pass.
+          if (w.decorationSurfaceId !== undefined) revealed.push(w.decorationSurfaceId);
+          revealed.push(w.surfaceId);
+          continue;
+        }
       }
       if (w.decorationSurfaceId !== undefined) ids.push(w.decorationSurfaceId);
       ids.push(w.surfaceId);
     }
+    ids.push(...revealed);
     compositor.setStack(ids);
+  }
+
+  // Recompute every window's focusReveal flag (see the Window field doc).
+  // Returns whether any flag changed so callers can re-push the stack.
+  function updateFocusReveal(): boolean {
+    const exclusiveByOutput =
+      focusedWindowId !== null ? exclusiveWindowsByOutput() : null;
+    let changed = false;
+    for (const w of windows) {
+      let reveal = false;
+      if (exclusiveByOutput !== null && exclusiveByOutput.size > 0
+          && w.surfaceId === focusedWindowId
+          && w.windowState.visible
+          && w.windowState.exclusive === "none") {
+        const ownerOutput = outputOf(w.surfaceId);
+        const exclusiveId =
+          ownerOutput !== null ? exclusiveByOutput.get(ownerOutput) : undefined;
+        reveal = exclusiveId !== undefined && exclusiveId !== w.surfaceId;
+      }
+      if ((w.focusReveal ?? false) !== reveal) {
+        w.focusReveal = reveal;
+        changed = true;
+      }
+    }
+    return changed;
   }
 
   // Resolve which window (if any) holds exclusive ownership of each
@@ -1406,7 +1468,10 @@ export function createWm(
         tiling: win.windowState.tiling,
       });
 
-      const newContent = win.insets ? shrink(newOuter, win.insets) : { ...newOuter };
+      // Same fullscreen carve-out as contentOf: the fullscreen configure
+      // must be the bare outer rect even while insets are still granted.
+      const newContent = win.insets && win.windowState.exclusive !== "fullscreen"
+        ? shrink(newOuter, win.insets) : { ...newOuter };
       const sizeChanged = newContent.width !== prevContent.width || newContent.height !== prevContent.height;
       const moved = prevOuter.x !== newOuter.x || prevOuter.y !== newOuter.y
                  || prevOuter.width !== newOuter.width || prevOuter.height !== newOuter.height;
@@ -2491,6 +2556,15 @@ export function createWm(
 
     listSnapshots() {
       return windows.map(snapshotOf);
+    },
+
+    setKeyboardFocus(surfaceId) {
+      if (focusedWindowId === surfaceId) return;
+      focusedWindowId = surfaceId;
+      // pushStack re-runs updateFocusReveal itself, but only re-push when
+      // something actually changed -- most focus changes have no exclusive
+      // window in play and must not cost a stack rebuild.
+      if (updateFocusReveal()) pushStack();
     },
 
     focusOrder() {

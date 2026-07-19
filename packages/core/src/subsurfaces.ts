@@ -249,6 +249,10 @@ export function collectSubsurfaceIds(
 // this value; using the same key is what keeps clicks landing on the
 // pixels the user sees.
 export function effectiveStackZ(w: WmWindowLike): number {
+  // focusReveal (WM-stamped: keyboard-focused window sharing an output with
+  // a DIFFERENT window holding exclusive) outranks the exclusive tier, so
+  // cycling focus away from a fullscreen window reveals the focused one.
+  if (w.focusReveal) return (w.z ?? 0) + 0x60000000;
   const boost = (w.windowState?.exclusive ?? "none") !== "none" ? 0x40000000 : 0;
   return (w.z ?? 0) + boost;
 }
@@ -302,6 +306,10 @@ export interface WmWindowLike {
   // Behavioral state; effectiveStackZ boosts exclusive windows above
   // every non-exclusive z tier.
   windowState?: { exclusive?: "none" | "maximized" | "fullscreen" };
+  // Stamped by the WM when this window is keyboard-focused and a DIFFERENT
+  // window on its output holds exclusive: the focused window draws above
+  // the exclusive tier (see effectiveStackZ).
+  focusReveal?: boolean;
 }
 
 // Recompute the full draw stack (via rebuildStackWithPopups, the SINGLE owner of

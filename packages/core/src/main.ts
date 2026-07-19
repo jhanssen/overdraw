@@ -59,7 +59,7 @@ import { reemitFractionalScale } from "./protocols/wp_fractional_scale_manager_v
 import { reemitScanoutFeedback } from "./protocols/zwp_linux_dmabuf_v1.js";
 import { makeOnOutputAdded, makeOnOutputRemoved } from "./output/hotplug.js";
 import { WINDOW_EVENT } from "./events/types.js";
-import { createCompositorBus } from "./events/window-bus.js";
+import { createCompositorBus, KEYBOARD_EVENT } from "./events/window-bus.js";
 import { DynamicBus } from "./events/dynamic-bus.js";
 import { IpcServer } from "./ipc/server.js";
 import { bindAddon, installConsoleShim, parseLogArgs, log, LEVEL } from "./log.js";
@@ -1400,6 +1400,15 @@ pluginBus.subscribe("window.move-to-output-cycle-requested", (_n, payload) => {
   const n = ids.length;
   const targetOutputId = dir === "next" ? ids[(i + 1) % n] : ids[(i - 1 + n) % n];
   pluginBus.emit("window.move-to-output-requested", { outputId: targetOutputId });
+});
+
+// Mirror keyboard focus into the WM. When focus lands on a window that
+// shares an output with a different window holding fullscreen/maximized,
+// the WM lifts the focused window above it (focusReveal) and re-pushes the
+// stack -- so focus-cycling away from a fullscreen window shows the newly
+// focused one instead of leaving it covered.
+bus.on(KEYBOARD_EVENT.focus, (ev) => {
+  state?.wm?.setKeyboardFocus(ev.surfaceId);
 });
 
 // The focus.next / focus.prev actions emit this; cycle keyboard focus
