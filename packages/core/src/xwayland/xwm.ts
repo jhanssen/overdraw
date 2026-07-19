@@ -36,7 +36,7 @@ import {
   type PropertyAtoms,
   type PropertyReply,
 } from "./properties.js";
-import { xwaylandScaleOf } from "./scale.js";
+import { xwaylandScaleOf, sizeHintsToLogical } from "./scale.js";
 import { xChartCameraOf, xGlassToWorld, tellXRect } from "./glass-map.js";
 
 export interface XwmEventMsg {
@@ -421,9 +421,11 @@ export function startXwm(state: CompositorState, addon: Addon, wmFd: number): Xw
   function sendStructuralProposals(w: XWindow): void {
     if (w.surfaceId === null || !w.addedToWm || !state.wm) return;
     const proposal: Parameters<NonNullable<typeof state.wm>["propose"]>[1] = {};
-    // Constraints: min/max from WM_NORMAL_HINTS.
+    // Constraints: min/max from WM_NORMAL_HINTS, reduced from X device
+    // pixels to logical (sizeHintsToLogical).
     if (w.minSize !== null || w.maxSize !== null) {
-      proposal.constraints = { minSize: w.minSize, maxSize: w.maxSize };
+      proposal.constraints =
+        sizeHintsToLogical(w.minSize, w.maxSize, xwaylandScaleOf(state));
     }
     // Parent: WM_TRANSIENT_FOR -> the parent X window's surfaceId, if we know
     // it. (If the parent X window hasn't associated yet, we leave it null;

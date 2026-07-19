@@ -48,3 +48,30 @@ export function xwaylandScaleOf(state: CompositorState): number {
   const n = state.xwaylandScale;
   return typeof n === "number" && n >= 1 ? n : 1;
 }
+
+type Size = { width: number; height: number };
+
+// WM_NORMAL_HINTS min/max arrive in X device pixels; the WM thinks in
+// logical. Convert conservatively -- ceil the min, floor the max -- so the
+// constraint the WM enforces never violates the client's own (a rounded-
+// down min could configure a size the client refuses to shrink to). A
+// range narrower than one logical pixel (min == max, the fixed-size-dialog
+// idiom) can invert under ceil/floor; keep it ordered by lifting max to
+// min (over-max by under a logical pixel).
+export function sizeHintsToLogical(
+  min: Size | null, max: Size | null, n: number,
+): { minSize: Size | null; maxSize: Size | null } {
+  const minSize = min === null ? null : {
+    width: Math.ceil(min.width / n),
+    height: Math.ceil(min.height / n),
+  };
+  const maxSize = max === null ? null : {
+    width: Math.floor(max.width / n),
+    height: Math.floor(max.height / n),
+  };
+  if (minSize !== null && maxSize !== null) {
+    maxSize.width = Math.max(maxSize.width, minSize.width);
+    maxSize.height = Math.max(maxSize.height, minSize.height);
+  }
+  return { minSize, maxSize };
+}
