@@ -158,10 +158,11 @@ export interface OverdrawConfig {
   // explicit display (default 50, well outside the typical 0-9 range used
   // by primary sessions); set null to let Xwayland autopick from :0 upward
   // (NOT recommended on a host with an existing X session).
-  // `scale` (integer 0..3) picks the global Xwayland scale (see
-  // docs/xwayland-design.md "HiDPI"). 0 = auto: ceil(max(output.scale)) at
-  // Xwayland start, clamped to [1,3]. 1..3 = explicit. Frozen for the
-  // Xwayland session; output hotplug after start does not change it.
+  // `scale` (0..3, fractional allowed) picks the global Xwayland scale
+  // (see docs/xwayland-design.md "HiDPI"). 0 = auto: max(output.scale) at
+  // Xwayland start (exactly -- a 1.5 output gives 1.5), clamped to [1,3].
+  // >= 1 = explicit. Frozen for the Xwayland session; output hotplug
+  // after start does not change it.
   xwayland?: {
     enabled?: boolean;
     terminate?: boolean;

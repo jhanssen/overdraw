@@ -65,11 +65,14 @@ function emitTo(
     || (ctx.state.xwaylandPid !== undefined
         && typeof ctx.addon.clientPid === "function"
         && ctx.addon.clientPid(resource) === ctx.state.xwaylandPid);
+  // Rounded: the X scale may be fractional and the protocol carries int32.
   const xn = isX ? (ctx.state.xwaylandScale ?? 1) : 1;
   events.zxdg_output_v1.send_logical_position(
-    resource, rec.logicalPosition.x * xn, rec.logicalPosition.y * xn);
+    resource,
+    Math.round(rec.logicalPosition.x * xn), Math.round(rec.logicalPosition.y * xn));
   events.zxdg_output_v1.send_logical_size(
-    resource, rec.logicalSize.width * xn, rec.logicalSize.height * xn);
+    resource,
+    Math.round(rec.logicalSize.width * xn), Math.round(rec.logicalSize.height * xn));
   // name/description are since 2; an xdg_output bound at v1 (manager bound at
   // v1) has no listener for them and would be aborted.
   if (resource.version >= 2) {

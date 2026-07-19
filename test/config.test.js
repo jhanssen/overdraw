@@ -277,13 +277,14 @@ test('xwayland.scale: defaults to 0 (auto), accepts 0..3, rejects others', async
   // Default (xwayland block present but scale omitted): scale = 0.
   c = await loadConfig(write('export default { xwayland: { enabled: true } }'));
   assert.equal(c.xwayland.scale, 0);
-  // Explicit 0..3 accepted.
-  for (const n of [0, 1, 2, 3]) {
+  // Explicit 0 or 1..3 accepted, fractional included.
+  for (const n of [0, 1, 1.5, 2, 2.25, 3]) {
     c = await loadConfig(write(`export default { xwayland: { scale: ${n} } }`));
     assert.equal(c.xwayland.scale, n);
   }
-  // Out of range / non-integer rejected.
-  for (const bad of ['-1', '4', '1.5', '"2"']) {
+  // Out of range rejected (including the (0,1) gap: a sub-1 scale would
+  // shrink the X world, which nothing supports).
+  for (const bad of ['-1', '4', '0.5', '"2"']) {
     await assert.rejects(() => loadConfig(write(
       `export default { xwayland: { scale: ${bad} } }`)), /xwayland\.scale/);
   }

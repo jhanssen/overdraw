@@ -220,9 +220,10 @@ function normalize(raw: unknown, path: string): ResolvedConfig {
       fail("`xwayland.displayNumber` must be a non-negative integer (or null for autopick)", path);
     }
     if (x.scale !== undefined
-        && (!Number.isInteger(x.scale) || (x.scale as number) < 0
-            || (x.scale as number) > 3)) {
-      fail("`xwayland.scale` must be an integer in 0..3 (0=auto)", path);
+        && (typeof x.scale !== "number" || !Number.isFinite(x.scale)
+            || (x.scale as number) < 0 || (x.scale as number) > 3
+            || ((x.scale as number) > 0 && (x.scale as number) < 1))) {
+      fail("`xwayland.scale` must be 0 (auto) or a number in 1..3 (fractional allowed)", path);
     }
     xwayland = {
       enabled: x.enabled ?? false,

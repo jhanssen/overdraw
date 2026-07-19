@@ -101,6 +101,11 @@ export function tellXRect(
 ): void {
   const cx = clampX16(Math.round(x), window, "x");
   const cy = clampX16(Math.round(y), window, "y");
-  addon.xwmConfigureWindow(window, cx, cy, w, h);
-  addon.xwmSendConfigureNotify(window, cx, cy, w, h);
+  // Round, don't truncate: with a fractional X scale the products carry
+  // float error (2879.9999...), and the napi int cast would truncate a
+  // pixel off the window.
+  const cw = Math.round(w);
+  const ch = Math.round(h);
+  addon.xwmConfigureWindow(window, cx, cy, cw, ch);
+  addon.xwmSendConfigureNotify(window, cx, cy, cw, ch);
 }

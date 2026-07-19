@@ -1,19 +1,24 @@
-// Effective Xwayland scale: one integer for the whole session, in [1,3].
-// See docs/xwayland-design.md "HiDPI".
+// Effective Xwayland scale: one number for the whole session, in [1,3],
+// fractional allowed. See docs/xwayland-design.md "HiDPI".
 //
 // The X client sees an oversized world by this factor; the compositor lies
 // about pixel sizes and coordinates uniformly. Computed once at Xwayland
-// start and frozen for the session.
+// start and frozen for the session. Auto tracks the highest output scale
+// EXACTLY (a 1.5-scaled output gives X scale 1.5), so the X desktop's
+// pixel size equals the output's device pixel size -- X clients render at
+// native density and a desktop-sized fullscreen buffer equals the mode
+// (direct-scanout-able 1:1). Every X-wire integer boundary rounds
+// (tellXRect, xdg_output); internal logical<->X conversions stay float.
 
 import type { CompositorState, OutputRecord } from "../protocols/ctx.js";
 
-// Clamp + round to the [1,3] integer band. Anything outside the band is
-// capped (we don't refuse it -- the higher levels validate the config
-// knob; this is the lower-level apply).
-function clampInt(n: number): number {
+// Clamp to the [1,3] band. Anything outside the band is capped (we don't
+// refuse it -- the higher levels validate the config knob; this is the
+// lower-level apply). Fractional values pass through.
+function clamp(n: number): number {
   if (!Number.isFinite(n) || n < 1) return 1;
   if (n > 3) return 3;
-  return Math.round(n);
+  return n;
 }
 
 // Walk the current outputs and return the highest scale seen, or 1 if
@@ -28,12 +33,12 @@ function highestOutputScale(state: CompositorState): number {
   return max;
 }
 
-// Resolve the integer X scale to use. `configScale` is the user knob:
-// 0 = auto (ceil(highest output scale)), 1..3 = explicit. Always returns
-// an int in [1,3].
+// Resolve the X scale to use. `configScale` is the user knob:
+// 0 = auto (the highest output scale, exactly), >= 1 = explicit
+// (fractional allowed). Always returns a number in [1,3].
 export function resolveXwaylandScale(state: CompositorState, configScale: number): number {
-  if (configScale >= 1) return clampInt(configScale);
-  return clampInt(Math.ceil(highestOutputScale(state)));
+  if (configScale >= 1) return clamp(configScale);
+  return clamp(highestOutputScale(state));
 }
 
 // Per-call convenience -- reads the frozen scale off state. Returns 1 when

@@ -112,17 +112,21 @@ Wayland progress.
 
 ## HiDPI
 
-X11 has no per-window scale. overdraw takes the single-global-integer
-compromise that every Xwayland-hosting compositor lands on. Per-window /
-per-output fractional scaling of X apps is a known hard limitation
-across the ecosystem and is out of scope.
+X11 has no per-window scale. overdraw uses a single global scale for the
+whole Xwayland session — fractional allowed. Per-window / per-output
+scaling of X apps is a known hard limitation across the ecosystem and is
+out of scope.
 
-**Effective scale.** One integer per Xwayland session, in `[1,3]`. The
-config knob `config.xwayland.scale` selects it:
+**Effective scale.** One number per Xwayland session, in `[1,3]`,
+fractional allowed. The config knob `config.xwayland.scale` selects it:
 
-- `0` (default) → auto: `ceil(max(output.scale))` over the outputs
-  present when Xwayland starts.
-- `1..3` → explicit override.
+- `0` (default) → auto: `max(output.scale)` over the outputs present
+  when Xwayland starts, EXACTLY — a 1.5-scaled output gives X scale
+  1.5. The X desktop's pixel size then equals the output's device pixel
+  size: X clients render at native density (no super- or under-
+  sampling), and a desktop-sized fullscreen buffer equals the mode, so
+  direct scanout can latch it 1:1.
+- `1..3` (fractional allowed) → explicit override.
 
 The scale is computed once at Xwayland start and frozen for the session.
 Output hotplug after start changes nothing on the X side: a new monitor
@@ -140,13 +144,17 @@ seams:
 
 - **Configure to X.** The WM-chosen logical rect `(x, y, w, h)` is
   multiplied by N before reaching `xwmConfigureWindow` /
-  `xwmSendConfigureNotify`. X clients react by drawing at `N*w × N*h`.
-- **X surface bufferScale.** On surface association
-  (`xwayland_shell_v1.set_serial`), the wl surface is forced to
-  `bufferScale = N`. X clients never call `wl_surface.set_buffer_scale`;
-  the compositor sets it synthetically. The existing composite path
-  divides buffer dims by `bufferScale` to get intrinsic logical size,
-  so the oversized X buffer ends up drawn at the correct logical size.
+  `xwmSendConfigureNotify`, ROUNDED to integers at that boundary (the
+  X wire is integer; with fractional N the products carry float error,
+  and truncation would shave a pixel). X clients react by drawing at
+  `round(N*w) × round(N*h)`.
+- **X surface bufferScale.** On commit, X surfaces are stamped with a
+  synthetic `bufferScale = N` (server-side bookkeeping; X clients never
+  call `wl_surface.set_buffer_scale`, and no protocol message carries
+  it, so fractional N is fine here). The composite path divides buffer
+  dims by `bufferScale` to get intrinsic logical size — that path
+  supports fractional scales (the cursor-theme path already uses them)
+  — so the oversized X buffer is drawn at the correct logical size.
 - **X → compositor coords** (`configure-notify`, override-redirect
   placement, ICCCM size hints): divided by N.
 - **Compositor → X coords** (`configure-request` reply, pointer
