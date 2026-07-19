@@ -54,6 +54,18 @@ const SYMS: { [name: string]: number } = {
   Print: 0xff61,
   Menu: 0xff67,
   Pause: 0xff13,
+  // Media / brightness (XF86 keysyms from <xkbcommon/xkbcommon-keysyms.h>)
+  XF86AudioMute: 0x1008ff12,
+  XF86AudioLowerVolume: 0x1008ff11,
+  XF86AudioRaiseVolume: 0x1008ff13,
+  XF86AudioMicMute: 0x1008ffb2,
+  XF86AudioPlay: 0x1008ff14,
+  XF86AudioPause: 0x1008ff31,
+  XF86AudioStop: 0x1008ff15,
+  XF86AudioPrev: 0x1008ff16,
+  XF86AudioNext: 0x1008ff17,
+  XF86MonBrightnessUp: 0x1008ff02,
+  XF86MonBrightnessDown: 0x1008ff03,
 };
 
 // Letters a-z map directly to ASCII code points (the X11 keysym convention).

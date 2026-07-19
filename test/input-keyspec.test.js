@@ -171,6 +171,23 @@ test("keysymOf: function keys F1-F12", () => {
   }
 });
 
+test("keysymOf: XF86 media / brightness keys", () => {
+  // Values from <xkbcommon/xkbcommon-keysyms.h>.
+  assert.equal(keysymOf("XF86AudioMute"), 0x1008ff12);
+  assert.equal(keysymOf("XF86AudioLowerVolume"), 0x1008ff11);
+  assert.equal(keysymOf("XF86AudioRaiseVolume"), 0x1008ff13);
+  assert.equal(keysymOf("XF86AudioMicMute"), 0x1008ffb2);
+  assert.equal(keysymOf("XF86AudioPlay"), 0x1008ff14);
+  assert.equal(keysymOf("XF86AudioPause"), 0x1008ff31);
+  assert.equal(keysymOf("XF86AudioStop"), 0x1008ff15);
+  assert.equal(keysymOf("XF86AudioPrev"), 0x1008ff16);
+  assert.equal(keysymOf("XF86AudioNext"), 0x1008ff17);
+  assert.equal(keysymOf("XF86MonBrightnessUp"), 0x1008ff02);
+  assert.equal(keysymOf("XF86MonBrightnessDown"), 0x1008ff03);
+  // Case-insensitive like every other name.
+  assert.equal(keysymOf("xf86audiomute"), 0x1008ff12);
+});
+
 test("keysymOf: returns null for unknown", () => {
   assert.equal(keysymOf("notakey"), null);
   assert.equal(keysymOf(""), null);
