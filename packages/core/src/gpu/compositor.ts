@@ -2943,6 +2943,10 @@ export class JsCompositor implements CompositorSink {
   // every slot is correct.
   repaintAll(): void {
     this.damageFull();
+    // A client present sent while the seat was paused was swallowed by
+    // the GPU process (no commit, no flip); a stale in-flight flag here
+    // would gate that output's scanout path shut forever.
+    this.scanoutFlipPending.clear();
   }
 
   // Fire the per-output render gate without geometry so the next frame
@@ -3554,7 +3558,7 @@ export class JsCompositor implements CompositorSink {
           || this.outputDamage.isDirty(o.id)
           || this.activeTransitions.has(o.id);
         if (!dirty) continue;
-        // Direct scanout: a solitary mode-sized opaque client dmabuf goes
+        // Direct scanout: a topmost mode-sized opaque client dmabuf goes
         // straight onto the primary plane -- no acquire, no render, no
         // composite. Damage is consumed (the plane shows the new buffer);
         // frame pacing rides the client flip's completion.
@@ -3562,14 +3566,28 @@ export class JsCompositor implements CompositorSink {
         const cand = this.activeTransitions.has(o.id)
           ? null : this.scanoutCandidate(o, this.drawOrder(o.id));
         if (cand) {
+          // One client present in flight per output. The composite path is
+          // paced by ring-slot availability (acquire fails while a flip is
+          // pending); client presents bypass the ring, so without this gate
+          // an uncapped client committing faster than refresh floods the
+          // GPU process's one-deep present stash -- each drop reports the
+          // (identical) buffer retired, churning the scanout session. Stay
+          // dirty and skip: this output's flip-complete re-enters
+          // renderFrame and presents the newest buffer.
+          if (this.scanoutFlipPending.has(o.id)) continue;
           const fence = this.takeScanoutAcquireFence(cand.bufferId);
           if (this.addon.sendScanoutClientPresent?.(o.id, cand.importId,
                                                     cand.bufferId, fence,
                                                     cand.tearing)) {
+            if (!wasScanout) {
+              log.info("core",
+                `scanout: output ${o.id} enter (buffer ${cand.bufferId})`);
+            }
             this.dispatch(this.lifecycle.step({
               kind: "scanoutPresented", bufferId: cand.bufferId,
             }));
             this.scanoutActive.set(o.id, cand.bufferId);
+            this.scanoutFlipPending.add(o.id);
             this.outputDamage.clearDirty(o.id);
             continue;
           }
@@ -3578,6 +3596,7 @@ export class JsCompositor implements CompositorSink {
         if (wasScanout) {
           // Leaving scanout: the ring slots hold stale pre-scanout
           // content, so the returning composite frame repaints fully.
+          log.info("core", `scanout: output ${o.id} leave; compositing`);
           this.scanoutActive.delete(o.id);
           this.outputDamage.fullOutput(o.id);
         }
@@ -4468,6 +4487,9 @@ export class JsCompositor implements CompositorSink {
   // attempt plane presents.
   private directScanoutEnabled = false;
   private scanoutActive = new Map<number, number>();     // outputId -> bufferId
+  // Outputs with a client present sent but its ScanoutClientFlip not yet
+  // received. Gates renderFrame to one client present in flight per output.
+  private scanoutFlipPending = new Set<number>();
   private scanoutVeto = new Map<number, Set<number>>();  // GPU-process-refused pairs
 
   setDirectScanoutEnabled(on: boolean): void {
@@ -4478,40 +4500,99 @@ export class JsCompositor implements CompositorSink {
     }
   }
 
-  // The solitary-fullscreen-dmabuf test. `draw` is the output's draw list
+  // The topmost-fullscreen-dmabuf test. `draw` is the output's draw list
   // for this frame; every overlay (software cursor, popup, subsurface,
-  // phantom, layer shell, decoration) is its own entry, so length !== 1
-  // covers the whole "something else is visible" family.
+  // phantom, layer shell, decoration) is its own entry. The candidate must
+  // be the TOP entry: anything stacked above it (a popup, an overlay, the
+  // software cursor, a focus-revealed window) is visible and forces the
+  // composite path. Entries BELOW it are provably invisible -- the checks
+  // that follow require an opaque mode-sized buffer placed exactly over
+  // the output's logical rect at full opacity with no shape/transform/
+  // camera, so the candidate hides everything under it.
   private scanoutCandidate(o: OutputGeom, draw: readonly number[]):
       { bufferId: number; importId: number; tearing: boolean } | null {
     if (!this.directScanoutEnabled || this.headless) return null;
     if (!this.addon.sendScanoutClientPresent) return null;
-    if (draw.length !== 1) return null;
-    const id = draw[0];
-    if (id === this.internalCursorSurfaceId) return null;
-    const s = this.surfaces.get(id);
-    if (!s || !s.present || s.frozen) return null;
-    const bufferId = s.currentBufferId ?? 0;
-    if (!bufferId) return null;
-    const imp = this.dmabufImports.get(bufferId);
-    if (!imp) return null;  // shm / plugin-texture surface: no dmabuf to scan out
-    // Buffer must exactly match the mode; the plane does not scale or
-    // blend. Alpha-carrying fourccs would need an opaque-region check.
-    if (imp.width !== o.deviceWidth || imp.height !== o.deviceHeight) return null;
-    if (!SCANOUT_OPAQUE_FOURCCS.has(imp.fourcc)) return null;
-    if (s.bufferTransform !== 0) return null;
-    if (s.viewportSrc) return null;
-    // Placement must exactly cover the output's logical rect, unwarped:
-    // identity camera, no fx transform/margin/mask/shape, full opacity.
+    if (draw.length === 0) return null;
+    const id = draw[draw.length - 1];
+    // Output-covering test, evaluated first so the ineligibility diagnostic
+    // can stay silent for the ordinary desktop case (top window is just a
+    // normal window). Reasons are only reported once a surface LOOKS like a
+    // fullscreen candidate: it covers the output's logical rect exactly.
     const lw = Math.round(o.deviceWidth / o.scale);
     const lh = Math.round(o.deviceHeight / o.scale);
-    if (s.x !== o.logicalX || s.y !== o.logicalY) return null;
-    if (Math.round(s.layoutW) !== lw || Math.round(s.layoutH) !== lh) return null;
-    if (s.fx.opacity !== 1 || this.fxDrawsOutsideLayout(s)) return null;
-    if (s.fx.shape !== null) return null;
-    if (this.cameras.has(o.id)) return null;
-    if (this.scanoutVeto.get(o.id)?.has(bufferId)) return null;
+    const covers = (t: Surface): boolean =>
+      t.x === o.logicalX && t.y === o.logicalY
+      && Math.round(t.layoutW) === lw && Math.round(t.layoutH) === lh;
+    const s = id === this.internalCursorSurfaceId ? undefined : this.surfaces.get(id);
+    if (!s || !s.present || s.frozen || !covers(s)) {
+      // Not a candidate shape. If an output-covering surface sits BURIED in
+      // the list, a would-be-fullscreen window is being blocked by whatever
+      // is stacked above it -- report that, else stay silent.
+      let buried: number | null = null;
+      for (let i = draw.length - 2; i >= 0; i--) {
+        const b = this.surfaces.get(draw[i]);
+        if (b && b.present && !b.frozen && covers(b)) { buried = draw[i]; break; }
+      }
+      this.noteScanoutIneligible(o.id, buried === null ? null
+        : `surface ${buried} covers the output but is not top of the draw `
+          + `list (top: ${id === this.internalCursorSurfaceId
+            ? `software cursor` : `surface ${id}`})`);
+      return null;
+    }
+    const fail = (reason: string): null => {
+      this.noteScanoutIneligible(o.id, `surface ${id}: ${reason}`);
+      return null;
+    };
+    const bufferId = s.currentBufferId ?? 0;
+    if (!bufferId) return fail("no current buffer");
+    const imp = this.dmabufImports.get(bufferId);
+    // shm / plugin-texture surface: no dmabuf to scan out.
+    if (!imp) return fail("buffer is not an imported dmabuf (shm or plugin texture)");
+    // Buffer pixel dims are free: the plane samples the whole buffer
+    // (src = buffer rect) into the whole mode (crtc = mode rect), so a
+    // mode-mismatched buffer rides the display engine's plane scaler --
+    // e.g. an Xwayland-scale-2 fullscreen game's 5120x2880 buffer on a
+    // 3840x2160 mode. Whether the hardware can do a given scale factor is
+    // the kernel's call: the atomic TEST refuses, ScanoutClientReject
+    // comes back, and the veto + composite fallback handles it.
+    if (imp.width === 0 || imp.height === 0) {
+      return fail("buffer has zero dimension");
+    }
+    if (!SCANOUT_OPAQUE_FOURCCS.has(imp.fourcc)) {
+      return fail(`fourcc 0x${imp.fourcc.toString(16)} not scannable `
+        + `(alpha-carrying or unknown)`);
+    }
+    if (s.bufferTransform !== 0) return fail("buffer_transform is not normal");
+    if (s.viewportSrc) return fail("viewport source crop set");
+    // Placement is unwarped: identity camera, no fx transform/margin/mask/
+    // shape, full opacity.
+    if (s.fx.opacity !== 1 || this.fxDrawsOutsideLayout(s)) {
+      return fail("fx opacity/transform/margin active");
+    }
+    if (s.fx.shape !== null) return fail("fx shape set (decoration rounding?)");
+    if (this.cameras.has(o.id)) return fail("output camera is not identity");
+    if (this.scanoutVeto.get(o.id)?.has(bufferId)) {
+      return fail("buffer vetoed by an earlier kernel rejection");
+    }
+    this.noteScanoutIneligible(o.id, null);
     return { bufferId, importId: imp.importId, tearing: s.tearingAsync === true };
+  }
+
+  // Last logged per-output ineligibility reason. noteScanoutIneligible logs
+  // only on CHANGE, and reason strings avoid per-frame identifiers (no
+  // bufferIds -- a buffer-cycling client would otherwise log every commit).
+  private scanoutIneligibleReason = new Map<number, string>();
+
+  private noteScanoutIneligible(outputId: number, reason: string | null): void {
+    const prev = this.scanoutIneligibleReason.get(outputId);
+    if (reason === null) {
+      this.scanoutIneligibleReason.delete(outputId);
+      return;
+    }
+    if (prev === reason) return;
+    this.scanoutIneligibleReason.set(outputId, reason);
+    log.info("core", `scanout: output ${outputId} ineligible: ${reason}`);
   }
 
   // Consume the buffer's stashed explicit-sync acquire fence for a scanout
@@ -4527,6 +4608,7 @@ export class JsCompositor implements CompositorSink {
   // retired buffer's release (the display engine no longer reads it).
   handleScanoutClientFlip(outputId: number, latchedBufferId: number,
                           retiredBufferId: number): void {
+    this.scanoutFlipPending.delete(outputId);
     if (latchedBufferId !== 0) {
       this.scanoutActive.set(outputId, latchedBufferId);
     } else if (this.scanoutActive.get(outputId) === retiredBufferId) {
@@ -4555,6 +4637,9 @@ export class JsCompositor implements CompositorSink {
       set.delete(oldest);
     }
     this.scanoutActive.delete(outputId);
+    // The rejected present will never flip; without this the in-flight
+    // gate would wedge the output.
+    this.scanoutFlipPending.delete(outputId);
     this.dispatch(this.lifecycle.step({ kind: "scanoutRetired", bufferId }));
     this.outputDamage.fullOutput(outputId);
     this.addon.wake();

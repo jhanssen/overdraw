@@ -18,21 +18,33 @@ An output presents by direct scanout when ALL of:
 
 1. `directScanout` config is true (default) and the output is KMS with
    a live ring.
-2. The output's draw list is exactly one surface (this alone excludes
-   software cursor, popups, subsurfaces, phantoms, overlays, layer
-   shell, decorations — they are all separate draw-list entries), and
-   no transition/live-composer is active on the output.
+2. The candidate surface is the TOP entry of the output's draw list.
+   Anything stacked above it (software cursor, popups, phantoms,
+   overlays, layer shell, a focus-revealed window) is visible and
+   forces compositing; entries below it are provably hidden -- rules
+   3-5 require the candidate to opaquely cover the output's logical
+   rect -- so occluded windows (e.g. the terminal a fullscreen client
+   was launched from) do not defeat scanout. No transition/
+   live-composer may be active on the output. A subsurface can be the
+   candidate (a player whose mode-sized video subsurface covers the
+   output scans out that subsurface's buffer).
 3. That surface's window is `exclusive === "fullscreen"` on this
    output and its layout rect equals the output's logical rect.
-4. The committed buffer is an imported dmabuf whose pixel dims equal
-   the output's mode, `buffer_transform` is normal, no viewport crop,
-   and the fourcc is alpha-less (XRGB8888-class; an alpha fourcc could
-   blend with what's under it, which scanout cannot do). Buffer scale
-   is free — a scale-2-aware client's mode-sized buffer qualifies.
+4. The committed buffer is an imported dmabuf, `buffer_transform` is
+   normal, no viewport crop, and the fourcc is alpha-less
+   (XRGB8888-class; an alpha fourcc could blend with what's under it,
+   which scanout cannot do). Buffer pixel dims are free: the commit
+   samples the whole buffer (SRC = buffer rect) into the whole mode
+   (CRTC = mode rect), so a mode-mismatched buffer rides the display
+   engine's plane scaler — e.g. an Xwayland-scale-2 fullscreen game's
+   5120x2880 buffer on a 3840x2160 mode. Whether the hardware can do a
+   given scale factor is the kernel's call: the atomic TEST refuses,
+   `ScanoutClientReject` comes back, and the veto + composite fallback
+   applies (see "Rejection + retry").
 5. The output's camera is identity (canvas world-mode zoom/pan renders
    a transformed view; the plane cannot).
 6. The cursor is on the hardware cursor plane or hidden (a software
-   cursor is a second draw-list entry, so this falls out of rule 2).
+   cursor is stacked above everything, so this falls out of rule 2).
 7. The GPU process has not vetoed this buffer/output (an AddFB2 or
    atomic TEST rejection reports back and the core composites; see
    "Rejection + retry").
@@ -133,6 +145,12 @@ points" §1 anticipated):
 
 AddFB2 or TEST failure emits `ScanoutClientReject`; the core marks the
 (outputId, bufferId) pair vetoed, damages the output, and composites.
+A client-present TEST refusal never enters the cursor-demotion retry
+(that fallback is for ring presents only): scanout eligibility requires
+the hw cursor or a hidden one, so demoting to software cursor would
+permanently defeat scanout while also costing composited frames the hw
+cursor. The client present is simply rejected and the ring present --
+known-good with the cursor plane -- carries the frame.
 The veto is per-BUFFER: the next buffer the client commits retries
 (after the scanout feedback tranche lands, well-behaved clients
 re-allocate with scannable modifiers, which is exactly the retry that
@@ -168,7 +186,19 @@ The game's frame loop is unchanged from its point of view: commit ->
 present) -> flip -> `ScanoutClientFlip` -> `wl_callback.done` +
 presentation feedback with the kernel scanout timestamp. The core's
 wake/flip-complete machinery drives renderFrame exactly as for
-composite frames; only the present leg differs. wp_presentation
+composite frames; only the present leg differs. One client present in
+flight per output, gated in the CORE: composite frames are paced by
+ring-slot availability, which client presents bypass, so renderFrame
+skips an output whose `ScanoutClientFlip` hasn't arrived (staying
+dirty; the flip re-enters renderFrame with the newest buffer). Without
+the gate, a client committing faster than refresh (Vulkan mailbox /
+immediate) floods the GPU process's one-deep present stash, and every
+drop reports its buffer retired -- for same-buffer re-presents that is
+the LATCHED id, tearing down the scanout session each frame. The gate
+also caps present traffic at the refresh rate. It clears on
+`ScanoutClientFlip`, on `ScanoutClientReject` (the present will never
+flip), and on seat re-enable (a present sent while paused was
+swallowed). wp_presentation
 reports zero-copy flags... (deferred: the feedback `kind` bits; v1
 reports the same as composite frames).
 
@@ -199,8 +229,6 @@ way the first async-requested flip went.
 
 ## Explicitly out of scope (v1)
 
-- Plane-scaled scanout (buffer != mode via SRC/CRTC scaling) — needs
-  per-driver TEST probing; the exact-match rule is the portable core.
 - Alpha-fourcc fullscreen surfaces (would need an opaque-region
   check or an undercoat guarantee).
 - Overlay planes for non-fullscreen surfaces.

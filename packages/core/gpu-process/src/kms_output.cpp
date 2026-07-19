@@ -1025,6 +1025,20 @@ bool KmsOutputBackend::presentOutputImpl(PerOutput& o, int slotIdx, int inFenceF
         testFlags &= ~DRM_MODE_PAGE_FLIP_ASYNC;
         testRc = drmModeAtomicCommit(drmFd_, req, testFlags, this);
     }
+    if (testRc != 0 && isClient) {
+        // A refused client-scanout TEST (e.g. the driver rejecting a scaled
+        // primary plane) is answered by rejecting the client present: the
+        // core vetoes the buffer and composites through the ring, which is
+        // known-good with the cursor plane. Never demote the hw cursor to
+        // salvage a client present -- scanout eligibility requires the hw
+        // cursor (or none), so demotion would permanently defeat the very
+        // path it tried to save, and cost every composited frame the hw
+        // cursor besides.
+        drmModeAtomicFree(req);
+        LOG_ERR(Gpu, "[kms] atomic TEST refused client present: {} "
+                "(output {})", std::strerror(errno), o.outputId);
+        return false;
+    }
     if (testRc != 0 && o.topo.cursorPlaneId && !o.cursorDemoted
         && o.cursorVisible && o.cursorImageValid) {
         // The cursor plane props may be what the kernel rejects (driver

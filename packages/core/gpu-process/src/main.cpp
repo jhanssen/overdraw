@@ -2257,6 +2257,24 @@ int run(int wireFd, int ctrlFd, int inputFd, bool headless,
                     || !kms->presentClientFbAt(p.outputId, ct.kmsFbId,
                                                ct.width, ct.height,
                                                p.bufferId, fenceFd, tearing)) {
+                    // Classify the refusal for the log: a modifier missing
+                    // from the primary plane's IN_FORMATS is an allocation
+                    // problem (the feedback tranche should steer the client);
+                    // a listed modifier points at the commit itself (e.g.
+                    // the driver refusing a scaled plane).
+                    bool planeSupports = false;
+                    for (const auto& fm : kms->primaryPlaneFormatsAt(p.outputId)) {
+                        if (fm.fourcc == ct.fourcc && fm.modifier == ct.modifier) {
+                            planeSupports = true;
+                            break;
+                        }
+                    }
+                    LOG_ERR(Gpu, "scanout reject: output {} buffer {} "
+                            "{}x{} fourcc=0x{:x} modifier=0x{:x} "
+                            "(plane {} this format+modifier)",
+                            p.outputId, p.bufferId, ct.width, ct.height,
+                            ct.fourcc, ct.modifier,
+                            planeSupports ? "SUPPORTS" : "does NOT list");
                     reject();
                 }
                 if (fenceFd >= 0) ::close(fenceFd);

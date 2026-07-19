@@ -667,9 +667,14 @@ as fully transparent (invisible pointer). End-to-end coverage:
 A solitary fullscreen client dmabuf goes straight onto the primary
 plane, skipping the composite pass (`docs/scanout-design.md`;
 `directScanout` config knob, default true, KMS only). Eligibility is
-re-evaluated per output per frame in `renderFrame` (draw list is
-exactly one surface; buffer dims == mode; alpha-less fourcc; no
-transform/viewport-crop/fx/shape/camera; hw-cursor or hidden cursor);
+re-evaluated per output per frame in `renderFrame` (the candidate is
+the TOPMOST draw-list entry -- anything above it forces compositing,
+anything below is occluded by it; alpha-less fourcc; no
+transform/viewport-crop/fx/shape/camera; hw-cursor or hidden cursor;
+buffer dims are free -- a mode-mismatched buffer rides the plane
+scaler, SRC = buffer rect into CRTC = mode rect, with the atomic-TEST
+refusal -> veto -> composite fallback covering hardware that can't do
+the scale);
 the present rides `ScanoutClientPresent` naming the buffer by its wire
 texture handle — the GPU process already retains the dmabuf fd from
 import and lazily wraps it as a KMS FB (`AddFB2WithModifiers`,
@@ -1297,11 +1302,14 @@ validated + resolved + consumed by the runtime + hotkey plugin.
   FocusIn handling for cross-app focus-stealing denial; CLIPBOARD +
   PRIMARY selection bridge between X clients and wayland clients,
   both directions, with INCR for >64 KiB payloads).   Global Xwayland HiDPI scale wired
-  (`config.xwayland.scale`, default 0 = auto: `ceil(max(output.scale))`
-  at start, clamped to `[1,3]`; frozen for the session). X clients see
-  an oversized world by the scale factor; the X surface is treated as
-  `bufferScale=N` so the existing composite path renders it at the
-  right logical size. EWMH polish landed: `_NET_SUPPORTING_WM_CHECK`
+  (`config.xwayland.scale`, default 0 = auto: `max(output.scale)` at
+  start, EXACT — fractional allowed, so a 1.5 output gives X scale 1.5
+  and the X desktop equals the device pixel size; clamped to `[1,3]`;
+  frozen for the session). X clients see an oversized world by the
+  scale factor; the X surface is treated as `bufferScale=N` (the
+  composite path handles fractional) so it renders at the right
+  logical size; X-wire integer boundaries (configures, xdg_output)
+  round. EWMH polish landed: `_NET_SUPPORTING_WM_CHECK`
   (root + bookkeeper child + `_NET_WM_NAME="overdraw"`),
   `_NET_SUPPORTED` lists every EWMH atom the WM acts on, ICCCM
   `WM_STATE = NormalState` on managed windows (deleted on unmap),
