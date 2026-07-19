@@ -247,6 +247,7 @@ void deliverXwmEvent(const XwmEvent& e) {
         case XwmEvent::ConfigureRequest: typeStr = "configure-request"; break;
         case XwmEvent::ConfigureNotify: typeStr = "configure-notify"; break;
         case XwmEvent::SurfaceSerial: typeStr = "surface-serial"; break;
+        case XwmEvent::NetWmState: typeStr = "net-wm-state"; break;
         case XwmEvent::PropertyNotify: typeStr = "property-notify"; break;
         case XwmEvent::PropertyReply: typeStr = "property-reply"; break;
         case XwmEvent::FocusIn: typeStr = "focus-in"; break;
@@ -289,6 +290,12 @@ void deliverXwmEvent(const XwmEvent& e) {
 
     if (e.type == XwmEvent::FocusIn) {
         setU32("eventSequence", e.eventSequence);
+    }
+
+    if (e.type == XwmEvent::NetWmState) {
+        setU32("stateAction", e.stateAction);
+        setU32("stateAtom1", e.stateAtom1);
+        setU32("stateAtom2", e.stateAtom2);
     }
 
     // PropertyNotify / PropertyReply payload.

@@ -504,6 +504,17 @@ bool xwmProcess(XwmConn* x, const std::function<void(const XwmEvent&)>& cb) {
                     o.window = e->window;
                     o.serial = (static_cast<uint64_t>(hi) << 32) | lo;
                     cb(o);
+                } else if (e->type == x->atoms[ATOM_NET_WM_STATE] && e->format == 32) {
+                    // EWMH §5.7: post-map state changes arrive as a root-window
+                    // ClientMessage (action + up to two state atoms), not as a
+                    // property write by the client.
+                    XwmEvent o;
+                    o.type = XwmEvent::NetWmState;
+                    o.window = e->window;
+                    o.stateAction = e->data.data32[0];
+                    o.stateAtom1 = e->data.data32[1];
+                    o.stateAtom2 = e->data.data32[2];
+                    cb(o);
                 }
                 break;
             }

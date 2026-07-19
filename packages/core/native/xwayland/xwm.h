@@ -87,6 +87,7 @@ struct XwmEvent {
         ConfigureRequest,
         ConfigureNotify,  // X-side geometry changed (root's substructure-notify)
         SurfaceSerial,    // WL_SURFACE_SERIAL client-message (the association join)
+        NetWmState,       // _NET_WM_STATE client-message (post-map state change)
         PropertyNotify,   // a watched property on a managed window changed
         PropertyReply,    // async reply to a prior xwmGetProperty call
         FocusIn,          // X-side focus moved to this window (X -> compositor)
@@ -99,6 +100,11 @@ struct XwmEvent {
     int32_t x = 0, y = 0, width = 0, height = 0;
     bool overrideRedirect = false;
     uint64_t serial = 0;       // SurfaceSerial only
+    // NetWmState only: action (0 = remove, 1 = add, 2 = toggle) and the one
+    // or two state atoms the client wants changed (0 = unused slot).
+    uint32_t stateAction = 0;
+    uint32_t stateAtom1 = 0;
+    uint32_t stateAtom2 = 0;
     uint32_t eventSequence = 0; // FocusIn only: the X event's sequence number,
                                 // for serial validation against lastFocusSeq
 

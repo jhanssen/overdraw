@@ -22,6 +22,12 @@
 //                    for compositor readback tests).
 //   --fullscreen     Set _NET_WM_STATE=_NET_WM_STATE_FULLSCREEN before
 //                    mapping (how fullscreen games declare themselves).
+//   --fullscreen-after-ms <n>  After <n> ms of the event loop, request
+//                    fullscreen via the EWMH _NET_WM_STATE ClientMessage to
+//                    the root (action ADD) -- the post-map path a windowed
+//                    app takes when the user hits its fullscreen toggle.
+//                    Prints "[x11] fullscreen-requested" after the flush.
+//   --unfullscreen-after-ms <n>  Same, action REMOVE.
 //   --stdin-fills    Read commands from stdin: "fill X Y W H RRGGBB" paints
 //                    a sub-rectangle and prints "[x11] filled X Y W H" after
 //                    the flush. Drives partial-damage tests: each fill is an
@@ -58,6 +64,8 @@ int main(int argc, char** argv) {
     int timeoutMs = 5000;
     int overrideRedirect = 0;
     int fullscreen = 0;
+    int fullscreenAfterMs = -1;
+    int unfullscreenAfterMs = -1;
     int x = 0, y = 0, w = 200, h = 150;
     const char* fillColor = NULL;
     int stdinFills = 0;
@@ -79,6 +87,12 @@ int main(int argc, char** argv) {
         else if (!strcmp(argv[i], "--fill") && i + 1 < argc) { fillColor = argv[++i]; }
         else if (!strcmp(argv[i], "--stdin-fills")) { stdinFills = 1; }
         else if (!strcmp(argv[i], "--fullscreen")) { fullscreen = 1; }
+        else if (!strcmp(argv[i], "--fullscreen-after-ms") && i + 1 < argc) {
+            fullscreenAfterMs = atoi(argv[++i]);
+        }
+        else if (!strcmp(argv[i], "--unfullscreen-after-ms") && i + 1 < argc) {
+            unfullscreenAfterMs = atoi(argv[++i]);
+        }
     }
 
     xcb_connection_t* c = xcb_connect(NULL, NULL);
@@ -273,6 +287,30 @@ int main(int argc, char** argv) {
                 wmStateReported = 1;
             }
             free(r);
+        }
+        // --fullscreen-after-ms / --unfullscreen-after-ms: EWMH says a
+        // MAPPED window must not rewrite _NET_WM_STATE itself; it sends a
+        // ClientMessage to the root and the WM applies + republishes it.
+        if ((fullscreenAfterMs >= 0 && elapsedMs >= fullscreenAfterMs)
+            || (unfullscreenAfterMs >= 0 && elapsedMs >= unfullscreenAfterMs)) {
+            const int add = fullscreenAfterMs >= 0 && elapsedMs >= fullscreenAfterMs;
+            xcb_client_message_event_t ev;
+            memset(&ev, 0, sizeof(ev));
+            ev.response_type = XCB_CLIENT_MESSAGE;
+            ev.window = win;
+            ev.type = intern(c, "_NET_WM_STATE");
+            ev.format = 32;
+            ev.data.data32[0] = add ? 1 : 0;  /* _NET_WM_STATE_ADD : _REMOVE */
+            ev.data.data32[1] = intern(c, "_NET_WM_STATE_FULLSCREEN");
+            xcb_send_event(c, 0, screen->root,
+                           XCB_EVENT_MASK_SUBSTRUCTURE_REDIRECT
+                           | XCB_EVENT_MASK_SUBSTRUCTURE_NOTIFY,
+                           (const char*)&ev);
+            xcb_flush(c);
+            printf(add ? "[x11] fullscreen-requested\n"
+                       : "[x11] unfullscreen-requested\n");
+            fflush(stdout);
+            if (add) fullscreenAfterMs = -1; else unfullscreenAfterMs = -1;
         }
         if (elapsedMs >= deadlineMs) break;
         struct pollfd p[2] = {

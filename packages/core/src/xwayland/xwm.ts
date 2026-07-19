@@ -49,6 +49,7 @@ export interface XwmEventMsg {
     | "configure-request"
     | "configure-notify"
     | "surface-serial"
+    | "net-wm-state"
     | "property-notify"
     | "property-reply"
     | "focus-in"
@@ -76,6 +77,12 @@ export interface XwmEventMsg {
   // property-notify only: 0 = NewValue, 1 = Delete. The selection bridge
   // keys both INCR pumps off this distinction.
   propertyState?: number;
+  // net-wm-state only: EWMH _NET_WM_STATE ClientMessage payload. Action is
+  // 0 = remove, 1 = add, 2 = toggle; atoms are the one or two states the
+  // client wants changed (0 = unused slot).
+  stateAction?: number;
+  stateAtom1?: number;
+  stateAtom2?: number;
   // Selection-bridge fields.
   selection?: number;
   target?: number;
@@ -626,6 +633,41 @@ export function startXwm(state: CompositorState, addon: Addon, wmFd: number): Xw
         const surfaceId = lookupBySerial(state, serial);
         if (surfaceId !== null) { w.surfaceId = surfaceId; onAssociated(w); }
         else pendingBySerial.set(serial, w);  // wayland side not registered yet
+        break;
+      }
+      case "net-wm-state": {
+        // EWMH §5.7: a mapped client asks for a state change (fullscreen /
+        // maximized / modal) via ClientMessage; the WM applies it and
+        // rewrites the _NET_WM_STATE property to match.
+        const w = windows.get(ev.window);
+        if (!w) break;
+        const action = ev.stateAction ?? 0;
+        const atoms = new Set<number>(w.netWmStateAtoms);
+        for (const atom of [ev.stateAtom1 ?? 0, ev.stateAtom2 ?? 0]) {
+          if (atom === 0) continue;
+          if (action === 0) atoms.delete(atom);
+          else if (action === 1) atoms.add(atom);
+          else if (action === 2) {
+            if (atoms.has(atom)) atoms.delete(atom);
+            else atoms.add(atom);
+          }
+        }
+        w.netWmStateAtoms = atoms;
+        w.presentationHint = netWmStateToPresentation(atoms, pa);
+        w.modalHint = netWmStateIsModal(atoms, pa);
+        const stateAtom = atomsByName._NET_WM_STATE ?? 0;
+        if (stateAtom !== 0) {
+          if (atoms.size === 0) {
+            addon.xwmDeleteProperty(ev.window, stateAtom);
+          } else {
+            const buf = new Uint32Array(atoms.size);
+            let i = 0;
+            for (const atom of atoms) buf[i++] = atom;
+            addon.xwmChangeProperty(
+              ev.window, stateAtom, 4 /*ATOM*/, 32, buf, buf.length);
+          }
+        }
+        sendStructuralProposals(w);
         break;
       }
       case "property-notify": {
