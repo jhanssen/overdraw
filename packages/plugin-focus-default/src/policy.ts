@@ -11,11 +11,17 @@ export interface FocusPluginConfig {
   // pointer with a stationary pointer leaves the new window unfocused, and
   // click-to-focus forces the user to click before typing.
   focusOnMap: boolean;
+  // Follow-pointer only: treat a repick -- the WORLD moving under a
+  // stationary pointer (camera flight, strip scroll, retile) -- like real
+  // pointer motion and refocus whatever lands under the cursor. Off, only
+  // physical pointer motion moves focus.
+  followRepick: boolean;
 }
 
 export const DEFAULT_CONFIG: FocusPluginConfig = {
   policy: "follow-pointer",
   focusOnMap: true,
+  followRepick: false,
 };
 
 // Validate the user's config slice. Throws on any schema deviation; the
@@ -37,7 +43,13 @@ export function validateConfig(raw: unknown): FocusPluginConfig {
     throw new TypeError(
       `focus.focusOnMap must be a boolean (got ${typeof focusOnMap})`);
   }
-  return { policy, focusOnMap };
+  const followRepick = o.followRepick === undefined
+    ? DEFAULT_CONFIG.followRepick : o.followRepick;
+  if (typeof followRepick !== "boolean") {
+    throw new TypeError(
+      `focus.followRepick must be a boolean (got ${typeof followRepick})`);
+  }
+  return { policy, focusOnMap, followRepick };
 }
 
 // Decide focus from a coarse event. A `{}` return (undefined keyboardFocus)
@@ -55,6 +67,17 @@ export function decideFocus(config: FocusPluginConfig, inputs: FocusInputs): Foc
 
     case "pointer-leave": {
       if (policy === "follow-pointer") return { keyboardFocus: null };
+      return {};
+    }
+
+    case "pointer-repick": {
+      // The world moved under a stationary pointer. Ignored by default:
+      // a camera flight or strip scroll must not hand keyboard focus to
+      // whatever slides under the cursor. followRepick opts back into
+      // treating it as pointer motion.
+      if (policy === "follow-pointer" && config.followRepick) {
+        return { keyboardFocus: inputs.pointer.surfaceUnderPointer };
+      }
       return {};
     }
 

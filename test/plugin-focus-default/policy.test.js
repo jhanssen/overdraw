@@ -34,15 +34,21 @@ test('validateConfig: null/undefined uses defaults', () => {
 });
 
 test('validateConfig: full custom value passes through', () => {
-  const c = validateConfig({ policy: 'click-to-focus', focusOnMap: false });
-  assert.deepEqual(c, { policy: 'click-to-focus', focusOnMap: false });
+  const c = validateConfig(
+    { policy: 'click-to-focus', focusOnMap: false, followRepick: true });
+  assert.deepEqual(c,
+    { policy: 'click-to-focus', focusOnMap: false, followRepick: true });
 });
 
 test('validateConfig: partial fills with defaults', () => {
   assert.deepEqual(validateConfig({ policy: 'click-to-focus' }),
-    { policy: 'click-to-focus', focusOnMap: true });
+    { policy: 'click-to-focus', focusOnMap: true, followRepick: false });
   assert.deepEqual(validateConfig({ focusOnMap: false }),
-    { policy: 'follow-pointer', focusOnMap: false });
+    { policy: 'follow-pointer', focusOnMap: false, followRepick: false });
+});
+
+test('validateConfig: rejects non-boolean followRepick', () => {
+  assert.throws(() => validateConfig({ followRepick: 1 }), /followRepick/);
 });
 
 test('validateConfig: rejects invalid policy string', () => {
@@ -78,6 +84,32 @@ test('follow-pointer: pointer-leave clears focus', () => {
 test('follow-pointer: pointer-button does NOT change focus', () => {
   const r = decideFocus(FOLLOW, inputs('pointer-button',
     { under: 99, currentKb: 42 }));
+  assert.deepEqual(r, {});
+});
+
+// pointer-repick = the world moved under a stationary pointer (camera
+// flight, strip scroll, retile). Ignored by default so camera motion
+// never hands focus to whatever slides under the cursor; followRepick
+// opts back into treating it as pointer motion.
+test('follow-pointer: pointer-repick is ignored by default', () => {
+  const r = decideFocus(FOLLOW, inputs('pointer-repick',
+    { under: 99, currentKb: 42 }));
+  assert.deepEqual(r, {});
+});
+
+test('follow-pointer + followRepick: pointer-repick refocuses (and clears on null)', () => {
+  const cfg = { ...FOLLOW, followRepick: true };
+  assert.deepEqual(
+    decideFocus(cfg, inputs('pointer-repick', { under: 99, currentKb: 42 })),
+    { keyboardFocus: 99 });
+  assert.deepEqual(
+    decideFocus(cfg, inputs('pointer-repick', { currentKb: 42 })),
+    { keyboardFocus: null });
+});
+
+test('click-to-focus: pointer-repick is ignored even with followRepick', () => {
+  const r = decideFocus({ ...CLICK, followRepick: true },
+    inputs('pointer-repick', { under: 99, currentKb: 42 }));
   assert.deepEqual(r, {});
 });
 

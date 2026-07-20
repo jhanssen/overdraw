@@ -1087,8 +1087,12 @@ export async function installProtocols(
   // populates state.seat; the driver may dispatch before that happens
   // (unlikely in practice but cheap to guard).
   const applyTarget: FocusApplyTarget = {
-    applyKeyboardFocus(surfaceId) {
-      state.seat?.applyKeyboardFocus(surfaceId);
+    applyKeyboardFocus(surfaceId, reason) {
+      // Forward BOTH arguments. Dropping `reason` here is invisible to the
+      // type checker (narrower callbacks are assignable) but downgrades
+      // every decided focus to the seat's "explicit" default, breaking
+      // consumers that distinguish hover focus from deliberate focus.
+      state.seat?.applyKeyboardFocus(surfaceId, reason);
     },
   };
   const focusDriver: FocusDriver = opts.focusDriverFactory

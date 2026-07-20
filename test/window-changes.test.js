@@ -42,6 +42,19 @@ test('coalesces multiple field changes into one window.change', () => {
   assert.equal(events[0].appId, 'foo');
 });
 
+test('activated edges carry the recorded focus reason; other edges do not', () => {
+  const { state, events, surfaceId } = makeState({ kbFocusId: 1 });
+  state.lastFocusReason = 'pointer-enter';
+  markWindowChanged(state, surfaceId, 'activated');
+  flushWindowChanges(state);
+  assert.equal(events.length, 1);
+  assert.equal(events[0].focusReason, 'pointer-enter');
+  // A title-only change has no focus cause to report.
+  markWindowChanged(state, surfaceId, 'title');
+  flushWindowChanges(state);
+  assert.equal(events[1].focusReason, undefined);
+});
+
 test('flush clears pending so a second flush emits nothing', () => {
   const { state, events, surfaceId } = makeState();
   markWindowChanged(state, surfaceId, 'title');

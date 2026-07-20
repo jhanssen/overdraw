@@ -30,6 +30,72 @@ async function dispatchAndSettle(driver, settledWaiter, args) {
   await settledWaiter();
 }
 
+// The driver hands the dispatch reason to the apply target alongside the
+// id -- the seat stamps it on the activated window.change edge so
+// consumers can tell hover focus from deliberate focus. A target (or a
+// forwarding adapter in front of the seat) that drops the second argument
+// silently downgrades every decided focus to "explicit"; this pins the
+// two-argument contract.
+test('end-to-end: the apply target receives the dispatch reason', async () => {
+  await withRuntime({}, async (rt) => {
+    await rt.load([bundledToResolved(focusSpec, focusSpec.module,
+      loadedConfig({ policy: 'follow-pointer', focusOnMap: true }))]);
+    await rt.waitForNamespace('focus');
+    const applied = [];
+    const driver = createFocusDriver({
+      target: { applyKeyboardFocus: (id, reason) => applied.push({ id, reason }) },
+      decide: (inputs) => rt.invokeNamespace('focus', 'decide', [inputs]),
+    });
+    await dispatchAndSettle(driver, () => driver.settled(), {
+      reason: 'pointer-enter',
+      pointer: { x: 100, y: 100, surfaceUnderPointer: 42 },
+      currentKeyboardFocus: null,
+      trigger: 42,
+    });
+    assert.deepEqual(applied, [{ id: 42, reason: 'pointer-enter' }]);
+  });
+});
+
+// pointer-repick (the world moved under a stationary pointer) is ignored
+// by the default follow-pointer policy; focus: { followRepick: true }
+// opts back into refocusing.
+test('end-to-end: pointer-repick ignored by default, honored with followRepick', async () => {
+  await withRuntime({}, async (rt) => {
+    await rt.load([bundledToResolved(focusSpec, focusSpec.module,
+      loadedConfig({ policy: 'follow-pointer', focusOnMap: true }))]);
+    await rt.waitForNamespace('focus');
+    const applied = [];
+    const driver = createFocusDriver({
+      target: { applyKeyboardFocus: (id) => applied.push(id) },
+      decide: (inputs) => rt.invokeNamespace('focus', 'decide', [inputs]),
+    });
+    await dispatchAndSettle(driver, () => driver.settled(), {
+      reason: 'pointer-repick',
+      pointer: { x: 100, y: 100, surfaceUnderPointer: 42 },
+      currentKeyboardFocus: null,
+      trigger: 42,
+    });
+    assert.deepEqual(applied, [], 'repick must not move focus by default');
+  });
+  await withRuntime({}, async (rt) => {
+    await rt.load([bundledToResolved(focusSpec, focusSpec.module,
+      loadedConfig({ policy: 'follow-pointer', focusOnMap: true, followRepick: true }))]);
+    await rt.waitForNamespace('focus');
+    const applied = [];
+    const driver = createFocusDriver({
+      target: { applyKeyboardFocus: (id) => applied.push(id) },
+      decide: (inputs) => rt.invokeNamespace('focus', 'decide', [inputs]),
+    });
+    await dispatchAndSettle(driver, () => driver.settled(), {
+      reason: 'pointer-repick',
+      pointer: { x: 100, y: 100, surfaceUnderPointer: 42 },
+      currentKeyboardFocus: null,
+      trigger: 42,
+    });
+    assert.deepEqual(applied, [42], 'followRepick refocuses on repick');
+  });
+});
+
 test('end-to-end: bundled focus plugin (follow-pointer) responds to coarse events', async () => {
   await withRuntime({}, async (rt) => {
     await rt.load([bundledToResolved(focusSpec, focusSpec.module,

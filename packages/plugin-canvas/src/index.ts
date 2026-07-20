@@ -173,6 +173,28 @@ async function activate(
       + "column width are declared in the layout config); ignored");
   }
   const elasticDefault = elasticRaw === true;
+  // Strip camera behavior knobs (canvas slice, world mode only):
+  //   scrollOnHover (default false): hover-driven focus (follow-pointer's
+  //     pointer-enter) scrolls the strip to center the focused column.
+  //     Off, only deliberate focus -- click, keyboard cycle, workspace
+  //     switch, window map -- moves the camera.
+  //   clickReveals (default true): a pointer press centers the pressed
+  //     window's column (the pointer path to a partially visible column
+  //     when scrollOnHover is off).
+  //   unfitKeepsFocus (default true): workspace.unfit re-asserts the
+  //     window focused at invoke time instead of letting the focus policy
+  //     hand focus to whatever the landing leaves under the cursor.
+  const boolOpt = (key: string, dflt: boolean): boolean => {
+    const v = worldMode
+      ? (config?.canvas as { [k: string]: unknown })[key] : undefined;
+    if (v === undefined) return dflt;
+    if (typeof v === "boolean") return v;
+    sdk.log(`canvas: config ${key} must be a boolean; using ${dflt}`);
+    return dflt;
+  };
+  const scrollOnHover = boolOpt("scrollOnHover", false);
+  const clickReveals = boolOpt("clickReveals", true);
+  const unfitKeepsFocus = boolOpt("unfitKeepsFocus", true);
   // Camera scroll animation within a strip (ms).
   const SCROLL_MS = 150;
   // Scroll-reveal margin (the layout gap): a revealed column sits this
@@ -331,7 +353,8 @@ async function activate(
   // where the user was working.
   sdk.events.subscribe("window.change", (_name, payload) => {
     if (!payload || typeof payload !== "object") return;
-    const p = payload as { surfaceId?: unknown; activated?: unknown; changed?: unknown };
+    const p = payload as { surfaceId?: unknown; activated?: unknown; changed?: unknown;
+                           focusReason?: unknown };
     if (typeof p.surfaceId !== "number") return;
     if (typeof p.activated !== "boolean") return;
     // Only react to events that actually carry an activation transition;
@@ -367,8 +390,16 @@ async function activate(
         }
         // Elastic strips: keep the newly focused window inside the
         // docked view -- scroll the camera minimally within its island.
+        // Unless scrollOnHover opts in, pointer-caused focus that isn't a
+        // press -- hover crossings (pointer-enter) and world-moved-under-
+        // cursor repicks -- is exempt: the strip must not shift under a
+        // merely-moving cursor. A deliberate focus -- click, keyboard
+        // cycle, workspace switch, window map -- still reveals; so does
+        // an event with no reason (core versions that don't stamp one).
         if (rec && worldMode && isElastic(handle) && !override.has(rec.outputId)
-            && state.shownByOutput.get(rec.outputId) === handle) {
+            && state.shownByOutput.get(rec.outputId) === handle
+            && (scrollOnHover || (p.focusReason !== "pointer-enter"
+                                  && p.focusReason !== "pointer-repick"))) {
           const sid = p.surfaceId;
           void (async () => {
             const snap = await sdk.windows.get(sid);
@@ -389,6 +420,18 @@ async function activate(
       // pointer/keyboard is still anchored on that output.
     }
   });
+  // A pointer press is deliberate intent: center the pressed window's
+  // column in its docked strip. Hover-driven focus never scrolls (the
+  // gate in the window.change handler), so the click is the pointer path
+  // that commits to a partially visible column.
+  sdk.events.subscribe("pointer.pressed", (_name, payload) => {
+    if (!worldMode || !clickReveals) return;
+    if (!payload || typeof payload !== "object") return;
+    const sid = (payload as { surfaceId?: unknown }).surfaceId;
+    if (typeof sid !== "number") return;
+    void revealSurface(sid);
+  });
+
   // State changes that re-solve the world: a member floating/unfloating
   // joins or leaves the tiled set an elastic island is measured for, an
   // exclusive (maximize/fullscreen) member collapses its strip to the
@@ -800,6 +843,24 @@ async function activate(
     s = Math.min(maxScroll, Math.max(0, s));
     scrollByHandle.set(handle, s);
     return s !== prev ? s : null;
+  }
+
+  // Center/reveal `sid`'s column within its docked elastic strip. No-op
+  // when the surface isn't tracked, the island isn't an elastic strip, or
+  // the output is overridden (fit / free roam) or showing another
+  // workspace. Serves the deliberate reveal paths: pointer presses and
+  // the workspace.reveal action.
+  async function revealSurface(sid: number): Promise<void> {
+    const handle = state.surfaceToHandle.get(sid);
+    if (handle === undefined || !worldMode || !isElastic(handle)) return;
+    const rec = state.byHandle.get(handle);
+    if (!rec || override.has(rec.outputId)) return;
+    if (state.shownByOutput.get(rec.outputId) !== handle) return;
+    const snap = await sdk.windows.get(sid);
+    if (!snap?.outer || snap.outer.width <= 0) return;
+    if (revealScroll(rec.outputId, handle, snap.outer) !== null) {
+      await applyScroll(rec.outputId);
+    }
   }
 
   // Move a docked camera to its (re-clamped) scroll position within the
@@ -1404,8 +1465,14 @@ async function activate(
   // interactive grabs/drags). A flight preempted by a newer show abandons
   // its settle -- the winner (whose tween starts from the live mid-flight
   // camera) owns the output from that point.
+  // `keepFocus`: a surface that should hold keyboard focus once the
+  // flight settles, pre-empting the deferred policy decide -- under
+  // follow-pointer that decide would hand focus to whatever the landing
+  // leaves under the stationary cursor. Honored only if the surface still
+  // lives on the settled shown workspace.
   async function showWithFlight(
     index: WorkspaceIndex, outputId: number, t: ShowTransitionSpec,
+    keepFocus?: number,
   ): Promise<void> {
     noteFlight(t.kind);
     exitOverride(outputId);
@@ -1460,11 +1527,16 @@ async function activate(
         ? camPosFor(outputId, settleShown) : { x: 0, y: 0 };
       lastCamByOutput.set(outputId, settle);
       await sdk.windows.setOutputCamera(outputId, settle.x, settle.y);
-      const focusEffect = r.sideEffects.find(
-        (e): e is Extract<SideEffect, { kind: "requestFocusDecision" }> =>
-          e.kind === "requestFocusDecision");
-      if (focusEffect) {
-        await sdk.windows.requestFocusDecision(focusEffect.reason);
+      if (keepFocus !== undefined
+          && state.surfaceToHandle.get(keepFocus) === settleShown) {
+        await sdk.windows.focus(keepFocus);
+      } else {
+        const focusEffect = r.sideEffects.find(
+          (e): e is Extract<SideEffect, { kind: "requestFocusDecision" }> =>
+            e.kind === "requestFocusDecision");
+        if (focusEffect) {
+          await sdk.windows.requestFocusDecision(focusEffect.reason);
+        }
       }
     } finally {
       if (flying.get(outputId) === token) flying.delete(outputId);
@@ -1758,6 +1830,11 @@ async function activate(
   async function unfitTo(
     outputId: number, index: number | undefined, t: CameraTransitionSpec | null,
   ): Promise<void> {
+    // The window focused when the action fired keeps focus through the
+    // zoom-in (unfitKeepsFocus): the camera motion parks the cursor
+    // wherever the landing leaves it, and the policy decide would hand
+    // focus to that window instead.
+    const keep = unfitKeepsFocus ? focusedSurfaceId : null;
     exitOverride(outputId);
     const positions = state.positionsByOutput.get(outputId) ?? [];
     const shown = state.shownByOutput.get(outputId);
@@ -1777,15 +1854,24 @@ async function activate(
         `workspace.unfit: index ${target} out of bounds (1..${positions.length})`);
     }
     if (target !== shownIdx) {
+      const keepFocus = keep !== null
+        && state.surfaceToHandle.get(keep) === positions[target - 1]
+        ? keep : undefined;
       if (t) {
         await showWithFlight(asIndex(target), outputId,
-          { kind: "camera", duration: t.duration, easing: t.easing });
+          { kind: "camera", duration: t.duration, easing: t.easing },
+          keepFocus);
         return;
       }
       await cancelFlight(outputId);
       const r = reg.show(state, asIndex(target), outputId, outputNameOf(outputId));
       state = r.state;
-      await applyEffects(r.sideEffects);
+      if (keepFocus !== undefined) {
+        await applyEffects(r.sideEffects, new Set(["requestFocusDecision"]));
+        await sdk.windows.focus(keepFocus);
+      } else {
+        await applyEffects(r.sideEffects);
+      }
       return;
     }
     // Zoom back onto the shown workspace: optics only. The fit union
@@ -2261,6 +2347,26 @@ async function activate(
       const p = parseUnfitParams(params, resolveOutputName, focusedOutputId());
       const t = parseCameraTransition(params, "workspace.unfit");
       await unfitTo(p.outputId, p.index, t);
+      return null;
+    },
+  });
+
+  sdk.actions.register({
+    name: "workspace.reveal",
+    description:
+      "World mode: scroll the docked elastic strip to center a window's column. Params: { surfaceId?: number } -- default the focused window. No-op when the window's workspace isn't an elastic strip in the docked view.",
+    handler: async (params: unknown): Promise<null> => {
+      if (!worldMode) {
+        throw new Error(
+          "workspace.reveal: requires canvas world mode (canvas: { world: true })");
+      }
+      const p = (params ?? {}) as { surfaceId?: unknown };
+      if (p.surfaceId !== undefined && p.surfaceId !== null
+          && typeof p.surfaceId !== "number") {
+        throw new TypeError("workspace.reveal: params.surfaceId must be a number");
+      }
+      const sid = typeof p.surfaceId === "number" ? p.surfaceId : focusedSurfaceId;
+      if (typeof sid === "number") await revealSurface(sid);
       return null;
     },
   });

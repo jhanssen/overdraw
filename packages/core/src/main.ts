@@ -60,7 +60,7 @@ import { reemitFractionalScale } from "./protocols/wp_fractional_scale_manager_v
 import { reemitScanoutFeedback } from "./protocols/zwp_linux_dmabuf_v1.js";
 import { makeOnOutputAdded, makeOnOutputRemoved } from "./output/hotplug.js";
 import { WINDOW_EVENT } from "./events/types.js";
-import { createCompositorBus, KEYBOARD_EVENT } from "./events/window-bus.js";
+import { createCompositorBus, KEYBOARD_EVENT, POINTER_EVENT } from "./events/window-bus.js";
 import { DynamicBus } from "./events/dynamic-bus.js";
 import { IpcServer } from "./ipc/server.js";
 import { bindAddon, installConsoleShim, parseLogArgs, log, LEVEL } from "./log.js";
@@ -155,6 +155,7 @@ bus.on(WINDOW_EVENT.unmap, (ev) => { pluginBus.emit(WINDOW_EVENT.unmap, ev); });
 bus.on(WINDOW_EVENT.change, (ev) => { pluginBus.emit(WINDOW_EVENT.change, ev); });
 bus.on(WINDOW_EVENT.closing, (ev) => { pluginBus.emit(WINDOW_EVENT.closing, ev); });
 bus.on(WINDOW_EVENT.opening, (ev) => { pluginBus.emit(WINDOW_EVENT.opening, ev); });
+bus.on(POINTER_EVENT.pressed, (ev) => { pluginBus.emit(POINTER_EVENT.pressed, ev); });
 // Reverse bridge: the wm emits window.preconfigure on the plugin bus
 // synchronously inside markInitialCommitComplete. Mirror it onto the
 // typed bus so core-side subscribers (e.g. the intercept broker, which

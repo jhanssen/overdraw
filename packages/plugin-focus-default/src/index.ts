@@ -8,7 +8,8 @@ import { decideFocus, validateConfig, type FocusPluginConfig } from "./policy.js
 
 export default async function init(sdk: PluginSdkShape, rawConfig?: unknown): Promise<void> {
   const config: FocusPluginConfig = validateConfig(rawConfig);
-  sdk.log(`focus plugin: policy=${config.policy}, focusOnMap=${config.focusOnMap}`);
+  sdk.log(`focus plugin: policy=${config.policy}, focusOnMap=${config.focusOnMap}, `
+    + `followRepick=${config.followRepick}`);
 
   const api: FocusAPI = {
     decide(inputs: FocusInputs): Promise<FocusResult> {

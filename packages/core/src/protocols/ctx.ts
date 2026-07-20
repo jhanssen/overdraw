@@ -1011,6 +1011,11 @@ export interface CompositorState {
   // last flush. The frame sweep drains this into window.change events. Populated
   // by set_title/set_app_id and keyboard-focus changes. Created lazily.
   pendingWindowChanges?: Map<number, Set<WindowChangeField>>;
+  // The coarse cause of the most recent keyboard-focus move (the seat
+  // records it in setKbFocus). Stamped on flushed window.change events
+  // whose changed set includes "activated", so consumers can tell a
+  // hover-driven focus (pointer-enter) from a deliberate one.
+  lastFocusReason?: import("@overdraw/focus-types").FocusReason;
   // Per-output toplevel-order filter set by sdk.windows.setOutputStack
   // (workspace plugin, etc). The protocol layer is the single owner of the
   // compositor's per-output draw stack: rebuildStackWithPopups expands each
@@ -1396,8 +1401,11 @@ export interface SeatState {
   focusWindow(surfaceId: number, surfaceRec: { resource: Resource },
               rect: { x: number; y: number; width: number; height: number }): void;
   // Apply a focus result by surface id (null clears). Used by the focus
-  // driver and by the explicit-override path sdk.windows.focus.
-  applyKeyboardFocus(surfaceId: number | null): void;
+  // driver and by the explicit-override path sdk.windows.focus. `reason`
+  // is the coarse cause of the move, stamped on the resulting activated
+  // window.change edge; direct callers omit it ("explicit").
+  applyKeyboardFocus(surfaceId: number | null,
+                     reason?: import("./focus-driver.js").FocusReason): void;
   // Trigger a focus-driver decide() with the given coarse reason. The seat
   // supplies the current pointer position + surfaceUnderPointer + current
   // keyboard focus to FocusInputs. Used by policy-mediated focus callers

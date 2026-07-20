@@ -125,6 +125,9 @@ export interface PluginWindowsLike {
     layout?: { [k: string]: unknown };
   }): Promise<{ width: number; height: number } | null>;
   requestFocusDecision(reason: FocusReason, trigger?: number): Promise<void>;
+  // Explicit focus override; bypasses the focus plugin's decide(). null
+  // clears. For policy-mediated focus, use requestFocusDecision.
+  focus(id: number | null): Promise<void>;
   list(): Promise<WindowSnapshotLike[]>;
   get(id: number): Promise<WindowSnapshotLike | null>;
   // Behavioral-state proposal (tiling, exclusive, visible, ...); runs the

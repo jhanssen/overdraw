@@ -129,12 +129,17 @@ export type WindowChangeField = "title" | "appId" | "activated";
 // Emitted (coalesced per frame) when a mapped toplevel's metadata changes.
 // `changed` lists the fields; the current values are included so a consumer
 // never has to re-query. `activated` is keyboard-focus (active window).
+// `focusReason` accompanies activated edges: the coarse cause of the focus
+// move (a FocusReason -- "pointer-enter", "pointer-button", "explicit",
+// ...), so consumers can distinguish hover-driven focus from deliberate
+// focus. Absent when no focus move was recorded (e.g. title-only changes).
 export type WindowChangeEvent = {
   surfaceId: number;
   changed: WindowChangeField[];
   appId: string | null;
   title: string | null;
   activated: boolean;
+  focusReason?: string;
 };
 
 // Emitted when a per-window state-bag entry changes (sdk.windows.setState or

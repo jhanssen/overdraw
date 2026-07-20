@@ -59,16 +59,22 @@ async function withCanvasPlugin(fn, opts = {}) {
   const bus = createCompositorBus();
   const sink = mockSink();
   const layoutSnapshots = [];
+  // The WM's apply target, captured so tests can push real window rects
+  // (the capture driver never computes any).
+  let layoutApply = null;
   const wm = createWm(sink,
     [{ id: 0, rect: { x: 0, y: 0, width: 800, height: 600 }, scale: 1 }],
     {
       // The plugin bus makes the WM's window.committed/relayout emits
       // visible to the plugin under test, as in production.
       pluginBus,
-      layoutDriverFactory: (target, snapshot) => ({
-        schedule() { layoutSnapshots.push(snapshot()); },
-        settled() { return Promise.resolve(); },
-      }),
+      layoutDriverFactory: (target, snapshot) => {
+        layoutApply = target;
+        return {
+          schedule() { layoutSnapshots.push(snapshot()); },
+          settled() { return Promise.resolve(); },
+        };
+      },
     });
   const seatCalls = { focus: [] };
   const seat = {
@@ -180,6 +186,7 @@ async function withCanvasPlugin(fn, opts = {}) {
     await fn({
       rt, sink, wm, wsEvents, seatCalls, layoutSnapshots, animCalls, animPending,
       pluginBus, seat, state,
+      layoutApply: () => layoutApply,
       islands() { return layoutSnapshots.at(-1)?.islands ?? []; },
       addWindow(id, { place } = {}) {
         wm.addWindow(id, res(id));
@@ -803,6 +810,51 @@ test('world: focus while fitted flips the shown workspace; unfit zooms into it',
   }, { world: true });
 });
 
+// unfit re-asserts the window focused at invoke time (unfitKeepsFocus,
+// default on) instead of firing the workspace-changed policy decide --
+// under follow-pointer that decide would hand focus to whatever the
+// landing leaves under the stationary cursor.
+test('world: unfit keeps the invoking focus instead of re-deciding', async () => {
+  await withCanvasPlugin(async (h) => {
+    const { rt, pluginBus, seatCalls } = h;
+    await setupTwoIslands(h);
+    // Focus 102 on the NON-shown ws2 (no fit override, so the shown
+    // workspace does not follow): unfit's default target becomes ws2.
+    pluginBus.emit('window.change',
+      { surfaceId: 102, activated: true, changed: ['activated'] });
+    await settle();
+    seatCalls.focus.length = 0;
+
+    await rt.invokeAction('workspace.unfit', {});
+    await settle();
+    assert.ok(seatCalls.focus.includes(102),
+      `unfit re-asserts the invoking focus (got ${JSON.stringify(seatCalls.focus)})`);
+    assert.ok(!seatCalls.focus.some(
+      (c) => typeof c === 'object' && c !== null && c.reason === 'workspace-changed'),
+      'no workspace-changed policy decide after unfit');
+    const cur = await call(rt, 'current', [0]);
+    assert.equal(cur.index, 2);
+  }, { world: true });
+});
+
+// unfitKeepsFocus: false restores the policy decide on unfit.
+test('world: unfitKeepsFocus false fires the workspace-changed decide', async () => {
+  await withCanvasPlugin(async (h) => {
+    const { rt, pluginBus, seatCalls } = h;
+    await setupTwoIslands(h);
+    pluginBus.emit('window.change',
+      { surfaceId: 102, activated: true, changed: ['activated'] });
+    await settle();
+    seatCalls.focus.length = 0;
+
+    await rt.invokeAction('workspace.unfit', {});
+    await settle();
+    assert.ok(seatCalls.focus.some(
+      (c) => typeof c === 'object' && c !== null && c.reason === 'workspace-changed'),
+      `expected a workspace-changed decide (got ${JSON.stringify(seatCalls.focus)})`);
+  }, { canvas: { world: true, unfitKeepsFocus: false } });
+});
+
 test('world: unfit with a different index behaves like show', async () => {
   await withCanvasPlugin(async (h) => {
     const { rt, sink, wsEvents } = h;
@@ -1285,6 +1337,78 @@ test('elastic: a column with neighbors both sides is centered; head/tail sit flu
     assert.deepEqual(await focus(103, 800), { outputId: 0, x: 400, y: 0, zoom: 1 },
       'the tail column sits flush right');
   }, { canvas: { world: true, elastic: true }, layout: { mode: 'columns' } });
+});
+
+// Hover-driven focus (focusReason "pointer-enter") must not move the
+// camera: the strip scrolls only on deliberate focus (click, keyboard,
+// workspace switch), a press, or an explicit workspace.reveal.
+test('elastic: hover focus never scrolls; a press or workspace.reveal does', async () => {
+  await withCanvasPlugin(async (h) => {
+    const { rt, sink, pluginBus, addWindow, layoutApply } = h;
+    for (const id of [101, 102, 103]) { addWindow(id); await settle(); }
+    // Real column rects in the WM (3 x 400 across the 1200 strip): the
+    // press/reveal paths read them via windows.get.
+    await layoutApply().apply({ rects: [
+      { id: 101, outer: { x: 0, y: 0, width: 400, height: 600 } },
+      { id: 102, outer: { x: 400, y: 0, width: 400, height: 600 } },
+      { id: 103, outer: { x: 800, y: 0, width: 400, height: 600 } },
+    ] }, 'state-changed');
+    await settle();
+
+    // Deliberate focus (no focusReason) on the middle column: centered.
+    pluginBus.emit('window.change',
+      { surfaceId: 102, activated: true, changed: ['activated'] });
+    await settle();
+    assert.deepEqual(sink.cameraCalls.at(-1), { outputId: 0, x: 200, y: 0, zoom: 1 });
+    sink.cameraCalls.length = 0;
+
+    // Hover onto the head column: focus follows the pointer, the camera stays.
+    pluginBus.emit('window.change',
+      { surfaceId: 101, activated: true, changed: ['activated'],
+        focusReason: 'pointer-enter' });
+    await settle();
+    assert.equal(sink.cameraCalls.length, 0, 'hover focus must not scroll the strip');
+
+    // A repick (world moved under the stationary cursor) is equally inert.
+    pluginBus.emit('window.change',
+      { surfaceId: 101, activated: true, changed: ['activated'],
+        focusReason: 'pointer-repick' });
+    await settle();
+    assert.equal(sink.cameraCalls.length, 0, 'repick focus must not scroll the strip');
+
+    // A press commits to the head column: it reveals (flush left).
+    pluginBus.emit('pointer.pressed', { surfaceId: 101 });
+    await settle();
+    assert.deepEqual(sink.cameraCalls.at(-1), { outputId: 0, x: 0, y: 0, zoom: 1 });
+    sink.cameraCalls.length = 0;
+
+    // workspace.reveal scrolls to an explicit column (tail -> flush right).
+    await rt.invokeAction('workspace.reveal', { surfaceId: 103 });
+    await settle();
+    assert.deepEqual(sink.cameraCalls.at(-1), { outputId: 0, x: 400, y: 0, zoom: 1 });
+  }, { canvas: { world: true, elastic: true }, layout: { mode: 'columns' } });
+});
+
+// scrollOnHover: true restores hover-driven strip scroll (the previous
+// default): a pointer-enter focus centers its column like any other focus.
+test('elastic: scrollOnHover opts back into hover-driven scroll', async () => {
+  await withCanvasPlugin(async (h) => {
+    const { sink, pluginBus, addWindow, layoutApply } = h;
+    for (const id of [101, 102, 103]) { addWindow(id); await settle(); }
+    await layoutApply().apply({ rects: [
+      { id: 101, outer: { x: 0, y: 0, width: 400, height: 600 } },
+      { id: 102, outer: { x: 400, y: 0, width: 400, height: 600 } },
+      { id: 103, outer: { x: 800, y: 0, width: 400, height: 600 } },
+    ] }, 'state-changed');
+    await settle();
+    sink.cameraCalls.length = 0;
+    pluginBus.emit('window.change',
+      { surfaceId: 102, activated: true, changed: ['activated'],
+        focusReason: 'pointer-enter' });
+    await settle();
+    assert.deepEqual(sink.cameraCalls.at(-1), { outputId: 0, x: 200, y: 0, zoom: 1 });
+  }, { canvas: { world: true, elastic: true, scrollOnHover: true },
+     layout: { mode: 'columns' } });
 });
 
 test('elastic: the docked camera scrolls to keep the focused window visible', async () => {

@@ -20,7 +20,7 @@ import {
 } from "./ctx.js";
 import { computeGrabRect } from "../input/grab-math.js";
 import type { Resource, InputEvent } from "../types.js";
-import { KEYBOARD_EVENT } from "../events/window-bus.js";
+import { KEYBOARD_EVENT, POINTER_EVENT } from "../events/window-bus.js";
 import { markWindowChanged } from "./window-changes.js";
 import type { FocusDriver } from "./focus-driver.js";
 import { hitTestSurfaceTree, type SurfaceHit } from "../surface-hit-test.js";
@@ -515,14 +515,20 @@ export default function makeSeat(ctx: Ctx, driver: FocusDriver): SeatHandler {
   }
 
   // Move keyboard focus to `target` (or clear with null). Sends wl_keyboard
-  // leave/enter on change. No-op if already focused there.
-  function setKbFocus(target: SeatFocus | null): void {
+  // leave/enter on change. No-op if already focused there. `reason` is the
+  // coarse event that caused the move (focus-driver decisions carry theirs;
+  // direct callers -- windows.focus, focus cycling, layer-shell exclusivity
+  // -- are deliberate, hence the "explicit" default). It is recorded so the
+  // window.change activated edge can report WHY focus moved.
+  function setKbFocus(target: SeatFocus | null,
+                      reason: import("./focus-driver.js").FocusReason = "explicit"): void {
     const seat = ctx.state.seat;
     if (!seat) return;
     const cur = seat.kbFocus;
     if (cur && target && cur.surfaceId === target.surfaceId) return;
     if (cur && (!target || cur.surfaceId !== target.surfaceId)) sendKbLeave(cur);
     seat.kbFocus = target;
+    ctx.state.lastFocusReason = reason;
     if (target) sendKbEnter(target);
     // keyboard.focus event: the clipboard layer (re)sends the selection to the
     // newly focused client (selection follows keyboard focus); the XWM mirrors
@@ -601,16 +607,17 @@ export default function makeSeat(ctx: Ctx, driver: FocusDriver): SeatHandler {
   // care about apply failures; the kb focus simply stays where it was).
   // Layer-shell exclusive override: when a qualifying exclusive surface
   // exists, any focus target is replaced with that surface.
-  function applyKeyboardFocus(surfaceId: number | null): void {
+  function applyKeyboardFocus(surfaceId: number | null,
+                              reason: import("./focus-driver.js").FocusReason = "explicit"): void {
     const exclusive = pickExclusiveLayerSurface();
     if (exclusive) {
       const t = focusTargetFor(exclusive.surface.id);
       setKbFocus(t);
       return;
     }
-    if (surfaceId === null) { setKbFocus(null); return; }
+    if (surfaceId === null) { setKbFocus(null, reason); return; }
     const t = focusTargetFor(surfaceId);
-    if (t) setKbFocus(t);
+    if (t) setKbFocus(t, reason);
   }
 
   // Recompute the exclusive-layer-focus state. Called from the layer-shell
@@ -967,6 +974,12 @@ export default function makeSeat(ctx: Ctx, driver: FocusDriver): SeatHandler {
         }
         if (ev.pressed) {
           const rootId = seat.focus.rootSurfaceId ?? seat.focus.surfaceId;
+          // Deliberate pointer intent, independent of any focus change:
+          // under follow-pointer the clicked window is usually already
+          // focused (the hover did it), so a press produces no focus
+          // edge -- consumers that react to clicks (e.g. the canvas strip
+          // centering on the clicked column) need this signal.
+          ctx.state.bus?.emit(POINTER_EVENT.pressed, { surfaceId: rootId });
           dispatchFocus("pointer-button", rootId, rootId);
           // Click-to-raise: a press on a toplevel's content surface
           // raises it (and its modal subtree, redirecting up the
@@ -1155,10 +1168,13 @@ export default function makeSeat(ctx: Ctx, driver: FocusDriver): SeatHandler {
 
   // Re-derive the surface under the (stationary) pointer after the scene
   // changed beneath it -- a relayout swapped tiles, a workspace switch
-  // replaced the stack. Produces the same leave/enter/motion sequence and
-  // focus-policy dispatch a zero-length pointer motion would, so
-  // follow-pointer keyboard focus and client hover state track scene
-  // changes, not just device input. No-op while a move/resize grab or a
+  // replaced the stack, a camera write scrolled the world. Client hover
+  // state (wl_pointer leave/enter/motion) is refreshed exactly as a
+  // zero-length pointer motion would, but the focus-policy dispatch uses
+  // "pointer-repick", NOT "pointer-enter": the pointer did not move, the
+  // world did, and the default follow-pointer policy deliberately ignores
+  // it (a camera flight must not hand keyboard focus to whatever slides
+  // under the stationary cursor). No-op while a move/resize grab or a
   // DnD drag owns the pointer, or while the host pointer is outside the
   // compositor.
   function repickPointer(): void {
@@ -1173,7 +1189,7 @@ export default function makeSeat(ctx: Ctx, driver: FocusDriver): SeatHandler {
     if (!hit) {
       notifyPointerFocus(ctx, null);
       if (prevPointerSurface !== null) {
-        dispatchFocus("pointer-leave", undefined, null);
+        dispatchFocus("pointer-repick", undefined, null);
       }
       return;
     }
@@ -1198,7 +1214,7 @@ export default function makeSeat(ctx: Ctx, driver: FocusDriver): SeatHandler {
     }
     notifyPointerFocus(ctx, hit.surfaceId);
     if (prevPointerSurface !== hit.surfaceId) {
-      dispatchFocus("pointer-enter", hit.rootSurfaceId, hit.rootSurfaceId);
+      dispatchFocus("pointer-repick", hit.rootSurfaceId, hit.rootSurfaceId);
     }
   }
 

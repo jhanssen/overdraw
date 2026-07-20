@@ -12,6 +12,10 @@
 export const FOCUS_REASONS = [
   "pointer-enter",     // pointer crossed into a surface
   "pointer-leave",     // pointer left all surfaces (or went off-output)
+  "pointer-repick",    // the surface under a STATIONARY pointer changed
+                       // because the world moved (camera write, retile),
+                       // not because the pointer did. surfaceUnderPointer
+                       // is the new surface (null when nothing is there).
   "pointer-button",    // a button press over a surface
   "window-mapped",     // a toplevel mapped + got presentable content
   "window-unmapped",   // a mapped toplevel unmapped/destroyed

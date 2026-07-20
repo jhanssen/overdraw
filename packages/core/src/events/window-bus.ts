@@ -30,6 +30,19 @@ export const KEYBOARD_EVENT = {
   focus: "keyboard.focus",
 } as const;
 
+// A pointer button was pressed over a toplevel (its root surface id).
+// Deliberate pointer intent, decoupled from focus: under follow-pointer
+// the pressed window is usually already focused, so no focus edge fires
+// for the press. Consumers reacting to clicks (canvas strip centering)
+// subscribe here.
+export type PointerPressedEvent = {
+  surfaceId: number;
+};
+
+export const POINTER_EVENT = {
+  pressed: "pointer.pressed",
+} as const;
+
 // Selection (clipboard / primary) ownership changed -- a wl client set or
 // cleared a source, OR the Xwayland selection bridge published an X-owned
 // source. Subscribers (the data-control protocol layer; bookkeeping that
@@ -56,6 +69,7 @@ export interface CompositorEventMap {
   [WINDOW_EVENT.preconfigure]: WindowPreconfigureEvent;
   [STACK_EVENT.relayout]: StackRelayoutEvent;
   [KEYBOARD_EVENT.focus]: KeyboardFocusEvent;
+  [POINTER_EVENT.pressed]: PointerPressedEvent;
   [SELECTION_EVENT.changed]: SelectionChangedEvent;
 }
 

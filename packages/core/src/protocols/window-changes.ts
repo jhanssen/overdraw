@@ -39,6 +39,12 @@ export function flushWindowChanges(state: CompositorState): void {
       appId: ta.appId,
       title: ta.title,
       activated: surfaceId === activeId,
+      // Why the focus moved, for activated edges. Coalescing note: with
+      // several focus moves in one frame, every activated edge carries
+      // the LAST move's reason -- the one that produced the flushed
+      // activated value.
+      ...(fields.has("activated") && state.lastFocusReason !== undefined
+        ? { focusReason: state.lastFocusReason } : {}),
     });
   }
   pending.clear();

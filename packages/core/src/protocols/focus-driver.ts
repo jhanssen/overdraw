@@ -27,8 +27,11 @@ export interface DispatchArgs {
 
 export interface FocusApplyTarget {
   // null clears focus. The seat resolves the surface id to its current
-  // SeatFocus and sends the wl_keyboard leave/enter pair.
-  applyKeyboardFocus(surfaceId: number | null): void;
+  // SeatFocus and sends the wl_keyboard leave/enter pair. `reason` is the
+  // coarse event that drove the decision; the seat stamps it on the
+  // focus-change notifications so consumers can tell a hover-driven focus
+  // from a deliberate one (click, keyboard, workspace switch).
+  applyKeyboardFocus(surfaceId: number | null, reason: FocusReason): void;
 }
 
 // Production wraps runtime.invokeNamespace('focus', 'decide', [inputs]);
@@ -67,7 +70,7 @@ export function createFocusDriver(deps: FocusDriverDeps): FocusDriver {
       (result) => {
         if (mySeq !== latestSeq) return;                  // superseded; drop
         if (result.keyboardFocus === undefined) return;   // leave unchanged
-        deps.target.applyKeyboardFocus(result.keyboardFocus);
+        deps.target.applyKeyboardFocus(result.keyboardFocus, args.reason);
       },
       (err: unknown) => {
         const msg = err instanceof Error ? err.message : String(err);
