@@ -20,18 +20,25 @@ export interface InputBrokerDeps {
 
 export const NOT_HANDLED = Symbol("input-broker:not-handled");
 
-export type InputBroker = (
-  pluginName: string, method: string, params: unknown,
-) => unknown | typeof NOT_HANDLED;
+export interface InputBroker {
+  onRequest(
+    pluginName: string, method: string, params: unknown,
+  ): unknown | typeof NOT_HANDLED;
+  // Drop every bind and mode `pluginName` registered: chain unbinds, mode
+  // undefines, table cleanup. Wired to the runtime's onPluginRelease so a
+  // stopped plugin's chords stop matching and a same-named successor can
+  // re-define its modes (defineMode throws on duplicates).
+  unregisterAllFor(pluginName: string): void;
+}
 
 export function createInputBroker(deps: InputBrokerDeps): InputBroker {
   const { state, emitToPlugin } = deps;
 
   // Per-plugin registration tables. Each plugin mints its own binding ids
   // (via input-sdk's nextId counter); the broker maps (pluginName, id) ->
-  // chain unbind. On unbind or plugin teardown, we walk the table.
+  // chain unbind. Walked by unbind requests and unregisterAllFor.
   const bindings = new Map<string, Map<number, { unbind(): void }>>();
-  // Per-plugin defined modes; on teardown we undefine them.
+  // Per-plugin defined modes, for the same lifecycle.
   const modes = new Map<string, Map<string, { undefine(): void }>>();
 
   function pluginBindings(name: string): Map<number, { unbind(): void }> {
@@ -45,7 +52,20 @@ export function createInputBroker(deps: InputBrokerDeps): InputBroker {
     return m;
   }
 
-  return (pluginName: string, method: string, params: unknown): unknown | typeof NOT_HANDLED => {
+  function unregisterAllFor(pluginName: string): void {
+    const b = bindings.get(pluginName);
+    if (b) {
+      for (const handle of b.values()) handle.unbind();
+      bindings.delete(pluginName);
+    }
+    const m = modes.get(pluginName);
+    if (m) {
+      for (const handle of m.values()) handle.undefine();
+      modes.delete(pluginName);
+    }
+  }
+
+  const onRequest = (pluginName: string, method: string, params: unknown): unknown | typeof NOT_HANDLED => {
     const chain = state.bindingChain;
     if (!chain) return NOT_HANDLED;
 
@@ -119,6 +139,8 @@ export function createInputBroker(deps: InputBrokerDeps): InputBroker {
         return NOT_HANDLED;
     }
   };
+
+  return { onRequest, unregisterAllFor };
 }
 
 // ---- Payload guards -------------------------------------------------------

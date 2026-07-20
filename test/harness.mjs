@@ -534,7 +534,7 @@ export async function setupCompositor(opts = {}) {
       if (r !== WINDOWS_NOT_HANDLED) return r;
     }
     if (method.startsWith("input.")) {
-      const r = inputBroker(plugin, method, params);
+      const r = inputBroker.onRequest(plugin, method, params);
       if (r !== INPUT_NOT_HANDLED) return r;
     }
     if (transitionsBroker && method.startsWith("transitions.")) {

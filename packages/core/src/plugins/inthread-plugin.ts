@@ -127,8 +127,7 @@ export class InThreadPlugin implements PluginHandle {
       if (this.state !== "spawning") return;
       this.log(`[plugin ${this.cfg.name}] init did not settle within ${this.opts.initTimeoutMs}ms; marking failed`);
       this.state = "failed";
-      this.ns.registry().unregisterAllFor(this.cfg.name);
-      this.ns.actions().unregisterAllFor(this.cfg.name);
+      this.ns.releasePlugin(this.cfg.name);
       this.releaseBusSubs();
       this.endpoint?.close(`plugin ${this.cfg.name} init timed out`);
       this.endpoint = null;
@@ -161,8 +160,7 @@ export class InThreadPlugin implements PluginHandle {
       } else {
         this.log(`[plugin ${this.cfg.name}] init failed: ${d.error ?? "unknown"}`);
         this.state = "failed";
-        this.ns.registry().unregisterAllFor(this.cfg.name);
-        this.ns.actions().unregisterAllFor(this.cfg.name);
+        this.ns.releasePlugin(this.cfg.name);
         this.releaseBusSubs();
         this.endpoint?.close(`plugin ${this.cfg.name} init failed`);
         this.endpoint = null;
@@ -182,8 +180,7 @@ export class InThreadPlugin implements PluginHandle {
     this.clearInitTimer();
     if (!this.endpoint || this.state === "failed") {
       this.releaseBusSubs();
-      this.ns.registry().unregisterAllFor(this.cfg.name);
-      this.ns.actions().unregisterAllFor(this.cfg.name);
+      this.ns.releasePlugin(this.cfg.name);
       this.state = "failed";
       this.settleFirst();
       return;
@@ -198,8 +195,7 @@ export class InThreadPlugin implements PluginHandle {
       await Promise.race([ep.request("shutdown"), timeout]);
     } catch { /* onShutdown threw; carry on */ }
     this.releaseBusSubs();
-    this.ns.registry().unregisterAllFor(this.cfg.name);
-    this.ns.actions().unregisterAllFor(this.cfg.name);
+    this.ns.releasePlugin(this.cfg.name);
     ep.close(`plugin ${this.cfg.name} stopped`);
     this.endpoint = null;
     this.state = "failed";

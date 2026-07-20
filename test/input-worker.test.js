@@ -39,7 +39,7 @@ test("Worker plugin: sdk.input.bind + defineMode + pushMode/popMode end-to-end",
     onEvent: (p, n, d) => events.push({ p, n, d }),
     onRequest: (plugin, method, params) => {
       if (method.startsWith("input.")) {
-        const r = inputBroker(plugin, method, params);
+        const r = inputBroker.onRequest(plugin, method, params);
         if (r === INPUT_NOT_HANDLED) throw new Error(`unhandled ${method}`);
         return r;
       }

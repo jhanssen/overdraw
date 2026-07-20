@@ -60,6 +60,12 @@ export interface RuntimeOptions {
   // is live; without this bound, an init that never settles would block
   // load() -- and compositor startup -- forever with no diagnostic.
   initTimeoutMs: number;
+  // Called whenever a plugin is torn down (graceful stop, crash, init
+  // failure, reload), after its namespace claims and actions are dropped.
+  // main.ts wires core-side brokers that hold per-plugin state the runtime
+  // doesn't know about (input binds/modes, decoration providers) so a
+  // same-named successor never collides with its predecessor's leftovers.
+  onPluginRelease?: (pluginName: string) => void;
   // Override the bootstrap entry (tests point at a fixture-aware bootstrap if needed).
   bootstrapPath?: string;
   // Absolute paths to the plugin Worker addon + dawn.node. When set (and the
@@ -282,8 +288,7 @@ class ManagedPlugin implements PluginHandle {
     this.stopWatchdog();
     this.terminating = true;
     this.releaseBusSubs();
-    this.ns.registry().unregisterAllFor(this.cfg.name);
-    this.ns.actions().unregisterAllFor(this.cfg.name);
+    this.ns.releasePlugin(this.cfg.name);
     this.endpoint?.close(`plugin ${this.cfg.name} terminated`);
     void this.worker?.terminate();
   }
@@ -298,8 +303,7 @@ class ManagedPlugin implements PluginHandle {
     this.clearInitTimer();
     this.stopWatchdog();
     this.releaseBusSubs();
-    this.ns.registry().unregisterAllFor(this.cfg.name);
-    this.ns.actions().unregisterAllFor(this.cfg.name);
+    this.ns.releasePlugin(this.cfg.name);
     this.endpoint?.close(`plugin ${this.cfg.name} exited (code ${code})`);
     this.endpoint = null;
     this.worker = null;
@@ -344,8 +348,7 @@ class ManagedPlugin implements PluginHandle {
     this.stopWatchdog();
     if (!this.worker || !this.endpoint) {
       this.releaseBusSubs();
-      this.ns.registry().unregisterAllFor(this.cfg.name);
-      this.ns.actions().unregisterAllFor(this.cfg.name);
+      this.ns.releasePlugin(this.cfg.name);
       this.state = "failed"; return;
     }
     this.state = "shutting-down";
@@ -654,6 +657,12 @@ export class PluginRuntime implements PluginController {
   // wait-for-active on registrations.
 
   registry(): NamespaceRegistry { return this.nsRegistry; }
+
+  releasePlugin(pluginName: string): void {
+    this.nsRegistry.unregisterAllFor(pluginName);
+    this.actionRegistry.unregisterAllFor(pluginName);
+    this.opts.onPluginRelease?.(pluginName);
+  }
 
   onRegister(pluginName: string, payload: unknown): void {
     if (!isRegisterPayload(payload)) {

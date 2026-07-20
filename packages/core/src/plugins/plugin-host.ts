@@ -18,6 +18,13 @@ export type PluginState =
 // event. PluginRuntime implements it.
 export interface PluginController {
   registry(): NamespaceRegistry;
+  // Release every per-plugin registration held outside the plugin's own
+  // realm: namespace claims, actions, and (via the runtime's
+  // onPluginRelease hook) core-side broker state keyed by plugin name --
+  // input binds/modes, decoration provider registrations. Every teardown
+  // path (graceful stop, crash, init failure/timeout, watchdog kill)
+  // funnels here so a same-named successor starts from a clean slate.
+  releasePlugin(pluginName: string): void;
   onRegister(pluginName: string, payload: unknown): void;
   onUnregister(pluginName: string, payload: unknown): void;
   onInvoke(callerName: string, payload: unknown): Promise<Json>;

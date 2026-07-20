@@ -37,10 +37,10 @@ async function activate(
       modeSpec.exitOnEscape !== undefined ? { exitOnEscape: modeSpec.exitOnEscape } : undefined);
   }
 
-  // Track bind handles for later sdk.windows.onShutdown cleanup. (The
-  // runtime calls onShutdown on plugin termination; binding unregister
-  // is reentrant-safe with the chain.)
-  const bindings: { unregister(): void }[] = [];
+  // No teardown bookkeeping here: the core's input broker drops every
+  // bind and mode this plugin registered when the plugin is torn down
+  // (runtime onPluginRelease), so a restart -- crash respawn or config
+  // reload -- re-defines and re-binds from a clean slate.
   for (const [modeName, modeSpec] of Object.entries(config.modes)) {
     for (const binding of modeSpec.bindings) {
       const hasRelease = binding.releaseAction !== undefined
@@ -54,8 +54,7 @@ async function activate(
       if (hasRelease) {
         bindOpts.release = () => dispatchRelease(binding);
       }
-      const handle = await sdk.input.bind(bindOpts);
-      bindings.push(handle);
+      await sdk.input.bind(bindOpts);
     }
   }
 

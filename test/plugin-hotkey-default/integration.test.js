@@ -109,7 +109,7 @@ async function withHotkeyPlugin(hotkeysConfig, fn, opts = {}) {
         return r;
       }
       if (method.startsWith('input.')) {
-        const r = inputBroker(plugin, method, params);
+        const r = inputBroker.onRequest(plugin, method, params);
         if (r === INPUT_NOT_HANDLED) throw new Error(`unhandled ${method}`);
         return r;
       }

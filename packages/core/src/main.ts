@@ -1564,6 +1564,15 @@ const deferredRefResolver = buildResolver({
 runtime = new PluginRuntime({
   pluginAddonPath,
   dawnPath: dawnNodePath,
+  // Core-side brokers hold per-plugin state the runtime doesn't track;
+  // drop it whenever a plugin is torn down (stop, crash, config reload)
+  // so a same-named successor starts clean -- leftover input binds keep
+  // consuming chords with dead handlers, and a leftover mode definition
+  // makes the successor's defineMode throw, failing its activation.
+  onPluginRelease: (name) => {
+    inputBroker.unregisterAllFor(name);
+    decorationBroker.unregisterPlugin(name);
+  },
   // In-thread bundled plugins share core's GPUDevice. main.ts already
   // brought up the device + the overlay broker + the compositor; package
   // them into the bundle the in-thread loader uses to construct sdk.gpu.
@@ -1632,7 +1641,7 @@ runtime = new PluginRuntime({
       return r;
     }
     if (method.startsWith("input.")) {
-      const r = inputBroker(plugin, method, params);
+      const r = inputBroker.onRequest(plugin, method, params);
       if (r === INPUT_NOT_HANDLED) {
         throw new Error(`no handler for input method '${method}'`);
       }
