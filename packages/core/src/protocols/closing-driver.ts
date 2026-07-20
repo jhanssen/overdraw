@@ -112,10 +112,23 @@ export function createClosingDriver(deps: ClosingDriverDeps): ClosingDriver {
       const appId = ta.appId;
       const title = ta.title;
 
+      // Output + tiling context, mirroring the opening driver: outputRect
+      // is the world region the window's output is showing (same space as
+      // the outer rect), so a plugin can derive slide directions without a
+      // lookup. Falls back to the primary output when the window was never
+      // placed (defensive; a mapped toplevel normally has an output).
+      const outputId = wmWin?.outputId ?? state.wm.primaryOutputId();
+      const outputRect = state.wm.viewportOf(outputId)
+        ?? { x: 0, y: 0, width: outer.width, height: outer.height };
+      const tiling = state.wm.getWindowState?.(s.id)?.tiling ?? "managed";
+
       const payload: WindowClosingEvent = {
         phantomSurfaceId,
         originalSurfaceId: s.id,
         rect: { x: outer.x, y: outer.y, width: outer.width, height: outer.height },
+        outputId,
+        outputRect,
+        tiling,
         appId, title,
       };
       // Emit window.closing on the typed bus. Subscribers (the

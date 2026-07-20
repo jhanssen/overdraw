@@ -110,8 +110,10 @@ test("closing-animation: with plugin -- phantom fades out, then is destroyed",
     // via sdk.log which goes through the endpoint.emit('log', ...).
     // Simpler: peek at the bus for our marker events instead.
     let phantomId = null;
+    let closingPayload = null;
     c.pluginBus.subscribe("window.closing", (_name, payload) => {
       phantomId = payload.phantomSurfaceId;
+      closingPayload = payload;
       logs.push(`closing: phantom=${phantomId}`);
     });
 
@@ -134,6 +136,18 @@ test("closing-animation: with plugin -- phantom fades out, then is destroyed",
     assert.ok(phantomId !== null, "phantom id should be set by window.closing");
     assert.ok(c.jsCompositor.activePhantomIds().includes(phantomId),
       "phantom should be in compositor's active list");
+
+    // Output + tiling context mirrors window.opening: a plugin can pick
+    // its exit animation from the payload alone.
+    assert.equal(closingPayload.tiling, "managed",
+      "a tiled toplevel closes with tiling 'managed'");
+    assert.equal(typeof closingPayload.outputId, "number");
+    assert.deepEqual(
+      { w: closingPayload.outputRect.width, h: closingPayload.outputRect.height },
+      { w: OUT.width, h: OUT.height },
+      "outputRect is the output's shown region");
+    assert.ok(closingPayload.rect.width > 0 && closingPayload.rect.height > 0,
+      "rect is the closing window's outer rect");
 
     // While the fade animation runs (400ms), there should be a
     // moment where the phantom is partly transparent. Pixel

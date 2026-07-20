@@ -361,10 +361,19 @@ export type StackRelayoutEvent = {
 // appId/title are the closing toplevel's, snapshotted at unmap
 // time. Either may be null (a client may set_app_id after first
 // commit; if it never did, both are null).
+//
+// `outputId` / `outputRect` / `tiling` mirror WindowOpeningEvent so a
+// plugin can pick its exit (slide toward an output edge for tiled,
+// fade in place for floating) from the event alone: outputRect is the
+// world region the window's output is showing (same space as `rect`),
+// tiling is the window's lane at unmap time.
 export type WindowClosingEvent = {
   phantomSurfaceId: number;
   originalSurfaceId: number;
   rect: WindowRect;
+  outputId: number;
+  outputRect: WindowRect;
+  tiling: Tiling;
   appId: string | null;
   title: string | null;
 };
