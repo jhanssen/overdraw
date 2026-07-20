@@ -476,3 +476,51 @@ test('island layout hint { mode: "columns" } selects equal columns', async () =>
     assert.equal(fallback.rects[0].outer.width, Math.round((1200) * 0.5));
   });
 });
+
+// Positional widths: the hint's `columns` array assigns fractions by
+// column index (member order); indices past the array fall back to
+// `column`/default, and a user-pinned per-window width always wins.
+// layout.column-widths is the extraction path: the effective fractions,
+// in order, for a given window list + hint.
+test('columns hint: positional widths + layout.column-widths extraction', async () => {
+  await withRuntime({}, async (rt) => {
+    await rt.load([bundledToResolved(layoutPluginSpec, layoutPluginSpec.module)]);
+    await rt.waitForNamespace('layout');
+
+    const hint = { mode: 'columns', columns: [0.25, 0.5] };
+    const inputs = {
+      output: { id: 0, rect: { x: 0, y: 0, width: 1000, height: 600 }, scale: 1 },
+      tileRegion: { x: 0, y: 0, width: 1200, height: 600 },
+      island: { id: 7, layout: hint },
+      windows: [
+        { id: 1, role: 'toplevel' },
+        { id: 2, role: 'toplevel' },
+        { id: 3, role: 'toplevel' },   // past the array -> default 0.5
+      ],
+      reason: 'mapped',
+    };
+    const r = await rt.invokeNamespace('layout', 'compute', [inputs]);
+    // Weights 0.25 / 0.5 / 0.5 over a 1200 region: 240 / 480 / 480.
+    assert.deepEqual(r.rects.map((x) => x.outer.width), [240, 480, 480]);
+
+    // Extraction mirrors the hint for unpinned windows.
+    const w1 = await rt.invokeAction('layout.column-widths',
+      { surfaceIds: [1, 2, 3], layout: hint });
+    assert.deepEqual(w1, { widths: [0.25, 0.5, 0.5] });
+
+    // A user resize pins window 2; the pin wins over the hint.
+    await rt.invokeNamespace('layout', 'setParams',
+      [{ surfaceId: 2, widthDelta: 0.25 }]);
+    const w2 = await rt.invokeAction('layout.column-widths',
+      { surfaceIds: [1, 2, 3], layout: hint });
+    assert.deepEqual(w2, { widths: [0.25, 0.75, 0.5] });
+    const r2 = await rt.invokeNamespace('layout', 'compute', [inputs]);
+    // Weights 0.25 / 0.75 / 0.5 over 1200: 200 / 600 / 400.
+    assert.deepEqual(r2.rects.map((x) => x.outer.width), [200, 600, 400]);
+
+    // Malformed params are rejected.
+    await assert.rejects(
+      rt.invokeAction('layout.column-widths', { surfaceIds: 'nope' }),
+      /surfaceIds/);
+  });
+});

@@ -40,6 +40,13 @@ export interface WorkspaceSnapshot {
   // events) once it is empty AND not the shown workspace on its output.
   // Persistent workspaces only die via an explicit destroy().
   persistent: boolean;
+  // Columns-mode workspaces only: the effective column-width fractions
+  // (of the workarea) in member order -- exactly what a config
+  // workspaces entry's `layout: { mode: "columns", columns: [...] }`
+  // needs to reproduce the current sizing. Attached by providers that
+  // can resolve the widths (the canvas plugin via layout.column-widths);
+  // absent otherwise.
+  columns?: number[];
 }
 
 export interface WorkspaceCreateSpec {

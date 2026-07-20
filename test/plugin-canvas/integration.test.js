@@ -1339,6 +1339,68 @@ test('elastic: a column with neighbors both sides is centered; head/tail sit flu
   }, { canvas: { world: true, elastic: true }, layout: { mode: 'columns' } });
 });
 
+// default: true on a declared workspace makes it the initially shown one
+// on its output; the auto-created unnamed boot workspace (empty,
+// non-persistent, no longer shown) evaporates, so the output boots
+// straight onto the declared set.
+test('world: a declared workspace with default: true is the boot-shown one', async () => {
+  await withCanvasPlugin(async (h) => {
+    const { rt } = h;
+    const cur = await rt.invokeAction('workspace.current', {});
+    assert.equal(cur.name, 'main');
+    const list = await rt.invokeAction('workspace.list', {});
+    assert.deepEqual(list.map((w) => w.name), ['main'],
+      'the unnamed boot workspace evaporated');
+  }, { canvas: { world: true, workspaces: [{ name: 'main', default: true }] } });
+});
+
+// Declared per-position column widths (canvas.workspaces layout.columns)
+// flow to the layout provider as the island hint, and workspace.current
+// reports the effective fractions back in the same shape -- the
+// resize-then-extract round trip (`overdrawctl invoke workspace.current`
+// -> paste into the config workspaces entry).
+test('world: declared columns publish as the island hint and extract via workspace.current', async () => {
+  await withCanvasPlugin(async (h) => {
+    const { rt, addWindow, islands } = h;
+    // The declared workspace exists from boot; show it so the mapped
+    // windows join it (the harness's output starts on its own default
+    // workspace).
+    const list = await rt.invokeAction('workspace.list', {});
+    const main = list.find((w) => w.name === 'main');
+    assert.ok(main, 'declared workspace exists from boot');
+    await call(rt, 'show', [main.index, 0]);
+    await settle();
+    addWindow(101); await settle();
+    addWindow(102); await settle();
+    addWindow(103); await settle();
+
+    const cur = await rt.invokeAction('workspace.current', {});
+    assert.equal(cur.name, 'main');
+    assert.deepEqual(cur.members.length, 3);
+    // Effective fractions: positional hint for the first two, island
+    // default for the third.
+    assert.deepEqual(cur.columns, [0.25, 0.6, 0.5]);
+
+    // The island hint published to the layout driver carries the array.
+    const isl = islands().find((i) => i.members.includes(101));
+    assert.deepEqual(isl?.layout, { mode: 'columns', columns: [0.25, 0.6] });
+
+    // A user resize pins window 102; extraction reflects it.
+    await rt.invokeNamespace('layout', 'setParams',
+      [{ surfaceId: 102, widthDelta: 0.15 }]);
+    const cur2 = await rt.invokeAction('workspace.current', {});
+    assert.deepEqual(cur2.columns, [0.25, 0.75, 0.5]);
+  }, {
+    canvas: {
+      world: true, elastic: true,
+      workspaces: [
+        { name: 'main', layout: { mode: 'columns', columns: [0.25, 0.6] } },
+      ],
+    },
+    layout: { mode: 'columns', column: 0.5 },
+  });
+});
+
 // Hover-driven focus (focusReason "pointer-enter") must not move the
 // camera: the strip scrolls only on deliberate focus (click, keyboard,
 // workspace switch), a press, or an explicit workspace.reveal.

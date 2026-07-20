@@ -107,21 +107,31 @@ function activate(sdk: PluginSdkShape, params: LayoutParams): LayoutAPI {
     lastSeed.delete(ev.surfaceId);
   });
 
-  // The effective mode + default column fraction for one island: the
+  // The effective mode + default column fraction(s) for one island: the
   // declared hint wins over the configured default. Unknown hint shapes
   // fall back to the config (a provider ignores hints it doesn't
-  // understand).
-  function islandParams(hint: unknown): { mode: LayoutParams["mode"]; column: number } {
+  // understand). `columns` declares widths by column POSITION (member
+  // order); a window at an index past the array's end falls back to
+  // `column`.
+  function islandParams(hint: unknown): {
+    mode: LayoutParams["mode"]; column: number; columns?: number[];
+  } {
     let mode = params.mode;
     let column = params.column;
+    let columns: number[] | undefined;
     if (hint !== null && typeof hint === "object") {
-      const h = hint as { mode?: unknown; column?: unknown };
+      const h = hint as { mode?: unknown; column?: unknown; columns?: unknown };
       if (h.mode === "master-stack" || h.mode === "columns") mode = h.mode;
       if (typeof h.column === "number" && Number.isFinite(h.column)) {
         column = Math.min(COLUMN_MAX, Math.max(COLUMN_MIN, h.column));
       }
+      if (Array.isArray(h.columns)
+          && h.columns.every((v) => typeof v === "number" && Number.isFinite(v))) {
+        columns = (h.columns as number[]).map(
+          (v) => Math.min(COLUMN_MAX, Math.max(COLUMN_MIN, v)));
+      }
     }
-    return { mode, column };
+    return { mode, column, ...(columns !== undefined ? { columns } : {}) };
   }
 
   function widthOf(id: number, islandColumn: number): number {
@@ -154,11 +164,12 @@ function activate(sdk: PluginSdkShape, params: LayoutParams): LayoutAPI {
       // measure() lands each on its target and a workarea-sized one
       // compresses them instead.
       const region = inputs.tileRegion;
-      const { mode, column } = islandParams(inputs.island?.layout);
+      const { mode, column, columns } = islandParams(inputs.island?.layout);
       const dims = { width: region.width, height: region.height };
       const rects = mode === "columns"
         ? columnsLayout(
-            inputs.windows.map((w) => widthOf(w.id, column)), dims, params.gap,
+            inputs.windows.map((w, i) => widthOf(w.id, columns?.[i] ?? column)),
+            dims, params.gap,
             inputs.windows.map((w) => widthBounds(w.constraints)))
         : masterStackLayout(inputs.windows.length, dims, params);
       return {
@@ -206,18 +217,45 @@ function activate(sdk: PluginSdkShape, params: LayoutParams): LayoutAPI {
 
     async measure(inputs: MeasureInputs): Promise<MeasureResult> {
       const wa = inputs.workarea;
-      const { mode, column } = islandParams(inputs.island?.layout);
+      const { mode, column, columns } = islandParams(inputs.island?.layout);
       if (mode !== "columns") {
         // Master-stack always fits its region; its natural size IS the
         // workarea (growth is inert -- canvas-design.md §5).
         return { width: wa.width, height: wa.height };
       }
       const widthsPx = inputs.windows.map(
-        (w) => widthOf(w.id, column) * wa.width);
+        (w, i) => widthOf(w.id, columns?.[i] ?? column) * wa.width);
       return columnsMeasure(widthsPx, wa, params.gap,
         inputs.windows.map((w) => widthBounds(w.constraints)));
     },
   };
+
+  // Effective column-width fractions for a set of windows, in the given
+  // order -- what a config `layout: { columns: [...] }` entry would need
+  // to reproduce the current sizing. Priority per window: the user-pinned
+  // width (grow/shrink-column), else the island hint's positional /
+  // default fraction, else the width the window was last laid out at,
+  // else the configured default. The workspace plugin attaches the result
+  // to its snapshots so `overdrawctl invoke workspace.current` is the
+  // extraction path.
+  sdk.actions.register({
+    name: "layout.column-widths",
+    description: "Effective column-width fractions (of the workarea) for " +
+      "the given windows, in order. Params: { surfaceIds: number[], " +
+      "layout?: island layout hint }. Returns { widths: number[] }.",
+    handler: async (raw: unknown): Promise<{ widths: number[] }> => {
+      const p = (raw ?? {}) as { surfaceIds?: unknown; layout?: unknown };
+      if (!Array.isArray(p.surfaceIds)
+          || !p.surfaceIds.every((v) => typeof v === "number")) {
+        throw new TypeError(
+          "layout.column-widths: params.surfaceIds must be a number array");
+      }
+      const { column, columns } = islandParams(p.layout);
+      const widths = (p.surfaceIds as number[]).map((id, i) =>
+        colWidths.get(id) ?? columns?.[i] ?? lastSeed.get(id) ?? column);
+      return { widths };
+    },
+  });
 
   sdk.log(`layout activated (mode=${params.mode}, masterFraction=${params.masterFraction}, column=${params.column}, gap=${params.gap})`);
   return api;

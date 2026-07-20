@@ -105,9 +105,12 @@ export interface LayoutInputs {
   // workspace.set-layout -- never derived from the island's growth
   // (canvas-design.md §5 "Layout mode is declared"). Providers that
   // understand a hint honor it; others ignore it. The bundled plugin
-  // recognizes `{ mode: "master-stack" | "columns", column?: number }`
-  // (column = the default column-width fraction for this island) and
-  // falls back to its configured default mode when absent.
+  // recognizes `{ mode: "master-stack" | "columns", column?: number,
+  // columns?: number[] }` (column = the default column-width fraction
+  // for this island; columns = fractions by column POSITION in member
+  // order, entries past the array's end falling back to column) and
+  // falls back to its configured default mode when absent. A per-window
+  // width the user pinned via grow/shrink-column always wins over both.
   island: { id: number; layout?: unknown };
   windows: ReadonlyArray<LayoutWindow>;
   reason: LayoutReason;

@@ -1926,8 +1926,11 @@ async function activate(
   // so a replug reclaims it); an unresolvable output falls back to the
   // default output. `elastic` declares growth by NAME (see isElastic);
   // `layout` declares the workspace's layout mode by NAME (see
-  // layoutHintFor). Registry create is idempotent on name, so
-  // re-seeding is safe.
+  // layoutHintFor). `default: true` makes the entry the initially shown
+  // workspace on its output -- the auto-created unnamed boot workspace,
+  // now empty and unshown, evaporates, so the output boots straight onto
+  // the declared set. First default-entry per output wins. Registry
+  // create is idempotent on name, so re-seeding is safe.
   async function seedWorkspaces(canvasSlice: unknown): Promise<void> {
     if (!canvasSlice || typeof canvasSlice !== "object") return;
     const list = (canvasSlice as { workspaces?: unknown }).workspaces;
@@ -1936,6 +1939,7 @@ async function activate(
       sdk.log("canvas: config workspaces must be an array; ignored");
       return;
     }
+    const shownSeeded = new Set<number>();
     for (const entry of list) {
       if (!isObj(entry) || typeof entry.name !== "string" || entry.name === "") {
         sdk.log(`canvas: config workspace without a name skipped (${JSON.stringify(entry)})`);
@@ -1953,12 +1957,15 @@ async function activate(
       }
       if (entry.layout !== undefined) {
         // Declared per-workspace layout: { mode: "master-stack" |
-        // "columns", column? }. Published verbatim as the island's
-        // layout hint; the provider validates/clamps what it consumes.
+        // "columns", column?, columns? }. Published verbatim as the
+        // island's layout hint; the provider validates/clamps what it
+        // consumes. `columns` is per-position width fractions (member
+        // order) -- the shape workspace.list/current report back, so an
+        // extracted arrangement pastes in unchanged.
         if (!isObj(entry.layout)
             || (entry.layout.mode !== "master-stack" && entry.layout.mode !== "columns")) {
           sdk.log(`canvas: config workspace '${entry.name}' layout must be `
-            + `{ mode: "master-stack" | "columns", column? }; skipped`);
+            + `{ mode: "master-stack" | "columns", column?, columns? }; skipped`);
           continue;
         }
         const hint: { [k: string]: unknown } = { mode: entry.layout.mode };
@@ -1968,6 +1975,15 @@ async function activate(
             sdk.log(`canvas: config workspace '${entry.name}' layout.column must be a number; ignored`);
           } else {
             hint.column = entry.layout.column;
+          }
+        }
+        if (entry.layout.columns !== undefined) {
+          if (!Array.isArray(entry.layout.columns)
+              || !entry.layout.columns.every(
+                (v) => typeof v === "number" && Number.isFinite(v))) {
+            sdk.log(`canvas: config workspace '${entry.name}' layout.columns must be a number array; ignored`);
+          } else {
+            hint.columns = [...entry.layout.columns];
           }
         }
         layoutByName.set(entry.name, hint);
@@ -1994,6 +2010,23 @@ async function activate(
       }, outputNameOf(outputId));
       state = c.state;
       await applyEffects(c.sideEffects);
+      if (entry.default !== undefined && typeof entry.default !== "boolean") {
+        sdk.log(`canvas: config workspace '${entry.name}' default must be a boolean; ignored`);
+      } else if (entry.default === true) {
+        const wsOutput = c.snapshot.outputId;
+        if (shownSeeded.has(wsOutput)) {
+          sdk.log(`canvas: config workspace '${entry.name}' default: true ignored `
+            + `(another entry already claims the default on its output)`);
+        } else {
+          shownSeeded.add(wsOutput);
+          const idx = reg.findIndex(state, c.snapshot.handle, wsOutput);
+          if (idx !== null) {
+            const r = reg.show(state, idx, wsOutput, outputNameOf(wsOutput));
+            state = r.state;
+            await applyEffects(r.sideEffects);
+          }
+        }
+      }
     }
   }
   await seedWorkspaces(config?.canvas);
@@ -2460,7 +2493,7 @@ async function activate(
   sdk.actions.register({
     name: "workspace.set-layout",
     description:
-      "World mode: declare a workspace's layout -- { mode: \"master-stack\" | \"columns\", column? } (column = default column-width fraction). Positional {index?, output?}; index defaults to the shown workspace on the focused output. Session-scoped override; omit `mode` to clear it (back to config/default).",
+      "World mode: declare a workspace's layout -- { mode: \"master-stack\" | \"columns\", column?, columns? } (column = default column-width fraction; columns = fractions by column position, the shape workspace.current reports). Positional {index?, output?}; index defaults to the shown workspace on the focused output. Session-scoped override; omit `mode` to clear it (back to config/default).",
     handler: async (params: unknown): Promise<{ mode: string | null }> => {
       if (!worldMode) {
         throw new Error(
@@ -2486,6 +2519,7 @@ async function activate(
       } else {
         const hint: { [k: string]: unknown } = { mode: p.mode };
         if (p.column !== undefined) hint.column = p.column;
+        if (p.columns !== undefined) hint.columns = p.columns;
         layoutByHandle.set(handle, hint);
       }
       await publishWorld();
@@ -2624,40 +2658,66 @@ async function activate(
     },
   });
 
+  // Attach the effective column-width fractions (member order) to a
+  // columns-mode workspace's snapshot -- the exact value a config
+  // `layout: { mode: "columns", columns: [...] }` entry needs to
+  // reproduce the current sizing, so `overdrawctl invoke
+  // workspace.current` is the extraction path. Omitted for master-stack
+  // workspaces and when the layout provider doesn't expose the widths.
+  async function withColumns(snap: WorkspaceSnapshot): Promise<WorkspaceSnapshot> {
+    const hint = layoutHintFor(snap.handle);
+    const mode = (hint?.mode as string | undefined) ?? defaultLayoutMode;
+    if (mode !== "columns" || snap.members.length === 0) return snap;
+    try {
+      const r = await sdk.actions.invoke("layout.column-widths", {
+        surfaceIds: [...snap.members],
+        ...(hint !== undefined ? { layout: hint } : {}),
+      });
+      const w = (r as { widths?: unknown } | null)?.widths;
+      if (Array.isArray(w) && w.every((v) => typeof v === "number")) {
+        return { ...snap, columns: w as number[] };
+      }
+    } catch { /* provider without layout.column-widths */ }
+    return snap;
+  }
+
   sdk.actions.register({
     name: "workspace.list",
     description:
-      "Workspaces on the given output, sorted by per-output index. Omit `output` to list every workspace on every live output.",
+      "Workspaces on the given output, sorted by per-output index. Omit `output` to list every workspace on every live output. Columns-mode workspaces include `columns` (effective width fractions in member order; paste into a config workspaces entry's layout.columns to reproduce).",
     handler: async (params: unknown): Promise<WorkspaceSnapshot[]> => {
+      const snapshots = (): WorkspaceSnapshot[] => {
+        const out: WorkspaceSnapshot[] = [];
+        for (const outputId of state.positionsByOutput.keys()) {
+          out.push(...reg.snapshotsForOutput(state, outputId));
+        }
+        return out;
+      };
+      let list: WorkspaceSnapshot[];
       if (params === undefined || params === null) {
-        // No output requested -> every workspace, every output.
-        const out: WorkspaceSnapshot[] = [];
-        for (const outputId of state.positionsByOutput.keys()) {
-          out.push(...reg.snapshotsForOutput(state, outputId));
+        list = snapshots();
+      } else {
+        if (!isObj(params)) throw new TypeError("workspace.list: expected an object");
+        if (params.output === undefined) {
+          list = snapshots();
+        } else {
+          const outputId = parseOptionalOutput(params, resolveOutputName, -1, "workspace.list");
+          list = reg.snapshotsForOutput(state, outputId);
         }
-        return out;
       }
-      if (!isObj(params)) throw new TypeError("workspace.list: expected an object");
-      if (params.output === undefined) {
-        const out: WorkspaceSnapshot[] = [];
-        for (const outputId of state.positionsByOutput.keys()) {
-          out.push(...reg.snapshotsForOutput(state, outputId));
-        }
-        return out;
-      }
-      const outputId = parseOptionalOutput(params, resolveOutputName, -1, "workspace.list");
-      return reg.snapshotsForOutput(state, outputId);
+      return Promise.all(list.map(withColumns));
     },
   });
 
   sdk.actions.register({
     name: "workspace.current",
     description:
-      "The currently-shown workspace on the given output (defaults to the focused output).",
+      "The currently-shown workspace on the given output (defaults to the focused output). Columns-mode workspaces include `columns` (effective width fractions in member order; paste into a config workspaces entry's layout.columns to reproduce).",
     handler: async (params: unknown): Promise<WorkspaceSnapshot | null> => {
       const outputId = parseOptionalOutput(
         params, resolveOutputName, focusedOutputId(), "workspace.current");
-      return reg.current(state, outputId);
+      const cur = reg.current(state, outputId);
+      return cur === null ? null : withColumns(cur);
     },
   });
 
@@ -3077,7 +3137,8 @@ function parseSetLayoutParams(
   params: unknown,
   resolveOutput: (input: string) => number | null,
   defaultOutputId: number,
-): { index?: number; mode?: "master-stack" | "columns"; column?: number; outputId: number } {
+): { index?: number; mode?: "master-stack" | "columns"; column?: number;
+    columns?: number[]; outputId: number } {
   if (params === undefined || params === null) {
     return { outputId: defaultOutputId };
   }
@@ -3087,7 +3148,8 @@ function parseSetLayoutParams(
   const outputId = parseOptionalOutput(
     params, resolveOutput, defaultOutputId, "workspace.set-layout");
   const out: {
-    index?: number; mode?: "master-stack" | "columns"; column?: number; outputId: number;
+    index?: number; mode?: "master-stack" | "columns"; column?: number;
+    columns?: number[]; outputId: number;
   } = { outputId };
   if (params.index !== undefined) {
     if (typeof params.index !== "number" || !Number.isInteger(params.index)
@@ -3108,6 +3170,13 @@ function parseSetLayoutParams(
       throw new TypeError("workspace.set-layout: column must be a finite number");
     }
     out.column = params.column;
+  }
+  if (params.columns !== undefined) {
+    if (!Array.isArray(params.columns)
+        || !params.columns.every((v) => typeof v === "number" && Number.isFinite(v))) {
+      throw new TypeError("workspace.set-layout: columns must be a number array");
+    }
+    out.columns = [...(params.columns as number[])];
   }
   return out;
 }
