@@ -415,7 +415,10 @@ async function activate(
             // the stack.relayout trigger instead.
             if (!snap?.outer || snap.outer.width <= 0) return;
             if (focusedSurfaceId !== sid) return;
-            if (revealScroll(rec.outputId, handle, snap.outer) !== null) {
+            // Focus-driven: minimal reveal, unless scrollOnHover opted
+            // back into the always-center behavior wholesale.
+            const align = scrollOnHover ? "center" : "visible";
+            if (revealScroll(rec.outputId, handle, snap.outer, align) !== null) {
               await applyScroll(rec.outputId);
             }
           })();
@@ -485,17 +488,27 @@ async function activate(
     if (!payload || typeof payload !== "object") return;
     const wins = (payload as { windows?: unknown }).windows;
     if (!Array.isArray(wins)) return;
-    const entry = wins.find((w): w is { newOuter: { x: number; width: number } } =>
-      isObj(w) && w.surfaceId === focusedSurfaceId && isObj(w.newOuter)
-      && typeof (w.newOuter as { width?: unknown }).width === "number"
-      && (w.newOuter as { width: number }).width > 0);
+    const entry = wins.find(
+      (w): w is { newOuter: { x: number; y: number; width: number; height: number };
+                  oldOuter?: { x: number; y: number; width: number; height: number } } =>
+        isObj(w) && w.surfaceId === focusedSurfaceId && isObj(w.newOuter)
+        && typeof (w.newOuter as { width?: unknown }).width === "number"
+        && (w.newOuter as { width: number }).width > 0);
     if (!entry) return;
+    // Only chase rects that MOVED. A pass that re-delivered the same rect
+    // (a reserved-zones re-check, a sibling-only retile) reveals nothing;
+    // without this, a layer client committing every frame would re-reveal
+    // the focused column on every hover-focus change.
+    const o = entry.oldOuter;
+    const n = entry.newOuter;
+    if (o && o.x === n.x && o.y === n.y
+        && o.width === n.width && o.height === n.height) return;
     const handle = state.surfaceToHandle.get(focusedSurfaceId);
     if (handle === undefined || !isElastic(handle)) return;
     const rec = state.byHandle.get(handle);
     if (!rec || override.has(rec.outputId)) return;
     if (state.shownByOutput.get(rec.outputId) !== handle) return;
-    if (revealScroll(rec.outputId, handle, entry.newOuter) !== null) {
+    if (revealScroll(rec.outputId, handle, entry.newOuter, "visible") !== null) {
       void applyScroll(rec.outputId);
     }
   });
@@ -819,22 +832,25 @@ async function activate(
   }
 
   // Where the focused column `rect` sits in the docked view of `handle`'s
-  // island -- the WORKAREA-wide window onto the strip. The column's place
-  // in the strip picks the alignment, so the view always says what lies
-  // on either side of the focus:
-  //   neighbors both sides -> CENTERED, so both peek in and either can be
-  //     hovered or clicked. A column revealed flush against the edge it
-  //     came from hides whatever is past that edge with no hint it is
-  //     there -- unreachable by pointer, since there is nothing to aim at.
-  //   only one neighbor -> flush to ITS side (head sits left, tail sits
-  //     right), spending the slack on the one direction that has strip in
-  //     it rather than on void.
+  // island -- the WORKAREA-wide window onto the strip. Two alignments:
+  //   "center" (pointer commits: a press, workspace.reveal): the column's
+  //     place in the strip picks the framing -- neighbors both sides ->
+  //     CENTERED so both peek in and either can be hovered or clicked;
+  //     only one neighbor -> flush to ITS side (head sits left, tail
+  //     sits right), spending the slack on the direction that has strip
+  //     in it rather than on void.
+  //   "visible" (focus-driven reveals: keyboard cycling, retile follow,
+  //     flight aiming): minimal scroll -- a column already fully in view
+  //     leaves the camera alone (focus walking across visible columns
+  //     must not shift the strip); an off-view column scrolls just
+  //     enough to sit flush at the edge it entered from.
   // A column wider than the view can't do either; its left edge wins.
   // Updates scrollByHandle; returns the new scroll, or null when the view
   // already sits there.
   function revealScroll(
     outputId: number, handle: WorkspaceHandle,
     rect: { x: number; width: number },
+    align: "center" | "visible" = "center",
   ): number | null {
     const g = outputGeom.get(outputId);
     const isl = islandRectFor(outputId, handle);
@@ -846,22 +862,49 @@ async function activate(
     // edge: the neighbor ends exactly at the edge. The head/tail columns
     // keep their island-edge gap since clamping lands on 0 / maxScroll.
     const m = Math.min(scrollMargin, wa.width / 4);
-    // Columns tile the island edge to edge, so anything but the head has
-    // strip to its left and anything but the tail has strip to its right.
-    const hasLeft = rect.x - isl.x > m;
-    const hasRight = (isl.x + isl.width) - (rect.x + rect.width) > m;
+    // Strip-local column edges.
+    const left = rect.x - isl.x;
+    const right = left + rect.width;
     const slack = wa.width - rect.width;
     let s: number;
-    if (slack <= 0 || (!hasLeft && hasRight)) {
-      s = rect.x - m - isl.x;
-    } else if (hasLeft && hasRight) {
-      s = Math.round(rect.x - isl.x - slack / 2);
+    if (align === "visible") {
+      if (left - m >= prev && right + m <= prev + wa.width) return null;
+      s = slack <= 0 || left - m < prev
+        ? left - m                      // entered from the left / oversized
+        : right + m - wa.width;         // entered from the right
     } else {
-      s = rect.x + rect.width + m - wa.width - isl.x;
+      // Columns tile the island edge to edge, so anything but the head
+      // has strip to its left and anything but the tail to its right.
+      const hasLeft = left > m;
+      const hasRight = isl.width - right > m;
+      if (slack <= 0 || (!hasLeft && hasRight)) {
+        s = left - m;
+      } else if (hasLeft && hasRight) {
+        s = Math.round(left - slack / 2);
+      } else {
+        s = right + m - wa.width;
+      }
     }
     s = Math.min(maxScroll, Math.max(0, s));
     scrollByHandle.set(handle, s);
     return s !== prev ? s : null;
+  }
+
+  // Fold the focused window's reveal into `handle`'s stored strip scroll
+  // WITHOUT touching the camera -- callers about to compute a flight
+  // target (unfit, show-with-flight) use it so the tween aims at the
+  // view that will hold after the post-settle reveal, instead of flying
+  // to a stale scroll and snapping. No-op when the focused window isn't
+  // a member of `handle` or the strip isn't elastic.
+  async function foldFocusIntoScroll(
+    outputId: number, handle: WorkspaceHandle,
+  ): Promise<void> {
+    const sid = focusedSurfaceId;
+    if (sid === null || !isElastic(handle)) return;
+    if (state.surfaceToHandle.get(sid) !== handle) return;
+    const snap = await sdk.windows.get(sid);
+    if (!snap?.outer || snap.outer.width <= 0) return;
+    revealScroll(outputId, handle, snap.outer, "visible");
   }
 
   // Center/reveal `sid`'s column within its docked elastic strip. No-op
@@ -1522,6 +1565,11 @@ async function activate(
         await sdk.animations?.cancel({ kind: "output-camera", outputId });
       }
       const shown = state.shownByOutput.get(outputId);
+      // Aim at the final view: fold the focused window's reveal into the
+      // destination strip's scroll before computing the target (see
+      // foldFocusIntoScroll -- avoids the fly-then-snap when the reveal
+      // would move the camera again after settle).
+      if (shown !== undefined) await foldFocusIntoScroll(outputId, shown);
       const target = shown !== undefined
         ? camPosFor(outputId, shown) : { x: 0, y: 0 };
       const cur = await sdk.windows.getOutputCamera(outputId);
@@ -1547,6 +1595,9 @@ async function activate(
       // may have changed the shown workspace under us.
       const settleShown = state.shownByOutput.get(outputId);
       await pushStack(outputId, reg.stackFor(state, outputId));
+      if (settleShown !== undefined) {
+        await foldFocusIntoScroll(outputId, settleShown);
+      }
       const settle = settleShown !== undefined
         ? camPosFor(outputId, settleShown) : { x: 0, y: 0 };
       lastCamByOutput.set(outputId, settle);
@@ -1901,6 +1952,13 @@ async function activate(
     // Zoom back onto the shown workspace: optics only. The fit union
     // keeps riding the stack for the journey; settle collapses it.
     await cancelFlight(outputId);
+    // Aim the flight at the FINAL view: fold the focused window's reveal
+    // into the strip scroll BEFORE computing the target. Focus moved
+    // while overridden doesn't scroll (the override gate), so the stored
+    // scroll is pre-fit stale -- flying there and letting the
+    // post-settle relayout reveal correct it reads as a zoom to the old
+    // view followed by a snap.
+    if (shown !== undefined) await foldFocusIntoScroll(outputId, shown);
     const cam = shown !== undefined
       ? camPosFor(outputId, shown) : { x: 0, y: 0 };
     if (t && sdk.animations) {

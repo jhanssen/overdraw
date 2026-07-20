@@ -322,8 +322,8 @@ const sock = addon.startServer();
 // installProtocols(opts.reservedZones).
 const reservedZones = createReservedZoneRegistry();
 // Zone changes move the usable glass (workarea). Camera-policy plugins
-// (canvas world mode) resize their islands off this; the WM's own relayout
-// rides the layer-shell handlers' triggerWmRelayout separately.
+// (canvas world mode) resize their islands off this; the WM's relayout
+// rides the same registry onChange, wired inside installProtocols.
 reservedZones.onChange((outputId) => {
   pluginBus.emit("output.workarea-changed", { outputId });
 });

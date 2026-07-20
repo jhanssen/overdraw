@@ -87,17 +87,17 @@ test("elastic: strip grows per member; camera scrolls to follow focus", { skip }
       pixelMatches(pixelAt(p, OUT.width, 320, 360), argbToBgra(cC), 4)
       && pixelMatches(pixelAt(p, OUT.width, 960, 360), argbToBgra(cA), 4));
 
-    // Swap C back one (A | C | B): now it has strip on BOTH sides, so it
-    // centers and both neighbors peek into the view -- A on the left, B on
-    // the right, each hoverable rather than hidden past an edge.
+    // Swap C back one (A | C | B): its column (COL..2*COL) is fully
+    // visible at the current scroll, and focus-driven reveals are
+    // MINIMAL -- the camera stays put rather than re-centering, so the
+    // view keeps showing A | C.
     await c.runtime.invokeNamespace("workspace", "reorder", [cId, "swap-next"]);
     await settled(() => rectOf(cId).x, (x) => x === COL, { what: "C in the middle" });
     await settled(() => c.query().outputs[0].cameraX,
-      (x) => x === COL - (OUT.width - COL) / 2, { what: "camera centered on C" });
+      (x) => x === 0, { what: "camera stays at the strip head" });
     await readUntil(c, (p) =>
-      pixelMatches(pixelAt(p, OUT.width, 160, 360), argbToBgra(cA), 4)
-      && pixelMatches(pixelAt(p, OUT.width, 640, 360), argbToBgra(cC), 4)
-      && pixelMatches(pixelAt(p, OUT.width, 1120, 360), argbToBgra(cB), 4));
+      pixelMatches(pixelAt(p, OUT.width, 320, 360), argbToBgra(cA), 4)
+      && pixelMatches(pixelAt(p, OUT.width, 960, 360), argbToBgra(cC), 4));
   } finally {
     await c.teardown();
   }

@@ -111,17 +111,7 @@ function outputRectFor(state: CompositorState, outputId: number): { x: number; y
 function effectiveRectExcluding(state: CompositorState, exclude: LayerSurfaceRecord): { x: number; y: number; width: number; height: number } {
   const raw = outputRectFor(state, exclude.output);
   if (!state.reservedZones) return raw;
-  const myId = exclude.reservedZoneId;
-  if (!myId) return state.reservedZones.effectiveRect(exclude.output, raw);
-  // Temporarily drop this surface's reservation, compute, restore. Avoid
-  // allocating a fresh registry: snapshot the surface's zone, clear it,
-  // compute, restore.
-  const mine = state.reservedZones.list(exclude.output).find((z) => z.owner === exclude.surface.id);
-  if (!mine) return state.reservedZones.effectiveRect(exclude.output, raw);
-  state.reservedZones.clear(myId);
-  const r = state.reservedZones.effectiveRect(exclude.output, raw);
-  state.reservedZones.set(myId, mine);
-  return r;
+  return state.reservedZones.effectiveRect(exclude.output, raw, exclude.surface.id);
 }
 
 // ---- per-record apply ----------------------------------------------------
@@ -284,7 +274,6 @@ export function isLayerSurfaceInitialCommit(rec: LayerSurfaceRecord): boolean {
 export function applyLayerSurfaceInitial(ctx: Ctx, rec: LayerSurfaceRecord): void {
   applyLayerSurface(ctx, rec, { firstConfigure: true });
   reflowOtherLayerSurfaces(ctx, rec);
-  triggerWmRelayout(ctx.state);
 }
 
 // Drive a subsequent apply (any commit after the initial). Doesn't necessarily
@@ -292,7 +281,6 @@ export function applyLayerSurfaceInitial(ctx: Ctx, rec: LayerSurfaceRecord): voi
 export function applyLayerSurfacePending(ctx: Ctx, rec: LayerSurfaceRecord): void {
   applyLayerSurface(ctx, rec, { firstConfigure: false });
   reflowOtherLayerSurfaces(ctx, rec);
-  triggerWmRelayout(ctx.state);
   // Keyboard interactivity may have just changed; let the seat re-evaluate
   // the exclusive override. Cheap when nothing is exclusive (an O(n) walk
   // of layer surfaces with no allocations).
@@ -340,7 +328,6 @@ export function teardownLayerSurface(state: CompositorState, rec: LayerSurfaceRe
   // Other layer surfaces may have placed themselves against this surface's
   // reservation; reflow them.
   reflowOtherLayerSurfacesForTeardown(state, rec);
-  triggerWmRelayout(state);
   // The exclusive set may have just shrunk; re-evaluate so focus reverts
   // to whatever the focus driver chooses next.
   state.seat?.reevaluateExclusiveLayerFocus();
@@ -393,27 +380,10 @@ function reflowOtherLayerSurfacesForTeardown(state: CompositorState, changed: La
   }
 }
 
-// Trigger a WM layout pass: the tile region just changed, so tiled and
-// maximized windows need to reflow. The WM is unaware of layer-shell; we
-// reach the layout driver through the WM's schedule API by addWindow/unmap
-// no-ops. A direct relayout-schedule hook would be cleaner; for now reach
-// in via the wm interface a generic schedule isn't exposed -- so we trigger
-// it by setting + clearing a no-op state? Inspect the API:
-//
-// The Wm interface (wm/index.ts) exposes addWindow/unmapWindow/propose etc.
-// All of those eventually call driver.schedule(reason). There is no public
-// schedule(reason) on Wm. Easiest: rebuild via the existing rebuild() hook
-// the wm uses (state.compositor.setStack is pushed via rebuildStackWithPopups
-// the WM holds). But that won't re-run the LAYOUT.
-//
-// For now: if the WM exposes a schedule via its driver we can't reach here,
-// so we use a small indirection: the wm.state.windows list is exactly what
-// we'd ask the driver to recompute; calling something that bumps a no-op
-// rebuild won't re-run compute. So we use an explicit relayout function
-// added on state -- it's set by installProtocols when wiring T6.
-function triggerWmRelayout(state: CompositorState): void {
-  state.relayout?.("reserved-zones-changed");
-}
+// WM relayout on zone changes rides the reserved-zone registry's onChange
+// (wired in installProtocols): the registry is silent for a set that stores
+// identical values, so per-frame layer commits (a bar's meter, an animated
+// wallpaper) never schedule layout passes -- only an actual zone change does.
 
 // ---- handler factories ---------------------------------------------------
 

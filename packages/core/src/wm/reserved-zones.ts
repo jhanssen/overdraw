@@ -32,8 +32,11 @@ export interface ReservedZoneRegistry {
   clear(zoneId: string): void;
   // Output rect minus all zones for that output, clamped non-negative.
   // When no zones are registered for the output, returns outputRect
-  // unchanged.
-  effectiveRect(outputId: number, outputRect: Rect): Rect;
+  // unchanged. `excludeOwner` skips that owner's zones -- a layer surface
+  // placing itself must not see its own reservation, and reading it this
+  // way keeps the computation pure (no clear/re-set churn, no spurious
+  // onChange).
+  effectiveRect(outputId: number, outputRect: Rect, excludeOwner?: number): Rect;
   // Diagnostic: enumerate zones for an output. Returned in insertion order.
   list(outputId: number): ReadonlyArray<ReservedZone>;
   // Notify when an output's zone picture actually changes (a set that
@@ -71,10 +74,11 @@ export function createReservedZoneRegistry(): ReservedZoneRegistry {
       if (!zones.delete(zoneId)) return;
       if (prev) notify(prev.outputId);
     },
-    effectiveRect(outputId, outputRect) {
+    effectiveRect(outputId, outputRect, excludeOwner) {
       let top = 0, right = 0, bottom = 0, left = 0;
       for (const z of zones.values()) {
         if (z.outputId !== outputId) continue;
+        if (excludeOwner !== undefined && z.owner === excludeOwner) continue;
         switch (z.edge) {
           case "top": top += z.thickness; break;
           case "right": right += z.thickness; break;

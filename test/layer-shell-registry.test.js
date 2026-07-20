@@ -74,6 +74,9 @@ function mockState(opts = {}) {
     relayoutCalls: [],
   };
   state.relayout = (reason) => state.relayoutCalls.push(reason);
+  // Mirror installProtocols' wiring: the WM relayout rides the zone
+  // registry's (deduped) onChange, not the layer-shell commit path.
+  state.reservedZones?.onChange(() => state.relayout("reserved-zones-changed"));
   return state;
 }
 
@@ -337,7 +340,7 @@ test("destroying a layer surface clears its reservation", () => {
   assert.equal(ctx.state.layerSurfacesBySurface.size, 0);
 });
 
-test("apply triggers state.relayout('reserved-zones-changed')", () => {
+test("a zone change triggers relayout; a same-zone re-apply is silent", () => {
   const ctx = mockCtx({ withReservedZones: true });
   const ls = makeLayerSurface(ctx);
   const { layerSurface, resource } = createLayerSurface(ctx, 100);
@@ -346,6 +349,19 @@ test("apply triggers state.relayout('reserved-zones-changed')", () => {
   ls.set_exclusive_zone(resource, 30);
   applyLayerSurfaceInitial(ctx, layerSurface);
   assert.ok(ctx.state.relayoutCalls.includes("reserved-zones-changed"));
+
+  // A commit that stores the identical zone (a bar redrawing its clock
+  // every frame) must NOT schedule further layout passes.
+  ctx.state.relayoutCalls.length = 0;
+  applyLayerSurfacePending(ctx, layerSurface);
+  applyLayerSurfacePending(ctx, layerSurface);
+  assert.deepEqual(ctx.state.relayoutCalls, [],
+    'same-zone re-applies must not relayout');
+
+  // An actual zone change relayouts again.
+  ls.set_exclusive_zone(resource, 40);
+  applyLayerSurfacePending(ctx, layerSurface);
+  assert.deepEqual(ctx.state.relayoutCalls, ["reserved-zones-changed"]);
 });
 
 // ---- mapping (layer-stack push) -----------------------------------------

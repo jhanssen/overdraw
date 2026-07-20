@@ -837,6 +837,41 @@ test('world: unfit keeps the invoking focus instead of re-deciding', async () =>
   }, { world: true });
 });
 
+// Unfit aims at the FINAL view: the focused window's reveal is folded
+// into the strip scroll BEFORE the dock target is computed, so the
+// camera lands directly on the hovered column instead of flying to the
+// stale pre-fit scroll and snapping when the post-settle reveal fires.
+test('world: unfit lands directly on the focused column (no fly-then-snap)', async () => {
+  await withCanvasPlugin(async (h) => {
+    const { rt, sink, pluginBus, addWindow, layoutApply } = h;
+    for (const id of [101, 102, 103]) { addWindow(id); await settle(); }
+    await layoutApply().apply({ rects: [
+      { id: 101, outer: { x: 0, y: 0, width: 400, height: 600 } },
+      { id: 102, outer: { x: 400, y: 0, width: 400, height: 600 } },
+      { id: 103, outer: { x: 800, y: 0, width: 400, height: 600 } },
+    ] }, 'state-changed');
+    await settle();
+    // Focus the head column deliberately (visible; scroll stays 0), fit,
+    // then hover the off-view tail column while fitted -- focus follows,
+    // nothing scrolls (override gate).
+    pluginBus.emit('window.change',
+      { surfaceId: 101, activated: true, changed: ['activated'] });
+    await settle();
+    await rt.invokeAction('workspace.fit', {});
+    pluginBus.emit('window.change',
+      { surfaceId: 103, activated: true, changed: ['activated'],
+        focusReason: 'pointer-enter' });
+    await settle();
+    sink.cameraCalls.length = 0;
+
+    await rt.invokeAction('workspace.unfit', {});
+    await settle();
+    // The dock lands at the tail column's reveal (flush right, scroll
+    // 400), not at the stale pre-fit scroll 0.
+    assert.deepEqual(sink.cameraCalls.at(-1), { outputId: 0, x: 400, y: 0, zoom: 1 });
+  }, { canvas: { world: true, elastic: true }, layout: { mode: 'columns' } });
+});
+
 // unfitKeepsFocus: false restores the policy decide on unfit.
 test('world: unfitKeepsFocus false fires the workspace-changed decide', async () => {
   await withCanvasPlugin(async (h) => {
@@ -1302,11 +1337,12 @@ test('elastic: scroll reveals keep the layout gap visible (margin = gap)', async
   }, { canvas: { world: true, elastic: true }, layout: { mode: 'columns', gap: 10 } });
 });
 
-// The focused column's place in the strip picks its alignment: a column
-// with strip on both sides is centered so both neighbors peek in (each is
-// then hoverable, and their existence is visible at all); head and tail
-// columns sit flush to the side that has strip in it.
-test('elastic: a column with neighbors both sides is centered; head/tail sit flush', async () => {
+// Focus-driven reveals are MINIMAL: a column already fully in view
+// leaves the camera alone (focus cycling across visible columns must not
+// shift the strip); an off-view column scrolls just enough to sit flush
+// at the edge it entered from. Centering is reserved for pointer commits
+// (a press, workspace.reveal).
+test('elastic: focus reveals minimally; visible columns leave the camera', async () => {
   await withCanvasPlugin(async (h) => {
     const { sink, pluginBus, addWindow } = h;
     for (const id of [101, 102, 103]) { addWindow(id); await settle(); }
@@ -1323,19 +1359,24 @@ test('elastic: a column with neighbors both sides is centered; head/tail sit flu
         }],
       });
       await settle();
-      return sink.cameraCalls.at(-1);
     };
 
-    // Middle column (400..800): centered, so 200px of each neighbor shows.
-    assert.deepEqual(await focus(102, 400), { outputId: 0, x: 200, y: 0, zoom: 1 },
-      'the middle column centers, leaving both neighbors visible');
-    // Head column (0..400): nothing to its left, so it sits flush left
-    // rather than spending the slack on void.
-    assert.deepEqual(await focus(101, 0), { outputId: 0, x: 0, y: 0, zoom: 1 },
-      'the head column sits flush left');
-    // Tail column (800..1200): flush right, same reason mirrored.
-    assert.deepEqual(await focus(103, 800), { outputId: 0, x: 400, y: 0, zoom: 1 },
-      'the tail column sits flush right');
+    // Middle column (400..800) is fully visible at scroll 0: no move.
+    sink.cameraCalls.length = 0;
+    await focus(102, 400);
+    assert.equal(sink.cameraCalls.length, 0,
+      'focusing a fully visible column must not scroll');
+    // Tail column (800..1200) is off-view: flush right, minimal.
+    await focus(103, 800);
+    assert.deepEqual(sink.cameraCalls.at(-1), { outputId: 0, x: 400, y: 0, zoom: 1 },
+      'an off-view column scrolls flush to the edge it entered from');
+    // Middle column again: fully visible at scroll 400 too -- no move.
+    sink.cameraCalls.length = 0;
+    await focus(102, 400);
+    assert.equal(sink.cameraCalls.length, 0);
+    // Head column (0..400): off-view at scroll 400 -> flush left.
+    await focus(101, 0);
+    assert.deepEqual(sink.cameraCalls.at(-1), { outputId: 0, x: 0, y: 0, zoom: 1 });
   }, { canvas: { world: true, elastic: true }, layout: { mode: 'columns' } });
 });
 
@@ -1417,14 +1458,15 @@ test('elastic: hover focus never scrolls; a press or workspace.reveal does', asy
     ] }, 'state-changed');
     await settle();
 
-    // Deliberate focus (no focusReason) on the middle column: centered.
+    // Deliberate focus on the off-view tail column: minimal flush reveal.
     pluginBus.emit('window.change',
-      { surfaceId: 102, activated: true, changed: ['activated'] });
+      { surfaceId: 103, activated: true, changed: ['activated'] });
     await settle();
-    assert.deepEqual(sink.cameraCalls.at(-1), { outputId: 0, x: 200, y: 0, zoom: 1 });
+    assert.deepEqual(sink.cameraCalls.at(-1), { outputId: 0, x: 400, y: 0, zoom: 1 });
     sink.cameraCalls.length = 0;
 
-    // Hover onto the head column: focus follows the pointer, the camera stays.
+    // Hover onto the (off-view) head column: focus follows the pointer,
+    // the camera stays.
     pluginBus.emit('window.change',
       { surfaceId: 101, activated: true, changed: ['activated'],
         focusReason: 'pointer-enter' });
@@ -1442,6 +1484,13 @@ test('elastic: hover focus never scrolls; a press or workspace.reveal does', asy
     pluginBus.emit('pointer.pressed', { surfaceId: 101 });
     await settle();
     assert.deepEqual(sink.cameraCalls.at(-1), { outputId: 0, x: 0, y: 0, zoom: 1 });
+    sink.cameraCalls.length = 0;
+
+    // A press on a fully VISIBLE column still centers -- clicks commit
+    // to the column, unlike focus-driven reveals which are minimal.
+    pluginBus.emit('pointer.pressed', { surfaceId: 102 });
+    await settle();
+    assert.deepEqual(sink.cameraCalls.at(-1), { outputId: 0, x: 200, y: 0, zoom: 1 });
     sink.cameraCalls.length = 0;
 
     // workspace.reveal scrolls to an explicit column (tail -> flush right).

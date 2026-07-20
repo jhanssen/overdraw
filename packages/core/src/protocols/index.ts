@@ -553,8 +553,14 @@ export async function installProtocols(
     },
   );
   // Expose wm.schedule via state.relayout for callers outside the WM that
-  // affect the tile region (layer-shell reserved-zone changes).
+  // affect the tile region.
   state.relayout = (reason) => state.wm?.schedule(reason);
+  // Reserved-zone changes move the tile region, so tiled/maximized windows
+  // reflow. Riding the registry's onChange (which is silent for a set that
+  // stores identical values) rather than the layer-shell commit path keeps
+  // a layer client that commits every frame -- a bar's meter, an animated
+  // wallpaper -- from scheduling a full relayout per frame.
+  opts.reservedZones?.onChange(() => state.relayout?.("reserved-zones-changed"));
   // Cross-output workspace-move residency: subscribe to
   // workspace.window-moved so a window crossing outputs freezes at the
   // OLD location and waits for the client to reallocate at the new

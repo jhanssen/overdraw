@@ -163,3 +163,20 @@ test("schedule(reason) reflows on demand (reserved-zones-changed)", async () => 
   assert.equal(observed.lastInputs.tileRegion.y, 40);
   assert.equal(observed.lastInputs.tileRegion.height, 560);
 });
+
+test("effectiveRect excludeOwner skips that owner's zones without mutating", () => {
+  const reservedZones = createReservedZoneRegistry();
+  const out = { x: 0, y: 0, width: 1000, height: 600 };
+  const changes = [];
+  reservedZones.onChange((id) => changes.push(id));
+  reservedZones.set("bar", { outputId: 0, edge: "top", thickness: 30, owner: 7 });
+  reservedZones.set("dock", { outputId: 0, edge: "left", thickness: 50, owner: 8 });
+  changes.length = 0;
+
+  // Excluding owner 7 drops only its zone; the read is pure (no onChange).
+  assert.deepEqual(reservedZones.effectiveRect(0, out, 7),
+    { x: 50, y: 0, width: 950, height: 600 });
+  assert.deepEqual(reservedZones.effectiveRect(0, out),
+    { x: 50, y: 30, width: 950, height: 570 });
+  assert.deepEqual(changes, [], "effectiveRect must never notify");
+});
