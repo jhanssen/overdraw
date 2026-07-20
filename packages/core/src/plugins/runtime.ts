@@ -541,6 +541,22 @@ export class PluginRuntime implements PluginController {
     if (p) await p.stop();
   }
 
+  // Replace plugins by name: gracefully stop every handle whose name
+  // matches an entry, remove those handles from the plugin list, then
+  // spawn the entries as one load batch. Removal matters: name-based
+  // routing (namespace activation, emit, pluginConfig) takes the FIRST
+  // matching handle, so a stopped predecessor left in the list would
+  // shadow its replacement. Used by config hot-reload to re-init bundled
+  // plugins with a freshly-evaluated config slice.
+  async reload(configs: readonly ResolvedPlugin[]): Promise<void> {
+    const names = new Set(configs.map((c) => c.name));
+    const doomed = this.plugins.filter((p) => names.has(p.cfg.name));
+    await Promise.all(doomed.map((p) => p.stop()));
+    const gone = new Set(doomed);
+    this.plugins = this.plugins.filter((p) => !gone.has(p));
+    await this.load(configs);
+  }
+
   // Push a one-way event to one plugin by name (core -> plugin). No-op if no such
   // plugin or it is not `live`. Used by point-to-point flows like decoration
   // assignment; broad event delivery goes through the dynamic bus instead.

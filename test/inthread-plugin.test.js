@@ -51,6 +51,25 @@ test('in-thread: bundled plugin loads, registers namespace, invocation works', a
   });
 });
 
+test('in-thread: reload replaces the plugin and re-activates with fresh config', async () => {
+  await withRuntime({}, async (rt) => {
+    await rt.load([bundledEntry('inthread-config.mjs', { gap: 4 })]);
+    await rt.waitForNamespace('test-config');
+    assert.deepEqual(
+      await rt.invokeNamespace('test-config', 'getConfig', []), { gap: 4 });
+
+    await rt.reload([bundledEntry('inthread-config.mjs', { gap: 32 })]);
+
+    // The replacement owns the namespace and got the fresh config; the
+    // stopped predecessor must not shadow it (exactly one handle by name).
+    assert.deepEqual(
+      await rt.invokeNamespace('test-config', 'getConfig', []), { gap: 32 });
+    const states = rt.states().filter((s) => s.name === 'inthread-config');
+    assert.equal(states.length, 1);
+    assert.equal(states[0].state, 'live');
+  });
+});
+
 test('in-thread: bundled plugin with no config (undefined) gets null in init', async () => {
   await withRuntime({}, async (rt) => {
     await rt.load([bundledEntry('inthread-config.mjs')]);

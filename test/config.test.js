@@ -4,7 +4,7 @@
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, writeFileSync, mkdirSync, rmSync } from 'node:fs';
+import { mkdtempSync, writeFileSync, mkdirSync, rmSync, utimesSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -47,6 +47,22 @@ test('object default export: validate + normalize + defaults applied', async () 
     maxRestarts: 3, windowSeconds: 60, bundled: false, raw: { module: '/x.js' },
   }]);
   assert.equal(c.sourcePath, p);
+  rmSync(dir, { recursive: true, force: true });
+});
+
+test('loadConfig re-evaluates the file after an edit (cache-busted import)', async () => {
+  const dir = tmp();
+  const p = join(dir, 'config.mjs');
+  writeFileSync(p, 'export default { layout: { gap: 4 } }');
+  const c1 = await loadConfig(p);
+  assert.deepEqual(c1.layout, { gap: 4 });
+  writeFileSync(p, 'export default { layout: { gap: 32 } }');
+  // Force a distinct mtime: a same-millisecond rewrite would collide with
+  // the first import's cache key.
+  const t = new Date(Date.now() + 2000);
+  utimesSync(p, t, t);
+  const c2 = await loadConfig(p);
+  assert.deepEqual(c2.layout, { gap: 32 });
   rmSync(dir, { recursive: true, force: true });
 });
 

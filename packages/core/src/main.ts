@@ -11,8 +11,8 @@
 
 import { createRequire } from "node:module";
 import { fileURLToPath, pathToFileURL } from "node:url";
-import { dirname, join, isAbsolute, resolve as resolvePath } from "node:path";
-import { globSync } from "node:fs";
+import { basename, dirname, join, isAbsolute, resolve as resolvePath } from "node:path";
+import { globSync, watch as fsWatch } from "node:fs";
 
 import { installProtocols } from "./protocols/index.js";
 import { titleAppId } from "./query.js";
@@ -219,7 +219,8 @@ process.on("SIGTERM", () => shutdown("SIGTERM"));
 // processing is safe.
 pluginBus.subscribe("compositor.shutdown", () => shutdown("compositor.shutdown"));
 
-const config = await loadConfig(parseConfigArg(process.argv.slice(2)));
+const configArg = parseConfigArg(process.argv.slice(2));
+const config = await loadConfig(configArg);
 log.info("core", `config: ${config.sourcePath ?? "(defaults; no config file)"}`);
 
 // Backend selection. Production default: KMS (bare-metal). Override:
@@ -862,15 +863,19 @@ const bundledRuntime = { bootOutputDurableKey, initialOutputs };
 // Bundled plugins first (priority 0 floor), then user-config plugins
 // (default priority 100). A `module` that looks like a path (absolute or
 // ./ ../) resolves to a file:// URL; bare specifiers pass through to
-// Node's resolver.
-const bundledResolved = selectBundledPlugins(config).map((spec) => {
-  const isPath = isAbsolute(spec.module)
-    || spec.module.startsWith("./") || spec.module.startsWith("../");
-  const module = isPath
-    ? pathToFileURL(resolvePath(process.cwd(), spec.module)).href
-    : spec.module;
-  return bundledToResolved(spec, module, config, bundledRuntime);
-});
+// Node's resolver. Also called by config reload, which re-projects the
+// (updated) config through each spec's configFrom.
+function resolveBundled(): ReturnType<typeof bundledToResolved>[] {
+  return selectBundledPlugins(config).map((spec) => {
+    const isPath = isAbsolute(spec.module)
+      || spec.module.startsWith("./") || spec.module.startsWith("../");
+    const module = isPath
+      ? pathToFileURL(resolvePath(process.cwd(), spec.module)).href
+      : spec.module;
+    return bundledToResolved(spec, module, config, bundledRuntime);
+  });
+}
+const bundledResolved = resolveBundled();
 
 const base = config.sourcePath ? dirname(config.sourcePath) : process.cwd();
 const userResolved = config.plugins.map((p) => {
@@ -1753,6 +1758,105 @@ log.info("core", `plugins: ${summary.length > 0 ? summary : "(none)"}`);
       return snap as unknown as import("./plugins/protocol.js").Json;
     },
   });
+}
+
+// Config hot-reload: re-evaluate the config file when it changes on disk
+// (debounced fs.watch) or on `overdrawctl invoke config.reload`, then
+// re-init the bundled plugins that consume the changed slices. Only
+// plugin-owned slices with no live session state hot-apply:
+//   actions -> config-actions        (always re-init: may hold functions)
+//   windowRules -> window-rules      (always re-init: may hold functions)
+//   layout -> layout-default         (re-init when changed)
+//   focus -> focus-default           (re-init when changed)
+//   hotkeys -> hotkey-default        (re-init when changed)
+// Everything else is wired at boot or anchors live state (outputs,
+// xwayland, canvas workspaces, decoration match-once assignments, the
+// plugin list), so a change there logs a needs-restart warning and the
+// running value stays. Re-evaluation re-imports only the config file
+// itself; modules it imports stay in Node's ESM cache (see loadConfig).
+{
+  const sourcePath = config.sourcePath;
+  const rt = runtime;
+  if (sourcePath !== null) {
+    // Slices with no hot-apply path: compare and warn.
+    const STATIC_SLICES = [
+      "output", "card", "scale", "outputsByKey", "canvas", "plugins",
+      "xwayland", "autostart", "cursor", "directScanout", "decoration",
+    ] as const;
+    const same = (a: unknown, b: unknown): boolean =>
+      JSON.stringify(a ?? null) === JSON.stringify(b ?? null);
+    let reloading = false;
+    const reloadConfig = async (): Promise<string> => {
+      if (reloading) return "reload already in progress";
+      reloading = true;
+      try {
+        const next = await loadConfig(configArg);
+        const staticChanged = STATIC_SLICES.filter((k) => !same(config[k], next[k]));
+        if (staticChanged.length > 0) {
+          log.warn("core", `config reload: [${staticChanged.join(", ")}] only `
+            + `apply at boot; restart the compositor to pick them up`);
+        }
+        const restart = ["config-actions", "window-rules"];
+        if (!same(config.layout, next.layout)) restart.push("layout-default");
+        if (!same(config.focus, next.focus)) restart.push("focus-default");
+        if (!same(config.hotkeys, next.hotkeys)) restart.push("hotkey-default");
+        config.actions = next.actions;
+        config.windowRules = next.windowRules;
+        config.layout = next.layout;
+        config.focus = next.focus;
+        config.hotkeys = next.hotkeys;
+        const names = new Set(restart);
+        await rt.reload(resolveBundled().filter((r) => names.has(r.name)));
+        if (names.has("layout-default")) {
+          // Fresh layout params affect every tile; recompute now rather
+          // than on the next incidental relayout.
+          state?.relayout?.("param-changed");
+          pluginBus.emit("layout.params-changed", {});
+        }
+        const summary = `re-initialized [${restart.join(", ")}]`
+          + (staticChanged.length > 0
+            ? `; needs restart for [${staticChanged.join(", ")}]` : "");
+        log.info("core", `config reload: ${summary}`);
+        return summary;
+      } finally {
+        reloading = false;
+      }
+    };
+    rt.registerHostAction({
+      name: "config.reload",
+      description: "Re-evaluate the config file and re-init the bundled " +
+        "plugins that consume changed slices (hotkeys, focus, layout, " +
+        "windowRules, actions). Boot-only slices (outputs, xwayland, canvas, " +
+        "decoration, plugins) log a needs-restart warning when changed. Also " +
+        "fires automatically when the config file changes on disk. No " +
+        "params; returns a summary string.",
+      handler: () => reloadConfig(),
+    });
+    // Watch the config's directory, not the file: editors that save via
+    // rename-replace would orphan a file watch after the first save.
+    const dir = dirname(sourcePath);
+    const base = basename(sourcePath);
+    let debounce: ReturnType<typeof setTimeout> | null = null;
+    try {
+      const watcher = fsWatch(dir, (_event, filename) => {
+        // A null filename (platform-dependent) may still be our file.
+        if (filename !== null && filename !== base) return;
+        if (debounce) clearTimeout(debounce);
+        debounce = setTimeout(() => {
+          debounce = null;
+          reloadConfig().catch((e: unknown) => {
+            log.warn("core", `config reload failed: ${(e as Error).message}; `
+              + `keeping the previous config`);
+          });
+        }, 300);
+        debounce.unref?.();
+      });
+      watcher.unref?.();
+    } catch (e: unknown) {
+      log.warn("core", `config watch failed: ${(e as Error).message}; `
+        + `hot-reload via 'overdrawctl invoke config.reload' only`);
+    }
+  }
 }
 
 // IPC server: JSON-RPC 2.0 over a Unix socket. Plugins register actions and

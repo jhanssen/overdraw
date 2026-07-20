@@ -13,7 +13,7 @@
 // step is needed. The default export is an OverdrawConfig object or a
 // (sync/async) function returning one.
 
-import { existsSync } from "node:fs";
+import { existsSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { join, isAbsolute, resolve as resolvePath } from "node:path";
 import { pathToFileURL } from "node:url";
@@ -314,7 +314,15 @@ export async function loadConfig(explicit: string | null): Promise<ResolvedConfi
       sourcePath: null,
     };
   }
-  const mod = (await import(pathToFileURL(path).href)) as { default?: ConfigExport };
+  // Node's ESM registry caches by full URL, so a bare file URL would return
+  // the first evaluation forever. Keying a query param to the file's
+  // mtime+size makes a re-call after an edit re-evaluate the file (config
+  // hot-reload). Limitation: modules the config file itself imports stay
+  // cached; only the top-level file is re-evaluated.
+  const url = pathToFileURL(path);
+  const st = statSync(path);
+  url.searchParams.set("v", `${st.mtimeMs}-${st.size}`);
+  const mod = (await import(url.href)) as { default?: ConfigExport };
   if (mod.default === undefined) fail("file has no default export", path);
   let value: unknown = mod.default;
   if (typeof value === "function") {
