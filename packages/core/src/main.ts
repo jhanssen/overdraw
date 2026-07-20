@@ -1326,6 +1326,22 @@ pluginBus.subscribe("window.toggle-floating-requested", () => {
   void state.wm.propose(focused, { tiling: next }, "user-input");
 });
 
+// The window.toggle-maximize action: flip the focused window's exclusive
+// state. none -> maximized zooms the window over its island's workarea
+// (the layout driver hands an exclusive window the island's tile region,
+// which the canvas plugin keeps workarea-sized while a member is
+// exclusive); maximized or fullscreen -> none restores the captured
+// restoreRect via relayout.
+pluginBus.subscribe("window.toggle-maximize-requested", () => {
+  if (!state?.seat || !state.wm) return;
+  const focused = state.seat.kbFocus?.surfaceId;
+  if (typeof focused !== "number") return;
+  const ws = state.wm.getWindowState(focused);
+  if (!ws) return;
+  const next = ws.exclusive === "none" ? "maximized" : "none";
+  void state.wm.propose(focused, { exclusive: next }, "user-input");
+});
+
 // window.move-to-output (explicit outputId): move the focused window to the
 // shown workspace on the target output. Resolves via the workspace
 // namespace's moveWindow (which knows the shown workspace per output) so

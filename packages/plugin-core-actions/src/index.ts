@@ -166,6 +166,22 @@ export default async function init(sdk: PluginSdkShape): Promise<void> {
     },
   });
 
+  // Zoom the keyboard-focused window: flip its exclusive state between
+  // maximized (fills the output's workarea; the canvas world collapses a
+  // multi-screen island to the workarea while a member is exclusive) and
+  // none. Any exclusive state -- including client-requested fullscreen --
+  // toggles back to none.
+  sdk.actions.register({
+    name: "window.toggle-maximize",
+    description: "Toggle the keyboard-focused window between maximized " +
+      "(zoomed to fill the output's workarea while staying tiled) and its " +
+      "normal tile. Also un-fullscreens a fullscreen window. No params.",
+    handler: async (): Promise<null> => {
+      sdk.events.emit("window.toggle-maximize-requested", {});
+      return null;
+    },
+  });
+
   // Keyboard focus navigation. Cycles the keyboard focus through the WM's
   // toplevel stack (wrapping at the ends). The launcher resolves the current
   // focus + the stack order and applies the new focus; plugin context has

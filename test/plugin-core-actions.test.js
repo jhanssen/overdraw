@@ -64,6 +64,16 @@ test('window.close emits window.close-requested', async () => {
   assert.deepEqual(emitted.at(-1), ['window.close-requested', {}]);
 });
 
+test('window.toggle-maximize emits window.toggle-maximize-requested', async () => {
+  const { sdk, handlers, emitted } = makeSdk();
+  await init(sdk);
+  const toggle = handlers.get('window.toggle-maximize');
+  assert.ok(toggle, 'window.toggle-maximize action registered');
+  const result = await toggle();
+  assert.equal(result, null);
+  assert.deepEqual(emitted.at(-1), ['window.toggle-maximize-requested', {}]);
+});
+
 test('focus.next / focus.prev emit focus.cycle-requested with a direction', async () => {
   const { sdk, handlers, emitted } = makeSdk();
   await init(sdk);
