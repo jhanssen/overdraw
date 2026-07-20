@@ -1,8 +1,12 @@
-// Bundled workspace plugin. Registers in the 'workspace' namespace at
-// priority 0 (the floor; bundled default). Exposes the workspace action
-// surface; emits workspace.* events on the bus; maintains the per-window
+// Bundled workspace plugin. Claims the 'workspace' namespace at priority 0
+// (the floor; bundled default). Exposes the workspace action surface;
+// emits workspace.* events on the bus; maintains the per-window
 // 'workspace.id' state-bag entry; pushes setOutputStack as the active
 // workspace's membership changes.
+//
+// All of that happens in the activation callback: when a higher-priority
+// claim wins the namespace, this plugin's actions, subscriptions, and
+// placement handlers never come into existence.
 
 import type {
   WorkspaceAPI, WorkspaceHandle, WorkspaceIndex, WorkspaceSnapshot,
@@ -59,6 +63,12 @@ interface WorkspacePluginConfig {
 export default async function init(
   sdk: PluginSdkShape, config?: WorkspacePluginConfig,
 ): Promise<void> {
+  await sdk.registerPlugin("workspace", () => activate(sdk, config));
+}
+
+async function activate(
+  sdk: PluginSdkShape, config?: WorkspacePluginConfig,
+): Promise<WorkspaceAPI> {
   // Resolve fallback config. Empty defaults make this safe to run in
   // non-core harnesses (the recompute will throw if a workspace ever has
   // no live home in such a harness; tests stay clear of that case).
@@ -687,8 +697,8 @@ export default async function init(
     },
   };
 
-  await sdk.registerPlugin("workspace", () => api);
-  sdk.log("workspace plugin registered");
+  sdk.log("workspace plugin activated");
+  return api;
 }
 
 // ---- Param parsers -------------------------------------------------------

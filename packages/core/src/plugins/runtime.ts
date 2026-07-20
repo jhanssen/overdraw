@@ -389,52 +389,143 @@ export class PluginRuntime implements PluginController {
   // shared actionRegistry under the reserved owner name HOST_ACTION_OWNER.
   private hostActions = new Map<string, HostActionHandler>();
   // Pending `plugin.wait-for-active` waiters, keyed by namespace. Each
-  // waiter's promise resolves when the registry's active winner appears (or
+  // waiter's promise resolves when the namespace's winner is ACTIVATED (or
   // rejects on timeout / when the waiting plugin dies).
   private waiters = new Map<string, Set<{ resolve: () => void; reject: (e: Error) => void; timer: NodeJS.Timeout | null }>>();
+  // Depth of in-flight load() batches. While > 0, claims accumulate without
+  // activating; the batch end runs one activation pass over every inactive
+  // namespace. This is the barrier that lets a later-loading user plugin's
+  // higher-priority claim win WITHOUT the bundled claimant's init ever
+  // running.
+  private loadDepth = 0;
+  // Namespaces with an activation pass in flight (activation awaits a
+  // plugin.activate round-trip; a second pass for the same namespace would
+  // race it).
+  private activating = new Set<string>();
 
   constructor(opts: Partial<RuntimeOptions> = {}) {
     this.opts = { ...DEFAULT_OPTIONS, ...opts };
-    // Resolve namespace waiters whenever the active winner appears.
-    this.nsRegistry.onActiveChange((ns, _prev, next) => {
-      if (!next) return;   // active became null; don't resolve waiters
-      const set = this.waiters.get(ns);
-      if (!set) return;
-      for (const w of set) {
-        if (w.timer) clearTimeout(w.timer);
-        w.resolve();
+    this.nsRegistry.onChange((ns, change) => {
+      if (change.kind === "activated") {
+        // Resolve wait-for-active waiters.
+        const set = this.waiters.get(ns);
+        if (!set) return;
+        for (const w of set) {
+          if (w.timer) clearTimeout(w.timer);
+          w.resolve();
+        }
+        set.clear();
+        return;
       }
-      set.clear();
+      // A claim landing on an inactive namespace (post-load dynamic
+      // registration) or the activated claim going away (plugin death /
+      // unregister -> failover to the next-highest claim) both warrant an
+      // activation pass. During a load batch the pass is deferred to the
+      // barrier instead.
+      if (change.kind === "claim-added"
+          || (change.kind === "claim-removed" && change.wasActivated)) {
+        if (this.loadDepth > 0) return;
+        queueMicrotask(() => { void this.activateNamespace(ns); });
+      }
     });
   }
 
   // Spawn every configured plugin and await each one's first settle (live
   // or failed). cfg.bundled selects the transport: in-thread for bundled,
-  // Worker for user plugins.
+  // Worker for user plugins. After the batch settles, every namespace with
+  // claims but no activated winner runs activation: the highest-priority
+  // claim's init executes (in its plugin's realm) and becomes the routing
+  // target. load() resolves only after those activations settle.
   async load(configs: readonly ResolvedPlugin[]): Promise<void> {
-    for (const cfg of configs) {
-      let p: PluginHandle;
-      if (cfg.bundled) {
-        const itp = new InThreadPlugin(cfg, {
-          log: this.opts.log,
-          onEvent: this.opts.onEvent,
-          onRequest: this.opts.onRequest,
-          bus: this.opts.bus,
-          shutdownTimeoutMs: this.opts.shutdownTimeoutMs,
-          initTimeoutMs: this.opts.initTimeoutMs,
-          inThreadGpu: this.opts.inThreadGpu,
-          liveOutputIds: this.opts.liveOutputIds,
-        }, this);
-        itp.spawn();
-        p = itp;
-      } else {
-        const mp = new ManagedPlugin(cfg, this.opts, this);
-        mp.spawn();
-        p = mp;
+    this.loadDepth++;
+    try {
+      for (const cfg of configs) {
+        let p: PluginHandle;
+        if (cfg.bundled) {
+          const itp = new InThreadPlugin(cfg, {
+            log: this.opts.log,
+            onEvent: this.opts.onEvent,
+            onRequest: this.opts.onRequest,
+            bus: this.opts.bus,
+            shutdownTimeoutMs: this.opts.shutdownTimeoutMs,
+            initTimeoutMs: this.opts.initTimeoutMs,
+            inThreadGpu: this.opts.inThreadGpu,
+            liveOutputIds: this.opts.liveOutputIds,
+          }, this);
+          itp.spawn();
+          p = itp;
+        } else {
+          const mp = new ManagedPlugin(cfg, this.opts, this);
+          mp.spawn();
+          p = mp;
+        }
+        this.plugins.push(p);
       }
-      this.plugins.push(p);
+      await Promise.all(this.plugins.map((p) => p.ready));
+    } finally {
+      this.loadDepth--;
     }
-    await Promise.all(this.plugins.map((p) => p.ready));
+    if (this.loadDepth === 0) await this.activatePendingNamespaces();
+  }
+
+  // One activation pass over every claimed-but-inactive namespace, in
+  // first-claim order (= load order, preserving bundled ordering
+  // constraints like focus-before-workspace).
+  private async activatePendingNamespaces(): Promise<void> {
+    for (const ns of this.nsRegistry.namespaces()) {
+      if (!this.nsRegistry.active(ns)) await this.activateNamespace(ns);
+    }
+  }
+
+  // Activate the highest-priority claim for `ns`: send plugin.activate to
+  // the claimant (its stored init runs there; the reply carries the API's
+  // method names). A claimant whose activation throws is FAILED outright
+  // (stopped, all its registrations cleaned up) -- an activation that
+  // half-ran may have registered actions/subscriptions/binds before
+  // throwing, and stopping the plugin is the only cleanup that covers
+  // them all. The next-highest claim is then tried: the priority-chain
+  // failure recovery. No-op if the namespace already has an activated
+  // winner (activation never preempts).
+  private async activateNamespace(ns: string): Promise<void> {
+    if (this.activating.has(ns)) return;
+    this.activating.add(ns);
+    try {
+      for (;;) {
+        if (this.nsRegistry.active(ns)) return;
+        const top = this.nsRegistry.topClaim(ns);
+        if (!top) return;
+        const target = this.plugins.find((p) => p.cfg.name === top.pluginName);
+        const ep = target?.endpointHandle();
+        if (!ep) {
+          this.opts.log?.(
+            `[plugin ${top.pluginName}] claim on '${ns}' dropped: plugin not live`);
+          this.nsRegistry.unregister(top.pluginName, ns);
+          continue;
+        }
+        try {
+          const res = await ep.request("plugin.activate", { namespace: ns });
+          const raw = (res as { methods?: unknown } | null)?.methods;
+          const methods = Array.isArray(raw)
+            ? raw.filter((m): m is string => typeof m === "string")
+            : [];
+          this.nsRegistry.markActivated(ns, top.pluginName, methods);
+          return;
+        } catch (err: unknown) {
+          const msg = err instanceof Error ? err.message : String(err);
+          this.opts.log?.(
+            `[plugin ${top.pluginName}] activation of '${ns}' failed: ${msg}; ` +
+            `failing plugin`);
+          if (target) await target.stop();
+          // stop() removes the plugin's claims via unregisterAllFor; the
+          // explicit unregister is a belt-and-braces guard against a stop
+          // path that settles before its exit handler ran (idempotent).
+          this.nsRegistry.unregister(top.pluginName, ns);
+          // Loop: try the next-highest claim.
+        }
+      }
+    } finally {
+      this.activating.delete(ns);
+    }
   }
 
   // Graceful shutdown of all plugins (parallel).
@@ -558,9 +649,11 @@ export class PluginRuntime implements PluginController {
       ? payload.priority
       : (isBundled ? 0 : 100);
     try {
+      // methods stay null until activation runs the claimant's init and
+      // reports the API surface.
       this.nsRegistry.register({
         pluginName, namespace: payload.namespace,
-        priority, methods: new Set(payload.methods),
+        priority, methods: null,
       });
     } catch (err: unknown) {
       const msg = err instanceof Error ? err.message : String(err);
@@ -584,7 +677,7 @@ export class PluginRuntime implements PluginController {
     if (!active) {
       throw new Error(`plugin.invoke: no active plugin for namespace '${payload.namespace}'`);
     }
-    if (!active.methods.has(payload.method)) {
+    if (!active.methods?.has(payload.method)) {
       throw new Error(
         `plugin.invoke: '${payload.namespace}.${payload.method}' not registered ` +
         `by '${active.pluginName}'`);
@@ -771,12 +864,10 @@ function isActionInvokePayload(d: unknown): d is { name: string; params: Json } 
 // (it's our bootstrap.ts) but malformed messages should be logged and
 // dropped rather than corrupt a registry.
 
-function isRegisterPayload(d: unknown): d is { namespace: string; methods: string[]; priority?: number } {
+function isRegisterPayload(d: unknown): d is { namespace: string; priority?: number } {
   if (typeof d !== "object" || d === null) return false;
   const o = d as { [k: string]: unknown };
   if (typeof o.namespace !== "string" || o.namespace.length === 0) return false;
-  if (!Array.isArray(o.methods)) return false;
-  if (!o.methods.every((m) => typeof m === "string")) return false;
   if (o.priority !== undefined && typeof o.priority !== "number") return false;
   return true;
 }

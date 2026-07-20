@@ -79,8 +79,18 @@ function validateConfig(raw: unknown): LayoutParams {
 }
 
 export default async function init(sdk: PluginSdkShape, rawConfig?: unknown): Promise<void> {
+  // Config validation is eager (a bad config fails the plugin at load);
+  // everything else -- state, subscriptions, the API -- lives in the
+  // activation callback below, so a displaced claim leaves no trace.
   const params: LayoutParams = validateConfig(rawConfig);
 
+  // Priority 0 is the bundled-plugin floor (set by the runtime when
+  // ResolvedPlugin.bundled is true). Pass undefined here so the runtime's
+  // default applies; an explicit value would shadow the bundled marker.
+  await sdk.registerPlugin("layout", () => activate(sdk, params));
+}
+
+function activate(sdk: PluginSdkShape, params: LayoutParams): LayoutAPI {
   // Per-window column-width fractions (of the workarea width), columns
   // mode. Keyed by surface id so a width follows its window through
   // reorders and across islands. ONLY user-resized windows appear here
@@ -209,11 +219,8 @@ export default async function init(sdk: PluginSdkShape, rawConfig?: unknown): Pr
     },
   };
 
-  // Priority 0 is the bundled-plugin floor (set by the runtime when
-  // ResolvedPlugin.bundled is true). Pass undefined here so the runtime's
-  // default applies; an explicit value would shadow the bundled marker.
-  await sdk.registerPlugin("layout", () => api);
-  sdk.log(`layout registered (mode=${params.mode}, masterFraction=${params.masterFraction}, column=${params.column}, gap=${params.gap})`);
+  sdk.log(`layout activated (mode=${params.mode}, masterFraction=${params.masterFraction}, column=${params.column}, gap=${params.gap})`);
+  return api;
 }
 
 // Re-export the user-facing config type so plugin authors can

@@ -890,9 +890,16 @@ shares core's `GPUDevice` directly.
 down`/`failed`), watchdog (>K missed pongs → terminate), restart
 policy (`on-failure` up to `maxRestarts` in `windowSeconds`).
 Bundled plugins are core's own code and load first; user-config
-plugins load after the server is up. Namespace registry sorts
-registrations priority-descending with a priority chain (head is
-active; failure demotes).
+plugins load after the server is up. Namespace claims are inert:
+the claimant's registerPlugin init runs only when the claim is
+ACTIVATED (winner selection at load-batch end, highest priority
+wins; bundled floor 0, user default 100). A displaced provider's
+init — and thus its actions, subscriptions, and binds — never
+runs, so any bundled exclusive-role plugin is replaceable by a
+user plugin claiming its namespace. Activation failure fails the
+claimant plugin and activates the next claim (priority chain);
+same failover on death/unregister. Activation never preempts a
+live winner (replacement is a boot-time decision).
 
 **Bundled plugins:**
 - `@overdraw/plugin-layout-default` (namespace `'layout'`):

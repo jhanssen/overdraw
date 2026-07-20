@@ -4,26 +4,32 @@
 // binding handler dispatches per the BindingSpec's outcome (action /
 // pushMode / popMode).
 //
-// In-thread, namespace 'hotkey', priority 0 (the bundled-plugin floor).
-// User configs may override by registering a higher-priority hotkey
-// plugin in the same namespace.
+// In-thread, namespace 'hotkey', priority 0 (the bundled-plugin floor). A
+// higher-priority claim on 'hotkey' replaces this plugin outright: mode
+// definitions and key binds happen inside the activation callback, so when
+// another claimant wins, none of this plugin's bindings exist.
 
 import type {
   BindingSpec, ModeSpec,
 } from "@overdraw/hotkey-types";
 import type { PluginSdkShape } from "@overdraw/plugin-sdk-types";
 
-// Minimal namespace API the plugin exposes. There's nothing for other
-// plugins to call into today; the namespace exists so a third-party
-// hotkey plugin can replace this one via the priority chain.
-const api = {} as const;
-
 export default async function init(sdk: PluginSdkShape, rawConfig?: unknown): Promise<void> {
+  // Config validation is eager (a bad config fails the plugin at load);
+  // modes and binds are established only on activation.
   const config = validateConfig(rawConfig);
+  await sdk.registerPlugin("hotkey", () => activate(sdk, config));
+}
 
+// The namespace API is empty -- there's nothing for other plugins to call
+// into today. Activation's value is its side effects: the seat modes and
+// key binds come into existence here, for the winning claimant only.
+async function activate(
+  sdk: PluginSdkShape, config: NormalizedConfig,
+): Promise<{ [k: string]: unknown }> {
   // The config validator returns an empty config when rawConfig is null /
   // undefined; in that case there's nothing to define or bind. The plugin
-  // still registers its namespace (so the priority chain works) but is
+  // still claims its namespace (so the priority chain works) but is
   // otherwise inert.
   for (const [modeName, modeSpec] of Object.entries(config.modes)) {
     if (modeName === "default") continue;
@@ -111,11 +117,11 @@ export default async function init(sdk: PluginSdkShape, rawConfig?: unknown): Pr
       `binding has releaseAction but no outcome: ${JSON.stringify(binding)}`);
   }
 
-  await sdk.registerPlugin("hotkey", () => api);
   const totalBindings = Object.values(config.modes)
     .reduce((n, m) => n + m.bindings.length, 0);
   const modeCount = Object.keys(config.modes).length;
-  sdk.log(`hotkey plugin registered (${totalBindings} bindings across ${modeCount} mode${modeCount === 1 ? "" : "s"})`);
+  sdk.log(`hotkey plugin activated (${totalBindings} bindings across ${modeCount} mode${modeCount === 1 ? "" : "s"})`);
+  return {};
 }
 
 // Normalize + validate the user's config. Returns a NormalizedConfig where

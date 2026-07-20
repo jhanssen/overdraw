@@ -570,24 +570,43 @@ made invokable from hotkeys, config, IPC, and other plugins.
 ### 11. Plugin namespace registry
 
 ```ts
-sdk.registerPlugin<API>(name: string, init: () => Promise<API>): { unregister }
-sdk.plugin<API>(name: string): Promise<API>     // resolves when ready; rejects if missing
+sdk.registerPlugin<API>(name: string, init: () => Promise<API>,
+                        opts?: { priority?: number }): { unregister }
+sdk.plugin<API>(name: string): Promise<API>     // resolves when ACTIVATED; rejects if missing
 ```
 
 A plugin claims a namespace (`'workspace'`), exposes a typed API (defined in
 its own `.d.ts`), and other plugins consume it. Core knows nothing about the
 API surface; it routes calls.
 
-For exclusive-role plugins (layout, focus, workspace, etc.), the namespace
-registry + priority is the arbitration mechanism: the highest-priority
-registration under a name wins; lower-priority registrations are queried
-only on failure (the priority-chain failure-recovery pattern from the doc).
+**Claims are inert; activation runs init.** `registerPlugin` records the
+claim (name + priority) and stores `init` without running it. Core selects
+each namespace's winner — the highest-priority claim; bundled plugins claim
+at the priority-0 floor, user plugins default to 100 — and only the
+winner's `init` ever executes. A displaced bundled provider's actions,
+subscriptions, and input binds never come into existence, because they
+happen inside `init`. This is the replacement contract: **a provider
+performs ALL its side effects in the `registerPlugin` init callback**, and
+a user plugin replaces any built-in role by claiming its namespace.
+
+Winner selection happens at the end of each runtime load batch, so claim
+order within a batch is irrelevant — a user plugin loading after the
+bundled set still wins with a higher priority. After load, a claim on a
+namespace with no activated winner activates immediately; a claim on an
+actively-held namespace queues as failover (activation never preempts a
+live winner — replacement is a boot-time decision; restart is cheap).
+
+Failure recovery (the priority chain): if activation throws, the claimant
+plugin is failed outright — a half-run init may have registered actions or
+subscriptions, and plugin-level cleanup is what covers them — and the
+next-highest claim activates. The same failover runs when the activated
+plugin dies or unregisters.
 
 For multiplex roles (intercepts, observers, decoration-by-match,
 action-handlers-by-match), the registry holds all registrations and the
 consuming machinery iterates them (in priority order where order matters,
-unordered where it doesn't). The same primitive serves both; what differs
-is how callers consume the registry.
+unordered where it doesn't). Exclusivity semantics apply only to
+namespace claims.
 
 Inter-plugin types are unenforced at runtime (the `.d.ts` is a build-time
 contract). Plugins validate inputs they receive from other plugins; same as

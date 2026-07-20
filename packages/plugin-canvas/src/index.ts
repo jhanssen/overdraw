@@ -1,8 +1,9 @@
-// Canvas workspace provider (docs/canvas-design.md). Registers in the
+// Canvas workspace provider (docs/canvas-design.md). Claims the
 // 'workspace' namespace at priority 0 with the same verb/event/action
 // surface as @overdraw/plugin-workspace-default, whose registry (the pure
-// workspace state machine) it shares. Two modes, selected by the user's
-// `canvas` config slice:
+// workspace state machine) it shares. All side effects live in the
+// activation callback, so a higher-priority claim replaces this provider
+// wholesale. Two modes, selected by the user's `canvas` config slice:
 //
 //   parity (default): each output's SHOWN workspace publishes as an
 //   explicit island (id = durable handle, rect = null so the tile region
@@ -109,6 +110,15 @@ const SLOT_GUTTER = 128;
 export default async function init(
   sdk: PluginSdkShape, config?: CanvasPluginConfig,
 ): Promise<void> {
+  // Everything -- state seeding, subscriptions, action registrations,
+  // camera control -- happens on activation, so a displaced claim leaves
+  // no trace.
+  await sdk.registerPlugin("workspace", () => activate(sdk, config));
+}
+
+async function activate(
+  sdk: PluginSdkShape, config?: CanvasPluginConfig,
+): Promise<WorkspaceAPI> {
   // Resolve fallback config. Empty defaults make this safe to run in
   // non-core harnesses (the recompute will throw if a workspace ever has
   // no live home in such a harness; tests stay clear of that case).
@@ -2630,8 +2640,8 @@ export default async function init(
     },
   };
 
-  await sdk.registerPlugin("workspace", () => api);
-  sdk.log(`canvas plugin registered (${worldMode ? "world" : "workspace parity"} mode)`);
+  sdk.log(`canvas plugin activated (${worldMode ? "world" : "workspace parity"} mode)`);
+  return api;
 }
 
 // ---- Param parsers -------------------------------------------------------

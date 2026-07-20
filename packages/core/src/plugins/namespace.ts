@@ -1,16 +1,22 @@
 // Worker-side sdk.registerPlugin / sdk.plugin (core-plugin-api.md §11). Runs
 // INSIDE the plugin Worker; talks to core via the Endpoint.
 //
-// Two halves:
+// Three halves:
 //   1. Registration: the plugin calls sdk.registerPlugin(name, init, opts?).
-//      The worker invokes init() to get the API object, walks its function-
-//      valued keys to build a method list, sends `plugin.register` to core,
-//      and remembers the API locally so future plugin.handle requests from
-//      core can dispatch into it.
-//   2. Consumption: the plugin calls sdk.plugin(name). The worker returns a
+//      The claim is sent to core (`plugin.register`) and init is STORED,
+//      not run -- a claim is inert until core selects it for activation.
+//   2. Activation: core sends a `plugin.activate` request when this claim
+//      wins its namespace. The worker runs the stored init() then, walks
+//      the returned API's function-valued keys to build the method list,
+//      replies with it, and remembers the API locally so future
+//      plugin.handle requests from core can dispatch into it. A losing
+//      claim's init never runs -- side effects a provider performs in its
+//      init (actions, subscriptions, input binds) exist only for the
+//      winner.
+//   3. Consumption: the plugin calls sdk.plugin(name). The worker returns a
 //      Proxy whose method calls turn into `plugin.invoke` requests to core.
-//      The Proxy resolves when an active winner exists for that namespace
-//      (worker asks core via `plugin.wait-for-active`).
+//      The Proxy resolves when an ACTIVATED winner exists for that
+//      namespace (worker asks core via `plugin.wait-for-active`).
 //
 // The same plugin author code runs unchanged when later moved to in-thread
 // execution (bundled). What differs is the transport: in-thread will route
@@ -79,9 +85,12 @@ export interface NamespaceHandle {
 const DEFAULT_WAIT_MS = 5_000;
 
 export function createNamespaceHandle(endpoint: Endpoint): NamespaceHandle {
-  // Active local registrations: namespace -> API object (so we can dispatch
-  // plugin.handle requests from core into the right method).
+  // Activated local registrations: namespace -> API object (so we can
+  // dispatch plugin.handle requests from core into the right method).
   const localApis = new Map<string, RegisteredApi>();
+  // Claims awaiting activation: namespace -> the stored init. Moved into
+  // localApis when core sends plugin.activate.
+  const pendingInits = new Map<string, InitFn<RegisteredApi>>();
 
   const ns: PluginNamespace = {
     async registerPlugin(name, init, opts): Promise<RegistrationHandle> {
@@ -91,32 +100,23 @@ export function createNamespaceHandle(endpoint: Endpoint): NamespaceHandle {
       if (typeof init !== "function") {
         throw new TypeError("registerPlugin init must be a function");
       }
-      if (localApis.has(name)) {
+      if (localApis.has(name) || pendingInits.has(name)) {
         throw new Error(`already registered for namespace '${name}'`);
       }
 
-      const api = await init();
-      if (api === null || typeof api !== "object") {
-        throw new TypeError(
-          `registerPlugin('${name}'): init must return an object (got ${typeof api})`);
-      }
-
-      const methods: string[] = [];
-      for (const key of Object.keys(api)) {
-        if (typeof (api as RegisteredApi)[key] === "function") methods.push(key);
-      }
-
-      localApis.set(name, api);
+      // Store init for activation; the claim itself carries no API surface.
+      pendingInits.set(name, init);
 
       const priority = opts?.priority;
-      const payload: Json = { namespace: name, methods };
+      const payload: Json = { namespace: name };
       if (typeof priority === "number") (payload as { [k: string]: Json }).priority = priority;
       endpoint.emit("plugin.register", payload);
 
       return {
         unregister(): void {
-          if (!localApis.has(name)) return;
+          if (!localApis.has(name) && !pendingInits.has(name)) return;
           localApis.delete(name);
+          pendingInits.delete(name);
           endpoint.emit("plugin.unregister", { namespace: name });
         },
       };
@@ -159,6 +159,36 @@ export function createNamespaceHandle(endpoint: Endpoint): NamespaceHandle {
 
   const dispatcher: NamespaceDispatcher = {
     tryHandle(method, params): DispatchResult {
+      if (method === "plugin.activate") {
+        const nsName = (params as { namespace?: unknown } | null)?.namespace;
+        if (typeof nsName !== "string") {
+          return { handled: true,
+            result: Promise.reject(new Error("plugin.activate: malformed payload")) };
+        }
+        // Idempotent for an already-activated namespace: report the
+        // existing API surface (core may retry after a dropped reply).
+        const existing = localApis.get(nsName);
+        if (existing) {
+          return { handled: true, result: Promise.resolve({ methods: methodsOf(existing) }) };
+        }
+        const init = pendingInits.get(nsName);
+        if (!init) {
+          return { handled: true, result: Promise.reject(new Error(
+            `plugin.activate: no claim stored for '${nsName}'`)) };
+        }
+        const result = (async (): Promise<Json> => {
+          const api = await init();
+          if (api === null || typeof api !== "object") {
+            throw new TypeError(
+              `registerPlugin('${nsName}'): init must return an object (got ${typeof api})`);
+          }
+          pendingInits.delete(nsName);
+          localApis.set(nsName, api);
+          return { methods: methodsOf(api) };
+        })();
+        return { handled: true, result };
+      }
+
       if (method !== "plugin.handle") return { handled: false };
       if (!isHandlePayload(params)) {
         // We DID recognize the method; reject it loudly. (Not falling
@@ -190,6 +220,14 @@ export function createNamespaceHandle(endpoint: Endpoint): NamespaceHandle {
   };
 
   return { ns, dispatcher };
+}
+
+function methodsOf(api: RegisteredApi): string[] {
+  const methods: string[] = [];
+  for (const key of Object.keys(api)) {
+    if (typeof api[key] === "function") methods.push(key);
+  }
+  return methods;
 }
 
 function isHandlePayload(d: unknown): d is { namespace: string; method: string; args: unknown[] } {

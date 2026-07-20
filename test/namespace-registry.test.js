@@ -1,51 +1,44 @@
 // Pure-unit tests for the namespace registry. No transport / no Workers; just
-// the data structure.
+// the data structure. Claims are inert bookkeeping; active() reflects only
+// ACTIVATED claims (the runtime activates via markActivated after running
+// the claimant's init).
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 
 import { NamespaceRegistry } from '../packages/core/dist/plugins/namespace-registry.js';
 
-function reg(plugin, ns, prio, methods = ['m']) {
-  return { pluginName: plugin, namespace: ns, priority: prio, methods: new Set(methods) };
+function reg(plugin, ns, prio) {
+  return { pluginName: plugin, namespace: ns, priority: prio, methods: null };
 }
 
-// --- registration + active selection ---------------------------------------
+// --- claims + top-claim selection -------------------------------------------
 
-test('register: empty registry returns no active', () => {
+test('register: empty registry has no active and no top claim', () => {
   const r = new NamespaceRegistry();
+  assert.equal(r.active('workspace'), null);
+  assert.equal(r.topClaim('workspace'), null);
+});
+
+test('register: a claim is inert -- topClaim is set, active stays null', () => {
+  const r = new NamespaceRegistry();
+  r.register(reg('p1', 'workspace', 100));
+  assert.equal(r.topClaim('workspace').pluginName, 'p1');
   assert.equal(r.active('workspace'), null);
 });
 
-test('register: a single registration becomes active', () => {
-  const r = new NamespaceRegistry();
-  const changed = r.register(reg('p1', 'workspace', 100));
-  assert.equal(changed, true);
-  assert.equal(r.active('workspace').pluginName, 'p1');
-});
-
-test('register: higher priority displaces the active', () => {
+test('register: higher priority becomes the top claim', () => {
   const r = new NamespaceRegistry();
   r.register(reg('low', 'workspace', 0));
-  assert.equal(r.active('workspace').pluginName, 'low');
-  const changed = r.register(reg('high', 'workspace', 100));
-  assert.equal(changed, true);
-  assert.equal(r.active('workspace').pluginName, 'high');
-});
-
-test('register: lower priority does NOT displace the active', () => {
-  const r = new NamespaceRegistry();
   r.register(reg('high', 'workspace', 100));
-  const changed = r.register(reg('low', 'workspace', 0));
-  assert.equal(changed, false);
-  assert.equal(r.active('workspace').pluginName, 'high');
+  assert.equal(r.topClaim('workspace').pluginName, 'high');
 });
 
 test('register: ties resolved by registration order (first wins, stays)', () => {
   const r = new NamespaceRegistry();
   r.register(reg('first', 'workspace', 100));
   r.register(reg('second', 'workspace', 100));
-  assert.equal(r.active('workspace').pluginName, 'first');
+  assert.equal(r.topClaim('workspace').pluginName, 'first');
 });
 
 test('register: duplicate (plugin, namespace) throws', () => {
@@ -59,46 +52,72 @@ test('register: empty/missing namespace throws', () => {
   assert.throws(() => r.register(reg('p1', '', 100)), TypeError);
 });
 
-test('register: non-finite priority throws', () => {
+// --- activation --------------------------------------------------------------
+
+test('markActivated: makes the claim active and records methods', () => {
   const r = new NamespaceRegistry();
-  assert.throws(() => r.register(reg('p1', 'workspace', Infinity)), TypeError);
-  assert.throws(() => r.register(reg('p1', 'workspace', NaN)), TypeError);
+  r.register(reg('p1', 'workspace', 100));
+  r.markActivated('workspace', 'p1', ['show', 'list']);
+  const active = r.active('workspace');
+  assert.equal(active.pluginName, 'p1');
+  assert.ok(active.methods.has('show'));
+  assert.ok(active.methods.has('list'));
 });
 
-// --- unregister + failure promotion ----------------------------------------
-
-test('unregister: removing the active promotes the next-highest', () => {
+test('markActivated: a non-top claim can be activated (runtime decides)', () => {
   const r = new NamespaceRegistry();
-  r.register(reg('low', 'workspace', 0));
   r.register(reg('high', 'workspace', 100));
-  assert.equal(r.active('workspace').pluginName, 'high');
-  const changed = r.unregister('high', 'workspace');
-  assert.equal(changed, true);
+  r.register(reg('low', 'workspace', 0));
+  r.markActivated('workspace', 'low', []);
   assert.equal(r.active('workspace').pluginName, 'low');
 });
 
-test('unregister: removing a dormant does NOT change the active', () => {
+test('markActivated: unknown claim throws', () => {
   const r = new NamespaceRegistry();
-  r.register(reg('low', 'workspace', 0));
-  r.register(reg('high', 'workspace', 100));
-  const changed = r.unregister('low', 'workspace');
-  assert.equal(changed, false);
-  assert.equal(r.active('workspace').pluginName, 'high');
+  assert.throws(() => r.markActivated('workspace', 'ghost', []), /no claim/);
 });
 
-test('unregister: removing the last registration clears the namespace', () => {
+test('markActivated: activating over a different activated claim throws', () => {
   const r = new NamespaceRegistry();
-  r.register(reg('only', 'workspace', 100));
-  r.unregister('only', 'workspace');
-  assert.equal(r.active('workspace'), null);
-  assert.deepEqual(r.namespaces(), []);
-});
-
-test('unregister: idempotent (unknown plugin/namespace is no-op)', () => {
-  const r = new NamespaceRegistry();
-  assert.equal(r.unregister('nobody', 'workspace'), false);
   r.register(reg('p1', 'workspace', 100));
-  assert.equal(r.unregister('p1', 'other-namespace'), false);
+  r.register(reg('p2', 'workspace', 0));
+  r.markActivated('workspace', 'p1', []);
+  assert.throws(() => r.markActivated('workspace', 'p2', []), /already activated/);
+});
+
+test('a claim registered above the activated one does not change active()', () => {
+  const r = new NamespaceRegistry();
+  r.register(reg('bundled', 'workspace', 0));
+  r.markActivated('workspace', 'bundled', []);
+  r.register(reg('user', 'workspace', 100));
+  assert.equal(r.active('workspace').pluginName, 'bundled');
+  assert.equal(r.topClaim('workspace').pluginName, 'user');
+});
+
+// --- unregister --------------------------------------------------------------
+
+test('unregister: removing the activated claim clears active', () => {
+  const r = new NamespaceRegistry();
+  r.register(reg('p1', 'workspace', 100));
+  r.register(reg('p2', 'workspace', 0));
+  r.markActivated('workspace', 'p1', []);
+  r.unregister('p1', 'workspace');
+  assert.equal(r.active('workspace'), null);
+  assert.equal(r.topClaim('workspace').pluginName, 'p2');
+});
+
+test('unregister: removing a dormant claim leaves active untouched', () => {
+  const r = new NamespaceRegistry();
+  r.register(reg('p1', 'workspace', 100));
+  r.register(reg('p2', 'workspace', 0));
+  r.markActivated('workspace', 'p1', []);
+  r.unregister('p2', 'workspace');
+  assert.equal(r.active('workspace').pluginName, 'p1');
+});
+
+test('unregister: unknown claim is a silent no-op', () => {
+  const r = new NamespaceRegistry();
+  assert.equal(r.unregister('ghost', 'workspace'), false);
 });
 
 test('unregisterAllFor: removes every claim by that plugin', () => {
@@ -107,105 +126,89 @@ test('unregisterAllFor: removes every claim by that plugin', () => {
   r.register(reg('p1', 'layout', 100));
   r.register(reg('p2', 'workspace', 0));
   r.unregisterAllFor('p1');
-  assert.equal(r.active('workspace').pluginName, 'p2');
-  assert.equal(r.active('layout'), null);
+  assert.equal(r.topClaim('workspace').pluginName, 'p2');
+  assert.equal(r.topClaim('layout'), null);
 });
 
-// --- introspection ---------------------------------------------------------
+// --- onChange notifications ---------------------------------------------------
 
-test('registrations: returns priority-descending list', () => {
+test('onChange: claim-added fires on register', () => {
   const r = new NamespaceRegistry();
-  r.register(reg('low', 'workspace', 0));
-  r.register(reg('mid', 'workspace', 50));
-  r.register(reg('high', 'workspace', 100));
-  const rs = r.registrations('workspace');
-  assert.equal(rs.length, 3);
-  assert.equal(rs[0].pluginName, 'high');
-  assert.equal(rs[1].pluginName, 'mid');
-  assert.equal(rs[2].pluginName, 'low');
-});
-
-test('namespaces: lists every namespace with at least one claim', () => {
-  const r = new NamespaceRegistry();
+  const events = [];
+  r.onChange((ns, ch) => events.push({ ns, kind: ch.kind, plugin: ch.registration.pluginName }));
   r.register(reg('p1', 'workspace', 100));
-  r.register(reg('p1', 'layout', 100));
-  assert.deepEqual([...r.namespaces()].sort(), ['layout', 'workspace']);
+  assert.deepEqual(events, [{ ns: 'workspace', kind: 'claim-added', plugin: 'p1' }]);
 });
 
-// --- onActiveChange notifications ------------------------------------------
-
-test('onActiveChange: fires when first registration claims a namespace', () => {
+test('onChange: activated fires on markActivated', () => {
   const r = new NamespaceRegistry();
   const events = [];
-  r.onActiveChange((ns, prev, next) => events.push({ ns, prev: prev?.pluginName ?? null, next: next?.pluginName ?? null }));
   r.register(reg('p1', 'workspace', 100));
-  assert.deepEqual(events, [{ ns: 'workspace', prev: null, next: 'p1' }]);
+  r.onChange((ns, ch) => events.push(ch.kind));
+  r.markActivated('workspace', 'p1', []);
+  assert.deepEqual(events, ['activated']);
 });
 
-test('onActiveChange: fires when higher-priority displaces', () => {
+test('onChange: claim-removed carries wasActivated for the activated claim', () => {
   const r = new NamespaceRegistry();
-  r.register(reg('low', 'workspace', 0));
   const events = [];
-  r.onActiveChange((ns, prev, next) => events.push({ ns, prev: prev?.pluginName ?? null, next: next?.pluginName ?? null }));
-  r.register(reg('high', 'workspace', 100));
-  assert.deepEqual(events, [{ ns: 'workspace', prev: 'low', next: 'high' }]);
+  r.register(reg('p1', 'workspace', 100));
+  r.register(reg('p2', 'workspace', 0));
+  r.markActivated('workspace', 'p1', []);
+  r.onChange((ns, ch) => events.push({ kind: ch.kind, wasActivated: ch.wasActivated }));
+  r.unregister('p1', 'workspace');
+  r.unregister('p2', 'workspace');
+  assert.deepEqual(events, [
+    { kind: 'claim-removed', wasActivated: true },
+    { kind: 'claim-removed', wasActivated: false },
+  ]);
 });
 
-test('onActiveChange: fires when active unregisters and next promotes', () => {
+test('onChange: throwing listener does not break the registry', () => {
   const r = new NamespaceRegistry();
-  r.register(reg('low', 'workspace', 0));
-  r.register(reg('high', 'workspace', 100));
-  const events = [];
-  r.onActiveChange((ns, prev, next) => events.push({ ns, prev: prev?.pluginName ?? null, next: next?.pluginName ?? null }));
-  r.unregister('high', 'workspace');
-  assert.deepEqual(events, [{ ns: 'workspace', prev: 'high', next: 'low' }]);
-});
-
-test('onActiveChange: fires when active unregisters and no fallback exists', () => {
-  const r = new NamespaceRegistry();
-  r.register(reg('only', 'workspace', 100));
-  const events = [];
-  r.onActiveChange((ns, prev, next) => events.push({ ns, prev: prev?.pluginName ?? null, next: next?.pluginName ?? null }));
-  r.unregister('only', 'workspace');
-  assert.deepEqual(events, [{ ns: 'workspace', prev: 'only', next: null }]);
-});
-
-test('onActiveChange: does NOT fire when dormant unregisters', () => {
-  const r = new NamespaceRegistry();
-  r.register(reg('low', 'workspace', 0));
-  r.register(reg('high', 'workspace', 100));
-  const events = [];
-  r.onActiveChange((ns, prev, next) => events.push({ ns, prev: prev?.pluginName ?? null, next: next?.pluginName ?? null }));
-  r.unregister('low', 'workspace');
-  assert.deepEqual(events, []);
-});
-
-test('onActiveChange: throwing listener does not break the registry', () => {
-  const r = new NamespaceRegistry();
-  r.onActiveChange(() => { throw new Error('boom'); });
+  r.onChange(() => { throw new Error('boom'); });
   let reached = false;
-  r.onActiveChange(() => { reached = true; });
-  // Should not throw, and second listener should still fire.
+  r.onChange(() => { reached = true; });
   r.register(reg('p1', 'workspace', 100));
   assert.equal(reached, true);
+  assert.equal(r.topClaim('workspace').pluginName, 'p1');
 });
 
-test('onActiveChange: unsubscribe stops delivery', () => {
+test('onChange: unsubscribe stops delivery', () => {
   const r = new NamespaceRegistry();
   const events = [];
-  const off = r.onActiveChange((ns, prev, next) => events.push({ ns, next: next?.pluginName }));
+  const off = r.onChange((ns) => events.push(ns));
   r.register(reg('p1', 'workspace', 100));
   off();
-  r.register(reg('p2', 'workspace', 200));   // would have been an active change
-  assert.equal(events.length, 1);
+  r.register(reg('p2', 'workspace', 0));
+  assert.deepEqual(events, ['workspace']);
 });
 
-test('unregisterAllFor: fires one change per affected namespace', () => {
+test('unregisterAllFor: fires one claim-removed per affected namespace', () => {
   const r = new NamespaceRegistry();
+  const events = [];
   r.register(reg('p1', 'workspace', 100));
   r.register(reg('p1', 'layout', 100));
-  const events = [];
-  r.onActiveChange((ns) => events.push(ns));
+  r.onChange((ns, ch) => { if (ch.kind === 'claim-removed') events.push(ns); });
   r.unregisterAllFor('p1');
   assert.deepEqual(events.sort(), ['layout', 'workspace']);
+});
+
+// --- introspection ------------------------------------------------------------
+
+test('registrations: priority-descending order', () => {
+  const r = new NamespaceRegistry();
+  r.register(reg('low', 'workspace', 0));
+  r.register(reg('high', 'workspace', 100));
+  r.register(reg('mid', 'workspace', 50));
+  assert.deepEqual(r.registrations('workspace').map((x) => x.pluginName),
+    ['high', 'mid', 'low']);
+});
+
+test('namespaces: first-claim order', () => {
+  const r = new NamespaceRegistry();
+  r.register(reg('p1', 'layout', 0));
+  r.register(reg('p2', 'workspace', 0));
+  r.register(reg('p3', 'layout', 100));
+  assert.deepEqual([...r.namespaces()], ['layout', 'workspace']);
 });
