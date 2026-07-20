@@ -1,7 +1,16 @@
-// Animations broker: routes plugin animations.run / animations.cancel
-// requests to the core evaluator (core-plugin-api.md §9). The evaluator
-// is constructed in main.ts; the broker is a thin dispatch shim like
-// the windows broker.
+// Animations broker: routes plugin animations.* requests to the core
+// evaluator (core-plugin-api.md §9). The evaluator is constructed in
+// main.ts; the broker is a thin dispatch shim like the windows broker.
+//
+// Two submission shapes:
+//   animations.run     -- one request whose response arrives at settle.
+//   animations.start   -- responds immediately after registration (the
+//                         evaluator has applied the `from` value by
+//                         then) with a handle; animations.settled with
+//                         that handle resolves at settle. Lets a plugin
+//                         sequence "start value is live" against other
+//                         calls (gate release, interceptor return)
+//                         without waiting out the animation.
 
 import type { AnimationEvaluator } from "../animations/evaluator.js";
 import type { AnimationSpec, TargetRef } from "@overdraw/animation-types";
@@ -25,24 +34,58 @@ export function createAnimationsBroker(
   evaluator: AnimationEvaluator,
   opts: AnimationsBrokerOptions = {},
 ): AnimationsBroker {
+  // Settle promises for started-but-not-yet-claimed animations, keyed by
+  // handle. An entry is removed when the animation settles, so the map
+  // stays bounded even if a plugin dies between start and claim; a
+  // settled claim for a handle no longer present resolves immediately
+  // (the animation is already over -- if it FAILED within that one
+  // round-trip window the rejection reason is lost to the claimant,
+  // though it was pre-observed here so it never surfaces as an
+  // unhandled rejection).
+  const settles = new Map<number, Promise<void>>();
+  let nextHandle = 1;
+
   return (pluginName: string, method: string, params: unknown) => {
     void pluginName;  // reserved for future capability gating / audit
     if (method === "animations.run") return handleRun(params);
+    if (method === "animations.start") return handleStart(params);
+    if (method === "animations.settled") return handleSettled(params);
     if (method === "animations.cancel") return handleCancel(params);
     return NOT_HANDLED;
   };
 
-  function handleRun(p: unknown): Promise<void> {
-    if (!isRunPayload(p)) throw new Error("animations.run: malformed payload");
+  function gateAndRun(spec: AnimationSpec, label: string): Promise<void> {
     if (opts.cameraGate) {
-      for (const outputId of cameraTargetsOf(p.spec)) {
+      for (const outputId of cameraTargetsOf(spec)) {
         const denied = opts.cameraGate(outputId);
         if (denied !== null) {
-          throw new Error(`animations.run: camera animation denied: ${denied}`);
+          throw new Error(`${label}: camera animation denied: ${denied}`);
         }
       }
     }
-    return evaluator.run(p.spec);
+    return evaluator.run(spec);
+  }
+
+  function handleRun(p: unknown): Promise<void> {
+    if (!isRunPayload(p)) throw new Error("animations.run: malformed payload");
+    return gateAndRun(p.spec, "animations.run");
+  }
+
+  function handleStart(p: unknown): { handle: number } {
+    if (!isRunPayload(p)) throw new Error("animations.start: malformed payload");
+    const settle = gateAndRun(p.spec, "animations.start");
+    const handle = nextHandle++;
+    settles.set(handle, settle);
+    void settle.then(undefined, () => {}).then(() => { settles.delete(handle); });
+    return { handle };
+  }
+
+  function handleSettled(p: unknown): Promise<void> {
+    const handle = (p as { handle?: unknown } | null)?.handle;
+    if (typeof handle !== "number") {
+      throw new Error("animations.settled: malformed payload");
+    }
+    return settles.get(handle) ?? Promise.resolve();
   }
 
   function handleCancel(p: unknown): Promise<void> {

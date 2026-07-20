@@ -202,6 +202,10 @@ export interface PluginTransitionsLike {
 // canonical AnimationSpec / TargetRef shapes for plugins that want them.
 export interface PluginAnimationsLike {
   run(spec: unknown): Promise<void>;
+  // Resolves once the animation is registered and its `from` value applied
+  // in core; `settled` resolves when the animation completes or is
+  // preempted/cancelled.
+  start(spec: unknown): Promise<{ handle: number; settled: Promise<void> }>;
   cancel(target: unknown): Promise<void>;
 }
 

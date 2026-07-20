@@ -148,6 +148,52 @@ test('tween transform: translateX and scaleX interpolate independently', () => {
   assert.equal(last.scaleY, 1);
 });
 
+// ---- eager from: applied at registration, before any tick --------------
+
+test('tween: from value is applied at run(), before the first tick', () => {
+  const sink = mockSink();
+  const e = createEvaluator(sink);
+  void e.run({
+    type: 'tween',
+    target: { kind: 'window-opacity', windowId: 1 },
+    from: 0.25, to: 1, duration: 1000,
+  });
+  // No tick has happened; the sink must already show the start value.
+  const applied = sink.calls.filter((c) => c.method === 'opacity' && c.id === 1);
+  assert.equal(applied.length, 1);
+  assert.equal(applied[0].opacity, 0.25);
+});
+
+test('tween transform: from value (with defaults) is applied at run()', () => {
+  const sink = mockSink();
+  const e = createEvaluator(sink);
+  void e.run({
+    type: 'tween',
+    target: { kind: 'window-transform', windowId: 3 },
+    from: { translateX: -40 }, to: { translateX: 0 }, duration: 500,
+  });
+  const applied = sink.calls.filter((c) => c.method === 'transform' && c.id === 3);
+  assert.equal(applied.length, 1);
+  assert.equal(applied[0].t.translateX, -40);
+  // Omitted fields ride the identity defaults.
+  assert.equal(applied[0].t.translateY, 0);
+  assert.equal(applied[0].t.scaleX, 1);
+  assert.equal(applied[0].t.scaleY, 1);
+});
+
+test('spring: from value is applied at run(), before the first tick', () => {
+  const sink = mockSink();
+  const e = createEvaluator(sink);
+  void e.run({
+    type: 'spring',
+    target: { kind: 'window-opacity', windowId: 2 },
+    from: 0.75, to: 0,
+  });
+  const applied = sink.calls.filter((c) => c.method === 'opacity' && c.id === 2);
+  assert.equal(applied.length, 1);
+  assert.equal(applied[0].opacity, 0.75);
+});
+
 // ---- spring: settles + Promise resolves --------------------------------
 
 test('spring: opacity 0 -> 1 overshoots then settles', async () => {

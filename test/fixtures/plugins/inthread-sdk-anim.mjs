@@ -1,9 +1,10 @@
 // Fixture (in-thread bundled): exercises @overdraw/sdk-anim end-to-end.
 // The plugin imports the builder API and submits a tween built via
-// `tween(target.windowOpacity(...), {...})`; the spec flows through
-// the SDK -> broker -> evaluator -> compositor exactly the same as
-// a hand-built spec, demonstrating the builders are zero-runtime over
-// the plain object form.
+// `tween(target.windowOpacity(...), {...})` through sdk.animations.start;
+// the spec flows through the SDK -> broker -> evaluator -> compositor
+// exactly the same as a hand-built spec. start() resolving proves the
+// registration ack: by the "animation submitted" log the evaluator has
+// the leaf active and the `from` value applied.
 //
 // config.surfaceId picks which compositor surface to animate.
 
@@ -17,6 +18,7 @@ export default async function init(sdk, config) {
     duration: config.durationMs,
     easing: easings.linear,
   });
-  void sdk.animations.run(spec).then(() => sdk.log("animation done"));
+  const started = await sdk.animations.start(spec);
+  void started.settled.then(() => sdk.log("animation done"));
   sdk.log("animation submitted");
 }

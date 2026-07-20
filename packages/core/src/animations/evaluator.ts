@@ -51,8 +51,11 @@ interface SpringLeaf extends ActiveLeaf {
 type Leaf = TweenLeaf | SpringLeaf;
 
 export interface AnimationEvaluator {
-  // Submit a spec. Returns a Promise that resolves when the entire
-  // composite (or single leaf) settles or is cancelled.
+  // Submit a spec. Registering a leaf applies its `from` value through
+  // the sink immediately, so frames composited before the first tick
+  // show the start value rather than stale state. Returns a Promise
+  // that resolves when the entire composite (or single leaf) settles
+  // or is cancelled.
   run(spec: AnimationSpec): Promise<void>;
   // Cancel the active leaf on `target`, if any. Resolves immediately;
   // the cancelled leaf's run() Promise also resolves cleanly. No-op if
@@ -105,6 +108,9 @@ export function createEvaluator(
       throw new Error("tween: from/to component count mismatch");
     }
     preemptTarget(spec.target);
+    // Apply `from` at registration so the surface renders the start value
+    // on any frame composited before the first tick steps the leaf.
+    applyValue(sink, spec.target, from);
     return new Promise<void>((resolve) => {
       const leaf: TweenLeaf = {
         kind: "tween",
@@ -143,6 +149,8 @@ export function createEvaluator(
       initialVelocity: spec.initialVelocity ?? DEFAULT_SPRING.initialVelocity,
     };
     preemptTarget(spec.target);
+    // Same eager-apply as tween: the start value lands before the first tick.
+    applyValue(sink, spec.target, from);
     return new Promise<void>((resolve) => {
       const springs = from.map((f, i) => new SpringState(f, to[i], params));
       const leaf: SpringLeaf = {

@@ -480,8 +480,10 @@ Declarative animation specs evaluated in core. Plugin-side library
 (`overdraw-sdk-anim`) produces specs; core evaluates per frame.
 
 ```ts
-sdk.animations.run(spec: AnimationSpec): Promise<void>
-sdk.animations.cancel(handle): Promise<void>
+sdk.animations.run(spec: AnimationSpec): Promise<void>       // resolves at settle
+sdk.animations.start(spec: AnimationSpec):
+  Promise<{ handle: AnimationHandle, settled: Promise<void> }>  // resolves at registration
+sdk.animations.cancel(target: TargetRef): Promise<void>
 
 type AnimationSpec =
   | { type: 'tween',    target: TargetRef, from?, to, duration, easing }
@@ -523,6 +525,19 @@ animate(
 `animate(...)` builds an `AnimationSpec` and calls `sdk.animations.run(spec)`.
 The `target.*` helpers build `TargetRef` values. No per-frame IPC; the
 plugin's only call to core is the one `animations.run` per animation.
+
+Registering a leaf applies its `from` value immediately — frames composited
+before the first tick show the start value, so plugins never pre-write it
+via `setTransform`/`setOpacity`. When a plugin must order "the start value
+is live" against another call (releasing an opening gate, returning from a
+relayout interceptor), it awaits `start(spec)` — resolved once core has
+registered the animation and applied `from` — and uses the returned
+`settled` promise where the completion matters. `run(spec)` is the
+single-call form for fire-and-forget or completion-only uses.
+
+`cancel` is by target, which composes with the cancel-on-replacement rule
+(one active animation per target); the handle returned by `start` is
+reserved for future cancel-by-handle.
 
 Core's evaluator: ~500–1000 lines. Tween/keyframes are trivial; spring physics
 is the meatiest (borrow a known-good integrator, don't roll fresh).

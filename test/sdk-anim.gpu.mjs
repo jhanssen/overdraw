@@ -1,9 +1,9 @@
 // GPU integration test: a bundled in-thread plugin uses @overdraw/sdk-anim
-// builders to construct an AnimationSpec, submits it via sdk.animations.run,
-// and the composited frame shows the animated value. End-to-end proof that
-// the builder package is the spec-construction half of the animation
-// surface; the evaluator (test/inthread-animation.gpu.mjs) is the
-// evaluation half. Together they form the full Phase 4 surface.
+// builders to construct an AnimationSpec, submits it via
+// sdk.animations.start (registration ack + settled promise), and the
+// composited frame shows the animated value. End-to-end proof that the
+// builder package is the spec-construction half of the animation surface;
+// the evaluator (test/inthread-animation.gpu.mjs) is the evaluation half.
 
 import test from "node:test";
 import assert from "node:assert/strict";

@@ -332,12 +332,13 @@ export interface PluginWindows extends PluginWindowObserver {
   // composite includes it -- with whatever per-surface render state
   // the plugin set before calling this. Typical pattern:
   //
-  //   sdk.events.on("window.opening", (ev) => {
-  //     sdk.windows.setTransform(ev.surfaceId, { translateX: ev.outerRect.width });
-  //     sdk.windows.releaseOpeningGate(ev.surfaceId);  // visible from this frame
-  //     sdk.animations.run(tween(target.windowTransform(ev.surfaceId),
+  //   sdk.events.on("window.opening", async (ev) => {
+  //     // start() resolves once the tween's `from` value is applied,
+  //     // so the first visible frame is already mid-animation.
+  //     await sdk.animations.start(tween(target.windowTransform(ev.surfaceId),
   //       { from: { translateX: ev.outerRect.width }, to: { translateX: 0 },
   //         duration: 200 }));
+  //     sdk.windows.releaseOpeningGate(ev.surfaceId);  // visible from this frame
   //   });
   //
   // The release-gate path cancels the opening-driver's backstop timer.

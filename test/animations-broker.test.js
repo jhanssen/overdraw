@@ -78,6 +78,72 @@ test('non-animations method returns NOT_HANDLED', () => {
     NOT_HANDLED);
 });
 
+// ---- animations.start / animations.settled ---------------------------------
+
+const OPACITY_SPEC = {
+  spec: { type: 'tween', target: { kind: 'window-opacity', windowId: 1 },
+          from: 0, to: 1, duration: 100 },
+};
+
+test('animations.start: registers with the evaluator and returns a handle', async () => {
+  const ev = mockEvaluator();
+  const broker = createAnimationsBroker(ev);
+  const res = await broker('p', 'animations.start', OPACITY_SPEC);
+  assert.equal(typeof res.handle, 'number');
+  assert.equal(ev.calls.length, 1);
+  assert.equal(ev.calls[0].method, 'run');
+});
+
+test('animations.settled: resolves when the started run settles', async () => {
+  let settle;
+  const ev = {
+    ...mockEvaluator(),
+    run() { return new Promise((resolve) => { settle = resolve; }); },
+  };
+  const broker = createAnimationsBroker(ev);
+  const { handle } = await broker('p', 'animations.start', OPACITY_SPEC);
+  let done = false;
+  const claim = Promise.resolve(broker('p', 'animations.settled', { handle }))
+    .then(() => { done = true; });
+  await new Promise((r) => setImmediate(r));
+  assert.equal(done, false, 'settled must not resolve before the run does');
+  settle();
+  await claim;
+  assert.equal(done, true);
+});
+
+test('animations.settled: unknown handle resolves immediately', async () => {
+  const broker = createAnimationsBroker(mockEvaluator());
+  await broker('p', 'animations.settled', { handle: 12345 });
+});
+
+test('animations.start: distinct handles per start', async () => {
+  const broker = createAnimationsBroker(mockEvaluator());
+  const a = await broker('p', 'animations.start', OPACITY_SPEC);
+  const b = await broker('p', 'animations.start', OPACITY_SPEC);
+  assert.notEqual(a.handle, b.handle);
+});
+
+test('animations.start: malformed payload throws', () => {
+  const broker = createAnimationsBroker(mockEvaluator());
+  assert.throws(() => broker('p', 'animations.start', {}), /malformed payload/);
+});
+
+test('animations.settled: malformed payload throws', () => {
+  const broker = createAnimationsBroker(mockEvaluator());
+  assert.throws(() => broker('p', 'animations.settled', {}), /malformed payload/);
+});
+
+test('animations.start: cameraGate denial rejects before the evaluator', () => {
+  const ev = mockEvaluator();
+  const broker = createAnimationsBroker(ev, { cameraGate: () => 'grab active' });
+  assert.throws(() => broker('p', 'animations.start', {
+    spec: { type: 'tween', target: { kind: 'output-camera', outputId: 0 },
+            from: { x: 0 }, to: { x: 10 }, duration: 100 },
+  }), /camera animation denied: grab active/);
+  assert.equal(ev.calls.length, 0);
+});
+
 // ---- output-camera targets -------------------------------------------------
 
 test('animations.cancel: output-camera target forwards to the evaluator', async () => {

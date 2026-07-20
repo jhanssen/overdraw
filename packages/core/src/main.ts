@@ -1018,7 +1018,8 @@ const windowsBroker = createWindowsBroker({
 
 // Animation evaluator + broker (core-plugin-api.md §9). The evaluator
 // ticks once per compositor frame from state.beforeRender (wired below);
-// the broker routes plugin animations.run / cancel requests to it.
+// the broker routes plugin animations.* requests (run / start / settled /
+// cancel) to it.
 //
 // A transform/opacity animation on a window reaches its whole surface group
 // (toplevel + decoration + subsurface subtree) because the compositor's fx
