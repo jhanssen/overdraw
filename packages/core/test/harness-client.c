@@ -383,6 +383,16 @@ int main(int argc, char** argv) {
                         wl_display_flush(display);
                         printf("[harness-client] renamed app_id=%s\n", id);
                         fflush(stdout);
+                    } else if (strncmp(inbuf, "unfullscreen", 12) == 0) {
+                        xdg_toplevel_unset_fullscreen(toplevel);
+                        wl_display_flush(display);
+                        printf("[harness-client] unfullscreen requested\n");
+                        fflush(stdout);
+                    } else if (strncmp(inbuf, "fullscreen", 10) == 0) {
+                        xdg_toplevel_set_fullscreen(toplevel, NULL);
+                        wl_display_flush(display);
+                        printf("[harness-client] fullscreen requested\n");
+                        fflush(stdout);
                     }
                 }
             }

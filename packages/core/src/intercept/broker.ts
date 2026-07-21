@@ -47,6 +47,15 @@ export interface InterceptBrokerDeps {
   // plugins style focus from current seat state, not an async window.change
   // edge. Optional: absent in test harnesses with no seat (defaults unfocused).
   isActivated?(surfaceId: number): boolean;
+  // Whether a surface is CURRENTLY fullscreen, read live from the WM.
+  // The preconfigure payload's initialState is a snapshot taken before the
+  // plugin round-trip; a pre-content fullscreen stamp landing DURING that
+  // round-trip both post-dates the snapshot and pre-dates this broker's
+  // registration of the toplevel (the committed edge fires before the
+  // toplevel is known here). Pulling the live state at registration time
+  // closes that ordering hole. Optional: harnesses without a WM fall back
+  // to the payload snapshot.
+  isFullscreen?(surfaceId: number): boolean;
   // The client's declared window geometry (set_window_geometry): the opaque
   // window sub-rect within the buffer, in buffer px. CSD clients (GTK) draw
   // transparent shadow margins outside this. Null when the client never set
@@ -141,7 +150,7 @@ type ActiveRegistration = ActiveRegistrationInThread | ActiveRegistrationWorker;
 const DEFAULT_UNMATCH_ACK_TIMEOUT_MS = 1000;
 
 export class InterceptBroker {
-  private readonly engine = new MatchEngine();
+  private readonly engine: MatchEngine;
   private readonly registrations = new Map<number, ActiveRegistration>();
   private nextRegistrationId = 1;
   private readonly deps: InterceptBrokerDeps;
@@ -154,6 +163,9 @@ export class InterceptBroker {
 
   constructor(deps: InterceptBrokerDeps) {
     this.deps = deps;
+    this.engine = new MatchEngine({
+      ...(deps.isFullscreen ? { isFullscreen: deps.isFullscreen } : {}),
+    });
     // Subscribe to the core window-event bus. window.preconfigure fires
     // synchronously inside markInitialCommitComplete BEFORE the first
     // sized configure goes out: matching at this seam lets the plugin's
@@ -167,9 +179,9 @@ export class InterceptBroker {
         surfaceId: ev.surfaceId,
         appId: ev.appId,
         title: ev.title,
-        // Seed the fullscreen flag from the initial state so a window
-        // that declares fullscreen before mapping (games) is never
-        // matched-then-unmatched by an excludeFullscreen registration.
+        // Fallback seed for harnesses without deps.isFullscreen; with a
+        // live reader wired the engine resolves fullscreen at match time
+        // and this snapshot is never consulted.
         fullscreen: ev.initialState.exclusive === "fullscreen",
       });
     });

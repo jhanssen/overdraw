@@ -65,6 +65,13 @@ int main(int argc, char** argv) {
     int overrideRedirect = 0;
     int fullscreen = 0;
     int fullscreenAfterMs = -1;
+    // --ewmh-geometry-sync: mimic Wine/SDL's EWMH state sync. While the
+    // client WANTS fullscreen, any ConfigureNotify whose size differs from
+    // the X screen triggers a _NET_WM_STATE REMOVE (the geometry proves the
+    // WM didn't really fullscreen us); a retry ADD follows ~1s later.
+    int ewmhGeometrySync = 0;
+    int wantsFullscreen = 0;
+    long retryAddAtMs = -1;
     int unfullscreenAfterMs = -1;
     int x = 0, y = 0, w = 200, h = 150;
     const char* fillColor = NULL;
@@ -93,7 +100,9 @@ int main(int argc, char** argv) {
         else if (!strcmp(argv[i], "--unfullscreen-after-ms") && i + 1 < argc) {
             unfullscreenAfterMs = atoi(argv[++i]);
         }
+        else if (!strcmp(argv[i], "--ewmh-geometry-sync")) { ewmhGeometrySync = 1; }
     }
+    if (fullscreen) wantsFullscreen = 1;
 
     xcb_connection_t* c = xcb_connect(NULL, NULL);
     if (xcb_connection_has_error(c)) {
@@ -310,7 +319,29 @@ int main(int argc, char** argv) {
             printf(add ? "[x11] fullscreen-requested\n"
                        : "[x11] unfullscreen-requested\n");
             fflush(stdout);
+            wantsFullscreen = add;
             if (add) fullscreenAfterMs = -1; else unfullscreenAfterMs = -1;
+        }
+        // --ewmh-geometry-sync retry: re-request fullscreen after a backoff
+        // (SDL-style: keep trying to get the mode we want).
+        if (ewmhGeometrySync && retryAddAtMs >= 0 && elapsedMs >= retryAddAtMs) {
+            retryAddAtMs = -1;
+            wantsFullscreen = 1;
+            xcb_client_message_event_t ev;
+            memset(&ev, 0, sizeof(ev));
+            ev.response_type = XCB_CLIENT_MESSAGE;
+            ev.format = 32;
+            ev.window = win;
+            ev.type = intern(c, "_NET_WM_STATE");
+            ev.data.data32[0] = 1;  /* ADD */
+            ev.data.data32[1] = intern(c, "_NET_WM_STATE_FULLSCREEN");
+            xcb_send_event(c, 0, screen->root,
+                           XCB_EVENT_MASK_SUBSTRUCTURE_REDIRECT
+                           | XCB_EVENT_MASK_SUBSTRUCTURE_NOTIFY,
+                           (const char*)&ev);
+            xcb_flush(c);
+            printf("[x11] fullscreen-retry\n");
+            fflush(stdout);
         }
         if (elapsedMs >= deadlineMs) break;
         struct pollfd p[2] = {
@@ -358,6 +389,32 @@ int main(int argc, char** argv) {
                        synthetic ? "synthetic" : "real",
                        cn->x, cn->y, cn->width, cn->height);
                 fflush(stdout);
+                // --ewmh-geometry-sync: wanting fullscreen but configured to a
+                // non-screen size means the WM didn't (or stopped) honoring
+                // it; drop the state like Wine's state sync does, then retry.
+                if (ewmhGeometrySync && wantsFullscreen
+                    && (cn->width != screen->width_in_pixels
+                        || cn->height != screen->height_in_pixels)) {
+                    wantsFullscreen = 0;
+                    retryAddAtMs = elapsedMs + 1000;
+                    xcb_client_message_event_t rm;
+                    memset(&rm, 0, sizeof(rm));
+                    rm.response_type = XCB_CLIENT_MESSAGE;
+                    rm.format = 32;
+                    rm.window = win;
+                    rm.type = intern(c, "_NET_WM_STATE");
+                    rm.data.data32[0] = 0;  /* REMOVE */
+                    rm.data.data32[1] = intern(c, "_NET_WM_STATE_FULLSCREEN");
+                    xcb_send_event(c, 0, screen->root,
+                                   XCB_EVENT_MASK_SUBSTRUCTURE_REDIRECT
+                                   | XCB_EVENT_MASK_SUBSTRUCTURE_NOTIFY,
+                                   (const char*)&rm);
+                    xcb_flush(c);
+                    printf("[x11] geometry-sync remove (got %ux%u want %ux%u)\n",
+                           cn->width, cn->height,
+                           screen->width_in_pixels, screen->height_in_pixels);
+                    fflush(stdout);
+                }
             } else if (type == XCB_EXPOSE) {
                 // --fill: (re)paint the whole window so tests get
                 // deterministic pixels. Repainting per Expose (not once at

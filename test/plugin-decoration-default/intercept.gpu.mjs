@@ -399,3 +399,97 @@ test("decoration-default (intercept): a fullscreen window draws bare (no band, n
     await c.teardown();
   }
 });
+
+// -- Fullscreen: the decoration must drop on entry and return on exit --
+//
+// The bundled registration sets excludeFullscreen: fullscreen entry
+// unmatches (band + insets drop; the client gets the full output);
+// exit re-matches. Two regressions covered here:
+//   - the WM's applyLayout skip: a SOLE window entering fullscreen keeps
+//     its outer rect (it already filled the output), and the catch-up
+//     configure must still go out even though the outer didn't change
+//     (the content derivation changed under it);
+//   - the broker's excludeFullscreen re-evaluation rides the plugin bus
+//     (window.committed), which the harness must wire like production.
+
+test("decoration-default (intercept): pre-map fullscreen client draws bare",
+  { skip }, async () => {
+  const B = 8;
+  const c = await setupCompositor({
+    headless: OUT,
+    intercept: true,
+    config: {
+      decoration: {
+        appIdPattern: ".*",
+        border: { width: B, radius: 0 },
+        unfocused: { kind: "solid", color: "#3a3a3aff" },
+        focused: { kind: "solid", color: "#3a3a3aff" },
+      },
+    },
+  });
+  try {
+    const client = c.spawnClient(
+      ["--app-id", "fs-premap", "--color", CLIENT_COLOR_ARGB,
+       "--size", CLIENT_REQUESTED_SIZE, "--title", "t",
+       "--fill-configured", "--initial-state", "fullscreen"],
+      { bin: HARNESS_BIN, readyMarker: "[harness-client] mapped" });
+    await client.ready;
+    await settled(() => c.frameReadback(),
+      (p) => p
+        && pixelMatches(pixelAt(p, OUT.width, OUT.width >> 1, OUT.height >> 1), CLIENT_BGRA, 8)
+        && pixelMatches(pixelAt(p, OUT.width, 2, 2), CLIENT_BGRA, 8)
+        && pixelMatches(pixelAt(p, OUT.width, OUT.width >> 1, 2), CLIENT_BGRA, 8),
+      { what: "pre-map fullscreen client fills every pixel (no band)", timeoutMs: 6000 });
+  } finally {
+    await c.teardown();
+  }
+});
+
+test("decoration-default (intercept): post-map fullscreen entry drops the band; exit restores it",
+  { skip }, async () => {
+  const B = 8;
+  const c = await setupCompositor({
+    headless: OUT,
+    intercept: true,
+    config: {
+      decoration: {
+        appIdPattern: ".*",
+        border: { width: B, radius: 0 },
+        unfocused: { kind: "solid", color: "#3a3a3aff" },
+        focused: { kind: "solid", color: "#3a3a3aff" },
+      },
+    },
+  });
+  try {
+    const client = c.spawnClient(
+      ["--app-id", "fs-postmap", "--color", CLIENT_COLOR_ARGB,
+       "--size", CLIENT_REQUESTED_SIZE, "--title", "t", "--fill-configured"],
+      { bin: HARNESS_BIN, readyMarker: "[harness-client] mapped", stdin: true });
+    await client.ready;
+    const decorated = (p) => p
+      && pixelMatches(pixelAt(p, OUT.width, OUT.width >> 1, OUT.height >> 1), CLIENT_BGRA, 8)
+      && pixelMatches(pixelAt(p, OUT.width, OUT.width >> 1, 2), UNFOCUSED_BGRA, 8);
+    const bare = (p) => p
+      && pixelMatches(pixelAt(p, OUT.width, OUT.width >> 1, OUT.height >> 1), CLIENT_BGRA, 8)
+      && pixelMatches(pixelAt(p, OUT.width, 2, 2), CLIENT_BGRA, 8)
+      && pixelMatches(pixelAt(p, OUT.width, OUT.width >> 1, 2), CLIENT_BGRA, 8);
+
+    await settled(() => c.frameReadback(), decorated,
+      { what: "decorated steady state (band + inset client)", timeoutMs: 6000 });
+
+    // Runtime fullscreen entry (mpv pressing f): the band must vanish and
+    // the client must be reconfigured to the full output.
+    client.send("fullscreen");
+    await client.waitForLine(/fullscreen requested/, { what: "client sent set_fullscreen" });
+    await settled(() => c.frameReadback(), bare,
+      { what: "fullscreen client fills every pixel (band gone)", timeoutMs: 6000 });
+
+    // Exit: the registration re-matches and the band returns.
+    client.send("unfullscreen");
+    await client.waitForLine(/unfullscreen requested/, { what: "client sent unset_fullscreen" });
+    await settled(() => c.frameReadback(), decorated,
+      { what: "band restored after fullscreen exit", timeoutMs: 6000 });
+  } finally {
+    await c.teardown();
+  }
+});

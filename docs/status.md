@@ -6,7 +6,36 @@ test counts, and historical rationale live in `status-detailed.md`. This
 file is the short read; consult the detailed doc when investigating a
 specific subsystem.
 
-Last updated: 2026-07-20. Recent landings: last-output hotplug removal
+Last updated: 2026-07-20. Recent landings: fullscreen-flap fixes (an X11
+game declaring fullscreen pre-map flapped exclusive none<->fullscreen and
+often settled decorated/tiled: markInitialCommitComplete committed its
+stale pre-round-trip snapshot over the synchronously-stamped fullscreen --
+it now applies only the fields plugins deliberately changed -- and the
+xwm's sendStructuralProposals claimed wantsFullscreen:false from property
+replies that landed before _NET_WM_STATE was read, stale snapshots that
+committed behind the serialized propose queue -- clientRequests are now
+proposed only once known and only on change. A stale _NET_WM_STATE
+property-reply guard (local-mutation sequence) covers the read-vs-
+ClientMessage race, and exclusive transitions + xwm state changes are
+logged with reasons. x11-test-client gained --ewmh-geometry-sync
+(Wine-style remove-on-mismatch + retry) to reproduce the client half.
+The decoration's excludeFullscreen matching is now LEVEL-TRIGGERED: the
+match engine consults a live isFullscreen reader against current WM state
+at match time, with events acting only as re-evaluation triggers -- a
+cached/event-borne fullscreen flag can race registration and go stale by
+construction. The pre-content stamp also announces its state change as a
+window.committed edge).
+Prior: fullscreen catch-up configure
+fix (a sole window entering fullscreen keeps its outer rect, and
+applyLayout's no-change skip compared against a re-derived content rect --
+which the fullscreen carve-out had just changed -- so the client was never
+reconfigured to the bare output and kept its decoration inset; the skip
+now compares against the content rect the window last actually had. The
+test harness also now wires pluginBus into the InterceptBroker like
+production, so excludeFullscreen re-evaluation is exercised; harness-client
+gained stdin fullscreen/unfullscreen commands and the decoration suite
+covers pre-map fullscreen plus the post-map enter/exit round-trip).
+Prior: last-output hotplug removal
 fix (unplugging the only monitor pushed an empty output set into the WM,
 whose setOutputs threw; the exception was silently swallowed at the
 native->JS callback boundary and took the queued OutputAdded for the

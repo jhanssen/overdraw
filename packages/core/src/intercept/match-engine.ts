@@ -61,6 +61,21 @@ export interface MatchEvent {
 }
 
 export class MatchEngine {
+  // Live fullscreen reader, consulted AT MATCH TIME. Fullscreen matching
+  // is level-triggered: events (preconfigure, map, committed edges) only
+  // TRIGGER re-evaluation; the answer always comes from current WM state.
+  // Cached copies of fullscreen-ness (event payloads, snapshots crossing
+  // async boundaries) go stale by construction -- an edge that fires
+  // before this engine tracks the toplevel is lost forever, and a
+  // preconfigure snapshot pre-dates any state change made during the
+  // plugin round-trip. When no reader is wired (harnesses), the tracked
+  // per-toplevel flag is the fallback.
+  private readonly isFullscreen?: (surfaceId: number) => boolean;
+
+  constructor(opts?: { isFullscreen?: (surfaceId: number) => boolean }) {
+    this.isFullscreen = opts?.isFullscreen;
+  }
+
   // Registrations sorted by (priority asc, insertionSeq asc).
   // First-match-wins iterates this list head-to-tail; the sort means
   // lower priority wins, and same-priority falls back to registration
@@ -91,7 +106,10 @@ export class MatchEngine {
     insertSorted(this.registrations, r);
     const events: MatchEvent[] = [];
     for (const [surfaceId, top] of this.toplevels.entries()) {
-      if (!matches(r, top)) continue;
+      const fullscreen = this.isFullscreen
+        ? this.isFullscreen(surfaceId)
+        : top.fullscreen === true;
+      if (!matches(r, top, fullscreen)) continue;
       const cur = this.assignments.get(surfaceId);
       if (cur === undefined) {
         // Unassigned: claim it.
@@ -215,7 +233,11 @@ export class MatchEngine {
   onToplevelFullscreenChanged(surfaceId: number, fullscreen: boolean): MatchEvent[] {
     const cur = this.toplevels.get(surfaceId);
     if (!cur) return [];
-    if (cur.fullscreen === fullscreen) return [];
+    // With a live reader wired this event is only a re-evaluation TRIGGER;
+    // whether anything changed is decided by re-matching against the live
+    // answer (reevaluate is idempotent). Deduping on the tracked flag
+    // would drop triggers whose PAYLOAD merely repeats a stale cache.
+    if (!this.isFullscreen && cur.fullscreen === fullscreen) return [];
     cur.fullscreen = fullscreen;
     return this.reevaluate(surfaceId, cur);
   }
@@ -259,8 +281,13 @@ export class MatchEngine {
   }
 
   private firstMatching(top: ToplevelData): RegistrationData | null {
+    // Level-triggered fullscreen: resolve from the live reader at match
+    // time; the tracked flag is only the no-reader fallback.
+    const fullscreen = this.isFullscreen
+      ? this.isFullscreen(top.surfaceId)
+      : top.fullscreen === true;
     for (const r of this.registrations) {
-      if (matches(r, top)) return r;
+      if (matches(r, top, fullscreen)) return r;
     }
     return null;
   }
@@ -288,11 +315,12 @@ function insertSorted(list: RegistrationData[], r: RegistrationData): void {
   list.splice(idx, 0, r);
 }
 
-function matches(r: RegistrationData, top: ToplevelData): boolean {
+function matches(r: RegistrationData, top: ToplevelData,
+                 fullscreen: boolean): boolean {
   // In 10a we only support matching toplevels. The 'roles' filter is
   // recorded but the match here is implicitly toplevel-scoped because
   // this engine only sees toplevels.
-  if (r.excludeFullscreen && top.fullscreen === true) return false;
+  if (r.excludeFullscreen && fullscreen) return false;
   if (r.appIdRegex !== null) {
     if (top.appId === null) return false;       // no app_id yet -> no match
     if (!r.appIdRegex.test(top.appId)) return false;

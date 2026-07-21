@@ -626,6 +626,21 @@ pluginBus.subscribe(WINDOW_EVENT.committed, (_name, payload) => {
   reemitScanoutFeedback(state, addon);
 });
 
+// Exclusive transitions are rare and load-bearing (fullscreen entry drives
+// decoration release, scanout eligibility, layout suppression); log each
+// with its propose reason so a flap -- e.g. a client or sync loop reverting
+// fullscreen -- is visible in the session log.
+pluginBus.subscribe(WINDOW_EVENT.committed, (_name, payload) => {
+  const ev = payload as {
+    surfaceId?: number; reason?: string; changed?: string[];
+    previous?: { exclusive?: string }; current?: { exclusive?: string };
+  };
+  if (!ev.changed?.includes("exclusive")) return;
+  log.info("core",
+    `window ${ev.surfaceId}: exclusive ${ev.previous?.exclusive ?? "?"} -> `
+    + `${ev.current?.exclusive ?? "?"} (${ev.reason ?? "?"})`);
+});
+
 // M7 hotplug handlers. Logic factored out into output/hotplug.ts so tests
 // can call the handler directly with a mocked addon/state.
 {
@@ -1121,6 +1136,8 @@ interceptBrokerLate = new InterceptBroker({
   pluginBus: state.pluginBus,
   compositor,
   isActivated: (sid) => state?.seat?.kbFocus?.surfaceId === sid,
+  isFullscreen: (sid) => state?.wm?.state.windows
+    .find((w) => w.surfaceId === sid)?.windowState.exclusive === "fullscreen",
   surfaceGeometry: (sid) => state?.surfacesById?.get(sid)?.xdgSurface?.geometry ?? null,
   gateSink: state.wm,
   inThread: {

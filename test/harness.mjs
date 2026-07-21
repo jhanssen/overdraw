@@ -622,9 +622,17 @@ export async function setupCompositor(opts = {}) {
       // unwired (in-thread tests only).
       const interceptBrokerOpts = {
         bus: coreBus,
+        // The plugin-visible dynamic bus: window.committed (exclusive
+        // transitions -> excludeFullscreen re-evaluation) only rides
+        // here. Mirrors main.ts wiring.
+        pluginBus,
         compositor: jsCompositor,
         // Surface live keyboard focus as ctx.activated (mirrors main.ts).
         isActivated: (sid) => state?.seat?.kbFocus?.surfaceId === sid,
+        // Live fullscreen reader (mirrors main.ts): excludeFullscreen is
+        // level-triggered against current WM state, not event payloads.
+        isFullscreen: (sid) => state?.wm?.state.windows
+          .find((w) => w.surfaceId === sid)?.windowState.exclusive === "fullscreen",
         surfaceGeometry: (sid) => state?.surfacesById?.get(sid)?.xdgSurface?.geometry ?? null,
         // Wire the WM as the gate sink so intercepts that declare
         // `gates: true` (e.g. the bundled decoration plugin) can engage

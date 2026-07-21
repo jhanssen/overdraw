@@ -37,6 +37,7 @@ import {
   type PropertyReply,
 } from "./properties.js";
 import { xwaylandScaleOf, sizeHintsToLogical } from "./scale.js";
+import { log } from "../log.js";
 import { xChartCameraOf, xGlassToWorld, tellXRect } from "./glass-map.js";
 
 export interface XwmEventMsg {
@@ -132,6 +133,24 @@ export interface XWindow {
   // without clobbering client-set bits (fullscreen / maximized /
   // modal / etc.). Refreshed on every _NET_WM_STATE property reply.
   netWmStateAtoms: Set<number>;
+  // Bumped on every LOCAL mutation of netWmStateAtoms (net-wm-state
+  // ClientMessage apply, setStateFocused). A _NET_WM_STATE property-read
+  // reply is applied only if no local mutation happened since the read
+  // was issued -- the X server may have serviced the read BEFORE a
+  // ClientMessage we have since applied, and applying that stale reply
+  // would roll the cache (and the WM's exclusive state) back.
+  netWmStateSeq: number;
+  // False until _NET_WM_STATE has been parsed at least once (property
+  // apply or ClientMessage). Until then the window's fullscreen/maximized/
+  // modal WISHES are unknown -- sendStructuralProposals must not claim
+  // "wants nothing" for state it has not read: that snapshot would queue
+  // behind the WM's serialized propose pipeline and revert a newer,
+  // genuine request when it finally commits.
+  netWmStateParsed: boolean;
+  // The clientRequests values last proposed to the WM, so unchanged
+  // snapshots are not re-sent (every re-send is a queued commit that can
+  // land arbitrarily late).
+  lastSentRequests: { f: boolean; m: boolean; mod: boolean } | null;
   // _NET_STARTUP_ID: an opaque ASCII id the launcher set on the window
   // (matched against the SI message the launcher emitted via dbus).
   // Exposed read-only via the XwmStateView so launchers / plugins can
@@ -247,6 +266,9 @@ function newXWindow(window: number, x: number, y: number, w: number, h: number,
     inputHint: null,
     pid: null,
     netWmStateAtoms: new Set<number>(),
+    netWmStateSeq: 0,
+    netWmStateParsed: false,
+    lastSentRequests: null,
     startupId: null,
     icons: null,
     criticalReadsPending: 0,
@@ -286,7 +308,9 @@ export function startXwm(state: CompositorState, addon: Addon, wmFd: number): Xw
   // it; completed when onSerialRegistered fires for that serial.
   const pendingBySerial = new Map<bigint, XWindow>();
   // cookieId -> { window, atomName } for in-flight property reads.
-  const pendingReads = new Map<number, { window: number; name: string }>();
+  // stateSeq: for _NET_WM_STATE reads, the window's netWmStateSeq at issue
+  // time; the reply is dropped if a local mutation bumped it since.
+  const pendingReads = new Map<number, { window: number; name: string; stateSeq?: number }>();
   // surfaceId -> X window, populated on association. Cheap reverse lookup for
   // titleAppId / closeBySurfaceId.
   const bySurface = new Map<number, XWindow>();
@@ -389,7 +413,10 @@ export function startXwm(state: CompositorState, addon: Addon, wmFd: number): Xw
     const watched = pickWatchedAtoms(atomsByName);
     for (const e of watched) {
       const cookie = addon.xwmGetProperty(w.window, e.atom);
-      pendingReads.set(cookie, { window: w.window, name: e.name });
+      pendingReads.set(cookie, {
+        window: w.window, name: e.name,
+        ...(e.name === "_NET_WM_STATE" ? { stateSeq: w.netWmStateSeq } : {}),
+      });
     }
     // Hold the manage step until the identity reads (WM_CLASS + title) in this
     // batch reply, so window.preconfigure carries the real app_id/title and
@@ -441,11 +468,26 @@ export function startXwm(state: CompositorState, addon: Addon, wmFd: number): Xw
     // to be fullscreen/maximized/modal"; that's a wish, not a decision.
     // The policy seam in wm.propose maps it onto the decision axes the
     // same way it does for xdg_toplevel.set_* and xdg_dialog.set_modal.
-    proposal.clientRequests = {
-      wantsFullscreen: w.presentationHint === "fullscreen",
-      wantsMaximized: w.presentationHint === "maximized",
-      wantsModal: w.modalHint,
-    };
+    // Only propose requests that are KNOWN (the state property has been
+    // parsed) and that CHANGED since the last proposal: an unchanged
+    // snapshot re-sent from an unrelated property reply is a queued
+    // commit that can land after -- and revert -- a newer request.
+    if (w.netWmStateParsed) {
+      const cr = {
+        f: w.presentationHint === "fullscreen",
+        m: w.presentationHint === "maximized",
+        mod: w.modalHint,
+      };
+      const last = w.lastSentRequests;
+      if (!last || last.f !== cr.f || last.m !== cr.m || last.mod !== cr.mod) {
+        w.lastSentRequests = cr;
+        proposal.clientRequests = {
+          wantsFullscreen: cr.f,
+          wantsMaximized: cr.m,
+          wantsModal: cr.mod,
+        };
+      }
+    }
     if (Object.keys(proposal).length > 0) {
       void state.wm.propose(w.surfaceId, proposal, "client-request");
     }
@@ -501,8 +543,15 @@ export function startXwm(state: CompositorState, addon: Addon, wmFd: number): Xw
       case "_NET_WM_STATE": {
         const states = parseNetWmState(p);
         w.netWmStateAtoms = states;
+        w.netWmStateParsed = true;
+        const prevHint = w.presentationHint;
         w.presentationHint = netWmStateToPresentation(states, pa);
         w.modalHint = netWmStateIsModal(states, pa);
+        if (w.presentationHint !== prevHint) {
+          log.info("core",
+            `xwm: X window ${w.window} _NET_WM_STATE property -> `
+            + `${w.presentationHint ?? "none"}`);
+        }
         sendStructuralProposals(w);
         break;
       }
@@ -655,8 +704,16 @@ export function startXwm(state: CompositorState, addon: Addon, wmFd: number): Xw
           }
         }
         w.netWmStateAtoms = atoms;
+        w.netWmStateSeq++;
+        w.netWmStateParsed = true;
+        const prevHint = w.presentationHint;
         w.presentationHint = netWmStateToPresentation(atoms, pa);
         w.modalHint = netWmStateIsModal(atoms, pa);
+        if (w.presentationHint !== prevHint) {
+          log.info("core",
+            `xwm: X window ${ev.window} _NET_WM_STATE ClientMessage `
+            + `(action=${action}) -> ${w.presentationHint ?? "none"}`);
+        }
         const stateAtom = atomsByName._NET_WM_STATE ?? 0;
         if (stateAtom !== 0) {
           if (atoms.size === 0) {
@@ -684,7 +741,10 @@ export function startXwm(state: CompositorState, addon: Addon, wmFd: number): Xw
         const name = nameOfAtom(atomsByName, ev.atom);
         if (name === null) break;
         const cookie = addon.xwmGetProperty(ev.window, ev.atom);
-        pendingReads.set(cookie, { window: ev.window, name });
+        pendingReads.set(cookie, {
+          window: ev.window, name,
+          ...(name === "_NET_WM_STATE" ? { stateSeq: w.netWmStateSeq } : {}),
+        });
         break;
       }
       case "property-reply": {
@@ -707,6 +767,17 @@ export function startXwm(state: CompositorState, addon: Addon, wmFd: number): Xw
           format: ev.format ?? 0,
           data: ev.data ?? new Uint8Array(0),
         };
+        // Stale-reply guard: a _NET_WM_STATE read serviced by the X server
+        // BEFORE a local mutation we have since applied (net-wm-state
+        // ClientMessage, focus mirror) must not roll the atom cache back --
+        // that reverts the WM's exclusive decision (fullscreen flap).
+        if (pend.name === "_NET_WM_STATE"
+            && pend.stateSeq !== undefined && pend.stateSeq !== w.netWmStateSeq) {
+          log.info("core",
+            `xwm: dropped stale _NET_WM_STATE reply for X window ${pend.window} `
+            + `(read seq ${pend.stateSeq}, cache seq ${w.netWmStateSeq})`);
+          break;
+        }
         const observableChanged = applyProperty(w, pend.name, reply);
         // An identity read from the associate-time batch landed: if it clears
         // the last outstanding one, the deferred manage can run now (with the
@@ -876,7 +947,7 @@ export function startXwm(state: CompositorState, addon: Addon, wmFd: number): Xw
     else atoms.delete(focusedAtom);
     // Sync the cache with what we're about to write; the X server's
     // own PropertyNotify will arrive later but the value matches.
-    if (w) w.netWmStateAtoms = atoms;
+    if (w) { w.netWmStateAtoms = atoms; w.netWmStateSeq++; }
     if (atoms.size === 0) {
       addon.xwmDeleteProperty(window, stateAtom);
       return;

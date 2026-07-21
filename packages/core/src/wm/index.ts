@@ -1427,7 +1427,13 @@ export function createWm(
     for (const win of snapshotWindows) {
       const r = byId.get(win.surfaceId);
       if (!r) continue;
-      const prevContent = contentOf(win);
+      // The content rect the window last actually had (every applied pass
+      // writes win.rect). Re-deriving via contentOf here would lie right
+      // after a windowState change that alters the derivation -- the
+      // fullscreen carve-out returns the bare outer, so a sole window
+      // entering fullscreen (outer unchanged) would compare equal and the
+      // skip below would suppress the catch-up configure the client needs.
+      const prevContent = { ...win.rect };
       const prevOuter = win.outer;
       let newOuter: Rect = { ...r.outer };
 
@@ -2216,6 +2222,7 @@ export function createWm(
       // pass below still runs the proposed-interceptor + layout for the
       // sized second configure.
       if (win.pendingInitialCommit) {
+        const preStamp = cloneState(win.windowState);
         const stamp: Partial<WindowState> = {};
         if (proposal.tiling !== undefined) stamp.tiling = proposal.tiling;
         if (proposal.exclusive !== undefined) stamp.exclusive = proposal.exclusive;
@@ -2238,6 +2245,22 @@ export function createWm(
           };
           const merged: WindowState = { ...win.windowState, clientRequests: nextCR };
           win.windowState = resolveDecisions(win.windowState, merged, "pre-content");
+        }
+        // Announce the stamp's edge. The async pass below re-resolves to
+        // the same values and diffs to nothing, so without this emit a
+        // pre-content decision (a pre-map fullscreen) changes windowState
+        // with NO window.committed -- and edge-driven consumers (the
+        // intercept broker's excludeFullscreen, workspace policies) act on
+        // a state they never heard about.
+        const stampChanged = diffState(preStamp, win.windowState);
+        if (stampChanged.length > 0 && pluginBus) {
+          const ev: WindowCommittedEvent = {
+            surfaceId, reason,
+            previous: preStamp,
+            current: cloneState(win.windowState),
+            changed: [...stampChanged],
+          };
+          pluginBus.emit(WINDOW_EVENT.committed, ev);
         }
       }
       // Same race for client-declared constraints (set_min_size /
@@ -2414,23 +2437,37 @@ export function createWm(
         // so the handshake configures below are suppressed (a 0x0 configure
         // would reach the X client as a bogus 0x0 ConfigureNotify).
         const isXwayland = info.xwayland === true;
-        let finalState: WindowState = cloneState(win.windowState);
+        // Snapshot the state the plugins are shown. While the emit below
+        // awaits, a client-request propose can advance win.windowState
+        // through its SYNCHRONOUS pre-content stamp (a pre-map fullscreen
+        // X window's _NET_WM_STATE landing mid-round-trip). Committing the
+        // plugins' returned snapshot wholesale would revert that stamp, so
+        // only the fields the plugins DELIBERATELY changed (relative to
+        // what they were shown) are applied onto the then-current state.
+        const preEmit = cloneState(win.windowState);
+        let pluginFinal: WindowState | null = null;
         if (pluginBus) {
           const initial: WindowPreconfigureEvent = {
             surfaceId,
             appId: info.appId, title: info.title,
             xwayland: info.xwayland ?? false,
-            initialState: cloneState(win.windowState),
+            initialState: cloneState(preEmit),
           };
           const finalPayload = await pluginBus.emit(WINDOW_EVENT.preconfigure, initial,
             { timeoutMs: INTERCEPTOR_TIMEOUT_MS });
           if (!windows.includes(win)) return;
           const ev = finalPayload as WindowPreconfigureEvent | undefined;
           const modified = ev ? validateState(ev.initialState) : null;
-          if (modified) finalState = cloneState(modified);
+          if (modified) pluginFinal = cloneState(modified);
         }
 
         const previous = cloneState(win.windowState);
+        const finalState = cloneState(previous);
+        if (pluginFinal) {
+          for (const f of diffState(preEmit, pluginFinal)) {
+            (finalState as Record<string, unknown>)[f] = pluginFinal[f];
+          }
+        }
         const changed = diffState(previous, finalState);
         if (changed.length > 0) {
           win.windowState = finalState;

@@ -374,3 +374,35 @@ test('match engine: plain registrations keep fullscreen toplevels', () => {
   assert.deepEqual(e.onToplevelFullscreenChanged(1, true), []);
   assert.equal(e.registrationFor(1), 100);
 });
+
+test('match engine: live isFullscreen reader outranks stale event payloads', () => {
+  // Level-triggered fullscreen: the reader is consulted at match time, so
+  // a preconfigure seed or map payload claiming "not fullscreen" (a
+  // snapshot taken before a pre-content stamp landed, or an edge that
+  // fired before this engine tracked the toplevel) cannot cause a match.
+  let live = true;
+  const e = new MatchEngine({ isFullscreen: () => live });
+  e.addRegistration({
+    id: 1, priority: 10, appIdRegex: compileAppIdRegex({ source: '.*' }),
+    titleRegex: null, roles: ['toplevel'], excludeFullscreen: true,
+  });
+  // Stale seed says NOT fullscreen; the live reader says fullscreen.
+  const events = e.onToplevelPreconfigure(
+    { surfaceId: 1, appId: 'game', title: null, fullscreen: false });
+  assert.deepEqual(events, [], 'no match while live state is fullscreen');
+
+  // The window leaves fullscreen for real: any re-evaluation trigger now
+  // matches, regardless of its payload.
+  live = false;
+  const events2 = e.onToplevelFullscreenChanged(1, false);
+  assert.deepEqual(events2,
+    [{ kind: 'matched', registrationId: 1, surfaceId: 1 }],
+    're-evaluation matches once live state says not-fullscreen');
+
+  // Back to fullscreen: unmatched again -- also payload-independent.
+  live = true;
+  const events3 = e.onToplevelFullscreenChanged(1, true);
+  assert.deepEqual(events3,
+    [{ kind: 'unmatched', registrationId: 1, surfaceId: 1 }],
+    'fullscreen entry unmatches from the live reader');
+});
