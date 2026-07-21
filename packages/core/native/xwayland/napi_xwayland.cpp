@@ -11,6 +11,8 @@
 #include "xwayland/server.h"
 #include "xwayland/xwm.h"
 #include "wayland/wayland_fd.h"
+#include "log/log.h"
+#include "napi/js_exception.h"
 #include "napi/uv_js_scope.h"
 
 namespace overdraw::xwayland {
@@ -97,6 +99,12 @@ void finish(ReadyWatch* w, const char* err, int displayNumber) {
         argv[1] = info;
     }
     napi_call_function(env, undef, cb, 2, argv, nullptr);
+    {
+        std::string detail;
+        if (overdraw::napi::takePendingJsException(env, &detail)) {
+            LOG_ERR(Core, "uncaught JS exception in xwayland-ready callback: {}", detail);
+        }
+    }
     napi_close_handle_scope(env, scope);
 
     napi_delete_reference(env, w->cb);
@@ -357,6 +365,12 @@ void deliverXwmEvent(const XwmEvent& e) {
     napi_get_reference_value(env, g_xwm.cb, &cb);
     napi_get_undefined(env, &undef);
     napi_call_function(env, undef, cb, 1, &obj, nullptr);
+    {
+        std::string detail;
+        if (overdraw::napi::takePendingJsException(env, &detail)) {
+            LOG_ERR(Core, "uncaught JS exception in xwm event callback: {}", detail);
+        }
+    }
     napi_close_handle_scope(env, scope);
 }
 

@@ -6,7 +6,17 @@ test counts, and historical rationale live in `status-detailed.md`. This
 file is the short read; consult the detailed doc when investigating a
 specific subsystem.
 
-Last updated: 2026-07-12. Recent landings: commit-timing-v1 (per-surface
+Last updated: 2026-07-20. Recent landings: last-output hotplug removal
+fix (unplugging the only monitor pushed an empty output set into the WM,
+whose setOutputs threw; the exception was silently swallowed at the
+native->JS callback boundary and took the queued OutputAdded for the
+monitor's return down with it -- the output never came back. The WM now
+receives the virtual fallback output, JsCompositor.setOutputs accepts an
+empty set so wl_surface.leave still fires for the last output, and every
+native->JS callback site clears + logs a pending JS exception via
+`napi/js_exception.h` so one throwing callback can neither vanish
+silently nor starve the messages dispatched after it). Prior:
+commit-timing-v1 (per-surface
 timed commits latched at their target presentation-clock time; see the
 protocol list below). Prior: per-keyboard keymaps with
 active-keyboard arbitration (virtual keyboards honor their own keymap +
@@ -304,6 +314,14 @@ nothing, with no error. Worst-first.
   fallback policy (right of rightmost, top-aligned) every time -- so a
   monitor that was on the LEFT before unplug reappears on the RIGHT
   after replug. Fix is a separate follow-up.
+
+- **Single-monitor unplug/replug is unit-tested, not yet
+  hardware-verified.** The removal pipeline (fallback output to the WM,
+  leave-before-global_remove, scanout release) and the re-add are covered
+  by GPU-free unit tests over the factored hotplug handlers; the
+  end-to-end KMS path (real HPD drop on the only connector, layout-driver
+  pass with only the 0x0 fallback output, ScanoutReserve on return) needs
+  a physical monitor power-cycle to confirm.
 
 - **Advertised-incomplete protocols (clients warn and fall back):**
   text-input, xdg-activation, toplevel-icon, system-bell. See the

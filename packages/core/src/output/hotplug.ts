@@ -75,14 +75,31 @@ export function pushOutputsToLayers(deps: {
     x: r.logicalPosition.x, y: r.logicalPosition.y,
     w: r.logicalSize.width, h: r.logicalSize.height,
   })));
-  state.wm?.setOutputs([...outputs.values()].map((r) => ({
+  // The WM requires >= 1 output at all times (its setOutputs throws on an
+  // empty set). When the last real output is unplugged, hand it the virtual
+  // fallback output instead: workspaces park there, windows stay alive in
+  // the WM tree, and the next real OutputAdded replaces it wholesale.
+  let wmOutputs = [...outputs.values()].map((r) => ({
     id: r.id,
     rect: {
       x: r.logicalPosition.x, y: r.logicalPosition.y,
       width: r.logicalSize.width, height: r.logicalSize.height,
     },
     scale: r.scale,
-  })));
+  }));
+  if (wmOutputs.length === 0) {
+    const f = state.fallbackOutput;
+    if (!f) return;  // pre-installProtocols; nothing to push
+    wmOutputs = [{
+      id: f.id,
+      rect: {
+        x: f.logicalPosition.x, y: f.logicalPosition.y,
+        width: f.logicalSize.width, height: f.logicalSize.height,
+      },
+      scale: f.scale,
+    }];
+  }
+  state.wm?.setOutputs(wmOutputs);
 }
 
 export function makeOnOutputAdded(deps: HotplugDeps): (d: OutputDescriptor) => void {

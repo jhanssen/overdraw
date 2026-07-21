@@ -27,6 +27,7 @@
 #include <vector>
 
 #include "core/compositor.h"
+#include "napi/js_exception.h"
 #include "core/gpu_process.h"
 #include "core/spawn_child.h"
 #include "core/input.h"
@@ -209,6 +210,17 @@ void advancePendingAllocs(napi_env env);
 void advanceConnBrokers(napi_env env);
 void advanceInjects(napi_env env);
 
+// Every JS callback the addon invokes runs outside a JS frame, so a throw has
+// nowhere to propagate: it stays pending and silently no-ops every later napi
+// call in the same native pass. Call this right after each napi_call_function
+// to clear + log the exception, so one throwing callback can neither vanish
+// without a trace nor swallow the messages dispatched after it.
+void logJsException(napi_env env, const char* where) {
+    std::string desc;
+    if (!overdraw::napi::takePendingJsException(env, &desc)) return;
+    LOG_ERR(Core, "uncaught JS exception in {}: {}", where, desc);
+}
+
 // Forwards normalized input events to the JS onInput callback. Same Node thread
 // (driven from the inputPoll handle), so a direct napi_call_function is safe.
 class JsInputSink : public InputSink {
@@ -228,6 +240,7 @@ void notifyFrame() {
     napi_get_undefined(env, &undefined);
     napi_create_uint32(env, static_cast<uint32_t>(g_addon.compositor->presented()), &arg);
     napi_call_function(env, undefined, cb, 1, &arg, nullptr);
+    logJsException(env, "onFrame");
     napi_close_handle_scope(env, scope);
 }
 
@@ -256,6 +269,7 @@ void notifyFlipComplete(uint32_t outputId, uint64_t tvSec, uint32_t tvNsec, uint
     napi_create_uint32(env, tvNsec, &args[2]);
     napi_create_uint32(env, seq, &args[3]);
     napi_call_function(env, undefined, cb, 4, args, nullptr);
+    logJsException(env, "onFlipComplete");
     napi_close_handle_scope(env, scope);
 }
 
@@ -272,6 +286,7 @@ void notifySeatEnabled() {
     napi_get_reference_value(env, g_addon.onSeatEnabled, &cb);
     napi_get_undefined(env, &undefined);
     napi_call_function(env, undefined, cb, 0, nullptr, nullptr);
+    logJsException(env, "onSeatEnabled");
     napi_close_handle_scope(env, scope);
 }
 
@@ -508,6 +523,7 @@ void JsInputSink::onInputEvent(const InputEvent& ev) {
     napi_get_reference_value(env, g_addon.onInput, &cb);
     napi_get_undefined(env, &undefined);
     napi_call_function(env, undefined, cb, 1, &obj, nullptr);
+    logJsException(env, "onInput");
     napi_close_handle_scope(env, scope);
 }
 
@@ -765,6 +781,7 @@ void invokePluginCb(napi_env env, napi_ref cbRef, napi_value result) {
     napi_value arg = result;
     if (arg == nullptr) napi_get_null(env, &arg);
     napi_call_function(env, undefined, cb, 1, &arg, nullptr);
+    logJsException(env, "plugin-broker callback");
     napi_delete_reference(env, cbRef);
 }
 
@@ -1476,6 +1493,7 @@ void fireJsImports(napi_env env) {
             napi_get_null(env, &arg);
         }
         napi_call_function(env, undefined, cb, 1, &arg, nullptr);
+        logJsException(env, "dmabuf-import callback");
         napi_delete_reference(env, it->second);
         g_jsImportCbs.erase(it);
     }
@@ -1534,6 +1552,7 @@ void fireOutputDescriptors(napi_env env) {
     for (const auto& d : descs) {
         napi_value obj = buildDescriptorObject(env, d);
         napi_call_function(env, undefined, cb, 1, &obj, nullptr);
+        logJsException(env, "onOutput");
     }
     napi_close_handle_scope(env, scope);
 }
@@ -1559,6 +1578,7 @@ void fireOutputsAdded(napi_env env) {
     for (const auto& d : descs) {
         napi_value obj = buildDescriptorObject(env, d);
         napi_call_function(env, undefined, cb, 1, &obj, nullptr);
+        logJsException(env, "onOutputAdded");
     }
     napi_close_handle_scope(env, scope);
 }
@@ -1581,6 +1601,7 @@ void fireOutputsRemoved(napi_env env) {
         napi_create_uint32(env, id, &v);
         napi_set_named_property(env, obj, "outputId", v);
         napi_call_function(env, undefined, cb, 1, &obj, nullptr);
+        logJsException(env, "onOutputRemoved");
     }
     napi_close_handle_scope(env, scope);
 }
@@ -1609,6 +1630,7 @@ void fireCursorPlaneStatuses(napi_env env) {
         napi_create_uint32(env, m.maxHeight, &v);
         napi_set_named_property(env, obj, "maxHeight", v);
         napi_call_function(env, undefined, cb, 1, &obj, nullptr);
+        logJsException(env, "onCursorPlaneStatus");
     }
     napi_close_handle_scope(env, scope);
 }
@@ -1637,6 +1659,7 @@ void fireScanoutClientEvents(napi_env env) {
                 napi_create_uint32(env, f.retiredBufferId, &v);
                 napi_set_named_property(env, obj, "retiredBufferId", v);
                 napi_call_function(env, undefined, cb, 1, &obj, nullptr);
+                logJsException(env, "onScanoutClientFlip");
             }
         }
     }
@@ -1653,6 +1676,7 @@ void fireScanoutClientEvents(napi_env env) {
                 napi_create_uint32(env, r.bufferId, &v);
                 napi_set_named_property(env, obj, "bufferId", v);
                 napi_call_function(env, undefined, cb, 1, &obj, nullptr);
+                logJsException(env, "onScanoutClientReject");
             }
         }
     }
@@ -1692,6 +1716,7 @@ void fireOutputModes(napi_env env) {
         }
         napi_set_named_property(env, obj, "modes", arr);
         napi_call_function(env, undefined, cb, 1, &obj, nullptr);
+        logJsException(env, "onOutputModes");
     }
     napi_close_handle_scope(env, scope);
 }
@@ -1730,6 +1755,8 @@ napi_value CreateTextureFromDmabuf(napi_env env, napi_callback_info info) {
         napi_get_reference_value(env, cbRef, &cb);
         napi_get_undefined(env, &undefined);
         napi_get_null(env, &nul);
+        // No logJsException: this runs inside a JS-initiated binding call,
+        // so a throw from cb propagates to the JS caller.
         napi_call_function(env, undefined, cb, 1, &nul, nullptr);
         napi_delete_reference(env, cbRef);
         napi_value zero; napi_create_uint32(env, 0, &zero);

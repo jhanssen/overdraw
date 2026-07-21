@@ -256,3 +256,50 @@ test('OutputRemoved: no leave when surface does not overlap the dying output', (
   assert.equal(iLeave, -1,
     "no wl_surface.leave when the dying output was never part of the residency set");
 });
+
+test('OutputRemoved: LAST output still emits leave before global_remove', () => {
+  // Unplugging the only monitor: the WM must be handed the virtual
+  // fallback (its setOutputs contract forbids an empty set), and the
+  // surface must still observe leave -> global_remove for the dying
+  // output. A throw anywhere in this pipeline once left the compositor
+  // unable to process the monitor's re-add.
+  const { deps, state, timeline } = makeFixture();
+  // Reduce to a single output (0) with the surface resident on it.
+  state.outputs.delete(1);
+  const rec = [...state.surfaces.values()][0];
+  rec.enteredOutputs = new Set([0]);
+  state.compositor.surfaceOutputs =
+    (sid) => sid === 42 ? [...state.outputs.keys()] : [];
+  state.compositor.surfaceVisibleOutputs = state.compositor.surfaceOutputs;
+  state.fallbackOutput = {
+    id: -1,
+    logicalPosition: { x: 0, y: 0 },
+    logicalSize: { width: 0, height: 0 },
+    deviceSize: { width: 0, height: 0 },
+    scale: 1, name: "__fallback__", description: "overdraw fallback output",
+    refreshMhz: 0, transform: 0, physicalWidthMm: 0, physicalHeightMm: 0,
+    make: "overdraw", model: "overdraw", edidId: "",
+  };
+  // Enforce the real WM contract; record what it received.
+  const wmCalls = [];
+  state.wm.setOutputs = (outs) => {
+    if (outs.length === 0) throw new Error("setOutputs: outputs must be non-empty");
+    wmCalls.push(outs.map((o) => ({ ...o })));
+  };
+
+  const onRemoved = makeOnOutputRemoved(deps);
+  onRemoved({ outputId: 0 });  // must not throw
+
+  assert.equal(wmCalls.length, 1);
+  assert.equal(wmCalls[0][0].id, -1, "WM received the fallback output");
+
+  const iLeave = timeline.findIndex((e) => e.kind === "wl_surface.send_leave");
+  const iDestroyGlobal = timeline.findIndex(
+    (e) => e.kind === "addon.destroyGlobalForOutput");
+  const iRelease = timeline.findIndex(
+    (e) => e.kind === "addon.releaseScanoutForOutput");
+  assert.ok(iLeave >= 0, "wl_surface.leave emitted for the last output");
+  assert.ok(iLeave < iDestroyGlobal, "leave precedes global_remove");
+  assert.ok(iRelease > iDestroyGlobal, "scanout release runs last");
+  assert.equal(state.outputs.size, 0);
+});

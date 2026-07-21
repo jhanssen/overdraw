@@ -10,6 +10,7 @@
 #include <wayland-util.h>
 
 #include "log/log.h"
+#include "napi/js_exception.h"
 #include "wayland_fd.h"
 
 namespace overdraw::wayland {
@@ -188,8 +189,11 @@ void Trampoline::onBind(wl_client* client, void* data, uint32_t version, uint32_
         if (t == napi_function) {
             napi_value arg = self->wrapResource(res, st->name);
             napi_value result;
-            if (napi_call_function(env, handler, bindFn, 1, &arg, &result) != napi_ok)
-                napi_get_and_clear_last_exception(env, &result);
+            napi_call_function(env, handler, bindFn, 1, &arg, &result);
+            std::string detail;
+            if (overdraw::napi::takePendingJsException(env, &detail)) {
+                LOG_ERR(Wayland, "handler {}.bind threw: {}", st->name, detail);
+            }
         }
     }
     napi_close_handle_scope(env, scope);
@@ -598,35 +602,10 @@ int Trampoline::onDispatch(const void* implData, void* target, uint32_t opcode,
     }
 
     napi_value result;
-    napi_status s = napi_call_function(env, handler, method, jsArgs.size(), jsArgs.data(), &result);
-    if (s != napi_ok) {
-        napi_value ex;
-        if (napi_get_and_clear_last_exception(env, &ex) == napi_ok) {
-            // Surface the actual error: prefer the stack (message + trace),
-            // fall back to coercing the thrown value to a string.
-            auto toStr = [&](napi_value v) -> std::string {
-                napi_value str;
-                if (napi_coerce_to_string(env, v, &str) != napi_ok) {
-                    napi_value pending;
-                    napi_get_and_clear_last_exception(env, &pending);
-                    return "";
-                }
-                size_t len = 0;
-                napi_get_value_string_utf8(env, str, nullptr, 0, &len);
-                std::string out;
-                out.resize(len);
-                size_t got = 0;
-                napi_get_value_string_utf8(env, str, out.data(), len + 1, &got);
-                return out;
-            };
-            std::string detail;
-            napi_value stack;
-            napi_valuetype t = napi_undefined;
-            if (napi_get_named_property(env, ex, "stack", &stack) == napi_ok) {
-                napi_typeof(env, stack, &t);
-                if (t == napi_string) detail = toStr(stack);
-            }
-            if (detail.empty()) detail = toStr(ex);
+    napi_call_function(env, handler, method, jsArgs.size(), jsArgs.data(), &result);
+    {
+        std::string detail;
+        if (overdraw::napi::takePendingJsException(env, &detail)) {
             LOG_ERR(Wayland, "handler {}.{} threw: {}", st->name, msg->name, detail);
         }
     }

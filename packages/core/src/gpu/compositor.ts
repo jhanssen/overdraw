@@ -1360,7 +1360,9 @@ export class JsCompositor implements CompositorSink {
   // renderFrame renders every entry per frame into its own target. Empty input
   // is ignored (keeps the existing single primary rather than blanking output).
   setOutputs(outputs: ReadonlyArray<OutputGeom>): void {
-    if (outputs.length === 0) return;
+    // An empty set is legal: the last real output was unplugged. Clearing
+    // outputsGeom lets the residency diff emit wl_surface.leave for it;
+    // rendering idles until an OutputAdded repopulates the set.
     this.outputsGeom.clear();
     for (const o of outputs) {
       const scale = o.scale > 0 ? o.scale : 1;

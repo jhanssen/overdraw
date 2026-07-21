@@ -91,6 +91,18 @@ function makeState({ withWm = true, withEvents = false } = {}) {
     compositor,
     wlOutputResources: new Map(),
     relayout: (reason) => relayoutCalls.push(reason),
+    // Mirrors production: installProtocols always seeds the virtual
+    // fallback output. pushOutputsToLayers hands it to the WM when the
+    // last real output is removed.
+    fallbackOutput: {
+      id: -1,
+      logicalPosition: { x: 0, y: 0 },
+      logicalSize: { width: 0, height: 0 },
+      deviceSize: { width: 0, height: 0 },
+      scale: 1, name: "__fallback__", description: "overdraw fallback output",
+      refreshMhz: 0, transform: 0, physicalWidthMm: 0, physicalHeightMm: 0,
+      make: "overdraw", model: "overdraw", edidId: "",
+    },
   };
   const relayoutCalls = [];
 
@@ -419,4 +431,129 @@ test('OutputRemoved: state.wlOutputResources entry for X is cleared', () => {
   onRemoved({ outputId: 0 });
   assert.equal(fixture.state.wlOutputResources.has(0), false,
     "wlOutputResources[0] cleared so a future bind at the reused dense id starts clean");
+});
+
+// -- Last-output removal: the WM must receive the virtual fallback --
+//
+// The WM's setOutputs throws on an empty set (it requires >= 1 output at
+// all times). Unplugging the only monitor must therefore hand it the
+// virtual fallback output, and the removal pipeline must run to
+// completion -- a throw here is what once left the compositor unable to
+// process the monitor's re-add.
+
+function seedOnlyOutput(fixture) {
+  fixture.state.outputs.set(0, {
+    id: 0, name: "HDMI-A-1",
+    logicalPosition: { x: 0, y: 0 },
+    logicalSize: { width: 2560, height: 1440 },
+    deviceSize: { width: 3840, height: 2160 },
+    scale: 1.5, description: "HDMI-A-1", refreshMhz: 59996, transform: 0,
+    physicalWidthMm: 697, physicalHeightMm: 392, make: "t", model: "HDMI-A-1",
+    edidId: "TST-0001-00000000",
+  });
+}
+
+// A WM mock that enforces the real contract, so these tests prove the
+// fallback (not an empty set) is what reaches it.
+function contractWm(calls) {
+  return {
+    setOutputs(outs) {
+      if (outs.length === 0) throw new Error("setOutputs: outputs must be non-empty");
+      calls.push(outs.map((o) => ({ ...o })));
+    },
+  };
+}
+
+test('OutputRemoved: last output hands the virtual fallback to the WM', () => {
+  const { deps, fixture, addon, pluginBus, logCalls } = makeDeps();
+  seedOnlyOutput(fixture);
+  const wmCalls = [];
+  fixture.state.wm = contractWm(wmCalls);
+
+  const onRemoved = makeOnOutputRemoved(deps);
+  onRemoved({ outputId: 0 });  // must not throw
+
+  assert.equal(wmCalls.length, 1, "wm.setOutputs called once");
+  assert.equal(wmCalls[0].length, 1);
+  assert.equal(wmCalls[0][0].id, -1, "WM received the fallback output");
+
+  // The compositor sink saw the raw empty set (the fallback never renders;
+  // clearing the geometry is what lets the residency diff emit leave).
+  assert.deepEqual(fixture.setOutputsCalls.at(-1), []);
+
+  // The removal pipeline ran to completion.
+  assert.ok(addon.calls.find(([n]) => n === "destroyGlobalForOutput"),
+    "wl_output global destroyed");
+  assert.ok(addon.calls.find(([n]) => n === "releaseScanoutForOutput"),
+    "scanout released");
+  assert.ok(pluginBus.events.find((e) => e.name === "output.removed"),
+    "output.removed emitted");
+  assert.ok(logCalls.find(([lvl, m]) => lvl === "info" && m.includes("output 0 removed")),
+    "removal logged");
+  assert.equal(fixture.state.outputs.size, 0);
+});
+
+test('OutputAdded after last-removal: WM gets the real output back (no fallback)', () => {
+  const { deps, fixture } = makeDeps();
+  seedOnlyOutput(fixture);
+  const wmCalls = [];
+  fixture.state.wm = contractWm(wmCalls);
+
+  makeOnOutputRemoved(deps)({ outputId: 0 });
+  makeOnOutputAdded(deps)(descriptor(0, "HDMI-A-1", 3840, 2160));
+
+  assert.equal(wmCalls.length, 2);
+  const last = wmCalls.at(-1);
+  assert.equal(last.length, 1, "exactly one WM output after re-add");
+  assert.equal(last[0].id, 0, "the real output replaced the fallback");
+});
+
+test('pushOutputsToLayers: empty set without a fallbackOutput skips the WM push', () => {
+  // Pre-installProtocols there is no fallback; the WM (if any) must not be
+  // handed an empty set.
+  const { deps, fixture } = makeDeps();
+  seedOnlyOutput(fixture);
+  fixture.state.fallbackOutput = undefined;
+  const wmCalls = [];
+  fixture.state.wm = contractWm(wmCalls);
+
+  makeOnOutputRemoved(deps)({ outputId: 0 });  // must not throw
+  assert.equal(wmCalls.length, 0, "wm.setOutputs not called with nothing to push");
+});
+
+// -- JsCompositor.setOutputs must accept the empty set --
+//
+// hotplug.ts's removal pipeline requires outputsGeom to have dropped the
+// removed output BEFORE updateAllSurfaceResidency runs, or the diff can
+// never emit wl_surface.leave for it. That includes the last output.
+
+test('JsCompositor.setOutputs([]) clears outputsGeom', () => {
+  const c = Object.create(JsCompositor.prototype);
+  c.outputsGeom = new Map([[0, {
+    id: 0, deviceWidth: 3840, deviceHeight: 2160,
+    logicalX: 0, logicalY: 0, scale: 1.5,
+  }]]);
+  c.cameras = new Map([[0, { x: 10, y: 20, zoom: 2 }]]);
+  c.hwCursorCaps = new Map();
+  c.hwCursorActive = new Map();
+  c.hwCursorLastSent = new Map();
+  c.hwCursorHotspotDev = new Map();
+  c.cursorShapeResolver = undefined;
+  c.cursorTargetSurfaceId = null;
+  c.internalCursorSurfaceId = null;
+  c.hwCursorEnabled = false;
+  const damageCalls = [];
+  c.outputDamage = {
+    setOutputs: (b) => damageCalls.push(["setOutputs", b]),
+    setCamera: (...a) => damageCalls.push(["setCamera", a]),
+    full: () => damageCalls.push(["full"]),
+  };
+
+  c.setOutputs([]);
+
+  assert.equal(c.outputsGeom.size, 0, "outputsGeom cleared");
+  assert.equal(c.cameras.size, 0, "cameras for vanished outputs dropped");
+  const damageSet = damageCalls.find(([n]) => n === "setOutputs");
+  assert.ok(damageSet, "damage map updated");
+  assert.deepEqual(damageSet[1], [], "damage map sees the empty set");
 });
