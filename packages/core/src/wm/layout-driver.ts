@@ -180,9 +180,13 @@ export function createLayoutDriver(deps: LayoutDriverDeps): LayoutDriver {
         }
 
         // First pass: find an exclusive (maximized or fullscreen) window.
-        // If one exists and is visible, it owns the island and every peer
-        // (except a fullscreen-on-top floating, which is also owned out of
-        // the way) is suppressed from this frame.
+        // If one exists and is visible, it owns the island: it gets the
+        // whole-glass (fullscreen) or workarea (maximized) rect, and
+        // pushStack keeps peers out of the draw stack. Peers still get
+        // their NORMAL layout below -- suppression is a stacking concern,
+        // not a geometry one. A window mapping while the island is owned
+        // must still receive its first rect, or it cannot be focus-
+        // revealed, hit-tested, or shown on fullscreen exit.
         let exclusiveWin: LayoutSnapshotWindow | null = null;
         for (const w of bucket) {
           if (!w.visible) continue;
@@ -207,8 +211,6 @@ export function createLayoutDriver(deps: LayoutDriverDeps): LayoutDriver {
                 }
               : outputRect;
           resolvedRects.push({ id: exclusiveWin.id, outer });
-          for (const r of resolvedRects) mergedRects.push(r);
-          continue;
         }
 
         for (const w of bucket) {
@@ -219,7 +221,11 @@ export function createLayoutDriver(deps: LayoutDriverDeps): LayoutDriver {
           // filtered by visibility in the workspace plugin) ensures it is
           // not drawn.
           if (!w.visible) continue;
+          const isExclusive = exclusiveWin !== null && w.id === exclusiveWin.id;
           if (w.tiling === "floating") {
+            // The exclusive window's rect is already resolved above; a
+            // second (stored-rect) entry would win at apply time.
+            if (isExclusive) continue;
             // Floating windows keep their stored rect. Fall back to the
             // window's currentRect if none was captured, then to the
             // output rect so the window never vanishes.
@@ -229,6 +235,9 @@ export function createLayoutDriver(deps: LayoutDriverDeps): LayoutDriver {
             });
             continue;
           }
+          // A managed exclusive window stays IN the compute so it keeps
+          // occupying its slot (no peer reflow on fullscreen exit); its
+          // slot rect is dropped at merge in favor of the override.
           // Managed lane: hand to the plugin.
           managed.push({
             id: w.id,
@@ -265,7 +274,10 @@ export function createLayoutDriver(deps: LayoutDriverDeps): LayoutDriver {
           }
         }
 
-        for (const r of pluginResult.rects) mergedRects.push(r);
+        for (const r of pluginResult.rects) {
+          if (exclusiveWin !== null && r.id === exclusiveWin.id) continue;
+          mergedRects.push(r);
+        }
         for (const r of resolvedRects) mergedRects.push(r);
       }
 

@@ -68,19 +68,27 @@ test('all managed: plugin gets every window; tile region = full output', async (
   assert.equal(target.calls[0].result.rects.length, 2);
 });
 
-test('maximized (exclusive) window: resolved to tile region without calling plugin', async () => {
+test('maximized (exclusive) window: resolved to tile region (override wins over its slot)', async () => {
   const target = captureTarget();
   let computeCalls = 0;
   const driver = createLayoutDriver({
     snapshot: () => snap([{ id: 1, role: 'toplevel', exclusive: 'maximized' }]),
     target,
-    compute: async () => { computeCalls++; return { rects: [] }; },
+    // The plugin still runs (peers keep their layout; the exclusive
+    // window occupies its slot) -- but its slot rect for the exclusive
+    // window is dropped in favor of the override.
+    compute: async (inputs) => {
+      computeCalls++;
+      return { rects: inputs.windows.map((w) => ({ id: w.id, outer: { x: 1, y: 2, width: 3, height: 4 } })) };
+    },
   });
   driver.schedule('mapped');
   await driver.settled();
-  assert.equal(computeCalls, 0); // exclusive window present -> plugin not called
+  assert.equal(computeCalls, 1);
   assert.equal(target.calls[0].result.rects.length, 1);
-  // Without reserved zones, maximized = full output.
+  assert.equal(target.calls[0].result.rects[0].id, 1);
+  // Without reserved zones, maximized = full output -- the plugin's slot
+  // rect for the exclusive window never reaches apply.
   assert.deepEqual(target.calls[0].result.rects[0].outer,
     { x: 0, y: 0, width: 1000, height: 600 });
 });
@@ -90,10 +98,12 @@ test('fullscreen window: resolved to full output rect', async () => {
   const driver = createLayoutDriver({
     snapshot: () => snap([{ id: 1, role: 'toplevel', exclusive: 'fullscreen' }]),
     target,
-    compute: async () => { throw new Error('plugin should not be called'); },
+    compute: async (inputs) =>
+      ({ rects: inputs.windows.map((w) => ({ id: w.id, outer: { x: 9, y: 9, width: 9, height: 9 } })) }),
   });
   driver.schedule('mapped');
   await driver.settled();
+  assert.equal(target.calls[0].result.rects.length, 1);
   assert.deepEqual(target.calls[0].result.rects[0].outer,
     { x: 0, y: 0, width: 1000, height: 600 });
 });
@@ -114,9 +124,9 @@ test('invisible window: omitted from rects[] (no draw this frame)', async () => 
   assert.equal(target.calls[0].result.rects.length, 0);
 });
 
-test('exclusive suppresses peers on the same output', async () => {
+test('exclusive override coexists with peer layout on the same output', async () => {
   const target = captureTarget();
-  let computeCalls = 0;
+  let computeWindows = null;
   const driver = createLayoutDriver({
     snapshot: () => snap([
       managedWin(1),
@@ -124,18 +134,24 @@ test('exclusive suppresses peers on the same output', async () => {
       managedWin(3),
     ]),
     target,
-    compute: async () => {
-      computeCalls++;
-      return { rects: [] };
+    compute: async (inputs) => {
+      computeWindows = inputs.windows.map((w) => w.id);
+      return { rects: inputs.windows.map((w) => ({ id: w.id, outer: { x: 5, y: 5, width: 100, height: 100 } })) };
     },
   });
   driver.schedule('mapped');
   await driver.settled();
-  // Plugin not called: an exclusive window owns the workspace.
-  assert.equal(computeCalls, 0);
-  // Result has ONLY the exclusive window.
-  assert.equal(target.calls[0].result.rects.length, 1);
-  assert.equal(target.calls[0].result.rects[0].id, 2);
+  // Peers still get their layout (suppression is a stacking concern, not
+  // geometry: a window mapping under an exclusive owner needs a rect for
+  // focus-reveal / hit-testing). The exclusive window stays in the
+  // compute (it keeps occupying its slot) but its slot rect is replaced
+  // by the override.
+  assert.deepEqual(computeWindows, [1, 2, 3]);
+  const rects = target.calls[0].result.rects;
+  const byId = new Map(rects.map((r) => [r.id, r.outer]));
+  assert.deepEqual([...byId.keys()].sort(), [1, 2, 3]);
+  assert.deepEqual(byId.get(2), { x: 0, y: 0, width: 1000, height: 600 });
+  assert.deepEqual(byId.get(1), { x: 5, y: 5, width: 100, height: 100 });
 });
 
 test('reserved zones: exclusive=maximized + tileRegion both honor them', async () => {

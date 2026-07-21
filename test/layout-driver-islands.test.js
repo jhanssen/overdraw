@@ -111,7 +111,10 @@ test('fullscreen on an explicit island covers the glass: island origin shifted b
       [{ ...managedWin(1), exclusive: 'fullscreen' }]),
     target,
     reservedZones: zones,
-    compute: async () => { throw new Error('exclusive islands never reach the plugin'); },
+    // The compute still runs (the exclusive member keeps occupying its
+    // slot); its slot rect is replaced by the glass-covering override.
+    compute: async (inputs) =>
+      ({ rects: inputs.windows.map((w) => ({ id: w.id, outer: { x: 1, y: 1, width: 1, height: 1 } })) }),
   });
   driver.schedule('mapped');
   await driver.settled();
@@ -144,12 +147,14 @@ test('exclusive window owns only its island; the sibling island still tiles', as
   driver.schedule('mapped');
   await driver.settled();
 
-  // Island A resolves in core (maximized covers the island; peer 2
-  // suppressed); only island B reaches the plugin.
-  assert.deepEqual(computeCalls, [11]);
+  // Both islands reach the plugin: peers of an exclusive owner still get
+  // their layout (suppression is a stacking concern, not geometry). The
+  // exclusive window's slot rect from island A's compute is replaced by
+  // the island-covering override.
+  assert.deepEqual(computeCalls, [10, 11]);
   const rects = target.calls[0].result.rects;
   const ids = rects.map((r) => r.id).sort();
-  assert.deepEqual(ids, [1, 3]);
+  assert.deepEqual(ids, [1, 2, 3]);
   // Maximized covers the ISLAND rect, not the whole output.
   assert.deepEqual(rects.find((r) => r.id === 1).outer, islandA.rect);
 });

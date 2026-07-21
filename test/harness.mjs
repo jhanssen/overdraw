@@ -27,6 +27,7 @@ import { selectBundledPlugins, bundledToResolved } from "../packages/core/dist/p
 import { DynamicBus } from "../packages/core/dist/events/dynamic-bus.js";
 import { createCompositorBus } from "../packages/core/dist/events/window-bus.js";
 import { WINDOW_EVENT } from "../packages/core/dist/events/types.js";
+import { KEYBOARD_EVENT } from "../packages/core/dist/events/window-bus.js";
 import { createWindowsBroker, NOT_HANDLED as WINDOWS_NOT_HANDLED }
   from "../packages/core/dist/plugins/windows-broker.js";
 import { createInputBroker, NOT_HANDLED as INPUT_NOT_HANDLED }
@@ -349,6 +350,9 @@ export async function setupCompositor(opts = {}) {
       },
     }),
   });
+  // Keyboard focus reaches the WM (focusReveal / exclusive dominance) via
+  // this bus subscription; mirrors main.ts.
+  coreBus.on(KEYBOARD_EVENT.focus, (ev) => { state?.wm?.setKeyboardFocus(ev.surfaceId); });
 
   // Hand the compositor the subsurface tree so it derives child placement +
   // cascades fx (matches main.ts). Without this, subsurfaces never get a rect.

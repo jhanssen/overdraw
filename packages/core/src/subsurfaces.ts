@@ -253,7 +253,10 @@ export function effectiveStackZ(w: WmWindowLike): number {
   // a DIFFERENT window holding exclusive) outranks the exclusive tier, so
   // cycling focus away from a fullscreen window reveals the focused one.
   if (w.focusReveal) return (w.z ?? 0) + 0x60000000;
-  const boost = (w.windowState?.exclusive ?? "none") !== "none" ? 0x40000000 : 0;
+  // Dominance follows focus: only a FOCUSED exclusive window (WM-stamped
+  // exclusiveDominant) outranks its peers; unfocused it stacks normally
+  // so the island around it stays visible and hit-testable.
+  const boost = (w.exclusiveDominant ?? false) ? 0x40000000 : 0;
   return (w.z ?? 0) + boost;
 }
 
@@ -303,8 +306,11 @@ export interface WmWindowLike {
   contentGateOwners?: ReadonlySet<string>;
   decorationSurfaceId?: number;
   z?: number;
-  // Behavioral state; effectiveStackZ boosts exclusive windows above
-  // every non-exclusive z tier.
+  // WM-stamped: exclusive AND keyboard-focused. effectiveStackZ boosts
+  // only dominant exclusive windows above the non-exclusive z tiers.
+  exclusiveDominant?: boolean;
+  // Behavioral state; effectiveStackZ reads focusReveal/exclusiveDominant
+  // rather than raw exclusive.
   windowState?: { exclusive?: "none" | "maximized" | "fullscreen" };
   // Stamped by the WM when this window is keyboard-focused and a DIFFERENT
   // window on its output holds exclusive: the focused window draws above

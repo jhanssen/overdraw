@@ -49,7 +49,12 @@ test('focus on a fullscreen peer sets focusReveal and re-pushes the stack', asyn
   const { wm, sink } = makeWmWithTwoWindows();
   await wm.propose(1, { exclusive: 'fullscreen' }, 'client-request');
 
-  // Fullscreen window owns the output: the fallback stack drops window 2.
+  // Dominance follows focus: unfocused fullscreen suppresses nothing.
+  assert.ok(sink.stacks.at(-1).includes(2),
+    'peer stays in the stack while the fullscreen window is unfocused');
+
+  // Focusing the fullscreen window engages dominance: peer dropped.
+  wm.setKeyboardFocus(1);
   assert.deepEqual(sink.stacks.at(-1), [1]);
 
   wm.setKeyboardFocus(2);
@@ -61,7 +66,7 @@ test('focus on a fullscreen peer sets focusReveal and re-pushes the stack', asyn
   assert.ok(effectiveStackZ(winOf(wm, 2)) > effectiveStackZ(winOf(wm, 1)));
 });
 
-test('focus back on the fullscreen window clears the reveal', async () => {
+test('focus back on the fullscreen window clears the reveal and re-engages dominance', async () => {
   const { wm, sink } = makeWmWithTwoWindows();
   await wm.propose(1, { exclusive: 'fullscreen' }, 'client-request');
   wm.setKeyboardFocus(2);
@@ -85,7 +90,10 @@ test('focus on a non-window surface (e.g. a layer shell id) clears the reveal', 
   wm.setKeyboardFocus(2);
   wm.setKeyboardFocus(777);
   assert.equal(winOf(wm, 2).focusReveal, false);
-  assert.deepEqual(sink.stacks.at(-1), [1]);
+  // Focus left the island entirely: the fullscreen window is not dominant
+  // either, so nothing is suppressed and nothing is revealed.
+  assert.ok(sink.stacks.at(-1).includes(1) && sink.stacks.at(-1).includes(2),
+    'no dominance and no reveal with focus outside the island');
 });
 
 test('no exclusive window anywhere: focus changes do not re-push the stack', async () => {

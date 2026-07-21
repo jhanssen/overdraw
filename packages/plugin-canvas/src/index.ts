@@ -363,7 +363,14 @@ async function activate(
     const changed = Array.isArray(p.changed) ? p.changed as unknown[] : [];
     if (!changed.includes("activated")) return;
     if (p.activated) {
+      const prevFocused = focusedSurfaceId;
       focusedSurfaceId = p.surfaceId;
+      // Dominance follows focus: focus moving onto or off an exclusive
+      // member engages/releases the island collapse -- re-solve.
+      if (exclusiveMembers.has(p.surfaceId)
+          || (prevFocused !== null && exclusiveMembers.has(prevFocused))) {
+        void publishWorld();
+      }
       // Resolve surface -> workspace -> output. If the surface isn't
       // tracked (unmapped, layer-shell, popup) leave the cache as-is.
       const handle = state.surfaceToHandle.get(p.surfaceId);
@@ -440,10 +447,22 @@ async function activate(
   // life, not only before it maps). window.committed is the observe-only
   // signal for behavioral-state commits.
   const MEASURED_FIELDS = ["tiling", "exclusive", "visible", "constraints"];
+  // Members currently holding exclusive != none, tracked from committed
+  // events so focus edges can tell when dominance flips (collapse follows
+  // the FOCUSED exclusive member; see tiledMembers).
+  const exclusiveMembers = new Set<number>();
   sdk.events.subscribe("window.committed", (_name, payload) => {
     if (!worldMode || !payload || typeof payload !== "object") return;
-    const p = payload as { surfaceId?: unknown; changed?: unknown };
+    const p = payload as { surfaceId?: unknown; changed?: unknown;
+                           current?: { exclusive?: unknown } };
     if (typeof p.surfaceId !== "number" || !Array.isArray(p.changed)) return;
+    if (p.changed.includes("exclusive")) {
+      if (p.current?.exclusive !== undefined && p.current.exclusive !== "none") {
+        exclusiveMembers.add(p.surfaceId);
+      } else {
+        exclusiveMembers.delete(p.surfaceId);
+      }
+    }
     if (!p.changed.some((f) => MEASURED_FIELDS.includes(f as string))) return;
     if (!state.surfaceToHandle.has(p.surfaceId)) return;
     void publishWorld();
@@ -1067,12 +1086,14 @@ async function activate(
   }
 
   // The members the layout will tile, mirroring the driver's compute()
-  // lane filter: managed, non-exclusive, visible. Returns null when an
-  // exclusive (maximized / fullscreen) member collapses the island to
-  // the workarea -- a maximize covers the usable glass, not a
-  // multi-screen strip. A member without a WM snapshot counts for
-  // nothing: undersizing (workarea-width island) is always recoverable,
-  // oversizing stretches windows past the output.
+  // lane filter: managed, visible. Returns null when a FOCUSED exclusive
+  // (maximized / fullscreen) member collapses the island to the workarea
+  // -- a maximize covers the usable glass, not a multi-screen strip.
+  // Exclusive dominance follows focus: an unfocused fullscreen member
+  // keeps its state but the strip stays a strip, so the user can work in
+  // (and launch into) the rest of the island. A member without a WM
+  // snapshot counts for nothing: undersizing (workarea-width island) is
+  // always recoverable, oversizing stretches windows past the output.
   function tiledMembers(
     members: ReadonlyArray<number>,
     snapById: Map<number, WindowSnapshotLike>,
@@ -1082,7 +1103,10 @@ async function activate(
       const ws = snapById.get(id)?.windowState;
       if (!ws) continue;
       if (!ws.visible) continue;
-      if (ws.exclusive !== "none") return null;
+      if (ws.exclusive !== "none") {
+        if (id === focusedSurfaceId) return null;
+        continue;  // unfocused exclusive: not tiled, not collapsing
+      }
       if (ws.tiling === "managed") tiled.push(id);
     }
     return tiled;

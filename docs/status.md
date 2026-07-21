@@ -6,7 +6,17 @@ test counts, and historical rationale live in `status-detailed.md`. This
 file is the short read; consult the detailed doc when investigating a
 specific subsystem.
 
-Last updated: 2026-07-20. Recent landings: fullscreen-flap fixes (an X11
+Last updated: 2026-07-20. Recent landings: exclusive dominance follows
+focus (a fullscreen/maximized window dominates its island -- topmost
+stacking, canvas island collapse -- only while keyboard-focused; unfocused
+it keeps its exclusive state and rect but the island stays a usable strip:
+peers keep their layout, newly-mapped windows get their first rect --
+suppression is a stacking concern, not geometry -- and focus-cycling
+reveals them above the fullscreen window. WM stamps exclusiveDominant
+alongside focusReveal; effectiveStackZ and the canvas collapse consume it.
+The harness now wires KEYBOARD_EVENT.focus into wm.setKeyboardFocus like
+production -- focusReveal/dominance was previously untestable in GPU
+tests). Prior: fullscreen-flap fixes (an X11
 game declaring fullscreen pre-map flapped exclusive none<->fullscreen and
 often settled decorated/tiled: markInitialCommitComplete committed its
 stale pre-round-trip snapshot over the synchronously-stamped fullscreen --

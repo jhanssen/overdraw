@@ -124,6 +124,14 @@ export interface Window {
   // Maintained by updateFocusReveal (recomputed on every stack push and
   // on setKeyboardFocus).
   focusReveal?: boolean;
+  // True while this window holds exclusive !== "none" AND keyboard focus.
+  // Exclusive DOMINANCE follows focus: only a focused exclusive window
+  // suppresses its island peers from the draw stack and outranks them in
+  // effectiveStackZ. Unfocused, it keeps its exclusive STATE (the client
+  // stays fullscreen; the layout override rect stays) but stacks like a
+  // normal window, so the rest of the island is visible and usable.
+  // Maintained by updateFocusReveal alongside focusReveal.
+  exclusiveDominant?: boolean;
   // Per-window mutation queue. Async operations on win.windowState
   // (propose, markInitialCommitComplete) chain on this so a second call
   // doesn't read stale state mid-microtask from an in-flight first call.
@@ -1157,12 +1165,11 @@ export function createWm(
     updateFocusReveal();
     if (rebuild) { rebuild(); return; }
     const ids: number[] = [];
-    // When some window on a workspace has exclusive !== "none", it owns
-    // the workspace and every peer is omitted from the draw stack
-    // (matches the layout-driver's resolver, which only emits a rect
-    // for the exclusive window on that output) -- except a focusReveal
-    // peer, which draws above it. Invisible windows (visible === false)
-    // are also omitted regardless.
+    // A FOCUSED exclusive window (exclusiveDominant) owns its workspace:
+    // every peer is omitted from the draw stack except a focusReveal
+    // peer, which draws above it. An unfocused exclusive window keeps
+    // its state and rect but suppresses nothing. Invisible windows
+    // (visible === false) are omitted regardless.
     const exclusiveByOutput = exclusiveWindowsByOutput();
     const revealed: number[] = [];
     for (const w of windows) {
@@ -1171,12 +1178,20 @@ export function createWm(
       const ownerOutput = outputOf(w.surfaceId);
       if (ownerOutput !== null) {
         const exclusiveId = exclusiveByOutput.get(ownerOutput);
+        // Peers are omitted only while the owner is DOMINANT (focused):
+        // an unfocused fullscreen window keeps its state and rect but the
+        // rest of the island stays in the stack and usable. A focusReveal
+        // peer always appends after the main pass -- the exclusive
+        // window's glass-sized rect overlaps it regardless of dominance.
+        const owner = exclusiveId !== undefined
+          ? windows.find((x) => x.surfaceId === exclusiveId) : undefined;
         if (exclusiveId !== undefined && exclusiveId !== w.surfaceId) {
-          if (!w.focusReveal) continue;
-          // Above the exclusive window: append after the main pass.
-          if (w.decorationSurfaceId !== undefined) revealed.push(w.decorationSurfaceId);
-          revealed.push(w.surfaceId);
-          continue;
+          if (w.focusReveal) {
+            if (w.decorationSurfaceId !== undefined) revealed.push(w.decorationSurfaceId);
+            revealed.push(w.surfaceId);
+            continue;
+          }
+          if (owner?.exclusiveDominant ?? false) continue;
         }
       }
       if (w.decorationSurfaceId !== undefined) ids.push(w.decorationSurfaceId);
@@ -1205,6 +1220,15 @@ export function createWm(
       }
       if ((w.focusReveal ?? false) !== reveal) {
         w.focusReveal = reveal;
+        changed = true;
+      }
+      // Dominance follows focus: exclusive state alone does not suppress
+      // peers -- only the focused exclusive window owns its island.
+      const dominant = w.windowState.exclusive !== "none"
+        && w.windowState.visible
+        && w.surfaceId === focusedWindowId;
+      if ((w.exclusiveDominant ?? false) !== dominant) {
+        w.exclusiveDominant = dominant;
         changed = true;
       }
     }
