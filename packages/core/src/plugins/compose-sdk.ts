@@ -230,7 +230,10 @@ export function createInThreadCompose(
           const reg = windowRegion(w.id);
           if (!reg) continue;
           const rect = { x: reg.x, y: reg.y, w: reg.w, h: reg.h };
-          const cr = composeRegion({ drawList: flattenWindows([w.id]), region: rect, scale: reg.scale });
+          // effects: false -- a per-window crop captures the window's own
+          // pixels; backdrop effects belong to scene composes.
+          const cr = composeRegion({ drawList: flattenWindows([w.id]),
+            region: rect, scale: reg.scale, effects: false });
           results.push({ id: w.id, texture: cr.texture, rect });
         }
         let releasedR = false;

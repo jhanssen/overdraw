@@ -430,6 +430,19 @@ export interface CompositorSink {
   // optional alpha mask. null = rectangle (default; shader early-out).
   // Radii are in surface LOGICAL pixels.
   setSurfaceShape?(id: number, shape: import("../gpu/compositor.js").SurfaceShape): void;
+  // Backdrop effect: the surface composites over a renderer-transformed
+  // copy of everything below it in the draw order (e.g. kind "blur").
+  // null clears. The kind must have a renderer registered via
+  // registerBackdropEffectRenderer; renderers run mid-composite on the
+  // core thread + core device, so only core itself and in-thread plugins
+  // can register one (Worker plugins cannot).
+  setSurfaceBackdropEffect?(
+    id: number, e: import("../gpu/compositor.js").SurfaceBackdropEffect | null,
+  ): void;
+  registerBackdropEffectRenderer?(
+    kind: string, r: import("../gpu/compositor.js").BackdropEffectRenderer,
+  ): void;
+  unregisterBackdropEffectRenderer?(kind: string): void;
   // Subsurface positioning + fx cascade. The compositor derives each subsurface's
   // absolute placement (parent rect + offset) and cascades per-surface fx over
   // the subtree, so no caller enumerates subsurfaces. The accessor is the only
@@ -504,13 +517,16 @@ export interface CompositorSink {
   // for screen capture. Returns null for an unknown output. Caller owns the
   // texture.
   composeOutput?(outputId: number): { texture: GPUTexture; outW: number; outH: number } | null;
-  // Compose an explicit flattened draw list (a window's toplevel + decoration
-  // + subsurfaces) covering a global-logical region into a device-resolution
-  // texture, for single-window screen capture. Caller owns the texture.
+  // Compose an explicit flattened draw list covering a global-logical region
+  // into a device-resolution texture (scene composes and single-window
+  // capture crops alike). Backdrop effects default ON so a scene compose
+  // matches the screen; content-crop callers pass effects: false. Caller
+  // owns the texture.
   composeRegion?(args: {
     drawList: ReadonlyArray<number>;
     region: { x: number; y: number; w: number; h: number };
     scale: number;
+    effects?: boolean;
   }): { texture: GPUTexture; outW: number; outH: number };
   // Live scene: re-renders every frame at device resolution; getDrawList is
   // re-evaluated each frame so subsurfaces committed after registration are

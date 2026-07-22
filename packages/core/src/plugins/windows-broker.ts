@@ -107,6 +107,7 @@ export function createWindowsBroker(deps: WindowsBrokerDeps): WindowsBroker {
     if (method === "windows.set-shape") return handleSetShape(params);
     if (method === "windows.set-tint") return handleSetTint(params);
     if (method === "windows.set-color-matrix") return handleSetColorMatrix(params);
+    if (method === "windows.set-backdrop-effect") return handleSetBackdropEffect(params);
     if (method === "windows.destroy-phantom") return handleDestroyPhantom(params);
     if (method === "windows.release-opening-gate") return handleReleaseOpeningGate(params);
     return NOT_HANDLED;
@@ -166,6 +167,20 @@ export function createWindowsBroker(deps: WindowsBrokerDeps): WindowsBroker {
     }
     // Cascades over the window group; see handleSetTint.
     compositor.setSurfaceColorMatrix(p.id, p.m);
+    return null;
+  }
+
+  function handleSetBackdropEffect(p: unknown): null {
+    if (!isSetBackdropEffectPayload(p)) {
+      throw new Error("windows.set-backdrop-effect: malformed payload");
+    }
+    if (!compositor.setSurfaceBackdropEffect) {
+      throw new Error("windows.set-backdrop-effect: not supported by this compositor");
+    }
+    // No group cascade: the effect transforms the backdrop of the ONE
+    // surface; cascading over subsurfaces/decoration would re-process
+    // inside the window.
+    compositor.setSurfaceBackdropEffect(p.id, p.e);
     return null;
   }
 
@@ -854,6 +869,24 @@ function isSetColorMatrixPayload(d: unknown): d is {
   if (m.length !== 16) return false;
   for (let i = 0; i < 16; i++) {
     const v = m[i];
+    if (typeof v !== "number" || !Number.isFinite(v)) return false;
+  }
+  return true;
+}
+
+function isSetBackdropEffectPayload(d: unknown): d is {
+  id: number; e: import("../gpu/compositor.js").SurfaceBackdropEffect | null;
+} {
+  if (typeof d !== "object" || d === null) return false;
+  const o = d as { [k: string]: unknown };
+  if (typeof o.id !== "number") return false;
+  if (o.e === null) return true;
+  if (typeof o.e !== "object" || o.e === null) return false;
+  const e = o.e as { [k: string]: unknown };
+  if (typeof e.kind !== "string" || e.kind.length === 0) return false;
+  if (e.params === undefined) return true;
+  if (typeof e.params !== "object" || e.params === null) return false;
+  for (const v of Object.values(e.params)) {
     if (typeof v !== "number" || !Number.isFinite(v)) return false;
   }
   return true;

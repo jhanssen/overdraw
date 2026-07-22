@@ -156,6 +156,19 @@ sdk.windows.setMask(id, texture | null): Promise<void>
 sdk.windows.setTransform(id, { translate, scale, rotate? }): Promise<void>
 sdk.windows.setOutputMargin(id, { top, right, bottom, left }): Promise<void>
 
+// Backdrop effect: the window composites over a renderer-transformed copy
+// of the content BELOW it (frosted-glass blur etc.); the window's own alpha
+// decides how much shows through, and its shape clips the effect. `kind`
+// names a renderer registered with the compositor ("blur" is built in;
+// in-thread plugins register more via sdk.gpu.registerBackdropEffect —
+// renderers encode into core's frame mid-composite, so Worker plugins
+// cannot register one). Applies wherever a scene is composited: on-screen
+// frames, screen capture, compose scenes (snapshot + live) and transition
+// frames all route through the same scene compositor. Per-window content
+// crops (compose.windows, freeze snapshots, closing phantoms) capture the
+// window's own pixels without it.
+sdk.windows.setBackdropEffect(id, { kind, params? } | null): Promise<void>
+
 // State requests originating from clients (xdg_toplevel) or other plugins
 // — stored as opaque per-window state; layout/policy plugins read these as hints
 sdk.windows.setFloating(id, boolean): Promise<void>

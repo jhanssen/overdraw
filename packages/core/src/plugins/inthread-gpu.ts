@@ -311,6 +311,20 @@ export function createInThreadGpu(
     listOutputs(): Promise<OutputInfo[]> {
       return Promise.resolve(deps.listOutputs?.() ?? []);
     },
+    // Direct sink call: in-thread plugins share the core device and
+    // thread, which is exactly what a mid-composite renderer requires.
+    registerBackdropEffect(kind, renderer): Promise<void> {
+      if (!compositor.registerBackdropEffectRenderer) {
+        return Promise.reject(
+          new Error("registerBackdropEffect: not supported by this compositor"));
+      }
+      compositor.registerBackdropEffectRenderer(kind, renderer);
+      return Promise.resolve();
+    },
+    unregisterBackdropEffect(kind): Promise<void> {
+      compositor.unregisterBackdropEffectRenderer?.(kind);
+      return Promise.resolve();
+    },
   };
 
   return {

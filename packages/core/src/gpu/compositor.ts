@@ -49,8 +49,11 @@
 //   - Saturation / brightness / contrast / hue rotation -> colorMatrix.
 //   - Per-channel scale (dim red channel, etc.) -> tint.
 //   - Workspace inactive dim: tint = (0.5, 0.5, 0.5, 1).
-// Effects that need to read neighbor pixels (blur, distortion) are not
-// expressible here -- they're for the buffer-intercept path.
+// Effects that need to read neighbor pixels are not expressible here:
+// within the window's OWN content (distortion, content blur) they're for
+// the buffer-intercept path; on the content BEHIND the window they're for
+// backdrop effects (SurfaceFx.backdropEffect + a registered
+// BackdropEffectRenderer).
 //
 // outputMargin reserves canvas around the surface's nominal rect. The mask
 // is sampled across the FULL expanded region (margin included) and its alpha
@@ -539,6 +542,13 @@ interface SurfaceFx {
   // Analytic shape mask (rounded rect / superellipse / ...). null = full
   // rectangular coverage; the shader's kind=0 branch is an early-out.
   shape: SurfaceShape;
+  // Backdrop effect: composite this surface over a transformed copy of the
+  // content below it (compositeScene splits the pass at this surface and
+  // runs the registered renderer for `kind`). null = off. Applies to every
+  // scene composite (on-screen, capture, compose scenes, transition
+  // sources); content crops (composeWindows, freeze snapshots, phantoms)
+  // render without it.
+  backdropEffect: SurfaceBackdropEffect | null;
 }
 
 interface Surface {
@@ -684,6 +694,7 @@ function defaultFx(): SurfaceFx {
     tintR: 1, tintG: 1, tintB: 1, tintA: 1,
     colorMatrix: identityColorMatrix(),
     shape: null,
+    backdropEffect: null,
   };
 }
 
@@ -820,6 +831,64 @@ export interface SurfaceTint {
 // diagonal and 0s elsewhere; that is the default if a surface has never had
 // setSurfaceColorMatrix called.
 export type ColorMatrix = readonly number[] | Float32Array;
+
+// Backdrop effect assigned to a surface: the surface composites over a
+// transformed copy of everything BELOW it in the draw order. `kind` names a
+// renderer registered via registerBackdropEffectRenderer (the built-in
+// "blur" default is registered at startup; plugins may register more).
+// `params` is a flat numeric bag the renderer interprets (e.g. { radius }
+// for blur).
+export interface SurfaceBackdropEffect {
+  kind: string;
+  params?: Record<string, number>;
+}
+
+// What a backdrop-effect renderer receives per effect-surface per
+// composited scene, mid-pass: the target with everything below the surface
+// already drawn (sample-only -- it is the attachment of the surrounding
+// passes), and the surface's rect in [0,1] UV over that target. The target
+// is not necessarily an output: every scene composite (on-screen frames,
+// capture, compose scenes, transitions' from/to textures) runs the same
+// path, so renderers must key any cached resources by the target's device
+// dimensions, not by an output identity.
+export interface BackdropEffectArgs {
+  encoder: GPUCommandEncoder;
+  source: GPUTextureView;
+  // Device-pixel dimensions of `source`.
+  deviceWidth: number;
+  deviceHeight: number;
+  // The effect surface's rect as a UV region of `source`.
+  rect: { u0: number; v0: number; u1: number; v1: number };
+  surfaceId: number;
+  params: Readonly<Record<string, number>>;
+}
+
+// The renderer's product: a texture view plus the UV region of it that
+// covers BackdropEffectArgs.rect. The compositor draws that region as an
+// opaque quad clipped to the surface's footprint (shape/rounded corners
+// included), then blends the surface itself over it.
+export interface BackdropEffectResult {
+  view: GPUTextureView;
+  uv: { u0: number; v0: number; u1: number; v1: number };
+}
+
+// A backdrop-effect implementation. Renderers run on the core thread and
+// the core GPUDevice (in-thread plugins share both; Worker plugins cannot
+// register one). render() encodes its passes into args.encoder between two
+// segments of a scene composite -- it must not submit, and must not
+// render to args.source. Returning null skips the effect this pass (the
+// surface composites directly over the unprocessed backdrop). Cached GPU
+// resources must be keyed by (deviceWidth, deviceHeight) with bounded
+// eviction: the same renderer serves outputs and arbitrary-sized compose
+// targets alike.
+export interface BackdropEffectRenderer {
+  // Sampling reach in LOGICAL pixels beyond the surface's rect for the
+  // given params: how far outside the rect source pixels can influence the
+  // result. Drives partial-repaint inflation -- understating it leaves
+  // stale fringes around the effect on partial repaints.
+  reach(params: Readonly<Record<string, number>>): number;
+  render(args: BackdropEffectArgs): BackdropEffectResult | null;
+}
 
 function clamp(v: number, lo: number, hi: number): number {
   return v < lo ? lo : v > hi ? hi : v;
@@ -1111,6 +1180,17 @@ export class JsCompositor implements CompositorSink {
   private transitionPipeline: GPURenderPipeline | null = null;
   private transitionLayout: GPUBindGroupLayout | null = null;
   private transitionUniformBuf: GPUBuffer | null = null;
+  // Backdrop effects: renderer registry keyed by effect kind, per-surface
+  // quad pseudo-surfaces (the quad that paints the processed backdrop under
+  // the surface, drawn with the shared surface pipeline so shape/opacity
+  // clipping applies), and a count of surfaces with an effect set --
+  // gating every per-frame effect code path so the feature is zero-cost
+  // when unused. warnedEffectKinds keeps the unknown-kind log to once per
+  // kind.
+  private backdropRenderers = new Map<string, BackdropEffectRenderer>();
+  private backdropQuads = new Map<number, Surface>();
+  private backdropCount = 0;
+  private warnedEffectKinds = new Set<string>();
   private activeTransitions = new Map<number, ActiveTransition>();
 
   // dmabuf buffer-release lifecycle. The pure state machine (no GPU, no Dawn)
@@ -1299,12 +1379,17 @@ export class JsCompositor implements CompositorSink {
 
     // Headless: allocate an owned offscreen target (read back via readback()).
     // Otherwise the render target is acquired per output per frame from the
-    // addon (KMS scanout slot or nested-host swapchain).
+    // addon (KMS scanout slot or nested-host swapchain). TEXTURE_BINDING
+    // mirrors the on-screen scanout textures (RenderAttachment |
+    // TextureBinding on the native side): backdrop-effect renderers sample
+    // the render target between passes.
     if (this.headless) {
       this.target = device.createTexture({
         size: { width: this.width, height: this.height },
         format: this.format,
-        usage: this.g.GPUTextureUsage.RENDER_ATTACHMENT | this.g.GPUTextureUsage.COPY_SRC,
+        usage: this.g.GPUTextureUsage.RENDER_ATTACHMENT
+             | this.g.GPUTextureUsage.TEXTURE_BINDING
+             | this.g.GPUTextureUsage.COPY_SRC,
       });
       this.targetView = this.target.createView();
     }
@@ -1903,10 +1988,11 @@ export class JsCompositor implements CompositorSink {
       return;
     }
     const enc = this.device.createCommandEncoder();
-    this.composite({
+    this.compositeScene({
       encoder: enc, targetView: snap.view, drawList: [id],
       outW: s.layoutW, outH: s.layoutH,
       placements: new Map([[id, { x: 0, y: 0, w: s.layoutW, h: s.layoutH }]]),
+      effects: false,  // the freeze bakes the window's own pixels only
     });
     this.device.queue.submit([enc.finish()]);
     this.addon.writeEndAccess(imp.importId);
@@ -2160,6 +2246,57 @@ export class JsCompositor implements CompositorSink {
     this.damageFull();  // shape changes the entire visible footprint
   }
 
+  // Register a backdrop-effect renderer under an effect kind. Renderers
+  // run mid-composite on the core thread + core device (in-thread plugins
+  // qualify; Worker plugins cannot register). Re-registering a kind
+  // replaces the previous renderer; the caller owns both renderers'
+  // GPU resources.
+  registerBackdropEffectRenderer(kind: string, r: BackdropEffectRenderer): void {
+    this.backdropRenderers.set(kind, r);
+    this.warnedEffectKinds.delete(kind);
+    if (this.backdropCount > 0) this.damageFull();
+  }
+
+  // Remove a kind's renderer. Surfaces still carrying that kind composite
+  // without the effect (and log once) until it is re-registered or their
+  // effect is cleared.
+  unregisterBackdropEffectRenderer(kind: string): void {
+    this.backdropRenderers.delete(kind);
+    if (this.backdropCount > 0) this.damageFull();
+  }
+
+  // Assign (or clear, with null) a backdrop effect on a surface: it
+  // composites over a renderer-transformed copy of everything below it in
+  // the draw order. No group cascade -- the effect is a property of the
+  // one surface's backdrop, and cascading it over subsurfaces/decoration
+  // would re-process inside the window. The effect quad draws only inside
+  // the surface's rect, so the rect damage suffices; repaint scoping under
+  // the rect is handled by the composite-scissor inflation in renderFrame.
+  setSurfaceBackdropEffect(id: number, e: SurfaceBackdropEffect | null): void {
+    let next: SurfaceBackdropEffect | null = null;
+    if (e && typeof e.kind === "string" && e.kind.length > 0) {
+      // Copy the numeric params: the caller's bag is theirs to mutate, and
+      // non-finite values would propagate into renderer uniforms.
+      const params: Record<string, number> = {};
+      if (e.params) {
+        for (const [k, v] of Object.entries(e.params)) {
+          if (typeof v === "number" && Number.isFinite(v)) params[k] = v;
+        }
+      }
+      next = { kind: e.kind, params };
+    }
+    const s = this.ensureSurface(id);
+    const had = s.fx.backdropEffect !== null;
+    if (!had && !next) return;
+    s.fx.backdropEffect = next;
+    if (had !== (next !== null)) this.backdropCount += next ? 1 : -1;
+    if (!next) {
+      const q = this.backdropQuads.get(id);
+      if (q) { q.uniformBuf?.destroy(); this.backdropQuads.delete(id); }
+    }
+    this.damageSurface(id);
+  }
+
   // Install (or clear) an alpha mask on a surface. The mask is sampled across
   // the full expanded (surface + outputMargin) region; its .a channel modulates
   // the surface's alpha (and premultiplied rgb). null restores the default
@@ -2210,9 +2347,12 @@ export class JsCompositor implements CompositorSink {
     this.dispatch(this.lifecycle.step({ kind: "surfaceRemoved", surfaceId: id }));
     this.fxFollowers.delete(id);
     this.lastShmSource.delete(id);
+    const bq = this.backdropQuads.get(id);
+    if (bq) { bq.uniformBuf?.destroy(); this.backdropQuads.delete(id); }
 
     const s = this.surfaces.get(id);
     if (s) {
+      if (s.fx.backdropEffect) this.backdropCount--;
       // The per-surface uniform buffer is a wire GPUBuffer the executor
       // owns; destroy it now. The sampled texture is the dmabuf import
       // owned by dmabufImports/lifecycle; the lifecycle path released it
@@ -3434,6 +3574,19 @@ export class JsCompositor implements CompositorSink {
     // clears the box first so the stack blends against black. The box is in
     // output LOGICAL coords. Absent = full-frame clear (the default).
     scissor?: { x: number; y: number; w: number; h: number };
+    // Resumed segment of a pass-split frame (backdrop blur): load the
+    // target unconditionally -- the preceding segment already cleared /
+    // black-filled -- while keeping the scissor clip if one is set.
+    resume?: boolean;
+    // Blurred-backdrop quads drawn before the drawList: each pseudo-surface
+    // samples a blur-chain output via the caller-supplied cropUV (the
+    // surface's on-screen rect in output UV). `id` is the REAL surface's id
+    // so camera exemption and the shape-clip footprint resolve to the
+    // window the quad sits under.
+    prepend?: Array<{
+      surf: Surface; id: number;
+      cropUV: { u0: number; v0: number; u1: number; v1: number };
+    }>;
     // On-screen output context. When set, surface placement subtracts this
     // output's logical origin and the scissor uses this output's scale +
     // device dims. Absent for offscreen/compose targets (live scenes, window
@@ -3448,7 +3601,7 @@ export class JsCompositor implements CompositorSink {
     const pass = args.encoder.beginRenderPass({
       colorAttachments: [{
         view: args.targetView,
-        loadOp: partial ? "load" : "clear",
+        loadOp: partial || args.resume ? "load" : "clear",
         storeOp: "store",
         clearValue: { r: 0, g: 0, b: 0, a: 1 },
       }],
@@ -3469,8 +3622,10 @@ export class JsCompositor implements CompositorSink {
       const sy1 = Math.min(devH, Math.max(sy, Math.ceil((ly + args.scissor.h) * scale)));
       pass.setScissorRect(sx, sy, sx1 - sx, sy1 - sy);
       // Clear the scissored box to black (loadOp:load preserved old pixels).
-      const black = this.ensureBlackFill();
-      if (black.bindGroup) {
+      // A resumed segment skips the fill: the first segment already painted
+      // the box and this pass must blend on top of it.
+      const black = args.resume ? null : this.ensureBlackFill();
+      if (black && black.bindGroup) {
         // The fill's placement is the device box mapped back to logical, NOT
         // the logical damage box: a quad at the damage box's fractional
         // device edges rasterizes short of the scissor's last column/row,
@@ -3490,6 +3645,15 @@ export class JsCompositor implements CompositorSink {
       }
     }
     pass.setPipeline(this.pipeline);
+    if (args.prepend) {
+      for (const p of args.prepend) {
+        if (!p.surf.bindGroup) continue;
+        this.updateUniforms(p.surf, p.id, args.outW, args.outH,
+          { cropUV: p.cropUV }, out);
+        pass.setBindGroup(0, p.surf.bindGroup);
+        pass.draw(4);
+      }
+    }
     for (const id of args.drawList) {
       const s = this.surfaces.get(id);
       if (!s || !s.present || !s.bindGroup) continue;
@@ -3532,6 +3696,261 @@ export class JsCompositor implements CompositorSink {
       pass.draw(4);
     }
     pass.end();
+  }
+
+  // Resolve the renderer for a surface's backdrop effect; logs (once per
+  // kind) when the kind has no registration -- an unregistered kind means
+  // the surface composites with no effect, which should be visible in the
+  // log rather than silent.
+  private backdropRendererFor(e: SurfaceBackdropEffect): BackdropEffectRenderer | null {
+    const r = this.backdropRenderers.get(e.kind);
+    if (!r && !this.warnedEffectKinds.has(e.kind)) {
+      this.warnedEffectKinds.add(e.kind);
+      log.warn("core", `js-compositor: backdrop effect kind "${e.kind}" has no `
+        + `registered renderer; compositing without it`);
+    }
+    return r ?? null;
+  }
+
+  // A renderer's sampling reach for the given params, hardened against a
+  // plugin-supplied reach() throwing or returning garbage.
+  private backdropReach(
+    r: BackdropEffectRenderer, params: Readonly<Record<string, number>>,
+  ): number {
+    try {
+      const v = r.reach(params);
+      return Number.isFinite(v) && v > 0 ? v : 0;
+    } catch {
+      return 0;
+    }
+  }
+
+  // The surface's on-screen rect in output-local (glass) LOGICAL coords:
+  // resolved placement (intercept override / layout / geometry / intrinsic)
+  // mapped through the output camera plus the fx translate/scale, mirroring
+  // updateUniforms + the vertex shader's placement math. null when the
+  // surface has no resolvable size.
+  private backdropGlassRect(
+    id: number, s: Surface, out: OutputCtx,
+  ): { x: number; y: number; w: number; h: number } | null {
+    const cam = !this.cameraExempt(id, s);
+    const camZ = cam ? out.cameraZoom : 1;
+    const ox = out.originX + (cam ? out.cameraX : 0);
+    const oy = out.originY + (cam ? out.cameraY : 0);
+    const ip = s.interceptPlacement;
+    const geom = s.geometry ?? null;
+    let w = ip?.w ?? (s.layoutW || (geom ? geom.width : 0));
+    let h = ip?.h ?? (s.layoutH || (geom ? geom.height : 0));
+    if (w <= 0 || h <= 0) ({ w, h } = this.logicalSizeOf(s));
+    if (w <= 0 || h <= 0) return null;
+    const fx = s.fx;
+    return {
+      x: ((ip?.x ?? s.x) - ox) * camZ + fx.translateX,
+      y: ((ip?.y ?? s.y) - oy) * camZ + fx.translateY,
+      w: w * camZ * fx.scaleX,
+      h: h * camZ * fx.scaleY,
+    };
+  }
+
+  // Grow a partial-repaint scissor to cover every backdrop-effect surface
+  // whose effect input it touches. The renderer samples the freshly-
+  // composited below-stack across the surface's rect plus its declared
+  // reach; outside the scissor the target still holds LAST frame's final
+  // pixels (effect quad and window included), so a scissor that clips into
+  // that region must expand to re-composite all of it. Rects and the
+  // scissor are in GLOBAL logical coords. Fixpoint loop: a union can newly
+  // reach another effect surface's rect.
+  private expandScissorForBackdrops(
+    o: OutputGeom,
+    scissor: { x: number; y: number; w: number; h: number } | undefined,
+  ): { x: number; y: number; w: number; h: number } | undefined {
+    if (!scissor || this.backdropCount === 0) return scissor;
+    const out = this.outputCtx(o);
+    const rects: Array<{ x0: number; y0: number; x1: number; y1: number }> = [];
+    for (const id of this.drawOrder(out.id, false)) {
+      const s = this.surfaces.get(id);
+      const e = s?.present ? s.fx.backdropEffect : null;
+      if (!s || !e) continue;
+      const renderer = this.backdropRendererFor(e);
+      if (!renderer) continue;
+      const r = this.backdropGlassRect(id, s, out);
+      if (!r || r.w <= 0 || r.h <= 0) continue;
+      const reach = this.backdropReach(renderer, e.params ?? {}) + 2;
+      rects.push({
+        x0: out.originX + r.x - reach, y0: out.originY + r.y - reach,
+        x1: out.originX + r.x + r.w + reach, y1: out.originY + r.y + r.h + reach,
+      });
+    }
+    if (rects.length === 0) return scissor;
+    let x0 = scissor.x, y0 = scissor.y;
+    let x1 = scissor.x + scissor.w, y1 = scissor.y + scissor.h;
+    let grew = true;
+    while (grew) {
+      grew = false;
+      for (const r of rects) {
+        if (r.x0 >= x1 || r.x1 <= x0 || r.y0 >= y1 || r.y1 <= y0) continue;
+        if (r.x0 < x0 || r.y0 < y0 || r.x1 > x1 || r.y1 > y1) {
+          x0 = Math.min(x0, r.x0); y0 = Math.min(y0, r.y0);
+          x1 = Math.max(x1, r.x1); y1 = Math.max(y1, r.y1);
+          grew = true;
+        }
+      }
+    }
+    return { x: x0, y: y0, w: x1 - x0, h: y1 - y0 };
+  }
+
+  // Sync the backdrop-effect quad pseudo-surface for `id` from the real
+  // surface and bind it to the renderer's output view. The quad mirrors
+  // the window's placement, camera treatment, transform, opacity and shape
+  // so the processed patch rasterizes exactly the window's on-screen
+  // footprint (rounded corners included, via the shape-clip resolved under
+  // the REAL surface id). opaque forces sampled alpha to 1 -- the quad
+  // must fully replace the backdrop, and the window's own alpha then
+  // blends over it.
+  private syncBackdropQuad(
+    id: number, win: Surface, result: BackdropEffectResult,
+  ): { surf: Surface; id: number;
+       cropUV: { u0: number; v0: number; u1: number; v1: number } } {
+    let q = this.backdropQuads.get(id);
+    if (!q) {
+      q = blankSurface(0, 0, 0, 0);
+      q.present = true;
+      q.opaque = true;
+      this.backdropQuads.set(id, q);
+    }
+    const ip = win.interceptPlacement;
+    const geom = win.geometry ?? null;
+    q.x = ip?.x ?? win.x;
+    q.y = ip?.y ?? win.y;
+    let w = ip?.w ?? (win.layoutW || (geom ? geom.width : 0));
+    let h = ip?.h ?? (win.layoutH || (geom ? geom.height : 0));
+    if (w <= 0 || h <= 0) ({ w, h } = this.logicalSizeOf(win));
+    q.layoutW = w;
+    q.layoutH = h;
+    q.outputAnchored = win.outputAnchored;
+    q.fx.opacity = win.fx.opacity;
+    q.fx.translateX = win.fx.translateX;
+    q.fx.translateY = win.fx.translateY;
+    q.fx.scaleX = win.fx.scaleX;
+    q.fx.scaleY = win.fx.scaleY;
+    q.fx.shape = win.fx.shape;
+    this.rebuildBindGroup(q, result.view);
+    return { surf: q, id, cropUV: result.uv };
+  }
+
+  // THE scene-compositing primitive: a draw list of surfaces in, a fully
+  // composited texture out. Every consumer routes through here -- the
+  // on-screen per-output pass, capture (composeOutput/composeRegion),
+  // plugin compose scenes and window crops (snapshot + live), transition
+  // from/to scene textures, freeze snapshots, phantom captures -- so a
+  // surface composites identically everywhere, up to the explicit
+  // parameters (cursor inclusion is the caller's drawOrder decision;
+  // `effects` opts backdrop effects out for content crops).
+  //
+  // A single composite pass in the common case; with backdrop-effect
+  // surfaces in the draw list, the pass splits at each one -- below-stack
+  // segment, renderer passes sampling the target, then a resumed segment
+  // that draws the effect quad, the surface, and the rest. All segments
+  // share the caller's encoder (one submit per target). A renderer throw
+  // or null result degrades to compositing that surface without its
+  // effect.
+  //
+  // effects defaults ON; it requires `output` (the placement math the
+  // effect quad mirrors) and is skipped under per-surface placement
+  // overrides (a content crop has no meaningful backdrop). Callers that
+  // capture a window's own pixels (composeWindows, freeze snapshots,
+  // phantoms) pass effects: false explicitly.
+  private compositeScene(args: {
+    encoder: GPUCommandEncoder;
+    targetView: GPUTextureView;
+    drawList: number[];
+    outW: number;
+    outH: number;
+    scissor?: { x: number; y: number; w: number; h: number };
+    output?: OutputCtx;
+    placements?: Map<number, { x: number; y: number; w: number; h: number }>;
+    cropUV?: Map<number, { u0: number; v0: number; u1: number; v1: number }>;
+    effects?: boolean;
+  }): void {
+    const { encoder: enc, targetView: view, drawList, output: out, scissor } = args;
+    const base = {
+      encoder: enc, targetView: view, drawList,
+      outW: args.outW, outH: args.outH,
+      scissor, output: out,
+      placements: args.placements, cropUV: args.cropUV,
+    };
+    let plan: Array<{ id: number; s: Surface;
+      renderer: BackdropEffectRenderer;
+      params: Readonly<Record<string, number>>;
+      rect: { x: number; y: number; w: number; h: number } }> | null = null;
+    if (this.backdropCount > 0 && args.effects !== false && out
+        && !args.placements) {
+      for (const id of drawList) {
+        const s = this.surfaces.get(id);
+        if (!s || !s.present || !s.bindGroup) continue;
+        const e = s.fx.backdropEffect;
+        if (!e) continue;
+        const renderer = this.backdropRendererFor(e);
+        if (!renderer) continue;
+        const r = this.backdropGlassRect(id, s, out);
+        if (!r || r.w <= 0 || r.h <= 0) continue;
+        // Entirely off this output: nothing to process here.
+        if (r.x + r.w <= 0 || r.y + r.h <= 0
+          || r.x >= out.logicalWidth || r.y >= out.logicalHeight) continue;
+        const params = e.params ?? {};
+        if (scissor) {
+          // The repaint box misses the effect's input region entirely: the
+          // quad's pixels are outside the scissor and cannot change, so
+          // skip the split (and the renderer) for this surface. When the
+          // box DOES touch it, expandScissorForBackdrops already grew the
+          // box over the full input region, so the below-stack under the
+          // quad is freshly composited.
+          const reach = this.backdropReach(renderer, params) + 2;
+          const sx0 = scissor.x - out.originX, sy0 = scissor.y - out.originY;
+          if (sx0 >= r.x + r.w + reach || sx0 + scissor.w <= r.x - reach
+            || sy0 >= r.y + r.h + reach || sy0 + scissor.h <= r.y - reach) {
+            continue;
+          }
+        }
+        (plan ??= []).push({ id, s, renderer, params, rect: r });
+      }
+    }
+    if (!plan || !out) {
+      this.composite(base);
+      return;
+    }
+    let start = 0;
+    let resume = false;
+    let prepend: Array<{ surf: Surface; id: number;
+      cropUV: { u0: number; v0: number; u1: number; v1: number } }> | undefined;
+    for (const p of plan) {
+      const idx = drawList.indexOf(p.id, start);
+      if (idx < 0) continue;
+      this.composite({ ...base, drawList: drawList.slice(start, idx), resume, prepend });
+      resume = true;
+      let result: BackdropEffectResult | null = null;
+      try {
+        result = p.renderer.render({
+          encoder: enc,
+          source: view,
+          deviceWidth: out.deviceWidth,
+          deviceHeight: out.deviceHeight,
+          rect: {
+            u0: p.rect.x / out.logicalWidth,
+            v0: p.rect.y / out.logicalHeight,
+            u1: (p.rect.x + p.rect.w) / out.logicalWidth,
+            v1: (p.rect.y + p.rect.h) / out.logicalHeight,
+          },
+          surfaceId: p.id,
+          params: p.params,
+        });
+      } catch (err) {
+        log.warn("core", "js-compositor: backdrop renderer render threw: %o", err);
+      }
+      prepend = result ? [this.syncBackdropQuad(p.id, p.s, result)] : undefined;
+      start = idx;
+    }
+    this.composite({ ...base, drawList: drawList.slice(start), resume, prepend });
   }
 
   // Composite one on-screen frame: open import brackets, encode the pass,
@@ -3580,7 +3999,8 @@ export class JsCompositor implements CompositorSink {
         view: this.targetView,
         tex: null,
         present: false,
-        scissor: this.takeScissor(o, JsCompositor.HEADLESS_DAMAGE_KEY),
+        scissor: this.expandScissorForBackdrops(
+          o, this.takeScissor(o, JsCompositor.HEADLESS_DAMAGE_KEY)),
       });
       this.flushHwCursorStates(new Set([OUTPUT_DEFAULT]));
     } else {
@@ -3663,7 +4083,7 @@ export class JsCompositor implements CompositorSink {
           present: true,
           // Composite-scissor: keyed by the stable per-slot output handle so
           // each output gets its own damage accounting.
-          scissor: this.takeScissor(o, handle),
+          scissor: this.expandScissorForBackdrops(o, this.takeScissor(o, handle)),
         });
       }
       // Cursor plane positions flush here, after the render set is known:
@@ -3752,7 +4172,7 @@ export class JsCompositor implements CompositorSink {
             throw new Error(
               `renderFrame: missing draw list for outputId=${t.ctx.id}`);
           }
-          this.composite({
+          this.compositeScene({
             encoder: enc, targetView: t.view, drawList: d,
             outW: t.ctx.logicalWidth, outH: t.ctx.logicalHeight,
             scissor: t.scissor, output: t.ctx,
@@ -3767,7 +4187,7 @@ export class JsCompositor implements CompositorSink {
       for (let i = 0; i < this.liveScenes.length; i++) {
         const ls = this.liveScenes[i];
         const enc = this.device.createCommandEncoder();
-        this.composite({
+        this.compositeScene({
           encoder: enc, targetView: ls.view, drawList: liveSceneLists[i],
           outW: ls.ctx.logicalWidth, outH: ls.ctx.logicalHeight,
           output: ls.ctx,
@@ -3788,10 +4208,11 @@ export class JsCompositor implements CompositorSink {
               }]])
             : undefined;
           const enc = this.device.createCommandEncoder();
-          this.composite({
+          this.compositeScene({
             encoder: enc, targetView: w.view, drawList: [w.id],
             outW: w.rect.w, outH: w.rect.h,
             placements, cropUV,
+            effects: false,  // content crop: a lone window has no backdrop
           });
           this.device.queue.submit([enc.finish()]);
         }
@@ -3919,6 +4340,8 @@ export class JsCompositor implements CompositorSink {
     // composite subtracts this output's logical origin and scales by its scale
     // into the (device-resolution) target. Absent = origin-relative, no scale.
     output?: OutputCtx;
+    // Threaded to compositeScene; content-crop callers pass false.
+    effects?: boolean;
   }): void {
     // tickleLifecycle=false: a snapshot is not on the on-screen lifecycle
     // frame's submit serial chain; driving frameSampled/endAccessFenceExported
@@ -3929,7 +4352,7 @@ export class JsCompositor implements CompositorSink {
     this.openImportBrackets(args.drawList, bracketed, /*tickleLifecycle*/ false);
     try {
       const enc = this.device.createCommandEncoder();
-      this.composite({
+      this.compositeScene({
         encoder: enc,
         targetView: args.targetView,
         drawList: args.drawList,
@@ -3937,6 +4360,7 @@ export class JsCompositor implements CompositorSink {
         placements: args.placements,
         cropUV: args.cropUV,
         output: args.output,
+        effects: args.effects,
       });
       this.device.queue.submit([enc.finish()]);
     } finally {
@@ -3975,6 +4399,10 @@ export class JsCompositor implements CompositorSink {
     drawList: ReadonlyArray<number>;
     region: { x: number; y: number; w: number; h: number };
     scale: number;
+    // Backdrop effects default ON (a region compose of a scene must match
+    // what the screen shows there); single-window content-crop callers
+    // (compose.windows, toplevel capture) pass false.
+    effects?: boolean;
   }): { texture: GPUTexture; outW: number; outH: number } {
     const scale = args.scale > 0 ? args.scale : 1;
     const devW = Math.max(1, Math.round(args.region.w * scale));
@@ -3991,6 +4419,7 @@ export class JsCompositor implements CompositorSink {
       drawList: [...args.drawList],
       outW: args.region.w, outH: args.region.h,
       output: synth,
+      effects: args.effects,
     });
     return { texture, outW: devW, outH: devH };
   }
@@ -4052,6 +4481,7 @@ export class JsCompositor implements CompositorSink {
       drawList: [...surfaceIds],
       outW, outH,
       placements,
+      effects: false,  // the phantom bakes the window's own pixels only
     });
 
     // Mint the phantom surface entry. setSurfaceLayout creates the

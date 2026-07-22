@@ -184,6 +184,18 @@ export interface PluginGpu {
   // startup covers the boot topology (the output.added burst precedes the
   // plugin runtime); output.* bus events cover changes from then on.
   listOutputs(): Promise<OutputInfo[]>;
+  // Register a backdrop-effect renderer under `kind`, applicable to
+  // windows via sdk.windows.setBackdropEffect({ kind, params }).
+  // Renderers encode GPU passes into the compositor's frame mid-composite,
+  // so they must live on the CORE device and run on the core thread:
+  // in-thread bundled plugins only. Worker plugins reject (their device is
+  // a different GPUDevice on another thread); give the effect to an
+  // in-thread plugin instead.
+  registerBackdropEffect(
+    kind: string,
+    renderer: import("../gpu/compositor.js").BackdropEffectRenderer,
+  ): Promise<void>;
+  unregisterBackdropEffect(kind: string): Promise<void>;
 }
 
 // Internal producer/consumer ring allocator (NOT plugin-facing). `allocExtra`
@@ -398,6 +410,18 @@ export async function createPluginGpu(
         });
       }
       return outs;
+    },
+    registerBackdropEffect(): Promise<void> {
+      // The renderer would have to encode into core's command encoder on
+      // core's device, mid-frame -- impossible from a Worker's separate
+      // device/thread. Same boundary as setMask's GPUTexture.
+      return Promise.reject(new Error(
+        "registerBackdropEffect: in-thread plugins only (a Worker plugin's "
+        + "GPUDevice cannot encode into the core compositor's frame)"));
+    },
+    unregisterBackdropEffect(): Promise<void> {
+      return Promise.reject(new Error(
+        "unregisterBackdropEffect: in-thread plugins only"));
     },
   };
 

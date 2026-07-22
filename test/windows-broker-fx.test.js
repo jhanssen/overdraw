@@ -38,6 +38,9 @@ function mockSink() {
     setSurfaceColorMatrix(id, m) {
       calls.push({ method: 'setSurfaceColorMatrix', id, m });
     },
+    setSurfaceBackdropEffect(id, e) {
+      calls.push({ method: 'setSurfaceBackdropEffect', id, e });
+    },
   };
 }
 
@@ -327,5 +330,64 @@ test('set-color-matrix: sink without setSurfaceColorMatrix -> not supported', ()
   };
   const { broker } = makeBroker(bare);
   assert.throws(() => broker('p', 'windows.set-color-matrix', { id: 1, m: null }),
+    /not supported/);
+});
+
+// ---- set-backdrop-effect ----------------------------------------------------
+
+test('set-backdrop-effect: forwards kind + params to the sink', () => {
+  const { broker, sink } = makeBroker();
+  broker('p', 'windows.set-backdrop-effect',
+    { id: 7, e: { kind: 'blur', params: { radius: 24 } } });
+  assert.deepEqual(sink.calls[0],
+    { method: 'setSurfaceBackdropEffect', id: 7,
+      e: { kind: 'blur', params: { radius: 24 } } });
+});
+
+test('set-backdrop-effect: params are optional', () => {
+  const { broker, sink } = makeBroker();
+  broker('p', 'windows.set-backdrop-effect', { id: 7, e: { kind: 'blur' } });
+  assert.deepEqual(sink.calls[0].e, { kind: 'blur' });
+});
+
+test('set-backdrop-effect: null clears', () => {
+  const { broker, sink } = makeBroker();
+  broker('p', 'windows.set-backdrop-effect', { id: 7, e: null });
+  assert.deepEqual(sink.calls[0],
+    { method: 'setSurfaceBackdropEffect', id: 7, e: null });
+});
+
+test('set-backdrop-effect: missing or empty kind throws', () => {
+  const { broker } = makeBroker();
+  assert.throws(() => broker('p', 'windows.set-backdrop-effect',
+    { id: 1, e: {} }), /malformed payload/);
+  assert.throws(() => broker('p', 'windows.set-backdrop-effect',
+    { id: 1, e: { kind: '' } }), /malformed payload/);
+});
+
+test('set-backdrop-effect: non-finite or non-number param throws', () => {
+  const { broker } = makeBroker();
+  assert.throws(() => broker('p', 'windows.set-backdrop-effect',
+    { id: 1, e: { kind: 'blur', params: { radius: NaN } } }), /malformed payload/);
+  assert.throws(() => broker('p', 'windows.set-backdrop-effect',
+    { id: 1, e: { kind: 'blur', params: { radius: 'big' } } }), /malformed payload/);
+});
+
+test('set-backdrop-effect: missing id throws', () => {
+  const { broker } = makeBroker();
+  assert.throws(() => broker('p', 'windows.set-backdrop-effect',
+    { e: { kind: 'blur' } }), /malformed payload/);
+});
+
+test('set-backdrop-effect: sink without setSurfaceBackdropEffect -> not supported', () => {
+  const bare = {
+    setSurfaceLayout() {}, setStack() {}, setLayerSurfaces() {},
+    setSurfaceTexture() {}, commitSurfaceBuffer() {}, commitSurfaceDmabuf() {},
+    removeSurface() {}, takeImportedSurfaces() { return []; },
+    takeFreedBuffers() { return []; }, afterCurrentFrame() {}, renderFrame() {},
+    // no setSurfaceBackdropEffect
+  };
+  const { broker } = makeBroker(bare);
+  assert.throws(() => broker('p', 'windows.set-backdrop-effect', { id: 1, e: null }),
     /not supported/);
 });

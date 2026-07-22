@@ -50,6 +50,7 @@ import { createSceneRegistry } from "./plugins/scene-registry.js";
 import { selectBundledPlugins, bundledToResolved } from "./plugins/bundled.js";
 import { JsCompositor } from "./gpu/compositor.js";
 import type { DawnWire, DawnGlobals } from "./gpu/compositor.js";
+import { createBackdropBlurRenderer } from "./gpu/backdrop-blur.js";
 import type { Addon, InputEvent } from "./types.js";
 import type { CompositorSink, CompositorState } from "./protocols/ctx.js";
 import { OUTPUT_DEFAULT } from "./protocols/ctx.js";
@@ -263,6 +264,12 @@ const compositor: CompositorSink = new JsCompositor(device, dawn.globals, addon,
   { width: dims.width, height: dims.height }, dawn, h.device,
   { headless: false, format: addon.outputFormat() });
 log.info("core", "compositor: JS (over the Dawn wire)");
+
+// Built-in backdrop-effect kinds. Plugins apply them via
+// sdk.windows.setBackdropEffect and can register more kinds via
+// sdk.gpu.registerBackdropEffect (in-thread plugins only).
+compositor.registerBackdropEffectRenderer?.("blur",
+  createBackdropBlurRenderer(device, dawn.globals, addon.outputFormat()));
 
 // Hardware cursor: apply the config gate, then subscribe to per-output
 // cursor-plane availability from the GPU process (KMS only; nested never

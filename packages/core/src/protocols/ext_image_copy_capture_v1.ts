@@ -340,6 +340,9 @@ function captureOneFrame(
         drawList,
         region: { x: rect.x, y: rect.y, w: rect.width, h: rect.height },
         scale: windowOutputScale(ctx, sRec.resource),
+        // Toplevel capture is a content crop of the one window; its
+        // backdrop is not part of the captured image.
+        effects: false,
       });
       tex = r.texture;
       // If the window resized between advertise and capture, the device dims

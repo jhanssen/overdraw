@@ -100,9 +100,21 @@ export interface SurfaceTint {
 // Caller passes 16 numbers in COLUMN-MAJOR order, matching
 // WGSL mat4x4f. Identity = [1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1]. Covers
 // saturation, hue rotation, contrast, brightness, channel swap. Anything
-// needing neighbor pixels (blur, distortion) is for the buffer-intercept
-// path, not core primitives.
+// needing neighbor pixels within the window's OWN content (distortion,
+// content blur) is for the buffer-intercept path; effects on the content
+// BEHIND the window go through setBackdropEffect.
 export type ColorMatrix = readonly number[] | Float32Array;
+
+// Backdrop effect: the window composites over a transformed copy of
+// everything below it in the draw order. `kind` names a renderer
+// registered with the compositor ("blur" is the built-in default; in-thread
+// plugins can register more via sdk.gpu.registerBackdropEffect). `params`
+// is a flat numeric bag the renderer interprets -- for "blur":
+// { radius } in logical pixels (default 20).
+export interface SurfaceBackdropEffect {
+  kind: string;
+  params?: Record<string, number>;
+}
 
 // Analytic per-surface shape evaluated by the compositor's fragment shader.
 // Composes multiplicatively with the optional alpha mask, so a plugin may use
@@ -314,6 +326,15 @@ export interface PluginWindows extends PluginWindowObserver {
   // 4x4 color matrix applied to the sampled rgba BEFORE the tint. Pass 16
   // numbers in column-major order (WGSL mat4x4f). null restores identity.
   setColorMatrix(id: number, m: ColorMatrix | null): Promise<void>;
+
+  // Backdrop effect: the window composites over a renderer-transformed
+  // copy of the content BELOW it (frosted-glass blur and the like); the
+  // window's own alpha decides how much of it shows through. null clears.
+  // The window's shape (setShape) clips the effect too, so rounded corners
+  // hold. Applies wherever a scene is composited (on-screen, screen
+  // capture, compose scenes, transition frames); per-window content crops
+  // (compose.windows) capture the window's own pixels without it.
+  setBackdropEffect(id: number, e: SurfaceBackdropEffect | null): Promise<void>;
 
   // Destroy a phantom surface (created by core in response to
   // a closing window and passed to the plugin via the window.closing
@@ -683,6 +704,16 @@ export function createPluginWindows(
       await endpoint.request("windows.set-color-matrix", { id, m: payload as unknown as Json });
     },
 
+    async setBackdropEffect(id, e): Promise<void> {
+      if (typeof id !== "number") {
+        throw new TypeError("setBackdropEffect id must be a number");
+      }
+      validateBackdropEffect(e);
+      // kind + flat numeric params, Json-safe.
+      // eslint-disable-next-line no-restricted-syntax
+      await endpoint.request("windows.set-backdrop-effect", { id, e: e as unknown as Json });
+    },
+
     async destroyPhantom(id): Promise<void> {
       if (typeof id !== "number" || !Number.isInteger(id) || id <= 0) {
         throw new TypeError("destroyPhantom id must be a positive integer");
@@ -835,6 +866,26 @@ function validateShape(shape: SurfaceShape): void {
       throw new TypeError(
         `setShape: unknown shape kind ${JSON.stringify(k)} `
         + `(expected "rounded-rect", "rounded-rect-per-corner", or "superellipse")`);
+    }
+  }
+}
+
+function validateBackdropEffect(e: SurfaceBackdropEffect | null): void {
+  if (e === null) return;
+  if (typeof e !== "object") {
+    throw new TypeError("setBackdropEffect e must be an object or null");
+  }
+  if (typeof e.kind !== "string" || e.kind.length === 0) {
+    throw new TypeError("setBackdropEffect kind must be a non-empty string");
+  }
+  if (e.params !== undefined) {
+    if (typeof e.params !== "object" || e.params === null) {
+      throw new TypeError("setBackdropEffect params must be an object");
+    }
+    for (const [k, v] of Object.entries(e.params)) {
+      if (typeof v !== "number" || !Number.isFinite(v)) {
+        throw new TypeError(`setBackdropEffect params.${k} must be a finite number`);
+      }
     }
   }
 }

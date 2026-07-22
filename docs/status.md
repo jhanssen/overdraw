@@ -598,6 +598,33 @@ dmabuf-interop service.
 - **Workspace plugin authoritative for per-output ordered visible
   windows** -- layout-driver, `windowAt`, `focusOrder` all read from
   `state.outputToplevelStacks`.
+- **Backdrop effects (frosted-glass blur):** per-surface
+  `setSurfaceBackdropEffect(id, { kind, params })`. `compositeScene` is
+  THE scene-compositing primitive -- every consumer (on-screen per-output
+  pass, `ext_image_copy_capture_v1` capture, compose scenes snapshot +
+  live, transition from/to sources, freeze snapshots, phantoms) routes
+  through it, so a surface composites identically everywhere up to
+  explicit parameters (cursor inclusion via drawOrder; `effects: false`
+  for per-window content crops, where a backdrop is meaningless). It
+  splits the pass at each effect surface, runs the registered renderer
+  for `kind` on the just-composited below-stack (render targets are
+  sampleable: `RenderAttachment | TextureBinding` on both native
+  reservation paths and on compose textures), and draws the result as an
+  opaque quad clipped to the surface's shape/footprint before blending
+  the surface over it. Built-in kind: `"blur"` (dual-Kawase,
+  `backdrop-blur.ts`, registered in `main.ts`); in-thread plugins
+  register more kinds via `sdk.gpu.registerBackdropEffect` (Worker
+  plugins cannot -- renderers encode into core's encoder mid-frame).
+  Renderers cache by target device size (bounded LRU), not output
+  identity -- compose targets are anonymous. Partial repaints inflate
+  the composite scissor by the renderer's declared reach
+  (`expandScissorForBackdrops`; on-screen only, snapshots always
+  full-repaint). Pixel-tested headless incl. the capture path
+  (`test/backdrop-blur.gpu.mjs`). Known gaps: a closing phantom bakes
+  the window's own pixels and the phantom surface carries no effect, so
+  a translucent blurred window loses its blur for the duration of its
+  closing animation; a surface whose effect kind has no registered
+  renderer composites without it (warned once per kind in the log).
 
 ### KMS scanout backend (`--backend=kms`)
 
