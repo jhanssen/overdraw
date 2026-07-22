@@ -646,6 +646,11 @@ pluginBus.subscribe(WINDOW_EVENT.committed, (_name, payload) => {
   log.info("core",
     `window ${ev.surfaceId}: sizeMode ${ev.previous?.sizeMode ?? "?"} -> `
     + `${ev.current?.sizeMode ?? "?"} (${ev.reason ?? "?"})`);
+  // A sizeMode transition can flip the window's stacking tier (and its
+  // input-transparency when lowered) without any focus change, moving what
+  // is under a stationary pointer -- re-pick so pointer focus and the
+  // cursor track the new stack.
+  state?.seat?.repickPointer();
 });
 
 // M7 hotplug handlers. Logic factored out into output/hotplug.ts so tests

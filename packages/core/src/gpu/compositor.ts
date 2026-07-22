@@ -466,6 +466,8 @@ export type CompositorAddon = Pick<
   | "sendCursorImageShm"
   | "sendCursorState"
   | "sendScanoutClientPresent"
+  | "shmBufferRef"
+  | "shmBufferUnref"
 >;
 
 // The dawn.node wire binding bits the compositor needs for dmabuf surfaces.
@@ -2346,7 +2348,7 @@ export class JsCompositor implements CompositorSink {
     // guarantees no client-disconnect leak.
     this.dispatch(this.lifecycle.step({ kind: "surfaceRemoved", surfaceId: id }));
     this.fxFollowers.delete(id);
-    this.lastShmSource.delete(id);
+    this.setShmSource(id, null);
     const bq = this.backdropQuads.get(id);
     if (bq) { bq.uniformBuf?.destroy(); this.backdropQuads.delete(id); }
 
@@ -2514,8 +2516,10 @@ export class JsCompositor implements CompositorSink {
     if (seq === 0) return 0;
     // Remember where this surface's pixels live so a cursor-role surface
     // can be shipped to a KMS cursor plane by pool reference (the GPU
-    // process copies out of its own mmap on receipt).
-    this.lastShmSource.set(id, { poolId, offset, stride, width, height });
+    // process copies out of its own mmap on receipt). Holds a pool ref
+    // (see setShmSource) so later re-installs never reference an
+    // unregistered pool.
+    this.setShmSource(id, { poolId, offset, stride, width, height });
     const sFinal = this.surfaces.get(id);
     if (sFinal) sFinal.present = true;
     this.imported.push({ id, width, height });
@@ -2554,7 +2558,7 @@ export class JsCompositor implements CompositorSink {
       return false;
     }
     // The surface's pixels no longer live in an shm pool.
-    this.lastShmSource.delete(id);
+    this.setShmSource(id, null);
 
     // Ensure the surface exists (the layout sweep may not have created it).
     let surf = this.surfaces.get(id);
@@ -4756,10 +4760,30 @@ export class JsCompositor implements CompositorSink {
   // Latest shm buffer source per surface, recorded on every shm commit so a
   // client cursor surface's pixels can be referenced by pool without a
   // readback (the GPU process has the pool mapped). Dmabuf commits clear
-  // the entry.
+  // the entry. Each entry HOLDS A POOL REF (shmBufferRef) for as long as it
+  // exists: cursor re-installs (output crossing, plane arrival, pointer
+  // repick) re-send CursorImageShm long after the client may have destroyed
+  // its pool and buffers, and without the ref the GPU process would have
+  // unmapped the pool -- the install is then dropped ("unknown poolId") and
+  // the plane keeps a stale image. All mutations go through setShmSource.
   private lastShmSource = new Map<number, {
     poolId: number; offset: number; stride: number; width: number; height: number;
   }>();
+
+  private setShmSource(id: number, src: {
+    poolId: number; offset: number; stride: number; width: number; height: number;
+  } | null): void {
+    const prev = this.lastShmSource.get(id);
+    // Ref-before-unref so a same-pool replacement never lets the refcount
+    // touch zero (which would free the mapping) in between.
+    if (src) {
+      this.addon.shmBufferRef?.(src.poolId);
+      this.lastShmSource.set(id, src);
+    } else {
+      this.lastShmSource.delete(id);
+    }
+    if (prev) this.addon.shmBufferUnref?.(prev.poolId);
+  }
 
   setHwCursorEnabled(on: boolean): void {
     this.hwCursorEnabled = on;

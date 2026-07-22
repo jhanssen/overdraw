@@ -2184,6 +2184,14 @@ export function createWm(
       // peer.
       candidates.sort((a, b) => effectiveStackZ(b) - effectiveStackZ(a));
       for (const win of candidates) {
+        // A lowered sizeMode window (tier -1: unfocused fullscreen, or
+        // maximized floating) is input-transparent: it shows through tile
+        // gaps as backdrop, but pointer input there must not split from
+        // keyboard focus -- hover would apply its cursor preference (a
+        // game that hid the cursor keeps it hidden over the gaps) and
+        // follow-pointer focus would raise it on a mere mouse crossing.
+        // Focus-cycling is the way back to it.
+        if (win.stackTier === -1) continue;
         const r = win.rect;
         if (x < r.x || x >= r.x + r.width || y < r.y || y >= r.y + r.height) continue;
         if (accept) {

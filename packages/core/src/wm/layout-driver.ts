@@ -308,7 +308,11 @@ export function createLayoutDriver(deps: LayoutDriverDeps): LayoutDriver {
       const next = pendingReason;
       pendingReason = null;
       if (next !== null) {
-        setImmediate(() => { void runOnce(next); });
+        // Hold `running` through the setImmediate gap: settled() must not
+        // observe the idle window between this pass ending and the
+        // chained pass starting, or it resolves with a pass still owed.
+        running = true;
+        setImmediate(() => { running = false; void runOnce(next); });
       } else {
         const waiters = settleWaiters;
         settleWaiters = [];

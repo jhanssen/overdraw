@@ -181,6 +181,31 @@ test('a new maximize does NOT demote a fullscreen window', async () => {
   assert.equal(winOf(wm, 2).windowState.sizeMode, 'maximized');
 });
 
+test('lowered fullscreen window is input-transparent; focused it takes hits again', async () => {
+  const { wm } = makeWmWithWindows();
+  // Float window 2 into a small corner rect so most of the glass shows
+  // only the lowered fullscreen backdrop (window 1).
+  await wm.propose(2, { tiling: 'floating' }, 'plugin');
+  wm.setFloatingRect(2, { x: 0, y: 0, width: 100, height: 100 });
+  await wm.propose(1, { sizeMode: 'fullscreen' }, 'client-request');
+  await wm.settled();
+  // A point covered only by the lowered fullscreen window hits NOTHING:
+  // pointer input there must not reach a backdrop window (cursor prefs,
+  // follow-pointer focus would raise it on a mere mouse crossing).
+  wm.setKeyboardFocus(2);
+  assert.equal(winOf(wm, 1).stackTier, -1);
+  const exposed = { x: 700, y: 300 };
+  assert.equal(wm.windowAt(exposed.x, exposed.y), null,
+    'lowered fullscreen window takes no pointer input');
+  // A point over the floating peer hits the peer, not the glass-sized
+  // backdrop beneath it.
+  assert.equal(wm.windowAt(50, 50)?.surfaceId, 2);
+  // Focused (raised) it is hit-testable everywhere it covers.
+  wm.setKeyboardFocus(1);
+  assert.equal(winOf(wm, 1).stackTier, 1);
+  assert.equal(wm.windowAt(exposed.x, exposed.y)?.surfaceId, 1);
+});
+
 test('fullscreen window leaves the tile layout: the remaining peer reflows to the full region', async () => {
   const { wm, sink } = makeWmWithWindows([1, 2, 3]);
   await wm.settled();
