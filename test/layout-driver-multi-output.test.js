@@ -44,7 +44,7 @@ function snap(windows, outputs = TWO_OUTPUTS) {
 function managedOn(id, outputId) {
   return {
     id, role: 'toplevel', outputId,
-    tiling: 'managed', exclusive: 'none', visible: true,
+    tiling: 'managed', sizeMode: 'none', visible: true,
   };
 }
 
@@ -126,14 +126,14 @@ test('one output empty (no windows): plugin NOT called for that output', async (
   assert.equal(calls, 1);  // only output 0
 });
 
-test('per-output exclusive: fullscreen on output 1 covers output 1 only', async () => {
+test('per-output sizeMode: fullscreen on output 1 covers output 1 only', async () => {
   const target = captureTarget();
   const driver = createLayoutDriver({
     snapshot: () => snap([
       managedOn(1, 0),
       {
         id: 2, role: 'toplevel', outputId: 1,
-        tiling: 'managed', exclusive: 'fullscreen', visible: true,
+        tiling: 'managed', sizeMode: 'fullscreen', visible: true,
       },
     ]),
     target,

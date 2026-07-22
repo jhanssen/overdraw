@@ -28,7 +28,7 @@ function snap(windows) {
   const wins = windows.map((win) => ({
     outputId: 0,
     tiling: 'managed',
-    exclusive: 'none',
+    sizeMode: 'none',
     visible: true,
     ...win,
   }));
@@ -46,7 +46,7 @@ function snap(windows) {
 }
 
 function managedWin(id) {
-  return { id, role: 'toplevel', tiling: 'managed', exclusive: 'none', visible: true, outputId: 0 };
+  return { id, role: 'toplevel', tiling: 'managed', sizeMode: 'none', visible: true, outputId: 0 };
 }
 
 test('all managed: plugin gets every window; tile region = full output', async () => {
@@ -72,7 +72,7 @@ test('maximized (exclusive) window: resolved to tile region (override wins over 
   const target = captureTarget();
   let computeCalls = 0;
   const driver = createLayoutDriver({
-    snapshot: () => snap([{ id: 1, role: 'toplevel', exclusive: 'maximized' }]),
+    snapshot: () => snap([{ id: 1, role: 'toplevel', sizeMode: 'maximized' }]),
     target,
     // The plugin still runs (peers keep their layout; the exclusive
     // window occupies its slot) -- but its slot rect for the exclusive
@@ -96,7 +96,7 @@ test('maximized (exclusive) window: resolved to tile region (override wins over 
 test('fullscreen window: resolved to full output rect', async () => {
   const target = captureTarget();
   const driver = createLayoutDriver({
-    snapshot: () => snap([{ id: 1, role: 'toplevel', exclusive: 'fullscreen' }]),
+    snapshot: () => snap([{ id: 1, role: 'toplevel', sizeMode: 'fullscreen' }]),
     target,
     compute: async (inputs) =>
       ({ rects: inputs.windows.map((w) => ({ id: w.id, outer: { x: 9, y: 9, width: 9, height: 9 } })) }),
@@ -130,7 +130,7 @@ test('exclusive override coexists with peer layout on the same output', async ()
   const driver = createLayoutDriver({
     snapshot: () => snap([
       managedWin(1),
-      { id: 2, role: 'toplevel', exclusive: 'maximized' },
+      { id: 2, role: 'toplevel', sizeMode: 'maximized' },
       managedWin(3),
     ]),
     target,
@@ -177,7 +177,7 @@ test('reserved zones: exclusive=maximized + tileRegion both honor them', async (
   // Now check maximized honors reserved zones too.
   const target2 = captureTarget();
   const driver2 = createLayoutDriver({
-    snapshot: () => snap([{ id: 2, role: 'toplevel', exclusive: 'maximized' }]),
+    snapshot: () => snap([{ id: 2, role: 'toplevel', sizeMode: 'maximized' }]),
     target: target2,
     reservedZones,
     compute: async () => ({ rects: [] }),
@@ -193,7 +193,7 @@ test('exclusive=fullscreen ignores reserved zones (full output)', async () => {
   reservedZones.set('bar', { outputId: 0, edge: 'top', thickness: 30, owner: 99 });
   const target = captureTarget();
   const driver = createLayoutDriver({
-    snapshot: () => snap([{ id: 1, role: 'toplevel', exclusive: 'fullscreen' }]),
+    snapshot: () => snap([{ id: 1, role: 'toplevel', sizeMode: 'fullscreen' }]),
     target,
     reservedZones,
     compute: async () => ({ rects: [] }),

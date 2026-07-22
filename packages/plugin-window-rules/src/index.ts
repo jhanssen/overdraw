@@ -24,7 +24,7 @@
 // WM_CLASS/title land, so they're real here, not null) and a mutable
 // `initialState`. The declarative `float` field flips the tiling lane; the
 // `apply` lambda gets the full `state` proposal and may set any field
-// (tiling, exclusive, visible, modal, constraints, parent, layoutMode/...).
+// (tiling, sizeMode, visible, modal, constraints, parent, layoutMode/...).
 // The window maps with that state, no flicker. Rules apply in array order;
 // later rules win per axis. The lambda runs after the declarative `float`.
 //
@@ -59,7 +59,7 @@ interface WindowQuery {
   xwayland: boolean;
 }
 // The apply lambda also gets `state`: the mutable pre-map proposal. It may
-// assign any field (tiling, exclusive, visible, modal, constraints, parent,
+// assign any field (tiling, sizeMode, visible, modal, constraints, parent,
 // layoutMode/layoutData); the WM validates the returned state.
 interface WindowTarget extends WindowQuery {
   state: WindowStateLike;

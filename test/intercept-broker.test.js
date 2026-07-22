@@ -900,12 +900,12 @@ test('broker: fullscreen transitions on the plugin bus unmatch/rematch excludeFu
   const committed = subs.get(WINDOW_EVENT.committed);
   assert.ok(committed, 'broker subscribed to window.committed on the plugin bus');
   committed(WINDOW_EVENT.committed,
-    { surfaceId: 1, changed: ['exclusive'], current: { exclusive: 'fullscreen' } });
+    { surfaceId: 1, changed: ['sizeMode'], current: { sizeMode: 'fullscreen' } });
   assert.equal(unmatched, 1);
   assert.deepEqual(broker.activeSurfacesFor(id), []);
 
   committed(WINDOW_EVENT.committed,
-    { surfaceId: 1, changed: ['exclusive'], current: { exclusive: 'none' } });
+    { surfaceId: 1, changed: ['sizeMode'], current: { sizeMode: 'none' } });
   assert.equal(matched, 2);
   assert.deepEqual(broker.activeSurfacesFor(id), [1]);
 });
@@ -931,7 +931,7 @@ test('broker: preconfigure seeds fullscreen so an excludeFullscreen registration
   // A game declaring fullscreen pre-map: preconfigure carries the state.
   bus.emit(WINDOW_EVENT.preconfigure, {
     surfaceId: 1, appId: 'game', title: null, xwayland: false,
-    initialState: { exclusive: 'fullscreen' },
+    initialState: { sizeMode: 'fullscreen' },
   });
   bus.emit(WINDOW_EVENT.map, mapEvent(1, 'game'));
   assert.equal(matched, 0);

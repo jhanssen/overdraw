@@ -53,7 +53,7 @@ function immediateLayoutDriver(target, snapshot) {
       const allWindows = [...snap.windows.values()];
       const rects = [];
       const visible = allWindows.filter((w) => w.visible);
-      const exclusiveWin = visible.find((w) => w.exclusive !== 'none');
+      const exclusiveWin = visible.find((w) => w.sizeMode !== 'none');
       if (exclusiveWin) {
         rects.push({ id: exclusiveWin.id, outer: outRect });
       } else {
@@ -316,7 +316,7 @@ test('pre-content set_maximized: default policy suppresses, but the wish is pres
   // at window.preconfigure)...
   assert.equal(s.clientRequests.wantsMaximized, true);
   // ...but the decision axis is NOT honored at this phase (pre-content).
-  assert.equal(s.exclusive, 'none');
+  assert.equal(s.sizeMode, 'none');
 });
 
 test('pre-content set_fullscreen: default policy honors (matches sway/hyprland)', async () => {
@@ -331,7 +331,7 @@ test('pre-content set_fullscreen: default policy honors (matches sway/hyprland)'
   await wm.propose(1, { clientRequests: { wantsFullscreen: true } }, 'client-request');
   const s = wm.getWindowState(1);
   assert.equal(s.clientRequests.wantsFullscreen, true);
-  assert.equal(s.exclusive, 'fullscreen');
+  assert.equal(s.sizeMode, 'fullscreen');
 });
 
 // --- window.preconfigure interceptor path ---
@@ -348,14 +348,14 @@ test('preconfigure: emits with current state as initialState', async () => {
   await wm.settled();
   // Direct decision-axis write (bypasses the policy seam): this represents
   // a plugin pre-empting the decision before the first configure.
-  await wm.propose(1, { exclusive: 'maximized' }, 'plugin');
+  await wm.propose(1, { sizeMode: 'maximized' }, 'plugin');
   await wm.settled();
   await wm.markInitialCommitComplete(1, { appId: 'firefox', title: 'Test' });
   assert.equal(events.length, 1);
   assert.equal(events[0].surfaceId, 1);
   assert.equal(events[0].appId, 'firefox');
   assert.equal(events[0].title, 'Test');
-  assert.equal(events[0].initialState.exclusive, 'maximized');
+  assert.equal(events[0].initialState.sizeMode, 'maximized');
 });
 
 test('preconfigure: interceptor modifies initialState and the modified state is committed', async () => {
@@ -368,14 +368,14 @@ test('preconfigure: interceptor modifies initialState and the modified state is 
   bus.intercept('window.preconfigure', (_n, p) => {
     const ev = p;
     if (ev.appId === 'firefox') {
-      return { ...ev, initialState: { ...ev.initialState, exclusive: 'maximized' } };
+      return { ...ev, initialState: { ...ev.initialState, sizeMode: 'maximized' } };
     }
   });
   wm.addWindow(1, res(1), { deferInitialCommit: true });
   await wm.settled();
   // Client didn't ask for maximized; rule plugin overrides at preconfigure.
   await wm.markInitialCommitComplete(1, { appId: 'firefox', title: 'Firefox' });
-  assert.equal(wm.getWindowState(1).exclusive, 'maximized');
+  assert.equal(wm.getWindowState(1).sizeMode, 'maximized');
 });
 
 test('preconfigure: client-declared state survives when interceptor leaves it alone', async () => {
@@ -391,7 +391,7 @@ test('preconfigure: client-declared state survives when interceptor leaves it al
   await wm.propose(1, { clientRequests: { wantsFullscreen: true } }, 'client-request');
   await wm.settled();
   await wm.markInitialCommitComplete(1, { appId: 'foo', title: 'Bar' });
-  assert.equal(wm.getWindowState(1).exclusive, 'fullscreen');
+  assert.equal(wm.getWindowState(1).sizeMode, 'fullscreen');
 });
 
 test('preconfigure: interceptor modification emits window.committed', async () => {
@@ -402,7 +402,7 @@ test('preconfigure: interceptor modification emits window.committed', async () =
   });
   bus.intercept('window.preconfigure', (_n, p) => {
     const ev = p;
-    return { ...ev, initialState: { ...ev.initialState, exclusive: 'fullscreen' } };
+    return { ...ev, initialState: { ...ev.initialState, sizeMode: 'fullscreen' } };
   });
   const committed = [];
   bus.subscribe('window.committed', (_n, p) => committed.push(p));
@@ -411,8 +411,8 @@ test('preconfigure: interceptor modification emits window.committed', async () =
   await wm.markInitialCommitComplete(1, { appId: 'foo', title: 'Bar' });
   assert.equal(committed.length, 1);
   assert.equal(committed[0].reason, 'window-rule');
-  assert.equal(committed[0].current.exclusive, 'fullscreen');
-  assert.ok(committed[0].changed.includes('exclusive'));
+  assert.equal(committed[0].current.sizeMode, 'fullscreen');
+  assert.ok(committed[0].changed.includes('sizeMode'));
 });
 
 test('preconfigure: synchronous setInsets in interceptor shrinks the first sized configure', async () => {

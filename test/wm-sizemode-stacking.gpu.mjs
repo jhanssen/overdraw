@@ -1,12 +1,13 @@
-// Exclusive dominance follows focus.
+// Stacking follows keyboard focus across sizeMode tiers, end-to-end.
 //
-// A fullscreen (exclusive) window dominates its island -- topmost in the
-// draw stack, peers suppressed -- only WHILE IT HOLDS KEYBOARD FOCUS.
-// Unfocused, it keeps its exclusive state and glass rect but stacks like
-// a normal window, so the rest of the island stays visible and usable:
-// windows mapping under it still get their layout rect (suppression is a
-// stacking concern, not geometry), can be focus-cycled to, and draw
-// above it when focused.
+// A fullscreen window is not a tile member: focused it draws topmost and
+// covers the glass; unfocused it drops BELOW the tiled tier and its peers
+// reflow over the island -- windows mapping while it exists get real
+// layout slots, can be focus-cycled to, and draw above it. Unmapping a
+// tiled peer reflows the survivors over the full strip (the fullscreen
+// window holds no slot). A zoom (maximized) coexists with the fullscreen
+// window: the game keeps its glass-sized rect (never squeezed into a
+// tile slot and never reconfigured).
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { setupCompositor, canRunGpu, waitFor } from "./harness.mjs";
@@ -39,7 +40,7 @@ test("exclusive dominance: newcomers get rects; dominance follows focus", { skip
       { timeoutMs: 8000, what: "game mapped" });
     const gameId = c.query().windows.map((w) => w.surfaceId).find((id) => id !== termId);
     await waitFor(() => c.state.wm.state.windows.find((w) => w.surfaceId === gameId),
-      (w) => w?.windowState.exclusive === "fullscreen",
+      (w) => w?.windowState.sizeMode === "fullscreen",
       { timeoutMs: 8000, what: "game exclusive" });
 
     // Launch a THIRD window while the game holds exclusive.
@@ -73,22 +74,67 @@ test("exclusive dominance: newcomers get rects; dominance follows focus", { skip
     assert.equal(last.at(-1), gameId,
       `focused game draws topmost; got ${JSON.stringify(last)}`);
 
-    // Focus the terminal: dominance drops; the terminal draws above the
-    // (still-fullscreen) game and the editor stays in the stack.
+    // Focus the terminal: the unfocused fullscreen game drops BELOW the
+    // tiled tier -- both tiled windows draw above it, terminal (focused)
+    // topmost.
     c.state.seat?.applyKeyboardFocus(termId);
     await new Promise((r) => setTimeout(r, 300));
     last = stacks.at(-1) ?? [];
     assert.equal(last.at(-1), termId,
-      `focused terminal draws above the unfocused fullscreen; got ${JSON.stringify(last)}`);
+      `focused terminal draws topmost; got ${JSON.stringify(last)}`);
     assert.ok(last.includes(edId) && last.includes(gameId),
       `editor and game remain in the stack; got ${JSON.stringify(last)}`);
+    assert.ok(last.indexOf(gameId) < last.indexOf(edId)
+           && last.indexOf(gameId) < last.indexOf(termId),
+      `unfocused fullscreen draws below BOTH tiled windows; got ${JSON.stringify(last)}`);
 
-    // Back to the game: dominance re-engages.
+    // Back to the game: it rises to the top tier again.
     c.state.seat?.applyKeyboardFocus(gameId);
     await new Promise((r) => setTimeout(r, 300));
     last = stacks.at(-1) ?? [];
     assert.equal(last.at(-1), gameId,
       `refocused game draws topmost again; got ${JSON.stringify(last)}`);
+
+    // The game holds no layout slot: unmapping the terminal must reflow
+    // the editor (now the sole tiled member) without touching the game's
+    // glass-sized rect.
+    const gameOuterBefore = { ...c.state.wm.state.windows
+      .find((w) => w.surfaceId === gameId).outer };
+    const edOuterBefore = { ...c.state.wm.state.windows
+      .find((w) => w.surfaceId === edId).outer };
+    term.child.kill("SIGTERM");
+    await waitFor(c.query, (s) => s.windows.length === 2,
+      { timeoutMs: 8000, what: "terminal unmapped" });
+    await c.state.wm.settled();
+    await new Promise((r) => setTimeout(r, 500));
+    const gameAfter = c.state.wm.state.windows.find((w) => w.surfaceId === gameId);
+    const edAfter = c.state.wm.state.windows.find((w) => w.surfaceId === edId);
+    assert.deepEqual(gameAfter.outer, gameOuterBefore,
+      "fullscreen rect untouched by the peer unmap");
+    assert.ok(edAfter.outer.x !== edOuterBefore.x
+           || edAfter.outer.width !== edOuterBefore.width,
+      `editor reflowed after the peer unmap; outer=${JSON.stringify(edAfter.outer)}`);
+
+    // Zoom the editor while the game is fullscreen: both sizeModes
+    // coexist. The editor covers the workarea-scoped rect; the game
+    // keeps its glass rect (it is never handed to the layout plugin, so
+    // it cannot be squeezed into a tile slot).
+    c.state.seat?.applyKeyboardFocus(edId);
+    await c.state.wm.propose(edId, { sizeMode: "maximized" }, "user-input");
+    await c.state.wm.settled();
+    await new Promise((r) => setTimeout(r, 300));
+    const gameZoomed = c.state.wm.state.windows.find((w) => w.surfaceId === gameId);
+    const edZoomed = c.state.wm.state.windows.find((w) => w.surfaceId === edId);
+    assert.equal(gameZoomed.windowState.sizeMode, "fullscreen",
+      "zoom on a peer does not demote the fullscreen window");
+    assert.deepEqual(gameZoomed.outer, gameOuterBefore,
+      "fullscreen rect untouched by a peer zoom");
+    assert.ok(edZoomed.outer.width > edOuterBefore.width,
+      `zoomed editor covers the workarea-scoped rect; outer=${JSON.stringify(edZoomed.outer)}`);
+    // Focused zoomed editor draws above the unfocused fullscreen game.
+    last = stacks.at(-1) ?? [];
+    assert.ok(last.indexOf(gameId) < last.indexOf(edId),
+      `zoomed focused editor draws above the game; got ${JSON.stringify(last)}`);
   } finally {
     await c.teardown();
   }

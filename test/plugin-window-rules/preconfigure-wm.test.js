@@ -94,10 +94,10 @@ test('apply lambda runs against the live window pre-map', async () => {
 test('apply lambda can set a non-tiling axis (exclusive) committed by the WM', async () => {
   const wm = await setup([{ match: { appId: 'player' }, apply: (win) => {
     win.state.tiling = 'floating';
-    win.state.exclusive = 'maximized';
+    win.state.sizeMode = 'maximized';
   } }]);
   await premap(wm, 7, { appId: 'player', title: null, xwayland: false });
   const s = wm.getWindowState(7);
   assert.equal(s.tiling, 'floating');
-  assert.equal(s.exclusive, 'maximized');
+  assert.equal(s.sizeMode, 'maximized');
 });

@@ -67,7 +67,7 @@ test("set_maximized before initial commit: SUPPRESSED by default policy; wish pr
     assert.equal(snap.windows.length, 1);
     const win = snap.windows[0];
     const ws = c.state.wm.getWindowState(win.surfaceId);
-    assert.equal(ws.exclusive, "none",
+    assert.equal(ws.sizeMode, "none",
       "default policy declined pre-content set_maximized");
     assert.equal(ws.clientRequests.wantsMaximized, true,
       "client's wish recorded for window-rules plugins to read");
@@ -99,7 +99,7 @@ test("set_fullscreen before initial commit: fullscreen arrives with the sized co
     assert.ok(sized.states.includes(STATE_FULLSCREEN));
     const snap = c.query();
     const ws = c.state.wm.getWindowState(snap.windows[0].surfaceId);
-    assert.equal(ws.exclusive, "fullscreen");
+    assert.equal(ws.sizeMode, "fullscreen");
   } finally {
     await c.teardown();
   }

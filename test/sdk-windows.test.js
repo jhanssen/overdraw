@@ -123,14 +123,14 @@ async function withWindowsSetup(targetId, fn, opts = {}) {
 test('propose: exclusive=maximized commits to WM state and is reflected in the snapshot', async () => {
   await withWindowsSetup(7, async ({ events, pluginBus, wm }) => {
     assert.equal(wm.getWindowState(7).tiling, 'managed');
-    assert.equal(wm.getWindowState(7).exclusive, 'none');
+    assert.equal(wm.getWindowState(7).sizeMode, 'none');
     trigger(pluginBus, 1);
     await waitFor(() => findLog(events, 'propose-maximized'));
-    assert.equal(wm.getWindowState(7).exclusive, 'maximized');
+    assert.equal(wm.getWindowState(7).sizeMode, 'maximized');
 
     trigger(pluginBus, 2);
     await waitFor(() => findLog(events, 'propose-managed'));
-    assert.equal(wm.getWindowState(7).exclusive, 'none');
+    assert.equal(wm.getWindowState(7).sizeMode, 'none');
     assert.equal(wm.getWindowState(7).tiling, 'managed');
   });
 });
@@ -139,7 +139,7 @@ test('propose: exclusive=fullscreen commits to WM state', async () => {
   await withWindowsSetup(7, async ({ events, pluginBus, wm }) => {
     trigger(pluginBus, 3);
     await waitFor(() => findLog(events, 'propose-fullscreen'));
-    assert.equal(wm.getWindowState(7).exclusive, 'fullscreen');
+    assert.equal(wm.getWindowState(7).sizeMode, 'fullscreen');
   });
 });
 
@@ -185,7 +185,7 @@ test('get: returns the window snapshot with windowState + state inlined', async 
     assert.equal(snap.surfaceId, 7);
     assert.equal(snap.windowState.layoutMode, 'floating');
     assert.equal(snap.windowState.tiling, 'managed');
-    assert.equal(snap.windowState.exclusive, 'none');
+    assert.equal(snap.windowState.sizeMode, 'none');
     assert.equal(snap.state.k, 'v');
   });
 });

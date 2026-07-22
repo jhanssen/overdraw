@@ -92,7 +92,7 @@ test('managed window on a v1 toplevel: maximized only (tiled states are v2+)', a
 test('maximized window: states contains maximized', async () => {
   const s = setup();
   s.wm.addWindow(1, { resource: {} });
-  await s.wm.propose(1, { exclusive: 'maximized' }, 'client-request');
+  await s.wm.propose(1, { sizeMode: 'maximized' }, 'client-request');
   configureToplevel(s.ctx, s.xs, 1000, 600);
   assert.deepEqual(s.getConfigure().states, [STATE_MAXIMIZED]);
 });
@@ -100,7 +100,7 @@ test('maximized window: states contains maximized', async () => {
 test('fullscreen window: states contains fullscreen', async () => {
   const s = setup();
   s.wm.addWindow(1, { resource: {} });
-  await s.wm.propose(1, { exclusive: 'fullscreen' }, 'client-request');
+  await s.wm.propose(1, { sizeMode: 'fullscreen' }, 'client-request');
   configureToplevel(s.ctx, s.xs, 1000, 600);
   assert.deepEqual(s.getConfigure().states, [STATE_FULLSCREEN]);
 });
@@ -117,7 +117,7 @@ test('focused managed window: maximized + tiled states + activated', async () =>
 test('maximized + focused: states contains both', async () => {
   const s = setup();
   s.wm.addWindow(1, { resource: {} });
-  await s.wm.propose(1, { exclusive: 'maximized' }, 'client-request');
+  await s.wm.propose(1, { sizeMode: 'maximized' }, 'client-request');
   s.ctx.state.seat = { kbFocus: { surfaceId: 1 } };
   configureToplevel(s.ctx, s.xs, 1000, 600);
   // Order: presentation first, then activated.
@@ -158,7 +158,7 @@ test('0x0 configure: managed window omits maximized + tiled (size-binding states
 test('0x0 configure: maximized window omits maximized', async () => {
   const s = setup();
   s.wm.addWindow(1, { resource: {} });
-  await s.wm.propose(1, { exclusive: 'maximized' }, 'client-request');
+  await s.wm.propose(1, { sizeMode: 'maximized' }, 'client-request');
   configureToplevel(s.ctx, s.xs, 0, 0);
   assert.deepEqual(s.getConfigure().states, []);
 });
@@ -166,7 +166,7 @@ test('0x0 configure: maximized window omits maximized', async () => {
 test('0x0 configure: fullscreen window omits fullscreen', async () => {
   const s = setup();
   s.wm.addWindow(1, { resource: {} });
-  await s.wm.propose(1, { exclusive: 'fullscreen' }, 'client-request');
+  await s.wm.propose(1, { sizeMode: 'fullscreen' }, 'client-request');
   configureToplevel(s.ctx, s.xs, 0, 0);
   assert.deepEqual(s.getConfigure().states, []);
 });
@@ -184,7 +184,7 @@ test('0x0 configure: activated is independent of size and still ships', async ()
 test('partially-zero configure (height = 0): size-binding states still suppressed', async () => {
   const s = setup();
   s.wm.addWindow(1, { resource: {} });
-  await s.wm.propose(1, { exclusive: 'maximized' }, 'client-request');
+  await s.wm.propose(1, { sizeMode: 'maximized' }, 'client-request');
   configureToplevel(s.ctx, s.xs, 800, 0);
   assert.deepEqual(s.getConfigure().states, []);
 });

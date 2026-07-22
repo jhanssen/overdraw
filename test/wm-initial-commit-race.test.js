@@ -62,7 +62,7 @@ test('client request landing during the preconfigure round-trip survives the com
   // stamp applies it synchronously.
   const p = wm.propose(1, { clientRequests: { wantsFullscreen: true } }, 'client-request');
   const win = wm.state.windows.find((w) => w.surfaceId === 1);
-  assert.equal(win.windowState.exclusive, 'fullscreen',
+  assert.equal(win.windowState.sizeMode, 'fullscreen',
     'pre-content stamp resolved fullscreen synchronously');
 
   // Plugins return their (stale) snapshot unchanged; the commit must not
@@ -71,18 +71,18 @@ test('client request landing during the preconfigure round-trip survives the com
   await micc;
   await p;
 
-  assert.equal(win.windowState.exclusive, 'fullscreen',
+  assert.equal(win.windowState.sizeMode, 'fullscreen',
     'fullscreen survived the initial-commit pipeline');
   const reverts = bus.committed.filter((ev) =>
-    ev.previous?.exclusive === 'fullscreen' && ev.current?.exclusive === 'none');
+    ev.previous?.sizeMode === 'fullscreen' && ev.current?.sizeMode === 'none');
   assert.deepEqual(reverts, [], 'no fullscreen->none commit was emitted');
   // The stamp must ANNOUNCE its edge: edge-driven consumers (the intercept
   // broker's excludeFullscreen) otherwise never learn the window went
   // fullscreen -- the async pass re-resolves to the same values and diffs
   // to nothing.
   const announced = bus.committed.filter((ev) =>
-    ev.previous?.exclusive === 'none' && ev.current?.exclusive === 'fullscreen'
-    && ev.changed?.includes('exclusive'));
+    ev.previous?.sizeMode === 'none' && ev.current?.sizeMode === 'fullscreen'
+    && ev.changed?.includes('sizeMode'));
   assert.ok(announced.length >= 1,
     'the pre-content fullscreen stamp emitted a window.committed edge');
 });
@@ -119,5 +119,5 @@ test('plugin changes made during preconfigure still apply', async () => {
 
   const win = wm.state.windows.find((w) => w.surfaceId === 1);
   assert.equal(win.windowState.tiling, 'floating', 'plugin change (float) applied');
-  assert.equal(win.windowState.exclusive, 'fullscreen', 'client request preserved');
+  assert.equal(win.windowState.sizeMode, 'fullscreen', 'client request preserved');
 });

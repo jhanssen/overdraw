@@ -30,9 +30,22 @@ test("drag-and-drop: source drag dropped on target transfers the payload", { ski
     const target = c.spawnClient(["--target", MIME],
       { bin: DND, readyMarker: "[dnd-client] target mapped" });
     await target.ready;
-    const snap = await c.waitFor(c.query, (s) => s.windows.length === 2, { what: "target window" });
+    await c.waitFor(c.query, (s) => s.windows.length === 2, { what: "target window" });
 
-    // Identify the two windows by title.
+    // Wait for the retile to LAND, not just be computed: the source keeps
+    // its old (full-region) drawn rect inside the resize-tx hold until it
+    // re-renders or the hold times out. Dropping while the rects still
+    // overlap would hit whichever window is on top at that point, not
+    // necessarily the target.
+    const disjoint = (a, b) =>
+      a.x + a.width <= b.x || b.x + b.width <= a.x
+      || a.y + a.height <= b.y || b.y + b.height <= a.y;
+    const snap = await c.waitFor(c.query, (s) => {
+      const src = s.windows.find((w) => w.title === "dnd-source");
+      const tgt = s.windows.find((w) => w.title === "dnd-target");
+      return src && tgt && disjoint(src.rect, tgt.rect);
+    }, { what: "windows tiled side by side" });
+
     const srcWin = snap.windows.find((w) => w.title === "dnd-source");
     const tgtWin = snap.windows.find((w) => w.title === "dnd-target");
     assert.ok(srcWin && tgtWin, "both windows present");

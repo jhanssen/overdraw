@@ -23,7 +23,7 @@ function captureTarget() {
 const OUTPUT = { id: 0, rect: { x: 0, y: 0, width: 1000, height: 600 }, scale: 1 };
 
 function managedWin(id) {
-  return { id, role: 'toplevel', tiling: 'managed', exclusive: 'none', visible: true };
+  return { id, role: 'toplevel', tiling: 'managed', sizeMode: 'none', visible: true };
 }
 
 function snapWith(islands, windows, outputs = [OUTPUT]) {
@@ -108,7 +108,7 @@ test('fullscreen on an explicit island covers the glass: island origin shifted b
   };
   const driver = createLayoutDriver({
     snapshot: () => snapWith([island],
-      [{ ...managedWin(1), exclusive: 'fullscreen' }]),
+      [{ ...managedWin(1), sizeMode: 'fullscreen' }]),
     target,
     reservedZones: zones,
     // The compute still runs (the exclusive member keeps occupying its
@@ -134,7 +134,7 @@ test('exclusive window owns only its island; the sibling island still tiles', as
   const islandB = { id: 11, contextOutputId: 0, rect: { x: 500, y: 0, width: 500, height: 600 }, members: [3] };
   const driver = createLayoutDriver({
     snapshot: () => snapWith([islandA, islandB], [
-      { ...managedWin(1), exclusive: 'maximized' },
+      { ...managedWin(1), sizeMode: 'maximized' },
       managedWin(2),
       managedWin(3),
     ]),

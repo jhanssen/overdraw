@@ -10,7 +10,7 @@ import type { CompositorBus } from "../events/window-bus.js";
 import type { DynamicBus } from "../events/dynamic-bus.js";
 import { WINDOW_EVENT } from "../events/types.js";
 import type {
-  WindowStateBagChangedEvent, ProposalReason, Tiling, Exclusive,
+  WindowStateBagChangedEvent, ProposalReason, Tiling, SizeMode,
 } from "../events/types.js";
 import type { CompositorState, CompositorSink } from "../protocols/ctx.js";
 import { rebuildStackWithPopups } from "../protocols/xdg_popup.js";
@@ -18,7 +18,7 @@ import { FOCUS_REASONS } from "@overdraw/focus-types";
 import { log } from "../log.js";
 
 const TILINGS: ReadonlyArray<Tiling> = ["managed", "floating"];
-const EXCLUSIVES: ReadonlyArray<Exclusive> = ["none", "maximized", "fullscreen"];
+const SIZE_MODES: ReadonlyArray<SizeMode> = ["none", "maximized", "fullscreen"];
 const PROPOSAL_REASONS: ReadonlyArray<ProposalReason> = [
   "client-request", "plugin", "user-input", "window-rule", "core",
 ];
@@ -663,9 +663,9 @@ function isProposePayload(d: unknown): d is {
     if (typeof p.tiling !== "string"
         || !(TILINGS as readonly string[]).includes(p.tiling)) return false;
   }
-  if (p.exclusive !== undefined) {
-    if (typeof p.exclusive !== "string"
-        || !(EXCLUSIVES as readonly string[]).includes(p.exclusive)) return false;
+  if (p.sizeMode !== undefined) {
+    if (typeof p.sizeMode !== "string"
+        || !(SIZE_MODES as readonly string[]).includes(p.sizeMode)) return false;
   }
   if (p.visible !== undefined) {
     if (typeof p.visible !== "boolean") return false;

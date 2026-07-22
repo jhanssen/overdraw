@@ -625,27 +625,27 @@ pluginBus.subscribe("output.changed", (_name, payload) => {
 
 // Fullscreen transitions retarget per-surface dmabuf feedback (the scanout
 // tranche leads while the surface is fullscreen on a scanout-capable
-// output). Keyed re-send: a committed event with no exclusive change is a
+// output). Keyed re-send: a committed event with no sizeMode change is a
 // cheap no-op.
 pluginBus.subscribe(WINDOW_EVENT.committed, (_name, payload) => {
   const changed = (payload as { changed?: string[] }).changed;
-  if (changed && !changed.includes("exclusive")) return;
+  if (changed && !changed.includes("sizeMode")) return;
   reemitScanoutFeedback(state, addon);
 });
 
-// Exclusive transitions are rare and load-bearing (fullscreen entry drives
-// decoration release, scanout eligibility, layout suppression); log each
+// sizeMode transitions are rare and load-bearing (fullscreen entry drives
+// decoration release, scanout eligibility, stacking tiers); log each
 // with its propose reason so a flap -- e.g. a client or sync loop reverting
 // fullscreen -- is visible in the session log.
 pluginBus.subscribe(WINDOW_EVENT.committed, (_name, payload) => {
   const ev = payload as {
     surfaceId?: number; reason?: string; changed?: string[];
-    previous?: { exclusive?: string }; current?: { exclusive?: string };
+    previous?: { sizeMode?: string }; current?: { sizeMode?: string };
   };
-  if (!ev.changed?.includes("exclusive")) return;
+  if (!ev.changed?.includes("sizeMode")) return;
   log.info("core",
-    `window ${ev.surfaceId}: exclusive ${ev.previous?.exclusive ?? "?"} -> `
-    + `${ev.current?.exclusive ?? "?"} (${ev.reason ?? "?"})`);
+    `window ${ev.surfaceId}: sizeMode ${ev.previous?.sizeMode ?? "?"} -> `
+    + `${ev.current?.sizeMode ?? "?"} (${ev.reason ?? "?"})`);
 });
 
 // M7 hotplug handlers. Logic factored out into output/hotplug.ts so tests
@@ -1144,7 +1144,7 @@ interceptBrokerLate = new InterceptBroker({
   compositor,
   isActivated: (sid) => state?.seat?.kbFocus?.surfaceId === sid,
   isFullscreen: (sid) => state?.wm?.state.windows
-    .find((w) => w.surfaceId === sid)?.windowState.exclusive === "fullscreen",
+    .find((w) => w.surfaceId === sid)?.windowState.sizeMode === "fullscreen",
   surfaceGeometry: (sid) => state?.surfacesById?.get(sid)?.xdgSurface?.geometry ?? null,
   gateSink: state.wm,
   inThread: {
@@ -1356,20 +1356,19 @@ pluginBus.subscribe("window.toggle-floating-requested", () => {
   void state.wm.propose(focused, { tiling: next }, "user-input");
 });
 
-// The window.toggle-maximize action: flip the focused window's exclusive
-// state. none -> maximized zooms the window over its island's workarea
-// (the layout driver hands an exclusive window the island's tile region,
-// which the canvas plugin keeps workarea-sized while a member is
-// exclusive); maximized or fullscreen -> none restores the captured
-// restoreRect via relayout.
+// The window.toggle-maximize action: flip the focused window's sizeMode.
+// none -> maximized zooms the window over its island's workarea (a
+// managed window keeps its layout slot; the WM demotes any other
+// maximized window on the island); maximized or fullscreen -> none
+// restores the captured restoreRect via relayout.
 pluginBus.subscribe("window.toggle-maximize-requested", () => {
   if (!state?.seat || !state.wm) return;
   const focused = state.seat.kbFocus?.surfaceId;
   if (typeof focused !== "number") return;
   const ws = state.wm.getWindowState(focused);
   if (!ws) return;
-  const next = ws.exclusive === "none" ? "maximized" : "none";
-  void state.wm.propose(focused, { exclusive: next }, "user-input");
+  const next = ws.sizeMode === "none" ? "maximized" : "none";
+  void state.wm.propose(focused, { sizeMode: next }, "user-input");
 });
 
 // window.move-to-output (explicit outputId): move the focused window to the
@@ -1450,13 +1449,16 @@ pluginBus.subscribe("window.move-to-output-cycle-requested", (_n, payload) => {
   pluginBus.emit("window.move-to-output-requested", { outputId: targetOutputId });
 });
 
-// Mirror keyboard focus into the WM. When focus lands on a window that
-// shares an output with a different window holding fullscreen/maximized,
-// the WM lifts the focused window above it (focusReveal) and re-pushes the
-// stack -- so focus-cycling away from a fullscreen window shows the newly
-// focused one instead of leaving it covered.
+// Mirror keyboard focus into the WM. Stacking follows focus (a focused
+// sizeMode window rises to the top tier; an unfocused fullscreen window
+// drops below the tiled tier), so a focus change can restack what is
+// under a stationary pointer. Re-pick pointer focus afterwards: without
+// it, the pointer stays on the surface that USED to be on top -- e.g. a
+// fullscreen game that hid the cursor keeps it hidden even though the
+// user focus-cycled to a window now covering the pointer position.
 bus.on(KEYBOARD_EVENT.focus, (ev) => {
   state?.wm?.setKeyboardFocus(ev.surfaceId);
+  state?.seat?.repickPointer();
 });
 
 // The focus.next / focus.prev actions emit this; cycle keyboard focus

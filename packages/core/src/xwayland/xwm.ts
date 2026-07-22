@@ -138,7 +138,7 @@ export interface XWindow {
   // reply is applied only if no local mutation happened since the read
   // was issued -- the X server may have serviced the read BEFORE a
   // ClientMessage we have since applied, and applying that stale reply
-  // would roll the cache (and the WM's exclusive state) back.
+  // would roll the cache (and the WM's sizeMode state) back.
   netWmStateSeq: number;
   // False until _NET_WM_STATE has been parsed at least once (property
   // apply or ClientMessage). Until then the window's fullscreen/maximized/
@@ -770,7 +770,7 @@ export function startXwm(state: CompositorState, addon: Addon, wmFd: number): Xw
         // Stale-reply guard: a _NET_WM_STATE read serviced by the X server
         // BEFORE a local mutation we have since applied (net-wm-state
         // ClientMessage, focus mirror) must not roll the atom cache back --
-        // that reverts the WM's exclusive decision (fullscreen flap).
+        // that reverts the WM's sizeMode decision (fullscreen flap).
         if (pend.name === "_NET_WM_STATE"
             && pend.stateSeq !== undefined && pend.stateSeq !== w.netWmStateSeq) {
           log.info("core",

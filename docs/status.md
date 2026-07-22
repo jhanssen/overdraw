@@ -6,17 +6,23 @@ test counts, and historical rationale live in `status-detailed.md`. This
 file is the short read; consult the detailed doc when investigating a
 specific subsystem.
 
-Last updated: 2026-07-20. Recent landings: exclusive dominance follows
-focus (a fullscreen/maximized window dominates its island -- topmost
-stacking, canvas island collapse -- only while keyboard-focused; unfocused
-it keeps its exclusive state and rect but the island stays a usable strip:
-peers keep their layout, newly-mapped windows get their first rect --
-suppression is a stacking concern, not geometry -- and focus-cycling
-reveals them above the fullscreen window. WM stamps exclusiveDominant
-alongside focusReveal; effectiveStackZ and the canvas collapse consume it.
-The harness now wires KEYBOARD_EVENT.focus into wm.setKeyboardFocus like
-production -- focusReveal/dominance was previously untestable in GPU
-tests). Prior: fullscreen-flap fixes (an X11
+Last updated: 2026-07-21. Recent landings: `exclusive` renamed to
+`sizeMode` with new tier-based semantics. A sizeMode window (fullscreen /
+maximized) keeps a fixed override rect (glass / island-scoped workarea)
+and is never reconfigured by focus changes; what the user sees is decided
+by STACKING alone. A fullscreen window is not a tile member by
+definition: it leaves the layout compute (peers reflow over the island),
+draws topmost while keyboard-focused, and drops BELOW the tiled tier when
+unfocused. A maximized MANAGED window stays a tile member (keeps its
+slot; peers hold position; the focused peer's z tie-break draws above
+it); a maximized floating window is a non-member and lowers like
+fullscreen. Any number of sizeMode windows coexist ("top z wins");
+maximized alone is single-instance per island -- a new maximize demotes
+the previous one via propose(). WM stamps stackTier (-1/0/+1) and
+kbFocused; effectiveStackZ and the canvas collapse consume them; the old
+focusReveal lift is gone. Keyboard-focus changes also re-pick pointer
+focus (main.ts), so a fullscreen client that hid the cursor no longer
+pins it hidden after focus-cycling away. Prior: fullscreen-flap fixes (an X11
 game declaring fullscreen pre-map flapped exclusive none<->fullscreen and
 often settled decorated/tiled: markInitialCommitComplete committed its
 stale pre-round-trip snapshot over the synchronously-stamped fullscreen --
@@ -145,7 +151,7 @@ nothing, with no error. Worst-first.
 - **`WindowState` splits the orthogonal axes and separates client
   requests from compositor decisions.** `WindowState` carries four
   decision fields the compositor owns -- `tiling` (`managed |
-  floating`), `exclusive` (`none | maximized | fullscreen`), `visible`
+  floating`), `sizeMode` (`none | maximized | fullscreen`), `visible`
   (boolean), `modal` (boolean) -- plus a `clientRequests` sub-object
   (`wantsMaximized`, `wantsFullscreen`, `wantsMinimized`, `wantsModal`)
   that records the client's stated wishes. The renderer + the
@@ -153,10 +159,10 @@ nothing, with no error. Worst-first.
   seam reads `clientRequests`.
 
   - `xdg_toplevel.set_maximized` writes `clientRequests.wantsMaximized
-    = true`; it does NOT directly touch `exclusive`. Same for
+    = true`; it does NOT directly touch `sizeMode`. Same for
     set_fullscreen / set_minimized and their unset_ counterparts.
     Interactive move/resize and plugin-driven layout decisions write
-    `tiling`/`exclusive`/`visible` directly.
+    `tiling`/`sizeMode`/`visible` directly.
   - `resolveDecisions(prev, candidate, phase)` is the default policy.
     Pre-content `wantsMaximized` is **suppressed by default** (the
     GTK/Qt startup boilerplate case); pre-content `wantsFullscreen` is
@@ -164,18 +170,20 @@ nothing, with no error. Worst-first.
     requests are honored on both axes. A window-rules plugin overrides
     via `window.preconfigure` (for first-content) or `window.proposed`
     (for later changes).
-  - The xdg_toplevel.configure encoder reads `tiling`/`exclusive`/
+  - The xdg_toplevel.configure encoder reads `tiling`/`sizeMode`/
     `visible` only. A client whose `wantsMaximized` was declined sees
     a configure with no maximized state (spec-correct: "the compositor
     responds with a configure event without the maximized state").
-  - The layout-driver reads `exclusive` and `visible` directly:
-    when any window on an output has `exclusive !== "none"`, only that
-    window is laid out (peers suppressed); invisible windows are
-    omitted from `rects[]` entirely. `LayoutResult.hidden` is gone.
+  - The layout-driver reads `sizeMode` and `visible` directly: every
+    visible sizeMode window gets an override rect (glass for
+    fullscreen; island-scoped workarea for maximized) and its plugin
+    slot rect (if any) is dropped at merge. Fullscreen windows are
+    excluded from the plugin compute (peers reflow); maximized managed
+    windows stay in it (slot preserved). Invisible windows are omitted
+    from `rects[]` entirely. `LayoutResult.hidden` is gone.
     `wm.applyLayout` already iterates only the ids in `rects[]`, so
-    omitted windows keep their geometry; `pushStack` filters by
-    `visible` and the per-output exclusive owner so invisible /
-    peer-suppressed windows are not in the draw stack.
+    omitted windows keep their geometry. Nothing is suppressed from
+    the draw stack by sizeMode; stacking tiers order it instead.
 
 - **`wl_region` is implemented; only the opaque region is unconsumed.**
   `add`/`subtract` build a real disjoint rect list (`region.ts`) snapshotted

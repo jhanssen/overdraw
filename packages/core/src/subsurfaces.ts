@@ -240,24 +240,22 @@ export function collectSubsurfaceIds(
 // `windows` is the toplevel order to emit. Default = wm.state.windows (the
 // global stack). Pass a filtered/reordered list for per-output expansion.
 // Without a WM AND no explicit list, returns [].
-// Effective stacking z for draw order and hit-testing. An exclusive
-// (fullscreen / maximized) window owns its island and OVERLAPS its
-// suppressed peers at the full output/tile size, so it must stack above
-// every non-exclusive window -- including floating windows, whose
-// raiseWindow z would otherwise put them on top. Both computeBaseStack
-// (draw, ascending) and the WM's windowAt (input, descending) sort by
-// this value; using the same key is what keeps clicks landing on the
-// pixels the user sees.
+// Effective stacking z for draw order and hit-testing. Stacking follows
+// keyboard focus across three tiers (WM-stamped stackTier): a focused
+// sizeMode (fullscreen/maximized) window covers everything on its output,
+// so it stacks above every other window -- including floating windows,
+// whose raiseWindow z would otherwise put them on top; an unfocused
+// fullscreen (or maximized floating) window is not a tile member and
+// drops below the tiled tier so the island around it stays visible and
+// hit-testable. Within a tier, z orders as usual and the keyboard-focused
+// window wins z ties -- the tiled tier shares one z, so this is what
+// draws the focused tile above an overlapping maximized tile member.
+// Both computeBaseStack (draw, ascending) and the WM's windowAt (input,
+// descending) sort by this value; using the same key is what keeps
+// clicks landing on the pixels the user sees.
 export function effectiveStackZ(w: WmWindowLike): number {
-  // focusReveal (WM-stamped: keyboard-focused window sharing an output with
-  // a DIFFERENT window holding exclusive) outranks the exclusive tier, so
-  // cycling focus away from a fullscreen window reveals the focused one.
-  if (w.focusReveal) return (w.z ?? 0) + 0x60000000;
-  // Dominance follows focus: only a FOCUSED exclusive window (WM-stamped
-  // exclusiveDominant) outranks its peers; unfocused it stacks normally
-  // so the island around it stays visible and hit-testable.
-  const boost = (w.exclusiveDominant ?? false) ? 0x40000000 : 0;
-  return (w.z ?? 0) + boost;
+  const tier = (w.stackTier ?? 0) * 0x40000000;
+  return tier + (w.z ?? 0) * 2 + ((w.kbFocused ?? false) ? 1 : 0);
 }
 
 export function computeBaseStack(
@@ -268,11 +266,14 @@ export function computeBaseStack(
   if (!list) return [];
   // Sort by ascending effective z (bottom-to-top). Ties keep input list
   // order (stable sort) -- callers passing wm.state.windows get the
-  // master-front order preserved within a z-bucket, which matters
-  // only when a bucket has multiple windows AND the layout puts them
-  // overlapping (the tiled bucket never overlaps; the floating
-  // bucket gets one z per window from raiseWindow; exclusive windows
-  // overlap everything and stack above via effectiveStackZ).
+  // master-front order preserved within a z-bucket, which matters only
+  // when a bucket has multiple windows AND the layout puts them
+  // overlapping: a maximized tile member overlaps its tiled-tier peers,
+  // and effectiveStackZ's kbFocused tie-break lifts only the focused
+  // one above it; the rest keep list order beneath. Floating windows
+  // get one z per window from raiseWindow; sizeMode tiers lift a
+  // focused override above everything and drop an unfocused non-member
+  // below the world.
   const sorted = [...list].sort((a, b) => effectiveStackZ(a) - effectiveStackZ(b));
   const stack: number[] = [];
   for (const win of sorted) {
@@ -306,16 +307,12 @@ export interface WmWindowLike {
   contentGateOwners?: ReadonlySet<string>;
   decorationSurfaceId?: number;
   z?: number;
-  // WM-stamped: exclusive AND keyboard-focused. effectiveStackZ boosts
-  // only dominant exclusive windows above the non-exclusive z tiers.
-  exclusiveDominant?: boolean;
-  // Behavioral state; effectiveStackZ reads focusReveal/exclusiveDominant
-  // rather than raw exclusive.
-  windowState?: { exclusive?: "none" | "maximized" | "fullscreen" };
-  // Stamped by the WM when this window is keyboard-focused and a DIFFERENT
-  // window on its output holds exclusive: the focused window draws above
-  // the exclusive tier (see effectiveStackZ).
-  focusReveal?: boolean;
+  // WM-stamped stacking tier (see the WM's updateStackTiers): +1 focused
+  // sizeMode window, -1 unfocused non-tile-member sizeMode window, 0
+  // otherwise. effectiveStackZ reads this rather than raw sizeMode.
+  stackTier?: -1 | 0 | 1;
+  // WM-stamped: keyboard-focused. Breaks z ties within a tier.
+  kbFocused?: boolean;
 }
 
 // Recompute the full draw stack (via rebuildStackWithPopups, the SINGLE owner of

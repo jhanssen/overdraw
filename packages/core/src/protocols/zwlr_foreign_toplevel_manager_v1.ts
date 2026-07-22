@@ -85,9 +85,9 @@ function buildStateArray(ws: WindowState | null, activated: boolean): Uint8Array
   if (ws) {
     if (!ws.visible) {
       out.push(STATE.minimized);
-    } else if (ws.exclusive === "maximized") {
+    } else if (ws.sizeMode === "maximized") {
       out.push(STATE.maximized);
-    } else if (ws.exclusive === "fullscreen") {
+    } else if (ws.sizeMode === "fullscreen") {
       out.push(STATE.fullscreen);
     }
   }
@@ -146,7 +146,7 @@ function emitCommitted(ctx: Ctx, mgr: Binding, surfaceId: number,
   if (!handle) return;
   let any = false;
   const stateChanged = prev.tiling !== next.tiling
-    || prev.exclusive !== next.exclusive
+    || prev.sizeMode !== next.sizeMode
     || prev.visible !== next.visible;
   if (stateChanged) {
     const activated = ctx.state.seat?.kbFocus?.surfaceId === surfaceId;

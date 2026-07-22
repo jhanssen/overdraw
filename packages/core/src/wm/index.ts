@@ -3,7 +3,7 @@
 // Owns the window list + stacking order and pushes layout/stack to the
 // compositor sink. The geometry policy (where windows go) lives in
 // layout-driver.ts (the resolver) + the bundled layout plugin. The
-// behavioral state of each window (tiling, exclusive, visible, layoutMode,
+// behavioral state of each window (tiling, sizeMode, visible, layoutMode,
 // constraints, parent, clientRequests) lives here, mutated through
 // propose().
 //
@@ -32,7 +32,7 @@ import type {
   StackRelayoutEvent,
   WindowState,
   Tiling,
-  Exclusive,
+  SizeMode,
   ClientRequests,
   ProposalReason,
   WindowProposedEvent,
@@ -117,21 +117,24 @@ export interface Window {
   // the end of each pass. null = unplaced (e.g. workspace plugin hasn't
   // claimed it for any output yet).
   outputId?: number | null;
-  // True while this window is keyboard-focused AND a different window on
-  // its output holds exclusive !== "none". effectiveStackZ lifts it above
-  // the exclusive tier so focus-cycling away from a fullscreen window
-  // reveals the newly focused one instead of leaving it covered.
-  // Maintained by updateFocusReveal (recomputed on every stack push and
-  // on setKeyboardFocus).
-  focusReveal?: boolean;
-  // True while this window holds exclusive !== "none" AND keyboard focus.
-  // Exclusive DOMINANCE follows focus: only a focused exclusive window
-  // suppresses its island peers from the draw stack and outranks them in
-  // effectiveStackZ. Unfocused, it keeps its exclusive STATE (the client
-  // stays fullscreen; the layout override rect stays) but stacks like a
-  // normal window, so the rest of the island is visible and usable.
-  // Maintained by updateFocusReveal alongside focusReveal.
-  exclusiveDominant?: boolean;
+  // Stacking tier, stamped by updateStackTiers (recomputed on every stack
+  // push and on setKeyboardFocus), consumed by effectiveStackZ:
+  //   +1  sizeMode !== "none", visible, keyboard-focused: draws above
+  //       every tier ("top z wins" -- a focused fullscreen/maximized
+  //       window covers the glass/workarea).
+  //   -1  sizeMode !== "none", visible, unfocused, and NOT a tile member
+  //       (fullscreen any tiling, or maximized floating): drops below the
+  //       tiled tier so the rest of the island is visible and usable. The
+  //       client keeps its state and rect; only stacking changes.
+  //    0  everything else -- including an unfocused maximized MANAGED
+  //       window, which is a tile member (it keeps its slot) and stays in
+  //       the tiled tier; the focused peer's kbFocused tie-break draws
+  //       above it.
+  stackTier?: -1 | 0 | 1;
+  // True while this window is keyboard-focused. Breaks z ties within a
+  // tier (the tiled tier shares one z), so the focused tiled window draws
+  // above an overlapping maximized tile member. Stamped by updateStackTiers.
+  kbFocused?: boolean;
   // Per-window mutation queue. Async operations on win.windowState
   // (propose, markInitialCommitComplete) chain on this so a second call
   // doesn't read stale state mid-microtask from an in-flight first call.
@@ -176,7 +179,7 @@ export interface Window {
 export function defaultWindowState(): WindowState {
   return {
     tiling: "managed",
-    exclusive: "none",
+    sizeMode: "none",
     visible: true,
     modal: false,
     clientRequests: {
@@ -242,13 +245,13 @@ export interface InsetGrant { insets: Insets; outerRect: Rect; contentRect: Rect
 // state, runs the candidate through the proposed-event chain, then commits.
 // Fields omitted from the proposal stay at their current value.
 //
-// `tiling`, `exclusive`, `visible` are the compositor's decisions; a plugin
+// `tiling`, `sizeMode`, `visible` are the compositor's decisions; a plugin
 // (or core) writes them directly. Client requests (xdg_toplevel.set_*)
 // arrive as `clientRequests` and go through resolveDecisions() to become
 // decision-axis writes.
 export interface WindowStateProposal {
   tiling?: Tiling;
-  exclusive?: Exclusive;
+  sizeMode?: SizeMode;
   visible?: boolean;
   modal?: boolean;
   clientRequests?: Partial<ClientRequests>;
@@ -419,7 +422,7 @@ export interface Wm {
   // to update geometry per motion event; bypasses the proposal pipeline
   // because per-frame interactive drags are continuous geometric
   // updates, not policy decisions. The window must be in the floating
-  // lane (tiling === "floating") and non-exclusive for the rect to
+  // lane (tiling === "floating") with sizeMode "none" for the rect to
   // take effect (otherwise the resolver ignores it -- the rect is
   // still stored for later transitions). Triggers a relayout pass.
   setFloatingRect(surfaceId: number, rect: Rect): void;
@@ -443,12 +446,12 @@ export interface Wm {
   focusOrder(): number[];
 
   // Report the current keyboard-focused surface (any surface id or null;
-  // non-window ids simply match no window). When focus lands on a window
-  // that shares an output with a DIFFERENT window holding exclusive
-  // (fullscreen/maximized), the focused window is lifted above the
-  // exclusive tier (focusReveal) and the stack re-pushes -- focus-cycling
-  // away from a fullscreen window reveals the newly focused one. The
-  // seat's keyboard.focus bus event is the single caller.
+  // non-window ids simply match no window). Stacking follows focus: a
+  // focused sizeMode window rises to the top tier, an unfocused
+  // fullscreen (or maximized floating) window drops below the tiled
+  // tier, and the focused window wins z ties within its tier -- so
+  // focus-cycling away from a fullscreen window uncovers the island.
+  // The seat's keyboard.focus bus event is the single caller.
   setKeyboardFocus(surfaceId: number | null): void;
 
   // Reorder the window list relative to one surface:
@@ -506,7 +509,7 @@ function contentOf(win: Window): Rect {
   // window is smaller than the output, and geometry-derived clients
   // (Wine's EWMH state sync) respond by dropping fullscreen, which
   // oscillates.
-  if (win.windowState.exclusive === "fullscreen") return { ...win.outer };
+  if (win.windowState.sizeMode === "fullscreen") return { ...win.outer };
   return win.insets ? shrink(win.outer, win.insets) : { ...win.outer };
 }
 
@@ -530,7 +533,7 @@ function isRect(v: unknown): v is Rect {
 function cloneState(s: WindowState): WindowState {
   return {
     tiling: s.tiling,
-    exclusive: s.exclusive,
+    sizeMode: s.sizeMode,
     visible: s.visible,
     modal: s.modal,
     clientRequests: { ...s.clientRequests },
@@ -552,7 +555,7 @@ function validateState(v: unknown): WindowState | null {
   if (typeof v !== "object" || v === null) return null;
   const o = v as { [k: string]: unknown };
   if (o.tiling !== "managed" && o.tiling !== "floating") return null;
-  if (o.exclusive !== "none" && o.exclusive !== "maximized" && o.exclusive !== "fullscreen") return null;
+  if (o.sizeMode !== "none" && o.sizeMode !== "maximized" && o.sizeMode !== "fullscreen") return null;
   if (typeof o.visible !== "boolean") return null;
   if (typeof o.modal !== "boolean") return null;
   const cr = o.clientRequests;
@@ -585,7 +588,7 @@ function validateState(v: unknown): WindowState | null {
 
 // Fields whose change requires a layout pass.
 const GEOMETRY_FIELDS: ReadonlyArray<keyof WindowState> = [
-  "tiling", "exclusive", "visible", "layoutMode", "layoutData", "constraints",
+  "tiling", "sizeMode", "visible", "layoutMode", "layoutData", "constraints",
 ];
 
 // Fields whose change requires a stacking pass (z-recompute + raise of any
@@ -599,7 +602,7 @@ const STACKING_FIELDS: ReadonlyArray<keyof WindowState> = [
 function diffState(prev: WindowState, next: WindowState): Array<keyof WindowState> {
   const out: Array<keyof WindowState> = [];
   if (prev.tiling !== next.tiling) out.push("tiling");
-  if (prev.exclusive !== next.exclusive) out.push("exclusive");
+  if (prev.sizeMode !== next.sizeMode) out.push("sizeMode");
   if (prev.visible !== next.visible) out.push("visible");
   if (prev.modal !== next.modal) out.push("modal");
   if (!clientRequestsEqual(prev.clientRequests, next.clientRequests)) out.push("clientRequests");
@@ -643,7 +646,7 @@ function restoreRectEqual(a: Rect | null, b: Rect | null): boolean {
 function mergeProposal(current: WindowState, p: WindowStateProposal): WindowState {
   const next = cloneState(current);
   if (p.tiling !== undefined) next.tiling = p.tiling;
-  if (p.exclusive !== undefined) next.exclusive = p.exclusive;
+  if (p.sizeMode !== undefined) next.sizeMode = p.sizeMode;
   if (p.visible !== undefined) next.visible = p.visible;
   if (p.modal !== undefined) next.modal = p.modal;
   if (p.clientRequests !== undefined) {
@@ -681,7 +684,7 @@ function mergeProposal(current: WindowState, p: WindowStateProposal): WindowStat
 // Apply the default policy that maps clientRequests onto the decision axes.
 // This runs AFTER the proposed-interceptor chain (so a plugin sees the
 // post-merge candidate including the new clientRequests and may pre-empt
-// the resolution by writing tiling/exclusive/visible directly). The
+// the resolution by writing tiling/sizeMode/visible directly). The
 // candidate passed in here is the one the WM is about to commit; the
 // returned state reflects the policy-resolved decisions.
 //
@@ -704,23 +707,23 @@ function resolveDecisions(
   const req = candidate.clientRequests;
   const decisionDirectlySet =
     prev.tiling !== candidate.tiling
-    || prev.exclusive !== candidate.exclusive
+    || prev.sizeMode !== candidate.sizeMode
     || prev.visible !== candidate.visible
     || prev.modal !== candidate.modal;
   if (decisionDirectlySet) return out;
 
   // wantsFullscreen wins over wantsMaximized (matches EWMH precedence).
   if (req.wantsFullscreen !== prevReq.wantsFullscreen) {
-    out.exclusive = req.wantsFullscreen ? "fullscreen" : "none";
+    out.sizeMode = req.wantsFullscreen ? "fullscreen" : "none";
   } else if (req.wantsMaximized !== prevReq.wantsMaximized) {
     if (req.wantsMaximized) {
       // Default policy: pre-content set_maximized from a client is
       // suppressed (GTK/Qt startup boilerplate that demands maximize
       // before the user has seen the window). A window-rules plugin
       // intercepting window.preconfigure may override.
-      if (phase === "post-content") out.exclusive = "maximized";
-    } else if (out.exclusive === "maximized") {
-      out.exclusive = "none";
+      if (phase === "post-content") out.sizeMode = "maximized";
+    } else if (out.sizeMode === "maximized") {
+      out.sizeMode = "none";
     }
   }
 
@@ -834,7 +837,7 @@ function resolveParentOutputId(
 // Window state convenience helpers re-exported here so callers reading the
 // WM module don't need a parallel events/types.js import.
 export type {
-  Tiling, Exclusive, ClientRequests, WindowState, ProposalReason,
+  Tiling, SizeMode, ClientRequests, WindowState, ProposalReason,
 } from "../events/types.js";
 
 // Re-exported for the test that wants to assert modal-tether behavior
@@ -897,7 +900,7 @@ export function createWm(
   const windows: Window[] = [];
   const wm: WmState = { outputs: outputsMap(outputs), windows };
   // The keyboard-focused surface as reported via setKeyboardFocus (any
-  // surface id, not necessarily a WM window). Drives focusReveal.
+  // surface id, not necessarily a WM window). Drives stackTier/kbFocused.
   let focusedWindowId: number | null = null;
 
   // Z-order state. tiledZ is the single z value shared by every
@@ -1162,99 +1165,43 @@ export function createWm(
   }
 
   function pushStack(): void {
-    updateFocusReveal();
+    updateStackTiers();
     if (rebuild) { rebuild(); return; }
+    // Harness fallback (no rebuild wired): emit visible, non-gated windows
+    // bottom-to-top in the same order computeBaseStack uses, so GPU-free
+    // tests observe the production stacking.
+    const ordered = windows
+      .filter((w) => !isGated(w) && w.hasContent && w.windowState.visible)
+      .sort((a, b) => effectiveStackZ(a) - effectiveStackZ(b));
     const ids: number[] = [];
-    // A FOCUSED exclusive window (exclusiveDominant) owns its workspace:
-    // every peer is omitted from the draw stack except a focusReveal
-    // peer, which draws above it. An unfocused exclusive window keeps
-    // its state and rect but suppresses nothing. Invisible windows
-    // (visible === false) are omitted regardless.
-    const exclusiveByOutput = exclusiveWindowsByOutput();
-    const revealed: number[] = [];
-    for (const w of windows) {
-      if (isGated(w) || !w.hasContent) continue;
-      if (!w.windowState.visible) continue;
-      const ownerOutput = outputOf(w.surfaceId);
-      if (ownerOutput !== null) {
-        const exclusiveId = exclusiveByOutput.get(ownerOutput);
-        // Peers are omitted only while the owner is DOMINANT (focused):
-        // an unfocused fullscreen window keeps its state and rect but the
-        // rest of the island stays in the stack and usable. A focusReveal
-        // peer always appends after the main pass -- the exclusive
-        // window's glass-sized rect overlaps it regardless of dominance.
-        const owner = exclusiveId !== undefined
-          ? windows.find((x) => x.surfaceId === exclusiveId) : undefined;
-        if (exclusiveId !== undefined && exclusiveId !== w.surfaceId) {
-          if (w.focusReveal) {
-            if (w.decorationSurfaceId !== undefined) revealed.push(w.decorationSurfaceId);
-            revealed.push(w.surfaceId);
-            continue;
-          }
-          if (owner?.exclusiveDominant ?? false) continue;
-        }
-      }
+    for (const w of ordered) {
       if (w.decorationSurfaceId !== undefined) ids.push(w.decorationSurfaceId);
       ids.push(w.surfaceId);
     }
-    ids.push(...revealed);
     compositor.setStack(ids);
   }
 
-  // Recompute every window's focusReveal flag (see the Window field doc).
-  // Returns whether any flag changed so callers can re-push the stack.
-  function updateFocusReveal(): boolean {
-    const exclusiveByOutput =
-      focusedWindowId !== null ? exclusiveWindowsByOutput() : null;
+  // Recompute every window's stackTier + kbFocused (see the Window field
+  // docs). Returns whether any flag changed so callers can re-push the
+  // stack.
+  function updateStackTiers(): boolean {
     let changed = false;
     for (const w of windows) {
-      let reveal = false;
-      if (exclusiveByOutput !== null && exclusiveByOutput.size > 0
-          && w.surfaceId === focusedWindowId
-          && w.windowState.visible
-          && w.windowState.exclusive === "none") {
-        const ownerOutput = outputOf(w.surfaceId);
-        const exclusiveId =
-          ownerOutput !== null ? exclusiveByOutput.get(ownerOutput) : undefined;
-        reveal = exclusiveId !== undefined && exclusiveId !== w.surfaceId;
-      }
-      if ((w.focusReveal ?? false) !== reveal) {
-        w.focusReveal = reveal;
-        changed = true;
-      }
-      // Dominance follows focus: exclusive state alone does not suppress
-      // peers -- only the focused exclusive window owns its island.
-      const dominant = w.windowState.exclusive !== "none"
-        && w.windowState.visible
-        && w.surfaceId === focusedWindowId;
-      if ((w.exclusiveDominant ?? false) !== dominant) {
-        w.exclusiveDominant = dominant;
-        changed = true;
-      }
+      const focused = w.surfaceId === focusedWindowId;
+      const overriding = w.windowState.sizeMode !== "none" && w.windowState.visible;
+      // A maximized managed window is a tile member (it keeps its slot)
+      // and stays in the tiled tier. Fullscreen (any tiling) and
+      // maximized floating windows are not members; unfocused they drop
+      // below the tiled tier.
+      const tileMember = w.windowState.tiling === "managed"
+        && w.windowState.sizeMode !== "fullscreen";
+      let tier: -1 | 0 | 1 = 0;
+      if (overriding && focused) tier = 1;
+      else if (overriding && !tileMember) tier = -1;
+      if ((w.stackTier ?? 0) !== tier) { w.stackTier = tier; changed = true; }
+      if ((w.kbFocused ?? false) !== focused) { w.kbFocused = focused; changed = true; }
     }
     return changed;
-  }
-
-  // Resolve which window (if any) holds exclusive ownership of each
-  // output. Iterates outputContent (the workspace plugin's per-output
-  // visible-window order) and picks the first window in each list whose
-  // `exclusive` is not "none" and whose `visible` is true.
-  function exclusiveWindowsByOutput(): Map<number, number> {
-    const out = new Map<number, number>();
-    if (!outputContent) return out;
-    const content = outputContent();
-    for (const [outputId, ids] of content) {
-      for (const id of ids) {
-        const w = windows.find((x) => x.surfaceId === id);
-        if (!w) continue;
-        if (!w.windowState.visible) continue;
-        if (w.windowState.exclusive !== "none") {
-          out.set(outputId, id);
-          break;
-        }
-      }
-    }
-    return out;
   }
 
   // Resolve the output a window currently lives on by scanning
@@ -1500,7 +1447,7 @@ export function createWm(
 
       // Same fullscreen carve-out as contentOf: the fullscreen configure
       // must be the bare outer rect even while insets are still granted.
-      const newContent = win.insets && win.windowState.exclusive !== "fullscreen"
+      const newContent = win.insets && win.windowState.sizeMode !== "fullscreen"
         ? shrink(newOuter, win.insets) : { ...newOuter };
       const sizeChanged = newContent.width !== prevContent.width || newContent.height !== prevContent.height;
       const moved = prevOuter.x !== newOuter.x || prevOuter.y !== newOuter.y
@@ -1716,7 +1663,7 @@ export function createWm(
         id: w.surfaceId,
         role: "toplevel" as const,
         tiling: w.windowState.tiling,
-        exclusive: w.windowState.exclusive,
+        sizeMode: w.windowState.sizeMode,
         visible: w.windowState.visible,
         layoutMode: w.windowState.layoutMode ?? undefined,
         layoutData: w.windowState.layoutData,
@@ -1771,7 +1718,23 @@ export function createWm(
     ? layoutDriverFactory(target, snapshot)
     : { schedule: () => { /* no-op */ }, settled: () => Promise.resolve() };
 
-  return {
+  // Maximized is single-instance per island: a window entering
+  // "maximized" demotes any other maximized window on the same output
+  // back to "none" (its restoreRect applies). Fullscreen windows are
+  // untouched -- any number may coexist; stacking decides what shows.
+  // Runs through propose() so the demoted window gets the full pipeline
+  // (events, un-maximized configure, relayout).
+  function demoteMaximizedPeers(of: Window): void {
+    const island = outputOf(of.surfaceId);
+    for (const w of windows) {
+      if (w === of) continue;
+      if (w.windowState.sizeMode !== "maximized") continue;
+      if (outputOf(w.surfaceId) !== island) continue;
+      void api.propose(w.surfaceId, { sizeMode: "none" }, "core");
+    }
+  }
+
+  const api: Wm = {
     state: wm,
 
     schedule(reason) {
@@ -1864,7 +1827,7 @@ export function createWm(
           && (minW === maxW || minH === maxH);
         let dialogPolicyMutated = false;
         if (win.windowState.tiling === "managed"
-            && win.windowState.exclusive === "none"
+            && win.windowState.sizeMode === "none"
             && (win.windowState.parent !== null || fixedSize || win.floatByType)) {
           win.windowState = { ...win.windowState, tiling: "floating" };
           dialogPolicyMutated = true;
@@ -1884,7 +1847,7 @@ export function createWm(
         // the content rect equal to the client's size.
         let floatingSized = false;
         if (win.windowState.tiling === "floating"
-            && win.windowState.exclusive === "none"
+            && win.windowState.sizeMode === "none"
             && win.floatingRect === undefined) {
           const clampAxis = (v: number, lo: number, hi: number): number => {
             let r = v;
@@ -2213,12 +2176,12 @@ export function createWm(
       } else {
         candidates = [...windows];
       }
-      // Stable descending-effective-z sort: ties keep candidate order (the
-      // tiled bucket shares one z and never overlaps, so tie order is
-      // immaterial). effectiveStackZ lifts exclusive (fullscreen/maximized)
-      // windows above every other tier -- they DO overlap their suppressed
-      // island peers, and the renderer stacks them with the same key, so
-      // input and pixels agree.
+      // Stable descending-effective-z sort: ties keep candidate order.
+      // effectiveStackZ folds in the sizeMode stacking tier and the
+      // kbFocused tie-break, and the renderer stacks with the same key,
+      // so input and pixels agree -- a click lands on whatever is drawn
+      // on top, including the focused tile revealed above a maximized
+      // peer.
       candidates.sort((a, b) => effectiveStackZ(b) - effectiveStackZ(a));
       for (const win of candidates) {
         const r = win.rect;
@@ -2238,7 +2201,7 @@ export function createWm(
       if (!win) return null;
       // Before the initial commit, the throwaway 0x0 first configure is sent
       // SYNCHRONOUSLY (sendInitialConfigure) and its states array is read from
-      // win.windowState (tiling/exclusive/visible). A direct decision-axis
+      // win.windowState (tiling/sizeMode/visible). A direct decision-axis
       // write that arrived in the same wayland-batch goes through this async
       // pipeline, which only writes windowState after a microtask hop -- too
       // late for that first configure. Stamp the client-declared decision
@@ -2249,7 +2212,7 @@ export function createWm(
         const preStamp = cloneState(win.windowState);
         const stamp: Partial<WindowState> = {};
         if (proposal.tiling !== undefined) stamp.tiling = proposal.tiling;
-        if (proposal.exclusive !== undefined) stamp.exclusive = proposal.exclusive;
+        if (proposal.sizeMode !== undefined) stamp.sizeMode = proposal.sizeMode;
         if (proposal.visible !== undefined) stamp.visible = proposal.visible;
         if (proposal.modal !== undefined) stamp.modal = proposal.modal;
         if (proposal.parent !== undefined) stamp.parent = proposal.parent;
@@ -2378,13 +2341,13 @@ export function createWm(
           win.floatingRect = { ...win.outer };
         }
 
-        // Capture restoreRect on entry into exclusive, restore on exit.
-        const wasExclusive = current.exclusive !== "none";
-        const becomingExclusive = candidate.exclusive !== "none";
-        if (!wasExclusive && becomingExclusive && candidate.restoreRect === null) {
+        // Capture restoreRect on entry into a sizeMode, restore on exit.
+        const hadSizeMode = current.sizeMode !== "none";
+        const gainsSizeMode = candidate.sizeMode !== "none";
+        if (!hadSizeMode && gainsSizeMode && candidate.restoreRect === null) {
           candidate.restoreRect = { ...win.outer };
         }
-        if (wasExclusive && !becomingExclusive && candidate.restoreRect !== null) {
+        if (hadSizeMode && !gainsSizeMode && candidate.restoreRect !== null) {
           // restoreRect consumed; layout-driver will read it via the
           // snapshot for the destination lane (floating uses it as
           // floatingRect fallback). Clear so a subsequent re-entry
@@ -2414,11 +2377,11 @@ export function createWm(
         if (win.hasContent && changed.some((f) => STACKING_FIELDS.includes(f))) {
           assignZForMap(win);
           pushStack();
-        } else if (win.hasContent && changed.includes("exclusive")) {
-          // Exclusive transitions change the window's EFFECTIVE stacking
-          // tier (effectiveStackZ lifts an exclusive window above every
-          // peer it now overlaps) without touching win.z, so the draw
-          // stack must be re-pushed even though no z was reassigned.
+        } else if (win.hasContent && changed.includes("sizeMode")) {
+          // sizeMode transitions change the window's stacking TIER
+          // (updateStackTiers / effectiveStackZ) without touching win.z,
+          // so the draw stack must be re-pushed even though no z was
+          // reassigned.
           pushStack();
         }
         // Modal transitions: tether or untether focus.
@@ -2428,6 +2391,9 @@ export function createWm(
           } else if (!candidate.modal && current.modal) {
             untetherFocusOnUnmodal(win, surfaceId);
           }
+        }
+        if (candidate.sizeMode === "maximized" && current.sizeMode !== "maximized") {
+          demoteMaximizedPeers(win);
         }
         return cloneState(candidate);
       } finally {
@@ -2622,10 +2588,13 @@ export function createWm(
     setKeyboardFocus(surfaceId) {
       if (focusedWindowId === surfaceId) return;
       focusedWindowId = surfaceId;
-      // pushStack re-runs updateFocusReveal itself, but only re-push when
-      // something actually changed -- most focus changes have no exclusive
-      // window in play and must not cost a stack rebuild.
-      if (updateFocusReveal()) pushStack();
+      // pushStack re-runs updateStackTiers itself, but only re-push when
+      // a tier or the kbFocused tie-break actually changed -- a focus
+      // change between non-overlapping windows must not cost a rebuild
+      // when nothing in the draw order moves. kbFocused flips on every
+      // focus change between WM windows, which is exactly when tie-break
+      // order within the tiled tier can change.
+      if (updateStackTiers()) pushStack();
     },
 
     focusOrder() {
@@ -2712,6 +2681,7 @@ export function createWm(
       }
     },
   };
+  return api;
 }
 
 function snapshotOf(win: Window): WindowSnapshot {
@@ -2726,7 +2696,7 @@ function snapshotOf(win: Window): WindowSnapshot {
     contentGated: win.contentGateOwners !== undefined && win.contentGateOwners.size > 0,
     windowState: {
       tiling: win.windowState.tiling,
-      exclusive: win.windowState.exclusive,
+      sizeMode: win.windowState.sizeMode,
       visible: win.windowState.visible,
       modal: win.windowState.modal,
       clientRequests: { ...win.windowState.clientRequests },

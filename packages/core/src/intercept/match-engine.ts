@@ -41,12 +41,12 @@ export interface RegistrationData {
 
 // A mapped toplevel's match-relevant fields. Updated by the broker on
 // window.map / window.change / window.unmap / window.committed
-// (exclusive transitions).
+// (sizeMode transitions).
 export interface ToplevelData {
   surfaceId: number;
   appId: string | null;
   title: string | null;
-  // Current exclusive=fullscreen state. Optional: an update that omits
+  // Current sizeMode=fullscreen state. Optional: an update that omits
   // it (e.g. the map event, which doesn't carry window state) leaves
   // the tracked value unchanged.
   fullscreen?: boolean;

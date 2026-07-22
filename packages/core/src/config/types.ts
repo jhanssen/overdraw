@@ -218,14 +218,14 @@ export interface WindowRuleQuery {
 
 // Facade passed to a rule's `apply` lambda. The read fields mirror
 // WindowRuleQuery; `state` is the mutable pre-map proposal. Assign any field
-// of `state` (tiling, exclusive, visible, modal, constraints, parent,
+// of `state` (tiling, sizeMode, visible, modal, constraints, parent,
 // layoutMode/layoutData) and it takes effect before the window is mapped (no
 // flicker). The compositor validates the result; an out-of-shape value is
 // ignored (the original state stands).
 //
 //   apply: (win) => {
 //     win.state.tiling = "floating";
-//     if (win.title?.includes("Picture-in-Picture")) win.state.exclusive = "none";
+//     if (win.title?.includes("Picture-in-Picture")) win.state.sizeMode = "none";
 //   }
 export interface WindowRuleTarget extends WindowRuleQuery {
   state: WindowState;

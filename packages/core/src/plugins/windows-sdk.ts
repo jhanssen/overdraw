@@ -16,12 +16,12 @@ import type { PluginEvents } from "./events.js";
 import { createWindowObserver } from "./window-observer.js";
 import { FOCUS_REASONS, type FocusReason } from "@overdraw/focus-types";
 import type {
-  Tiling, Exclusive, ClientRequests, ProposalReason, WindowState,
+  Tiling, SizeMode, ClientRequests, ProposalReason, WindowState,
 } from "../events/types.js";
 
 // Re-exported so plugins building proposals don't need a parallel import.
 export type {
-  Tiling, Exclusive, ClientRequests, ProposalReason, WindowState,
+  Tiling, SizeMode, ClientRequests, ProposalReason, WindowState,
 } from "../events/types.js";
 
 // A partial WindowState. Fields omitted from the proposal stay at their
@@ -29,7 +29,7 @@ export type {
 // min/max stays put.
 export interface WindowStateProposal {
   tiling?: Tiling;
-  exclusive?: Exclusive;
+  sizeMode?: SizeMode;
   visible?: boolean;
   modal?: boolean;
   clientRequests?: Partial<ClientRequests>;
@@ -736,7 +736,7 @@ export function createPluginWindows(
 }
 
 const TILINGS: ReadonlyArray<Tiling> = ["managed", "floating"];
-const EXCLUSIVES: ReadonlyArray<Exclusive> = ["none", "maximized", "fullscreen"];
+const SIZE_MODES: ReadonlyArray<SizeMode> = ["none", "maximized", "fullscreen"];
 
 function validateProposal(p: WindowStateProposal): void {
   if (typeof p !== "object" || p === null) {
@@ -747,10 +747,10 @@ function validateProposal(p: WindowStateProposal): void {
     throw new TypeError(
       `propose tiling must be one of ${TILINGS.join("|")}`);
   }
-  if (p.exclusive !== undefined
-      && !(EXCLUSIVES as readonly string[]).includes(p.exclusive)) {
+  if (p.sizeMode !== undefined
+      && !(SIZE_MODES as readonly string[]).includes(p.sizeMode)) {
     throw new TypeError(
-      `propose exclusive must be one of ${EXCLUSIVES.join("|")}`);
+      `propose sizeMode must be one of ${SIZE_MODES.join("|")}`);
   }
   if (p.visible !== undefined && typeof p.visible !== "boolean") {
     throw new TypeError("propose visible must be a boolean");

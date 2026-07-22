@@ -169,8 +169,8 @@ export default function makeToplevel(ctx: Ctx): XdgToplevelHandler {
     unset_maximized(resource) {
       // Spec: "after this request, the compositor will respond by
       // emitting a configure event without the maximized state."
-      // Clearing the wish lets resolveDecisions revert exclusive to
-      // "none" only when the WM is currently in exclusive=maximized
+      // Clearing the wish lets resolveDecisions revert sizeMode to
+      // "none" only when the WM is currently in sizeMode=maximized
       // (so a floating window prophylactically sending unset_maximized
       // doesn't leak into the tiling lane).
       propose(resource, { clientRequests: { wantsMaximized: false } });
@@ -178,7 +178,7 @@ export default function makeToplevel(ctx: Ctx): XdgToplevelHandler {
     set_fullscreen(resource, output) {
       propose(resource, { clientRequests: { wantsFullscreen: true } });
       // Optional target output: ask the workspace plugin (which owns output
-      // placement) to move the window there. It's already exclusive=fullscreen,
+      // placement) to move the window there. It's already sizeMode=fullscreen,
       // so the layout driver fullscreens it on whichever output it lands on.
       if (output) {
         const surfaceId = ctx.state.toplevels?.get(resource)?.xdgSurface.surface?.id;

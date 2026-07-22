@@ -93,7 +93,7 @@ function surfaceIdOf(state: CompositorState, surface: Resource): number | null {
 // is fullscreen there. null = not fullscreen anywhere.
 function scanoutOutputFor(state: CompositorState, surfaceId: number): number | null {
   const ws = state.wm?.getWindowState(surfaceId);
-  if (!ws || ws.exclusive !== "fullscreen") return null;
+  if (!ws || ws.sizeMode !== "fullscreen") return null;
   const outs = state.compositor.surfaceOutputs?.(surfaceId);
   return outs && outs.length > 0 ? outs[0] : null;
 }

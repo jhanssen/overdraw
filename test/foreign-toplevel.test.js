@@ -106,7 +106,7 @@ function mockCtx() {
         propose.push({ id, partial, reason });
         // Merge into the recorded state so the test can observe the result.
         const cur = state._wmStates.get(id) ?? {
-          tiling: "managed", exclusive: "none", visible: true, modal: false,
+          tiling: "managed", sizeMode: "none", visible: true, modal: false,
           clientRequests: {
             wantsMaximized: false, wantsFullscreen: false,
             wantsMinimized: false, wantsModal: false,
@@ -305,7 +305,7 @@ test("window.change(activated): handle re-emits state + done", () => {
 
 function ws(over = {}) {
   return {
-    tiling: "managed", exclusive: "none", visible: true, modal: false,
+    tiling: "managed", sizeMode: "none", visible: true, modal: false,
     clientRequests: {
       wantsMaximized: false, wantsFullscreen: false,
       wantsMinimized: false, wantsModal: false,
@@ -330,7 +330,7 @@ test("window.committed(exclusive maximized): handle emits state + done", () => {
   ctx.state.pluginBus.emit("window.committed", {
     surfaceId: 200,
     previous: ws(),
-    current: ws({ exclusive: "maximized" }),
+    current: ws({ sizeMode: "maximized" }),
   });
 
   const stateEv = ctx.state._sent.find(([k]) => k === "state");

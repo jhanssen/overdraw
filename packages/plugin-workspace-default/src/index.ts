@@ -463,7 +463,7 @@ async function activate(
   // A client asked to go fullscreen on a specific output (xdg_toplevel
   // .set_fullscreen with an output arg). Output placement is ours, so move the
   // window to that output's shown workspace; the WM already flagged it
-  // exclusive=fullscreen and fullscreens it on whichever output it lands on.
+  // sizeMode=fullscreen and fullscreens it on whichever output it lands on.
   sdk.events.subscribe("window.fullscreen-output-request", (_name, payload) => {
     const p = payload as { surfaceId?: unknown; outputId?: unknown };
     if (typeof p.surfaceId !== "number" || typeof p.outputId !== "number") return;

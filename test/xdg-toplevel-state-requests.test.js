@@ -55,7 +55,7 @@ test('set_maximized: post-content default policy honors -> exclusive=maximized',
   await new Promise((resolve) => setImmediate(resolve));
   const s = setup.wm.getWindowState(1);
   assert.equal(s.clientRequests.wantsMaximized, true);
-  assert.equal(s.exclusive, 'maximized');
+  assert.equal(s.sizeMode, 'maximized');
 });
 
 test('unset_maximized: clears wantsMaximized and reverts exclusive to none', async () => {
@@ -67,7 +67,7 @@ test('unset_maximized: clears wantsMaximized and reverts exclusive to none', asy
   await new Promise((resolve) => setImmediate(resolve));
   const s = setup.wm.getWindowState(1);
   assert.equal(s.clientRequests.wantsMaximized, false);
-  assert.equal(s.exclusive, 'none');
+  assert.equal(s.sizeMode, 'none');
 });
 
 test('set_fullscreen: post-content default policy honors -> exclusive=fullscreen', async () => {
@@ -77,7 +77,7 @@ test('set_fullscreen: post-content default policy honors -> exclusive=fullscreen
   await new Promise((resolve) => setImmediate(resolve));
   const s = setup.wm.getWindowState(1);
   assert.equal(s.clientRequests.wantsFullscreen, true);
-  assert.equal(s.exclusive, 'fullscreen');
+  assert.equal(s.sizeMode, 'fullscreen');
 });
 
 test('unset_fullscreen: clears wantsFullscreen and reverts exclusive to none', async () => {
@@ -89,7 +89,7 @@ test('unset_fullscreen: clears wantsFullscreen and reverts exclusive to none', a
   await new Promise((resolve) => setImmediate(resolve));
   const s = setup.wm.getWindowState(1);
   assert.equal(s.clientRequests.wantsFullscreen, false);
-  assert.equal(s.exclusive, 'none');
+  assert.equal(s.sizeMode, 'none');
 });
 
 test('set_minimized: post-content default policy honors -> visible=false', async () => {
@@ -186,7 +186,7 @@ test('multiple state requests accumulate; getWindowState reflects final state', 
   setup.handler.set_maximized(r);
   await new Promise((resolve) => setImmediate(resolve));
   const s = setup.wm.getWindowState(1);
-  assert.equal(s.exclusive, 'maximized');
+  assert.equal(s.sizeMode, 'maximized');
   assert.equal(s.clientRequests.wantsMaximized, true);
   assert.deepEqual(s.constraints.minSize, { width: 400, height: 300 });
 });

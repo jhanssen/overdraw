@@ -63,7 +63,7 @@ export interface WindowSnapshotLike {
   // harnesses can fake snapshots; the core always provides it.
   windowState?: {
     tiling: string;
-    exclusive: string;
+    sizeMode: string;
     visible: boolean;
     [k: string]: unknown;
   };
@@ -130,7 +130,7 @@ export interface PluginWindowsLike {
   focus(id: number | null): Promise<void>;
   list(): Promise<WindowSnapshotLike[]>;
   get(id: number): Promise<WindowSnapshotLike | null>;
-  // Behavioral-state proposal (tiling, exclusive, visible, ...); runs the
+  // Behavioral-state proposal (tiling, sizeMode, visible, ...); runs the
   // window.proposed interceptor chain and returns the committed state.
   // Reason defaults to 'plugin'; pass 'user-input' when acting on a
   // user gesture.

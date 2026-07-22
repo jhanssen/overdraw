@@ -5,12 +5,13 @@
 // Responsibilities:
 //   - Coalesce relayout requests (at most one compute() in flight; subsequent
 //     invalidations queue and replace).
-//   - Resolve non-managed lanes in core: a window with exclusive !== "none"
-//     covers its island (tile region for maximized, full output for
-//     fullscreen) and suppresses island peers; an invisible
-//     (visible === false) window is omitted from the result; a floating
-//     (tiling === "floating") window uses its stored floatingRect.
-//   - Build LayoutInputs per island from its `managed`, non-exclusive,
+//   - Resolve non-managed lanes in core: a window with sizeMode !== "none"
+//     gets an override rect (workarea for maximized, full output/glass for
+//     fullscreen; any number may coexist -- which one shows is a stacking
+//     concern); an invisible (visible === false) window is omitted from
+//     the result; a floating (tiling === "floating") window uses its
+//     stored floatingRect.
+//   - Build LayoutInputs per island from its `managed`, non-fullscreen,
 //     visible members + the island's tile region (implicit islands derive
 //     it from the output minus reserved zones), invoke compute() on the
 //     island's layout plugin.
@@ -19,7 +20,7 @@
 //
 // On compute failure (plugin throws, no plugin registered after timeout,
 // permanent restart-budget exhaustion), the driver logs and leaves
-// managed-window geometry untouched. Non-managed rects (exclusive,
+// managed-window geometry untouched. Non-managed rects (sizeMode overrides,
 // floating) still apply since the resolver computed them.
 //
 // The plugin contract is async. Tests inject a synchronous fake driver to
@@ -32,7 +33,7 @@ import type {
   LayoutReason,
   Rect,
 } from "@overdraw/layout-types";
-import type { Tiling, Exclusive } from "../events/types.js";
+import type { Tiling, SizeMode } from "../events/types.js";
 import type { ReservedZoneRegistry } from "./reserved-zones.js";
 import { log as coreLog } from "../log.js";
 
@@ -85,16 +86,16 @@ export interface LayoutSnapshot {
 }
 
 // The driver's view of a window. Carries everything needed to either pass
-// to the layout plugin (for managed/non-exclusive/visible) or resolve
+// to the layout plugin (for the managed lane) or resolve
 // internally (for other lanes).
 export interface LayoutSnapshotWindow extends LayoutWindow {
   tiling: Tiling;
-  exclusive: Exclusive;
+  sizeMode: SizeMode;
   visible: boolean;
   // The rect to place a floating window at. Used only when
   // tiling === "floating". Absent otherwise.
   floatingRect?: Rect;
-  // For windows transitioning out of exclusive back to non-exclusive.
+  // For windows transitioning out of a sizeMode back to "none".
   restoreRect?: Rect;
 }
 
@@ -179,29 +180,35 @@ export function createLayoutDriver(deps: LayoutDriverDeps): LayoutDriver {
           if (w) bucket.push(w);
         }
 
-        // First pass: find an exclusive (maximized or fullscreen) window.
-        // If one exists and is visible, it owns the island: it gets the
-        // whole-glass (fullscreen) or workarea (maximized) rect, and
-        // pushStack keeps peers out of the draw stack. Peers still get
-        // their NORMAL layout below -- suppression is a stacking concern,
-        // not a geometry one. A window mapping while the island is owned
-        // must still receive its first rect, or it cannot be focus-
-        // revealed, hit-tested, or shown on fullscreen exit.
-        let exclusiveWin: LayoutSnapshotWindow | null = null;
+        // Resolve sizing overrides. Every visible sizeMode window gets an
+        // override rect; any number may coexist per island -- which one
+        // the user sees is a stacking concern (focus picks the top), not
+        // a geometry one, so none of them suppresses or reflows another.
+        //
+        // Fullscreen covers the whole glass. For an explicit island the
+        // docked camera aligns the island's origin with the output's
+        // workarea origin, so the glass's world footprint is the island
+        // origin shifted back by the workarea offset, at the output's
+        // full size. Implicit islands sit at the output rect itself.
+        //
+        // Maximized covers the usable glass, island-scoped: for an
+        // explicit island a workarea-sized region at the island origin
+        // (where the strip collapses to while the maximized member holds
+        // focus), clamped to the island rect so a maximize never spills
+        // into a sibling island; for the implicit island the tile region
+        // itself.
+        const overrides = new Map<number, Rect>();
         for (const w of bucket) {
-          if (!w.visible) continue;
-          if (w.exclusive !== "none") { exclusiveWin = w; break; }
-        }
-
-        if (exclusiveWin !== null) {
-          // Fullscreen covers the whole glass. For an explicit island
-          // the docked camera aligns the island's origin with the
-          // output's workarea origin, so the glass's world footprint is
-          // the island origin shifted back by the workarea offset, at
-          // the output's full size. Implicit islands sit at the output
-          // rect itself.
-          const outer = exclusiveWin.exclusive !== "fullscreen"
-            ? tileRegion
+          if (!w.visible || w.sizeMode === "none") continue;
+          const outer = w.sizeMode !== "fullscreen"
+            ? island.rect
+              ? {
+                  x: island.rect.x,
+                  y: island.rect.y,
+                  width: Math.min(workarea.width, island.rect.width),
+                  height: Math.min(workarea.height, island.rect.height),
+                }
+              : tileRegion
             : island.rect
               ? {
                   x: island.rect.x - (workarea.x - outputRect.x),
@@ -210,7 +217,8 @@ export function createLayoutDriver(deps: LayoutDriverDeps): LayoutDriver {
                   height: outputRect.height,
                 }
               : outputRect;
-          resolvedRects.push({ id: exclusiveWin.id, outer });
+          resolvedRects.push({ id: w.id, outer });
+          overrides.set(w.id, outer);
         }
 
         for (const w of bucket) {
@@ -221,11 +229,10 @@ export function createLayoutDriver(deps: LayoutDriverDeps): LayoutDriver {
           // filtered by visibility in the workspace plugin) ensures it is
           // not drawn.
           if (!w.visible) continue;
-          const isExclusive = exclusiveWin !== null && w.id === exclusiveWin.id;
           if (w.tiling === "floating") {
-            // The exclusive window's rect is already resolved above; a
-            // second (stored-rect) entry would win at apply time.
-            if (isExclusive) continue;
+            // An override rect is already resolved above; a second
+            // (stored-rect) entry would win at apply time.
+            if (overrides.has(w.id)) continue;
             // Floating windows keep their stored rect. Fall back to the
             // window's currentRect if none was captured, then to the
             // output rect so the window never vanishes.
@@ -235,10 +242,13 @@ export function createLayoutDriver(deps: LayoutDriverDeps): LayoutDriver {
             });
             continue;
           }
-          // A managed exclusive window stays IN the compute so it keeps
-          // occupying its slot (no peer reflow on fullscreen exit); its
-          // slot rect is dropped at merge in favor of the override.
-          // Managed lane: hand to the plugin.
+          // A fullscreen window is not a tile member by definition: it
+          // leaves the compute and its peers reflow over the island. A
+          // maximized managed window stays IN the compute so it keeps
+          // occupying its slot (peers hold position; un-maximizing
+          // restores the arrangement without a reflow); its slot rect is
+          // dropped at merge in favor of the override.
+          if (w.sizeMode === "fullscreen") continue;
           managed.push({
             id: w.id,
             appId: w.appId,
@@ -275,7 +285,7 @@ export function createLayoutDriver(deps: LayoutDriverDeps): LayoutDriver {
         }
 
         for (const r of pluginResult.rects) {
-          if (exclusiveWin !== null && r.id === exclusiveWin.id) continue;
+          if (overrides.has(r.id)) continue;
           mergedRects.push(r);
         }
         for (const r of resolvedRects) mergedRects.push(r);

@@ -40,7 +40,7 @@ function payload(opts = {}) {
     appId: opts.appId ?? null,
     title: opts.title ?? null,
     xwayland: opts.xwayland ?? false,
-    initialState: { tiling: 'managed', exclusive: 'none', marker: 'keep' },
+    initialState: { tiling: 'managed', sizeMode: 'none', marker: 'keep' },
   };
 }
 
@@ -105,14 +105,14 @@ test('apply lambda can mutate any proposal field (exclusive, visible, constraint
   const { handler } = await load([
     { match: { appId: 'media' }, apply: (win) => {
         win.state.tiling = 'floating';
-        win.state.exclusive = 'fullscreen';
+        win.state.sizeMode = 'fullscreen';
         win.state.visible = false;
         win.state.constraints = { minSize: { width: 320, height: 240 }, maxSize: null };
       } },
   ]);
   const hit = await handler('window.preconfigure', payload({ appId: 'media' }));
   assert.equal(hit.initialState.tiling, 'floating');
-  assert.equal(hit.initialState.exclusive, 'fullscreen');
+  assert.equal(hit.initialState.sizeMode, 'fullscreen');
   assert.equal(hit.initialState.visible, false);
   assert.deepEqual(hit.initialState.constraints, { minSize: { width: 320, height: 240 }, maxSize: null });
   assert.equal(hit.initialState.marker, 'keep'); // untouched fields preserved

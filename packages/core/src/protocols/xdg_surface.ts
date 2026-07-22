@@ -69,7 +69,7 @@ export function configureToplevel(ctx: Ctx, xs: XdgSurfaceRecord, width: number,
 function buildStatesArray(ctx: Ctx, xs: XdgSurfaceRecord, sizeUnknown: boolean): Uint8Array {
   const states: number[] = [];
   const id = xs.surface?.id;
-  // A managed (tiled), non-exclusive window is told it is maximized so the
+  // A managed (tiled), sizeMode-"none" window is told it is maximized so the
   // configured size is BINDING -- xdg-shell requires a maximized client to
   // use the given size, whereas a stateless configure size is only advisory
   // and the tiled states alone are advisory too (a media player honors
@@ -77,7 +77,7 @@ function buildStatesArray(ctx: Ctx, xs: XdgSurfaceRecord, sizeUnknown: boolean):
   // content). The four tiled edges are additionally advertised (v2+) so the
   // client suppresses resize affordances on every side.
   //
-  // The encoder reads the compositor's DECISION fields (tiling, exclusive,
+  // The encoder reads the compositor's DECISION fields (tiling, sizeMode,
   // visible) only -- never `clientRequests`. A client that asked maximized
   // but had its request declined by the policy seam sees a configure with
   // no maximized state, matching the spec.
@@ -85,19 +85,19 @@ function buildStatesArray(ctx: Ctx, xs: XdgSurfaceRecord, sizeUnknown: boolean):
   if (!sizeUnknown && id !== undefined && ctx.state.wm) {
     const ws = ctx.state.wm.getWindowState(id);
     if (ws) {
-      if (ws.exclusive === "maximized") {
+      if (ws.sizeMode === "maximized") {
         states.push(STATE.maximized);
-      } else if (ws.exclusive === "fullscreen") {
+      } else if (ws.sizeMode === "fullscreen") {
         states.push(STATE.fullscreen);
       } else if (ws.tiling === "managed") {
-        // Non-exclusive tiled window: maximized + tiled-edges.
+        // sizeMode-"none" tiled window: maximized + tiled-edges.
         states.push(STATE.maximized);
         if (tiledOk) {
           states.push(STATE.tiled_left, STATE.tiled_right,
                       STATE.tiled_top, STATE.tiled_bottom);
         }
       }
-      // tiling === "floating", non-exclusive, visible: no state.
+      // tiling === "floating", sizeMode "none", visible: no state.
     }
   }
   // 'activated' tracks keyboard focus.

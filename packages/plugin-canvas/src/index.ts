@@ -365,10 +365,10 @@ async function activate(
     if (p.activated) {
       const prevFocused = focusedSurfaceId;
       focusedSurfaceId = p.surfaceId;
-      // Dominance follows focus: focus moving onto or off an exclusive
+      // Collapse follows focus: focus moving onto or off a sizeMode
       // member engages/releases the island collapse -- re-solve.
-      if (exclusiveMembers.has(p.surfaceId)
-          || (prevFocused !== null && exclusiveMembers.has(prevFocused))) {
+      if (sizeModeMembers.has(p.surfaceId)
+          || (prevFocused !== null && sizeModeMembers.has(prevFocused))) {
         void publishWorld();
       }
       // Resolve surface -> workspace -> output. If the surface isn't
@@ -443,27 +443,27 @@ async function activate(
   });
 
   // State changes that re-solve the world: a member floating/unfloating
-  // joins or leaves the tiled set an elastic island is measured for, an
-  // exclusive (maximize/fullscreen) member collapses its strip to the
-  // viewport, and a size constraint changes what the layout measures for
-  // that member (a client may state its minimum at any point in its
+  // joins or leaves the tiled set an elastic island is measured for, a
+  // focused sizeMode (maximize/fullscreen) member collapses its strip to
+  // the viewport, and a size constraint changes what the layout measures
+  // for that member (a client may state its minimum at any point in its
   // life, not only before it maps). window.committed is the observe-only
   // signal for behavioral-state commits.
-  const MEASURED_FIELDS = ["tiling", "exclusive", "visible", "constraints"];
-  // Members currently holding exclusive != none, tracked from committed
-  // events so focus edges can tell when dominance flips (collapse follows
-  // the FOCUSED exclusive member; see tiledMembers).
-  const exclusiveMembers = new Set<number>();
+  const MEASURED_FIELDS = ["tiling", "sizeMode", "visible", "constraints"];
+  // Members currently holding sizeMode != none, tracked from committed
+  // events so focus edges can tell when the collapse engages/releases
+  // (collapse follows the FOCUSED sizeMode member; see tiledMembers).
+  const sizeModeMembers = new Set<number>();
   sdk.events.subscribe("window.committed", (_name, payload) => {
     if (!worldMode || !payload || typeof payload !== "object") return;
     const p = payload as { surfaceId?: unknown; changed?: unknown;
-                           current?: { exclusive?: unknown } };
+                           current?: { sizeMode?: unknown } };
     if (typeof p.surfaceId !== "number" || !Array.isArray(p.changed)) return;
-    if (p.changed.includes("exclusive")) {
-      if (p.current?.exclusive !== undefined && p.current.exclusive !== "none") {
-        exclusiveMembers.add(p.surfaceId);
+    if (p.changed.includes("sizeMode")) {
+      if (p.current?.sizeMode !== undefined && p.current.sizeMode !== "none") {
+        sizeModeMembers.add(p.surfaceId);
       } else {
-        exclusiveMembers.delete(p.surfaceId);
+        sizeModeMembers.delete(p.surfaceId);
       }
     }
     if (!p.changed.some((f) => MEASURED_FIELDS.includes(f as string))) return;
@@ -1129,14 +1129,17 @@ async function activate(
   }
 
   // The members the layout will tile, mirroring the driver's compute()
-  // lane filter: managed, visible. Returns null when a FOCUSED exclusive
-  // (maximized / fullscreen) member collapses the island to the workarea
-  // -- a maximize covers the usable glass, not a multi-screen strip.
-  // Exclusive dominance follows focus: an unfocused fullscreen member
-  // keeps its state but the strip stays a strip, so the user can work in
-  // (and launch into) the rest of the island. A member without a WM
-  // snapshot counts for nothing: undersizing (workarea-width island) is
-  // always recoverable, oversizing stretches windows past the output.
+  // lane filter: managed, visible, not fullscreen. Returns null when a
+  // FOCUSED sizeMode (maximized / fullscreen) member collapses the island
+  // to the workarea -- a maximize covers the usable glass, not a
+  // multi-screen strip. Unfocused, the strip stays a strip so the user
+  // can work in (and launch into) the rest of the island: an unfocused
+  // fullscreen member is not a tile member (it dropped below the tiled
+  // tier and its peers reflowed over the island), while an unfocused
+  // maximized MANAGED member still occupies its slot and counts toward
+  // the measured width. A member without a WM snapshot counts for
+  // nothing: undersizing (workarea-width island) is always recoverable,
+  // oversizing stretches windows past the output.
   function tiledMembers(
     members: ReadonlyArray<number>,
     snapById: Map<number, WindowSnapshotLike>,
@@ -1146,10 +1149,8 @@ async function activate(
       const ws = snapById.get(id)?.windowState;
       if (!ws) continue;
       if (!ws.visible) continue;
-      if (ws.exclusive !== "none") {
-        if (id === focusedSurfaceId) return null;
-        continue;  // unfocused exclusive: not tiled, not collapsing
-      }
+      if (ws.sizeMode !== "none" && id === focusedSurfaceId) return null;
+      if (ws.sizeMode === "fullscreen") continue;
       if (ws.tiling === "managed") tiled.push(id);
     }
     return tiled;
@@ -2251,7 +2252,7 @@ async function activate(
     const tiled = snaps.filter((s) =>
       s.surfaceId !== surfaceId && members.includes(s.surfaceId)
       && s.windowState?.tiling === "managed" && s.windowState.visible
-      && s.windowState.exclusive === "none"
+      && s.windowState.sizeMode === "none"
       && s.outer && s.outer.width > 0);
     if (tiled.length === 0) return null;
     const contains = (s: WindowSnapshotLike): boolean => {
@@ -2337,7 +2338,7 @@ async function activate(
   // A client asked to go fullscreen on a specific output (xdg_toplevel
   // .set_fullscreen with an output arg). Output placement is ours, so move the
   // window to that output's shown workspace; the WM already flagged it
-  // exclusive=fullscreen and fullscreens it on whichever output it lands on.
+  // sizeMode=fullscreen and fullscreens it on whichever output it lands on.
   sdk.events.subscribe("window.fullscreen-output-request", (_name, payload) => {
     const p = payload as { surfaceId?: unknown; outputId?: unknown };
     if (typeof p.surfaceId !== "number" || typeof p.outputId !== "number") return;

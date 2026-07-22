@@ -126,7 +126,7 @@ test("maximized presentation: outer rect is the effective rect (not the output)"
   });
   wm.addWindow(1, rec(1));
   // Push into maximized presentation.
-  await wm.propose(1, { exclusive: "maximized" }, "client-request");
+  await wm.propose(1, { sizeMode: "maximized" }, "client-request");
   await wm.settled();
   // The window's outer rect should be the tileRegion (effectiveRect), not the
   // raw output rect. Top 30 reserved -> y=30, height=570.

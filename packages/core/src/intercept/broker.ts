@@ -31,7 +31,7 @@ import type { DawnWire } from "../gpu/compositor.js";
 
 export interface InterceptBrokerDeps {
   bus: CompositorBus;
-  // The plugin-visible dynamic bus. window.committed (exclusive
+  // The plugin-visible dynamic bus. window.committed (sizeMode
   // transitions -> excludeFullscreen re-evaluation) is only emitted
   // there. Optional for harnesses.
   pluginBus?: {
@@ -182,7 +182,7 @@ export class InterceptBroker {
         // Fallback seed for harnesses without deps.isFullscreen; with a
         // live reader wired the engine resolves fullscreen at match time
         // and this snapshot is never consulted.
-        fullscreen: ev.initialState.exclusive === "fullscreen",
+        fullscreen: ev.initialState.sizeMode === "fullscreen",
       });
     });
     deps.bus.on(WINDOW_EVENT.map, (ev) => {
@@ -206,12 +206,12 @@ export class InterceptBroker {
       const ev = payload as {
         surfaceId?: number;
         changed?: ReadonlyArray<string>;
-        current?: { exclusive?: string };
+        current?: { sizeMode?: string };
       } | null;
       if (!ev || typeof ev.surfaceId !== "number") return;
-      if (!Array.isArray(ev.changed) || !ev.changed.includes("exclusive")) return;
+      if (!Array.isArray(ev.changed) || !ev.changed.includes("sizeMode")) return;
       this.engine.onToplevelFullscreenChanged(
-        ev.surfaceId, ev.current?.exclusive === "fullscreen")
+        ev.surfaceId, ev.current?.sizeMode === "fullscreen")
         .forEach((e) => this.dispatchMatchEvent(e));
     });
     deps.bus.on(WINDOW_EVENT.unmap, (ev) => {

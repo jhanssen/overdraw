@@ -26,7 +26,7 @@ export const WINDOW_EVENT = {
   // (lower-frequency, typed) and from window.committed (behavioral state).
   stateBagChanged: "window.state-bag-changed",
   // Pre-action interceptable event: someone wants to change a window's
-  // behavioral state (tiling, exclusive, visible, layoutMode, layoutData,
+  // behavioral state (tiling, sizeMode, visible, layoutMode, layoutData,
   // constraints, parent, clientRequests). Interceptors receive the
   // current state and a candidate; they may modify the candidate
   // (return a new payload) or revert it (return the candidate with the
@@ -121,7 +121,7 @@ export type WindowUnmapEvent = {
 };
 
 // Which fields of a mapped window changed since the last emit. Window
-// behavioral state (tiling, exclusive, visible, layoutMode, ...) is NOT a
+// behavioral state (tiling, sizeMode, visible, layoutMode, ...) is NOT a
 // change field -- those go through 'window.committed'. This event is for
 // the metadata stream: title, appId, focus activation.
 export type WindowChangeField = "title" | "appId" | "activated";
@@ -157,8 +157,16 @@ export type WindowStateBagChangedEvent = {
 // client wishes:
 //   - `tiling`     -- which lane the window lives in within the layout
 //                     partition (managed = tile-flow; floating = free).
-//   - `exclusive`  -- does this window own the workspace by itself
-//                     (maximized = tileRegion; fullscreen = full output).
+//   - `sizeMode`   -- sizing override outside the layout plugin's control
+//                     (maximized = workarea; fullscreen = full output).
+//                     A fullscreen window is by definition NOT a tile
+//                     member: it leaves the layout compute and peers
+//                     reflow. A maximized managed window stays a tile
+//                     member (keeps its slot; peers hold position).
+//                     Stacking, not geometry, follows keyboard focus:
+//                     a focused sizeMode window draws above everything;
+//                     an unfocused non-member (fullscreen, or maximized
+//                     floating) draws below the tiled tier.
 //   - `visible`    -- whether the window is drawn at all (false ≡ minimized).
 //   - `modal`      -- this window blocks interaction with its parent chain
 //                     (focus is tethered; input on the parent is gated).
@@ -182,7 +190,7 @@ export type WindowStateBagChangedEvent = {
 //                         renderer + the configure-states encoder NEVER read
 //                         these.
 export type Tiling = "managed" | "floating";
-export type Exclusive = "none" | "maximized" | "fullscreen";
+export type SizeMode = "none" | "maximized" | "fullscreen";
 
 export type ClientRequests = {
   wantsMaximized: boolean;
@@ -195,7 +203,7 @@ export type WindowState = {
   // Compositor decisions (what to render; what to send in configure;
   // what to gate focus + input on):
   tiling: Tiling;
-  exclusive: Exclusive;
+  sizeMode: SizeMode;
   visible: boolean;
   modal: boolean;
   // Client wishes (read by the policy seam; not by the renderer):
@@ -207,10 +215,10 @@ export type WindowState = {
     maxSize: { width: number; height: number } | null;
   };
   parent: number | null;
-  // The rect to restore to when leaving exclusive (maximized/fullscreen)
-  // back to non-exclusive. Captured at the propose() that transitions
-  // INTO exclusive and consumed at the propose() that transitions back
-  // out. null until the first such transition.
+  // The rect to restore to when leaving maximized/fullscreen back to
+  // sizeMode "none". Captured at the propose() that transitions INTO a
+  // sizeMode and consumed at the propose() that transitions back out.
+  // null until the first such transition.
   restoreRect: { x: number; y: number; width: number; height: number } | null;
 };
 

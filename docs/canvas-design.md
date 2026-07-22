@@ -355,9 +355,8 @@ its left edge wins.
 Visibility: `setOutputStack` semantics invert from "the shown workspace's
 members" to "everything near the camera's view rect" (with margin for
 pan). The camera + per-output scissor culls; windows far off-view are
-omitted from the stack entirely. `pushStack` gating (exclusive-window
-suppression etc.) keys on islands-in-view rather than the per-window
-output cache.
+omitted from the stack entirely. sizeMode stacking tiers key on
+islands-in-view rather than the per-window output cache.
 
 **Hidden means hidden** (LANDED): visibility is explicit stack state, not
 a geometric accident -- a camera roaming over a hidden island's world
@@ -716,10 +715,9 @@ Retirements (semantics superseded by the model):
   becomes a placement HINT (which island's region the window lands in);
   placement rules target islands/bookmarks (§7), not outputs.
 - **Per-output state shapes**: `outputContent` / `outputOf` and the
-  exclusive-window suppression keys scoped per-output move to
-  island-scoped equivalents (`LayoutIsland` already scopes exclusive
-  ownership; the per-output forms remain as the implicit-island
-  degenerate case).
+  per-output sizeMode override resolution move to island-scoped
+  equivalents (`LayoutIsland` already scopes overrides; the per-output
+  forms remain as the implicit-island degenerate case).
 - **`focusedOutputIdCache`** in the organizer plugin: derivable from
   focus + camera framing; retire the cache once island refs make the
   derivation cheap.
@@ -760,8 +758,8 @@ tests only.
    `LayoutIsland`s ({id, outputId, rect | null, members}); the WM derives
    one implicit island per output (rect = null -> output minus reserved
    zones) from the workspace plugin's per-output content; explicit
-   islands pass their rect verbatim and scope exclusive-window ownership
-   to the island. `LayoutInputs.island` identifies the pass; existing
+   islands pass their rect verbatim and scope sizeMode overrides to the
+   island. `LayoutInputs.island` identifies the pass; existing
    layout plugins work unchanged. Unit tests:
    `layout-driver-islands.test.js`. No explicit-island producer exists
    yet -- that arrives with the canvas plugin (step 3).
@@ -863,9 +861,10 @@ tests only.
    toggle; index defaults to the shown workspace; overrides are
    session-scoped). An elastic island grows along its row -- one
    column of `column` × workarea width (default 0.5) per visible
-   managed member; floating members take none, and an exclusive member
-   collapses the strip to the workarea (maximize covers the usable
-   glass, not the strip). Members tile as equal full-height columns via a
+   managed member; floating members take none, and a FOCUSED sizeMode
+   member collapses the strip to the workarea (maximize covers the
+   usable glass, not the strip; unfocused, a fullscreen member leaves
+   the strip and a maximized managed member keeps its column). Members tile as equal full-height columns via a
    per-island layout HINT (`LayoutIsland.layout`, passed through
    verbatim to `LayoutInputs.island.layout`; the bundled provider
    recognizes `{ mode: "columns" }`) -- a deliberate small step toward

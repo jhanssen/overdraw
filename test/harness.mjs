@@ -350,7 +350,7 @@ export async function setupCompositor(opts = {}) {
       },
     }),
   });
-  // Keyboard focus reaches the WM (focusReveal / exclusive dominance) via
+  // Keyboard focus reaches the WM (stack tiers) via
   // this bus subscription; mirrors main.ts.
   coreBus.on(KEYBOARD_EVENT.focus, (ev) => { state?.wm?.setKeyboardFocus(ev.surfaceId); });
 
@@ -626,7 +626,7 @@ export async function setupCompositor(opts = {}) {
       // unwired (in-thread tests only).
       const interceptBrokerOpts = {
         bus: coreBus,
-        // The plugin-visible dynamic bus: window.committed (exclusive
+        // The plugin-visible dynamic bus: window.committed (sizeMode
         // transitions -> excludeFullscreen re-evaluation) only rides
         // here. Mirrors main.ts wiring.
         pluginBus,
@@ -636,7 +636,7 @@ export async function setupCompositor(opts = {}) {
         // Live fullscreen reader (mirrors main.ts): excludeFullscreen is
         // level-triggered against current WM state, not event payloads.
         isFullscreen: (sid) => state?.wm?.state.windows
-          .find((w) => w.surfaceId === sid)?.windowState.exclusive === "fullscreen",
+          .find((w) => w.surfaceId === sid)?.windowState.sizeMode === "fullscreen",
         surfaceGeometry: (sid) => state?.surfacesById?.get(sid)?.xdgSurface?.geometry ?? null,
         // Wire the WM as the gate sink so intercepts that declare
         // `gates: true` (e.g. the bundled decoration plugin) can engage

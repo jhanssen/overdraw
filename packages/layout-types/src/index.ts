@@ -54,11 +54,13 @@ export interface SizeConstraints {
 // What the layout sees about each window. The layout's compute() iterates
 // these in order; index 0 is conventionally the 'master' in tiling layouts.
 //
-// The three decision axes (`tiling`, `exclusive`, `visible`) are NOT on
+// The three decision axes (`tiling`, `sizeMode`, `visible`) are NOT on
 // this type because the WM's resolver dispatches non-managed lanes
-// (exclusive, invisible, floating) itself, before calling the plugin.
-// The plugin only sees windows whose tiling is "managed" AND exclusive
-// is "none" AND visible is true.
+// (sizeMode overrides, invisible, floating) itself, before calling the plugin.
+// The plugin only sees visible windows whose tiling is "managed" and
+// whose sizeMode is not "fullscreen" (a fullscreen window is not a tile
+// member; a maximized managed window keeps its slot in the compute --
+// its slot rect is overridden at merge, but peers hold position).
 export interface LayoutWindow {
   id: number;             // surface id (matches core's window record)
   appId?: string | null;
@@ -161,7 +163,7 @@ export interface LayoutParamSnapshot {
 
 // What measure() sees: the would-be members (ids only -- the island
 // source has already filtered lanes exactly as the driver does for
-// compute(): managed, non-exclusive, visible) and the island's sizing
+// compute(): managed, non-fullscreen, visible) and the island's sizing
 // authority, its home workarea (canvas-design.md §10b).
 export interface MeasureInputs {
   // The would-be members, each with the size constraints compute() will

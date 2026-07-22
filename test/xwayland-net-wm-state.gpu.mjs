@@ -210,9 +210,9 @@ test("xwm: pre-map fullscreen survives a slow preconfigure round-trip (no flap)"
       const transitions = [];
       c.pluginBus.subscribe("window.committed", (_n, p) => {
         const ev = p;
-        if (!ev?.changed?.includes("exclusive")) return;
+        if (!ev?.changed?.includes("sizeMode")) return;
         transitions.push(
-          `${ev.surfaceId}: ${ev.previous?.exclusive}->${ev.current?.exclusive}(${ev.reason})`);
+          `${ev.surfaceId}: ${ev.previous?.sizeMode}->${ev.current?.sizeMode}(${ev.reason})`);
       });
 
       handle = await startXwayland(c.addon, {
@@ -239,7 +239,7 @@ test("xwm: pre-map fullscreen survives a slow preconfigure round-trip (no flap)"
         `no fullscreen reverts expected; transitions: ${JSON.stringify(transitions)}`);
       assert.ok(!gameOut.includes("geometry-sync remove"),
         `the game never saw a non-fullscreen configure; stdout: ${gameOut}`);
-      assert.equal(gameWin()?.windowState.exclusive, "fullscreen",
+      assert.equal(gameWin()?.windowState.sizeMode, "fullscreen",
         "game ends exclusive fullscreen");
 
       // The decoration must be GONE -- including the rounded-corner arcs,
