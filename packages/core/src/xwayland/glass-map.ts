@@ -112,6 +112,15 @@ export function tellXRect(
   // pixel off the window.
   const cw = Math.round(w);
   const ch = Math.round(h);
+  // A zero-size ConfigureWindow is a BadValue error, and the synthetic
+  // ConfigureNotify would tell the client a size it can't render into
+  // (some clients abort on 0x0). Callers guard the pre-layout placeholder
+  // rect; this catches anything that slips through.
+  if (cw < 1 || ch < 1) {
+    log.warn("core",
+      `X window ${window}: suppressed zero-size tell ${cw}x${ch} at ${cx},${cy}`);
+    return;
+  }
   addon.xwmConfigureWindow(window, cx, cy, cw, ch);
   addon.xwmSendConfigureNotify(window, cx, cy, cw, ch);
 }

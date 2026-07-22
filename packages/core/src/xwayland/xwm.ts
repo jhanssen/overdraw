@@ -644,11 +644,16 @@ export function startXwm(state: CompositorState, addon: Addon, wmFd: number): Xw
         // honor the request (X coords passed through), update our tracked
         // rect (also X coords), and re-place the overlay so the compositor
         // draws it at the new coords.
+        // A managed window's WM rect is a sizeless placeholder until the
+        // first layout pass; echoing it would tell the client a zero-size
+        // rect (X clients may abort on it, and a zero-size ConfigureWindow
+        // is a BadValue error). Fall through and honor the client's request
+        // until layout assigns a real rect.
         const n = xwaylandScaleOf(state);
         const w = windows.get(ev.window);
         if (w && w.addedToWm && w.surfaceId !== null) {
           const r = state.wm?.rectOf(w.surfaceId);
-          if (r) {
+          if (r && r.width > 0 && r.height > 0) {
             const cam = xChartCameraOf(state, w.surfaceId);
             tellXRect(addon, ev.window,
               (r.x - cam.x) * n, (r.y - cam.y) * n,
@@ -1079,7 +1084,10 @@ export function startXwm(state: CompositorState, addon: Addon, wmFd: number): Xw
     for (const w of windows.values()) {
       if (w.overrideRedirect || !w.addedToWm || w.surfaceId === null) continue;
       const r = state.wm?.rectOf(w.surfaceId);
-      if (!r) continue;
+      // Placeholder rect (no layout pass yet): nothing truthful to narrate,
+      // and a zero-size tell can abort the client. The layout pass sends
+      // the first real rect.
+      if (!r || r.width <= 0 || r.height <= 0) continue;
       const cam = xChartCameraOf(state, w.surfaceId);
       const xx = Math.round((r.x - cam.x) * n);
       const xy = Math.round((r.y - cam.y) * n);
