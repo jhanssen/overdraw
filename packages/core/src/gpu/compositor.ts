@@ -4770,6 +4770,16 @@ export class JsCompositor implements CompositorSink {
     poolId: number; offset: number; stride: number; width: number; height: number;
   }>();
 
+  // Drop a surface's recorded shm source and its pool ref. removeSurface
+  // does this for mapped windows; the protocol layer calls it from the
+  // universal surface-teardown path so never-mapped surfaces (cursor
+  // roles, orphaned subsurfaces on disconnect) release their pin too --
+  // without it, one destroyed cursor surface pins its client's cursor
+  // pool mapping (core + GPU process) forever.
+  releaseShmSource(id: number): void {
+    this.setShmSource(id, null);
+  }
+
   private setShmSource(id: number, src: {
     poolId: number; offset: number; stride: number; width: number; height: number;
   } | null): void {

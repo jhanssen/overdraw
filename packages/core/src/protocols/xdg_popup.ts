@@ -88,10 +88,15 @@ export function configurePopup(ctx: Ctx, pr: PopupRecord): void {
   // that output. A toplevel-rooted popup solves against the output's
   // camera VIEW rect (the region of the world the output shows: origin +
   // camera offset, spanning logical/zoom world units -- the parent's
-  // coordinates are world coordinates); a layer-rooted popup is
-  // glass-anchored and uses the plain rect. Fall back to a safe
-  // single-output area at origin when outputs is absent (test stubs).
-  const cam = (!popupChainLayerRooted(ctx.state, pr)
+  // coordinates are world coordinates); a chain rooted at glass-anchored
+  // chrome (layer surface or fullscreen toplevel) lives in glass
+  // coordinates and uses the plain rect -- solving it against the camera
+  // view would slide the menu to the view edge, away from its drawn
+  // parent. Fall back to a safe single-output area at origin when
+  // outputs is absent (test stubs).
+  const anchoredChain = popupChainLayerRooted(ctx.state, pr)
+    || popupChainFullscreenRooted(ctx.state, pr);
+  const cam = (!anchoredChain
     ? ctx.state.outputCameras?.get(parentOutputId) : undefined)
     ?? { x: 0, y: 0, zoom: 1 };
   const outRect = outEntry

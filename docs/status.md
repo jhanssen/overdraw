@@ -32,7 +32,7 @@ of sizeMode windows coexist ("top z wins"); maximized alone is
 single-instance per island -- a new maximize demotes the previous one
 via propose() -- and in canvas world mode zoom is focus-transient: when
 another window on the SAME output takes activity, the zoomed member
-unzooms (restoreRect) instead of lingering as a strip-anchored cover.
+unzooms (the recompute restores its slot) instead of lingering as a strip-anchored cover.
 WM stamps stackTier (-1/0/+1) and `active`; effectiveStackZ and the
 canvas collapse (also output-local via its own activeByOutput) consume
 them; the old focusReveal lift is gone. Keyboard-focus changes and

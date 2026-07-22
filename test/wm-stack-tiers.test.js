@@ -260,6 +260,82 @@ test('lowered fullscreen window is input-transparent; focused it takes hits agai
   assert.equal(wm.windowAt(exposed.x, exposed.y)?.surfaceId, 1);
 });
 
+test('focused fullscreen moved to another output stays active there (live restamp)', async () => {
+  const sink = mockSink();
+  const content = new Map([[0, [1, 2]], [1, [3]]]);
+  const wm = createWm(sink,
+    [{ id: 0, rect: { x: 0, y: 0, width: 800, height: 600 }, scale: 1 },
+     { id: 1, rect: { x: 800, y: 0, width: 800, height: 600 }, scale: 1 }],
+    {
+      outputContent: () => content,
+      configure: { configure: () => null, configureMove: () => {} },
+      layoutDriverFactory: (target, snapshot) => createLayoutDriver({
+        target, snapshot,
+        compute: async (inputs) => ({
+          rects: inputs.windows.map((win, i) => ({
+            id: win.id,
+            outer: { x: inputs.tileRegion.x + i * 100, y: 0, width: 100, height: 100 },
+          })),
+        }),
+      }),
+    });
+  for (const id of [1, 2, 3]) { wm.addWindow(id, res(id)); wm.windowHasContent(id); }
+  await wm.propose(1, { sizeMode: 'fullscreen' }, 'client-request');
+  wm.setKeyboardFocus(1);
+  assert.equal(winOf(wm, 1).stackTier, 1);
+  // Move the focused fullscreen window to output 1 with NO focus edge
+  // (workspace move). The next restack must find it active on its NEW
+  // output -- not tier -1 (input-transparent while keyboard-focused).
+  content.set(0, [2]);
+  content.set(1, [3, 1]);
+  wm.refreshStackTiers();
+  assert.equal(winOf(wm, 1).stackTier, 1,
+    'focused fullscreen stays active after a cross-output move');
+});
+
+test('minimizing an active fullscreen window drops its tier and the anchored pick', async () => {
+  const { wm } = makeWmWithWindows();
+  await wm.propose(1, { sizeMode: 'fullscreen' }, 'client-request');
+  wm.setKeyboardFocus(1);
+  await wm.settled();
+  assert.equal(wm.anchoredFullscreenAt(400, 300)?.surfaceId, 1);
+  // visible is a tier input: the commit must restack (and the validated
+  // anchored pick must stop returning the window) with no focus change.
+  await wm.propose(1, { visible: false }, 'plugin');
+  assert.notEqual(winOf(wm, 1).stackTier, 1);
+  assert.equal(wm.anchoredFullscreenAt(400, 300), null,
+    'hidden fullscreen window must not swallow pointer input');
+});
+
+test('a dialog chain rooted at an active fullscreen window draws above it', async () => {
+  const { wm } = makeWmWithWindows();
+  await wm.propose(1, { sizeMode: 'fullscreen' }, 'client-request');
+  await wm.propose(2, { parent: 1, modal: true }, 'plugin');
+  wm.setKeyboardFocus(1);
+  assert.equal(winOf(wm, 1).stackTier, 1);
+  // The modal inherits the parent's raised tier; its z (parent.z + 1)
+  // then wins within the tier -- the parent must not cover its own
+  // dialog.
+  assert.equal(winOf(wm, 2).stackTier, 1);
+  assert.ok(effectiveStackZ(winOf(wm, 2)) > effectiveStackZ(winOf(wm, 1)));
+});
+
+test('a maximize from a window on no output does not demote placed windows', async () => {
+  const sink = mockSink();
+  // Window 3 exists in the WM but is on NO output (hidden workspace).
+  const content = new Map([[0, [1, 2]]]);
+  const wm = createWm(sink,
+    [{ id: 0, rect: { x: 0, y: 0, width: 800, height: 600 }, scale: 1 }],
+    { outputContent: () => content,
+      configure: { configure: () => null, configureMove: () => {} } });
+  for (const id of [1, 2, 3]) { wm.addWindow(id, res(id)); wm.windowHasContent(id); }
+  await wm.propose(1, { sizeMode: 'maximized' }, 'client-request');
+  await wm.propose(3, { sizeMode: 'maximized' }, 'client-request');
+  await winOf(wm, 1).pendingMutation;
+  assert.equal(winOf(wm, 1).windowState.sizeMode, 'maximized',
+    'a background maximize must not demote windows on live outputs');
+});
+
 test('fullscreen window leaves the tile layout: the remaining peer reflows to the full region', async () => {
   const { wm, sink } = makeWmWithWindows([1, 2, 3]);
   await wm.settled();

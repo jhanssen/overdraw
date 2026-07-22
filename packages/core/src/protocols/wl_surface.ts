@@ -970,6 +970,12 @@ export function unmapAndTeardownSurface(state: CompositorState, addon: Addon, s:
   if (s.unmapped) return;
   s.unmapped = true;
   detachSurfaceRole(state, addon, s);
+  // Release any shm-pool pin the compositor holds for this surface's
+  // pixels. detachSurfaceRole only reaches compositor.removeSurface for
+  // MAPPED surfaces; a cursor-role surface (or an orphaned subsurface on
+  // disconnect) never maps, and its pin would otherwise hold the
+  // client's pool mapping in both processes forever.
+  state.compositor.releaseShmSource?.(s.id);
   dropSerialsForSurface(state, s.id);
   state.surfacesById?.delete(s.id);
   // Invalidate seat focus NOW, not at the next per-frame sweep: a focus

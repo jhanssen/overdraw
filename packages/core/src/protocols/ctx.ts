@@ -392,8 +392,13 @@ export interface CompositorSink {
   }>): void;
   // Mark a surface as glass-positioned (ignores the content camera) even
   // though it rides the content stack: popups parented to layer-shell
-  // surfaces. Optional (GPU-free test sinks omit it).
+  // surfaces, fullscreen toplevels. Optional (GPU-free test sinks omit it).
   setSurfaceOutputAnchored?(id: number, anchored: boolean): void;
+  // Drop the recorded shm source (and its pool pin) for a surface.
+  // Called from the universal surface-teardown path so never-mapped
+  // surfaces (cursor roles) release their pool ref. Optional (GPU-free
+  // test sinks omit it).
+  releaseShmSource?(id: number): void;
   // Which outputs SHOW the surface: geometric overlap gated by draw-stack
   // membership (hidden surfaces are shown nowhere regardless of camera
   // position -- canvas-design.md). Drives wl_surface.enter/leave +

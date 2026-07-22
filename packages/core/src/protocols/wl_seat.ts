@@ -24,7 +24,7 @@ import { KEYBOARD_EVENT, POINTER_EVENT } from "../events/window-bus.js";
 import { markWindowChanged } from "./window-changes.js";
 import type { FocusDriver } from "./focus-driver.js";
 import { hitTestSurfaceTree, type SurfaceHit } from "../surface-hit-test.js";
-import { popupOutputOrigin, popupChainLayerRooted } from "./xdg_popup.js";
+import { popupOutputOrigin, popupChainLayerRooted, popupChainFullscreenRooted } from "./xdg_popup.js";
 import { sendRelativeMotionTo } from "./zwp_relative_pointer_manager_v1.js";
 import { isPointerLocked, notifyPointerFocus, notifyPointerMotion } from "./zwp_pointer_constraints_v1.js";
 
@@ -371,18 +371,15 @@ export default function makeSeat(ctx: Ctx, driver: FocusDriver): SeatHandler {
   function pickAnchoredFullscreen(x: number, y: number): SeatFocus | null {
     const wm = ctx.state.wm;
     if (!wm) return null;
-    for (const w of wm.state.windows) {
-      if (w.stackTier !== 1) continue;
-      if (w.windowState.sizeMode !== "fullscreen") continue;
-      const r = w.rect;
-      if (x < r.x || x >= r.x + r.width || y < r.y || y >= r.y + r.height) continue;
-      const root = ctx.state.surfaces.get(w.surfaceRec.resource);
-      if (!root) continue;
-      const hit = hitTestSurfaceTree(ctx.state, root, w.rect, x, y);
-      if (!hit) continue;
-      return toFocus(hit, root.id, SEAT_VIEW_IDENTITY);
-    }
-    return null;
+    // The WM validates tier, visibility, gating, and output membership
+    // -- a stale tier stamp must not swallow the output's pointer input.
+    const w = wm.anchoredFullscreenAt(x, y);
+    if (!w) return null;
+    const root = ctx.state.surfaces.get(w.surfaceRec.resource);
+    if (!root) return null;
+    const hit = hitTestSurfaceTree(ctx.state, root, w.rect, x, y);
+    if (!hit) return null;
+    return toFocus(hit, root.id, SEAT_VIEW_IDENTITY);
   }
 
   // The glass->world view transform of the output under a glass-space
@@ -506,9 +503,14 @@ export default function makeSeat(ctx: Ctx, driver: FocusDriver): SeatHandler {
         height: pr.rect.height,
       };
       // A toplevel-rooted popup's rect is in world coordinates (its parent
-      // pans with the camera); a layer-rooted chain is glass-anchored.
-      // Test each popup with the point in its own space.
-      const pview = popupChainLayerRooted(ctx.state, pr) ? SEAT_VIEW_IDENTITY : view;
+      // pans with the camera); a chain rooted at glass-anchored chrome --
+      // a layer surface or a fullscreen toplevel -- is glass-anchored.
+      // Test each popup with the point in its own space; it must match
+      // the space configurePopup anchored it in, or clicks land beside
+      // the drawn menu.
+      const pview = popupChainLayerRooted(ctx.state, pr)
+        || popupChainFullscreenRooted(ctx.state, pr)
+        ? SEAT_VIEW_IDENTITY : view;
       const hit = hitTestSurfaceTree(ctx.state, root, rect,
         seatViewToWorldX(pview, x), seatViewToWorldY(pview, y));
       if (hit) return toFocus(hit, root.id, pview);

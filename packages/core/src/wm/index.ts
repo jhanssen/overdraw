@@ -371,6 +371,21 @@ export interface Wm {
     x: number, y: number,
     accept?: (win: Window, localX: number, localY: number) => boolean,
   ): Window | null;
+  // The output-anchored (glass-space) fullscreen window covering the
+  // GLASS point, if any: tier +1, fullscreen, visible, non-gated, and
+  // currently placed on an output. The seat consults this BEFORE the
+  // world-space windowAt pass -- anchored surfaces are hit in glass
+  // coordinates, mirroring the render side's camera exemption. Validity
+  // is re-checked here rather than trusting the tier stamp alone, so a
+  // stale stamp (hidden workspace, minimize without a restack yet)
+  // cannot swallow an output's pointer input.
+  anchoredFullscreenAt(x: number, y: number): Window | null;
+  // Re-stamp stacking tiers from current state WITHOUT pushing the
+  // stack. Call before rebuilding the stack after outputContent changes
+  // (workspace switch, cross-output move): tier inputs moved without any
+  // focus edge or window-state commit, and a rebuild would otherwise
+  // consume stale stamps. The caller owns the subsequent rebuild.
+  refreshStackTiers(): void;
   setInsets(surfaceId: number, insets: Insets): InsetGrant | undefined;
   outerRectOf(surfaceId: number): Rect | undefined;
   rectOf(surfaceId: number): Rect | undefined;
@@ -1214,7 +1229,22 @@ export function createWm(
         }
       }
     }
-    let changed = false;
+    // The keyboard-focused window is ALWAYS its current output's active
+    // window, resolved live -- placement converges asynchronously
+    // (workspace plugin roundtrips, cross-output moves with no focus
+    // edge), so the one-shot stamp in setKeyboardFocus can miss or point
+    // at the window's previous output. Restamp the memory too, so the
+    // activity survives once focus later leaves.
+    if (focusedWindowId !== null
+        && windows.some((w) => w.surfaceId === focusedWindowId)) {
+      const fo = outputOf(focusedWindowId);
+      if (fo !== null) {
+        activeByOutput.set(fo, focusedWindowId);
+        lastActiveByOutput.set(fo, focusedWindowId);
+      }
+    }
+    const tiers = new Map<number, -1 | 0 | 1>();
+    const actives = new Map<number, boolean>();
     for (const w of windows) {
       const o = outputOf(w.surfaceId);
       const active = o !== null
@@ -1230,6 +1260,24 @@ export function createWm(
       let tier: -1 | 0 | 1 = 0;
       if (overriding && active) tier = 1;
       else if (overriding && !tileMember) tier = -1;
+      tiers.set(w.surfaceId, tier);
+      actives.set(w.surfaceId, active);
+    }
+    // Raise-with inheritance: a modal/dialog chain rooted at a tier +1
+    // window rides that tier -- the tier boost outranks raw z, so
+    // without this an active fullscreen parent would draw OVER its own
+    // dialog (child z = parent.z + 1 only wins ties within a tier).
+    for (const w of windows) {
+      if ((tiers.get(w.surfaceId) ?? 0) !== 0) continue;
+      const root = rootOfChain(w);
+      if (root !== w && tiers.get(root.surfaceId) === 1) {
+        tiers.set(w.surfaceId, 1);
+      }
+    }
+    let changed = false;
+    for (const w of windows) {
+      const tier = tiers.get(w.surfaceId) ?? 0;
+      const active = actives.get(w.surfaceId) ?? false;
       if ((w.stackTier ?? 0) !== tier) { w.stackTier = tier; changed = true; }
       if ((w.active ?? false) !== active) { w.active = active; changed = true; }
       // A fullscreen window is glass furniture: its surface is anchored
@@ -1760,12 +1808,20 @@ export function createWm(
 
   // Maximized is single-instance per island: a window entering
   // "maximized" demotes any other maximized window on the same output
-  // back to "none" (its restoreRect applies). Fullscreen windows are
+  // back to "none" (the layout recompute restores its slot). Fullscreen windows are
   // untouched -- any number may coexist; stacking decides what shows.
   // Runs through propose() so the demoted window gets the full pipeline
   // (events, un-maximized configure, relayout).
   function demoteMaximizedPeers(of: Window): void {
     const island = outputOf(of.surfaceId);
+    // With a workspace plugin wired, every window NOT in outputContent
+    // (hidden workspace, not yet placed) resolves to null -- treating
+    // null as one shared island would let a background window's
+    // maximize demote maximized windows on every other hidden
+    // workspace. Demote only within a known island then; the null
+    // fallback is for workspace-less harnesses where all windows share
+    // the primary output.
+    if (island === null && outputContent) return;
     for (const w of windows) {
       if (w === of) continue;
       if (w.windowState.sizeMode !== "maximized") continue;
@@ -2219,14 +2275,15 @@ export function createWm(
       } else {
         candidates = [...windows];
       }
-      // Stable descending-effective-z sort: ties keep candidate order.
-      // effectiveStackZ folds in the sizeMode stacking tier and the
-      // active tie-break, and the renderer stacks with the same key,
-      // so input and pixels agree -- a click lands on whatever is drawn
-      // on top, including the focused tile revealed above a maximized
-      // peer.
-      candidates.sort((a, b) => effectiveStackZ(b) - effectiveStackZ(a));
-      for (const win of candidates) {
+      // Sort ASCENDING (stable) exactly like computeBaseStack, then walk
+      // from the top: a stable DESCENDING sort would resolve equal-key
+      // ties in the opposite order from the draw side, and the tie
+      // bucket is reachable -- a non-active maximized tile member shares
+      // z, tier, AND overlap with its tiled peers. Input and pixels must
+      // agree: the click lands on whatever is drawn on top.
+      candidates.sort((a, b) => effectiveStackZ(a) - effectiveStackZ(b));
+      for (let ci = candidates.length - 1; ci >= 0; ci--) {
+        const win = candidates[ci];
         // A lowered sizeMode window (tier -1: unfocused fullscreen, or
         // maximized floating) is input-transparent: it shows through tile
         // gaps as backdrop, but pointer input there must not split from
@@ -2245,6 +2302,25 @@ export function createWm(
         return gate(win);
       }
       return null;
+    },
+
+    anchoredFullscreenAt(x, y) {
+      for (const w of windows) {
+        if (w.stackTier !== 1) continue;
+        if (w.windowState.sizeMode !== "fullscreen") continue;
+        if (!w.windowState.visible || !w.hasContent || isGated(w)) continue;
+        // A window absent from outputContent (hidden workspace) is not
+        // on any glass; its tier stamp may simply not have caught up.
+        if (outputContent && outputOf(w.surfaceId) === null) continue;
+        const r = w.rect;
+        if (x < r.x || x >= r.x + r.width || y < r.y || y >= r.y + r.height) continue;
+        return w;
+      }
+      return null;
+    },
+
+    refreshStackTiers() {
+      updateStackTiers();
     },
 
     async propose(surfaceId, proposal, reason) {
@@ -2299,6 +2375,12 @@ export function createWm(
             changed: [...stampChanged],
           };
           pluginBus.emit(WINDOW_EVENT.committed, ev);
+        }
+        // The stamp can introduce maximized; the async pass below then
+        // diffs to nothing and returns before its demote hook.
+        if (win.windowState.sizeMode === "maximized"
+            && preStamp.sizeMode !== "maximized") {
+          demoteMaximizedPeers(win);
         }
       }
       // Same race for client-declared constraints (set_min_size /
@@ -2428,11 +2510,16 @@ export function createWm(
         if (win.hasContent && changed.some((f) => STACKING_FIELDS.includes(f))) {
           assignZForMap(win);
           pushStack();
-        } else if (win.hasContent && changed.includes("sizeMode")) {
-          // sizeMode transitions change the window's stacking TIER
-          // (updateStackTiers / effectiveStackZ) without touching win.z,
-          // so the draw stack must be re-pushed even though no z was
-          // reassigned.
+        } else if (win.hasContent
+                   && (changed.includes("sizeMode") || changed.includes("visible")
+                       || changed.includes("tiling"))) {
+          // sizeMode, visible, and tiling are all tier INPUTS
+          // (updateStackTiers / effectiveStackZ): a transition changes
+          // the window's stacking tier without touching win.z, so the
+          // draw stack must be re-pushed even though no z was
+          // reassigned -- a minimizing fullscreen window must drop its
+          // top tier, an unfloating maximized window becomes a tile
+          // member.
           pushStack();
         }
         // Modal transitions: tether or untether focus.
@@ -2521,6 +2608,13 @@ export function createWm(
             };
             pluginBus.emit(WINDOW_EVENT.committed, ev);
           }
+        }
+        // The maximized single-instance rule applies to rule/pre-content
+        // maximizes too: the regular propose() demote hook never sees
+        // this commit path.
+        if (win.windowState.sizeMode === "maximized"
+            && previous.sizeMode !== "maximized") {
+          demoteMaximizedPeers(win);
         }
 
         // Clear the flag BEFORE scheduling so the configure suppression

@@ -646,10 +646,15 @@ pluginBus.subscribe(WINDOW_EVENT.committed, (_name, payload) => {
   log.info("core",
     `window ${ev.surfaceId}: sizeMode ${ev.previous?.sizeMode ?? "?"} -> `
     + `${ev.current?.sizeMode ?? "?"} (${ev.reason ?? "?"})`);
-  // A sizeMode transition can flip the window's stacking tier (and its
-  // input-transparency when lowered) without any focus change, moving what
-  // is under a stationary pointer -- re-pick so pointer focus and the
-  // cursor track the new stack.
+});
+
+// sizeMode, visible, and tiling are stacking-tier inputs: a commit can
+// flip a window's tier (and its input-transparency when lowered) without
+// any focus change, moving what is under a stationary pointer -- re-pick
+// so pointer focus and the cursor track the new stack.
+pluginBus.subscribe(WINDOW_EVENT.committed, (_name, payload) => {
+  const changed = (payload as { changed?: string[] }).changed;
+  if (!changed?.some((f) => f === "sizeMode" || f === "visible" || f === "tiling")) return;
   state?.seat?.repickPointer();
 });
 
@@ -1365,7 +1370,7 @@ pluginBus.subscribe("window.toggle-floating-requested", () => {
 // none -> maximized zooms the window over its island's workarea (a
 // managed window keeps its layout slot; the WM demotes any other
 // maximized window on the island); maximized or fullscreen -> none
-// restores the captured restoreRect via relayout.
+// restores its lane rect via relayout (managed slot recompute; floating rect).
 pluginBus.subscribe("window.toggle-maximize-requested", () => {
   if (!state?.seat || !state.wm) return;
   const focused = state.seat.kbFocus?.surfaceId;

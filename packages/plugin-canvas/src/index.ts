@@ -387,19 +387,31 @@ async function activate(
       if (handle !== undefined) {
         const rec = state.byHandle.get(handle);
         if (rec) focusedOutputIdCache = rec.outputId;
-        if (rec) activeByOutput.set(rec.outputId, p.surfaceId);
         // Zoom is focus-transient in world mode: activity moving to
         // ANOTHER window on the SAME output releases the collapse,
         // expands the strip, and moves the world under the maximized
-        // member -- so rather than leave it as a strip-anchored cover
-        // it unzooms (restoreRect applies). Activity is output-local:
-        // focus landing on a different output changes nothing for the
-        // zoomed member's output, so it stays zoomed. Fullscreen is
+        // member -- so rather than leave it as a strip-anchored cover it
+        // unzooms (the layout recompute restores its slot). The edge is
+        // derived from the OUTPUT's previous active window, not the
+        // seat's previous focus: focus may have detoured through a
+        // launcher (layer surface), another output, or a window that
+        // already unmapped, and the release must still fire. Activity is
+        // output-local: focus landing on a different output changes
+        // nothing for the zoomed member's output. Fullscreen is
         // untouched -- it is glass furniture, not a strip resident.
-        if (rec && prevFocused !== null && prevFocused !== p.surfaceId
-            && sizeModeMembers.get(prevFocused) === "maximized"
-            && outputOfSurface(prevFocused) === rec.outputId) {
-          void sdk.windows.propose(prevFocused, { sizeMode: "none" });
+        const prevActive = rec ? activeByOutput.get(rec.outputId) : undefined;
+        if (rec) activeByOutput.set(rec.outputId, p.surfaceId);
+        if (rec && prevActive !== undefined && prevActive !== p.surfaceId
+            && sizeModeMembers.get(prevActive) === "maximized") {
+          void sdk.windows.propose(prevActive, { sizeMode: "none" });
+        }
+        // The collapse keys on activeByOutput: an activity change onto
+        // or off a sizeMode member re-solves the world even when the
+        // seat-global focus edge (checked above) missed it.
+        if (rec && prevActive !== p.surfaceId
+            && (sizeModeMembers.has(p.surfaceId)
+                || (prevActive !== undefined && sizeModeMembers.has(prevActive)))) {
+          void publishWorld();
         }
         // While an output's camera is overridden (fit or free roam)
         // every visible window is focusable (click, or hover under
@@ -427,8 +439,12 @@ async function activate(
         // merely-moving cursor. A deliberate focus -- click, keyboard
         // cycle, workspace switch, window map -- still reveals; so does
         // an event with no reason (core versions that don't stamp one).
+        // Fullscreen members never drive the strip reveal: their outer is
+        // the output rect, and revealing it resets the scroll (see
+        // revealSurface).
         if (rec && worldMode && isElastic(handle) && !override.has(rec.outputId)
             && state.shownByOutput.get(rec.outputId) === handle
+            && sizeModeMembers.get(p.surfaceId) !== "fullscreen"
             && (scrollOnHover || (p.focusReason !== "pointer-enter"
                                   && p.focusReason !== "pointer-repick"))) {
           const sid = p.surfaceId;
@@ -470,12 +486,13 @@ async function activate(
   });
 
   // State changes that re-solve the world: a member floating/unfloating
-  // joins or leaves the tiled set an elastic island is measured for, a
-  // focused sizeMode (maximize/fullscreen) member collapses its strip to
-  // the viewport, and a size constraint changes what the layout measures
-  // for that member (a client may state its minimum at any point in its
-  // life, not only before it maps). window.committed is the observe-only
-  // signal for behavioral-state commits.
+  // joins or leaves the tiled set an elastic island is measured for, an
+  // active maximized member collapses its strip to the viewport (a
+  // fullscreen member never touches the strip -- glass furniture), and a
+  // size constraint changes what the layout measures for that member (a
+  // client may state its minimum at any point in its life, not only
+  // before it maps). window.committed is the observe-only signal for
+  // behavioral-state commits.
   const MEASURED_FIELDS = ["tiling", "sizeMode", "visible", "constraints"];
   // Members currently holding sizeMode != none (value = which mode),
   // tracked from committed events so focus edges can tell when the
@@ -532,6 +549,10 @@ async function activate(
     const n = entry.newOuter;
     if (o && o.x === n.x && o.y === n.y
         && o.width === n.width && o.height === n.height) return;
+    // A member ENTERING fullscreen reports its outer jumping to the
+    // output rect -- following that would reset the strip scroll (see
+    // revealSurface).
+    if (sizeModeMembers.get(focusedSurfaceId) === "fullscreen") return;
     const handle = state.surfaceToHandle.get(focusedSurfaceId);
     if (handle === undefined || !isElastic(handle)) return;
     const rec = state.byHandle.get(handle);
@@ -593,6 +614,7 @@ async function activate(
     outputAliasesById.delete(p.outputId);
     outputGeom.delete(p.outputId);
     override.delete(p.outputId);
+    activeByOutput.delete(p.outputId);
     // Focus may have been on this output; reset to OUTPUT_DEFAULT so the
     // next action targets a live output rather than the vanished one.
     if (focusedOutputIdCache === p.outputId) {
@@ -942,6 +964,11 @@ async function activate(
   // workspace. Serves the deliberate reveal paths: pointer presses and
   // the workspace.reveal action.
   async function revealSurface(sid: number): Promise<void> {
+    // A fullscreen member is glass furniture: its outer is the world-space
+    // output rect, not a strip column -- "revealing" it would clamp the
+    // strip scroll to 0 and lose the user's framing while the (opaque,
+    // camera-exempt) surface covers the glass anyway.
+    if (sizeModeMembers.get(sid) === "fullscreen") return;
     const handle = state.surfaceToHandle.get(sid);
     if (handle === undefined || !worldMode || !isElastic(handle)) return;
     const rec = state.byHandle.get(handle);
@@ -1158,17 +1185,16 @@ async function activate(
   }
 
   // The members the layout will tile, mirroring the driver's compute()
-  // lane filter: managed, visible, not fullscreen. Returns null when a
-  // FOCUSED sizeMode (maximized / fullscreen) member collapses the island
-  // to the workarea -- a maximize covers the usable glass, not a
-  // multi-screen strip. Unfocused, the strip stays a strip so the user
-  // can work in (and launch into) the rest of the island: an unfocused
-  // fullscreen member is not a tile member (it dropped below the tiled
-  // tier and its peers reflowed over the island), while an unfocused
-  // maximized MANAGED member still occupies its slot and counts toward
-  // the measured width. A member without a WM snapshot counts for
-  // nothing: undersizing (workarea-width island) is always recoverable,
-  // oversizing stretches windows past the output.
+  // lane filter: managed, visible, not fullscreen. Returns null when the
+  // output's ACTIVE member is maximized: the collapse squeezes the island
+  // to the workarea (a maximize covers the usable glass, not a
+  // multi-screen strip). Fullscreen members never affect the strip in
+  // either direction -- they are glass furniture covering the monitor on
+  // their own, so activating one leaves the columns untouched. A
+  // non-active maximized MANAGED member still occupies its slot and
+  // counts toward the measured width. A member without a WM snapshot
+  // counts for nothing: undersizing (workarea-width island) is always
+  // recoverable, oversizing stretches windows past the output.
   function tiledMembers(
     members: ReadonlyArray<number>,
     snapById: Map<number, WindowSnapshotLike>,
@@ -1183,8 +1209,15 @@ async function activate(
       const ws = snapById.get(id)?.windowState;
       if (!ws) continue;
       if (!ws.visible) continue;
-      if (ws.sizeMode !== "none" && id === active) return null;
+      // Fullscreen is glass furniture: it covers the monitor by itself
+      // (output-anchored surface), so it neither counts toward the strip
+      // nor EVER collapses it -- activating a fullscreen member must
+      // leave the tiled columns exactly as they are, or cycling through
+      // it would compress the strip into the workarea and back. Only an
+      // active MAXIMIZED member collapses (maximize covers the usable
+      // glass; the camera docks on it).
       if (ws.sizeMode === "fullscreen") continue;
+      if (ws.sizeMode !== "none" && id === active) return null;
       if (ws.tiling === "managed") tiled.push(id);
     }
     return tiled;
@@ -2261,7 +2294,25 @@ async function activate(
       }
     }
   }
-  sdk.windows.onMap((ev) => { void placeOnMap(ev); });
+  sdk.windows.onMap((ev) => {
+    void placeOnMap(ev).then(() => {
+      // The activation edge for this window may have arrived BEFORE
+      // placement populated surfaceToHandle (the handler tolerates the
+      // race and skips). Catch up here: if the window is the current
+      // focus, stamp its output's activity and fire the same
+      // maximized-release edge the activation handler would have.
+      if (focusedSurfaceId !== ev.surfaceId) return;
+      const outId = outputOfSurface(ev.surfaceId);
+      if (outId === null) return;
+      const prevActive = activeByOutput.get(outId);
+      activeByOutput.set(outId, ev.surfaceId);
+      if (prevActive !== undefined && prevActive !== ev.surfaceId
+          && sizeModeMembers.get(prevActive) === "maximized") {
+        void sdk.windows.propose(prevActive, { sizeMode: "none" });
+      }
+      focusedOutputIdCache = outId;
+    });
+  });
 
   // Membership on drag (canvas-design.md §3): a move grab's drop
   // re-parents the window to the island under the CURSOR (the seat
@@ -2365,6 +2416,10 @@ async function activate(
     })();
   });
   sdk.windows.onUnmap((ev) => {
+    sizeModeMembers.delete(ev.surfaceId);
+    for (const [o, id] of activeByOutput) {
+      if (id === ev.surfaceId) activeByOutput.delete(o);
+    }
     const r = reg.applyUnmap(state, ev.surfaceId);
     state = r.state;
     void applyEffects(r.sideEffects);

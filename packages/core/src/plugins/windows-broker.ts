@@ -328,6 +328,13 @@ export function createWindowsBroker(deps: WindowsBrokerDeps): WindowsBroker {
     } else {
       state.outputToplevelStacks.set(p.outputId, p.ids.slice());
     }
+    // Re-stamp stacking tiers before rebuilding: outputContent membership
+    // is a tier input (output-local activity, tile membership), and it
+    // just changed with no focus edge or window-state commit -- a plain
+    // rebuild would consume stale stackTier/active stamps (e.g. a
+    // workspace switch hiding an active fullscreen window must drop its
+    // top tier or it keeps swallowing the output's pointer input).
+    state.wm?.refreshStackTiers();
     rebuildStackWithPopups(state);
     // The visible window set on this output changed; trigger a relayout so
     // the layout-driver picks up the new ordering / membership. "reorder"
