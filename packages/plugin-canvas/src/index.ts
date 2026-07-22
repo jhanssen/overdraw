@@ -323,6 +323,16 @@ async function activate(
   function focusedOutputId(): number {
     return focusedOutputIdCache;
   }
+  // Per-output activity memory (mirrors the WM's stacking rule): the last
+  // activated window on each output. Collapse and zoom transience key on
+  // THIS, not on seat-global focus, so focus or camera changes on another
+  // output never release a strip's collapse or unzoom its member.
+  const activeByOutput = new Map<number, number>();
+  function outputOfSurface(sid: number): number | null {
+    const h = state.surfaceToHandle.get(sid);
+    if (h === undefined) return null;
+    return state.byHandle.get(h)?.outputId ?? null;
+  }
   // Subscribe BEFORE init so a synchronous emit during startup doesn't drop.
   sdk.events.subscribe("output.changed", (_name, payload) => {
     if (!payload || typeof payload !== "object") return;
@@ -377,6 +387,20 @@ async function activate(
       if (handle !== undefined) {
         const rec = state.byHandle.get(handle);
         if (rec) focusedOutputIdCache = rec.outputId;
+        if (rec) activeByOutput.set(rec.outputId, p.surfaceId);
+        // Zoom is focus-transient in world mode: activity moving to
+        // ANOTHER window on the SAME output releases the collapse,
+        // expands the strip, and moves the world under the maximized
+        // member -- so rather than leave it as a strip-anchored cover
+        // it unzooms (restoreRect applies). Activity is output-local:
+        // focus landing on a different output changes nothing for the
+        // zoomed member's output, so it stays zoomed. Fullscreen is
+        // untouched -- it is glass furniture, not a strip resident.
+        if (rec && prevFocused !== null && prevFocused !== p.surfaceId
+            && sizeModeMembers.get(prevFocused) === "maximized"
+            && outputOfSurface(prevFocused) === rec.outputId) {
+          void sdk.windows.propose(prevFocused, { sizeMode: "none" });
+        }
         // While an output's camera is overridden (fit or free roam)
         // every visible window is focusable (click, or hover under
         // follow-pointer focus), so the shown workspace FOLLOWS focus:
@@ -426,8 +450,11 @@ async function activate(
       }
     } else if (focusedSurfaceId === p.surfaceId) {
       focusedSurfaceId = null;
-      // Keep focusedOutputIdCache: the focus departed but the user's
-      // pointer/keyboard is still anchored on that output.
+      // Deactivation without a successor (focus went to a layer surface
+      // or nothing): output activity is sticky, so a zoomed member stays
+      // zoomed and its collapse holds until another window on its output
+      // activates. Keep focusedOutputIdCache too: the focus departed but
+      // the user's pointer/keyboard is still anchored on that output.
     }
   });
   // A pointer press is deliberate intent: center the pressed window's
@@ -450,18 +477,20 @@ async function activate(
   // life, not only before it maps). window.committed is the observe-only
   // signal for behavioral-state commits.
   const MEASURED_FIELDS = ["tiling", "sizeMode", "visible", "constraints"];
-  // Members currently holding sizeMode != none, tracked from committed
-  // events so focus edges can tell when the collapse engages/releases
-  // (collapse follows the FOCUSED sizeMode member; see tiledMembers).
-  const sizeModeMembers = new Set<number>();
+  // Members currently holding sizeMode != none (value = which mode),
+  // tracked from committed events so focus edges can tell when the
+  // collapse engages/releases (collapse follows the FOCUSED sizeMode
+  // member; see tiledMembers) and whether the departed member was
+  // maximized (zoom is focus-transient in world mode; see below).
+  const sizeModeMembers = new Map<number, string>();
   sdk.events.subscribe("window.committed", (_name, payload) => {
     if (!worldMode || !payload || typeof payload !== "object") return;
     const p = payload as { surfaceId?: unknown; changed?: unknown;
                            current?: { sizeMode?: unknown } };
     if (typeof p.surfaceId !== "number" || !Array.isArray(p.changed)) return;
     if (p.changed.includes("sizeMode")) {
-      if (p.current?.sizeMode !== undefined && p.current.sizeMode !== "none") {
-        sizeModeMembers.add(p.surfaceId);
+      if (typeof p.current?.sizeMode === "string" && p.current.sizeMode !== "none") {
+        sizeModeMembers.set(p.surfaceId, p.current.sizeMode);
       } else {
         sizeModeMembers.delete(p.surfaceId);
       }
@@ -1143,13 +1172,18 @@ async function activate(
   function tiledMembers(
     members: ReadonlyArray<number>,
     snapById: Map<number, WindowSnapshotLike>,
+    outputId: number,
   ): number[] | null {
+    // Collapse follows OUTPUT-LOCAL activity, not seat-global focus: a
+    // zoomed member stays collapsed while it is the last-activated
+    // window on ITS output, even when focus sits on another output.
+    const active = activeByOutput.get(outputId) ?? focusedSurfaceId;
     const tiled: number[] = [];
     for (const id of members) {
       const ws = snapById.get(id)?.windowState;
       if (!ws) continue;
       if (!ws.visible) continue;
-      if (ws.sizeMode !== "none" && id === focusedSurfaceId) return null;
+      if (ws.sizeMode !== "none" && id === active) return null;
       if (ws.sizeMode === "fullscreen") continue;
       if (ws.tiling === "managed") tiled.push(id);
     }
@@ -1167,7 +1201,8 @@ async function activate(
     wa: { width: number; height: number },
     snapById: Map<number, WindowSnapshotLike>,
   ): Promise<number> {
-    const tiled = tiledMembers(members, snapById);
+    const rec = state.byHandle.get(handle);
+    const tiled = tiledMembers(members, snapById, rec?.outputId ?? reg.OUTPUT_DEFAULT);
     // No tiled members -> the workarea, without asking: every provider
     // floors its measure there, and publishWorld runs on each structural
     // change across every island.

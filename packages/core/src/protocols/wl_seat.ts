@@ -354,10 +354,35 @@ export default function makeSeat(ctx: Ctx, driver: FocusDriver): SeatHandler {
     const view = contentViewAt(x, y);
     const popup = pickPopup(x, y, view);
     if (popup) return popup;
+    // An ACTIVE fullscreen toplevel is glass-anchored (it covers its
+    // output regardless of the camera), so it is hit in glass
+    // coordinates with the identity view, above all world content --
+    // mirroring cameraExempt + the top stacking tier on the render side.
+    // A non-active fullscreen window is tier -1 and input-transparent
+    // (windowAt skips it), so only the active case exists here.
+    const anchored = pickAnchoredFullscreen(x, y);
+    if (anchored) return anchored;
     const win = pickToplevel(
       seatViewToWorldX(view, x), seatViewToWorldY(view, y), view);
     if (win) return win;
     return pickLayer(x, y, ["bottom", "background"]);
+  }
+
+  function pickAnchoredFullscreen(x: number, y: number): SeatFocus | null {
+    const wm = ctx.state.wm;
+    if (!wm) return null;
+    for (const w of wm.state.windows) {
+      if (w.stackTier !== 1) continue;
+      if (w.windowState.sizeMode !== "fullscreen") continue;
+      const r = w.rect;
+      if (x < r.x || x >= r.x + r.width || y < r.y || y >= r.y + r.height) continue;
+      const root = ctx.state.surfaces.get(w.surfaceRec.resource);
+      if (!root) continue;
+      const hit = hitTestSurfaceTree(ctx.state, root, w.rect, x, y);
+      if (!hit) continue;
+      return toFocus(hit, root.id, SEAT_VIEW_IDENTITY);
+    }
+    return null;
   }
 
   // The glass->world view transform of the output under a glass-space
@@ -440,6 +465,12 @@ export default function makeSeat(ctx: Ctx, driver: FocusDriver): SeatHandler {
     let bestHit: SurfaceHit | null = null;
     let bestRootId = 0;
     const win = wm.windowAt(x, y, (w) => {
+      // Glass-anchored (active fullscreen) toplevels are hit by
+      // pickAnchoredFullscreen in glass coordinates; their WM rect is
+      // arrangement-space and must not match a WORLD-space point (a
+      // camera on another output can map into this output's arrangement
+      // rect).
+      if (w.stackTier === 1 && w.windowState.sizeMode === "fullscreen") return false;
       const root = ctx.state.surfaces.get(w.surfaceRec.resource);
       if (!root) return false;
       const hit = hitTestSurfaceTree(ctx.state, root, w.rect, x, y);

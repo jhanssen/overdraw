@@ -7,22 +7,38 @@ file is the short read; consult the detailed doc when investigating a
 specific subsystem.
 
 Last updated: 2026-07-21. Recent landings: `exclusive` renamed to
-`sizeMode` with new tier-based semantics. A sizeMode window (fullscreen /
-maximized) keeps a fixed override rect (glass / island-scoped workarea)
-and is never reconfigured by focus changes; what the user sees is decided
-by STACKING alone. A fullscreen window is not a tile member by
-definition: it leaves the layout compute (peers reflow over the island),
-draws topmost while keyboard-focused, and drops BELOW the tiled tier when
-unfocused. A maximized MANAGED window stays a tile member (keeps its
-slot; peers hold position; the focused peer's z tie-break draws above
-it); a maximized floating window is a non-member and lowers like
-fullscreen. Any number of sizeMode windows coexist ("top z wins");
-maximized alone is single-instance per island -- a new maximize demotes
-the previous one via propose(). WM stamps stackTier (-1/0/+1) and
-kbFocused; effectiveStackZ and the canvas collapse consume them; the old
-focusReveal lift is gone. Keyboard-focus changes also re-pick pointer
-focus (main.ts), so a fullscreen client that hid the cursor no longer
-pins it hidden after focus-cycling away. Prior: fullscreen-flap fixes (an X11
+`sizeMode` with tier-based, output-local semantics. A sizeMode window
+(fullscreen / maximized) keeps a fixed override rect and is never
+reconfigured by focus changes; what the user sees is decided by STACKING
+alone, and stacking follows each output's ACTIVE window (its most
+recently keyboard-focused window, sticky while focus parks on a layer
+surface or another output) -- so a fullscreen window on output B keeps
+covering B while the user works on A, and one fullscreen window per
+output coexists. A fullscreen window is not a tile member by definition:
+it leaves the layout compute (peers reflow over the island), draws
+topmost while output-active, drops BELOW the tiled tier otherwise, and
+is then INPUT-TRANSPARENT (windowAt skips tier -1: no pointer input, no
+cursor-preference capture, no hover-raise through tile gaps;
+focus-cycling is the way back). Its surface is OUTPUT-ANCHORED glass
+furniture (setSurfaceOutputAnchored / cameraExempt): its rect is the
+plain output arrangement rect, so it covers the monitor at every canvas
+camera position and zoom -- seat picking hits an active fullscreen in
+glass coordinates (identity view), popup chains rooted at one anchor
+with it, and xwayland glass narration applies no camera to it. A
+maximized MANAGED window stays a tile member (keeps its slot; peers hold
+position; the active peer's z tie-break draws above it); a maximized
+floating window is a non-member and lowers like fullscreen. Any number
+of sizeMode windows coexist ("top z wins"); maximized alone is
+single-instance per island -- a new maximize demotes the previous one
+via propose() -- and in canvas world mode zoom is focus-transient: when
+another window on the SAME output takes activity, the zoomed member
+unzooms (restoreRect) instead of lingering as a strip-anchored cover.
+WM stamps stackTier (-1/0/+1) and `active`; effectiveStackZ and the
+canvas collapse (also output-local via its own activeByOutput) consume
+them; the old focusReveal lift is gone. Keyboard-focus changes and
+sizeMode commits re-pick pointer focus (main.ts), so a fullscreen client
+that hid the cursor no longer pins it hidden after focus-cycling away.
+Prior: fullscreen-flap fixes (an X11
 game declaring fullscreen pre-map flapped exclusive none<->fullscreen and
 often settled decorated/tiled: markInitialCommitComplete committed its
 stale pre-round-trip snapshot over the synchronously-stamped fullscreen --

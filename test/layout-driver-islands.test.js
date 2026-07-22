@@ -97,7 +97,7 @@ test('reserved zones never carve explicit island rects; implicit still derives o
   assert.deepEqual(byIsland.get(0).tileRegion, { x: 0, y: 30, width: 1000, height: 570 });
 });
 
-test('fullscreen on an explicit island covers the glass: island origin shifted back by the workarea offset, output-sized', async () => {
+test('fullscreen on an explicit island gets the plain output rect (glass-anchored surface)', async () => {
   const zones = createReservedZoneRegistry();
   zones.set('bar', { outputId: 0, edge: 'top', thickness: 30, owner: 99 });
 
@@ -111,19 +111,20 @@ test('fullscreen on an explicit island covers the glass: island origin shifted b
       [{ ...managedWin(1), sizeMode: 'fullscreen' }]),
     target,
     reservedZones: zones,
-    // The compute still runs (the exclusive member keeps occupying its
-    // slot); its slot rect is replaced by the glass-covering override.
+    // A fullscreen member is not a tile member: the compute must not see
+    // it (an empty compute never runs; assert via the returned rects).
     compute: async (inputs) =>
       ({ rects: inputs.windows.map((w) => ({ id: w.id, outer: { x: 1, y: 1, width: 1, height: 1 } })) }),
   });
   driver.schedule('mapped');
   await driver.settled();
 
-  // The docked camera puts the island origin at the workarea origin
-  // (0, 30 on the glass); a glass-covering rect therefore starts 30px
-  // above the island in world space and spans the full output size.
+  // The fullscreen surface is output-anchored (camera-exempt), so its
+  // rect is the context output's arrangement rect verbatim -- the glass
+  // position for an anchored surface -- independent of the island's
+  // world origin, the reserved zones, and the camera.
   assert.deepEqual(target.calls[0].result.rects, [
-    { id: 1, outer: { x: 5000, y: -30, width: 1000, height: 600 } },
+    { id: 1, outer: { x: 0, y: 0, width: 1000, height: 600 } },
   ]);
 });
 

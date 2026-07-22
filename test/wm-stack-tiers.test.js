@@ -93,7 +93,7 @@ test('focus-cycling away from a fullscreen window uncovers the island', async ()
   wm.setKeyboardFocus(1);
   wm.setKeyboardFocus(2);
   assert.equal(winOf(wm, 1).stackTier, -1);
-  assert.equal(winOf(wm, 2).kbFocused, true);
+  assert.equal(winOf(wm, 2).active, true);
   const stack = sink.stacks.at(-1);
   assert.ok(stack.indexOf(1) < stack.indexOf(2),
     'fullscreen window dropped behind the newly focused peer');
@@ -107,16 +107,70 @@ test('fullscreen exit returns the window to the tiled tier', async () => {
   assert.equal(winOf(wm, 1).stackTier, 0);
 });
 
-test('focus on a non-window surface (e.g. a layer shell id) lowers the fullscreen window', async () => {
-  const { wm, sink } = makeWmWithWindows();
+test('focus parked on a non-window surface (layer shell) keeps output activity sticky', async () => {
+  const { wm } = makeWmWithWindows();
   await wm.propose(1, { sizeMode: 'fullscreen' }, 'client-request');
   wm.setKeyboardFocus(1);
+  assert.equal(winOf(wm, 1).stackTier, 1);
+  // A launcher/bar taking keyboard focus is not a window on any output:
+  // the fullscreen window stays its output's active window and keeps
+  // covering it.
   wm.setKeyboardFocus(777);
+  assert.equal(winOf(wm, 1).stackTier, 1);
+  // Moving focus to a real peer window DOES transfer activity.
+  wm.setKeyboardFocus(2);
   assert.equal(winOf(wm, 1).stackTier, -1);
-  const stack = sink.stacks.at(-1);
-  assert.ok(stack.includes(1) && stack.includes(2),
-    'both windows stay in the stack with focus outside the island');
-  assert.ok(stack.indexOf(1) < stack.indexOf(2));
+});
+
+test('multi-output: a fullscreen window per output; focus on one output does not demote the other', async () => {
+  const sink = mockSink();
+  const content = new Map([[0, [1, 2]], [1, [3, 4]]]);
+  const wm = createWm(sink,
+    [{ id: 0, rect: { x: 0, y: 0, width: 800, height: 600 }, scale: 1 },
+     { id: 1, rect: { x: 800, y: 0, width: 800, height: 600 }, scale: 1 }],
+    {
+      outputContent: () => content,
+      configure: { configure: () => null, configureMove: () => {} },
+      layoutDriverFactory: (target, snapshot) => createLayoutDriver({
+        target, snapshot,
+        compute: async (inputs) => ({
+          rects: inputs.windows.map((win, i) => ({
+            id: win.id,
+            outer: { x: inputs.tileRegion.x + i * 100, y: 0, width: 100, height: 100 },
+          })),
+        }),
+      }),
+    });
+  for (const id of [1, 2, 3, 4]) {
+    wm.addWindow(id, res(id));
+    wm.windowHasContent(id);
+  }
+  await wm.propose(1, { sizeMode: 'fullscreen' }, 'client-request');
+  await wm.propose(3, { sizeMode: 'fullscreen' }, 'client-request');
+  await wm.settled();
+  // Make each fullscreen window its output's active window.
+  wm.setKeyboardFocus(1);
+  wm.setKeyboardFocus(3);
+  // Focus sits on output 1's window; output 0's fullscreen window must
+  // stay raised (activity is output-local, not seat-global).
+  assert.equal(winOf(wm, 1).stackTier, 1);
+  assert.equal(winOf(wm, 3).stackTier, 1);
+  // Each covers ITS output's rect.
+  assert.deepEqual(winOf(wm, 1).outer, { x: 0, y: 0, width: 800, height: 600 });
+  assert.deepEqual(winOf(wm, 3).outer, { x: 800, y: 0, width: 800, height: 600 });
+  // Focusing a tiled peer on output 1 lowers only output 1's fullscreen.
+  wm.setKeyboardFocus(4);
+  assert.equal(winOf(wm, 3).stackTier, -1);
+  assert.equal(winOf(wm, 1).stackTier, 1);
+  // Maximize demotion is island-scoped: zoom on output 0 must not touch
+  // a zoomed window on output 1.
+  await wm.propose(4, { sizeMode: 'maximized' }, 'client-request');
+  wm.setKeyboardFocus(2);
+  await wm.propose(2, { sizeMode: 'maximized' }, 'client-request');
+  await winOf(wm, 4).pendingMutation;
+  assert.equal(winOf(wm, 4).windowState.sizeMode, 'maximized',
+    'zoom on another output is untouched by the demotion rule');
+  assert.equal(winOf(wm, 2).windowState.sizeMode, 'maximized');
 });
 
 test('maximized managed window stays in the tiled tier; the focused peer wins the tie', async () => {

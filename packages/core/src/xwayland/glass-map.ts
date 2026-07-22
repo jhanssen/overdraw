@@ -32,6 +32,12 @@ import { log } from "../log.js";
 export function xChartCameraOf(
   state: CompositorState, surfaceId: number,
 ): { x: number; y: number } {
+  // A fullscreen X window's surface is output-anchored (camera-exempt):
+  // its layout rect IS its glass position, so the narration applies no
+  // camera offset regardless of where the content camera sits.
+  if (state.wm?.getWindowState(surfaceId)?.sizeMode === "fullscreen") {
+    return { x: 0, y: 0 };
+  }
   const comp = state.compositor;
   const outs = comp.surfaceVisibleOutputs
     ? comp.surfaceVisibleOutputs(surfaceId) : undefined;

@@ -118,23 +118,26 @@ export interface Window {
   // claimed it for any output yet).
   outputId?: number | null;
   // Stacking tier, stamped by updateStackTiers (recomputed on every stack
-  // push and on setKeyboardFocus), consumed by effectiveStackZ:
-  //   +1  sizeMode !== "none", visible, keyboard-focused: draws above
-  //       every tier ("top z wins" -- a focused fullscreen/maximized
-  //       window covers the glass/workarea).
-  //   -1  sizeMode !== "none", visible, unfocused, and NOT a tile member
-  //       (fullscreen any tiling, or maximized floating): drops below the
-  //       tiled tier so the rest of the island is visible and usable. The
-  //       client keeps its state and rect; only stacking changes.
-  //    0  everything else -- including an unfocused maximized MANAGED
-  //       window, which is a tile member (it keeps its slot) and stays in
-  //       the tiled tier; the focused peer's kbFocused tie-break draws
-  //       above it.
+  // push and on setKeyboardFocus), consumed by effectiveStackZ. "Active"
+  // means the window is its OUTPUT's most recently keyboard-focused
+  // window -- output-local, so focus on another output changes nothing:
+  //   +1  sizeMode !== "none", visible, output-active: draws above every
+  //       tier ("top z wins" -- an active fullscreen/maximized window
+  //       covers the glass/workarea).
+  //   -1  sizeMode !== "none", visible, not output-active, and NOT a
+  //       tile member (fullscreen any tiling, or maximized floating):
+  //       drops below the tiled tier so the rest of the island is
+  //       visible and usable, and windowAt makes it input-transparent.
+  //       The client keeps its state and rect; only stacking changes.
+  //    0  everything else -- including a non-active maximized MANAGED
+  //       window, which is a tile member (it keeps its slot) and stays
+  //       in the tiled tier; the active peer's tie-break draws above it.
   stackTier?: -1 | 0 | 1;
-  // True while this window is keyboard-focused. Breaks z ties within a
-  // tier (the tiled tier shares one z), so the focused tiled window draws
-  // above an overlapping maximized tile member. Stamped by updateStackTiers.
-  kbFocused?: boolean;
+  // True while this window is its output's active window. Breaks z ties
+  // within a tier (the tiled tier shares one z), so the active tiled
+  // window draws above an overlapping maximized tile member. Stamped by
+  // updateStackTiers.
+  active?: boolean;
   // Per-window mutation queue. Async operations on win.windowState
   // (propose, markInitialCommitComplete) chain on this so a second call
   // doesn't read stale state mid-microtask from an in-flight first call.
@@ -900,8 +903,14 @@ export function createWm(
   const windows: Window[] = [];
   const wm: WmState = { outputs: outputsMap(outputs), windows };
   // The keyboard-focused surface as reported via setKeyboardFocus (any
-  // surface id, not necessarily a WM window). Drives stackTier/kbFocused.
+  // surface id, not necessarily a WM window). Drives stackTier/active.
   let focusedWindowId: number | null = null;
+  // Per-output activity memory: the last keyboard-focused WM window on
+  // each output. Stacking (updateStackTiers) follows this, not raw
+  // keyboard focus, so a fullscreen window keeps covering its output
+  // while the user works on another one. Entries are validated against
+  // current membership at read time; unmapWindow prunes eagerly.
+  const lastActiveByOutput = new Map<number, number>();
 
   // Z-order state. tiledZ is the single z value shared by every
   // tiled (master-stack) window: tiled windows don't overlap each
@@ -1181,25 +1190,56 @@ export function createWm(
     compositor.setStack(ids);
   }
 
-  // Recompute every window's stackTier + kbFocused (see the Window field
-  // docs). Returns whether any flag changed so callers can re-push the
-  // stack.
+  // Recompute every window's stackTier + active flag (see the Window
+  // field docs). Returns whether any flag changed so callers can re-push
+  // the stack.
+  //
+  // Stacking follows OUTPUT-LOCAL activity, not raw keyboard focus:
+  // keyboard focus is seat-global, and focusing a window on output A
+  // must not demote a fullscreen window covering output B. Each output's
+  // active window is the most recently keyboard-focused window that
+  // still lives on it (lastActiveByOutput, stamped by setKeyboardFocus);
+  // focus parked on a non-window surface (a layer-shell launcher)
+  // changes nothing. Without a workspace plugin (no outputContent),
+  // activity degrades to global keyboard focus.
   function updateStackTiers(): boolean {
+    const content = outputContent ? outputContent() : null;
+    const activeByOutput = new Map<number, number>();
+    if (content) {
+      for (const [outputId, ids] of content) {
+        const last = lastActiveByOutput.get(outputId);
+        if (last !== undefined && ids.includes(last)
+            && windows.some((x) => x.surfaceId === last)) {
+          activeByOutput.set(outputId, last);
+        }
+      }
+    }
     let changed = false;
     for (const w of windows) {
-      const focused = w.surfaceId === focusedWindowId;
+      const o = outputOf(w.surfaceId);
+      const active = o !== null
+        ? activeByOutput.get(o) === w.surfaceId
+        : w.surfaceId === focusedWindowId;
       const overriding = w.windowState.sizeMode !== "none" && w.windowState.visible;
       // A maximized managed window is a tile member (it keeps its slot)
       // and stays in the tiled tier. Fullscreen (any tiling) and
-      // maximized floating windows are not members; unfocused they drop
-      // below the tiled tier.
+      // maximized floating windows are not members; while not their
+      // output's active window they drop below the tiled tier.
       const tileMember = w.windowState.tiling === "managed"
         && w.windowState.sizeMode !== "fullscreen";
       let tier: -1 | 0 | 1 = 0;
-      if (overriding && focused) tier = 1;
+      if (overriding && active) tier = 1;
       else if (overriding && !tileMember) tier = -1;
       if ((w.stackTier ?? 0) !== tier) { w.stackTier = tier; changed = true; }
-      if ((w.kbFocused ?? false) !== focused) { w.kbFocused = focused; changed = true; }
+      if ((w.active ?? false) !== active) { w.active = active; changed = true; }
+      // A fullscreen window is glass furniture: its surface is anchored
+      // to the output (camera-exempt), so it always covers the monitor
+      // regardless of the canvas camera's position or zoom. The layout
+      // rect the driver assigns it is the plain output rect, which for
+      // an anchored surface IS its glass position. The setter no-ops on
+      // an unchanged flag.
+      compositor.setSurfaceOutputAnchored?.(
+        w.surfaceId, w.windowState.sizeMode === "fullscreen");
     }
     return changed;
   }
@@ -1966,6 +2006,9 @@ export function createWm(
       const mt = mapAckBackstops.get(surfaceId);
       if (mt) { clearTimeout(mt); mapAckBackstops.delete(surfaceId); }
       lastConfigureSerial.delete(surfaceId);
+      for (const [o, id] of lastActiveByOutput) {
+        if (id === surfaceId) lastActiveByOutput.delete(o);
+      }
       driver.schedule("unmapped");
       pushStack();
       if (wasModal) untetherFocusOnUnmodal(unmapped, surfaceId);
@@ -2178,7 +2221,7 @@ export function createWm(
       }
       // Stable descending-effective-z sort: ties keep candidate order.
       // effectiveStackZ folds in the sizeMode stacking tier and the
-      // kbFocused tie-break, and the renderer stacks with the same key,
+      // active tie-break, and the renderer stacks with the same key,
       // so input and pixels agree -- a click lands on whatever is drawn
       // on top, including the focused tile revealed above a maximized
       // peer.
@@ -2596,12 +2639,16 @@ export function createWm(
     setKeyboardFocus(surfaceId) {
       if (focusedWindowId === surfaceId) return;
       focusedWindowId = surfaceId;
+      if (surfaceId !== null && windows.some((w) => w.surfaceId === surfaceId)) {
+        const o = outputOf(surfaceId);
+        if (o !== null) lastActiveByOutput.set(o, surfaceId);
+      }
       // pushStack re-runs updateStackTiers itself, but only re-push when
-      // a tier or the kbFocused tie-break actually changed -- a focus
+      // a tier or the active tie-break actually changed -- a focus
       // change between non-overlapping windows must not cost a rebuild
-      // when nothing in the draw order moves. kbFocused flips on every
-      // focus change between WM windows, which is exactly when tie-break
-      // order within the tiled tier can change.
+      // when nothing in the draw order moves. The active flag flips
+      // whenever an output's activity moves between its windows, which
+      // is exactly when tie-break order within the tiled tier can change.
       if (updateStackTiers()) pushStack();
     },
 

@@ -255,7 +255,7 @@ export function collectSubsurfaceIds(
 // clicks landing on the pixels the user sees.
 export function effectiveStackZ(w: WmWindowLike): number {
   const tier = (w.stackTier ?? 0) * 0x40000000;
-  return tier + (w.z ?? 0) * 2 + ((w.kbFocused ?? false) ? 1 : 0);
+  return tier + (w.z ?? 0) * 2 + ((w.active ?? false) ? 1 : 0);
 }
 
 export function computeBaseStack(
@@ -269,7 +269,7 @@ export function computeBaseStack(
   // master-front order preserved within a z-bucket, which matters only
   // when a bucket has multiple windows AND the layout puts them
   // overlapping: a maximized tile member overlaps its tiled-tier peers,
-  // and effectiveStackZ's kbFocused tie-break lifts only the focused
+  // and effectiveStackZ's active tie-break lifts only the active
   // one above it; the rest keep list order beneath. Floating windows
   // get one z per window from raiseWindow; sizeMode tiers lift a
   // focused override above everything and drop an unfocused non-member
@@ -307,12 +307,14 @@ export interface WmWindowLike {
   contentGateOwners?: ReadonlySet<string>;
   decorationSurfaceId?: number;
   z?: number;
-  // WM-stamped stacking tier (see the WM's updateStackTiers): +1 focused
-  // sizeMode window, -1 unfocused non-tile-member sizeMode window, 0
-  // otherwise. effectiveStackZ reads this rather than raw sizeMode.
+  // WM-stamped stacking tier (see the WM's updateStackTiers): +1
+  // output-active sizeMode window, -1 non-active non-tile-member
+  // sizeMode window, 0 otherwise. effectiveStackZ reads this rather
+  // than raw sizeMode.
   stackTier?: -1 | 0 | 1;
-  // WM-stamped: keyboard-focused. Breaks z ties within a tier.
-  kbFocused?: boolean;
+  // WM-stamped: the output's active (most recently keyboard-focused)
+  // window. Breaks z ties within a tier.
+  active?: boolean;
 }
 
 // Recompute the full draw stack (via rebuildStackWithPopups, the SINGLE owner of

@@ -60,14 +60,16 @@ export function popupOutputOrigin(state: CompositorState, pr: PopupRecord): { x:
 export function configurePopup(ctx: Ctx, pr: PopupRecord): void {
   const origin = popupOutputOrigin(ctx.state, pr);
   if (!origin) return; // unparented; defer the configure
-  // A popup chain rooted at a layer-shell surface (a bar's menu, its
-  // submenus) is positioned relative to glass-anchored chrome: exempt it
-  // from the content camera. Toplevel-rooted popups pan with their window.
+  // A popup chain rooted at glass-anchored chrome -- a layer-shell
+  // surface (a bar's menu, its submenus) or a fullscreen toplevel (whose
+  // surface is output-anchored) -- must not pan with the content camera:
+  // exempt it. Other toplevel-rooted popups pan with their window.
   // Subsurfaces of either inherit via the compositor's parent walk.
   const popupSurfaceRec = pr.xdgSurface.surface;
   if (popupSurfaceRec) {
     ctx.state.compositor.setSurfaceOutputAnchored?.(
-      popupSurfaceRec.id, popupChainLayerRooted(ctx.state, pr));
+      popupSurfaceRec.id,
+      popupChainLayerRooted(ctx.state, pr) || popupChainFullscreenRooted(ctx.state, pr));
   }
   // Position-constrain the popup against its parent surface's CURRENT
   // output. A popup parented to a toplevel that has been moved to a
@@ -196,6 +198,18 @@ export function maybeDismissGrabbedPopup(ctx: Ctx, x: number, y: number): boolea
   ctx.events.xdg_popup.send_popup_done(grabRes);
   ctx.state.grabbedPopup = undefined;
   return true;
+}
+
+// True when the popup's parent chain terminates at a fullscreen toplevel.
+// Such a toplevel's surface is output-anchored (camera-exempt glass
+// furniture), so its popups must anchor with it or they would pan away
+// from their parent under a moving camera.
+export function popupChainFullscreenRooted(
+  state: CompositorState, pr: PopupRecord,
+): boolean {
+  const rootId = popupRootToplevelId(state, pr);
+  if (rootId === null) return false;
+  return state.wm?.getWindowState(rootId)?.sizeMode === "fullscreen";
 }
 
 // Walk a popup's parent chain back to the root toplevel xdg_surface. Returns

@@ -185,11 +185,11 @@ export function createLayoutDriver(deps: LayoutDriverDeps): LayoutDriver {
         // the user sees is a stacking concern (focus picks the top), not
         // a geometry one, so none of them suppresses or reflows another.
         //
-        // Fullscreen covers the whole glass. For an explicit island the
-        // docked camera aligns the island's origin with the output's
-        // workarea origin, so the glass's world footprint is the island
-        // origin shifted back by the workarea offset, at the output's
-        // full size. Implicit islands sit at the output rect itself.
+        // Fullscreen covers the whole glass and its surface is
+        // OUTPUT-ANCHORED (camera-exempt; the WM stamps the flag): for an
+        // anchored surface the arrangement-space output rect IS its glass
+        // position, so the plain outputRect covers the monitor at every
+        // camera position and zoom, with no per-frame updates.
         //
         // Maximized covers the usable glass, island-scoped: for an
         // explicit island a workarea-sized region at the island origin
@@ -209,14 +209,7 @@ export function createLayoutDriver(deps: LayoutDriverDeps): LayoutDriver {
                   height: Math.min(workarea.height, island.rect.height),
                 }
               : tileRegion
-            : island.rect
-              ? {
-                  x: island.rect.x - (workarea.x - outputRect.x),
-                  y: island.rect.y - (workarea.y - outputRect.y),
-                  width: outputRect.width,
-                  height: outputRect.height,
-                }
-              : outputRect;
+            : outputRect;
           resolvedRects.push({ id: w.id, outer });
           overrides.set(w.id, outer);
         }
