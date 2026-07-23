@@ -215,11 +215,6 @@ export type WindowState = {
     maxSize: { width: number; height: number } | null;
   };
   parent: number | null;
-  // The rect to restore to when leaving maximized/fullscreen back to
-  // sizeMode "none". Captured at the propose() that transitions INTO a
-  // sizeMode and consumed at the propose() that transitions back out.
-  // null until the first such transition.
-  restoreRect: { x: number; y: number; width: number; height: number } | null;
 };
 
 // Why a proposal was made. Helps interceptors distinguish client intent

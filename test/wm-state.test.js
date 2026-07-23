@@ -53,7 +53,6 @@ test('windowState: new window starts with default fields', () => {
   assert.equal(s.layoutData, undefined);
   assert.deepEqual(s.constraints, { minSize: null, maxSize: null });
   assert.equal(s.parent, null);
-  assert.equal(s.restoreRect, null);
 });
 
 test('getWindowState: unknown window returns null', () => {
@@ -181,7 +180,6 @@ test('propose: emits window.proposed and window.committed (no interceptor)', asy
   assert.equal(committed.length, 1);
   assert.equal(committed[0].previous.sizeMode, 'none');
   assert.equal(committed[0].current.sizeMode, 'fullscreen');
-  // The exclusive transition also captures restoreRect as a side effect.
   assert.ok(committed[0].changed.includes('sizeMode'));
 });
 

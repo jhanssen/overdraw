@@ -95,8 +95,6 @@ export interface LayoutSnapshotWindow extends LayoutWindow {
   // The rect to place a floating window at. Used only when
   // tiling === "floating". Absent otherwise.
   floatingRect?: Rect;
-  // For windows transitioning out of a sizeMode back to "none".
-  restoreRect?: Rect;
 }
 
 // What the driver does with the layout result.

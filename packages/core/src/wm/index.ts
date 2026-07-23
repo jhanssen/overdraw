@@ -168,7 +168,7 @@ export interface Window {
   // (some media players size to their own content) honor the resize.
   pendingSizeConfigure?: boolean;
   // Behavioral state (presentation, layoutMode, layoutData, constraints,
-  // parent, restoreRect). Mutated only through propose().
+  // parent). Mutated only through propose().
   windowState: WindowState;
   // Freeform per-window state bag. Plugins store concept-specific data here
   // under namespaced keys ('workspace.id', 'rules.tags', ...). Core does not
@@ -195,7 +195,6 @@ export function defaultWindowState(): WindowState {
     layoutData: undefined,
     constraints: { minSize: null, maxSize: null },
     parent: null,
-    restoreRect: null,
   };
 }
 
@@ -562,7 +561,6 @@ function cloneState(s: WindowState): WindowState {
       maxSize: s.constraints.maxSize ? { ...s.constraints.maxSize } : null,
     },
     parent: s.parent,
-    restoreRect: s.restoreRect ? { ...s.restoreRect } : null,
   };
 }
 
@@ -596,7 +594,6 @@ function validateState(v: unknown): WindowState | null {
     }
   }
   if (o.parent !== null && typeof o.parent !== "number") return null;
-  if (o.restoreRect !== null && !isRect(o.restoreRect)) return null;
   // layoutData is opaque -- accept anything.
   // We've validated each known field above; the cast here marks the value
   // as a well-formed WindowState for downstream code.
@@ -629,7 +626,6 @@ function diffState(prev: WindowState, next: WindowState): Array<keyof WindowStat
   if (prev.layoutData !== next.layoutData) out.push("layoutData");
   if (!constraintsEqual(prev.constraints, next.constraints)) out.push("constraints");
   if (prev.parent !== next.parent) out.push("parent");
-  if (!restoreRectEqual(prev.restoreRect, next.restoreRect)) out.push("restoreRect");
   return out;
 }
 
@@ -651,12 +647,6 @@ function sizeEqual(
   if (a === null && b === null) return true;
   if (a === null || b === null) return false;
   return a.width === b.width && a.height === b.height;
-}
-
-function restoreRectEqual(a: Rect | null, b: Rect | null): boolean {
-  if (a === null && b === null) return true;
-  if (a === null || b === null) return false;
-  return a.x === b.x && a.y === b.y && a.width === b.width && a.height === b.height;
 }
 
 // Merge a proposal onto the current state. Returns a new WindowState; does
@@ -1761,7 +1751,6 @@ export function createWm(
         },
         currentRect: { ...w.outer },
         ...(w.floatingRect ? { floatingRect: { ...w.floatingRect } } : {}),
-        ...(w.windowState.restoreRect ? { restoreRect: { ...w.windowState.restoreRect } } : {}),
       });
     }
     const outputDescs: Array<{ id: number; rect: Rect; scale: number }> = [];
@@ -2474,20 +2463,6 @@ export function createWm(
           win.floatingRect = { ...win.outer };
         }
 
-        // Capture restoreRect on entry into a sizeMode, restore on exit.
-        const hadSizeMode = current.sizeMode !== "none";
-        const gainsSizeMode = candidate.sizeMode !== "none";
-        if (!hadSizeMode && gainsSizeMode && candidate.restoreRect === null) {
-          candidate.restoreRect = { ...win.outer };
-        }
-        if (hadSizeMode && !gainsSizeMode && candidate.restoreRect !== null) {
-          // restoreRect consumed; layout-driver will read it via the
-          // snapshot for the destination lane (floating uses it as
-          // floatingRect fallback). Clear so a subsequent re-entry
-          // captures a fresh rect.
-          candidate.restoreRect = null;
-        }
-
         win.windowState = candidate;
 
         if (pluginBus) {
@@ -2858,8 +2833,6 @@ function snapshotOf(win: Window): WindowSnapshot {
           ? { ...win.windowState.constraints.maxSize } : null,
       },
       parent: win.windowState.parent,
-      restoreRect: win.windowState.restoreRect
-        ? { ...win.windowState.restoreRect } : null,
     },
     state,
   };
