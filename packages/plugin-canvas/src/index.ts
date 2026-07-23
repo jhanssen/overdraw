@@ -1431,14 +1431,28 @@ async function activate(
     }
   }
 
-  // A move carries no activation edge, so the at-most-one-zoom rule the
-  // activation handler enforces needs settling here: a zoomed window
-  // arriving in an island that already holds a zoomed member wins, and
-  // the incumbent demotes (mirrors the activation edge, where the
+  // A move carries no activation edge, so the activity-driven zoom rules
+  // need settling here. Cross-output: zoom is output-local activity and
+  // does not survive leaving the output -- the mover demotes and arrives
+  // as a plain member; the source output's recorded activity is dropped
+  // if it named the departed window (a later activation edge there must
+  // not demote a window that now lives elsewhere). Same-output: a zoomed
+  // window arriving in an island that already holds a zoomed member wins,
+  // and the incumbent demotes (mirrors the activation edge, where the
   // newcomer wins). Fullscreen members are glass furniture and coexist.
-  async function settleZoomAfterMove(p: { surfaceId: number }): Promise<void> {
+  async function settleZoomAfterMove(
+    p: { surfaceId: number; fromOutputId: number; toOutputId: number },
+  ): Promise<void> {
     const sid = p.surfaceId;
+    if (p.toOutputId !== p.fromOutputId
+        && activeByOutput.get(p.fromOutputId) === sid) {
+      activeByOutput.delete(p.fromOutputId);
+    }
     if (sizeModeMembers.get(sid) !== "maximized") return;
+    if (p.toOutputId !== p.fromOutputId) {
+      await sdk.windows.propose(sid, { sizeMode: "none" });
+      return;
+    }
     const handle = state.surfaceToHandle.get(sid);
     const rec = handle !== undefined ? state.byHandle.get(handle) : undefined;
     if (!rec) return;
@@ -1491,8 +1505,9 @@ async function activate(
         case "emit":
           sdk.events.emit(e.name, e.payload);
           if (e.name === "workspace.window-moved") {
-            await settleZoomAfterMove(
-              e.payload as { surfaceId: number });
+            await settleZoomAfterMove(e.payload as {
+              surfaceId: number; fromOutputId: number; toOutputId: number;
+            });
           }
           break;
       }

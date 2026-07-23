@@ -466,6 +466,39 @@ test('world: a zoomed window moved onto an island with a zoomed member demotes t
   }, { world: true });
 });
 
+test('world: a zoomed window moved across outputs unzooms; source activity is dropped', async () => {
+  await withCanvasPlugin(async ({ rt, wm, addWindow, pluginBus }) => {
+    pluginBus.emit('output.changed', {
+      outputId: 1, name: 'mock-1', edidId: '',
+      x: 800, y: 0, width: 800, height: 600, scale: 1,
+    });
+    await call(rt, 'ensureOutput', [1]);
+    addWindow(101);
+    addWindow(102);
+    await settle();
+    // 102 is output 0's active window and zooms there.
+    pluginBus.emit('window.change',
+      { surfaceId: 102, activated: true, changed: ['activated'] });
+    await settle();
+    await wm.propose(102, { sizeMode: 'maximized' }, 'user-input');
+    await settle();
+    assert.equal(wm.getWindowState(102).sizeMode, 'maximized');
+    // Zoom is output-local activity: crossing outputs releases it.
+    await call(rt, 'moveWindow', [102, 1, 1]);
+    await settle();
+    assert.equal(wm.getWindowState(102).sizeMode, 'none');
+    // The move also dropped output 0's stale activity record naming 102.
+    // Re-zoom 102 on output 1, then activate on output 0: the edge there
+    // must not demote a window living on another output.
+    await wm.propose(102, { sizeMode: 'maximized' }, 'user-input');
+    await settle();
+    pluginBus.emit('window.change',
+      { surfaceId: 101, activated: true, changed: ['activated'] });
+    await settle();
+    assert.equal(wm.getWindowState(102).sizeMode, 'maximized');
+  }, { world: true });
+});
+
 test('world: show docks the camera on the shown slot; hidden members stay published', async () => {
   await withCanvasPlugin(async ({ rt, sink, islands, addWindow }) => {
     addWindow(100);   // anchors ws1 (empty hidden workspaces evaporate)
