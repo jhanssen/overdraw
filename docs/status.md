@@ -6,7 +6,15 @@ test counts, and historical rationale live in `status-detailed.md`. This
 file is the short read; consult the detailed doc when investigating a
 specific subsystem.
 
-Last updated: 2026-07-21. Recent landings: `exclusive` renamed to
+Last updated: 2026-07-22. Recent landings: window moves settle the zoom
+rules (a zoomed window moved cross-output demotes on arrival -- zoom is
+output-local activity -- and the source output's stale activity record is
+dropped; a zoomed window moved into an island holding a zoomed member
+demotes the incumbent); publishWorld is serialized (overlapping triggers
+coalesce into one rerun); focus-driven pointer repicks refresh hover only
+(followRepick no longer bounces a deliberate focus cycle to the window
+under the stationary cursor); the write-only restoreRect field is gone.
+Prior: `exclusive` renamed to
 `sizeMode` with tier-based, output-local semantics. A sizeMode window
 (fullscreen / maximized) keeps a fixed override rect and is never
 reconfigured by focus changes; what the user sees is decided by STACKING
