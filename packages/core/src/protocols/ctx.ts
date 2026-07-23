@@ -394,6 +394,13 @@ export interface CompositorSink {
   // though it rides the content stack: popups parented to layer-shell
   // surfaces, fullscreen toplevels. Optional (GPU-free test sinks omit it).
   setSurfaceOutputAnchored?(id: number, anchored: boolean): void;
+  // The output shows an ACTIVE fullscreen window. While set, the "above"
+  // layer (layer-shell "top": bars, panels) is dropped from that output's
+  // draw order -- fullscreen covers the glass and the fullscreen buffer
+  // can become the top draw entry (direct-scanout eligibility). "overlay"
+  // (lock screens, OSDs) still draws on top. The seat's input pick gates
+  // the "top" layer the same way. Optional (GPU-free test sinks omit it).
+  setOutputFullscreenActive?(outputId: number, on: boolean): void;
   // Drop the recorded shm source (and its pool pin) for a surface.
   // Called from the universal surface-teardown path so never-mapped
   // surfaces (cursor roles) release their pool ref. Optional (GPU-free

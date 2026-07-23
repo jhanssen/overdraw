@@ -916,6 +916,10 @@ export function createWm(
   // while the user works on another one. Entries are validated against
   // current membership at read time; unmapWindow prunes eagerly.
   const lastActiveByOutput = new Map<number, number>();
+  // Outputs currently showing an active fullscreen window, as last pushed
+  // to the sink via setOutputFullscreenActive (updateStackTiers diffs
+  // against it).
+  let fullscreenActiveOutputs = new Set<number>();
 
   // Z-order state. tiledZ is the single z value shared by every
   // tiled (master-stack) window: tiled windows don't overlap each
@@ -1279,6 +1283,33 @@ export function createWm(
       compositor.setSurfaceOutputAnchored?.(
         w.surfaceId, w.windowState.sizeMode === "fullscreen");
     }
+    // Outputs showing an active fullscreen window (same liveness predicate
+    // as anchoredFullscreenAt): the compositor drops the "above" layer
+    // from their draw order and the seat gates the "top" pick, so
+    // fullscreen covers bars and its buffer can reach the top draw entry
+    // (direct-scanout eligibility).
+    const fsOutputs = new Set<number>();
+    for (const w of windows) {
+      if (tiers.get(w.surfaceId) !== 1) continue;
+      if (w.windowState.sizeMode !== "fullscreen") continue;
+      if (!w.windowState.visible || !w.hasContent || isGated(w)) continue;
+      const o = outputOf(w.surfaceId);
+      if (o !== null) fsOutputs.add(o);
+      else if (!outputContent) {
+        // Workspace-less harness: every window shares the primary output.
+        const first = wm.outputs.keys().next();
+        if (!first.done) fsOutputs.add(first.value);
+      }
+    }
+    for (const o of fullscreenActiveOutputs) {
+      if (!fsOutputs.has(o)) compositor.setOutputFullscreenActive?.(o, false);
+    }
+    for (const o of fsOutputs) {
+      if (!fullscreenActiveOutputs.has(o)) {
+        compositor.setOutputFullscreenActive?.(o, true);
+      }
+    }
+    fullscreenActiveOutputs = fsOutputs;
     return changed;
   }
 

@@ -6,7 +6,16 @@ test counts, and historical rationale live in `status-detailed.md`. This
 file is the short read; consult the detailed doc when investigating a
 specific subsystem.
 
-Last updated: 2026-07-22. Recent landings: window moves settle the zoom
+Last updated: 2026-07-22. Recent landings: an ACTIVE fullscreen window
+covers the layer-shell "top" layer -- the output's draw order drops the
+"above" layer while one is present (WM pushes setOutputFullscreenActive
+from the tier refresh) and the seat's pick skips "top" at covered points,
+so bars neither draw over fullscreen nor swallow its input, and the
+fullscreen buffer can top the draw list (direct-scanout eligibility with
+a bar running). "overlay" (lock screens, OSDs) still draws above
+fullscreen and forces compositing. The bar returns as soon as the
+fullscreen window loses its output's activity (focus-cycling away raises
+the tiles over it). Window moves settle the zoom
 rules (a zoomed window moved cross-output demotes on arrival -- zoom is
 output-local activity -- and the source output's stale activity record is
 dropped; a zoomed window moved into an island holding a zoomed member

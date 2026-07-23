@@ -160,8 +160,11 @@ static int parseKbd(const char* s) {
 
 int main(int argc, char** argv) {
     const char* socket = NULL;
+    int lifetime_ms = 2500;
     for (int i = 1; i < argc; ++i) {
         if (strcmp(argv[i], "--socket") == 0 && i + 1 < argc) socket = argv[++i];
+        else if (strcmp(argv[i], "--lifetime") == 0 && i + 1 < argc)
+            lifetime_ms = atoi(argv[++i]);
         else if (strcmp(argv[i], "--layer") == 0 && i + 1 < argc)
             requested_layer = parseLayer(argv[++i]);
         else if (strcmp(argv[i], "--anchor") == 0 && i + 1 < argc)
@@ -238,11 +241,10 @@ int main(int argc, char** argv) {
 
     printf("[client] mapped\n"); fflush(stdout);
 
-    // Stay alive for an upper bound while the driver test injects input /
-    // exercises the compositor.
-    const int LIFETIME_MS = 2500;
+    // Stay alive for an upper bound (--lifetime overrides) while the
+    // driver test injects input / exercises the compositor.
     const int STEP_MS = 20;
-    for (int t = 0; t < LIFETIME_MS; t += STEP_MS) {
+    for (int t = 0; t < lifetime_ms; t += STEP_MS) {
         wl_display_dispatch_pending(display);
         wl_display_flush(display);
         wl_display_roundtrip(display);

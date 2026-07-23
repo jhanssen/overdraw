@@ -1122,6 +1122,10 @@ export class JsCompositor implements CompositorSink {
   // Membership = the surface is glass-anchored for camera purposes
   // (cameraExempt) without any per-surface tagging.
   private layerIdSet = new Set<number>();
+  // Outputs showing an active fullscreen window (WM-pushed via
+  // setOutputFullscreenActive). drawOrder drops the "above" layer for
+  // these outputs.
+  private fullscreenActiveOutputs = new Set<number>();
 
   // Live compose targets. Each entry is re-rendered inside every renderFrame()
   // alongside the on-screen composite, sharing the frame's open import
@@ -1632,6 +1636,19 @@ export class JsCompositor implements CompositorSink {
     if (this.cameras.size > 0) this.damageFull();
   }
 
+  // While an output shows an active fullscreen window, its draw order
+  // drops the "above" layer (layer-shell "top": bars, panels): fullscreen
+  // covers the glass, and with nothing composited on top the fullscreen
+  // buffer is the top draw entry, which direct-scanout eligibility
+  // requires. "overlay" still draws above (lock screens, OSDs) and forces
+  // the composite path.
+  setOutputFullscreenActive(outputId: number, on: boolean): void {
+    if (this.fullscreenActiveOutputs.has(outputId) === on) return;
+    if (on) this.fullscreenActiveOutputs.add(outputId);
+    else this.fullscreenActiveOutputs.delete(outputId);
+    this.damageFull();
+  }
+
   // True when the per-output content camera does NOT move this surface:
   // output-anchored surfaces, non-content layer surfaces (bars, wallpaper),
   // and the cursor sprite are glass-positioned. A subsurface inherits its
@@ -1755,7 +1772,14 @@ export class JsCompositor implements CompositorSink {
         // most recently closed window's phantom is on top of older phantoms.
         if (this.phantoms.length > 0) out.push(...this.phantoms);
       }
-      else { const ids = this.layers.get(layer); if (ids) out.push(...ids); }
+      else {
+        // An output showing an active fullscreen window drops the "above"
+        // layer: bars are covered by definition, and skipping them lets
+        // the fullscreen buffer top the list (direct-scanout eligibility).
+        if (layer === "above" && this.fullscreenActiveOutputs.has(outputId)) continue;
+        const ids = this.layers.get(layer);
+        if (ids) out.push(...ids);
+      }
     }
     // The cursor is always on top -- above every layer,
     // above phantoms, above any plugin overlay. The target surfaceId

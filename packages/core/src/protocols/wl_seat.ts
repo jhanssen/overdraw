@@ -343,8 +343,17 @@ export default function makeSeat(ctx: Ctx, driver: FocusDriver): SeatHandler {
   }
 
   function pick(x: number, y: number): SeatFocus | null {
-    const above = pickLayer(x, y, ["overlay", "top"]);
-    if (above) return above;
+    const over = pickLayer(x, y, ["overlay"]);
+    if (over) return over;
+    // The "top" layer (bars, panels) sits above ordinary content but
+    // BELOW an active fullscreen window: the render side drops the
+    // "above" layer for outputs showing one (setOutputFullscreenActive),
+    // so a bar there is not drawn and must not swallow input either.
+    // "overlay" (lock screens, OSDs) stays above fullscreen in both.
+    if (!ctx.state.wm?.anchoredFullscreenAt(x, y)) {
+      const top = pickLayer(x, y, ["top"]);
+      if (top) return top;
+    }
     // Content surfaces live in world coordinates: the pointer's glass
     // position maps into the world through the content camera of the
     // output it is on (identity camera = same point). Layer-shell trees
