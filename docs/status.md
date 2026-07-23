@@ -11,8 +11,13 @@ covers the layer-shell "top" layer -- the output's draw order drops the
 "above" layer while one is present (WM pushes setOutputFullscreenActive
 from the tier refresh) and the seat's pick skips "top" at covered points,
 so bars neither draw over fullscreen nor swallow its input, and the
-fullscreen buffer can top the draw list (direct-scanout eligibility with
-a bar running). "overlay" (lock screens, OSDs) still draws above
+fullscreen buffer can top the draw list. Direct-scanout eligibility also
+accepts a non-identity output camera when the candidate is camera-exempt
+(an output-anchored fullscreen surface never moves with the camera), so
+a bar's exclusive zone -- whose workarea offset docks the canvas camera
+off identity -- no longer blocks scanout; eligibility is probeable
+headless via scanoutEligibilityReason (backend gates live at the
+renderFrame call site). "overlay" (lock screens, OSDs) still draws above
 fullscreen and forces compositing. The bar returns as soon as the
 fullscreen window loses its output's activity (focus-cycling away raises
 the tiles over it). Window moves settle the zoom

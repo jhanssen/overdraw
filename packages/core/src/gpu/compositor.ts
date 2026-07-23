@@ -4059,7 +4059,9 @@ export class JsCompositor implements CompositorSink {
         // composite. Damage is consumed (the plane shows the new buffer);
         // frame pacing rides the client flip's completion.
         const wasScanout = this.scanoutActive.has(o.id);
-        const cand = this.activeTransitions.has(o.id)
+        const cand = (this.activeTransitions.has(o.id)
+            || !this.directScanoutEnabled || this.headless
+            || !this.addon.sendScanoutClientPresent)
           ? null : this.scanoutCandidate(o, this.drawOrder(o.id));
         if (cand) {
           // One client present in flight per output. The composite path is
@@ -5047,8 +5049,6 @@ export class JsCompositor implements CompositorSink {
   // camera, so the candidate hides everything under it.
   private scanoutCandidate(o: OutputGeom, draw: readonly number[]):
       { bufferId: number; importId: number; tearing: boolean } | null {
-    if (!this.directScanoutEnabled || this.headless) return null;
-    if (!this.addon.sendScanoutClientPresent) return null;
     if (draw.length === 0) return null;
     const id = draw[draw.length - 1];
     // Output-covering test, evaluated first so the ineligibility diagnostic
@@ -5107,12 +5107,38 @@ export class JsCompositor implements CompositorSink {
       return fail("fx opacity/transform/margin active");
     }
     if (s.fx.shape !== null) return fail("fx shape set (decoration rounding?)");
-    if (this.cameras.has(o.id)) return fail("output camera is not identity");
+    // A camera-exempt candidate (an output-anchored fullscreen surface) is
+    // glass furniture: the content camera never moves it, and the opacity/
+    // covering checks above prove it hides all world content beneath it --
+    // so a docked/panned camera doesn't disqualify it. World-content
+    // candidates DO move with the camera, and `covers` tested layout
+    // coords, so a non-identity camera would scan out the wrong content.
+    if (this.cameras.has(o.id) && !this.cameraExempt(id, s)) {
+      return fail("output camera is not identity");
+    }
     if (this.scanoutVeto.get(o.id)?.has(bufferId)) {
       return fail("buffer vetoed by an earlier kernel rejection");
     }
     this.noteScanoutIneligible(o.id, null);
     return { bufferId, importId: imp.importId, tearing: s.tearingAsync === true };
+  }
+
+  // Eligibility probe for tests/introspection: evaluate the candidate test
+  // for one output regardless of backend (headless included -- the
+  // backend gates live at the renderFrame call site). Returns null when a
+  // candidate exists, else the blocking reason (the string
+  // noteScanoutIneligible records, or a generic marker when the top draw
+  // entry isn't even candidate-shaped).
+  scanoutEligibilityReason(outputId: number): string | null {
+    let geom: OutputGeom | null = null;
+    for (const o of this.outputsGeom.values()) {
+      if (o.id === outputId) { geom = o; break; }
+    }
+    if (!geom) return "unknown output";
+    const cand = this.scanoutCandidate(geom, this.drawOrder(outputId));
+    if (cand) return null;
+    return this.scanoutIneligibleReason.get(outputId)
+      ?? "no output-covering candidate at the top of the draw list";
   }
 
   // Last logged per-output ineligibility reason. noteScanoutIneligible logs

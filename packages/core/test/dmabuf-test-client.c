@@ -73,6 +73,7 @@ int main(int argc, char** argv) {
     uint32_t pixel = 0xFFFF0000u;   /* ARGB red */
     int hold_ms = 400;
     int fit_configure = 0;
+    int fullscreen = 0;
     const char* app_id = NULL;
     for (int i = 2; i < argc; ++i) {
         if (strcmp(argv[i], "--format") == 0 && i + 1 < argc) {
@@ -87,6 +88,9 @@ int main(int argc, char** argv) {
         /* Size the buffer from the first xdg configure (the WM's tile), so a
            gated consumer (decoration contentReady) sees a size-correct commit. */
         else if (strcmp(argv[i], "--fit-configure") == 0) fit_configure = 1;
+        /* Request fullscreen pre-map and size the buffer from the sized
+           configure (the glass), so the commit is mode-sized. */
+        else if (strcmp(argv[i], "--fullscreen") == 0) fullscreen = 1;
     }
 
     struct wl_display* display = wl_display_connect(argv[1]);
@@ -110,10 +114,19 @@ int main(int argc, char** argv) {
     xdg_toplevel_add_listener(toplevel, &tlListener, NULL);
     xdg_toplevel_set_title(toplevel, "overdraw-dmabuf-test");
     if (app_id) xdg_toplevel_set_app_id(toplevel, app_id);
+    if (fullscreen) xdg_toplevel_set_fullscreen(toplevel, NULL);
 
     wl_surface_commit(surface);     // map -> configure
     wl_display_roundtrip(display);
-    if (fit_configure && cfg_w > 0 && cfg_h > 0) { W = cfg_w; H = cfg_h; }
+    /* A pre-map fullscreen window's sized configure (the glass) arrives
+       before any content commit, but possibly after the 0x0 throwaway --
+       wait for it so the buffer is mode-sized. fit_configure keeps the
+       one-roundtrip behavior (a sized configure may not exist yet). */
+    for (int i = 0; fullscreen && (cfg_w <= 0 || cfg_h <= 0) && i < 100; ++i) {
+        wl_display_roundtrip(display);
+        usleep(20 * 1000);
+    }
+    if ((fit_configure || fullscreen) && cfg_w > 0 && cfg_h > 0) { W = cfg_w; H = cfg_h; }
 
     // Allocate a LINEAR dmabuf via GBM on the primary render node.
     const char* rnode = getenv("OVERDRAW_RENDER_NODE"); if (!rnode || !*rnode) { fprintf(stderr, "[client] OVERDRAW_RENDER_NODE not set\n"); return 1; }
