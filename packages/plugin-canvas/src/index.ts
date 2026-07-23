@@ -1431,6 +1431,24 @@ async function activate(
     }
   }
 
+  // A move carries no activation edge, so the at-most-one-zoom rule the
+  // activation handler enforces needs settling here: a zoomed window
+  // arriving in an island that already holds a zoomed member wins, and
+  // the incumbent demotes (mirrors the activation edge, where the
+  // newcomer wins). Fullscreen members are glass furniture and coexist.
+  async function settleZoomAfterMove(p: { surfaceId: number }): Promise<void> {
+    const sid = p.surfaceId;
+    if (sizeModeMembers.get(sid) !== "maximized") return;
+    const handle = state.surfaceToHandle.get(sid);
+    const rec = handle !== undefined ? state.byHandle.get(handle) : undefined;
+    if (!rec) return;
+    for (const m of [...rec.members]) {
+      if (m !== sid && sizeModeMembers.get(m) === "maximized") {
+        await sdk.windows.propose(m, { sizeMode: "none" });
+      }
+    }
+  }
+
   // Apply each side effect against the SDK. Errors from SDK calls bubble up;
   // the registry's invariants are preserved either way (state is updated
   // synchronously before effects fire).
@@ -1472,6 +1490,10 @@ async function activate(
           break;
         case "emit":
           sdk.events.emit(e.name, e.payload);
+          if (e.name === "workspace.window-moved") {
+            await settleZoomAfterMove(
+              e.payload as { surfaceId: number });
+          }
           break;
       }
     }

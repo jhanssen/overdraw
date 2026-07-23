@@ -68,6 +68,10 @@ async function withCanvasPlugin(fn, opts = {}) {
       // The plugin bus makes the WM's window.committed/relayout emits
       // visible to the plugin under test, as in production.
       pluginBus,
+      // Production wiring: the broker's set-output-stack handler stores
+      // stacks on `state`; the WM derives per-output content from them
+      // (island scoping for maximized demotion, parent resolution).
+      outputContent: () => state.outputToplevelStacks ?? new Map(),
       layoutDriverFactory: (target, snapshot) => {
         layoutApply = target;
         return {
@@ -437,6 +441,28 @@ test('world: overlapping publishWorld triggers coalesce into sequential passes',
     const passes = setIslandsCalls.length - before;
     assert.ok(passes >= 1 && passes <= 2,
       `expected 1-2 coalesced publish passes, saw ${passes}`);
+  }, { world: true });
+});
+
+test('world: a zoomed window moved onto an island with a zoomed member demotes the incumbent', async () => {
+  await withCanvasPlugin(async ({ rt, wm, addWindow }) => {
+    addWindow(101);
+    await settle();
+    await call(rt, 'create', [{}]);
+    await settle();
+    addWindow(102);
+    await settle();
+    await call(rt, 'moveWindow', [102, 2, 0]);
+    await settle();
+    await wm.propose(101, { sizeMode: 'maximized' }, 'user-input');
+    await wm.propose(102, { sizeMode: 'maximized' }, 'user-input');
+    await settle();
+    // Two islands, one zoomed member each. Moving zoomed 102 into 101's
+    // island demotes the incumbent; the arrival keeps its zoom.
+    await call(rt, 'moveWindow', [102, 1, 0]);
+    await settle();
+    assert.equal(wm.getWindowState(102).sizeMode, 'maximized');
+    assert.equal(wm.getWindowState(101).sizeMode, 'none');
   }, { world: true });
 });
 
