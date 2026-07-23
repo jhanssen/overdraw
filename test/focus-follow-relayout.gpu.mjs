@@ -101,3 +101,68 @@ test("reorder under a stationary pointer: followRepick refocuses the window now 
     await c.teardown();
   }
 });
+
+// A keyboard focus change restacks (an unfocused fullscreen window drops
+// below the tiled tier), which can uncover a different window under the
+// STATIONARY pointer. The repick that follows refreshes hover state only:
+// even with followRepick, the policy is not consulted, so the cycle
+// target keeps keyboard focus instead of bouncing to whatever the
+// restack uncovered under the cursor.
+test("focus-cycle away from fullscreen: followRepick keeps the cycle target", { skip }, async () => {
+  const c = await setupCompositor({
+    config: { layout: LAYOUT },
+    focus: { policy: "follow-pointer", focusOnMap: true, followRepick: true },
+  });
+  try {
+    const out = { width: c.dims.width, height: c.dims.height };
+    const h1 = c.spawnClient(["--app-id", "w1", "--title", "w1"]);
+    await h1.ready;
+    const h2 = c.spawnClient(["--app-id", "w2", "--title", "w2"]);
+    await h2.ready;
+    const tiles = masterStackLayout(2, out, LAYOUT);
+    const settled = (s) =>
+      s.windows.length === 2
+      && s.windows.every((w, i) =>
+        w.rect.x === tiles[i].x && w.rect.y === tiles[i].y
+        && w.rect.width === tiles[i].width && w.rect.height === tiles[i].height);
+    await waitFor(c.query, settled, { what: "2 windows tiled", timeoutMs: 4000 });
+    const snap = c.query();
+    const masterId = snap.windows[0].surfaceId;
+    const stackId = snap.windows[1].surfaceId;
+
+    const game = c.spawnClient(
+      ["--app-id", "game", "--title", "game", "--initial-state", "fullscreen"]);
+    await game.ready;
+    await waitFor(c.query, (s) => s.windows.length === 3,
+      { what: "game mapped", timeoutMs: 8000 });
+    const gameId = c.query().windows.map((w) => w.surfaceId)
+      .find((id) => id !== masterId && id !== stackId);
+    await waitFor(() => c.state.wm.state.windows.find((w) => w.surfaceId === gameId),
+      (w) => w?.windowState.sizeMode === "fullscreen",
+      { timeoutMs: 8000, what: "game fullscreen" });
+    // focusOnMap gave the game keyboard focus; focused fullscreen covers
+    // the output, so parking the pointer over the stack tile lands on it.
+    await waitFor(c.query, (s) => s.keyboardFocus === gameId,
+      { what: "game focused on map" });
+    const px = tiles[1].x + (tiles[1].width >> 1);
+    const py = tiles[1].y + (tiles[1].height >> 1);
+    pointerMotion(c.addon, px, py);
+    await waitFor(c.query, (s) => s.pointerFocus === gameId,
+      { what: "pointer parked on the fullscreen game" });
+    // The park's pointer-enter dispatch is async; let it apply before
+    // cycling so its (gameId) result can't land after the cycle.
+    await c.focusDriver.settled();
+
+    // Cycle keyboard focus to the master window: the unfocused game drops
+    // below the tiled tier and the stack window lands under the cursor.
+    c.state.seat.applyKeyboardFocus(masterId);
+    await waitFor(c.query, (s) => s.pointerFocus === stackId,
+      { what: "hover state follows the uncovered tile", timeoutMs: 4000 });
+    // Leave time for any stray policy dispatch to land before asserting.
+    await new Promise((r) => setTimeout(r, 400));
+    assert.equal(c.query().keyboardFocus, masterId,
+      "keyboard focus stays with the cycle target, not the window under the cursor");
+  } finally {
+    await c.teardown();
+  }
+});

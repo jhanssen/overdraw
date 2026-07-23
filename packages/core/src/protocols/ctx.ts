@@ -1440,9 +1440,12 @@ export interface SeatState {
   // Re-derive pointer focus at the last-known pointer position, sending
   // leave/enter/motion and a focus-policy dispatch as if the pointer had
   // moved zero pixels. Called when the scene changes under a stationary
-  // pointer (resize-tx batch apply, workspace switch). No-op during
-  // grabs/drags or while the host pointer is outside the compositor.
-  repickPointer(): void;
+  // pointer (resize-tx batch apply, workspace switch). dispatchFocus:false
+  // refreshes hover state without the policy dispatch, for repicks caused
+  // by a keyboard focus change (followRepick must not bounce focus back
+  // to the window under the stationary cursor). No-op during grabs/drags
+  // or while the host pointer is outside the compositor.
+  repickPointer(opts?: { dispatchFocus?: boolean }): void;
   // The last observed pointer position (output-space). Used by the
   // action-registry's deferred-ref resolver (ref.pointerX/Y). When no
   // pointer event has ever been seen, returns {x: 0, y: 0} -- matches

@@ -313,6 +313,9 @@ export async function setupCompositor(opts = {}) {
   // installProtocols below. waitForNamespace inside compute()/decide()
   // absorbs the boot race.
   let runtime = null;
+  // Captured by focusDriverFactory below; exposed on the rig so tests can
+  // await focusDriver.settled() before asserting focus state.
+  let focusDriver = null;
 
   // Reserved-zone registry shared with the layout driver. Always
   // constructed in the harness; layer-shell tests rely on it to register
@@ -341,18 +344,26 @@ export async function setupCompositor(opts = {}) {
         return await runtime.invokeNamespace("layout", "compute", [inputs]);
       },
     }),
-    focusDriverFactory: (target) => createFocusDriver({
-      target,
-      decide: async (inputs) => {
-        if (!runtime) throw new Error("focus: runtime not initialized");
-        await runtime.waitForNamespace("focus");
-        return await runtime.invokeNamespace("focus", "decide", [inputs]);
-      },
-    }),
+    focusDriverFactory: (target) => {
+      focusDriver = createFocusDriver({
+        target,
+        decide: async (inputs) => {
+          if (!runtime) throw new Error("focus: runtime not initialized");
+          await runtime.waitForNamespace("focus");
+          return await runtime.invokeNamespace("focus", "decide", [inputs]);
+        },
+      });
+      return focusDriver;
+    },
   });
-  // Keyboard focus reaches the WM (stack tiers) via
-  // this bus subscription; mirrors main.ts.
-  coreBus.on(KEYBOARD_EVENT.focus, (ev) => { state?.wm?.setKeyboardFocus(ev.surfaceId); });
+  // Keyboard focus reaches the WM (stack tiers) via this bus subscription;
+  // mirrors main.ts, including the hover-only repick (no policy dispatch:
+  // a focus-driven restack must not let followRepick bounce focus to the
+  // window under the stationary cursor).
+  coreBus.on(KEYBOARD_EVENT.focus, (ev) => {
+    state?.wm?.setKeyboardFocus(ev.surfaceId);
+    state?.seat?.repickPointer({ dispatchFocus: false });
+  });
 
   // Hand the compositor the subsurface tree so it derives child placement +
   // cascades fx (matches main.ts). Without this, subsurfaces never get a rect.
@@ -862,7 +873,7 @@ export async function setupCompositor(opts = {}) {
     addon, state, sock, dims, query: () => state.query(),
     spawnClient, waitFor, frameReadback, teardown, jsCompositor,
     coreDevice, dawn,
-    runtime, pluginBus,
+    runtime, pluginBus, focusDriver,
   };
 }
 

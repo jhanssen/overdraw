@@ -1466,9 +1466,13 @@ pluginBus.subscribe("window.move-to-output-cycle-requested", (_n, payload) => {
 // it, the pointer stays on the surface that USED to be on top -- e.g. a
 // fullscreen game that hid the cursor keeps it hidden even though the
 // user focus-cycled to a window now covering the pointer position.
+// Hover refresh only, no policy dispatch: this repick is the consequence
+// of a focus change, and feeding it back to the policy would let
+// followRepick hand focus straight to whatever the restack uncovered
+// under the stationary cursor, overwriting a deliberate focus cycle.
 bus.on(KEYBOARD_EVENT.focus, (ev) => {
   state?.wm?.setKeyboardFocus(ev.surfaceId);
-  state?.seat?.repickPointer();
+  state?.seat?.repickPointer({ dispatchFocus: false });
 });
 
 // The focus.next / focus.prev actions emit this; cycle keyboard focus

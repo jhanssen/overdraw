@@ -1207,10 +1207,15 @@ export default function makeSeat(ctx: Ctx, driver: FocusDriver): SeatHandler {
   // "pointer-repick", NOT "pointer-enter": the pointer did not move, the
   // world did, and the default follow-pointer policy deliberately ignores
   // it (a camera flight must not hand keyboard focus to whatever slides
-  // under the stationary cursor). No-op while a move/resize grab or a
-  // DnD drag owns the pointer, or while the host pointer is outside the
-  // compositor.
-  function repickPointer(): void {
+  // under the stationary cursor). dispatchFocus:false skips the policy
+  // dispatch entirely (hover refresh only) -- used when the repick is
+  // itself the consequence of a keyboard focus change, where feeding the
+  // policy would let followRepick immediately overwrite that focus with
+  // the window under the stationary cursor. No-op while a move/resize
+  // grab or a DnD drag owns the pointer, or while the host pointer is
+  // outside the compositor.
+  function repickPointer(opts?: { dispatchFocus?: boolean }): void {
+    const dispatch = opts?.dispatchFocus !== false;
     const seat = ctx.state.seat;
     if (!seat || seat.grab || seat.drag || !pointerInside) return;
     const hit = pick(lastX, lastY);
@@ -1221,7 +1226,7 @@ export default function makeSeat(ctx: Ctx, driver: FocusDriver): SeatHandler {
     }
     if (!hit) {
       notifyPointerFocus(ctx, null);
-      if (prevPointerSurface !== null) {
+      if (prevPointerSurface !== null && dispatch) {
         dispatchFocus("pointer-repick", undefined, null);
       }
       return;
@@ -1246,7 +1251,7 @@ export default function makeSeat(ctx: Ctx, driver: FocusDriver): SeatHandler {
       }
     }
     notifyPointerFocus(ctx, hit.surfaceId);
-    if (prevPointerSurface !== hit.surfaceId) {
+    if (prevPointerSurface !== hit.surfaceId && dispatch) {
       dispatchFocus("pointer-repick", hit.rootSurfaceId, hit.rootSurfaceId);
     }
   }
