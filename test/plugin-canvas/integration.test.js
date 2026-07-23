@@ -107,6 +107,9 @@ async function withCanvasPlugin(fn, opts = {}) {
     wsEvents.push({ name, payload });
   });
 
+  // One entry per windows.set-islands broker call = one publishWorld pass.
+  const setIslandsCalls = [];
+
   // Mock animations broker for camera flights. Modes (opts.animations):
   //   undefined      -- run resolves immediately (flights settle instantly);
   //   'manual'       -- run parks until the test resolves it via animPending
@@ -141,6 +144,7 @@ async function withCanvasPlugin(fn, opts = {}) {
   await withRuntime({
     bus: pluginBus,
     onRequest: (plugin, method, params) => {
+      if (method === 'windows.set-islands') setIslandsCalls.push(params);
       if (method.startsWith('windows.')) {
         const r = broker(plugin, method, params);
         if (r === WINDOWS_NOT_HANDLED) throw new Error(`unhandled ${method}`);
@@ -185,7 +189,7 @@ async function withCanvasPlugin(fn, opts = {}) {
     await rt.waitForNamespace('workspace');
     await fn({
       rt, sink, wm, wsEvents, seatCalls, layoutSnapshots, animCalls, animPending,
-      pluginBus, seat, state,
+      pluginBus, seat, state, setIslandsCalls,
       layoutApply: () => layoutApply,
       islands() { return layoutSnapshots.at(-1)?.islands ?? []; },
       addWindow(id, { place } = {}) {
@@ -415,6 +419,24 @@ test('world: every workspace publishes an island at its slot rect', async () => 
     // Hidden workspaces publish too; members carry through.
     assert.deepEqual(ws1.members, [101]);
     assert.deepEqual(ws2.members, []);
+  }, { world: true });
+});
+
+test('world: overlapping publishWorld triggers coalesce into sequential passes', async () => {
+  await withCanvasPlugin(async ({ pluginBus, setIslandsCalls, addWindow }) => {
+    addWindow(101);
+    await settle();
+    const before = setIslandsCalls.length;
+    // Five triggers in one tick while the first pass is parked on its
+    // awaits: one active pass plus one coalesced rerun, never five
+    // interleaved runs racing their set-islands pushes.
+    for (let i = 0; i < 5; i++) {
+      pluginBus.emit('output.workarea-changed', { outputId: 0 });
+    }
+    await settle();
+    const passes = setIslandsCalls.length - before;
+    assert.ok(passes >= 1 && passes <= 2,
+      `expected 1-2 coalesced publish passes, saw ${passes}`);
   }, { world: true });
 });
 

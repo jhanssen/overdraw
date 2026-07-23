@@ -1250,7 +1250,32 @@ async function activate(
     return Math.max(wa.width, m?.width ?? wa.width);
   }
 
-  async function publishWorld(): Promise<void> {
+  // publishWorld awaits many round trips (workareas, elastic measures,
+  // setIslands, cameras) and is invoked fire-and-forget from independent
+  // event handlers, so runs must not overlap: an older run resuming after
+  // a newer one would push a stale island set / camera and poison the
+  // dedupe caches (lastCamByOutput, lastBackdropsJson) and
+  // rowRectsByOutput. Serialize: one run at a time; calls during a run
+  // coalesce into a single rerun that starts from fresh state once the
+  // active run finishes.
+  let publishRun: Promise<void> | null = null;
+  let publishAgain = false;
+
+  function publishWorld(): Promise<void> {
+    if (publishRun) {
+      publishAgain = true;
+      return publishRun;
+    }
+    publishRun = (async () => {
+      do {
+        publishAgain = false;
+        await publishWorldPass();
+      } while (publishAgain);
+    })().finally(() => { publishRun = null; });
+    return publishRun;
+  }
+
+  async function publishWorldPass(): Promise<void> {
     if (!worldMode) return;
     // Drop slots + scroll + growth overrides for destroyed workspaces.
     for (const h of [...slotByHandle.keys()]) {
